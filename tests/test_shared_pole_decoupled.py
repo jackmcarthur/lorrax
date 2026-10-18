@@ -253,7 +253,7 @@ def test_scalar_face_round_matches_local(monkeypatch):
     from gw.shared_pole_capacity import _local_eigenplan
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     # The face round's eigh stacks on route (c), as the staged route's run on CPU.
-    monkeypatch.setattr(ex, "face_eigh", lambda mesh_, n, room=None: _local_eigenplan(mesh_, int(n)))
+    monkeypatch.setattr(ex, "face_eigh", lambda mesh_, n, room=None, backend=None: _local_eigenplan(mesh_, int(n)))
     extent = port_extent(mesh)
     states, infinity, tables, models = _pencil(mesh, seed=2)
     q = len(models)
@@ -270,7 +270,7 @@ def test_scalar_face_round_matches_local(monkeypatch):
                          ordered=True, odd_moments=True, keep_budget=8, gram_keep=gram_keep)
     fs, fi = place(NamedSharding(mesh, P(None, "x", "y")))
     face = ex.face_reduce_round(fs, fi, tables, mesh=mesh, budget=None, ordered=True, odd_moments=True,
-                                keep_budget=8, admit=False, gram_keep=gram_keep,
+                                keep_budget=8, eigh_backend="auto", admit=False, gram_keep=gram_keep,
                                 carrier=ex.face_ritz_carrier(mesh, 8))
     (lb, lp, la), (fb, fp, fa) = ([np.asarray(a) for a in r[0]] for r in (local, face))
     assert np.array_equal(la, fa)

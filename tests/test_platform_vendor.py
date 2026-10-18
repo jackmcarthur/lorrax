@@ -33,9 +33,9 @@ CASES = [
     (_dev("gpu", "cuda", "PJRT C API\ncuda 13020", "NVIDIA A100-SXM4-80GB"), "cuda", "CUDA"),
     (_dev("gpu", "gpu", "", "NVIDIA H100 80GB HBM3"), "cuda", "CUDA"),
     (_dev("cuda", "", "", ""), "cuda", "CUDA"),
-    (_dev("gpu", "rocm", "rocm 60300", "AMD Instinct MI250X"), "rocm", "rocm"),
-    (_dev("gpu", "gpu", "", "gfx90a"), "rocm", "rocm"),
-    (_dev("rocm", "", "", ""), "rocm", "rocm"),
+    (_dev("gpu", "rocm", "rocm 60300", "AMD Instinct MI250X"), "rocm", "ROCM"),
+    (_dev("gpu", "gpu", "", "gfx90a"), "rocm", "ROCM"),
+    (_dev("rocm", "", "", ""), "rocm", "ROCM"),
     (_dev("gpu", "gpu", "", "Some chipset"), "gpu", "gpu"),       # 'chipset' is not 'hip'
     (_dev("tpu", "tpu", "", "TPU v4"), "tpu", "tpu"),
 ]
@@ -59,7 +59,7 @@ def test_gpu_string_alone_is_not_cuda():
 def test_platform_from_env_per_vendor():
     saved = os.environ.get("JAX_PLATFORMS")
     try:
-        for value, want in (("cuda,cpu", "CUDA"), ("gpu", "CUDA"), ("rocm,cpu", "rocm"),
+        for value, want in (("cuda,cpu", "CUDA"), ("gpu", "CUDA"), ("rocm,cpu", "ROCM"),
                             ("cpu", "cpu"), ("", "CUDA")):
             os.environ["JAX_PLATFORMS"] = value
             assert lxkit.platform_from_env() == want, (value, lxkit.platform_from_env())
@@ -87,7 +87,7 @@ def test_rocm_mesh_never_probes_a_cuda_or_host_library():
         try:
             g.require(rocm)
         except RuntimeError as exc:
-            assert "rocm" in str(exc)
+            assert "ROCM" in str(exc)
         else:
             raise AssertionError("require() served a rocm mesh")
 
@@ -171,21 +171,26 @@ def test_visible_device_count_per_vendor_variable():
 
 
 def test_gpu_plugin_platform_from_the_installed_plugin():
-    with tempfile.TemporaryDirectory() as root:
-        os.makedirs(os.path.join(root, "jax_plugins", "xla_rocm7"))
-        sys.path.insert(0, root)
-        try:
-            assert runtime._gpu_plugin_platform() == "rocm"
-        finally:
-            sys.path.remove(root)
-    with tempfile.TemporaryDirectory() as root:
-        os.makedirs(os.path.join(root, "jax_plugins", "xla_cuda13"))
-        saved_path = list(sys.path)
-        sys.path[:] = [root]
-        try:
-            assert runtime._gpu_plugin_platform() == "cuda"
-        finally:
-            sys.path[:] = saved_path
+    import lxkit
+    saved_path, saved_present = list(sys.path), lxkit.leg_device_present
+    try:
+        for plugin, want in (("xla_rocm7", "rocm"), ("xla_cuda13", "cuda")):
+            with tempfile.TemporaryDirectory() as root:
+                os.makedirs(os.path.join(root, "jax_plugins", plugin))
+                sys.path[:] = [root]
+                assert runtime._gpu_plugin_platform() == want
+        # Both plugins installed (a dependency pulled the other one in): the
+        # leg whose device is visible wins, whichever it is.
+        with tempfile.TemporaryDirectory() as root:
+            for plugin in ("xla_rocm7", "xla_cuda13"):
+                os.makedirs(os.path.join(root, "jax_plugins", plugin))
+            sys.path[:] = [root]
+            for key, want in (("ROCM", "rocm"), ("CUDA", "cuda")):
+                lxkit.leg_device_present = lambda leg, k=key, **_: leg.key == k
+                assert runtime._gpu_plugin_platform() == want
+    finally:
+        sys.path[:] = saved_path
+        lxkit.leg_device_present = saved_present
 
 
 def _main():

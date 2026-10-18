@@ -9,6 +9,7 @@ import os
 
 import numpy as np
 import jax
+from lxkit import ordered_psum
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -622,7 +623,7 @@ def fold_small_head_wings_sharded(
         local = jnp.einsum(
             "...am,...mn,...nb->...ab",
             y_local, w_local, z_local, optimize=True)
-        correction = jax.lax.psum(local, ("x", "y"))
+        correction = ordered_psum(local, ("x", "y"))
         return s_direct + correction / volume
 
     folded = shard_map(
@@ -664,10 +665,10 @@ def fold_cartesian_head_wings_sharded(
 def _small_head_wing_halves_sharded(Y_x, W_body_xy, Z_y, *, mesh_xy):
     """Compiled body of :func:`small_head_wing_halves_sharded`."""
     def _local(y_local, w_local, z_local):
-        yw = jax.lax.psum(
+        yw = ordered_psum(
             jnp.einsum("aAi,ij->aAj", y_local, w_local, optimize=True),
             "x")
-        wz = jax.lax.psum(
+        wz = ordered_psum(
             jnp.einsum("ij,bjB->biB", w_local, z_local, optimize=True),
             "y")
         return yw, wz
@@ -1983,10 +1984,12 @@ class HeadSigmaDiag:
 
     Sigma^head_nk(omega) = sum_p pref_p [ f_nk / (omega - e_nk + z_p)
                                         + (1 - f_nk) / (omega - e_nk - z_p) ]
-    depends on E_nk and f_nk only, so it is evaluated where it is read and the
-    (n_omega, nk, nb) array is not held on any host: ``band_rows`` gives a rank
-    the rows of its own Sigma tile for the finalize add, ``at_slots`` the omega
-    slots an on-shell reader interpolates between.  Every value is
+    depends on E_nk and f_nk only, so it is evaluated where it is read:
+    :meth:`on_shell` at per-state energies (the on-shell Sigma's tables and
+    their derivative), ``band_rows`` on ``omega_grid_ry`` (the sampled range,
+    for the head-shift log line, and a rank's rows of its own Sigma tile for
+    the grid finalize add), ``at_slots`` the omega slots a grid reader
+    interpolates between (``sigma_omega_grid_debug``).  Every value is
     ``_head_pole_sum`` of its cell, so the readers agree to the bit.
     ``np.asarray`` evaluates the whole array (one-shot output tables).
     """

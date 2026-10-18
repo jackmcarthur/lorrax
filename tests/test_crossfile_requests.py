@@ -33,10 +33,12 @@ import textwrap
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
-if _SRC not in sys.path:
-    sys.path.insert(0, _SRC)
+# ``runtime``'s leg checks import ``lxkit`` lazily (stdlib-only at import).
+for _p in (_SRC, os.path.join(_REPO, "services", "lxkit", "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-import runtime as _runtime            # noqa: E402  (os + subprocess only)
+import runtime as _runtime            # noqa: E402  (os + subprocess; lxkit lazily)
 
 
 # ---------------------------------------------------------------------------

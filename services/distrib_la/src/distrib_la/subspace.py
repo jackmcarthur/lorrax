@@ -4,6 +4,9 @@ Only row coefficients are reduced. Vector storage remains partitioned over
 all mesh axes declared by the caller; no vector gather is permitted here.
 The CPU compatibility provider uses active NumPy BLAS/LAPACK callbacks, so
 it promises fixed JAX geometry, not GPU-like memory or transfer performance.
+The XLA provider stages the same algebra as device products on the active
+window and :func:`distrib_la.eigh_local` on the active block: no host callback.
+Which provider a platform leg takes is :data:`SUBSPACE_ROUTE`.
 """
 from dataclasses import dataclass, replace
 
@@ -12,9 +15,36 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 from lxkit import device_vendor
+from lxkit import ordered_psum
 
-from distrib_la.active_subspace import LocalSubspacePlan, _orthogonalization_range, plan_local_subspace
+from distrib_la._active_local import interval_rows
+from distrib_la.active_subspace import (LocalSubspacePlan, _orthogonalization_range, native_fields,
+                                       native_leg, plan_local_subspace)
 from distrib_la.loader import probe_target
+from distrib_la.local_eigh import eigh_local
+
+
+#: Subspace provider by ``lxkit`` leg key -- a backend preference of this
+#: service (as ``local_eigh.COMPLEX_EIGH_ROUTE``), so it lives here and not in
+#: ``lxkit.LEGS``.  ``"native"``: the ``lorrax_active_subspace_*`` handlers;
+#: ``"xla"``: :class:`XlaSubspacePlan` (device products and ``eigh_local``, the
+#: XLA reference route); ``"host"``: :class:`CpuSubspacePlan` (NumPy LAPACK in
+#: ``pure_callback``).  A vendor with no leg runs the XLA route
+#: (``docs/architecture/decisions.md#xla-reference``).  ROCM: ``"native"`` -- the
+#: CUDA handlers' leg-neutral port (rocBLAS/rocSOLVER, ``src/ffi/cpp/active_subspace``),
+#: gated against ``"xla"`` and ``"host"`` on the same GCD by
+#: tests/test_subspace_native_gate.py.  (Wave 1: the host route cost bse 517 callbacks,
+#: 1.52 s of 5.8 s, and made the solver jits uncacheable; the XLA route followed.)
+SUBSPACE_ROUTE = {"cpu": "host", "CUDA": "native", "ROCM": "native"}
+
+
+def subspace_route(leg_key=None):
+    """The provider this process's leg (or ``leg_key``) takes: native | xla | host."""
+    if leg_key is None:
+        from lxkit import leg_for_vendor
+        leg = leg_for_vendor(device_vendor(jax.local_devices()[0]))
+        leg_key = None if leg is None else leg.key
+    return SUBSPACE_ROUTE.get(leg_key, "xla")
 
 
 @dataclass(frozen=True)
@@ -108,6 +138,162 @@ class CpuSubspacePlan:
     normalize = LocalSubspacePlan.normalize
 
 
+def _rows(array):
+    return array.reshape(array.shape[0], -1)
+
+
+def _eigh_sizes(capacity):
+    """Static eigensolve extents: powers of two from 64 below capacity, then capacity."""
+    sizes, size = [], 64
+    while size < capacity:
+        sizes.append(size)
+        size *= 2
+    return tuple(sizes) + (capacity,)
+
+
+@dataclass(frozen=True)
+class XlaSubspacePlan:
+    """The XLA route: active-window device products and ``eigh_local``; no callback.
+
+    Window products slice only the active rows (``interval_rows``): inactive
+    rows may hold NaN and never enter arithmetic. ``project`` multiplies the
+    new image rows against the whole basis and selects the first ``active``
+    rows of the result (a GEMM output row reads only its own basis row).
+    ``eigh`` solves the smallest static extent of :func:`_eigh_sizes` that
+    holds the active block, its inactive diagonal shifted above the active
+    spectrum (twice its Gershgorin bound), so arithmetic stays within a factor
+    two of the active size above 64. Invalid runtime windows return NaN,
+    never a clamped slice.
+    """
+    capacity: int
+    n_eig: int
+    max_block_size: int | None = None
+
+    @property
+    def workspace_specs(self):
+        # Scratch is XLA-owned temporaries; read it from memory_analysis().
+        return {}
+
+    def _window(self, start, count):
+        """int32 [lo, hi) and its validity, judged in the operands' own width.
+
+        An invalid window comes back empty (no loop trip, no clamped slice);
+        callers return NaN for it.
+        """
+        start, count = jnp.asarray(start), jnp.asarray(count)
+        cap = self.capacity
+        valid = ((start >= 0) & (start <= cap) & (count >= 0) & (count <= cap)
+                 & (start + count <= cap))
+        lo = jnp.where(valid, start, 0).astype(jnp.int32)
+        return lo, lo + jnp.where(valid, count, 0).astype(jnp.int32), valid
+
+    def _gram_rows(self, vf, pf, lo, hi):
+        """C[r] = conj(V[r]) . P^T for r in [lo, hi), zero elsewhere."""
+        def block(s, w, out):
+            vs = jax.lax.dynamic_slice_in_dim(vf, s, w, axis=0)
+            return jax.lax.dynamic_update_slice_in_dim(
+                out, jnp.conj(jnp.conj(pf) @ vs.T).T, s, axis=0)
+        return interval_rows(block, lo, hi, self.capacity,
+                             jnp.zeros((self.capacity, pf.shape[0]), jnp.complex128))
+
+    def _combine(self, c, vf, lo, hi):
+        """sum_{r in [lo, hi)} c[r]^T V[r]: (c.shape[1], n)."""
+        def block(s, w, out):
+            vs = jax.lax.dynamic_slice_in_dim(vf, s, w, axis=0)
+            cs = jax.lax.dynamic_slice_in_dim(c, s, w, axis=0)
+            return out + cs.T @ vs
+        return interval_rows(block, lo, hi, self.capacity,
+                             jnp.zeros((c.shape[1], vf.shape[1]), jnp.complex128))
+
+    def eigh(self, h, active):
+        cap, b = self.capacity, self.n_eig
+        if h.shape != (cap, cap) or h.dtype != jnp.complex128:
+            raise ValueError('projected Hamiltonian differs from the declared plan')
+        m = jnp.asarray(active, jnp.int32)
+        sizes = _eigh_sizes(cap)
+
+        def solve(size):
+            def branch(h):
+                inside = jnp.arange(size) < m
+                a = jnp.where(inside[:, None] & inside[None, :], h[:size, :size], 0)
+                # The lower triangle is the matrix (LAPACK's UPLO='L', as the host route).
+                a = jnp.tril(a) + jnp.conj(jnp.tril(a, -1)).T
+                bound = jnp.max(jnp.sum(jnp.abs(a), axis=1))
+                shift = jnp.where(bound > 0, 2 * bound, 1.0)
+                a = a + jnp.diag(jnp.where(inside, 0.0, shift)).astype(a.dtype)
+                w, v = eigh_local(a, UPLO='L', symmetrize_input=False)
+                n = min(size, b)
+                values = jnp.full((b,), jnp.inf, jnp.float64).at[:n].set(w[:n])
+                vectors = jnp.zeros((cap, b), jnp.complex128).at[:size, :n].set(v[:, :n])
+                return values, vectors
+            return branch
+
+        index = jnp.minimum(jnp.sum(jnp.asarray(sizes) < m), len(sizes) - 1)
+        values, vectors = jax.lax.switch(index, tuple(solve(n) for n in sizes), h)
+        column = jnp.arange(b) < m
+        values = jnp.where(column, values, jnp.inf)
+        vectors = jnp.where((jnp.arange(cap) < m)[:, None] & column[None, :], vectors, 0)
+        return values, vectors
+
+    def gram(self, v, p, active, *, start=0):
+        if v.shape[0] != self.capacity or v.shape[1:] != p.shape[1:]:
+            raise ValueError('active Gram buffer geometry differs from plan')
+        lo, hi, valid = self._window(start, active)
+        out = self._gram_rows(_rows(v), _rows(p), lo, hi)
+        return jnp.where(valid, out, jnp.nan)
+
+    def reconstruct(self, v, hv, c, active, template, *, columns=None, compute_image=True, start=0):
+        if v.shape != hv.shape or v.shape[0] != self.capacity or c.shape != (self.capacity, template.shape[0]):
+            raise ValueError('active reconstruction buffer geometry differs from plan')
+        if v.shape[1:] != template.shape[1:]:
+            raise ValueError('active reconstruction vector shapes differ')
+        columns = template.shape[0] if columns is None else columns
+        lo, hi, valid = self._window(start, active)
+        keep = (jnp.arange(template.shape[0]) < columns)[:, None]
+
+        def image(vectors):
+            out = jnp.where(keep, self._combine(c, _rows(vectors), lo, hi), 0)
+            return jnp.where(valid, out, jnp.nan).reshape(template.shape)
+        x = image(v)
+        hx = image(hv) if compute_image else jnp.zeros(template.shape, jnp.complex128)
+        return x, hx
+
+    def orthogonalize(self, v, p, active, *, start=0):
+        if p.shape[0] > (self.max_block_size or self.n_eig):
+            raise ValueError('orthogonalization block exceeds planned scratch width')
+        if v.shape[0] != self.capacity or v.shape[1:] != p.shape[1:]:
+            raise ValueError('active orthogonalization buffer geometry differs from plan')
+        start, active = _orthogonalization_range(start, active, self.capacity)
+        lo, hi, valid = self._window(start, active)
+        vf, pf = _rows(v), _rows(p)
+        for _ in range(2):
+            pf = pf - self._combine(self._gram_rows(vf, pf, lo, hi), vf, lo, hi)
+        return jnp.where(valid, pf, jnp.nan).reshape(p.shape).astype(p.dtype)
+
+    def project(self, v, hv, active, h, start, count):
+        if v.shape != hv.shape or v.shape[0] != self.capacity or h.shape != (self.capacity, self.capacity):
+            raise ValueError('active projection buffer geometry differs from plan')
+        cap = self.capacity
+        vf, hf = _rows(v), _rows(hv)
+        lo, hi, valid = self._window(start, count)
+
+        def block(s, w, out):
+            hs = jax.lax.dynamic_slice_in_dim(hf, s, w, axis=0)
+            return jax.lax.dynamic_update_slice(out, jnp.conj(jnp.conj(hs) @ vf.T).T, (jnp.int32(0), s))
+        panel = interval_rows(block, lo, hi, cap, jnp.zeros((cap, cap), jnp.complex128))
+        row = jnp.arange(cap)
+        new, old = (row >= lo) & (row < hi), row < active
+        upper = old[:, None] & new[None, :]
+        out = jnp.where(upper, panel, h)
+        out = jnp.where(upper.T, jnp.conj(jnp.where(upper, panel, 0)).T, out)
+        return jnp.where(valid, out, jnp.nan)
+
+    store = CpuSubspacePlan.store
+    qr = CpuSubspacePlan.qr
+    constrain = LocalSubspacePlan.constrain
+    normalize = LocalSubspacePlan.normalize
+
+
 @dataclass(frozen=True)
 class DistributedSubspacePlan:
     local: object
@@ -177,7 +363,7 @@ class DistributedSubspacePlan:
     def gram(self, v, p, active, *, start=0):
         def body(v, p, active, start):
             c = self.local.gram(v, p, active, start=start)
-            return jax.lax.psum(c, self.axes)
+            return ordered_psum(c, self.axes)
         spec = self.vector_sharding.spec
         return self._map(body, (spec, spec, P(), P()), P())(v, p, active, start)
 
@@ -186,7 +372,7 @@ class DistributedSubspacePlan:
         # would multiply its retained block by the processor count.
         def body(v, hv, active, start, count):
             delta = self.local.project(v, hv, active, jnp.zeros((self.capacity, self.capacity), jnp.complex128), start, count)
-            return jax.lax.psum(delta, self.axes)
+            return ordered_psum(delta, self.axes)
         spec = self.vector_sharding.spec
         delta = self._map(body, (spec, spec, P(), P(), P()), P())(v, hv, active, start, count)
         row = jnp.arange(self.capacity)
@@ -208,13 +394,13 @@ class DistributedSubspacePlan:
         if isinstance(self.local, LocalSubspacePlan) and self.orthogonalization_context is None:
             def body(v, p, active, start):
                 start, active = _orthogonalization_range(start, active, self.capacity)
-                c = jax.lax.psum(self.local.gram(v, p, active, start=start), self.axes)
+                c = ordered_psum(self.local.gram(v, p, active, start=start), self.axes)
                 # Form the second pass's local overlaps while updating p in
                 # place, avoiding a separate vector-sized projection buffer.
                 # They still need a global sum before the second subtraction.
                 p, c = self.local.subtract_projection(
                     v, p, c, active, start=start, next_gram=True)
-                c = jax.lax.psum(c, self.axes)
+                c = ordered_psum(c, self.axes)
                 return self.local.subtract_projection(v, p, c, active, start=start)
             spec = self.vector_sharding.spec
             return self._map(body, (spec, spec, P(), P()), spec)(v, p, active, start)
@@ -266,45 +452,51 @@ def _distribute(local, vector_sharding, *, native_collectives=False):
     if isinstance(local, LocalSubspacePlan):
         local = replace(local, local_shard=True)
         mesh = vector_sharding.mesh
+        leg = native_leg().key
         if native_collectives:
             if not (mesh.size == jax.process_count() and jax.local_device_count() == 1
                     and set(mesh.axis_names) == {'x', 'y'}):
                 raise ValueError('native orthogonalization collectives need one GPU per process on the complete X/Y mesh')
-            target = probe_target('lorrax_active_subspace_distributed_ortho', 'CUDA')
+            # Only a leg with a native communicator context builds this handler (CUDA:
+            # cuSolverMp's NCCL comm); elsewhere the opt-in refuses, it never degrades.
+            target = probe_target('lorrax_active_subspace_distributed_ortho', leg)
             if not target.ok:
-                raise RuntimeError(f'distributed orthogonalization provider unavailable: {target}')
+                raise RuntimeError('GATE subspace_native_collectives: distributed orthogonalization '
+                                   f'provider unavailable on the {leg} leg: {target}; '
+                                   'fix: native_collectives=False (JAX psum of the coefficients)')
             from distrib_la._cusolvermp import context_key
             context = context_key(mesh, col_major=False)
         else:
             for name in ('gram', 'subtract', 'subtract_gram'):
-                target = probe_target('lorrax_active_subspace_'+name, 'CUDA')
+                target = probe_target('lorrax_active_subspace_'+name, leg)
                 if not target.ok:
                     raise RuntimeError(f'orthogonalization provider unavailable: {target}')
     return DistributedSubspacePlan(local, vector_sharding, context)
 
 
-def _host_plan(capacity, n_eig, max_block_size):
-    """The host LAPACK plan, which a device with no native provider (ROCm) also takes, warned."""
-    vendor = device_vendor(jax.local_devices()[0])
-    if vendor != 'cpu':
-        import warnings
-        warnings.warn(f'distrib_la subspace: no native {vendor} provider; the host LAPACK '
-                      'pure_callback runs instead and copies every block to the host',
-                      RuntimeWarning, stacklevel=3)
-    return CpuSubspacePlan(capacity, n_eig, max_block_size)
+def _local_plan(route, capacity, n_eig, max_block_size):
+    if route == 'native':
+        return plan_local_subspace(capacity=capacity, n_eig=n_eig, max_block_size=max_block_size)
+    if route == 'xla':
+        return XlaSubspacePlan(capacity, n_eig, max_block_size)
+    if route == 'host':
+        return CpuSubspacePlan(capacity, n_eig, max_block_size)
+    raise ValueError(f'GATE subspace_route: unknown subspace route {route!r}')
 
 
 def plan_subspace(*, capacity, n_eig, vector_sharding=None, max_block_size=None,
                   native_collectives=False):
     """Resolve before tracing; ``vector_sharding`` includes the unsharded row axis.
 
-    CUDA uses runtime-sized native BLAS/LAPACK. CPU uses active host LAPACK.
-    Both accept count/start windows without changing the compiled array sizes.
-    Native collectives are an explicit opt-in because their context costs memory.
+    The provider is the leg's :data:`SUBSPACE_ROUTE`: CUDA and ROCm runtime-sized
+    native BLAS/LAPACK (cuBLAS/cuSOLVER, rocBLAS/rocSOLVER), a vendor with no leg
+    XLA device products, CPU active host LAPACK. All accept count/start windows
+    without changing the compiled array sizes. Native collectives are an explicit
+    opt-in because their context costs memory (native route; legs without the
+    handler refuse by GATE subspace_native_collectives).
     """
     _validate_plan_geometry(capacity, n_eig, vector_sharding, max_block_size)
-    local = (plan_local_subspace(capacity=capacity, n_eig=n_eig, max_block_size=max_block_size)
-             if device_vendor(jax.local_devices()[0]) == 'cuda' else _host_plan(capacity, n_eig, max_block_size))
+    local = _local_plan(subspace_route(), capacity, n_eig, max_block_size)
     return _distribute(local, vector_sharding, native_collectives=native_collectives)
 
 
@@ -320,13 +512,16 @@ def plan_orthogonalization(*, capacity, max_block_size, vector_sharding=None,
     if not isinstance(max_block_size, int) or max_block_size < 1:
         raise ValueError('max_block_size must be a positive Python integer')
     _validate_plan_geometry(capacity, 1, vector_sharding, max_block_size)
-    if device_vendor(jax.local_devices()[0]) == 'cuda':
-        result = probe_target('lorrax_active_subspace_ortho', 'CUDA')
+    route = subspace_route()
+    if route == 'native':
+        leg = native_leg()
+        result = probe_target('lorrax_active_subspace_ortho', leg.key)
         if not result.ok:
             raise RuntimeError(f'orthogonalization provider unavailable: {result}')
-        local = LocalSubspacePlan(capacity, 1, 0, max_block_size=max_block_size)
+        local = LocalSubspacePlan(capacity, 1, 0, max_block_size=max_block_size,
+                                  **native_fields(leg))
     else:
-        local = _host_plan(capacity, 1, max_block_size)
+        local = _local_plan(route, capacity, 1, max_block_size)
     implementation = _distribute(local, vector_sharding,
                                   native_collectives=native_collectives)
     def orthogonalize(basis, block, active, *, start=0):
@@ -343,11 +538,13 @@ def plan_orthogonalization(*, capacity, max_block_size, vector_sharding=None,
         k: v for k, v in implementation.workspace_specs.items()
         if k in ('gram', 'blas', 'orthogonalization_ranges')}
     if isinstance(implementation, DistributedSubspacePlan):
-        orthogonalize.backend = ('cuda_nccl'
+        orthogonalize.backend = (f'{local.vendor}_nccl'
             if implementation.orthogonalization_context is not None
-            else ('cuda_jax_collectives' if isinstance(local, LocalSubspacePlan)
+            else (f'{local.vendor}_jax_collectives' if isinstance(local, LocalSubspacePlan)
+                  else 'xla_jax_collectives' if isinstance(local, XlaSubspacePlan)
                   else 'jax_collectives'))
     else:
-        orthogonalize.backend = ('cuda' if isinstance(local, LocalSubspacePlan)
+        orthogonalize.backend = (local.vendor if isinstance(local, LocalSubspacePlan)
+                                 else 'xla' if isinstance(local, XlaSubspacePlan)
                                  else 'cpu_callback')
     return orthogonalize

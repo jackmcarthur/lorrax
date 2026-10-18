@@ -22,10 +22,11 @@ It owns four things every dial has to get right:
 THE PLATFORM KEY.  :func:`device_vendor` reads the vendor from the device
 client (``client.platform``, ``client.platform_version``, ``device_kind``),
 never from the string ``gpu``, which JAX reports for every GPU vendor.
-:func:`mesh_ffi_platform` maps the vendor to the FFI library key: ``"CUDA"``
-and ``"cpu"`` have LORRAX libraries; every other vendor (``"rocm"``, an
-unrecognised GPU) passes through, has no native target, and runs the XLA
-path (``docs/architecture/decisions.md#xla-reference``).
+:func:`mesh_ffi_platform` maps the vendor to its leg's FFI platform key
+(:data:`lxkit.legs.LEGS`: ``"cpu"``, ``"CUDA"``, ``"ROCM"``).  A vendor with
+no leg (an unrecognised GPU, a TPU) passes through unmapped, has no native
+target, and runs the XLA path (``docs/architecture/decisions.md#xla-reference``);
+a leg whose library is not built is refused by naming its ``.so``.
 
 ``import lxkit.gate`` is stdlib-only: every jax reference sits inside a
 function body.  Contract: ``docs/dev/ffi_gate_contract.md``.
@@ -38,6 +39,8 @@ import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Callable, Mapping, Optional
+
+from lxkit.legs import LEGS
 
 __all__ = [
     "Gate", "MODE_SPELLINGS", "MODE_HELP", "FFI_PLATFORM_MAP",
@@ -132,12 +135,11 @@ def reset_gate_state() -> None:
 _ROCM_WORDS = frozenset(("rocm", "hip", "amd", "instinct", "radeon"))
 _CUDA_WORDS = frozenset(("cuda", "nvidia"))
 
-#: Vendor -> FFI library key.  Only CUDA and cpu have LORRAX libraries; a
-#: vendor missing here passes through unmapped, so a refusal names what it saw.
-FFI_PLATFORM_MAP: Mapping[str, str] = MappingProxyType({
-    "cpu":  "cpu",
-    "cuda": "CUDA",
-})
+#: Vendor -> FFI platform key, one entry per leg of :data:`lxkit.legs.LEGS`.
+#: A vendor missing here has no leg and passes through unmapped, so a
+#: refusal names what it saw.
+FFI_PLATFORM_MAP: Mapping[str, str] = MappingProxyType(
+    {leg.vendor: leg.key for leg in LEGS.values()})
 
 
 def device_vendor(device) -> str:
@@ -167,8 +169,8 @@ def device_vendor(device) -> str:
 
 def mesh_ffi_platform(mesh, platform_map: Mapping[str, str] = FFI_PLATFORM_MAP
                       ) -> str:
-    """The FFI platform key of ``mesh``'s devices: ``"CUDA"``, ``"cpu"``, or the
-    unmapped vendor (``"rocm"``, ``"gpu"``, ``"tpu"``), which has no library."""
+    """The FFI platform key of ``mesh``'s devices (``"cpu"``, ``"CUDA"``,
+    ``"ROCM"``), or the unmapped vendor (``"gpu"``, ``"tpu"``), which has no leg."""
     vendor = device_vendor(mesh.devices.flat[0])
     return platform_map.get(vendor, vendor)
 
@@ -177,15 +179,17 @@ def platform_from_env(default: str = "CUDA") -> str:
     """The FFI platform key from ``JAX_PLATFORMS``, without touching the backend.
 
     For code that must decide before ``jax.distributed.initialize``.  The
-    first entry wins, as in JAX: ``cuda``/``gpu`` -> ``"CUDA"``, ``rocm`` ->
-    ``"rocm"``, anything else -> ``"cpu"``; unset -> ``default``.
+    first entry wins, as in JAX: a name in a device leg's ``jax_platforms``
+    (``cuda``/``gpu`` -> ``"CUDA"``, ``rocm`` -> ``"ROCM"``) gives that leg's
+    key, anything else ``"cpu"``; unset -> ``default``.
     """
     first = os.environ.get("JAX_PLATFORMS", "").split(",")[0].strip().lower()
     if not first:
         return default
-    if first in ("cuda", "gpu"):
-        return "CUDA"
-    return "rocm" if first == "rocm" else "cpu"
+    for leg in LEGS.values():
+        if leg.accelerator and first in leg.jax_platforms:
+            return leg.key
+    return "cpu"
 
 
 def dial_key(*gates: "Gate") -> tuple:

@@ -26,6 +26,7 @@ from typing import NamedTuple
 
 import numpy as np
 import jax
+from lxkit import ordered_psum
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -365,7 +366,8 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
             kg = sl(kvecs)[:, None, :] + sl(g3).astype(jnp.float64)     # (k, Gp, 3)
             ph = jnp.exp(2j * jnp.pi * jnp.einsum('kgd,md->kgm', kg, xmu))
             X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi), ph) / np.sqrt(N)
-            X = jax.lax.psum(X, _XY) * live[None, None, None, :]
+            # Rank-order sum (lxkit.ordered_psum): RCCL's order follows the GCD placement.
+            X = ordered_psum(X, _XY) * live[None, None, None, :]
             # 2. pair GEMM in G space on this rank's slice
             D_l, D_r = pair_projectors_lr(X, psi, w_l, w_r)            # (k, s, b, s, Gp)
             # 3. one all-to-all: G split -> μ owners, [L | R] owner-major

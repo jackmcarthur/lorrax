@@ -59,8 +59,15 @@ done
 
 [[ -f "$SO" ]] || { echo "[cloud build] FAILED: no $SO" >&2; exit 1; }
 
+# Dependency closure (lxkit.native_provider): this box is the runtime, so the
+# runtime search path is what the record pins; the loader enforces it.
+"$LORRAX_CLOUD_ENV/bin/python" "$SRC/stage/write_checkout_closure.py" "$SO" \
+    --python "$LORRAX_CLOUD_ENV/bin/python" --private-dir "$LORRAX_CLOUD_STAGE/lib" \
+    --library-dirs "$(lorrax_cloud_runtime_ld_library_path)" --skip-missing-dirs
+
 LORRAX_ROOT="$LORRAX_CLOUD_ROOT" \
     bash "$SRC/stage/stamp_provenance.sh" "$SO" \
+    closure_sha256="$("$LORRAX_CLOUD_ENV/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "$SO.closure.json")" \
     leg=cuda \
     cuda_root="$CU13" \
     jax="$LORRAX_CLOUD_JAX_VERSION" \

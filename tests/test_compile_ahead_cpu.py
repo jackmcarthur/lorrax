@@ -8,9 +8,33 @@ counter, the slot reservation and the in-flight dedupe are exercised.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
+
+
+@pytest.fixture(autouse=True)
+def _counted_compiles():
+    """Every compile counted here is a real XLA compile: no persistent-cache hit serves one.
+
+    An earlier test in the same process (the hsuite chain) arms JAX's persistent cache,
+    and entries a previous run wrote would then serve these programs uncompiled, so the
+    counts would read the cache's history (green on a cold cache, red on a warm one).
+    """
+    from jax._src import compilation_cache as _cc
+    from common.jax_compile_cache import _disarm_persistent_cache
+    old = jax.config.jax_compilation_cache_dir
+    _disarm_persistent_cache(jax)
+    yield
+    jax.config.update("jax_compilation_cache_dir", old)
+    _cc.reset_cache()
+
+
+def _mesh_2x2():
+    if len(jax.devices()) < 4:
+        pytest.skip("needs 4 host devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    return Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
 
 
 def _compiles():
@@ -21,7 +45,7 @@ def _compiles():
 def test_compile_ahead_is_the_live_program():
     from common import jax_compile_cache as jcc
     jcc.install_compile_agreement()
-    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    mesh = _mesh_2x2()
     face = NamedSharding(mesh, P("x", "y"))
     x = jax.device_put(np.arange(64, dtype=np.float64).reshape(8, 8) + 1.0, face)
 
@@ -151,7 +175,7 @@ def test_coulomb_root_operand_keys_like_the_live_v():
     from common import jax_compile_cache as jcc
     from gw import response_bank as rb
     jcc.install_compile_agreement()
-    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    mesh = _mesh_2x2()
     face = NamedSharding(mesh, P(None, "x", "y"))
     kernel = jax.jit(lambda v: (v @ v, jnp.trace(v, axis1=1, axis2=2)),
                      in_shardings=(face,), out_shardings=(face, NamedSharding(mesh, P())))
@@ -170,7 +194,7 @@ def test_stream_pass_carry_keys_like_the_live_carry():
     from common import jax_compile_cache as jcc
     from gw import response_bank as rb
     jcc.install_compile_agreement()
-    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    mesh = _mesh_2x2()
     group = NamedSharding(mesh, P(None, None, "x", "y"))
     kernel = jax.jit(lambda c, p: c * 2.0 + p, in_shardings=(group, None), out_shardings=group,
                      donate_argnums=(0,))

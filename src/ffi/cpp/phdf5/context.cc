@@ -11,6 +11,8 @@
 //   LORRAX_PHDF5_INDEPENDENT      (0)   force independent READS
 //   LORRAX_PHDF5_COLL_META        (0)   collective metadata ops
 //   LORRAX_PHDF5_ALIGN_MB         (4)   H5Pset_alignment threshold/length
+//   LORRAX_PHDF5_READ_STAGING_RETAIN_MB (256) process-wide budget for read
+//                                       staging kept above 32 MiB per file
 //   LORRAX_PHDF5_STRIPE_COUNT  (policy) Lustre striping_factor hint; unset =
 //                                       clamp(world_size, 4, 128)
 //   LORRAX_PHDF5_STRIPE_SIZE_FS(policy) Lustre striping_unit hint (lfs form;
@@ -31,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -38,8 +41,9 @@
 #include <unordered_set>
 #include <vector>
 
-#ifndef LORRAX_FFI_NO_CUDA
-#include <cuda_runtime.h>
+#include "../common/leg.h"
+#if LRX_LEG_DEVICE
+#include "gpu_runtime.h"
 #endif
 #include <mpi.h>
 #include <hdf5.h>
@@ -57,11 +61,11 @@ static void throw_if(hid_t id, const char* what) {
         throw std::runtime_error(os.str());
     }
 }
-#ifndef LORRAX_FFI_NO_CUDA
-static void throw_if_cuda(cudaError_t st, const char* what) {
-    if (st != cudaSuccess) {
+#if LRX_LEG_DEVICE
+static void throw_if_cuda(lrx::gpu::Error st, const char* what) {
+    if (st != lrx::gpu::kSuccess) {
         std::ostringstream os;
-        os << what << ": " << cudaGetErrorName(st) << " (" << cudaGetErrorString(st) << ")";
+        os << what << ": " << lrx::gpu::error_name(st) << " (" << lrx::gpu::error_string(st) << ")";
         throw std::runtime_error(os.str());
     }
 }
@@ -188,10 +192,10 @@ static long stripe_policy_unit(int world_size) {
 // Free one staging buffer through the allocator that made it.
 static void staging_free(void* p) {
     if (!p) return;
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
     std::free(p);
 #else
-    cudaFreeHost(p);
+    (void)lrx::gpu::free_host(p);
 #endif
 }
 
@@ -221,14 +225,14 @@ static bool ensure_staging(void** slot, std::atomic<size_t>* capacity,
     *slot = nullptr;
     capacity->store(0, std::memory_order_release);
     const size_t rounded = ((need_bytes + kChunk - 1) / kChunk) * kChunk;
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
     // 64-byte aligned so the H5Dread lands on a cache-line boundary
     // (rounded is a 2-MiB multiple, so it satisfies aligned_alloc's
     // size-multiple-of-alignment requirement).
     *slot = std::aligned_alloc(64, rounded);
     if (*slot == nullptr) return false;
 #else
-    if (cudaMallocHost(slot, rounded) != cudaSuccess) {
+    if (lrx::gpu::malloc_host(slot, rounded) != lrx::gpu::kSuccess) {
         *slot = nullptr;
         return false;
     }
@@ -239,7 +243,7 @@ static bool ensure_staging(void** slot, std::atomic<size_t>* capacity,
 
 // WRITER-THREAD staging (ctx.h OWNERSHIP).
 bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes) {
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
     // Host build: ``pinned_buf`` has exactly one producer, the writer thread
     // (H5Dwrite reads the XLA input buffer in place, so the write path never
     // stages).  Enforce it rather than assert it in a comment: the buffer's
@@ -268,15 +272,42 @@ bool ensure_pinned(PhdfCtx* ctx, size_t need_bytes) {
                           need_bytes, "ensure_pinned");
 }
 
+// Synchronous-read staging above this is retained only under the process
+// budget below (settle_read_buf); within it, per file, always.
+static constexpr size_t kMaxRetainedReadStaging = size_t{32} << 20;
+static std::atomic<size_t> g_read_reserved{0};
+
+static size_t read_retain_budget() {
+    static const size_t budget = [] {
+        // Clamp before the shift, as ALIGN_MB: <= 0 retains nothing above
+        // the per-file bound (the old behaviour); 64 GiB caps a typo.
+        long mb = env_long("LORRAX_PHDF5_READ_STAGING_RETAIN_MB", 256);
+        if (mb < 0) mb = 0;
+        if (mb > (64L << 10)) mb = 64L << 10;
+        return static_cast<size_t>(mb) << 20;
+    }();
+    return budget;
+}
+
+static void release_read_reservation(PhdfCtx* ctx) {
+    if (ctx->read_reserved) {
+        g_read_reserved.fetch_sub(ctx->read_reserved, std::memory_order_acq_rel);
+        ctx->read_reserved = 0;
+    }
+}
+
 // SYNCHRONOUS-READER staging (ctx.h OWNERSHIP).
 bool ensure_read_buf(PhdfCtx* ctx, size_t need_bytes) {
-#ifndef LORRAX_FFI_NO_CUDA
+#if LRX_LEG_DEVICE
     // Reusing or growing a cached buffer before the previous async H2D
     // finishes would overwrite/free its source. This wait belongs at the
     // actual reuse boundary. Oversize buffers are retired instead.
     if (ctx->read_buf &&
-        cudaEventSynchronize(ctx->h2d_event) != cudaSuccess) return false;
+        lrx::gpu::event_synchronize(ctx->h2d_event) != lrx::gpu::kSuccess) return false;
 #endif
+    // Growth frees the buffer the reservation was taken for.
+    if (ctx->read_capacity.load(std::memory_order_acquire) < need_bytes)
+        release_read_reservation(ctx);
     return ensure_staging(&ctx->read_buf, &ctx->read_capacity,
                           need_bytes, "ensure_read_buf");
 }
@@ -286,11 +317,12 @@ static std::atomic<size_t> retired_read_bytes{0};
 void retire_read_buf(PhdfCtx* ctx) {
     void* retired = ctx->read_buf;
     if (!retired) return;
+    release_read_reservation(ctx);
     const size_t capacity =
         ctx->read_capacity.load(std::memory_order_acquire);
     ctx->read_buf = nullptr;
     ctx->read_capacity.store(0, std::memory_order_release);
-#ifdef LORRAX_FFI_NO_CUDA
+#if !LRX_LEG_DEVICE
     staging_free(retired);
 #else
     retired_read_bytes.fetch_add(capacity, std::memory_order_acq_rel);
@@ -300,11 +332,11 @@ void retire_read_buf(PhdfCtx* ctx) {
             // The stream is FIFO: this includes the H2D queued before the
             // buffer was detached. It runs on the already device-bound
             // worker, outside the XLA handler's critical path.
-            const cudaError_t st = cudaStreamSynchronize(ctx->stream);
-            if (st != cudaSuccess) {
+            const lrx::gpu::Error st = lrx::gpu::stream_synchronize(ctx->stream);
+            if (st != lrx::gpu::kSuccess) {
                 std::fprintf(stderr,
                     "[phdf5 ERROR rank=%d] retired read H2D failed: %s\n",
-                    ctx->rank, cudaGetErrorString(st));
+                    ctx->rank, lrx::gpu::error_string(st));
                 std::fflush(stderr);
                 return;  // Keep the host allocation if DMA safety is unknown.
             }
@@ -314,6 +346,22 @@ void retire_read_buf(PhdfCtx* ctx) {
     }
     ctx->queue_cv.notify_one();
 #endif
+}
+
+void settle_read_buf(PhdfCtx* ctx) {
+    const size_t cap = ctx->read_capacity.load(std::memory_order_acquire);
+    if (cap <= kMaxRetainedReadStaging || ctx->read_reserved == cap) return;
+    release_read_reservation(ctx);
+    const size_t budget = read_retain_budget();
+    size_t cur = g_read_reserved.load(std::memory_order_acquire);
+    while (cur + cap <= budget) {
+        if (g_read_reserved.compare_exchange_weak(cur, cur + cap,
+                                                  std::memory_order_acq_rel)) {
+            ctx->read_reserved = cap;
+            return;
+        }
+    }
+    retire_read_buf(ctx);
 }
 
 // -----------------------------------------------------------------
@@ -416,10 +464,11 @@ static void abandon_partial_ctx(PhdfCtx* ctx, MPI_Info* info) noexcept {
     if (ctx->dcpl_id    >= 0) H5Pclose(ctx->dcpl_id);
     if (ctx->fapl_id    >= 0) H5Pclose(ctx->fapl_id);
     if (ctx->fcpl_id    >= 0) H5Pclose(ctx->fcpl_id);
-#ifndef LORRAX_FFI_NO_CUDA
-    if (ctx->d2h_event) cudaEventDestroy(ctx->d2h_event);
-    if (ctx->h2d_event) cudaEventDestroy(ctx->h2d_event);
-    if (ctx->stream)    cudaStreamDestroy(ctx->stream);
+#if LRX_LEG_DEVICE
+    if (ctx->d2h_event) (void)lrx::gpu::event_destroy(ctx->d2h_event);
+    if (ctx->h2d_event) (void)lrx::gpu::event_destroy(ctx->h2d_event);
+    if (ctx->order_event) (void)lrx::gpu::event_destroy(ctx->order_event);
+    if (ctx->stream)    (void)lrx::gpu::stream_destroy(ctx->stream);
 #endif
     delete ctx;
 }
@@ -798,22 +847,24 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     throw_if(ctx->dxpl_indep, "H5Pcreate(DATASET_XFER indep)");
     H5Pset_dxpl_mpio(ctx->dxpl_indep, H5FD_MPIO_INDEPENDENT);
 
-#ifndef LORRAX_FFI_NO_CUDA
+#if LRX_LEG_DEVICE
     // --- private CUDA stream for D2H staging ---
     // Record the current device so the writer_thread can bind to the
     // same one; GPU pointers allocated under the main thread's JAX
     // context aren't recognised on a different device and
     // cudaMemcpyAsync returns cudaErrorMemoryAllocation.
-    throw_if_cuda(cudaGetDevice(&ctx->cuda_device),
-                  "cudaGetDevice(phdf5 ctx)");
-    throw_if_cuda(cudaStreamCreateWithFlags(&ctx->stream, cudaStreamNonBlocking),
-                  "cudaStreamCreate(phdf5 ctx)");
+    throw_if_cuda(lrx::gpu::get_device(&ctx->cuda_device),
+                  LRX_GPU_API "GetDevice(phdf5 ctx)");
+    throw_if_cuda(lrx::gpu::stream_create_with_flags(&ctx->stream, lrx::gpu::kStreamNonBlocking),
+                  LRX_GPU_API "StreamCreate(phdf5 ctx)");
 
     // --- reusable D2H/H2D completion events (see ctx.h) ---
-    throw_if_cuda(cudaEventCreateWithFlags(&ctx->d2h_event, cudaEventDisableTiming),
-                  "cudaEventCreate(phdf5 d2h_event)");
-    throw_if_cuda(cudaEventCreateWithFlags(&ctx->h2d_event, cudaEventDisableTiming),
-                  "cudaEventCreate(phdf5 h2d_event)");
+    throw_if_cuda(lrx::gpu::event_create_with_flags(&ctx->d2h_event, lrx::gpu::kEventDisableTiming),
+                  LRX_GPU_API "EventCreate(phdf5 d2h_event)");
+    throw_if_cuda(lrx::gpu::event_create_with_flags(&ctx->h2d_event, lrx::gpu::kEventDisableTiming),
+                  LRX_GPU_API "EventCreate(phdf5 h2d_event)");
+    throw_if_cuda(lrx::gpu::event_create_with_flags(&ctx->order_event, lrx::gpu::kEventDisableTiming),
+                  LRX_GPU_API "EventCreate(phdf5 order_event)");
 #endif
 
     // --- start dedicated writer thread (FIFO task queue) ---
@@ -827,8 +878,8 @@ static PhdfCtx* open_ctx_impl(const std::string& path, int p, int q,
     // On the host build there is no device to bind and the staging tail
     // is a plain memcpy.
     ctx->writer_thread = std::thread([ctx]() {
-#ifndef LORRAX_FFI_NO_CUDA
-        cudaSetDevice(ctx->cuda_device);
+#if LRX_LEG_DEVICE
+        (void)lrx::gpu::set_device(ctx->cuda_device);
 #endif
         // Publish this thread's identity BEFORE any task can run; it is what
         // ``ensure_pinned`` checks on the host build (ctx.h OWNERSHIP).  A
@@ -1309,13 +1360,15 @@ void close_ctx(PhdfCtx* ctx, int64_t* timing_out) {
     staging_free(ctx->pinned_buf);
     ctx->pinned_buf = nullptr;
     ctx->pinned_capacity.store(0, std::memory_order_release);
+    release_read_reservation(ctx);
     staging_free(ctx->read_buf);
     ctx->read_buf = nullptr;
     ctx->read_capacity.store(0, std::memory_order_release);
-#ifndef LORRAX_FFI_NO_CUDA
-    if (ctx->d2h_event) cudaEventDestroy(ctx->d2h_event);
-    if (ctx->h2d_event) cudaEventDestroy(ctx->h2d_event);
-    if (ctx->stream)    cudaStreamDestroy(ctx->stream);
+#if LRX_LEG_DEVICE
+    if (ctx->d2h_event) (void)lrx::gpu::event_destroy(ctx->d2h_event);
+    if (ctx->h2d_event) (void)lrx::gpu::event_destroy(ctx->h2d_event);
+    if (ctx->order_event) (void)lrx::gpu::event_destroy(ctx->order_event);
+    if (ctx->stream)    (void)lrx::gpu::stream_destroy(ctx->stream);
 #endif
 
     if (ctx->owns_comm && ctx->comm != MPI_COMM_NULL) {
@@ -1328,6 +1381,50 @@ void close_ctx(PhdfCtx* ctx, int64_t* timing_out) {
     // registered inside ensure_mpi_initialized in HDF5/MPI runtimes).
 
     delete ctx;
+}
+
+// ─── Posted control registry (ctx.h POSTED CONTROL) ────────────────────
+namespace {
+std::mutex g_control_mu;
+std::map<std::pair<uint64_t, int64_t>, std::vector<int64_t>> g_controls;
+}  // namespace
+
+int post_control(uint64_t addr, int64_t kind, const int64_t* v, int64_t n) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    auto key = std::make_pair(addr, kind);
+    if (g_controls.count(key)) return 1;
+    g_controls.emplace(key, std::vector<int64_t>(v, v + (n > 0 ? n : 0)));
+    return 0;
+}
+
+bool retract_control(uint64_t addr, int64_t kind) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    return g_controls.erase(std::make_pair(addr, kind)) > 0;
+}
+
+bool take_control(uint64_t addr, int64_t kind, std::vector<int64_t>* out,
+                  std::string* err) {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    auto it = g_controls.find(std::make_pair(addr, kind));
+    if (it == g_controls.end()) {
+        std::ostringstream os;
+        os << "GATE phdf5_posted_control: got: no control posted for kind " << kind
+           << " at buffer 0x" << std::hex << addr << std::dec << " (" << g_controls.size()
+           << " pending); want: SlabIO's post for this call's own buffer; why: the "
+           << "handler takes its descriptors by the address of the buffer it was "
+           << "handed, so a copy XLA inserted (alias not honoured) or a call SlabIO "
+           << "did not post refuses here instead of reading another call's offsets";
+        *err = os.str();
+        return false;
+    }
+    *out = std::move(it->second);
+    g_controls.erase(it);
+    return true;
+}
+
+size_t pending_controls() {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    return g_controls.size();
 }
 
 }  // namespace lorrax_ffi::phdf5

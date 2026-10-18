@@ -134,6 +134,7 @@ class _CacheState:
         self.receipt_mark = (0, 0.0, 0, {})   # compile_receipt's last window edge
         self.read_secs = 0.0   # time spent loading executables from disk
         self.namespace = ""    # default-policy namespace ("" when explicit/off)
+        self.vendor_caches: list = []   # runtime_kernel_caches variables this process set
         self.compile_agreement_configured = False
         self.compile_agreement_enabled = False
         self.compile_agreement_reason = "not installed"
@@ -826,6 +827,7 @@ def _install_compile_counter() -> None:
     _orig = getattr(_compiler, _COMPILE_ENTRY_POINT)
     _orig_request = getattr(_compiler, _COMPILE_REQUEST_POINT)
 
+    @functools.wraps(_orig_request)
     def _requested(*args, **kwargs):
         s = _STATE
         if not (s.compile_agreement_enabled or s._pool is not None):
@@ -888,6 +890,7 @@ def _install_compile_counter() -> None:
                  f"({seconds:.1f} s); JAX's persistent cache never stores it, so it "
                  f"compiles again in every process")
 
+    @functools.wraps(_orig)
     def _counting(*args, **kwargs):
         current = getattr(_STATE._compile_local, "current", None)
         if _STATE.compile_agreement_enabled and current is not None:
@@ -1061,6 +1064,7 @@ def compile_cache_stats() -> dict:
         "write_scope": "process-local; JAX writes on process 0 only",
         "keys": sorted(s.probe_keys),
         "demotions": dict(s.demotions),
+        "vendor_caches": {k: os.environ.get(k) for k in s.vendor_caches},
     }
 
 
@@ -1082,9 +1086,11 @@ _NS_PRUNE_EVERY_S = 6 * 3600
 _NS_STAMP = ".last_used"
 _NS_PRUNE_STAMP = ".last_prune"
 #: Bump when an entry's meaning changes without jax, jaxlib or the FFI bundle
-#: changing (a LORRAX patch to how JAX keys or stores an entry). There is none
-#: today: JAX's own key and writer are used unchanged, so ``k1`` stays.
-_KEY_SCHEMA = "k1"
+#: changing (a LORRAX patch to how JAX keys or stores an entry).  ``k2``: the
+#: FFI component became the enforced native closure identity (every library the
+#: legs map, not the leg file alone); every ``k1`` namespace is retired by the
+#: age pruner.
+_KEY_SCHEMA = "k2"
 
 
 def default_cache_root() -> Path:
@@ -1097,48 +1103,50 @@ def default_cache_root() -> Path:
     return user_cache_dir("jax_compile")
 
 
-def _library_identity(path) -> str:
-    """A native library's sealed bundle id, or its own SHA-256 when unsealed."""
-    p = Path(path).resolve()
-    for manifest in (p.parent / "lorrax_ffi_bundle.json",
-                     p.parent.parent / "lorrax_ffi_bundle.json"):
-        if manifest.is_file():
-            bundle = json.loads(manifest.read_text(encoding="utf-8"))
-            return "bundle-" + str(bundle["bundle_id"])[:12]
-    h = hashlib.sha256()
-    with open(p, "rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
-            h.update(block)
-    return "so-" + h.hexdigest()[:12]
-
-
 def _ffi_identity() -> str:
-    """The FFI libraries this process loaded, or would load first."""
+    """``ffi-<12 hex>``: the native closure identity of the FFI legs this process
+    opened (:func:`lxkit.native_provider.native_closure_identity`, computed when
+    their dependency closure was enforced), or would open first (the identity
+    each candidate's build record promises).  Every library a leg maps -- MPI,
+    HDF5, LibSci, the GPU math/collective libraries, the engine-private
+    providers -- is in it, so a different library set is a different namespace
+    and can never reuse an entry.  ``noffi`` where no leg exists."""
     try:
         from ffi.common import ffi_loader
     except Exception:                                      # noqa: BLE001
         return "noffi"
-    ids = set()
-    for platform in ("CUDA", "cpu"):
-        path = ffi_loader.loaded_lib_path(platform)
-        if path is None:
-            path = next((c for c in ffi_loader._candidate_paths(platform)
-                         if c.is_file()), None)
-        if path is not None:
-            try:
-                ids.add(_library_identity(path))
-            except (OSError, ValueError, KeyError):
-                ids.add("unreadable")
-    return "+".join(sorted(ids)) or "noffi"
+    from lxkit import LEGS
+    from lxkit import native_provider as _np
+    ids = []
+    for platform in sorted(LEGS):
+        cands = [Path(p) for p in ([ffi_loader.loaded_lib_path(platform)]
+                                   if ffi_loader.loaded_lib_path(platform) else [])]
+        cands += [c for c in ffi_loader._candidate_paths(platform) if c.is_file()]
+        try:
+            ids.append(f"{platform}:{_np.native_closure_identity_or_expected(platform, cands)}")
+        except _np.ClosureNotEnforced:
+            continue                                       # no such leg here
+        except OSError as exc:                             # a leg that cannot load
+            ids.append(f"{platform}:unrecorded:{type(exc).__name__}")
+    if not ids:
+        return "noffi"
+    return "ffi-" + hashlib.sha256("|".join(ids).encode()).hexdigest()[:12]
+
+
+def native_cache_tag() -> str:
+    """The native closure component of any persistent cache's key (the same
+    value the compile-cache namespace carries): see :func:`_ffi_identity`."""
+    return _ffi_identity()
 
 
 def cache_namespace() -> str:
     """``jax<v>-jaxlib<v>_<ffi>_<schema>``: what JAX's own key cannot see.
 
     JAX keys an entry on the module, the compile options, the jaxlib version
-    and the backend.  It does not see the native bundle behind a custom-call
+    and the backend.  It does not see the native libraries behind a custom-call
     name (a handler's traits, e.g. command-buffer compatibility, are read at
-    compile time).  The LORRAX source is deliberately absent: a commit reaches
+    compile time), so the namespace carries the enforced native closure
+    identity (:func:`_ffi_identity`).  The LORRAX source is deliberately absent: a commit reaches
     a compiled program only through its HLO, which the key already hashes.
     """
     import jax
@@ -1255,15 +1263,20 @@ def _start_namespace_prune(root: Path, current: str) -> None:
 def _resolve_cache_base_dir() -> tuple[str, str]:
     """Resolve the one persistent-cache owner: ``(base, source)``.
 
-    A nonempty ``ISDF_JAX_CACHE_DIR`` is used as-is (``"explicit"``); an
-    empty or whitespace one is the explicit opt-out.  Unset, the runtime
+    A nonempty ``ISDF_JAX_CACHE_DIR`` is the base (``"explicit"``), split by
+    the native closure identity (``<dir>/ffi-<12 hex>``); an empty or
+    whitespace one is the explicit opt-out.  Unset, the runtime
     default is :func:`default_cache_dir` (``"runtime default"``).  No other
     variable (``LORRAX_RUN_DIR``, ``XDG_CACHE_HOME``, JAX's own
     ``JAX_COMPILATION_CACHE_DIR``) selects a location.
     """
     explicit = os.environ.get("ISDF_JAX_CACHE_DIR")
     if explicit is not None:
-        return explicit.strip(), "explicit"
+        if not explicit.strip():
+            return "", "explicit"
+        # An explicit base is still split by the native closure, so two library
+        # sets pointed at one directory never share an entry.
+        return str(Path(explicit.strip()).expanduser() / _ffi_identity()), "explicit"
     return str(default_cache_dir()), "runtime default"
 
 
@@ -1285,6 +1298,46 @@ def _disarm_persistent_cache(_jax) -> None:
 
 
 # ---------------------------------------------------------------------------
+
+
+def _arm_runtime_kernel_caches(cache_base: Path, proc_idx: int) -> list:
+    """Point the leg's run-time kernel caches beside the compile cache; return what was set.
+
+    Some vendor libraries compile device kernels at run time and keep them
+    across processes only where a variable points
+    (``PlatformLeg.runtime_kernel_caches``; on ROCM AMD comgr's code objects).
+    Content-keyed kernel stores that outlive this namespace (rocFFT's) are
+    ``runtime_kernel_stores``, armed by :mod:`runtime.vendor_kernels`.  A ``"process-file"`` cache is
+    one file per process index under ``<cache>/np<P>/vendor/`` (several
+    writers on one rocFFT SQLite file on Lustre spin without progress, hsuite
+    P4, Frontier); a ``"shared-dir"`` one is a directory there.  A variable
+    the caller exported wins.  Runs before the first FFT, which is when
+    rocFFT reads its variable.  Never raises: a cache that cannot be placed
+    is named once and the library compiles again, as without it.
+    """
+    try:
+        import jax as _jax
+        from lxkit import device_vendor, leg_for_vendor
+        leg = leg_for_vendor(device_vendor(_jax.local_devices()[0]))
+    except Exception:                                      # noqa: BLE001
+        return []
+    armed = []
+    for env, name, scope in (leg.runtime_kernel_caches if leg is not None else ()):
+        if os.environ.get(env):
+            continue
+        base = cache_base / "vendor"
+        path = base / (f"{name}.p{proc_idx}.db" if scope == "process-file" else name)
+        try:
+            (path if scope != "process-file" else base).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            if proc_idx == 0:
+                _say(f"{env} not set: cannot create {path} ({exc}); {leg.key} "
+                     f"run-time kernels compile again in every process.")
+            continue
+        os.environ[env] = str(path)
+        armed.append(env)
+    _STATE.vendor_caches = armed
+    return armed
 
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1432,8 @@ def ensure_jax_compile_cache() -> None:
     if n_proc > 1:
         _install_rank_invariant_cpu_key()
     _STATE.enabled = True
+    # The vendor kernels do not depend on P: one store per namespace, beside np<P>.
+    _arm_runtime_kernel_caches(Path(cache_dir).expanduser(), proc_idx)
     if cache_source != "explicit":
         _STATE.namespace = Path(cache_dir).name
         if proc_idx == 0:

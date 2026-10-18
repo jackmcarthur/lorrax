@@ -12,6 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import jax
+from lxkit import ordered_psum
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec as P
@@ -268,7 +269,7 @@ def _finite_q_head_kernel(mesh: Mesh, nb_logical: int) -> Callable:
             weight = jnp.where(static, static_weight, dynamic_weight)
             local = prefactor * jnp.sum(
                 jnp.where(logical[None, :, :], strength * weight, 0.0))
-            return jax.lax.psum(local, (ax_x, ax_y))
+            return ordered_psum(local, (ax_x, ax_y))
 
         return jax.vmap(_one)(z_samples)
 

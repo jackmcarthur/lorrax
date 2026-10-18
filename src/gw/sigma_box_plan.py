@@ -35,7 +35,6 @@ from ffi import _services
 
 _services.ensure_on_path()
 
-import jax.numpy as jnp
 import numpy as np
 
 from common import timing
@@ -1338,9 +1337,12 @@ def sigma_box_executor_nodes(
                   * np.exp(-eta * time_exec))
     if one_sided_hermitian:
         alpha_exec = 1.0j * alpha_exec
+    # Host plan data: the Σ executor stacks every window's nodes into one
+    # device table per Σ call (gw.ppm_accumulators.WindowTable); placing each
+    # window's nodes here would be a transfer per window and a read back.
     return MinimaxNodes(
-        t=jnp.asarray(time_exec, dtype=jnp.complex128),
-        alpha=jnp.asarray(alpha_exec, dtype=jnp.complex128))
+        t=np.ascontiguousarray(time_exec, dtype=np.complex128),
+        alpha=np.ascontiguousarray(alpha_exec, dtype=np.complex128))
 
 
 def _coarse_runs(base_name, owned, positions, frequencies, omega_eta, omega_grp, fixed,

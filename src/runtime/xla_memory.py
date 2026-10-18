@@ -96,7 +96,108 @@ def cuda_device_total_bytes(ordinal: int = 0) -> int | None:
         return None
 
 
+def _kfd_device_total_bytes(ordinal: int = 0) -> int | None:
+    """The ``ordinal``-th visible GPU's local memory from the KFD topology
+    (``/sys/class/kfd/kfd/topology/nodes/<n>/mem_banks/0/properties``
+    ``size_in_bytes``), before any HIP runtime exists.  GPU nodes are the
+    topology nodes with ``simd_count > 0``, in node order, which is the ROCr
+    device order; ``ROCR_VISIBLE_DEVICES`` (indices) selects among them.
+    None where the topology is absent or the variable names UUIDs."""
+    try:
+        import glob
+        nodes = []
+        for d in sorted(glob.glob("/sys/class/kfd/kfd/topology/nodes/*"),
+                        key=lambda p: int(os.path.basename(p))):
+            with open(os.path.join(d, "properties"), encoding="utf-8") as fh:
+                props = dict(line.split()[:2] for line in fh if len(line.split()) >= 2)
+            if int(props.get("simd_count", 0)) > 0:
+                nodes.append(d)
+        visible = os.environ.get("ROCR_VISIBLE_DEVICES", "").strip()
+        if visible:
+            idx = [int(v) for v in visible.split(",")]
+            nodes = [nodes[i] for i in idx]
+        bank = os.path.join(nodes[int(ordinal)], "mem_banks", "0", "properties")
+        with open(bank, encoding="utf-8") as fh:
+            props = dict(line.split()[:2] for line in fh if len(line.split()) >= 2)
+        return int(props["size_in_bytes"]) or None
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def hip_device_total_bytes(ordinal: int = 0) -> int | None:
+    """The device's total memory from the HIP runtime the ROCm PJRT plugin
+    already mapped (``hipDeviceTotalMem``).  Where no ``libamdhip64`` is
+    mapped into this process yet (before the ROCm client exists, when the
+    pool policy sizes the arena) it reads the KFD topology instead
+    (:func:`_kfd_device_total_bytes`, 68.70 GB per MI250X GCD, equal to
+    ``hipDeviceTotalMem``): this never dlopens a HIP runtime, because a second
+    one beside the plugin's own (a module ROCm on ``LD_LIBRARY_PATH`` against
+    the wheel's) is two runtimes in one process."""
+    try:
+        import ctypes
+        with open("/proc/self/maps", encoding="utf-8", errors="replace") as fh:
+            paths = sorted({line.split()[-1] for line in fh
+                            if "libamdhip64" in line and "/" in line})
+        if not paths:
+            return _kfd_device_total_bytes(ordinal)
+        hip = ctypes.CDLL(paths[0], mode=os.RTLD_NOLOAD | os.RTLD_GLOBAL)
+        total = ctypes.c_size_t()
+        if hip.hipDeviceTotalMem(ctypes.byref(total), ctypes.c_int(int(ordinal))):
+            return None
+        return int(total.value) or None
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+#: ``PlatformLeg.device_memory_api`` -> its reader.  The leg declares which
+#: API answers; this module owns how.
+_DEVICE_TOTAL_READERS = {
+    "cuda_driver": cuda_device_total_bytes,
+    "hip_runtime": hip_device_total_bytes,
+}
+
+
+def _process_gpu_leg():
+    """The device leg of this process's devices when the backend is up (the
+    client's vendor), else the leg the environment selects (pre-backend)."""
+    import sys
+    from lxkit import device_vendor, leg_for_vendor, process_accelerator_leg
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    if bridge and getattr(bridge, "_backends", None):
+        import jax
+        local = jax.local_devices()
+        return leg_for_vendor(device_vendor(local[0])) if local else None
+    return process_accelerator_leg()
+
+
+def device_total_bytes(ordinal: int = 0) -> int | None:
+    """The card's total memory through this process's leg's
+    ``device_memory_api`` (:data:`lxkit.LEGS`); None on CPU, on a leg that
+    declares no reader, or where the reader cannot answer (it says why in its
+    own docstring).  The one entry point every budget and gate uses."""
+    try:
+        leg = _process_gpu_leg()
+    except Exception:                                         # noqa: BLE001
+        return None
+    reader = _DEVICE_TOTAL_READERS.get(getattr(leg, "device_memory_api", "") or "")
+    return reader(ordinal) if reader is not None else None
+
+
 def outside_pool_bytes(ordinal: int = 0) -> int | None:
+    """Device bytes this process holds outside the XLA pool, through this
+    process's leg's ``outside_pool_api`` (:data:`lxkit.LEGS`): the default
+    mempool on CUDA (:func:`_cuda_outside_pool_bytes`), the BFC arena on ROCm
+    (:func:`_hip_outside_arena_bytes`).  None on CPU, on a leg that declares
+    no reader, or where the reader cannot answer."""
+    try:
+        leg = _process_gpu_leg()
+    except Exception:                                         # noqa: BLE001
+        return None
+    reader = _OUTSIDE_POOL_READERS.get(getattr(leg, "outside_pool_api", "") or "")
+    return reader(ordinal) if reader is not None else None
+
+
+def _cuda_outside_pool_bytes(ordinal: int = 0) -> int | None:
     """Device bytes this process holds outside the default mempool:
     ``total - free - reserved`` (the CUDA context and modules, NCCL and
     library communicators, cuFFT plans, raw ``cudaMalloc`` workspaces).
@@ -143,6 +244,130 @@ def outside_pool_bytes(ordinal: int = 0) -> int | None:
     thread.start()
     thread.join()
     return out[0] if out else None
+
+
+def _mapped_hip_runtime():
+    """The HIP runtime the ROCm PJRT plugin mapped (never a second one), or None."""
+    import ctypes
+    with open("/proc/self/maps", encoding="utf-8", errors="replace") as fh:
+        paths = sorted({line.split()[-1] for line in fh
+                        if "libamdhip64" in line and "/" in line})
+    if not paths:
+        return None
+    return ctypes.CDLL(paths[0], mode=os.RTLD_NOLOAD | os.RTLD_GLOBAL)
+
+
+def _hip_mem_info(ordinal: int) -> tuple[int, int] | None:
+    """``(free, total)`` of device ``ordinal`` from ``hipMemGetInfo``, read on a
+    short thread so the caller's current device is untouched.  Whole-device
+    figures (every process on the GCD), like ``nvidia-smi``'s."""
+    import ctypes
+    import threading
+    out: list = []
+
+    def read():
+        try:
+            hip = _mapped_hip_runtime()
+            if hip is None:
+                return
+            free, total = ctypes.c_size_t(), ctypes.c_size_t()
+            if not (hip.hipSetDevice(ctypes.c_int(int(ordinal)))
+                    or hip.hipMemGetInfo(ctypes.byref(free), ctypes.byref(total))):
+                out.append((int(free.value), int(total.value)))
+        except Exception:                                     # noqa: BLE001
+            return
+
+    thread = threading.Thread(target=read, name="lorrax-hip-meminfo")
+    thread.start()
+    thread.join()
+    return out[0] if out else None
+
+
+def _local_device_with_hardware_id(ordinal: int):
+    import jax
+    return next((d for d in jax.local_devices()
+                 if int(getattr(d, "local_hardware_id", 0) or 0) == int(ordinal)), None)
+
+
+def _hip_outside_arena_bytes(ordinal: int = 0) -> int | None:
+    """Device bytes outside the XLA arena on ROCm: ``total - free - pool``,
+    with ``pool`` the BFC arena's ``pool_bytes`` (the bytes it holds from the
+    device, preallocated or grown), read before and after the free-memory
+    read, the larger one used (as on CUDA).  Covers the HIP context and code
+    objects, RCCL communicators, rocBLAS/hipBLASLt handles and any raw
+    ``hipMalloc``.  None where the client keeps no arena accounting (the
+    ``platform`` allocator) or no HIP runtime is mapped."""
+    try:
+        device = _local_device_with_hardware_id(ordinal)
+        if device is None:
+            return None
+        before = (device.memory_stats() or {}).get("pool_bytes")
+        info = _hip_mem_info(ordinal)
+        after = (device.memory_stats() or {}).get("pool_bytes")
+        if info is None or before is None or after is None:
+            return None
+        free, total = info
+        return total - free - max(int(before), int(after))
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+#: ``PlatformLeg.outside_pool_api`` -> its reader.
+_OUTSIDE_POOL_READERS = {
+    "cuda_driver_mempool": _cuda_outside_pool_bytes,
+    "hip_runtime_arena": _hip_outside_arena_bytes,
+}
+
+
+def _nvidia_smi_used_bytes(ordinal: int = 0) -> int | None:
+    """``nvidia-smi --query-gpu=memory.used`` of this rank's GPU (the first
+    ``CUDA_VISIBLE_DEVICES`` entry, else GPU 0), in bytes (nvidia-smi's MB
+    are MiB).  ``ordinal`` is unused: nvidia-smi numbers GPUs physically."""
+    import subprocess
+    try:
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        gpu_idx = cvd.split(",")[0].strip() if cvd else "0"
+        out = subprocess.run(
+            ["nvidia-smi", f"--id={gpu_idx}",
+             "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return int(out.stdout.strip().split("\n")[0]) * 2**20
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def _hip_used_bytes(ordinal: int = 0) -> int | None:
+    """``total - free`` of device ``ordinal`` from ``hipMemGetInfo`` (whole
+    device, like nvidia-smi's ``memory.used``).  In process: ``amd-smi``
+    takes 1.0 s a sample and ``rocm-smi`` 0.45 s (MI250X), and both number all
+    eight GCDs rather than the one ``ROCR_VISIBLE_DEVICES`` leaves visible."""
+    info = _hip_mem_info(ordinal)
+    return None if info is None else info[1] - info[0]
+
+
+#: ``PlatformLeg.memory_telemetry`` -> (sampler, short label for probe lines).
+_TELEMETRY = {
+    "nvidia-smi": (_nvidia_smi_used_bytes, "nvsmi"),
+    "hip_runtime": (_hip_used_bytes, "hipmem"),
+}
+
+
+def device_used_sample(ordinal: int = 0) -> tuple[str, int | None]:
+    """``(label, bytes)``: whole-device used memory through this process's
+    leg's ``memory_telemetry`` (:data:`lxkit.LEGS`), the true-HBM figure that
+    includes everything outside the XLA arena.  ``("none", None)`` on CPU or
+    a leg that declares no sampler; bytes None where the sampler failed.
+    Never raises."""
+    try:
+        leg = _process_gpu_leg()
+    except Exception:                                         # noqa: BLE001
+        return "none", None
+    entry = _TELEMETRY.get(getattr(leg, "memory_telemetry", "") or "")
+    if entry is None:
+        return "none", None
+    sampler, label = entry
+    return label, sampler(ordinal)
 
 
 #: allocator -> whether the PJRT client keeps arena accounting, i.e.
@@ -367,7 +592,17 @@ def _find_pool():
     import jax
     from lxkit import device_vendor
     if device_vendor(jax.local_devices()[0]) != "cuda":
-        _POOL["source"] = "none"
+        # No CUDA mempool to read (ROCm: jaxlib's BFC arena).  The arena's own
+        # accounting stands in, with the never-resets warning below; "none"
+        # here left every ROCm stage peak blank ("-" in the stage table).
+        stats = jax.local_devices()[0].memory_stats() or {}
+        _POOL["source"] = "peak_bytes_in_use" if "peak_bytes_in_use" in stats else "none"
+        if _POOL["source"] == "peak_bytes_in_use":
+            import warnings
+            warnings.warn("device peaks per stage read peak_bytes_in_use: this device's "
+                          "allocator keeps no CUDA pool, and that figure never resets, so "
+                          "a stage below an earlier high-water mark reads as the earlier "
+                          "mark.", RuntimeWarning)
         return None
     pointer = None
     for array in jax.live_arrays():          # one device buffer; nothing is allocated

@@ -69,6 +69,37 @@
 //                registry common/ctx_registry.{h,cc}; new C entry points
 //                lrx_ctx_bind / lrx_ctx_unbind (leg-suffixed).
 //
+//   ABI 6 -> 7   (2026-10-16, slabmr/w8).  PhdfRead, PhdfReadMulti, PhdfWrite
+//                and PhdfWriteIndependent lost their S64 control operands
+//                (handle / offset / valid_shape, and read_multi's control
+//                table).  SlabIO posts those values through
+//                lrx_phdf5_post_control, keyed by the address of the call's
+//                own buffer (reads: a caller-allocated destination aliased to
+//                the result; writes: the operand), and the handler takes them
+//                by that address (cpp/phdf5/ctx.h POSTED CONTROL).  An ABI-6
+//                library would receive one Arg where it expects three: refused
+//                by name at load instead.
+//
+//   ABI 7 -> 8   (2026-10-16, slabmr/w8).  PhdfReadKchunkUnion lost its three
+//                S64 control operands (handle, offset table, count table) and
+//                takes one destination aliased to its result; SlabIO posts
+//                {ctx, ds_id, n_kchunk, N_file, offsets, this rank's counts}
+//                under the destination's address (ctx.h kCtlReadKchunkUnion).
+//                An ABI-7 library -- including one built from the first ABI-7
+//                trees, whose union handler still took operands -- would get
+//                one Arg where it expects three; refused by name at load.
+//
+//   ABI 8 -> 9   (2026-10-17, dlascale).  lorrax_slate_potrf takes one more
+//                attribute, seed_min_bytes (the outside allowance past which a
+//                rank's SLATE pool is seeded), and lorrax_slate_eigh one more
+//                result, a u8 workspace seeding its device pools (sized by
+//                distrib_la._slate.eigh_workspace_bytes; CUDA and ROCM legs).
+//                potrf and batched_{solve_lu_factors,getrf,getrs} also bind
+//                xla::ffi::ScratchAllocator for their per-rank pool seed
+//                (slate/pool_seed.h); their operands and results are ABI 8's.
+//                An ABI-8 library would reject the attribute and miss the result;
+//                refused by name at load instead.
+//
 // ---------------------------------------------------------------------------
 // THE RULE
 // ---------------------------------------------------------------------------
@@ -93,4 +124,4 @@
 // Python tree with a still-correct .so.  What has to match is the CONTRACT.
 #pragma once
 
-#define LORRAX_FFI_ABI_VERSION 6
+#define LORRAX_FFI_ABI_VERSION 9

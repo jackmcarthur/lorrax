@@ -50,11 +50,13 @@ declared mode with no resolver branch.
 `lxkit.mesh_ffi_platform(mesh)` reads the vendor from the first device's
 client (`lxkit.device_vendor`: `client.platform`, `client.platform_version`,
 `device_kind`), never from `device.platform`, which is `gpu` for every GPU
-vendor. `cuda` maps to `CUDA` and `cpu` to `cpu`, the two platforms with a
-LORRAX library; `rocm` and an unrecognised GPU pass through unmapped, so no
-gate or loader selects a native target there.
+vendor, and maps it to its leg's key in `lxkit.LEGS`: `cpu` -> `cpu`,
+`cuda` -> `CUDA`, `rocm` -> `ROCM` ([platform legs](../architecture/ffi_layout.md#platform-legs)).
+A vendor with no leg (an unrecognised GPU, a TPU) passes through unmapped, so
+no gate or loader selects a native target there; a leg whose library is not
+built (ROCM today) is refused by naming its `.so`.
 Before the backend exists, `lxkit.platform_from_env()` reads the same key from
-`JAX_PLATFORMS`. Tests: `tests/test_platform_vendor.py`.
+`JAX_PLATFORMS`. Tests: `tests/test_platform_vendor.py`, `tests/test_platform_legs.py`.
 
 ### Two tiers
 

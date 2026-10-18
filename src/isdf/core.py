@@ -1861,7 +1861,8 @@ def _transverse_lu_math(C_log: jax.Array, n_log: int):
     phase = jnp.arange(n_log, dtype=jnp.float64) * 0.6180339887498949
     x0 = jnp.exp(2j * jnp.pi * phase).astype(C_reg.dtype)
     b = C_reg @ x0
-    x = jax.scipy.linalg.lu_solve((lu, piv), b, trans=0)
+    from distrib_la import lu_solve_local   # 2^31-byte span route (ROCM)
+    x = lu_solve_local(lu, piv, b)
     eta = (jnp.linalg.norm(C_reg @ x - b)
            / (jnp.linalg.norm(C_reg) * jnp.linalg.norm(x) + jnp.linalg.norm(b)))
     return lu, piv, eta.astype(jnp.float64)
@@ -2287,6 +2288,12 @@ def factor_c_q(
         C_q, mesh_xy, n_rmu_logical, zeta_rcond=zeta_rcond)
 
 
+def _lu_solve_local(LU, piv, Z):
+    """``jax.scipy.linalg.lu_solve((LU, piv), Z, trans=0)``, by distrib_la.local_lu's span route."""
+    from distrib_la import lu_solve_local
+    return lu_solve_local(LU, piv, Z)
+
+
 def _zeta_logical_solvers(
         n_log):
     """Produce the existing back-solves restricted to the logical centroid extent."""
@@ -2295,15 +2302,15 @@ def _zeta_logical_solvers(
         def _ridged_lu(L_log, Z_log):
             ridge = _transverse_lu_ridge(jnp.trace(L_log), n_log)
             L_reg = L_log + ridge * jnp.eye(n_log, dtype=L.dtype)
-            return jnp.linalg.solve(L_reg, Z_log)
+            from distrib_la import solve_local   # 2^31-byte span route (ROCM)
+            return solve_local(L_reg, Z_log)
         return solve_at_logical(_ridged_lu, n_log, (L,), Z)
 
     def _lu_apply_logical(LU: jax.Array, piv: jax.Array,
                           Z: jax.Array) -> jax.Array:
         """HOISTED transverse back-solve at the LOGICAL μ extent: apply the per-q ``(LU, piv)`` factor that ``factor_c_q`` computed once per channel; see docs/architecture/zeta_fit_face_psi_cct.md."""
         return solve_at_logical(
-            lambda LU_log, Z_log: jax.scipy.linalg.lu_solve(
-                (LU_log, piv), Z_log, trans=0),
+            lambda LU_log, Z_log: _lu_solve_local(LU_log, piv, Z_log),
             n_log, (LU,), Z)
 
     def _pinv_matmul_logical(B: jax.Array, Z: jax.Array) -> jax.Array:

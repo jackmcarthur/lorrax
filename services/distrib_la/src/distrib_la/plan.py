@@ -87,8 +87,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._result_check import (_flag, _notices, deflate_zero_rows, in_checked_retry, native_eigh,
                                       traced_phase)
-from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
-                                mesh_key, resolve_backend)
+from distrib_la.resolve import (NATIVE, NATIVE2D, ONE_DEVICE, OPS, backend_module,
+                                mesh_key, mesh_platform, resolve_backend,
+                                resolve_eigh_capacity, size_route_note)
 
 __all__ = ["Plan", "plan", "StackRoute", "ensure_sharding", "BATCHED_SCAN_UNROLL",
            "BATCHED_ROUTES", "BATCHED_ROUTE_CHOICES",
@@ -208,9 +209,16 @@ def new_stack_routes() -> list[str]:
     """One line per eigh-stack decision made since the last call, for a driver log.
 
     The service decides (:meth:`Plan.stack_route`); a driver prints these
-    lines through its own reporter, once per (op, B, n, dtype, room).
+    lines through its own reporter, once per (op, B, n, dtype, room).  The
+    ``distributed`` size route's decisions (resolve guard 1b) ride the same
+    channel, once per (op, leg, mesh, n), as ``"<what>: <backend>, <reason>"``.
     """
+    from distrib_la import resolve as _resolve
     lines = []
+    for key, line in _resolve._SIZE_DECISIONS.items():
+        if ("size",) + key not in _REPORTED:
+            _REPORTED.add(("size",) + key)
+            lines.append(line)
     for key, route in _STACK_ROUTES.items():
         if key not in _REPORTED:
             _REPORTED.add(key)
@@ -300,9 +308,11 @@ def _local_eigh_errors(a, values, vectors, *, mesh=None):
     x = probes(a.shape[-1], vectors.dtype)
     vx = vectors @ x
     left = jnp.conj(jnp.swapaxes(jnp.conj(jnp.swapaxes(vx, -1, -2)) @ a, -1, -2))
-    residual = _norm(0.5 * (a @ vx + left) - vectors @ (values[..., :, None] * x)) / (
-        jnp.maximum(_norm(a), jnp.finfo(values.dtype).tiny) * _norm(x))
-    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x) / _norm(x)
+    from distrib_la._result_check import _face, _rows
+    nd = a.ndim
+    residual = _norm(0.5 * (a @ vx + left) - vectors @ (values[..., :, None] * x), mesh, _rows(nd)) / (
+        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * _norm(x))
+    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x, mesh, _rows(nd)) / _norm(x)
     finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
     return (jnp.where(finite, jnp.max(residual), jnp.inf),
             jnp.where(finite, jnp.max(orthogonality), jnp.inf))
@@ -432,10 +442,382 @@ def _gathered_eigh(A, *, mesh):
 #: that says what to call instead.  ``tests/test_distrib_la_shape_algebra``
 #: cross-checks the flag against each wrapper's own return annotation, so
 #: the declaration cannot quietly disagree with the code.
+#: The agreed size-route costs of a ``distributed`` plan resolved to ``one_device``, one per
+#: room-free call signature (:func:`_measured_rounds`' on-disk key; None where no library
+#: resolves).  The room is applied per call: a new room is arithmetic, with no exchange, no
+#: disk read and no compile.
+_MEASURED: dict = {}
+#: Library plans of :meth:`Plan._library_plan`, one per (op, mesh, n, route, library).
+_LIBRARY_PLANS: dict = {}
+
+
+def _program_bytes(fn, abstract) -> int | None:
+    """Per-device bytes a compiled program allocates beside its arguments: XLA's
+    ``memory_analysis`` temp + output, less the outputs aliased to arguments.  None where the
+    backend reports no analysis."""
+    stats = jax.jit(fn).lower(*abstract).compile().memory_analysis()
+    if stats is None:
+        return None
+    return (int(stats.temp_size_in_bytes) + int(stats.output_size_in_bytes)
+            - int(getattr(stats, "alias_size_in_bytes", 0) or 0))
+
+
+def _library_bytes(p, abstract, single: bool) -> int | None:
+    """The leg library program's compiled per-device bytes on these operands, or None where no
+    library resolves on this host."""
+    try:
+        lib = p._library_plan()
+    except (RuntimeError, ValueError):
+        return None
+    return _program_bytes((lambda *o: lib(*o)) if single else (lambda *o: lib.batched(*o)), abstract)
+
+
+_LIBRARY_BYTES_DEFAULT = _library_bytes
+
+
+def _round_candidates(nb: int, ranks: int) -> list:
+    """Rounds tried in order: 1, then doubling, up to one matrix per rank per round."""
+    last = max(1, -(-int(nb) // int(ranks)))
+    out, r = [1], 2
+    while r < last:
+        out.append(r)
+        r *= 2
+    if last > 1:
+        out.append(last)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _measured_code_hash() -> str:
+    """The distrib_la sources the measured programs are built from (and the jax build): a cached
+    cost is reused only by the same code."""
+    import hashlib
+    import os
+    import jaxlib
+    h = hashlib.sha256(f"{jax.__version__}/{jaxlib.__version__}".encode())
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in sorted(os.listdir(here)):
+        if name.endswith(".py"):
+            with open(os.path.join(here, name), "rb") as f:
+                h.update(name.encode() + f.read())
+    return h.hexdigest()[:16]
+
+
+def native_closure_identity(platform: str) -> str:
+    """The native closure the measured programs run on: the enforced dependency
+    closure identity of the platform's FFI leg
+    (:func:`lxkit.native_provider.native_closure_identity` -- every library the
+    leg maps, by path and content hash, verified at start-up), or ``"none"``
+    where no leg of that platform is open.  A cost measured against any other
+    library set is another key.  Not cached here: lxkit computes it once, at
+    enforcement, and a ``"none"`` asked before the leg opens must not stick."""
+    from lxkit import native_provider
+    try:
+        return native_provider.native_closure_identity(_lxkit_platform(platform))
+    except native_provider.ClosureNotEnforced:
+        return "none"
+
+
+def _lxkit_platform(platform: str) -> str:
+    """distrib_la's platform name -> the lxkit.legs.LEGS key."""
+    from lxkit import LEGS
+    if platform in LEGS:
+        return platform
+    for key, spec in LEGS.items():
+        if platform.lower() in (key.lower(), str(getattr(spec, "vendor", "")).lower()):
+            return key
+    return platform
+
+
+def _measured_cache_dir() -> str:
+    import os
+    from lxkit import user_cache_dir
+    return os.path.join(str(user_cache_dir("distrib_la")), "measured_cost")
+
+
+def _measured_cache_file(disk_key: str) -> str:
+    import hashlib
+    import os
+    return os.path.join(_measured_cache_dir(), hashlib.sha256(disk_key.encode()).hexdigest()[:32] + ".json")
+
+
+def _payload_digest(disk_key: str, value) -> str:
+    import hashlib
+    import json
+    return hashlib.sha256(json.dumps([disk_key, value], sort_keys=True).encode()).hexdigest()
+
+
+def _valid_costs(value, measured, need_library: bool = True) -> bool:
+    """A cached figure set is used only whole and well-typed: the library's bytes where the
+    incumbent is the library, and every measured round's largest and smallest per-rank bytes
+    (an int each); anything else is a miss and is re-measured."""
+    if not isinstance(value, dict):
+        return False
+    if need_library and not isinstance(value.get("library"), int):
+        return False
+    want = {str(r) for r in measured}
+    for name in ("rounds", "rounds_min"):
+        rounds = value.get(name)
+        if not (isinstance(rounds, dict) and set(rounds) == want
+                and all(isinstance(v, int) and v >= 0 for v in rounds.values())):
+            return False
+    return True
+
+
+def _measured_cache_get(disk_key: str, measured, need_library: bool = True):
+    """This signature's agreed costs from its own file, validated (key, digest, types); None on
+    a miss, a stale code hash (another key), a partial or corrupt file: never a mis-route."""
+    import json
+    try:
+        with open(_measured_cache_file(disk_key)) as f:
+            entry = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(entry, dict) or entry.get("key") != disk_key
+            or entry.get("digest") != _payload_digest(disk_key, entry.get("value"))
+            or not _valid_costs(entry.get("value"), measured, need_library)):
+        return None
+    return entry["value"]
+
+
+def _measured_cache_put(disk_key: str, value) -> None:
+    """One writer per key (process 0, after the agreement), published atomically: written to a
+    private temp file, then os.replace'd over the key's file; a reader sees the old file or the
+    whole new one."""
+    import json
+    import os
+    if int(jax.process_index()) != 0:
+        return
+    path = _measured_cache_file(disk_key)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"key": disk_key, "value": value,
+                       "digest": _payload_digest(disk_key, value)}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+#: Agreements per signature hash in this process (every rank traces in the same order).
+_AGREE_GEN: dict = {}
+
+
+def _exchange(tag: str, payload: dict) -> list:
+    """Every process's ``payload`` (JSON), in process order, through the coordination service's
+    key-value store: a host exchange, no device work and no device sync.  One process: itself."""
+    import json
+    if jax.process_count() == 1:
+        return [payload]
+    from jax._src.distributed import global_state
+    from distrib_la._collectives import _wait_for_bootstrap
+    client = global_state.client
+    gen = _AGREE_GEN[tag] = _AGREE_GEN.get(tag, -1) + 1
+    base = f"distrib_la/measured/{tag}/{gen}"
+    me = int(jax.process_index())
+    client.key_value_set(f"{base}/{me}", json.dumps(payload))
+    return [json.loads(_wait_for_bootstrap(client, f"{base}/{r}", me,
+                                           "every rank's measured route costs"))
+            for r in range(jax.process_count())]
+
+
+def _agreed(values: list, need_library: bool = True):
+    """The conservative agreement of every rank's figures: the SMALLEST library bytes, and per
+    round count the LARGEST one_device bytes (``rounds``: what a candidate is charged) and the
+    SMALLEST (``rounds_min``: what a one_device incumbent is credited with), so the route
+    decided from them is the same on every rank and never raises any rank's peak above the
+    incumbent's.  Where the incumbent is the library: None if no rank has one (all agree on
+    that), and a mix is refused by name on every rank alike."""
+    libs = [v.get("library") for v in values]
+    if need_library:
+        if all(l is None for l in libs):
+            return None
+        if any(l is None for l in libs):
+            raise RuntimeError("distrib_la measured size route: the leg library resolves on some "
+                               "processes and not others; refusing rather than route divergently")
+    rounds, low = {}, {}
+    for v in values:
+        for r, c in v["rounds"].items():
+            rounds[r] = None if c is None or rounds.get(r, 0) is None else max(rounds.get(r, 0), int(c))
+        for r, c in (v.get("rounds_min") or v["rounds"]).items():
+            low[r] = (None if c is None or (r in low and low[r] is None)
+                      else min(low.get(r, int(c)), int(c)))
+    return {"library": min(int(l) for l in libs) if need_library else None,
+            "rounds": rounds, "rounds_min": low}
+
+
+def _incumbent(p, shapes, single: bool) -> int:
+    """The route today's main takes for this call -- the owner's INCUMBENT (2026-10-17, "never
+    regress main"): on a leg with a size row (:data:`resolve.ONE_DEVICE_MAX_N`, ROCM) the size
+    route's ``one_device`` in the round rule's count against that row
+    (:func:`distrib_la._one_device.rounds_for`; one matrix: 1 round); on a room leg (CUDA, no
+    row) the leg library.  Returns that round count, or 0 for the library.  A shape rule: no
+    exchange, no sync."""
+    from distrib_la import resolve as _resolve
+    from distrib_la._one_device import rounds_for
+    row = _resolve.ONE_DEVICE_MAX_N.get((p.op, _resolve.mesh_platform(p.mesh)))
+    if row is None:
+        return 0
+    if single:
+        return 1
+    ranks = int(p.mesh.shape["x"]) * int(p.mesh.shape["y"])
+    nb, n = int(shapes[0][0]), int(shapes[0][-1])
+    width = int(shapes[1][-1]) if p.op == "solve_lu" and len(shapes) > 1 else None
+    return int(rounds_for(nb, n, ranks, _resolve.one_device_round_n(
+        p.op, _resolve.mesh_platform(p.mesh), int(row)), width))
+
+
+_RULE = ("the fewest-round one_device whose per-rank footprint is within the incumbent's"
+         "{room}, else the incumbent")
+
+
+def _measured_rounds(p, A, args, single: bool = False):
+    """The size-route decision of a ``distributed`` plan resolved to ``one_device``, for one call
+    signature (owner rules: no stage's per-rank device peak may go up, 2026-10-16; never regress
+    main, 2026-10-17).
+
+    The INCUMBENT is what today's main runs on this leg and shape (:func:`_incumbent`): the leg
+    library on a room leg (CUDA), ``one_device`` in the round rule's count on a size-row leg
+    (ROCM).  The candidates are the ``one_device`` round counts (:func:`_round_candidates`) whose
+    per-rank footprint -- XLA's ``memory_analysis`` of the compiled program, temp + output per
+    device, the caller's operands common to all -- is within the incumbent's and within the
+    plan's room; the fewest-round candidate runs (fewer rounds is the faster program on both
+    legs: a deterministic preference, no wall-time measurement), else the incumbent.  Only what
+    could beat the incumbent is measured: a ``one_device`` incumbent in k rounds compiles the
+    rounds below k (and k, for its own figure), and in 1 round nothing at all (no compile, no
+    exchange).  Figures are agreed over every rank (largest candidate bytes against the
+    smallest incumbent bytes, the room refused by name unless every rank's is the same) and
+    cached per signature on disk and in memory, without the room (:data:`_MEASURED`).
+
+    Returns the rounds to run, 0 for the library, None for ``one_device``'s own round rule (the
+    incumbent on a size-row leg, or where no library resolves on this host).  Each decision is a
+    route-ledger line (:func:`distrib_la.new_stack_routes`) naming the incumbent, its figure and
+    the rule.  Vendor workspaces that a library or jaxlib kernel allocates at run time are
+    outside both analyses."""
+    import json
+    from distrib_la import resolve as _resolve
+    dtypes = (A.dtype,) + tuple(x.dtype for x in args)
+    shapes = (tuple(int(s) for s in A.shape),) + tuple(tuple(int(s) for s in x.shape) for x in args)
+    key = (p.op, _resolve.mesh_key(p.mesh), shapes, tuple(str(d) for d in dtypes), p.budget_bytes,
+           p.requested_batched_route, bool(single))
+    room = None if p.budget_bytes is None else int(p.budget_bytes)
+    platform = _resolve.mesh_platform(p.mesh)
+    library = _resolve._DISTRIBUTED_DEFAULT.get((p.op, platform))
+    ranks = int(p.mesh.shape["x"]) * int(p.mesh.shape["y"])
+    candidates = [1] if single else _round_candidates(shapes[0][0], ranks)
+    incumbent = _incumbent(p, shapes, single)
+    need_library = incumbent == 0
+    if need_library:
+        measured = list(candidates)
+    else:
+        fewer = [r for r in candidates if r < incumbent]
+        measured = fewer + [incumbent] if fewer else []
+    import hashlib
+    import time
+    started = time.perf_counter()
+    costs, inc_cost, agreed, source = {}, None, None, None
+    if measured:
+        devices = p.mesh.devices.flat
+        kind = str(getattr(next(iter(devices)), "device_kind", ""))
+        disk_key = json.dumps([p.op, shapes, [str(d) for d in dtypes],
+                               [int(p.mesh.shape["x"]), int(p.mesh.shape["y"])], platform, kind,
+                               library, p.requested_batched_route, bool(single), incumbent,
+                               measured, _measured_code_hash(), native_closure_identity(platform)])
+        if disk_key in _MEASURED:
+            source, agreed = "memoised", _MEASURED[disk_key]
+        else:
+            tag = hashlib.sha256(disk_key.encode()).hexdigest()[:24]
+            default = _library_bytes is _LIBRARY_BYTES_DEFAULT
+            cached = _measured_cache_get(disk_key, measured, need_library) if default else None
+            # Round 1: does EVERY rank hold this signature's agreed costs?  Only then is
+            # nothing compiled; one miss and every rank measures, so all lower the same
+            # programs (a library plan's first lowering may bootstrap its context collectively).
+            probe = _exchange(tag + "/probe", {
+                "room": room, "hit": cached is not None,
+                "library": None if cached is None else cached["library"],
+                "rounds": {} if cached is None else cached["rounds"],
+                "rounds_min": {} if cached is None else cached["rounds_min"]})
+            if len({v["room"] for v in probe}) > 1:
+                raise RuntimeError(f"distrib_la measured size route: {p.op} {shapes[0]} has a room "
+                                   f"that differs across processes ({[v['room'] for v in probe]}); "
+                                   f"refusing rather than route divergently")
+            if all(v["hit"] for v in probe):
+                source = "cached"
+                agreed = _agreed(probe, need_library)
+            else:
+                source = "compiled"
+                spec = P("x", "y") if single else P(None, "x", "y")
+                face = NamedSharding(p.mesh, spec)
+                abstract = tuple(jax.ShapeDtypeStruct(s, d, sharding=face)
+                                 for s, d in zip(shapes, dtypes))
+                lib_local = _library_bytes(p, abstract, single) if need_library else None
+                rounds_local = {}
+                if lib_local is not None or not need_library:
+                    for r in measured:
+                        fn = ((lambda *o: p(*o, _rounds=1)) if single
+                              else (lambda *o, _r=r: p.batched(*o, _rounds=_r)))
+                        c_r = _program_bytes(fn, abstract)
+                        rounds_local[str(r)] = None if c_r is None else int(c_r)
+                # Round 2: every rank's own figures, agreed conservatively.
+                mine = {"library": None if lib_local is None else int(lib_local),
+                        "rounds": rounds_local}
+                agreed = _agreed(_exchange(tag + "/measure", mine), need_library)
+                if agreed is not None and default and _valid_costs(agreed, measured, need_library):
+                    _measured_cache_put(disk_key, agreed)
+            _MEASURED[disk_key] = agreed
+        if agreed is not None:
+            costs = {int(r): c for r, c in agreed["rounds"].items()}
+            low = {int(r): c for r, c in agreed["rounds_min"].items()}
+            inc_cost = agreed["library"] if need_library else low.get(incumbent)
+    seconds = time.perf_counter() - started
+    within = lambda r: (costs.get(r) is not None and inc_cost is not None and costs[r] <= inc_cost
+                        and (room is None or costs[r] <= room))
+    if need_library:
+        if agreed is None:
+            chosen = None                     # no library on this host: one_device's own rounds
+        else:
+            fits = [r for r in measured if within(r)]
+            chosen = fits[0] if fits else 0
+    else:
+        fits = [r for r in measured if r < incumbent and within(r)]
+        chosen = fits[0] if fits else None    # None: the incumbent, main's own round rule
+    gb = lambda b: "n/a" if b is None else f"{b / 1e9:.4f}"
+    inc_name = library if need_library else f"one_device in {incumbent} round(s)"
+    rule = _RULE.format(room="" if room is None else f" and the room {room / 1e9:.2f} GB")
+    if need_library and agreed is None:
+        verdict = "one_device's own rounds (no library on this host)"
+    elif chosen == 0:
+        verdict = f"{library} (the incumbent)"
+    elif chosen is None:
+        verdict = f"one_device in {incumbent} round(s) (the incumbent)"
+    else:
+        verdict = f"one_device in {chosen} round(s)"
+    if measured:
+        tried = ", ".join(f"{r}: {gb(c)}" for r, c in costs.items())
+        how = (f"measured ({source}, agreed over {jax.process_count()} process(es), "
+               f"{seconds:.2f} s) per-rank GB: incumbent {inc_name} {gb(inc_cost)}, "
+               f"one_device by rounds {{{tried}}}")
+    else:
+        how = (f"incumbent {inc_name} (main's round rule on the leg row); no candidate has fewer "
+               f"rounds, nothing measured")
+    line = (f"{p.op} 'distributed' {'x'.join(map(str, shapes[0]))} on the "
+            f"{int(p.mesh.shape['x'])}x{int(p.mesh.shape['y'])} {platform} mesh: {how}; "
+            f"rule: {rule} -> {verdict}")
+    _resolve._SIZE_DECISIONS.setdefault(("measured",) + key, line)
+    _resolve.announce_once(("distrib_la.plan", "measured", key),
+                           f"  [distrib_la.plan] {line}", scope="rank0")
+    return chosen
+
+
 _IMPL: dict[tuple[str, str], dict[str, Any]] = {
     ("eigh", "cusolvermp"):     dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
     ("eigh", "slate"):          dict(one="distributed_eigh",
+                                     many=None, post=_eigh_columns),
+    ("eigh", "elpa"):           dict(one="distributed_eigh",
                                      many=None, post=_eigh_columns),
     ("eigh", "scalapack"):      dict(one="distributed_eigh",
                                      many="batched_distributed_eigh",
@@ -450,6 +832,18 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
                                      many="batched_distributed_solve_lu",
                                      post=None),
     ("solve_lu", "scalapack"):  dict(one=None,
+                                     many="batched_distributed_solve_lu",
+                                     post=None),
+    ("solve_lu", "slate"):      dict(one=None,
+                                     many="batched_distributed_solve_lu",
+                                     post=None),
+    # one_device (the size route of ``distributed``): pure JAX with the FFI
+    # operand contract, so the checked chain and every route apply to it as
+    # to a library.  Its stacked entry is route (c) in bounded rounds.
+    ("eigh", ONE_DEVICE):       dict(one="distributed_eigh",
+                                     many="batched_distributed_eigh",
+                                     post=_eigh_columns),
+    ("solve_lu", ONE_DEVICE):   dict(one=None,
                                      many="batched_distributed_solve_lu",
                                      post=None),
     # native2d is pure JAX, but it routes through the same table: its
@@ -540,6 +934,11 @@ class Plan:
         ``'auto'`` requested and a budget given, each eigh stack's route is
         the service's capacity decision (:meth:`stack_route`): route (c) when
         the compiled program that runs it fits, otherwise the provider.
+    capacity_refusal
+        ``None``, or why an ``auto`` eigh plan with a room has no capacity
+        route on this mesh (:func:`~distrib_la.resolve.resolve_eigh_capacity`).
+        Such a plan is native: it runs route (c) wherever a stack fits the
+        room and refuses by name where one does not (:meth:`require_capacity`).
     """
 
     op: str
@@ -554,12 +953,34 @@ class Plan:
     # room are equal, so every program cached on a plan is shared across
     # rooms (the room enters no HLO; the decided route does, per shape).
     budget_bytes: int | None = field(default=None, compare=False)
+    capacity_refusal: str | None = None
+    #: What the ``distributed`` size route decided (resolve guard 1b), or None.
+    size_route: str | None = field(default=None, compare=False)
 
     # ---- introspection -------------------------------------------------
     @property
     def is_native(self) -> bool:
         """True when the resolved backend is the native JAX path."""
         return self.backend == NATIVE
+
+    def require_capacity(self, what: str) -> None:
+        """Refuse by name when ``what`` needs the whole-mesh eigh and this plan has none.
+
+        A no-op on every plan except an ``auto`` eigh plan whose capacity
+        route did not resolve (:attr:`capacity_refusal`).  Called by
+        :meth:`stack_route` for each stack it sends to the whole mesh, and by
+        a caller that decides the whole mesh itself before any work.
+        """
+        if self.capacity_refusal is None:
+            return
+        px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
+        raise RuntimeError(
+            f"GATE eigh_capacity_route: {what} needs the whole-mesh (capacity) "
+            f"eigh, and the {px}x{py} {mesh_platform(self.mesh)} mesh has none "
+            f"({self.capacity_refusal}).  The 'auto' eigh runs whole matrices "
+            f"per rank (route (c)) only where they fit the room.  Fix: more "
+            f"ranks or a larger memory_per_device_gb so route (c) fits, or a "
+            f"leg that carries the platform's distributed eigh.")
 
     @property
     def donates(self) -> tuple[int, ...]:
@@ -641,6 +1062,45 @@ class Plan:
         """The route :meth:`batched` takes for one operand stack (:meth:`stack_route`)."""
         return self.stack_route(shape, dtype, traced=traced).route
 
+    def decision(self, A, *args) -> tuple:
+        """What :meth:`batched` traces for this call signature, without the room.
+
+        ``(backend, route, rounds)`` (:meth:`_decide`): everything a plan's room decides in
+        the program :meth:`batched` traces for ``A`` and ``args``, so a caller's program cache
+        keys on this tuple and never on the room (COMPILEAUDIT 2026-10-05 rule 4).  Host-side,
+        on arrays or ``jax.ShapeDtypeStruct`` (only shape and dtype are read).  An eigh plan
+        with a room decides per stack in :meth:`stack_route` and is not covered.
+        """
+        if self.op == "eigh" and self.budget_bytes is not None:
+            raise NotImplementedError("Plan.decision: an eigh plan with a room decides per "
+                                      "stack (stack_route); not covered")
+        return self._decide(A, args)
+
+    def _decide(self, A, args, traced: bool = True, route: str | None = None) -> tuple:
+        """``(backend, route, rounds)`` :meth:`batched` runs ``A``, ``args`` with: the one place
+        it is decided.  ``rounds`` is set on ``one_device``'s stacked entry only: the measured
+        size route's (:func:`_measured_rounds`; 0 the leg library), else one_device's own round
+        rule (:func:`distrib_la._one_device.rounds_for` against
+        :func:`distrib_la.resolve.one_device_round_n` of the bound: the leg row, or on a room leg
+        the room this plan was resolved against, capped by the leg's round row).  ``route`` is the gates' override."""
+        route = self.route_for(A.shape, A.dtype, traced) if route is None else route
+        rounds = None
+        if route == ROUTE_BACKEND_BATCHED and self.backend == ONE_DEVICE:
+            if self._measured_applies():
+                rounds = _measured_rounds(self, A, args)
+            if rounds is None:
+                from distrib_la import _one_device as od, resolve as _resolve
+                n = int(A.shape[-1])
+                bound = od._bound(self.op, self.mesh, n, _resolve.one_device_max_n(
+                    self.op, _resolve.mesh_platform(self.mesh), self.budget_bytes))
+                # one_device's own round rule: against the leg's round row (ONE_DEVICE_ROUND_N,
+                # resolve.one_device_round_n), exactly as _one_device computes it without rounds=.
+                rounds = od.rounds_for(int(A.shape[0]), n, od._ranks(self.mesh),
+                                       _resolve.one_device_round_n(
+                                           self.op, _resolve.mesh_platform(self.mesh), bound),
+                                       int(args[0].shape[-1]) if self.op == "solve_lu" else None)
+        return (self.backend, route, rounds)
+
     def stack_route(self, shape, dtype, op: str = "eigh", traced: bool = True) -> StackRoute:
         """How :meth:`batched` runs one operand stack: the service's decision.
 
@@ -664,16 +1124,23 @@ class Plan:
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
         if static == ROUTE_BATCH_RESHARD:
             return StackRoute(static, -(-nb // ranks))
+        capacity = self.capacity_refusal is None
         if (self.requested_batched_route != "auto" or self.budget_bytes is None
-                or self.is_native or self.op != "eigh"):
+                or (self.is_native and capacity) or self.op != "eigh"):
             return StackRoute(static)
-        if self.budget_bytes == 0 or in_checked_retry():
-            # A checked program's retry is the whole-mesh program its caller sized.
+        if self.budget_bytes == 0 or (capacity and in_checked_retry()):
+            # A checked program's retry is the whole-mesh program its caller
+            # sized; a plan with no whole mesh retries on its decided route.
+            self.require_capacity(f"an eigh stack {shape} with no room")
             return StackRoute(static, room=0)
         key = self._stack_key(op, nb, shape[-1], dtype, traced)
         decided = _STACK_ROUTES.get(key)
         if decided is None:
-            decided = _STACK_ROUTES[key] = self._decide_stack(op, nb, key[3], key[4], key[6], traced)
+            decided = self._decide_stack(op, nb, key[3], key[4], key[6], traced)
+            if decided.route != ROUTE_BATCH_RESHARD:
+                self.require_capacity(
+                    f"the eigh stack {shape} ({_describe_stack(decided)})")
+            _STACK_ROUTES[key] = decided
         return decided
 
     def _stack_key(self, op, nb, n, dtype, traced):
@@ -686,7 +1153,8 @@ class Plan:
         else this plan's provider route: a pure query, with no compile and no
         exchange, for pricing (``distrib_la.workspace``)."""
         static = self.batched_route
-        if static == ROUTE_BATCH_RESHARD or self.budget_bytes is None or self.is_native:
+        if (static == ROUTE_BATCH_RESHARD or self.budget_bytes is None
+                or (self.is_native and self.capacity_refusal is None)):
             return static
         shape = tuple(int(v) for v in shape)
         nb = shape[0] if len(shape) == 3 else 1
@@ -751,8 +1219,14 @@ class Plan:
     def describe(self) -> str:
         """One line for a run banner: what resolved, and to what geometry."""
         px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
-        where = ("native JAX, any layout" if self.is_native else
+        where = ("route (c) only; no whole-mesh eigh on this mesh"
+                 if self.capacity_refusal is not None else
+                 "native JAX, any layout" if self.is_native else
+                 f"each matrix whole on one device, face layout P('x','y') on the {px}x{py} mesh"
+                 if self.backend == ONE_DEVICE else
                  f"ONE tile over the {px}x{py} mesh at P('x','y')")
+        if self.size_route is not None:
+            where += f"; {self.size_route}"
         n = "" if self.n is None else f", n={self.n}"
         line = (f"{self.op}: {self.requested!r} -> {self.backend} "
                 f"({where}{n}); batched "
@@ -767,7 +1241,24 @@ class Plan:
             "; stacks " + "; ".join(stacks) if stacks else "")
 
     # ---- calling -------------------------------------------------------
-    def _entry(self, key: str):
+    def _measured_applies(self) -> bool:
+        """A plan the size route resolved from ``distributed`` to ``one_device``: each call
+        shape is decided by measured cost (:func:`_measured_rounds`)."""
+        return (self.backend == ONE_DEVICE
+                and str(self.requested).strip().lower() == "distributed")
+
+    def _library_plan(self):
+        """The leg library plan ``distributed`` names on this mesh (built once)."""
+        from distrib_la import resolve as _resolve
+        library = _resolve._DISTRIBUTED_DEFAULT[(self.op, _resolve.mesh_platform(self.mesh))]
+        key = (self.op, _resolve.mesh_key(self.mesh), self.n, self.requested_batched_route, library)
+        lib = _LIBRARY_PLANS.get(key)
+        if lib is None:
+            lib = _LIBRARY_PLANS[key] = plan(self.op, self.mesh, backend=library, n=self.n,
+                                             batched_route=self.requested_batched_route)
+        return lib
+
+    def _entry(self, key: str, rounds: int | None = None):
         """The backend's ``one`` or ``many`` call and its result normaliser.
 
         An FFI eigh or LU solve comes back checked (:mod:`distrib_la._result_check`,
@@ -779,6 +1270,15 @@ class Plan:
         spec = _IMPL[(self.op, self.backend)]
         name = spec[key]
         call = None if name is None else getattr(self.module, name)
+        if call is not None and self.backend == ONE_DEVICE:
+            # The bound that plans the rounds: the leg row, or on a room leg the room this
+            # plan was resolved against (resolve.one_device_max_n), so both agree.
+            import functools
+            from distrib_la import resolve as _resolve
+            call = functools.partial(call, max_n=_resolve.one_device_max_n(
+                self.op, _resolve.mesh_platform(self.mesh), self.budget_bytes))
+            if rounds is not None and key == "many":
+                call = functools.partial(call, rounds=int(rounds))      # Plan._decide's
         if call is None or self.op not in ("eigh", "solve_lu"):
             return call, spec["post"]
         if self.op == "solve_lu":
@@ -819,7 +1319,7 @@ class Plan:
         # failure flag, so their buffers are never reserved beside the first
         # attempt's (EIGHSTACK: n 18304, P4, 80 GB).
         out = program("first", ())(*ops)
-        if not _flag(out[-1]):
+        if not _flag(out[-1], int(ops[0].shape[-1]), ops[0].dtype):
             return out
         _notices(out[-1], self.op, int(ops[0].shape[-1]), ops[0].dtype, site, final=False)
         del out
@@ -840,8 +1340,8 @@ class Plan:
             # The face SUMMA (panel_matmul): a single matrix never batch-reshards onto one device.
             gemm = partial(matmul, mesh=mesh, backend="distributed", batched_route="auto")
             pin = eigh_layout(mesh, A.ndim)
-            deflate = partial(deflate_zero_rows, constrain=pin)
-            attempts = [deflate(solve), deflate(shifted(solve, matmul=gemm))]
+            deflate = partial(deflate_zero_rows, constrain=pin, mesh=mesh)
+            attempts = [deflate(solve), deflate(shifted(solve, matmul=gemm, mesh=mesh))]
             n = int(A.shape[-1])
             if backend == "cusolvermp":
                 # cuSOLVERMp 0.9.1 syevd returns vectors that are not orthonormal
@@ -877,14 +1377,14 @@ class Plan:
             # The sketch is taken before the call, which consumes A and B: the LU
             # factors are an output aliased to A and X one aliased to B.  The
             # barrier keeps XLA from scheduling the sketch after the call.
-            sketch = (*matrix_sketch(A), *rhs_sketch(B))
+            sketch = (*matrix_sketch(A, mesh), *rhs_sketch(B, mesh))
             sketch, A, B = jax.lax.optimization_barrier((sketch, A, B))
             X = call(A, B, mesh=mesh, **kwargs)
-            return checked("solve_lu", (lambda x: x,), lambda x: solve_errors(sketch, x),
+            return checked("solve_lu", (lambda x: x,), lambda x: solve_errors(sketch, x, mesh),
                            (X,), n=A.shape[-1], dtype=A.dtype)
         return safe
 
-    def __call__(self, A, *args, **kwargs):
+    def __call__(self, A, *args, _rounds: int | None = None, **kwargs):
         """Run the op on ONE tile (no batch axis).
 
         ``A`` (and any further matrix operands, e.g. ``solve_lu``'s RHS)
@@ -904,6 +1404,9 @@ class Plan:
                     f"isdf/core), not a single call.  Branch on "
                     f"plan.is_native and run it there.")
             return fn(A, *args, **kwargs)
+        if (_rounds is None and self.op == "eigh" and self._measured_applies()
+                and _measured_rounds(self, A, args, True) == 0):
+            return self._library_plan()(A, *args, **kwargs)
         one, post = self._entry("one")
         if one is None:
             raise NotImplementedError(
@@ -919,7 +1422,8 @@ class Plan:
         out = one(*ops, mesh=self.mesh, **kwargs)
         return post(self.backend, *out) if post is not None else out
 
-    def batched(self, A, *args, _route: str | None = None, **kwargs):
+    def batched(self, A, *args, _route: str | None = None, _rounds: int | None = None,
+                **kwargs):
         """Run the op on a STACK ``(nb, n, n)`` — uniform across backends.
 
         The same call for every backend, whatever the library underneath
@@ -970,10 +1474,13 @@ class Plan:
                     f"{ROUTE_BATCH_RESHARD!r}.")
             return self(A, *args, **kwargs)
 
+        rounds = _rounds if _rounds is not None else self._decide(A, args, traced, route)[2]
+        if rounds == 0:
+            return self._library_plan().batched(A, *args, **kwargs)
         ops = tuple(ensure_sharding(x, self.batch_in_sharding)
                     for x in (A, *args))
         if route == ROUTE_BACKEND_BATCHED:
-            many, post = self._entry("many")
+            many, post = self._entry("many", rounds=rounds)
             if many is None:
                 raise NotImplementedError(
                     f"{self.op} backend {self.backend!r} has no stacked FFI "
@@ -995,7 +1502,7 @@ class Plan:
                     return self._finish(self._scan_over_single(ops, kwargs, phase=phase), A, site)
                 # Eager: the retries run as a second scan only when a matrix failed.
                 out = self._scan_over_single(ops, kwargs, phase="first")
-                if _flag(out[-1]):
+                if _flag(out[-1], int(A.shape[-1]), A.dtype):
                     _notices(out[-1], self.op, int(A.shape[-1]), A.dtype, site, final=False)
                     del out
                     out = self._scan_over_single(ops, kwargs, phase="retry")
@@ -1033,7 +1540,7 @@ class Plan:
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
             return values_vectors
         values_vectors, failed = program("first")(A)
-        if _flag(failed):
+        if _flag(failed, shape[-1], A.dtype):
             _notices(failed, "eigh", shape[-1], A.dtype, site, final=False)
             del values_vectors
             values_vectors, failed = program("retry")(A)
@@ -1124,6 +1631,27 @@ class Plan:
         return cached_scan(key, _build)(*ops)
 
 
+def _size_routed_library(op: str, requested: str, mesh_xy: Mesh, n, resolved: str) -> bool:
+    """``distributed`` resolved to the leg's library BY SIZE: ``n`` past the leg's
+    one-device row (:data:`distrib_la.resolve.ONE_DEVICE_MAX_N`).  Recorded on the
+    route ledger (:func:`new_stack_routes`) when true.  A shape rule: no exchange."""
+    from distrib_la import resolve as _resolve
+    if (str(requested).strip().lower() != "distributed" or n is None
+            or resolved in (NATIVE, ONE_DEVICE)):
+        return False
+    platform = _resolve.mesh_platform(mesh_xy)
+    bound = _resolve.ONE_DEVICE_MAX_N.get((op, platform))
+    if bound is None or int(n) <= int(bound):
+        return False
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    _resolve._SIZE_DECISIONS.setdefault(
+        ("batched-route", op, platform, px, py, int(n)),
+        f"{op} 'distributed' n={int(n)} on the {px}x{py} {platform} mesh: batched route "
+        f"'auto' -> {resolved}'s own entry (n > {bound}: the size route chose {resolved}; "
+        f"the default route (c) would solve each matrix whole on one device)")
+    return True
+
+
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
          n: int | None = None,
          batched_route: str | None = None,
@@ -1163,7 +1691,15 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         rank (0: no room). Given without a route, the service decides each
         eigh stack by capacity (:meth:`Plan.stack_route`): whole matrices per
         rank (route (c), in rounds) when the compiled program that runs it
-        fits the room, else the whole-mesh provider.
+        fits the room, else the whole-mesh provider.  With ``backend='auto'``
+        (eigh) the whole-mesh provider is the platform's ``distributed``
+        backend when it resolves on this mesh, so the plan equals the one an
+        explicit ``distributed`` request builds; when it does not, the plan is
+        native, runs route (c), and refuses by name at the first stack that
+        needs the whole mesh (:func:`~distrib_la.resolve.resolve_eigh_capacity`).
+        This is how a ``linalg = local`` deck asks for the capacity route.
+        The room also caps an explicit ``distributed`` request's size route
+        (resolve guard 1b): ``one_device`` only where one whole matrix fits it.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
@@ -1173,6 +1709,7 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     """
     if op not in OPS:
         raise ValueError(f"unknown linalg op {op!r} (known: {'|'.join(OPS)})")
+    route_defaulted = batched_route is None and budget_bytes is None
     if batched_route is None:
         batched_route = "auto" if budget_bytes is not None else BATCHED_ROUTE_DEFAULT
     batched_route = str(batched_route).strip().lower()
@@ -1180,14 +1717,31 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         raise ValueError(
             f"unknown batched route {batched_route!r} (known: "
             f"{'|'.join(BATCHED_ROUTE_CHOICES)})")
-    resolved = resolve_backend(op, backend, mesh_xy, n=n)
+    capacity_refusal = None
+    if op == "eigh" and budget_bytes is not None and str(backend).strip().lower() == "auto":
+        # Local where a stack fits the room, the platform's whole-mesh eigh
+        # where it does not (resolve_eigh_capacity; refused by name at that
+        # stack when this mesh has none).
+        resolved, capacity_refusal = resolve_eigh_capacity(mesh_xy, n=n)
+    else:
+        # A room caps the size route of ``distributed`` as well (guard 1b): one
+        # whole matrix per rank must fit it, or the leg's library runs.
+        resolved = resolve_backend(op, backend, mesh_xy, n=n, room=budget_bytes)
+    if (route_defaulted and batched_route == ROUTE_BATCH_RESHARD
+            and _size_routed_library(op, backend, mesh_xy, n, resolved)):
+        # Route (c) solves each matrix WHOLE on one device: exactly what the size
+        # route just ruled out for this n.  Left as the default it ran a 20480
+        # complex LU on one GCD of a plan that reports slate (MI250X P4,
+        # dlascale probe1); the leg library's own route runs instead.  An
+        # explicit batched_route is honoured as named.
+        batched_route = "auto"
     ffi = resolved != NATIVE
     if budget_bytes is not None:
         import operator
         budget_bytes = operator.index(budget_bytes)
         if budget_bytes < 0:
             raise ValueError(f"budget_bytes must be non-negative, got {budget_bytes}")
-    face = ffi or batched_route == ROUTE_BATCH_RESHARD
+    face = ffi or batched_route == ROUTE_BATCH_RESHARD or capacity_refusal is not None
     tile = NamedSharding(mesh_xy, P("x", "y")) if face else None
     stack = NamedSharding(mesh_xy, P(None, "x", "y")) if face else None
     if batched_route == ROUTE_BATCH_RESHARD or budget_bytes is not None:
@@ -1199,4 +1753,5 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
                 mesh=mesh_xy, n=None if n is None else int(n),
                 in_sharding=tile, batch_in_sharding=stack,
                 requested_batched_route=batched_route,
-                budget_bytes=budget_bytes)
+                budget_bytes=budget_bytes, capacity_refusal=capacity_refusal,
+                size_route=size_route_note(op, backend, mesh_xy, n, resolved, budget_bytes))

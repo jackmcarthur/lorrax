@@ -149,7 +149,9 @@ def _chol_2d_single(mesh: Mesh, J: int, b: int):
 
         def right_solve_LH(block, L):
             """Solve X @ L^H = block for X."""
-            return solve_triangular(L.conj(), block.T, lower=True, trans="N").T
+            from distrib_la.local_lu import tri_solve_local   # 2^31-byte span route (ROCM)
+            return tri_solve_local(L.conj(), block.T, native=lambda l, b: solve_triangular(
+                l, b, lower=True, trans="N")).T
 
         def body_k(A_local, k):
             diag_px = k // J_row           # who owns diagonal block (k, k)
@@ -167,7 +169,7 @@ def _chol_2d_single(mesh: Mesh, J: int, b: int):
                 A_local)
 
             # 2. Broadcast Lkk via psum (tree-based, O(log P)).
-            Lkk = lax.psum(
+            Lkk = lax.psum(  # exact-reduce: diagonal-block owner's tile, zeros elsewhere
                 jnp.where(is_diag_owner, Lkk_local, jnp.zeros((b, b), dtype)),
                 ("x", "y"))
 
@@ -199,7 +201,7 @@ def _chol_2d_single(mesh: Mesh, J: int, b: int):
                     panel.at[i_glob].set(A_local[i_loc, k_loc_col]),
                     panel)
 
-            panel = lax.psum(
+            panel = lax.psum(  # exact-reduce: column-k owners fill disjoint rows
                 lax.fori_loop(0, J_row, fill_panel, panel_init), ("x", "y"))
 
             # 5. SYRK: update blocks (i, j) with i > k, j > k, i >= j.

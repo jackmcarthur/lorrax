@@ -27,6 +27,7 @@ from functools import partial
 
 from solvers.chebyshev import jackson_coefficients
 from solvers.dos import compute_dos, dos_weighted_windows, compute_window_partition, DOSResult
+from distrib_la import eigh_local
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -326,7 +327,7 @@ def _galerkin_ritz_cj(
     H_proj = jnp.einsum('kd,ld->kl', jnp.conj(Q), HQ)
     H_proj = 0.5 * (H_proj + H_proj.conj().T)
 
-    theta, S = jnp.linalg.eigh(H_proj)
+    theta, S = eigh_local(H_proj)
     Xi = jnp.einsum('kl,kd->ld', S.T, Q)  # Ritz vectors (k, dim)
     return Xi, theta
 
@@ -369,7 +370,7 @@ def _galerkin_ritz_dav(
     H_proj = jnp.einsum('nk,n,nl->kl', jnp.conj(overlap), E_j, overlap)
     H_proj = 0.5 * (H_proj + H_proj.conj().T)
 
-    theta, S = jnp.linalg.eigh(H_proj)
+    theta, S = eigh_local(H_proj)
     Xi = jnp.einsum('kl,kd->ld', S.T, Q)
 
     return np.asarray(Xi), np.asarray(theta)

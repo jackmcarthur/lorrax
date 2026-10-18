@@ -43,6 +43,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._result_check import native_eigh
 from jax import shard_map
+from distrib_la.local_lu import solve_local
 from distrib_la.resolve import mesh_key
 
 __all__ = ["batch_layout", "batch_layout_eigh_call", "batch_reshard_call",
@@ -232,7 +233,7 @@ def _dense_real_rows(
             operand = (A1, B1)
 
             def _work(ab):
-                return jnp.linalg.solve(ab[0], ab[1])
+                return solve_local(ab[0], ab[1])
 
             def _skip(ab):
                 return jnp.zeros_like(ab[1])
@@ -473,7 +474,10 @@ def batch_layout_eigh_call(op: str, mesh: Mesh, A, *, real_rows: int | None = No
         fn = jax.jit(shard_map(_body, mesh=mesh, in_specs=(spec, P()),
                                out_specs=(P(), spec), check_vma=False))
         _JIT_CACHE[key] = fn
-    return fn(A, np.int32(nreal))
+    # The count is placed once per distinct (mesh, count), not transferred on
+    # every call as a host scalar (the run's rounds repeat a few counts).
+    from distrib_la._collectives import device_put_process_local_cached
+    return fn(A, device_put_process_local_cached(np.int32(nreal), NamedSharding(mesh, P())))
 
 
 def batch_reshard_call(
@@ -543,7 +547,7 @@ def reshard_program(op: str, mesh: Mesh, signature, rcond=None):
 
             X = (_dense_real_rows(
                     op, A, local[1], nbatch=nbatch, py=py)
-                 if batch_pad else jnp.linalg.solve(A, local[1]))
+                 if batch_pad else solve_local(A, local[1]))
             return _batch_to_face(X, px=px, py=py)[:nbatch]
 
         mapped = shard_map(

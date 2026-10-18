@@ -27,6 +27,47 @@ Native MPI (parallel HDF5, SLATE, ScaLAPACK) — the site MPI, linked directly
 | several CPU processes | `impl=mpi`; startup refuses gloo and an unset or missing `MPITRAMPOLINE_LIB` |
 | GPU | NCCL through XLA ([Perlmutter network transport](machines/perlmutter.md#network-transport-at-startup)) |
 
+## Rank-order reductions {#rank-order-reductions}
+
+A library all-reduce or reduce-scatter (RCCL, NCCL, MPI) adds the P per-rank terms in
+the order its rings or trees take from the devices' physical links. The same P=4 job on
+another GPU set, or with ranks paired differently across MI250X packages, therefore
+rounds differently in the last bit, and the ISDF fit and the shared-pole gates amplify
+that. Measured on Fe V2: Σ_c moved by 4e-7 to 7.5e-7 eV and eqp prints flipped with the
+placement. On hsuite `bisp_sc`, the CT sector's `retained_metric_positive` gate passed or
+failed with the placement (det lane, 2026-10-16).
+
+**Rule.** Every floating sum over mesh ranks is added in rank order:
+
+- **Inside `shard_map`:** use `lxkit.ordered_psum` / `lxkit.ordered_psum_scatter`, with the
+  same arguments as `lax.psum` / `lax.psum_scatter`. They use `all_to_all` and `all_gather`
+  (pure data movement), then `c[0] + … + c[P-1]` on each device. Two ranks, one rank and
+  integer operands go straight to the library collective, at no cost, because those sums
+  are exact.
+- **Outside `shard_map`:** `jnp.sum`, `tensordot`, `@` or `norm` over a sharded dimension
+  makes XLA insert an all-reduce itself, with no `psum` in the source. Use
+  `lxkit.ordered_reduce(local_fn, *arrays)`: each rank's partial, then `ordered_psum`.
+- **Exempt raw calls:** a raw `lax.psum` stays only where the sum is exact at any rank
+  count (integer operand, one owner per element with zeros elsewhere, zeros), marked
+  `# exact-reduce: <reason>` on the call.
+
+**Checks.** `tests/test_reduction_lint.py` refuses an unmarked raw call.
+`LORRAX_REDUCTION_GUARD=log|raise` records or refuses one at trace time, and
+`LORRAX_REDUCTION_TRACE` writes each ordered call's payload. Neither sees an XLA-inserted
+all-reduce. For those, dump the optimized HLO (`--xla_dump_to`) and list `all-reduce` ops
+over three or more devices; the op's `stack_frame_id` names the source line.
+
+**Memory.** At or below the slab (`LORRAX_ORDERED_SLAB_MB`, default 8 MiB) the ordered
+sum holds the operand's `all_to_all` copy, about 1.25x the operand. Above it, the
+reduction runs in slabs inside one loop, with the all-reduce in the operand's own buffer
+as the library all-reduce does, so the extra transient is at most two slabs (16 MiB) at
+any size. That bound is the named cap `T_ord` of the memory rule (`lxkit.ordered_transient_bytes`,
+[memory model](../architecture/memory-model.md#rule)): it comes off the planner budget once. Measured on MI250X compiled programs (det lane, `memgpu.py`): a 64 MiB
+reduce-scatter takes the library's temp plus at most 16 MiB; a slabbed all-reduce takes
+less temp than the library's.
+
+**Cost.** Fe V2 P=4 total 93.07 s against 93.81 s before the change, within noise.
+
 ## Why CPU collectives run on MPI {#why-mpi}
 
 jaxlib 0.9.1 offers two CPU collective implementations, `gloo` (its default)

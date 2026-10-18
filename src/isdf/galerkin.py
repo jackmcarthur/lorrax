@@ -21,6 +21,7 @@ import os
 import time
 
 import jax
+from lxkit import ordered_psum, ordered_psum_scatter
 import jax.numpy as jnp
 import numpy as np
 from jax.scipy import linalg as jsp_linalg
@@ -195,7 +196,7 @@ def _galerkin_rank_metrics_kernel(mesh, shape, *, selected_rows, physical):
             valid[:, None, None], jnp.abs(gram-jnp.eye(nb, dtype=gram.dtype)), 0.0)), axes)
         missing_norm = jax.lax.pmax(jnp.max(jnp.where(
             valid[:, None], jnp.abs(row_norm-1.0), 0.0)), axes)
-        norm_sum = jax.lax.psum(jnp.sum(jnp.where(valid[:, None], row_norm, 0.0)), axes)
+        norm_sum = ordered_psum(jnp.sum(jnp.where(valid[:, None], row_norm, 0.0)), axes)
         return (jnp.min(jnp.real(jnp.diag(factor))[:physical]),
                 orthogonality, missing_norm,
                 jnp.sqrt(jnp.maximum(0.0, 1.0-norm_sum/(nk*nb))),
@@ -1278,7 +1279,7 @@ def _reduce_device_partials(acc, mesh: Mesh):
         @partial(shard_map, mesh=mesh, in_specs=(spec,), out_specs=P(),
                  check_vma=False)
         def _sum(local):
-            return jax.lax.psum(local, ('x', 'y'))
+            return ordered_psum(local, ('x', 'y'))
 
         fn = _PARTIAL_REDUCE_KERNELS[key] = jax.jit(
             _sum, in_shardings=NamedSharding(mesh, spec),
@@ -1476,8 +1477,15 @@ def _selected_gram_from_projection(projection, *, selected_states,
 def _solve_selected_basis_rows(factor, selected_rows):
     """Evaluate ``B = L^-1 X`` with spin kept outside the solve axis."""
     rhs = jnp.moveaxis(selected_rows, 1, 0)
-    basis = jax.vmap(
-        lambda x: jsp_linalg.solve_triangular(factor, x, lower=True))(rhs)
+    from distrib_la import local_lu_routes as routes, tri_solve_local
+    if rhs.ndim == 3 and routes(factor.shape, (rhs.shape[1], rhs.shape[0] * rhs.shape[2]), factor.dtype):
+        # 2^31-byte span route (ROCM): the batch becomes columns of one solve.
+        s, r, m = rhs.shape
+        cols = jnp.moveaxis(rhs, 0, 1).reshape(r, s * m)
+        basis = jnp.moveaxis(tri_solve_local(factor, cols).reshape(r, s, m), 1, 0)
+    else:
+        basis = jax.vmap(
+            lambda x: jsp_linalg.solve_triangular(factor, x, lower=True))(rhs)
     return jnp.moveaxis(basis, 0, 1)
 
 
@@ -1662,7 +1670,9 @@ def _coefficients_from_projection(projection, factor):
     """``C = (Psi X^H) L^-H``, i.e. ``C^H = L^-1 (Psi X^H)^H``."""
     nk, nb, rank = projection.shape
     rhs = jnp.conj(projection.reshape(nk * nb, rank)).T
-    c_h = jsp_linalg.solve_triangular(factor, rhs, lower=True)
+    from distrib_la import tri_solve_local   # 2^31-byte span route (ROCM)
+    c_h = tri_solve_local(factor, rhs,
+                          native=lambda l, b: jsp_linalg.solve_triangular(l, b, lower=True))
     return jnp.conj(c_h).T.reshape(nk, nb, rank)
 
 
@@ -1712,7 +1722,7 @@ def _reduce_projection_partials(acc, mesh: Mesh):
     @partial(shard_map, mesh=mesh, in_specs=source, out_specs=target,
              check_vma=False)
     def _sum(local):
-        return jax.lax.psum_scatter(local, ("x", "y"),
+        return ordered_psum_scatter(local, ("x", "y"),
                                     scatter_dimension=2, tiled=True)
 
     return jax.jit(_sum, in_shardings=NamedSharding(mesh, source),
@@ -1798,7 +1808,7 @@ def _basis_at_nodes_from_selected_chunks(
         take = node_r - local_start
         owns = valid & (take >= 0) & (take < local.shape[-1])
         values = local[..., jnp.clip(take, 0, local.shape[-1] - 1)]
-        return jax.lax.psum(jnp.where(owns, values, 0.0), ('x', 'y'))
+        return jax.lax.psum(jnp.where(owns, values, 0.0), ('x', 'y'))  # exact-reduce: one owner per node, zeros elsewhere
 
     sample = jax.jit(_sample, in_shardings=(r_layout, rep, rep), out_shardings=rep)
 

@@ -1,0 +1,302 @@
+"""The platform legs are one table (``lxkit.legs.LEGS``) that every loader reads.
+
+CPU only; the registry and the native-provider policy need no jax, the loader
+cells import ``ffi.common.ffi_loader`` / ``distrib_la.loader`` and skip without it.
+Run: ``PYTHONPATH=src:services/lxkit/src:services/distrib_la/src python3 -m pytest
+tests/test_platform_legs.py``.
+"""
+import os
+import sys
+
+import pytest
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.join(_REPO, "src"), os.path.join(_REPO, "services", "lxkit", "src"),
+           os.path.join(_REPO, "services", "distrib_la", "src")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import lxkit                                                     # noqa: E402
+from lxkit import legs                                           # noqa: E402
+from lxkit import native_provider as native                      # noqa: E402
+
+
+# ---- the table -----------------------------------------------------------------
+
+def test_the_cuda_and_host_legs_keep_their_historical_facts():
+    """Sealed bundles, site modules and LORRAX_FFI_SO pins depend on these values."""
+    cuda, host = legs.LEGS["CUDA"], legs.LEGS["cpu"]
+    assert (cuda.so_name, cuda.so_env, cuda.build_subdir, cuda.c_abi_suffix,
+            cuda.abi_symbol) == ("liblorrax_ffi.so", "LORRAX_FFI_SO", "build", "",
+                                 "lorrax_ffi_cuda_abi_version")
+    assert (host.so_name, host.so_env, host.build_subdir, host.c_abi_suffix,
+            host.abi_symbol) == ("liblorrax_ffi_host.so", "LORRAX_FFI_HOST_SO",
+                                 "build_host", "_host", "lorrax_ffi_host_abi_version")
+
+
+def test_the_runtime_vendor_facts_are_declared_per_leg():
+    """The CUDA row carries the values the runtime hard-coded before they were leg facts;
+    the host leg declares none (exact-zero scratch, no reader, no collective library)."""
+    cuda, rocm, host = legs.LEGS["CUDA"], legs.LEGS["ROCM"], legs.LEGS["cpu"]
+    fields = ("fft_plan_scratch", "outside_pool_api", "memory_telemetry",
+              "collective_library", "collective_net_plugin")
+    assert tuple(getattr(cuda, f) for f in fields) == (
+        "cufft", "cuda_driver_mempool", "nvidia-smi", "nccl", "libnccl-net.so")
+    assert tuple(getattr(rocm, f) for f in fields) == (
+        "hipfft", "hip_runtime_arena", "hip_runtime", "rccl", "librccl-net.so")
+    assert all(not getattr(host, f) for f in fields) and host.profiler == ()
+    assert cuda.profiler[2] == 0 and rocm.profiler == ("rocprofv3", "librocprofiler-sdk-tool", 1)
+    from runtime import aot_memory, xla_memory
+    for leg in (cuda, rocm):
+        assert leg.fft_plan_scratch in aot_memory._PLAN_APIS
+        assert leg.outside_pool_api in xla_memory._OUTSIDE_POOL_READERS
+        assert leg.memory_telemetry in xla_memory._TELEMETRY
+
+
+def test_every_leg_fact_that_must_be_distinct_is_distinct():
+    """Both libraries are dlopened RTLD_GLOBAL in one process: a shared file name,
+    pin, C-ABI suffix or ABI symbol lets one leg answer for another."""
+    rows = list(legs.LEGS.values())
+    for field in ("key", "vendor", "so_name", "so_env", "build_subdir",
+                  "c_abi_suffix", "abi_symbol"):
+        values = [getattr(r, field) for r in rows]
+        assert len(set(values)) == len(values), (field, values)
+    assert all(k == r.key for k, r in legs.LEGS.items())
+
+
+def test_vendor_map_is_derived_from_the_legs():
+    assert dict(lxkit.FFI_PLATFORM_MAP) == {"cpu": "cpu", "cuda": "CUDA", "rocm": "ROCM"}
+    assert legs.leg_for_vendor("rocm") is legs.LEGS["ROCM"]
+    assert legs.leg_for_vendor("tpu") is None
+
+
+# ---- hosting a device leg, before any backend exists ------------------------------
+
+def _fs(*present):
+    return lambda pattern: pattern in present
+
+
+@pytest.mark.parametrize("env, nodes, want", [
+    ({}, ("/dev/nvidiactl",), "CUDA"),
+    ({}, ("/dev/kfd",), "ROCM"),
+    ({}, (), None),
+    ({"JAX_PLATFORMS": "cpu"}, ("/dev/nvidiactl", "/dev/kfd"), None),
+    ({"JAX_PLATFORMS": "cuda,cpu"}, ("/dev/nvidiactl",), "CUDA"),
+    ({"JAX_PLATFORMS": "gpu"}, ("/dev/nvidiactl",), "CUDA"),
+    ({"JAX_PLATFORMS": "rocm,cpu"}, ("/dev/kfd",), "ROCM"),
+    ({"JAX_PLATFORMS": "rocm"}, ("/dev/nvidiactl",), None),        # asked for ROCm, none here
+    ({"CUDA_VISIBLE_DEVICES": ""}, ("/dev/nvidiactl",), None),     # masked
+    ({"ROCR_VISIBLE_DEVICES": ""}, ("/dev/kfd",), None),
+    ({"HIP_VISIBLE_DEVICES": ""}, ("/dev/kfd",), None),
+    ({"CUDA_VISIBLE_DEVICES": "0"}, ("/dev/nvidiactl",), "CUDA"),
+    ({}, ("/usr/lib/wsl/lib/libcuda.so.1",), "CUDA"),               # WSL2
+])
+def test_process_accelerator_leg(env, nodes, want):
+    leg = legs.process_accelerator_leg(environ=env, exists=_fs(*nodes))
+    assert (leg.key if leg else None) == want
+
+
+def test_the_cuda_answer_is_the_one_the_loaders_used_to_give():
+    """The removed ``process_can_use_cuda``: JAX_PLATFORMS first entry in
+    {unset, cuda, gpu}, CUDA_VISIBLE_DEVICES not empty, an NVIDIA node."""
+    def old(env, nvidia):
+        first = env.get("JAX_PLATFORMS", "").split(",")[0].strip().lower()
+        if first and first not in ("cuda", "gpu"):
+            return False
+        cvd = env.get("CUDA_VISIBLE_DEVICES")
+        return not (cvd is not None and cvd.strip() == "") and nvidia
+    for env in ({}, {"JAX_PLATFORMS": "cuda"}, {"JAX_PLATFORMS": "gpu,cpu"},
+                {"JAX_PLATFORMS": "cpu"}, {"CUDA_VISIBLE_DEVICES": ""},
+                {"CUDA_VISIBLE_DEVICES": "1"}):
+        for nvidia in (True, False):
+            nodes = ("/dev/nvidiactl",) if nvidia else ()
+            leg = legs.process_accelerator_leg(environ=env, exists=_fs(*nodes))
+            assert ((leg is not None and leg.key == "CUDA") == old(env, nvidia)), (env, nvidia)
+
+
+def test_the_device_leg_opens_before_the_host_leg_once():
+    tried = set()
+    kfd = dict(environ={"JAX_PLATFORMS": "rocm,cpu"}, exists=_fs("/dev/kfd"))
+    assert legs.accelerator_leg_to_open_first("ROCM", {}, tried, **kfd) is None   # not the host leg
+    assert legs.accelerator_leg_to_open_first("cpu", {}, tried, **kfd) == "ROCM"
+    assert legs.accelerator_leg_to_open_first("cpu", {}, tried, **kfd) is None    # one attempt
+    assert legs.accelerator_leg_to_open_first("cpu", {"CUDA": 1}, set(), environ={},
+                                              exists=_fs("/dev/nvidiactl")) is None  # already open
+    assert legs.accelerator_leg_to_open_first("cpu", {}, set(), environ={"JAX_PLATFORMS": "cpu"},
+                                              exists=_fs("/dev/kfd")) is None    # CPU process
+
+
+# ---- native-provider policy over the legs ---------------------------------------
+
+@pytest.mark.parametrize("names, ok", [
+    ({"CUDA", "cpu"}, True), ({"ROCM", "cpu"}, True), ({"CUDA", "ROCM"}, False),
+    ({"CUDA", "ROCM", "cpu"}, False), ({"cpu"}, False), ({"CUDA"}, False),
+    ({"tpu", "cpu"}, False),
+])
+def test_a_bundle_binds_the_host_leg_and_one_device_leg(names, ok):
+    assert native._is_leg_pair(names) is ok
+
+
+@pytest.mark.parametrize("name", [
+    "libamdhip64.so.6", "libhsa-runtime64.so.1", "libamd_comgr.so.3", "libhiprtc.so.6",
+    "libhipblas.so.2", "librocblas.so.4", "libhipfft.so.0", "librocfft.so.0",
+    "librocsolver.so.0", "librccl.so.1", "libamd_smi.so.26",
+    "libcudart.so.13", "libnccl.so.2",
+])
+def test_device_runtime_libraries_are_never_bundled(name):
+    with pytest.raises(OSError, match="runtime-owned"):
+        native.refuse_private_library(name)
+
+
+def test_engine_private_libraries_still_bundle():
+    native.refuse_private_library("libslate.so.2")
+
+
+# ---- both loaders read the one table ----------------------------------------------
+
+def _loaders():
+    pytest.importorskip("jax")
+    from ffi.common import ffi_loader
+    from distrib_la import loader as dl
+    return ffi_loader, dl
+
+
+def test_both_loaders_derive_the_same_leg_specs():
+    ffi_loader, dl = _loaders()
+    fields = ("so_name", "env", "build_subdir")
+    for loader in (ffi_loader, dl):
+        assert set(loader._PLATFORMS) == set(legs.LEGS)
+        for key, leg in legs.LEGS.items():
+            assert (loader._PLATFORMS[key]["so_name"], loader._PLATFORMS[key]["env"],
+                    loader._PLATFORMS[key]["build_subdir"]) == (
+                        leg.so_name, leg.so_env, leg.build_subdir)
+        assert loader._ABI_SYMBOLS == {k: l.abi_symbol for k, l in legs.LEGS.items()}
+        assert loader._C_ABI_SUFFIX == {k: l.c_abi_suffix for k, l in legs.LEGS.items()}
+    assert ({k: tuple(v[f] for f in fields) for k, v in ffi_loader._PLATFORMS.items()}
+            == {k: tuple(v[f] for f in fields) for k, v in dl._PLATFORMS.items()})
+
+
+def test_the_rocm_leg_is_declared_and_refused_by_its_file_name(monkeypatch):
+    ffi_loader, dl = _loaders()
+    monkeypatch.delenv("LORRAX_FFI_ROCM_SO", raising=False)
+    monkeypatch.delenv("LORRAX_FFI_HOST_SO", raising=False)
+    # A ROCm library an earlier in-process test loaded must not answer for the missing file.
+    monkeypatch.delitem(ffi_loader._LIBS, "ROCM", raising=False)
+    monkeypatch.delitem(dl._LIBS, "ROCM", raising=False)
+    with pytest.raises(ffi_loader.FfiLibraryNotBuilt, match="liblorrax_ffi_rocm.so"):
+        ffi_loader.get_lib("ROCM")
+    with pytest.raises(dl.LibraryNotBuilt, match="liblorrax_ffi_rocm.so"):
+        dl.get_lib("ROCM")
+    ok, reason = ffi_loader.probe_target("lorrax_phdf5_write", "ROCM")
+    assert not ok and "ROCM" in reason
+
+
+def test_the_rocm_leg_carries_exactly_its_ported_families():
+    """The ROCM table is the CUDA one's shared families (the device legs compile the
+    same sources) -- exactly the families ffi.common.families marks built on ROCM --
+    plus the leg's own families (kdft: the CUDA leg serves those operations with mathdx)."""
+    from ffi.common.families import built_prefixes
+    ffi_loader, dl = _loaders()
+    rocm = ffi_loader._PLATFORMS["ROCM"]["targets"]
+    own = ffi_loader._ROCM_OWN_TARGET_SYMBOLS
+    shared = {t: s for t, s in rocm.items() if t not in own}
+    prefixes = tuple(p for p in built_prefixes("ROCM")
+                     if any(t.startswith(p) for t in ffi_loader._CUDA_TARGET_SYMBOLS))
+    assert set(prefixes) == {"lorrax_phdf5_", "lorrax_slate_", "lorrax_cublas_local_", "lorrax_active_gemm_"}
+    assert shared and all(t.startswith(prefixes) for t in shared)
+    assert all(ffi_loader._CUDA_TARGET_SYMBOLS[t] == s for t, s in shared.items())
+    assert {t for t in ffi_loader._CUDA_TARGET_SYMBOLS if t.startswith(prefixes)} == set(shared)
+    # The leg's own targets: the kdft families, SLATE's LU (CUDA's LU is cusolvermp) and the
+    # batched local eigh (CUDA's is jaxlib's cuSOLVER).
+    lu = {"lorrax_slate_batched_solve_lu_factors", "lorrax_slate_batched_getrf",
+          "lorrax_slate_batched_getrs"}
+    eigh = {"lorrax_rocsolver_batched_eigh"}
+    lulocal = {"lorrax_rocsolver_lu_solve", "lorrax_rocsolver_tri_solve"}   # the one-device LU solve (cpp/rocsolver/)
+    fplan = {"lorrax_fourier_plan_rocm"}          # LocalFourierPlan's ROCM leg (cpp/hipfft/)
+    agemm = {"lorrax_active_gemm_device", "lorrax_active_gemm_device_out"}
+    elpa = {"lorrax_elpa_eigh"}                  # the ROCM distributed eigh (cpp/elpa/)
+    assert own and all(t.startswith("lorrax_kdft_") or t in lu | eigh | lulocal | fplan | elpa
+                       for t in own)
+    assert elpa <= set(own)
+    assert fplan <= set(own)
+    # The device-bounds active GEMM is built on both legs: shared (from the CUDA table), not own.
+    assert agemm <= set(shared) and not agemm & set(own)
+    assert eigh <= set(own)
+    assert lulocal <= set(own)
+    assert lu <= set(own)
+    assert not set(own) & set(ffi_loader._CUDA_TARGET_SYMBOLS)
+    assert all(rocm[t] == s for t, s in own.items())
+    # distrib_la's ROCM table: the SLATE family, its LU entries included, the batched eigh and
+    # the active-subspace family (the CUDA symbols, less the NCCL-context distributed_ortho), and
+    # the local active-range GEMM (the CUDA leg's leg-neutral source, the same symbols).
+    dl_rocm = dl._PLATFORMS["ROCM"]["targets"]
+    assert dl_rocm and all(t.startswith(("lorrax_slate_", "lorrax_active_subspace_", "lorrax_cublas_local_"))
+                           or t in eigh | lulocal | agemm | elpa for t in dl_rocm)
+    active = {t for t in dl_rocm if t.startswith("lorrax_active_subspace_")}
+    assert active == {t for t in dl._CUDA_TARGET_SYMBOLS if t.startswith("lorrax_active_subspace_")
+                      } - {"lorrax_active_subspace_distributed_ortho", "lorrax_active_subspace_eigh"}
+    assert all(dl_rocm[t] == dl._CUDA_TARGET_SYMBOLS[t] for t in active)
+    assert all(dl_rocm[t] == rocm[t] for t in agemm)
+    assert all(dl_rocm[t] == ffi_loader._CUDA_TARGET_SYMBOLS[t] for t in dl_rocm
+               if t.startswith("lorrax_cublas_local_"))
+    assert lu | eigh | elpa <= set(dl_rocm) and all(dl_rocm[t] == rocm[t] for t in lu | eigh | elpa)
+    cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
+    section = cmake[cmake.index('STREQUAL "rocm"'):]
+    block = section[:section.index("add_library(lorrax_ffi_rocm")]
+    assert "phdf5/read_ffi.cc" in block and "cusolvermp/" not in section
+    assert "kdft/kdft_klead_ffi.cc" in block and "common/rtc_build.cc" in block
+    assert "cublas/local_active_gemm_ffi.cc" in block
+    assert "active_gemm/active_gemm_device_ffi.cc" in block
+    assert "slate/eigh_ffi.cc" in section       # bound with target_sources when SLATE is found
+
+
+def test_the_family_table_matches_the_loaders_routers_and_build():
+    """ffi.common.families is the one per-leg declaration: every registered target belongs to
+    a family built on its leg, every built family registers a target there, the ROCm k-leading
+    router serves kdft targets only, and the ROCM CMake block compiles each ROCM-built family."""
+    from ffi.common import families as fam
+    ffi_loader, dl = _loaders()
+    for leg in legs.LEGS:
+        targets = set(ffi_loader._PLATFORMS[leg]["targets"]) | set(dl._PLATFORMS[leg]["targets"])
+        for target in targets:
+            name = fam.family_of(target)
+            assert name is not None, target
+            assert fam.state(name, leg)[0] == "built", (target, leg)
+        for name, row in fam.FAMILIES.items():
+            assert set(row.legs) == set(legs.LEGS) and all(s in fam.STATES for s, _ in row.legs.values())
+            if row.legs[leg][0] == "built":
+                assert any(t.startswith(row.prefixes) for t in targets), (name, leg)
+            if row.legs[leg][0] in ("elsewhere", "refused", "host"):
+                assert row.legs[leg][1], (name, leg)
+    import ffi.fft as fft
+    assert {fam.family_of(t) for t in fft._ROCM_KLEAD_TARGETS.values()} == {"kdft"}
+    cmake = open(os.path.join(_REPO, "src", "ffi", "cpp", "CMakeLists.txt")).read()
+    import re
+    section = cmake[cmake.index('STREQUAL "rocm"'):]
+    nxt = re.search(r"^(elseif|else)\(", section[1:], re.M)
+    section = section[:nxt.start() + 1] if nxt else section
+    block = section[:section.index("add_library(lorrax_ffi_rocm")]
+    # A family is built on ROCM iff one of its translation units is compiled in the ROCM section
+    # (set(...SOURCES) or target_sources); headers embedded for hipRTC (cufft/kbox_stage.cuh) do not count.
+    compiled = {u.split("/")[0] for u in re.findall(r"\b[\w]+/[\w]+\.cc\b", section)}
+    for name, row in fam.FAMILIES.items():
+        assert (row.source in compiled) == (row.legs["ROCM"][0] == "built"), name
+    srcs = block[block.index("set(LORRAX_FFI_ROCM_SOURCES"):]
+    srcs = srcs[:srcs.index(")")]
+    assert "kdft/kbox_unfold_ffi.cc" in srcs and "cufft/" not in srcs
+    # The one cufft/ file the leg reads: the k-box stage's text (leg-neutral; its line transform is
+    # the leg's policy), embedded for hipRTC as the CUDA leg embeds it for NVRTC.
+    assert set(re.findall(r"cufft/[\w.]+", block)) <= {"cufft/kbox_stage.cuh", "cufft/kbox_stage_src.h.in"}
+
+
+def test_the_active_subspace_row_states_the_subspace_route():
+    """The 'active_subspace' family row agrees with its owner, distrib_la.subspace.SUBSPACE_ROUTE
+    (native -> built, xla -> xla, host -> host), read from source so the cell needs no jax."""
+    import ast
+    from ffi.common import families as fam
+    src = open(os.path.join(_REPO, "services", "distrib_la", "src", "distrib_la", "subspace.py")).read()
+    route = next(ast.literal_eval(n.value) for n in ast.parse(src).body
+                 if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "SUBSPACE_ROUTE")
+    assert set(route) == set(legs.LEGS)
+    for leg, provider in route.items():
+        assert fam.state("active_subspace", leg)[0] == {"native": "built"}.get(provider, provider), leg

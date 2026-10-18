@@ -27,6 +27,462 @@ process).
 - **Decks.** A bulk export of `eps0mat` adds `q0_body_3d = omit_head_wing`
   or exports `files = epsmat`.
 
+## 2026-10-18 — On-shell Sigma sweep checkpointed (one-shot restart)
+
+A one-shot shared-pole run on the default on-shell path now writes its swept
+Σ_c, the pair and diagonal slots, to `tmp/sigma_checkpoint_oneshot_on_shell.h5`
+(`file_io.sigma_checkpoint`, the grid path's mechanism and payoff rule). A
+rerun with `restart = true` whose checkpoint authenticates skips the τ sweep
+and goes straight to finalize. Before this, the on-shell sweep was recomputed
+on every restart. The identity is the grid path's plus the evaluation and the
+on-shell request tables (E_eval, E_DFT, coverage). A run whose energies moved
+recomputes, and the old file is removed with a named WARNING. The grid and
+on-shell sweeps never read each other's file. SC runs are unchanged: they
+continue at map granularity from `sc_seed/sc_checkpoint.h5`.
+
+- **Results unchanged.** Measured on Fe 8^3 (MPA shared pole, one-shot,
+  4 A100 ranks) against `6f7b2ca26`: the eqp0/eqp1/eqp_g0w0/sigma_diag
+  bodies, every `sigma_mnk.h5` and `qp_wfn_rotations.h5` dataset and
+  attribute, and the per-rank device peak are bitwise equal. The restart
+  that reads the checkpoint reproduces them bitwise.
+- **Cost.** 27.3 MiB, written in 0.3 s after a 105 s sweep. The restart
+  reads it in 0.5 s, and its wall falls from 144.3 s to 49.8 s.
+- **Grid debug path** (`sigma_omega_grid_debug = true`): outputs and its
+  checkpoint file are byte-identical to `6f7b2ca26`, and its restart still
+  reads it.
+- **Files.** A new `tmp/` file per one-shot run. It is written only when
+  `write_restart_tensors` is on and the sweep took at least 5× its predicted
+  write.
+
+## 2026-10-18 — Sigma(omega) grid debug restored
+
+The ω-grid Σ_c(ω) path is back as an opt-in debug path,
+`sigma_omega_grid_debug = true` (default false; [On-shell Σ_c §grid
+debug](docs/theory/sigma-on-shell.md#grid-debug)). With the key set, every
+output is the one `c2975e450` wrote with the same key. That covers the
+`(n_ω, nk, nb, nb)` cube and `omega_ev` in `sigma_mnk.h5`, eqp0/eqp1 from the
+interpolated Σ_c and the stencil Z, the C(ω) eqp receipt (and
+`python -m gw.eqp_bgw --finite-difference-spacing`), `sigma_freq_debug.dat`,
+the SC `sigC`/`sigXC` columns, and the one-shot sweep checkpoint
+(`tmp/sigma_checkpoint_oneshot.h5`, written and read on restart).
+`qp_omega0_ev` (`write_qsgw_datasets`) is back as `c2975e450` had it: written
+for an unsharded cube only. Under `sigma_omega_layout = sharded` it is
+omitted by name, as before; that held on every validation leg (4 ranks and
+1), so it was not compared bitwise.
+
+- **Default path unchanged.** With the key unset, results are bitwise those
+  of `663c27863` (the on-shell entry below). Measured on Fe 8^3 (MPA shared
+  pole, 4 A100 ranks, SC map and one-shot): the eqp0/eqp1/sigma_diag bodies,
+  every `sigma_mnk.h5` dataset and attribute, the Response-quadrature lines
+  and the per-rank device peak.
+- **Grid outputs as before.** With the key, on the same deck, the same files
+  plus the cube, `omega_ev`, `sigma_freq_debug.dat`, the C(ω) receipt and the
+  sweep checkpoint (written, and read on restart) are bitwise those of
+  `c2975e450`.
+- **Cost under the key.** On that deck (n_ω = 271) `sigma_mnk.h5` grows
+  from 7.9 MiB to 714 MiB and the τ sweep from 105.3 s to 122.3 s; the
+  per-rank device peak does not move (the W response sets it). A one-shot
+  run also writes a 2.99 GiB sweep checkpoint.
+- **eqp2 stays retired.** `write_eqp2`, `eqp2_tol_ev`, `eqp2_max_iter`,
+  `eqp2_accelerator`, `eqp2_history_depth` and `eqp2_file` still refuse by
+  name at parse time, now as `GATE eqp2_retired`; `sigma_omega_grid_debug`
+  no longer refuses. `eqp2.dat` is not written.
+- **Not restored:** the `omega_ev`/`sigc_omega_ev_{re,im}` curve of
+  `python -m gw.plane_wave_pipeline --deck` (it stays on shell).
+- **API:** `DebugConfig.sigma_omega_grid_debug` is back;
+  `DeviceOmegaAccumulator.grid(...)` builds the grid accumulator.
+  `LorraxConfig.eqp2`, `EQP2Config` and `FilePaths.eqp2_file` stay removed.
+- **What you must change:** nothing for default decks. A deck that dropped
+  `sigma_omega_grid_debug = true` because of the retirement may set it again.
+
+## 2026-10-17 — ROCm: ELPA is the distributed eigensolver
+
+On Frontier (ROCm), `eigh` with `linalg = "distributed"` above the one-device
+bound (`ONE_DEVICE_MAX_N`, unchanged) now runs ELPA 2026.02.001's one-stage GPU
+solver (`backend elpa`), in place of SLATE's `heev`. SLATE stays selectable
+(`backend = "slate"`) and still serves `potrf` and `solve_lu`. Measured on 2x2
+MI250X GCDs (`ELPA_ROCM_REPORT.md`): complex128 n = 20480 in 26 s through
+`distributed` (SLATE: 122 s), n = 51200 in 211 s (SLATE aborts at 30720).
+Residual and orthogonality ~1e-14.
+
+- **Which results move.** Only runs that diagonalise a matrix above the
+  one-device bound on ROCm: eigenvalues and eigenvectors change at rounding
+  level (a different algorithm). Runs at or below the bound (Fe P=4 among
+  them) are bitwise unchanged.
+- **Memory.** During the solve, ELPA's device buffers and the workspaces of
+  all of its rocBLAS/rocSOLVER handles come from one XLA workspace (inside the
+  arena, sized from measured high-waters). ELPA's input is the operand's
+  transposed temporary, aliased, so there is no copy. Between calls the
+  handles hold no device memory. Measured at n = 51200 on 2x2, the process's
+  device memory outside the arena peaked at 2.30 GB (allowance
+  `DISTRIBUTED_LINALG_OUTSIDE_BYTES` = 3 GB). If a rocBLAS workspace region is
+  too small, the solve **refuses** with
+  `rocBLAS/rocSOLVER call(s) failed during the solve`; it never returns a
+  result.
+- **Two-stage ELPA is not available.** It was slower everywhere measured and
+  returns wrong eigenvectors on 4x4 grids at n >= 47104. There is no option
+  for it, and an `ELPA_FORCE_*` environment variable makes the solve refuse
+  (ELPA would let it override the pinned settings).
+
+**What a user must change.** Rebuild the ROCm leg with
+`config/frontier/build_ffi_rocm.sh`. On first use it builds ELPA with
+`config/frontier/build_elpa_hip.sh` (two LORRAX source patches) into a
+content-keyed prefix. The leg's closure record gains `libelpa_openmp.so.19`
+(private). Unset any `ELPA_FORCE_*` variable.
+
+## 2026-10-17 — Sigma_c on shell only: the ω-grid path and eqp2 are retired
+
+Dynamic Σ_c is evaluated on shell only
+([On-shell Σ_c](docs/theory/sigma-on-shell.md)). The ω-grid debug path
+(`sigma_omega_grid_debug = true`) and everything only it fed are removed.
+That includes the grid fold, the ω-cube unfold and writer, the interpolating
+readers, the finite-difference Z, the streamed ω combination, the C(ω) eqp
+receipt, the sweep checkpoint and fixed-Σ evSC (`eqp2.dat`).
+
+- **Results do not move** on the remaining paths. Measured on Fe 8^3 P4
+  (one SC map, A100), against the previous commit: the eqp0/eqp1 bodies are
+  bitwise identical. The sigma_diag body is identical on every column the
+  two files share; the SC `sigC`/`sigXC` columns are omitted (below). The
+  P4 hsuite passes against its references.
+- **Deck keys removed.** Each one refuses by name at parse time, with any
+  value (`GATE omega_grid_retired`): `sigma_omega_grid_debug`, `write_eqp2`,
+  `eqp2_tol_ev`, `eqp2_max_iter`, `eqp2_accelerator`, `eqp2_history_depth`,
+  `eqp2_file`. Delete the lines; nothing replaces them.
+- **Outputs removed:**
+  - `eqp2.dat` and its report section.
+  - The `(n_ω, nk, nb, nb)` Σ_c(ω) cube and `omega_ev` in `sigma_mnk.h5`.
+  - `qp_omega0_ev` (`write_qsgw_datasets`): named as omitted, permanently.
+  - The C(ω) curve in the eqp receipt (`eqp_assembly_conditioned_sigma_c_omega_diag_ev`).
+  - The `omega_ev` and `sigc_omega_ev_{re,im}` keys of
+    `python -m gw.plane_wave_pipeline --deck`. Its `sigc_at_e_ev` is now the
+    exact on-shell Σ_c,nn(E_DFT): the `dft0` table, Σ(0) outside the covered
+    range, where the old value was a clamped interpolation.
+- **`sigma_diag.dat` under SC** no longer carries a column of zeros for the
+  DFT-basis Σ_c(E_DFT), which on shell does not exist. The `sigC` and
+  `sigXC` columns are omitted and named in a `# omitted:` header line.
+- **`sigma_freq_debug.dat`** (one-shot) reads the on-shell operand: Σ_c at
+  E_DFT and E_eval, dΣ/dω, Z, and the q→0 head at E_DFT. Under SC it is
+  omitted by name.
+- **`eqp_bgw.make_eqp_bgw`** reassembles from the on-shell receipt only. An
+  old ω-grid `sigma_mnk.h5` refuses (`GATE omega_grid_receipt_retired`). The
+  CLI option `--finite-difference-spacing` is gone.
+- **Z guard.** eqp1 and the SC tail weights share one Z
+  (`eqp_bgw.on_shell_z_factor`). It prints one line counting states with Z
+  outside (0, 1] or non-finite, and a non-finite Z refuses
+  (`GATE z_factor_finite`).
+- **SC grid-edge census** (`sigma_out_of_grid = static`) runs on shell again,
+  from two diagonal-only tables, Σ(0) and Σ at the nearer range edge, that
+  the request adds in that mode only.
+- **Restart:** a `sigma_checkpoint_oneshot.h5` from the grid path is no
+  longer read. The on-shell sweep is recomputed on restart, as before.
+- **API:** `mixing.acceleration.rcrop_nojit`, `band_partition.
+  apply_band_partition`/`build_omega_band_partition` and `scissor.
+  qsgw_out_of_range_energies`/`classify_bands_in_grid` are removed (their one
+  caller was eqp2). `LorraxConfig.eqp2`, `EQP2Config`,
+  `DebugConfig.sigma_omega_grid_debug` and `FilePaths.eqp2_file` are gone.
+- **What you must change:** delete the removed keys from decks, and stop
+  reading `eqp2.dat`, `qp_omega0_ev` or an ω axis from `sigma_mnk.h5`.
+
+## 2026-10-17 — k-convolution kernels: four sub-1.15× arms removed (CUDA)
+
+A simplification pass on the mathdx modes 7, 9 and 11 (`src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`,
+`kbox_stage.cuh`). Removed: mode 7's per-call k-fastest index-table kernel (M7KF; the factory now
+forms the k-fastest tables in XLA and passes them to a new target), the m7s split arm at
+n_s = 1, mode 9's four-block W2 rule below N_k = 256 and its fixed-column exception (W2 there now
+runs two blocks a SM), and mode 9's
+persistent split plane pass (m9b); the dead tuning bits of the kernel text; and the duplicated
+pair-order, table-load and axis-pass helpers (now in `kbox_stage.cuh`). The arms that remain are
+listed per mode in [k-convolution §4](docs/architecture/kconv.md#arms).
+
+- **Results do not move:** every remaining arm computes the same lines in the same order (bitwise
+  on the 45-case modes 7/9 sweep, the 21 mode-11 comparisons and the Fe 8³ P4 deck bodies).
+- **Speed:** per call (A100, 45 k-grid cases x modes 7 and 9 against the previous kernels): mode 7
+  up to 1.12× at n_s = 1 on 14³/15³ (the m7s rule), mode 9 1.20–1.22× at 6³ (0.30 -> 0.36 ms) and
+  1.11–1.23× at ≥ 14³; every other case within 1.02× (M7KF's gain is kept: Fe 8³ mode 7 4.06 ms).
+  Mode 11 is unchanged.
+- **Memory:** `ffi.fft.klead_unfold_scratch_bytes` now prices the m7s arm's pair-major W_R (16·N_k B
+  a pair at n_s = 2 on 14³–21³ A100 grids), which the Σ τ window checks already add; before, that
+  arm took up to 25 % more scratch than priced. M7KF's unpriced handler workspace is gone; the
+  k-fastest tables are XLA buffers of `4·N_k·(μ_x + ν_y)·n_s` B a call (2.95 MB on a Fe 8³ P4
+  rank), counted by `memory_analysis`.
+- **New target:** mode 7 calls `lorrax_mathdx_kconv_klead_unfold_kf` (`_xblock` plus the k-fastest
+  tables; a new handler, so no ABI bump). A CUDA leg without it refuses at startup
+  (`GATE kconv-target`); `_xblock` stays for older trees and runs the chain arm there.
+- **Startup:** `require_kconv` also probes `lorrax_mathdx_kconv_chi_unfold_q`, so a CUDA leg older than
+  that target refuses at startup (`GATE kconv-target`), not at the first W stream.
+- **`make_kconv_chi_unfold(rows=...)`:** a static `rows` outside `[0, N_k)` raises `ValueError`.
+- **Build log:** the `[kconv_mathdx]` line names `variant=` and `arm=`.
+- **What you must change:** nothing in decks or environment, and no handler signature moved (ABI
+  unchanged). The kernel text changed, so the cubin store recompiles each (mode, grid) once
+  (about 8 s each); the module is republished with a bundle from this commit.
+
+## 2026-10-17 — Dyson response programs: one compile per LU decision on the CUDA room leg
+
+Under `linalg = distributed` on CUDA, the W response's Dyson programs keyed on a figure
+(`one_device`'s bound) that moves with almost any change of the ledger room, so a moved
+room recompiled them. They now key on what the program runs, `(backend, route, rounds)`
+(`distrib_la` `Plan.decision`), and the measured size route's agreed costs are memoised
+without the room, so a new room exchanges, reads and compiles nothing to decide.
+
+- **Results do not move:** the same routes and rounds are chosen as before.
+- **New refusal:** a measured size route whose ranks hold different rooms now refuses by
+  name ("has a room that differs across processes") instead of routing divergently.
+- **What you must change:** nothing.
+
+## 2026-10-17 — W response: warm rule nodes cost 0 in the planner; the q-span row window gathers through its cached program
+
+Two schedule-only changes in `src/gw/response_bank.py`. No rule, energy or output byte moves.
+
+- **Warm rule-tree nodes cost 0 in the round planner** (`_attempt_cost`). A node that holds an
+  earlier map's rule on the same member set is tried first on that rule's nodes: one projection
+  pass and no pencil when it fits. It was priced as a cold attempt (2.4–3.4 s on the device
+  route), so on Fe 8³ SC maps 1–3 the planner deferred warm needed nodes to a round of their own
+  and filled it with cold speculation. They now ride in the round of the failing shared fit.
+  Fe 8³ P4, `sc_max_iter 3`: rule construction −7.6 s and W response −6.7 s summed over the four
+  maps; quadrature lines, `eqp0_iter*.dat` and per-rank peak memory identical.
+- **`_RowWindow.__getitem__` takes rows through the cached `_MemberRows` gather program**
+  instead of eager indexing (1.64 → 0.12 ms dispatch per take; bitwise, same sharding). Fe 8³ P4,
+  `sc_max_iter 1`, two A/B pairs: W response 158.8 / 159.0 s → 157.2 / 157.0 s; `eqp0.dat`,
+  `eqp1.dat` and `sigma_diag.dat` identical.
+- **What you must change:** nothing.
+
+## 2026-10-17 — k-convolution kernels: faster mathdx modes 7, 9 and 11 (CUDA); a new native target
+
+The NVRTC-built k-convolution kernels (`src/ffi/cpp/cufft/kconv_mathdx_cuda_ffi.cc`) gain
+faster arms; every output is bitwise identical to the previous kernels.
+
+- **Mode 7** (W_R pass): a fused single-arm tile for n_s <= 2 (cp.async gather,
+  orbit-blocked tiles, k-fastest index tables) and a split arm (persistent plane pass,
+  pair-major W_R, overlapped column pass) with an n_s = 1 rule. **Mode 9**: batched W2
+  gather and a fixed-column store. **Mode 11** (chi0 from the raw-parent Greens, n_s = 2):
+  a fused single-arm tile; `make_kconv_chi_unfold(acc=None)` writes without an
+  accumulator, and `acc=None, rows=q` stores only the q rows of the flat-k transform
+  through the new target `lorrax_mathdx_kconv_chi_unfold_q`, which `gw.w_isdf`'s direct
+  stream uses wherever `fn.q_store` holds.
+- **Results do not move:** bitwise on 45 k-grid cases x modes 7 and 9 and 21 mode-11
+  comparisons (A100), and Fe 8^3 P4 eqp0/eqp1/sigma_diag bodies. Fe 8^3 P4 one map, warm
+  (A100, BFC default pool): W response 198.6 -> 159.6 s, Sigma tau sweep 141.4 -> 107.0 s,
+  map wall 346.9 -> 273.4 s.
+- **What you must change:** nothing in decks. The Python needs a `liblorrax_ffi.so` built
+  from this source: with an older CUDA leg, an n_s = 2 mode-11 deck fails loudly
+  (`lorrax_mathdx_kconv_chi_unfold_q` unregistered; the old handler refuses `acc=None`).
+  Rebuild a clone's pair (`config/perlmutter/build_ffi_cuda.sh`); the Perlmutter module is
+  republished with a bundle from this commit. The kernel source changed, so the cubin
+  store recompiles each (mode, grid) once (about 8 s each).
+
+## 2026-10-16 — Native dependencies: recorded at build, enforced at start-up, on every route
+
+Every FFI leg's build records the exact library set it resolved, and every
+start-up enforces it, on every route (a clone, the Perlmutter module, a sealed
+bundle) and for every leg (CUDA, ROCm, host)
+([the dependency closure](docs/installation/ffi-build.md#closure)). This closes
+the defect where a plain clone launch on Perlmutter mapped the HPC SDK's
+cuSOLVERMp 0.8 in place of the staged 0.9.1 (the first distributed LU/eigh
+failed with `status=7`), and the site-default LibSci/HDF5 mapped cray-mpich
+9.1.0 beside 9.0.1.
+
+- **Recorded.** `<leg>.closure.json` beside each leg (schema 2): the leg's
+  SHA-256 and every library of its `DT_NEEDED` closure (path, size, mtime,
+  SHA-256, SONAME, family). That covers the cuSOLVERMp/cuBLASMp stage, the
+  GPU math and collective libraries the venv's JAX plugin maps (cuBLAS,
+  cuSOLVER, cuFFT, NCCL; rocBLAS, rocSOLVER, HIP; RCCL attested once JAX maps
+  it), MPI, HDF5, LibSci, SLATE/BLAS++/LAPACK++ and the HIP SLATE's OpenBLAS.
+  `PROVENANCE` gains `closure_sha256`. Sealed bundles (manifest schema 2)
+  carry both records.
+- **Enforced.** The loader opens the recorded files by exact path before the
+  leg. After the leg's `dlopen` it requires every recorded family to be
+  mapped exactly once, as the recorded file (or byte-identical). Otherwise:
+  `GATE native-closure: got <wrong>; want <expected>; fix: <remedy>`. A missing
+  or stale record refuses too. There is no fallback and no warning mode.
+  `LD_LIBRARY_PATH` no longer decides a leg's libraries, so a clone needs no
+  hand-built library path. Each leg logs one `closure … enforced` line and one
+  `closure … libraries:` line naming every family's file and hash: the
+  identity lines for HIP, rocSOLVER, rocBLAS, RCCL, HDF5, MPI, cuSOLVERMp,
+  NCCL and the rest.
+- **Caches.** `lxkit.native_provider.native_closure_identity(platform)` keys
+  every cache that depends on native libraries:
+  - the JAX compile-cache namespace, schema `k2`, so every `k1` namespace is
+    retired by the age pruner. An explicit `ISDF_JAX_CACHE_DIR` is split by
+    the same `ffi-<12 hex>` tag;
+  - the kconv image store and the rocFFT kernel store.
+
+  The first run after upgrading recompiles once.
+
+- **NCCL: one pin, every route.** The `nvidia-nccl-cu13` 2.30.7 wheel (the
+  `uv.lock` pin). The CUDA leg now compiles and links against the wheel, not
+  the HPC SDK's `comm_libs` 2.29.3. The module venv installs the same wheel,
+  its modulefile drops `comm_libs` NCCL, and its sealed bundle records the
+  wheel. A run that maps any other `libnccl` refuses. The NCCL net plugin is
+  unchanged (`config/perlmutter/site.toml`, AWS OFI).
+
+**What a user must change.**
+- **Rebuild every FFI leg** with this tree's build scripts, and build a new
+  module prefix (the module venv gains the NCCL wheel; `setup_env.sh` never
+  refreshes a venv in place). Perlmutter:
+  `config/perlmutter/build_ffi_host.sh`, `build_ffi_cuda.sh`. Frontier:
+  `config/frontier/build_ffi_host.sh`, `build_ffi_rocm.sh`. A leg without a
+  schema-2 record refuses at start-up (`no closure record`). Reseal bundles
+  with this tree's `seal_bundle.py`; a schema-1 bundle refuses.
+- **Rebuild after changing a recorded library**: a `uv sync` that changes the
+  CUDA or ROCm wheels, a SLATE or OpenBLAS rebuild, a moved or purged `.build`,
+  or a site module upgrade in place. The next run refuses with
+  `stale closure record` until the legs are rebuilt.
+- **Drop hand-built library paths.** Launch scripts that prepend the stage or
+  the pinned directories to `LD_LIBRARY_PATH` are no longer needed; they
+  change nothing a leg maps.
+- **No second copy may be mapped.** An `LD_PRELOAD`, or a Python package that
+  loads another MPI, HDF5, cuBLAS, NCCL, rocBLAS, … beside the recorded one
+  (for example an mpi4py built against the site-default MPI), now refuses at
+  start-up instead of running.
+- **A host-leg SLATE op refuses in a device process.** There the device leg's
+  SLATE (Frontier: SLATE-HIP with OpenBLAS) answers the SLATE SONAMEs, so the
+  host leg's `lorrax_slate_*` handlers would run against a library they were
+  not built against. They are not registered, and calling one raises
+  `GATE native-closure: host-leg <target> needs SLATE-CPU but the device leg's
+  SLATE serves this process`. Run SLATE ops on the device mesh, or in a
+  CPU-only process. Closures now merge in `dlopen` order, shared by every
+  loader; before this, a process whose two loaders finished their checks in
+  the other order refused at its first batched eigh (Frontier P=16).
+- **Source the site launch script before a multi-node `srun`.**
+  `config/perlmutter/gpu_env.sh` now links `libcudart.so`, which libfabric
+  dlopens by that name, to the venv's CUDA runtime, first on
+  `LD_LIBRARY_PATH` (Frontier's `rocm_env.sh` already did this for
+  `libhsa-runtime64.so`). A multi-node step whose `libcudart.so` names another
+  file refuses at start-up. Before this, a 4-node clone step ran the
+  toolkit's cudart 13.2.75 for the plugin and the leg, unrecorded.
+- Results: unchanged on the clone route. The enforced libraries are the ones
+  the documented routes already ran. Measured against aff42ce37 (DEP_ENFORCE.md):
+  Fe V2 P=4 bitwise on both machines; Fe V2 P=16 on 4 Perlmutter nodes bitwise,
+  NCCL 2.30.7 over AWS Libfabric with GDRDMA on all 16 ranks and no `NCCL WARN`.
+  Per-rank device peaks are unchanged.
+- **The Perlmutter module carries a clone's CUDA wheels.** Its venv is
+  `uv export --extra cuda13` of the lock (cuBLAS 13.6.1, cuFFT 12.3, the CUDA
+  runtime 13.3, cuDNN 9.24, …), no longer `jax[cuda13-local]` on the toolkit's
+  libraries (cuBLAS 13.4.1). Build a new module prefix: `setup_env.sh` never
+  refreshes a venv. The modulefile lists no toolkit library directory
+  ([Perlmutter](docs/installation/perlmutter.md)). Measured: module Fe V2 P=4
+  is bitwise identical to the clone run of the same tree.
+
+## 2026-10-16 — rocm/integration8: follow-ups on the release
+
+Integration 8 lands the follow-up lanes below on the release `aff42ce37`. Fe V2, MI250X,
+P=4, one node (`/lustre/orion/mat280/scratch/jackmc/int8/<run>/run.r0.log`):
+- Total 89.33 s (release, `int7/feR1`) → 84.92 s (`h5fe1`). Rule construction
+  32.91 → 27.40 s, constructor 14.27 → 12.85 s, Σ τ other 6.13 → 3.73 s.
+- eqp0 / eqp1 are bitwise equal to the release after every group. From syn/w12 on,
+  `sigma_mnk.h5` moves by ≤ 2.2e-14 relative (per dataset, max |Δ| / max |ref|) and
+  `qp_wfn_rotations.h5` `U_mnk` by ≤ 2.6e-11; before it every file is bitwise.
+- Device peak per rank 6.77 GB, as the release, in every stage row. On ROCm a stage row
+  reads the allocator's `peak_bytes_in_use`, which never resets, so every row shows the
+  run's high-water mark (set in ζ), not the stage's own peak.
+- Rank-0 transfer census, release → integration 8 (`int7/cenR` → `int8/h5fe2`): H2D
+  `device_put` 737 → 238, D2H 433 → 348, explicit D2H 74 → 70, `jax.block_until_ready`
+  18 → 5.
+- hsuite P=4: 16/16. Na SC completes (the release refused it, `GATE shared_pole_zero_ritz`
+  at q=2) and matches its reference: eqp max |Δ| 4.0e-7 eV.
+
+**What a user must change.**
+- **Rebuild the FFI libraries** from this tree (`config/frontier/build_ffi_rocm.sh`; host
+  and CUDA likewise). The handler ABI goes 6 → 8: SlabIO's read, read_multi, k-chunk union
+  and write handlers take no control operand ([SlabIO](docs/architecture/slab_io.md#stream-race)),
+  and `active_gemm_device` takes `conj_b`. A library of another ABI refuses at load.
+- New refusals: `GATE phdf5_posted_control`, `GATE slab_io_write_finite`,
+  `GATE shared_pole_round_tables_device`, `GATE shared_pole_ritz_eigh_finite` (an
+  eigensolver failure left after the Jacobi re-solve; such a round used to refuse as
+  `shared_pole_zero_ritz`).
+
+| lane (commit) | what | measured effect (Fe V2 P=4 unless noted) | gate |
+|---|---|---|---|
+| lsync/w5 polar (7e5898496, 005699355), slabmr/w8 (473f3bde9), comm7 T1 (9265e080a), ctor5/w12 (49ada1eaf, 3a7876794) | polar cuts from one device word; SlabIO posted control (ABI 8), device order fence, k-chunk union reader, staging budget; transpose partner without self pairs; constructor round tables, directions recipe and pole counts on the device | constructor 14.27 → 12.77 s; census as above | Fe bitwise (2 runs); phdf5 read_multi, active, kdft gates at P=4 |
+| crash/w9 (b697bce69; int8 bf8041aee: public import) | distinct inert sentinels; Jacobi re-solve of a non-finite local round; `shared_pole_ritz_eigh_finite` | Na SC completes; no re-solve fired in hsuite (the sentinels suffice) | hsuite 16/16; Fe bitwise |
+| syn/w12-i8 (dfce55663) | active GEMM reads B conjugated on load; identity little-group projector; per-branch W orientation | Σ τ other 5.84 → 3.70 s | eqp bitwise, Σ ≤ 2.2e-14 relative |
+| rcgpu (6b8629482) | the rule tree abandons a geometry on its error forecast's prediction bound | rule construction 32.42 → 27.40 s | Fe bitwise |
+
+||||||| parent of 491fd4afc (docs: the build records, and the runtime enforces, every leg's dependency closure)
+## 2026-10-16 — rocm/integration7: the ROCm leg's host syncs, transfers and kernels
+
+Integration 7 lands the lane branches listed below on `rocm/integration6` 4e6b28dfc. The rules
+and tools are in [Host–device sync](docs/architecture/host_device_sync.md),
+[Determinism](docs/architecture/determinism.md),
+[Start-up, environment and caches](docs/architecture/startup_environment.md) and
+[ROCm leg](docs/architecture/rocm_leg.md).
+- Fe V2, MI250X, P=4, one node: total 112.18 s (int6 control, frontier00605)
+  → 91.83 / 90.61 s (frontier00620; there was no int6 control on that node).
+  Rule construction 48.82 → 33.70 / 33.02 s, constructor 17.75 → 13.96 /
+  14.09 s, Σ τ other 7.89 → 6.72 / 6.70 s.
+- Rank-0 transfer census, int6 → int7 tip (`xsync/cen2` → `int7/cen5`): H2D
+  `device_put` 7545 → 713, D2H 2089 → 425, explicit D2H 461 → 71,
+  `block_until_ready` (array + `jax.`) 907 + 117 → 119 + 6. The `jax.` count
+  depends on timing (SlabIO waits only on reads still in flight), so other runs
+  give 6–17 (the lsync/w3 run below: 119 + 7 = 126).
+- eqp against int6/e5 (int7 tip, off-shell Σ_c): 2.3e-8 / 5.0e-8 eV (eqp0 / eqp1); the Fe gate is
+  ≤ 1e-7 eV.
+
+Every wall above is from the integration release notes (rank-0 stage timing;
+`/lustre/orion/mat280/scratch/jackmc/int7/<run>/run.r0.log`); per-lane numbers
+are from the lane's report.
+
+**With main's on-shell Σ_c (this merge).** main makes on-shell dynamic Σ_c the
+default (entry below). Merging it with dput/w2's device Σ window table needed one
+semantic resolution (`ppm_accumulators.integrate_window`/`run_window`,
+`sigma._sigma_window_table`): the shared-pole sweep keeps the window table for its
+operands (nodes, masks, reference energies, intervals), and on shell each window's
+coefficient is main's `_on_shell_pack`, placed once with the table
+(`DeviceOmegaAccumulator.on_shell_coefficients`), so a window still transfers nothing
+from the host. Fe V2 P=4 on the release branch (frontier03277): total 89.33–95.02 s,
+Σ τ other 6.13 s (6.67 s for the off-shell int7 tip on the same node). Against the
+off-shell int7 tip, eqp0 moves ≤ 0.032 eV; eqp1 moves up to 10.4 eV on states on Σ
+pole structure, because Z is now the analytic derivative (Z ∈ [−1.44, 3.20]; 241 of
+1664 states with |ΔZ| > 0.1). The Fe reference is re-established on this branch.
+Follow-up: an on-shell `window_pick` (today the table's dense coefficient is still
+computed on the device and discarded on shell; transient capacity × n_ω complex).
+
+**What a user must change.**
+- **Per-stage walls need `LORRAX_STAGE_SYNC=1`.** Timing-only device waits no
+  longer run by default. Totals are exact, but a stage row is host-attributed:
+  device work is charged to the first later stage that reads it. The stage table
+  prints which attribution is in force.
+- **The environment freezes at start-up step 7b.** A LORRAX write that adds an
+  environment key after that refuses (`GATE env-frozen`); another library's is
+  announced. A warning of either kind in a log is a bug to report.
+- **Rebuild the ROCm FFI library** from this tree (`config/frontier/build_ffi_rocm.sh`).
+  New handlers: `kdft_kconv_parent`, `kdft_plane_fft_gather`, the read_multi
+  phdf5 handler, and the MFMA tiles of `active_gemm_device`.
+- **`wfn_trs` stamps** move to schema `wfn-trs-stamp-v2`: an old stamp is a miss
+  and is measured again once.
+- **Multi-rank runs no longer depend on the GPU placement.** The four-rank
+  reductions on the Fe path are rank-ordered, so two runs with different
+  rank→GPU maps give the same bits.
+- New registry rows: `LORRAX_STAGE_SYNC`, `LORRAX_CHECK_COUNTS`,
+  `LORRAX_KDFT_KBOX_ARM`.
+
+| lane (commit) | what | measured effect (Fe V2 P=4 unless noted) | gate |
+|---|---|---|---|
+| ctorfix/w8 (b601b2801), mfma/w8 (43af0af0b), dput/w1 (6259b21ef), census tool (8f6a2c8fe) | stacked partner eighs and device pack tables; FP64 MFMA tiles in the device-bounds active-range GEMM; content-keyed cached placement and the device-agreed polar spectrum | merged together: total 112.18 → 104.87 s, constructor 17.75 → 14.34 s, Σ τ other 7.89 → 6.82 s, line_select 1.48 → 1.03 s; census H2D `device_put` 7545 → 1528 | active gate 64/64 at P=4; eqp 2.1e-8 / 6.2e-8 eV |
+| dput/w2 (8229a52e3) | Σ window table on the device, device zeros and row slices, pack offsets on the device, SlabIO commit zeros | bank and Σ stages pass `transfer_guard("disallow")` (lane, g5b) | eqp 1.4e-8 / 2.1e-8 eV |
+| kconv/w1 (446148490) | kdft modes 1 and 10 on ROCm | ζ 3.14 → 3.00 s; ζ device peak per rank 10.70 → 6.77 GB; mode 1 2.45×, mode 10 1.32× per call (lane) | `test_kdft_parent_gate.py` at P=4, 1e-12 |
+| crash/w8 (c885977cc) | the environment freeze (rc 139 start-up SIGSEGV); atomic, validated `wfn_trs` stamps | 0 crashes in 48 stressed start-ups (lane) | CPU +12 tests (`test_env_guard`, cache safety) |
+| lsync/final (42c9647a7) | χ₀ contour accumulate with a static-trip inner loop | χ₀ direct dispatch 12 930 → 5 798 syncs at P=1; wall neutral (lane) | eqp bitwise |
+| slabmr/w8 (60c9049af) | `SlabIO.read_multi` / `PhdfReadMulti` on every leg | `sample_batch_read` 2.80–2.87 → 2.12–2.16 s; constructor host syncs 836 → 292 (lane) | phdf5 read_multi gate 10/10 at P=4 |
+| lsync/w3 (8e3d3eec0) | timing-only waits under `LORRAX_STAGE_SYNC=1`; coordination-service barrier; read heartbeat off the caller | explicit waits 1024 → 126 per rank; walls 106.98 → 106.94 s same node (lane) | eqp byte-identical |
+| rcgpu/w1 (ee0e014ff) | rule-construction shift pencils on the GPU | rule construction 49.23 → 33.76 s (lane) | eqp 6.2e-7 / 1.54e-6 eV (gate ≤ 5e-6) |
+| mfma2/w9 (9f46a8690) | active GEMM 32×32 tile and register K prefetch | Σ τ other 7.00 → 6.67 s (lane); W full-K call 10.4 → 13.9 TF/s | active gate 64/64 |
+| dput/w3 (29a402fab) | polar counts cut on the device; Coulomb sub-span start and Σ ω-slab starts on the device | rank-0 H2D 1531 → 1446 (lane) | eqp 2.6e-8 / 5.4e-8 eV vs the previous tip |
+| lsync/w4 (2caadcb95) | rank-uniform status word per checked solve; deferred reciprocity census; batched digest verdicts and reduction | census D2H 455 → 425, explicit D2H 235 → 71 (merges 11–12 together) | eqp bitwise, same node |
+| rcgpu/w2 (5252601a4) | host re-decision of device acceptances the dilation cannot resolve | eqp vs e5 1.5e-6 → 2.3e-8 / 5.0e-8 eV; +0.2–0.3 s (lane) | Fe gate ≤ 1e-7 eV restored |
+| det/w1 (92385e7fc) | rank-order four-rank reductions (`lxkit.ordered_psum`, `ordered_psum_scatter`) | bitwise across three placements on two nodes; wall cost not measurable (lane) | hsuite scalar chain; `test_ordered_collectives.py` |
+
+**Known issues** (release notes):
+- hsuite na_sc: on the det tip a deterministic `GATE shared_pole_zero_ritz` (q=2,
+  SC W map 0) on every placement; before det/w1 it was flaky (a tolerance miss of
+  1.09–1.12e-1 eV against 4.3e-2, or an intermittent V_q NaN). Root cause: a
+  marginal SC path sensitive to 1-ulp reduction order; owned by the crash lane.
+- bisp_sc: before det/w1 it intermittently refused with an all-zero CT Gram
+  (`GATE shared_pole_sector_retained_metric_positive`); after det/w1 it passed on
+  every placement tested (three placements, two nodes) and on the release branch.
+- On shell, the Σ window table's dense coefficient is computed and discarded
+  (follow-up: an on-shell `window_pick`).
+
 ## 2026-10-16 — `bse_k_grid` with `--eqp`: the QP energies enter the htransform
 
 `bse_jax` and `absorption_haydock` re-sliced the coarse restart's QP energies
@@ -137,6 +593,27 @@ Deck changes:
   `sigC(Edft)` and the MPA sweep checkpoint are omitted by name.
 - GN/HL-PPM's q→0 head is now the closed form MPA's is; its grid values are
   unchanged.
+
+## 2026-10-14 — one platform-leg table; ROCM is a declared leg
+
+The per-platform facts of the native libraries (file, pin, build directory,
+C-ABI suffix, ABI symbol, and how a process knows it can host a device leg)
+were restated in `lxkit.gate`, `lxkit.native_provider`, `ffi.common.ffi_loader`,
+`distrib_la.loader` and `runtime`. They are now one table, `lxkit.LEGS`
+([platform legs](docs/architecture/ffi_layout.md#platform-legs)), and the two
+loaders' copies of the CUDA-first open logic are one function
+(`lxkit.accelerator_leg_to_open_first`).
+
+No result moves on CUDA or cpu, and no deck or environment change is needed
+there: the CUDA and host legs keep their file names, pins and ABI symbols, and
+a sealed CUDA bundle loads as before (`tests/test_platform_legs.py` pins the
+facts). On a ROCm mesh the FFI platform key is now `ROCM`, a declared leg
+whose library (`liblorrax_ffi_rocm.so`, pin `LORRAX_FFI_ROCM_SO`) is not built
+yet: a request for a native target refuses by naming that file, where it
+used to refuse with `unknown platform 'rocm'`. `distrib_la.resolve` keys its
+ROCm rows `ROCM`. On WSL2 the loaders now see the mapped libcuda as a CUDA
+device, as `runtime` already did, so the CUDA leg opens before the host leg
+there too.
 
 ## 2026-10-13 — FFI bundle: the LU factors are a declared output; both legs carry RUNPATH $ORIGIN
 

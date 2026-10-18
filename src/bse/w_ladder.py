@@ -1154,7 +1154,8 @@ def dyson_close_tile(T: jax.Array, V_q0: jax.Array, *,
             n = T_.shape[-1]
             A = jnp.eye(n, dtype=T_.dtype) - T_
             # Y = T (I - T)^{-1}  <=>  (I - T)^T Y^T = T^T
-            Y = jnp.linalg.solve(A.T, T_.T).T
+            from distrib_la import solve_local   # 2^31-byte span route (ROCM)
+            Y = solve_local(A.T, T_.T).T
             # Put the product back on the wedge tile's own sharding: at P>1
             # the dense solve above is replicated by construction, and letting
             # GSPMD pick the OUTPUT layout would leave the wedge stack's

@@ -9,6 +9,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from jax import shard_map
 from .resolve import mesh_platform
+from ._active_local import active_local_route
 
 
 # Kernel lessons: the batched 2-D SUMMA Green build (numbers: sandbox claim ids).
@@ -138,11 +139,12 @@ def _panel_contraction(mesh, active=True):
     whose interval is an attribute, so no bounds are read and the stream does not wait.
     The bounds are valid by construction (``_interleaved_kernel``), so no guard runs."""
     one = np.complex128(1.0)
-    if mesh_platform(mesh) == "CUDA":
+    platform = mesh_platform(mesh)
+    if active_local_route(platform) == "native":
         from ._active_local_cuda import (_native, _native_out, _prepared_native,
                                          require_active_local_cuda,
                                          require_prepared_active_local_cuda)
-        (require_active_local_cuda if active else require_prepared_active_local_cuda)()
+        (require_active_local_cuda if active else require_prepared_active_local_cuda)(platform)
 
         def contract(left, right, bounds, c):
             if bounds is None:
@@ -151,14 +153,32 @@ def _panel_contraction(mesh, active=True):
             if c is None:
                 return _native_out(left, right, bounds, alpha=one)
             return _native(left, right, bounds, c, alpha=one, beta=one)
+    elif active_local_route(platform) == "device":
+        from ._active_local_device import device_call, require_active_local_device
+        require_active_local_device(platform)
+
+        def contract(left, right, bounds, c):
+            if bounds is None:
+                # Every column into ``c``, accumulated IN PLACE (``c`` aliased to the result,
+                # beta = 1), as the native route's prepared target does.  Not ``c + left @
+                # right``: inside the panel scan XLA keeps that add beside the running sum,
+                # one more output tile per rank (A100 Fe V2 P=4: spole moments 1.07 vs 1.05
+                # GB on the native/library route).  Full-interval bounds, a host constant.
+                every = np.broadcast_to(np.array([0, left.shape[2]], np.int32),
+                                        (left.shape[0], 2))
+                return device_call(left, right, jnp.asarray(every), None, c, alpha=one, beta=one)
+            if c is None:
+                return device_call(left, right, bounds, None, None, alpha=one, beta=0)
+            return device_call(left, right, bounds, None, c, alpha=one, beta=one)
     else:
-        from ._active_local import active_local_matmul
+        from ._active_local import local_active_impl
+        active_impl = local_active_impl(mesh_platform(mesh))
 
         def contract(left, right, bounds, c):
             if bounds is None:
                 return c + left @ right
             weights = jnp.ones(left.shape[::2], left.dtype)
-            return active_local_matmul(left, right, bounds, weights, c, alpha=one,
+            return active_impl(left, right, bounds, weights, c, alpha=one,
                                        beta=np.complex128(0.0) if c is None else one)
     return contract
 

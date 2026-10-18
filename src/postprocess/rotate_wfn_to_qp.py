@@ -19,6 +19,8 @@ Usage:
 import argparse
 import os
 from types import SimpleNamespace
+# runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
+import runtime  # noqa: F401
 import numpy as np
 
 

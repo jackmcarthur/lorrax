@@ -21,10 +21,18 @@
 // family kernel, so the single-pass transform is bitwise with it.
 //
 // Two halves:
-//   * device code (NVRTC or nvcc, sm_80+: cp.async, no TMA or clusters), compiled when
-//     __CUDACC__ or __CUDACC_RTC__ is defined.  It needs cufftdx.hpp included first.  The
-//     family embeds this file into its NVRTC program as a named header.
+//   * device code, compiled when a device compiler is: NVRTC or nvcc (__CUDACC_RTC__ /
+//     __CUDACC__; sm_80+: cp.async, no TMA or clusters) or hipRTC (__HIPCC_RTC__).  The
+//     family embeds this file into its RTC program as a named header.
 //   * host code (the launch rule), compiled by the host compiler of the .cc.
+//
+// The line transform is the leg's policy, the one vendor seam of the stage (with the copy and the
+// lane read below it): every pass calls line_fft<N, Arch, Dir>(p, stride), one unnormalised
+// length-N DFT of a strided line, forward exp(-2 pi i jk / N), inverse exp(+2 pi i jk / N).
+//   CUDA (NVRTC)  a cuFFTDx thread FFT (cufftdx.hpp included first); Dir is cufftdx::fft_direction.
+//   ROCm (hipRTC) LRX_KBOX_DIRECT_DFT: the kdft direct DFT (cpp/kdft/), N*N FMAs against
+//                 compile-time twiddles; Dir is this header's own fft_direction.
+// lrx_kbox::fft_direction names the leg's type, so a mode's text spells one direction for both.
 #pragma once
 
 namespace lrx_kbox {
@@ -62,7 +70,7 @@ struct UnfoldTiles {
 };
 
 // ---- host: the launch rule ------------------------------------------------------------------
-#if !defined(__CUDACC_RTC__)
+#if !defined(__CUDACC_RTC__) && !defined(__HIPCC_RTC__)
 struct Plan {
     int arm;            // 0 single pass, 1 split
     int tr;             // single: columns per block (power of two >= 2); split: plane tile columns
@@ -103,8 +111,17 @@ inline Plan kbox_plan(int nx, int ny, int nz, int group, int n_operands, int ele
 
 }  // namespace lrx_kbox
 
-#if defined(__CUDACC__) || defined(__CUDACC_RTC__)
+#if defined(__HIPCC_RTC__) && !defined(LRX_KBOX_DIRECT_DFT)
+#define LRX_KBOX_DIRECT_DFT 1
+#endif
+#if defined(__CUDACC__) || defined(__CUDACC_RTC__) || defined(__HIPCC_RTC__)
 namespace lrx_kbox {
+
+#if LRX_KBOX_DIRECT_DFT
+enum class fft_direction { forward, inverse };
+#else
+using fft_direction = cufftdx::fft_direction;
+#endif
 
 template <int NX, int NY, int NZ>
 struct Geo {
@@ -118,6 +135,16 @@ struct Geo {
 
 // The lanes that meet by shuffles (a ROCm wavefront is 64), and one lane's read of lane `src`'s value
 // within its warp (the port swaps the intrinsic here).
+#if LRX_KBOX_DIRECT_DFT
+constexpr int kWarp = 64;
+template <class C>
+__device__ __forceinline__ C lane_read(C v, int src) {
+    C r;
+    r.x = __shfl(v.x, src, kWarp);
+    r.y = __shfl(v.y, src, kWarp);
+    return r;
+}
+#else
 constexpr int kWarp = 32;
 template <class C>
 __device__ __forceinline__ C lane_read(C v, int src) {
@@ -126,6 +153,7 @@ __device__ __forceinline__ C lane_read(C v, int src) {
     r.y = __shfl_sync(0xffffffffu, v.y, src);
     return r;
 }
+#endif
 
 // The live columns [lo, hi) of a pass padded to a scan's largest pass (a kconv call's live rows times its
 // columns per row, so whole groups): a pass runs over [b, e) = [lo, hi) within [0, ncols) only, as
@@ -154,7 +182,19 @@ struct Live {
     }
 };
 
-// cp.async of one element (8 or 16 bytes), global -> shared; commit; wait for all.
+// cp.async of one element (8 or 16 bytes), global -> shared; commit; wait for all.  ROCm has no
+// asynchronous global -> LDS copy in this subset: a plain load and store, so commit and wait are
+// empty (the block barrier after the copy orders it, as on CUDA).
+#if LRX_KBOX_DIRECT_DFT
+template <int BYTES>
+__device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
+    static_assert(BYTES == 8 || BYTES == 16, "cp.async element size");
+    struct alignas(BYTES) Cell { char b[BYTES]; };
+    *static_cast<Cell*>(smem) = *static_cast<const Cell*>(gmem);
+}
+__device__ __forceinline__ void cp_async_commit() {}
+__device__ __forceinline__ void cp_async_wait_all() {}
+#else
 template <int BYTES>
 __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
     static_assert(BYTES == 8 || BYTES == 16, "cp.async element size");
@@ -163,7 +203,74 @@ __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::); }
+#endif
 
+#if LRX_KBOX_DIRECT_DFT
+// The kdft line transform: out[m] = sum_j in[j] w^(m j), w = exp(-+2 pi i / N), N*N FMAs per line.
+// The twiddles are compile-time constants (Tw<N, M>), so after the template unroll each product
+// is an FMA against an immediate: no table, no LDS, no barrier.  cos and sin of 2 pi M / N are
+// reduced to an octant (exact 0 and +-1 on the axes) and summed as Taylor series on |x| <= pi/4
+// (14 terms; error about one ulp), so a twiddle is as accurate as the kdft table's sincospi.
+namespace dft {
+constexpr double sin_series(double x) {
+    double t = x, s = x;
+    for (int k = 1; k < 14; ++k) { t *= -x * x / double((2 * k) * (2 * k + 1)); s += t; }
+    return s;
+}
+constexpr double cos_series(double x) {
+    double t = 1.0, s = 1.0;
+    for (int k = 1; k < 14; ++k) { t *= -x * x / double((2 * k - 1) * (2 * k)); s += t; }
+    return s;
+}
+// exp(+2 pi i m / n) = (cos, sin): quadrant q = floor(4m / n), remainder r = 4m - qn in [0, n);
+// the quadrant angle (pi / 2) r / n, folded to [0, pi/4] by the complement when 2r > n.
+constexpr double tw(int m, int n, bool want_sin) {
+    m %= n;
+    const int q = (4 * m) / n, r = 4 * m - q * n;
+    const bool fold = 2 * r > n;
+    const double x = 3.14159265358979323846 * double(fold ? n - r : r) / double(2 * n);
+    double c = cos_series(x), s = sin_series(x);
+    if (fold) { const double u = c; c = s; s = u; }
+    double cq = c, sq = s;                                   // rotate by q quarter turns
+    if (q == 1) { cq = -s; sq = c; }
+    if (q == 2) { cq = -c; sq = -s; }
+    if (q == 3) { cq = s; sq = -c; }
+    return want_sin ? sq : cq;
+}
+template <int N, int M>
+struct Tw {
+    static constexpr double c = tw(M, N, false), s = tw(M, N, true);
+};
+template <int V> struct Int { static constexpr int value = V; };
+template <int I, int E>
+struct For {                                                  // f(Int<I>{}), ..., f(Int<E-1>{})
+    template <class F> __device__ __forceinline__ static void run(const F& f) {
+        if constexpr (I < E) { f(Int<I>{}); For<I + 1, E>::run(f); }
+    }
+};
+}  // namespace dft
+
+template <int N, int Arch, fft_direction Dir, class C>
+__device__ __forceinline__ void line_fft(C* p, int stride) {
+    using R = decltype(C::x);
+    constexpr double sg = Dir == fft_direction::forward ? -1.0 : 1.0;
+    R ix[N], iy[N];
+#pragma unroll
+    for (int e = 0; e < N; ++e) { ix[e] = p[e * stride].x; iy[e] = p[e * stride].y; }
+    dft::For<0, N>::run([&](auto m) {
+        constexpr int Mo = decltype(m)::value;
+        R ax = 0, ay = 0;
+        dft::For<0, N>::run([&](auto j) {
+            constexpr int J = decltype(j)::value;
+            constexpr R wx = R(dft::Tw<N, (Mo * J) % N>::c), wy = R(sg * dft::Tw<N, (Mo * J) % N>::s);
+            ax = fma(ix[J], wx, fma(-iy[J], wy, ax));
+            ay = fma(ix[J], wy, fma(iy[J], wx, ay));
+        });
+        p[Mo * stride].x = ax;
+        p[Mo * stride].y = ay;
+    });
+}
+#else
 template <int N, int Arch, cufftdx::fft_direction Dir, class C>
 using ThreadFFT = decltype(cufftdx::Size<N>() + cufftdx::Precision<decltype(C::x)>() +
                            cufftdx::Type<cufftdx::fft_type::c2c>() + cufftdx::Direction<Dir>() +
@@ -179,6 +286,7 @@ __device__ __forceinline__ void line_fft(C* p, int stride) {
 #pragma unroll
     for (int e = 0; e < N; ++e) { p[e * stride].x = v[e].x; p[e * stride].y = v[e].y; }
 }
+#endif
 
 // Pass line l of TR resident rows with n lines per row -> (row j, line li).  From 8 rows up
 // the row runs fastest: the 8 threads of a 16-byte shared-memory phase then take one line
@@ -202,37 +310,91 @@ __device__ __forceinline__ void line_of(int l, int n, int& j, int& li) {
 struct BlockSync {
     __device__ void operator()() const { __syncthreads(); }
 };
-template <int NX, int NY, int NZ, int TR, int Arch, cufftdx::fft_direction Dir, class C, class Sync>
-__device__ void transform3(C* bank, int tid, int nthr, const Sync& sync) {
-    constexpr int tr = TR;
+// One axis pass of transform3 (AX 2 = z, 1 = y, 0 = x) over TR resident padded rows, row j at
+// bank + j * RSTR (RSTR: G::RS for adjacent rows; a mode that transforms every GRP-th row of its
+// tile passes GRP * G::RS), lines dealt as transform3 deals them; ends with sync() when the axis has
+// more than one point.  A fused tile (m7f, m11f) calls the passes it does not fuse with its Mid.
+template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, int AX, int RSTR = Geo<NX, NY, NZ>::RS,
+          class C, class Sync>
+__device__ __forceinline__ void axis_pass(C* bank, int tid, int nthr, const Sync& sync) {
     using G = Geo<NX, NY, NZ>;
-    int j, li;
-    if constexpr (NZ > 1) {
-        for (int l = tid; l < tr * NX * NY; l += nthr) {
-            line_of<TR>(l, NX * NY, j, li);
-            line_fft<NZ, Arch, Dir>(bank + j * G::RS + li * G::ZP, 1);
-        }
-        sync();
-    }
-    if constexpr (NY > 1) {
-        for (int l = tid; l < tr * NX * NZ; l += nthr) {
-            line_of<TR>(l, NX * NZ, j, li);
-            line_fft<NY, Arch, Dir>(bank + j * G::RS + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
-        }
-        sync();
-    }
-    if constexpr (NX > 1) {
-        for (int l = tid; l < tr * NY * NZ; l += nthr) {
-            line_of<TR>(l, NY * NZ, j, li);
-            line_fft<NX, Arch, Dir>(bank + j * G::RS + G::plane_at(li), NY * G::ZP);
+    constexpr int N = AX == 2 ? NZ : (AX == 1 ? NY : NX), n = NX * NY * NZ / N;   // n: lines per row
+    if constexpr (N > 1) {
+        int j, li;
+        for (int l = tid; l < TR * n; l += nthr) {
+            line_of<TR>(l, n, j, li);
+            C* r = bank + j * RSTR;
+            if constexpr (AX == 2) line_fft<NZ, Arch, Dir>(r + li * G::ZP, 1);
+            else if constexpr (AX == 1) line_fft<NY, Arch, Dir>(r + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
+            else line_fft<NX, Arch, Dir>(r + G::plane_at(li), NY * G::ZP);
         }
         sync();
     }
 }
-template <int NX, int NY, int NZ, int TR, int Arch, cufftdx::fft_direction Dir, class C>
+template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, int AX, int RSTR = Geo<NX, NY, NZ>::RS,
+          class C>
+__device__ __forceinline__ void axis_pass(C* bank) {
+    axis_pass<NX, NY, NZ, TR, Arch, Dir, AX, RSTR>(bank, (int)threadIdx.x, (int)blockDim.x, BlockSync{});
+}
+template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, int RSTR = Geo<NX, NY, NZ>::RS,
+          class C, class Sync>
+__device__ void transform3(C* bank, int tid, int nthr, const Sync& sync) {
+    axis_pass<NX, NY, NZ, TR, Arch, Dir, 2, RSTR>(bank, tid, nthr, sync);
+    axis_pass<NX, NY, NZ, TR, Arch, Dir, 1, RSTR>(bank, tid, nthr, sync);
+    axis_pass<NX, NY, NZ, TR, Arch, Dir, 0, RSTR>(bank, tid, nthr, sync);
+}
+template <int NX, int NY, int NZ, int TR, int Arch, fft_direction Dir, int RSTR = Geo<NX, NY, NZ>::RS, class C>
 __device__ void transform3(C* bank) {
-    transform3<NX, NY, NZ, TR, Arch, Dir>(bank, (int)threadIdx.x, (int)blockDim.x, BlockSync{});
+    transform3<NX, NY, NZ, TR, Arch, Dir, RSTR>(bank, (int)threadIdx.x, (int)blockDim.x, BlockSync{});
 }
+// The (ky, kz) plane passes of a split arm's TP plane columns (column t at sm + t * PR): the z lines,
+// a barrier, the y lines, a barrier (both barriers also where an axis is 1).
+template <int NX, int NY, int NZ, int TP, int Arch, fft_direction Dir, class C>
+__device__ __forceinline__ void plane_zy(C* sm) {
+    using G = Geo<NX, NY, NZ>;
+    if constexpr (NZ > 1) {
+        for (int l = threadIdx.x; l < TP * NY; l += blockDim.x)
+            line_fft<NZ, Arch, Dir>(sm + (l / NY) * G::PR + (l % NY) * G::ZP, 1);
+    }
+    __syncthreads();
+    if constexpr (NY > 1) {
+        for (int l = threadIdx.x; l < TP * NZ; l += blockDim.x)
+            line_fft<NY, Arch, Dir>(sm + (l / NZ) * G::PR + l % NZ, G::ZP);
+    }
+    __syncthreads();
+}
+
+// ---- the fused tiles' pair order and tables (CUDA modes 7 and 11) -------------------------------
+#if !LRX_KBOX_DIRECT_DFT
+// Pair q of nrow block rows x my right centroids in blocks of kOBX rows x kOBY right centroids, the
+// right centroid fastest -> (row r from the first live row, right centroid y).  A symmetry star's
+// sources are the pair's orbit images, so the blocks of a wave of tiles share their parent sources
+// in L2.  Which pairs share a tile changes no pair's arithmetic.
+constexpr int kOBX = 16, kOBY = 32;
+__device__ __forceinline__ void orbit_pair(int q, int nrow, int my, int& r, int& y) {
+    const int rb = q / (kOBX * my), r0 = rb * kOBX, h = min(kOBX, nrow - r0);
+    int rem = q - rb * kOBX * my;
+    const int cbk = rem / (h * kOBY), c0 = cbk * kOBY, w = min(kOBY, my - c0);
+    rem -= cbk * h * kOBY;
+    r = r0 + rem / w;
+    y = c0 + rem % w;
+}
+// A tile pair, formed once per tile: left centroid, right centroid, block row, flags (bit 0 live,
+// bit 1 a real source pair).
+struct PairInfo { int xx, yy, rx, flags; };
+// NS consecutive int32 table entries (one aligned 8-byte load for NS = 2: the merged endpoint
+// tables are (nk, m*NS) with the NS slots of a centroid adjacent).
+template <int NS>
+__device__ __forceinline__ void load_ns(const int* __restrict__ p, int (&v)[NS]) {
+    if constexpr (NS == 2) {
+        const int2 q = *reinterpret_cast<const int2*>(p);
+        v[0] = q.x; v[1] = q.y;
+    } else {
+#pragma unroll
+        for (int c = 0; c < NS; ++c) v[c] = p[c];
+    }
+}
+#endif
 
 // The staged tile as a direct Load writes it: v(k, j) is element k of tile column j.
 template <int NX, int NY, int NZ, class C>
@@ -391,7 +553,7 @@ struct PlainK {
 // (a k-minor Store such as PlainK writes one run per column).  lv: as Live.  TILEMAJOR: a tile's NX
 // planes run together (consecutive blocks), so a gathered Load's star members, which sit on other
 // planes, find their parent sources in L2 (mode 7's gather at 20^3: DRAM 1.46 -> 1.15 GB, 1.05x).
-template <int NX, int NY, int NZ, int Arch, cufftdx::fft_direction Dir, int TP, bool KMINOR = false,
+template <int NX, int NY, int NZ, int Arch, fft_direction Dir, int TP, bool KMINOR = false,
           bool TILEMAJOR = false, class C, class Load, class Store>
 __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& st, const Live& lv = Live{}) {
     using G = Geo<NX, NY, NZ>;
@@ -423,16 +585,7 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
             }
             __syncthreads();
         }
-        if constexpr (NZ > 1) {
-            for (int l = threadIdx.x; l < TP * NY; l += blockDim.x)
-                line_fft<NZ, Arch, Dir>(sm + (l / NY) * G::PR + (l % NY) * G::ZP, 1);
-        }
-        __syncthreads();
-        if constexpr (NY > 1) {
-            for (int l = threadIdx.x; l < TP * NZ; l += blockDim.x)
-                line_fft<NY, Arch, Dir>(sm + (l / NZ) * G::PR + l % NZ, G::ZP);
-        }
-        __syncthreads();
+        plane_zy<NX, NY, NZ, TP, Arch, Dir>(sm);
         for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
             const int t = KMINOR ? i / (NY * NZ) : i % TP, p = KMINOR ? i % (NY * NZ) : i / TP;
             if (c0 + t < e) st.put(kx * NY * NZ + p, c0 + t, sm[t * G::PR + G::plane_at(p)]);
@@ -454,12 +607,12 @@ __device__ void column_pass(C* bank, C* y, long long ncols, const Mid& mid, cons
         stage_tile<NX, NY, NZ, 1>(bank, col, ncols, PlainK<C>{y, G::NK});
         for (int l = threadIdx.x; l < NY * NZ; l += blockDim.x) {
             C* p = bank + G::plane_at(l);
-            if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::inverse>(p, NY * G::ZP);
+            if constexpr (NX > 1) line_fft<NX, Arch, fft_direction::inverse>(p, NY * G::ZP);
 #pragma unroll
             for (int kx = 0; kx < NX; ++kx) p[kx * NY * G::ZP] = mid(kx * NY * NZ + l, col, p[kx * NY * G::ZP]);
         }
         __syncthreads();
-        transform3<NX, NY, NZ, 1, Arch, cufftdx::fft_direction::forward>(bank);
+        transform3<NX, NY, NZ, 1, Arch, fft_direction::forward>(bank);
         store_tile<NX, NY, NZ, 1>(bank, col, ncols, st);
     }
     zero_dead<G::NK, C>(ncols, lv, st);
@@ -469,7 +622,7 @@ __device__ void column_pass(C* bank, C* y, long long ncols, const Mid& mid, cons
 // inverse . mid . forward (CONV) or the transform in Dir then mid (!CONV), then st.put(k, col, v)
 // (in place on the intermediate unless the Store maps elsewhere).  !CONV with an inverse Dir and
 // a multiplying mid is the first half of a convolution; with a scaling mid, a pass's last axis.
-template <int NX, int NY, int NZ, int Arch, bool CONV, cufftdx::fft_direction Dir, class C, class Mid,
+template <int NX, int NY, int NZ, int Arch, bool CONV, fft_direction Dir, class C, class Mid,
           class Store>
 __device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Store& st, const Live& lv = Live{}) {
     const long long b = lv.b(), n = lv.e(ncols) - b, total = (long long)NY * NZ * n;
@@ -480,10 +633,10 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Store& 
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) v[kx] = y[((long long)kx * NY * NZ + p) * ncols + col];
         if constexpr (CONV) {
-            if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::inverse>(v, 1);
+            if constexpr (NX > 1) line_fft<NX, Arch, fft_direction::inverse>(v, 1);
 #pragma unroll
             for (int kx = 0; kx < NX; ++kx) v[kx] = mid(int(kx * NY * NZ + p), col, v[kx]);
-            if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::forward>(v, 1);
+            if constexpr (NX > 1) line_fft<NX, Arch, fft_direction::forward>(v, 1);
         } else {
             if constexpr (NX > 1) line_fft<NX, Arch, Dir>(v, 1);
 #pragma unroll
@@ -494,7 +647,7 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Store& 
     }
     zero_dead<NX * NY * NZ, C>(ncols, lv, st);
 }
-template <int NX, int NY, int NZ, int Arch, bool CONV, cufftdx::fft_direction Dir, class C, class Mid>
+template <int NX, int NY, int NZ, int Arch, bool CONV, fft_direction Dir, class C, class Mid>
 __device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Live& lv = Live{}) {
     pencil_pass<NX, NY, NZ, Arch, CONV, Dir>(y, ncols, mid, Plain<C>{y, ncols}, lv);
 }
@@ -529,7 +682,7 @@ __device__ void pencil_group_warp_pass(const C* y, long long ncols, long long n_
             if (live) v[kx] = y[((long long)kx * PL + p) * ncols + col];
             else { v[kx].x = 0; v[kx].y = 0; }
         }
-        if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::inverse>(v, 1);
+        if constexpr (NX > 1) line_fft<NX, Arch, fft_direction::inverse>(v, 1);
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) {
             const C own = v[kx];

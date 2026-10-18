@@ -15,7 +15,7 @@ without an ``OccupationState`` is still refused by name.
 Returned :class:`SigmaResult` always contains ``v_h_kij_ry``,
 ``sigma_x_kij_ry``, and a single ``sigma_xc_kij_ry`` representing the
 total exchange-correlation contribution to ``H_QP = kin_ion + V_H +
-Σ_xc``.  Dynamic-mode-only diagnostics (full ω-grid Σ_c, on-shell diagonals,
+Σ_xc``.  Dynamic-mode-only diagnostics (the on-shell Σ_c and its diagonals,
 head decomposition) live as optional fields and are populated only when
 the mode produces them.
 
@@ -27,7 +27,7 @@ The Σ kernels live under ``cohsex_sigma`` (static channels),
 ``ppm_pipeline`` (two-point PPM Σ_c), ``gw.mpa`` (multipole Σ_c) and
 ``qsgw_utils`` (the QSGW Hermitisation); this module orchestrates them
 and owns the shared dynamic-Σ finalization seam
-(:func:`finalize_dynamic_sigma`: head injection, at-DFT interpolation,
+(:func:`finalize_dynamic_sigma`: head injection, the at-DFT read,
 file write, QSGW build).
 """
 
@@ -95,8 +95,14 @@ class SigmaResult:
     Dynamic-mode-only (None in static)
     ----------------------------------
     sigma_c_omega_kij_ry      : (nω, nk, nb, nb), sharded P(None,None,'x','y')
-                                Full ω-grid Σ_c (post-head); drives eqp1
-                                Z-factor central difference.
+                                Full ω-grid Σ_c (post-head), only under
+                                ``sigma_omega_grid_debug``; drives eqp1
+                                Z-factor central difference there.
+    sigma_c_on_shell          : ``ppm_sigma.OnShellSigma`` (post-head): the
+                                QSGW pair (2, nk, nb, nb) at
+                                P(None,None,'x','y') and the diagonal slots.
+    sigma_c_on_shell_diag     : (4, nk, nb)  its eqp operand
+                                (``eqp_bgw.ON_SHELL_*``): drives eqp0/eqp1.
     sigma_c_at_dft_diag_ev    : (nk, nb)  diag(Σ_c) at E_DFT (eV).
     omega_dft_rel_ev          : (nk, nb)  E_DFT − E_F (eV).
     e_eval_ev                 : (nk, nb)  the energies the QSGW ansatz
@@ -106,10 +112,11 @@ class SigmaResult:
                                 QP energies for an SC iteration.  eqp1's
                                 linearization is centred here; see
                                 ``eqp_bgw.assemble_eqp``.
-    omega_grid_ev             : (nω,)     ω-grid in eV.
-    omega_grid_ry             : (nω,)     ω-grid in Ry.
-    head_sigma_diag_w_kn_ry   : (nω, nk, nb)  Dynamic q→0 head diagonal: a host array, or its closed form (``head_correction.HeadSigmaDiag``).
-    sigma_omega_h5_path       : str       on-disk Σ_c(ω) HDF5 path.
+    omega_grid_ev             : (nω,)     the sampled range's grid in eV
+                                (only its extent is read: coverage).
+    omega_grid_ry             : (nω,)     the same in Ry.
+    head_sigma_diag_w_kn_ry   : Dynamic q→0 head diagonal, its closed form (``head_correction.HeadSigmaDiag``).
+    sigma_omega_h5_path       : str       on-disk ``sigma_mnk.h5`` path.
 
     Basis
     -----
@@ -146,24 +153,21 @@ class SigmaResult:
     #: keeps the default path's object graph unchanged.
     sigma_xc_kij_ry_unextrap: jax.Array | None = None
     #: The RAW Σ_c: the band sum truncated at the run's N bands (the last
-    #: bracket, before the spectral_shell tail), head included.  Its band
-    #: diagonal on the ω grid (n_omega, nk, nb) in Ry, and its value at
-    #: E_DFT (nk, nb) in eV, interpolated exactly as ``sigma_c_at_dft_
-    #: diag_ev``.  Same Σ evaluation as the extrapolated cube, so it costs
-    #: one diagonal gather.  Present only when the band extrapolation drives
-    #: this stage; the writers put it in the raw columns, which are the
+    #: bracket, before the spectral_shell tail), head included: its value at
+    #: E_DFT (nk, nb) in eV, read exactly as ``sigma_c_at_dft_diag_ev``.
+    #: Present only when the band extrapolation drives this stage; the
+    #: writers put it in the raw columns, which are the
     #: BerkeleyGW-comparable numbers (BGW truncates at number_bands).
     sigma_c_omega_diag_unextrap_ry: np.ndarray | None = None
     sigma_c_at_dft_diag_unextrap_ev: np.ndarray | None = None
     sigma_c_omega_kij_ry: jax.Array | None = None
     #: The ON-SHELL Sigma_c (``gw.ppm_sigma.OnShellSigma``: the QSGW pair and
-    #: the diagonal slots, head included), in place of
-    #: ``sigma_c_omega_kij_ry`` when ``sigma_omega_grid_debug`` is off.  Its
-    #: host eqp operand (``eqp_bgw.OnShellDiagonal``) rides beside it, and
+    #: the diagonal slots, head included).  Its host eqp operand (a
+    #: ``(4, nk, nb)`` array, ``eqp_bgw.ON_SHELL_*``) rides beside it, and
     #: the raw (un-extrapolated) twin's when the band extrapolation drives.
     sigma_c_on_shell: object | None = None
-    sigma_c_on_shell_diag: object | None = None
-    sigma_c_on_shell_diag_unextrap: object | None = None
+    sigma_c_on_shell_diag: np.ndarray | None = None
+    sigma_c_on_shell_diag_unextrap: np.ndarray | None = None
     sigma_band_axis: PaddedAxis | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
     sigma_c_odd_at_dft_diag_ev: np.ndarray | None = None
@@ -176,14 +180,14 @@ class SigmaResult:
     efermi_dft_ev: float | None = None
     #: Which convention ``efermi_dft_ev`` IS — "fixed-N mu" or "midgap".
     #: Carried beside the number so the end-of-SC writer stamps the same
-    #: answer the finalize interpolated with (audit A2), instead of
+    #: answer the finalize read with (audit A2), instead of
     #: re-deriving it from a config key one layer further from the choice.
     omega_reference_provenance: str | None = None
     #: K-point set carried by every k-indexed table in this result.  A
     #: one-shot result remains on the full BZ; the SC map changes the tag and
     #: every table together at its single output seam.
     kset: str = SIGMA_KSET_FULL_BZ
-    #: :class:`gw.dynamic_sigma.OmegaCoverage` for the at-DFT interpolation
+    #: :class:`gw.dynamic_sigma.OmegaCoverage` for the at-DFT read
     #: — WHICH (k, n) the ω grid actually sampled, and what was done with the
     #: rest.  Carried on the result rather than recomputed by each writer
     #: because ``sigma_c_at_dft_diag_ev`` cannot say by itself which of its
@@ -232,9 +236,11 @@ class SigmaResult:
 # owes the post-Σ seam a DFT-basis object, so its finalize
 # (``sc_iteration.run_sc_driver``) rotates the matrices named in
 # ``ROTATED_TO_DFT_FIELDS`` with ``O_DFT = U·O_QP·U†`` and leaves the
-# rest untouched.  The original Σ_c(ω) cube is written in its QP compute
-# basis before this finalize; the returned copy is rotated for DFT-basis
-# output assembly.  These four tuples record the returned object's basis
+# rest untouched.  The on-shell Σ_c is written in its QP compute basis
+# before this finalize and is not rotated (its slots carry the QP states'
+# energies).  A Σ_c(ω) cube (``sigma_omega_grid_debug``) is written in its QP
+# compute basis too; the returned copy is rotated for DFT-basis output
+# assembly.  These four tuples record the returned object's basis
 # and partition ``dataclasses.fields(SigmaResult)`` exactly
 # (``tests/test_sigma_result_basis.py`` fails when they do not).
 
@@ -345,8 +351,8 @@ SIGMA_RESULT_K_AXES = {
     "photon_head_sigma_diag_tskn_ry": 2,
     "sigma_c_omega_kij_ry": 1,
     "sigma_c_on_shell": 1,
-    "sigma_c_on_shell_diag": 0,
-    "sigma_c_on_shell_diag_unextrap": 0,
+    "sigma_c_on_shell_diag": 1,
+    "sigma_c_on_shell_diag_unextrap": 1,
     "sigma_c_at_dft_diag_ev": 0,
     "sigma_c_odd_at_dft_diag_ev": 0,
     "sigma_c_omega_diag_unextrap_ry": 1,
@@ -617,9 +623,9 @@ def finalize_dynamic_sigma(
         add_head_sigma_diag,
         eval_sigma_c_at_dft_energies,
         extract_sigma_diag_logical,
-        sigma_omega_output_path,
         write_sigma_omega,
     )
+    from .eqp_bgw import ON_SHELL_AT_DFT
     from .qsgw_utils import build_qsgw_sigma_xc
 
     if v_h_scalar is None:
@@ -629,19 +635,21 @@ def finalize_dynamic_sigma(
         v_h_scalar = sig_h
 
     with timing.section("sigma.finalize_input_wait"):
-        jax.block_until_ready((sigma_c_body_omega, sigma_c_body_omega_unextrap,
-                               sig_x, sig_h))
-    # The head add takes each body cube's buffer: nothing below reads a
+        timing.stage_wait(sigma_c_body_omega, sigma_c_body_omega_unextrap, sig_x, sig_h)
+    # The head add takes a grid body cube's buffer: nothing below reads a
     # headless cube (the at-DFT read, sigma_omega write, QSGW build, raw
     # columns and debug outputs all read the head-added one), so the body and
     # the total are never both resident (Na 8^3 [-100,+150] eV: 14.12 GiB
     # each).  A cube that shares a buffer with another input is not donated.
-    donate_body = not _shares_buffer(
-        sigma_c_body_omega, sigma_c_body_omega_unextrap, sigma_c_odd_body_omega)
-    donate_unextrap = not _shares_buffer(
-        sigma_c_body_omega_unextrap, sigma_c_body_omega, sigma_c_odd_body_omega)
+    from .ppm_sigma import is_on_shell
+    donate_body = donate_unextrap = False
+    if not is_on_shell(sigma_c_body_omega):
+        donate_body = not _shares_buffer(
+            sigma_c_body_omega, sigma_c_body_omega_unextrap, sigma_c_odd_body_omega)
+        donate_unextrap = not _shares_buffer(
+            sigma_c_body_omega_unextrap, sigma_c_body_omega, sigma_c_odd_body_omega)
     with timing.section("gw_jax.dynamic_sigma_finalize") as finalize_section:
-        sigma_c_omega = add_head_sigma_diag(
+        sigma_c = add_head_sigma_diag(
             sigma_c_body_omega, head_sigma_diag_w_kn_ry,
             band_axis=sigma_band_axis, donate_body=donate_body)
         del sigma_c_body_omega
@@ -651,7 +659,7 @@ def finalize_dynamic_sigma(
          efermi_dft_ev,
          omega_reference_provenance,
          omega_coverage) = eval_sigma_c_at_dft_energies(
-            sigma_c_omega,
+            sigma_c,
             config=config,
             band_slices=band_slices, wfn=wfn, sym=sym, meta=meta,
             mesh_xy=mesh_xy, print_fn=print_fn,
@@ -659,8 +667,8 @@ def finalize_dynamic_sigma(
             efermi_ry=efermi_ry,
             efermi_provenance=efermi_provenance,
         )
-        on_shell = hasattr(sigma_c_omega, "request")
-        on_shell_diag = (_on_shell_eqp_operand(sigma_c_omega, sigma_band_axis)
+        on_shell = is_on_shell(sigma_c)
+        on_shell_diag = (_on_shell_eqp_operand(sigma_c, sigma_band_axis)
                          if on_shell else None)
         sigma_c_odd_at_dft_ev = None
         if sigma_c_odd_body_omega is not None:
@@ -685,8 +693,8 @@ def finalize_dynamic_sigma(
                     "Sigma_c were evaluated on different energy references")
 
         # Static Sigma_x is added in the QSGW kernel.  E_F here is the SAME
-        # reference the interpolation above used — one omega reference per
-        # finalize, or the two reads sample different grid positions.
+        # reference the at-DFT read above used — one omega reference per
+        # finalize, or the two reads sample different energies.
         # Formed BEFORE the write because the write stamps it: see below.
         omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
         e_qp_rel_ev = (
@@ -694,7 +702,7 @@ def finalize_dynamic_sigma(
 
         if write_sigma_omega_h5:
             sigma_omega_h5_path = write_sigma_omega(
-                sigma_c_omega,
+                sigma_c,
                 sig_x=sig_x, sig_h=sig_h,
                 v_h_scalar=v_h_scalar,
                 h_transverse=h_transverse,
@@ -726,7 +734,7 @@ def finalize_dynamic_sigma(
                 print_fn=print_fn,
             )
         else:
-            # The field names the cube this finalize wrote, so with no write
+            # The field names the file this finalize wrote, so with no write
             # it is None.  A path here promises a file that does not exist:
             # qsgw_utils.write_qsgw_sigma_cube opens it "a" (h5py creates a
             # file with no omega axis and no raw operators) and
@@ -737,7 +745,7 @@ def finalize_dynamic_sigma(
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
         sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
-            sigma_c_omega, sig_x_rep,
+            sigma_c, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
             band_axis=sigma_band_axis,
             out_of_grid=config.sigma.out_of_grid,
@@ -758,27 +766,25 @@ def finalize_dynamic_sigma(
                 sigma_xc_qsgw - current[1] - current[2])
 
         # ── THE SECOND QSGW MATRIX: N₃, UN-EXTRAPOLATED ─────────────────
-        # Built only when the band extrapolation is driving and
-        # ``sigma_freq_debug_output`` keeps the full N₃ cube (by default the
-        # twin is its band diagonal, which is all the raw columns read), and
-        # built the
-        # SAME way as the one above so the pair differs in exactly one thing:
-        # whether Σ_c carries the extrapolated band tail.  Same head (the
-        # q->0 head is band-diagonal with no unoccupied sum, hence
-        # bracket-independent), same ω grid, same E_qp, same clipping policy.
-        # Its only consumer is the driver's side-by-side eqp report; it is
-        # never mixed into the carry.
-        sigma_xc_qsgw_unextrap = None
-        raw_diag_ry = raw_at_dft_ev = None
-        raw_on_shell_diag = None
-        if hasattr(sigma_c_body_omega_unextrap, "request"):
-            # The on-shell twin: N3's diagonals (its pair too under
-            # sigma_freq_debug_output), with the same head.
+        # Present only when the band extrapolation is driving.  By default
+        # the twin is N3's diagonal slots (all the raw columns read); under
+        # ``sigma_freq_debug_output`` it keeps its pair too, and its QSGW
+        # matrix is built the SAME way as the one above so the two differ in
+        # exactly one thing: whether Σ_c carries the extrapolated band tail.
+        # Same head (the q->0 head is band-diagonal with no unoccupied sum,
+        # hence bracket-independent), same energies, same read rule.  Its
+        # only consumer is the driver's side-by-side eqp report; it is never
+        # mixed into the carry.  A grid twin (``sigma_omega_grid_debug``) is
+        # N3's band diagonal (``BandDiagonalSlots``) or, under
+        # ``sigma_freq_debug_output``, its cube.
+        sigma_xc_qsgw_unextrap = raw_at_dft_ev = raw_on_shell_diag = None
+        raw_diag_ry = None
+        if is_on_shell(sigma_c_body_omega_unextrap):
             twin = add_head_sigma_diag(
                 sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry,
                 band_axis=sigma_band_axis)
             raw_on_shell_diag = _on_shell_eqp_operand(twin, sigma_band_axis)
-            raw_at_dft_ev = raw_on_shell_diag.at_dft_ev
+            raw_at_dft_ev = raw_on_shell_diag[ON_SHELL_AT_DFT]
             if twin.pair is not None:
                 sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
                     twin, sig_x_rep, omega_grid_ev, e_qp_rel_ev, mesh_xy,
@@ -839,7 +845,7 @@ def finalize_dynamic_sigma(
                 sigma_omega_h5_path, sigma_xc_qsgw,
                 config=config, print_fn=print_fn)
 
-        finalize_section.watch(sigma_c_omega, sigma_xc_qsgw, sigma_xc_qsgw_unextrap)
+        finalize_section.watch(sigma_c, sigma_xc_qsgw, sigma_xc_qsgw_unextrap)
 
     _band_attrs = ((band_extrapolation or {}).get("attrs") or {})
     _band_counts_raw = _band_attrs.get("band_counts")
@@ -865,8 +871,8 @@ def finalize_dynamic_sigma(
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
         sigma_c_omega_diag_unextrap_ry=raw_diag_ry,
         sigma_c_at_dft_diag_unextrap_ev=raw_at_dft_ev,
-        sigma_c_omega_kij_ry=None if on_shell else sigma_c_omega,
-        sigma_c_on_shell=sigma_c_omega if on_shell else None,
+        sigma_c_omega_kij_ry=None if on_shell else sigma_c,
+        sigma_c_on_shell=sigma_c if on_shell else None,
         sigma_c_on_shell_diag=on_shell_diag,
         sigma_c_on_shell_diag_unextrap=raw_on_shell_diag,
         sigma_band_axis=sigma_band_axis,
@@ -905,19 +911,18 @@ def finalize_dynamic_sigma(
 
 
 def _on_shell_eqp_operand(sigma_c, band_axis):
-    """The eqp assembly's on-shell operand (``eqp_bgw.OnShellDiagonal``) in eV.
+    """The eqp assembly's on-shell operand (``eqp_bgw.ON_SHELL_*`` rows), ``(4, nk, nb)``.
 
     Sigma_c at E_DFT and at E_eval under the eqp readers' rule (an uncovered
-    state at omega = 0) and the exact dSigma_c/domega at E_eval, all read
-    from the slots the sweep filled (every rank enters: the reads are
-    collective).
+    state at omega = 0) in eV, the exact dSigma_c/domega at E_eval and the
+    coverage, read from the slots the sweep filled (every rank enters: the
+    one diagonal read is collective).
     """
-    from .eqp_bgw import OnShellDiagonal
-    return OnShellDiagonal(
-        at_dft_ev=sigma_c.diagonal("dft0", band_axis) * RYD_TO_EV,
-        at_eval_ev=sigma_c.diagonal("eval0", band_axis) * RYD_TO_EV,
-        dsigma_at_eval=sigma_c.diagonal("derivative", band_axis),
-        covered_kn=np.asarray(sigma_c.request.covered_kn, dtype=bool))
+    return np.stack([
+        sigma_c.diagonal("dft0", band_axis) * RYD_TO_EV,
+        sigma_c.diagonal("eval0", band_axis) * RYD_TO_EV,
+        sigma_c.diagonal("derivative", band_axis),
+        np.asarray(sigma_c.request.covered_kn, dtype=bool).astype(np.complex128)])
 
 
 # ---------------------------------------------------------------------------
@@ -957,7 +962,7 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
 
 
 def _sweep_checkpoint(config, input_dir, fit_identity, fit_digest, head, lorentz_output,
-                      *, e_qp_ev, body_options, band_slices, efermi_ry):
+                      *, e_qp_ev, body_options, band_slices, efermi_ry, request=None):
     """Path and identity of a one-shot shared-pole sweep checkpoint, or None.
 
     Only one-shots: an SC run continues at map granularity from its own
@@ -965,25 +970,65 @@ def _sweep_checkpoint(config, input_dir, fit_identity, fit_digest, head, lorentz
     earlier map directories.
     The identity binds the W model (its digest names its identity, the WFN
     included), the energies Σ is read at, the ω grid and every sweep option.
+    On shell (``request``) the file is its own and the identity adds the
+    evaluation and the request's tables: the grid and on-shell sweeps never
+    read each other's, and moved on-shell energies recompute.
     """
     from .gw_output import restart_tensor_writes_enabled
     if (fit_digest is None or lorentz_output
             or str((fit_identity or {}).get("iteration_id")) != "oneshot"):
         return None
     from pathlib import Path
-    path = Path(input_dir) / "tmp" / "sigma_checkpoint_oneshot.h5"
+    path = Path(input_dir) / "tmp" / ("sigma_checkpoint_oneshot.h5" if request is None
+                                      else "sigma_checkpoint_oneshot_on_shell.h5")
     if not restart_tensor_writes_enabled(config, str(path)):
         return None
     from file_io.sigma_checkpoint import sweep_identity
     options = {k: v for k, v in body_options.items()
-               if k not in ("print_fn", "occupation_state", "fixed_quadrature_session")}
+               if k not in ("print_fn", "occupation_state", "fixed_quadrature_session",
+                            "request")}
+    on_shell = {} if request is None else dict(
+        evaluation="on_shell", on_shell_tables_ry=request.tables_ry,
+        on_shell_parent_ry=request.parent_ry, on_shell_covered_kn=request.covered_kn,
+        on_shell_names=list(request.names), on_shell_aliases=dict(request.aliases),
+        on_shell_range_ev=list(request.omega_range_ev))
     return path, sweep_identity(
         schema="sigma-sweep-checkpoint-v1", w_digest=fit_digest, w_identity=fit_identity,
         head=None if head is None else (head.get("identity"), head.get("body_digest")),
         e_qp_ev=np.asarray(e_qp_ev, np.float64), options=options,
         sigma_bands=[int(band_slices.b0), int(band_slices.b3), str(band_slices.sigma_range)],
         band_extrapolation=bool(config.sigma.band_extrapolation),
-        efermi_ry=float(efermi_ry))
+        efermi_ry=float(efermi_ry), **on_shell)
+
+
+def _checkpoint_arrays(values, request):
+    """The arrays a sweep checkpoint stores: an on-shell value as its pair and
+    slots (its request is the dispatch's), a grid cube as itself.  None when
+    an on-shell value carries another request."""
+    from .ppm_sigma import is_on_shell
+    if request is None:
+        return values
+    arrays = {}
+    for name, value in values.items():
+        if is_on_shell(value):
+            if value.request is not request:
+                return None
+            arrays[f"{name}_pair"], arrays[f"{name}_slots"] = value.pair, value.slots
+        elif value is not None:
+            return None
+    return arrays
+
+
+def _checkpoint_values(arrays, request, mesh_xy):
+    """Inverse of :func:`_checkpoint_arrays`: the request is the live one (its
+    tables are in the checkpoint identity)."""
+    from .ppm_sigma import OnShellSigma
+    if request is None:
+        return arrays
+    return {name: None if arrays.get(f"{name}_slots") is None else OnShellSigma(
+                pair=arrays.get(f"{name}_pair"), slots=arrays[f"{name}_slots"],
+                request=request, mesh_xy=mesh_xy)
+            for name in ("body", "unextrap", "odd")}
 
 
 def _validate_sigma_stage(
@@ -1262,7 +1307,7 @@ def _static_sigma_channels(
             mode is not ComputeMode.MPA or config.debug.sigma_lorentz_debug_output)
         # Charge pending input work to its boundary, not to exchange.
         with timing.section("sigma.input_wait"):
-            jax.block_until_ready((wfns, wfns_transverse, V_q, Gij))
+            timing.stage_wait(wfns, wfns_transverse, V_q, Gij)
         with timing.section("sigma.exchange") as sec:
             sigma_x_result = compute_sigma_x(
                 wfns, V_q, meta, mesh_xy,
@@ -1406,8 +1451,19 @@ def _compute_mpa_sigma(
             print_fn(
                 "  MPA scalar head: occupation provenance matched an exact "
                 "legacy square-mesh zero-pad encoding.")
-    body_options = dict(
-        omega_grid_ry=config.omega_grid_ry,
+    from .dynamic_sigma import sigma_on_shell_request
+    # The windows are planned on the states' own energies; under
+    # sigma_omega_grid_debug on the omega grid (and the sweep's options are
+    # the grid's own: they are the checkpoint identity).
+    request = None
+    if bool(config.debug.sigma_omega_grid_debug):
+        body_options = dict(omega_grid_ry=config.omega_grid_ry)
+    else:
+        request = sigma_on_shell_request(
+            config, e_eval_ev=e_qp_ev, wfn=wfn, sym=sym, meta=meta,
+            band_slices=band_slices, efermi_ry=sigma_efermi_ry, print_fn=print_fn)
+        body_options = dict(request=request)
+    body_options.update(
         efermi_ry=sigma_efermi_ry,
         occupation_state=occupation_state,
         regularization_width_ry=_xi.resolved_ry,
@@ -1422,17 +1478,6 @@ def _compute_mpa_sigma(
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
         material_class=material_class,
         print_fn=print_fn)
-    from .dynamic_sigma import sigma_on_shell_request
-    on_shell_request = sigma_on_shell_request(
-        config, e_eval_ev=e_qp_ev, wfn=wfn, sym=sym, meta=meta,
-        band_slices=band_slices, efermi_ry=sigma_efermi_ry)
-    if on_shell_request is not None:
-        # The windows are planned on the states' own energies.
-        body_options.update(omega_grid_ry=on_shell_request.frequencies_ry,
-                            on_shell_request=on_shell_request)
-        print_fn(f"  Sigma_c on shell: {on_shell_request.n_table} energy table(s) "
-                 f"{on_shell_request.names}, "
-                 f"{on_shell_request.frequencies_ry.size} distinct frequencies")
     patch = getattr(config, "sc_coarse_windows_ev", None) or None
     if patch is not None:
         # THE COARSE (SEMICORE) WINDOWS (gw.qp_support): their samples sit in
@@ -1441,15 +1486,30 @@ def _compute_mpa_sigma(
         # at max(sigma_quadrature_eps, qp_support.SEMICORE_EPS).  The scalar
         # body and every sector call (mpa.sector_sigma) read the same labels.
         from .qp_support import window_labels
-        omega_ev = np.asarray(body_options["omega_grid_ry"], dtype=np.float64) * RYD_TO_EV
-        if on_shell_request is None:
-            omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+        omega_ev = (np.asarray(config.omega_grid_ev, dtype=np.float64) if request is None
+                    else np.asarray(request.frequencies_ry, dtype=np.float64) * RYD_TO_EV)
         eta_ev, group = window_labels(omega_ev, patch, _xi.resolved_ry * RYD_TO_EV)
         body_options.update(omega_eta_ry=eta_ev / RYD_TO_EV, omega_group=group,
                             group_fixed=tuple(bool(w[3]) for w in patch))
     lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
     if not lorentz_output:
         sigma_lorentz = None
+
+    plan = None
+    # Every MPA pole sum brackets its Green band sum exactly as the PPM route
+    # does (one executor, one plan owner, one pooled fit): the scalar body,
+    # and the four-current body's CC class (mpa.sector_sigma).
+    if bool(config.sigma.band_extrapolation) and band_extrapolation_is_consumable(
+            (ComputeMode.MPA,), scalar_mpa=mpa_sigma_runs_scalar_executor(config)):
+        plan = plan_sigma_band_brackets(
+            config, wfns, meta, print_fn=print_fn,
+            where="sigma_dispatch MPA plan seam")
+        # Before the checkpoint: the bracket plan is part of the sweep's identity.
+        body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
+    checkpoint = _sweep_checkpoint(
+        config, input_dir, fit_identity, fit_digest, head, lorentz_output,
+        e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
+        efermi_ry=sigma_efermi_ry, request=request)
 
     def finalize(cubes, host):
         from runtime.padding import PaddedAxis
@@ -1481,26 +1541,6 @@ def _compute_mpa_sigma(
             efermi_ry=sigma_efermi_ry,
             efermi_provenance=sigma_efermi_provenance)
 
-    plan = None
-    # Every MPA pole sum brackets its Green band sum exactly as the PPM route
-    # does (one executor, one plan owner, one pooled fit): the scalar body,
-    # and the four-current body's CC class (mpa.sector_sigma).
-    if bool(config.sigma.band_extrapolation) and band_extrapolation_is_consumable(
-            (ComputeMode.MPA,), scalar_mpa=mpa_sigma_runs_scalar_executor(config)):
-        plan = plan_sigma_band_brackets(
-            config, wfns, meta, print_fn=print_fn,
-            where="sigma_dispatch MPA plan seam")
-        # Before the checkpoint: the bracket plan is part of the sweep's identity.
-        body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
-    checkpoint = None
-    if on_shell_request is None:
-        checkpoint = _sweep_checkpoint(
-            config, input_dir, fit_identity, fit_digest, head, lorentz_output,
-            e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
-            efermi_ry=sigma_efermi_ry)
-    elif bool(getattr(config, "restart", False)):
-        print_fn("Sigma checkpoint: none on the on-shell route (it stores the omega "
-                 "cube); the sweep is recomputed")
     if checkpoint is not None and bool(getattr(config, "restart", False)):
         import common.timing as timing
         from file_io.sigma_checkpoint import read_sigma_checkpoint
@@ -1508,19 +1548,19 @@ def _compute_mpa_sigma(
             restored = read_sigma_checkpoint(checkpoint[0], identity=checkpoint[1],
                                              mesh=mesh_xy, print_fn=print_fn)
         if restored[0] is not None:
-            return finalize(*restored[:2])
+            return finalize(_checkpoint_values(restored[0], request, mesh_xy), restored[1])
     import time
     sweep_started = time.monotonic()
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
-        on_shell = None
+        lorentz_shell = None
         if lorentz_output:
             from .qsgw_utils import build_qsgw_sigma_xc
             e_qp_rel_ev = (np.asarray(e_qp_ev, dtype=np.float64)
                            - sigma_efermi_ry * RYD_TO_EV)
             zero_x = jnp.zeros_like(sig_x)
 
-            def on_shell(value):
+            def lorentz_shell(value):
                 shell, _ = build_qsgw_sigma_xc(
                     value.sigma_c_kij, zero_x, config.omega_grid_ev,
                     e_qp_rel_ev, mesh_xy, band_axis=value.band_axis,
@@ -1529,7 +1569,8 @@ def _compute_mpa_sigma(
 
         sector_result = compute_sector_sigma(
             sector_handle, (wfns, wfns_transverse), mu_bases, meta, mesh_xy,
-            on_shell=on_shell, linalg=linalg_resolution({"linalg": config.backend.linalg}).layout,
+            lorentz_shell=lorentz_shell,
+            linalg=linalg_resolution({"linalg": config.backend.linalg}).layout,
             **body_options)
         if lorentz_output:
             body, (ct_shell, tt_shell) = sector_result
@@ -1560,12 +1601,12 @@ def _compute_mpa_sigma(
         else:
             head_enk = np.asarray(iteration_head.sigma_energies_ry)
             head_occ = np.asarray(iteration_head.sigma_occupations)
-        # The head Sigma(omega) is added to the body on the body's omega grid,
-        # so it is measured from the body's reference (as ppm_pipeline's
+        # The head Sigma(omega) is added to the body at the body's on-shell
+        # energies, so it is measured from the body's reference (as ppm_pipeline's
         # body_efermi_ry).  The SC head's census mu displaced the head poles by
         # mu - E_F: +2.99 eV at CrI3 8x8 SC map 1, and map 0 != one-shot.
-        # The closed form, not its (n_omega, nk, nb) array: the finalize add
-        # and the band-extrapolation fit evaluate it where they read it.
+        # The closed form: the finalize add and the band-extrapolation fit
+        # evaluate it where they read it.
         head_diag = HeadSigmaDiag.build(
             omega_grid_ry=np.asarray(config.omega_grid_ry),
             enk_ry=head_enk,
@@ -1598,16 +1639,17 @@ def _compute_mpa_sigma(
     if checkpoint is not None:
         from file_io.sigma_checkpoint import (
             PAYOFF, checkpoint_pays, checkpointable, write_sigma_checkpoint)
+        stored = _checkpoint_arrays(cubes, request)
         # The write finishes before finalize: finalize donates the body cube
         # to the head add, so nothing may still be reading it.
         jax.block_until_ready(cubes["body"])
         sweep_seconds = time.monotonic() - sweep_started
-        pays, predicted = checkpoint_pays(cubes, sweep_seconds)
-        named = checkpointable(cubes)
+        pays, predicted = checkpoint_pays(stored or {}, sweep_seconds)
+        named = stored is not None and checkpointable(stored)
         print_fn(f"Sigma checkpoint: {'written' if pays and named else 'skipped'} (sweep "
                  f"{sweep_seconds:.0f} s{' >= ' if pays else ' < '}{PAYOFF:g} x "
                  f"write est {predicted:.0f} s"
-                 f"{'' if named else '; a cube has no named sharding'})")
+                 f"{'' if named else '; a value has no named sharding or its own request'})")
         if pays and named:
             import common.timing as timing
             from file_io.sigma_checkpoint import discard_sigma_checkpoint
@@ -1615,7 +1657,7 @@ def _compute_mpa_sigma(
                 with timing.section("sigma.checkpoint_write", announce=True):
                     # The head diagonal is stored as its closed form's fields.
                     nbytes, seconds = write_sigma_checkpoint(
-                        checkpoint[0], identity=checkpoint[1], cubes=cubes,
+                        checkpoint[0], identity=checkpoint[1], cubes=stored,
                         host=dict(host, head_diag=None if head_diag is None else
                                   asdict(head_diag)),
                         mesh=mesh_xy)

@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.collectives import device_put_process_local
+from common.collectives import device_put_process_local, device_put_process_local_cached
 from common import timing
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
@@ -118,6 +118,7 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
 def synthesize_shared_pole_parents(
     b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy, gemm, layout="face",
     weights_fn=_shared_pole_weights, active_range=False, same_factor=True,
+    orientation="pair",
 ):
     """Synthesize both raw-parent orientations through the configured G service.
 
@@ -156,6 +157,12 @@ def synthesize_shared_pole_parents(
         ``gemm`` was planned with ``enable_active_range=True``: contract only
         each parent's ``intervals`` columns, each scaled by its weight.
 
+    orientation : {"pair", "plus", "transpose"}
+        ``"pair"`` returns both tiles (below).  A consumer that reads one orientation only
+        (``same_factor``; its realization the identity pair) takes ``"plus"``, ``(b_X d) b_Y†``
+        with no transpose exchange, or ``"transpose"``, ``(conj(b_X) d) b_Yᵀ`` contracted on
+        this rank's own faces as ``conj((b_X conj(d)) b_Y†)``: the same GEMM at conjugate
+        weights, no exchange and no second contraction.
     Returns
     -------
     Wplus, Wtranspose : jax.Array
@@ -163,6 +170,11 @@ def synthesize_shared_pole_parents(
         ``(conj(b_X) d) b_Yᵀ`` at the SAME τ (DESIGN §3.4). Never conjugate
         Wplus to obtain its antiunitary partner: d must retain its phase.
     """
+    if orientation not in ("pair", "plus", "transpose"):
+        raise ValueError(f"shared-pole synthesis orientation {orientation!r}")
+    if orientation != "pair" and not same_factor:
+        raise ValueError("a single shared-pole orientation needs the same factor on both faces")
+    one = (lambda w: jnp.conj(w)) if orientation == "transpose" else (lambda w: w)
     if layout == "local":
         # The replicated intervals take the factor's padded batch rows (an
         # empty interval: zero weight) and its batch placement, a local slice.
@@ -170,7 +182,7 @@ def synthesize_shared_pole_parents(
         intervals = jax.lax.with_sharding_constraint(
             jnp.pad(intervals, ((0, rows - n_parent), (0, 0))),
             NamedSharding(mesh_xy, P(("x", "y"), None)))
-        weights = weights_fn(poles2, intervals, E_ref_B, t_node)
+        weights = one(weights_fn(poles2, intervals, E_ref_B, t_node))
         plus = _shared_pole_contract_local(b_X, weights, intervals, mesh_xy=mesh_xy,
                                            n_parent=n_parent, right=b_Y,
                                            partner=not same_factor)
@@ -179,10 +191,14 @@ def synthesize_shared_pole_parents(
             raise ValueError("shared-pole faces require [parent,mu,spin,column]")
         if b_X.shape[2] not in (1, 3) or b_Y.shape[2] not in (1, 3):
             raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
-        weights = weights_fn(poles2, intervals, E_ref_B, t_node)
+        weights = one(weights_fn(poles2, intervals, E_ref_B, t_node))
         plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
                                      intervals=intervals if active_range else None,
                                      partner=not same_factor)
+    if orientation == "plus":
+        return plus
+    if orientation == "transpose":
+        return jnp.conj(plus)
     if not same_factor:
         return plus
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
@@ -335,6 +351,12 @@ def _shared_pole_panel_realizer(meta, header, q_span, *, mesh_xy, tables=None):
     def realize_pair(plus, transposed):
         return project_local(*realize(plus, transposed))
 
+    # Static: the pair passes through unchanged (the little-group realization is the identity
+    # pair and no row takes the fixed-q TRS average), so each orientation is read alone.
+    from symmetry_maps import self_negative_q_mask
+    fixed_q = bool(getattr(policy, "trs_measured", True)) and bool(
+        np.any(self_negative_q_mask(qids, kgrid=policy.kgrid)))
+    realize_pair.is_identity = bool(getattr(realize, "is_identity", False)) and not fixed_q
     return realize_pair
 
 
@@ -347,9 +369,10 @@ def _require_local_maps(certificates):
 
 
 _W_LOADS = {}
+_W_LOAD_TRS = {}
 
 
-def _shared_pole_q_wedge(meta, header, *, mesh_xy):
+def _shared_pole_q_wedge(meta, header, *, mesh_xy, with_trs=False):
     """The store's q wedge as the Σ kconv call reads W: ``(wedge, (particle, hole) device loads)``.
 
     ``wedge`` is a ``symmetry_maps.QirrOperator`` of tables (no values): the
@@ -384,6 +407,10 @@ def _shared_pole_q_wedge(meta, header, *, mesh_xy):
         loads = _W_LOADS[key] = (
             device_load_tables(particle, mesh_xy),
             device_load_tables(hole_tables(particle, header["grid"]), mesh_xy) if ordered else None)
+        # Host copy of the particle rows' partner flag (1: the row reads Wt), for the plan.
+        _W_LOAD_TRS[key] = np.array(particle.trs, dtype=np.int32, copy=True)
+    if with_trs:
+        return wedge, loads, _W_LOAD_TRS[key]
     return wedge, loads
 
 
@@ -455,6 +482,26 @@ def _shared_pole_static_key(meta, header, tables, *, mesh_xy, layout):
         {name: value for name, value in tables.items() if name != "policy"}))
 
 
+def _w_orientation(all_identity, reads_w, reads_wt, *, weights_on_load=True):
+    """The W orientation one Sigma branch forms: ``"pair"``, ``"plus"`` or ``"transpose"``.
+
+    A single orientation only when every panel's realization is the identity pair (no
+    stabilizer mixes W with its partner) AND the branch's load rows read that orientation
+    alone; a branch whose rows read both (or, defensively, neither) forms the pair through
+    the transpose exchange exactly as before.
+
+    ``weights_on_load``: the synthesis GEMM's active route applies the per-column weights as
+    it loads ``b_X`` (the device route, ``distrib_la._active_local.ACTIVE_LOCAL_ROUTE``).  On
+    a route that forms the weighted copy ``b_X diag(d)`` itself (the CUDA native cuBLAS arm,
+    the XLA routes), the single-orientation kernel holds that copy at the window executable's
+    peak (A100 Fe V2 P=4: c128[64,156,2,36], 11.5 MB in jit(run), 'Sigma tau other' 1.11 GB
+    per rank vs 1.08 on the pair), so such a branch keeps the pair.
+    """
+    if not all_identity or reads_w == reads_wt or not weights_on_load:
+        return "pair"
+    return "plus" if reads_w else "transpose"
+
+
 def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy, layout="face",
                              weights_fn=_shared_pole_weights, stage="sigma"):
     """Read the factors once and bind W(τ) on the irreducible q for the window executable.
@@ -492,16 +539,27 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             raise ValueError("shared-pole panel capacities must be positive")
         # Ordered stores: conduction windows use W_+(q), valence windows W_+(-q)^T.
         ordered = header.get("representation") == "scalar-ordered-ph"
-        q_wedge, loads = _shared_pole_q_wedge(meta, header, mesh_xy=mesh_xy)
+        q_wedge, loads, particle_trs = _shared_pole_q_wedge(
+            meta, header, mesh_xy=mesh_xy, with_trs=True)
         # The valence branch of an ordered store reads W_+(-q)^T through the
         # q-negated tables: the same parent pair, another load, chosen per
         # window so both branches run one window program.
         branch_load = lambda space: loads[1] if ordered and space == 'val' else loads[0]
+        # Which orientations each branch's Sigma load reads (host tables): trs 0 reads W, 1
+        # its partner; the ordered valence branch reads the q-negated rows with the flag
+        # flipped (sector_sigma.hole_tables).
+        if ordered:
+            from symmetry_maps import q_negation_index
+            qn = np.asarray(q_negation_index(tuple(int(v) for v in header["grid"])), np.int64)
+            hole_trs = (1 - particle_trs[qn]).astype(np.int32)
+        def branch_reads(space):
+            trs = hole_trs if (ordered and space == 'val') else particle_trs
+            return bool(np.any(trs == 0)), bool(np.any(trs == 1))
         if kmax == 0:
             zero = _zeros(mesh_xy, (nq, m, m))
             synthesis = WSynthesis(
                 lambda _f, _p, _i, load, _ref, _time: (zero(), zero(), load),
-                lambda space, _indices, _bounds: ((), (), None, branch_load(space)), lambda: (),
+                lambda space, _intervals: ((), (), None, branch_load(space)), lambda: (),
                 lambda _result=None: None, 0, ("zero", mesh_xy, nq, m))
             synthesis.q_wedge = q_wedge
             return synthesis
@@ -514,12 +572,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         chunked = ccap < kmax
         width = face_width(mesh_xy, kmax, (0, ccap) if chunked else None)
         n_chunks = -(-kmax // width)
-        # Query the same distributed dense context used by G before warming
-        # any matrix operands. The service accepts a resolved dense Plan for
-        # a GEMM workspace query, as in the shared-pole constructor.
-        from distrib_la import plan, workspace_bytes_per_rank
-        workspace_plan = plan("eigh", mesh_xy, n=m, backend="distributed",
-                              batched_route="auto")
+        # The face GEMM's workspace (distrib_la.panel_matmul, the provider of
+        # every distributed GEMM), asked of the GEMM service directly: no eigh
+        # is planned here, so no eigh backend is requested.
+        from distrib_la import matmul_workspace_bytes_per_rank
         native_workspace = 0
         panels = []
         for lo in range(0, nq, bcap):
@@ -528,11 +584,11 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             static = _shared_pole_static_key(meta, header, tables, mesh_xy=mesh_xy, layout=layout)
             count = hi - lo
             if not local:
-                native_workspace = max(native_workspace, workspace_bytes_per_rank(
-                    workspace_plan, "gemm", ((count, m, width), (count, width, m)),
-                    np.complex128))
+                native_workspace = max(native_workspace, matmul_workspace_bytes_per_rank(
+                    mesh_xy, ((count, m, width), (count, width, m)), np.complex128,
+                    backend="distributed", batched_route="auto"))
 
-            def program(span=(lo, hi), tables=tables, count=count):
+            def program(span=(lo, hi), tables=tables, count=count, orientation="pair"):
                 from distrib_la import gemm_plan
                 # As G's plan: pole columns outside a window's interval are
                 # never contracted, and no warm-up (the plan runs inside the
@@ -544,6 +600,14 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     meta, header, span, mesh_xy=mesh_xy, tables=tables)
 
                 def body(factors, poles2, ranges, e, t):
+                    if orientation != "pair":
+                        # One orientation read, the realization the identity pair: form
+                        # that tile alone on this rank's faces (no transpose exchange).
+                        tile = synthesize_shared_pole_parents(
+                            *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
+                            layout=layout, weights_fn=weights_fn, active_range=True,
+                            orientation=orientation)
+                        return tile, tile
                     plus, transposed = synthesize_shared_pole_parents(
                         *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
                         layout=layout, weights_fn=weights_fn, active_range=True)
@@ -551,8 +615,13 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 return jax.jit(body)
             kind = ("synthesis" if weights_fn is _shared_pole_weights
                     else "synthesis." + weights_fn.__name__)
-            kernel = _synthesis_program((static, kind, count, m, width), program)
-            panels.append(dict(span=(lo, hi), kernel=kernel, static=static, count=count))
+            identity = bool(_shared_pole_panel_realizer(
+                meta, header, (lo, hi), mesh_xy=mesh_xy, tables=tables).is_identity)
+            kernels = {o: _synthesis_program(
+                (static, kind, count, m, width) + (() if o == "pair" else (o,)),
+                partial(program, orientation=o)) for o in ("pair", "plus", "transpose")}
+            panels.append(dict(span=(lo, hi), kernel=kernels["pair"], kernels=kernels,
+                               identity=identity, static=static, count=count))
         schedule["native_gemm_workspace_bytes_per_rank"] = native_workspace
     _band_fence('tau.factor_read', sync_ranks=True)
     with timing.section('tau.factor_read'):
@@ -586,7 +655,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             panel_poles.append(pp)
         del x, y, poles
         panel_factors, panel_poles = tuple(panel_factors), tuple(panel_poles)
-        jax.block_until_ready((panel_factors, panel_poles))
+        timing.stage_wait(panel_factors, panel_poles)
         if ambient is not None:
             resident = sum(int(a.addressable_shards[0].data.nbytes)
                            for a in jax.tree.leaves((panel_factors, panel_poles)))
@@ -594,53 +663,64 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                              workspace_bytes_per_rank=0, concurrent_with=ambient)
             capacity.live_stages = (*ambient, f"{stage}.synthesis.resident")
 
-    spans = tuple((p["span"], p["kernel"]) for p in panels)
+    # Per branch: the pair, or (every panel's realization the identity) the one orientation
+    # its load reads.  The unread tile slot carries the read one; the load never reads it.
+    all_identity = all(p["identity"] for p in panels)
+    from distrib_la import active_weights_on_load, mesh_platform
+    weights_on_load = active_weights_on_load(mesh_platform(mesh_xy))
+    def branch_orientation(space):
+        return _w_orientation(all_identity, *branch_reads(space), weights_on_load=weights_on_load)
+    def _w_kernel_for(orientation):
+        spans = tuple((p["span"], p["kernels"][orientation]) for p in panels)
+        def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node):
+            pair = None
+            for ((lo, hi), kernel), factors, poles2 in zip(spans, factors_by_panel, poles_by_panel):
+                ranges = intervals[lo:hi]
+                if pair is not None:
+                    # One panel's temporaries at a time: the next panel's
+                    # synthesis waits for the running pair.
+                    pair, factors, poles2 = jax.lax.optimization_barrier((pair, factors, poles2))
+                if not chunked:
+                    part = kernel(factors, poles2, jnp.clip(ranges, 0, width), e_ref, t_node)
+                    if pair is None and (lo, hi) == (0, nq):
+                        # The one all-parent panel IS the parent pair.
+                        pair = part
+                    else:
+                        base = (_zeros(mesh_xy, (nq, m, m))(),) * 2 if pair is None else pair
+                        pair = tuple(b.at[lo:hi].add(v) for b, v in zip(base, part))
+                    continue
 
-    def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node):
-        pair = None
-        for ((lo, hi), kernel), factors, poles2 in zip(spans, factors_by_panel, poles_by_panel):
-            ranges = intervals[lo:hi]
-            if pair is not None:
-                # One panel's temporaries at a time: the next panel's
-                # synthesis waits for the running pair.
-                pair, factors, poles2 = jax.lax.optimization_barrier((pair, factors, poles2))
-            if not chunked:
-                part = kernel(factors, poles2, jnp.clip(ranges, 0, width), e_ref, t_node)
-                if pair is None and (lo, hi) == (0, nq):
-                    # The one all-parent panel IS the parent pair.
-                    pair = part
-                else:
-                    base = (_zeros(mesh_xy, (nq, m, m))(),) * 2 if pair is None else pair
-                    pair = tuple(b.at[lo:hi].add(v) for b, v in zip(base, part))
-                continue
+                def chunk(j, acc, factors=factors, poles2=poles2, ranges=ranges, lo=lo, hi=hi,
+                          kernel=kernel):
+                    selected = jnp.clip(ranges - j*width, 0, width)
 
-            def chunk(j, acc, factors=factors, poles2=poles2, ranges=ranges, lo=lo, hi=hi,
-                      kernel=kernel):
-                selected = jnp.clip(ranges - j*width, 0, width)
+                    def add(acc):
+                        # Chunk j is read from the counter once, behind a barrier
+                        # (the R82 remat hazard, as the window runner's node reads).
+                        faces, poles_j = jax.lax.optimization_barrier((
+                            tuple(jax.lax.dynamic_index_in_dim(f, j, 0, keepdims=False)
+                                  for f in factors),
+                            jax.lax.dynamic_index_in_dim(poles2, j, 0, keepdims=False)))
+                        part = kernel(faces, poles_j, selected, e_ref, t_node)
+                        return tuple(a.at[lo:hi].add(v) for a, v in zip(acc, part))
+                    # A chunk with no active column in this window adds nothing.
+                    return jax.lax.cond(jnp.any(selected[:, 1] > selected[:, 0]),
+                                        add, lambda acc: acc, acc)
+                pair = jax.lax.fori_loop(
+                    0, n_chunks, chunk,
+                    (_zeros(mesh_xy, (nq, m, m))(),) * 2 if pair is None else pair)
+            return (*pair, load)
+        return w_kernel
+    w_kernels = {o: _w_kernel_for(o) for o in ("pair", "plus", "transpose")}
+    w_kernel = w_kernels["pair"]
 
-                def add(acc):
-                    # Chunk j is read from the counter once, behind a barrier
-                    # (the R82 remat hazard, as the window runner's node reads).
-                    faces, poles_j = jax.lax.optimization_barrier((
-                        tuple(jax.lax.dynamic_index_in_dim(f, j, 0, keepdims=False)
-                              for f in factors),
-                        jax.lax.dynamic_index_in_dim(poles2, j, 0, keepdims=False)))
-                    part = kernel(faces, poles_j, selected, e_ref, t_node)
-                    return tuple(a.at[lo:hi].add(v) for a, v in zip(acc, part))
-                # A chunk with no active column in this window adds nothing.
-                return jax.lax.cond(jnp.any(selected[:, 1] > selected[:, 0]),
-                                    add, lambda acc: acc, acc)
-            pair = jax.lax.fori_loop(
-                0, n_chunks, chunk,
-                (_zeros(mesh_xy, (nq, m, m))(),) * 2 if pair is None else pair)
-        return (*pair, load)
+    def window_intervals(indices, bounds):
+        # Host plan data: the Σ executor stacks every window's intervals into
+        # its window table (placed once per Σ call, read on device per window).
+        return shared_pole_intervals(frequencies, np.asarray(indices), np.asarray(bounds))
 
-    def window_operands(space, indices, bounds):
-        # Host intervals once per window; every τ node of the window reuses them.
-        intervals = shared_pole_intervals(frequencies, np.asarray(indices), np.asarray(bounds))
-        return (panel_factors, panel_poles,
-                device_put_process_local(intervals, NamedSharding(mesh_xy, P())),
-                branch_load(space))
+    def window_operands(space, intervals):
+        return (panel_factors, panel_poles, intervals, branch_load(space))
 
     closed = False
 
@@ -662,8 +742,20 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     if weights_fn is not _shared_pole_weights:
         key += (weights_fn.__name__,)
     synthesis = WSynthesis(w_kernel, window_operands, lambda: (panel_factors, panel_poles),
-                           close, native_workspace, key, tile_bytes=16 * nq * m * m // int(mesh_xy.size))
+                           close, native_workspace, key, tile_bytes=16 * nq * m * m // int(mesh_xy.size),
+                           window_intervals=window_intervals)
     synthesis.q_wedge = q_wedge
+    synthesis.branch_orientation = branch_orientation
+    synthesis.w_kernel_for = lambda space: w_kernels[branch_orientation(space)]
+    def _rows(space):
+        trs = hole_trs if (ordered and space == 'val') else particle_trs
+        return f"{int(np.sum(trs == 0))}/{int(np.sum(trs == 1))}"
+    synthesis.path_note = (
+        "route Sigma W synthesis: realization " + ("identity pair" if all_identity else "little-group")
+        + f" ({sum(p['identity'] for p in panels)}/{len(panels)} panels), "
+        + ("ordered" if ordered else "trs-even") + " store; "
+        + "; ".join(f"{sp} rows W/Wt {_rows(sp)} -> {branch_orientation(sp)}"
+                    for sp in (("cond", "val") if ordered else ("cond",))))
     return synthesis
 
 
@@ -1150,11 +1242,14 @@ def _static_key(value):
 class WSynthesis:
     """A shared-pole model's bound W(τ) synthesis: kernel, per-window operands, lifetime.
 
-    ``w_kernel(*window_operands(space, indices, bounds), ref, time)`` is
+    ``w_kernel(*window_operands(space, intervals), ref, time)`` is
     W(τ) in its consumer's operand layout and is traceable: it runs inside the
-    window executable.  ``window_operands`` does the host work once per window
-    (the pole intervals) and passes the window's branch tables (the valence
-    branch of an ordered model reads -q), so both branches share one program.
+    window executable.  ``window_intervals(indices, bounds)`` is the host plan
+    work (the pole intervals, ``None`` when the model has none); the Σ
+    executor stacks it over windows into its window table and passes the
+    window's device row to ``window_operands``, which adds the window's branch
+    tables (the valence branch of an ordered model reads -q), so both
+    branches share one program.
     ``resident_operands()`` are the device factors its
     stage already charged, ``native`` its GEMM's native workspace, ``close``
     releases them, ``key`` is the static configuration ``w_kernel`` closes
@@ -1162,8 +1257,9 @@ class WSynthesis:
     """
 
     def __init__(self, w_kernel, window_operands, resident_operands, close, native, key,
-                 *, tile_bytes=0):
+                 *, tile_bytes=0, window_intervals=None):
         self.key = key
+        self.window_intervals = window_intervals
         self.tile_bytes = int(tile_bytes)
         self.w_kernel = w_kernel
         self.window_operands = window_operands
@@ -1179,9 +1275,10 @@ class SynthesisTau:
     """One τ body for the window executable: W(τ) synthesis and Σ(τ) in one program.
 
     Serves the scalar shared-pole route and every photon sector.
-    ``window_kernel()`` is the traceable ``fn(*arguments, t, active_count)``
-    of :meth:`DeviceOmegaAccumulator.integrate_window`, one for both W
-    branches; ``window_arguments`` swaps in the right endpoint's operands and
+    ``window_kernel(space)`` is the traceable ``fn(*arguments, t, active_count)``
+    of :meth:`DeviceOmegaAccumulator.integrate_window`: one for both W branches,
+    unless the synthesis reads one W orientation per branch
+    (``WSynthesis.branch_orientation``), then one per orientation; ``window_arguments`` swaps in the right endpoint's operands and
     the synthesis's per-window operands.  Neither closes over a device
     buffer, so the accumulator's runner cache retains no factors.
     ``kconv_tables`` (the Σ kconv call's placed load tables, ``ppm_tau_kernel.sigma_kconv_tables``,
@@ -1205,7 +1302,7 @@ class SynthesisTau:
         self._kconv_tables = kconv_tables
         self._admitted = False
 
-    def window_kernel(self):
+    def window_kernel(self, space=None):
         """The τ body, one function object per static configuration.
 
         The window runner is cached on this object, so returning the first
@@ -1213,9 +1310,13 @@ class SynthesisTau:
         parent plans and W synthesis) lets every later SC map dispatch the
         compiled window executable instead of recompiling it.
         """
-        key = (self._key, self._synthesis.key)
+        pick = getattr(self._synthesis, "branch_orientation", None)
+        orientation = "pair" if space is None or pick is None else pick(space)
+        key = (self._key, self._synthesis.key) + (() if orientation == "pair" else (orientation,))
         if key not in _SYNTHESIS_TAU:
-            spatial, w_kernel = self._spatial, self._synthesis.w_kernel
+            spatial = self._spatial
+            w_kernel = (self._synthesis.w_kernel if orientation == "pair"
+                        else self._synthesis.w_kernel_for(space))
 
             def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, kconv_tables, t,
                     _active):
@@ -1227,8 +1328,8 @@ class SynthesisTau:
             _SYNTHESIS_TAU[key] = (self._plans, tau)
         return _SYNTHESIS_TAU[key][1]
 
-    def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, indices, bounds):
-        w_operands = self._synthesis.window_operands(space, indices, bounds)
+    def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, intervals):
+        w_operands = self._synthesis.window_operands(space, intervals)
         tables = self._kconv_tables
         return (xn, self._right[0], xr, self._right[1], energies, weight, w_operands,
                 e_ref_a, e_ref_b, tables(space) if callable(tables) else tables)
@@ -1282,12 +1383,54 @@ class SynthesisTau:
                                counted + max(plan["new"] + second, got), section="sigma.tau_sweep")
 
 
+def _sigma_window_table(accumulator, synthesis, plan, capacity):
+    """The Σ window table of a shared-pole sweep: every planned window's operands, placed once.
+
+    Rows follow the plan (the sweep's one pass).  Fields: the coefficient
+    inputs of :meth:`DeviceOmegaAccumulator.window_table` (nodes padded to
+    ``capacity``, the states the window's frequencies own (on the grid, its
+    frequencies on the full axis), sign, prefactor, reference sum) and the
+    window operands -- the active pole count, the band mask
+    (flattened, padded to the widest branch), the two reference energies and
+    the synthesis's pole intervals (``WSynthesis.window_intervals``).
+    """
+    masks = [np.asarray(row.window.mask_A, dtype=bool).reshape(-1) for row in plan]
+    width = max((m.size for m in masks), default=0)
+    extras = dict(
+        active=[np.int32(len(row.pole_indices)) for row in plan],
+        mask=[np.pad(m, (0, width - m.size)) for m in masks],
+        e_ref_a=[np.float64(row.window.E_ref_A) for row in plan],
+        e_ref_b=[np.float64(row.window.E_ref_B) for row in plan])
+    if synthesis.window_intervals is not None:
+        extras["intervals"] = [np.ascontiguousarray(synthesis.window_intervals(
+            row.pole_indices, row.bounds)) for row in plan]
+    windows = [dict(t=row.window.nodes.t, alpha=row.window.nodes.alpha,
+                    omega_indices=row.omega_idx, omega_values=row.omega_abs,
+                    omega_sign=row.window.omega_sign, prefactor=row.window.prefactor,
+                    e_ref_sum=row.window.E_ref_A + row.window.E_ref_B) for row in plan]
+    return accumulator.window_table(windows, capacity=capacity, extras=extras)
+
+
+@lru_cache(maxsize=None)
+def _window_selector(shape, weighted):
+    """A window's band selector from its table row's flattened mask (and the branch weight)."""
+    size = int(np.prod(shape))
+
+    def select(mask, weight):
+        selector = jnp.reshape(mask[:size], shape)
+        if not weighted:
+            return selector
+        return (selector.astype(jnp.float64)
+                * jnp.reshape(jnp.asarray(weight, jnp.float64), shape))
+    return jax.jit(select)
+
+
 def _integrate_sigma_batches(
     wfns,
     batches,
     n_poles,
     plan,
-    omega_grid_ry,
+    request,
     meta,
     mesh_xy,
     *,
@@ -1299,7 +1442,7 @@ def _integrate_sigma_batches(
     tau_kernel_factory=None,
     q_wedge=None,
     tau_capacity=None,
-    on_shell_request=None,
+    omega_grid_ry=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
@@ -1316,11 +1459,12 @@ def _integrate_sigma_batches(
     wedge's unfold tables (mathdx mode 9), whose device tables ride the
     residue argument.
 
-    ``on_shell_request`` (``gw.ppm_sigma.OnShellRequest``): fold only the on-shell
-    pair and diagonal slots (``gw.ppm_accumulators``); ``omega_grid_ry`` is
-    then the request's frequency list, which the windows were planned on.
-    The result is an ``OnShellSigma`` (no brackets) or an on-shell
-    ``BandCountCube``."""
+    ``request`` (``gw.ppm_sigma.OnShellRequest``): the sweep folds the on-shell
+    pair and diagonal slots (``gw.ppm_accumulators``) at its energies; its
+    frequency list is the one the windows were planned on.  The result is an
+    ``OnShellSigma`` (no brackets) or a ``BandCountCube``.  ``request`` None
+    (``sigma_omega_grid_debug``) folds Sigma_c onto ``omega_grid_ry``: the
+    result is the ``(n_omega, nk, nb, nb)`` cube or a grid ``BandCountCube``."""
     # Band fences are profiling boundaries (see ``_unfenced``).  This executor
     # is shared with the incumbent elementwise-MPA route (``w_synthesis is
     # None``), which is never fenced whatever a harness has installed.
@@ -1328,9 +1472,6 @@ def _integrate_sigma_batches(
     fence = _band_fence if synthesis else _unfenced
     fence('tau.setup', sync_ranks=True)
     with timing.section('tau.setup'):
-        omega = np.asarray(omega_grid_ry, np.float64)
-        if omega.ndim != 1 or not omega.size:
-            raise ValueError("omega_grid_ry must be a nonempty vector")
         s = wfns.slices
         sigma_axis = sigma_band_axis(
             int(s.nb_sigma), mesh_xy, ansatz="dynamic")
@@ -1360,31 +1501,26 @@ def _integrate_sigma_batches(
         spatial_shape = (
             int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
         face_kwargs["face_band_extent"] = sigma_axis.carrier
-        shape = (omega.size, *spatial_shape)
         output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
-        reduce = None
-        if bracketed:
-            # The sweep folds only what the band counts keep: the matrix of
-            # the first and the last count and the diagonals between.
-            reduce = _band_count_reduce(mesh_xy, len(brackets))
-            n_between = max(len(brackets) - 2, 0)
-            shape = ((shape,) * (len(brackets) - n_between),
-                     ((omega.size, spatial_shape[0], sigma_axis.carrier,
-                       int(mesh_xy.shape["y"])),) * n_between)
-        tables = None
-        if on_shell_request is not None:
-            if not np.array_equal(omega, np.asarray(on_shell_request.frequencies_ry, np.float64)):
-                raise ValueError("on-shell Sigma: the windows were planned on a frequency "
-                                 "list other than the request's")
-            tables = _on_shell_parent_tables(on_shell_request, k_unfold_plan, sigma_axis, mesh_xy)
+        if request is None:
+            omega = np.asarray(omega_grid_ry, np.float64)
+            if omega.ndim != 1 or not omega.size:
+                raise ValueError("omega_grid_ry must be a nonempty vector")
+            accumulator = _grid_accumulator(omega, spatial_shape, output_sharding,
+                                            brackets if bracketed else None,
+                                            sigma_axis, mesh_xy)
+        else:
+            if request.parent_ry.shape[1] != int(k_unfold_plan.n_parent):
+                raise ValueError(f"on-shell Sigma: the request holds {request.parent_ry.shape[1]} "
+                                 f"parent k rows, the k plan {k_unfold_plan.n_parent}")
             n_counts = len(brackets) if bracketed else 1
-            reduce = _on_shell_reduce(mesh_xy, len(brackets) if bracketed else None)
-            shape = (((2, *spatial_shape),) * (2 if n_counts > 1 else 1),
-                     ((tables.n_slot, spatial_shape[0], sigma_axis.carrier,
-                       int(mesh_xy.shape["y"])),) * n_counts)
-        accumulator = DeviceOmegaAccumulator(
-            omega, shape=shape, sharding=output_sharding, omega_axis=0,
-            reduce=reduce, on_shell=tables)
+            accumulator = DeviceOmegaAccumulator(
+                request, carrier=sigma_axis.carrier, sharding=output_sharding,
+                reduce=_on_shell_reduce(mesh_xy, len(brackets) if bracketed else None),
+                shape=(((2, *spatial_shape),) * (2 if n_counts > 1 else 1),
+                       ((request.n_slot, spatial_shape[0], sigma_axis.carrier,
+                         int(mesh_xy.shape["y"])),) * n_counts))
+
         kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
         if tau_kernel_factory is not None:
@@ -1407,13 +1543,16 @@ def _integrate_sigma_batches(
                            w_synthesis.q_wedge.wedge_key(),
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
             # The Green kconv call's tables, placed once per run and plan: a window argument.
-            # Two nodes per loop trip (gw.ppm_accumulators.WINDOW_OVERLAP): one
-            # node's W exchange runs beside the other's k-convolutions, when
-            # the paired window fits (SynthesisTau.fits, at the first compile).
+            # Two nodes per loop trip (gw.ppm_accumulators.WINDOW_OVERLAP) on a leg
+            # whose WINDOW_PAIRING row says so: one node's W exchange runs beside the
+            # other's k-convolutions, when the paired window fits (SynthesisTau.fits,
+            # at the first compile).
+            from gw.ppm_accumulators import window_pairing
             tau_kernel = SynthesisTau(
                 scalar_spatial, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
                 "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,),
-                kconv_tables=sigma_kconv_tables(mesh_xy, k_unfold_plan), overlap=True)
+                kconv_tables=sigma_kconv_tables(mesh_xy, k_unfold_plan),
+                overlap=window_pairing(mesh_xy))
         else:
             tau_kernel = get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
@@ -1434,6 +1573,17 @@ def _integrate_sigma_batches(
         # raises it; a one-shot sizes it from its own windows.
         tau_capacity = max(max((len(row.window.nodes.t) for row in plan), default=0),
                            int(tau_capacity or 0))
+        window_table = counter = None
+        window_index = 0
+        if synthesis:
+            # Every window's operands (nodes, coefficient inputs, intervals,
+            # band masks, reference energies, active count) placed once per Σ
+            # call; a window reads its row on device behind the counter.
+            window_table = _sigma_window_table(accumulator, w_synthesis, plan, tau_capacity)
+            counter = accumulator.window_counter()
+            if request is not None:
+                print_fn(f"  Sigma window table: {len(window_table.nodes)} windows, "
+                         f"{window_table.nbytes / 2**20:.2f} MiB per device")
 
         n_sweeps = n_tau = 0
         batch_size = int(pole_batch_size)
@@ -1488,17 +1638,34 @@ def _integrate_sigma_batches(
                 continue
             fence('tau.window_arguments', sync_ranks=True)
             with timing.section('tau.window_arguments'):
-                pole_indices, bounds, phase_real, active_count = selected
-                active_count = device_put_process_local(active_count, small)
                 win = row.window
                 weight = getattr(row, "band_weight", None)
-                if weight is None:
-                    selector = jnp.asarray(win.mask_A)
+                if synthesis:
+                    # The window's row of the Σ window table, on device behind
+                    # the device window counter: no host transfer per window.
+                    if window_index >= len(window_table.nodes):
+                        raise ValueError("GATE sigma_window_table: a window outside the planned "
+                                         "table was visited; want one pass over the plan")
+                    t_pad, coeff, n_active, operands, counter = accumulator.window_pick(
+                        window_table, counter)
+                    n_nodes = window_table.nodes[window_index]
+                    window_index += 1
+                    active_count = operands["active"]
+                    selector = _window_selector(np.shape(win.mask_A), weight is not None)(
+                        operands["mask"], weight)
+                    e_ref_a, e_ref_b = operands["e_ref_a"], operands["e_ref_b"]
                 else:
-                    selector = (jnp.asarray(win.mask_A, jnp.float64)
-                                * jnp.reshape(
-                                    jnp.asarray(weight, jnp.float64),
-                                    np.asarray(win.mask_A).shape))
+                    pole_indices, bounds, phase_real, active_count = selected
+                    # One of a few window widths: placed once per distinct value.
+                    active_count = device_put_process_local_cached(active_count, small)
+                    if weight is None:
+                        selector = jnp.asarray(win.mask_A)
+                    else:
+                        selector = (jnp.asarray(win.mask_A, jnp.float64)
+                                    * jnp.reshape(
+                                        jnp.asarray(weight, jnp.float64),
+                                        np.asarray(win.mask_A).shape))
+                    e_ref_a, e_ref_b = jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B)
                 E_A_call = k_unfold_plan.parent_rows(row.E_A)
                 selector = k_unfold_plan.parent_rows(
                     jnp.reshape(selector, np.shape(row.E_A)))
@@ -1506,12 +1673,11 @@ def _integrate_sigma_batches(
                 # window, so they are built once per window rather than per node.
                 if synthesis:
                     # The synthesis reads the right endpoint's faces and its
-                    # window operands (host intervals, once per window).
-                    row_kernel = tau_kernel.window_kernel()
+                    # window operands (the table row's intervals).
+                    row_kernel = tau_kernel.window_kernel(row.space)
                     tau_arguments = tau_kernel.window_arguments(
                         psi_coh_xn, psi_proj_xr, E_A_call, selector,
-                        jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B),
-                        row.space, row.pole_indices, row.bounds)
+                        e_ref_a, e_ref_b, row.space, operands.get("intervals"))
                 else:
                     pole_indices, bounds, phase_real = (
                         device_put_process_local(x, small)
@@ -1525,7 +1691,7 @@ def _integrate_sigma_batches(
                         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A_call, selector, B_branch, Omega,
                         pole_indices, bounds, phase_real,
-                        jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B), g_load)
+                        e_ref_a, e_ref_b, g_load)
             window_options = dict(
                 active_count=active_count, capacity=tau_capacity,
                 omega_sign=win.omega_sign, prefactor=win.prefactor,
@@ -1533,41 +1699,69 @@ def _integrate_sigma_batches(
                 antihermitian=(win.project_code == 1),
                 omega_indices=row.omega_idx, omega_values=row.omega_abs,
                 overlap=getattr(tau_kernel, "overlap", False))
+
+            def compile_window(row_kernel=row_kernel, tau_arguments=tau_arguments):
+                if synthesis:
+                    return accumulator.run_window(
+                        row_kernel, tau_arguments, t_pad, coeff, n_active, active_count,
+                        antihermitian=window_options["antihermitian"],
+                        overlap=window_options["overlap"], compile_only=True)
+                return accumulator.integrate_window(
+                    row_kernel, tau_arguments, win.nodes.t,
+                    win.nodes.alpha, compile_only=True, **window_options)
             if not sweep_started:
                 fence('tau.initial_compile_and_probe', sync_ranks=True)
                 with timing.section('tau.initial_compile_and_probe'):
-                    compiled = accumulator.integrate_window(
-                        row_kernel, tau_arguments, win.nodes.t,
-                        win.nodes.alpha, n_active=len(win.nodes.t),
-                        compile_only=True, **window_options)
-                    if window_options["overlap"] and not tau_kernel.fits(compiled):
+                    # Every window program this plan runs (one per W orientation its
+                    # branches read, :meth:`WSynthesis.branch_orientation`), compiled
+                    # here and priced together: the largest is admitted.
+                    programs = [(row_kernel, tau_arguments)]
+                    if synthesis:
+                        for space in sorted({r.space for r in plan} - {row.space}):
+                            other = tau_kernel.window_kernel(space)
+                            if any(other is k for k, _ in programs):
+                                continue
+                            programs.append((other, tau_kernel.window_arguments(
+                                psi_coh_xn, psi_proj_xr, E_A_call, selector,
+                                e_ref_a, e_ref_b, space, operands.get("intervals"))))
+                    compiled_all = [compile_window(k, a) for k, a in programs]
+                    if window_options["overlap"] and not all(
+                            tau_kernel.fits(c) for c in compiled_all):
                         # Two nodes in flight do not fit beside the live
                         # stages: one node per trip, the default schedule (the
                         # stage table's window price then names no pairing).
                         tau_kernel.overlap = window_options["overlap"] = False
-                        compiled = accumulator.integrate_window(
-                            row_kernel, tau_arguments, win.nodes.t,
-                            win.nodes.alpha, n_active=len(win.nodes.t),
-                            compile_only=True, **window_options)
+                        compiled_all = [compile_window(k, a) for k, a in programs]
+                    compiled = compiled_all[0]
                     if synthesis:
-                        tau_kernel.admit(compiled, tau_arguments)
+                        from runtime.aot_memory import aot_kernel_peak_bytes
+                        largest = max(range(len(compiled_all)), key=lambda i: int(
+                            aot_kernel_peak_bytes(compiled_all[i]).total))
+                        tau_kernel.admit(compiled_all[largest], programs[largest][1])
                     print_fn(
                         "  MPA Sigma sweep begin: one executable per window "
                         "prewarmed")
                     sweep_started = True
-            fence('tau.window_setup', sync_ranks=True)
-            with timing.section('tau.window_setup'):
-                t_nodes = np.asarray(
-                    jax.device_get(win.nodes.t), np.complex128)
-                alpha_nodes = np.asarray(
-                    jax.device_get(win.nodes.alpha), np.complex128)
-            # One executable per window: the node loop runs on device.
-            total = accumulator.integrate_window(
-                row_kernel, tau_arguments, t_nodes, alpha_nodes,
-                n_active=len(t_nodes), **window_options)
-            for _ in t_nodes:
+            if synthesis:
+                # One executable per window: the node loop runs on device.
+                total = accumulator.run_window(
+                    row_kernel, tau_arguments, t_pad, coeff, n_active, active_count,
+                    antihermitian=window_options["antihermitian"],
+                    overlap=window_options["overlap"])
+            else:
+                fence('tau.window_setup', sync_ranks=True)
+                with timing.section('tau.window_setup'):
+                    t_nodes = np.asarray(
+                        jax.device_get(win.nodes.t), np.complex128)
+                    alpha_nodes = np.asarray(
+                        jax.device_get(win.nodes.alpha), np.complex128)
+                # One executable per window: the node loop runs on device.
+                total = accumulator.integrate_window(
+                    row_kernel, tau_arguments, t_nodes, alpha_nodes, **window_options)
+                n_nodes = len(t_nodes)
+            for _ in range(n_nodes):
                 progress.step(wait=total)
-            n_tau += len(t_nodes)
+            n_tau += n_nodes
             n_sweeps += 1
         del B, B_odd, Omega
         gc.collect()
@@ -1575,30 +1769,24 @@ def _integrate_sigma_batches(
 
     fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
-        sigma = accumulator.finalize()
-        if bracketed or on_shell_request is not None:
+        if request is None:
+            sigma = _grid_finalize(accumulator.finalize(), k_unfold_plan.sym, bracketed,
+                                   output_sharding, mesh_xy)
+        else:
             # The counts stay on the wedge; each is unfolded when it is read.
-            matrices, diagonals = sigma
+            matrices, diagonals = accumulator.finalize()
             sym = k_unfold_plan.sym
             full = _wedge_is_full_bz(sym)
-            unfold = ((lambda value: value) if full else
-                      _on_shell_unfold_fn(sym, output_sharding) if on_shell_request is not None else
-                      _unfold_sigma_cube_fn(sym, 1, output_sharding))
             sigma = BandCountCube(
-                matrices=list(matrices),
-                diagonals=[] if on_shell_request is not None else list(diagonals),
-                unfold=unfold,
+                matrices=list(matrices), slot_diagonals=list(diagonals),
+                unfold=(lambda value: value) if full else _on_shell_unfold_fn(sym, output_sharding),
                 unfold_rows=((lambda slots: slots) if full else
                              _band_count_rows_fn(sym, mesh_xy)),
-                nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy,
-                on_shell=on_shell_request,
-                slot_diagonals=list(diagonals) if on_shell_request is not None else [])
+                nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=request)
             if not bracketed:
                 # One count: the on-shell Sigma itself.
                 sigma = sigma.point(0)
-        else:
-            sigma = _unfold_sigma_cube(
-                sigma, k_unfold_plan.sym, k_axis=1, sharding=output_sharding)
+
         if bracketed:
             if band_counts is None:
                 band_counts = tuple(
@@ -1625,12 +1813,48 @@ def _integrate_sigma_batches(
                 f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
                 f"max|D|/max|B|={ratio:.12e}")
         return SigmaOmegaResult(
-            omega_ry=omega,
-            omega_ev=np.asarray(omega * RYD_TO_EV, np.float64),
             sigma_c_kij=sigma,
             band_axis=sigma_axis,
             band_counts=(() if band_counts is None else tuple(band_counts)),
-            odd_even_residue_ratio=ratio)
+            odd_even_residue_ratio=ratio,
+            omega_ry=None if request is not None else omega,
+            omega_ev=(None if request is not None else
+                      np.asarray(omega * RYD_TO_EV, np.float64)))
+
+
+def _grid_accumulator(omega, spatial_shape, output_sharding, brackets, sigma_axis, mesh_xy):
+    """The omega-grid accumulator (``sigma_omega_grid_debug``) of one Sigma sweep.
+
+    Unbracketed it folds the ``(n_omega, n_parent, nb, nb)`` cube; bracketed,
+    only what the band counts keep: the matrix of the first and the last
+    count and the diagonals between (:func:`_band_count_reduce`).
+    """
+    shape = (omega.size, *spatial_shape)
+    reduce = None
+    if brackets is not None:
+        reduce = _band_count_reduce(mesh_xy, len(brackets))
+        n_between = max(len(brackets) - 2, 0)
+        shape = ((shape,) * (len(brackets) - n_between),
+                 ((omega.size, spatial_shape[0], sigma_axis.carrier,
+                   int(mesh_xy.shape["y"])),) * n_between)
+    return DeviceOmegaAccumulator.grid(
+        omega, shape=shape, sharding=output_sharding, omega_axis=0, reduce=reduce)
+
+
+def _grid_finalize(sigma, sym, bracketed, output_sharding, mesh_xy):
+    """The grid sweep's result: the full-BZ cube, or the counts kept on the wedge."""
+    if not bracketed:
+        return _unfold_sigma_cube(sigma, sym, k_axis=1, sharding=output_sharding)
+    # The counts stay on the wedge; each is unfolded when it is read.
+    matrices, diagonals = sigma
+    full = _wedge_is_full_bz(sym)
+    return BandCountCube(
+        matrices=list(matrices), slot_diagonals=[], diagonals=list(diagonals),
+        unfold=((lambda value: value) if full else
+                _unfold_sigma_cube_fn(sym, 1, output_sharding)),
+        unfold_rows=((lambda slots: slots) if full else
+                     _band_count_rows_fn(sym, mesh_xy)),
+        nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=None)
 
 
 def _unfold_sigma_cube(sigma, sym, *, k_axis, sharding):
@@ -1715,11 +1939,7 @@ def _on_shell_reduce(mesh_xy, n_brackets):
     slots the extrapolation combines.
     """
     from gw.ppm_sigma import band_diagonal_slots
-    if int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
-        raise ValueError(
-            "GATE on_shell_square_mesh: the on-shell Sigma keeps band diagonals in "
-            "place, which needs a square processor mesh; run sigma_omega_grid_debug "
-            "on this mesh")
+    # A square mesh is resolve_mesh's invariant (band_diagonal_slots checks it).
     diag_slots = band_diagonal_slots(mesh_xy, 3)
 
     def reduce(sigma):
@@ -1746,7 +1966,9 @@ def _on_shell_unfold_fn(sym, sharding):
     carries the frequency of the ROW state and slot 1 that of the COLUMN
     state, and a transpose exchanges them, so there
     ``pair[0](k') = pair[1](k)^T``: an antiunitary row reads the slot-swapped
-    pair.  A diagonal is unchanged (``_band_count_rows_fn``).
+    pair.  The base transport acts on each slot alone, so the swapped pair's
+    transport is the transported pair swapped: one unfold.  A diagonal is
+    unchanged (``_band_count_rows_fn``).
     """
     from symmetry_maps import star_tables_of
     base = _unfold_sigma_cube_fn(sym, 1, sharding)
@@ -1757,37 +1979,9 @@ def _on_shell_unfold_fn(sym, sharding):
     anti = jnp.asarray(anti)
 
     def unfold(pair):
-        return jnp.where(anti[None, :, None, None], base(pair[::-1]), base(pair))
+        out = base(pair)
+        return jnp.where(anti[None, :, None, None], out[::-1], out)
     return jax.jit(unfold, out_shardings=sharding)
-
-
-def _on_shell_parent_tables(request, k_unfold_plan, sigma_axis, mesh_xy):
-    """The request's tables on the parent k rows and the padded band carrier.
-
-    ``GATE on_shell_star_invariant``: the per-state energies must be the same
-    at every k of a star, since the wedge Sigma is evaluated at its parent's
-    energies and transported to the star.  A QP spectrum is (the SC loop's
-    states are symmetric); a violation would put one star partner's Sigma at
-    another's energy.
-    """
-    from gw.ppm_accumulators import OnShellTables
-    full = np.asarray(request.tables_ry, np.float64)
-    parent = np.asarray(k_unfold_plan.parent_rows(full, axis=1))
-    irr = np.asarray(k_unfold_plan.irr_idx)
-    drift = float(np.max(np.abs(parent[:, irr] - full), initial=0.0))
-    if drift > 1.0e-9:
-        raise ValueError(
-            f"GATE on_shell_star_invariant: the on-shell energies differ by {drift:.3e} Ry "
-            "between k points of one star")
-    index = np.asarray(k_unfold_plan.parent_rows(np.asarray(request.index), axis=1))
-    pad = int(sigma_axis.carrier) - int(parent.shape[-1])
-    if pad < 0:
-        raise ValueError(f"on-shell tables carry {parent.shape[-1]} bands, the Sigma "
-                         f"carrier {sigma_axis.carrier}")
-    parent = np.pad(parent, ((0, 0), (0, 0), (0, pad)))
-    index = np.pad(index.astype(np.int32), ((0, 0), (0, 0), (0, pad)), constant_values=-1)
-    omega = device_put_process_local(parent, NamedSharding(mesh_xy, P()))
-    return OnShellTables(omega=omega, index=index, omega_host=parent)
 
 
 def _attach_ordered_odd_sigma(total, even):
@@ -1905,7 +2099,7 @@ def integrate_sigma_store(
     fit_src,
     n_poles,
     plan,
-    omega_grid_ry,
+    request,
     meta,
     mesh_xy,
     *,
@@ -1915,7 +2109,7 @@ def integrate_sigma_store(
     odd_residue_off=False,
     tau_capacity=None,
     tau_kernel_factory=None,
-    on_shell_request=None,
+    omega_grid_ry=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -1930,10 +2124,10 @@ def integrate_sigma_store(
 
     ``brackets`` optionally partitions the intermediate-state band sum into
     disjoint slices.  The spatial kernel then returns a leading bracket axis;
-    this executor folds the cumulative first and last counts and the
-    diagonals between (``_band_count_reduce``) on the FILE wedge and returns
-    a ``BandCountCube``, which unfolds one count at a time.  ``None``
-    preserves the ordinary MPA rank-4 result.
+    this executor folds the cumulative first and last pairs and every count's
+    diagonal slots (``_on_shell_reduce``) on the FILE wedge and returns a
+    ``BandCountCube``, which unfolds one count at a time.  ``None`` returns
+    the ``OnShellSigma`` itself.
 
     ``tau_kernel_factory`` replaces the resident pole route's τ body (the
     plane-wave path's ``get_shared_sigma_tau_kernel(_sigma_kij=...)``); see
@@ -1955,11 +2149,11 @@ def integrate_sigma_store(
 
     def run(reader):
         return _integrate_sigma_batches(
-            wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
+            wfns, batches(reader), int(n_poles), plan, request, meta,
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
             q_wedge=q_wedge, tau_capacity=tau_capacity,
-            tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
+            tau_kernel_factory=tau_kernel_factory, omega_grid_ry=omega_grid_ry,
             print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
@@ -2026,7 +2220,8 @@ def compute_sigma_c_mpa_omega_grid(
     meta,
     mesh_xy,
     *,
-    omega_grid_ry,
+    request=None,
+    omega_grid_ry=None,
     efermi_ry,
     regularization_width_ry,
     edge_factor=1.5,
@@ -2051,7 +2246,6 @@ def compute_sigma_c_mpa_omega_grid(
     omega_group=None,
     group_fixed=None,
     linalg=None,
-    on_shell_request=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -2060,10 +2254,10 @@ def compute_sigma_c_mpa_omega_grid(
     per-frequency broadening and window labels (``sigma_box_plan.plan_sigma_windows``).
     ``linalg``: the deck's resolved dense layout, which places a shared-pole
     model's W(τ) synthesis (:func:`_shared_pole_memory_schedule`).
-    ``on_shell_request`` (``gw.ppm_sigma.OnShellRequest``): evaluate Sigma_c on shell
-    only; ``omega_grid_ry`` must then be the request's ``frequencies_ry``
-    (the planner's frequency list, on which ``omega_eta_ry``/``omega_group``
-    are labelled).  None is the grid (``sigma_omega_grid_debug``).
+    ``request`` (``gw.ppm_sigma.OnShellRequest``): where Sigma_c is evaluated;
+    the windows are planned on its ``frequencies_ry`` (on which
+    ``omega_eta_ry``/``omega_group`` are labelled).  ``omega_grid_ry`` in its
+    place (``sigma_omega_grid_debug``) evaluates Sigma_c on that grid.
 
     ``occupation_state`` (duck-typed ``gw.efermi.OccupationState``): None is
     the incumbent insulating semantics, bit-exact.  With a state, the causal
@@ -2094,10 +2288,14 @@ def compute_sigma_c_mpa_omega_grid(
     """
     if sigma_w_model not in ("mpa", "shared_pole"):
         raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
-    if on_shell_request is not None and not np.array_equal(
-            np.asarray(omega_grid_ry, np.float64), on_shell_request.frequencies_ry):
-        raise ValueError("compute_sigma_c_mpa_omega_grid: an on-shell call plans its windows "
-                         "on the request's frequency list (omega_grid_ry)")
+    if (request is None) == (omega_grid_ry is None):
+        raise ValueError("compute_sigma_c_mpa_omega_grid: pass request (on shell) or "
+                         "omega_grid_ry (the grid), not both")
+    # The grid sweep folds onto omega_grid_ry; on shell the windows are
+    # planned on the request's frequencies.
+    grid_ry = omega_grid_ry if request is None else None
+    if request is not None:
+        omega_grid_ry = request.frequencies_ry
     shared_pole = sigma_w_model == "shared_pole"
     if shared_pole and tau_kernel_factory is not None:
         raise ValueError(
@@ -2319,18 +2517,20 @@ def compute_sigma_c_mpa_omega_grid(
                         layout=schedule.get("factor_layout", wfns.layout))
                         if sector_context is None else sector_context["synthesis"](
                             reader, ledger, frequencies, schedule))
+                    print_fn("  " + getattr(synthesis, "path_note",
+                                            "route Sigma W synthesis: pair (no per-branch orientation)"))
                 # A sector's caller owns its synthesis lifetime
                 # (compute_sector_sigma); the scalar model's ends here.
                 owned = sector_context is None
                 try:
                     total = _integrate_sigma_batches(
                         wfns, ((0, None, None, None),), n_poles, plan,
-                        omega_grid_ry, meta, mesh_xy, pole_batch_size=n_poles,
+                        request, meta, mesh_xy, pole_batch_size=n_poles,
                         brackets=band_brackets, band_counts=band_counts,
                         w_synthesis=synthesis,
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
-                        tau_capacity=geometry.get("sc_tau_capacity"), on_shell_request=on_shell_request,
+                        tau_capacity=geometry.get("sc_tau_capacity"), omega_grid_ry=grid_ry,
                         print_fn=print_fn)
                 except BaseException:
                     if owned:
@@ -2341,11 +2541,11 @@ def compute_sigma_c_mpa_omega_grid(
                 del synthesis
             else:
                 total = integrate_sigma_store(
-                    wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+                    wfns, reader, n_poles, plan, request, meta, mesh_xy,
                     pole_batch_size=pole_batch_size, brackets=band_brackets,
                     band_counts=band_counts,
                     tau_capacity=geometry.get("sc_tau_capacity"),
-                    tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
+                    tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
                     print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
@@ -2358,10 +2558,10 @@ def compute_sigma_c_mpa_omega_grid(
         # A debug-off arm deliberately emits a zero twin, letting the public
         # sigC_odd column check its own A/B.
         even = integrate_sigma_store(
-            wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
+            wfns, reader, n_poles, plan, request, meta, mesh_xy,
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=True,
-            tau_kernel_factory=tau_kernel_factory, on_shell_request=on_shell_request,
+            tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
             print_fn=lambda *args, **kwargs: None)
         return _attach_ordered_odd_sigma(total, even)
 

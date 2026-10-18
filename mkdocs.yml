@@ -62,6 +62,7 @@ nav:
       - Installation:
           - Overview: installation/index.md
           - Perlmutter (NERSC): installation/perlmutter.md
+          - Frontier (OLCF): installation/frontier.md
           - Building the FFI libraries: installation/ffi-build.md
       - Inputs from DFT: preprocessing.md
       - Drivers: drivers.md
@@ -113,6 +114,10 @@ nav:
       - The FFI layer: architecture/ffi_layout.md
       - k-convolution: architecture/kconv.md
       - Compilation: architecture/compilation.md
+      - Host–device sync: architecture/host_device_sync.md
+      - Determinism: architecture/determinism.md
+      - Start-up, environment and caches: architecture/startup_environment.md
+      - ROCm leg kernels: architecture/rocm_leg.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
       - Mesh-padded axes: architecture/padding.md
       - Memory model: architecture/memory-model.md

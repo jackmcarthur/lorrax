@@ -114,6 +114,12 @@ _L3_MODULES = frozenset({
     "runtime.source_closure",
     # stdlib-only site network policy resolved before backend initialization
     "runtime.network_env",
+    # the leg's vendor first-use policy (kernel stores, BLAS warm-up), armed
+    # by runtime step 7b; it imports jax and lxkit only
+    "runtime.vendor_kernels",
+    # the process-environment freeze armed by runtime step 7b (before the
+    # first native worker thread); stdlib-only, consumed only by ``runtime``
+    "runtime.env_guard",
     # ``runtime.env_flags`` — THE boolean-env grammar, and its level is the
     # whole reason it is here rather than in ``gw.gw_config``.  The parsers
     # that still swallowed an unrecognised token silently
@@ -123,6 +129,12 @@ _L3_MODULES = frozenset({
     # were.  It knows about ``os.environ`` and nothing else: no jax, no
     # config, no physics.
     "runtime.env_flags",
+    # stdlib-only OpenBLAS spin tuning, run as the first statement of
+    # ``runtime`` (before numpy maps a library) and gated in bootstrap
+    "runtime.blas_env",
+    # the ordered process end every P > 1 entry point gets (threading shutdown
+    # hook + sys.monitoring exit status); stdlib-only, consumed only by ``runtime``
+    "runtime.ordered_exit",
     # the cross-process service and its one policy client
     "common.collectives", "centroid.distribution",
     # movement primitives.  Named, owned patterns — NOT generic ``shard_map``

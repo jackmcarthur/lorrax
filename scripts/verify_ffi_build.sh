@@ -2,7 +2,7 @@
 # ============================================================================
 # verify_ffi_build.sh — THE acceptance contract for a LORRAX FFI library.
 #
-#   scripts/verify_ffi_build.sh [--leg host|cuda] <so-file>
+#   scripts/verify_ffi_build.sh [--leg host|cuda|rocm] <so-file>
 #
 # Every build path in this repository ends here.  config/perlmutter/
 # build_ffi_host.sh delegates to it, src/ffi/cpp/build_host.sh and
@@ -50,7 +50,7 @@
 # infers its own expectation from the artifact cannot fail, which is how the
 # Aug-7 build passed everything anybody ran on it.
 #
-#   LORRAX_FFI_EXPECT_LEG          host | cuda.  Inferred from the file name
+#   LORRAX_FFI_EXPECT_LEG          host | cuda | rocm.  Inferred from the file name
 #                                  when unset, and the inference is announced.
 #   LORRAX_FFI_EXPECT_BACKENDS     comma list of what this build was SUPPOSED
 #                                  to contain.  Default is the FULL set for the
@@ -60,6 +60,7 @@
 #                                  the Aug-7 library.
 #                                    host: scalapack,gemm,slate,phdf5,fft
 #                                    cuda: cusolvermp,cufft,slate,phdf5
+#                                    rocm: phdf5,slate,kdft
 #   LORRAX_FFI_EXPECT_HDF5_SOVERSION
 #                                  the HDF5 SOVERSION THE RUNTIME WILL MOUNT
 #                                  (e.g. 200).  Stated, not inferred: on
@@ -117,7 +118,7 @@ LEG="${LORRAX_FFI_EXPECT_LEG:-}"
 SO=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --leg) LEG="${2:?--leg needs host|cuda}"; shift 2 ;;
+        --leg) LEG="${2:?--leg needs host|cuda|rocm}"; shift 2 ;;
         --leg=*) LEG="${1#--leg=}"; shift ;;
         -h|--help)
             sed -n '2,110p' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -134,7 +135,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$SO" ]]; then
-    warn "usage: verify_ffi_build.sh [--leg host|cuda] <so-file>"
+    warn "usage: verify_ffi_build.sh [--leg host|cuda|rocm] <so-file>"
     exit 2
 fi
 
@@ -158,16 +159,17 @@ if [[ -z "$LEG" ]]; then
     case "$(basename "$SO")" in
         *_host.so|*_host.so.*) LEG=host ;;
         liblorrax_ffi.so|liblorrax_ffi.so.*) LEG=cuda ;;
+        *_rocm.so|*_rocm.so.*) LEG=rocm ;;
         *)  warn "REFUSED: cannot tell which leg $SO is from its name, and the"
             warn "  leg decides which backends and which symbol names are"
-            warn "  expected.  Say so: --leg host|cuda."
+            warn "  expected.  Say so: --leg host|cuda|rocm."
             exit 2 ;;
     esac
     say "leg inferred from the file name: $LEG"
 fi
 case "$LEG" in
-    host|cuda) ;;
-    *) warn "REFUSED: --leg must be 'host' or 'cuda', got '$LEG'."; exit 2 ;;
+    host|cuda|rocm) ;;
+    *) warn "REFUSED: --leg must be 'host', 'cuda' or 'rocm', got '$LEG'."; exit 2 ;;
 esac
 
 # --- expectations -----------------------------------------------------------
@@ -175,6 +177,8 @@ esac
 # backend must fail, and a site that deliberately builds fewer must say so.
 if [[ "$LEG" == host ]]; then
     DEFAULT_BACKENDS="scalapack,gemm,slate,phdf5,fft"
+elif [[ "$LEG" == rocm ]]; then
+    DEFAULT_BACKENDS="phdf5,slate,kdft"
 else
     DEFAULT_BACKENDS="cusolvermp,cufft,slate,phdf5"
 fi
@@ -217,6 +221,14 @@ RUNTIME_ENV=1
 if [[ "$LEG" == cuda ]]; then
     RUNTIME_ENV=0
     [[ -d /lorrax_phdf5 || -d /lorrax_nvhpc ]] && RUNTIME_ENV=1
+fi
+# The ROCM leg is built and run bare-metal, but its HIP runtime is the one the
+# JAX plugin maps from the pip ROCm wheel, which no module puts on the search
+# path: the closure resolves here only where LD_LIBRARY_PATH carries a ROCm
+# 7 lib directory (module rocm/<v>, or the wheel's lib dirs).
+if [[ "$LEG" == rocm ]]; then
+    RUNTIME_ENV=0
+    ldd "$SO" 2>/dev/null | grep -E '^[[:space:]]*libamdhip64\.so\.7 ' | grep -qv 'not found' && RUNTIME_ENV=1
 fi
 [[ "${LORRAX_FFI_VERIFY_ENV:-}" == runtime ]] && RUNTIME_ENV=1
 [[ "${LORRAX_FFI_VERIFY_ENV:-}" == build   ]] && RUNTIME_ENV=0
@@ -269,7 +281,7 @@ printf '%s\n' "$NEEDED" | sed "s/^/[$TAG]   /"
 # with a stamp saying 0 is a stale build directory.  Both are real.
 # ===========================================================================
 say "--- GATE 0 (declared backends are present) ---"
-STAMP="$(strings -a "$SO" 2>/dev/null | grep -m1 -E '(^|[[:space:]])leg=(host|cuda)[[:space:]]+abi=[0-9]+' || true)"
+STAMP="$(strings -a "$SO" 2>/dev/null | grep -m1 -E '(^|[[:space:]])leg=(host|cuda|rocm)[[:space:]]+abi=[0-9]+' || true)"
 if [[ -z "$STAMP" ]]; then
     # Fall back to the pre-2026-08-08 host stamp, which had no leg= or abi=.
     STAMP="$(strings -a "$SO" 2>/dev/null | grep -m1 -E '^linked_fftw3=[01] scalapack=[01]' || true)"
@@ -311,6 +323,10 @@ backend_stamp_key() {
         cuda:cufft)      echo cufft ;;
         cuda:slate)      echo slate ;;
         cuda:phdf5)      echo phdf5 ;;
+        rocm:phdf5)      echo phdf5 ;;
+        rocm:slate)      echo slate ;;
+        # kdft compiles unconditionally on the ROCM leg (no configure key).
+        rocm:kdft)       echo - ;;
         *) echo "?" ;;
     esac
 }
@@ -325,6 +341,9 @@ backend_symbol_re() {
         cuda:cufft)      echo '^(Cufft|KConvMathdx|KFftMathdx)[A-Za-z0-9]*CudaFfi$' ;;
         cuda:slate)      echo '^Slate[A-Za-z0-9]*Ffi$' ;;
         cuda:phdf5)      echo '^Phdf[A-Za-z0-9]*Ffi$' ;;
+        rocm:phdf5)      echo '^Phdf[A-Za-z0-9]*Ffi$' ;;
+        rocm:slate)      echo '^Slate[A-Za-z0-9]*Ffi$' ;;
+        rocm:kdft)       echo '^KDft[A-Za-z0-9]*Ffi$' ;;
         *) echo "" ;;
     esac
 }
@@ -337,12 +356,13 @@ for b in "${_want[@]}"; do
     if [[ -z "$re" ]]; then
         fail 0b "'$b' is not a backend of the $LEG leg.  Known:
       host = scalapack gemm slate phdf5 fft
-      cuda = cusolvermp cufft slate phdf5"
+      cuda = cusolvermp cufft slate phdf5
+      rocm = phdf5 slate kdft"
         continue
     fi
     # On the device leg the host handlers are absent, but keep the two name
     # spaces apart explicitly rather than by luck.
-    if [[ "$LEG" == cuda ]]; then
+    if [[ "$LEG" != host ]]; then
         n="$(printf '%s\n' "$DEFINED" | grep -v 'Host' | grep -cE "$re")"
     else
         n="$(printf '%s\n' "$DEFINED" | grep -cE "$re")"
@@ -471,6 +491,63 @@ $(printf '%s\n' "$_cuda_needed" | sed 's/^/        /')
     else
         say "GATE 3 PASSED: no CUDA-stack library in DT_NEEDED"
     fi
+elif [[ "$LEG" == rocm ]]; then
+    # (a) no CUDA stack; (b) one HIP runtime SONAME, the 7.x one JAX's wheel
+    # provides; (c) the SONAME-race half (ffi_loader.py "SHARE THEIR SLATE"):
+    # the libslate.so.2 this environment resolves for the leg is a HIP build,
+    # not the gpu_backend=none install the host leg's LD_LIBRARY_PATH entry
+    # names -- a device-less SLATE loads fine and every handler then refuses
+    # with get_device_count()=0.
+    _cuda_needed="$(printf '%s\n' "$NEEDED" | grep -iE 'cuda|nccl|nvshmem|^libcal\.so' || true)"
+    _hip_needed="$(printf '%s\n' "$NEEDED" | grep -E '^libamdhip64' | sort -u)"
+    _g3=0
+    if [[ -n "$_cuda_needed" ]]; then
+        fail 3a "the ROCM library links CUDA-stack libraries: $(echo $_cuda_needed)"; _g3=1
+    fi
+    if [[ -n "$_hip_needed" && "$_hip_needed" != "libamdhip64.so.7" ]]; then
+        fail 3b "the ROCM library links HIP runtime(s) '$(echo $_hip_needed)', not the
+      libamdhip64.so.7 that the JAX ROCm 7 plugin maps."; _g3=1
+    fi
+    if printf '%s\n' "$NEEDED" | grep -qx 'libslate.so.2'; then
+        if [[ "$RUNTIME_ENV" -eq 0 ]]; then
+            notrun 3c "which libslate.so.2 the leg binds is an environment fact;
+      not checkable where libamdhip64.so.7 does not resolve (LORRAX_FFI_VERIFY_ENV=runtime)."
+        else
+            _sl="$(ldd "$SO" 2>/dev/null | awk '$1=="libslate.so.2"{print $3}')"
+            if [[ -z "$_sl" || ! -f "$_sl" ]]; then
+                fail 3c "libslate.so.2 does not resolve for this leg here."; _g3=1
+            elif ! readelf -d "$_sl" | grep NEEDED | grep -q 'librocblas'; then
+                fail 3c "libslate.so.2 resolves to $_sl, a SLATE WITHOUT HIP (no
+      librocblas in its DT_NEEDED).  The device leg would load the host leg's
+      gpu_backend=none SLATE.  The ROCM leg pins its SLATE by DT_RPATH
+      (CMakeLists ROCM block); a stale build or an LD_PRELOAD defeats it."; _g3=1
+            else
+                say "GATE 3c: libslate.so.2 -> $_sl (HIP build)"
+                # GATE 3d: SLATE's host BLAS must be safe for CONCURRENT callers
+                # (SLATE calls it from its OpenMP task threads).  LibSci is not,
+                # in either flavour: threaded SIGSEGVs, sequential returns wrong
+                # heev eigenpairs at nb < n/p (SLATE_PERF_REPORT); the site's
+                # BLAS is the locking OpenBLAS (build_openblas_seq.sh), shipped in
+                # the SLATE prefix.  Checked on the LEG's closure: SONAMEs the leg
+                # binds by DT_RPATH are the ones SLATE's own NEEDED entries meet.
+                _bl="$(ldd "$SO" 2>/dev/null | awk '$1 ~ /^lib(sci|openblas)/{print $1"="$3}' | sort -u | tr '\n' ' ')"
+                _ob="$(ldd "$SO" 2>/dev/null | awk '$1 ~ /^libopenblas/{print $3}' | head -1)"
+                if printf '%s' "$_bl" | grep -q 'libsci'; then
+                    fail 3d "the leg's closure maps LibSci ($_bl): not safe for SLATE's
+      concurrent host BLAS calls.  Rebuild with config/frontier/build_openblas_seq.sh
+      then build_slate_hip.sh."; _g3=1
+                elif [[ -z "$_ob" ]]; then
+                    fail 3d "the leg's closure maps no libopenblas ($_bl)."; _g3=1
+                elif grep -qs 'USE_LOCKING=1' "$(dirname "$_ob")/libopenblas.LORRAX_BUILD_FLAGS"; then
+                    say "GATE 3d: SLATE host BLAS $_ob ($(cat "$(dirname "$_ob")/libopenblas.LORRAX_BUILD_FLAGS"))"
+                else
+                    fail 3d "the leg binds $_ob, not a sequential LOCKING OpenBLAS (no
+      libopenblas.LORRAX_BUILD_FLAGS stamp with USE_LOCKING=1 beside it)."; _g3=1
+                fi
+            fi
+        fi
+    fi
+    [[ "$_g3" -eq 0 ]] && say "GATE 3 PASSED: no CUDA stack; HIP runtime=${_hip_needed:-none}"
 else
     say "GATE 3 N/A on the cuda leg (a CUDA library links CUDA)"
 fi
@@ -668,7 +745,9 @@ fi
 # reported as a pass.
 # ===========================================================================
 say "--- GATE 8 (FFT engine identity) ---"
-if [[ "$LEG" != host ]]; then
+if [[ "$LEG" == rocm ]]; then
+    say "GATE 8 N/A: the ROCM leg has no dlopened host FFT engine."
+elif [[ "$LEG" != host ]]; then
     say "GATE 8 N/A: the device leg's FFT is cuFFT, linked, not dlopened."
 elif [[ ! -x "$CPP_DIR/gate_one_fftw.sh" ]]; then
     notrun 8 "$CPP_DIR/gate_one_fftw.sh not found."

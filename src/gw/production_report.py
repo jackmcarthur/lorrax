@@ -350,22 +350,6 @@ class GWProductionReport:
         self.emit(
             f"QP consistency  : {solver} | other options: one_shot_dft "
             "(Sigma at E_DFT), self_consistent (rebuild G/W/Sigma)")
-        eqp2 = getattr(config, "eqp2", None)
-        if bool(getattr(eqp2, "enabled", False)):
-            self.emit(
-                "EQP2 treatment  : fixed-Sigma eigenvalue self-consistency; "
-                "semicore E-E_F + conduction scissor outside the protected "
-                "window; final post-rotation map required; "
-                f"max|dE| cutoff={float(eqp2.tol_ev) * 1e3:.3f} meV "
-                "(non-scissored); "
-                f"accelerator={eqp2.accelerator}"
-                + (f"(depth={int(eqp2.history_depth)})"
-                   if str(eqp2.accelerator) == "rcrop" else "")
-                + f"; max_iter={int(eqp2.max_iter)}; screening unchanged")
-        else:
-            self.emit(
-                "EQP2 treatment  : off (set write_eqp2=true for fixed-Sigma "
-                "eigenvalue self-consistency)")
         self.emit(f"Screening      : {diagram_text}; "
                   f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
         self.emit(f"Long wavelength: head={head_mode}; source={head_source}")
@@ -499,7 +483,7 @@ class GWProductionReport:
         b = band_slices
         # The sampled grid the result was built on (grown past the requested
         # edges, or derived from the bands when they are unset).
-        _grid = getattr(sigma_result, "omega_grid_ev", None)
+        _grid = sigma_result.omega_grid_ev
         grid_lo, grid_hi = ((float(_grid[0]), float(_grid[-1])) if _grid is not None
                             else sigma_requested_edges_ev(config.sigma))
         ef_ev = float(sigma_result.efermi_dft_ev)
@@ -523,10 +507,10 @@ class GWProductionReport:
         self.heading("Dynamic Sigma energy coverage")
         self.emit(f"Energy origin   : E_F = {ef_ev:+.5f} eV ({provenance})")
         omega_grid = np.asarray(
-            getattr(sigma_result, "omega_grid_ev", ()), dtype=np.float64)
+            () if _grid is None else _grid, dtype=np.float64)
         grid_note = (f"; step={float(config.sigma.omega_step_ev):.5f} eV; "
                      f"{int(omega_grid.size)} points")
-        if getattr(sigma_result, "sigma_c_on_shell", None) is not None:
+        if sigma_result.sigma_c_on_shell is not None:
             # On shell the grid is only the covered range; Sigma was not
             # sampled on its points (docs/theory/sigma-on-shell.md).
             grid_note += "; on shell: covered range only"
@@ -641,35 +625,6 @@ class GWProductionReport:
         self.emit(f"Full-matrix effective-H gap: {qp_gap:.5f} eV ({state})")
         self.emit(f"Gap correction : {qp_gap - dft_gap:+.5f} eV relative to DFT")
         self.emit("State energies  : written to the EQP files listed below")
-
-    def eqp2_summary(self, *, band_slices, e_eqp2_ry,
-                     iterations: int, residual_ev: float,
-                     tol_ev: float) -> None:
-        """Report the optional fixed-Sigma ladder and its actual criterion."""
-        if e_eqp2_ry is None:
-            return
-        e = np.asarray(e_eqp2_ry, dtype=np.float64) * RYD_TO_EV
-        iv = int(band_slices.b2 - band_slices.b0 - 1)
-        ic = int(band_slices.b2 - band_slices.b0)
-        self.heading("Fixed-Sigma eigenvalue consistency")
-        self.emit(f"Convergence     : {int(iterations)} map evaluations; "
-                  f"max|dE|={float(residual_ev) * 1e3:.6f} meV "
-                  f"<= {float(tol_ev) * 1e3:.6f} meV over non-scissored "
-                  "states; final post-rotation map verified")
-        self.emit("Updated internally: QP eigenvalues/eigenvectors and the "
-                  "basis representation of stored Sigma(omega)")
-        self.emit("EQP2 eigenvectors: internal to this consistency loop; "
-                  "not serialized")
-        self.emit("QP WFN/rotations: remain the ordinary one-shot "
-                  "full-matrix artifacts; eqp2.dat contains the final "
-                  "EQP2 eigenvalue spectrum only")
-        self.emit("Held fixed      : screening, W, and all self-energy diagrams")
-        self.emit("Outside grid    : semicore preserves E-E_F; high conduction "
-                  "uses the in-grid affine scissor")
-        if e.ndim == 2 and iv >= 0 and ic < e.shape[1]:
-            gap = float(np.min(e[:, ic]) - np.max(e[:, iv]))
-            state = "insulating" if gap > 0.0 else "metallic/overlapping"
-            self.emit(f"EQP2 gap       : {gap:.5f} eV ({state})")
 
     def timings(self, records, *, wall: float) -> None:
         """Print accumulated, non-overlapping major scientific stages.
@@ -840,7 +795,6 @@ class GWProductionReport:
             ("mean-field load", top_level("gw_jax.kin_ion_load")),
             ("QP solve + diagonalize", top_level(
                 "gw_jax.solve_qp", "gw_jax.qp_eigh")),
-            ("fixed-Sigma evSC", top_level("gw_jax.eqp2_evsc")),
             ("result writes", top_level("gw_jax.output")),
         ]
         # A stage absent in a mode should not occupy a zero-valued report row.
@@ -863,12 +817,27 @@ class GWProductionReport:
             self.emit(f"  {name:<{width}} {seconds:10.2f}  "
                       f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
         self.emit(f"  {'total run':<{width}} {wall:10.2f}  {100.0:9.2f}%")
+        # The "runtime bring-up" row is the sum of these phases; state the
+        # split so a slow bring-up names its phase (Frontier Fe V2 runs ending
+        # 2026-10-15 20:33-21:06 UTC: 11 of 13 took 21-74 s, against 6.9-10.1 s
+        # for 39 of 40 runs outside that window; three lanes, two nodes, and
+        # no phase recorded anywhere).
+        phases = [(str(r["name"])[len("gw_jax.runtime_stack."):], float(r["inclusive"]))
+                  for r in rows if str(r["name"]).startswith("gw_jax.runtime_stack.")]
+        if phases:
+            self.emit("  runtime bring-up (rank 0) = " + " + ".join(
+                f"{phase} {seconds:.2f}" for phase, seconds in phases) + " s")
         if any(r["name"].startswith(("bank.", "tau.")) for r in rows):
             self.emit("  bank real_time/laplace = incumbent G/FFT correlation plus bank coefficient carry;")
             self.emit("  these fused clocks are not FFT-only or evidence of a bandwidth limit.")
             self.emit("  Sigma tau other is the window executables: W(tau) synthesis, G/W convolution,")
             self.emit("  projection and frequency fold in one program. No pure-GEMM or pure-FFT wall is inferred.")
             self.emit("  device_wait drains preceding work; rank_wait measures process alignment.")
+        from common.timing import stage_sync
+        self.emit("  stage walls: " + ("device-attributed (LORRAX_STAGE_SYNC=1: every stage waits for its device work)."
+                                      if stage_sync() else
+                                      "host-attributed (no timing-only device waits; device work lands in the first "
+                                      "later stage that reads it; LORRAX_STAGE_SYNC=1 attributes it)."))
         if spole_rows:
             self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
             self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")

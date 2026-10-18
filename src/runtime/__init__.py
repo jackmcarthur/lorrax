@@ -57,6 +57,15 @@ from __future__ import annotations
 
 import os
 
+# FIRST, before every other import: OpenBLAS reads OPENBLAS_THREAD_TIMEOUT
+# once, when each copy is mapped (numpy's at ``import numpy``, scipy's at the
+# first ``scipy.linalg``), so the default must be in the environment before
+# anything here can map one.  ``runtime.blas_env`` owns the setting, the
+# per-library census and GATE blas_spin (enforced in :func:`bootstrap`).
+from .blas_env import STATE as _BLAS_TUNE_STATE
+from .blas_env import tune_at_import as _tune_blas_at_import
+_tune_blas_at_import()
+
 # Step 5b's gate.  A SIBLING module (see its "WHY IT LIVES IN runtime/"), and
 # imported at module scope on purpose: it pulls only ``inspect``/``os`` at
 # import, so it costs this package nothing and — decisively — brings no jax
@@ -207,11 +216,10 @@ _DEMOTIONS: list = []
 _MALLOC_TUNE: dict = {"applied": None, "mmap_mb": None, "trim_mb": None,
                       "reason": None}
 
-#: Filled in by :func:`tune_blas_threading`, which runs at IMPORT time rather
-#: than from :func:`bootstrap` — OpenBLAS reads its environment once, in the
-#: library constructor, and that runs at the first ``import numpy``.
-_BLAS_TUNE: dict = {"applied": None, "timeout": None, "reason": None,
-                    "numpy_already_imported": None}
+#: ``runtime.blas_env.STATE``: filled in at IMPORT of this package (its first
+#: statement), not from :func:`bootstrap` — each OpenBLAS copy reads its
+#: environment once, when it is mapped.  ``libs`` is the per-library census.
+_BLAS_TUNE: dict = _BLAS_TUNE_STATE
 
 #: Filled in by :func:`init_jax_distributed`: the
 #: ``jax.distributed.initialize()`` call that ran, for the startup report.
@@ -244,13 +252,24 @@ def bootstrap(*, platform: str = "gpu") -> None:
     # stale installed copies and refuses a LORRAX_CHECKOUT/runtime mismatch
     # before set_default_env's first possible JAX import.
     _ensure_source_closure(print_fn=rank0_print)
+    # GATE blas_spin: an OpenBLAS copy mapped before runtime set
+    # OPENBLAS_THREAD_TIMEOUT cannot be tuned any more; refuse it by name.
+    from .blas_env import enforce as _enforce_blas_spin
+    _enforce_blas_spin()
     set_default_env(platform=platform)
     announce_cpu_collectives()
     skip_gpu_plugin_discovery()
+    check_profiler_ranks()
     init_jax_distributed()
     fallback_to_cpu_if_no_gpu_backend()
+    init_mpi_before_device_collectives()
     install_failfast_excepthook()
+    install_ordered_exit()
     pin_matmul_precision()
+    # LORRAX_REDUCTION_GUARD=log|raise: record or refuse raw floating sums over
+    # more than two ranks (topology-ordered); a no-op when unset.
+    from lxkit import install_reduction_guard_from_env
+    install_reduction_guard_from_env()
     # Every sharding is explicit, so a legacy ``with mesh:`` would only add its
     # mesh to every program's key and re-trace held programs: JAX refuses one.
     _import_jax().config.update("jax_disallow_mesh_context_manager", True)
@@ -343,6 +362,34 @@ def pin_matmul_precision() -> str:
     jax = _import_jax()
     jax.config.update("jax_default_matmul_precision", precision)
     return precision
+
+
+def install_ordered_exit() -> None:
+    """At P > 1, make :func:`finalize_process` the end of the process for EVERY entry point.
+
+    A CLI that ends with ``sys.exit(main())``, ``raise SystemExit(...)`` or by
+    falling off the end used to reach interpreter teardown, where a non-main
+    Python thread still inside jaxlib aborted the process (rc 134 on every
+    rank after a successful run, Frontier 2026-10-16;
+    :mod:`runtime.ordered_exit` has the measurement and what is not known).
+    :mod:`runtime.ordered_exit` hooks the start of interpreter shutdown: exit
+    status 0 runs :func:`finalize_process` (ordered, collective teardown, then
+    ``os._exit(0)``); a nonzero status exits with it at once, without collective
+    teardown, as :func:`run_main_and_finalize` does.  Drivers that call
+    :func:`run_main_and_finalize` end before the hook runs; nothing changes
+    for them.  No-op at P = 1.  Idempotent.  Standard library only.
+    """
+    if _resolve_proc_count() <= 1:
+        return
+    from . import ordered_exit
+    state = ordered_exit.install(finalize_process)
+    if state["installed"]:
+        debug_print("[runtime] ordered process end armed: interpreter shutdown runs "
+                    "finalize_process (status 0) or exits with the status (nonzero).")
+    elif state["reason"]:
+        rank0_print(f"[runtime] WARNING: ordered process end NOT armed ({state['reason']}); "
+                    "an entry point that does not call run_main_and_finalize ends by "
+                    "interpreter teardown.")
 
 
 def install_failfast_excepthook() -> None:
@@ -443,14 +490,14 @@ X64_OVERRIDE_ENV = "LORRAX_ALLOW_X64_OFF"
 #: first JAX backend exists, while a deployment-provided value must win.
 _XLA_FLAGS_ENV = "XLA_FLAGS"
 _XLA_GPU_AUTOTUNE_FLAG = "--xla_gpu_autotune_level"
-_XLA_GPU_AUTOTUNE_DEFAULT = "0"
 #: XLA compiles each module's LLVM IR in parallel parts; the same merge and
 #: the same rule as the autotune level (a caller's value wins), results bitwise
 #: and the device peak unchanged (sandbox claim 4179).  Not
 #: ``--xla_gpu_force_compilation_parallelism``, which forces a thread count
 #: and slowed cold compile 3.0 % (claim 684).
 _XLA_GPU_LLVM_PARALLEL_FLAG = "--xla_gpu_enable_llvm_module_compilation_parallelism"
-_XLA_GPU_LLVM_PARALLEL_DEFAULT = "true"
+#: The VALUES are per leg (``PlatformLeg.xla_flag_defaults``): the same flag
+#: can be a measured win on one vendor and a no-op or a loss on another.
 
 #: Receipt captured at the ONE interpretation site below.  Startup reporting
 #: consumes this record; it must not re-parse ``XLA_FLAGS`` and risk printing
@@ -489,60 +536,66 @@ def _xla_flag_value(raw: str, flag: str) -> str | None:
 
 
 def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
-    """Merge LORRAX's two measured GPU compile flags into ``XLA_FLAGS``.
+    """Merge the GPU leg's declared compile flags into ``XLA_FLAGS``.
 
-    ``--xla_gpu_autotune_level=0`` (sandbox claims 683--684: cold compile
-    shorter, execution inside run-to-run noise) and
+    The flags and their values are the leg's ``xla_flag_defaults``
+    (:data:`lxkit.LEGS`; evidence in ``docs/architecture/compilation.md``
+    section 3).  CUDA: ``--xla_gpu_autotune_level=0`` (sandbox claims
+    683--684: cold compile shorter, execution inside run-to-run noise) and
     ``--xla_gpu_enable_llvm_module_compilation_parallelism=true`` (claim
-    4179: each module's LLVM IR compiles in parallel parts, results bitwise,
-    device peak unchanged; ``docs/architecture/compilation.md`` holds them).
-    Both are GPU-only XLA flags: a forced CPU startup leaves ``XLA_FLAGS``
-    byte-for-byte unchanged so the host/FFTW chain never depends on a GPU
-    parser accepting them.
+    4179).  ROCm: see its row.  The leg is the one ``JAX_PLATFORMS`` selects,
+    else the installed plugin's (:func:`_gpu_leg`).  All are GPU-only XLA
+    flags: a forced CPU startup leaves ``XLA_FLAGS`` byte-for-byte unchanged
+    so the host/FFTW chain never depends on a GPU parser accepting them.
 
     Caller policy always wins, flag by flag.  A flag already present in
     either accepted spelling is neither rewritten nor appended, and its last
     value is recorded as caller provenance; a missing one is appended as
     exactly one token, preserving every unrelated flag.  The returned dict is
-    a copy of the receipt the startup report consumes.
+    a copy of the receipt the startup report consumes: ``value`` and
+    ``llvm_parallel`` are the two historical flags, ``flags`` every flag the
+    leg declares or the caller set, ``leg`` the leg key.
     """
     if platform not in ("gpu", "cpu"):
         raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
 
     raw = os.environ.get(_XLA_FLAGS_ENV, "")
-    supplied = _xla_flag_value(raw, _XLA_GPU_AUTOTUNE_FLAG)
-    supplied_llvm = _xla_flag_value(raw, _XLA_GPU_LLVM_PARALLEL_FLAG)
+    leg = _gpu_leg() if platform == "gpu" else None
+    declared = dict(leg.xla_flag_defaults) if leg is not None else {}
+    named = [_XLA_GPU_AUTOTUNE_FLAG, _XLA_GPU_LLVM_PARALLEL_FLAG]
+    names = named + [f for f in declared if f not in named]
+    supplied = {f: _xla_flag_value(raw, f) for f in names}
+    flags = {}
     if platform == "cpu":
-        def _inactive(given):
-            return ("caller-supplied XLA_FLAGS; GPU-only and inactive on this "
-                    "forced CPU startup" if given is not None else
-                    "not applied: forced CPU startup")
-        _XLA_GPU_AUTOTUNE.update({
-            "value": supplied,
-            "provenance": _inactive(supplied),
-            "llvm_parallel": supplied_llvm,
-            "llvm_parallel_provenance": _inactive(supplied_llvm),
-            "applicable": False,
-            "xla_flags": os.environ.get(_XLA_FLAGS_ENV),
-        })
-        return dict(_XLA_GPU_AUTOTUNE)
-
-    default = "LORRAX default (runtime.set_default_env)"
-    caller = "caller-supplied XLA_FLAGS"
-    additions = []
-    if supplied is None:
-        additions.append(f"{_XLA_GPU_AUTOTUNE_FLAG}={_XLA_GPU_AUTOTUNE_DEFAULT}")
-    if supplied_llvm is None:
-        additions.append(f"{_XLA_GPU_LLVM_PARALLEL_FLAG}={_XLA_GPU_LLVM_PARALLEL_DEFAULT}")
-    if additions:
-        os.environ[_XLA_FLAGS_ENV] = " ".join(([raw] if raw else []) + additions)
+        for f in names:
+            flags[f] = (supplied[f],
+                        "caller-supplied XLA_FLAGS; GPU-only and inactive on this "
+                        "forced CPU startup" if supplied[f] is not None else
+                        "not applied: forced CPU startup")
+        applicable = False
+    else:
+        default = f"LORRAX default for the {leg.key if leg else '?'} leg (lxkit.LEGS)"
+        additions = []
+        for f in names:
+            if supplied[f] is not None:
+                flags[f] = (supplied[f], "caller-supplied XLA_FLAGS")
+            elif f in declared:
+                additions.append(f"{f}={declared[f]}")
+                flags[f] = (declared[f], default)
+            else:
+                flags[f] = (None, f"not set: the {leg.key if leg else '?'} leg "
+                                  f"declares no default (lxkit.LEGS)")
+        if additions:
+            os.environ[_XLA_FLAGS_ENV] = " ".join(([raw] if raw else []) + additions)
+        applicable = True
     _XLA_GPU_AUTOTUNE.update({
-        "value": _XLA_GPU_AUTOTUNE_DEFAULT if supplied is None else supplied,
-        "provenance": default if supplied is None else caller,
-        "llvm_parallel": (_XLA_GPU_LLVM_PARALLEL_DEFAULT if supplied_llvm is None
-                          else supplied_llvm),
-        "llvm_parallel_provenance": default if supplied_llvm is None else caller,
-        "applicable": True,
+        "value": flags[_XLA_GPU_AUTOTUNE_FLAG][0],
+        "provenance": flags[_XLA_GPU_AUTOTUNE_FLAG][1],
+        "llvm_parallel": flags[_XLA_GPU_LLVM_PARALLEL_FLAG][0],
+        "llvm_parallel_provenance": flags[_XLA_GPU_LLVM_PARALLEL_FLAG][1],
+        "applicable": applicable,
+        "leg": leg.key if leg is not None else None,
+        "flags": {f: {"value": v, "provenance": why} for f, (v, why) in flags.items()},
         "xla_flags": os.environ.get(_XLA_FLAGS_ENV),
     })
     return dict(_XLA_GPU_AUTOTUNE)
@@ -739,6 +792,7 @@ def set_default_env(*, platform: str = "gpu") -> None:
     # refuse each other here; ``file_io.hdf5_owner`` owns that clash.  HDF5
     # reads this at file open, so it is set before any store opens.
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "BEST_EFFORT")
+    apply_site_scratch(say=rank0_print)
     if platform == "gpu":
         os.environ.setdefault("JAX_PLATFORMS", f"{_gpu_plugin_platform()},cpu")
     elif platform == "cpu":
@@ -748,6 +802,11 @@ def set_default_env(*, platform: str = "gpu") -> None:
     _check_allocator_env()
     if platform == "gpu":
         set_default_gpu_pool()
+        # The leg's runtime-library env (lxkit.LEGS runtime_env_defaults):
+        # read by ROCr/HIP at backend start, so it must precede it.
+        leg = _gpu_leg()
+        for name, value in (leg.runtime_env_defaults if leg is not None else ()):
+            os.environ.setdefault(name, value)
     tune_glibc_malloc()
     skip_gpu_plugin_discovery()
     resolved_platforms = os.environ.get("JAX_PLATFORMS", "")
@@ -759,12 +818,63 @@ def set_default_env(*, platform: str = "gpu") -> None:
     configure_gpu_network(platform=xla_platform, say=rank0_print)
 
 
+_SITE_SCRATCH_DONE: list = []
+
+
+def site_scratch(env=os.environ) -> tuple[str | None, str]:
+    """``(path, why)``: the scratch root the site profile declares
+    (``[paths] scratch``, environment variables expanded) when ``SCRATCH``
+    is unset, or ``(None, why not)``.  The path must expand completely and
+    be a writable directory."""
+    if env.get("SCRATCH"):
+        return None, "SCRATCH is set"
+    from runtime.network_env import site_profile
+    profile = site_profile(env)
+    template = ((profile or {}).get("paths") or {}).get("scratch")
+    if not template:
+        return None, "the site profile declares no scratch"
+    path = _expand(template, env)
+    if "$" in path:
+        return None, (f"the {profile['site']} scratch rule {template!r} does not "
+                      f"expand here ({path!r})")
+    if not (os.path.isdir(path) and os.access(path, os.W_OK)):
+        return None, f"the {profile['site']} scratch {path} is not a writable directory"
+    return path, f"{profile['site']} profile"
+
+
+def _expand(template: str, env) -> str:
+    import re
+    return re.sub(r"\$(\w+)|\$\{(\w+)\}",
+                  lambda m: env.get(m.group(1) or m.group(2), m.group(0)), template)
+
+
+def apply_site_scratch(*, say=print) -> None:
+    """Set ``SCRATCH`` from the site profile when the site defines none.
+
+    A site rule, not a cache-local one: every per-user cache root reads
+    ``SCRATCH`` (:func:`lxkit.user_cache_dir`: the persistent compile cache
+    and, beside it, the rocFFT/comgr kernel caches), so they all leave NFS
+    HOME together.  Frontier: ``$MEMBERWORK/$SLURM_JOB_ACCOUNT``.  Once per
+    process, before any cache is opened; announced either way when the
+    profile declares a rule.
+    """
+    if _SITE_SCRATCH_DONE:
+        return
+    _SITE_SCRATCH_DONE.append(True)
+    path, why = site_scratch()
+    if path:
+        os.environ["SCRATCH"] = path
+        say(f"[runtime] SCRATCH={path} ({why} [paths] scratch; the site defines none).")
+    elif why not in ("SCRATCH is set", "the site profile declares no scratch"):
+        say(f"[runtime] WARNING: {why}; per-user caches stay under HOME.")
+
+
 #: The one device-memory rule (owner 2026-10-08), the same for every vendor and
 #: card size, fitted with a 1.2 margin to the largest P4 and P64 sampler
 #: readings (sandbox claim 3978).  With ``M`` the card total and ``O`` the bytes
 #: outside the XLA pool:
 #:
-#:     planner budget    B = (M - 1.2 O) / (1 + 1.2 phi)     (planner_budget_bytes)
+#:     planner budget    B = (M - 1.2 O) / (1 + 1.2 phi) - T_ord   (planner_budget_bytes)
 #:     pool reservation  R = M - 1.2 O_max                  (pool_fraction)
 #:
 #: ``O`` is 3 GB (the CUDA context and modules, XLA's NCCL communicators, cuFFT
@@ -778,7 +888,8 @@ def set_default_env(*, platform: str = "gpu") -> None:
 #: #pool-growth).  The pool is reserved before the deck is read, so
 #: ``R`` leaves room for the larger ``O``; the reservation is not a cap.  Both
 #: read only ``M`` and the deck's resolved ``linalg``: the same on every rank
-#: and every run.
+#: and every run.  ``T_ord`` (16 MiB, :func:`ordered_reduction_transient_bytes`)
+#: is the rank-order reductions' fixed transient inside the pool.
 OUTSIDE_POOL_BYTES = 3e9
 #: The cuSOLVERMp/cuBLASMp contexts, their NCCL communicators and workspace
 #: under ``linalg = distributed`` (5.9 GB outside at P4 against 2.9).  Owner:
@@ -790,16 +901,41 @@ MEMORY_MARGIN = 1.2
 
 
 def outside_pool_allowance_bytes(linalg: str = "local") -> float:
-    """``O`` for the deck's resolved ``linalg`` (``local`` or ``distributed``)."""
-    return OUTSIDE_POOL_BYTES + (DISTRIBUTED_LINALG_OUTSIDE_BYTES
+    """``O`` for the deck's resolved ``linalg`` (``local`` or ``distributed``).
+
+    The ``local`` term is the device leg's ``outside_pool_bytes`` (:data:`lxkit.LEGS`)
+    where it declares one, else :data:`OUTSIDE_POOL_BYTES`; read before any backend
+    exists, the same on every rank."""
+    base = OUTSIDE_POOL_BYTES
+    leg = None
+    if os.environ.get("JAX_PLATFORMS", "").split(",")[0] != "cpu":   # a forced-CPU process: default O
+        try:
+            leg = _gpu_leg()
+        except Exception:                                     # noqa: BLE001
+            leg = None      # no GPU plugin installed: a CPU process, the default O
+    if leg is not None and getattr(leg, "outside_pool_bytes", None) is not None:
+        base = float(leg.outside_pool_bytes)
+    return base + (DISTRIBUTED_LINALG_OUTSIDE_BYTES
                                  if linalg == "distributed" else 0.0)
 
 
+def ordered_reduction_transient_bytes() -> float:
+    """``T_ord``: the named cap of the rank-order reductions' transient.
+
+    ``lxkit.ordered_transient_bytes()``, ``ORDERED_TRANSIENT_SLABS`` (2) slabs of
+    ``LORRAX_ORDERED_SLAB_MB`` (8 MiB): 16 MiB.  Fixed: an ordered all-reduce or
+    reduce-scatter of any size holds at most this much beyond the library
+    collective (docs/environment/transports.md#rank-order-reductions), so the
+    rule reserves it once, out of ``B``, for every planner and route."""
+    from lxkit import ordered_transient_bytes
+    return float(ordered_transient_bytes())
+
+
 def planner_budget_bytes(total_bytes: float, linalg: str = "local") -> float:
-    """``B = (M - 1.2 O) / (1 + 1.2 phi)``, at most the reservation and at least ``M / 4``."""
+    """``B = (M - 1.2 O) / (1 + 1.2 phi) - T_ord``, at most the reservation and at least ``M / 4``."""
     total = float(total_bytes)
     budget = ((total - MEMORY_MARGIN * outside_pool_allowance_bytes(linalg))
-              / (1.0 + MEMORY_MARGIN * POOL_OVERSHOOT))
+              / (1.0 + MEMORY_MARGIN * POOL_OVERSHOOT)) - ordered_reduction_transient_bytes()
     return max(min(budget, pool_reservation_bytes(total)), 0.25 * total)
 
 
@@ -842,9 +978,12 @@ def set_default_gpu_pool() -> None:
 
     Both fraction spellings at once also REFUSE (jaxlib raises on the pair
     inside plugin discovery, as "Unable to initialize backend 'cuda'").
-    Nothing is set unless this is a CUDA run on a node with a GPU device
-    (:func:`_gpu_is_present`): a CPU run, a GPU-less node and ROCm keep
-    jaxlib's own defaults.
+    Nothing is set unless this is a GPU run on a node with a GPU device
+    (:func:`_gpu_is_present`) whose leg declares an allocator
+    (``PlatformLeg.xla_allocator``, :data:`lxkit.LEGS`): a CPU run, a GPU-less
+    node and a leg that declares none keep jaxlib's own defaults.  On ROCm
+    the allocator is BFC: the reservation is then also the arena's cap, and
+    what lies outside it is ``M - R``, the same headroom.
 
     The fraction is not a cap: ``cuda_async`` (``create_new_pool=false``,
     the device's default mempool, which every FFI ``cudaMallocAsync`` shares)
@@ -857,9 +996,15 @@ def set_default_gpu_pool() -> None:
     """
     plats = [p.strip().lower()
              for p in os.environ.get("JAX_PLATFORMS", "").split(",") if p.strip()]
-    if (plats[:1] == ["cpu"] or "rocm" in plats
+    if (plats[:1] == ["cpu"]
             or os.environ.get("JAX_PLATFORM_NAME", "").lower() == "cpu"
             or not _gpu_is_present()):
+        return
+    # The allocator is the leg's declaration (lxkit.LEGS xla_allocator:
+    # cuda_async on CUDA, bfc on ROCm); a leg that declares none keeps
+    # jaxlib's own defaults.
+    leg = _gpu_leg()
+    if leg is None or not leg.xla_allocator:
         return
     _check_allocator_env()
     if all(os.environ.get(k) for k in _FRACTION_ENVS):
@@ -872,11 +1017,11 @@ def set_default_gpu_pool() -> None:
     allocator = os.environ.get(_ALLOCATOR_ENV)
     prealloc = os.environ.get(_PREALLOCATE_ENV) or None     # blank = unset
     if allocator is None and prealloc is None:
-        os.environ[_ALLOCATOR_ENV] = "cuda_async"
+        os.environ[_ALLOCATOR_ENV] = leg.xla_allocator
         os.environ[_PREALLOCATE_ENV] = "true"
         if not any(os.environ.get(k) for k in _FRACTION_ENVS):
-            from runtime.xla_memory import cuda_device_total_bytes
-            os.environ[_FRACTION_ENVS[0]] = pool_fraction(cuda_device_total_bytes(0))
+            from runtime.xla_memory import device_total_bytes
+            os.environ[_FRACTION_ENVS[0]] = pool_fraction(device_total_bytes(0))
         return
     if allocator is None and prealloc not in ("false", "False", "0"):
         raise ValueError(
@@ -966,6 +1111,7 @@ def _check_allocator_env(*, print_fn=print) -> None:
                      f"backends\".", flush=True)
         return
     if raw.lower() in ALLOCATOR_SPELLINGS:            # jaxlib: .lower(), no strip
+        _check_allocator_on_leg(raw)
         return
     raise ValueError(
         f"{_ALLOCATOR_ENV}={raw!r} is not a value jaxlib accepts.  Legal: "
@@ -977,6 +1123,32 @@ def _check_allocator_env(*, print_fn=print) -> None:
         f"as \"Backend 'cuda' is not in the list of known backends\" — a "
         f"message that names neither this variable nor its value, and "
         f"reads as missing hardware rather than a typo.")
+
+
+def _check_allocator_on_leg(raw: str) -> None:
+    """Refuse a jaxlib-legal allocator that this run's GPU leg cannot build.
+
+    ``PlatformLeg.xla_allocators`` (:data:`lxkit.LEGS`) lists what the leg's
+    PJRT plugin accepts.  ROCm's refuses ``cuda_async`` at client creation
+    ("CUDA async allocator requires CUDA >= 11.2", MI250X, jax 0.9.1, runtime
+    lane 2026-10-14), inside backend discovery, as an anonymous
+    "Unable to initialize backend 'rocm'".  A CPU run is not checked.
+    """
+    first = os.environ.get("JAX_PLATFORMS", "").split(",")[0].strip().lower()
+    if first == "cpu":
+        return
+    leg = _gpu_leg()
+    if leg is None or not leg.xla_allocators or raw.lower() in leg.xla_allocators:
+        return
+    raise ValueError(
+        f"GATE xla_allocator_leg: {_ALLOCATOR_ENV}={raw!r} is not available on "
+        f"the {leg.key} leg (lxkit.LEGS xla_allocators: "
+        f"{' | '.join(leg.xla_allocators)}).  Left to jaxlib the {leg.key} "
+        f"plugin refuses it while the client is created, reported as "
+        f"\"Unable to initialize backend\".  Unset it: the runtime's pool policy "
+        f"for this leg is {leg.xla_allocator or 'jaxlib default'!r}.  A site "
+        f"script or module carrying another machine's environment is the "
+        f"usual source.")
 
 
 # ---------------------------------------------------------------------------
@@ -1187,77 +1359,23 @@ def skip_gpu_plugin_discovery(*, announce: bool = True) -> bool:
 
 
 def tune_blas_threading() -> bool:
-    """Stop OpenBLAS's idle workers from spinning.  Returns True when the
-    tuning was applied; a path that leaves it unapplied because numpy was
-    already imported announces itself, because by then it cannot be fixed
-    in-process (QUALITY_PATTERNS #5/#7).
+    """Stop OpenBLAS's idle workers from spinning in every copy mapped from
+    now on (``setdefault`` ``OPENBLAS_THREAD_TIMEOUT=1``).  Returns True when
+    the default is in the environment.
 
-    WHY.  OpenBLAS keeps its worker threads in a busy-wait after a call
-    finishes so the next call finds them hot.  That is the right default for
-    a tight loop of BLAS calls and the wrong one for every driver here, which
-    interleaves short LAPACK calls with substantial Python/numpy work: the
-    spinning workers hold the cores the calling thread needs, and small
-    factorisations collapse.  MEASURED on the Sigma box-rule planner
-    (``minimax.uniform_rule``, scipy-openblas 0.3.34, 4 threads): one
-    140x140 ``cho_factor`` took 28.7 ms in situ against 0.067 ms standalone,
-    a factor of 400, and 230 of them were most of the build.  Setting the
-    timeout takes one crossing-box build from 15.02 s to 2.87 s (5.2x) with
-    an identical node count, and the 41-box corpus from 1720 s to 303 s
-    (run DEV/327, results/spin_step30; claims 2192/2193).
+    Runs as the FIRST statement of this package (see the top of this file),
+    so it never needs calling; this name is the public handle.  Every driver
+    imports ``runtime`` before numpy, and the driver packages (``gw``,
+    ``bse``, ``centroid``, ``bandstructure``) import it in their
+    ``__init__``, so ``import gw.<anything>`` tunes numpy's copy too;
+    ``tests/test_runtime_blas_env.py`` holds that order.  A copy mapped
+    before (numpy imported first) cannot be tuned in-process: GATE blas_spin
+    in :func:`bootstrap` refuses that process unless the launch exported the
+    variable or ``LORRAX_BLAS_TUNE=0`` declines the tuning.
 
-    The cost is real but small and in the other regime: 200 back-to-back
-    ``cholesky(300)`` calls with NOTHING between them measured 96.1 -> 117.2
-    ms (+22 %), because there the spin is doing its job.  Sustained large
-    GEMM is unaffected (zgemm 2000/4000 at 352/367 GFLOP/s either way).  No
-    LORRAX driver is a tight BLAS loop, so the default is on.
-
-    ``OPENBLAS_THREAD_TIMEOUT`` is log2 of the spin count and is read ONCE,
-    in OpenBLAS's constructor, which runs at the first ``import numpy`` —
-    so this cannot live in :func:`set_default_env` (that runs from
-    :func:`bootstrap`, long after the driver's own ``import numpy``) and is
-    called at import of this module instead.  Every driver therefore has to
-    import ``runtime`` before numpy; ``tests/test_runtime_blas_env.py``
-    enforces that so the ordering cannot rot.  ``setdefault`` throughout: a
-    caller who exports ``OPENBLAS_THREAD_TIMEOUT`` wins.
-
-    Knobs: ``LORRAX_BLAS_TUNE=0`` disables; ``OPENBLAS_THREAD_TIMEOUT``
-    set by the caller is honoured as-is.  Thread COUNT is deliberately not
-    set here — it is workload-dependent and belongs to the launcher.
+    WHY, the cost, and the per-library witness: ``runtime.blas_env``.
     """
-    import sys as _sys
-    already = "numpy" in _sys.modules
-    _BLAS_TUNE["numpy_already_imported"] = already
-    if _env_falsy("LORRAX_BLAS_TUNE"):
-        _BLAS_TUNE.update(applied=False, reason="disabled by LORRAX_BLAS_TUNE")
-        return False
-    if already:
-        # Too late to matter: OpenBLAS read its environment in the
-        # constructor that ran with numpy.  Say so rather than report a
-        # tuning that is not in force.
-        _BLAS_TUNE.update(
-            applied=False,
-            reason="numpy was imported before runtime; OpenBLAS already read "
-                   "its environment")
-        _record_demotion(
-            "BLAS spin tuning was NOT applied: numpy was imported before the "
-            "runtime module, so OPENBLAS_THREAD_TIMEOUT came too late. Host "
-            "LAPACK-heavy work (the Sigma box-rule planner above all) runs "
-            "the slow way — measured 5.2x on that planner. Import runtime "
-            "before numpy in this entry point.")
-        return False
-    os.environ.setdefault("OPENBLAS_THREAD_TIMEOUT", "1")
-    _BLAS_TUNE.update(applied=True,
-                      timeout=os.environ["OPENBLAS_THREAD_TIMEOUT"],
-                      reason=None)
-    return True
-
-
-# Run it NOW, at import of this module, not from bootstrap(): OpenBLAS reads
-# OPENBLAS_THREAD_TIMEOUT in its constructor, which runs at the first
-# `import numpy`, and every driver imports runtime before numpy (enforced by
-# tests/test_runtime_blas_env.py).  This is the one startup action that
-# cannot wait for the startup call.
-tune_blas_threading()
+    return _tune_blas_at_import()
 
 
 # glibc mallopt parameter numbers (malloc.h).
@@ -1479,6 +1597,76 @@ def _resolve_coordinator_address() -> str | None:
     return f"{expand_nodelist(nodelist)[0]}:{61440 + (int(job) + 257 * step) % 4096}"
 
 
+def _under_tool(marker: str, environ=None, maps_text: str | None = None) -> bool:
+    """This process runs under the tracer whose library name contains ``marker``:
+    it is preloaded (``LD_PRELOAD``, or rocprofv3's ``ROCP_TOOL_LIBRARIES``) or
+    already mapped."""
+    env = os.environ if environ is None else environ
+    if any(marker in env.get(v, "") for v in ("LD_PRELOAD", "ROCP_TOOL_LIBRARIES")):
+        return True
+    if maps_text is None:
+        try:
+            with open("/proc/self/maps", encoding="utf-8", errors="replace") as fh:
+                maps_text = fh.read()
+        except OSError:
+            return False
+    return marker in maps_text
+
+
+def check_profiler_ranks(*, environ=None, maps_text: str | None = None) -> None:
+    """GATE profiler: refuse a step larger than the leg's vendor tracer survives.
+
+    The device leg declares ``profiler = (tool, library marker, largest
+    process count)`` (:data:`lxkit.LEGS`); a step under that tool with more
+    processes refuses here, before the collective library starts, instead of
+    deadlocking in its first collective (rocprofv3 --kernel-trace with RCCL at
+    P=4, Screening lane 2026-10-14).  A limit of 0 never refuses (nsys).
+    """
+    leg = _gpu_leg()
+    if leg is None or not getattr(leg, "profiler", ()):
+        return
+    tool, marker, limit = leg.profiler
+    if not limit or not _under_tool(marker, environ, maps_text):
+        return
+    count = _resolve_proc_count()
+    if count > limit:
+        raise RuntimeError(
+            f"GATE profiler: refusing a {count}-process {leg.key} step under {tool}: "
+            f"{tool} deadlocks the leg's collective library above {limit} "
+            f"process(es) (lxkit.LEGS[{leg.key!r}].profiler).  Profile a "
+            f"{limit}-process run, or run without {tool}.")
+
+
+_MPI_FIRST_DONE: list = []
+
+
+def init_mpi_before_device_collectives(*, say=None) -> None:
+    """Initialize MPI through the host leg now, when the site requires MPI to
+    open its network endpoint before the device collective library does.
+
+    The site profile's ``mpi_before_collectives`` (Frontier: with RCCL's OFI
+    plugin first, cray-mpich's endpoint creation fails with ENOSPC on every
+    rank), recorded by :func:`runtime.network_env.configure_gpu_network` for a
+    multi-node step it applied.  Runs after backend start-up (the device leg
+    opens before the host leg, the SONAME rule) and before any collective;
+    collective over the launch's processes (``MPI_Init_thread``), so every
+    rank reaches it from :func:`bootstrap`.  Idempotent; a no-op elsewhere.
+    """
+    if _MPI_FIRST_DONE:
+        return
+    _MPI_FIRST_DONE.append(True)
+    from runtime.network_env import network_configuration
+    decision = network_configuration() or {}
+    if not decision.get("mpi_before_collectives"):
+        return
+    import time
+    from ffi.common import ffi_loader
+    t0 = time.time()
+    ffi_loader.phdf5_init_mpi("cpu")
+    (say or rank0_print)(f"[runtime] MPI initialized before the first {decision.get('library', '')} "
+                         f"collective ({decision['policy']}, {time.time() - t0:.2f} s).")
+
+
 def init_jax_distributed() -> None:
     """Call ``jax.distributed.initialize()`` once per process when P > 1.
 
@@ -1554,8 +1742,8 @@ def _enforce_gpu_placement() -> None:
             f"{jax.process_count()} addresses {len(gpus)} GPUs; the SlabIO, "
             f"NCCL and distributed-solver transports run one process per GPU.  "
             f"Launch one rank per GPU with each rank pinned to its own device "
-            f"(srun -n <GPUs> src/ffi/cpp/select_gpu.sh <cmd>, or "
-            f"CUDA_VISIBLE_DEVICES=<local rank>; lx run -G 4 -n 4).")
+            f"(srun -n <GPUs> --gpus-per-task=1 --gpu-bind=closest <cmd>, or "
+            f"{'/'.join(_device_visibility_envs())}=<local rank>; lx run -G 4 -n 4).")
     # Remote JAX device descriptors report this client's model, so exchange
     # measured local targets rather than trusting jax.devices() metadata.
     kinds = [device.device_kind for device in gpus]
@@ -1617,58 +1805,90 @@ def nccl_warmup(mesh_xy) -> None:
 def _gpu_is_present() -> bool:
     """True if a GPU of any vendor is visible to this process.
 
-    Answered before the device client exists, so from the device nodes:
-    NVIDIA ``/dev/nvidia[0-9]*`` or ``/dev/nvidiactl`` (or WSL2's mapped
-    ``/usr/lib/wsl/lib/libcuda.so.1``, since WSL2 has no ``/dev/nvidia*``),
-    AMD ``/dev/kfd``.  A vendor's visibility variable set empty
-    (``CUDA_VISIBLE_DEVICES=""``, ``ROCR_VISIBLE_DEVICES=""``,
-    ``HIP_VISIBLE_DEVICES=""``) masks that vendor's devices.  Decides whether
-    a GPU-backend init failure is benign (no GPU here: run on CPU) or genuine
-    (a GPU node with a driver problem, which is re-raised).  The vendor of the
-    devices the run uses is read later, from the client
-    (:func:`lxkit.device_vendor`).
+    Answered before the device client exists, from each device leg's device
+    nodes and visibility variables (:func:`lxkit.legs.leg_device_present`:
+    NVIDIA ``/dev/nvidia[0-9]*``, ``/dev/nvidiactl`` or WSL2's mapped
+    ``libcuda``; AMD ``/dev/kfd``; a vendor's visibility variable set empty
+    masks that vendor).  Decides whether a GPU-backend init failure is benign
+    (no GPU here: run on CPU) or genuine (a GPU node with a driver problem,
+    which is re-raised).  The vendor of the devices the run uses is read
+    later, from the client (:func:`lxkit.device_vendor`).
     """
-    def masked(*names):
-        return any((os.environ.get(n) is not None
-                    and os.environ.get(n).strip() == "") for n in names)
-    import glob
-    nvidia = not masked("CUDA_VISIBLE_DEVICES") and (
-        bool(glob.glob("/dev/nvidia[0-9]*"))
-        or os.path.exists("/dev/nvidiactl")
-        or os.path.exists("/usr/lib/wsl/lib/libcuda.so.1"))
-    amd = (not masked("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES")
-           and os.path.exists("/dev/kfd"))
-    return nvidia or amd
+    from lxkit import accelerator_legs, leg_device_present
+    return any(leg_device_present(leg) for leg in accelerator_legs())
 
 
 def _gpu_plugin_platform() -> str:
-    """``"rocm"`` when the installed jaxlib GPU plugin is a ROCm build, else ``"cuda"``.
+    """The ``JAX_PLATFORMS`` name of the installed jaxlib GPU plugin's leg:
+    ``"rocm"`` for a ROCm build, else ``"cuda"``.
 
     Read from the ``jax_plugins`` namespace directories on ``sys.path``
-    (``xla_cuda13``, ``xla_rocm7``, ...): no plugin is imported and no device
-    is touched, because it decides ``JAX_PLATFORMS`` before the backend exists.
+    (``xla_cuda13``, ``xla_rocm7``, ...) against each device leg's
+    ``jax_plugin_prefix`` (:data:`lxkit.LEGS`): no plugin is imported and no
+    device is touched, because it decides ``JAX_PLATFORMS`` before the backend
+    exists.  When plugins of two legs are installed, the one whose device is
+    visible here wins (:func:`lxkit.leg_device_present`); with none found the
+    first device leg's name (``cuda``) is kept, as before.
     """
     import sys
+    from lxkit import accelerator_legs, leg_device_present
+    names = set()
     for root in sys.path:
         try:
-            names = os.listdir(os.path.join(root or ".", "jax_plugins"))
+            names.update(os.listdir(os.path.join(root or ".", "jax_plugins")))
         except OSError:
             continue
-        if any(n.startswith("xla_rocm") for n in names):
-            return "rocm"
-    return "cuda"
+    legs = accelerator_legs()
+    found = [leg for leg in legs if leg.jax_plugin_prefix
+             and any(n.startswith(leg.jax_plugin_prefix) for n in names)]
+    present = [leg for leg in found if leg_device_present(leg)]
+    return (present or found or legs)[0].jax_platforms[0]
 
 
-#: The launcher's per-vendor device-visibility variables, in lookup order.
-_VISIBLE_DEVICE_ENVS = ("CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
-                        "HIP_VISIBLE_DEVICES")
+def _gpu_leg():
+    """The device leg a GPU startup configures, before any backend exists:
+    the leg ``JAX_PLATFORMS``'s first entry names (``set_default_env`` sets it
+    to the installed plugin's), else the installed plugin's leg."""
+    from lxkit import leg_for_jax_platform
+    first = os.environ.get("JAX_PLATFORMS", "").split(",")[0]
+    return leg_for_jax_platform(first) or leg_for_jax_platform(_gpu_plugin_platform())
+
+
+def _device_visibility_envs() -> tuple:
+    """The launcher's per-vendor device-visibility variables, in lookup order:
+    every device leg's (:data:`lxkit.legs.LEGS`), resolved lazily so importing
+    this module stays stdlib-only."""
+    from lxkit import accelerator_legs
+    return tuple(env for leg in accelerator_legs() for env in leg.visibility_envs)
+
+
+def pin_first_visible_device(env=None) -> tuple:
+    """Restrict a process to the first GPU its launcher made visible, through
+    the GPU leg's own visibility variable; return ``(variable, value)``.
+
+    For the single-process (P1) paths that must run on ONE device.  The
+    variable is the innermost of the leg's ``visibility_envs`` already set
+    (ROCm: ``HIP_VISIBLE_DEVICES`` indexes within ``ROCR_VISIBLE_DEVICES``, so
+    narrowing the inner one is valid whatever the outer holds), else the
+    leg's innermost one, set to ``0``.  ``env`` defaults to ``os.environ``.
+    A process with no GPU leg is left alone (``(None, None)``).
+    """
+    env = os.environ if env is None else env
+    leg = _gpu_leg()
+    if leg is None or not leg.visibility_envs:
+        return None, None
+    names = leg.visibility_envs
+    var = next((n for n in reversed(names) if (env.get(n) or "").strip()), names[-1])
+    first = ((env.get(var) or "0").split(",")[0].strip()) or "0"
+    env[var] = first
+    return var, first
 
 
 def _visible_device_count() -> int:
     """How many GPUs the launcher made visible to this process; 0 when no
     visibility variable restricts them.  Read from the environment because
     ``jax.distributed.initialize`` must run before the client exists."""
-    for var in _VISIBLE_DEVICE_ENVS:
+    for var in _device_visibility_envs():
         raw = os.environ.get(var, "")
         if raw.strip():
             return len([x for x in raw.split(",") if x.strip()])
@@ -1885,6 +2105,46 @@ class RuntimeStack:
                 f"proc={self.process_index}/{self.process_count})")
 
 
+def _open_device_leg_before_collectives() -> None:
+    """Step 5e of :func:`initialize_communicator_stack`: open this process's
+    device FFI leg before the first collective communicator exists.
+
+    The leg's open maps its recorded closure by exact path
+    (:func:`lxkit.native_provider.open_and_attest`).  Opened after (6), the
+    collective library has already dlopened the site network plugin
+    (Perlmutter: aws-ofi-nccl, ``NEEDED libcudart.so.13``, no RUNPATH) and
+    the loader has satisfied that plugin from ``LD_LIBRARY_PATH``; the
+    recorded copy then maps second and the closure gate refuses the process
+    (measured: Fe P=16, 4 nodes, two ``libcudart`` copies on rank 0).
+    Opened here, every later SONAME request binds to the recorded copy.
+
+    A leg that cannot open is refused at (6b), by the same ``get_lib`` call,
+    in the mesh-aware wording of :mod:`ffi.gate`.  What refuses here is a
+    multi-node launch whose site transport would dlopen a second copy of a
+    recorded library by an unversioned name (``site.toml``
+    ``launch_libraries``; :func:`lxkit.native_provider.check_launch_libraries`).
+    A CPU-platform process has no device leg and returns at once.
+    """
+    import jax
+    if jax.default_backend() == "cpu":
+        return
+    from ffi.common import ffi_loader
+    try:
+        ffi_loader.get_lib(None)
+    except Exception:                                          # noqa: BLE001
+        return                  # (6b) re-raises it with the gate's remedy
+    # The site transport's unversioned dlopens (site.toml launch_libraries)
+    # happen inside (6); a name that would map a second copy refuses here.
+    from runtime.network_env import network_configuration
+    decision = network_configuration() or {}
+    if decision.get("launch_libraries"):
+        from lxkit import native_provider
+        native_provider.check_launch_libraries(
+            decision["launch_libraries"], os.environ.get("LD_LIBRARY_PATH", ""),
+            remedy=decision.get("launch_libraries_remedy", ""),
+            unusable_cls=ffi_loader.FfiLibraryUnusable)
+
+
 def initialize_communicator_stack(*, platform: str = "gpu",
                                   axis_names=("x", "y"),
                                   print_fn=None) -> RuntimeStack:
@@ -1955,6 +2215,13 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        refusal after the live coordination client and supported JAX surface
        exist, but before the mesh warmup performs the first compile.  A
        rank-divergent warmup is therefore covered rather than grandfathered.
+    5e. :func:`_open_device_leg_before_collectives` -- the device FFI leg
+       opens here, so its recorded dependency closure is mapped by exact
+       path before (6) creates the first NCCL/RCCL communicator.  That is
+       when the collective library dlopens a site network plugin, which
+       binds its own NEEDED runtime (``libcudart.so.13``) by SONAME: with
+       the closure already mapped it gets the recorded copy, not whatever
+       ``LD_LIBRARY_PATH`` offers (a second runtime the closure gate refuses).
     6. :func:`common.collectives.prepare_mesh` -- the run's mesh, then
        ``warm_mesh_cliques`` (CPU/MPI) and ``nccl_warmup`` (GPU/NCCL).
        Collective: every rank must reach it.  Needs (4) and (5).
@@ -1973,6 +2240,11 @@ def initialize_communicator_stack(*, platform: str = "gpu",
        The exact-line PJRT stderr filter is installed immediately afterward:
        it removes only OpenXLA's upstream-deleted executable-version notice,
        while the compile cache and all compatibility checks remain live.
+    7b. :mod:`runtime.vendor_kernels` -- the leg's vendor first-use policy:
+       its content-keyed kernel stores (rocFFT on ROCM) before the first FFT,
+       then its BLAS warm-up (rocBLAS/Tensile on ROCM): GEMMs compiled here,
+       after (7) so a warm run reads them from the cache, and run on a helper
+       thread while the driver imports.  No-ops on a leg that declares none.
     8. The startup report -- LAST, because it reads the live client, and
        the live client does not exist until (5).
     8a. :func:`enforce_x64` on the resolved flag the report just measured.
@@ -2036,6 +2308,8 @@ def initialize_communicator_stack(*, platform: str = "gpu",
     # -- 5d -----------------------------------------------------------------
     from common.jax_compile_cache import install_compile_agreement
     install_compile_agreement()
+    # -- 5e -----------------------------------------------------------------
+    _open_device_leg_before_collectives()
     _t_boot = time.perf_counter()
     # -- 6 ------------------------------------------------------------------
     from common.collectives import prepare_mesh
@@ -2067,6 +2341,22 @@ def initialize_communicator_stack(*, platform: str = "gpu",
         # the failure and leave fd 2 completely unmodified.
         say(f"  [runtime] exact PJRT notice filter unavailable "
             f"({type(exc).__name__}: {exc}); stderr is unfiltered")
+    # -- 7b -----------------------------------------------------------------
+    try:
+        from .vendor_kernels import arm_runtime_kernel_stores, start_blas_host_warmup
+        import jax as _jax_vk
+        _proc = int(_jax_vk.process_index())
+        arm_runtime_kernel_stores(proc_idx=_proc, say=_print_rank0)
+        # The last LORRAX environment writes (OPENBLAS_NUM_THREADS when unset) happen here, and
+        # then the environment freezes, before the first native helper thread starts: a later
+        # setenv races native getenv (GATE env-frozen, runtime.env_guard; the rc 139 SIGSEGV).
+        default_blas_threads()
+        from .env_guard import freeze_process_environment
+        freeze_process_environment("runtime.initialize_communicator_stack step 7b")
+        start_blas_host_warmup(proc_idx=_proc, say=_print_rank0)
+    except Exception as exc:                                  # noqa: BLE001
+        _print_rank0(f"  [runtime] vendor first-use policy not applied "
+                     f"({type(exc).__name__}: {exc}); vendor kernels build on first use")
     _t_cache = time.perf_counter()
     # -- 8 ------------------------------------------------------------------
     facts = collect_startup_facts(mesh, cache_error=cache_error)
@@ -2148,6 +2438,10 @@ def debug_print(*a, **k):
 _print_rank0 = rank0_print
 
 
+#: Set by the first :func:`finalize_process` call (it never returns normally).
+_FINALIZE_STARTED = False
+
+
 def finalize_process(rc: int = 0):
     """End the process by EXPLICIT, ORDERED finalization.  Does not return.
 
@@ -2191,6 +2485,12 @@ def finalize_process(rc: int = 0):
     import atexit
     import sys
 
+    global _FINALIZE_STARTED
+    if _FINALIZE_STARTED:
+        # Re-entered (an atexit duty or the ordered-exit hook reaching it
+        # again): the first call owns the teardown and ends the process.
+        return
+    _FINALIZE_STARTED = True
     try:
         import jax
         try:
@@ -2384,6 +2684,8 @@ def default_blas_threads() -> str | None:
     it, and the handlers have their own caps (LORRAX_MKLBLAS_THREADS,
     LORRAX_SCALAPACK_MKL_THREADS).
     """
+    if _BLAS_AUTO:
+        return _BLAS_AUTO[0]
     if os.environ.get("OPENBLAS_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS"):
         return None
     cores = _physical_cores_in_affinity()
@@ -2410,7 +2712,13 @@ def default_blas_threads() -> str | None:
             break
     except Exception:                                         # noqa: BLE001
         pass
-    return f"{cores} (auto: physical cores of the affinity mask; {applied})"
+    _BLAS_AUTO.append(f"{cores} (auto: physical cores of the affinity mask; {applied})")
+    return _BLAS_AUTO[0]
+
+
+#: :func:`default_blas_threads`' description, kept from its one effective call: step 7b runs it
+#: before the environment freezes (runtime.env_guard), and step 8's startup facts report it.
+_BLAS_AUTO: list = []
 
 
 def _thread_env() -> dict:
@@ -2695,8 +3003,8 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
 
     f["backend"] = jax.default_backend()
     from lxkit import mesh_ffi_platform
-    # The FFI library key from the device vendor ("CUDA", "cpu", or an
-    # unmapped vendor such as "rocm", which has no LORRAX library).
+    # The FFI leg key from the device vendor ("CUDA", "ROCM", "cpu", or an
+    # unmapped vendor such as "tpu", which has no LORRAX leg).
     f["ffi_platform"] = mesh_ffi_platform(mesh)
     f["process_index"] = int(jax.process_index())
     f["process_count"] = int(jax.process_count())
@@ -2768,9 +3076,9 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         pool["corroboration"] = reading.peak_source
         pool["disagreement"] = reading.disagreement
         pool["accounting_present"] = reading.accounting_present
-        if f["ffi_platform"] == "CUDA" and local:
-            from .xla_memory import cuda_device_total_bytes
-            pool["device_total_bytes"] = cuda_device_total_bytes(
+        if local:
+            from .xla_memory import device_total_bytes
+            pool["device_total_bytes"] = device_total_bytes(
                 getattr(local[0], "local_hardware_id", 0) or 0)
     except Exception as exc:                                  # noqa: BLE001
         pool["corroboration"] = "unavailable"
@@ -2785,10 +3093,11 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
 
     # -- FFI ---------------------------------------------------------------
     plat_key = f["ffi_platform"]
-    f["ffi_library"] = (_ffi_library_facts(plat_key) if plat_key in ("CUDA", "cpu")
+    from lxkit import LEGS
+    f["ffi_library"] = (_ffi_library_facts(plat_key) if plat_key in LEGS
                         else {"platform": plat_key, "path": None, "loaded": False,
                               "no_library": True,
-                              "reason": "LORRAX builds no library for this platform"})
+                              "reason": "LORRAX has no leg for this platform"})
     f["ffi_dials"] = _ffi_dial_facts()
     f["linalg"] = _linalg_facts(mesh)
 
@@ -2804,6 +3113,11 @@ def collect_startup_facts(mesh, *, cache_error: str | None = None) -> dict:
         f["compile_cache"] = {"error": f"{type(exc).__name__}: {exc}"}
     f["compile_cache_error"] = cache_error
     f["malloc_tune"] = dict(_MALLOC_TUNE)
+    try:
+        from .blas_env import census as _blas_census
+        _blas_census()      # every copy mapped by now, scipy's included
+    except Exception as exc:                                  # noqa: BLE001
+        _BLAS_TUNE["libs"] = [{"error": f"{type(exc).__name__}: {exc}"}]
     f["blas_tune"] = dict(_BLAS_TUNE)
     import sys as _sys
     f["failfast"] = bool(getattr(_sys, "_lorrax_failfast_installed", False))
@@ -3220,6 +3534,15 @@ def format_startup_report(f: dict) -> list:
         add("  glibc malloc tuning was never attempted in this process, "
             "which means set_default_env() did not run and this report is "
             "describing an environment LORRAX did not configure.")
+    bt = f.get("blas_tune", {})
+    if bt.get("applied") is False:
+        add(f"  WARNING: OpenBLAS spin tuning is NOT in force ({bt.get('reason')}).")
+    elif bt.get("libs"):
+        add("  OpenBLAS spin tuning (OPENBLAS_THREAD_TIMEOUT as each library "
+            "read it): " + "; ".join(
+                f"{r.get('lib')} {r.get('state')}={r.get('value')} "
+                f"({r.get('witness')})" if "lib" in r else str(r.get("error"))
+                for r in bt["libs"]) + ".")
     L.append(_RULE)
     return L
 

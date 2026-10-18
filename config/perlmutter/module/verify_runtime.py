@@ -4,7 +4,10 @@ It checks what the module claims, from inside a live four-rank process:
 the pinned package versions, one GPU per rank and four in all, the runtime
 imported from the module's git-archive snapshot (no checkout), and both FFI
 legs mapped from one sealed bundle whose manifest names that snapshot's
-revision and hashes the mapped files.  No pip CUDA runtime may be mapped.
+revision and hashes the mapped files, each leg's recorded dependency closure
+enforced (one mapped copy of every recorded library, the recorded one).  The
+CUDA libraries are the venv's uv.lock wheels, a clone's set: no CUDA library of
+the toolkit may be mapped, and libcudart.so (libfabric's name) is the wheel's.
 """
 
 # ruff: noqa: E402 -- distributed initialization must precede JAX imports.
@@ -71,13 +74,41 @@ def main() -> None:
     maps = Path("/proc/self/maps").read_text()
     for so in (so_cuda, so_host):
         assert str(so) in maps, f"{so} is not mapped"
-    pip_cuda = sorted({line.split()[-1] for line in maps.splitlines()
-                       if "site-packages/nvidia/" in line
-                       and "/cudnn/" not in line})
-    assert not pip_cuda, f"pip CUDA libraries mapped: {pip_cuda}"
+    sdk = Path(os.environ["CUDA_HOME"]).resolve().parents[1]
+    mapped = {os.path.realpath(line.split()[-1]) for line in maps.splitlines()
+              if len(line.split()) > 5 and ".so" in line.split()[-1]}
+    toolkit = sorted(p for p in mapped if p.startswith(str(sdk) + "/"))
+    assert not toolkit, f"toolkit CUDA libraries mapped: {toolkit}"
+    site = Path(jax.__file__).resolve().parents[1]
+    wheels = site / "nvidia" / "cu13" / "lib"
+    for name in ("libcudart.so.13", "libcublas.so.13", "libcufft.so.12"):
+        want = os.path.realpath(wheels / name)
+        assert want in mapped, f"{name}: the wheel's {want} is not mapped"
+    launch = [d for d in os.environ.get("LD_LIBRARY_PATH", "").split(":")
+              if d and os.path.isfile(os.path.join(d, "libcudart.so"))]
+    assert launch and os.path.realpath(os.path.join(launch[0], "libcudart.so")) \
+        == os.path.realpath(wheels / "libcudart.so.13"), launch[:1]
+    # NCCL: exactly the venv's nvidia-nccl-cu13 wheel (stack.sh NCCL_VERSION).
+    nccl = sorted({os.path.realpath(line.split()[-1]) for line in maps.splitlines()
+                   if "/libnccl.so" in line})
+    want_nccl = os.path.realpath(site / "nvidia" / "nccl" / "lib" / "libnccl.so.2")
+    assert nccl == [want_nccl], f"NCCL mapped {nccl}, want only {want_nccl}"
+    assert md.version("nvidia-nccl-cu13") == expect.get("nvidia-nccl-cu13"), \
+        md.version("nvidia-nccl-cu13")
     assert "libcudart.so.12" not in maps
     say(f"PASS sealed bundle {manifest['bundle_id'][:12]}: both legs mapped, "
-        "hashes match, no pip CUDA runtime")
+        f"hashes match, CUDA = the uv.lock wheels, no toolkit library, "
+        f"NCCL = the wheel {want_nccl}")
+    # The bundle's own dependency closure was enforced when each leg opened:
+    # every recorded library mapped exactly once, as the recorded file.
+    from lxkit import native_provider
+    assert set(manifest.get("closures", {})) == {"CUDA", "cpu"}, \
+        sorted(manifest.get("closures", {}))
+    ids = {leg: native_provider.native_closure_identity(leg) for leg in ("CUDA", "cpu")}
+    for leg, so in (("CUDA", so_cuda), ("cpu", so_host)):
+        assert ids[leg] == native_provider.expected_closure_identity(so, leg), leg
+    say("PASS dependency closure enforced: "
+        + ", ".join(f"{leg}={ident[:12]}" for leg, ident in sorted(ids.items())))
 
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
     x = jax.make_array_from_callback(

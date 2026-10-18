@@ -118,6 +118,7 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 from jax import lax
+from distrib_la import eigh_local
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -434,7 +435,7 @@ def sdy_lanczos_eig(
         SAME real Q.  Returns (basis, retained θ², arrow couplings)."""
         _tally('restart')
         T = 0.5 * (T + T.T)
-        theta, Y = jnp.linalg.eigh(T)          # float64 in, float64 out: Q REAL
+        theta, Y = eigh_local(T)          # float64 in, float64 out: Q REAL
         theta_k = theta[:n_keep]
         Y_k = Y[:, :n_keep]                    # (m_max, n_keep), real
         Yc = Y_k.astype(dtype)

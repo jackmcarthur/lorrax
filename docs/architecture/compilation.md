@@ -36,16 +36,22 @@ lists. On any other device the driver JIT-compiles the PTX at first load into
 `CUDA_CACHE_PATH` ([registry §5](../reference/env_vars.md#5-external-variables-lorrax-sets-or-reads)),
 at a cost not measured.
 
-**NVRTC images.** One service, `src/ffi/cpp/common/nvrtc_build.h`, builds
+**NVRTC images.** One service, `src/ffi/cpp/common/rtc_build.h`, builds
 every kernel compiled at run time: the k-convolution family, its BSE outer
-kernels, and the Fourier plan's fused pair. It compiles for the device's own
+kernels, and the Fourier plan's fused pair. The same source is the ROCM leg's
+service with the vendor spelled by the leg (`common/leg.h`): hipRTC, resolved
+beside the HIP runtime the process mapped, for the device's full target id
+(`--offload-arch=gfx90a:sramecc+:xnack-`), keyed `hiprtc<maj>.<min>@<libhiprtc
+real path>`, and stored as `kdft_m<mode>_…_gfx90a_<key>.hsaco` in the same cache
+directory ([FFI layer](ffi_layout.md), the kdft family). The rest of this
+paragraph is the CUDA leg's. It compiles for the device's own
 `sm_<cc>`, keeps each image in process, stores it in the cubin cache and
 loads it through the driver API. The cubin cache is always on, has no knob,
 and serves every world size.
 
 | part of the key | what it is |
 |---|---|
-| program | FNV-1a over the embedded source, the text of each embedded header and the NVRTC options that decide the image (`nvrtc_build.cc:130`). Editing a source or header, comments included, invalidates its images |
+| program | FNV-1a over the embedded source, the text of each embedded header and the NVRTC options that decide the image (`rtc_build.cc`, `key`). Editing a source or header, comments included, invalidates its images |
 | toolchain | `nvrtc::mathdx_toolchain`: the cuFFTDx or cuBLASDx, commonDx, CUTLASS and CCCL version headers, the wheel's dist-info name, and the NVRTC version with the loaded `libnvrtc`'s real path. A version header that reads empty disables the disk cache for that build rather than leaving the key |
 | kernel constants | the k-convolution modes and BSE outer kernels: [k-convolution §14](kconv.md#build-and-cache); the Fourier pair: its two GEMM extents and supports (`fourier_plan_cuda_ffi.cc:249`) |
 | not keyed | file names, include paths, the host code, $N_\mu$, $P$ |
@@ -53,7 +59,7 @@ and serves every world size.
 | step | rule |
 |---|---|
 | file | `kconv_m<mode>[w<variant>]_<nkx>x<nky>x<nkz>_ns<ns>[x<n_r>][_c64]_sm<XY>_<key>.cubin`, `kconv_outer[_dec]_…` or `plan_pair_…`, framed by a `LRXKCONV1` header with the key and a payload hash. A k-convolution image is about 8.5 MB on sm_80, 6.1 MB of it line info (claim 4127) |
-| write | to a unique temporary, renamed into place (`nvrtc_build.cc:180`), so concurrent ranks each publish a whole file |
+| write | to a unique temporary, renamed into place (`rtc_build.cc`, `disk_store`), so concurrent ranks each publish a whole file |
 | read | a torn, foreign or non-ELF file is recompiled over the entry; one the driver refuses to load is unlinked first (`:251`) |
 | cost | about 7 s per image (claim 4129), on every rank that misses: nothing is shared until a file lands |
 | store | a process's first `cubin_cache_dir()` call links every store image the cache lacks into it (`ffi.fft.seed_cubin_cache`, `src/ffi/fft.py:451`) under a temporary name, renamed into place; a present entry is kept, a dangling link replaced. A bad store image is rebuilt into the cache over the link; the store file is never written. With the hsuite's 25-image store a cold run builds no image (claim 4126) |
@@ -139,16 +145,69 @@ A cache hit checks and waits for nothing. A check waits without bound by
 default ([registry](../reference/env_vars.md#2e-compile-cache)). The agreement
 costs 6.2 s on the warm hsuite (161.9 against 155.7 s, claim 4130) and stays on.
 
-**The runtime's XLA flags.** The runtime merges three flags into
-`XLA_FLAGS`; a caller's value wins, flag by flag. The first two
-(`runtime.set_default_xla_gpu_autotune`, `src/runtime/__init__.py:497`) are
-GPU-only; a CPU run gets neither.
+**The runtime's XLA flags.** The runtime merges the GPU leg's declared
+compile flags (`PlatformLeg.xla_flag_defaults` in `lxkit.LEGS`, merged by
+`runtime.set_default_xla_gpu_autotune`) and one HLO-pass flag into
+`XLA_FLAGS`; a caller's value wins, flag by flag. The leg is the one
+`JAX_PLATFORMS` names, else the installed plugin's. The leg flags are
+GPU-only; a CPU run gets none.
 
-| flag | effect | claim |
-|---|---|---|
-| `--xla_gpu_autotune_level=0` | cold compile −12.9 % (Na) and −16.3 % (Si) at P4, execution within noise | 683 |
-| `--xla_gpu_enable_llvm_module_compilation_parallelism=true` | XLA splits each module's LLVM IR into parts compiled in parallel; hsuite release-cold XLA compile 219.5 → 195.2 s, programs of 0.5 s or more −22 %, programs under 50 ms +10 %; results bitwise, device peak unchanged | 4179 |
-| `rematerialization` added to `--xla_disable_hlo_passes` (`runtime.disable_xla_rematerialization`, `:561`) | GPU and CPU. On CUDA a module that then does not fit the device refuses before it runs ([memory model](memory-model.md#module-does-not-fit)); on CPU nothing checks | — |
+| flag | leg | effect | claim |
+|---|---|---|---|
+| `--xla_gpu_autotune_level=0` | CUDA | cold compile −12.9 % (Na) and −16.3 % (Si) at P4, execution within noise | 683 |
+| `--xla_gpu_enable_llvm_module_compilation_parallelism=true` | CUDA | XLA splits each module's LLVM IR into parts compiled in parallel; hsuite release-cold XLA compile 219.5 → 195.2 s, programs of 0.5 s or more −22 %, programs under 50 ms +10 %; results bitwise, device peak unchanged | 4179 |
+| `--xla_gpu_autotune_level=0` | ROCM | MI250X P4 seeded cold: XLA compile gnppm 21.8 → 18.3 s, exciton_bands 15.1 → 13.3 s against level 4; warm walls within noise; d/zgemm n = 1024–8192 steady state identical (zgemm 8192: 39.6 TF/s at both) | runtime lane 2026-10-14 (pool logs runtime_a2_flags, runtime_a3) |
+| `--xla_gpu_disable_async_collectives=ALLCOLLECTIVES` | ROCM | every collective runs on the compute stream, in program order. With async collectives an all-reduce on the collective stream and a collective of another communicator on the compute stream are in flight together, and RCCL deadlocks across ranks (all GCDs at 100 %, every rank waiting on the same executable): `qsgw_head._drude_tensor_kernel` (psum over x,y beside psum over y) hung bisp_sc 3/3, the Coulomb-root program hung sp_export 1/1; a 25-line repro of that kernel hangs at iteration 1 and runs 300/300 with the flag. bisp_sc PASS 189.2 s with it (A100 173.7 s) | disteigh lane 2026-10-15 (pool logs disteigh_bisp1-3, disteigh_repro_async/sync) |
+| `rematerialization` added to `--xla_disable_hlo_passes` (`runtime.disable_xla_rematerialization`) | all | On a GPU leg with a readable card total (CUDA, ROCm) a module that then does not fit the device refuses before it runs ([memory model](memory-model.md#module-does-not-fit)); on CPU nothing checks | — |
+
+Not declared for ROCM, each measured on MI250X at P4 (gnppm XLA compile,
+278 programs): `--xla_gpu_force_compilation_parallelism=7` 18.4 s against
+18.3 s, and the LLVM-module flag, which XLA's AMDGPU compiler cannot act on
+(it does not link split modules). Where a ROCm compile goes (gnppm, XLA
+VLOG timers): HLO passes 4.0 s, backend 12.1 s, of which LLVM AMDGPU codegen
+and HSACO link (`CompileToHsaco`) 6.1 s. Per program that is about 66 ms,
+against 88 ms per program on the A100-80 release-cold hsuite (claim 4212), so
+compile is not a ROCm-specific cost; the persistent cache removes it there
+as on CUDA (keys are rank-invariant on ROCm too: JAX reports
+`backend.platform == "gpu"` and strips the device assignment).
+
+**Vendor run-time kernels (ROCm).** Two ROCm libraries compile or load
+device code at run time, outside XLA and outside JAX's cache; the leg declares
+both and `runtime.vendor_kernels` implements them (CUDA and the host declare
+none). rocFFT builds each new FFT kernel with hipRTC (1.9–7.6 s per length per
+process on MI250X; the pip wheel ships no system kernel cache). Its kernels are
+keyed by name, arch, HIP version and generator checksum, so, like the kconv
+image store, they live in `lxkit.user_cache_dir("rocfft")` and outlive the
+compile-cache namespace (`PlatformLeg.runtime_kernel_stores`): rocFFT reads a
+read-only snapshot (`ROCFFT_RTC_SYS_CACHE_PATH`), writes new kernels to one
+SQLite file per process (`ROCFFT_RTC_CACHE_PATH`; shared writers on Lustre
+spin), and each process folds its file into the snapshot at exit (copy, insert,
+rename). From the store the first FFT of a length costs 0.02–0.04 s. hsuite
+kmeans→dipole builds 16 kernels per process, 10.0 s of the cold kmeans wall.
+A "cold" hsuite run (empty compile cache) therefore reads both vendor-kernel
+stores, kconv and rocFFT, as a CUDA cold run reads the kernels cuFFT ships.
+rocBLAS loads its Tensile tables on a process's first GEMM: 2.84 s for an 8x8
+dgemm, then 0.055 s for the first zgemm (P1 probe, autotune 0, either level).
+`PlatformLeg.blas_host_warmup` compiles one 8x8 GEMM per dtype at start-up
+(main thread, so the compile agreement sees the same programs on every rank)
+and runs them on a helper thread, where the load overlaps the driver's
+imports. Before that thread starts the process environment freezes
+(`runtime.env_guard`, `GATE env-frozen`): the thread's `hipModuleLoadData`
+calls `getenv` inside HSA, and glibc's `getenv` takes no lock, so a main-thread
+`os.environ` write that adds a key (and so reallocates `environ`) is a
+use-after-free there. That was the intermittent rc 139 start-up SIGSEGV
+(Frontier, 2026-10-16: 6 of 72 concurrent Fe start-ups, from the SlabIO
+striping export at the first WFN.h5 open; evidence in `runtime.env_guard`). Every LORRAX
+environment write therefore happens before step 7b; a later LORRAX write that
+adds a key refuses, any other code's is announced. With the SlabIO export removed and the
+freeze armed, the same stress (6 concurrent 4-rank start-ups over 3 nodes, hot
+and cold caches) gave 0 of 48 crashes (40 of them through the crash window; the other 8
+sat on frontier00749, whose GCDs 4-7 stall in the same window and is now excluded from
+the pool), and the Fe deck's eqp0/eqp1 were
+unchanged bit for bit (branch `crash/w8`). AMD comgr's code-object cache stays per namespace
+(`runtime_kernel_caches`, `<cache>/vendor/comgr`). Runtime start-up itself
+(`initialize_communicator_stack`, 5.3–8.7 s per process: jax import ~2 s,
+distributed and backend init ~1.5 s, clique warm-up 2.6 s) is not cached.
 
 ## 4 Where the time goes
 

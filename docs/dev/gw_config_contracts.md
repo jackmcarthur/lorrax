@@ -70,11 +70,11 @@ rulings override anything here.
   head columns before they are written. Every operator that is diagonalized
   stays unaveraged, because averaging only the diagonal of a degenerate block
   depends on the arbitrary basis inside it.
-- **`write_eqp2` never recomputes GW.** `sc_iteration.run_fixed_sigma_evsc`
-  iterates the one-shot full-matrix Σ(ω), rotated into each updated QP basis;
-  G, χ₀, W and Σ are built once. The Σ(ω) cube exists only under
-  `sigma_omega_grid_debug = true`; on shell it refuses
-  (`GATE eqp2_needs_omega_grid`).
+- **Retired keys refuse by name.** `write_eqp2` and the `eqp2_*` keys are
+  tombstones (`_EQP2_RETIRED_KEYS`, in `_LEGACY_DECK_KEYS`): any value
+  refuses at parse time with `GATE eqp2_retired` and the UPGRADE_NOTES
+  pointer. `sigma_omega_grid_debug` is a live debug key
+  (`DebugConfig.sigma_omega_grid_debug`, default false).
 
 ## Configuration contracts (`gw.gw_config`)
 
@@ -165,7 +165,7 @@ rulings override anything here.
   `lo:hi:eta` triples are coarse windows, parsed and refused
   (`GATE sigma_coarse_window`) by `parse_coarse_windows_ev`. On shell only
   the grid's extent is read (`ppm_sigma.on_shell_request`); its samples are
-  evaluated under `sigma_omega_grid_debug = true`.
+  never evaluated.
 
 ### Screening
 
@@ -206,7 +206,10 @@ rulings override anything here.
   selects the distributed W Dyson solve, the distributed transverse LU
   (`distributed_lu`) and the distributed eigensolvers, including the SC
   eigh; the ζ back-solve is a whole-tile factor applied on its q owners under
-  either value.
+  either value. `LinalgResolution.eigh_backend` (`local` → `auto`,
+  `distributed` → `distributed`) is the eigh request of every whole-mesh site
+  (shared-pole face and staged plans, line selection, parallel-transport
+  polar); none names a backend itself.
 - **`eigh_backend_choices`** reads `distrib_la.BACKEND_CHOICES`, which imports
   without any `.so`; a literal fallback covers a tree without `services/`, and
   `EIGH_CHOICES_SOURCE` records which answered.
@@ -300,8 +303,6 @@ rulings override anything here.
   (`sc_iteration._resolve_sc_eigh`). `LORRAX_SC_MAX_ITER`,
   `LORRAX_SC_TOL_EV` and `LORRAX_SC_DUMP_DIR` override
   their deck keys and print a deprecation note when set. The loop: [self-consistency](../self_consistency.md).
-- **`EQP2Config`** configures fixed-Σ eigenvalue self-consistency for the
-  opt-in `eqp2.dat` (`write_eqp2`); it never rebuilds G, χ₀, W or Σ.
 - **`BSEConfig`**: `get_centroids_fi` gates the htransform-driven fine-k
   wavefunction recovery (`bandstructure.bse_setup.compute_wfns_fi`).
 - **`LorraxConfig`** is the frozen record built once and threaded through the

@@ -85,7 +85,9 @@ from typing import Any, Callable, NamedTuple
 from ffi import _services
 
 _services.ensure_on_path()
-from lxkit import device_put_process_local, device_put_process_tiles
+from lxkit import (device_put_process_local, device_put_process_local_cached,
+                   device_put_process_tiles, placement_cache_stats)
+from lxkit import ordered_psum, ordered_psum_scatter
 
 
 __all__ = [
@@ -108,7 +110,9 @@ __all__ = [
     "prepare_mesh",
     # staging a host table onto a mesh, without a collective
     "device_put_process_local",
+    "device_put_process_local_cached",
     "device_put_process_tiles",
+    "placement_cache_stats",
     "replicate_to_mesh",
     "shard_over_k",
     # reductions and gathers
@@ -172,6 +176,39 @@ def device_count() -> int:
     return int(jax.device_count())
 
 
+#: Seconds a rank waits at a :func:`barrier` for its peers before the barrier fails
+#: (the coordination service's deadline; a rank that never arrives -- a mismatched
+#: name, a dead peer -- surfaces as this error instead of a hang).
+BARRIER_TIMEOUT_S = 1800
+_BARRIER_SERIAL: dict = {}
+
+
+def _coordination_barrier(name, _mh):
+    """Host barrier through the distributed runtime's coordination service.
+
+    No device work: ``multihost_utils.sync_global_devices`` all-gathers a name hash
+    through the devices (an H2D put, a collective and a D2H read per barrier).  Every
+    caller here orders HOST work (a rank-0 HDF5 write, a file closed before another
+    rank opens it, a timing band), which the coordination barrier orders without
+    touching a device.  Each use of a name gets its own barrier id (the n-th use on
+    every rank, in program order), so a name can recur.  Without a distributed client
+    (a multi-process run started outside ``jax.distributed``) the device barrier is
+    used, with one notice (GATE barrier_coordination).
+    """
+    from jax._src import distributed as _dist
+    client = getattr(_dist.global_state, "client", None)
+    if client is None:
+        if "notice" not in _BARRIER_SERIAL:
+            _BARRIER_SERIAL["notice"] = True
+            print("  GATE barrier_coordination: no distributed runtime client; "
+                  "collectives.barrier uses the device barrier (sync_global_devices)",
+                  flush=True)
+        _mh.sync_global_devices(name)
+        return
+    n = _BARRIER_SERIAL[name] = _BARRIER_SERIAL.get(name, 0) + 1
+    client.wait_at_barrier(f"lorrax.barrier:{name}:{n}", int(BARRIER_TIMEOUT_S * 1000))
+
+
 def barrier(name: str, *, print_fn: Callable[..., Any] = print) -> bool:
     """Synchronize all processes at ``name``; fatal if the collective fails.
 
@@ -196,7 +233,7 @@ def barrier(name: str, *, print_fn: Callable[..., Any] = print) -> bool:
     if process_count() <= 1:
         return False
     try:
-        _mh.sync_global_devices(name)
+        _coordination_barrier(name, _mh)
     except Exception as exc:
         # Do NOT swallow.  A broken barrier in a multi-process run means
         # this rank is about to diverge from its peers; continuing turns a
@@ -675,8 +712,18 @@ def to_transpose_partner(t, p: int):
     face (a block held ``[.., a_X, b_Y]`` arrives as the partner's
     ``[.., a_Y, b_X]``)."""
     import jax
-    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p)]
-    return jax.lax.ppermute(t, ("x", "y"), perm)
+    import jax.numpy as jnp
+    if p == 1:
+        return t
+    # Off-diagonal pairs only; a diagonal rank IS its own partner and keeps
+    # its block.  A self pair is not free: RCCL executes it as a 0.50 ms copy
+    # of a 24.9 MB block on MI250X (P4 Fe W tile; 0.065 ms as this select,
+    # comm7 lane 2026-10-16), against 0.59-0.74 ms for the real exchange.
+    # The select fuses into the consumer; ranks still meet in one permute.
+    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p) if i != j]
+    moved = jax.lax.ppermute(t, ("x", "y"), perm)
+    on_diagonal = jax.lax.axis_index("x") == jax.lax.axis_index("y")
+    return jnp.where(on_diagonal, t, moved)
 
 
 def xy_tile_mesh(x):
@@ -782,7 +829,9 @@ def _psum_kernel(ndim: int, mesh):
         @partial(shard_map, mesh=mesh, in_specs=(P(axes, *rest),),
                  out_specs=P(*rest), check_vma=False)
         def _body(x):
-            return jax.lax.psum(x[0], axes)
+            # Rank-order sum (lxkit.ordered_psum): the library all-reduce's order
+            # follows the GCD placement (det lane 2026-10-16: the exact Hartree's rho).
+            return ordered_psum(x[0], axes)
 
         fn = jax.jit(_body)
         _PSUM_KERNELS[key] = fn
@@ -1327,7 +1376,7 @@ def psum_scatter_checked(x, axis, scatter_dimension, tiled=True, *, name):
             f"tiled layout.  Use lax.psum_scatter directly, unchecked, and say "
             f"so at the call site.")
 
-    out = lax.psum_scatter(x, axis, scatter_dimension=scatter_dimension,
+    out = ordered_psum_scatter(x, axis, scatter_dimension=scatter_dimension,
                            tiled=tiled)
 
     glob = [int(v) for v in x.shape]           # x carries the FULL extent
@@ -1341,7 +1390,7 @@ def psum_scatter_checked(x, axis, scatter_dimension, tiled=True, *, name):
 
     # ONE scalar all-reduce, 2 complex doubles.  psum, never psum_scatter —
     # the checker must not be built on the primitive it is checking.
-    packed = lax.psum(jnp.stack([s_in - s_out, s_in]), axis)
+    packed = ordered_psum(jnp.stack([s_in - s_out, s_in]), axis)
     # SCALE = |checksum of the correct reduction|, NOT the operand's L1 mass.
     # Measured (wk_REL job 7880840): a separate L1-mass pass costs +65 % on the
     # 0.41 MB BSE collective and +157 % at 41 MB, because `abs(x)` materialises
@@ -1437,7 +1486,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     axes = list(mesh.axis_names)
     groups = list(axes) + ([tuple(axes)] if len(axes) > 1 else [])
     for ax in groups:
-        f = jax.jit(shard_map(lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,
+        f = jax.jit(shard_map(lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,  # exact-reduce: warm-up of zeros
                               in_specs=(P(None),), out_specs=P(None),
                               check_vma=False))
         jax.block_until_ready(f(tiny))
@@ -1552,6 +1601,97 @@ def xor_to_all(digest, *, path, stage):
         reduce=lambda records: np.bitwise_xor.reduce(np.stack(records), axis=0)))
 
 
+_RANK_LOCAL_IO = threading.local()
+
+
+class _rank_local_io:
+    """Mark rank-0-only file work (``rank0_transaction``'s ``write``, a
+    ``rank0_read`` reader): a nested ``rank0_read`` inside it reads directly,
+    because its peers are not there to exchange with."""
+
+    def __enter__(self):
+        _RANK_LOCAL_IO.depth = getattr(_RANK_LOCAL_IO, "depth", 0) + 1
+
+    def __exit__(self, *_exc):
+        _RANK_LOCAL_IO.depth -= 1
+
+
+#: Largest single host-control value ``rank0_read`` stores; longer results
+#: are split, so a 1.7 MB model header never meets a transport message cap.
+_RANK0_READ_CHUNK = 512 * 1024
+#: Builtin classes a peer re-raises by name, so ``except (OSError, ValueError,
+#: KeyError)`` callers decide alike on every rank. Anything else: RuntimeError.
+_RANK0_READ_ERRORS = {cls.__name__: cls for cls in (
+    ValueError, KeyError, TypeError, OSError, FileNotFoundError, RuntimeError,
+    AttributeError, IndexError, AssertionError)}
+
+
+def rank0_read(path, *, stage, read):
+    """One process reads a committed file; every process gets the result.
+
+    ``read()`` runs on rank 0 alone and returns a JSON value (the metadata a
+    validator authenticated, never tensor payload). Its result, or its
+    failure, reaches every other rank through the host coordination store:
+    no device collective, no device memory. The peers wait for it, so this is
+    also the barrier after the writer's close, and they never open ``path``.
+
+    This removes the concurrent serial reopen of a just-committed file. At
+    P=16 on two Frontier nodes, sixteen h5py reopens of a just-closed
+    ``bank.h5`` made the Lustre client report its size short at a stripe
+    boundary for milliseconds (``truncated file: eof < stored_eof``). One
+    reader does not contend with its peers.
+
+    Every rank returns the same JSON round trip of rank 0's value. A failure
+    raises rank 0's exception on rank 0, and the same builtin class with the
+    same message on the others. Must be called by every process in the same
+    order (it takes one ``_io_control_key`` occurrence); inside rank-0-only
+    work (``rank0_transaction``'s ``write``, another reader) it reads
+    directly.
+    """
+    import json
+
+    n_proc = process_count()
+    if n_proc <= 1 or getattr(_RANK_LOCAL_IO, "depth", 0):
+        with _rank_local_io():
+            return json.loads(json.dumps(read()))
+    from jax._src.distributed import global_state
+    from ffi.common.broadcast import _arrive, wait_for_key
+
+    client = global_state.client
+    key = _io_control_key(path, stage)
+    what = f"rank 0's read of {path} ({stage})"
+    if process_rank() == 0:
+        error = None
+        try:
+            with _rank_local_io():
+                body = json.dumps(read()).encode()
+            flag = b"\0"
+        except BaseException as exc:                      # noqa: BLE001
+            error = exc
+            body = json.dumps([type(exc).__name__, str(exc)]).encode()
+            flag = b"\1"
+        chunks = [body[i:i + _RANK0_READ_CHUNK]
+                  for i in range(0, len(body), _RANK0_READ_CHUNK)] or [b""]
+        for i, chunk in enumerate(chunks):
+            client.key_value_set_bytes(f"{key}/chunk/{i}", chunk)
+        client.key_value_set_bytes(f"{key}/result", flag + str(len(chunks)).encode())
+        wait_for_key(client, f"{key}/read/complete", 0,
+                     what=f"every rank to take {what}")
+        client.key_value_delete(key)          # the whole key/ directory
+        if error is not None:
+            raise error
+        return json.loads(body)
+    head = wait_for_key(client, f"{key}/result", 0, what=what)
+    body = b"".join(wait_for_key(client, f"{key}/chunk/{i}", 0, what=what)
+                    for i in range(int(head[1:])))
+    _arrive(client, f"{key}/read", n_proc - 1)
+    value = json.loads(body)
+    if head[:1] == b"\1":
+        name, message = value
+        raise _RANK0_READ_ERRORS.get(name, RuntimeError)(message)
+    return value
+
+
 def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
     """Validate on all ranks, perform serial I/O, then broadcast its verdict.
 
@@ -1582,7 +1722,8 @@ def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
     value = None
     if process_rank() == 0:
         try:
-            value = write()
+            with _rank_local_io():
+                value = write()
         except BaseException as exc:
             error = exc
     agree_io_error(error, path=path, stage=stage)

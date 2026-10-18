@@ -4,9 +4,14 @@ Plain srun starts one pytest per rank; xdist starts independent workers. Only
 srun ranks share these rendezvous. Child drivers retain their launch environment
 and own the MPI/JAX runtime. Work directories live outside pytest's basetemp,
 which pytest is allowed to delete independently in each process, and outside
-the source tree, which is read-only in a module install: ``ROOT`` is the
-per-user cache tree (``$SCRATCH/.cache/lorrax/hsuite``, or under ``~`` where
-the site defines no ``SCRATCH``), which every rank resolves alike.
+the source tree, which is read-only in a module install: :func:`run_root` is
+the per-user cache tree ``$SCRATCH/.cache/lorrax/hsuite``, which every rank
+resolves alike.  ``SCRATCH`` is resolved by the runtime's own site rule
+(:func:`runtime.apply_site_scratch`: a caller's export wins, else the site
+profile's ``[paths] scratch``, e.g. Frontier's ``$MEMBERWORK/<account>``)
+before the directory is chosen; with neither, the suite refuses rather than
+fall back to HOME, where the drivers' HDF5 files fail (Frontier NFS:
+``[Errno 524] Unable to synchronously open file``).
 """
 from __future__ import annotations
 
@@ -20,13 +25,46 @@ import tempfile
 import time
 
 from ffi import _services
-from runtime import _resolve_proc_count, _resolve_proc_id
+from runtime import _resolve_proc_count, _resolve_proc_id, apply_site_scratch, site_scratch
 
 _services.ensure_on_path()
 from lxkit import user_cache_dir  # noqa: E402
 
-ROOT = user_cache_dir("hsuite")
+_ROOT = None
 _SEQUENCE = 0
+
+
+def run_root() -> Path:
+    """The suite's run and rendezvous root, ``$SCRATCH/.cache/lorrax/hsuite``.
+
+    ``SCRATCH`` comes from the same resolution the runtime applies at start-up
+    (:func:`runtime.apply_site_scratch`; idempotent, a caller's export wins), run
+    here because the harness picks its directories before any driver starts.
+    Refuses when there is still no ``SCRATCH``: the run directories hold the
+    drivers' HDF5 files, and HOME is not a filesystem they work on.
+    """
+    global _ROOT
+    if _ROOT is None:
+        apply_site_scratch()
+        if not os.environ.get("SCRATCH", "").strip():
+            _, why = site_scratch()
+            raise RuntimeError(
+                "GATE hsuite_run_root: got: no scratch root for the driver suite's run "
+                f"directories (SCRATCH is unset and {why}); want: SCRATCH, or a site "
+                "profile [paths] scratch rule that expands to a writable directory; why: "
+                "the run directories hold the drivers' HDF5 files, which fail on a home "
+                "filesystem (Frontier NFS: [Errno 524] Unable to synchronously open file). "
+                "Export SCRATCH=<a writable directory on the site's scratch filesystem>, "
+                "or declare [paths] scratch in config/<site>/site.toml.")
+        _ROOT = user_cache_dir("hsuite")
+    return _ROOT
+
+
+def __getattr__(name):
+    # ``rank_session.ROOT``: the same root, resolved on first use (PEP 562).
+    if name == "ROOT":
+        return run_root()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def exchange(value, *, timeout=240):
@@ -41,8 +79,9 @@ def exchange(value, *, timeout=240):
     _SEQUENCE += 1
     key = hashlib.sha256(
         f"{job}:{step}:{_SEQUENCE}".encode()).hexdigest()
-    ROOT.mkdir(parents=True, exist_ok=True)
-    address_file = ROOT / f"{key}.json"
+    root = run_root()
+    root.mkdir(parents=True, exist_ok=True)
+    address_file = root / f"{key}.json"
     deadline = time.monotonic() + timeout
     if rank == 0:
         with socket.socket() as listener:
@@ -98,8 +137,9 @@ def stage(source, prepare):
     result = None
     if _resolve_proc_id() == 0:
         try:
-            ROOT.mkdir(parents=True, exist_ok=True)
-            target = Path(tempfile.mkdtemp(prefix=source.name + "-", dir=ROOT)) / source.name
+            root = run_root()
+            root.mkdir(parents=True, exist_ok=True)
+            target = Path(tempfile.mkdtemp(prefix=source.name + "-", dir=root)) / source.name
             result = {"path": str(prepare(source, target))}
         except Exception as exc:
             result = {"error": repr(exc)}

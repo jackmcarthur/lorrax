@@ -12,13 +12,18 @@ sites resolve the right handler from the lowering platform and never
 mention a platform themselves:
 
     CUDA  liblorrax_ffi.so       cuSOLVERMp/cuBLAS/phdf5/slate/mathdx k-conv
+    ROCM  liblorrax_ffi_rocm.so  phdf5 / slate / kdft k-leading conv + transform (hipRTC)
     cpu   liblorrax_ffi_host.so  phdf5 read+write / slate (Target::HostTask)
                                  / ScaLAPACK / FFTW3-ABI flat-k / MKL GEMM
+
+The legs themselves (file, pin, build dir, C-ABI suffix, ABI symbol, how a
+process hosts the leg) are :data:`lxkit.legs.LEGS`; this module owns only
+its target tables, ctypes declarations and build hints.
 
 Public API
 ----------
 get_lib(platform=None) : ctypes.CDLL
-    The loaded library for ``platform`` ("CUDA" or "cpu"; default = the
+    The loaded library for ``platform`` (a :data:`lxkit.legs.LEGS` key; default = the
     JAX default backend's platform) with ctypes argtypes/restype set on
     its ``lrx_*`` wrapper functions.  The XLA FFI handlers remain raw
     ``ctypes._FuncPtr`` — we pass them to ``jax.ffi.pycapsule`` rather
@@ -30,6 +35,8 @@ LORRAX_FFI_SO
     Absolute path to ``liblorrax_ffi.so`` (CUDA).  Takes precedence.
 LORRAX_FFI_HOST_SO
     Absolute path to ``liblorrax_ffi_host.so`` (cpu).  Takes precedence.
+LORRAX_FFI_ROCM_SO
+    Absolute path to ``liblorrax_ffi_rocm.so`` (ROCM).  Takes precedence.
 
 Where the library's own dependencies come from (audited 2026-07-27, AW)
 ----------------------------------------------------------------------
@@ -84,6 +91,7 @@ _services.ensure_on_path()
 import jax
 import jax.ffi
 from lxkit import FFI_PLATFORM_MAP, device_vendor, native_provider as _native
+from lxkit import LEGS, accelerator_leg_to_open_first
 from lxkit import platform_from_env  # noqa: F401  (re-exported: the pre-backend platform key)
 
 __all__ = ["get_lib", "has_target", "probe_target", "has_phdf5_read",
@@ -105,6 +113,10 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_cublas_local_active_range_gemm": "CublasLocalActiveRangeGemmFfi",
     "lorrax_cublas_local_active_range_gemm_out": "CublasLocalActiveRangeGemmOutFfi",
     "lorrax_cublas_local_prepared_active_range_gemm": "CublasLocalPreparedActiveRangeGemmFfi",
+    # The active-range GEMM with DEVICE-side bounds (cpp/active_gemm/, leg-neutral, run-time
+    # compiled; DMMA f64 on compute capability >= 8.0): ACTIVE_LOCAL_ROUTE's "device" row.
+    "lorrax_active_gemm_device": "ActiveGemmDeviceFfi",
+    "lorrax_active_gemm_device_out": "ActiveGemmDeviceOutFfi",
     # The NVIDIA k-convolution family on nvidia-mathdx (cpp/cufft/
     # kconv_mathdx_cuda_ffi.cc): cuFFTDx transforms, NVRTC-built per
     # (mode, grid, ns, context) and disk-cached.  CUDA-only; the ffi.fft router
@@ -126,10 +138,12 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_mathdx_kconv_klead_lorentz_rows": "KConvMathdxKleadLorentzRowsCudaFfi",
     "lorrax_mathdx_kconv_klead_unfold_block": "KConvMathdxKleadUnfoldBlockCudaFfi",
     "lorrax_mathdx_kconv_klead_unfold_xblock": "KConvMathdxKleadUnfoldXBlockCudaFfi",
+    "lorrax_mathdx_kconv_klead_unfold_kf": "KConvMathdxKleadUnfoldKfCudaFfi",
     "lorrax_mathdx_kconv_klead_lorentz_conj": "KConvMathdxKleadLorentzConjCudaFfi",
     "lorrax_mathdx_kconv_klead_lorentz_wparent": "KConvMathdxKleadLorentzWParentCudaFfi",
     "lorrax_mathdx_kfft_klead_unfold": "KFftMathdxKleadUnfoldCudaFfi",
     "lorrax_mathdx_kconv_chi_unfold": "KConvMathdxChiUnfoldCudaFfi",
+    "lorrax_mathdx_kconv_chi_unfold_q": "KConvMathdxChiUnfoldQCudaFfi",
     "lorrax_mathdx_kconv_chi_vertex": "KConvMathdxChiVertexCudaFfi",
     "lorrax_mathdx_kfft_klead":     "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor":   "KConvMathdxKminorCudaFfi",
@@ -144,6 +158,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_phdf5_read":            "PhdfReadFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionFfi",
+    "lorrax_phdf5_read_multi":        "PhdfReadMultiFfi",
     "lorrax_slate_eigh":              "SlateEighFfi",
     "lorrax_slate_potrf":             "SlatePotrfFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfFfi",
@@ -191,28 +206,87 @@ _HOST_TARGET_SYMBOLS = {
     "lorrax_phdf5_read":              "PhdfReadHostFfi",
     "lorrax_phdf5_read_kchunk":       "PhdfReadKchunkHostFfi",
     "lorrax_phdf5_read_kchunk_union": "PhdfReadKchunkUnionHostFfi",
+    "lorrax_phdf5_read_multi":        "PhdfReadMultiHostFfi",
     "lorrax_phdf5_write":             "PhdfWriteHostFfi",
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentHostFfi",
 }
 
-# Per-platform library spec: .so filename, env-var override, in-tree build
-# dir (relative to src/ffi/cpp/, the one C++ tree), target table, and the
-# build command for the not-found error.
+#: The ROCM leg's handlers: the device families ported so far (phdf5, slate, cublas_local).  The
+#: device legs compile the SAME sources, so the symbols are the CUDA leg's
+#: (``LRX_PHDF_HANDLER(<X>)`` is ``<X>Ffi`` on both); only one device leg is
+#: ever loaded in a process.  A family joins this table when it joins
+#: ``CMakeLists.txt``'s ROCM source list.
+#: Derived from :data:`ffi.common.families.FAMILIES`: the families built on ROCM whose
+#: sources the CUDA leg also builds.
+from ffi.common.families import built_prefixes as _built_prefixes
+_ROCM_FAMILIES = tuple(p for p in _built_prefixes("ROCM")
+                       if any(t.startswith(p) for t in _CUDA_TARGET_SYMBOLS))
+#: The ROCM leg's own families: leg-neutral sources the CUDA leg does not build because it
+#: serves the same operation another way.  The k-leading direct-DFT pair (cpp/kdft/,
+#: hipRTC-built; CUDA uses the nvidia-mathdx modes 2/3) and the k-minor pair (modes 4/5):
+#: ffi.fft._ROCM_KLEAD_TARGETS; the k-box unfold (cpp/kdft/kbox_unfold_ffi.cc, mode 7 on
+#: cufft/kbox_stage.cuh): ffi.fft._ROCM_KBOX_TARGETS.
+_ROCM_OWN_TARGET_SYMBOLS = {
+    "lorrax_kdft_kconv_klead":      "KDftKconvKleadFfi",
+    "lorrax_kdft_kfft_klead":       "KDftKfftKleadFfi",
+    "lorrax_kdft_kconv_kminor":     "KDftKconvKminorFfi",
+    "lorrax_kdft_kfft_kminor":      "KDftKfftKminorFfi",
+    "lorrax_kdft_kconv_klead_unfold": "KDftKconvKleadUnfoldFfi",
+    # The SLATE LU family (cpp/slate/batched_solve_lu_ffi.cc): CUDA serves the
+    # distributed LU with cuSOLVERMp (distrib_la.resolve), so only this leg builds it.
+    "lorrax_slate_batched_solve_lu_factors": "SlateBatchedSolveLuFactorsFfi",
+    "lorrax_slate_batched_getrf":            "SlateBatchedGetrfFfi",
+    "lorrax_slate_batched_getrs":            "SlateBatchedGetrsFfi",
+    # The ELPA eigh (cpp/elpa/eigh_ffi.cc): the ROCM distributed eigh (distrib_la.resolve).
+    "lorrax_elpa_eigh":                      "ElpaEighFfi",
+    # k-box modes 9 and 11 (cpp/kdft/kbox_rspace_ffi.cc): ffi.fft._ROCM_KBOX_TARGETS.
+    "lorrax_kdft_kfft_klead_unfold": "KDftKfftKleadUnfoldFfi",
+    "lorrax_kdft_kconv_chi_unfold":  "KDftKconvChiUnfoldFfi",
+    "lorrax_kdft_kconv_chi_vertex":  "KDftKconvChiVertexFfi",
+    # The BSE W term's outer-product load and its fused decode (cpp/kdft/kconv_outer_rocm_ffi.cc,
+    # the port of cpp/cufft/kconv_outer_cuda_ffi.cc): ffi.fft._ROCM_OUTER_TARGETS.
+    "lorrax_kdft_kconv_klead_outer": "KDftKconvKleadOuterFfi",
+    "lorrax_kdft_kconv_klead_outer_decode": "KDftKconvKleadOuterDecodeFfi",
+    # k-box mode 6, the ISDF route-G pair convolution (cpp/kdft/kbox_plane_ffi.cc, the port of the
+    # mathdx plane mode): ffi.fft._ROCM_PAIR_TARGETS.
+    "lorrax_kdft_kconv_plane": "KDftKconvPlaneFfi",
+    # k-box mode 1, the ISDF parent-load pair convolution (cpp/kdft/kbox_parent_ffi.cc, the port of the
+    # mathdx parent mode), and mode 10, the route-G plane FFT with gather-on-load
+    # (cpp/kdft/plane_gather_ffi.cc, the port of the mathdx kPlaneSrc): ffi.fft._ROCM_PAIR_TARGETS.
+    "lorrax_kdft_kconv_parent": "KDftKconvParentFfi",
+    "lorrax_kdft_plane_fft_gather": "KDftPlaneFftGatherFfi",
+    # The batched local Hermitian eigh (cpp/rocsolver/batched_eigh_ffi.cc), called by
+    # distrib_la.local_eigh (BATCHED_EIGH_ROUTE); CUDA uses jaxlib's cuSOLVER for it.
+    "lorrax_rocsolver_batched_eigh": "RocsolverBatchedEighFfi",
+    # The one-device LU solve (cpp/rocsolver/lu_solve_ffi.cc), called by distrib_la.local_lu
+    # (LOCAL_LU_ROUTE) for a system spanning >= 2^31 bytes; CUDA uses jaxlib's cuSOLVER for it.
+    "lorrax_rocsolver_lu_solve": "RocsolverLuSolveFfi",
+    "lorrax_rocsolver_tri_solve": "RocsolverTriSolveFfi",
+    # LocalFourierPlan's ROCM leg (cpp/hipfft/fourier_plan_rocm_ffi.cc, the port of the CUDA
+    # leg's cufft/fourier_plan_cuda_ffi.cc): ffi.fft.FOURIER_PLAN_TARGETS["ROCM"].
+    "lorrax_fourier_plan_rocm":      "LorraxFourierPlanRocmFfi",
+    # (The device-bounds active-range GEMM, cpp/active_gemm/, is built on both legs now: its
+    # targets reach this table through _ROCM_FAMILIES from the CUDA table above.)
+}
+_ROCM_TARGET_SYMBOLS = {**{target: symbol for target, symbol in _CUDA_TARGET_SYMBOLS.items()
+                           if target.startswith(_ROCM_FAMILIES)},
+                        **_ROCM_OWN_TARGET_SYMBOLS}
+
+#: Leg key -> this loader's target table and the build command for its
+#: not-found error.  Everything else about a leg is ``lxkit.legs.LEGS``.
+_TARGETS = {"CUDA": _CUDA_TARGET_SYMBOLS, "ROCM": _ROCM_TARGET_SYMBOLS,
+            "cpu": _HOST_TARGET_SYMBOLS}
+_BUILD_HINTS = {
+    "CUDA": "bash config/perlmutter/build_ffi_cuda.sh (Perlmutter; docs/installation/perlmutter.md)",
+    "ROCM": "bash config/frontier/build_ffi_rocm.sh (Frontier; docs/architecture/ffi_layout.md)",
+    "cpu": "bash src/ffi/cpp/build_host.sh",
+}
+
+# Per-platform library spec (the shape lxkit.native_provider.locate_library reads).
 _PLATFORMS = {
-    "CUDA": dict(
-        so_name="liblorrax_ffi.so",
-        env="LORRAX_FFI_SO",
-        build_subdir="build",
-        targets=_CUDA_TARGET_SYMBOLS,
-        build_hint="bash config/perlmutter/build_ffi_cuda.sh (Perlmutter; docs/installation/perlmutter.md)",
-    ),
-    "cpu": dict(
-        so_name="liblorrax_ffi_host.so",
-        env="LORRAX_FFI_HOST_SO",
-        build_subdir="build_host",
-        targets=_HOST_TARGET_SYMBOLS,
-        build_hint="bash src/ffi/cpp/build_host.sh",
-    ),
+    key: dict(so_name=leg.so_name, env=leg.so_env, build_subdir=leg.build_subdir,
+              targets=_TARGETS[key], build_hint=_BUILD_HINTS[key])
+    for key, leg in LEGS.items()
 }
 
 # Error buffer size for the lrx_ wrappers.
@@ -227,9 +301,8 @@ def _default_platform() -> str:
     if vendor in FFI_PLATFORM_MAP:
         return FFI_PLATFORM_MAP[vendor]
     raise RuntimeError(
-        f"lorrax_ffi: no FFI library for the {vendor!r} devices of this "
-        f"process (libraries exist for cuda and cpu); its operations run "
-        f"the XLA path.")
+        f"lorrax_ffi: no FFI leg for the {vendor!r} devices of this process "
+        f"(legs: {sorted(LEGS)}); its operations run the XLA path.")
 
 
 def _candidate_paths(platform: str) -> list[Path]:
@@ -269,7 +342,7 @@ class FfiLibraryNotBuilt(FileNotFoundError):
 #: this boundary is unavoidable; what IS avoidable is the mirror drifting
 #: silently, and ``tests/test_ffi_abi_stamp.py`` parses the header and fails if
 #: these two numbers disagree.
-LORRAX_FFI_ABI_VERSION = 6
+LORRAX_FFI_ABI_VERSION = 9
 
 #: platform -> the C entry point that reports the library's ABI.  Per leg on
 #: purpose: both libraries are dlopened RTLD_GLOBAL in a GPU process and
@@ -277,8 +350,7 @@ LORRAX_FFI_ABI_VERSION = 6
 #: here would let the first-loaded library answer for the second — and this is
 #: the one question where being answered by the wrong library is the exact
 #: failure being detected.
-_ABI_SYMBOLS = {"cpu": "lorrax_ffi_host_abi_version",
-                "CUDA": "lorrax_ffi_cuda_abi_version"}
+_ABI_SYMBOLS = {key: leg.abi_symbol for key, leg in LEGS.items()}
 
 class FfiLibraryUnusable(OSError):
     """An FFI .so WAS located but cannot be used.
@@ -346,14 +418,20 @@ _SHARED_C_ENTRY_POINTS = (
     "lrx_phdf5_dataset_geometry",
     "lrx_phdf5_read_whole",
     "lrx_phdf5_staging_totals",
+    # Posted control (handler ABI 7; cpp/phdf5/ctx.h POSTED CONTROL).
+    "lrx_phdf5_post_control",
+    "lrx_phdf5_retract_control",
+    "lrx_phdf5_pending_controls",
     "lrx_slate_context_create",
     "lrx_slate_subrow_context_create",
     "lrx_slate_context_destroy",
     "lrx_slate_init_mpi",
+    # The ROCM leg's k-box image prebuild (kdft/kbox_rspace_ffi.cc; ffi.fft._kbox_prebuild).
+    "lrx_kbox_rspace_prebuild",
 )
 
 #: platform -> the suffix ``LRX_C_ENTRY`` appends on that leg.
-_C_ABI_SUFFIX = {"CUDA": "", "cpu": "_host"}
+_C_ABI_SUFFIX = {key: leg.c_abi_suffix for key, leg in LEGS.items()}
 
 
 def _bind_c_abi(lib: ctypes.CDLL, platform: str) -> None:
@@ -386,8 +464,9 @@ def _bind_c_abi(lib: ctypes.CDLL, platform: str) -> None:
 def _set_argtypes(lib: ctypes.CDLL, platform: str) -> None:
     """Declare argtypes/restype for the lrx_* entry points ``lib`` exports."""
     _bind_c_abi(lib, platform)
-    if platform == "CUDA":
-        _declare_cuda_stack(lib)
+    declare_stack = _DEVICE_STACK_DECLARATIONS.get(platform)
+    if declare_stack is not None:
+        declare_stack(lib)
     # phdf5 lifecycle (CUDA-free) + slate lifecycle (pure MPI) are exported by
     # WHICHEVER platform library was built with them — the phdf5 host read
     # path drives lrx_phdf5_* through liblorrax_ffi_host.so.  Both declare
@@ -435,6 +514,11 @@ def _declare_cuda_stack(lib: ctypes.CDLL) -> None:
         ctypes.POINTER(ctypes.c_int),
     ]
     lib.lrx_version_info.restype = ctypes.c_int
+
+
+#: Leg key -> the declarations of that leg's device-runtime entry points
+#: (communicator and solver contexts).  A leg with none has no row.
+_DEVICE_STACK_DECLARATIONS = {"CUDA": _declare_cuda_stack}
 
 
 def _declare_phdf5(lib: ctypes.CDLL) -> None:
@@ -511,6 +595,15 @@ def _declare_phdf5(lib: ctypes.CDLL) -> None:
             ctypes.POINTER(ctypes.c_int64),      # pinned + read staging bytes
         ]
         lib.lrx_phdf5_staging_totals.restype = ctypes.c_int
+    if hasattr(lib, "lrx_phdf5_post_control"):
+        lib.lrx_phdf5_post_control.argtypes = [
+            ctypes.c_uint64, ctypes.c_int64,     # buffer address, handler kind
+            ctypes.POINTER(ctypes.c_int64), ctypes.c_int64]
+        lib.lrx_phdf5_post_control.restype = ctypes.c_int
+        lib.lrx_phdf5_retract_control.argtypes = [ctypes.c_uint64, ctypes.c_int64]
+        lib.lrx_phdf5_retract_control.restype = ctypes.c_int
+        lib.lrx_phdf5_pending_controls.argtypes = []
+        lib.lrx_phdf5_pending_controls.restype = ctypes.c_int64
     if hasattr(lib, "lrx_phdf5_close_timed"):
         lib.lrx_phdf5_close_timed.argtypes = [
             ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
@@ -556,6 +649,11 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
         # failing the whole load; the corresponding Python wrappers raise
         # a clear AttributeError only if actually called.
         if not hasattr(lib, cpp_symbol):
+            continue
+        # A handler whose library another leg serves in this process is not
+        # registered: nothing can run it (probe_target and the call sites
+        # refuse it by name, native_provider.refuse_if_borrowed).
+        if _native.borrowed_families(platform, target_name):
             continue
         fn = getattr(lib, cpp_symbol)
         try:
@@ -609,7 +707,7 @@ def probe_target(target_name: str, platform: str) -> tuple[bool, str]:
     if sym is None:
         return False, (f"unknown target: {target_name!r} is not a target of "
                        f"the {platform} FFI library (known: "
-                       f"{', '.join(sorted(spec['targets']))})")
+                       f"{', '.join(sorted(spec['targets'])) or 'none yet'})")
     try:
         lib = get_lib(platform)
     except Exception as exc:
@@ -618,11 +716,14 @@ def probe_target(target_name: str, platform: str) -> tuple[bool, str]:
             f"{type(exc).__name__}: {exc}  "
             f"NOTE: this says nothing about whether {target_name} is "
             f"compiled — fix the library path/dependencies first "
-            f"(LORRAX_FFI_SO / LORRAX_FFI_HOST_SO select the .so; "
+            f"({spec['env']} selects the .so; "
             f"LD_LIBRARY_PATH must cover every library that .so needs — "
             f"on Frontera that is the vendor BLAS/ScaLAPACK (MKL) + the "
             f"Intel compiler runtime + parallel HDF5 + libfabric + "
             f"SLATE's lib64; run `ldd <so>` to see which are missing).")
+    borrowed = _native.borrowed_reason(platform, target_name)
+    if borrowed:
+        return False, borrowed
     if not hasattr(lib, sym):
         return False, (
             f"loaded {_loaded_path(platform)} but it does not export {sym} — "
@@ -801,65 +902,25 @@ def has_phdf5_write(platform: str) -> bool:
 # in the ODR fix touches that.  Retiring the pre-open would re-open the eight
 # ``FAILED_PRECONDITION: slate.potrf: blas::get_device_count()=0`` cells.
 # ``test_so_acceptance.py``'s check 5 is what will say when it CAN go.
-_CUDA_FIRST_TRIED = False
+#: Device legs this loader has already tried to open ahead of the host leg.
+_ACCELERATOR_FIRST_TRIED: set = set()
 
 
-def _nvidia_device_visible() -> bool:
-    """A GPU device node this process can see.
+def _open_accelerator_before_host() -> None:
+    """Win the ``libslate``/``libblaspp`` SONAME for the device build.
 
-    Split out from :func:`_process_can_use_cuda` so its cells can construct
-    both answers without monkeypatching ``glob``/``os.path`` for the whole
-    session -- the hardware half of the question is the one a pure test
-    cannot arrange for real.
+    Only where this process can host a device leg
+    (:func:`lxkit.legs.process_accelerator_leg`: ``JAX_PLATFORMS`` and a
+    visible, unmasked device node, decided without initialising a backend):
+    a CPU-platform process opens the host library and nothing else.  A
+    best-effort open: a missing device library is the device leg's own
+    refusal, raised where that leg is requested.
     """
-    return (any(Path("/dev").glob("nvidia[0-9]*"))
-            or Path("/dev/nvidiactl").exists())
-
-
-def _process_can_use_cuda() -> bool:
-    """Can THIS process run CUDA work at all?  Environment only.
-
-    TRUTHFUL AT LOAD TIME is the whole requirement, and it rules out the
-    obvious answer: ``jax.default_backend()`` INITIALIZES the XLA backend
-    (the reason :func:`get_lib` takes an explicit platform at all), so
-    asking it from inside a loader call would make the loader decide the
-    process's backend.  Both signals below are ones JAX itself acts on and
-    both are readable before any backend exists:
-
-      * ``JAX_PLATFORMS`` -- :func:`platform_from_env` resolves it exactly
-        as JAX picks its default backend (first entry wins).  ``cpu`` there
-        forbids a GPU backend outright, so no CUDA handler in this process
-        can ever run and there is nothing for the load order to protect.
-      * A VISIBLE NVIDIA DEVICE.  ``CUDA_VISIBLE_DEVICES=""`` is this
-        tree's spelling of "no GPU, deliberately", and JAX's own
-        ``backends()`` skips cuda when no device node is visible
-        (``xla_bridge.py``: ``if platform == "cuda" and not
-        has_visible_nvidia_gpu(): continue``).  Same two signals in the
-        same order as ``runtime._gpu_is_present`` -- the call this tree
-        already makes, made the same way, so the two cannot drift into
-        disagreeing about what platform a process is.
-
-    Deliberately NOT a probe of the library.  "Is the CUDA .so loadable
-    here" is a different question and the best-effort ``try`` in
-    :func:`_open_cuda_before_host` is what answers it.
-    """
-    return _native.process_can_use_cuda(device_visible=_nvidia_device_visible)
-
-
-def _open_cuda_before_host() -> None:
-    """Win the ``libslate``/``libblaspp`` SONAME for the CUDA build.
-
-    Only where there is a CUDA build in the running to win it: a
-    CPU-platform process opens the host library and nothing else.
-    """
-    global _CUDA_FIRST_TRIED
-    if _CUDA_FIRST_TRIED or "CUDA" in _LIBS:
+    key = accelerator_leg_to_open_first("cpu", _LIBS, _ACCELERATOR_FIRST_TRIED)
+    if key is None:
         return
-    if not _process_can_use_cuda():
-        return
-    _CUDA_FIRST_TRIED = True
     try:
-        get_lib("CUDA")
+        get_lib(key)
     except Exception:                                          # noqa: BLE001
         pass
 
@@ -884,13 +945,13 @@ def _assert_one_mapped_mpi_runtime() -> None:
 def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     """Return the loaded FFI library for ``platform``; idempotent.
 
-    ``platform`` is "CUDA" or "cpu"; ``None`` follows the JAX default
-    backend, so wrapper call sites stay platform-agnostic.
+    ``platform`` is a :data:`lxkit.legs.LEGS` key; ``None`` follows the JAX
+    default backend, so wrapper call sites stay platform-agnostic.
 
-    In a CUDA-CAPABLE process, opening the ``cpu`` library opens the
-    ``CUDA`` one first — see the SONAME note above; it is a correctness
+    In a process that can host a device leg, opening the ``cpu`` library
+    opens that leg's first — see the SONAME note above; it is a correctness
     requirement, not a warm-up.  In a CPU-platform process it does NOT:
-    there is no CUDA handler to protect and the mixed load costs that
+    there is no device handler to protect and the mixed load costs that
     process its host phdf5 path.
     """
     if platform is None:
@@ -903,7 +964,7 @@ def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     if lib is not None:
         return lib
     if platform == "cpu":
-        _open_cuda_before_host()
+        _open_accelerator_before_host()
         lib = _LIBS.get(platform)
         if lib is not None:                    # re-entrancy, not reachable today
             return lib
@@ -1083,6 +1144,43 @@ def phdf5_staging_totals(ctx_handle: int = 0,
     staged = ctypes.c_int64(0)
     fn(int(ctx_handle), ctypes.byref(n_live), ctypes.byref(staged))
     return int(n_live.value), int(staged.value)
+
+
+#: Handler kinds of the posted-control registry (cpp/phdf5/ctx.h ControlKind).
+PHDF5_CONTROL_KIND = {"read": 1, "read_multi": 2, "write": 3, "write_independent": 4,
+                      "read_kchunk_union": 5}
+
+
+def phdf5_post_control(address: int, kind: str, values, *, platform: str) -> None:
+    """Post one call's control values under its own buffer ``address`` (ABI 7).
+
+    Process-local; the handler of ``kind`` takes them by the address of the
+    buffer it is handed.  Refuses (GATE phdf5_posted_control) when an entry
+    for this address and kind is already pending, which would be two calls on
+    one buffer in flight.
+    """
+    lib = get_lib(platform)
+    # Addresses travel as int64 (two's complement above 2**63).
+    vals = [int(x) - (1 << 64) if int(x) >= (1 << 63) else int(x) for x in values]
+    buf = (ctypes.c_int64 * max(len(vals), 1))(*vals)
+    rc = lib.lrx_phdf5_post_control(
+        ctypes.c_uint64(int(address)), PHDF5_CONTROL_KIND[kind], buf, len(vals))
+    if rc != 0:
+        raise RuntimeError(
+            f"GATE phdf5_posted_control: got: a {kind} control already pending for buffer "
+            f"0x{int(address):x}; want: one call in flight per buffer and kind; why: the "
+            f"handler finds its control by its buffer's address")
+
+
+def phdf5_retract_control(address: int, kind: str, *, platform: str) -> bool:
+    """Withdraw a post whose call did not dispatch; True when one was pending."""
+    return get_lib(platform).lrx_phdf5_retract_control(
+        ctypes.c_uint64(int(address)), PHDF5_CONTROL_KIND[kind]) == 0
+
+
+def phdf5_pending_controls(*, platform: str) -> int:
+    """Posted controls no handler has taken yet (0 when no call is in flight)."""
+    return int(get_lib(platform).lrx_phdf5_pending_controls())
 
 
 # Mapping from numpy/jax dtype to the integer tag matching xla::ffi::DataType.

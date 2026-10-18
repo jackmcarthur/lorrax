@@ -81,7 +81,7 @@ def test_chi_vertex_sign_acts_on_k_rows(backend):
     sign[:2] = (1.0, -1.0)                              # both signs present
     left = (((0, 1), (1, 1j)), ((1, 0), (-1, 1j)))       # (perm, phase) monomial vertices
     right = (((1, 0), (1j, -1)),)
-    mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+    mesh = Mesh(np.array(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
     with (F.xla_reference() if backend == "xla" else contextlib.nullcontext()):
         assert F.kconv_backend(mesh, KG) == backend
         fn = F.make_kconv_chi_vertex(mesh, KG, tables, left_vertices=left, right_vertices=right,

@@ -282,7 +282,8 @@ class TimingSection:
 		# most important time not to leave a false heartbeat behind.
 		watcher_failed = False
 		try:
-			if exc_type is None and self._watchers:
+			# Watchers only make the clock honest: they run under stage_sync() alone.
+			if exc_type is None and self._watchers and stage_sync():
 				for watcher in self._watchers:
 					watcher()
 		except BaseException:
@@ -773,6 +774,41 @@ def report(
 	wall: float | None = None,
 ) -> None:
 	_GLOBAL_COLLECTOR.report(print_fn=print_fn, title=title, min_percent=min_percent, max_depth=max_depth, wall=wall)
+
+
+_STAGE_SYNC: bool | None = None
+
+
+def stage_sync() -> bool:
+	"""Whether stage clocks wait for their device work (``LORRAX_STAGE_SYNC``, default off).
+
+	Off (production): no timing-only ``block_until_ready`` runs -- a hot path does no
+	host-device synchronization to make a clock honest.  A section's clock then stops when
+	its host work (dispatch included) returns, and device work it enqueued is charged to
+	the first later section that needs a value from it (a host read, a file write, a
+	barrier): the run's total wall is exact, a stage row is host-attributed.
+	``LORRAX_STAGE_SYNC=1`` restores every timing-only wait -- section watchers
+	(``timed(watch=True)``, ``TimingSection.watch``), :func:`stage_wait` boundaries and
+	progress milestones -- so each row is its stage's own device time (profiling; the
+	pre-switch behaviour).  Read once per process; every rank reads the same environment.
+	"""
+	global _STAGE_SYNC
+	if _STAGE_SYNC is None:
+		from runtime.env_flags import env_bool
+		_STAGE_SYNC = env_bool("LORRAX_STAGE_SYNC", False)
+	return _STAGE_SYNC
+
+
+def stage_wait(*values: Any) -> None:
+	"""``jax.block_until_ready(values)`` under :func:`stage_sync`; nothing otherwise.
+
+	For waits whose only purpose is to charge pending device work to a stage row.  A wait
+	that a host decision needs (a value read, a buffer reused, memory released to a ledger)
+	is not a stage wait and stays unconditional at its site.
+	"""
+	if stage_sync():
+		import jax
+		jax.block_until_ready(values)
 
 
 def fence(name: str, *, sync_ranks: bool = True) -> None:

@@ -42,13 +42,8 @@
 
 #pragma once
 
-// LORRAX_FFI_NO_CUDA is defined by the host-platform build only (see
-// cpp/CMakeLists.txt, `target_compile_definitions(lorrax_ffi_host ...)`), so
-// it is the same seam the rest of the shared TUs already switch on.  Keep it
-// that way: a SECOND way to ask "which leg is this" is a second thing to get
-// out of sync.
-#ifdef LORRAX_FFI_NO_CUDA
-#  define LRX_C_ENTRY(name) name##_host
-#else
-#  define LRX_C_ENTRY(name) name
-#endif
+// The suffix is the leg's (common/leg.h: `_host`, none on CUDA, `_rocm`),
+// the one place that answers "which leg is this".  Keep it that way: a
+// SECOND way to ask is a second thing to get out of sync.
+#include "leg.h"
+#define LRX_C_ENTRY(name) LRX_LEG_PASTE(name)

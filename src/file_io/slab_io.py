@@ -415,6 +415,7 @@ class SlabIO:
         global_shape: Sequence[int] | None = None,
         valid_shape: Sequence[int] | None = None,
         dtype=None,
+        require_finite: bool = False,
     ) -> None:
         """Write A as a hyperslab of dataset ``name``.
 
@@ -443,6 +444,14 @@ class SlabIO:
         whose last chunk is short).  An override that overruns the
         dataset refuses, on every rank.  ``global_shape`` is likewise
         only needed when ``write_slab`` has to create the dataset.
+
+        ``require_finite=True`` refuses a NaN/Inf anywhere in ``A``.  The
+        check runs where the bytes already are on the host -- the writer's
+        own staging copy (FFI tier; a rank holding a non-finite value
+        writes nothing and every rank raises at the next read or at
+        :meth:`close`) or the serial tier's host blocks (raises here,
+        before anything is written) -- so it costs no device reduction and
+        no device-to-host read of its own.
         """
         with _journal.op_scope("write", self.path, stack=self._stack, ds=name,
                                off=offset, cnt=tuple(A.shape) if hasattr(
@@ -453,6 +462,7 @@ class SlabIO:
                 offset=offset, global_shape=global_shape,
                 valid_shape=valid_shape,
                 dtype=dtype,
+                require_finite=require_finite,
             )
 
     # ------------------------------------------------------------------
@@ -567,6 +577,49 @@ class SlabIO:
         with _journal.op_scope("read", self.path, stack=self._stack, ds=name,
                                mode=self.mode, handle=self._handle()):
             return self._backend.read_whole(name, dtype=dtype)
+
+    # ------------------------------------------------------------------
+    @timed("read_multi_dispatch")
+    def read_multi(self, requests, *, partition_spec, mesh=None) -> list:
+        """Read N hyperslabs of N datasets of this file in ONE collective call.
+
+        ``requests`` is a sequence of dicts with the :meth:`read_slab` keys
+        ``name``, ``shape``, ``offset`` and optionally ``valid_shape`` and
+        ``dtype``; every request has the same rank and is sharded by the one
+        ``partition_spec``.  Returns the N ``jax.Array`` values, each exactly
+        what :meth:`read_slab` returns for its request (same placement, same
+        zero padding past ``valid_shape``, same bytes).
+
+        COLLECTIVE like :meth:`read_slab`: every rank passes the same list in
+        the same order.  On the collective tier it is ONE ``PhdfReadMulti``
+        dispatch (``H5Dread_multi``, HDF5 >= 1.14) with ONE replicated
+        descriptor table, where N ``read_slab`` calls cost N dispatches,
+        3 N descriptor puts, N collective rendezvous and N host syncs.  The
+        outputs are the N XLA result buffers, written by the handler's H2D
+        copies; nothing else is allocated on the device.
+
+        NOT SYNCHRONOUS, unlike :meth:`read_slab`: it returns once the read is
+        enqueued.  The values are ordinary arrays (a consumer simply waits on
+        them); the handle's next HDF5 entry point, and its close, wait for the
+        read, as for :meth:`read_slabs`.
+
+        A request whose payload :meth:`read_slab` would move as bounded file
+        rows (large, fully distributed) is read that way, by the same route;
+        a zero-size request is zeros without I/O.  HDF5 refuses two
+        selections of one multi-dataset read that share a file address, so an
+        identical request (a repeated parent) is read once and its value
+        shared, and requests whose boxes overlap on one dataset go in a later
+        disjoint wave (one more dispatch; normally there is one wave).  A
+        library without the handler refuses (GATE slab_io_read_multi).
+        """
+        requests = list(requests)
+        first = requests[0]["name"] if requests else "-"
+        with _journal.op_scope("read", self.path, stack=self._stack,
+                               ds=f"{first}+{max(len(requests) - 1, 0)}",
+                               off=f"multi{len(requests)}", mode=self.mode,
+                               handle=self._handle()):
+            return self._backend.read_multi(
+                requests, partition_spec=partition_spec, mesh=mesh or self.mesh)
 
     # ------------------------------------------------------------------
     @timed("read_union_dispatch")

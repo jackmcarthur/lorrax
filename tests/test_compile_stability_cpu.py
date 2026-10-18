@@ -16,6 +16,8 @@ shape, not on a timing:
 5. Face constructor rounds share one width, the ragged tail included.
 6. The batch-layout eigh takes its real-row count as an operand: one program
    per stack serves every count.
+7. The Dyson response programs key on the LU plan's decision, never on the
+   room that decides it (COMPILEAUDIT rule 4).
 """
 import os
 import subprocess
@@ -107,6 +109,9 @@ class _CheckedPlan:
     def describe(self):
         return "checked test plan"
 
+    def decision(self, A, *args):
+        return ("checked",)
+
     def batched(self, A, *rest, **kwargs):
         from distrib_la import _result_check as rc
         if self.op == "eigh":
@@ -127,18 +132,30 @@ def _matmul(a, b, *, transa="N", transb="N", **kwargs):
 
 
 @pytest.fixture
-def checked_service(monkeypatch):
+def fresh_bank(monkeypatch):
+    """response_bank's program caches, empty before and after the test."""
+    import distrib_la
+    from gw import response_bank as rb
+    monkeypatch.setattr(distrib_la, "matmul", _matmul)
+    monkeypatch.setattr(rb, "_VARIANTS", {})
+    rb._response_programs.cache_clear()
+    yield rb
+    rb._response_programs.cache_clear()
+
+
+@pytest.fixture
+def checked_service(monkeypatch, fresh_bank):
     import distrib_la
     monkeypatch.setattr(distrib_la, "plan", _CheckedPlan)
-    monkeypatch.setattr(distrib_la, "matmul", _matmul)
 
 
 def test_response_programs_have_no_host_callback(checked_service):
     from gw import response_bank as rb
     mesh, n, nq = _mesh(), 8, 2
     face = jax.ShapeDtypeStruct((nq, n, n), jnp.complex128, sharding=NamedSharding(mesh, P(None, "x", "y")))
-    dyson, slope, moments, _ = rb._response_programs.__wrapped__(
-        mesh, n, "distributed", "auto", 0.5, False, None)
+    built = rb._response_programs(mesh, n, "distributed", "auto", 0.5, False, None)
+    dyson, moments, _ = built.bind(None)
+    slope = built.slope
     sqrt_v = rb._coulomb_algebra.__wrapped__(mesh, n, n, "distributed")
     counts = {"dyson.value": _host_callbacks(dyson.value.lower(face, face)),
               "slope": _host_callbacks(slope.lower(face, face, face)),
@@ -147,9 +164,69 @@ def test_response_programs_have_no_host_callback(checked_service):
     assert counts == dict.fromkeys(counts, 0)
 
 
+@pytest.mark.parametrize("photon", [False, True])
+def test_response_programs_key_on_the_solve_decision_not_the_room(fresh_bank, monkeypatch, photon):
+    """The Dyson programs key on the real LU plan's decision (COMPILEAUDIT rule 4) on the CUDA
+    room leg (stood in for; no library on this host), whose one_device bound moves with any
+    room: a room that moves without moving the rounds traces and lowers nothing again; one
+    that changes them takes a new variant.  Photon: value, pair and moments all solve."""
+    import importlib
+    from distrib_la._one_device import one_device_bytes
+    rb = fresh_bank
+    for mod in ("distrib_la.resolve", "distrib_la._one_device"):
+        monkeypatch.setattr(importlib.import_module(mod), "mesh_platform", lambda m: "CUDA")
+    monkeypatch.setattr(importlib.import_module("distrib_la.plan"), "_MEASURED", {})
+    mesh, n, nq = _mesh(), 8, 2
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    x = [jax.device_put(0.01 * _hermitian(n, nq, seed=s), face) for s in range(6)]
+    root = jax.device_put(0.1 * _hermitian(n, nq, seed=9), face)
+    built = rb._response_programs(mesh, n, "distributed", "auto", 0.5, False, 1.0 if photon else None)
+    calls = ({"value": (root, x[0], x[1]), "pair": (root, x[0], x[2], x[1], x[3]),
+              "moments": (root, x[2], x[3], x[4], x[5], x[1])} if photon else
+             {"value": (root, x[0]), "pair": (root, x[0], x[1])})
+    lowerings = _lowerings()
+
+    def run(room):
+        dyson, moments, _ = built.bind(room)
+        progs = {"value": dyson.value, "pair": dyson.pair("face"), "moments": moments}
+        return {k: (progs[k].resolve(*a), [np.asarray(v) for v in jax.tree.leaves(progs[k](*a))])
+                for k, a in calls.items()}
+    first = run(10 ** 10)
+    lowered = len(lowerings)
+    assert lowered >= len(calls)
+    moved = run(10 ** 10 + 10 ** 7)            # another one_device bound, the same rounds
+    assert len(lowerings) == lowered
+    flipped = run(one_device_bytes("solve_lu", n))     # bound n: one matrix a round
+    for k in calls:
+        assert moved[k][0] is first[k][0] and flipped[k][0] is not first[k][0]
+        for a, b, c in zip(first[k][1], moved[k][1], flipped[k][1]):
+            np.testing.assert_array_equal(b, a)
+            np.testing.assert_allclose(c, a, rtol=1e-12, atol=1e-14)
+    assert sorted({d for (*_, d) in rb._VARIANTS}) == [("one_device", "backend_batched", 1),
+                                                       ("one_device", "backend_batched", 2)]
+    assert built.bind(10 ** 10)[0].value == built.bind(10 ** 10)[0].value   # a value, not an identity
+
+
+def _stack_matches_single(stacked, single):
+    """A stacked solve against the one-matrix solve of the same matrix.
+
+    cpu: bit for bit (LAPACK ``heevd`` runs matrix by matrix either way).  A GPU's eigh
+    depends on the stack: jaxlib's cuSOLVER ``syevd`` solves a stack of n <= 32 matrices
+    with batched Jacobi and one matrix with divide and conquer, and its eigenvectors differ
+    in the last bits at n = 40 and 64 too (A100, jax 0.9.1).  Both are backward stable, so
+    a gauge-free result agrees to rounding (measured <= 2.3e-15 relative).
+    """
+    a, b = np.asarray(stacked), np.asarray(single)
+    if jax.default_backend() == "cpu":
+        assert np.array_equal(a, b)
+    else:
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-13 * np.max(np.abs(b)))
+
+
 def test_polar_stack_has_no_host_callback():
     """The parallel-transport link stack (``PolarPlan.batched``, distributed route) is
-    cacheable, and each link is that matrix's own polar factor, bit for bit."""
+    cacheable, and each link is that matrix's own polar factor: bit for bit on cpu, to
+    rounding on a GPU (:func:`_stack_matches_single`)."""
     from distrib_la import polar
 
     class _CheckedEigh(_CheckedPlan):
@@ -167,15 +244,16 @@ def test_polar_stack_has_no_host_callback():
     assert _host_callbacks(call.lower(a)) == 0
     for i in range(2):
         one_link, one_s = plan(jax.device_put(a[i], tile))
-        assert np.array_equal(np.asarray(link[i]), np.asarray(one_link))
-        assert np.array_equal(np.asarray(s[i]), np.asarray(one_s))
+        _stack_matches_single(link[i], one_link)
+        _stack_matches_single(s[i], one_s)
     u, _, vh = np.linalg.svd(np.asarray(a))
     np.testing.assert_allclose(np.asarray(link), u @ vh, atol=1e-12)
 
 
 def test_zeta_factor_has_no_host_callback(capsys):
     """The charge ζ factor, replicated and q-parallel, holds no host callback; its
-    rank receipt prints on the host, and the two schedules agree bit for bit."""
+    rank receipt prints on the host, and the two schedules agree: B bit for bit on cpu,
+    the gauge-free C⁺ = B Bᴴ to rounding on a GPU (:func:`_stack_matches_single`)."""
     from isdf import core
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
     c = jax.device_put(_hermitian(8, b=4, seed=5), NamedSharding(mesh, P(None, "x", "y")))
@@ -184,7 +262,10 @@ def test_zeta_factor_has_no_host_callback(capsys):
     programs = [cache[next(k for k in cache if k[1:] == (4, 8, 8, 1e-8))]
                 for cache in (core._replicated_chol_cache, core._qparallel_factor_cache)]
     assert [_host_callbacks(p.lower(c)) for p in programs] == [0, 0]
-    assert np.array_equal(np.asarray(f), np.asarray(g))
+    if jax.default_backend() == "cpu":
+        assert np.array_equal(np.asarray(f), np.asarray(g))
+    else:   # B's columns carry the eigensolver's phase; C⁺ = B Bᴴ does not
+        _stack_matches_single(*(b @ jnp.conj(jnp.swapaxes(b, -1, -2)) for b in (f, g)))
     assert capsys.readouterr().out.count("[zeta rank_truncate] n_log=8 rcond=1.0e-08 n_keep/q=[8 8 8 8]") == 2
 
 

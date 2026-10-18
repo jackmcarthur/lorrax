@@ -254,9 +254,16 @@ Nothing crosses the host.
 ### The eigh-stack API {#eigh-stack}
 
 A caller that holds a face stack `(B, n, n)` passes its room per rank beside
-its own live set, `plan('eigh', mesh, n=n, backend='distributed',
+its own live set, `plan('eigh', mesh, n=n, backend=request,
 budget_bytes=room)`, and the service decides each stack (`Plan.stack_route`,
-a `StackRoute`):
+a `StackRoute`). `request` is the deck's eigh request
+(`LinalgResolution.eigh_backend`): `distributed` under `linalg = distributed`,
+which refuses at plan time where the leg has no distributed eigh; `auto` under
+`linalg = local`, whose whole-mesh provider is the platform's `distributed`
+backend when it resolves on the mesh (`resolve.resolve_eigh_capacity`; the plan
+then equals the explicit one) and otherwise none: the plan is native, runs
+route (c), and refuses by name at the first stack that needs the whole mesh
+(`GATE eigh_capacity_route`, `Plan.require_capacity`), announced once on rank 0.
 
 - **Route (c)** when the program that runs the stack, priced from the shapes
   (`_stack_price`: `BATCH_EIGH_TILES` = 8 n² per whole matrix a rank holds,
@@ -268,13 +275,25 @@ a `StackRoute`):
   holds the whole chain. The most whole matrices per rank that fit win, and
   the stack runs in that many slices, one `lax.scan` over slice starts writing
   the face outputs in place.
-- **The whole-mesh provider** otherwise, including room 0.
+- **The whole-mesh provider** otherwise, including room 0 (an `auto` plan
+  with no provider refuses here; its checked retry stays on route (c)).
 - **Every rank decides alike.** The candidates and their prices follow from
   the shape and the room only: nothing is compiled to be measured and no size
   is exchanged between ranks.
 - **One plan per room.** A plan carries one room; a caller that keys
   programs on the plan (the scalar face constructor floors its rooms to whole
-  GiB) compiles again when its room changes.
+  GiB) compiles again when its room changes. A caller that keys them on the
+  plan's decision does not (next paragraph).
+- **Decision-keyed programs.** `Plan.decision(A, *args)` returns, host-side
+  on arrays or `jax.ShapeDtypeStruct`s, the `(backend, route, rounds)` that
+  `batched` traces for that call signature: the route (`route_for`) and, on
+  `one_device`'s stacked entry, its round count (the
+  [measured size route's](backends.md#measured-route), else the round rule
+  against the bound). `batched` runs from the same private `Plan._decide`, so
+  the two cannot disagree. The room enters a program only through this tuple:
+  a caller that caches programs per (signature, decision) compiles once per
+  decision, not per room (`gw.response_bank`'s Dyson programs do). An eigh plan
+  with a room decides per stack (`stack_route`) and refuses `decision`.
 - **Reporting.** Each decision is printed once per (op, B, n, dtype, room,
   phase: first attempt or whole chain) by `new_stack_routes()`, which a driver prints through its
   reporter, and listed by `describe()`. `known_route` is the pure query for

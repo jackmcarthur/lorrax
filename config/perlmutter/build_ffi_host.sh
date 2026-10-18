@@ -497,6 +497,15 @@ unset _dynsyms
 # gates that moved into scripts/verify_ffi_build.sh, which runs it below with
 # the same SLATE LD_LIBRARY_PATH this script would have used.
 
+# Dependency closure (lxkit.native_provider): the SLATE install and the pinned
+# MPI/HDF5/LibSci files, recorded beside the leg; the loader opens exactly those
+# and refuses a process that maps another copy of any of them.
+"$LORRAX_ROOT/.venv/bin/python" "$LORRAX_ROOT/src/ffi/cpp/stage/write_checkout_closure.py" \
+    "$SO_FILE" --private-dir "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" \
+    --library-dirs "$LORRAX_PM_RUNTIME_LIB_DIRS" || {
+        echo "[build_ffi_host] FAILED: dependency closure" >&2; exit 1; }
+_closure_sha="$("$LORRAX_ROOT/.venv/bin/python" -c 'import json,sys; print(json.load(open(sys.argv[1]))["record_sha256"])' "$SO_FILE.closure.json")"
+
 # The Perlmutter host recipe builds ALL FIVE host backends.  Declaring it is
 # what turns "ScaLAPACK/BLACS not found" from a CMake WARNING into a build
 # failure — the Aug-7 deployed library shipped with scalapack=0 because
@@ -539,10 +548,11 @@ GATE_TAG=build_ffi_host \
     "hdf5=$LORRAX_PM_HDF5" \
     "phdf5_stage=$LORRAX_PM_PHDF5_STAGE" \
     "fftw=$LORRAX_PM_FFTW" \
-    "slate=$LORRAX_SLATE_HOST_INSTALL_DIR" || {
+    "slate=$LORRAX_SLATE_HOST_INSTALL_DIR" \
+    "closure_sha256=$_closure_sha" || {
         echo "[build_ffi_host] WARNING: provenance stamp failed" >&2
     }
 
 echo
 echo "[build_ffi_host] done.  .so at: $SO_FILE"
-echo "[build_ffi_host] unsealed, it finds SLATE only on LD_LIBRARY_PATH; seal_bundle.py makes the pair."
+echo "[build_ffi_host] the loader opens and enforces $(basename "$SO_FILE").closure.json; seal_bundle.py makes the pair."

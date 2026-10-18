@@ -32,8 +32,10 @@ All arrays are complex128 (16 B) unless stated.
 Every planner prices its stage against one number per device, the budget `B`
 (`common.gpu_utils.device_budget_bytes`, `src/common/gpu_utils.py:71`). One
 rule sets `B` from two quantities known before the deck is read: `M`, the
-card total (`cuDeviceTotalMem`, `runtime.xla_memory.cuda_device_total_bytes`,
-`src/runtime/xla_memory.py:81`), and `O`, the bytes the process holds
+card total (`runtime.xla_memory.device_total_bytes`, through the device leg's
+declared reader, `PlatformLeg.device_memory_api` in `lxkit.LEGS`:
+`cuDeviceTotalMem` on CUDA, `hipDeviceTotalMem` from the ROCm plugin's own
+HIP runtime on ROCm), and `O`, the bytes the process holds
 outside XLA's memory pool. This section defines the pool, states the rule,
 explains why the pool's reserved bytes can run past its reservation, and
 says which part of that the rule has to price.
@@ -65,17 +67,24 @@ The card's free bytes are `F(t) = M − O(t) − V(t)`.
 ### The rule {#rule}
 
 ```text
-B = (M − 1.2·O) / (1 + 1.2·φ)     the planner budget   (runtime.planner_budget_bytes, src/runtime/__init__.py:812)
+B = (M − 1.2·O) / (1 + 1.2·φ) − T_ord   the planner budget   (runtime.planner_budget_bytes, src/runtime/__init__.py:812)
 R = M − 1.2·O_max                 the pool's reservation (runtime.pool_reservation_bytes, :797; runtime.pool_fraction = R/M)
 ```
 
-`O` is 3 GB (`OUTSIDE_POOL_BYTES`), plus 3 GB under `linalg = distributed`
+`O` is 3 GB (`OUTSIDE_POOL_BYTES`; a device leg may declare its own, `PlatformLeg.outside_pool_bytes`: 4.1 GB on ROCm, where ROCr keeps reclaimed-off scratch outside the arena, see the ROCm arena paragraph below), plus 3 GB under `linalg = distributed`
 for the cuSOLVERMp/cuBLASMp contexts, their communicators and workspace
 (`DISTRIBUTED_LINALG_OUTSIDE_BYTES`; `O_max` = 6 GB). `φ` = 0.19
 (`POOL_OVERSHOOT`, `:802`) is the fraction by which the pool's in-use bytes
 `U` may run above the budget the planners priced: peaks they under-price,
 and free space trapped between live buffers ([§ what φ covers](#what-phi-covers)).
-1.2 is the margin (`MEMORY_MARGIN`). `B` is at most `R` and at least `M/4`.
+1.2 is the margin (`MEMORY_MARGIN`). `T_ord` is the one named cap of the
+rank-order reductions' transient inside the pool, `lxkit.ORDERED_TRANSIENT_SLABS` (2)
+slabs of `LORRAX_ORDERED_SLAB_MB` (8 MiB) = 16 MiB
+(`runtime.ordered_reduction_transient_bytes`). It is fixed: an ordered all-reduce
+or reduce-scatter of any operand size holds at most two slabs beyond the library
+collective ([rank-order reductions](../environment/transports.md#rank-order-reductions)),
+so it comes off `B` once and every planner and route (`admit_local`'s room is `B`
+less the live stages) sees it. `B` is at most `R` and at least `M/4`.
 
 | card | M | R | B, linalg local | B, linalg distributed |
 |---|---|---|---|---|
@@ -232,8 +241,21 @@ and 15.1 GB on A100-80GB for these two terms.
 
 ### The allocator {#allocator}
 
-`cuda_async` with its pool reserved is the one allocator configuration
-([environment § GPU pool](../environment/overview.md#gpu-pool)). The
+`cuda_async` with its pool reserved is the one allocator configuration on
+CUDA ([environment § GPU pool](../environment/overview.md#gpu-pool)); the
+allocator is the device leg's declaration (`PlatformLeg.xla_allocator`), and
+the ROCm leg declares BFC (`cuda_async` does not exist there), preallocated at
+`R` like the CUDA pool: 60.18 of 68.70 GB (61.50 GB before the leg's O of 4.1 GB) on an MI250X GCD instead of jaxlib's
+75 % (51.53 GB), so the planner budget (41.96 -> 50.08 GB on hsuite) fits in
+the arena. Outside it, after RCCL start-up, 512 MiB collectives, a 3D FFT and a
+GEMM, each P4 rank held 0.99-1.08 GB of the 7.20 GB left (hipMemGetInfo minus
+the arena's `pool_bytes`, `runtime.xla_memory.outside_pool_bytes`). With `HSA_NO_SCRATCH_RECLAIM=1` (the leg's runtime env) ROCr keeps each
+queue's largest scratch allocation: the bytes outside the arena, sampled
+every 0.25 s through whole runs, peaked at 4.07 GB per P4 rank in hsuite kmeans
+(2.71 GB with reclaim) and 3.30 GB on Fe V2 (2.13 GB), so the leg declares
+`outside_pool_bytes` = 4.1 GB. The hipFFT
+plan workspace is inside the arena and priced like cuFFT's
+(`PlatformLeg.fft_plan_scratch`, `runtime.aot_memory`). The
 alternatives jaxlib offers were measured on CrI3 6×6 bispinor SC maps 0–2
 at P4, cold, at the rule's budget (claim 4092). "Peak in use" is
 XLA's `peak_bytes_in_use`; "high-water" is the pool's reserved high-water
@@ -393,9 +415,12 @@ rank beside what is live:
 
 `S_11` is mode 11's split-arm scratch, at most one `T_p`
 (`greens_function_kernel.chi0_kconv_scratch`); it is 0 on the single pass.
-`S_7` is mode 7's, `min(R·ν, ⌊1 GiB / 16·N_k·n_s²⌋)` pairs of `16·N_k·n_s²` B,
-at most 1 GiB (`greens_function_kernel.sigma_kconv_scratch`); it is 0 on the
-single arm (bulk grids below about 14³ at n_s = 1 or 2).
+`S_7` is mode 7's, `min(R·ν, ⌊1 GiB / s⌋)` pairs of `s` B, at most 1 GiB, with
+`s = 16·N_k·n_s²` plus `16·N_k` (the chunk's pair-major `W_R`) on the m7s arm (n_s = 2
+where one padded column fits a block: 14³–21³ on an A100)
+(`greens_function_kernel.sigma_kconv_scratch` → `ffi.fft.klead_unfold_scratch_bytes`; the
+handler rounds an m7s chunk down to whole waves, so the price is its upper bound there); it is 0
+on the single arm (bulk grids below about 14³ at n_s = 1 or 2).
 
 The q-wedge Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
 rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
@@ -590,7 +615,7 @@ its executor for the module's first execution and before any of its buffers
 exist (`runtime.aot_memory.refuse_over_device`, installed by
 `common.jax_compile_cache`). When the module's buffers,
 `temp + arguments + outputs − aliased`, exceed the card's total memory
-(`cuDeviceTotalMem`), the run stops with
+(`runtime.xla_memory.device_total_bytes`), the run stops with
 
 ```text
 GATE xla_rematerialization: REFUSED module '<name>': its compiled buffers
@@ -601,7 +626,7 @@ need 137.04 GB per device (temp 125.49 + arguments 11.55 + outputs 0.22
 This is a hard device limit, not the budget: such a module cannot run on
 this card. A module
 between the budget and the card is not refused; the budget only warns. The
-check is CUDA only. It does not run at compile, because planners compile
+check runs on every GPU leg whose card total is readable (CUDA and ROCm). It does not run at compile, because planners compile
 larger candidates on purpose to read their figures and then shrink
 ([the compiled check](#the-compiled-check), the kmeans Gram width); a
 candidate that never runs is never refused.
@@ -678,7 +703,10 @@ is invisible in it. The CUDA pool behind XLA's `cuda_async` allocator keeps
 `CU_MEMPOOL_ATTR_USED_MEM_HIGH`, which a reset sets back to the bytes in use.
 `runtime.xla_memory.pool_high_water` reads and resets it at every
 `common.timing` section boundary on the main thread (two driver calls), so
-every section has its own peak on every rank. A planner records its price
+every section has its own peak on every rank. A leg without a CUDA pool (ROCm,
+jaxlib's BFC arena) reads the arena's `peak_bytes_in_use` instead, which never
+resets: a warning says so once, and a stage below an earlier mark reads as
+that mark. A planner records its price
 with `common.gpu_utils.record_stage_price(stage, bytes, section=...)`: the
 live bytes plus what it plans. What the pool cannot see: NCCL and library
 workspaces outside it (2–3 GB per rank on A100; the start-up line prints the

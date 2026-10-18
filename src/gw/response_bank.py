@@ -6,7 +6,7 @@ Disk conversion belongs to the scratch writer. Dense products and solves
 enter through ``distrib_la``.
 """
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from functools import lru_cache
 import hashlib
@@ -15,6 +15,7 @@ from pathlib import Path
 import time
 
 import jax
+from lxkit import ordered_norm, ordered_sum
 from common import timing
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
@@ -41,8 +42,10 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     Returns
     -------
     dyson, slope, moments, receipt
-        Jitted functions accepting complex128 ``[b,n,n]`` operators at
-        ``P(None,'x','y')``, and the resolved backend/prefactor description.
+        Compiled-program callables (``__call__``, ``lower``, ``finish``) accepting
+        complex128 ``[b,n,n]`` operators at ``P(None,'x','y')``, and the resolved
+        backend/prefactor description.  The programs that hold the Dyson solve are
+        keyed on its LU plan's decision, never on the room (:class:`_Decided`).
         ``dyson.value(H, chi_raw)`` returns Wc (Ry); ``slope(H, Wc, dchi_raw)``
         returns its s derivative (Ry^-1), restoring the bare operator internally (photon input is W-V). ``moments(H, A0, A1)`` takes already scaled
         bare-response expansion coefficients and returns M1/M3 (Ry^3/Ry^5).
@@ -64,9 +67,11 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     pref = _w_solve_pref_scalar(meta)
-    dyson, slope, moments, lu = _response_programs(
-        mesh_xy, n, backend, route, pref, ordered,
-        float(meta.cell_volume) if photon else None)
+    built = _response_programs(mesh_xy, n, backend, route, pref, ordered,
+                               float(meta.cell_volume) if photon else None)
+    room = _dyson_room(meta, mesh_xy, n) if backend == "distributed" else None
+    dyson, moments, lu = built.bind(room)
+    slope = built.slope
     algebra = {
         "linalg": resolution.layout,
         "solve": lu.describe(),
@@ -88,15 +93,87 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     return dyson, slope, moments, algebra
 
 
+def _dyson_room(meta, mesh_xy, n):
+    """Per-rank room of the Dyson solve, for distrib_la's size route (resolve guard 1b).
+
+    The shared ledger's room beside its bound live reservations
+    (``CapacityLedger.room_bytes_per_rank``) less the solve's own face operands (H, chi
+    and W: 3 nq n^2 complex128 over the P ranks, the pricing of ``w_isdf._dyson_route``). A shape-and-ledger rule every rank shares: no
+    exchange, no sync. None (the leg's library, never one_device) on one rank, with no
+    ledger, or with the ledger's caller lifetimes unbound (unknown live bytes are not zero).
+    """
+    ledger = getattr(meta, "shared_pole_capacity", None)
+    ranks = int(mesh_xy.size)
+    if ledger is None or ranks <= 1:
+        return None
+    try:
+        live = ledger.live_stages
+    except ValueError:
+        return None
+    faces = 16 * int(n) * int(n) * 3 * int(meta.nk_tot) // ranks
+    return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - faces)
+
+
+#: The solve-bearing programs per (builder, program, call signature, LU decision): never the room.
+_VARIANTS: dict = {}
+
+
+@dataclass(frozen=True)
+class _Decided:
+    """A solve-bearing response program keyed on the Dyson LU plan's decision.
+
+    The room enters the HLO only through ``Plan.decision`` (backend, route, rounds).  Every
+    solve in these bodies takes ``(b, n, n)`` operands at the face, ``b`` the leading
+    extent of operand 1, so each call signature takes the variant cached on ``(builder,
+    name, signature, decision)``, built with this room's plan on a miss and only ever traced
+    on that signature: a room that moves without moving the decision lowers and compiles
+    nothing again (COMPILEAUDIT 2026-10-05 rule 4).  A value (``builder`` is
+    :func:`_response_programs`' key; ``lu``, that room's plan, is not compared), so equal
+    programs compare equal.  The check-then-set needs no lock: ``compile_ahead`` lowers on
+    the calling thread (INVARIANTS 21/25).
+    """
+    builder: tuple
+    name: str
+    room: object
+    lu: object = field(compare=False, repr=False)
+
+    def resolve(self, *args):
+        """The variant program for this call signature."""
+        x, n = args[1], self.builder[1]
+        face = jax.ShapeDtypeStruct((int(x.shape[0]), n, n), x.dtype)
+        key = (self.builder, self.name, tuple((tuple(a.shape), str(a.dtype)) for a in args),
+               self.lu.decision(face, face))
+        if key not in _VARIANTS:
+            builder = _response_programs(*self.builder)
+            _VARIANTS[key] = builder.program_for(self.name, self.lu.batched)
+        return _VARIANTS[key]
+
+    def __call__(self, *args):
+        return self.resolve(*args)(*args)
+
+    def lower(self, *args):
+        return self.resolve(*args).lower(*args)
+
+    def finish(self, args, result):
+        return self.resolve(*args).finish(args, result)
+
+
 @lru_cache(maxsize=None)
 def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
-    """Reuse compiled algebra across SC maps without retaining state arrays."""
+    """Reuse compiled algebra across SC maps without retaining state arrays.
+
+    Returns the builder: ``slope``, the charge ``moments`` (no solve), and
+    ``bind(room) -> (dyson, moments, lu)`` with the Dyson LU plan ``lu`` at ``room``
+    (:func:`_dyson_room`: on every leg distrib_la takes one_device only where one whole
+    matrix fits it, else the distributed library).  On the distributed backend the
+    programs that hold the solve are :class:`_Decided`, keyed on that plan's decision and
+    never on the room that decides it; on ``off`` they solve locally and are built once.
+    """
     from types import SimpleNamespace
     from distrib_la import batch_layout, checked_program, local_batch, matmul, plan
 
-    lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
-              batched_route=route)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    key = (mesh_xy, n, backend, route, pref, ordered, volume)
 
     def program(inputs, outputs=1, resident=(), layout="face"):
         def wrap(fn):
@@ -107,8 +184,6 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                                    in_shardings=(face,) * inputs)
         return wrap
 
-    solve = jnp.linalg.solve if backend == "off" else lu.batched
-
     def mm(a, b):
         if backend == "off":
             return a @ b
@@ -118,62 +193,33 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def congruence(h, a):
         return mm(mm(h, a), h)
 
-    def wc(h, chi_raw):
-        x = pref * congruence(h, chi_raw)
-        identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
-        e = solve(identity - x, identity.copy())
-        return congruence(h, mm(x, e))
-
     def derivative(w, dchi_raw):
         # Full W on BOTH sides; no adjoint at complex frequency.
         return mm(mm(w, pref * dchi_raw), w)
 
-    @program(3)
-    def slope(h, wc, dchi_raw):
-        return derivative(wc + mm(h, h), dchi_raw)
+    def bodies(solve):
+        """The solve-bearing bodies over ``solve``: name -> (body, inputs, outputs,
+        resident, layout)."""
+        def wc(h, chi_raw):
+            x = pref * congruence(h, chi_raw)
+            identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
+            e = solve(identity - x, identity.copy())
+            return congruence(h, mm(x, e))
 
-    def pair(h, chi_raw, dchi_raw):
-        value = wc(h, chi_raw)
-        return value, derivative(value + mm(h, h), dchi_raw)
+        def pair(h, chi_raw, dchi_raw):
+            value = wc(h, chi_raw)
+            return value, derivative(value + mm(h, h), dchi_raw)
 
-    # One sample's value and slope in one program: the roots H stay laid out
-    # for every sample (no exchange), only the two chi stacks move in, and a
-    # 'batch' consumer takes both outputs without the exchange back.
-    resident = (0,) if backend == "off" else ()
-    pairs = {layout: program(3, 2, resident, layout)(pair)
-             for layout in (("face", "batch") if backend == "off" else ("face",))}
-    dyson = SimpleNamespace(value=program(2)(wc), pair=pairs.get,
-                            place=(lambda h: batch_layout(h, mesh_xy)) if resident else (lambda h: h))
+        if volume is None:
+            # One sample's value and slope in one program: the roots H stay laid out
+            # for every sample (no exchange), only the two chi stacks move in, and a
+            # 'batch' consumer takes both outputs without the exchange back.
+            resident = (0,) if backend == "off" else ()
+            out = {"value": (wc, 2, 1, (), "face")}
+            for layout in (("face", "batch") if backend == "off" else ("face",)):
+                out["pair:" + layout] = (pair, 3, 2, resident, layout)
+            return out
 
-    @program(3, 2)
-    def moments(h, a0, a1):
-        # chi_scaled=A0/s+A1/s²; whitened Dyson coefficients are
-        # B0=H A0 H, B1=H A1 H, S0=B0, S1=B1+B0².
-        b0 = congruence(h, a0)
-        b1 = congruence(h, a1)
-        return (0.5 * congruence(h, b0),
-                0.5 * congruence(h, b1 + mm(b0, b0)))
-
-    if ordered:
-        @program(5, 4)
-        def moments(h, a0, a1, o0, o1):
-            # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
-            # reversal or reality assumption; X_k = H chi_k H and
-            # Wc = H X (I-X)^-1 H. Coefficients C1..C4 of 1/z..1/z^4 keep
-            # every X1 cross term (o0 vanishes only in a complete basis).
-            # Returns M0=C1/2, M1=C2/2, M2=C3/2, M3=C4/2 (M_k = C_(k+1)/2, the
-            # constructor's convention); with o0=o1=0 the even pair reduces
-            # to the incumbent M1/M3 exactly.
-            x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
-            x11 = mm(x1, x1)
-            c2 = x2 + x11
-            c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
-            c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
-                  + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
-            return (0.5 * congruence(h, x1), 0.5 * congruence(h, c2),
-                    0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
-
-    if volume is not None:
         def infinity(v, contact):
             # chi(z)=chi_param(z)-contact, so W_inf=(I+V contact)^-1 V.
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
@@ -189,16 +235,8 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             # slope reads W = (Wc + (W_inf - V)) + V.
             value = w_minus_v(v, chi_raw, contact) - constant
             return value, derivative((value + constant) + v, dchi_raw)
-        dyson = SimpleNamespace(value=program(3)(w_minus_v),
-                                pair={"face": program(5, 2)(photon_pair)}.get,
-                                place=lambda v: v)
 
-        @program(3)
-        def slope(v, wc, dchi_raw):
-            return derivative(wc + v, dchi_raw)
-
-        @program(6, 5)
-        def moments(v, a0, a1, o0, o1, contact):
+        def photon_moments(v, a0, a1, o0, o1, contact):
             # W=W_inf + sum C_k/z^k. Dyson recurrence
             # C_k=W_inf [chi_k W_inf + sum_{i=1}^{k-1} chi_i C_(k-i)].
             # Bare coefficients are already physically scaled.
@@ -212,7 +250,66 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                 result.append(mm(winf, rhs))
             return (winf - v, *(0.5 * c for c in result))
 
-    return dyson, slope, moments, lu
+        return {"value": (w_minus_v, 3, 1, (), "face"),
+                "pair:face": (photon_pair, 5, 2, (), "face"),
+                "moments": (photon_moments, 6, 5, (), "face")}
+
+    def program_for(name, solve):
+        body, inputs, outputs, resident, layout = bodies(solve)[name]
+        return program(inputs, outputs, resident, layout)(body)
+
+    local = ({name: program_for(name, jnp.linalg.solve) for name in bodies(jnp.linalg.solve)}
+             if backend == "off" else None)
+    names = tuple(bodies(None))
+
+    def bind(room):
+        lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
+        progs = local or {name: _Decided(key, name, room, lu) for name in names}
+        pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
+        resident = backend == "off" and volume is None
+        dyson = SimpleNamespace(value=progs["value"], pair=pairs.get,
+                                place=(lambda h: batch_layout(h, mesh_xy)) if resident else (lambda h: h))
+        return dyson, progs.get("moments", moments), lu
+
+    if volume is None:
+        @program(3)
+        def slope(h, wc, dchi_raw):
+            return derivative(wc + mm(h, h), dchi_raw)
+
+        @program(3, 2)
+        def moments(h, a0, a1):
+            # chi_scaled=A0/s+A1/s²; whitened Dyson coefficients are
+            # B0=H A0 H, B1=H A1 H, S0=B0, S1=B1+B0².
+            b0 = congruence(h, a0)
+            b1 = congruence(h, a1)
+            return (0.5 * congruence(h, b0),
+                    0.5 * congruence(h, b1 + mm(b0, b0)))
+        if ordered:
+            @program(5, 4)
+            def moments(h, a0, a1, o0, o1):
+                # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
+                # reversal or reality assumption; X_k = H chi_k H and
+                # Wc = H X (I-X)^-1 H. Coefficients C1..C4 of 1/z..1/z^4 keep
+                # every X1 cross term (o0 vanishes only in a complete basis).
+                # Returns M0=C1/2, M1=C2/2, M2=C3/2, M3=C4/2 (M_k = C_(k+1)/2, the
+                # constructor's convention); with o0=o1=0 the even pair reduces
+                # to the incumbent M1/M3 exactly.
+                x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
+                x11 = mm(x1, x1)
+                c2 = x2 + x11
+                c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
+                c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
+                      + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
+                return (0.5 * congruence(h, x1), 0.5 * congruence(h, c2),
+                        0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
+
+    else:
+        @program(3)
+        def slope(v, wc, dchi_raw):
+            return derivative(wc + v, dchi_raw)
+        moments = None
+
+    return SimpleNamespace(program_for=program_for, bind=bind, slope=slope, moments=moments)
 
 
 def response_weights(wfns, meta):
@@ -571,11 +668,11 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
     return (*totals, census)
 
 
-@jax.jit
 def _odd_moment_ratios(M0, M1, M2, M3):
     # Per parent of a [b, n, n] batch: ratios of the 1/z and 1/z^3 coefficients,
-    # m0 = 2 M0 and m2 = 2 M2.
-    norm = lambda a: jnp.linalg.norm(a, axis=(-2, -1))
+    # m0 = 2 M0 and m2 = 2 M2.  Norms in rank order on each stack's own layout
+    # (lxkit.ordered_norm reads the concrete sharding).
+    norm = lambda a: ordered_norm(a, axis=(-2, -1))
     return jnp.stack([2 * norm(M0) / norm(M1), 2 * norm(M2) / norm(M3)], axis=-1)
 
 
@@ -774,7 +871,7 @@ def _operator_digest_program(mesh_xy, shape):
         g = 2 * ((q * jnp.uint64(n) + r) * jnp.uint64(m) + c)
         bits = jax.lax.bitcast_convert_type(jnp.stack([v.real, v.imag], -1), jnp.uint64)
         total = jnp.sum(bits[..., 0] * (2 * g + 1) + bits[..., 1] * (2 * g + 3), dtype=jnp.uint64)
-        return jax.lax.psum(total, ("x", "y"))
+        return jax.lax.psum(total, ("x", "y"))  # exact-reduce: uint64 checksum
     return jax.jit(shard_map(local, mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(),
                              check_vma=False))
 
@@ -858,6 +955,8 @@ def _compiled(kernel, args, *, ahead=False):
     executable or waits for it.
     """
     from common.jax_compile_cache import compile_ahead
+    if isinstance(kernel, _Decided):
+        kernel = kernel.resolve(*args)          # the variant its LU decision names
     key = (kernel, jax.tree.structure(args), tuple(
         (tuple(x.shape), str(x.dtype), getattr(x, "sharding", None))
         if hasattr(x, "shape") else x for x in jax.tree.leaves(args)))
@@ -984,8 +1083,8 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
             if (k_token == token and tuple(k_rest) == key[2:] and k_lo <= key[1][0]
                     and key[1][1] <= k_hi and not any(x.is_deleted() for x in cover[:2])):
                 a, b = key[1][0] - k_lo, key[1][1] - k_lo
-                rows = _span_rows(mesh_xy, a, b)
-                return rows(cover[0]), rows(cover[1]), list(cover[2][a:b])
+                rows, start = _span_rows(mesh_xy, b - a), _span_cursor(mesh_xy, (k_token, k_lo), a, b)
+                return rows(cover[0], start), rows(cover[1], start), list(cover[2][a:b])
     h, hi, ranks = _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute)
     if key is not None:
         for stale in [k for k in _COULOMB_ROOTS if k[0] != token]:
@@ -995,9 +1094,57 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
 
 
 @lru_cache(maxsize=32)
-def _span_rows(mesh_xy, a, b):
-    """Rows [a, b) of a face-tiled parent stack, kept on the face."""
-    return jax.jit(lambda x: x[a:b], out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+def _span_rows(mesh_xy, width):
+    """``width`` rows of a face-tiled parent stack from a placed start row, kept on the face.
+
+    One program per width: the start is an operand, so a constructor round's span
+    (a new start each round) runs the same program (a static slice compiled one per round).
+    """
+    return jax.jit(lambda x, start: jax.lax.dynamic_slice_in_dim(x, start, width, axis=0),
+                   out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
+_SPAN_CURSOR = {}
+
+
+def _span_cursor(mesh_xy, cover, a, b):
+    """The start row ``a`` of a sub-span ``[a, b)`` of ``cover``, carried on device.
+
+    Constructor rounds take a cover's parents in order: span 0 starts at a
+    compiled zero and each next span at the previous start plus its width (one
+    device add), so no start crosses from the host.  An out-of-order span
+    takes :func:`_span_start` (placed once per value).
+    """
+    key = (mesh_xy, cover)
+    held = _SPAN_CURSOR.get(key)
+    if a == 0:
+        start = _span_zero(mesh_xy)()
+    elif held is not None and held[0] == a:
+        start = held[1]
+    else:
+        start = _span_start(mesh_xy, a)
+    while len(_SPAN_CURSOR) >= 4 and key not in _SPAN_CURSOR:
+        _SPAN_CURSOR.pop(next(iter(_SPAN_CURSOR)))
+    _SPAN_CURSOR[key] = (b, _span_advance(mesh_xy, b - a)(start))
+    return start
+
+
+@lru_cache(maxsize=8)
+def _span_zero(mesh_xy):
+    return jax.jit(lambda: jnp.zeros((), jnp.int32), out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@lru_cache(maxsize=32)
+def _span_advance(mesh_xy, width):
+    return jax.jit(lambda start: start + jnp.asarray(width, start.dtype),
+                   out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@lru_cache(maxsize=None)
+def _span_start(mesh_xy, start):
+    """A span's start row, placed replicated once per value."""
+    from common.collectives import device_put_process_local
+    return device_put_process_local(np.int32(start), NamedSharding(mesh_xy, P()))
 
 
 @lru_cache(maxsize=8)
@@ -1158,6 +1305,7 @@ def _receipt(stage, census, bank_io):
 
 
 def _finish_receipt(receipt, meta, header, started):
+    _resolve_reciprocity(receipt)
     receipt["seconds"]["total"] = time.monotonic()-started
     receipt["bank_complete"] = bool(header["complete"])
     receipt["capacity"] = meta.shared_pole_capacity.receipt()
@@ -1382,7 +1530,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                                                   q_ids=tuple(qids[q0:q1]), execute=execute)
                     # The batch's totals finish here, so their device time is theirs.
-                    jax.block_until_ready((a0, a1) + ((o0, o1) if ordered else ()))
+                    timing.stage_wait((a0, a1) + ((o0, o1) if ordered else ()))
                 with _moment_phase(receipt, "diagnostics"):
                     _check_bare_hermitian(mesh_xy, q0, receipt, A0=a0, A1=a1)
                 with _moment_phase(receipt, "coulomb"):
@@ -1392,7 +1540,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                 with _moment_phase(receipt, "dyson"):
                     result = execute(moments, operands + (() if vertex is None else (contact,)),
                                      "moment_dyson")
-                    jax.block_until_ready(result)
+                    timing.stage_wait(result)
                 names = (("constant", "M0", "M1", "M2", "M3") if vertex is not None else
                          (("M0", "M1", "M2", "M3") if ordered else ("M1", "M3")))
                 values = dict(zip(names,result))
@@ -1504,11 +1652,26 @@ def _reciprocity_census(receipt, value, z_batch, q_full, parent, meta):
     rows = [i for i, z in enumerate(points) if z.real == 0.0]
     if not rows:
         return
-    scalars = np.asarray(_reciprocity_scalars(value))
-    receipt.setdefault("reciprocity_real_supports", []).extend(
-        dict(q_parent=int(parent), q_full=int(q_full),
-             u_ry=float(points[i].imag), defect=float(scalars[i]))
-        for i in rows)
+    # The defect stays on the device until the receipt is finished: nothing on the
+    # host decides on it, so one stacked read serves every recorded support
+    # (_finish_receipt), not one read per sample and parent.
+    receipt.setdefault("_reciprocity_pending", []).append(
+        (_reciprocity_scalars(value), [(dict(q_parent=int(parent), q_full=int(q_full),
+                                             u_ry=float(points[i].imag)), i) for i in rows]))
+
+
+def _resolve_reciprocity(receipt):
+    """The pending reciprocity defects as receipt rows, read back in one transfer."""
+    pending = receipt.pop("_reciprocity_pending", None)
+    if not pending:
+        return
+    import jax.numpy as jnp
+    flat = np.asarray(jnp.concatenate([jnp.ravel(values) for values, _ in pending]))
+    rows, offset = receipt.setdefault("reciprocity_real_supports", []), 0
+    for values, entries in pending:
+        for entry, i in entries:
+            rows.append(dict(entry, defect=float(flat[offset + i])))
+        offset += int(np.prod(values.shape))
 
 
 @lru_cache(maxsize=8)
@@ -1561,34 +1724,160 @@ def response_groups(z, group_size):
     return [order[i:i+group_size] for i in range(0, len(order), group_size)]
 
 
-def _gather_group_rules(requests, build):
-    """Build requested groups round-robin across hosts; replicate the small rules."""
+#: Stands in a request's attempt table for a node whose attempt raised: the
+#: walk stops there, and the refusal is raised only if the serial walk reaches it.
+_REFUSED = object()
+
+
+#: An idle process's speculative attempt may run this many times the round's
+#: longest needed load (Fe V2 replay simulation: P=8 28.9 s against 41.5 s
+#: without it; P=2 and P=4 unchanged).
+_IDLE_SPECULATION_SPAN = 1.5
+
+
+def _attempt_cost(tree, node):
+    """Relative wall of one whole-group attempt, per pencil route.
+
+    Host LAPACK pencils: (size/1000)^3, +0.85 for one sample. The shift
+    pencil's QR/SVD is ~size^3 per geometry; a one-sample attempt scans without
+    the stagnation patience. Fitted on 21 Frontier attempts of the Fe V2 call
+    (7 BLAS threads; 3.8 s*(size/1000)^3 + 3.3 s per one-sample node, rms 1.3 s
+    against 1.9 s for size^3 alone).
+
+    Device pencils (``tree.pencil`` set): the pencil runs ahead of the host
+    scan, so the scan dominates: (size/1000)^3 + 1.9, +3.0 for one sample.
+    Fitted on the 14 attempts of the Fe V2 walk on one MI250X GCD (1.05 s*
+    (size/1000)^3 + 1.96 s + 3.17 s per one-sample node, rms 1.1 s against 1.8
+    s for the host form; pool log rcgpu_ab1). Only the planner's balance reads
+    it, never a rule.
+
+    A warm node (an earlier map's rule on the same member set) is tried first
+    on that rule's nodes: one projection pass and no pencil when it fits, so
+    it costs 0 here (Fe 8^3 SC maps 1-3: 0.2-0.8 s, against 2.4 s modelled,
+    whose speculation then outlasted the round's needed work by ~3 s).
+    """
+    if tree.warm(node):
+        return 0.
+    one = len(node) == 1
+    if getattr(tree, "pencil", None) is not None:
+        return (tree.size(node)/1000.)**3 + 1.9 + (3.0 if one else 0.)
+    return (tree.size(node)/1000.)**3 + (0.85 if one else 0.)
+
+
+def _rule_round(trees, known, world):
+    """One round's attempts per process: the serial walks' next nodes, then speculation.
+
+    Every process computes the same plan from the same ``known`` tables. The
+    nodes the walks need now are placed longest-first on the least-loaded
+    process; the round then lasts about the longest load ``T``. Untried
+    descendants of those nodes, most likely needed first (the product of
+    their undecided tried ancestors' pencil sizes over the largest, since a
+    wider shared pencil fails more often), fill each process up to ``T``. A
+    speculative attempt that the walk never reaches is discarded; it never
+    changes a rule. Costs are :func:`_attempt_cost`. A process the round
+    left idle may take one candidate up to :data:`_IDLE_SPECULATION_SPAN`
+    times ``T``: on many processes the next level of the chain then starts a
+    round early instead of waiting for its own.
+    """
+    need = [(i, node) for i, tree in enumerate(trees) for node in tree.pending(known[i])]
+    if not need:
+        return None
+    cost = {}
+
+    def estimate(i, node):
+        if (i, node) not in cost:
+            cost[i, node] = _attempt_cost(trees[i], node)
+        return cost[i, node]
+    load, plan = [0.]*world, [[] for _ in range(world)]
+    for task in sorted(need, key=lambda t: -estimate(*t)):
+        r = min(range(world), key=lambda r: (load[r], r))
+        plan[r].append(task)
+        load[r] += estimate(*task)
+    if world > 1:
+        span = max(load)
+        wide = max(float(t.size(t.root)) for t in trees)
+        candidates = []
+
+        def descend(i, node, odds, depth):
+            for half in trees[i].children(node):
+                if trees[i].tried(half):
+                    if half not in known[i]:
+                        candidates.append((-odds, depth, len(candidates), i, half))
+                    elif known[i][half] is not None:
+                        continue
+                    descend(i, half, odds*min(1., trees[i].size(half)/wide), depth+1)
+                else:
+                    descend(i, half, odds, depth+1)
+        for i, node in need:
+            descend(i, node, min(1., trees[i].size(node)/wide), 1)
+        for *_, i, node in sorted(candidates):
+            r = min(range(world), key=lambda r: (load[r], r))
+            if load[r] + estimate(i, node) <= span or (
+                    not load[r] and estimate(i, node) <= _IDLE_SPECULATION_SPAN*span):
+                plan[r].append((i, node))
+                load[r] += estimate(i, node)
+    return plan
+
+
+def _gather_group_rules(requests, tree):
+    """Build every request's rule tree across hosts; replicate the small rules.
+
+    ``tree(members)`` is the request's ``minimax.ResponseGroupTree``. Its
+    serial walk is a chain of whole-group attempts, each a pure function of
+    its node (one machine class, pinned BLAS threads; with device pencils, one
+    device class), so any process may
+    evaluate any attempt: rounds of attempts (:func:`_rule_round`) run on all
+    processes, cross hosts as data, and every process walks the same tables
+    to the serial walk's rules, byte for byte (one list per request). Refusals
+    cross as data and are raised only where the serial walk would raise them.
+    """
     import pickle
     from common.collectives import all_gather_processes, process_count, process_rank
     rank, world = int(process_rank()), int(process_count())
-    local = []
-    for index in range(rank, len(requests), world):
-        try:
-            local.append((index, build(requests[index]), None))
-        except Exception as error:  # refusals cross hosts as data, then raise
-            local.append((index, None, f"{type(error).__name__}: {error}"))
-    if world == 1:
-        shards = [local]
-    else:
-        payload = np.frombuffer(pickle.dumps(local, protocol=pickle.HIGHEST_PROTOCOL), np.uint8)
-        lengths = np.asarray(all_gather_processes(np.asarray(payload.size, np.int32)), np.int64).reshape(-1)
-        padded = np.zeros(int(lengths.max()), np.uint8)
-        padded[:payload.size] = payload
-        gathered = np.asarray(all_gather_processes(padded), np.uint8)
-        shards = [pickle.loads(np.ascontiguousarray(gathered[r, :int(n)]).tobytes())
-                  for r, n in enumerate(lengths)]
-    rows = sorted((row for shard in shards for row in shard), key=lambda row: row[0])
-    if [row[0] for row in rows] != list(range(len(requests))):
-        raise RuntimeError("response rule construction did not gather every group")
-    for _, _, error in rows:
-        if error is not None:
-            raise ValueError(error)
-    return [rule for _, rules, _ in rows for rule in rules]
+    trees = [tree(members) for members in requests]
+    known = [dict() for _ in trees]
+    errors = [dict() for _ in trees]
+    while (plan := _rule_round(trees, known, world)) is not None:
+        # A device pencil source compiles the round's shapes here, on every
+        # rank in the same order (cross-rank compile agreement), each rank's
+        # first attempt first; the attempts below, which differ per rank, then
+        # only execute. Only the round's shapes: compiles share the rank's
+        # cores with the host scans.
+        for i, t in enumerate(trees):
+            prepare = getattr(getattr(t, "pencil", None), "prepare", None)
+            if prepare is not None:
+                prepare([shape for position in range(max(map(len, plan)))
+                         for tasks in plan if position < len(tasks) and tasks[position][0] == i
+                         for shape in t.pencil_shapes(tasks[position][1])])
+        local = []
+        for i, node in plan[rank]:
+            try:
+                local.append((i, node, trees[i].attempt(node), None))
+            except Exception as error:  # refusals cross hosts as data, then raise
+                local.append((i, node, None, f"{type(error).__name__}: {error}"))
+        if world == 1:
+            shards = [local]
+        else:
+            payload = np.frombuffer(pickle.dumps(local, protocol=pickle.HIGHEST_PROTOCOL), np.uint8)
+            lengths = np.asarray(all_gather_processes(np.asarray(payload.size, np.int32)), np.int64).reshape(-1)
+            padded = np.zeros(int(lengths.max()), np.uint8)
+            padded[:payload.size] = payload
+            gathered = np.asarray(all_gather_processes(padded), np.uint8)
+            shards = [pickle.loads(np.ascontiguousarray(gathered[r, :int(n)]).tobytes())
+                      for r, n in enumerate(lengths)]
+        for shard in shards:
+            for i, node, rules, error in shard:
+                known[i][node] = _REFUSED if error is not None else rules
+                if error is not None:
+                    errors[i][node] = error
+    out = []
+    for i, t in enumerate(trees):
+        attempts = {node: got for node, got in known[i].items() if got is not _REFUSED}
+        refused = [node for node in t.pending(attempts) if node in errors[i]]
+        if refused:
+            raise ValueError(errors[i][refused[0]])
+        out.append(t.rules(attempts))
+    return out
 
 
 #: The energy pad (eV) of a held SC response plan: the rule interval and the
@@ -1606,7 +1895,7 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     mu = sample_plan["census"]["mu_ry"]
     decay_rate, amplitude = response_occupation_envelope(energy, f, u, mu)
     from .greens_function_kernel import _phase_band_interval
-    lo_band, hi_band = jax.device_get(_phase_band_interval(jnp.asarray(np.stack((f, u)))))
+    lo_band, hi_band = _phase_band_interval(np.stack((np.asarray(f), np.asarray(u))))
     # Enclose every parent's exact weight support. Fixed bounds share one
     # batched GEMM on the direct stream's band-complete ψ rows and remain safe
     # when a complex-time phase underflows.
@@ -1685,19 +1974,26 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
         # batches the evaluation below.
         requests = response_groups(z, len(z))
         previous = [] if old is None else old["rule_groups"]
+        from .response_pencil import response_pencil_source
+        pencil = response_pencil_source()
+        if jax.process_index() == 0:
+            print_fn("Response rule pencils: " + ("device QR + dilation eigh, decisions on host"
+                     if pencil is not None else "host LAPACK"), flush=True)
 
-        def build(members):
+        def tree(members):
             local = {m: i for i, m in enumerate(members)}
             warm = [dict(rule, members=[local[m] for m in rule["members"]])
                     for rule in previous if set(rule["members"]) <= set(members)]
-            rules = minimax.response_group_rules(
+            return minimax.ResponseGroupTree(
                 plan["lo"], plan["hi"], z[members],
                 rel_tol=sample_plan["bank_rule_tolerance"]/amplitude,
-                decay_rate=decay_rate, previous=warm)
-            return [dict(rule, members=[members[m] for m in rule["members"]]) for rule in rules]
+                decay_rate=decay_rate, previous=warm, pencil=pencil)
 
         with timing.section("bank.rule_construction", announce=True):
-            plan["rule_groups"] = _gather_group_rules(requests, build)
+            plan["rule_groups"] = [
+                dict(rule, members=[members[m] for m in rule["members"]])
+                for members, rules in zip(requests, _gather_group_rules(requests, tree))
+                for rule in rules]
         if session is not None:
             session["frequency"] = plan
     if plan["decay_rate"]:
@@ -1756,8 +2052,14 @@ def _group_stream_arguments(rules, group):
 
 
 def _group_zeros(mesh_xy, shape):
-    """The donated group carry [member, q, mu_X, nu_Y]."""
-    return jnp.zeros(shape, jnp.complex128, device=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+    """The donated group carry [member, q, mu_X, nu_Y], made on device (no fill-value transfer)."""
+    return _group_zeros_program(mesh_xy, tuple(int(n) for n in shape))()
+
+
+@lru_cache(maxsize=16)
+def _group_zeros_program(mesh_xy, shape):
+    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
 def _group_carry(mesh_xy, shape):
@@ -2099,7 +2401,8 @@ class _RowWindow:
 
     def __getitem__(self, key):
         i, rows = key
-        return self.value[int(i), np.asarray(rows) - self.first]
+        # The cached gather program, not eager indexing (several dispatches per take).
+        return _MemberRows(self.value, 0)[i, np.asarray(rows) - self.first]
 
 
 class _MemberRows:
@@ -2110,7 +2413,28 @@ class _MemberRows:
 
     def __getitem__(self, key):
         i, rows = key
-        return _member_rows(self.carry, self.first + int(i), np.asarray(rows))
+        sharding = getattr(self.carry, "sharding", None)
+        if not isinstance(sharding, NamedSharding):
+            return _member_rows(self.carry, self.first + int(i), np.asarray(rows))
+        # The member index and its rows repeat across groups: placed once per
+        # distinct value instead of two host transfers on every take.
+        from common.collectives import device_put_process_local_cached
+        rep = NamedSharding(sharding.mesh, P())
+        return _member_rows(self.carry,
+                            device_put_process_local_cached(np.int64(self.first + int(i)), rep),
+                            device_put_process_local_cached(np.asarray(rows), rep))
+
+
+def _parent_row(value, i, mesh_xy):
+    """``value[i:i+1]`` on device: the row index is a placed constant, not an eager slice's host start."""
+    from common.collectives import device_put_process_local_cached
+    return _parent_row_program(value, device_put_process_local_cached(
+        np.int32(i), NamedSharding(mesh_xy, P())))
+
+
+@jax.jit
+def _parent_row_program(value, i):
+    return jax.lax.dynamic_slice_in_dim(value, i, 1, axis=0)
 
 
 @jax.jit
@@ -2333,6 +2657,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         roots = held = bank_io["photon_v"]
     carry_per_sample = 2*len(response_rows)*face_bytes
     selection = None
+    # The deck's eigh request for a face selection plan (resolve_linalg).
+    from .gw_config import linalg_resolution
+    face_eigh_backend = linalg_resolution({"linalg": config.backend.linalg}).eigh_backend
 
     def line_route(width, carry):
         """The line selection of ``width`` parents beside ``carry`` bytes: (selection,
@@ -2341,16 +2668,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         rows = ([int(meta.mu_basis.n_packed)] if vertex is None else
                 [int(b.n_packed) * (3 if f else 1) for f, b in enumerate(bank_io["mu_bases"])])
         execution, resident, workspace = line_selection_execution(
-            rows, mesh=mesh_xy, ledger=ledger, nq=width, carry=carry)
+            rows, mesh=mesh_xy, ledger=ledger, nq=width, carry=carry,
+            eigh_backend=face_eigh_backend)
         return line_selector(execution, width), resident, workspace
 
     def line_selector(execution, width):
         if vertex is None:
             from .shared_pole_directions import charge_line_selection
             return charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
-                                         execution=execution, nq=width)
+                                         execution=execution, nq=width,
+                                         eigh_backend=face_eigh_backend)
         from .shared_pole_sectors import sector_line_selection
-        return sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution, nq=width)
+        return sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution, nq=width,
+                                     eigh_backend=face_eigh_backend)
 
     if p1 > p0:
         # The line selection runs beside one sample's carry; its route is
@@ -2588,7 +2918,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 # Fe 4^3 charge), and a batch-layout line pair is never sliced.
                 if vertex is None and z[sample].real == 0 and _self_negative(int(qids[iq]),meta):
                     part = slice(iq-q0,iq-q0+1)
-                    _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
+                    _reciprocity_census(receipt,_parent_row(value,iq-q0,mesh_xy),z[sample:sample+1],
+                                        int(qids[iq]),iq,meta)
                     # Diagnostic only (nothing reads it): an extra Dyson solve per
                     # imaginary sample at every TRIM parent, so it runs under the
                     # debug-output dial, never in the production prefactor.
@@ -2800,8 +3131,9 @@ def _photon_norm_program(layout, mesh_xy):
 
     @jax.jit
     def norms(value):
-        return jnp.stack([jnp.sqrt(sum(jnp.sum(jnp.abs(photon_block_view(value, layout, a, b, mesh_xy))**2,
-                                               axis=(-2, -1)) for a, b in pairs))
+        face = P(None, "x", "y")
+        return jnp.stack([jnp.sqrt(sum(ordered_sum(jnp.abs(photon_block_view(value, layout, a, b, mesh_xy))**2,
+                                                   axis=(-2, -1), mesh=mesh_xy, spec=face) for a, b in pairs))
                           for _, pairs in _PHOTON_SECTOR_BLOCKS], axis=-1)
     return norms
 

@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import jax
+from lxkit import ordered_sum
 import jax.numpy as jnp
 import numpy as np
 import h5py
@@ -2522,7 +2523,7 @@ def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
     if wedge is None:
         return whole
     op = whole.restrict(QirrOperator(values=None, **wedge[0]))
-    jax.block_until_ready(op.values)
+    timing.stage_wait(op.values)
     return op
 
 
@@ -2538,7 +2539,7 @@ def _finalize_vq_views(
         G0 = G0[0]
     print_fn(f"\n  V_q computed:")
     print_fn(f"    Shape: {V_qmunu.shape}")
-    _vq0_trace = float(jnp.trace(V_q_raw[0]).real)
+    _vq0_trace = float(ordered_sum(jnp.diagonal(V_q_raw[0])).real)
     print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
     from common import sanity
     sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
@@ -2930,11 +2931,11 @@ def _prepare_fresh_isdf(
         # Route G's stage split through V_q (read, faces, C, fit, V_q),
         # a receipt kept by the production report.  A bispinor run hands
         # V_q the ζ files (its Z stores are closed after the fits).
-        V_qmunu.block_until_ready()
+        timing.stage_wait(V_qmunu)
         _rows = []
         timing.report(print_fn=_rows.append, title="", max_depth=3)
         print0("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
-    V_qmunu.block_until_ready()
+    timing.stage_wait(V_qmunu)
     print0("  Chunked ISDF path complete")
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
 

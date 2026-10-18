@@ -150,6 +150,27 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 _CHARGE_KCONV: dict = {}
 
 
+_PLACED_LOAD = {}
+
+
+def _placed_load_tables(mesh_xy, plan, tables):
+    """``plan``'s unfold load tables placed once per (mesh, plan), shared by every kconv entry.
+
+    The kconv caches hold two entries (one per row extent); each new entry
+    re-placed the same plan tables (8 fields per entry).  ``tables`` is
+    ``plan.unfold_load_tables()`` (a pure function of the plan); the key holds
+    the plan, so its identity cannot be reused while the entry lives.
+    """
+    key = (mesh_xy, plan)
+    hit = _PLACED_LOAD.get(key)
+    if hit is None:
+        from symmetry_maps import device_load_tables
+        while len(_PLACED_LOAD) >= 2:
+            _PLACED_LOAD.pop(next(iter(_PLACED_LOAD)))
+        hit = _PLACED_LOAD[key] = (tables, tuple(device_load_tables(tables, mesh_xy)))
+    return hit[1]
+
+
 def _charge_stream_kconv(mesh_xy, kgrid, plan):
     """``ffi.fft.make_kconv_chi_unfold`` on ``plan`` and its tables placed once.
 
@@ -162,10 +183,9 @@ def _charge_stream_kconv(mesh_xy, kgrid, plan):
     hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
-        from symmetry_maps import device_load_tables
         tables = plan.unfold_load_tables()
         hit = (make_kconv_chi_unfold(mesh_xy, kgrid, tables, n_out=1, complete=False, norm="ortho"),
-               tuple(device_load_tables(tables, mesh_xy)))
+               _placed_load_tables(mesh_xy, plan, tables))
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
         _CHARGE_KCONV[key] = hit
@@ -186,14 +206,13 @@ def _charge_window_kconv(mesh_xy, kgrid, plan, rows):
     hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
-        from symmetry_maps import device_load_tables
         from .subtile_stream import window_tables
         base = plan.unfold_load_tables()
         side, ns = int(mesh_xy.shape["x"]), int(np.asarray(base.spin).shape[-1])
         local_rows = int(np.asarray(base.lsrc).shape[1]) // (side * ns)
         shape = base if int(rows) == local_rows else window_tables(base, rows, side, ns)
         hit = (make_kconv_chi_unfold(mesh_xy, kgrid, shape, n_out=1, complete=False, norm="ortho"),
-               tuple(device_load_tables(base, mesh_xy)))
+               _placed_load_tables(mesh_xy, plan, base))
         while len(_CHARGE_KCONV) >= 2:
             _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
         _CHARGE_KCONV[key] = hit
@@ -1457,6 +1476,24 @@ def _get_chi_fractional_contour_kernel_face(
             """The q rows of a transformed charge correlation."""
             return jnp.take(value, jnp.asarray(q), axis=0)
 
+        both_q = (None if gather_q is None else
+                  np.concatenate([np.asarray(gather_q, np.int32), np.asarray(reverse_q, np.int32)]))
+
+        def charge_q_rows(kconv, lower, upper, partners, acc_shape, **kw):
+            """The node's (gather_q, reverse_q) rows of FT_k[v] from one mode-11 call.
+
+            Where the call stores q rows itself (``kconv.q_store``: CUDA fused single arm) it
+            returns them bit for bit as the accumulate on zeros, ``chi_fftn`` and the row
+            gather, with no full-k accumulator; otherwise exactly those three steps.
+            """
+            ones = jnp.ones((1,), jnp.complex128)
+            if both_q is not None and getattr(kconv, "q_store", False):
+                sel = kconv(None, lower.G, upper.G, ones, *partners, rows=both_q, **kw)[0]
+                return sel[:len(gather_q)], sel[len(gather_q):]
+            zero = jax.lax.with_sharding_constraint(jnp.zeros(acc_shape, jnp.complex128), selected_shard)
+            value = chi_fftn(kconv(zero, lower.G, upper.G, ones, *partners, **kw)[0])
+            return rows(value, gather_q), rows(value, reverse_q)
+
         def selected(value):
             return rows(chi_fftn(value), gather_q)
 
@@ -1506,12 +1543,8 @@ def _get_chi_fractional_contour_kernel_face(
             upper = parent(upper_weight, upper_time, upper_ref, True)
             partners = (() if lower.conj_partner and upper.conj_partner
                         else (lower.partner(), upper.partner()))
-            zero = jax.lax.with_sharding_constraint(
-                jnp.zeros((1, nk, n_mu, n_mu), jnp.complex128), selected_shard)
-            value = chi_fftn(chi_kconv(zero, lower.G, upper.G,
-                                      jnp.ones((1,), jnp.complex128), *partners,
-                                      load=chi_load)[0])
-            ahead, behind = rows(value, gather_q), rows(value, reverse_q)
+            ahead, behind = charge_q_rows(chi_kconv, lower, upper, partners,
+                                          (1, nk, n_mu, n_mu), load=chi_load)
             return (jnp.conj(ahead), behind) if physical else (ahead, jnp.conj(behind))
 
         def direct_node(index, accumulators):
@@ -1589,13 +1622,9 @@ def _get_chi_fractional_contour_kernel_face(
                 upper = parent(upper_w, jnp.conj(time), energy_reference[1], True)
                 partners = (() if lower.conj_partner and upper.conj_partner
                             else (lower.partner(), upper.partner()))
-                zero = jax.lax.with_sharding_constraint(
-                    jnp.zeros((1, nk, px * R, n_mu), jnp.complex128), selected_shard)
                 # A window's rows outside its live rows add nothing (mode 11's live).
-                value = chi_fftn(pass_kconv(zero, lower.G, upper.G,
-                                           jnp.ones((1,), jnp.complex128), *partners,
-                                           load=load, **live)[0])
-                ahead, behind = rows(value, gather_q), rows(value, reverse_q)
+                ahead, behind = charge_q_rows(pass_kconv, lower, upper, partners,
+                                              (1, nk, px * R, n_mu), load=load, **live)
                 ahead, behind = ((jnp.conj(ahead), behind) if physical
                                  else (ahead, jnp.conj(behind)))
                 return jax.lax.with_sharding_constraint(jnp.stack([ahead, behind])[None],
@@ -1766,8 +1795,11 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
                 # the logical Dyson system; the W pad block is exactly
                 # zero (A_pad = I, RHS_pad = 0).
                 A = jnp.eye(n_log, dtype=V_log.dtype) - V_log @ chi_log
-                lu, piv = jsp_linalg.lu_factor(A)
-                return jsp_linalg.lu_solve((lu, piv), V_log)
+                # distrib_la.local_lu: the original factor + solve below 2^31 bytes; above it the
+                # span-blocked ROCM route (rocBLAS trsm's in-place path is wrong past it).
+                from distrib_la import solve_local
+                return solve_local(A, V_log, native=lambda a, v: jsp_linalg.lu_solve(
+                    jsp_linalg.lu_factor(a), v))
 
             def solve_one(iq, W_acc):
                 W_row = solve_at_logical(
@@ -1811,7 +1843,8 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
 
 def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
                                 n_rmu_logical: int,
-                                distrib_la_batched_route: str = "batch_reshard"):
+                                distrib_la_batched_route: str = "batch_reshard",
+                                room: int | None = None):
     """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded; see docs/theory/bispinor-gw.md#dyson."""
     n_ext = int(n_rmu)
     n_log = int(n_rmu_logical)
@@ -1825,7 +1858,7 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # prefixes (notably scalar charge versus an explicit packed carrier), so
     # omitting n_log would reuse a closure with the wrong exact-zero mask.
     cache_key = ("distributed", _mesh_key(mesh_xy), nq, n_ext, n_log,
-                 str(distrib_la_batched_route))
+                 str(distrib_la_batched_route), room)
     if cache_key in _w_solve_cache:
         return _w_solve_cache[cache_key]
 
@@ -1853,9 +1886,11 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
     # raises at resolve time (the former silent 1-D-mesh degenerate-to-
     # native was removed; audit fix/zq 2026-07-28), so a returned plan is
     # always the distributed backend it names.
+    # ``room`` (the plan's bytes per rank beside the faces, _dyson_route) caps
+    # the leg's size route: one_device only where one whole system fits it.
     p = linalg_plan(
         "solve_lu", mesh_xy, backend="distributed", n=n_ext,
-        batched_route=distrib_la_batched_route)
+        batched_route=distrib_la_batched_route, budget_bytes=room)
 
     px = int(mesh_xy.shape['x'])
     py = int(mesh_xy.shape['y'])
@@ -2006,8 +2041,11 @@ def _w_solve_pref_scalar(meta) -> float:
 
 
 def _dyson_route(dyson, n, stack, mesh_xy):
-    """``"local"`` or ``"distributed"``: the deck's W plan, with the local plan
-    admitted only where one rank's whole matrices fit (``common.gpu_utils.admit_local``).
+    """``("local" | "distributed", room)``: the deck's W plan, with the local plan
+    admitted only where one rank's whole matrices fit (``common.gpu_utils.admit_local``),
+    and the distributed plan's room per rank beside the faces (None on one rank).
+    The room goes to the solve plan, so a leg's size route (distrib_la resolve guard
+    1b, ``one_device``) cannot put the whole matrices that did not fit back on a rank.
 
     Local holds V, χ and W whole for its ⌈stack/P⌉ parents and one LU working
     pair, beside the face-tiled V, χ and W; distributed holds the faces and
@@ -2017,12 +2055,13 @@ def _dyson_route(dyson, n, stack, mesh_xy):
     from common.gpu_utils import admit_local, device_budget_bytes
     ranks = int(mesh_xy.size)
     site = f"W Dyson {int(stack)} x {int(n)}^2"
+    faces = 16.0 * n * n * 3 * int(stack) / ranks
+    room = max(0, int(device_budget_bytes() - faces)) if ranks > 1 else None
     if dyson == "distributed":
         admit_local(site, 0, 0, forced="distributed")
-        return "distributed"
+        return "distributed", room
     if ranks <= 1:
-        return "local"
-    faces = 16.0 * n * n * 3 * int(stack) / ranks
+        return "local", None
     whole = 16.0 * n * n * (3 * -(-int(stack) // ranks) + 2)
 
     def probe():
@@ -2032,7 +2071,7 @@ def _dyson_route(dyson, n, stack, mesh_xy):
         resolve_backend("solve_lu", "distributed", mesh_xy)
     local = admit_local(site, faces + whole, device_budget_bytes(),
                         distributed_bytes=faces + 2 * 16.0 * n * n / ranks, probe=probe)
-    return "local" if local else "distributed"
+    return ("local", None) if local else ("distributed", room)
 
 
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
@@ -2048,7 +2087,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
     from .gw_config import normalize_w_dyson_solver
     nq = int(meta.nk_tot) if nq is None else int(nq)
     dyson = normalize_w_dyson_solver(dyson_solver)
-    routed = _dyson_route(dyson, int(n_rmu), nq if stack is None else int(stack), mesh_xy)
+    routed, room = _dyson_route(dyson, int(n_rmu), nq if stack is None else int(stack), mesh_xy)
     if routed != dyson:
         # The provider plan, not route (c): staged whole matrices are what did not fit.
         dyson, distrib_la_batched_route = routed, "auto"
@@ -2065,7 +2104,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
 
     if dyson == "distributed":
         solve_fn = _get_w_solve_fn_distributed(
-            mesh_xy, nq, n_rmu, n_log, distrib_la_batched_route)
+            mesh_xy, nq, n_rmu, n_log, distrib_la_batched_route, room=room)
     else:
         solve_fn = _get_w_solve_fn_local(
             mesh_xy, nq, n_rmu, n_rmu_logical=n_log)
@@ -3452,7 +3491,7 @@ def _fractional_pair_scan_face(
             global_band - y_idx * shard_w_y, 0, shard_w_y - 1)
         gathered = jnp.take(psi_mun_local, local_idx, axis=3)
         gathered = jnp.where(owns[None, None, None, :], gathered, 0)
-        return jax.lax.psum(gathered, 'y')
+        return jax.lax.psum(gathered, 'y')  # exact-reduce: masked gather, one owner per band
 
     def _gather_nmu(psi_nmu_local, g_lo):
         """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank — masked-gather + psum('x') from psi_nmu's local shard (bands on 'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile` bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s, mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc) needs one transpose to match the band-last endpoint (nk, s, mu, n) order; see docs/architecture/fractional_chi0_response_face.md."""
@@ -3467,7 +3506,7 @@ def _fractional_pair_scan_face(
             global_band - x_idx * shard_w_x, 0, shard_w_x - 1)
         gathered = jnp.take(psi_nmu_local, local_idx, axis=1)
         gathered = jnp.where(owns[None, :, None, None], gathered, 0)
-        gathered = jax.lax.psum(gathered, 'x')
+        gathered = jax.lax.psum(gathered, 'x')  # exact-reduce: masked gather, one owner per band
         return jnp.transpose(gathered, (0, 2, 3, 1))
 
     # ``nb_full`` is a storage extent and can include rank-padding above the

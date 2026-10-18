@@ -13,6 +13,7 @@ from functools import partial
 from pathlib import Path
 
 import jax
+from lxkit import ordered_sum
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -35,6 +36,7 @@ from common.parallel_transport import (
 )
 from common.wfn_layout import band_sphere_spec
 from file_io.slab_io import SlabIO
+from distrib_la import eigh_local
 
 
 SCHEMA_VERSION = 4
@@ -407,7 +409,7 @@ def _require_service_apis():
         raise RuntimeError(
             "parallel-transport preprocessing requires the public service "
             "distrib_la.plan_polar_factor(mesh, n=..., "
-            "backend='distributed', rcond=...); merge the distrib_la "
+            "backend=..., rcond=...); merge the distrib_la "
             "polar-factor service lane"
         ) from exc
     try:
@@ -1314,16 +1316,19 @@ def write_parallel_transport_artifact(
     nbands: int,
     bispinor: bool,
     batched_route: str,
+    eigh_backend: str,
     rcond: float = 1.0e-10,
     w_av_first_neighbors: bool = False,
     w_av_second_neighbors: bool = False,
 ) -> None:
     """Append streamed links and the full-BZ connection to an initialized file.
 
-    ``batched_route`` is the deck's ``linalg`` resolution
-    (``gw_config.resolve_distrib_la_batched_route``): ``batch_reshard``
-    (``linalg = local``) solves P link polars at a time, one per rank;
-    ``auto`` (``linalg = distributed``) solves each link on the mesh.
+    ``batched_route`` and ``eigh_backend`` are the deck's ``linalg``
+    resolution (``gw_config.resolve_distrib_la_batched_route`` and
+    ``gw_config.resolve_eigh_backend``): ``batch_reshard`` with ``auto``
+    (``linalg = local``) solves P link polars at a time, one per rank, and
+    plans no whole-mesh eigh; ``auto`` with ``distributed``
+    (``linalg = distributed``) solves each link on the mesh.
 
     THE STENCIL GATE LIVES HERE, per axis, not in the artifact initializer
     -- this is the ONLY stage that differentiates along k.  Since 2026-09-05
@@ -1356,7 +1361,7 @@ def write_parallel_transport_artifact(
         _require_service_apis())
     nb_padded = band_storage_extent(mesh, int(nbands))
     polar_plan = plan_polar(
-        mesh, n=nb_padded, backend="distributed", rcond=float(rcond),
+        mesh, n=nb_padded, backend=str(eigh_backend), rcond=float(rcond),
         batched_route=str(batched_route))
     full_plus, source_full, source_steps = _write_link_stage(
         str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
@@ -1495,7 +1500,7 @@ def transported_frame(
     # and with each other; a generic real combination of them therefore has
     # the same eigenvectors and a batched Hermitian eigh diagonalizes S
     # exactly, with no matrix-logarithm branch beyond the principal one.
-    _values, V = jnp.linalg.eigh(hermitian + 0.7548 * antihermitian)
+    _values, V = eigh_local(hermitian + 0.7548 * antihermitian)
     theta = jnp.angle(jnp.diagonal(
         _dagger(V) @ S @ V, axis1=-2, axis2=-1))
     exponents = -jnp.arange(n, dtype=jnp.float64) / float(n)
@@ -1645,8 +1650,8 @@ def complete_velocity_validation(
     # (gw.qsgw_head.link_correction_bound), on the elements the head reads.
     head_set = head_velocity_set(occupations)[None]
     metrics["head_set_relative_l2"] = float(jax.device_get(
-        jnp.sqrt(jnp.sum(jnp.where(head_set, jnp.abs(reconstructed - exact) ** 2, 0.0))
-                 / jnp.maximum(jnp.sum(jnp.where(head_set, jnp.abs(exact) ** 2, 0.0)),
+        jnp.sqrt(ordered_sum(jnp.where(head_set, jnp.abs(reconstructed - exact) ** 2, 0.0))
+                 / jnp.maximum(ordered_sum(jnp.where(head_set, jnp.abs(exact) ** 2, 0.0)),
                                1.0e-60))))
     metrics["entrywise_passed"] = bool(metrics["passed"])
     metrics["stencil_orders"] = tuple(int(o) for o in orders)
@@ -1669,13 +1674,13 @@ def complete_velocity_validation(
     transition = (
         (delta_e > 0.0) & (jnp.abs(occupation_difference) > 1.0e-10))
     transition = transition[None]
-    exact_norm = jnp.sqrt(jnp.sum(
+    exact_norm = jnp.sqrt(ordered_sum(
         jnp.where(transition, jnp.abs(exact) ** 2, 0.0)))
-    reconstructed_norm = jnp.sqrt(jnp.sum(
+    reconstructed_norm = jnp.sqrt(ordered_sum(
         jnp.where(transition, jnp.abs(reconstructed) ** 2, 0.0)))
-    transition_error = jnp.sqrt(jnp.sum(jnp.where(
+    transition_error = jnp.sqrt(ordered_sum(jnp.where(
         transition, jnp.abs(reconstructed - exact) ** 2, 0.0)))
-    overlap = jnp.sum(jnp.where(
+    overlap = ordered_sum(jnp.where(
         transition, jnp.conj(exact) * reconstructed, 0.0 + 0.0j))
     overlap = overlap / jnp.maximum(
         exact_norm * reconstructed_norm, jnp.asarray(1.0e-30))
@@ -2241,7 +2246,7 @@ def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
 
 
 def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
-                                batched_route,
+                                batched_route, eigh_backend,
                                 rcond, velocity_only, w_av_first_neighbors,
                                 w_av_second_neighbors, atol, rtol,
                                 report, head_nbands=None) -> None:
@@ -2268,7 +2273,8 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
     with timing.section("parallel_transport_links"):
         write_parallel_transport_artifact(
             path, wfn=wfn, sym=sym, mesh=mesh, nbands=nbands,
-            bispinor=bispinor, batched_route=batched_route, rcond=rcond,
+            bispinor=bispinor, batched_route=batched_route,
+            eigh_backend=eigh_backend, rcond=rcond,
             w_av_first_neighbors=w_av_first_neighbors,
             w_av_second_neighbors=w_av_second_neighbors)
     with timing.section("parallel_transport_validation"):

@@ -229,6 +229,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
     h = scale[:, :, None] * h * scale[:, None, :]
     output = output * scale[:, None, :]
     gamma, u = eigh(hermitian_part(g))
+    gram_eigh_finite = jnp.all(jnp.isfinite(gamma), axis=-1) & jnp.all(jnp.isfinite(u), axis=(-2, -1))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
     floor = _validity_floor(scale, rounding, output_norm, largest, gates=gates)
@@ -249,9 +250,21 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
     t = hermitian_part(matmul(z, matmul(h, z), transa="C"))
     # The norm puts the inert spectrum strictly below every physical Ritz
     # value, including negative physical values which must reach zero policy.
+    # The inert rows take DISTINCT sentinels in [s, 2s), s = -(||t||_F + 1), as
+    # distrib_la.deflate_zero_rows gives zero rows: one common value makes an
+    # exactly degenerate cluster of every unkept column, on which rocSOLVER
+    # zheevd behind the reflector route returns finite eigenvalues with NaN
+    # eigenvectors and info 0 (Na even-route Ritz operand c128[234,234], 133
+    # inert rows, 1-ulp perturbations: 16/400 common, 0/400 distinct; crash
+    # lane pool log crash_rb_ep1).  The inert vectors are discarded either way.
     sentinel = -(jnp.linalg.norm(t, axis=(-2, -1)) + 1)
-    t = t + null_identity * sentinel[:, None, None]
+    side = t.shape[-1]
+    spread = 1 + jnp.arange(side, dtype=sentinel.dtype) / side
+    t = t + null_identity * (sentinel[:, None] * spread[None, :])[:, None, :]
     poles, rotation = eigh(t)
+    # A silent solver failure is refused by name (gate below), not as a zero-Ritz weight.
+    ritz_eigh_finite = (gram_eigh_finite & jnp.all(jnp.isfinite(poles), axis=-1)
+                        & jnp.all(jnp.isfinite(rotation), axis=(-2, -1)))
     active = jnp.arange(g.shape[-1])[None, :] >= g.shape[-1] - count[:, None]
     b = matmul(matmul(output, z), rotation) * active[:, None, :]
     poles = jnp.where(active, poles, 1.0)
@@ -268,6 +281,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
         "retained_metric_positive": metric_ok,
         "retained_metric_relative": jnp.linalg.norm(metric - wanted_metric, axis=(-2, -1))
         / jnp.sqrt(jnp.maximum(count, 1)),
+        "ritz_eigh_finite": ritz_eigh_finite,
     }
     # Undo equilibration in the coefficient map used by retained-space checks.
     coefficients = matmul(z, rotation) * active[:, None, :]

@@ -92,6 +92,7 @@ from common import rank_criterion
 from common import spectral_closure
 from common.collectives import warm_mesh_cliques
 from common.contract_bands import contract_bands_block_reshard
+from distrib_la import eigh_local
 
 __all__ = [
     "least_squares_transfer",
@@ -187,12 +188,15 @@ def least_squares_transfer(
                 f"projection downstream.")
 
         def _body(L_loc, O_loc):
-            y = jax.lax.linalg.triangular_solve(
-                L_loc, O_loc, left_side=True, lower=True,
-                transpose_a=False, conjugate_a=False)
-            return jax.lax.linalg.triangular_solve(
-                L_loc, y, left_side=True, lower=True,
-                transpose_a=True, conjugate_a=True)
+            # distrib_la.local_lu: these calls below 2^31 bytes, the span route above (ROCM).
+            from distrib_la import tri_solve_local
+            y = tri_solve_local(L_loc, O_loc, native=lambda l, o: jax.lax.linalg.triangular_solve(
+                l, o, left_side=True, lower=True,
+                transpose_a=False, conjugate_a=False))
+            return tri_solve_local(L_loc, y, transpose=True, conjugate=True,
+                                   native=lambda l, o: jax.lax.linalg.triangular_solve(
+                l, o, left_side=True, lower=True,
+                transpose_a=True, conjugate_a=True))
 
         return shard_map(
             _body, mesh=mesh_xy,
@@ -203,7 +207,7 @@ def least_squares_transfer(
         raise ValueError(
             f"rcond must be in (0, 1) — it is a RELATIVE threshold on "
             f"λ/λ_max, got {rcond!r}.")
-    w, V = jnp.linalg.eigh(gram_S)              # ascending, replicated
+    w, V = eigh_local(gram_S)              # ascending, replicated
     lam_max = jnp.max(w, axis=-1, keepdims=True)
     keep = w > (float(rcond) * lam_max)
     # CLOSURE.  The cut above is a cap on amplification; it is not allowed to

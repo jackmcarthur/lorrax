@@ -1,4 +1,4 @@
-"""True per-rank peak HBM for a compiled JAX kernel — cuFFT scratch included.
+"""True per-rank peak HBM for a compiled JAX kernel — FFT plan scratch included.
 
 ``compiled.memory_analysis()`` reports ONLY what XLA's buffer assignment
 placed (``temp + argument + output - alias``).  A cuFFT plan's *workspace*
@@ -10,10 +10,17 @@ gap: docs/architecture/memory-model.md §"cuFFT plan scratch".
 
 Three steps close it: ``memory_analysis()`` -> ``compiled_peak``; a regex
 over ``compiled.as_text()`` -> one :class:`FftSpec` per fft op;
-``cufftMakePlanMany`` (autoAllocation off) on the *exact* libcufft jaxlib
+``<api>MakePlanMany`` (autoAllocation off) on the *exact* FFT library jaxlib
 ``dlopen``'d, found via ``/proc/self/maps`` -> ``cufft_scratch``.  Using
-jaxlib's own libcufft is what makes the plan we size the plan the runtime
-will build — no version drift between query and execution.
+jaxlib's own library is what makes the plan we size the plan the runtime
+will build — no version drift between query and execution.  Which library
+answers is the device leg's ``fft_plan_scratch`` (:data:`lxkit.LEGS`):
+cuFFT on CUDA, hipFFT on ROCm (XLA's ROCm FFT thunk takes the hipFFT plan
+workspace from the arena exactly as the CUDA thunk does: the MI250X BFC
+peak rose by exactly ``hipfftMakePlanMany``'s ``workSize`` on seven c128 3D
+boxes, 0 to 131.1 MB; a 1D 1009 x 4096 case gave no reading, Runtime-LEGS
+lane 2026-10-15).  The ``cufft_*`` field and error
+names are historical; they mean the leg's plan library.
 
 Public API: :func:`aot_kernel_peak_bytes` ``(compiled, platform=None) ->
 AotPeakBreakdown``; compare ``.total`` against the per-rank budget.  The
@@ -28,8 +35,8 @@ recompiles once only when it exceeds the room; :func:`agreed_chunk` makes
 the chunk every rank runs the same (the response direct stream, the ζ μ batch; the Σ τ window reads
 :func:`compiled_new_bytes`).
 
-Works on CPU and GPU.  On a non-CUDA platform there are no cuFFT plans, so
-the scratch term is an exact 0 — NOT a demotion.  That has to be decided
+Works on CPU and GPU.  On a platform whose leg declares no plan query (cpu)
+there are no plan workspaces, so the scratch term is an exact 0 — NOT a demotion.  That has to be decided
 from the platform, not the HLO: measured on jax 0.9.1 (job 7882062),
 XLA:CPU keeps the ``fft`` op in ``as_text()`` exactly like XLA:GPU, so
 "the HLO has an fft op" does not mean "cuFFT is involved".
@@ -227,81 +234,97 @@ def _cufft_type_for(dtype: str, fft_type: str) -> int:
         ) from None
 
 
-@functools.lru_cache(maxsize=1)
-def _jax_cufft_handle() -> ctypes.CDLL:
-    """``ctypes``-load the ``libcufft.so`` jaxlib itself already loaded.
+#: ``PlatformLeg.fft_plan_scratch`` -> (library file prefix, symbol prefix,
+#: plan-handle ctype).  The leg declares which library answers; this module
+#: owns how.  hipFFT mirrors the cuFFT plan API one to one (same type codes,
+#: same argument order) except that its handle is a pointer, not an int.
+_PLAN_APIS = {
+    "cufft": ("libcufft.so", "cufft", ctypes.c_int),
+    "hipfft": ("libhipfft.so", "hipfft", ctypes.c_void_p),
+}
+_PLAN_NAMES = {"cufft": "cuFFT", "hipfft": "hipFFT"}
+_PLAN_BACKENDS = {"cufft": "CUDA", "hipfft": "ROCm"}
 
-    Forces CUDA platform init first so the library is actually mapped, then
+
+@functools.lru_cache(maxsize=2)
+def _jax_fft_handle(api: str):
+    """``ctypes``-load the FFT plan library jaxlib itself already loaded.
+
+    Forces GPU platform init first so the library is actually mapped, then
     reads ``/proc/self/maps`` for it.  Using that exact path (rather than a
-    system libcufft) is what makes the queried workspace equal the workspace
-    the runtime FFT thunk will allocate.
+    system copy) is what makes the queried workspace equal the workspace
+    the runtime FFT thunk will allocate.  Returns ``(lib, prefix, handle)``.
 
-    Raises :class:`CufftQueryError` when there is no CUDA backend or the
+    Raises :class:`CufftQueryError` when there is no GPU backend or the
     library is not in the process map (e.g. a statically linked jaxlib).
     """
     import jax
+    file_prefix, sym, handle = _PLAN_APIS[api]
     try:
-        jax.devices("gpu")          # forces CUDA platform init; no-op if done
+        jax.devices("gpu")          # forces GPU platform init; no-op if done
     except Exception as e:
         raise CufftQueryError(
-            f"no CUDA backend; cannot query cuFFT scratch: {e}") from e
+            f"no {_PLAN_BACKENDS[api]} backend; cannot query {_PLAN_NAMES[api]} "
+            f"scratch: {e}") from e
 
     # Lines look like:
     #   7f12...-7f12... r-xp 00000000 fd:01 12345  /path/to/libcufft.so.12
-    cufft_path = None
+    path = None
     try:
         with open("/proc/self/maps", "r") as fh:
             for line in fh:
                 parts = line.rstrip().split(None, 5)
                 if len(parts) == 6 and parts[5].startswith("/") \
-                        and os.path.basename(parts[5]).startswith("libcufft.so"):
-                    cufft_path = parts[5]
+                        and os.path.basename(parts[5]).startswith(file_prefix):
+                    path = parts[5]
                     break
     except OSError as e:
         raise CufftQueryError(f"could not read /proc/self/maps: {e}") from e
-    if cufft_path is None:
+    if path is None:
         raise CufftQueryError(
-            "libcufft.so is not in /proc/self/maps after CUDA init — a "
-            "CPU-only or statically linked jaxlib build?")
+            f"{file_prefix} is not in /proc/self/maps after {_PLAN_BACKENDS[api]} "
+            "init — a CPU-only or statically linked jaxlib build?")
 
     try:
-        lib = ctypes.CDLL(cufft_path, mode=ctypes.RTLD_GLOBAL)
+        lib = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
     except OSError as e:
-        raise CufftQueryError(f"failed to ctypes-load {cufft_path}: {e}") from e
+        raise CufftQueryError(f"failed to ctypes-load {path}: {e}") from e
 
-    # ABI signatures, cuda/include/cufft.h.  inembed/onembed are passed NULL
+    # ABI signatures, cufft.h / hipfft.h.  inembed/onembed are passed NULL
     # (packed contiguous), matching jaxlib's FFT thunk for a batched C2C box.
-    lib.cufftCreate.restype = ctypes.c_int
-    lib.cufftCreate.argtypes = [ctypes.POINTER(ctypes.c_int)]
-    lib.cufftDestroy.restype = ctypes.c_int
-    lib.cufftDestroy.argtypes = [ctypes.c_int]
-    lib.cufftSetAutoAllocation.restype = ctypes.c_int
-    lib.cufftSetAutoAllocation.argtypes = [ctypes.c_int, ctypes.c_int]
-    lib.cufftMakePlanMany.restype = ctypes.c_int
-    lib.cufftMakePlanMany.argtypes = [
-        ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int),   # plan/rank/n
+    f = lambda name: getattr(lib, sym + name)
+    f("Create").restype = ctypes.c_int
+    f("Create").argtypes = [ctypes.POINTER(handle)]
+    f("Destroy").restype = ctypes.c_int
+    f("Destroy").argtypes = [handle]
+    f("SetAutoAllocation").restype = ctypes.c_int
+    f("SetAutoAllocation").argtypes = [handle, ctypes.c_int]
+    f("MakePlanMany").restype = ctypes.c_int
+    f("MakePlanMany").argtypes = [
+        handle, ctypes.c_int, ctypes.POINTER(ctypes.c_int),         # plan/rank/n
         ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int,   # in embed/stride/dist
         ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int,   # out embed/stride/dist
         ctypes.c_int, ctypes.c_int,                                 # type, batch
         ctypes.POINTER(ctypes.c_size_t),                            # workSize
     ]
-    return lib
+    return lib, sym, handle
 
 
 @functools.lru_cache(maxsize=512)
-def _query_one_plan_workspace_bytes(spec: FftSpec) -> int:
-    """Plan-workspace bytes for ``spec``, via ``cufftMakePlanMany``.
+def _query_one_plan_workspace_bytes(spec: FftSpec, api: str = "cufft") -> int:
+    """Plan-workspace bytes for ``spec``, via ``<api>MakePlanMany``.
 
-    ``cufftSetAutoAllocation(plan, 0)`` means no device memory beyond the
+    ``<api>SetAutoAllocation(plan, 0)`` means no device memory beyond the
     plan descriptor is allocated — the query is cheap and side-effect free.
-    Queried at the *production* batch: cuFFT picks its algorithm from the
-    plan parameters, so extrapolating from a small batch would be a
+    Queried at the *production* batch: the library picks its algorithm from
+    the plan parameters, so extrapolating from a small batch would be a
     different algorithm's workspace.
     """
-    lib = _jax_cufft_handle()
+    lib, sym, handle = _jax_fft_handle(api)
+    f = lambda name: getattr(lib, sym + name)
     if spec.batch >= (1 << 31):
         raise CufftQueryError(
-            f"batch={spec.batch} exceeds int32; needs cufftMakePlanMany64.")
+            f"batch={spec.batch} exceeds int32; needs {sym}MakePlanMany64.")
     ctype_code = _cufft_type_for(spec.dtype, spec.fft_type)
 
     # idist/odist are per-batch element counts: product(n) for C2C, with the
@@ -315,26 +338,26 @@ def _query_one_plan_workspace_bytes(spec: FftSpec) -> int:
     in_dist = half if spec.fft_type == "IRFFT" else dist
     out_dist = half if spec.fft_type == "RFFT" else dist
 
-    plan = ctypes.c_int(0)
-    rc = lib.cufftCreate(ctypes.byref(plan))
+    plan = handle()
+    rc = f("Create")(ctypes.byref(plan))
     if rc != _CUFFT_SUCCESS:
-        raise CufftQueryError(f"cufftCreate failed: rc={rc}")
+        raise CufftQueryError(f"{sym}Create failed: rc={rc}")
     try:
-        rc = lib.cufftSetAutoAllocation(plan, 0)
+        rc = f("SetAutoAllocation")(plan, 0)
         if rc != _CUFFT_SUCCESS:
-            raise CufftQueryError(f"cufftSetAutoAllocation failed: rc={rc}")
+            raise CufftQueryError(f"{sym}SetAutoAllocation failed: rc={rc}")
         work_size = ctypes.c_size_t(0)
-        rc = lib.cufftMakePlanMany(
+        rc = f("MakePlanMany")(
             plan, spec.rank, (ctypes.c_int * spec.rank)(*spec.transform_shape),
             None, 1, in_dist, None, 1, out_dist,
             ctype_code, spec.batch, ctypes.byref(work_size))
         if rc != _CUFFT_SUCCESS:
             raise CufftQueryError(
-                f"cufftMakePlanMany failed: rc={rc} for spec={spec} "
+                f"{sym}MakePlanMany failed: rc={rc} for spec={spec} "
                 f"(idist={in_dist}, odist={out_dist}, type=0x{ctype_code:x})")
         return int(work_size.value)
     finally:
-        lib.cufftDestroy(plan)
+        f("Destroy")(plan)
 
 
 def _fft_data_bytes(spec: FftSpec) -> int:
@@ -344,8 +367,9 @@ def _fft_data_bytes(spec: FftSpec) -> int:
     return int(spec.batch) * math.prod(spec.transform_shape) * item
 
 
-def query_cufft_workspace_bytes(specs) -> int:
-    """**Max** plan workspace over the distinct ``FftSpec``s in ``specs``.
+def query_cufft_workspace_bytes(specs, api: str = "cufft") -> int:
+    """**Max** plan workspace over the distinct ``FftSpec``s in ``specs``,
+    from the leg's plan library ``api`` (``"cufft"`` | ``"hipfft"``).
 
     Max, not sum: XLA schedules FFT thunks sequentially, so within one
     kernel only one plan's scratch is live at a time.  "Distinct" is spec
@@ -355,7 +379,7 @@ def query_cufft_workspace_bytes(specs) -> int:
     distinct = set(specs)
     if not distinct:
         return 0
-    return max(_query_one_plan_workspace_bytes(s) for s in distinct)
+    return max(_query_one_plan_workspace_bytes(s, api) for s in distinct)
 
 
 # ---------------------------------------------------------------------------
@@ -363,21 +387,24 @@ def query_cufft_workspace_bytes(specs) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _is_cuda_platform(platform: str | None) -> bool:
-    """Is the executable's platform one where cuFFT plans exist?
+def _fft_plan_api(platform: str | None) -> str:
+    """The plan library whose workspace this executable's FFTs take, or "".
 
     ``platform`` is the caller's declaration (``mesh.devices[0].platform``);
-    a GPU is CUDA when this process's device vendor is
-    (:func:`lxkit.device_vendor`).
+    a GPU's library is its device leg's ``fft_plan_scratch``
+    (:data:`lxkit.LEGS`, via :func:`lxkit.device_vendor`).  "" (no plan
+    scratch, an exact 0) on cpu and on a leg that declares none.
     """
-    if platform is not None and platform not in ("gpu", "cuda"):
-        return False
+    if platform is not None and platform not in ("gpu", "cuda", "rocm"):
+        return ""
     try:
         import jax
-        from lxkit import device_vendor
-        return device_vendor(jax.local_devices()[0]) == "cuda"
+        from lxkit import device_vendor, leg_for_vendor
+        leg = leg_for_vendor(device_vendor(jax.local_devices()[0]))
+        api = getattr(leg, "fft_plan_scratch", "") or ""
+        return api if api in _PLAN_APIS else ""
     except Exception:
-        return False
+        return ""
 
 
 def buffer_peak_bytes(m) -> int:
@@ -392,8 +419,8 @@ class ModuleDoesNotFit(RuntimeError):
 
 @functools.lru_cache(maxsize=None)
 def _device_total(ordinal: int) -> int | None:
-    from runtime.xla_memory import cuda_device_total_bytes
-    return cuda_device_total_bytes(ordinal)
+    from runtime.xla_memory import device_total_bytes
+    return device_total_bytes(ordinal)
 
 
 def refuse_over_device(executable, module_name: str, platform: str) -> None:
@@ -405,12 +432,13 @@ def refuse_over_device(executable, module_name: str, platform: str) -> None:
     (``runtime.disable_xla_rematerialization``), so nothing at compile time
     shrinks a module that does not fit; it would fail at its first
     allocation.  This refuses it at once instead.  The limit is the card's
-    total memory (``cuDeviceTotalMem``), a hard device limit: the buffers
+    total memory (``runtime.xla_memory.device_total_bytes``), a hard device limit: the buffers
     alone (``temp + arguments + outputs - aliased``, no cuFFT scratch, no
     NCCL or context) cannot fit above it.  It is not the memory budget;
-    ``memory_per_device_gb`` still only warns.  CUDA only.
+    ``memory_per_device_gb`` still only warns.  Every GPU leg whose
+    ``device_memory_api`` answers (:data:`lxkit.LEGS`; CUDA and ROCm).
     """
-    if (platform not in ("cuda", "gpu")
+    if (platform not in ("cuda", "gpu", "rocm")
             or not hasattr(executable, "get_compiled_memory_stats")):
         return
     stats = executable.get_compiled_memory_stats()
@@ -449,12 +477,14 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
     jax 0.9.1, job 7882062) XLA:CPU keeps the ``fft`` op in ``as_text()``
     exactly like XLA:GPU does:
 
-    * non-CUDA -> ``cufft_scratch = 0``, ``cufft_measured = True``.  There
-      are no cuFFT plans on this platform, so 0 is exact.  (XLA:CPU's own
+    * a leg with no ``fft_plan_scratch`` (cpu) -> ``cufft_scratch = 0``,
+      ``cufft_measured = True``.  There are no plan workspaces, so 0 is exact.  (XLA:CPU's own
       Ducc FFT scratch is a different, much smaller quantity that this
       module does not claim to model.)
-    * CUDA, query succeeds -> the measured workspace, ``measured = True``.
-    * CUDA, query fails -> 0 with ``measured = False``, announced once.
+    * CUDA or ROCm, query succeeds -> the measured workspace (cuFFT or
+      hipFFT), ``measured = True``.
+    * CUDA or ROCm, query fails -> a conservative figure with
+      ``measured = False``, announced once.
     """
     m = compiled.memory_analysis()
     compiled_peak = buffer_peak_bytes(m)
@@ -471,30 +501,32 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
     )
 
     cufft_scratch, measured = 0, True
+    api = _fft_plan_api(platform)
     try:
         fft_specs = tuple(parse_fft_specs_from_hlo(compiled.as_text()))
     except HloFftParseError as exc:
         fft_specs = ()
-        if _is_cuda_platform(platform):
+        if api:
             measured = False
             cufft_scratch = compiled_increment
             announce_once(
                 "hlo-fft-parse",
-                f"the HLO FFT-op parser missed ({exc}); cuFFT scratch is priced "
+                f"the HLO FFT-op parser missed ({exc}); {_PLAN_NAMES[api]} scratch is priced "
                 f"as the module's temporaries and outputs again, "
                 f"{cufft_scratch / 1e9:.2f} GB for this kernel")
-    if fft_specs and _is_cuda_platform(platform):
+    if fft_specs and api:
         try:
-            cufft_scratch = query_cufft_workspace_bytes(fft_specs)
+            cufft_scratch = query_cufft_workspace_bytes(fft_specs, api)
         except CufftQueryError as exc:
             measured = False
             cufft_scratch = 2 * max(
                 _fft_data_bytes(spec) for spec in fft_specs)
             announce_once(
-                f"cufft-query-unavailable:{type(exc).__name__}",
-                f"cuFFT plan-workspace query UNAVAILABLE on a CUDA backend "
-                f"({exc}); the plan workspace is priced as twice the largest "
-                f"FFT op's data, {cufft_scratch / 1e9:.2f} GB for this kernel")
+                f"{api}-query-unavailable:{type(exc).__name__}",
+                f"{_PLAN_NAMES[api]} plan-workspace query UNAVAILABLE on a "
+                f"{_PLAN_BACKENDS[api]} backend ({exc}); the plan workspace is "
+                f"priced as twice the largest FFT op's data, "
+                f"{cufft_scratch / 1e9:.2f} GB for this kernel")
 
     return AotPeakBreakdown(
         compiled_peak=compiled_peak,

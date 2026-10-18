@@ -37,3 +37,38 @@ def test_two_windows_match_one_window():
                        windows=((0, 0, 3), (3, 0, 3)), blocks=(Block(),)))
     assert np.any(one != 0)
     np.testing.assert_array_equal(two, one)
+
+
+def test_live_outputs_and_nodes_match_full_accumulate():
+    """Padded member slots (zero weights) and a chunk's nodes past the count are skipped
+    exactly: the carry equals the dense every-term, every-output accumulate."""
+    from gw.subtile_stream import Block, PassPlan, stream_passes
+
+    mesh = Mesh(np.array(jax.devices("cpu")[:1]).reshape(1, 1), ("x", "y"))
+    L, N, n_out, cap, live_out, count = 6, 5, 9, 7, 4, 5
+    rng = np.random.default_rng(1)
+    w = rng.standard_normal((2, n_out, cap)) + 1j * rng.standard_normal((2, n_out, cap))
+    w[:, live_out:] = 0
+    w[:, :, count:] = 0
+    weights = jnp.asarray(w)
+    planes = jnp.asarray(rng.standard_normal((cap, 2, L, N)) + 1j * rng.standard_normal((cap, 2, L, N)))
+
+    def node_rows(ops, n):
+        return planes[n][None, :, None]
+
+    plan = PassPlan(passes=((0, 3), (3, 3)), chunk=3, rows=3,
+                    windows=((0, 0, 3), (3, 0, 3)), blocks=(Block(),))
+
+    def node_rows_w(ops, n):
+        return jax.lax.dynamic_slice_in_dim(planes[n], ops, 3, axis=1)[None, :, None]
+
+    f = jax.jit(lambda c: stream_passes(c, mesh=mesh, plan=plan, weights=weights,
+                                        count=jnp.int32(count), node_rows=node_rows_w,
+                                        prepare=lambda window: window[0]))
+    out = np.asarray(f(jnp.zeros((n_out, 1, L, N), jnp.complex128)))
+    ref = np.zeros((n_out, 1, L, N), np.complex128)
+    for n in range(count):
+        for s in range(2):
+            ref = ref + w[s, :, n][:, None, None, None] * np.asarray(planes[n, s])[None, None]
+    np.testing.assert_allclose(out, ref, rtol=1e-13, atol=1e-13)
+    assert np.all(out[live_out:] == 0)

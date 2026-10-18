@@ -237,6 +237,139 @@ Two gates are properties of the pair, not of one artifact:
 - `LORRAX_FFI_VERIFY=off` disables the verifier and announces it on every
   invocation. An unverified library is not deployable.
 
+## The dependency closure: recorded at build, enforced at start-up {#closure}
+
+A leg's search path is `$ORIGIN` alone, a `DT_RUNPATH`, which
+`LD_LIBRARY_PATH` outranks. Without a record, the launch shell would decide which
+file serves each SONAME, and it has: on Perlmutter `cudatoolkit/13.2` puts the
+HPC SDK's cuSOLVERMp 0.8 under the SONAME of the staged 0.9.1 the CUDA leg is
+compiled against, and the site-default LibSci/HDF5 map cray-mpich 9.1.0 beside
+the pinned 9.0.1. So every build records the leg's dependency closure and
+every start-up enforces it, on every route (a clone, the module, a sealed
+bundle) and for every leg (CUDA, ROCm, host).
+
+**Recorded.** Every build script ends by writing `<leg>.closure.json` beside the
+leg (`src/ffi/cpp/stage/write_checkout_closure.py`): the leg's SHA-256 and every
+library of its `DT_NEEDED` closure, transitively, with path, size, mtime,
+SHA-256, `DT_SONAME` and family. Each name resolves from the first of:
+
+1. the engine-private stage (cuSOLVERMp/cuBLASMp, SLATE/BLAS++/LAPACK++);
+2. the directories the venv's JAX plugin loads its GPU libraries from (its
+   RPATH/RUNPATH: the CUDA wheels, or the ROCm SDK wheels). JAX maps those
+   before any leg opens, so the leg must bind the same copy;
+3. the pinned machine directories: MPI, parallel HDF5, LibSci (`ffi_mpi.sh`),
+   and on Perlmutter the toolkit's math and NCCL libraries, which serve a venv
+   without CUDA wheels such as the module's;
+4. the needing library's own RPATH/RUNPATH.
+
+The process, compiler and driver runtime (libc, libstdc++, libgomp, libcuda)
+and libraries reached only through the system search path (libfabric, libz)
+are listed as `external` and not enforced. An MPI, HDF5, LibSci, GPU
+math/collective or engine-private library found in none of the four refuses
+the build. `PROVENANCE` carries the record's `closure_sha256`, and
+`seal_bundle.py` copies both records into the manifest ([sealing](#seal)).
+
+**Enforced.** `lxkit.native_provider.open_and_attest`, before the leg can run
+anything:
+
+1. refuses a leg without a record, a record of another schema, a record
+   written for other leg bytes, and a recorded file that is gone, has another
+   size, or (when its mtime moved) another SHA-256;
+2. opens every recorded file by exact path, `RTLD_GLOBAL`, dependencies first,
+   so the recorded file holds each SONAME before anything searches for it;
+3. opens the leg, then reads `/proc/self/maps` and groups the mapped objects by
+   family (from their `DT_SONAME`). Every recorded family must be mapped
+   exactly once, at the recorded path or byte-identical to the recorded file.
+
+A wrong file, a second copy of a family (the one-MPI check, generalized to
+every recorded family) or a recorded family that is not mapped refuses. There
+is no fallback and no warning-and-continue. MPI is one family whatever the
+SONAME (`libmpi`, `libmpi_gnu`, `libmpi_gnu_123`, `libmpich`), as are LibSci,
+LibSci-MPI and HDF5 across their compiler and threading variants; any other
+library is its SONAME up to `.so`. h5py's auditwheel `libhdf5-<hash>.so`, a
+private SONAME that no leg can bind, is therefore not a second HDF5.
+
+One process maps one file per family across its legs. The one exception is
+the SLATE stack (SLATE, BLAS++, LAPACK++): in a process with a device leg, the
+device leg opens first and its build answers those SONAMEs for the host leg
+too ([load order](#loader)), so the host leg's record yields for those three
+families. Any other disagreement between the legs' records refuses. "First"
+is the order the legs' `dlopen`s succeeded, recorded at that moment in one
+registry that every loader (`ffi.common.ffi_loader`, `distrib_la.loader`)
+shares, not the order their checks finished.
+
+A yielded family means the host leg's SLATE code would run against the device
+leg's SLATE (on Frontier, SLATE-HIP with OpenBLAS). It must not run. In a
+device process neither loader registers the host leg's SLATE handlers
+(`lorrax_slate_eigh`, `_potrf`, `_batched_potrf`, `_batched_trsm`), both
+`probe_target`s report the refusal, and `distrib_la`'s SLATE call sites raise
+it by name:
+`GATE native-closure: host-leg <target> needs SLATE-CPU but the device leg's SLATE serves this process (…)`.
+The host leg's other handlers (ScaLAPACK, CBLAS, FFTW, phdf5) and its
+`lrx_slate_*` context entries link none of these libraries (`nm -C -u` on the
+host build: only `slate/host_ffi.cc` references `slate::`, `blas::` or
+`lapack::`), so they run (`native_provider.TARGET_FAMILIES`). Run a SLATE op on
+the device mesh, or in a CPU-only process, where the host leg's SLATE is its
+own. Distinct SONAMEs would not fix this: under `RTLD_GLOBAL` the first
+definition of each symbol still wins.
+
+**The refusal and its remedy.** Every refusal is one line:
+
+```text
+GATE native-closure: got <what is mapped or found>; want <what the record says>; fix: <remedy>
+```
+
+| got | cause | fix |
+|---|---|---|
+| `<path> serving libcusolverMp.so.0` with the staged file wanted | something mapped another copy before the leg opened: an `LD_PRELOAD`, a Python extension, a package that loads a module's library | remove what loads it; `LD_LIBRARY_PATH` neither causes nor fixes this. If the recorded file is the one that should change, rebuild the leg in the environment you run in |
+| `2 copies of mpi mapped: …` (or of HDF5, NCCL, cuBLAS, rocBLAS, …) | a second copy beside the recorded one, for example mpi4py or a site LibSci linked against another cray-mpich | the same |
+| `no closure record for …` | a leg built before this rule, or by a script that does not record | rebuild with the site's build script |
+| `stale closure record …` | the leg was rebuilt without its record, or a recorded file moved, was purged or was replaced (a module upgrade, a `uv sync` that changed the CUDA or ROCm wheels, a purged `.build`) | rebuild the leg |
+| `<leg> records mpi as … but <leg> (opened first) records …` | the two legs were built against different library sets | rebuild both legs in one environment |
+| `host-leg lorrax_slate_<op> needs SLATE-CPU but the device leg's SLATE serves this process` | a host-leg SLATE op called in a process with a device leg, whose SLATE answers the SONAMEs | run the op on the device mesh, or in a CPU-only process |
+| `libcudart.so on LD_LIBRARY_PATH resolves to <file> …: a second copy of libcudart` (multi-node) | the site transport would dlopen a runtime other than the recorded one (below) | source the site's launch script (`config/perlmutter/gpu_env.sh`, `config/frontier/rocm_env.sh`) before `srun` |
+
+**Before the first collective.** A GPU process opens its device leg as
+start-up step 5e, after the backend exists and before the mesh creates the
+first NCCL/RCCL communicator. That is when the collective library dlopens the
+site network plugin, and the plugin binds its own runtime by SONAME
+(Perlmutter's aws-ofi-nccl: `NEEDED libcudart.so.13`, no RUNPATH). With the
+closure already mapped it binds the recorded copy.
+
+**Launch libraries.** The site transport also dlopens some libraries by an
+unversioned name, which matches no loaded SONAME and so resolves only through
+the launch's `LD_LIBRARY_PATH`: libfabric's CUDA memory interface opens
+`libcudart.so`, its ROCr one `libhsa-runtime64.so`. `site.toml` lists them as
+`launch_libraries`. The site's launch script links each name to the run
+python's wheel runtime, first on `LD_LIBRARY_PATH` (`gpu_env.sh`,
+`rocm_env.sh`); a python without that wheel (the Perlmutter module, which
+records the toolkit runtime) leaves the path as the module sets it. On a
+multi-node step, step 5e refuses when a name's first match is not the recorded
+file of its family (`native_provider.check_launch_libraries`), before the
+transport can map a second runtime. This is the one place where
+`LD_LIBRARY_PATH` decides a mapped library, so it is checked rather than
+trusted.
+
+The check runs once per leg at start-up, and once more at the first
+`native_closure_identity()` call. It costs stat calls and the ELF headers of
+the mapped objects, plus a SHA-256 only on a mismatch. It touches no device
+and sets no variable.
+
+**Identity and caches.** `lxkit.native_provider.native_closure_identity(platform)`
+is the SHA-256 of the enforced record (paths and content hashes) and the files
+verified mapped for it, computed once at enforcement. It keys every
+persistent cache that depends on native libraries, so a different library set
+never reuses an entry:
+
+- the JAX compile-cache namespace (`…_ffi-<12 hex>_k2`); an explicit
+  `ISDF_JAX_CACHE_DIR` is split by the same tag;
+- the k-convolution NVRTC/hipRTC image store and the rocFFT kernel store;
+- the sealed `bundle_id` and the build's `PROVENANCE`.
+
+`python -m lxkit.closure verify <leg>` checks a record without loading
+the leg and prints the identity it promises (exit 3 on a refusal), for
+build-reuse tooling ([the FFI source key](../architecture/startup_environment.md#ffi-source-key)).
+
 ## Sealing the deployable pair {#seal}
 
 A private build runs unsealed. To publish a pair for other users, seal it
@@ -270,11 +403,17 @@ full source revision, each file's size and SHA-256, each ELF SONAME and
   libraries belong to the machine runtime and are refused: a copy in the
   bundle would be a second instance of a library the whole process
   shares.
-- **At load**, `lxkit.native_provider` rehashes both legs and the closure,
-  preloads each private library by exact path (so no run script owns a
-  library search path), checks with `dladdr` which file the live ABI symbol
-  came from, and refuses any mapped engine-private library the manifest does
-  not name.
+- **Closure.** Each leg's build record is copied into the manifest's
+  `closures` (schema 2). Its private entries point at the sealed copies, which
+  must be byte-identical to the files the build recorded. A machine or JAX
+  plugin file the record names may not live under scratch or a build tree. A
+  `--private-lib` that neither record names refuses. A schema-1 bundle (no
+  closures) refuses at load: reseal.
+- **At load**, `lxkit.native_provider` rehashes both legs and the private
+  libraries, enforces the leg's recorded closure ([the dependency
+  closure](#closure)) exactly as for a checkout leg, checks with `dladdr`
+  which file the live ABI symbol came from, and refuses any mapped
+  engine-private library the manifest does not name.
 - **Compatibility.** The manifest's source revision is provenance, not a
   demand that the running checkout have the same commit. Compatibility is the
   exported ABI number, the live feature and target probes, and the build
@@ -300,8 +439,10 @@ the same `lxkit.native_provider` policy) chooses one library per platform:
   naming `cuda` or `gpu` first, and an NVIDIA device is visible), opening the host library
   opens the CUDA library first, so a CUDA-built SLATE and BLAS++, when
   present, win the shared SONAMEs: a host-built BLAS++ reports zero devices
-  to a CUDA SLATE. After each `dlopen` the loader refuses a process with more
-  than one MPI runtime mapped.
+  to a CUDA SLATE. Each leg opens over its recorded dependency closure, and
+  after each `dlopen` the loader refuses a process that maps a wrong file or a
+  second copy of any recorded family ([the dependency closure](#closure)),
+  more than one MPI runtime included.
 - **Probe.** `probe_target(target, platform)` gives one of three reasons a
   target is unusable: the name is unknown, the library could not be loaded,
   or it loaded without that handler. Every gate refusal quotes it.

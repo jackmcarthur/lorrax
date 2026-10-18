@@ -1496,8 +1496,9 @@ def _sweep_body(geom: SweepGeometry, operators: tuple, spans: tuple,
         if operator.coeffs is not None:
             # Separable terms: psum the slab projections (R·ns·nb, no G
             # axis), then couple this rank's bra rows and ket columns.
-            co = jax.lax.psum(per_k(operator.coeffs, consts)(
-                psi_g, gv_s, gm_s, t["kvec"]), axes)
+            from lxkit import ordered_psum          # rank order on every GCD placement
+            co = jax.tree_util.tree_map(lambda v: ordered_psum(v, axes), per_k(operator.coeffs, consts)(
+                psi_g, gv_s, gm_s, t["kvec"]))
             x0 = jax.lax.axis_index("x") * nbx
             y0 = jax.lax.axis_index("y") * nby
 

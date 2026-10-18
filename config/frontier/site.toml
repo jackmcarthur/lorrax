@@ -1,0 +1,69 @@
+# What Frontier (OLCF, MI250X, Slingshot 11) provides and requires.
+# runtime.network_env reads this file when LORRAX_SITE_PROFILE, NERSC_HOST or
+# LMOD_SYSTEM_NAME is "frontier" (OLCF's Lmod sets LMOD_SYSTEM_NAME=frontier)
+# and owns when it applies.
+
+# Paths the site defines under another name than LORRAX reads.
+[paths]
+# OLCF defines no SCRATCH; its Lustre member-work tree is
+# $MEMBERWORK/<project> (/lustre/orion/<project>/scratch/<user>; $MEMBERWORK
+# itself is not writable).  runtime sets SCRATCH to this when it is unset and
+# the expansion is a writable directory, so every per-user cache
+# (lxkit.user_cache_dir: the compile cache, rocFFT/comgr kernel caches) leaves
+# NFS HOME.  Outside a job (no SLURM_JOB_ACCOUNT) the rule does not apply and
+# says so.
+scratch = "$MEMBERWORK/$SLURM_JOB_ACCOUNT"
+
+# A multi-node ROCm step.  RCCL reads NCCL_* variables.
+[rccl]
+# libfabric's ROCr memory interface dlopens "libhsa-runtime64.so" (unversioned);
+# the ROCm wheel ships only libhsa-runtime64.so.1.  Without the name on the
+# launch's LD_LIBRARY_PATH every GPU-buffer registration fails ("NET/OFI
+# Unable to register memory (type = 2) ... Bad address") and the step dies in
+# its first inter-node collective; with it RCCL runs GDRDMA (measured
+# 2026-10-15, P=16).  The file must be the wheel's own runtime, never a module
+# ROCm's: two HSA runtimes in one process.
+launch_libraries = ["libhsa-runtime64.so"]
+launch_libraries_remedy = "Source config/frontier/rocm_env.sh before srun: it links the wheel's HSA runtime under that name and puts it on LD_LIBRARY_PATH."
+# cray-mpich must open its CXI endpoint before RCCL's OFI plugin does: with
+# RCCL first (the plugin takes endpoints on all four NICs at the first
+# inter-node collective) MPI_Init_thread fails "OFI EP enable failed ... No
+# space left on device" on every rank (P=16, 2026-10-15; independent of the
+# FI_CXI_* values below, four subsets tried); with MPI first both run.  So
+# runtime.bootstrap initializes MPI through the host leg right after backend
+# start-up, before any collective.
+mpi_before_collectives = true
+
+# The Slingshot settings OLCF's rccl-net-plugin/1.0 module sets (`module show`,
+# OLCF 2026-07-01: aws-ofi-nccl 1.19.2 built per ROCm), plus the transport
+# choice, filled in where the caller has not exported them.  The module itself
+# does NOT set NCCL_NET or NCCL_NET_PLUGIN (its lua prepends the plugin's lib
+# directory to LD_LIBRARY_PATH and needs a module ROCm); LORRAX names both: an
+# absolute plugin path because LD_LIBRARY_PATH cannot change once Python has
+# started, and NCCL_NET so a plugin that does not load fails RCCL's init by name
+# instead of falling back to sockets.  A caller who exports either chooses the
+# transport; the other settings here are still filled in (runtime.network_env,
+# explicit transport).  The plugin is the ROCm 7.13.0 build, the newest beside
+# the wheel's ROCm 7.14.1; it links libamdhip64.so.7, which resolves to the HIP
+# runtime the ROCm PJRT plugin already mapped, and libfabric 2.3.1 from the Cray
+# PE library path.  Measured at P=16 (2 nodes x 8 GCDs, 512 MiB per rank, one rank
+# per node in each group): without this section RCCL ran NET/Socket over bond0
+# and hsn0-3, psum 1.25 GB/s and all_to_all 1.11 GB/s (bus bandwidth); with it
+# NET/AWS Libfabric/GDRDMA, all_to_all 11.4-11.6 GB/s and psum 11.6-22.0 GB/s
+# (bimodal from run to run, with or without async collectives; 8 runs).
+[rccl.env]
+NCCL_NET = "AWS Libfabric"
+NCCL_NET_PLUGIN = "/sw/frontier/rccl-plugins/aws-ofi-nccl/1.19.2/rocm/7.13.0/lib/librccl-net.so"
+NCCL_CROSS_NIC = "1"
+NCCL_NET_GDR_LEVEL = "PHB"
+NCCL_SOCKET_IFNAME = "hsn0,hsn1,hsn2,hsn3"
+HSA_FORCE_FINE_GRAIN_PCIE = "1"
+FI_MR_CACHE_MONITOR = "kdreg2"
+FI_CXI_DISABLE_HOST_REGISTER = "1"
+FI_CXI_DEFAULT_CQ_SIZE = "131072"
+FI_CXI_RDZV_PROTO = "alt_read"
+FI_CXI_RDZV_EAGER_SIZE = "0"
+FI_CXI_RDZV_THRESHOLD = "0"
+FI_CXI_RDZV_GET_MIN = "0"
+FI_CXI_DEFAULT_TX_SIZE = "2048"
+FI_CXI_RX_MATCH_MODE = "hybrid"

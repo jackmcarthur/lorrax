@@ -445,6 +445,7 @@ class _SerialBackend(_DatasetGeometry):
         global_shape: Sequence[int] | None = None,
         valid_shape: Sequence[int] | None = None,
         dtype=None,
+        require_finite: bool = False,
     ) -> None:
         """Write ``A``'s shards into ``name``, one shard at a time.
 
@@ -520,17 +521,27 @@ class _SerialBackend(_DatasetGeometry):
         # tiers' logs comparable line for line.
         ds = self._h5[name]
         if host:
-            self._write_block(ds, np.asarray(A), (0,) * len(slab_shape),
-                              off, vshape)
-            return
-        seen: set = set()
-        for shard in A.addressable_shards:
-            starts, _stops = _index_bounds(shard.index, slab_shape)
-            if starts in seen:
-                continue                     # replica of one already written
-            seen.add(starts)
-            self._write_block(ds, np.asarray(shard.data), starts, off,
-                              vshape)
+            blocks = [((0,) * len(slab_shape), np.asarray(A))]
+        else:
+            blocks, seen = [], set()
+            for shard in A.addressable_shards:
+                starts, _stops = _index_bounds(shard.index, slab_shape)
+                if starts in seen:
+                    continue                 # replica of one already written
+                seen.add(starts)
+                blocks.append((starts, np.asarray(shard.data)))
+        if require_finite:
+            # The host blocks this tier writes from; all checked before any
+            # is written (the FFI tier checks its staging copy instead).
+            for starts, block in blocks:
+                if (np.issubdtype(block.dtype, np.inexact)
+                        and not np.isfinite(block).all()):
+                    raise ValueError(
+                        f"GATE slab_io_write_finite: got: a non-finite value in the "
+                        f"block of {name!r} at slab start {tuple(starts)}; want: every "
+                        f"value finite (write_slab require_finite=True); nothing written")
+        for starts, block in blocks:
+            self._write_block(ds, block, starts, off, vshape)
 
     @staticmethod
     def _write_block(ds, block: np.ndarray, starts: Sequence[int],
@@ -708,6 +719,14 @@ class _SerialBackend(_DatasetGeometry):
             tuple(int(s) for s in read_shape), sharding, _block)
 
     # ------------------------------------------------------------------
+    def read_multi(self, requests, *, partition_spec, mesh: Mesh | None = None) -> list:
+        """N :meth:`read_slab` requests: this tier's transport is per shard
+        (one process owns every shard), so the list is its own loop."""
+        return [self.read_slab(r["name"], shape=r["shape"], dtype=r.get("dtype"),
+                               offset=r.get("offset"), valid_shape=r.get("valid_shape"),
+                               mesh=mesh, partition_spec=partition_spec)
+                for r in requests]
+
     def read_slabs(
         self,
         name: str,
