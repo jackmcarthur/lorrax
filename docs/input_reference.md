@@ -356,6 +356,7 @@ behind `lorrax.model = isdf` is on [TD-aGW interaction](theory/td_agw.md).
 | `lorrax.collision_hermitian` | `dynamic` | The held Hermitian part ΔΣ^h added to K δρ at each refresh: `dynamic`, Herm S̃[ρ] − Herm S̃[ρ_eq] less its static-W limit (the population response of W^c(0), which K already holds); `full`, Herm S̃[ρ] − Herm S̃[ρ_eq]; `none`. | `td_collision` |
 | `lorrax.collision_refresh_fs` | `0.0` (= never) | Refresh the rates, the dissipator and ΔΣ^h every this many fs (at the first chunk end past it); 0 holds the rates of ρ_eq. | `td_collision_refresh` |
 | `lorrax.collision_refresh_df` | `0.0` (= never) | Refresh at the first chunk end where max \|f − f_last\| over the window's populations exceeds this; 0 = no population trigger. | `td_collision_refresh` |
+| `lorrax.collision_refresh_sweep` | `full` | What a refresh sweeps: `full`, the window Σ over every intermediate band, planned on the GW run's on-shell list; `active`, the window's own intermediate bands only, added to the frozen bands' part evaluated once at t0 (exact with W frozen: each Σ branch is linear in the intermediate populations and the frozen bands keep theirs), both parts planned on the window's own on-shell energies, each on its own held quadrature session ([td_agw_dynamical.md §1.6](theory/td_agw_dynamical.md)). The refresh lines name the sweep's τ nodes. | `td_collision` |
 
 `[measurements.<i>]` options, by measurement index `<i>` (0-based, as in
 TDGW): `dataset_name` (default: the type), `itrange` and `ntsave` (TDGW's

@@ -51,12 +51,20 @@ G7  branches=True at the same state, one sweep: cond + val + static == pair
 G8  static_limit=True: sx == the dense -sum_s f_s <s| W^c(0) |s> exchange on
     every mode (window block, instantaneous basis)                          rel <= 1e-8
     and the head part is zero (no head on this bundle)
+G9  the split band sum (td_agw_dynamical.md §1.6) at the excited state of G5:
+    window_sigma_c(internal="frozen") + window_sigma_c(internal="active")
+    == the whole sum for the pair, each branch, the static term and the
+    static limit (separately planned: within the rules' eps)                rel <= 1e-5;
+    a window-only plan == the prefix plan                                   rel <= 1e-5;
+    on one held session (every active state live in both branches) the
+    active part is affine in f: A[(f1 + f2)/2] == (A[f1] + A[f2])/2         rel <= 1e-12
 R0  the conjugate particle-hole orientation at i w_p (z -> -z) fails G0
 R1  chi0^fa dropped fails G2 (W)
 R2  pole order swapped (D -> -D: R_+ <-> R_-) fails G5
 R3  frozen bands omitted from G fails G5
 R4  populations read in the fixed basis fails G5
 R5  the hole sign flipped (G~< = +i(S~_h - S~_h^H)) fails G7 (G~<)
+R6  a stale active part (at f_eq, not f) fails G9 (pair)
 """
 import json
 import sys
@@ -513,6 +521,33 @@ def run_checks(mesh):
         rows["G8_sx"] = _rel(outb["static_limit"]["sx"],
                              _dense_sx(psi_r, f_r, psi_r[:, B_LO:B_LO + NA], gather(poles.Wc0_q)))
         rows["G8_head"] = float(np.max(np.abs(outb["static_limit"]["head"])))
+        # ---- G9: the split band sum, the window-only plan, the held active session
+        kw = dict(meta=meta, mesh_xy=mesh, branches=True, static_limit=True)
+        fro = PS.window_sigma_c(wfns, poles, win, splan, internal="frozen", **kw)
+        act = PS.window_sigma_c(wfns, poles, win, splan, internal="active", **kw)
+        tot = PS.add_window_parts(fro, act)
+        rows["G9_pair"] = _rel(tot["pair"], outb["pair"])
+        rows["G9_branches"] = max(_rel(tot["branch_pair"][k_], outb["branch_pair"][k_])
+                                  for k_ in ("cond", "val", "static"))
+        rows["G9_static_limit"] = _rel(tot["static_limit"]["sx"], outb["static_limit"]["sx"])
+        rows["G9_tau"] = [int(fro["sweep"]["distinct_tau"]), int(act["sweep"]["distinct_tau"]),
+                          int(outb["sweep"]["distinct_tau"])]
+        wplan = PS.window_sigma_plan(_config(omega_ry), window_only=True)
+        own = PS.window_sigma_c(wfns, poles, win, wplan, **kw)
+        rows["G9_window_only"] = _rel(own["pair"], outb["pair"])
+        rows["G9_window_only_tau"] = int(own["sweep"]["distinct_tau"])
+        held = PS.window_sigma_plan(_config(omega_ry), session={}, window_only=True)
+        frac = lambda c: np.clip(c + 0.1 * rng.standard_normal((nk, NA)), 0.05, 0.95)
+        PS.window_sigma_c(wfns, poles, dict(win, f=np.full((nk, NA), 0.5)), held,
+                          internal="active", **kw)                         # the session's plan
+        f1, f2 = frac(np.full((nk, NA), 0.4)), frac(np.full((nk, NA), 0.6))
+        a1, a2, am = (PS.window_sigma_c(wfns, poles, dict(win, f=ff), held, internal="active",
+                                        **kw) for ff in (f1, f2, 0.5 * (f1 + f2)))
+        rows["G9_affine"] = _rel(am["pair"], 0.5 * (a1["pair"] + a2["pair"]))
+        rows["G9_affine_rebuilds"] = sum(int(o["sweep"]["rebuilds"]) for o in (a1, a2, am))
+        stale = PS.window_sigma_c(wfns, poles, dict(win, f=f[:, B_LO:B_LO + NA]), splan,
+                                  internal="active", **kw)
+        rows["R6"] = _rel(PS.add_window_parts(fro, stale)["pair"], outb["pair"])
         # R2: pole order swapped; R3: frozen bands omitted; R4: fixed-basis populations
         import dataclasses
         swapped = dataclasses.replace(poles, B_odd_q=-poles.B_odd_q)
@@ -530,9 +565,10 @@ GATES = dict(G0_W0=1e-8, G0_Wp=1e-8, G1_static=1e-8, G1_probe=1e-8, G2_W0=1e-8, 
              G2_poles_vs_driver=1e-8, G2_poles_vs_dense=1e-8, G3_W=1e-8, G3_poles_vs_dense=1e-8,
              G4=1e-5, G5=1e-5, G6_onshell=1e-5, G6_omega=1e-5, G7_split=1e-12,
              G7_pair_same=1e-12, G7_cond=1e-5, G7_val=1e-5, G7_static=1e-5, G7_gout=1e-5,
-             G7_gin=1e-5, G8_sx=1e-8, G8_head=0.0)
-COUNTS = ("G2_valid_vs_driver", "G2_valid_vs_dense", "G3_valid_vs_dense")
-TWINS = dict(R0="G0_Wp", R1="G2_W0", R2="G5", R3="G5", R4="G5", R5="G7_gin")
+             G7_gin=1e-5, G8_sx=1e-8, G8_head=0.0, G9_pair=1e-5, G9_branches=1e-5,
+             G9_static_limit=1e-5, G9_window_only=1e-5, G9_affine=1e-12)
+COUNTS = ("G2_valid_vs_driver", "G2_valid_vs_dense", "G3_valid_vs_dense", "G9_affine_rebuilds")
+TWINS = dict(R0="G0_Wp", R1="G2_W0", R2="G5", R3="G5", R4="G5", R5="G7_gin", R6="G9_pair")
 
 
 def verdict(rows):

@@ -796,9 +796,22 @@ def window_branch_rates(tabs: dict):
     return g_out, g_in, s
 
 
+#: ``gnppm_collision``'s refresh sweeps (``[lorrax] collision_refresh_sweep``).
+REFRESH_SWEEPS = ("full", "active")
+
+
+def _sweep_nodes(out: dict) -> dict:
+    """The tau-node census of one ``window_sigma_c`` output (its ``sweep``)."""
+    s = out.get("sweep") or {}
+    return dict(distinct_tau=int(s.get("distinct_tau", 0)),
+                window_tau_pairs=int(s.get("window_tau_pairs", 0)),
+                n_windows=int(s.get("n_windows", 0)), rebuilds=int(s.get("rebuilds", 0)),
+                windows=list(s.get("windows", ())))
+
+
 def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: int,
                     form: str = "subtracted", hermitian: str = "dynamic", policy=None,
-                    say=print, record=None):
+                    sweep: str = "full", check_full: bool = False, say=print, record=None):
     """The held collision term of the GN-PPM member at t0 and its refresh hook (§1.5, §7.1).
 
     Parameters
@@ -810,6 +823,17 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     ntr : the propagator's trials (each gets its own rates).
     form : ``tdagw.collision.FORMS``; ``hermitian`` : ``tdagw.collision.HERMITIAN_MODES``.
     policy : ``tdagw.collision.RefreshPolicy`` (None: the rates of t0 throughout).
+    sweep : :data:`REFRESH_SWEEPS`.  ``"full"``: one window sweep over every
+        intermediate band per refresh, planned on the GW run's on-shell list (the
+        incumbent).  ``"active"`` (td_agw_dynamical.md §1.6): with W frozen and
+        dress none every branch is linear in the intermediate weights and the
+        frozen bands keep their populations, so their part (``window_sigma_c(
+        internal="frozen")``) is evaluated once at t0 and a refresh sweeps the
+        window's own intermediate bands (``internal="active"``); each part on its
+        own held quadrature session, planned on the window's on-shell energies.
+    check_full : ``sweep = "active"`` only (diagnostic): also run the full sweep at
+        t0 and at every refresh and record the differences of the rates and of
+        Delta Sigma^h (``full_vs_split`` in each record).
     say : the stdout line of each refresh; ``record`` (or None) gets each
         refresh's dict (the run log's section, the case scripts' tables).
 
@@ -829,7 +853,7 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     import time
     from common.collectives import gather_to_host
     from common.units import RYD_TO_EV
-    from gw.ppm_sigma import window_sigma_c
+    from gw.ppm_sigma import add_window_parts, window_sigma_c, window_sigma_plan
     from tdagw import collision as C
     from tdagw import propagate as tp
     from tdagw.self_energy import held_term
@@ -838,6 +862,11 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     if hermitian not in C.HERMITIAN_MODES:
         _refuse("dynsig_collision_hermitian", repr(hermitian), " | ".join(C.HERMITIAN_MODES),
                 "pick one")
+    if sweep not in REFRESH_SWEEPS:
+        _refuse("dynsig_collision_sweep", repr(sweep), " | ".join(REFRESH_SWEEPS), "pick one")
+    if check_full and sweep != "active":
+        _refuse("dynsig_collision_check", "check_full with sweep = 'full'", "sweep = 'active'",
+                "the check compares the split refresh with the full one")
     policy = C.RefreshPolicy() if policy is None else policy
     wfns, meta, poles, splan = source["wfns"], source["meta"], source["poles"], source["plan"]
     nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
@@ -870,11 +899,34 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     def to_td(a):                         # bundle rows (nk, ...) -> TD rows
         return np.asarray(a)[bundle_of]
 
-    def sweep(f_bundle):
+    def window(f_bundle, plan, internal=None):
         """One window Sigma (both branches) at window populations f (bundle rows)."""
+        t = time.perf_counter()
         out = window_sigma_c(wfns, poles, dict(b_lo=int(b_lo), U=eye, e=e_g, f=f_bundle),
-                             splan, meta=meta, mesh_xy=mesh, branches=True,
-                             static_limit=dynamic)
+                             plan, meta=meta, mesh_xy=mesh, branches=True,
+                             static_limit=dynamic, internal=internal)
+        out["wall_s"] = time.perf_counter() - t
+        return out
+
+    held_parts, plans = {}, {}
+    t_split = time.perf_counter()
+    if sweep == "active":
+        # A held session's first call is served by one-shot rules (gw.sigma_box_plan), so each
+        # part's session is planned by a call before t0: every value the run uses then comes
+        # from held rules, and a refresh at rho_eq reproduces t0.  The active part is planned
+        # with every active state live in both branches (f = 1/2), the superset of the live
+        # sets a run reaches; the frozen part's states never change.
+        cfg = source["config"]
+        plans = dict(frozen=window_sigma_plan(cfg, head=None, session={}, window_only=True),
+                     active=window_sigma_plan(cfg, head=source["head"], session={},
+                                              window_only=True))
+        window(f_b, plans["frozen"], "frozen")
+        held_parts["frozen"] = window(f_b, plans["frozen"], "frozen")
+        window(np.full_like(f_b, 0.5), plans["active"], "active")
+    t_split = time.perf_counter() - t_split
+
+    def tables(out):
+        """The rates, S~ and the static-W limit of one window output, on the TD k rows."""
         g_out, g_in, s = window_branch_rates(out["branch_pair"])
         static = None
         if dynamic:
@@ -882,7 +934,21 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
             static = out["static_limit"]["sx"].copy()
             static[:, idx, idx] += out["static_limit"]["head"]
         return dict(g_out=to_td(g_out), g_in=to_td(g_in), s=to_td(s),
-                    static=None if static is None else to_td(static), raw=out)
+                    static=None if static is None else to_td(static), raw=out,
+                    wall_s=out["wall_s"])
+
+    def full_sweep(f_bundle):
+        out = window(f_bundle, splan)
+        return dict(tables(out), nodes=_sweep_nodes(out))
+
+    def sweep_tables(f_bundle):
+        """The refresh's window Sigma at window populations f (bundle rows)."""
+        if sweep == "full":
+            return full_sweep(f_bundle)
+        act = window(f_bundle, plans["active"], "active")
+        out = add_window_parts(held_parts["frozen"], act)
+        out["wall_s"] = act["wall_s"]
+        return dict(tables(out), nodes=_sweep_nodes(act))
 
     put = lambda a: tp.place_window_blocks(a, mesh, nk_pad)
     stack = lambda key, parts: np.stack([p[key] for p in parts]) * half
@@ -892,17 +958,32 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     def populations(rho):
         return np.asarray(gather_to_host(pops(rho)))[:, :nk]               # (ntr, nk, nb)
 
+    ry_mev = RYD_TO_EV * 1e3
+
+    def compare(a, b, h_a=None, h_b=None):
+        """Split vs full tables at one state: rates (G~>, G~<), S~ and Delta Sigma^h, meV."""
+        mx = lambda x: float(np.max(np.abs(x)))
+        scale = max(mx(b["g_out"]), mx(b["g_in"]), 1e-300)
+        d = dict(rate_out_mev=mx(a["g_out"] - b["g_out"]) * ry_mev,
+                 rate_in_mev=mx(a["g_in"] - b["g_in"]) * ry_mev,
+                 rate_rel=max(mx(a["g_out"] - b["g_out"]), mx(a["g_in"] - b["g_in"])) / scale,
+                 s_mev=mx(a["s"] - b["s"]) * ry_mev, full_tau=b["nodes"]["distinct_tau"],
+                 full_s=b["wall_s"])
+        if h_a is not None:
+            d["herm_mev"] = mx(np.asarray(h_a) - np.asarray(h_b)) * 2.0 * ry_mev   # Ha -> meV
+        return d
+
     # ---- t0: the equilibrium rates, C[rho_eq], the first dissipator
     t_a = time.perf_counter()
-    eq = sweep(f_b)
+    eq = sweep_tables(f_b)
     t_b = time.perf_counter()
+    eq_full = full_sweep(f_b) if check_full else None
     g_out_eq, g_in_eq = put(stack("g_out", [eq] * ntr)), put(stack("g_in", [eq] * ntr))
     rho0 = put(np.broadcast_to(np.asarray(gather_to_host(ops.rho_eq))[:nk], (ntr, nk, nb, nb)))
     res = program(g_out_eq, g_in_eq, rho0, ops.rho_eq, g_out_eq, g_in_eq, ops.w_k)
     c_eq = res["c_eq"]
     jax.block_until_ready(res["diss"])
     t_c = time.perf_counter()
-    ry_mev = RYD_TO_EV * 1e3
     geq_h = np.stack([eq["g_out"], eq["g_in"]])                            # Ry
     d_out, d_in = (np.real(np.einsum("kii->ki", g)) for g in geq_h)
     receipt = dict(
@@ -915,9 +996,18 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         min_eig_in_mev=float(np.linalg.eigvalsh(0.5 * (eq["g_in"] + np.conj(
             np.swapaxes(eq["g_in"], -1, -2)))).min() * ry_mev),
         c_eq_diag=float(res["c_eq_diag"]), c_eq_offdiag=float(res["c_eq_offdiag"]),
-        trace=[float(v) for v in np.asarray(res["trace"])], form=form, hermitian=hermitian)
+        trace=[float(v) for v in np.asarray(res["trace"])], form=form, hermitian=hermitian,
+        sweep=sweep, nodes=eq["nodes"],
+        frozen=(None if not held_parts else dict(
+            nodes=_sweep_nodes(held_parts["frozen"]), wall_s=held_parts["frozen"]["wall_s"],
+            setup_s=t_split)))
+    if eq_full is not None:
+        receipt["full_vs_split"] = compare(eq, eq_full)
     s_eq = np.stack([eq["s"]] * ntr)
     static_eq = None if not dynamic else np.stack([eq["static"]] * ntr)
+    if eq_full is not None:
+        s_eq_full = np.stack([eq_full["s"]] * ntr)
+        static_eq_full = None if not dynamic else np.stack([eq_full["static"]] * ntr)
     held0 = None if hermitian == "none" else put(np.zeros((ntr, nk, nb, nb), complex))
     state = dict(t_last=0.0, f_last=np.broadcast_to(f_td, (ntr, nk, nb)).copy(), n=0,
                  trace_last=np.asarray(res["trace"]).copy(), history=[receipt],
@@ -928,7 +1018,11 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
             f"min eig G~ {receipt['min_rate_mev']:.3g} meV (G~> {receipt['min_eig_out_mev']:.3g}, "
             f"G~< {receipt['min_eig_in_mev']:.3g}); ||C[rho_eq]|| diag {receipt['c_eq_diag']:.3e} "
             f"off-diag {receipt['c_eq_offdiag']:.3e} Ha/hbar; wall {receipt['wall_s']:.2f} s "
-            f"(sweep {receipt['sweep_s']:.2f}, build {receipt['build_s']:.2f})")
+            f"(sweep {receipt['sweep_s']:.2f}, build {receipt['build_s']:.2f}); sweep {sweep}: "
+            f"{eq['nodes']['distinct_tau']} tau in {eq['nodes']['n_windows']} windows"
+            + ("" if not held_parts else
+               f" (frozen part once: {receipt['frozen']['nodes']['distinct_tau']} tau, "
+               f"{receipt['frozen']['wall_s']:.2f} s)"))
     say(line)
     if record is not None:
         record(dict(receipt, line=line))
@@ -940,11 +1034,12 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         if not due:
             return None
         t1 = time.perf_counter()
-        parts = []
+        parts, f_rows = [], []
         for tr in range(ntr):
             fb = np.empty((kb_frac.shape[0], nb))
             fb[bundle_of] = f[tr]
-            parts.append(sweep(fb))
+            f_rows.append(fb)
+            parts.append(sweep_tables(fb))
         t2 = time.perf_counter()
         g_out, g_in = put(stack("g_out", parts)), put(stack("g_in", parts))
         t3 = time.perf_counter()
@@ -952,7 +1047,7 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         new_ops = ops_now._replace(collision=out["diss"])
         jax.block_until_ready(out["diss"])
         t4 = time.perf_counter()
-        new_params, delta, held_max = params, None, 0.0
+        new_params, delta, held_max, h = params, None, 0.0, None
         if hermitian != "none":
             s_t = np.stack([p["s"] for p in parts])
             st_t = None if not dynamic else np.stack([p["static"] for p in parts])
@@ -971,7 +1066,19 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                    in_per_fs=[float(v) * fs for v in np.asarray(out["inn"])],
                    d_trace=[float(v) for v in (trace - state["trace_last"])],
                    min_rate_mev=float(out["min_rate"]) * 2.0 * ry_mev, held_max_mev=held_max,
-                   c_eq_diag=receipt["c_eq_diag"], c_eq_offdiag=receipt["c_eq_offdiag"])
+                   c_eq_diag=receipt["c_eq_diag"], c_eq_offdiag=receipt["c_eq_offdiag"],
+                   sweep=sweep, nodes=parts[0]["nodes"])
+        if check_full:                       # diagnostic, outside the refresh's wall
+            fulls = [full_sweep(fb) for fb in f_rows]
+            h_full = None
+            if hermitian != "none":
+                h_full = np.asarray(C.hermitian_update(
+                    np.stack([p["s"] for p in fulls]), s_eq_full,
+                    None if not dynamic else np.stack([p["static"] for p in fulls]),
+                    static_eq_full)) * half
+            cmp = [compare(p, q, None if h is None else h[i], None if h_full is None else h_full[i])
+                   for i, (p, q) in enumerate(zip(parts, fulls))]
+            rec["full_vs_split"] = {k: max(c[k] for c in cmp) for k in cmp[0]}
         state.update(t_last=float(t), f_last=f, trace_last=trace)
         state["history"].append(rec)
         line = (f"  collision refresh {rec['n']:3d} at {rec['t_fs']:9.4f} fs ({why}): wall "
@@ -980,12 +1087,17 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                 f"{df:.3e}, dTr rho {max(rec['d_trace'], key=abs):+.3e} since last; d(Tr rho)/dt "
                 f"out {min(rec['out_per_fs']):+.3e} in {max(rec['in_per_fs']):+.3e} per fs; min "
                 f"eig G~ {rec['min_rate_mev']:.3g} meV; max|dSigma^h| {held_max:.3g} meV; "
-                f"||C[rho_eq]|| diag {rec['c_eq_diag']:.2e} off {rec['c_eq_offdiag']:.2e}")
+                f"||C[rho_eq]|| diag {rec['c_eq_diag']:.2e} off {rec['c_eq_offdiag']:.2e}; "
+                f"{sweep} sweep {rec['nodes']['distinct_tau']} tau"
+                + (f" ({rec['nodes']['rebuilds']} rules rebuilt)" if rec["nodes"]["rebuilds"] else "")
+                + ("" if "full_vs_split" not in rec else
+                   f"; vs full: rates {rec['full_vs_split']['rate_rel']:.2e} rel, "
+                   f"dSigma^h {rec['full_vs_split'].get('herm_mev', 0.0):.2e} meV"))
         say(line)
         if record is not None:
             record(dict(rec, line=line))
         return dict(ops=new_ops, params=new_params, delta=delta)
 
     return dict(diss=res["diss"], held=held0, refresh=refresh, t0=receipt, state=state,
-                c_eq=c_eq, rates_eq=(g_out_eq, g_in_eq), sweep=sweep, program=program, eq=eq,
-                bundle_of=bundle_of)
+                c_eq=c_eq, rates_eq=(g_out_eq, g_in_eq), sweep=sweep_tables, program=program,
+                eq=eq, bundle_of=bundle_of, parts=held_parts, plans=plans)

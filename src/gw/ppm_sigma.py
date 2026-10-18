@@ -1141,6 +1141,7 @@ def _compute_invalid_static_sigma(
     mesh_xy: Mesh,
     occupation_state=None,
     q_wedge=None,
+    coulomb_hole: bool = True,
 ) -> np.ndarray:
     """Static-COHSEX Σ for the invalid PPM poles (BGW ``invalid_gpp_mode=3``).
 
@@ -1178,12 +1179,17 @@ def _compute_invalid_static_sigma(
     it matters in ``cohsex_sigma``: the screened-exchange half of this
     term runs over the OCCUPIED manifold, so on a metal the Fermi-shell
     bands must enter with their fractional weights.
+
+    ``coulomb_hole = False`` returns the screened-exchange half alone (the
+    population-dependent part of a split band sum, :class:`InternalBands`).
     """
     from .cohsex_sigma import build_Gij
     Gij = build_Gij(meta, mesh_xy, occupation_state)
     sigma_sx, sigma_coh, W_static = _invalid_static_kernels(
         wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge)
     sx = _band_sigma_host(sigma_sx(wfns, Gij, W_static), wfns)
+    if not coulomb_hole:
+        return sx
     coh = _band_sigma_host(sigma_coh(wfns, W_static, None), wfns)
     return sx + coh
 
@@ -1359,6 +1365,7 @@ def compute_sigma_c_ppm_omega_grid(
     request_for=None,
     omega_grid_ry: np.ndarray | None = None,
     populations=None,
+    internal: 'InternalBands | None' = None,
     keep_branches=False,
     print_fn=print,
 ) -> SigmaOmegaResult:
@@ -1373,6 +1380,11 @@ def compute_sigma_c_ppm_omega_grid(
     the invalid-pole static term's occupied projector is diag(f).  ``None`` is
     the incumbent 0/1 step split, bit-for-bit.  The step table ``wfns.occ``
     still fixes the gap check and the omega frame.
+
+    ``internal`` (:class:`InternalBands`, with ``populations`` only) restricts
+    the intermediate-state band sum: both causal branches and the invalid-pole
+    term's occupied projector run over its bands, and the windows are planned
+    on their energies.  ``None`` is the whole sum.
 
     The PPM fit remains the two-point algebra in :func:`fit_ppm`.  This stage
     applies the established invalid-pole policy, hands that result to the
@@ -1470,17 +1482,25 @@ def compute_sigma_c_ppm_omega_grid(
 
     sigma_static_host = None
     static_coh_at_counts = None
+    if internal is not None and populations is None:
+        raise ValueError(
+            "GATE ppm_sigma_internal: got an internal-band restriction without band "
+            "populations; want populations (the split is of a population sum); fix: "
+            "pass populations with internal")
     if populations is not None:
         if occupation_state is not None:
             raise ValueError(
                 "GATE ppm_sigma_populations: got both an occupation state and band "
                 "populations; want one occupation source; fix: pass populations only "
                 "(a GN/HL-PPM deck carries no metallic occupation state)")
-        occupation_state = _population_state(populations, meta, enk_full.shape)
+        occupation_state = _population_state(
+            populations if internal is None else internal.weights(populations),
+            meta, enk_full.shape)
     if invalid_static and n_invalid:
         sigma_static_host = _compute_invalid_static_sigma(
             wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
-            occupation_state=occupation_state, q_wedge=ppm.q_wedge)
+            occupation_state=occupation_state, q_wedge=ppm.q_wedge,
+            coulomb_hole=internal is None or internal.coulomb_hole)
         print_fn(
             "  PPM invalid modes -> static COHSEX: max|Sigma_static| = "
             f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV")
@@ -1531,7 +1551,8 @@ def compute_sigma_c_ppm_omega_grid(
             cond_mask=state.cond_mask,
             val_mask=state.val_mask)
     else:
-        branches = _population_branches(omega_req, enk_full, state.efermi, populations)
+        branches = _population_branches(omega_req, enk_full, state.efermi, populations,
+                                        internal=None if internal is None else internal.mask)
     result = compute_sigma_c_mpa_omega_grid(
         wfns, poles, meta, mesh_xy,
         request=request,
@@ -1596,22 +1617,52 @@ def _population_state(populations, meta, shape):
                            / float(meta.nk_tot))
 
 
-def _population_branches(omega_ry, enk_full, efermi, populations):
+def _population_branches(omega_ry, enk_full, efermi, populations, internal=None):
     """Causal branches of band populations: valence weight f, conduction 1 - f, energies unclipped.
 
     ``gw.mpa.sigma._branches``' occupation-state form on the PPM frame
     ``efermi``: a hole in a valence band sits on the conduction branch at its
     own (negative) energy, which the step split's clipped ``E_cond`` could not
-    represent.
+    represent.  ``internal`` (nk, nb) bool keeps only those intermediate states
+    in both branches (:class:`InternalBands`); None keeps every band.
     """
     f = jnp.asarray(populations, dtype=jnp.float64)
     energy = jnp.asarray(enk_full, dtype=jnp.float64) - efermi
+    if internal is None:
+        return branches_for_omega_grid(
+            omega_ry, E_cond=energy, H_val=-energy, cond_mask=(f != 1.0), val_mask=(f != 0.0),
+            cond_weight=1.0 - f, val_weight=f)
+    keep = jnp.asarray(internal, dtype=bool)
     return branches_for_omega_grid(
-        omega_ry, E_cond=energy, H_val=-energy, cond_mask=(f != 1.0), val_mask=(f != 0.0),
-        cond_weight=1.0 - f, val_weight=f)
+        omega_ry, E_cond=energy, H_val=-energy, cond_mask=(f != 1.0) & keep,
+        val_mask=(f != 0.0) & keep, cond_weight=jnp.where(keep, 1.0 - f, 0.0),
+        val_weight=jnp.where(keep, f, 0.0))
 
 
-def window_sigma_plan(config, *, head=None, session=None, frequencies_abs_ry=None) -> dict:
+@dataclass(frozen=True)
+class InternalBands:
+    """A restriction of the Σ sweep's intermediate-state band sum (TD-aGW, td_agw_dynamical.md §1.6).
+
+    At fixed screening each causal branch is linear in the internal weights
+    (particle 1 - f_n, hole f_n), and so is the invalid-pole term's screened
+    exchange (occupied projector diag f), so Σ[f] = Σ[internal] + Σ[rest]
+    exactly.  ``mask`` (nk, nb_full) bool selects the internal bands n of both
+    branches and of that projector; the windows are planned on their energies
+    alone.  ``coulomb_hole``: whether the invalid-pole term's Coulomb hole
+    (population independent, over every band) is in this part; exactly one
+    part of a split carries it.
+    """
+    mask: np.ndarray
+    coulomb_hole: bool
+
+    def weights(self, populations):
+        """The populations seen by the occupied projector: f on the internal bands, 0 elsewhere."""
+        f = np.asarray(jax.device_get(populations), np.float64)
+        return np.where(np.broadcast_to(np.asarray(self.mask, bool), f.shape), f, 0.0)
+
+
+def window_sigma_plan(config, *, head=None, session=None, frequencies_abs_ry=None,
+                      window_only: bool = False) -> dict:
     """The held plan of :func:`window_sigma_c` from a GW run's config.
 
     ``head``: the run's ``head_correction.HeadSigmaDiag`` (frozen q -> 0 head,
@@ -1622,14 +1673,23 @@ def window_sigma_plan(config, *, head=None, session=None, frequencies_abs_ry=Non
     GW run's).  ``frequencies_abs_ry``: absolute frequencies (Ry) the windows
     are planned on in addition to the window's own energies (the GW run's
     on-shell list reproduces its window plan exactly), or None.
+    ``window_only``: the windows are planned on the window's own on-shell
+    energies alone.  The rows of the Sigma band prefix outside the window,
+    which the sweep evaluates and nobody reads (§9 item 6), take the energy
+    of the window's first band at their k, so they add no frequency.
     """
+    if window_only and frequencies_abs_ry is not None:
+        raise ValueError(
+            "GATE window_sigma_plan_frequencies: got window_only with an added frequency "
+            "list; want one planning rule; fix: drop frequencies_abs_ry")
     return dict(ppm_cfg=config.ppm, sigma_cfg=config.sigma, mpa_cfg=config.mpa,
                 ansatz=config.compute_mode, screening_diagrams=config.screening.diagrams,
                 omega_grid_ry=np.asarray(config.omega_grid_ry, np.float64),
                 omega_range_ev=np.asarray(config.omega_grid_ev, np.float64),
                 out_of_grid=config.sigma.out_of_grid, head=head, session=session,
                 frequencies_abs_ry=(None if frequencies_abs_ry is None else
-                                    np.asarray(frequencies_abs_ry, np.float64)))
+                                    np.asarray(frequencies_abs_ry, np.float64)),
+                window_only=bool(window_only))
 
 
 @lru_cache(maxsize=8)
@@ -1701,9 +1761,38 @@ def _head_branch_rows(head, table_ry, win):
     return hole, particle, static
 
 
+def add_window_parts(a: dict, b: dict) -> dict:
+    """The window Sigma of a split band sum: :func:`window_sigma_c`'s outputs of two parts added.
+
+    ``a`` and ``b`` are one window's outputs on complementary ``internal`` sets
+    (:class:`InternalBands`: the frozen part held from t0 and a refresh's active
+    part).  Every table adds (``pair``, ``diag``, ``onshell``, ``omega``, each
+    ``branch_pair`` and ``static_limit`` table); the request, carrier and frame
+    are ``b``'s (the frames must agree); ``sweep`` is ``b``'s with both parts'
+    censuses under ``parts``.
+    """
+    if float(a["efermi_ry"]) != float(b["efermi_ry"]):
+        raise ValueError("GATE window_sigma_parts: the parts' omega frames differ "
+                         f"({a['efermi_ry']!r} vs {b['efermi_ry']!r} Ry)")
+    out = dict(b)
+    for key in ("pair", "diag", "onshell", "omega"):
+        if (key in a) != (key in b):
+            raise ValueError(f"GATE window_sigma_parts: {key!r} in one part only")
+        if key in b:
+            out[key] = a[key] + b[key]
+    for key in ("branch_pair", "static_limit"):
+        if (key in a) != (key in b):
+            raise ValueError(f"GATE window_sigma_parts: {key!r} in one part only")
+        if key in b:
+            out[key] = {name: a[key][name] + b[key][name] for name in b[key]}
+    out["sweep"] = dict(b.get("sweep") or {}, parts=[a.get("sweep"), b.get("sweep")])
+    return out
+
+
 def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omega_ry=None,
                    omit_frozen: bool = False, branches: bool = False,
-                   static_limit: bool = False, print_fn=None) -> dict:
+                   static_limit: bool = False, internal: str | None = None,
+                   keep_frozen=None, print_fn=None) -> dict:
     """Sigma^c of a band window at an instantaneous state, from a pole model (Ry).
 
     docs/theory/td_agw_dynamical.md §1.2-1.5 (Eqs. 2-3, 8) and §9 item 5.  The GW
@@ -1749,6 +1838,16 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         (:func:`_head_branch_rows`).  At fixed screening the populations enter the
         static limit of the GN-PPM Sigma only through these (the COH half and the
         D/Omega term are population independent).
+    internal : None (every band of the Σ sum as an intermediate state: the
+        incumbent), ``"active"`` (the window's own bands [b_lo, b_hi), with the
+        head and the invalid-pole term's screened exchange of their populations)
+        or ``"frozen"`` (every other band, with the invalid-pole term's Coulomb
+        hole; no head).  At fixed poles the two parts add up to the whole sum
+        (:class:`InternalBands`), and with ``dress = "none"`` the frozen part
+        never changes: the frozen-W refresh sweeps the active part only
+        (td_agw_dynamical.md §1.5-1.6).
+    keep_frozen : with ``internal = "frozen"`` only: (nb_full,) bool, the frozen
+        bands kept in the sum (a truncation; its error is measured, not bounded).
 
     Returns
     -------
@@ -1763,7 +1862,9 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     slices and the Σ window [0, nb_sigma) the sweep ran on; ``branch_pair`` /
     ``static_limit`` on request.  ``pair``,
     ``branch_pair`` and ``static_limit`` are in the instantaneous basis (the
-    columns of U); ``onshell`` and ``omega`` in the band basis.
+    columns of U); ``onshell`` and ``omega`` in the band basis.  ``sweep``: the
+    on-shell sweep's window plan (``gw.quadrature_log``): ``n_windows``,
+    ``window_tau_pairs``, ``distinct_tau``, ``windows`` [(name, n_tau)].
 
     The Sigma band window is [0, b_lo + n_A): the invalid-pole static term's
     occupied projector (``cohsex_sigma.build_Gij``) needs every occupied band
@@ -1808,6 +1909,20 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     if omit_frozen:
         keep[:] = 0.0
         keep[win] = 1.0
+    internal_bands = None
+    if internal is not None:
+        if internal not in ("active", "frozen"):
+            raise ValueError(f"GATE window_sigma_internal: got {internal!r}; want None, "
+                             "'active' or 'frozen'")
+        active = np.zeros(pop.shape, bool)
+        active[:, win] = True
+        mask = active if internal == "active" else ~active
+        if keep_frozen is not None:
+            if internal != "frozen":
+                raise ValueError("GATE window_sigma_keep_frozen: a truncation of the frozen "
+                                 "sum needs internal='frozen'")
+            mask = mask & np.broadcast_to(np.asarray(keep_frozen, bool), pop.shape)
+        internal_bands = InternalBands(mask=mask, coulomb_hole=(internal == "frozen"))
     psi_nmu, psi_mun = _rotate_faces(carrier.psi_nmu, carrier.psi_mun, U, b_lo, keep)
     rep = NamedSharding(mesh_xy, P(None, None))
     from common.collectives import device_put_process_local
@@ -1824,12 +1939,15 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     wfns_t = replace(wfns, enk=put(enk_t), slices=slices_t, green_parent=carrier_t,
                      psi_nmu=None, psi_mun=None)
     meta_t = dataclasses.replace(meta, b_id_3=int(meta.b_id_0) + b_hi)
-    head = plan.get("head")
+    head = None if internal == "frozen" else plan.get("head")
     nb_sig = int(slices_t.nb_sigma)
     built = {}
 
     def request_for(efermi_ry):
         e_rel = (enk_t[:, :nb_sig] - float(efermi_ry)) * RYD_TO_EV
+        if plan.get("window_only"):
+            e_rel = e_rel.copy()
+            e_rel[:, :b_lo] = e_rel[:, b_lo:b_lo + 1]
         req = on_shell_request(e_eval_rel_ev=e_rel, e_dft_rel_ev=e_rel,
                                omega_range_ev=plan["omega_range_ev"],
                                out_of_grid=plan["out_of_grid"],
@@ -1847,7 +1965,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
             ansatz=plan["ansatz"], screening_diagrams=plan["screening_diagrams"],
             plan=None, fixed_quadrature_session=plan.get("session"),
             request_for=request_for if omega_grid is None else None,
-            omega_grid_ry=omega_grid, populations=pop,
+            omega_grid_ry=omega_grid, populations=pop, internal=internal_bands,
             keep_branches=keep_branches, print_fn=quiet)
 
     def head_rows(efermi_ry):
@@ -1859,6 +1977,15 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     block4 = _window_block_fn(mesh_xy, b_lo, n_a, 4)
     block3 = _window_block_fn(mesh_xy, b_lo, n_a, 3)
     res = run(keep_branches=bool(branches))
+    from .quadrature_log import sigma_plan
+    geometry = sigma_plan()[0] or {}
+    sweep = dict(n_windows=int(geometry.get("n_windows", 0)),
+                 window_tau_pairs=int(geometry.get("window_tau_pairs", 0)),
+                 distinct_tau=int(geometry.get("distinct_tau_count", 0)),
+                 windows=[(str(w["name"]), int(w["node_count"]))
+                          for b in geometry.get("branches", ()) for w in b["windows"]],
+                 held=bool(geometry.get("sc_fixed_quadrature", False)),
+                 rebuilds=int(geometry.get("sc_fixed_rebuilds_this_iteration", 0)))
     hr = head_rows(res.efermi_ry)
     point = res.sigma_c_kij.point(0).with_head(hr)
     pair = np.asarray(gather_to_host(block4(point.pair)))
@@ -1866,7 +1993,8 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     Uh = np.conj(np.swapaxes(U, -1, -2))
     S = 0.5 * (pair[0] + pair[1])
     out = dict(pair=pair, diag=diag, onshell=U @ S @ Uh, efermi_ry=float(res.efermi_ry),
-               request=built.get("request"), carrier=dict(slices=slices_t, nb_sigma=nb_sig))
+               request=built.get("request"), carrier=dict(slices=slices_t, nb_sigma=nb_sig),
+               sweep=sweep)
     if branches or static_limit:
         req = built["request"]
         table = req.tables_ry[req.slot("pair")]
@@ -1888,7 +2016,8 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         from .cohsex_sigma import build_Gij
         sigma_sx, _, W_all = _invalid_static_kernels(
             wfns_t, poles.Wc0_q, True, meta_t, mesh_xy, poles.q_wedge)
-        state = _population_state(pop, meta_t, pop.shape)
+        state = _population_state(pop if internal_bands is None else
+                                  internal_bands.weights(pop), meta_t, pop.shape)
         sx = sigma_sx(wfns_t, build_Gij(meta_t, mesh_xy, state), W_all)
         out["static_limit"] = dict(sx=np.asarray(gather_to_host(block3(sx))), head=head_static)
     if omega_ry is not None:
@@ -1904,5 +2033,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     p(f"  window Sigma_c: bands [{b_lo}, {b_hi}) on the Sigma window [0, {nb_sig}), "
       f"max|Sigma_ii(e_i)| = {float(np.max(np.abs(diag))) * RYD_TO_EV:.6f} eV"
       + (" (RED TWIN: frozen bands omitted from G)" if omit_frozen else "")
-      + (", branches kept" if branches else ""))
+      + (", branches kept" if branches else "")
+      + ("" if internal is None else f", internal bands {internal}")
+      + f", {sweep['distinct_tau']} tau in {sweep['n_windows']} windows")
     return out

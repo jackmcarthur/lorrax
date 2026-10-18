@@ -543,11 +543,14 @@ class TdReport(ScientificProductionReport):
         if coll:
             refs = [h for h in coll["history"] if h.get("why") != "t0"]
             mean = lambda key: sum(h[key] for h in refs) / max(len(refs), 1)
+            taus = [h["nodes"]["distinct_tau"] for h in refs if h.get("nodes")]
             out.append(f"  collision       : {coll['form']}, hermitian {coll['hermitian']}; "
                        f"{len(refs)} refresh(es)"
                        + (f", mean wall {mean('wall_s'):.3g} s (sweep {mean('sweep_s'):.3g}, "
                           f"dissipator {mean('build_s'):.3g}, hermitian {mean('hermitian_s'):.3g})"
                           if refs else "")
+                       + (f"; {coll['t0'].get('sweep', 'full')} sweep, "
+                          f"{min(taus)}-{max(taus)} tau per refresh" if taus else "")
                        + f"; t0 build {coll['t0']['wall_s']:.3g} s; GW source run "
                        f"{coll['source_wall_s']:.1f} s; {stats.get('programs', 0)} chunk "
                        f"program(s), {stats.get('jit_cache', 0)} traced")

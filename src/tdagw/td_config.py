@@ -86,6 +86,7 @@ TD_DEFAULTS = {
     "lorrax.collision_hermitian": "dynamic",
     "lorrax.collision_refresh_fs": 0.0,
     "lorrax.collision_refresh_df": 0.0,
+    "lorrax.collision_refresh_sweep": "full",
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -106,6 +107,8 @@ SYSTEMS = ("tdgw_header", "bundle")
 COLLISION_FORMS = ("off", "subtracted", "raw")
 #: ``lorrax.collision_hermitian``: the held Hermitian part (``tdagw.collision``).
 COLLISION_HERMITIAN = ("dynamic", "full", "none")
+#: ``lorrax.collision_refresh_sweep``: what a refresh sweeps (``tdagw.dynsig.REFRESH_SWEEPS``).
+COLLISION_REFRESH_SWEEPS = ("full", "active")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
 #: Sample names the driver keeps for its own per-chunk record (``tdagw.propagate.PROGRESS``);
@@ -165,6 +168,10 @@ def _check_collision(vals: dict) -> None:
         raise _gate("td_collision", f"collision_hermitian = "
                     f"{vals['lorrax.collision_hermitian']!r}", " | ".join(COLLISION_HERMITIAN),
                     "set [lorrax] collision_hermitian")
+    if vals["lorrax.collision_refresh_sweep"] not in COLLISION_REFRESH_SWEEPS:
+        raise _gate("td_collision", f"collision_refresh_sweep = "
+                    f"{vals['lorrax.collision_refresh_sweep']!r}",
+                    " | ".join(COLLISION_REFRESH_SWEEPS), "set [lorrax] collision_refresh_sweep")
     for key in ("lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"):
         try:
             ok = float(vals[key]) >= 0.0
@@ -474,7 +481,8 @@ def inactive_keys(deck) -> dict:
         (("system.ivbm",), model == "none" and not bundle,
          "model none on a TDGW header (occupations come from the header)"),
         (("lorrax.collision_source", "lorrax.collision_hermitian",
-          "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"),
+          "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
+          "lorrax.collision_refresh_sweep"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
     ]
     out = {}
@@ -820,4 +828,13 @@ TD_KEY_DOCS = {
         "= never", "Refresh at the first chunk end where max |f − f_last| over the "
         "window's populations exceeds this; 0 = no population trigger.",
         ("td_collision_refresh",)),
+    "lorrax.collision_refresh_sweep": (
+        "", "What a refresh sweeps: `full`, the window Σ over every intermediate band, "
+        "planned on the GW run's on-shell list; `active`, the window's own intermediate "
+        "bands only, added to the frozen bands' part evaluated once at t0 (exact with W "
+        "frozen: each Σ branch is linear in the intermediate populations and the frozen "
+        "bands keep theirs), both parts planned on the window's own on-shell energies, each "
+        "on its own held quadrature session ([td_agw_dynamical.md §1.6]"
+        "(theory/td_agw_dynamical.md)). The refresh lines name the sweep's τ nodes.",
+        ("td_collision",)),
 }

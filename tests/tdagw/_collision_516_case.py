@@ -30,6 +30,14 @@ H   the chunk program's collectives, collision on vs off (k-locality)
 W   the wide window (--wide): rates at rho_eq per band (both eta), the hot-carrier
     state (--hot-from band, --hot-to band, --hot-amount) relaxed with the collision
     on (refreshed), populations and Tr rho
+S   the refresh sweeps (td_agw_dynamical.md §1.6) on --bands and --wide: tau nodes
+    per window and warm walls of the incumbent sweep (GW run's on-shell list), of
+    the whole sum planned on the window's own energies, of the frozen part (once)
+    and of the active part (per refresh, held session); the split Sigma^F +
+    Sigma^A against the incumbent at rho_eq and at a hot-carrier state (rates,
+    S~, static limit)
+SD  the driven run of DR with the split refresh (collision_refresh_sweep =
+    active), every refresh checked against a full sweep at the same rho
 """
 import argparse
 import copy
@@ -74,7 +82,7 @@ class CompileLog(logging.Handler):
 
 def _td_deck(ref, bands, outdir, *, tf_fs, dtm_as=50.0, efield=None, collision="off",
              refresh_fs=0.0, refresh_df=0.0, hermitian="dynamic", method="cfm4", dt_as=25.0,
-             chunk=5, degeneracy="", ivbm=130):
+             chunk=5, degeneracy="", ivbm=130, sweep="full"):
     b_lo, b_hi = bands
     ex = efield or 0.0
     raw = {"control": {"calc_type": "COHSEX",
@@ -94,6 +102,8 @@ def _td_deck(ref, bands, outdir, *, tf_fs, dtm_as=50.0, efield=None, collision="
                       "collision_refresh_df": refresh_df, "collision_hermitian": hermitian}}
     if degeneracy:
         raw["lorrax"]["degeneracy_mode"] = degeneracy
+    if sweep != "full":
+        raw["lorrax"]["collision_refresh_sweep"] = sweep
     return raw
 
 
@@ -140,6 +150,8 @@ def main():
     ap.add_argument("--hot-to", type=int, default=139)
     ap.add_argument("--hot-amount", type=float, default=0.1)
     ap.add_argument("--hot-fs", type=float, default=4.0)
+    ap.add_argument("--hot2v-amount", type=float, default=0.05,
+                    help="S: the 2v2c hot state moves this from band 129 to 130 (0-based)")
     ap.add_argument("--sections", default="D0,A,B,C,DR,H,W")
     ap.add_argument("--drive-cases", default="off,sub,raw,sub_full,sub_norebase")
     a = ap.parse_args()
@@ -564,6 +576,105 @@ def main():
             dr["dsigma_apply_ms"] = (time.perf_counter() - t1) / 50 * 1e3
             dr["memory"] = mem()
             out["DR"] = dr
+
+    if "S" in sections:
+        with section("S"):
+            from gw import quadrature_log
+            cfg = src["config"]
+            mxa = lambda x: float(np.max(np.abs(x)))
+            eye_n = lambda n: np.broadcast_to(np.eye(n, dtype=complex), (nk, n, n)).copy()
+
+            def call(lo, n, f_win, plan, internal=None):
+                w = dict(b_lo=lo, U=eye_n(n), e=e_full[:, lo:lo + n], f=f_win)
+                t1 = time.perf_counter()
+                o = PS.window_sigma_c(wfns, poles, w, plan, meta=meta, mesh_xy=mesh,
+                                      branches=True, static_limit=True, internal=internal)
+                o["wall_s"] = time.perf_counter() - t1
+                return o
+
+            def census(o):
+                s = o["sweep"]
+                return dict(distinct_tau=s["distinct_tau"], window_tau_pairs=s["window_tau_pairs"],
+                            n_windows=s["n_windows"], windows=s["windows"],
+                            rebuilds=s.get("rebuilds", 0), wall_s=o["wall_s"])
+
+            def diffs(a, b):
+                ga, gb = D.window_branch_rates(a["branch_pair"]), D.window_branch_rates(b["branch_pair"])
+                sl = lambda o: o["static_limit"]["sx"] + np.einsum(
+                    "ki,ij->kij", o["static_limit"]["head"], np.eye(o["static_limit"]["head"].shape[1]))
+                scale = max(mxa(gb[0]), mxa(gb[1]))
+                return dict(rate_out_mev=mxa(ga[0] - gb[0]) * mev, rate_in_mev=mxa(ga[1] - gb[1]) * mev,
+                            rate_rel=max(mxa(ga[0] - gb[0]), mxa(ga[1] - gb[1])) / scale,
+                            s_mev=mxa(ga[2] - gb[2]) * mev, pair_rel=mxa(a["pair"] - b["pair"]) / mxa(b["pair"]),
+                            static_limit_mev=mxa(sl(a) - sl(b)) * mev, max_rate_mev=scale * mev)
+
+            ss = {}
+            wins = [("2v2c", (b_lo, b_hi))] + ([("wide", tuple(a.wide))] if a.wide else [])
+            for tag, (lo, hi) in wins:
+                n = hi - lo
+                f_eq = f_full[:, lo:hi]
+                f_hot = f_eq.copy()
+                if tag == "wide":
+                    f_hot[:, a.hot_from - lo] -= a.hot_amount
+                    f_hot[:, a.hot_to - lo] += a.hot_amount
+                else:
+                    f_hot[:, 1] -= a.hot2v_amount
+                    f_hot[:, 2] += a.hot2v_amount
+                rec = {}
+                inc = [call(lo, n, f_eq, splan) for _ in range(3)]          # the incumbent refresh
+                rec["incumbent"] = dict(census(inc[-1]), walls_s=[o["wall_s"] for o in inc])
+                own = [call(lo, n, f_eq, PS.window_sigma_plan(cfg, head=src["head"],
+                                                              window_only=True)) for _ in range(2)]
+                rec["window_only_full"] = dict(census(own[-1]), walls_s=[o["wall_s"] for o in own])
+                pf = PS.window_sigma_plan(cfg, head=None, session={}, window_only=True)
+                pa = PS.window_sigma_plan(cfg, head=src["head"], session={}, window_only=True)
+                fr0 = call(lo, n, f_eq, pf, "frozen")
+                fro = call(lo, n, f_eq, pf, "frozen")
+                rec["frozen"] = dict(census(fro), plan_call=census(fr0))
+                ac0 = call(lo, n, np.full_like(f_eq, 0.5), pa, "active")
+                act = [call(lo, n, f_eq, pa, "active") for _ in range(3)]
+                rec["active"] = dict(census(act[-1]), walls_s=[o["wall_s"] for o in act],
+                                     plan_call=census(ac0))
+                rec["split_vs_incumbent_eq"] = diffs(PS.add_window_parts(fro, act[-1]), inc[-1])
+                rec["split_vs_window_only_eq"] = diffs(PS.add_window_parts(fro, act[-1]), own[-1])
+                rec["window_only_vs_incumbent_eq"] = diffs(own[-1], inc[-1])
+                hot_inc = call(lo, n, f_hot, splan)
+                hot_act = call(lo, n, f_hot, pa, "active")
+                rec["split_vs_incumbent_hot"] = diffs(PS.add_window_parts(fro, hot_act), hot_inc)
+                rec["hot_active"] = census(hot_act)
+                rec["hot"] = (dict(from_band=a.hot_from, to_band=a.hot_to, amount=a.hot_amount)
+                              if tag == "wide" else dict(from_band=lo + 1, to_band=lo + 2,
+                                                         amount=a.hot2v_amount))
+                ss[tag] = rec
+                out["S"] = ss
+                _save()
+
+    if "SD" in sections and coll is not None:
+        with section("SD"):
+            raw = _td_deck(ref, (b_lo, b_hi), os.path.join(a.out, "td", "drive_sub_active"),
+                           tf_fs=a.drive_fs, efield=PULSE, collision="subtracted",
+                           refresh_fs=a.refresh_fs, refresh_df=a.refresh_df, sweep="active")
+            orig = D.gnppm_collision
+            D.gnppm_collision = lambda *x, **kw: orig(*x, **dict(kw, check_full=True))
+            try:
+                rr = summarize_run(td_run("drive_sub_active", raw, sysw, model), rho_eq_w)
+            finally:
+                D.gnppm_collision = orig
+            sd = dict(run=rr)
+            hist = (rr.get("collision") or {}).get("history", [])
+            fv = [h["full_vs_split"] for h in hist if "full_vs_split" in h]
+            if fv:
+                sd["full_vs_split_max"] = {k: max(x[k] for x in fv) for k in fv[0]
+                                           if isinstance(fv[0][k], (int, float))}
+            prev = out.get("DR", {}).get("runs", {}).get("sub")
+            if rank0 and prev is not None and "pol_t" in prev and "pol_t" in rr:
+                P0, P1 = np.asarray(prev["pol_t"]), np.asarray(rr["pol_t"])
+                m = min(len(P0), len(P1))
+                sd["pol_rel_vs_full_refresh"] = float(np.max(np.abs(P1[:m] - P0[:m]))) / max(
+                    float(np.max(np.abs(P0[:m]))), 1e-300)
+                sd["pops_max_diff_vs_full_refresh"] = float(np.max(np.abs(
+                    np.asarray(rr["pops_t"])[:m] - np.asarray(prev["pops_t"])[:m])))
+            out["SD"] = sd
 
     if "H" in sections and sysw is not None:
         with section("H"):

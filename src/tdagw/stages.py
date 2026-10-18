@@ -311,7 +311,8 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
     if v.get("lorrax.collision", "off") != "off":     # absent when off: those carries unchanged
         fp["collision"] = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in (
             "lorrax.collision", "lorrax.collision_source", "lorrax.collision_hermitian",
-            "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df")}
+            "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
+            "lorrax.collision_refresh_sweep")}
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
               nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
               measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
@@ -576,10 +577,10 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
     built = gnppm_collision(source, system.ops, mesh=mesh, k_frac=system.hdr["kpts"],
                             b_lo=int(system.bands[0]) - 1, ntr=len(deck.trials),
                             form=v["lorrax.collision"], hermitian=v["lorrax.collision_hermitian"],
-                            policy=policy, say=emit)
+                            policy=policy, sweep=v["lorrax.collision_refresh_sweep"], say=emit)
     every = policy.every * tdgw_io.T_IN_ATTOSEC / 1000.0
     say(f"  collision       : {v['lorrax.collision']}, hermitian "
-        f"{v['lorrax.collision_hermitian']}; refresh "
+        f"{v['lorrax.collision_hermitian']}, {v['lorrax.collision_refresh_sweep']} sweep; refresh "
         + (" or ".join(([f"every {every:g} fs"] if policy.every else [])
                        + ([f"max|df| >= {policy.df:g}"] if policy.df else []))
            or "never (rates of rho_eq)")
