@@ -254,7 +254,8 @@ H_{\rm QP}=(T+V_{\rm ion})+V_{\rm H}+\Sigma^{\rm QSGW}_{xc},
 $$
 
 A dynamic \(\Sigma_c(\omega)\) is evaluated on shell, at the energies its
-readers use ([on-shell Σ_c](sigma-on-shell.md)).
+readers use ([on-shell Σ_c](sigma-on-shell.md)); under
+`sigma_omega_grid_debug = true` it is interpolated on its real-frequency grid.
 An energy outside the grid's range takes \(\Sigma_c(\omega=0)\). `qp_solver` selects
 where the energies come from: `one_shot_dft` (at \(E_{\rm DFT}\)) or
 `self_consistent` (QSGW, at each map's own energies,

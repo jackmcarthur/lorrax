@@ -92,8 +92,9 @@ One map $F: H \mapsto H'$ (`sc_iteration.gw_iteration_map`) does six things:
    $$
 
    where $[\cdot]^{\rm h}$ is the Hermitian part, $\Sigma(\tilde E)$ is
-   evaluated at $\tilde E$ itself ([on-shell Σ_c](theory/sigma-on-shell.md)),
-   and $\tilde E$ is the
+   evaluated at $\tilde E$ itself ([on-shell Σ_c](theory/sigma-on-shell.md);
+   under `sigma_omega_grid_debug = true`, by linear interpolation on the
+   sampled ω grid, §4), and $\tilde E$ is the
    state's current energy (a pinned semicore state reads at its DFT energy,
    §2).
 6. Rotate back and set
@@ -437,11 +438,12 @@ other WFN refuses it by fingerprint.
 
 ## 4 The Σ grid across maps {#sigma-grid-and-quadrature}
 
-Σ_c is evaluated on shell, at the states' own energies
+By default Σ_c is evaluated on shell, at the states' own energies
 ([on-shell Σ_c](theory/sigma-on-shell.md)), and the grid below is read only
 for its range $[\omega_{\min}, \omega_{\max}]$: which energies are covered,
-and so where the out-of-grid rule and $Z = 1$ apply. Its samples are never
-evaluated.
+and so where the out-of-grid rule and $Z = 1$ apply. Its samples are evaluated
+only under `sigma_omega_grid_debug = true`. The plan, the hold and the
+out-of-grid rule are the same on both routes.
 
 $\Sigma_c(\omega)$ is sampled on a uniform grid of step `sigma_omega_step_ev`,
 measured from the $E_F$ of the Σ frame: `efermi.resolve_sigma_efermi_ry` for
