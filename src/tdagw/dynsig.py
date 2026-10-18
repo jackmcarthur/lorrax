@@ -1024,7 +1024,8 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                     sweep: str = "full", check_full: bool = False, screening: str = "frozen",
                     frozen_bands=None, frozen_plan: str = "window",
                     check_truncation: bool = False, odd_same_side: bool = True,
-                    screening_gamma_ev: float = 0.0, say=print, record=None):
+                    screening_gamma_ev: float = 0.0, rebase: bool = False, say=print,
+                    record=None):
     """The held collision term of the GN-PPM member at t0 and its refresh hook (§1.5, §7.1).
 
     Parameters
@@ -1069,6 +1070,10 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         coefficient at i omega_p, a comparison).
     screening_gamma_ev : the static support's same-side principal-value width
         (:func:`collision_screening`), eV; 0 refuses degenerate pairs.
+    rebase : refreshed screening only: the subtracted form's C[rho_eq] at the rates of
+        rho_eq on the refresh's W(t) (one more window sweep at f_eq) instead of the
+        t0 rates, so rho_eq stays a fixed point of each refresh's dissipator and the
+        regularization tails of C[rho_eq] cancel at every W (a measured option).
     say : the stdout line of each refresh; ``record`` (or None) gets each
         refresh's dict (the run log's section, the case scripts' tables).
 
@@ -1112,6 +1117,9 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         _refuse("dynsig_collision_frozen_bands", f"frozen_bands with screening = {screening!r}, "
                 f"sweep = {sweep!r}", "screening = 'refreshed', sweep = 'active'",
                 "the truncation is of the frozen part's change under W(t)")
+    if rebase and screening != "refreshed":
+        _refuse("dynsig_collision_rebase", "rebase with screening = 'frozen'",
+                "screening = 'refreshed'", "the t0 rates are rho_eq's at W0")
     if check_truncation and frozen_bands is None:
         _refuse("dynsig_collision_check", "check_truncation without frozen_bands",
                 "frozen_bands", "the check compares the truncated frozen part with the whole")
@@ -1377,8 +1385,14 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                 parts[-1]["_truncation"] = alt
         t2 = time.perf_counter()
         g_out, g_in = put(stack("g_out", parts)), put(stack("g_in", parts))
+        g_eq_now, rebase_s = (g_out_eq, g_in_eq), 0.0
+        if rebase:
+            tr0 = time.perf_counter()
+            eqs = [sweep_tables(f_b, at=p_) for p_ in poles_now]
+            g_eq_now = (put(stack("g_out", eqs)), put(stack("g_in", eqs)))
+            rebase_s = time.perf_counter() - tr0
         t3 = time.perf_counter()
-        out = program(g_out, g_in, rho, ops_now.rho_eq, g_out_eq, g_in_eq, ops_now.w_k)
+        out = program(g_out, g_in, rho, ops_now.rho_eq, *g_eq_now, ops_now.w_k)
         new_ops = ops_now._replace(collision=out["diss"])
         jax.block_until_ready(out["diss"])
         t4 = time.perf_counter()
@@ -1402,7 +1416,9 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                    d_trace=[float(v) for v in (trace - state["trace_last"])],
                    min_rate_mev=float(out["min_rate"]) * 2.0 * ry_mev, held_max_mev=held_max,
                    c_eq_diag=receipt["c_eq_diag"], c_eq_offdiag=receipt["c_eq_offdiag"],
-                   sweep=sweep, nodes=parts[0]["nodes"], screening=screening)
+                   sweep=sweep, nodes=parts[0]["nodes"], screening=screening,
+                   rebase_s=rebase_s, c_eq_now=(None if not rebase else
+                                                [float(out["c_eq_diag"]), float(out["c_eq_offdiag"])]))
         if refreshed:
             worst = lambda key: max(sr[key] for sr in screens)
             rec.update(screen=dict(

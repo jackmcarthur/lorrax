@@ -178,6 +178,8 @@ def main():
     ap.add_argument("--cd-check-trunc", action="store_true",
                     help="CD refreshed with frozen bands: also sweep the whole frozen part")
     ap.add_argument("--cd-tag", default="", help="CD: suffix of the run tags")
+    ap.add_argument("--cd-rebase", action="store_true",
+                    help="CD refreshed: rebase the subtracted form's C[rho_eq] on W(t)")
     ap.add_argument("--cd-gamma-ev", type=float, default=None,
                     help="CD refreshed: collision_screening_gamma_ev (default: the deck's)")
     ap.add_argument("--drive-cases", default="off,sub,raw,sub_full,sub_norebase")
@@ -887,9 +889,13 @@ def main():
                                        frozen_bands=fb if scr_ == "refreshed" else None,
                                        gamma_ev=a.cd_gamma_ev)
                         orig = D.gnppm_collision
+                        extra = {}
                         if a.cd_check_trunc and scr_ == "refreshed" and fb is not None:
-                            D.gnppm_collision = lambda *x, **kw: orig(
-                                *x, **dict(kw, check_truncation=True))
+                            extra["check_truncation"] = True
+                        if a.cd_rebase and scr_ == "refreshed":
+                            extra["rebase"] = True
+                        if extra:
+                            D.gnppm_collision = lambda *x, **kw: orig(*x, **dict(kw, **extra))
                         try:
                             r = summarize_run(td_run(tag, raw, sys_cd, model_cd), rho_eq_cd)
                         finally:
