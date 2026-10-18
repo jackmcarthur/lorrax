@@ -236,7 +236,7 @@ else.
 | `read_bgw_vcoul.py` | Compatibility shim over the `vcoul` service's parser of BerkeleyGW's `vcoul` file. |
 | `restart_bundle.py` | Reads the GW restart bundle. |
 | `shared_pole_store.py` | Shared real-pole model and construction-scratch I/O. |
-| `sigma_checkpoint.py` | The sweep-checkpoint schema (`tmp/sigma_checkpoint_oneshot.h5`); written only by the one-shot ω-grid debug sweep (`sigma_omega_grid_debug = true`; an on-shell checkpoint is a follow-up). |
+| `sigma_checkpoint.py` | The sweep-checkpoint schema, written by a one-shot shared-pole sweep: on shell `tmp/sigma_checkpoint_oneshot_on_shell.h5` (pair and slots), under `sigma_omega_grid_debug = true` `tmp/sigma_checkpoint_oneshot.h5` (cubes); and the SC loop's `sc_seed/sc_checkpoint.h5`. |
 | `sigma_output.py` | Writes self-energy and quasiparticle outputs. |
 | `slab_io.py` | Exposes sharded slab reads and writes. |
 | `static_gauge_head.py` | Reads and writes static-gauge head data. |

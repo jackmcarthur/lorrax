@@ -398,10 +398,11 @@ their unfold tables: no full-q W is formed for the file, and BSE unfolds on
 load ([BSE](bse.md)). Plain-MPA and metal restarts carry no `W0_qmunu`
 ([BSE](bse.md) says what a BSE on them does).
 
-The on-shell Σ sweep is not checkpointed: a rerun with `restart = true`
-recomputes it (an on-shell checkpoint is a follow-up). Under
-`sigma_omega_grid_debug = true` the one-shot ω-grid sweep keeps its
-checkpoint, `file_io.sigma_checkpoint` ([on-shell Σ_c](../theory/sigma-on-shell.md#grid-debug)).
+A one-shot Σ sweep keeps its checkpoint, `file_io.sigma_checkpoint`: on
+shell the pair and slots (`tmp/sigma_checkpoint_oneshot_on_shell.h5`), under
+`sigma_omega_grid_debug = true` the ω-grid cubes
+(`tmp/sigma_checkpoint_oneshot.h5`); a rerun with `restart = true` whose
+checkpoint authenticates skips the sweep ([on-shell Σ_c](../theory/sigma-on-shell.md#grid-debug)).
 
 `write_w = true` dumps the bank as stored (line supports as panels) and is a
 debug output.
