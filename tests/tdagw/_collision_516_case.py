@@ -178,6 +178,8 @@ def main():
     ap.add_argument("--cd-check-trunc", action="store_true",
                     help="CD refreshed with frozen bands: also sweep the whole frozen part")
     ap.add_argument("--cd-tag", default="", help="CD: suffix of the run tags")
+    ap.add_argument("--cd-dtm-as", type=float, default=50.0,
+                    help="CD: the sample interval (as); a refresh happens at chunk ends, chunk = 5 samples")
     ap.add_argument("--cd-rebase", action="store_true",
                     help="CD refreshed: rebase the subtracted form's C[rho_eq] on W(t)")
     ap.add_argument("--cd-gamma-ev", type=float, default=None,
@@ -883,7 +885,8 @@ def main():
                     for scr_ in a.cd_screenings.split(","):
                         tag = f"{a.cd_window}_E{amp:g}_r{cad:g}_{scr_}{a.cd_tag}"
                         raw = _td_deck(ref, (lo, hi), os.path.join(a.out, "td", tag),
-                                       tf_fs=a.drive_fs, efield=_pulse(amp), collision="subtracted",
+                                       tf_fs=a.drive_fs, dtm_as=a.cd_dtm_as,
+                                       efield=_pulse(amp), collision="subtracted",
                                        refresh_fs=cad, refresh_df=a.refresh_df, sweep="active",
                                        screening=scr_, degeneracy=deg,
                                        frozen_bands=fb if scr_ == "refreshed" else None,
