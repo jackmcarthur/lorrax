@@ -5,6 +5,37 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-18 — TD-aGW collision term on main: split refresh, refreshed GN-PPM screening
+
+The on-shell collision term of TD-aGW (`[lorrax] collision`, [TD-aGW dynamical
+§1.5](docs/theory/td_agw_dynamical.md#damping)) is merged onto this main
+(6f7b2ca26) and gains two refresh options; the GW driver gains one opt-in
+observer field. Nothing in a deck has to change.
+
+- **Default path unchanged.** With the new keys unset, results are those of the
+  collision branch. The GW driver on the CrI3 516 GN-PPM deck is bitwise
+  main's (15/15 `sigma_mnk.h5` datasets and attributes, `sigma_diag.dat`); the
+  516 collision drives agree with the branch's to ≤ 2.4×10⁻¹² in P(t) (main's
+  driver moves Σ_c by ≤ 2.1×10⁻¹¹ eV against the branch's 07 files).
+- **`collision_refresh_sweep = "active"`** (default `"full"`). A refresh sweeps
+  the window's own intermediate bands and adds the frozen bands' part, swept
+  once at t0, each part on its own held quadrature session: 0.95 s against
+  3.3 s per refresh on 516 2v2c, equal to the full sweep to the rule tolerance
+  (rates 2×10⁻³ of their maximum). Unlike the full sweep, whose one-shot plan
+  re-plans when a state passes the occupation-weight floor (the held ΔΣ^h then
+  carries 0.38 meV of rule change), it keeps its rules.
+- **`collision_screening = "refreshed"`** (default `"frozen"`), with
+  `collision_frozen_bands` and `collision_screening_gamma_ev` (1 meV). Each
+  refresh re-screens W at 0 and iω_p from the window populations and refits the
+  run's poles: 5.0 s (2v2c) and 11.5 s (10v14c) per refresh on 516. A measured
+  prototype: the subtracted form then needs its C[ρ_eq] on the refreshed W
+  (`gnppm_collision(rebase=True)`, no deck key yet), and the invalid-mode flips
+  make ΔΣ^h jump between refreshes at strong fields (theory page §1.5).
+- **GW seam.** `gw.ppm_pipeline.observe_window_sigma_source(screening=True)`
+  also leaves the run's `fit_plan` and copies of its two W samples; with no
+  observer, or without the opt-in, the driver does nothing new.
+  `gw.ppm_sigma.window_sigma_c` takes `static_limit_wc0=`.
+
 ## 2026-10-18 — Sigma(omega) grid debug restored
 
 The ω-grid Σ_c(ω) path is back as an opt-in debug path,

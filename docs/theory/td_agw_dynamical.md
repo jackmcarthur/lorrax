@@ -329,8 +329,109 @@ text above:
   15–31 refreshes; the chunk program's collectives are unchanged. Physical
   rates at band edges therefore need a smaller regularization width than the
   Σ quadrature uses, or the shared-pole member.
+* **On origin/main (2026-10-18).** Merged onto main 6f7b2ca26 (on-shell-only Σ:
+  the accumulator factory carries `keep_branches`). The GW driver on the 07 deck
+  is bitwise main's (15/15 `sigma_mnk.h5` datasets); main's driver differs from
+  the 07 arm's files by ≤ 2.1×10⁻¹¹ eV in Σ_c (sigma_diag.dat identical), so
+  the 516 rates move by ≤ 1.2×10⁻¹² (relative) and the driven runs by ≤ 2.4×10⁻¹²
+  in P(t). The incumbent sweep is unchanged: 206 τ in 8 windows (val:resonant
+  156), 3.26 s at P4 (3.22 s before the merge).
+* **Rule switching (a non-smoothness of the incumbent).** A state enters a
+  branch when its weight passes `OCCUPATION_WEIGHT_FLOOR` (10⁻⁵); the one-shot
+  plan of the full sweep then re-plans its windows (516 drive at 5×10⁸ V/m:
+  206 → 275 τ at 2.5 fs, when $n_c$ passes 10⁻⁵). The new rules differ from
+  those of $\tilde\Sigma[\rho^{\rm eq}]$ by the quadrature error, and the held
+  $\Delta\Sigma^{\rm h}$ jumps from 1.5×10⁻³ meV to 0.38 meV and stays there,
+  while its physical value (the split refresh below, one held session) is
+  2.9×10⁻³ → 0.9×10⁻³ meV. The full refresh should hold its rules too.
+
+**Split refresh (`collision_refresh_sweep = active`).** With $W$ frozen and
+dress none each branch is linear in the intermediate weights ($1-f_n$, $f_n$)
+and so is the invalid-pole term's screened exchange, while the frozen bands keep
+their populations. The window Σ splits by intermediate band,
+$\Sigma=\Sigma^F+\Sigma^A[f]$ (`gw.ppm_sigma.InternalBands`;
+`window_sigma_c(internal="frozen"|"active")`): $\Sigma^F$ (the bands outside the
+window, with the Coulomb hole, no head) is swept once at t0 and each refresh
+sweeps $\Sigma^A$ (the window's own bands, with the head). Each part runs on its
+own held quadrature session planned on the window's own on-shell energies
+(`window_sigma_plan(window_only=True)`; the rows of the Σ prefix outside the
+window take the window's first energy at their $k$), the active one with every
+active state live in both branches, so every value after the planning calls
+comes from held rules and a refresh at $\rho^{\rm eq}$ reproduces t0. The
+band-bracket reduction is not used: it keeps the matrices of the first and last
+cumulative counts only, and the frozen part needs the off-diagonal blocks of a
+middle bracket. Measured (516, P4): 2v2c active 44 τ, 0.95 s per refresh (88 τ,
+1.56 s once both branches are live) against the incumbent's 206 τ, 3.27 s
+(275 τ, 4.23 s), frozen part 48 τ, 1.09 s once; 10v14c active 68 τ, 1.29 s (182 τ,
+2.82 s hot) against 206 τ, 3.34 s. The split equals the full sweep to the rule
+tolerance (rates 2.1×10⁻³ of their maximum, pair 5×10⁻⁵ relative); along the
+5×10⁸ V/m drive every refresh was checked against a full sweep at the same ρ.
+
+**Refreshed screening (`collision_screening = refreshed`, §7.1).** Each refresh
+re-screens $W$ at both GN-PPM supports from the window populations,
+$W(z_s,t)=[1-W_0(z_s)\delta\chi_0(z_s,t)]^{-1}W_0(z_s)$, $z_s\in\{0,i\omega_p\}$
+(`gw.ppm_sigma.screening_update` on the run's own two W samples and fit plan,
+taken at the GW driver's seam by `observe_window_sigma_source(screening=True)`),
+and sweeps the window Σ on the new poles; the $q\to0$ head stays the run's.
+$\delta\chi_0$ (`tdagw.dynsig.delta_chi0`, dress none) uses the run's static
+Laplace rule and its ordered probe rule: at $i\omega_p$ every node weighs
+$\alpha_l-i\beta_l$, the Pauli product is the same kernel with the opposite
+sign, and a same-side pair takes $(f_a-f_b)/(E_a-E_b-i\omega_p)$, the
+orientation of the run's ordered $\chi_0(i\omega_p)$. Its real part alone
+(the time-reversal-even coefficient) misses the magnet's odd channel (twin R7
+fails by 0.21 on the synthetic bundle). At $z=0$ a driven distribution leaves
+symmetry-equivalent $k$ unequally populated, and the exact static term of such a
+degenerate pair is a Drude pole (884 pairs on the 516 drive); the refresh takes
+the principal value of width γ, $(f_a-f_b)(E_a-E_b)/((E_a-E_b)^2+\gamma^2)$
+(`collision_screening_gamma_ev`, 1 meV), exact for $|E_a-E_b|\gg\gamma$. The
+frozen part now changes with $W$ and is swept at every refresh on its held t0
+session. $\Delta\Sigma^{\rm h}$ subtracts the static limit of the run's $W_0$,
+which $K\delta\rho$ holds, so the static and dynamical parts of $\delta W$ stay:
+$\Delta\Sigma^{\rm h}=\mathrm{Herm}\,\tilde S[\rho,W(t)]-\mathrm{Herm}\,\tilde
+S[\rho^{\rm eq},W_0]-(\Sigma^{\rm SL}[\rho,W_0]-\Sigma^{\rm SL}[\rho^{\rm eq},W_0])$.
+With every mode invalid (the static-$W$ limit) this is the static member's
+Eq. (5) for the populations (synthetic: 8×10⁻¹¹; the static limit taken at
+$W(t)$ instead fails by 2.6, twin R8). At $\rho^{\rm eq}$, $\delta\chi_0=0$ and
+$W=W_0$ exactly and the poles are the run's bitwise (516 and synthetic); the
+run's $\chi_0$ rebuilt from the split at both supports gives its $W$ to
+1.1×10⁻¹⁴ (516).
+
+Measured on the 516 2v2c drives (8 fs, cfm4 25 as, refresh by cadence and
+$\max|\delta f|\ge10^{-3}$; $E_g$ = 3.37 eV, the 07 arm's QP gap):
+* **The equilibrium subtraction must follow $W$.** With $C[\rho^{\rm eq}]$ at the
+  t0 rates the final carrier density rises by 43 % at 5×10⁸ V/m and 58 % at
+  3×10⁹ V/m against frozen $W$; with $C[\rho^{\rm eq}]$ at the rates of
+  $\rho^{\rm eq}$ on $W(t)$ (`rebase=True`, +2.1 s per refresh) by 0.2 % and 19 %.
+  The difference is the regularization tails of $C[\rho^{\rm eq}]$ changing with
+  $W$, not scattering.
+* **$\delta W$ moves Re Σ more than the band-edge rates.** At a 5 % carrier
+  transfer (all $k$) Re Σ of the window moves by 594 meV (17.7 % of $E_g$) and the
+  band-edge rates by 37–39 meV; along the 3×10⁹ V/m drive the held
+  $\Delta\Sigma^{\rm h}$ reaches 119 meV (3.5 %) against 0.13 meV with frozen $W$,
+  while the smallest rate eigenvalue moves by 5.5 meV.
+* **Not smooth.** $\Delta\Sigma^{\rm h}$ jumps by up to 77 meV (2.3 % of $E_g$)
+  between refreshes at 3×10⁹ V/m (0.78 meV at 5×10⁸), correlated with the
+  invalid-mode flips (r = 0.94; up to 1.7×10⁵ of 3.4×10⁷ modes per refresh):
+  a mode whose fitted $\Omega^2$ changes sign moves between the pole and the
+  static term. Refreshing every 0.125 fs does not converge P(t) at 3×10⁹ V/m
+  (3.3×10⁻² between cadences; 3×10⁻⁴ at 5×10⁸ V/m, 2×10⁻⁵ with frozen $W$). The
+  same-side principal value is a second sensitivity: γ = 10 meV instead of 1 meV
+  moves the final carrier density by −55 % at 3×10⁹ V/m.
+* On 10v14c at 3×10⁹ V/m (0.5 carriers per cell) $W$ moves by 85 %, 19 % of the
+  modes turn invalid and the smallest rate eigenvalue reaches −1.8 eV: outside
+  the member's range.
 
 ### 1.6 The active space: band window or disentangled subspace (proposed) {#active-space}
+
+The split refresh of §1.5 uses the window as the active space of the
+intermediate-band sum too: with $W$ frozen only the window's own intermediate
+states change, so a refresh sweeps them alone, and the frozen bands' part is
+the t0 one. With refreshed screening the frozen part changes with $W$ for every
+band; restricting its change to the bands next to the window
+(`collision_frozen_bands`) keeps the rates (16 + 16 bands: 2.8×10⁻³ of their
+maximum, the rule tolerance) but not $\mathrm{Re}\,\Sigma$ (81 meV, 2.4 % of the
+QP gap, at a 5 % carrier transfer): the screened exchange of every occupied band
+responds to $\delta W(0)$.
 
 $A$ is a band-index range. Where a band of other character enters $A$'s
 energy range in part of the zone, the window holds that character at those $k$
@@ -595,6 +696,26 @@ at 12×12) to the full zone. The frozen
 `apply` walls are TDPROP's (516 2v2c) and TDMODEL's (30×30, 12×12) at b = 1;
 at 30v × 14c on 6×6 k it is 9.0 ms.
 
+**Measured per refresh, the collision term on origin/main** (516 6×6, 160
+bands, $N_\mu$ 978, 4 × A100, warm; τ = distinct Σ τ nodes of the sweep):
+
+| refresh (2v2c window [128, 132)) | τ | wall per refresh |
+|---|---|---|
+| frozen W, full sweep on the GW run's on-shell list (incumbent) | 206 (275 once both branches are live) | 3.26–3.29 s (4.23 s) |
+| frozen W, split: active part (frozen part 48 τ, 1.09 s, once at t0) | 44 (88) | 0.95–1.00 s (1.56 s) |
+| refreshed W, split: δχ0 at 0 and $i\omega_p$ | — | 1.85 s |
+| refreshed W: both Dyson solves + the run's pole fit | — | 0.40 s |
+| refreshed W: frozen part on W(t), window plan (GW list: 207 τ, 3.26 s) | 48 | 1.10 s |
+| refreshed W: active part on W(t) | 44–111 | 0.98–2.06 s |
+| refreshed W, total | | 4.3–5.4 s |
+
+On the 10v14c window [120, 144): incumbent 206 τ, 3.34 s; split active 68 τ,
+1.29 s (182 τ, 2.82 s hot; frozen part 76 τ, 1.49 s); refreshed δχ0 5.16 s and
+Dyson + fit 1.58 s. The frozen part's τ count is set by the window's own
+energies (48 or 76 τ against 181–207 τ on the GW list); the active part's by its
+live branches. δχ0 on the window is the bubble's change only ($\chi_0^{ff}$ is in
+$W_0$): its same-side sum grows with $n_A$ (2v2c 1.85 s, 10v14c 5.16 s).
+
 The 30×30 W update runs on the 8×8 parent (the 30×30 NSCF has 200 bands, not
 the 898 of the sums) and is densified as W already is
 (`bse_densify`, srlr/c1); the window populations are folded to the parent grid
@@ -619,6 +740,23 @@ chunk boundary, so the jitted step stays one program. The collision term
 `collision_refresh_df` (population tolerance), one line per refresh in the log's
 `Collision refreshes` section. At one refresh per fs,
 a 30 fs 12×12 drive costs at most 30 × 82 s + 2400 × 0.31 s ≈ 53 min on 4 A100.
+A refresh can happen only at a chunk end, and `chunk` counts samples: at
+`chunk = 5` and `dt_measure = 50` as a chunk is 0.25 fs, the shortest cadence (a
+0.125 fs cadence then refreshes every chunk, as 0.25 fs does); 0.125 fs needs
+25 as samples.
+
+**Refreshed screening** (`collision_screening = refreshed`, §1.5) refreshes
+Eq. (6) and the pole model with the rates. Each refresh line adds the walls (δχ0
+at both supports, Dyson + fit, frozen and active sweeps), the invalid-mode count
+and its flips (since the last refresh and against $\rho^{\rm eq}$), the largest
+$|\Delta\Omega|$ over the modes valid in both, $\max|\delta W|/|W_0|$ at both
+supports and the degenerate pairs taken at their principal value.
+The subtracted form keeps $C[\rho^{\rm eq}]$ at the t0 rates (W0); with $W(t)$
+the regularization tails of $C[\rho^{\rm eq}]$ (28 meV on the diagonal at
+516) change with $W$ and are no longer cancelled. `gnppm_collision(rebase=True)`
+takes $C[\rho^{\rm eq}]$ at the rates of $\rho^{\rm eq}$ on $W(t)$ (one more split
+sweep at $f^{\rm eq}$, 2.1 s on 516 2v2c); on the 516 drives it removes the
+spurious carriers (§1.5) and should be the refreshed screening's default.
 
 ## 8. Validation {#validation}
 
@@ -712,3 +850,35 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
 8. **In-jit refusals.** The prototype poisons ΔΣ with NaN and names the gate on
    the host (`dynsig.check_state`); the propagator should return the gate
    flags with each chunk.
+9. **Held rules for the full sweep.** The incumbent full refresh plans one-shot
+   rules per call, so the held $\Delta\Sigma^{\rm h}$ carries the rule change
+   when a state crosses the occupation-weight floor (§1.5, 0.38 meV on 516).
+   Change: a held session for the full sweep, planned with every window state
+   live in both branches (as the split's active part), or the split as the
+   default.
+10. **Split by bracket.** The split refresh restricts the intermediate bands by
+    mask (`InternalBands`), two sweeps at t0 (frozen, active). The band-bracket
+    reduction (`BandBracketPlan`) keeps the matrices of the first and last
+    cumulative counts only and asserts contiguous brackets over $[0,n_b)$;
+    one bracketed sweep would need the middle bracket's full block.
+11. **Instantaneous dressing in the split** (not implemented). With
+    `dress = instantaneous` the window's orbitals and energies move ($\psi_AU$,
+    $e(t)$). The active part already takes $(U, e, f)$. The frozen part keeps its
+    internal bands and populations but not its external side: its on-shell tables
+    are read at $e_i(t)$, $e_j(t)$ in the rotated basis. Needed: hold
+    $\Sigma^F_{nm}(\omega)$ in the band basis on a frequency grid that spans the
+    envelope of $e(t)$ (`window_sigma_c(omega_ry=…)`, the ω-grid route, planned
+    once on that envelope), then per refresh $\tilde\Sigma^F_{ij}=\tfrac12[U^\dagger
+    \Sigma^F(e_i)U+U^\dagger\Sigma^F(e_j)U]_{ij}$ by interpolation, with the
+    interpolation error measured against the on-shell sweep; and the active
+    part's session planned on the same envelope, so that no rule is re-fitted
+    when $e(t)$ moves.
+12. **Rebased subtraction and smooth invalid modes for refreshed screening.**
+    `gnppm_collision(rebase=True)` as the default with refreshed screening (a deck
+    key after a deck-route check); and an invalid-mode treatment continuous in
+    $\Omega^2$ (a blend of the pole and its static limit across $\Omega^2=0$, or
+    the shared-pole member), since the flips set the jumps of $\Delta\Sigma^{\rm h}$.
+13. **Pole census.** $\max|\Delta\Omega|$ is set from the first refresh
+    (δW/W0 ~ 10⁻⁹ on 516: 25 eV) by modes whose fit is ill-conditioned
+    ($W^c(0)\to\mathrm{Re}\,W^c(i\omega_p)$); a residue-weighted measure would
+    report the modes that move Σ.

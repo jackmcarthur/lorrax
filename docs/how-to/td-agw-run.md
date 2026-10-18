@@ -230,6 +230,41 @@ on-shell Hermitian change; `full` also re-adds its static-W limit, which K
 already holds (0.08 % of P(t) on the 516 drive). A collision run does not
 restart from a checkpoint.
 
+### Cheaper refreshes and refreshed screening {#collision-refresh}
+
+```toml
+collision_refresh_sweep = "active"        # sweep the window's own intermediate bands per refresh
+collision_screening = "refreshed"         # re-screen W at both GN-PPM supports per refresh
+collision_screening_gamma_ev = 0.001      # principal-value width of degenerate same-side pairs
+```
+
+`collision_refresh_sweep = "active"` sweeps only the window's own intermediate
+bands at a refresh and adds the frozen bands' part, swept once at t0
+([TD-aGW dynamical §1.5](../theory/td_agw_dynamical.md#damping)): on the 516
+2v2c window 0.95 s per refresh against 3.3 s, on held rules, so the held
+ΔΣ^h does not jump when a state starts to fill (the full sweep re-plans then:
+0.38 meV, where the physical ΔΣ^h is 3×10⁻³ meV). The t0 line names both
+parts' τ nodes.
+
+`collision_screening = "refreshed"` (with the split sweep) recomputes W from
+the window populations at each refresh — δχ0 at ω = 0 and iω_p, the Dyson solve
+with W0 in v's place, the GW run's own pole fit — and sweeps the window Σ on the
+new poles, the frozen part included: 4.3–5.4 s per refresh on 516 2v2c (δχ0
+1.85 s, Dyson + fit 0.40 s, frozen sweep 1.10 s, active sweep 1–2 s). The t0 line
+states the fixed point (δχ0 = 0, W = W0 and the poles bitwise the run's at
+ρ_eq); each refresh line adds the walls, the invalid-mode count and flips,
+max|ΔΩ| and max|δW|/|W0| at both supports. `collision_frozen_bands = [n, m]`
+re-sweeps only the frozen bands next to the window: the rates survive it, Re Σ
+does not (§1.6).
+
+Refreshed screening is a measured prototype, not a production setting. On the
+516 drives the subtracted form keeps `C[rho_eq]` at the t0 rates, and the
+change of its regularization tails with W raises the carrier density by
+43–58 %; the Python option `gnppm_collision(rebase=True)` (no deck key yet)
+removes it. At 3e9 V/m the held ΔΣ^h jumps by up to 77 meV between refreshes,
+following the invalid-mode flips in the refresh lines, and P(t) does not
+converge with the cadence. Read the flips column before trusting a run.
+
 ## Choosing an integrator {#integrators}
 
 The first three rows were measured on four A100s on the 30×30 CrI3 ISDF model
