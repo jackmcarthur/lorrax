@@ -71,6 +71,8 @@ _CASES = [
     ("lorrax.collision_hermitian", "half", "td_collision"),
     ("lorrax.collision_refresh_fs", -1.0, "td_collision_refresh"),
     ("lorrax.collision_refresh_df", "often", "td_collision_refresh"),
+    ("lorrax.collision_screening", "dynamic", "td_collision"),
+    ("lorrax.collision_frozen_bands", [4], "td_collision"),
     ("lorrax.collision", "subtracted", "td_collision_source"),
 ]
 
@@ -167,6 +169,20 @@ def test_collision_refuses_another_source_and_a_restart():
     assert _refuses(raw, "td_collision_restart")
     assert not _refuses(_bundle(collision="raw", collision_source="gw/oneshot.in"),
                         "td_collision_source")
+
+
+def test_collision_screening_and_frozen_bands():
+    on = dict(collision="subtracted", collision_screening="refreshed",
+              collision_refresh_sweep="active")
+    v = parse_td_deck(_bundle(**on, collision_frozen_bands=[4, 8])).values
+    assert v["lorrax.collision_screening"] == "refreshed"
+    assert v["lorrax.collision_frozen_bands"] == [4, 8]
+    assert parse_td_deck(_bundle(collision="subtracted")).values["lorrax.collision_screening"] == "frozen"
+    # the truncation is of the frozen part's change under W(t): refreshed screening, split sweep
+    assert _refuses(_bundle(collision="subtracted", collision_frozen_bands=[4, 8]), "td_collision")
+    assert _refuses(_bundle(collision="subtracted", collision_screening="refreshed",
+                            collision_frozen_bands=[4, 8]), "td_collision")
+    assert _refuses(_bundle(**on, collision_frozen_bands=[4, -1]), "td_collision")
 
 
 def test_collision_keys_inactive_when_off_and_fingerprint():

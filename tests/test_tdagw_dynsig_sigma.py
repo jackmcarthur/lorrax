@@ -58,6 +58,17 @@ G9  the split band sum (td_agw_dynamical.md §1.6) at the excited state of G5:
     a window-only plan == the prefix plan                                   rel <= 1e-5;
     on one held session (every active state live in both branches) the
     active part is affine in f: A[(f1 + f2)/2] == (A[f1] + A[f2])/2         rel <= 1e-12
+G10 tdagw.dynsig.delta_chi0 of the excited populations of G3 (dress none) at both
+    supports == the dense ordered dchi0 (same-side pairs exact at i w_p)    rel <= 1e-8;
+    at rho_eq it is exactly zero at both supports
+G11 the refreshed screening of the collision term (dynsig.collision_screening,
+    screen_populations) on the run's own W samples and fit plan: its rules ==
+    the driver's; at rho_eq dchi0 = 0, W == W0 and the poles == the run's   rel <= 1e-14;
+    at the excited state W(t) == dense [1 - W0 dchi0]^-1 W0 at both supports rel <= 1e-8;
+    window_sigma_c on the new poles == dense, frozen + active == whole       rel <= 1e-5;
+    its static limit on the run's W0 (static_limit_wc0) == dense            rel <= 1e-8;
+    with every mode invalid (the static-W limit) the held Hermitian update ==
+    the static_rpa member's dynamic_correction (Eq. 5) for the populations   rel <= 1e-8
 R0  the conjugate particle-hole orientation at i w_p (z -> -z) fails G0
 R1  chi0^fa dropped fails G2 (W)
 R2  pole order swapped (D -> -D: R_+ <-> R_-) fails G5
@@ -65,6 +76,9 @@ R3  frozen bands omitted from G fails G5
 R4  populations read in the fixed basis fails G5
 R5  the hole sign flipped (G~< = +i(S~_h - S~_h^H)) fails G7 (G~<)
 R6  a stale active part (at f_eq, not f) fails G9 (pair)
+R7  the time-reversal-even same-side coefficient at i w_p, (f_a - f_b)(E_a - E_b)/((E_a -
+    E_b)^2 + w_p^2), fails G10 (probe)
+R8  the static limit subtracted at W(t) instead of W0 fails G11 (static-W limit)
 """
 import json
 import sys
@@ -558,6 +572,69 @@ def run_checks(mesh):
         win_fixed = dict(win, f=np.real(np.einsum("kii->ki", rho)))
         rows["R4"] = _rel(PS.window_sigma_c(wfns, poles, win_fixed, splan, meta=meta,
                                             mesh_xy=mesh)["pair"], ref)
+
+        # ---- G10 / R7: dchi0 at both supports (dress none: U = 1, e = eps^G), the fixed point
+        putrep = lambda a: putr(np.ascontiguousarray(a), P())
+        wsl = slice(B_LO, B_LO + NA)
+
+        def _dmap(r, odd):
+            return jax.jit(lambda A__, U_, e_, f_: D.delta_chi0(
+                {**S_, **A__}, kern, U_, e_, f_, rule=r, odd_same_side=odd)[0])
+
+        dfn = {"0": _dmap(None, True), "p": _dmap(prule, True), "p_even": _dmap(prule, False)}
+        args10 = (A_, putrep(eye), putrep(e[:, wsl]))
+        d10 = {t_: gather(fn(*args10, putrep(f_t[:, wsl]))) for t_, fn in dfn.items()}
+        rows["G10_static"] = _rel(d10["0"], dchi[0])
+        rows["G10_probe"] = _rel(d10["p"], dchi[1])
+        rows["R7"] = _rel(d10["p_even"], dchi[1])
+        rows["G10_eq"] = max(float(np.max(np.abs(gather(dfn[t_](*args10, putrep(f[:, wsl]))))))
+                             for t_ in ("0", "p"))
+        # ---- G11 / R8: the refreshed screening of the collision term
+        src = dict(wfns=wfns, meta=meta, poles=poles, fit_plan=plan, W_supports=(W0_u, Wp_u),
+                   quad=quad, config=SimpleNamespace(minimax_config=mm))
+        scr = D.collision_screening(src, mesh=mesh, b_lo=B_LO, n_active=NA)
+        rows["G11_rules"] = max(
+            float(np.max(np.abs(scr["rules"]["static"]["tau"] - rule["tau"]))),
+            float(np.max(np.abs(scr["rules"]["probe"]["tau"] - prule["tau"]))),
+            float(np.max(np.abs(scr["rules"]["probe"]["beta"] - prule["beta"]))))
+        p_eq, _, r_eq = D.screen_populations(scr, f[:, wsl])
+        rows["G11_eq_dchi"] = max(r_eq["dchi_max"])
+        rows["G11_eq_W"] = max(r_eq["dW"])
+        rows["G11_eq_poles"] = max(_rel(gather(getattr(p_eq, k_)), gather(getattr(poles, k_)))
+                                   for k_ in ("Omega_q", "B_q", "B_odd_q", "Wc0_q"))
+        rows["G11_eq_valid"] = int(np.sum(gather(p_eq.valid_mask_q) != gather(poles.valid_mask_q)))
+        p_t, W_t, r_t = D.screen_populations(scr, f_t[:, wsl])
+        rows["G11_W"] = max(_rel(gather(W_t[0]), W3_d[0]), _rel(gather(W_t[1]), W3_d[1]))
+        rows["G11_census"] = dict(n_invalid=r_t["n_invalid"], n_logical=r_t["n_logical"],
+                                  flips_eq=r_t["flips_eq"], d_omega_mev=r_t["d_omega_mev"],
+                                  dW=r_t["dW"])
+        win_t = dict(b_lo=B_LO, U=eye, e=e[:, wsl], f=f_t[:, wsl])
+        kw11 = dict(meta=meta, mesh_xy=mesh, branches=True, static_limit=True,
+                    static_limit_wc0=poles.Wc0_q)
+        o11 = PS.window_sigma_c(wfns, p_t, win_t, splan, **kw11)
+        dpo_t = tuple(gather(getattr(p_t, k_)) for k_ in ("Omega_q", "B_q", "B_odd_q",
+                                                          "valid_mask_q", "Wc0_q"))
+        rows["G11_sigma"] = _rel(o11["pair"], _dense_pair(psi, e, f_t, psi[:, wsl], e[:, wsl],
+                                                          dpo_t, eta))
+        rows["G11_static_limit_W0"] = _rel(o11["static_limit"]["sx"],
+                                           _dense_sx(psi, f_t, psi[:, wsl], gather(poles.Wc0_q)))
+        fro_t, act_t = (PS.window_sigma_c(wfns, p_t, win_t, splan, internal=i_, **kw11)
+                        for i_ in ("frozen", "active"))
+        rows["G11_split"] = _rel(PS.add_window_parts(fro_t, act_t)["pair"], o11["pair"])
+        dead = lambda pp: dataclasses.replace(pp, valid_mask_q=jnp.zeros_like(pp.valid_mask_q))
+        stl = lambda o: o["static_limit"]["sx"] + np.stack(
+            [np.diag(r_) for r_ in o["static_limit"]["head"]])
+        s_t = PS.window_sigma_c(wfns, dead(p_t), win_t, splan, **kw11)
+        s_0 = PS.window_sigma_c(wfns, dead(poles), win_eq, splan, **kw11)
+        h11 = np.asarray(C.hermitian_update(s_t["onshell"], s_0["onshell"], stl(s_t), stl(s_0)))
+        x_d = np.stack([np.diag(np.diag(x[k_])) for k_ in range(nk)])
+        dsig = gather(jax.jit(lambda A__, xx: D.dynamic_correction({**S_, **A__}, kern, xx)[0])(
+            A_, putrep(x_d)))
+        rows["G11_static_W_limit"] = _rel(h11, dsig)
+        kw8 = dict(kw11, static_limit_wc0=None)
+        s_t8 = PS.window_sigma_c(wfns, dead(p_t), win_t, splan, **kw8)
+        rows["R8"] = _rel(np.asarray(C.hermitian_update(s_t8["onshell"], s_0["onshell"], stl(s_t8),
+                                                        stl(s_0))), dsig)
     return rows
 
 
@@ -566,9 +643,14 @@ GATES = dict(G0_W0=1e-8, G0_Wp=1e-8, G1_static=1e-8, G1_probe=1e-8, G2_W0=1e-8, 
              G4=1e-5, G5=1e-5, G6_onshell=1e-5, G6_omega=1e-5, G7_split=1e-12,
              G7_pair_same=1e-12, G7_cond=1e-5, G7_val=1e-5, G7_static=1e-5, G7_gout=1e-5,
              G7_gin=1e-5, G8_sx=1e-8, G8_head=0.0, G9_pair=1e-5, G9_branches=1e-5,
-             G9_static_limit=1e-5, G9_window_only=1e-5, G9_affine=1e-12)
-COUNTS = ("G2_valid_vs_driver", "G2_valid_vs_dense", "G3_valid_vs_dense", "G9_affine_rebuilds")
-TWINS = dict(R0="G0_Wp", R1="G2_W0", R2="G5", R3="G5", R4="G5", R5="G7_gin", R6="G9_pair")
+             G9_static_limit=1e-5, G9_window_only=1e-5, G9_affine=1e-12, G10_static=1e-8,
+             G10_probe=1e-8, G10_eq=0.0, G11_rules=0.0, G11_eq_dchi=0.0, G11_eq_W=1e-14,
+             G11_eq_poles=1e-14, G11_W=1e-8, G11_sigma=1e-5, G11_static_limit_W0=1e-8,
+             G11_split=1e-5, G11_static_W_limit=1e-8)
+COUNTS = ("G2_valid_vs_driver", "G2_valid_vs_dense", "G3_valid_vs_dense", "G9_affine_rebuilds",
+          "G11_eq_valid")
+TWINS = dict(R0="G0_Wp", R1="G2_W0", R2="G5", R3="G5", R4="G5", R5="G7_gin", R6="G9_pair",
+             R7="G10_probe", R8="G11_static_W_limit")
 
 
 def verdict(rows):

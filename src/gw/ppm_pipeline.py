@@ -104,19 +104,28 @@ class observe_window_sigma_source:
     ``efermi_ry``, ``request`` (the run's ``OnShellRequest`` or None), ``V_q``,
     ``quad``.  The device fields of the poles and the carrier are copied at the
     seam (a later stage may donate the originals); the last Sigma stage of the
-    block wins.
+    block wins.  ``screening=True`` also leaves ``fit_plan`` (the run's
+    :func:`gw.ppm_sigma.pole_fit_plan`) and ``W_supports`` (copies of the fit's
+    two W samples, W(0) and W(probe) on the fit's q set, taken right after the
+    fit): the held inputs of the TD-aGW screening update
+    (``gw.ppm_sigma.screening_update``, docs/theory/td_agw_dynamical.md Eq. 6).
     """
 
-    def __init__(self):
+    def __init__(self, screening: bool = False):
         self.source = {}
+        self.screening = bool(screening)
 
     def __enter__(self):
-        _WINDOW_SOURCE_OBSERVERS.append(self.source)
+        _WINDOW_SOURCE_OBSERVERS.append(self)
         return self.source
 
     def __exit__(self, *exc):
-        _WINDOW_SOURCE_OBSERVERS.remove(self.source)
+        _WINDOW_SOURCE_OBSERVERS.remove(self)
         return False
+
+
+#: The fields only a ``screening=True`` observer receives.
+_SCREENING_FIELDS = ("fit_plan", "W_supports")
 
 
 def _publish_window_source(**fields):
@@ -129,8 +138,9 @@ def _publish_window_source(**fields):
         B_odd_q=copy(poles.B_odd_q))
     fields["wfns"] = jax.tree.map(
         lambda a: jnp.copy(a) if isinstance(a, jax.Array) else a, fields["wfns"])
-    for box in _WINDOW_SOURCE_OBSERVERS:
-        box.update(fields)
+    for obs in _WINDOW_SOURCE_OBSERVERS:
+        obs.source.update({k: v for k, v in fields.items()
+                           if obs.screening or k not in _SCREENING_FIELDS})
 
 
 def _fit_head_correction(
@@ -879,6 +889,10 @@ def compute_ppm_sigma_pipeline(
             solve_extent=int(getattr(meta, 'mu_solve_extent', meta.n_rmu)),
         )
         ppm = fit_pole_model(fit_inputs[0], fit_inputs[1], fit_plan, print_fn=print_fn)
+        screening_source = {}
+        if any(obs.screening for obs in _WINDOW_SOURCE_OBSERVERS):
+            screening_source = dict(fit_plan=fit_plan, W_supports=(
+                jnp.copy(fit_inputs[0]), jnp.copy(fit_inputs[1])))
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)
         #
@@ -973,7 +987,7 @@ def compute_ppm_sigma_pipeline(
         _publish_window_source(
             wfns=wfns, meta=meta, config=config, poles=ppm, head=head_sigma_diag_w_kn_ry,
             efermi_ry=sigma_omega.efermi_ry, request=getattr(sigma_c_body_omega, "request", None),
-            V_q=V_q, quad=quad)
+            V_q=V_q, quad=quad, **screening_source)
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
         band_axis=sigma_omega.band_axis,

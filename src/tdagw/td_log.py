@@ -551,6 +551,7 @@ class TdReport(ScientificProductionReport):
                           if refs else "")
                        + (f"; {coll['t0'].get('sweep', 'full')} sweep, "
                           f"{min(taus)}-{max(taus)} tau per refresh" if taus else "")
+                       + self._screening_summary(refs)
                        + f"; t0 build {coll['t0']['wall_s']:.3g} s; GW source run "
                        f"{coll['source_wall_s']:.1f} s; {stats.get('programs', 0)} chunk "
                        f"program(s), {stats.get('jit_cache', 0)} traced")
@@ -563,6 +564,23 @@ class TdReport(ScientificProductionReport):
                            None if last["e_abs"] is None else f"|E| {last['e_abs']:.4e} V/m")
                                    if t))
         return out
+
+    @staticmethod
+    def _screening_summary(refs) -> str:
+        """The refreshed-screening part of the collision summary ('' when W is frozen)."""
+        scr = [h["screen"] for h in refs if h.get("screen")]
+        if not scr:
+            return ""
+        inv = [c["n_invalid"] for c in scr]
+        mean = lambda key: sum(h.get(key, 0.0) for h in refs) / len(refs)
+        return (f"; refreshed screening: dchi0 {sum(c['dchi_s'] for c in scr) / len(scr):.3g} s, "
+                f"Dyson+fit {sum(c['fit_s'] for c in scr) / len(scr):.3g} s"
+                + (f", frozen sweep {mean('frozen_s'):.3g} s, active {mean('active_s'):.3g} s"
+                   if any("frozen_s" in h for h in refs) else "")
+                + f" per refresh; invalid modes {min(inv)}-{max(inv)} of {scr[0]['n_logical']} "
+                f"(max {max(c['flips_prev'] for c in scr)} flips between refreshes), "
+                f"max|dOmega| {max(c['d_omega_mev'] for c in scr):.3g} meV, max|dW|/|W0| "
+                f"{max(c['dW'][0] for c in scr):.2e} (0) {max(c['dW'][1] for c in scr):.2e} (i w_p)")
 
     def timings(self, stages_rows, *, wall: float) -> None:
         self._flush_pending()

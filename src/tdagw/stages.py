@@ -312,7 +312,8 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
         fp["collision"] = {k: (repr(v[k]) if isinstance(v[k], float) else v[k]) for k in (
             "lorrax.collision", "lorrax.collision_source", "lorrax.collision_hermitian",
             "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
-            "lorrax.collision_refresh_sweep")}
+            "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
+            "lorrax.collision_frozen_bands")}
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
               nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
               measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
@@ -549,6 +550,7 @@ def collision_source(deck: TdDeck, mesh, *, say=None):
     lines = []
     work = os.path.join(os.path.abspath(str(v["control.files.outdir"])), "collision_source")
     src = gnppm_source(v["lorrax.collision_source"], mesh, workdir=work,
+                       screening=v["lorrax.collision_screening"] == "refreshed",
                        say=say or lines.append)
     src["line"] = lines[0] if lines else ""
     return src
@@ -577,10 +579,15 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
     built = gnppm_collision(source, system.ops, mesh=mesh, k_frac=system.hdr["kpts"],
                             b_lo=int(system.bands[0]) - 1, ntr=len(deck.trials),
                             form=v["lorrax.collision"], hermitian=v["lorrax.collision_hermitian"],
-                            policy=policy, sweep=v["lorrax.collision_refresh_sweep"], say=emit)
+                            policy=policy, sweep=v["lorrax.collision_refresh_sweep"],
+                            screening=v["lorrax.collision_screening"],
+                            frozen_bands=v["lorrax.collision_frozen_bands"], say=emit)
     every = policy.every * tdgw_io.T_IN_ATTOSEC / 1000.0
+    fb = v["lorrax.collision_frozen_bands"]
     say(f"  collision       : {v['lorrax.collision']}, hermitian "
-        f"{v['lorrax.collision_hermitian']}, {v['lorrax.collision_refresh_sweep']} sweep; refresh "
+        f"{v['lorrax.collision_hermitian']}, {v['lorrax.collision_refresh_sweep']} sweep, "
+        f"{v['lorrax.collision_screening']} screening"
+        + ("" if fb is None else f" (frozen change over {fb[0]} + {fb[1]} bands)") + "; refresh "
         + (" or ".join(([f"every {every:g} fs"] if policy.every else [])
                        + ([f"max|df| >= {policy.df:g}"] if policy.df else []))
            or "never (rates of rho_eq)")

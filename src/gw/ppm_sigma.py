@@ -1792,7 +1792,7 @@ def add_window_parts(a: dict, b: dict) -> dict:
 def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omega_ry=None,
                    omit_frozen: bool = False, branches: bool = False,
                    static_limit: bool = False, internal: str | None = None,
-                   keep_frozen=None, print_fn=None) -> dict:
+                   keep_frozen=None, static_limit_wc0=None, print_fn=None) -> dict:
     """Sigma^c of a band window at an instantaneous state, from a pole model (Ry).
 
     docs/theory/td_agw_dynamical.md §1.2-1.5 (Eqs. 2-3, 8) and §9 item 5.  The GW
@@ -1848,6 +1848,10 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         (td_agw_dynamical.md §1.5-1.6).
     keep_frozen : with ``internal = "frozen"`` only: (nb_full,) bool, the frozen
         bands kept in the sum (a truncation; its error is measured, not bounded).
+    static_limit_wc0 : with ``static_limit`` only: the W^c(0) of the static limit,
+        (nq, mu, mu) as ``poles.Wc0_q`` (default ``poles.Wc0_q``).  A refreshed-
+        screening collision term sweeps the poles of W(t) and subtracts the static
+        limit of the run's W0, the part K drho already holds (td_agw_dynamical.md §7.1).
 
     Returns
     -------
@@ -2015,7 +2019,8 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     if static_limit:
         from .cohsex_sigma import build_Gij
         sigma_sx, _, W_all = _invalid_static_kernels(
-            wfns_t, poles.Wc0_q, True, meta_t, mesh_xy, poles.q_wedge)
+            wfns_t, poles.Wc0_q if static_limit_wc0 is None else static_limit_wc0, True,
+            meta_t, mesh_xy, poles.q_wedge)
         state = _population_state(pop if internal_bands is None else
                                   internal_bands.weights(pop), meta_t, pop.shape)
         sx = sigma_sx(wfns_t, build_Gij(meta_t, mesh_xy, state), W_all)

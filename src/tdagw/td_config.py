@@ -87,6 +87,8 @@ TD_DEFAULTS = {
     "lorrax.collision_refresh_fs": 0.0,
     "lorrax.collision_refresh_df": 0.0,
     "lorrax.collision_refresh_sweep": "full",
+    "lorrax.collision_screening": "frozen",
+    "lorrax.collision_frozen_bands": None,
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -109,6 +111,8 @@ COLLISION_FORMS = ("off", "subtracted", "raw")
 COLLISION_HERMITIAN = ("dynamic", "full", "none")
 #: ``lorrax.collision_refresh_sweep``: what a refresh sweeps (``tdagw.dynsig.REFRESH_SWEEPS``).
 COLLISION_REFRESH_SWEEPS = ("full", "active")
+#: ``lorrax.collision_screening``: the W of the rates (``tdagw.dynsig.COLLISION_SCREENINGS``).
+COLLISION_SCREENINGS = ("frozen", "refreshed")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
 #: Sample names the driver keeps for its own per-chunk record (``tdagw.propagate.PROGRESS``);
@@ -172,6 +176,26 @@ def _check_collision(vals: dict) -> None:
         raise _gate("td_collision", f"collision_refresh_sweep = "
                     f"{vals['lorrax.collision_refresh_sweep']!r}",
                     " | ".join(COLLISION_REFRESH_SWEEPS), "set [lorrax] collision_refresh_sweep")
+    if vals["lorrax.collision_screening"] not in COLLISION_SCREENINGS:
+        raise _gate("td_collision", f"collision_screening = "
+                    f"{vals['lorrax.collision_screening']!r}", " | ".join(COLLISION_SCREENINGS),
+                    "set [lorrax] collision_screening")
+    fb = vals["lorrax.collision_frozen_bands"]
+    if fb is not None:
+        ok = (isinstance(fb, (list, tuple)) and len(fb) == 2
+              and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in fb))
+        if not ok:
+            raise _gate("td_collision", f"collision_frozen_bands = {fb!r}",
+                        "[n_below, n_above], two integers >= 0",
+                        "set [lorrax] collision_frozen_bands or leave it unset")
+        if (vals["lorrax.collision_screening"] != "refreshed"
+                or vals["lorrax.collision_refresh_sweep"] != "active"):
+            raise _gate("td_collision", "collision_frozen_bands with collision_screening = "
+                        f"{vals['lorrax.collision_screening']!r}, collision_refresh_sweep = "
+                        f"{vals['lorrax.collision_refresh_sweep']!r}",
+                        "collision_screening = 'refreshed' and collision_refresh_sweep = 'active'",
+                        "the truncation is of the frozen part's change under W(t); unset it")
+        vals["lorrax.collision_frozen_bands"] = [int(n) for n in fb]
     for key in ("lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"):
         try:
             ok = float(vals[key]) >= 0.0
@@ -482,7 +506,8 @@ def inactive_keys(deck) -> dict:
          "model none on a TDGW header (occupations come from the header)"),
         (("lorrax.collision_source", "lorrax.collision_hermitian",
           "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
-          "lorrax.collision_refresh_sweep"),
+          "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
+          "lorrax.collision_frozen_bands"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
     ]
     out = {}
@@ -836,5 +861,27 @@ TD_KEY_DOCS = {
         "bands keep theirs), both parts planned on the window's own on-shell energies, each "
         "on its own held quadrature session ([td_agw_dynamical.md §1.6]"
         "(theory/td_agw_dynamical.md)). The refresh lines name the sweep's τ nodes.",
+        ("td_collision",)),
+    "lorrax.collision_screening": (
+        "", "The W of the rates and of ΔΣ^h: `frozen`, the GW run's W0 and poles throughout; "
+        "`refreshed`, at every refresh W is re-screened at both GN-PPM supports (0 and "
+        "iω_p) from the window populations — δχ0 of the RPA bubble (cross-gap pairs on the "
+        "run's own Laplace rules, Pauli blocking, same-side pairs exact), the Dyson solve "
+        "with W0 in the place of v and the run's own pole fit "
+        "(`gw.ppm_sigma.screening_update`) — and the window Σ is swept on the new poles; "
+        "the q → 0 head stays the run's. The frozen bands' part changes with W, so it is "
+        "swept at every refresh (with `collision_refresh_sweep = active`). The static-W "
+        "limit subtracted from ΔΣ^h stays the run's W0 (K δρ holds −W^c_0(0) δf), so both "
+        "the static and the dynamical part of δW are kept "
+        "([td_agw_dynamical.md §7.1](theory/td_agw_dynamical.md)). The refresh lines add "
+        "the walls (δχ0, Dyson + fit, frozen and active sweeps), the invalid-mode count "
+        "and flips, max|ΔΩ| and max|δW|/|W0| at both supports.",
+        ("td_collision",)),
+    "lorrax.collision_frozen_bands": (
+        "= every frozen band", "With `collision_screening = refreshed` and "
+        "`collision_refresh_sweep = active`: `[n_below, n_above]`, the frozen bands whose "
+        "part is re-swept under W(t) — [b_lo − n_below, b_lo) and [b_hi, b_hi + n_above); "
+        "the others keep their part at W0 (Σ^F[W(t)] ≈ Σ^F[W0] + Σ^F_kept[W(t)] − "
+        "Σ^F_kept[W0], exact at ρ_eq). A truncation: its error is measured, not bounded.",
         ("td_collision",)),
 }

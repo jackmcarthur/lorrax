@@ -38,6 +38,15 @@ S   the refresh sweeps (td_agw_dynamical.md §1.6) on --bands and --wide: tau no
     S~, static limit)
 SD  the driven run of DR with the split refresh (collision_refresh_sweep =
     active), every refresh checked against a full sweep at the same rho
+CS  the refreshed screening (collision_screening = refreshed) per window: its rules,
+    the rho_eq fixed point (dchi0 = 0, W = W0, the run's poles), a hot state's pole
+    census and walls, the window Sigma on W(t) (split vs full, the frozen part
+    planned on the window vs on the GW list, the frozen-band truncation), and the
+    size of the dW effect on the band-edge rates against Re Sigma
+C0  the run's chi0 rebuilt from the split at both supports (chi0^ff + fa + aa):
+    W of the Dyson solve with V against the run's W samples
+CD  driven runs: pulses x refresh cadences x screening (frozen / refreshed), the
+    split refresh, a max|df| trigger; per-refresh census, P(t), populations
 """
 import argparse
 import copy
@@ -82,7 +91,8 @@ class CompileLog(logging.Handler):
 
 def _td_deck(ref, bands, outdir, *, tf_fs, dtm_as=50.0, efield=None, collision="off",
              refresh_fs=0.0, refresh_df=0.0, hermitian="dynamic", method="cfm4", dt_as=25.0,
-             chunk=5, degeneracy="", ivbm=130, sweep="full"):
+             chunk=5, degeneracy="", ivbm=130, sweep="full", screening="frozen",
+             frozen_bands=None):
     b_lo, b_hi = bands
     ex = efield or 0.0
     raw = {"control": {"calc_type": "COHSEX",
@@ -104,6 +114,10 @@ def _td_deck(ref, bands, outdir, *, tf_fs, dtm_as=50.0, efield=None, collision="
         raw["lorrax"]["degeneracy_mode"] = degeneracy
     if sweep != "full":
         raw["lorrax"]["collision_refresh_sweep"] = sweep
+    if screening != "frozen":
+        raw["lorrax"]["collision_screening"] = screening
+    if frozen_bands is not None:
+        raw["lorrax"]["collision_frozen_bands"] = [int(v) for v in frozen_bands]
     return raw
 
 
@@ -153,6 +167,15 @@ def main():
     ap.add_argument("--hot2v-amount", type=float, default=0.05,
                     help="S: the 2v2c hot state moves this from band 129 to 130 (0-based)")
     ap.add_argument("--sections", default="D0,A,B,C,DR,H,W")
+    ap.add_argument("--cs-trunc", default="4,16", help="CS: frozen-band truncation widths")
+    ap.add_argument("--cd-window", default="2v2c", choices=("2v2c", "wide"))
+    ap.add_argument("--cd-pulses", default="5e8,3e9", help="CD: peak fields, V/m")
+    ap.add_argument("--cd-cadences", default="0.5,0.25,0.125", help="CD: refresh cadences, fs")
+    ap.add_argument("--cd-screenings", default="frozen,refreshed")
+    ap.add_argument("--cd-frozen-bands", default="", help="CD refreshed: 'n_below,n_above'")
+    ap.add_argument("--cd-check-trunc", action="store_true",
+                    help="CD refreshed with frozen bands: also sweep the whole frozen part")
+    ap.add_argument("--cd-tag", default="", help="CD: suffix of the run tags")
     ap.add_argument("--drive-cases", default="off,sub,raw,sub_full,sub_norebase")
     a = ap.parse_args()
     sections = set(a.sections.split(","))
@@ -222,7 +245,8 @@ def main():
     src = None
     with section("source"):
         src = D.gnppm_source(os.path.join(ref, "oneshot.in"), mesh,
-                             workdir=os.path.join(os.path.abspath(a.out), "driver"), say=say)
+                             workdir=os.path.join(os.path.abspath(a.out), "driver"),
+                             screening=bool({"CS", "C0", "CD"} & sections), say=say)
         meta = src["meta"]
         out["source"] = dict(wall_s=src["wall_s"], rc=src["rc"], nk=int(meta.nk_tot),
                              n_mu=int(meta.n_rmu), memory_after=mem(),
@@ -675,6 +699,198 @@ def main():
                 sd["pops_max_diff_vs_full_refresh"] = float(np.max(np.abs(
                     np.asarray(rr["pops_t"])[:m] - np.asarray(prev["pops_t"])[:m])))
             out["SD"] = sd
+
+    def _pulse(amp):
+        """The deck's pulse with peak field ``amp`` V/m (PULSE's envelope and carrier)."""
+        return f"{float(amp)!r} * " + PULSE.split(" * ", 1)[1]
+
+    if "CS" in sections or "C0" in sections:
+        with section("CS"):
+            cfg = src["config"]
+            req_ = src["request"]
+            freqs = None if req_ is None else (np.asarray(req_.frequencies_ry)
+                                               + float(src["efermi_ry"]))
+            W0c = poles.Wc0_q
+            mxa = lambda x: float(np.max(np.abs(x)))
+            eye_n = lambda n: np.broadcast_to(np.eye(n, dtype=complex), (nk, n, n)).copy()
+            herm = lambda m: 0.5 * (m + np.conj(np.swapaxes(m, -1, -2)))
+            dg = lambda m: np.real(np.einsum("...ii->...i", m))
+
+            def callp(lo, n, f_win, plan, at, internal=None, keep=None, static=True):
+                w = dict(b_lo=lo, U=eye_n(n), e=e_full[:, lo:lo + n], f=f_win)
+                t1 = time.perf_counter()
+                o = PS.window_sigma_c(wfns, at, w, plan, meta=meta, mesh_xy=mesh, branches=True,
+                                      static_limit=static, internal=internal, keep_frozen=keep,
+                                      static_limit_wc0=W0c if static else None)
+                o["wall_s"] = time.perf_counter() - t1
+                return o
+
+            def census(o):
+                s_ = o["sweep"]
+                return dict(distinct_tau=s_["distinct_tau"], window_tau_pairs=s_["window_tau_pairs"],
+                            n_windows=s_["n_windows"], windows=s_["windows"],
+                            rebuilds=s_.get("rebuilds", 0), wall_s=o["wall_s"])
+
+            def diffs(x, y):
+                gx, gy = D.window_branch_rates(x["branch_pair"]), D.window_branch_rates(y["branch_pair"])
+                scale = max(mxa(gy[0]), mxa(gy[1]))
+                return dict(rate_out_mev=mxa(gx[0] - gy[0]) * mev, rate_in_mev=mxa(gx[1] - gy[1]) * mev,
+                            rate_rel=max(mxa(gx[0] - gy[0]), mxa(gx[1] - gy[1])) / scale,
+                            s_mev=mxa(gx[2] - gy[2]) * mev,
+                            herm_mev=mxa(herm(gx[2]) - herm(gy[2])) * mev,
+                            pair_rel=mxa(x["pair"] - y["pair"]) / mxa(y["pair"]), max_rate_mev=scale * mev)
+
+            def dw_effect(x, y):
+                """W(t) (x) vs W0 (y) at the same populations: band-edge rates vs Re Sigma, meV."""
+                gx, gy = D.window_branch_rates(x["branch_pair"]), D.window_branch_rates(y["branch_pair"])
+                return dict(
+                    d_rate_out_diag_mev=mxa(dg(gx[0]) - dg(gy[0])) * mev,
+                    d_rate_in_diag_mev=mxa(dg(gx[1]) - dg(gy[1])) * mev,
+                    rate_out_diag_max_mev=mxa(dg(gy[0])) * mev, rate_in_diag_max_mev=mxa(dg(gy[1])) * mev,
+                    d_rate_out_mev=mxa(gx[0] - gy[0]) * mev, d_rate_in_mev=mxa(gx[1] - gy[1]) * mev,
+                    d_re_sigma_mev=mxa(herm(gx[2]) - herm(gy[2])) * mev,
+                    d_re_sigma_diag_mev=mxa(dg(herm(gx[2])) - dg(herm(gy[2]))) * mev,
+                    re_sigma_diag_max_mev=mxa(dg(herm(gy[2]))) * mev)
+
+            cs, scrs = {}, {}
+            wins = [("2v2c", (b_lo, b_hi))] + ([("wide", tuple(a.wide))] if a.wide else [])
+            widths = [int(v) for v in a.cs_trunc.split(",") if v]
+            for tag, (lo, hi) in wins:
+                n = hi - lo
+                f_eq = f_full[:, lo:hi]
+                f_hot = f_eq.copy()
+                if tag == "wide":
+                    f_hot[:, a.hot_from - lo] -= a.hot_amount
+                    f_hot[:, a.hot_to - lo] += a.hot_amount
+                else:
+                    f_hot[:, 1] -= a.hot2v_amount
+                    f_hot[:, 2] += a.hot2v_amount
+                rec = {}
+                t1 = time.perf_counter()
+                scr = D.collision_screening(src, mesh=mesh, b_lo=lo, n_active=n)
+                rec["setup_s"] = time.perf_counter() - t1
+                ru = scr["rules"]
+                rec["rules"] = dict(static_nodes=len(ru["static"]["tau"]),
+                                    probe_nodes=len(ru["probe"]["tau"]),
+                                    probe_odd=bool(np.any(ru["probe"]["beta"] != 0.0)),
+                                    x_min_ry=ru["static"]["x_min"], x_max_ry=ru["static"]["x_max"],
+                                    omega_p_ry=ru["probe"]["omega_p"], nbf=scr["nbf"])
+                _, _, r1 = D.screen_populations(scr, f_eq)
+                pe, _, re_ = D.screen_populations(scr, f_eq)
+                same = lambda u, v: (u is None and v is None) or (
+                    u is not None and v is not None and bool(jax.device_get(jnp.array_equal(u, v))))
+                rec["eq"] = dict(re_, first_call=dict(dchi_s=r1["dchi_s"], fit_s=r1["fit_s"]),
+                                 poles_bitwise=all(same(getattr(pe, k_), getattr(poles, k_))
+                                                   for k_ in ("Omega_q", "B_q", "B_odd_q",
+                                                              "valid_mask_q", "Wc0_q")))
+                del pe
+                ph, _, rh = D.screen_populations(scr, f_hot)
+                rec["hot"] = dict(rh, state=(dict(from_band=a.hot_from, to_band=a.hot_to,
+                                                  amount=a.hot_amount) if tag == "wide" else
+                                             dict(from_band=lo + 1, to_band=lo + 2,
+                                                  amount=a.hot2v_amount)))
+                full_t = callp(lo, n, f_hot, splan, ph)
+                full_0 = callp(lo, n, f_hot, splan, poles)
+                rec["full_W_t"], rec["full_W0"] = census(full_t), census(full_0)
+                rec["dW_effect_hot"] = dw_effect(full_t, full_0)
+                pf = PS.window_sigma_plan(cfg, head=None, session={}, window_only=True)
+                pa = PS.window_sigma_plan(cfg, head=src["head"], session={}, window_only=True)
+                callp(lo, n, f_eq, pf, poles, "frozen")
+                fro0 = callp(lo, n, f_eq, pf, poles, "frozen")
+                callp(lo, n, np.full_like(f_eq, 0.5), pa, poles, "active")
+                fro_t = callp(lo, n, f_hot, pf, ph, "frozen", static=False)
+                fro_t["static_limit"] = fro0["static_limit"]
+                act_t = callp(lo, n, f_hot, pa, ph, "active")
+                split_t = PS.add_window_parts(fro_t, act_t)
+                rec["frozen_W0_held"], rec["frozen_W_t"] = census(fro0), census(fro_t)
+                rec["active_W_t"] = census(act_t)
+                rec["split_vs_full_W_t"] = diffs(split_t, full_t)
+                pg = PS.window_sigma_plan(cfg, head=None, frequencies_abs_ry=freqs)
+                fro_g = callp(lo, n, f_hot, pg, ph, "frozen", static=False)
+                fro_g["static_limit"] = fro0["static_limit"]
+                rec["frozen_gw_list_W_t"] = census(fro_g)
+                rec["frozen_gw_list_vs_window"] = diffs(PS.add_window_parts(fro_g, act_t), split_t)
+                nfull = f_full[:, wfns.slices.full].shape[1] if hasattr(wfns.slices, "full") else f_full.shape[1]
+                for w_ in widths:
+                    keep = np.zeros(nfull, bool)
+                    keep[max(0, lo - w_):lo] = True
+                    keep[hi:min(nfull, hi + w_)] = True
+                    pk = PS.window_sigma_plan(cfg, head=None, session={}, window_only=True)
+                    callp(lo, n, f_eq, pk, poles, "frozen", keep=keep, static=False)
+                    fk0 = callp(lo, n, f_eq, pk, poles, "frozen", keep=keep, static=False)
+                    fkt = callp(lo, n, f_hot, pk, ph, "frozen", keep=keep, static=False)
+                    tr_ = D._shift_window_part(fro0, fkt, fk0)
+                    tr_["static_limit"] = fro0["static_limit"]
+                    rec[f"trunc_{w_}"] = dict(diffs(PS.add_window_parts(tr_, act_t), split_t),
+                                              kept_bands=int(keep.sum()), census=census(fkt))
+                cs[tag] = rec
+                scrs[tag] = scr
+                del ph, full_t, full_0, fro_t, act_t, split_t, fro_g
+                out["CS"] = cs
+                _save()
+            if "C0" in sections:
+                scr = scrs["2v2c"]
+                c0 = {}
+                t1 = time.perf_counter()
+                chis = []
+
+                def _split_fn(r_):
+                    return jax.jit(lambda A_: D.chi0_split({**scr["dyn"], **A_}, scr["kern"],
+                                                           rule=r_))
+
+                for r_ in (None, scr["rules"]["probe"]):
+                    sp = _split_fn(r_)(scr["arrays"])
+                    chis.append(sp["ff"] + sp["fa"] + sp["aa"])
+                    del sp
+                jax.block_until_ready(chis)
+                c0["chi0_split_s"] = time.perf_counter() - t1
+                Vf = scr["plan"]["V_q"]
+                _, Wr = PS.screening_update((Vf, Vf), chis, scr["plan"])
+                c0["W_rel_vs_run"] = [float(jax.device_get(jnp.max(jnp.abs(Wr[i] - scr["W0"][i]))
+                                                           / jnp.max(jnp.abs(scr["W0"][i]))))
+                                      for i in range(2)]
+                c0["Wc_rel_vs_run"] = [float(jax.device_get(
+                    jnp.max(jnp.abs(Wr[i] - scr["W0"][i])) / jnp.max(jnp.abs(scr["W0"][i] - Vf))))
+                    for i in range(2)]
+                del Wr, chis
+                out["C0"] = c0
+            del scrs
+
+    if "CD" in sections and coll is not None:
+        with section("CD"):
+            if a.cd_window == "2v2c":
+                lo, hi, sys_cd, model_cd, rho_eq_cd, deg = b_lo, b_hi, sysw, model, rho_eq_w, ""
+            else:
+                lo, hi = (int(b) for b in a.wide)
+                deg = "off"
+                rawp = _td_deck(ref, (lo, hi), os.path.join(a.out, "td", "cd_wide_probe"), tf_fs=0.1,
+                                degeneracy=deg)
+                deckp = parse_td_deck(rawp, source="collision_516_cd_wide")
+                sys_cd = stages.load_system(deckp, mesh)
+                model_cd = stages.build_self_energy(deckp, sys_cd, mesh)
+                rho_eq_cd = np.asarray(gather_to_host(sys_cd.ops.rho_eq))[:sys_cd.nk]
+            fb = tuple(int(v) for v in a.cd_frozen_bands.split(",")) if a.cd_frozen_bands else None
+            cd = out.setdefault("CD", {})
+            for amp in (float(v) for v in a.cd_pulses.split(",")):
+                for cad in (float(v) for v in a.cd_cadences.split(",")):
+                    for scr_ in a.cd_screenings.split(","):
+                        tag = f"{a.cd_window}_E{amp:g}_r{cad:g}_{scr_}{a.cd_tag}"
+                        raw = _td_deck(ref, (lo, hi), os.path.join(a.out, "td", tag),
+                                       tf_fs=a.drive_fs, efield=_pulse(amp), collision="subtracted",
+                                       refresh_fs=cad, refresh_df=a.refresh_df, sweep="active",
+                                       screening=scr_, degeneracy=deg,
+                                       frozen_bands=fb if scr_ == "refreshed" else None)
+                        orig = D.gnppm_collision
+                        if a.cd_check_trunc and scr_ == "refreshed" and fb is not None:
+                            D.gnppm_collision = lambda *x, **kw: orig(
+                                *x, **dict(kw, check_truncation=True))
+                        try:
+                            r = summarize_run(td_run(tag, raw, sys_cd, model_cd), rho_eq_cd)
+                        finally:
+                            D.gnppm_collision = orig
+                        cd[tag] = dict(r, window=[lo, hi], amp=amp, cadence_fs=cad, screening=scr_,
+                                       frozen_bands=fb)
+                        _save()
 
     if "H" in sections and sysw is not None:
         with section("H"):

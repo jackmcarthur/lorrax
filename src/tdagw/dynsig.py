@@ -70,7 +70,8 @@ __all__ = ["DynsigKernels", "assemble_dynsig_bundle", "check_state", "chi0_split
            "dynamic_correction", "dynsig_model", "equilibrium_sigma", "exchange_sigma",
            "instantaneous_basis", "literal_sx", "make_dynsig_kernels", "probe_rule",
            "screened_update", "static_rule", "gnppm_source", "gnppm_collision",
-           "window_branch_rates"]
+           "window_branch_rates", "collision_screening", "screen_populations",
+           "COLLISION_SCREENINGS"]
 
 GREEN_SPEC = P(None, "x", None, "y", None)        # (k, mu, s, nu, t)
 CHI_SPEC = P(None, "x", "y")                      # (q, mu, nu)
@@ -354,16 +355,21 @@ def chi0_split(dyn: dict, kern: DynsigKernels, rule: dict | None = None):
             for name, a in zip(("ff", "fa", "aa"), acc)}
 
 
-def _same_side_chi(dyn, kern, psi_A, e_A, f_A, x_sep):
-    """Exact omega = 0 sum over ordered same-side pairs with an active leg, (nq, mu, nu), Ry^-1.
+def _same_side_chi(dyn, kern, psi_A, e_A, f_A, x_sep, omega_p: float = 0.0,
+                   odd: bool = True):
+    """Exact sum over ordered same-side pairs with an active leg, (nq, mu, nu), Ry^-1.
 
-    chi^ss_q = (g_s/N_k) sum_k sum_ab c_ab rho_ab(mu) rho_ab*(nu), a at k, b at k-q,
-    rho_ab(mu) = sum_s psi_a,s(mu) psi*_b,s(mu), c_ab = (f_a - f_b)/(E_a - E_b) where both
-    legs lie on one side of e_sep (cross-gap pairs are on the Laplace rule).  E1: a in
-    the window at k, b any band; E2: a frozen at k, b in the window.  Every q is one
+    chi^ss_q(z) = (g_s/N_k) sum_k sum_ab c_ab rho_ab(mu) rho_ab*(nu), a at k, b at k-q,
+    rho_ab(mu) = sum_s psi_a,s(mu) psi*_b,s(mu), c_ab = (f_a - f_b)/(E_a - E_b - z) where
+    both legs lie on one side of e_sep (cross-gap pairs are on the Laplace rule).  E1: a
+    in the window at k, b any band; E2: a frozen at k, b in the window.  Every q is one
     ``lax.map`` step, so one q's pair densities (nk, nA, nbf, mu) are live at a time.
-    Returns (chi, bad): bad counts near-degenerate same-side pairs whose populations
-    differ (their static limit is a Drude term this prototype refuses).
+    ``omega_p`` 0: the static support z = 0; > 0: z = i omega_p, the ordered orientation of
+    the GW run's chi0(i omega_p), c_ab = (f_a - f_b)(E_a - E_b + i omega_p)/((E_a - E_b)^2 +
+    omega_p^2); ``odd = False`` keeps its real part alone (the time-reversal-even
+    coefficient; a comparison, not the run's chi0 on a magnet).  Returns (chi, bad):
+    bad counts near-degenerate same-side pairs whose populations differ at z = 0 (their
+    static limit is a Drude term this prototype refuses); none at i omega_p.
     """
     nk, mesh = int(np.prod(kern.kgrid)), kern.mesh
     b_lo, nA = dyn["band_lo"], dyn["n_active"]
@@ -378,6 +384,10 @@ def _same_side_chi(dyn, kern, psi_A, e_A, f_A, x_sep):
     def coeff(Ea, Eb, fa, fb, mask):
         same = ((Ea - x_sep) < 0.0) == ((Eb - x_sep) < 0.0)
         dE, df = Ea - Eb, fa - fb
+        if omega_p > 0.0:
+            w = float(omega_p)
+            c = df * ((dE + 1j * w) if odd else dE) / (dE * dE + w * w)
+            return jnp.where(same & mask, c, 0.0), jnp.zeros((), jnp.int32)
         ok = same & (jnp.abs(dE) > tol) & mask
         bad = same & (jnp.abs(dE) <= tol) & (jnp.abs(df) > otol) & mask
         return jnp.where(ok, df / jnp.where(ok, dE, 1.0), 0.0), jnp.sum(bad)
@@ -418,7 +428,7 @@ def _gate_flags(dyn, e_A, x_sep):
 
 
 def delta_chi0(dyn: dict, kern: DynsigKernels, U, e_A, f_A, *, pauli: bool = True,
-               same_side: bool = True):
+               same_side: bool = True, rule: dict | None = None, odd_same_side: bool = True):
     """dchi0 of Eq. (4) for the instantaneous window state (U, e_A, f_A), (nq, mu, nu), Ry^-1.
 
     G_eq(tau) of every band (G_frozen + G_active(0)) is composed at each node and
@@ -426,6 +436,11 @@ def delta_chi0(dyn: dict, kern: DynsigKernels, U, e_A, f_A, *, pauli: bool = Tru
     regrouping G_eq = G_f + G_a(0) makes Eq. (4) free of cancellation: no term is
     a difference of two equilibrium-sized products.  ``pauli=False`` /
     ``same_side=False`` drop the inverted product / the same-side pairs (red twins).
+    ``rule=None`` is the static support (the bundle's rule); :func:`probe_rule` is
+    z = i omega_p, the ordered orientation of :func:`chi0_split`: each node weighs
+    alpha_l - i beta_l (the Pauli product is the same kernel with the opposite
+    sign at any support) and the same-side pairs take (f_a - f_b)/(E_a - E_b -
+    i omega_p) (``odd_same_side=False``: its real part alone, a comparison).
     Returns (dchi, flags) with flags the NaN-gate counters.
     """
     nk, mesh = int(np.prod(kern.kgrid)), kern.mesh
@@ -440,6 +455,13 @@ def delta_chi0(dyn: dict, kern: DynsigKernels, U, e_A, f_A, *, pauli: bool = Tru
     x_sep = jnp.asarray(dyn["rule"]["e_sep"])
     onesA = jnp.ones_like(e0)
     G = functools.partial(_green, mesh)
+    if rule is None:
+        taus, weights, omega_p = dyn["tau"], dyn["alpha"], 0.0
+    else:
+        taus = jnp.asarray(np.asarray(rule["tau"], np.float64))
+        weights = jnp.asarray(np.asarray(rule["alpha"], np.float64)
+                              - 1j * np.asarray(rule["beta"], np.float64))
+        omega_p = float(rule["omega_p"])
 
     def body(acc, node):
         tau, alpha = node
@@ -457,13 +479,13 @@ def delta_chi0(dyn: dict, kern: DynsigKernels, U, e_A, f_A, *, pauli: bool = Tru
                                     kern.g_ifft(G(psiA_X, psiA_Y, ahU)))
         return acc + alpha * p, None
 
-    acc, _ = lax.scan(body, _chi_zero(mesh, nk, dyn["nmu_pad"]), (dyn["tau"], dyn["alpha"]),
-                      unroll=1)
+    acc, _ = lax.scan(body, _chi_zero(mesh, nk, dyn["nmu_pad"]), (taus, weights), unroll=1)
     dchi = kern.c_fft((-2.0 * dyn["g_s"] / np.sqrt(nk)) * jnp.real(acc).astype(jnp.complex128))
     crossed, out = _gate_flags(dyn, e_A, x_sep)
     bad = jnp.zeros((), jnp.int32)
     if same_side:
-        chi_ss, bad = _same_side_chi(dyn, kern, psiA_X, e_A, f_A, x_sep)
+        chi_ss, bad = _same_side_chi(dyn, kern, psiA_X, e_A, f_A, x_sep, omega_p=omega_p,
+                                     odd=odd_same_side)
         dchi = dchi + chi_ss
     return dchi, dict(crossed=crossed, out_of_rule=out, degenerate=bad.astype(jnp.int32))
 
@@ -732,7 +754,8 @@ def _copy_gw_deck(deck: str, workdir: str) -> str:
     return out
 
 
-def gnppm_source(gw_deck: str, mesh: Mesh, *, workdir: str, say=print) -> dict:
+def gnppm_source(gw_deck: str, mesh: Mesh, *, workdir: str, screening: bool = False,
+                 say=print) -> dict:
     """The frozen-W source of the GN-PPM collision term: the GW run's own carrier, poles and head.
 
     A GN-PPM run persists W(0) but neither W(i w_p) nor its pole model, so the
@@ -744,9 +767,10 @@ def gnppm_source(gw_deck: str, mesh: Mesh, *, workdir: str, say=print) -> dict:
     Must run outside another driver's ``RunSession`` (the GW driver owns the
     timing table and stdout while it runs).  Returns the observer's dict
     (``wfns``, ``meta``, ``config``, ``poles``, ``head``, ``efermi_ry``,
-    ``request``, ``V_q``, ``quad``) plus ``plan`` (``gw.ppm_sigma.window_sigma_plan``
-    on the run's own on-shell frequency list), ``deck``, ``workdir``, ``rc``,
-    ``wall_s``.
+    ``request``, ``V_q``, ``quad``; with ``screening`` also ``fit_plan`` and
+    ``W_supports``, the held inputs of :func:`collision_screening`) plus ``plan``
+    (``gw.ppm_sigma.window_sigma_plan`` on the run's own on-shell frequency list),
+    ``deck``, ``workdir``, ``rc``, ``wall_s``.
     """
     import os
     import time
@@ -763,7 +787,7 @@ def gnppm_source(gw_deck: str, mesh: Mesh, *, workdir: str, say=print) -> dict:
     cwd = os.getcwd()
     os.chdir(workdir)
     try:
-        with observe_window_sigma_source() as src:
+        with observe_window_sigma_source(screening=screening) as src:
             rc = gw_driver.main(["-i", os.path.basename(copy)])
     finally:
         os.chdir(cwd)
@@ -786,6 +810,151 @@ def gnppm_source(gw_deck: str, mesh: Mesh, *, workdir: str, say=print) -> dict:
     return src
 
 
+#: ``gnppm_collision``'s screening (``[lorrax] collision_screening``).
+COLLISION_SCREENINGS = ("frozen", "refreshed")
+
+
+def collision_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
+                        odd_same_side: bool = True) -> dict:
+    """The held objects of the refreshed screening of the GN-PPM collision term (§7.1).
+
+    W(z_s, t) = [1 - W0(z_s) dchi0(z_s, t)]^-1 W0(z_s) at the GN supports z_s = 0 and
+    i omega_p (Eq. 6, ``gw.ppm_sigma.screening_update``), then the run's own pole fit.
+    Everything comes from ``source`` (:func:`gnppm_source` with ``screening=True``):
+    the run's two W samples and fit plan, its carrier (psi of every band of the chi0
+    sum at the centroids in the run's packed order, eps^G, the step occupations), its
+    static Laplace rule ``quad`` and, built by the driver's own call, its probe rule.
+    dchi0 (:func:`delta_chi0`, dress none: U = 1, e = eps^G) is the change of the
+    run's chi0 when the window populations move: cross-gap pairs on the rules,
+    same-side pairs exact at each support, chi0^ff never formed.  k rows go to flat
+    C order (the run's q convention); the screening bundle is not the propagator's.
+
+    Returns dict: ``dchi`` (the two jitted dchi0 maps (arrays, U, e, f) -> (dchi,
+    flags), static then probe), ``arrays``, ``dyn`` (static part), ``U``, ``e_A``
+    (device, replicated), ``flat_rows`` (flat k row j <- carrier row flat_rows[j]),
+    ``W0`` (the two supports), ``plan`` (``fit_plan``), ``rules``, ``census`` (the
+    jitted pole census; logical modes are those with Omega_0 != 0), ``nbf``, ``poles0``.
+    """
+    from gw.minimax_screening import build_imag_probe_response_rule
+    from tdagw.model import flat_k_rows
+    from common.collectives import device_put_process_local
+    if "fit_plan" not in source or "W_supports" not in source:
+        _refuse("dynsig_collision_screening_source", "a source without the run's W samples",
+                "gnppm_source(..., screening=True)", "rebuild the source with screening=True")
+    wfns, meta, poles0 = source["wfns"], source["meta"], source["poles"]
+    plan, quad = source["fit_plan"], source["quad"]
+    carrier = wfns.green_parent
+    kplan = carrier.plan
+    rows = getattr(kplan, "parent_full_rows", None)
+    nk = int(meta.nk_tot)
+    if rows is not None and not np.array_equal(np.asarray(rows), np.arange(nk)):
+        _refuse("dynsig_collision_screening_rows", "a carrier whose parent rows are permuted",
+                "parent rows = the full zone in the bundle's order", "run the GW parent "
+                "without symmetry (as runs/CrI3/516)")
+    kgrid = tuple(int(n) for n in meta.kgrid)
+    rows_b = np.asarray(flat_k_rows(np.asarray(kplan.k_parent_frac, np.float64), kgrid))
+    flat_rows = np.argsort(rows_b)                       # flat row j <- carrier row flat_rows[j]
+    sl = wfns.slices                     # the logical chi0 bands (the world-size pads are inert)
+    nbf = min(int(sl.b4_chi), int(sl.b4_logical or sl.b4_chi)) - int(sl.b0)
+    if int(wfns.slices.b0) != 0:
+        _refuse("dynsig_collision_screening_bands", f"chi0 sum from band {int(wfns.slices.b0)}",
+                "every band from 0", "run the GN-PPM bundle on the full band set")
+    e_all = np.asarray(jax.device_get(wfns.enk), np.float64)[flat_rows, :nbf]
+    f_all = np.asarray(jax.device_get(wfns.occ), np.float64)[flat_rows, :nbf]
+    occ, emp = f_all > 0.5, f_all < 0.5
+    rule = dict(tau=np.asarray(quad.tau, np.float64), alpha=np.asarray(quad.alpha, np.float64),
+                x_min=float(quad.x_min), x_max=float(quad.x_max),
+                max_error=float(quad.max_error), provenance=quad.provenance,
+                e_sep=0.5 * (float(e_all[occ].max()) + float(e_all[emp].min())))
+    z = complex(plan["probe_omega"])
+    if abs(z.real) > 0.0 or z.imag <= 0.0:
+        _refuse("dynsig_collision_screening_probe", f"probe {z!r}", "i omega_p (GN-PPM)",
+                "use a GN-PPM run")
+    ordered = bool(plan["fit"]["ordered_orientations"])
+    q_p = build_imag_probe_response_rule(quad, float(z.imag), source["config"].minimax_config,
+                                         print_fn=None, with_odd_kernel=ordered)
+    prule = dict(tau=np.asarray(q_p.tau, np.float64), alpha=np.asarray(q_p.alpha, np.float64),
+                 beta=(np.zeros(len(q_p.tau)) if q_p.alpha_odd is None
+                       else np.asarray(q_p.alpha_odd, np.float64)),
+                 omega_p=float(z.imag), max_error=float(q_p.max_error),
+                 provenance=q_p.provenance)
+    take = jax.jit(lambda a: jnp.take(a, jnp.asarray(flat_rows), axis=0)[:, :nbf],
+                   out_shardings=NamedSharding(mesh, P(None, None, None, "x")))
+    psi_flat = take(carrier.psi_nmu)
+    W0 = tuple(source["W_supports"])
+    td_min = dict(kgrid=kgrid, band_lo=int(b_lo), n_bands=int(n_active), n_rmu=int(meta.n_rmu))
+    dyn = assemble_dynsig_bundle(td_min, psi_flat, e_all, f_all, W0[0], mesh_xy=mesh,
+                                 rule=rule)
+    del psi_flat
+    kern = make_dynsig_kernels(mesh, kgrid)
+    arrays, static = split_bundle(dyn)
+    win = slice(int(b_lo), int(b_lo) + int(n_active))
+    rep_ = NamedSharding(mesh, P())
+    put = lambda a: device_put_process_local(np.ascontiguousarray(a), rep_)
+
+    def dchi_map(r):
+        return jax.jit(lambda A, U, e, f: delta_chi0(
+            {**static, **A}, kern, U, e, f, rule=r, odd_same_side=odd_same_side))
+
+    @jax.jit
+    def census(om, valid, valid_prev, w_t0, w_tp, om0, valid0, w00, w0p):
+        """Pole census against the run's (every operand an argument: no global closure)."""
+        live = om0 != 0.0                         # logical modes (pad modes are born dead)
+        both = valid & valid0
+        mx = lambda a: jnp.max(jnp.abs(a))
+        return dict(
+            n_invalid=jnp.sum(live & ~valid), flips_prev=jnp.sum(live & (valid != valid_prev)),
+            flips_eq=jnp.sum(live & (valid != valid0)), n_logical=jnp.sum(live),
+            d_omega=jnp.max(jnp.where(both, jnp.abs(om - om0), 0.0)),
+            dW_static=mx(w_t0 - w00) / mx(w00), dW_probe=mx(w_tp - w0p) / mx(w0p))
+
+    return dict(dchi=(dchi_map(None), dchi_map(prule)), arrays=arrays, dyn=static, kern=kern,
+                U=put(np.broadcast_to(np.eye(int(n_active), dtype=complex),
+                                      (nk, int(n_active), int(n_active))).copy()),
+                e_A=put(e_all[:, win]), flat_rows=flat_rows, W0=W0, plan=plan,
+                rules=dict(static=rule, probe=prule), census=census, nbf=nbf, poles0=poles0)
+
+
+def screen_populations(scr: dict, f_rows, *, valid_prev=None):
+    """W(t) at both supports and its pole model for the window populations ``f_rows``.
+
+    ``f_rows`` (nk, n_A) on the carrier's rows.  Returns (poles, W, rec): ``rec`` has
+    the walls (``dchi_s``: dchi0 at both supports; ``fit_s``: the two Dyson solves and
+    the fit, ``gw.ppm_sigma.screening_update``), the pole census against the run's
+    poles (``n_invalid``, ``flips_prev`` against ``valid_prev``, ``flips_eq``,
+    ``d_omega_mev`` over the modes valid in both, ``dW`` = max|W(z) - W0(z)|/max|W0(z)|
+    at 0 and i omega_p), ``dchi_max`` (max|dchi0| at both supports, Ry^-1); a raised
+    dchi0 gate refuses by name.
+    """
+    import time
+    from common.collectives import device_put_process_local
+    from common.units import RYD_TO_EV
+    from gw.ppm_sigma import screening_update
+    f_flat = np.asarray(f_rows, np.float64)[scr["flat_rows"]]
+    rep_ = NamedSharding(scr["kern"].mesh, P())
+    f_dev = device_put_process_local(np.ascontiguousarray(f_flat), rep_)
+    t0 = time.perf_counter()
+    outs = [fn(scr["arrays"], scr["U"], scr["e_A"], f_dev) for fn in scr["dchi"]]
+    jax.block_until_ready([o[0] for o in outs])
+    t1 = time.perf_counter()
+    for _, flags in outs:
+        check_state(scr["dyn"], flags)
+    dchi_max = [float(v) for v in jax.device_get([jnp.max(jnp.abs(o[0])) for o in outs])]
+    poles, W = screening_update(scr["W0"], [o[0] for o in outs], scr["plan"])
+    jax.block_until_ready((poles.Omega_q, W[0], W[1]))
+    t2 = time.perf_counter()
+    p0 = scr["poles0"]
+    prev = p0.valid_mask_q if valid_prev is None else valid_prev
+    c = {k: float(v) for k, v in jax.device_get(scr["census"](
+        poles.Omega_q, poles.valid_mask_q, prev, W[0], W[1], p0.Omega_q, p0.valid_mask_q,
+        scr["W0"][0], scr["W0"][1])).items()}
+    rec = dict(dchi_s=t1 - t0, fit_s=t2 - t1, n_invalid=int(c["n_invalid"]),
+               flips_prev=int(c["flips_prev"]), flips_eq=int(c["flips_eq"]),
+               d_omega_mev=c["d_omega"] * RYD_TO_EV * 1e3, dW=[c["dW_static"], c["dW_probe"]],
+               n_logical=int(c["n_logical"]), dchi_max=dchi_max)
+    return poles, W, rec
+
+
 def window_branch_rates(tabs: dict):
     """(G~>, G~<, S~) host (nk, n, n) Ry from ``window_sigma_c``'s ``branch_pair`` (Eq. 8)."""
     from tdagw import collision as C
@@ -794,6 +963,24 @@ def window_branch_rates(tabs: dict):
     s = 0.5 * (tabs["cond"][0] + tabs["cond"][1] + tabs["val"][0] + tabs["val"][1]
                ) + tabs["static"]
     return g_out, g_in, s
+
+
+def _shift_window_part(base: dict, new: dict, old: dict) -> dict:
+    """base + (new - old) on every table of ``window_sigma_c`` outputs (frame and census: base/new).
+
+    The truncated frozen part of a refreshed-screening refresh: Sigma^F[W0] held from t0
+    plus the change of the kept frozen bands' part, Sigma^F_kept[W(t)] - Sigma^F_kept[W0].
+    """
+    for part in (new, old):
+        if float(part["efermi_ry"]) != float(base["efermi_ry"]):
+            raise ValueError("GATE dynsig_collision_parts: the parts' omega frames differ")
+    out = dict(base)
+    for key in ("pair", "diag", "onshell"):
+        out[key] = base[key] + (new[key] - old[key])
+    out["branch_pair"] = {n: base["branch_pair"][n] + (new["branch_pair"][n] - old["branch_pair"][n])
+                          for n in base["branch_pair"]}
+    out["sweep"] = new.get("sweep")
+    return out
 
 
 #: ``gnppm_collision``'s refresh sweeps (``[lorrax] collision_refresh_sweep``).
@@ -811,7 +998,10 @@ def _sweep_nodes(out: dict) -> dict:
 
 def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: int,
                     form: str = "subtracted", hermitian: str = "dynamic", policy=None,
-                    sweep: str = "full", check_full: bool = False, say=print, record=None):
+                    sweep: str = "full", check_full: bool = False, screening: str = "frozen",
+                    frozen_bands=None, frozen_plan: str = "window",
+                    check_truncation: bool = False, odd_same_side: bool = True, say=print,
+                    record=None):
     """The held collision term of the GN-PPM member at t0 and its refresh hook (§1.5, §7.1).
 
     Parameters
@@ -834,6 +1024,26 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     check_full : ``sweep = "active"`` only (diagnostic): also run the full sweep at
         t0 and at every refresh and record the differences of the rates and of
         Delta Sigma^h (``full_vs_split`` in each record).
+    screening : :data:`COLLISION_SCREENINGS`.  ``"frozen"``: the run's poles throughout
+        (the incumbent).  ``"refreshed"`` (td_agw_dynamical.md §7.1): each refresh
+        re-screens W at both GN supports from the window populations
+        (:func:`collision_screening`, :func:`screen_populations`: dchi0, the Dyson
+        solves and the run's pole fit) and sweeps the window Sigma on the new poles;
+        the q -> 0 head stays the run's.  The frozen bands' part then changes too and
+        is swept at every refresh (``sweep = "active"``) on the held session of t0;
+        the static-W limit subtracted from Delta Sigma^h stays the run's W0 (K drho
+        holds -W^c_0(0) df), so the static and dynamic parts of dW are both kept.
+    frozen_bands : ``(n_below, n_above)`` or None, refreshed + active only: the frozen
+        part's change is swept over the frozen bands [b_lo - n_below, b_lo) and
+        [b_hi, b_hi + n_above) alone, Sigma^F[W(t)] ~ Sigma^F[W0] + Sigma^F_kept[W(t)]
+        - Sigma^F_kept[W0] (exact at rho_eq; its error is measured, ``check_truncation``).
+    frozen_plan : ``"window"`` (the window's on-shell energies, a held session) or
+        ``"gw_list"`` (the GW run's on-shell list, one-shot rules): the frozen part's
+        windows (``sweep = "active"``).
+    check_truncation : with ``frozen_bands`` (diagnostic): also sweep the whole frozen
+        part at each refresh and record the differences (``truncation`` in each record).
+    odd_same_side : :func:`delta_chi0`'s (False: the time-reversal-even same-side
+        coefficient at i omega_p, a comparison).
     say : the stdout line of each refresh; ``record`` (or None) gets each
         refresh's dict (the run log's section, the case scripts' tables).
 
@@ -867,6 +1077,19 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     if check_full and sweep != "active":
         _refuse("dynsig_collision_check", "check_full with sweep = 'full'", "sweep = 'active'",
                 "the check compares the split refresh with the full one")
+    if screening not in COLLISION_SCREENINGS:
+        _refuse("dynsig_collision_screening", repr(screening), " | ".join(COLLISION_SCREENINGS),
+                "pick one")
+    if frozen_plan not in ("window", "gw_list"):
+        _refuse("dynsig_collision_frozen_plan", repr(frozen_plan), "'window' | 'gw_list'",
+                "pick one")
+    if frozen_bands is not None and (screening != "refreshed" or sweep != "active"):
+        _refuse("dynsig_collision_frozen_bands", f"frozen_bands with screening = {screening!r}, "
+                f"sweep = {sweep!r}", "screening = 'refreshed', sweep = 'active'",
+                "the truncation is of the frozen part's change under W(t)")
+    if check_truncation and frozen_bands is None:
+        _refuse("dynsig_collision_check", "check_truncation without frozen_bands",
+                "frozen_bands", "the check compares the truncated frozen part with the whole")
     policy = C.RefreshPolicy() if policy is None else policy
     wfns, meta, poles, splan = source["wfns"], source["meta"], source["poles"], source["plan"]
     nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
@@ -899,14 +1122,42 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     def to_td(a):                         # bundle rows (nk, ...) -> TD rows
         return np.asarray(a)[bundle_of]
 
-    def window(f_bundle, plan, internal=None):
-        """One window Sigma (both branches) at window populations f (bundle rows)."""
+    def window(f_bundle, plan, internal=None, *, at=None, keep=None, wc0=None, static=None):
+        """One window Sigma (both branches) at window populations f (bundle rows), poles ``at``."""
         t = time.perf_counter()
-        out = window_sigma_c(wfns, poles, dict(b_lo=int(b_lo), U=eye, e=e_g, f=f_bundle),
-                             plan, meta=meta, mesh_xy=mesh, branches=True,
-                             static_limit=dynamic, internal=internal)
+        out = window_sigma_c(wfns, poles if at is None else at,
+                             dict(b_lo=int(b_lo), U=eye, e=e_g, f=f_bundle), plan, meta=meta,
+                             mesh_xy=mesh, branches=True,
+                             static_limit=dynamic if static is None else bool(static),
+                             internal=internal, keep_frozen=keep, static_limit_wc0=wc0)
         out["wall_s"] = time.perf_counter() - t
         return out
+
+    refreshed = screening == "refreshed"
+    W0c = poles.Wc0_q                                   # the run's W^c(0): the static limit's
+    keep = None
+    if frozen_bands is not None:
+        n_lo, n_hi = (int(v) for v in frozen_bands)
+        nfull = int(np.asarray(jax.device_get(wfns.occ))[:, wfns.slices.full].shape[1])
+        keep = np.zeros(nfull, bool)
+        keep[max(0, int(b_lo) - n_lo):int(b_lo)] = True
+        keep[int(b_lo) + nb:min(nfull, int(b_lo) + nb + n_hi)] = True
+    scr, screen_eq = None, None
+    if refreshed:
+        t_s = time.perf_counter()
+        scr = collision_screening(source, mesh=mesh, b_lo=int(b_lo), n_active=nb,
+                                  odd_same_side=odd_same_side)
+        t_b0 = time.perf_counter()
+        poles_eq, _, screen_eq = screen_populations(scr, f_b)
+        same = lambda a, b: (a is None and b is None) or (
+            a is not None and b is not None and bool(jax.device_get(jnp.array_equal(a, b))))
+        screen_eq.update(
+            setup_s=t_b0 - t_s, poles_bitwise=all(same(getattr(poles_eq, k), getattr(poles, k))
+                                                 for k in ("Omega_q", "B_q", "B_odd_q",
+                                                           "valid_mask_q", "Wc0_q")),
+            rule_nodes=[len(scr["rules"]["static"]["tau"]), len(scr["rules"]["probe"]["tau"])],
+            frozen_bands=None if keep is None else int(keep.sum()), frozen_plan=frozen_plan)
+        del poles_eq
 
     held_parts, plans = {}, {}
     t_split = time.perf_counter()
@@ -917,12 +1168,23 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         # with every active state live in both branches (f = 1/2), the superset of the live
         # sets a run reaches; the frozen part's states never change.
         cfg = source["config"]
-        plans = dict(frozen=window_sigma_plan(cfg, head=None, session={}, window_only=True),
-                     active=window_sigma_plan(cfg, head=source["head"], session={},
-                                              window_only=True))
-        window(f_b, plans["frozen"], "frozen")
+        if frozen_plan == "gw_list":
+            req = source["request"]
+            fplan = window_sigma_plan(cfg, head=None, frequencies_abs_ry=(
+                None if req is None else np.asarray(req.frequencies_ry) + float(source["efermi_ry"])))
+        else:
+            fplan = window_sigma_plan(cfg, head=None, session={}, window_only=True)
+        plans = dict(frozen=fplan, active=window_sigma_plan(cfg, head=source["head"], session={},
+                                                            window_only=True))
+        if frozen_plan == "window":
+            window(f_b, plans["frozen"], "frozen")
         held_parts["frozen"] = window(f_b, plans["frozen"], "frozen")
         window(np.full_like(f_b, 0.5), plans["active"], "active")
+        if keep is not None:
+            plans["frozen_keep"] = window_sigma_plan(cfg, head=None, session={}, window_only=True)
+            window(f_b, plans["frozen_keep"], "frozen", keep=keep, static=False)
+            held_parts["frozen_keep"] = window(f_b, plans["frozen_keep"], "frozen", keep=keep,
+                                               static=False)
     t_split = time.perf_counter() - t_split
 
     def tables(out):
@@ -937,18 +1199,39 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                     static=None if static is None else to_td(static), raw=out,
                     wall_s=out["wall_s"])
 
-    def full_sweep(f_bundle):
-        out = window(f_bundle, splan)
+    def full_sweep(f_bundle, at=None):
+        out = window(f_bundle, splan, at=at, wc0=None if at is None else W0c)
         return dict(tables(out), nodes=_sweep_nodes(out))
 
-    def sweep_tables(f_bundle):
-        """The refresh's window Sigma at window populations f (bundle rows)."""
+    scratch = {}
+
+    def frozen_part(f_bundle, at):
+        """The frozen bands' part on the poles ``at`` (static limit: the held one at W0)."""
+        if keep is None:
+            fz = window(f_bundle, plans["frozen"], "frozen", at=at, static=False)
+            out = dict(fz)
+        else:
+            fz = window(f_bundle, plans["frozen_keep"], "frozen", at=at, keep=keep, static=False)
+            out = _shift_window_part(held_parts["frozen"], fz, held_parts["frozen_keep"])
+        if "static_limit" in held_parts["frozen"]:
+            out["static_limit"] = held_parts["frozen"]["static_limit"]
+        return out, fz
+
+    def sweep_tables(f_bundle, at=None):
+        """The refresh's window Sigma at window populations f (bundle rows), poles ``at``."""
         if sweep == "full":
-            return full_sweep(f_bundle)
-        act = window(f_bundle, plans["active"], "active")
-        out = add_window_parts(held_parts["frozen"], act)
-        out["wall_s"] = act["wall_s"]
-        return dict(tables(out), nodes=_sweep_nodes(act))
+            return full_sweep(f_bundle, at=at)
+        extra = {}
+        frozen = held_parts["frozen"]
+        if at is not None:
+            frozen, fz = frozen_part(f_bundle, at)
+            extra = dict(frozen_s=fz["wall_s"], frozen_nodes=_sweep_nodes(fz))
+        act = window(f_bundle, plans["active"], "active", at=at,
+                     wc0=None if at is None else W0c)
+        scratch["act"] = act
+        out = add_window_parts(frozen, act)
+        out["wall_s"] = act["wall_s"] + extra.get("frozen_s", 0.0)
+        return dict(tables(out), nodes=_sweep_nodes(act), active_s=act["wall_s"], **extra)
 
     put = lambda a: tp.place_window_blocks(a, mesh, nk_pad)
     stack = lambda key, parts: np.stack([p[key] for p in parts]) * half
@@ -1000,7 +1283,7 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         sweep=sweep, nodes=eq["nodes"],
         frozen=(None if not held_parts else dict(
             nodes=_sweep_nodes(held_parts["frozen"]), wall_s=held_parts["frozen"]["wall_s"],
-            setup_s=t_split)))
+            setup_s=t_split)), screening=screening, screen_eq=screen_eq)
     if eq_full is not None:
         receipt["full_vs_split"] = compare(eq, eq_full)
     s_eq = np.stack([eq["s"]] * ntr)
@@ -1011,7 +1294,7 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
     held0 = None if hermitian == "none" else put(np.zeros((ntr, nk, nb, nb), complex))
     state = dict(t_last=0.0, f_last=np.broadcast_to(f_td, (ntr, nk, nb)).copy(), n=0,
                  trace_last=np.asarray(res["trace"]).copy(), history=[receipt],
-                 held_max_mev=0.0)
+                 held_max_mev=0.0, valid_prev=[None] * ntr)
     line = (f"  collision t0     : {form}, hermitian {hermitian}; rates at rho_eq: diag "
             f"out [{receipt['rate_out_diag_mev'][0]:.3g}, {receipt['rate_out_diag_mev'][1]:.3g}] meV, "
             f"in [{receipt['rate_in_diag_mev'][0]:.3g}, {receipt['rate_in_diag_mev'][1]:.3g}] meV, "
@@ -1021,8 +1304,18 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
             f"(sweep {receipt['sweep_s']:.2f}, build {receipt['build_s']:.2f}); sweep {sweep}: "
             f"{eq['nodes']['distinct_tau']} tau in {eq['nodes']['n_windows']} windows"
             + ("" if not held_parts else
-               f" (frozen part once: {receipt['frozen']['nodes']['distinct_tau']} tau, "
-               f"{receipt['frozen']['wall_s']:.2f} s)"))
+               f" (frozen part {'at t0' if not refreshed else 'per refresh'}: "
+               f"{receipt['frozen']['nodes']['distinct_tau']} tau, "
+               f"{receipt['frozen']['wall_s']:.2f} s)")
+            + ("" if screen_eq is None else
+               f"; screening refreshed: at rho_eq max|dchi0| {screen_eq['dchi_max'][0]:.1e}/"
+               f"{screen_eq['dchi_max'][1]:.1e}, max|W - W0|/|W0| {screen_eq['dW'][0]:.1e}/"
+               f"{screen_eq['dW'][1]:.1e} (0 / i w_p), poles "
+               f"{'bitwise' if screen_eq['poles_bitwise'] else 'NOT bitwise'} the run's, "
+               f"{screen_eq['n_invalid']}/{screen_eq['n_logical']} invalid modes; dchi0 "
+               f"{screen_eq['dchi_s']:.2f} s, Dyson+fit {screen_eq['fit_s']:.2f} s; rules "
+               f"{screen_eq['rule_nodes'][0]}+{screen_eq['rule_nodes'][1]} nodes"
+               + ("" if keep is None else f"; frozen change over {int(keep.sum())} bands")))
     say(line)
     if record is not None:
         record(dict(receipt, line=line))
@@ -1034,12 +1327,26 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
         if not due:
             return None
         t1 = time.perf_counter()
-        parts, f_rows = [], []
+        parts, f_rows, screens, poles_now = [], [], [], []
         for tr in range(ntr):
             fb = np.empty((kb_frac.shape[0], nb))
             fb[bundle_of] = f[tr]
             f_rows.append(fb)
-            parts.append(sweep_tables(fb))
+            at = None
+            if refreshed:
+                at, _, srec = screen_populations(scr, fb, valid_prev=state["valid_prev"][tr])
+                state["valid_prev"][tr] = at.valid_mask_q
+                screens.append(srec)
+                poles_now.append(at)
+            parts.append(sweep_tables(fb, at=at))
+            if check_truncation:
+                fz = window(fb, plans["frozen"], "frozen", at=at, static=False)
+                whole = dict(fz)
+                if "static_limit" in held_parts["frozen"]:
+                    whole["static_limit"] = held_parts["frozen"]["static_limit"]
+                alt = dict(tables(add_window_parts(whole, scratch["act"])), nodes=_sweep_nodes(fz),
+                           wall_s=fz["wall_s"])
+                parts[-1]["_truncation"] = alt
         t2 = time.perf_counter()
         g_out, g_in = put(stack("g_out", parts)), put(stack("g_in", parts))
         t3 = time.perf_counter()
@@ -1067,9 +1374,34 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                    d_trace=[float(v) for v in (trace - state["trace_last"])],
                    min_rate_mev=float(out["min_rate"]) * 2.0 * ry_mev, held_max_mev=held_max,
                    c_eq_diag=receipt["c_eq_diag"], c_eq_offdiag=receipt["c_eq_offdiag"],
-                   sweep=sweep, nodes=parts[0]["nodes"])
+                   sweep=sweep, nodes=parts[0]["nodes"], screening=screening)
+        if refreshed:
+            worst = lambda key: max(sr[key] for sr in screens)
+            rec.update(screen=dict(
+                dchi_s=sum(sr["dchi_s"] for sr in screens), fit_s=sum(sr["fit_s"] for sr in screens),
+                n_invalid=worst("n_invalid"), n_logical=screens[0]["n_logical"],
+                flips_prev=worst("flips_prev"), flips_eq=worst("flips_eq"),
+                d_omega_mev=worst("d_omega_mev"),
+                dW=[max(sr["dW"][0] for sr in screens), max(sr["dW"][1] for sr in screens)],
+                dchi_max=[max(sr["dchi_max"][0] for sr in screens),
+                          max(sr["dchi_max"][1] for sr in screens)]))
+            if sweep == "active":
+                rec.update(frozen_s=sum(p_["frozen_s"] for p_ in parts),
+                           active_s=sum(p_["active_s"] for p_ in parts),
+                           frozen_nodes=parts[0]["frozen_nodes"])
+        if check_truncation:                 # diagnostic, outside the comparison's own wall
+            h_alt = None
+            if hermitian != "none":
+                h_alt = np.asarray(C.hermitian_update(
+                    np.stack([p_["_truncation"]["s"] for p_ in parts]), s_eq,
+                    None if not dynamic else np.stack([p_["_truncation"]["static"] for p_ in parts]),
+                    static_eq)) * half
+            cmp = [compare(p_, p_["_truncation"], None if h is None else h[i],
+                           None if h_alt is None else h_alt[i]) for i, p_ in enumerate(parts)]
+            rec["truncation"] = {k: max(c_[k] for c_ in cmp) for k in cmp[0]}
         if check_full:                       # diagnostic, outside the refresh's wall
-            fulls = [full_sweep(fb) for fb in f_rows]
+            fulls = [full_sweep(fb, at=(poles_now[i] if refreshed else None))
+                     for i, fb in enumerate(f_rows)]
             h_full = None
             if hermitian != "none":
                 h_full = np.asarray(C.hermitian_update(
@@ -1090,6 +1422,21 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
                 f"||C[rho_eq]|| diag {rec['c_eq_diag']:.2e} off {rec['c_eq_offdiag']:.2e}; "
                 f"{sweep} sweep {rec['nodes']['distinct_tau']} tau"
                 + (f" ({rec['nodes']['rebuilds']} rules rebuilt)" if rec["nodes"]["rebuilds"] else "")
+                + ("" if "screen" not in rec else
+                   f"; W(t): dchi0 {rec['screen']['dchi_s']:.2f} s, Dyson+fit "
+                   f"{rec['screen']['fit_s']:.2f} s"
+                   + ("" if "frozen_s" not in rec else
+                      f", frozen sweep {rec['frozen_s']:.2f} s ({rec['frozen_nodes']['distinct_tau']} "
+                      f"tau" + (f", {rec['frozen_nodes']['rebuilds']} rules rebuilt"
+                                if rec['frozen_nodes']['rebuilds'] else "")
+                      + f"), active {rec['active_s']:.2f} s")
+                   + f"; invalid {rec['screen']['n_invalid']}/{rec['screen']['n_logical']} modes "
+                   f"({rec['screen']['flips_prev']} flips since last, {rec['screen']['flips_eq']} vs "
+                   f"rho_eq), max|dOmega| {rec['screen']['d_omega_mev']:.3g} meV, max|dW|/|W0| "
+                   f"{rec['screen']['dW'][0]:.2e} (0) {rec['screen']['dW'][1]:.2e} (i w_p)")
+                + ("" if "truncation" not in rec else
+                   f"; vs whole frozen part: rates {rec['truncation']['rate_rel']:.2e} rel, "
+                   f"dSigma^h {rec['truncation'].get('herm_mev', 0.0):.2e} meV")
                 + ("" if "full_vs_split" not in rec else
                    f"; vs full: rates {rec['full_vs_split']['rate_rel']:.2e} rel, "
                    f"dSigma^h {rec['full_vs_split'].get('herm_mev', 0.0):.2e} meV"))
@@ -1100,4 +1447,5 @@ def gnppm_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: in
 
     return dict(diss=res["diss"], held=held0, refresh=refresh, t0=receipt, state=state,
                 c_eq=c_eq, rates_eq=(g_out_eq, g_in_eq), sweep=sweep_tables, program=program,
-                eq=eq, bundle_of=bundle_of, parts=held_parts, plans=plans)
+                eq=eq, bundle_of=bundle_of, parts=held_parts, plans=plans, screening=scr,
+                window=window, tables=tables, keep=keep)
