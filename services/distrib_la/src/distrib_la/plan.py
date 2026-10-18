@@ -1079,9 +1079,10 @@ class Plan:
     def _decide(self, A, args, traced: bool = True, route: str | None = None) -> tuple:
         """``(backend, route, rounds)`` :meth:`batched` runs ``A``, ``args`` with: the one place
         it is decided.  ``rounds`` is set on ``one_device``'s stacked entry only: the measured
-        size route's (:func:`_measured_rounds`; 0 the leg library), else the round rule against
-        the bound (:func:`distrib_la._one_device.rounds_for`; the leg row, or on a room leg the
-        room this plan was resolved against).  ``route`` is the gates' override."""
+        size route's (:func:`_measured_rounds`; 0 the leg library), else one_device's own round
+        rule (:func:`distrib_la._one_device.rounds_for` against
+        :func:`distrib_la.resolve.one_device_round_n` of the bound: the leg row, or on a room leg
+        the room this plan was resolved against, capped by the leg's round row).  ``route`` is the gates' override."""
         route = self.route_for(A.shape, A.dtype, traced) if route is None else route
         rounds = None
         if route == ROUTE_BACKEND_BATCHED and self.backend == ONE_DEVICE:
@@ -1092,7 +1093,11 @@ class Plan:
                 n = int(A.shape[-1])
                 bound = od._bound(self.op, self.mesh, n, _resolve.one_device_max_n(
                     self.op, _resolve.mesh_platform(self.mesh), self.budget_bytes))
-                rounds = od.rounds_for(int(A.shape[0]), n, od._ranks(self.mesh), bound,
+                # one_device's own round rule: against the leg's round row (ONE_DEVICE_ROUND_N,
+                # resolve.one_device_round_n), exactly as _one_device computes it without rounds=.
+                rounds = od.rounds_for(int(A.shape[0]), n, od._ranks(self.mesh),
+                                       _resolve.one_device_round_n(
+                                           self.op, _resolve.mesh_platform(self.mesh), bound),
                                        int(args[0].shape[-1]) if self.op == "solve_lu" else None)
         return (self.backend, route, rounds)
 

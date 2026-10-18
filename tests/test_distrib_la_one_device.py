@@ -271,3 +271,22 @@ def test_slate_lu_px1_rows_come_back_in_order():
     assert np.array_equal(np.asarray(got), X)
     assert _slate.lu_layout(8192, 2, 2) == 256 and _slate.lu_layout(512, 2, 2) == 256
     assert _slate.lu_layout(4 * 1009, 2, 2) == 2018    # prime-ish edge: one tile per rank
+
+
+def test_the_decision_runs_one_devices_own_round_rule(mesh, rocm, monkeypatch):
+    """Plan._decide (the one decider, cfd792b5d) runs one_device's own round rule: rounds against
+    the leg's round row (resolve.one_device_round_n, ROCM solve_lu 8192), not the raw selection
+    bound -- else a capacity-routed matrix past the row would hold more matrices per round than
+    _one_device allows."""
+    plan_mod = importlib.import_module("distrib_la.plan")
+    monkeypatch.setattr(plan_mod, "_measured_rounds", lambda p, A, args, single=False: None)
+    n, nb = 6144, 16
+    bound = resolve_mod.one_device_max_n("solve_lu", "ROCM")
+    round_n = resolve_mod.one_device_round_n("solve_lu", "ROCM", bound)
+    assert round_n < bound          # the case this guards: a round row below the selection bound
+    p = distrib_la.plan("solve_lu", mesh, backend="distributed", n=n, batched_route="auto")
+    assert p.backend == "one_device"
+    a = jax.ShapeDtypeStruct((nb, n, n), np.complex128)
+    backend, route, rounds = p.decision(a, a)
+    want = od.rounds_for(nb, n, 4, round_n, n)
+    assert rounds == want and want != od.rounds_for(nb, n, 4, bound, n), (rounds, want)
