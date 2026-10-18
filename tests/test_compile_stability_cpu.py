@@ -207,9 +207,26 @@ def test_response_programs_key_on_the_solve_decision_not_the_room(fresh_bank, mo
     assert built.bind(10 ** 10)[0].value == built.bind(10 ** 10)[0].value   # a value, not an identity
 
 
+def _stack_matches_single(stacked, single):
+    """A stacked solve against the one-matrix solve of the same matrix.
+
+    cpu: bit for bit (LAPACK ``heevd`` runs matrix by matrix either way).  A GPU's eigh
+    depends on the stack: jaxlib's cuSOLVER ``syevd`` solves a stack of n <= 32 matrices
+    with batched Jacobi and one matrix with divide and conquer, and its eigenvectors differ
+    in the last bits at n = 40 and 64 too (A100, jax 0.9.1).  Both are backward stable, so
+    a gauge-free result agrees to rounding (measured <= 2.3e-15 relative).
+    """
+    a, b = np.asarray(stacked), np.asarray(single)
+    if jax.default_backend() == "cpu":
+        assert np.array_equal(a, b)
+    else:
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-13 * np.max(np.abs(b)))
+
+
 def test_polar_stack_has_no_host_callback():
     """The parallel-transport link stack (``PolarPlan.batched``, distributed route) is
-    cacheable, and each link is that matrix's own polar factor, bit for bit."""
+    cacheable, and each link is that matrix's own polar factor: bit for bit on cpu, to
+    rounding on a GPU (:func:`_stack_matches_single`)."""
     from distrib_la import polar
 
     class _CheckedEigh(_CheckedPlan):
@@ -227,15 +244,16 @@ def test_polar_stack_has_no_host_callback():
     assert _host_callbacks(call.lower(a)) == 0
     for i in range(2):
         one_link, one_s = plan(jax.device_put(a[i], tile))
-        assert np.array_equal(np.asarray(link[i]), np.asarray(one_link))
-        assert np.array_equal(np.asarray(s[i]), np.asarray(one_s))
+        _stack_matches_single(link[i], one_link)
+        _stack_matches_single(s[i], one_s)
     u, _, vh = np.linalg.svd(np.asarray(a))
     np.testing.assert_allclose(np.asarray(link), u @ vh, atol=1e-12)
 
 
 def test_zeta_factor_has_no_host_callback(capsys):
     """The charge ζ factor, replicated and q-parallel, holds no host callback; its
-    rank receipt prints on the host, and the two schedules agree bit for bit."""
+    rank receipt prints on the host, and the two schedules agree: B bit for bit on cpu,
+    the gauge-free C⁺ = B Bᴴ to rounding on a GPU (:func:`_stack_matches_single`)."""
     from isdf import core
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
     c = jax.device_put(_hermitian(8, b=4, seed=5), NamedSharding(mesh, P(None, "x", "y")))
@@ -244,7 +262,10 @@ def test_zeta_factor_has_no_host_callback(capsys):
     programs = [cache[next(k for k in cache if k[1:] == (4, 8, 8, 1e-8))]
                 for cache in (core._replicated_chol_cache, core._qparallel_factor_cache)]
     assert [_host_callbacks(p.lower(c)) for p in programs] == [0, 0]
-    assert np.array_equal(np.asarray(f), np.asarray(g))
+    if jax.default_backend() == "cpu":
+        assert np.array_equal(np.asarray(f), np.asarray(g))
+    else:   # B's columns carry the eigensolver's phase; C⁺ = B Bᴴ does not
+        _stack_matches_single(*(b @ jnp.conj(jnp.swapaxes(b, -1, -2)) for b in (f, g)))
     assert capsys.readouterr().out.count("[zeta rank_truncate] n_log=8 rcond=1.0e-08 n_keep/q=[8 8 8 8]") == 2
 
 
