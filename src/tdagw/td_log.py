@@ -411,10 +411,13 @@ class TdReport(ScientificProductionReport):
         self._pending = False
         self.heading("Progress")
         ham = v["system.depopulation"] == 0.0 and v["system.dephasing"] == 0.0
+        coll = v.get("lorrax.collision", "off") != "off"
         self.emit("  one row per chunk; t = the chunk's end state; |P|, n_c and |E| at its last "
                   "sample, max over drives; dSigma = calls so far (steps and samples);")
         self.emit("  dTr/Tr, dPur/Pur = largest |X - X(t0)| / X(t0) of Tr rho and Tr rho^2 over "
                   "the chunk's samples (" + (
+                      "collision on: Tr rho moves by the out/in balance of the held rates, "
+                      "Tr rho^2 is not conserved)" if coll else
                       "Gamma = 0: both are invariants of the exact flow)" if ham else
                       "Gamma != 0: Tr rho^2 decays by design, Tr rho is conserved)"))
         self.emit("  a chunk of a new step or sample count compiles its program (the first always, "
