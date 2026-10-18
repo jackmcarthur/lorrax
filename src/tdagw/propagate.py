@@ -1237,9 +1237,16 @@ def run_propagation(cfg: PropagatorConfig, spec: SampleSpec, rho0, ops,
     the integrator's whole carry and its step counter (every rank), and the
     state's time.  ``resume`` = dict(carry=
     host leaves, step=int, i_next=int) continues a checkpointed run from its
-    next sample.  Returns (counters, carry): steps taken by this run,
-    rejected tries, dSigma evaluations; with the stiff split also the
-    closing-solve counters (``fast``).  A chunk in which any step's closing
+    next sample.  Returns (counters, carry): ``accepted`` steps taken by this
+    run, ``rejected`` tries, ``dsigma`` evaluations in the steps,
+    ``sample_dsigma`` (the samples' own ΔΣ calls), ``t_final``, ``refreshes``
+    and ``refresh_dsigma`` (the collision refreshes and their ΔΣ calls),
+    ``jit_cache`` (traced specializations of the chunk programs) and
+    ``programs`` (chunk programs built); with the stiff split also the
+    closing-solve counters (``fast``).  The per-chunk ``COUNTERS`` carry
+    ``accepted``, ``rejected``, ``dsigma``, ``sample_dsigma``, ``refreshes``,
+    ``refresh_dsigma`` and ``jit_cache`` so far, and ``new_program`` (whether
+    the chunk built its program).  A chunk in which any step's closing
     solve missed its tolerance refuses (``td_stiff_solve``) before its
     samples reach ``on_chunk``.
 

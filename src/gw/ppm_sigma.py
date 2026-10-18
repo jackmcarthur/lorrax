@@ -1729,7 +1729,9 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     projection; its Hermitian part is the operator of sigma-on-shell.md);
     ``diag`` (nk, n_A): Sigma^c_ii(e_i); ``omega`` (n_omega, nk, n_A, n_A) in the band
     basis when ``omega_ry`` is given; ``efermi_ry``; ``request`` (the on-shell
-    tables); ``branch_pair`` / ``static_limit`` on request.  ``pair``,
+    tables); ``carrier`` = dict(slices, nb_sigma), the rotated carrier's band
+    slices and the Σ window [0, nb_sigma) the sweep ran on; ``branch_pair`` /
+    ``static_limit`` on request.  ``pair``,
     ``branch_pair`` and ``static_limit`` are in the instantaneous basis (the
     columns of U); ``onshell`` and ``omega`` in the band basis.
 
