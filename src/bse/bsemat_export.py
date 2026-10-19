@@ -6,8 +6,9 @@ The outline, in the order it runs:
    W(q) and the head-less Γ tiles, all canonical centroid order;
 2. BerkeleyGW's head momentum of every (k, k′) pair (``fullbz`` + ``sortbyq``,
    ties included) and the ζ column at it, unfolded from the q wedge;
-3. per q the file-only split E3–E5 (``bse.bsemat_algebra.head_split``) on
-   V's face, with its gates;
+3. the file-only split E3–E5 (``bse.bsemat_algebra``): one batched eigh of V per
+   wedge q, the solve carried to every head key as ζ is, E3–E5 on each key's
+   own V/W faces with its gates (``head_split_keys``);
 4. the gauge map of ψ into the coarse WFN's coefficient gauge;
 5. one k′ row of the file at a time: E7 against W(k − k′) for all k, then the
    exchange row, each written as one hyperslab per matrix through SlabIO.
@@ -143,22 +144,15 @@ def grid_index(frac, grid):
 # 2b. ζ columns at the head momenta, unfolded from the wedge
 # ---------------------------------------------------------------------------
 
-def head_columns(keys, *, zeta_path, tables, sym, grid, n_rmu, n_rmu_pad, mesh_xy):
-    """ζ_q(μ, G)/√Ω at each requested ``(iq, G)`` of the full grid (host, (n_keys, μ_pad)).
+def _head_parents(keys, *, tables, sym, grid, n_rmu_pad):
+    """Parent ``(wedge q, ζ slot)`` of every head key, from SymMaps' star rows (host).
 
-    Each key's parent column is ``G_p = S⁻¹(q + G) − q_p`` at its wedge q_p, read
-    from ``zeta_q.h5`` and carried to q by ``symmetry_maps.unfold_isdf_one_leg``
-    (preselected carrier). Keys of one wedge q that need different parent
-    slots (zone-boundary ties) go through separate unfold layers.
+    A key ``(iq, G)`` sits at ``q + G = S(q_p + G_p)`` with ``S`` its star row,
+    so ``G_p = S⁻¹(q + G) − q_p``. Returns the padded tables, the full and
+    wedge q (BerkeleyGW-wrapped crystal) and ``need[kk] = (p, G_p)``.
     """
-    from ffi import _services
-    _services.ensure_on_path()
-    from symmetry_maps import bgw_integer_q_to_fractional, unfold_isdf_one_leg
-    from zeta_loader import ZetaLoader
-    from common.collectives import device_put_process_local
-
+    from symmetry_maps import bgw_integer_q_to_fractional
     tp = tables.padded(int(n_rmu_pad))
-    # the one-leg unfold's star rows, from SymMaps' public tables
     g3 = np.asarray(grid, dtype=np.int64).reshape(3)
     q_full = bgw_integer_q_to_fractional(np.asarray(sym.kvecs_asints, np.int64), g3)
     q_parent = np.asarray(tp.q_irr_frac, dtype=np.float64)
@@ -170,7 +164,6 @@ def head_columns(keys, *, zeta_path, tables, sym, grid, n_rmu, n_rmu_pad, mesh_x
     S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
     if idx.shape != (q_full.shape[0],) or rows.shape != idx.shape or np.any(rows >= S_all.shape[0]):
         raise ValueError("GATE bsemat_head_parent: SymMaps star rows do not cover the full q grid")
-    n_qi = q_parent.shape[0]
     need = []
     for iq, G in keys:
         S = np.asarray(S_all[int(rows[iq])], dtype=np.float64)
@@ -179,10 +172,13 @@ def head_columns(keys, *, zeta_path, tables, sym, grid, n_rmu, n_rmu_pad, mesh_x
         if not np.allclose(Gp_f, Gp, atol=1e-8):
             raise ValueError(f"GATE bsemat_head_parent: key {(iq, tuple(G))} has parent G {Gp_f}")
         need.append((int(idx[iq]), tuple(int(v) for v in Gp)))
-    per_p = {p: sorted({g for (pp, g) in need if pp == p}) for p in range(n_qi)}
-    n_layer = max(len(v) for v in per_p.values() if v) if need else 0
-    out = np.zeros((len(keys), int(n_rmu_pad)), np.complex128)
-    rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
+    return tp, q_full, q_parent, idx, need
+
+
+def _parent_columns(need, *, zeta_path, n_qi, n_rmu, n_rmu_pad):
+    """``ζ_{q_p}(μ, G_p)/√Ω`` at every distinct parent slot of ``need`` (host, μ_pad each), and Ω."""
+    from zeta_loader import ZetaLoader
+    cols = {}
     with ZetaLoader(zeta_path) as zl:
         omega = float(zl.cell_volume)
         gcomp = np.asarray(zl.gvec_components, dtype=np.int64)
@@ -190,28 +186,219 @@ def head_columns(keys, *, zeta_path, tables, sym, grid, n_rmu, n_rmu_pad, mesh_x
         if gcomp.shape[0] != n_qi:
             raise ValueError(f"GATE bsemat_zeta_wedge: {zeta_path} holds {gcomp.shape[0]} q, "
                              f"the W0 wedge {n_qi}")
-        for j in range(n_layer):
-            src = np.zeros((n_qi, 3), np.int64)
-            col = np.zeros((n_qi, int(n_rmu_pad)), np.complex128)
-            for p in range(n_qi):
-                gl = per_p[p]
-                g = gl[min(j, len(gl) - 1)] if gl else (0, 0, 0)
-                src[p] = g
-                lut = {tuple(v): i for i, v in enumerate(gcomp[p, :, :ngk[p]].T)}
-                if g not in lut:
-                    raise ValueError(f"GATE bsemat_head_in_sphere: wedge q {p} slot {g} "
-                                     "is outside the stored ζ sphere; fix: raise the ζ cutoff.")
-                col[p, :n_rmu] = np.asarray(zl.read_zeta_G_local((p, slice(None), lut[g])))
-            u = unfold_isdf_one_leg(
-                device_put_process_local(col / np.sqrt(omega), NamedSharding(mesh_xy, P(None, "x"))),
-                source_gvec_components=src.astype(np.int32), sym=sym, sym_idx=tp.sym_idx_q,
-                sym_perm=tp.sym_perm, L_table=tp.L_table, q_irr_frac=tp.q_irr_frac,
-                kgrid=tuple(int(g) for g in grid), mesh_xy=mesh_xy, component_action="scalar")
-            u = np.asarray(rep(u))
-            for kk, (p, g) in enumerate(need):
-                if src[p].tolist() == list(g):
-                    out[kk] = u[keys[kk][0]]
+        for p, g in sorted(set(need)):
+            lut = {tuple(v): i for i, v in enumerate(gcomp[p, :, :ngk[p]].T)}
+            if g not in lut:
+                raise ValueError(f"GATE bsemat_head_in_sphere: wedge q {p} slot {g} "
+                                 "is outside the stored ζ sphere; fix: raise the ζ cutoff.")
+            c = np.zeros(int(n_rmu_pad), np.complex128)
+            c[:n_rmu] = np.asarray(zl.read_zeta_G_local((p, slice(None), lut[g])))
+            cols[(p, g)] = c / np.sqrt(omega)
+    return cols, omega
+
+
+def _unfold_to_keys(cols, need, keys, *, tp, sym, grid, n_qi, n_rmu_pad, mesh_xy):
+    """Carry parent vectors to their keys by ``symmetry_maps.unfold_isdf_one_leg`` (host, (n_keys, μ_pad)).
+
+    ``cols[(p, G_p)]`` is a ζ-like parent column: it moves as ``ζ_q(·, G_p)``
+    does (centroid permutation, L and τ phases, conjugation on antiunitary
+    rows). Keys of one wedge q that need different parent slots (zone-boundary
+    ties) go through separate unfold layers; a parent with no key carries zeros.
+    """
+    from symmetry_maps import unfold_isdf_one_leg
+    from common.collectives import device_put_process_local
+    per_p = {p: sorted({g for (pp, g) in need if pp == p}) for p in range(n_qi)}
+    n_layer = max(len(v) for v in per_p.values() if v) if need else 0
+    out = np.zeros((len(keys), int(n_rmu_pad)), np.complex128)
+    rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
+    for j in range(n_layer):
+        src = np.zeros((n_qi, 3), np.int64)
+        col = np.zeros((n_qi, int(n_rmu_pad)), np.complex128)
+        for p in range(n_qi):
+            gl = per_p[p]
+            if gl:
+                src[p] = gl[min(j, len(gl) - 1)]
+                col[p] = cols[(p, tuple(int(v) for v in src[p]))]
+        u = unfold_isdf_one_leg(
+            device_put_process_local(col, NamedSharding(mesh_xy, P(None, "x"))),
+            source_gvec_components=src.astype(np.int32), sym=sym, sym_idx=tp.sym_idx_q,
+            sym_perm=tp.sym_perm, L_table=tp.L_table, q_irr_frac=tp.q_irr_frac,
+            kgrid=tuple(int(g) for g in grid), mesh_xy=mesh_xy, component_action="scalar")
+        u = np.asarray(rep(u))
+        for kk, (p, g) in enumerate(need):
+            if src[p].tolist() == list(g):
+                out[kk] = u[keys[kk][0]]
+    return out
+
+
+def head_columns(keys, *, zeta_path, tables, sym, grid, n_rmu, n_rmu_pad, mesh_xy):
+    """ζ_q(μ, G)/√Ω at each requested ``(iq, G)`` of the full grid (host, (n_keys, μ_pad)).
+
+    Each key's parent column is ``G_p = S⁻¹(q + G) − q_p`` at its wedge q_p, read
+    from ``zeta_q.h5`` and carried to q by ``symmetry_maps.unfold_isdf_one_leg``
+    (preselected carrier). Keys of one wedge q that need different parent
+    slots (zone-boundary ties) go through separate unfold layers.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    tp, q_full, q_parent, _, need = _head_parents(keys, tables=tables, sym=sym, grid=grid,
+                                                  n_rmu_pad=n_rmu_pad)
+    cols, omega = _parent_columns(need, zeta_path=zeta_path, n_qi=q_parent.shape[0],
+                                  n_rmu=n_rmu, n_rmu_pad=n_rmu_pad)
+    out = _unfold_to_keys(cols, need, keys, tp=tp, sym=sym, grid=grid, n_qi=q_parent.shape[0],
+                          n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy)
     return out, q_full, omega
+
+
+# ---------------------------------------------------------------------------
+# 3. the split per key from one eigendecomposition per wedge q
+# ---------------------------------------------------------------------------
+
+def _self_images(parents, *, q_parent, idx, tp, sym, grid):
+    """Full-grid index of each wedge q in ``parents`` where its star row is the identity (host).
+
+    There the centroid action is trivial (S = 1, τ = 0, unitary, identity
+    permutation, L = 0), so the bundle's full-q V and W tiles ARE the parent
+    tiles that every star member's tiles, and the one-leg ζ unfold, are built from.
+    """
+    S_all = np.asarray(sym.sym_mats_k, dtype=np.int64)
+    n_sp = int(np.asarray(sym.sym_matrices).shape[0])
+    tau = np.asarray(sym.translations, dtype=np.float64)
+    rows = np.asarray(tp.sym_idx_q, dtype=np.int64)
+    perm, L = np.asarray(tp.sym_perm), np.asarray(tp.L_table)
+    out = {}
+    for p in parents:
+        iq = int(grid_index(q_parent[p][None], grid)[0])
+        r = int(rows[iq])
+        if not (int(idx[iq]) == p and r < n_sp and np.array_equal(S_all[r], np.eye(3, dtype=np.int64))
+                and not np.any(np.abs(tau[r]) > 1e-12)
+                and np.array_equal(perm[r], np.arange(perm.shape[1])) and not np.any(L[r])):
+            raise ValueError(f"GATE bsemat_head_parent_self: wedge q {p} (full q {iq}) is reached by "
+                             f"star row {r}, not the identity; the split's one solve per wedge q needs "
+                             "the parent's own tile. fix: regenerate the restart's q-star tables "
+                             "(symmetry_maps.write_tables) so each IBZ point is its own identity image.")
+        out[p] = iq
+    return out
+
+
+def head_split_keys(keys, z_keys, V_flat, W_flat, *, zeta_path, tables, sym, grid, n_rmu,
+                    n_rmu_pad, v_head_q, q_frac, head_K, bvec, rcond, mesh_xy):
+    """E3–E5 at every head key from ONE eigendecomposition per wedge q (docs/theory/bgw-bsemat-export.md#split-ibz).
+
+    A star member S q of wedge q_p carries the parent tiles by the centroid action
+    (``unfold_isdf_operator``: V_Sq = M V_q M†, conjugated on antiunitary rows) and
+    its head column by the one-leg action (``unfold_isdf_one_leg``, the same
+    permutation and phases). So V_Sq⁺ = M V_q⁺ M† and conj(a) = conj(V⁺ z*)
+    moves exactly as z does: conj(a_Sq) = unfold(conj(a_q)) at the key's own
+    parent slot G_p, time reversal and zone-boundary ties included. Here:
+
+    1. one batched ``distrib_la`` eigh over the wedge tiles that some key needs
+       (the bundle's tiles at the wedge points' identity images);
+    2. one E3 solve per parent slot (p, G_p), with the parent's gates;
+    3. conj(a) carried to every key through head_columns' unfold layers;
+    4. per key, E3's residual, E4, E5 on the key's OWN V and W tiles (O(μ²)):
+       ``check_split`` as before, and s against the parent's
+       (``check_rotation``) certifies the rotation where it is consumed.
+
+    ``V_flat``/``W_flat`` (μ, ν, n_q) at ``P('x','y',None)``; ``z_keys`` (n_keys, μ_pad)
+    host from :func:`head_columns`; ``v_head_q`` (n_q,) v(q + G₁); ``q_frac`` (n_q, 3) the
+    bundle's full q (crystal), ``head_K`` (n_q, 3) V's head momentum per q and
+    ``bvec`` (3, 3) for the shortest-q+G gate. Returns ``W11 (n_keys,)``,
+    ``y_keys (n_keys, μ_pad)`` host, the per-key figures and a stage summary
+    (eigh faces, parent slots, keys, wall).
+    """
+    import distrib_la as dla
+    from ffi import _services
+    _services.ensure_on_path()
+    from common.collectives import device_put_process_local
+
+    t0 = time.time()
+    tp, _, q_parent, idx, need = _head_parents(keys, tables=tables, sym=sym, grid=grid,
+                                               n_rmu_pad=n_rmu_pad)
+    n_qi = q_parent.shape[0]
+    slots = sorted({need[kk] for kk, (iq, _) in enumerate(keys) if iq != 0})
+    parents = sorted({p for p, _ in slots})
+    self_iq = _self_images(parents, q_parent=q_parent, idx=idx, tp=tp, sym=sym, grid=grid)
+    cols, _ = _parent_columns(slots, zeta_path=zeta_path, n_qi=n_qi, n_rmu=n_rmu,
+                              n_rmu_pad=n_rmu_pad)
+
+    face = NamedSharding(mesh_xy, P("x", "y"))
+    rs = NamedSharding(mesh_xy, P())
+    rep = jax.jit(lambda a: a, out_shardings=rs)
+    tile = jax.jit(lambda a, i: jnp.take(a, i, axis=2), out_shardings=face)
+    herm = jax.jit(lambda a: 0.5 * (a + jnp.conj(a).T), out_shardings=face)
+    put = lambda a: device_put_process_local(np.ascontiguousarray(a), rs)
+
+    # 1. one eigendecomposition per wedge q, as one batched call
+    plan = dla.plan("eigh", mesh_xy, backend="distributed" if jax.process_count() > 1 else "native",
+                    n=n_rmu_pad)
+    iqs = np.asarray([self_iq[p] for p in parents], dtype=np.int32)
+    t_e, lam_all, U_all = time.time(), None, None
+    if parents:                                       # a Γ-only grid has no split to make
+        stack = jax.jit(lambda v, i: (lambda t: 0.5 * (t + jnp.conj(jnp.swapaxes(t, 1, 2))))(
+            jnp.moveaxis(jnp.take(v, i, axis=2), 2, 0)),
+            out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(V_flat, jnp.asarray(iqs))
+        lam_all, U_all = plan.batched(stack)
+        lam_all = np.asarray(rep(lam_all))
+        del stack
+    t_eigh = time.time() - t_e
+    pick = jax.jit(lambda u, i: u[i], out_shardings=face)
+
+    # 2. one solve per parent slot, with the parent's own gates
+    abar, s_par, rank_par, par_fig = {}, {}, {}, {}
+    for p in parents:
+        i = parents.index(p)
+        U_p = pick(U_all, i)
+        V_p = herm(tile(V_flat, self_iq[p]))
+        W_p = tile(W_flat, self_iq[p])
+        for (pp, g) in slots:
+            if pp != p:
+                continue
+            zr = put(cols[(p, g)])
+            a, rank = A.head_solve(put(lam_all[i]), U_p, zr, xp=jnp, rcond=rcond)
+            sp = A.head_rows(V_p, W_p, zr, a, float(v_head_q[self_iq[p]]), rank=rank, xp=jnp)
+            A.check_split(sp, where=f"wedge q {p} slot {g}")
+            abar[(p, g)] = np.asarray(rep(jnp.conj(a)))
+            s_par[(p, g)], rank_par[(p, g)] = sp.figures["s"], sp.figures["rank"]
+            par_fig[(p, g)] = sp.figures
+    del U_all
+    for (p, g) in set(need) - set(slots):
+        abar[(p, g)] = np.zeros(int(n_rmu_pad), np.complex128)     # q = 0 keys: no split
+
+    # 3. a at every key, carried exactly as z
+    a_keys = np.conj(_unfold_to_keys(abar, need, keys, tp=tp, sym=sym, grid=grid, n_qi=n_qi,
+                                     n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy))
+
+    # 4. E3 residual, E4, E5 on each key's own tiles
+    W11 = np.zeros(len(keys))
+    y_keys = np.zeros((len(keys), int(n_rmu_pad)), np.complex128)
+    figs = []
+    for kk, (iq, G) in enumerate(keys):
+        if iq == 0:
+            figs.append({"iq": 0, "G": G, "q0": True})
+            continue
+        Kc = (q_frac[iq] + np.asarray(G)) @ bvec
+        if abs(np.linalg.norm(Kc) - np.linalg.norm(head_K[iq] @ bvec)) > 1e-8 * np.linalg.norm(Kc):
+            raise ValueError(f"GATE bsemat_head_length: key {(iq, G)} is not a shortest q+G")
+        par = need[kk]
+        sp = A.head_rows(herm(tile(V_flat, iq)), tile(W_flat, iq), put(z_keys[kk]), put(a_keys[kk]),
+                         float(v_head_q[iq]), rank=rank_par[par], xp=jnp)
+        A.check_split(sp, where=f"q {iq} G {G}")
+        rel = A.check_rotation(sp, s_par[par], where=f"q {iq} G {G} (wedge q {par[0]} slot {par[1]})")
+        W11[kk] = sp.W11
+        y_keys[kk] = np.asarray(rep(sp.y))
+        figs.append({"iq": int(iq), "G": G, "qlen": float(np.linalg.norm(Kc)),
+                     "v1": float(v_head_q[iq]), **sp.figures,
+                     "parent": [int(par[0]), list(par[1])], "s_parent_rel": rel})
+    stats = {"eigh_faces": len(parents), "eigh_extent": int(n_rmu_pad), "parent_slots": len(slots),
+             "keys_split": sum(1 for iq, _ in keys if iq != 0), "wall_eigh_s": t_eigh,
+             "wall_s": time.time() - t0,
+             "parent_solve_residual_max": max((f["solve_residual"] for f in par_fig.values()), default=0.0)}
+    _log(f"[bsemat] split: {stats['eigh_faces']} wedge-q eigh (one batched call, {t_eigh:.2f} s) "
+         f"for {stats['parent_slots']} parent slots -> {stats['keys_split']} keys; "
+         f"max |s/s_parent - 1| {max((f.get('s_parent_rel', 0.0) for f in figs), default=0.0):.1e}; "
+         f"{stats['wall_s']:.2f} s")
+    return W11, y_keys, figs, stats
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +699,6 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     from common.collectives import device_put_process_local
     from .bse_loading import load_bse_data_from_restart_sharded
     from .bse_window import resolve_n_occ
-    import distrib_la as dla
 
     t0 = time.time()
     restart = _find_restart_file(input_file)
@@ -658,34 +844,10 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
         W_flat = upd(W_flat, device_put_process_local(A0, rs),
                      device_put_process_local(np.asarray(q0_body_update[1], np.complex128), rs))
         _log(f"[bsemat] q -> 0 body update of rank {A0.shape[0]} applied")
-    face = NamedSharding(mesh_xy, P("x", "y"))
-    tile = jax.jit(lambda a, i: jnp.take(a, i, axis=2), out_shardings=face)
-    plan = dla.plan("eigh", mesh_xy, backend="distributed" if jax.process_count() > 1 else "native",
-                    n=n_rmu_pad)
-    herm = jax.jit(lambda a: 0.5 * (a + jnp.conj(a).T), out_shardings=face)
-    W11 = np.zeros(len(keys))
-    y_keys = np.zeros_like(z_keys)
-    figs = []
-    eig_cache = {}
-    for kk, (iq, G) in enumerate(keys):
-        if iq == 0:
-            figs.append({"iq": 0, "G": G, "q0": True})
-            continue
-        Kc = (q_full_L[iq] + np.asarray(G)) @ bvec
-        if abs(np.linalg.norm(Kc) - np.linalg.norm(K_ch[iq] @ bvec)) > 1e-8 * np.linalg.norm(Kc):
-            raise ValueError(f"GATE bsemat_head_length: key {(iq, G)} is not a shortest q+G")
-        Vq = herm(tile(V_flat, iq))
-        if iq not in eig_cache:
-            eig_cache = {iq: plan(Vq)}
-        lam, U = eig_cache[iq]
-        zr = device_put_process_local(z_keys[kk], NamedSharding(mesh_xy, P()))
-        sp = A.head_split(Vq, tile(W_flat, iq), zr, float(v_head_q[iq]),
-                          eigh=lambda _m, _l=lam, _u=U: (_l, _u), xp=jnp, rcond=rcond)
-        A.check_split(sp, where=f"q {iq} G {G}")
-        W11[kk] = sp.W11
-        y_keys[kk] = np.asarray(rep(sp.y))
-        figs.append({"iq": int(iq), "G": G, "qlen": float(np.linalg.norm(Kc)),
-                     "v1": float(v_head_q[iq]), **sp.figures})
+    W11, y_keys, figs, split_stats = head_split_keys(
+        keys, z_keys, V_flat, W_flat, zeta_path=zeta_path, tables=tables, sym=sym, grid=grid,
+        n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, v_head_q=v_head_q, q_frac=q_full_L, head_K=K_ch,
+        bvec=bvec, rcond=rcond, mesh_xy=mesh_xy)
     _log("[bsemat] split: max solve residual %.2e, head_row min/max %.6f/%.6f, "
          "W11/v1 min/max %.4f/%.4f" % (
              max(f.get("solve_residual", 0) for f in figs),
@@ -789,7 +951,7 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     summary = {"nk": nk, "n1b": n1b, "n2b": n2b, "keys": len(keys), "ties": n_ties,
                "q0_body": q0_body, "q0_dipole": q0_fig, "downfold": df_fig,
                "frobenius": dict(zip(("head", "wing", "body", "exchange"), np.sqrt(fro).tolist())),
-               "split": figs, "gauge": gfig, "vbar_imag_rel": vim,
+               "split": figs, "head_split": split_stats, "gauge": gfig, "vbar_imag_rel": vim,
                "wall_total_s": t_end - t0, "wall_rows_s": t_end - t_rows,
                "peak_device_bytes": _peak_device_bytes()}
     return summary

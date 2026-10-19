@@ -71,6 +71,30 @@ $$H=W_{11}\,z^\dagger z,\qquad Y=z^\dagger y+y^\dagger z,\qquad B=W-H-Y. \tag{E6
 E4–E6 are exact for any single slot. They need one Hermitian solve and one
 product per q, one ζ column, and neither χ nor any persisted GW-time quantity.
 
+### One eigendecomposition per wedge q {#split-ibz}
+
+At a star member $Sq$ of the wedge point $q$ the bundle's tiles are the wedge
+tiles carried by the centroid action, $V_{Sq}=MV_qM^\dagger$ and
+$W_{Sq}=MW_qM^\dagger$ with $M_{\mu\mu'}=\bar\varphi_\mu\delta_{\mu',\pi(\mu)}$
+(complex-conjugated on antiunitary rows; `symmetry_maps.unfold_isdf_operator`),
+and the head column is the parent column carried by the one-leg action,
+$z_{Sq}=c\,\varphi\odot(z_q\circ\pi)$ (`unfold_isdf_one_leg`: the same $\pi$ and
+$\varphi$, $c$ the τ phase of the parent slot $q+G_p$, conjugated likewise). Hence
+$V_{Sq}^+=MV_q^+M^\dagger$, the spectrum and therefore the E3 cut are the same, and
+
+$$\bar a_{Sq}=c\,\varphi\odot(\bar a_q\circ\pi),\qquad s_{Sq}=s_q,\qquad
+r_{Sq}=c\,\varphi\odot(r_q\circ\pi): \tag{E3a}$$
+
+$\bar a$ moves exactly as $z$ does, on antiunitary rows too. The writer
+(`bsemat_export.head_split_keys`) diagonalises $V$ once per wedge point that a
+key needs (one batched `distrib_la` eigh over the wedge points' identity
+images), solves E3 once per parent slot $(q, G_p)$ (zone-boundary ties are
+separate slots), carries $\bar a$ to every key through the unfold layers that
+carry $z$, and evaluates E3's residual, E4 and E5 on the key's own $V$ and $W$.
+The residual gate certifies the rotation of $a$ against $V_{Sq}$; $s$ at the key
+against $s$ at the parent (`bsemat_head_rotation`, relative 1e-8) certifies
+$W_{Sq}$ against the same action.
+
 ## Kernel assembly {#kernel}
 
 With the centroid pair amplitudes $C_{nn'}(\mu)=\sum_s\psi^*_{nks}(r_\mu)\psi_{n'k's}(r_\mu)$,
