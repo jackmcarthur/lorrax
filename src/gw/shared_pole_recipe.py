@@ -465,12 +465,7 @@ class CapacityLedger:
             self._accepted[name]['resident_bytes_per_rank']
             + self._accepted[name]['workspace_bytes_per_rank'] for name in live)
         scaling_passed = total <= self.limit_bytes_per_rank
-        # Stream and Sigma are sequential inherited phases, not simultaneous
-        # allocations. Retain the larger recorded peak conservatively.
-        inherited = max((row.get('value', {}).get('shared_bytes_per_rank') or 0
-                         for row in (self.stream_peak, self.sigma_peak)
-                         if isinstance(row.get('value'), dict)), default=0)
-        available = max(0, self.device_budget_bytes_per_rank - inherited - self.baseline_bytes_per_rank)
+        available = max(0, self.device_budget_bytes_per_rank - self.baseline_bytes_per_rank)
         passed = total <= available
         g = self.geometry
         max_ranks = math.floor(self.limit_bytes_per_rank * g['px'] * g['py'] / total) if total else None
@@ -491,7 +486,6 @@ class CapacityLedger:
                    aggregate_bytes_per_rank=total,
                    limit_bytes_per_rank=self.limit_bytes_per_rank,
                    device_budget_bytes_per_rank=self.device_budget_bytes_per_rank,
-                   inherited_peak_bytes_per_rank=inherited,
                    baseline_bytes_per_rank=self.baseline_bytes_per_rank,
                    available_device_bytes_per_rank=available,
                    device_budget_status='PASS' if passed else 'FAIL',
@@ -513,17 +507,6 @@ class CapacityLedger:
                            concurrent_with=concurrent_with)
         return max(0, int(row['available_device_bytes_per_rank'])
                    - int(row['aggregate_bytes_per_rank']))
-
-    def record_measured_peak(self, bytes_per_rank, *, reason):
-        """Record the new-object maximum over ranks, excluding inherited stream."""
-        peak = self._bytes(bytes_per_rank)
-        if peak < self.measured_peak.get('bytes_per_rank', 0):
-            return self.receipt()['measured_peak']
-        self.measured_peak = gate_receipt(
-            'capacity', peak / self.U_bytes_per_rank,
-            passed=peak <= self.limit_bytes_per_rank, reason=reason)
-        self.measured_peak['bytes_per_rank'] = peak
-        return self.receipt()['measured_peak']
 
     def receipt(self, *, entry_start=None):
         """Snapshot stage rows and peaks, optionally as an indexed ledger segment.

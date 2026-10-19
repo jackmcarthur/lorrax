@@ -385,20 +385,14 @@ def _gathered_admitted(shape, dtype, room=None) -> bool:
     return small <= GATHERED_EIGH_BYTES or (room is not None and _gathered_bytes(shape, dtype) <= room)
 
 
-#: cusolverDnXsyevd_bufferSize over LAPACK's heevd lwork + lrwork, complex128 (A100, cuSOLVER
-#: 12.2.6.9, 2026-10-19): 1.08 / 0.54 GB at n 4096, 57.7 / 28.8 GB at 30000, 109 / 54.4 GB at
-#: 41250. float64 unmeasured (the same factor).
-CUDA_HEEVD_FACTOR = 2.0
-
-
 def local_eigh_workspace(n, dtype, platform) -> int:
-    """Device bytes of one local n x n eigh's workspace, from the shape: LAPACK ?heevd/?syevd
-    lwork, lrwork and liwork, times CUDA_HEEVD_FACTOR on CUDA. No vendor query is issued while
-    planning (a query at trace time could create a handle mid-run)."""
-    n = int(n)
-    lapack = (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) if np.dtype(dtype).kind == "c"
-              else 8 * (1 + 6 * n + 2 * n * n)) + 4 * (3 + 5 * n)
-    return int(lapack * (CUDA_HEEVD_FACTOR if platform == "CUDA" else 1))
+    """Device bytes of one local n x n eigh's workspace (``lxkit.memory.vendor``: a remembered
+    query, else the leg's measured row -- cusolverDnXsyevd = 2.0 x LAPACK heevd on CUDA, LAPACK
+    itself on the host).  No vendor query is issued while planning (a query at trace time could
+    create a handle mid-run)."""
+    from lxkit import LEGS, memory
+    leg, lib = (LEGS["CUDA"], "cusolverdn") if platform == "CUDA" else (LEGS["cpu"], "lapack")
+    return int(memory.vendor(leg, lib, "heevd", int(n), 1, np.dtype(dtype).itemsize).fixed)
 
 
 def _gathered_bytes(shape, dtype) -> int:

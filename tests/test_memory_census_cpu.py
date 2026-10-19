@@ -155,7 +155,45 @@ def test_vendor_rows_and_strict_range(monkeypatch):
     assert "LAPACK" in term.source
     monkeypatch.setattr(memory, "STRICT", True)
     with pytest.raises(RuntimeError, match="GATE memory_unpriced: .*outside the measured"):
-        memory.vendor(LEGS["CUDA"], "cusolvermp", "solve_lu", 30000, 16, 16)
+        memory.vendor(LEGS["CUDA"], "cusolvermp", "solve_lu", 30000, 16, 16, unit=1.0)
     memory.remember("cusolvermp", "solve_lu", 30000, 16, 16, 7e9, "test query")
     assert memory.vendor(LEGS["CUDA"], "cusolvermp", "solve_lu", 30000, 16, 16).fixed == 7e9
     memory._VENDOR.clear()
+
+
+# ---- the census (memory.STRICT) -------------------------------------------------------------
+
+def test_census_flags_unpriced_allocations_and_missing_provenance(monkeypatch):
+    jnp.zeros(4).block_until_ready()
+    monkeypatch.setattr(memory, "STRICT", True)
+    keep = []
+    with timing.section("t.unpriced"):
+        keep.append(jnp.ones((160 * MB,), jnp.uint8).block_until_ready())
+    memory.book(memory.priced(100 * MB, "test"), stage="t.priced")
+    with timing.section("t.priced"):
+        with timing.section("t.child"):                # inside a priced stage: fine
+            keep.append(jnp.ones((80 * MB,), jnp.uint8).block_until_ready())
+    with timing.section("t.small"):
+        keep.append(jnp.ones((8 * MB,), jnp.uint8).block_until_ready())
+    memory.admit("t.route", (("a", memory.Price(xla=memory.Term(1.0))),), 2.0)
+    got = memory.findings()
+    assert len(got) == 2, got
+    assert got[0].startswith("unpriced: t.unpriced allocated ")
+    assert got[1] == "no provenance: t.route (a): xla"
+    del keep
+
+
+def test_run30k_plan_census_is_clean_under_strict():
+    """Every price the run30k plan books or admits has provenance and every measured row is
+    used inside its range (the replay of the 16-device plan, tests/replays)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ, LORRAX_MEMORY_STRICT="1", JAX_PLATFORMS="cpu", JAX_ENABLE_X64="1",
+               XLA_FLAGS="--xla_force_host_platform_device_count=16")
+    run = subprocess.run([sys.executable, str(root / "tests/replays/run30k_plan_census.py")],
+                         env=env, capture_output=True, text=True, timeout=600)
+    assert run.returncode == 0, run.stderr[-3000:]
+    assert '"refusals": []' in run.stdout
+    assert "CENSUS []" in run.stdout, [l for l in run.stdout.splitlines() if "CENSUS" in l]

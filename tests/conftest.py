@@ -35,3 +35,14 @@ def _thaw_env_freeze_after_each_test():
     for key, value in saved.items():
         if os.environ.get(key) != value:
             os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
+def _isolated_memory_model():
+    """lxkit.memory's run figures and records are process state: no test leaks them."""
+    from lxkit import memory
+    saved = dict(memory._RUN)
+    yield
+    memory.reset()
+    memory._RUN.clear()
+    memory._RUN.update(saved)

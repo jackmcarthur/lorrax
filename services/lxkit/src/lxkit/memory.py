@@ -24,6 +24,7 @@ Stdlib-only at import; jax is imported lazily.  An instrument never raises.
 from __future__ import annotations
 
 import math
+import os
 import re
 import threading
 import time
@@ -32,9 +33,12 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 TERMS = ("operands", "xla", "vendor", "outside")
-#: A MEASURED row used outside its range raises ``GATE memory_unpriced`` when True (the CPU
-#: census); otherwise it is extrapolated, warned once, and its provenance says so.
-STRICT = False
+#: The census (``LORRAX_MEMORY_STRICT=1``): a MEASURED row outside its range raises ``GATE
+#: memory_unpriced``, and :func:`findings` lists every section that allocated more than
+#: :data:`CENSUS_BYTES` outside a priced stage and every price term without provenance.
+#: Off, an out-of-range row is extrapolated, warned once, its provenance saying so.
+STRICT = os.environ.get("LORRAX_MEMORY_STRICT", "") == "1"
+CENSUS_BYTES = 64 << 20
 
 
 @dataclass(frozen=True)
@@ -226,12 +230,12 @@ def instrument_cost() -> tuple:
 class Tracker:
     """An open section: ``whole``/``own`` high-water (own: outside open children);
     ``metered``: since its price was attached, after a wait (the receipt's figure)."""
-    __slots__ = ("name", "price", "whole", "own", "metered", "exact", "mark0")
+    __slots__ = ("name", "price", "whole", "own", "metered", "exact", "mark0", "base")
 
     def __init__(self, name, price):
         self.name, self.price = str(name), price
         self.whole = self.own = self.metered = -1
-        self.exact, self.mark0 = True, None
+        self.exact, self.mark0, self.base = True, None, -1
 
     def meter(self) -> None:
         if self.mark0 is None and _backend_up():
@@ -245,6 +249,7 @@ class Tracker:
 _OPEN: list = []                 # the main thread's open trackers, outermost first
 _PENDING: dict = {}              # stage -> booked Price
 _RECEIPTS: dict = {}             # stage -> receipt row (max over calls)
+_FINDINGS: list = []             # the census's findings (STRICT)
 _SINK = [None]
 
 
@@ -306,6 +311,7 @@ def open_tracker(name: str, price: Optional[Price] = None) -> Optional[Tracker]:
     if str(name) in _DOOMED:
         _say(_DOOMED[str(name)])
     tracker.meter() if price is not None else boundary()
+    tracker.base = _I["live"]
     _OPEN.append(tracker)
     return tracker
 
@@ -325,6 +331,10 @@ def close_tracker(tracker: Optional[Tracker]) -> tuple:
         tracker.metered = _I["mark"] if tracker.exact else tracker.metered
     if tracker.price is not None:
         _receipt(tracker)
+    elif (STRICT and _I["source"] == "live" and tracker.whole - tracker.base > CENSUS_BYTES
+          and not any(t.price is not None for t in _OPEN)):
+        _FINDINGS.append(f"unpriced: {tracker.name} allocated "
+                         f"{_gb(tracker.whole - tracker.base)} outside a priced stage")
     return tracker.whole, tracker.own, tracker.exact
 
 
@@ -333,6 +343,8 @@ def book(price: Price, stage: Optional[str] = None) -> None:
     ``None``: the innermost open tracker.  The largest price booked to a stage stands."""
     if not isinstance(price, Price):
         raise TypeError(f"memory.book takes a memory.Price, got {type(price).__name__}")
+    if STRICT and price.unsourced():
+        _FINDINGS.append(f"no provenance: {stage or price.label}: {', '.join(price.unsourced())}")
     target = None
     if _main():
         target = (_OPEN[-1] if _OPEN else None) if stage is None else next(
@@ -343,8 +355,10 @@ def book(price: Price, stage: Optional[str] = None) -> None:
         target.meter()
         _PLANNED.setdefault(target.name, ((("booked", target.price),), None))
         return
-    key = str(stage)
+    key = str(stage if stage is not None else price.label)
     _PLANNED.setdefault(key, ((("booked", price),), None))
+    if stage is None:
+        return                   # no section open (a planning replay): sizing only
     if key not in _PENDING or price.bytes() > _PENDING[key].bytes():
         _PENDING[key] = price
 
@@ -394,6 +408,11 @@ def pending() -> dict:
     return dict(_PENDING)
 
 
+def findings() -> list:
+    """The census's findings this run (:data:`STRICT`), and prices never taken."""
+    return list(_FINDINGS) + [f"never opened: {name}" for name in _PENDING]
+
+
 # ---------------------------------------------------------------------------
 # Vendor workspace: a cached plan-time query, else the leg's MEASURED row in range
 # ---------------------------------------------------------------------------
@@ -406,7 +425,8 @@ def remember(lib: str, op: str, n: int, ranks: int, itemsize: int, nbytes: float
     _VENDOR[(lib, op, int(n), int(ranks), int(itemsize))] = (float(nbytes), str(source))
 
 
-def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int) -> Term:
+def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int,
+           unit: Optional[float] = None) -> Term:
     """The vendor workspace term per rank on ``leg``: a remembered query, else the leg's
     measured row (``PlatformLeg.vendor_rows``), GATE memory_unpriced outside its range
     under :data:`STRICT`."""
@@ -417,7 +437,7 @@ def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int) -> Term:
     if row is None:
         raise RuntimeError(f"GATE memory_unpriced: got: no query and no measured row for "
                            f"{leg.key}/{lib}/{op}; want: memory.remember at plan construction")
-    nbytes = row.ratio * row.unit(int(n), int(ranks), int(itemsize))
+    nbytes = row.ratio * (row.unit(int(n), int(ranks), int(itemsize)) if unit is None else unit)
     src = f"{row.ratio:g} x {row.unit_name} ({row.source})"
     if not (row.n[0] <= n <= row.n[1] and row.p[0] <= ranks <= row.p[1]):
         where = (f"{leg.key}/{lib}/{op} at n {int(n)}, P {int(ranks)} outside the measured "
@@ -449,13 +469,19 @@ def pool_reservation(total: float, leg) -> float:
     return max(float(total) - outside_allowance(leg, "distributed"), 0.5 * float(total))
 
 
+_AGREE: list = [None]
+
+
 def _agree(value: float) -> float:
+    """The minimum over processes, through the caller's collective (:func:`resolve`'s
+    ``agree``: the source tree's all-gather; lxkit owns none)."""
+    if _AGREE[0] is not None:
+        return float(_AGREE[0](float(value)))
     import jax
-    if jax.process_count() <= 1:
-        return float(value)
-    import numpy as np
-    from jax.experimental import multihost_utils
-    return float(np.min(multihost_utils.process_allgather(np.asarray(float(value)))))
+    if jax.process_count() > 1:
+        raise RuntimeError("memory: several processes and no agreement collective; resolve the "
+                           "budget through common.gpu_utils.resolve_device_budget_gb")
+    return float(value)
 
 
 def _enforced(stats) -> bool:
@@ -466,7 +492,7 @@ def _enforced(stats) -> bool:
 
 
 def resolve(deck_bytes: float = 0.0, linalg: str = "local", *, total: Optional[float] = None,
-            outside: Optional[float] = None) -> float:
+            outside: Optional[float] = None, agree: Optional[Callable] = None) -> float:
     """THE run budget, bytes per device, recorded once (every process enters).
 
     limit = ``bytes_limit`` where the allocator enforces it, else ``total`` less the bytes
@@ -474,9 +500,11 @@ def resolve(deck_bytes: float = 0.0, linalg: str = "local", *, total: Optional[f
     the local devices.  budget = (limit - pending outside) x (1 - reserve) - T_ord, the
     minimum over processes; ``pending``: the distributed providers' contexts, which open
     later outside an allocator that does not enforce its limit.  A positive deck value can
-    only lower it.  ``total``/``outside`` come from the caller's card readers."""
+    only lower it.  ``total``/``outside`` come from the caller's card readers, ``agree``
+    (value -> minimum over processes) from its collectives; :func:`room` reuses it."""
     import jax
     from lxkit import ordered_transient_bytes
+    _AGREE[0] = agree
     leg = _leg()
     stats = jax.local_devices()[0].memory_stats() or {}
     if leg is None or not leg.accelerator:
@@ -608,6 +636,8 @@ def admit(stage: str, routes, room_bytes: float, *, probe=None, forced=None,
                               f"{_gb(done[0][2])}", warning=f"the {name} route is unavailable "
                               f"here ({type(exc).__name__}: {exc})")
         done.append((name, price() if callable(price) else price, room))
+        if STRICT and done[-1][1].unsourced():
+            _FINDINGS.append(f"no provenance: {stage} ({name}): {', '.join(done[-1][1].unsourced())}")
         _PLANNED[key] = (tuple(d[:2] for d in done), room + _RUN.get("reserve", 0.0))
         if done[-1][1].bytes() <= room:
             return record(name, "".join(f"{n} {_gb(p.bytes())}/rank over room {_gb(r)}; "
@@ -703,5 +733,5 @@ def sizing(stages: Optional[dict] = None, *, limit_bytes: Optional[float] = None
 
 def reset() -> None:
     """Forget receipts, bookings, routes and plans (a new run in the same process)."""
-    for table in (_RECEIPTS, _PENDING, _ROUTES, _PLANNED, _DOOMED, _LAST, _WARNED):
+    for table in (_RECEIPTS, _PENDING, _ROUTES, _PLANNED, _DOOMED, _LAST, _WARNED, _FINDINGS):
         table.clear()

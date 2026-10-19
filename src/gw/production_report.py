@@ -974,6 +974,8 @@ class GWProductionReport:
                                                        row["exact"], row["source"])
                           + f" [x{row['count']}]")
         self.emit("  " + memory.sizing()["line"])
+        for finding in memory.findings() if memory.STRICT else ():
+            self.emit("  memory census: " + finding)
         reads, seconds = timing.instrument_cost()
         self.emit(f"  instrument: {memory.source() or 'none'}; {reads} boundary "
                   f"reads on rank 0 took {seconds * 1e3:.1f} ms "
