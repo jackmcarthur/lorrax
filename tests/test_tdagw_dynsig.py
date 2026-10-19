@@ -25,9 +25,9 @@ G2  Sigma^SX, Sigma^COH at rho_eq from W0 == dense COHSEX                 rel <=
 G3  dchi0 of an excited state (holes, carriers, unequal same-side
     populations, coherences) == dense chi0(t) - chi0(0)                  rel <= 1e-7
 G4  dSigma (static_rpa, dress none) == dense Sigma[rho] - Sigma[rho_eq]   rel <= 1e-7
-G4b the same with dress = instantaneous: the population-dressed basis, the
-    fixed point of diag(eps^G) + K drho_pop (drho_pop = U diag(f) U^H - rho_eq),
-    iterated to convergence in NumPy                                     rel <= 1e-7
+G4b the same with dress = instantaneous: the carrier-dressed basis, the fixed
+    point of diag(eps^G) + K drho_car (drho_car = U diag(f - f_eq) U^H), iterated
+    to convergence in NumPy                                              rel <= 1e-7
 G4c the same on a hot-carrier state (populations only, up to 0.39)       rel <= 1e-7
 G5  rho = rho_eq gives dSigma == 0 exactly;  G6 dSigma_k Hermitian        <= 1e-12
 G7  literal Eq. (1) in a rotated instantaneous basis, frozen W:
@@ -51,6 +51,8 @@ R1  populations read in the fixed basis (occupation = fixed_basis) fails G4b
 R6  the coherent dressing (dress = coherent: diag(eps^G) + K drho, the whole drho)
     fails G4b
 R7  the coherent dressing scales as eps (slope ~1) and fails G10
+R8  the Fermi-sea-rotation map (dress = sea_rotation: U diag(f) U^H - rho_eq) fails
+    G11 (its plain iteration contracts at -0.88 on the driven state)
 R2  chi0^fa dropped fails G1
 R3  the Pauli-blocking product dropped fails G3
 R4  coherences dropped from G^< fails G7
@@ -180,9 +182,9 @@ def _dense_kernel(psi_w, zeta, v, W0):
 
 
 def _dense_dressed(e_w, f_w, x, K, tol=1e-15, cap=4000):
-    """The population-dressed basis by plain iteration to convergence: U, e, f, (steps, residual).
+    """The carrier-dressed basis by plain iteration to convergence: U, e, f, (steps, residual).
 
-    h = diag(e_w) + K drho_pop, drho_pop = U diag(f) U^H - rho_eq, f = Re diag(U^H rho U).
+    h = diag(e_w) + K drho_car, drho_car = U diag(f - f_eq) U^H, f = Re diag(U^H rho U).
     """
     rho_eq = np.stack([np.diag(fk) for fk in f_w]).astype(complex)
     rho = rho_eq + x
@@ -191,7 +193,7 @@ def _dense_dressed(e_w, f_w, x, K, tol=1e-15, cap=4000):
     for n in range(1, cap + 1):
         ev, U = np.linalg.eigh(h0 + K(P))
         fr = np.real(np.einsum("kmi,kmn,kni->ki", np.conj(U), rho, U))
-        Pn = np.einsum("kmi,ki,kni->kmn", U, fr, np.conj(U)) - rho_eq
+        Pn = np.einsum("kmi,ki,kni->kmn", U, fr - f_w, np.conj(U))
         r, P = float(np.max(np.abs(Pn - P))), Pn
         if r < tol:
             break
@@ -317,8 +319,8 @@ def run_checks(mesh):
             m_dyn.params, tp.place_state(rho_eq_h[None], mesh)))
         rows["G5"] = float(np.max(np.abs(z)))
 
-        # G4b / G4c / R1 / R6: dress = instantaneous; the reference iterates the population
-        # dressing diag(eps^G) + K drho_pop to its fixed point (dense K, plain iteration)
+        # G4b / G4c / R1 / R6: dress = instantaneous; the reference iterates the carrier
+        # dressing diag(eps^G) + K drho_car to its fixed point (dense K, plain iteration)
         K_dense = _dense_kernel(psi_w, zeta, v, W0)
         e_w, f_w = e[:, B_LO:B_LO + NA], f[:, B_LO:B_LO + NA]
 
@@ -378,7 +380,7 @@ def run_checks(mesh):
 
 
 def _dress_checks(mesh, td, dyn_m, kern, x_drv, x_hot, f_w, nk, rng):
-    """G10 / R7 (eps scaling of the dynamic correction) and G11 (fixed-point residuals)."""
+    """G10 / R7 (eps scaling of the dynamic correction), G11 / R8 (fixed-point residuals)."""
     import functools
     import jax
     import jax.numpy as jnp
@@ -407,10 +409,10 @@ def _dress_checks(mesh, td, dyn_m, kern, x_drv, x_hot, f_w, nk, rng):
     def basis(A_, ops_, xx, steps):
         dd = {**S_m, **A_}
         fw = dd["f_full"][:, B_LO:B_LO + NA]
-        return D._population_basis(dd["e_full"][:, B_LO:B_LO + NA], xx + D._band_diag(fw),
-                                   D._band_diag(fw), static_ds(ops_), steps=steps)
+        return D._population_basis(dd["e_full"][:, B_LO:B_LO + NA], xx + D._band_diag(fw), fw,
+                                   static_ds(ops_), steps=steps)
     fns = {dr: jax.jit(functools.partial(corr, dress=dr))
-           for dr in ("instantaneous", "coherent", "none")}
+           for dr in ("instantaneous", "coherent", "none", "sea_rotation")}
     rows = {}
     A, unitary, X = _drive_family(rng, nk, f_w)
     epss = (2.5e-4, 5e-4, 1e-3)
@@ -433,6 +435,8 @@ def _dress_checks(mesh, td, dyn_m, kern, x_drv, x_hot, f_w, nk, rng):
         rows[f"G11_{tag}_df"] = float(np.max(np.abs(f_last - f_prev)))
         rows[f"G11_{tag}_unconverged"] = int(gather(unc))
     rows["G11_steps"] = steps
+    _, res, unc = fns["sea_rotation"](A_m, ops, put(x_drv))
+    rows["R8"], rows["R8_unconverged"] = float(gather(res)), int(gather(unc))
     return rows
 
 
@@ -508,6 +512,7 @@ def verdict(rows):
     for r, g in TWINS.items():
         ok[r] = rows[r] > GATES[g]
     ok["R7"] = not G10_SLOPE[0] <= rows["R7_slope"] <= G10_SLOPE[1]
+    ok["R8"] = not rows["R8"] <= G11_TOL
     return ok
 
 
