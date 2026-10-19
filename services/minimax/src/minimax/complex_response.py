@@ -564,8 +564,9 @@ class ResponseGroupTree:
         if pencil is not None and self.capacity != RESPONSE_RULE_CAPACITY:
             raise ValueError('a device pencil source serves RESPONSE_RULE_CAPACITY only; '
                              'a custom capacity builds on the host pencils')
-        if self.panels and (self.capacity != RESPONSE_RULE_CAPACITY
-                            or self.max_kappa != _RESPONSE_MAX_KAPPA):
+        # The bank's defaults keep the bank's calls exactly (no extra arguments).
+        self._tuned = ((self.capacity, self.max_kappa) != (RESPONSE_RULE_CAPACITY, _RESPONSE_MAX_KAPPA))
+        if self.panels and self._tuned:
             raise ValueError('closed-form panels serve the bank capacity and mass gate only')
         self.reference = 0. if decay_rate else lo
         self.root = tuple(range(len(z)))
@@ -618,20 +619,22 @@ class ResponseGroupTree:
     def _attempt(self, members):
         lo, hi, z, tol, decay_rate = self.lo, self.hi, self.z, self.rel_tol/2, self.decay_rate
         poles = _poles(z[members])
+        tuned = dict(capacity=self.capacity, max_kappa=self.max_kappa) if self._tuned else {}
         # A single sample keeps the full scan (its refusal is final) unless panels
         # follow a failed pencil: then it stops at the group's stagnation patience too.
         got = _shared_times(lo, hi, poles, tol, self._old.get(frozenset(members)), decay_rate,
                             patience=(None if len(members) == 1 and not self.panels
                                       else _STAGNATION_NODES),
-                            pencil=self.pencil, capacity=self.capacity, max_kappa=self.max_kappa)
+                            pencil=self.pencil, **tuned)
         if got is None:
             # Where the pencil fails, the closed-form imaginary-axis set serves
             # every pole when it fits the pencil's capacity (two pencils' for
             # one sample, whose poles could otherwise take two sets).
             got = _imaginary_times(lo, hi, poles, tol, decay_rate, 2*self.capacity
-                                   if len(members) == 1 else self.capacity, self.max_kappa)
+                                   if len(members) == 1 else self.capacity,
+                                   *((self.max_kappa,) if self._tuned else ()))
         if got is not None:
-            rule = _rule(z[members], [(*got[:1], poles, got[1])], 2*self.capacity)
+            rule = _rule(z[members], [(*got[:1], poles, got[1])], *((2*self.capacity,) if self._tuned else ()))
             return [dict(rule, members=list(members), reference_ry=self.reference)]
         if len(members) > 1:
             return None
@@ -653,13 +656,12 @@ class ResponseGroupTree:
         sets = []
         for pole in poles:
             one = np.asarray([pole])
-            got = _shared_times(lo, hi, one, tol, None, decay_rate, pencil=self.pencil,
-                                capacity=self.capacity, max_kappa=self.max_kappa)
+            got = _shared_times(lo, hi, one, tol, None, decay_rate, pencil=self.pencil, **tuned)
             if got is None:
                 raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
                                  f'sample={z[members[0]]}, pole={pole}, tolerance={self.rel_tol}')
             sets.append((got[0], one, got[1]))
-        rule = _rule(z[members], sets, 2*self.capacity)
+        rule = _rule(z[members], sets, *((2*self.capacity,) if self._tuned else ()))
         return [dict(rule, members=list(members), reference_ry=self.reference)]
 
     def pending(self, attempts):
