@@ -750,6 +750,15 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
                               rcond=rcond)
 
 
+#: The partner cut's eigh check reads the columns above this fraction of ``cutoff**2``
+#: times each operand's own largest eigenvalue (check what you use; see
+#: :func:`leading_eigenvectors_above`). One half leaves the cut's boundary multiplet
+#: (relative gap ``multiplet_tol`` << 1/2) inside the check.
+PARTNER_CHECK_CUT = 0.5
+#: Rounding allowance on ``max eig(perp) <= max eig(top)``, the premise of that check.
+PARTNER_COVER_SLACK = 1e-6
+
+
 def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_extent,
                                multiplet_tol=1e-6, real_rows=None):
     """Leading eigenvectors of each row of ``perp`` above ``cutoff**2`` times ``top``'s largest eigenvalue.
@@ -777,8 +786,18 @@ def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_ext
     if cutoff is None:
         raise ValueError("cutoff must be an explicit relative cutoff")
     _check_tolerance(multiplet_tol)
-    s_top, _ = _leading_eigh(top, eigh_plan, layout, real_rows)
-    s, q = _leading_eigh(perp, eigh_plan, layout, real_rows)
+    # Check what you use. The cut reads top's largest eigenvalue and perp's columns above
+    # cutoff**2 * max eig(top), closed over a boundary multiplet (relative gap
+    # multiplet_tol << 1/2). The shared-pole partner operands have perp = R R^H with R the
+    # part of O outside span(Q), so max eig(perp) <= max eig(top); then probing each
+    # operand's columns above PARTNER_CHECK_CUT * cutoff**2 of its own largest eigenvalue
+    # covers every column read (the device word refuses a perp above top). It leaves out
+    # the exact null cluster both stacks carry, which an over-complete ISDF basis (N_mu
+    # above the pair rank: Fe V2 1872 > 1482) makes the bulk of the spectrum; a defect on
+    # a column the cut reads still refuses by name (GATE distrib_la_result_check).
+    check_cut = PARTNER_CHECK_CUT * float(cutoff) ** 2
+    s_top, _ = _leading_eigh(top, eigh_plan, layout, real_rows, cut=check_cut)
+    s, q = _leading_eigh(perp, eigh_plan, layout, real_rows, cut=check_cut)
     top_agreed, agreed = _agreed(s_top), _agreed(s)
     if top_agreed is None or agreed is None:
         raise ValueError("GATE spectral_cut_agreement: leading_eigenvectors_above needs "
@@ -787,15 +806,21 @@ def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_ext
     full_dev, closed_dev, word = _partner_cut_program(
         eigh_plan.mesh, tuple(agreed.shape), float(cutoff) ** 2, float(multiplet_tol),
         int(real), None if real_rows is None else int(real_rows))(top_agreed, agreed)
-    word = np.asarray(word)                      # [counts..., nonfinite top, nonfinite perp]
+    word = np.asarray(word)        # [counts..., nonfinite top, nonfinite perp, perp above top]
     top_read, read = _SpectrumRead(top_agreed), _SpectrumRead(agreed)
-    if word[-2]:
+    if word[-1]:
+        raise ValueError(
+            "GATE partner_cut_check_cover: leading_eigenvectors_above checks each operand's "
+            f"columns above {PARTNER_CHECK_CUT} * cutoff**2 of its own largest eigenvalue, which "
+            "covers the columns it reads only when max eig(perp) <= max eig(top); a real row "
+            "has perp above top (perp must be the part of top's operand outside span(Q))")
+    if word[-3]:
         _refuse_nonfinite_spectrum(top, top_read.host(), mesh=eigh_plan.mesh,
                                    what="leading eigenvalue spectra")
-    if word[-1]:
+    if word[-2]:
         _refuse_nonfinite_spectrum(perp, read.host(), mesh=eigh_plan.mesh,
                                    what="leading eigenvalue spectra")
-    counts = tuple(int(v) for v in word[:-2])
+    counts = tuple(int(v) for v in word[:-3])
     full = tuple(m if real_rows is None or i < real_rows else 0 for i in range(b))
 
     def host_counts():
@@ -826,7 +851,8 @@ def _partner_cut_program(mesh, shape, threshold, tolerance, real, real_rows):
     """``(full, closed, word)`` of :func:`leading_eigenvectors_above` from the two agreed spectra.
 
     ``full`` the leading set's counts (m per real row), ``closed`` the retained
-    counts, ``word`` = ``[closed..., nonfinite top rows, nonfinite perp rows]``.
+    counts, ``word`` = ``[closed..., nonfinite top rows, nonfinite perp rows,
+    real rows whose perp lies above top]`` (the premise of the check cut).
     ``threshold`` is ``cutoff**2`` (a host float, as the host product used it).
     """
     b, m = shape
@@ -842,14 +868,20 @@ def _partner_cut_program(mesh, shape, threshold, tolerance, real, real_rows):
             closed = jnp.where(index < real_rows, closed, 0)
         closed = closed.astype(jnp.int64)
         full = jnp.where(index < (b if real_rows is None else real_rows), m, 0).astype(jnp.int64)
-        word = jnp.concatenate([closed, _nonfinite_rows(top), _nonfinite_rows(agreed)])
+        above = (index < real) & (agreed[..., -1] > top[..., -1] * (1.0 + PARTNER_COVER_SLACK))
+        word = jnp.concatenate([closed, _nonfinite_rows(top), _nonfinite_rows(agreed),
+                                jnp.any(above)[None].astype(jnp.int64)])
         return full, closed, word
     replicated = NamedSharding(mesh, P())
     return jax.jit(program, out_shardings=(replicated, replicated, replicated))
 
 
-def _leading_eigh(W, eigh_plan, layout, real_rows):
-    """``(s, q)`` of a Hermitian direction operand on its route (ascending, as the solvers return)."""
+def _leading_eigh(W, eigh_plan, layout, real_rows, cut=None):
+    """``(s, q)`` of a Hermitian direction operand on its route (ascending, as the solvers return).
+
+    ``cut`` (face routes): the checked eigh probes only the columns ``w > cut * max(w)``
+    (check what you use, :func:`distrib_la._result_check.used_probes`); ``None`` checks all.
+    The batch-layout route checks Hermiticity only, so ``cut`` does not apply there."""
     if layout == 'batch':
         from distrib_la._batch_reshard import batch_layout_eigh_call
         return batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
@@ -867,10 +899,11 @@ def _leading_eigh(W, eigh_plan, layout, real_rows):
     if not bool(jnp.all(jnp.isfinite(scale) & (defect <= tol * scale))):
         raise ValueError("leading_eigenvectors requires finite Hermitian W")
     # One decision: Plan.batched runs the stack on the route it decides.
+    checked = {} if cut is None else {"cut": cut}
     if W.ndim == 2:
-        s, q = eigh_plan.batched(W[None])
+        s, q = eigh_plan.batched(W[None], **checked)
         return s[0], q[0]
-    return eigh_plan.batched(W)
+    return eigh_plan.batched(W, **checked)
 
 
 def _leading_selection(W, s, q, r, *, eigh_plan, column_extent, layout, multiplet_tol,
