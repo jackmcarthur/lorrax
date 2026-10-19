@@ -1,7 +1,13 @@
 """run30k plan census on a 16-device CPU mesh: every eigh plan the bank and the constructor
 build, in the rooms the runtime helpers give them on the run's ledger, and every stack the
-constructor's face programs decide while traced (jax.eval_shape on abstract operands)."""
-import dataclasses, json, sys, traceback
+constructor's face programs decide while traced (jax.eval_shape on abstract operands).
+
+``LORRAX_REPLAY_DECK=deck.json`` replaces the run30k extents (keys of ``DECK``) with another
+scalar ordered deck's; ``LORRAX_REPLAY_MEASURED=cal.csv`` (the calibration CSV: deck, stage,
+outside, priced, measured in GB/rank) prints each of its ``deck_name`` rows beside this tree's
+price for that production section (``memory.receipts``), and names the C4 -> C6 change of the
+stages it does not replay."""
+import dataclasses, json, os, sys, traceback
 import numpy as np, jax, jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 from functools import lru_cache
@@ -20,11 +26,17 @@ if hasattr(_pl, "resolve_eigh_capacity"):
     _pl.resolve_eigh_capacity = _cap
 from common import gpu_utils
 from lxkit import memory
-memory.set_budget(63.41e9, limit_bytes=77.89e9, per_node=4, platform="NVIDIA A100-SXM4-80GB",
-                  linalg="distributed")
-mesh = Mesh(np.array(jax.devices()[:16]).reshape(4, 4), ("x", "y"))
-N, NLOG, BUDGET, NATIVE_EIGH = 30000, 29998, 63414637611, 7382397440
-POLE_BUDGET, INFINITY_W, IMAG_W, LINE_CAP, STATE_W = 14999, 3750, 7500, 1875, 4612
+DECK = dict(deck_name="run30k", mesh_side=4, N=30000, NLOG=29998, BUDGET=63414637611,
+            LIMIT=77.89e9, NATIVE_EIGH=7382397440, POLE_BUDGET=14999, INFINITY_W=3750,
+            STATE_W=4612, BASELINE=3_130_000_000, CONSERVATIVE=84480, SIDE=48640)
+if os.environ.get("LORRAX_REPLAY_DECK"):
+    DECK.update(json.load(open(os.environ["LORRAX_REPLAY_DECK"])))
+memory.set_budget(DECK["BUDGET"], limit_bytes=DECK["LIMIT"], per_node=4,
+                  platform="NVIDIA A100-SXM4-80GB", linalg="distributed")
+mesh = Mesh(np.array(jax.devices()[:DECK["mesh_side"] ** 2]).reshape(DECK["mesh_side"], -1),
+            ("x", "y"))
+N, NLOG, BUDGET, NATIVE_EIGH = (DECK[k] for k in ("N", "NLOG", "BUDGET", "NATIVE_EIGH"))
+POLE_BUDGET, INFINITY_W, STATE_W = DECK["POLE_BUDGET"], DECK["INFINITY_W"], DECK["STATE_W"]
 
 # ---- the leg's vendor (cuSOLVERMp whole-mesh eigh), faked below the decision -------------
 import gw.shared_pole_execution as spe
@@ -66,6 +78,8 @@ def batched(self, A, *args, **kw):
 _pl.Plan.batched = batched
 
 def stage(name, fn):
+    if name.startswith("constructor"):
+        ledger.at_phase()                             # shared_pole_constructor's phase entry
     try:
         out = fn()
         print(f"STAGE {name}: ok {out if out is not None else ''}", flush=True)
@@ -85,12 +99,13 @@ from gw.shared_pole_local import book_check_eighs
 from common import timing
 # The driver's arrays live beside the ledger: leg 59998942 measured a 3.13 GB/rank floor
 # ('spole other'; Sigma rule plan 3.17, QP 3.19), what the bind's baseline measures.
-BASELINE = 3_130_000_000
+BASELINE = DECK["BASELINE"]
 ledger = CapacityLedger(SimpleNamespace(nk_tot=1, nspinor=2, n_rmu=NLOG), mesh_xy=mesh,
                         device_budget_bytes=BUDGET, baseline_bytes=BASELINE)
 # The room helpers that measure live arrays see the same floor.
 memory.room = lambda stage="", *, bucketed=True: (
     memory.bucket if bucketed else int)(BUDGET - BASELINE)
+ledger.room_bytes = BUDGET - BASELINE              # resolve_shared_pole_recipe's bind
 face_bytes = 16 * N * N // mesh.size
 ledger.reserve("coulomb_roots:2", resident_bytes_per_rank=face_bytes, workspace_bytes_per_rank=0)
 ledger.live_stages = ("coulomb_roots:2",)
@@ -107,6 +122,11 @@ def bank_line():
     sel = charge_line_selection(meta, mesh_xy=mesh, ordered=True, execution=execution, nq=1,
                                 eigh_backend="auto", room=room)
     sel.plans["charge"].stack_route((1, N, N), np.complex128, "normal_eigh")   # polar extract
+    row = ledger.reserve("line_selection:0", resident_bytes_per_rank=resident,
+                         workspace_bytes_per_rank=ws, concurrent_with=ledger.live_stages)
+    memory.book(ledger.price(row), stage="bank.line_select")
+    with timing.section("bank.line_select"):
+        pass
     info["line"] = dict(execution=execution, face_aggregate=resident + ws + carry + face_bytes, room=int(room))
     return info["line"]
 stage("bank line selection", bank_line)
@@ -133,7 +153,7 @@ meta = SimpleNamespace(n_rmu_padded=N)
 resolution = SimpleNamespace(eigh_backend="auto", layout="local")
 extent = port_extent(mesh)
 carrier = face_ritz_carrier(mesh, POLE_BUDGET)
-CONSERVATIVE, SIDE = 84480, 48640
+CONSERVATIVE, SIDE = DECK["CONSERVATIVE"], DECK["SIDE"]
 upstream = ledger.live_stages
 budget = None
 def constructor_admission():
@@ -153,6 +173,10 @@ def constructor_admission():
                                reduction_gb=receipt["reduction"]["aggregate_bytes_per_rank"] / 1e9,
                                face_room=int(face_room))
     info["receipt"] = receipt
+    with timing.section("spole.batch_admission"):
+        budget.batch_width = width
+        budget.plan(CONSERVATIVE, phase="selection", sample_batch=4)
+        budget.live(())
     return info["constructor"]
 stage("constructor batch admission", constructor_admission)
 
@@ -170,7 +194,8 @@ def constructor_reduction():
     actual = face_reduction_bytes(mesh, 1, rows=N, side=SIDE, carrier=carrier)
     budget.program_bytes = 0
     try:
-        reserved = budget.plan(SIDE, phase="reduction", runs_in="spole.gram_reduction")
+        with timing.section("spole.reduction_admission"):
+            reserved = budget.plan(SIDE, phase="reduction", runs_in="spole.gram_reduction")
     finally:
         budget.program_bytes = admitted
     row = receipt["reduction"]
@@ -254,3 +279,35 @@ print("RESULT " + json.dumps(dict(info={k: v for k, v in info.items() if k != "r
                                   census=census, refusals=refusals), default=str))
 print("SIZING " + memory.sizing()["line"])
 print("CENSUS " + json.dumps(memory.findings()))
+
+# ---- this tree's price per production section beside a measured leg ----------------------
+#: What changed C4 -> C6 in the stages this replay does not rebuild.
+DELTA = (("tau.memcheck", "unpriced (A5: provisional bound deleted)"),
+         ("tau.setup", "unpriced (A5: provisional bound deleted)"),
+         ("tau.window_arguments", "unpriced (A5: provisional bound deleted)"),
+         ("spole.bank", "C4 less its outside term (A6: stage_outside deleted)"),
+         ("spole.reduction_admission", "booked in spole.gram_reduction (runs_in), as in C4"),
+         ("spole.", "ledger row: absolute (baseline + live rows + own); C4 an increment"),
+         ("bank.line_", "ledger row: absolute (baseline + live rows + own); C4 an increment"),
+         ("gw_jax.V_q", "tile admission host-only (A4); device price = booked parts"),
+         ("", "formula unchanged C4 -> C6"))
+if os.environ.get("LORRAX_REPLAY_MEASURED"):
+    import csv
+    priced = {r["stage"]: r["priced"] / 1e9 for r in memory.receipts()}
+    rows = [r for r in csv.DictReader(open(os.environ["LORRAX_REPLAY_MEASURED"]))
+            if r["deck"] == DECK["deck_name"]]
+    print(f"PRICES {DECK['deck_name']}: stage | C4 priced | measured | C6 priced | gamma C6 | C6 basis")
+    for r in sorted(rows, key=lambda r: r["stage"]):
+        c4, meas = float(r["priced"]), float(r["measured"])
+        if r["stage"] in priced:
+            c6, basis = priced[r["stage"]], "replayed"
+        else:
+            basis = next(t for k, t in DELTA if r["stage"].startswith(k))
+            c6 = (None if basis.startswith("unpriced") else
+                  c4 - float(r["outside"] or 0) if r["stage"] == "spole.bank" else
+                  None if basis.startswith(("ledger", "tile")) else c4)
+        cell = "-" if c6 is None else f"{c6:.2f}"
+        gamma = "-" if not c6 else f"{meas / c6:.2f}"
+        print(f"PRICE {r['stage']} | {c4:.2f} | {meas:.2f} | {cell} | {gamma} | {basis}")
+    for stage in sorted(set(priced) - {r["stage"] for r in rows}):
+        print(f"PRICE {stage} | - | - | {priced[stage]:.2f} | - | replayed, not in the CSV")

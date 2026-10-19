@@ -25,12 +25,6 @@ plan_mod = importlib.import_module("distrib_la.plan")
 
 
 
-@pytest.fixture(autouse=True)
-def _gcd_run():
-    """The run's allocator limit an MI250X GCD reports (the ROCM solve_lu size row's input)."""
-    from lxkit import memory
-    memory.set_budget(48.99e9, limit_bytes=60_183_563_895, per_node=8, platform="MI250X")
-
 @pytest.fixture
 def mesh():
     if len(jax.devices()) < 4:
@@ -55,8 +49,13 @@ def test_one_device_price_is_the_route_c_stack_price():
 @pytest.mark.parametrize("op,n", [("eigh", 64), ("solve_lu", 64)])
 def test_room_caps_the_size_route(mesh, rocm, op, n):
     need = od.one_device_bytes(op, n)
-    # No room: unchanged.  Room for one whole matrix: one_device.
-    assert resolve_mod.resolve_backend(op, "distributed", mesh, n=n) == "one_device"
+    # No room: eigh keeps its size row; solve_lu (a room leg) refuses by name.  Room for one
+    # whole matrix: one_device.
+    if op == "eigh":
+        assert resolve_mod.resolve_backend(op, "distributed", mesh, n=n) == "one_device"
+    else:
+        with pytest.raises(ValueError, match="GATE distrib_la_room"):
+            resolve_mod.resolve_backend(op, "distributed", mesh, n=n)
     assert resolve_mod.resolve_backend(op, "distributed", mesh, n=n, room=need) == "one_device"
     # One byte short (and the no-room 0 of a whole-mesh caller): the library
     # (no SLATE handler on this host, so the ladder names it).
