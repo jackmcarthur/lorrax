@@ -14,13 +14,13 @@ checked route's assertions hold for any matrix of this structure.
 Checked (every line must say PASS; the script exits 1 otherwise):
   plan     distrib_la.plan('eigh', backend='distributed').batched: deflated
            and checked, eigenvalues equal to host LAPACK
-  guard    the checked eigh around the bare library call, retrying at one
-           tile per rank: the right spectrum
+  guard    the checked eigh around the deflated library call (one attempt,
+           the plan's): the right spectrum
   small    the plan on the same matrix times 1e-6 (sentinels scale with A)
-  refuse   the checked eigh around a solver with wrong vectors and no retry:
+  refuse   the checked eigh around a solver with wrong vectors:
            a NaN result on every rank, and GATE distrib_la_result_check raised
            by the eager refusal
-Reported, not checked: the bare library at its default and retry layouts.
+Reported, not checked: the bare library at its default layout.
 
     lx run --pool POOL -N 1 -G 4 -n 4 -- bash -c 'source config/perlmutter/gpu_env.sh; \
         python3 -u services/distrib_la/bench/eigh_zero_block_check.py'
@@ -53,7 +53,7 @@ def main():
     from jax.sharding import NamedSharding, PartitionSpec as P
     import distrib_la
     from distrib_la import _cusolvermp
-    from distrib_la._result_check import accept, checked_eigh, eigh_errors, raise_if_failed
+    from distrib_la._result_check import accept, checked_eigh, deflate_zero_rows, eigh_errors, raise_if_failed
     from distrib_la.plan import _eigh_columns
     from common.collectives import gather_to_host
 
@@ -81,16 +81,15 @@ def main():
         return values
 
     bare = lambda x, **k: _eigh_columns("cusolvermp", *_cusolvermp.distributed_eigh(x, mesh=mesh, **k))
-    retry = lambda x: bare(x, block=_cusolvermp.retry_block(n, 2))
     line("bare", *jax.jit(bare)(A))
-    line("bare1", *jax.jit(retry)(A))
     plan = distrib_la.plan("eigh", mesh, n=n, backend="distributed", batched_route="auto")
     stack = NamedSharding(mesh, P(None, "x", "y"))
     w, v = jax.jit(plan.batched)(jax.make_array_from_callback((1,) + a.shape, stack, lambda i: a[None][i]))
     line("plan", w[0], v[0], lambda values, r, o: (
         r <= accept(n) and o <= accept(n) and np.max(np.abs(values - reference)) <= 1e-12))
 
-    line("guard", *jax.jit(lambda x: checked_eigh([bare, retry], x, mesh=mesh)[0])(A),
+    deflated = deflate_zero_rows(bare, mesh=mesh)
+    line("guard", *jax.jit(lambda x: checked_eigh(deflated, x, mesh=mesh)[0])(A),
          lambda values, r, o: np.max(np.abs(values - reference)) <= 1e-12 and r <= accept(n) and o <= accept(n))
 
     # A small-norm zero-row matrix (1/c-scaled transverse metrics): the
@@ -109,11 +108,11 @@ def main():
               f"{'PASS' if ok else 'FAIL'}", flush=True)
 
     def wrong(x):
-        values, vectors = retry(x)
+        values, vectors = deflated(x)
         return values, jnp.roll(vectors, 1, axis=-1)
     # Inside a jit the refused result comes back NaN on every rank; an eager
     # caller (Plan, factor/solve) then raises the GATE by name.
-    (w, v), flag = jax.jit(lambda x: checked_eigh([wrong], x, mesh=mesh))(A)
+    (w, v), flag = jax.jit(lambda x: checked_eigh(wrong, x, mesh=mesh))(A)
     poisoned = bool(np.isnan(np.asarray(gather_to_host(w))).all())
     try:
         raise_if_failed(flag, "eigh", n, A.dtype, "bench refuse")

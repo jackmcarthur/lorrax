@@ -664,7 +664,7 @@ def own_extent_receipts(reduction, own):
         zeros = np.flatnonzero(spectrum == 0)
         kept = np.delete(spectrum, zeros[len(zeros) - pad:] if pad > 0 else [])[:side]
         row["gram_spectrum_relative"] = kept[None]
-        row["gram_min_relative"] = kept[:1]
+        row["gram_min_relative"] = np.sort(kept)[:1]
         row["metric_inverse_root_residual_relative"] = row["metric_inverse_root_residual_fro"] / np.sqrt(side)
         rows.append(row)
     return rows

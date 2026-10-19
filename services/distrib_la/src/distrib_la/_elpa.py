@@ -24,8 +24,8 @@ MPI context, as ScaLAPACK does.
 Tile: ELPA's GPU kernels need ``nb`` a power of two (any other value silently moves work
 to the host).  1-stage: nb 64 and 128 measured equal (20480, both dtypes: 23.1 vs 23.0 s
 complex128, 15.3 vs 15.5 s float64), so 64, which divides more local edges.  A local edge with
-no such divisor is padded to the next multiple of the tile, with sentinel eigenvalues below
-the spectrum (:func:`pad_with_sentinels`).
+no such divisor is padded to the next multiple of the tile (:func:`eigh_layout`; the plan
+zero-pads and deflates the pads).
 
 Device memory, all of it XLA's (inside the arena) during the solve:
 
@@ -49,10 +49,10 @@ from typing import Tuple
 import jax
 import jax.numpy as jnp
 from jax import shard_map
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P
 
 from distrib_la import _slate
-from distrib_la._cyclic import cyclic_to_block, pad_with_sentinels
+from distrib_la._cyclic import cyclic_to_block
 from distrib_la.resolve import mesh_key
 
 __all__ = ["distributed_eigh", "eigh_layout", "workspace_bytes", "pool_bytes", "rocblas_bytes"]
@@ -164,16 +164,46 @@ def workspace_bytes(side: int, p: int, dtype, threads: int | None = None) -> int
     return pool_bytes(side, p, dtype) + rocblas_bytes(side, p, dtype, threads)
 
 
+def _last_row_coupled(solve):
+    """``solve`` (an eigh returning ``(W, Q)``, Q's rows the operand's) with the operand's last row coupled.
+
+    ELPA (2026.02.001, 1-stage, AMD GPU) returns wrong pairs when the LAST row is decoupled
+    (a zero-row block at the global tail; standalone reproducer, upstream report draft
+    ELPA_TAIL_BLOCK_UPSTREAM.md, largenmu 2026-10-19), and not when the same block sits at
+    the head or in the middle: swap the last row/column with the last coupled one (O(n)
+    movement) and the vectors' rows back. One swap suffices: the block then ends one row
+    before the tail, where ELPA solves it.
+    """
+    def run(a):
+        side = a.shape[-1]
+        i = jnp.arange(side)
+        coupled = jnp.any((a != 0) & (i[:, None] != i[None, :]), axis=-1)
+        j = jnp.where(jnp.any(coupled), side - 1 - jnp.argmax(coupled[::-1]), side - 1)
+        W, Q = solve(_swap(_swap(a, j, 0), j, 1))
+        return W, _swap(Q, j, 0)
+    return run
+
+
+def _swap(a, j, axis):
+    """``a`` with its index ``j`` and its last index exchanged along ``axis`` (0 rows, 1 columns), by
+    selects on the operand's own tiles (no gather): the two lines are masked sums."""
+    n = a.shape[axis]
+    i = jnp.arange(n)
+    at = (lambda k: i[:, None] == k) if axis == 0 else (lambda k: i[None, :] == k)
+    line = lambda k: jnp.sum(jnp.where(at(k), a, 0), axis=axis, keepdims=True)
+    return jnp.where(at(j), line(n - 1), jnp.where(at(n - 1), line(j), a))
+
+
 def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
-                     block_size: int | None = None,
-                     side: int | None = None) -> Tuple[jax.Array, jax.Array]:
+                     block_size: int | None = None) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition on ELPA (ROCM leg).
 
     Same contract as :func:`distrib_la._slate.distributed_eigh`: ``A`` square, float64 or
     complex128, sharded ``P('x','y')`` on a square ``('x','y')`` mesh; returns ``W``
     ``(n,)`` ascending, replicated, and ``Q`` ``(n, n)`` with the eigenvectors as columns,
-    ``P('x','y')``.  ``block_size`` must be a power of two dividing ``side/p``; ``side``
-    defaults to :func:`eigh_layout`'s.  ELPA's one-stage solver only (module docstring).
+    ``P('x','y')``.  ``n`` must be :func:`eigh_layout`'s side (the plan zero-pads to it and
+    deflates the pads); ``block_size`` must be a power of two dividing ``n/p``.  ELPA's
+    one-stage solver only (module docstring).
     """
     if A.ndim != 2 or A.shape[0] != A.shape[1]:
         raise ValueError(f"elpa distributed_eigh: expected a square matrix, got {A.shape}")
@@ -183,11 +213,10 @@ def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
     n = int(A.shape[0])
     if n % p:
         raise ValueError(f"elpa distributed_eigh: n={n} must be divisible by mesh axis size {p}.")
-    if side is None:
-        side, nb = eigh_layout(n, p, A.dtype)
-    else:
-        side = int(side)
-        nb = eigh_layout(side, p, A.dtype)[1]
+    side, nb = eigh_layout(n, p, A.dtype)
+    if side != n:
+        raise ValueError(f"elpa distributed_eigh: n={n} is not a solve side on a {p}x{q} mesh; "
+                         f"pad it to {side} first (distrib_la.plan pads with zero rows)")
     if block_size is not None:
         nb = int(block_size)
     local = side // p
@@ -223,15 +252,7 @@ def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
                 Q_T = cyclic_to_block(Q_T, n=side, p=q, mb=nb, axis="y")
             return W, jnp.transpose(Q_T, (1, 0))
 
-        face = NamedSharding(mesh, P("x", "y"))
-
-        def _padded(a):
-            whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)
-            W, Q = _call(whole)
-            W, Q = W[side - n:], Q[:n, side - n:]
-            return W, jax.lax.with_sharding_constraint(Q, face)
-
         # No donation: plan.DONATES declares eigh as donating nothing.
-        fn = jax.jit(_call if side == n else _padded)
+        fn = jax.jit(_last_row_coupled(_call))
         _JIT_CACHE[key] = fn
     return fn(A)

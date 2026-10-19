@@ -203,7 +203,7 @@ def test_decoupled_cross_matches_the_joint_reduction():
     face = NamedSharding(mesh, P(None, "x", "y"))
     eig = lambda m: tuple(np.linalg.eigh(np.asarray(m)))
     want, wd = reduce_sector_pencil(tuple(jnp.asarray(x) for x in (metric, value, oc, ot)),
-                                    eigh=lambda m: tuple(jnp.asarray(v) for v in eig(m)), matmul=_mm, gates=gates)
+                                    eigh=lambda m, **_: tuple(jnp.asarray(v) for v in eig(m)), matmul=_mm, gates=gates)
     plan = _local_eigenplan(mesh, k)
     for width in (q, 2):
         got, gd = face_cross_decoupled([jax.device_put(x, face) for x in (metric, value, oc, ot)],

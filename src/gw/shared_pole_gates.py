@@ -221,7 +221,7 @@ def _passivity_response_checks(response, *, eigh, gates):
     anti = jnp.linalg.norm(response - _adjoint(response), axis=(-2, -1))
     anti = anti / jnp.where(norm > 0, 2 * norm, 1)
     values, _ = eigh(herm)
-    minimum, maximum = values[:, 0], values[:, -1]
+    minimum, maximum = jnp.min(values, axis=-1), jnp.max(values, axis=-1)
     limit = gates["passivity"]["threshold"].get("antihermitian_relative_max")
     passed = ((minimum >= gates["passivity"]["threshold"]["eigenvalue_min"])
               & (maximum <= gates["passivity"]["threshold"]["eigenvalue_max"])
