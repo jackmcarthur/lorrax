@@ -57,13 +57,17 @@ def read_wfn_k_list(wfn_file):
 
 
 def create_bsemat_file(path, *, wfn_file, kpts, kgrid, nvb, ncb, extended, icutv,
-                       ecuts, ecutg, efermi, nspinor, ns=1):
+                       ecuts, ecutg, efermi, nspinor, ns=1, qflag=1,
+                       exciton_Q_shift=(0.0, 0.0, 0.0)):
     """Write the header and empty contiguous matrix datasets (serial h5py, rank 0).
 
     ``mf_header`` is copied from the coarse WFN byte for byte, so absorption
     reads the k list and the G sphere it maps with. ``bse_header`` holds
     exactly the keys the NERSC berkeleygw/4.0 kernel writes (it writes no
-    ``kpoints/flagbz``). Returns the matrix shape.
+    ``kpoints/flagbz``). ``qflag`` and ``exciton_Q_shift`` are kernel.x's
+    ``exciton_Q_shift Qflag Qx Qy Qz`` (1: Q = 0; 2: the valence leg on
+    WFN_co; 0: on WFNq_co), the shift being minus the exciton momentum
+    (``BSE/inread_kernel.f90``, ``Common/kernel_io.F90``). Returns the matrix shape.
     """
     n1b = nvb + ncb if extended else nvb
     n2b = nvb + ncb if extended else ncb
@@ -88,8 +92,8 @@ def create_bsemat_file(path, *, wfn_file, kpts, kgrid, nvb, ncb, extended, icutv
         kp["nk"] = i4(nk)
         kp["kpts"] = np.asarray(kpts, dtype=np.float64)
         kp["kgrid"] = np.asarray(kgrid, dtype=i4)
-        kp["qflag"] = i4(1)
-        kp["exciton_Q_shift"] = np.zeros(3)
+        kp["qflag"] = i4(qflag)
+        kp["exciton_Q_shift"] = np.asarray(exciton_Q_shift, dtype=np.float64).reshape(3)
         f.create_group("mats")
         for name in MATRICES:
             f.create_dataset(name, shape=shape, dtype=np.float64)
@@ -109,6 +113,7 @@ def read_bsemat_header(path):
             "versionnumber", "flavor", "params/screening", "params/icutv",
             "params/theory", "params/nblocks", "params/nmat", "bands/nvb",
             "bands/ncb", "bands/n1b", "bands/n2b", "bands/ns", "bands/nspinor",
-            "kpoints/nk", "kpoints/kpts", "kpoints/kgrid", "kpoints/qflag")}
+            "kpoints/nk", "kpoints/kpts", "kpoints/kgrid", "kpoints/qflag",
+            "kpoints/exciton_Q_shift")}
         out["shape"] = tuple(f[MATRICES[0]].shape)
     return out
