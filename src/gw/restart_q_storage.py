@@ -120,8 +120,17 @@ def closure_for_restart(resolution):
     return resolution.verdict
 
 
-def resolve_restart_q_storage(requested, resolution, *, context: str):
-    """Store the computed q wedge, or the natural unreduced q axis, without an override."""
+def resolve_restart_q_storage(requested, resolution, *, context: str,
+                              q_counts=None):
+    """Store the computed q wedge, or the natural unreduced q axis, without an override.
+
+    ``q_counts`` is ``(n_q_irr, n_q_full)`` of this run's q grid when the
+    caller holds it.  ``auto`` stores the wedge only when it is smaller
+    than the zone (``n_q_irr < n_q_full``); a grid that does not reduce
+    (Γ only, or a WFN with no reducing symmetry) resolves ``full`` up
+    front, so no writer waits for a pre-unfold capture of a wedge that
+    is the whole zone.
+    """
     req = str(requested).strip().lower()
     if req not in RESTART_Q_STORAGE:
         raise ValueError(
@@ -169,6 +178,13 @@ def resolve_restart_q_storage(requested, resolution, *, context: str):
             reason="the deck asked for wedge storage and the set is closed")
 
     # ``auto``.
+    reduces = q_counts is None or int(q_counts[0]) < int(q_counts[1])
+    if closed and use_ibz and not reduces:
+        return RestartQStorage(
+            mode="full", requested=req, resolution=None,
+            reason=(f"the q axis does not reduce ({int(q_counts[0])} IBZ q "
+                    f"of {int(q_counts[1])} full-BZ q), so the wedge is the "
+                    f"whole zone"))
     if closed and use_ibz:
         return RestartQStorage(
             mode="ibz", requested=req, resolution=resolution,
@@ -443,7 +459,14 @@ def resolve_restart_q_storage_for_run(config, *, sym, centroid_indices,
         res = resolve_qgrid_symmetry_tables(
             sym=sym, centroid_indices=centroid_indices, fft_grid=fft_grid,
             context=context)
-    decision = resolve_restart_q_storage(requested, res, context=context)
+    q_counts = None
+    if sym is not None and getattr(sym, "q_irr_full_idx", None) is not None \
+            and getattr(sym, "irr_idx_q", None) is not None:
+        import numpy as np
+        q_counts = (int(np.asarray(sym.q_irr_full_idx).shape[0]),
+                    int(np.asarray(sym.irr_idx_q).shape[0]))
+    decision = resolve_restart_q_storage(requested, res, context=context,
+                                         q_counts=q_counts)
     # ANNOUNCED, ONCE, ON RANK 0 — same discipline as the suppress key.
     # A run whose restart file changed SHAPE and said nothing is a run
     # nobody can tell from one whose centroid set quietly stopped closing.
