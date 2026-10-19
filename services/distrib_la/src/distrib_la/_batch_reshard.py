@@ -209,7 +209,7 @@ def _dense_real_rows(
     matrices.  The last local slots may be synthetic padding.  A vmapped
     conditional is not sufficient here because a batched predicate may run
     both branches; the scalar ``fori_loop`` + ``lax.cond`` is the same
-    schedule used by ``isdf.core._factor_c_q_replicated_qparallel`` and makes
+    schedule the q-parallel factors used (``isdf.core``'s transverse LU) and makes
     the expensive branch unreachable for a synthetic global q index.
     """
     local_nb = int(A.shape[0])
