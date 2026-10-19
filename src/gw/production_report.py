@@ -1,0 +1,1053 @@
+"""Rank-zero, human-readable GW calculation report.
+
+This is the scientific output of ``gwjax``.  It intentionally does not echo
+library inventories, per-rank messages, HDF5 implementation details or the
+driver's historical diagnostic prose.  Those remain available behind the one
+driver-wide ``LORRAX_DEBUG_PRINT`` switch and in the launcher's own log.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+from typing import Iterable
+
+import numpy as np
+
+from common.scientific_output import (
+    FLOAT_DIGITS,
+    abs_path,
+    architecture_lines,
+    band_range,
+    centroid_orbit_line,
+    file_table_lines,
+    numerical_environment_lines,
+    symmetry_sampling_lines,
+)
+from common.units import RYD_TO_EV
+from . import quadrature_log
+from .gw_config import qp_solver_semantics, sigma_requested_edges_ev
+
+
+_WARNING_WORDS = (
+    "WARNING", "FATAL", "FAILURE", "FAILED", "UNPHYSICAL",
+    "NOT TRUSTWORTHY", "DEPRECATED",
+)
+
+# Stable role labels for the driver's closing file table.  These deliberately
+# name the energy definition rather than inferring a method from ``eqpN``.
+EQP0_FILE_ROLE = "fixed-DFT-state diagonal zeroth-order energies"
+EQP1_FILE_ROLE = "fixed-DFT-state diagonal Z-linearized energies"
+QP_ROTATIONS_FILE_ROLE = "full-matrix effective-H rotations"
+QP_WFN_FILE_ROLE = "matched full-matrix QP wavefunctions"
+
+
+
+def _human_bytes(n_bytes: float) -> str:
+    """GiB above one GiB, MiB below, three significant figures either way."""
+    gib = float(n_bytes) / 2**30
+    if gib >= 1.0:
+        return f"{gib:.3g} GiB"
+    return f"{float(n_bytes) / 2**20:.3g} MiB"
+
+def layout_dial_record_lines(
+        *, config, n_mu: int, n_q_irr: int, processes: int) -> tuple[str, ...]:
+    """Build the startup record for the two user-facing memory/layout dials."""
+    n_mu = int(n_mu)
+    q_per_task = (int(n_q_irr) + int(processes) - 1) // int(processes)
+    matrix_gib = (
+        q_per_task * n_mu * n_mu * np.dtype(np.complex128).itemsize
+        / 1024 ** 3)
+    layout = str(config.backend.linalg).strip().lower()
+    lines = [
+        f"[config provenance] linalg = {layout} "
+        f"({config.backend.linalg_provenance})",
+    ]
+    if layout == "local":
+        lines.append(
+            "linalg = local: fastest, but each task holds ceil(N_q_irr/P) "
+            "complete N_mu x N_mu dense matrices "
+            f"(here ceil({int(n_q_irr)}/{int(processes)}) x {n_mu}^2 x "
+            f"16 B = {_human_bytes(matrix_gib * 2**30)} per task, complex128) plus their "
+            "factor workspace; on large systems where that is a large "
+            "fraction of memory per task, set linalg = distributed")
+    else:
+        lines.append(
+            "linalg = distributed: dense N_mu x N_mu matrices are 2D "
+            f"distributed across the process mesh (N_mu = {n_mu})")
+
+    lines.append(
+        "ψ parent carrier: band-distributed faces; band contractions gather "
+        "their band panels in memory-sized chunks; band chunks of at least "
+        f"{int(config.memory.band_chunk_size)}, sized from memory_per_device_gb.")
+    return tuple(lines)
+
+
+_SIGMA_KIND = {
+    "crossing": "crossing",
+    "sign_definite_positive": "d > 0",
+    "sign_definite_negative": "d < 0",
+}
+
+
+def _chi_rule_line(row: dict) -> str:
+    """One screening rule as a fixed-width report row (energies in Ry)."""
+    kind = row["kind"]
+    if kind == "direct":
+        where = f"z {row['omega_ry']:.4g} + {row['varpi_ry']:.3g}i"
+        return f"{kind:<7} {where:<34} {'-':>7}  {'exact':>9}  ordered-pair scan"
+    if kind == "line":
+        count = row["points"]
+        where = (f"varpi {row['varpi_ry']:.4g}, F {row['freq_max_ry']:.4g}, "
+                 f"{count} point{'' if count == 1 else 's'}")
+        nodes = (f"{row['nodes']}x{row['sweeps']}" if row["sweeps"] > 1
+                 else str(row["nodes"]))
+        return (f"{kind:<7} {where:<34} {nodes:>7}  "
+                f"{'<=' + format(row['target'], '.0e'):>9}  "
+                f"Gauss-Legendre, {row['panels']} panels, "
+                f"A {row['a_dim']:.0f}, kappa0 {row['kappa0']:.2f}")
+    where = (f"x {row['x_min']:.3g}-{row['x_max']:.3g}, "
+             f"R {row['x_max'] / row['x_min']:.3g}")
+    if kind != "static":
+        axis = "i" if kind == "imag" else ""
+        where = f"omega {row['omega_ry']:.4g}{axis}, {where}"
+    source = (f"{row['source']}, "
+              f"{'certified' if row['certified'] else 'UNCERTIFIED'}")
+    if row["note"]:
+        source += f"; {row['note']}"
+    return (f"{kind:<7} {where:<34} {row['nodes']:>7}  "
+            f"{row['error']:>9.2e}  {source}")
+
+
+def _sigma_rule_lines(geometry: dict, plans: int) -> list[str]:
+    """The Sigma plan header and one row per product window (box in eta)."""
+    eta = float(geometry["eta_ry"])
+    count = int(geometry.get("n_windows", 0))
+    head = f"Sigma rules: eta {eta * RYD_TO_EV:.4f} eV"
+    if "eps" in geometry:
+        head += f", eps {float(geometry['eps']):.1e}"
+    head += f"; {count} window{'' if count == 1 else 's'}"
+    if "window_tau_pairs" in geometry:
+        head += f", {geometry['window_tau_pairs']} (window,tau) pairs"
+    if "distinct_tau_count" in geometry:
+        head += f", {geometry['distinct_tau_count']} distinct tau"
+    if "plan_seconds" in geometry:
+        head += f"; plan {float(geometry['plan_seconds']):.1f} s"
+    if plans > 1:
+        head += f" (last of {plans} plans)"
+    lines = [head]
+    windows = [window for branch in geometry.get("branches", ())
+               for window in branch["windows"]]
+    if not windows:
+        return lines
+    width = max(len("window"), *(len(w["name"]) for w in windows))
+    lines.append(
+        f"  {'window':<{width}}  {'kind':<8}  {'Re d / eta':>16}  "
+        f"{'Im d / eta':>12}  {'nodes':>5}  {'sup/eps':>7}  {'kappa':>8}  "
+        f"{'fit s':>6}  rule")
+    for w in windows:
+        lo, hi, gamma_lo, gamma_hi = (float(v) / eta for v in w["box_ry"])
+        lines.append(
+            f"  {w['name']:<{width}}  {_SIGMA_KIND.get(w['kind'], w['kind']):<8}  "
+            f"{lo:+7.1f}..{hi:+7.1f}  {gamma_lo:5.2f}..{gamma_hi:5.2f}  "
+            f"{w['node_count']:>5}  {w['sup_error'] / w['eps']:>7.3f}  "
+            f"{w['kappa_max']:>8.2e}  {w['fit_seconds']:>6.1f}  "
+            f"{w['rule_source']}")
+    return lines
+
+
+class _Band:
+    """One stage row: its seconds and the timing nodes whose time it owns, the
+    subtrees under ``plus`` less those under ``minus`` (paths).  Subtracting a band
+    removes its subtrees, so a residual row owns exactly the time it reports."""
+
+    __slots__ = ("seconds", "plus", "minus")
+
+    def __init__(self, seconds=0.0, plus=(), minus=()):
+        self.seconds, self.plus, self.minus = float(seconds), tuple(plus), tuple(minus)
+
+    def __add__(self, other):
+        return _Band(self.seconds + float(other), self.plus + getattr(other, "plus", ()),
+                     self.minus + getattr(other, "minus", ()))
+
+    __radd__ = __add__
+
+    def __sub__(self, other):
+        return _Band(self.seconds - float(other), self.plus,
+                     self.minus + getattr(other, "plus", ()))
+
+    def __float__(self):
+        return self.seconds
+
+    def floor(self):
+        return _Band(max(self.seconds, 0.0), self.plus, self.minus)
+
+    def owns(self, path):
+        under = lambda roots: any(tuple(path[:len(r)]) == tuple(r) for r in roots)
+        return under(self.plus) and not under(self.minus)
+
+
+#: Sections whose own device peak the memory table prints beside the stage rows.
+_SUBSTAGE_PEAKS = ("spole.gram_reduction", "spole.passivity_held", "head.sample_terms")
+
+
+def _substage_peak_lines(paths, rows):
+    """Lines of the memory table for :data:`_SUBSTAGE_PEAKS`: each section's own pool
+    high-water (max over its calls, max / min over ranks) and where it ran."""
+    sub = {}
+    for path, row in zip(paths, rows):
+        if path and path[-1] in _SUBSTAGE_PEAKS:
+            peak = _rank_peaks(row, "peak")
+            if np.any(np.isfinite(peak)):
+                old = sub.get(path[-1])
+                sub[path[-1]] = (peak if old is None else np.fmax(old[0], peak), path)
+    if not sub:
+        return []
+    lines = ["  constructor sub-stages, each section's own pool high-water (max over its calls):"]
+    for name in _SUBSTAGE_PEAKS:
+        if name in sub:
+            peak, path = sub[name]
+            lines.append(f"    {name}: peak {_gb_pair(peak, 0)} GB; {' > '.join(path[-3:])}")
+    return lines
+
+
+def _rank_peaks(row, key):
+    """Every rank's value of a record's peak (bytes; NaN = unmeasured)."""
+    ranks = row.get(key + "_ranks")
+    if ranks is not None:
+        return np.asarray(ranks, dtype=np.float64)
+    local = row.get(key)
+    return np.asarray([np.nan if local is None else float(local)])
+
+
+def _gb_pair(values, width=6):
+    """"max / min" over ranks in GB, or "–" when no rank measured it."""
+    if values is None or not np.any(np.isfinite(values)):
+        return "–"
+    return f"{np.nanmax(values) / 1e9:{width}.2f} / {np.nanmin(values) / 1e9:{width}.2f}"
+
+
+class GWProductionReport:
+    """One clean GW report, owned and written only by process zero."""
+
+    def __init__(self, path: str, *, runtime, debug: bool, stdout) -> None:
+        self.path = abs_path(path)
+        self.runtime = runtime
+        self.debug = bool(debug)
+        self.stdout = stdout
+        self.rank = int(getattr(runtime, "process_index", 0))
+        self._warnings: list[str] = []
+        self._warnings_emitted = False
+        self._timings_emitted = False
+        self._stream = None
+        if self.rank == 0:
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            self._stream = open(self.path, "w", encoding="utf-8", buffering=1)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
+
+    def emit(self, line: str = "") -> None:
+        """Write one rank-zero line to both the report and live stdout."""
+        if self.rank != 0:
+            return
+        text = str(line)
+        self.stdout(text)
+        if self._stream is not None:
+            self._stream.write(text + "\n")
+
+    def legacy_print(self, *args, sep: str = " ", **kwargs) -> None:
+        """Sink historical component chatter unless driver debug is enabled.
+
+        High-signal warnings are retained for one consolidated block at the
+        end.  Exceptions still use stderr through the shared fail-fast path.
+        """
+        text = sep.join(str(v) for v in args)
+        if text.startswith("  Resident ψ "):
+            self.emit(text)
+            return
+        # The μ-batch ζ fit's plan and its measured store/timing receipts are
+        # the run's record of where Z lived and what the transfers cost; the
+        # ladder resolvent's per-z receipts (wall, iterations, residual,
+        # high-water, fingerprints) are the same kind of record.
+        if text.startswith(("  ISDF μ-batch plan", "  μ-batch ", "  Z store: ", "  [host mem] ",
+                            "  Zeta output: ", "  Ladder W(z) ")):
+            self.emit(text)
+            return
+        # Every box plan carries a durable policy and accepted-rule receipt,
+        # including ordinary shared-pole runs with debug disabled.
+        if text.startswith(("Sigma quadrature receipt: ", "Response quadrature: ",
+                            "Sigma checkpoint: ", "Shared-pole constructor: ",
+                            "Shared-pole sector constructor: ", "  route ",
+                            "  WARNING: route ")):
+            self.progress(text)
+            return
+        # Fixed-SC quadrature identity is a physics invariant, not backend
+        # chatter: retain its compact receipt so every map's exact node set
+        # and zero-rebuild claim remain auditable after live stdout is gone.
+        if text.startswith(("  SC fixed quadrature: ",
+                            "    SC fixed quadrature recompute: ",
+                            "    SC fixed window: ")):
+            self.progress(text)
+            return
+        # The long-loop cadence is part of the scientific run record, not
+        # component chatter.  LoopProgress owns these three stable shapes.
+        if (text.startswith("Started ") or text.startswith("Finished ")
+                or (text.startswith("[ ") and " | " in text
+                    and " / " in text)):
+            self.progress(text)
+            return
+        if self.debug:
+            self.stdout(text, **kwargs)
+            return
+        upper = text.upper()
+        if any(word in upper for word in _WARNING_WORDS):
+            self._retain_warning(text)
+
+    def _retain_warning(self, text: str) -> None:
+        """Retain one normalized warning for the final consolidated block."""
+        cleaned = " ".join(str(text).split())
+        if cleaned and cleaned not in self._warnings:
+            self._warnings.append(cleaned)
+
+    def heading(self, title: str) -> None:
+        self.emit()
+        self.emit(title.upper())
+        self.emit("-" * len(title))
+
+    def progress(self, line: str) -> None:
+        """Write one deliberately selected rank-zero progress line."""
+        self.emit(line)
+
+    def layout_dials(
+            self, *, config, n_mu: int, n_q_irr: int, processes: int) -> None:
+        """Record resolved layout/memory dials before allocating dense data."""
+        for line in layout_dial_record_lines(
+                config=config, n_mu=n_mu, n_q_irr=n_q_irr,
+                processes=processes):
+            self.progress(line)
+
+    def begin(self, *, input_file: str, config) -> None:
+        self.emit("=" * 78)
+        self.emit("LORRAX GW CALCULATION")
+        self.emit("=" * 78)
+        self.emit(f"Input          : {abs_path(input_file)}")
+        self.emit(f"Method         : {config.compute_mode.value} / "
+                  f"{config.qp_solver.value}")
+
+    def architecture(self) -> None:
+        self.heading("Processor architecture")
+        for line in architecture_lines(
+                self.runtime, mesh_role="centroid axes X x Y"):
+            self.emit(line)
+
+    def method(self, *, config) -> None:
+        """Dense statement of the physical approximations that actually run."""
+        mode = config.compute_mode.value
+        solver = config.qp_solver.value
+        mode_text = {
+            "x_only": "bare exchange",
+            "cohsex": "static screened exchange + Coulomb hole",
+            "gn_ppm": "Godby-Needs plasmon-pole GW",
+            "hl_ppm": "Hybertsen-Louie plasmon-pole GW",
+            "mpa": "multipole-approximation GW",
+        }.get(mode, mode)
+        solver_text = qp_solver_semantics(solver).description
+        screening = getattr(config, "screening", None)
+        diagrams = getattr(getattr(screening, "diagrams", None), "value", "-")
+        diagram_text = {
+            "w_rpa": "RPA Dyson series",
+            "w_bse": "electron-hole ladder series",
+        }.get(diagrams, diagrams)
+        head = getattr(config, "head", None)
+        head_mode = getattr(getattr(head, "correction", None), "value", "-")
+        head_source = getattr(head, "wcoul0_source", "-")
+        dim = int(getattr(config, "sys_dim", 3))
+        geometry = {3: "3D bulk", 2: "2D slab", 1: "1D wire",
+                    0: "0D isolated"}.get(dim, f"{dim}D")
+
+        self.heading("Method and physical pathways")
+        self.emit(f"Self-energy    : {mode_text}; {solver_text}")
+        self.emit(
+            f"QP consistency  : {solver} | other options: one_shot_dft "
+            "(Sigma at E_DFT), self_consistent (rebuild G/W/Sigma)")
+        self.emit(f"Screening      : {diagram_text}; "
+                  f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
+        self.emit(f"Long wavelength: head={head_mode}; source={head_source}")
+        self.emit(f"Coulomb system : {geometry}; Hartree=live G-space")
+        self.emit("Spin channels  : " + (
+            "charge + transverse current (bispinor)"
+            if bool(getattr(config, "bispinor", False)) else "charge (scalar)"))
+        if solver == "self_consistent":
+            self.emit("Degenerate sets: full SC operators retained; "
+                      "no diagonal averaging in the iteration map")
+        else:
+            self.emit("Degenerate sets: " + (
+                "left in the input gauge" if bool(getattr(
+                    config, "no_degen_averaging", False))
+                else "reporting diagonals averaged at "
+                f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
+        self.emit("ISDF state     : " + (
+            "restart requested" if bool(getattr(config, "restart", False))
+            else "fresh fit requested"))
+
+    def environment(self, *, config, wfn) -> None:
+        f = self.runtime.facts
+        backend = str(f.get("backend", "unknown")).lower()
+        platform = f.get("ffi_platform", backend)       # the device vendor's FFI key
+        self.heading("Numerical environment")
+        for line in numerical_environment_lines(self.runtime):
+            self.emit(line)
+        self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
+        self.emit(f"Dense linalg   : {config.backend.linalg} layout")
+
+        # Report only controls with a caller in this calculation.  The
+        # k-convolutions (Σ, ζ fit, ladder-W) have no dial: the router picks
+        # nvidia-mathdx on CUDA, the host plan route on cpu and the XLA backend
+        # elsewhere, and announces
+        # that choice at startup.
+        relevant = {"LORRAX_BANDS_GEMM_FFI"}
+        descriptions = {
+            "LORRAX_BANDS_GEMM_FFI": "right-GEMM contraction forming G(tau)",
+        }
+        for dial in f.get("ffi_dials", ()):
+            name = str(dial.get("env", ""))
+            if name not in relevant:
+                continue
+            supported_here = platform in tuple(dial.get("platforms", ()))
+            if not supported_here:
+                state = "NATIVE"
+                implementation = str(dial.get("off_label") or "JAX/XLA lowering")
+            elif dial.get("enabled"):
+                state = "ON"
+                implementation = str(dial.get("target") or "platform FFI kernel")
+            else:
+                state = "OFF"
+                implementation = str(dial.get("off_label") or "default lowering")
+            self.emit(f"{name:<26} = {state:<6} : "
+                      f"{descriptions[name]} ({implementation})")
+        # The k-convolution router has no dial: it answers by device vendor,
+        # so the report names the engine it picks.
+        kconv = {"CUDA": "nvidia-mathdx fused cuFFTDx kernels",
+                 "cpu": "FFTW3-ABI host plan route"}.get(platform, "XLA, jnp.fft k-axis transforms")
+        self.emit(f"{'k-convolution router':<26} = {platform:<6} : "
+                  f"k-axis convolutions of the zeta fit and Sigma ({kconv})")
+
+    def sampling(self, *, wfn, sym, centroids=None) -> None:
+        self.heading("Crystal symmetry and Brillouin-zone sampling")
+        for line in symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS):
+            self.emit(line)
+        if centroids is not None:
+            self.emit(centroid_orbit_line(centroids))
+
+    def trs_pathways(self, *, config, sym, material_class="insulator") -> None:
+        """Record the automatic TRS-dependent branch taken by this run."""
+        allowed = bool(sym.trs_allowed)
+        self.emit(
+            "TRS pathways   : automatic from SymMaps.trs_allowed="
+            f"{str(allowed).lower()}; no input override")
+        mode = config.compute_mode.value
+        if mode == "mpa":
+            from .mpa.model import chi0_orientation_route
+
+            self.emit(
+                "MPA chi0 route : "
+                + chi0_orientation_route(
+                    material_class, trs_allowed=allowed))
+        elif mode == "gn_ppm":
+            route = (
+                "ordered orientations with the TR-odd channel"
+                if not allowed else "incumbent symmetric completion")
+            self.emit(f"GN probe route  : {route}; dedicated probe pass")
+        elif mode == "hl_ppm":
+            self.emit(
+                "HL probe route  : incumbent real-axis completion"
+                + ("; measured-broken-TR limitation retained"
+                   if not allowed else ""))
+
+    def bands(self, *, config, wfn, band_slices, zeta_ranges) -> None:
+        b = band_slices
+        n_e = float(getattr(wfn, "num_electrons", np.nan))
+        self.heading("Band spaces and energy coverage")
+        self.emit(f"Electrons      : {n_e:.5f}; occupied-band boundary = {b.b2}")
+        self.emit(f"Occupied bands : {band_range(b.b0, b.b2)}")
+        self.emit(f"QP valence     : {band_range(b.b1, b.b2)}")
+        self.emit(f"QP conduction  : {band_range(b.b2, b.b3)}")
+        self.emit(f"QP matrix      : {band_range(b.b0, b.b3)}")
+        # ``b4_logical`` is the physical loaded top (tagged_arrays.py); a
+        # band-slices object without it (older producers, test stubs) means
+        # no mesh padding, so the padded top is the logical top.
+        b4_logical = int(getattr(b, "b4_logical", b.b4))
+        logical_chi = min(int(b.b4_chi), b4_logical)
+        logical_sigma = min(int(b.b4_sigma), b4_logical)
+        self.emit(f"chi0/W sum     : {band_range(b.b0, logical_chi)}")
+        self.emit(f"Sigma sum      : {band_range(b.b0, logical_sigma)}")
+        self.emit(f"Loaded ISDF psi: {band_range(b.b0, b4_logical)}")
+        if int(b.b4) != b4_logical:
+            self.emit(
+                f"Band carrier    : {band_range(b.b0, b.b4)} "
+                f"({int(b.b4) - b4_logical} zero-pad rows)")
+        self.emit(f"zeta fit       : left {band_range(*zeta_ranges[0])}; "
+                  f"right {band_range(*zeta_ranges[1])}")
+
+    def sigma_coverage(self, *, config, band_slices, enk_dft_ry,
+                       sigma_result) -> None:
+        """Report the dynamic grid against Sigma's resolved energy origin.
+
+        The result owns this origin: for a metal it is the fixed-N chemical
+        potential of the accepted map, while for an insulator it is the
+        configured VBM or midgap.  Reconstructing it from ``wfn.efermi``
+        would silently misreport every non-midgap calculation.
+        """
+        if not config.compute_mode.is_dynamic:
+            return
+        b = band_slices
+        # The sampled grid the result was built on (grown past the requested
+        # edges, or derived from the bands when they are unset).
+        _grid = sigma_result.omega_grid_ev
+        grid_lo, grid_hi = ((float(_grid[0]), float(_grid[-1])) if _grid is not None
+                            else sigma_requested_edges_ev(config.sigma))
+        ef_ev = float(sigma_result.efermi_dft_ev)
+        provenance = (getattr(sigma_result, "omega_reference_provenance", None)
+                      or config.sigma.fermi_reference)
+        energies = np.asarray(enk_dft_ry, dtype=np.float64) * RYD_TO_EV
+        rel = energies - ef_ev
+        lv0, lv1 = b.b1 - b.b0, b.b2 - b.b0
+        lc0, lc1 = b.b2 - b.b0, b.b3 - b.b0
+
+        def span(i0, i1):
+            if i1 <= i0:
+                return None
+            values = rel[:, i0:i1]
+            return float(np.min(values)), float(np.max(values))
+
+        val_span, cond_span = span(lv0, lv1), span(lc0, lc1)
+        target = [v for pair in (val_span, cond_span) if pair is not None
+                  for v in pair]
+
+        self.heading("Dynamic Sigma energy coverage")
+        self.emit(f"Energy origin   : E_F = {ef_ev:+.5f} eV ({provenance})")
+        omega_grid = np.asarray(
+            () if _grid is None else _grid, dtype=np.float64)
+        grid_note = (f"; step={float(config.sigma.omega_step_ev):.5f} eV; "
+                     f"{int(omega_grid.size)} points")
+        if sigma_result.sigma_c_on_shell is not None:
+            # On shell the grid is only the covered range; Sigma was not
+            # sampled on its points (docs/theory/sigma-on-shell.md).
+            grid_note += "; on shell: covered range only"
+        self.emit(f"Sigma omega    : [{grid_lo:+.5f}, {grid_hi:+.5f}] eV "
+                  f"relative to E_F{grid_note}")
+        if val_span is not None:
+            self.emit(f"DFT QP valence : [{val_span[0]:+.5f}, "
+                      f"{val_span[1]:+.5f}] eV relative to E_F")
+        if cond_span is not None:
+            self.emit(f"DFT QP conduct.: [{cond_span[0]:+.5f}, "
+                      f"{cond_span[1]:+.5f}] eV relative to E_F")
+        if target:
+            target_lo, target_hi = min(target), max(target)
+            lower_margin = target_lo - grid_lo
+            upper_margin = grid_hi - target_hi
+            if lower_margin >= 0.0 and upper_margin >= 0.0:
+                self.emit("Coverage status : COMPLETE")
+                self.emit(f"Grid margins    : {lower_margin:.5f} eV below; "
+                          f"{upper_margin:.5f} eV above requested DFT output bands")
+            else:
+                self.emit("Coverage status : INCOMPLETE")
+                shortfalls = []
+                if lower_margin < 0.0:
+                    shortfalls.append(f"{-lower_margin:.5f} eV below")
+                if upper_margin < 0.0:
+                    shortfalls.append(f"{-upper_margin:.5f} eV above")
+                self.emit("Grid shortfall  : " + "; ".join(shortfalls)
+                          + " requested DFT output bands")
+                coverage = getattr(sigma_result, "omega_coverage", None)
+                policy_name = str(getattr(coverage, "policy", "unknown"))
+                affected = ""
+                if coverage is not None:
+                    mask = np.asarray(getattr(coverage, "mask_kn", ()))
+                    default_uncovered = (int(np.count_nonzero(~mask.astype(
+                        bool))) if mask.size else 0)
+                    n_uncovered = int(getattr(
+                        coverage, "n_uncovered", default_uncovered))
+                    if mask.size:
+                        affected = (f"; Sigma(E_DFT) has {n_uncovered}/"
+                                    f"{mask.size} out-of-grid cells")
+                named = "; ".join(getattr(coverage, "uncovered_bands", ()))
+                self._retain_warning(
+                    "WARNING: dynamic Sigma grid is incomplete for requested "
+                    "DFT output bands (" + "; ".join(shortfalls) + f"){affected}; "
+                    f"out-of-range policy={policy_name}: those states use "
+                    "Sigma(omega=0)" + (f" ({named})" if named else "")
+                    + ". Widen sigma_omega_min_ev / sigma_omega_max_ev or add a "
+                    "sigma_omega_patches_ev window to sample them.")
+
+        state = "ON" if config.sigma.band_extrapolation else "OFF"
+        estimator = (getattr(
+            sigma_result, "band_extrapolation_estimator", None)
+            or config.sigma.band_extrapolation_estimator)
+        scheme = (getattr(sigma_result, "band_extrapolation_scheme", None)
+                  or config.sigma.band_extrapolation_bracket_scheme)
+        self.emit(f"Band tail      : {state} | estimator={estimator} | "
+                  f"brackets={scheme}")
+        counts = getattr(sigma_result, "band_extrapolation_counts", None)
+        if counts:
+            self.emit("Tail calculations: " + " / ".join(
+                f"N{i}={int(value)}" for i, value in enumerate(counts, start=1))
+                + " cumulative bands")
+        if getattr(sigma_result, "sigma_c_at_dft_diag_unextrap_ev",
+                   None) is not None:
+            from file_io.sigma_output import RAW_SIGMA_NOTE
+            self.emit("Raw Sigma_c    : sigC_raw, eqp0_raw, eqp1_raw "
+                      "columns in sigma_diag.dat")
+            self.emit("                 " + RAW_SIGMA_NOTE)
+
+    def quadrature(self) -> None:
+        """Every quadrature rule the run used: screening chi0, then Sigma."""
+        rules = quadrature_log.chi_rules()
+        geometry, plans = quadrature_log.sigma_plan()
+        if not rules and geometry is None:
+            return
+        self.heading("Quadrature windows")
+        if rules:
+            self.emit("Screening chi0 rules (energies in Ry)")
+            self.emit(f"  {'rule':<7} {'where':<34} {'nodes':>7}  "
+                      f"{'max err':>9}  source")
+            for row in rules:
+                self.emit("  " + _chi_rule_line(row))
+        if geometry is not None:
+            for line in _sigma_rule_lines(geometry, plans):
+                self.emit(line)
+
+    def files(self, rows: Iterable[tuple[str, str, str]]) -> None:
+        self.heading("Output files and inputs")
+        for line in file_table_lines(rows, omit_paths=(self.path,)):
+            self.emit(line)
+
+    def qp_gap(self, *, band_slices, e_dft_ry, e_qp_ry) -> None:
+        """Summarize the fundamental gap without duplicating EQP tables."""
+        b = band_slices
+        dft = np.asarray(e_dft_ry, dtype=np.float64) * RYD_TO_EV
+        qp = np.asarray(e_qp_ry, dtype=np.float64) * RYD_TO_EV
+        iv = int(b.b2 - b.b0 - 1)
+        ic = int(b.b2 - b.b0)
+        self.heading("Fundamental gap")
+        if (dft.ndim != 2 or qp.ndim != 2 or dft.shape != qp.shape
+                or iv < 0 or ic >= dft.shape[1]):
+            self.emit("Gap            : unavailable (no complete protected "
+                      "valence/conduction pair in the QP result)")
+            return
+        dft_gap = float(np.min(dft[:, ic]) - np.max(dft[:, iv]))
+        qp_gap = float(np.min(qp[:, ic]) - np.max(qp[:, iv]))
+        if not np.isfinite(dft_gap) or not np.isfinite(qp_gap):
+            self.emit("Gap            : unavailable (non-finite band edge)")
+            return
+        state = "insulating" if qp_gap > 0.0 else "metallic/overlapping"
+        self.emit(f"DFT gap        : {dft_gap:.5f} eV")
+        self.emit(f"Full-matrix effective-H gap: {qp_gap:.5f} eV ({state})")
+        self.emit(f"Gap correction : {qp_gap - dft_gap:+.5f} eV relative to DFT")
+        self.emit("State energies  : written to the EQP files listed below")
+
+    def timings(self, records, *, wall: float) -> None:
+        """Print accumulated, non-overlapping major scientific stages.
+
+        ``gw_jax.isdf`` and ``gw_jax.screening`` are inclusive parent timers.
+        Their named child rows are therefore subtracted from a residual setup
+        row instead of being added beside the parent.  This keeps the report's
+        invariant explicit: every displayed stage contributes to the wall
+        exactly once, while retaining the zeta/V and chi0/W distinctions that
+        operators use to diagnose scaling. Printed once: a refusal raised after
+        the completed run's table (the artifact gate) does not repeat it.
+        """
+        if self._timings_emitted:
+            return
+        self._timings_emitted = True
+        rows = list(records)
+
+        def total(predicate):
+            chosen = [row for row in rows if predicate(row)]
+            return _Band(sum(float(row["inclusive"]) for row in chosen),
+                         plus=[tuple(row.get("path", (row["name"],))) for row in chosen])
+
+        def top_level(*names):
+            wanted = set(names)
+            return total(lambda r: r["name"] in wanted
+                         and tuple(r.get("path", (r["name"],)))
+                         == (r["name"],))
+
+        def outer_prefixed(prefix, *, within=None, excluding=()):
+            def selected(row):
+                path = tuple(row.get("path", (row["name"],)))
+                if not row["name"].startswith(prefix):
+                    return False
+                if within is not None and (not path or path[0] != within):
+                    return False
+                if any(str(parent).startswith(excluding) for parent in path[:-1]):
+                    return False
+                return not any(str(parent).startswith(prefix)
+                               for parent in path[:-1])
+            return total(selected)
+
+        def partition(parent, prefixes, label):
+            """Replace an inclusive band by disjoint descendants and residuals."""
+            parents = [r for r in rows if r["name"] == parent]
+            result = []
+            for owner in parents:
+                path = tuple(owner.get("path", (parent,)))
+                selected = {tuple(r["path"]): r for r in rows
+                            if tuple(r.get("path", ()))[:len(path)] == path
+                            and len(r.get("path", ())) > len(path)
+                            and r["name"].startswith(prefixes)}
+
+                def visit(key, row, title):
+                    children = [p for p in selected if p[:len(key)] == key
+                                and len(p) > len(key)
+                                and not any(q != p and len(q) > len(key)
+                                            and p[:len(q)] == q for q in selected)]
+                    for child in children:
+                        name = selected[child]["name"].split(".", 1)[1]
+                        visit(child, selected[child], label + " " + name)
+                    residual = float(row["inclusive"]) - sum(
+                        float(selected[p]["inclusive"]) for p in children)
+                    result.append((title + (" other" if children else ""),
+                                   _Band(residual, plus=(key,), minus=children).floor()))
+
+                visit(path, owner, label)
+            # A name may occur under the first-call probe and ordinary sweep.
+            totals = {}
+            for name, band in result:
+                totals[name] = totals.get(name, 0.0) + band
+            return list(totals.items())
+
+        isdf_total = top_level("gw_jax.isdf")
+        zeta = total(lambda r: r["name"] == "gw_jax.zeta_fit_chunked"
+                     and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
+        zeta_transverse = outer_prefixed(
+            "gw_jax.zeta_fit_transverse", within="gw_jax.isdf")
+        # The bispinor's CC and TT tiles (V_q_compute_cc / _tt) are V(q) too.
+        v_q = outer_prefixed("gw_jax.V_q_compute", within="gw_jax.isdf")
+        restart_load = total(
+            lambda r: r["name"] == "gw_jax.restart_load"
+            and tuple(r.get("path", ()))[:1] == ("gw_jax.isdf",))
+        isdf_support = (
+            isdf_total - zeta - zeta_transverse - v_q - restart_load).floor()
+
+        screening_total = top_level("gw_jax.screening")
+        # A shared-pole bank may call chi/W owners internally. Its inclusive
+        # band already owns those seconds; do not print them a second time.
+        chi0 = outer_prefixed("chi.", within="gw_jax.screening", excluding=("spole.",))
+        w_screen = outer_prefixed("W.", within="gw_jax.screening", excluding=("spole.",))
+        spole_rows = [r for r in rows if r["name"].startswith("spole.")
+                      and tuple(r.get("path", ()))[:1] == ("gw_jax.screening",)
+                      and not any(str(p).startswith("spole.")
+                                  for p in r.get("path", ())[:-1])]
+        # Preserve the constructor census names and their execution order.
+        # Waits name the NEXT consumer; they drain PREVIOUS asynchronous work.
+        screening_details = []
+        for name in dict.fromkeys(r["name"] for r in spole_rows):
+            label = name.removeprefix("spole.")
+            if label.startswith("device_wait."):
+                label = "wait before " + label.removeprefix("device_wait.")
+            elif label.startswith("rank_wait."):
+                continue  # all process alignment is one disjoint row below
+            elif label == "passivity_held":
+                label = "passivity + held (fused)"
+            if name == "spole.bank" and any(r["name"].startswith("bank.") for r in rows):
+                screening_details.extend(partition("spole.bank", ("bank.",), "bank"))
+                continue
+            screening_details.append(("spole " + label,
+                total(lambda r: r in spole_rows and r["name"] == name)))
+        screening_details.append(("spole rank synchronization",
+            total(lambda r: r in spole_rows and r["name"].startswith("spole.rank_wait."))))
+        screening_support = (screening_total - chi0 - w_screen
+                             - sum(value for _, value in screening_details)).floor()
+
+        # The dynamic-Sigma executor opens ``sigma.rule_plan`` (box-rule
+        # building, reused within the run by box and tolerance) and ``sigma.tau_sweep`` (the
+        # tau contraction) under gw_jax.sigma or, in a self-consistent run,
+        # under gw_jax.sc_driver. Shared finalization and the fenced setup
+        # phases below are disjoint from the plan and sweep.
+        sigma_total = top_level("gw_jax.sigma", "gw_jax.sc_driver")
+        # An SC map's W and its Sigma rule refit (nested in the plan) are
+        # their own rows, so an SC table sums to the wall with named stages.
+        sc_w_response = outer_prefixed("sc.w_response")
+        sigma_refit = outer_prefixed("sigma.rule_refit")
+        sigma_plan = outer_prefixed("sigma.rule_plan") - sigma_refit
+        sigma_sweep = outer_prefixed("sigma.tau_sweep")
+        sigma_details = [
+            ("Sigma pending inputs", outer_prefixed("sigma.input_wait")
+             + outer_prefixed("sigma.finalize_input_wait")),
+            ("Sigma exchange", outer_prefixed("sigma.exchange")),
+            ("Sigma Hartree", outer_prefixed("sigma.hartree")),
+            ("Sigma model validation", outer_prefixed("sigma.model_validate")),
+            ("Sigma capacity", outer_prefixed("sigma.capacity")),
+            ("Sigma branches", outer_prefixed("sigma.branches")),
+            ("Sigma census", outer_prefixed("sigma.census")),
+            ("Sigma finalize + writes", outer_prefixed("gw_jax.dynamic_sigma_finalize")),
+        ]
+        sigma_other = (sigma_total - sc_w_response - sigma_refit
+                       - sigma_plan - sigma_sweep
+                       - sum(value for _, value in sigma_details)).floor()
+
+        stages = [
+            ("runtime bring-up", total(lambda r: r["name"].startswith(
+                "gw_jax.runtime_stack."))),
+            ("pre-main + imports", top_level("gw_jax.imports")),
+            ("input + run setup", top_level("gw_jax.startup")),
+            ("zeta", zeta),
+            ("zeta transverse", zeta_transverse),
+            ("V(q)", v_q),
+            ("restart load", restart_load),
+            ("ISDF setup + I/O", isdf_support),
+            ("minimax quadrature", top_level("gw_jax.minimax_quadrature")),
+            ("chi0", chi0),
+            ("W", w_screen),
+            *screening_details,
+            ("spole other" if spole_rows else "screening support", screening_support),
+            ("W persist + q0 head", top_level(
+                "gw_jax.persist_w0", "gw_jax.static_head")),
+            ("SC W response", sc_w_response),
+            ("Sigma rule plan", sigma_plan),
+            ("SC Sigma rule refit", sigma_refit),
+            *(partition("sigma.tau_sweep", ("tau.",), "Sigma tau")
+              if any(r["name"].startswith("tau.") for r in rows)
+              else [("Sigma tau sweep", sigma_sweep)]),
+            *sigma_details,
+            ("Sigma other", sigma_other),
+            ("mean-field load", top_level("gw_jax.kin_ion_load")),
+            ("QP solve + diagonalize", top_level(
+                "gw_jax.solve_qp", "gw_jax.qp_eigh")),
+            ("result writes", top_level("gw_jax.output")),
+        ]
+        # A stage absent in a mode should not occupy a zero-valued report row.
+        # Use the table's two-decimal display threshold so a floating-point
+        # subtraction residual cannot survive the filter as ``0.00 s``.
+        stages = [(name, band) for name, band in stages
+                  if float(band) >= 0.005]
+        accounted = sum(float(band) for _name, band in stages)
+        stages.append(("other driver work", _Band(
+            max(float(wall) - accounted, 0.0),
+            plus=[tuple(r.get("path", (r["name"],))) for r in rows
+                  if len(r.get("path", (r["name"],))) == 1],
+            minus=[p for _name, band in stages for p in band.plus])))
+        self.heading("Major-stage timing")
+        detailed = any(r["name"].startswith(("bank.", "tau.")) for r in rows)
+        width = max(22, max((len(name) for name, _ in stages), default=22)) if detailed else 22
+        self.emit(f"  {'stage':<{width}}   wall (s)     fraction")
+        for name, band in stages:
+            seconds = float(band)
+            self.emit(f"  {name:<{width}} {seconds:10.2f}  "
+                      f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
+        self.emit(f"  {'total run':<{width}} {wall:10.2f}  {100.0:9.2f}%")
+        # The "runtime bring-up" row is the sum of these phases; state the
+        # split so a slow bring-up names its phase (Frontier Fe V2 runs ending
+        # 2026-10-15 20:33-21:06 UTC: 11 of 13 took 21-74 s, against 6.9-10.1 s
+        # for 39 of 40 runs outside that window; three lanes, two nodes, and
+        # no phase recorded anywhere).
+        phases = [(str(r["name"])[len("gw_jax.runtime_stack."):], float(r["inclusive"]))
+                  for r in rows if str(r["name"]).startswith("gw_jax.runtime_stack.")]
+        if phases:
+            self.emit("  runtime bring-up (rank 0) = " + " + ".join(
+                f"{phase} {seconds:.2f}" for phase, seconds in phases) + " s")
+        if any(r["name"].startswith(("bank.", "tau.")) for r in rows):
+            self.emit("  bank real_time/laplace = incumbent G/FFT correlation plus bank coefficient carry;")
+            self.emit("  these fused clocks are not FFT-only or evidence of a bandwidth limit.")
+            self.emit("  Sigma tau other is the window executables: W(tau) synthesis, G/W convolution,")
+            self.emit("  projection and frequency fold in one program. No pure-GEMM or pure-FFT wall is inferred.")
+            self.emit("  device_wait drains preceding work; rank_wait measures process alignment.")
+        from common.timing import stage_sync
+        self.emit("  stage walls: " + ("device-attributed (LORRAX_STAGE_SYNC=1: every stage waits for its device work)."
+                                      if stage_sync() else
+                                      "host-attributed (no timing-only device waits; device work lands in the first "
+                                      "later stage that reads it; LORRAX_STAGE_SYNC=1 attributes it)."))
+        if spole_rows:
+            self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
+            self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")
+            self.emit("  share one compiled call; their fused wall is not split into invented timings.")
+        self._stage_memory(rows, stages, width=width, wall=wall)
+        self._routes()
+
+    def _routes(self) -> None:
+        """Every memory-driven route the run took and why (``common.gpu_utils.routes``)."""
+        from common.gpu_utils import routes
+        taken = routes()
+        if not taken:
+            return
+        self.heading("Routes")
+        for row in taken:
+            self.emit(f"  {row['line']}" + (f" [x{row['count']}]" if row["count"] > 1 else ""))
+
+    def _stage_memory(self, rows, stages, *, width, wall) -> None:
+        """The device peak of every major stage against its planner's price, and its host peak.
+
+        A row's peak is the pool high-water mark over the timing nodes it owns
+        (``common.timing``; max and min over ranks).  A planner's price
+        (``common.gpu_utils.record_stage_price``) is judged against the own peak
+        of the section it names: an enclosing one, else the one sharing the
+        longest path with the call, else the section open at the call.
+
+        The host columns are the process resident high-water mark (``ru_maxrss``,
+        which never falls) at the row's last exit and the rise the row's own
+        intervals caused, each the max over ranks.  No planner prices the host.
+        """
+        from common import timing
+        from common.gpu_utils import stage_prices
+        from runtime.xla_memory import pool_high_water_source
+        paths = [tuple(r.get("path", (r["name"],))) for r in rows]
+        selfs = [_rank_peaks(r, "peak_self") for r in rows]
+        hosts = [_rank_peaks(r, "host") for r in rows]
+        rises = [_rank_peaks(r, "host_rise") for r in rows]
+        if not any(np.any(np.isfinite(v)) for v in selfs + hosts):
+            return
+        n_ranks = max(len(v) for v in selfs + hosts)
+        pad = lambda v: v if len(v) == n_ranks else np.full(n_ranks, np.nan)
+
+        def row_peak(band):
+            """Every rank's peak over the nodes the row owns, and the node that set it."""
+            owned = [(p, pad(v)) for p, v in zip(paths, selfs) if band.owns(p)]
+            owned = [(p, v) for p, v in owned if np.any(np.isfinite(v))]
+            if not owned:
+                return None, ()
+            stack = np.asarray([v for _, v in owned])
+            peak = np.asarray([np.nanmax(col) if np.any(np.isfinite(col)) else np.nan
+                               for col in stack.T])
+            return peak, owned[int(np.nanargmax(np.nanmax(stack, axis=1)))][0]
+
+        def row_host(band):
+            """Max over ranks of the row's host mark and of the rise it caused (GB)."""
+            mine = [i for i, p in enumerate(paths)
+                    if band.owns(p) and np.any(np.isfinite(hosts[i]))]
+            if not mine:
+                return f"{'–':>7}  {'–':>6}"
+            mark = np.nanmax([np.nanmax(hosts[i]) for i in mine])
+            rise = np.nanmax(np.nansum([pad(rises[i]) for i in mine], axis=0))
+            return f"{mark / 1e9:7.2f}  {rise / 1e9:+6.2f}"
+
+        priced = {}      # (stage, section path) -> the largest price, and the peak
+        for price in stage_prices():
+            call = tuple(price["path"])
+            # The named section: an enclosing one first, else the one sharing the
+            # longest path with the call, else the section open at the call.
+            candidates = [(call[:len(p)] == p, len(os.path.commonprefix([p, call])), -i, i)
+                          for i, p in enumerate(paths) if p and p[-1] == price["section"]]
+            candidates = candidates or [(True, len(p), -i, i)
+                                        for i, p in enumerate(paths) if p == call]
+            if not candidates:
+                continue
+            node = max(candidates)[3]
+            key = (price["stage"], paths[node])
+            if key not in priced or price["bytes"] > priced[key][0]["bytes"]:
+                priced[key] = (price, paths[node], _rank_peaks(rows[node], "peak"))
+        priced = list(priced.values())
+        self.heading("Major-stage device and host memory")
+        from common import gpu_utils
+        budget = gpu_utils._RUN_DEVICE_BUDGET_GB
+        run_peak = max((np.nanmax(v) for v in selfs if np.any(np.isfinite(v))), default=0.0)
+        self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
+                  f"rank(s); γ = peak / planner price")
+        host_run = [pad(v) for v in hosts if np.any(np.isfinite(v))]
+        if host_run:
+            host_run = np.nanmax(np.asarray(host_run), axis=0)
+            self.emit(f"  host = resident high-water (ru_maxrss) per rank at the stage's last "
+                      f"exit, max over ranks; rise = what the stage added to it; unpriced")
+            self.emit(f"  host run peak {_gb_pair(host_run, 0)} GB (max / min over ranks)")
+        holds = gpu_utils.host_holds()
+        if holds:
+            self.emit("  held on the host across stages, per rank: " + "; ".join(
+                f"{name} {nbytes / 1e9:.2f} GB" for name, nbytes in holds.items()))
+        if budget:
+            self.emit(f"  budget memory_per_device_gb = {budget:.2f} GB; run peak "
+                      f"{run_peak / 1e9:.2f} GB ({'within' if run_peak <= budget * 1e9 else 'OVER'})")
+        self.emit(f"  {'stage':<{width}}  peak GB max / min   price GB           γ  "
+                  f"host GB    rise  set by")
+        for name, band in stages:
+            peak, setter = row_peak(band)
+            host = row_host(band)
+            if peak is None and "–" in host:
+                continue
+            mine = [pr for pr, node, _ in priced if band.owns(node)]
+            if mine:
+                price = max(pr["bytes"] for pr in mine)
+                gamma = (f"{np.nanmax(peak) / price:10.2f}" if price > 0 and peak is not None
+                         else f"{'–':>10}")
+                tail = f"{price / 1e9:9.2f}  {gamma}"
+            else:
+                tail = f"{'–':>9}  no planner"
+            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}  {host}  "
+                      f"{' > '.join(setter[-2:])}")
+        # Constructor sub-stages with their own pool high-water (TimingNode.peak), so a leg
+        # measures what the reduction, passivity and head prices are calibrated against.
+        for line in _substage_peak_lines(paths, rows):
+            self.emit(line)
+        if priced:
+            self.emit("  planner prices, each against the own peak of the section it names:")
+            for price, node, peak in priced:
+                gamma = (f"{np.nanmax(peak) / price['bytes']:.2f}"
+                         if price["bytes"] > 0 and np.any(np.isfinite(peak)) else "–")
+                self.emit(f"    {price['stage']}: {price['bytes'] / 1e9:.2f} GB; "
+                          f"{' > '.join(node)} peak {_gb_pair(peak, 0)} GB; γ {gamma}")
+        reads, seconds = timing.instrument_cost()
+        self.emit(f"  instrument: {pool_high_water_source() or 'none'}; {reads} boundary "
+                  f"reads on rank 0 took {seconds * 1e3:.1f} ms "
+                  f"({100.0 * seconds / wall if wall else 0.0:.4f}% of the wall)")
+
+    def warnings(self) -> None:
+        if self._warnings_emitted:
+            return
+        self._warnings_emitted = True
+        warnings = self._display_warnings()
+        if warnings:
+            self.heading("Warnings")
+            for warning in warnings:
+                self.emit(f"  {warning}")
+
+    def _display_warnings(self) -> list[str]:
+        """Collapse repeated catalog receipts into one numerical warning."""
+        minimax = [warning for warning in self._warnings
+                   if "minimax: served " in warning and
+                   "UNCERTIFIED" in warning]
+        others = [warning for warning in self._warnings
+                  if warning not in minimax]
+        if not minimax:
+            return others
+
+        def numbers(pattern: str) -> list[float]:
+            values = []
+            for warning in minimax:
+                match = re.search(pattern, warning)
+                if match is not None:
+                    values.append(float(match.group(1)))
+            return values
+
+        targets = numbers(r"\btarget\s+([0-9.eE+-]+)")
+        errors = numbers(r"\bmax_err\s+([0-9.eE+-]+)")
+        nodes = [int(value) for value in
+                 numbers(r"->\s+([0-9]+)\s+nodes")]
+        detail = f"{len(minimax)} catalog entries used"
+        if nodes:
+            node_text = (str(nodes[0]) if min(nodes) == max(nodes) else
+                         f"{min(nodes)}-{max(nodes)}")
+            detail += f" ({node_text} nodes)"
+        if targets:
+            target_text = (f"{targets[0]:.5e}" if min(targets) == max(targets)
+                           else f"{min(targets):.5e}-{max(targets):.5e}")
+            detail += f"; requested tolerance {target_text}"
+        if errors:
+            detail += f"; worst reported error {max(errors):.5e}"
+        return [
+            "Minimax quadrature: " + detail + ". Catalog generator/backend "
+            "provenance is UNCERTIFIED.",
+            *others,
+        ]
+
+    def finish(self, *, status: str = "completed") -> None:
+        self.warnings()
+        self.emit()
+        self.emit(f"LORRAX GW calculation {status}.")
+        self.emit(f"Report written to {self.path}")
+        self.close()
+
+
+__all__ = ["GWProductionReport"]

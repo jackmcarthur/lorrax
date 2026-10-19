@@ -1,0 +1,1437 @@
+"""Two-point GN/HL-PPM fit and its adapter to shared dynamic Sigma.
+
+The PPM-specific work ends after fitting one ``(Omega, B)`` pair for every
+``(q, mu, nu)``.  :func:`compute_sigma_c_ppm_omega_grid` resolves invalid-pole
+policy, writes those fields as a finalized one-pole MPA store, and delegates
+all dynamic windows, box rules, cache use, tau execution and accumulation to
+``gw.mpa.sigma``.  Only the static-COHSEX completion for invalid PPM poles
+remains outside that store because it is frequency independent.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from typing import TYPE_CHECKING, Callable, NamedTuple
+
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+import numpy as np
+
+from common import timing
+from common.units import RYD_TO_EV
+from .gw_config import DynamicSigmaConfig, PPMConfig
+from .minimax_screening import (
+    GN_PPM_EXTREME_TAIL_DIVISOR,
+    fit_gn_ppm_from_wc_pair,
+)
+from .ppm_windows import (
+    branches_for_omega_grid,
+    resolve_sigma_regularization,
+)
+from runtime.padding import PaddedAxis
+
+if TYPE_CHECKING:
+    from .band_extrapolation import BandBracketPlan
+
+
+@dataclass(frozen=True)
+class PPMBuildResult:
+    omega_p: float
+    Wc0_q: jax.Array          # (nq, μ, μ) static W^c(0) = W(0) − V; the data
+                              # seam for the invalid-pole static-COHSEX term
+                              # (ppm_invalid_mode="static_limit", BGW mode 3).
+                              # Identity: Wc0 = −2·B_q/Ω_q elementwise.
+    B_q: jax.Array            # (nq, μ, μ) PPM amplitude: (R_+ + R_-)/2
+    Omega_q: jax.Array        # (nq, μ, μ) PPM pole frequency
+    valid_mask_q: jax.Array   # (nq, μ, μ)
+    unfulfilled_fraction: float
+    n_nodes_static: int
+    #: The odd residue D = (R_+ - R_-)/2 of the ordered-orientation fit on a
+    #: measured-broken-TR deck.  Conduction branches consume R_+ = B + D;
+    #: valence branches consume R_- = B - D.  ``None`` is the incumbent
+    #: single-residue model.
+    B_odd_q: jax.Array | None = None
+    probe_hermiticity_residual: float | None = None
+    odd_even_residue_ratio: float | None = None
+    #: The q wedge the fields live on (a ``symmetry_maps.QirrOperator``
+    #: carrying the tables, no values), or ``None``: the full zone (HL, an
+    #: unreduced grid).  Every Sigma consumer unfolds them on load.
+    q_wedge: object = None
+
+
+def _residue_for_space(space: str, B_q, B_odd_q=None):
+    """The pole residue one Σ branch evolves: ``R_+`` (cond) or ``R_-`` (val).
+
+    ``Σ_c(E) = Σ_occ ψψ†⊙R_-/(E−ε+Ω) + Σ_emp ψψ†⊙R_+/(E−ε−Ω)`` — the
+    conduction (empty) A-space carries the +Ω residue, the valence
+    (occupied) A-space the −Ω one (derivation §4, verified against the
+    imaginary-axis contour in ``tests/test_gnppm_ordered_orientations.py``).
+    With ``B_odd_q=None`` both branches get ``B_q`` and nothing about the
+    incumbent path changes, not even the object identity.  A zero-valued
+    ``B_odd_q`` (the explicit broken-TR debug A/B arm) likewise gives
+    ``R_+ = R_- = B_q`` while retaining the odd-channel observability seam.
+    """
+    if space not in ("cond", "val"):
+        raise ValueError(
+            f"_residue_for_space: space must be 'cond' or 'val'; got {space!r}")
+    if B_odd_q is None:
+        return B_q
+    return B_q + B_odd_q if space == "cond" else B_q - B_odd_q
+
+
+@lru_cache(maxsize=16)
+def band_diagonal_slots(mesh_xy, ndim: int):
+    """Band diagonal of a ``P(..., 'x', 'y')`` band-tiled array, kept in place.
+
+    ``(..., nb, nb) -> (..., nb, p_y)`` at the same spec: the tile that owns
+    element ``(n, n)`` writes it into its one slot, every other slot is an
+    exact zero, so the sum over the last axis is the diagonal bit for bit and
+    nothing moves between ranks.  Needs a square processor mesh.
+    """
+    from jax import shard_map
+    if int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
+        raise ValueError("band-diagonal slots need a square processor mesh")
+    spec = P(*((None,) * (ndim - 2)), "x", "y")
+
+    def slots(tile):
+        own = jax.lax.axis_index("x") == jax.lax.axis_index("y")
+        diag = jnp.diagonal(tile, axis1=-2, axis2=-1)
+        return jnp.where(own, diag, jnp.zeros((), tile.dtype))[..., None]
+
+    return shard_map(slots, mesh=mesh_xy, in_specs=spec, out_specs=spec,
+                     check_vma=False)
+
+
+@lru_cache(maxsize=8)
+def _diagonal_of_cube_fn(mesh_xy):
+    return jax.jit(band_diagonal_slots(mesh_xy, 4))
+
+
+@lru_cache(maxsize=8)
+def _diagonal_sum_fn(mesh_xy):
+    return jax.jit(lambda values: jnp.sum(values, axis=-1),
+                   out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@lru_cache(maxsize=8)
+def _diagonal_slots_read_fn(mesh_xy):
+    return jax.jit(lambda values, s, k, n: jnp.sum(values, axis=-1)[s, k, n],
+                   out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@dataclass(frozen=True)
+class BandDiagonalSlots:
+    """The band diagonal of a Sigma(omega) cube without the cube.
+
+    ``values`` is ``(n_omega, nk, nb, p_y)`` at ``P(None, None, 'x', 'y')``
+    (:func:`band_diagonal_slots`).  The readers return what the same reads of
+    the cube return.
+    """
+    values: jax.Array
+    mesh_xy: Mesh
+
+    def logical(self, band_axis=None, *, host=True):
+        """``(n_omega, nk, nb_logical)`` on the host (None with ``host=False``)."""
+        diagonal = _diagonal_sum_fn(self.mesh_xy)(self.values)
+        if not host:
+            return None
+        diagonal = np.asarray(diagonal)
+        if band_axis is not None:
+            from runtime.padding import strip_axis
+            diagonal = np.asarray(strip_axis(diagonal, band_axis, axis=-1))
+        return diagonal
+
+    def at_omega_slots(self, slots_s_kn):
+        """``d[slots[s, k, n], k, n]`` on the host, (n_slot, nk, nb_logical)."""
+        slots = np.asarray(slots_s_kn)
+        k_idx = np.arange(slots.shape[1])[None, :, None]
+        n_idx = np.arange(slots.shape[-1])[None, None, :]
+        return np.asarray(_diagonal_slots_read_fn(self.mesh_xy)(
+            self.values, slots, k_idx, n_idx))
+
+    def block_until_ready(self):
+        self.values.block_until_ready()
+        return self
+
+
+#: The on-shell evaluation tables, in slot order (:func:`on_shell_request`).
+#: ``pair``: E_eval as the QSGW build reads it (``sigma_out_of_grid``);
+#: ``eval0``/``dft0``: E_eval and E_DFT under the eqp readers' rule (an
+#: uncovered state reads Sigma(omega = 0)); ``zero``/``edge`` (the SC
+#: grid-edge census, ``sigma_out_of_grid = static`` only): omega = 0 and the
+#: sampled range's edge nearer each state.  A table equal to an earlier one
+#: is not repeated; :meth:`OnShellRequest.slot` resolves the name.
+ON_SHELL_TABLES = ("pair", "eval0", "dft0", "zero", "edge")
+
+
+@dataclass(frozen=True)
+class OnShellRequest:
+    """Where an on-shell Sigma_c is evaluated: one energy per state and table.
+
+    ``tables_ry`` ``(n_table, nk, nb_logical)`` float64, Ry, measured from the
+    Sigma body's omega reference, full BZ, logical Sigma bands; table 0 is
+    ``pair``.  ``parent_ry`` is the same tables on the parent k rows the sweep
+    evaluates (``centroid_k_unfold.parent_rows``), ``frequencies_ry`` their
+    sorted distinct union, the planner's frequency list, and ``parent_index``
+    each parent entry's position in it.  ``covered_kn`` marks the states whose
+    E_eval lies inside the sampled range ``omega_range_ev``; the derivative
+    slot is read only there (Z = 1 elsewhere, as the grid's clamped probes
+    gave).
+    """
+    tables_ry: np.ndarray
+    names: tuple
+    aliases: dict
+    parent_ry: np.ndarray
+    frequencies_ry: np.ndarray
+    parent_index: np.ndarray
+    covered_kn: np.ndarray
+    omega_range_ev: tuple
+
+    @property
+    def n_table(self) -> int:
+        return int(self.tables_ry.shape[0])
+
+    @property
+    def n_slot(self) -> int:
+        """One value slot per table, then dSigma/domega on ``pair``."""
+        return self.n_table + 1
+
+    def slot(self, name: str) -> int:
+        """The diagonal slot of table ``name`` (``"derivative"``: the last)."""
+        if name == "derivative":
+            return self.n_table
+        return int(self.aliases[name])
+
+    def table_ev(self, name: str) -> np.ndarray:
+        return self.tables_ry[self.slot(name)] * RYD_TO_EV
+
+    def select_k(self, select_rows) -> "OnShellRequest":
+        """The request on the k rows ``select_rows`` keeps (a leading-axis selector).
+
+        The parent-row fields are the sweep's and stay as they are."""
+        tables = np.moveaxis(np.asarray(select_rows(np.moveaxis(self.tables_ry, 1, 0))), 0, 1)
+        return replace(self, tables_ry=tables,
+                       covered_kn=np.asarray(select_rows(np.asarray(self.covered_kn))))
+
+
+def on_shell_request(*, e_eval_rel_ev, e_dft_rel_ev, omega_range_ev, out_of_grid,
+                     irr_idx, n_parent, edge_window_ev=None):
+    """The on-shell tables for one Sigma call (:class:`OnShellRequest`).
+
+    ``e_eval_rel_ev`` / ``e_dft_rel_ev`` ``(nk, nb)``: the energies the QSGW
+    ansatz evaluates Sigma at and the DFT energies, both measured from the
+    Sigma body's omega reference.  ``omega_range_ev`` is the sampled range
+    (``config.omega_grid_ev``: only its extent is read).  The read rules are
+    :func:`gw.qsgw_utils.sigma_eval_omega` for ``pair`` (what H reads) and
+    the eqp readers' Sigma(omega = 0) rule for ``eval0``/``dft0``.
+    ``irr_idx``/``n_parent``: the full-k -> parent map of the sweep's k plan.
+    ``edge_window_ev`` (the SC growth window, ``sigma_out_of_grid = static``):
+    add the ``zero`` and ``edge`` tables of the grid-edge census
+    (``qsgw_utils.sigma_grid_edge_ambiguity``).
+
+    ``GATE on_shell_star_invariant``: the energies must be the same at every
+    k of a star (within 1e-9 Ry), since the wedge Sigma is evaluated at its
+    parent's energies and transported to the star.
+    """
+    from .centroid_k_unfold import parent_rows
+    from .qsgw_utils import omega_coverage, sigma_eval_omega
+    grid = np.asarray(omega_range_ev, dtype=np.float64)
+    e_eval = np.asarray(e_eval_rel_ev, dtype=np.float64)
+    e_dft = np.asarray(e_dft_rel_ev, dtype=np.float64)
+    if e_eval.shape != e_dft.shape or e_eval.ndim != 2:
+        raise ValueError(f"on_shell_request: E_eval {e_eval.shape} and E_DFT "
+                         f"{e_dft.shape} must be one (nk, nb) shape")
+    lo, hi = float(grid[0]), float(grid[-1])
+    if not lo <= 0.0 <= hi:
+        raise ValueError("on_shell_request: omega = 0 must lie in the sampled range "
+                         f"[{lo:.3f}, {hi:.3f}] eV")
+    pair = sigma_eval_omega(grid, e_eval, out_of_grid)[0]
+    covered = omega_coverage(grid, e_eval)[0]
+    candidates = [("pair", pair), ("eval0", np.where(covered, e_eval, 0.0)),
+                  ("dft0", np.where(omega_coverage(grid, e_dft)[0], e_dft, 0.0))]
+    if edge_window_ev is not None:
+        top = (np.abs(e_eval - max(hi, float(edge_window_ev[1])))
+               <= np.abs(e_eval - min(lo, float(edge_window_ev[0]))))
+        candidates += [("zero", np.zeros_like(e_eval)), ("edge", np.where(top, hi, lo))]
+    tables, names, aliases = [], [], {}
+    for name, table in candidates:
+        for i, kept in enumerate(tables):
+            if np.array_equal(kept, table):
+                aliases[name] = i
+                break
+        else:
+            aliases[name] = len(tables)
+            tables.append(table)
+            names.append(name)
+    tables_ry = np.stack(tables) / RYD_TO_EV
+    parent = np.asarray(parent_rows(irr_idx, int(n_parent), tables_ry, axis=1))
+    drift = float(np.max(np.abs(parent[:, np.asarray(irr_idx)] - tables_ry), initial=0.0))
+    if drift > 1.0e-9:
+        raise ValueError(
+            f"GATE on_shell_star_invariant: the on-shell energies differ by {drift:.3e} Ry "
+            "between k points of one star")
+    frequencies, index = np.unique(parent, return_inverse=True)
+    return OnShellRequest(
+        tables_ry=tables_ry, names=tuple(names), aliases=aliases, parent_ry=parent,
+        frequencies_ry=frequencies,
+        parent_index=np.asarray(index, dtype=np.int32).reshape(parent.shape),
+        covered_kn=np.asarray(covered, dtype=bool), omega_range_ev=(lo, hi))
+
+
+def slots_from_diagonal(diag, n_slot_cols):
+    """``(..., nb)`` -> the :func:`band_diagonal_slots` layout ``(..., nb, p_y)``.
+
+    Band ``n`` lives on the tile row block ``n // (nb / p_y)``, whose diagonal
+    tile writes it into column ``n // (nb / p_y)``; every other column is an
+    exact zero.  An elementwise select, so it fuses into its consumer.
+    """
+    nb = int(diag.shape[-1])
+    block = nb // int(n_slot_cols)
+    owner = (jnp.arange(nb)[:, None] // block) == jnp.arange(int(n_slot_cols))[None, :]
+    return jnp.where(owner, diag[..., :, None], jnp.zeros((), diag.dtype))
+
+
+def _diag_matrix(diag):
+    """``(..., nb)`` -> ``(..., nb, nb)`` with ``diag`` on the band diagonal (fused select)."""
+    nb = int(diag.shape[-1])
+    eye = jnp.arange(nb)[:, None] == jnp.arange(nb)[None, :]
+    return jnp.where(eye, diag[..., :, None], jnp.zeros((), diag.dtype))
+
+
+@lru_cache(maxsize=8)
+def _on_shell_head_fn(mesh_xy):
+    """Add a band-diagonal head to an on-shell Sigma: the pair's diagonal and
+    every value slot get the head's value at their table, the derivative slot
+    its derivative.  ``head`` is ``(n_slot, nk, nb_carrier)`` replicated;
+    ``pair_head`` its pair-table row twice."""
+    spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+
+    def add(pair, slots, head, pair_head):
+        slots = slots + slots_from_diagonal(head, slots.shape[-1])
+        return (None if pair is None else pair + _diag_matrix(pair_head)), slots
+    return jax.jit(add, out_shardings=(spec, spec))
+
+
+@dataclass(frozen=True)
+class OnShellSigma:
+    """Sigma_c on shell: the QSGW pair and the eqp readers' diagonals, no omega axis.
+
+    ``pair`` ``(2, nk, nb, nb)`` at ``P(None, None, 'x', 'y')``:
+    ``pair[0, k, m, n] = Sigma_mn(k, omega_km)`` and ``pair[1, k, m, n] =
+    Sigma_mn(k, omega_kn)`` on ``request``'s ``pair`` table; ``None`` for a
+    diagonal-only twin.  ``slots`` ``(n_slot, nk, nb, p_y)`` at the same spec
+    (:func:`band_diagonal_slots` layout): the band diagonal on each table, then
+    dSigma_nn/domega on ``pair``.  Every array is Ry (the derivative is
+    dimensionless) on the full BZ and the padded band carrier.
+    """
+    pair: "jax.Array | None"
+    slots: jax.Array
+    request: OnShellRequest
+    mesh_xy: Mesh
+    #: The ``(n_slot, nk, nb_carrier)`` host diagonals, read once (:meth:`diagonal`).
+    _diagonals: "np.ndarray | None" = dataclasses.field(
+        default=None, init=False, repr=False, compare=False)
+
+    @property
+    def shape(self):
+        """The pair's shape (its slot axis leads)."""
+        return tuple(self.pair.shape) if self.pair is not None else tuple(self.slots.shape)
+
+    @property
+    def dtype(self):
+        return self.slots.dtype
+
+    def diagonal(self, name: str, band_axis=None):
+        """``(nk, nb_logical)`` on the host: table ``name``'s diagonal, or ``"derivative"``.
+
+        Every slot's diagonal is read in one collective the first time any is
+        asked for (every rank enters it) and served from the host after."""
+        if self._diagonals is None:
+            object.__setattr__(self, "_diagonals",
+                               np.asarray(_diagonal_sum_fn(self.mesh_xy)(self.slots)))
+        value = self._diagonals[self.request.slot(name)]
+        if band_axis is not None:
+            from runtime.padding import strip_axis
+            value = np.asarray(strip_axis(value, band_axis, axis=-1))
+        return value
+
+    def with_head(self, head, band_axis=None):
+        """Add the band-diagonal q->0 head (``head_correction.HeadSigmaDiag``)."""
+        if head is None:
+            return self
+        from common.collectives import device_put_process_local
+        values, deriv = [], None
+        for name in self.request.names:
+            v, d = head.on_shell(self.request.tables_ry[self.request.slot(name)])
+            values.append(v)
+            if name == "pair":
+                deriv = d
+        rows = np.stack(values + [deriv])
+        carrier = int(self.slots.shape[2])
+        if rows.shape[-1] != carrier:
+            rows = np.pad(rows, ((0, 0), (0, 0), (0, carrier - rows.shape[-1])))
+        rep = NamedSharding(self.mesh_xy, P())
+        head_rows = device_put_process_local(np.asarray(rows, np.complex128), rep)
+        pair_head = device_put_process_local(
+            np.ascontiguousarray(np.broadcast_to(rows[:1], (2,) + rows.shape[1:])), rep)
+        pair, slots = _on_shell_head_fn(self.mesh_xy)(
+            self.pair, self.slots, head_rows, pair_head)
+        return replace(self, pair=pair, slots=slots)
+
+    def select_k(self, select_rows) -> "OnShellSigma":
+        """On the k rows ``select_rows`` keeps (a leading-axis selector)."""
+        def rows(a):
+            return None if a is None else jnp.moveaxis(
+                select_rows(jnp.moveaxis(a, 1, 0)), 0, 1)
+        return replace(self, pair=rows(self.pair), slots=rows(self.slots),
+                       request=self.request.select_k(select_rows))
+
+    def __add__(self, other: "OnShellSigma") -> "OnShellSigma":
+        """The sum of two evaluations of one request (the four-current classes)."""
+        return add_on_shell_term(self, other)
+
+    def __sub__(self, other: "OnShellSigma") -> "OnShellSigma":
+        """The difference of two evaluations of one request (the ordered-residue twin)."""
+        if other.request is not self.request:
+            raise ValueError("OnShellSigma: a difference needs one request")
+        sub = _on_shell_difference_fn(self.mesh_xy)
+        return replace(self, slots=sub(self.slots, other.slots),
+                       pair=None if self.pair is None else sub(self.pair, other.pair))
+
+    def block_until_ready(self):
+        jax.block_until_ready((self.pair, self.slots))
+        return self
+
+
+@lru_cache(maxsize=8)
+def _on_shell_difference_fn(mesh_xy):
+    return jax.jit(lambda a, b: a - b,
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+
+
+def is_on_shell(sigma) -> bool:
+    """Whether ``sigma`` is the on-shell evaluation; else the omega-grid cube
+    (``sigma_omega_grid_debug``)."""
+    return isinstance(sigma, OnShellSigma)
+
+
+@dataclass(frozen=True)
+class BandCountCube:
+    """The cumulative band-count points of the on-shell Sigma_c, served one at a time.
+
+    The sweep keeps, on the FILE wedge, the pair of the first and of the last
+    count (``matrices``, each ``(2, n_wedge_k, nb, nb)``) and the diagonal
+    slots of EVERY count (``slot_diagonals``, each ``(n_slot, n_wedge_k, nb,
+    p_y)``).  That is what the band extrapolation reads: the fit takes each
+    count's diagonals (:meth:`diagonal`), and its matrix combines N1 and N3
+    only, N2 carrying weight zero (``SpectralShellFit.weights``); the
+    derivative and the eqp tables of the extrapolated Sigma combine every
+    count's slots.  :meth:`point` returns a matrix count on the full BZ as an
+    :class:`OnShellSigma`.
+
+    On the omega grid (``request`` None, ``sigma_omega_grid_debug``) the
+    matrices are ``(n_omega, n_wedge_k, nb, nb)``, ``diagonals`` holds the
+    band diagonal of every count between the first and the last, and
+    :meth:`point` returns ``(n_omega, nk, nb, nb)`` at ``P(None, None, 'x',
+    'y')``.  The ``(n_count, n_omega, nk, nb, nb)`` cube is never made (Na
+    8^3 at 1001 omega: 42.4 GiB per rank in one allocation at P4).
+
+    ``fresh``: ``unfold`` returns a new buffer.  Where the wedge is the full
+    BZ it is false and a matrix point IS the stored array.
+    """
+    matrices: list
+    slot_diagonals: list
+    #: wedge pair -> full BZ; wedge diagonal slots -> full BZ.
+    unfold: Callable
+    unfold_rows: Callable
+    nk: int
+    fresh: bool
+    mesh_xy: Mesh
+    #: The on-shell evaluation, or None (the omega grid).
+    request: "OnShellRequest | None"
+    #: Added to every point: ``(nk, nb, nb)``, the PPM static-limit term (the
+    #: same at every energy), or an :class:`OnShellSigma` of the four-current
+    #: classes and constant that are not extrapolated
+    #: (``gw.mpa.sector_sigma.compute_sector_sigma``); on the grid that is
+    #: ``(n_omega, nk, nb, nb)`` on the full BZ.
+    term: "jax.Array | OnShellSigma | None" = None
+    #: Grid only: the band diagonal of each count between the first and last.
+    diagonals: list = dataclasses.field(default_factory=list)
+
+    @property
+    def shape(self):
+        if self.request is None:
+            n_omega, _, nb_i, nb_j = self.matrices[0].shape
+            return (len(self.matrices) + len(self.diagonals), n_omega, int(self.nk), nb_i, nb_j)
+        _, nk, nb_i, nb_j = self.matrices[0].shape
+        return (len(self.slot_diagonals), 2, int(self.nk), nb_i, nb_j)
+
+    def diagonal_only(self, i: int) -> bool:
+        return 0 < int(i) < self.shape[0] - 1
+
+    def _matrix(self, i: int):
+        return self.matrices[0 if int(i) == 0 else -1]
+
+    def point(self, i: int) -> OnShellSigma:
+        if self.diagonal_only(i):
+            raise ValueError(
+                f"BandCountCube: count {i} is kept on its band diagonal "
+                f"only; read it with diagonal({i})")
+        value = self.unfold(self._matrix(i))
+        if self.request is None:
+            if self.term is None:
+                return value
+            return _add_static_term_fn(value.sharding, self.fresh)(value, self.term)
+        return self._point(i, value)
+
+    def diagonal(self, i: int) -> OnShellSigma:
+        """Count ``i``'s diagonal slots on the full BZ (a diagonal-only point).
+
+        On the grid: the count's band diagonal, without its cube."""
+        if self.request is None:
+            return self._grid_diagonal(i)
+        return self._point(i, None)
+
+    def _point(self, i: int, pair) -> OnShellSigma:
+        point = OnShellSigma(pair=pair, slots=self.unfold_rows(self.slot_diagonals[int(i)]),
+                             request=self.request, mesh_xy=self.mesh_xy)
+        return point if self.term is None else add_on_shell_term(point, self.term)
+
+    def _grid_diagonal(self, i: int) -> "BandDiagonalSlots":
+        slots = (self.diagonals[int(i) - 1] if self.diagonal_only(i) else
+                 _diagonal_of_cube_fn(self.mesh_xy)(self._matrix(i)))
+        slots = self.unfold_rows(slots)
+        if self.term is not None:
+            slots = _add_term_slots_fn(self.mesh_xy, self.term.ndim)(slots, self.term)
+        return BandDiagonalSlots(slots, self.mesh_xy)
+
+    def block_until_ready(self):
+        jax.block_until_ready((self.matrices, self.diagonals, self.slot_diagonals))
+        return self
+
+    def release(self):
+        """Drop the stored counts once the extrapolation has consumed them
+        (without symmetry they are the points themselves)."""
+        self.matrices.clear()
+        self.diagonals.clear()
+        self.slot_diagonals.clear()
+
+    def __sub__(self, other):
+        if self.term is not None or other.term is not None:
+            raise ValueError(
+                "BandCountCube: a difference is taken before the static term")
+        return replace(
+            self,
+            matrices=[a - b for a, b in zip(self.matrices, other.matrices)],
+            diagonals=[a - b for a, b in zip(self.diagonals, other.diagonals)],
+            slot_diagonals=[a - b for a, b in zip(self.slot_diagonals,
+                                                  other.slot_diagonals)])
+
+
+@lru_cache(maxsize=8)
+def _on_shell_static_term_fn(mesh_xy, n_table):
+    """An omega-independent ``(nk, nb, nb)`` term on an on-shell Sigma: both pair
+    slots and every value slot take it, the derivative slot nothing."""
+    term_slots = band_diagonal_slots(mesh_xy, 3)
+    spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+
+    def add(pair, slots, term):
+        d = term_slots(term)[None]
+        slots = slots + jnp.concatenate(
+            [jnp.broadcast_to(d, (n_table,) + d.shape[1:]),
+             jnp.zeros_like(d)], axis=0)
+        return (None if pair is None else pair + term[None]), slots
+    return jax.jit(add, out_shardings=(spec, spec))
+
+
+@lru_cache(maxsize=8)
+def _on_shell_sum_fn(mesh_xy):
+    spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    return jax.jit(lambda a, b: None if a is None else a + b, out_shardings=spec)
+
+
+def add_on_shell_term(point: OnShellSigma, term) -> OnShellSigma:
+    """``point + term``: a static ``(nk, nb, nb)`` term or an on-shell one."""
+    if isinstance(term, OnShellSigma):
+        if term.request is not point.request:
+            raise ValueError("on-shell term: evaluated on a different request")
+        add = _on_shell_sum_fn(point.mesh_xy)
+        return replace(point, slots=add(point.slots, term.slots),
+                       pair=(None if point.pair is None else add(point.pair, term.pair)))
+    if term.ndim != 3:
+        raise ValueError(f"on-shell term: a static (nk, nb, nb) term, got {term.shape}")
+    pair, slots = _on_shell_static_term_fn(point.mesh_xy, point.request.n_table)(
+        point.pair, point.slots, term)
+    return replace(point, pair=pair, slots=slots)
+
+
+@lru_cache(maxsize=8)
+def _add_term_slots_fn(mesh_xy, ndim=3):
+    """Diagonal slots of ``sigma + term`` from those of ``sigma``: the owning
+    slot adds the term's diagonal, the zero slots add zero.  ``ndim``: the
+    term's, 3 (one ω-independent term) or 4 (one per ω)."""
+    term_slots = band_diagonal_slots(mesh_xy, ndim)
+    lead = (None,) * (4 - ndim)
+    return jax.jit(lambda slots, term: slots + term_slots(term)[lead],
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
+
+
+@dataclass(frozen=True)
+class SigmaOmegaResult:
+    # A bracketed sum (every PPM run; MPA under band extrapolation) carries a
+    # :class:`BandCountCube`: point ``i`` is Σ_c summed over bands
+    # ``[0, band_counts[i])``, so the last point is the ordinary full-band
+    # Σ_c.  One point in the ordinary case (``band_counts == (nband,)``), 3
+    # under ``use_band_extrapolation``.  An unbracketed MPA sum carries the
+    # :class:`OnShellSigma` itself, its arrays at P(None, None, 'x', 'y'); a
+    # grid one (``sigma_omega_grid_debug``) the ``(n_omega, nk, nb, nb)``
+    # array, band-tiled the same way (qsgw_utils.is_band_sharded_sigma_omega).
+    sigma_c_kij: 'OnShellSigma | BandCountCube | jax.Array'
+    #: Logical Sigma band window and its square mesh carrier.  Consumers keep
+    #: the carrier while either band axis is sharded and derive every mask or
+    #: slice from this receipt.
+    band_axis: PaddedAxis | None = None
+    #: Optional exact ordered-residue contribution on the SAME request:
+    #: ``Sigma_c[B,D] - Sigma_c[B,D=0]``.  GN-PPM carries this beside the
+    #: result in ``PPMOutputs`` because of its band-bracket pipeline; MPA has
+    #: no bracket tail and carries it here.  ``None`` is the TRS/incumbent
+    #: route and preserves its object graph.
+    sigma_c_odd_kij: 'OnShellSigma | jax.Array | None' = None
+    #: The LOGICAL band count each leading-axis element sums to.  Aligned
+    #: with ``sigma_c_kij``'s axis 0; the extrapolation reads both together
+    #: and nothing else needs either.
+    band_counts: tuple[int, ...] = ()
+    #: ``(n_bracket, nk, nb, nb)`` Ry, or ``None``.  The CUMULATIVE Coulomb-hole
+    #: half of the ``ppm_invalid_mode="static_limit"`` term at each of
+    #: ``band_counts`` — the part of Σ_c that is a static Coulomb hole and is
+    #: therefore folded in as a CONSTANT rather than extrapolated.  Present
+    #: only when the extrapolation is running (``len(band_counts) > 1``) and
+    #: the run has invalid poles to treat.  It is NOT a component to be added
+    #: to ``sigma_c_kij`` — that fold already happened; it is the evidence for
+    #: how much of ``S_inf`` was never extrapolated
+    #: (``band_extrapolation.static_limit_tail_ruling``).
+    static_coh_at_counts: np.ndarray | None = None
+    #: Measured fit-level ``max|D|/max|B|`` for an ordered MPA store.  Kept
+    #: here so the shared driver report does not re-read or re-fit poles.
+    odd_even_residue_ratio: float | None = None
+    #: The energy (Ry) the omega axis of THIS body is measured from: the
+    #: current bundle's VBM or midgap (``_prepare_sigma_state``).  The
+    #: finalizer must read Sigma back in this frame; without it the lookup
+    #: fell back to ``wfn.efermi`` (the DFT midgap), off by 0.5-1.1 eV on
+    #: CrI3 16x16 SC (audit 2026-09-23 item 2).  None on non-PPM results.
+    efermi_ry: float | None = None
+    #: The omega grid of a grid result (``sigma_omega_grid_debug``): the
+    #: cube's leading axis, Ry and eV.  None on shell.
+    omega_ry: np.ndarray | None = None
+    omega_ev: np.ndarray | None = None
+
+
+
+
+# ---------------------------------------------------------------------------
+#  Physics-state prep — single jit that collapses the scattered trace-time
+#  jnp operations the driver used to emit (Fermi level, band masks, PPM
+#  pole masks, invalid-count tallies).
+# ---------------------------------------------------------------------------
+
+class _SigmaPhysicsState(NamedTuple):
+    efermi: jax.Array          # scalar
+    E_cond: jax.Array          # (nk, nb_full)  max(enk - efermi, 0)
+    H_val: jax.Array           # (nk, nb_full)  max(efermi - enk, 0)
+    cond_mask: jax.Array       # (nk, nb_full)  bool
+    val_mask: jax.Array        # (nk, nb_full)  bool
+    B_corr: jax.Array          # (nq, μ, μ)     c128, ready-to-contract B_q
+    Omega_abs: jax.Array       # (nq, μ, μ)     f64,  max(Re Ω_q, 0)
+    B_mask: jax.Array          # (nq, μ, μ)     bool, B_mask_raw & valid
+    invalid_mask: jax.Array    # (nq, μ, μ)     bool, logical modes with Ω²<0
+    n_total_modes: jax.Array   # scalar int64
+    n_invalid: jax.Array       # scalar int64
+
+
+def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
+    """Refuse a GN/HL-PPM Σ whose occupation table has a Fermi-crossing band.
+
+    Returns the number of crossing bands (always 0 on the accepted path), so
+    a caller or a test reads a NUMBER rather than the absence of an
+    exception.
+
+    WHAT IS MEASURED, AND WHY THE MATERIAL CHECK DOES NOT ANSWER IT.
+    ``gw_config.validate_material_inputs`` already refuses GN-PPM on a WFN
+    whose occupations are fractional (``GATE gn_ppm_refuses_metals``, owner
+    ruling 2026-09-17: GN-PPM is never allowed for metals).  A WFN written
+    with integer occupations can still carry a band that crosses the Fermi
+    level of the step table, and that is a property of the spectrum.  So the
+    measurement here is on the occupation table:
+
+        band n crosses E_F  <=>  occ[:, n] > 0.5 is not constant over k.
+
+    ``wavefunction_bundle._build_occ`` fills ``occ`` as ``(enk <= efermi)``,
+    exactly 0.0/1.0, so on a gapped system every band is uniformly occupied
+    or uniformly empty and this is exactly zero.  A crossing band is the one
+    thing that makes it nonzero, and it needs no tolerance: the predicate is
+    over an integer table.
+
+    WHAT GOES WRONG IF IT RUNS ANYWAY, which is why this refuses rather than
+    warns.  ``_prepare_sigma_state`` builds ``vbm = max(enk | occupied)`` and
+    ``cbm = min(enk | empty)``; with a crossing band ``vbm > cbm``, so the
+    "midgap" ``0.5*(vbm+cbm)`` is not in any gap and the ``fermi_reference``
+    the deck chose is meaningless.  It then clips
+    ``E_cond = max(enk - efermi, 0)`` and ``H_val = max(efermi - enk, 0)``, so
+    a band on the wrong side of that pseudo-Fermi level cannot even be
+    REPRESENTED — its dynamic denominator collapses to the ω = 0 edge.  Every
+    array keeps its shape and the run completes.  Measured on Na bcc SOC 48b
+    (`reports/occupation_threshold_all_paths_2026-08-16/evidence/probe_na.log`,
+    JID 57138992): MP1 gives f in [-0.002194, +1.031587] with 150
+    negative-lobe and 12 over-one (k,n) entries, and the step split assigns
+    every one of them fully to one branch with weight 1.
+
+    This is the SCOPE LIMIT the module has documented in prose since the
+    ``TODO(metal-greens)`` at ``_prepare_sigma_state`` was written, enforced.
+    The port itself — feeding the iteration's ``OccupationState`` into
+    ``branches_for_omega_grid`` as ``cond_weight = 1-f`` / ``val_weight = f``
+    — remains open work; a documented limitation that nothing enforces is a
+    limitation only the reader has.
+    """
+    occ = np.asarray(jax.device_get(occ_full))
+    if occ.ndim != 2:
+        raise ValueError(
+            f"assert_gapped_occupations_for_ppm: expected (nk, nb) "
+            f"occupations, got shape {occ.shape}")
+    filled = occ > 0.5
+    crossing = np.flatnonzero(filled.any(axis=0) & ~filled.all(axis=0))
+    if crossing.size == 0:
+        return 0
+    # No override: GN-PPM is not allowed for metals (owner ruling
+    # 2026-09-17), and the former crossing-bands environment debugging
+    # hatch was the one way to run it on a Fermi-crossing spectrum.
+    raise ValueError(
+        f"GATE ppm_sigma_gapped_occupations: this spectrum has "
+        f"{crossing.size} Fermi-crossing band(s) — occupied at some k and "
+        f"empty at others — at band index/indices "
+        f"{crossing.tolist()[:12]}"
+        + (" (first 12 shown)" if crossing.size > 12 else "") + ".\n"
+        f"  got:  a metallic occupation table on the GN/HL plasmon-pole "
+        f"Sigma driver, whose band split is a hard occ > 0.5 step\n"
+        f"  want: a gapped spectrum, i.e. every band uniformly occupied or "
+        f"uniformly empty over k\n"
+        f"  fix:  GN/HL-PPM is not allowed for metals (owner ruling "
+        f"2026-09-17): run this system with compute_mode = mpa and "
+        f"sigma_w_model = shared_pole on a WFN with its fractional "
+        f"occupations and occ_smearing_width_ry; or narrow the band window "
+        f"so no band crosses E_F\n"
+        f"  why:  with a crossing band, vbm > cbm, so the 'midgap' Fermi "
+        f"reference this driver derives is not in any gap, and E_cond/H_val "
+        f"are clipped at zero so a wrong-side band cannot be represented.  "
+        f"Nothing about that changes an array shape or the exit code.\n"
+        f"  doc:  docs/theory/metallic-mpa-screening.md")
+
+
+def ppm_fermi_frame(enk_full, occ_full, use_midgap):
+    """The origin of the PPM Sigma(omega) grid: the current spectrum's VBM, or
+    ``0.5*(VBM + CBM)`` when ``use_midgap`` and a state is empty.
+
+    The one owner of that rule: ``_prepare_sigma_state`` builds the Sigma
+    frame with it, and ``efermi.sigma_frame_mu_ev`` (shared by the one-shot
+    and the SC loop) calls it on the same energies to judge grid coverage in
+    that frame.
+    """
+    occ_mask = occ_full > 0.5
+    vbm = jnp.max(jnp.where(occ_mask, enk_full, -1.0e30))
+    cbm = jnp.min(jnp.where(~occ_mask, enk_full, 1.0e30))
+    midgap_candidate = jnp.where(jnp.any(~occ_mask), 0.5 * (vbm + cbm), vbm)
+    return jnp.where(use_midgap, midgap_candidate, vbm)
+
+
+@jax.jit
+def _prepare_sigma_state(
+    enk_full: jax.Array,
+    occ_full: jax.Array,
+    B_q: jax.Array,
+    Omega_q: jax.Array,
+    valid_mask_q: jax.Array,
+    use_midgap: jax.Array,
+    keep_invalid: jax.Array,
+) -> _SigmaPhysicsState:
+    """Derive Fermi level + derived energy/PPM arrays in one fused trace.
+
+    Replaces ~9 eager jnp ops previously emitted at trace time by the sigma
+    driver.  ``use_midgap`` is a traced bool scalar; the caller passes
+    ``jnp.asarray(fermi_reference == 'midgap')``.  ``valid_mask_q`` is always
+    a real bool array (the caller substitutes ``jnp.ones_like(...)`` when
+    no mask is available), so the helper doesn't branch on None.
+
+    ``keep_invalid`` is a traced bool implementing ``ppm_invalid_mode`` (BGW
+    ``invalid_gpp_mode``) for poles with fitted ``Omega^2 < 0``: False = drop
+    them from the τ-pole sum (``B_mask &= valid``; BGW mode 0 / "zero", and
+    also the pole-sum half of "static_limit" / BGW mode 3 — the caller adds
+    the analytic static-COHSEX term for the modes flagged by
+    ``invalid_mask``); True = keep the fit's fallback pole at
+    ``fallback_omega`` (default 2 Ry; BGW mode 2 / "2ry").
+
+    μ-pad safety is structural, not per-consumer: pad modes are born DEAD
+    at the fit (``fit_gn_ppm_from_wc_pair(n_mu_logical=...)`` zeroes their
+    Ω, hence B = 0 and valid = False), so ``B_mask_raw = Ω > 1e-14``
+    excludes them here — and in every other Ω/B consumer — with no mask
+    argument (docs/architecture/padding.md#pad-extent-invariance).
+    """
+    # TODO(metal-greens): the finite-occupation Green's-function/Sigma
+    # decomposition needs particle/hole weights f and 1-f, not f > 0.5.
+    occ_mask = occ_full > 0.5
+    unocc_mask = ~occ_mask
+    efermi = ppm_fermi_frame(enk_full, occ_full, use_midgap)
+
+    E_cond = jnp.maximum(enk_full - efermi, 0.0)
+    H_val = jnp.maximum(efermi - enk_full, 0.0)
+
+    Omega_abs = jnp.maximum(jnp.real(Omega_q), 0.0).astype(jnp.float64)
+    B_corr = jnp.asarray(B_q, dtype=jnp.complex128)
+    B_mask_raw = Omega_abs > 1.0e-14
+    valid = jnp.asarray(valid_mask_q, dtype=bool)
+    # ppm_invalid_mode: keep_invalid=False drops Omega^2<0 poles (BGW mode 0);
+    # keep_invalid=True keeps the fit's fallback pole (BGW mode 2).
+    B_mask = B_mask_raw & (valid | keep_invalid)
+    invalid_mask = B_mask_raw & (~valid)
+
+    return _SigmaPhysicsState(
+        efermi=efermi,
+        E_cond=E_cond, H_val=H_val,
+        cond_mask=unocc_mask, val_mask=occ_mask,
+        B_corr=B_corr, Omega_abs=Omega_abs, B_mask=B_mask,
+        invalid_mask=invalid_mask,
+        n_total_modes=jnp.sum(B_mask_raw, dtype=jnp.int64),
+        n_invalid=jnp.sum(invalid_mask, dtype=jnp.int64),
+    )
+
+
+# ---------------------------------------------------------------------------
+#  PPM construction
+# ---------------------------------------------------------------------------
+
+@jax.jit
+def _probe_antihermitian_residual(W_q):
+    """``max_q |(W_q - W_q^H) z|_inf / max_q |W_q z|_inf`` for one fixed probe.
+
+    ``z`` has unit-modulus, golden-ratio phases. ``W^H z`` is
+    ``conj(conj(z)^T W)``, so each q costs two mat-vecs and a row reduction,
+    and W is never transposed.  The exact entrywise ``max|W_q - W_q^H|``
+    transposed every sharded q block and took ~5 s per SC map on CrI3 16x16
+    at P64 (P2-J, 2026-09-24).  An anti-Hermitian part of W is seen at the
+    same relative size: the ratio is 0 for a Hermitian W.
+    """
+    n = W_q.shape[-1]
+    phase = jnp.mod(jnp.arange(n, dtype=jnp.float64) * 0.6180339887498949, 1.0)
+    z = jnp.exp(2j * jnp.pi * phase).astype(W_q.dtype)
+    w_z = jnp.einsum("qij,j->qi", W_q, z)
+    wh_z = jnp.conj(jnp.einsum("j,qji->qi", jnp.conj(z), W_q))
+    scale = jnp.max(jnp.abs(w_z))
+    return jnp.where(scale > 0.0, jnp.max(jnp.abs(w_z - wh_z)) / scale, 0.0)
+
+
+def fit_ppm(
+    W0_q: jax.Array,
+    Wprobe_q: jax.Array,
+    V_q: jax.Array,
+    probe_omega: complex,
+    mesh_xy: Mesh,
+    *,
+    fallback_omega: float = 2.0,
+    n_nodes_static: int = 0,
+    print_fn=None,
+    model_label: str = "PPM",
+    n_mu_logical: int,
+    mu_active_mask=None,
+    q_neg_index: np.ndarray | None = None,
+    coarsen_extreme_tails: bool = False,
+    ordered_orientations: bool = False,
+    q_star=None,
+    q_partner=None,
+    q_wedge=None,
+) -> PPMBuildResult:
+    """Fit two-point PPM pole parameters from precomputed W(0) and W(probe).
+
+    Model-agnostic over the pole-fit ansatz: the same algebra serves
+    both Godby-Needs (purely imaginary ``probe_omega = i·ωp``) and
+    Hybertsen-Louie (real ``probe_omega = Ω`` above all transitions).
+
+    ``ordered_orientations=True`` (GN on a measured-broken-TR deck) splits
+    the probe into Hermitian and anti-Hermitian halves and returns the odd
+    residue ``D`` in ``B_odd_q``.
+
+    All input arrays are flat-q (nq, μ, μ).  Returns PPMBuildResult with
+    B_q, Omega_q, valid_mask_q sharded as P(None, 'x', 'y').
+
+    ``n_mu_logical`` (REQUIRED, = ``meta.n_rmu``): logical centroid
+    count.  The fitted tensors keep the padded extent, but pad modes are
+    born DEAD (Ω = B = 0, valid = False) and the ``unfulfilled``
+    fraction counts logical modes only — see ``fit_gn_ppm_from_wc_pair``.
+    ``q_neg_index`` is the public symmetry service's canonical full-grid
+    involution, passed from the driver rather than rebuilt at this layer.  It
+    is required only when ``coarsen_extreme_tails`` is true.
+
+    ``coarsen_extreme_tails=True`` is the fixed user-ruled GN-only policy.  It
+    preserves affected ``Wc(0)`` elements but changes their finite poles and
+    ``1/z^2`` moments, so it is not strict BGW pole parity.  It is explicit
+    here because the same algebra also fits HL poles, whose real-axis
+    two-point model must not silently inherit this GN policy.
+    """
+    import time as _t
+    z = complex(probe_omega)
+    t0 = _t.perf_counter()
+
+    Wc0_q = W0_q - V_q
+    Wci_q = Wprobe_q - V_q
+    fit = fit_gn_ppm_from_wc_pair(
+         Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
+         n_mu_logical=int(n_mu_logical),
+         mu_active_mask=mu_active_mask,
+         q_neg_index=q_neg_index,
+         q_star=q_star, q_partner=q_partner,
+         coarsen_extreme_tails=bool(coarsen_extreme_tails),
+         ordered_orientations=bool(ordered_orientations),
+         print_fn=print_fn if print_fn is not None else print)
+
+    q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    Omega = jax.lax.with_sharding_constraint(
+        jnp.asarray(fit.omega_qmunu), q_shard)
+    B = jax.lax.with_sharding_constraint(jnp.asarray(fit.B_qmunu), q_shard)
+    B_odd = (None if fit.B_odd_qmunu is None else
+             jax.lax.with_sharding_constraint(
+                 jnp.asarray(fit.B_odd_qmunu), q_shard))
+    valid_mask = jax.lax.with_sharding_constraint(
+        jnp.asarray(fit.valid_qmunu), q_shard)
+    Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
+    t1 = _t.perf_counter()
+
+    probe_hermiticity_residual = None
+    odd_even_residue_ratio = None
+    if B_odd is not None:
+        d_max = float(jax.device_get(jnp.max(jnp.abs(B_odd))))
+        b_max = float(jax.device_get(jnp.max(jnp.abs(B))))
+        odd_even_residue_ratio = d_max / b_max if b_max > 0.0 else d_max
+        probe_hermiticity_residual = float(jax.device_get(
+            _probe_antihermitian_residual(Wprobe_q)))
+        if print_fn is not None:
+            print_fn(
+                f"  {model_label} ORDERED residues (measured-broken-TR deck): "
+                f"R± = B ± D; max|D|/max|B| = "
+                f"{odd_even_residue_ratio:.3e}; W(iω_p) probe Hermiticity "
+                f"residual = {probe_hermiticity_residual:.3e}.")
+
+    # Deck-level ε_H measurement (env-gated observability; channel-
+    # hermiticity memo §1.3/§3.5): the Laplace-family symmetry diagnostics
+    # (σ_R symmetric / σ_I antisymmetric, check L1) hold only to the PPM
+    # ω_p in PPMBuildResult historically meant the imaginary-axis magnitude;
+    # carry the probe magnitude there for diagnostics.  Downstream Σ kernels
+    # consume only B_q, Omega_q (the *fitted* pole frequency), so the probe
+    # magnitude is for logging / restart provenance only.
+    probe_mag = float(abs(z))
+
+    if print_fn is not None:
+        kind = "iωp" if abs(z.real) < 1.0e-12 else "Ω"
+        print_fn(
+            f"  {model_label} fit: {t1-t0:.2f}s, {kind}={probe_mag:.4f} Ry, "
+            f"unfulfilled={100.0 * fit.unfulfilled_fraction:.2f}%")
+        print_fn(
+            f"  {model_label} pole census: valid={fit.n_valid}, "
+            f"Omega=[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] Ry, "
+            f"min |Wc(0)-Wc(probe)|/max(|Wc(0)|,|Wc(probe)|)="
+            f"{fit.pair_relative_separation_min:.8e}")
+        if coarsen_extreme_tails:
+            budget = fit.n_valid // GN_PPM_EXTREME_TAIL_DIVISOR
+            print_fn(
+                "  GN user-ruled fitted-pole tail policy: "
+                f"low={fit.n_tail_low}/{budget}, "
+                f"high={fit.n_tail_high}/{budget}; "
+                f"[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] -> "
+                f"[{fit.omega_min_after:.8e}, {fit.omega_max_after:.8e}] Ry; "
+                f"anchor={fit.tail_anchor_omega:.8e} Ry; boundary key groups "
+                "are atomic before orbit closure; physical partner orbits "
+                "remain unsplit and closure may further undershoot"
+            )
+            print_fn(
+                "  GN tail semantics: affected Wc(0) is preserved by "
+                "B'=-Wc(0)*Omega'/2; the 1/z^2 moment changes; this is not "
+                "BGW finite-pole parity; exact panes remain downstream."
+            )
+
+    return PPMBuildResult(
+        omega_p=probe_mag,
+        Wc0_q=Wc0_q,
+        B_q=B,
+        Omega_q=Omega,
+        valid_mask_q=valid_mask,
+        unfulfilled_fraction=fit.unfulfilled_fraction,
+        n_nodes_static=n_nodes_static,
+        B_odd_q=B_odd,
+        probe_hermiticity_residual=probe_hermiticity_residual,
+        odd_even_residue_ratio=odd_even_residue_ratio,
+        q_wedge=q_wedge,
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Sigma convolution — the device-side τ loop.  Its host-side counterpart
+#  (window construction) lives in ppm_windows; the two halves share no state
+#  beyond the window list itself.
+# ---------------------------------------------------------------------------
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Sigma band-window mesh padding
+# ---------------------------------------------------------------------------
+
+def pad_sigma_window(psi_proj_xr, psi_proj_yn, mesh_xy):
+    """Zero-pad both projected-band operands to one square Sigma carrier.
+
+    The returned third value is the :class:`runtime.padding.PaddedAxis`
+    receipt.  Production calls the same owner directly in ``gw.mpa.sigma``;
+    this small adapter remains the projection primitive's focused test seam.
+    """
+    from runtime.padding import pad_to_axis, padded_axis
+
+    tag = padded_axis(
+        int(psi_proj_xr.shape[1]), mesh_xy, name="Sigma band window",
+        specs=(
+            (P(None, "x"), 1),
+            (P(None, None, None, "y"), 3),
+        ))
+    return (
+        pad_to_axis(psi_proj_xr, tag, axis=1),
+        pad_to_axis(psi_proj_yn, tag, axis=3),
+        tag,
+    )
+
+
+def sigma_band_axis(nb_proj: int, mesh_xy, *, ansatz: str):
+    """Return the square mesh carrier receipt for a Sigma band window.
+
+    Both matrix axes share one tag so Hermitisation remains square even on a
+    rectangular mesh.  The runtime owner derives the least common compatible
+    divisor from the two actual specs.
+    """
+    from runtime.padding import padded_axis
+
+    return padded_axis(
+        int(nb_proj), mesh_xy, name=f"{ansatz} Sigma band window",
+        specs=(
+            (P(None, "x"), 1),
+            (P(None, None, None, "y"), 3),
+        ))
+
+
+def _compute_invalid_static_sigma(
+    wfns,
+    Wc0_q: jax.Array,
+    invalid_mask: jax.Array,
+    meta,
+    mesh_xy: Mesh,
+    occupation_state=None,
+    q_wedge=None,
+) -> np.ndarray:
+    """Static-COHSEX Σ for the invalid PPM poles (BGW ``invalid_gpp_mode=3``).
+
+    BGW's default treatment of a pole with fitted ``Ω² < 0`` sets
+    ``ω̃ → 1/TOL_ZERO`` (mtxel_cor.f90:788/838), which is the Ω→∞ limit of
+    the full dynamical pole: for that mode's ``W_static = W^c(0)·mask``,
+
+        occupied   l:  ssx → −I_ε,  sch → −½·I_ε   ⇒  −W_static + ½·W_static
+        unoccupied l:                sch → −½·I_ε   ⇒            + ½·W_static
+
+    i.e. the mode is treated within static COHSEX: a screened-exchange
+    term over occupied states plus the Coulomb-hole over the full RI
+    window.  (Ω→∞ can NOT be pushed through the τ-integral — ``B ∝ Ω``
+    makes ``B·e^{−iΩτ}`` non-integrable — hence this analytic,
+    ω-independent term instead.)  Equivalently, per intermediate state:
+    occ → −½·W^c(0) (= B/Ω), unocc → +½·W^c(0) — the exact Ω→∞ limit of
+    the two-branch pole sum ``B/(ω−E_l∓Ω)``.
+
+    The static Σ kernels (``gw.cohsex_sigma``: the Σ τ node at τ = 0) with the
+    masked static ``W^c(0)`` as the interaction:
+
+        Σ_static = sigma_sx(G_occ, W_static) + sigma_coh(W_static − 0)
+                 = −⟨G_occ·W_static⟩ + ½·⟨G_RI·W_static⟩
+
+    μ-pad safety is inherited from ``invalid_mask`` (pad modes are born
+    dead at the fit, so they are never flagged invalid and ``W_static`` is
+    exactly zero there).
+
+    Returns the replicated host tensor (nk, nb_sigma, nb_sigma) in Ry,
+    to be added to Σ_c at EVERY ω (the term is ω-independent).
+
+    ``occupation_state`` is the iteration's
+    :class:`gw.efermi.OccupationState` (``None`` ⇒ the integer projector,
+    bit-exact insulating behaviour).  It matters here for the same reason
+    it matters in ``cohsex_sigma``: the screened-exchange half of this
+    term runs over the OCCUPIED manifold, so on a metal the Fermi-shell
+    bands must enter with their fractional weights.
+    """
+    from .cohsex_sigma import build_Gij
+    Gij = build_Gij(meta, mesh_xy, occupation_state)
+    sigma_sx, sigma_coh, W_static = _invalid_static_kernels(
+        wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge)
+    sx = _band_sigma_host(sigma_sx(wfns, Gij, W_static), wfns)
+    coh = _band_sigma_host(sigma_coh(wfns, W_static, None), wfns)
+    return sx + coh
+
+
+def _invalid_static_kernels(wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge):
+    """The static Σ kernels (``cohsex_sigma``'s SX and COH) and the masked ``W^c(0)``
+    as a Hermitian interaction on the fit's q wedge (conj rule), or the full zone."""
+    import dataclasses as _dc
+    from .cohsex_sigma import _face_kwargs, _make_cohsex_kernels
+    sigma_sx, sigma_coh = _make_cohsex_kernels(
+        mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
+    W_static = jnp.where(
+        jnp.asarray(invalid_mask, dtype=bool),
+        jnp.asarray(Wc0_q, dtype=jnp.complex128),
+        jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
+    )
+    if q_wedge is not None:
+        W_static = _dc.replace(q_wedge, values=W_static, trs_rule="conj")
+    return sigma_sx, sigma_coh, W_static
+
+
+def _band_sigma_host(sigma_kij, wfns):
+    """A static Σ ``(nk, carrier, carrier)`` on the host, cut to the QP window."""
+    from common.collectives import gather_to_host
+    nb = int(wfns.slices.nb_sigma)
+    return np.asarray(gather_to_host(sigma_kij), dtype=np.complex128)[:, :nb, :nb]
+
+
+def _invalid_static_coh_by_bracket(
+    wfns,
+    Wc0_q: jax.Array,
+    invalid_mask: jax.Array,
+    meta,
+    mesh_xy: Mesh,
+    brackets,
+    q_wedge=None,
+) -> np.ndarray:
+    """The static-limit term's OWN band-count series, one point per bracket.
+
+    WHY THIS EXISTS — THE ONE PLACE THE PPM-ONLY GUARD CANNOT REACH.
+    ``gw.sigma_dispatch``'s guard keeps the band extrapolation away from a
+    static Coulomb hole because the ``1/N → 0`` limit is wrong for one (it
+    ANTI-converges: 94.9 → 288.2 meV MAE as nband goes 60 → 124, overshooting
+    BerkeleyGW's exact closure by ~340 meV — ``gw.band_extrapolation``'s module
+    docstring owns that measurement).  That guard is per-``compute_mode``, and
+    ``ppm_invalid_mode = "static_limit"`` — the SHIPPING DEFAULT — puts a
+    static Coulomb hole inside a Σ whose ``compute_mode`` genuinely IS
+    ``gn_ppm``.  The guard cannot see it because it is per-MODE, one logical
+    ISDF mode at a time, underneath the seam the guard checks.
+
+    WHAT IS AND IS NOT BAND-COUNT DEPENDENT.  The static-limit term is
+    ``Σ_static = −⟨G_occ·W_static⟩ + ½⟨G_RI·W_static⟩``.  The first half runs
+    over OCCUPIED states through ``Gij`` and is band-count independent for any
+    ``nband ≥ nelec``.  The second — the Coulomb hole — runs over ``s.full``
+    with no occupation projector, so it carries exactly the slowly convergent
+    unoccupied tail this module exists to worry about.  Only the second half is
+    measured here, and that is not a simplification: the extrapolation is an
+    AFFINE estimator with ``sum(c) == 1``, so any band-count-INDEPENDENT part
+    passes through it unchanged and cancels identically out of
+    ``S_inf − S(N₃)``.  The occupied half therefore cannot contribute to the
+    diagnostic even in principle.
+
+    IT IS FREE, WHICH IS WHY IT CAN BE ON BY DEFAULT.  ``G_RI`` is a plain band
+    sum, so the brackets PARTITION it the same way they partition Σ_c, and
+    ``n_brk`` contractions over disjoint sub-ranges cost the same total flops
+    as the one contraction over the whole range that runs anyway.  The price is
+    one extra pass of the COH channel, not ``n_brk`` extra passes.
+
+    Returns the replicated host tensor ``(n_brk, nk, nb_sigma, nb_sigma)`` in
+    Ry, holding the DISJOINT per-bracket contributions — the caller cumulates
+    them to get Σ_COH at each of the plan's band counts, in the same order and
+    by the same rule that turns the Σ_c brackets into band counts.
+    """
+    _, sigma_coh, W_static = _invalid_static_kernels(
+        wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge)
+    out = [_band_sigma_host(sigma_coh(wfns, W_static, None,
+                                      ri_bands=(int(lo), int(hi))), wfns)
+           for lo, hi in brackets]
+    return np.stack(out, axis=0)
+
+
+# ---------------------------------------------------------------------------
+#  Top-level sigma driver
+# ---------------------------------------------------------------------------
+
+def _resolve_ppm_band_plan(wfns, meta, plan, *, where):
+    """One band-bracket validation seam for both transition executors."""
+    from .band_extrapolation import (
+        assert_brackets_match_ols_abscissae, trivial_plan)
+
+    s = wfns.slices
+    if plan is None:
+        plan = trivial_plan(
+            int(s.nb_sigma_sum), int(s.b2 - s.b0),
+            int(meta.b_id_4_sigma_user or s.b4) - int(s.b0))
+    assert_brackets_match_ols_abscissae(
+        plan, s, meta=meta, where=where)
+    return plan
+
+
+
+
+@jax.jit
+def _ppm_as_one_pole_store_fields(
+    state: _SigmaPhysicsState,
+    B_odd_q=None,
+):
+    """Policy-resolved PPM poles in the MPA ``(p,q,mu,nu)`` convention.
+
+    Both ansatzes use
+
+    ``Wc(z) = 2*Omega*B/(z**2 - Omega**2)`` and therefore
+    ``Wc(0) = -2*B/Omega``.  No residue rescaling or sign flip is needed.
+    ``state.B_mask`` has already applied ``ppm_invalid_mode``; absent modes
+    are encoded by the MPA store's ordinary zero-residue convention and their
+    frequency is zeroed as well.  An ordered GN fit's ``B_odd_q=D`` is masked
+    by the same policy and stored beside ``B`` so the shared executor consumes
+    ``R_+=B+D`` on conduction rows and ``R_-=B-D`` on valence rows.  GN/HL
+    poles retained here are positive real frequencies, i.e. causal MPA poles
+    with zero fitted width.
+    """
+    live = jnp.asarray(state.B_mask, dtype=bool)
+    if B_odd_q is not None and tuple(B_odd_q.shape) != tuple(state.B_corr.shape):
+        raise ValueError(
+            "ordered PPM B_odd_q must match B_q; got "
+            f"{tuple(B_odd_q.shape)} and {tuple(state.B_corr.shape)}")
+    Omega = jnp.where(live, state.Omega_abs, 0.0).astype(jnp.complex128)
+    B = jnp.where(live, state.B_corr, 0.0 + 0.0j).astype(jnp.complex128)
+    D = (None if B_odd_q is None else
+         jnp.where(live, jnp.asarray(B_odd_q), 0.0 + 0.0j)
+         .astype(jnp.complex128)[None, ...])
+    return Omega[None, ...], B[None, ...], D
+
+
+def _add_static_ppm_term(
+        sigma_c_kij, sigma_static_host, mesh_xy, band_axis: PaddedAxis):
+    """Add one static invalid-pole term to every cumulative band count."""
+    from common.collectives import device_put_process_local
+    from runtime.padding import pad_square
+
+    static_sharding = NamedSharding(mesh_xy, P(None, "x", "y"))
+    sigma_static_host = pad_square(
+        jnp.asarray(sigma_static_host, dtype=jnp.complex128), band_axis)
+    static = device_put_process_local(
+        np.asarray(sigma_static_host, dtype=np.complex128), static_sharding)
+    return replace(sigma_c_kij, term=static)
+
+
+@lru_cache(maxsize=8)
+def _add_static_term_fn(sharding, donate):
+    """``sigma + term``, an ω-independent term broadcast over omega; ``donate``: in the
+    point's buffer."""
+    return jax.jit(lambda sigma, term: sigma + (term if term.ndim == sigma.ndim
+                                                else term[None, ...]),
+                   out_shardings=sharding,
+                   donate_argnums=(0,) if donate else ())
+
+
+def compute_sigma_c_ppm_omega_grid(
+    wfns,
+    ppm,
+    meta,
+    mesh_xy: Mesh,
+    *,
+    ppm_cfg: PPMConfig,
+    sigma_cfg: DynamicSigmaConfig,
+    mpa_cfg,
+    ansatz: str,
+    screening_diagrams,
+    occupation_state=None,
+    plan: 'BandBracketPlan | None' = None,
+    fixed_quadrature_session=None,
+    request_for=None,
+    omega_grid_ry: np.ndarray | None = None,
+    print_fn=print,
+) -> SigmaOmegaResult:
+    """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
+
+    The PPM fit remains the two-point algebra in :func:`fit_ppm`.  This stage
+    applies the established invalid-pole policy, hands that result to the
+    executor in memory as a one-pole source, and then delegates window construction,
+    denominator-box rules, cache lookup, pole batching, the tau executor and
+    omega accumulation to :func:`gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`.
+
+    ``plan`` retains the PPM band-convergence contract: disjoint brackets are
+    evaluated by the shared spatial kernel and returned as cumulative band
+    counts.  The optional static-COHSEX invalid-pole term remains separate
+    from the dynamic store and is added exactly once to each cumulative count.
+
+    ``request_for(efermi_ry)`` returns the on-shell request at this body's
+    omega reference (``dynamic_sigma.sigma_on_shell_request``); the reference
+    is the bundle's VBM/midgap resolved here.  ``omega_grid_ry`` in its place
+    evaluates Sigma_c on that grid (``sigma_omega_grid_debug``).
+    """
+    if (request_for is None) == (omega_grid_ry is None):
+        raise ValueError("compute_sigma_c_ppm_omega_grid: pass request_for (on shell) "
+                         "or omega_grid_ry (the grid), not both")
+    from .mpa.sigma import MemoryPoleSource, compute_sigma_c_mpa_omega_grid
+
+    s = wfns.slices
+    plan = _resolve_ppm_band_plan(
+        wfns, meta, plan, where="ppm_sigma shared MPA bracket partition")
+
+    enk_full = wfns.enk[:, s.full]
+    occ_full = wfns.occ[:, s.full]
+    if omega_grid_ry is not None:
+        omega_grid_ry = np.asarray(omega_grid_ry, dtype=np.float64)
+        if omega_grid_ry.ndim != 1 or not omega_grid_ry.size:
+            raise ValueError("omega_grid_ry must be a nonempty vector")
+    if int(meta.nk_tot) != int(enk_full.shape[0]):
+        raise ValueError(
+            "enk_full shape mismatch: expected first dim "
+            f"{int(meta.nk_tot)}, got {enk_full.shape[0]}")
+
+    invalid_mode = str(ppm_cfg.invalid_mode).strip().lower()
+    if invalid_mode == "imaginary":
+        raise NotImplementedError(
+            "ppm_invalid_mode='imaginary' (BGW mode 1) needs a "
+            "complex-Omega path.")
+    if invalid_mode not in (
+            "zero", "skip", "2ry", "static_limit", "infinity"):
+        raise ValueError(
+            "ppm_invalid_mode must be zero/skip/2ry/static_limit/infinity; "
+            f"got {invalid_mode!r}")
+    keep_invalid = invalid_mode == "2ry"
+    invalid_static = invalid_mode in ("static_limit", "infinity")
+
+    assert_gapped_occupations_for_ppm(occ_full, print_fn=print_fn)
+    valid_mask = ppm.valid_mask_q
+    if valid_mask is None:
+        valid_mask = jnp.ones(ppm.Omega_q.shape, dtype=bool)
+    with timing.section("sigma.state"):
+        state = _prepare_sigma_state(
+            enk_full, occ_full, ppm.B_q, ppm.Omega_q, valid_mask,
+            jnp.asarray(sigma_cfg.fermi_reference == "midgap", dtype=bool),
+            jnp.asarray(keep_invalid, dtype=bool))
+
+    regularization_width_ry = (
+        float(sigma_cfg.regularization_ev) / RYD_TO_EV)
+    ansatz_name = str(getattr(ansatz, "value", ansatz)).strip().lower()
+    resolved_xi = resolve_sigma_regularization(
+        requested_ry=regularization_width_ry, ansatz=ansatz_name)
+    print_fn(resolved_xi.describe())
+    regularization_width_ry = resolved_xi.resolved_ry
+
+    n_total_modes, n_invalid = map(
+        int, jax.device_get((state.n_total_modes, state.n_invalid)))
+    stars = None if ppm.q_wedge is None else ppm.q_wedge.star_sizes()
+    if n_invalid:
+        n_invalid_q = np.asarray(jax.device_get(
+            jnp.sum(state.invalid_mask, axis=(1, 2), dtype=jnp.int64)))
+        if stars is not None:
+            # The census of the full-zone field: each wedge row counts once
+            # per q of its star.
+            n_total_q = np.asarray(jax.device_get(
+                jnp.sum(state.B_mask | state.invalid_mask, axis=(1, 2),
+                        dtype=jnp.int64)))
+            n_invalid = int(np.dot(n_invalid_q, stars))
+            n_total_modes = int(np.dot(n_total_q, stars))
+        print_fn(
+            f"  PPM invalid modes: {n_invalid}/{n_total_modes} "
+            f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)")
+        print_fn(
+            f"  PPM invalid modes per {'q' if stars is None else 'wedge q'}: "
+            f"min={int(n_invalid_q.min())} max={int(n_invalid_q.max())} "
+            f"counts={np.array2string(n_invalid_q, max_line_width=100, threshold=64)}")
+
+    sigma_static_host = None
+    static_coh_at_counts = None
+    if invalid_static and n_invalid:
+        sigma_static_host = _compute_invalid_static_sigma(
+            wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
+            occupation_state=occupation_state, q_wedge=ppm.q_wedge)
+        print_fn(
+            "  PPM invalid modes -> static COHSEX: max|Sigma_static| = "
+            f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV")
+        if plan.n_brackets > 1:
+            static_coh_at_counts = np.cumsum(
+                _invalid_static_coh_by_bracket(
+                    wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
+                    plan.bounds, q_wedge=ppm.q_wedge),
+                axis=0)
+
+    Omega_p, B_p, B_odd_p = _ppm_as_one_pole_store_fields(
+        state, ppm.B_odd_q)
+    if getattr(meta, 'mu_basis', None) is not None:
+        # The store keeps the canonical centroid order (grid-agnostic).
+        Omega_p, B_p = (meta.mu_basis.unpack_operator(Omega_p),
+                        meta.mu_basis.unpack_operator(B_p))
+        if B_odd_p is not None:
+            B_odd_p = meta.mu_basis.unpack_operator(B_odd_p)
+    diagram_value = str(getattr(
+        screening_diagrams, "value", screening_diagrams))
+    # In memory, no store (owner 2026-09-23): the executor reads the same
+    # sharded fields a store round trip would have returned.
+    poles = MemoryPoleSource(
+        Omega_p, B_p, B_odd_p,
+        n_mu_logical=int(meta.n_rmu), mesh_xy=mesh_xy, q_wedge=ppm.q_wedge,
+        provenance={
+            "fit_protocol": "two_point_ppm",
+            "pole_model": ansatz_name,
+            "ppm_invalid_mode": invalid_mode,
+            "screening_diagrams": diagram_value,
+            "probe_frequency_ry": float(ppm.omega_p),
+            "unfulfilled_fraction": float(ppm.unfulfilled_fraction),
+        })
+    del Omega_p, B_p, B_odd_p
+    print_fn(
+        f"  {ansatz_name} fit -> in-memory one-pole source (no store); "
+        f"invalid policy={invalid_mode}")
+
+    efermi_ry = float(jax.device_get(state.efermi))
+    # The windows are planned on the states' own energies (on the grid, on it).
+    request = None if request_for is None else request_for(efermi_ry)
+    omega_req = omega_grid_ry if request is None else request.frequencies_ry
+    branches = branches_for_omega_grid(
+        omega_req,
+        E_cond=state.E_cond,
+        H_val=state.H_val,
+        cond_mask=state.cond_mask,
+        val_mask=state.val_mask)
+    result = compute_sigma_c_mpa_omega_grid(
+        wfns, poles, meta, mesh_xy,
+        request=request,
+        omega_grid_ry=omega_grid_ry,
+        efermi_ry=efermi_ry,
+        regularization_width_ry=regularization_width_ry,
+        edge_factor=float(sigma_cfg.window_edge_factor),
+        quadrature_eps=float(sigma_cfg.quadrature_eps),
+        omega_grid_step_ry=float(sigma_cfg.omega_step_ev) / RYD_TO_EV,
+        pole_batch_size=int(mpa_cfg.pole_batch_size),
+        expected_screening_diagrams=screening_diagrams,
+        sigma_branches=branches,
+        band_brackets=plan.bounds,
+        band_counts=plan.counts,
+        fixed_quadrature_session=fixed_quadrature_session,
+        # The same fitted box rules as full frequency (owner 2026-09-22): the
+        # analytic fixed-height line rule needed 416 vs 206 (cond:resonant) and
+        # 320 vs 178 (val:resonant) nodes on comparable zero-damping boxes
+        # (CrI3 16x16 GN-PPM 824 tau nodes vs TaAs MPA).
+        analytic_line=False,
+        # No D=0 twin on the GN/HL route: the odd-reference Sigma was a
+        # diagnostic-only second sweep, removed by owner decision 2026-09-23.
+        odd_reference=False,
+        print_fn=print_fn)
+    sigma_c_kij = result.sigma_c_kij
+    if sigma_static_host is not None:
+        sigma_c_kij = _add_static_ppm_term(
+            sigma_c_kij, sigma_static_host, mesh_xy, result.band_axis)
+    return SigmaOmegaResult(
+        sigma_c_kij=sigma_c_kij,
+        band_axis=result.band_axis,
+        sigma_c_odd_kij=result.sigma_c_odd_kij,
+        band_counts=result.band_counts,
+        static_coh_at_counts=static_coh_at_counts,
+        odd_even_residue_ratio=ppm.odd_even_residue_ratio,
+        efermi_ry=efermi_ry,
+        omega_ry=result.omega_ry,
+        omega_ev=result.omega_ev)

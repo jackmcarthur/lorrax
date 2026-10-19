@@ -1,0 +1,156 @@
+[project]
+name = "lorrax"
+version = "0.1.0"
+description = "LORRAX: Low-scaling Real-space Real-Axis eXcited state package"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # FIRST-PARTY SERVICES.  These stay independently installable, but a
+    # LORRAX installation is one coherent distribution set: production wheels
+    # install these requirements, while uv resolves them from the workspace
+    # sources declared below.  runtime.source_closure reads the same package
+    # metadata for bare-source launches; no launcher owns a copied service list.
+    "distrib_la==0.1.0",
+    "lxkit==0.1.0",
+    "minimax==0.1.0",
+    "symmetry_maps==0.1.0",
+    "vcoul==0.1.0",
+    "wfn_loader==0.1.0",
+    "zeta_loader==0.1.0",
+    "h5py>=3.14.0",
+    # NO CUDA VARIANT PINNED HERE — it is a SITE fact, not a package fact.
+    # Pick one at install time:  pip install -e '.[cuda13]'  (Perlmutter)
+    #                            pip install -e '.[cuda12]'  (Frontera rtx)
+    # See [project.optional-dependencies] below for the support matrix.
+    #
+    # THE WINDOW, NOT JUST A FLOOR, and it is enforced at startup by
+    # src/runtime/jax_support.py (SUPPORTED_MIN / SUPPORTED_MAX_EXCLUSIVE).
+    # Those two must agree with these specifiers; a floor nothing checks is
+    # how the Perlmutter GPU leg came to run four minors below it unnoticed.
+    #
+    # One generation everywhere.  The tracked lock and Perlmutter module use
+    # 0.9.1; the series window permits patch releases while refusing old
+    # CUDA-12/JAX-0.7 launchers and unmeasured 0.10+ stacks at startup.
+    "jax>=0.9.0,<0.10.0",
+    "jaxlib>=0.9.0,<0.10.0",
+    "matplotlib>=3.10.3",
+    "numpy>=2.3.1",
+    "scipy>=1.16.0",
+    "xmlschema>=4.1.0",
+    "xsdata[cli]>=25.7",
+]
+
+[project.optional-dependencies]
+# Documentation site (mkdocs-material + mkdocstrings). Build-only; not pulled
+# in by a plain `pip install lorrax`. Build with `mkdocs build`.
+docs = [
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.6.20",
+    "mkdocstrings>=0.30.1",
+    "mkdocstrings-python>=1.18.2",
+]
+# ---------------------------------------------------------------------------
+# GPU SUPPORT MATRIX — one extra per CUDA major, chosen per SITE.
+#
+# This used to be a single hard pin in [project.dependencies], flipped
+# cuda13 -> cuda12 on 2026-07-24 for TACC Frontera and thereby silently
+# downgrading every other machine.  A global pin cannot express a fact that
+# differs per machine; an extra can.  The driver is what constrains this:
+#
+#   site                 GPU              driver        CUDA userspace  extra
+#   -------------------  ---------------  ------------  --------------  ------
+#   NERSC Perlmutter     A100 (sm_80)     580.159.04    13.0            cuda13
+#   TACC Frontera (rtx)  RTX 5000 (sm_75) 535.113.01    12.2            cuda12
+#
+# CUDA 13 needs a >=580 driver, which is why Frontera cannot use it.  Driver
+# 535 runs the full CUDA 12.x userspace via minor-version compatibility and
+# JAX on CUDA 12 supports sm_52+, so Turing is well within range there.
+#
+# CPU-ONLY installs need NEITHER extra: the base `jax`/`jaxlib` dependency is
+# the CPU build, which is what the host-platform FFI leg runs against.
+#
+# Perlmutter uses the bare-host CUDA-13/JAX-0.9 module; Frontera's RTX lane
+# uses the CUDA-12 extra.  Both remain in the same JAX generation.
+#
+# nvidia-mathdx is REQUIRED on every NVIDIA GPU (owner ruling, decisions.md
+# 2026-09-24): the k-convolution router's only CUDA backend compiles its
+# cuFFTDx kernels at run time from this wheel's headers (header-only, no
+# binaries, no dependencies).  A CUDA run without it refuses at startup
+# (GATE mathdx-headers).  Pinned to the version the kernels were validated on.
+cuda12 = ["jax[cuda12]>=0.9.0,<0.10.0",
+          "nvidia-mathdx==25.6.0; sys_platform == 'linux'"]
+cuda13 = ["jax[cuda13]>=0.9.0,<0.10.0",
+          "nvidia-mathdx==25.6.0; sys_platform == 'linux'"]
+
+[project.scripts]
+lorrax-gw = "gw.gw_jax:main"
+gw_jax = "gw.gw_jax:main"
+lorrax-centroids = "centroid.kmeans_cli:main"
+lorrax-downfold = "gw.downfold_cli:main"
+# NOTE: `lorrax-bse` was removed. Its former target `bse.bse_isdf:main` was
+# deleted (commit a0da0a5; it was a deprecation shim with no main()). The
+# current BSE driver `bse.bse_jax` keeps its CLI inside an
+# `if __name__ == "__main__":` block and exposes no importable `main()`, so it
+# cannot be wired as a console script without a source refactor. Re-add this
+# entry once `bse.bse_jax` (or a successor) gains a module-level `main()`.
+
+# The installed-form source-closure manifest.  Names are distributions and
+# values are their public import packages.  The bare-source form cross-checks this
+# table against the workspace members, their own project names, root runtime
+# requirements, and uv workspace sources before putting any path on sys.path.
+[project.entry-points."lorrax.services"]
+distrib_la = "distrib_la"
+lxkit = "lxkit"
+minimax = "minimax"
+symmetry_maps = "symmetry_maps"
+vcoul = "vcoul"
+wfn_loader = "wfn_loader"
+zeta_loader = "zeta_loader"
+
+[tool.uv]
+package = true
+
+# Empty: the place a new package-data claim would go.
+[tool.setuptools.package-data]
+
+[tool.uv.sources]
+distrib_la = { workspace = true }
+lxkit = { workspace = true }
+minimax = { workspace = true }
+symmetry_maps = { workspace = true }
+vcoul = { workspace = true }
+wfn_loader = { workspace = true }
+zeta_loader = { workspace = true }
+
+[tool.uv.workspace]
+members = ["services/*"]
+
+[tool.pytest.ini_options]
+# The suite is tests/hsuite (the driver chain on the magnetic H2⁻ fixture)
+# plus the static AST suites beside it; see tests/README.md.  `bench` holds
+# standalone benchmark drivers, not pytest suites.
+testpaths = ["tests"]
+norecursedirs = ["bench"]
+
+[dependency-groups]
+dev = [
+    "flake8>=7.3.0",
+    "pytest>=8.0.0",
+]
+jax = [
+    # CPU/base only — see [project.optional-dependencies] cuda12 / cuda13 for
+    # the per-site GPU variant.  Do not re-pin a CUDA major here.
+    # Same window as [project.dependencies] and src/runtime/jax_support.py.
+    "jax>=0.9.0,<0.10.0",
+    "jaxlib>=0.9.0,<0.10.0",
+]
+build = [
+    "scikit-build-core>=0.11.0",
+    "cmake>=4.0.0",
+    "ninja>=1.10.0",
+]
+profile = [
+    "tensorboard>=2.20.0",
+    "tensorboard-plugin-profile>=2.22.0",
+    "xprof>=2.22.0",
+]

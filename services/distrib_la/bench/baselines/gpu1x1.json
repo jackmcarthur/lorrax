@@ -1,0 +1,648 @@
+{
+  "backend": "gpu",
+  "devices": 1,
+  "ffi_host_so": "/pscratch/sd/j/jackm/svc_distrib_la/build_host_h200/liblorrax_ffi_host.so",
+  "ffi_so": "/global/homes/j/jackm/software/lorrax_ffi_2026-08-07/liblorrax_ffi.so",
+  "jax_version": "0.7.0.dev20260807",
+  "jobid": "56447670",
+  "machine": "perlmutter",
+  "mesh": "1x1",
+  "nodes": 1,
+  "processes": 1,
+  "recorded": "2026-08-07T07:40:54-0700",
+  "rows": [
+    {
+      "backend": "off",
+      "compile_seconds": 0.0027169600361958146,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "plan.batched",
+      "seconds": 0.0025886710500344634,
+      "seconds_max": 0.002742198994383216,
+      "seconds_min": 0.00255274202208966,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.007662252988666296,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "plan.batched",
+      "seconds": 0.007468846975825727,
+      "seconds_max": 0.007581254991237074,
+      "seconds_min": 0.0074459119932726026,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.045691428997088224,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "plan.batched",
+      "seconds": 0.027635034057311714,
+      "seconds_max": 0.027705140004400164,
+      "seconds_min": 0.027627150004263967,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "off",
+      "compile_seconds": 0.03791004599770531,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native",
+      "route": "plan.batched",
+      "seconds": 0.053868569957558066,
+      "seconds_max": 0.07704686996294186,
+      "seconds_min": 0.037831443012692034,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 0.007117676956113428,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 0.022719048953149468,
+      "seconds_max": 0.029188667016569525,
+      "seconds_min": 0.0054891270119696856,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 0.011966822028625757,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 0.011228489980567247,
+      "seconds_max": 0.011352139990776777,
+      "seconds_min": 0.011053369962610304,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 0.08185735100414604,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 0.04536024696426466,
+      "seconds_max": 0.13805286498973146,
+      "seconds_min": 0.04121573700103909,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "compile_seconds": 0.04403089900733903,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 0.04414706298848614,
+      "seconds_max": 0.04691381996963173,
+      "seconds_min": 0.04398617101833224,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "1x1",
+      "op": "eigh",
+      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "1x1",
+      "op": "eigh",
+      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "1x1",
+      "op": "eigh",
+      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "1x1",
+      "op": "eigh",
+      "refused": "eigh backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available eigh backends on this mesh: native, cusolvermp, slate.",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 0.00549339602002874,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 0.005442127003334463,
+      "seconds_max": 0.005677993991412222,
+      "seconds_min": 0.00531659199623391,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 0.01112568099051714,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 0.011191608966328204,
+      "seconds_max": 0.059810575970914215,
+      "seconds_min": 0.011060634977184236,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 0.04152007802622393,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 0.041607986961025745,
+      "seconds_max": 0.1083373649744317,
+      "seconds_min": 0.04153282300103456,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "compile_seconds": 0.11290565697709098,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "cusolvermp",
+      "route": "plan.batched",
+      "seconds": 0.04395269596716389,
+      "seconds_max": 0.04425770801026374,
+      "seconds_min": 0.043517592013813555,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 0.8595346559886821,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.batched",
+      "seconds": 0.7756953500211239,
+      "seconds_max": 0.8628360900329426,
+      "seconds_min": 0.7034179709735326,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 0.7247173159848899,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.batched",
+      "seconds": 0.9539554860093631,
+      "seconds_max": 0.9919865159899928,
+      "seconds_min": 0.821236226009205,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 3.7287632150109857,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.batched",
+      "seconds": 3.713506200001575,
+      "seconds_max": 3.7406966829439625,
+      "seconds_min": 3.651374531968031,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 2.1622968149604276,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "eigh",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "plan.batched",
+      "seconds": 2.194399450032506,
+      "seconds_max": 2.278904175036587,
+      "seconds_min": 2.0875437020440586,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.0019295429810881615,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native2d",
+      "route": "plan.batched",
+      "seconds": 0.0015699149807915092,
+      "seconds_max": 0.0016748589696362615,
+      "seconds_min": 0.001547191001009196,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.003851510991808027,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native2d",
+      "route": "plan.batched",
+      "seconds": 0.003353564999997616,
+      "seconds_max": 0.003424983995500952,
+      "seconds_min": 0.0032371789566241205,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.0638864710344933,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native2d",
+      "route": "plan.batched",
+      "seconds": 0.004504327953327447,
+      "seconds_max": 0.004873402998782694,
+      "seconds_min": 0.0042742209625430405,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "native2d",
+      "compile_seconds": 0.00588416401296854,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "operands": "reused",
+      "reps": 5,
+      "resolved": "native2d",
+      "route": "plan.batched",
+      "seconds": 0.005526740977074951,
+      "seconds_max": 0.008117535035125911,
+      "seconds_min": 0.005357532005291432,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "refused": "cholesky backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "refused": "cholesky backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "refused": "cholesky backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "refused": "cholesky backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 1.3139438349753618,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "operands": "fresh per call (donated)",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "factor+solve",
+      "seconds": 1.256230988947209,
+      "seconds_max": 1.5081980919931084,
+      "seconds_min": 1.1537841419922188,
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 1.4012929170276038,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "operands": "fresh per call (donated)",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "factor+solve",
+      "seconds": 1.3045629799598828,
+      "seconds_max": 1.3587077839765698,
+      "seconds_min": 1.1787040599738248,
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 5.223647731996607,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "operands": "fresh per call (donated)",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "factor+solve",
+      "seconds": 5.6336180579965,
+      "seconds_max": 5.993911003984977,
+      "seconds_min": 5.511541809013579,
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "slate",
+      "compile_seconds": 1.3233570950105786,
+      "dtype": "complex128",
+      "mesh": "1x1",
+      "op": "cholesky",
+      "operands": "fresh per call (donated)",
+      "reps": 5,
+      "resolved": "slate",
+      "route": "factor+solve",
+      "seconds": 1.5736608549486846,
+      "seconds_max": 1.5875628399662673,
+      "seconds_min": 1.423188487009611,
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "distributed",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' (requested as 'distributed') needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off'",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "distributed",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' (requested as 'distributed') needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off'",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' (requested as 'distributed') needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off'",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "distributed",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' (requested as 'distributed') needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off'",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available solve_lu backends on this mesh: native, cusolvermp.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available solve_lu backends on this mesh: native, cusolvermp.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available solve_lu backends on this mesh: native, cusolvermp.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "scalapack",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'scalapack' is host-only but the mesh devices are 'CUDA'. Available solve_lu backends on this mesh: native, cusolvermp.",
+      "shape": [
+        2,
+        1024
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
+      "shape": [
+        2,
+        64
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
+      "shape": [
+        2,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
+      "shape": [
+        8,
+        256
+      ]
+    },
+    {
+      "backend": "cusolvermp",
+      "mesh": "1x1",
+      "op": "solve_lu",
+      "refused": "solve_lu backend 'cusolvermp' needs a true-2D mesh (px >= 2 and py >= 2): its block-cyclic 2-D layout degenerates on the 1x1 mesh. Use a true-2D mesh, or 'auto' (demotes to native with an announcement), or 'off' for the native path.",
+      "shape": [
+        2,
+        1024
+      ]
+    }
+  ],
+  "tag": "gpu1x1"
+}

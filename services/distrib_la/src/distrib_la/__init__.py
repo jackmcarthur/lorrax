@@ -1,0 +1,198 @@
+"""``distrib_la`` — distributed dense linear algebra over a JAX device mesh.
+
+One public API for ``polar_factor``, ``eigh``, ``cholesky``, ``solve_lu`` and
+``matmul`` on an ``('x','y')`` device mesh, over four backend families:
+**scalapack/PBLAS** (CPU preferred),
+**slate** (CPU fallback where it is not broken; ROCm always,
+declared-untested), **cusolvermp** (CUDA preferred) and **native**
+(pure JAX, everywhere).  A caller says what it wants computed and on which mesh;
+which library runs is a resolved fact it can read but never has to
+branch on.
+
+THE PACKAGE IS THE PUBLIC API.  There is no separate facade module: everything
+a consumer needs is a top-level name here, and importing
+``distrib_la.<submodule>`` from outside is a layering violation the
+monorepo's ``tests/test_layering.py`` fails on.  That is what makes
+"only distrib_la sees the provider families" checkable rather than
+aspirational — ScaLAPACK, SLATE and cuSOLVERMp appear in
+exactly one dependency edge in this package (:mod:`distrib_la.loader`, which
+dlopens a ``.so`` by path) and in zero of its declared dependencies.
+
+The surface
+-----------
+polar_factor(A, mesh, ...) -> (L, s)
+    Square distributed polar/SVD through a Hermitian dilation and one planned
+    Hermitian eigensolve.  The planned form separates eager resolution from
+    the trace-safe operation used in streamed k-point loops.
+``plan(op, mesh, *, backend='auto', n=None, batched_route='batch_reshard') -> Plan``
+    Resolve once, then call.  ``Plan(A)`` for one tile at ``P('x','y')``,
+    ``Plan.batched(A_stack)`` for ``P(None,'x','y')``.  Eigenvalues come
+    back replicated, eigenvectors as COLUMNS, on every backend.
+``Plan.batched_route`` / ``BATCHED_ROUTES`` / ``BATCHED_SCAN_UNROLL``
+    The batched surface is a ``lax.scan`` over the single-matrix op, and
+    ``batched_route`` is the ONE place that says how a given stack will
+    actually run: the scan, or the backend's own stacked entry where the
+    library has one (a backend-internal optimization behind the same
+    interface, never a second surface). The default third route moves the
+    batch axis onto the mesh, runs the device-local native kernel, and moves
+    matrix outputs back through explicit staged collectives. It is the
+    shipping default; explicit ``auto`` restores provider/scan selection.
+    Production selection is
+    ``BATCHED_ROUTE_CHOICES = ('auto', 'batch_reshard')``.
+``Plan.native_fn``
+    A pure, trace-safe closure — native backends only — for a call site
+    that needs the math INSIDE its own ``jit``.
+``matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N',
+backend='auto', batched_route='batch_reshard')``
+    Distributed rank-2 or batched rank-3 GEMM in the same face layout as a
+    plan. The default performs x/y face-to-batch exchanges, local GEMM, then
+    y/x inverse exchanges; ``batched_route='auto'`` runs :func:`panel_matmul`
+    for every backend name but ``'off'``, which makes the staged route
+    provider-free.
+``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0,
+layout='face', enable_active_range=False) -> GemmPlan``
+    Resolve one N,N GEMM shape ONCE, for a caller
+    that will call it many times from inside its own ``jax.jit``/
+    ``lax.scan`` (G construction, per-tau Sigma projection).  ``GemmPlan(A,
+    B, C=None, *, out=None)`` is trace-safe. With active ranges enabled,
+    ``GemmPlan.active_range(A, B, lo, hi, C=None, *, out=None, weights=None)``
+    contracts an exact dynamic interval in the fixed-size operands. Optional
+    ``weights`` has shape ``(nq, k)``. When bounds are known before tracing,
+    ``GemmPlan.prepare_active_range(lo, hi)`` returns a callable with the same
+    operand, weighting and accumulation contract but no runtime bounds
+    operands. The face layout runs :func:`panel_matmul`; the local panel
+    products, like the axis layout's, use cuBLAS pointer views on CUDA and
+    bounded JAX dot panels elsewhere.
+    See ``docs/services/distrib_la/api.md`` § Active ranges.
+``hermitian_part(a)``, ``hermitian_block(block, off, corner)``, ``join_columns(a, b)``, ``diagonal_like(values, like)``, ``on_face(fn, out, *operands, **static)``
+    Block glue for stacked ``[b, R, R]`` operators and ``[b, n, R]`` panels
+    that keeps each result on its operand's ``('x','y')`` face. Eager
+    concatenation and ``a + a^H`` of face-sharded arrays come out replicated;
+    these run the same elementwise program with face output shardings, so
+    values are bitwise equal. Traced or unsharded operands take the plain
+    function.
+``resolve_backend(op, requested, mesh, *, n=None) -> str``
+    The raising probe.  ``n`` is decoupled from the operands on purpose:
+    a caller that will pad can ask before it has built anything.
+``list_backends(op, mesh) -> dict``
+    The never-raising report, for startup banners.
+``BACKEND_CHOICES``
+    The vocabulary.  Importable with NO ``.so`` anywhere on the machine —
+    a deck parser must not need the FFI layer to read a deck.
+``dial_key() -> tuple``
+    The factory-time cache-key aggregate.
+``mesh_key(mesh) -> tuple``
+    A stable, hashable mesh identity (axes, extents, platform, device ids)
+    for any cache whose stored value does NOT retain the mesh.
+
+Two phases, and they stay two
+-----------------------------
+``plan()`` is EAGER (it dlopens and reads ``jax.process_count()``); what it
+returns is TRACE-SAFE.  Only platform and handler guards can fire at
+resolve time — operand dtype, rank and extent are trace-time facts — so a
+single-phase API would have to lie about when it checked.
+
+Promise semantics
+-----------------
+A returned backend name means EVERY guard passed; the call cannot then
+fail for an availability or geometry reason.  Explicit requests refuse
+rather than downgrade; only ``auto`` demotes, and it announces on rank 0.
+The worst measured defect in this tree was a silent route change that ran
+to completion with rc=0 and a QP gap of −161 eV, so this is not
+punctilio — it is the failure mode.
+"""
+
+from __future__ import annotations
+
+from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
+                               hermitian_part, join_columns, on_face)
+from distrib_la.subspace import plan_orthogonalization, plan_subspace, subspace_route, SUBSPACE_ROUTE
+from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
+from distrib_la.workspace import eigh_stack_bytes, lu_workspace_bytes, fits_local, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
+from distrib_la.loader import dial_key, has_target, probe_target
+from distrib_la.matmul import (
+    MATMUL_BACKEND_CHOICES,
+    contract_faces,
+    matmul,
+    resolve_matmul_backend,
+)
+from distrib_la.matmul_plan import GemmPlan, gemm_plan, local_gemm_plan
+from distrib_la._panel_matmul import batch_gram, panel_matmul
+from distrib_la.plan import RoomExhausted, room_or_exhausted  # noqa: E402
+from distrib_la.plan import (
+    BATCHED_ROUTE_CHOICES,
+    BATCHED_ROUTE_DEFAULT,
+    BATCHED_ROUTES,
+    BATCHED_SCAN_UNROLL,
+    DONATES,
+    ROUTE_BACKEND_BATCHED,
+    ROUTE_BATCH_RESHARD,
+    ROUTE_SCAN,
+    Plan,
+    StackRoute,
+    ensure_sharding,
+    new_stack_routes,
+    plan,
+)
+from distrib_la.polar import (PolarPlan, plan_polar_factor, polar_factor,
+                             right_singular_vectors, leading_eigenvectors,
+                             leading_eigenvectors_above, retain_leading_eigenvectors)
+from distrib_la.resolve import (
+    BACKEND_CHOICES,
+    CHOLESKY_BACKENDS,
+    EIGH_BACKENDS,
+    LU_BACKENDS,
+    NATIVE,
+    OPS,
+    backend_module,
+    list_backends,
+    mesh_is_cpu,
+    mesh_key,
+    mesh_platform,
+    resolve_backend,
+)
+
+from ._active_local import active_weights_on_load
+from ._batch_reshard import batch_layout, is_batch_layout, local_batch
+from ._result_check import checked_program, checked_shapes, native_eigh_jacobi
+from distrib_la.local_eigh import eigh_local, eigh_route, COMPLEX_EIGH_ROUTE
+from distrib_la.local_lu import (LOCAL_LU_ROUTE, lu_solve_local, solve_local, routes as local_lu_routes,
+                               tri_solve_local)
+from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
+
+__all__ = [
+    "eigh_local", "eigh_route", "COMPLEX_EIGH_ROUTE",
+    "solve_local", "lu_solve_local", "tri_solve_local", "local_lu_routes", "LOCAL_LU_ROUTE",
+    "local_batch", "batch_layout", "is_batch_layout",
+    "LocalSubspacePlan", "plan_local_subspace", "plan_subspace",
+    "plan_orthogonalization", "subspace_route", "SUBSPACE_ROUTE",
+    # face-pinned block glue for stacked [b, R, R] operators
+    "face_sharding", "on_face", "hermitian_part", "hermitian_block",
+    "join_columns", "diagonal_like",
+    # plan
+    "Plan", "plan", "StackRoute", "RoomExhausted", "room_or_exhausted", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
+    # native dense workspace queries (no allocation)
+    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local", "eigh_stack_bytes", "lu_workspace_bytes",
+    # polar / SVD
+    "PolarPlan", "plan_polar_factor", "polar_factor",
+    "right_singular_vectors", "leading_eigenvectors", "leading_eigenvectors_above",
+    "retain_leading_eigenvectors",
+    # distributed matrix multiplication
+    "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
+    # planned N,N GEMM (trace-safe, for hot loops)
+    "GemmPlan", "gemm_plan", "local_gemm_plan", "panel_matmul", "batch_gram",
+    # the batched route toggle and its dial
+    "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
+    "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_ROUTE_DEFAULT",
+    "BATCHED_SCAN_UNROLL",
+    # resolution
+    "resolve_backend", "list_backends", "backend_module",
+    "BACKEND_CHOICES", "EIGH_BACKENDS", "CHOLESKY_BACKENDS", "LU_BACKENDS",
+    "OPS", "NATIVE", "mesh_platform", "mesh_is_cpu", "mesh_key",
+    # whether a platform's active-range GEMM weights its operand as it loads it
+    "active_weights_on_load",
+    # capability
+    "probe_target", "has_target", "dial_key",
+    # round-off tolerance of every linear-algebra check
+    "roundoff_tol", "ROUNDOFF_MARGIN",
+]

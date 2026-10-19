@@ -1,0 +1,19 @@
+{
+  "cbm_ev": -4.27445781919291,
+  "indirect_gap_ev": 0.0722313672008458,
+  "nbnd": 9,
+  "nelec": 3.0,
+  "nks": 9,
+  "occupied_bands": 3,
+  "schema": "qe.pw.scf_xml_report.v1",
+  "source_xml": "/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/H2/07_fixturefix_20260930/e3_general_h2minus_lda_tight/qe/scf-schema.xml",
+  "source_xml_sha256": "66310c5af0b278e95408af3d1c8c2e9898a19f39d47ee9dd82ec44458ff65956",
+  "total_energy_ha": -1.060257506912279,
+  "total_energy_ry": -2.120515013824558,
+  "total_magnetization_bohr_magneton": [
+    -1.741010548387164e-24,
+    0.9999999999999939,
+    -5.181187938393671e-25
+  ],
+  "vbm_ev": -4.346689186393756
+}

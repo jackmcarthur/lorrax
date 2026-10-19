@@ -1,0 +1,2991 @@
+"""Frequency-resolved W restart tensors and the B/Omega fit store.
+
+This module owns MPA sample and pole bytes.  It remains dependency-light:
+nothing here imports from ``gw``, the ``symmetry_maps`` public API is imported
+lazily through :func:`_qs`, and every ``jax`` import is inside the function
+that needs it — so importing THIS MODULE costs no jax.  (Importing the
+``file_io`` PACKAGE does, and has since the wfn_loader extraction:
+``file_io/__init__.py`` imports ``wfn_loader`` at module scope and that
+imports jax.  Re-measured 2026-08-15; this sentence used to claim the
+package was jax-free and it has not been for some time.)
+
+WHAT THIS FORMAT IS.  The multipole-W fit needs W_c evaluated on the
+double-parallel sampling grid — 2·n_p complex frequencies on two lines
+ϖ₁ and ϖ₂ (``docs/theory/THEORY_mpa_implementation.md``) — before it can
+fit anything, and the
+owner's memory constraint is exact: a SMALL NUMBER of W_q(μ,ν) copies
+fit in memory at once, but NOT all ω_i.  So every frequency goes to the
+restart file, with the frequency axis LEADING::
+
+    (n_omega, n_q_on_disk, N_mu, N_mu)      complex128
+
+prepended to the per-frequency wedge layout the q_irr checkpoint
+landed.  The leading position is the point: a slab ``ds[i]`` is a
+contiguous ``(n_q, N_mu, N_mu)`` read that is bit-identical to what a
+frequency-free file would hold, so the axis is REMOVABLE later without
+touching any downstream reader — the fit stage can graduate to holding
+one frequency at a time, or the axis can be dropped entirely for a
+static-W run, and neither is a format migration.
+:func:`read_w_slab_collective` is that read, through SlabIO.  The
+removability claim has a test.
+
+THE WEDGE APPLIES PER FREQUENCY.  W_c(q, ω) transforms under the space
+group exactly as W_c(q) does at each ω separately — the symmetry
+operation acts on (q, μ, ν) and does not touch ω — so the stored tables
+(``irr_idx_q``, ``sym_idx_q``, ``q_irr_frac``, ``sym_perm``,
+``L_table``, ``n_sym_spatial``) are shared across the whole frequency
+axis and unfolding is ``unfold_isdf_operator`` applied slab by slab.
+One table group per tensor, not one per frequency: n_omega copies of a
+table that cannot differ is n_omega chances for them to differ.
+
+VERSION 2, AND WHY IT IS NOT OPTIONAL.  The frequency axis bumps
+``qirr_format_version`` from 1 to 2.  It has to, and the reason is the
+sharpest failure this format has: a version-1 reader handed a
+``(n_omega, n_q_ibz, N_mu, N_mu)`` dataset stamped version 1 takes
+``ds.shape[0]`` as the q extent and ``ds.shape[-1]`` as the μ extent,
+and BOTH ARE THE RIGHT SHAPE — the tables validate, the shape-vs-attr
+cross-check agrees, nothing refuses — whenever ``n_omega`` happens to
+equal the wedge extent.  Si 4³ reduces 64 q to 8 and an n_p = 4 fit
+samples 8 frequencies; that coincidence is one deck away, not one in a
+million.  So: the writer stamps 2, ``qirr_store.read_tensor`` refuses
+any rank but 3 under its own stamp, and
+:func:`_refuse_unless_rank_matches_version` discriminates on the RANK
+before any reader here believes an extent.
+
+PRESENCE IS NEVER READINESS, PER FREQUENCY.  ``gw_init`` allocates a
+full-size zero ``W0`` before the screening that fills it exists, and the
+April BSE incident was a plausible excitonic spectrum out of an all-zero
+screening tensor that passed every shape check.  A frequency-resolved
+file makes that worse, not better: the producer fills ω slabs one at a
+time, so a file with 16 slabs allocated and 9 written is a state the
+pipeline REACHES ROUTINELY rather than a state it crashes into.  The
+``data_ready`` ledger in the ``<name>__mpa`` group carries one bool per
+frequency and :func:`read_w_slab_collective` refuses an unstamped slab
+by index.
+The scalar ``qirr_data_ready`` attr is stamped beside it as
+``all(ledger)`` so that any reader honouring the v1 attr gets the
+CONSERVATIVE answer, and a disagreement between the two refuses.
+
+THE μ PAD DOES NOT REACH DISK.  Inherited unchanged from the q_irr
+checkpoint and restated because it is the rule most easily lost when a
+layout gains an axis: stored tables and tensors are LOGICAL, the pad
+width is ``padded_mu_extent(n_rmu, device_count())`` and therefore
+device-count-dependent, and SHARDING_RULES §2 forbids such a quantity
+in a restart artifact because a file written on four ranks must read on
+eight.  Readers re-pad against their OWN mesh
+(``runtime.padding.padded_mu_extent``).
+
+THE COLUMN READER IS THE MEMORY ARGUMENT.  Per-element plasmon-pole
+fits want a few ν columns ACROSS ALL FREQUENCIES, never a full
+(N_μ, N_μ) frequency slab and never all of ω for a full row-block.
+:class:`WColumnReader` is that read, held across a bounded fit epoch, and
+:func:`choose_column_budget` is its arithmetic; the budget is sized so the
+returned block costs about
+what ONE (N_μ, N_μ) tile costs, which is the unit the owner's
+constraint is stated in.  The block is 1-D SHARDED ON THE ROW AXIS
+ONLY — never 2-D — because the fit is elementwise in (μ, ν) and a
+second split on the column axis buys nothing while making every rank's
+column count a function of the mesh shape.
+
+EVERY FILE THIS MODULE TOUCHES IS TOUCHED THROUGH TWO HDF5 LIBRARY
+INSTANCES, and that is the module's sharpest operational constraint.
+The bytes go through ``SlabIO`` (the FFI's cray parallel libhdf5); the
+ledger, the attrs and the unfold tables go through h5py (its own
+bundled libhdf5).  Two instances, two metadata caches, two open-file
+tables, one file — undefined the moment they overlap with a writer
+(audit A1; sandbox claims/0110;
+``docs/architecture/slab_io.md#one-owner``).  So:
+
+* **every** h5py open in this module goes through :func:`_h5`, which
+  declares to :mod:`file_io.hdf5_owner` and is refused BY NAME if the
+  FFI holds a live handle on the same path.  A new h5py open added
+  outside that entry point is a defect, not a shortcut;
+* the collective readers do their h5py work BEFORE the collective
+  handle opens and none after — :class:`PoleReader` holds ONE
+  ``SlabIO`` across an iteration's pole batches for exactly that
+  reason;
+* the alternation is COUNTED, per path, and reported: measured 2026-08-15
+  at **1027 cross-library alternations on one file in one SC
+  iteration**, most of them the former reopen-per-block fit writer.  The
+  production walk now holds one :class:`FitWriter` payload handle and commits
+  its small ledger once, after that handle closes.
+  ``LORRAX_HDF5_ONE_OWNER=strict`` turns the count into a refusal.
+
+ONE PATH.  Every payload byte is written and read through the collective
+forms (``*_collective``, :class:`FitWriter`, :class:`WColumnReader`,
+:class:`PoleReader`); :func:`stamp_w_omega` stamps metadata on bytes SlabIO
+already wrote.  The unit tests run that same path on a CPU mesh through the
+host ``SlabIO`` stand-in in ``tests/_mpa_test_geometry.py``; the
+Perlmutter leg is ``tests/multi_device/mpa_fit_stream_gate.py``.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import datetime
+import hashlib
+import os
+import sys
+
+import numpy as np
+
+#: The frequency-resolved layout.  Registered ALONGSIDE version 1 rather
+#: than replacing it: a v1 file is still a v1 file and still reads, and
+#: :data:`QIRR_FORMAT_VERSIONS_READABLE` is the set the widened reader
+#: accepts.  The value lives here rather than in ``qirr_store`` only
+#: while this module is staged outside the format layer; when it moves,
+#: it moves next to ``QIRR_FORMAT_VERSION``.
+QIRR_FORMAT_VERSION_FREQ = 2
+
+#: Every version :func:`_refuse_unless_rank_matches_version` accepts.
+#: A reader that
+#: reads an unknown version best-effort returns wrong numbers on the day
+#: the layout changes; a reader that accepts a KNOWN version without
+#: checking the rank returns wrong numbers on the day the layout gains
+#: an axis, which is this day.
+QIRR_FORMAT_VERSIONS_READABLE = (1, 2)
+
+#: Rank of the stored dataset THIS format adds — version 2 is
+#: ``(n_omega, n_q, N_μ, N_μ)``.  The rank is the discriminant, not a
+#: consistency nicety; see :func:`_refuse_unless_rank_matches_version`.
+#:
+#: Version 1's rank is NOT restated here.  It is
+#: ``symmetry_maps.QIRR_RANK_BY_VERSION``'s to state and
+#: ``qirr_store.read_tensor``'s to enforce, and the format layer asks
+#: extenders in as many words to compose (``{**QIRR_RANK_BY_VERSION, 2:
+#: 4}``) rather than to restate — a second copy of "version 1 is rank 3"
+#: is a second thing to update on the day it is not.  Composed through
+#: :func:`_rank_by_version` because the public API is imported lazily.
+_MPA_RANK = 4
+
+
+def _rank_by_version():
+    """Every version's rank: the format layer's table, plus ours."""
+    return {**_qs().QIRR_RANK_BY_VERSION, QIRR_FORMAT_VERSION_FREQ: _MPA_RANK}
+
+#: Sibling group holding the ω grid, its protocol provenance, and the
+#: per-frequency readiness ledger.  Beside the tensor and never
+#: elsewhere, for the same reason the unfold tables are: a tensor whose
+#: sampling grid lives in another file is a tensor that silently decays
+#: when anything upstream is regenerated.
+MPA_GROUP_SUFFIX = "__mpa"
+
+#: Sibling group holding the staged-fit completion ledger.
+MPA_FIT_SUFFIX = "__mpafit"
+
+#: Tiny scalar q->0 fit beside, but independent of, the body pole tensors.
+MPA_HEAD_SUFFIX = "__mpahead"
+
+#: Compact, write-once receipt for the successful body-fit attempt.  It is
+#: committed before the later scalar-head/root-COMPLETE transaction.
+MPA_FIT_IO_RECEIPT_SUFFIX = "__mpafit_io"
+
+#: The fit driver's bounded durability epoch.  Kept beside the receipt schema
+#: because the receipt authenticates its open/close census against this value;
+#: the driver aliases this constant rather than maintaining a second copy.
+FIT_IO_CHECKPOINT_BLOCKS = 32
+
+# The fit keeps the W wedge's q map beside its poles.  The tables belong to
+# ``symmetry_maps``; this is only the dataset name under which that service
+# files them.
+FIT_TABLE_OWNER = "Omega_p"
+FIT_ENERGY_UNIT_ATTR = "mpa_fit_energy_unit"
+FIT_ENERGY_UNITS = {"Ry": 1.0, "Ha": 2.0}
+
+#: Scalar metrics retained in the small completion ledger and enforced by
+#: :func:`validate_fit_store`.  They are computed for every element, reduced
+#: per block, and never need an ``(n_q, n_mu, n_mu)`` payload dataset.
+CERTIFICATION_METRICS = ("condition", "backward_error")
+
+#: The sole per-element diagnostic retained in production fit stores.  It is
+#: useful when localizing an ill-conditioned pole fit; all other fit health is
+#: reduced into :data:`CERTIFICATION_METRICS` before the payload write.
+PERSISTED_DIAGNOSTICS = ("condition",)
+
+#: Every scalar-head fit model :func:`read_head_fit_collective` knows how to
+#: interpret.  The reader refuses an unknown model rather than serving
+#: poles whose fitting protocol nobody can name.
+_HEAD_FIT_MODELS = (
+    "head_off_zero",
+    "fixed_dft_gn",
+    "dft_direct_loewner",
+    "bgw_q0shift_loewner",
+    "bse_resolvent_micro_loewner",
+    "qsgw_direct_loewner",
+    "qsgw_schur_loewner",
+    "dft_direct_companion",
+    "bgw_q0shift_companion",
+    "bse_resolvent_micro_companion",
+    "qsgw_direct_companion",
+    "qsgw_schur_companion",
+    "dft_direct_thiele",
+    "bgw_q0shift_thiele",
+    "bse_resolvent_micro_thiele",
+    "qsgw_direct_thiele",
+    "qsgw_schur_thiele",
+)
+
+#: Bump when the fit store's layout changes.  Independent of the W
+#: format's version: the two files have separate lifetimes and a reader
+#: of one is not a reader of the other.
+MPA_FIT_FORMAT_VERSION = 1
+
+#: Attr marking the leading frequency axis.  Its presence is the ATTR
+#: half of the rank cross-check, and the string names what is removable.
+_FREQ_ATTR = "mpa_freq_axis"
+_FREQ_ATTR_VALUE = "leading"
+
+#: Sampling-protocol keys every W(ω) file must carry, with the units the
+#: theory plan states them in.  Required rather than defaulted: a fit
+#: whose partition α nobody recorded is a fit nobody can reproduce, and
+#: α is the one parameter that differs between insulators (1) and metals
+#: (2) while changing nothing about the shapes.
+_SAMPLING_REQUIRED = ("varpi", "n_p", "alpha", "omega_max")
+
+#: Everything the ω-grid digest covers, in a fixed order.
+_SAMPLING_ORDER = ("protocol", "varpi", "n_p", "alpha", "omega_max")
+
+#: The attrs version 2 adds on top of the version-1 q_irr set — the
+#: EXACT difference between the two stamps, which is what makes the
+#: removability claim checkable: set these aside and the version number,
+#: and a v2 file's attrs must equal a v1 file's attr for attr.  An
+#: explicit closed set rather than an ``mpa_`` prefix match, so that an
+#: attr added later to one format and not the other fails the comparison
+#: instead of being swallowed by a ``startswith``; the sampling portion
+#: is derived from :data:`_SAMPLING_ORDER`, the one list of sampling
+#: keys.  (``mpa_writer`` is deliberately absent: it says BY WHAT, not
+#: WHAT, and belongs with the timestamps the comparison already
+#: exempts.)
+_MPA_OWNED_ATTRS = (
+    _FREQ_ATTR, "mpa_n_omega", "mpa_omega_units",
+    *("mpa_" + key for key in _SAMPLING_ORDER),
+    "mpa_grid_hash",
+)
+
+#: Occupation-provenance stamps, in a fixed order; attr name = "mpa_" +
+#: key.  Written only when an occupation state is supplied, so insulating
+#: stores stay byte-identical.  Asserted at REUSE sites only: a same-run
+#: assert would compare the store to the state that just wrote it (the
+#: same circularity that retired fit_identity), so the consumers are the
+#: cross-run reader and the QSGW per-iteration log.
+_OCC_STAMP_ORDER = (
+    "occ_hash", "mu_ry", "smearing_family", "smearing_width_ry",
+    "occ_nelec")
+
+# Canonical mean-field identity carried from the W sample into its pole fit.
+# The digest and scheme are owned by ``common.parallel_transport``; this
+# format only gives those existing facts stable provenance keys.
+WFN_IDENTITY_PROVENANCE_KEYS = (
+    "wfn_fingerprint_scheme", "wfn_fingerprint")
+
+# Opaque receipt owned by ``gw_init``.  This format transports it from the
+# charge-zeta/restart transaction through samples and fits; it does not know
+# which zeta provenance fields contribute to the digest.
+CHARGE_ZETA_IDENTITY_PROVENANCE_KEYS = (
+    "charge_zeta_identity_scheme", "charge_zeta_identity")
+MPA_IDENTITY_PROVENANCE_KEYS = (
+    *WFN_IDENTITY_PROVENANCE_KEYS, *CHARGE_ZETA_IDENTITY_PROVENANCE_KEYS)
+
+
+def _occ_stamp_values(occupation_state):
+    """The five stamp values from a duck-typed occupation state."""
+    st = occupation_state
+    return {
+        "occ_hash": str(st.occ_hash),
+        "mu_ry": float(st.mu_ry),
+        "smearing_family": str(st.smearing_family),
+        "smearing_width_ry": float(st.smearing_width_ry),
+        "occ_nelec": float(st.n_electrons),
+    }
+
+
+def stamp_occupation_provenance(obj, occupation_state):
+    """Stamp the ``mpa_<key>`` occupation attrs on an h5 object."""
+    for key, val in _occ_stamp_values(occupation_state).items():
+        obj.attrs["mpa_" + key] = val
+
+
+def assert_occupation_stamps(
+        src, occupation_state, *, where="fit store",
+        compatible_occ_hashes=()):
+    """REUSE-site gate: the store's occupations are the run's occupations.
+
+    Refuses an unstamped store outright — a metallic reuse of a store
+    that predates the stamps cannot certify compatibility and must be
+    regenerated.  Never called on the same-run write path (W4: stamps are
+    asserted at REUSE sites only; claim 0194).
+
+    WHAT IS ACTUALLY COMPARED, because the summary line over-reaches:
+    ``occ_hash``, ``smearing_family``, ``smearing_width_ry`` and
+    ``occ_nelec``.  **``mu_ry`` is NOT compared** — it is carried in the
+    failure message for context only, so a store whose chemical potential
+    differs from the run's passes this gate.
+
+    ``occupation_state`` is duck-typed and must expose ``occ_hash``,
+    ``mu_ry``, ``smearing_family``, ``smearing_width_ry`` and
+    ``n_electrons`` (which is stamped under the key ``occ_nelec`` — the
+    attribute and the stamp are deliberately spelled differently and that
+    is the only place it is written down). ``compatible_occ_hashes`` is a
+    caller-computed set of exact legacy encodings; it exists only to migrate
+    stores whose old digest included zero band padding. Other stamp fields
+    remain exact, and this layer never guesses a padding geometry.
+
+    Rank-local and serial.  ``src`` is a path (this call's ``_h5`` owns the
+    handle) or an open h5py group (the caller owns it); the read is
+    hard-wired ``mode='r'``, so passing the PATH while holding the file
+    open ``'a'`` yourself puts a second h5py handle on it.
+    """
+    stamps = _bundle_reader.read_occupation_stamps(src)
+    if stamps is None:
+        raise ValueError(
+            f"{where}: no occupation stamps present. A metallic reuse "
+            "needs a store written with its occupation state "
+            "(mpa_occ_hash ...); regenerate the fit store with the "
+            "current build.")
+    want = _occ_stamp_values(occupation_state)
+    compatible = {str(value) for value in compatible_occ_hashes}
+    occ_exact = stamps["occ_hash"] == want["occ_hash"]
+    occ_compatible = stamps["occ_hash"] in compatible
+    hard = ("smearing_family", "smearing_width_ry", "occ_nelec")
+    bad = [k for k in hard if stamps[k] != want[k]]
+    if not (occ_exact or occ_compatible):
+        bad.insert(0, "occ_hash")
+    if bad:
+        detail = ", ".join(
+            f"{k}: store {stamps[k]!r} != run {want[k]!r}" for k in bad)
+        raise ValueError(
+            f"{where}: occupation stamps disagree with the run's "
+            f"occupation state ({detail}; store mu_ry={stamps['mu_ry']!r}, "
+            f"run mu_ry={want['mu_ry']!r}). The fit was made from "
+            "different occupations — regenerate it.")
+    return "exact" if occ_exact else "legacy_zero_pad"
+
+
+#: Bytes per complex128 element.  Named because it appears in the budget
+#: arithmetic, and a budget whose constants are anonymous is a budget
+#: nobody can check against a message.
+COMPLEX128_BYTES = 16
+
+
+_QS_CACHE: list = []
+
+
+def _qs():
+    """The ``symmetry_maps`` public API, imported lazily and once.
+
+    THE PUBLIC API, NOT THE SUBMODULE.  Everything this module needs from the
+    q_irr format layer — :class:`~symmetry_maps.QirrDest`,
+    :func:`~symmetry_maps.qirr_attr_str`,
+    :data:`~symmetry_maps.QIRR_VERSION_ATTR`,
+    :data:`~symmetry_maps.QIRR_TABLE_SUFFIX`,
+    :func:`~symmetry_maps.validate_qirr_tables`,
+    :func:`~symmetry_maps.qirr_generator_commit`,
+    :data:`~symmetry_maps.QIRR_RANK_BY_VERSION` and the read/stamp
+    entry points — is a TOP-LEVEL name on ``symmetry_maps``.  It was not
+    always: this module was written while the q_irr checkpoint was still
+    landing, when the format's plumbing was private to
+    ``symmetry_maps.qirr_store``, and it reached into that submodule for
+    thirty-four of them.  ``tests/test_layering.py``'s public-API rule counted
+    that reach, correctly — a consumer that imports a service's submodule
+    is a consumer that stops the service being replaceable — and the
+    checkpoint answered it by PUBLISHING the plumbing rather than by
+    letting a second store copy it.  The public API's own docstring gives the
+    reason in the format layer's words.
+
+    STILL LAZY, for the reason that outlived the other one.
+    ``symmetry_maps`` is a jax-importing package and ``file_io`` is
+    imported by tools that want neither jax nor a device; paying the
+    dependency at first use rather than at collection is what keeps this
+    module dependency-light, which is half of what makes it MOVABLE (see
+    the module docstring).  The staging argument that it might sit in a
+    tree without the checkpoint is retired — the checkpoint is landed,
+    and this module now depends on names only it publishes.
+    """
+    if _QS_CACHE:
+        return _QS_CACHE[0]
+    try:
+        import symmetry_maps
+    except ImportError as exc:                              # pragma: no cover
+        raise ImportError(
+            "file_io.mpa_store needs the symmetry_maps service — the "
+            "q_irr restart format layer.  The frequency-resolved layout "
+            "is that format with a leading ω axis and it shares its "
+            "table record, digest, validation and provenance stamp "
+            "rather than restating them.  Install/branch onto a tree "
+            "that carries it."
+        ) from exc
+    _QS_CACHE.append(symmetry_maps)
+    return symmetry_maps
+
+
+@contextlib.contextmanager
+def _h5(target, mode, *, where=None):
+    """THE serial-h5py entry point onto a store the FFI transport also drives.
+
+    Every h5py open in this module goes through here, with no exception,
+    because every file this module writes is ALSO written by ``SlabIO``
+    through a different HDF5 library instance (audit A1; sandbox
+    claims/0110).  What the entry point adds over a bare ``QirrDest``:
+
+    * it DECLARES the open to :mod:`file_io.hdf5_owner`, which refuses by
+      name if the FFI currently holds a live handle on the same path and
+      either side can write — the undefined case, and the one whose
+      symptom is a native rank-0 segfault rather than an exception;
+    * it FLUSHES before close on a write mode, so the bytes are durable
+      before the next collective open reads the superblock;
+    * it closes in a ``finally`` — the registry must not be left believing
+      a handle is live after an exception, or it would refuse every later
+      legitimate open on the path.
+
+    ``target`` is a path (this entry point owns the handle) or an already-open
+    h5py File/Group (the caller owns it; the entry point still declares it, since
+    a live foreign handle is exactly what the registry needs to know
+    about).  ``where`` defaults to the calling function's name.
+
+    THE FLUSH IS OWNED-ONLY.  A caller-supplied File/Group is never
+    flushed by this entry point, on any mode — the caller owns the handle and
+    therefore owns its durability.  Only the path form gets the flush.
+
+    THE ONE OPEN THAT USED TO BYPASS IT was :func:`read_w_tables`, which
+    forwarded straight to ``qirr_store.read_tables`` and let the format
+    layer open h5py undeclared — on every rank, in production.  It routes
+    through here since 2026-08-15 (audit §E.3 item 2), which is what makes
+    the first sentence above a machine-enforced invariant rather than a
+    convention; ``test_the_table_read_is_declared_to_the_registry`` is the
+    cell that would notice it drifting back.
+    """
+    from .hdf5_owner import STACK_H5PY, is_write_mode, note_close, note_open
+
+    if where is None:
+        try:
+            where = "mpa_store." + sys._getframe(2).f_code.co_name
+        except Exception:                                   # pragma: no cover
+            where = "mpa_store"
+    owned = isinstance(target, (str, bytes, os.PathLike))
+    if owned:
+        path, reg_mode = os.fspath(target), mode
+    else:
+        handle = getattr(target, "file", None)
+        path = getattr(handle, "filename", None)
+        # The caller's real mode, not ours: ``QirrDest`` ignores ``mode``
+        # on an open group, so claiming "a" for a handle the caller opened
+        # "r" would invent a writer.
+        reg_mode = getattr(handle, "mode", "r") or "r"
+    token = (None if path is None
+             else note_open(path, STACK_H5PY, reg_mode, where=where))
+    try:
+        dest = _qs().QirrDest(target, mode)
+        # ``QirrDest.__enter__`` is where ``h5py.File`` runs, so the
+        # status_flags OSError surfaces THERE, not in the constructor.
+        # Entering explicitly is what lets the diagnosis wrap it while the
+        # ``finally`` below still releases the registry claim.
+        try:
+            grp = dest.__enter__()
+        except OSError as exc:
+            raise _superblock_flag_diagnosis(exc, path, mode, where) from exc
+        try:
+            try:
+                yield grp
+            finally:
+                if owned and is_write_mode(mode):
+                    grp.file.flush()
+        finally:
+            dest.__exit__(None, None, None)
+    finally:
+        if token is not None:
+            note_close(path, token)
+
+
+#: The exact HDF5 phrase.  It is the SUPERBLOCK's ``status_flags``
+#: write-open bit, not a POSIX lock, which is why
+#: ``HDF5_USE_FILE_LOCKING`` does not touch it and why the runs that died
+#: this way had it FALSE.
+_STATUS_FLAGS_PHRASE = "file is already open for write"
+
+
+def _superblock_flag_diagnosis(exc, path, mode, where):
+    """Turn HDF5's status_flags OSError into a message that names its cause.
+
+    THE FAILURE.  At 16 ranks on 4 nodes, the twelve ranks NOT on rank 0's
+    node die here — every one of them, at the same line, after all of an
+    iteration's fit blocks are on disk — with
+
+        OSError: Unable to synchronously open file (file is already open
+        for write (may use <h5clear file> to clear file consistency flags))
+
+    and the single-node arm of the same deck completes three SC iterations
+    clean.  It is intermittent at 4 ranks on ONE node too, so "single-node
+    is safe" is a frequency statement, not an invariant.
+
+    WHAT IT IS NOT.  Not a POSIX lock: the failing runs and the passing runs
+    both had ``HDF5_USE_FILE_LOCKING=FALSE``.
+    Not this entry point's bookkeeping: ``file_io.hdf5_owner`` is per-process by
+    construction and at the failing open no FFI handle is live in THAT
+    rank's process.  Not caused by the A1 work: a detached worktree at
+    ``bf57701b`` — before ``hdf5_owner``, ``_h5`` and ``PoleReader``
+    existed — fails identically, same twelve ranks, same message.
+
+    WHAT IT IS.  h5py's libhdf5 reading the SUPERBLOCK's ``status_flags``
+    and finding the write-open bit set.  The FFI's cray libhdf5_parallel
+    cleared that bit at ``H5Fclose``; the clear has to become visible to
+    three other Lustre clients, and on these runs it had not.  Two HDF5
+    library instances, one file — audit A1's hazard escalated across
+    nodes.
+
+    So this raises the same class with the diagnosis attached.  It does
+    NOT repair anything: the repair is to stop reading a phdf5-written
+    store with a second HDF5 library, which needs an FFI attribute reader
+    (the ledger is attribute-heavy) or a rank-0 read plus a broadcast.
+    Until then, a message that names the mechanism is what stops the next
+    session re-deriving it from twelve identical tracebacks.
+    """
+    if _STATUS_FLAGS_PHRASE not in str(exc):
+        return exc
+    from common.collectives import process_rank, process_count
+    try:
+        rank, world = int(process_rank()), int(process_count())
+    except Exception:                                       # pragma: no cover
+        rank, world = -1, -1
+    return OSError(
+        f"{exc}\n"
+        f"  LORRAX diagnosis: this is the HDF5 SUPERBLOCK status_flags "
+        f"write-open bit, read by h5py's libhdf5 on a store the FFI's cray "
+        f"libhdf5_parallel wrote and closed.  Two HDF5 library instances, "
+        f"one file (audit A1; docs/architecture/slab_io.md#one-owner).\n"
+        f"  file  : {path}\n"
+        f"  open  : mode={mode!r} from {where}, rank {rank}/{world}\n"
+        f"  NOT   : a POSIX lock — runs with HDF5_USE_FILE_LOCKING=FALSE "
+        f"failed this way and passed this way alike;\n"
+        f"  NOT   : file_io.hdf5_owner — it is per-process and no FFI "
+        f"handle is live in THIS process at this open;\n"
+        f"  NOT   : a regression from the A1 work — an A/B at bf57701b, "
+        f"before this entry point existed, fails identically.\n"
+        f"  what  : the FFI cleared that bit at H5Fclose and the clear had "
+        f"not become visible to this Lustre client.  Off-node ranks lose "
+        f"this race far more often, which is why 12 of 16 ranks on 4 nodes "
+        f"die here and a 4-rank single-node arm usually does not.\n"
+        f"  fix   : do not read a phdf5-written store through a second "
+        f"HDF5 library.  The ledger is attribute-heavy, so that needs an "
+        f"FFI attribute reader beside lrx_phdf5_read_whole, or a rank-0 "
+        f"read plus a broadcast.  Interim: run this stage at 4 ranks on "
+        f"one node, or set LORRAX_HDF5_ONE_OWNER=strict to enumerate every "
+        f"alternation site in one run.")
+
+
+# ---------------------------------------------------------------------------
+# The ω grid and its provenance
+# ---------------------------------------------------------------------------
+
+def _canonical_sampling(sampling):
+    """Validate the protocol record and return it in stamping order.
+
+    Returns a plain dict; there is no record class here on purpose
+    (AGENTS.md CONVENTIONS: procedural on plain arrays, no new API
+    layers for what a function on numpy arrays does).
+    """
+    if not isinstance(sampling, dict):
+        raise TypeError(
+            f"mpa_store: sampling= must be a dict carrying "
+            f"{list(_SAMPLING_REQUIRED)}; got "
+            f"{type(sampling).__name__}")
+    missing = [k for k in _SAMPLING_REQUIRED if k not in sampling]
+    if missing:
+        raise ValueError(
+            f"mpa_store: the sampling protocol record is missing "
+            f"{missing}.  The ω grid alone does not say which protocol "
+            f"produced it, and a fit whose partition α or pole count "
+            f"nobody recorded cannot be reproduced or extended — nested "
+            f"partitions are the whole reason growing n_p adds samples "
+            f"instead of moving them.")
+    varpi = np.ascontiguousarray(sampling["varpi"], dtype=np.float64)
+    if varpi.ndim != 1 or varpi.size < 1:
+        raise ValueError(
+            f"mpa_store: varpi must be the 1-D list of sampling lines in "
+            f"Hartree (the double-parallel protocol ships two, ϖ₁ = 0.1 "
+            f"and ϖ₂ = 1); got shape {varpi.shape}.")
+    if np.any(varpi < 0.0):
+        raise ValueError(
+            f"mpa_store: varpi carries a negative line offset "
+            f"{varpi.tolist()}.  The sampling lines are at +iϖ in the "
+            f"upper half plane; a negative one is the wrong branch and "
+            f"the fit's forced time ordering would fight it.")
+    n_p = int(sampling["n_p"])
+    if n_p < 1:
+        raise ValueError(f"mpa_store: n_p must be >= 1; got {n_p}")
+    alpha = int(sampling["alpha"])
+    if alpha < 1:
+        raise ValueError(
+            f"mpa_store: the partition α must be >= 1 (1 for insulators "
+            f"and Na, 2 for Al and Cu); got {alpha}")
+    out = {
+        "protocol": str(sampling.get("protocol", "double_parallel")),
+        "varpi": varpi,
+        "n_p": n_p,
+        "alpha": alpha,
+        "omega_max": float(sampling["omega_max"]),
+    }
+    extra = {k: v for k, v in sampling.items()
+             if k not in _SAMPLING_ORDER}
+    return out, extra
+
+
+def omega_grid_digest(omega, omega_line, sampling):
+    """``'sha256:<hex>'`` over the ω grid AND the protocol that made it.
+
+    The grid and the protocol are hashed TOGETHER because either one
+    alone is an incomplete identity: two runs can sample the same 2·n_p
+    points from different α partitions when n_p is small, and a fit
+    extended from a nested partition must know it is extending the same
+    chain.  Names go in beside the bytes so two float arrays of the same
+    shape cannot be swapped without the digest moving.
+    """
+    can, _ = _canonical_sampling(sampling)
+    w = np.ascontiguousarray(omega, dtype=np.complex128)
+    line = np.ascontiguousarray(omega_line, dtype=np.int32)
+    h = hashlib.sha256()
+    h.update(b"omega")
+    h.update(str(w.shape).encode("utf-8"))
+    h.update(w.tobytes())
+    h.update(b"omega_line")
+    h.update(line.tobytes())
+    for key in _SAMPLING_ORDER:
+        val = can[key]
+        h.update(key.encode("utf-8"))
+        if isinstance(val, np.ndarray):
+            h.update(val.tobytes())
+        elif isinstance(val, str):
+            h.update(val.encode("utf-8"))
+        elif isinstance(val, int):
+            h.update(np.int64(val).tobytes())
+        else:
+            h.update(np.float64(val).tobytes())
+    return "sha256:" + h.hexdigest()
+
+
+def _normalise_grid(omega, omega_line, n_omega):
+    w = np.ascontiguousarray(omega, dtype=np.complex128)
+    if w.ndim != 1:
+        raise ValueError(
+            f"mpa_store: omega must be the 1-D list of sampling points; "
+            f"got shape {w.shape}")
+    if int(w.shape[0]) != int(n_omega):
+        raise ValueError(
+            f"mpa_store: the ω grid has {int(w.shape[0])} points but the "
+            f"tensor's leading axis is {int(n_omega)}.  The leading axis "
+            f"IS the frequency axis; a disagreement here means the file "
+            f"cannot say which ω a slab was evaluated at, which is the "
+            f"one thing the fit stage reads it for.")
+    if omega_line is None:
+        line = np.zeros(w.shape[0], dtype=np.int32)
+    else:
+        line = np.ascontiguousarray(omega_line, dtype=np.int32)
+    if line.shape != w.shape:
+        raise ValueError(
+            f"mpa_store: omega_line is {line.shape} but omega is "
+            f"{w.shape}; one line label per sampling point.")
+    if line.size and (int(line.min()) < 0):
+        raise ValueError(
+            f"mpa_store: omega_line carries a negative index "
+            f"{int(line.min())}; it indexes into varpi.")
+    return w, line
+
+
+# ---------------------------------------------------------------------------
+# Write: allocate, fill slab by slab, stamp
+# ---------------------------------------------------------------------------
+
+
+def _w_storage_geometry(n_omega, n_q_on_disk, n_mu, dtype,
+                        closure_verdict, *, where):
+    """Validate one W-frequency allocation before any bytes are created."""
+    n_omega = int(n_omega)
+    n_q_on_disk = int(n_q_on_disk)
+    n_mu = int(n_mu)
+    if min(n_omega, n_q_on_disk, n_mu) < 1:
+        raise ValueError(
+            f"mpa_store: extents must be positive; got n_omega="
+            f"{n_omega}, n_q_on_disk={n_q_on_disk}, n_mu={n_mu}")
+    dtype = np.dtype(np.complex128 if dtype is None else dtype)
+    shape = (n_omega, n_q_on_disk, n_mu, n_mu)
+    # THE CLOSURE REFUSAL RUNS BEFORE ANY BYTE IS ALLOCATED.  The stamp
+    # below refuses too — it is the same call — but by then a full-size
+    # dataset exists, and a refused allocation that leaves a
+    # correctly-shaped file behind is precisely the shape of the
+    # all-zero-screening hazard this format spends a ledger to avoid.
+    if closure_verdict is None:
+        raise ValueError(
+            f"{where}: closure_verdict= is required.  A wedge "
+            "stored against a centroid set that is not orbit-closed has "
+            "no permutation α and is unrecoverable — at EVERY "
+            "frequency, so the ω axis multiplies the damage rather than "
+            "diluting it.  Take one from "
+            "symmetry_maps.verify_centroid_orbit_closure.")
+    closure_verdict.raise_if_not_closed(f"{where} refuses q_irr storage")
+    return shape, dtype
+
+
+def allocate_w_omega_collective(
+    dest,
+    name,
+    *,
+    mesh_xy,
+    n_omega,
+    n_q_on_disk,
+    n_mu,
+    tables,
+    omega,
+    sampling,
+    omega_line=None,
+    closure_verdict=None,
+    dtype=None,
+    provenance=None,
+    n_rmu_logical=None,
+    energy_unit="Ha",
+    mode="a",
+):
+    """Collectively allocate W(z); serial HDF5 writes metadata only.
+
+    The large rank-4 dataset is created through :class:`SlabIO` on every
+    process.  After that collective handle closes, rank zero stamps the small
+    q-wedge tables, frequency grid, and readiness ledger, then all processes
+    synchronize before any slab write begins.  Every ledger bit starts False
+    and :func:`write_w_slab_collective` sets them one slab at a time: the
+    screening solve produces one line-batched sweep at a time, and an
+    allocated-but-unwritten slab reads back as zeros of the right shape.
+
+    COLLECTIVE over ``mesh_xy``: every rank calls it, in the same order.
+    ``dest`` MUST BE A PATH (``SlabIO`` ``str()``s it).
+
+    ``n_mu`` is the LOGICAL centroid count (the μ pad never reaches disk).
+    ``omega`` is ``(n_omega,)`` complex, ``omega_line`` ``(n_omega,)``
+    int32 (the ``varpi`` line of each point; default all zero),
+    ``sampling`` the protocol record (:data:`_SAMPLING_REQUIRED`),
+    ``tables`` a ``QirrTables`` at the LOGICAL μ extent, and
+    ``energy_unit`` one of :data:`FIT_ENERGY_UNITS`.  ``closure_verdict``
+    is required and refuses a non-closed centroid set: a wedge stored
+    against a set with no permutation α is unrecoverable at every ω.
+
+    RETURNS ``None``, ON EVERY RANK.  It used to hand back rank 0's
+    :func:`read_w_header` dict and ``None`` everywhere else — a
+    rank-dependent return type, i.e. a mesh divergence waiting for the
+    first caller that branches on it (audit §E.3 item 3).  Uniform
+    ``None`` rather than a broadcast because nothing consumes it: both
+    production call sites (``gw/mpa/model.py``) discard it, and a rank
+    that wants the header can call :func:`read_w_header` — one more h5py
+    open, which a collective allocator must not pay on every rank for a
+    value nobody asked for.
+
+    The open sequence is FFI ``'w'`` → close → rank-0 h5py ``'a'`` →
+    barrier: sequential cross-stack alternation with a write on each side,
+    which :mod:`file_io.hdf5_owner` counts and which
+    ``LORRAX_HDF5_ONE_OWNER=strict`` refuses.
+    """
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    shape, dtype = _w_storage_geometry(
+        n_omega, n_q_on_disk, n_mu, dtype, closure_verdict,
+        where=f"allocate_w_omega_collective({name!r})")
+    with SlabIO(dest, mode=mode, mesh=mesh_xy) as io:
+        io.create_dataset(name, shape=shape, dtype=dtype)
+
+    if process_rank() == 0:
+        stamp_w_omega(
+            dest, name, tables=tables, omega=omega, sampling=sampling,
+            omega_line=omega_line, closure_verdict=closure_verdict,
+            data_ready=np.zeros(shape[0], dtype=bool),
+            n_rmu_logical=n_rmu_logical, provenance=provenance,
+            energy_unit=energy_unit)
+    barrier("mpa_w_omega_allocated")
+
+
+def _values_equal(left, right):
+    """Exact metadata equality across h5py/numpy scalar spellings."""
+    a, b = np.asarray(left), np.asarray(right)
+    if a.shape != b.shape:
+        return False
+    if a.dtype.kind in ("S", "U", "O") or b.dtype.kind in ("S", "U", "O"):
+        def text(value):
+            if isinstance(value, (bytes, np.bytes_)):
+                return bytes(value).decode("utf-8")
+            return str(value)
+        return [text(v) for v in a.reshape(-1).tolist()] == [
+            text(v) for v in b.reshape(-1).tolist()]
+    return bool(np.array_equal(a, b))
+
+
+def _validate_w_component_for_resume(src, name, spec):
+    """Validate one surviving sample component against its full contract."""
+    header = _bundle_reader.read_w_header(src, name)
+    shape, dtype = _w_storage_geometry(
+        spec["n_omega"], spec["n_q_on_disk"], spec["n_mu"],
+        spec.get("dtype"), spec["closure_verdict"],
+        where=f"resume W component {name!r}")
+    omega, line = _normalise_grid(
+        spec["omega"], spec.get("omega_line"), shape[0])
+    sampling, sampling_extra = _canonical_sampling(spec["sampling"])
+    logical_tables = spec["tables"].canonical()
+    if spec.get("n_rmu_logical") is not None:
+        logical_tables = logical_tables.logical(
+            int(spec["n_rmu_logical"])).canonical()
+    expected = {
+        "n_omega": shape[0],
+        "n_q_on_disk": shape[1],
+        "n_mu": shape[2],
+        "n_rmu_logical": int(
+            spec.get("n_rmu_logical") or shape[2]),
+        "n_q_full": int(logical_tables.n_q_full),
+        "omega_units": str(spec.get("energy_unit", "Ha")),
+        "grid_hash": omega_grid_digest(omega, line, sampling),
+        "table_hash": logical_tables.digest(),
+        "centroid_hash": str(spec["closure_verdict"].centroid_hash),
+        "dtype": np.dtype(dtype),
+    }
+    mismatch = []
+    for key, want in expected.items():
+        got = header.get(key)
+        if key == "dtype":
+            equal = np.dtype(got) == want
+        else:
+            equal = _values_equal(got, want)
+        if not equal:
+            mismatch.append(f"{key}: stored={got!r}, expected={want!r}")
+    for key, want in (("omega", omega), ("omega_line", line),
+                      ("sampling", sampling),
+                      ("sampling_extra", sampling_extra)):
+        got = header.get(key)
+        if isinstance(want, dict):
+            equal = (set(got or {}) == set(want) and all(
+                _values_equal((got or {})[field], want[field])
+                for field in want))
+        else:
+            equal = _values_equal(got, want)
+        if not equal:
+            mismatch.append(f"{key} differs")
+    automatic = {
+        "qirr_generator_commit", "qirr_written_utc", "qirr_writer",
+        "mpa_writer",
+    }
+    stored_provenance = {
+        key: value for key, value in header["provenance"].items()
+        if key not in automatic}
+    expected_provenance = dict(spec.get("provenance") or {})
+    if (set(stored_provenance) != set(expected_provenance)
+            or any(not _values_equal(stored_provenance[key], value)
+                   for key, value in expected_provenance.items()
+                   if key in stored_provenance)):
+        mismatch.append(
+            "provenance differs: stored keys="
+            f"{sorted(stored_provenance)}, expected keys="
+            f"{sorted(expected_provenance)}")
+    if mismatch:
+        raise ValueError(
+            f"MPA partial sample component {name!r} is incompatible:\n  "
+            + "\n  ".join(mismatch))
+    return header
+
+
+def prepare_w_sample_store_collective(
+        dest, components, *, mesh_xy, overwrite_incompatible=False):
+    """Open a compatible partial sample store or allocate missing components.
+
+    Every surviving component is authenticated before any writer opens the
+    inode.  Missing components are then appended through the canonical
+    collective allocator; no existing readiness ledger or payload is reset.
+    An incompatible partial store is a refusal unless the caller explicitly
+    selected the incumbent destructive-overwrite option.
+    """
+    specs = tuple(dict(component) for component in components)
+    names = tuple(str(spec.pop("name")) for spec in specs)
+    if not names or len(set(names)) != len(names):
+        raise ValueError(
+            "prepare_w_sample_store_collective requires unique component names")
+    path = os.path.abspath(os.fspath(dest))
+    present = set()
+    incompatible = None
+    if os.path.exists(path):
+        try:
+            with _h5(path, "r") as grp:
+                present = {name for name in names if name in grp}
+            for name, spec in zip(names, specs):
+                if name in present:
+                    _validate_w_component_for_resume(path, name, spec)
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            incompatible = exc
+    replace = incompatible is not None
+    if replace and not bool(overwrite_incompatible):
+        raise ValueError(
+            "GATE mpa_partial_sample_compatible: existing partial sample "
+            f"store {path} is incompatible and will not be repaired or "
+            "truncated. Set mpa_overwrite_completed_artifacts = true only "
+            "if destructive regeneration is intended. Cause: "
+            f"{type(incompatible).__name__}: {incompatible}") from incompatible
+
+    missing = list(names if replace or not os.path.exists(path) else
+                   (name for name in names if name not in present))
+    # Every rank performed serial-h5py validation above.  Transfer inode
+    # ownership only after the slowest reader has closed; otherwise a fast
+    # rank can enter SlabIO's collective writer while a peer still owns a
+    # read handle to the same file.
+    from common.collectives import barrier
+    barrier("mpa_sample_resume_readers_closed")
+    for index, name in enumerate(missing):
+        spec = specs[names.index(name)]
+        mode = "w" if index == 0 and (replace or not os.path.exists(path)) else "a"
+        allocate_w_omega_collective(
+            path, name, mesh_xy=mesh_xy, mode=mode, **spec)
+    headers = {
+        name: _bundle_reader.read_w_header(path, name)
+        for name in names
+    }
+    # The caller's next operation is normally a collective sample write.
+    # Close these final all-rank serial header readers before returning that
+    # decision to it, including the no-missing-components resume path.
+    barrier("mpa_sample_headers_readers_closed")
+    return headers
+
+
+def stamp_w_omega(
+    dest,
+    name,
+    *,
+    tables,
+    omega,
+    sampling,
+    omega_line=None,
+    closure_verdict,
+    data_ready=None,
+    n_rmu_logical=None,
+    provenance=None,
+    energy_unit="Ha",
+    mode="a",
+):
+    """Make an ALREADY-WRITTEN 4-D dataset a version-2 W(ω) tensor.
+
+    THE STAMP IS ``qirr_store.stamp_qirr_tensor`` PLUS THE ω GROUP, and
+    the split is exactly the same one that function exists for: the GW
+    producer does not write its restart tensors with h5py, it writes
+    them through ``file_io.slab_io.SlabIO`` where every rank contributes
+    its own (μ, ν) hyperslab and no rank ever holds the whole array.  A
+    format function that insisted on creating the dataset would force
+    that write back through one process.
+
+    THE ONE PLACE THIS CANNOT DELEGATE is the rank.  The landed stamp
+    asserts ``ds.ndim == 3``, correctly, because that is what version 1
+    is.  A 4-D dataset therefore cannot be handed to it at all, so the
+    q_irr attrs are written here against a temporary 3-D VIEW of the
+    layout — one frequency slab's worth of shape — and the version attr
+    is then overwritten with 2 and the frequency attrs added.  Doing it
+    in that order means every v1 attr on a v2 file is written by the v1
+    stamp and not by a copy of it, which is the property that keeps the
+    two formats from drifting apart attr by attr.
+    """
+    qs = _qs()
+    can = tables.canonical()
+    if n_rmu_logical is not None:
+        can = can.logical(int(n_rmu_logical)).canonical()
+
+    with _h5(dest, mode) as grp:
+        if name not in grp:
+            raise KeyError(
+                f"mpa_store: {name!r} is not in this file.  "
+                f"stamp_w_omega stamps a dataset the caller has already "
+                f"written (the SlabIO path); use "
+                f"allocate_w_omega_collective to create one.")
+        ds = grp[name]
+        if ds.ndim != 4:
+            raise ValueError(
+                f"mpa_store: {name!r} is {ds.shape} (rank {ds.ndim}); "
+                f"the frequency-resolved layout is rank 4, "
+                f"(n_omega, n_q, N_μ, N_μ).  A rank-3 tensor is a "
+                f"version-1 q_irr tensor and belongs to "
+                f"qirr_store.stamp_qirr_tensor — stamping it here would "
+                f"claim a frequency axis it does not have.")
+        if int(ds.shape[2]) != int(ds.shape[3]):
+            raise ValueError(
+                f"mpa_store: {name!r} has μ extents {ds.shape[2]} x "
+                f"{ds.shape[3]}; W_q(μ,ν) is square in the ISDF basis.")
+        n_omega = int(ds.shape[0])
+        n_q_on_disk = int(ds.shape[1])
+        n_mu = int(ds.shape[3])
+
+        w, line = _normalise_grid(omega, omega_line, n_omega)
+        san, extra = _canonical_sampling(sampling)
+        grid_hash = omega_grid_digest(w, line, san)
+
+        if data_ready is None:
+            ready = np.zeros(n_omega, dtype=bool)
+        else:
+            ready = np.ascontiguousarray(data_ready, dtype=bool)
+        if ready.shape != (n_omega,):
+            raise ValueError(
+                f"mpa_store: the data_ready ledger is {ready.shape} but "
+                f"the tensor has {n_omega} frequency slabs.  One bit per "
+                f"slab: a ledger that cannot address every slab cannot "
+                f"say which of them are data.")
+
+        # THE V1 STAMP, ON A 3-D VIEW.  ``stamp_qirr_tensor`` writes the
+        # tables, the digest, the closure record and the provenance —
+        # everything the two versions share — and it insists on rank 3,
+        # which a v2 dataset is not.  So the shared attrs are taken from
+        # a scratch 3-D dataset of ONE SLAB'S shape (zero-filled, never
+        # read) and copied across.  The alternative is a second
+        # implementation of the stamp, which is a second claim about
+        # what the file says, differing on the day one of them gains an
+        # attr.
+        scratch = name + "__v1stamp_scratch"
+        if scratch in grp:
+            del grp[scratch]
+        grp.create_dataset(scratch, shape=(n_q_on_disk, n_mu, n_mu),
+                           dtype=ds.dtype)
+        try:
+            qs.stamp_qirr_tensor(
+                grp, scratch, tables=can,
+                closure_verdict=closure_verdict,
+                provenance=provenance,
+                data_ready=bool(ready.all()))
+            src = grp[scratch]
+            for key, val in src.attrs.items():
+                ds.attrs[key] = val
+            tgrp_name = name + qs.QIRR_TABLE_SUFFIX
+            if tgrp_name in grp:
+                del grp[tgrp_name]
+            grp.copy(grp[scratch + qs.QIRR_TABLE_SUFFIX], tgrp_name)
+        finally:
+            del grp[scratch]
+            stale = scratch + qs.QIRR_TABLE_SUFFIX
+            if stale in grp:
+                del grp[stale]
+
+        # THE VERSION BUMP AND THE AXIS.  Written AFTER the v1 stamp so
+        # it overwrites rather than races it.
+        ds.attrs[qs.QIRR_VERSION_ATTR] = np.int64(QIRR_FORMAT_VERSION_FREQ)
+        ds.attrs[_FREQ_ATTR] = _FREQ_ATTR_VALUE
+        ds.attrs["mpa_n_omega"] = np.int64(n_omega)
+        unit = str(energy_unit)
+        if unit not in FIT_ENERGY_UNITS:
+            raise ValueError(
+                f"mpa_store: energy_unit must be one of "
+                f"{tuple(FIT_ENERGY_UNITS)}, got {energy_unit!r}")
+        ds.attrs["mpa_omega_units"] = unit
+        # THE SAMPLING ATTRS, in :data:`_SAMPLING_ORDER` — the one list
+        # of sampling keys.  ``_canonical_sampling`` already fixed the
+        # types (str, float64 array, int, int, float); ints and floats
+        # are stamped as fixed-width scalars.
+        for key in _SAMPLING_ORDER:
+            val = san[key]
+            if isinstance(val, int):
+                val = np.int64(val)
+            elif isinstance(val, float):
+                val = np.float64(val)
+            ds.attrs["mpa_" + key] = val
+        ds.attrs["mpa_grid_hash"] = grid_hash
+        ds.attrs["mpa_writer"] = "file_io.mpa_store"
+        for key, val in extra.items():
+            ds.attrs["mpa_prov_" + str(key)] = val
+
+        mgrp_name = name + MPA_GROUP_SUFFIX
+        if mgrp_name in grp:
+            del grp[mgrp_name]
+        mgrp = grp.create_group(mgrp_name)
+        mgrp.create_dataset("omega", data=w)
+        mgrp.create_dataset("omega_line", data=line)
+        mgrp.create_dataset("data_ready", data=ready)
+        mgrp.attrs["grid_hash"] = grid_hash
+        return _bundle_reader.read_w_header(grp, name)
+
+
+def _mark_w_slab_ready(ds, mgrp, i_omega, ready):
+    """Commit one slab only after its data writer has closed."""
+    i = int(i_omega)
+    n_omega = int(ds.shape[0])
+    if not 0 <= i < n_omega:
+        raise IndexError(
+            f"mpa_store: frequency index {i} is outside [0, {n_omega}) "
+            f"for {ds.name!r}.")
+    led = mgrp["data_ready"][()]
+    led[i] = bool(ready)
+    mgrp["data_ready"][...] = led
+    ds.attrs["qirr_data_ready"] = bool(led.all())
+    return int(led.sum())
+
+
+def _require_layout(arr, mesh_xy, spec, where):
+    """Refuse unless ``arr`` lies on ``NamedSharding(mesh_xy, spec)``.
+
+    Layout EQUIVALENCE, never spec equality: JAX canonicalizes specs (a
+    rank-3 array's trailing replicated entries are dropped, for one), so
+    two unequal specs can name ONE placement — and on a one-device mesh
+    every placement is the same bytes.  ``where`` is the complete
+    refusal message; the caller writes it because only the caller knows
+    what the array is and what its producer should have done.
+    """
+    from jax.sharding import NamedSharding
+
+    expected = NamedSharding(mesh_xy, spec)
+    mesh_size = int(np.prod(tuple(int(v) for v in mesh_xy.shape.values())))
+    sharding = getattr(arr, "sharding", None)
+    if not (isinstance(sharding, NamedSharding)
+            and sharding.mesh == mesh_xy
+            and (sharding.is_equivalent_to(expected, np.ndim(arr))
+                 or mesh_size == 1)):
+        raise ValueError(where)
+
+
+def write_w_slab_collective(
+    dest,
+    name,
+    i_omega,
+    W_q_munu,
+    *,
+    mesh_xy,
+    global_shape,
+    ready=True,
+):
+    """Write one native sharded W(z) slab and then commit readiness.
+
+    ``W_q_munu`` remains on its ``P(None, 'x', 'y')`` layout — REQUIRED,
+    and enforced by ``_require_layout``.  It is rank 3,
+    ``(n_q, n_mu_padded, n_mu_padded)``; SlabIO inserts the singleton
+    frequency axis, clips only the device-dependent mu padding against
+    ``global_shape`` (which must be the rank-4
+    ``(n_omega, n_q, n_mu, n_mu)``), and closes collectively before rank
+    zero updates the small readiness ledger.  A failed data write therefore
+    leaves the slab explicitly unready.
+
+    COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH (SlabIO).
+
+    RETURNS ``None``, ON EVERY RANK — it used to be the new ready count
+    on rank 0 and ``None`` elsewhere, the same rank-divergent hazard
+    :func:`allocate_w_omega_collective` carried (audit §E.3 item 3).  The
+    count is not lost, it is just not returned per slab: it lives in the
+    readiness ledger this call commits, and :func:`read_w_header` reports
+    it as ``n_ready`` / ``data_ready`` for a rank that asks.
+    """
+    from jax.sharding import PartitionSpec as P
+
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+    from runtime.padding import padded_mu_extent
+
+    shape = tuple(int(n) for n in global_shape)
+    if len(shape) != 4 or shape[2] != shape[3]:
+        raise ValueError(
+            "write_w_slab_collective: global_shape must be square "
+            "(n_omega,n_q,n_mu,n_mu)")
+    i = int(i_omega)
+    if not 0 <= i < shape[0]:
+        raise IndexError(
+            f"write_w_slab_collective: frequency index {i} is outside "
+            f"[0,{shape[0]})")
+    n_mu_padded = int(padded_mu_extent(shape[2], mesh_xy))
+    expected = (shape[1], n_mu_padded, n_mu_padded)
+    got = tuple(int(n) for n in W_q_munu.shape)
+    if got != expected:
+        raise ValueError(
+            "write_w_slab_collective requires one complete canonical "
+            f"product-padded slab {expected} for logical destination "
+            f"{shape[1:]}; got {got}.  SlabIO intentionally clips a larger "
+            "carrier to the logical file extent, so this seam must refuse "
+            "an undersized, wrong-q, or merely per-axis-padded producer "
+            "before it could mark a partial slab ready.")
+    _require_layout(
+        W_q_munu, mesh_xy, P(None, "x", "y"),
+        "write_w_slab_collective requires W on P(None,'x','y'); "
+        "the producer must return the native SlabIO layout rather "
+        "than resharding a bulk tensor at the writer seam")
+    header = _bundle_reader.read_w_header(dest, name)
+    if (header["n_omega"], header["n_q_on_disk"], header["n_mu"],
+            header["n_mu"]) != shape:
+        raise ValueError(
+            f"write_w_slab_collective destination {name!r} has logical "
+            f"shape {(header['n_omega'], header['n_q_on_disk'], header['n_mu'], header['n_mu'])}, "
+            f"but caller supplied {shape}")
+    if bool(header["data_ready"][i]):
+        raise ValueError(
+            f"write_w_slab_collective refuses to replace ready {name!r} "
+            f"frequency slab {i}; completed sample slabs are write-once")
+    barrier("mpa_w_slab_header_readers_closed")
+    W4 = W_q_munu[None, ...]
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        io.write_slab(
+            name, W4, offset=(i, 0, 0, 0),
+            global_shape=shape)
+    del W4
+
+    barrier("mpa_w_slab_payload_closed")
+    if process_rank() == 0:
+        with _h5(dest, "a") as grp:
+            ds, mgrp = _open_w(grp, name)
+            _mark_w_slab_ready(ds, mgrp, i, ready)
+    barrier("mpa_w_slab_ready")
+
+
+# ---------------------------------------------------------------------------
+# Read: the header, the widened discriminator, the slab, the columns
+# ---------------------------------------------------------------------------
+
+def _open_w(grp, name):
+    """``(dataset, mpa_group)`` for a stamped W(ω) tensor, or refuse."""
+    if name not in grp:
+        raise KeyError(f"mpa_store: {name!r} is not in this file")
+    mgrp_name = name + MPA_GROUP_SUFFIX
+    if mgrp_name not in grp:
+        raise ValueError(
+            f"mpa_store: {name!r} carries no {mgrp_name!r} group, so the "
+            f"file cannot say which frequencies its slabs were evaluated "
+            f"at nor which of them are data.  A frequency-resolved "
+            f"tensor whose ω grid lives anywhere but beside it is a "
+            f"tensor that silently decays when the sampling protocol is "
+            f"regenerated.")
+    return grp[name], grp[mgrp_name]
+
+
+def _refuse_unless_rank_matches_version(ds, name):
+    """THE DISCRIMINANT, for the versions THIS module owns.
+
+    Rank and version must agree or the file is refused, because a
+    version-1 reader takes ``ds.shape[0]`` as the q extent and
+    ``ds.shape[-1]`` as the μ extent.  Hand it a
+    ``(n_omega, n_q_ibz, N_μ, N_μ)`` dataset and both of those
+    expressions still evaluate — ``shape[-1]`` is genuinely N_μ, and
+    ``shape[0]`` is n_omega, which the table validation compares against
+    the number of IBZ rows.  When ``n_omega == n_q_ibz`` that comparison
+    PASSES.  So do the q_storage cross-check, the table digest, the
+    n_q_full stamp and the readiness flag.  Nothing refuses, and the
+    caller receives a 4-D array it believes is 3-D with the frequency
+    axis relabelled as q.  Si 4³ reduces 64 q to 8 and an n_p = 4 fit
+    samples 8 frequencies, so the coincidence is one deck away.
+
+    THE VERSION-1 HALF OF THAT CHECK IS NO LONGER HERE, and its removal
+    is the point rather than a simplification.  This function used to
+    enforce rank 3 under a version-1 stamp, and the since-deleted
+    dispatcher registered the reason as a follow-up in as
+    many words: a wrapper protects the callers who use it and nobody
+    else, and the hazard is worst precisely for a caller who does not
+    know the new layout exists.  ``qirr_store.read_tensor`` now runs that
+    refusal itself, above ``read_tables`` and before any extent is
+    believed, so a consumer that never heard of the frequency axis is
+    protected by the version-1 reader it was already calling.  Repeating
+    it here would be a second, weaker copy of a check that has found its
+    home — and the copy would be the one to go stale.
+
+    What stays is what only this module can know.  Version 2 is not a
+    version ``qirr_store`` has heard of, so its rank-4 requirement is
+    ours to state and ours to enforce; and the ``mpa_freq_axis`` attr is
+    ours in both directions, which is why the presence cross-check below
+    runs on a version-1 file too.  A v1 file carrying the frequency attr
+    is a half-stamp, and the missing half is exactly what would say
+    whether the shape means what it looks like.
+    """
+    qs = _qs()
+    if qs.QIRR_VERSION_ATTR not in ds.attrs:
+        raise ValueError(
+            f"mpa_store: {name!r} carries no {qs.QIRR_VERSION_ATTR!r}.  "
+            f"'No attrs' is read as q_storage='full' for backward "
+            f"compatibility by qirr_store.read_tensor, which is the "
+            f"reader for that case; the frequency-resolved layout is "
+            f"never legacy.")
+    version = int(ds.attrs[qs.QIRR_VERSION_ATTR])
+    if version not in QIRR_FORMAT_VERSIONS_READABLE:
+        raise ValueError(
+            f"mpa_store: {name!r} is format version {version}; this "
+            f"reader knows {list(QIRR_FORMAT_VERSIONS_READABLE)}.  "
+            f"Refusing rather than guessing.")
+    # THE RANK, FOR VERSION 2 ONLY.  Version 1's rank is
+    # ``qirr_store.read_tensor``'s refusal now — it runs it before it
+    # believes any extent, so the caller this module dispatches to has
+    # already made the check by the time it returns.  See the docstring.
+    want = _rank_by_version()[version]
+    if version == QIRR_FORMAT_VERSION_FREQ and int(ds.ndim) != want:
+        raise ValueError(
+            f"mpa_store: {name!r} stamps qirr_format_version={version}, "
+            f"which is rank {want}, but the dataset is {ds.shape} — rank "
+            f"{int(ds.ndim)}.  RANK IS THE DISCRIMINANT and the version "
+            f"attr is its cross-check, in that order.  Version "
+            f"{QIRR_FORMAT_VERSION_FREQ} is the frequency-resolved layout "
+            f"and its leading axis is ω; a tensor stamped for it that is "
+            f"not rank {want} has either lost that axis or never had it, "
+            f"and reading it would hand the caller a q axis relabelled as "
+            f"frequency.  That is silent corruption, so it is refused on "
+            f"a property of the bytes rather than of an attr.")
+    has_freq_attr = _FREQ_ATTR in ds.attrs
+    if has_freq_attr != (version == QIRR_FORMAT_VERSION_FREQ):
+        raise ValueError(
+            f"mpa_store: {name!r} is version {version} but "
+            f"{_FREQ_ATTR!r} is "
+            f"{'present' if has_freq_attr else 'absent'}.  The attr "
+            f"marks the leading frequency axis and belongs to version "
+            f"{QIRR_FORMAT_VERSION_FREQ} exactly; a half-stamp is "
+            f"refused rather than read, because the missing half is "
+            f"what would say whether the shape means what it looks "
+            f"like.")
+    if has_freq_attr and qs.qirr_attr_str(ds, _FREQ_ATTR) != _FREQ_ATTR_VALUE:
+        raise ValueError(
+            f"mpa_store: {name!r} stamps {_FREQ_ATTR}="
+            f"{qs.qirr_attr_str(ds, _FREQ_ATTR)!r}; this format's frequency "
+            f"axis is {_FREQ_ATTR_VALUE!r} — axis 0 — and nothing else "
+            f"has been defined.")
+    return version
+
+
+# ---------------------------------------------------------------------------
+# The column budget, and the 1-D-sharded column read
+# ---------------------------------------------------------------------------
+
+def one_tile_bytes(n_mu, itemsize=COMPLEX128_BYTES):
+    """Bytes in ONE (N_μ, N_μ) tile — the unit the constraint is in.
+
+    The owner's memory constraint is stated in tiles: a small number of
+    W_q(μ,ν) copies fit at once.  Everything the fit stage holds is
+    priced against this, so it has a name.
+    """
+    return int(n_mu) * int(n_mu) * int(itemsize)
+
+
+def choose_column_budget(n_mu, n_omega, tile_bytes=None,
+                         itemsize=COMPLEX128_BYTES):
+    """How many ν columns may be read ACROSS ALL ω for one tile's cost.
+
+    THE ARITHMETIC, and it is deliberately a closed form rather than a
+    heuristic.  A column block spanning every frequency costs
+
+        n_omega * N_mu * n_cols * itemsize        bytes
+
+    (one full row axis, ``n_cols`` columns, all of ω) and the budget is
+    one (N_μ, N_μ) tile,
+
+        N_mu * N_mu * itemsize                    bytes
+
+    so
+
+        n_cols = min(N_mu,
+                     max(1, floor(tile_bytes / (n_omega * N_mu * itemsize))))
+
+    which for the default budget collapses to ``n_cols = N_mu //
+    n_omega`` — the frequency axis is paid for out of the column count,
+    one for one.  At the Si production scale, N_μ = 480 and n_omega = 16
+    (an n_p = 8 fit's 2·n_p samples): the tile is 480·480·16 =
+    3 686 400 B (3.52 MiB), the per-column cost across ω is 16·480·16 =
+    122 880 B, and the budget is exactly **30 columns** — 16·480·30·16 =
+    3 686 400 B, the tile to the byte.
+
+    BOTH CLAMPS ARE IN THE FORMULA ABOVE, and both bite in practice.  The
+    LOWER one — a budget of zero columns is not a budget, it is a refusal
+    to make progress, and the honest failure for a grid so long that one
+    column busts a tile is to hand back 1 and let the caller see the cost
+    in :func:`describe_column_cost`.  The UPPER one bites whenever
+    ``tile_bytes`` is generous: measured 2026-08-15,
+    ``choose_column_budget(480, 16)`` is 30 as the worked example says,
+    but ``choose_column_budget(480, 16, 100*2**20)`` returns **480** — the
+    whole row extent — where the unclamped ratio would give 853.  There
+    are only ``n_mu`` columns to read.  The clamp used to be absent from
+    the published form, so a caller that sized an ``n_cols_buffer`` off it
+    and passed a large budget was refused by
+    :func:`read_w_columns_collective` (audit §E.3 item 5).
+
+    Parameters
+    ----------
+    n_mu
+        LOGICAL centroid count — the row extent of the block.
+    n_omega
+        Frequencies read at once.  This is the whole grid: the point of
+        the leading axis is that a fit reads all of ω for a few columns,
+        never all columns for a few ω.
+    tile_bytes
+        Budget.  Defaults to :func:`one_tile_bytes`.  Pass a larger one
+        to spend more deliberately; the reader will say so in its
+        refusal either way.
+    """
+    n_mu = int(n_mu)
+    n_omega = int(n_omega)
+    if n_mu < 1 or n_omega < 1:
+        raise ValueError(
+            f"choose_column_budget: n_mu and n_omega must be positive; "
+            f"got n_mu={n_mu}, n_omega={n_omega}")
+    budget = one_tile_bytes(n_mu, itemsize) if tile_bytes is None \
+        else int(tile_bytes)
+    if budget < 1:
+        raise ValueError(
+            f"choose_column_budget: tile_bytes must be positive; got "
+            f"{budget}")
+    per_col = n_omega * n_mu * int(itemsize)
+    return max(1, min(n_mu, budget // per_col))
+
+
+def describe_column_cost(n_mu, n_omega, n_cols, tile_bytes=None,
+                         itemsize=COMPLEX128_BYTES):
+    """The budget arithmetic as a sentence, for refusals and for logs.
+
+    Separate from the refusal so the same numbers can be printed by a
+    driver that is deciding rather than failing — a message a caller can
+    only see by triggering an exception is a message that gets read once.
+
+    THE ARITHMETIC IS THE ONE THAT RAN.  The budget half prints the tile
+    product only when the budget IS one tile; a caller-supplied
+    ``tile_bytes`` prints as the number it is, because
+    ``n_mu*n_mu*itemsize = <a different number>`` is a false equation and
+    a false equation in a refusal costs more than the refusal saves.  The
+    ``choose_column_budget(...)`` call it ends with is ECHOED IN FULL, so
+    a reader who types it gets the number that was just printed rather
+    than the default-budget one (audit §E.3 item 4).
+    """
+    n_mu = int(n_mu)
+    n_omega = int(n_omega)
+    n_cols = int(n_cols)
+    itemsize = int(itemsize)
+    budget = one_tile_bytes(n_mu, itemsize) if tile_bytes is None \
+        else int(tile_bytes)
+    cost = n_omega * n_mu * n_cols * itemsize
+    allowed = choose_column_budget(n_mu, n_omega, tile_bytes, itemsize)
+    budget_terms = (f"one (N_mu, N_mu) tile, {n_mu}*{n_mu}*{itemsize} B = "
+                    if tile_bytes is None else "")
+    return (
+        f"{n_cols} columns at n_omega={n_omega}, N_mu={n_mu} costs "
+        f"{n_omega}*{n_mu}*{n_cols}*{itemsize} B = {cost} B "
+        f"({cost / 2 ** 20:.2f} MiB) against a budget of "
+        f"{budget_terms}{budget} B "
+        f"({budget / 2 ** 20:.2f} MiB) — a ratio of "
+        f"{cost / budget:.3f}x.  choose_column_budget({n_mu}, "
+        f"{n_omega}, tile_bytes={budget}, itemsize={itemsize}) allows "
+        f"{allowed}.")
+
+
+def normalise_columns(mu_cols, n_mu):
+    """Columns as a sorted, unique, in-range int64 array, or refuse.
+
+    Sorted and unique because the read below hands them to HDF5 as a
+    point selection, which requires increasing order, and because a
+    duplicated column is a column the fit would solve twice and write
+    twice — the second write racing the first in the staged store.
+    """
+    cols = np.atleast_1d(np.asarray(mu_cols))
+    if cols.dtype == bool:
+        raise TypeError(
+            "mpa_store: mu_cols must be indices, not a boolean mask; a "
+            "mask hides the column COUNT, which is the quantity the "
+            "budget is about.")
+    cols = cols.astype(np.int64, copy=False)
+    if cols.ndim != 1:
+        raise ValueError(
+            f"mpa_store: mu_cols must be 1-D; got shape {cols.shape}")
+    if cols.size == 0:
+        raise ValueError("mpa_store: mu_cols is empty")
+    uniq, counts = np.unique(cols, return_counts=True)
+    if uniq.size != cols.size:
+        # The REPEATED ones, not the first four distinct ones: the label
+        # says "repeats a column", so the numbers beside it have to be the
+        # columns that repeat or the message sends the reader to innocent
+        # indices (audit §E.3 item 11).
+        dup = uniq[counts > 1].tolist()
+        raise ValueError(
+            f"mpa_store: mu_cols repeats a column "
+            f"({cols.size} given, {uniq.size} distinct, e.g. "
+            f"{dup[:4]}).  A repeated column is fitted twice and "
+            f"written twice into the staged store, where the second "
+            f"write silently overwrites the first.")
+    if int(uniq[0]) < 0 or int(uniq[-1]) >= int(n_mu):
+        raise IndexError(
+            f"mpa_store: mu_cols spans [{int(uniq[0])}, "
+            f"{int(uniq[-1])}] but the tensor has {int(n_mu)} logical "
+            f"columns.")
+    return uniq
+
+
+def _column_span(cols):
+    """``(lo, hi, sel)`` for a normalised column set.
+
+    ``[lo, hi)`` is the covering span; ``sel`` is ``None`` when the set
+    is contiguous (one HDF5 hyperslab) and the explicit point-selection
+    list when it is not.
+    """
+    lo, hi = int(cols[0]), int(cols[-1]) + 1
+    if (hi - lo) == int(cols.size):
+        return lo, hi, None
+    return lo, hi, cols.tolist()
+
+
+def _validate_column_request(header, q, mu_cols, tile_bytes, where,
+                             *, require_ready=True):
+    """The refusal set both all-frequency column readers share.
+
+    Returns ``(iq, cols, budget)`` — the checked q index, the
+    normalised columns and the tile-budget column count — or refuses:
+    over budget, frequency slabs missing, or q out of range, in that
+    order, each naming its arithmetic.
+    """
+    n_mu = int(header["n_mu"])
+    n_omega = int(header["n_omega"])
+    cols = normalise_columns(mu_cols, n_mu)
+    budget = choose_column_budget(n_mu, n_omega, tile_bytes)
+    if int(cols.size) > budget:
+        raise ValueError(
+            f"{where}: refusing {int(cols.size)} columns.  " +
+            describe_column_cost(n_mu, n_omega, int(cols.size),
+                                 tile_bytes) +
+            f"  A block spanning all {n_omega} frequencies is priced to "
+            f"be ONE of the small number of W_q(μ,ν) copies that fit at "
+            f"once; pass tile_bytes= to raise the budget deliberately, "
+            f"or loop the columns in blocks of {budget}.")
+    if require_ready and int(header["n_ready"]) != n_omega:
+        missing = np.flatnonzero(
+            ~np.asarray(header["data_ready"], dtype=bool))
+        raise ValueError(
+            f"{where}: {len(missing)} of {n_omega} "
+            f"frequency slabs are not ready (indices "
+            f"{missing[:8].tolist()}{'...' if len(missing) > 8 else ''})."
+            f"  A column block spans the WHOLE frequency axis, so a fit "
+            f"run on the ready half of the grid returns poles that are "
+            f"wrong rather than absent — the unwritten slabs read as "
+            f"zeros and the Padé solve happily fits them.  Fill the "
+            f"grid, or pass require_ready=False to inspect it.")
+    iq = int(q)
+    if not 0 <= iq < int(header["n_q_on_disk"]):
+        raise IndexError(
+            f"{where}: q={iq} is outside [0, "
+            f"{int(header['n_q_on_disk'])}); the tensor is stored on "
+            f"the {header['q_storage']} q axis.")
+    return iq, cols, budget
+
+
+# ---------------------------------------------------------------------------
+# The staged B/Ω fit store
+# ---------------------------------------------------------------------------
+
+def _initialise_fit_metadata(
+    grp, *, n_q, n_mu, n_p, energy_unit, grid_hash, table_hash,
+    centroid_hash, unfold_tables, provenance, diagnostic_keys=None,
+    preserve_payload=False, occupation_state=None, ordered_residues=False,
+):
+    """Rank-zero-only small metadata half of fit-store allocation."""
+    qs = _qs()
+    reset = [MPA_FIT_SUFFIX, MPA_HEAD_SUFFIX, MPA_FIT_IO_RECEIPT_SUFFIX]
+    if not preserve_payload:
+        reset = ["Omega_p", "B_p", "B_odd_p"] + [
+            k for k in grp if str(k).startswith("fit_")] + reset
+    for key in reset:
+        if key in grp:
+            del grp[key]
+    led = grp.create_group(MPA_FIT_SUFFIX)
+    led.create_dataset("blocks_done", data=np.zeros((n_q, n_mu), dtype=bool))
+    led.create_dataset("block_journal", shape=(0, 3), maxshape=(None, 3),
+                       dtype=np.int64)
+    for key in CERTIFICATION_METRICS:
+        led.create_dataset("block_" + key + "_max", shape=(0,),
+                           maxshape=(None,), dtype=np.float64)
+    if diagnostic_keys is not None:
+        led.attrs["diagnostic_keys"] = ",".join(sorted(diagnostic_keys))
+
+    grp.attrs["mpa_fit_format_version"] = np.int64(MPA_FIT_FORMAT_VERSION)
+    if energy_unit is not None:
+        grp.attrs[FIT_ENERGY_UNIT_ATTR] = str(energy_unit)
+    grp.attrs["mpa_fit_n_p"] = np.int64(n_p)
+    grp.attrs["mpa_fit_n_q"] = np.int64(n_q)
+    grp.attrs["mpa_fit_n_mu_logical"] = np.int64(n_mu)
+    grp.attrs["mpa_fit_ordered_residues"] = bool(ordered_residues)
+    grp.attrs["mpa_fit_complete"] = False
+    grp.attrs["mpa_fit_writer"] = "file_io.mpa_store"
+    grp.attrs["mpa_fit_generator_commit"] = qs.qirr_generator_commit()
+    grp.attrs["mpa_fit_allocated_utc"] = _utc_now()
+    for label, val in (("grid_hash", grid_hash), ("table_hash", table_hash),
+                       ("centroid_hash", centroid_hash)):
+        if val is not None:
+            grp.attrs["mpa_fit_w_" + label] = str(val)
+    for key, val in (provenance or {}).items():
+        grp.attrs["prov_" + str(key)] = val
+    if occupation_state is not None:
+        stamp_occupation_provenance(grp, occupation_state)
+    if unfold_tables is not None:
+        stamp_fit_unfold_tables(grp, unfold_tables)
+
+
+def allocate_fit_store_collective(
+    dest, *, mesh_xy, n_q, n_mu, n_p,
+    energy_unit=None, grid_hash=None, table_hash=None, centroid_hash=None,
+    unfold_tables=None, dtype=None, provenance=None, occupation_state=None,
+    ordered_residues=False,
+    mode="w",
+):
+    """Allocate a fit store without any rank owning a pole tensor.
+
+    SlabIO first replaces the inode and collectively creates the pole and
+    diagnostic datasets.  This ordering is required on Lustre: the stripe
+    layout is fixed when the inode is created, so a preliminary serial-h5py
+    metadata file would pin the multi-gigabyte fit store to one OST.  After
+    SlabIO closes, rank zero stamps only the small ledger/tables and a barrier
+    makes the complete store visible before any block is written.
+
+    COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH (SlabIO), and
+    ``mode`` is REFUSED unless ``'w'`` — this call owns the inode.
+
+    Only the per-element ``fit_condition`` map is retained.  Backward error
+    and the remaining fit-health quantities are reduced into the small
+    completion ledger before this payload write; they are not full tensor
+    datasets.  ``unfold_tables`` (the W file's q-wedge tables),
+    ``occupation_state`` and the three identity hashes (``grid_hash``,
+    ``table_hash``, ``centroid_hash``: the W(z) file's stamps, so Σ can
+    assert which screening and centroid set the poles came from) go into
+    the small metadata.
+
+    The store is staged because the fit's output (2·n_p tensors of
+    (N_μ, N_μ)) is larger than its input: blocks go to disk as they
+    complete, ``blocks_done`` records which (q, column) are done and
+    ``block_journal`` records each written range with its diagnostics.
+
+    RETURNS :func:`fit_completion_ledger`, UNIFORMLY — every rank reads it
+    back after the barrier, so this return does not depend on the rank
+    (which is now true of every collective in this module).
+
+    Open sequence: FFI ``'w'`` → barrier → rank-0 h5py ``'a'`` → barrier →
+    all-rank h5py ``'r'``.  Cross-stack alternation with writes on both
+    sides; ``LORRAX_HDF5_ONE_OWNER=strict`` refuses it.
+    """
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    n_q, n_mu, n_p = int(n_q), int(n_mu), int(n_p)
+    if min(n_q, n_mu, n_p) < 1:
+        raise ValueError("allocate_fit_store_collective: extents must be positive")
+    if energy_unit is not None and str(energy_unit) not in FIT_ENERGY_UNITS:
+        raise ValueError(
+            f"allocate_fit_store_collective: unsupported energy unit "
+            f"{energy_unit!r}")
+    if mode != "w":
+        raise ValueError(
+            "allocate_fit_store_collective requires mode='w': allocation "
+            "must replace the inode so SlabIO can apply its rank-aware "
+            "Lustre stripe policy")
+    keys = PERSISTED_DIAGNOSTICS
+    dtype = np.complex128 if dtype is None else dtype
+    with SlabIO(dest, mode="w", mesh=mesh_xy) as io:
+        io.create_dataset("Omega_p", shape=(n_p, n_q, n_mu, n_mu),
+                          dtype=dtype)
+        io.create_dataset("B_p", shape=(n_p, n_q, n_mu, n_mu), dtype=dtype)
+        if ordered_residues:
+            io.create_dataset(
+                "B_odd_p", shape=(n_p, n_q, n_mu, n_mu), dtype=dtype)
+        for key in keys:
+            io.create_dataset("fit_" + key, shape=(n_q, n_mu, n_mu),
+                              dtype=np.float64)
+    barrier("mpa_fit_payload_allocated")
+    if process_rank() == 0:
+        with _h5(dest, "a") as grp:
+            _initialise_fit_metadata(
+                grp, n_q=n_q, n_mu=n_mu, n_p=n_p,
+                energy_unit=energy_unit, grid_hash=grid_hash,
+                table_hash=table_hash, centroid_hash=centroid_hash,
+                unfold_tables=unfold_tables, provenance=provenance,
+                diagnostic_keys=keys, preserve_payload=True,
+                occupation_state=occupation_state,
+                ordered_residues=ordered_residues)
+    barrier("mpa_fit_metadata_allocated")
+    return fit_completion_ledger(dest)
+
+
+#: The one jitted reduction behind :func:`refuse_bad_pole_fields`, built on
+#: first use because this module imports no jax at import time.
+_POLE_FIELD_COUNTS: list = []
+
+
+def _pole_field_counts():
+    """``(n_nonfinite, n_bad_causal)`` of a pole field, as one program.
+
+    Traced once per shape and sharding: the elementwise tests fuse into
+    the two sums, so no field-sized temporary is allocated.  The eager
+    form allocated one per ``jnp`` op and died at 6.44 GiB on CrI3 8x8
+    GN-PPM SC.
+    """
+    if not _POLE_FIELD_COUNTS:
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def counts(Omega, residue, odd_residue):
+            finite = (jnp.isfinite(jnp.real(Omega))
+                      & jnp.isfinite(jnp.imag(Omega))
+                      & jnp.isfinite(jnp.real(residue))
+                      & jnp.isfinite(jnp.imag(residue)))
+            if odd_residue is None:
+                live = jnp.abs(residue) > 0.0
+            else:
+                finite = (finite
+                          & jnp.isfinite(jnp.real(odd_residue))
+                          & jnp.isfinite(jnp.imag(odd_residue)))
+                live = ((jnp.abs(residue + odd_residue) > 0.0)
+                        | (jnp.abs(residue - odd_residue) > 0.0))
+            bad_causal = live & ((jnp.real(Omega) <= 0.0)
+                                 | (jnp.imag(Omega) > 0.0))
+            return (jnp.sum(~finite, dtype=jnp.int64),
+                    jnp.sum(bad_causal, dtype=jnp.int64))
+
+        _POLE_FIELD_COUNTS.append(counts)
+    return _POLE_FIELD_COUNTS[0]
+
+
+def refuse_bad_pole_fields(Omega, residue, odd_residue=None, *, where):
+    """Refuse non-finite elements and live poles off the MPA causal half-plane.
+
+    A zero-residue element is an absent pole and may carry zero frequency;
+    every element must be finite, dormant ones included.
+    """
+    import jax
+
+    n_nonfinite, n_bad_causal = map(int, jax.device_get(
+        _pole_field_counts()(Omega, residue, odd_residue)))
+    if n_nonfinite:
+        raise ValueError(
+            f"{where} refuses {n_nonfinite} non-finite pole/residue elements")
+    if n_bad_causal:
+        raise ValueError(
+            f"{where} refuses {n_bad_causal} live poles with Re Omega <= 0 "
+            "or Im Omega > 0")
+
+
+def _utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(
+        microsecond=0).isoformat()
+
+
+def _open_fit(grp):
+    if MPA_FIT_SUFFIX not in grp:
+        raise ValueError(
+            f"mpa_store: this group carries no {MPA_FIT_SUFFIX!r} "
+            f"ledger, so it cannot say which column ranges of which q "
+            f"have been fitted.  A staged store without its ledger is a "
+            f"tensor of poles indistinguishable from a tensor of zeros.")
+    version = int(grp.attrs.get("mpa_fit_format_version", -1))
+    if version != MPA_FIT_FORMAT_VERSION:
+        raise ValueError(
+            f"mpa_store: fit store is format version {version}; this "
+            f"reader is version {MPA_FIT_FORMAT_VERSION}.  Refusing "
+            f"rather than guessing.")
+    return grp[MPA_FIT_SUFFIX]
+
+
+def _append(dset, values):
+    n = int(dset.shape[0])
+    arr = np.asarray(values)
+    dset.resize(n + arr.shape[0], axis=0)
+    dset[n:] = arr
+
+
+def _commit_fit_blocks(led, records):
+    """Publish several landed payload blocks in one metadata transaction.
+
+    ``records`` contains ``(q, cols, lo, hi, condition_max,
+    backward_error_max)`` tuples in write order.  The payload writer calls
+    this only after its collective HDF5 handle has drained and closed, so the
+    ledger can never certify bytes that are still queued.  Updating
+    ``blocks_done`` and extending each journal dataset once is also the
+    difference between one O(n_blocks) metadata commit and replaying an
+    O(n_q*n_mu) read-modify-write for every block.
+    """
+    records = tuple(records)
+    if not records:
+        return
+    done = np.asarray(led["blocks_done"][()], dtype=bool)
+    journal = np.empty((len(records), 3), dtype=np.int64)
+    maxima = {
+        key: np.empty(len(records), dtype=np.float64)
+        for key in CERTIFICATION_METRICS
+    }
+    for i, (iq, cols, lo, hi, cond_max, berr_max) in enumerate(records):
+        done[int(iq), np.asarray(cols, dtype=np.int64)] = True
+        journal[i] = (int(iq), int(lo), int(hi))
+        maxima["condition"][i] = float(cond_max)
+        maxima["backward_error"][i] = float(berr_max)
+    led["blocks_done"][...] = done
+    _append(led["block_journal"], journal)
+    for key in CERTIFICATION_METRICS:
+        _append(led["block_" + key + "_max"], maxima[key])
+
+
+def _unit_scale(source_unit, to_unit, where):
+    """The multiplier taking energies from ``source_unit`` to ``to_unit``.
+
+    Both units must be declared in :data:`FIT_ENERGY_UNITS`; an
+    undeclared unit is refused rather than passed through at 1.0.
+    """
+    if source_unit not in FIT_ENERGY_UNITS or to_unit not in FIT_ENERGY_UNITS:
+        raise ValueError(
+            f"{where}: both stored and requested energy units must be "
+            f"declared; stored={source_unit!r}, requested={to_unit!r}")
+    return FIT_ENERGY_UNITS[source_unit] / FIT_ENERGY_UNITS[to_unit]
+
+
+def _matching_ready_collective_head(
+    src,
+    *,
+    sample_z,
+    sample_Wc,
+    Omega_p,
+    B_p,
+    energy_unit,
+    diagnostics,
+    grid_hash,
+    fit_provenance,
+    model,
+    occupation_state,
+):
+    """Whether an incomplete fit already owns this exact committed head.
+
+    A ready head is immutable transaction state: exact equality permits an
+    interrupted body+head transaction to continue to the root COMPLETE
+    stamp, while any mismatch refuses.  A present ``ready=False`` group is
+    disposable staging state; the caller has already authenticated the root
+    fit ledger and all body ranges before reaching this check.
+    """
+    expected_payload = {
+        "sample_z": sample_z,
+        "sample_Wc": sample_Wc,
+        "Omega_p": Omega_p,
+        "B_p": B_p,
+    }
+    expected_attrs = {
+        "format_version": np.int64(2),
+        "model": str(model),
+        "frequency_unit": str(energy_unit),
+        "Wc_unit": "a.u.",
+        "residue_unit": f"{energy_unit}*a.u.",
+        "mpa_grid_hash": str(grid_hash),
+        **dict(diagnostics),
+    }
+    expected_provenance = {
+        "fit_" + str(key): value
+        for key, value in dict(fit_provenance).items()
+    }
+    expected_occ = (
+        {} if occupation_state is None else {
+            "mpa_" + key: value
+            for key, value in _occ_stamp_values(occupation_state).items()
+        })
+    with _h5(src, "r") as grp:
+        _open_fit(grp)
+        if MPA_HEAD_SUFFIX not in grp:
+            return False
+        head = grp[MPA_HEAD_SUFFIX]
+        if not bool(head.attrs.get("ready", False)):
+            return False
+        faults = []
+        if set(map(str, head.keys())) != set(expected_payload):
+            faults.append(
+                f"payload datasets={sorted(map(str, head.keys()))}, "
+                f"expected={sorted(expected_payload)}")
+        for name, expected in expected_payload.items():
+            if name not in head:
+                continue
+            dataset = head[name]
+            if np.dtype(dataset.dtype) != np.dtype(np.complex128):
+                faults.append(
+                    f"{name} dtype={dataset.dtype}, expected=complex128")
+                continue
+            if tuple(dataset.shape) != tuple(expected.shape):
+                faults.append(
+                    f"{name} shape={tuple(dataset.shape)}, "
+                    f"expected={tuple(expected.shape)}")
+                continue
+            if not np.array_equal(np.asarray(dataset[()]), expected):
+                faults.append(f"{name} values differ")
+        for name, expected in expected_attrs.items():
+            if name not in head.attrs or not _values_equal(
+                    head.attrs.get(name), expected):
+                faults.append(
+                    f"{name}={head.attrs.get(name)!r}, expected={expected!r}")
+        diagnostic_names = set(diagnostics)
+        actual_provenance = {
+            str(key): head.attrs[key]
+            for key in head.attrs
+            if str(key).startswith("fit_")
+            and str(key) not in diagnostic_names
+        }
+        if (set(actual_provenance) != set(expected_provenance)
+                or any(not _values_equal(actual_provenance[key], value)
+                       for key, value in expected_provenance.items()
+                       if key in actual_provenance)):
+            faults.append("fit provenance differs")
+        actual_occ = {
+            "mpa_" + key: head.attrs["mpa_" + key]
+            for key in _OCC_STAMP_ORDER if "mpa_" + key in head.attrs
+        }
+        if (set(actual_occ) != set(expected_occ)
+                or any(not _values_equal(actual_occ[key], value)
+                       for key, value in expected_occ.items()
+                       if key in actual_occ)):
+            faults.append("occupation provenance differs")
+    if faults:
+        raise ValueError(
+            "GATE mpa_ready_head_identity: an incomplete fit store already "
+            "contains a ready scalar head that differs from this restart; "
+            "refusing to replace committed head state:\n  "
+            + "\n  ".join(faults))
+    return True
+
+
+def write_head_fit_collective(
+    dest,
+    sample_z,
+    sample_Wc,
+    Omega_p,
+    B_p,
+    *,
+    mesh_xy,
+    energy_unit,
+    fit_condition,
+    fit_backward_error,
+    fit_max_abs_residual,
+    grid_hash,
+    fit_provenance,
+    model="multipole",
+    occupation_state=None,
+):
+    """Collectively publish one tiny scalar head fit through SlabIO.
+
+    COLLECTIVE over ``mesh_xy``.  ``dest`` must be a PATH.
+
+    SHAPES AND UNITS.  All four arrays are flattened to 1-D complex128.
+    ``sample_z``/``sample_Wc`` share an extent — 2·n_p in production — and
+    ``Omega_p``/``B_p`` share a DIFFERENT one, n_p; the two pairs are not
+    required to agree with each other.  ``sample_Wc`` stays in
+    Coulomb-head atomic units, while ``sample_z``, ``Omega_p`` and ``B_p``
+    use ``energy_unit`` (the pole residue carries one energy factor).
+
+    REPLICATED INPUT, RANK-0 BYTES.  The vectors are published through
+    ``SlabIO.write_attr``, which queues and lets only rank 0's copy land at
+    close — so every rank must supply identical values, and a rank-dependent
+    array here is silently discarded on all ranks but one.
+
+    ORDERING PRECONDITION: every BODY range must be checkpointed while the
+    store itself remains incomplete, and its ``w_grid_hash`` must equal
+    ``grid_hash``.  The final COMPLETE stamp is published only after this
+    head's readiness transaction closes.  A matching already-ready head is
+    authenticated and preserved so a crash immediately before COMPLETE is
+    idempotently resumable; a differing ready head is immutable and refuses.
+
+    FORMAT VERSION 2.  This writer stamps 2 and
+    :func:`read_head_fit_collective` refuses anything else; a version-1
+    head (the retired serial writer's) is not readable.  A fresh publish
+    uses all-rank h5py
+    validation, rank-0 h5py metadata allocation, FFI payload publication,
+    then rank-0 h5py readiness.  The already-ready path stops after the
+    read-only identity check.
+    """
+    from common.collectives import barrier, process_rank
+    from file_io.slab_io import SlabIO
+
+    z = np.ascontiguousarray(sample_z, dtype=np.complex128).reshape(-1)
+    wc = np.ascontiguousarray(sample_Wc, dtype=np.complex128).reshape(-1)
+    poles = np.ascontiguousarray(Omega_p, dtype=np.complex128).reshape(-1)
+    residues = np.ascontiguousarray(B_p, dtype=np.complex128).reshape(-1)
+    if str(energy_unit) not in FIT_ENERGY_UNITS:
+        raise ValueError("collective scalar head has an unsupported energy unit")
+    if str(model) not in _HEAD_FIT_MODELS:
+        raise ValueError(
+            f"write_head_fit_collective: scalar-head model {model!r} is "
+            f"not one of {_HEAD_FIT_MODELS}; refuse to publish a fitting "
+            "protocol that the matching reader cannot consume")
+    if (z.size < 1 or poles.size < 1 or z.shape != wc.shape
+            or poles.shape != residues.shape):
+        raise ValueError("collective scalar head has inconsistent vector extents")
+    for name, arr in (
+        ("sample_z", z), ("sample_Wc", wc),
+        ("Omega_p", poles), ("B_p", residues),
+    ):
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"collective scalar head {name} is not finite")
+    diagnostics = {
+        "fit_condition": float(fit_condition),
+        "fit_backward_error": float(fit_backward_error),
+        "fit_max_abs_residual": float(fit_max_abs_residual),
+    }
+    if any(not np.isfinite(v) or v < 0.0 for v in diagnostics.values()):
+        raise ValueError("collective scalar-head diagnostics are invalid")
+    ledger = fit_completion_ledger(dest)
+    if ledger["complete"]:
+        raise ValueError(
+            "scalar head cannot replace data in a finalized fit store")
+    if not bool(np.asarray(ledger["blocks_done"], dtype=bool).all()):
+        raise ValueError(
+            "scalar head may only be attached after every body range is "
+            "checkpointed")
+    if str(ledger["w_grid_hash"]) != str(grid_hash):
+        raise ValueError(
+            "scalar-head grid hash does not match the fitted body grid")
+
+    head_ready = _matching_ready_collective_head(
+        dest,
+        sample_z=z,
+        sample_Wc=wc,
+        Omega_p=poles,
+        B_p=residues,
+        energy_unit=energy_unit,
+        diagnostics=diagnostics,
+        grid_hash=grid_hash,
+        fit_provenance=fit_provenance,
+        model=model,
+        occupation_state=occupation_state,
+    )
+    # The ledger and ready-head checks are all-rank serial-h5py reads.  Rank
+    # 0 must not open the inode for write until every peer has closed both.
+    # This is a reader->single-writer ownership transfer, not optional
+    # synchronization around the later parallel payload write.
+    barrier("mpa_head_ledger_readers_closed")
+    if head_ready:
+        return
+    if process_rank() == 0:
+        with _h5(dest, "a") as grp:
+            _open_fit(grp)
+            if MPA_HEAD_SUFFIX in grp:
+                del grp[MPA_HEAD_SUFFIX]
+            head = grp.create_group(MPA_HEAD_SUFFIX)
+            head.attrs["ready"] = False
+            head.attrs["format_version"] = np.int64(2)
+            head.attrs["model"] = str(model)
+            head.attrs["frequency_unit"] = str(energy_unit)
+            head.attrs["Wc_unit"] = "a.u."
+            head.attrs["residue_unit"] = f"{energy_unit}*a.u."
+            head.attrs["mpa_grid_hash"] = str(grid_hash)
+            for key, value in diagnostics.items():
+                head.attrs[key] = value
+            for key, value in sorted(dict(fit_provenance).items()):
+                head.attrs["fit_" + str(key)] = value
+            if occupation_state is not None:
+                stamp_occupation_provenance(head, occupation_state)
+    barrier("mpa_head_metadata_allocated")
+    with SlabIO(dest, mode="a", mesh=mesh_xy) as io:
+        prefix = MPA_HEAD_SUFFIX + "/"
+        io.write_attr(prefix + "sample_z", z)
+        io.write_attr(prefix + "sample_Wc", wc)
+        io.write_attr(prefix + "Omega_p", poles)
+        io.write_attr(prefix + "B_p", residues)
+    barrier("mpa_head_payload_written")
+    if process_rank() == 0:
+        with _h5(dest, "a") as grp:
+            grp[MPA_HEAD_SUFFIX].attrs["ready"] = True
+    barrier("mpa_head_committed")
+
+
+class FitWriter:
+    """One collective payload handle for a bounded pole-fit epoch.
+
+    The fit output is larger than its one-tile working set, so blocks still
+    stream to disk as soon as they are fitted.  What persists is the FILE
+    HANDLE, not the pole tensors: one ``SlabIO(mode='a')`` owns all block
+    writes, caches the three dataset handles, and only then does rank zero
+    publish the small completion ledger in one h5py transaction.  A failed
+    payload close publishes nothing.
+
+    Each block is drained before :meth:`write_block` returns.  The next fit
+    block is read from the W-sample file through the epoch's different,
+    persistent HDF5 handle; allowing that read to overlap this handle's
+    asynchronous H5Dwrite is illegal even though the two inodes differ
+    (parallel HDF5's VOL state is process-global).  Pre-opening every output
+    dataset before the first write and using one drain per three-write block
+    gives the service a strict ``read W -> fit -> write+drain poles``
+    transaction order without restoring any per-block file open or ledger
+    transaction.
+
+    COLLECTIVE over ``mesh_xy``.  Construct, call :meth:`write_block` in the
+    same order on every rank, then close collectively.  The context-manager
+    spelling commits only on a clean exit; an exceptional exit drains and
+    closes the payload but deliberately leaves its blocks uncommitted.
+
+    This lifetime is an I/O resource boundary, analogous to
+    :class:`PoleReader`; it does not accumulate any device array.  Pending
+    state is only the bool completion bitmap and one six-scalar host record
+    per block.
+    """
+
+    def __init__(self, dest, *, mesh_xy, mode="a"):
+        if mesh_xy is None:
+            raise ValueError(
+                "FitWriter requires mesh_xy: its payload handle is collective")
+        if mode != "a":
+            raise ValueError(
+                "FitWriter requires mode='a': allocation owns inode creation")
+        self.dest = os.fspath(dest)
+        self.mesh_xy = mesh_xy
+        self.ledger = fit_completion_ledger(self.dest)
+        if self.ledger["complete"]:
+            raise ValueError("FitWriter: store is finalized")
+        stamped = self.ledger.get("diagnostic_keys")
+        if stamped is None:
+            raise ValueError(
+                "FitWriter: allocated store has no diagnostic_keys stamp")
+        self.diagnostic_keys = tuple(stamped.split(","))
+        if self.diagnostic_keys != PERSISTED_DIAGNOSTICS:
+            raise ValueError(
+                "FitWriter: allocated diagnostic payload "
+                f"{self.diagnostic_keys!r} does not match production "
+                f"schema {PERSISTED_DIAGNOSTICS!r}")
+        self._pending = []
+        from common.collectives import barrier
+        # ``fit_completion_ledger`` is an all-rank serial read.  Each epoch
+        # must transfer ownership after that fresh check, not rely on a
+        # driver barrier that preceded this constructor.
+        barrier("mpa_fit_writer_ledger_readers_closed")
+        from file_io.slab_io import SlabIO
+        self._io = SlabIO(self.dest, mode=mode, mesh=mesh_xy)
+        pole_shape = (self.ledger["n_p"], self.ledger["n_q"],
+                      self.ledger["n_mu"], self.ledger["n_mu"])
+        diag_shape = (self.ledger["n_q"], self.ledger["n_mu"],
+                      self.ledger["n_mu"])
+        # Allocation already created these datasets.  Register all handles
+        # up front, while no payload write is in flight, so the block stream
+        # contains transfers only: no H5Dopen/H5Dcreate may interleave with
+        # the asynchronous writer thread.
+        self._io.create_dataset("Omega_p", shape=pole_shape,
+                                dtype=np.complex128)
+        self._io.create_dataset("B_p", shape=pole_shape,
+                                dtype=np.complex128)
+        self.ordered_residues = bool(self.ledger["ordered_residues"])
+        if self.ordered_residues:
+            self._io.create_dataset("B_odd_p", shape=pole_shape,
+                                    dtype=np.complex128)
+        for key in self.diagnostic_keys:
+            self._io.create_dataset("fit_" + key, shape=diag_shape,
+                                    dtype=np.float64)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close(commit=exc_type is None)
+
+    def close(self, *, commit=True):
+        """Drain/close the payload, then publish all landed blocks once."""
+        io, self._io = getattr(self, "_io", None), None
+        if io is None:
+            return self.ledger
+        try:
+            io.close()
+        except BaseException:
+            # The payload may be partial, but the on-disk ledger still says
+            # none of this session's blocks are consumable.
+            self._pending = []
+            raise
+
+        from common.collectives import barrier, process_rank
+        barrier("mpa_fit_payload_session_closed")
+        pending = tuple(self._pending)
+        self._pending = []
+        if not commit:
+            self.ledger = fit_completion_ledger(self.dest)
+            barrier("mpa_fit_aborted_ledger_readers_closed")
+            return self.ledger
+        if pending and process_rank() == 0:
+            with _h5(self.dest, "a") as grp:
+                _commit_fit_blocks(_open_fit(grp), pending)
+        barrier("mpa_fit_payload_session_committed")
+        self.ledger = fit_completion_ledger(self.dest)
+        # The next driver operation is rank zero's final metadata write.
+        # Publish that every rank's serial reader has CLOSED first; a barrier
+        # before the reads would order nothing about their completion.
+        barrier("mpa_fit_payload_session_ledger_readers_closed")
+        return self.ledger
+
+    def write_block(
+        self,
+        q,
+        mu_cols,
+        Omega_p_block,
+        B_p_block,
+        diag_block,
+        *,
+        B_odd_p_block=None,
+        block_condition_max,
+        block_backward_error_max,
+        diagnostics_finite,
+    ):
+        """Queue one native row-sharded block on the persistent handle.
+
+        Pole blocks are ``(n_p,1,n_mu_padded,n_cols_buffer)`` on
+        ``P(None,None,('x','y'),None)``.  Diagnostics are
+        ``(1,n_mu_padded,n_cols_buffer)`` on ``P(None,('x','y'))``.
+        ``mu_cols`` is one contiguous range.
+
+        The three host diagnostics must be rank-identical; the fit kernel
+        obtains them with mesh reductions before this call.  Payload writes
+        are asynchronous.  The returned ledger is the session's in-memory
+        view; it becomes the on-disk authority only after :meth:`close`.
+        """
+        from jax.sharding import PartitionSpec as P
+
+        if self._io is None:
+            raise ValueError("FitWriter.write_block after close")
+        ledger = self.ledger
+        iq = int(q)
+        if not 0 <= iq < ledger["n_q"]:
+            raise IndexError(
+                f"FitWriter.write_block: q={iq} outside [0,{ledger['n_q']})")
+        cols = normalise_columns(mu_cols, ledger["n_mu"])
+        lo, hi, sel = _column_span(cols)
+        if sel is not None:
+            raise ValueError("FitWriter.write_block requires contiguous columns")
+        already = cols[np.asarray(ledger["blocks_done"][iq, cols], dtype=bool)]
+        if already.size:
+            raise ValueError(
+                f"FitWriter.write_block: q={iq} columns "
+                f"{already[:8].tolist()} are already fitted")
+        if not bool(diagnostics_finite):
+            raise ValueError(
+                "FitWriter.write_block: fit diagnostics contain non-finite "
+                "values; refusing to certify this block")
+
+        pole_spec = P(None, None, ("x", "y"), None)
+        # JAX canonicalizes trailing replicated entries away on rank-3 arrays.
+        diag_spec = P(None, ("x", "y"))
+        Om, Bp = Omega_p_block, B_p_block
+        Dp = B_odd_p_block
+        if self.ordered_residues != (Dp is not None):
+            raise ValueError(
+                "FitWriter.write_block: B_odd_p_block presence must match "
+                f"the store's ordered-residue stamp ({self.ordered_residues})")
+        arrays = (Om, Bp) if Dp is None else (Om, Bp, Dp)
+        for arr in arrays:
+            _require_layout(
+                arr, self.mesh_xy, pole_spec,
+                "FitWriter.write_block requires Omega_p and B_p on "
+                "P(None,None,('x','y'),None)")
+        n_p, one, n_rows, width = map(int, Om.shape)
+        if tuple(Bp.shape) != tuple(Om.shape) or one != 1:
+            raise ValueError(
+                "FitWriter.write_block: pole blocks must agree and have "
+                "shape (n_p,1,n_mu_padded,n_cols_buffer)")
+        if Dp is not None and tuple(Dp.shape) != tuple(Om.shape):
+            raise ValueError(
+                "FitWriter.write_block: B_odd_p must match the pole block")
+        if n_p != ledger["n_p"] or n_rows < ledger["n_mu"] \
+                or width < int(cols.size):
+            raise ValueError(
+                f"FitWriter.write_block: pole block {tuple(Om.shape)} is "
+                f"incompatible with n_p={ledger['n_p']}, "
+                f"n_mu={ledger['n_mu']}, columns={int(cols.size)}")
+        keys = tuple(sorted(diag_block))
+        if keys != self.diagnostic_keys:
+            raise ValueError(
+                f"FitWriter.write_block: diagnostics {keys} do not match "
+                f"allocated keys {','.join(self.diagnostic_keys)!r}")
+        for key, arr in diag_block.items():
+            if tuple(arr.shape) != (1, n_rows, width):
+                raise ValueError(
+                    f"FitWriter.write_block: diagnostic {key!r} has "
+                    f"shape {tuple(arr.shape)}, expected "
+                    f"{(1, n_rows, width)}")
+            _require_layout(
+                arr, self.mesh_xy, diag_spec,
+                f"FitWriter.write_block: diagnostic {key!r} must be "
+                "on P(None,('x','y'),None)")
+
+        valid_pole = (n_p, 1, ledger["n_mu"], int(cols.size))
+        valid_diag = (1, ledger["n_mu"], int(cols.size))
+        global_pole = (n_p, ledger["n_q"], ledger["n_mu"],
+                       ledger["n_mu"])
+        global_diag = (ledger["n_q"], ledger["n_mu"], ledger["n_mu"])
+        self._io.write_slab("Omega_p", Om, offset=(0, iq, 0, lo),
+                            global_shape=global_pole,
+                            valid_shape=valid_pole)
+        self._io.write_slab("B_p", Bp, offset=(0, iq, 0, lo),
+                            global_shape=global_pole,
+                            valid_shape=valid_pole)
+        if Dp is not None:
+            self._io.write_slab("B_odd_p", Dp, offset=(0, iq, 0, lo),
+                                global_shape=global_pole,
+                                valid_shape=valid_pole)
+        for key in keys:
+            self._io.write_slab(
+                "fit_" + key, diag_block[key], offset=(iq, 0, lo),
+                global_shape=global_diag, valid_shape=valid_diag)
+
+        # The next scheduled operation reads the W-sample inode through a
+        # separate HDF5 context.  SlabIO's cross-handle contract requires
+        # this writer to be quiescent first; this also makes the block's
+        # payload durability the transaction boundary while the ledger
+        # remains a single end-of-session commit.
+        self._io.sync_writes()
+
+        record = (iq, cols.copy(), lo, hi, float(block_condition_max),
+                  float(block_backward_error_max))
+        self._pending.append(record)
+        ledger["blocks_done"][iq, cols] = True
+        ledger["n_done"] = int(ledger["blocks_done"].sum())
+        row = np.asarray([[iq, lo, hi]], dtype=np.int64)
+        ledger["journal"] = np.concatenate((ledger["journal"], row), axis=0)
+        for key, value in zip(
+                CERTIFICATION_METRICS,
+                (block_condition_max, block_backward_error_max)):
+            name = "block_" + key + "_max"
+            ledger[name] = np.append(ledger[name], float(value))
+            ledger[key + "_max"] = float(np.max(ledger[name]))
+        return ledger
+
+
+def write_fit_block_collective(
+    dest,
+    q,
+    mu_cols,
+    Omega_p_block,
+    B_p_block,
+    diag_block,
+    *,
+    B_odd_p_block=None,
+    mesh_xy,
+    block_condition_max,
+    block_backward_error_max,
+    diagnostics_finite,
+):
+    """Write and commit one block through a one-block :class:`FitWriter`.
+
+    This remains the surgical/resume API used by :func:`fit_one_block` when
+    no session is supplied.  Production :func:`gw.mpa.fit_driver.run_fit_driver`
+    owns one :class:`FitWriter` across its whole schedule; calling this helper
+    in that loop would reintroduce the collective open/close defect.
+    """
+    with FitWriter(dest, mesh_xy=mesh_xy) as writer:
+        writer.write_block(
+            q, mu_cols, Omega_p_block, B_p_block, diag_block,
+            B_odd_p_block=B_odd_p_block,
+            block_condition_max=block_condition_max,
+            block_backward_error_max=block_backward_error_max,
+            diagnostics_finite=diagnostics_finite)
+    return writer.ledger
+
+
+def fit_completion_ledger(src, *, mode="r"):
+    """Which column ranges of which q are fitted — a plain dict.
+
+    ``blocks_done`` is the authority — ``(n_q, n_mu)`` bool, indexed
+    ``blocks_done[iq, cols]``.  ``journal`` is the append-only record of the
+    order the blocks arrived in: ``(n_blocks, 3)`` int64 of
+    ``[iq, lo, hi]`` and NOTHING ELSE.  The per-block worst condition and
+    backward error are SEPARATE 1-D keys, ``block_condition_max`` and
+    ``block_backward_error_max``, with the scalar reductions under
+    ``condition_max`` / ``backward_error_max``; this docstring used to put
+    them inside ``journal``, and a caller indexing ``journal[:, 3]`` for a
+    condition number gets an IndexError.  The two structures are not
+    redundant: the ledger answers "is this column done", the journal
+    answers "in what order", and the Σ stage's certification reads the
+    maxima.
+
+    Rank-local and serial, but invoked on every rank by three collective
+    functions — a collective caller must invoke it uniformly.  ``src`` is a
+    path or an already-open group; this is the entry point in this module most
+    often passed both ways.
+    """
+    qs = _qs()
+    with _h5(src, mode) as grp:
+        led = _open_fit(grp)
+        done = np.asarray(led["blocks_done"][()], dtype=bool)
+        journal = np.asarray(led["block_journal"][()], dtype=np.int64)
+        maxima = {
+            key: np.asarray(led["block_" + key + "_max"][()],
+                            dtype=np.float64)
+            for key in CERTIFICATION_METRICS
+        }
+        certification = {
+            str(key)[len("mpa_cert_"):]: grp.attrs[key]
+            for key in grp.attrs if str(key).startswith("mpa_cert_")
+        }
+        provenance = {
+            str(key)[len("prov_"):]: grp.attrs[key]
+            for key in grp.attrs if str(key).startswith("prov_")
+        }
+        ordered_residues = bool(
+            grp.attrs.get("mpa_fit_ordered_residues", False))
+        has_odd = "B_odd_p" in grp
+        if has_odd != ordered_residues:
+            raise ValueError(
+                "mpa_store: fit store's mpa_fit_ordered_residues stamp "
+                f"is {ordered_residues}, but B_odd_p presence is {has_odd}. "
+                "A partial ordered-residue schema is refused.")
+        out = {
+            "format_version": int(grp.attrs["mpa_fit_format_version"]),
+            "n_p": int(grp.attrs["mpa_fit_n_p"]),
+            "n_q": int(grp.attrs["mpa_fit_n_q"]),
+            "n_q_full": int(grp.attrs.get(
+                "mpa_fit_n_q_full", grp.attrs["mpa_fit_n_q"])),
+            "q_storage": qs.qirr_attr_str(
+                grp, "mpa_fit_q_storage") or "full",
+            "table_hash": qs.qirr_attr_str(grp, "mpa_fit_table_hash"),
+            "w_grid_hash": qs.qirr_attr_str(grp, "mpa_fit_w_grid_hash"),
+            "w_table_hash": qs.qirr_attr_str(grp, "mpa_fit_w_table_hash"),
+            "w_centroid_hash": qs.qirr_attr_str(
+                grp, "mpa_fit_w_centroid_hash"),
+            "energy_unit": qs.qirr_attr_str(grp, FIT_ENERGY_UNIT_ATTR),
+            "n_mu": int(grp.attrs["mpa_fit_n_mu_logical"]),
+            "ordered_residues": ordered_residues,
+            "complete": bool(grp.attrs.get("mpa_fit_complete", False)),
+            "blocks_done": done,
+            "n_done": int(done.sum()),
+            "n_total": int(done.size),
+            "journal": journal,
+            "diagnostic_keys": qs.qirr_attr_str(
+                led, "diagnostic_keys"),
+            "finalized_utc": qs.qirr_attr_str(grp, "mpa_fit_finalized_utc"),
+            "certification": certification,
+            "provenance": provenance,
+        }
+        for key, vals in maxima.items():
+            out["block_" + key + "_max"] = vals
+            out[key + "_max"] = float(vals.max()) if vals.size else None
+        return out
+
+
+def _validate_pole_payload_metadata(src, ledger, *, mode="r"):
+    """Validate pole/diagnostic dataset metadata without reading payloads."""
+    expected_shape = (
+        int(ledger["n_p"]), int(ledger["n_q"]),
+        int(ledger["n_mu"]), int(ledger["n_mu"]),
+    )
+    expected_dtype = np.dtype(np.complex128)
+    names = ["Omega_p", "B_p"]
+    if ledger["ordered_residues"]:
+        names.append("B_odd_p")
+    with _h5(src, mode) as grp:
+        for name in names:
+            if name not in grp:
+                raise ValueError(
+                    f"MPA fit is missing pole payload {name!r}")
+            dataset = grp[name]
+            if tuple(dataset.shape) != expected_shape:
+                raise ValueError(
+                    f"MPA fit payload {name!r} has shape "
+                    f"{tuple(dataset.shape)}, expected exact logical shape "
+                    f"{expected_shape} from its completion ledger")
+            if np.dtype(dataset.dtype) != expected_dtype:
+                raise ValueError(
+                    f"MPA fit payload {name!r} has dtype "
+                    f"{np.dtype(dataset.dtype).name}, expected "
+                    f"{expected_dtype.name}")
+        diagnostic_shape = (int(ledger["n_q"]), int(ledger["n_mu"]),
+                            int(ledger["n_mu"]))
+        for key in PERSISTED_DIAGNOSTICS:
+            name = "fit_" + key
+            if name not in grp:
+                raise ValueError(f"MPA fit is missing diagnostic payload {name!r}")
+            dataset = grp[name]
+            if tuple(dataset.shape) != diagnostic_shape:
+                raise ValueError(
+                    f"MPA fit payload {name!r} has shape "
+                    f"{tuple(dataset.shape)}, expected {diagnostic_shape}")
+            if np.dtype(dataset.dtype) != np.dtype(np.float64):
+                raise ValueError(
+                    f"MPA fit payload {name!r} has dtype {dataset.dtype}, "
+                    "expected float64")
+
+
+def refuse_finalized_fit_replacement(fit_path, *, overwrite_completed=False):
+    """Early write-once gate for a build that will resume sample artifacts."""
+    path = os.path.abspath(os.fspath(fit_path))
+    if not os.path.exists(path):
+        return None
+    try:
+        _bundle_reader.validate_fit_store(path)
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+    if not bool(overwrite_completed):
+        raise ValueError(
+            "GATE mpa_completed_fit_write_once: finalized certified MPA fit "
+            f"store {path} is write-once. Consume it through "
+            "mpa_fit_reuse_file, choose a new run variant, or deliberately "
+            "set mpa_overwrite_completed_artifacts = true for destructive "
+            "regeneration.")
+    return path
+
+
+def _require_certification(certification, dest):
+    """A certification :func:`validate_fit_store` will accept, or refuse.
+
+    THE PRESENCE AND THE VALUE, because the validator checks both and a
+    finalize is the last moment either can be fixed: a threshold that is
+    absent, non-numeric, non-finite or non-positive fails
+    ``validate_fit_store`` exactly as hard as no certification at all, and
+    a finalized store cannot be written to or finalized again.
+    """
+    cert = dict(certification or {})
+    missing, bad = [], []
+    for key in CERTIFICATION_METRICS:
+        name = key + "_max_allowed"
+        if name not in cert:
+            missing.append(name)
+            continue
+        try:
+            val = float(cert[name])
+        except (TypeError, ValueError):
+            bad.append(f"{name}={cert[name]!r}")
+            continue
+        if not np.isfinite(val) or val <= 0.0:
+            bad.append(f"{name}={cert[name]!r}")
+    if not missing and not bad:
+        return
+    faults = "; ".join(
+        ([f"missing {', '.join(missing)}"] if missing else [])
+        + ([f"unusable {', '.join(bad)}"] if bad else []))
+    raise ValueError(
+        "finalize_fit_store: refusing to finalize a store Σ could never "
+        "read\n"
+        f"  file  : {dest}\n"
+        f"  got   : certification={certification!r} — {faults}.\n"
+        f"  want  : a finite, positive "
+        + " and ".join(k + "_max_allowed" for k in CERTIFICATION_METRICS)
+        + ", the thresholds validate_fit_store enforces against the "
+        "observed maxima.  Finalizing without them stamps a store that "
+        "the validator refuses ('MPA Sigma requires certified pole "
+        "fits') and that NOTHING can repair: a second finalize is "
+        "refused and every writer refuses a finalized store.\n"
+        "  fix   : pass certification={"
+        + ", ".join(f"'{k}_max_allowed': <threshold>"
+                    for k in CERTIFICATION_METRICS)
+        + "}.  The fit driver's own values are the solver-consistency "
+        "pair 1/rcond and sqrt(eps) (gw/mpa/fit_driver.py); a stage with "
+        "no material tolerance of its own should reuse them rather than "
+        "leave the store uncertified.")
+
+
+_FIT_IO_RECEIPT_COUNTS = (
+    "blocks_walked",
+    "blocks_skipped",
+    "checkpoint_blocks",
+    "checkpoint_epochs_planned",
+    "checkpoint_epochs_committed",
+    "sample_source_opens",
+    "sample_source_closes",
+    "sample_h5d_reads",
+)
+_FIT_IO_RECEIPT_SECONDS = (
+    "source_open", "read", "source_close", "fit", "write", "finalize",
+    "total",
+)
+
+
+def _normalise_fit_io_receipt(report):
+    """The exact compact schema persisted for one successful body attempt."""
+    row = dict(report)
+    try:
+        count_values = {key: np.asarray(row[key])
+                        for key in _FIT_IO_RECEIPT_COUNTS}
+        second_values = {key: np.asarray(row["seconds"][key])
+                         for key in _FIT_IO_RECEIPT_SECONDS}
+        ordered_value = np.asarray(row["ordered_residues"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "fit I/O receipt is missing its exact count/timing schema") from exc
+    if any(value.shape != () or value.dtype.kind not in "iu"
+           for value in count_values.values()):
+        raise ValueError("fit I/O receipt counts must be scalar integers")
+    if any(value.shape != () or value.dtype.kind not in "iuf"
+           for value in second_values.values()):
+        raise ValueError("fit I/O receipt seconds must be scalar numbers")
+    if ordered_value.shape != () or ordered_value.dtype.kind != "b":
+        raise ValueError("fit I/O receipt ordered_residues must be bool")
+    counts = {key: int(value) for key, value in count_values.items()}
+    seconds = {key: float(value) for key, value in second_values.items()}
+    ordered = bool(ordered_value)
+    if any(value < 0 for value in counts.values()):
+        raise ValueError("fit I/O receipt counts must be nonnegative")
+    if any(not np.isfinite(value) or value < 0.0
+           for value in seconds.values()):
+        raise ValueError(
+            "fit I/O receipt seconds must be finite and nonnegative")
+    if counts["sample_source_opens"] != counts["sample_source_closes"]:
+        raise ValueError("fit I/O receipt source opens/closes disagree")
+    if counts["checkpoint_blocks"] != FIT_IO_CHECKPOINT_BLOCKS:
+        raise ValueError(
+            "fit I/O receipt checkpoint_blocks disagrees with the format "
+            f"policy {FIT_IO_CHECKPOINT_BLOCKS}")
+    expected_epochs = (
+        counts["blocks_walked"] + FIT_IO_CHECKPOINT_BLOCKS - 1
+    ) // FIT_IO_CHECKPOINT_BLOCKS
+    if (counts["checkpoint_epochs_planned"] != expected_epochs
+            or counts["checkpoint_epochs_committed"] != expected_epochs
+            or counts["sample_source_opens"] != expected_epochs):
+        raise ValueError(
+            "fit I/O receipt epoch/open census disagrees with "
+            f"ceil(blocks_walked/{FIT_IO_CHECKPOINT_BLOCKS})="
+            f"{expected_epochs}")
+    expected_reads = counts["blocks_walked"] * (2 if ordered else 1)
+    if counts["sample_h5d_reads"] != expected_reads:
+        raise ValueError(
+            "fit I/O receipt H5Dreads disagree with fitted blocks/components: "
+            f"got {counts['sample_h5d_reads']}, expected {expected_reads}")
+    return {"ordered_residues": ordered,
+            "counts": counts, "seconds": seconds}
+
+
+def _validate_fit_io_receipt_against_ledger(grp, normal):
+    """Bind a plausible receipt to the actual completed body transaction."""
+    led = _open_fit(grp)
+    counts = normal["counts"]
+    n_journal = int(led["block_journal"].shape[0])
+    described = counts["blocks_walked"] + counts["blocks_skipped"]
+    if described != n_journal:
+        raise ValueError(
+            "fit I/O receipt block census disagrees with the fit ledger: "
+            f"walked+skipped={described}, journal={n_journal}")
+    stored_ordered = bool(
+        grp.attrs.get("mpa_fit_ordered_residues", False))
+    if normal["ordered_residues"] != stored_ordered:
+        raise ValueError(
+            "fit I/O receipt ordered_residues disagrees with the fit ledger")
+
+
+def _read_fit_io_receipt_group(grp):
+    """Read and authenticate the exact ready receipt group."""
+    if MPA_FIT_IO_RECEIPT_SUFFIX not in grp:
+        return None
+    row = grp[MPA_FIT_IO_RECEIPT_SUFFIX]
+    expected = {
+        "format_version", "scope", "ordered_residues", "written_utc",
+        "ready",
+        *("count_" + key for key in _FIT_IO_RECEIPT_COUNTS),
+        *("seconds_" + key for key in _FIT_IO_RECEIPT_SECONDS),
+    }
+    actual = set(map(str, row.attrs.keys()))
+    if actual != expected:
+        raise ValueError(
+            "fit I/O receipt does not have the exact schema: "
+            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}")
+    if int(row.attrs["format_version"]) != 1:
+        raise ValueError("unsupported fit I/O receipt format_version")
+    scope = row.attrs["scope"]
+    if isinstance(scope, (bytes, np.bytes_)):
+        scope = bytes(scope).decode("utf-8")
+    if str(scope) != "successful_body_attempt":
+        raise ValueError("fit I/O receipt has an unknown scope")
+    if not bool(row.attrs["ready"]):
+        raise ValueError("fit I/O receipt is present but not ready")
+    report = {
+        key: row.attrs["count_" + key]
+        for key in _FIT_IO_RECEIPT_COUNTS
+    }
+    report["ordered_residues"] = bool(row.attrs["ordered_residues"])
+    report["seconds"] = {
+        key: row.attrs["seconds_" + key]
+        for key in _FIT_IO_RECEIPT_SECONDS
+    }
+    normal = _normalise_fit_io_receipt(report)
+    _validate_fit_io_receipt_against_ledger(grp, normal)
+    return {
+        "format_version": 1,
+        "scope": "successful_body_attempt",
+        "written_utc": row.attrs["written_utc"],
+        **normal,
+    }
+
+
+def _flush_fit_io_receipt(grp):
+    """Make one receipt publication phase durable in its current file."""
+    grp.file.flush()
+
+
+def write_fit_io_receipt(dest, report, *, mode="a"):
+    """Commit the successful body attempt's compact I/O receipt once.
+
+    RANK-0 ONLY.  The body ledger must be complete and root COMPLETE must
+    still be false: production writes this after ``run_fit_driver(...,
+    finalize=False)`` and before the separate scalar-head/finalize
+    transaction.  A ready receipt is immutable and is authenticated/preserved
+    on a no-pending restart.  An unready group is abandoned staging state and
+    may be replaced.  ``ready`` is the last write.
+    """
+    normal = _normalise_fit_io_receipt(report)
+    with _h5(dest, mode) as grp:
+        led = _open_fit(grp)
+        if bool(grp.attrs.get("mpa_fit_complete", False)):
+            raise ValueError(
+                "fit I/O receipt must be committed before root COMPLETE")
+        if not bool(np.asarray(led["blocks_done"][()], dtype=bool).all()):
+            raise ValueError(
+                "fit I/O receipt requires every body range checkpointed")
+        _validate_fit_io_receipt_against_ledger(grp, normal)
+        if MPA_FIT_IO_RECEIPT_SUFFIX in grp:
+            incumbent = grp[MPA_FIT_IO_RECEIPT_SUFFIX]
+            if bool(incumbent.attrs.get("ready", False)):
+                return _read_fit_io_receipt_group(grp)
+            del grp[MPA_FIT_IO_RECEIPT_SUFFIX]
+        row = grp.create_group(MPA_FIT_IO_RECEIPT_SUFFIX)
+        # False is the first field and is made durable with the payload below.
+        # A crash anywhere before the second flush therefore leaves staging
+        # state that the next attempt may replace, never a torn ready schema.
+        row.attrs["ready"] = False
+        row.attrs["format_version"] = np.int64(1)
+        row.attrs["scope"] = "successful_body_attempt"
+        row.attrs["ordered_residues"] = normal["ordered_residues"]
+        for key, value in normal["counts"].items():
+            row.attrs["count_" + key] = np.int64(value)
+        for key, value in normal["seconds"].items():
+            row.attrs["seconds_" + key] = np.float64(value)
+        row.attrs["written_utc"] = _utc_now()
+        _flush_fit_io_receipt(grp)
+        row.attrs["ready"] = True
+        _flush_fit_io_receipt(grp)
+        return _read_fit_io_receipt_group(grp)
+
+
+def finalize_fit_store(dest, *, certification=None, require_head=False,
+                       mode="a"):
+    """Stamp the store COMPLETE — once, and only when it is.
+
+    Refuses a store with an unfitted (q, column) and NAMES the gaps,
+    because "which columns are missing" is the only question a driver
+    that crashed halfway actually has.  Refuses a second finalize for
+    the same reason a second stamp is refused everywhere in this
+    format: two claims about what the file says, differing on the day
+    one of them is made against a different state.
+
+    ``certification`` is stamped as ``mpa_cert_*`` — the thresholds the
+    Σ stage should hold these poles to.  The OBSERVED maxima are stamped
+    regardless (``mpa_fit_condition_max``, ``mpa_fit_backward_error_max``,
+    ``mpa_fit_n_blocks``).
+
+    ``certification`` IS REQUIRED, and the keyword keeps its ``None``
+    default only so the omission fails by name instead of as a
+    ``TypeError``.  A ``certification`` that would not satisfy
+    :func:`validate_fit_store` — absent, empty, or missing/garbage in any
+    ``<key>_max_allowed`` for :data:`CERTIFICATION_METRICS` — is REFUSED
+    HERE, before the store is opened, because the resulting file would be
+    unusable AND unrepairable: the validator refuses an uncertified store
+    ("MPA Sigma requires certified pole fits"), a second
+    :func:`finalize_fit_store` is refused, and every writer refuses a
+    finalized store, so there is no way back through this API.  A store
+    that cannot be validated must not be finalizable; the refusal is that
+    sentence in code.  (Before 2026-08-15 this call accepted the omission
+    and bricked the store for Σ — audit §E.3 item 1.)  The observed-maxima
+    attrs are read by no code in ``src/`` or ``services/``; only tests
+    assert them, which is why they are not a fallback.
+
+    RANK-0 ONLY in production, and that is a real precondition, not a
+    convention: the driver guards the call with ``process_rank() == 0`` and
+    barriers after it.  Called on every rank this is a concurrent
+    multi-process h5py write plus an "already finalized" race.  ``dest`` is
+    a path or an open group; the default ``mode='a'`` is a WRITE open, so
+    calling it while a SlabIO handle is live on the same path is exactly
+    the case :mod:`file_io.hdf5_owner` refuses.  Returns the ledger.
+    """
+    _require_certification(certification, dest)
+    qs = _qs()
+    with _h5(dest, mode) as grp:
+        led = _open_fit(grp)
+        if bool(grp.attrs.get("mpa_fit_complete", False)):
+            raise ValueError(
+                f"finalize_fit_store: this store was already finalized "
+                f"at {qs.qirr_attr_str(grp, 'mpa_fit_finalized_utc')}.  A "
+                f"second finalize would stamp completeness against a "
+                f"state the first one did not measure; if blocks were "
+                f"written since, they were written to a file that "
+                f"already claimed to be done, which is the bug and not "
+                f"the fix.")
+        done = np.asarray(led["blocks_done"][()], dtype=bool)
+        if not done.all():
+            gaps = []
+            for iq in range(done.shape[0]):
+                miss = np.flatnonzero(~done[iq])
+                if miss.size:
+                    gaps.append(f"q={iq}: columns "
+                                f"{_ranges(miss)}")
+            raise ValueError(
+                f"finalize_fit_store: {int((~done).sum())} of "
+                f"{int(done.size)} (q, column) pairs are unfitted, so "
+                f"the store is not complete.  " +
+                "; ".join(gaps[:6]) +
+                (" ..." if len(gaps) > 6 else "") +
+                "  Stamping it complete would tell the Σ stage that "
+                "zeros are poles.")
+        if require_head:
+            if MPA_HEAD_SUFFIX not in grp:
+                raise ValueError(
+                    "finalize_fit_store: production MPA store has a complete "
+                    "body but no scalar head; leaving it resumable")
+            head = grp[MPA_HEAD_SUFFIX]
+            if not bool(head.attrs.get("ready", False)):
+                raise ValueError(
+                    "finalize_fit_store: scalar head is not ready; leaving "
+                    "the body/head transaction incomplete and resumable")
+            head_grid_hash = qs.qirr_attr_str(head, "mpa_grid_hash")
+            body_grid_hash = qs.qirr_attr_str(grp, "mpa_fit_w_grid_hash")
+            if head_grid_hash != body_grid_hash:
+                raise ValueError(
+                    "finalize_fit_store: scalar head/body grid hashes differ")
+        grp.attrs["mpa_fit_complete"] = True
+        grp.attrs["mpa_fit_finalized_utc"] = _utc_now()
+        for key in CERTIFICATION_METRICS:
+            vals = np.asarray(led["block_" + key + "_max"][()])
+            grp.attrs["mpa_fit_" + key + "_max"] = np.float64(
+                vals.max() if vals.size else 0.0)
+        grp.attrs["mpa_fit_n_blocks"] = np.int64(
+            int(led["block_journal"].shape[0]))
+        for key, val in (certification or {}).items():
+            grp.attrs["mpa_cert_" + str(key)] = val
+        return fit_completion_ledger(grp)
+
+
+def _ranges(idx):
+    """``[0 1 2 5 6]`` -> ``'0-2,5-6'`` — gaps a human can act on."""
+    idx = np.asarray(idx, dtype=np.int64)
+    if idx.size == 0:
+        return ""
+    cuts = np.flatnonzero(np.diff(idx) != 1)
+    starts = np.concatenate([[0], cuts + 1])
+    stops = np.concatenate([cuts, [idx.size - 1]])
+    parts = [f"{int(idx[a])}" if idx[a] == idx[b]
+             else f"{int(idx[a])}-{int(idx[b])}"
+             for a, b in zip(starts, stops)]
+    return ",".join(parts[:8]) + ("..." if len(parts) > 8 else "")
+
+
+def _refuse_unfinalized(grp, ledger, allow_partial, where):
+    if ledger["complete"] or allow_partial:
+        return
+    raise ValueError(
+        f"{where}: this fit store is NOT FINALIZED — {ledger['n_done']} "
+        f"of {ledger['n_total']} (q, column) pairs are fitted.  An "
+        f"unfitted column reads back as zeros, and a zero pole is not "
+        f"an absent pole: B_p = 0 at Ω_p = 0 contributes nothing to "
+        f"W(τ) = Σ_p B_p e^{{−iΩ_p τ}} and therefore looks exactly like "
+        f"a converged fit of a screening channel that is genuinely "
+        f"dark.  Pass allow_partial=True to read the staged state "
+        f"deliberately; the ledger comes back beside the arrays so the "
+        f"caller can say which of it is real.")
+
+
+def stamp_fit_unfold_tables(dest, tables, *, mode="a"):
+    """Store the W wedge's existing q-unfold tables beside its fitted poles."""
+    qs = _qs()
+    can = tables.canonical()
+    with _h5(dest, mode) as grp:
+        ledger = fit_completion_ledger(grp)
+        storage = qs.validate_qirr_tables(
+            can, int(ledger["n_q"]), int(ledger["n_mu"]))
+        digest = can.digest()
+        stamped = qs.qirr_attr_str(grp, "mpa_fit_table_hash")
+        if stamped is not None and stamped != digest:
+            raise ValueError(
+                "stamp_fit_unfold_tables: the store already carries a "
+                "different q-unfold table")
+        name = FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX
+        if name in grp:
+            del grp[name]
+        tgrp = grp.create_group(name)
+        for key in ("irr_idx_q", "sym_idx_q", "q_irr_frac", "sym_perm",
+                    "L_table"):
+            tgrp.create_dataset(key, data=getattr(can, key))
+        tgrp.attrs["n_sym_spatial"] = np.int64(can.n_sym_spatial)
+        tgrp.attrs["table_hash"] = digest
+        grp.attrs["mpa_fit_table_hash"] = digest
+        grp.attrs["mpa_fit_q_storage"] = storage
+        grp.attrs["mpa_fit_n_q_full"] = np.int64(can.n_q_full)
+    return can
+
+
+def unfold_pole_field(Omega_p, B_p, tables, *, mesh_xy, B_odd_p=None):
+    """Unfold one pole wedge without conjugating its frequency dependence."""
+    import jax.numpy as jnp
+
+    from symmetry_maps import unfold_isdf_operator
+
+    can = tables.canonical()
+    if (Omega_p.ndim != 3 or tuple(B_p.shape) != tuple(Omega_p.shape)
+            or Omega_p.shape[-1] != Omega_p.shape[-2]):
+        raise ValueError("pole slabs must share one square (q,mu,mu) shape")
+    if int(can.n_mu) > int(Omega_p.shape[-1]):
+        raise ValueError("pole slab is smaller than its centroid tables")
+    if int(can.n_mu) != int(Omega_p.shape[-1]):
+        can = can.padded(int(Omega_p.shape[-1]))
+    kwargs = dict(
+        irr_idx=can.irr_idx_q, sym_idx=can.sym_idx_q,
+        sym_perm=can.sym_perm, q_irr_frac=can.q_irr_frac,
+        mesh_xy=mesh_xy, n_sym_spatial=int(can.n_sym_spatial),
+        trs_rule="pair_transpose")
+    zeros = np.zeros_like(np.asarray(can.L_table))
+    Omega_full = unfold_isdf_operator(
+        jnp.asarray(Omega_p), L_table=zeros, **kwargs)
+    B_full = unfold_isdf_operator(
+        jnp.asarray(B_p), L_table=can.L_table, **kwargs)
+    if B_odd_p is None:
+        return Omega_full, B_full
+    if tuple(B_odd_p.shape) != tuple(Omega_p.shape):
+        raise ValueError("odd-residue pole slab must match Omega_p")
+    D_full = unfold_isdf_operator(
+        jnp.asarray(B_odd_p), L_table=can.L_table, **kwargs)
+    return Omega_full, B_full, D_full
+
+
+def _finish_pole_read(
+    Omega, Bp, ledger, *, mesh_xy, unfold, return_sharded, to_unit,
+    tables, B_odd=None, include_odd=False,
+):
+    """Apply the one unit/unfold policy shared by pole readers.
+
+    ``tables`` is the unfold table set :class:`PoleReader` read once per
+    iteration, BEFORE it opened its collective handle (``None`` for a
+    full-BZ store).
+    """
+    if to_unit is not None:
+        scale = _unit_scale(ledger["energy_unit"], to_unit, "pole read")
+        Omega, Bp = Omega * scale, Bp * scale
+        if B_odd is not None:
+            B_odd = B_odd * scale
+
+    if unfold and ledger["q_storage"] == "ibz":
+        import jax.numpy as jnp
+
+        if mesh_xy is None:
+            raise ValueError("a wedge pole unfold requires mesh_xy")
+        if tables is None:
+            raise ValueError("wedge fit has no unfold tables")
+        if Omega.ndim == 3:
+            unfolded = unfold_pole_field(
+                Omega, Bp, tables, mesh_xy=mesh_xy, B_odd_p=B_odd)
+            if B_odd is None:
+                Omega, Bp = unfolded
+            else:
+                Omega, Bp, B_odd = unfolded
+        else:
+            unfolded = tuple(
+                unfold_pole_field(
+                    Omega[p], Bp[p], tables, mesh_xy=mesh_xy,
+                    B_odd_p=None if B_odd is None else B_odd[p])
+                for p in range(int(Omega.shape[0])))
+            stacked = tuple(map(jnp.stack, zip(*unfolded)))
+            if B_odd is None:
+                Omega, Bp = stacked
+            else:
+                Omega, Bp, B_odd = stacked
+    if return_sharded and mesh_xy is None:
+        raise ValueError("return_sharded requires mesh_xy")
+    if include_odd:
+        return Omega, Bp, B_odd
+    return Omega, Bp
+
+
+def _pole_read_shape(ledger, mesh_xy):
+    """Global read shape for one pole range's trailing (q, μ, ν) axes.
+
+    Deliberately ``runtime.padding.padded_mu_extent`` and NOT
+    ``slab_io.mesh_divisible_shape``: the unfold's all_to_all needs the
+    μ extent divisible by the device PRODUCT, not merely by each mesh
+    axis.
+    """
+    from runtime.padding import padded_mu_extent
+
+    n_pad = int(padded_mu_extent(ledger["n_mu"], mesh_xy))
+    return ledger["n_q"], n_pad, n_pad
+
+
+def _pole_range(ledger, pole_slice, where):
+    """Normalise ``pole_slice`` against the ledger's pole count."""
+    if pole_slice is None:
+        lo, hi = 0, ledger["n_p"]
+    elif isinstance(pole_slice, (int, np.integer)):
+        lo, hi = int(pole_slice), int(pole_slice) + 1
+    else:
+        lo, hi, step = pole_slice.indices(ledger["n_p"])
+        if step != 1:
+            raise ValueError(f"{where} requires a contiguous pole slice")
+    if not (0 <= lo < hi <= ledger["n_p"]):
+        raise IndexError(
+            f"{where}: pole range [{lo},{hi}) is outside "
+            f"[0,{ledger['n_p']})")
+    return int(lo), int(hi)
+
+
+from file_io import restart_bundle as _bundle_reader

@@ -1,0 +1,2314 @@
+"""SlabIO artifact for the fixed-gauge parallel-transport head data.
+
+This module owns the whole preprocessing transaction. It streams one raw IBZ
+centre and one positive neighbour at a time, writes compact links, then
+re-reads those links through SlabIO for symmetry unfolding and fourth-order
+connection construction. No wavefunction survives the streamed link stage,
+and every HDF5 payload or metadata item crosses the SlabIO public API.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+
+import jax
+from lxkit import ordered_sum
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec as P
+
+from common.parallel_transport import (
+    band_storage_extent,
+    build_g_wrap_lookup,
+    build_neighbor_table,
+    link_connection,
+    link_covariant_derivative,
+    link_stencil,
+    g_wrap_for_step,
+    make_cross_k_overlap,
+    make_distributed_band_matmul,
+    MIN_STENCIL_POINTS,
+    COLLAPSED_AXIS,
+    collapsed_axes,
+    link_stencil_orders,
+    undersampled_link_axes,
+)
+from common.wfn_layout import band_sphere_spec
+from file_io.slab_io import SlabIO
+from distrib_la import eigh_local
+
+
+SCHEMA_VERSION = 4
+LINKS_DATASET = "links_ibz"
+SINGULAR_VALUES_DATASET = "singular_values_ibz"
+CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
+CONNECTION_CART_DATASET = "berry_connection_cart"
+VELOCITY_DFT_DATASET = "velocity_dft_cart"
+#: ``p`` alone (no V_NL, no V_U), same layout; optional (newer artifacts).
+VELOCITY_KINETIC_DATASET = "velocity_kinetic_cart"
+HUBBARD_PROVENANCE_ATTR = "hubbard_provenance_utf8"
+#: ``(3, nk, nb, nb)`` band matrix of the reduced-coordinate position
+#: ``b_a . r`` on every COLLAPSED axis a (one mesh point; a vacuum direction),
+#: zero on the stencil axes.  The connection along a collapsed axis, and the
+#: operator whose commutator is the covariant derivative there.
+COLLAPSED_POSITION_DATASET = "collapsed_position_reduced"
+ENERGIES_DATASET = "dft_energies_ry_full"
+W_AV_DENSITY_DATASET = "w_av_density_mtxel"
+W_AV_SCHEMA_VERSION = 3
+OCCUPATIONS_DATASET = "dft_occupations_full"
+
+def wfn_link_stencil(wfn):
+    """:func:`common.parallel_transport.link_stencil` on this WFN's mesh."""
+    return link_stencil(
+        tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)),
+        np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat))
+
+
+def link_symmetry_reduction_applies(sym, kgrid, *, wfn=None) -> bool:
+    """Whether the IBZ link stream + directed-edge unfold is DEFINED here.
+
+    The reduction stores one link per (IBZ k, elementary +b_i/N_i step) and
+    recovers every full-BZ link by mapping those edges through the point
+    group.  That is only possible when the symmetry image of an elementary
+    mesh step is again an elementary mesh step up to sign — i.e. when the
+    point group acts on the PRIMITIVE reciprocal basis as signed
+    permutations.  True for simple-cubic/tetragonal/orthorhombic primitive
+    cells; FALSE for bcc and fcc primitive cells, where the cubic group
+    sends [1,0,0] to [0,1,1] (measured on the sodium 8x8x8 bcc deck,
+    2026-08-15).  ``directed_edge_orbit_table`` refuses in that case and
+    names this escape hatch; when it does not apply the links are streamed
+    on the FULL BZ and the unfold degenerates to the identity.
+
+    Uses the same step map as
+    ``symmetry_maps.directed_edges._mapped_step``: round(S @ (b/N) * N).
+
+    With ``wfn`` the directed-edge table itself must also complete: a point
+    represented through time reversal (k1 = -k2) makes the edge
+    ``k1 -> k1 + b`` the reverse of itself, and with ``+b`` steps only it
+    has no stored image (``PT-EDGE-INCOMPLETE``; MoS2 3x3x1).  Then the
+    links are streamed on the full BZ, as on bcc/fcc.
+    """
+    if wfn is not None and not undersampled_link_axes(kgrid) \
+            and not np.array_equal(
+                wfn_link_stencil(wfn).steps, np.eye(3, dtype=np.int32)):
+        # The IBZ edge stream stores the three elementary steps; a shell
+        # with other steps (bcc, fcc, hexagonal) streams the full BZ.
+        return False
+    mats_all = np.asarray(sym.sym_mats_k, dtype=np.float64)
+    active = np.asarray(
+        getattr(sym, "active_symmetry_rows",
+                np.arange(mats_all.shape[0], dtype=np.int32)),
+        dtype=np.int32)
+    mats = mats_all[active]
+    if mats.ndim != 3 or mats.shape[-2:] != (3, 3):
+        raise ValueError(
+            f"sym_mats_k must be (n_sym, 3, 3); got {mats.shape}")
+    grid = np.asarray(kgrid, dtype=np.float64).reshape(3)
+    steps = np.eye(3, dtype=np.int64)
+    allowed = {tuple(int(x) for x in row)
+               for row in np.concatenate([steps, -steps], axis=0)}
+    for mat in mats:
+        for step in steps:
+            raw = (mat @ (step / grid)) * grid
+            rounded = np.rint(raw)
+            if float(np.max(np.abs(raw - rounded))) > 1.0e-10:
+                return False
+            if tuple(int(x) for x in rounded) not in allowed:
+                return False
+    if wfn is None:
+        return True
+    from symmetry_maps import directed_edge_orbit_table
+    try:
+        directed_edge_orbit_table(
+            kgrid=np.asarray(wfn.kgrid, dtype=np.int32),
+            kgrid_shift=np.asarray(wfn.shift, dtype=np.float64),
+            sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
+            irr_idx_k=np.asarray(sym.irr_idx_k, dtype=np.int32),
+            sym_idx_k=np.asarray(sym.sym_idx_k, dtype=np.int32),
+            source_full_ids=np.asarray(sym.kirr_fullids, dtype=np.int32),
+            source_steps=np.eye(3, dtype=np.int32),
+            n_sym_spatial=int(wfn.ntran),
+            target_steps=np.eye(3, dtype=np.int32))
+    except ValueError as exc:
+        if "PT-EDGE-INCOMPLETE" not in str(exc):
+            raise
+        return False
+    return True
+
+
+__all__ = [
+    "collapsed_axis_position_operators",
+    "complete_parallel_transport",
+    "publish_dft_velocity",
+    "CONNECTION_CART_DATASET",
+    "CONNECTION_REDUCED_DATASET",
+    "ENERGIES_DATASET",
+    "LINKS_DATASET",
+    "OCCUPATIONS_DATASET",
+    "SCHEMA_VERSION",
+    "SINGULAR_VALUES_DATASET",
+    "VELOCITY_DFT_DATASET",
+    "complete_velocity_validation",
+    "W_AV_DENSITY_DATASET",
+    "WAvStencilMetadata",
+    "WAvStencilReader",
+    "line_index_table",
+    "link_symmetry_reduction_applies",
+    "stored_link_steps",
+    "wfn_link_stencil",
+    "initialize_parallel_transport_artifact",
+    "load_full_bz_links",
+    "load_link_singular_values",
+    "transported_frame",
+    "validate_parallel_transport_artifact",
+    "write_parallel_transport_artifact",
+    "write_w_av_stencil_artifact",
+    "write_velocity_validation",
+]
+
+
+@dataclass(frozen=True)
+class WAvStencilMetadata:
+    """Small, replicated contract for a streamed finite-q vertex file."""
+
+    schema_version: int
+    complete: bool
+    band_start: int
+    band_stop: int
+    effective_nspinor: int
+    bispinor: bool
+    kgrid: np.ndarray
+    kgrid_shift: np.ndarray
+    reciprocal_lattice_cart: np.ndarray
+    wfn_path: str
+    wfn_fingerprint: str
+    first_neighbors: bool
+    second_neighbors: bool
+    seed_steps: np.ndarray
+    seed_shell_mask: np.ndarray
+    source_steps: np.ndarray
+    source_full_ids: np.ndarray
+    source_irr_idx: np.ndarray
+    source_shell_mask: np.ndarray
+    source_kplusq_full: np.ndarray
+    source_g_wrap: np.ndarray
+    target_steps: np.ndarray
+    target_full_ids: np.ndarray
+    target_source_row: np.ndarray
+    target_sym_idx: np.ndarray
+    target_antiunitary: np.ndarray
+    target_shell_mask: np.ndarray
+    target_seed_mask: np.ndarray
+
+    @property
+    def nbands(self) -> int:
+        return int(self.band_stop - self.band_start)
+
+    @property
+    def nk_full(self) -> int:
+        return int(np.prod(self.kgrid))
+
+    @property
+    def nq_source(self) -> int:
+        return int(self.source_steps.shape[0])
+
+
+def _decode_i32_text(value) -> str:
+    raw = np.asarray(value, dtype=np.int32)
+    if np.any(raw < 0) or np.any(raw > 255):
+        raise ValueError("W-av text metadata contains a non-byte value")
+    return bytes(raw.astype(np.uint8).tolist()).decode("utf-8")
+
+
+def _read_w_av_metadata(io: SlabIO) -> WAvStencilMetadata:
+    """Read only the small replicated datasets through SlabIO."""
+
+    def _read(name, ndim):
+        return np.asarray(io.read_slab(
+            name, partition_spec=P(*((None,) * int(ndim))), as_numpy=True))
+
+    def _scalar(name):
+        value = _read(name, 1).reshape(-1)
+        if value.size != 1:
+            raise ValueError(f"W-av metadata {name!r} must contain one value")
+        return int(value[0])
+
+    meta = WAvStencilMetadata(
+        schema_version=_scalar("w_av_schema_version"),
+        complete=bool(_scalar("w_av_complete")),
+        band_start=_scalar("band_start"),
+        band_stop=_scalar("band_stop"),
+        effective_nspinor=_scalar("effective_nspinor"),
+        bispinor=bool(_scalar("bispinor")),
+        kgrid=_read("kgrid", 1).astype(np.int32),
+        kgrid_shift=_read("kgrid_shift", 1).astype(np.float64),
+        reciprocal_lattice_cart=(
+            _read("reciprocal_lattice_cart", 2).astype(np.float64)),
+        wfn_path=_decode_i32_text(_read("wfn_path_bytes_i32", 1)),
+        wfn_fingerprint=_decode_i32_text(
+            _read("wfn_fingerprint_bytes_i32", 1)),
+        first_neighbors=bool(_scalar("w_av_first_neighbors")),
+        second_neighbors=bool(_scalar("w_av_second_neighbors")),
+        seed_steps=_read("w_av_seed_steps", 2).astype(np.int32),
+        seed_shell_mask=_read("w_av_seed_shell_mask", 1).astype(np.int32),
+        source_steps=_read("w_av_source_qsteps", 2).astype(np.int32),
+        source_full_ids=_read("w_av_source_q_full_ids", 1).astype(np.int32),
+        source_irr_idx=_read("w_av_source_q_irr_idx", 1).astype(np.int32),
+        source_shell_mask=(
+            _read("w_av_source_shell_mask", 1).astype(np.int32)),
+        source_kplusq_full=(
+            _read("w_av_source_kplusq_full", 2).astype(np.int32)),
+        source_g_wrap=_read("w_av_source_g_wrap", 3).astype(np.int32),
+        target_steps=_read("w_av_target_qsteps", 2).astype(np.int32),
+        target_full_ids=_read("w_av_target_q_full_ids", 1).astype(np.int32),
+        target_source_row=(
+            _read("w_av_target_source_row", 1).astype(np.int32)),
+        target_sym_idx=_read("w_av_target_sym_idx", 1).astype(np.int32),
+        target_antiunitary=(
+            _read("w_av_target_antiunitary", 1).astype(np.int32)),
+        target_shell_mask=(
+            _read("w_av_target_shell_mask", 1).astype(np.int32)),
+        target_seed_mask=(
+            _read("w_av_target_seed_mask", 2).astype(np.int32)),
+    )
+    if meta.schema_version != W_AV_SCHEMA_VERSION:
+        raise ValueError(
+            f"W-av schema {meta.schema_version} != {W_AV_SCHEMA_VERSION}")
+    if not meta.complete:
+        raise ValueError("W-av artifact is incomplete")
+    if meta.band_start != 0 or meta.band_stop <= 0:
+        raise ValueError(
+            f"invalid W-av band interval [{meta.band_start},{meta.band_stop})")
+    if meta.kgrid.shape != (3,) or np.any(meta.kgrid <= 0):
+        raise ValueError(f"invalid W-av kgrid {meta.kgrid}")
+    expected_kq = (meta.nq_source, meta.nk_full)
+    if meta.source_kplusq_full.shape != expected_kq:
+        raise ValueError(
+            f"W-av k+q table shape {meta.source_kplusq_full.shape} != "
+            f"{expected_kq}")
+    if meta.source_g_wrap.shape != expected_kq + (3,):
+        raise ValueError(
+            f"W-av G-wrap shape {meta.source_g_wrap.shape} != "
+            f"{expected_kq + (3,)}")
+    return meta
+
+
+class WAvStencilReader:
+    """Validated, one-source-q-at-a-time SlabIO reader.
+
+    Metadata is read collectively at construction.  The large density
+    dataset is never read whole: :meth:`read_source_row` returns one q row
+    sharded over both band axes.
+    """
+
+    def __init__(self, path, *, mesh) -> None:
+        self.path = str(path)
+        self.mesh = mesh
+        self._io = SlabIO(self.path, mode="r", mesh=mesh)
+        try:
+            self.metadata = _read_w_av_metadata(self._io)
+        except Exception:
+            self._io.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def close(self):
+        if self._io is not None:
+            self._io.close()
+            self._io = None
+
+    def validate_runtime(
+        self, *, nbands, effective_nspinor, bispinor, kgrid, kgrid_shift,
+        reciprocal_lattice_cart, wfn_fingerprint, sym,
+    ) -> None:
+        """Refuse unless file geometry and the canonical SymMaps agree."""
+        m = self.metadata
+        checks = (
+            (m.nbands == int(nbands),
+             f"nbands {m.nbands} != runtime {int(nbands)}"),
+            (m.effective_nspinor == int(effective_nspinor),
+             "effective spinor extent differs"),
+            (m.bispinor == bool(bispinor), "bispinor setting differs"),
+            (np.array_equal(m.kgrid, np.asarray(kgrid, dtype=np.int32)),
+             "kgrid differs"),
+            (np.allclose(m.kgrid_shift, kgrid_shift, atol=1.0e-12),
+             "kgrid shift differs"),
+            (np.allclose(m.reciprocal_lattice_cart,
+                         reciprocal_lattice_cart, atol=1.0e-12),
+             "reciprocal lattice differs"),
+            (m.wfn_fingerprint == str(wfn_fingerprint),
+             "WFN fingerprint differs"),
+        )
+        for passed, message in checks:
+            if not passed:
+                raise ValueError(f"W-av artifact/runtime mismatch: {message}")
+
+        from symmetry_maps import q_stencil_orbit_table
+        table = q_stencil_orbit_table(
+            kgrid=m.kgrid,
+            sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
+            irr_idx_q=np.asarray(sym.irr_idx_q, dtype=np.int32),
+            sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
+            seed_steps=m.seed_steps,
+            n_sym_spatial=int(len(sym.sym_mats_k) // 2),
+            active_symmetry_rows=np.asarray(
+                sym.active_symmetry_rows, dtype=np.int32),
+        )
+        expected = {
+            "source_steps": m.source_steps,
+            "source_full_ids": m.source_full_ids,
+            "source_irr_idx": m.source_irr_idx,
+            "target_steps": m.target_steps,
+            "target_full_ids": m.target_full_ids,
+            "target_source_row": m.target_source_row,
+            "target_sym_idx": m.target_sym_idx,
+            "target_antiunitary": m.target_antiunitary,
+            "target_seed_mask": m.target_seed_mask,
+        }
+        for name, stored in expected.items():
+            if not np.array_equal(np.asarray(table[name]), stored):
+                raise ValueError(
+                    f"W-av artifact/runtime SymMaps mismatch in {name}")
+        neighbors = build_neighbor_table(
+            np.asarray(sym.kvecs_asints, dtype=np.int32),
+            m.kgrid, m.source_steps).T
+        if not np.array_equal(neighbors, m.source_kplusq_full):
+            raise ValueError(
+                "W-av artifact/runtime SymMaps mismatch in k+q endpoints")
+
+    def read_source_row(self, source_row: int):
+        """Read one ``(k,n,m)`` source-q vertex tile as ``P(None,x,y)``."""
+        if self._io is None:
+            raise RuntimeError("WAvStencilReader is closed")
+        iq = int(source_row)
+        m = self.metadata
+        if not 0 <= iq < m.nq_source:
+            raise IndexError(
+                f"source_row={iq} outside [0,{m.nq_source})")
+        nb_storage = band_storage_extent(self.mesh, m.nbands)
+        slab = self._io.read_slab(
+            W_AV_DENSITY_DATASET,
+            shape=(1, m.nk_full, nb_storage, nb_storage),
+            offset=(iq, 0, 0, 0),
+            valid_shape=(1, m.nk_full, m.nbands, m.nbands),
+            partition_spec=P(None, None, "x", "y"))
+        return slab[0]
+
+
+def _require_service_apis():
+    """Import sibling-lane service APIs only when the opt-in path runs."""
+    try:
+        from distrib_la import plan_polar_factor
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "parallel-transport preprocessing requires the public service "
+            "distrib_la.plan_polar_factor(mesh, n=..., "
+            "backend=..., rcond=...); merge the distrib_la "
+            "polar-factor service lane"
+        ) from exc
+    try:
+        from symmetry_maps import (apply_band_matrix_symmetry,
+                                   directed_edge_orbit_table,
+                                   q_stencil_orbit_table)
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "parallel-transport preprocessing requires the public symmetry "
+            "service APIs for directed edges, q stencils and band-matrix "
+            "actions; merge the symmetry service lane"
+        ) from exc
+    return (plan_polar_factor, directed_edge_orbit_table,
+            apply_band_matrix_symmetry, q_stencil_orbit_table)
+
+
+def _full_band_tables(wfn, sym, nbands: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return spin-channel-zero DFT energies/occupations on the full grid."""
+    irr = np.asarray(sym.irr_idx_k, dtype=np.int32)
+    energies = np.asarray(wfn.energies)
+    occupations = np.asarray(wfn.occs)
+    if energies.ndim == 3:
+        energies = energies[0]
+    if occupations.ndim == 3:
+        occupations = occupations[0]
+    if energies.ndim != 2 or occupations.ndim != 2:
+        raise ValueError(
+            "WFN energies and occupations must reduce to (nk_ibz, nb); "
+            f"got {energies.shape} and {occupations.shape}")
+    nb = int(nbands)
+    return (np.asarray(energies[irr, :nb], dtype=np.float64),
+            np.asarray(occupations[irr, :nb], dtype=np.float64))
+
+
+def initialize_parallel_transport_artifact(
+    path: str | Path,
+    *,
+    wfn,
+    sym,
+    mesh,
+    nbands: int,
+    effective_nspinor: int,
+    bispinor: bool,
+    velocity_dft_kmajor,
+    wfn_path: str,
+    wfn_fingerprint: str,
+    vnl_velocity_sign: float,
+    vnl_included: bool,
+    rcond: float = 1.0e-10,
+    hubbard_provenance: str | None = None,
+    collapsed_position_kmajor=None,
+    collapsed_axis_centers=None,
+    velocity_kinetic_kmajor=None,
+) -> None:
+    """Create the schema and write exact velocity before the WFN stream.
+
+    ``vnl_velocity_sign`` / ``vnl_included`` are the operator provenance of
+    the stored velocity ``p ± i[r, V_NL]``: the resolved relative sign of the
+    nonlocal term (``common.mtxel_sweep.require_vnl_velocity_sign`` — +1 is
+    the default arm, -1 the pre-2026-08-09 one) and whether V_NL is in it at
+    all.  Both are REQUIRED and written as scalar datasets
+    ``vnl_velocity_sign`` (f64) and ``vnl_included`` (i32), the same facts
+    ``dipole.h5`` stamps as ``prov_vnl_velocity_sign``/``prov_skip_vnl``,
+    so a consumer can refuse a velocity built under an arm it does not
+    implement instead of silently reading it.
+
+    ``collapsed_position_kmajor`` ``(nk_full, 3, nb_pad, nb_pad)`` is the
+    position operator ``Z_a`` of every collapsed axis (zero elsewhere), the
+    connection those axes use instead of a link stencil
+    (``common.parallel_transport.link_stencil_orders``); it is REQUIRED when
+    the k grid has a collapsed axis and refused when it has none.
+    ``collapsed_axis_centers`` are the three slab/wire centre fractional
+    coordinates (NaN on stencil axes), stamped for provenance.
+
+    This is a separate transaction so the dipole producer can release its
+    resident full-BZ wavefunctions and sharded velocity before loading the
+    central/neighbor pairs. The only simultaneous large device objects in the
+    link stage are therefore one central sphere, one neighbor sphere and one
+    distributed band tile.
+
+    UNCONDITIONAL ON ``kgrid``.  ``v^DFT = p + i[r,V_NL]`` (Stage A of
+    ``reports/metal_head_pt_pipelines_2026-08-23/PLAN.md``) is gauge-free and
+    needs no neighbouring k-point at all, so it carries no mesh-density
+    requirement.  The advertised fourth-order +/-2 link stencil DOES need one
+    -- :func:`undersampled_link_axes` -- but that need belongs to the link
+    and connection stages :func:`write_parallel_transport_artifact` appends
+    afterward, not to this transaction.  Until that later call runs (or is
+    never made, for a velocity-only consumer such as
+    ``sc_head_update=dft_velocity``), the schema's link/connection datasets
+    stay at their created-but-``connection_complete=0`` state, which is
+    exactly the state :func:`gw.qsgw_head.load_parallel_transport_head`
+    already refuses by name -- a links-requiring consumer handed this
+    artifact before (or without) that call refuses on
+    ``connection_complete is not 1``, never on a silently short read.
+    Before 2026-08-23 this same 2D/undersampled case (measured on a real
+    CrI3 9x9x1 deck) refused HERE instead, before velocity -- the object
+    that carries no stencil requirement at all -- was ever written.
+    """
+    from common.mtxel_sweep import require_vnl_velocity_sign
+    vnl_sign = require_vnl_velocity_sign(vnl_velocity_sign)
+    nb = int(nbands)
+    kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
+    reduced = link_symmetry_reduction_applies(sym, kgrid, wfn=wfn)
+    nk = int(sym.nk_tot)
+    nrk = int(np.asarray(sym.kirr_fullids).size) if reduced else nk
+    stencil = (None if undersampled_link_axes(kgrid)
+               else wfn_link_stencil(wfn))
+    nd = 3 if stencil is None else stencil.ndir
+    energies, occupations = _full_band_tables(wfn, sym, nb)
+    velocity = jnp.asarray(velocity_dft_kmajor)
+    if velocity.ndim != 4 or velocity.shape[:2] != (nk, 3):
+        raise ValueError(
+            "velocity_dft_kmajor must be (nk_full, 3, nb_pad, nb_pad); "
+            f"got {tuple(velocity.shape)}")
+    if velocity.shape[-2] != velocity.shape[-1] or velocity.shape[-1] < nb:
+        raise ValueError(
+            f"velocity band shape {tuple(velocity.shape[-2:])} does not "
+            f"contain logical nbands={nb}")
+    # The velocity write stays unconditional on kgrid (docstring): a
+    # two-point axis has no link rule, so it gets no order stamp here and
+    # the link stage refuses it by name if it is ever asked for.
+    orders = (None if undersampled_link_axes(kgrid)
+              else link_stencil_orders(kgrid))
+    collapsed = collapsed_axes(kgrid)
+    if collapsed and collapsed_position_kmajor is None:
+        raise ValueError(
+            "GATE pt_collapsed_axis_needs_position: kgrid "
+            f"{kgrid} has collapsed axis/axes {collapsed} and the artifact "
+            "needs their real-space position operator (the producer's "
+            "collapsed-axis sweep); none was supplied.")
+    if not collapsed and collapsed_position_kmajor is not None:
+        raise ValueError(
+            f"kgrid {kgrid} has no collapsed axis; a collapsed position "
+            "operator was supplied anyway")
+    position = None
+    if collapsed:
+        position = jnp.asarray(collapsed_position_kmajor)
+        if tuple(position.shape) != tuple(velocity.shape):
+            raise ValueError(
+                "collapsed_position_kmajor must match the velocity shape "
+                f"{tuple(velocity.shape)}; got {tuple(position.shape)}")
+    centers = np.full(3, np.nan, dtype=np.float64)
+    if collapsed_axis_centers is not None:
+        centers = np.asarray(collapsed_axis_centers, dtype=np.float64)
+        if centers.shape != (3,):
+            raise ValueError(
+                f"collapsed_axis_centers must be three values; got "
+                f"{centers.shape}")
+
+    with SlabIO(str(path), mode="w", mesh=mesh) as io:
+        io.create_dataset(
+            LINKS_DATASET, shape=(nrk, nd, nb, nb), dtype=np.complex128,
+            attrs={
+                "k_storage": ("ibz_source_edges" if reduced
+                              else "full_bz_source_edges"),
+                "orientation": "L_d(k) X(k+b_d) L_d(k)^H",
+                "source_steps": ("link_stencil steps: one of each +/- pair "
+                                 "of a Marzari-Vanderbilt shell set"),
+                "band_layout": "P(None,None,x,y)",
+                "gauge": "WfnLoader generated full-BZ gauge",
+            })
+        io.create_dataset(
+            SINGULAR_VALUES_DATASET, shape=(nrk, nd, nb), dtype=np.float64,
+            attrs={
+                "k_storage": ("ibz_source_edges" if reduced
+                              else "full_bz_source_edges"),
+                "source_steps": "link_stencil steps",
+                "ordering": "descending",
+                "distribution": "replicated O(nband) diagnostic",
+            })
+        io.create_dataset(
+            VELOCITY_DFT_DATASET, shape=(3, nk, nb, nb),
+            dtype=np.complex128,
+            attrs={
+                "k_storage": "full_bz",
+                "components": "Cartesian",
+                "band_layout": "P(None,None,x,y)",
+                "units": "WFN velocity convention",
+                "manifold": "bands [band_start, band_stop)",
+            })
+        if velocity_kinetic_kmajor is not None:
+            io.create_dataset(
+                VELOCITY_KINETIC_DATASET, shape=(3, nk, nb, nb),
+                dtype=np.complex128,
+                attrs={
+                    "k_storage": "full_bz",
+                    "components": "Cartesian",
+                    "band_layout": "P(None,None,x,y)",
+                    "units": "WFN velocity convention",
+                    "operator": "p alone (no V_NL, no V_U)",
+                })
+        if position is not None:
+            # Only a grid with a collapsed axis carries the dataset; a 3D
+            # artifact's schema is unchanged.
+            io.create_dataset(
+                COLLAPSED_POSITION_DATASET, shape=(3, nk, nb, nb),
+                dtype=np.complex128,
+                attrs={
+                    "k_storage": "full_bz",
+                    "components": ("reduced reciprocal coordinates: "
+                                   "Z_a = <m| b_a . r |n> = 2 pi <m| f_a |n>"),
+                    "band_layout": "P(None,None,x,y)",
+                    "hermitian": True,
+                    "nonzero_axes": "collapsed (one-point) axes only",
+                    "branch_cut": ("centre of the largest vacuum gap "
+                                   "(collapsed_axis_vacuum_gap)"),
+                })
+        io.create_dataset(
+            CONNECTION_REDUCED_DATASET, shape=(3, nk, nb, nb),
+            dtype=np.complex128,
+            attrs={
+                "k_storage": "full_bz",
+                "components": "reduced reciprocal coordinates",
+                "band_layout": "P(None,None,x,y)",
+                "hermitian": True,
+                "finite_difference_order": (
+                    "per link_stencil shell: 4 (>=5 points per line), 2 "
+                    "(3-4); position operator on a collapsed axis"),
+            })
+        io.create_dataset(
+            CONNECTION_CART_DATASET, shape=(3, nk, nb, nb),
+            dtype=np.complex128,
+            attrs={
+                "k_storage": "full_bz",
+                "components": "Cartesian",
+                "band_layout": "P(None,None,x,y)",
+                "hermitian": True,
+                "conversion": "A_cart = B^{-T} A_reduced",
+            })
+        velocity_dir_major = jnp.moveaxis(velocity, 1, 0)
+        velocity_dir_major = jax.lax.with_sharding_constraint(
+            velocity_dir_major,
+            NamedSharding(mesh, P(None, None, "x", "y")))
+        io.write_slab(VELOCITY_DFT_DATASET, velocity_dir_major)
+        if velocity_kinetic_kmajor is not None:
+            io.write_slab(VELOCITY_KINETIC_DATASET, jax.lax.with_sharding_constraint(
+                jnp.moveaxis(velocity_kinetic_kmajor, 1, 0),
+                NamedSharding(mesh, P(None, None, "x", "y"))))
+        if position is not None:
+            position_dir_major = jax.lax.with_sharding_constraint(
+                jnp.moveaxis(position, 1, 0),
+                NamedSharding(mesh, P(None, None, "x", "y")))
+            io.write_slab(COLLAPSED_POSITION_DATASET, position_dir_major)
+        if orders is not None:
+            io.write_attr("link_stencil_orders",
+                          np.asarray(orders, dtype=np.int32))
+        if stencil is not None:
+            io.write_attr("link_stencil_step_orders",
+                          np.asarray(stencil.orders, dtype=np.int32))
+            io.write_attr("link_stencil_coefficients", stencil.coefficients)
+        io.write_attr("collapsed_axis_flags",
+                      np.asarray([int(n == 1) for n in kgrid],
+                                 dtype=np.int32))
+        io.write_attr("collapsed_axis_center_frac", centers)
+        io.write_attr(ENERGIES_DATASET, energies)
+        io.write_attr(OCCUPATIONS_DATASET, occupations)
+        io.write_attr("schema_version", np.int32(SCHEMA_VERSION))
+        io.write_attr("band_start", np.int32(0))
+        io.write_attr("band_stop", np.int32(nb))
+        io.write_attr("spin_channel", np.int32(0))
+        io.write_attr("effective_nspinor", np.int32(effective_nspinor))
+        io.write_attr("bispinor", np.int32(bool(bispinor)))
+        io.write_attr("vnl_velocity_sign", np.float64(vnl_sign))
+        io.write_attr("vnl_included", np.int32(bool(vnl_included)))
+        io.write_attr("kgrid", np.asarray(wfn.kgrid, dtype=np.int32))
+        io.write_attr("kgrid_shift", np.asarray(wfn.shift, dtype=np.float64))
+        io.write_attr("reduced_spacing",
+                      1.0 / np.asarray(wfn.kgrid, dtype=np.float64))
+        io.write_attr(
+            "reciprocal_lattice_cart",
+            np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat))
+        io.write_attr("irr_idx_k", np.asarray(sym.irr_idx_k, dtype=np.int32))
+        io.write_attr("sym_idx_k", np.asarray(sym.sym_idx_k, dtype=np.int32))
+        io.write_attr(
+            "wfn_path_utf8",
+            np.frombuffer(str(wfn_path).encode("utf-8"), dtype=np.uint8))
+        io.write_attr(
+            "wfn_fingerprint_utf8",
+            np.frombuffer(
+                str(wfn_fingerprint).encode("utf-8"), dtype=np.uint8).astype(np.int32))
+        io.write_attr("polar_rcond", np.float64(rcond))
+        if hubbard_provenance is not None:
+            # DFT+U stamp (psp.hubbard_ops): 'none' or the JSON of occupations
+            # hash, U/J/B, formulation, projector.  Absent = pre-V_U file.
+            io.write_attr(
+                HUBBARD_PROVENANCE_ATTR,
+                np.frombuffer(str(hubbard_provenance).encode("utf-8"),
+                              dtype=np.uint8).astype(np.int32))
+        # Numeric convention stamps are SlabIO-readable on every backend.
+        # 1 means the sole supported convention documented by this schema.
+        io.write_attr("energy_units_ry", np.int32(1))
+        io.write_attr("velocity_units_ry_bohr", np.int32(1))
+        io.write_attr("velocity_frame_cartesian", np.int32(1))
+        io.write_attr("reciprocal_units_bohr_inverse", np.int32(1))
+        io.write_attr("links_symmetry_reduced", np.int32(bool(reduced)))
+        io.write_attr("connection_complete", np.int32(0))
+        io.write_attr("velocity_validation_complete", np.int32(0))
+        io.write_attr("velocity_validation_passed", np.int32(0))
+
+
+def _write_link_stage(
+    path: str,
+    *,
+    wfn,
+    sym,
+    mesh,
+    nbands: int,
+    bispinor: bool,
+    polar_plan,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Stream IBZ wavefunctions and write links plus fixed-reference data."""
+    from wfn_loader import IBZRows
+
+    nb = int(nbands)
+    # bcc/fcc primitive cells are NOT closed under their own point group in
+    # the elementary-step basis, so the IBZ edge stream cannot be unfolded
+    # (see ``link_symmetry_reduction_applies``).  There the source set is the
+    # full BZ and every center is addressed by its full-BZ id, exactly the
+    # way the neighbor already is.
+    reduced = link_symmetry_reduction_applies(
+        sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)), wfn=wfn)
+    source_full = (np.asarray(sym.kirr_fullids, dtype=np.int32) if reduced
+                   else np.arange(int(sym.nk_tot), dtype=np.int32))
+    nrk = int(source_full.size)
+    source_steps = wfn_link_stencil(wfn).steps
+    nd = int(source_steps.shape[0])
+    full_plus = build_neighbor_table(
+        sym.kvecs_asints, wfn.kgrid, source_steps)
+    source_plus = full_plus[source_full]
+    wraps = np.empty((nrk, nd, 3), dtype=np.int32)
+    singular_values = []
+    center_on_x, overlap_kernel = make_cross_k_overlap(mesh)
+    # Independent small overlap faces pass through the native bounded polar
+    # service; the physical Marzari-Vanderbilt direction set stays unchanged.
+    group_size = int(mesh.size)
+    from distrib_la import ROUTE_BATCH_RESHARD
+    route = polar_plan.batched_route
+    if route != ROUTE_BATCH_RESHARD:
+        group_size = 1
+    print(f"  parallel-transport links: {nd*nrk} edges, group={group_size}, "
+          f"polar route={route}, matrix={polar_plan.n}, "
+          "raw overlaps and links at P(None,x,y)", flush=True)
+    overlaps, edge_ids = [], []
+    # Bind the stack's layout in the executable: on a 1 x 1 mesh an eager
+    # stack of P('x','y') faces carries no named layout.
+    stack_faces = jax.jit(
+        lambda *faces: jnp.stack(faces),
+        out_shardings=NamedSharding(mesh, P(None, "x", "y")))
+
+    with SlabIO(path, mode="a", mesh=mesh) as io:
+        def flush():
+            if not overlaps:
+                return
+            link, values = polar_plan.batched(stack_faces(*overlaps))
+            for j, (ik, direction) in enumerate(edge_ids):
+                io.write_slab(
+                    LINKS_DATASET, link[j:j+1, None, :, :],
+                    offset=(ik, direction, 0, 0),
+                    global_shape=(nrk, nd, nb, nb))
+                singular_values.append(values[j, :nb])
+            # Complete the whole group's writes before WfnLoader enters
+            # its next collective HDF5 read. No wavefunction is buffered.
+            io.sync_writes()
+            overlaps.clear()
+            edge_ids.clear()
+
+        for ik_irr, center_full in enumerate(source_full):
+            center_ids = (IBZRows((int(ik_irr),)) if reduced
+                          else [int(center_full)])
+            center_xy = wfn.load(
+                bands=(0, nb), k=center_ids, sharding=band_sphere_spec(),
+                bispinor=bool(bispinor))
+            center_x = center_on_x(center_xy)
+            g_center = wfn.gvecs(k=center_ids)[0]
+            ngk_center = int(wfn.ngk_valid(k=center_ids)[0])
+
+            for idir in range(nd):
+                neighbor_full = int(source_plus[ik_irr, idir])
+                neighbor_ids = [neighbor_full]
+                wrap = g_wrap_for_step(
+                    sym.unfolded_kpts, int(center_full), neighbor_full,
+                    source_steps[idir], wfn.kgrid)
+                wraps[ik_irr, idir] = wrap
+                g_neighbor = wfn.gvecs(k=neighbor_ids)[0]
+                ngk_neighbor = int(wfn.ngk_valid(k=neighbor_ids)[0])
+                g_index, g_valid = build_g_wrap_lookup(
+                    g_neighbor, g_center, wrap,
+                    ngk_neighbor=ngk_neighbor, ngk_center=ngk_center)
+
+                neighbor_xy = wfn.load(
+                    bands=(0, nb), k=neighbor_ids,
+                    sharding=band_sphere_spec(), bispinor=bool(bispinor))
+                # WfnLoader owns the exact zero band pad.  distrib_la's
+                # polar contract returns the canonical partial isometry for
+                # those null directions; slicing the physical leading block
+                # is therefore well-defined and does not perturb the link.
+                raw = overlap_kernel(center_x, neighbor_xy, g_index, g_valid)
+                # Finish the contraction before releasing its spheres. Only
+                # small overlap faces survive into the bounded solve group.
+                raw.block_until_ready()
+                overlaps.append(raw)
+                edge_ids.append((ik_irr, idir))
+                del neighbor_xy
+                if len(overlaps) == group_size:
+                    flush()
+            del center_xy, center_x
+
+        flush()
+        singular_values_device = (
+            jnp.stack(singular_values).reshape(nrk, nd, nb) if nd
+            else jnp.zeros((nrk, 0, nb), dtype=jnp.float64))
+        singular_values_device = jax.lax.with_sharding_constraint(
+            singular_values_device, NamedSharding(mesh, P()))
+        io.write_slab(
+            SINGULAR_VALUES_DATASET, singular_values_device,
+            global_shape=(nrk, nd, nb))
+        io.write_attr("source_steps", source_steps)
+        io.write_attr("source_full_ids", source_full)
+        io.write_attr("source_neighbor_full_ids", source_plus)
+        io.write_attr("g_wrap_ibz", wraps)
+        io.write_attr("full_forward_neighbors", full_plus)
+    return full_plus, source_full, source_steps
+
+
+def _write_connection_stage(
+    path: str,
+    *,
+    wfn,
+    sym,
+    mesh,
+    nbands: int,
+    full_plus: np.ndarray,
+    source_full: np.ndarray,
+    source_steps: np.ndarray,
+    directed_edge_orbit_table,
+    apply_band_matrix_symmetry,
+) -> None:
+    """Read compact links, unfold through SymMaps, and write A once."""
+    nb = int(nbands)
+    nb_storage = band_storage_extent(mesh, nb)
+    reduced = link_symmetry_reduction_applies(
+        sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)), wfn=wfn)
+    table = None
+    if reduced:
+        table = directed_edge_orbit_table(
+            kgrid=np.asarray(wfn.kgrid, dtype=np.int32),
+            kgrid_shift=np.asarray(wfn.shift, dtype=np.float64),
+            sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
+            irr_idx_k=np.asarray(sym.irr_idx_k, dtype=np.int32),
+            sym_idx_k=np.asarray(sym.sym_idx_k, dtype=np.int32),
+            source_full_ids=source_full,
+            source_steps=source_steps,
+            n_sym_spatial=int(wfn.ntran),
+            target_steps=np.eye(3, dtype=np.int32),
+        )
+    elif int(source_full.size) != int(sym.nk_tot):
+        raise ValueError(
+            "unreduced link storage must cover the full BZ; got "
+            f"{int(source_full.size)} source rows for nk_tot={int(sym.nk_tot)}")
+    block_spec = P(None, None, "x", "y")
+    block_sharding = NamedSharding(mesh, block_spec)
+    band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
+
+    with SlabIO(path, mode="a", mesh=mesh) as io:
+        # This append handle did not create ``links_ibz`` even though the
+        # artifact initializer did.  Register the existing logical geometry
+        # collectively before the padded read: otherwise SlabIO has to learn
+        # it through a serial-h5py introspection while its writable parallel
+        # HDF5 handle is live, which the one-owner guard correctly refuses.
+        # ``create_dataset`` is idempotent for an identical existing dataset
+        # and leaves its contents untouched.
+        nd = int(np.asarray(source_steps).shape[0])
+        io.create_dataset(
+            LINKS_DATASET,
+            shape=(int(source_full.size), nd, nb, nb),
+            dtype=np.complex128,
+        )
+        source_links = io.read_slab(
+            LINKS_DATASET,
+            shape=(int(source_full.size), nd, nb_storage, nb_storage),
+            partition_spec=block_spec)
+        if table is None:
+            # The source rows ARE the targets, in full-BZ id order, and each
+            # already carries its own elementary step: the unfold is the
+            # identity and no gauge/sewing operation applies.
+            full_target_major = source_links
+        else:
+            selected = source_links[
+                table["source_row"], table["source_direction"]]
+            full_target_major = apply_band_matrix_symmetry(
+                selected,
+                antiunitary=table["antiunitary"],
+                reverse=table["reverse"],
+                sewing_start=None,
+                sewing_end=None,
+            )
+        full_links = jnp.moveaxis(full_target_major, 1, 0)
+        full_links = jax.lax.with_sharding_constraint(
+            full_links, block_sharding)
+
+        stencil = wfn_link_stencil(wfn)
+        position = None
+        if COLLAPSED_AXIS in stencil.axis_rules:
+            # Same collective registration as ``links_ibz`` above: this
+            # append handle did not create the dataset.
+            io.create_dataset(
+                COLLAPSED_POSITION_DATASET,
+                shape=(3, int(sym.nk_tot), nb, nb), dtype=np.complex128)
+            position = io.read_slab(
+                COLLAPSED_POSITION_DATASET,
+                shape=(3, int(sym.nk_tot), nb_storage, nb_storage),
+                partition_spec=block_spec)
+
+        # Bind the executable output itself: a constraint after dispatch
+        # cannot repair a replicated intermediate. A collapsed-axis position
+        # table, when present, retains these same all-P matrix faces.
+        position_sharding = block_sharding if position is not None else None
+        @partial(jax.jit, in_shardings=(block_sharding, position_sharding),
+                 out_shardings=block_sharding)
+        def _connection(links, position):
+            return link_connection(
+                links, full_plus, stencil, band_matmul=band_matmul,
+                collapsed_position=position)
+
+        connection_reduced = _connection(full_links, position)
+        connection_reduced = jax.lax.with_sharding_constraint(
+            connection_reduced, block_sharding)
+
+        reciprocal = (
+            np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat))
+        try:
+            from gw.qsgw_head import reduced_covector_to_cartesian
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "parallel-transport connection conversion requires "
+                "gw.qsgw_head.reduced_covector_to_cartesian; merge the QSGW "
+                "head service lane") from exc
+
+        @jax.jit
+        def _to_cart(A):
+            out = reduced_covector_to_cartesian(A, reciprocal)
+            out = 0.5 * (out + jnp.swapaxes(jnp.conj(out), -1, -2))
+            return jax.lax.with_sharding_constraint(out, block_sharding)
+
+        connection_cart = _to_cart(connection_reduced)
+        # NEVER STAMP ``connection_complete = 1`` OVER AN ALL-ZERO BLOCK.
+        # The artifact is created with a zero ``berry_connection_cart`` and
+        # ``connection_complete = 0``, and until 2026-08-15 a bcc/fcc deck
+        # left it exactly that way — the velocity stage succeeded, the
+        # artifact was written, and the connection was silently a zero
+        # (nk,3,nb,nb) block (measured on the ACCEPTED 24-band canonical
+        # ``runs/Na/sodium_test_canonical/parallel_transport.h5``).  The
+        # full-BZ link path fixed the cause; this is the guard that the
+        # SYMPTOM can never be stamped as complete again, whatever the
+        # cause.  One reduction on an already-resident sharded array.
+        cart_scale = float(jax.device_get(jnp.max(jnp.abs(connection_cart))))
+        if not np.isfinite(cart_scale) or cart_scale == 0.0:
+            raise ValueError(
+                "PT-CONNECTION-ZERO refusal: the Berry connection assembled "
+                f"to max|A_cart| = {cart_scale}, i.e. an all-zero (or "
+                "non-finite) block, and an artifact stamped "
+                "connection_complete=1 over it is indistinguishable from a "
+                "completed one to every consumer.  Refusing to write it.  "
+                f"got: link stage "
+                f"{'symmetry-reduced' if reduced else 'full-BZ'}, "
+                f"{int(source_full.size)} source rows, nk_tot="
+                f"{int(sym.nk_tot)}.  want: a finite, nonzero connection.  "
+                "fix: check that the link stage actually streamed "
+                "wavefunctions for this deck (a bcc/fcc primitive cell has "
+                "no elementary-step symmetry reduction — see "
+                "link_symmetry_reduction_applies) before re-running the "
+                "connection stage.  doc: "
+                "docs/architecture/symmetry_register.md")
+        connection_shape = (3, int(sym.nk_tot), nb, nb)
+        io.write_slab(
+            CONNECTION_REDUCED_DATASET, connection_reduced,
+            global_shape=connection_shape)
+        io.write_slab(
+            CONNECTION_CART_DATASET, connection_cart,
+            global_shape=connection_shape)
+        if table is not None:
+            io.write_attr("directed_edge_source_row", table["source_row"])
+            io.write_attr(
+                "directed_edge_source_direction", table["source_direction"])
+            io.write_attr("directed_edge_sym_idx", table["sym_idx"])
+            io.write_attr("directed_edge_reverse", table["reverse"])
+            io.write_attr("directed_edge_antiunitary", table["antiunitary"])
+        io.write_attr("connection_complete", np.int32(1))
+
+
+def _w_av_seed_steps(
+    first_neighbors: bool,
+    second_neighbors: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return stencil seeds and per-seed shell bits (first=1, second=2)."""
+    steps = []
+    shells = []
+    axes = np.eye(3, dtype=np.int32)
+    if bool(first_neighbors):
+        for step in np.concatenate([axes, -axes], axis=0):
+            steps.append(step)
+            shells.append(1)
+    if bool(second_neighbors):
+        for step in np.concatenate([2 * axes, -2 * axes], axis=0):
+            steps.append(step)
+            shells.append(2)
+        for iaxis in range(3):
+            for jaxis in range(iaxis + 1, 3):
+                for sign_i in (-1, 1):
+                    for sign_j in (-1, 1):
+                        step = np.zeros(3, dtype=np.int32)
+                        step[iaxis] = sign_i
+                        step[jaxis] = sign_j
+                        steps.append(step)
+                        shells.append(2)
+    if not steps:
+        return (np.empty((0, 3), dtype=np.int32),
+                np.empty((0,), dtype=np.int32))
+    return (np.asarray(steps, dtype=np.int32),
+            np.asarray(shells, dtype=np.int32))
+
+
+def _write_w_av_stage(
+    path: str,
+    *,
+    wfn,
+    sym,
+    mesh,
+    nbands: int,
+    bispinor: bool,
+    first_neighbors: bool,
+    second_neighbors: bool,
+    q_stencil_orbit_table,
+    mode: str = "a",
+    wfn_path: str = "",
+    wfn_fingerprint: str = "",
+) -> None:
+    """Stream symmetry-reduced W-av density vertices into a SlabIO artifact."""
+    seeds, seed_shells = _w_av_seed_steps(
+        first_neighbors, second_neighbors)
+    if seeds.shape[0] == 0:
+        return
+    table = q_stencil_orbit_table(
+        kgrid=np.asarray(wfn.kgrid, dtype=np.int32),
+        sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
+        irr_idx_q=np.asarray(sym.irr_idx_q, dtype=np.int32),
+        sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
+        seed_steps=seeds,
+        n_sym_spatial=int(wfn.ntran),
+        active_symmetry_rows=np.asarray(
+            sym.active_symmetry_rows, dtype=np.int32),
+    )
+    source_steps = np.asarray(table["source_steps"], dtype=np.int32)
+    target_seed_mask = np.asarray(table["target_seed_mask"], dtype=np.int32)
+    target_shell_mask = np.bitwise_or.reduce(
+        target_seed_mask * seed_shells[None, :], axis=1).astype(np.int32)
+    source_shell_mask = target_shell_mask[
+        np.asarray(table["source_target_row"], dtype=np.int32)]
+
+    nb = int(nbands)
+    nq = int(source_steps.shape[0])
+    nk = int(sym.nk_tot)
+    kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
+    qpoints_frac = source_steps / kgrid[None, :]
+    target_qpoints_frac = (
+        np.asarray(table["target_steps"], dtype=np.float64)
+        / kgrid[None, :])
+    neighbor_full = build_neighbor_table(
+        np.asarray(sym.kvecs_asints, dtype=np.int32), kgrid, source_steps)
+    wraps = np.empty((nq, nk, 3), dtype=np.int32)
+    center_on_x, overlap = make_cross_k_overlap(mesh)
+    from common.gpu_utils import device_budget_bytes
+    from runtime.xla_memory import resolve_xla_gpu_memory_env
+    xla_memory = resolve_xla_gpu_memory_env()
+    from lxkit import device_vendor
+    if (device_vendor(jax.devices()[0]) == "cuda"
+            and xla_memory.allocator != "platform"):
+        raise RuntimeError(
+            "W_AV-QSTREAM-ALLOCATOR refusal: got "
+            f"XLA_PYTHON_CLIENT_ALLOCATOR={xla_memory.allocator_raw!r}; "
+            "want 'platform' for finite-q W-av preprocessing. The PHDF5 "
+            "q-stream reproducibly segfaults with BFC during the first "
+            "collective write. Fix: export "
+            "XLA_PYTHON_CLIENT_ALLOCATOR=platform before lx run; see "
+            "docs/reference/env_vars.md.")
+    tile_budget_bytes = 0.20 * device_budget_bytes()
+    px = int(mesh.shape["x"])
+    py = int(mesh.shape["y"])
+    nb_storage = band_storage_extent(mesh, nb)
+    nspinor = 4 if bool(bispinor) else int(wfn.nspinor)
+    sphere_bytes = nspinor * int(wfn.ngkmax) * np.dtype(np.complex128).itemsize
+    fixed_bytes = sphere_bytes * (
+        nb_storage // px + nb_storage // (px * py))
+    streamed_q_bytes = (
+        sphere_bytes * (
+            nb_storage // py + nb_storage // (px * py))
+        + (nb_storage // px) * (nb_storage // py)
+        * np.dtype(np.complex128).itemsize)
+    # q is the streaming boundary. The factor of two reserves both the
+    # input and the gathered/aligned neighbor while the overlap is live.
+    working_bytes_per_k = fixed_bytes + 2 * streamed_q_bytes
+    if working_bytes_per_k > tile_budget_bytes:
+        # The smallest k=1, q=1 raw-density tile runs.
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("W-av raw-density tile (k=1, q=1)", working_bytes_per_k,
+                         tile_budget_bytes)
+    k_batch = max(1, min(
+        nk, int(tile_budget_bytes // max(1, working_bytes_per_k))))
+    if jax.process_index() == 0:
+        working_gib = k_batch * working_bytes_per_k / 2**30
+        artifact_gib = (
+            nq * nk * nb * nb * np.dtype(np.complex128).itemsize / 2**30)
+        print(
+            f"  W-av streaming: k={k_batch}/{nk}, q=1/{nq} "
+            f"resident (conservative overlap working set "
+            f"{working_gib:.2f} GiB/device; "
+            f"20% of the {device_budget_bytes() / 1e9:.1f} GB run budget); "
+            f"WFN source=center+neighbor union; "
+            f"raw artifact={artifact_gib:.2f} GiB")
+    g_full = wfn.gvecs(k="full_bz")
+    ngk_full = wfn.ngk_valid(k="full_bz")
+
+    with SlabIO(path, mode=mode, mesh=mesh) as io:
+        io.create_dataset(
+            W_AV_DENSITY_DATASET,
+            shape=(nq, nk, nb, nb),
+            dtype=np.complex128,
+            attrs={
+                "orientation": "rho_nm(k,q)=<u_n,k|u_m,k+q>",
+                "q_storage": "symmetry_reduced_stencil",
+                "k_storage": "full_bz",
+                "band_layout": "P(None,None,x,y)",
+                "spinor_contraction": "sum over every stored component",
+                "unfold_stage": "after full-k response sum",
+            })
+        io.write_attr("w_av_complete", np.asarray([0], dtype=np.int32))
+        if mode == "w":
+            io.write_attr(
+                "artifact_kind_utf8",
+                np.frombuffer(b"w_av_finite_q_stencil", dtype=np.uint8))
+            io.write_attr("band_start", np.asarray([0], dtype=np.int32))
+            io.write_attr("band_stop", np.asarray([nb], dtype=np.int32))
+            io.write_attr("spin_channel", np.asarray([0], dtype=np.int32))
+            io.write_attr(
+                "effective_nspinor",
+                np.asarray(
+                    [4 if bool(bispinor) else int(wfn.nspinor)],
+                    dtype=np.int32))
+            io.write_attr(
+                "bispinor", np.asarray([bool(bispinor)], dtype=np.int32))
+            io.write_attr("kgrid", kgrid)
+            io.write_attr(
+                "kgrid_shift", np.asarray(wfn.shift, dtype=np.float64))
+            io.write_attr(
+                "reduced_spacing", 1.0 / kgrid.astype(np.float64))
+            io.write_attr(
+                "reciprocal_lattice_cart",
+                np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat))
+            io.write_attr(
+                "reciprocal_units_bohr_inverse",
+                np.asarray([1], dtype=np.int32))
+            io.write_attr(
+                "wfn_path_utf8",
+                np.frombuffer(str(wfn_path).encode("utf-8"), dtype=np.uint8))
+            io.write_attr(
+                "wfn_fingerprint_utf8",
+                np.frombuffer(
+                    str(wfn_fingerprint).encode("utf-8"), dtype=np.uint8))
+            # SlabIO's collective reader deliberately supports the numeric
+            # compute dtypes, not uint8.  Keep the historical uint8 spelling
+            # for external HDF5 tools and add an int32 byte view for every
+            # production consumer that must remain behind the SlabIO public API.
+            io.write_attr(
+                "wfn_path_bytes_i32",
+                np.frombuffer(str(wfn_path).encode("utf-8"),
+                              dtype=np.uint8).astype(np.int32))
+            io.write_attr(
+                "wfn_fingerprint_bytes_i32",
+                np.frombuffer(str(wfn_fingerprint).encode("utf-8"),
+                              dtype=np.uint8).astype(np.int32))
+        for k_start in range(0, nk, k_batch):
+            k_stop = min(k_start + k_batch, nk)
+            center_ids = list(range(k_start, k_stop))
+            n_center = k_stop - k_start
+            for iq in range(nq):
+                neighbor_ids = np.asarray(
+                    neighbor_full[k_start:k_stop, iq], dtype=np.int32)
+                # One loader call owns the complete q tile. This avoids
+                # retaining a loader result across a second collective load,
+                # while keeping residency bounded to one center and one
+                # neighbor bank irrespective of the stencil size.
+                windows_xy = wfn.load(
+                    bands=(0, nb),
+                    k=[*center_ids, *neighbor_ids.tolist()],
+                    sharding=band_sphere_spec(), bispinor=bool(bispinor))
+                center_x = center_on_x(windows_xy[:n_center])
+                neighbor_xy = windows_xy[n_center:, None, ...]
+                g_indices = np.empty(
+                    (n_center, 1, int(wfn.ngkmax)), dtype=np.int32)
+                g_masks = np.empty_like(g_indices, dtype=bool)
+                for ik_local, ik in enumerate(center_ids):
+                    g_center = g_full[ik]
+                    ngk_center = int(ngk_full[ik])
+                    ineighbor = int(neighbor_ids[ik_local])
+                    wrap = g_wrap_for_step(
+                        sym.unfolded_kpts, ik, ineighbor,
+                        source_steps[iq], kgrid)
+                    wraps[iq, ik] = wrap
+                    g_index, g_valid = build_g_wrap_lookup(
+                        g_full[ineighbor], g_center, wrap,
+                        ngk_neighbor=int(ngk_full[ineighbor]),
+                        ngk_center=ngk_center)
+                    g_indices[ik_local, 0] = g_index
+                    g_masks[ik_local, 0] = g_valid
+                rho = overlap(
+                    center_x, neighbor_xy, g_indices, g_masks)
+                io.write_slab(
+                    W_AV_DENSITY_DATASET, rho,
+                    offset=(iq, k_start, 0, 0),
+                    global_shape=(nq, nk, nb, nb))
+                io.sync_writes()
+                del windows_xy, center_x, neighbor_xy, rho
+
+        io.write_attr(
+            "w_av_schema_version",
+            np.asarray([W_AV_SCHEMA_VERSION], dtype=np.int32))
+        io.write_attr("w_av_complete", np.asarray([1], dtype=np.int32))
+        io.write_attr("w_av_first_neighbors",
+                      np.asarray([bool(first_neighbors)], dtype=np.int32))
+        io.write_attr("w_av_second_neighbors",
+                      np.asarray([bool(second_neighbors)], dtype=np.int32))
+        io.write_attr("w_av_seed_steps", seeds)
+        io.write_attr("w_av_seed_shell_mask", seed_shells)
+        io.write_attr("w_av_source_qsteps", source_steps)
+        io.write_attr("w_av_source_qpoints_frac", qpoints_frac)
+        io.write_attr("w_av_source_q_full_ids",
+                      np.asarray(table["source_full_ids"], dtype=np.int32))
+        io.write_attr("w_av_source_q_irr_idx",
+                      np.asarray(table["source_irr_idx"], dtype=np.int32))
+        io.write_attr("w_av_source_shell_mask", source_shell_mask)
+        io.write_attr("w_av_source_kplusq_full",
+                      np.asarray(neighbor_full.T, dtype=np.int32))
+        io.write_attr("w_av_source_g_wrap", wraps)
+        io.write_attr("w_av_target_qsteps",
+                      np.asarray(table["target_steps"], dtype=np.int32))
+        io.write_attr("w_av_target_qpoints_frac", target_qpoints_frac)
+        io.write_attr("w_av_target_q_full_ids",
+                      np.asarray(table["target_full_ids"], dtype=np.int32))
+        io.write_attr("w_av_target_source_row",
+                      np.asarray(table["target_source_row"], dtype=np.int32))
+        io.write_attr("w_av_target_sym_idx",
+                      np.asarray(table["target_sym_idx"], dtype=np.int32))
+        io.write_attr("w_av_target_antiunitary",
+                      np.asarray(table["target_antiunitary"], dtype=np.int32))
+        io.write_attr("w_av_target_shell_mask", target_shell_mask)
+        io.write_attr("w_av_target_seed_mask",
+                      np.asarray(target_seed_mask, dtype=np.int32))
+    if jax.process_index() == 0:
+        print(
+            f"  W-av stencil: stored {nq} symmetry-inequivalent q rows "
+            f"for {int(np.shape(table['target_steps'])[0])} target neighbors")
+
+
+def write_w_av_stencil_artifact(
+    path: str | Path,
+    *,
+    wfn,
+    sym,
+    mesh,
+    nbands: int,
+    bispinor: bool,
+    first_neighbors: bool,
+    second_neighbors: bool,
+    wfn_path: str,
+    wfn_fingerprint: str,
+) -> None:
+    """Write the standalone finite-q W-av artifact without PT preprocessing."""
+    if not bool(first_neighbors) and not bool(second_neighbors):
+        raise ValueError(
+            "standalone W-av preprocessing requires at least one enabled "
+            "neighbor shell")
+    try:
+        from symmetry_maps import q_stencil_orbit_table
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "W-av preprocessing requires the public symmetry service "
+            "q_stencil_orbit_table API") from exc
+    _write_w_av_stage(
+        str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
+        bispinor=bool(bispinor),
+        first_neighbors=bool(first_neighbors),
+        second_neighbors=bool(second_neighbors),
+        q_stencil_orbit_table=q_stencil_orbit_table,
+        mode="w", wfn_path=str(wfn_path),
+        wfn_fingerprint=str(wfn_fingerprint))
+
+
+def write_parallel_transport_artifact(
+    path: str | Path,
+    *,
+    wfn,
+    sym,
+    mesh,
+    nbands: int,
+    bispinor: bool,
+    batched_route: str,
+    eigh_backend: str,
+    rcond: float = 1.0e-10,
+    w_av_first_neighbors: bool = False,
+    w_av_second_neighbors: bool = False,
+) -> None:
+    """Append streamed links and the full-BZ connection to an initialized file.
+
+    ``batched_route`` and ``eigh_backend`` are the deck's ``linalg``
+    resolution (``gw_config.resolve_distrib_la_batched_route`` and
+    ``gw_config.resolve_eigh_backend``): ``batch_reshard`` with ``auto``
+    (``linalg = local``) solves P link polars at a time, one per rank, and
+    plans no whole-mesh eigh; ``auto`` with ``distributed``
+    (``linalg = distributed``) solves each link on the mesh.
+
+    THE STENCIL GATE LIVES HERE, per axis, not in the artifact initializer
+    -- this is the ONLY stage that differentiates along k.  Since 2026-09-05
+    the rule is :func:`common.parallel_transport.link_stencil_orders`: >= 5
+    points take the fourth-order +/-2 stencil, 3 or 4 the second-order
+    +/-1 one, and a collapsed axis (``kgrid[i] == 1``, a slab normal or a
+    wire's transverse directions) takes the real-space position operator
+    the initializer already stored as its connection; only a two-point axis
+    has no rule and refuses here.  The link stream itself runs on every
+    axis (a collapsed axis's forward neighbour is the point itself through
+    the reciprocal vector ``b_i``; the derivative kernels never read that
+    link).
+    """
+    kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
+    bad_axes = undersampled_link_axes(kgrid)
+    if bad_axes:
+        raise ValueError(
+            "PT-LINK-STENCIL-UNSUPPORTED refusal: a reduced axis with "
+            "exactly two mesh points supports no finite difference (its "
+            "+/-1 neighbours coincide) and is not a collapsed vacuum "
+            "direction either.\n"
+            f"  got:  kgrid={kgrid}, two-point axes {', '.join(bad_axes)}\n"
+            "  want: >= 3 mesh points (second-order stencil), >= "
+            f"{MIN_STENCIL_POINTS} (fourth-order), or exactly 1 (a "
+            "collapsed axis, taken through the real-space position "
+            "operator)\n"
+            "  fix:  densify the axis to >= 3 points or collapse it to 1\n"
+            "  doc:  common.parallel_transport.link_stencil_orders")
+    plan_polar, edge_table, apply_symmetry, q_stencil_table = (
+        _require_service_apis())
+    nb_padded = band_storage_extent(mesh, int(nbands))
+    polar_plan = plan_polar(
+        mesh, n=nb_padded, backend=str(eigh_backend), rcond=float(rcond),
+        batched_route=str(batched_route))
+    full_plus, source_full, source_steps = _write_link_stage(
+        str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
+        bispinor=bool(bispinor), polar_plan=polar_plan)
+    _write_connection_stage(
+        str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
+        full_plus=full_plus, source_full=source_full,
+        source_steps=source_steps,
+        directed_edge_orbit_table=edge_table,
+        apply_band_matrix_symmetry=apply_symmetry)
+
+    if bool(w_av_first_neighbors) or bool(w_av_second_neighbors):
+        _write_w_av_stage(
+            str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
+            bispinor=bool(bispinor),
+            first_neighbors=bool(w_av_first_neighbors),
+            second_neighbors=bool(w_av_second_neighbors),
+            q_stencil_orbit_table=q_stencil_table)
+
+
+def _dagger(matrices):
+    return jnp.swapaxes(jnp.conj(matrices), -1, -2)
+
+
+def line_index_table(
+    forward_neighbors: np.ndarray,
+    direction: int,
+    extent: int,
+) -> np.ndarray:
+    """Return ``(n_lines, extent)`` full-BZ ids of every ``+b_i`` cycle.
+
+    The mesh is a torus, so repeatedly following one elementary step
+    partitions the full BZ into ``nk/extent`` disjoint cycles of exactly
+    ``extent`` points.  This is a host-side O(nk) integer walk over the
+    stored neighbour table, so it makes no assumption about how the full-BZ
+    rows happen to be flattened.  It REFUSES on anything that is not that
+    partition, because a short or overlapping cycle would silently make the
+    transported frame multi-valued.
+    """
+    plus = np.asarray(forward_neighbors, dtype=np.int64)
+    idir = int(direction)
+    n = int(extent)
+    if plus.ndim != 2 or plus.shape[1] != 3:
+        raise ValueError(
+            f"forward_neighbors must be (nk, 3); got {plus.shape}")
+    if not 0 <= idir < 3:
+        raise ValueError(f"direction must be 0, 1 or 2; got {direction}")
+    nk = int(plus.shape[0])
+    if n <= 0 or nk % n:
+        raise ValueError(
+            f"direction {idir} extent {n} does not divide nk={nk}")
+    seen = np.zeros(nk, dtype=bool)
+    lines = []
+    for start in range(nk):
+        if seen[start]:
+            continue
+        line = [start]
+        seen[start] = True
+        node = start
+        for _ in range(n - 1):
+            node = int(plus[node, idir])
+            if seen[node]:
+                raise ValueError(
+                    f"direction {idir} cycle through k={start} closes after "
+                    f"{len(line)} of {n} steps; the neighbour table is not a "
+                    "uniform torus")
+            line.append(node)
+            seen[node] = True
+        if int(plus[node, idir]) != start:
+            raise ValueError(
+                f"direction {idir} cycle through k={start} does not close "
+                f"after {n} steps")
+        lines.append(line)
+    return np.asarray(lines, dtype=np.int64)
+
+
+def transported_frame(
+    links_direction,
+    forward_neighbors: np.ndarray,
+    direction: int,
+    extent: int,
+    *,
+    mesh,
+    band_matmul,
+) -> tuple[jax.Array, float]:
+    """Return the frame parallel-transported along one reduced direction.
+
+    ``U(k)`` is built by walking every ``+b_i`` line of the mesh from its own
+    base point, ``U(k+b_i) = L_i(k)^H U(k)``, and is then TWISTED so the line
+    closes on the torus: with ``S`` the line's holonomy the frame carries an
+    extra ``S^(-t/N)``.  Both properties are needed and neither is optional:
+
+    * transported, so ``H_t = U^H diag(E) U`` is the DFT Hamiltonian in a
+      frame that follows the manifold smoothly THROUGH band crossings — the
+      sorted spectrum's kinks are a property of the labelling, not of the
+      operator (claims 0183, 0187);
+    * closed, so ``H_t`` is PERIODIC along that direction.  Untwisted, the
+      frame jumps by the Wilson loop at the zone boundary and the FFT
+      derivative rings on that discontinuity.
+
+    The spectral derivative along ``b_i`` is a per-line 1-D operation, so
+    nothing is required of this frame in the other two directions; that is
+    why one frame per direction is built rather than one global sweep, whose
+    big-loop holonomies measured 13-18x worse on the crossing fixture.
+
+    In the twisted frame the transported link is the per-line CONSTANT
+    ``S^(-1/N)``, so the fourth-order connection of it carries no
+    finite-difference truncation error of its own.
+
+    Returns ``(U, max|S - 1|)``; the second value is the transport holonomy
+    diagnostic, stamped on the artifact.
+    """
+    links = jnp.asarray(links_direction)
+    order = line_index_table(forward_neighbors, direction, extent)
+    n_lines, n = order.shape
+    nk, nb = int(links.shape[0]), int(links.shape[-1])
+    line_sharding = NamedSharding(mesh, P(None, "x", "y"))
+    stack_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
+
+    frames = [jax.lax.with_sharding_constraint(
+        jnp.broadcast_to(jnp.eye(nb, dtype=links.dtype), (n_lines, nb, nb)),
+        line_sharding)]
+    for step in range(1, n):
+        frames.append(band_matmul(
+            _dagger(links[order[:, step - 1]]), frames[-1]))
+    holonomy = band_matmul(_dagger(links[order[:, n - 1]]), frames[-1])
+
+    # The line holonomies are the ONE object this service replicates: there
+    # are nk/extent of them, i.e. one full-BZ band matrix divided by the
+    # mesh extent, and a batched eigh needs them whole.
+    S = jax.lax.with_sharding_constraint(holonomy, NamedSharding(mesh, P()))
+    eye = jnp.eye(nb, dtype=S.dtype)
+    hermitian = 0.5 * (S + _dagger(S))
+    antihermitian = (S - _dagger(S)) / 2.0j
+    # S is unitary, so its Hermitian and anti-Hermitian parts commute with it
+    # and with each other; a generic real combination of them therefore has
+    # the same eigenvectors and a batched Hermitian eigh diagonalizes S
+    # exactly, with no matrix-logarithm branch beyond the principal one.
+    _values, V = eigh_local(hermitian + 0.7548 * antihermitian)
+    theta = jnp.angle(jnp.diagonal(
+        _dagger(V) @ S @ V, axis1=-2, axis2=-1))
+    exponents = -jnp.arange(n, dtype=jnp.float64) / float(n)
+    phase = jnp.exp(1.0j * exponents[:, None, None] * theta[None])
+    twist = jnp.einsum("lij,tlj,lkj->tlik", V, phase, jnp.conj(V),
+                       optimize=True)
+    twist = jax.lax.with_sharding_constraint(twist, stack_sharding)
+
+    stacked = jax.lax.with_sharding_constraint(
+        jnp.stack(frames, axis=0), stack_sharding)
+    twisted = make_distributed_band_matmul(mesh, n_batch_axes=2)(
+        stacked, twist)
+    U = jnp.zeros((nk, nb, nb), dtype=links.dtype)
+    U = U.at[jnp.asarray(order.T.reshape(-1))].set(
+        twisted.reshape(n * n_lines, nb, nb))
+    U = jax.lax.with_sharding_constraint(U, line_sharding)
+    defect = float(jax.device_get(jnp.max(jnp.abs(S - eye[None]))))
+    return U, defect
+
+
+def head_velocity_set(occupations_kn, tol: float = 1.0e-10):
+    """``[k, m, n]`` mask of the velocity elements a q->0 head reads.
+
+    Transitions ``|f_m - f_n| > tol`` (off-diagonal) and, on a metal, the
+    diagonal of partly filled states (the Fermi velocities of the Drude
+    term).  Empty-empty and full-full blocks are not read.
+    """
+    f = jnp.asarray(occupations_kn)
+    nb = f.shape[-1]
+    diagonal = np.eye(nb, dtype=bool)[None]
+    transition = (jnp.abs(f[:, :, None] - f[:, None, :]) > tol) & ~diagonal
+    partial = (f > tol) & (f < 1.0 - tol)
+    return transition | (diagonal & partial[:, :, None])
+
+
+def complete_velocity_validation(
+    path: str | Path,
+    *,
+    mesh,
+    kgrid,
+    bvec_cart,
+    energies_full,
+    occupations_full,
+    velocity_exact_cart,
+    links_full,
+    forward_neighbors,
+    atol: float,
+    rtol: float,
+    scope_blocks=(),
+    collapsed_position=None,
+    head_nbands=None,
+) -> dict[str, object]:
+    """Run and stamp the finite-link DFT head-velocity gate.
+
+    ``head_nbands`` (default: every band of the artifact) is the head's
+    band set.  The links and the covariant derivative run on the whole
+    (outer) artifact manifold; the gate judges the reconstruction on
+    ``[0, head_nbands)`` only, which is the block the QSGW head consumes
+    (:func:`gw.qsgw_head.load_parallel_transport_head`).  Bands between the
+    head and the outer edge are a buffer: the outer edge's link collapse
+    stays out of the head block.  The judged extent is stamped as
+    ``velocity_validation_band_stop``.
+
+    ``collapsed_position`` ``(3, nk, nb, nb)`` is required when ``kgrid``
+    has a collapsed axis: there the reconstructed velocity is
+    ``-i[Z_a, diag(E)]``, i.e. ``-i Z_mn (E_n - E_m)``, which tests the
+    position operator (its vacuum branch cut included) against the exact
+    ``p + i[r, V_NL]`` with no k stencil in the way.
+
+    Both this producer-side gate and QSGW call
+    :func:`common.parallel_transport.link_covariant_derivative`.
+    The acceptance observable is the static occupied-to-empty head tensor,
+    supplemented by the complex transition-velocity overlap so a conjugated
+    link orientation cannot pass a phase-blind quadratic response.  Full
+    matrix maxima and leading blocks remain diagnostics: high empty-empty
+    crossings do not enter an insulating head and cannot veto its artifact.
+    """
+    try:
+        from gw.qsgw_head import (
+            head_s_tensor_sharded,
+            reduced_covector_to_cartesian,
+        )
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "parallel-transport validation requires "
+            "gw.qsgw_head.head_s_tensor_sharded and "
+            "reduced_covector_to_cartesian") from exc
+
+    energies = jnp.asarray(energies_full)
+    occupations = jnp.asarray(occupations_full)
+    exact = jnp.asarray(velocity_exact_cart)
+    links = jnp.asarray(links_full)
+    grid = tuple(int(x) for x in kgrid)
+    reciprocal = np.asarray(bvec_cart, dtype=np.float64)
+    if energies.ndim != 2:
+        raise ValueError(
+            f"energies_full must be (nk, nb); got {energies.shape}")
+    nk, nb = int(energies.shape[0]), int(energies.shape[1])
+    if tuple(occupations.shape) != (nk, nb):
+        raise ValueError(
+            f"occupations shape {occupations.shape} does not match energies "
+            f"{energies.shape}")
+    if tuple(exact.shape) != (3, nk, nb, nb):
+        raise ValueError(
+            f"exact velocity must be (3,{nk},{nb},{nb}); got {exact.shape}")
+    stencil = link_stencil(grid, reciprocal)
+    nd = stencil.ndir
+    if tuple(links.shape) != (nd, nk, nb, nb):
+        raise ValueError(
+            f"links_full must be ({nd}, {nk}, {nb}, {nb}); got "
+            f"{tuple(links.shape)}")
+    plus = np.asarray(forward_neighbors, dtype=np.int64)
+    if plus.shape != (nk, nd):
+        raise ValueError(
+            f"forward_neighbors must be ({nk}, {nd}); got {plus.shape}")
+    h_sharding = NamedSharding(mesh, P(None, "x", "y"))
+    band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
+
+    def _diagonal_hamiltonian(e):
+        return jax.vmap(jnp.diag)(e).astype(links.dtype)
+
+    _diagonal_hamiltonian = jax.jit(
+        _diagonal_hamiltonian, out_shardings=h_sharding)
+    H = _diagonal_hamiltonian(energies.astype(links.real.dtype))
+    orders = link_stencil_orders(grid)
+    reduced = link_covariant_derivative(
+        H, links, plus, stencil, band_matmul=band_matmul,
+        collapsed_position=collapsed_position)
+    reconstructed = reduced_covector_to_cartesian(reduced, reciprocal)
+    outer_reconstructed = reconstructed
+    judged = int(nb if head_nbands is None else head_nbands)
+    if not 0 < judged <= nb:
+        raise ValueError(f"head_nbands={judged} outside the artifact's {nb} bands")
+    if judged < nb:
+        # The head block only: rows and columns past the head are zeroed in
+        # both operands, so every metric below (entrywise, transition
+        # overlap, head response) is the head's.
+        keep = np.arange(nb) < judged
+        block = (keep[:, None] & keep[None, :])[None, None]
+        reconstructed = jnp.where(block, reconstructed, 0.0)
+        exact = jnp.where(block, exact, 0.0)
+
+    metrics = _velocity_error_metrics(
+        reconstructed, exact, atol=float(atol), rtol=float(rtol))
+    metrics["band_stop"] = judged
+    # The link error the QSGW head bound multiplies by its Sigma correction
+    # (gw.qsgw_head.link_correction_bound), on the elements the head reads.
+    head_set = head_velocity_set(occupations)[None]
+    metrics["head_set_relative_l2"] = float(jax.device_get(
+        jnp.sqrt(ordered_sum(jnp.where(head_set, jnp.abs(reconstructed - exact) ** 2, 0.0))
+                 / jnp.maximum(ordered_sum(jnp.where(head_set, jnp.abs(exact) ** 2, 0.0)),
+                               1.0e-60))))
+    metrics["entrywise_passed"] = bool(metrics["passed"])
+    metrics["stencil_orders"] = tuple(int(o) for o in orders)
+    metrics["link_directions"] = int(stencil.ndir)
+    # Per-Cartesian-axis reduction of the same error, so a slab's collapsed
+    # axis (position operator) and its stencil axes are judged separately.
+    axis_error = jnp.abs(reconstructed - exact)
+    metrics["max_abs_by_axis"] = tuple(
+        float(v) for v in jax.device_get(
+            jnp.max(axis_error.reshape(3, -1), axis=1)))
+    metrics["exact_max_abs_by_axis"] = tuple(
+        float(v) for v in jax.device_get(
+            jnp.max(jnp.abs(exact).reshape(3, -1), axis=1)))
+    for name, value in zip("xyz", metrics["max_abs_by_axis"]):
+        metrics[f"max_abs_axis_{name}"] = float(value)
+
+    delta_e = energies[:, :, None] - energies[:, None, :]
+    occupation_difference = (
+        occupations[:, None, :] - occupations[:, :, None])
+    transition = (
+        (delta_e > 0.0) & (jnp.abs(occupation_difference) > 1.0e-10))
+    transition = transition[None]
+    exact_norm = jnp.sqrt(ordered_sum(
+        jnp.where(transition, jnp.abs(exact) ** 2, 0.0)))
+    reconstructed_norm = jnp.sqrt(ordered_sum(
+        jnp.where(transition, jnp.abs(reconstructed) ** 2, 0.0)))
+    transition_error = jnp.sqrt(ordered_sum(jnp.where(
+        transition, jnp.abs(reconstructed - exact) ** 2, 0.0)))
+    overlap = ordered_sum(jnp.where(
+        transition, jnp.conj(exact) * reconstructed, 0.0 + 0.0j))
+    overlap = overlap / jnp.maximum(
+        exact_norm * reconstructed_norm, jnp.asarray(1.0e-30))
+    metrics["transition_relative_l2"] = float(jax.device_get(
+        transition_error / jnp.maximum(exact_norm, 1.0e-30)))
+    metrics["transition_overlap_real"] = float(jax.device_get(jnp.real(overlap)))
+    metrics["transition_overlap_imag"] = float(jax.device_get(jnp.imag(overlap)))
+
+    response_kwargs = dict(
+        mesh=mesh,
+        nb_logical=nb,
+        cell_volume=1.0,
+        nk_tot=nk,
+        nspin=1,
+        nspinor=1,
+        eta_ry=0.0,
+    )
+    exact_response = head_s_tensor_sharded(
+        exact, energies, occupations, jnp.asarray([0.0 + 0.0j]),
+        **response_kwargs)[0]
+    reconstructed_response = head_s_tensor_sharded(
+        reconstructed, energies, occupations,
+        jnp.asarray([0.0 + 0.0j]), **response_kwargs)[0]
+    response_norm = jnp.linalg.norm(exact_response)
+    response_relative = (
+        jnp.linalg.norm(reconstructed_response - exact_response)
+        / jnp.maximum(response_norm, 1.0e-30))
+    exact_trace = jnp.real(jnp.trace(exact_response))
+    safe_exact_trace = jnp.where(
+        jnp.abs(exact_trace) > 1.0e-30,
+        exact_trace,
+        jnp.asarray(1.0e-30, dtype=exact_trace.dtype),
+    )
+    response_trace_ratio = (
+        jnp.real(jnp.trace(reconstructed_response)) / safe_exact_trace)
+    metrics["head_response_relative_frobenius"] = float(
+        jax.device_get(response_relative))
+    metrics["head_response_trace_ratio"] = float(
+        jax.device_get(response_trace_ratio))
+    # Per Cartesian axis, the diagonal head component reconstructed over
+    # exact (diagnostic): which axis's rule the Frobenius gate is failing on.
+    diag_ratio = jax.device_get(
+        jnp.real(jnp.diagonal(reconstructed_response))
+        / jnp.where(jnp.abs(jnp.real(jnp.diagonal(exact_response))) > 1.0e-30,
+                    jnp.real(jnp.diagonal(exact_response)), 1.0e-30))
+    metrics["head_response_ratio_by_axis"] = tuple(
+        float(v) for v in diag_ratio)
+    metrics["passed"] = bool(
+        np.isfinite(metrics["head_response_relative_frobenius"])
+        and np.isfinite(metrics["transition_overlap_real"])
+        and metrics["head_response_relative_frobenius"] <= float(rtol)
+        and metrics["transition_overlap_real"] >= 1.0 - float(rtol)
+    )
+
+    blocks = tuple(int(m) for m in scope_blocks if 0 < int(m) <= nb)
+    if jax.process_index() == 0:
+        rule = {COLLAPSED_AXIS: "position", 2: "order-2", 4: "order-4"}
+        print("  finite-link velocity rule per axis: "
+              + ", ".join(
+                  f"{a}={rule[o]} (max|dv|={e:.3e} of {x:.3e}, head "
+                  f"S_{a}{a} reconstructed/exact {r:.4f})"
+                  for a, o, e, x, r in zip(
+                      "xyz", metrics["stencil_orders"],
+                      metrics["max_abs_by_axis"],
+                      metrics["exact_max_abs_by_axis"],
+                      metrics["head_response_ratio_by_axis"])))
+    if blocks:
+        metrics["blocks"] = _block_scoped_metrics(
+            outer_reconstructed, jnp.asarray(velocity_exact_cart), blocks,
+            atol=float(atol), rtol=float(rtol))
+        if jax.process_index() == 0:
+            print(f"  finite-link velocity diagnostics (nb={nb}, nk={nk})")
+            print("   bands  max_abs      diag         offdiag      rel_l2 gate")
+            for row in metrics["blocks"]:
+                print(f"   1..{row['bands']:<4d} {row['max_abs']:.6e}  "
+                      f"{row['max_abs_diagonal']:.4e}  "
+                      f"{row['max_abs_offdiagonal']:.4e}  "
+                      f"{str(row['passed']):>5s}")
+    write_velocity_validation(path, mesh=mesh, metrics=metrics)
+    if not metrics["passed"] and jax.process_index() == 0:
+        # A warning, never a refusal or a drop: the link error is a
+        # k-convergence measure.  The QSGW head serves D_k DeltaH from these
+        # links and logs rel_err x |D_k DeltaH|/|v_DFT| at every map
+        # (gw.qsgw_head.link_correction_bound).
+        print(
+            "  WARNING: finite-link DFT velocity reconstruction above rtol "
+            "(the k grid is underconverged for the links; the artifact is "
+            "written and the SC head serves its Sigma term from it): "
+            f"head_response_relative_frobenius="
+            f"{metrics['head_response_relative_frobenius']:.6e}, "
+            f"transition_overlap="
+            f"{metrics['transition_overlap_real']:+.6e}"
+            f"{metrics['transition_overlap_imag']:+.6e}j, "
+            f"required response <= {float(rtol):.6e} and overlap real >= "
+            f"{1.0 - float(rtol):.6e}; full-matrix diagnostic max_abs="
+            f"{metrics['max_abs']:.6e}; per Cartesian axis (rule, max|dv| of "
+            "max|v|, head S_aa reconstructed/exact): "
+            + ", ".join(
+                f"{a}={ {COLLAPSED_AXIS: 'position', 2: 'order-2', 4: 'order-4'}[o] }"
+                f" {e:.3e} of {x:.3e}, {r:.4f}"
+                for a, o, e, x, r in zip(
+                    "xyz", metrics["stencil_orders"],
+                    metrics["max_abs_by_axis"],
+                    metrics["exact_max_abs_by_axis"],
+                    metrics["head_response_ratio_by_axis"]))
+            + f"; head-set relative L2 "
+            f"{metrics['head_set_relative_l2']:.3e}", flush=True)
+    return metrics
+
+
+def stored_link_steps(io) -> np.ndarray:
+    """The ``(nd, 3)`` link steps an artifact stores (``source_steps``)."""
+    return np.asarray(io.read_slab(
+        "source_steps", partition_spec=P(None, None), as_numpy=True),
+        dtype=np.int32).reshape(-1, 3)
+
+
+def load_full_bz_links(
+    io,
+    *,
+    mesh,
+    nk: int,
+    nb_storage: int,
+    nb_logical: int,
+):
+    """Read the stored links and return them as ``(nd, nk, nb, nb)``.
+
+    ``nd`` is the stored ``source_steps`` count (the artifact's
+    :func:`common.parallel_transport.link_stencil`).
+
+    The link stage stores either one row per full-BZ point (bcc/fcc, where
+    ``link_symmetry_reduction_applies`` is false) or one row per IBZ point
+    plus the directed-edge orbit table that unfolds it.  Both layouts are
+    stamped on the artifact, so the gate reads whichever is there rather
+    than rebuilding the table from a SymMaps it does not own.
+    """
+    block_spec = P(None, None, "x", "y")
+    source_full = np.asarray(io.read_slab(
+        "source_full_ids", partition_spec=P(None), as_numpy=True))
+    n_source = int(source_full.size)
+    nd = stored_link_steps(io).shape[0]
+    stored = io.read_slab(
+        LINKS_DATASET, shape=(n_source, nd, nb_storage, nb_storage),
+        partition_spec=block_spec)
+    if n_source == nk:
+        links = jnp.moveaxis(stored, 1, 0)
+    else:
+        try:
+            from symmetry_maps import apply_band_matrix_symmetry
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "unfolding symmetry-reduced parallel-transport links requires "
+                "symmetry_maps.apply_band_matrix_symmetry; merge the symmetry "
+                "service lane") from exc
+
+        def _table(name):
+            return np.asarray(io.read_slab(
+                f"directed_edge_{name}", shape=(nk, 3),
+                partition_spec=P(None, None), as_numpy=True))
+
+        selected = stored[_table("source_row"), _table("source_direction")]
+        unfolded = apply_band_matrix_symmetry(
+            selected,
+            antiunitary=_table("antiunitary"),
+            reverse=_table("reverse"),
+            sewing_start=None,
+            sewing_end=None,
+        )
+        links = jnp.moveaxis(unfolded, 1, 0)
+
+    nb = int(nb_logical)
+    if not 0 < nb <= int(nb_storage):
+        raise ValueError(
+            f"logical link manifold {nb} outside storage {nb_storage}")
+    if int(nb_storage) > nb:
+        # The stored pad block is zero.  Identity links make a pad operator
+        # exactly inert under finite-link transport without changing any
+        # logical row or column.
+        pad = np.zeros((nb_storage, nb_storage), dtype=np.complex128)
+        rows = np.arange(nb, nb_storage)
+        pad[rows, rows] = 1.0
+        links = links + pad[None, None]
+    return links
+
+
+def load_link_singular_values(io, *, nb_logical: int) -> np.ndarray:
+    """Read the per-source-k, per-direction link overlap singular values.
+
+    Returns ``(n_source, nd, nb_logical)``, descending along the last axis
+    (the dataset's own ``ordering`` attribute; see
+    :data:`SINGULAR_VALUES_DATASET`'s ``create_dataset`` call).  ``n_source``
+    is the IBZ row count on a symmetry-reduced deck or ``nk_tot`` on an
+    unreduced (bcc/fcc) one -- WHICHEVER the artifact actually stored, read
+    from ``source_full_ids`` exactly as :func:`load_full_bz_links` does, so
+    the two never disagree about how many rows exist.
+
+    UNLIKE the links themselves, singular values are NOT unfolded to the
+    full BZ here: they are real scalars invariant under the point-group
+    action that produced any symmetry-equivalent k, so the IBZ (or full-BZ)
+    source set the artifact stored already carries every value a full-BZ
+    "minimum over k" query would see -- unfolding would repeat values, not
+    add information, for a min-reduction consumer.  A caller that needs a
+    specific k's value at a k outside the stored source set must go through
+    the same directed-edge table :func:`load_full_bz_links` uses; no
+    consumer needs that today.
+    """
+    nb = int(nb_logical)
+    source_full = np.asarray(io.read_slab(
+        "source_full_ids", partition_spec=P(None), as_numpy=True))
+    n_source = int(source_full.size)
+    values = io.read_slab(
+        SINGULAR_VALUES_DATASET,
+        shape=(n_source, stored_link_steps(io).shape[0], nb),
+        partition_spec=P(None, None, None), as_numpy=True)
+    return np.asarray(values, dtype=np.float64)
+
+
+def validate_parallel_transport_artifact(
+    path: str | Path,
+    *,
+    mesh,
+    kgrid,
+    bvec_cart,
+    nbands: int,
+    atol: float,
+    rtol: float,
+    scope_blocks=None,
+    head_nbands=None,
+) -> dict[str, object]:
+    """Read the artifact through SlabIO and execute its mandatory gate."""
+    nb = int(nbands)
+    nb_storage = band_storage_extent(mesh, nb)
+    grid = tuple(int(x) for x in kgrid)
+    nk = int(np.prod(grid))
+    with SlabIO(str(path), mode="r", mesh=mesh) as io:
+        velocity = io.read_slab(
+            VELOCITY_DFT_DATASET,
+            shape=(3, nk, nb_storage, nb_storage),
+            partition_spec=P(None, None, "x", "y"))
+        energies = io.read_slab(
+            ENERGIES_DATASET,
+            shape=(nk, nb_storage),
+            partition_spec=P(None, ("x", "y")))
+        occupations = io.read_slab(
+            OCCUPATIONS_DATASET,
+            shape=(nk, nb_storage),
+            partition_spec=P(None, ("x", "y")))
+        forward_neighbors = np.asarray(io.read_slab(
+            "full_forward_neighbors",
+            shape=(nk, stored_link_steps(io).shape[0]),
+            partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
+        links = load_full_bz_links(
+            io, mesh=mesh, nk=nk, nb_storage=nb_storage,
+            nb_logical=nb)
+        collapsed_position = None
+        if collapsed_axes(grid):
+            collapsed_position = io.read_slab(
+                COLLAPSED_POSITION_DATASET,
+                shape=(3, nk, nb_storage, nb_storage),
+                partition_spec=P(None, None, "x", "y"))
+    if nb <= 0 or nb > int(np.shape(energies)[1]):
+        raise ValueError(
+            f"nbands={nb} outside SlabIO energy extent {np.shape(energies)[1]}")
+    if scope_blocks is None:
+        scope_blocks = tuple(range(8, nb, 8)) + (nb,)
+    return complete_velocity_validation(
+        path, mesh=mesh, kgrid=grid, bvec_cart=bvec_cart,
+        energies_full=energies,
+        occupations_full=occupations,
+        velocity_exact_cart=velocity,
+        links_full=links,
+        forward_neighbors=forward_neighbors,
+        atol=float(atol), rtol=float(rtol), scope_blocks=scope_blocks,
+        collapsed_position=collapsed_position, head_nbands=head_nbands)
+
+
+def _velocity_error_metrics(
+    reconstructed,
+    exact,
+    *,
+    atol: float,
+    rtol: float,
+) -> dict[str, object]:
+    """Reduce all complex matrix entries to the mandatory gate metrics."""
+    reconstructed = jnp.asarray(reconstructed)
+    exact = jnp.asarray(exact)
+    if reconstructed.shape != exact.shape:
+        raise ValueError(
+            f"reconstructed/exact shapes differ: {reconstructed.shape} "
+            f"vs {exact.shape}")
+    error = jnp.abs(reconstructed - exact)
+    scale = jnp.maximum(jnp.abs(exact), float(atol))
+    relative = error / scale
+    nband = exact.shape[-1]
+    diagonal = np.eye(nband, dtype=bool)[None, None, :, :]
+    off_diagonal = ~diagonal
+    max_abs = float(jax.device_get(jnp.max(error)))
+    max_rel = float(jax.device_get(jnp.max(relative)))
+    max_abs_diag = float(jax.device_get(jnp.max(
+        jnp.where(diagonal, error, 0.0))))
+    max_abs_offdiag = float(jax.device_get(jnp.max(
+        jnp.where(off_diagonal, error, 0.0))))
+    passed = bool(jax.device_get(jnp.all(
+        error <= float(atol) + float(rtol) * jnp.abs(exact))))
+    return {
+        "passed": passed,
+        "atol": float(atol),
+        "rtol": float(rtol),
+        "max_abs": max_abs,
+        "max_rel": max_rel,
+        "max_abs_diagonal": max_abs_diag,
+        "max_abs_offdiagonal": max_abs_offdiag,
+    }
+
+
+@partial(jax.jit, static_argnames=("blocks", "q_tile"))
+def _block_scoped_reductions(reconstructed, exact, *, blocks, atol, rtol,
+                             q_tile=64):
+    """Reduce leading-band diagnostics without a full error-array lifetime.
+
+    The two resident operators retain their all-P band-face layout. Only a
+    bounded q panel enters the elementwise arithmetic; band masks preserve
+    the carrier layout instead of slicing a smaller, potentially unaligned
+    band face. The final panel overlaps its predecessor when nk is ragged:
+    max/all are idempotent, so that overlap does not change any statistic.
+    """
+    nk, nb = int(exact.shape[1]), int(exact.shape[-1])
+    width = min(int(q_tile), nk)
+    n_panels = (nk + width - 1) // width
+    band = jnp.arange(nb)
+    diagonal = (band[:, None] == band[None, :])[None, None]
+    masks = tuple(((band[:, None] < m) & (band[None, :] < m))[None, None]
+                  for m in blocks)
+    zeros = jnp.zeros((len(blocks),), dtype=exact.real.dtype)
+    initial = (zeros, zeros, zeros, zeros,
+               jnp.ones((len(blocks),), dtype=jnp.bool_))
+
+    def panel(i, accumulated):
+        start = jnp.minimum(i * width, nk - width)
+        reference = jax.lax.dynamic_slice_in_dim(exact, start, width, axis=1)
+        estimate = jax.lax.dynamic_slice_in_dim(
+            reconstructed, start, width, axis=1)
+        error = jnp.abs(estimate - reference)
+        magnitude = jnp.abs(reference)
+        maximum, diag_maximum, off_maximum, relative, passed = [], [], [], [], []
+        for mask in masks:
+            maximum.append(jnp.max(jnp.where(mask, error, 0.0)))
+            diag_maximum.append(jnp.max(jnp.where(mask & diagonal, error, 0.0)))
+            off_maximum.append(jnp.max(jnp.where(mask & ~diagonal, error, 0.0)))
+            relative.append(jnp.max(jnp.where(
+                mask, error / jnp.maximum(magnitude, atol), 0.0)))
+            passed.append(jnp.all(jnp.where(
+                mask, error <= atol + rtol * magnitude, True)))
+        current = tuple(jnp.stack(v) for v in
+                        (maximum, diag_maximum, off_maximum, relative, passed))
+        return tuple(jnp.maximum(old, new) for old, new in
+                     zip(accumulated[:4], current[:4])) + (
+                         accumulated[4] & current[4],)
+
+    return jax.lax.fori_loop(0, n_panels, panel, initial)
+
+
+def _block_scoped_metrics(
+    reconstructed,
+    exact,
+    blocks,
+    *,
+    atol: float,
+    rtol: float,
+) -> list[dict[str, object]]:
+    """Repeat the gate metrics on leading band sub-blocks.
+
+    This is the scoping that separated "the connection is wrong" from "the
+    band window is truncated" on the sodium artifact (claim 0183): the
+    semicore rows never cross, so a block that is clean up to band 8 and
+    jumps at band 9 names a band-crossing defect and nothing else.  It is a
+    DIAGNOSTIC — the stamped verdict stays the full-window one.
+    """
+    blocks = tuple(int(m) for m in blocks)
+    if not blocks:
+        return []
+    reduced = jax.device_get(_block_scoped_reductions(
+        jnp.asarray(reconstructed), jnp.asarray(exact), blocks=blocks,
+        atol=float(atol), rtol=float(rtol)))
+    return [{
+        "bands": m,
+        "max_abs": float(reduced[0][i]),
+        "max_abs_diagonal": float(reduced[1][i]),
+        "max_abs_offdiagonal": float(reduced[2][i]),
+        "max_rel": float(reduced[3][i]),
+        "passed": bool(reduced[4][i]),
+    } for i, m in enumerate(blocks)]
+
+
+_VELOCITY_GATE_KEYS = (
+    "atol", "rtol", "max_abs", "max_rel",
+    "max_abs_diagonal", "max_abs_offdiagonal",
+    "transition_relative_l2", "transition_overlap_real",
+    "transition_overlap_imag", "head_response_relative_frobenius",
+    "head_response_trace_ratio",
+)
+_VELOCITY_DIAGNOSTIC_KEYS = (
+    "entrywise_passed", "head_set_relative_l2",
+    "max_abs_axis_x", "max_abs_axis_y", "max_abs_axis_z",
+)
+
+
+def write_velocity_validation(
+    path: str | Path,
+    *,
+    mesh,
+    metrics: dict[str, object],
+) -> None:
+    """Stamp mandatory DFT reconstruction gate metrics through SlabIO."""
+    required = set(_VELOCITY_GATE_KEYS) | {"passed"}
+    missing = required.difference(metrics)
+    if missing:
+        raise ValueError(f"velocity validation metrics missing {sorted(missing)}")
+    with SlabIO(str(path), mode="a", mesh=mesh) as io:
+        io.write_attr("velocity_validation_complete", np.int32(1))
+        io.write_attr(
+            "velocity_validation_passed", np.int32(bool(metrics["passed"])))
+        if "band_stop" in metrics:
+            io.write_attr("velocity_validation_band_stop",
+                          np.int32(int(metrics["band_stop"])))
+        for name in _VELOCITY_GATE_KEYS:
+            io.write_attr(
+                f"velocity_validation_{name}", np.float64(metrics[name]))
+        for name in _VELOCITY_DIAGNOSTIC_KEYS:
+            if name in metrics:
+                io.write_attr(
+                    f"velocity_validation_{name}", np.float64(metrics[name]))
+
+
+def collapsed_axis_position_operators(
+    psi_G, *, wfn, sym, geom, gtab_file, emit=print):
+    """``Z_a = <m| b_a . r |n>`` on the full BZ for every collapsed k axis.
+
+    One sweep per collapsed axis on the resident file-wedge ``psi_G`` (the
+    velocity's own sweep machinery) carries two operators: the position
+    sawtooth :func:`common.mtxel_sweep.collapsed_position_operator`, with
+    its branch cut at the centre of the largest vacuum gap
+    (:func:`common.parallel_transport.collapsed_axis_vacuum_gap`), and the
+    window :func:`common.mtxel_sweep.axis_window_operator` over the middle
+    ``COLLAPSED_CUT_PROBE_GAP_FRACTION`` of that gap, whose diagonal is each
+    band's density at the cut.  The occupied bands' share there is printed
+    and refused above ``COLLAPSED_CUT_DENSITY_MAX``
+    (``GATE pt_collapsed_axis_cut_density``): a cut through the density
+    makes ``Z`` wrong by ``2 pi`` times that share.
+
+    The file-wedge Cartesian vector ``sum_a Z_a b_a-hat`` is unfolded ONCE
+    with the polar unfold at ``time_odd=False`` (r is time-even; a mirror
+    through the slab flips ``b_a`` and with it ``Z_a``; a wire's C4 mixes
+    its two collapsed axes, which an axis-by-axis unfold would drop), then
+    each axis is projected back on its ``b_a-hat`` and Hermitised.  Returns
+    ``(Z (nk_full, 3, nb_pad, nb_pad), zero on stencil axes; centres (3,)
+    with NaN on stencil axes)``.
+    """
+    import common.timing as timing
+    from common.mtxel_sweep import (axis_window_operator,
+                                    collapsed_position_operator,
+                                    sweep_matrix_elements)
+    from symmetry_maps import unfold_file_wedge_polar_matrix
+    from common.parallel_transport import (
+        COLLAPSED_CUT_DENSITY_MAX, COLLAPSED_CUT_PROBE_GAP_FRACTION,
+        collapsed_axes, collapsed_axis_vacuum_gap)
+
+    axes = list(collapsed_axes(wfn.kgrid))
+    nb = int(geom.nb_logical)
+    B = np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
+    occ = np.asarray(wfn.occs)
+    occ = (occ[0] if occ.ndim == 3 else occ)[:, :nb]
+    centers = np.full(3, np.nan, dtype=np.float64)
+    bhat = {a: jnp.asarray(B[a] / np.linalg.norm(B[a])) for a in axes}
+    Z_vec_file = None
+    for axis in axes:
+        cut, gap = collapsed_axis_vacuum_gap(wfn.atom_crys, axis)
+        center = float(np.mod(cut + 0.5, 1.0))
+        centers[axis] = center
+        probe = COLLAPSED_CUT_PROBE_GAP_FRACTION * gap
+        with timing.section("parallel_transport_position"):
+            Z_file, window = sweep_matrix_elements(
+                psi_G, operator=(
+                    collapsed_position_operator(
+                        geom, axis=axis, center=center),
+                    axis_window_operator(
+                        geom, axis=axis, center=cut, width=probe)),
+                geom=geom, gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
+                box_index=wfn.box_index(k="ibz"),
+                kvecs=np.asarray(gtab_file.kvecs))
+            at_cut = np.real(np.asarray(jax.device_get(
+                jnp.diagonal(window, axis1=-2, axis2=-1))))[:, :nb]
+        del window
+        occupied = float(np.sum(occ * at_cut) / max(np.sum(occ), 1e-30))
+        k_max, n_max = np.unravel_index(int(np.argmax(at_cut)), at_cut.shape)
+        emit(f"Collapsed k axis {'xyz'[axis]}: position operator "
+             f"Z = <m| b . r |n>; largest vacuum gap {gap:.4f} of the cell, "
+             f"branch cut at f = {cut:.6f}; density in the middle "
+             f"{probe:.4f} of the cell around the cut: occupied bands "
+             f"{occupied:.3e} of their charge (refused above "
+             f"{COLLAPSED_CUT_DENSITY_MAX:.1e}), any window band max "
+             f"{float(at_cut[k_max, n_max]):.3e} (band {int(n_max) + 1}, "
+             f"IBZ k {int(k_max) + 1}); max|Z| = "
+             f"{float(jax.device_get(jnp.max(jnp.abs(Z_file)))):.4f}")
+        if not occupied <= COLLAPSED_CUT_DENSITY_MAX:
+            raise ValueError(
+                "GATE pt_collapsed_axis_cut_density: the branch cut of the "
+                f"collapsed-axis position operator along {'xyz'[axis]} sits "
+                f"at f = {cut:.6f} (centre of the largest vacuum gap, "
+                f"{gap:.4f} of the cell), and the occupied bands carry "
+                f"{occupied:.3e} of their charge within {probe / 2:.4f} of "
+                f"it (limit {COLLAPSED_CUT_DENSITY_MAX:.1e}).  The position "
+                "operator is wrong by 2 pi times that share.  Fix: more "
+                "vacuum along this axis.")
+        term = Z_file[:, None, :, :] * bhat[axis][None, :, None, None]
+        Z_vec_file = term if Z_vec_file is None else Z_vec_file + term
+    if Z_vec_file is None:
+        raise ValueError(
+            f"kgrid {tuple(int(n) for n in wfn.kgrid)} has no collapsed axis")
+    Z_vec = unfold_file_wedge_polar_matrix(sym, Z_vec_file, time_odd=False)
+    position = jnp.zeros_like(Z_vec)
+    for axis in axes:
+        Z_full = jnp.einsum("j,kjmn->kmn", bhat[axis], Z_vec, optimize=True)
+        Z_full = 0.5 * (Z_full + jnp.swapaxes(jnp.conj(Z_full), -1, -2))
+        position = position.at[:, axis].set(Z_full)
+    return position, centers
+
+
+def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
+                         gtab_file, mesh, nbands, effective_nspinor, bispinor,
+                         hubbard_provenance, wfn_path, vnl_velocity_sign,
+                         vnl_included, rcond, emit=print,
+                         velocity_kinetic=None) -> None:
+    """The artifact's velocity stage, from the producer's live sweep.
+
+    The exact DFT velocity ``v = p + i[r, V_NL]`` stays sharded and is
+    direction-major'd only inside the SlabIO writer
+    (:func:`initialize_parallel_transport_artifact`).  A collapsed k axis (a
+    slab normal, a wire's transverse pair) has no k stencil and none is
+    fabricated: its connection is the position band matrix
+    ``Z_a = <m| b_a . r |n>`` (:func:`collapsed_axis_position_operators`),
+    swept on the same resident file-wedge ``psi_G``.
+    """
+    import common.timing as timing
+    from common.parallel_transport import wfn_fingerprint
+
+    position = centers = None
+    if collapsed_axes(wfn.kgrid):
+        position, centers = collapsed_axis_position_operators(
+            psi_G, wfn=wfn, sym=sym, geom=geom, gtab_file=gtab_file,
+            emit=emit)
+    with timing.section("parallel_transport_velocity"):
+        initialize_parallel_transport_artifact(
+            path, wfn=wfn, sym=sym, mesh=mesh, nbands=nbands,
+            effective_nspinor=effective_nspinor, bispinor=bispinor,
+            velocity_dft_kmajor=velocity_kmajor,
+            hubbard_provenance=hubbard_provenance, wfn_path=wfn_path,
+            wfn_fingerprint=wfn_fingerprint(wfn),
+            vnl_velocity_sign=vnl_velocity_sign, vnl_included=vnl_included,
+            rcond=rcond, collapsed_position_kmajor=position,
+            collapsed_axis_centers=centers,
+            velocity_kinetic_kmajor=velocity_kinetic)
+
+
+def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
+                                batched_route, eigh_backend,
+                                rcond, velocity_only, w_av_first_neighbors,
+                                w_av_second_neighbors, atol, rtol,
+                                report, head_nbands=None) -> None:
+    """The links, the fourth-order connection and the velocity-identity gate.
+
+    ``velocity_only`` stops after the velocity stage: the link stream, the
+    connection and the validation are skipped, which is what the
+    ``sc_head_update = dft_velocity`` consumer
+    (``gw.qsgw_head.load_dft_velocity_head``) reads, on decks whose mesh
+    cannot support the link stencil (a collapsed or undersampled axis).
+    Otherwise the reconstructed covariant velocity is measured against the
+    exact one on the head's bands and stamped; the per-axis receipt goes to
+    ``report``.  The error is a diagnostic here: the QSGW head judges it on
+    its own Sigma correction (``gw.qsgw_head.link_correction_bound``).
+    """
+    import common.timing as timing
+
+    if velocity_only:
+        print("  DFT velocity-only parallel-transport artifact: no "
+              "links, no connection, no validation (--parallel-transport"
+              "-velocity-only).")
+        print(f"\nWrote DFT-velocity-only parallel-transport data to {path}")
+        return
+    with timing.section("parallel_transport_links"):
+        write_parallel_transport_artifact(
+            path, wfn=wfn, sym=sym, mesh=mesh, nbands=nbands,
+            bispinor=bispinor, batched_route=batched_route,
+            eigh_backend=eigh_backend, rcond=rcond,
+            w_av_first_neighbors=w_av_first_neighbors,
+            w_av_second_neighbors=w_av_second_neighbors)
+    with timing.section("parallel_transport_validation"):
+        metrics = validate_parallel_transport_artifact(
+            path, mesh=mesh, kgrid=wfn.kgrid, nbands=nbands,
+            bvec_cart=np.asarray(wfn.bvec) * float(wfn.blat),
+            atol=atol, rtol=rtol, head_nbands=head_nbands)
+    verdict = "within rtol" if metrics["passed"] else "above rtol (diagnostic)"
+    print(f"  DFT covariant-velocity reconstruction: {verdict}; "
+          f"max_abs={metrics['max_abs']:.6e}, "
+          f"max_rel={metrics['max_rel']:.6e}")
+    print(f"\nWrote parallel-transport data to {path}")
+    report.heading("Parallel-transport validation")
+    report.emit(f"Links on bands 1-{int(nbands)} along "
+                f"{int(metrics['link_directions'])} +/- step pairs "
+                "(common.parallel_transport.link_stencil); velocity judged "
+                f"on bands 1-{int(metrics['band_stop'])} (the head)")
+    report.emit(f"Covariant DFT velocity: {verdict}; relative L2 on the "
+                "head's elements (transitions, Fermi-surface diagonal)="
+                f"{float(metrics['head_set_relative_l2']):.4e} (the SC head's "
+                "link error); "
+                f"max abs={float(metrics['max_abs']):.5e}; "
+                f"max rel={float(metrics['max_rel']):.5e}")
+    rule = {0: "position", 2: "order-2", 4: "order-4"}
+    report.emit(
+        "Per axis (rule, max|dv| of max|v|, head S_aa "
+        "reconstructed/exact): " + ", ".join(
+            f"{a}={rule[int(o)]} {e:.3e} of {x:.3e}, {r:.4f}"
+            for a, o, e, x, r in zip(
+                "xyz", metrics["stencil_orders"],
+                metrics["max_abs_by_axis"],
+                metrics["exact_max_abs_by_axis"],
+                metrics["head_response_ratio_by_axis"]))
+        + "; head response rel="
+        f"{float(metrics['head_response_relative_frobenius']):.3e}, "
+        "transition overlap="
+        f"{float(metrics['transition_overlap_real']):.6f}")

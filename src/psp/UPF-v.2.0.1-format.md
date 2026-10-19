@@ -1,0 +1,496 @@
+# Unified Pseudopotential Format, v.2.0.1 
+
+The Unified Pseudopotential Format (UPF), currently at v.2.0.1,
+is designed to store different kinds of pseudopotentials:
+
+- Norm-conserving (NC) pseudopotentials (PP) in nonlocal form
+- As above, in both semilocal (SL) and nonlocal (NL) form
+- Ultrasoft (US) PP (aka Vanderbilt)
+- Projector Augmented Waves (PAW) datasets
+- Additional data for the GIPAW reconstruction of all-electron (AE) charge
+
+into a flexible file format, having a XML-like structure.
+All quantities depending upon r are stored in numerical form on a radial grid.
+
+## General structure
+
+The file is formatted, starts with a line
+```
+    <UPF version="2.0.1">
+```
+ends with a line
+```
+    </UPF>
+```
+The file contains "fields", introduced by starting and ending tags
+as in the example below:
+```
+    <FOO>
+      (content of field FOO)
+    </FOO>
+```
+The opening tag FOO may have attributes, as in the following example:
+```
+    <FOO attr="BAR">
+      (content of field FOO)
+    </FOO>
+```
+Fields may contain numeric data, character strings, comments,
+or other fields (subfields). Comments are introduced by `<!--`,
+terminated by `-->`. The following restrictions apply:
+- Tags are case-sensitive and should be capitalized
+- Tags can contain only letters and digits
+- Spaces are not allowed between `<` and the tag name
+- Maximum line length is 80 characters
+- Comments must be terminated on the same line it is opened
+- Numeric data in fields should be readable using fortran free format
+
+Note that
+- Blank spaces preceding tags are ignored
+- Trailing characters after a tag in the same line are ignored
+- Blank lines inside a field are ignored.
+- All attributes must be between quotes (attr="..." or attr ='...')
+
+## Pre-defined fields
+
+First-level fields defined in v.2.0.1 of the UPF format are
+([] = optional, or present only in some cases):
+
+- [ PP_INFO ]
+- PP_HEADER
+- PP_MESH]
+- [ PP_NLCC ]
+- PP_LOCAL
+- [ PP_SEMILOCAL ]
+- PP_NONLOCAL
+- PP_PSWFC
+- [ PP_FULL_WFC ]
+- PP_RHOATOM
+- [ PP_PAW ]
+- [ PP_GIPAW ]
+
+These fields must appear in the order specified above.
+Fields that are not defined are ignored.
+
+## Field specifications
+
+All quantities are in atomic Rydberg units: e^2=2, m=1/2, hbar=1. Lengths
+are in Bohr (0.529177 A), energies in Ry (13.6058 eV). Potentials are
+multiplied by e so they have the units of energy. 
+
+Arrays are written in the Fortran way (leftmost index runs faster) and can be
+written in free format, not exceeding the limit of 80 characters per line.
+
+
+### PP_INFO
+
+The PP_INFO field should contain any piece of information that is deemed useful
+to re-generate the pseudopotential. It is not meant to contain data that is
+actually read and used. The recommanded structure is the following:
+```
+<PP_INFO>
+  Generated using XXX code v.N
+  Author: Jon Doe
+  Generation date: 32Oct1976
+  Pseudopotential type: SL|NC|1/r|US|PAW
+  Element:  Tc
+  Functional:  SLA  PW   PBX  PBC
+  Suggested minimum cutoff for wavefunctions:  N Ry
+  Suggested minimum cutoff for charge density: M Ry
+  Non-/scalar-/fully-relativistic pseudopotential
+  Local potential generation info (L, rcloc, pseudization)
+  Pseudopotential is spin-orbit/contains GIPAW data
+  Valence configuration:
+  nl, pn, l, occ, Rcut, Rcut US, E pseu
+  els(1),  nns(1),  lchi(1),  oc(1),  rcut(1),  rcutus(1),  epseu(1)
+  ...
+  els(n),  nns(n),  lchi(n),  oc(n),  rcut(n),  rcutus(n),  epseu(n)
+  Generation configuration:
+     as above, including all states used in generation
+  Pseudization used: Martins-Troullier/RRKJ
+  <PP_INPUTFILE>
+    Copy of the input file used in generation
+  </PP_INPUTFILE>
+</PP_INFO>
+```
+
+### PP_HEADER
+
+PP_HEADER contains important information, only as attributes. Structure:
+
+```
+<PP_HEADER attr1="value1" ... attrN="valueN">
+</PP_HEADER>
+```
+where
+
+| Attribute       | Meaning, allowed values |
+| ---             | ---                    |
+| generated       | Generation code (character) | 
+| author          | Author (character)          | 
+| date            | Generation date (character) | 
+| comment         | Brief description (character)| 
+| element         | A valid chemical symbol: H, He, Li, ... (character)| 
+| pseudo_type     | Type of PP (see below): NC, SL, 1/r, US, PAW (character)|
+| relativistic    | scalar, full, nonrelativistic (character)| 
+| is_ultrasoft    | T if Ultrasoft (logical) |
+| is_paw          | T if PAW       (logical) |
+| is_coulomb      | T if the PP is just a bare Coulomb potential (logical) |
+| has_so          | T if fully relativistic PP with spin-orbit terms (logical) |
+| has_wfc         | T if all-electron orbitals in field PP_FULL_WFC (logical) |
+| has_gipaw       | T if data for GIPAW reconstructions is present in PP_GIPAW (logical) |
+| paw_as_gipaw    | T if GIPAW reconstruction info is included (?) (logical) |
+| core_correction | T if non-linear core correction is included (logical)  |
+| functional      | A valid identifier for the exchange-correlation functional (max 25 characters) |
+| z_valence       | Valence charge (Z_v real) |
+| total_psenergy  | Total pseudo-valence energy of PP (real)|
+| wfc_cutoff      | Optional: suggested PW cutoff (ecutwfc) for expansion of KS orbitals (real)|
+| rho_cutoff      | Optional: suggested PW cutoff (ecutrho) for expansion of charge density (real)|
+| l_max           | Max angular momentum component present in PP (integer, 0 to 3) |
+| l_max_rho       | As above, in atomic charge density (PAW only) (integer) |
+| l_local         | Angular momentum chosen as local part (-1 if none, 0 to l_max-1) (integer)|
+| mesh_size       | Number of points (mesh) in radial grid (integer)|
+| number_of_wfc   | Number of atomic pseudo-orbitals (nwfc, see PP_PSWFC, may differ from nbeta below) (integer) |
+| number_of_proj  | Number of nonlocal projectors (nbeta, see PP_NONLOCAL) (integer) |
+
+
+Allowed values for pseudo_type:
+| Value  | Meaning  |
+| ---    | ---      |
+| NC     | Norm-Conserving PP, fully nonlocal form only     |
+| SL     | Norm-Conserving PP, nonlocal and semilocal forms available |
+| US     | Ultrasoft (Vanderbilt) PP. Implies: is_uspp="T"   |
+| 1/r    | Coulomb potential. Implies: is_coulomb="T"        |
+| PAW    | Projector-Augmented Wave set. Implies: is_paw="T" |
+
+### PP_MESH
+
+PP_MESH contains important information on the radial grid. Structure:
+```
+<PP_MESH dx="dx" mesh="mesh" xmin="xmin" rmax="rmax" zmesh="Zmesh">
+  <PP_R>
+     r(1) r(2) ...  r(mesh)
+  </PP_R>
+  <PP_RAB>
+     rab(1) rab(2) ... rab(mesh)
+  </PP_RAB>
+</PP_MESH>
+```
+Meaning of the variables:
+ - dx, mesh, xmin, rmax, Zmesh: radial grid parameters (mesh is integer,
+   all others are real numbers)
+ - r(1:mesh): radial grid points (a.u.). Typically, one of the following:
+   * $`r_i = exp(xmin) exp((i-1)*dx)/Zmesh`$ or
+   * $`r_i = exp(xmin)(exp((i-1)*dx)-1)/Zmesh`$ or simply
+   * $`r_i = (i-1)*dx`$
+- rmax=r(mesh)
+- rab(1:mesh): factor required for discrete integration, so that
+  $`\int f(r)dr = \sum_i f(i) rab(i)`$. For the three cases above:
+   * $`rab_i = r_i*dx`$,
+   * $`rab_i = (r_0+r_i)*dx`$ with $`r_0 = exp(xmin)/Zmesh`$
+   * $`rab_i = dx`$  
+
+### PP_NLCC
+
+Optional, needed only for PP with core corrections. Structure:
+```
+<PP_NLCC>
+  rho_c(1) rho_c(2) ... rho_c(mesh)
+</PP_NLCC>
+```
+Meaning of the rho_c(mesh) variable:
+- core charge for nonlinear core correction
+(pseudized but normalized as $`Z_c=\int \rho_c(r) r^2 dr d\Omega`$)
+
+### PP_LOCAL
+
+PP_LOCAL contains the local part of the PP. Structure:
+```
+<PP_LOCAL>
+   vloc(1) vloc(2) ... vloc(mesh)
+</PP_LOCAL>
+```
+Meaning of the vloc(mesh) variable:
+- local potential (Ry a.u.), sampled on the radial grid. Contains the
+  long-range term $`-Z_v e^2/r`$.
+
+### PP_SEMILOCAL
+
+Optional, for NC PP with semilocal form only. Structure:
+```
+<PP_SEMILOCAL>
+  <PP_VNL.1 L="l1" [ J="j1" ] >
+       V(1,l1) V(2,l1) ... V(mesh,l1)
+  </PP_VNL.1>
+  <PP_VNL.2 L="l2" [ J="j2" ] >
+       V(1,l2) V(2,l2) ... V(mesh,l2)
+  </PP_VNL.2>
+  ...
+</PP_SEMILOCAL>
+```
+Contains nbeta sub-fields, each one containing potential V(1:mesh,l) for the
+specified (integer) value of L. The optional attribute J (real valued) is
+present in the fully relativistic case: J=0.5 if L=0, J=L+0.5 or J=L-0.5 if L>0.
+
+### PP_NONLOCAL
+
+PP_NONLOCAL contains the nonlocal part of the PP, namely:
+- the "beta functions" (projectors) $`\beta_n(r)`$
+- the "D matrix" $`D_{ij}`$ (diagonal for NC PP)
+- augmentation terms (US and PAW only):
+  * the "q functions" $`q_{ij}(r)`$ 
+  * the multipoles, for PAW only
+  * the integrals $`Q_{ij} = 4\pi\int q_{mn}(r) r^2 dr`$.
+
+Note: for US PP, PAW, and for NC PP in the Kleinman-Bylander form,
+$`V_{NL} = \sum_{ij} |\beta_i\rangle D_ {ij}\langle\beta_j|`$.
+
+Structure:
+```
+<PP_NONLOCAL>
+  <PP_BETA.1 index="i1" angular_momentum="l" [ tot_ang_mom="j" label="Nl" ]
+             [ + optional attributes ] >
+       beta(1,i1) beta(2,i1) ... beta(mesh,i1)
+  </PP_BETA.1>
+  <PP_BETA.2 index="i2" angular_momentum="l" [ tot_ang_mom="j" label="Nl" ]
+             [ + optional attributes ] >
+       beta(1,i2) beta(2,i2) ... beta(mesh,i2)
+  </PP_BETA.2>
+  ...
+
+  <PP_DIJ>
+     d(1:nbeta,1:nbeta)
+  </PP_DIJ>
+  
+  <PP_AUGMENTATION q_with_l="q_with_l" nqf="nqf" nqlc="nqlc"
+                   [ + optional attributes ] > 
+     <PP_Q>
+        qq(1:nbeta,1:nbeta)
+     </PP_Q>
+     <PP_MULTIPOLES>
+        mom(1:nbeta,1:nbeta,0:2*l_max)
+     </PP_MULTIPOLES>
+     [ <PP_QFCOEF>
+          qfcoef(1:nqf, 1:nqlc, 1:nbeta, 1:nbeta)
+       </PP_QFCOEF>
+       <PP_RINNER>
+          rinner(1) ... rinner(nqlc)
+       </PP_RINNER>
+     ]
+     <PP_QIJL.1.1.0  composite_index="nmb" angular_momentum="l"> 
+         qfuncl(1,nmb,l) ... qfuncl(mesh,nmb,l)
+    </PP_QIJL.1.1.0>
+     <PP_QIJL.1.2.0  composite_index="nmb" angular_momentum="l">
+         qfuncl(1,nmb,l) ... qfuncl(mesh,nmb,l)
+     </PP_QIJL.1.2.0>
+        ...
+     <PP_QIJ.1.1  composite_index="nmb" > 
+         qfunc(1,nmb) ... qfunc(mesh,nmb)
+    </PP_QIJ.1.1>
+     <PP_QIJ.1.2  composite_index="nmb" >
+         qfunc(1,nmb) ... qfunc(mesh,nmb)
+     </PP_QIJ.1.2>
+        ...
+   </PP_AUGMENTATION>
+</PP_NONLOCAL>
+```
+| Variable  | Physical meaning |
+| ---       | ---              |
+| beta(i,j) |  $`\beta_j(r_i)`$ (beta functions or projectors)|
+| d(i,j)    |  $`D_{ij}`$ (D matrix)     |
+| qq(i,j)   |  $`Q_{ij}`$ integrals: $`Q_{ij} = 4\pi\int q_{ij}(r) r^2 dr`$ |
+| mom(i,j,l)|  ??? |
+| qfcoef(n,l,i,j)| Small-radius expansion coefficients of q functions|
+| rinner(l) | q functions are pseudized for $`r < r_{inner}`$|
+| qfuncl(n,ij,l) | q functions decomposed into multipoles, if q_with_l="T" (ij is a composite index)|
+| qfunc(n,ij) | q functions $`q_{ij}(r_n)`$, if q_with_l="F" (ij is a composite index)|
+
+qfcoef and rinner are to be considered obsolescent: they follow the convention
+of the US PP code of David Vanderbilt. If nqf=0 (see below) qfcoef and rinner are not read.
+
+| Tag       | Attribute       | Meaning, allowed values |
+| ---       | ---             | ---                     |
+| PP_BETA.N | index           | Second beta functions index (integer, 1 to nbeta)|
+|           | angular_momentum| Angular momentum L (integer, 0 to l_max)   |
+|	    | tot_ang_mom     | Total angular momentum J for fully relativistic case (real, J=0.5 if L=0, J=L+0.5 or J=L-0.5 if L>0) |
+|	    | label           | Label for this beta function (character, e.g. 4S) |
+|           | cutoff_radius          | Beta function is zero beyond cutoff_radius (real)|
+|	    | cutoff_radius_index    | Index of cutoff_radius in the grid (integer)|
+|           | ultrasoft_cutoff_radius| Optional: used during PP generation |
+| PP_AUGMENTATION | q_with_l | T if q functions are decomposed into angular momentum components (logical)|
+|                 | nqf      | Number of expansion coefficients for q functions (integer, may be zero) |
+|                 | nqlc     | Number of angular momenta terms in q functions (integer, may be zero) |
+|                 | shape    | PAW only: Shape of augmentation function (PSQ or GAUSS or BESSEL, character) |
+|                 | cutoff_r | PAW only: q functions zero beyond cutoff_r (real) |
+|                 | cutoff_r_index | PAW only: Index of cutoff_r in the grid (integer)|
+|                 | augmentation_epsilon | PAW only: obscure parameter used during generation (real) |
+|		  | l_max_aug | PAW only: Max value of L appearing in q functions (integer) |
+
+A note on units: the beta functions and D matrix are defined as in Vanderbilt’s
+US PP code and should have Bohr^{-1/2} and Ry units, respectively.
+Since they enter the calculation only as $`\beta D\beta`$, one might as well
+have "dion" in Ry^{-1} units and "beta" in Ry*Bohr^{-1/2} units, in line with
+what suggested by the Kleinman-Bylader transformation. Some converters actually
+do exacrtly that.
+
+***FIXME***: qfunc is $`q(r)`$ or $`r^2 q(r)`$ ?
+
+### PP_PSWFC
+
+PP_PSWFC (optional but strongly recommanded) contains nwfc atomic
+pseudo-orbitals for some reference atomic configuration, typically
+the ground state.
+
+```
+<PP_PSWFC>
+  <PP_CHI.1 index="i1" label="Nl" l="l" n="N" occupation="2.0"
+      [ pseudo_energy=e1" cutoff_radius="r1" ultrasoft_cutoff_radius="r1" ] >
+      chi(1,i1) chi(2,i1) ...  chi(mesh,i1)
+  </PP_CHI.1>
+  <PP_CHI.2 index="i2" label="Nl" l="l" n="N" occupation="4.0"
+      [ pseudo_energy=e2" cutoff_radius="r2" ultrasoft_cutoff_radius="r2" ] >
+      chi(1,i2) chi(2,i2) ...  chi(mesh,i2)
+  </PP_CHI.1>
+  ..........
+</PP_PSWFC>
+```
+Meaning of the variables:
+ - chi(1:mesh,i): i-th pseudo-atomic orbital $`\chi_i(r)=rR_i(r)`$,
+ radial part of the KS equation, multiplied by r
+ - i=1,...,nwfc defined in PP_HEADER as number_of_wfc; mesh in PP_MESH
+
+Meaning of the attributes:
+ - index: Second wavefunction index (integer, 1 to nwfc)|
+ - l: Angular momentum L (integer, 0 to l_max)
+ - n: Principal quantum number N
+ - label: Label (e.g., 4S, 4P) for this wavefunction (character)|
+ - pseudo_energy: eigenvalue in eV (real)|
+ - cutoff_radius: used for pseudopotential generation (real)
+ - ultrasoft_cutoff_radius: as above, for USPP; optional
+
+### PP_FULL_WFC
+
+PP_FULL_WFC (optional) contains nwfc atomic all-electron orbitals
+for the same reference atomic configuration of PP_PSWFC
+
+```
+<PP_FULL_WFC number_of_wfc="nwfc">
+  <PP_AEWFC.1 index="i1" label="Nl" l="l1" >
+      aewfc(1,i1) aewfc(2,i1) ...  aewfc(mesh,i1)
+  </PP_AEWFC.1>
+  <PP_AEWFC.2 index="i2" label="Nl" l="l2"  >
+      aewfc(1,i2) aewfc(2,i2) ...  aewfc(mesh,i2)
+  </PP_AEWFC.2>
+  ..........
+  Moreover, for the fully relativistic case:
+  <PP_AEWFC_REL.1 index="i1" label="Nl" l="l1" j="j1">
+      aewfc_rel(1,i1) aewfc_rel(2,i1) ...  aewfc_rel(mesh,i1)
+  </PP_AEWFC_REL.1>
+  <PP_AEWFC_REL.2 index="i2" label="Nl" l="l2"  j="j2">
+      aewfc_rel(1,i2) aewfc_rel(2,i2) ...  aewfc_rel(mesh,i2)
+  </PP_AEWFC_REL.2>
+  
+</PP_FULL_WFC>
+```
+Meaning of the variables:  ***FIXME***: what are they exactly?
+ - aewfc(1:mesh,i): i-th atomic orbital
+ - aewfc_rel(1:mesh,i): as above, fully relativistic case
+ 
+Meaning of the attributes:
+ - index: Second wavefunction index (integer, 1 to nwfc)|
+ - l: Angular momentum L (integer, 0 to l_max)
+ - j: (fully relativistic case) total angular momentum l-1/2 or l+1/2
+ - label: Label (e.g., 4S, 4P) for this wavefunction (character)|
+
+### PP_RHOATOM
+
+```
+<PP_RHOATOM>
+   rho_a(1) rho_a(2) ... rho_a(mesh)
+</PP_RHOATOM>
+```
+Meaning of variable rho_a(1:mesh): radial atomic (pseudo-)charge,
+multiplied by $`4\pi r^2`$ (beware!).
+
+### PP_PAW
+
+If a PAW dataset is contained in the UPF file then the additional tag
+<PP_PAW> is present; it contains the fields
+- PP_OCCUPATIONS
+- PP_AE_NLCC
+- PP_AE_VLOC
+
+```
+<PP_OCCUP>
+   do nb = 1,nbeta
+      occ(nb)
+   end do
+</PP_OCCUP>
+```
+Occupations of atomic orbitals.
+
+```
+<PP_AE_NLCC>
+    aeccharg(k), k = 1,mesh
+</PP_AE_NLCC>
+```
+All-electron atomic density on the radial grid.
+
+```
+<PP_AE_VLOC>
+   do nb = 1,nbeta
+      ae_vloc(k), k = 1,mesh
+   end do
+</PP_AE_VLOC>
+```
+All-electron local potential
+
+### GIPAW
+
+GIPAW additional data is necessary to reconstruct all-electron charge density
+using the gipaw.x code
+
+```
+<GIPAW_CORE_ORBITALS>
+    n_core_orbitals "number of core orbitals"
+    <GIPAW_CORE_ORBITAL>
+       n, l  "orbital n and l quantum numbers"
+       core_orbital(k), k = 1,mesh
+    </GIPAW_CORE_ORBITAL>
+    ... (Repeated for each core orbital)
+</GIPAW_CORE_ORBITALS>
+```
+Core orbitals.
+
+```
+<GIPAW_LOCAL_DATA>
+   <GIPAW_VLOCAL_AE>
+      vlocal_ae(k), k = 1,mesh
+   </GIPAW_VLOCAL_AE>
+   <GIPAW_VLOCAL_PS>
+      vlocal_ps(k), k = 1,mesh
+   </GIPAW_VLOCAL_PS>
+</GIPAW_LOCAL_DATA>
+```
+All electron and pseudo local potentials, sampled on the radial grid.
+
+```
+<GIPAW_ORBITALS>
+   <GIPAW_AE_ORBITAL>
+         el(nb), ll(nb)
+         wfs_ae(k,nb), k = 1, mesh
+   </GIPAW_AE_ORBITAL>
+   <GIPAW_PS_ORBITAL>
+         rcut(nb), rcutus(nb)
+         wfs_ae(k,nb), k = 1, mesh
+   </GIPAW_PS_ORBITAL>
+   ... (Repeated for each valence orbital)
+</GIPAW_ORBITALS>
+```
+ - el: principal quantum number (0,1,2..)
+ - ll: angular momentum quantum number
+ - rcut: inner cutof radius (a.u.)
+ - rcutus: outer cutoff radius (a.u.)
+ - wfc_ae: all-electron wavefunction sample on radial grid
+ - wfc_ps: pseudo wavefunction sample on radial grid
+

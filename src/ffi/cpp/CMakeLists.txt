@@ -1,0 +1,1796 @@
+cmake_minimum_required(VERSION 3.22)
+
+# ============================================================================
+# THE one FFI build entry point — both platform legs of LORRAX's FFI live
+# behind this file (layout: docs/architecture/ffi_layout.md):
+#
+#   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=cuda ...  -> liblorrax_ffi.so
+#       (the complete NVIDIA stack: cuSOLVERMp/cuBLASMp/cuBLAS/cuFFT/NVRTC/NCCL,
+#        + phdf5; entry scripts: build.sh, the lorrax_A runtime recipe)
+#   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=rocm ...  -> liblorrax_ffi_rocm.so
+#       (the AMD device leg: the shared device families over the HIP runtime,
+#        phdf5 so far; entry script: config/frontier/build_ffi_rocm.sh)
+#   cmake -S src/ffi/cpp -DLORRAX_FFI_PLATFORM=host ...  -> liblorrax_ffi_host.so
+#       (CUDA-free by construction: phdf5 + ScaLAPACK + FFTW3-ABI FFT + CBLAS GEMM + SLATE
+#        gpu_backend=none; entry scripts: build_host.sh,
+#        config/frontera/build_ffi_host.sh)
+#
+# The selector is EXPLICIT and refuses when unset (announce-or-refuse): the
+# old scheme selected the leg by which directory cmake was pointed at, an
+# implicit dial.  Both legs register the same jax.ffi target names under
+# different C++ symbols — see src/ffi/common/ffi_loader.py.
+# ============================================================================
+set(LORRAX_FFI_PLATFORM "" CACHE STRING
+    "Which FFI library to configure: cuda | host | rocm (REQUIRED, no default)")
+
+if(LORRAX_FFI_PLATFORM STREQUAL "cuda")
+# ============================== CUDA leg ====================================
+project(lorrax_ffi LANGUAGES C CXX)
+
+# Open MPI's mpi.h emits references to the deprecated MPI C++ bindings
+# (libmpi_cxx) unless told not to; nothing links them, so a phdf5-bearing
+# .so built over Open MPI dies at dlopen with
+# `undefined symbol: _ZN3MPI8Datatype4FreeEv` (measured, Ubuntu 24.04
+# OpenMPI 4.1, config/cloud bring-up 2026-08-26).  A no-op macro on every
+# other MPI (Cray MPICH, Intel MPI, MPICH proper define no such guard use).
+add_compile_definitions(OMPI_SKIP_MPICXX=1)
+
+# ----------------------------------------------------------------------------
+# Options / paths
+# ----------------------------------------------------------------------------
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# ----------------------------------------------------------------------------
+# Optional-target switches, both default ON:
+#   -DLORRAX_FFI_HAVE_CAL=OFF     cuSOLVERMp >= 0.7 is NCCL-native and needs
+#                                 no CAL (libcal / cal.h absent from the pip
+#                                 wheels).  OFF drops the cal.h include, the
+#                                 CAL->NCCL shim, the pre-0.7 CAL comm path,
+#                                 and the libcal link; the NCCL comm path
+#                                 (create_context, ensure_cublasmp) passes
+#                                 ncclComm_t directly.
+#   -DLORRAX_FFI_HAVE_PHDF5=OFF   drop the phdf5 subpackage (no parallel HDF5
+#                                 / MPI at build time).  The cusolverMp /
+#                                 cuBLASMp distributed-linalg targets still
+#                                 build; ffi_loader.py skips the absent
+#                                 phdf5 handler symbols.
+option(LORRAX_FFI_HAVE_CAL   "Build the CAL (<=0.6.x cuSOLVERMp) comm path"      ON)
+option(LORRAX_FFI_HAVE_PHDF5 "Build the phdf5 subpackage (needs parallel HDF5)" ON)
+# The CUDA leg is the complete NVIDIA stack (owner, 2026-09-25): nvcc, cuBLAS,
+# cuBLASMp, cuSOLVERMp, cuFFT and NVRTC; nvidia-mathdx is a run-time wheel,
+# checked at startup (GATE mathdx-headers).  No partial CUDA leg is built: the
+# former switches LORRAX_FFI_HAVE_CUBLASMP and LORRAX_FFI_HAVE_CUFFT refuse
+# OFF by name, and a missing cuFFT or NVRTC is a FATAL_ERROR at configure.
+foreach(_lrx_retired LORRAX_FFI_HAVE_CUBLASMP LORRAX_FFI_HAVE_CUFFT)
+    if(DEFINED ${_lrx_retired} AND NOT ${_lrx_retired})
+        message(FATAL_ERROR
+            "${_lrx_retired}=OFF: got a request for a partial CUDA leg; want the "
+            "complete stack (nvcc, cuBLAS, cuBLASMp, cuSOLVERMp, cuFFT, NVRTC); "
+            "fix: drop -D${_lrx_retired}=OFF, or build the CPU leg with "
+            "-DLORRAX_FFI_PLATFORM=host")
+    endif()
+endforeach()
+set(LORRAX_FFI_HAVE_CUBLASMP ON)
+set(LORRAX_FFI_HAVE_CUFFT ON)
+
+# ----------------------------------------------------------------------------
+# CUDA language (for the .cu translation units compiled by nvcc).
+# CMAKE_CUDA_COMPILER defaults to /usr/local/cuda's nvcc when that exists, so
+# it matches the toolkit whose headers/runtime the C++ TUs use.
+# Architectures: SASS for sm_80, 86, 89, 90, 100 and 120 (A100/A30, GA10x,
+# AD10x, H100/H200, B200, GB20x; a minor revision of one of these runs its
+# major's SASS), plus compute_80 and compute_120 PTX, which the driver
+# JIT-compiles on a device with no matching SASS (sm_110; anything newer).
+# The NVRTC kernels are not affected: they compile for the device's own
+# sm_<cc> at run time.
+# ----------------------------------------------------------------------------
+# Set the targets before enable_language(CUDA): CMake otherwise probes
+# nvcc and seeds its cache with the compiler's default, after which a
+# post-enable ``NOT DEFINED`` check is already too late.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "80;86-real;89-real;90-real;100-real;120" CACHE STRING
+        "CUDA architectures of the nvcc TUs: SASS sm_80..sm_120, PTX compute_80 and compute_120")
+endif()
+if(NOT DEFINED CMAKE_CUDA_COMPILER)
+    if(EXISTS "/usr/local/cuda/bin/nvcc")
+        set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+    endif()
+endif()
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# ----------------------------------------------------------------------------
+#  Locate cuSOLVERMp + libcal.  BGW-style: prefer -D options, else env vars,
+#  else well-known paths.  See docs/installation/ffi-build.md for per-site notes.
+# ----------------------------------------------------------------------------
+set(NVHPC_ROOT "" CACHE PATH
+    "Explicit NVHPC root (leave empty to autodetect from env vars and standard paths)")
+set(NVHPC_CUDA_SUBDIR "" CACHE STRING
+    "CUDA minor version string inside NVHPC math_libs (e.g. 12.9); empty = newest present")
+set(CUSOLVERMP_INCLUDE_DIR "" CACHE PATH
+    "Alternative: explicit directory containing cusolverMp.h + cal.h")
+set(CUSOLVERMP_LIB_DIR "" CACHE PATH
+    "Alternative: explicit directory containing libcusolverMp.so + libcal.so")
+
+# Autodetection ladder — first match wins:
+#   (a) explicit CUSOLVERMP_{INCLUDE,LIB}_DIR                (override)
+#   (b) explicit NVHPC_ROOT
+#   (c) $NVHPC_ROOT / $HPCSDK_ROOT / $NVHPC_SDK_PATH env vars
+#   (d) /opt/nvidia/hpc_sdk/... or /lorrax_nvhpc/...
+#   (e) CUDA Toolkit layout (CUDA 12.8+ standalone cuda-cusolvermp-12-X pkg)
+
+if(CUSOLVERMP_INCLUDE_DIR AND CUSOLVERMP_LIB_DIR)
+    set(CUSOLVERMP_INCLUDE "${CUSOLVERMP_INCLUDE_DIR}")
+    set(CUSOLVERMP_LIBDIR  "${CUSOLVERMP_LIB_DIR}")
+    message(STATUS "cuSOLVERMp: using explicit paths from CUSOLVERMP_{INCLUDE,LIB}_DIR")
+else()
+    # (b, c) env vars
+    if(NOT NVHPC_ROOT)
+        foreach(_envvar NVHPC_ROOT HPCSDK_ROOT NVHPC_SDK_PATH)
+            if(DEFINED ENV{${_envvar}} AND IS_DIRECTORY "$ENV{${_envvar}}")
+                set(NVHPC_ROOT "$ENV{${_envvar}}")
+                message(STATUS "cuSOLVERMp: NVHPC_ROOT from \$${_envvar} = ${NVHPC_ROOT}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    # (d) common NVHPC install locations
+    if(NOT NVHPC_ROOT)
+        file(GLOB _nvhpc_candidates
+            "/opt/nvidia/hpc_sdk/Linux_x86_64/*"
+            "/lorrax_nvhpc/*"                        # Shifter bind-mount target
+            "/usr/local/nvhpc/Linux_x86_64/*")
+        list(SORT _nvhpc_candidates ORDER DESCENDING)  # newest first
+        foreach(_c ${_nvhpc_candidates})
+            if(EXISTS "${_c}/math_libs")
+                set(NVHPC_ROOT "${_c}")
+                message(STATUS "cuSOLVERMp: NVHPC_ROOT autodetected = ${NVHPC_ROOT}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(NVHPC_ROOT)
+        # Pick CUDA subdir under NVHPC_ROOT (newest present with cusolverMp.h)
+        if(NOT NVHPC_CUDA_SUBDIR)
+            file(GLOB _cuda_vers RELATIVE "${NVHPC_ROOT}/math_libs" "${NVHPC_ROOT}/math_libs/*")
+            list(SORT _cuda_vers ORDER DESCENDING)
+            foreach(_v ${_cuda_vers})
+                if(EXISTS "${NVHPC_ROOT}/math_libs/${_v}/targets/x86_64-linux/include/cusolverMp.h")
+                    set(NVHPC_CUDA_SUBDIR "${_v}")
+                    message(STATUS "cuSOLVERMp: CUDA subdir autodetected = ${NVHPC_CUDA_SUBDIR}")
+                    break()
+                endif()
+            endforeach()
+        endif()
+        if(NOT NVHPC_CUDA_SUBDIR)
+            message(FATAL_ERROR
+                "cuSOLVERMp: no usable CUDA subdir found under ${NVHPC_ROOT}/math_libs/")
+        endif()
+        set(CUSOLVERMP_INCLUDE
+            "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/targets/x86_64-linux/include")
+        set(CUSOLVERMP_LIBDIR
+            "${NVHPC_ROOT}/math_libs/${NVHPC_CUDA_SUBDIR}/lib64")
+    else()
+        # (e) CUDA Toolkit layout — CUDA 12.8+ ships `cuda-cusolvermp-12-X`
+        # as a standalone package that installs into the toolkit tree
+        # right next to the single-GPU cuSOLVER.
+        foreach(_cuda_root "/usr/local/cuda" "/usr/local/cuda-12.9"
+                          "/usr/local/cuda-12.8")
+            set(_inc "${_cuda_root}/targets/x86_64-linux/include/cusolverMp.h")
+            set(_lib "${_cuda_root}/targets/x86_64-linux/lib/libcusolverMp.so")
+            if(EXISTS "${_inc}" AND EXISTS "${_lib}")
+                set(CUSOLVERMP_INCLUDE "${_cuda_root}/targets/x86_64-linux/include")
+                set(CUSOLVERMP_LIBDIR  "${_cuda_root}/targets/x86_64-linux/lib")
+                message(STATUS "cuSOLVERMp: found alongside CUDA Toolkit at ${_cuda_root}")
+                break()
+            endif()
+        endforeach()
+    endif()
+
+    if(NOT CUSOLVERMP_INCLUDE OR NOT CUSOLVERMP_LIBDIR)
+        message(FATAL_ERROR
+            "cusolverMp.h not found.  Pass one of:\n"
+            "  -DNVHPC_ROOT=<dir with math_libs/>\n"
+            "  -DCUSOLVERMP_INCLUDE_DIR=<dir with cusolverMp.h> "
+            "-DCUSOLVERMP_LIB_DIR=<dir with libcusolverMp.so>\n"
+            "or set \$NVHPC_ROOT / \$HPCSDK_ROOT, or install "
+            "cuda-cusolvermp-12-X.  See docs/installation/ffi-build.md.")
+    endif()
+endif()
+
+if(NOT EXISTS "${CUSOLVERMP_INCLUDE}/cusolverMp.h")
+    message(FATAL_ERROR
+        "cusolverMp.h not found at ${CUSOLVERMP_INCLUDE}/.\n"
+        "See docs/installation/ffi-build.md for where cuSOLVERMp usually lives and how "
+        "to point the build at it on a new cluster.")
+endif()
+if(NOT EXISTS "${CUSOLVERMP_LIBDIR}/libcusolverMp.so")
+    message(FATAL_ERROR
+        "libcusolverMp.so not found at ${CUSOLVERMP_LIBDIR}/.")
+endif()
+
+# ----------------------------------------------------------------------------
+# Python (for jax.ffi.include_dir)
+# ----------------------------------------------------------------------------
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c
+        "import jax.ffi, sys; d = jax.ffi.include_dir(); sys.stdout.write(d if isinstance(d, str) else d.decode())"
+    OUTPUT_VARIABLE JAX_FFI_INCLUDE_DIR
+    RESULT_VARIABLE _jax_status
+    ERROR_VARIABLE  _jax_stderr)
+if(NOT _jax_status EQUAL 0 OR NOT JAX_FFI_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "Could not locate jax.ffi.include_dir(): ${_jax_stderr}")
+endif()
+message(STATUS "JAX FFI headers: ${JAX_FFI_INCLUDE_DIR}")
+
+# ----------------------------------------------------------------------------
+# CUDA / NCCL — use the container's (not HPC SDK's)
+# ----------------------------------------------------------------------------
+set(CUDA_TOOLKIT_ROOT "/usr/local/cuda" CACHE PATH "Container CUDA toolkit root")
+if(NOT EXISTS "${CUDA_TOOLKIT_ROOT}/include/cuda_runtime.h")
+    message(FATAL_ERROR
+        "cuda_runtime.h not at ${CUDA_TOOLKIT_ROOT}/include/. "
+        "Set -DCUDA_TOOLKIT_ROOT if building outside the NVIDIA JAX container.")
+endif()
+
+# ----------------------------------------------------------------------------
+#  ABI sanity check: CUDA toolkit (the one JAX links against at runtime)
+#  must be compatible with the CUDA subdir under NVHPC where we found
+#  cusolverMp.  Major version mismatch → guaranteed ABI breakage.  Minor
+#  mismatch → usually OK within 12.X, but worth a warning.
+# ----------------------------------------------------------------------------
+if(EXISTS "${CUDA_TOOLKIT_ROOT}/version.json")
+    file(READ "${CUDA_TOOLKIT_ROOT}/version.json" _cuda_ver_json)
+    string(REGEX MATCH "\"cuda\"[^{]*{[^\"]*\"version\"[ :]*\"([0-9]+\\.[0-9]+)" _ _cuda_ver_json)
+    if(CMAKE_MATCH_1)
+        set(TOOLKIT_CUDA_VERSION "${CMAKE_MATCH_1}")
+    endif()
+endif()
+if(NOT TOOLKIT_CUDA_VERSION AND EXISTS "${CUDA_TOOLKIT_ROOT}/bin/nvcc")
+    execute_process(COMMAND "${CUDA_TOOLKIT_ROOT}/bin/nvcc" --version
+                    OUTPUT_VARIABLE _nvcc_out OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string(REGEX MATCH "release ([0-9]+\\.[0-9]+)" _ "${_nvcc_out}")
+    if(CMAKE_MATCH_1)
+        set(TOOLKIT_CUDA_VERSION "${CMAKE_MATCH_1}")
+    endif()
+endif()
+
+if(TOOLKIT_CUDA_VERSION AND NVHPC_CUDA_SUBDIR)
+    string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" _ "${TOOLKIT_CUDA_VERSION}")
+    set(_tk_major "${CMAKE_MATCH_1}")
+    set(_tk_minor "${CMAKE_MATCH_2}")
+    string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" _ "${NVHPC_CUDA_SUBDIR}")
+    set(_hp_major "${CMAKE_MATCH_1}")
+    set(_hp_minor "${CMAKE_MATCH_2}")
+    if(_tk_major AND _hp_major AND NOT "${_tk_major}" STREQUAL "${_hp_major}")
+        message(FATAL_ERROR
+            "CUDA major-version mismatch:\n"
+            "  toolkit (${CUDA_TOOLKIT_ROOT}) = ${TOOLKIT_CUDA_VERSION}\n"
+            "  NVHPC math_libs subdir        = ${NVHPC_CUDA_SUBDIR}\n"
+            "libcusolverMp.so is ABI-incompatible across CUDA major "
+            "versions.  Use an NVHPC install built against CUDA "
+            "${_tk_major}.x, or bump the container's CUDA.")
+    elseif(_tk_minor AND _hp_minor AND NOT "${_tk_minor}" STREQUAL "${_hp_minor}")
+        message(WARNING
+            "CUDA minor-version mismatch — toolkit ${TOOLKIT_CUDA_VERSION} "
+            "vs NVHPC math_libs ${NVHPC_CUDA_SUBDIR}.  Usually OK within "
+            "12.X (forward compatibility), but test before shipping.")
+    endif()
+    message(STATUS "CUDA toolkit version: ${TOOLKIT_CUDA_VERSION} "
+                   "(NVHPC math_libs: ${NVHPC_CUDA_SUBDIR}) — compatible")
+endif()
+
+set(NCCL_INCLUDE "/usr/include" CACHE PATH "Directory containing nccl.h")
+if(NOT EXISTS "${NCCL_INCLUDE}/nccl.h")
+    # Try the HPC SDK one as a fallback
+    set(NCCL_INCLUDE
+        "${NVHPC_ROOT}/comm_libs/${NVHPC_CUDA_SUBDIR}/nccl/include")
+endif()
+if(NOT EXISTS "${NCCL_INCLUDE}/nccl.h")
+    message(FATAL_ERROR "nccl.h not found; pass -DNCCL_INCLUDE=<path>.")
+endif()
+
+# Toolkit lib dir spellings, all real: lib64 (container/NVHPC installs),
+# targets/x86_64-linux/lib (CUDA toolkit trees), and plain lib — the pip
+# nvidia wheels' layout (site-packages/nvidia/cu13/lib), which the
+# config/cloud lane points CUDA_TOOLKIT_ROOT at directly.
+find_library(CUDART_LIBRARY cudart
+    PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+          "${CUDA_TOOLKIT_ROOT}/lib"
+    NO_DEFAULT_PATH)
+find_library(CUSOLVER_LIBRARY cusolver
+    PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+          "${CUDA_TOOLKIT_ROOT}/lib"
+    NO_DEFAULT_PATH)
+get_filename_component(_single_gpu_math_dir "${CUSOLVER_LIBRARY}" DIRECTORY)
+find_library(CUBLAS_LIBRARY cublas
+    PATHS "${_single_gpu_math_dir}" "${CUDA_TOOLKIT_ROOT}/lib64"
+          "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib" "${CUDA_TOOLKIT_ROOT}/lib"
+    NO_DEFAULT_PATH)
+if(NOT CUBLAS_LIBRARY)
+    message(FATAL_ERROR "libcublas (single-GPU active subspace) not found")
+endif()
+if(NOT CUSOLVER_LIBRARY)
+    message(FATAL_ERROR "libcusolver (single-GPU) not found")
+endif()
+find_library(NCCL_LIBRARY nccl
+    PATHS "/lib/x86_64-linux-gnu" "/usr/lib/x86_64-linux-gnu"
+          "${NVHPC_ROOT}/comm_libs/${NVHPC_CUDA_SUBDIR}/nccl/lib"
+    NO_DEFAULT_PATH)
+if(NOT CUDART_LIBRARY)
+    message(FATAL_ERROR "libcudart not found")
+endif()
+if(NOT NCCL_LIBRARY)
+    message(FATAL_ERROR "libnccl not found")
+endif()
+
+# ----------------------------------------------------------------------------
+#  cuFFT + NVRTC — for the mathdx k-convolution family (NVRTC) and the
+#  Fourier plan (cuFFT, NVRTC).  Required: the CUDA leg is the complete stack.
+# ----------------------------------------------------------------------------
+set(LORRAX_CUFFT_ON 0)
+if(LORRAX_FFI_HAVE_CUFFT)
+    find_library(CUFFT_LIBRARY cufft
+        PATHS "${CUDA_TOOLKIT_ROOT}/lib64"
+              "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+              "${CUDA_TOOLKIT_ROOT}/lib"
+        NO_DEFAULT_PATH)
+    find_library(NVRTC_LIBRARY nvrtc
+        PATHS "${CUDA_TOOLKIT_ROOT}/lib64"
+              "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
+              "${CUDA_TOOLKIT_ROOT}/lib"
+        NO_DEFAULT_PATH)
+    find_path(CUFFT_INCLUDE_DIR cufft.h
+        PATHS "${CUDA_TOOLKIT_ROOT}/include"
+              "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+        NO_DEFAULT_PATH)
+    find_path(NVRTC_INCLUDE_DIR nvrtc.h
+        PATHS "${CUDA_TOOLKIT_ROOT}/include"
+              "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+        NO_DEFAULT_PATH)
+    if(CUFFT_LIBRARY AND NVRTC_LIBRARY AND CUFFT_INCLUDE_DIR AND NVRTC_INCLUDE_DIR)
+        set(LORRAX_CUFFT_ON 1)
+        message(STATUS "cufft: mathdx k-convolution family and Fourier plan ON "
+                       "(${CUFFT_LIBRARY}; nvrtc=${NVRTC_LIBRARY})")
+    else()
+        message(FATAL_ERROR
+            "cufft: got cufft.h=${CUFFT_INCLUDE_DIR} lib=${CUFFT_LIBRARY} "
+            "nvrtc.h=${NVRTC_INCLUDE_DIR} libnvrtc=${NVRTC_LIBRARY} under "
+            "${CUDA_TOOLKIT_ROOT}; want all four (the CUDA leg is the complete "
+            "stack: the k-convolution family and the Fourier plan need them); "
+            "fix: point -DCUFFT_LIBRARY/-DCUFFT_INCLUDE_DIR/-DNVRTC_LIBRARY/"
+            "-DNVRTC_INCLUDE_DIR (or CUDA_TOOLKIT_ROOT) at the toolkit")
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
+#  Parallel HDF5 + MPI — for the ffi.phdf5 subpackage.  Gated on
+#  LORRAX_FFI_HAVE_PHDF5 so a port without parallel HDF5 / MPI (e.g. an
+#  eigh-only cuSOLVERMp build) can skip the whole probe.
+# ----------------------------------------------------------------------------
+if(LORRAX_FFI_HAVE_PHDF5)
+# Default stage dir (bind-mounted by run_shifter.sh).  Callers can
+# override with -DHDF5_ROOT=... or $HDF5_ROOT / $HDF5_DIR env vars,
+# which CMake's find_package(HDF5) honours natively.
+if(NOT DEFINED HDF5_ROOT AND NOT DEFINED ENV{HDF5_ROOT} AND NOT DEFINED ENV{HDF5_DIR})
+    if(IS_DIRECTORY "/lorrax_phdf5/lib")
+        set(HDF5_ROOT "/lorrax_phdf5" CACHE PATH
+            "Root of parallel HDF5 install (bind-mounted stage by default)")
+        message(STATUS "HDF5: using bind-mounted stage at /lorrax_phdf5")
+    endif()
+endif()
+
+set(HDF5_PREFER_PARALLEL ON)
+find_package(HDF5 COMPONENTS C REQUIRED)
+if(NOT HDF5_IS_PARALLEL)
+    message(FATAL_ERROR
+        "HDF5 found at ${HDF5_INCLUDE_DIRS} is NOT built with MPI-IO.\n"
+        "Load a parallel module (cray-hdf5-parallel, hdf5/1.14-openmpi, ...)\n"
+        "or set HDF5_ROOT / -DHDF5_DIR=... to a parallel install.\n"
+        "See docs/installation/ffi-build.md for per-site notes.")
+endif()
+message(STATUS "HDF5: ${HDF5_VERSION} at ${HDF5_INCLUDE_DIRS} (parallel)")
+
+# MPI — we do NOT use find_package(MPI) because the NVIDIA JAX
+# container ships HPC-X OpenMPI at /opt/hpcx/ompi, so mpicc would be
+# OpenMPI regardless of which MPI ABI the staged HDF5 was built
+# against.  run_shifter.sh picks a stack (LORRAX_PHDF5_MPI_STACK =
+# openmpi | mpich) and exports LORRAX_MPI_INCLUDE_DIR + LORRAX_MPICH_LIB_DIR
+# pointing at the right paths inside the container.  Either env var
+# can also be set directly (-DLORRAX_MPI_INCLUDE_DIR=, etc.).
+if(NOT DEFINED LORRAX_MPI_INCLUDE_DIR AND DEFINED ENV{LORRAX_MPI_INCLUDE_DIR})
+    set(LORRAX_MPI_INCLUDE_DIR "$ENV{LORRAX_MPI_INCLUDE_DIR}" CACHE PATH "MPI header dir")
+endif()
+if(NOT DEFINED LORRAX_MPI_INCLUDE_DIR)
+    # Last-ditch: look for mpi.h next to HDF5 headers (Cray stage layout).
+    find_path(LORRAX_MPI_INCLUDE_DIR mpi.h
+        HINTS "${HDF5_INCLUDE_DIRS}" "/opt/hpcx/ompi/include"
+        NO_DEFAULT_PATH)
+endif()
+if(NOT LORRAX_MPI_INCLUDE_DIR OR NOT EXISTS "${LORRAX_MPI_INCLUDE_DIR}/mpi.h")
+    message(FATAL_ERROR
+        "mpi.h not found.  Set LORRAX_MPI_INCLUDE_DIR (run_shifter.sh "
+        "does this automatically via LORRAX_PHDF5_MPI_STACK).")
+endif()
+
+if(NOT DEFINED LORRAX_MPICH_LIB_DIR AND DEFINED ENV{LORRAX_MPICH_LIB_DIR})
+    set(LORRAX_MPICH_LIB_DIR "$ENV{LORRAX_MPICH_LIB_DIR}" CACHE PATH "MPI runtime lib dir")
+endif()
+if(NOT DEFINED LORRAX_MPICH_LIB_DIR)
+    # Default chases the OpenMPI path (verified default) so bare cmake
+    # runs inside a shifter-gpu container still find something.  This is
+    # ONLY appropriate for the LORRAX_PHDF5_MPI_STACK=openmpi build path;
+    # on Cray/MPICH sites it produces DT_NEEDED libmpi.so.40 which can't
+    # be resolved at runtime under --module=mpich (see KNOWN_SANDBOX_ERRORS
+    # 2026-05-10).  build.sh refuses to run if LORRAX_MPICH_LIB_DIR is
+    # unset; cmake-by-hand callers should pass -DLORRAX_MPICH_LIB_DIR=...
+    # explicitly.
+    message(WARNING
+        "LORRAX_MPICH_LIB_DIR not set — falling back to /opt/hpcx/ompi/lib "
+        "(HPC-X OpenMPI).  This is correct only for the OpenMPI build "
+        "path; on Cray/MPICH sites invoke build.sh via run_shifter.sh so "
+        "LORRAX_MPICH_LIB_DIR=/opt/udiImage/modules/mpich is exported.")
+    set(LORRAX_MPICH_LIB_DIR "/opt/hpcx/ompi/lib" CACHE PATH "MPI runtime lib dir")
+endif()
+# NOTE on SONAME resolution: cmake's find_library follows the libmpi.so
+# symlink, and the linker records the target's SONAME as DT_NEEDED.  On
+# Cray Perlmutter the symlink chain inside the container is
+#   /opt/udiImage/modules/mpich/libmpi.so → libmpi_gnu_91.so.12.0.0
+# with SONAME `libmpi_gnu_91.so.12`, so the FFI ends up with DT_NEEDED
+# libmpi_gnu_91.so.12 — the actual Cray MPICH ABI tag.  HDF5's own
+# DT_NEEDED is `libmpi_gnu_123.so.12` (a filename alias provided by the
+# Cray phdf5 stage); the staged dir contains a symlink mapping that
+# filename onto the same MPICH library, so both resolve to one process-
+# global libmpi.
+find_library(LORRAX_MPI_LIBRARY
+    NAMES mpi
+    HINTS "${LORRAX_MPICH_LIB_DIR}"
+    NO_DEFAULT_PATH)
+if(NOT LORRAX_MPI_LIBRARY)
+    message(FATAL_ERROR
+        "libmpi not found in ${LORRAX_MPICH_LIB_DIR}.")
+endif()
+message(STATUS "MPI:  include=${LORRAX_MPI_INCLUDE_DIR} lib=${LORRAX_MPI_LIBRARY}")
+endif()  # LORRAX_FFI_HAVE_PHDF5
+
+# ----------------------------------------------------------------------------
+#  SLATE — for the ffi.slate subpackage.  Found via find_package(slate)
+#  pointing at the host install (accessible inside the container via
+#  siteFs mount of /global/u2).  Runtime deps (Cray libsci etc.) come from
+#  the stage dir populated by src/ffi/cpp/stage/slate_stage_cray.sh.
+# ----------------------------------------------------------------------------
+if(NOT DEFINED LORRAX_SLATE_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_INSTALL_DIR})
+    set(LORRAX_SLATE_INSTALL_DIR "$ENV{LORRAX_SLATE_INSTALL_DIR}" CACHE PATH
+        "SLATE install prefix")
+endif()
+if(NOT DEFINED LORRAX_SLATE_INSTALL_DIR)
+    set(LORRAX_SLATE_INSTALL_DIR "$ENV{HOME}/software/slate/install"
+        CACHE PATH "SLATE install prefix (default: host build under \$HOME/software/slate/install)")
+endif()
+
+# slateConfig.cmake internally find_dependency(blaspp, lapackpp), which
+# live alongside slate in ${LORRAX_SLATE_INSTALL_DIR}.  Point all three
+# at their CMake config dirs so the find chain resolves.
+set(slate_DIR    "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/slate")
+set(blaspp_DIR   "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/blaspp")
+set(lapackpp_DIR "${LORRAX_SLATE_INSTALL_DIR}/lib64/cmake/lapackpp")
+
+# slateConfig expects MPI::MPI_CXX (from find_package(MPI)).  We deliberately
+# avoid that search above so we can pin to the chosen MPI stack.  Create a
+# stand-in IMPORTED target that points at the same libmpi / mpi.h.
+if(NOT TARGET MPI::MPI_CXX)
+    add_library(MPI::MPI_CXX INTERFACE IMPORTED)
+    set_target_properties(MPI::MPI_CXX PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${LORRAX_MPI_INCLUDE_DIR}"
+        INTERFACE_LINK_LIBRARIES      "${LORRAX_MPI_LIBRARY}")
+endif()
+
+find_package(slate CONFIG)
+if(slate_FOUND)
+    message(STATUS "SLATE: found via ${LORRAX_SLATE_INSTALL_DIR}")
+    set(LORRAX_HAVE_SLATE 1)
+else()
+    message(STATUS
+        "SLATE: not found at ${LORRAX_SLATE_INSTALL_DIR} — ffi.slate targets "
+        "will be skipped.  Build SLATE (see sources/SLATE) or set "
+        "-DLORRAX_SLATE_INSTALL_DIR=... to include them.")
+    set(LORRAX_HAVE_SLATE 0)
+endif()
+
+# ----------------------------------------------------------------------------
+# Build lorrax_ffi.so
+# ----------------------------------------------------------------------------
+set(LORRAX_FFI_SOURCES
+    cusolvermp/c_api.cc
+    active_subspace/active_eigh.cc
+    active_subspace/active_ops.cc
+    cublas/local_active_gemm_ffi.cc
+    cusolvermp/context.cc
+    cusolvermp/eigh_ffi.cc
+    cusolvermp/batched_potrf_ffi.cc
+    cusolvermp/batched_potrs_ffi.cc
+    cusolvermp/batched_solve_lu_ffi.cc
+)
+if(LORRAX_CUFFT_ON)
+    # Isolated compile target for the NVIDIA k-convolution family on
+    # nvidia-mathdx (decisions.md 2026-09-24).  Its kernels are NVRTC-built at
+    # run time from the installed wheel's cuFFTDx headers, per k-grid: there
+    # is no embedded cubin to extract.
+    add_library(build_kconv_mathdx_cuda OBJECT
+        cufft/kconv_mathdx_cuda_ffi.cc
+        cufft/kconv_outer_cuda_ffi.cc
+        # The active-range GEMM with DEVICE-side bounds (active_gemm/: the ROCM leg's
+        # leg-neutral source, NVRTC-built here; DMMA f64 on compute capability >= 8.0).
+        active_gemm/active_gemm_device_ffi.cc
+        common/rtc_build.cc)
+    set_target_properties(build_kconv_mathdx_cuda PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(build_kconv_mathdx_cuda SYSTEM PRIVATE
+        "${JAX_FFI_INCLUDE_DIR}"
+        "${CUDA_TOOLKIT_ROOT}/include"
+        "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+        "${NVRTC_INCLUDE_DIR}")
+    target_include_directories(build_kconv_mathdx_cuda PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/common"
+        "${CMAKE_CURRENT_BINARY_DIR}"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    # The device-bounds active-range GEMM kernel as text for NVRTC (the ROCM leg's same rule).
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h" LRX_ACTIVE_GEMM_SRC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_src.h.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/generated/active_gemm_src.h" @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h")
+    # The k-box stage's text for NVRTC (cufft/kbox_stage_src.h.in): regenerated whenever
+    # kbox_stage.cuh changes, so the embedded header and the host launch rule are one file.
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh" LRX_KBOX_SRC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage_src.h.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_stage_src.h" @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh")
+    target_compile_options(build_kconv_mathdx_cuda PRIVATE
+        -Wall -Wextra)
+    # The CUDA FFT leg: the nvidia-mathdx k-convolution family (the cuFFT
+    # strided flat-k handler was replaced 2026-09-24, measured) and
+    # lorrax_fourier_plan_mathdx, the LocalFourierPlan's one custom call
+    # (cuBLAS Fourier GEMMs, the fused cuBLASDx pair, one cufftPlanMany group
+    # and its remap kernel; lorrax_fourier_plan, pair-less, for older trees).
+    list(APPEND LORRAX_FFI_SOURCES
+        $<TARGET_OBJECTS:build_kconv_mathdx_cuda>
+        cufft/fourier_plan.cu
+        cufft/fourier_plan_cuda_ffi.cc
+    )
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    list(APPEND LORRAX_FFI_SOURCES
+        phdf5/api.cc
+        phdf5/context.cc
+        phdf5/write_ffi.cc
+        phdf5/read_ffi.cc
+    )
+endif()
+if(LORRAX_HAVE_SLATE)
+    list(APPEND LORRAX_FFI_SOURCES
+        slate/context.cc
+        slate/eigh_ffi.cc
+        slate/potrf_ffi.cc
+        slate/trsm_ffi.cc
+        slate/batched_potrf_ffi.cc
+        slate/batched_trsm_ffi.cc
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+#  GENERATED CAPABILITY HEADER + BUILD STAMP — the device leg, since 2026-08-08.
+#
+#  The host leg has recorded what it resolved since 2026-08-05.  This leg
+#  recorded NOTHING: `strings liblorrax_ffi.so | grep -E 'scalapack=|cufft='`
+#  on the deployed device library returns empty, so the only artifact-level
+#  question anyone could ask of a device .so was "which symbols does it
+#  export".  That is enough to catch a missing handler and useless for the two
+#  questions that actually cost time here — which cuSOLVERMp comm path it was
+#  compiled for (CAL vs NCCL; src/ffi/cpp/build.sh refuses without an answer
+#  precisely because every stage exports the same SONAME), and which handler
+#  ABI it speaks.
+# ---------------------------------------------------------------------------
+set(LORRAX_CFG_CUSOLVERMP 1)   # base sources; this leg does not exist without it
+if(LORRAX_FFI_HAVE_CUBLASMP)
+    set(LORRAX_CFG_CUBLASMP 1)
+else()
+    set(LORRAX_CFG_CUBLASMP 0)
+endif()
+set(LORRAX_CFG_CUFFT ${LORRAX_CUFFT_ON})
+if(LORRAX_FFI_HAVE_CAL)
+    set(LORRAX_CFG_CAL 1)
+else()
+    set(LORRAX_CFG_CAL 0)
+endif()
+if(LORRAX_HAVE_SLATE)
+    set(LORRAX_CFG_SLATE 1)
+else()
+    set(LORRAX_CFG_SLATE 0)
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    set(LORRAX_CFG_PHDF5 1)
+else()
+    set(LORRAX_CFG_PHDF5 0)
+endif()
+# Host-leg keys: present in the shared template, never emitted on this leg.
+set(LORRAX_CFG_FFTW3 0)
+set(LORRAX_CFG_SCALAPACK 0)
+set(LORRAX_CFG_GEMM 0)
+set(LORRAX_CFG_MATH_LINK "")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
+list(APPEND LORRAX_FFI_SOURCES common/build_config.cc common/ctx_registry.cc)
+
+add_library(lorrax_ffi SHARED ${LORRAX_FFI_SOURCES})
+
+set_target_properties(lorrax_ffi PROPERTIES
+    OUTPUT_NAME "lorrax_ffi"
+    PREFIX "lib"
+    # The search path is $ORIGIN alone, a DT_RUNPATH (--enable-new-dtags
+    # below).  A sealed bundle's private providers sit beside this file; MPI,
+    # site HDF5, CUDA and NCCL belong to the run environment, whose
+    # LD_LIBRARY_PATH a RUNPATH does not outrank, so a module can redirect
+    # them and no build or site directory is baked in.
+    BUILD_WITH_INSTALL_RPATH ON
+    INSTALL_RPATH "$ORIGIN"
+)
+target_link_options(lorrax_ffi PRIVATE "LINKER:--enable-new-dtags")
+
+# ----------------------------------------------------------------------------
+#  PRIVATE SYMBOLS — the fix for KNOWN_FAILURES L1 (cross-.so ODR).
+#
+#  The two platform libraries are dlopened RTLD_GLOBAL into ONE process, so
+#  every default-visibility symbol they both define is one name with two
+#  definitions behind it and the first-loaded answers for both -- including
+#  for the other library's own internal calls.  Measured 2026-08-07 on the
+#  BUILD_NOTES-pinned pair: 259 shared names, 25 of them LORRAX's own phdf5
+#  core and lrx_* entry points, which is how a PhdfCtx* minted under one
+#  build's layout came to be read under the other's.
+#
+#  exports_cuda.map localises everything LORRAX itself defines.  READ IT
+#  before widening the pattern: the `local: *` form was tried first and
+#  segfaults five SLATE host cells, because it also unmerges the weak COMDAT
+#  copies of SLATE's template code that the C++ ABI intends the dynamic
+#  linker to merge with libslate.so's.  The file carries the five-arm
+#  measurement.  LINK_DEPENDS so editing the map relinks.
+# ----------------------------------------------------------------------------
+target_link_options(lorrax_ffi PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_cuda.map")
+set_property(TARGET lorrax_ffi APPEND PROPERTY
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports_cuda.map")
+
+# Third-party headers (XLA FFI + vendor toolkits) as SYSTEM — they are not
+# warning-clean under -Wall -Wextra and are not ours to fix; LORRAX's own
+# sources stay under the full warning set (no blanket -Wno-unused-*).
+target_include_directories(lorrax_ffi SYSTEM PRIVATE
+    "${JAX_FFI_INCLUDE_DIR}"
+    "${CUSOLVERMP_INCLUDE}"
+    "${NCCL_INCLUDE}"
+    "${CUDA_TOOLKIT_ROOT}/include"
+    "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/include"
+    "${HDF5_INCLUDE_DIRS}"
+    "${LORRAX_MPI_INCLUDE_DIR}"
+)
+target_include_directories(lorrax_ffi PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_BINARY_DIR}"     # generated lorrax_config.h
+)
+
+find_package(Threads REQUIRED)
+
+# libcal must be linked EXPLICITLY: context.cc references cal_comm_*
+# for the <=0.6.x CAL comm path.  The CAL-era cuBLASMp (<=0.4.x) NEEDed
+# libcal.so.0 itself, so the symbols used to resolve transitively; the
+# NCCL-era cuBLASMp (>=0.5.0) doesn't, and without this line the .so
+# fails to dlopen with "undefined symbol: cal_comm_destroy".
+target_link_libraries(lorrax_ffi PRIVATE
+    "${CUSOLVERMP_LIBDIR}/libcusolverMp.so"
+    "${CUSOLVERMP_LIBDIR}/libcublasmp.so"
+    "${NCCL_LIBRARY}"
+    "${CUDART_LIBRARY}"
+    "${CUSOLVER_LIBRARY}"
+    "${CUBLAS_LIBRARY}"
+    Threads::Threads
+)
+# CAL is only linked for the <=0.6.x comm path; NCCL-native cuSOLVERMp
+# (>=0.7, the pip wheels) ships no libcal.
+if(LORRAX_FFI_HAVE_CAL)
+    target_link_libraries(lorrax_ffi PRIVATE "${CUSOLVERMP_LIBDIR}/libcal.so")
+endif()
+if(LORRAX_CUFFT_ON)
+    # ${CMAKE_DL_LIBS}: the NVRTC build service resolves the driver API
+    # (cuModule*/cuLaunchKernel) via dlsym, so no link-time libcuda (absent on
+    # build/login nodes).  libcufft: the Fourier plan's FFT group.
+    target_link_libraries(lorrax_ffi PRIVATE
+        "${CUFFT_LIBRARY}" "${NVRTC_LIBRARY}" ${CMAKE_DL_LIBS})
+    target_include_directories(lorrax_ffi PRIVATE
+        "${CUFFT_INCLUDE_DIR}" "${NVRTC_INCLUDE_DIR}")
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    target_link_libraries(lorrax_ffi PRIVATE ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}")
+endif()
+if(LORRAX_HAVE_SLATE)
+    target_link_libraries(lorrax_ffi PRIVATE slate)
+endif()
+
+# Propagate the switches to the C++ sources (api.cc, cusolvermp/context.cc).
+target_compile_definitions(lorrax_ffi PRIVATE
+    LORRAX_FFI_HAVE_CAL=$<BOOL:${LORRAX_FFI_HAVE_CAL}>
+    LORRAX_FFI_HAVE_PHDF5=$<BOOL:${LORRAX_FFI_HAVE_PHDF5}>
+)
+
+# -Wno-unused-parameter/-Wno-unused-variable removed 2026-08-01 (seam-audit
+# leftover): the blanket opt-outs also hid genuinely dead locals.  Warnings
+# are not errors here (no -Werror); host-leg sources were rebuilt clean —
+# CUDA-only TUs get their warning pass at the next rtx/Perlmutter build.
+target_compile_options(lorrax_ffi PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+)
+
+# Ensure nvcc passes -fPIC to the host compiler for .cu TUs linked into
+# the shared lib.  CMAKE_POSITION_INDEPENDENT_CODE usually handles this,
+# but being explicit avoids relocation R_X86_64_PC32 link errors.
+set_target_properties(lorrax_ffi PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
+)
+
+message(STATUS "lorrax_ffi will link:")
+message(STATUS "  cuSOLVERMp = ${CUSOLVERMP_LIBDIR}/libcusolverMp.so")
+message(STATUS "  NCCL       = ${NCCL_LIBRARY}")
+message(STATUS "  CUDART     = ${CUDART_LIBRARY}")
+message(STATUS "  HDF5       = ${HDF5_LIBRARIES}")
+message(STATUS "  MPI        = ${LORRAX_MPI_LIBRARY}")
+
+elseif(LORRAX_FFI_PLATFORM STREQUAL "host")
+# ============================== host leg ====================================
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxParallelHdf5.cmake")
+# LANGUAGES CXX ONLY — deliberate, do not add C or Fortran.  Nothing here is
+# Fortran (the ScaLAPACK calls go through MKL's C bindings) and the py312
+# apptainer container this builds in has no gfortran, so enabling Fortran
+# fails the configure outright.  SLATE's OWN CMakeLists declares
+# `LANGUAGES CXX Fortran` while using Fortran nowhere and needs the same
+# one-line patch before it will configure here — see
+# config/frontera/build_ffi_host.sh, step "patch SLATE".
+project(lorrax_ffi_host LANGUAGES CXX)
+
+# Same Open MPI C++-bindings guard as the CUDA leg (see the comment there);
+# the host leg's phdf5 handlers include mpi.h too.
+add_compile_definitions(OMPI_SKIP_MPICXX=1)
+
+# liblorrax_ffi_host.so — the host-platform (JAX CPU backend) FFI library.
+#
+# Deliberately a separate LEG from the CUDA leg above (same file, selected
+# by -DLORRAX_FFI_PLATFORM): that leg hard-requires cuSOLVERMp / NCCL / the
+# CUDA language and runs inside the Shifter/apptainer container; this one is
+# CUDA-free BY CONSTRUCTION.  It
+# compiles the SAME phdf5 collective MPI-IO core (context.cc + read_ffi.cc +
+# write_ffi.cc) as the CUDA lib, with -DLORRAX_FFI_NO_CUDA so the
+# device-staging seams collapse: the read tail becomes a std::memcpy into the
+# host-resident XLA output buffer instead of a cudaMemcpyAsync H2D, and the
+# write path hands H5Dwrite the XLA input buffer directly instead of staging
+# it D2H through a pinned buffer (see cpp/phdf5/platform_seam.h).
+# ffi_loader.py registers
+# this library's handlers under platform="cpu" (the CUDA library's under
+# platform="CUDA") with the same jax.ffi target names — the jaxlib
+# cpu-lapack / cuda-cusolver registration split.
+#
+# Three optional component groups, each CUDA-free and each INDEPENDENT of the
+# others (they were not independent before 2026-07-31 — see the "HOST
+# NUMERICAL LIBRARIES" block further down for what that cost):
+#   LORRAX_FFI_HAVE_PHDF5     (ON)  parallel-HDF5 read + write handlers
+#                                   + lifecycle
+#   LORRAX_HOST_HAVE_SCALAPACK(ON)  ScaLAPACK distributed eigh + fused LU,
+#                                   plus the CBLAS GEMM and MKL-FFT handlers
+#                                   that ride the same link line
+#   LORRAX_HOST_HAVE_SLATE    (ON)  SLATE gpu_backend=none host handlers
+# Every group downgrades to a "skipped" STATUS line if its dependency is not
+# found, so a phdf5-only host lib still builds on a cluster with neither a
+# SLATE install nor a ScaLAPACK.
+#
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+option(LORRAX_FFI_HAVE_PHDF5  "Build the phdf5 host read+write handlers (needs parallel HDF5)" ON)
+option(LORRAX_HOST_HAVE_SLATE "Build the SLATE host handlers (needs a gpu_backend=none SLATE install)" ON)
+
+# ----------------------------------------------------------------------------
+# XLA FFI headers.  They must match the RUNTIME jaxlib (the container's jax,
+# NOT whatever python is first on the host PATH — newer XLA-FFI headers on an
+# older runtime is the unsupported direction).  Prefer an explicit
+# LORRAX_XLA_FFI_INCLUDE_DIR (build_host.sh stages one out of the container);
+# otherwise fall back to probing jax.ffi.include_dir() with Python3 — correct
+# when this cmake runs INSIDE the runtime container/venv (the Frontera path).
+# ----------------------------------------------------------------------------
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxXlaFfi.cmake")
+lorrax_find_xla_ffi()
+
+set(LORRAX_FFI_HOST_SOURCES "")
+set(_host_link_libs "")
+
+# ----------------------------------------------------------------------------
+# parallel-HDF5 + MPI (CUDA-free).  Same probe as the CUDA CMakeLists, minus
+# every CUDA/NCCL/cuSOLVERMp dependency: the host read handlers only need
+# HDF5 (MPI-IO) + MPI.  On Frontera these are the host Intel-MPI parallel
+# HDF5 (-DHDF5_ROOT=...) + Intel MPI (-DLORRAX_MPI_INCLUDE_DIR / _MPICH_LIB_DIR),
+# with the config/frontera/cmake FindMPI stub on CMAKE_MODULE_PATH.
+# ----------------------------------------------------------------------------
+if(LORRAX_FFI_HAVE_PHDF5)
+    lorrax_find_parallel_hdf5()
+
+    list(APPEND LORRAX_FFI_HOST_SOURCES
+        phdf5/api.cc
+        phdf5/context.cc
+        phdf5/read_ffi.cc
+        phdf5/write_ffi.cc
+    )
+    list(APPEND _host_link_libs ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}")
+endif()
+
+#  ===========================================================================
+#  HOST NUMERICAL LIBRARIES — WHAT IS LINKED, WHICH API IT IMPLEMENTS, AND
+#  WHAT ITS ABSENCE LOOKS LIKE.       Read this before debugging a link error.
+#  ===========================================================================
+#
+#  Four of the host handler families call a numerical library.  THREE OF THE
+#  FOUR TARGET A PUBLISHED, MULTI-VENDOR API and are therefore not tied to any
+#  one vendor; only SLATE is a single-implementation library.  The table is
+#  the map from "symbol the linker could not find" back to "thing that was
+#  not resolved here".
+#
+#  family    API it calls              implementations that provide it
+#  --------  ------------------------  -------------------------------------
+#  scalapack ScaLAPACK + C-BLACS       Intel MKL (libmkl_scalapack_lp64
+#            (Fortran ABI; the ELEVEN  defines 8 + libmkl_blacs_<mpi>_lp64
+#            symbols listed below,     defines 3 = all eleven, measured),
+#            declared in scalapack/    Cray LibSci (libsci_*_mpi_*), netlib
+#            cpp/blacs_grid.h)         ScaLAPACK, AMD AOCL.  NOT SLATE's
+#                                      libslate_scalapack_api: 6/11, and
+#                                      refused -- see RESOLVE 1/4 below.
+#  cblas     CBLAS (cblas_dgemm /      Intel MKL, Cray LibSci, OpenBLAS,
+#            cblas_zgemm; the batched  BLIS, ATLAS.  Only the *_batch entry
+#            entry is an extension)    is vendor-variable, and that is asked
+#                                      at RUNTIME, never here.
+#  fftw      FFTW3 advanced interface  FFTW, cray-fftw, MKL's FFTW3 export,
+#            (fftw_plan_many_dft),     AOCL.  Bound at RUNTIME, never linked
+#            bound by dlsym            (RESOLVE 3/4).
+#  slate     slate:: C++ templates     ICL SLATE ONLY (a C++ library, not an
+#                                      ABI — no second implementation exists)
+#
+#  The target names keep their historical spellings (lorrax_mklblas_*,
+#  lorrax_mklfft_*); nothing at runtime can observe which vendor supplied
+#  ScaLAPACK or CBLAS — src/ffi/common/ffi_loader.py keys only on LORRAX's
+#  own handler symbol names (ScalapackEighHostFfi, ...).
+#
+#  RESOLUTION IS ONE BLOCK, FOUR CONSUMERS.  Before 2026-07-31 the ScaLAPACK,
+#  CBLAS and FFT resolutions were all nested inside `if(slate_FOUND)`, and
+#  the FFT one additionally inside the MKL branch of the ScaLAPACK probe.
+#  Two capabilities were silently lost as a result:
+#    * no SLATE install  ->  ScaLAPACK eigh/LU, GEMM and FFT handlers ALL
+#      dropped, though none of them calls SLATE (proved by compiling
+#      cpp/scalapack/{eigh,solve_lu}_ffi.cc and cpp/{fftw,cblas}/*.cc with
+#      only the XLA-FFI and MPI header paths — they need no SLATE header, and
+#      the resulting objects reference no slate symbol);
+#    * ScaLAPACK given explicitly via -DLORRAX_SCALAPACK_LIBRARIES  ->  the
+#      FFT handlers were not merely skipped, they were never reached, so the
+#      configure log said nothing at all about them.
+#  Both are fixed by resolving first and appending second, below.
+#
+#  WHAT A MISSING PIECE LOOKS LIKE, AND WHERE TO FIX IT
+#  ----------------------------------------------------
+#  Every one of these is announced at configure time by the `message(STATUS)`
+#  lines below — read the configure log FIRST; only reach for the runtime
+#  symptom if you no longer have it.
+#
+#  unresolved at load: any of
+#         pzheevd_  pdsyevd_  pzgetrf_  pdgetrf_  pzgetrs_  pdgetrs_
+#         numroc_   descinit_ Csys2blacs_handle  Cblacs_gridinit
+#         Cblacs_gridinfo
+#      -> no ScaLAPACK+BLACS on the link line.  Set -DLORRAX_MKL_ROOT (or
+#         $MKLROOT), or pass a whole -DLORRAX_SCALAPACK_LIBRARIES link line.
+#         Those ELEVEN names are the entire ScaLAPACK surface LORRAX uses —
+#         the complete undefined-symbol set of solve_lu_ffi.cc + eigh_ffi.cc
+#         outside libc, measured, not estimated.  Anything implementing them
+#         can back these handlers.
+#  unresolved at load: cblas_dgemm / cblas_zgemm
+#      -> the CBLAS came from a header-only prefix with no library on the
+#         link line.  cblas_?gemm_batch will NEVER appear here: it is looked
+#         up at runtime and its absence selects the plain-GEMM loop.
+#  unresolved at load: slate::* (mangled _ZN5slate...)
+#      -> libslate.so is not on the load path.  Note this is the ONLY family
+#         whose absence cannot be worked around with another vendor.
+#  configure says "SLATE (host): not found" and you wanted SLATE
+#      -> -DLORRAX_SLATE_HOST_INSTALL_DIR must point at the prefix that
+#         CONTAINS lib64/cmake/slate/slateConfig.cmake.
+#  hangs or aborts inside blacs_gridinit with no error
+#      -> BLACS flavour does not match the MPI actually linked (MKL ships one
+#         BLACS per MPI: mkl_blacs_intelmpi_lp64 vs mkl_blacs_openmpi_lp64).
+#         This links cleanly and only fails at the first collective.
+#
+#  The runtime load path for all of the above is set by
+#  config/frontera/build_ffi_host.sh (which bakes the resolved directories
+#  into the library's own search path) — see its header for the Frontera
+#  values.
+#  ===========================================================================
+
+option(LORRAX_HOST_HAVE_SCALAPACK
+       "Build the ScaLAPACK host handlers (distributed eigh + fused LU)" ON)
+
+# Accumulators.  Nothing is appended to LORRAX_FFI_HOST_SOURCES /
+# _host_link_libs in the RESOLVE half — the APPEND half
+# further down does that, in a fixed order, so the emitted link line is
+# independent of which optional pieces were found.
+set(_host_math_link   "")   # ScaLAPACK+BLACS+BLAS+OpenMP, in link order
+set(_mkl_incdir       "")   # MKL header dir, when MKL is the ScaLAPACK source
+set(_scalapack_on     0)
+set(_mklfft_on        0)
+set(_mklblas_on       0)
+
+# ----------------------------------------------------------------------------
+#  RESOLVE 1/4 — ScaLAPACK + C-BLACS.  Required by cpp/scalapack/*_ffi.cc
+#  (pXgetrf / pXgetrs / pXheevd / Cblacs_gridinit / descinit / numroc;
+#  prototypes hand-declared in cpp/scalapack/blacs_grid.h because ScaLAPACK
+#  ships no vendor-neutral C header).
+#
+#  SLATE DOES NOT SUPPLY THEM, AND CANNOT (measured 2026-07-31, job 7883830).
+#  The `slate` target brings in BLAS/LAPACK only, and the reason is NOT the
+#  -DSCALAPACK_LIBRARIES="" this repo's SLATE build passes — as this comment
+#  used to say.  Two independent facts:
+#    * SLATE v2025.05.28's own CMakeLists.txt has the whole `scalapack_api`
+#      block COMMENTED OUT ("# todo: requires ScaLAPACK"), so a CMake install
+#      never contains libslate_scalapack_api regardless of that setting.
+#    * Even when built from the GNUmakefile (or
+#      cpp/stage/slate_build_scalapack_api.sh), that library DEFINES only 6 of
+#      the eleven names below — every compute routine, none of the
+#      grid/descriptor tools, and it CALLS numroc_ / Cblacs_gridinfo itself.
+#      It is an OVERLAY on a real ScaLAPACK, never a provider.  LORRAX
+#      REFUSES it at run time (cpp/scalapack/blacs_grid.h) because its
+#      pXheevd is bug L-2, its shims hard-code MPI_COMM_WORLD, and they
+#      hard-wire info=0.  Refusal: docs/services/distrib_la/backends.md.
+#  Workstream L (2026-07-25) had to hand-inject the link line via
+#  -DCMAKE_SHARED_LINKER_FLAGS on every configure — that gap is closed here.
+#
+#  Resolution order:
+#    1. -DLORRAX_SCALAPACK_LIBRARIES="<link line>" — vendor-agnostic escape
+#       hatch (Cray LibSci, netlib, AOCL, ...; NOT SLATE's overlay — see
+#       above).  A CMake list or a space-separated string; raw `-l`/`-L`
+#       flags are fine.
+#    2. MKL, probed under -DLORRAX_MKL_ROOT / $MKLROOT.  This is the Frontera
+#       path (MKL 2020.1 at
+#       /opt/intel/compilers_and_libraries_2020.1.217/linux/mkl).
+#    3. nothing found -> loud WARNING and the ScaLAPACK handlers are NOT
+#       built, so ffi_loader.has_target() answers honestly.  (Before
+#       2026-07-31 they were built with the routines left unresolved, and
+#       has_target() reported the handler present until the first call died.)
+#
+#  `-Wl,--no-as-needed` is mandatory: MKL's layered libraries are reached
+#  transitively, and ld 2.30+ otherwise drops them from the library's
+#  recorded dependency list, producing a .so that loads and then cannot
+#  resolve pzgetrf at call time.
+# ----------------------------------------------------------------------------
+if(LORRAX_HOST_HAVE_SCALAPACK)
+    if(NOT DEFINED LORRAX_SCALAPACK_LIBRARIES AND DEFINED ENV{LORRAX_SCALAPACK_LIBRARIES})
+        set(LORRAX_SCALAPACK_LIBRARIES "$ENV{LORRAX_SCALAPACK_LIBRARIES}" CACHE STRING
+            "Full ScaLAPACK+BLACS link line (overrides the MKL probe)")
+    endif()
+    if(LORRAX_SCALAPACK_LIBRARIES)
+        separate_arguments(_host_math_link UNIX_COMMAND
+                          "${LORRAX_SCALAPACK_LIBRARIES}")
+        set(_scalapack_on 1)
+        message(STATUS "ScaLAPACK: explicit -> ${LORRAX_SCALAPACK_LIBRARIES}")
+    else()
+        if(NOT DEFINED LORRAX_MKL_ROOT AND DEFINED ENV{LORRAX_MKL_ROOT})
+            set(LORRAX_MKL_ROOT "$ENV{LORRAX_MKL_ROOT}" CACHE PATH "MKL install prefix")
+        endif()
+        if(NOT LORRAX_MKL_ROOT AND DEFINED ENV{MKLROOT})
+            set(LORRAX_MKL_ROOT "$ENV{MKLROOT}" CACHE PATH "MKL install prefix")
+        endif()
+        # BLACS flavour MUST match the MPI actually linked above
+        # (Intel MPI on Frontera); a mismatch links fine and then
+        # hangs/aborts inside blacs_gridinit.
+        set(LORRAX_MKL_BLACS "mkl_blacs_intelmpi_lp64" CACHE STRING
+            "MKL BLACS library, must match the MPI (…_intelmpi_lp64 | …_openmpi_lp64)")
+        set(LORRAX_MKL_THREAD_LIB "mkl_gnu_thread" CACHE STRING
+            "MKL threading layer (mkl_gnu_thread for g++, mkl_sequential to disable)")
+        find_library(LORRAX_MKL_SCALAPACK_LIBRARY NAMES mkl_scalapack_lp64
+            HINTS "${LORRAX_MKL_ROOT}/lib/intel64_lin"
+                  "${LORRAX_MKL_ROOT}/lib/intel64"
+                  "${LORRAX_MKL_ROOT}/lib")
+        if(LORRAX_MKL_SCALAPACK_LIBRARY)
+            get_filename_component(_mkl_libdir
+                                   "${LORRAX_MKL_SCALAPACK_LIBRARY}" DIRECTORY)
+            set(_host_math_link
+                "-L${_mkl_libdir}" "-Wl,--no-as-needed"
+                "-lmkl_scalapack_lp64" "-l${LORRAX_MKL_BLACS}"
+                "-lmkl_intel_lp64" "-l${LORRAX_MKL_THREAD_LIB}" "-lmkl_core")
+            if(LORRAX_MKL_THREAD_LIB STREQUAL "mkl_gnu_thread")
+                list(APPEND _host_math_link "-lgomp")
+            endif()
+            list(APPEND _host_math_link "-lpthread" "-lm" "-ldl")
+            get_filename_component(_mkl_incdir
+                                   "${_mkl_libdir}/../../include" ABSOLUTE)
+            set(_scalapack_on 1)
+            message(STATUS "ScaLAPACK: MKL at ${_mkl_libdir} "
+                           "(blacs=${LORRAX_MKL_BLACS}, thread=${LORRAX_MKL_THREAD_LIB})")
+        else()
+            message(WARNING
+                "ScaLAPACK/BLACS not found — the ScaLAPACK host handlers "
+                "(distributed eigh + fused LU) are NOT built, and "
+                "ffi_loader.has_target('lorrax_scalapack_eigh') will "
+                "correctly answer no.  Set -DLORRAX_MKL_ROOT (or \$MKLROOT), "
+                "or pass a full -DLORRAX_SCALAPACK_LIBRARIES link line "
+                "(Cray LibSci, netlib, AOCL all implement the same API).")
+        endif()
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
+#  RESOLVE 2/4 — CBLAS header for the vendor-BLAS GEMM host handler
+#  (cpp/cblas/gemm_batch_ffi.cc; contract_bands FFI GEMM body, 2026-07-28 —
+#  RESHARD_OVERHEAD_MEMO Sec. 4.4 exit (b)).  VENDOR-PORTABLE since
+#  2026-07-29 (owner order): it builds against ANY standard CBLAS — Intel MKL
+#  via mkl_cblas.h (the Frontera path; zero new link deps) or Cray LibSci /
+#  OpenBLAS / BLIS via cblas.h.  cblas_?gemm_batch is an MKL EXTENSION
+#  (OpenBLAS ships it too) and is looked up AT RUNTIME inside the TU —
+#  present -> the batched entry; absent -> the TU's portable plain
+#  cblas_{d,z}gemm loop; the live entry is announced on first use.  Works in
+#  principle with Intel MKL or Cray LibSci; TESTED WITH INTEL ONLY so far.
+#  Compiled -fopenmp for omp_get_max_threads() in its thread-cap policy.
+#
+#  NO BUILD-TIME FEATURE PROBE — deliberate (owner order 2026-07-29).  A
+#  link-based check_symbol_exists answers "no" for ENVIRONMENTAL reasons, and
+#  its "no" silently selects the ~1.6-1.9x slower plain loop.  It did exactly
+#  that on Frontera twice, for two different link-closure reasons (jobs
+#  7879278 / 7879281 — a try_compile EXECUTABLE must close the whole
+#  shared-library graph, so BLACS's open MPI_* references failed it, and then
+#  libmpi's own fi_*@FABRIC_* references failed it again).  A build-time
+#  question whose wrong answer is invisible and costly does not belong in the
+#  build; the runtime lookup asks it in the process that makes the call.
+#
+#  What remains below is a plain EXISTS test choosing WHICH CBLAS header to
+#  include.  That is not a probe in the same sense: its failure mode is "GEMM
+#  handler not built at all", announced right here and refused loudly at
+#  runtime — never "built, but silently slow".
+# ----------------------------------------------------------------------------
+#  HEADER *AND* LIBRARY (audit P1.7, 2026-07-31).  The gate used to key on
+#  find_path(cblas.h) alone, but gemm_batch_ffi.cc's plain-loop fallback
+#  calls cblas_dgemm/cblas_zgemm as LINK-TIME symbols (only the *_batch
+#  entries are dlsym'd): on a non-MKL site with a header-only CBLAS prefix
+#  the .so built with undefined symbols and died at the FIRST GEMM call
+#  instead of refusing at build/configure time.  On the MKL path the link
+#  line already carries libmkl_intel_lp64 (which defines cblas_?gemm); on
+#  the cblas.h path a real library must be found — or an explicit
+#  -DLORRAX_SCALAPACK_LIBRARIES link line may supply it (Cray LibSci defines
+#  CBLAS inside libsci) — otherwise the handler is skipped, announced.  The
+#  -Wl,--no-undefined at the link step below is the backstop that makes any
+#  remaining gap a BUILD failure, never a first-call crash.
+set(_gemm_cblas_header "")
+set(_gemm_cblas_incdir "")
+set(_gemm_cblas_lib    "")
+if(_mkl_incdir AND EXISTS "${_mkl_incdir}/mkl_cblas.h")
+    set(_gemm_cblas_header "mkl_cblas.h")
+    set(_gemm_cblas_incdir "${_mkl_incdir}")
+    # cblas_?gemm live in libmkl_intel_lp64, already on _host_math_link.
+    set(_mklblas_on 1)
+else()
+    find_path(LORRAX_CBLAS_INCLUDE_DIR cblas.h
+        HINTS "$ENV{CRAY_LIBSCI_PREFIX_DIR}/include"
+              "$ENV{LORRAX_CBLAS_DIR}/include"
+              "$ENV{LORRAX_CBLAS_DIR}")
+    if(LORRAX_CBLAS_INCLUDE_DIR)
+        find_library(LORRAX_CBLAS_LIBRARY
+            NAMES cblas openblas blis sci_gnu sci_cray
+            HINTS "$ENV{CRAY_LIBSCI_PREFIX_DIR}/lib"
+                  "$ENV{LORRAX_CBLAS_DIR}/lib64"
+                  "$ENV{LORRAX_CBLAS_DIR}/lib"
+                  "$ENV{LORRAX_CBLAS_DIR}")
+        if(LORRAX_CBLAS_LIBRARY)
+            set(_gemm_cblas_header "cblas.h")
+            set(_gemm_cblas_incdir "${LORRAX_CBLAS_INCLUDE_DIR}")
+            set(_gemm_cblas_lib    "${LORRAX_CBLAS_LIBRARY}")
+            set(_mklblas_on 1)
+        elseif(LORRAX_SCALAPACK_LIBRARIES)
+            # LibSci-style: the explicit ScaLAPACK link line is trusted to
+            # define cblas_?gemm (libsci does); -Wl,--no-undefined verifies.
+            set(_gemm_cblas_header "cblas.h")
+            set(_gemm_cblas_incdir "${LORRAX_CBLAS_INCLUDE_DIR}")
+            set(_mklblas_on 1)
+            message(STATUS
+                "mklblas: cblas.h at ${LORRAX_CBLAS_INCLUDE_DIR}; no "
+                "standalone CBLAS library found — relying on the explicit "
+                "LORRAX_SCALAPACK_LIBRARIES link line to define "
+                "cblas_?gemm (the -Wl,--no-undefined link will fail loudly "
+                "if it does not).")
+        else()
+            message(STATUS
+                "mklblas: cblas.h found at ${LORRAX_CBLAS_INCLUDE_DIR} but "
+                "NO CBLAS library (searched cblas/openblas/blis/sci_* under "
+                "CRAY_LIBSCI_PREFIX_DIR / LORRAX_CBLAS_DIR) — GEMM handler "
+                "skipped rather than built with undefined cblas_?gemm "
+                "(LORRAX_BANDS_GEMM_FFI=1 will refuse at runtime; the auto "
+                "default stays on the XLA lowering).")
+        endif()
+    endif()
+endif()
+if(NOT _mklblas_on AND NOT _gemm_cblas_header)
+    message(STATUS
+        "mklblas: no CBLAS header found (mkl_cblas.h under the "
+        "MKL prefix, or cblas.h — set LORRAX_CBLAS_DIR / "
+        "CRAY_LIBSCI_PREFIX_DIR) — GEMM handler skipped "
+        "(LORRAX_BANDS_GEMM_FFI=1 will refuse at runtime; the "
+        "auto default stays on the XLA lowering).")
+endif()
+
+# ----------------------------------------------------------------------------
+#  RESOLVE 3/4 — the FFTW3-ABI flat-k host handlers (cpp/fftw/fft_flat_k_ffi.cc).
+#  The TU calls the FFTW3 advanced interface (fftw_plan_many_dft), bound at
+#  RUN time by dlsym: the engine already resident (MKL exports it from the
+#  ScaLAPACK link line), else a dlopen ladder (docs/architecture/ffi_layout.md
+#  §3c).  Nothing FFTW is linked: a DT_NEEDED fftw would make the whole
+#  library unloadable where that SONAME is not visible (GATE 5 checks zero
+#  fftw in DT_NEEDED).  This leg only records a found FFTW3 as the
+#  compile-time absolute-path hint that heads the ladder.  A process with no
+#  engine refuses at its first host FFT, naming every candidate tried; the
+#  startup gate (ffi.fft.require_kconv) checks only the exported
+#  handler symbol.  The TU is compiled -fopenmp for its chunk-loop threading.
+# ----------------------------------------------------------------------------
+option(LORRAX_HOST_HAVE_FFTW3
+       "Record a system FFTW3 as the runtime dlopen hint (NOT linked; not needed on MKL sites)"
+       ON)
+
+set(_fftw3_on 0)
+if(LORRAX_HOST_HAVE_FFTW3)
+    # Detection ladder, first hit wins: a real package description before a
+    # hand-held path, and the raw -D override last.
+    #   1. find_package(FFTW3 CONFIG)  -- upstream FFTW >= 3.3.7 ships this
+    #   2. pkg-config fftw3            -- cray-fftw ships fftw3.pc
+    #   3. FFTW_INC / FFTW_DIR / FFTW_ROOT hints (the cray-fftw modulefile
+    #      sets all three)
+    #   4. -DLORRAX_FFTW3_INCLUDE_DIR / -DLORRAX_FFTW3_LIBRARY (last resort)
+    if(NOT LORRAX_FFTW3_LIBRARY)
+        find_package(FFTW3 CONFIG QUIET)
+    endif()
+    if(TARGET FFTW3::fftw3)
+        set(_fftw3_on 1)
+        # We want a PATH, not a link target: the result is a dlopen hint, not
+        # a link-line entry.  IMPORTED_LOCATION is where the imported target
+        # keeps the actual file.
+        get_target_property(_fftw3_hint FFTW3::fftw3 IMPORTED_LOCATION)
+        if(NOT _fftw3_hint)
+            get_target_property(_fftw3_hint FFTW3::fftw3
+                                IMPORTED_LOCATION_RELEASE)
+        endif()
+        message(STATUS "fftw3: found via FFTW3Config.cmake -> ${_fftw3_hint}")
+    else()
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(PC_FFTW3 QUIET fftw3)
+        endif()
+        find_path(LORRAX_FFTW3_INCLUDE_DIR fftw3.h
+            HINTS ${PC_FFTW3_INCLUDE_DIRS}
+                  "$ENV{FFTW_INC}" "$ENV{FFTW_ROOT}/include")
+        find_library(LORRAX_FFTW3_LIBRARY NAMES fftw3
+            HINTS ${PC_FFTW3_LIBRARY_DIRS}
+                  "$ENV{FFTW_DIR}" "$ENV{FFTW_ROOT}/lib")
+        if(LORRAX_FFTW3_LIBRARY)
+            set(_fftw3_on 1)
+            set(_fftw3_hint "${LORRAX_FFTW3_LIBRARY}")
+            message(STATUS "fftw3: ${LORRAX_FFTW3_LIBRARY}")
+        endif()
+    endif()
+endif()
+
+# The flat-k FFT handlers are ALWAYS built: the TU declares the FFTW3 ABI
+# itself and resolves every entry point by dlsym, so it needs no vendor
+# header and no vendor library at COMPILE time.  Whether an engine is
+# actually present is a RUN-time question, answered by the dlsym table and
+# reported by ffi.fft.require_kconv at startup.
+set(_mklfft_on 1)
+if(_fftw3_on)
+    message(STATUS
+        "mklfft: flat-k FFT handlers ON — FFTW3 advanced interface "
+        "(fftw_plan_many_dft) resolved at runtime by dlsym.  System FFTW3 "
+        "recorded as the runtime dlopen HINT (${_fftw3_hint}) and "
+        "deliberately NOT linked — see the DT_NEEDED note above.")
+else()
+    message(STATUS
+        "mklfft: flat-k FFT handlers ON — FFTW3 advanced interface "
+        "(fftw_plan_many_dft) resolved at runtime by dlsym.  No standalone "
+        "FFTW3 linked; this is CORRECT on an MKL site (libmkl_intel_lp64 "
+        "exports the FFTW3 C interface natively).  On a non-MKL site load "
+        "cray-fftw (or any FFTW3) and reconfigure, or ffi.fft.require_kconv will "
+        "refuse at startup naming the unresolved symbol.")
+endif()
+
+# ----------------------------------------------------------------------------
+#  RESOLVE 4/4 — SLATE, the gpu_backend=none install (optional; skipped if
+#  absent).  This is the only host dependency with no second implementation:
+#  it is a C++ template library, so there is no ABI another vendor could
+#  supply.  Its absence costs the slate potrf/trsm/batched host handlers and
+#  NOTHING ELSE — the ScaLAPACK, GEMM and FFT handlers above are independent
+#  of it (see the header note).
+#
+#  cpp/slate/context.cc and cpp/slate/ctx.h are NOT SLATE code despite the
+#  directory: they are LORRAX's own MPI mesh context (a rank-remapped
+#  MPI_Comm plus the host-collective mutex) in namespace lorrax_ffi::slate,
+#  and they include only <mpi.h>.  The ScaLAPACK handlers use that context,
+#  which is why context.cc is compiled whenever EITHER family is on.
+# ----------------------------------------------------------------------------
+if(LORRAX_HOST_HAVE_SLATE)
+    if(NOT DEFINED LORRAX_SLATE_HOST_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_HOST_INSTALL_DIR})
+        set(LORRAX_SLATE_HOST_INSTALL_DIR "$ENV{LORRAX_SLATE_HOST_INSTALL_DIR}" CACHE PATH
+            "SLATE gpu_backend=none install prefix")
+    endif()
+    if(NOT DEFINED LORRAX_SLATE_HOST_INSTALL_DIR)
+        set(LORRAX_SLATE_HOST_INSTALL_DIR "$ENV{HOME}/software/slate_builds/cpu/install"
+            CACHE PATH "SLATE gpu_backend=none install prefix")
+    endif()
+    set(slate_DIR    "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64/cmake/slate")
+    set(blaspp_DIR   "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64/cmake/blaspp")
+    set(lapackpp_DIR "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64/cmake/lapackpp")
+    if(NOT TARGET MPI::MPI_CXX)
+        add_library(MPI::MPI_CXX INTERFACE IMPORTED)
+    endif()
+    find_package(slate CONFIG
+        NO_DEFAULT_PATH PATHS "${LORRAX_SLATE_HOST_INSTALL_DIR}/lib64/cmake/slate")
+    if(slate_FOUND)
+        message(STATUS "SLATE (host): found via ${LORRAX_SLATE_HOST_INSTALL_DIR}")
+    else()
+        message(STATUS
+            "SLATE (host): not found at ${LORRAX_SLATE_HOST_INSTALL_DIR} — "
+            "slate potrf/trsm/batched host handlers skipped.  The "
+            "ScaLAPACK, GEMM and FFT host handlers do NOT depend on SLATE "
+            "and are unaffected.")
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
+#  APPEND — sources, link libraries and library search paths, in a FIXED
+#  order.  Keep this order: it is what makes the emitted link line for the
+#  full 11-target Frontera build byte-identical to the pre-2026-07-31 one,
+#  which is how this restructure was checked without a compute node.
+# ----------------------------------------------------------------------------
+# LORRAX's MPI mesh context — needed by the slate AND the scalapack handlers.
+if(slate_FOUND OR _scalapack_on)
+    list(APPEND LORRAX_FFI_HOST_SOURCES slate/context.cc)
+endif()
+if(slate_FOUND)
+    list(APPEND LORRAX_FFI_HOST_SOURCES slate/host_ffi.cc)
+    list(APPEND _host_link_libs slate)
+endif()
+if(_scalapack_on)
+    list(APPEND LORRAX_FFI_HOST_SOURCES
+        scalapack/solve_lu_ffi.cc
+        scalapack/getrf_getrs_ffi.cc
+        scalapack/eigh_ffi.cc)
+endif()
+if(_mklfft_on)
+    list(APPEND LORRAX_FFI_HOST_SOURCES fftw/fft_flat_k_ffi.cc)
+    set_source_files_properties(
+        fftw/fft_flat_k_ffi.cc
+        PROPERTIES COMPILE_OPTIONS "-fopenmp")
+    # The TU's own OpenMP pragmas need gomp even if the MKL threading layer
+    # is switched to mkl_sequential (mkl_gnu_thread already pulls it in).
+    if(NOT LORRAX_MKL_THREAD_LIB STREQUAL "mkl_gnu_thread")
+        list(APPEND _host_math_link "-lgomp")
+    endif()
+    # NOT `list(APPEND _host_math_link ...)`.  The detected FFTW3 is handed to
+    # the TU as a compile-time dlopen HINT and never reaches the link line —
+    # linking it is what made the whole library unloadable wherever that exact
+    # SONAME was absent (see the DT_NEEDED note at the detection block).  No
+    # rpath entry either, for the same reason: an rpath pointing at a
+    # bare-metal-only directory is how a container-invisible dependency gets
+    # baked in without anyone noticing.
+    if(_fftw3_on AND _fftw3_hint)
+        set_property(SOURCE fftw/fft_flat_k_ffi.cc APPEND PROPERTY
+            COMPILE_DEFINITIONS
+            "LORRAX_FFTW3_SO_HINT=\"${_fftw3_hint}\"")
+    endif()
+endif()
+if(_mklblas_on)
+    list(APPEND LORRAX_FFI_HOST_SOURCES cblas/gemm_batch_ffi.cc)
+    set(LORRAX_MKLBLAS_INCLUDE_DIR "${_gemm_cblas_incdir}")
+    set(_gemm_defs "")
+    if(_gemm_cblas_header STREQUAL "mkl_cblas.h")
+        list(APPEND _gemm_defs "LORRAX_MKLBLAS_MKL_HEADER=1")
+    endif()
+    set_source_files_properties(
+        cblas/gemm_batch_ffi.cc
+        PROPERTIES COMPILE_OPTIONS "-fopenmp"
+                   COMPILE_DEFINITIONS "${_gemm_defs}")
+    # The CBLAS library resolved above (cblas.h path only; the MKL path's
+    # cblas_?gemm ride libmkl_intel_lp64, already on the math link line).
+    if(_gemm_cblas_lib)
+        list(APPEND _host_math_link "${_gemm_cblas_lib}")
+    endif()
+    # gomp for the TU's omp_get_max_threads(); harmless duplicate when the
+    # MKL branch already appended it via mkl_gnu_thread.
+    list(APPEND _host_math_link "-lgomp")
+    # NOTE: the substring "chosen at RUNTIME by dlsym" is grepped out of the
+    # build log by the probe-removal gate (wk_REL/harness/gbp_dlsym.sbatch:68).
+    # `dlsym` stays in THIS line for that reason and because a build log is
+    # the one place naming the mechanism is the point; the LORRAX-facing
+    # runtime announcement (cpp/cblas/gemm_batch_ffi.cc) says it in plain
+    # words instead.
+    message(STATUS
+        "mklblas: GEMM host handler ON (${_gemm_cblas_header} at "
+        "${_gemm_cblas_incdir}); batched-vs-plain entry is chosen "
+        "at RUNTIME by dlsym and announced on first use — no "
+        "build-time feature probe by design")
+endif()
+list(APPEND _host_link_libs ${_host_math_link})
+
+list(APPEND LORRAX_FFI_HOST_SOURCES common/build_config.cc common/ctx_registry.cc)
+
+if(NOT LORRAX_FFI_HOST_SOURCES)
+    message(FATAL_ERROR
+        "No host FFI components selected/found (phdf5 off and SLATE absent). "
+        "Nothing to build.")
+endif()
+
+# ----------------------------------------------------------------------------
+# Build liblorrax_ffi_host.so
+# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  GENERATED CAPABILITY HEADER — what the build ACTUALLY resolved, recorded
+#  in the library instead of only in a configure log nobody kept.
+#  lorrax_ffi_host_build_config() returns it as one line, so a run (or a
+#  `strings` on a .so found in a scratch directory) can report its own
+#  provenance.  Note it records whether an FFTW3 was FOUND AT CONFIGURE TIME
+#  and recorded as the runtime dlopen hint — not that one was linked (none is,
+#  since 2026-08-06) and not which engine will actually bind: that is a
+#  runtime dlopen/dlsym fact by design.
+# ---------------------------------------------------------------------------
+if(_fftw3_on)
+    set(LORRAX_CFG_FFTW3 1)
+else()
+    set(LORRAX_CFG_FFTW3 0)
+endif()
+if(_scalapack_on)
+    set(LORRAX_CFG_SCALAPACK 1)
+else()
+    set(LORRAX_CFG_SCALAPACK 0)
+endif()
+if(_mklblas_on)
+    set(LORRAX_CFG_GEMM 1)
+else()
+    set(LORRAX_CFG_GEMM 0)
+endif()
+if(slate_FOUND)
+    set(LORRAX_CFG_SLATE 1)
+else()
+    set(LORRAX_CFG_SLATE 0)
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    set(LORRAX_CFG_PHDF5 1)
+else()
+    set(LORRAX_CFG_PHDF5 0)
+endif()
+string(REPLACE ";" " " LORRAX_CFG_MATH_LINK "${_host_math_link}")
+# The device-leg keys exist in the template so ONE template serves both legs;
+# build_config.cc never emits them on this leg, so these zeros are not a claim
+# about anything.
+set(LORRAX_CFG_CUSOLVERMP 0)
+set(LORRAX_CFG_CUBLASMP 0)
+set(LORRAX_CFG_CUFFT 0)
+set(LORRAX_CFG_CAL 0)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
+
+add_library(lorrax_ffi_host SHARED ${LORRAX_FFI_HOST_SOURCES})
+
+# The defining flag: every phdf5 TU compiled here switches its device-staging
+# tail + staging-buffer allocator to the host path and drops <cuda_runtime.h>.
+target_compile_definitions(lorrax_ffi_host PRIVATE LORRAX_FFI_NO_CUDA=1)
+
+set_target_properties(lorrax_ffi_host PROPERTIES
+    OUTPUT_NAME "lorrax_ffi_host"
+    PREFIX "lib"
+    BUILD_WITH_INSTALL_RPATH ON
+    # The same $ORIGIN-only RUNPATH as the CUDA leg.
+    INSTALL_RPATH "$ORIGIN"
+)
+target_link_options(lorrax_ffi_host PRIVATE "LINKER:--enable-new-dtags")
+
+# The XLA FFI headers are THIRD-PARTY (vendored with jaxlib) and are not
+# warning-clean under -Wall -Wextra; SYSTEM keeps their noise out of the
+# build log so LORRAX's own sources can be held to the no-opt-out bar above.
+target_include_directories(lorrax_ffi_host SYSTEM PRIVATE
+    "${LORRAX_XLA_FFI_INCLUDE_DIR}"
+)
+target_include_directories(lorrax_ffi_host PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+if(LORRAX_MKLFFT_INCLUDE_DIR)
+    target_include_directories(lorrax_ffi_host PRIVATE
+        "${LORRAX_MKLFFT_INCLUDE_DIR}")
+endif()
+if(LORRAX_MKLBLAS_INCLUDE_DIR)
+    # CBLAS headers for the GEMM handler (same dir as mklfft under MKL;
+    # the LibSci/OpenBLAS cblas.h dir on non-MKL builds).
+    target_include_directories(lorrax_ffi_host PRIVATE
+        "${LORRAX_MKLBLAS_INCLUDE_DIR}")
+endif()
+if(LORRAX_FFI_HAVE_PHDF5)
+    target_include_directories(lorrax_ffi_host PRIVATE
+        "${HDF5_INCLUDE_DIRS}"
+        "${LORRAX_MPI_INCLUDE_DIR}")
+endif()
+
+find_package(Threads REQUIRED)
+# ${CMAKE_DL_LIBS}: blacs_grid.h resolves MKL_Set_Num_Threads_Local via
+# dlsym(RTLD_DEFAULT) so the MKL-thread pin needs no MKL link dependency
+# (and is a clean no-op on a non-MKL ScaLAPACK).
+target_link_libraries(lorrax_ffi_host PRIVATE ${_host_link_libs}
+                      Threads::Threads ${CMAKE_DL_LIBS})
+
+# No -Wno-unused-* here (removed 2026-08-01): the host sources compile clean
+# under plain -Wall -Wextra; keep them that way rather than re-adding the
+# blanket opt-out.
+target_compile_options(lorrax_ffi_host PRIVATE -Wall -Wextra)
+
+# Announce-or-refuse at LINK time (audit P1.7): every link-time symbol the
+# handlers reference must resolve when the .so is built — an undefined
+# cblas_?gemm (or anything else) fails HERE, loudly, instead of building a
+# library that loads cleanly and dies at the first call.  Runtime-optional
+# entries (cblas_?gemm_batch, MKL_Set_Num_Threads_Local, the CUDA driver
+# API) are dlsym'd and deliberately NOT link references, so this flag does
+# not constrain them.
+target_link_options(lorrax_ffi_host PRIVATE "-Wl,--no-undefined")
+
+# ----------------------------------------------------------------------------
+#  PRIVATE SYMBOLS — the host half of the KNOWN_FAILURES L1 fix.  See the
+#  matching block on the CUDA target above and the header of
+#  exports_host.map.  Together with the per-leg C-ABI rename in
+#  cpp/common/c_abi.h, this makes the set of symbols BOTH libraries define
+#  and LORRAX owns empty -- which is what
+#  services/distrib_la/tests/test_so_acceptance.py's check 6 asserts.
+# ----------------------------------------------------------------------------
+target_link_options(lorrax_ffi_host PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_host.map")
+set_property(TARGET lorrax_ffi_host APPEND PROPERTY
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports_host.map")
+
+message(STATUS "lorrax_ffi_host will build sources:")
+foreach(_s ${LORRAX_FFI_HOST_SOURCES})
+    message(STATUS "  ${_s}")
+endforeach()
+
+elseif(LORRAX_FFI_PLATFORM STREQUAL "rocm")
+# ============================== ROCM leg ====================================
+# liblorrax_ffi_rocm.so: the AMD device leg (docs/architecture/ffi_layout.md,
+# "Platform legs").  The SAME shared sources as the CUDA leg, compiled with
+# -DLORRAX_FFI_ROCM so common/leg.h selects the ROCM spellings and
+# common/gpu_runtime.h the HIP runtime.  The families are host C++ calling
+# the GPU runtime API, so no device compiler is needed: the C++ compiler,
+# the HIP headers and libamdhip64 (CMake package `hip`, target hip::host).
+# Device kernels are compiled at run time by hipRTC (common/rtc_build.h, the
+# CUDA leg's NVRTC service with the vendor spelled by the leg), which the
+# library resolves beside the HIP runtime the process mapped -- so it is not
+# linked, and the leg loads (phdf5 serves) where no hipRTC is installed.
+#
+# Families, one per port (each gated against XLA on the same device, as its
+# CUDA twin is):  phdf5;  kdft (the k-leading direct-DFT convolution and
+# transform, modes 2/3, and the k-minor pair, modes 4/5, run-time compiled);  slate (distributed
+# eigh / potrf / trsm and their batched forms over a gpu_backend=hip SLATE);
+# rocsolver (the batched local Hermitian eigh, one rocsolver_{z,d}{heevd,syevd}_strided_batched
+# call per stack, and the one-device LU solve on a 2^31-byte-span-blocked rocBLAS trsm/gemm path
+# (rocsolver/lu_solve_ffi.cc: rocBLAS trsm's in-place path is wrong past that span), both
+# resolved from the librocsolver.so.0 the JAX ROCm plugin mapped: not linked);
+# fourier_plan_rocm (LocalFourierPlan's ROCM leg, the port of the CUDA leg's fourier_plan_cuda_ffi.cc:
+# rocBLAS ZGEMM axes + hipFFT groups, both resolved from the wheel copies JAX mapped, and a
+# hipRTC remap kernel);
+# active_subspace (active_subspace/active_devsize.cc: the CUDA family's targets with device-side
+# sizes -- hipRTC kernels, no per-call host read; distributed_ortho and the active-block eigh
+# stay CUDA-only, the ROCM plan solves the capacity matrix through rocsolver);
+# cublas_local (the local active-range GEMM, cublas/local_active_gemm_ffi.cc on rocBLAS through
+# common/gpu_blas.h, librocblas.so.5 resolved the same way); active_gemm (the same operation with
+# device-side bounds, one hipRTC-built kernel).  A family with no ROCm port is
+# simply not in the source list; ffi_loader's ROCM table lists only what this
+# leg exports.
+#
+# ROCm comes from ROCM_PATH (`module load rocm/<v>` sets it) or
+# -DCMAKE_PREFIX_PATH=<rocm root>; GPU targets need no flag here because
+# nothing is compiled for the device at build time (hipRTC compiles for the
+# device's own target id at run time).
+project(lorrax_ffi_rocm LANGUAGES CXX)
+add_compile_definitions(OMPI_SKIP_MPICXX=1)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+option(LORRAX_FFI_HAVE_PHDF5 "Build the phdf5 handlers (needs parallel HDF5)" ON)
+if(NOT LORRAX_FFI_HAVE_PHDF5)
+    message(FATAL_ERROR
+        "LORRAX_FFI_HAVE_PHDF5=OFF: got a ROCM leg with no family; want phdf5, "
+        "the ROCM leg's only family so far; fix: drop -DLORRAX_FFI_HAVE_PHDF5=OFF")
+endif()
+
+if(DEFINED ENV{ROCM_PATH})
+    list(APPEND CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}")
+endif()
+find_package(hip CONFIG REQUIRED)
+message(STATUS "HIP: ${hip_VERSION} (${hip_DIR})")
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxXlaFfi.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/LorraxParallelHdf5.cmake")
+lorrax_find_xla_ffi()
+lorrax_find_parallel_hdf5()
+
+set(LORRAX_FFI_ROCM_SOURCES
+    phdf5/api.cc
+    phdf5/context.cc
+    phdf5/read_ffi.cc
+    phdf5/write_ffi.cc
+    common/build_config.cc
+    common/ctx_registry.cc
+    common/rtc_build.cc
+    kdft/kdft_klead_ffi.cc
+    kdft/kdft_kminor_ffi.cc
+    kdft/kbox_unfold_ffi.cc
+    kdft/kbox_rspace_ffi.cc
+    kdft/kconv_outer_rocm_ffi.cc
+    kdft/kbox_plane_ffi.cc
+    kdft/kbox_parent_ffi.cc
+    kdft/plane_gather_ffi.cc
+    rocsolver/batched_eigh_ffi.cc
+    rocsolver/lu_solve_ffi.cc
+    hipfft/fourier_plan_rocm_ffi.cc
+    active_subspace/active_devsize.cc
+    # The local active-range GEMM: the CUDA leg's own leg-neutral source (cuBLAS there,
+    # rocBLAS here through common/gpu_blas.h, resolved from the mapped librocblas.so.5).
+    cublas/local_active_gemm_ffi.cc
+    # The active-range GEMM with DEVICE-side bounds (active_gemm/: one run-time-compiled kernel,
+    # no host read, no sync; ACTIVE_LOCAL_ROUTE's ROCM row).  Leg-neutral: the CUDA leg adopts
+    # it by listing the same file and generated header.
+    active_gemm/active_gemm_device_ffi.cc
+)
+# The sync-free active-subspace kernels' text for hipRTC (active_subspace/active_dev_src.h.in).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/active_subspace/active_dev_kernel.h" LRX_ACTIVE_DEV_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/active_subspace/active_dev_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/active_dev_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/active_subspace/active_dev_kernel.h")
+
+# The kdft kernel's text for hipRTC (kdft/kdft_klead_src.h.in): regenerated
+# whenever the kernel source changes, so the embedded text is that one file.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_kernel.h" LRX_KDFT_SRC)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_core.h" LRX_KDFT_CORE_SRC)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_plan.h" LRX_KDFT_PLAN_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kdft_klead_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_klead_kernel.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_core.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_plan.h")
+# The k-minor kernel (modes 4/5, kdft/kdft_kminor_src.h.in), embedded the same way; it includes
+# the core through kdft_klead_src.h's kCoreSrc / kPlanSrc (one embedded copy of the core).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_kminor_kernel.h" LRX_KDFT_KMINOR_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_kminor_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kdft_kminor_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kdft_kminor_kernel.h")
+# The k-box unfold kernel (kdft/kbox_unfold_src.h.in) and the k-box stage it includes as a named
+# header (cufft/kbox_stage_src.h.in, the CUDA leg's own embedding of the same file): one stage
+# text for both legs, its line transform the leg's policy (kbox_stage.cuh).
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_unfold_kernel.h" LRX_KBOX_UNFOLD_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_unfold_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_unfold_src.h" @ONLY)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh" LRX_KBOX_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_stage_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_unfold_kernel.h"
+             "${CMAKE_CURRENT_SOURCE_DIR}/cufft/kbox_stage.cuh")
+# The k-box R-space kernels (modes 9 and 11, kdft/kbox_rspace_src.h.in) on the same stage text.
+# The device-bounds active-range GEMM kernel (active_gemm/active_gemm_src.h.in), embedded as text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h" LRX_ACTIVE_GEMM_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/active_gemm_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/active_gemm/active_gemm_kernel.h")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_kernel.h" LRX_KBOX_RSPACE_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_rspace_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_rspace_kernel.h")
+# The outer-product k-convolution (the BSE W term; kdft/kconv_outer_src.h.in), the port of
+# kconv_outer_cuda_ffi.cc (the CUDA leg's cufft/ directory), on the same stage text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_kernel.h" LRX_KCONV_OUTER_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kconv_outer_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kconv_outer_kernel.h")
+# The k-box mode-6 plane convolution (the ISDF route-G pair; kdft/kbox_plane_src.h.in), on the same stage text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_plane_kernel.h" LRX_KBOX_PLANE_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_plane_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_plane_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_plane_kernel.h")
+# The k-box mode-1 parent-load pair convolution (the ISDF C_q; kdft/kbox_parent_src.h.in) and the
+# mode-10 plane FFT with gather-on-load (route G; kdft/plane_gather_src.h.in), on the same stage text.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_parent_kernel.h" LRX_KBOX_PARENT_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_parent_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/kbox_parent_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/kbox_parent_kernel.h")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/kdft/plane_gather_kernel.h" LRX_PLANE_GATHER_SRC)
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/kdft/plane_gather_src.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/plane_gather_src.h" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             "${CMAKE_CURRENT_SOURCE_DIR}/kdft/plane_gather_kernel.h")
+
+# Capability header: the shared template; only phdf5 is a claim on this leg.
+set(LORRAX_CFG_PHDF5 1)
+foreach(_k CUSOLVERMP CUBLASMP CUFFT CAL SLATE FFTW3 SCALAPACK GEMM)
+    set(LORRAX_CFG_${_k} 0)
+endforeach()
+# ---- SLATE (gpu_backend=hip): the slate/ family on this leg ----------------
+# The SAME slate/*.cc as the CUDA leg (leg-neutral through gpu_runtime.h),
+# against a SLATE built by config/frontier/build_slate_hip.sh.  The install
+# must be a HIP build: a gpu_backend=none SLATE links and loads, and then
+# every handler refuses with blas::get_device_count()=0 (the CUDA leg's
+# SONAME-race signature, ffi_loader.py).  So the configure refuses it here.
+option(LORRAX_ROCM_HAVE_SLATE
+    "Build the SLATE device handlers (needs a gpu_backend=hip SLATE install)" ON)
+if(LORRAX_ROCM_HAVE_SLATE)
+    if(NOT DEFINED LORRAX_SLATE_ROCM_INSTALL_DIR AND DEFINED ENV{LORRAX_SLATE_ROCM_INSTALL_DIR})
+        set(LORRAX_SLATE_ROCM_INSTALL_DIR "$ENV{LORRAX_SLATE_ROCM_INSTALL_DIR}" CACHE PATH
+            "gpu_backend=hip SLATE install prefix")
+    endif()
+    if(NOT DEFINED LORRAX_SLATE_ROCM_INSTALL_DIR)
+        set(LORRAX_SLATE_ROCM_INSTALL_DIR "$ENV{HOME}/software/slate_builds/hip/install"
+            CACHE PATH "gpu_backend=hip SLATE install prefix (config/frontier/build_slate_hip.sh)")
+    endif()
+    set(slate_DIR    "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/slate")
+    set(blaspp_DIR   "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/blaspp")
+    set(lapackpp_DIR "${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64/cmake/lapackpp")
+    if(NOT TARGET MPI::MPI_CXX)    # slateConfig wants it; pin it to the leg's MPI
+        add_library(MPI::MPI_CXX INTERFACE IMPORTED)
+        set_target_properties(MPI::MPI_CXX PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${LORRAX_MPI_INCLUDE_DIR}"
+            INTERFACE_LINK_LIBRARIES      "${LORRAX_MPI_LIBRARY}")
+    endif()
+    find_package(slate CONFIG NO_DEFAULT_PATH PATHS "${slate_DIR}")
+    if(NOT slate_FOUND)
+        message(FATAL_ERROR
+            "GATE rocm-slate: no SLATE at ${LORRAX_SLATE_ROCM_INSTALL_DIR}; want a "
+            "gpu_backend=hip install; fix: bash config/frontier/build_slate_hip.sh, "
+            "-DLORRAX_SLATE_ROCM_INSTALL_DIR=<prefix>, or -DLORRAX_ROCM_HAVE_SLATE=OFF")
+    endif()
+    if(NOT slate_use_hip)
+        message(FATAL_ERROR
+            "GATE rocm-slate: ${LORRAX_SLATE_ROCM_INSTALL_DIR} is a SLATE without HIP "
+            "(slate_use_hip=${slate_use_hip}); its handlers would refuse with "
+            "get_device_count()=0; fix: point at the build_slate_hip.sh install")
+    endif()
+    message(STATUS "SLATE (hip): ${LORRAX_SLATE_ROCM_INSTALL_DIR}")
+    set(LORRAX_CFG_SLATE 1)
+endif()
+set(LORRAX_CFG_MATH_LINK "")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/common/lorrax_config.h.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/lorrax_config.h" @ONLY)
+
+add_library(lorrax_ffi_rocm SHARED ${LORRAX_FFI_ROCM_SOURCES})
+target_compile_definitions(lorrax_ffi_rocm PRIVATE LORRAX_FFI_ROCM=1)
+set_target_properties(lorrax_ffi_rocm PROPERTIES
+    OUTPUT_NAME "lorrax_ffi_rocm"
+    PREFIX "lib"
+    BUILD_WITH_INSTALL_RPATH ON
+    INSTALL_RPATH "$ORIGIN"            # the same $ORIGIN-only RUNPATH as the other legs
+)
+# DT_RUNPATH, except where the leg binds a SLATE: DT_RPATH (SLATE section below).
+# Not both: the Cray wrapper reorders -Wl options, so --enable-new-dtags wins.
+if(NOT LORRAX_ROCM_HAVE_SLATE)
+    target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--enable-new-dtags")
+endif()
+target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE
+    "${LORRAX_XLA_FFI_INCLUDE_DIR}"
+    "${HDF5_INCLUDE_DIRS}"
+    "${LORRAX_MPI_INCLUDE_DIR}"
+)
+target_include_directories(lorrax_ffi_rocm PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+)
+find_package(Threads REQUIRED)
+target_link_libraries(lorrax_ffi_rocm PRIVATE
+    ${HDF5_LIBRARIES} "${LORRAX_MPI_LIBRARY}" hip::host Threads::Threads ${CMAKE_DL_LIBS})
+target_compile_options(lorrax_ffi_rocm PRIVATE -Wall -Wextra)
+target_link_options(lorrax_ffi_rocm PRIVATE "-Wl,--no-undefined")
+# PRIVATE SYMBOLS: the ROCM third of the KNOWN_FAILURES L1 fix (exports_rocm.map).
+target_link_options(lorrax_ffi_rocm PRIVATE
+    "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_rocm.map")
+set_property(TARGET lorrax_ffi_rocm APPEND PROPERTY
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/exports_rocm.map")
+message(STATUS "lorrax_ffi_rocm will build sources:")
+foreach(_s ${LORRAX_FFI_ROCM_SOURCES})
+    message(STATUS "  ${_s}")
+endforeach()
+if(LORRAX_ROCM_HAVE_SLATE)
+    target_sources(lorrax_ffi_rocm PRIVATE
+        slate/context.cc slate/eigh_ffi.cc slate/potrf_ffi.cc slate/trsm_ffi.cc
+        slate/batched_potrf_ffi.cc slate/batched_trsm_ffi.cc
+        slate/batched_solve_lu_ffi.cc)    # LU: this leg only (CUDA's is cusolvermp)
+    target_link_libraries(lorrax_ffi_rocm PRIVATE slate)
+    # THE LEG BINDS ITS OWN SLATE.  libslate/libblaspp/liblapackpp share their
+    # SONAMEs with the gpu_backend=none install the host leg uses, and
+    # config/frontier/ffi_env.sh puts THAT install on LD_LIBRARY_PATH, which
+    # ld.so searches before any DT_RUNPATH.  With the $ORIGIN-only RUNPATH the
+    # other legs carry, this leg would therefore map the device-less SLATE and
+    # every handler would refuse (get_device_count()=0).  DT_RPATH is searched
+    # BEFORE LD_LIBRARY_PATH, so the leg carries the HIP install as an RPATH
+    # entry after $ORIGIN.  That directory holds only the three SLATE
+    # libraries, so it can shadow nothing else.  In a process that opens both
+    # legs the accelerator-first rule (lxkit.legs) opens this one first, and
+    # the HIP SLATE then serves the host leg too, as the CUDA SLATE does on
+    # Perlmutter.  verify_ffi_build.sh GATE 3c checks the resolution.
+    set_target_properties(lorrax_ffi_rocm PROPERTIES
+        INSTALL_RPATH "$ORIGIN;${LORRAX_SLATE_ROCM_INSTALL_DIR}/lib64")
+    target_link_options(lorrax_ffi_rocm PRIVATE "LINKER:--disable-new-dtags")
+    message(STATUS "  slate/{context,eigh,potrf,trsm,batched_potrf,batched_trsm}")
+endif()
+# ---- ELPA (AMD GPU kernels): the elpa/ family on this leg ------------------
+# ELPA 2026.02.001 built by config/frontier/build_elpa_hip.sh into its
+# content-keyed prefix (OpenMP, the LORRAX device-allocator patch, ScaLAPACK
+# static and hidden inside libelpa).  The handler shares the SLATE family's
+# per-mesh MPI context (as ScaLAPACK does), so it needs LORRAX_ROCM_HAVE_SLATE.
+# The prefix joins the RPATH AFTER SLATE's: the leg's libopenblas.so.0 stays
+# SLATE's copy (the closure writer and ld.so both resolve a SONAME once).
+option(LORRAX_ROCM_HAVE_ELPA
+    "Build the ELPA eigh handler (needs config/frontier/build_elpa_hip.sh's prefix)" ON)
+if(LORRAX_ROCM_HAVE_ELPA)
+    if(NOT LORRAX_ROCM_HAVE_SLATE)
+        message(FATAL_ERROR "GATE rocm-elpa: the ELPA handler uses the SLATE family's mesh "
+            "context; fix: -DLORRAX_ROCM_HAVE_SLATE=ON or -DLORRAX_ROCM_HAVE_ELPA=OFF")
+    endif()
+    if(NOT DEFINED LORRAX_ELPA_ROCM_DIR AND DEFINED ENV{LORRAX_ELPA_ROCM_DIR})
+        set(LORRAX_ELPA_ROCM_DIR "$ENV{LORRAX_ELPA_ROCM_DIR}")
+    endif()
+    if(NOT DEFINED LORRAX_ELPA_ROCM_DIR OR NOT EXISTS "${LORRAX_ELPA_ROCM_DIR}/LORRAX_ELPA_COMPLETE")
+        message(FATAL_ERROR "GATE rocm-elpa: no finished ELPA prefix at '${LORRAX_ELPA_ROCM_DIR}'; "
+            "fix: bash config/frontier/build_elpa_hip.sh (build_ffi_rocm.sh passes its "
+            "--print-prefix), or -DLORRAX_ROCM_HAVE_ELPA=OFF")
+    endif()
+    file(GLOB _elpa_inc "${LORRAX_ELPA_ROCM_DIR}/include/elpa*-*")
+    # Uncached: a new content-keyed prefix must re-resolve (a cached path would link the
+    # previous prefix's library; an existing cache entry would also short-circuit NO_CACHE).
+    unset(LORRAX_ELPA_LIBRARY CACHE)
+    find_library(LORRAX_ELPA_LIBRARY NAMES elpa_openmp elpa
+                 PATHS "${LORRAX_ELPA_ROCM_DIR}/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+    target_sources(lorrax_ffi_rocm PRIVATE elpa/eigh_ffi.cc)
+    target_include_directories(lorrax_ffi_rocm SYSTEM PRIVATE ${_elpa_inc})
+    target_link_libraries(lorrax_ffi_rocm PRIVATE "${LORRAX_ELPA_LIBRARY}")
+    get_target_property(_rp lorrax_ffi_rocm INSTALL_RPATH)
+    set_target_properties(lorrax_ffi_rocm PROPERTIES
+        INSTALL_RPATH "${_rp};${LORRAX_ELPA_ROCM_DIR}/lib")
+    message(STATUS "ELPA (hip): ${LORRAX_ELPA_ROCM_DIR} (${LORRAX_ELPA_LIBRARY})")
+    message(STATUS "  elpa/eigh")
+endif()
+else()
+    message(FATAL_ERROR
+        "LORRAX_FFI_PLATFORM is '${LORRAX_FFI_PLATFORM}' — set it explicitly:\n"
+        "  -DLORRAX_FFI_PLATFORM=cuda  -> liblorrax_ffi.so (CUDA leg)\n"
+        "  -DLORRAX_FFI_PLATFORM=host  -> liblorrax_ffi_host.so (CUDA-free host leg)\n"
+        "  -DLORRAX_FFI_PLATFORM=rocm  -> liblorrax_ffi_rocm.so (ROCM leg)\n"
+        "There is no default on purpose: the leg used to be selected by which\n"
+        "directory cmake was pointed at, and a silent default would hide a\n"
+        "wrong-platform build until runtime.")
+endif()

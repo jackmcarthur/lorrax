@@ -1,0 +1,71 @@
+"""Compatibility facade for the BSE restart I/O, split 2026-08-10.
+
+The code lives in four modules, each with one responsibility and one authority
+rule stated in its own docstring:
+
+``bse_window``
+    Which bands are in the window, and how its axes are padded.  The
+    ``PAD_EPS_GUARD_RY`` sentinel, the pad masks and counts, the ``--eqp``
+    re-slice, and the eigenvector writer's declared window.
+``bse_head``
+    The q=0 rank-1 Coulomb head: where its scalars come from, the ``w0_ready``
+    gate that keeps a screened head off an unscreened tile, and the separate
+    ``defer_whead`` question a pending densification asks.
+``bse_densify``
+    Coarse k-grid to fine: the exact real-space zero-pad, the one sharded
+    densifier, C1's analytic per-fine-q head channel, and the whole-bundle
+    interpolation the ``bse_k_grid`` key drives.
+``bse_loading``
+    Reading a GW restart into a BSE bundle: the readiness and q-wedge gates,
+    the SlabIO / serial transports, and the two loaders.
+
+NOTHING MOVED THAT CONSUMERS CAN SEE.  Every name this module exported before
+the split is re-exported here and resolves to the same function object, so
+every consumer's import is unchanged.  Only two test GUARDS that reach in to
+patch or to read the source of moved code had to follow it.
+
+Retiring the facade — repointing the import sites and deleting this file — is a
+separate decision that has NOT been taken.  ``bse/vq_interp.py``'s lazy
+``from . import bse_io`` is still on it deliberately: the lazy form is what
+keeps the two modules out of an import cycle, so repointing it belongs with the
+retirement rather than ahead of it.
+
+Write new code against the module that owns the behaviour, not against this
+file.
+"""
+from __future__ import annotations
+
+from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
+                                    check_band_window, resolve_band_window)
+
+from .bse_densify import (W_HEAD_DENSIFY_MODES, _interpolate_bse_data_to_grid,
+                          _parse_grid_spec, _read_lorrax_input_quietly,
+                          _resolve_bse_k_grid, _zeropad_R_axis,
+                          build_w_head_channel, decimate_W_q_to_subgrid,
+                          make_w_densifier, pad_W_R_to_grid,
+                          resolve_w_head_densify)
+from .bse_head import (_inject_q0_head, _parse_head_overrides,
+                       _resolve_head_params)
+from .bse_loading import (_load_ring_subset, _pad_first_two_axes, _pad_last_axis, _pad_last_two_axes, load_bse_data_from_restart_sharded)
+from .bse_window import (PAD_EPS_GUARD_RY, _generate_kpts_grid, _log0, _parse_wfn_path, apply_eqp_and_reslice_bands, n_pad_transitions, pad_zone_mask, pad_zone_mask_np, resolve_n_occ, write_eigenvectors_stream)
+
+__all__ = [
+    "DEFAULT_MODE",
+    "DEGENERACY_TOL_RY",
+    "PAD_EPS_GUARD_RY",
+    "W_HEAD_DENSIFY_MODES",
+    "apply_eqp_and_reslice_bands",
+    "build_w_head_channel",
+    "check_band_window",
+    "decimate_W_q_to_subgrid",
+    "load_bse_data_from_restart_sharded",
+    "make_w_densifier",
+    "n_pad_transitions",
+    "pad_W_R_to_grid",
+    "pad_zone_mask",
+    "pad_zone_mask_np",
+    "resolve_band_window",
+    "resolve_n_occ",
+    "resolve_w_head_densify",
+    "write_eigenvectors_stream",
+]

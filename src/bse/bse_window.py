@@ -1,0 +1,691 @@
+"""The BSE band window: which bands are in it, and how its axes are padded.
+
+AUTHORITY RULE — the window a run SOLVED is the window everything downstream
+names.  A caller asks for ``n_val``/``n_cond``; this module turns that request
+into a real band range, and every number that leaves it is post-clamp and
+post-guard.  ``resolve_n_occ`` settles where the gap is; the band-degeneracy
+guard keeps a window boundary from cutting a degenerate multiplet — under the
+default ``--band-degeneracy strict`` it REFUSES such a window, and only the
+explicit ``snap`` opt-in widens the request outward
+(:mod:`common.band_degeneracy`); and ``apply_eqp_and_reslice_bands`` re-asks
+both questions on the quasiparticle spectrum when ``--eqp`` moved the
+energies.  Nothing else in the BSE is allowed to re-derive a window from an
+array's shape: the shapes carry the mesh PAD, not the bands.
+
+That is the second half of what lives here.  The band axes are rounded up to a
+mesh multiple, and the pad is not inert — ``H_BSE``'s diagonal is a difference
+of band energies, so a zero pad would place spurious transitions BELOW the
+absorption onset.  The signed ``PAD_EPS_GUARD_RY`` sentinel, the padding
+helper that writes it, and the masks and counts that name the physical block
+are all here, together, because they are one convention and drifting them
+apart is how the pad becomes visible in a spectrum.
+
+``write_eigenvectors_stream`` is here for the same reason: the window it
+declares in ``eigenvectors.h5`` is the resolved one, and the file's ``nv``/
+``nc`` header fields have to name real bands that ``dipole.h5`` can be sliced
+with.  The writer trims the mesh pad off by COUNT and refuses a declared
+window narrower than the one that was solved.
+"""
+from __future__ import annotations
+
+import os
+from file_io.restart_bundle import apply_eqp_corrections
+from typing import Optional
+
+import h5py
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
+                                    check_band_window)
+from common.collectives import gather_to_host
+from common.units import RYD_TO_EV
+from runtime.padding import pad_axis
+
+
+def _log0(*a, **k):
+    """``print`` on process 0 only.
+
+    The band-window guard emits a four-line block; every rank resolves the
+    same window from the same energies, so without this the warning arrives
+    64 times at P=64 and reads as 64 different problems.  ``band_degeneracy``
+    itself stays pure-numpy and jax-free, which is why the rank filter is
+    injected here rather than living in the guard.
+    """
+    try:
+        first = jax.process_index() == 0
+    except Exception:
+        first = True
+    if first:
+        print(*a, **k)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  The band-pad sentinel — why the ε pad is NOT zero
+# ═══════════════════════════════════════════════════════════════════════
+# A zero pad is inert for operators LINEAR or BILINEAR in the padded axis
+# and a WRONG NUMBER for a diagonalisation.  Both cases are live on the
+# BSE (c, v) band axes and they need DIFFERENT fills:
+#
+#   ψ pad rows -> EXACT ZERO.  Every kernel term (V and W) is bilinear in
+#     ψ, so a zero-ψ pad band contributes exactly nothing and, critically,
+#     couples the pad block to the physical block with EXACTLY zero
+#     off-diagonal.  The pad block decouples; that is what makes the
+#     sentinel below safe.
+#
+#   ε pad entries -> ±PAD_EPS_GUARD_RY.  ``H_BSE``'s diagonal is
+#     ΔE(c,v,k) = ε_c(k,c) − ε_v(k,v) (``bse_ring_comm._apply_D_term``,
+#     and the same construction in the (deleted) bse_serial / bse_simple /
+#     w_omega_chain / bse_preconditioner).  With a ZERO ε pad the pad
+#     transitions acquire diagonal energies
+#         (c_pad, v_pad) -> 0 − 0        = 0
+#         (c_pad, v_real)-> 0 − ε_v      = |ε_v|
+#         (c_real, v_pad)-> ε_c − 0      = ε_c
+#     and, because ΔE_physical = ε_c − ε_v = ε_c + |ε_v| is LARGER than
+#     either of the mixed terms, every one of those spurious transitions
+#     sits BELOW the true absorption onset.  An eigensolver asked for the
+#     lowest excitons returns them.  Signing the pad ±guard puts every pad
+#     transition at ΔE ≳ PAD_EPS_GUARD_RY instead, decoupled and outside
+#     any physical window, so the padded modes are dropped BY COUNT
+#     (n_cond_pad·n_val_pad − n_cond·n_val per k) and never by value.
+#
+# FINITE, and that is the constraint on the value.  These pad energies are
+# KEPT: they are stored in the bundle as ``data['eps_c']``/``['eps_v']``,
+# handed to every driver, and ``bse_preconditioner`` builds exactly a
+# resolvent out of them, 1/(ΔE − λ + ε_shift).  So an absurd value is not
+# free here the way it is on a pad that never leaves the function writing
+# it (``psp/dft_operators.py`` uses 1e10 on ``T_diag``, an argsort basis
+# for a selection); ``common/wfn_transforms.get_enk_bandrange`` pads band
+# energies that DO flow downstream and gives this same reason for its
+# finite ``max(real ε) + 1 Ry``.
+#
+# 1e3 Ry ≈ 13.6 keV is seven orders above the widest QP window this code
+# will ever see and keeps the float32 KPM leg's ΔE well inside single
+# precision.  ``exciton_bands`` asserts the ε_v pad is below
+# ``-0.5 * PAD_EPS_GUARD_RY``, i.e. that the loader signed it at all.
+PAD_EPS_GUARD_RY = 1.0e3
+
+
+def pad_zone_mask_np(n_cond, n_val, n_cond_pad, n_val_pad, nk, dtype=np.float64):
+    """``(1, nc_pad, nv_pad, nk)`` 1.0 on physical transitions, 0.0 on pad.
+
+    THE spelling for "restrict a BSE pair-basis vector to the physical
+    block", derived BY COUNT from the logical/padded extents the loader
+    puts in the bundle — never by thresholding an energy.  Callers that
+    seed a Krylov space with random numbers over the PADDED shape must
+    apply this, or they hand the solver a start vector with support in a
+    block whose eigenvalues are the ``PAD_EPS_GUARD_RY`` sentinel.
+
+    Vectors built from ψ (dipoles, ``w_omega_chain``'s seed block) already
+    have exact zeros there by the bilinearity above and need no mask.
+    """
+    mask = np.zeros((1, int(n_cond_pad), int(n_val_pad), int(nk)), dtype=dtype)
+    mask[:, :int(n_cond), :int(n_val), :] = 1.0
+    return mask
+
+
+def pad_zone_mask(data, dtype=None):
+    """:func:`pad_zone_mask_np` read off a loader bundle, as a jax array."""
+    nk = int(data["nkx"]) * int(data["nky"]) * int(data["nkz"])
+    if dtype is None:
+        dtype = data["eps_c"].dtype
+    return jnp.asarray(pad_zone_mask_np(
+        int(data["n_cond"]), int(data["n_val"]),
+        int(data["n_cond_pad"]), int(data["n_val_pad"]), nk), dtype=dtype)
+
+
+def n_pad_transitions(data) -> int:
+    """How many pair-basis entries are pad — the COUNT to drop by."""
+    nk = int(data["nkx"]) * int(data["nky"]) * int(data["nkz"])
+    return nk * (int(data["n_cond_pad"]) * int(data["n_val_pad"])
+                 - int(data["n_cond"]) * int(data["n_val"]))
+
+
+def _generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:
+    """Monkhorst-Pack style k-point grid in crystal coords [0, 1), C-order.
+
+    Returns ``(nk, 3)``.  Single consumer: ``write_eigenvectors_stream``.
+    """
+    kpts = []
+    for ix in range(nkx):
+        for iy in range(nky):
+            for iz in range(nkz):
+                kx = ix / nkx
+                ky = iy / nky
+                kz = iz / nkz if nkz > 0 else 0.0
+                kpts.append([kx, ky, kz])
+    return np.array(kpts, dtype=np.float64)
+
+
+def write_eigenvectors_stream(
+    output_file: str,
+    eigenvalues: jax.Array,
+    eigenvectors: jax.Array,
+    n_val: int,
+    n_cond: int,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    n_write: int,
+    use_tda: bool = True,
+    dipoles: Optional[np.ndarray] = None,
+) -> None:
+    # ── WHICH WINDOW DOES THIS FILE DESCRIBE? ─────────────────────────────
+    # The LOGICAL one the loader RESOLVED (``data['n_val']``/``data['n_cond']``).
+    # These become BGW's ``nv``/``nc`` header fields, and
+    # an absorption post-processor slices ``dipole.h5`` with exactly those against
+    # ``n_occ`` — bands ``[n_occ - nv, n_occ)`` and ``[n_occ, n_occ + nc)`` —
+    # so they have to name REAL bands.
+    #
+    # Two other numbers get mistaken for them and neither belongs in the file:
+    #
+    #   * the CLI ``--n-val``/``--n-cond`` REQUEST, which is PRE-guard and so
+    #     can be NARROWER than what was solved whenever ``--band-degeneracy
+    #     snap`` widened it (on the Si deck ``--n-cond 4`` becomes 8).
+    #     Declaring the request created the dataset at the wrong ``nc`` and
+    #     the write died part-way, leaving a truncated ``eigenvectors.h5``
+    #     behind — worse than writing none.
+    #
+    #   * the mesh-rounded PAD extents ``n_cond_pad``/``n_val_pad``, which is
+    #     what the incoming array is actually shaped by.  Those are not bands:
+    #     ``pad_zone_mask``'s block is decoupled by construction (ψ pad = 0)
+    #     and its amplitudes are exact zero, so writing them would put a
+    #     column of zeros in the file under a band label the dipole file has
+    #     no matching entry for.  They are dropped BY COUNT here, the same
+    #     spelling as ``pad_zone_mask_np`` — never by thresholding a value.
+    #
+    # So the caller declares the logical counts and this writer TRIMS to them
+    # (see ``_to_bgw``); trusting the array's own shape would re-export the pad.
+    #
+    # AND THE TRIM IS CHECKED, because the two reasons an incoming component is
+    # WIDER than the declared window need opposite treatment and cannot be told
+    # apart by shape: mesh pad must be dropped, a stale pre-guard count must be
+    # REFUSED (the bands it drops are real and carry weight).  What separates
+    # them is a value, and it separates them exactly: the pad block is
+    # decoupled by construction and its amplitudes are EXACT zero, so a
+    # discarded block with any weight in it is not pad.  A silent truncation
+    # here would be a worse bug than the loud broadcast error it replaced.
+    #
+    # TDA eigenvectors arrive as ``(n_write, 1, nc, nv, nk)`` (resonant X
+    # only); full-BSE (non-TDA) as ``(n_write, 2, nc, nv, nk)`` = the paired
+    # (X, Y) with X^H X - Y^H Y = +1.  For non-TDA the resonant X is written
+    # to ``eigenvectors`` (so the sum-over-states absorption reads the
+    # dominant part) and the coupling Y to a sibling ``eigenvectors_coupling``
+    # dataset, so both components are persisted.  BGW eigenvectors.h5 stores
+    # eigenvalues in eV (BSE/diag.f90's write path; ``eigenvalues.dat``'s
+    # header says "eig (eV)") and our solvers return Ry — convert here.
+    #
+    # ``dipoles`` (optional, TDA only): the host ``(n_write, 3)`` per-state
+    # ⟨0|r̂_α|S⟩ from ``absorption_common.exciton_dipoles_distributed``, written
+    # beside the eigenvectors as ``exciton_data/dipoles`` (1, n_write, 3, 2) —
+    # a LORRAX extension BGW readers ignore (``eigenvectors.h5.spec``).
+    RYD2EV = 13.6056980659
+    if dipoles is not None:
+        dipoles = np.asarray(dipoles)
+        if not use_tda or dipoles.shape != (int(n_write), 3):
+            raise ValueError(
+                f"write_eigenvectors_stream: dipoles must be the TDA per-state "
+                f"(n_write, 3) = ({int(n_write)}, 3) array; got shape "
+                f"{dipoles.shape} with use_tda={use_tda}")
+    # ``gather_to_host``, not ``device_get``: see the ONE-writer note below for
+    # why this writer must not assume any particular solver's sharding.  On the
+    # replicated Lanczos arrays and on Davidson's already-host eigenvalues the
+    # helper degrades to the plain ``device_get`` that was here before.
+    eigenvalues = gather_to_host(eigenvalues[:n_write]) * RYD2EV
+    # The declared window must FIT inside what the solver actually carried.
+    # ``>=`` is the pad (trimmed in ``_to_bgw``); ``<`` is a caller that named
+    # more bands than it solved, which h5py would have reported five frames
+    # deeper as an unattributable "Can't broadcast".
+    n_cond, n_val = int(n_cond), int(n_val)
+    _nc_arr, _nv_arr = (int(s) for s in eigenvectors.shape[-3:-1])
+    if _nc_arr < n_cond or _nv_arr < n_val:
+        raise ValueError(
+            f"write_eigenvectors_stream: declared window n_cond={n_cond} "
+            f"n_val={n_val} does not fit the eigenvectors' (nc, nv) = "
+            f"({_nc_arr}, {_nv_arr}).  Pass the LOADER's resolved counts "
+            f"(data['n_cond'] / data['n_val']), not the CLI request — under "
+            f"--band-degeneracy snap the resolved window is the wider one.")
+    kpts = _generate_kpts_grid(nkx, nky, nkz)
+    nk = kpts.shape[0]
+    ns = 1
+    nQ = 1
+    flavor = 2
+    spin_kernel = 3
+    bse_hamiltonian_size = ns * nk * n_val * n_cond
+    evec_sz = bse_hamiltonian_size
+
+    kpts_fortran = kpts.T.copy()
+    exciton_Q_shifts = np.zeros((1, 3), dtype=np.float64)
+
+    def _to_bgw(comp, which):
+        # comp: (nc_pad, nv_pad, nk) -> BGW (nk, nc, nv, ns) layout.
+        #
+        # TRIM FIRST, FLIP SECOND, and the order is load-bearing.  The pad is
+        # appended at the TOP of each band axis, while BGW's convention
+        # reverses the valence axis (v=0 = highest valence,
+        # BSE/input_fi.f90:407) where our internal slice puts v=0 at the
+        # deepest valence.  Flipping before the trim would slide the pad
+        # columns to the FRONT and then keep them as the "highest valence"
+        # bands — zeros written under real band labels, silently.
+        comp = np.asarray(comp)
+        kept = comp[:n_cond, :n_val, :]
+        if comp.shape[0] > n_cond or comp.shape[1] > n_val:
+            # Everything outside the kept block, in one number.  The reference
+            # is the KEPT block's own scale, so this is a statement about
+            # weight and not about units.
+            w_kept = float(np.max(np.abs(kept))) if kept.size else 0.0
+            w_drop = max(
+                float(np.max(np.abs(comp[n_cond:, :, :])))
+                if comp.shape[0] > n_cond else 0.0,
+                float(np.max(np.abs(comp[:, n_val:, :])))
+                if comp.shape[1] > n_val else 0.0)
+            if w_drop > 1.0e-10 * max(w_kept, 1.0e-300):
+                raise ValueError(
+                    f"write_eigenvectors_stream: trimming eigenvector {which} "
+                    f"from (nc, nv) = ({comp.shape[0]}, {comp.shape[1]}) down "
+                    f"to the declared window ({n_cond}, {n_val}) would DISCARD "
+                    f"amplitude {w_drop:.3e} against a kept scale of "
+                    f"{w_kept:.3e}.  The mesh pad is exactly zero, so this is "
+                    f"not pad: the declared window is narrower than the one "
+                    f"that was solved.  Pass the LOADER's resolved counts "
+                    f"(data['n_cond'] / data['n_val']) — under "
+                    f"--band-degeneracy snap they exceed the CLI request.")
+        c = np.transpose(kept, (2, 0, 1))[:, :, ::-1][..., None]
+        return c.real, c.imag
+
+    # ── PRE-FLIGHT, before any file exists ────────────────────────────────
+    # The declared window is a property of the RUN, not of a state, so state 0
+    # settles it for all of them — and settling it here means a wrong window
+    # refuses with nothing on disk instead of leaving the truncated
+    # ``eigenvectors.h5`` that the pre-fix crash left behind.  Runs on EVERY
+    # rank, above the rank-0 gate, for the lockstep reason set out below: the
+    # gather is a global collective and the refusal is a function of shapes and
+    # values every rank holds identically, so all ranks raise together.
+    if n_write > 0:
+        _v0 = gather_to_host(eigenvectors[0])
+        if use_tda:
+            _to_bgw(_v0[0] if np.ndim(_v0) == 4 else _v0, "0 (resonant X)")
+        else:
+            _to_bgw(_v0[0], "0 (resonant X)")
+            _to_bgw(_v0[1], "0 (coupling Y)")
+
+    # ── ONE writer ────────────────────────────────────────────────────────
+    # Only rank 0 may open ``output_file``.  MEASURED at P=64 / N_mu=10015
+    # (job 7879470, leg m24x64) when every rank reached the ``h5py.File(...,
+    # "w")`` below on one shared path: the ranks race each other truncating
+    # it and the step exits rc=1 with "Unable to synchronously create file
+    # (file signature not found)" — QUALITY_PATTERNS #7 in production.
+    #
+    # WHY ``gather_to_host`` AND NOT ``jax.device_get``.  A writer must not
+    # depend on a solver's layout to be correct.  Replication holds on the
+    # Lanczos routes but NOT on ``--solver davidson``, which returns ``X`` on
+    # the solve sharding ``P(None,"x","y",None)``; a bare ``device_get`` died
+    # there on every rank at P>1 with "Fetching value for `jax.Array` that
+    # spans non-addressable (non process local) devices".  ``bse_lanczos``
+    # now pins Davidson to the replicated convention too, but any future
+    # solver — or any caller handing this function a solve-sharded array —
+    # would resurrect the crash.  ``common.collectives.gather_to_host`` asks
+    # "does this process hold all of it?" instead of assuming, and degrades
+    # to exactly ``device_get`` when the array is replicated or
+    # single-process, so the 1-GPU path is unchanged.
+    #
+    # The fetches stay UNGATED on both branches on purpose: ``eigenvectors[i]``
+    # slices a GLOBAL array, which dispatches an XLA computation every process
+    # must enter, and ``gather_to_host``'s collective arm is chosen on
+    # ``is_fully_addressable``/``is_fully_replicated``, both GLOBAL properties —
+    # so every rank takes the same arm and the ranks stay in lockstep.  A
+    # rank-0-only body would hang the multi-process client rather than fix
+    # anything.
+    if jax.process_index() != 0:
+        for i in range(n_write):
+            gather_to_host(eigenvectors[i])
+        return
+
+    with h5py.File(output_file, "w") as f:
+        f.create_group("mf_header")
+        f.create_group("eps_header")
+        f.create_group("bse_header")
+
+        exciton_header = f.create_group("exciton_header")
+        exciton_header.create_dataset("version", data=1)
+        exciton_header.create_dataset("flavor", data=flavor)
+
+        params = exciton_header.create_group("params")
+        params.create_dataset("bse_hamiltonian_size", data=bse_hamiltonian_size)
+        params.create_dataset("evec_sz", data=evec_sz)
+        params.create_dataset("spin_kernel", data=spin_kernel)
+        params.create_dataset("nevecs", data=n_write)
+        params.create_dataset("ns", data=ns)
+        params.create_dataset("nc", data=n_cond)
+        params.create_dataset("nv", data=n_val)
+        params.create_dataset("use_tda", data=1 if use_tda else 0)
+
+        kpoints = exciton_header.create_group("kpoints")
+        kpoints.create_dataset("nk", data=nk)
+        kpoints.create_dataset("kpts", data=kpts_fortran)
+        kpoints.create_dataset("nQ", data=nQ)
+        kpoints.create_dataset("exciton_Q_shifts", data=exciton_Q_shifts.T)
+
+        exciton_data = f.create_group("exciton_data")
+        exciton_data.create_dataset("eigenvalues", data=eigenvalues)
+        evec_dset = exciton_data.create_dataset(
+            "eigenvectors",
+            shape=(1, n_write, nk, n_cond, n_val, ns, 2),
+            dtype=np.float64,
+        )
+        coupling_dset = None
+        if not use_tda:
+            coupling_dset = exciton_data.create_dataset(
+                "eigenvectors_coupling",
+                shape=(1, n_write, nk, n_cond, n_val, ns, 2),
+                dtype=np.float64,
+            )
+
+        for i in range(n_write):
+            vec = gather_to_host(eigenvectors[i])
+            if use_tda:
+                # (1, nc, nv, nk) sharded or (nc, nv, nk) unsharded -> resonant X.
+                Xc = vec[0] if vec.ndim == 4 else vec
+                Yc = None
+            else:
+                # (2, nc, nv, nk) = paired (X, Y) from the non-TDA solver.
+                Xc, Yc = vec[0], vec[1]
+            re, im = _to_bgw(Xc, f"{i} (resonant X)")
+            evec_dset[0, i, :, :, :, :, 0] = re
+            evec_dset[0, i, :, :, :, :, 1] = im
+            if Yc is not None:
+                re, im = _to_bgw(Yc, f"{i} (coupling Y)")
+                coupling_dset[0, i, :, :, :, :, 0] = re
+                coupling_dset[0, i, :, :, :, :, 1] = im
+
+        if dipoles is not None:
+            exciton_data.create_dataset(
+                "dipoles",
+                data=np.stack([dipoles.real, dipoles.imag], axis=-1)[None])
+
+    print(f"Wrote {n_write} eigenvectors to {output_file}"
+          + ("" if use_tda else " (+ coupling Y)")
+          + ("" if dipoles is None else " (+ per-state dipoles)"))
+
+
+
+
+def _parse_wfn_path(input_file: str) -> str:
+    """Extract ``wfn_file`` from ``cohsex.in`` and resolve relative paths."""
+
+    input_dir = os.path.dirname(os.path.abspath(input_file))
+    wfn_file = "WFN.h5"
+    with open(input_file) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, _, val = stripped.partition("=")
+            if key.strip() == "wfn_file":
+                wfn_file = val.strip()
+                break
+    if not os.path.isabs(wfn_file):
+        wfn_file = os.path.join(input_dir, wfn_file)
+    return wfn_file
+
+
+def refuse_eqp_on_a_qp_wfn(input_file: str, eqp_file: str) -> None:
+    """A QP WFN already carries its eigenvalues.  A second ladder is a defect.
+
+    ``write_qp_wfn_h5`` produces a WFN.h5 whose ψ and E are a MATCHED PAIR:
+    the rotated orbitals carry the QP eigenvalues that produced the rotation.
+    ``--eqp`` supplies a diagonal ladder written against **DFT band labels**,
+    so applying it on top of a QP WFN discards the canonical eigenvalues and
+    relabels the rotated orbitals with the mean-field ordering.  Every array
+    keeps the right shape, so nothing downstream notices.
+
+    Measured on the MoS2 run-82 parent smoke, JID 57269074 step ``.128``:
+    ``00_lorrax_gw/exciton_parent_smoke.in:9`` selects ``WFN_qp.h5`` and the
+    wrapper passes ``--eqp eqp1.dat``.  The existing shape guard in
+    ``exciton_bands`` sees this ONLY when a ``bse_k_grid`` densification has
+    already moved ψ to a different k axis; without densification the two
+    tables are the same size and the overwrite is invisible.
+
+    ASKED OF THE FILE, NOT OF ITS NAME.  The discriminator is the stamp
+    ``file_io.qp_wfn`` writes, not the string ``_qp`` in a path — a filename
+    is not a fact about contents, and this repo has paid for that reading
+    before.  ``read_qp_wfn_stamp`` returning ``None`` means UNVERIFIABLE (a
+    ``pw2bgw`` WFN, or one written before the stamp existed) and licenses
+    nothing, so it does NOT refuse: an absence is a claim about what was
+    searched.  Only a positive identification refuses.
+    """
+    from file_io.qp_wfn import refuse_conflicting_qp_state_sources
+    wfn_path = _parse_wfn_path(input_file)
+    refuse_conflicting_qp_state_sources(
+        wfn_path=wfn_path, eqp_file=eqp_file)
+
+
+
+class BseWindowOutsideZetaTrainingError(ValueError):
+    """The BSE band window reaches bands whose pair densities ζ never fit."""
+
+
+def assert_bse_window_in_zeta_training(header, band_lo, band_hi):
+    """Refuse a BSE window ``[band_lo, band_hi)`` outside the ζ training set.
+
+    The BSE reads every pair of its window: v×c for the exchange, v×v' and
+    c×c' for the direct term.  The stored V and W represent a pair only if
+    both bands lie in the intersection of the ζ-fit legs, L ∩ R.  The
+    restart stamps the legs as ``zeta_fit_windows = (L0, L1, R0, R1)``;
+    a bundle written before 2026-09-26 has no stamp and used
+    L = (b0, b3), R = (b1, b4), so L ∩ R = [b1, b3) from ``band_window``.
+    """
+    stamp = header.get("zeta_fit_windows")
+    if stamp is not None:
+        l0, l1, r0, r1 = (int(v) for v in np.asarray(stamp).reshape(-1))
+        source = f"the ζ-fit legs left=({l0}, {l1}), right=({r0}, {r1})"
+    else:
+        if header.get("band_window") is None:
+            return
+        b0, b1, b2, b3, b4 = (
+            int(v) for v in np.asarray(header["band_window"]).reshape(-1))
+        l0, l1, r0, r1 = b0, b3, b1, b4
+        source = (f"the legacy ζ-fit legs left=({b0}, {b3}), "
+                  f"right=({b1}, {b4}) (bundle predates the zeta_fit_windows "
+                  f"stamp)")
+    lo, hi = max(l0, r0), min(l1, r1)
+    if int(band_lo) < lo or int(band_hi) > hi:
+        raise BseWindowOutsideZetaTrainingError(
+            f"BseWindowOutsideZetaTrainingError: the BSE band window "
+            f"[{int(band_lo)}, {int(band_hi)}) leaves [{lo}, {hi}), the "
+            f"bands on both legs of {source}.  Its v×v' or c×c' pair "
+            f"densities were never fitted.  Narrow the BSE window, or rerun "
+            f"the GW with nval/ncond covering it.")
+
+def resolve_n_occ(
+    enk_full: np.ndarray,
+    *,
+    n_occ: Optional[int] = None,
+    input_file: Optional[str] = None,
+    fermi_energy: Optional[float] = None,
+) -> int:
+    """Determine n_occ (count of occupied bands) for BSE band slicing.
+
+    Resolution order:
+
+      1. **Explicit ``n_occ``** — caller knows; return as-is.
+      2. **WFN.h5 ``ifmax``** via ``input_file`` (cohsex.in's ``wfn_file``
+         entry). Reads ``mf_header/kpoints/ifmax`` directly — authoritative.
+      3. **``mean_enk < fermi_energy``** if ``fermi_energy`` is explicitly
+         passed (Ry). Caller's responsibility to pass a sane reference.
+
+    Raises ``ValueError`` if none of the above resolves — there is
+    deliberately no zero-argument auto-detect.  Guessing from the spectrum
+    alone (``mean_enk < 0``, or the largest gap) is silently wrong wherever
+    the pseudopotential reference puts the valence above zero, which is most
+    QE setups including Si: it returns only the deepest semicore states.
+
+    Parameters
+    ----------
+    enk_full : (nk, nb) ndarray (Ry) — DFT eigenvalues per k. Used only
+        when ``fermi_energy`` is given as a hint.
+    n_occ : int, optional — explicit bypass.
+    input_file : str, optional — cohsex.in / nscf.in path. Its
+        ``wfn_file`` entry is followed to a WFN.h5 to read ``ifmax``.
+    fermi_energy : float, optional (Ry) — explicit Fermi-level hint.
+    """
+    if n_occ is not None:
+        return int(n_occ)
+
+    if input_file is not None:
+        try:
+            from ffi import _services
+            _services.ensure_on_path()
+            from wfn_loader import WfnLoader
+            wfn_path = _parse_wfn_path(input_file)
+            if os.path.exists(wfn_path):
+                w = WfnLoader(wfn_path)
+                return int(w.nelec)
+            else:
+                print(f"  [resolve_n_occ] WFN.h5 not found at {wfn_path}; "
+                      "trying fermi_energy hint next.")
+        except Exception as e:
+            print(f"  [resolve_n_occ] WFN.h5 lookup failed "
+                  f"({type(e).__name__}: {e}); trying fermi_energy hint next.")
+
+    if fermi_energy is not None:
+        mean_enk = np.asarray(np.mean(enk_full, axis=0))
+        nb = mean_enk.size
+        n_occ_hint = int(np.sum(mean_enk < fermi_energy))
+        if 1 <= n_occ_hint <= nb - 1:
+            return n_occ_hint
+
+    raise ValueError(
+        "Could not determine n_occ. Pass `n_occ=` explicitly, or "
+        "`input_file=` pointing to a cohsex.in / nscf.in whose `wfn_file` "
+        "resolves to a valid WFN.h5 (where `mf_header/kpoints/ifmax` "
+        "gives the count of occupied bands authoritatively)."
+    )
+
+
+
+
+def apply_eqp_and_reslice_bands(
+    restart_file: str,
+    eqp_file: str,
+    input_file: str,
+    n_val: int,
+    n_cond: int,
+    n_occ: Optional[int],
+    grid_x: int,
+    grid_y: int,
+    degeneracy_mode: str = DEFAULT_MODE,
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
+) -> tuple[jax.Array, jax.Array, int]:
+    """Apply BGW ``eqp1.dat`` corrections and re-slice the BSE band window.
+
+    Reads ``enk_full`` from ``restart_file``, applies the eqp corrections, then
+    RE-resolves n_occ on the CORRECTED energies (QP shifts can move the gap)
+    before slicing ``n_val``/``n_cond`` bands around the new n_occ.  The
+    valence/conduction energy axes are padded to multiples of (grid_y, grid_x)
+    to match the loader's psi band axes.
+
+    ``n_val``/``n_cond`` must be the loader-CLAMPED counts (``data['n_val']`` /
+    ``data['n_cond']``), not raw CLI requests, or the slice can run out of
+    bounds.  Single-sourced by the sharded --eqp paths (bse_jax._preview_lanczos,
+    absorption_haydock).
+
+    Returns ``(eps_v_padded, eps_c_padded, n_occ_eff)``.
+    """
+    from file_io.restart_bundle import read_metadata
+    enk_full_np = read_metadata(restart_file)["energies"]
+    enk_full_np = apply_eqp_corrections(
+        enk_full_np, eqp_file, input_file=input_file,
+        state_artifact_path=restart_file)
+    n_occ_eff = resolve_n_occ(enk_full_np, n_occ=n_occ, input_file=input_file)
+    # Degeneracy guard, REPORT-ONLY here by construction.  The loader already
+    # snapped the window on the DFT spectrum and ψ has been read at those
+    # shapes; this function only re-derives ENERGIES, so widening now would
+    # desynchronise eps from psi.  What is new at this seam is that the QP
+    # shifts can open or close a near-degeneracy the DFT spectrum did not
+    # have, and that is worth a warning even though it cannot be repaired
+    # without re-reading ψ with a wider window.
+    check_band_window(
+        enk_full_np, n_occ_eff - n_val, n_occ_eff + n_cond,
+        tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
+        where="apply_eqp_and_reslice_bands (QP-corrected spectrum; re-run "
+              "with a wider --n-val/--n-cond to repair)", log=_log0)
+    val_idx = np.arange(n_occ_eff - n_val, n_occ_eff)
+    cond_idx = np.arange(n_occ_eff, n_occ_eff + n_cond)
+    eps_v = jnp.asarray(enk_full_np[:, val_idx])
+    eps_c = jnp.asarray(enk_full_np[:, cond_idx])
+    # Signed sentinel, as at the loader seam — this REPLACES data['eps_*'],
+    # so a zero pad here would re-open the wrong-number path after --eqp.
+    eps_v = pad_axis(eps_v, grid_y, axis=1, fill=-PAD_EPS_GUARD_RY).array
+    eps_c = pad_axis(eps_c, grid_x, axis=1, fill=PAD_EPS_GUARD_RY).array
+    return eps_v, eps_c, n_occ_eff
+
+
+def apply_eqp_to_bse_window(data, restart_file: str, eqp_file: str,
+                            input_file: str, *, mesh_shape,
+                            degeneracy_mode: str = DEFAULT_MODE,
+                            degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
+                            log=_log0):
+    """Put a loaded BSE window on quasiparticle energies; return ``E^QP``.
+
+    Both legs of the pair basis move together, or ``D_Q = ε_c(k+Q) − ε_v(k)``
+    mixes QP conduction with DFT valence.  This re-slices the stored leg,
+    ``data["eps_v"]``/``data["eps_c"]``, on the corrected spectrum
+    (:func:`apply_eqp_and_reslice_bands`, which re-resolves ``n_occ`` so a
+    QP gap change cannot mis-slice), and returns the full-band
+    ``(nk, nb)`` QP table for the caller's interpolated leg.  ``eqp_file``
+    is the irreducible wedge; ``apply_eqp_corrections`` unfolds it through
+    the symmetry service.
+
+    Refuses (before touching ``data``) an eqp ladder on a QP WFN, whose ψ
+    and E are already a matched pair (:func:`refuse_eqp_on_a_qp_wfn`), and
+    energies rebuilt on the native restart grid after ``bse_k_grid`` has
+    densified ψ to another k axis.
+    """
+    from file_io.restart_bundle import read_metadata
+    refuse_eqp_on_a_qp_wfn(input_file, eqp_file)
+    enk_dft = read_metadata(restart_file)["energies"]
+    n_occ_in = resolve_n_occ(enk_dft, input_file=input_file)
+    data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
+        restart_file, eqp_file, input_file, int(data["n_val"]),
+        int(data["n_cond"]), n_occ_in, int(mesh_shape[0]), int(mesh_shape[1]),
+        degeneracy_mode=degeneracy_mode, degeneracy_tol_ry=degeneracy_tol_ry)
+    if int(data["eps_c"].shape[0]) != int(data["psi_c_X"].shape[0]):
+        raise ValueError(
+            "--eqp rebuilt energies on the native restart "
+            f"grid ({int(data['eps_c'].shape[0])} k) after bse_k_grid "
+            "had already densified the BSE wavefunctions to "
+            f"{int(data['psi_c_X'].shape[0])} k.  This would mix coarse "
+            "energies with fine-grid psi.  If wfn_file is WFN_qp.h5, "
+            "remove --eqp: that file already carries the canonical QP "
+            "eigenvalues paired with its rotated wavefunctions.  A "
+            "mean-field WFN plus diagonal eqp corrections needs the eqp "
+            "ladder applied inside the htransform densification, not "
+            "patched onto its output here.")
+    enk_qp = apply_eqp_corrections(enk_dft, eqp_file, input_file)
+    shift_ev = (enk_qp - enk_dft) * RYD_TO_EV
+    log(f"  [eqp] {os.path.basename(eqp_file)}: n_occ={n_occ_qp}, "
+        f"QP shifts min/max = {shift_ev.min():+.4f} / {shift_ev.max():+.4f} eV; "
+        f"BSE runs on QUASIPARTICLE energies")
+    return enk_qp
+
+
+def require_valence_pad_guard(data) -> None:
+    """Refuse a loaded window whose valence pad is not at the signed guard.
+
+    The loader and :func:`apply_eqp_and_reslice_bands` write
+    ``-PAD_EPS_GUARD_RY`` on the valence pad bands; a zero pad makes
+    ``ΔE = ε_c − 0`` a spurious transition below every physical one.
+    """
+    n_val, nv_pad = int(data["n_val"]), int(data["n_val_pad"])
+    if nv_pad <= n_val:
+        return
+    worst = float(jnp.max(jnp.asarray(data["eps_v"])[:, n_val:].real))
+    if worst > -0.5 * PAD_EPS_GUARD_RY:
+        raise ValueError(
+            f"loader returned an unguarded valence pad — "
+            f"max eps_v over the {nv_pad - n_val} pad bands is {worst:.3e} "
+            f"Ry, expected <= {-0.5 * PAD_EPS_GUARD_RY:.3e}. A zero pad "
+            f"here makes DeltaE = eps_c - 0 a spurious transition BELOW "
+            f"every physical one. See bse_window.PAD_EPS_GUARD_RY.")

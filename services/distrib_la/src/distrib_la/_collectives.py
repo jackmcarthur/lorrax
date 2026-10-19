@@ -1,0 +1,136 @@
+"""The cross-process primitives distrib_la needs, and nothing else.
+
+``broadcast_bytes`` was ported from LORRAX ``src/ffi/common/broadcast.py`` at
+96a6399.  Process-local placement is imported from lxkit's shared substrate.
+Survey 3 (a) ruled ``broadcast_bytes`` OUT of lxkit — it reaches
+``jax._src.distributed.global_state``, which is a private-API bet lxkit
+must not take on every service's behalf — and INTO the service that needs
+it, which is this one: the cuSOLVERMp context bootstrap ships an
+``ncclUniqueId`` from rank 0 to every process before any collective work.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+import numpy as np
+from lxkit import device_put_process_local, device_put_process_local_cached
+
+__all__ = ["broadcast_bytes", "device_put_process_local", "device_put_process_local_cached",
+           "warm_mesh_cliques"]
+
+
+_BOOTSTRAP_HEARTBEAT_MS = 60_000
+
+
+def _wait_for_bootstrap(client, key: str, rank: int,
+                        what: str = "rank 0 to publish NCCL ID") -> str:
+    """Wait for rank 0's opaque payload; only retry the KV client's timeout.
+
+    Service-local sibling of common.jax_compile_cache's wait: distrib_la is
+    independently installable and cannot import LORRAX's common package.
+    Walltime belongs to the whole-step supervisor, never an arriving rank.
+    """
+    from jax.errors import JaxRuntimeError
+
+    started = time.monotonic()
+    while True:
+        try:
+            return client.blocking_key_value_get(key, _BOOTSTRAP_HEARTBEAT_MS)
+        except (TimeoutError, JaxRuntimeError) as exc:
+            if not isinstance(exc, TimeoutError) and not str(exc).startswith(
+                    "DEADLINE_EXCEEDED:"):
+                raise
+            print(
+                f"[distrib_la] rank={rank} still waiting for {what} "
+                f"key={key} "
+                f"({time.monotonic() - started:.0f} s elapsed)", file=sys.stderr, flush=True)
+
+
+def broadcast_bytes(buf: np.ndarray, *, key: str) -> np.ndarray:
+    """Broadcast a ``uint8`` numpy buffer from rank 0 to all JAX processes.
+
+    Byte-exact, and that is the whole point.  Under
+    ``jax_enable_x64=True`` — which LORRAX always runs —
+    ``jax.experimental.multihost_utils.broadcast_one_to_all`` silently
+    promotes ``uint8`` to ``uint64``, which scrambles an opaque payload
+    like an ``ncclUniqueId``.  The distributed runtime client's KV store is
+    byte-exact by construction (strings over a network) and is already live
+    once ``jax.distributed.initialize()`` returns.
+
+    ``key`` must be unique per call site; single-process jobs pass through.
+    """
+    import jax
+    if buf.dtype != np.uint8:
+        raise TypeError(
+            f"broadcast_bytes: expected uint8 input, got {buf.dtype}")
+    if jax.process_count() == 1:
+        return buf
+
+    from jax._src.distributed import global_state
+    client = global_state.client
+    if int(jax.process_index()) == 0:
+        client.key_value_set(key, buf.tobytes().hex())
+    payload = bytes.fromhex(_wait_for_bootstrap(
+        client, key, int(jax.process_index())))
+    if len(payload) != buf.size:
+        raise RuntimeError(
+            f"broadcast_bytes: received {len(payload)} bytes, "
+            f"expected {buf.size}")
+    return np.frombuffer(payload, dtype=np.uint8).copy()
+
+
+# CPU/MPI creates collective communicators on first use.  jaxlib refuses to
+# create them from an intra-op worker because that worker is not MPI's main
+# thread.  This is the service-local sibling of
+# ``common.collectives.warm_mesh_cliques``: distrib_la is independently
+# installable and must not reach upward into LORRAX's common package.
+_WARMED_MESHES: set = set()
+
+
+def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
+    """Create each mesh-axis MPI communicator on the calling main thread.
+
+    A no-op off JAX's CPU ``impl=mpi`` transport, in single-process runs,
+    and for an already-warmed mesh.  Call synchronously on every rank before
+    compiling a route containing explicit ``all_to_all`` collectives.
+    """
+    if os.environ.get(
+            "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "").strip().lower() != "mpi":
+        return 0.0
+
+    import time
+
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
+
+    from jax import shard_map
+
+    if jax.process_count() <= 1:
+        return 0.0
+    key = (tuple(int(d.id) for d in mesh.devices.ravel()),
+           tuple(mesh.axis_names))
+    if key in _WARMED_MESHES:
+        return 0.0
+
+    t0 = time.perf_counter()
+    tiny = jnp.zeros(1)
+    axes = list(mesh.axis_names)
+    groups = list(axes) + ([tuple(axes)] if len(axes) > 1 else [])
+    for ax in groups:
+        f = jax.jit(shard_map(
+            lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,  # exact-reduce: warm-up of zeros
+            in_specs=(P(None),), out_specs=P(None), check_vma=False))
+        jax.block_until_ready(f(tiny))
+
+    dt = time.perf_counter() - t0
+    _WARMED_MESHES.add(key)
+    if jax.process_index() == 0:
+        print_fn(
+            f"[distrib_la] warmed {len(groups)} MPI cliques for mesh "
+            f"{tuple(mesh.devices.shape)} axes={axes} in {dt * 1e3:.0f} ms")
+    return dt

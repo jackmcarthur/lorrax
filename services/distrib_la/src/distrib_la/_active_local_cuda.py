@@ -1,0 +1,257 @@
+"""Exact active-range local GEMM through classic BLAS (cuBLAS on CUDA, rocBLAS on ROCM).
+
+Its callers import it only for a mesh whose ``ACTIVE_LOCAL_ROUTE`` row is
+``"native"`` (``_active_local.active_local_route(mesh_platform(mesh))``), and
+pass that platform key to the probes, so it never loads a device library
+elsewhere.  Both device legs build the same leg-neutral handler
+(``src/ffi/cpp/cublas/local_active_gemm_ffi.cc`` over ``common/gpu_blas.h``),
+so the target names, the contract and this module are one for both.  Each invocation operates on one process-local tile and
+issues no communication.  Runtime bounds remain device operands; the FFI reads
+only their small metadata array to the host and views the original row-major
+buffers without packing slices.  It stays the CUDA arm because it is 3.7-5.0x
+faster than the JAX panels (``_active_local``) on windowed bounds at P4, and
+equal on a full window (sandbox claim 3987).
+"""
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+from distrib_la.loader import probe_target
+
+
+_TARGET = "lorrax_cublas_local_active_range_gemm"
+#: The same product with no C operand (beta = 0): the handler writes every row,
+#: so the output is not zero-filled first.
+_OUT_TARGET = "lorrax_cublas_local_active_range_gemm_out"
+_PREPARED_TARGET = "lorrax_cublas_local_prepared_active_range_gemm"
+_WORKSPACE_BYTES = 4 * 1024 * 1024
+
+
+def require_active_local_cuda(platform: str = "CUDA") -> None:
+    """Load and capability-probe the device handler (``platform``: CUDA | ROCM) before tracing."""
+    for target in (_TARGET, _OUT_TARGET):
+        usable, reason = probe_target(target, platform)
+        if not usable:
+            raise RuntimeError(
+                "local active cuBLAS GEMM is unavailable: " + reason)
+
+
+def require_prepared_active_local_cuda(platform: str = "CUDA") -> None:
+    """Load and capability-probe the prepared device handler (CUDA | ROCM) before tracing."""
+    usable, reason = probe_target(_PREPARED_TARGET, platform)
+    if not usable:
+        raise RuntimeError(
+            "local prepared active cuBLAS GEMM is unavailable: " + reason)
+
+
+def _dense(a, b, weighted_a, c, *, alpha, beta):
+    scale = alpha if a.dtype.kind == "c" else alpha.real
+    result = scale * jnp.matmul(weighted_a, b)
+    if beta != 0:
+        beta_scale = beta if a.dtype.kind == "c" else beta.real
+        result = result + beta_scale * c
+    return result
+
+
+def _native(a, b, bounds, c, *, alpha, beta):
+    output = jax.ShapeDtypeStruct((a.shape[0], a.shape[1], b.shape[2]), a.dtype)
+    workspace = jax.ShapeDtypeStruct((_WORKSPACE_BYTES,), jnp.uint8)
+    call = jax.ffi.ffi_call(
+        _TARGET,
+        (output, workspace),
+        # jax.ffi spells layouts major-to-minor. These are ordinary C-order
+        # buffers; the handler performs the row/column-major reinterpretation.
+        input_layouts=[(0, 1, 2), (0, 1, 2), (0, 1), (0, 1, 2)],
+        output_layouts=[(0, 1, 2), (0,)],
+        input_output_aliases={3: 0},
+        vmap_method="sequential",
+    )
+    result, _ = call(
+        a,
+        b,
+        bounds,
+        c,
+        nq=a.shape[0],
+        m=a.shape[1],
+        k=a.shape[2],
+        n=b.shape[2],
+        alpha_re=float(alpha.real),
+        alpha_im=float(alpha.imag),
+        beta_re=float(beta.real),
+        beta_im=float(beta.imag),
+    )
+    return result
+
+
+def _native_out(a, b, bounds, *, alpha):
+    """``alpha·A[:, :, lo:hi] @ B[:, lo:hi]`` per row into a fresh output (beta = 0)."""
+    output = jax.ShapeDtypeStruct((a.shape[0], a.shape[1], b.shape[2]), a.dtype)
+    workspace = jax.ShapeDtypeStruct((_WORKSPACE_BYTES,), jnp.uint8)
+    call = jax.ffi.ffi_call(
+        _OUT_TARGET,
+        (output, workspace),
+        input_layouts=[(0, 1, 2), (0, 1, 2), (0, 1)],
+        output_layouts=[(0, 1, 2), (0,)],
+        vmap_method="sequential",
+    )
+    result, _ = call(
+        a,
+        b,
+        bounds,
+        nq=a.shape[0],
+        m=a.shape[1],
+        k=a.shape[2],
+        n=b.shape[2],
+        alpha_re=float(alpha.real),
+        alpha_im=float(alpha.imag),
+    )
+    return result
+
+
+def _prepared_native(a, b, c, *, active_bounds, alpha, beta):
+    output = jax.ShapeDtypeStruct((a.shape[0], a.shape[1], b.shape[2]), a.dtype)
+    workspace = jax.ShapeDtypeStruct((_WORKSPACE_BYTES,), jnp.uint8)
+    call = jax.ffi.ffi_call(
+        _PREPARED_TARGET,
+        (output, workspace),
+        input_layouts=[(0, 1, 2), (0, 1, 2), (0, 1, 2)],
+        output_layouts=[(0, 1, 2), (0,)],
+        input_output_aliases={2: 0},
+        vmap_method="sequential",
+    )
+    result, _ = call(
+        a,
+        b,
+        c,
+        nq=a.shape[0],
+        m=a.shape[1],
+        k=a.shape[2],
+        n=b.shape[2],
+        alpha_re=float(alpha.real),
+        alpha_im=float(alpha.imag),
+        beta_re=float(beta.real),
+        beta_im=float(beta.imag),
+        active_bounds=active_bounds,
+    )
+    return result
+
+
+# Kernel lessons: the local active-range GEMM (numbers: sandbox claim ids).
+# Over plain JAX: the Sigma tau Green over each parent's live bands instead of an XLA ZGEMM over all
+#   bands, CrI3 6x6 mu3088 Sigma tau 88.5 -> 59.7 s (1.48x), its Green ZGEMM 45.1 -> 13.0 s (2833);
+#   8192 bands at P16, 18.1x narrow and 3.6x wide over the masked product (2266).
+# Paid: the no-C target writes every row itself, so the aliased zero fill (746 x 4.35 ms) is gone (2841).
+# Did not pay: band slices bucketed by width with their own compiles, CrI3 tau sweep 5.02 -> 7.67 s
+#   (2724); host-planned bounds to drop the per-call bounds read and sync, which idles the GPU
+#   <= 1.2% (2954) and would not be bitwise, since the live bands move with tau (I); a sync-free tau
+#   loop, host-blocked 2.04 -> 0 s with the sweep unchanged (2829).
+# Decides it: flops scale with the live interval; the bounds read is cheap because the GPU queue
+#   refills within ~20 us of it (2829).
+def active_local_cuda(a, b, bounds, weights, c=None, *, alpha, beta, guard="cond"):
+    """Compute weighted local interval products with fixed allocation shapes.
+
+    ``a`` is ``(nq,m,K)``, ``b`` is ``(nq,K,n)``, ``bounds`` is
+    ``(nq,2)``, and ``weights`` is ``(nq,K)``.  All are local values inside
+    the plan's shard_map.  ``guard`` (``_active_local.ACTIVE_LOCAL_GUARD``):
+    ``"cond"`` -- full bounds retain the original JAX dense product, valid
+    partial bounds use the pointer-view handler, invalid dynamic bounds
+    produce an all-NaN result without entering the native call;
+    ``"select"`` -- no device control flow: every row of an invalid set is
+    replaced by an empty interval, the handler always runs (full bounds
+    included), and the result is NaN where the bounds were invalid;
+    ``"full"`` -- no host read: the prepared target over all K columns with
+    the weights zeroed outside each row's interval (NaN for invalid bounds),
+    exact for finite inactive storage, NaN in a row whose inactive storage is
+    not finite (see ``ACTIVE_LOCAL_GUARD``).
+    """
+    if a.ndim != 3 or b.ndim != 3 or a.shape[0] != b.shape[0] or a.shape[2] != b.shape[1]:
+        raise ValueError("local active cuBLAS GEMM operand geometry mismatch")
+    if a.dtype != b.dtype or a.dtype not in (jnp.float64, jnp.complex128):
+        raise TypeError("local active cuBLAS GEMM requires matching float64/complex128 operands")
+    if bounds.shape != (a.shape[0], 2) or not jnp.issubdtype(bounds.dtype, jnp.integer):
+        raise ValueError("local active cuBLAS GEMM bounds must have shape (nq,2)")
+    if weights.shape != (a.shape[0], a.shape[2]) or weights.dtype != a.dtype:
+        raise ValueError("local active cuBLAS GEMM weights must match (nq,K) and operand dtype")
+    shape = (a.shape[0], a.shape[1], b.shape[2])
+    if c is None:
+        if beta != 0:
+            raise ValueError("local active cuBLAS GEMM requires C when beta != 0")
+    elif c.shape != shape or c.dtype != a.dtype:
+        raise ValueError("local active cuBLAS GEMM C geometry or dtype mismatch")
+
+    weighted_a = a * weights[:, None, :]
+    lo, hi = bounds[:, 0], bounds[:, 1]
+    valid = jnp.all((lo >= 0) & (lo <= hi) & (hi <= a.shape[2]))
+    if guard == "full":
+        col = jnp.arange(a.shape[2], dtype=bounds.dtype)
+        live = (col >= lo[:, None]) & (col < hi[:, None])
+        w = jnp.where(valid, jnp.where(live, weights, jnp.zeros((), a.dtype)),
+                      jnp.full((), jnp.nan, a.dtype))
+        cc = jnp.zeros(shape, a.dtype) if c is None else c
+        every = np.array([0, a.shape[2]], np.int64)
+        return _prepared_native(a * w[:, None, :], b, cc, active_bounds=every, alpha=alpha,
+                                beta=beta if c is not None else np.complex128(0.0))
+    if guard == "select":
+        safe = jnp.where(valid, bounds, jnp.zeros_like(bounds))
+        result = (_native_out(weighted_a, b, safe, alpha=alpha) if c is None
+                  else _native(weighted_a, b, safe, c, alpha=alpha, beta=beta))
+        return jnp.where(valid, result, jnp.full((), jnp.nan, a.dtype))
+    if guard != "cond":
+        raise ValueError(
+            f"local active GEMM guard must be 'cond', 'select' or 'full', got {guard!r}")
+    full = jnp.all((lo == 0) & (hi == a.shape[2]))
+    nan = lambda _: jnp.full(shape, jnp.nan, dtype=a.dtype)
+    # No C: the `_out` handler writes every row itself (no zero-filled alias).
+    native = (lambda _: _native_out(weighted_a, b, bounds, alpha=alpha)) if c is None \
+        else (lambda _: _native(weighted_a, b, bounds, c, alpha=alpha, beta=beta))
+
+    def valid_call(_):
+        return jax.lax.cond(
+            full,
+            lambda _: _dense(a, b, weighted_a, c, alpha=alpha, beta=beta),
+            native,
+            operand=None,
+        )
+
+    return jax.lax.cond(valid, valid_call, nan, operand=None)
+
+
+def prepared_active_local_cuda(
+    a, b, weights, c=None, *, active_bounds, alpha, beta,
+):
+    """Compute one host-validated interval encoded in immutable FFI attrs."""
+    if (a.ndim != 3 or b.ndim != 3 or a.shape[0] != b.shape[0] or
+            a.shape[2] != b.shape[1]):
+        raise ValueError("local prepared active cuBLAS GEMM operand geometry mismatch")
+    if a.dtype != b.dtype or a.dtype not in (jnp.float64, jnp.complex128):
+        raise TypeError(
+            "local prepared active cuBLAS GEMM requires matching float64/complex128 operands")
+    if weights.shape != (a.shape[0], a.shape[2]) or weights.dtype != a.dtype:
+        raise ValueError(
+            "local prepared active cuBLAS GEMM weights must match (nq,K) and operand dtype")
+    if c is None:
+        if beta != 0:
+            raise ValueError(
+                "local prepared active cuBLAS GEMM requires C when beta != 0")
+        c = jnp.zeros((a.shape[0], a.shape[1], b.shape[2]), dtype=a.dtype)
+    elif c.shape != (a.shape[0], a.shape[1], b.shape[2]) or c.dtype != a.dtype:
+        raise ValueError(
+            "local prepared active cuBLAS GEMM C geometry or dtype mismatch")
+
+    weighted_a = a * weights[:, None, :]
+    pairs = np.asarray(active_bounds).reshape(-1, 2)
+    if np.all(pairs[:, 0] == 0) and np.all(pairs[:, 1] == a.shape[2]):
+        return _dense(a, b, weighted_a, c, alpha=alpha, beta=beta)
+    return _prepared_native(
+        weighted_a, b, c, active_bounds=active_bounds,
+        alpha=alpha, beta=beta)
+
+
+__all__ = [
+    "active_local_cuda",
+    "prepared_active_local_cuda",
+    "require_active_local_cuda",
+    "require_prepared_active_local_cuda",
+]

@@ -1,0 +1,1864 @@
+"""THE cross-process layer: one wrapped API for everything that spans ranks.
+
+A driver that needs another process's data — or needs to agree with it —
+calls this module and nothing below it.  Nothing here requires the caller to
+know what a ``Mesh``, a ``NamedSharding``, a ``shard_map`` or
+``multihost_utils`` is; that is the point.  Every function imports jax
+*inside its body*, so importing this module costs nothing and is safe before
+``jax.distributed.initialize``.
+
+In the order a driver meets it: **topology** (:func:`process_rank_world`,
+:func:`device_count`); **the mesh and its warm-up** (:func:`prepare_mesh`,
+:func:`resolve_mesh`, :func:`single_device_mesh`); **staging onto a mesh
+without a collective** (:func:`device_put_process_local`,
+:func:`replicate_to_mesh`, :func:`shard_over_k`); **vacating a mesh without
+a collective** (:func:`spill_to_host`, :func:`restore_from_host` — the
+same anti-collective idiom run in the other direction, for bounding a
+multi-stage driver's live set rather than for placement); **reductions and gathers**
+(:func:`psum_replicate`, :func:`all_gather_processes`,
+:func:`gather_to_host`, :func:`gather_indexed_blocks`,
+:func:`psum_scatter_checked`); **the k-partitioned sweep**
+(:func:`local_share`, :func:`sweep_local_k`, :func:`gather_k_blocks`); and
+**barriers** (:func:`barrier`, :func:`warm_mesh_cliques`).
+
+Two of these are the ones a physics driver actually wants:
+:func:`prepare_mesh` (*"give me the run's mesh, with every communicator it
+will need already created"*) and :func:`gather_k_blocks` (*"run this per-k
+block on every k and hand me all of them"*), with the partition, the
+pipelining, the warm-up and the gather inside.
+
+Two pairs here look interchangeable and are not — read their docstrings
+before choosing.  :func:`all_gather_processes` vs :func:`gather_to_host`
+(different-value-per-process vs one-global-array; the wrong branch silently
+multiplies the leading axis by P), and ``warm_mesh_cliques`` vs
+``runtime.nccl_warmup`` (only :func:`prepare_mesh`'s CALL SITE unifies them;
+their bodies must stay separate).
+
+Why the barrier is the module's founding member
+-----------------------------------------------
+The codebase had seven copies of this shape, wrapped around the barrier
+that follows a rank-0-only HDF5 write::
+
+    try:
+        from jax.experimental import multihost_utils as _mh
+        _mh.sync_global_devices("restart_head_scalars")
+    except Exception:
+        pass
+
+The intent was benign — "don't blow up in a single-process run" — but the
+handler catches far more than that.  ``sync_global_devices`` raises when
+the distributed client is *broken*: a peer has died, a timeout expired, a
+rank reached a barrier its peers never will.  Swallowing that is the worst
+possible response, because the surviving rank then sails past a barrier
+its peers are still blocked in.  The result is the campaign's signature
+failure: the job hangs or half-completes, srun reaps it, and the exit code
+at the sbatch level is **0**.
+
+The correct split is:
+
+* **single process** → the barrier is genuinely a no-op; skip it, silently.
+* **``multihost_utils`` unavailable** → ditto (there is nothing to sync).
+* **anything else** → fatal.  Let it propagate so the rank dies loudly and
+  takes the job's exit code with it.
+
+That is what :func:`barrier` implements, and it is the *only* thing it
+does differently from the code it replaces.
+
+The module's second job — :func:`device_put_process_local` — is the
+mirror image: a cross-process placement that must NOT become a
+collective.  See its docstring for the JAX behaviour it works around.
+
+Its third job — :func:`spill_to_host` / :func:`restore_from_host` — runs
+that mirror image in the OTHER direction: moving an already-sharded
+``jax.Array`` off-device and back, touching only shards a process already
+owns, so a driver holding several large sharded results across stages
+(``gw.screening.compute_screening``'s per-role W is the motivating
+caller) can bound how many are resident on-device at once without a
+second chi0/W implementation or a disk round-trip.
+"""
+from __future__ import annotations
+
+import itertools
+import threading
+from typing import Any, Callable, NamedTuple
+
+from ffi import _services
+
+_services.ensure_on_path()
+from lxkit import (device_put_process_local, device_put_process_local_cached,
+                   device_put_process_tiles, placement_cache_stats)
+from lxkit import ordered_psum, ordered_psum_scatter
+
+
+__all__ = [
+    # topology
+    "process_count",
+    "process_rank",
+    "process_rank_world",
+    "device_count",
+    # barriers
+    "barrier",
+    "agree_io_error",
+    "xor_to_all",
+    "rank0_transaction",
+    "rank0_atomic_file_transaction",
+    "collective_atomic_file_transaction",
+    # mesh construction (and the warm-up that must accompany it)
+    "resolve_mesh",
+    "single_device_mesh",
+    "mesh_is_emulated",
+    "prepare_mesh",
+    # staging a host table onto a mesh, without a collective
+    "device_put_process_local",
+    "device_put_process_local_cached",
+    "device_put_process_tiles",
+    "placement_cache_stats",
+    "replicate_to_mesh",
+    "shard_over_k",
+    # reductions and gathers
+    "psum_replicate",
+    "transpose_xy",
+    "to_transpose_partner",
+    "xy_tile_mesh",
+    "all_gather_processes",
+    "gather_to_host",
+    "gather_indexed_blocks",
+    "gather_indexed_blocks_to_owner",
+    "psum_scatter_checked",
+    "COLLECTIVE_RTOL",
+    # the k-partitioned sweep
+    "local_share",
+    "sweep_local_k",
+    "gather_k_blocks",
+    "sweep_lookahead",
+    "SWEEP_LOOKAHEAD_ENV",
+    # impl=mpi clique warm-up
+    "warm_mesh_cliques",
+]
+
+
+def _jax_int(attr: str, default: int) -> int:
+    """``int(jax.<attr>())``, or ``default`` when jax is absent OR its backend
+    is not initialised yet — both of which mean "treat this as local"."""
+    try:
+        import jax
+        return int(getattr(jax, attr)())
+    except Exception:                                          # noqa: BLE001
+        return default
+
+
+def process_count() -> int:
+    """Number of participating processes (1 when JAX is not distributed)."""
+    return _jax_int("process_count", 1)
+
+
+def process_rank() -> int:
+    """This process's index in the world (0 when JAX is not distributed)."""
+    return _jax_int("process_index", 0)
+
+
+def process_rank_world() -> tuple[int, int]:
+    """``(rank, world)`` for a work partition — PROCESS granularity.
+
+    The unit of parallelism for every sweep in this module is the process
+    (one full CPU socket on Frontera, one device), not the device, because
+    the sweeps run on process-local single-device arrays.  A build with
+    more than one addressable device per process would break that
+    identity; :func:`psum_replicate` asserts it rather than silently
+    mis-assembling.
+    """
+    return process_rank(), process_count()
+
+
+def device_count() -> int:
+    """Global device count — what a run should print, not ``len(local)``."""
+    import jax
+    return int(jax.device_count())
+
+
+#: Seconds a rank waits at a :func:`barrier` for its peers before the barrier fails
+#: (the coordination service's deadline; a rank that never arrives -- a mismatched
+#: name, a dead peer -- surfaces as this error instead of a hang).
+BARRIER_TIMEOUT_S = 1800
+_BARRIER_SERIAL: dict = {}
+
+
+def _coordination_barrier(name, _mh):
+    """Host barrier through the distributed runtime's coordination service.
+
+    No device work: ``multihost_utils.sync_global_devices`` all-gathers a name hash
+    through the devices (an H2D put, a collective and a D2H read per barrier).  Every
+    caller here orders HOST work (a rank-0 HDF5 write, a file closed before another
+    rank opens it, a timing band), which the coordination barrier orders without
+    touching a device.  Each use of a name gets its own barrier id (the n-th use on
+    every rank, in program order), so a name can recur.  Without a distributed client
+    (a multi-process run started outside ``jax.distributed``) the device barrier is
+    used, with one notice (GATE barrier_coordination).
+    """
+    from jax._src import distributed as _dist
+    client = getattr(_dist.global_state, "client", None)
+    if client is None:
+        if "notice" not in _BARRIER_SERIAL:
+            _BARRIER_SERIAL["notice"] = True
+            print("  GATE barrier_coordination: no distributed runtime client; "
+                  "collectives.barrier uses the device barrier (sync_global_devices)",
+                  flush=True)
+        _mh.sync_global_devices(name)
+        return
+    n = _BARRIER_SERIAL[name] = _BARRIER_SERIAL.get(name, 0) + 1
+    client.wait_at_barrier(f"lorrax.barrier:{name}:{n}", int(BARRIER_TIMEOUT_S * 1000))
+
+
+def barrier(name: str, *, print_fn: Callable[..., Any] = print) -> bool:
+    """Synchronize all processes at ``name``; fatal if the collective fails.
+
+    Returns True when a real barrier was executed, False when it was
+    correctly skipped as a single-process no-op.  Never returns after a
+    *failed* barrier — that raises.
+
+    Parameters
+    ----------
+    name
+        Barrier label.  Must be identical on every rank; JAX uses it as
+        the collective key, so a typo on one rank is itself a hang.
+    print_fn
+        Used only to annotate the failure before re-raising, so the log
+        names the barrier that broke rather than just the traceback.
+    """
+    try:
+        from jax.experimental import multihost_utils as _mh
+    except ImportError:
+        # No multihost support compiled in: nothing to synchronize.
+        return False
+    if process_count() <= 1:
+        return False
+    try:
+        _coordination_barrier(name, _mh)
+    except Exception as exc:
+        # Do NOT swallow.  A broken barrier in a multi-process run means
+        # this rank is about to diverge from its peers; continuing turns a
+        # crash into a hang-then-rc-0.
+        print_fn(
+            f"  *** LORRAX SANITY FAILURE: collective barrier {name!r} failed "
+            f"across {process_count()} processes ({type(exc).__name__}: "
+            f"{exc}).  This rank is now out of step with its peers — "
+            f"aborting rather than continuing into an undefined collective "
+            f"state. ***"
+        )
+        raise
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Mesh construction
+# ---------------------------------------------------------------------------
+
+
+def _require_addressable(mesh, *, origin: str):
+    """Refuse a mesh in which THIS process owns no device.
+
+    21 production sites build their own ``Mesh`` (enumerated in
+    ``wk_REL/API_LINKAGE_AUDIT.md`` §B.1, plus 19 more in ``common/*_test.py``);
+    five build the 1x1 one as
+    ``Mesh(jax.devices()[:1].reshape(1,1), …)``, which is the standing bug —
+    ``jax.devices()`` is the GLOBAL list, so every rank builds a mesh over
+    *process 0's* device and every rank >= 1 gets a mesh with ZERO
+    addressable devices.  Nothing complains until the first array is placed
+    on it, at which point ``jax.make_array_from_process_local_data`` runs
+    ``next(iter(addressable_shards.values()))`` (jax/_src/array.py:1017) over
+    an empty map and raises a BARE ``StopIteration`` — no message, no rank,
+    no mention of a mesh.
+
+    ``Mesh.local_devices`` (jax/_src/mesh.py:425) keeps only devices whose
+    ``process_index`` matches this client's, so an empty list is exactly that
+    case.  Refusing here names the caller, which is the only place the mesh's
+    provenance is still known.
+    """
+    if not list(mesh.local_devices):
+        raise RuntimeError(
+            f"{origin}: the mesh over devices "
+            f"{[int(d.id) for d in mesh.devices.flat]} contains NO device "
+            f"addressable by process {process_rank()} of {process_count()}.  "
+            f"Nothing can be computed on it, and the first array placed on it "
+            f"would raise a bare StopIteration from "
+            f"jax.make_array_from_process_local_data.  The usual cause is "
+            f"``jax.devices()[:1]`` (the GLOBAL list — process 0's device on "
+            f"every rank) where ``collectives.single_device_mesh()`` was "
+            f"meant.")
+    return mesh
+
+
+#: The one canonical SQUARE mesh per axis-name tuple, cached on first
+#: resolution.  Same identity contract as ``_PROCESS_LOCAL_MESH`` below and
+#: for the same reason: shape-keyed jit caches key on the output
+#: ``NamedSharding``, which embeds the mesh OBJECT, so a library that
+#: re-resolves after ``runtime.initialize_communicator_stack`` built the
+#: run's mesh must get THE mesh back, not an equal-but-distinct twin
+#: (``centroid.distribution.build_mesh`` and the BSE factory both re-resolve).
+_CANONICAL_MESHES: dict = {}
+
+
+def resolve_mesh(mesh=None, *, axis_names=("x", "y")):
+    """THE run's device mesh: pass your own, or get the canonical SQUARE one.
+
+    Callers that already hold the run's mesh (the GW driver) pass it, so no
+    second mesh — and no second communicator — is created.  A CLI has none
+    and gets the s x s mesh over ``jax.devices()`` (s = sqrt of the device
+    count), degenerating to 1x1 on a single device so every code path is
+    identical at P=1.
+
+    ONLY SQUARE 2-D MESHES ARE SUPPORTED (owner ruling, repo
+    ``docs/architecture/decisions.md`` 2026-08-01): rectangular meshes
+    complicate ScaLAPACK grid geometry and the divisibility contracts for no
+    measured benefit at our scales.  A device count that is not a perfect
+    square REFUSES here, naming the square counts to request.  The ruling's
+    stated safety net — build s x s and idle the surplus ranks — is
+    deliberately NOT implemented on this stack, because idle ranks cannot be
+    made deadlock-free without deep surgery: (a) under the production
+    transport ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi``, communicator
+    creation is ``MPI_Comm_split`` — collective over ``MPI_COMM_WORLD`` (see
+    :func:`warm_mesh_cliques`) — so a rank outside the mesh that never
+    executes the warm-up jits leaves every in-mesh rank blocked in the split;
+    (b) :func:`psum_replicate` and the k-sweep gathers assume mesh size ==
+    process count; (c) ``multihost_utils`` barriers span the WORLD, so idle
+    ranks would have to replay the entire driver control flow in lockstep
+    while skipping every mesh-touching jit.  A refusal that names the square
+    count is the deadlock-free form of the same rule.
+
+    The mesh is built ONCE per process per axis-name tuple and cached
+    (``_CANONICAL_MESHES``): ``runtime.initialize_communicator_stack``
+    resolves it at driver import, and every later no-argument call — a
+    library helper resolving "the run's mesh" for itself — gets the same
+    object rather than an equal-but-distinct twin that would double every
+    shape-keyed jit cache.
+
+    Either way the result is checked with :func:`_require_addressable`, so a
+    mesh this process cannot compute on is refused here rather than
+    manifesting as a bare ``StopIteration`` several layers down.
+    """
+    import math
+
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    if mesh is not None:
+        return _require_addressable(mesh, origin="resolve_mesh(caller's mesh)")
+    key = tuple(axis_names)
+    cached = _CANONICAL_MESHES.get(key)
+    if cached is not None:
+        return _require_addressable(cached, origin="resolve_mesh(canonical)")
+    devices = jax.devices()
+    total = len(devices)
+    s = math.isqrt(total)
+    if s * s != total:
+        raise RuntimeError(
+            f"resolve_mesh: this run has {total} devices over "
+            f"{process_count()} process(es), and {total} is not a perfect "
+            f"square.  Only square 2-D meshes are supported (repo "
+            f"docs/architecture/decisions.md, 2026-08-01) — request "
+            f"{s * s} processes (a {s}x{s} mesh) or {(s + 1) * (s + 1)} "
+            f"(a {s + 1}x{s + 1} mesh).  Idle-rank truncation to {s}x{s} is "
+            f"not implemented: under JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi, "
+            f"communicator creation is collective over MPI_COMM_WORLD, so "
+            f"the {total - s * s} out-of-mesh rank(s) would deadlock the "
+            f"in-mesh ranks at their first collective (see the resolve_mesh "
+            f"docstring for the full argument).")
+    built = _require_addressable(
+        Mesh(np.asarray(devices).reshape(s, s), axis_names=key),
+        origin="resolve_mesh")
+    _CANONICAL_MESHES[key] = built
+    return built
+
+
+#: The one cached process-local mesh.  A module global, not a
+#: ``functools.lru_cache``, so it is greppable and so the identity contract
+#: below is visible at the point it is enforced.
+_PROCESS_LOCAL_MESH = None
+
+
+def single_device_mesh():
+    """THE 1x1 ``('x','y')`` mesh over **this process's own** device.
+
+    Use wherever a jit must run process-locally: every rank gets a different
+    mesh holding a different device, so the program compiles and runs with no
+    collective and no cross-rank agreement on shapes.  Safe at any P — which
+    is what distinguishes it from a same-named helper that means "collapse to
+    ONE device for the whole run" and must refuse at P>1.
+
+    **There must be exactly one of these objects per process, and this module
+    owns it.**  That is a correctness requirement, not tidiness: the
+    shape-keyed jit caches in ``common.wfn_transforms`` (``to_box`` and
+    friends) key on the output ``NamedSharding``, which embeds the mesh
+    OBJECT, so a second equal-but-distinct 1x1 ``Mesh`` doubles every one of
+    them.  ``common.wfn_transforms.process_local_mesh`` is an alias for this
+    function — the same object, not a second implementation.
+
+    It was defined there until 2026-07-31, and this module reached *up* into
+    that ψ-transform kernel to borrow it: the cross-process service importing
+    a physics module to learn where its own device is.  The identity contract
+    is unchanged; only the direction of the import is.
+
+    NOTE the difference from ``jax.devices()[:1]``, the spelling this helper
+    replaces at its call sites: ``jax.devices()`` is the GLOBAL device list,
+    so ``jax.devices()[0]`` is process 0's device on every rank — a mesh no
+    rank but 0 can compute on.
+    """
+    global _PROCESS_LOCAL_MESH
+    if _PROCESS_LOCAL_MESH is None:
+        import jax
+        import numpy as np
+        from jax.sharding import Mesh
+        _PROCESS_LOCAL_MESH = Mesh(
+            np.asarray(jax.local_devices()[:1]).reshape(1, 1),
+            axis_names=('x', 'y'))
+    return _PROCESS_LOCAL_MESH
+
+
+def mesh_is_emulated(mesh) -> bool:
+    """True when ``mesh`` spans more devices than this run has processes.
+
+    ``mesh.devices.size > 1 and process_count() == 1`` — one process
+    owning every cell of a multi-device mesh, which is what
+    ``--xla_force_host_platform_device_count=N`` produces and what a real
+    ``srun -n N`` never does.
+
+    The predicate reads ``process_count()``, not the XLA flag, and that is
+    load-bearing in both directions: a real ``-n 4`` leg sets no flag and
+    must never be labelled emulated, and a flagged single-process run must
+    never be labelled real.
+
+    It is also platform-blind, which is the third direction and the one
+    that bites.  It reads ``devices.size`` and ``process_count()`` and
+    nothing else, so it is equally true of a single-process multi-GPU mesh
+    — ``resolve_mesh()`` on a 4-GPU box, or a test harness child handed all
+    four GPUs.  That geometry is not an emulation; it is the arm deleted
+    with the cuSOLVERMg backend (``docs/architecture/slab_io.md``: one
+    process per device), and every FFI
+    transport refuses it.  So a consumer that tiers down on this predicate
+    must add its own platform guard, or it will serve a deleted geometry
+    through a path nobody chose.  ``file_io._slab_io_serial`` does exactly
+    that (``ffi.gate.mesh_ffi_platform(mesh) != "cpu"`` → refuse), and
+    ``tests/test_slab_io_emulated_mesh.py`` has the false case.  Widening
+    this predicate to read the platform itself would be wrong: "more
+    devices than processes" is a true statement about that mesh, and the
+    consumers that only ask the question (rather than tiering down on it)
+    want the honest answer.
+
+    What it is for.  A mesh cell is a per-device thing; an MPI/NCCL/HDF5
+    context is a per-process thing.  Every transport that bootstraps one
+    context per mesh cell (``ffi.io.open_file``,
+    ``distrib_la._slate``) therefore requires ``p*q == process_count()`` and
+    refuses an emulated mesh — correctly, since all N devices would share
+    rank 0's hyperslab or communicator.  A component with a serial tier
+    (``wfn_loader``'s ``eager``, ``file_io._slab_io_serial``) asks this
+    instead, and selects the tier that needs no per-cell context.  It is a
+    tier predicate, never a fallback trigger: nothing may call it after a
+    transport has failed.
+
+    ``False`` at ``P=1/D=1`` (nothing to emulate) and at every ``P>1``,
+    including the misconfiguration where one of several processes was
+    handed extra devices — that one is a refusal at the transport, not a
+    tier-down here.
+    """
+    try:
+        size = int(mesh.devices.size)
+    except AttributeError as exc:
+        raise TypeError(
+            f"mesh_is_emulated: expected a jax.sharding.Mesh, got "
+            f"{type(mesh).__name__} — the predicate reads mesh.devices.size "
+            f"against process_count()") from exc
+    return size > 1 and process_count() == 1
+
+
+def prepare_mesh(mesh=None, *, axis_names=("x", "y"), print_fn=print):
+    """:func:`resolve_mesh`, then warm every communicator the run will need.
+
+    THE call a driver should make once, before any jit.  Nobody owned
+    collective warm-up, so it was happening by luck: ``gw.gw_jax`` calls only
+    ``runtime.nccl_warmup``, and under
+    ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` its mesh gets clique-warmed
+    *incidentally*, by whichever physics kernel fires a collective first
+    (``common/zeta_projection.py``, ``common/contract_bands.py``).  That works only while those early
+    programs stay small enough for XLA's SEQUENTIAL thunk executor; a larger
+    one takes the parallel executor and lands on the very refusal that killed
+    the BSE TDA Lanczos outright (32 refusals at P=16, gate 7881216).  A
+    physics kernel performing distributed-runtime initialisation is the
+    layering inverted; this function is where it belongs.
+
+    THE TWO WARM-UPS ARE NOT MERGED, AND MUST NOT BE.  Only the CALL SITE is
+    unified here.
+
+    * :func:`warm_mesh_cliques` (CPU/MPI) is correct *because* its jit is
+      small enough that XLA takes ``ThunkExecutor::ExecuteSequential`` and
+      runs the thunk inline on the calling thread — that inlining IS the
+      mechanism, not an implementation detail.
+    * ``runtime.nccl_warmup`` (GPU/NCCL) deliberately routes through
+      ``jax.jit(jnp.sum)`` on a sharded array, because ``lax.psum`` is not
+      callable from a top-level jit, and its purpose is to force
+      ``ncclCommInitRank`` topology discovery, which has no thread constraint.
+
+    A merged body would have to satisfy both, and the CPU constraint bounds
+    program size in a way the GPU one does not need.
+
+    Both are no-ops off their platform, at P=1, and on an already-warmed mesh,
+    so this is safe to call unconditionally.  It IS a collective: call it
+    synchronously on every rank.
+    """
+    from common import timing
+
+    mesh = resolve_mesh(mesh, axis_names=axis_names)
+    if process_count() > 1:
+        with timing.section("collective_warmup"):
+            warm_mesh_cliques(mesh, print_fn=print_fn)
+            from runtime import nccl_warmup
+            nccl_warmup(mesh)
+    return mesh
+
+
+def shard_over_k(arr, mesh, *, axes=None):
+    """Constrain ``arr`` to be split along its LEADING axis over the mesh.
+
+    The k-major sharding constraint every ψ consumer applies:  ``arr`` is
+    ``(nk, …)``, the k axis rides the flattened mesh axes and every other axis
+    is replicated.  ``P(('x','y'), …)`` flattens row-major, so the mesh's
+    factorisation changes only how a 2-D spec would split — not which device
+    holds which k.
+
+    Exists so a physics driver never has to name ``NamedSharding`` or
+    ``PartitionSpec`` to say "one k per device" (request R2 from
+    ``psp/_dist.py``).
+    """
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    ax = tuple(mesh.axis_names) if axes is None else tuple(axes)
+    spec = P(ax, *((None,) * (int(arr.ndim) - 1)))
+    return jax.lax.with_sharding_constraint(arr, NamedSharding(mesh, spec))
+
+
+# ---------------------------------------------------------------------------
+# The anti-collective: staging a host table onto a multi-process sharding
+# ---------------------------------------------------------------------------
+#
+# ``jax.device_put(host_numpy, NamedSharding(multi_process_mesh, spec))``
+# LOOKS like a pure local placement — every rank already holds the same
+# host table, each rank owns one device, so nothing needs to move.  It is
+# not.  ``jax/_src/dispatch.py::_device_put_sharding_impl`` takes this
+# branch whenever the target sharding is not fully addressable AND the
+# operand is a numpy array (or an *uncommitted* ``jax.Array``)::
+#
+#     if xla_bridge.process_count() == len(s. ... .process_indices):
+#         multihost_utils.assert_equal(x, fail_message=...)
+#
+# and ``assert_equal`` is ``process_allgather(x, tiled=True)`` — a REAL
+# all-gather that concatenates every process's copy and materialises
+# ``P × x.nbytes`` on **every** rank, on device AND (via the closing
+# ``np.asarray``) on the host.  It is a debug assertion, it is silent, it
+# is P-LINEAR, and it is charged to whatever stage happened to call
+# ``device_put``.
+#
+# MEASURED (wk_Y probe, MoS2 12x12, rank-0 optimized HLO — scorecard Y.3):
+# the WFN loader's two big tables did exactly this inside the
+# ``A_centroid_load`` stage:
+#
+#     jit(_identity_fn)  s32[P*nk, 36,36,135]  =  P*nk*n_rtot*4
+#                        1.61 GB @P=16 | 6.45 GB @P=64 | 14.5 GB @P=144
+#     jit(_identity_fn)  c128[P*nk, ngkmax]    =  P*nk*ngkmax*16
+#                        0.32 GB @P=16 | 1.27 GB @P=64 |  2.85 GB @P=144
+#
+# i.e. 17.4 GB/rank of pure assertion traffic at the production mesh, and
+# the reason the planner "under-predicted" A_centroid_load by ~2x at
+# 606c/P=64 (scorecard Y.5 / anomaly 5) — nothing in the memory model
+# knows about a debug all-gather.
+#
+# The cure is the idiom the codebase already uses in three other places
+# (``WfnLoader._assemble_process_local``, ``kin_ion_io.replicate_to_mesh``,
+# the slab-io process-local writers): declare each rank's own shard with
+# ``jax.make_array_from_single_device_arrays``.  Zero collectives, zero
+# transient, and identical semantics for the values this is used on.
+
+class HostSpill(NamedTuple):
+    """A ``jax.Array``'s LOCAL shards, moved to host RAM by
+    :func:`spill_to_host`.  Opaque outside this module — hand it straight
+    to :func:`restore_from_host`.  A caller juggling several of these
+    beside real arrays (e.g. a ``{role: W_q}`` dict where every role but
+    the one about to be used stays spilled) only ever needs
+    ``isinstance(v, HostSpill)`` to tell the two apart.
+    """
+    shape: tuple[int, ...]
+    sharding: Any
+    shards: list          # [(device, numpy shard), ...], one per local shard
+
+
+def spill_to_host(arr) -> "HostSpill":
+    """Pull every LOCAL shard of ``arr`` to host RAM and DELETE ``arr``.
+
+    The anti-collective's other direction (see :func:`device_put_process_local`
+    above, and the module docstring): each process touches only shards it
+    already owns (``arr.addressable_shards``), so nothing crosses a process
+    boundary — restoring is the ``jax.make_array_from_single_device_arrays``
+    idiom this module already uses in three other places, run on data that
+    came from THIS process's own shards rather than a host table every
+    process already agrees on.
+
+    ``arr`` is explicitly ``.delete()``-d before return, so the device HBM
+    it held is freed at THIS statement — not whenever Python's refcounter
+    happens to run, which is the property that makes this usable as a
+    bounded-live-set tool rather than a hint to the allocator.  A driver
+    computing several large sharded results in sequence (the motivating
+    caller is ``gw.screening.compute_screening``'s per-role W: the
+    completed STATIC role's W was staying resident, on Python-dict
+    reference alone, across the PROBE role's own chi0/W build) can spill every result but the one
+    about to be consumed, so at most one such result is resident at a
+    time, and restore the rest with :func:`restore_from_host` once every
+    stage that could contend for headroom has run.  Do NOT touch ``arr``
+    after this call — the same discipline as a donated buffer.
+
+    Round-trips bit-exactly: a device→host→device copy moves bits, it does
+    not touch them.
+    """
+    import jax
+    import numpy as np
+
+    shards = [(shard.device, np.asarray(jax.device_get(shard.data)))
+              for shard in arr.addressable_shards]
+    spill = HostSpill(shape=tuple(int(s) for s in arr.shape),
+                       sharding=arr.sharding, shards=shards)
+    arr.delete()
+    return spill
+
+
+def restore_from_host(spill: "HostSpill"):
+    """Reconstruct the ``jax.Array`` :func:`spill_to_host` took apart.
+
+    Zero collectives, mirroring ``spill_to_host``: each process re-places
+    only the shards it contributed, on the same devices, via the same
+    ``jax.make_array_from_single_device_arrays`` idiom
+    :func:`device_put_process_local` uses above.
+    """
+    import jax
+
+    arrays = [jax.device_put(host_np, device)
+              for device, host_np in spill.shards]
+    return jax.make_array_from_single_device_arrays(
+        spill.shape, spill.sharding, arrays)
+
+
+def replicate_to_mesh(host_array, mesh):
+    """A host array every rank already holds → a REPLICATED global array.
+
+    The fully-replicated case of :func:`device_put_process_local`, and the
+    third of the three call sites its header names.  No communication: each
+    rank declares its identical copy as the replica on its own device.  Use
+    it on anything produced by :func:`psum_replicate` or
+    :func:`gather_indexed_blocks` before mixing it with a driver's global
+    arrays — ``jnp.asarray`` would make a *single-device* array instead,
+    which is indistinguishable from the right thing at P=1 and an
+    operand-sharding error at P>1.
+
+    Correctness precondition: the input must be bit-identical on every rank.
+    Both producers above satisfy that by construction (a psum and an
+    all-gather are rank-invariant).
+    """
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    if process_count() <= 1:
+        return jnp.asarray(host_array)
+    spec = P(*([None] * len(np.shape(host_array))))
+    return device_put_process_local(host_array, NamedSharding(mesh, spec))
+
+
+# ---------------------------------------------------------------------------
+# Reductions and gathers over PROCESSES
+# ---------------------------------------------------------------------------
+
+
+def transpose_xy(x, mesh):
+    """``swapaxes(x, -1, -2)`` of ``x`` sharded ``P(..., 'x', 'y')`` on the square mesh.
+
+    Each rank transposes its tile in place and sends it to its transpose
+    partner, rank (i, j) -> (j, i): ONE collective permute of one tile, so
+    per-rank bytes fall as 1/P.  A GSPMD ``swapaxes`` on this layout
+    all-gathers the (μ, ν) slices instead (GN-PPM fit and tail masks, CrI3
+    16x16 P64: 16.65 GB of replicated masks).  ``mesh=None`` is an unsharded
+    (μ, ν) pair: the local transpose.  Traceable under ``jit``; values are
+    moved, never recomputed.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    if mesh is None:
+        return jnp.swapaxes(x, -1, -2)
+    if x.dtype == jnp.bool_:          # collectives move bytes, not predicates
+        return transpose_xy(x.astype(jnp.uint8), mesh).astype(jnp.bool_)
+    from jax import shard_map
+    p = int(mesh.shape["x"])
+    if int(mesh.shape["y"]) != p:
+        raise ValueError(f"transpose_xy: mesh {dict(mesh.shape)} is not square")
+    spec = P(*((None,) * (x.ndim - 2)), "x", "y")
+    return shard_map(
+        lambda t: to_transpose_partner(jnp.swapaxes(t, -1, -2), p),
+        mesh=mesh, in_specs=spec, out_specs=spec)(x)
+
+
+def to_transpose_partner(t, p: int):
+    """Inside a ``shard_map`` over the square ``('x', 'y')`` mesh: rank (i, j)'s block to rank (j, i).
+
+    One collective permute of this rank's block, no arithmetic; the body of
+    :func:`transpose_xy` and of any kernel that needs an operand's other
+    face (a block held ``[.., a_X, b_Y]`` arrives as the partner's
+    ``[.., a_Y, b_X]``)."""
+    import jax
+    import jax.numpy as jnp
+    if p == 1:
+        return t
+    # Off-diagonal pairs only; a diagonal rank IS its own partner and keeps
+    # its block.  A self pair is not free: RCCL executes it as a 0.50 ms copy
+    # of a 24.9 MB block on MI250X (P4 Fe W tile; 0.065 ms as this select,
+    # comm7 lane 2026-10-16), against 0.59-0.74 ms for the real exchange.
+    # The select fuses into the consumer; ranks still meet in one permute.
+    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p) if i != j]
+    moved = jax.lax.ppermute(t, ("x", "y"), perm)
+    on_diagonal = jax.lax.axis_index("x") == jax.lax.axis_index("y")
+    return jnp.where(on_diagonal, t, moved)
+
+
+def xy_tile_mesh(x):
+    """The mesh of ``x`` when its last two axes are sharded ``('x', 'y')``, else ``None``.
+
+    The static argument :func:`transpose_xy` wants, read from a concrete
+    array before a ``jit`` boundary; refuses any other sharding of (μ, ν).
+    """
+    from jax.sharding import NamedSharding
+    sh = getattr(x, "sharding", None)
+    if not isinstance(sh, NamedSharding):
+        return None
+    spec = tuple(sh.spec) + (None,) * (x.ndim - len(tuple(sh.spec)))
+    if spec[-2:] == ("x", "y"):
+        return sh.mesh
+    if spec[-2:] == (None, None) or sh.mesh.size == 1:
+        return None
+    raise ValueError(f"xy_tile_mesh: (mu, nu) sharded {spec[-2:]}, want ('x', 'y') or none")
+
+
+def psum_replicate(local_np, mesh):
+    """Per-rank partial → the summed whole, on every rank.  ONE psum.
+
+    ``local_np`` is this rank's partial (any shape); the return is the
+    element-wise sum over ranks, as a host array identical on all of them.
+    Cost is exactly one all-reduce of ``local_np.nbytes``.
+
+    Mechanism: the per-rank partials are declared as the shards of a
+    ``(world, *shape)`` global array via
+    ``make_array_from_single_device_arrays`` (a metadata operation — no data
+    moves), then a ``shard_map`` body whose only op is ``lax.psum`` reduces
+    them.  Spelling it as an explicit psum instead of ``jnp.sum(axis=0)``
+    keeps the optimized HLO to a single ``all-reduce`` with no
+    reduce-scatter/all-gather pair, which is what the communication audit
+    checks.
+
+    P=1 short-circuits to the identity: no mesh, no collective, and therefore
+    bit-identical to a serial accumulation.
+
+    Reading a timer wrapped around this: a collective cannot complete before
+    the LAST rank arrives, so a rank-0 measurement is (rank-0 idle waiting for
+    the slowest peer) + (the actual reduce, microseconds).  It is a
+    load-imbalance meter, not a bandwidth meter — do not read a large value as
+    "the network is slow".
+    """
+    import jax
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    world = process_count()
+    if world <= 1:
+        return np.asarray(local_np)
+    if int(jax.local_device_count()) != 1:
+        raise RuntimeError(
+            f"psum_replicate assumes one addressable device per process; "
+            f"this process has {int(jax.local_device_count())}.")
+    if int(mesh.devices.size) != world:
+        raise RuntimeError(
+            f"mesh has {int(mesh.devices.size)} devices but there are "
+            f"{world} processes; they must match for a process-partial psum.")
+
+    shape = tuple(int(s) for s in np.shape(local_np))
+    sharding = NamedSharding(mesh, P(tuple(mesh.axis_names),
+                                     *((None,) * len(shape))))
+    local_dev = jax.device_put(np.asarray(local_np)[None],
+                               jax.local_devices()[0])
+    g = jax.make_array_from_single_device_arrays(
+        (world,) + shape, sharding, [local_dev])
+    return np.asarray(_psum_kernel(len(shape), mesh)(g))
+
+
+_PSUM_KERNELS: dict = {}
+
+
+def _psum_kernel(ndim: int, mesh):
+    """Cached ``jit(shard_map(psum))`` — one compile per (rank, mesh).
+
+    Built once and memoised because the QSGW loop calls the V_H kernel every
+    SC iteration; a fresh closure per call would retrace and recompile the
+    reduction each time, and per-rank compiles are the documented dominant
+    startup cost of this code base.
+
+    ``id(mesh)`` is safe as a key here (and everywhere else in the tree that
+    uses it — isdf/core's five kernel caches do the same): the CACHED VALUE
+    closes over ``mesh`` through the shard_map, so the Mesh object cannot be
+    collected while its entry lives and its id cannot be recycled underneath
+    us.  The failure mode is therefore a redundant compile on a second, equal
+    Mesh object — never a stale hit.  Use ``distrib_la.mesh_key`` instead
+    wherever the cached value does NOT retain the mesh.
+    """
+    from functools import partial
+
+    import jax
+    from jax import shard_map
+    from jax.sharding import PartitionSpec as P
+
+    key = (int(ndim), id(mesh))
+    fn = _PSUM_KERNELS.get(key)
+    if fn is None:
+        rest = (None,) * int(ndim)
+        axes = tuple(mesh.axis_names)
+
+        @partial(shard_map, mesh=mesh, in_specs=(P(axes, *rest),),
+                 out_specs=P(*rest), check_vma=False)
+        def _body(x):
+            # Rank-order sum (lxkit.ordered_psum): the library all-reduce's order
+            # follows the GCD placement (det lane 2026-10-16: the exact Hartree's rho).
+            return ordered_psum(x[0], axes)
+
+        fn = jax.jit(_body)
+        _PSUM_KERNELS[key] = fn
+    return fn
+
+
+def all_gather_processes(x, *, tiled: bool = False):
+    """Every process's ``x`` → the ``(world, *x.shape)`` host array on all.
+
+    THE wrapper for ``jax.experimental.multihost_utils.process_allgather``,
+    which six sites in this tree hand-rolled with their own ``device_put`` and
+    their own ``np.asarray``.  Two things it fixes for all of them:
+
+    * the operand is placed on **this process's own** device
+      (``jax.local_devices()[0]``), never ``jax.devices()[0]``;
+    * P=1 never touches jax at all, so a single-process run of a distributed
+      routine is bit-identical to the serial one and cannot be perturbed by a
+      backend that is not up yet.
+
+    ``tiled=False`` stacks (leading axis = process index); ``tiled=True``
+    concatenates along axis 0, as in the underlying call.
+
+    A host record whose gathered bytes fit :data:`_HOST_GATHER_BYTES` (budgets,
+    host names, receipts, plan digests) goes through the distributed host
+    control store, byte-exact and without a device program; larger host
+    arrays and every ``jax.Array`` take the device all-gather.
+    """
+    import numpy as np
+
+    if process_count() <= 1:
+        arr = np.asarray(x)
+        return arr if tiled else arr[None]
+    import jax
+    from jax.experimental import multihost_utils as _mh
+
+    if not isinstance(x, jax.Array):
+        arr = np.asarray(x)
+        if arr.nbytes * process_count() <= _HOST_GATHER_BYTES:
+            return _host_gather(arr, tiled)
+        x = jax.device_put(arr, jax.local_devices()[0])
+    return np.asarray(_mh.process_allgather(x, tiled=tiled))
+
+
+#: Gathered bytes (all ranks together) a host record may send through the
+#: control store; it carries receipts, never payloads.
+_HOST_GATHER_BYTES = 1 << 16
+_HOST_GATHER_OCCURRENCE = itertools.count()
+
+
+def _host_gather(arr, tiled):
+    """Every rank's equal-shape host ``arr`` through the host control store."""
+    import numpy as np
+    from ffi.common.broadcast import reduce_bytes_to_all
+
+    key = f"lorrax/host-gather/v1/{next(_HOST_GATHER_OCCURRENCE)}"
+    raw = reduce_bytes_to_all(np.frombuffer(arr.tobytes(), np.uint8), key=key,
+                              reduce=np.concatenate, max_bytes=_HOST_GATHER_BYTES)
+    out = raw.view(arr.dtype).reshape((process_count(),) + arr.shape)
+    return out.reshape((-1,) + arr.shape[1:]) if tiled else out
+
+
+def gather_to_host(x):
+    """ONE global ``jax.Array`` → the full host array, on every process.
+
+    The OTHER gather, and keeping it apart from :func:`all_gather_processes`
+    is the whole point:
+
+    * :func:`all_gather_processes` — every process holds a DIFFERENT
+      process-local value; stack or concatenate them.
+    * this one — there is a single logical array, and the question is only
+      whether this process happens to hold all of it.
+
+    Getting that branch wrong is SILENT.  ``jax.device_get`` raises on an
+    array whose shards live on other processes, so that direction is loud.
+    The other direction is not: ``process_allgather(tiled=True)`` on a
+    FULLY-ADDRESSABLE (replicated, or single-process) array concatenates each
+    process's complete copy and MULTIPLIES THE LEADING AXIS BY P — e.g.
+    ``eps_c (144, ·) → (2304, ·)`` at P=16, a plausible array of the wrong
+    shape (``bse/exciton_bands.py:117-119`` documents having been bitten).
+
+    ``is_fully_addressable`` is a GLOBAL property — identical on every
+    process — so the branch keeps the collective in lockstep.  Five wrapper
+    functions in this tree hand-roll this, four of them naming another in
+    their own docstring, and they disagree on ``tiled``; this is the one they
+    should call.
+
+    THREE ARMS, NOT TWO — and the middle one is the whole point.
+    ``is_fully_replicated`` and ``is_fully_addressable`` are DIFFERENT
+    predicates and a two-arm version gets replicated arrays wrong.  jax's own
+    ``Array`` docstring says it: *"fully replicated is not equal to fully
+    addressable; a fully replicated array can span multiple hosts."*  A
+    ``P()``-sharded array at P=64 has 64 devices in its sharding and 1
+    addressable, so ``is_fully_addressable`` is **False** — measured, in this
+    tree, by ``bse/exciton_bands.py``'s own log line:
+
+        [dist] evs sharding=NamedSharding(mesh=Mesh('x': 8, 'y': 8),
+               spec=P(), ...), fully_addressable=False        (job 7882507)
+
+    A two-arm version therefore pushed every replicated array through a
+    collective it does not need.  That is wasted communication at best, and at
+    worst a refusal: under ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` it took
+    down the ``exciton_bands`` on-grid gate on every cell of jobs 7882523,
+    7882531 and 7882555 at P=16 with "Communicator requested from a thread
+    that is not the one MPI was initialized from".
+
+    When the array is fully replicated, this process ALREADY holds all of it:
+    read shard 0 locally and issue nothing.  ``file_io.slab_io``
+    has carried this arm and its rationale all along
+    (``PROCESS_ALLGATHER_DESIGN_REVIEW_2026-05-20.md``); the service did not,
+    which is why it was the least correct of the five wrappers it was meant to
+    replace.  Strictly LESS communication than before in every variable.
+    """
+    import numpy as np
+
+    import jax
+
+    if getattr(x, "is_fully_addressable", True):
+        return np.asarray(jax.device_get(x))
+    if getattr(x, "is_fully_replicated", False):
+        return np.asarray(x.addressable_data(0))
+    from jax.experimental import multihost_utils as _mh
+    return np.asarray(_mh.process_allgather(x, tiled=True))
+
+
+def gather_indexed_blocks(local_vals, local_idx, n_total: int):
+    """Per-rank ``(blk, …)`` blocks + their global indices → the whole array.
+
+    Each rank passes the values it computed and, alongside them, the global
+    slot each one belongs in (``-1`` marks a padding slot on ranks that drew
+    fewer items).  Carrying the index in the payload is what frees the work
+    assignment from having to be contiguous — see :func:`local_share` — and
+    removes any dependence on the process ordering of the gather.
+
+    ONE all-gather of ``world · blk · prod(item_shape)`` elements.  For
+    ⟨mk|V_H|nk⟩ that is nk·nb²·16 B ≈ 15 MB at 80 bands / 33 MB at 120 bands
+    (MoS₂ 12×12) — deliberately accepted rather than engineered away: it is
+    3 % of one matrix-element sweep's flops-equivalent time, it happens once
+    per invocation, and it hands every rank the object both consumers want (a
+    file write on rank 0; a replicated operand for a driver).
+    """
+    import numpy as np
+
+    vals = np.asarray(local_vals)
+    out = np.zeros((int(n_total),) + tuple(int(s) for s in vals.shape[1:]),
+                   dtype=vals.dtype)
+    vals_g = all_gather_processes(vals)
+    idx_g = all_gather_processes(np.asarray(local_idx, dtype=np.int32))
+    for r in range(idx_g.shape[0]):
+        for j in range(idx_g.shape[1]):
+            ik = int(idx_g[r, j])
+            if ik >= 0:
+                out[ik] = vals_g[r, j]
+    return out
+
+
+def _owner_gather_chunk_bytes() -> int:
+    """Per-collective payload cap for :func:`gather_indexed_blocks_to_owner`.
+
+    Reads ``LORRAX_COLLECTIVE_CHUNK_MB`` — the SAME per-instruction
+    transport cap the distributed ζ tier and the W Dyson A-build enforce
+    (``isdf/core._collective_chunk_bytes``; calibration in
+    ``docs/reference/env_vars.md``).  Re-read here rather than imported because
+    ``common`` must not import ``isdf``.  ``0``/negative = unbounded,
+    same escape-hatch semantics as there.
+    """
+    import os
+
+    try:
+        mb = float(os.environ.get("LORRAX_COLLECTIVE_CHUNK_MB", 128.0))
+    except ValueError:
+        mb = 128.0
+    if mb <= 0:
+        return 1 << 62
+    return max(1, int(mb * (1 << 20)))
+
+
+def gather_indexed_blocks_to_owner(local_vals, local_idx, n_total: int):
+    """:func:`gather_indexed_blocks`, assembled on rank 0 ONLY.
+
+    Same collective contract (every rank must call it, with the same
+    ``blk`` and item shape), but the ``(n_total, *item_shape)`` table is
+    materialised only on rank 0; every other rank gets ``None``.  For
+    k-partitioned sweeps whose ONLY consumer is the rank-0 h5 write
+    (dipole / kin-ion), where the replicated table is ``(nk, nb, nb)``-
+    class waste on every peer — 604 MB/rank at 12x12/512b (scorecard
+    BD.4).
+
+    The transport is still ``process_allgather`` (jax exposes no
+    gather-to-root), so total traffic is unchanged; what changes is
+    residency: the allgather is CHUNKED along the block axis so no rank
+    ever holds more than ``LORRAX_COLLECTIVE_CHUNK_MB`` of transient
+    payload, and non-root ranks drop each chunk immediately.  P=1 (and
+    the fastloop shard4 leg, which is single-process) falls through to
+    :func:`gather_indexed_blocks` bit-identically.
+    """
+    import numpy as np
+
+    rank, world = process_rank_world()
+    if world <= 1:
+        return gather_indexed_blocks(local_vals, local_idx, n_total)
+
+    vals = np.asarray(local_vals)
+    blk = int(vals.shape[0])
+    item_shape = tuple(int(s) for s in vals.shape[1:])
+    item_bytes = int(np.prod(item_shape, dtype=np.int64)) * vals.dtype.itemsize
+    step = max(1, _owner_gather_chunk_bytes() // max(1, world * item_bytes))
+
+    idx_g = all_gather_processes(np.asarray(local_idx, dtype=np.int32))
+    out = (np.zeros((int(n_total),) + item_shape, dtype=vals.dtype)
+           if rank == 0 else None)
+    for j0 in range(0, blk, step):
+        j1 = min(blk, j0 + step)
+        vals_g = all_gather_processes(vals[j0:j1])
+        if rank == 0:
+            for r in range(world):
+                for j in range(j0, j1):
+                    ik = int(idx_g[r, j])
+                    if ik >= 0:
+                        out[ik] = vals_g[r, j - j0]
+        del vals_g
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The k-partitioned sweep
+# ---------------------------------------------------------------------------
+#
+# Why the work assignment is round-robin (``seq[rank::world]``) rather than
+# contiguous blocks: the item count need not divide P (the cohsex fixture has
+# nk=9), and contiguous blocking would idle whole ranks — nk=9 at P=4 gives
+# 3/3/3/0 contiguous but 3/2/2/2 round-robin.  :func:`gather_indexed_blocks`
+# carries each item's index with it, so the assignment is free to be any
+# permutation.
+
+#: Host-ahead-of-device depth for :func:`sweep_local_k`.  Named for the
+#: driver it was first measured on, and KEPT at that name because the live
+#: D10 harness (``wk_REL/d10_inner.sh``) sets it to run the un-pipelined
+#: control cell.
+SWEEP_LOOKAHEAD_ENV = "LORRAX_KIN_ION_LOOKAHEAD"
+
+_DEFAULT_LOOKAHEAD = 2
+
+
+def sweep_lookahead() -> int:
+    """The resolved :func:`sweep_local_k` lookahead depth (>= 1, default 2).
+
+    ``1`` restores the serialised behaviour (no read/compute overlap) and
+    exists so the overlap's contribution can be MEASURED against the
+    pipelined default rather than asserted.
+
+    Malformed input REFUSES, naming the variable — the same rule
+    ``common.timing`` applies to the fixed driver-debug trace depth.  The parse
+    this replaces swallowed ``ValueError`` and returned the default, so
+    ``LORRAX_KIN_ION_LOOKAHEAD=one`` silently ran the PIPELINED path while
+    the operator believed the control cell had disabled it, and a control
+    that measures the same thing twice is worse than no control.
+    """
+    import os
+
+    raw = os.environ.get(SWEEP_LOOKAHEAD_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_LOOKAHEAD
+    try:
+        depth = int(raw)
+    except ValueError:
+        depth = 0                    # falls into the refusal below, with raw
+    if depth < 1:
+        raise ValueError(
+            f"{SWEEP_LOOKAHEAD_ENV}={raw!r} is not a usable depth.  It is how "
+            f"many k the host may run ahead of the device in the per-k sweep: "
+            f"an integer >= 1, where 1 disables the read/compute overlap "
+            f"(default {_DEFAULT_LOOKAHEAD}).")
+    return depth
+
+
+def local_share(items):
+    """This process's round-robin share of ``items`` (see the note above)."""
+    rank, world = process_rank_world()
+    return list(items)[rank::world]
+
+
+def sweep_local_k(ks_local, blk: int, item_shape, per_k, *,
+                  lookahead: int | None = None,
+                  print_fn=print, label: str = "k"):
+    """Run ``per_k(ik)`` over this rank's local k — **ONE host readback**.
+
+    ``per_k`` returns k's ``item_shape`` block (``(nb, nb)`` for every caller
+    today) as a **device** array and must not force it.  The blocks are
+    collected lazily and copied to the host in a single transfer at the end,
+    so a sweep over ``n`` local k costs ONE device→host copy instead of ``n``
+    blocking ones.  Returns ``(vals, idx)`` in exactly the layout
+    :func:`gather_indexed_blocks` consumes: ``vals`` is ``(blk, *item_shape)``
+    with unused rows zero, ``idx`` is ``(blk,)`` with ``-1`` in the unused
+    slots.
+
+    ``item_shape`` is REQUIRED rather than inferred from the first block
+    because a rank can legitimately draw NO k: ``world > nk`` (P=64 on a 16-k
+    deck) leaves ``world - nk`` ranks with an empty list, and the gather is a
+    collective — every rank must contribute the same shape or it
+    mis-assembles.  An empty rank has no block to infer from.
+
+    WHY THE PER-K READBACK WAS THE COST, not the transfer volume.  Each
+    ``np.asarray(H_k)`` is a full host synchronisation: it drains the device
+    queue, so the *next* k's ψ read (h5py, host-side, hundreds of ms) could
+    not start until the *current* k's FFTs had finished.  The two are
+    independent — a k block of ⟨mk|O|nk⟩ touches no other k — and deferring
+    the copy lets them overlap.  This is only legal once every k presents the
+    SAME operand shapes; with a ragged ``ngk`` each k was a distinct XLA
+    executable and the loop was a sequence of unrelated dispatches (owner
+    decision D10).
+
+    ``lookahead`` bounds how far the host may run ahead of the device.  It
+    matters because the operand being held in flight is the ψ FFT box —
+    ``nb·nspinor·nx·ny·nz·16`` B, 189 MB at MoS₂ 4×4/256 bands — and an
+    unbounded queue would hold one per pending k.  ``2`` is the smallest value
+    that still overlaps read *k+1* with compute *k*; it caps the extra
+    residency at one box.  Note ``block_until_ready`` is a synchronisation,
+    NOT a transfer, so the one-readback contract holds for any lookahead.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+
+    ks_local = [int(v) for v in ks_local]
+    blk = int(blk)
+    shape = (blk,) + tuple(int(s) for s in item_shape)
+    depth = sweep_lookahead() if lookahead is None else max(1, int(lookahead))
+    blocks: list = []
+    for j, ik in enumerate(ks_local):
+        if j % 16 == 0:
+            print_fn(f"    {label}: local {j + 1}/{len(ks_local)} "
+                     f"(global k={ik + 1})...")
+        blocks.append(per_k(ik))
+        if j >= depth:
+            blocks[j - depth].block_until_ready()
+
+    vals = np.zeros(shape, dtype=np.complex128)
+    if blocks:
+        stacked = np.asarray(jnp.stack(blocks))          # <-- the ONE readback
+        if stacked.shape[1:] != shape[1:]:
+            raise ValueError(
+                f"{label}: per_k returned {stacked.shape[1:]} but "
+                f"item_shape={shape[1:]} was declared; the gather is a "
+                f"collective and would mis-assemble.")
+        vals[: stacked.shape[0]] = stacked
+    idx = np.full((blk,), -1, dtype=np.int32)
+    idx[: len(ks_local)] = np.asarray(ks_local, dtype=np.int32)
+    return vals, idx
+
+
+def gather_k_blocks(n_k: int, per_k, *, item_shape, label: str,
+                    lookahead: int | None = None, print_fn=print,
+                    owner_only: bool = False):
+    """``per_k(ik)`` for EVERY ``ik`` in ``range(n_k)`` → the whole array.
+
+    The entire k-partition contract in one call, and the only one a physics
+    driver should need: the work is spread round-robin over the processes,
+    each rank's share is swept behind a single host readback
+    (:func:`sweep_local_k`), and the result is returned as an
+    ``(n_k, *item_shape)`` host array **identical on every rank**
+    (:func:`gather_indexed_blocks`).  No reduction is involved anywhere — a k
+    block of ⟨mk|O|nk⟩ is independent of every other, so this is
+    embarrassingly parallel with one indexed gather at the end.
+
+    ``owner_only=True`` assembles on rank 0 alone and returns ``None`` on
+    every other rank (:func:`gather_indexed_blocks_to_owner`) — the mode
+    for sweeps whose only consumer is the rank-0 file write.  A caller
+    that needs the table as a replicated operand (the driver's gspace
+    V_H route) must keep the default.
+
+    ``per_k`` must return a device array of ``item_shape`` and must not force
+    it.  ``label`` names the two timing sections (``{label}_k`` and
+    ``{label}_gather``) and the progress lines, so a driver gets its sweep and
+    its gather in the timing table without opening a section by hand.
+    """
+    from common import timing
+
+    n_k = int(n_k)
+    world = process_count()
+    ks_local = local_share(range(n_k))
+    print_fn(f"\nProcessing {n_k} k-points over P={world} rank"
+             f"{'s' if world != 1 else ''} ({len(ks_local)} on this rank)...")
+    with timing.section(f"{label}_k"):
+        vals, idx = sweep_local_k(ks_local, max(1, -(-n_k // world)),
+                                  item_shape, per_k, lookahead=lookahead,
+                                  print_fn=print_fn, label=label)
+    with timing.section(f"{label}_gather"):
+        if owner_only:
+            return gather_indexed_blocks_to_owner(vals, idx, n_k)
+        return gather_indexed_blocks(vals, idx, n_k)
+
+
+# ---------------------------------------------------------------------------
+# The checked reduce-scatter
+# ---------------------------------------------------------------------------
+#
+# WHY
+# ---
+# ``jax.lax.psum_scatter`` under ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo``
+# silently returns wrong data in ~5 % of executions — always output segment 0,
+# always a plausible magnitude, always with a zero exit code
+# (``wk_REL/UPSTREAM_gloo_psum_scatter_corruption.md``).  The transport verdict
+# is that mpi is clean in 584/584, so this is not a live fire; it is the
+# durable answer to "what makes the NEXT one detectable".  There are fifteen
+# reduce-scatter sites in this codebase and none of them carries an invariant.
+# This function is the ONE place that changes for all fifteen — no per-call-site
+# carve-outs, one primitive, one tolerance, one message.
+#
+# THE CHECK — Freivalds, not a plain sum
+# --------------------------------------
+# A reduce-scatter over a replica group of P ranks satisfies, by definition,
+#
+#     concat_r out_r  ==  sum_p x_p
+#
+# so for ANY weight tensor ``w`` the two weighted sums must agree:
+#
+#     sum_{global j} w_j (sum_p x_p)_j  ==  sum_r sum_{local j} w_{rL+j} out_r[j]
+#
+# A PLAIN sum would not do: it is invariant under moving mass between segments,
+# and it cancels for a zero-mean perturbation — which is exactly the observed
+# failure shape (a stale / dropped / duplicated SEGMENT, §4.6a).  With an
+# incoherent ``w``, a corrupted segment escapes only on a measure-zero
+# coincidence.
+#
+# Both sides are built from ``psum``, which the corruption study established as
+# the clean path: the all-reduce-only formulation of the same reduction was
+# 200/200 clean in the same harness that corrupted the reduce-scatter.  The
+# checker therefore does not rest on the primitive it is checking.
+#
+# ``w`` must NOT be materialised — it would be as large as the payload (253 MB
+# at the corrupting shape) — so it is RANK-1 FACTORISED,
+# ``w[i0,i1,…] = prod_d v_d[i_d]``.  The contraction is then a sequence of
+# axis-wise matrix-vector products: ONE pass over the operand, O(1) extra
+# memory, and no large intermediate (the "no replicated large intermediates"
+# rule is respected by construction).
+#
+# The two checksums ride ONE scalar all-reduce, not two: only
+# ``|psum(s_in − s_out)|`` is needed, so the difference is formed locally and a
+# single 2-element ``psum`` carries it together with the scale.
+#
+# COST — measured, wk_REL/collective_invariants_notes.md §2.3.  In the form
+# below (two contractions, no separate scale pass) it is +0.7 % on the 0.41 MB
+# BSE collective under mpi and +1.3 % under gloo — free at the payload BSE
+# actually issues.  It is NOT free at Sigma-class payloads: +107 % at 41 MB and
+# +56 % at 253 MB under mpi, because the contraction is a memory-bandwidth
+# sweep over the operand while the mpi reduce-scatter of the same operand is
+# fast.  Under gloo everything is under +5 %.  Read §2.3-2.4 before wiring it
+# anywhere; §2.4 prices the sub-sampling lever that brings the large payloads
+# down.
+#
+# WIRING STATUS: no call site uses this yet.  Ten of the fifteen reduce-scatter
+# sites live in ``contract_bands.py`` and ``zeta_projection.py``, which the
+# all-MPI migration workstream owns.  Wiring is an owner decision on the
+# measured cost, and it should land as ONE change across all fifteen.
+
+COLLECTIVE_RTOL = 1e-10
+
+# Six mutually-incommensurate multipliers, one per tensor axis, so the
+# per-axis weight sequences are independent.  Values are irrelevant beyond
+# being irrational-ish and distinct; determinism is what matters.
+_W_MULT = (1.6180339887498949, 1.3247179572447460, 1.2207440846057595,
+           1.1673039782614187, 1.1347241384015194, 1.1127756842787055)
+
+
+def _weight_vec(length: int, axis_pos: int):
+    """Deterministic unit-modulus weights for one axis of the checksum.
+
+    A pure function of ``(length, axis_pos)``, so every rank in the replica
+    group produces identical weights with **no communication**, and a failure
+    reproduces exactly.  Unit modulus keeps the checksum's dynamic range equal
+    to the data's — no amplification, and no way for a large-magnitude weight
+    to hide a small-magnitude corrupted segment.
+    """
+    import jax.numpy as jnp
+    import numpy as np
+
+    i = jnp.arange(int(length), dtype=jnp.float64)
+    m = _W_MULT[axis_pos % len(_W_MULT)]
+    return jnp.exp(2j * np.pi * jnp.mod(i * m, 1.0))
+
+
+def _weighted_sum(t, glob_len, offsets):
+    """``sum_idx (prod_d v_d[idx_d + offsets_d]) * t[idx]`` in ONE pass.
+
+    ``glob_len[d]`` is the GLOBAL extent of axis ``d`` and must be a Python
+    int; the weight vector is generated at global length (so every rank agrees
+    on the weights) and then ``dynamic_slice``d at this rank's offset, which
+    MAY be a tracer.  Generating it at ``t.shape[d] + offset`` instead puts a
+    tracer inside ``jnp.arange`` and raises ``ConcretizationTypeError``.
+
+    Axes are contracted one at a time, so the working set shrinks
+    monotonically and the total flop count is ~ ``t.size``.
+    """
+    import jax.numpy as jnp
+    from jax import lax
+
+    shp = tuple(int(v) for v in t.shape)
+    out = t
+    for d in range(len(shp)):
+        v = _weight_vec(int(glob_len[d]), d).astype(t.dtype)
+        v = lax.dynamic_slice(v, (offsets[d],), (shp[d],))
+        out = jnp.tensordot(out, v, axes=([0], [0]))
+    return out
+
+
+def psum_scatter_checked(x, axis, scatter_dimension, tiled=True, *, name):
+    """``lax.psum_scatter`` carrying a Freivalds checksum of its own output.
+
+    Drop-in for ``jax.lax.psum_scatter`` except that it returns a PAIR.
+
+    Parameters
+    ----------
+    x
+        Local partial, FULL extent along ``scatter_dimension``.
+    axis
+        Mesh axis name to reduce over (the replica group).
+    scatter_dimension
+        Tensor axis to tile the result over, as in ``lax.psum_scatter``.
+    tiled
+        As in ``lax.psum_scatter``.  ``tiled=False`` is not supported: the
+        segment→global index map below assumes the contiguous tiled layout.
+    name
+        Label used in the failure message.  Must identify the call site.
+
+    Returns
+    -------
+    (out, residual)
+        ``out`` is exactly what ``lax.psum_scatter`` would have returned.
+        ``residual`` is a REPLICATED real scalar,
+        ``|Σ w·in − Σ w·out| / Σ |w·in|``, at round-off when the collective is
+        correct.  You cannot raise inside ``shard_map``, so the caller must
+        accumulate ``residual`` (``jnp.maximum``) into a small device buffer
+        and read it on the host at a coarse boundary — per τ node, per
+        Lanczos iteration — where a host value is affordable.
+    """
+    import jax.numpy as jnp
+    from jax import lax
+
+    if not tiled:
+        raise ValueError(
+            f"psum_scatter_checked({name!r}): tiled=False is not supported — "
+            f"the checksum's segment→global index map assumes the contiguous "
+            f"tiled layout.  Use lax.psum_scatter directly, unchecked, and say "
+            f"so at the call site.")
+
+    out = ordered_psum_scatter(x, axis, scatter_dimension=scatter_dimension,
+                           tiled=tiled)
+
+    glob = [int(v) for v in x.shape]           # x carries the FULL extent
+    seg = int(out.shape[scatter_dimension])
+    off_in = [0] * x.ndim
+    off_out = [0] * out.ndim
+    off_out[scatter_dimension] = lax.axis_index(axis) * seg
+
+    s_in = _weighted_sum(x, glob, off_in)
+    s_out = _weighted_sum(out, glob, off_out)
+
+    # ONE scalar all-reduce, 2 complex doubles.  psum, never psum_scatter —
+    # the checker must not be built on the primitive it is checking.
+    packed = ordered_psum(jnp.stack([s_in - s_out, s_in]), axis)
+    # SCALE = |checksum of the correct reduction|, NOT the operand's L1 mass.
+    # Measured (wk_REL job 7880840): a separate L1-mass pass costs +65 % on the
+    # 0.41 MB BSE collective and +157 % at 41 MB, because `abs(x)` materialises
+    # a second full-size array — it was the ENTIRE overhead at the BSE payload
+    # (+65 % with it, +0.7 % without).  Using |s_in| is free, and it is also
+    # the better-conditioned choice: numerator and denominator are then the
+    # SAME kind of quantity (a length-N random-walk sum of unit-modulus-weighted
+    # terms), so the ratio is a pure relative error with no sqrt(N) offset
+    # between them.  Measured floor at the 253 MB payload: 4.7e-13 this way vs
+    # 2.3e-11 with the extra pass.
+    denom = jnp.maximum(jnp.abs(packed[1]), jnp.finfo(jnp.float64).tiny)
+    return out, (jnp.abs(packed[0]) / denom).astype(jnp.float64)
+
+
+# ---------------------------------------------------------------------------
+# impl=mpi mesh-clique warm-up
+# ---------------------------------------------------------------------------
+
+_WARMED_MESHES: set = set()
+
+
+def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
+    """Create every mesh-axis MPI communicator on the calling (main) thread.
+
+    THE PROBLEM.  jaxlib 0.9.1's
+    ``xla::cpu::MpiCollectives::CreateCommunicators`` refuses with ``MPI:
+    Communicator requested from a thread that is not the one MPI was
+    initialized from`` unless ``MPI_Is_thread_main`` is true, and XLA:CPU's
+    PARALLEL ``ThunkExecutor`` issues collective thunks from intra-op pool
+    workers.  So under ``JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi`` any clique
+    whose FIRST use is inside a real jitted program dies on every rank.  This
+    is what killed the BSE TDA Lanczos (job 7879458).
+
+    THE MECHANISM THAT FIXES IT.  The guard fires only on communicator
+    CREATION, and ``xla::cpu::AcquireCommunicator`` caches communicators in a
+    process-global clique map keyed *only* by the participating-device set:
+    it takes the map lock and calls ``CreateCommunicator`` only on a MISS.
+    Creating each clique once here — from the main thread, inside a jit small
+    enough (one 8-byte buffer, <= 8 thunks) that XLA takes
+    ``ThunkExecutor::ExecuteSequential`` and runs the thunk inline on the
+    caller — makes every later acquisition a cache hit, so the guard is never
+    evaluated again.  Verified live with ``TF_CPP_VMODULE=cpu_cliques=3``:
+    three cliques per rank, created during warm-up, never re-created.
+
+    WHICH CLIQUES.  Exactly the ones the program will touch: one per mesh
+    axis, plus one over all axes together.  This is **per-clique**, and the
+    discriminating controls (job 7881053) are unambiguous — warming the world
+    clique ALONE fails, ``x`` alone fails, ``x+y`` without the world fails,
+    and only ``x + y + world`` passes.  An earlier helper in
+    ``common.contract_bands`` warmed the world clique only, which is exactly
+    the failing cell; that is why the "world-collective-first contract" looked
+    falsified.  Warm-up does matter — it was warming the wrong device sets.
+
+    COST.  Three 8-byte ``psum``s for a 2-D mesh; ~150 ms once per process at
+    P=4, ``O(log P)`` in latency, independent of ``N_mu``/``N_k``/``N_q``.  It
+    adds nothing to any solver iteration and leaves the compiled HLO of every
+    downstream kernel untouched, so it cannot move the collective table or the
+    allocation table.
+
+    WHY NOT THE WRAPPER OVERRIDE.  ``LORRAX_MPI_FORCE_THREAD_MAIN`` also
+    works, but it is a patched MPI shim every user must build, and it is
+    strictly less safe: it lets XLA call ``MPI_Comm_split`` — which is
+    collective over ``MPI_COMM_WORLD`` — from arbitrary pool workers.
+    ``AcquireCommunicator`` serialises creation *within* a process but nothing
+    serialises it *across* ranks, so two cliques becoming ready in different
+    orders on different ranks is a latent deadlock.  Warming from one thread
+    in a program-defined order before any jit runs removes that exposure.
+    (The wrapper's OTHER override, the ``MPI_THREAD_MULTIPLE`` upgrade, is
+    still required and is unrelated — see docs/environment/transports.md.)
+
+    MUST be called synchronously on every rank: it is a collective.  A no-op
+    off the mpi implementation, in single-process runs, and on a mesh already
+    warmed in this process.  Returns the elapsed seconds (0.0 when a no-op).
+    """
+    import os
+    if os.environ.get(
+            "JAX_CPU_COLLECTIVES_IMPLEMENTATION", "").strip().lower() != "mpi":
+        return 0.0
+    import time
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.sharding import PartitionSpec as P
+    from jax import shard_map
+    if jax.process_count() <= 1:
+        return 0.0
+    key = (tuple(int(d.id) for d in mesh.devices.ravel()),
+           tuple(mesh.axis_names))
+    if key in _WARMED_MESHES:
+        return 0.0
+    t0 = time.perf_counter()
+    tiny = jnp.zeros(1)
+    axes = list(mesh.axis_names)
+    groups = list(axes) + ([tuple(axes)] if len(axes) > 1 else [])
+    for ax in groups:
+        f = jax.jit(shard_map(lambda a, ax=ax: lax.psum(a, ax), mesh=mesh,  # exact-reduce: warm-up of zeros
+                              in_specs=(P(None),), out_specs=P(None),
+                              check_vma=False))
+        jax.block_until_ready(f(tiny))
+    dt = time.perf_counter() - t0
+    # Mark AFTER the collectives succeed: marking first would skip the warm-up
+    # forever if one raised, and the next caller would hit the refusal with no
+    # indication why.  (Same ordering rule the old contract_bands helper used.)
+    _WARMED_MESHES.add(key)
+    if jax.process_index() == 0:
+        print_fn(f"[collectives] warmed {len(groups)} MPI cliques for mesh "
+                 f"{tuple(mesh.devices.shape)} axes={axes} in {dt*1e3:.0f} ms")
+    return dt
+
+
+# Fixed-size host control receipts, never tensor payloads. Only rank zero
+# collects P records; every rank receives one bounded result.
+def _io_error_receipt(error):
+    import json
+    import numpy as np
+
+    receipt = (error is not None, process_rank(),
+               type(error).__name__[:80] if error is not None else '',
+               str(error)[:240] if error is not None else '')
+    data = json.dumps(receipt, ensure_ascii=True).encode('ascii')
+    result = np.zeros(4096, dtype=np.uint8)
+    result[:len(data)] = np.frombuffer(data, dtype=np.uint8)
+    return result
+
+
+def _raise_io_receipts(receipts, *, path, stage):
+    import json
+
+    for data in receipts:
+        failed, rank, kind, message = json.loads(bytes(data).rstrip(b'\0'))
+        if failed:
+            raise RuntimeError(
+                f"GATE io_global_commit: path={path}; stage={stage}; "
+                f"failing rank={rank}; {kind}: {message}. "
+                "Artifact publication refused; inspect this private artifact "
+                "and rebuild in a new run directory.")
+
+
+_IO_CONTROL_OCCURRENCE = 0
+_IO_CONTROL_LOCK = threading.Lock()
+
+
+def _io_control_key(path, stage):
+    """Stable per-occurrence key for one all-rank host control exchange."""
+    import hashlib
+
+    global _IO_CONTROL_OCCURRENCE
+    with _IO_CONTROL_LOCK:
+        occurrence = _IO_CONTROL_OCCURRENCE
+        _IO_CONTROL_OCCURRENCE += 1
+    digest = hashlib.sha256(
+        (str(path) + "\0" + str(stage)).encode("utf-8")).hexdigest()[:24]
+    return f"lorrax/io-control/v1/{digest}/{occurrence}"
+
+
+def _reduce_io_control(data, *, path, stage, reduce):
+    from ffi.common.broadcast import reduce_bytes_to_all
+
+    return reduce_bytes_to_all(
+        data, key=_io_control_key(path, stage), reduce=reduce,
+        max_bytes=4096)
+
+
+def _first_io_error(receipts):
+    """Select the lowest-rank failure, or rank zero's success receipt."""
+    import json
+
+    for receipt in receipts:
+        failed, _rank, _kind, _message = json.loads(
+            bytes(receipt).rstrip(b'\0'))
+        if failed:
+            return receipt
+    return receipts[0]
+
+
+def agree_io_error(error, *, path, stage):
+    """Raise the same bounded I/O failure on every rank after local teardown.
+
+    Parameters
+    ----------
+    error : BaseException or None
+        This rank's error; all ranks must call even when locally successful.
+    path : path-like
+        Replicated artifact path, retained verbatim in the refusal.
+    stage : str
+        Replicated action name. The lowest failing rank supplies the error.
+    """
+    # Error agreement must still work when a device collective is failed or
+    # busy.  Route this bounded receipt through the distributed host control
+    # store rather than compiling/launching a GPU process_allgather.
+    receipt = _reduce_io_control(
+        _io_error_receipt(error), path=path, stage=stage,
+        reduce=_first_io_error)
+    _raise_io_receipts([receipt], path=path, stage=stage)
+
+
+def xor_to_all(digest, *, path, stage):
+    """The XOR of every rank's equal-length ``digest`` bytes, on every rank.
+
+    A bounded receipt through the host control store, like
+    :func:`agree_io_error` (no device collective); every rank must call.
+    """
+    import numpy as np
+
+    data = np.frombuffer(bytes(digest), dtype=np.uint8).copy()
+    return bytes(_reduce_io_control(
+        data, path=path, stage=f"{stage}/xor",
+        reduce=lambda records: np.bitwise_xor.reduce(np.stack(records), axis=0)))
+
+
+_RANK_LOCAL_IO = threading.local()
+
+
+class _rank_local_io:
+    """Mark rank-0-only file work (``rank0_transaction``'s ``write``, a
+    ``rank0_read`` reader): a nested ``rank0_read`` inside it reads directly,
+    because its peers are not there to exchange with."""
+
+    def __enter__(self):
+        _RANK_LOCAL_IO.depth = getattr(_RANK_LOCAL_IO, "depth", 0) + 1
+
+    def __exit__(self, *_exc):
+        _RANK_LOCAL_IO.depth -= 1
+
+
+#: Largest single host-control value ``rank0_read`` stores; longer results
+#: are split, so a 1.7 MB model header never meets a transport message cap.
+_RANK0_READ_CHUNK = 512 * 1024
+#: Builtin classes a peer re-raises by name, so ``except (OSError, ValueError,
+#: KeyError)`` callers decide alike on every rank. Anything else: RuntimeError.
+_RANK0_READ_ERRORS = {cls.__name__: cls for cls in (
+    ValueError, KeyError, TypeError, OSError, FileNotFoundError, RuntimeError,
+    AttributeError, IndexError, AssertionError)}
+
+
+def rank0_read(path, *, stage, read):
+    """One process reads a committed file; every process gets the result.
+
+    ``read()`` runs on rank 0 alone and returns a JSON value (the metadata a
+    validator authenticated, never tensor payload). Its result, or its
+    failure, reaches every other rank through the host coordination store:
+    no device collective, no device memory. The peers wait for it, so this is
+    also the barrier after the writer's close, and they never open ``path``.
+
+    This removes the concurrent serial reopen of a just-committed file. At
+    P=16 on two Frontier nodes, sixteen h5py reopens of a just-closed
+    ``bank.h5`` made the Lustre client report its size short at a stripe
+    boundary for milliseconds (``truncated file: eof < stored_eof``). One
+    reader does not contend with its peers.
+
+    Every rank returns the same JSON round trip of rank 0's value. A failure
+    raises rank 0's exception on rank 0, and the same builtin class with the
+    same message on the others. Must be called by every process in the same
+    order (it takes one ``_io_control_key`` occurrence); inside rank-0-only
+    work (``rank0_transaction``'s ``write``, another reader) it reads
+    directly.
+    """
+    import json
+
+    n_proc = process_count()
+    if n_proc <= 1 or getattr(_RANK_LOCAL_IO, "depth", 0):
+        with _rank_local_io():
+            return json.loads(json.dumps(read()))
+    from jax._src.distributed import global_state
+    from ffi.common.broadcast import _arrive, wait_for_key
+
+    client = global_state.client
+    key = _io_control_key(path, stage)
+    what = f"rank 0's read of {path} ({stage})"
+    if process_rank() == 0:
+        error = None
+        try:
+            with _rank_local_io():
+                body = json.dumps(read()).encode()
+            flag = b"\0"
+        except BaseException as exc:                      # noqa: BLE001
+            error = exc
+            body = json.dumps([type(exc).__name__, str(exc)]).encode()
+            flag = b"\1"
+        chunks = [body[i:i + _RANK0_READ_CHUNK]
+                  for i in range(0, len(body), _RANK0_READ_CHUNK)] or [b""]
+        for i, chunk in enumerate(chunks):
+            client.key_value_set_bytes(f"{key}/chunk/{i}", chunk)
+        client.key_value_set_bytes(f"{key}/result", flag + str(len(chunks)).encode())
+        wait_for_key(client, f"{key}/read/complete", 0,
+                     what=f"every rank to take {what}")
+        client.key_value_delete(key)          # the whole key/ directory
+        if error is not None:
+            raise error
+        return json.loads(body)
+    head = wait_for_key(client, f"{key}/result", 0, what=what)
+    body = b"".join(wait_for_key(client, f"{key}/chunk/{i}", 0, what=what)
+                    for i in range(int(head[1:])))
+    _arrive(client, f"{key}/read", n_proc - 1)
+    value = json.loads(body)
+    if head[:1] == b"\1":
+        name, message = value
+        raise _RANK0_READ_ERRORS.get(name, RuntimeError)(message)
+    return value
+
+
+def rank0_transaction(path, *, stage, write, validate=None, return_value=False):
+    """Validate on all ranks, perform serial I/O, then broadcast its verdict.
+
+    Parameters
+    ----------
+    path : path-like
+        Replicated destination, named in every rank's failure.
+    stage : str
+        Replicated transaction name.
+    write : callable
+        Rank-0-only filesystem action. Must contain no physics collectives.
+    validate : callable, optional
+        Preflight called on every rank before mutation. Materialize replicated
+        JAX metadata here, never inside ``write``. No tensor is gathered here.
+    return_value : bool, optional
+        Broadcast and return a JSON scalar produced by ``write``. This is for
+        small control decisions such as an authenticated resume verdict, never
+        artifact metadata or tensor payloads.
+    """
+    if validate is not None:
+        error = None
+        try:
+            validate()
+        except BaseException as exc:
+            error = exc
+        agree_io_error(error, path=path, stage=f'{stage}/preflight')
+    error = None
+    value = None
+    if process_rank() == 0:
+        try:
+            with _rank_local_io():
+                value = write()
+        except BaseException as exc:
+            error = exc
+    agree_io_error(error, path=path, stage=stage)
+    if return_value:
+        import json
+        import numpy as np
+
+        data = np.zeros(4096, dtype=np.uint8)
+        value_error = None
+        if process_rank() == 0:
+            try:
+                encoded = json.dumps(
+                    value, ensure_ascii=True, allow_nan=False).encode('ascii')
+                if len(encoded) > data.size:
+                    raise ValueError(
+                        'rank0_transaction control value exceeds 4096 bytes')
+                data[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+            except BaseException as exc:
+                value_error = exc
+        agree_io_error(value_error, path=path,
+                       stage=f'{stage}/return_value')
+        returned = _reduce_io_control(
+            data, path=path, stage=f'{stage}/return_value_payload',
+            reduce=lambda records: records[0])
+        return json.loads(bytes(returned).rstrip(b'\0'))
+
+
+def _reserve_staging_path(destination):
+    """Create and return a private empty sibling of ``destination``.
+
+    O_EXCL gives the writer a private path in the destination directory, so
+    ``os.replace`` onto the destination is one-filesystem atomic; 0666 follows
+    the process umask like a direct h5py ``"w"`` open, where
+    ``tempfile.mkstemp`` would hard-code 0600 and silently change the
+    group-accessible artifact mode (0660 under the production 0007 umask).
+    Both artifact writers truncate or replace an existing path, so the empty
+    file does not constrain them.
+    """
+    import os
+    import secrets
+
+    directory = os.path.dirname(os.path.abspath(destination))
+    basename = os.path.basename(destination)
+    for _ in range(16):
+        candidate = os.path.join(
+            directory, f".{basename}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            continue
+        os.close(fd)
+        return candidate
+    raise FileExistsError(
+        f"could not reserve a private staging path for {destination}")
+
+
+def _unlink_if_present(path):
+    import os
+
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def rank0_atomic_file_transaction(
+        path, *, stage, write, validate_file, validate=None):
+    """Publish one rank-0 file only after its closed staging file validates.
+
+    ``write(staging_path)`` and ``validate_file(staging_path)`` run on rank 0
+    inside :func:`rank0_transaction`.  The staging file is created in the
+    destination directory, so ``os.replace`` is one-filesystem atomic.  A
+    write or validation failure removes only the staging file and leaves any
+    previous destination untouched.  ``validate`` retains the all-rank
+    preflight meaning of :func:`rank0_transaction`.
+
+    The writer must close its file before returning.  The validator must
+    reopen that path through the format owner's reader and return normally
+    only for a complete artifact.
+    """
+    import os
+
+    destination = os.fspath(path)
+
+    def _publish():
+        temporary = _reserve_staging_path(destination)
+        try:
+            write(temporary)
+            validate_file(temporary)
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if temporary is not None:
+                _unlink_if_present(temporary)
+
+    rank0_transaction(
+        destination, stage=stage, write=_publish, validate=validate)
+
+
+def collective_atomic_file_transaction(path, *, stage, write, validate_file):
+    """Publish one file EVERY rank writes, only after its closed staging file validates.
+
+    The collective twin of :func:`rank0_atomic_file_transaction`, for an
+    artifact written through ``file_io.slab_io``: rank 0 reserves the private
+    staging sibling and broadcasts its name; ``write(staging_path)`` runs on
+    every rank and must close its SlabIO handles (a collective) before
+    returning; the ranks agree on its outcome; rank 0 then runs
+    ``validate_file(staging_path)`` and renames.  Any failure removes only
+    the staging file, leaves a previous destination untouched, and raises
+    the same named failure on every rank.
+    """
+    import os
+
+    destination = os.fspath(path)
+    staging = rank0_transaction(
+        destination, stage=f"{stage}/reserve",
+        write=lambda: _reserve_staging_path(destination), return_value=True)
+    error = None
+    try:
+        write(staging)
+    except BaseException as exc:                              # noqa: BLE001
+        error = exc
+    try:
+        agree_io_error(error, path=destination, stage=f"{stage}/write")
+    except BaseException:
+        if process_rank() == 0:
+            _unlink_if_present(staging)
+        raise
+
+    def _publish():
+        try:
+            validate_file(staging)
+            os.replace(staging, destination)
+        except BaseException:
+            _unlink_if_present(staging)
+            raise
+
+    rank0_transaction(destination, stage=f"{stage}/publish", write=_publish)

@@ -1,0 +1,408 @@
+"""LocalFourierPlan: one local separable DFT with restricted per-axis supports.
+
+The plan computes, on one device and in the caller's precision,
+
+    y = R_out · F_{s,norm} · E_in · x,
+
+where ``F_{s,norm}`` is exactly ``jnp.fft.fftn`` (``sign=-1``) or
+``jnp.fft.ifftn`` (``sign=+1``) over ``axes`` with ``jnp.fft``'s ``norm``
+meaning for that direction.  ``E_in`` embeds a compact input: on an axis with
+``in_support[ax] = idx`` (length ``K``), ``x`` has extent ``K`` and
+``x[..., k, ...]`` sits at full-grid index ``idx[k] mod N``; every other index
+is zero.  ``R_out`` restricts the output: on an axis with
+``out_support[ax] = idx'`` (length ``K'``), ``y[..., k', ...]`` is the full
+result at index ``idx'[k'] mod N``.  Supports are separable (one index set per
+axis); a sphere or disk enters through its tight bounding box, the product of
+its per-axis projections, which costs ~3 % more line work than exact sphere
+pruning and keeps every stage a regular batched operation.
+
+Each axis is one stage, a GEMM with a Fourier matrix stored in the plan,
+
+    A_ax[j', j] = scale_ax · exp(sign · 2πi · (idx'[j'] · idx[j] mod N) / N),
+
+or an FFT.  The integer phase ``idx'·idx mod N`` is reduced exactly before the
+float64 exponential.  The GEMM does the embedding, transform and restriction
+in one pass; it is chosen when ``N`` lies in the device's measured GEMM range
+(:data:`GEMM_CROSSOVER`, separately for full and supported axes; a supported
+axis also needs ``n_in·n_out/N² ≤`` the row's bound).
+FFT axes go to one ``fft_helpers.local_fftn3``/``local_ifftn3`` call (a single
+multidimensional ``jnp.fft`` transform, so the library keeps its
+multidimensional algorithm), preceded by one gather per embedded axis
+(``take(mode='fill')``: the full axis reads zero off the support) and followed
+by one take per restricted axis.  Stages run in increasing ``n_out/n_in``
+order: shrinking GEMMs first, the FFT group next, expanding GEMMs last, so the
+array is as small as possible at every stage.
+
+The crossover table is a deterministic function of ``device_kind``: every rank
+builds the same plan and there is no runtime autotune.  An unknown device kind
+(and CPU) uses the FFT on every axis, so the O(N log N) scaling is kept
+everywhere; a GEMM replaces an FFT only on axes whose length is a measured,
+bounded constant.
+
+The matrices are numpy arrays owned by the plan.  Under ``jit`` or inside a
+``shard_map`` body they become constants of the executable; they are never
+rebuilt per call.
+
+A plane read from a cylinder (``in_gather=(plane_from_col, n_col)``, 2-D,
+forward, ``norm='backward'``) is not separable: ``x (..., n_col)`` holds the
+occupied cells of the ``(n_b, n_c)`` plane, ``plane_from_col[cell]`` the
+column of each cell (``n_col`` on an empty one), and the plan returns
+``fftn(take(x, plane_from_col, mode='fill').reshape(..., n_b, n_c))``.  It is
+served by :func:`ffi.fft.make_plane_fft_gather`: the cuFFTDx gather-on-load
+kernel on CUDA when it serves the plane (the zero plane is never written),
+else the static-run concatenate + one 2-D FFT.  ``plan(Fa, start, size)``
+reads the planes ``[start, start + size)`` of axis 1 of ``Fa`` in place.
+"""
+
+from __future__ import annotations
+
+from typing import Mapping
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+
+from common.fft_helpers import local_fftn3, local_ifftn3
+
+
+# Per ``device_kind`` prefix: the axis lengths ``N`` at which the stored-matrix
+# GEMM beats the library FFT, for a full N→N axis and for an axis with a
+# support (whose FFT arm pays the embedding gather or the restriction take).
+# A missing device, or an ``N`` outside the range, means FFT.
+#
+# A100, complex128, measured through the CUDA leg (one custom call): a batched
+# cuFFT costs about one HBM pass for every N in 2..256, and the Fourier ZGEMMs
+# (DMMA tensor cores, ~7 TFLOP/s at K ≈ 27–40) cost more than a pass, so a full
+# axis never takes the GEMM (1-D 1.14–6.1× at 1e3–1e5 lines, 2-D/3-D grids 1.2–82×).  A supported
+# axis's FFT arm pays the zero-fill embed, the transform and the restriction;
+# the GEMM does all three in one pass: one way 0.50–0.82 and round trip
+# 0.45–0.87 of the FFT arm on 16³–96³ and 24²–128² boxes.  12³ loses (1.16:
+# launch-bound batched GEMMs), hence the floor at 16.
+#
+# A supported axis also needs a small support.  The GEMM costs K = n_in·n_out/N
+# multiply-adds per grid element and the FFT arm about one pass, so the row's
+# third entry bounds K/N.  Measured on A100 (``runs/runtime/
+# f3_fft_adoption_20260925/sweep_support_fraction.out``: 2-D and 3-D, N 24–128,
+# in and out supports), the GEMM wins 1.08–2.8× at every K/N ≤ 0.54 except 2-D
+# out-support at small N.  The first loss above 0.54 is at N = 128, K/N = 0.55
+# (out-support, 0.74–0.83×).  The bound 0.54 keeps Fe's 13/25 union box.
+# The fourth entry is the supported-axis N range of a plan over one or two
+# axes.  2-D out-supports lose at N 16–30 (0.60–0.97×; N = 27 wins 1.08–1.14×)
+# and win from N = 32 (``sweep_small_n.out``).  3-D supports and 2-D
+# in-supports win from N = 16/20 and keep the third entry's range.
+# Missing entries mean no K/N bound and the same range.
+# Kept 2026-09-25 (FP): at Fe 8³ in real-space GW, sphere↔box is 54–91% of the FFT
+# time (estimate), and the supported-axis GEMM runs it at 0.50–0.73 of the FFT arm
+# (claim 2764), cutting FFT time by 26–47%.  The empty full-axis column is kept for
+# parts with weak FP64 (B300, sm_86/89/120), where a complex128 FFT is compute-bound
+# and an emulated ZGEMM row is unmeasured.
+# Two optional entries follow (absent: the A100 behaviour).  The fifth: whether an axis with
+# only an OUTPUT support (a restriction) may take the GEMM (default True).  The sixth: whether
+# the FFT arm runs on the device leg too (default False: a plan with no GEMM stage takes the
+# XLA leg, as A100 measured).
+#
+# MI250X (one GCD), complex128, ``lorrax_fourier_plan_rocm`` against the XLA leg
+# (pool log fplan_h2probe2, sweep at ~64 MB per box batch, K/N ~ 0.52): an input-support
+# (embedding) axis on the rocBLAS ZGEMM is 0.38-0.88 of XLA's take + rocFFT at every 3-D N in
+# 12..80 and 0.40-0.94 at every 2-D N in 16..128; a restriction GEMM is erratic (0.61-1.66,
+# Fe's N = 25: 1.25), so restrictions stay on the FFT arm; and the device FFT arm (hipRTC remap +
+# hipFFT) is 0.56-1.00 of XLA at every point (the reverse of A100), so it runs on the device
+# leg.  Full axes stay FFT (unmeasured as GEMMs); the K/N bound is A100's (MI250X measured at
+# 0.52 only).
+GEMM_CROSSOVER: dict[str, tuple] = {
+    "NVIDIA A100": (range(0), range(16, 129), 0.54, range(32, 129)),
+    "AMD Instinct MI250X": (range(0), range(12, 81), 0.54, range(16, 129), False, True),
+}
+
+_NORMS = (None, "backward", "ortho", "forward")
+
+
+def _axis_scale(n: int, sign: int, norm: str | None) -> float:
+    """``jnp.fft``'s per-axis scale for this direction (fftn: sign -1)."""
+    if norm == "ortho":
+        return 1.0 / np.sqrt(n)
+    scaled = "forward" if sign < 0 else "backward"
+    return 1.0 / n if (norm or "backward") == scaled else 1.0
+
+
+def dft_matrix(n: int, out_idx, in_idx, *, sign: int, scale: float = 1.0,
+               dtype=np.complex128) -> np.ndarray:
+    """``A[j', j] = scale · exp(sign·2πi·(out_idx[j']·in_idx[j] mod n)/n)``.
+
+    The phase index is reduced exactly in int64 and centred on ``(-n/2, n/2]``
+    before the float64 exponential.
+    """
+    o = np.asarray(out_idx, dtype=np.int64) % n
+    i = np.asarray(in_idx, dtype=np.int64) % n
+    m = np.outer(o, i) % n
+    m = np.where(2 * m > n, m - n, m)
+    a = np.exp((sign * 2.0 * np.pi / n) * 1j * m.astype(np.float64))
+    return (scale * a).astype(dtype)
+
+
+def gemm_crossover(device_kind: str) -> tuple[range, range, float, range]:
+    """``(full-axis N range, supported-axis N range, max supported n_in·n_out/N²,
+    supported-axis N range of a 1- or 2-axis plan)`` taking the GEMM."""
+    row = next((r for p, r in GEMM_CROSSOVER.items() if device_kind.startswith(p)),
+               (range(0), range(0)))
+    return (row[0], row[1], row[2] if len(row) > 2 else 1.0,
+            row[3] if len(row) > 3 else row[1])
+
+
+def native_policy(device_kind: str) -> tuple[bool, bool]:
+    """``(restriction axes may take the GEMM, the FFT arm runs on the device leg)`` of the
+    device's GEMM_CROSSOVER row (its optional fifth and sixth entries; ``(True, False)``)."""
+    row = next((r for p, r in GEMM_CROSSOVER.items() if device_kind.startswith(p)), ())
+    return (bool(row[4]) if len(row) > 4 else True, bool(row[5]) if len(row) > 5 else False)
+
+
+def _default_leg():
+    """``None``: the leg follows the platform the call is lowered for.  Tests and
+    the sweep force ``'xla'`` or ``'ffi'`` by patching this."""
+    return None
+
+
+def _leg_present(leg: str, mesh) -> bool:
+    """Whether the plan can be lowered for device leg ``leg``: the mesh's platform, else any
+    device of the leg's JAX platform in this process."""
+    if mesh is not None:
+        from ffi.gate import mesh_ffi_platform
+        return mesh_ffi_platform(mesh) == leg
+    from lxkit import LEGS
+    try:
+        return len(jax.devices(LEGS[leg].jax_platforms[0])) > 0
+    except RuntimeError:
+        return False
+
+
+def _process_leg() -> str:
+    """The leg of this process's default devices, by vendor (``device.platform`` is ``'gpu'``
+    for every GPU vendor): ``'CUDA'``, ``'ROCM'`` or ``'cpu'``."""
+    from ffi.gate import device_vendor
+    from lxkit import LEGS
+    vendor = device_vendor(jax.devices()[0])
+    return next((k for k, leg in LEGS.items() if leg.vendor == vendor), "cpu")
+
+
+class LocalFourierPlan:
+    """A jnp.fft-convention transform over ``axes`` with optional supports.
+
+    ``extents`` are the full grid sizes ``N`` aligned with ``axes``;
+    ``in_support``/``out_support`` map an axis (as written in ``axes``) to an
+    integer index array.  ``plan(x)`` requires ``x.dtype == dtype`` and the
+    compact extent on every in-support axis, the full extent elsewhere.
+    ``out_perm`` returns ``jnp.transpose(y, out_perm)`` instead of ``y``.
+    ``device_kind`` defaults to the kind of ``mesh``'s first device, else
+    ``jax.devices()[0]``'s (it chooses GEMM axes only, never correctness).
+    A plan with a GEMM stage chooses its leg when the call is lowered, from the
+    platform it is lowered for (``jax.lax.platform_dependent``): one custom call on a
+    leg with a route row (``ffi.fft.FOURIER_PLAN_TARGETS``: ``lorrax_fourier_plan_mathdx``
+    on CUDA, ``lorrax_fourier_plan_rocm`` on ROCM), XLA ops elsewhere, so a CPU
+    operand in a GPU process takes the XLA leg.  A plan without one takes the XLA
+    leg everywhere (``plan.leg == 'xla'``, set at construction).  The fused pair's
+    nvidia-mathdx wheel is checked at construction (``ffi.fft.pair_build_attrs``).  Contract on every platform: complex128, at most three
+    transform axes (``GATE fourier-plan-contract`` otherwise).
+    ``plan.stages`` lists ``(axis, 'gemm'|'fft', n_in, n_out)`` in execution
+    order on both legs.  ``in_gather`` (with
+    the caller's ``mesh``) is the cylinder-plane form of the module docstring;
+    only it takes ``plan(x, start, size)``.
+    """
+
+    def __init__(self, extents, axes, *, sign: int, norm: str | None = "backward",
+                 dtype=jnp.complex128,
+                 in_support: Mapping[int, np.ndarray] | None = None,
+                 out_support: Mapping[int, np.ndarray] | None = None,
+                 out_perm: tuple[int, ...] | None = None,
+                 in_gather: tuple | None = None, mesh=None,
+                 device_kind: str | None = None):
+        extents, axes = tuple(int(n) for n in extents), tuple(int(a) for a in axes)
+        if len(extents) != len(axes) or len(set(axes)) != len(axes):
+            raise ValueError(f"LocalFourierPlan: extents {extents} and axes {axes} "
+                             "must align one-to-one with distinct axes")
+        if sign not in (-1, 1):
+            raise ValueError(f"LocalFourierPlan: sign must be -1 or +1, got {sign!r}")
+        if norm not in _NORMS:
+            raise ValueError(f"LocalFourierPlan: norm must be one of {_NORMS}, got {norm!r}")
+        self.dtype = jnp.dtype(dtype)
+        if self.dtype != jnp.complex128 or not 1 <= len(axes) <= 3:
+            raise ValueError(
+                f"GATE fourier-plan-contract: got dtype {self.dtype} over {len(axes)} axes; "
+                "want complex128 over 1 to 3 transform axes; why: the CUDA leg "
+                "(lorrax_fourier_plan_mathdx) serves exactly that, and the plan keeps one contract "
+                "on every platform; fix: cast to complex128, or split the transform")
+        in_support, out_support = dict(in_support or {}), dict(out_support or {})
+        self._gather = None
+        if in_gather is not None:
+            if (axes != (-2, -1) or sign != -1 or (norm or "backward") != "backward"
+                    or in_support or out_support or out_perm is not None or mesh is None):
+                raise ValueError(
+                    "LocalFourierPlan: in_gather is the forward 'backward'-norm plane "
+                    "transform over axes (-2, -1) with no supports or out_perm, and "
+                    f"needs the caller's mesh; got extents {extents}, axes {axes}, "
+                    f"sign {sign}, norm {norm!r}, mesh {mesh!r}")
+            from ffi.fft import make_plane_fft_gather
+            plane_from_col, n_col = in_gather
+            self._gather = make_plane_fft_gather(mesh, plane_from_col, int(n_col), extents)
+            self.extents, self.axes, self.sign, self.norm = extents, axes, sign, norm
+            self.stages = [(axes, "gather-fft", int(n_col), extents[0] * extents[1])]
+            self.leg = None             # the factory chooses mathdx mode 10 or its XLA route
+            return
+        for name, sup in (("in_support", in_support), ("out_support", out_support)):
+            if set(sup) - set(axes):
+                raise ValueError(f"LocalFourierPlan: {name} keys {sorted(sup)} "
+                                 f"are not all in axes {axes}")
+        # A support listing the whole axis in order is no support: that axis
+        # is full, and a full axis takes the full-axis row (A100: the FFT).
+        n_of = dict(zip(axes, extents))
+        for sup in (in_support, out_support):
+            for ax in [a for a, idx in sup.items()
+                       if np.array_equal(np.asarray(idx).ravel() % n_of[a], np.arange(n_of[a]))]:
+                del sup[ax]
+        if device_kind is None:
+            device_kind = (mesh.devices.flat[0] if mesh is not None else jax.devices()[0]).device_kind
+        self.device_kind = str(device_kind)
+        n_full, n_sup, kn_max, n_sup12 = gemm_crossover(self.device_kind)
+        restrict_gemm, native_fft = native_policy(self.device_kind)
+        if len(axes) < 3:
+            n_sup = n_sup12
+
+        self.extents, self.axes, self.sign, self.norm = extents, axes, sign, norm
+        gemm, fft, embed, take, self.stages = [], [], [], [], []
+        self._axis = {}                 # ax -> (n, in_idx, out_idx, supported_in, supported_out)
+        for n, ax in zip(extents, axes):
+            i_idx = np.asarray(in_support.get(ax, np.arange(n)), dtype=np.int64).ravel() % n
+            o_idx = np.asarray(out_support.get(ax, np.arange(n)), dtype=np.int64).ravel() % n
+            if i_idx.size == 0 or o_idx.size == 0:
+                raise ValueError(f"LocalFourierPlan: empty support on axis {ax}")
+            if np.unique(i_idx).size != i_idx.size:
+                raise ValueError(f"LocalFourierPlan: in_support on axis {ax} repeats an index")
+            supported = ax in in_support or (restrict_gemm and ax in out_support)
+            self._axis[ax] = (n, i_idx, o_idx, ax in in_support, ax in out_support)
+            if (n in n_sup and i_idx.size * o_idx.size <= kn_max * n * n) if supported else n in n_full:
+                A = dft_matrix(n, o_idx, i_idx, sign=sign,
+                               scale=_axis_scale(n, sign, norm), dtype=self.dtype)
+                gemm.append((o_idx.size / i_idx.size, ax, A))
+                continue
+            fft.append(ax)
+            if ax in in_support:        # position of each full index in x; K → zero
+                pos = np.full(n, i_idx.size, dtype=np.int32)
+                pos[i_idx] = np.arange(i_idx.size, dtype=np.int32)
+                embed.append(("embed", ax, pos))
+            if ax in out_support:
+                take.append(("take", ax, o_idx.astype(np.int32)))
+            self.stages.append((ax, "fft", i_idx.size, o_idx.size))
+        # Shrinking GEMMs first, then the FFT group (its embeddings, one
+        # multidimensional transform, its restrictions), expanding GEMMs last;
+        # within a ratio the last-listed axis first.
+        rank = {ax: -i for i, ax in enumerate(axes)}       # minor-most listed axis first
+        order = sorted(range(len(gemm)), key=lambda s: (gemm[s][0], rank[gemm[s][1]]))
+        pre = [("gemm", gemm[s][1], gemm[s][2]) for s in order if gemm[s][0] < 1]
+        post = [("gemm", gemm[s][1], gemm[s][2]) for s in order if gemm[s][0] >= 1]
+        mid = embed + ([("fft", tuple(fft), None)] if fft else []) + take
+        self._ops = pre + mid + post
+        self.out_perm = None if out_perm is None else tuple(int(a) for a in out_perm)
+        # A plan with no GEMM stage takes the XLA leg on every platform: on A100 the CUDA
+        # leg's FFT arm (remap embed + cuFFT) is 1.20-1.33x the XLA leg's take-embed + cuFFT
+        # on 24²-80² and 24³-64³ sphere->box plans, with cuFFT itself equal (claim 2786).
+        # MI250X measured the reverse (GEMM_CROSSOVER's sixth entry): its FFT arm runs on the device leg.
+        self.leg = None if gemm or native_fft else "xla"
+        # Every device leg with a route row (ffi.fft.FOURIER_PLAN_TARGETS) is a branch of the
+        # lowering-time choice; a present leg's handler must be loaded before lowering.
+        # Only a leg present in this process (the mesh's, else any of its devices) is a branch:
+        # the lowered program of a CUDA process is the one it was before the ROCM row existed.
+        from ffi.fft import FOURIER_PLAN_TARGETS, _require_target, fourier_plan_build_attrs
+        self._n_gemm, self._build = len(gemm), {}
+        for leg_key, target in FOURIER_PLAN_TARGETS.items():
+            if _leg_present(leg_key, mesh):
+                _require_target(target, leg_key)
+                # CUDA: a fused pair is possible with two GEMM axes; its wheel is checked here.
+                self._build[leg_key] = fourier_plan_build_attrs(leg_key, n_gemm=len(gemm))
+        fft_stages = self.stages
+        self.stages = ([(ax, "gemm", A.shape[1], A.shape[0]) for _, ax, A in pre]
+                       + fft_stages
+                       + [(ax, "gemm", A.shape[1], A.shape[0]) for _, ax, A in post])
+        self._in_extent = {ax: (np.asarray(in_support[ax]).size if ax in in_support else n)
+                           for n, ax in zip(extents, axes)}
+
+    def __call__(self, x, start=None, size=None):
+        if self._gather is not None:
+            return self._gather(x) if start is None else self._gather(x, start, size)
+        if start is not None:
+            raise ValueError("LocalFourierPlan: the slab form (start, size) is in_gather only")
+        if x.dtype != self.dtype:
+            raise TypeError(f"LocalFourierPlan: x.dtype {x.dtype} != plan dtype {self.dtype}")
+        for ax, k in self._in_extent.items():
+            if x.shape[ax] != k:
+                raise ValueError(f"LocalFourierPlan: axis {ax} of x has extent "
+                                 f"{x.shape[ax]}, the plan expects {k}")
+        leg = _default_leg() or self.leg
+        if leg is not None:
+            return self._call_ffi(x, _process_leg()) if leg == "ffi" else self._call_xla(x)
+        from lxkit import LEGS
+        branches = {LEGS[k].jax_platforms[0]: (lambda x, k=k: self._call_ffi(x, k)) for k in self._build}
+        return jax.lax.platform_dependent(x, default=self._call_xla, **branches)
+
+    def _call_xla(self, x):
+        """The XLA leg: each GEMM contracts its axis in place (``tensordot``, the new
+        axis moved back to that position), the FFT group is one ``jnp.fft`` call.
+
+        A transpose-minimising route search over GEMM orders and output placements
+        (1.13-1.40x on this leg's GEMM chains, claim 2745) was removed 2026-09-25:
+        <4% of FFT time on every NVIDIA platform we target.  Every CUDA build carries
+        the complete NVIDIA stack (owner 2026-09-25), so on NVIDIA this leg runs a
+        GEMM axis only when a caller forces it, which production never does, and
+        cpu has no GEMM row.
+        """
+        nd = x.ndim
+        fft = local_fftn3 if self.sign < 0 else local_ifftn3
+        for kind, ax, A in self._ops:
+            if kind == "fft":
+                x = fft(x, axes=tuple(a % nd for a in ax), norm=self.norm)
+                continue
+            p = ax % nd
+            if kind == "embed":         # one gather; out-of-range K reads zero
+                x = jnp.take(x, jnp.asarray(A), axis=p, mode="fill", fill_value=0)
+            elif kind == "take":
+                x = jnp.take(x, jnp.asarray(A), axis=p)
+            else:                       # A (N', K) against axis p (K)
+                x = jnp.moveaxis(jnp.tensordot(x, jnp.asarray(A), axes=((p,), (1,))), -1, p)
+        if self.out_perm is not None:
+            x = jnp.transpose(x, [a % nd for a in self.out_perm])
+        return x
+
+    def _call_ffi(self, x, leg):
+        """A device leg (``leg``, a key of ``ffi.fft.FOURIER_PLAN_TARGETS``): the transform
+        axes are moved trailing (free when they already are), then one custom call executes
+        the same stages row-major (GEMMs by the vendor BLAS with the matrix broadcast, the FFT
+        group by the vendor FFT; on CUDA the two trailing axes' GEMMs, back to back, as one
+        cuBLASDx plane kernel when a block fits it on the device)."""
+        from ffi.fft import fourier_plan_build_attrs, fourier_plan_ffi
+        nd = x.ndim
+        phys = sorted(a % nd for a in self.axes)
+        trailing = list(range(nd - len(phys), nd))
+        if phys != trailing:
+            x = jnp.moveaxis(x, phys, trailing)
+        by_pos = {a % nd: a for a in self.axes}
+        pos = {by_pos[p]: i for i, p in enumerate(phys)}      # plan axis -> trailing slot
+        cols = [self._axis[by_pos[p]] for p in phys]
+        gemm_axes = {ax for kind, ax, _ in self._ops if kind == "gemm"}
+        order = []
+        for kind, ax, _ in self._ops:
+            if kind == "gemm":
+                order.append(pos[ax])
+            elif kind == "fft":
+                order.append(-1)
+        y = fourier_plan_ffi(
+            x, n=[c[0] for c in cols], kin=[c[1].size for c in cols],
+            kout=[c[2].size for c in cols], in_idx=np.concatenate([c[1] for c in cols]),
+            out_idx=np.concatenate([c[2] for c in cols]), sup_in=[int(c[3]) for c in cols],
+            sup_out=[int(c[4]) for c in cols],
+            gemm=[int(by_pos[p] in gemm_axes) for p in phys],
+            scale=[_axis_scale(c[0], self.sign, self.norm) for c in cols], order=order,
+            sign=self.sign, leg=leg, **(self._build[leg] if leg in self._build else
+                                        fourier_plan_build_attrs(leg, n_gemm=self._n_gemm)))
+        if phys != trailing:
+            y = jnp.moveaxis(y, trailing, phys)
+        if self.out_perm is not None:
+            y = jnp.transpose(y, [a % nd for a in self.out_perm])
+        return y

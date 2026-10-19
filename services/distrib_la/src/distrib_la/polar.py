@@ -1,0 +1,1252 @@
+"""Distributed polar factor from a Hermitian-dilation SVD.
+
+The factorization is built from the service's planned eigh operation on
+[[0, A], [A.H, 0]].  The polar factor never diagonalizes A.H @ A, which would
+square the condition number.  Relative-cut direction selection
+(``right_singular_vectors``) does, on the m x m normal matrix: its cut
+squared stays far above round-off, and it costs an eighth of the 2m
+dilation eigensolve.  Only the length-n singular-value vector is replicated;
+single-matrix work stays two-dimensionally sharded at P('x','y'). Independent
+batches may use the service's capacity-bounded batch ownership on all ranks.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+import math
+import operator
+import numpy as np
+from typing import Callable
+
+import jax
+from lxkit import ordered_norm
+import jax.numpy as jnp
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
+from distrib_la.resolve import mesh_key
+from distrib_la._collectives import device_put_process_local_cached
+
+__all__ = ["PolarPlan", "plan_polar_factor", "polar_factor",
+           "right_singular_vectors", "leading_eigenvectors",
+           "retain_leading_eigenvectors"]
+
+
+_SUPPORTED_DTYPES = (jnp.dtype(jnp.float64), jnp.dtype(jnp.complex128))
+
+# One fused executable per resolved plan/signature.  The value retains its
+# plan and mesh.  Fusing the dilation, planned eigh and final distributed
+# GEMM avoids a Python/JIT boundary per streamed k-point.
+_KERNEL_CACHE: dict[tuple, Callable] = {}
+
+# The one-shot entry point also caches plans so a streaming loop cannot accidentally
+# repeat backend probing/dlopen.  Explicit planning remains the preferred
+# spelling when the operation is called from another traced function.
+_PLAN_CACHE: dict[tuple, "PolarPlan"] = {}
+
+
+def _hermitian_dilation(A):
+    """Form [[0,A],[A.H,0]] without changing the input matrix extent."""
+    n = A.shape[-1]
+    upper = jnp.pad(A, ((0, 0),) * (A.ndim - 2) + ((0, n), (n, 0)))
+    return upper + jnp.conj(jnp.swapaxes(upper, -1, -2))
+
+
+def _dilation_vectors(Q, n):
+    """Extract U,V from the positive half of the dilation eigenvectors."""
+    positive = Q[..., n:]
+    root2 = jnp.asarray(math.sqrt(2.0), dtype=Q.dtype)
+    return root2 * positive[..., :n, :], root2 * positive[..., n:, :]
+
+
+def _dilation_svd(A, eigh):
+    """Extract ascending singular triplets from [[0,A],[A.H,0]] (the polar factor)."""
+    evals, Q = eigh(_hermitian_dilation(A))
+    u, v = _dilation_vectors(Q, A.shape[-1])
+    return jnp.maximum(evals[..., A.shape[-1]:], 0), u, v
+
+
+def _polar_from_matrix(A, eigh, rcond):
+    """One polar equation for local batches and distributed single tiles."""
+    s, u, v = _dilation_svd(A, eigh)
+    cutoff = jnp.asarray(rcond, dtype=s.dtype) * jnp.max(s, axis=-1, keepdims=True)
+    # Zero dilation modes mix independent left/right null spaces. Dropping
+    # them gives the unique partial isometry, without inventing an extension.
+    keep = (s > cutoff).astype(A.dtype)
+    link = (u * keep[..., None, :]) @ jnp.conj(jnp.swapaxes(v, -1, -2))
+    return link, s[..., ::-1]
+
+
+def _close_spectral_cut(values, count, tolerance):
+    """Keep the entire adjacent relative-gap multiplet at a descending cut."""
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("multiplet_tol must be finite and nonnegative")
+    while 0 < count < len(values):
+        a, b = values[count - 1:count + 1]
+        if abs(a - b) > tolerance * max(abs(a), abs(b)):
+            break
+        count += 1
+    return count
+
+
+def _layout_spec(layout, ndim):
+    """Face ``P(None,...,'x','y')`` or batch layout ``P(('x','y'),None,...)`` for rank ``ndim``."""
+    if layout == 'batch':
+        return P(('x', 'y'), *((None,) * (ndim - 1)))
+    return P(*((None,) * (ndim - 2)), 'x', 'y')
+
+
+def _direction_input(W, eig, real_rows=None):
+    """Validate a direction operand; return its layout, ``'face'`` or ``'batch'``."""
+    if isinstance(W, jax.core.Tracer):
+        raise ValueError("spectral direction selection is an eager construction stage")
+    if W.ndim < 2 or W.shape[-2] != W.shape[-1]:
+        raise ValueError("spectral directions require a square rank-2 matrix or a batch of them")
+    _validate_dtype(W.dtype)
+    if eig.op != 'eigh' or eig.n not in (None, W.shape[-1]):
+        raise ValueError("eigh_plan must match the matrix extent")
+    face = W.sharding.is_equivalent_to(
+        NamedSharding(eig.mesh, _layout_spec('face', W.ndim)), W.ndim)
+    batch = W.ndim >= 3 and W.sharding.is_equivalent_to(
+        NamedSharding(eig.mesh, _layout_spec('batch', W.ndim)), W.ndim)
+    if face and batch:
+        # One device (P1) holds both layouts, so placement cannot tell them
+        # apart. ``real_rows`` exists only for a batch stack, so a caller
+        # that passes it has declared the batch layout.
+        return 'batch' if real_rows is not None else 'face'
+    if face:
+        return 'face'
+    if batch:
+        return 'batch'
+    raise ValueError("spectral directions require W face-tiled over x/y or in batch layout "
+                     "P(('x','y'),None,...)")
+
+
+def _direction_output_layout(Q, mesh):
+    """Layout of an already selected rank-2 or rank-3 direction carrier."""
+    if isinstance(Q, jax.core.Tracer) or Q.ndim not in (2, 3):
+        raise ValueError("retained eigenvectors require an eager rank-2 or rank-3 carrier")
+    _validate_dtype(Q.dtype)
+    if Q.sharding.is_equivalent_to(
+            NamedSharding(mesh, _layout_spec('face', Q.ndim)), Q.ndim):
+        return 'face'
+    if Q.ndim == 3 and Q.sharding.is_equivalent_to(
+            NamedSharding(mesh, _layout_spec('batch', Q.ndim)), Q.ndim):
+        return 'batch'
+    raise ValueError("retained eigenvectors require Q in a spectral direction layout")
+
+
+@lru_cache(maxsize=32)
+def _leading_axes_kernel(mesh, leading, layout='face'):
+    """Reshape the leading batch axes of a stack; each rank keeps its own tile or rows.
+
+    ``leading=None`` flattens [b0,...,bk,m,m] to one batch; a tuple restores
+    that leading shape. On the face the leading axes are unsharded and
+    adjacent; in batch layout the first axis carries ('x','y') and the rest
+    are unsharded, so every rank keeps whole contiguous rows. A bitcast.
+    """
+    rank = 1 if leading is None else len(leading)
+    tile = NamedSharding(mesh, _layout_spec(layout, rank + 2))
+    if leading is None:
+        return jax.jit(lambda w: w.reshape((-1,) + w.shape[-2:]), out_shardings=tile)
+    return jax.jit(lambda w: w.reshape(tuple(leading) + w.shape[-2:]), out_shardings=tile)
+
+
+def _nest(values, leading):
+    """Nest a flat per-row tuple as tuples following the leading batch shape."""
+    if len(leading) == 1:
+        return tuple(values)
+    step = int(np.prod(leading[1:]))
+    return tuple(_nest(values[i * step:(i + 1) * step], leading[1:])
+                 for i in range(leading[0]))
+
+
+def _over_leading_axes(select, W, mesh, layout, real_rows):
+    """Run a rank-3 spectral selection on a rank >= 4 stack and restore its axes.
+
+    Only the eager spectrum cut sees the flattened rows; Q returns with the
+    original leading axes and the per-row spectra as nested tuples.
+    ``real_rows`` counts entries of the FIRST axis and becomes flat rows here.
+    """
+    leading = tuple(int(v) for v in W.shape[:-2])
+    flat = None if real_rows is None else int(real_rows) * int(np.prod(leading[1:]))
+    q, values = select(_leading_axes_kernel(mesh, None, layout)(W), flat)
+    return _leading_axes_kernel(mesh, leading, layout)(q), _nest(values, leading)
+
+
+def _real_row_counts(values, cut, real_rows):
+    """Per-row retained counts; synthetic rows (index >= real_rows) keep none."""
+    return tuple(cut(row) if real_rows is None or i < real_rows else 0
+                 for i, row in enumerate(values))
+
+
+@lru_cache(maxsize=128)
+def _retained_column_kernel(
+    mesh, batched, extent, layout='face', descending=False,
+):
+    """Select padded columns; current per-row counts are runtime mask inputs."""
+    tile = NamedSharding(mesh, _layout_spec(layout, 3) if batched else P('x', 'y'))
+    @jax.jit(out_shardings=tile)
+    def select(q, count):
+        width = min(extent, q.shape[-1])
+        selected = q[..., :width] if descending else q[..., ::-1][..., :width]
+        selected = jnp.pad(selected, ((0, 0),) * (q.ndim - 1)
+                           + ((0, extent - width),))
+        active = jnp.arange(extent) < count[..., None]
+        return jnp.where(active[..., None, :], selected, 0)
+    return select
+
+
+def _normal_matrix(A):
+    """A.H @ A of a local (whole-matrix) stack, Hermitian by construction."""
+    g = jnp.matmul(jnp.conj(jnp.swapaxes(A, -1, -2)), A)
+    return (g + jnp.conj(jnp.swapaxes(g, -1, -2))) / 2
+
+
+def _singular_values(evals):
+    """sigma = sqrt(max(lambda, 0)) of a normal-matrix spectrum; round-off negatives read 0."""
+    return jnp.sqrt(jnp.maximum(evals, 0))
+
+
+def _normal_svd(A, eigh):
+    """Ascending singular values and right singular vectors from eigh(A.H @ A)."""
+    evals, v = eigh(_normal_matrix(A))
+    return _singular_values(evals), v
+
+
+@dataclass(frozen=True)
+class _ShiftedCut:
+    """Check what you use on I + G/||G||_F: the columns mu - 1 > c (max mu - 1), i.e.
+    lambda_G > c lambda_max. The direction cut keeps lambda > tau^2 lambda_max and its
+    boundary multiplet (relative gap <= multiplet_tol << 1/2), so c = tau^2 / 2 checks every
+    column it reads. The rejected columns are G's null cluster at mu = 1, where cuSOLVERMp
+    0.9.1 returns non-orthonormal vectors (n 30000, run30k); a kept column it corrupts still
+    refuses by name. A value, so the programs keyed on it are shared."""
+    c: float
+
+    def __call__(self, mu):
+        return (mu - 1) > self.c * (jnp.max(mu, axis=-1, keepdims=True) - 1)
+
+
+def _shifted_normal_eigh(g, eigh, mesh=None, cut=None):
+    """eigh of the PSD normal matrix G as I + G/||G||_F, eigenvalues mapped back.
+
+    cuSOLVERMp STEDC failed (info 4, in58730813.3/.4) on the zero cluster of a
+    padded dilation at P16; the shifted positive matrix completed (.5). G has
+    the same, denser cluster, so the whole-mesh cuSOLVERMp route solves the
+    shifted matrix. Eigenvectors are those of G. The eigenvalue error becomes
+    ~2 eps ||G||_F <= 2 eps sqrt(r) lambda_max, so sigma at the cut
+    tau * sigma_max moves by ~eps sqrt(r) / tau**2 relative: 3e-8 at
+    r = 2e4, tau = 1e-3, against the 1e-6 multiplet tolerance.
+    """
+    scale = (jnp.linalg.norm(g, axis=(-2, -1)) if mesh is None else
+             ordered_norm(g, axis=(-2, -1), mesh=mesh, spec=P(*((None,) * (g.ndim - 2)), "x", "y")))
+    scale = jnp.where(scale > 0, scale, 1)
+    eye = jnp.eye(g.shape[-1], dtype=g.dtype)
+    mu, v = eigh(g / scale[..., None, None] + eye, **({} if cut is None else {"cut": cut}))
+    return (mu - 1) * scale[..., None], v
+
+
+@lru_cache(maxsize=32)
+def _agree_kernel(mesh):
+    """Every device's copy of a replicated spectrum replaced by mesh device 0's bits, on device.
+
+    The bits travel as unsigned integers and every other device contributes
+    zero to one psum, so the sum is device 0's bit pattern exactly (no float
+    rounding, signed zeros and NaN payloads kept).
+    """
+    from jax import shard_map
+    axes = tuple(mesh.axis_names)
+
+    def body(s):
+        bits = jax.lax.bitcast_convert_type(s, _UINT_OF[jnp.dtype(s.dtype).itemsize])
+        root = jnp.asarray(True)
+        for a in axes:
+            root = root & (jax.lax.axis_index(a) == 0)
+        bits = jax.lax.psum(jnp.where(root, bits, jnp.zeros_like(bits)), axes)  # exact-reduce: root's bits, zeros elsewhere
+        return jax.lax.bitcast_convert_type(bits, s.dtype)
+    return jax.jit(shard_map(body, mesh=mesh, in_specs=P(), out_specs=P(), check_vma=False))
+
+
+_UINT_OF = {4: jnp.uint32, 8: jnp.uint64}
+
+
+def _agreed(s):
+    """The mesh-uniform device spectrum (``_agree_kernel``), or ``None`` for a non-mesh input."""
+    sharding = getattr(s, "sharding", None)
+    if isinstance(sharding, NamedSharding) and jnp.dtype(s.dtype).itemsize in _UINT_OF:
+        return _agree_kernel(sharding.mesh)(s)
+    return None
+
+
+def _close_cut_xp(xp, rows, count, tolerance):
+    """:func:`_close_spectral_cut` for every row at once (``xp`` numpy or jax.numpy, same decisions).
+
+    ``rows`` [..., n] descending, ``count`` [...] the uncut widths. The cut moves
+    to the first adjacent pair past it whose relative gap exceeds ``tolerance``
+    (the same comparison, element for element, as the host loop), or to n.
+    """
+    n = rows.shape[-1]
+    a, b = rows[..., :-1], rows[..., 1:]
+    gap = xp.abs(a - b) > tolerance * xp.maximum(xp.abs(a), xp.abs(b))
+    index = xp.arange(1, n)
+    first = xp.min(xp.where(gap & (index >= count[..., None]), index, n), axis=-1, initial=n)
+    return xp.where((count > 0) & (count < n), first, count)
+
+
+def _cut_counts(kind, cut, max_rank, tolerance, real_rows, rcond):
+    """The per-row retained counts of an agreed (ascending) device spectrum: the host cut, on the device.
+
+    ``kind`` 'singular' (``right_singular_vectors``: relative cutoff ``cut``,
+    optional ``max_rank``) or 'leading' (``leading_eigenvectors``: width ``cut``,
+    a scalar or one per row, and optional ``rcond``); rows at index >= ``real_rows``
+    keep none.  Element for element the comparisons of the host cut
+    (``_close_spectral_cut``, ``_leading_counts``, ``_real_row_counts``).
+    """
+    def counts(agreed):
+        rows = agreed[..., ::-1]
+        if kind == "singular":
+            width = jnp.sum(rows > cut * rows[..., :1], axis=-1)
+            if max_rank is not None:
+                width = jnp.minimum(width, max_rank)
+        else:
+            if isinstance(cut, tuple):
+                width = jnp.asarray(np.asarray(cut, np.int64).reshape(rows.shape[:-1]))
+            else:
+                width = jnp.full(rows.shape[:-1], cut, jnp.int64)
+            if rcond is not None:
+                width = jnp.minimum(width, jnp.sum(rows > rcond * jnp.max(jnp.abs(rows), axis=-1, keepdims=True), axis=-1))
+        width = _close_cut_xp(jnp, rows, width.astype(jnp.int64), tolerance)
+        if real_rows is not None and rows.ndim > 1:
+            width = jnp.where(jnp.arange(rows.shape[0]) < real_rows, width, 0)
+        return width.astype(jnp.int64)
+    return counts
+
+
+@lru_cache(maxsize=64)
+def _device_cut_program(mesh, kind, shape, cut, max_rank, tolerance, real_rows, rcond):
+    """:func:`_cut_counts` as a replicated program (the select's count operand)."""
+    return jax.jit(_cut_counts(kind, cut, max_rank, tolerance, real_rows, rcond),
+                   out_shardings=NamedSharding(mesh, P()))
+
+
+def _nonfinite_rows(agreed):
+    """How many rows of a spectrum hold a non-finite value (a 1-D spectrum is one row)."""
+    return jnp.sum(~jnp.all(jnp.isfinite(agreed), axis=-1)).astype(jnp.int64).reshape(1)
+
+
+@lru_cache(maxsize=64)
+def _device_cut_word(mesh, kind, shape, cut, max_rank, tolerance, real_rows, rcond):
+    """``(counts, word)``: the select's count operand and ``[counts..., nonfinite rows]``.
+
+    The word is everything the host decides from the spectrum (the carrier
+    extent, the per-row widths and the finite refusal): one small int64 read
+    per eigh family instead of the spectrum itself.
+    """
+    counts = _cut_counts(kind, cut, max_rank, tolerance, real_rows, rcond)
+
+    def word(agreed):
+        c = counts(agreed)
+        return c, jnp.concatenate([c.reshape(-1), _nonfinite_rows(agreed)])
+    replicated = NamedSharding(mesh, P())
+    return jax.jit(word, out_shardings=(replicated, replicated))
+
+
+class _SpectrumRead:
+    """One eigh family's agreed device spectrum, read to the host on first use, once."""
+
+    __slots__ = ("_device", "_host")
+
+    def __init__(self, agreed):
+        self._device, self._host = agreed, None
+
+    def host(self):
+        """The descending spectrum rows as NumPy (one read for the whole family)."""
+        if self._host is None:
+            self._host = np.asarray(self._device)[..., ::-1].copy()
+            self._device = None
+        return self._host
+
+
+class RetainedSpectrum:
+    """A retained descending spectrum: its length on the host, its values read on first use.
+
+    The selection decides from the device counts alone, so the values never
+    cross unless a caller asks for them: ``size``, ``shape`` and ``len`` need
+    no transfer; ``np.asarray`` (or indexing, iteration) reads the whole eigh
+    family once (:class:`_SpectrumRead`) and returns float64 values, as before.
+    """
+
+    __slots__ = ("_read", "_row", "size")
+    ndim = 1
+    dtype = np.dtype(np.float64)
+
+    def __init__(self, read, row, size):
+        self._read, self._row, self.size = read, row, int(size)
+
+    @property
+    def shape(self):
+        return (self.size,)
+
+    def __len__(self):
+        return self.size
+
+    def __array__(self, dtype=None, copy=None):
+        host = self._read.host()
+        row = host if self._row is None else host[self._row]
+        out = np.array(row[:self.size], dtype=np.float64, copy=True)
+        return out if dtype is None else out.astype(dtype, copy=False)
+
+    def __getitem__(self, key):
+        return np.asarray(self)[key]
+
+    def __iter__(self):
+        return iter(np.asarray(self))
+
+    def __repr__(self):
+        return f"RetainedSpectrum(size={self.size})"
+
+
+def _check_tolerance(tolerance):
+    if not math.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("multiplet_tol must be finite and nonnegative")
+
+
+def _word_counts(word, ndim):
+    """The host counts of a cut word: an int for one spectrum, else a per-row tuple."""
+    return int(word[0]) if ndim == 1 else tuple(int(v) for v in word[:-1])
+
+
+def _host_spectrum(s):
+    """One O(n) spectrum for all eager rank cuts, including roundoff tails.
+
+    Every process must cut the same bits.  A mesh-replicated spectrum is made
+    uniform on the device (``_agree_kernel``: device 0's bits) and read once;
+    the previous host broadcast (one host-to-device put and one collective
+    per eigh, ``multihost_utils.broadcast_one_to_all``) serves only an input
+    that is not a mesh array.
+    """
+    agreed = _agreed(s)
+    if agreed is not None:
+        return np.asarray(agreed)[..., ::-1].copy()
+    from jax.experimental.multihost_utils import broadcast_one_to_all
+    values = np.asarray(s)
+    bits = broadcast_one_to_all(values.view(np.uint64))
+    return bits.view(values.dtype)[..., ::-1].copy()
+
+
+@lru_cache(maxsize=16)
+def _row_health_kernel(mesh):
+    """Per-row [finite, max|W - W^H|, max|W|] of a square stack, replicated."""
+    @jax.jit(out_shardings=NamedSharding(mesh, P()))
+    def health(w):
+        defect = jnp.max(jnp.abs(w - jnp.conj(jnp.swapaxes(w, -1, -2))), axis=(-2, -1))
+        scale = jnp.max(jnp.abs(w), axis=(-2, -1))
+        finite = jnp.all(jnp.isfinite(w), axis=(-2, -1)).astype(defect.dtype)
+        return jnp.stack([finite, defect, scale], axis=-1)
+    return health
+
+
+def _refuse_nonfinite_spectrum(W, values, *, mesh, what):
+    """Name each row without a finite spectrum and why; a no-op when all are finite.
+
+    ``values`` are replicated, so every rank takes this branch together and
+    runs the one collective diagnostic. A synthetic row is zero and finite.
+    """
+    rows = np.asarray(values)
+    rows = rows.reshape(-1, rows.shape[-1])
+    bad = np.flatnonzero(~np.all(np.isfinite(rows), axis=-1))
+    if not bad.size:
+        return
+    from distrib_la.tolerance import roundoff_tol
+    health = np.asarray(_row_health_kernel(mesh)(W)).reshape(-1, 3)
+    tol = roundoff_tol(W.shape[-1], dtype=W.dtype)
+    causes = []
+    for i in bad[:8]:
+        finite, defect, scale = health[i]
+        ratio = defect / scale if scale > 0 else 0.0
+        if not finite:
+            cause = "input not finite"
+        elif ratio > tol:
+            cause = f"input not Hermitian, max|W-W^H|/max|W| = {ratio:.3e} > {tol:.1e}"
+        else:
+            cause = (f"input finite and Hermitian (max|W-W^H|/max|W| = {ratio:.3e}, "
+                     f"max|W| = {scale:.3e}); the eigensolver returned no spectrum")
+        causes.append(f"row {int(i)}: {cause}")
+    raise ValueError(f"{what} must be finite rank-1 rows; {bad.size} of {rows.shape[0]} "
+                     f"rows are not: " + "; ".join(causes))
+
+
+def _retained_columns(
+    Q, values, count, *, mesh, column_extent, layout='face', descending=False,
+    device_counts=None,
+):
+    """Select per-row physical columns; return their unpadded spectra."""
+    largest = max(count) if isinstance(count, tuple) else count
+    extent = operator.index(column_extent(largest))
+    if extent < largest or extent < 1 or extent % int(mesh.shape['y']):
+        raise ValueError("column_extent must cover the rank and tile mesh y")
+    if descending and int(Q.shape[-1]) < largest:
+        raise ValueError("leading direction carrier does not cover the retained rank")
+    select = _retained_column_kernel(
+        mesh, isinstance(count, tuple), extent, layout, descending)
+    replicated = NamedSharding(mesh, P())
+    # The counts are the select's runtime mask operand, placed once per
+    # distinct count vector.  The spectra are host values already (the
+    # broadcast _host_spectrum, identical on every process) and every caller
+    # reads them on the host (sizes, cuts, receipts): they are returned as
+    # host arrays, never re-placed on the device (one transfer per row before).
+    counts = (device_put_process_local_cached(np.asarray(count, dtype=np.int64), replicated)
+              if device_counts is None else device_counts)
+    if isinstance(values, _SpectrumRead):
+        # A device family: the counts came from the device word; the values stay
+        # there until a caller reads them (RetainedSpectrum).
+        spectra = (tuple(RetainedSpectrum(values, i, n) for i, n in enumerate(count))
+                   if isinstance(count, tuple) else RetainedSpectrum(values, None, count))
+        return select(Q, counts), spectra
+    retained = (tuple(row[:n] for row, n in zip(values, count))
+                if isinstance(count, tuple) else values[:count])
+    spectra = jax.tree.map(lambda row: np.array(row, dtype=np.float64, copy=True), retained)
+    return select(Q, counts), spectra
+
+
+def _leading_counts(values, r, *, multiplet_tol, real_rows, batched, rcond=None):
+    """Close requested leading widths with the sole multiplet-cut policy."""
+    rows = (tuple(np.asarray(row) for row in values) if batched
+            else (np.asarray(values),))
+    if any(row.ndim != 1 or not np.all(np.isfinite(row)) for row in rows):
+        raise ValueError("leading eigenvalue spectra must be finite rank-1 rows")
+    def close(row, width):
+        if rcond is not None:
+            width = min(width, int(np.count_nonzero(row > rcond * np.max(np.abs(row)))))
+        return _close_spectral_cut(row, width, multiplet_tol)
+    if not batched:
+        return close(rows[0], r)
+    if isinstance(r, tuple):
+        return tuple(close(row, width)
+                     if width and (real_rows is None or i < real_rows) else 0
+                     for i, (row, width) in enumerate(zip(rows, r)))
+    return _real_row_counts(rows, lambda row: close(row, r), real_rows)
+
+
+def retain_leading_eigenvectors(
+    Q, values, r, *, mesh, column_extent, multiplet_tol=1e-6,
+    real_rows=None,
+):
+    """Retain a narrower cut from a descending leading eigensystem.
+
+    ``Q, values`` are the output of :func:`leading_eigenvectors`. This eager
+    selection performs no eigensolve. It applies the same multiplet closure,
+    synthetic-row rule, caller padding and exact zero-tail mask as the
+    original selection.
+    """
+    layout = _direction_output_layout(Q, mesh)
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
+    batched = Q.ndim == 3
+    rows = (tuple(np.asarray(row) for row in values) if batched
+            else (np.asarray(values),))
+    expected_rows = int(Q.shape[0]) if batched else 1
+    if len(rows) != expected_rows or any(
+            len(row) > int(Q.shape[-1]) for row in rows):
+        raise ValueError(
+            "leading spectra must match the carrier rows and column extent")
+    if isinstance(r, (tuple, list, np.ndarray)):
+        r = tuple(operator.index(v) for v in np.asarray(r).reshape(-1))
+        if (not batched or len(r) != len(rows)
+                or not all(0 <= width <= len(row)
+                           for width, row in zip(r, rows)) or max(r) < 1):
+            raise ValueError("per-row r must fit every spectrum")
+    else:
+        r = operator.index(r)
+        if not 1 <= r <= min((len(row) for row in rows), default=0):
+            raise ValueError("r must lie within every eigenvalue spectrum")
+    values = rows if batched else rows[0]
+    count = _leading_counts(
+        values, r, multiplet_tol=multiplet_tol,
+        real_rows=real_rows, batched=batched)
+    return _retained_columns(
+        Q, values, count, mesh=mesh, column_extent=column_extent,
+        layout=layout, descending=True)
+
+
+@lru_cache(maxsize=16)
+def _direction_svd_kernel(eigh_plan, ndim, tau=None):
+    """Right singular vectors of the current face-tiled responses from the m x m normal matrix.
+
+    A batch-reshard plan moves whole matrices and forms W.H W and its eigh
+    rank-locally; a whole-mesh plan forms W.H W with the service GEMM on the
+    plan's provider and solves it with the planned eigh (on cuSOLVERMp as
+    I + G/||G||_F, ``_shifted_normal_eigh``). The provider eigh reads one
+    triangle, so the face G takes no Hermitian projection (no transpose of a
+    face-tiled matrix). Only the length-m spectrum replicates.
+    """
+    from distrib_la.matmul import matmul
+    tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
+    gemm_backend = "distributed" if eigh_plan.requested in ("auto", "off") else eigh_plan.requested
+
+    @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
+    def extract(w):
+        stack = w if w.ndim == 3 else w[None]
+        if eigh_plan.stack_route(stack.shape, w.dtype, "normal_eigh").route == ROUTE_BATCH_RESHARD:
+            s, v = eigh_plan.reshard_stack("normal_eigh", stack)
+        else:
+            g = matmul(stack, stack, mesh=eigh_plan.mesh, transa="C",
+                       backend=gemm_backend, batched_route="auto")
+            if eigh_plan.backend == "cusolvermp":
+                evals, v = _shifted_normal_eigh(g, eigh_plan.batched, eigh_plan.mesh,
+                                                None if tau is None else _ShiftedCut(0.5 * tau ** 2))
+            else:
+                evals, v = eigh_plan.batched(g)
+            s = _singular_values(evals)
+        return (s, v) if w.ndim == 3 else (s[0], v[0])
+
+    return extract
+
+
+def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
+                           multiplet_tol=1e-6, real_rows=None, max_rank=None):
+    """Return right singular directions with sigma/sigma_max > tau.
+
+    Parameters
+    ----------
+    W
+        Square [m,m] or independent [b,m,m] float64/complex128 faces at
+        P('x','y') or P(None,'x','y'); or a stack in batch layout
+        P(('x','y'),None,None) (b a multiple of Px*Py, whole matrices per
+        rank), which is always served by the rank-local kernel with no
+        movement whatever the plan's route, and returns Q in batch layout.
+        Singular values carry W's units; vectors are dimensionless.
+    tau
+        Finite positive relative cutoff; whole adjacent multiplets at
+        relative gap <= multiplet_tol survive a boundary crossing. The cut is
+        tau**2 on the normal spectrum; tau**2 < 1e4 * m * eps refuses. The
+        realistic sigma error at the cut is ~eps / (2 tau**2) (1e-10 at
+        tau = 1e-3), four orders below multiplet_tol = 1e-6; the refusal
+        bound is the worst case m * eps / (2 tau**2) <= 5e-5.
+    eigh_plan
+        Resolved service eigh Plan for m. Its batched route owns the
+        local/distributed policy. The directions are the eigenvectors of
+        the m x m normal matrix W.H W, sigma = sqrt(max(lambda, 0)); the
+        relative cut tau is tau**2 on lambda, so tau**2 must stay far above
+        round-off: tau**2 >= 1e4 * m * eps is required.
+    column_extent
+        Eager callable from physical retained rank to caller-planned padded
+        width, which must tile y. Padding policy belongs to the caller.
+    multiplet_tol
+        Relative adjacent spectral-gap tolerance, default 1e-6.
+    real_rows
+        Batch layout only: entries of the first axis at index >= real_rows
+        are synthetic round slots. They are never solved and retain no
+        column (count 0, empty spectrum, zero Q).
+    max_rank
+        Optional cap on each row's retained count: the largest singular
+        values above tau, at most max_rank of them, then closed over the
+        multiplet at the boundary (a degenerate multiplet is never split).
+
+    Returns
+    -------
+    Q, sigma
+        Q[m,r_padded] at P('x','y'), active columns first and zero tails;
+        sigma[r] a host float64 array (the same on every process) in
+        descending order. r = sigma.size. Only the O(m) spectrum crosses the
+        host, never a matrix, and it is not placed back. Selection is eager.
+        Batched input returns Q[b,m,max(r_padded)] at P(None,'x','y') and
+        a tuple of b unpadded sigma[r_q] arrays. Thus every cut/multiplet
+        remains independent; the matrix tail of each row is exactly zero.
+        A stack [b0,...,bk,m,m] at P(None,...,'x','y') is one batch of
+        b0*...*bk rows: Q[b0,...,bk,m,max(r_padded)] keeps the leading axes
+        and the spectra nest as tuples in the same order.
+    """
+    layout = _direction_input(W, eigh_plan, real_rows)
+    tau = _as_rcond(tau)
+    if tau is None:
+        raise ValueError("tau must be an explicit relative cutoff")
+    if tau ** 2 < 1e4 * W.shape[-1] * np.finfo(np.float64).eps:
+        raise ValueError(f"right_singular_vectors: tau={tau} at m={W.shape[-1]} is too close to round-off "
+                         "for the normal-matrix spectrum; want tau**2 >= 1e4*m*eps")
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
+    if W.ndim > 3:
+        return _over_leading_axes(lambda w, rows: right_singular_vectors(
+            w, tau, eigh_plan=eigh_plan, column_extent=column_extent,
+            multiplet_tol=multiplet_tol, real_rows=rows, max_rank=max_rank),
+            W, eigh_plan.mesh, layout, real_rows)
+    if layout == 'batch':
+        from distrib_la._batch_reshard import batch_layout_eigh_call
+        s, v = batch_layout_eigh_call("normal_eigh", eigh_plan.mesh, W, real_rows=real_rows)
+    else:
+        s, v = _direction_svd_kernel(eigh_plan, W.ndim, float(tau))(W)
+    def cut(row):
+        count = int(np.count_nonzero(row > tau * row[0]))
+        if max_rank is not None:
+            count = min(count, operator.index(max_rank))
+        return _close_spectral_cut(row, count, multiplet_tol)
+
+    def host_cut(values):
+        return cut(values) if values.ndim == 1 else _real_row_counts(values, cut, real_rows)
+    agreed = _agreed(s)
+    if agreed is None:
+        values = _host_spectrum(s)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("nonfinite singular spectrum")
+        if max_rank is not None and operator.index(max_rank) < 1:
+            raise ValueError("max_rank must be a positive integer")
+        return _retained_columns(v, values, host_cut(values), mesh=eigh_plan.mesh,
+                                 column_extent=column_extent, layout=layout)
+    if max_rank is not None and operator.index(max_rank) < 1:
+        raise ValueError("max_rank must be a positive integer")
+    _check_tolerance(multiplet_tol)
+    # The host decides the widths and the refusal from one int64 word; the
+    # spectrum stays on the device (RetainedSpectrum reads it only on request).
+    device_counts, word = _device_cut_word(
+        eigh_plan.mesh, "singular", tuple(agreed.shape), float(tau),
+        None if max_rank is None else operator.index(max_rank), float(multiplet_tol),
+        None if real_rows is None else int(real_rows), None)(agreed)
+    word = np.asarray(word)
+    read = _SpectrumRead(agreed)
+    if word[-1]:
+        raise ValueError("nonfinite singular spectrum")
+    count = _word_counts(word, agreed.ndim)
+    _check_device_counts(count, lambda: host_cut(read.host()))
+    return _retained_columns(v, read, count, mesh=eigh_plan.mesh,
+                             column_extent=column_extent, layout=layout,
+                             device_counts=device_counts)
+
+
+def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
+                         multiplet_tol=1e-6, real_rows=None, rcond=None):
+    """Return leading Hermitian eigenvectors, including the cut multiplet.
+
+    W[m,m], W[b,m,m] or W[b0,...,bk,m,m] is Hermitian on its x/y faces or in
+    batch layout; r is the requested physical width for each row. The leading
+    batch is independent. eigh_plan is resolved for m, and column_extent,
+    multiplet_tol, real_rows and the (Q,values) output follow
+    right_singular_vectors. Values retain W's units. No Hermitian projection
+    is applied to repair an invalid input. With explicit ``rcond``, the width
+    is also bounded by the positive spectrum above ``rcond * max(abs(values))``
+    before multiplet closure; eigenvalues themselves are never changed.
+    """
+    layout = _direction_input(W, eigh_plan, real_rows)
+    rcond = _as_rcond(rcond)
+    if isinstance(r, (tuple, list, np.ndarray)):
+        # One width per row of the flattened batch; 0 retains nothing for that row.
+        r = tuple(operator.index(v) for v in np.asarray(r).reshape(-1))
+        if W.ndim < 3 or len(r) != int(np.prod(W.shape[:-2])) or not all(0 <= v <= W.shape[-1] for v in r) or max(r) < 1:
+            raise ValueError("per-row r needs one width in [0,m] per row of the batch, at least one positive")
+    else:
+        r = operator.index(r)
+        if not 1 <= r <= W.shape[-1]:
+            raise ValueError("r must lie in [1,m]")
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
+    if W.ndim > 3:
+        return _over_leading_axes(lambda w, rows: leading_eigenvectors(
+            w, r, eigh_plan=eigh_plan, column_extent=column_extent,
+            multiplet_tol=multiplet_tol, real_rows=rows, rcond=rcond), W, eigh_plan.mesh, layout, real_rows)
+    s, q = _leading_eigh(W, eigh_plan, layout, real_rows)
+    return _leading_selection(W, s, q, r, eigh_plan=eigh_plan, column_extent=column_extent,
+                              layout=layout, multiplet_tol=multiplet_tol, real_rows=real_rows,
+                              rcond=rcond)
+
+
+def leading_eigenvectors_above(perp, top, cutoff, *, real, eigh_plan, column_extent,
+                               multiplet_tol=1e-6, real_rows=None):
+    """Leading eigenvectors of each row of ``perp`` above ``cutoff**2`` times ``top``'s largest eigenvalue.
+
+    The partner cut of the shared-pole rounds in one call: both Hermitian
+    stacks [b, m, m] (face or batch layout, ``real_rows`` as for
+    :func:`leading_eigenvectors`) are solved on their route, and row ``i < real``
+    keeps the eigenvalues of ``perp`` strictly above ``cutoff**2 * max eig(top_i)``,
+    closed over the boundary multiplet; rows ``>= real`` keep none. The counts,
+    the threshold and the closure are decided on the device; the host reads
+    one int64 word (the counts and both families' finite verdicts). Returns
+    ``(Q, counts)``: ``Q`` the retained directions on ``perp``'s carrier, as
+    ``retain_leading_eigenvectors(*leading_eigenvectors(perp, m), counts)``
+    returns them, or ``None`` when every count is zero; ``counts`` a per-row tuple.
+    Identical decisions to the host sequence (``LORRAX_CHECK_COUNTS=1`` checks it).
+    """
+    layout = _direction_input(perp, eigh_plan, real_rows)
+    if perp.ndim != 3 or top.ndim != 3 or perp.shape[0] != top.shape[0]:
+        raise ValueError("leading_eigenvectors_above needs two [b,m,m] stacks of equal b")
+    if _direction_input(top, eigh_plan, real_rows) != layout:
+        raise ValueError("leading_eigenvectors_above needs perp and top in one layout")
+    if real_rows is not None and layout != 'batch':
+        raise ValueError("real_rows applies to a batch-layout stack only")
+    cutoff = _as_rcond(cutoff)
+    if cutoff is None:
+        raise ValueError("cutoff must be an explicit relative cutoff")
+    _check_tolerance(multiplet_tol)
+    s_top, _ = _leading_eigh(top, eigh_plan, layout, real_rows)
+    s, q = _leading_eigh(perp, eigh_plan, layout, real_rows)
+    top_agreed, agreed = _agreed(s_top), _agreed(s)
+    if top_agreed is None or agreed is None:
+        raise ValueError("GATE spectral_cut_agreement: leading_eigenvectors_above needs "
+                         "mesh-replicated spectra (an eigh on the plan's mesh)")
+    b, m = int(perp.shape[0]), int(perp.shape[-1])
+    full_dev, closed_dev, word = _partner_cut_program(
+        eigh_plan.mesh, tuple(agreed.shape), float(cutoff) ** 2, float(multiplet_tol),
+        int(real), None if real_rows is None else int(real_rows))(top_agreed, agreed)
+    word = np.asarray(word)                      # [counts..., nonfinite top, nonfinite perp]
+    top_read, read = _SpectrumRead(top_agreed), _SpectrumRead(agreed)
+    if word[-2]:
+        _refuse_nonfinite_spectrum(top, top_read.host(), mesh=eigh_plan.mesh,
+                                   what="leading eigenvalue spectra")
+    if word[-1]:
+        _refuse_nonfinite_spectrum(perp, read.host(), mesh=eigh_plan.mesh,
+                                   what="leading eigenvalue spectra")
+    counts = tuple(int(v) for v in word[:-2])
+    full = tuple(m if real_rows is None or i < real_rows else 0 for i in range(b))
+
+    def host_counts():
+        # The host sequence this replaces: the threshold on the full spectra, then
+        # retain_leading_eigenvectors' closure.
+        top_rows, rows = top_read.host(), read.host()
+        widths = tuple(int(np.sum(rows[i] > float(cutoff) ** 2 * float(top_rows[i][0])))
+                       if i < real else 0 for i in range(b))
+        return _leading_counts(tuple(rows[i][:full[i]] for i in range(b)), widths,
+                               multiplet_tol=multiplet_tol, real_rows=real_rows, batched=True)
+    _check_device_counts(counts, host_counts)
+    if max(counts) == 0:
+        return None, counts
+    # The two selects of the host sequence, on the same carriers: perp's full
+    # leading set, then the retained prefix of it.
+    directions, _ = _retained_columns(q, read, full, mesh=eigh_plan.mesh,
+                                      column_extent=column_extent, layout=layout,
+                                      device_counts=full_dev)
+    kept, _ = _retained_columns(directions, read, counts, mesh=eigh_plan.mesh,
+                                column_extent=column_extent,
+                                layout=_direction_output_layout(directions, eigh_plan.mesh),
+                                descending=True, device_counts=closed_dev)
+    return kept, counts
+
+
+@lru_cache(maxsize=16)
+def _partner_cut_program(mesh, shape, threshold, tolerance, real, real_rows):
+    """``(full, closed, word)`` of :func:`leading_eigenvectors_above` from the two agreed spectra.
+
+    ``full`` the leading set's counts (m per real row), ``closed`` the retained
+    counts, ``word`` = ``[closed..., nonfinite top rows, nonfinite perp rows]``.
+    ``threshold`` is ``cutoff**2`` (a host float, as the host product used it).
+    """
+    b, m = shape
+
+    def program(top, agreed):
+        rows = agreed[..., ::-1]
+        largest = top[..., -1]                   # the descending spectrum's first value
+        index = jnp.arange(b)
+        width = jnp.sum(rows > threshold * largest[:, None], axis=-1).astype(jnp.int64)
+        width = jnp.where(index < real, width, 0)
+        closed = _close_cut_xp(jnp, rows, width, tolerance)
+        if real_rows is not None:
+            closed = jnp.where(index < real_rows, closed, 0)
+        closed = closed.astype(jnp.int64)
+        full = jnp.where(index < (b if real_rows is None else real_rows), m, 0).astype(jnp.int64)
+        word = jnp.concatenate([closed, _nonfinite_rows(top), _nonfinite_rows(agreed)])
+        return full, closed, word
+    replicated = NamedSharding(mesh, P())
+    return jax.jit(program, out_shardings=(replicated, replicated, replicated))
+
+
+def _leading_eigh(W, eigh_plan, layout, real_rows):
+    """``(s, q)`` of a Hermitian direction operand on its route (ascending, as the solvers return)."""
+    if layout == 'batch':
+        from distrib_la._batch_reshard import batch_layout_eigh_call
+        return batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
+    # Checked once on the faces, before either route: a non-Hermitian W
+    # is the caller's, refused by name, never a solver failure to retry.
+    # A distributed solver never owns complete local rows; checking
+    # arbitrary off-diagonal faces still requires peer communication.
+    # W - W^H = 2 (W - Herm W), with Herm W kept on W's faces (blocks.hermitian_part):
+    # an eager swapaxes difference of a face stack comes back replicated.
+    from distrib_la.blocks import hermitian_part
+    from distrib_la.tolerance import roundoff_tol
+    defect = 2 * jnp.max(jnp.abs(W - hermitian_part(W)), axis=(-2, -1))
+    scale = jnp.max(jnp.abs(W), axis=(-2, -1))
+    tol = roundoff_tol(W.shape[-1], dtype=W.dtype)
+    if not bool(jnp.all(jnp.isfinite(scale) & (defect <= tol * scale))):
+        raise ValueError("leading_eigenvectors requires finite Hermitian W")
+    # One decision: Plan.batched runs the stack on the route it decides.
+    if W.ndim == 2:
+        s, q = eigh_plan.batched(W[None])
+        return s[0], q[0]
+    return eigh_plan.batched(W)
+
+
+def _leading_selection(W, s, q, r, *, eigh_plan, column_extent, layout, multiplet_tol,
+                       real_rows, rcond):
+    """The leading cut of one eigh family: widths and refusal from one int64 word."""
+    agreed = _agreed(s)
+    if agreed is None:
+        values = _host_spectrum(s)
+        _refuse_nonfinite_spectrum(W, values, mesh=eigh_plan.mesh,
+                                   what="leading eigenvalue spectra")
+        count = _leading_counts(
+            values, r, multiplet_tol=multiplet_tol, real_rows=real_rows,
+            batched=values.ndim > 1, rcond=rcond)
+        return _retained_columns(q, values, count, mesh=eigh_plan.mesh,
+                                 column_extent=column_extent, layout=layout)
+    _check_tolerance(multiplet_tol)
+    device_counts, word = _device_cut_word(
+        eigh_plan.mesh, "leading", tuple(agreed.shape), r, None, float(multiplet_tol),
+        None if real_rows is None else int(real_rows),
+        None if rcond is None else float(rcond))(agreed)
+    word = np.asarray(word)
+    read = _SpectrumRead(agreed)
+    if word[-1]:
+        _refuse_nonfinite_spectrum(W, read.host(), mesh=eigh_plan.mesh,
+                                   what="leading eigenvalue spectra")
+    count = _word_counts(word, agreed.ndim)
+    _check_device_counts(count, lambda: _leading_counts(
+        read.host(), r, multiplet_tol=multiplet_tol, real_rows=real_rows,
+        batched=agreed.ndim > 1, rcond=rcond))
+    return _retained_columns(q, read, count, mesh=eigh_plan.mesh,
+                             column_extent=column_extent, layout=layout,
+                             device_counts=device_counts)
+
+
+def _check_device_counts(count, host_count):
+    """``LORRAX_CHECK_COUNTS=1``: refuse unless the device cut equals the host cut.
+
+    ``host_count()`` recomputes the cut on the host from the family's spectrum
+    (the read the device word otherwise avoids).
+    """
+    import os
+    if os.environ.get("LORRAX_CHECK_COUNTS", "0") in ("", "0"):
+        return
+    want = host_count()
+    if not np.array_equal(np.asarray(count, np.int64), np.asarray(want, np.int64)):
+        raise ValueError(f"GATE spectral_cut_agreement: device counts {np.asarray(count)} "
+                         f"!= host counts {np.asarray(want)}")
+
+
+def _as_extent(n) -> int:
+    """Return a positive integer matrix extent, refusing lossy coercions."""
+    if isinstance(n, bool):
+        raise ValueError(f"polar_factor: n must be a positive integer, got {n!r}")
+    try:
+        out = operator.index(n)
+    except TypeError as exc:
+        raise ValueError(
+            f"polar_factor: n must be a positive integer, got {n!r}") from exc
+    if out <= 0:
+        raise ValueError(f"polar_factor: n must be positive, got {out}")
+    return int(out)
+
+
+def _as_rcond(rcond) -> float | None:
+    """Validate the relative numerical-rank cutoff at eager plan time."""
+    if rcond is None:
+        return None
+    if isinstance(rcond, bool):
+        raise ValueError(
+            f"polar_factor: rcond must be a finite non-negative real, "
+            f"got {rcond!r}")
+    try:
+        out = float(rcond)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"polar_factor: rcond must be a finite non-negative real, "
+            f"got {rcond!r}") from exc
+    if not math.isfinite(out) or out < 0.0:
+        raise ValueError(
+            f"polar_factor: rcond must be a finite non-negative real, "
+            f"got {rcond!r}")
+    return out
+
+
+def _mesh_contract(mesh: Mesh, n: int) -> tuple[int, int]:
+    """Validate the public P('x','y') shape contract."""
+    axes = tuple(getattr(mesh, "axis_names", ()))
+    if "x" not in axes or "y" not in axes:
+        raise ValueError(
+            "polar_factor: mesh must contain axes ('x','y'); "
+            f"got {axes}")
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    if n % px or n % py:
+        divisor = math.lcm(px, py)
+        n_pad = ((n + divisor - 1) // divisor) * divisor
+        raise ValueError(
+            f"polar_factor: n={n} cannot have layout P('x','y') on a "
+            f"{px}x{py} mesh; n must be divisible by both mesh axes.  "
+            f"Zero-pad A to at least n={n_pad}, factor the padded matrix, "
+            f"then slice the logical leading block.")
+    return px, py
+
+
+def _same_layout(have, want: NamedSharding) -> bool:
+    return (getattr(have, "spec", None) == want.spec
+            and getattr(have, "mesh", None) == want.mesh)
+
+
+def _validate_dtype(dtype) -> None:
+    """Refuse precisions the distributed eigh backends do not share."""
+    dtype = jnp.dtype(dtype)
+    if dtype not in _SUPPORTED_DTYPES:
+        allowed = "|".join(str(x) for x in _SUPPORTED_DTYPES)
+        raise TypeError(
+            f"polar_factor: A.dtype must be {allowed}; got {dtype}.  "
+            "The distributed eigh backends share this precision contract.")
+
+
+def _validate_operand(A, polar_plan: "PolarPlan") -> None:
+    """Call-time rank, shape, dtype and concrete-layout refusal ladder."""
+    shape = getattr(A, "shape", None)
+    if shape is None:
+        raise TypeError(
+            "polar_factor: A must be a jax.Array with shape (n,n) and "
+            "layout P('x','y')")
+    if len(shape) != 2:
+        raise ValueError(
+            f"polar_factor: A must have rank 2 and shape (n,n); got {shape}")
+    if shape[0] != shape[1]:
+        raise ValueError(f"polar_factor: A must be square; got shape {shape}")
+    if int(shape[0]) != polar_plan.n:
+        raise ValueError(
+            f"polar_factor: planned n={polar_plan.n}, got A.shape={shape}")
+
+    _validate_dtype(A.dtype)
+
+    # A tracer's layout is fixed by the outer jit boundary and reinforced by
+    # this plan's inner in_shardings.  Concrete input must already obey the
+    # contract: silently device_put'ing n^2 data is a hidden full-matrix move.
+    if not isinstance(A, jax.core.Tracer):
+        have = getattr(A, "sharding", None)
+        if not _same_layout(have, polar_plan.in_sharding):
+            raise ValueError(
+                "polar_factor: A must already be sharded at P('x','y') "
+                "on the supplied mesh; refusing an implicit n^2 reshard.  "
+                f"Got {have!r}.")
+
+
+@dataclass(frozen=True)
+class PolarPlan:
+    """A planned, trace-safe distributed polar-factor operation.
+
+    The object owns the invariant joining the physical extent, numerical
+    rank cutoff, layout, and one eagerly resolved Hermitian-eigh plan.
+    Rank-deficient inputs return the canonical polar partial isometry:
+    directions satisfying s <= rcond * max(s) contribute zero.  A unitary
+    extension over null spaces is non-unique and is therefore not invented.
+    """
+
+    mesh: Mesh
+    n: int
+    requested: str
+    rcond: float | None
+    eigh_plan: Plan
+    in_sharding: NamedSharding
+    singular_value_sharding: NamedSharding
+
+    @property
+    def backend(self) -> str:
+        """Concrete backend selected for the Hermitian dilation."""
+        return self.eigh_plan.backend
+
+    @property
+    def is_native(self) -> bool:
+        """Whether the planned Hermitian eigensolve is pure JAX."""
+        return self.eigh_plan.is_native
+
+    def describe(self) -> str:
+        """One-line resolved operation description for startup banners."""
+        cutoff = "dtype default" if self.rcond is None else repr(self.rcond)
+        return (f"polar_factor: {self.requested!r} -> {self.backend} "
+                f"(Hermitian dilation n={2 * self.n}, "
+                f"A/L at P('x','y'), s replicated, rcond={cutoff})")
+
+    def __call__(self, A):
+        """Return (L, s) for one planned square matrix A.
+
+        A and L have shape (n,n) at P('x','y').  The replicated s has shape
+        (n,), is non-negative, and is sorted in NumPy SVD order (descending).
+        """
+        _validate_operand(A, self)
+        return _kernel_for(self, jnp.dtype(A.dtype))(A)
+
+    @property
+    def batched_route(self):
+        """The route :meth:`batched` takes: the plan's requested route."""
+        return self.eigh_plan.batched_route
+
+    def batched(self, A):
+        """Return (L[B,n,n], s[B,n]) from A at P(None,'x','y').
+
+        Route batch_reshard exchanges independent matrices across all ranks,
+        runs the SAME dilation/cutoff locally, then returns face-sharded L.
+        Only the O(B*n) singular values are replicated. Ragged batches skip
+        synthetic rows. The distributed route solves the stack's dilations
+        through the eigh plan's own stack surface, single-tile solves for a
+        library without a stacked entry, and holds the stack at O(B*n^2/P).
+        Local work is O(B*n^3/P), with O(ceil(B/P)*n^2) matrices per rank
+        and one solver workspace.
+        """
+        if A.ndim != 3 or A.shape[-2:] != (self.n, self.n) or A.shape[0] < 1:
+            raise ValueError("polar batched requires a nonempty (B,n,n) stack")
+        _validate_dtype(A.dtype)
+        face = NamedSharding(self.mesh, P(None, 'x', 'y'))
+        if not isinstance(A, jax.core.Tracer) and not _same_layout(getattr(A,'sharding',None), face):
+            raise ValueError("polar batched requires A already at P(None,'x','y')")
+        rcond = self.rcond
+        if rcond is None:
+            rcond = self.n * float(jnp.finfo(A.real.dtype).eps)
+        if self.batched_route == ROUTE_BATCH_RESHARD:
+            from distrib_la._batch_reshard import batch_reshard_call
+            s, link = batch_reshard_call('polar', self.mesh, (A,), rcond=rcond)
+            return link, s
+
+        def stack(a):
+            return _polar_from_matrix(a, self.eigh_plan.batched, rcond)
+        if isinstance(A, jax.core.Tracer):
+            return stack(A)
+        key = ('polar_batch', mesh_key(self.mesh), self.n, self.backend,
+               self.rcond, tuple(A.shape), str(A.dtype))
+        fn = _KERNEL_CACHE.get(key)
+        if fn is None:
+            from distrib_la._result_check import checked_program
+            # The stack surface returns the checked eigh's status to this
+            # program: no host callback, so the persistent cache stores it.
+            fn = _KERNEL_CACHE[key] = checked_program(
+                stack, self.mesh, (face, NamedSharding(self.mesh, P())), in_shardings=face)
+        return fn(A)
+
+
+def _kernel_for(polar_plan: PolarPlan, dtype) -> Callable:
+    """Build/cache the fused dilation-eigh-polar executable."""
+    dtype = jnp.dtype(dtype)
+    key = (mesh_key(polar_plan.mesh), polar_plan.n, polar_plan.backend,
+           polar_plan.rcond, str(dtype))
+    fn = _KERNEL_CACHE.get(key)
+    if fn is not None:
+        return fn
+
+    n = polar_plan.n
+    tile = polar_plan.in_sharding
+    replicated = polar_plan.singular_value_sharding
+    eigh = polar_plan.eigh_plan
+    if polar_plan.rcond is None:
+        real_dtype = jnp.empty((), dtype=dtype).real.dtype
+        rcond = float(n) * float(jnp.finfo(real_dtype).eps)
+    else:
+        rcond = polar_plan.rcond
+
+    def _polar(A):
+        A = jax.lax.with_sharding_constraint(A, tile)
+        L, s = _polar_from_matrix(A, eigh, rcond)
+        L = jax.lax.with_sharding_constraint(L, tile)
+        # Reverse only the replicated O(n) vector.  Reversing the distributed
+        # eigenvector columns would add a whole-matrix cross-device permutation
+        # even though the order cancels from U @ V.H.
+        s = jax.lax.with_sharding_constraint(s, replicated)
+        return L, s
+
+    fn = jax.jit(_polar, in_shardings=tile,
+                 out_shardings=(tile, replicated))
+    _KERNEL_CACHE[key] = fn
+    return fn
+
+
+def plan_polar_factor(
+    mesh: Mesh,
+    *,
+    n: int,
+    backend: str = "distributed",
+    rcond: float | None = None,
+    batched_route: str = 'auto',
+) -> PolarPlan:
+    """Eagerly resolve one reusable distributed polar-factor plan.
+
+    Hoist this call out of streamed k-point loops.  n is the physical matrix
+    extent and must be divisible by both mesh axes.  For a non-divisible
+    logical band count, zero-pad rows and columns to the next common multiple,
+    factor that matrix, then slice the leading logical block and singular
+    values.  Thresholded null directions make this zero padding safe.
+
+    Parameters
+    ----------
+    mesh
+        JAX mesh containing axes ('x','y').
+    n
+        Positive physical square-matrix extent.
+    backend
+        Eigh backend request; 'distributed' by default.
+    rcond
+        Relative rank cutoff.  None uses n * eps(dtype).
+    batched_route
+        ``'auto'`` keeps :meth:`PolarPlan.batched` on the distributed solve;
+        ``'batch_reshard'`` runs it rank-local, ``ceil(B/P)`` whole matrices
+        per rank. A single call is always distributed.
+    """
+    n = _as_extent(n)
+    _mesh_contract(mesh, n)
+    rcond = _as_rcond(rcond)
+    requested = str(backend)
+    # Single calls stay on the face route. Independent stacks have a separate
+    # method on this same plan, using the existing batch movement owner.
+    eig = plan("eigh", mesh, backend=backend, n=2 * n,
+               batched_route=batched_route)
+    return PolarPlan(
+        mesh=mesh,
+        n=n,
+        requested=requested,
+        rcond=rcond,
+        eigh_plan=eig,
+        in_sharding=NamedSharding(mesh, P("x", "y")),
+        singular_value_sharding=NamedSharding(mesh, P()),
+    )
+
+
+def polar_factor(
+    A,
+    mesh: Mesh,
+    *,
+    backend: str = "distributed",
+    rcond: float | None = None,
+):
+    """Return the distributed polar factor and singular values of A.
+
+    This top-level convenience caches eager plans by mesh/shape/backend/cutoff.
+    For an outer jit, eagerly call plan_polar_factor and invoke the returned
+    trace-safe PolarPlan inside the traced function.
+
+    Parameters
+    ----------
+    A
+        Rank-2 square float64 or complex128 JAX array at P('x','y').
+    mesh
+        Mesh that shards A.
+    backend
+        Planned eigh backend; 'distributed' by default.
+    rcond
+        Relative numerical-rank cutoff.
+
+    Returns
+    -------
+    L
+        Polar factor with A's shape, dtype and P('x','y') sharding.
+    s
+        Replicated real singular values in descending order.
+    """
+    if isinstance(A, jax.core.Tracer):
+        raise RuntimeError(
+            "polar_factor performs eager backend planning and cannot be "
+            "entered for the first time from a JAX trace.  Call "
+            "plan_polar_factor(mesh, n=..., ...) eagerly, then invoke the "
+            "returned trace-safe PolarPlan inside jit.")
+    shape = getattr(A, "shape", None)
+    if shape is None or len(shape) != 2:
+        got = None if shape is None else shape
+        raise ValueError(
+            f"polar_factor: A must have rank 2 and shape (n,n); got {got}")
+    if shape[0] != shape[1]:
+        raise ValueError(f"polar_factor: A must be square; got shape {shape}")
+    _validate_dtype(A.dtype)
+    n = _as_extent(shape[0])
+    rcond_value = _as_rcond(rcond)
+    key = (mesh_key(mesh), n, str(backend), rcond_value)
+    polar_plan = _PLAN_CACHE.get(key)
+    if polar_plan is None:
+        polar_plan = plan_polar_factor(
+            mesh, n=n, backend=backend, rcond=rcond_value)
+        _PLAN_CACHE[key] = polar_plan
+    return polar_plan(A)

@@ -1,0 +1,2311 @@
+"""Sigma self-energy output file writers."""
+import os
+import numpy as np
+import h5py
+
+from common.provenance import provenance_header
+from .hdf5_owner import STACK_H5PY, open_scope
+
+
+def read_sc_sigma_lorentz_h5(path):
+	"""Read one committed SC-map Lorentz split in its input QP basis."""
+	from .commit_state import assert_committed
+
+	with h5py.File(path, "r") as h5:
+		assert_committed(h5, path=path)
+		parts = np.asarray(h5["sigma_lorentz_skij_ev"])
+		rotation = np.asarray(h5["U_dft_to_qp_kij"])
+		kpoints = np.asarray(h5["kpoints_crys"])
+		if (parts.ndim != 4 or parts.shape[0] != 3
+				or parts.shape[1:] != rotation.shape
+				or kpoints.shape != (parts.shape[1], 3)):
+			raise ValueError(f"invalid SC Lorentz map shape in {path}")
+		return parts, rotation, kpoints
+
+
+def write_sc_sigma_lorentz_h5(path, components_skij_ev, rotation_kij,
+							 kpoints_crys, *, call_index, role, kset,
+							 band_start_1based):
+	"""Atomically publish CC, CT+TC and TT matrices from one SC map."""
+	from common.collectives import rank0_atomic_file_transaction
+	from .commit_state import set_commit_state
+
+	parts = np.asarray(components_skij_ev, dtype=np.complex128)
+	rotation = np.asarray(rotation_kij, dtype=np.complex128)
+	kpoints = np.asarray(kpoints_crys, dtype=np.float64)
+	if (parts.ndim != 4 or parts.shape[0] != 3
+			or parts.shape[1:] != rotation.shape
+			or kpoints.shape != (parts.shape[1], 3)):
+		raise ValueError("SC Lorentz matrices, rotation and k points disagree")
+
+	def _write(staging):
+		with h5py.File(staging, "w") as h5:
+			h5.create_dataset("sigma_lorentz_skij_ev", data=parts)
+			h5.create_dataset("U_dft_to_qp_kij", data=rotation)
+			h5.create_dataset("kpoints_crys", data=kpoints)
+			h5.attrs["sectors"] = ("CC", "CT+TC", "TT")
+			h5.attrs["basis"] = "input_qp"
+			h5.attrs["kset"] = kset
+			h5.attrs["role"] = role
+			h5.attrs["call_index"] = int(call_index)
+			h5.attrs["band_start_1based"] = int(band_start_1based)
+			set_commit_state(h5, True)
+
+	rank0_atomic_file_transaction(
+		path, stage=f"sc.sigma_lorentz.{int(call_index):04d}",
+		write=_write, validate_file=read_sc_sigma_lorentz_h5)
+
+# THE STAMP CONTRACT IS ``kin_ion``'s, IMPORTED RATHER THAN RESTATED.
+# ``sigma_mnk.h5`` and ``kin_ion.h5`` now both store a k axis that may be
+# the irreducible wedge, and they must mean the SAME thing by that or a
+# reader will eventually apply one file's rule to the other.  So the attr
+# names, the version integer, the two table names and the
+# "no attr means full" default all come from one module, and
+# :func:`kin_ion.read_star_map` is the one implementation that reads them.
+from .kin_ion import (
+    IRR_IDX_DATASET,
+    K_STORAGE_ATTR,
+    K_STORAGE_FULL,
+    K_STORAGE_IBZ,
+    K_STORAGE_VERSION,
+    K_STORAGE_VERSION_ATTR,
+    N_SYM_SPATIAL_ATTR,
+    SYM_IDX_DATASET,
+)
+from file_io.restart_bundle import (read_star_map)
+
+#: Attr prefix under which the pre-extraction star-spread measurement is
+#: stamped.  Four numbers per dataset — see :func:`sigma_star_spread_stats`
+#: for what each one is and why four rather than one.
+SPREAD_ATTR_PREFIX = "star_spread_"
+
+#: The on-shell evaluation tables, in slot order (``gw.ppm_sigma.on_shell_request``
+#: builds them; this format layer owns the one list both read).
+#: ``pair``: E_eval as the QSGW build reads it (``sigma_out_of_grid``);
+#: ``eval0``/``dft0``: E_eval and E_DFT under the eqp readers' rule (an
+#: uncovered state reads Sigma(omega = 0)); ``zero``/``edge`` (the SC
+#: grid-edge census, ``sigma_out_of_grid = static`` only): omega = 0 and the
+#: sampled range's edge nearer each state.
+ON_SHELL_TABLES = ("pair", "eval0", "dft0", "zero", "edge")
+
+#: Which datasets of ``sigma_mnk.h5`` carry a k axis, and where it is.
+#: The dynamic cubes of an omega-grid file (``sigma_omega_grid_debug``) are
+#: ``(n_omega, nk, nb, nb)`` beside ``omega_ev``, which has no k axis and is
+#: written verbatim.
+#: On shell the two cubes ``sigma_{total,c}_kij_ev`` hold the PAIR
+#: ``(2, nk, nb, nb)`` = Sigma_mn(E_m), Sigma_mn(E_n) (stamped
+#: ``pair_slots``; no ``omega_ev`` is written, so a reader that needs an
+#: omega axis fails on it), beside the diagonal on each evaluation table,
+#: the exact dSigma_c/domega and the tables themselves (omega-relative eV);
+#: everything else is ``(nk, …)``.
+#: Per evaluation table (:data:`ON_SHELL_TABLES`), band diagonals
+#: ``(nk, nb)``: Sigma_c there (eV) and the table's energies (omega-relative eV).
+ON_SHELL_DIAG_DATASET = "sigma_c_onshell_{table}_kn_ev"
+ON_SHELL_ENERGIES_DATASET = "onshell_{table}_rel_ev"
+ON_SHELL_DSIGMA_DATASET = "sigma_c_onshell_dsigma_kn"
+#: Root-level marker dataset naming the evaluation (``on_shell``; absent: grid).
+SIGMA_EVALUATION_ATTR = "sigma_evaluation"
+#: The ``star_spread_omega_index`` stamp of a pair cube: its star spread is
+#: measured on the half-sum of the two slots, not on one omega slice.
+PAIR_HALF_SUM_SLICE = -2
+
+SIGMA_K_AXIS = {
+	"sigma_total_kij_ev": 1,
+	"sigma_c_kij_ev": 1,
+	**{ON_SHELL_DIAG_DATASET.format(table=t): 0 for t in ON_SHELL_TABLES},
+	**{ON_SHELL_ENERGIES_DATASET.format(table=t): 0 for t in ON_SHELL_TABLES},
+	ON_SHELL_DSIGMA_DATASET: 0,
+	"sigma_sx_kij_ev": 0,
+	"hartree_kij_ev": 0,
+	"hartree_scalar_kij_ev": 0,
+	"hartree_transverse_kij_ev": 0,
+	"sigma_xc_qsgw_kij_ev": 0,
+	"qp_omega0_ev": 0,
+	"qp_static_cohsex_ev": 0,
+	# The Σ_c band-convergence fit, band-DIAGONAL (nk, nb), so k is axis 0.
+	# Registered here and not only written, because that is what puts them
+	# through the same star extraction and the same star-spread instrument
+	# as the cubes: the invariant that matters for S_inf is exact star
+	# covariance, and it is only checkable on a persisted, stamped array.
+	"sigma_c_extrap_inf_kn_ev": 0,
+	"sigma_c_extrap_last_kn_ev": 0,
+	"sigma_c_extrap_sigma_kn_ev": 0,
+	# The pooled beta of ``spectral_shell`` on states with a tail, NaN elsewhere.
+	"sigma_c_extrap_beta_kn": 0,
+	# The energies THIS Sigma was evaluated at, omega-relative, band
+	# diagonal (nk, nb) -> k is axis 0.  Registered here rather than merely
+	# written, so it rides the same star extraction and the same star-spread
+	# instrument as the cubes it describes: an evaluation spectrum that is
+	# not star-covariant would mean the cube's rows and its stamp disagree
+	# about which k they are.
+	"sigma_eval_rel_ev": 0,
+}
+
+#: The two attrs on the ``pair`` energies that say what they are measured
+#: FROM.  The energies are RELATIVE; before this stamp nothing in the file
+#: said relative to what, so every post-hoc consumer guessed, and the one
+#: that guessed insulating midgap mis-sampled Σ_c by a measured 2.79 eV on
+#: the sodium metal deck (audit A2).  One name, defined once, used by the
+#: writer and by every post-hoc reader.
+OMEGA_DATASET = "omega_ev"
+OMEGA_REFERENCE_ATTR = "omega_reference_ev"
+OMEGA_REFERENCE_PROVENANCE_ATTR = "omega_reference_provenance"
+
+#: The EFFECTIVE Sigma broadening the run used, and the value the deck
+#: asked for.  Stamped on the same axis as the reference above and for the
+#: same reason: the deck key `sigma_regularization_ev` is a REQUEST, an
+#: ansatz may raise it to a conditioning floor, and until this stamp
+#: existed the resolved value lived only in a print -- so a cross-ansatz
+#: comparison could not assert that two runs shared xi, only assume it.
+SIGMA_REGULARIZATION_ATTR = "sigma_regularization_ev"
+SIGMA_REGULARIZATION_REQUESTED_ATTR = "sigma_regularization_requested_ev"
+SIGMA_REGULARIZATION_FLOOR_POLICY_ATTR = "sigma_regularization_floor_policy"
+
+#: The provenance values the driver stamps — ONE per ``fermi_reference``
+#: value, and they are produced by ``gw.efermi.resolve_sigma_efermi_ry``
+#: rather than inferred here.  ``fixed-N mu`` is the metal path's chemical
+#: potential from the fixed-N MP1 solve; ``midgap`` is the insulating
+#: loader convention (``wfn.efermi``, ½(VBM+CBM)); ``vbm`` is
+#: ``fermi_reference = vbm``, which used to be indistinguishable from
+#: ``midgap`` in this file because the stamp was derived from "did the
+#: caller pass an explicit reference" rather than from the deck key.
+OMEGA_REFERENCE_FIXED_N_MU = "fixed-N mu"
+OMEGA_REFERENCE_MIDGAP = "midgap"
+OMEGA_REFERENCE_VBM = "vbm"
+
+#: WHERE this Sigma was evaluated, stamped on :data:`SIGMA_EVAL_DATASET`.
+#: A DIFFERENT fact from the omega reference above: that says what the axis
+#: is measured FROM, this says which spectrum the cube was built AT.  Until
+#: 2026-08-22 the file carried the first and not the second, so
+#: ``gw.eqp_bgw.make_eqp_bgw`` had no way to tell a one-shot cube from a
+#: self-consistent one and silently reverted to the at-E_DFT linearization
+#: -- correct for one-shot, a different calculation for SC.
+SIGMA_EVAL_DATASET = "sigma_eval_rel_ev"
+SIGMA_EVAL_PROVENANCE_ATTR = "sigma_eval_provenance"
+SIGMA_EVAL_AT_E_DFT = "at_e_dft"
+SIGMA_EVAL_SELF_CONSISTENT = "self_consistent_qp"
+
+#: How much of the evaluation spectrum the omega grid actually SAMPLED, and
+#: what was done with the rest.  Stamped beside the eval energies because a
+#: consumer that centres on them needs to know which of them the cube can
+#: answer for: the Na semicore run wrote 41.3 % endpoint values as if they
+#: were Sigma at the state's own energy.
+OMEGA_COVERAGE_N_ATTR = "omega_uncovered_count"
+OMEGA_COVERAGE_FRAC_ATTR = "omega_uncovered_fraction"
+OMEGA_COVERAGE_POLICY_ATTR = "omega_out_of_range_policy"
+
+#: The datasets :func:`write_sigma_omega_h5` creates the file with.  Every
+#: run that writes ``sigma_mnk.h5`` at all writes these, so the appender
+#: below can use any one of them that is present to learn the file's own k
+#: storage rather than being told it.
+SIGMA_CUBE_DATASETS = (
+	"sigma_total_kij_ev",
+	"sigma_c_kij_ev",
+	"sigma_sx_kij_ev",
+	"hartree_kij_ev",
+)
+
+#: The additive direct-field decomposition carried only by component-aware
+#: schema-v6 artifacts.  ``hartree_kij_ev`` above remains the aggregate
+#: ``Hdir`` so every ordinary operator consumer keeps its historical name;
+#: these two companions make its scalar ``V_H`` and transverse ``H_T``
+#: operands independently auditable.  Absence of BOTH means schema v5.
+SIGMA_DIRECT_COMPONENT_DATASETS = (
+	"hartree_scalar_kij_ev",
+	"hartree_transverse_kij_ev",
+)
+SIGMA_RAW_OPERATOR_DATASETS = (
+	SIGMA_CUBE_DATASETS + SIGMA_DIRECT_COMPONENT_DATASETS)
+DIRECT_FIELD_SUM_RULE_ATTR = "direct_field_sum_rule"
+DIRECT_FIELD_SUM_RULE = (
+	"hartree_kij_ev=hartree_scalar_kij_ev+hartree_transverse_kij_ev")
+DIRECT_FIELD_SUM_FULL_BZ_ATTR = "direct_field_sum_verified_full_bz"
+DIRECT_FIELD_SUM_STAR_WEDGE_ATTR = "direct_field_sum_verified_star_wedge_input"
+DIRECT_FIELD_SUM_FILE_WEDGE_ATTR = "direct_field_sum_verified_file_wedge"
+
+#: Meaning of the four operator cubes above.  They are deliberately the
+#: unconditioned operators produced by the Sigma kernel: full off-diagonals
+#: intact, before the output-side BGW degenerate-set projection.  Changing
+#: those arrays in place would silently change the QSGW/SC artifact and every
+#: operator consumer merely to repair a band-diagonal text reconstruction.
+#: The small :data:`EQP_ASSEMBLY_DATASET` receipt below owns the completed
+#: output assembly meaning instead.
+SIGMA_OPERATOR_STATE_ATTR = "sigma_operator_state"
+SIGMA_OPERATOR_STATE_VERSION_ATTR = "sigma_operator_state_version"
+SIGMA_OPERATOR_STATE_VERSION = 1
+SIGMA_OPERATOR_STATE_RAW = "raw_pre_output_conditioning"
+
+#: Canonical receipt persisted only AFTER live :func:`assemble_eqp` returns.
+#: The full cubes remain raw; the primary dataset holds the exact
+#: live G-space H, X, and derived C(E_DFT) carried by that EqpAssembly.
+#: Its small companion holds the on-shell operand (or, on the omega grid,
+#: the output-conditioned C(omega) diagonal curve) from which the same
+#: assembler read both C(E_DFT) and Z.  H/X/C are all DFT-band basis; an SC
+#: run writes no receipt (its eqp pair is the SC spectrum).
+#: A post-hoc reader therefore consumes the receipt rather than attempting to
+#: reconstruct the projection from energies or deck settings it may not own.
+EQP_ASSEMBLY_DATASET = "eqp_assembly_conditioned_diagonals_ev"
+EQP_ASSEMBLY_CANDIDATE_DATASET = (
+	"__eqp_assembly_conditioned_diagonals_ev_candidate")
+EQP_ASSEMBLY_C_OMEGA_DATASET = "eqp_assembly_conditioned_sigma_c_omega_diag_ev"
+#: The on-shell companion in place of the C(omega) curve, ``(4, nk, nb)``: C(E_DFT), C(E_eval), dC/domega
+#: at E_eval and the coverage mask (1 where E_eval lies on the sampled range,
+#: Z = 1 elsewhere), the ``eqp_bgw.ON_SHELL_*`` rows.
+EQP_ASSEMBLY_C_ONSHELL_DATASET = "eqp_assembly_conditioned_sigma_c_onshell_ev"
+EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET = (
+	"__eqp_assembly_conditioned_sigma_c_onshell_ev_candidate")
+EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET = (
+	"__eqp_assembly_conditioned_sigma_c_omega_diag_ev_candidate")
+EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET = (
+	"eqp_assembly_hartree_scalar_transverse_diag_ev")
+EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET = (
+	"__eqp_assembly_hartree_scalar_transverse_diag_ev_candidate")
+EQP_ASSEMBLY_EXPECTED_DATASET = "eqp_assembly_receipt_expected"
+EQP_ASSEMBLY_SCHEMA_VERSION_ATTR = "schema_version"
+# v1 lacked final H/X/C and fail-closed creation semantics.  v2 was the
+# pushed-but-held intermediate that persisted pre-assembly C(E_DFT) while
+# deriving Z from the raw curve.  Neither byte meaning may collide with this
+# post-assembly, one-conditioned-curve schema.
+EQP_ASSEMBLY_SCHEMA_VERSION = 5
+#: Schema v6 is selected ONLY when ``H_T`` exists.  Older v3/v4 receipts
+#: carried the removed Hartree-source policy and are refused.
+#: Keeping v5 as the
+#: charge-only constant is deliberate: old readers refuse a v6 expected
+#: marker before touching ``hartree_kij_ev``, instead of interpreting the
+#: aggregate ``Hdir`` as scalar ``V_H`` and corrupting implied Vxc.
+EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION = 6
+EQP_ASSEMBLY_STATE_ATTR = "state"
+EQP_ASSEMBLY_STATE_READY = "assembled"
+EQP_ASSEMBLY_HX_BASIS_ATTR = "hartree_exchange_basis"
+EQP_ASSEMBLY_C_BASIS_ATTR = "correlation_basis"
+EQP_ASSEMBLY_DFT_BAND_BASIS = "dft_band"
+EQP_ASSEMBLY_K_STORAGE_ATTR = "k_storage"
+EQP_ASSEMBLY_K_STORAGE_WEDGE = "file_wedge"
+EQP_ASSEMBLY_FILE_ROWS_ATTR = "file_wedge_full_bz_rows"
+EQP_ASSEMBLY_HARTREE_STATE_ATTR = "hartree_state"
+EQP_ASSEMBLY_HARTREE_STATE_LIVE_GSPACE = "live_gspace"
+EQP_ASSEMBLY_BAND_START_ATTR = "band_start"
+EQP_ASSEMBLY_BAND_STOP_ATTR = "band_stop"
+EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR = "degeneracy_policy"
+EQP_ASSEMBLY_DEGENERACY_TOL_ATTR = "degeneracy_tol_ry"
+EQP_ASSEMBLY_DEGENERACY_POLICIES = (
+	"bgw_average",
+	"disabled",
+)
+
+#: The datasets the OPT-IN ``write_qsgw_datasets`` deck key adds, in the
+#: order a reader meets them.  They are the plotting payload: the static
+#: Hermitian Σ_xc the QSGW ansatz produces, and the QP energy ladders of
+#: the approximations one wants to see beside each other.  Names and
+#: shapes are the ones the pre-2026-04 driver wrote and the committed
+#: ``cohsex_debug`` fixture still holds, so a script written against that
+#: file keeps working against a new one.
+QSGW_PLOT_DATASETS = (
+	"sigma_xc_qsgw_kij_ev",
+	"qp_static_cohsex_ev",
+	"qp_omega0_ev",
+)
+
+
+#: The one explanation stamped wherever the raw (un-extrapolated) Σ_c is
+#: written: the ``*_raw`` columns of sigma_diag.dat and the gwjax.out
+#: band-tail block.
+RAW_SIGMA_NOTE = (
+	"raw = band sum truncated at N bands, no spectral_shell tail; compare "
+	"to BerkeleyGW at the same number_bands")
+
+
+def write_sigma_to_file(
+	sigma_sx_kij_eV,
+	filename="eqp0.dat",
+	sigma_coh_kij_eV=None,
+	hartree_kij_eV=None,
+	energies_dft_ev=None,
+	*,
+	kpoints_crys,
+	star_spread_ev=None,
+	star_spread_per_band_ev=None,
+	star_spread_multiplet_ev=None,
+	n_star_members=None,
+	sx_label: str = "sigSX",
+	corr_label: str = "sigCOH",
+	total_label: str = "sigTOT",
+	hartree_label: str = "VH",
+	sigma_lorentz_skn_eV=None,
+	sigma_c_odd_kn_eV=None,
+	z_factor_kn=None,
+	sigma_c_raw_kn_eV=None,
+	eqp_raw_kn_eV=None,
+	z_note: str = "1/(1 - dRe sigC/dw) at E_DFT",
+	omitted_note: str | None = None,
+):
+	"""Write self-energy components to file.
+
+	Args:
+		sigma_sx_kij_eV: Exchange-like self-energy in eV, shape (nk, nb, nb),
+			or its already-extracted diagonal with shape (nk, nb).
+		filename: Output file path
+		kpoints_crys: (nk, 3) crystal coordinates, ONE ROW PER Sigma ROW.
+			REQUIRED, and checked against ``nk``.  See the k-BASIS note
+			below: this file's rows are whatever basis the caller's Sigma
+			is on, and this argument is how the file says which.
+		sigma_coh_kij_eV: Correlation-like self-energy in eV, shape (nk, nb, nb)
+		hartree_kij_eV: Hartree matrix elements in eV, shape (nk, nb, nb)
+		energies_dft_ev: DFT (mean-field) band energies in eV, shape (nk, nb).
+			When given, an ``Eo=`` column is written per row so the file can be
+			aligned band-for-band against a BGW ``sigma_hp`` output (which lists
+			``Eo``) — the mean-field energy is the reference-free key that ties
+			LORRAX's band window to BGW's.
+		sx_label: Text label for first self-energy column
+		corr_label: Text label for second self-energy column
+		omitted_note: With ``sigma_coh_kij_eV`` None, the header line naming
+			the omitted correlation and total columns and why.
+		total_label: Text label for the sum of first and second columns
+		hartree_label: Text label for the direct-field column
+		sigma_lorentz_skn_eV: Optional physical Sigma total split with axes
+			(CC, CT+TC, TT, k, band), or the same with two band-matrix axes.
+			When present the named ``sigCC``, ``sigTT``, ``sigCT`` columns are
+			written.  None leaves the historical scalar file byte-identical.
+		sigma_c_odd_kn_eV: Optional measured broken-TR contribution to Sigma_c,
+			shape (nk, band), written as ``sigC_odd``.  None omits the column.
+		z_factor_kn: Optional raw quasiparticle residue, shape ``(nk, band)``.
+			When present, every row records ``Z`` without clipping it.
+		sigma_c_raw_kn_eV: Optional raw Sigma_c(E_DFT), shape ``(nk, band)``:
+			the band sum truncated at N bands with no spectral_shell tail,
+			written after ``Z`` as ``sigC_raw`` (see :data:`RAW_SIGMA_NOTE`).
+			None (every run without band extrapolation) omits the column.
+		eqp_raw_kn_eV: Optional ``(eqp0, eqp1)`` pair, each ``(nk, band)``,
+			assembled from the raw Sigma_c exactly as eqp0.dat/eqp1.dat are
+			from the extrapolated one; written LAST as ``eqp0_raw`` and
+			``eqp1_raw``.  Requires ``sigma_c_raw_kn_eV``.
+
+	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
+	------------------------------------------------
+	The block label ``k-point N`` is a POSITION in whatever array the
+	caller handed in, and nothing in the file used to say which k that
+	was.  Three separate downstream comparisons then paired this file's
+	rows against BerkeleyGW's IBZ blocks by position, because positions
+	0,1,2 coincide on Si 4x4x4 and only diverge from row 3 on (the true
+	map is ``[0,1,2,5,6,7,10,27]``).  The worst of them reported a
+	291 meV disagreement where the real figure was 28 meV; an earlier
+	one manufactured a 600 meV "non-symmorphic phase bug".
+
+	So the coordinate is written on every block, and ``kpoints_crys`` is
+	REQUIRED and length-checked against the Sigma rows.  A consumer can
+	now join on the coordinate instead of the position, and a reader can
+	see at a glance which basis the file is on -- an IBZ file and a
+	full-BZ file no longer look identical.
+
+	This writer does NOT decide the basis; ``gw_output.write_results``
+	does, and since 2026-08-15 it writes EVERY text file on the
+	irreducible wedge — the k-set Sigma is actually extracted on.  The
+	full-BZ arrays are that wedge's symmetry image and carry no
+	independent information, so writing them was writing the same numbers
+	several times under indices nothing in the file explained.
+	A consumer that genuinely needs the full BZ unfolds through the
+	symmetry service (``symmetry_maps.star_broadcast``, via
+	``file_io.kin_ion.broadcast_ibz_to_full_bz``), which is what
+	``htransform.read_eqp_energies`` and ``bse_io.apply_eqp_corrections``
+	do.  Nothing reconstructs a star by hand.
+
+	The coordinate goes on its OWN line, never appended to the
+	``k-point N:`` header and never onto a data row.  Both of those
+	placements break parsers in tree: htransform anchors its header
+	regex with ``$`` (``htransform.py:1153``), and six parsers
+	discriminate header-from-body by "exactly four whitespace tokens".
+	A separate ``#`` line is invisible to every one of them, exactly as
+	the existing ruler line already is.
+	"""
+	_shape = np.shape(sigma_sx_kij_eV)
+	if len(_shape) == 2:
+		nk, nbands = _shape
+	elif len(_shape) == 3 and _shape[1] == _shape[2]:
+		nk, nbands, _ = _shape
+	else:
+		raise ValueError(
+			"sigma_sx_kij_eV must be (nk,nb) or (nk,nb,nb); got "
+			f"{_shape}")
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (nk, 3):
+		# The structural guard: handing 64 rows of full-BZ Sigma an
+		# 8-row IBZ k-list (or vice versa) is the mistake this file
+		# exists to make impossible, so it is refused rather than
+		# written out and discovered downstream.
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the {nk} "
+			f"Sigma k-rows of {os.path.basename(str(filename))} — the "
+			f"k-list and the self-energy are on different k-bases.")
+
+	# ------------------------------------------------------------------
+	# REAL-VS-COMPLEX IS ONE DECISION PER COLUMN, TAKEN OVER THE WHOLE ARRAY
+	# ------------------------------------------------------------------
+	# This used to be decided PER SCALAR: each row asked whether its own
+	# imaginary part exceeded 1e-10 and appended either "+x.xxxxxxi" or a
+	# 12-space filler.  A run where one band's Sigma carries a numerically
+	# significant imaginary part and its neighbours do not therefore emits
+	# rows of two different SHAPES in one column — which is the malformed
+	# dump seen in the frontier artifacts.  Two ways it bites: a
+	# whitespace-splitting parser reads the next column's value into this
+	# one, and the `VH` branch below had no filler at all, so the trailing
+	# `Eo=` column moved horizontally depending on the row.
+	#
+	# A file format is a property of the FILE.  So the question is asked
+	# once per component, over every element that will be written (the
+	# diagonal of every k-point), and every row of that column then has the
+	# same width whatever its own value happens to be.  A column that is
+	# complex ANYWHERE is written complex EVERYWHERE, which is also the
+	# honest report: "this quantity is complex in this run".
+	#
+	# Threshold unchanged (1e-10) and still absolute — this is a formatting
+	# decision about eV-scale numbers, not a convergence test.
+	_IM_TOL = 1e-10
+
+	def _diag(a):
+		"""The (nk, nbands) diagonal actually written, or None."""
+		if a is None:
+			return None
+		arr = np.asarray(a)
+		if arr.shape == (nk, nbands):
+			return arr
+		if arr.shape == (nk, nbands, nbands):
+			return arr[:, np.arange(nbands), np.arange(nbands)]
+		raise ValueError(
+			"Sigma output component must match the leading component as "
+			f"(nk,nb) or (nk,nb,nb); got {arr.shape}")
+
+	sx_diag = _diag(sigma_sx_kij_eV)
+	coh_diag = _diag(sigma_coh_kij_eV)
+	hv_diag = _diag(hartree_kij_eV)
+	tot_diag = None if coh_diag is None else sx_diag + coh_diag
+	lorentz_diag = None
+	if sigma_lorentz_skn_eV is not None:
+		_parts = np.asarray(sigma_lorentz_skn_eV)
+		if _parts.shape == (3, nk, nbands):
+			lorentz_diag = _parts
+		elif _parts.shape == (3, nk, nbands, nbands):
+			idx = np.arange(nbands)
+			lorentz_diag = _parts[:, :, idx, idx]
+		else:
+			raise ValueError(
+				"sigma_lorentz_skn_eV must be (3,nk,nb) or "
+				f"(3,nk,nb,nb); got {_parts.shape}")
+		if tot_diag is None:
+			raise ValueError(
+				"sigma_lorentz_skn_eV requires the two physical Sigma columns")
+		_closure = np.max(np.abs(np.sum(lorentz_diag, axis=0) - tot_diag))
+		_scale = np.max(np.abs(tot_diag)) if tot_diag.size else 0.0
+		_limit = 1.0e-12 + 1.0e-10 * _scale
+		if _closure > _limit:
+			raise ValueError(
+				"GATE sigma_lorentz_column_closure: sigCC + sigCT + sigTT "
+				f"does not equal {total_label}: {_closure:.3e} eV > "
+				f"{_limit:.3e} eV")
+	odd_diag = _diag(sigma_c_odd_kn_eV)
+	raw_diag = _diag(sigma_c_raw_kn_eV)
+	eqp_raw = None
+	if eqp_raw_kn_eV is not None:
+		if raw_diag is None:
+			raise ValueError("eqp_raw_kn_eV requires sigma_c_raw_kn_eV")
+		eqp_raw = [np.asarray(a, dtype=np.float64) for a in eqp_raw_kn_eV]
+		if len(eqp_raw) != 2 or any(a.shape != (nk, nbands) for a in eqp_raw):
+			raise ValueError(
+				f"eqp_raw_kn_eV must be two ({nk},{nbands}) arrays")
+	z_diag = None if z_factor_kn is None else np.asarray(
+		z_factor_kn, dtype=np.float64)
+	if z_diag is not None and z_diag.shape != (nk, nbands):
+		raise ValueError(
+			f"z_factor_kn must have shape ({nk},{nbands}); got "
+			f"{z_diag.shape}.")
+
+	def _is_complex(d):
+		return d is not None and bool(np.any(np.abs(np.imag(d)) > _IM_TOL))
+
+	sx_cplx = _is_complex(sx_diag)
+	coh_cplx = _is_complex(coh_diag)
+	tot_cplx = _is_complex(tot_diag)
+	hv_cplx = _is_complex(hv_diag)
+	lorentz_cplx = ([ _is_complex(lorentz_diag[s]) for s in range(3)]
+	                 if lorentz_diag is not None else None)
+	odd_cplx = _is_complex(odd_diag)
+	raw_cplx = _is_complex(raw_diag)
+
+	#: Width of the omitted "+x.xxxxxxi" field, so a real column occupies
+	#: exactly as many characters as a complex one would.
+	_IM_PAD = " " * 12
+
+	def _im(value, complex_column):
+		"""The imaginary field for a column, or the exact-width filler.
+
+		One function for both branches so the widths cannot drift apart:
+		``+`` + 10 + ``i`` is 12 characters, and so is :data:`_IM_PAD`.
+		"""
+		if not complex_column:
+			return _IM_PAD
+		return f"+{float(value):>10.6f}i"
+
+	# Resolve to absolute path, ensure directory exists
+	abs_path = os.path.abspath(filename)
+	dirname = os.path.dirname(abs_path)
+	if dirname:
+		os.makedirs(dirname, exist_ok=True)
+
+	with open(abs_path, "w") as f:
+		# Write header with units
+		f.write(provenance_header())
+		f.write("# Sigma output (all in eV)\n")
+		f.write(f"# {total_label} = {sx_label} + {corr_label}\n")
+		if lorentz_diag is not None:
+			f.write(f"# {total_label} = sigCC + sigTT + sigCT; "
+			        "sigCT is CT+TC\n")
+		if odd_diag is not None:
+			f.write("# sigC_odd = ordered broken-TR residue contribution "
+			        "Sigma_c[B,D] - Sigma_c[B,D=0]\n")
+		if z_diag is not None:
+			f.write(f"# Z is {z_note}\n")
+		if raw_diag is not None:
+			names = "sigC_raw, eqp0_raw, eqp1_raw" if eqp_raw else "sigC_raw"
+			f.write(f"# {names}: {RAW_SIGMA_NOTE}\n")
+		if omitted_note is not None:
+			f.write(f"# omitted: {omitted_note}\n")
+		f.write(f"# k-basis: irreducible wedge, {nk} k-points; each block "
+		        f"states its crystal coordinate on a '# kcrys' line\n")
+		# The star-spread diagnostic, MEASURED ON THE FULL BZ upstream (see
+		# ``gw_output._star_spread_of_sigma_diag``) because a wedge file
+		# cannot carry it: unfolding the wedge back is a gather, so the
+		# spread would read 0.000 by construction.  Recorded here so the
+		# check survives the file's move to the wedge.
+		if star_spread_ev is not None:
+			f.write(f"# star_spread_ev {float(star_spread_ev):.9e}   "
+			        f"# max over ALL {nbands} bands of the per-band max-min "
+			        f"of Re diag {total_label} within one star, over the "
+			        f"{int(n_star_members)} full-BZ k this wedge unfolds "
+			        f"to.  READ THE PER-BAND ROW BELOW, NOT THIS, IF YOU "
+			        f"COMPARE A BAND SUBSET: the band scope belongs to the "
+			        f"consumer, and this max answers the widest possible "
+			        f"question.  BLIND TO THE TRS CONJUGATION CLASS by "
+			        f"construction (conjugating a Hermitian block leaves "
+			        f"its real diagonal intact) — that question is gated in "
+			        f"tests/test_star_offdiag_gate.py\n")
+		if star_spread_per_band_ev is not None:
+			_pb = np.asarray(star_spread_per_band_ev, dtype=np.float64)
+			if _pb.shape != (nbands,):
+				raise ValueError(
+					f"star_spread_per_band_ev has shape {_pb.shape}, "
+					f"expected ({nbands},) — one entry per written band.")
+			f.write("# star_spread_ev_per_band "
+			        + " ".join(f"{float(v):.9e}" for v in _pb) + "\n")
+		if star_spread_multiplet_ev is not None:
+			# THE DEGENERACY-RESOLVED TWIN, and it is not a refinement of the
+			# row above -- it answers a question that one cannot.  A single
+			# band inside a degenerate multiplet has no symmetry-invariant
+			# Re Sigma_bb: any unitary mixing within the subspace is an
+			# equally valid eigenbasis, so the per-band row measures the
+			# eigensolver's gauge there as much as the physics.  The TRACE
+			# over the multiplet IS invariant.  Entries are per band (the
+			# subspace spread divided by its size) so the two rows compare
+			# element by element; where a band is isolated the two agree by
+			# construction.  See gw_output._star_spread_over_multiplets.
+			_mp = np.asarray(star_spread_multiplet_ev, dtype=np.float64)
+			if _mp.shape != (nbands,):
+				raise ValueError(
+					f"star_spread_multiplet_ev has shape {_mp.shape}, "
+					f"expected ({nbands},) — one entry per written band.")
+			# NAMED "star_spread_multiplet_ev*", NOT "star_spread_ev_*_multiplet".
+			# "# star_spread_ev" is already a PREFIX of
+			# "# star_spread_ev_per_band", and any reader that counts rows by
+			# prefix -- tests/test_eqp_kpoint_basis.py does -- breaks the
+			# moment a third key extends that stem.  Measured: the first
+			# spelling of this row did exactly that.  A new header key must
+			# not extend an existing one.
+			f.write(f"# star_spread_multiplet_ev {float(_mp.max()):.9e}\n")
+			f.write("# star_spread_multiplet_ev_per_band "
+			        + " ".join(f"{float(v):.9e}" for v in _mp) + "\n")
+		for k in range(nk):
+			f.write(f"\nk-point {k}:\n")
+			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
+			        f"{kpts[k, 2]:15.9f}\n")
+			f.write("-" * 100 + "\n")
+			for n in range(nbands):
+				sx_re = float(np.real(sx_diag[k, n]))
+				sx_im = float(np.imag(sx_diag[k, n]))
+				line = f"n={n:<3} {sx_label}={sx_re:>12.6f}"
+				line += _im(sx_im, sx_cplx)
+
+				if coh_diag is not None:
+					coh_re = float(np.real(coh_diag[k, n]))
+					coh_im = float(np.imag(coh_diag[k, n]))
+					line += f"  {corr_label}={coh_re:>12.6f}"
+					line += _im(coh_im, coh_cplx)
+					# Total COHSEX
+					total_re = sx_re + coh_re
+					total_im = sx_im + coh_im
+					line += f"  {total_label}={total_re:>12.6f}"
+					line += _im(total_im, tot_cplx)
+
+				if lorentz_diag is not None:
+					# Stable public order follows the requested names, while the
+					# internal sector order remains CC, CT+TC, TT.  The old total's
+					# six-decimal spelling is a compatibility contract.  Quantize the
+					# two independently computed current sectors to that same public
+					# precision, then spell CC as the residual, so parsing the text
+					# preserves sigCC+sigTT+sigCT=total below 1e-9 eV without moving
+					# or respelling any incumbent column.
+					display_re = [
+						float(f"{float(np.real(lorentz_diag[s, k, n])):.6f}")
+						for s in range(3)]
+					display_re[0] = (
+						float(f"{total_re:.6f}") - display_re[1] - display_re[2])
+					for label, sector in (("sigCC", 0), ("sigTT", 2),
+					                      ("sigCT", 1)):
+						value = lorentz_diag[sector, k, n]
+						line += f"  {label}={display_re[sector]:>12.6f}"
+						line += _im(float(np.imag(value)),
+						            lorentz_cplx[sector])
+
+				if odd_diag is not None:
+					value = odd_diag[k, n]
+					line += f"  sigC_odd={float(np.real(value)):>12.6f}"
+					line += _im(float(np.imag(value)), odd_cplx)
+
+				if hv_diag is not None:
+					hv_re = float(np.real(hv_diag[k, n]))
+					hv_im = float(np.imag(hv_diag[k, n]))
+					line += f"  {hartree_label}={hv_re:>12.6f}"
+					# Padded on the real branch too — it was NOT before, so
+					# the trailing Eo= column moved row to row.
+					line += _im(hv_im, hv_cplx)
+
+				# Trailing Eo= column (mean-field energy) — appended last so
+				# existing sigSX/sigCOH/sigTOT/VH parsers are unaffected.
+				if energies_dft_ev is not None:
+					line += f"  Eo={float(energies_dft_ev[k, n]):>12.6f}"
+
+				if z_diag is not None:
+					line += f"  Z={float(z_diag[k, n]):>12.6f}"
+
+				# Last, so every existing column keeps its position.
+				if raw_diag is not None:
+					value = raw_diag[k, n]
+					line += f"  sigC_raw={float(np.real(value)):>12.6f}"
+					line += _im(float(np.imag(value)), raw_cplx)
+				if eqp_raw is not None:
+					# eqp0.dat's precision, so the columns compare exactly.
+					line += (f"  eqp0_raw={eqp_raw[0][k, n]:>15.9f}"
+					         f"  eqp1_raw={eqp_raw[1][k, n]:>15.9f}")
+
+				f.write(line + "\n")
+
+
+def write_eqp_g0w0(
+	eqp_path,
+	energies_dft_ev,
+	g0w0_diag_ev,
+	*,
+	kpoints_crys,
+):
+	"""Write E_DFT next to diagonal (H0 + Sigma_xc(E_DFT)) for G0W0 comparisons.
+
+	Parameters
+	----------
+	eqp_path : str
+		Output file path.
+	energies_dft_ev : array (nk, nb)
+		DFT eigenvalues in eV.
+	g0w0_diag_ev : array (nk, nb)
+		Diagonal matrix elements of (kin_ion + V_H + Sigma_xc(E_DFT)) in eV.
+	kpoints_crys : array (nk, 3)
+		Crystal coordinates, one row per energy row.  REQUIRED and
+		length-checked, for the reason spelled out in the k-BASIS note
+		of :func:`write_sigma_to_file` — this file has the same
+		``k-point N:`` block layout and was paired by position by the
+		same downstream scripts.  On the irreducible wedge, like every
+		other text file ``gw_output.write_results`` emits; its one
+		former full-BZ consumer was the out-of-tree
+		``make_eqp_htformat.py``, whose whole job was pre-unfolding this
+		file for htransform — which now reads the wedge and unfolds
+		through the symmetry service itself.
+	"""
+	energies_dft_ev = np.asarray(energies_dft_ev, dtype=np.float64)
+	g0w0_diag_ev = np.asarray(g0w0_diag_ev, dtype=np.complex128)
+	if energies_dft_ev.shape != g0w0_diag_ev.shape:
+		raise ValueError(
+			f"Shape mismatch for eqp_g0w0: DFT {energies_dft_ev.shape} vs G0W0 {g0w0_diag_ev.shape}"
+		)
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (energies_dft_ev.shape[0], 3):
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the "
+			f"{energies_dft_ev.shape[0]} energy k-rows of eqp_g0w0 — the "
+			f"k-list and the energies are on different k-bases.")
+
+	abs_path = os.path.abspath(eqp_path)
+	dirname = os.path.dirname(abs_path)
+	if dirname:
+		os.makedirs(dirname, exist_ok=True)
+
+	with open(abs_path, "w") as f:
+		f.write(provenance_header())
+		f.write("# G0W0 diagonal energies (eV)\n")
+		f.write("# columns: band  E_DFT  Re[H0+Sigma_xc(E_DFT)]  Im[H0+Sigma_xc(E_DFT)]\n")
+		for k in range(energies_dft_ev.shape[0]):
+			f.write(f"\nk-point {k}:\n")
+			f.write(f"# kcrys {kpts[k, 0]:15.9f}{kpts[k, 1]:15.9f}"
+			        f"{kpts[k, 2]:15.9f}\n")
+			f.write("-" * 80 + "\n")
+			for n in range(energies_dft_ev.shape[1]):
+				e_dft = float(energies_dft_ev[k, n])
+				val = complex(g0w0_diag_ev[k, n])
+				f.write(
+					f"n={n:<3}  E_DFT={e_dft:>12.6f}  Re={val.real:>12.6f}  Im={val.imag:>12.6f}\n"
+				)
+	return abs_path
+
+
+def write_sigma_freq_debug_table(
+	filepath: str,
+	columns: list[tuple[str, np.ndarray]],
+	*,
+	kpoints_crys,
+	metadata: dict[str, str] | None = None,
+) -> str:
+	"""Write a per-(k, n) decomposition table.
+
+	``kpoints_crys`` is (nk, 3) crystal coordinates, REQUIRED and
+	length-checked against the columns, and written as a ``# kcrys`` line
+	under each ``k-point N:`` header — the same rule the other two text
+	writers in this module follow, for the same reason.  This file carries
+	``k`` as a DATA COLUMN, which makes it look self-describing and is
+	exactly the trap: that integer is a position in whatever array the
+	caller passed, and pairing it against another code's k-order by value
+	is the mistake that produced 291 meV and 600 meV phantom
+	disagreements elsewhere in this tree.  The coordinate is the join key;
+	the integer is not.
+
+	Each entry in ``columns`` is a ``(name, array)`` pair, where ``array``
+	has shape ``(nk, nb)`` and is real or complex.  Real arrays produce one
+	column; complex arrays produce two adjacent ``Re/Im`` sub-columns.  All
+	values are assumed to already be in eV — the caller does the Ry→eV
+	conversion at the seam (consistent with the rule "internals in Ry, eV
+	only at print").
+
+	Optional ``metadata`` is written into this same canonical receipt as stable
+	``# metadata key=value`` lines.  Keys and values must each be single-line;
+	the caller owns their semantics and authentication.
+
+	The first row is a comment header naming all columns; subsequent rows
+	are tab-separated numerical values, one per ``(k, n)`` pair, with k
+	and n as the leading two integer columns.
+
+	Returns
+	-------
+	The absolute path written.
+	"""
+	if not columns:
+		raise ValueError("write_sigma_freq_debug_table: ``columns`` is empty.")
+	metadata = {} if metadata is None else dict(metadata)
+	for key, value in metadata.items():
+		if not isinstance(key, str) or not key or any(c in key for c in "=\r\n"):
+			raise ValueError(f"invalid Sigma debug metadata key {key!r}")
+		if not isinstance(value, str) or any(c in value for c in "\r\n"):
+			raise ValueError(
+				f"invalid Sigma debug metadata value for {key!r}: {value!r}")
+
+	arrays = [(name, np.asarray(arr)) for name, arr in columns]
+	nk, nb = arrays[0][1].shape
+	for name, arr in arrays:
+		if arr.shape != (nk, nb):
+			raise ValueError(
+				f"column {name!r}: shape {arr.shape} != ({nk}, {nb})")
+	kpts = np.asarray(kpoints_crys, dtype=np.float64)
+	if kpts.shape != (nk, 3):
+		raise ValueError(
+			f"kpoints_crys shape {kpts.shape} does not match the {nk} k-rows "
+			f"of {os.path.basename(str(filepath))} — the k-list and the "
+			f"columns are on different k-bases.")
+
+	# Column header — Re/Im split for complex arrays.
+	header = ["k", "n"]
+	for name, arr in arrays:
+		if np.iscomplexobj(arr):
+			header += [f"{name}.Re", f"{name}.Im"]
+		else:
+			header.append(name)
+
+	abs_path = os.path.abspath(filepath)
+	dirname = os.path.dirname(abs_path)
+	if dirname:
+		os.makedirs(dirname, exist_ok=True)
+
+	col_w = 16
+
+	def _hdr(name: str) -> str:
+		return f"{name:<{col_w}s}"
+
+	def _val(x) -> str:
+		if isinstance(x, complex) or np.iscomplexobj(x):
+			# Should never reach here — complex columns are split above.
+			x = float(np.real(x))
+		fx = float(x)
+		if np.isnan(fx):
+			return f"{'nan':>{col_w}s}"
+		return f"{fx:>+{col_w}.6f}"
+
+	with open(abs_path, "w") as f:
+		f.write(provenance_header())
+		f.write(
+			"# Sigma frequency debug decomposition (per-(k, n) diagonals; all "
+			"energies in eV).\n"
+		)
+		for key in sorted(metadata):
+			f.write(f"# metadata {key}={metadata[key]}\n")
+		f.write("# " + "\t".join(_hdr(h) for h in header) + "\n")
+		for ik in range(nk):
+			f.write(f"\nk-point {ik}:\n")
+			f.write(f"# kcrys {kpts[ik, 0]:15.9f}{kpts[ik, 1]:15.9f}"
+			        f"{kpts[ik, 2]:15.9f}\n")
+			for ib in range(nb):
+				row = [f"{ik:>{col_w}d}", f"{ib:>{col_w}d}"]
+				for name, arr in arrays:
+					v = arr[ik, ib]
+					if np.iscomplexobj(arr):
+						row += [_val(v.real), _val(v.imag)]
+					else:
+						row.append(_val(v))
+				f.write("\t".join(row) + "\n")
+
+	return abs_path
+
+
+# ===========================================================================
+# HOW sigma_mnk.h5 STORES ITS k AXIS — the SELECTION, and what it is not
+# ===========================================================================
+# This file can store its k axis on the irreducible wedge, and the way it
+# does so is a SELECTION of rows that were already accumulated: the Σ sweep
+# runs at every full-BZ k exactly as before, the cube is completed, the
+# kernel exits, and only then does the writer keep one row per star and drop
+# the rest.  Nothing is reconstructed, nothing is substituted, and the rows
+# that survive are bit-for-bit the rows the full-BZ file held.
+#
+# THAT IS NOT THE THING THIS FILE REFUSED, and the distinction is the whole
+# design.  What was refused — and stays refused — is storing the wedge and
+# REBUILDING the other nk−nrk rows from it on read.  ``gw.sc_iteration``
+# performs the extraction at its one map-output seam.  Every full-BZ k is an
+# INDEPENDENT evaluation, so an unfold would replace nk−nrk
+# measurements with reconstructions, and on a deck whose quadrature is not
+# orbit-closed those reconstructions are wrong by the amounts below.  No
+# reader in this module unfolds; a consumer that wants full-BZ Σ rows must
+# get them from a run, not from this file.
+#
+# The reason a selection is nevertheless sound is that nothing downstream
+# consumes the dropped rows.  EQP consumption (kin_ion + live V_H + Σ^xc)
+# is already k_irr-side, and the static Hermitianization now happens on the
+# selected rows only, so the extraction removes payload that had no reader.
+#
+# WHAT THE DROPPED ROWS USED TO LET YOU MEASURE, and where it went.  Because
+# the star relation is the metric the whole orbit-closure program is priced
+# in (SPEC_qirr_restart_tensors §2a: Σ star spread 16.884 → 0.743 meV, a 23x
+# gain, against +4.4 meV on BSE at fixed rank), an artifact that no longer
+# carries the star members cannot be measured for it afterwards.  So the
+# measurement runs before selection: at WRITE time for one-shot results, via
+# :func:`sigma_star_spread_stats`, and inside the SC map before its retained
+# output seam.  An SC terminal write receives only the retained star wedge,
+# so it omits the unrecoverable per-dataset spread attrs rather than unfolding
+# and stamping a manufactured zero.
+#
+# THE NUMBERS, and what they turned out to be.  Measured on
+# ``tests/regression/cohsex_debug/sigma_mnk.h5`` (nk 9, nrk 3 — a 3.00x
+# reduction on this deck, not the 8x a Si 4³/48-op deck would suggest),
+# residual of ``unfold(select(A))`` against ``A``:
+#
+#     dataset                worst element   Re-diag spread   after degen-avg
+#     hartree_kij_ev            113.08 eV         61.51 eV         56.76 eV
+#     sigma_total_kij_ev        105.27 eV         59.53 eV         54.75 eV
+#     sigma_sx_kij_ev             8.89 eV          1.21 eV          1.16 eV
+#     sigma_xc_qsgw_kij_ev        7.28 eV          4.30 eV          4.20 eV
+#     sigma_c_kij_ev              1.43 eV          0.98 eV          0.97 eV
+#
+# The 113.08 eV was investigated before the extraction was written, on the
+# owner's instruction, because a number that large usually means the Σ
+# procedure did something wrong.  It did not, and the answer is in two
+# halves.
+#
+# HALF ONE: the raw metric can read enormous from gauge alone.  ⟨mk|O|nk⟩
+# is not a physical quantity when m and n are degenerate — the diagonaliser
+# picks a basis inside each manifold independently at every k.  ``kin_ion``,
+# built on the exact FFT grid with no ISDF quadrature anywhere in its path,
+# is the control: it reads 2.861e-01 relative and 7.78 Ry on its worst
+# element under this metric, and 6.4e-13 under one the gauge cannot move.
+# The 113.08 eV element itself sits at (k, m, n) = (8, 0, 6), OFF-DIAGONAL,
+# stored −52.7533+20.3097i against an unfold of +52.7210−20.4598i: the
+# magnitudes are 56.5278 and 56.5518, agreeing to 4 parts in 10⁴, with the
+# phase inverted, and band 0 lies in a manifold of multiplicity 2.  A 56 eV
+# element reports 113 eV the moment the sign convention differs.
+#
+# HALF TWO: what is left after the gauge is removed is real, and it is this
+# fixture's quadrature.  Degeneracy-averaging the Hartree diagonal takes its
+# star spread only from 61.51 eV to 56.76 eV — 7.7 % was gauge.
+# ``verify_centroid_orbit_closure`` on this deck's own
+# ``centroids_frac_60.txt`` returns the identity op at exactly 0.0000 and
+# all eleven genuine rotations at 0.166 … 0.276, and the Σ spread has the
+# same signature: relations needing a rotation break at 8e-02 … 3e-01
+# gauge-blind, relations needing none hold at 1.1e-04 (hartree) and 2.6e-04
+# (sigma_sx).  Cause and effect line up op by op.
+#
+# NONE OF WHICH THE SELECTION TOUCHES.  A run whose quadrature is not
+# orbit-closed has a Σ that differs across a star, and that was true of the
+# full-BZ file too; the extraction neither creates the disagreement nor
+# hides it, because the stamped stats report it on every run.  What the
+# extraction does mean is that the file no longer offers a CHOICE of which
+# star member to believe — it keeps the first, which is the row every
+# k_irr-side consumer was already reading.
+#
+# CORRECTED WHILE MEASURING.  ``sigma_total_kij_ev`` reproduces
+# ``c + sx[None] + h[None]`` on that fixture to max|Δ| 4.3511e-05 eV, and
+# this block used to attribute the gap to an unpinned association order.  It
+# is not that.  All three association orders give BIT-IDENTICALLY the same
+# 4.3511e-05 eV, so reassociation is not what moves it; every one of the four
+# arrays is exactly a float32 value widened into a complex128 container, and
+# 4.3511e-05 against a peak of 384.51 eV is 1.13e-07 relative, which is
+# float32 epsilon.  The fixture is a single-precision artifact.  Pinning the
+# association would not have made it exact — and the writer's two paths
+# already share one association order by construction, ``(c + sx) + h``, in
+# both the replicated derivation below and ``gw.ppm_pipeline``'s sharded
+# one.  What was missing was a gate saying so, and
+# ``tests/test_sigma_kirr_extraction.py`` is now it.
+
+
+def star_select_k_irr(values, rows_to_keep, *, k_axis=0):
+	"""Keep ``rows_to_keep`` along ``k_axis``.  Pure selection, no arithmetic.
+
+	This is the whole extraction.  It is spelled as its own function so the
+	gate can assert what it is: a take of rows that already existed, which
+	makes bit-identity against the full-BZ array trivially true rather
+	than something to be measured to a tolerance.
+
+	A DEVICE ARRAY STAYS ON ITS DEVICE.  ``jax.Array`` carries ``.take``,
+	so the sharded write path drops its rows without a host round trip of
+	the cube — the k axis is never the sharded one here (the sharded
+	layout tiles bands), so this is a local gather on every rank.
+	"""
+	rows = np.asarray(rows_to_keep)
+	take = getattr(values, "take", None)
+	if take is not None:
+		return take(rows, axis=k_axis)
+	return np.take(np.asarray(values), rows, axis=k_axis)
+
+
+def _slab_to_host(a):
+	"""Host numpy for one Sigma slab, whether it is replicated or SHARDED.
+
+	The star-spread statistic is measured on ONE slice of a pair (the
+	caller slices before calling, so the transfer is the slice).  At P > 1
+	that slice is still a
+	GLOBALLY sharded ``jax.Array`` whose devices are not all addressable
+	from this process, and a bare ``np.asarray`` on it raises
+	"Fetching value for `jax.Array` that spans non-addressable ... devices"
+	-- which is exactly how the sharded layout died at P=4 the first time
+	anyone ran it through the k_irr extraction (the extraction landed
+	2026-08-08, the sharded layout 2026-07-28, and the two had never met).
+
+	The nonlocal route is owned by :func:`common.collectives.gather_to_host`;
+	this format-level wrapper keeps only the numpy/fully-addressable fast path
+	so this module does not import jax at module scope.  Replicated / numpy
+	operands therefore keep the byte-for-byte historical path, while global
+	replication and sharding use the codebase's one collective convention.
+	"""
+	if getattr(a, "is_fully_addressable", True):
+		return np.asarray(a)
+	from common.collectives import gather_to_host
+	return gather_to_host(a)
+
+
+def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
+                            n_sym_spatial, *, k_axis=0, omega_index=None,
+                            on_shell_pair=True):
+	"""How far this array is from its own star relation.  FOUR numbers.
+
+	Computed on the COMPLETE full-BZ array, before any row is dropped —
+	that is the only moment it can be computed at all once the artifact
+	stops carrying the star members.
+
+	Four rather than one, because one cannot be read.  A raw-element
+	residual on a Σ matrix mixes a physical disagreement together with the
+	degenerate-manifold basis choice, and the second can dominate the
+	first by thirteen orders (see the block above).  So the raw number is
+	reported for continuity with the published one, and beside it two
+	quantities the gauge cannot move at all:
+
+	``raw_ev``
+	    ``max |A − unfold(select(A))|``.  THE published metric, the one
+	    that reads 113.08 eV on ``cohsex_debug``'s Hartree array.  Read it
+	    as an upper bound, never as an error.
+	``diag_ev``
+	    Worst per-band ``max − min`` of the REAL diagonal within a star —
+	    ``harness.compare_to_bgw``'s ``_star_spread``, so the stamped
+	    number is comparable to it.  Gauge-free except inside degenerate
+	    manifolds.
+	``frobenius_ev``, ``trace_ev``
+	    Worst ``max − min`` of ``‖A[k]‖_F`` and of ``|Tr A[k]|`` within a
+	    star.  Both are invariant under ``A → U†AU`` for ANY unitary U,
+	    which is a superset of the diagonaliser's freedom, so a nonzero
+	    value here is proof that the operators genuinely differ and not an
+	    artifact of anybody's basis.  They are also free: no eigen- or
+	    singular-value decomposition, two reductions over an array already
+	    in memory.  On the control they collapse 7.78 → 0.003; on the Σ
+	    cubes they do not collapse, which is how one reads that the
+	    fixture's residual spread is real.
+
+	A 4-D array is an on-shell pair, measured on the half-sum of its two
+	slots (stamped ``omega_index`` :data:`PAIR_HALF_SUM_SLICE`): the slots
+	carry the row and the column state's energy, which an antiunitary star
+	member exchanges with its transpose, so the half-sum is the slice that
+	transports as a band operator.
+	An omega-grid cube (``on_shell_pair`` False) is measured at
+	``omega_index`` alone (the ω nearest zero, chosen by the writer): the star
+	relation is a per-ω statement.  The index is stamped alongside so the
+	number is never read as an all-ω claim.
+	"""
+	from ffi import _services
+	_services.ensure_on_path()
+	import symmetry_maps
+
+	# ONE ω SLICE, TAKEN BEFORE THE HOST TRANSFER.  ``np.asarray`` on the
+	# cube itself would pull all (n_omega, nk, nb, nb) of it back from the
+	# devices to measure one slice of it — 1.3 GB on the mos2_4x4 deck for
+	# a 33 MB answer.  Slicing first keeps the transfer to the slice.
+	ndim = len(np.shape(values))
+	if ndim == 4 and on_shell_pair:
+		M = 0.5 * (_slab_to_host(values[0]) + _slab_to_host(values[1]))
+		omega_index = PAIR_HALF_SUM_SLICE
+	elif ndim == 4:
+		if omega_index is None:
+			omega_index = np.shape(values)[0] // 2
+		M = _slab_to_host(values[int(omega_index)])
+	else:
+		M = _slab_to_host(values)
+		omega_index = -1
+	if k_axis != 0:
+		M = np.moveaxis(M, k_axis - (1 if ndim == 4 else 0), 0)
+
+	sel = M[np.asarray(rows_to_keep)]
+	# ``star_row``: ``sel`` is rows taken out of the FULL-BZ array ``M``,
+	# so each row carries a ``sym_idx`` of its own and the predicate is the
+	# XOR — the same flavour ``star_select`` produces.  This used to ride
+	# the argument's default; the default is gone, because the other branch
+	# is wrong here by 183.61 eV on the off-diagonals with the real
+	# diagonal exactly intact, which nothing downstream would have seen.
+	# One bounded block of full-BZ rows at a time: the unfolded array and
+	# |M - unfolded| are never whole (3 x 0.59 GB at Fe 20^3, 68 bands).
+	# max is exact, so the number is the whole-array one.
+	raw = 0.0
+	if M.size:
+		step = max(1, (1 << 28) // max(1, M[0].nbytes))
+		for k0 in range(0, M.shape[0], step):
+			rows = np.arange(k0, min(M.shape[0], k0 + step))
+			unfolded = np.asarray(symmetry_maps.star_broadcast(
+				sel, np.asarray(compact_irr), np.asarray(sym_idx_k),
+				int(n_sym_spatial),
+				irr_labels=np.arange(len(rows_to_keep), dtype=np.int32),
+				trs_reference="star_row", rows=rows))
+			raw = max(raw, float(np.abs(M[rows[0]:rows[-1] + 1] - unfolded).max()))
+
+	diag = frob = trace = 0.0
+	compact = np.asarray(compact_irr)
+	for lab in range(len(rows_to_keep)):
+		mem = np.flatnonzero(compact == lab)
+		if mem.size < 2:
+			continue
+		blk = M[mem]
+		if blk.ndim == 3:
+			d = np.real(np.diagonal(blk, axis1=1, axis2=2))
+			diag = max(diag, float((d.max(0) - d.min(0)).max()))
+			t = np.abs(np.trace(blk, axis1=1, axis2=2))
+			trace = max(trace, float(t.max() - t.min()))
+		else:
+			d = np.real(blk)
+			diag = max(diag, float((d.max(0) - d.min(0)).max()))
+		f = np.linalg.norm(blk.reshape(mem.size, -1), axis=1)
+		frob = max(frob, float(f.max() - f.min()))
+
+	return {
+		"raw_ev": raw,
+		"diag_ev": diag,
+		"frobenius_ev": frob,
+		"trace_ev": trace,
+		"omega_index": int(omega_index),
+	}
+
+
+class DeferredArray:
+	"""A Σ(ω) dataset produced when it is read: ``shape`` now, values later.
+
+	``materialize()`` makes the whole array.  A producer that can also make
+	a range of ω (``omega_range(lo, hi)``) and the k rows the file keeps
+	(``take_rows``) is never made whole: :func:`extract_and_stamp_k_irr`
+	measures the star spread on ``values[omega_index]`` and selects
+	``values.take(rows, axis=1)``, and a full-BZ file (no star tables) is
+	written ω slab by ω slab (:func:`_write_omega_cube`).  Each read is the
+	same numbers, element for element, as the whole array would give.
+	"""
+
+	def __init__(self, shape, produce, *, omega_range=None, take_rows=None):
+		self.shape = tuple(int(n) for n in shape)
+		self._produce = produce
+		self.omega_range = omega_range
+		self._take_rows = take_rows
+
+	def materialize(self):
+		return self._produce()
+
+	def __getitem__(self, index):
+		if self.omega_range is not None and isinstance(index, (int, np.integer)):
+			return self.omega_range(int(index), int(index) + 1)[0]
+		return self.materialize()[index]
+
+	def take(self, rows, axis=0):
+		rows = np.asarray(rows)
+		if axis == 1 and np.array_equal(rows, np.arange(self.shape[1])):
+			# Every k row kept in order (a WFN without symmetry): the
+			# selection is the identity, so the array stays deferred and is
+			# written slab by slab.
+			return self
+		if self._take_rows is not None and axis == 1:
+			return self._take_rows(rows)
+		return self.materialize().take(rows, axis=axis)
+
+
+def _materialize(arr):
+	return arr.materialize() if isinstance(arr, DeferredArray) else arr
+
+
+#: ω slabs per streamed cube write.  SlabIO keeps at most two queued writes
+#: and one in flight, so three slabs of a cube are ever resident.
+_OMEGA_WRITE_SLABS = 16
+
+
+def _write_omega_cube(io, name, arr):
+	"""Write a (n_omega, nk, nb, nb) dataset; a DeferredArray that can make an
+	ω range is converted and written slab by slab at its ω offset."""
+	if not (isinstance(arr, DeferredArray) and arr.omega_range is not None):
+		io.write_slab(name, _materialize(arr))
+		return
+	n_omega = int(arr.shape[0])
+	step = -(-n_omega // _OMEGA_WRITE_SLABS)
+	for lo in range(0, n_omega, step):
+		hi = min(n_omega, lo + step)
+		io.write_slab(name, arr.omega_range(lo, hi), offset=(lo, 0, 0, 0))
+
+
+def extract_and_stamp_k_irr(
+	payload, star, *, omega_ev=None, nk_full=None,
+	star_already_selected=False, on_shell_pairs=None, print_fn=None,
+):
+	"""THE RULED ORDERING, in one implementation.  Measure, then drop.
+
+	``payload`` maps dataset name → array (or ``None``, which passes
+	through).  The k axis of each name comes from :data:`SIGMA_K_AXIS`, so
+	a name that table does not carry is REFUSED rather than written on a
+	guessed axis — an array dropped along the wrong axis is still an array
+	of the right dtype and a plausible shape.
+
+	Returns ``(payload, attrs_for, compact_irr, sym_idx_k)``.  ``attrs_for``
+	is a callable ``name → dict | None`` carrying the storage stamp and
+	that dataset's own four spread numbers.
+
+	WHY THIS IS A FUNCTION AND NOT A BLOCK IN THE WRITER.  Two writers now
+	need the ordering: :func:`write_sigma_omega_h5`, which creates the
+	file, and :func:`append_qsgw_datasets_h5`, which adds the QSGW cube and
+	the QP ladders to a file that already exists.  The ordering is the
+	owner's ruling — the arrays arrive COMPLETE on the full BZ, the
+	star-spread statistic is measured on them, and only then are rows
+	dropped — and a second copy of it is a second place for the measure and
+	the drop to swap.  They must not: after the drop each star has exactly
+	one member left and every spread arm reads identically zero, which
+	``tests/test_sigma_kirr_extraction.py`` demonstrates rather than
+	asserts.
+
+	``star_already_selected=True`` is the SC terminal-write contract: every
+	array already carries the map seam's star-wedge rows.  Their storage is
+	stamped but they are not selected a second time.  Star-spread attributes
+	are deliberately absent because the discarded members cannot be measured;
+	manufacturing an exact-zero spread by unfolding would be a fake green.
+
+	``on_shell_pairs`` names the 4-D arrays that are an on-shell pair, whose
+	star spread is measured on the half-sum of the two slots
+	(:func:`sigma_star_spread_stats`); None: every 4-D array is one.  An
+	omega-grid cube is measured at the ω of ``omega_ev`` nearest zero.
+
+	``star`` of ``None`` is the full-BZ write.  The payload comes back
+	untouched and ``attrs_for`` returns ``None`` for every name, which is
+	the no-attr-means-full back-compat direction: a file that carries no
+	stamp is read as full-BZ, so nothing written before this format can be
+	reinterpreted by it.
+	"""
+	unknown = sorted(n for n in payload if n not in SIGMA_K_AXIS)
+	if unknown:
+		raise ValueError(
+			f"extract_and_stamp_k_irr: {unknown} are not in SIGMA_K_AXIS, so "
+			f"this function does not know which of their axes is k.  Add the "
+			f"dataset there with its k axis; do not let it default to 0.")
+	if star is None:
+		if star_already_selected:
+			raise ValueError(
+				"extract_and_stamp_k_irr: star_already_selected requires star "
+				"tables to stamp the retained rows")
+		return dict(payload), (lambda name: None), None, None
+
+	irr_idx_k, sym_idx_k, n_sym_spatial = star
+	irr_idx_k = np.asarray(irr_idx_k)
+	sym_idx_k = np.asarray(sym_idx_k, dtype=np.int32)
+	if (not star_already_selected and nk_full is not None
+			and irr_idx_k.size != int(nk_full)):
+		raise ValueError(
+			f"star tables describe {irr_idx_k.size} full-BZ k but the "
+			f"Σ cube has nk={int(nk_full)}; the sweep and the tables are not "
+			f"from the same run.")
+	# ONE star-row rule: the service's first-occurrence rows and the
+	# full-BZ table renumbered onto them (``KStarMap.rows`` / ``.take``).
+	# The renumbering is not cosmetic: ``irr_idx_k`` labels WFN wedge rows,
+	# which can outnumber the stars (``cohsex_debug``: labels {0, 2, 3} of
+	# a 4-row wedge for 3 stars), and ``kin_ion.read_star_map`` refuses a
+	# stored table that claims more rows than the slab has.
+	from ffi import _services
+	_services.ensure_on_path()
+	from symmetry_maps import KStarMap
+	star_map = KStarMap(irr_idx_k, sym_idx_k, n_sym_spatial)
+	rows_to_keep, compact_irr = star_map.rows, star_map.take
+
+	# Every ordinary array arrives on the full BZ.  The SC terminal writer is
+	# the sole exception: its complete retained result already lives on the
+	# star wedge and this function only validates/stamps it.
+	expected_nk = len(rows_to_keep) if star_already_selected else irr_idx_k.size
+	for name, arr in payload.items():
+		if arr is None:
+			continue
+		k_axis = SIGMA_K_AXIS[name]
+		nk_seen = int(np.shape(arr)[k_axis])
+		if nk_seen != expected_nk:
+			raise ValueError(
+				f"{name}: axis {k_axis} has {nk_seen} rows, expected "
+				f"{expected_nk} for "
+				f"{'the retained star wedge' if star_already_selected else 'the COMPLETE full-BZ payload'}.")
+
+	# MEASURED ON THE COMPLETE ARRAYS, BEFORE ANY ROW IS DROPPED.
+	omega_index = (int(np.argmin(np.abs(np.asarray(omega_ev))))
+	               if omega_ev is not None else None)
+	stamps: dict[str, dict] = {}
+	selected = {}
+	if not star_already_selected:
+		for name, arr in payload.items():
+			if arr is None:
+				selected[name] = None
+				continue
+			# One dataset at a time; a DeferredArray is measured on its one ω
+			# slice and selected to its retained rows without being made
+			# whole, and only those rows outlive the step.
+			stats = sigma_star_spread_stats(
+				arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
+				k_axis=SIGMA_K_AXIS[name], omega_index=omega_index,
+				on_shell_pair=on_shell_pairs is None or name in on_shell_pairs)
+			selected[name] = star_select_k_irr(
+				arr, rows_to_keep, k_axis=SIGMA_K_AXIS[name])
+			del arr
+			stamps[name] = stats
+			if print_fn is not None:
+				print_fn(
+					f"  Σ star spread [{name}]: raw {stats['raw_ev']:.4f} eV, "
+					f"diag {stats['diag_ev']:.4f} eV, gauge-blind "
+					f"‖·‖_F {stats['frobenius_ev']:.4f} / "
+					f"|Tr| {stats['trace_ev']:.4f} eV")
+	if print_fn is not None:
+		if star_already_selected:
+			print_fn(
+				f"  Σ k axis already on retained k_irr: {len(rows_to_keep)} "
+				"rows (validated and stamped; no second selection).")
+		else:
+			print_fn(
+				f"  Σ k axis EXTRACTED to k_irr: {irr_idx_k.size} -> "
+				f"{len(rows_to_keep)} rows (selection, not reconstruction).")
+
+	# ...and only now are they dropped.
+	out = ({name: _materialize(arr) for name, arr in payload.items()}
+	       if star_already_selected else selected)
+
+	def attrs_for(name):
+		a = {
+			K_STORAGE_ATTR: K_STORAGE_IBZ,
+			K_STORAGE_VERSION_ATTR: K_STORAGE_VERSION,
+			N_SYM_SPATIAL_ATTR: int(n_sym_spatial),
+			"nk_full": int(compact_irr.size),
+		}
+		for key, val in stamps.get(name, {}).items():
+			a[SPREAD_ATTR_PREFIX + key] = val
+		return a
+
+	return out, attrs_for, compact_irr, sym_idx_k
+
+
+def derive_sigma_total(sigma_c, sigma_sx, hartree):
+	"""``(c + sx[None]) + h[None]`` — THE association, in one place.
+
+	Both write paths need this sum and they must produce bit-identical
+	bytes, so they call one function rather than each spelling their own
+	parenthesisation: the replicated derivation in
+	:func:`write_sigma_omega_h5` and the sharded one inside
+	``gw.dynamic_sigma.write_sigma_omega``'s jitted ``_ev_tensors``.
+	Works on host and device arrays alike — it is three adds.
+
+	WHY THIS IS A NAMED FUNCTION AND NOT AN EXPRESSION.  A float64
+	reassociation of a three-term sum moves the result at 1e-16 relative,
+	which no physics gate would ever catch, and the two paths sat in
+	different files with no gate between them.
+	``tests/test_sigma_kirr_extraction.py`` pins the association here,
+	where pinning it costs one cell instead of a parallel run.
+
+	(The 4.35e-05 eV that ``cohsex_debug``'s committed cube shows against
+	this sum is NOT a reassociation — all three orders reproduce it
+	bit-identically, and every array in that file is a widened float32.
+	See the block above.)
+	"""
+	total = sigma_c
+	if sigma_sx is not None:
+		total = total + sigma_sx[None, ...]
+	if hartree is not None:
+		total = total + hartree[None, ...]
+	return total
+
+
+def k_irr_rows_for(full_bz_indices, compact_irr, *, what="caller"):
+	"""Full-BZ row indices → STORED row indices, or a refusal.
+
+	The one adapter a k_irr-side consumer needs, and the reason it refuses
+	rather than remapping blindly.  A consumer that already held full-BZ
+	indices naming the wedge rows it wants — ``eqp_bgw``'s
+	``kirr_to_kfull`` is the live example — can keep those indices and
+	come through here; ``compact_irr[i]`` is the stored row holding k *i*.
+
+	THE REFUSAL IS THE WHOLE POINT.  ``compact_irr[i]`` is defined for
+	EVERY full-BZ *i*, including ones whose data is not on disk, and for
+	those it returns the star's FIRST member instead.  That substitution —
+	handing back a different member of the same star — is exactly the
+	operation this file refuses, and on a deck whose quadrature is not
+	orbit-closed the two differ by up to the 113 eV in the block above.
+	So a request for a row that is not itself a stored row raises, and the
+	caller learns which k it asked for instead of receiving a plausible
+	wrong matrix.
+
+	In practice the check passes because the rows kept are the
+	first-occurrence members and ``kirr_to_kfull`` names first occurrences
+	too, but "in practice" is not a contract and this is the twin.
+	"""
+	compact = np.asarray(compact_irr)
+	idx = np.asarray(full_bz_indices, dtype=np.int64)
+	if idx.size and (idx.min() < 0 or idx.max() >= compact.size):
+		raise ValueError(
+			f"{what}: full-BZ index out of range for a {compact.size}-k "
+			f"mesh (got min {int(idx.min())}, max {int(idx.max())}).")
+	# The stored rows are the first occurrences, recovered from the table
+	# itself so this function needs no second source of truth.
+	_, first = np.unique(compact, return_index=True)
+	stored_rows = set(int(v) for v in first)
+	bad = sorted({int(i) for i in idx.ravel()} - stored_rows)
+	if bad:
+		raise ValueError(
+			f"{what}: full-BZ k {bad} are not stored rows of this file.  "
+			f"The file keeps one member per star ({len(stored_rows)} of "
+			f"{compact.size}), and returning a DIFFERENT member of the same "
+			f"star in their place is the substitution this format refuses — "
+			f"on a deck whose ISDF quadrature is not orbit-closed those "
+			f"members disagree by eV, not by round-off.  Regenerate "
+			f"sigma_mnk.h5 from a run whose k_irr set matches this consumer.")
+	return compact[idx]
+
+
+def _assert_direct_field_sum(hdir, v_h_scalar, h_transverse, *, where):
+	"""Authenticate ``Hdir = V_H + H_T`` without inventing an I/O route.
+
+	The operands may be numpy arrays, replicated JAX arrays, or globally
+	sharded JAX arrays.  :func:`_slab_to_host` is already this format owner's
+	canonical bridge for exactly that set, so the identity check does not add
+	a direct ``device_get``/all-gather dialect.  The producer deliberately
+	forms ``Hdir`` with this association in output units; equality is exact,
+	not a physics tolerance.
+	"""
+	arrays = (hdir, v_h_scalar, h_transverse)
+	if any(a is None for a in arrays):
+		raise ValueError(
+			f"{where}: component-aware direct fields require the complete "
+			"Hdir/V_H/H_T triple.")
+	shapes = tuple(tuple(np.shape(a)) for a in arrays)
+	if len(set(shapes)) != 1:
+		raise ValueError(
+			f"{where}: Hdir/V_H/H_T shapes disagree: {shapes}.")
+	host = tuple(_slab_to_host(a) for a in arrays)
+	if not all(np.all(np.isfinite(a)) for a in host):
+		raise ValueError(
+			f"{where}: Hdir/V_H/H_T contains non-finite values.")
+	if not np.array_equal(host[0], host[1] + host[2]):
+		raise ValueError(
+			f"{where}: aggregate Hdir is not exactly scalar V_H + "
+			"transverse H_T.")
+
+
+def write_sigma_omega_h5(
+	filepath,
+	sigma_total_kij_ev=None,
+	*,
+	sigma_c_kij_ev=None,
+	sigma_sx_kij_ev=None,
+	hartree_kij_ev=None,
+	hartree_scalar_kij_ev=None,
+	hartree_transverse_kij_ev=None,
+	mesh=None,
+	star=None,
+	star_already_selected=False,
+	omega_reference_ev=None,
+	omega_reference_provenance=None,
+	sigma_regularization=None,
+	eval_energies_rel_ev=None,
+	eval_energies_provenance=None,
+	omega_coverage=None,
+	band_extrapolation=None,
+	band_axis=None,
+	on_shell=None,
+	omega_ev=None,
+	print_fn=None,
+):
+	"""Write the on-shell dynamic Sigma_mnk (or, ``omega_ev``, Sigma_mnk(omega)) to HDF5.
+
+	Datasets:
+	  - sigma_total_kij_ev: (2, nk, nb, nb)            — the pair, large sharded
+	  - sigma_c_kij_ev  (optional): (2, nk, nb, nb)
+	  (omega grid, ``sigma_omega_grid_debug``: ``omega_ev`` (n_omega,) and the
+	  two cubes ``(n_omega, nk, nb, nb)`` in place of the pair)
+	  - sigma_sx_kij_ev (optional): (nk, nb, nb)
+	  - hartree_kij_ev  (optional): (nk, nb, nb)
+	  - hartree_scalar_kij_ev (optional): scalar charge V_H
+	  - hartree_transverse_kij_ev (optional): current H_T
+	  - sigma_c_extrap_*_kn_ev (optional): (nk, nb) — the Σ_c
+	    band-convergence fit, present only when the run extrapolated
+
+	``band_extrapolation``
+	    ``{"arrays": {name: (nk, nb)}, "attrs": {...}}`` from
+	    ``gw.band_extrapolation.spectral_h5_payload``.  Until
+	    2026-08-15 the fitted ``S_inf`` reached NO artifact: a run with the
+	    feature on and one with it off were identical to 8e-15 in every
+	    dataset here while the log reported an 848 meV correction, so the
+	    feature could not be gated, diffed or consumed, and a star-spread
+	    test on this file passed vacuously by measuring the
+	    un-extrapolated cube.  The arrays ride the SAME extraction and
+	    stamp as the cubes rather than being appended raw, so ``S_inf``
+	    and ``sigma_c_kij_ev`` cannot disagree about which k the file
+	    holds.  ``None`` writes exactly the pre-feature file.
+
+	All large writes go through :mod:`file_io.slab_io`, which has one
+	transport (per-rank collective MPI-IO) and no selector.
+
+	``on_shell``
+	    The on-shell layout (``gw.ppm_sigma.OnShellSigma``): the two cubes
+	    are the PAIR ``(2, nk, nb, nb)``, slot 0 Sigma_mn(E_m) and slot 1
+	    Sigma_mn(E_n), stamped ``pair_slots``; no ``omega_ev`` is written.
+	    A dict of host arrays on the logical bands: ``names`` (the tables),
+	    ``energies_rel_ev`` ``(n_table, nk, nb)``, ``diag_ev``
+	    ``(n_table, nk, nb)`` and ``dsigma`` ``(nk, nb)``, written one
+	    ``(nk, nb)`` dataset per table (:data:`ON_SHELL_DIAG_DATASET`,
+	    :data:`ON_SHELL_ENERGIES_DATASET`) through the same k extraction.  The
+	    omega reference is stamped on the ``pair`` energies.
+
+	``star``
+	    ``(irr_idx_k, sym_idx_k, n_sym_spatial)`` — the same triple
+	    ``symmetry_maps.star_tables_of`` returns.  Given it, the k axis of
+	    every array above is EXTRACTED to one row per star before it is
+	    written, the two unfold tables are filed beside the arrays, and
+	    each dataset is stamped so a reader knows what it is holding.
+	    Omitted, the full BZ is written exactly as before and no attr
+	    appears — which is the back-compat direction that matters, since
+	    a dataset with no stamp is read as full-BZ.
+
+	    THE ORDER IS THE RULING, and it is visible in the code below: the
+	    arrays arrive complete, the star-spread statistic is measured on
+	    the COMPLETE arrays, and only then are rows dropped.  Measuring
+	    after the drop would measure nothing — there would be one member
+	    per star left to compare.
+	``star_already_selected``
+	    True only for the SC terminal writer, whose complete retained result
+	    already crossed the map's star-wedge seam.  The rows are validated and
+	    stamped without another selection; per-dataset star-spread attributes
+	    are omitted because the discarded full-BZ members are no longer held.
+
+	``omega_reference_ev`` / ``omega_reference_provenance``
+	    THE ENERGY the tables are MEASURED FROM, and where it came from
+	    ("fixed-N mu" or "midgap").  They are RELATIVE and always were; until this stamp existed the file did not say relative
+	    to WHAT, so every post-hoc consumer had to guess, and
+	    ``gw.eqp_bgw.make_eqp_bgw`` guessed the insulating midgap — a
+	    measured 2.79 eV mis-sampling of Σ_c(ω) on the sodium metal deck
+	    (audit A2).  Optional only so a pre-stamp file still writes; a
+	    metallic consumer REFUSES an unstamped file rather than assume.
+
+	``eval_energies_rel_ev`` / ``eval_energies_provenance``
+	    THE SPECTRUM THIS Σ WAS EVALUATED AT, on the same relative axis as
+	    the tables, and which of the two candidates it is
+	    (:data:`SIGMA_EVAL_AT_E_DFT` / :data:`SIGMA_EVAL_SELF_CONSISTENT`).
+	    A DIFFERENT question from the ω reference, and the one the file did
+	    not answer: ``gw.eqp_bgw.make_eqp_bgw``'s own docstring says
+	    "Nothing in the files distinguishes the two cases, so this function
+	    will not guess", and absent this stamp it then linearizes at E_DFT —
+	    right for a one-shot cube, a different and wrong calculation for a
+	    self-consistent one.  Optional only so a pre-stamp file still
+	    writes; it rides the SAME star extraction as the cubes, so the eval
+	    spectrum and the Σ rows cannot disagree about which k they are.
+
+	``omega_coverage``
+	    A ``gw.dynamic_sigma.OmegaCoverage`` (duck-typed: ``n_uncovered``,
+	    ``fraction_uncovered``, ``policy``).  Stamped on the eval dataset so
+	    a consumer centring on those energies learns how many of them the
+	    cube cannot actually answer for — the Na semicore run wrote 41.3 %
+	    endpoint values as if they were Σ at the state's own energy.
+	"""
+	from .slab_io import SlabIO
+
+	abs_path = os.path.abspath(filepath)
+	if sigma_total_kij_ev is None and sigma_c_kij_ev is None:
+		raise ValueError("write_sigma_omega_h5 requires sigma_total_kij_ev or sigma_c_kij_ev.")
+
+	if sigma_total_kij_ev is not None:
+		shape_ref = tuple(sigma_total_kij_ev.shape)
+	else:
+		shape_ref = tuple(sigma_c_kij_ev.shape)
+	if len(shape_ref) != 4 or (on_shell is not None and shape_ref[0] != 2):
+		raise ValueError("dynamic sigma tensors must have shape (n_omega, nk, nb, nb), "
+		                 "an on-shell pair (2, nk, nb, nb).")
+	name_total, name_c = "sigma_total_kij_ev", "sigma_c_kij_ev"
+	n_slot, nk, nb, nb2 = shape_ref
+	if nb != nb2:
+		raise ValueError("dynamic sigma tensors must be square in band indices.")
+	logical_nb = nb
+	if band_axis is not None:
+		logical_nb = int(band_axis.logical)
+		expected_carrier = int(band_axis.carrier)
+		if nb != expected_carrier:
+			raise ValueError(
+				"write_sigma_omega_h5: Sigma band carrier is "
+				f"{nb}, expected {expected_carrier} for logical extent "
+				f"{logical_nb} and divisor {int(band_axis.divisor)}")
+	storage_shape = (n_slot, nk, logical_nb, logical_nb)
+	component_flags = (
+		hartree_scalar_kij_ev is not None,
+		hartree_transverse_kij_ev is not None,
+	)
+	component_aware = any(component_flags)
+	if component_aware:
+		if not all(component_flags) or hartree_kij_ev is None:
+			raise ValueError(
+				"write_sigma_omega_h5: component-aware direct output requires "
+				"aggregate Hdir, scalar V_H, and transverse H_T together; got "
+				f"Hdir={hartree_kij_ev is not None}, "
+				f"V_H={component_flags[0]}, H_T={component_flags[1]}.")
+		_assert_direct_field_sum(
+			hartree_kij_ev, hartree_scalar_kij_ev,
+			hartree_transverse_kij_ev,
+			where=("retained star-wedge raw Sigma input"
+			       if star_already_selected else "full-BZ raw Sigma input"))
+	receipt_schema = (
+		EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION
+		if component_aware else EQP_ASSEMBLY_SCHEMA_VERSION)
+
+	# sigma_total_kij_ev is derived when not passed: total = c + sx + h.
+	#
+	# THE ASSOCIATION IS ``(c + sx) + h``, and it is the same one
+	# ``gw.ppm_pipeline``'s sharded branch spells out for itself, so the
+	# two write paths agree bit-for-bit rather than to a tolerance.
+	# ``tests/test_sigma_kirr_extraction.py`` pins it.  (The 4.35e-05 eV
+	# the cohsex_debug fixture shows against this sum is NOT reassociation
+	# — every array in that file is a widened float32 — see the block
+	# above.)  This runs BEFORE the extraction so the derived total is the
+	# sum of the full-BZ operands and the extraction of the total equals
+	# the total of the extraction.
+	total = sigma_total_kij_ev
+	if total is None:
+		total = derive_sigma_total(
+			sigma_c_kij_ev, sigma_sx_kij_ev, hartree_kij_ev)
+
+	payload = {
+		name_total: total,
+		name_c: sigma_c_kij_ev,
+		"sigma_sx_kij_ev": sigma_sx_kij_ev,
+		"hartree_kij_ev": hartree_kij_ev,
+		"hartree_scalar_kij_ev": hartree_scalar_kij_ev,
+		"hartree_transverse_kij_ev": hartree_transverse_kij_ev,
+	}
+	# INTO THE SAME PAYLOAD as the cubes: the eval spectrum labels the same
+	# (k, n) the cube's band diagonal does, so it must be extracted to the
+	# same rows by the same table.  Extracting it separately — or not at
+	# all — is how a stamp comes to describe rows the file no longer holds.
+	if eval_energies_rel_ev is not None:
+		payload[SIGMA_EVAL_DATASET] = np.asarray(
+			eval_energies_rel_ev, dtype=np.float64)
+	on_shell_names = ()
+	if on_shell is not None:
+		for i, table in enumerate(on_shell["names"]):
+			e_name = ON_SHELL_ENERGIES_DATASET.format(table=table)
+			d_name = ON_SHELL_DIAG_DATASET.format(table=table)
+			payload[e_name] = np.asarray(on_shell["energies_rel_ev"][i], np.float64)
+			payload[d_name] = np.asarray(on_shell["diag_ev"][i], np.complex128)
+			on_shell_names += (e_name, d_name)
+		payload[ON_SHELL_DSIGMA_DATASET] = np.asarray(on_shell["dsigma"], np.complex128)
+		on_shell_names += (ON_SHELL_DSIGMA_DATASET,)
+	extrap_arrays = dict((band_extrapolation or {}).get("arrays", {}))
+	extrap_attrs = dict((band_extrapolation or {}).get("attrs", {}))
+	# Into the SAME payload, so the extraction, the stamp and the spread
+	# measurement are one code path for the cubes and the fit alike.
+	payload.update(extrap_arrays)
+
+	# The ordering is :func:`extract_and_stamp_k_irr`'s, shared with the
+	# QSGW appender rather than spelled twice.
+	payload, _attrs, compact_irr, sym_idx_k = extract_and_stamp_k_irr(
+		payload, star, omega_ev=(None if on_shell is not None else omega_ev),
+		nk_full=nk, star_already_selected=star_already_selected,
+		on_shell_pairs=None if on_shell is not None else (),
+		print_fn=print_fn)
+	if star is not None:
+		nk = int(np.shape(payload[name_total])[1])
+		storage_shape = (n_slot, nk, logical_nb, logical_nb)
+
+	eval_rel_extracted = payload.pop(SIGMA_EVAL_DATASET, None)
+	on_shell_extracted = {name: payload.pop(name) for name in on_shell_names}
+	total = payload[name_total]
+	sigma_c_kij_ev = payload[name_c]
+	sigma_sx_kij_ev = payload["sigma_sx_kij_ev"]
+	hartree_kij_ev = payload["hartree_kij_ev"]
+	hartree_scalar_kij_ev = payload["hartree_scalar_kij_ev"]
+	hartree_transverse_kij_ev = payload["hartree_transverse_kij_ev"]
+	if component_aware:
+		_assert_direct_field_sum(
+			hartree_kij_ev, hartree_scalar_kij_ev,
+			hartree_transverse_kij_ev, where="file-wedge raw Sigma payload")
+
+	def _band_receipt_attrs(attrs):
+		if band_axis is not None:
+			attrs["band_logical_extent"] = logical_nb
+			attrs["band_carrier_extent"] = int(band_axis.carrier)
+			attrs["band_carrier_divisor"] = int(band_axis.divisor)
+		return attrs
+
+	def _direct_attrs(name, semantics):
+		attrs = _band_receipt_attrs(dict(_attrs(name) or {}))
+		attrs[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
+		attrs[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
+		attrs["direct_field_semantics"] = semantics
+		attrs[DIRECT_FIELD_SUM_RULE_ATTR] = DIRECT_FIELD_SUM_RULE
+		attrs[DIRECT_FIELD_SUM_FULL_BZ_ATTR] = not star_already_selected
+		attrs[DIRECT_FIELD_SUM_STAR_WEDGE_ATTR] = bool(star_already_selected)
+		attrs[DIRECT_FIELD_SUM_FILE_WEDGE_ATTR] = True
+		return attrs
+
+	def _operator_attrs(name):
+		"""k-storage stamps plus the one meaning shared by every raw cube."""
+		at = _band_receipt_attrs(dict(_attrs(name) or {}))
+		at[SIGMA_OPERATOR_STATE_ATTR] = SIGMA_OPERATOR_STATE_RAW
+		at[SIGMA_OPERATOR_STATE_VERSION_ATTR] = SIGMA_OPERATOR_STATE_VERSION
+		return at
+
+	def _operator_storage_shape(values):
+		shape = tuple(int(n) for n in values.shape)
+		return shape[:-2] + (logical_nb, logical_nb)
+
+	with SlabIO(abs_path, mode="w", mesh=mesh) as io:
+		# Creation-time promise, before the later live assemble_eqp append.
+		# If the run stops after this writer closes but before that append, a
+		# reader sees an expected-receipt artifact with no receipt and fails closed.
+		io.write_attr(
+			EQP_ASSEMBLY_EXPECTED_DATASET,
+			np.asarray(receipt_schema, dtype=np.int32),
+		)
+		# The ω axis (the on-shell energies) and its own reference, stamped ON
+		# it — one place to look, and it cannot drift away from the array it
+		# describes.
+		axis_name = OMEGA_DATASET
+		if on_shell is None:
+			io.write_attr("omega_ev", np.asarray(omega_ev, dtype=np.float64))
+		else:
+			axis_name = ON_SHELL_ENERGIES_DATASET.format(table="pair")
+			io.write_attr(SIGMA_EVALUATION_ATTR, np.asarray(b"on_shell"))
+		if omega_reference_ev is not None:
+			io.stamp_dataset_attrs(axis_name, {
+				OMEGA_REFERENCE_ATTR: float(omega_reference_ev),
+				OMEGA_REFERENCE_PROVENANCE_ATTR: str(
+					omega_reference_provenance or "unstated"),
+			})
+		if sigma_regularization is not None:
+			# The EFFECTIVE broadening, from the same resolver the kernel
+			# ran at (``gw.ppm_windows.resolve_sigma_regularization``) --
+			# re-derived from the config here, not threaded, so the two
+			# cannot disagree by construction.
+			io.stamp_dataset_attrs(axis_name, {
+				SIGMA_REGULARIZATION_ATTR:
+					float(sigma_regularization.resolved_ev),
+				SIGMA_REGULARIZATION_REQUESTED_ATTR:
+					float(sigma_regularization.requested_ev),
+				SIGMA_REGULARIZATION_FLOOR_POLICY_ATTR:
+					str(sigma_regularization.floor_policy),
+			})
+		if star is not None:
+			# The tables live in the same file as the arrays they describe.
+			# A table that lives elsewhere is a table that silently decays
+			# when anything upstream is regenerated — kin_ion's words, and
+			# the same reasoning put them beside the slab there.
+			io.write_attr(IRR_IDX_DATASET,
+				np.asarray(compact_irr, dtype=np.int32))
+			io.write_attr(SYM_IDX_DATASET,
+				np.asarray(sym_idx_k, dtype=np.int32))
+		def _cube_attrs(name):
+			at = _operator_attrs(name)
+			if on_shell is not None:
+				at[SIGMA_EVALUATION_ATTR] = "on_shell"
+				at["pair_slots"] = "Sigma_mn(E_m),Sigma_mn(E_n)"
+			return at
+		io.create_dataset(name_total,
+			shape=storage_shape, dtype=np.complex128,
+			attrs=_cube_attrs(name_total))
+		_write_omega_cube(io, name_total, total)
+		del total
+		if sigma_c_kij_ev is not None:
+			io.create_dataset(name_c,
+				shape=storage_shape, dtype=np.complex128,
+				attrs=_cube_attrs(name_c))
+			_write_omega_cube(io, name_c, sigma_c_kij_ev)
+		for name, arr in on_shell_extracted.items():
+			# Energies are real; the diagonals and dSigma/domega complex.
+			dtype = np.float64 if name.startswith("onshell_") else np.complex128
+			at = dict(_attrs(name) or {})
+			at[SIGMA_EVALUATION_ATTR] = "on_shell"
+			io.create_dataset(name, shape=tuple(np.shape(arr)), dtype=dtype, attrs=at)
+			io.write_slab(name, np.asarray(arr, dtype=dtype))
+		if sigma_sx_kij_ev is not None:
+			io.create_dataset("sigma_sx_kij_ev",
+				shape=_operator_storage_shape(sigma_sx_kij_ev),
+				dtype=np.complex128,
+				attrs=_operator_attrs("sigma_sx_kij_ev"))
+			io.write_slab("sigma_sx_kij_ev", sigma_sx_kij_ev)
+		if hartree_kij_ev is not None:
+			io.create_dataset("hartree_kij_ev",
+				shape=_operator_storage_shape(hartree_kij_ev),
+				dtype=np.complex128,
+				attrs=(
+					_operator_attrs("hartree_kij_ev")
+					if hartree_transverse_kij_ev is None else _direct_attrs(
+						"hartree_kij_ev", "V_H_scalar+H_transverse")))
+			io.write_slab("hartree_kij_ev", hartree_kij_ev)
+		if hartree_scalar_kij_ev is not None:
+			io.create_dataset("hartree_scalar_kij_ev",
+				shape=_operator_storage_shape(hartree_scalar_kij_ev),
+				dtype=np.complex128,
+				attrs=_direct_attrs(
+					"hartree_scalar_kij_ev", "V_H_scalar"))
+			io.write_slab("hartree_scalar_kij_ev", hartree_scalar_kij_ev)
+		if hartree_transverse_kij_ev is not None:
+			io.create_dataset("hartree_transverse_kij_ev",
+				shape=_operator_storage_shape(hartree_transverse_kij_ev),
+				dtype=np.complex128,
+				attrs=_direct_attrs(
+					"hartree_transverse_kij_ev", "H_transverse"))
+			io.write_slab(
+				"hartree_transverse_kij_ev", hartree_transverse_kij_ev)
+		if eval_rel_extracted is not None:
+			# The two facts that make this array usable ride ON it: which
+			# spectrum it is, and how much of it the ω grid could answer
+			# for.  A number without either is what the file already had.
+			at = dict(_attrs(SIGMA_EVAL_DATASET) or {})
+			at[SIGMA_EVAL_PROVENANCE_ATTR] = str(
+				eval_energies_provenance or "unstated")
+			if omega_coverage is not None:
+				at[OMEGA_COVERAGE_N_ATTR] = int(
+					getattr(omega_coverage, "n_uncovered", 0))
+				at[OMEGA_COVERAGE_FRAC_ATTR] = float(
+					getattr(omega_coverage, "fraction_uncovered", 0.0))
+				at[OMEGA_COVERAGE_POLICY_ATTR] = str(
+					getattr(omega_coverage, "policy", "unstated"))
+			io.create_dataset(SIGMA_EVAL_DATASET,
+				shape=tuple(np.shape(eval_rel_extracted)),
+				dtype=np.float64, attrs=at)
+			io.write_slab(SIGMA_EVAL_DATASET,
+				np.asarray(eval_rel_extracted, dtype=np.float64))
+		for name in extrap_arrays:
+			arr = payload[name]
+			if arr is None:
+				continue
+			arr = np.asarray(arr)
+			# The run-level facts (band counts, fractions, verdict, any
+			# planner fallback) ride on EVERY one of these datasets, so a
+			# reader that opens one of them alone still learns whether the
+			# number it is holding was trusted.
+			at = dict(_attrs(name) or {})
+			at.update(extrap_attrs)
+			io.create_dataset(name, shape=tuple(arr.shape),
+				dtype=np.complex128,
+				attrs=at)
+			io.write_slab(name, arr)
+	return abs_path
+
+
+
+
+
+
+
+
+
+
+
+
+def _raw_operator_stamp_errors(h5):
+	"""Return ``(present, bad)`` for the exact raw-operator contract."""
+	def _text(value):
+		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+	present = [name for name in SIGMA_RAW_OPERATOR_DATASETS if name in h5]
+	bad = []
+	for name in present:
+		attrs = h5[name].attrs
+		try:
+			version = int(attrs.get(SIGMA_OPERATOR_STATE_VERSION_ATTR, -1))
+		except (TypeError, ValueError):
+			version = -1
+		if (_text(attrs.get(SIGMA_OPERATOR_STATE_ATTR, "missing"))
+				!= SIGMA_OPERATOR_STATE_RAW
+				or version != SIGMA_OPERATOR_STATE_VERSION):
+			bad.append(name)
+	return present, bad
+
+
+def _validate_raw_direct_component_contract(h5, *, required):
+	"""Validate the additive raw Hdir/V_H/H_T layout without loading cubes."""
+	def _text(value):
+		return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+	names = ("hartree_kij_ev",) + SIGMA_DIRECT_COMPONENT_DATASETS
+	companions = tuple(
+		name for name in SIGMA_DIRECT_COMPONENT_DATASETS if name in h5)
+	if not companions and not required:
+		return False
+	present = tuple(name for name in names if name in h5)
+	if present != names:
+		raise ValueError(
+			"partial raw direct-field component layout: expected "
+			f"{names}, found {present}.")
+	shapes = tuple(tuple(h5[name].shape) for name in names)
+	if len(set(shapes)) != 1:
+		raise ValueError(
+			f"raw Hdir/V_H/H_T shapes disagree: {shapes}.")
+	for name in names:
+		attrs = h5[name].attrs
+		if (_text(attrs.get(DIRECT_FIELD_SUM_RULE_ATTR, "missing"))
+				!= DIRECT_FIELD_SUM_RULE
+				or not (bool(attrs.get(DIRECT_FIELD_SUM_FULL_BZ_ATTR, False))
+					or (bool(attrs.get(DIRECT_FIELD_SUM_STAR_WEDGE_ATTR, False))
+						and _text(attrs.get(K_STORAGE_ATTR, "")) == K_STORAGE_IBZ))
+				or not bool(attrs.get(DIRECT_FIELD_SUM_FILE_WEDGE_ATTR, False))):
+			raise ValueError(
+				f"{name} lacks the authenticated input/file-wedge "
+				f"{DIRECT_FIELD_SUM_RULE!r} contract.")
+	return True
+
+
+def append_eqp_assembly_receipt_h5(
+	filepath, *,
+	assembly,
+	file_wedge_full_bz_rows,
+	degeneracy_policy: str,
+	degeneracy_tol_ry: float,
+	print_fn=None,
+):
+	"""Persist one completed ``EqpAssembly`` beside the raw Sigma operators.
+
+	The assembler, not this format owner, produces H/X/C(E_DFT) and the
+	on-shell operand (``eqp_bgw.ON_SHELL_*`` rows; on the omega grid, the conditioned
+	C(omega) curve).  This function validates and transcribes that
+	completed payload; it never accepts independent operand arrays that could
+	drift from what live eqp0/eqp1 used.  The full operator cubes remain raw.
+	Call on rank 0 after collective cube close and after ``assemble_eqp``.
+
+	The k rows come from the caller, not from the file, because two
+	different k-sets meet here.  ``sigma_mnk.h5`` stores the STAR wedge
+	(one row per symmetry orbit, what :func:`extract_and_stamp_k_irr`
+	keeps).  The completed assembly is on the FILE wedge (``wfn.kpoints``,
+	the rows eqp0/eqp1 are written on, which is what
+	:attr:`EQP_ASSEMBLY_FILE_ROWS_ATTR` names).  They have the same length
+	only when nk_red == n_orbits: gnppm_debug is 9 and 5, bispinor_debug 9
+	and 5, cohsex_debug 4 and 3, while si_cohsex_debug, si_bse_debug and
+	hbn_cohsex_debug coincide.  Deriving one from the other refused correct
+	assemblies on the first group until 2026-08-27, and the star map cannot
+	supply the file wedge: it labels each full-BZ k with its orbit and says
+	nothing about which k the WFN stored.
+
+	``file_wedge_full_bz_rows`` is checked, not trusted: one row per
+	assembly row, distinct, in range for the cube's mesh, and every stored
+	star reached by at least one row.  The last is the part with content —
+	a file wedge reaches the whole zone under the group, so an assembly
+	short a star, or on another deck's k-set, fails it.
+	"""
+	abs_path = os.path.abspath(filepath)
+	if not os.path.isfile(abs_path):
+		raise FileNotFoundError(
+			f"append_eqp_assembly_receipt_h5: {abs_path} does not exist; the "
+			"receipt belongs to an existing sigma_mnk.h5 and never creates one.")
+
+	on_shell = assembly.sigma_c_on_shell
+	if assembly.sigma_c_omega_diag_ev is None and on_shell is None:
+		raise ValueError(
+			"a dynamic sigma_mnk.h5 receipt requires an EqpAssembly carrying "
+			"its conditioned C(omega) curve or its on-shell operand.")
+	h = np.asarray(assembly.hartree_diag_ev, dtype=np.float64)
+	x = np.asarray(assembly.sigma_x_diag_ev, dtype=np.float64)
+	c = np.asarray(assembly.sigma_c_at_dft_diag_ev, dtype=np.complex128)
+	if on_shell is not None:
+		# The operand C(E_DFT) and Z came from, in its own (4, nk, nb) form.
+		curve_name = EQP_ASSEMBLY_C_ONSHELL_DATASET
+		curve_candidate = EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET
+		c_omega = np.asarray(on_shell, np.complex128)
+	else:
+		curve_name = EQP_ASSEMBLY_C_OMEGA_DATASET
+		curve_candidate = EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET
+		c_omega = np.asarray(
+			assembly.sigma_c_omega_diag_ev, dtype=np.complex128)
+	h_transverse_obj = getattr(
+		assembly, "hartree_transverse_diag_ev", None)
+	component_aware = h_transverse_obj is not None
+	receipt_schema = (
+		EQP_ASSEMBLY_COMPONENT_SCHEMA_VERSION
+		if component_aware else EQP_ASSEMBLY_SCHEMA_VERSION)
+	h_components = None
+	if component_aware:
+		h_scalar = np.asarray(
+			assembly.hartree_scalar_diag_ev, dtype=np.float64)
+		h_transverse = np.asarray(h_transverse_obj, dtype=np.float64)
+		_assert_direct_field_sum(
+			h, h_scalar, h_transverse,
+			where="component-aware EQP assembly receipt")
+		h_components = np.stack((h_scalar, h_transverse), axis=0)
+	if h.ndim != 2 or x.shape != h.shape or c.shape != h.shape:
+		raise ValueError(
+			"EQP assembly receipt needs matching (nk_file_wedge, nb_window) "
+			f"H/X/C(E_DFT) diagonals; got H {h.shape}, X {x.shape}, C {c.shape}.")
+	if (c_omega.ndim != 3 or c_omega.shape[1:] != h.shape
+			or (on_shell is not None and c_omega.shape[0] != 4)):
+		raise ValueError(
+			"EQP assembly receipt needs the completed assembly's conditioned "
+			f"C(omega) curve with shape (n_omega,{h.shape[0]},{h.shape[1]}) "
+			f"(on shell: (4,...)); got {c_omega.shape}.")
+	if assembly.z_factor is None:
+		raise ValueError(
+			"a dynamic sigma_mnk.h5 receipt requires an EqpAssembly with Z "
+			"derived from its conditioned C(omega) curve or on-shell operand.")
+	b0, b1 = int(assembly.band_offset), int(assembly.band_offset + h.shape[1])
+	if b0 < 0 or b1 <= b0 or h.shape[1] != b1 - b0:
+		raise ValueError(
+			f"EQP assembly receipt band window [{b0},{b1}) has width {b1-b0}, "
+			f"but the arrays have width {h.shape[1]}.")
+	if not all(np.all(np.isfinite(a)) for a in (h, x, c, c_omega)):
+		raise ValueError(
+			"EQP assembly receipt refuses non-finite H/X/C/C(omega) diagonals.")
+	policy = str(degeneracy_policy)
+	if policy not in EQP_ASSEMBLY_DEGENERACY_POLICIES:
+		raise ValueError(
+			f"unknown EQP degeneracy policy {policy!r}; expected one of "
+			f"{EQP_ASSEMBLY_DEGENERACY_POLICIES}.")
+	tol_ry = float(degeneracy_tol_ry)
+	if not np.isfinite(tol_ry) or tol_ry < 0.0:
+		raise ValueError(
+			"EQP degeneracy tolerance must be finite and non-negative; got "
+			f"{degeneracy_tol_ry!r}.")
+	c_basis = EQP_ASSEMBLY_DFT_BAND_BASIS
+
+	values = np.stack((h, x, c), axis=0)
+	with open_scope(
+			abs_path, STACK_H5PY, "r",
+			where="append_eqp_assembly_receipt_h5 star-map read"):
+		star = read_star_map(abs_path, "sigma_c_kij_ev", k_axis=1)
+		with h5py.File(abs_path, "r") as raw_h5:
+			nk_raw = int(raw_h5["sigma_c_kij_ev"].shape[1])
+	file_rows = np.asarray(file_wedge_full_bz_rows, dtype=np.int64)
+	if file_rows.ndim != 1 or file_rows.shape != (h.shape[0],):
+		raise ValueError(
+			"EQP assembly receipt file-wedge rows: got shape "
+			f"{file_rows.shape}, want one full-BZ row index per assembly k "
+			f"row, i.e. ({h.shape[0]},).  Fix: pass the same reduction the "
+			"assembly's rows came from, "
+			"symmetry_maps.reduce_full_bz_to_file_wedge(sym, arange(nk_full)), "
+			"never a table the writer holds separately.")
+	if file_rows.size and (int(file_rows.min()) < 0
+			or np.unique(file_rows).size != file_rows.size):
+		raise ValueError(
+			"EQP assembly receipt file-wedge rows must be distinct "
+			f"non-negative full-BZ indices; got {file_rows.tolist()}.")
+	# The mesh the cube's tables describe: without a star map the cube is
+	# the full BZ, with one the tables are (nk_full,).
+	compact = None if star is None else np.asarray(star[0])
+	nk_full = nk_raw if compact is None else int(compact.size)
+	if file_rows.size and int(file_rows.max()) >= nk_full:
+		raise ValueError(
+			"EQP assembly receipt file-wedge row "
+			f"{int(file_rows.max())} is out of range for the "
+			f"{nk_full}-k mesh {os.path.basename(abs_path)} describes; the "
+			"assembly and the cube are not from the same run.")
+	if compact is not None:
+		covered = np.unique(compact[file_rows])
+		if covered.size != nk_raw:
+			raise ValueError(
+				"EQP assembly receipt k-set does not cover the raw cube: "
+				f"{file_rows.size} file-wedge rows reach {covered.size} of "
+				f"the {nk_raw} stars {os.path.basename(abs_path)} stores "
+				f"(stars {covered.tolist()}).  Every stored star must be the "
+				"orbit of at least one row.  Fix: assemble on the run's own "
+				"wfn.kpoints set.")
+	with open_scope(
+			abs_path, STACK_H5PY, "a",
+			where="append_eqp_assembly_receipt_h5"), \
+			h5py.File(abs_path, "a") as h5:
+		present, bad = _raw_operator_stamp_errors(h5)
+		if not present:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} contains none of "
+				f"{list(SIGMA_CUBE_DATASETS)}; refusing to attach an EQP receipt "
+				"to a file that is not a sigma_mnk.h5 artifact.")
+		expected = (h5[EQP_ASSEMBLY_EXPECTED_DATASET][()]
+			if EQP_ASSEMBLY_EXPECTED_DATASET in h5 else None)
+		if expected is None:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} has no "
+				f"{EQP_ASSEMBLY_EXPECTED_DATASET!r} creation marker. Legacy "
+				"sigma_mnk.h5 files cannot be upgraded because they do not "
+				"authenticate a live G-space Hartree build; rerun gw_jax.")
+		else:
+			try:
+				expected_version = int(expected)
+			except (TypeError, ValueError):
+				expected_version = -1
+		if expected is not None and expected_version != receipt_schema:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} expects EQP receipt schema "
+				f"{expected!r}; this writer only appends schema "
+				f"{receipt_schema} for this payload.")
+		if expected is not None and bad:
+			raise ValueError(
+				f"{os.path.basename(abs_path)} has partial/unknown raw operator "
+				f"state on {bad}; refusing to append schema "
+				f"{receipt_schema}.")
+		raw_components = _validate_raw_direct_component_contract(
+			h5, required=component_aware)
+		if raw_components != component_aware:
+			raise ValueError(
+				f"schema-v{receipt_schema} receipt/component mismatch: raw "
+				f"component-aware={raw_components}, assembly "
+				f"component-aware={component_aware}.")
+		if not component_aware:
+			foreign_components = [name for name in (
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET,
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET)
+				if name in h5]
+			if foreign_components:
+				raise ValueError(
+					"schema-v5 charge-only append refuses component receipt "
+					f"datasets {foreign_components}.")
+		candidate_names = [
+				EQP_ASSEMBLY_CANDIDATE_DATASET,
+				EQP_ASSEMBLY_C_OMEGA_CANDIDATE_DATASET,
+				EQP_ASSEMBLY_C_ONSHELL_CANDIDATE_DATASET]
+		if component_aware:
+			candidate_names.append(
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET)
+		for name in candidate_names:
+			if name in h5:
+				del h5[name]
+		ds = h5.create_dataset(EQP_ASSEMBLY_CANDIDATE_DATASET, data=values)
+		h5.create_dataset(curve_candidate, data=c_omega)
+		if component_aware:
+			h5.create_dataset(
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET,
+				data=h_components)
+		ds.attrs[EQP_ASSEMBLY_SCHEMA_VERSION_ATTR] = receipt_schema
+		ds.attrs[EQP_ASSEMBLY_STATE_ATTR] = EQP_ASSEMBLY_STATE_READY
+		ds.attrs[EQP_ASSEMBLY_HX_BASIS_ATTR] = EQP_ASSEMBLY_DFT_BAND_BASIS
+		ds.attrs[EQP_ASSEMBLY_C_BASIS_ATTR] = c_basis
+		ds.attrs[EQP_ASSEMBLY_K_STORAGE_ATTR] = EQP_ASSEMBLY_K_STORAGE_WEDGE
+		ds.attrs[EQP_ASSEMBLY_FILE_ROWS_ATTR] = file_rows
+		ds.attrs[EQP_ASSEMBLY_HARTREE_STATE_ATTR] = (
+			EQP_ASSEMBLY_HARTREE_STATE_LIVE_GSPACE)
+		ds.attrs[EQP_ASSEMBLY_BAND_START_ATTR] = b0
+		ds.attrs[EQP_ASSEMBLY_BAND_STOP_ATTR] = b1
+		ds.attrs[EQP_ASSEMBLY_DEGENERACY_POLICY_ATTR] = policy
+		ds.attrs[EQP_ASSEMBLY_DEGENERACY_TOL_ATTR] = tol_ry
+		h5.flush()
+		canonical_names = [
+			EQP_ASSEMBLY_DATASET,
+			EQP_ASSEMBLY_C_OMEGA_DATASET,
+			EQP_ASSEMBLY_C_ONSHELL_DATASET]
+		if component_aware:
+			canonical_names.append(EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET)
+		for name in canonical_names:
+			if name in h5:
+				del h5[name]
+		h5.move(EQP_ASSEMBLY_CANDIDATE_DATASET, EQP_ASSEMBLY_DATASET)
+		h5.move(curve_candidate, curve_name)
+		if component_aware:
+			h5.move(
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_CANDIDATE_DATASET,
+				EQP_ASSEMBLY_HARTREE_COMPONENTS_DATASET)
+		h5.flush()
+
+	if print_fn is not None:
+		component_text = (
+			" + authenticated scalar V_H/transverse H_T"
+			if component_aware else "")
+		print_fn(
+			f"  EQP assembly receipt -> {os.path.basename(abs_path)}: "
+			f"schema v{receipt_schema}, assembled H/X/C(E_DFT) {h.shape} "
+			f"+ conditioned {'on-shell C' if on_shell is not None else 'C(omega)'} "
+			f"{c_omega.shape}, DFT H/X/C, "
+			f"file wedge, {policy}, "
+			f"live G-space H{component_text}; C(E_DFT) and Z share the "
+			"conditioned curve")
+	return abs_path
+
+
+
+
+# ===========================================================================
+# THE OPT-IN PLOTTING PAYLOAD — the QSGW Σ_xc cube and the QP ladders
+# ===========================================================================
+# These four datasets had NO PRODUCER between 2026-04-11 (``Rewrite
+# QP/output section``, which deleted the block that wrote them together
+# with a pile of genuinely dead code) and this commit; they survived only
+# in ``tests/regression/cohsex_debug/sigma_mnk.h5``, which is why the
+# k_irr landing found their names in :data:`SIGMA_K_AXIS` with nothing on
+# the other end.  The owner's ruling restores them: gated by the deck,
+# default off, "a lot of people will want to plot that".
+#
+# WHY AN APPEND AND NOT A LONGER ``write_sigma_omega_h5`` SIGNATURE.  On
+# the one-shot path the file is written INSIDE
+# ``gw.ppm_pipeline.compute_ppm_sigma_pipeline`` (its step 5), and the
+# QSGW cube does not exist yet at that moment — ``build_qsgw_sigma_xc``
+# runs after the pipeline returns, in ``gw.sigma_dispatch``.  The QP
+# ladders are later still: two of the three need ``kin_ion``, which the Σ
+# dispatch never sees.  Widening the writer's signature would mean
+# holding the whole ω-cube back until the last of its companions existed,
+# which is the opposite of what the single-write consolidation bought.
+# So each producer writes at its own seam, and they all come through here.
+#
+# THE FILE, NOT THE CALLER, DECIDES THE k SET.  This function reads its
+# own storage from the cube datasets already in it (via
+# ``kin_ion.read_star_map``) instead of taking a ``star`` argument.  That
+# is not tidiness: a caller-supplied triple that disagreed with the file
+# would produce a HETEROGENEOUS artifact — some datasets on the wedge and
+# some on the full BZ, all of them shaped plausibly — and no reader in the
+# tree checks across datasets.  Reading the file also means every refusal
+# ``read_star_map`` already owns (a truncated slab, tables of the wrong
+# length, an unknown version, a storage value that is neither legal one)
+# guards the append too, with no second copy of any of them here.
+
+
+def append_qsgw_datasets_h5(
+	filepath, payload, *, star_already_selected=False, print_fn=None,
+):
+	"""Add the QSGW / QP-ladder datasets to an existing ``sigma_mnk.h5``.
+
+	Parameters
+	----------
+	filepath
+		An existing ``sigma_mnk.h5``.  This function never CREATES one:
+		the datasets describe a Σ that file already holds, and a file with
+		only the appendix in it would answer ``sigma_c_kij_ev`` with a
+		``KeyError`` where today's consumers get an honest
+		``FileNotFoundError``.
+	payload
+		``name → array`` for any subset of :data:`QSGW_PLOT_DATASETS`.
+		Arrays ordinarily arrive on the full BZ.  With
+		``star_already_selected=True`` they arrive on the SC map's retained
+		star wedge and are stamped without a second selection.  A ``None``
+		value is skipped, which is how a mode that did not build a quantity
+		says so.
+	print_fn
+		Rank-0 print.  Gets the spread lines and one summary naming every
+		dataset written.
+
+	Returns the list of dataset names actually written.
+
+	CALL THIS ON RANK 0 ONLY, with a barrier after — h5py is a
+	single-writer library and every array here is replicated (the QSGW
+	cube is forced replicated by ``qsgw_utils.build_qsgw_sigma_xc``'s
+	final ``with_sharding_constraint``; the ladders are host eigenvalues).
+	There is no sharded slab to write, so ``SlabIO``'s collective
+	transport would buy nothing and would make the write impossible on any
+	box without ``liblorrax_ffi``.
+	"""
+	abs_path = os.path.abspath(filepath)
+	if not os.path.isfile(abs_path):
+		raise FileNotFoundError(
+			f"append_qsgw_datasets_h5: {abs_path} does not exist.  These "
+			f"datasets are an APPENDIX to sigma_mnk.h5 and this function "
+			f"does not create one; a run whose compute mode writes no Σ_c(ω) "
+			f"cube has nowhere to put them.")
+
+	payload = {k: v for k, v in payload.items() if v is not None}
+	if not payload:
+		return []
+
+	# The file's OWN k storage, learned from a dataset it was created with.
+	with h5py.File(abs_path, "r") as h5:
+		present = [n for n in SIGMA_CUBE_DATASETS if n in h5]
+		omega_ev = (np.asarray(h5["omega_ev"][()])
+		            if "omega_ev" in h5 else None)
+		nk_stored = (int(h5[present[0]].shape[SIGMA_K_AXIS[present[0]]])
+		             if present else 0)
+	if not present:
+		raise ValueError(
+			f"append_qsgw_datasets_h5: {os.path.basename(abs_path)} holds "
+			f"none of {list(SIGMA_CUBE_DATASETS)}, so it is not a "
+			f"sigma_mnk.h5 and its k storage cannot be read off it.  "
+			f"Refusing to append rather than guessing the k axis.")
+	ref = present[0]
+	star = read_star_map(abs_path, ref, k_axis=SIGMA_K_AXIS[ref])
+	nk_full = int(np.asarray(star[0]).size) if star is not None else nk_stored
+
+	# Same ordering as the creating writer, same function: measure on the
+	# complete arrays, then drop.
+	payload, attrs_for, _, _ = extract_and_stamp_k_irr(
+		payload, star, omega_ev=omega_ev, nk_full=nk_full,
+		on_shell_pairs=None if omega_ev is None else (),
+		star_already_selected=star_already_selected, print_fn=print_fn)
+	if star is None:
+		for name, arr in payload.items():
+			nk_seen = int(np.shape(arr)[SIGMA_K_AXIS[name]])
+			if nk_seen != nk_stored:
+				raise ValueError(
+					f"{name}: axis {SIGMA_K_AXIS[name]} has {nk_seen} rows "
+					f"but {os.path.basename(abs_path)} stores {nk_stored} on "
+					f"the full BZ ({ref}).  Appending a dataset on a "
+					f"different k set would make one file mean two things.")
+
+	written = []
+	with h5py.File(abs_path, "a") as h5:
+		for name in QSGW_PLOT_DATASETS:
+			if name not in payload:
+				continue
+			arr = np.asarray(payload[name])
+			arr = arr.astype(np.complex128 if np.iscomplexobj(arr)
+			                 else np.float64)
+			# Rewritten, not merged: a rerun in the same directory must
+			# leave the stamp and the values describing THIS run.
+			if name in h5:
+				del h5[name]
+			ds = h5.create_dataset(name, data=arr)
+			for key, val in (attrs_for(name) or {}).items():
+				ds.attrs[key] = val
+			written.append(name)
+	if print_fn is not None and written:
+		print_fn(
+			f"  QSGW plot datasets -> {os.path.basename(abs_path)}: "
+			+ ", ".join(written)
+			+ (f" (k_irr, {nk_full} -> {nk_stored} rows)" if star is not None
+			   else f" (full BZ, {nk_stored} rows)"))
+	return written

@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minimax"
+version = "0.1.0"
+description = "Minimax quadrature rules for LORRAX frequency kernels, solved at run time with provenance and refusals"
+requires-python = ">=3.12"
+
+# THE QUARANTINE, DECLARED.  numpy is the only import-time dependency.
+# scipy is NOT an install-time dependency: it is reached only from
+# `minimax.solver` (the crossing and imaginary-axis solvers) and the other
+# lazy builders, imported when a rule that needs it is requested.  The
+# noncrossing solver (`minimax.levelled`) is numpy-only.  The
+# `services/minimax/tests/test_minimax_import_isolation.py` cell MEASURES
+# that rather than asserting it.
+#
+# NOT depended on, deliberately: jax.  Unlike `vcoul`, `import minimax` never
+# touches jax at all — the whole service is host float64 arithmetic,
+# and the complex128 `MinimaxNodes` pytree that jax cares about stays in
+# `gw.minimax_screening`, which is what keeps this package jax-free.  That is
+# the SERVICE_FORM.md:12 pin ("stdlib-only at import time, jax lazy") arriving
+# by extraction rather than by engineering: `common/__init__.py` was dragging
+# jax in behind `common.minimax`'s back, and the package boundary removed it.
+#
+# NOT depended on, deliberately: lxkit.  minimax owns no `.so`, probes no
+# device and counts no processes; there is no capability gate to share.
+# `lxkit.testing` is a TEST-time dependency (the import-isolation cell), which
+# is what the `test` extra is for.
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+# The scipy-backed solvers, imported lazily when a rule needs them.
+solve = ["scipy>=1.16.0", "mpmath>=1.3"]
+test = ["pytest>=8.0.0", "numpy", "scipy>=1.16.0", "lxkit"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The SAME two markers the monorepo registers.  Declared in both places on
+# purpose: `pytest services/minimax/tests` from the monorepo root picks THIS
+# file as its rootdir config (it is the nearest pyproject.toml above the
+# argument), so a service that only registered them upstairs emits
+# PytestUnknownMarkWarning on exactly the invocation the charter calls its
+# standalone one.
+markers = [
+    "services: a standalone service's own suite, staged into the main one",
+    "minimax: the minimax service suite",
+    "slow: an integration guard that plans or fits a production-sized problem — correct, kept, and deselected from the default run because it costs tens of seconds where the rest of this suite costs tenths",
+]
+# The default run is the DEVELOPER LOOP and is meant to stay under ~10 s, so a
+# wrong edit is caught while it is still being typed.  `-m slow` runs the
+# integration guards; the monorepo census runs everything either way (it sets
+# its own addopts and does not inherit this line).
+addopts = "-m 'not slow'"

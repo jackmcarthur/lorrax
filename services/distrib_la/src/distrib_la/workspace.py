@@ -1,0 +1,371 @@
+"""Query-only dense workspace accounting; no matrix/workspace allocation."""
+from functools import lru_cache
+import ctypes
+import operator
+
+import numpy as np
+
+from distrib_la.resolve import ONE_DEVICE, mesh_platform
+from lxkit import device_vendor
+
+
+def _shapes(shapes):
+    try:
+        result = tuple(tuple(operator.index(n) for n in shape) for shape in shapes)
+    except (TypeError, ValueError) as ex:
+        raise ValueError('shapes must be a tuple of operand shape tuples') from ex
+    if not result or any(not s or min(s) < 1 for s in result):
+        raise ValueError('workspace shapes must have positive extents')
+    return result
+
+
+@lru_cache(maxsize=None)      # one native call per (context, op, sizes, dtype) for the process
+def _vendor_query(ctx, op, sizes, dtype):
+    from distrib_la.loader import get_lib
+    lib = get_lib('CUDA')
+    name = 'lrx_eigh_workspace_bytes'
+    if op == 'eigh' and len(sizes) == 2:
+        # (side, block): the descriptor the distributed solve runs at. A
+        # library without the block query prices one tile per rank at that side.
+        name = 'lrx_eigh_workspace_bytes_block'
+        if not hasattr(lib, name):
+            name, sizes = 'lrx_eigh_workspace_bytes', sizes[:1]
+    if not hasattr(lib, name):
+        raise RuntimeError(f'workspace query requires a native build exporting {name}')
+    fn = getattr(lib, name)
+    fn.argtypes = ([ctypes.c_int64]*(1+len(sizes)) + [ctypes.c_int]
+                   + [ctypes.POINTER(ctypes.c_uint64)]*2)
+    fn.restype = ctypes.c_int
+    device, host = ctypes.c_uint64(), ctypes.c_uint64()
+    rc = fn(ctx, *sizes, int(np.dtype(dtype).kind == 'c'),
+            ctypes.byref(device), ctypes.byref(host))
+    if rc:
+        raise RuntimeError(f'{name} failed with status={rc}, sizes={sizes}, local={ctx == 0}')
+    return int(device.value), int(host.value)
+
+
+@lru_cache(maxsize=128)
+def _local_gemm_temp(shapes, dtype, device):
+    """Compile the local batched matmul shape, without executing/allocating it."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import SingleDeviceSharding
+    sh = SingleDeviceSharding(device)
+    fn = jax.jit(jnp.matmul, in_shardings=(sh, sh), out_shardings=sh)
+    args = tuple(jax.ShapeDtypeStruct(s, np.dtype(dtype), sharding=sh) for s in shapes)
+    memory = fn.lower(*args).compile().memory_analysis()
+    if memory is None:
+        raise RuntimeError('local GEMM compiler did not return workspace accounting')
+    return int(memory.temp_size_in_bytes)
+
+
+# Off CUDA every dense route is an XLA program (host LAPACK eigh, XLA dot),
+# whose scratch the compiler allocates and counts; no vendor workspace sits
+# outside it, so the query answers zero device bytes.
+_XLA_MANAGED = dict(device_bytes=0, host_bytes=0, vendor_device_bytes=None,
+                    dynamic_xla_scratch_bytes=0, local=True,
+                    formula='non-CUDA mesh: XLA-managed scratch', provider='XLA')
+
+
+def _workspace_details(plan, op, shapes, dtype):
+    """Internal receipt producer; the public contract returns device bytes."""
+    import jax
+    from distrib_la.plan import Plan, ROUTE_BATCH_RESHARD
+    from distrib_la.matmul_plan import GemmPlan
+    from distrib_la._cusolvermp import get_or_init_context
+    if not isinstance(plan, (Plan, GemmPlan)):
+        raise TypeError('workspace query requires a resolved distrib_la Plan or GemmPlan')
+    shapes = _shapes(shapes)
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype('float64'), np.dtype('complex128')):
+        raise TypeError('workspace query supports float64 and complex128')
+    if mesh_platform(plan.mesh) != 'CUDA':
+        return _XLA_MANAGED
+    px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
+    # one_device (the size route) runs each matrix whole on one device with the native
+    # kernel: a local workspace, held_per_rank copies per round (the one-device formula).
+    one_device = isinstance(plan, Plan) and plan.backend == ONE_DEVICE
+    local = isinstance(plan, Plan) and (plan.is_native or one_device or (
+        (op != 'eigh' or len(shapes[0]) == 3)
+        and plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD))
+    if op == 'eigh':
+        if not isinstance(plan, Plan) or plan.op != 'eigh':
+            raise ValueError('eigh query requires an eigh Plan')
+        if (len(shapes) != 1 or len(shapes[0]) not in (2, 3)
+                or shapes[0][-2] != shapes[0][-1]):
+            raise ValueError('eigh shapes must be ((n,n),) or ((batch,n,n),)')
+        n = shapes[0][-1]
+        if plan.n is not None and plan.n != n:
+            raise ValueError('eigh shape differs from the planned n')
+        if not local and (n % px or n % py):
+            raise ValueError('eigh shape must tile the plan mesh')
+        if not local and plan.backend != 'cusolvermp':
+            raise ValueError('distributed eigh workspace query supports cusolvermp only')
+        ctx = 0 if local else get_or_init_context(plan.mesh)
+        side = n
+        if local:
+            from distrib_la.plan import local_eigh_workspace
+            device, host = local_eigh_workspace(n, dtype, 'CUDA'), 0
+        else:
+            from distrib_la._cusolvermp import solve_layout
+            side, block = solve_layout(n, px)
+            device, host = _vendor_query(ctx, op, (side, block), dtype.str)
+        # Local kernels need an info integer in addition to vendor work.
+        # Mp info is persistent context state, not per-operation scratch.
+        # A native auto route executes the whole batch, and route (c) its
+        # ceil(b/P) local rows, in one batched call; reserve one vendor
+        # workspace/info per member rather than assume serial reuse.
+        batch = int(shapes[0][0]) if local and len(shapes[0]) == 3 else 1
+        if one_device:
+            from distrib_la._one_device import held_per_rank
+            from distrib_la import resolve as _resolve
+            bound = _resolve.one_device_max_n('eigh', _resolve.mesh_platform(plan.mesh),
+                                              plan.budget_bytes) or n
+            copies = held_per_rank(batch, n, px * py, _resolve.one_device_round_n(
+                'eigh', _resolve.mesh_platform(plan.mesh), bound))
+        else:
+            copies = (-(-batch // (px * py))
+                      if plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
+        scratch = copies*(device + (4 if local else 0))
+        checked = 0
+        if not local:
+            # A distributed eigh is checked and retried inside the program
+            # (distrib_la._result_check): its XLA temporaries, and the gathered
+            # retry's replicated copies where the plan admits one.
+            from distrib_la.plan import CHECKED_EIGH_TILES, _gathered_admitted, _gathered_bytes
+            checked = CHECKED_EIGH_TILES * (n * n // (px * py)) * dtype.itemsize
+            if side > n:
+                # The padded operand and the padded vectors before the slice.
+                checked += 2 * (side * side // (px * py)) * dtype.itemsize
+            if _gathered_admitted((n, n), dtype, plan.budget_bytes):
+                checked += _gathered_bytes((n, n), dtype)
+        scratch += checked
+        return dict(device_bytes=scratch, host_bytes=host,
+                    vendor_device_bytes=device if local else None,
+                    native_device_bytes=device,
+                    dynamic_xla_scratch_bytes=scratch,
+                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes are the aligned vendor workspace (ABI 10: the solver destroys an aliased XLA copy of the operand, within checked); checked = CHECKED_EIGH_TILES n^2/P (+ 2 N^2/P at a padded solve side N, + the gathered retry: 2 n^2 and the heevd workspace, when admitted)',
+                    checked_device_bytes=checked,
+                    copies=copies,
+                    provider=('cusolverDn (one_device)' if one_device else 'cusolverDn')
+                    if local else 'cusolverMp')
+    if op not in ('gemm', 'matmul'):
+        raise ValueError('workspace op must be eigh or gemm')
+    if (len(shapes) != 2 or len(shapes[0]) not in (2, 3)
+            or len(shapes[1]) != len(shapes[0])
+            or shapes[0][:-2] != shapes[1][:-2]
+            or shapes[0][-1] != shapes[1][-2]):
+        raise ValueError('GEMM shapes must be matching N,N matrix or batched operand shapes')
+    m, k, n = shapes[0][-2], shapes[0][-1], shapes[1][-1]
+    batch = shapes[0][0] if len(shapes[0]) == 3 else 1
+    if isinstance(plan, GemmPlan) and ((m,k,n,batch) != (plan.m,plan.k,plan.n,plan.nq)
+                                        or dtype != np.dtype(plan.dtype)):
+        raise ValueError('GEMM shape/dtype differs from its plan')
+    if any(v % axis for v, axis in ((m,px),(k,px),(k,py),(n,py))):
+        raise ValueError('GEMM shapes must tile the plan mesh')
+    return _gemm_workspace_details(plan.mesh, shapes, dtype, local=local,
+        backend=plan.backend,
+        ctx_handle=plan.ctx_handle if isinstance(plan, GemmPlan) else None)
+
+
+def _gemm_workspace_details(mesh, shapes, dtype, *, local, backend, ctx_handle=None):
+    """Shared query implementation for planned and eager GEMM routes."""
+    import jax
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    m, k, n = shapes[0][-2], shapes[0][-1], shapes[1][-1]
+    batch = shapes[0][0] if len(shapes[0]) == 3 else 1
+    if local:
+        nb = (batch+px*py-1)//(px*py)
+        local_shapes = ((nb,m,k),(nb,k,n))
+        device = _local_gemm_temp(local_shapes, dtype.str, jax.local_devices()[0])
+        return dict(device_bytes=device, host_bytes=0, vendor_device_bytes=None,
+                    dynamic_xla_scratch_bytes=0, local=True,
+                    formula='compiled local batched matmul temp_size_in_bytes (workspace upper bound)',
+                    provider='XLA local GEMM')
+    # Every distributed GEMM is distrib_la.panel_matmul: XLA-managed, no vendor workspace.
+    return dict(device_bytes=0, host_bytes=0, vendor_device_bytes=0,
+                dynamic_xla_scratch_bytes=0, local=False,
+                formula='panel_matmul: XLA-managed panels, no vendor workspace',
+                provider='panel_matmul')
+
+
+def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
+                                    batched_route='batch_reshard'):
+    """Query the actual eager matmul route, independently of any eigh plan.
+
+    ``shapes`` are effective N,N rank-2/3 operand shapes after any endpoint
+    transpose; ``dtype`` is float64/complex128. Returns device workspace
+    bytes per rank (0 on a non-CUDA mesh: XLA-managed). Operand transpose staging and output storage are not
+    workspace and must be admitted separately by the caller.
+    """
+    from distrib_la.matmul import resolve_matmul_backend
+    from distrib_la.plan import ROUTE_BATCH_RESHARD
+    shapes = _shapes(shapes)
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype('float64'), np.dtype('complex128')):
+        raise TypeError('workspace query supports float64 and complex128')
+    if mesh_platform(mesh) != 'CUDA':
+        return 0
+    if (len(shapes) != 2 or len(shapes[0]) not in (2, 3)
+            or len(shapes[1]) != len(shapes[0])
+            or shapes[0][:-2] != shapes[1][:-2]
+            or shapes[0][-1] != shapes[1][-2]):
+        raise ValueError('GEMM shapes must be matching N,N matrix or batched operand shapes')
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    m, k, n = shapes[0][-2], shapes[0][-1], shapes[1][-1]
+    if any(v % axis for v, axis in ((m,px),(k,px),(k,py),(n,py))):
+        raise ValueError('GEMM shapes must tile the plan mesh')
+    route = str(batched_route).strip().lower()
+    provider = resolve_matmul_backend(backend, mesh, batched_route=route)
+    return int(_gemm_workspace_details(mesh, shapes, dtype,
+        local=route == ROUTE_BATCH_RESHARD, backend=provider)['device_bytes'])
+
+
+def _local_kernel_workspace(mesh, op, shapes, dtype):
+    """Workspace of the device-local kernel that route (c) runs, per rank.
+
+    eigh: the local vendor query (cuSolverDn syevd) on CUDA; on host meshes the
+    LAPACK ``?heevd``/``?syevd`` optimal workspace, which is a closed formula
+    (complex: lwork = 2n + n^2, lrwork = 1 + 5n + 2n^2, liwork = 3 + 5n; real:
+    lwork = 1 + 6n + 2n^2, liwork = 3 + 5n). gemm: the compiled local batched
+    matmul temporary. Route (c) solves a rank's local rows (the leading
+    extent of the first shape) in one batched eigh, so eigh reserves one
+    workspace per local row.
+    """
+    import jax
+    if op == 'eigh':
+        n = max(s[-1] for s in shapes)
+        rows = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
+        from distrib_la.plan import local_eigh_workspace
+        cuda = any(device_vendor(d) == 'cuda' for d in mesh.devices.flat)
+        return rows * local_eigh_workspace(n, dtype, 'CUDA' if cuda else 'other')
+    if op in ('gemm', 'matmul'):
+        return _local_gemm_temp(tuple(shapes[:2]), dtype.str, jax.local_devices()[0])
+    raise ValueError('fits_local op must be eigh or gemm')
+
+
+def fits_local(plan, op, shapes, dtype, budget_bytes, batch=None) -> bool:
+    """Whether one rank holds the caller's live set and the local kernel's workspace.
+
+    Parameters
+    ----------
+    plan : Plan or GemmPlan
+        Supplies the mesh (platform decides which workspace model applies).
+    op : {'eigh', 'gemm'}
+        The local kernel route (c) or a batch-layout operand runs.
+    shapes : tuple of tuples
+        The caller's whole per-rank live set of dense operands, e.g.
+        ``((local_batch, n, n),) * 2`` for an eigh input and its vectors, or
+        eight ``(1, R, R)`` blocks for a pencil reduction. Complete matrices,
+        not face tiles: this is the fit-on-one-device question.
+    dtype : numpy dtype
+        float64 or complex128.
+    budget_bytes : int
+        Device bytes per rank the caller admits for this stage. Pass a value
+        every rank agrees on (a deck budget), never a per-rank measurement:
+        the answer selects collectives.
+    batch : int, optional
+        The caller's whole stack count. Below the rank count the batch layout
+        pads every rank to a whole matrix with ``P - batch`` of them idle, so it
+        fits only within ``GATHERED_EIGH_BYTES`` (``distrib_la.plan.place``).
+
+    Returns
+    -------
+    bool
+        ``sum(prod(shape)) * itemsize + workspace <= budget_bytes``.
+    """
+    shapes = _shapes(shapes)
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype('float64'), np.dtype('complex128')):
+        raise TypeError('fits_local supports float64 and complex128')
+    budget = operator.index(budget_bytes)
+    live = sum(int(np.prod(s)) for s in shapes) * dtype.itemsize
+    if batch is not None and int(batch) < plan.mesh.devices.size:
+        from distrib_la.plan import GATHERED_EIGH_BYTES
+        budget = min(budget, GATHERED_EIGH_BYTES)
+    try:
+        workspace = int(_local_kernel_workspace(plan.mesh, op, shapes, dtype))
+    except RuntimeError:            # a shape the vendor cannot size is no local candidate
+        return False
+    return live + workspace <= budget
+
+
+def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
+    """Return a dense-plan device workspace bound without solving (0 off CUDA).
+
+    Parameters
+    ----------
+    plan : Plan or GemmPlan
+        Resolved dense policy and actual mesh. A Plan also supplies its
+        local/distributed policy for N,N GEMM. All ranks query collectively
+        when the native context has not yet been initialized.
+    op : {'eigh', 'gemm'}
+        Dense operation. Eigh includes eigenvectors; GEMM shapes describe
+        operands after the service's device transpose/adjoint staging.
+    shapes : tuple of tuples
+        ((n,n),) or ((batch,n,n),) for eigh; ((m,k),(k,n)) or matching
+        batched shapes for GEMM. No operand arrays are accepted or retained.
+    dtype : numpy dtype
+        float64 or complex128.
+
+    Returns
+    -------
+    int
+        Device bytes per rank for operation workspace. Mp eigh's dynamic
+        XLA ScratchAllocator allocation is exactly the native query result:
+        aligned vendor workspace plus one private input tile. Host workspace and persistent
+        context/communicator resources are separate (see WORKSPACE.md).
+        GEMM workspace persists: budget its maximum across planned calls
+        plus the largest concurrent eigh scratch. Local GEMM uses a
+        compiler temporary-byte upper bound, without executing the kernel.
+        Context/handle setup and compiler metadata may allocate resources;
+        the query allocates no matrix, result or queried workspace buffer.
+    """
+    return int(_workspace_details(plan, op, shapes, dtype)['device_bytes'])
+
+
+#: cuSOLVERMp 0.9.1's LU device workspace per matrix (getrf, getrs at nrhs = n chunked under its
+#: 2 GiB cap, and the pivots), in local panels of (n/Px + mb) * nb elements: 9.64-11.16 measured
+#: on 2x2 A100 (lrx_lu_workspace_bytes, n 4096-16384 one tile per rank, 20000-30000 block 250;
+#: 2026-10-19), the maximum taken. 4x4 unmeasured.
+CUSOLVERMP_LU_PANELS = 11.2
+
+
+def lu_workspace_bytes(mesh, n, dtype) -> int:
+    """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system against n right-hand
+    sides allocates beside its operands (cudaMallocAsync, outside XLA's pool), per matrix, at the
+    blocks it solves at (``lu_blocks``): :data:`CUSOLVERMP_LU_PANELS` local panels. Shapes only:
+    no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL communicator
+    split) per call, which deadlocked a rank in libfabric's memory hooks (run30k, 2026-10-19)."""
+    from distrib_la._cusolvermp import lu_blocks
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    mb, nb = lu_blocks(int(n), px, py)
+    return int(CUSOLVERMP_LU_PANELS * (int(n) // px + mb) * nb * np.dtype(dtype).itemsize)
+
+
+def eigh_stack_bytes(plan, shape, dtype) -> int:
+    """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
+    its operand, priced as :func:`distrib_la.plan.place` prices it: on route (c) its program
+    (``_stack_price``) and the leg's batched eigh workspace (at most one fixed tile); on the whole
+    mesh one solve (``_mesh_price``) beside the other matrices' vector faces and the values.
+    Shapes only: every rank computes the same figure.
+    """
+    from distrib_la.plan import (BATCH_EIGH_TILES, ROUTE_BATCH_RESHARD, _gathered_admitted,
+                                 _mesh_price, _stack_price)
+    nb, n = int(shape[0]), int(shape[-1])
+    ranks = int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
+    item = np.dtype(dtype).itemsize
+    if plan.batched_route == ROUTE_BATCH_RESHARD:
+        from distrib_la.local_eigh import batched_workspace_bytes
+        return (_stack_price('eigh', plan.mesh, nb, n, dtype, 1,
+                             _gathered_admitted((n, n), dtype, plan.budget_bytes))
+                + batched_workspace_bytes((-(-nb // ranks), n, n), dtype, mesh_platform(plan.mesh)))
+    if plan.backend == ONE_DEVICE:
+        # Whole matrices per rank, in the route's bounded rounds.
+        from distrib_la._one_device import held_per_rank
+        from distrib_la import resolve as _resolve
+        bound = _resolve.one_device_max_n("eigh", _resolve.mesh_platform(plan.mesh),
+                                          plan.budget_bytes) or n
+        return held_per_rank(nb, n, ranks, _resolve.one_device_round_n(
+            "eigh", _resolve.mesh_platform(plan.mesh), bound)) * BATCH_EIGH_TILES * n * n * item
+    return -(-(nb - 1) * n * n * item // ranks) + nb * n * 8 + _mesh_price(n, dtype, ranks)

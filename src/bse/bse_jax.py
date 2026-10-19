@@ -1,0 +1,673 @@
+"""BSE JAX entry points and CLI wrappers."""
+from __future__ import annotations
+
+import os
+
+# THE startup call (runtime module docstring) before any jax-collective
+# code: env defaults (x64), jax.distributed (the ring matvec uses
+# lax.psum/ppermute on the 2D mesh, which is silent-wrong if processes
+# don't agree on a shared distributed runtime), CPU fallback, the run's
+# clique-warmed square ('x','y') mesh, compile cache, rank-0 report.
+# MUST run before this module's own `import jax`.  ``create_mesh_2d()``
+# below returns this same startup mesh (plus the BSE-specific
+# process_allgather warm-up bse_ring_comm documents).
+from runtime import debug_print, initialize_communicator_stack
+RUNTIME = initialize_communicator_stack(print_fn=debug_print)
+
+import jax
+
+import common.timing as timing
+from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
+from common.preprocessing_output import ScientificProductionReport
+from common.progress import LoopProgress
+from common.scientific_output import policy
+from common.units import RYD_TO_EV
+from runtime.run_session import RunSession
+
+from .bse_ring_comm import (
+    build_bse_ring_matvec_full,
+    create_mesh_2d,
+    create_mesh_xy_from_flags,
+    make_bse_shardings,
+)
+from .bse_preconditioner import compute_pair_amplitude
+from file_io.restart_bundle import (_find_restart_file)
+from .bse_lanczos import (
+    simple_lanczos_eig,
+    iters_reported,
+)
+from .bse_io import write_eigenvectors_stream
+
+__all__ = [
+    "build_bse_ring_matvec_full",
+    "compute_pair_amplitude",
+    "create_mesh_2d",
+    "make_bse_shardings",
+    "simple_lanczos_eig",
+]
+
+
+#: The report's major-stage table: ``(label, timing sections...)``.
+_STAGES = (
+    ("restart input", "bse.load"),
+    ("BSE eigensolve", "bse.eigensolve"),
+    ("exciton dipoles", "bse.exciton_dipoles"),
+    ("eigenvector write", "bse.write_eigenvectors"),
+)
+
+
+def _preview_lanczos(
+    input_file: str,
+    n_val: int,
+    n_cond: int,
+    n_eig: int = 5,
+    write_eigs: int | None = None,
+    dipole_file: str | None = None,
+    max_lanczos_iter: int | None = None,
+    include_W: bool = True,
+    eqp_file: str | None = None,
+    n_occ: int | None = None,
+    block_size: int = 1,
+    rtol: float = 0.0,
+    check_every: int = 4,
+    n_reorth: int = -1,
+    solver_kind: str = "lanczos",
+    davidson_m_max: int | None = None,
+    davidson_precond: str = "bare",
+    davidson_olsen: bool = False,
+    davidson_eps_shift: float | None = None,
+    trlan_m_max: int | None = None,
+    trlan_n_keep: int | None = None,
+    tda: bool = True,
+    degeneracy_mode: str = DEFAULT_MODE,
+    degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
+    report=None,
+    stage_progress=None,
+) -> dict:
+    restart_file = _find_restart_file(input_file)
+    # ONE solve path on any mesh (1x1 included): the sharded loader and
+    # ``solve_bse_sharded`` on the trial-stack matvec.  The single-device
+    # ``solve_bse`` / ``bse_serial`` twin was deleted with C10 (2026-09-24).
+    _htransform_rank_records = []
+    _htransform_quality_records = []
+
+    # Sharded ring matvec — parallelises (μ,ν) and avoids per-iter
+    # 3D-FFT of W_q (precomputes W_R once outside the Lanczos loop).
+    from .bse_io import load_bse_data_from_restart_sharded
+    from .bse_lanczos import solve_bse_sharded
+    mesh_xy = create_mesh_2d()
+    # n_occ-aware band split: load_bse_data_from_restart_sharded
+    # auto-detects valence by ``mean_enk < fermi_energy``; user-given
+    # n_occ replaces that detection identically to _load_ring_subset.
+    # We pass fermi_energy=0.0 (default) and rely on enk_full's reference.
+    with timing.section("bse.load", announce=True,
+                        label="restart load (psi, W_q, V_q0)"):
+        data = load_bse_data_from_restart_sharded(
+            restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
+            input_file=input_file, n_occ=n_occ,
+            degeneracy_mode=degeneracy_mode,
+            degeneracy_tol_ry=degeneracy_tol_ry,
+            htransform_rank_record_fn=_htransform_rank_records.append,
+            htransform_quality_record_fn=(
+                _htransform_quality_records.append),
+            eqp_file=eqp_file,
+        )
+        grid_x, grid_y = mesh_xy.devices.shape
+        # EQP override on enk_full (BGW eqp1.dat semantics).  A bse_k_grid
+        # bundle took the QP energies inside its htransform; re-slicing the
+        # coarse restart here would put coarse ε on the fine k axis.
+        n_occ_eqp = None
+        if eqp_file is not None and not data["densified"]:
+            # Re-slice the band window on the eqp-corrected energies. Uses the
+            # loader-CLAMPED band counts (data['n_val']/data['n_cond']), not the
+            # raw CLI n_val/n_cond, so an over-request can't slice out of bounds.
+            from .bse_io import apply_eqp_and_reslice_bands
+            data["eps_v"], data["eps_c"], n_occ_eqp = apply_eqp_and_reslice_bands(
+                restart_file, eqp_file, input_file,
+                int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x,
+                grid_y, degeneracy_mode=degeneracy_mode,
+                degeneracy_tol_ry=degeneracy_tol_ry)
+    if report is not None:
+        for receipt in _htransform_rank_records:
+            report.spectral_compression(
+                receipt,
+                title="BSE-grid htransform spectral compression")
+        for receipt in _htransform_quality_records:
+            report.htransform_quality(
+                receipt,
+                title="BSE-grid htransform interpolation quality")
+    if stage_progress is not None:
+        stage_progress.step()
+    nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
+    nk = nkx * nky * nkz
+    nc_pad = int(data["n_cond_pad"])
+    nv_pad = int(data["n_val_pad"])
+    # The window this run is ACTUALLY solving, read off the loader — which
+    # clamped the request to what the file holds and then, under an
+    # explicit ``--band-degeneracy snap``, may have widened it outward past
+    # a cut multiplet.  Everything downstream that needs to name
+    # bands uses these, never the ``n_val``/``n_cond`` arguments: those are
+    # the request, and the request is stale the moment the guard fires.
+    n_val_eff = int(data["n_val"])
+    n_cond_eff = int(data["n_cond"])
+    bse_dim = nc_pad * nv_pad * nk
+    print(f"BSE problem (sharded {grid_x}x{grid_y}): "
+          f"{nc_pad} cond × {nv_pad} val × {nk} k = {bse_dim} dim")
+    if max_lanczos_iter is None:
+        max_lanczos_iter = max(30, min(200, bse_dim // 2))
+    # ``max_lanczos_iter`` is the *total* Krylov dimension upper
+    # bound; block path divides by block_size.
+    block_max_iter = max(1, max_lanczos_iter // max(1, block_size))
+    mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
+            if rtol > 0 else "fixed")
+    if block_size > 1:
+        print(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
+              f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
+    else:
+        print(f"Lanczos [{mode}]: ≤ {block_max_iter} iterations")
+    # Resolve full-reorth sentinel (-1) to the actual Krylov depth.
+    n_reorth_eff = block_max_iter if n_reorth < 0 else n_reorth
+    # ONE row for the eigensolve — compile + every Krylov iteration.  It
+    # is the number worth comparing across decks, and the only honest way
+    # to say "the BSE solve cost X" (the matvec itself runs
+    # block_max_iter x block_size times and must NOT be timed per call).
+    with timing.section("bse.eigensolve", announce=True,
+                        label=f"{solver_kind} eigensolve") as _sec:
+        eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
+            data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
+            include_W=include_W, block_size=block_size,
+            rtol=rtol, check_every=check_every, n_reorth=n_reorth_eff,
+            solver_kind=solver_kind, tda=tda,
+            davidson_m_max=davidson_m_max,
+            davidson_eps_shift_Ry=(davidson_eps_shift
+                if davidson_eps_shift else 1e-3),
+            davidson_precond=davidson_precond,
+            davidson_olsen=davidson_olsen,
+            trlan_m_max=trlan_m_max, trlan_n_keep=trlan_n_keep,
+        )
+        _sec.watch(eigenvalues, eigenvectors)
+    # Fixed-iteration routes return N_ITER_NOT_MEASURED; only the
+    # convergence-driven route (rtol > 0) reports a real count.  Going
+    # through the helper is what keeps the sentinel out of arithmetic.
+    n_done = iters_reported(n_iter_done, block_max_iter)
+    if rtol > 0:
+        tag = "Block Lanczos" if block_size > 1 else "Lanczos"
+        print(f"{tag} exited at iter {n_done}/{block_max_iter} "
+              f"(Krylov dim = {n_done * block_size})")
+    if stage_progress is not None:
+        stage_progress.step()
+    ryd2ev = 13.6056980659
+    print(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
+    print(f"Lowest {n_eig} eigenvalues (eV): {eigenvalues * ryd2ev}")
+
+    eigenvalues_host = jax.device_get(eigenvalues).real
+    if report is not None:
+        report.bands((
+            f"BSE valence    : {int(n_val_eff)} bands below the occupied boundary",
+            f"BSE conduction : {int(n_cond_eff)} bands above the occupied boundary",
+            f"Transition size: {int(bse_dim)} padded basis states; "
+            f"{int(n_val_eff * n_cond_eff * nk)} physical",
+            f"Requested roots: {int(n_eig)}",
+        ))
+        report.heading("Exciton spectrum")
+        report.emit("  state       energy (eV)")
+        for index, value in enumerate(eigenvalues_host[:n_eig], start=1):
+            report.emit(f"  S{index:03d}  "
+                        f"{float(value) * ryd2ev:15.5f}")
+
+    if write_eigs is not None:
+        n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
+        dipoles = None
+        if dipole_file is not None:
+            # ⟨0|r̂_α|S⟩ per written state: the dipole.h5 Haydock seeds from
+            # (``psp.get_dipole_mtxels``), sliced to the RESOLVED window with the
+            # n_occ the loader and ``--eqp`` settled on, contracted against the
+            # solve's distributed eigenvectors in state blocks (no gather).
+            from file_io.restart_bundle import load_dipole_h5, read_metadata
+            from .absorption_common import (build_dipole_vector_bse,
+                                            exciton_dipoles_distributed,
+                                            slice_dipole_to_bse_window)
+            from .bse_io import resolve_n_occ
+            from .bse_window import _parse_wfn_path
+            n_occ_dip = (n_occ_eqp if n_occ_eqp is not None else resolve_n_occ(
+                read_metadata(restart_file)["energies"], n_occ=n_occ,
+                input_file=input_file))
+            with timing.section("bse.exciton_dipoles", announce=True):
+                dipole_cart, deltaE, _ = load_dipole_h5(
+                    dipole_file, wfn_path=_parse_wfn_path(input_file))
+                d_alpha, _ = slice_dipole_to_bse_window(
+                    dipole_cart, deltaE, n_occ_dip, n_val_eff, n_cond_eff)
+                del dipole_cart, deltaE
+                dipoles = exciton_dipoles_distributed(
+                    eigenvectors, build_dipole_vector_bse(
+                        d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
+                    n_write)
+        with timing.section("bse.write_eigenvectors", announce=True):
+            write_eigenvectors_stream(
+                "eigenvectors.h5",
+                eigenvalues,
+                eigenvectors,
+                n_val_eff,
+                n_cond_eff,
+                nkx,
+                nky,
+                nkz,
+                n_write,
+                use_tda=tda,
+                dipoles=dipoles,
+            )
+
+    if stage_progress is not None:
+        stage_progress.step()
+        stage_progress.finish()
+
+    return {
+        "n_val": int(n_val_eff),
+        "n_cond": int(n_cond_eff),
+        "nk": int(nk),
+        "bse_dim": int(bse_dim),
+        "restart_file": str(restart_file),
+        "eigenvector_file": "eigenvectors.h5" if write_eigs is not None else None,
+    }
+
+
+
+def build_parser():
+    """The BSE CLI.  Below the startup call: ``--band-degeneracy`` takes its
+    choices from ``common.band_degeneracy`` (tests/test_cli_help_seam.py)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(allow_abbrev=False, description="BSE JAX entry point")
+    parser.add_argument("-i", "--input", help="COHSEX input file (for canonical isdf_tensors_*.h5 lookup)")
+    parser.add_argument("--n-val", type=int, default=4)
+    parser.add_argument("--n-cond", type=int, default=4)
+    parser.add_argument("--band-degeneracy", choices=MODES,
+                        default=DEFAULT_MODE,
+                        help="what to do when --n-val/--n-cond cut a "
+                             "degenerate multiplet: 'strict' (the default "
+                             "since 2026-08-10) refuses and names the counts "
+                             "that would work; 'snap' widens the window "
+                             "OUTWARD to the multiplet boundary and says so; "
+                             "'off' proceeds on the cut multiplet.  A widened "
+                             "window is a different calculation, so widening "
+                             "is opt-in.  Same guard, same defaults as "
+                             "bse.exciton_bands.")
+    parser.add_argument("--degeneracy-tol-ry", type=float,
+                        default=DEGENERACY_TOL_RY, dest="degeneracy_tol_ry",
+                        help="'same multiplet' tolerance in Ry (default 1 meV)")
+    parser.add_argument("--px", type=int, default=None,
+                        help="mesh rows; default = the run's square startup "
+                             "mesh")
+    parser.add_argument("--py", type=int, default=None,
+                        help="mesh columns; must equal --px, and px*py must "
+                             "be the job's device count")
+    parser.add_argument("--n-eig", type=int, default=5)
+    parser.add_argument("--feast-n-lanczos", type=int, default=10, help="Lanczos steps for FEAST bounds.")
+    parser.add_argument("--feast-buffer", type=float, default=0.05, help="Emax buffer fraction for FEAST windows.")
+    parser.add_argument("--feast-n-quad1", type=int, default=4, help="Quadrature points for FEAST iteration 1.")
+    parser.add_argument("--feast-n-quad2", type=int, default=8, help="Quadrature points for FEAST iteration 2+.")
+    parser.add_argument("--feast-quadrature", type=str, default="ellipse",
+                        choices=["zolotarev", "ellipse"],
+                        help="Quadrature type for FEAST filter (default: ellipse).")
+    parser.add_argument(
+        "--feast-units-ev-per-ry",
+        type=float,
+        default=13.6056980659,
+        help="Energy conversion Ry -> eV for FEAST report.",
+    )
+    parser.add_argument("--feast-ritz-count", type=int, default=4, help="Ritz values per window.")
+    parser.add_argument("--gmres-max-iter", type=int, default=10, help="GMRES iterations per shift.")
+    parser.add_argument("--gmres-tol", type=float, default=1e-2, help="GMRES relative tolerance.")
+    parser.add_argument("--gmres-seed", type=int, default=0, help="GMRES random seed.")
+    parser.add_argument("--gmres-fp32", action="store_true",
+                        help="Use FP32 data/GMRES for shifted solves.")
+    parser.add_argument("--tda", action="store_true",
+                        help="Use Tamm-Dancoff approximation (TDA). Default is full non-TDA.")
+    parser.add_argument("--rpa", action="store_true",
+                        help="Use RPA kernel (D+V only), skip W0 term entirely.")
+    parser.add_argument("--bse", action="store_true",
+                        help="Use full BSE kernel (D+V-W). Overrides default RPA.")
+    parser.add_argument("--kpm-window-count", type=int, default=4,
+                        help="Number of KPM-derived windows for FEAST.")
+    parser.add_argument("--lanczos", action="store_true", help="Run Lanczos preview + timing instead of FEAST.")
+    parser.add_argument(
+        "--feast-window1",
+        nargs=2,
+        metavar=("A", "B"),
+        help="Override FEAST window 1 bounds in eV (use 'auto' for B).",
+    )
+    parser.add_argument(
+        "--feast-window2",
+        nargs=2,
+        metavar=("A", "B"),
+        help="Override FEAST window 2 bounds in eV (use 'auto' for B).",
+    )
+    parser.add_argument(
+        "--write-eigs",
+        nargs="?",
+        const=-1,
+        type=int,
+        help="Write eigenvectors.h5 (optional N, default: n-eig).",
+    )
+    parser.add_argument(
+        "--dipole", default=None, metavar="DIPOLE_H5",
+        help="with --write-eigs (TDA): contract each written state against "
+             "this dipole.h5 (psp.get_dipole_mtxels, the file "
+             "absorption_haydock reads) and store <0|r|S> as "
+             "exciton_data/dipoles in eigenvectors.h5")
+    parser.add_argument(
+        "--report-file", default=None,
+        help="human-readable Lanczos report (default: bse.out)")
+    parser.add_argument(
+        "--max-lanczos-iter",
+        type=int,
+        default=None,
+        help="Lanczos iterations for eigensolve (default: auto-scale with problem size). "
+             "When --block-size > 1, this is total Krylov dimension (= block iters × block_size).",
+    )
+    parser.add_argument(
+        "--block-size",
+        type=int,
+        default=1,
+        help="Block-Lanczos block size (default 1 = single-vector Lanczos). "
+             "Larger blocks → larger per-call GEMMs and fewer host dispatches.",
+    )
+    parser.add_argument(
+        "--lanczos-rtol",
+        type=float,
+        default=0.0,
+        help="Convergence threshold on Ritz-eigenvalue change between checks. "
+             "0 (default) = fixed --max-lanczos-iter iterations, no early exit. "
+             ">0 enables ``lax.while_loop`` Lanczos that exits when the lowest "
+             "n-eig Ritz values stabilise within rtol (block-Lanczos only).",
+    )
+    parser.add_argument(
+        "--lanczos-check-every",
+        type=int,
+        default=4,
+        help="Convergence check cadence in block iterations (default 4).",
+    )
+    parser.add_argument(
+        "--n-reorth",
+        type=int,
+        default=-1,
+        help="Lanczos partial-reorthogonalisation window. -1 (default) "
+             "= full reorth (= max_lanczos_iter); essential for highly "
+             "degenerate spectra (e.g. spinor BSE) so Ritz vectors stay "
+             "orthogonal across the full Krylov basis. Smaller windows "
+             "(e.g. 10) give ghost eigenvalues that destroy per-state "
+             "oscillator strengths, and since 2026-08-08 they are no "
+             "longer even faster: the batched reorth route "
+             "(solvers.lanczos, cgs2) costs 2*max_iter collectives "
+             "whatever the window. There is no speed reason to narrow "
+             "this.",
+    )
+    parser.add_argument(
+        "--solver",
+        choices=("lanczos", "davidson", "trlan"),
+        default="lanczos",
+        help="Eigensolver. ``lanczos`` (default) for fast spectrum-shape "
+             "convergence (ε₂(ω)). ``davidson`` for tight per-state "
+             "eigenvector convergence using diagonal (E_c−E_v) "
+             "preconditioner — better for individual-state oscillator "
+             "strengths in densely-packed band-edge spectra. ``trlan`` for "
+             "thick-restart Lanczos: the same Krylov convergence as "
+             "``lanczos`` from a basis capped at --trlan-m-max slots instead "
+             "of --max-lanczos-iter slots, which is what makes the solve fit "
+             "at production bse_dim. Costs extra matvecs for the cap.",
+    )
+    parser.add_argument(
+        "--davidson-precond", choices=("bare", "exact", "auto"),
+        default="bare",
+        help="Davidson preconditioner diagonal. ``bare`` (default) divides by "
+             "the transition energy dE = E_c - E_v. ``exact`` divides by the "
+             "assembled diag(H) = dE + (V_x - W_d)/nk, which is what "
+             "BerkeleyGW hands PRIMME; it is assembled once per payload and "
+             "the per-iteration cost is identical to the bare route. ``auto`` "
+             "chooses between them on the transition-space dimension, at the "
+             "crossover in bse_davidson_helpers.EXACT_PRECOND_AUTO_MIN_DIM -- "
+             "which is a placeholder awaiting a large-deck measurement, not a "
+             "measured value.",
+    )
+    parser.add_argument(
+        "--davidson-olsen", action="store_true",
+        help="Davidson: Olsen-correct the preconditioned direction (project "
+             "out its component along the current Ritz vector). Two batched "
+             "inner products per iteration. This is what makes a SMALL "
+             "--davidson-eps-shift safe.",
+    )
+    parser.add_argument(
+        "--davidson-eps-shift", type=float, default=None,
+        help="Davidson: preconditioner regularisation in Ry. Default 1e-3 "
+             "(= 13.6 meV).",
+    )
+    parser.add_argument(
+        "--davidson-m-max", type=int, default=None,
+        help="Davidson: max subspace dimension before restart. Default "
+             "10*n_eig (measured knee). Memory is 2*m_max trial vectors, "
+             "because Davidson stores V and HV.",
+    )
+    parser.add_argument(
+        "--trlan-m-max", type=int, default=None,
+        help="Thick-restart Lanczos: basis slots (the memory cap). "
+             "Default max(3*n_eig, 60). The useful range is 3-5x n_eig.",
+    )
+    parser.add_argument(
+        "--trlan-n-keep", type=int, default=None,
+        help="Thick-restart Lanczos: Ritz vectors retained across a restart. "
+             "Default n_eig+10. Must satisfy n_eig <= n_keep < m_max.",
+    )
+    parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
+    parser.add_argument("--kpm-n-moments", type=int, default=100, help="Chebyshev moments M for KPM.")
+    parser.add_argument("--kpm-n-random", type=int, default=4, help="Stochastic trace vectors R for KPM.")
+    parser.add_argument("--kpm-n-lanczos", type=int, default=100, help="Lanczos steps for KPM spectral bounds.")
+    parser.add_argument("--kpm-emin-ev", type=float, default=None, help="Override KPM E_min (eV).")
+    parser.add_argument("--kpm-emax-ev", type=float, default=None, help="Override KPM E_max (eV).")
+    parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
+    parser.add_argument("--eqp", type=str, default=None, help="Path to BGW eqp1.dat for QP corrections.")
+    parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
+    return parser
+
+
+#: Retired flags refuse by name rather than as an unrecognised argument.
+_RETIRED_FLAGS = {
+    "--ring-timing": ("its timed ring-matvec arm was deleted 2026-08-08; "
+                      "time the jitted matvec with common.timing instead"),
+}
+
+#: The flags each route reads, beyond the ones every route reads.  A flag
+#: set away from its default on a route that does not read it refuses by
+#: name: the default FEAST route used to drop --eqp, --n-eig, --n-occ and
+#: the solver flags silently, so a QP run came back on DFT energies.
+_COMMON_DESTS = {"input", "n_val", "n_cond", "px", "py", "rpa", "bse", "tda",
+                 "lanczos", "kpm_dos"}
+_ROUTE_DESTS = {
+    "feast": {
+        "feast_n_lanczos", "feast_buffer", "feast_n_quad1", "feast_n_quad2",
+        "feast_quadrature", "feast_units_ev_per_ry", "feast_ritz_count",
+        "gmres_max_iter", "gmres_tol", "gmres_seed", "gmres_fp32",
+        "kpm_window_count", "kpm_n_moments", "kpm_n_random", "kpm_n_lanczos",
+        "feast_window1", "feast_window2"},
+    "kpm": {
+        "kpm_n_moments", "kpm_n_random", "kpm_n_lanczos", "kpm_window_count",
+        "kpm_plot_file", "kpm_emin_ev", "kpm_emax_ev"},
+    "lanczos": {
+        "n_eig", "write_eigs", "report_file", "max_lanczos_iter", "block_size",
+        "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
+        "davidson_precond", "davidson_olsen", "davidson_eps_shift",
+        "davidson_m_max", "trlan_m_max", "trlan_n_keep", "eqp", "n_occ",
+        "band_degeneracy", "degeneracy_tol_ry", "dipole"},
+}
+
+
+def parse_args(argv=None):
+    """``(route, args)``: strict parsing, retired and route-ignored flags refused."""
+    import sys
+    parser = build_parser()
+    raw = list(sys.argv[1:] if argv is None else argv)
+    for flag, why in _RETIRED_FLAGS.items():
+        if flag in raw:
+            parser.error(f"{flag} is retired: {why}")
+    args = parser.parse_args(raw)
+    if args.input is None:
+        parser.error("Default run requires -i/--input.")
+    route = ("kpm" if args.kpm_dos else "lanczos" if args.lanczos
+             else "feast")
+    ignored = sorted(
+        "--" + dest.replace("_", "-") for dest, value in vars(args).items()
+        if dest not in _COMMON_DESTS | _ROUTE_DESTS[route]
+        and value != parser.get_default(dest))
+    if ignored:
+        parser.error(
+            f"{', '.join(ignored)} {'is' if len(ignored) == 1 else 'are'} not "
+            f"read by the {route} route and would be ignored; drop "
+            f"{'it' if len(ignored) == 1 else 'them'} or choose the route "
+            f"that reads {'it' if len(ignored) == 1 else 'them'} (--lanczos "
+            f"for the eigensolve with QP energies and eigenvectors, "
+            f"--kpm-dos for the density of states, neither for FEAST)")
+    if args.dipole is not None and (args.write_eigs is None or not args.tda):
+        parser.error("--dipole stores per-state dipoles beside the written "
+                     "eigenvectors: it needs --write-eigs and --tda (the "
+                     "full-BSE oscillator strength needs both halves of the "
+                     "paired vector)")
+    return route, args
+
+
+def main(argv=None) -> int:
+    route, args = parse_args(argv)
+
+    # Omitted --px/--py = the run's canonical square mesh, not 1x1.  A shape
+    # that is not the job's refuses here, above every route, and the FEAST
+    # and KPM routes are handed the resolved shape.
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
+    use_tda = args.tda
+    use_rpa = args.rpa or not args.bse
+
+    if route == "kpm":
+        from . import bse_kpm
+        bse_kpm.run(bse_kpm.settings(
+            args.input, n_val=args.n_val, n_cond=args.n_cond, px=args.px,
+            py=args.py, n_moments=args.kpm_n_moments,
+            n_random=args.kpm_n_random, n_lanczos=args.kpm_n_lanczos,
+            n_windows=args.kpm_window_count, plot_file=args.kpm_plot_file,
+            rpa=use_rpa, tda=use_tda, emin_ev=args.kpm_emin_ev,
+            emax_ev=args.kpm_emax_ev))
+        return 0
+
+    if route == "feast":
+        from . import bse_feast
+        bse_feast.run(bse_feast.settings(
+            args.input, n_val=args.n_val, n_cond=args.n_cond, px=args.px,
+            py=args.py, n_lanczos=args.feast_n_lanczos,
+            buffer=args.feast_buffer, n_quad1=args.feast_n_quad1,
+            n_quad2=args.feast_n_quad2, quadrature=args.feast_quadrature,
+            units_ev_per_ry=args.feast_units_ev_per_ry, feast_ritz=True,
+            feast_ritz_count=args.feast_ritz_count,
+            gmres_max_iter=args.gmres_max_iter, gmres_tol=args.gmres_tol,
+            gmres_seed=args.gmres_seed, gmres_fp32=args.gmres_fp32,
+            rpa=use_rpa, tda=use_tda, windows_kpm=True,
+            windows_kpm_count=args.kpm_window_count,
+            kpm_n_moments=args.kpm_n_moments,
+            kpm_n_random=args.kpm_n_random, kpm_seed=args.gmres_seed,
+            kpm_n_energy_pts=2000, kpm_n_lanczos=args.kpm_n_lanczos,
+            window1=args.feast_window1, window2=args.feast_window2))
+        return 0
+
+    # Non-TDA (full BSE) now flows through the same preview via the
+    # ``solve_bse_sharded(tda=False)`` dispatch -> ``bse_nontda`` (structure-
+    # preserving definite-pencil / product solve).  TDA stays the default.
+    report_path = os.path.abspath(args.report_file or "bse.out")
+    with RunSession(RUNTIME, "bse", ScientificProductionReport, report_path,
+                    stages=_STAGES, driver_name="bse.bse_jax",
+                    calculation_name="Bethe-Salpeter eigensolve") as run:
+        report = run.report
+        report.begin(input_file=args.input)
+        report.architecture(mesh_role="BSE transition axes X x Y")
+        include_w = not (args.rpa or not args.bse)
+        report.pathways((
+            "Hamiltonian    : " + (
+                "Tamm-Dancoff Hermitian BSE" if use_tda else
+                "full resonant-antiresonant BSE"),
+            "Interaction    : " + (
+                "D + V - W (screened direct term; authenticated stored W0 "
+                "or a direct static RPA rebuild)" if include_w else
+                "D + V (RPA kernel; screened direct term omitted)"),
+            f"Eigensolver    : {args.solver}; block size={int(args.block_size)}; "
+            f"requested roots={int(args.n_eig)}",
+            "Iteration mode : " + (
+                f"relative convergence {float(args.lanczos_rtol):.5e}, "
+                f"checked every {int(args.lanczos_check_every)} iterations"
+                if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
+            "Matvec route   : trial-stack (bse_stack_matvec)",
+            f"Band boundary  : {args.band_degeneracy}; "
+            f"tolerance={float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.5f} meV",
+        ))
+
+        from .bse_window import _parse_wfn_path
+        from wfn_loader import WfnLoader
+        wfn_path = _parse_wfn_path(args.input)
+        wfn = WfnLoader(wfn_path, mesh=RUNTIME.mesh)
+        sym = wfn.symmetry()
+        report.environment(wfn=wfn, lines=(
+            "Transition data: distributed band and centroid blocks on X x Y",
+            "Eigensolve path: " + policy(
+                args.solver, ("lanczos", "davidson", "trlan")),
+            "Eigenvectors   : " + (
+                "written to a separate numerical artifact"
+                + (" with per-state dipoles <0|r|S>" if args.dipole else "")
+                if args.write_eigs is not None else "not requested"),
+        ))
+        report.sampling(wfn=wfn, sym=sym)
+        stage_progress = LoopProgress(
+            3, report.progress, title="BSE eigensolve",
+            item_name="major stage", max_updates=3)
+        stage_progress.start()
+
+        result = _preview_lanczos(
+            args.input,
+            args.n_val,
+            args.n_cond,
+            n_eig=args.n_eig,
+            write_eigs=args.write_eigs,
+            dipole_file=args.dipole,
+            max_lanczos_iter=args.max_lanczos_iter,
+            include_W=not (args.rpa or not args.bse),
+            eqp_file=args.eqp,
+            n_occ=args.n_occ,
+            block_size=args.block_size,
+            rtol=args.lanczos_rtol,
+            check_every=args.lanczos_check_every,
+            n_reorth=args.n_reorth,
+            solver_kind=args.solver,
+            davidson_m_max=args.davidson_m_max,
+            davidson_precond=args.davidson_precond,
+            davidson_olsen=args.davidson_olsen,
+            davidson_eps_shift=args.davidson_eps_shift,
+            trlan_m_max=args.trlan_m_max,
+            trlan_n_keep=args.trlan_n_keep,
+            degeneracy_mode=args.band_degeneracy,
+            degeneracy_tol_ry=args.degeneracy_tol_ry,
+            tda=use_tda,
+            report=report,
+            stage_progress=stage_progress,
+        )
+
+        wfn.close()
+        file_rows = [
+            ("GW/BSE restart", "read", result["restart_file"]),
+            ("wavefunctions", "read", wfn_path),
+        ]
+        if result["eigenvector_file"]:
+            file_rows.append(("exciton eigenvectors", "written",
+                              result["eigenvector_file"]))
+        if args.eqp:
+            file_rows.append(("QP corrections", "read", args.eqp))
+        file_rows.append(("input deck", "read", args.input))
+        run.complete(files=file_rows)
+    return 0
+
+
+if __name__ == "__main__":
+    from runtime import run_main_and_finalize
+    run_main_and_finalize(main)

@@ -1,0 +1,849 @@
+"""Parallel-HDF5 (MPI-IO) FFI service — the ONE io module of the facade.
+
+Wave-2 merge (docs/architecture/ffi_layout.md §3/§6, executed 2026-08-01):
+the former ``ffi.phdf5`` package — ``context.py`` (file/handle lifecycle),
+``read.py`` (sharded slab / k-chunk readers) and ``write.py`` (sharded slab
+writer) — concatenated verbatim into one module, imports de-duplicated,
+NOTHING renamed.
+
+Each process reads/writes its local shard directly to a hyperslab of the
+shared HDF5 file via MPI-IO — no gather through rank 0.  See
+``docs/installation/ffi-build.md`` for the build and the per-site
+dependencies.
+
+Section docstrings from the merged modules follow inline.
+"""
+from __future__ import annotations
+
+import atexit
+import functools
+import threading
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional, Sequence, Tuple
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+from jax import shard_map
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from runtime.padding import authenticate_padded_axis
+
+from .common import ffi_loader
+from .common.ffi_loader import get_lib
+
+__all__ = [
+    # lifecycle (was phdf5/context.py)
+    "open_file", "close_file", "platform_for_handle", "validate_mesh_2d",
+    "staging_totals",
+    # readers (was phdf5/read.py)
+    "handle_vector",
+    "ffi_read_call", "ffi_read_kchunk_call", "ffi_read_kchunk_union_call",
+    "read_kchunk_union_sharded",
+    # writer (was phdf5/write.py)
+    "ffi_write_call", "ffi_read_multi_call",
+]
+
+# =========================================================================
+#  Lifecycle  (merged from phdf5/context.py; original docstring below)
+# =========================================================================
+"""Python-side lifecycle for the parallel-HDF5 FFI.
+
+``open_file`` is collective: the underlying ``lrx_phdf5_open`` calls
+``MPI_Init_thread(MPI_THREAD_MULTIPLE)`` if needed, duplicates
+``MPI_COMM_WORLD``, and invokes ``H5Fcreate``/``H5Fopen`` with
+parallel-IO property lists cached on the context.  The returned
+``int64`` handle is the address of a C++ ``PhdfCtx`` struct.
+
+Read-only file handles are cached per-process.  Each matching open owns one
+reference; the native handle stays live until every owner closes it.
+"""
+_LOCK = threading.Lock()
+@dataclass
+class _FileContext:
+    ctx: int
+    platform: str
+    mode: str
+    mesh_shape: tuple[int, int]
+    owners: int = 1
+
+
+# path -> native context and its Python owners.
+# The platform is recorded at open and used for EVERY lifecycle call on
+# the handle: a
+# PhdfCtx* allocated by one platform's .so (its heap, its HDF5/MPI state)
+# must never be handed to the other library — the dual-platform
+# (JAX_PLATFORMS=cuda,cpu) hazard the mesh routing exists for.  Routing
+# only the open by mesh platform while close/ensure_dataset followed the
+# JAX default backend was exactly that bug (audit fix/zq 2026-07-28).
+_FILE_CTXS: Dict[str, _FileContext] = {}
+
+
+def assert_writable_open_available(path: str) -> None:
+    """Refuse a second writer before SlabIO replaces or mutates the inode."""
+    with _LOCK:
+        if path in _FILE_CTXS:
+            raise RuntimeError(
+                f"phdf5 writable open({path!r}): this path already has a "
+                "live context; close its SlabIO/handle first")
+
+
+def staging_totals(platform: Optional[str] = None):
+    """``(live_ctxs, staging_bytes)`` held by this process's parallel-HDF5
+    contexts, or None on a library built before 2026-09-20.
+
+    Pinned host memory is invisible to /proc (``cudaMallocHost`` is
+    driver-managed, not ``mlock``), so this is the direct measure behind the
+    SC loop's per-map memory receipt: a rising ctx count is a ctx-lifetime
+    leak, a flat count with rising bytes is grow-only staging.
+    ``ffi_loader.phdf5_staging_totals`` owns the call.
+    """
+    return ffi_loader.phdf5_staging_totals(platform=platform)
+
+
+def validate_mesh_2d(mesh: Mesh) -> tuple[int, int]:
+    if "x" not in mesh.axis_names or "y" not in mesh.axis_names:
+        raise ValueError(
+            f"mesh must have axes ('x','y'); got {mesh.axis_names}")
+    return int(mesh.shape["x"]), int(mesh.shape["y"])
+
+
+def _platform_for_mesh(mesh: Mesh) -> str:
+    """Which FFI library owns the collective context for ``mesh``: a leg key
+    ("CUDA", "ROCM", "cpu"; a leg whose library is not built is refused by
+    naming its .so) or a vendor with no leg, which ``get_lib`` refuses by
+    name.  The phdf5 read handlers are registered under both library platform
+    strings (same jax.ffi target names), and the collective open/dataset
+    lifecycle must go through the matching .so.
+    """
+    from ffi.gate import mesh_ffi_platform
+    return mesh_ffi_platform(mesh)
+
+
+_MODE_FLAGS = {"w": 0, "a": 1, "r": 2}
+
+
+def open_file(path: str, *, mesh: Mesh, mode: str) -> int:
+    """Collective open/create of a parallel-HDF5 file.
+
+    Parameters
+    ----------
+    path
+        Absolute filesystem path for the HDF5 file.  Must be reachable
+        by every JAX process (shared FS — Lustre/GPFS/NFS).
+    mesh
+        2-D ``Mesh`` labelled ``('x','y')``.  Shape must equal
+        ``jax.process_count()``.
+    mode
+        ``'w'`` truncate+create, ``'a'`` append-or-create, ``'r'``
+        read-only.  Required: a default of ``'w'`` let a read that forgot the
+        keyword truncate the file it meant to read.
+
+    Returns
+    -------
+    int
+        Opaque handle (int64 address of the C++ ``PhdfCtx``).  Pass to
+        ``SlabIO`` reads/writes and ``close_file``.
+    """
+    if mode not in _MODE_FLAGS:
+        raise ValueError(f"mode must be w/a/r; got {mode!r}")
+    platform = _platform_for_mesh(mesh)
+    ffi_loader.get_lib(platform)
+    p, q = validate_mesh_2d(mesh)
+    if p * q != jax.process_count():
+        raise ValueError(
+            f"mesh {p}×{q}={p*q} != jax.process_count()={jax.process_count()}")
+
+    with _LOCK:
+        if path in _FILE_CTXS:
+            entry = _FILE_CTXS[path]
+            # Only identical read-only opens can share a native context.
+            # A second writer would address the same file with independent
+            # publication state; mode='w' may already have replaced its inode.
+            if mode != "r" or entry.mode != "r":
+                raise RuntimeError(
+                    f"phdf5 open_file({path!r}, mode={mode!r}): this path is "
+                    f"already open with mode={entry.mode!r} "
+                    f"(handle {entry.ctx}); close the existing SlabIO/handle "
+                    "first")
+            if entry.platform != platform or entry.mesh_shape != (p, q):
+                raise RuntimeError(
+                    f"phdf5 open_file({path!r}): cached context uses "
+                    f"platform={entry.platform!r}, mesh={entry.mesh_shape}, "
+                    f"but this reader requested platform={platform!r}, "
+                    f"mesh={(p, q)}")
+            entry.owners += 1
+            return entry.ctx
+        ctx = ffi_loader.phdf5_open(
+            path, p, q,
+            int(jax.process_index()), int(jax.process_count()),
+            _MODE_FLAGS[mode], platform=platform,
+        )
+        _FILE_CTXS[path] = _FileContext(ctx, platform, mode, (p, q))
+        return ctx
+
+
+def platform_for_handle(ctx_handle: int) -> Optional[str]:
+    """The platform ("CUDA"/"cpu") whose library allocated ``ctx_handle``,
+    or None for an unknown handle.  Every lifecycle call on a handle
+    (``phdf5_close`` / ``phdf5_ensure_dataset`` / ``phdf5_open_dataset_ro``)
+    must go through the owning platform's .so — this is the lookup the
+    write-side lifecycle sites use to route theirs."""
+    with _LOCK:
+        for entry in _FILE_CTXS.values():
+            if entry.ctx == int(ctx_handle):
+                return entry.platform
+    return None
+
+
+def close_file(path_or_handle, *, timing: bool = False):
+    """Release one owner by path or handle; the final release closes the
+    native file collectively.
+
+    Routed to the platform library that OPENED the handle (recorded in
+    ``_FILE_CTXS`` at open) — not the JAX default backend, which in a
+    dual-platform process could be the other library and would then free
+    a foreign PhdfCtx* against foreign HDF5/MPI state.  An unknown handle
+    (not opened through this module) falls back to the default-backend
+    library, the pre-existing best guess."""
+    with _LOCK:
+        platform = None
+        if isinstance(path_or_handle, str):
+            path = path_or_handle
+            entry = _FILE_CTXS.get(path)
+            ctx = entry.ctx if entry is not None else None
+        else:
+            ctx = int(path_or_handle)
+            path = next((k for k, v in _FILE_CTXS.items() if v.ctx == ctx), None)
+            entry = _FILE_CTXS.get(path) if path is not None else None
+        if entry is not None:
+            entry.owners -= 1
+            if entry.owners:
+                return None
+            _FILE_CTXS.pop(path)
+            platform = entry.platform
+        if ctx is not None and ctx != 0:
+            # Drop this ctx's memoised dataset ids only on final close.
+            # H5Fclose invalidates every hid_t opened against the file, and the
+            # ctx address is about to become reusable — a memo entry that
+            # outlives the close is a stale ``ds_id`` waiting for the next
+            # ``open_file`` that lands on the same address
+            # (:func:`_forget_datasets_for_ctx`).
+            _forget_datasets_for_ctx(int(ctx))
+            # platform=None (unknown handle) follows the JAX default
+            # backend inside ffi_loader — hardcoding "CUDA" would fail on
+            # a CPU node where only the host lib exists.
+            return ffi_loader.phdf5_close(int(ctx), platform=platform,
+                                          timing=timing)
+
+
+def _atexit_close_all() -> None:
+    """Close any files still open at process exit — catches forgotten
+    close_file calls.  Runs on every process.  Each handle closes through
+    its own recorded platform library."""
+    with _LOCK:
+        for entry in list(_FILE_CTXS.values()):
+            try:
+                _forget_datasets_for_ctx(int(entry.ctx))
+                ffi_loader.phdf5_close(int(entry.ctx), platform=entry.platform)
+            except Exception:
+                pass
+        _FILE_CTXS.clear()
+        _DS_ID_MEMO.clear()
+
+
+atexit.register(_atexit_close_all)
+
+
+# =========================================================================
+#  Readers  (merged from phdf5/read.py; original docstring below)
+# =========================================================================
+"""Sharded-slab FFI readers for parallel-HDF5 datasets.
+
+Two entry points, each wrapping a C++ handler defined in
+``cpp/read_ffi.cc``:
+
+===========================  ===========================================
+``read_kchunk_union_sharded`` N-D dataset, ``n_kchunk`` **disjoint**
+                              windows via ``H5S_SELECT_OR`` compound
+                              hyperslab, **one H5Dread**.  Use when the
+                              caller can provide per-k variable counts
+                              so the windows are disjoint by
+                              construction.
+===========================  ===========================================
+
+There were THREE until 2026-08-07.  ``read_kchunk_sharded`` wrapped
+``PhdfReadKchunk``, which does n_kchunk SEQUENTIAL H5Dreads inside one
+handler invocation, and it had zero callers in the tree — every reader of
+variable-ngk WFN windows takes the union path, whose per-k counts make the
+windows disjoint by construction and cost one collective instead of n.
+The measurement that settled the question (2026-08-07, ``_measure_fold``):
+n separate reads cost 1.4-3.6x the union call at every deck measured, and
+the gap grows with n.  A wrapper with no callers and a losing measurement
+behind it is not an option, it is a second spelling; DELETED.  Its C++
+handler is still in the deployed ``.so`` pair and its removal is
+registered to the owner, so ``ffi_read_kchunk_call`` below stays as the
+1:1 binding of a handler that still exists.
+
+``read_sharded_slab`` and ``write_sharded_slab`` (2-D convenience wrappers
+with no caller) were deleted with handler ABI 7: their control operands no
+longer exist, and SlabIO is the one entry point that posts controls.
+
+Each high-level function returns a jitted ``shard_map`` closure: the
+caller dispatches against it with runtime buffer arguments (offsets,
+counts), and the same compiled module handles any offsets/counts
+combination at the same shapes/dtypes.
+
+Preferred public entry point remains :mod:`file_io.slab_io`, whose
+``read_slab`` / ``read_slabs`` are the public entry points onto these two.
+"""
+
+_TARGET_READ = "lorrax_phdf5_read"
+_TARGET_READ_KCHUNK = "lorrax_phdf5_read_kchunk"
+_TARGET_READ_KCHUNK_UNION = "lorrax_phdf5_read_kchunk_union"
+#: N datasets, one handler, one collective ``H5Dread_multi`` (``PhdfReadMulti``).
+_TARGET_READ_MULTI = "lorrax_phdf5_read_multi"
+
+
+# =============================================================================
+#  Helpers shared by the three wrappers
+# =============================================================================
+def _encode_sharding_axes(
+    mesh: Mesh, file_partition_spec: P, ndim_file: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return ``(axis_count_per_dim, axis_flat)`` tuples the C++ handler
+    consumes.  Defers to the shared encoder in
+    ``file_io._slab_io_ffi`` so there's exactly one source of truth.
+    """
+    # Lazy import: file_io may not be on sys.path in some minimal test
+    # harnesses that import this module directly.
+    from file_io._slab_io_ffi import _sharding_to_axis_info
+    return _sharding_to_axis_info(
+        NamedSharding(mesh, file_partition_spec), ndim_file)
+
+
+def _insert_at(seq: Sequence, axis: int, value) -> tuple:
+    """Insert ``value`` at position ``axis`` in ``seq``, returning a tuple."""
+    items = list(seq)
+    items.insert(axis, value)
+    return tuple(items)
+
+
+def _register_and_open_dataset(fh: int, ds_name: str,
+                               mesh: Mesh | None = None) -> int:
+    # Drive the collective H5Dopen through the SAME platform library that
+    # owns the context (CUDA on a GPU mesh, cpu on a CPU mesh) — so a
+    # dual-platform process (JAX_PLATFORMS=cuda,cpu) with a CPU mesh doesn't
+    # route the lifecycle call to the CUDA lib's HDF5/MPI state.  The read
+    # ffi_call itself still resolves by lowering platform automatically.
+    platform = _platform_for_mesh(mesh) if mesh is not None else None
+    get_lib(platform)
+    return ffi_loader.phdf5_open_dataset_ro(fh, ds_name, platform=platform)
+
+
+# =============================================================================
+#  Low-level FFI call wrappers (one per handler)
+# =============================================================================
+# Low-level padding contract: out_struct is the physical equal-block
+# shard; valid_shape is the logical file prefix that C++ reads.
+#: The ONE dtype every phdf5 control operand is marshalled as.  The C++
+#: handlers decode them as ``ffi::Buffer<ffi::DataType::S64>``; anything
+#: else is a signature mismatch, and the interesting case is the SILENT
+#: one below.
+_CONTROL_DTYPE = jnp.int64
+
+
+def require_control_i64(what: str, arr, *, ndim: int | None = None,
+                        length: int | None = None):
+    """Refuse a phdf5 control operand that is not exactly int64.
+
+    ``offset_base``, ``valid_shape``, the ``(2,)`` handle vector and the
+    k-chunk offset/count tables are the DESCRIPTORS: eight-byte signed
+    integers on both sides of the FFI boundary.  This is the Python half of
+    that contract, stated once and called at every dispatch site.
+
+    THE FAILURE IT CATCHES, and it is silent by construction: with
+    ``jax_enable_x64`` OFF, ``jnp.asarray(..., dtype=jnp.int64)`` yields
+    **int32**.  JAX canonicalises, it does not raise.  A 64-bit ``PhdfCtx*``
+    address then truncates to its low 32 bits and the handler
+    ``reinterpret_cast``s a garbage pointer.  ``runtime.bootstrap()`` sets
+    x64, so production is fine — but a harness, a bare ``import``, or a
+    test that builds a mesh without the bootstrap is not, and nothing
+    anywhere said so.
+
+    IT DOES NOT VALIDATE VALUES.  These arrays are traced inside the
+    ``shard_map``, so only ``dtype`` and ``shape`` are readable here.  The
+    value contract (non-negative, in bounds) is enforced at the two
+    concrete construction sites and, finally, in C++ — where a refusal is
+    computed from replicated operands and therefore fires on every rank.
+    """
+    dtype = jnp.dtype(getattr(arr, "dtype", None))
+    if dtype != jnp.dtype(_CONTROL_DTYPE):
+        raise TypeError(
+            f"phdf5 {what}: control operand must be int64, got {dtype}.  The "
+            f"C++ handler decodes it as ffi::Buffer<S64>.  The usual cause is "
+            f"jax_enable_x64 being OFF, under which jnp.int64 CANONICALISES "
+            f"to int32 without a word — which truncates a 64-bit ctx handle "
+            f"to its low half.  Call runtime.bootstrap() (or "
+            f"jax.config.update('jax_enable_x64', True)) before opening a "
+            f"SlabIO handle.")
+    shape = tuple(getattr(arr, "shape", ()))
+    if ndim is not None and len(shape) != int(ndim):
+        raise ValueError(
+            f"phdf5 {what}: control operand must be {ndim}-D, got shape "
+            f"{shape}")
+    if length is not None and (not shape or int(shape[0]) != int(length)):
+        raise ValueError(
+            f"phdf5 {what}: control operand must have leading extent "
+            f"{length}, got shape {shape}")
+    return arr
+
+
+def handle_vector(ctx_handle: int, ds_id: int, mesh=None) -> jax.Array:
+    """The ``(2,)`` int64 ``[ctx_handle, ds_id]`` buffer the FFI expects.
+
+    Passed with ``P()`` so it is replicated — every rank sees the same
+    pair, which is what lets the C++ dispatch keep treating its refusals
+    as every-rank-or-none.  Defined here, next to the calls that consume
+    it, so the read and write paths cannot disagree about the layout.
+
+    ``mesh`` is accepted and ignored: the shard_map's ``in_specs``
+    already does the replication, and materialising this through an
+    explicit ``NamedSharding`` would run JAX's hidden ``assert_equal``
+    all-gather on every call (scorecard AA.1).  ``file_io/_slab_io_ffi``
+    builds the same vector through ``_replicated_i64_vector``, which uses
+    ``device_put_process_local`` for exactly that reason.
+    """
+    del mesh
+    if int(ctx_handle) == 0:
+        raise ValueError(
+            "phdf5 handle_vector: ctx_handle is 0.  That is a closed or "
+            "never-opened SlabIO handle, and the C++ dispatch would refuse it "
+            "as a null ctx after the operands had already been marshalled.")
+    out = jnp.asarray([int(ctx_handle), int(ds_id)], dtype=jnp.int64)
+    # The one concrete construction site for the handle pair, so the width
+    # contract is checkable HERE, where a truncated pointer is still
+    # recognisable as one.  See :func:`require_control_i64`.
+    return require_control_i64("handle_vector", out, ndim=1, length=2)
+
+
+def ffi_read_call(
+    dst: jax.Array,
+    *,
+    mesh_shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+) -> jax.Array:
+    """Single-hyperslab read — one H5Dread of one rectangle into ``dst``.
+
+    Handler ABI 7: no control operand.  ``dst`` is this rank's block of a
+    caller-allocated output, aliased to the result (``input_output_aliases``)
+    and DONATED by the enclosing jit; SlabIO posts the call's control values
+    (ctx, ds_id, origin, valid extent) under ``dst``'s address
+    (``ffi_loader.phdf5_post_control``) and the handler takes them by the
+    address of the buffer it is handed (cpp/phdf5/ctx.h POSTED CONTROL).  The
+    ctx address and ds_id never enter the HLO, so one module still serves
+    every chunk, dataset, file and process (the ABI 2/3 measurement).
+    """
+    return jax.ffi.ffi_call(_TARGET_READ, jax.ShapeDtypeStruct(dst.shape, dst.dtype),
+                            input_output_aliases={0: 0})(
+        dst,
+        mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
+    )
+
+
+def ffi_read_multi_call(
+    dsts: Sequence[jax.Array],
+    *,
+    mesh_shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+) -> list:
+    """N hyperslabs of N datasets of one file -- one handler, one ``H5Dread_multi``.
+
+    Handler ABI 7: each of the N caller-allocated ``dsts`` is aliased to its
+    result; the control ``{ctx, N, ds_id[N], offset[N][ndim],
+    valid_shape[N][ndim], address[N]}`` is posted under the address of
+    ``dsts[0]`` and the handler checks every output against the posted
+    addresses.  The N outputs share ``ndim`` and the sharding encoding and
+    keep their own shapes and dtypes.
+    """
+    dsts = list(dsts)
+    return jax.ffi.ffi_call(
+        _TARGET_READ_MULTI, [jax.ShapeDtypeStruct(d.shape, d.dtype) for d in dsts],
+        input_output_aliases={i: i for i in range(len(dsts))})(
+        *dsts,
+        mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
+    )
+
+
+def ffi_read_kchunk_call(
+    out_struct: jax.ShapeDtypeStruct,
+    handle: jax.Array,               # (2,) == [ctx_handle, ds_id]
+    offset_base: jax.Array,          # (n_kchunk, ndim_file) int64
+    *,
+    mesh_shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+    n_kchunk: int,
+) -> jax.Array:
+    """Sequential-reads kchunk — one handler invocation doing
+    ``n_kchunk`` H5Dread calls into a packed pinned buffer.  Each of the
+    per-k rectangles has the same shape; only its file offset varies.
+
+    NO PYTHON CALLER since 2026-08-07: ``read_kchunk_sharded``, the only
+    one, was deleted on the measurement above.  Kept because the
+    ``PhdfReadKchunk`` handler is still exported by the deployed ``.so``
+    pair, and a binding is how anyone reaches or debugs one; it goes out
+    WITH the handler, which is registered to the owner.
+    """
+    require_control_i64("read_kchunk handle", handle, ndim=1, length=2)
+    require_control_i64("read_kchunk offset_base", offset_base, ndim=2)
+    return jax.ffi.ffi_call(_TARGET_READ_KCHUNK, out_struct)(
+        handle,
+        offset_base,
+        mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
+        n_kchunk=int(n_kchunk),
+    )
+
+
+def ffi_read_kchunk_union_call(
+    dst: jax.Array,
+    *,
+    mesh_shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+    n_kchunk: int,
+    kchunk_axis: int,
+) -> jax.Array:
+    """Compound-hyperslab kchunk — ONE H5Dread pulls ``n_kchunk`` disjoint
+    windows via ``H5S_SELECT_OR``.  Caller supplies per-k counts so the
+    per-k file rectangles are disjoint by construction.  ``kchunk_axis``
+    locates the k axis inside ``dst`` (required so memspace iteration order
+    matches filespace iteration order — see ``read_kchunk_union_sharded``).
+
+    Handler ABI 7: no control operand.  ``dst`` is this rank's block of a
+    caller-allocated output, aliased to the result and donated; the control
+    ``{ctx, ds_id, n_kchunk, N_file, offset[n][N], count[n][N]}`` (this rank's
+    own counts) is posted under ``dst``'s address (cpp/phdf5/ctx.h POSTED
+    CONTROL), so neither table is placed on the device.
+    """
+    return jax.ffi.ffi_call(_TARGET_READ_KCHUNK_UNION,
+                            jax.ShapeDtypeStruct(dst.shape, dst.dtype),
+                            input_output_aliases={0: 0})(
+        dst,
+        mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
+        n_kchunk=int(n_kchunk),
+        kchunk_axis=int(kchunk_axis),
+    )
+
+
+# =============================================================================
+#  High-level convenience wrappers (build a jitted shard_map closure)
+# =============================================================================
+def read_kchunk_union_sharded(
+    fh: int,
+    ds_name: str,
+    *,
+    n_kchunk: int,
+    kchunk_axis: int,
+    file_global_shape: Sequence[int],
+    per_rank_file_shape: Sequence[int],
+    dtype,
+    mesh: Mesh,
+    file_partition_spec: P,
+) -> Callable:
+    """See ``_read_kchunk_union_sharded_cached`` for impl; this wrapper
+    normalises Sequence args to tuples for lru_cache hashability and posts
+    each call's control (handler ABI 7).
+
+    Returns ``reader(dst, offsets, counts_local) -> (array, done)``:
+    ``dst`` is the caller-allocated destination (global shape = the slab
+    shape with ``n_kchunk`` inserted at ``kchunk_axis``; donated),
+    ``offsets`` the ``(n_kchunk, ndim_file)`` window origins (same on every
+    rank) and ``counts_local`` THIS rank's ``(n_kchunk, ndim_file)`` counts
+    (a rank's window may be clamped to the file extent, so counts differ per
+    rank).  Both are host values: they are posted, never placed.
+    """
+    from ffi.common import ffi_loader
+    # ``fh``/``ds_name`` resolve to the runtime handle HERE, outside the
+    # compiled-closure cache: the jitted closure is keyed on GEOMETRY only,
+    # so two files, datasets or processes share one compiled module.  The
+    # dataset open stays memoised on ``(fh, ds_name)`` so the collective
+    # H5Dopen count does not change (this wrapper runs on every
+    # ``read_slabs`` call).
+    ds_id = _open_dataset_memo(int(fh), str(ds_name), mesh)
+    n, ndim = int(n_kchunk), len(per_rank_file_shape)
+    inner = _read_kchunk_union_sharded_cached(
+        n_kchunk=n, kchunk_axis=int(kchunk_axis),
+        file_global_shape=tuple(int(s) for s in file_global_shape),
+        per_rank_file_shape=tuple(int(s) for s in per_rank_file_shape),
+        dtype=jnp.dtype(dtype),
+        mesh=mesh, file_partition_spec=file_partition_spec,
+    )
+    platform = _platform_for_mesh(mesh)
+
+    def _reader(dst: jax.Array, offsets, counts_local):
+        off = np.asarray(offsets, dtype=np.int64)
+        cnt = np.asarray(counts_local, dtype=np.int64)
+        if off.shape != (n, ndim) or cnt.shape != (n, ndim):
+            raise ValueError(
+                f"read_kchunk_union: offsets {off.shape} / counts {cnt.shape}; want "
+                f"({n}, {ndim}) each (this rank's own counts)")
+        shards = dst.addressable_shards
+        if len(shards) != 1:
+            raise ValueError(
+                f"GATE phdf5_posted_control: got: {len(shards)} addressable shards; "
+                f"want: one device per process (a posted control is keyed by this "
+                f"rank's one buffer address)")
+        address = int(shards[0].data.unsafe_buffer_pointer())
+        control = (int(fh), int(ds_id), n, ndim,
+                   *(int(v) for v in off.ravel()), *(int(v) for v in cnt.ravel()))
+        ffi_loader.phdf5_post_control(address, "read_kchunk_union", control,
+                                      platform=platform)
+        try:
+            return inner(dst)
+        except BaseException:
+            ffi_loader.phdf5_retract_control(address, "read_kchunk_union",
+                                             platform=platform)
+            raise
+
+    return _reader
+
+
+#: ``(ctx_handle, ds_name, mesh) -> hid_t`` for the k-chunk union reader.
+#: A PLAIN DICT, cleared by :func:`_forget_datasets_for_ctx` on the final
+#: ``close_file`` for a native context.  It used to be an ``lru_cache``;
+#: that is a defect,
+#: not a style: see :func:`_open_dataset_memo`.
+_DS_ID_MEMO: Dict[Tuple[int, str, Mesh], int] = {}
+
+
+def _forget_datasets_for_ctx(ctx: int) -> None:
+    """Drop every memoised ``ds_id`` belonging to ``ctx``.
+
+    THE CTX HANDLE IS A HEAP ADDRESS, AND HEAP ADDRESSES ARE REUSED.
+    ``open_file`` returns ``reinterpret_cast<int64_t>(ctx)``; ``close_ctx``
+    ``delete``s that object.  A second ``open_file`` of the same path in
+    the same process — same allocation size, freed moments earlier —
+    very often gets the SAME address back from the allocator.  Every
+    ``hid_t`` minted against the first context was invalidated by its
+    ``H5Fclose``, so a cache keyed on the address alone hands the second
+    context the first one's dead dataset ids and the read handler refuses
+    with ``phdf5 read_kchunk_union: ds_id is invalid``.
+
+    MEASURED, and this is the failure it explains: JID 57269074, a second
+    ``bandstructure.htransform.streaming_galerkin_solve`` in one exciton
+    process, rank 3 raising exactly that message after the first 24x24
+    load had completed and closed; an identical FRESH-PROCESS retry passed
+    the same site.  Fresh process, fresh allocator, no address reuse — so
+    the "intermittent" in that register row is the allocator's freedom to
+    hand back a different address, not a race.
+
+    Called from ``close_file`` (and the atexit sweep), which is the only
+    place a ctx dies, so the memo cannot outlive the handle it describes.
+    """
+    for key in [k for k in _DS_ID_MEMO if k[0] == int(ctx)]:
+        _DS_ID_MEMO.pop(key, None)
+
+
+def _open_dataset_memo(fh: int, ds_name: str, mesh: Mesh) -> int:
+    """Memoised collective ``H5Dopen``, keyed to a LIVE ctx.
+
+    Split out of :func:`_read_kchunk_union_sharded_cached` when
+    ``fh``/``ds_name`` left that function's key.  It is kept as its own
+    cache — and NOT folded into the compiled-closure cache — because the
+    two have genuinely different keys: a dataset id depends on the file
+    and the dataset, a compiled module depends on the geometry.  Keeping
+    it here holds the collective H5Dopen count at exactly one per
+    ``(fh, ds_name, mesh)``, which is what the un-split code did.
+
+    IT IS NOT AN ``lru_cache``, deliberately.  An ``lru_cache`` has no
+    invalidation hook, and the key's first component is a reused heap
+    address — see :func:`_forget_datasets_for_ctx` for the measured
+    failure that combination produces.  The entry is dropped when the ctx
+    it belongs to is closed, so a stale id is unreachable rather than
+    merely unlikely.
+    """
+    # ``mesh`` is part of the key exactly as it was under ``lru_cache``:
+    # ``Mesh`` is hashable, and the collective open is routed by the mesh's
+    # platform.  Keep the OBJECT, not ``id(mesh)`` — an id is a reused
+    # address too, which is the bug this function is about.
+    key = (int(fh), str(ds_name), mesh)
+    got = _DS_ID_MEMO.get(key)
+    if got is not None:
+        return got
+    ds_id = _register_and_open_dataset(fh, ds_name, mesh)
+    _DS_ID_MEMO[key] = int(ds_id)
+    return int(ds_id)
+
+
+@functools.lru_cache(maxsize=None)
+def _read_kchunk_union_sharded_cached(
+    *,
+    n_kchunk: int,
+    kchunk_axis: int,
+    file_global_shape: tuple,
+    per_rank_file_shape: tuple,
+    dtype,
+    mesh: Mesh,
+    file_partition_spec: P,
+) -> Callable[[jax.Array], tuple[jax.Array, jax.Array]]:
+    """Build a jitted ``f(dst) → (array, done)`` callable
+    that issues **ONE** ``H5Dread`` for ``n_kchunk`` per-k windows via
+    ``H5S_SELECT_OR``.  Correctness preconditions — see below.
+
+    The per-k file rectangles must be:
+      1. **pairwise disjoint** (caller supplies per-k ``count[k]`` tight
+         enough that the windows don't overlap), and
+      2. **sorted in ascending row-major file order** over the varying
+         file dim.  If the physical k-indices aren't sorted that way,
+         the caller should argsort the offset table before dispatch and
+         permute the output's kchunk axis back afterward (both cheap).
+
+    Parameters
+    ----------
+    n_kchunk : int
+        Number of windows (compile-time).
+    kchunk_axis : int
+        Position in the output shape at which the n_kchunk axis lives.
+        For correct row-major iteration-order matching between memspace
+        and filespace, this must be placed **immediately before the file
+        dim that varies across k** (the G axis for WFN-style reads).
+        Passing ``kchunk_axis=2`` for a ``(nb, ns, ngkmax, 2)``-shaped
+        per-rank file shape produces the output
+        ``(nb, ns, n_kchunk, ngkmax, 2)``.
+    file_global_shape : length ``ndim_file``
+        Dataset shape on disk (for sanity checks only).
+    per_rank_file_shape : length ``ndim_file``
+        One rank's portion of a single window.
+    dtype : numpy dtype
+    mesh : Mesh
+        2-D ``('x','y')`` mesh.
+    file_partition_spec : PartitionSpec, length ``ndim_file``
+        How the file dims are sharded on ``mesh``.
+
+    Returns
+    -------
+    callable
+        ``f(dst)``; ``dst`` is the donated destination (handler ABI 7: the
+        control is posted under its address by
+        :func:`read_kchunk_union_sharded`, the only way to reach this).
+        Output shape is ``per_rank_file_shape`` with ``n_kchunk`` inserted
+        at ``kchunk_axis``; partition spec gets ``None`` inserted at the
+        same position.  ``done`` holds at most one element per rank, sliced
+        from the rank's own result in the same program: it is ready exactly
+        when the rank's asynchronous read has landed, and holding it keeps
+        none of the result's bytes alive.
+    """
+    ndim_file = len(per_rank_file_shape)
+    if len(file_global_shape) != ndim_file:
+        raise ValueError(
+            f"file_global_shape ndim {len(file_global_shape)} != "
+            f"per_rank_file_shape ndim {ndim_file}")
+    if not (0 <= kchunk_axis <= ndim_file):
+        raise ValueError(
+            f"kchunk_axis {kchunk_axis} must be in [0, {ndim_file}]")
+    p = int(mesh.shape["x"])
+    q = int(mesh.shape["y"])
+
+    axis_count_per_dim, axis_flat = _encode_sharding_axes(
+        mesh, file_partition_spec, ndim_file)
+
+    out_local_shape = _insert_at(
+        [int(s) for s in per_rank_file_shape], kchunk_axis, n_kchunk)
+    out_struct = jax.ShapeDtypeStruct(out_local_shape, jnp.dtype(dtype))
+    out_partition_spec = P(*_insert_at(
+        list(file_partition_spec), kchunk_axis, None))
+
+    def _per_rank(dst_local):
+        out = ffi_read_kchunk_union_call(
+            dst_local,
+            mesh_shape=(p, q),
+            axis_count_per_dim=axis_count_per_dim,
+            axis_flat=axis_flat,
+            n_kchunk=int(n_kchunk),
+            kchunk_axis=int(kchunk_axis),
+        )
+        return out, out.reshape(-1)[:1]
+
+    del out_struct                      # the destination carries the shape
+    return jax.jit(shard_map(
+        _per_rank, mesh=mesh,
+        in_specs=(out_partition_spec,),
+        out_specs=(out_partition_spec, P(tuple(mesh.axis_names))),
+        check_vma=False,
+    ), donate_argnums=(0,))
+
+
+# =========================================================================
+#  Writer  (merged from phdf5/write.py; original docstring below)
+# =========================================================================
+"""Sharded-slab FFI writer — thin shard_map wrapper around PhdfWriteFfi.
+
+Preferred public entry point for gw_jax / isdf / etc. is
+:mod:`file_io.slab_io`, whose collective transport is this one — the only
+other backend it has is ``file_io._slab_io_serial``, which serves the
+emulated-mesh geometry that ``open_file`` below refuses (P=1, D>1) and is
+chosen from a mesh predicate rather than from any caller-facing dial.  The
+sentence that used to sit here still offered a choice between "the
+allgather-and-rank-0-h5py backend (default)" and the FFI backend; both
+the router and that backend were deleted at 233a830d, so the choice it
+described has not existed since.  Call this module directly only for 2-D
+block-partitioned writes where you know you want the raw FFI path.
+
+The underlying C++ handler is N-D and derives per-rank hyperslab
+offsets from ``ctx->rank`` + the mesh_shape / axis_for_dim attrs.
+"""
+_FFI_TARGET = "lorrax_phdf5_write"
+#: Same handler body with an independent (not two-phase) H5Dwrite, for slabs
+#: whose per-rank selection is one long file-order run; see
+#: ``file_io._slab_io_ffi._file_order_plan``.
+_FFI_TARGET_INDEPENDENT = "lorrax_phdf5_write_independent"
+
+
+# Low-level padding contract: A_local is the physical equal-block shard;
+# valid_shape is the logical global slab prefix that C++ clips against.
+def ffi_write_call(
+    A_local: jax.Array,
+    *,
+    mesh_shape: Sequence[int],
+    axis_count_per_dim: Sequence[int],
+    axis_flat: Sequence[int],
+    independent: bool,
+) -> jax.Array:
+    """Low-level FFI call for one rank's local shard.  Returns token.
+
+    ``independent`` selects the transfer mode, and it has no default because
+    neither is right in general: independent MPI-IO for a file-order row-block
+    slab (one long run per rank), two-phase collective for anything strided.
+
+    Handler ABI 7: no control operand.  SlabIO posts ``{ctx, ds_id,
+    offset_base[ndim], valid_shape[ndim]}`` under the address of this rank's
+    shard of ``A`` and the handler takes them by the address of the operand it
+    is handed (cpp/phdf5/ctx.h POSTED CONTROL).  Until ABI 6 they were three
+    int64 operands -- one placement each per write, and a D2H copy plus an
+    xla_stream sync in the handler.  They were Attrs before 2026-08-07, which
+    forked a module per process (heap address) and per offset (~400 ms each,
+    reports/zeta_offset_runtime_2026-04-19/); posting keeps them out of the HLO.
+
+    The mesh/axis attrs remain compile-time attrs — they are geometry, so
+    a change in them genuinely IS a different module.
+
+    Use inside a ``shard_map`` body.
+    """
+    token_spec = jax.ShapeDtypeStruct((1,), jnp.int32)
+    target = _FFI_TARGET_INDEPENDENT if independent else _FFI_TARGET
+    return jax.ffi.ffi_call(target, token_spec, has_side_effect=True)(
+        A_local,
+        mesh_shape=np.asarray(mesh_shape, dtype=np.int64),
+        axis_count_per_dim=np.asarray(axis_count_per_dim, dtype=np.int64),
+        axis_flat=np.asarray(axis_flat, dtype=np.int64),
+    )

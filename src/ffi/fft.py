@@ -1,0 +1,3718 @@
+"""The k-convolution router: one factory per k-axis operation, one backend per platform.
+
+Every k-axis convolution and k-axis transform the physics needs is asked for
+through a factory here (or its ``common.fft_helpers`` re-export).  The factory
+chooses the backend from the mesh's device vendor only, never from an
+environment variable (``docs/architecture/decisions.md#xla-reference``):
+
+    CUDA   nvidia-mathdx: cuFFTDx thread FFTs inside one fused shared-memory
+           pass per k-row, NVRTC-built per (mode, k-grid) and disk-cached
+           (``cpp/cufft/kconv_mathdx_cuda_ffi.cc``).  Kept because it is
+           decisive on memory (``docs/architecture/kconv.md#why-fused``).
+    cpu    the plan backend: the reference composition (the same unfolds,
+           products and spin sums in XLA) with the host FFTW3-ABI flat-k
+           transforms and fused Σ convolution (``cpp/fftw/``).  Kept because it
+           is 3.8-7.4x faster than ``jnp.fft`` at a CrI3 rank tile.
+    ROCM   the XLA backend, except the factories with a kdft row: the k-leading
+           and k-minor pairs (:data:`_ROCM_KLEAD_TARGETS`), the k-box modes 7/9/11
+           (:data:`_ROCM_KBOX_TARGETS`) and the BSE outer load and fused decode
+           (:data:`_ROCM_OUTER_TARGETS`), hipRTC-built per k-grid (``cpp/kdft/``).
+           ``kconv_backend`` stays ``'xla'``; each factory announces its route once.
+    other  the XLA backend: the same composition with XLA's own k-axis
+           transforms (:func:`_kfft`: one dense DFT GEMM on the k axis in place
+           for a grid of at most the leg's ``xla_kdft_max_nk`` points,
+           ``jnp.fft`` above).  It is the reference every vendor route is gated against on
+           the same device (:func:`xla_reference`, ``tests/test_kconv_xla_gate.py``).
+
+    factory                   layout         operation
+    ------------------------  -------------  ----------------------------------------
+    make_fused_conv_kpair     3-D leading    ISDF CCT/ZCT post-pair convolution
+    make_fused_conv_kparent   parent tables  the same with the typed parent load
+    make_fused_conv_kplane    route-G planes the same read from the D-plane FFT output,
+                                             Bloch phase and L/R split applied on load
+    make_kconv_klead          flat leading   Σ / COHSEX  fftn(ifftn(T)·ifftn(W))
+    make_kconv_klead_unfold   parent Green   the Σ one read from the raw-parent G with
+                                             the typed unfold and spin action on load,
+                                             stored at the caller's k rows only
+    make_kconv_lorentz_unfold parent G + W   the four-current Σ: the same load for G and
+                                             for W's irreducible-q parent tile, then the
+                                             γ_i Ĝ γ_j† · Ŵ_ij block sum in R space
+    make_kfft_klead_unfold    wedge interaction  make_kconv_klead's prep (ifftn into R
+                                             space) read from the q wedge
+    make_kconv_kminor         trailing       BSE rung    fftn(ifftn(X)·K_R)
+    make_kfft_klead / _local  flat leading   one transform
+    make_kfft_kminor / _local trailing       one transform
+
+Pick the factory whose k position matches the tile you already hold; a caller
+does not transpose to reach another.  On CUDA a grid the mathdx family cannot
+serve on this device (:func:`mathdx_refusal`: an axis above ``KCONV_AXIS_MAX``,
+a split-arm plane tile beyond the opt-in shared memory, a failed probe compile)
+takes the XLA backend, with one warning.
+Contract: ``docs/architecture/kconv.md``.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import functools
+import math
+from functools import lru_cache, partial
+from pathlib import Path
+from typing import Callable, NamedTuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, PartitionSpec as P
+
+# ``common.fft_helpers`` is imported inside the
+# function bodies that use them: importing any ``common`` submodule runs
+# ``common/__init__.py``, which imports ``common.fft_helpers``, which imports
+# this module, so a module-scope import here would close an import cycle.
+
+__all__ = [
+    "ffi_fft_scale", "validate_flat_spec", "xla_reference",
+    # The k-convolution router: CUDA -> nvidia-mathdx, cpu -> the plan backend, else XLA.
+    "KCONV_PAIR_TARGET", "KCONV_PARENT_TARGET", "KCONV_KLEAD_TARGET",
+    "KFFT_KLEAD_TARGET", "KCONV_KMINOR_TARGET", "KFFT_KMINOR_TARGET",
+    "KCONV_TARGETS", "KCONV_AXIS_MAX",
+    "KDFT_KCONV_KLEAD_TARGET", "KDFT_KFFT_KLEAD_TARGET", "kdft_refusal", "rocm_klead_target",
+    "KDFT_KCONV_KMINOR_TARGET", "KDFT_KFFT_KMINOR_TARGET", "kdft_kminor_refusal",
+    "kconv_backend", "require_kconv", "mathdx_root", "cubin_cache_dir", "conv_kpair_scale",
+    "make_fused_conv_kpair", "make_fused_conv_kparent", "make_fused_conv_kplane",
+    "KCONV_PLANE_TARGET",
+    "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET", "klead_unfold_kf",
+    "klead_unfold_scratch_bytes",
+    "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
+    "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET", "live_row_mask",
+    "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET", "KCONV_CHI_UNFOLD_Q_TARGET", "chi_q_store_ok",
+    "chi_unfold_scratch_bytes", "make_kconv_chi_vertex", "KCONV_CHI_VERTEX_TARGET",
+    "make_kconv_kminor", "kconv_kminor_out_shape",
+    "make_kfft_klead", "make_kfft_kminor",
+    "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
+    "make_local_kconv_klead",
+    "KCONV_KLEAD_OUTER_TARGET", "klead_outer_refusal", "make_local_kconv_klead_outer",
+    "KCONV_KLEAD_OUTER_DECODE_TARGET", "klead_outer_decode_refusal", "make_local_kconv_klead_outer_decode",
+    "PLANE_FFT_GATHER_TARGET", "plane_fft_split", "plane_resident_bytes", "make_plane_fft_gather",
+]
+
+#: The NVIDIA k-convolution family on nvidia-mathdx (the router's CUDA leg).
+KCONV_PAIR_TARGET = "lorrax_mathdx_kconv_pair"
+KCONV_PARENT_TARGET = "lorrax_mathdx_kconv_parent"
+KCONV_PLANE_TARGET = "lorrax_mathdx_kconv_plane"
+KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
+#: Mode 2 with its T formed on the load as a rank-K outer-product sum (the BSE W term's encode):
+#: :func:`make_local_kconv_klead_outer`, cpp/cufft/kconv_outer_cuda_ffi.cc.
+KCONV_KLEAD_OUTER_TARGET = "lorrax_mathdx_kconv_klead_outer"
+#: The outer load with its K-sum pipe chosen (``LORRAX_BSE_OUTER_KSUM=fma``, A/B; additive).
+KCONV_KLEAD_OUTER_KSUM_TARGET = "lorrax_mathdx_kconv_klead_outer_ksum"
+#: The same load with the BSE decode's (t, μ) contraction fused into the store (U never stored):
+#: :func:`make_local_kconv_klead_outer_decode`.
+KCONV_KLEAD_OUTER_DECODE_TARGET = "lorrax_mathdx_kconv_klead_outer_decode"
+#: Mode 7 on the parent rows: the conj-on-load partner, the stored x block, and the k-fastest
+#: copies of the endpoint tables its fused single arm reads (:func:`klead_unfold_kf`).  The library
+#: keeps ``..._xblock`` (no copies; its single arm is the chain) for older trees.
+KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_kf"
+#: Mode 8 with W read from its irreducible-q parent tile on the load (the library keeps the V_R
+#: targets for older trees; nothing here calls them).
+KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_wparent"
+KFFT_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kfft_klead_unfold"
+#: Mode 11, the chi0 pass read from the raw-parent Green pair (:func:`make_kconv_chi_unfold`).
+KCONV_CHI_UNFOLD_TARGET = "lorrax_mathdx_kconv_chi_unfold"
+KCONV_CHI_UNFOLD_Q_TARGET = "lorrax_mathdx_kconv_chi_unfold_q"
+#: Mode 11 with the four-current channel vertices (:func:`make_kconv_chi_vertex`).
+KCONV_CHI_VERTEX_TARGET = "lorrax_mathdx_kconv_chi_vertex"
+KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
+KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
+KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
+#: Mode 10, the route-G plane FFT with gather-on-load (:func:`make_plane_fft_gather`).
+PLANE_FFT_GATHER_TARGET = "lorrax_mathdx_plane_fft_gather"
+#: Every mathdx target; ``require_kconv`` checks them all at startup.
+KCONV_TARGETS = (KCONV_PAIR_TARGET, KCONV_PARENT_TARGET, KCONV_PLANE_TARGET, KCONV_KLEAD_TARGET,
+                 KCONV_KLEAD_OUTER_TARGET, KCONV_KLEAD_OUTER_DECODE_TARGET,
+                 KCONV_KLEAD_UNFOLD_TARGET, KCONV_KLEAD_LORENTZ_TARGET,
+                 KFFT_KLEAD_TARGET, KFFT_KLEAD_UNFOLD_TARGET, KCONV_CHI_UNFOLD_TARGET,
+                 KCONV_CHI_UNFOLD_Q_TARGET, KCONV_KMINOR_TARGET, KFFT_KMINOR_TARGET, PLANE_FFT_GATHER_TARGET)
+
+#: The ROCM leg's k-leading pair (cpp/kdft/kdft_klead_ffi.cc): mode 2 and mode 3 by mixed-radix
+#: DFT in LDS, the operations and layouts of KCONV_KLEAD_TARGET / KFFT_KLEAD_TARGET.
+KDFT_KCONV_KLEAD_TARGET = "lorrax_kdft_kconv_klead"
+KDFT_KFFT_KLEAD_TARGET = "lorrax_kdft_kfft_klead"
+# kdft measured record (MI250X, one GCD, ROCm 7.14.1, JAX 0.9.1; c128 unless noted; per call; the
+# XLA route = this module's _xla composition inside xla_reference(); gate max |dU|/max|U| <= 2.2e-15
+# c128, 6.3e-7 c64 on 30 grids up to nk = 10240, odd, prime and unit axes included).  XLA's FFT
+# transforms minor axes only, so jnp.fft over the leading k axes is transpose + FFT + transpose
+# per transform.  kdft passes: 1 when the k tile fits a block, else 2*(groups-1)+1 (mode 2) and
+# one per group (mode 3), planned by cpp/kdft/kdft_klead_plan.h, which also holds the per-pass
+# bandwidth fit (1.16 TB/s at W >= 32 columns down to 0.44 at 400-point W = 8 tiles).
+#   k-grid    T (nk, a, mx, b, my)    mode 2 XLA -> kdft ms (x)   mode 3 fftn XLA -> kdft ms (x)
+#   8x8x1     (64, 2, 500, 2, 500)      7.92 ->  3.49 (2.3)        --
+#   6x6x6     (216, 2, 250, 2, 250)    24.99 ->  4.02 (6.2)      10.33 -> 3.04 (3.4)
+#   12x12x1   (144, 2, 300, 2, 300)     7.52 ->  3.65 (2.1)       4.21 -> 2.53 (1.7)
+#   8x8x8     (512, 2, 150, 2, 150)     9.20 ->  4.78 (1.9)       4.64 -> 2.74 (1.7)
+#   12x12x12  (1728, 2, 95, 2, 95)     14.94 ->  7.56 (2.0)       7.34 -> 4.31 (1.7)
+#   16x16x16  (4096, 2, 62, 2, 62)     11.60 ->  9.14 (1.3)       5.90 -> 4.93 (1.2)
+#   64x64x1   (4096, 2, 62, 2, 62)     11.40 ->  6.45 (1.8)       5.79 -> 3.64 (1.6)
+#   20x20x20  (8000, 2, 44, 2, 44)     15.65 ->  9.01 (1.7)       7.70 -> 4.85 (1.6)
+#   90x90x1   (8100, 2, 44, 2, 44)     19.11 ->  7.93 (2.4)       9.39 -> 4.20 (2.2)
+#   97x97x1   (9409, 2, 40, 2, 40)     27.19 -> 18.05 (1.5)      13.23 -> 9.48 (1.4)
+#   32x32x10  (10240, 2, 39, 2, 39)    25.97 ->  8.67 (3.0)      12.93 -> 5.55 (2.3)
+#   128x80x1  (10240, 2, 39, 2, 39)    11.67 ->  9.08 (1.3)       5.80 -> 5.00 (1.2)
+# The single-pass grids match the first, direct-DFT kdft within 3% (8x8x1 3.38, 6x6x6 3.96, 8x8x8
+# 4.66 ms) and beat it at 12x12x1 (4.82 ms).  Not paid on hsuite (5x5x1, launch-bound).
+#: The ROCM leg's k-minor pair (cpp/kdft/kdft_kminor_ffi.cc): modes 4 and 5, the operations and
+#: layouts of KCONV_KMINOR_TARGET / KFFT_KMINOR_TARGET (the BSE rung and the BSE kernel prep).
+KDFT_KCONV_KMINOR_TARGET = "lorrax_kdft_kconv_kminor"
+KDFT_KFFT_KMINOR_TARGET = "lorrax_kdft_kfft_kminor"
+# kdft k-minor record (modes 4/5; MI250X, one GCD, ROCm 7.14.1, JAX 0.9.1; c128; XLA = the same
+# factory inside xla_reference(): the dense DFT GEMM on the minor k axis for nk <= 144, jnp.fft
+# with k moved leading above; gate max|dU|/max|U| <= 1.6e-15 c128, 4.4e-7 c64 on 70 cases, axes to
+# 128 incl. primes 97 and 127, nk to 3904).  Launch: 32 KiB footprint / 512 threads (sweep of
+# {8,16,32,60} KiB x {256,512,1024}); rows per block odd, or a power of two for out_layout 1
+# (cpp/kdft/kdft_kminor_ffi.cc).  "v1" = the first cut's own direct DFT, before kdft_core.h.
+#   tile                              op                 XLA ms   kdft ms (v1)    speedup   GB/s
+#   W (1000,1000, 8,8,1)  1.02 GB     mode 5 ifftn        3.63     1.71 (1.62)     2.1       1196
+#   W (600,600, 12,12,1)  0.83 GB     mode 5 ifftn        4.90     1.37 (1.94)     3.6       1212
+#   W (600,600, 6,6,6)    1.24 GB     mode 5 ifftn       16.33     2.33 (2.14)     7.0       1067
+#   W (300,300, 8,8,8)    0.74 GB     mode 5 ifftn        5.56     1.30 (1.54)     4.3       1137
+#   T (4,500,500,1,1,64)  1.02 GB     mode 4 out_layout 1 8.23     3.13 (2.92)     2.6        655
+#   T (4,300,300,1,1,144) 0.83 GB     mode 4 out_layout 1 10.66    3.49 (4.59)     3.1        475
+#   T (4,250,250,1,1,216) 0.86 GB     mode 4 out_layout 1 28.10    4.10 (3.86)     6.9        422
+#   T (4,150,150,1,1,512) 0.74 GB     mode 4 out_layout 1 10.35    4.03 (3.81)     2.6        366
+# The split arm's out_layout-1 store (its last row pass) orders its blocks by the store's k
+# stride M*16 B, M = d1*d2*d3*d4 (kdft_kminor_plan.h l1_order).  Mode 4, T (4|2, mu, nu, 1, 1, nk)
+# ~1 GB, one GCD, ms per call (pool logs kminfin_final; int3 = kminfin_base1/base2):
+#   grid     M     int3 L1  now L1  L0       grid      M     int3 L1  now L1  L0
+#   128x64   1936  12.46    7.09    7.19     16x16x30  2116  10.10    7.73    6.66
+#   64x64    3600   7.85    5.22    5.31     64x64     4096   8.67    7.38    6.04
+#   16^3     3600   7.61    6.55    5.92     32x32x10  1600   8.28    7.78    6.96
+#   16^3     4096  10.63   10.54    6.72     128x64    4096  12.87   11.44    7.58
+# (the last two: nk*16 B and M*16 B both multiples of 4 KiB, the store's residual).
+#: Factory -> the kdft target that serves it on a ROCm mesh.  A factory with no row takes the
+#: XLA backend there; ``kconv_backend`` stays ``'xla'`` on ROCm, so every unported factory and
+#: every backend-keyed caller (mixed_basis_pair_convolution, greens_function_kernel) is unchanged.
+_ROCM_KLEAD_TARGETS = {"kconv_klead": KDFT_KCONV_KLEAD_TARGET,
+                       "kfft_klead": KDFT_KFFT_KLEAD_TARGET,
+                       "kconv_kminor": KDFT_KCONV_KMINOR_TARGET,
+                       "kfft_kminor": KDFT_KFFT_KMINOR_TARGET}
+#: kdft's verified range (cpp/kdft/kdft_klead_plan.h kNkMax, kAxisMax).  A grid whose k tile does
+#: not fit a block's 64 KiB of LDS is split into axis groups, one HBM pass each (mode 2:
+#: 2*(groups-1)+1 passes), and each axis is a mixed-radix Stockham DFT in LDS (any length; a
+#: prime above 16 is one chunked direct stage), so the bounds are where the gate was run on
+#: MI250X, not an LDS limit: every grid with nk <= 10240 and axes <= 128 (docs/architecture/kconv.md).
+KDFT_NK_MAX = 10240
+KDFT_AXIS_MAX = 128
+#: The k-minor pair's verified range (cpp/kdft/kdft_kminor_ffi.cc, plan kdft_kminor_plan.h): the
+#: single arm (a block owns whole rows) while one row's k tile fits and is the cheaper plan, else
+#: the split arm (row passes over the trailing axis group, k-leading column passes over the
+#: others, the K multiply fused in one; 2*(groups-1)+1 HBM passes for mode 4), so the bounds are
+#: the k-leading pair's: every grid with nk <= 10240 and axes <= 128 (the gate range).
+KDFT_KMINOR_NK_MAX = 10240
+KDFT_KMINOR_AXIS_MAX = 128
+#: The ROCM leg's k-box symmetry unfold (cpp/kdft/kbox_unfold_ffi.cc): mode 7 on the k-box stage
+#: (cufft/kbox_stage.cuh, its line transform the kdft direct DFT under hipRTC), the operands and
+#: layouts of KCONV_KLEAD_UNFOLD_TARGET.  Single arm only (:func:`kdft_kbox_refusal`).
+KDFT_KCONV_KLEAD_UNFOLD_TARGET = "lorrax_kdft_kconv_klead_unfold"
+#: Factory -> the ROCM k-box target that serves it (a factory with no row keeps its XLA route,
+#: whose k transforms are the kdft pair above).
+#: The ROCM leg's k-box R-space modes (cpp/kdft/kbox_rspace_ffi.cc, single and split arms): mode 9
+#: (an interaction's inverse transform read from its q wedge) and mode 11 (one chi0 tau node from
+#: the raw-parent Green pair, plain and with the four-current vertices), the operands and layouts
+#: of KFFT_KLEAD_UNFOLD_TARGET / KCONV_CHI_UNFOLD_TARGET / KCONV_CHI_VERTEX_TARGET less
+#: mathdx_root.  The arm rule is :func:`kdft_kbox_arm`; the refusals :func:`kdft_kbox_wedge_refusal`,
+#: :func:`kdft_kbox_chi_refusal`.
+KDFT_KFFT_KLEAD_UNFOLD_TARGET = "lorrax_kdft_kfft_klead_unfold"
+KDFT_KCONV_CHI_UNFOLD_TARGET = "lorrax_kdft_kconv_chi_unfold"
+KDFT_KCONV_CHI_VERTEX_TARGET = "lorrax_kdft_kconv_chi_vertex"
+_ROCM_KBOX_TARGETS = {"kconv_klead_unfold": KDFT_KCONV_KLEAD_UNFOLD_TARGET,
+                      "kfft_klead_unfold": KDFT_KFFT_KLEAD_UNFOLD_TARGET,
+                      "kconv_chi_unfold": KDFT_KCONV_CHI_UNFOLD_TARGET,
+                      "kconv_chi_vertex": KDFT_KCONV_CHI_VERTEX_TARGET}
+#: A block's LDS on gfx90a, the k-box stage's opt-in budget on ROCM (kbox_unfold_ffi.cc kLds).
+KDFT_KBOX_LDS = 64 * 1024
+#: The k-box mode-7 kernel's own axis bound (cpp/kdft/kbox_unfold_ffi.cc kAxisMax): its line
+#: transform is the stage's unrolled direct DFT, so it does not widen with KDFT_AXIS_MAX.
+KDFT_KBOX_AXIS_MAX = 40
+#: Modes 9 and 11's own axis bounds (cpp/kdft/kbox_rspace_ffi.cc kAxisMaxWedge / kAxisMaxChi):
+#: the same direct-DFT line transform on both arms, gated to axis 40 (tests/test_kdft_kbox_gate.py).
+KDFT_KBOX_WEDGE_AXIS_MAX = 40
+KDFT_KBOX_CHI_AXIS_MAX = 40
+#: Modes 9 and 11's nk bound (both arms), the k-lead family's (KDFT_NK_MAX); gated at 40x16x16.
+KDFT_KBOX_RSPACE_NK_MAX = 10240
+#: The k-box arm rule's measured constants (cpp/kdft/kbox_rspace_ffi.cc, one MI250X GCD at a
+#: 128 x 128 tile, pool logs kboxsplit_sweep1 / kboxsplit_sweep2): mode 9's single arm needs a tile
+#: of KDFT_KBOX_WEDGE_MIN_COLS columns (narrower single tiles, e.g. 12x12x1, 6^3, 7^3, ran slower than
+#: the split arm); the split arm takes three passes when its two-pass plane tile holds fewer than
+#: KDFT_KBOX_PLANE_MIN_COLS columns (12^3, 16^3: 1.1-1.4x faster three-pass).
+KDFT_KBOX_WEDGE_MIN_COLS = 16
+KDFT_KBOX_PLANE_MIN_COLS = 32
+#: Mode 11's single arm also needs KDFT_KBOX_CHI_SINGLE_MIN_LINES lines per axis pass (tile columns x
+#: nk / longest axis; the n_s 1 2-D tiles of 48-80 lines ran 0.91-1.05x XLA, 1.01-1.42x split).
+KDFT_KBOX_CHI_SINGLE_MIN_LINES = 96
+#: Mode 11 on a 2-D grid (nz = 1) keeps the XLA route past this axis (GATE kdft-kbox-chi-2d): the
+#: k-box arms' direct-DFT lines measured 0.72-0.91x the XLA route at 32x32x1, 40x8x1, 40x40x1
+#: (n_s 1, 2; pool log kboxsplit_bench3) and >= 1.12x up to 24x24x1.  A router rule, not a kernel
+#: limit; 3-D grids to axis 40 measured >= 1.10x.
+KDFT_KBOX_CHI_2D_AXIS_MAX = 24
+#: The ROCM leg's outer-product pair (cpp/kdft/kconv_outer_rocm_ffi.cc, the port of
+#: cpp/cufft/kconv_outer_cuda_ffi.cc): the BSE W term's T formed on the load (U and the fused decode's
+#: A), the operands and layouts of KCONV_KLEAD_OUTER_TARGET (K unpadded) and, for the decode, Pc as
+#: the BSE holds it (no fragment tiling).  Rules: :func:`kdft_outer_refusal`,
+#: :func:`kdft_outer_decode_refusal`.
+KDFT_KCONV_KLEAD_OUTER_TARGET = "lorrax_kdft_kconv_klead_outer"
+KDFT_KCONV_KLEAD_OUTER_DECODE_TARGET = "lorrax_kdft_kconv_klead_outer_decode"
+_ROCM_OUTER_TARGETS = {"kconv_klead_outer": KDFT_KCONV_KLEAD_OUTER_TARGET,
+                       "kconv_klead_outer_decode": KDFT_KCONV_KLEAD_OUTER_DECODE_TARGET}
+#: The outer kernels' axis bound (kconv_outer_rocm_ffi.cc kAxisMax): the stage's direct-DFT line.
+KDFT_OUTER_AXIS_MAX = 40
+#: The fused decode's accumulators per thread (kconv_outer_rocm_ffi.cc kAccMax, complex).
+KDFT_OUTER_ACC_MAX = 32
+# Measured routing (one MI250X GCD, c128, per call, native vs the unfused chain it replaces: the XLA
+# encode einsum + kdft mode 2 [+ the XLA decode einsum]; pool logs kcv_bench1 / kcv_sweep1, 512 threads):
+#   shape (k-grid na mx nb my K nc)       U before -> native ms (x)     A before -> native ms (x)
+#   5x5x1  2  96 2  96 8  8 (8x8 box)     0.114 ->  0.084 (1.37)        0.145 ->  0.422 (0.34)
+#   4x4x4  2 156 2 156 8  8 (2x8 box)     0.492 ->  0.459 (1.07)        0.640 ->  1.067 (0.60)
+#   8x8x1  2 362 2 362 8 14 (2x8 box)     2.371 ->  2.697 (0.88)        2.941 ->  8.188 (0.36)
+#   8x8x1  2 724 2 724 8 14 (2x8 box)     8.082 -> 10.929 (0.74)       11.263 -> 33.886 (0.33)
+# The load is L2-bound where 64 KiB of LDS caps the box below the CUDA kernel's 8 x 8 (the R leg is
+# re-read per x block), and the decode adds a sequential per-pair contraction; so the router sends
+# the outer load to kdft only where the 8 x 8 box fits half the LDS (GATE kdft-kconv-outer-box) and
+# keeps the XLA decode (GATE kdft-kconv-outer-decode-slower).  LORRAX_KDFT_OUTER=all (the gate's and
+# the bench's A/B) routes both wherever the kernels fit.
+KDFT_OUTER_BOX_COLS = 64
+#: The ROCM leg's k-box mode 6 (cpp/kdft/kbox_plane_ffi.cc, the port of the mathdx plane mode): the
+#: ISDF route-G pair convolution read from the D-plane FFT output, the operands and attributes of
+#: KCONV_PLANE_TARGET less mathdx_root.  Rule: :func:`kdft_plane_refusal`.
+KDFT_KCONV_PLANE_TARGET = "lorrax_kdft_kconv_plane"
+#: Mode 1 (cpp/kdft/kbox_parent_ffi.cc, the port of the mathdx parent mode): the ISDF parent-load pair
+#: convolution, the operands, attributes and centroid_major input layout of KCONV_PARENT_TARGET less
+#: mathdx_root.  Rule: :func:`kdft_parent_refusal`.
+KDFT_KCONV_PARENT_TARGET = "lorrax_kdft_kconv_parent"
+#: Mode 10 (cpp/kdft/plane_gather_ffi.cc, the port of the mathdx kPlaneSrc): the route-G plane FFT read
+#: from its cylinder, the operands and attributes of PLANE_FFT_GATHER_TARGET less mathdx_root.
+#: Rule: :func:`kdft_plane_fft_refusal`.
+KDFT_PLANE_FFT_GATHER_TARGET = "lorrax_kdft_plane_fft_gather"
+_ROCM_PAIR_TARGETS = {"kconv_plane": KDFT_KCONV_PLANE_TARGET, "kconv_parent": KDFT_KCONV_PARENT_TARGET,
+                      "plane_fft_gather": KDFT_PLANE_FFT_GATHER_TARGET}
+#: Mode 6's axis bound (kbox_plane_ffi.cc kAxisMax): the stage's direct-DFT line.
+KDFT_PLANE_AXIS_MAX = 40
+
+
+def _kdft_outer_all() -> bool:
+    """``LORRAX_KDFT_OUTER``: unset or ``measured`` (the measured rule), ``all`` (every grid the
+    kernels fit: the gate's and the bench's A/B).  Anything else refuses."""
+    import os
+    v = os.environ.get("LORRAX_KDFT_OUTER", "measured").strip().lower() or "measured"
+    if v not in ("measured", "all"):
+        raise ValueError(f"LORRAX_KDFT_OUTER={v!r}: want 'measured' (default) or 'all'")
+    return v == "all"
+
+def ffi_fft_scale(kind: str, norm: str | None, nk: int) -> float:
+    """Total scale matching jnp.fft's norm conventions exactly:
+    ifftn: backward/None -> 1/N, ortho -> 1/sqrt(N), forward -> 1;
+    fftn : backward/None -> 1,  ortho -> 1/sqrt(N), forward -> 1/N.
+
+    Computed HERE, in Python, and shipped to the handler as a plain scale —
+    the handlers implement no norm convention of their own."""
+    if norm == 'ortho':
+        return 1.0 / math.sqrt(float(nk))
+    if norm in (None, 'backward'):
+        return 1.0 / float(nk) if kind == 'ifftn' else 1.0
+    if norm == 'forward':
+        return 1.0 if kind == 'ifftn' else 1.0 / float(nk)
+    raise ValueError(f"Unsupported FFT norm={norm!r}")
+
+
+def validate_flat_spec(spec: P, what: str) -> P:
+    """FFT axes (leading three of the 3-D form) must be replicated; return
+    the equivalent flat-form spec (nk axis replicated + original trail)."""
+    axes = tuple(spec)
+    if len(axes) < 3 or any(ax is not None for ax in axes[:3]):
+        raise ValueError(
+            f"FFI flat-k backend needs the three k axes of {what} replicated "
+            f"(spec {spec}); sharded FFT axes are unsupported (same contract "
+            f"as the XLA-path helpers).")
+    return P(None, *axes[3:])
+
+
+# ===========================================================================
+# THE k-CONVOLUTION ROUTER — the ISDF pair convolution
+# ===========================================================================
+# CUDA -> the nvidia-mathdx family; cpu -> the plan backend; every other
+# platform -> the XLA backend.  All return the SAME callable contract, so a
+# consumer never branches on the backend.
+
+#: cuFFTDx fp64 thread-FFT limit: a k-grid with a longer axis takes the XLA backend.
+KCONV_AXIS_MAX = 40
+
+
+def conv_kpair_scale(norm: str | None, nk: int, mult: float = 1.0) -> float:
+    """Fold two inverse norms and one forward norm into one scalar."""
+    si = ffi_fft_scale("ifftn", norm, nk)
+    return si * si * ffi_fft_scale("fftn", norm, nk) * float(mult)
+
+
+def _conv_kpair_phase_codes(phase, ns: int, label: str) -> np.ndarray:
+    """Encode exact monomial phases as 0:+1, 1:+i, 2:-1, 3:-i."""
+    values = np.asarray(phase, dtype=np.complex128).reshape(-1)
+    if values.size != ns:
+        raise ValueError(f"k-conv {label} phase has {values.size} entries; ns={ns}")
+    quadrants = np.asarray([1, 1j, -1, -1j], dtype=np.complex128)
+    codes = np.empty(ns, dtype=np.int64)
+    for i, value in enumerate(values):
+        hits = np.flatnonzero(np.abs(quadrants - value) <= 1e-14)
+        if hits.size != 1:
+            raise ValueError(
+                f"k-conv {label} phase[{i}]={value!r} is not in {{+1,+i,-1,-i}}")
+        codes[i] = int(hits[0])
+    return codes
+
+
+def _check_perm(perm, ns: int, label: str) -> np.ndarray:
+    p = np.asarray(perm, dtype=np.int64).reshape(-1)
+    if p.size != ns or sorted(int(v) for v in p) != list(range(ns)):
+        raise ValueError(f"k-conv {label} perm {p.tolist()} is not a permutation of range({ns})")
+    return p
+
+
+def mathdx_root() -> str:
+    """The installed nvidia-mathdx wheel's ``nvidia/mathdx`` directory, or a GATE refusal.
+
+    Found from the Python package spec, never from an environment variable;
+    NVRTC includes ``include/`` and ``external/cutlass/include`` beneath it.
+    """
+    import importlib.util
+    import os
+    try:
+        spec = importlib.util.find_spec("nvidia.mathdx")
+    except ModuleNotFoundError:
+        spec = None
+    roots = list(spec.submodule_search_locations) if spec is not None else []
+    for root in roots:
+        if os.path.isfile(os.path.join(root, "include", "cufftdx.hpp")):
+            return root
+    raise RuntimeError(
+        "GATE mathdx-headers: got no importable nvidia.mathdx with "
+        "include/cufftdx.hpp; want the nvidia-mathdx wheel, the only supported "
+        "k-convolution backend on NVIDIA GPUs (docs/architecture/kconv.md#router); why: "
+        "the fused k-convolution kernels are compiled at run time from its "
+        "cuFFTDx headers; fix: pip install nvidia-mathdx.")
+
+
+#: Non-empty inside :func:`xla_reference`.
+_XLA_REFERENCE: list = []
+
+
+@contextlib.contextmanager
+def xla_reference():
+    """Build every factory inside this block on the XLA backend, on any platform.
+
+    The reference a kept vendor route is gated against on the same device
+    (``tests/test_kconv_xla_gate.py``) and timed against.  A factory decides
+    its backend when it is built, so the callables it returns keep it after
+    the block ends.  It is a Python argument of the caller, not an environment
+    variable, so no deployment can select it by accident.
+    """
+    _XLA_REFERENCE.append(True)
+    try:
+        yield
+    finally:
+        _XLA_REFERENCE.pop()
+
+
+#: Why the mathdx family cannot run on this job's devices: set once by
+#: :func:`require_kconv` when its probe compile fails on any process.
+_MATHDX_DOWN: list = []
+
+
+def mathdx_refusal(kgrid, *, kminor: bool = False, optin: int | None = None) -> str:
+    """Why the mathdx family cannot serve ``kgrid`` on this device ("" when it can).
+
+    Decided from the grid and the device's opt-in shared memory per block
+    (``optin``, default the attribute), so every rank of a job decides alike:
+    an axis above :data:`KCONV_AXIS_MAX`; a split-arm plane tile of 16
+    columns (every k-box mode's floor at ns <= 4) beyond the opt-in memory;
+    for the k-minor modes 4/5, which have no split arm, one k-box column
+    beyond it; or a failed probe compile at startup.
+    """
+    if _MATHDX_DOWN:
+        return _MATHDX_DOWN[0]
+    nx, ny, nz = (int(v) for v in kgrid)
+    if max(nx, ny, nz) > KCONV_AXIS_MAX:
+        return f"an axis above {KCONV_AXIS_MAX}, the fp64 cuFFTDx thread-FFT limit"
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    if have is None:
+        return ""
+    plane, column = 16 * 16 * ((ny * (nz | 1)) | 1), 16 * ((nx * ny * (nz | 1)) | 1)
+    # ponytail: one floor for every k-box mode; a single-pass mode-2/3 tile could still fit a
+    # grid with nx < 8 that this sends to XLA.
+    if kminor and column > have:
+        return (f"one k-box column needs {column} B > {have} B of opt-in shared memory "
+                "(the k-minor modes 4 and 5 have no split arm)")
+    if plane > have:
+        return f"a split-arm plane tile needs {plane} B > {have} B of opt-in shared memory"
+    return ""
+
+
+def kconv_backend(mesh: Mesh, kgrid=None, *, kminor: bool = False) -> str:
+    """``'mathdx'`` on a CUDA mesh, ``'plan'`` on a cpu mesh, ``'xla'`` on every
+    other platform and inside :func:`xla_reference`.  With ``kgrid`` (and
+    ``kminor`` for modes 4/5), a CUDA mesh takes ``'xla'`` where
+    :func:`mathdx_refusal` names a reason, announced once per grid as a warning."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE:
+        return "xla"
+    backend = {"CUDA": "mathdx", "cpu": "plan"}.get(mesh_ffi_platform(mesh), "xla")
+    if backend != "mathdx" or (kgrid is None and not _MATHDX_DOWN):
+        return backend
+    why = _MATHDX_DOWN[0] if kgrid is None else mathdx_refusal(kgrid, kminor=kminor)
+    if not why:
+        return backend
+    from ffi.gate import announce_once
+    grid = "" if kgrid is None else f" for k-grid {tuple(int(v) for v in kgrid)}"
+    msg = (f"[kconv] k-convolution router: CUDA -> XLA (jnp.fft){grid}"
+           f"{' (k-minor)' if kminor else ''}, not nvidia-mathdx: {why}")
+    if announce_once(("kconv", "xla", None if kgrid is None else tuple(kgrid), kminor), msg):
+        import warnings
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    return "xla"
+
+
+#: Why the kdft family cannot run on this job's devices: set once by :func:`require_kconv`
+#: when its probe fails on any process.
+_KDFT_DOWN: list = []
+
+
+def kdft_refusal(kgrid) -> str:
+    """Why kdft cannot serve ``kgrid`` ("" when it can): a grid beyond its verified range."""
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    if max(kg) > KDFT_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_AXIS_MAX} "
+                f"(kdft's verified range)")
+    if nk > KDFT_NK_MAX:
+        return f"GATE kdft-nk: got nk={nk}; want nk <= {KDFT_NK_MAX} (kdft's verified range)"
+    return ""
+
+
+def kdft_kminor_refusal(kgrid) -> str:
+    """Why the k-minor kdft pair cannot serve ``kgrid`` ("" when it can): a grid beyond its
+    verified range (the single and split arms together cover nk <= KDFT_KMINOR_NK_MAX)."""
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    if max(kg) > KDFT_KMINOR_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_KMINOR_AXIS_MAX} "
+                f"(the k-minor pair's verified range)")
+    if nk > KDFT_KMINOR_NK_MAX:
+        return (f"GATE kdft-nk: got nk={nk}; want nk <= {KDFT_KMINOR_NK_MAX} "
+                f"(the k-minor pair's verified range)")
+    return ""
+
+
+#: Factory -> its kdft refusal rule (default :func:`kdft_refusal`).
+_KDFT_REFUSAL = {"kconv_kminor": kdft_kminor_refusal, "kfft_kminor": kdft_kminor_refusal}
+
+
+def rocm_klead_target(mesh: Mesh, kgrid, factory: str) -> str | None:
+    """The kdft target serving ``factory`` on this mesh, or ``None`` (the XLA backend): a ROCm
+    mesh outside :func:`xla_reference`, kdft not demoted, ``kgrid`` within its verified range
+    (else one warning per grid)."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    target = _ROCM_KLEAD_TARGETS.get(factory)
+    why = _KDFT_REFUSAL.get(factory, kdft_refusal)(kgrid) if target else ""
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM {factory} -> XLA (jnp.fft), not kdft: {why}"
+        if announce_once(("kconv", "kdft", factory, tuple(int(v) for v in kgrid)), msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return None
+    _note_rocm_target(target)
+    return target
+
+
+def _kbox_single_arm(kgrid, group: int, operands: int, lds: int) -> tuple[int, int]:
+    """``(tr, per_col)`` of the k-box stage's single arm, as ``lrx_kbox::kbox_plan`` (kbox_stage.cuh)
+    decides them for c128 and ``min_tr = 1``: ``tr`` instances of ``group`` columns of ``operands``
+    staged operands per block, 0 when one instance does not fit ``lds``; ``per_col`` is one
+    instance's bytes.  The one mirror of the rule in this module."""
+    nx, ny, nz = (int(v) for v in kgrid)
+    per_col = int(operands) * int(group) * (((nx * ny * (nz | 1)) | 1) * 16)
+    lines = nx * ny * nz // max(nx, ny, nz)
+    want = 8
+    while want * group * lines < 256:
+        want *= 2
+    cap = 1
+    while 2 * cap * per_col <= lds // 2:
+        cap *= 2
+    tr = min(want, cap)
+    return (tr if tr * per_col <= lds else 0), per_col
+
+
+def kdft_kbox_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM k-box stage cannot serve mode 7 on ``kgrid`` at ``ns`` ("" when it can).
+
+    The stage's single-arm rule (``lrx_kbox::kbox_plan`` with mode 7's arguments: a group of
+    ``ns**2`` columns, one c128 operand, a convolution, ``min_tr = 1``) against a block's LDS,
+    and a tile of at least two columns, as the handler decides; the split arm is not ported."""
+    if max(int(v) for v in kgrid) > KDFT_KBOX_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {tuple(int(v) for v in kgrid)}; want every axis <= "
+                f"{KDFT_KBOX_AXIS_MAX} (the k-box stage's direct-DFT line transform)")
+    why = kdft_refusal(kgrid)
+    if why:
+        return why
+    nx, ny, nz = (int(v) for v in kgrid)
+    group = int(ns) * int(ns)
+    tr, per_col = _kbox_single_arm(kgrid, group, 1, lds)
+    if tr and tr * group >= 2:
+        return ""
+    return (f"GATE kdft-kbox-residency: got k-grid {(nx, ny, nz)} ns={ns}, a spin group of {group} padded "
+            f"columns ({per_col} B, two columns at ns=1); want it in a block's {lds // 1024} KiB of LDS "
+            "(the k-box single arm; the split arm is not ported to ROCM)")
+
+
+def kdft_kbox_arm(mode: int, kgrid, ns: int, nsr: int | None = None,
+                  lds: int = KDFT_KBOX_LDS) -> tuple[str | None, int]:
+    """``(arm, tile_columns)`` the ROCM k-box handler takes for mode 9 or 11 on ``kgrid``
+    (``arm`` None when none fits), the mirror of ``plan()`` in cpp/kdft/kbox_rspace_ffi.cc:
+
+    * ``"single"``: the stage's single-arm rule (:func:`_kbox_single_arm`: mode 9 a group of
+      ``ns*nsr`` columns, one operand; mode 11 a group of ``ns**2`` columns, two operands), kept for
+      mode 9 at a tile of at least :data:`KDFT_KBOX_WEDGE_MIN_COLS` columns and for mode 11 at a
+      tile of at most half the LDS (two blocks per CU) with at least
+      :data:`KDFT_KBOX_CHI_SINGLE_MIN_LINES` lines per axis pass;
+    * ``"split"`` (two passes): the plane tile of the most whole groups (``ns*nsr`` columns; mode 11
+      one operand's ``ns**2``) a block's LDS holds, ``16 * ((ny*(nz|1))|1)`` B per column;
+    * ``"split3"`` (three passes, ``nz > 1``): where the two-pass tile does not fit or holds fewer
+      than :data:`KDFT_KBOX_PLANE_MIN_COLS` columns; z tiles of one padded z-line per column.
+
+    ``LORRAX_KDFT_KBOX_ARM`` = ``single`` | ``split`` (the rule's passes) | ``split2`` | ``split3``
+    (the gate's and the bench's override) picks that arm where it fits, as the handler does."""
+    import os
+    nx, ny, nz = (int(v) for v in kgrid)
+    group = int(ns) * int(ns if nsr is None else nsr)
+    operands = 2 if int(mode) == 11 else 1
+    tr, per_col = _kbox_single_arm((nx, ny, nz), group, operands, lds)
+    single_fits = bool(tr)
+    lines = tr * group * operands * nx * ny * nz // max(nx, ny, nz)
+    single_rule = single_fits and (2 * tr * per_col <= lds and lines >= KDFT_KBOX_CHI_SINGLE_MIN_LINES
+                                   if int(mode) == 11 else tr * group >= KDFT_KBOX_WEDGE_MIN_COLS)
+    pr = (ny * (nz | 1)) | 1
+    tile = max(1, lds // (pr * 16) // group) * group
+    split_fits = tile * pr * 16 <= lds
+    force = os.environ.get("LORRAX_KDFT_KBOX_ARM", "")
+    if single_fits if force == "single" else (not split_fits and single_rule) if force.startswith("split") \
+            else single_rule:
+        return "single", tr * group * operands
+    three = nz > 1 and (force == "split3" or (force != "split2" and (not split_fits or tile < KDFT_KBOX_PLANE_MIN_COLS)))
+    if three:
+        zt = max(1, lds // ((nz | 1) * 16) // group) * group
+        if zt * (nz | 1) * 16 <= lds and ((ny | 1) * 16) <= lds:
+            return "split3", zt
+    return ("split", tile) if split_fits else (None, 0)
+
+
+def _kbox_rspace_refusal(mode: int, kg, ns: int, nsr: int | None, lds: int) -> str:
+    """The shared part of modes 9 and 11's rules: the axis, the nk bound and the arms' residency."""
+    name = "kdft_kbox_wedge_refusal" if mode == 9 else "kdft_kbox_chi_refusal"
+    amax = KDFT_KBOX_WEDGE_AXIS_MAX if mode == 9 else KDFT_KBOX_CHI_AXIS_MAX
+    if max(kg) > amax:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {amax} "
+                f"(k-box mode {mode}'s direct-DFT line transform)")
+    nk = kg[0] * kg[1] * kg[2]
+    if nk > KDFT_KBOX_RSPACE_NK_MAX:
+        return (f"GATE kdft-nk: got k-grid {kg} (nk={nk}); want nk <= {KDFT_KBOX_RSPACE_NK_MAX} "
+                f"(k-box mode {mode}'s verified range: KDFT_KBOX_RSPACE_NK_MAX)")
+    if mode == 11 and kg[2] == 1 and max(kg[0], kg[1]) > KDFT_KBOX_CHI_2D_AXIS_MAX:
+        return (f"GATE kdft-kbox-chi-2d: got the 2-D k-grid {kg}; want both axes <= {KDFT_KBOX_CHI_2D_AXIS_MAX} "
+                "(k-box mode 11 on longer 2-D axes measured slower than the XLA route: KDFT_KBOX_CHI_2D_AXIS_MAX)")
+    arm, _ = kdft_kbox_arm(mode, kg, ns, nsr, lds)
+    if arm is None:
+        group = int(ns) * int(ns if nsr is None else nsr)
+        pr = (kg[1] * (kg[2] | 1)) | 1
+        return (f"GATE kdft-kbox-residency: got k-grid {kg} widths ({ns}, {nsr or ns}), whose split plane tile "
+                f"of one spin group ({group} columns of a padded (ky, kz) plane, or of a z-line) needs "
+                f"{group * pr * 16} B; want it in a block's {lds // 1024} KiB of LDS (k-box mode {mode}; ffi.fft.{name})")
+    return ""
+
+
+def kdft_kbox_wedge_refusal(kgrid, ns: int, nsr: int | None = None, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM k-box stage cannot serve mode 9 (:func:`make_kfft_klead_unfold`) on ``kgrid``
+    with endpoint widths ``(ns, nsr)`` ("" when it can): an axis beyond
+    :data:`KDFT_KBOX_WEDGE_AXIS_MAX`, nk beyond :data:`KDFT_KBOX_RSPACE_NK_MAX`, or neither arm
+    (:func:`kdft_kbox_arm`) fitting a block's LDS."""
+    return _kbox_rspace_refusal(9, tuple(int(v) for v in kgrid), ns, nsr, lds)
+
+
+def kdft_kbox_chi_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM k-box stage cannot serve mode 11 (:func:`make_kconv_chi_unfold`,
+    :func:`make_kconv_chi_vertex`) on ``kgrid`` at ``ns`` ("" when it can): an axis beyond
+    :data:`KDFT_KBOX_CHI_AXIS_MAX`, nk beyond :data:`KDFT_KBOX_RSPACE_NK_MAX`, a 2-D grid axis beyond
+    :data:`KDFT_KBOX_CHI_2D_AXIS_MAX`, or no arm (:func:`kdft_kbox_arm`) fitting a block's LDS."""
+    return _kbox_rspace_refusal(11, tuple(int(v) for v in kgrid), ns, None, lds)
+
+
+def kdft_kbox_chi_scratch_bytes(kgrid, ns: int, tile_bytes: int, lds: int = KDFT_KBOX_LDS) -> int:
+    """Per-rank bytes the ROCM mode-11 handler draws from XLA's scratch allocator at run time
+    (the ``scratch_bytes`` it is passed): 0 on the single arm; on the split arm (:func:`kdft_kbox_arm`)
+    a ``(N_k, chunk * 2 ns^2)`` intermediate of at most 1 GiB or one local parent-Green tile,
+    whichever is smaller, and at least one pair's full-k transform (the CUDA family's rule,
+    :func:`chi_unfold_scratch_bytes`).  A runtime allocation: callers price it."""
+    if not (kdft_kbox_arm(11, kgrid, ns, None, lds)[0] or "").startswith("split"):
+        return 0
+    nk = int(np.prod([int(v) for v in kgrid]))
+    per_pair = nk * 2 * int(ns) * int(ns) * 16
+    return max(per_pair, min(int(tile_bytes), 1 << 30))
+
+
+#: Factory -> its k-box refusal rule ``(kgrid, ns, nsr) -> str``.
+_KBOX_REFUSAL = {
+    "kconv_klead_unfold": lambda kg, ns, nsr: kdft_kbox_refusal(kg, ns),
+    "kfft_klead_unfold": kdft_kbox_wedge_refusal,
+    "kconv_chi_unfold": lambda kg, ns, nsr: kdft_kbox_chi_refusal(kg, ns),
+    "kconv_chi_vertex": lambda kg, ns, nsr: kdft_kbox_chi_refusal(kg, ns),
+}
+
+
+def rocm_kbox_target(mesh: Mesh, kgrid, factory: str, ns: int, nsr: int | None = None) -> str | None:
+    """The ROCM k-box target serving ``factory`` on this mesh, or ``None`` (the factory's XLA
+    route): a ROCm mesh outside :func:`xla_reference`, kdft not demoted, and the grid within
+    the factory's rule in ``_KBOX_REFUSAL`` (else one warning per grid).  ``nsr``: mode 9's
+    right endpoint width (default ``ns``)."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    target = _ROCM_KBOX_TARGETS.get(factory)
+    why = _KBOX_REFUSAL[factory](kgrid, ns, nsr) if target else ""
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM {factory} -> XLA unfold + kdft, not the k-box stage: {why}"
+        if announce_once(("kconv", "kbox", factory, tuple(int(v) for v in kgrid), int(ns),
+                          int(ns if nsr is None else nsr)), msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return None
+    _note_rocm_target(target)
+    return target
+
+
+def kdft_outer_tile(kgrid, lds: int = KDFT_KBOX_LDS) -> tuple[int, int]:
+    """``(xb, yb)`` of the ROCM outer load's tile on ``kgrid`` (``(0, 0)`` when none fits), the mirror
+    of ``plan_tile`` in cpp/kdft/kconv_outer_rocm_ffi.cc: the largest XB x YB box (YB = 8 with XB = 8,
+    4, 2, 1, then YB = 4, 2, 1 at XB = 1) of padded c128 columns within half a block's LDS, else
+    within all of it (the CUDA kernel's 8 x 8 bank where it fits)."""
+    nx, ny, nz = (int(v) for v in kgrid)
+    col = 16 * ((nx * ny * (nz | 1)) | 1)
+    for budget in (lds // 2, lds):
+        for yb, xb in ((8, 8), (8, 4), (8, 2), (8, 1), (4, 1), (2, 1), (1, 1)):
+            if xb * yb * col <= budget:
+                return xb, yb
+    return 0, 0
+
+
+def kdft_outer_refusal(kgrid, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM outer load cannot serve ``kgrid`` (\"\" when it can): an axis beyond
+    :data:`KDFT_OUTER_AXIS_MAX`, no tile (:func:`kdft_outer_tile`) in a block's LDS, or (the measured
+    rule, outside ``LORRAX_KDFT_OUTER=all``) an 8 x 8 box beyond half the LDS."""
+    kg = tuple(int(v) for v in kgrid)
+    if max(kg) > KDFT_OUTER_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_OUTER_AXIS_MAX} "
+                "(the outer load's direct-DFT line transform)")
+    col = 16 * ((kg[0] * kg[1] * (kg[2] | 1)) | 1)
+    if kdft_outer_tile(kg, lds)[0] == 0:
+        return (f"GATE kdft-kconv-outer-tile: got k-grid {kg}, whose padded column needs "
+                f"{col} B; want it in a block's {lds // 1024} KiB of LDS")
+    if not _kdft_outer_all() and KDFT_OUTER_BOX_COLS * col > lds // 2:
+        return (f"GATE kdft-kconv-outer-box: got k-grid {kg}, whose 8 x 8 box needs {KDFT_OUTER_BOX_COLS * col} B; "
+                f"want it in half a block's LDS ({lds // 2048} KiB): a smaller box measured 0.74-1.07x the XLA "
+                "encode + kdft mode 2 (ffi.fft, kdft outer record; LORRAX_KDFT_OUTER=all overrides)")
+    return ""
+
+
+def kdft_outer_decode_refusal(kgrid, n_c: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """:func:`kdft_outer_refusal`, and the fused decode's accumulators: ``ceil(nk * n_c * yb / t)``
+    complex per thread at ``t`` = 512 threads (1024 when that exceeds half the bound) within
+    :data:`KDFT_OUTER_ACC_MAX` (the handler's GATE kdft-kconv-outer-decode-tile); outside
+    ``LORRAX_KDFT_OUTER=all``, ``GATE kdft-kconv-outer-decode-slower`` (the measured rule)."""
+    why = kdft_outer_refusal(kgrid, lds)
+    if why:
+        return why
+    kg = tuple(int(v) for v in kgrid)
+    cells = kg[0] * kg[1] * kg[2] * int(n_c) * kdft_outer_tile(kg, lds)[1]
+    threads = 512 if -(-cells // 512) <= KDFT_OUTER_ACC_MAX // 2 else 1024
+    acc = -(-cells // threads)
+    if acc > KDFT_OUTER_ACC_MAX:
+        return (f"GATE kdft-kconv-outer-decode-tile: got k-grid {kg} n_c={n_c}, {acc} decode accumulators "
+                f"per thread at {threads} threads; want <= {KDFT_OUTER_ACC_MAX}")
+    if not _kdft_outer_all():
+        return ("GATE kdft-kconv-outer-decode-slower: the fused decode measured 0.33-0.60x the outer load + "
+                "XLA decode einsum chain on MI250X (ffi.fft, kdft outer record); the XLA decode is kept "
+                "(LORRAX_KDFT_OUTER=all overrides)")
+    return ""
+
+
+def kdft_plane_no(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> int:
+    """Output columns per tile of the ROCM mode-6 kernel (0 when none fits), the mirror of
+    ``plan_no`` in cpp/kdft/kbox_plane_ffi.cc: the most (<= 16) whose ``2 ns^2`` padded c128
+    columns each fit half a block's LDS, else all of it."""
+    nx, ny, nz = (int(v) for v in kgrid)
+    per = 2 * int(ns) ** 2 * 16 * ((nx * ny * (nz | 1)) | 1)
+    for budget in (lds // 2, lds):
+        if budget // per >= 1:
+            return min(16, budget // per)
+    return 0
+
+
+def kdft_plane_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM mode-6 kernel cannot serve ``kgrid`` at ``ns`` (\"\" when it can): an axis beyond
+    :data:`KDFT_PLANE_AXIS_MAX`, or one output column's ``2 ns^2`` padded columns beyond a block's LDS."""
+    kg = tuple(int(v) for v in kgrid)
+    if max(kg) > KDFT_PLANE_AXIS_MAX:
+        return (f"GATE kdft-axis: got k-grid {kg}; want every axis <= {KDFT_PLANE_AXIS_MAX} "
+                "(k-box mode 6's direct-DFT line transform)")
+    if int(ns) not in (1, 2, 4):
+        return f"GATE kdft-kconv-plane-tile: got ns={ns}; want 1, 2 or 4"
+    if kdft_plane_no(kg, ns, lds) == 0:
+        return (f"GATE kdft-kconv-plane-tile: got k-grid {kg} ns={ns}, whose output column needs "
+                f"{2 * int(ns) ** 2 * 16 * ((kg[0] * kg[1] * (kg[2] | 1)) | 1)} B; want it in a block's {lds // 1024} KiB of LDS")
+    return ""
+
+
+def rocm_plane_target(mesh: Mesh, kgrid, ns: int) -> str | None:
+    """The ROCM mode-6 target serving :func:`make_fused_conv_kplane` on this mesh, or ``None`` (the XLA
+    route): a ROCm mesh outside :func:`xla_reference`, kdft not demoted, the handler in the loaded
+    library, and :func:`kdft_plane_refusal` empty (else one warning per grid)."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(KDFT_KCONV_PLANE_TARGET, "ROCM")
+    why = kdft_plane_refusal(kgrid, ns) if ok else f"no {KDFT_KCONV_PLANE_TARGET} handler ({why})"
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM kconv_plane -> XLA (the plane composition), not kdft: {why}"
+        if announce_once(("kconv", "plane", tuple(int(v) for v in kgrid), int(ns)), msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return None
+    _note_rocm_target(KDFT_KCONV_PLANE_TARGET)
+    return KDFT_KCONV_PLANE_TARGET
+
+
+def kdft_parent_refusal(kgrid, ns: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM mode-1 kernel cannot serve ``kgrid`` at ``ns`` (\"\" when it can).  Its tile is mode 6's
+    (``2 ns^2`` padded operand columns per output column, :func:`kdft_plane_no`), so the bound is too:
+    an axis beyond :data:`KDFT_PLANE_AXIS_MAX`, or one output column beyond a block's LDS."""
+    why = kdft_plane_refusal(kgrid, ns, lds)
+    return why.replace("kdft-kconv-plane-tile", "kdft-kconv-parent-tile").replace("k-box mode 6", "k-box mode 1")
+
+
+def _rocm_pair_target(mesh: Mesh, target: str, why_fn, key: tuple, what: str) -> str | None:
+    """Shared tail of the ROCM pair-family routers: a ROCm mesh outside :func:`xla_reference`, kdft not
+    demoted, ``target`` in the loaded library and ``why_fn()`` empty, else ``None`` with one warning per key."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or _KDFT_DOWN or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(target, "ROCM")
+    why = why_fn() if ok else f"no {target} handler ({why})"
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM {what} -> XLA, not kdft: {why}"
+        if announce_once(key, msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=4)
+        return None
+    _note_rocm_target(target)
+    return target
+
+
+def rocm_parent_target(mesh: Mesh, kgrid, ns: int) -> str | None:
+    """The ROCM mode-1 target serving :func:`make_fused_conv_kparent` on this mesh, or ``None`` (the XLA
+    route): :func:`_rocm_pair_target` with :func:`kdft_parent_refusal`."""
+    kg = tuple(int(v) for v in kgrid)
+    return _rocm_pair_target(mesh, KDFT_KCONV_PARENT_TARGET, lambda: kdft_parent_refusal(kg, ns),
+                             ("kconv", "parent", kg, int(ns)), "kconv_parent (the typed parent load + pair tail)")
+
+
+#: Mode 10's factor-line bound on ROCM (plane_gather_ffi.cc kFactorMax): the direct DFT of the k-box
+#: stage, the same 40 as the CUDA thread FFT, so :func:`plane_fft_split` serves both legs.
+KDFT_PLANE_FFT_FACTOR_MAX = 40
+KDFT_PLANE_FFT_PB_MAX = 8
+#: Mode 10 routing, measured on one MI250X GCD (tests/test_kdft_parent_gate.py --bench, pool log
+#: kconv_b1b; ms per call, XLA run-concatenate + rocFFT 2-D -> kdft): 25^2 Fe slab (64,25,2,78,2)
+#: 20.00 -> 15.16 (1.32x), 54^2 1.29 -> 0.99 (1.31x), 45^2 3.26x, 40^2 2.36x, 24x30 2.26x, 16^2 1.47x,
+#: 27^2 1.07x; 32^2 0.30 -> 0.32 (0.93x, rocFFT's radix-2 plan): an axis listed here keeps the XLA
+#: route (GATE kdft-plane-slower).  Every other axis with a split above 32 has no split (64, 128).
+#: Tried: the factor line as one direct DFT (M^2 products): 25^2 0.80x, 54^2 0.94x; one register
+#: Cooley-Tukey step (M (R + Q) products, plane_gather_kernel.h line_fft) is what paid.
+KDFT_PLANE_FFT_SLOW_AXES = (32,)
+
+
+def _kdft_plane_fft_lds(nb: int, nc: int, rows: int, pb: int) -> int:
+    """LDS of ``pb`` resident planes and the kernel's static tables (plane_gather_ffi.cc lds_bytes)."""
+    return 16 * nb * (nc | 1) * pb + nb + 4 * max(1, rows) + 8 * pb + 16
+
+
+def kdft_plane_fft_pb(nb: int, nc: int, rows: int, lds: int = KDFT_KBOX_LDS) -> int:
+    """Planes per block of the ROCM mode-10 kernel (0 when none fits), the mirror of ``plan_pb``: the most
+    (<= 8) within half a block's LDS (two blocks per CU), else one plane in all of it."""
+    nb, nc, rows = int(nb), int(nc), int(rows)
+    pb = max([p for p in range(1, KDFT_PLANE_FFT_PB_MAX + 1) if _kdft_plane_fft_lds(nb, nc, rows, p) <= lds // 2],
+             default=0)
+    return pb or (1 if _kdft_plane_fft_lds(nb, nc, rows, 1) <= lds else 0)
+
+
+def kdft_plane_fft_refusal(nb: int, nc: int, rows: int, lds: int = KDFT_KBOX_LDS) -> str:
+    """Why the ROCM mode-10 kernel cannot serve an ``(nb, nc)`` plane with ``rows`` occupied rows (\"\" when
+    it can): an axis with no Good-Thomas split into factors <= 40 (:func:`plane_fft_split`), or a plane
+    beyond a block's LDS."""
+    nb, nc = int(nb), int(nc)
+    if plane_fft_split(nb) is None or plane_fft_split(nc) is None:
+        return (f"GATE kdft-plane-split: got plane ({nb},{nc}); want each axis n = n1*n2 with gcd 1 and both "
+                f"factors <= {KDFT_PLANE_FFT_FACTOR_MAX}, or a prime power <= {KDFT_PLANE_FFT_FACTOR_MAX} "
+                "(the direct-DFT factor line)")
+    if kdft_plane_fft_pb(nb, nc, rows, lds) == 0:
+        return (f"GATE kdft-plane-residency: got plane ({nb},{nc}), whose resident plane needs "
+                f"{_kdft_plane_fft_lds(nb, nc, rows, 1)} B; want it in a block's {lds // 1024} KiB of LDS")
+    return ""
+
+
+def rocm_plane_fft_target(mesh: Mesh, nb: int, nc: int, rows: int) -> str | None:
+    """The ROCM mode-10 target serving :func:`make_plane_fft_gather` on this mesh, or ``None`` (the XLA
+    route): :func:`_rocm_pair_target` with :func:`kdft_plane_fft_refusal`."""
+    def why():
+        r = kdft_plane_fft_refusal(nb, nc, rows)
+        slow = [n for n in (int(nb), int(nc)) if n in KDFT_PLANE_FFT_SLOW_AXES]
+        return r or (f"GATE kdft-plane-slower: got plane ({nb},{nc}) with axis {slow[0]}, measured slower than "
+                     "the XLA route (ffi.fft.KDFT_PLANE_FFT_SLOW_AXES)" if slow else "")
+    return _rocm_pair_target(mesh, KDFT_PLANE_FFT_GATHER_TARGET, why,
+                             ("plane_fft", "rocm", int(nb), int(nc)), f"plane_fft_gather plane ({nb},{nc})")
+
+
+def rocm_outer_target(mesh: Mesh, kgrid, factory: str, n_c: int | None = None) -> str | None:
+    """The ROCM outer target serving ``factory`` (``kconv_klead_outer`` or ``kconv_klead_outer_decode``,
+    the latter with ``n_c``) on this mesh, or ``None``: a ROCm mesh outside :func:`xla_reference`, kdft
+    not demoted, the handler in the loaded library, and the grid within the rule (else one warning
+    per grid: the caller keeps the unfused chain)."""
+    why = rocm_outer_refusal(mesh, kgrid, factory, n_c)
+    if why is None:
+        return None
+    if why:
+        from ffi.gate import announce_once
+        msg = f"[kconv] k-convolution router: ROCM {factory} -> XLA encode + kdft mode 2, not the outer load: {why}"
+        if announce_once(("kconv", "outer", factory, tuple(int(v) for v in kgrid), n_c), msg):
+            import warnings
+            warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return None
+    target = _ROCM_OUTER_TARGETS[factory]
+    _note_rocm_target(target)
+    return target
+
+
+def rocm_outer_refusal(mesh: Mesh, kgrid, factory: str, n_c: int | None = None) -> str | None:
+    """``None`` off a ROCm mesh (or inside :func:`xla_reference`), \"\" when the ROCM outer target
+    serves ``factory`` here, else the reason it does not (no announcement)."""
+    from ffi.gate import mesh_ffi_platform
+    if _XLA_REFERENCE or mesh_ffi_platform(mesh) != "ROCM":
+        return None
+    if _KDFT_DOWN:
+        return _KDFT_DOWN[0]
+    from ffi.common import ffi_loader
+    target = _ROCM_OUTER_TARGETS[factory]
+    ok, why = ffi_loader.probe_target(target, "ROCM")
+    if not ok:
+        return f"no {target} handler ({why})"
+    return kdft_outer_decode_refusal(kgrid, n_c) if n_c is not None else kdft_outer_refusal(kgrid)
+
+
+_KBOX_PREBUILT: set = set()
+
+
+def _kbox_prebuild(mesh: Mesh, mode: int, kg, ns: int, nsr: int, variant: int, live: bool) -> None:
+    """Build and load the ROCM k-box image of mode 9 or 11 on this process's mesh devices when the
+    k-box call is traced, before any XLA program runs it (``lrx_kbox_rspace_prebuild``), so the
+    hipRTC compile and the module load stay off the running program's execute thread
+    (cpp/kdft/kbox_rspace_ffi.cc).  Once per (image, device, arm override).  Raises ``GATE
+    kdft-kbox-build`` with the handler's reason (a grid the router admits always builds)."""
+    import ctypes
+    import os
+    devs = sorted({int(getattr(d, "local_hardware_id", d.id)) for d in mesh.devices.flat
+                   if d.process_index == jax.process_index()})
+    key = (int(mode), tuple(int(v) for v in kg), int(ns), int(nsr), int(variant), bool(live),
+           os.environ.get("LORRAX_KDFT_KBOX_ARM", ""), tuple(devs))
+    if key in _KBOX_PREBUILT:
+        return
+    from ffi.common import ffi_loader
+    fn = getattr(ffi_loader.get_lib("ROCM"), "lrx_kbox_rspace_prebuild", None)
+    if fn is None:
+        raise RuntimeError("GATE kdft-kbox-build: got a ROCM library without lrx_kbox_rspace_prebuild_rocm; want "
+                           "the leg built from this tree (config/frontier/build_ffi_rocm.sh)")
+    fn.argtypes = [ctypes.c_int] * 9 + [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    fn.restype = ctypes.c_int
+    why = ctypes.create_string_buffer(4096)
+    for dev in devs:
+        if fn(dev, int(mode), *(int(v) for v in kg), int(ns), int(nsr), int(variant), int(bool(live)),
+              cubin_cache_dir().encode(), why, len(why)):
+            raise RuntimeError(f"GATE kdft-kbox-build: {why.value.decode(errors='replace')}")
+    _KBOX_PREBUILT.add(key)
+
+
+def _require_kdft_targets() -> None:
+    """Refuse a ROCM library without the kdft targets: a build defect, not a routing condition."""
+    for target in (*_ROCM_KLEAD_TARGETS.values(), *_ROCM_KBOX_TARGETS.values()):
+        _require_target(target, "ROCM")
+
+
+def _probe_kdft(mesh: Mesh) -> None:
+    """Build and run the kdft transform once (mode 3, k-grid 2x1x1) on this process's first mesh
+    device: a device hipRTC cannot compile for is found at startup.  Raises ``GATE kdft-probe``."""
+    local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
+    dev = local[0] if local else jax.local_devices()[0]
+    try:
+        with jax.default_device(dev):
+            y = np.asarray(jax.jit(lambda x: _kdft_rows_call(
+                KDFT_KFFT_KLEAD_TARGET, x, (2, 1, 1), forward=True, scale=1.0))(
+                jnp.asarray([[1.0], [0.0]], jnp.complex128)))
+        err = "" if np.allclose(y.ravel(), [1.0, 1.0]) else f"wrong result: FFT [1, 0] -> {y.ravel().tolist()}"
+    except Exception as e:                                          # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+    if err:
+        raise RuntimeError(f"GATE kdft-probe: got a kdft probe failure on {dev.device_kind}; want the "
+                           f"hipRTC-built k-leading transform to compile and run; cause: {err}")
+
+
+def _kdft_rows_call(target, x2, kg, *, forward: bool, scale: float, v=None):
+    """One kdft call on a (nk, rows) tile (mode 3) or T (nk, a, mx, b, my) with V_R (mode 2)."""
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                 scale=np.float64(scale), cubin_dir=cubin_cache_dir())
+    if v is None:
+        attrs["forward"] = np.int64(1 if forward else 0)
+    args = (x2,) if v is None else (x2, v)
+    return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(x2.shape, x2.dtype),
+                            input_output_aliases={0: 0})(*args, **attrs)
+
+
+def require_kconv(mesh: Mesh, *, announce: bool = True) -> str:
+    """Startup check of the router's backend on this mesh; returns it or refuses.
+
+    CUDA: compute capability 8.0 or newer on every local device, the
+    nvidia-mathdx wheel, every family target and one probe compile; a failed
+    probe on any process demotes every k-convolution to XLA, announced on
+    rank 0 and recorded (``common.jax_compile_cache.record_demotion``).  cpu:
+    the two host plan targets and one call of each host engine.  The XLA
+    backend needs no library.
+    """
+    from ffi.gate import announce_once, mesh_ffi_platform
+    precondition = _KCONV_DEVICE_PRECONDITION.get(mesh_ffi_platform(mesh))
+    if precondition is not None:
+        precondition()
+    backend = kconv_backend(mesh)
+    if backend == "mathdx":
+        root = mathdx_root()
+        for target in KCONV_TARGETS:
+            _require_target(target, "CUDA")
+        try:
+            _probe_kconv_compile(mesh)
+            why = ""
+        except RuntimeError as e:
+            why = str(e)
+        # Every process takes the same route: one failed probe sends all to XLA.
+        from jax.experimental import multihost_utils
+        if int(np.max(multihost_utils.process_allgather(np.int32(bool(why))))):
+            _MATHDX_DOWN[:] = [why or "a peer process failed the mathdx probe compile"]
+            from common.jax_compile_cache import record_demotion
+            record_demotion("kconv", f"nvidia-mathdx -> XLA: {_MATHDX_DOWN[0]}")
+            if jax.process_index() == 0:
+                print(f"*** [kconv] DEMOTED: every k-convolution (Sigma, zeta fit, "
+                      f"ladder W) runs on the XLA backend, a full-k copy per call: "
+                      f"several times the fused route's memory and about 2x its "
+                      f"time (docs/architecture/kconv.md#why-fused).  Cause: "
+                      f"{_MATHDX_DOWN[0]} ***", flush=True)
+            return kconv_backend(mesh)
+        announce_once(("kconv", "backend", backend),
+                      f"[kconv] k-convolution router: CUDA -> nvidia-mathdx ({root}); "
+                      f"cubin cache {_cubin_cache_summary()}",
+                      scope="rank0", emit=announce)
+    elif backend == "plan":
+        for target in (FLAT_K_TARGET, GW_CONV_TARGET):
+            _require_target(target, "cpu")
+        _probe_host_engines(mesh)
+        announce_once(("kconv", "backend", backend),
+                      "[kconv] k-convolution router: cpu -> FFTW3-ABI host plan route",
+                      scope="rank0", emit=announce)
+    elif mesh_ffi_platform(mesh) == "ROCM" and not _XLA_REFERENCE:
+        try:
+            _probe_kdft(mesh)
+            why = ""
+        except RuntimeError as e:
+            why = str(e)
+        from jax.experimental import multihost_utils
+        if int(np.max(multihost_utils.process_allgather(np.int32(bool(why))))):
+            _KDFT_DOWN[:] = [why or "a peer process failed the kdft probe"]
+            from common.jax_compile_cache import record_demotion
+            record_demotion("kconv", f"kdft -> XLA: {_KDFT_DOWN[0]}")
+            if jax.process_index() == 0:
+                print(f"*** [kconv] DEMOTED: the ROCm k-leading pair runs on the XLA backend. "
+                      f"Cause: {_KDFT_DOWN[0]} ***", flush=True)
+        announce_once(("kconv", "backend", backend),
+                      "[kconv] k-convolution router: ROCM -> XLA (jnp.fft k-axis transforms); "
+                      + ("k-leading pair also XLA (kdft demoted)" if _KDFT_DOWN else
+                         f"k-leading pair -> kdft (hipRTC; cache {cubin_cache_dir()})"),
+                      scope="rank0", emit=announce)
+    else:
+        announce_once(("kconv", "backend", backend),
+                      f"[kconv] k-convolution router: {mesh_ffi_platform(mesh)} -> XLA "
+                      f"(jnp.fft k-axis transforms)", scope="rank0", emit=announce)
+    return backend
+
+
+def _require_sm80() -> None:
+    """Refuse a CUDA device below compute capability 8.0: the CUDA library's
+    PTX targets compute_80, and the mathdx kernels use ``cp.async``."""
+    for dev in jax.local_devices():
+        cc = str(getattr(dev, "compute_capability", "") or "")
+        try:
+            old = tuple(int(v) for v in cc.split(".")[:2]) < (8, 0)
+        except ValueError:
+            continue
+        if old:
+            raise RuntimeError(
+                f"GATE cuda-sm80: got {dev.device_kind} (compute capability {cc}); want "
+                "compute capability 8.0 or newer; why: liblorrax_ffi.so is built for "
+                "compute_80 and the mathdx kernels use cp.async; fix: run on an A100 or "
+                "newer GPU, or on CPU.")
+
+
+
+
+#: Leg key -> the device check :func:`require_kconv` runs before the router's
+#: backend on that leg.  A leg with no row has no device precondition.
+_KCONV_DEVICE_PRECONDITION = {"CUDA": _require_sm80, "ROCM": _require_kdft_targets}
+
+def _probe_host_engines(mesh: Mesh) -> None:
+    """Run the plan backend's host engines once at startup: a 2-point FFT on
+    the FFTW3-ABI handler and, when ``LORRAX_BANDS_GEMM_FFI`` is on, a 1x1
+    batched GEMM.  The handlers bind their engines at the first call, so a
+    missing engine library refuses here instead of at the first transform."""
+    from ffi.gemm import gemm_batch, gemm_ffi_enabled
+    local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
+    with jax.default_device(local[0] if local else jax.local_devices()[0]):
+        try:
+            fft = np.asarray(jax.jit(lambda x: _host_flat_k(x, (2, 1, 1), "fftn"))(
+                jnp.asarray([1.0, 0.0], jnp.complex128)))
+            gemm = (np.asarray(jax.jit(gemm_batch)(jnp.full((1, 1, 1), 2.0),
+                                                   jnp.full((1, 1, 1), 3.0)))
+                    if gemm_ffi_enabled() else np.full((1, 1, 1), 6.0))
+            err = "" if (np.allclose(fft, [1.0, 1.0]) and np.allclose(gemm, 6.0)) else (
+                f"wrong results: FFT [1, 0] -> {fft.tolist()}, GEMM 2*3 -> {gemm.ravel().tolist()}")
+        except Exception as e:                                      # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+    if err:
+        raise RuntimeError(
+            f"GATE plan-engine: got a host FFT/GEMM engine that does not run ({err}); want "
+            "the FFTW3-ABI FFT and the batched CBLAS GEMM of liblorrax_ffi_host.so to load "
+            "and compute; fix: put the engine libraries the host library was linked against "
+            "on LD_LIBRARY_PATH (docs/architecture/ffi_layout.md#3c-which-fft-engine-the-host-library-binds).")
+
+
+def _probe_kconv_compile(mesh: Mesh) -> None:
+    """Compile and run one tiny mathdx kernel (mode 3, k-grid 2x1x1) on this
+    process's first mesh device (else its first local device), so a device the installed cuFFTDx cannot
+    compile for is found at startup, not at the first k-convolution.  A failure
+    raises ``GATE mathdx-probe`` naming the compute capability; :func:`require_kconv`
+    catches it and every process demotes to the XLA backend, announced and recorded.
+    The cubin is disk-cached like every other."""
+    local = [d for d in mesh.devices.flat if d.process_index == jax.process_index()]
+    dev = local[0] if local else jax.local_devices()[0]
+    try:
+        with jax.default_device(dev):
+            jax.block_until_ready(jax.jit(lambda: _rows_kfft_call(
+                KFFT_KLEAD_TARGET, jnp.zeros((2, 1), jnp.complex128), (2, 1, 1),
+                forward=True, scale=1.0))())
+    except Exception as e:                                          # noqa: BLE001
+        from importlib import metadata
+        try:
+            wheel = metadata.version("nvidia-mathdx")
+        except metadata.PackageNotFoundError:
+            wheel = "?"
+        cc = getattr(dev, "compute_capability", "?")
+        raise RuntimeError(
+            f"GATE mathdx-probe: got a probe compile failure on {dev.device_kind} (compute "
+            f"capability {cc}) with nvidia-mathdx {wheel}; want every mathdx kernel to compile "
+            "for this device; why: cuFFTDx defines a fixed list of SM targets and the kernels "
+            "are built by NVRTC for the device's own; fix: a nvidia-mathdx wheel that supports "
+            f"this architecture. Cause: {e}") from e
+
+
+def _cubin_cache_summary() -> str:
+    """``<dir>: N images, X MB`` for the startup line (one flat directory, no walk)."""
+    import os
+    d = cubin_cache_dir()
+    try:
+        sizes = [e.stat().st_size for e in os.scandir(d)
+                 if e.is_file() and e.name.endswith(".cubin")]
+    except FileNotFoundError:
+        sizes = []
+    linked = seed_cubin_cache(str(CUBIN_STORE), d)
+    return (f"{d}: {len(sizes)} images, {sum(sizes) / 1e6:.1f} MB"
+            + (f" ({linked} linked from the store {CUBIN_STORE})" if CUBIN_STORE.is_dir() else ""))
+
+
+def _require_target(target: str, platform: str) -> None:
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(target, platform)
+    if not ok:
+        raise RuntimeError(
+            f"GATE kconv-target: got a liblorrax_ffi without {target} on "
+            f"{platform} ({why}); want the handler this router selects; fix: "
+            "rebuild the native library (Perlmutter: "
+            "config/perlmutter/build_ffi_cuda.sh) from this tree.")
+
+
+def _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> dict:
+    kg = _check_kgrid(kgrid, "mathdx")
+    return dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                scale=np.float64(scale),
+                perm_l=_check_perm(perm_l, ns, "left"),
+                phase_l=_conv_kpair_phase_codes(phase_l, ns, "left"),
+                perm_r=_check_perm(perm_r, ns, "right"),
+                phase_r=_conv_kpair_phase_codes(phase_r, ns, "right"),
+                **_mathdx_common())
+
+
+def _check_kgrid(kgrid, backend: str) -> tuple[int, int, int]:
+    """Three positive k axes; on the ``mathdx`` leg also at most ``KCONV_AXIS_MAX``.
+
+    The cap is the fp64 cuFFTDx thread-FFT limit, a mathdx constraint: the XLA
+    backend has none.
+    """
+    kg = tuple(int(v) for v in kgrid)
+    if len(kg) != 3 or min(kg) < 1:
+        raise RuntimeError(
+            f"GATE kconv-kgrid: got k-grid {kg}; want three positive axes; fix: "
+            "pass the (nkx, nky, nkz) of the run's k-grid.")
+    if backend == "mathdx" and max(kg) > KCONV_AXIS_MAX:
+        raise RuntimeError(
+            f"GATE mathdx-kconv-axis: got k-grid {kg}; want every axis in "
+            f"[1,{KCONV_AXIS_MAX}]; why: the fp64 cuFFTDx thread-FFT limit; fix: "
+            "a smaller k-grid.")
+    return kg
+
+
+def _mathdx_common() -> dict:
+    """The two string attributes every mathdx handler takes: the wheel root and
+    the disk cubin cache directory (:func:`cubin_cache_dir`)."""
+    return dict(mathdx_root=mathdx_root(), cubin_dir=cubin_cache_dir())
+
+
+def cubin_cache_dir() -> str:
+    """Where the compiled mathdx kernels are kept: ``$SCRATCH/.cache/lorrax/kconv_mathdx/<ffi-tag>``,
+    or ``~/.cache/lorrax/kconv_mathdx/<ffi-tag>`` where the site defines no ``SCRATCH``;
+    ``<ffi-tag>`` is the enforced native closure identity
+    (``common.jax_compile_cache.native_cache_tag``).
+
+    Always on, and separate from the XLA compile cache
+    (``common.jax_compile_cache``, one namespace per jax, jaxlib, FFI bundle
+    and key schema): this store is small and content-addressed — each image
+    is keyed by the hash of its source, headers, deciding NVRTC options and
+    toolchain (``common/rtc_build.h``), written by tmp+rename and re-hashed
+    on read — so reusing it can never change a result, while rebuilding one
+    image costs about 7 s on every rank that misses
+    (``docs/architecture/compilation.md``, §2).  One
+    directory for every world size: an image depends on the device and the
+    wheel, not on P.  No knob.  The first call of a process seeds it from the
+    release's read-only store (:func:`seed_cubin_cache`).
+    """
+    from lxkit import user_cache_dir
+    from common.jax_compile_cache import native_cache_tag
+    # One store per native closure: an image built against one NVRTC/hipRTC and
+    # library set is never offered to another (lxkit.native_provider).
+    d = str(user_cache_dir("kconv_mathdx") / native_cache_tag())
+    seed_cubin_cache(str(CUBIN_STORE), d)
+    return d
+
+
+#: The release's read-only image store: ``<source root>/cubin_store``, built once per
+#: architecture at install (``scripts/build_cubin_store.py``); absent in a checkout.
+CUBIN_STORE = Path(__file__).resolve().parents[2] / "cubin_store"
+
+
+@lru_cache(maxsize=None)
+def seed_cubin_cache(store: str, cache: str) -> int:
+    """Link every store image the per-user cache lacks into it, once per process; the count.
+
+    The cache path, which every mathdx call carries as its ``cubin_dir`` attribute (and so
+    in its JAX compile key), never changes: the store only feeds it.  Each link is made
+    under a temporary name and renamed into place, so concurrent ranks cannot tear one; a
+    file already present is kept, and a dangling link (a retired release) is replaced.  The
+    native reader checks each image's key and hash as for any cached file
+    (``common/rtc_build.h``), so a torn or foreign store file is rebuilt into the cache.
+    """
+    import os
+    import warnings
+    try:
+        names = [e.name for e in os.scandir(store) if e.name.endswith(".cubin")]
+        os.makedirs(cache, exist_ok=True)
+    except OSError:
+        return 0
+    n = 0
+    for name in names:
+        dst = os.path.join(cache, name)
+        if os.path.exists(dst):
+            continue
+        tmp = f"{dst}.link.{os.getpid()}"
+        try:
+            os.symlink(os.path.join(store, name), tmp)
+            os.replace(tmp, dst)
+            n += 1
+        except OSError as e:
+            warnings.warn(f"[kconv] cubin store image {name} not linked into {cache}: {e}; "
+                          "it compiles once into the cache instead", RuntimeWarning, stacklevel=2)
+    return n
+
+
+# ---- the plan (cpu) and XLA backends: one composition, two transform engines ----
+
+#: The host FFTW3-ABI flat-k transform and fused Σ convolution of the plan backend.
+FLAT_K_TARGET = "lorrax_mklfft_flat_k"
+GW_CONV_TARGET = "lorrax_mklfft_gw_conv"
+
+
+# Kernel lessons: the plan backend's host FFTW3-ABI handlers (numbers: sandbox claim ids).
+# Over plain JAX: one CrI3 6x6 P4 rank tile (6x6x1 k, 489 x 489 centroids, ns 2) on 128 Milan
+#   cores, the Sigma tau convolution 0.16 s against 1.20 s for jnp.fft and the chi0 transform
+#   pair 0.34 s against 1.32 s; peak RSS 5.6 against 4.2 GB (3979).
+def _host_flat_k(x_flat, kgrid, kind: str, scale: float = 1.0):
+    """``scale·FFT^±`` of the leading flat-k axis on the host FFTW3-ABI handler (complex128)."""
+    _require_target(FLAT_K_TARGET, "cpu")
+    kg = tuple(int(v) for v in kgrid)
+    if x_flat.dtype != jnp.complex128:
+        raise TypeError(f"the host flat-k transform is complex128 only, got {x_flat.dtype}")
+    if int(x_flat.shape[0]) != kg[0] * kg[1] * kg[2]:
+        raise ValueError(f"flat-k input leading extent {x_flat.shape[0]} != prod({kg})")
+    return jax.ffi.ffi_call(
+        FLAT_K_TARGET, jax.ShapeDtypeStruct(x_flat.shape, x_flat.dtype),
+        input_output_aliases={0: 0},
+    )(x_flat, nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+      forward=np.int64(0 if kind == "ifftn" else 1), scale=np.float64(scale))
+
+
+def _host_gw_conv_local(kgrid, norm: str | None, mult: float) -> Callable:
+    """Rank-local ``fn(G, W) -> sigma`` on the host gw_conv handler (the plan backend):
+    ``sigma = fftn(ifftn(G) * ifftn(W)[:, None, :, None, :] * mult)``, all three
+    transforms and the product in one chunked call, so the R-space G tile never
+    materialises.  ``W`` stays in k space (the plan backend's ``prep`` is the identity)."""
+    _require_target(GW_CONV_TARGET, "cpu")
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                 scale_i=np.float64(ffi_fft_scale('ifftn', norm, nk)),
+                 scale_f=np.float64(ffi_fft_scale('fftn', norm, nk) * float(mult)))
+
+    def _local(g_local, w_local):
+        return jax.ffi.ffi_call(GW_CONV_TARGET, jax.ShapeDtypeStruct(g_local.shape, g_local.dtype),
+                                input_output_aliases={0: 0})(g_local, w_local, **attrs)
+    return _local
+
+
+# The XLA backend's k-axis engine.  ``jnp.fft`` over the k axes of a k-leading
+# tile is XLA's FFT op on minor-most dims: a transpose to k-minor, the batched
+# 3-D transform and a transpose back, each a full pass over the tile, and
+# rocFFT's small fp64 transforms (lengths 3-12) run far below bandwidth even
+# k-minor.  A grid this small is cheaper as ONE GEMM with the dense flat-k DFT
+# matrix applied on the axis where k already sits (``F @ X`` k-leading,
+# ``X @ F`` k-minor; F is symmetric): one read and one write of the tile, no
+# layout change.  MI250X GCD, complex128, unnormalised ifftn (pool log
+# screening_t8.out, ``kfft_probe.py``), jnp.fft k-leading vs DFT GEMM:
+#     5x5x1  x 239121 rows  0.947 -> 0.443 ms  (2.1x)   rel.err 9e-16
+#     6x6x1  x 239121       1.498 -> 0.603 ms  (2.5x)           3e-15
+#     4x4x4  x 120000       1.484 -> 0.431 ms  (3.4x)           1e-15
+#     12x12x1 x 60000       1.268 -> 0.589 ms  (2.2x)           7e-15
+# The GEMM costs 8 N_k flops per element, so the rule stops at the largest grid
+# measured; above it ``jnp.fft``'s N_k log N_k wins.  The cap is a per-leg row
+# of this module (a backend preference, so it stays out of lxkit.LEGS): ROCM
+# from the measurement above; cpu so the XLA reference the host gates compare
+# against exercises the engine; CUDA has no row until the A100 crossover is
+# measured, so its XLA route (``xla_reference``, mathdx refusals) keeps
+# ``jnp.fft`` exactly as before.
+#: The largest k-grid (points) the XLA backend transforms as one dense DFT GEMM, by leg key.
+XLA_KDFT_MAX_NK = {"ROCM": 144, "cpu": 144}
+
+
+def xla_kdft_max_nk() -> int:
+    """This process's dense-DFT cap: the row of the leg of ``jax.devices()[0]`` (0 = none)."""
+    from lxkit import leg_for_vendor
+    from ffi.gate import device_vendor
+    leg = leg_for_vendor(device_vendor(jax.devices()[0]))
+    return XLA_KDFT_MAX_NK.get(leg.key, 0) if leg is not None else 0
+
+
+@functools.lru_cache(maxsize=None)
+def _kdft_matrix(kg: tuple[int, int, int], kind: str) -> np.ndarray:
+    """The unnormalised flat-k DFT matrix ``F^±`` ``(N_k, N_k)`` of ``kg`` (C order, kx
+    slowest): ``ifftn`` is ``e^{+2πi k·R}``, ``fftn`` ``e^{-2πi k·R}``.  Symmetric; the
+    phase of each axis factor is reduced mod n before ``exp``, so every entry is
+    the correctly rounded root of unity times at most two roundings of the
+    Kronecker product."""
+    sign = 1.0 if kind == "ifftn" else -1.0
+    F = np.ones((1, 1), np.complex128)
+    for n in kg:
+        j = np.arange(n)
+        F = np.kron(F, np.exp(sign * 2j * np.pi * (np.outer(j, j) % n) / n))
+    F.setflags(write=False)
+    return F
+
+
+def _uses_kdft(kgrid, backend: str) -> bool:
+    """Whether the XLA backend takes the dense DFT GEMM for this grid."""
+    return backend == "xla" and int(np.prod([int(v) for v in kgrid])) <= xla_kdft_max_nk()
+
+
+def _kdft(x, kgrid, kind: str, *, kminor: bool):
+    """Unnormalised k transform of ``x`` as one GEMM on its flat-k axis: the leading
+    axis (``x (N_k, *rows)``) or the trailing one (``x (*rows, N_k)``)."""
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    F = jnp.asarray(_kdft_matrix(kg, kind), dtype=jnp.result_type(x.dtype, jnp.complex64))
+    hi = jax.lax.Precision.HIGHEST
+    if kminor:
+        return jnp.matmul(x.reshape(-1, nk), F, precision=hi).reshape(x.shape)
+    return jnp.matmul(F, x.reshape(nk, -1), precision=hi).reshape(x.shape)
+
+
+def _kfft(x_flat, kgrid, kind: str, backend: str):
+    """Unnormalised transform of the leading flat-k axis: the host handler on the
+    plan backend; on the XLA backend the dense DFT GEMM up to the leg's
+    :func:`xla_kdft_max_nk` points (:func:`_kdft`), ``jnp.fft`` above."""
+    if backend == "plan":
+        return _host_flat_k(x_flat, kgrid, kind)
+    if _uses_kdft(kgrid, backend):
+        return _kdft(x_flat, kgrid, kind, kminor=False)
+    from common.fft_helpers import local_fftn3, local_ifftn3   # see the import-cycle note
+    kg = tuple(int(v) for v in kgrid)
+    norm = "forward" if kind == "ifftn" else "backward"          # both unnormalised
+    f = local_ifftn3 if kind == "ifftn" else local_fftn3
+    y = f(x_flat.reshape(kg + tuple(x_flat.shape[1:])), axes=(0, 1, 2), norm=norm)
+    return y.reshape(x_flat.shape)
+
+
+def _pair_tail(P_l, P_r, kgrid, perm_l, phase_l, perm_r, phase_r, scale, backend):
+    """``s·FFT_k Σ_ab phase_l[a]·phase_r[b]·conj(IFFT_k P_l[:,a,…,b])·IFFT_k P_r[:,π_l a,…,π_r b]``.
+
+    ``P_l``/``P_r`` are flat-k open-spin ``(nk, ns, *rows, ns)``; returns ``(nk, *rows)``.
+    """
+    ns = int(P_l.shape[1])
+    I_l = jnp.conj(_kfft(P_l, kgrid, "ifftn", backend))
+    I_r = _kfft(P_r, kgrid, "ifftn", backend)
+    Z = 0
+    for a in range(ns):
+        for b in range(ns):
+            w = complex(phase_l[a]) * complex(phase_r[b])
+            Z = Z + w * I_l[:, a, ..., b] * I_r[:, int(perm_l[a]), ..., int(perm_r[b])]
+    return _kfft(Z, kgrid, "fftn", backend) * scale
+
+
+def _parent_open_spin(D, tables, right: bool):
+    """The typed parent load of every full-k child: ``(nk, ns, mu, nu, ns)``.
+
+    The same map as the mathdx kernel's load: umklapp phases of both
+    endpoints, antiunitary conjugation, then ``P = conj(Σ_cd coef·T(D_cd))``.
+    """
+    irr, sym, left, rightp, L, R, q, trs, coef_l, coef_r = tables
+    ns = int(D.shape[1])
+    coef = (coef_r if right else coef_l).reshape(-1, ns, ns, ns, ns)   # (k, a, b, c, e)
+    lm = jnp.take(left, sym, axis=0)                                    # (k, mu)
+    rn = jnp.take(rightp, sym, axis=0)                                  # (k, nu)
+    qp = jnp.take(q, irr, axis=0)                                       # (k, 3)
+    pl = jnp.exp(2j * jnp.pi * jnp.einsum('ki,kmi->km', qp, jnp.take(L, sym, axis=0)))
+    pr = jnp.exp(-2j * jnp.pi * jnp.einsum('ki,kni->kn', qp, jnp.take(R, sym, axis=0)))
+    G = jnp.take(D, irr, axis=0)                                        # (k, c, mu, e, nu)
+    G = jnp.take_along_axis(G, lm[:, None, :, None, None], axis=2)
+    G = jnp.take_along_axis(G, rn[:, None, None, None, :], axis=4)
+    V = pl[:, None, :, None, None] * G * pr[:, None, None, None, :]
+    V = jnp.where((trs != 0)[:, None, None, None, None], jnp.conj(V), V)
+    return jnp.conj(jnp.einsum('kabce,kcmen->kamnb', coef, V))   # spin axes 1 and -1
+
+
+def pair_resident_refusal(kgrid, *, optin=None) -> str:
+    """Why modes 0/1/6 need the staged route; same three-bank rule as CUDA.
+
+    The decision changes execution only. The staged route uses the existing
+    k-axis transform factory on each complete-P spatial tile, never a full-spin
+    unfolded bank. Both routes have O(nk log(nk) mu nu / P) work and O(nk mu nu / P)
+    scratch for bounded spin dimension (2/4); no new vendor or driver route.
+    """
+    kg = _check_kgrid(kgrid, "mathdx")
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    need = 3 * 16 * (int(np.prod(kg)) | 1)
+    if have is None:
+        return "no CUDA driver to read the opt-in shared memory"
+    why = f"resident pair row needs {need} B > {have} B opt-in shared memory" if need > have else ""
+    if why:
+        from ffi.gate import announce_once
+        announce_once(("kconv", "pair-staged", kg, have),
+                      f"[kconv] pair convolution -> staged spin/spatial tiles through the native k-axis FFT: {why}; "
+                      "scratch columns<=2048, no full-spin unfolded banks", scope="rank0")
+    return why
+
+
+def _stream_pair_components(kgrid, ns, perm_l, phase_l, perm_r, phase_r,
+                            scale, left, right, shape, fft, ifft):
+    """Sum open-spin components with only scalar-spin k tiles live.
+
+    ``left(a,b)``/``right(a,b)`` return (nk,mu,nu); their typed load owns
+    symmetry, conjugation and phases. A loop keeps XLA from constructing
+    the ns² full-k transform banks which the resident kernel avoids.
+    """
+    pl = jnp.asarray(_check_perm(perm_l, ns, "left"))
+    pr = jnp.asarray(_check_perm(perm_r, ns, "right"))
+    phl = jnp.asarray(np.asarray(phase_l, np.complex128).reshape(ns))
+    phr = jnp.asarray(np.asarray(phase_r, np.complex128).reshape(ns))
+
+    def add(i, total):
+        a, b = i // ns, i % ns
+        # Seal counter-indexed loads against post-loop-write rematerialization.
+        L = jax.lax.optimization_barrier(left(a, b))
+        R = jax.lax.optimization_barrier(right(pl[a], pr[b]))
+        weight = jax.lax.optimization_barrier(phl[a] * phr[b])
+        return total + weight * jnp.conj(ifft(L)) * ifft(R)
+
+    z = jax.lax.fori_loop(0, ns * ns, add, jnp.zeros(shape, jnp.complex128), unroll=False)
+    return fft(z) * scale
+
+
+def _staged_pair_ffts(mesh, kgrid):
+    """Existing NVIDIA k-box/CPU transform factories, with unnormalized transforms."""
+    return (make_local_kfft_klead(mesh, kgrid, kind="fftn", norm="backward"),
+            make_local_kfft_klead(mesh, kgrid, kind="ifftn", norm="forward"))
+
+
+def _parent_spin_component(D, tables, right, a, b, mu_start=0, mu_size=None, nu_start=0, nu_size=None):
+    """One component of _parent_open_spin, without its ns² full-k bank."""
+    irr, sym, left, rightp, L, R, q, trs, coef_l, coef_r = tables
+    ns = int(D.shape[1])
+    coef = (coef_r if right else coef_l).reshape(-1, ns, ns, ns, ns)
+    mu_size = int(D.shape[2]) if mu_size is None else int(mu_size)
+    nu_size = int(D.shape[4]) if nu_size is None else int(nu_size)
+    lm = jax.lax.dynamic_slice_in_dim(jnp.take(left, sym, axis=0), mu_start, mu_size, axis=1)
+    rn = jax.lax.dynamic_slice_in_dim(jnp.take(rightp, sym, axis=0), nu_start, nu_size, axis=1)
+    Lv = jax.lax.dynamic_slice_in_dim(jnp.take(L, sym, axis=0), mu_start, mu_size, axis=1)
+    Rv = jax.lax.dynamic_slice_in_dim(jnp.take(R, sym, axis=0), nu_start, nu_size, axis=1)
+    qp = jnp.take(q, irr, axis=0)
+    pl = jnp.exp(2j * jnp.pi * jnp.einsum('ki,kmi->km', qp, Lv))
+    pr = jnp.exp(-2j * jnp.pi * jnp.einsum('ki,kni->kn', qp, Rv))
+
+    def add(i, total):
+        c, e = i // ns, i % ns
+        # One gather of the requested spatial tile. Taking all k rows before
+        # slicing endpoints would secretly rebuild the full scalar-spin bank.
+        G = D[irr[:, None, None], c, lm[:, :, None], e, rn[:, None, :]]
+        G = jax.lax.optimization_barrier(G)
+        V = pl[:, :, None] * G * pr[:, None, :]
+        V = jnp.where((trs != 0)[:, None, None], jnp.conj(V), V)
+        w = jax.lax.optimization_barrier(coef[:, a, b, c, e])
+        return total + w[:, None, None] * V
+
+    out = jax.lax.fori_loop(0, ns * ns, add,
+                           jnp.zeros((irr.shape[0], mu_size, nu_size), D.dtype),
+                           unroll=False)
+    return jnp.conj(out)
+
+
+def _stream_pair_tiles(kgrid, ns, perm_l, phase_l, perm_r, phase_r,
+                       scale, left, right, shape, fft, ifft):
+    """Complete-P output, with <=2048 spatial columns of scalar-spin scratch."""
+    nk, mu, nu = shape
+    mt, nt = min(mu, 32), min(nu, 64)
+    nm, nn = (mu + mt - 1) // mt, (nu + nt - 1) // nt
+
+    def tile(i, out):
+        m = jax.lax.optimization_barrier(jnp.minimum((i // nn) * mt, mu - mt))
+        n = jax.lax.optimization_barrier(jnp.minimum((i % nn) * nt, nu - nt))
+        value = _stream_pair_components(
+            kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale,
+            lambda a, b: left(a, b, m, mt, n, nt),
+            lambda a, b: right(a, b, m, mt, n, nt),
+            (nk, mt, nt), fft, ifft)
+        return jax.lax.dynamic_update_slice(out, value, (0, m, n))
+
+    return jax.lax.fori_loop(0, nm * nn, tile, jnp.zeros(shape, jnp.complex128), unroll=False)
+
+
+def _staged_kparent(mesh, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale):
+    fft, ifft = _staged_pair_ffts(mesh, kgrid)
+
+    def apply(D_l, D_r, tables):
+        _check_parent_operands(D_l, D_r, ns)
+        return _stream_pair_tiles(
+            kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale,
+            lambda a, b, m, mt, n, nt: _parent_spin_component(D_l, tables, False, a, b, m, mt, n, nt),
+            lambda a, b, m, mt, n, nt: _parent_spin_component(D_r, tables, True, a, b, m, mt, n, nt),
+            (int(np.prod(kgrid)), int(D_l.shape[2]), int(D_l.shape[4])), fft, ifft)
+    return apply
+
+
+# ---- the router's pair-convolution factories --------------------------------
+
+# Kernel lessons: the zeta-fit pair convolution and plane FFT, modes 0, 1, 6 and 10 (numbers:
+# sandbox claim ids).
+# Over plain JAX: mode 10 against run concat + jnp.fft.fftn, 1.49-2.33x, production planes 54^2
+#   1.69x and 80^2 1.53x (2749), zeta charge loop -18.7% / -20.6% (2750); mode 6 (Bloch phase and
+#   L/R split on load) against the XLA moveaxis/phase/split + mode 1, route-G device time -30.7%
+#   (2704).
+# Paid: mode 10 at 512 threads, 80^2 3.26 -> 2.60 ms; its cp.async gather 1.11-1.37x (2785).
+# Did not pay: mode 1's typed parent load, 0.84-0.95x of XLA at VI3 12x12x1, 1.2-1.9x on TaAs
+#   (2650); a DFT GEMM on a full axis, never faster than cuFFT (2748); the CUDA leg on FFT-only
+#   plans, 1.20-1.33x slower than the XLA leg (2786); plan supports for density, mtxel and the
+#   zeta cylinder, <= 2% of FFT time (2785); one plane per block at N <= 40 (2749).
+# Decides it: HBM passes (mode 10 writes each plane once; route G runs at 64% of HBM) until
+#   residency binds: mode 6 at Fe 8^3 is 1 block per SM with 62% excess bank wavefronts (2796).
+def make_fused_conv_kpair(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    *,
+    perm_l,
+    phase_l,
+    perm_r,
+    phase_r,
+    norm: str | None = "forward",
+    mult: float = 1.0,
+) -> Callable:
+    """The ISDF CCT/ZCT post-pair convolution ``fn(A, B) -> U``, routed by platform.
+
+    ``A``/``B`` ``(nkx,nky,nkz, ns, col, mu, ns)`` c128, device-local inside
+    the caller's ``shard_map``; ``U`` ``(nkx,nky,nkz, col, mu)``::
+
+        U = s·FFT_k Σ_ab phase_l[a]·phase_r[b]·conj(IFFT_k A[…,a,…,b])·IFFT_k B[…,π_l a,…,π_r b]
+
+    CUDA: the nvidia-mathdx family; cpu: the plan backend; elsewhere the XLA
+    backend; all return the same contract.
+    """
+    ns = int(np.asarray(perm_l).size)
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    scale = conv_kpair_scale(norm, nk, mult)
+    backend = kconv_backend(mesh, kgrid)
+    if backend == "mathdx" and pair_resident_refusal(kgrid):
+        fft, ifft = _staged_pair_ffts(mesh, kgrid)
+
+        def _staged(A, B):
+            _check_pair_operands(A, B, (nkx, nky, nkz), ns)
+            Af, Bf = A.reshape((nk,) + A.shape[3:]), B.reshape((nk,) + B.shape[3:])
+            def component(X, a, b, m, mt, n, nt):
+                return jax.lax.dynamic_slice(X, (0, a, m, n, b), (nk, 1, mt, nt, 1))[:, 0, :, :, 0]
+            U = _stream_pair_tiles(
+                kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale,
+                lambda a, b, m, mt, n, nt: component(Af, a, b, m, mt, n, nt),
+                lambda a, b, m, mt, n, nt: component(Bf, a, b, m, mt, n, nt),
+                (nk,) + A.shape[4:6], fft, ifft)
+            return U.reshape(A.shape[:3] + A.shape[4:6])
+        return _staged
+    if backend == "mathdx":
+        _require_target(KCONV_PAIR_TARGET, "CUDA")
+        attrs = _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
+
+        def _mathdx(A, B):
+            _check_pair_operands(A, B, (nkx, nky, nkz), ns)
+            out = jax.ShapeDtypeStruct(A.shape[:3] + A.shape[4:6], A.dtype)
+            return jax.ffi.ffi_call(KCONV_PAIR_TARGET, out)(A, B, **attrs)
+        return _mathdx
+
+    return _kpair(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend)
+
+
+def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
+                            perm_l, phase_l, perm_r, phase_r, centroid_major=False) -> Callable:
+    """The ISDF parent-load pair convolution ``fn(D_l, D_r, tables) -> U``, routed by platform.
+
+    ``D_l``/``D_r`` ``(n_parent, ns, mu, ns, nu)`` c128 raw-parent projectors
+    and the ten typed tables of ``isdf.core._parent_conv_tables_local``;
+    ``U`` ``(nk, mu, nu)``.  ``centroid_major`` states the physical layout of
+    the D operands (CCT) for the CUDA handler; the logical contract is
+    unchanged.  ``trailing_shape`` is the caller's ``(mu, nu)`` tile, kept for
+    the seam's signature.  CUDA: nvidia-mathdx; cpu: the plan backend; elsewhere XLA.
+    """
+    del trailing_shape
+    ns = int(ns)
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    scale = conv_kpair_scale("forward", nk, 1.0)
+    backend = kconv_backend(mesh, kgrid)
+    if backend == "mathdx" and pair_resident_refusal(kgrid):
+        return _staged_kparent(mesh, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
+    if backend == "mathdx":
+        _require_target(KCONV_PARENT_TARGET, "CUDA")
+        attrs = _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
+        attrs["centroid_major"] = np.int64(bool(centroid_major))
+        layout = (0, 4, 3, 2, 1) if centroid_major else None
+
+        def _mathdx(D_l, D_r, tables):
+            _check_parent_operands(D_l, D_r, ns)
+            out = jax.ShapeDtypeStruct((nk, D_l.shape[2], D_l.shape[4]), D_l.dtype)
+            return jax.ffi.ffi_call(
+                KCONV_PARENT_TARGET, out,
+                input_layouts=(layout, layout, *(None for _ in tables)),
+            )(D_l, D_r, *tables, **attrs)
+        return _mathdx
+
+    target = rocm_parent_target(mesh, kgrid, ns)
+    if target is not None:
+        return _kdft_parent_fn(target, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, centroid_major)
+
+    return _kparent(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend)
+
+
+def _kdft_parent_fn(target, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, centroid_major) -> Callable:
+    """The ROCM mode-1 call of :func:`make_fused_conv_kparent` (the CUDA call's operands, attributes and
+    input layout less ``mathdx_root``).
+
+    Measured on one MI250X GCD against the XLA route (typed parent load + pair tail; pool log kconv_b1,
+    ms per call): 4^3 ns 2, 64 parents, 156^2 per rank (Fe V2 P=4) 4.21 -> 1.71 (2.45x), 312^2 2.28x,
+    78^2 with 8 parents 6.18x, 2^3 1.57x, 1x1x1 1.33x: routed wherever :func:`kdft_parent_refusal` is empty.
+    """
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz), scale=np.float64(scale),
+                 centroid_major=np.int64(bool(centroid_major)),
+                 perm_l=_check_perm(perm_l, ns, "left"), phase_l=_conv_kpair_phase_codes(phase_l, ns, "left"),
+                 perm_r=_check_perm(perm_r, ns, "right"), phase_r=_conv_kpair_phase_codes(phase_r, ns, "right"),
+                 cubin_dir=cubin_cache_dir())
+    layout = (0, 4, 3, 2, 1) if centroid_major else None
+
+    def _kdft(D_l, D_r, tables):
+        _check_parent_operands(D_l, D_r, ns)
+        out = jax.ShapeDtypeStruct((nk, D_l.shape[2], D_l.shape[4]), D_l.dtype)
+        return jax.ffi.ffi_call(target, out, input_layouts=(layout, layout, *(None for _ in tables)))(
+            D_l, D_r, *tables, **attrs)
+    return _kdft
+
+
+def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r) -> Callable:
+    """The route-G pair convolution ``fn(D, F) -> U`` read from the D-plane FFT output.
+
+    ``D`` ``(nk, g, ns, 2c, ns, p)`` c128 is the plane transform exactly as
+    ``isdf.zeta_mubatch`` leaves it (``g`` planes of ``p`` points; slots
+    ``[0, c)`` of the ``2c`` axis are the L projector, ``[c, 2c)`` the R one),
+    ``F`` ``(nk, g, p)`` its Bloch phase; ``U`` ``(nk, c, g·p)``::
+
+        P^X_{k,ab}(m, (g,p)) = conj(F[k,g,p] · D[k,g,a,X+m,b,p])      X = 0 | c
+        U = s·FFT_k Σ_ab phase_l[a]·phase_r[b]·conj(IFFT_k P^L_ab)·IFFT_k P^R_{π_l a, π_r b}
+
+    — :func:`make_fused_conv_kparent` on the identity plan, without the
+    transposed, phased and split copy of ``D`` that its operand layout needs.
+    CUDA: nvidia-mathdx mode 6 (the phase and the split are applied on load);
+    ROCM: its port on the k-box stage (``cpp/kdft/kbox_plane_ffi.cc``, :func:`kdft_plane_refusal`);
+    the plan and XLA backends run the same composition.  ``s`` is the forward-norm
+    pair scale of the parent factory.
+    """
+    ns = int(ns)
+    nkx, nky, nkz = (int(v) for v in kgrid)
+    nk = nkx * nky * nkz
+    scale = conv_kpair_scale("forward", nk, 1.0)
+    backend = kconv_backend(mesh, kgrid)
+    if backend == "mathdx" and pair_resident_refusal(kgrid):
+        fft, ifft = _staged_pair_ffts(mesh, kgrid)
+
+        def _staged(D, F):
+            c = _check_plane_operands(D, F, nk, ns)
+            def component(a, b, offset, m, mt, n, nt):
+                # Gather only this spatial tile, including flattened(g,p) columns.
+                # A moveaxis/reshape of all g planes before slicing could copy a
+                # complete scalar-spin bank, defeating the scratch bound.
+                cols = n + jnp.arange(nt)
+                gv, pv = cols // D.shape[5], cols % D.shape[5]
+                rows = offset + m + jnp.arange(mt)
+                X = D[jnp.arange(nk)[:, None, None], gv[None, None, :], a,
+                      rows[None, :, None], b, pv[None, None, :]]
+                phase = F[:, gv, pv]
+                return jnp.conj(X * phase[:, None, :])
+            return _stream_pair_tiles(
+                kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale,
+                lambda a, b, m, mt, n, nt: component(a, b, 0, m, mt, n, nt),
+                lambda a, b, m, mt, n, nt: component(a, b, c, m, mt, n, nt),
+                (nk, c, D.shape[1] * D.shape[5]), fft, ifft)
+        return _staged
+    if backend == "mathdx":
+        _require_target(KCONV_PLANE_TARGET, "CUDA")
+        attrs = _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
+
+        def _mathdx(D, F):
+            c = _check_plane_operands(D, F, nk, ns)
+            out = jax.ShapeDtypeStruct((nk, c, D.shape[1] * D.shape[5]), D.dtype)
+            return jax.ffi.ffi_call(KCONV_PLANE_TARGET, out)(D, F, **attrs)
+        return _mathdx
+
+    target = rocm_plane_target(mesh, kgrid, ns)
+    if target is not None:
+        attrs = dict(nkx=np.int64(nkx), nky=np.int64(nky), nkz=np.int64(nkz), scale=np.float64(scale),
+                     perm_l=_check_perm(perm_l, ns, "left"), phase_l=_conv_kpair_phase_codes(phase_l, ns, "left"),
+                     perm_r=_check_perm(perm_r, ns, "right"), phase_r=_conv_kpair_phase_codes(phase_r, ns, "right"),
+                     cubin_dir=cubin_cache_dir())
+
+        def _kdft(D, F):
+            c = _check_plane_operands(D, F, nk, ns)
+            out = jax.ShapeDtypeStruct((nk, c, D.shape[1] * D.shape[5]), D.dtype)
+            return jax.ffi.ffi_call(target, out)(D, F, **attrs)
+        return _kdft
+
+    pl, pr = _check_perm(perm_l, ns, "left"), _check_perm(perm_r, ns, "right")
+    phl = np.asarray(phase_l, np.complex128).reshape(-1)
+    phr = np.asarray(phase_r, np.complex128).reshape(-1)
+
+    def _xla(D, F):
+        c = _check_plane_operands(D, F, nk, ns)
+        X = jnp.moveaxis(D * F[:, :, None, None, None, :], 1, 4)    # (k, a, 2c, b, g, p)
+        X = jnp.conj(jnp.moveaxis(X.reshape(nk, ns, 2 * c, ns, -1), 3, 4))
+        return _pair_tail(X[:, :, :c], X[:, :, c:], kgrid, pl, phl, pr, phr, scale,
+                          backend)
+    return _xla
+
+
+def _check_plane_operands(D, F, nk: int, ns: int) -> int:
+    """Shape/dtype contract of :func:`make_fused_conv_kplane`; returns ``c``."""
+    if (D.ndim != 6 or F.ndim != 3 or D.dtype != jnp.complex128 or F.dtype != jnp.complex128
+            or int(D.shape[0]) != nk or int(D.shape[2]) != ns or int(D.shape[4]) != ns
+            or int(D.shape[3]) % 2 or tuple(F.shape) != (nk, D.shape[1], D.shape[5])):
+        raise ValueError(
+            f"k-conv plane expects c128 D (nk={nk}, g, ns={ns}, 2c, ns, p) and F (nk, g, p); "
+            f"got {D.shape} {D.dtype} / {F.shape} {F.dtype}")
+    return int(D.shape[3]) // 2
+
+
+def _kpair(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend) -> Callable:
+    """The plan/XLA-backend ``fn(A, B) -> U`` of :func:`make_fused_conv_kpair`."""
+    kg = tuple(int(v) for v in kgrid)
+    nk = kg[0] * kg[1] * kg[2]
+    pl, pr = _check_perm(perm_l, ns, "left"), _check_perm(perm_r, ns, "right")
+    phl = np.asarray(phase_l, np.complex128).reshape(-1)
+    phr = np.asarray(phase_r, np.complex128).reshape(-1)
+
+    def _xla(A, B):
+        _check_pair_operands(A, B, kg, ns)
+        flat = lambda X: X.reshape((nk,) + tuple(X.shape[3:]))
+        U = _pair_tail(flat(A), flat(B), kg, pl, phl, pr, phr, scale, backend)
+        return U.reshape(A.shape[:3] + A.shape[4:6])
+    return _xla
+
+
+def _kparent(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale, backend) -> Callable:
+    """The plan/XLA-backend ``fn(D_l, D_r, tables) -> U`` of :func:`make_fused_conv_kparent`."""
+    pl, pr = _check_perm(perm_l, ns, "left"), _check_perm(perm_r, ns, "right")
+    phl = np.asarray(phase_l, np.complex128).reshape(-1)
+    phr = np.asarray(phase_r, np.complex128).reshape(-1)
+
+    def _xla(D_l, D_r, tables):
+        _check_parent_operands(D_l, D_r, ns)
+        return _pair_tail(_parent_open_spin(D_l, tables, False),
+                          _parent_open_spin(D_r, tables, True),
+                          kgrid, pl, phl, pr, phr, scale, backend)
+    return _xla
+
+
+def _check_pair_operands(A, B, kg, ns) -> None:
+    if A.dtype != jnp.complex128 or B.dtype != jnp.complex128:
+        raise TypeError(f"k-conv pair is complex128 only; got {A.dtype}/{B.dtype}")
+    if A.ndim != 7 or A.shape != B.shape or tuple(int(v) for v in A.shape[:3]) != kg \
+            or int(A.shape[3]) != ns or int(A.shape[6]) != ns:
+        raise ValueError(
+            f"k-conv pair expects equal (nkx,nky,nkz,ns,col,mu,ns) operands with "
+            f"k-grid {kg}, ns={ns}; got {A.shape}/{B.shape}")
+
+
+def _check_parent_operands(D_l, D_r, ns) -> None:
+    if (D_l.ndim != 5 or D_l.shape != D_r.shape or D_l.shape[1] != ns or D_l.shape[3] != ns
+            or D_l.dtype != jnp.complex128 or D_r.dtype != jnp.complex128):
+        raise ValueError("k-conv parent requires matching c128 (parent,ns,mu,ns,nu) operands")
+
+
+# ===========================================================================
+# THE k-CONVOLUTION ROUTER — stored-kernel convolutions and k-axis transforms
+# ===========================================================================
+# Same routing as the pair family above: CUDA -> nvidia-mathdx (modes 2-5 of
+# cpp/cufft/kconv_mathdx_cuda_ffi.cc), cpu -> the plan backend, other -> XLA.
+# The k axis is either LEADING (the Σ/COHSEX dot layout, flat k first)
+# or MINOR (the BSE ring layout, the three k axes last); a caller asks for the
+# factory that matches the tile it holds, and never transposes to reach another.
+#
+#     make_kconv_klead   Σ, COHSEX   U = mult·fftn(ifftn(T)·ifftn(W)[:,None,:,None,:])
+#     make_kconv_kminor  BSE rung    U = mult·fftn_k(ifftn_k(X)·K_R)   (K_R already R space)
+#     make_kfft_klead    flat-k      Y = fftn|ifftn over the leading k axis
+#     make_kfft_kminor   BSE         Y = fftn|ifftn over the three trailing k axes
+#
+# The *_local variants are the same callables for code already inside a
+# shard_map (which cannot nest); the plain ones wrap their own.
+
+class KConvStored(NamedTuple):
+    """A stored-kernel k-leading convolution, split at its one W-only seam.
+
+    ``prep(W) -> W_prep`` is everything that depends on W alone, paid once per
+    W; ``apply(T, W_prep) -> U`` is the rest, paid per T.  ``W_prep`` is the
+    R-space form: pass it only to the ``apply`` of the same pair.
+    """
+    prep: Callable
+    apply: Callable
+
+
+def _rows_kfft_call(target, x2, kg, *, forward: bool, scale: float):
+    """One mathdx transform call on a 2-D (nk, rows) or (rows, nk) tile."""
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                 scale=np.float64(scale), forward=np.int64(1 if forward else 0),
+                 **_mathdx_common())
+    return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(x2.shape, x2.dtype),
+                            input_output_aliases={0: 0})(x2, **attrs)
+
+
+def _check_complex(*xs):
+    """Every operand complex128, or every operand complex64 (the fp32-GMRES BSE
+    arm; mathdx modes 2-5 compile a single-precision image for it).  Never cast."""
+    dts = {jnp.dtype(x.dtype) for x in xs}
+    if len(dts) != 1 or dts.pop() not in (jnp.dtype(jnp.complex128), jnp.dtype(jnp.complex64)):
+        raise TypeError(f"the k-convolution router takes all-complex128 or all-complex64 "
+                        f"operands; got {[str(x.dtype) for x in xs]} (it never casts)")
+
+
+def make_local_kfft_klead(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> Callable:
+    """Rank-local ``fn(X) -> Y`` over the LEADING flat-k axis of ``X (nk, *trail)``."""
+    if kind not in ("ifftn", "fftn"):
+        raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    scale = ffi_fft_scale(kind, norm, nk)
+    if kconv_backend(mesh, kgrid) == "mathdx":
+        _require_target(KFFT_KLEAD_TARGET, "CUDA")
+
+        def _mathdx(x):
+            _check_complex(x)
+            y = _rows_kfft_call(KFFT_KLEAD_TARGET, x.reshape(nk, -1), kg,
+                                forward=kind == "fftn", scale=scale)
+            return y.reshape(x.shape)
+        return _mathdx
+
+    if kconv_backend(mesh, kgrid) == "plan":
+        return lambda x: _host_flat_k(x, kg, kind, scale)
+
+    target = rocm_klead_target(mesh, kg, "kfft_klead")
+    if target is not None:
+        def _kdft(x):
+            _check_complex(x)
+            return _kdft_rows_call(target, x.reshape(nk, -1), kg, forward=kind == "fftn",
+                                   scale=scale).reshape(x.shape)
+        return _kdft
+
+    def _xla(x):
+        _check_complex(x)
+        return _kfft(x, kg, kind, "xla") * scale
+    return _xla
+
+
+def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) -> Callable:
+    """Rank-local ``fn(X) -> Y`` over the three TRAILING k axes of ``X (..., nkx, nky, nkz)``."""
+    if kind not in ("ifftn", "fftn"):
+        raise ValueError(f"kind must be 'ifftn' or 'fftn', got {kind!r}")
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid, kminor=True))
+    nk = kg[0] * kg[1] * kg[2]
+    scale = ffi_fft_scale(kind, norm, nk)
+    backend = kconv_backend(mesh, kgrid, kminor=True)
+    mathdx = backend == "mathdx"
+    if mathdx:
+        _require_target(KFFT_KMINOR_TARGET, "CUDA")
+    target = None if mathdx else rocm_klead_target(mesh, kg, "kfft_kminor")
+    if target is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), forward=np.int64(kind == "fftn"),
+                     cubin_dir=cubin_cache_dir())
+
+        def _kdft_kminor(x):
+            _check_complex(x)
+            if tuple(int(v) for v in x.shape[-3:]) != kg:
+                raise ValueError(f"k-minor transform expects trailing k axes {kg}; got {x.shape}")
+            x2 = x.reshape(-1, nk)
+            return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(x2.shape, x2.dtype),
+                                    input_output_aliases={0: 0})(x2, **attrs).reshape(x.shape)
+        return _kdft_kminor
+
+    def _kminor(x):
+        _check_complex(x)
+        if tuple(int(v) for v in x.shape[-3:]) != kg:
+            raise ValueError(f"k-minor transform expects trailing k axes {kg}; got {x.shape}")
+        if mathdx:
+            y = _rows_kfft_call(KFFT_KMINOR_TARGET, x.reshape(-1, nk), kg,
+                                forward=kind == "fftn", scale=scale)
+            return y.reshape(x.shape)
+        if _uses_kdft(kg, backend):                        # the GEMM reads k where it sits
+            return _kdft(x, kg, kind, kminor=True) * scale
+        lead = x.reshape(-1, nk).T                        # the transform is k-leading
+        return (_kfft(lead, kg, kind, backend) * scale).T.reshape(x.shape)
+    return _kminor
+
+
+def live_row_mask(live, n_rows: int, per_row: int = 1):
+    """The mask of a padded pass's live rows: ``live`` (int32 [2]) is ``[lo, hi)`` in rows of
+    ``per_row`` entries; an axis of ``n_rows * per_row`` entries.  The mathdx kconv calls take ``live``
+    as an optional last operand, skip the rest and store them as zeros (mode 11: add nothing);
+    the XLA compositions zero them with this."""
+    r = jnp.arange(n_rows * per_row) // per_row
+    return (r >= live[0]) & (r < live[1])
+
+
+def _sharded(local, mesh, in_specs, out_spec):
+    from jax import shard_map
+    return shard_map(local, mesh=mesh, in_specs=in_specs, out_specs=out_spec,
+                     check_vma=False)
+
+
+def make_kfft_klead(mesh: Mesh, kgrid, spec: P, *, kind: str, norm: str | None) -> Callable:
+    """Sharded ``fn(X) -> Y`` over the leading flat-k axis; ``spec`` is the 3-D-form spec."""
+    flat = validate_flat_spec(spec, "the input")
+    return _sharded(make_local_kfft_klead(mesh, kgrid, kind=kind, norm=norm),
+                    mesh, (flat,), flat)
+
+
+def make_kfft_kminor(mesh: Mesh, kgrid, spec: P, *, kind: str, norm: str | None) -> Callable:
+    """Sharded ``fn(X) -> Y`` over the three trailing k axes; they must be replicated."""
+    axes = tuple(spec)
+    if len(axes) < 3 or any(a is not None for a in axes[-3:]):
+        raise ValueError(f"k-minor transform needs the three trailing k axes replicated; got {spec}")
+    return _sharded(make_local_kfft_kminor(mesh, kgrid, kind=kind, norm=norm),
+                    mesh, (spec,), spec)
+
+
+
+def plane_fft_split(n: int) -> tuple[int, int] | None:
+    """The Good-Thomas split ``n = n1·n2`` mode 10 transforms an axis of ``n`` points as.
+
+    The most balanced coprime ``n1 >= n2 >= 2`` with ``n1 <= KCONV_AXIS_MAX``
+    (shorter cuFFTDx thread FFTs and more lines per pass); ``(n, 1)`` for a
+    prime power ``2 <= n <= KCONV_AXIS_MAX`` (one thread FFT); ``None`` when
+    neither exists: a prime power above the thread-FFT limit (64, 81, 125,
+    128, …) or a prime factor above it.
+    """
+    n = int(n)
+    best = None
+    for n1 in range(2, min(n, KCONV_AXIS_MAX + 1)):
+        n2 = n // n1
+        if n % n1 == 0 and 2 <= n2 <= n1 and math.gcd(n1, n2) == 1 and (best is None or n1 < best[0]):
+            best = (n1, n2)
+    if best is None and 2 <= n <= KCONV_AXIS_MAX:
+        best = (n, 1)
+    return best
+
+
+def _plane_runs(pfc: np.ndarray, n_col: int) -> tuple:
+    """The cylinder -> plane zero fill as maximal runs of the flat plane.
+
+    ``(start, stop)`` for cells holding the consecutive columns ``[start,
+    stop)``, ``(-1, length)`` for empty cells; concatenating ``F[...,
+    start:stop]`` and zero blocks is ``take(F, pfc, mode='fill')`` bit for bit.
+    Kept 2026-09-25 (FP, close call): the XLA route serves every plane mode 10
+    cannot, among them the 80² production planes on sm_86/89/120 (99 KiB), and the
+    runs cut that plane stage 5.54 -> 4.98 ms on A100 (claim 2746), ~2-5% of FFT time.
+    """
+    empty = pfc >= n_col
+    brk = np.flatnonzero(np.r_[True, (empty[1:] != empty[:-1])
+                               | (~empty[1:] & (pfc[1:] != pfc[:-1] + 1))])
+    ends = np.r_[brk[1:], pfc.size]
+    return tuple((-1, int(e - s)) if empty[s] else (int(pfc[s]), int(pfc[e - 1]) + 1)
+                 for s, e in zip(brk, ends))
+
+
+@lru_cache(maxsize=None)
+def _optin_smem_bytes(ordinal: int = 0) -> int | None:
+    """The device's opt-in shared memory per block (libcuda attribute 97); None without a driver."""
+    try:
+        import ctypes
+        cu = ctypes.CDLL("libcuda.so.1")
+        dev, v = ctypes.c_int(), ctypes.c_int()
+        if (cu.cuInit(0) or cu.cuDeviceGet(ctypes.byref(dev), int(ordinal))
+                or cu.cuDeviceGetAttribute(ctypes.byref(v), 97, dev)):
+            return None
+        return int(v.value)
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+def plane_resident_bytes(nb: int, nc: int) -> int:
+    """Shared memory one mode-10 block needs for an ``(nb, nc)`` plane, static included.
+
+    The dynamic plane ``16·nb·(nc|1)`` plus the kernel's static tables
+    ``live[nb]`` (1 B), ``rowb[rows]`` (4 B, rows <= nb) and ``foff[PB]`` (8 B,
+    PB = 1 for any plane near the limit), with 16 B of alignment slack.  Mode 10
+    serves the plane only when this fits the device's opt-in shared memory per
+    block; the handler's build() applies the same bound (and adds the
+    asynchronous gather's staging only when that fits as well).
+    """
+    nb, nc = int(nb), int(nc)
+    return 16 * nb * (nc | 1) + 5 * nb + 8 + 16
+
+
+def make_plane_fft_gather(mesh: Mesh, plane_from_col, n_col: int, plane_shape) -> Callable:
+    """Rank-local ``fn(F) -> Y``: the route-G plane transform read straight from the cylinder.
+
+    ``F (..., n_col)`` c128 holds the occupied cells of an ``(n_b, n_c)``
+    plane; ``plane_from_col (n_b·n_c,)`` (host, static) is each cell's column,
+    ``n_col`` on an empty one.  ``Y (..., n_b, n_c)`` is::
+
+        Y[..., k_b, k_c] = Σ_{b,c} plane[..., b, c] e^{-2πi (b k_b/n_b + c k_c/n_c)},
+        plane = take(F, plane_from_col, axis=-1, mode='fill').reshape(..., n_b, n_c)
+
+    i.e. ``fftn(plane, axes=(-2, -1), norm='backward')``.  ``fn(F, start,
+    size)`` transforms the slab ``F[:, start:start+size]`` of ``F (A, S, ...,
+    n_col)`` in place (``start`` traced, clamped as ``lax.dynamic_slice``
+    clamps; ``size`` static) and returns ``(A, size, ..., n_b, n_c)``.  CUDA: nvidia-mathdx
+    mode 10, which never writes the zero plane: the row FFTs run on the
+    occupied rows only and gather their cells on load, the column FFTs read
+    dead rows as zero, and the plane is stored once.  A plane mode 10 cannot
+    serve (an axis with no thread-FFT split, :func:`plane_fft_split`, or a
+    plane above the device's opt-in shared memory) takes the XLA route
+    (static-run concatenate + cuFFT 2-D), decided here once and announced.
+    ROCM: the port of mode 10 (``cpp/kdft/plane_gather_ffi.cc``, the same splits, factor lines
+    the kdft direct DFT) where :func:`kdft_plane_fft_refusal` is empty, else the XLA route.
+    Elsewhere the XLA route.  The returned function's ``route`` attribute names
+    the one taken (``'mathdx'``, ``'kdft'`` or ``'xla'``).
+    """
+    nb, nc = (int(v) for v in plane_shape)
+    n_col = int(n_col)
+    pfc = np.asarray(plane_from_col, dtype=np.int64).reshape(-1)
+    if pfc.size != nb * nc:
+        raise ValueError(f"plane_from_col has {pfc.size} cells; want n_b·n_c = {nb * nc}")
+    if pfc.size and not (0 <= int(pfc.min()) and int(pfc.max()) <= n_col):
+        raise ValueError(f"plane_from_col entries must lie in [0, n_col={n_col}] (n_col = "
+                         f"empty); got [{int(pfc.min())}, {int(pfc.max())}]")
+    runs = _plane_runs(pfc, n_col)
+
+    def _check_c128(F):
+        if jnp.dtype(F.dtype) != jnp.dtype(jnp.complex128):
+            raise TypeError(f"GATE plane-fft-dtype: got F {F.dtype}; want complex128 (mode 10 and "
+                            "its XLA route keep one contract; the kernel is fp64); fix: pass complex128")
+
+    def _xla(F, start=None, size=None):
+        _check_c128(F)
+        if start is not None:
+            F = jax.lax.dynamic_slice_in_dim(F, start, int(size), axis=1)
+        z = lambda n: jnp.zeros(F.shape[:-1] + (n,), F.dtype)
+        st = jnp.concatenate([F[..., a:e] if a >= 0 else z(e) for a, e in runs], axis=-1)
+        from common.fft_helpers import local_fftn3     # see the import-cycle note
+        return local_fftn3(st.reshape(F.shape[:-1] + (nb, nc)), axes=(-2, -1), norm="backward")
+
+    _xla.route = "xla"
+    if kconv_backend(mesh) != "mathdx":
+        occ = (pfc < n_col).reshape(nb, nc)
+        n_rows = int(occ.any(axis=1).sum())
+        target = rocm_plane_fft_target(mesh, nb, nc, n_rows)
+        return _xla if target is None else _kdft_plane_fft_fn(target, pfc, n_col, nb, nc)
+    from ffi.gate import announce_once
+    sb, sc = plane_fft_split(nb), plane_fft_split(nc)
+    need, have = plane_resident_bytes(nb, nc), _optin_smem_bytes()
+    why = ("an axis has no coprime split into cuFFTDx thread FFTs (<= "
+           f"{KCONV_AXIS_MAX})" if sb is None or sc is None else
+           f"the resident plane needs {need} B > {have} B of opt-in shared memory"
+           if have is None or need > have else "")
+    if why:
+        announce_once(("plane_fft", nb, nc),
+                      f"[plane_fft] plane ({nb},{nc}): XLA route (run concatenate + "
+                      f"cuFFT 2-D), not mathdx mode 10: {why}", scope="rank0")
+        return _xla
+    _require_target(PLANE_FFT_GATHER_TARGET, "CUDA")
+    rows, gidx = _plane_gather_tables(pfc, n_col, nb, nc)
+    attrs = dict(nb=np.int64(nb), nc=np.int64(nc), b1=np.int64(sb[0]), c1=np.int64(sc[0]),
+                 **_mathdx_common())
+    announce_once(("plane_fft", nb, nc),
+                  f"[plane_fft] plane ({nb},{nc}): mathdx mode 10, splits {sb} x {sc}, "
+                  f"{rows.size} of {nb} rows occupied", scope="rank0")
+    _mathdx = _plane_gather_call(PLANE_FFT_GATHER_TARGET, attrs, n_col, nb, nc, gidx, rows)
+    _mathdx.route = "mathdx"
+    return _mathdx
+
+def _plane_gather_tables(pfc: np.ndarray, n_col: int, nb: int, nc: int):
+    """Mode 10's static row tables: the occupied rows and each of their cells' cylinder column (-1 empty)."""
+    occ = (pfc < n_col).reshape(nb, nc)
+    rows = np.flatnonzero(occ.any(axis=1)).astype(np.int32)
+    gidx = np.where(occ[rows], pfc.reshape(nb, nc)[rows], -1).astype(np.int32)
+    return rows, gidx
+
+
+def _plane_gather_call(target, attrs, n_col, nb, nc, gidx, rows) -> Callable:
+    """The mode-10 call shared by both legs: ``fn(F[, start, size])`` with the slab contract."""
+    def call(F, start=None, size=None):
+        if jnp.dtype(F.dtype) != jnp.dtype(jnp.complex128):
+            raise TypeError(f"GATE plane-fft-dtype: got F {F.dtype}; want complex128 (mode 10 and "
+                            "its XLA route keep one contract; the kernel is fp64); fix: pass complex128")
+        if int(F.shape[-1]) != n_col:
+            raise ValueError(f"plane FFT expects F (..., n_col={n_col}); got {F.shape}")
+        lead = F.shape[:-1]
+        if start is not None:
+            if F.ndim < 3 or not 0 < int(size) <= F.shape[1]:
+                raise ValueError(f"slab form needs F (A, S, ..., n_col) and 0 < size <= S; got "
+                                 f"{F.shape}, size={size}")
+            lead = (F.shape[0], int(size)) + F.shape[2:-1]
+        out = jax.ShapeDtypeStruct(lead + (nb, nc), F.dtype)
+        s0 = jnp.asarray(0 if start is None else start, jnp.int32)
+        return jax.ffi.ffi_call(target, out)(F, jnp.asarray(gidx), jnp.asarray(rows), s0, **attrs)
+    return call
+
+
+def _kdft_plane_fft_fn(target, pfc, n_col, nb, nc) -> Callable:
+    """The ROCM mode-10 call of :func:`make_plane_fft_gather` (the CUDA call less ``mathdx_root``)."""
+    rows, gidx = _plane_gather_tables(pfc, n_col, nb, nc)
+    sb, sc = plane_fft_split(nb), plane_fft_split(nc)
+    attrs = dict(nb=np.int64(nb), nc=np.int64(nc), b1=np.int64(sb[0]), c1=np.int64(sc[0]),
+                 cubin_dir=cubin_cache_dir())
+    from ffi.gate import announce_once
+    announce_once(("plane_fft", "kdft", nb, nc),
+                  f"[plane_fft] plane ({nb},{nc}): kdft mode 10, splits {sb} x {sc}, {rows.size} of {nb} rows "
+                  f"occupied, {kdft_plane_fft_pb(nb, nc, rows.size)} planes per block", scope="rank0")
+    fn = _plane_gather_call(target, attrs, n_col, nb, nc, gidx, rows)
+    fn.route = "kdft"
+    return fn
+
+
+def make_kconv_klead(mesh: Mesh, kgrid, t_spec: P, w_spec: P, *,
+                     norm: str | None = "ortho", mult: float = 1.0) -> KConvStored:
+    """The Σ-family k-LEADING convolution, routed by platform.
+
+    ``U = mult · fftn(ifftn(T) · ifftn(W)[:, None, :, None, :])`` for
+    ``T``/``U`` ``(nk, a, mx, b, my)`` and ``W`` ``(nk, mx, my)`` c128 (flat k
+    leading, specs in the 3-D form).  Returns :class:`KConvStored`.
+
+    CUDA: ``prep`` is the mathdx k-leading transform (``ifftn(W)`` into R space,
+    once per W) and ``apply`` the fused mathdx T·W pass, in place on T.  The XLA
+    backend: the same split in XLA ops.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    t_flat = validate_flat_spec(t_spec, "T")
+    w_flat = validate_flat_spec(w_spec, "W")
+    prep_local, apply_local = _klead_locals(mesh, kg, norm, mult)
+
+    prep_sm = _sharded(prep_local, mesh, (w_flat,), w_flat)
+    apply_sm = _sharded(apply_local, mesh, (t_flat, w_flat), t_flat)
+
+    def prep(W):
+        _check_complex(W)
+        if W.ndim != 3 or int(W.shape[0]) != nk:
+            raise ValueError(f"k-leading conv expects W (nk={nk}, mx, my); got {W.shape}")
+        return prep_sm(W)
+
+    def apply(T, W_prep):
+        _check_complex(T, W_prep)
+        if T.ndim != 5 or int(T.shape[0]) != nk:
+            raise ValueError(f"k-leading conv expects T (nk={nk}, a, mx, b, my); got {T.shape}")
+        return apply_sm(T, W_prep)
+
+    return KConvStored(prep=prep, apply=apply)
+
+
+def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
+                           mult: float = 1.0) -> Callable:
+    """Rank-local k-LEADING stored-kernel convolution ``fn(T, V_R) -> U`` with the
+    kernel ALREADY in R space on every backend, for code inside a shard_map.
+
+    ``U = mult · fftn(ifftn(T) · V_R[:, None, :, None, :])`` for ``T``/``U``
+    ``(nk, a, mx, b, my)`` and ``V_R`` ``(nk, mx, my)``.  CUDA: mathdx mode 2, the
+    Σ τ pass of :func:`make_kconv_klead`, in place on T.  Elsewhere the XLA backend (as
+    :func:`make_local_kconv_kminor`), not the gw_conv host handler, which takes
+    k-space W.  The BSE W term holds its T k-leading so that the encode and
+    decode are batched ZGEMMs with no T-sized transpose, and calls this factory.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
+    if kconv_backend(mesh, kgrid) == "mathdx":
+        _require_target(KCONV_KLEAD_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale))
+
+        def _mathdx(t, v_r):
+            return jax.ffi.ffi_call(
+                KCONV_KLEAD_TARGET, jax.ShapeDtypeStruct(t.shape, t.dtype),
+                input_output_aliases={0: 0})(t, v_r, **attrs, **_mathdx_common())
+        return _mathdx
+
+    target = rocm_klead_target(mesh, kg, "kconv_klead")
+    if target is not None:
+        def _kdft(t, v_r):
+            _check_complex(t, v_r)
+            return _kdft_rows_call(target, t, kg, forward=True, scale=scale, v=v_r)
+        return _kdft
+
+    backend = kconv_backend(mesh, kgrid)
+
+    def _xla(t, v_r):
+        t_r = _kfft(t, kg, "ifftn", backend) * scale
+        return _kfft(t_r * v_r[:, None, :, None, :], kg, "fftn", backend)
+    return _xla
+
+
+def klead_outer_refusal(mesh: Mesh, kgrid, optin: int | None = None) -> str | None:
+    """``None`` when :func:`make_local_kconv_klead_outer` serves this mesh and grid, else why not.
+
+    CUDA needs the handler in the loaded library and the load's 64-column k-box bank,
+    ``64·16·((nx·ny·(nz|1))|1)`` B, within the opt-in shared memory per block (the handler's
+    GATE mathdx-kconv-outer-tile; ``optin`` defaults to the device's attribute).  ROCM needs the
+    kdft outer handler and :func:`kdft_outer_refusal`'s grid (:func:`rocm_outer_refusal`).  Any
+    other XLA-backend mesh, and every mesh inside :func:`xla_reference`, is always served.  Callers that get a reason keep the unfused encode +
+    :func:`make_local_kconv_klead` chain and say so.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    if kconv_backend(mesh, kgrid) != "mathdx":
+        return rocm_outer_refusal(mesh, kg, "kconv_klead_outer") or None
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
+    if not ok:
+        return f"no {KCONV_KLEAD_OUTER_TARGET} handler ({why})"
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    if have is None:
+        return "no CUDA driver to read the opt-in shared memory"
+    bank = 64 * 16 * ((kg[0] * kg[1] * (kg[2] | 1)) | 1)
+    if bank > have:
+        return f"the 64-column bank needs {bank} B; the device has {have} B of opt-in shared memory"
+    return None
+
+
+def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
+                                 mult: float = 1.0) -> Callable:
+    """Rank-local ``fn(L, R, V_R, conj_r=False) -> U``: :func:`make_local_kconv_klead` of ``T = Σ_K L R``.
+
+    ``U = mult · fftn(ifftn(T) · V_R)`` with ``T[k,a,x,b,y] = Σ_K L[k,a,x,K] R[k,K,b,y]`` for
+    ``L`` ``(nk, a, mx, K)``, ``R`` ``(nk, K, b, my)``, ``V_R`` ``(mx, my, nk)`` k-MINOR -- the
+    W_R tile as the BSE builds it, so no transpose is made -- and ``U`` ``(nk, a, mx, b, my)``.  CUDA: the
+    outer-product load (``kconv_outer_cuda_ffi.cc``) forms T in shared memory on the fp64
+    tensor cores and never stores it; the transforms, the kernel multiply and the scaled store
+    are mathdx mode 2's.  Its K sum reproduces XLA's batched ZGEMM of the same contraction bit
+    for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), moveaxis(V_R, -1, 0))``.
+    ROCM: the port (``cpp/kdft/kconv_outer_rocm_ffi.cc``) on the k-box stage, the K sum on the FP64
+    FMA pipe (round-off class against the XLA chain; gate 1e-12), K unpadded.  ``conj_r`` (static)
+    reads ``conj(R)`` instead (the BSE right leg is a conjugated wavefunction; reading it from
+    the wavefunction avoids a conjugated copy, bit for bit the explicit ``conj``).  K is zero-padded
+    to a multiple of 4 (the m8n8k4 chunk; exact).  The XLA backend: that composition in XLA.
+    Check :func:`klead_outer_refusal` first.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
+    if kconv_backend(mesh, kgrid) == "mathdx":
+        fma = _outer_ksum_fma()
+        target = KCONV_KLEAD_OUTER_KSUM_TARGET if fma else KCONV_KLEAD_OUTER_TARGET
+        _require_target(target, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), **(dict(ksum=np.int64(1)) if fma else {}))
+
+        def _mathdx(l, r, v_r, conj_r=False):
+            shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
+            pad = -l.shape[3] % 4
+            if pad:
+                l = jnp.pad(l, ((0, 0), (0, 0), (0, 0), (0, pad)))
+                r = jnp.pad(r, ((0, 0), (0, pad), (0, 0), (0, 0)))
+            return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(shape, l.dtype))(
+                l, r, v_r, conj_r=np.int64(bool(conj_r)), **attrs, **_mathdx_common())
+        return _mathdx
+    target = rocm_outer_target(mesh, kg, "kconv_klead_outer")
+    if target is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), cubin_dir=cubin_cache_dir())
+
+        def _kdft(l, r, v_r, conj_r=False):
+            _check_complex(l, r, v_r)
+            shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
+            return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(shape, l.dtype))(
+                l, r, v_r, conj_r=np.int64(bool(conj_r)), **attrs)
+        return _kdft
+    apply = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
+
+    def _xla(l, r, v_r, conj_r=False):
+        return apply(jnp.einsum("kaxK,kKby->kaxby", l, jnp.conj(r) if conj_r else r),
+                     jnp.moveaxis(v_r, -1, 0))
+    return _xla
+
+
+def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = None) -> str | None:
+    """``None`` when :func:`make_local_kconv_klead_outer_decode` serves this mesh, grid and band count.
+
+    CUDA needs :func:`klead_outer_refusal`'s conditions, the decode handler, the ping-pong's two
+    banks, ``2·64·16·RS`` B, within the opt-in shared memory (the handler stages the V tile beside
+    them when that fits too, else its Mid reads V from L2), and the per-lane accumulator
+    ``ceil(nk/16)·ceil(n_c/8) <= 8`` m8n8 blocks (the handler's GATE mathdx-kconv-outer-decode-tile).
+    ROCM: the kdft decode handler and :func:`kdft_outer_decode_refusal`.  Any other XLA-backend mesh is
+    always served.  Callers that get a reason keep the outer conv + XLA decode.
+    """
+    why = klead_outer_refusal(mesh, kgrid, optin)
+    if why is not None:
+        return why
+    if kconv_backend(mesh, kgrid) != "mathdx":
+        return rocm_outer_refusal(mesh, _check_kgrid(kgrid, "xla"), "kconv_klead_outer_decode", int(n_c)) or None
+    from ffi.common import ffi_loader
+    ok, why = ffi_loader.probe_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
+    if not ok:
+        return f"no {KCONV_KLEAD_OUTER_DECODE_TARGET} handler ({why})"
+    kg = _check_kgrid(kgrid, "mathdx")
+    nk = kg[0] * kg[1] * kg[2]
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    need = 2 * 64 * 16 * ((kg[0] * kg[1] * (kg[2] | 1)) | 1)
+    if have is None or need + 16 > have:
+        return f"the two banks need {need} B; the device has {have} B of opt-in shared memory"
+    blocks = -(-nk // 16) * -(-int(n_c) // 8)
+    if blocks > 8:
+        return f"the decode accumulator needs {blocks} m8n8 blocks per lane (nk {nk}, n_c {n_c}); the limit is 8"
+    return None
+
+
+def _outer_ksum_fma() -> int:
+    """``LORRAX_BSE_OUTER_KSUM`` (A/B, docs/reference/env_vars.md): ``dmma`` (default) runs the outer load's
+    and the fused decode's K sums on the fp64 tensor cores, ``fma`` on the fp64 FMA pipe (the same
+    fragment contract; round-off class), for comparing the two where their rates differ (H100, B200).
+    Anything else refuses."""
+    import os
+    v = os.environ.get("LORRAX_BSE_OUTER_KSUM", "dmma").strip().lower()
+    if v not in ("dmma", "fma"):
+        raise ValueError(f"LORRAX_BSE_OUTER_KSUM={v!r}: want 'dmma' (default) or 'fma'")
+    if v == "fma":
+        from ffi.gate import announce_once
+        announce_once(("bse", "outer_ksum", v), "[kconv_outer] K sums on the fp64 FMA pipe "
+                      "(LORRAX_BSE_OUTER_KSUM=fma; A/B only)")
+    return int(v == "fma")
+
+
+# Kernel lessons: the BSE W term's outer-product load and fused decode (numbers: sandbox claim ids).
+# Over plain JAX: one-trial matvec 9.76 -> 4.8 ms against the XLA encode and decode ZGEMMs around
+#   mode 2 (2.0x; 2844, 2874); CrI3 8x8 SOC Haydock step 55.0 -> 13.6 ms with the layout fixes
+#   (4.0x; 2834, 2874).
+# Paid: T formed on the load on DMMA and never stored, 9.76 -> 6.80 ms (2844); the decode in the
+#   store, U never stored, 7.0 -> 5.4 ms (2846); ping-pong of 2 x 8 warps, kernel 1.14x (2874);
+#   row-fastest FFT lines, mode 2 6.0 -> 4.4 ms (2845).
+# Did not pay: the FMA K sum, 8.85 against 4.97 ms on DMMA (2846; kept buildable); prefetch, unroll
+#   and L2-persisting variants (2844); a reordered decode, no speed while memory-bound (2844); the
+#   Mid folded into the inverse x pass 4.73 vs 4.65 ms, psi_c loads hoisted per k pair 5.06 ms,
+#   per-warp base pointers 4.69 ms, an even stream-K split 6.12 ms from L2 thrash (2846); 1 or 4 k
+#   in flight in the load, 3% slower than 2 (2874); a pair tile reusing both ISDF legs does not fit
+#   one SM (I).
+# Decides it: T bytes (the encode is ~7 flop/B) until T and U leave HBM; then one block per SM,
+#   fixed by the 128 KB register accumulator; now L2 operand latency (long_scoreboard 38%, pipe
+#   58%; 2874).  DMMA and named barriers are CUDA-only; the ROCm port (kconv_outer_rocm_ffi.cc)
+#   keeps the load, the items and the decode's slots on the FMA pipe with one block-wide group.
+def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None = "ortho") -> tuple:
+    """Rank-local ``(prep, apply)``: :func:`make_local_kconv_klead_outer` with the BSE decode's first
+    contraction fused into its store, so U never reaches HBM.
+
+    ``prep(Pc)`` tiles ``Pc`` (nk, n_c, a, mx) once per matvec (``ψ^X_c``); ``apply(L, R, V_R, Pc_t,
+    conj_r=False)`` returns ``A[k,c,b,y] = Σ_{a,x} conj(Pc[k,c,a,x]) U[k,a,x,b,y]`` (nk, n_c, b, my), with
+    ``U`` the outer conv of ``(L, R, V_R, conj_r)`` -- ``bse_stack_matvec._decode``'s (t, μ) contraction,
+    whose (s, ν) contraction stays the caller's einsum.  CUDA (``kconv_outer_cuda_ffi.cc``): one resident
+    block per SM, two 8-warp groups ping-ponging on two banks; the (phase, item) tiles go round robin
+    so a wave shares one x window in L2, and the tile completing an item sums its partials in phase
+    order (deterministic).  ``L`` and ``R`` are
+    tiled into fragment order per call (K zero-padded to a multiple of 4, μ and ν to 8).  ROCM
+    (``cpp/kdft/kconv_outer_rocm_ffi.cc``): the CUDA decode's items, phases, slots and counter on
+    one block-wide group, the (t, μ) sum in per-thread FMA accumulators; ``prep`` is the identity.
+    The XLA backend: the outer conv and the einsum in XLA.
+    Check :func:`klead_outer_decode_refusal` first.
+    """
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    if rocm_outer_refusal(mesh, kg, "kconv_klead_outer_decode", 1) == "":   # n_c is checked per call
+        scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk)
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale),
+                     cubin_dir=cubin_cache_dir())
+
+        def _prep_kdft(pc):                     # Pc (nk, c, a, mx) as the BSE holds it: no tiling
+            return pc
+
+        def _apply_kdft(l, r, v_r, pc, conj_r=False):
+            _check_complex(l, r, v_r, pc)
+            target = rocm_outer_target(mesh, kg, "kconv_klead_outer_decode", int(pc.shape[1]))
+            if target is None:                  # announced; the caller checked the refusal first
+                return jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(pc),
+                                  make_local_kconv_klead_outer(mesh, kg, norm=norm)(l, r, v_r, conj_r=conj_r))
+            out = jax.ShapeDtypeStruct((l.shape[0], pc.shape[1], r.shape[2], r.shape[3]), l.dtype)
+            return jax.ffi.ffi_call(target, out)(l, r, v_r, pc, conj_r=np.int64(bool(conj_r)), **attrs)
+        _note_rocm_target(KDFT_KCONV_KLEAD_OUTER_DECODE_TARGET)
+        return _prep_kdft, _apply_kdft
+    if kconv_backend(mesh, kgrid) != "mathdx":
+        outer = make_local_kconv_klead_outer(mesh, kg, norm=norm)
+
+        def _prep_xla(pc):
+            return pc
+
+        def _apply_xla(l, r, v_r, pc, conj_r=False):
+            return jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(pc), outer(l, r, v_r, conj_r=conj_r))
+        return _prep_xla, _apply_xla
+    _require_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
+    _require_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
+    scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk)
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale),
+                 ksum=np.int64(_outer_ksum_fma()))
+
+    def _prep(pc):                              # (nk, c, a, mx) -> (a, nxb, nk, MB, 2, 8, 4)
+        n_k, n_c, na, mx = pc.shape
+        mb, nxb = -(-n_c // 8), -(-mx // 8)
+        pc = jnp.pad(pc, ((0, 0), (0, 8 * mb - n_c), (0, 0), (0, 8 * nxb - mx)))
+        return pc.reshape(n_k, mb, 8, na, nxb, 2, 4).transpose(3, 4, 0, 1, 5, 2, 6), n_c
+
+    def _apply(l, r, v_r, pc_t, conj_r=False):
+        pcr, n_c = pc_t
+        n_k, na, mx, kr = l.shape
+        nb, my = r.shape[2], r.shape[3]
+        h, nxb, nyb = -(-kr // 4), -(-mx // 8), -(-my // 8)
+        # Lr (a, nxb, nk, H, 8, 4) = L[k, a, 8 xb + g, 4h + t]; Rr (b, nyb, nk, H, 8, 4) = R[k, 4h + t, b, 8 yb + g]
+        lr = jnp.pad(l, ((0, 0), (0, 0), (0, 8 * nxb - mx), (0, 4 * h - kr)))
+        lr = lr.reshape(n_k, na, nxb, 8, h, 4).transpose(1, 2, 0, 4, 3, 5)
+        rr = jnp.pad(r, ((0, 0), (0, 4 * h - kr), (0, 0), (0, 8 * nyb - my)))
+        rr = rr.reshape(n_k, h, 4, nb, nyb, 8).transpose(3, 4, 0, 1, 5, 2)
+        return jax.ffi.ffi_call(KCONV_KLEAD_OUTER_DECODE_TARGET, jax.ShapeDtypeStruct((n_k, n_c, nb, my), l.dtype))(
+            lr, rr, v_r, pcr, conj_r=np.int64(bool(conj_r)), **attrs, **_mathdx_common())
+    return _prep, _apply
+
+
+def _klead_locals(mesh, kg, norm, mult):
+    """Rank-local ``(prep, apply)`` of :func:`make_kconv_klead`: ``ifftn(W)`` into R
+    space, then the T·W_R pass; on the plan backend the identity and the host
+    gw_conv handler, which transforms W itself."""
+    if kconv_backend(mesh, kg) == "plan":
+        return (lambda w: w), _host_gw_conv_local(kg, norm, mult)
+    return (make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm),
+            make_local_kconv_klead(mesh, kg, norm=norm, mult=mult))
+
+
+def _store_row_map(store_rows, nk: int, label: str) -> tuple[np.ndarray, np.ndarray]:
+    """``(rows, kout)``: the stored full-k rows and the (nk,) map k -> output row (-1 = none)."""
+    rows = np.asarray(store_rows, dtype=np.int64).reshape(-1)
+    if rows.size == 0 or rows.min() < 0 or rows.max() >= nk or np.unique(rows).size != rows.size:
+        raise ValueError(f"{label}: store_rows must be distinct full-k rows in [0, {nk}); "
+                         f"got {rows.tolist()}")
+    kout = np.full(nk, -1, dtype=np.int32)
+    kout[rows] = np.arange(rows.size, dtype=np.int32)
+    return rows, kout
+
+
+def x_block_rows(rows) -> np.ndarray:
+    """The local left centroid of every row of an x block ``(x0, bx, xs, xn)``: ``(r // bx)*xs + x0 + r % bx``."""
+    x0, bx, xs, xn = (int(v) for v in rows)
+    r = np.arange(xn * bx)
+    return (r // bx) * xs + x0 + r % bx
+
+
+# Kernel lessons: the k-box k-convolution, modes 2-5, 7-9 and 11 (numbers: sandbox claim ids).
+# Over plain JAX: BSE W conv, jnp.fft chain -> mode 4, 33.5 -> 7.1 ms (4.7x, 3x3x1 mu2048; 2672);
+#   kpair 8^3, cuFFT plan chain -> fused cuFFTDx, 115 -> 12.5 ms (9.2x; 2651); mode 7's load vs the
+#   XLA unfold + spin FFI + mode 2, 26.0 -> 17.2 ms per tau node (2705).
+# Paid: tile tables at n_s 4, mode 7 1.90x, mode 11 1.73x (2799); mode 7 on the stage with
+#   conflict-free lines and 2 blocks/SM, Fe 8^3 1.68x (2943); mode 11 accumulating on every thread,
+#   1.44x (2789); x blocks instead of d x d spin blocks, mu3088 d=1 201.8 -> 58.5 s (2841); tile
+#   super-order, Fe 8^3 1.28x (2956, branch); mode 11 on the metal direct stream: the freed memory,
+#   not the kernel, cut Green pairs 344 -> 100 per Fe 8^3 map (2950); mode 11's split arm (a pair
+#   above the opt-in memory, 20^3 ns 2) with a warp-shuffle pencil and 16 warps per SM, P64 tile
+#   316 -> 204 ms per tau node, bitwise (3077): both passes had held one block of 8 warps.
+# Residency: mode 8's split vertex pencil staged nkx*ty*(ns^2+17) elements at ty 128/ns^2 and
+#   refused the two-spinor Dirac quarters at >= 16^3; ty now comes from the opt-in budget (3080).
+# Paid (one warp group pencil, kbox_stage.cuh pencil_group_warp_pass): mode 8's vertex pencil on one
+#   warp per pair, 20^3 ns-2 Dirac-quarter kconv call 848 -> 646 ms (pencil 2.3x), ns 4 1.14x (3080);
+#   modes 7/9 on the modes 2/3 split arm where a block cannot hold a group of two or more columns,
+#   P64 tile mode 7 555 -> 237 ms (the 11-row sub-tile pass 22.6 -> 11.6 ms), mode 9 64.9 -> 32.0 ms
+#   (3086): one column per block had re-gathered the pair's group per column (1.3 TB of L2).
+# Paid (B9, 3112): mode 7's split passes as separate entry points (one kernel held every pass at
+#   the x-pencil Mid's 240 registers, 8 warps per SM; the gather alone needs 104, so 16 warps),
+#   plane tiles of the most whole groups the opt-in memory holds (16 -> 24 columns at 20^3 ns 2),
+#   and where one column's padded box fits a block (20^3: 134 of 163 KB) the x pencil + Mid, the
+#   forward plane and the pencil + store as one column-resident pass (the intermediate read once,
+#   not three reads and writes), and the gather's plane tiles in tile-major order (a tile's planes
+#   together, so star members find their parents in L2: DRAM 1.46 -> 1.15 GB, 1.05x): pass shape
+#   11.66 -> 7.9 ms, P64 tile 237 -> 173 ms, bitwise.
+# Did not pay: phase-balanced thread counts 1.014-1.029x (2827); cp.async double buffering -21%
+#   (2799); a staged load reading its tables per cell, 1.63x slower on mode 11, 1.10x on mode 7
+#   (2789); padded shared rows +7% on mode 11, +19% on mode 7 (2845); a per-member vertex Mid
+#   0.76-0.94x (2947); tile tables at n_s 2, CrI3 8x8 Sigma tau 5.58 -> 6.24 s (2799); small-grid
+#   butterflies, kernel -28%, tau sweep flat (2320); tau batching, Sigma_mn projection fusion and
+#   W-prep fusion have no mechanism, FP32 adds an error source (I); ping-pong: HIP has no named
+#   barriers and mode 7 already keeps 3-4 blocks per SM (I); mode 11's split plane pass as two
+#   8-column tiles per SM, 1.17x slower than one 16-column tile (a tile's pairs share their tables
+#   in L1), and at a carveout of 100, 1.10x slower (3077); a column-resident mode 11 cannot fit an
+#   A100: the pair's two transformed columns and its accumulator are 384 KB against 163 KB (I);
+#   modes 7/9 split at one 4-column group per block (12^3 ns 2) 0.84x, and 1-column plane tiles
+#   (16-byte runs) left mode 9 at its single-arm wall (3086); mode 7's entries at 512 threads each
+#   (the Mid spills at 128 registers) 0.92x of 512/256/512, two 12-column plane blocks per SM 0.94x
+#   of one 24-column block; B bracket Greens per W load: 2-4 % at most, W_prep is already formed
+#   once per pass for every bracket (not built, 3112).  Left (3112): with G fully L2-resident the
+#   gather is still 2.73 ms (L2 traffic, 16 warps), so the parent regather bounds a gain at ~12 % of
+#   mode 7; tile-major order rereads the per-(k, nu) unfold tables per tile (0.32 -> 0.77 GB), which
+#   only op-indexed tables would avoid; a single-sweep column pass would redo each pair's 2x2 unfold
+#   per spin column (~4x the gather's L2), more than the intermediate round trip it saves (~1.8 ms).
+# Paid (B10, 3120): mode 8's split passes on two entry points (every pass but W_R's plane at 512
+#   threads, the vertex pencil included at a 112-byte spill: 3.54 -> 2.59 ms a chunk; W_R's plane,
+#   212 registers, at 256), wide plane tiles and tile-major gathers: 20^3 ns 2 Dirac quarter
+#   648.6 -> 554.9 ms, ns 4 366.6 -> 315.4 ms; mode 11's pencil on its own entry (the vertex pencil
+#   kept 256 threads at nkx > 12 for both passes) and a tile-major plane: 20^3 vertex 123.6 -> 113.1
+#   ms, plain 207.0 -> 194.9 ms; all bitwise.
+# Did not pay (B10, 3120): mode 9 at ns 1 as one column-resident sweep (one pair per block: every
+#   (k, pair) reads its own tables, L2-bound) 31.3 -> 58.8 ms at 512 threads; mode 9's gather
+#   tile-major 0.96x; the vertex pencil at two 256-thread blocks per SM (500-byte spill) 0.98x; mode
+#   11's plane tile at 24 columns 0.97x (plain); W_R's plane at two blocks per SM (its tile holds one)
+#   0.93x on that pass.
+# Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
+#   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
+#   unfold gather's L2 latency (long_scoreboard 49%; 2956).
+# Paid (U2c): the fused product forms of the unfold load and the chi trace (lrx_mulf, lrx_cmac),
+#   FP64 pipe busy time per chi0 tau node 62 -> 45 ms at base clock (6x6 bispinor, A100).  Did not
+#   pay: the tile-table gather with k fastest across threads, 6% slower (mode 11, A100).
+# Paid (kconv/final, 2026-10-17; A100, real Fe 8^3 tables, ms per call; the evidence directory
+#   cs_claude/sigma_depth2/kc_final): m7f, the fused single-arm tile of mode 7 at n_s <= 2 (cp.async
+#   gather, orbit-blocked tile order, x pencils in registers; Fe 8^3 mode 7 7.84 -> 4.08 with the
+#   k-fastest tables below); W2, mode 9's batched scalar gather with the fixed-column store (Fe 8^3
+#   1.317 -> 0.950; 8^3 1.359 -> 0.981 at two blocks a SM, 1.011-1.221 at four; 4^3 0.93x, so from
+#   nk 128); m7s, mode 7's arm 2 at n_s 2 (20^3, pass 16 x 640, LRX_M7S bits: none 34.97, L2
+#   evict-first stores 32.96, pair-major W_R 31.48, both 31.91, G evict-last 33.85 (slower), W_R +
+#   the persistent per-tile plane loop 29.14 (kept), + evict-first 29.48, + x-fastest pairs 32.84;
+#   measured 1.10-1.30x over 14^3-21^3); m11f, mode 11's fused single arm at n_s 2 (9.92 -> ~5 ms,
+#   2.0-3.3x with acc=None and the q-row store; the gather is the L1 address-divergence bound).
+# Pruned (cleanup/kconv-prune, owner 2026-10-17: below 1.15x, a host rule and kernel text each):
+#   M7KF, k-fastest copies of mode 7's index tables per call by a kernel into handler scratch (an
+#   unpriced 4 N_k (ml + nl) B workspace; 1.03x Fe 8^3, 1.13x 12^3 n_s 1), replaced by the same
+#   copies formed in XLA by this factory (klead_unfold_kf) and read by m7f alone: kernel 0.984-1.009x
+#   of M7KF's call on 4^3-13^3 (never slower at any tile size), end to end with placed tables
+#   1.000-1.006x at Fe 8^3, 12^3, 13^3 and 1.00-1.02x at 4^3-8^3 (kc_prune/m7cmp.log, res_kf.json); m7s at n_s 1 (bits 4 alone for a column box <= 64 KB,
+#   14^3 / 15^3 only on A100, 1.007-1.124x; 14^3 previous arm 2 / bits 12 / bits 4 3.63 / 3.26 /
+#   3.26, 15^3 4.28 / 4.81 / 3.99, 32 x 240 3.17 / 3.36 / 3.01; 16^3+ bits 4 did not pay); W2 at
+#   4 blocks a SM below nk 256 and its fixed-column exception (6^3 only: 0.338 plain -> 0.296 at
+#   four blocks, 0.387 at two; the fixed-column store beside it was 1.05x slower); m9b, mode 9's persistent orbit-blocked
+#   split plane pass where the tiles fill 90% of their waves (20^3 427 tiles 6.33 -> 5.96, 24^3
+#   17.3 -> 13.6; 0.995-1.006x on 18 of 24 measured rows, 15^3 0.88x).  Their measured cost on the
+#   45-case sweep (prune / previous, per call): mode 7 14^3 n_s 1 1.123, 15^3s 1.07, 15^3 1.06 (before the
+#   XLA tables also Fe 8^3 1.033, 12^3 n_s 1 1.127, 13^3 n_s 2 1.077); mode 9 6^3 1.20-1.22 (W2 at two blocks; W2 off below nk 256 instead
+#   measured 6^3 1.10 and 12x12x1 1.33, so W2 from nk 128), 14^3-24^3 1.11-1.23; the rest
+#   <= 1.02 (kc_prune/sweep_ratio.csv, w2_ratio.csv).
+def klead_unfold_kf(src, ns: int):
+    """The k-fastest copy of one rank's endpoint table: ``(nk, m*ns)`` -> ``(m, nk, ns)`` int32.
+
+    Mode 7's fused single arm reads a pair's ``ns`` source slots at every k of a warp's items from
+    one run along k (the measured record above :func:`make_kconv_klead_unfold`).  Formed in XLA by
+    :func:`make_kconv_klead_unfold` from the tables it is handed: constant-folded once per plan from
+    baked host tables, one transpose of a pass's cut tables when the consumer passes ``load``
+    (``4·N_k·(μ_x + ν_y)·n_s`` B, counted by the program's ``memory_analysis``).
+    """
+    nk, w = (int(v) for v in src.shape)
+    return jnp.transpose(src.reshape(nk, w // int(ns), int(ns)), (1, 0, 2))
+
+
+def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str | None = "ortho",
+                            mult: float = 1.0) -> Callable:
+    """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep, load=None) -> U``.
+
+    ``G`` ``(n_parent, mu, ns, nu, ns)`` c128 at ``P(None,'x',None,'y',None)``
+    is the centroid-major parent Green (``gw.greens_function_kernel.
+    build_G_parents``) and ``Gt`` its transposed partner for the antiunitary
+    rows (``None`` when no row is antiunitary); ``tables`` are
+    ``symmetry_maps.unfold_load_tables`` of the same plan; ``W_prep`` is
+    :func:`make_kconv_klead`'s ``prep(W)`` for the same ``(kgrid, norm, mult)``.
+    ``store_rows`` names the full-k rows the caller consumes (the Σ consumers
+    pass the plan's ``parent_full_rows``).  Returns ``U``
+    ``(len(store_rows), ns, mu, ns, nu)`` at ``P(None,None,'x',None,'y')``,
+    equal to ``apply(sigma_conv_operand(unfold_spin_centroid_operator(G, Gt)),
+    W_prep)[store_rows]``: the typed unfold, the spin action and the
+    spin-major reorder happen on the convolution's load, and every other k
+    row is transformed but never stored.  ``load``, when given, is the same
+    tables on the devices (``symmetry_maps.device_load_tables``, or a pass's
+    cut of them, ``gw.subtile_stream.window_load``), read as operands so the
+    consumer's program holds no table constants.  CUDA: nvidia-mathdx mode 7; ROCM: the
+    k-box stage's mode 7 (``lorrax_kdft_kconv_klead_unfold``) where :func:`kdft_kbox_refusal`
+    is empty; elsewhere the service's reference composition, then the XLA convolution (kdft on
+    ROCM) and the row selection.
+
+    ``apply(..., rows=(x0, bx, xs, xn))`` stores one x block with the whole spin group: block
+    row ``r`` in ``[0, xn*bx)`` of every rank's ``mu`` tile is the local left centroid
+    ``(r // bx)*xs + x0 + r % bx`` (``>= mu_local``: a zero padding row), so the output is
+    ``(len(store_rows), ns, P_x*xn*bx, ns, nu)`` at the same spec (``rows=None``: every mu).
+    A call reads only its own pairs' Green and W sources, so a consumer that bounds the output
+    tile by x blocks reads the Green once over all of them.  (An output spin block, the
+    rejected alternative, reads every source of each pair per block: the spin action mixes
+    them.)
+
+    ``apply(..., live=...)``: the pass is padded to a scan's largest pass and ``live`` (int32
+    ``[2]``, replicated) is its live stored rows ``[lo, hi)`` (the ``x``-block rows, or ``mu``):
+    the rest do no gather or transform and come back zero.
+    """
+    from symmetry_maps import (DEVICE_LOAD_SPECS, DeviceLoadTables,
+                               apply_unfold_load_tables_local, local_unfold_load_tables)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"k-leading unfold conv: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    rows, kout = _store_row_map(store_rows, nk, "k-leading unfold conv")
+    n_out = int(rows.size)
+    ns = int(tables.spin.shape[-1])
+    spin_host = np.asarray(tables.spin)
+    needs_partner = bool(np.any(np.asarray(tables.trs)))
+    mesh_shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if tuple(tables.mesh_shape) != mesh_shape:
+        raise ValueError(f"k-leading unfold conv: tables were cut for a {tuple(tables.mesh_shape)} "
+                         f"mesh; this mesh is {mesh_shape}")
+    si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
+    if kconv_backend(mesh, kgrid) == "mathdx":
+        _require_target(KCONV_KLEAD_UNFOLD_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(si * sf * float(mult)), **_mathdx_common())
+
+        def apply_tables(g, gt, v_r, t, conj_src, block, live):
+            n_par, mx, _, my, _ = (int(v) for v in g.shape)
+            x0, bx, xs, xn = (0, 0, 0, 0) if block is None else block
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            out = jax.ShapeDtypeStruct((n_out, ns, xn * bx if bx else mx, ns, my), g.dtype)
+            return jax.ffi.ffi_call(KCONV_KLEAD_UNFOLD_TARGET, out)(
+                flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                jnp.asarray(kout), v_r, klead_unfold_kf(t.lsrc, ns), klead_unfold_kf(t.rsrc, ns),
+                *(() if live is None else (live,)), conj_src=np.int64(bool(conj_src)),
+                x0=np.int64(x0), bx=np.int64(bx), xs=np.int64(xs), xn=np.int64(xn), **attrs)
+    elif (kbox := rocm_kbox_target(mesh, kg, "kconv_klead_unfold", ns)) is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(si * sf * float(mult)), cubin_dir=cubin_cache_dir())
+
+        def apply_tables(g, gt, v_r, t, conj_src, block, live):
+            n_par, mx, _, my, _ = (int(v) for v in g.shape)
+            x0, bx, xs, xn = (0, 0, 0, 0) if block is None else block
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            out = jax.ShapeDtypeStruct((n_out, ns, xn * bx if bx else mx, ns, my), g.dtype)
+            return jax.ffi.ffi_call(kbox, out)(
+                flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                jnp.asarray(kout), v_r, *(() if live is None else (live,)),
+                conj_src=np.int64(bool(conj_src)),
+                x0=np.int64(x0), bx=np.int64(bx), xs=np.int64(xs), xn=np.int64(xn), **attrs)
+    else:
+        _, conv_local = _klead_locals(mesh, kg, norm, mult)
+
+        def apply_tables(g, gt, v_r, t, conj_src, block, live):
+            n_par, mx, _, my, _ = (int(v) for v in g.shape)
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            gt = jnp.conj(g) if conj_src else gt
+            O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+            U = jnp.take(conv_local(jnp.transpose(O, (0, 2, 1, 4, 3)), v_r),
+                         jnp.asarray(rows), axis=0)
+            if block is not None:
+                idx = x_block_rows(block)
+                keep = jnp.asarray(idx < mx)[None, None, :, None, None]
+                U = jnp.where(keep, jnp.take(U, jnp.asarray(np.minimum(idx, mx - 1)), axis=2), 0)
+            if live is not None:
+                U = jnp.where(live_row_mask(live, int(U.shape[2]))[None, None, :, None, None], U, 0)
+            return U
+
+    def local(g, gt, v_r, *rest, conj_src=False, block=None, has_live=False):
+        # ``rest``: live (with has_live), then this rank's slices of the placed tables
+        # (DeviceLoadTables fields); without them, the host tables are cut here (baked).
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if load
+             else local_unfold_load_tables(tables))
+        return apply_tables(g, gt, v_r, t, conj_src, block, live)
+
+    g_spec = P(None, "x", None, "y", None)
+    sm = {}
+
+    def sharded(conj_src, block, placed, has_live):
+        key = (conj_src, block, placed, has_live)
+        if key not in sm:
+            sm[key] = _sharded(partial(local, conj_src=conj_src, block=block, has_live=has_live), mesh,
+                               (g_spec, g_spec, P(None, "x", "y")) + ((P(None),) if has_live else ())
+                               + (DEVICE_LOAD_SPECS if placed else ()),
+                               P(None, None, "x", None, "y"))
+        return sm[key]
+
+    def apply(G, Gt, W_prep, *, conj_partner=False, rows=None, load=None, live=None):
+        """``conj_partner``: the antiunitary partner is ``conj(G)`` (a Green of real weights),
+        read from ``G`` on the load, so no partner tile exists (``Gt`` must be ``None``)."""
+        _check_complex(G, W_prep)
+        if G.ndim != 5 or int(G.shape[2]) != ns or int(G.shape[4]) != ns:
+            raise ValueError(f"k-leading unfold conv expects G (n_parent, mu, {ns}, nu, {ns}); "
+                             f"got {G.shape}")
+        if conj_partner and Gt is not None:
+            raise ValueError("k-leading unfold conv: conj_partner reads conj(G); pass Gt=None")
+        if Gt is None:
+            if needs_partner and not conj_partner:
+                raise ValueError("k-leading unfold conv: the plan has antiunitary rows, so the "
+                                 "transposed parent Green Gt is required")
+            Gt = G
+        if Gt.shape != G.shape or W_prep.shape != (nk, G.shape[1], G.shape[3]):
+            raise ValueError(f"k-leading unfold conv: Gt {Gt.shape} / W_prep {W_prep.shape} do not "
+                             f"match G {G.shape} and nk={nk}")
+        # The kernel addresses parent row row[k] and local sources below the
+        # tables' widths without bounds checks: the operands must be the ones
+        # the tables were built for.
+        if (int(G.shape[0]) != int(tables.n_parent)
+                or int(G.shape[1]) * ns != int(tables.lsrc.shape[1])
+                or int(G.shape[3]) * ns != int(tables.rsrc.shape[1])):
+            raise ValueError(
+                f"k-leading unfold conv: G {G.shape} does not match its tables (n_parent="
+                f"{tables.n_parent}, endpoints {tables.lsrc.shape[1]}/{tables.rsrc.shape[1]} "
+                f"merged over ns={ns})")
+        if rows is not None:
+            mx = int(G.shape[1]) // mesh_shape[0]
+            x0, bx, xs, xn = rows = tuple(int(v) for v in rows)
+            if not (bx >= 1 and xn >= 1 and 0 <= x0 < mx and x0 + bx <= xs):
+                raise ValueError(f"k-leading unfold conv: x block {rows} must be pieces [x0, x0+bx) "
+                                 f"at stride xs >= x0+bx starting inside the local extent {mx}")
+            if rows == (0, mx, mx, 1):
+                rows = None
+        return sharded(bool(conj_partner and needs_partner), rows, load is not None, live is not None)(
+            G, Gt, W_prep, *(() if live is None else (live,)), *(() if load is None else tuple(load)))
+    return apply
+
+
+def _vertex_tables(vertices, ns: int, label: str) -> tuple[np.ndarray, np.ndarray]:
+    """``(perm, phase)`` monomial vertices → concatenated perm and phase-code attributes."""
+    if not 1 <= len(vertices) <= 4:
+        raise ValueError(f"k-conv {label}: 1..4 Lorentz vertices per side, got {len(vertices)}")
+    perms = [_check_perm(perm, ns, f"{label} vertex {i}") for i, (perm, _) in enumerate(vertices)]
+    codes = [_conv_kpair_phase_codes(phase, ns, f"{label} vertex {i}")
+             for i, (_, phase) in enumerate(vertices)]
+    return np.concatenate(perms).astype(np.int64), np.concatenate(codes).astype(np.int64)
+
+
+def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_vertices, right_vertices,
+                              store_rows, norm: str | None = "ortho",
+                              mult: float = 1.0) -> Callable:
+    """The four-current Σ convolution read from the RAW-PARENT Green and W: ``fn(G, Gt, W, Wt) -> U``.
+
+    ``U[k,a,x,b,y] = mult · fftn( Σ_ij (γ_i ifftn(Ĝ) γ_j†)[a,x,b,y] · ifftn(Ŵ)[k,x,i,y,j] )``
+
+    ``Ĝ`` is the full-k Green :func:`make_kconv_klead_unfold` reads from ``G``/``Gt``
+    and ``tables`` (the typed unfold, spin action and spin-major order on the
+    load); ``Ŵ`` the full-q interaction read the same way from its
+    irreducible-q parent tile ``W`` ``(nq_irr, mx, nA, my, nB)`` (centroid-major,
+    ``gw.greens_function_kernel.build_G_parents``'s order) and partner ``Wt``
+    through ``w_tables`` (``symmetry_maps.unfold_load_tables`` of the q plan,
+    ``trs_rule="pair_transpose"``, the endpoints' Lorentz actions as
+    ``spin``/``spin_r``).  ``left_vertices``/``right_vertices`` are the Lorentz
+    vertices ``γ_i``, ``γ_j`` as ``(perm, phase)`` monomial pairs
+    (``common.gamma_matrices.gamma_perm_phase``: ``γ[α,β] = phase[α] δ_{β,perm[α]}``).
+    One transform of the Green serves every block.  Returns ``U``
+    ``(len(store_rows), ns, mx, ns, my)`` at ``P(None,None,'x',None,'y')``, the
+    rows ``store_rows`` of the full-k result.  Neither a full-q W nor a
+    full-grid W_R exists: each tile's W columns are unfolded and transformed on
+    the kernel's load.
+
+    CUDA: nvidia-mathdx mode 8 with the second (W) load; it rounds as mode 9
+    on ``W`` then the V_R kconv call (bit for bit).  Elsewhere the service's
+    reference unfold of both operands and the XLA convolution.  ``load``/``w_load``
+    (``symmetry_maps.DeviceLoadTables`` of ``tables``/``w_tables``, or of a
+    row pass's cut of them): the tables enter as device operands, so the
+    program holds no table constants; without them the host tables are baked.
+    """
+    from symmetry_maps import (DEVICE_LOAD_SPECS, DeviceLoadTables,
+                               apply_unfold_load_tables_local, local_unfold_load_tables)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk or int(w_tables.row.shape[0]) != nk:
+        raise ValueError(f"k-leading lorentz conv: tables cover {tables.row.shape[0]} k and "
+                         f"{w_tables.row.shape[0]} q, grid has {nk}")
+    if int(w_tables.conj_trs):
+        raise ValueError("k-leading lorentz conv: W tables must use the pair_transpose rule")
+    rows, kout = _store_row_map(store_rows, nk, "k-leading lorentz conv")
+    n_out = int(rows.size)
+    ns = int(tables.spin.shape[-1])
+    spin_host = np.asarray(tables.spin)
+    w_spin_l = np.asarray(w_tables.spin)
+    w_spin_r = w_spin_l if w_tables.spin_r is None else np.asarray(w_tables.spin_r)
+    needs_partner = bool(np.any(np.asarray(tables.trs)))
+    mesh_shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if tuple(tables.mesh_shape) != mesh_shape or tuple(w_tables.mesh_shape) != mesh_shape:
+        raise ValueError(f"k-leading lorentz conv: tables were cut for a {tuple(tables.mesh_shape)} "
+                         f"/ {tuple(w_tables.mesh_shape)} mesh; this mesh is {mesh_shape}")
+    perm_l, phase_l = _vertex_tables(left_vertices, ns, "left")
+    perm_r, phase_r = _vertex_tables(right_vertices, ns, "right")
+    na, nb = len(left_vertices), len(right_vertices)
+    if (int(w_spin_l.shape[-1]), int(w_spin_r.shape[-1])) != (na, nb):
+        raise ValueError(f"k-leading lorentz conv: W tables act on ({w_spin_l.shape[-1]}, "
+                         f"{w_spin_r.shape[-1]}) components; the vertices are ({na}, {nb})")
+    si, sf = ffi_fft_scale("ifftn", norm, nk), ffi_fft_scale("fftn", norm, nk)
+    n_fields = len(DeviceLoadTables._fields)
+
+    def local_tables(loads):
+        # ``loads``: this rank's slices of the placed G then W tables
+        # (DeviceLoadTables fields); without them the host tables are cut here.
+        if not loads:
+            return local_unfold_load_tables(tables), local_unfold_load_tables(w_tables)
+        return (tables._replace(**dict(zip(DeviceLoadTables._fields, loads[:n_fields]))),
+                w_tables._replace(**dict(zip(DeviceLoadTables._fields, loads[n_fields:]))))
+    if kconv_backend(mesh, kgrid) == "mathdx":
+        _require_target(KCONV_KLEAD_LORENTZ_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale_g=np.float64(si), scale_f=np.float64(sf), mult=np.float64(mult),
+                     scale_w=np.float64(si), perm_l=perm_l, phase_l=phase_l, perm_r=perm_r,
+                     phase_r=phase_r, **_mathdx_common())
+
+        def local(g, gt, w, wt, *rest, conj_src=False, has_live=False):
+            live, loads = (rest[0], rest[1:]) if has_live else (None, rest)
+            t, tw = local_tables(loads)
+            n_par, mx, _, my, _ = (int(d) for d in g.shape)
+            n_w = int(w.shape[0])
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            wflat = lambda a: a.reshape(n_w, mx * na, my * nb)
+            out = jax.ShapeDtypeStruct((n_out, ns, mx, ns, my), g.dtype)
+            return jax.ffi.ffi_call(KCONV_KLEAD_LORENTZ_TARGET, out)(
+                flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                jnp.asarray(kout), wflat(w), wflat(wt), tw.row, tw.trs, tw.lsrc, tw.rsrc,
+                tw.mph, tw.nph, tw.spin, tw.spin_r, *(() if live is None else (live,)),
+                conj_src=np.int64(bool(conj_src)), **attrs)
+    else:
+        prep_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+        forward_local = make_local_kfft_klead(mesh, kg, kind="fftn", norm=norm)
+        quarter = np.asarray([1, 1j, -1, -1j], dtype=np.complex128)
+        left = [(perm_l[i * ns:(i + 1) * ns], quarter[phase_l[i * ns:(i + 1) * ns]]) for i in range(na)]
+        right = [(perm_r[j * ns:(j + 1) * ns], quarter[phase_r[j * ns:(j + 1) * ns]]) for j in range(nb)]
+
+        def local(g, gt, w, wt, *rest, conj_src=False, has_live=False):
+            live, loads = (rest[0], rest[1:]) if has_live else (None, rest)
+            t, tw = local_tables(loads)
+            n_par, mx, _, my, _ = (int(d) for d in g.shape)
+            n_w = int(w.shape[0])
+            flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
+            wflat = lambda a: a.reshape(n_w, mx * na, my * nb)
+            gt = jnp.conj(g) if conj_src else gt
+            O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+            green = prep_local(jnp.transpose(O, (0, 2, 1, 4, 3)))
+            v_r = prep_local(apply_unfold_load_tables_local(wflat(w), wflat(wt), tw, w_spin_l, w_spin_r))
+            total = jnp.zeros_like(green)
+            for i, (pl, hl) in enumerate(left):
+                for j, (pr, hr) in enumerate(right):
+                    # gamma_A on the left spin axis, gamma_B^dagger on the right:
+                    # a gather and an exact quarter-turn phase each.
+                    value = (jnp.take(green, jnp.asarray(pl), axis=1)
+                             * jnp.asarray(hl).reshape(1, ns, 1, 1, 1))
+                    value = (jnp.take(value, jnp.asarray(pr), axis=3)
+                             * jnp.asarray(np.conj(hr)).reshape(1, 1, 1, ns, 1))
+                    total = total + value * v_r[:, None, :, i, None, :, j]
+            U = jnp.take(forward_local(total) * mult, jnp.asarray(rows), axis=0)
+            if live is None:
+                return U
+            return jnp.where(live_row_mask(live, mx)[None, None, :, None, None], U, 0)
+
+    g_spec = P(None, "x", None, "y", None)
+    sm = {}
+
+    def sharded(c, placed, has_live):
+        if (c, placed, has_live) not in sm:
+            sm[c, placed, has_live] = _sharded(
+                partial(local, conj_src=c, has_live=has_live), mesh,
+                (g_spec, g_spec, g_spec, g_spec) + ((P(None),) if has_live else ())
+                + ((*DEVICE_LOAD_SPECS, *DEVICE_LOAD_SPECS) if placed else ()),
+                P(None, None, "x", None, "y"))
+        return sm[c, placed, has_live]
+    w_partner = bool(np.any(np.asarray(w_tables.trs)))
+
+    def apply(G, Gt, W, Wt, *, conj_partner=False, load=None, w_load=None, live=None):
+        """``conj_partner``: as :func:`make_kconv_klead_unfold`'s.  ``Wt`` may be ``None``
+        only when no q row of ``w_tables`` is antiunitary.  ``load``/``w_load``: the
+        placed tables (both or neither).  ``live``: as :func:`make_kconv_klead_unfold`'s
+        (the Green's and W's shared left rows)."""
+        if (load is None) != (w_load is None):
+            raise ValueError("k-leading lorentz conv: pass both placed loads or neither")
+        _check_complex(G, W)
+        if G.ndim != 5 or int(G.shape[2]) != ns or int(G.shape[4]) != ns:
+            raise ValueError(f"k-leading lorentz conv expects G (n_parent, mu, {ns}, nu, {ns}); "
+                             f"got {G.shape}")
+        if conj_partner and Gt is not None:
+            raise ValueError("k-leading lorentz conv: conj_partner reads conj(G); pass Gt=None")
+        if Gt is None:
+            if needs_partner and not conj_partner:
+                raise ValueError("k-leading lorentz conv: the plan has antiunitary rows, so the "
+                                 "transposed parent Green Gt is required")
+            Gt = G
+        if Wt is None:
+            if w_partner:
+                raise ValueError("k-leading lorentz conv: the q plan has antiunitary rows, so the "
+                                 "parent W's partner Wt is required")
+            Wt = W
+        if (Gt.shape != G.shape or Wt.shape != W.shape
+                or tuple(W.shape[1:]) != (G.shape[1], na, G.shape[3], nb)
+                or int(W.shape[0]) != int(w_tables.n_parent)):
+            raise ValueError(f"k-leading lorentz conv: Gt {Gt.shape} / W {W.shape} / Wt {Wt.shape} do "
+                             f"not match G {G.shape}, ({na}, {nb}) vertices and "
+                             f"{w_tables.n_parent} q parents")
+        if (int(G.shape[0]) != int(tables.n_parent)
+                or int(G.shape[1]) * ns != int(tables.lsrc.shape[1])
+                or int(G.shape[3]) * ns != int(tables.rsrc.shape[1])
+                or int(W.shape[1]) * na != int(w_tables.lsrc.shape[1])
+                or int(W.shape[3]) * nb != int(w_tables.rsrc.shape[1])):
+            raise ValueError(
+                f"k-leading lorentz conv: G {G.shape} / W {W.shape} do not match their tables "
+                f"(n_parent={tables.n_parent}, endpoints {tables.lsrc.shape[1]}/{tables.rsrc.shape[1]} "
+                f"merged over ns={ns}; W endpoints {w_tables.lsrc.shape[1]}/{w_tables.rsrc.shape[1]})")
+        placed = load is not None
+        return sharded(bool(conj_partner and needs_partner), placed, live is not None)(
+            G, Gt, W, Wt, *(() if live is None else (live,)), *((*load, *w_load) if placed else ()))
+    return apply
+
+
+def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ortho") -> Callable:
+    """An interaction's R-space operand read from its q WEDGE: ``fn(Wp, Wt=None, load=None) -> Y``.
+
+    ``Wp`` ``(n_wedge, ml, nl)`` c128 at ``P(None,'x','y')`` holds the
+    interaction on the wedge rows (merged endpoints ``ml = mx*n_l``,
+    ``nl = my*n_r``; a scalar W has ``n_l = n_r = 1``, a Lorentz block
+    ``(mx, nA, my, nB)`` flattened); ``Wt`` is its transposed partner, needed
+    only when ``tables`` use the pair-transpose rule on antiunitary rows
+    (``tables.conj_trs = 0``).  ``tables`` are
+    ``symmetry_maps.unfold_load_tables`` of the q wedge; ``load``, when given,
+    is the same tables on the devices (``symmetry_maps.device_load_tables``),
+    read as operands so a consumer's jit holds no table constants.  Returns ``Y``
+    ``(nk, ml, nl)`` at ``P(None,'x','y')``, equal to
+    ``make_kconv_klead(...).prep`` of the full-zone interaction
+    (``unfold_isdf_operator``, then the endpoint actions): the unfold is the
+    transform's load, so the full-zone interaction is never stored.  CUDA:
+    nvidia-mathdx mode 9; ROCM: the k-box stage's mode 9 (``lorrax_kdft_kfft_klead_unfold``,
+    single or split arm, :func:`kdft_kbox_arm`) where :func:`kdft_kbox_wedge_refusal` is empty; elsewhere the service's reference
+    composition, then ``ifftn``.  ``live`` (int32 ``[2]``, replicated): the pass is padded
+    to a scan's largest pass and ``[lo, hi)`` its live left centroid rows; the rest come back zero.
+    """
+    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"k-leading unfold fft: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    spin_l = np.asarray(tables.spin)
+    spin_r = spin_l if tables.spin_r is None else np.asarray(tables.spin_r)
+    n_l, n_r = int(spin_l.shape[-1]), int(spin_r.shape[-1])
+    conj = int(tables.conj_trs)
+    needs_partner = bool(np.any(np.asarray(tables.trs))) and not conj
+    if kconv_backend(mesh, kgrid) == "mathdx":
+        _require_target(KFFT_KLEAD_UNFOLD_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(ffi_fft_scale("ifftn", norm, nk)), conj_trs=np.int64(conj),
+                     **_mathdx_common())
+
+        def apply_tables(w, wt, t, live):
+            out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
+            return jax.ffi.ffi_call(KFFT_KLEAD_UNFOLD_TARGET, out)(
+                w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r,
+                *(() if live is None else (live,)), **attrs)
+    elif (kbox := rocm_kbox_target(mesh, kg, "kfft_klead_unfold", n_l, n_r)) is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(ffi_fft_scale("ifftn", norm, nk)), conj_trs=np.int64(conj),
+                     cubin_dir=cubin_cache_dir())
+
+        def apply_tables(w, wt, t, live):
+            _kbox_prebuild(mesh, 9, kg, n_l, n_r, 0, live is not None)
+            out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
+            return jax.ffi.ffi_call(kbox, out)(
+                w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r,
+                *(() if live is None else (live,)), **attrs)
+    else:
+        # The plan backend's gw_conv apply transforms W itself, so its prep stays in k space.
+        prep_local = ((lambda o: o) if kconv_backend(mesh, kgrid) == "plan"
+                      else make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm))
+
+        def apply_tables(w, wt, t, live):
+            O = apply_unfold_load_tables_local(w, wt, t, spin_l,
+                                               None if tables.spin_r is None else spin_r)
+            Y = prep_local(O.reshape(nk, int(w.shape[1]), int(w.shape[2])))
+            if live is None:
+                return Y
+            return jnp.where(live_row_mask(live, int(w.shape[1]) // n_l, n_l)[None, :, None], Y, 0)
+
+    def local(w, wt, *rest, has_live=False, placed=False):
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if placed
+             else local_unfold_load_tables(tables))
+        return apply_tables(w, wt, t, live)
+
+    from symmetry_maps import DEVICE_LOAD_SPECS, DeviceLoadTables
+    spec = P(None, "x", "y")
+    sm = {}
+
+    def sharded(placed, has_live):
+        if (placed, has_live) not in sm:
+            sm[placed, has_live] = _sharded(
+                partial(local, has_live=has_live, placed=placed), mesh,
+                (spec, spec) + ((P(None),) if has_live else ()) + (DEVICE_LOAD_SPECS if placed else ()),
+                spec)
+        return sm[placed, has_live]
+
+    def fn(Wp, Wt=None, load=None, live=None):
+        _check_complex(Wp)
+        if Wp.ndim != 3 or int(Wp.shape[1]) % n_l or int(Wp.shape[2]) % n_r:
+            raise ValueError(f"k-leading unfold fft expects Wp (n_wedge, mx*{n_l}, my*{n_r}); "
+                             f"got {Wp.shape}")
+        if int(Wp.shape[0]) != int(tables.n_parent):
+            raise ValueError(f"k-leading unfold fft: Wp has {Wp.shape[0]} wedge rows, the "
+                             f"tables {tables.n_parent}")
+        if Wt is None:
+            if needs_partner:
+                raise ValueError("k-leading unfold fft: the tables read the transposed partner on "
+                                 "antiunitary rows (pair_transpose), so Wt is required")
+            Wt = Wp
+        return sharded(load is not None, live is not None)(
+            Wp, Wt, *(() if live is None else (live,)), *(() if load is None else tuple(load)))
+    return fn
+
+
+def chi_unfold_scratch_bytes(kgrid, ns: int, tile_bytes: int, optin: int | None = None) -> int:
+    """Per-rank bytes mode 11 draws from XLA's scratch allocator at run time.
+
+    The split arm (a pair's ``2 ns^2`` columns do not fit the opt-in shared memory)
+    chunks its pairs through a ``(N_k, chunk·2ns²)``
+    intermediate bounded by ``scratch_bytes``. The default is at most 1 GiB
+    or one local parent-Green tile, whichever is smaller, and at least one
+    pair's full-k transform. Pair chunks own disjoint output entries; their
+    size changes neither the transforms nor the accumulation order. The single pass draws none. A runtime
+    allocation: compiled ``memory_analysis()`` does not count it, so callers price it.
+    """
+    nx, ny, nz = (int(v) for v in kgrid)
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    grp = 2 * int(ns) * int(ns)
+    single = have is not None and grp * (((nx * ny * (nz | 1)) | 1) * 16) <= have
+    per_pair = nx * ny * nz * grp * 16
+    return 0 if single else max(per_pair, min(int(tile_bytes), 1 << 30))
+
+
+def klead_unfold_scratch_bytes(kgrid, ns: int, pairs: int, optin: int | None = None) -> int:
+    """Per-rank bytes one mode-7 call (:func:`make_kconv_klead_unfold`) draws from XLA's
+    scratch allocator at run time, for ``pairs`` stored (μ, ν) pairs of the whole spin group.
+
+    The handler's build() takes a split arm when a block cannot hold a spin group of two or
+    more columns: the group's ``ns²`` columns of ``16·((nx·ny·(nz|1))|1)`` B exceed the
+    opt-in shared memory, or (``ns = 1``) four columns do.  The split arm chunks the pairs
+    through an ``(N_k, chunk·ns²)`` intermediate of at most 1 GiB and at least one pair; the
+    single arm draws none.  Its m7s passes (arm 2 at ``ns = 2``: one padded column fits a
+    block, and the plane tile's and the column's static tables fit beside them) add the
+    chunk's pair-major ``W_R``, ``16·N_k`` B a pair, inside the same bound, and round a chunk
+    below ``pairs`` down to whole waves of plane tiles (an SM-count rule, so this price is the
+    request's upper bound there and equal to it otherwise).  A runtime allocation: compiled
+    ``memory_analysis()`` does not count it, so callers price it.
+    """
+    nx, ny, nz = (int(v) for v in kgrid)
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    grp = int(ns) * int(ns)
+    rs = ((nx * ny * (nz | 1)) | 1) * 16                 # one padded column, bytes
+    if have is not None and grp * rs <= have and (grp > 1 or 4 * grp * rs <= have):
+        return 0
+    nk = nx * ny * nz
+    per_pair = nk * grp * 16
+    if have is not None and int(ns) == 2 and rs <= have:     # arm 2: is it m7s (the handler's build())?
+        pr = ((ny * (nz | 1)) | 1) * 16                    # one padded (ky, kz) plane, bytes
+        tile = max(1, have // pr // grp) * grp            # split_plane_tile(wide): columns
+        if tile * pr + (tile // grp) * 16 <= have and rs + ny * nz * 8 <= have:
+            per_pair += nk * 16
+    return max(1, min(int(pairs), (1 << 30) // per_pair)) * per_pair
+
+
+#: Mode 11's write protocol (``acc=None``): the acc operand of ``KCONV_CHI_UNFOLD_TARGET`` is a
+#: rank-1 one-element placeholder (not aliased) beside the full ``(n_out, nk, mu, nu)`` result, and
+#: the handler writes ``alpha * chi_tau`` without reading it (``KleadChiUnfoldImpl``); any other
+#: acc operand must have the result's shape.  No attribute: the target's signature is unchanged.
+_CHI_WRITE_PLACEHOLDER = (1,)
+
+
+def chi_q_store_ok(mesh: Mesh, kgrid, ns: int, n_out: int) -> bool:
+    """Whether :func:`make_kconv_chi_unfold`'s ``acc=None, rows=q`` call (the q-row store,
+    ``KCONV_CHI_UNFOLD_Q_TARGET``) serves this grid: the CUDA fused single arm (m11f) only,
+    ``ns`` 2, ``n_out`` 1, a pair's ``2 ns²`` columns in the opt-in shared memory.  Elsewhere the
+    consumer takes the accumulate call and the flat-k transform (``GATE mathdx-kconv-chi-q``
+    names this rule)."""
+    return (kconv_backend(mesh, kgrid) == "mathdx" and int(ns) == 2 and int(n_out) == 1
+            and chi_unfold_scratch_bytes(kgrid, ns, 1) == 0)
+
+
+def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bool,
+                          norm: str | None = "ortho", scratch_bytes: int | None = None) -> Callable:
+    """One tau node of the chi0 response read from the RAW-PARENT Green pair:
+    ``fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None, load=None) -> acc``.
+
+    ``acc=None`` returns ``alpha[o] * chi_tau`` itself, the update onto exact zeros (bit for bit
+    the call on a zero ``acc``): the CUDA single arm writes it without reading or zero-filling an
+    accumulator; every other route accumulates onto zeros.  ``acc=None, rows=q`` (``n_out`` 1, where
+    ``fn.q_store``) returns ``(1, len(q), mu, nu)``: the rows ``q`` of the flat-k forward transform
+    (``norm``) of that value, bit for bit :func:`make_flat_k_fftn` of it followed by the row gather,
+    formed in the transform's tile with no full-k accumulator (the CUDA fused single arm, ``ns`` 2).
+
+    ``Gv``/``Gc`` ``(n_parent, mu, ns, nu, ns)`` c128 at ``P(None,'x',None,'y',None)`` are the
+    centroid-major parent Greens (``gw.greens_function_kernel.build_G_parents``), NOT
+    conjugated; ``tables`` are their plan's ``symmetry_maps.unfold_load_tables``
+    (``trs_rule="pair_transpose"``).  ``Gvt``/``Gct`` are the partner tiles an antiunitary row
+    reads; ``None`` means the partner is ``conj(G)`` (a Green of real weights), which the load
+    forms from ``G`` itself.  ``acc`` ``(n_out, nk, mu, nu)`` c128 at ``P(None,None,'x','y')``
+    is updated in place (donate it) and ``alpha`` ``(n_out,)`` c128 is replicated:
+
+        acc[o] += alpha[o] * chi_tau,   chi_tau = sum_ab conj(Gc'_ab) Gv'_ab  (+ c.c. if complete)
+
+    with ``G' = ifftn_k(U_k G[row(k)] U_k^dagger)`` (``norm``) the unfolded Green in R space:
+    the response the chi0 minimax kernels accumulate (their ``fftn(conj(G))`` pair, whose
+    product is the same) before the one forward transform after the tau sum.  No full-k Green
+    exists.  ``load``, when given, is the same tables on the devices
+    (``symmetry_maps.device_load_tables``), read as operands so a consumer's jit holds no
+    table constants (baked, they are ~0.57 GB of HLO literal at Fe 20^3 with 1792 centroids).
+    CUDA: nvidia-mathdx mode 11 on the k-box stage (one pass; a chunked split pass on
+    large grids, its intermediate bounded by ``scratch_bytes``); ROCM: the k-box stage's mode 11
+    (``lorrax_kdft_kconv_chi_unfold``, single or split arm, :func:`kdft_kbox_arm`; the split arm's
+    intermediate bounded by ``scratch_bytes``, :func:`kdft_kbox_chi_scratch_bytes`) where
+    :func:`kdft_kbox_chi_refusal` is empty;
+    elsewhere the service's reference composition, then the XLA transforms.
+    """
+    from symmetry_maps import (DEVICE_LOAD_SPECS, apply_unfold_load_tables_local,
+                               local_unfold_load_tables)
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"k-leading chi unfold: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    if int(tables.conj_trs) != 0 or tables.spin_r is not None:
+        raise ValueError("k-leading chi unfold: a Green pair's tables use the pair-transpose rule "
+                         "and one spin action")
+    ns = int(tables.spin.shape[-1])
+    spin_host = np.asarray(tables.spin)
+    mesh_shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if tuple(tables.mesh_shape) != mesh_shape:
+        raise ValueError(f"k-leading chi unfold: tables were cut for a {tuple(tables.mesh_shape)} "
+                         f"mesh; this mesh is {mesh_shape}")
+    n_out, complete = int(n_out), bool(complete)
+    si = ffi_fft_scale("ifftn", norm, nk)
+    sf = ffi_fft_scale("fftn", norm, nk)
+    flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
+    q_store = chi_q_store_ok(mesh, kg, ns, n_out)
+    if kconv_backend(mesh, kgrid) == "mathdx":
+        _require_target(KCONV_CHI_UNFOLD_TARGET, "CUDA")
+
+        def apply_q(gv, gc, alpha, gvt, gct, conj_src, t, live, qsel):
+            out = jax.ShapeDtypeStruct((1, int(qsel.shape[0]), int(gv.shape[1]), int(gv.shape[3])), jnp.complex128)
+            call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_Q_TARGET, out)
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, alpha, qsel, *(() if live is None else (live,)),
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), sf=np.float64(sf), conj_trs=np.int64(2 if conj_src else 0),
+                        complete=np.int64(complete), **_mathdx_common())
+
+        def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
+            budget = (int(scratch_bytes) if scratch_bytes is not None
+                      else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
+            if acc is None:                    # write: the placeholder operand, no alias
+                out = jax.ShapeDtypeStruct((n_out, nk, int(gv.shape[1]), int(gv.shape[3])), jnp.complex128)
+                call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, out)
+                acc = jnp.zeros(_CHI_WRITE_PLACEHOLDER, jnp.complex128)
+            else:
+                call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                        input_output_aliases={12: 0})
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, alpha, acc, *(() if live is None else (live,)),
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
+                        complete=np.int64(complete), scratch_bytes=np.int64(budget),
+                        **_mathdx_common())
+    elif (kbox := rocm_kbox_target(mesh, kg, "kconv_chi_unfold", ns)) is not None:
+
+        def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
+            if acc is None:
+                acc = jnp.zeros((n_out, nk, int(gv.shape[1]), int(gv.shape[3])), jnp.complex128)
+            budget = (int(scratch_bytes) if scratch_bytes is not None
+                      else kdft_kbox_chi_scratch_bytes(kg, ns, int(gv.size) * 16))
+            _kbox_prebuild(mesh, 11, kg, ns, ns, int(complete), live is not None)
+            call = jax.ffi.ffi_call(kbox, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                    input_output_aliases={12: 0})
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, alpha, acc, *(() if live is None else (live,)),
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
+                        complete=np.int64(complete), scratch_bytes=np.int64(budget),
+                        cubin_dir=cubin_cache_dir())
+    else:
+        ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+
+        def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
+            if conj_src:
+                gvt, gct = jnp.conj(gv), jnp.conj(gc)
+            n_par, mx, _, my, _ = (int(v) for v in gv.shape)
+            if acc is None:
+                acc = jnp.zeros((n_out, nk, mx, my), jnp.complex128)
+
+            def unfolded(g, gt):
+                O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+                return ifft_local(O.reshape(nk, mx * ns, my * ns)).reshape(nk, mx, ns, my, ns)
+            chi = jnp.einsum("kxayb,kxayb->kxy", jnp.conj(unfolded(gc, gct)), unfolded(gv, gvt))
+            if complete:
+                chi = chi + jnp.conj(chi)
+            if live is not None:
+                chi = jnp.where(live_row_mask(live, mx)[None, :, None], chi, 0)
+            return acc + alpha[:, None, None, None] * chi[None]
+
+    def local(acc, gv, gc, alpha, gvt, gct, *rest, conj_src=False, placed=False, has_live=False):
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if placed
+             else local_unfold_load_tables(tables))
+        return apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live)
+
+    def local_write(*args, **kw):
+        return local(None, *args, **kw)
+
+    def local_q(qsel, gv, gc, alpha, gvt, gct, *rest, conj_src=False, placed=False, has_live=False):
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if placed
+             else local_unfold_load_tables(tables))
+        return apply_q(gv, gc, alpha, gvt, gct, conj_src, t, live, qsel)
+
+    from symmetry_maps import DeviceLoadTables
+    g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
+    sm = {}
+
+    def sharded(conj_src, placed, has_live, write=False):
+        """write: False (acc in place), True (acc=None) or "q" (acc=None, rows=q)."""
+        if (conj_src, placed, has_live, write) not in sm:
+            body = {False: local, True: local_write, "q": local_q}[write]
+            sm[conj_src, placed, has_live, write] = _sharded(
+                partial(body, conj_src=conj_src, placed=placed, has_live=has_live), mesh,
+                {False: (acc_spec,), True: (), "q": (P(None),)}[write]
+                + (g_spec, g_spec, P(None), g_spec, g_spec)
+                + ((P(None),) if has_live else ()) + (DEVICE_LOAD_SPECS if placed else ()), acc_spec)
+        return sm[conj_src, placed, has_live, write]
+
+    def fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None, load=None, live=None, rows=None):
+        write = acc is None
+        if rows is not None and not (write and q_store):
+            raise ValueError("k-leading chi unfold: rows= takes acc=None on a grid with fn.q_store "
+                             "(the CUDA fused single arm, n_out 1)")
+        _check_complex(*(() if write else (acc,)), Gv, Gc, alpha)
+        if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
+            raise ValueError(f"k-leading chi unfold expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
+                             f"got {Gv.shape} / {Gc.shape}")
+        acc_shape = (n_out, nk, int(Gv.shape[1]), int(Gv.shape[3])) if write else tuple(acc.shape)
+        if acc_shape != (n_out, nk, int(Gv.shape[1]), int(Gv.shape[3])) or alpha.shape != (n_out,):
+            raise ValueError(f"k-leading chi unfold: acc {acc_shape} / alpha {alpha.shape} do not match "
+                             f"n_out={n_out}, nk={nk} and G {Gv.shape}")
+        if (Gvt is None) != (Gct is None):
+            raise ValueError("k-leading chi unfold: pass both partners or neither")
+        conj_src = Gvt is None
+        if conj_src:
+            Gvt, Gct = Gv, Gc
+        elif Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
+            raise ValueError("k-leading chi unfold: the partners must match the Greens' shape")
+        if rows is not None:
+            if isinstance(rows, (list, tuple, np.ndarray)):
+                q = np.asarray(rows)
+                if q.ndim != 1 or q.size < 1 or q.min() < 0 or q.max() >= nk:
+                    raise ValueError(f"k-leading chi unfold: rows= takes 1 to n q rows in [0, {nk}); "
+                                     f"got {q.tolist()}")
+                q = jnp.asarray(q.astype(np.int32))
+            else:
+                q = rows                       # a traced operand: the caller's rows (unchecked)
+            return sharded(conj_src, load is not None, live is not None, "q")(
+                q, Gv, Gc, alpha, Gvt, Gct, *(() if live is None else (live,)),
+                *(() if load is None else tuple(load)))
+        return sharded(conj_src, load is not None, live is not None, write)(
+            *(() if write else (acc,)), Gv, Gc, alpha, Gvt, Gct, *(() if live is None else (live,)),
+            *(() if load is None else tuple(load)))
+    fn.q_store = q_store
+    return fn
+
+
+def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_vertices,
+                          sign_c=None, norm: str | None = "ortho",
+                          scratch_bytes: int | None = None) -> Callable:
+    """Mode 11 with channel vertices: ``fn(acc, Gv, Gc, Gvt=None, Gct=None, load=None) -> acc``.
+
+    For channel ``ch = i*nb + j`` of the ``na = len(left_vertices)`` x
+    ``nb = len(right_vertices)`` monomial vertices ``(perm, phase)``
+    (``γ[α,β] = phase[α] δ_{β,perm[α]}``, ``common.gamma_matrices``)::
+
+        acc[ch, k] += sum_ab conj(phase_i[a]) phase_j[b] conj(Gc'[perm_i a, perm_j b]) Gv'_ab
+
+    with ``G'`` the unfolded Green in R space exactly as :func:`make_kconv_chi_unfold`
+    reads it (the same ``tables``, one spin action, a single output weight of 1).
+    ``sign_c`` ``(nk,)`` real +-1, when given, multiplies Gc's unfolded k rows
+    (a Dirac-half quadrant's own sign relative to ``tables``).  ``acc``
+    ``(na*nb, nk, mu, nu)`` at ``P(None,None,'x','y')``, donated.  No full-k
+    Green exists.  ``load``, when given, is the same tables on the devices
+    (``symmetry_maps.device_load_tables``), read as operands so a consumer's
+    jit holds no table constants.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); ROCM: the k-box stage's
+    mode 11 (``lorrax_kdft_kconv_chi_vertex``, single or split arm) where :func:`kdft_kbox_chi_refusal` is
+    empty; elsewhere the service's reference composition.
+    """
+    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid))
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"chi vertex: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    if int(tables.conj_trs) != 0 or tables.spin_r is not None:
+        raise ValueError("chi vertex: a Green pair's tables use the pair-transpose rule and one spin action")
+    ns = int(tables.spin.shape[-1])
+    spin_host = np.asarray(tables.spin)
+    mesh_shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if tuple(tables.mesh_shape) != mesh_shape:
+        raise ValueError(f"chi vertex: tables were cut for a {tuple(tables.mesh_shape)} mesh; "
+                         f"this mesh is {mesh_shape}")
+    perm_l, phase_l = _vertex_tables(left_vertices, ns, "chi left")
+    perm_r, phase_r = _vertex_tables(right_vertices, ns, "chi right")
+    na, nb = len(left_vertices), len(right_vertices)
+    if na > 3 or nb > 3:
+        raise ValueError("chi vertex: at most three vertices per side")
+    n_ch = na * nb
+    signed = sign_c is not None
+    sign_host = (np.ones(nk) if sign_c is None else np.asarray(sign_c, dtype=np.float64).reshape(-1))
+    if sign_host.shape != (nk,) or not np.all(np.abs(sign_host) == 1.0):
+        raise ValueError("chi vertex: sign_c must be (nk,) of +-1")
+    si = ffi_fft_scale("ifftn", norm, nk)
+    flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
+    if kconv_backend(mesh, kgrid) == "mathdx":
+        _require_target(KCONV_CHI_VERTEX_TARGET, "CUDA")
+
+        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live):
+            budget = (int(scratch_bytes) if scratch_bytes is not None
+                      else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
+            call = jax.ffi.ffi_call(KCONV_CHI_VERTEX_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                    input_output_aliases={13: 0})
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, jnp.ones((1,), jnp.complex128),
+                        jnp.asarray(sign_host), acc, *(() if live is None else (live,)),
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
+                        scratch_bytes=np.int64(budget), signed_c=np.int64(signed),
+                        perm_l=perm_l, phase_l=phase_l, perm_r=perm_r, phase_r=phase_r,
+                        na=np.int64(na), nb=np.int64(nb), **_mathdx_common())
+    elif (kbox := rocm_kbox_target(mesh, kg, "kconv_chi_vertex", ns)) is not None:
+
+        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live):
+            budget = (int(scratch_bytes) if scratch_bytes is not None
+                      else kdft_kbox_chi_scratch_bytes(kg, ns, int(gv.size) * 16))
+            _kbox_prebuild(mesh, 11, kg, ns, ns, 2, live is not None)
+            call = jax.ffi.ffi_call(kbox, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                    input_output_aliases={13: 0})
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, jnp.ones((1,), jnp.complex128),
+                        jnp.asarray(sign_host), acc, *(() if live is None else (live,)),
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
+                        scratch_bytes=np.int64(budget), signed_c=np.int64(signed), perm_l=perm_l,
+                        phase_l=phase_l, perm_r=perm_r, phase_r=phase_r, na=np.int64(na), nb=np.int64(nb),
+                        cubin_dir=cubin_cache_dir())
+    else:
+        ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+        codes = np.asarray([1, 1j, -1, -1j])
+        pl, hl = perm_l.reshape(na, ns), codes[phase_l.reshape(na, ns)]
+        pr, hr = perm_r.reshape(nb, ns), codes[phase_r.reshape(nb, ns)]
+
+        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live):
+            if conj_src:
+                gvt, gct = jnp.conj(gv), jnp.conj(gc)
+            n_par, mx, _, my, _ = (int(v) for v in gv.shape)
+
+            def unfolded(g, gt, sign=None):
+                O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+                if sign is not None:
+                    # sign_c is per full-k row, so it acts on the unfolded k rows before the
+                    # transform to R (mode 11 applies it on its Gc load, at the same point).
+                    O = O * jnp.asarray(sign)[:, None, None, None, None]
+                return ifft_local(O.reshape(nk, mx * ns, my * ns)).reshape(nk, mx, ns, my, ns)
+            lower = unfolded(gv, gvt)
+            upper = unfolded(gc, gct, sign_host if signed else None)
+            planes = []
+            for i in range(na):
+                for j in range(nb):
+                    up = upper[:, :, pl[i]][:, :, :, :, pr[j]]
+                    w = np.conj(hl[i])[:, None] * hr[j][None, :]
+                    planes.append(jnp.einsum("kxayb,ab,kxayb->kxy", jnp.conj(up), w, lower))
+            planes = jnp.stack(planes)
+            if live is not None:
+                planes = jnp.where(live_row_mask(live, mx)[None, None, :, None], planes, 0)
+            return acc + planes
+
+    def local(acc, gv, gc, gvt, gct, *rest, conj_src=False, placed=False, has_live=False):
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if placed
+             else local_unfold_load_tables(tables))
+        return apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live)
+
+    from symmetry_maps import DEVICE_LOAD_SPECS, DeviceLoadTables
+    g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
+    sm = {}
+
+    def sharded(conj_src, placed, has_live):
+        if (conj_src, placed, has_live) not in sm:
+            sm[conj_src, placed, has_live] = _sharded(
+                partial(local, conj_src=conj_src, placed=placed, has_live=has_live), mesh,
+                (acc_spec, g_spec, g_spec, g_spec, g_spec) + ((P(None),) if has_live else ())
+                + (DEVICE_LOAD_SPECS if placed else ()), acc_spec)
+        return sm[conj_src, placed, has_live]
+
+    def fn(acc, Gv, Gc, Gvt=None, Gct=None, load=None, live=None):
+        _check_complex(acc, Gv, Gc)
+        if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
+            raise ValueError(f"chi vertex expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
+                             f"got {Gv.shape} / {Gc.shape}")
+        if tuple(acc.shape) != (n_ch, nk, int(Gv.shape[1]), int(Gv.shape[3])):
+            raise ValueError(f"chi vertex: acc {acc.shape} is not ({n_ch}, {nk}, mu, nu)")
+        if (Gvt is None) != (Gct is None):
+            raise ValueError("chi vertex: pass both partners or neither")
+        conj_src = Gvt is None
+        if conj_src:
+            Gvt, Gct = Gv, Gc
+        elif Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
+            raise ValueError("chi vertex: the partners must match the Greens' shape")
+        return sharded(conj_src, load is not None, live is not None)(
+            acc, Gv, Gc, Gvt, Gct, *(() if live is None else (live,)), *(() if load is None else tuple(load)))
+    return fn
+
+
+def kconv_kminor_out_shape(x_shape, out_layout: int) -> tuple[int, ...]:
+    """Output shape of :func:`make_kconv_kminor` for ``X`` of ``x_shape``."""
+    d0, d1, d2, d3, d4, nk = (int(v) for v in x_shape)
+    if out_layout == 0:
+        return (d0, d1, d2, d3, d4, nk)
+    if out_layout == 1:
+        return (d0, nk, d3, d1, d4, d2)
+    raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
+
+
+def _kminor_out_spec(x_spec: P, out_layout: int) -> P:
+    ax = tuple(x_spec)
+    return P(*ax) if out_layout == 0 else P(ax[0], ax[5], ax[3], ax[1], ax[4], ax[2])
+
+
+def make_local_kconv_kminor(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
+                            mult: float = 1.0, out_layout: int = 0) -> Callable:
+    """Rank-local ``fn(X, K_R) -> U`` of :func:`make_kconv_kminor`, for code already
+    inside a shard_map: ``X`` ``(d0, d1, d2, d3, d4, nk)``, ``K_R`` ``(d1, d2, nk)``."""
+    if out_layout not in (0, 1):
+        raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid, kminor=True))
+    nk = kg[0] * kg[1] * kg[2]
+    scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
+    if kconv_backend(mesh, kgrid, kminor=True) == "mathdx":
+        _require_target(KCONV_KMINOR_TARGET, "CUDA")
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), out_layout=np.int64(out_layout))
+
+        def _mathdx(x, k_r):
+            _check_complex(x, k_r)
+            out = jax.ShapeDtypeStruct(kconv_kminor_out_shape(x.shape, out_layout), x.dtype)
+            kw = {"input_output_aliases": {0: 0}} if out_layout == 0 else {}
+            return jax.ffi.ffi_call(KCONV_KMINOR_TARGET, out, **kw)(
+                x, k_r, **attrs, **_mathdx_common())
+        return _mathdx
+
+    target = rocm_klead_target(mesh, kg, "kconv_kminor")
+    if target is not None:
+        attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                     scale=np.float64(scale), out_layout=np.int64(out_layout),
+                     cubin_dir=cubin_cache_dir())
+
+        def _kdft_kminor_conv(x, k_r):
+            _check_complex(x, k_r)
+            out = jax.ShapeDtypeStruct(kconv_kminor_out_shape(x.shape, out_layout), x.dtype)
+            kw = {"input_output_aliases": {0: 0}} if out_layout == 0 else {}
+            return jax.ffi.ffi_call(target, out, **kw)(x, k_r, **attrs)
+        return _kdft_kminor_conv
+
+    backend = kconv_backend(mesh, kgrid, kminor=True)
+
+    def _xla(x, k_r):
+        _check_complex(x, k_r)
+        if _uses_kdft(kg, backend):                        # k stays minor: no moveaxis passes
+            u = _kdft(_kdft(x, kg, "ifftn", kminor=True) * k_r[None, :, :, None, None, :],
+                      kg, "fftn", kminor=True) * scale
+            return u if out_layout == 0 else jnp.transpose(u, (0, 5, 3, 1, 4, 2))
+        lead = jnp.moveaxis(x, -1, 0)                      # the transform is k-leading
+        u = _kfft(_kfft(lead, kg, "ifftn", backend)
+                  * jnp.moveaxis(k_r, -1, 0)[:, None, :, :, None, None], kg, "fftn", backend)
+        u = jnp.moveaxis(u * scale, 0, -1)
+        return u if out_layout == 0 else jnp.transpose(u, (0, 5, 3, 1, 4, 2))
+    return _xla
+
+
+def make_kconv_kminor(mesh: Mesh, kgrid, x_spec: P, k_spec: P, *,
+                      norm: str | None = "ortho", mult: float = 1.0,
+                      out_layout: int = 0) -> Callable:
+    """The BSE k-MINOR stored-kernel convolution ``fn(X, K_R) -> U``, routed by platform.
+
+    ``U = mult · fftn_k(ifftn_k(X) · K_R[None, :, :, None, None, :])`` for
+    ``X`` ``(d0, d1, d2, d3, d4, nk)`` and ``K_R`` ``(d1, d2, nk)`` already in R
+    space (the caller made it once with :func:`make_kfft_kminor`).  ``U`` has
+    X's layout (``out_layout=0``, in place) or ``(d0, nk, d3, d1, d4, d2)``
+    (``out_layout=1``, emitted by the store).  The k axis of both specs must be
+    replicated and ``K``'s ``(d1, d2)`` must sit on X's mesh axes.
+    """
+    if out_layout not in (0, 1):
+        raise ValueError(f"out_layout must be 0 or 1, got {out_layout!r}")
+    kg = _check_kgrid(kgrid, kconv_backend(mesh, kgrid, kminor=True))
+    nk = kg[0] * kg[1] * kg[2]
+    xax, kax = tuple(x_spec), tuple(k_spec)
+    if len(xax) != 6 or xax[5] is not None or len(kax) != 3 or kax[2] is not None \
+            or (kax[0], kax[1]) != (xax[1], xax[2]):
+        raise ValueError(f"k-minor conv wants X (d0..d4, nk) and K (d1, d2, nk) with k "
+                         f"replicated and (d1, d2) on the same mesh axes; got {x_spec} / {k_spec}")
+    _local = make_local_kconv_kminor(mesh, kg, norm=norm, mult=mult, out_layout=out_layout)
+    sm = _sharded(_local, mesh, (x_spec, k_spec), _kminor_out_spec(x_spec, out_layout))
+
+    def conv(X, K_R):
+        _check_complex(X, K_R)
+        if X.ndim != 6 or K_R.ndim != 3 or int(X.shape[5]) != nk or int(K_R.shape[2]) != nk:
+            raise ValueError(f"k-minor conv expects X (d0..d4, {nk}) and K (d1, d2, {nk}); "
+                             f"got {X.shape} / {K_R.shape}")
+        return sm(X, K_R)
+
+    return conv
+
+
+# =============================================================================
+# The local Fourier plan's device legs (``common.fourier_plan.LocalFourierPlan``)
+# =============================================================================
+FOURIER_PLAN_TARGET = "lorrax_fourier_plan_mathdx"
+#: The route row: leg -> the native target of a ``LocalFourierPlan`` with a GEMM stage, and
+#: the build attributes that target takes besides the plan's (``fourier_plan_ffi``).  A leg
+#: with no row takes the plan's XLA leg.  CUDA: cuBLAS GEMM axes, the fused cuBLASDx pair
+#: (``mathdx_root``/``cubin_dir`` from :func:`pair_build_attrs`, ``""`` = no pair), cuFFT
+#: (cpp/cufft/fourier_plan_cuda_ffi.cc).  ROCM: its port, rocBLAS GEMM axes, hipFFT and the
+#: hipRTC remap kernel cached under ``cubin_dir`` (cpp/hipfft/fourier_plan_rocm_ffi.cc).
+FOURIER_PLAN_TARGETS = {"CUDA": FOURIER_PLAN_TARGET, "ROCM": "lorrax_fourier_plan_rocm"}
+_FOURIER_PLAN_ATTRS = {"CUDA": ("mathdx_root", "cubin_dir"), "ROCM": ("cubin_dir",)}
+# The nvidia-mathdx wheels the plan's fused pair is validated with: its NVRTC build
+# defines CCCL's structured-bindings include guard to reconcile the wheel's CUTLASS
+# with CUDA 13's CCCL (fourier_plan_cuda_ffi.cc, pair_kernel).  Another wheel serves
+# every other kernel (the k-convolution family needs only its cuFFTDx headers,
+# require_kconv); a plan built on it runs its GEMM pairs as the cuBLAS chain.
+PAIR_MATHDX_WHEELS = ("25.6.0",)
+
+_FOURIER_PLAN_ANNOUNCE = {
+    "CUDA": "(cuBLAS Fourier GEMMs, the fused cuBLASDx pair on a validated nvidia-mathdx "
+            "wheel, one cuFFT group)",
+    "ROCM": "(rocBLAS Fourier GEMMs, one hipFFT group, hipRTC remap; no fused pair)",
+}
+
+
+def require_fourier_plan(mesh: Mesh, *, announce: bool = True) -> str:
+    """Startup check of ``LocalFourierPlan``'s leg on this mesh; returns it or refuses.
+
+    A device leg with a :data:`FOURIER_PLAN_TARGETS` row: its handler must be in the loaded
+    library (the plan's device leg is that one custom call).  CUDA needs no mathdx wheel
+    for it; the fused pair checks its wheel where a plan builds it
+    (:func:`pair_build_attrs`).  cpu: the XLA ops, nothing to probe.
+    """
+    from ffi.gate import announce_once, mesh_ffi_platform
+    leg = mesh_ffi_platform(mesh)
+    target = FOURIER_PLAN_TARGETS.get(leg)
+    if target is None:
+        return "xla"
+    _require_target(target, leg)
+    announce_once(("fourier_plan", leg.lower()),
+                  f"[fourier_plan] LocalFourierPlan {leg} leg: {target} "
+                  f"{_FOURIER_PLAN_ANNOUNCE[leg]}", scope="rank0", emit=announce)
+    return "ffi"
+
+
+def fourier_plan_build_attrs(leg: str, *, n_gemm: int) -> dict:
+    """The build attributes of ``leg``'s route row for :func:`fourier_plan_ffi`, for a plan
+    with ``n_gemm`` GEMM axes on a process where the leg is present.  The pair's row
+    (``mathdx_root``): :func:`pair_build_attrs` when a pair is possible, else ``""`` (no pair).
+    ``cubin_dir`` alone (the ROCM remap image): :func:`cubin_cache_dir`."""
+    names = _FOURIER_PLAN_ATTRS[leg]
+    if "mathdx_root" in names:
+        pair = pair_build_attrs() if n_gemm >= 2 else {}
+        return {k: pair.get(k, "") for k in names}
+    return {k: cubin_cache_dir() for k in names}
+
+
+def pair_build_attrs() -> dict:
+    """The fused pair's build attributes for :func:`fourier_plan_ffi`, checked once per plan.
+
+    ``{mathdx_root, cubin_dir}`` when the installed nvidia-mathdx wheel is one of
+    :data:`PAIR_MATHDX_WHEELS`; otherwise ``{}``, announced, and the plan's GEMM
+    pairs run as two cuBLAS GEMMs (the path a pair that does not fit shared memory
+    takes).  A missing wheel refuses as the k-convolution family does
+    (``GATE mathdx-headers``, :func:`mathdx_root`).
+    """
+    from importlib.metadata import PackageNotFoundError, version
+    from ffi.gate import announce_once
+    root = mathdx_root()
+    try:
+        wheel = version("nvidia-mathdx")
+    except PackageNotFoundError:
+        wheel = None
+    if wheel not in PAIR_MATHDX_WHEELS:
+        announce_once(("fourier_plan", "pair-wheel", wheel),
+                      f"[fourier_plan] fused pair off: nvidia-mathdx {wheel} is not among the "
+                      f"validated wheels {PAIR_MATHDX_WHEELS}; GEMM pairs run as the cuBLAS chain "
+                      "(validate the pair on the new wheel with tests/test_fourier_plan.py on the "
+                      "ffi leg, then add it to ffi.fft.PAIR_MATHDX_WHEELS)", scope="rank0")
+        return {}
+    return dict(mathdx_root=root, cubin_dir=cubin_cache_dir())
+
+
+def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm, scale,
+                     order, sign, leg="CUDA", mathdx_root="", cubin_dir=""):
+    """One custom call of ``leg``'s :data:`FOURIER_PLAN_TARGETS` row over the ``len(n)``
+    trailing axes of ``x`` (row-major in, row-major out; CUDA
+    ``cpp/cufft/fourier_plan_cuda_ffi.cc``, ROCM ``cpp/hipfft/fourier_plan_rocm_ffi.cc``).
+
+    Every attribute is per transform axis in physical order: full extent
+    ``n``, compact extents ``kin``/``kout``, the concatenated supports
+    ``in_idx``/``out_idx`` (identity ranges on an axis without one), the 0/1
+    flags ``sup_in``/``sup_out``/``gemm``, the axis' jnp.fft ``scale``, and
+    ``order``: GEMM axes in execution order with -1 where the FFT group runs.
+    CUDA: ``mathdx_root``/``cubin_dir`` build the fused supported pair (the two
+    trailing axes' GEMMs back to back as one cuBLASDx kernel, when a block fits
+    it on the device); ``""`` runs every GEMM through cuBLAS.  ROCM: ``cubin_dir``
+    caches the remap kernel's hipRTC image (``""``: not cached).
+    """
+    d = len(n)
+    out = jax.ShapeDtypeStruct(tuple(x.shape[:-d]) + tuple(int(k) for k in kout), x.dtype)
+    i64 = lambda v: np.asarray(v, dtype=np.int64)
+    build = dict(mathdx_root=mathdx_root, cubin_dir=cubin_dir)
+    return jax.ffi.ffi_call(FOURIER_PLAN_TARGETS[leg], out)(
+        x, n=i64(n), kin=i64(kin), kout=i64(kout), in_idx=i64(in_idx), out_idx=i64(out_idx),
+        sup_in=i64(sup_in), sup_out=i64(sup_out), gemm=i64(gemm),
+        scale=np.asarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign),
+        **{k: build[k] for k in _FOURIER_PLAN_ATTRS[leg]})
+
+
+# ---------------------------------------------------------------------------------------------
+# ROCM route receipts.  Every public factory, built on a ROCm mesh outside xla_reference(),
+# announces once (rank 0, per factory, k-grid and route) the route it took: its own native kdft
+# target, or the XLA composition and the kdft targets that composition calls inside.  The CUDA
+# and cpu legs are untouched (the wrapper returns the factory's result unchanged and prints only
+# on ROCM).  A nested factory reports into the outermost one, so one receipt names the whole route.
+# ---------------------------------------------------------------------------------------------
+_ROUTE_TRACE: list = []
+
+
+def _note_rocm_target(target: str | None) -> None:
+    """Record a kdft target chosen while a ROCm factory is being built (no-op outside one)."""
+    if target is not None and _ROUTE_TRACE:
+        _ROUTE_TRACE[-1].append(target)
+
+
+def _rocm_route_name(factory_name: str) -> str:
+    """``make_local_kconv_klead`` -> ``kconv_klead``: the router-table spelling of a factory."""
+    n = factory_name.removeprefix("make_").removeprefix("local_")
+    return {"fused_conv_kpair": "kconv_pair", "fused_conv_kparent": "kconv_parent",
+            "fused_conv_kplane": "kconv_plane"}.get(n, n)
+
+
+def _rocm_route_receipt(factory: Callable) -> Callable:
+    import inspect
+    sig = inspect.signature(factory)
+    name = _rocm_route_name(factory.__name__)
+
+    @functools.wraps(factory)
+    def built(mesh, *args, **kwargs):
+        from ffi.gate import announce_once, mesh_ffi_platform
+        try:
+            rocm = not _XLA_REFERENCE and mesh_ffi_platform(mesh) == "ROCM"
+        except (AttributeError, IndexError, TypeError):  # not a Mesh: the factory itself refuses it
+            rocm = False
+        if not rocm:
+            return factory(mesh, *args, **kwargs)
+        _ROUTE_TRACE.append([])
+        try:
+            fn = factory(mesh, *args, **kwargs)
+        finally:
+            used = list(dict.fromkeys(_ROUTE_TRACE.pop()))
+        if _ROUTE_TRACE:                                  # nested: the outer factory announces
+            _ROUTE_TRACE[-1].extend(used)
+            return fn
+        own = _ROCM_KLEAD_TARGETS.get(name) or _ROCM_KBOX_TARGETS.get(name) or _ROCM_OUTER_TARGETS.get(name) or _ROCM_PAIR_TARGETS.get(name)
+        if own is not None and own in used:
+            route = " + ".join(used)
+        else:
+            route = "XLA" + (f" around {' + '.join(used)}" if used else " (no native ROCM target)")
+        kg = sig.bind_partial(mesh, *args, **kwargs).arguments.get("kgrid")
+        grid = None if kg is None else tuple(int(v) for v in kg)
+        announce_once(("kconv", "rocm-route", name, grid, route),
+                      f"[kconv] k-convolution router: ROCM {name} k-grid {grid} -> {route}", scope="rank0")
+        return fn
+    return built
+
+
+for _f in [n for n in __all__ if n.startswith("make_")]:
+    globals()[_f] = _rocm_route_receipt(globals()[_f])
+del _f

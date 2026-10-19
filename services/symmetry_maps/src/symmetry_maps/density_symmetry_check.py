@@ -1,0 +1,964 @@
+"""Time-reversal verdict for a two-component DFT reference.
+
+QE's data decides (:func:`qe_trs_off_reason`). TRS holds only if no QE row is
+typed t_rev = 1 (if Theta were a symmetry, g = Theta^-1 (Theta g) would be
+one too and QE would type the row unitary) and the SCF absolute
+magnetization is below ``TOL_ABS_MAGNETIZATION``: in noncollinear DFT the
+only TR-odd Kohn-Sham term is sigma.B_xc[m] (+U through the spin-resolved
+occupations), so TRS holds iff m(r) = 0. Without an authenticated schema or
+an SCF magnetization, TRS is off.
+
+When QE says nonmagnetic, the wavefunction check is a consistency guard. A
+raw-pair or TRIM residual above tolerance refuses when QE's moment is 0
+(``GATE trs_qe_nonmagnetic_wfn_consistent``); at 0 < m <
+``TOL_ABS_MAGNETIZATION``, or on a spatial-pair failure, TRS goes off with a
+loud warning. It compares occupied one-particle
+density operators at ``k`` and ``-k`` directly in G space, from a raw stored
+partner, the spatial unfold of a stored partner, or Kramers closure at a
+TRIM; when QE says magnetic it does not run.
+
+The comparison is gauge invariant and accepts fractional occupations. It
+does not build an FFT box or a real-space density, and it is intentionally
+inactive for scalar, collinear-two-channel, and four-component inputs.
+
+A loader built with a mesh over every process deals the planned evidence
+items round-robin: each process reads only its own k pairs, then one
+all-gather of the per-item residuals, minimum singular values and covered k
+rows follows.  Every process classifies the same merged numbers, so the
+verdict is identical everywhere.  A mesh-less loader keeps the serial sweep.
+
+A completed measurement is stamped across processes (``_STAMP_SCHEMA``): a
+JSON receipt in ``lxkit.user_cache_dir("wfn_trs")``, never beside the WFN,
+keyed by the file's identity (resolved path, size, mtime_ns, inode), a
+SHA-256 of the header arrays and G lists the verdict reads, the algorithm
+version, a digest of this module's source (the code that measured and
+classified) and ``(tol, max_k, nocc)``.  The coefficients are not hashed: the
+stored band energies are a round-off fingerprint of the run that wrote them,
+so a regenerated WFN changes the digest even if size and mtime survive.  A
+check that raised is never stamped, and a stamp holding one is a miss.  The
+receipt is published with ``lxkit.atomic_write_bytes`` and carries a SHA-256
+of its report; a stamp whose digest, types or coverage do not check is a miss,
+never a verdict.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import os
+import sys
+import time
+import warnings
+from dataclasses import dataclass, field
+
+import numpy as np
+
+__all__ = [
+    "DensitySymmetryReport",
+    "cached_density_symmetry_check",
+    "check_density_symmetries",
+    "check_spinor_reference_trs",
+    "occupation_operator_residual",
+    "qe_trs_off_reason",
+    "trs_check_mode",
+]
+
+TOL_TRS = 1.0e-6
+#: SCF absolute magnetization (muB/cell) below which QE's reference counts as
+#: nonmagnetic. With a Stoner I ~ 1 eV/muB it splits Kramers pairs by about
+#: 0.1 meV, under the 1 meV Sigma budget, and is above SCF noise on m = 0.
+TOL_ABS_MAGNETIZATION = 1.0e-4
+MAX_K_DEFAULT = 12
+_ALGORITHM_VERSION = "qe-magnetization-decides-v3"
+_STAMP_SCHEMA = "wfn-trs-stamp-v2"
+#: A stamp is ~1.6 kB and one exists per (WFN, tol, max_k, nocc); test runs
+#: leave one per temporary WFN.  A write that finds more than this many drops
+#: the least recently written half, so the directory stays bounded.
+_STAMP_KEEP = 2000
+#: Loader arrays a verdict depends on: the k set, weights, occupations and
+#: band energies, the symmetry and lattice tables the spatial unfold uses, and
+#: the per-k G lists.  All are in memory once the loader is built.
+_STAMP_FIELDS = (
+    "nspin", "nspinor", "nkpts", "nbands", "ngkmax", "ecutwfc", "kgrid",
+    "shift", "ngk", "ifmin", "ifmax", "kweights", "kpoints", "energies",
+    "occs", "ng", "ecutrho", "fft_grid", "ntran", "sym_matrices",
+    "translations", "alat", "blat", "avec", "bvec", "atom_types",
+    "atom_positions", "_gvecs_raw",
+)
+
+
+@dataclass(frozen=True)
+class DensitySymmetryReport:
+    """Retained TRS receipt; density/spatial fields are compatibility data."""
+
+    trs_holds: bool
+    trs_basis: str
+    m_rel: float | None
+    m_rel_total: float | None
+    trs_coverage: float
+    tol_trs: float
+    trs_implied_by_mesh: bool | None
+    spatial_ops_ok: bool
+    spatial_residual: np.ndarray
+    spatial_untested: tuple[int, ...]
+    spatial_failed: tuple[int, ...]
+    tol_spatial: float
+    charge: float
+    charge_expected: float
+    charge_rel_err: float
+    rho_min_rel: float
+    invariants_ok: bool
+    manifold_gap: float
+    path: str
+    nocc: int
+    nspin: int
+    nspinor: int
+    n_k_used: int
+    n_k_total: int
+    subsampled: bool
+    fft_grid: tuple[int, ...]
+    seconds: float
+    seconds_io: float = 0.0
+    seconds_quad: float = 0.0
+    messages: tuple[str, ...] = field(default_factory=tuple)
+    method: str = "real-space-density"
+    subspace_residual: float | None = None
+    min_overlap_singular_value: float | None = None
+    evidence_counts: tuple[tuple[str, int], ...] = field(default_factory=tuple)
+    conclusive: bool = True
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.trs_holds and self.spatial_ops_ok
+                    and self.invariants_ok)
+
+    def summary(self) -> str:
+        residual = ("n/a" if self.subspace_residual is None else
+                    f"{self.subspace_residual:.2e}")
+        evidence = ", ".join(
+            f"{kind}={count}" for kind, count in self.evidence_counts)
+        if self.trs_basis == "not-2c":
+            state = "NOT APPLICABLE"
+        elif not self.trs_holds:
+            state = "BROKEN"
+        elif self.conclusive:
+            state = "CONSISTENT"
+        else:
+            state = "INCONCLUSIVE"
+        return (
+            f"[2c-TRS] {os.path.basename(self.path)}: {state} "
+            f"({self.trs_basis}, residual={residual}, "
+            f"coverage={self.trs_coverage:.0%}, {evidence or 'no evidence'}) "
+            f"| {self.seconds:.2f}s "
+            f"(io {self.seconds_io:.2f} + overlap {self.seconds_quad:.2f})"
+        )
+
+
+@dataclass(frozen=True)
+class _TRSEvidence:
+    kind: str
+    source: int
+    target_raw: int
+    spatial_op: int | None = None
+
+
+def trs_check_mode() -> str:
+    """Return ``on`` or ``strict`` from ``LORRAX_TRS_CHECK``.
+
+    The historical off values are refused: disabling the measurement made
+    ``WfnLoader.trs_holds`` fall back to True and was therefore an input-side
+    assertion of time reversal, not merely a diagnostic opt-out.
+    """
+    raw = os.environ.get("LORRAX_TRS_CHECK", "1").strip().lower()
+    if raw in {"0", "false", "off", "no"}:
+        raise ValueError(
+            "GATE retired_LORRAX_TRS_CHECK_off: LORRAX_TRS_CHECK="
+            f"{raw!r} is retired because it asserted time reversal by "
+            "skipping the occupied-density verdict. Leave the variable "
+            "unset (automatic measurement) or use 'strict' to turn a "
+            "broken/inconclusive verdict into a refusal.")
+    if raw == "strict":
+        return "strict"
+    if raw in {"", "1", "true", "on", "yes"}:
+        return "on"
+    raise ValueError(
+        "LORRAX_TRS_CHECK must be 1/on or strict; "
+        f"got {raw!r}")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = float(raw)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError(f"{name} must be finite and positive; got {raw!r}")
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative; got {raw!r}")
+    return value
+
+
+def _is_reporting_process() -> bool:
+    try:
+        import jax
+        return int(jax.process_index()) == 0
+    except Exception:
+        return True
+
+
+def _periodic_max_delta(a: np.ndarray, b: np.ndarray) -> float:
+    delta = np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)
+    delta -= np.rint(delta)
+    return float(np.max(np.abs(delta)))
+
+
+def _plan_two_component_evidence(
+    kpoints: np.ndarray,
+    sym_mats_k: np.ndarray,
+    weights: np.ndarray,
+    *,
+    max_k: int,
+    tol: float = 1.0e-7,
+) -> list[_TRSEvidence]:
+    """Choose raw, spatial-only, and TRIM comparisons.
+
+    Every row is a spatial partner: the check runs only when QE types every
+    row unitary (:func:`qe_trs_off_reason`).
+    """
+    kpts = np.asarray(kpoints, dtype=np.float64)
+    spatial = np.asarray(sym_mats_k, dtype=np.int64)
+    candidates: list[_TRSEvidence] = []
+    for i, ki in enumerate(kpts):
+        raw = [j for j, kj in enumerate(kpts)
+               if _periodic_max_delta(kj, -ki) < tol]
+        if raw:
+            j = int(raw[0])
+            if j == i:
+                candidates.append(_TRSEvidence("trim", i, j))
+            elif i < j:
+                candidates.append(_TRSEvidence("raw-pair", i, j))
+            continue
+
+        hit = None
+        for j, kj in enumerate(kpts):
+            for s, S in enumerate(spatial):
+                if _periodic_max_delta(S @ kj, -ki) < tol:
+                    hit = _TRSEvidence("spatial-pair", i, j, s)
+                    break
+            if hit is not None:
+                break
+        if hit is not None:
+            candidates.append(hit)
+
+    priority = {"raw-pair": 0, "spatial-pair": 1, "trim": 2}
+    candidates.sort(key=lambda e: (
+        -float(weights[e.source]), priority[e.kind], e.source,
+        e.target_raw, -1 if e.spatial_op is None else e.spatial_op))
+    return candidates if max_k <= 0 else candidates[:max_k]
+
+
+def _evidence_partition(loader) -> tuple[int, int]:
+    """``(rank, world)`` over which the evidence items are dealt.
+
+    Only a loader constructed with a mesh spanning every process is known to
+    be opened by all of them together (its ``load`` is itself collective).  A
+    mesh-less loader may be opened by one rank alone -- ``file_io.qp_wfn``
+    does so for its rank-0 writer -- so it keeps the serial sweep and issues
+    no collective.
+    """
+    mesh = getattr(loader, "_mesh", None)
+    if mesh is None:
+        return 0, 1
+    import jax
+    world = int(jax.process_count())
+    if world <= 1:
+        return 0, 1
+    owners = {int(d.process_index)
+              for d in np.asarray(mesh.devices).reshape(-1)}
+    if len(owners) != world:
+        return 0, 1
+    return int(jax.process_index()), world
+
+
+def _gather_process_rows(row: np.ndarray, world: int) -> np.ndarray:
+    """``(world, n)`` float64 rows, one per process (one all-gather)."""
+    row = np.asarray(row, dtype=np.float64).reshape(-1)
+    if world <= 1:
+        return row[None, :]
+    import jax
+    from jax.experimental import multihost_utils
+    local = jax.device_put(row, jax.local_devices()[0])
+    rows = np.asarray(multihost_utils.process_allgather(local),
+                      dtype=np.float64)
+    return rows.reshape(world, row.size)
+
+
+def _merge_process_evidence(row: np.ndarray, world: int) -> np.ndarray:
+    """Elementwise max over processes of a non-negative evidence row.
+
+    Every entry is filled by exactly one process and is zero elsewhere, so the
+    max returns the owner's value bit for bit.  It is one all-gather of a few
+    dozen doubles.
+    """
+    return _gather_process_rows(row, world).max(axis=0)
+
+
+def _raw_ibz_psi_k(loader, ik: int, nb: int, *, b_lo: int = 0) -> np.ndarray:
+    """Read one raw stored coefficient slab as ``(band,spinor,G)``."""
+    ds = loader._file["wfns/coeffs"]
+    start = int(loader.kpt_starts[int(ik)])
+    ngk = int(loader.ngk[int(ik)])
+    raw = ds[int(b_lo):int(nb), :, start:start + ngk, :]
+    return raw[..., 0] + 1j * raw[..., 1]
+
+
+def _theta_overlap(
+    source: np.ndarray,
+    source_g: np.ndarray,
+    source_k: np.ndarray,
+    target: np.ndarray,
+    target_g: np.ndarray,
+    target_k: np.ndarray,
+) -> np.ndarray:
+    """Return ``<target_a|Theta source_b>`` with ``Theta=i sigma_y K``."""
+    src = np.asarray(source, dtype=np.complex128)
+    dst = np.asarray(target, dtype=np.complex128)
+    if src.ndim != 3 or dst.ndim != 3 or src.shape[1] != 2 or dst.shape[1] != 2:
+        raise ValueError("2c TRS overlap requires (band,2,G) coefficients")
+    if src.shape[0] != dst.shape[0]:
+        raise ValueError("source and target occupation supports differ")
+
+    shift_f = np.asarray(source_k) + np.asarray(target_k)
+    shift = np.rint(shift_f).astype(np.int64)
+    if np.max(np.abs(shift_f - shift)) > 1.0e-7:
+        raise ValueError(
+            "TRS target is not reciprocal-equivalent to -k_source: "
+            f"k_source+k_target={shift_f.tolist()}")
+
+    target_lookup = {
+        tuple(int(v) for v in g): i
+        for i, g in enumerate(np.asarray(target_g, dtype=np.int64))
+    }
+    src_rows: list[int] = []
+    dst_rows: list[int] = []
+    for ig, g in enumerate(np.asarray(source_g, dtype=np.int64)):
+        jg = target_lookup.get(tuple(int(v) for v in (-g - shift)))
+        if jg is not None:
+            src_rows.append(ig)
+            dst_rows.append(jg)
+    if not src_rows:
+        return np.zeros((dst.shape[0], src.shape[0]), dtype=np.complex128)
+
+    si = np.asarray(src_rows, dtype=np.int64)
+    ti = np.asarray(dst_rows, dtype=np.int64)
+    theta_up = np.conj(src[:, 1, si])
+    theta_dn = -np.conj(src[:, 0, si])
+    return (np.conj(dst[:, 0, ti]) @ theta_up.T
+            + np.conj(dst[:, 1, ti]) @ theta_dn.T)
+
+
+def occupation_operator_residual(
+    overlap: np.ndarray,
+    target_occupations: np.ndarray,
+    source_occupations: np.ndarray,
+) -> tuple[float, float]:
+    """Distance between target and time-reversed one-particle densities."""
+    M = np.asarray(overlap, dtype=np.complex128)
+    ft = np.asarray(target_occupations, dtype=np.float64).reshape(-1)
+    fs = np.asarray(source_occupations, dtype=np.float64).reshape(-1)
+    if M.shape != (ft.size, fs.size):
+        raise ValueError(
+            f"overlap shape {M.shape} does not match occupations "
+            f"({ft.size}, {fs.size})")
+    if not (np.all(np.isfinite(ft)) and np.all(np.isfinite(fs))):
+        raise ValueError("occupations must be finite")
+    denom = float(np.dot(ft, ft) + np.dot(fs, fs))
+    if denom <= np.finfo(np.float64).tiny:
+        raise ValueError("empty occupied one-particle density operator")
+    cross = float(np.einsum(
+        "a,b,ab->", ft, fs, np.abs(M) ** 2, optimize=True))
+    distance2 = denom - 2.0 * cross
+    roundoff = 128.0 * np.finfo(np.float64).eps * max(1.0, denom)
+    if distance2 < -roundoff:
+        raise ValueError(
+            "negative density-operator distance: coefficient rows are not "
+            f"orthonormal enough for the overlap identity ({distance2:.3e})")
+    residual = float(np.sqrt(max(0.0, distance2) / denom))
+    singular = np.linalg.svd(M, compute_uv=False)
+    return residual, (float(np.min(singular)) if singular.size else 0.0)
+
+
+# Compatibility for focused tests and older diagnostic imports.
+_occupation_operator_residual = occupation_operator_residual
+
+
+def _classify_trs_evidence(
+    evidence: list[_TRSEvidence], residuals: list[float], *, tol_trs: float,
+) -> tuple[bool, str]:
+    """``(failed, basis)``: the failing evidence kind, else the strongest measured."""
+    if len(evidence) != len(residuals):
+        raise ValueError("TRS evidence and residual counts differ")
+    for kind in ("raw-pair", "trim", "spatial-pair"):
+        if any(e.kind == kind and r > tol_trs for e, r in zip(evidence, residuals)):
+            return True, f"{kind}-falsified"
+    kinds = {e.kind for e in evidence}
+    return False, next((k for k in ("raw-pair", "spatial-pair", "trim") if k in kinds),
+                       "no-evidence")
+
+
+def _empty_report(
+    loader,
+    *,
+    basis: str,
+    message: str,
+    tol_trs: float,
+    nspin: int,
+    nspinor: int,
+    conclusive: bool,
+    trs_holds: bool = True,
+) -> DensitySymmetryReport:
+    return DensitySymmetryReport(
+        trs_holds=bool(trs_holds), trs_basis=basis, m_rel=None,
+        m_rel_total=None,
+        trs_coverage=0.0, tol_trs=tol_trs, trs_implied_by_mesh=None,
+        spatial_ops_ok=True, spatial_residual=np.zeros(0),
+        spatial_untested=(), spatial_failed=(), tol_spatial=float("nan"),
+        charge=float("nan"), charge_expected=float("nan"),
+        charge_rel_err=0.0, rho_min_rel=0.0, invariants_ok=True,
+        manifold_gap=float("nan"),
+        path=str(getattr(loader, "path", getattr(loader, "_path", "<wfn>"))),
+        nocc=0, nspin=nspin, nspinor=nspinor, n_k_used=0,
+        n_k_total=int(getattr(loader, "nkpts", 0)), subsampled=False,
+        fft_grid=tuple(int(v) for v in getattr(loader, "fft_grid", ())),
+        seconds=0.0, messages=(message,),
+        method="occupied-density-subspace", conclusive=conclusive,
+    )
+
+
+def _check_two_component_trs(
+    loader,
+    *,
+    tol_trs: float,
+    max_k: int,
+    nocc: int | None,
+) -> DensitySymmetryReport:
+    t0 = time.perf_counter()
+    kpoints = np.asarray(loader.kpoints, dtype=np.float64)
+    weights = np.asarray(loader.kweights, dtype=np.float64)
+    if weights.shape != (kpoints.shape[0],) or not np.all(np.isfinite(weights)):
+        raise ValueError("WFN k weights are missing or non-finite")
+    weight_norm = float(np.sum(weights))
+    if weight_norm <= 0.0:
+        raise ValueError("WFN k weights have non-positive sum")
+
+    stop = int(loader.physical_density_band_stop if nocc is None else nocc)
+    stop = max(1, min(stop, int(loader.nbands)))
+    occupations = np.asarray(
+        loader.physical_density_occupations(k="file", unit_as_none=False),
+        dtype=np.float64)[:, :stop]
+    ntran = int(getattr(loader, "ntran", 1) or 1)
+    spatial = np.asarray(loader.sym_matrices, dtype=np.int64)[:ntran]
+    sym_mats_k = spatial.transpose(0, 2, 1)
+    evidence = _plan_two_component_evidence(
+        kpoints, sym_mats_k, weights, max_k=max_k)
+
+    raw_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    t_io = 0.0
+
+    def raw(ik: int) -> tuple[np.ndarray, np.ndarray]:
+        nonlocal t_io
+        if ik not in raw_cache:
+            tic = time.perf_counter()
+            coeff = _raw_ibz_psi_k(loader, ik, stop)
+            start = int(loader.kpt_starts[ik])
+            ngk = int(loader.ngk[ik])
+            gvec = np.asarray(loader._gvecs_raw[start:start + ngk],
+                              dtype=np.int64)
+            t_io += time.perf_counter() - tic
+            raw_cache[ik] = (coeff, gvec)
+        return raw_cache[ik]
+
+    operator_tables = None
+
+    def measure(item: _TRSEvidence) -> tuple[float, float, float]:
+        """``(residual, min singular value, overlap seconds)`` of one item."""
+        nonlocal operator_tables
+        source, source_g = raw(item.source)
+        if item.kind == "spatial-pair":
+            if operator_tables is None:
+                from symmetry_maps.maps import build_spatial_operator_tables
+                operator_tables = build_spatial_operator_tables(loader)
+            from symmetry_maps.maps import unfold_psi
+            s = int(item.spatial_op)
+            if not 0 <= s < ntran:
+                raise AssertionError("antiunitary row entered 2c TRS evidence")
+            target_raw, target_raw_g = raw(item.target_raw)
+            target = unfold_psi(
+                target_raw, sym_idx=s, g_kbar=target_raw_g,
+                sym_mats_k=operator_tables.sym_mats_k,
+                translations=operator_tables.translations,
+                U_spinor_spatial=operator_tables.U_spinor)
+            S = np.asarray(operator_tables.sym_mats_k[s], dtype=np.int64)
+            target_k = -np.asarray(kpoints[item.source], dtype=np.float64)
+            sk = S @ np.asarray(kpoints[item.target_raw], dtype=np.float64)
+            kg0_f = target_k - sk
+            kg0 = np.rint(kg0_f).astype(np.int64)
+            if np.max(np.abs(kg0_f - kg0)) > 1.0e-7:
+                raise ValueError("spatial TRS partner has non-integer umklapp")
+            target_g = np.einsum(
+                "ij,gj->gi", S, target_raw_g, optimize=True) - kg0
+        else:
+            target, target_g = raw(item.target_raw)
+            target_k = np.asarray(kpoints[item.target_raw], dtype=np.float64)
+
+        tic = time.perf_counter()
+        overlap = _theta_overlap(
+            source, source_g, kpoints[item.source],
+            target, target_g, target_k)
+        residual, min_singular = occupation_operator_residual(
+            overlap, occupations[item.target_raw], occupations[item.source])
+        return residual, min_singular, time.perf_counter() - tic
+
+    # Items are dealt round-robin; each process reads only its own k pairs.
+    rank, world = _evidence_partition(loader)
+    n_items = len(evidence)
+    residual_row = np.zeros(n_items, dtype=np.float64)
+    singular_row = np.zeros(n_items, dtype=np.float64)
+    covered_row = np.zeros(kpoints.shape[0], dtype=np.float64)
+    t_overlap = 0.0
+    local_error = None
+    for index, item in enumerate(evidence):
+        if index % world != rank:
+            continue
+        try:
+            residual, min_singular, seconds = measure(item)
+        except Exception as exc:     # every process must still reach the merge
+            local_error = exc
+            break
+        finally:
+            raw_cache.clear()
+        t_overlap += seconds
+        residual_row[index] = residual
+        singular_row[index] = min_singular
+        covered_row[item.source] = 1.0
+        covered_row[item.target_raw] = 1.0
+
+    merged = _merge_process_evidence(np.concatenate([
+        residual_row, singular_row, covered_row,
+        [0.0 if local_error is None else 1.0]]), world)
+    if local_error is not None:
+        raise local_error
+    if merged[-1] > 0.0:
+        raise RuntimeError(
+            "2c TRS evidence measurement failed on another process; that "
+            "process raised the exception itself")
+    residuals = [float(v) for v in merged[:n_items]]
+    singular_values = [float(v) for v in merged[n_items:2 * n_items]]
+    covered = merged[2 * n_items:-1] > 0.0
+    counts = {"raw-pair": 0, "spatial-pair": 0, "trim": 0}
+    for item in evidence:
+        counts[item.kind] += 1
+
+    max_residual = max(residuals, default=None)
+    min_singular = min(singular_values, default=None)
+    failed, basis = _classify_trs_evidence(evidence, residuals, tol_trs=tol_trs)
+    # QE's m = 0 (do_magnetization false) makes Theta exact, so a falsified
+    # Kramers pair is an inconsistent WFN.  A moment 0 < m < 1e-4 muB/cell
+    # breaks Theta at ~Delta/gap and QE did not TR-reduce that mesh, and a
+    # spatial-pair failure may be the unfold's: both take TRS off, loudly.
+    messages = ()
+    if failed:
+        m = loader.resolve_qe_symmetry().scf_absolute_magnetization
+        message = (f"the WFN fails the TRS guard ({basis}, residual "
+                   f"{max_residual:.3e} > {tol_trs:.1e}) for "
+                   f"{getattr(loader, 'path', '<wfn>')}")
+        if m == 0.0 and basis != "spatial-pair-falsified":
+            raise RuntimeError(
+                "GATE trs_qe_nonmagnetic_wfn_consistent: QE reports no t_rev "
+                f"row and m = 0, but {message}.")
+        messages = (f"TRS off: SCF |m| = {m:.1e} muB/cell and {message}.",)
+    charge_expected = float(getattr(loader, "num_electrons", np.nan))
+    n_used = int(np.count_nonzero(covered))
+    return DensitySymmetryReport(
+        trs_holds=not failed, trs_basis=basis,
+        m_rel=max_residual, m_rel_total=None,
+        trs_coverage=float(np.sum(weights[covered]) / weight_norm),
+        tol_trs=tol_trs, trs_implied_by_mesh=None,
+        spatial_ops_ok=True, spatial_residual=np.zeros(0),
+        spatial_untested=(), spatial_failed=(), tol_spatial=float("nan"),
+        charge=charge_expected, charge_expected=charge_expected,
+        charge_rel_err=0.0, rho_min_rel=0.0, invariants_ok=True,
+        manifold_gap=float("nan"),
+        path=str(getattr(loader, "path", getattr(loader, "_path", "<wfn>"))),
+        nocc=stop, nspin=1, nspinor=2, n_k_used=n_used,
+        n_k_total=int(kpoints.shape[0]), subsampled=bool(n_used < kpoints.shape[0]),
+        fft_grid=tuple(int(v) for v in loader.fft_grid),
+        seconds=time.perf_counter() - t0, seconds_io=t_io,
+        seconds_quad=t_overlap, messages=messages,
+        method="occupied-density-subspace",
+        subspace_residual=max_residual,
+        min_overlap_singular_value=min_singular,
+        evidence_counts=tuple((kind, counts[kind]) for kind in
+                              ("raw-pair", "spatial-pair", "trim")),
+    )
+
+
+def qe_trs_off_reason(loader) -> str | None:
+    """Why QE's data says TRS is broken or unknown, or None when it holds."""
+    binding = (loader.resolve_qe_symmetry()
+               if hasattr(loader, "resolve_qe_symmetry") else None)
+    if binding is None:
+        return ("no authenticated QE data-file-schema.xml; WFN.h5 does not "
+                "say whether the reference is magnetic")
+    if binding.n_antiunitary:
+        return (f"QE types {binding.n_antiunitary} operation(s) t_rev = 1, "
+                "so Theta is not a symmetry")
+    m = binding.scf_absolute_magnetization
+    if m is None:
+        return ("no SCF schema whose charge density matches the bound .save; "
+                "the absolute magnetization is unknown")
+    if not m < TOL_ABS_MAGNETIZATION:
+        return (f"SCF absolute magnetization {m:.3e} muB/cell >= "
+                f"{TOL_ABS_MAGNETIZATION:.0e}")
+    return None
+
+
+def check_spinor_reference_trs(
+    loader,
+    *,
+    tol_trs: float | None = None,
+    tol_spatial: float | None = None,
+    max_k: int | None = None,
+    nocc: int | None = None,
+    want_transverse: bool = True,
+    valence_density_fn=None,
+    spin_degeneracy_fn=None,
+    spin_density_fields_fn=None,
+) -> DensitySymmetryReport:
+    """Check a two-component DFT reference before antiunitary unfolding."""
+    del tol_spatial, want_transverse, valence_density_fn
+    del spin_degeneracy_fn, spin_density_fields_fn
+    tol = TOL_TRS if tol_trs is None else float(tol_trs)
+    cap = MAX_K_DEFAULT if max_k is None else int(max_k)
+    nspin = int(getattr(loader, "nspin", 1) or 1)
+    nspinor = int(getattr(loader, "nspinor", 1) or 1)
+    if (nspin, nspinor) != (1, 2):
+        return _empty_report(
+            loader, basis="not-2c",
+            message=("DFT reference TRS check is intentionally limited to "
+                     "nspin=1, nspinor=2 wavefunctions."),
+            tol_trs=tol, nspin=nspin, nspinor=nspinor, conclusive=True)
+    reason = qe_trs_off_reason(loader)
+    if reason is not None:
+        return _empty_report(
+            loader, basis="qe-magnetic", message=f"TRS off: {reason}.",
+            tol_trs=tol, nspin=nspin, nspinor=nspinor, conclusive=True,
+            trs_holds=False)
+    return _check_two_component_trs(
+        loader, tol_trs=tol, max_k=cap, nocc=nocc)
+
+
+check_density_symmetries = check_spinor_reference_trs
+
+
+_CACHE: dict[tuple, DensitySymmetryReport] = {}
+
+
+# ---------------------------------------------------------------------------
+# Cross-process stamp
+# ---------------------------------------------------------------------------
+
+def _stamp_dir():
+    from lxkit import user_cache_dir
+    return user_cache_dir("wfn_trs")
+
+
+_CODE_KEY: list = []
+
+
+def _code_key() -> str:
+    """SHA-256 (16 hex) of this module's source: a changed measurement misses."""
+    if not _CODE_KEY:
+        try:
+            with open(__file__, "rb") as handle:
+                _CODE_KEY.append(hashlib.sha256(handle.read()).hexdigest()[:16])
+        except OSError:
+            _CODE_KEY.append("unreadable")
+    return _CODE_KEY[0]
+
+
+def _report_digest(report_json: dict) -> str:
+    return hashlib.sha256(json.dumps(report_json, sort_keys=True).encode()).hexdigest()
+
+
+def _report_values_ok(report: DensitySymmetryReport) -> bool:
+    """The fields a hit hands downstream have the types and range a measurement gives."""
+    cov = report.trs_coverage
+    return (isinstance(report.trs_holds, bool) and isinstance(report.conclusive, bool)
+            and isinstance(report.spatial_ops_ok, bool)
+            and isinstance(report.invariants_ok, bool)
+            and isinstance(cov, (int, float)) and 0.0 <= float(cov) <= 1.0)
+
+
+def _content_digest(loader) -> str:
+    """SHA-256 over the named in-memory arrays in ``_STAMP_FIELDS``."""
+    h = hashlib.sha256()
+    for name in _STAMP_FIELDS:
+        value = np.ascontiguousarray(np.asarray(getattr(loader, name)))
+        h.update(f"{name}|{value.dtype.str}|{value.shape}|".encode())
+        h.update(value.tobytes())
+    return h.hexdigest()
+
+
+def _stamp_identity(loader, nocc: int, tol_trs: float,
+                    max_k: int) -> dict | None:
+    """The stamp key, or ``None`` when the file cannot be identified."""
+    try:
+        path = os.path.realpath(str(loader.path))
+        st = os.stat(path)
+        digest = _content_digest(loader)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return {
+        "qe_trs_off": qe_trs_off_reason(loader),
+        "schema": _STAMP_SCHEMA, "algorithm": _ALGORITHM_VERSION,
+        "code": _code_key(),
+        "path": path, "size": int(st.st_size),
+        "mtime_ns": int(st.st_mtime_ns), "inode": int(st.st_ino),
+        "content_sha256": digest, "tol_trs": repr(float(tol_trs)),
+        "max_k": int(max_k), "nocc": int(nocc),
+    }
+
+
+def _identity_digest(identity: dict) -> str:
+    blob = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _stamp_path(identity: dict):
+    return _stamp_dir() / f"trs_{_identity_digest(identity)}.json"
+
+
+def _is_measured(report: DensitySymmetryReport) -> bool:
+    """A completed 2c measurement: not a failed run, not the trivial arm."""
+    return (report.method == "occupied-density-subspace"
+            and report.trs_basis not in {"skipped", "not-2c"}
+            and report.nspinor == 2)
+
+
+def _report_to_json(report: DensitySymmetryReport) -> dict:
+    out = {}
+    for f in dataclasses.fields(report):
+        value = getattr(report, f.name)
+        if isinstance(value, np.ndarray):
+            value = [float(v) for v in value.reshape(-1)]
+        elif isinstance(value, tuple):
+            value = [list(v) if isinstance(v, tuple) else v for v in value]
+        out[f.name] = value
+    return out
+
+
+def _report_from_json(data: dict) -> DensitySymmetryReport:
+    kwargs = {}
+    for f in dataclasses.fields(DensitySymmetryReport):
+        value = data[f.name]
+        if f.name == "spatial_residual":
+            value = np.asarray(value, dtype=np.float64)
+        elif f.name == "evidence_counts":
+            value = tuple((str(k), int(n)) for k, n in value)
+        elif f.name in {"spatial_untested", "spatial_failed", "fft_grid"}:
+            value = tuple(int(v) for v in value)
+        elif f.name == "messages":
+            value = tuple(str(v) for v in value)
+        kwargs[f.name] = value
+    return DensitySymmetryReport(**kwargs)
+
+
+def _read_stamp(identity: dict | None):
+    """``(report, path)`` for a valid stamp with this exact key, else None."""
+    if identity is None:
+        return None
+    path = _stamp_path(identity)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            record = json.load(handle)
+        if record.get("identity") != identity or not record.get("measured"):
+            return None
+        if record.get("report_sha256") != _report_digest(record["report"]):
+            return None
+        report = _report_from_json(record["report"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if not _is_measured(report) or not _report_values_ok(report):
+        return None
+    return report, path
+
+
+def _write_stamp(identity: dict | None,
+                 report: DensitySymmetryReport) -> str | None:
+    """Write the stamp atomically; only a completed measurement is written."""
+    if identity is None or not _is_measured(report):
+        return None
+    from lxkit import atomic_write_bytes
+    path = _stamp_path(identity)
+    try:
+        report_json = _report_to_json(report)
+        text = json.dumps({"identity": identity, "measured": True,
+                           "written_unix": time.time(),
+                           "report": report_json,
+                           "report_sha256": _report_digest(report_json)},
+                          sort_keys=True)
+        atomic_write_bytes(path, text.encode("utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        warnings.warn(f"2c-TRS stamp not written at {path}: {exc!r}",
+                      RuntimeWarning)
+        return None
+    _prune_stamps(path.parent)
+    return str(path)
+
+
+def _prune_stamps(directory) -> None:
+    """Keep the newest ``_STAMP_KEEP // 2`` stamps once past ``_STAMP_KEEP``.
+
+    A pruned stamp only costs one re-measurement.
+    """
+    try:
+        entries = [e for e in os.scandir(directory)
+                   if e.name.startswith("trs_") and e.name.endswith(".json")]
+        if len(entries) <= _STAMP_KEEP:
+            return
+        entries.sort(key=lambda e: e.stat().st_mtime_ns)
+        for entry in entries[:len(entries) - _STAMP_KEEP // 2]:
+            os.unlink(entry.path)
+    except OSError:
+        pass
+
+
+def _all_processes_hit(loader, hit, identity: dict | None) -> bool:
+    """One branch for every process that shares the check's collective.
+
+    The check all-gathers only for a loader whose mesh spans every process
+    (:func:`_evidence_partition`); under that same condition every process
+    all-gathers ``[hit, token]`` here, and the stamp is used only if all hit
+    with the same key and payload.  Otherwise every process measures.
+    """
+    local = hit is not None
+    _, world = _evidence_partition(loader)
+    if world <= 1:
+        return local
+    token = hashlib.sha256(
+        (_identity_digest(identity) if identity is not None else "none")
+        .encode()
+        + (json.dumps(_report_to_json(hit[0]), sort_keys=True).encode()
+           if local else b"miss")).digest()
+    words = [float(int.from_bytes(token[i:i + 3], "little"))
+             for i in range(0, 24, 3)]
+    rows = _gather_process_rows(np.asarray([float(local), *words]), world)
+    return bool(np.all(rows[:, 0] == 1.0)
+                and np.all(rows[:, 1:] == rows[0:1, 1:]))
+
+
+def _cache_key(loader, nocc: int, tol_trs: float, max_k: int) -> tuple:
+    path = os.path.realpath(str(getattr(loader, "path", "")))
+    try:
+        st = os.stat(path)
+        stamp = (int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        stamp = (0, 0)
+    # The collective world is in the key: a rank-0-only open (world 1) must
+    # not answer a later all-rank open whose peers enter the all-gather.
+    return (path, *stamp, _ALGORITHM_VERSION, int(nocc), float(tol_trs),
+            int(max_k), _evidence_partition(loader)[1])
+
+
+def _enforce_policy(
+    report: DensitySymmetryReport,
+    mode: str,
+    *,
+    announce: bool,
+    note: str = "",
+) -> None:
+    if report.trs_basis == "not-2c":
+        return
+    strict_inconclusive = mode == "strict" and not report.conclusive
+    if mode == "strict" and (not report.ok or strict_inconclusive):
+        detail = "\n  ".join(report.messages)
+        state = "INCONCLUSIVE" if not report.conclusive else "FAILED"
+        raise RuntimeError(
+            f"WFN two-component TRS check {state} for {report.path}:\n  "
+            f"{detail}")
+    if not announce:
+        return
+    if _is_reporting_process():
+        print(report.summary() + note, flush=True)
+    if not report.ok:
+        detail = "\n  ".join(report.messages)
+        text = (f"WFN two-component TRS check FAILED for {report.path}:\n  "
+                f"{detail}")
+        print(f"\n*** {text}\n", file=sys.stderr, flush=True)
+        warnings.warn(text, RuntimeWarning)
+
+
+def cached_density_symmetry_check(loader) -> DensitySymmetryReport:
+    """Cached entry point used by ``WfnLoader``: process cache, then stamp."""
+    mode = trs_check_mode()
+    tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
+    max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)
+    nocc = int(loader.physical_density_band_stop)
+    key = _cache_key(loader, nocc, tol, max_k)
+    report = _CACHE.get(key)
+    if report is not None:
+        _enforce_policy(report, mode, announce=False)
+        return report
+
+    two_component = (int(getattr(loader, "nspin", 1) or 1),
+                     int(getattr(loader, "nspinor", 1) or 1)) == (1, 2)
+    t_stamp = time.perf_counter()
+    identity = (_stamp_identity(loader, nocc, tol, max_k)
+                if two_component else None)
+    if two_component:
+        hit = _read_stamp(identity)
+        if _all_processes_hit(loader, hit, identity):
+            # The receipt names this loader's path; the resolved file is
+            # the same one (it is in the key).
+            report = dataclasses.replace(hit[0], path=str(loader.path))
+            _CACHE[key] = report
+            _enforce_policy(
+                report, mode, announce=True,
+                note=(f" [stamp hit in {time.perf_counter() - t_stamp:.2f}s,"
+                      f" not re-measured: {hit[1]}]"))
+            return report
+
+    try:
+        report = check_spinor_reference_trs(
+            loader, tol_trs=tol, max_k=max_k)
+    except Exception as exc:
+        if mode == "strict" or str(exc).startswith("GATE "):
+            raise
+        warnings.warn(
+            "two-component TRS reference check failed to run on "
+            f"{getattr(loader, 'path', '<wfn>')}: {exc!r}. Global time "
+            "reversal is disabled because a failed measurement is not "
+            "evidence that it holds.", RuntimeWarning)
+        report = _empty_report(
+            loader, basis="skipped", message=repr(exc), tol_trs=tol,
+            nspin=int(getattr(loader, "nspin", 0) or 0),
+            nspinor=int(getattr(loader, "nspinor", 0) or 0),
+            conclusive=False, trs_holds=False)
+    _CACHE[key] = report
+    note = ""
+    if two_component and _is_reporting_process():
+        written = _write_stamp(identity, report)
+        if written is not None:
+            note = f" [stamp written {written}]"
+    _enforce_policy(report, mode, announce=True, note=note)
+    return report

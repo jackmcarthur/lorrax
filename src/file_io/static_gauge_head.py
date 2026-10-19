@@ -1,0 +1,386 @@
+"""Immutable SlabIO format of the static Hall artifact (``static_gauge_hall.h5``).
+
+This is the sole format owner for the three-component Hall pseudovector
+``sigma_H`` produced by :func:`gw.qsgw_head.static_gauge_hall_transaction`
+(``get_dipole_mtxels --static-gauge-hall-only``) and consumed, optionally, by
+the packed static photon Gamma-cell completion
+(:func:`gw.w_isdf.compute_static_photon_response` under
+``bispinor_gw = full_static_cohsex``).  The artifact is small (three floats
+plus identity attributes) and replicated; SlabIO is still the only transport
+so that every rank reads the same completed inode collectively.
+
+The loader authenticates the artifact against the consuming run: the WFN
+identity (:func:`common.parallel_transport.wfn_fingerprint`), the band
+manifold ``[0, stop)``, the full-BZ k-count and the velocity-operator stamps
+of the live charge carrier (:func:`gw.qsgw_head.head_hall_operator_stamps`).  A present-but-mismatched
+file refuses; it never degrades to ``sigma_H = 0``.  The absent-file default
+(``sigma_H = 0``) is decided by the consumer, not here.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import jax
+import numpy as np
+from jax.sharding import Mesh
+
+from common.collectives import barrier
+from common.parallel_transport import (
+    fingerprint_from_binding,
+    wfn_fingerprint,
+)
+from file_io.slab_io import SlabIO
+
+
+STATIC_GAUGE_HALL_SCHEMA_VERSION = 2   # v2: velocity-operator stamps
+
+
+def hall_operator_stamps(*, skip_vnl, vnl_mode, vnl_velocity_sign,
+                         kinetic_balance_lift) -> dict:
+    """The velocity-operator stamps a Hall artifact is written and read with.
+
+    The same three names ``dipole.h5`` carries (``prov_skip_vnl``,
+    ``prov_vnl_mode``, ``prov_vnl_velocity_sign``) plus the kinetic-balance
+    lift provenance of the current.  One owner for the producer and the
+    consumer, so neither restates the grammar.
+    """
+    from common.bispinor_init import kinetic_balance_lift_provenance
+    return {"prov_skip_vnl": bool(skip_vnl),
+            "prov_vnl_mode": str(vnl_mode),
+            "prov_vnl_velocity_sign": float(vnl_velocity_sign),
+            "prov_kinetic_balance_lift": kinetic_balance_lift_provenance(
+                kinetic_balance_lift)}
+
+
+def require_hall_operator_stamps(stamps: dict, expected: dict, *,
+                                 source: str) -> None:
+    """Refuse a Hall operator whose stamps differ from the live carrier's.
+
+    ``expected`` is :func:`gw.qsgw_head.head_hall_operator_stamps` (the
+    resolver the charge head's ``dipole.h5`` is authenticated with); every
+    key must be present and equal.  One gate for the artifact loader and the
+    charge-Hall response builder.
+    """
+    stamps = dict(stamps)
+    bad = [(k, stamps.get(k, "<absent>"), v) for k, v in expected.items()
+           if stamps.get(k) != v]
+    if bad or not expected:
+        detail = "; ".join(f"{k}: file={got!r} run={want!r}"
+                           for k, got, want in bad) or "no stamps expected"
+        raise ValueError(
+            "GATE static_gauge_hall_operator: the Hall artifact was built "
+            "with a different velocity operator.\n"
+            f"  got:  {source}; {detail}\n"
+            "  want: the deck's operator (V_NL included, analytic arm, the "
+            "deck's vnl_velocity_sign, the run's kinetic-balance lift); "
+            "regenerate with python -m psp.get_dipole_mtxels -i <deck> "
+            "--static-gauge-hall-only --static-gauge-hall-out <file>\n"
+            "  why:  the charge response reads dipole.h5 under the deck's "
+            "operator; a Hall term from another operator would enter the "
+            "same head with no symptom\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
+
+
+def _require_prefixed_sha256(value: str, *, field_name: str) -> str:
+    value = str(value).strip()
+    if (not value.startswith("sha256:")
+            or len(value) != len("sha256:") + 64
+            or any(c not in "0123456789abcdef" for c in value[7:])):
+        raise ValueError(
+            f"StaticGaugeHall {field_name} must be "
+            "sha256:<64 lowercase hex>")
+    return value
+
+
+def _require_wfn_sha256(value: str) -> str:
+    value = str(value).strip()
+    if (len(value) != 64
+            or any(c not in "0123456789abcdef" for c in value)):
+        raise ValueError(
+            "canonical StaticGaugeHall WFN fingerprint must be 64 "
+            "lowercase hexadecimal characters")
+    return value
+
+
+def _text_i32(value: str, *, encoding: str = "utf-8") -> np.ndarray:
+    return np.frombuffer(str(value).encode(encoding), dtype=np.uint8).astype(
+        np.int32)
+
+
+def _read_required_small(io: SlabIO, name: str, *, dtype=None):
+    try:
+        return io.read_small(name, dtype=dtype)
+    except (KeyError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            "GATE static_gauge_hall_schema: a required artifact field is "
+            "unreadable.\n"
+            f"  got:  StaticGaugeHall field {name!r}: "
+            f"{type(exc).__name__}: {exc}\n"
+            f"  want: a readable {name!r} field in a complete schema-v"
+            f"{STATIC_GAUGE_HALL_SCHEMA_VERSION} artifact\n"
+            "  why:  the Hall value is accepted only with its WFN, band, "
+            "operator, and k-count provenance; a missing field makes that "
+            "authentication impossible\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.") from exc
+
+
+def _decode_i32_text(value, *, field_name: str, encoding: str) -> str:
+    raw = np.asarray(value, dtype=np.int32).reshape(-1)
+    if np.any(raw < 0) or np.any(raw > 255):
+        raise ValueError(
+            "GATE static_gauge_hall_schema: an encoded text field contains "
+            "a non-byte value.\n"
+            f"  got:  {field_name} value range "
+            f"[{int(raw.min())}, {int(raw.max())}]\n"
+            f"  want: every {field_name} value in [0, 255]\n"
+            "  why:  values outside one byte cannot encode the provenance "
+            "text needed to authenticate this artifact\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
+    try:
+        return raw.astype(np.uint8).tobytes().decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            "GATE static_gauge_hall_schema: an encoded provenance field "
+            "cannot be decoded.\n"
+            f"  got:  {field_name} is not valid {encoding}: {exc}\n"
+            f"  want: {field_name} encoded as valid {encoding}\n"
+            "  why:  undecodable provenance cannot authenticate the Hall "
+            "artifact against the consuming calculation\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.") from exc
+
+
+def _immutable_partial_paths(
+    path: str | Path, *, artifact_name: str,
+) -> tuple[Path, Path]:
+    """Validate one create-once destination."""
+    final_path = Path(path)
+    partial_path = Path(str(final_path) + ".partial")
+    if final_path.name.endswith(".partial"):
+        raise ValueError(f"{artifact_name} final path may not end in '.partial'")
+    if not final_path.parent.is_dir():
+        raise FileNotFoundError(
+            f"{artifact_name} parent directory does not exist: "
+            f"{final_path.parent}")
+    if os.path.lexists(final_path):
+        raise FileExistsError(
+            f"immutable {artifact_name} artifact already exists: {final_path}. "
+            "Choose a new output path with --static-gauge-hall-out "
+            "(static_gauge_hall_file for the consuming deck); preserve the "
+            "completed artifact.")
+    if os.path.lexists(partial_path):
+        raise FileExistsError(
+            f"stale/in-flight {artifact_name} partial exists: {partial_path}. "
+            "Verify no writer is live, then move or delete this exact private "
+            f"partial {partial_path} before retrying --static-gauge-hall-out "
+            f"{final_path}; alternatively choose a new output path.")
+    return final_path, partial_path
+
+
+def _publish_completed_partial(
+    partial_path: Path,
+    final_path: Path,
+    *,
+    artifact_name: str,
+    barrier_name: str,
+) -> None:
+    """Collectively hard-link-publish one completed SlabIO inode."""
+    try:
+        os.link(partial_path, final_path)
+    except FileExistsError:
+        if not os.path.samefile(partial_path, final_path):
+            raise FileExistsError(
+                f"immutable {artifact_name} publish collided with a "
+                f"different artifact at {final_path}") from None
+    barrier(barrier_name)
+    try:
+        os.unlink(partial_path)
+    except FileNotFoundError:
+        pass
+
+
+def write_static_gauge_hall_artifact(
+    path: str | Path,
+    hall_transaction,
+    *,
+    mesh_xy: Mesh,
+    operator_stamps: dict,
+) -> None:
+    """Collectively persist the sealed three-number Hall transaction.
+
+    The final path is create-once.  SlabIO writes ``<path>.partial`` and
+    stamps ``complete=1`` only after its writes drain; a hard-link publish
+    then makes that completed inode visible at the final name without ever
+    replacing an existing artifact.
+    """
+    from gw.qsgw_head import StaticGaugeHallTransaction
+
+    if not isinstance(hall_transaction, StaticGaugeHallTransaction):
+        raise TypeError(
+            "StaticGaugeHall artifact requires the sealed canonical Hall "
+            "transaction")
+    stop = int(hall_transaction.band_stop)
+    nk_tot = int(hall_transaction.nk_tot)
+    wfn_sha256 = hall_transaction.wfn_fingerprint
+    operator_sha256 = (
+        hall_transaction.hamiltonian_config_operator_fingerprint)
+    sigma_array = hall_transaction.sigma_H
+    sigma_H = np.asarray(jax.device_get(sigma_array), dtype=np.float64)
+    if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
+        raise ValueError(
+            "StaticGaugeHall sigma_H must be three finite real numbers")
+    final_path, partial_path = _immutable_partial_paths(
+        path, artifact_name="StaticGaugeHall")
+    with SlabIO(str(partial_path), mode="w", mesh=mesh_xy) as io:
+        io.write_attr(
+            "schema_version", np.int32(STATIC_GAUGE_HALL_SCHEMA_VERSION))
+        io.write_attr("complete", np.int32(1))
+        io.write_attr(
+            "wfn_fingerprint_i32",
+            _text_i32(wfn_sha256, encoding="ascii"))
+        io.write_attr(
+            "hamiltonian_config_operator_fingerprint_i32",
+            _text_i32(operator_sha256, encoding="ascii"))
+        io.write_attr("band_stop", np.int32(stop))
+        io.write_attr("nk_tot", np.int32(nk_tot))
+        io.write_attr("sigma_H_cart", sigma_H)
+        io.write_attr("prov_skip_vnl",
+                      np.int32(bool(operator_stamps["prov_skip_vnl"])))
+        io.write_attr("prov_vnl_mode",
+                      _text_i32(operator_stamps["prov_vnl_mode"], encoding="ascii"))
+        io.write_attr("prov_vnl_velocity_sign",
+                      np.float64(operator_stamps["prov_vnl_velocity_sign"]))
+        io.write_attr("prov_kinetic_balance_lift",
+                      _text_i32(operator_stamps["prov_kinetic_balance_lift"]))
+
+    _publish_completed_partial(
+        partial_path, final_path, artifact_name="StaticGaugeHall",
+        barrier_name="static_gauge_hall_artifact_published")
+
+
+def load_static_gauge_hall_artifact(
+    path: str | Path,
+    *,
+    mesh_xy: Mesh,
+    wfn,
+    expected_band_start: int,
+    expected_band_stop: int,
+    expected_nk_tot: int,
+    expected_operator: dict,
+    wfn_fingerprint_binding=None,
+):
+    """Validate and load one immutable Hall transaction artifact.
+
+    Returns the sealed :class:`gw.qsgw_head.StaticGaugeHallTransaction`
+    placed on the run mesh.  Every identity mismatch refuses by name.
+    """
+    from gw.qsgw_head import _static_gauge_hall_transaction_from_artifact
+
+    artifact_path = Path(path)
+    if artifact_path.name.endswith(".partial"):
+        raise ValueError(
+            "GATE static_gauge_hall_partial: static_gauge_hall_file names "
+            "an unpublished partial artifact.\n"
+            f"  got:  static_gauge_hall_file = {artifact_path}\n"
+            "  want: a completed artifact path without the .partial suffix\n"
+            "  why:  .partial is the writer's in-flight inode and has not "
+            "passed the collective completion/publication barrier\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
+    if not artifact_path.exists():
+        raise FileNotFoundError(
+            "GATE static_gauge_hall_file_missing: static_gauge_hall_file "
+            "names no completed artifact.\n"
+            f"  got:  static_gauge_hall_file = {artifact_path} (absent)\n"
+            "  want: the completed artifact produced by "
+            "get_dipole_mtxels --static-gauge-hall-only, or an unnamed key "
+            "for sigma_H = 0\n"
+            "  why:  treating a mistyped or missing named file as the "
+            "unnamed zero-Hall default would silently change the model\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
+
+    expected_wfn = _require_wfn_sha256(
+        wfn_fingerprint(wfn)
+        if wfn_fingerprint_binding is None
+        else fingerprint_from_binding(wfn_fingerprint_binding, wfn))
+    expected_start = int(expected_band_start)
+    expected_stop = int(expected_band_stop)
+    expected_nk = int(expected_nk_tot)
+    if (expected_start != 0 or expected_stop <= expected_start
+            or expected_stop > int(wfn.nbands) or expected_nk <= 0):
+        raise ValueError(
+            "expected StaticGaugeHall manifold must be bands [0,stop) "
+            "within the WFN and nk_tot>0")
+
+    with SlabIO(str(artifact_path), mode="r", mesh=mesh_xy) as io:
+        complete = int(np.asarray(_read_required_small(io, "complete")))
+        schema = int(np.asarray(_read_required_small(io, "schema_version")))
+        artifact_wfn = _decode_i32_text(
+            _read_required_small(io, "wfn_fingerprint_i32"),
+            field_name="wfn_fingerprint_i32", encoding="ascii")
+        operator_fingerprint = _decode_i32_text(
+            _read_required_small(
+                io, "hamiltonian_config_operator_fingerprint_i32"),
+            field_name="hamiltonian_config_operator_fingerprint_i32",
+            encoding="ascii")
+        stop = int(np.asarray(_read_required_small(io, "band_stop")))
+        nk_tot = int(np.asarray(_read_required_small(io, "nk_tot")))
+        sigma_H = np.asarray(
+            _read_required_small(io, "sigma_H_cart"), dtype=np.float64)
+        stamps = {
+            "prov_skip_vnl": bool(int(np.asarray(
+                _read_required_small(io, "prov_skip_vnl")))),
+            "prov_vnl_mode": _decode_i32_text(
+                _read_required_small(io, "prov_vnl_mode"),
+                field_name="prov_vnl_mode", encoding="ascii"),
+            "prov_vnl_velocity_sign": float(np.asarray(
+                _read_required_small(io, "prov_vnl_velocity_sign"))),
+            "prov_kinetic_balance_lift": _decode_i32_text(
+                _read_required_small(io, "prov_kinetic_balance_lift"),
+                field_name="prov_kinetic_balance_lift", encoding="utf-8"),
+        }
+
+    if complete != 1:
+        raise ValueError(
+            f"StaticGaugeHall artifact is incomplete (complete={complete})")
+    if schema != STATIC_GAUGE_HALL_SCHEMA_VERSION:
+        raise ValueError(
+            f"schema_version={schema}, expected "
+            f"{STATIC_GAUGE_HALL_SCHEMA_VERSION}")
+    artifact_wfn = _require_wfn_sha256(artifact_wfn)
+    if artifact_wfn != expected_wfn:
+        raise ValueError("StaticGaugeHall WFN identity differs")
+    if stop != expected_stop:
+        raise ValueError(
+            f"StaticGaugeHall band_stop={stop}, expected {expected_stop}")
+    if nk_tot != expected_nk:
+        raise ValueError(
+            f"StaticGaugeHall nk_tot={nk_tot}, expected {expected_nk}")
+    if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
+        raise ValueError(
+            "StaticGaugeHall sigma_H_cart must contain three finite values")
+    require_hall_operator_stamps(
+        stamps, expected_operator,
+        source=f"static_gauge_hall_file = {str(artifact_path)!r}")
+    operator_fingerprint = _require_prefixed_sha256(
+        operator_fingerprint,
+        field_name="Hall Hamiltonian/config/operator fingerprint")
+
+    return _static_gauge_hall_transaction_from_artifact(
+        sigma_H=sigma_H,
+        hamiltonian_config_operator_fingerprint=operator_fingerprint,
+        wfn_fingerprint=artifact_wfn,
+        band_start=expected_start,
+        band_stop=stop,
+        nk_tot=nk_tot,
+        operator_stamps=stamps,
+        mesh=mesh_xy,
+    )
+
+
+__all__ = [
+    "STATIC_GAUGE_HALL_SCHEMA_VERSION",
+    "hall_operator_stamps",
+    "load_static_gauge_hall_artifact",
+    "require_hall_operator_stamps",
+    "write_static_gauge_hall_artifact",
+]

@@ -1,0 +1,282 @@
+"""Pure formatting helpers for the production centroid coordinate file."""
+
+from __future__ import annotations
+
+import math
+import os
+
+from common.scientific_output import (
+    architecture_lines,
+    numerical_environment_lines,
+)
+from common.timing import total as timing_total
+
+
+def validate_mode_policy(args) -> None:
+    """Refuse current-mode switches that change its physical metric."""
+    if args.density_mode == "current":
+        if args.no_orbit:
+            raise ValueError(
+                "current centroid selection requires atom-derived orbit "
+                "closure; --no-orbit is not a physical current-mode policy")
+        if float(args.rho_power) != 1.0:
+            raise ValueError(
+                "current centroid selection uses the exact feature-row norm; "
+                "--rho-power must remain 1")
+        if float(args.oversample) <= 1.0:
+            raise ValueError(
+                "current centroid selection requires transverse-Gram pruning; "
+                "--oversample must be greater than 1")
+
+
+def prune_band_ranges(args, n_val: int, n_cond: int):
+    """Resolved pair-density windows, shared by pruning and provenance.
+
+    The default ``v_x_vc`` follows the owner's rule (PAIRS audit,
+    2026-09-26): left = every occupied band plus the deck's Σ conduction
+    window ``[0, n_val + ncond)``, right = every band ``[0, n_val + n_cond)``.
+    ``args.sigma_ncond`` carries the deck's ``ncond``; when it is ``None``
+    (no deck given) the Σ window is unknown and the left leg widens to the
+    right one, the ``vc_x_vc`` square, a safe superset.  A window that drops
+    an occupied band refuses by name.
+    """
+    top = int(n_val) + int(n_cond)
+    fit_window = getattr(args, "fit_window", None)
+    if fit_window is not None:
+        if args.prune_window != "v_x_vc":
+            raise ValueError(
+                "--fit-window cannot be combined with a non-default "
+                "--prune-window")
+        try:
+            fields = str(fit_window).split(",")
+            if len(fields) != 2:
+                raise ValueError
+            left = tuple(int(v) for v in fields[0].split(":"))
+            right = tuple(int(v) for v in fields[1].split(":"))
+            if len(left) != 2 or len(right) != 2:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "--fit-window must be L0:L1,R0:R1 using integer, 0-based "
+                "half-open bounds") from exc
+        if any(lo < 0 or hi <= lo or hi > top
+               for lo, hi in (left, right)):
+            raise ValueError(
+                f"--fit-window ranges must be nonempty and lie in [0,{top}); "
+                f"got left={left}, right={right}")
+        from file_io.centroids import assert_windows_keep_occupied
+        assert_windows_keep_occupied(
+            left, right, int(n_val), where="kmeans --fit-window")
+        return left, right, "explicit feature pair"
+    if args.prune_window == "v_x_c":
+        return (0, int(n_val)), (int(n_val), top), "valence x conduction"
+    if args.prune_window == "vc_x_vc":
+        return (0, top), (0, top), "full protected square"
+    sigma_ncond = getattr(args, "sigma_ncond", None)
+    if sigma_ncond is None:
+        return ((0, top), (0, top),
+                "full protected square: no deck, Sigma window unknown")
+    left_top = min(top, int(n_val) + int(sigma_ncond))
+    return ((0, left_top), (0, top),
+            "(occupied + Sigma conduction) x all bands")
+
+
+class CentroidRankNotEstablished(RuntimeWarning):
+    """The point budget stopped the select before the pool was spent."""
+
+
+def rank_law_estimate(*, left, right, nspinor: int, kgrid, ng: int,
+                      ecutwfc: float, ecutrho: float):
+    """``(N_mu, L, B, terms)`` of the charge pair-set rank law, or ``None``.
+
+    N_mu(1 meV RMS Σ_x) ≈ 0.5·min(P, 445 L^0.107 B^0.322, 0.97 N_G(4E_wfc))
+    (docs/theory/isdf-exchange-accuracy.md#rank-law).  L and B are the left
+    and right window widths, per Kramers pair on a spinor WFN; P = N_k·L·B
+    bounds the pair functions; N_G(4E_wfc) scales the WFN's density sphere
+    ``ng`` at ``ecutrho``.  A Si calibration checked on Fe and Ni 20³.
+    """
+    per = 2.0 if int(nspinor) == 2 else 1.0
+    L = (int(left[1]) - int(left[0])) / per
+    B = (int(right[1]) - int(right[0])) / per
+    if not (L > 0 and B > 0 and float(ecutrho) > 0 and int(ng) > 0):
+        return None
+    terms = (math.prod(int(n) for n in kgrid) * L * B,
+             445.0 * L ** 0.107 * B ** 0.322,
+             0.97 * int(ng) * (4.0 * float(ecutwfc) / float(ecutrho)) ** 1.5)
+    return 0.5 * min(terms), L, B, terms
+
+
+def pool_rank_warning(*, pool: int, written: int, unpicked: float | None,
+                      rank_law=None) -> str | None:
+    """The warning for a select the point budget stopped, else ``None``.
+
+    ``unpicked`` is the largest never-picked residual over the floor
+    (``prune_candidates_by_pivoted_cholesky``); above 1 the pool still held
+    directions when the budget ran out, so the pair-space rank is unmeasured.
+    """
+    if unpicked is None or float(unpicked) <= 1.0:
+        return None
+    law = ("" if rank_law is None else
+           f"  The rank law puts N_mu for 1 meV RMS Sigma_x near "
+           f"{rank_law[0]:.0f} (written/estimate = "
+           f"{int(written) / rank_law[0]:.2f}).")
+    return (f"pair-space rank not established: the point budget stopped the "
+            f"pivoted Cholesky at {int(written)} points while unpicked "
+            f"candidates of the {int(pool)}-point pool still carry "
+            f"{float(unpicked):.3g}x its floor, so {int(written)} centroids "
+            f"are not a complete ISDF basis.{law}  Raise the request or the "
+            f"pool (--oversample) until the header reads 'stop: pool spent' "
+            f"to measure the rank.")
+
+
+def format_centroid_header(*, feature_fit: str, source_wfn: str,
+                           weight_label: str, num_electrons: float,
+                           occupied_boundary: int, fft_grid, kgrid, shift,
+                           seed: int, rho_power: float, requested: int,
+                           candidates: int, written: int, pruning: str,
+                           prune_rank: int | None, prune_left, prune_right,
+                           prune_label: str, orbit_aware: bool, n_sym: int,
+                           density_mode: str, pool: int,
+                           unpicked: float | None = None,
+                           rank_law=None) -> str:
+    """Centroid-table provenance, kept pure so the file contract is gated."""
+    rank_note = ""
+    if prune_rank is not None:
+        stop = (f"stop: pool spent, largest unpicked residual "
+                f"{float(unpicked):.3g}x the floor; the pair-space rank is at "
+                f"least {int(prune_rank)} and a larger pool can raise it"
+                if float(unpicked) <= 1.0 else
+                f"stop: point budget, largest unpicked residual "
+                f"{float(unpicked):.3g}x the floor; the pair-space rank "
+                f"exceeds {int(prune_rank)} and is not measured")
+        rank_note = (f"\npool rank={int(prune_rank)} of {int(written)} kept "
+                     f"pivots on a {int(pool)}-point pool; {stop}")
+    if rank_law is not None:
+        n_mu, L, B, terms = rank_law
+        rank_note += (
+            f"\nrank law: N_mu(1 meV RMS Sigma_x) ~ 0.5 min(P, 445 L^0.107 "
+            f"B^0.322, 0.97 N_G(4E_wfc)) = 0.5 min({terms[0]:.4g}, "
+            f"{terms[1]:.0f}, {terms[2]:.0f}) = {n_mu:.0f} at L={L:g}, "
+            f"B={B:g}; written/estimate={int(written) / n_mu:.2f}")
+    channel = ("gamma^0 (charge) ISDF" if density_mode == "scalar" else
+               "gamma^{1,2,3} (current) ISDF")
+    return (
+        "LORRAX ISDF centroid coordinates (fractional crystal units)\n"
+        f"feature fit: {feature_fit}\n"
+        f"source wavefunctions: {os.path.abspath(source_wfn)}\n"
+        f"selection metric: {weight_label}\n"
+        f"electrons: {float(num_electrons):.8g}; "
+        f"occupied-band boundary: {int(occupied_boundary)}\n"
+        f"FFT grid: {tuple(fft_grid)}; k grid: {tuple(kgrid)}; "
+        f"shift: {tuple(shift)}\n"
+        f"selection: weighted k-means; seed={int(seed)}; "
+        f"rho_power={float(rho_power):g}; requested={int(requested)}; "
+        f"candidates={int(candidates)}; written={int(written)}\n"
+        f"pruning: {pruning}; pair-density windows "
+        f"left={tuple(prune_left)}, right={tuple(prune_right)} "
+        f"({prune_label}){rank_note}\n"
+        f"symmetry closure: {'orbit-aware' if orbit_aware else 'literal points'}; "
+        f"spatial operations={int(n_sym)}\n"
+        f"coordinates: x y z snapped to FFT grid; {int(written)} unique points\n"
+        f"intended channels: {channel}"
+    )
+
+
+def format_kmeans_report(*, header: str, source_wfn: str,
+                         centroid_file: str, report_file: str,
+                         wfn_backend: str, elapsed_s: float, runtime,
+                         timing_records,
+                         warnings=()) -> str:
+    """Compact scientific output for one completed centroid selection."""
+    timing_records = tuple(timing_records)
+    phase_rows = (
+        ("Wavefunction setup [setup.wfn_io]",
+         timing_total(timing_records, "setup.wfn_io")),
+        ("Feature metric [setup.weight]",
+         timing_total(timing_records, "setup.weight")),
+        ("Weighted k-means [kmeans]",
+         timing_total(timing_records, "kmeans")),
+        ("Orbit snap/unfold [snap_unfold]",
+         timing_total(timing_records, "snap_unfold")),
+        ("Lloyd-state release [release_before_prune]",
+         timing_total(timing_records, "release_before_prune")),
+        ("Gram and selection [prune]",
+         timing_total(timing_records, "prune")),
+    )
+    recorded_s = sum(seconds for _, seconds in phase_rows)
+    unattributed_s = float(elapsed_s) - recorded_s
+
+    def path_seconds(*path: str) -> float:
+        return sum(float(record["inclusive"]) for record in timing_records
+                   if tuple(record.get("path", ())) == path)
+
+    detail_rows = {
+        "Weighted k-means [kmeans]": (
+            ("  Initialization [kmeans/init]",
+             path_seconds("kmeans", "init")),
+            ("  Lloyd iterations [kmeans/lloyd]",
+             path_seconds("kmeans", "lloyd")),
+            ("  Final assignment [kmeans/assign_labels]",
+             path_seconds("kmeans", "assign_labels")),
+        ),
+        "Gram and selection [prune]": (
+            ("  Gram build [prune/prune.gram]",
+             path_seconds("prune", "prune.gram")),
+            ("  Block selection [prune/prune.select]",
+             path_seconds("prune", "prune.select")),
+        ),
+    }
+    timing_lines = []
+    for label, seconds in phase_rows:
+        timing_lines.append(f"{label:<40}: {seconds:.3f} s")
+        timing_lines.extend(
+            f"{detail_label:<40}: {detail_seconds:.3f} s"
+            for detail_label, detail_seconds in detail_rows.get(label, ()))
+    lines = [
+        "=" * 78,
+        "LORRAX ISDF CENTROID SELECTION",
+        "=" * 78,
+        "",
+        "PROCESSOR ARCHITECTURE",
+        "----------------------",
+        *architecture_lines(runtime, mesh_role="centroid selection"),
+        "",
+        "NUMERICAL ENVIRONMENT",
+        "---------------------",
+        *numerical_environment_lines(runtime),
+        f"Wavefunctions  : {wfn_backend} reader",
+        "Selection      : feature-weighted k-means on the real-space FFT grid",
+        "",
+        "CENTROID PROVENANCE",
+        "-------------------",
+        *header.splitlines(),
+        "",
+        "FILES",
+        "-----",
+        f"Source WFN     : {os.path.abspath(source_wfn)}",
+        f"Centroids      : {os.path.abspath(centroid_file)}",
+        f"Report         : {os.path.abspath(report_file)}",
+        "",
+        "TIMING (POST-STARTUP)",
+        "---------------------",
+        *timing_lines,
+        f"{'Other selection work':<40}: {unattributed_s:.3f} s",
+        f"Selection wall : {float(elapsed_s):.3f} s",
+    ]
+    retained = [" ".join(str(item).split()) for item in warnings if str(item).strip()]
+    if retained:
+        lines.extend(["", "WARNINGS", "--------"])
+        lines.extend(f"  {item}" for item in retained)
+    lines.append("LORRAX ISDF centroid selection completed.")
+    return "\n".join(lines) + "\n"
+
+
+__all__ = [
+    "CentroidRankNotEstablished",
+    "format_centroid_header",
+    "format_kmeans_report",
+    "pool_rank_warning",
+    "prune_band_ranges",
+    "rank_law_estimate",
+    "validate_mode_policy",
+]

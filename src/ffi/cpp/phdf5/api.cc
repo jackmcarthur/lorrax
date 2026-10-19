@@ -1,0 +1,241 @@
+// api.cc — extern "C" lifecycle entry points for the parallel-HDF5 FFI.
+//
+// These thin ctypes wrappers (no pybind/nanobind) drive the collective
+// open/create, dataset open, and close paths implemented in context.cc.
+// They are deliberately CUDA-FREE so this ONE translation unit compiles
+// into BOTH platform libraries:
+//   * liblorrax_ffi.so       (CUDA)  — alongside the cusolverMp/cuBLASMp
+//                                       extern-C wrappers in cpp/cusolvermp/c_api.cc
+//   * liblorrax_ffi_host.so   (cpu)   — the CUDA-free host lib
+// so multi-process CPU can open a collective context and drive the host
+// read handlers through the same lifecycle the GPU path uses.  The
+// collective MPI-IO core (context.cc) and the device-staging switch
+// (read_ffi.cc) are the only phdf5 TUs that differ by platform, and they
+// differ only by the LORRAX_FFI_NO_CUDA compile flag — this file is
+// identical on both.
+//
+// All functions set *err_out (size err_cap) to a message on failure and
+// return nonzero; return zero on success — so Python sees C++ exceptions as
+// structured error strings without crossing the exception ABI boundary.
+
+#include <cstdint>
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+
+#include <hdf5.h>
+
+#include "../common/c_abi.h"
+#include "ctx.h"
+
+namespace lorrax_ffi::phdf5 {
+    // Implemented in cpp/phdf5/context.cc
+    PhdfCtx* open_ctx(const std::string& path, int p, int q,
+                      int rank, int world_size, int mode_flag);
+    void     close_ctx(PhdfCtx* ctx, int64_t* timing_out = nullptr);
+    hid_t    ensure_dataset(PhdfCtx* ctx, const std::string& ds_name,
+                            const int64_t* shape, int ndim, int dtype_tag);
+    hid_t    open_dataset_ro(PhdfCtx* ctx, const std::string& ds_name);
+    void     dataset_geometry(PhdfCtx* ctx, const std::string& ds_name,
+                              int64_t* shape_out, int cap_ndim,
+                              int* ndim_out, int* dtype_tag_out);
+    void     read_whole(PhdfCtx* ctx, const std::string& ds_name,
+                        int dtype_tag, void* out, int64_t out_nelem);
+    void     ensure_mpi_initialized();
+    bool     staging_totals(const PhdfCtx* ctx, size_t* n_live,
+                            size_t* pinned_bytes);
+}
+
+extern "C" {
+
+// Open (or create) a parallel-HDF5 file collectively.
+// mode_flag: 0 = 'w' truncate, 1 = 'a' append-or-create, 2 = 'r' read-only
+// Returns 0 on success; sets err_out and returns 1 on failure.
+int LRX_C_ENTRY(lrx_phdf5_open)(
+    const char* path,
+    int p, int q, int rank, int world_size,
+    int mode_flag,
+    int64_t* ctx_out,
+    char* err_out, int err_cap)
+{
+    try {
+        auto* ctx = lorrax_ffi::phdf5::open_ctx(
+            std::string(path), p, q, rank, world_size, mode_flag);
+        *ctx_out = reinterpret_cast<int64_t>(ctx);
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) {
+            snprintf(err_out, err_cap, "%s", e.what());
+        }
+        return 1;
+    }
+}
+
+void LRX_C_ENTRY(lrx_phdf5_close)(int64_t ctx_handle) {
+    lorrax_ffi::phdf5::close_ctx(
+        reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle));
+}
+
+// The normal close already joins the native writer/union-read worker.
+// Copy counters at that point, before the context is deleted; no extra
+// collective, synchronization, or second traversal of the task queue.
+void LRX_C_ENTRY(lrx_phdf5_close_timed)(int64_t ctx_handle,
+                                       int64_t* timing_out) {
+    lorrax_ffi::phdf5::close_ctx(
+        reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle), timing_out);
+}
+
+// Eager MPI init.  Safe to call multiple times.  Use at program
+// startup to move the ~400 ms MPI_Init_thread(THREAD_MULTIPLE) cost
+// off the first-open critical path.
+void LRX_C_ENTRY(lrx_phdf5_init_mpi)(void) {
+    lorrax_ffi::phdf5::ensure_mpi_initialized();
+}
+
+// Per-process pinned/read staging totals over every live ctx.  Collective-
+// free and side-effect-free: the handle is not dereferenced, so a caller
+// with no open file passes 0.  Returns 0 always; a library built before
+// 2026-09-20 lacks the symbol and ffi_loader falls back to procfs-only
+// receipt fields (hasattr-guarded, like the metadata half above).
+int LRX_C_ENTRY(lrx_phdf5_staging_totals)(
+    int64_t ctx_handle, int64_t* n_live_out, int64_t* pinned_bytes_out)
+{
+    size_t n_live = 0, pinned = 0;
+    lorrax_ffi::phdf5::staging_totals(
+        reinterpret_cast<const lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+        &n_live, &pinned);
+    if (n_live_out) *n_live_out = static_cast<int64_t>(n_live);
+    if (pinned_bytes_out) *pinned_bytes_out = static_cast<int64_t>(pinned);
+    return 0;
+}
+
+// Posted control (ctx.h POSTED CONTROL, handler ABI 7).  Process-local, not
+// collective: each rank posts the values of its own next call, keyed by the
+// address of that call's own data buffer on this rank.
+// Returns 0 when posted, 1 when an entry for (addr, kind) is already pending.
+int LRX_C_ENTRY(lrx_phdf5_post_control)(
+    uint64_t addr, int64_t kind, const int64_t* values, int64_t n)
+{
+    return lorrax_ffi::phdf5::post_control(addr, kind, values, n);
+}
+
+// Withdraw a post whose call never dispatched.  0 = removed, 1 = none pending.
+int LRX_C_ENTRY(lrx_phdf5_retract_control)(uint64_t addr, int64_t kind)
+{
+    return lorrax_ffi::phdf5::retract_control(addr, kind) ? 0 : 1;
+}
+
+// Entries posted and not yet taken by a handler (diagnostic; 0 when idle).
+int64_t LRX_C_ENTRY(lrx_phdf5_pending_controls)(void)
+{
+    return static_cast<int64_t>(lorrax_ffi::phdf5::pending_controls());
+}
+
+// Collective H5Dcreate/H5Dopen.  All ranks must call concurrently.
+// shape[ndim] is the N-D dataset shape; ndim >= 1.  dtype_tag: 1=F32
+// 2=F64 3=S32 4=S64 5=C64 6=C128 (matches xla::ffi::DataType).
+// Returns 0 on success and writes the hid_t to *ds_id_out; sets err_out
+// and returns 1 on failure.
+int LRX_C_ENTRY(lrx_phdf5_ensure_dataset)(
+    int64_t ctx_handle,
+    const char* ds_name,
+    const int64_t* shape, int ndim,
+    int dtype_tag,
+    int64_t* ds_id_out,
+    char* err_out, int err_cap)
+{
+    try {
+        hid_t ds = lorrax_ffi::phdf5::ensure_dataset(
+            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+            std::string(ds_name), shape, ndim, dtype_tag);
+        *ds_id_out = (int64_t)ds;
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
+        return 1;
+    }
+}
+
+// Collective H5Dopen (read-only semantics; no create).  All ranks must
+// call concurrently.  Returns 0 on success and writes the hid_t to
+// *ds_id_out; sets err_out and returns 1 on failure.
+int LRX_C_ENTRY(lrx_phdf5_open_dataset_ro)(
+    int64_t ctx_handle,
+    const char* ds_name,
+    int64_t* ds_id_out,
+    char* err_out, int err_cap)
+{
+    try {
+        hid_t ds = lorrax_ffi::phdf5::open_dataset_ro(
+            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+            std::string(ds_name));
+        *ds_id_out = (int64_t)ds;
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
+        return 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  The METADATA half of the transport — added 2026-08-22 so that no LORRAX
+//  path has to reach for a SECOND HDF5 library to learn a dataset's shape
+//  or to read a scalar back out of a phdf5-written file.
+//
+//  Both are "collective in the same sense as lrx_phdf5_open_dataset_ro":
+//  every rank calls them with the same name, they route through that same
+//  cached collective H5Dopen, and everything after it is a local metadata
+//  query or an INDEPENDENT read of data every rank wants entire.
+//
+//  A library built before this date does not export them.  The Python
+//  loader declares them under a hasattr guard and
+//  ``file_io._slab_io_ffi`` announces the degraded route rather than
+//  crashing — the ratchet belongs on the artifact, not on every worktree
+//  pinned to an older .so.
+// ---------------------------------------------------------------------------
+
+// Shape/dtype of an existing dataset.  ``shape_out`` receives ``*ndim_out``
+// extents (a SCALAR dataset reports ndim 0 and writes none).  dtype_tag
+// follows the same 1..6 table lrx_phdf5_ensure_dataset takes.
+int LRX_C_ENTRY(lrx_phdf5_dataset_geometry)(
+    int64_t ctx_handle,
+    const char* ds_name,
+    int64_t* shape_out, int cap_ndim,
+    int* ndim_out, int* dtype_tag_out,
+    char* err_out, int err_cap)
+{
+    try {
+        lorrax_ffi::phdf5::dataset_geometry(
+            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+            std::string(ds_name), shape_out, cap_ndim,
+            ndim_out, dtype_tag_out);
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
+        return 1;
+    }
+}
+
+// Read a WHOLE small dataset into a host buffer on every rank.  Serves
+// rank-0 (scalar) datasets, which the sharded read handler cannot: a
+// scalar dataspace has no hyperslab to select.  ``out_nelem`` is checked
+// against the dataset's own element count.
+int LRX_C_ENTRY(lrx_phdf5_read_whole)(
+    int64_t ctx_handle,
+    const char* ds_name,
+    int dtype_tag,
+    void* out, int64_t out_nelem,
+    char* err_out, int err_cap)
+{
+    try {
+        lorrax_ffi::phdf5::read_whole(
+            reinterpret_cast<lorrax_ffi::phdf5::PhdfCtx*>(ctx_handle),
+            std::string(ds_name), dtype_tag, out, out_nelem);
+        return 0;
+    } catch (const std::exception& e) {
+        if (err_out && err_cap > 0) snprintf(err_out, err_cap, "%s", e.what());
+        return 1;
+    }
+}
+
+}  // extern "C"

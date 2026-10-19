@@ -1,0 +1,412 @@
+"""Dirac gamma matrices represented as JAX arrays.
+
+The matrices are provided in the standard Dirac representation
+and stored as ``jax.numpy`` arrays.
+
+CONVENTION.  The stored Lorentz vertices are ``gamma_tilde^mu = gamma^0 gamma^mu``,
+so ``gamma0`` is the 4x4 identity and ``gamma_i`` is the Dirac ``alpha^i``.
+Every channel density is written with ``psi^dagger`` (never ``psi-bar``):
+``rho^mu = psi^dagger gamma_tilde^mu psi`` -- charge for ``mu = 0``, the
+current ``psi^dagger alpha^i psi`` for ``mu = i``.  Physics owner:
+``docs/theory/four-current-head-corrections.md`` and
+``docs/theory/bispinor-gw.md`` section 1.
+
+WHY THE LITERALS ARE BUILT THROUGH NUMPY.  Every constant below is a fixed
+4x4 (or 2x2) table, and this module is on the import path of every driver
+that touches ``isdf.core`` — ``bandstructure.htransform`` and the GW chain
+among them.  Spelling a constant ``jnp.array([[...]], dtype=complex128)``
+sends the Python list through jax's dtype-conversion path, which dispatches
+an eager XLA program per literal; spelling it ``jnp.asarray(np.array(...,
+dtype=np.complex128))`` is a plain host-to-device transfer of an array that
+already has the right dtype.  The two produce the same ``jax.Array`` with the
+same dtype and the same values.  MEASURED on an A100 with a warm backend
+(import/bring-up audit, 2026-08-09): eight literals cost **0.2295 s** the
+first way and **0.0059 s** the second, and the two ``jnp.stack`` calls at the
+bottom of the module cost **0.38 s** — one of them compiling an XLA program
+at import time (``xla_compiles=1``) — against **0.0001 s** for
+``jnp.asarray(np.stack(...))``.  The whole module body went from 0.437 s to
+0.006 s, on a warm htransform bring-up of ~12 s.
+
+So: build with numpy, hand to jax once.  Do not "simplify" these back into
+``jnp.array([[...]])`` — the shorter spelling costs a third of a second on
+every driver that imports this file.
+"""
+
+import jax
+import jax.numpy as jnp
+import numpy as _np
+
+def _t128(rows):
+    """The HOST table.  Every constant in this module starts life here."""
+    return _np.array(rows, dtype=_np.complex128)
+
+
+# THE HOST TABLES ARE THE SOURCE OF TRUTH, and everything derived below is
+# derived from THEM rather than from the device copies.  That is not a style
+# choice: ``_to_perm_phase`` reads its argument on the host, so deriving it
+# from ``gamma0`` (a ``jax.Array``) puts a device-to-host conversion in the
+# module body, and a module body containing one cannot be evaluated inside a
+# jit trace — ``np.asarray`` of a tracer raises TracerArrayConversionError.
+# The module was in that state before the 2026-08-09 audit too (the
+# ``jnp.nonzero`` that ``gw.isdf_fitting`` worked around was the second such
+# line, not the only one).  Reading the tables makes the body trace-clean by
+# construction, which ``tests/test_import_time_gate.py`` executes rather than
+# asserts.
+_T_SIGMA_X = _t128([[0, 1], [1, 0]])
+_T_SIGMA_Y = _t128([[0, -1j], [1j, 0]])
+_T_SIGMA_Z = _t128([[1, 0], [0, -1]])
+
+# Standard Dirac gamma matrices (4x4)
+# JM: actually I replace gamma0-3 with gamma0*gamma0-3, so that I can use psidag = conj(psi) rather than psibar = conj(psi) gamma0
+_T_GAMMA0 = _t128([[1, 0, 0, 0],
+                   [0, 1, 0, 0],
+                   [0, 0, 1, 0],
+                   [0, 0, 0, 1]])
+
+_T_GAMMA1 = _t128([[0, 0, 0, 1],
+                   [0, 0, 1, 0],
+                   [0, 1, 0, 0],
+                   [1, 0, 0, 0]])
+
+_T_GAMMA2 = _t128([[0, 0, 0, -1j],
+                   [0, 0, 1j, 0],
+                   [0, -1j, 0, 0],
+                   [1j, 0, 0, 0]])
+
+_T_GAMMA3 = _t128([[0, 0, 1, 0],
+                   [0, 0, 0, -1],
+                   [1, 0, 0, 0],
+                   [0, -1, 0, 0]])
+
+# gamma^5 = i gamma^0 gamma^1 gamma^2 gamma^3
+_T_GAMMA5 = _t128([[0, 0, 1, 0],
+                   [0, 0, 0, 1],
+                   [1, 0, 0, 0],
+                   [0, 1, 0, 0]])
+
+# Pauli matrices
+sigma_x = jnp.asarray(_T_SIGMA_X)
+sigma_y = jnp.asarray(_T_SIGMA_Y)
+sigma_z = jnp.asarray(_T_SIGMA_Z)
+paulis = jnp.asarray(_np.stack((_T_SIGMA_X, _T_SIGMA_Y, _T_SIGMA_Z)))
+
+gamma0 = jnp.asarray(_T_GAMMA0)
+gamma1 = jnp.asarray(_T_GAMMA1)
+gamma2 = jnp.asarray(_T_GAMMA2)
+gamma3 = jnp.asarray(_T_GAMMA3)
+gamma5 = jnp.asarray(_T_GAMMA5)
+
+
+def _to_perm_phase(mat):
+    """Decompose a 4×4 monomial matrix into (perm, phase) so that
+    ``mat[α, β] = phase[α] · δ_{β, perm[α]}``.
+
+    Every γ̃^μ ∈ {γ̃^0, γ̃^1, γ̃^2, γ̃^3} is monomial (one non-zero per
+    row and per column, value ∈ {±1, ±i}), so ``Σ_α γ̃_{αα'} · X[α]``
+    reduces to ``X[perm⁻¹[α']] · phase[perm⁻¹[α']]`` — a permuted
+    gather + element-wise phase multiply.  Eliminates 4×4 matmul at
+    every spin contraction site.
+
+    Returns HOST (numpy) arrays.  The device copies are made once, below, by
+    a single ``jnp.asarray`` on the stacked result — see the module docstring.
+    """
+    m = _np.asarray(mat)
+    n = m.shape[0]
+    perm = _np.zeros(n, dtype=_np.int32)
+    phase = _np.zeros(n, dtype=_np.complex128)
+    for a in range(n):
+        cols = _np.flatnonzero(_np.abs(m[a]) > 0)
+        assert cols.size == 1, (
+            f"_to_perm_phase requires a monomial matrix; row {a} has "
+            f"{cols.size} non-zeros."
+        )
+        c = int(cols[0])
+        perm[a] = c
+        phase[a] = m[a, c]
+    return perm, phase
+
+
+gammas = [gamma0, gamma1, gamma2, gamma3]
+_gamma_tables = [_T_GAMMA0, _T_GAMMA1, _T_GAMMA2, _T_GAMMA3]
+
+# Per-row permutation + phase decomposition of each γ̃^μ.  Used by the
+# bispinor ζ-fit and Σ^B kernels to replace 4×4 matmuls on the spinor
+# axis with a gather + per-element phase mul.  ``gammas_perm[μ][α] =
+# perm[α]`` and ``gammas_phase[μ][α] = phase[α]`` such that
+# ``γ̃^μ_{αβ} = phase[α] · δ_{β, perm[α]}``.
+#
+# Stacked on the HOST and transferred once.  ``jnp.stack`` on a list of four
+# device arrays is a traced concatenate: it compiled an XLA program at import
+# time and cost 0.38 s (measured, 2026-08-09).  ``np.stack`` then one
+# ``jnp.asarray`` gives the identical array for 0.0001 s.
+_perm_phase = [_to_perm_phase(t) for t in _gamma_tables]
+gammas_perm = jnp.asarray(_np.stack([pp[0] for pp in _perm_phase]))    # (4, 4) int32
+gammas_phase = jnp.asarray(_np.stack([pp[1] for pp in _perm_phase]))   # (4, 4) c128
+
+
+def gamma_perm_phase(mu_lorentz: int) -> tuple[jax.Array, jax.Array]:
+    """Return ``(perm, phase)`` for γ̃^{μ_L}.
+
+    γ̃^{μ_L}_{αβ} = phase[α] · δ_{β, perm[α]} (every γ̃ ∈ {γ̃^0..3} is
+    monomial, value ∈ {±1, ±i}).  Use with :func:`gamma_apply` to fold
+    a γ̃-on-spin-axis contraction into a gather + element-wise phase
+    multiply.
+    """
+    mu = int(mu_lorentz)
+    return gammas_perm[mu], gammas_phase[mu]
+
+
+def gamma_perm_phase_host(mu_lorentz: int) -> tuple[_np.ndarray, _np.ndarray]:
+    """:func:`gamma_perm_phase` as the HOST tables, for a consumer that bakes
+    the vertex into a kernel as static attributes (the four-current Σ kconv call)."""
+    perm, phase = _perm_phase[int(mu_lorentz)]
+    return perm.copy(), phase.copy()
+
+
+def current_fit_terms(channel: int, basis_rows) -> tuple:
+    """Channel ``c``'s Gram and Z as Σ w·U(γ̃^i at μ, γ̃^j at r): ``((w, i, j), ...)``.
+
+    ``basis_rows`` is None (Cartesian: channel c fits ψ†α^cψ) or the unitary
+    ``B`` of ``symmetry_maps.select_current_basis`` (channel c fits
+    Σ_i B_ci ψ†α^iψ).  The fit kernels put the vertex Γ = Σ_i B_ci α^i
+    bilinearly on both sides, which equals s × the least-squares
+    (sesquilinear) Gram and Z when the elementwise conjugate is Γ̄ = sΓ:
+    s = +1 for real-entry α^1, α^3, α^± = (α^1 ± iα^2)/√2, s = −1 for
+    Cartesian α^2.  The scalar cancels in ζ = C⁻¹Z.  A row whose nonzero
+    phases differ mod π has no such s and would fit obliquely, so it refuses.
+    """
+    c = int(channel)
+    if c == 0:
+        return ((1.0, 0, 0),)
+    if basis_rows is None:
+        return ((1.0, c, c),)
+    u = _np.asarray(basis_rows, dtype=_np.complex128)[c - 1]
+    vertex = sum(u[i] * _gamma_tables[i + 1] for i in range(3))
+    z = vertex[_np.abs(vertex) > 1e-12] ** 2
+    if not _np.allclose(z / _np.abs(z), z[0] / abs(z[0]), atol=1e-10):
+        raise ValueError(f"GATE current_vertex_phase: channel {c} vertex Σ_i B_ci α^i has nonzero "
+                         f"entries of more than one phase mod π (row {u}); its fit would be oblique")
+    return tuple((complex(u[i] * u[j]), i + 1, j + 1)
+                 for i in range(3) for j in range(3) if abs(u[i] * u[j]) > 0)
+
+
+def gamma_apply(X: jax.Array, perm: jax.Array, phase: jax.Array,
+                axis: int, is_identity: bool = False) -> jax.Array:
+    """Apply a monomial γ̃ matrix on ``axis`` of X via gather + phase mul.
+
+    Computes ``Y[..., β, ...] = Σ_α γ̃_{βα} · X[..., α, ...]`` where
+    ``γ̃_{βα} = phase[β] · δ_{α, perm[β]}``, i.e.
+
+        Y[..., β, ...] = phase[β] · X[..., perm[β], ...]
+
+    Replaces a 4×4 matmul on the spin axis with a single
+    ``jnp.take`` + broadcasted element-wise multiply.  Generic over
+    rank: the spin axis can sit anywhere, all other axes are
+    untouched.
+
+    For γ̃^0 = I_4 (perm = identity, phase = 1), pass ``is_identity=True``
+    (Python bool — branch resolves at JIT trace time) to skip the
+    gather + multiply entirely and return ``X`` byte-identical.
+    """
+    if is_identity:
+        return X
+    X_p = jnp.take(X, perm, axis=axis)
+    bcast = [1] * X_p.ndim
+    bcast[axis] = phase.shape[0]
+    return X_p * phase.reshape(bcast)
+
+
+def _gamma_matrix_from_perm_phase(perm: jax.Array | None,
+                                  phase: jax.Array | None,
+                                  ns: int,
+                                  dtype) -> jax.Array:
+    """Materialise the (ns, ns) γ̃ matrix from (perm, phase).
+
+    γ̃[α, β] = phase[α] · δ_{β, perm[α]}.  None on perm or phase ⇒ I_ns.
+    """
+    if perm is None and phase is None:
+        return jnp.eye(ns, dtype=dtype)
+    if perm is None:
+        perm = jnp.arange(ns, dtype=jnp.int32)
+    if phase is None:
+        phase = jnp.ones(ns, dtype=dtype)
+    eye = jnp.eye(ns, dtype=dtype)
+    return phase[:, None] * eye[perm]
+
+
+def _gamma_double_contract_take(P_l_conj, P_r, perm_L, phase_L,
+                                perm_R, phase_R, spin_axes):
+    """Original ``take + multiply`` implementation.  Two ``gamma_apply``
+    calls each materialise a fresh rank-5 buffer (the ``jnp.take`` with
+    a runtime perm can't reuse its input).  Verified to drive 5
+    concurrent rank-5 slots in XLA's BufferAssignment on MoS2 3×3.
+    See ``gw/gflat_memory_model.py`` for the slot accounting."""
+    a_axis, b_axis = spin_axes
+    P_r_p = P_r
+    if perm_L is not None:
+        P_r_p = gamma_apply(P_r_p, perm_L, phase_L, axis=a_axis)
+    if perm_R is not None:
+        P_r_p = gamma_apply(P_r_p, perm_R, phase_R, axis=b_axis)
+    return jnp.sum(P_l_conj * P_r_p, axis=spin_axes)
+
+
+def _gamma_double_contract_einsum(P_l_conj, P_r, perm_L, phase_L,
+                                  perm_R, phase_R, spin_axes):
+    """Single 4-tensor ``jnp.einsum`` that folds γ̃·γ̃·conj(P_l)·P_r
+    into one op.  Reduces the spin axes inline so XLA's einsum planner
+    sees the whole DAG; the (γ̃_L, γ̃_R) → 4-D `(a,A,b,B)` contraction
+    can be planned first (small intermediate) before the rank-5
+    multiply, vs the take-based path which always materialises
+    fresh rank-5 intermediates."""
+    a_axis, b_axis = spin_axes
+    if a_axis != 1 or b_axis != 2:
+        # Falls outside our standard rank-5 (k, a, b, μ, ν) layout.
+        # Keep the take path; rewriting the einsum spec dynamically
+        # for arbitrary spin_axes positions isn't worth it for the
+        # one rare path that uses spin_axes ≠ (1, 2).
+        return _gamma_double_contract_take(
+            P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
+    ns = P_r.shape[a_axis]
+    γL = _gamma_matrix_from_perm_phase(perm_L, phase_L, ns, P_r.dtype)
+    γR = _gamma_matrix_from_perm_phase(perm_R, phase_R, ns, P_r.dtype)
+    # Layout: P_l_conj has (k, a, b, μ, ν); P_r has (k, A, B, μ, ν).
+    # γ̃_L[a, A] couples P_l's a with P_r's A; γ̃_R[b, B] same for (b, B).
+    # Output: (k, μ, ν).
+    return jnp.einsum(
+        'kabmr,aA,bB,kABmr->kmr',
+        P_l_conj, γL, γR, P_r,
+        optimize='optimal',
+    )
+
+
+def _gamma_double_contract_scan(P_l_conj, P_r, perm_L, phase_L,
+                                perm_R, phase_R, spin_axes):
+    """``lax.scan`` over the ns² spin pairs.  Each iter slices rank-3
+    views out of the rank-5 buffers (no fresh rank-5 alloc) and
+    accumulates a rank-3 multiply-add.  The two source rank-5 tensors
+    (``P_l_conj``, ``P_r``) stay live throughout but no rank-5
+    intermediate ever materialises — expected 2 concurrent rank-5 slots
+    in XLA's BufferAssignment vs the take path's 5."""
+    a_axis, b_axis = spin_axes
+    if a_axis != 1 or b_axis != 2:
+        return _gamma_double_contract_take(
+            P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
+    ns = P_r.shape[a_axis]
+    dtype = P_l_conj.dtype
+    # Defaults for the identity (charge) channel — perm = identity,
+    # phase = 1.  All runtime-array so the scan body can index them.
+    perm_L_safe = (perm_L if perm_L is not None
+                   else jnp.arange(ns, dtype=jnp.int32))
+    perm_R_safe = (perm_R if perm_R is not None
+                   else jnp.arange(ns, dtype=jnp.int32))
+    phase_L_safe = (phase_L if phase_L is not None
+                    else jnp.ones(ns, dtype=dtype))
+    phase_R_safe = (phase_R if phase_R is not None
+                    else jnp.ones(ns, dtype=dtype))
+    # Output shape = P_l_conj.shape minus the two spin axes.
+    out_shape = P_l_conj.shape[:1] + P_l_conj.shape[3:]
+    init = jnp.zeros(out_shape, dtype=dtype)
+
+    def body(acc, ab):
+        a = ab // ns
+        b = ab %  ns
+        A = perm_L_safe[a]
+        B = perm_R_safe[b]
+        coef = phase_L_safe[a] * phase_R_safe[b]
+        # Rank-3 slices via dynamic_index_in_dim (no fresh rank-5 alloc;
+        # XLA emits a gather of size (k, μ, ν) directly).
+        Pl_3 = jax.lax.dynamic_index_in_dim(
+            P_l_conj, a, axis=1, keepdims=False)
+        Pl_3 = jax.lax.dynamic_index_in_dim(
+            Pl_3, b, axis=1, keepdims=False)
+        Pr_3 = jax.lax.dynamic_index_in_dim(
+            P_r, A, axis=1, keepdims=False)
+        Pr_3 = jax.lax.dynamic_index_in_dim(
+            Pr_3, B, axis=1, keepdims=False)
+        return acc + coef * Pl_3 * Pr_3, None
+
+    out, _ = jax.lax.scan(body, init, jnp.arange(ns * ns, dtype=jnp.int32), unroll=1)
+    return out
+
+
+def gamma_double_contract(
+    P_l_conj: jax.Array, P_r: jax.Array,
+    perm_L: jax.Array | None = None,
+    phase_L: jax.Array | None = None,
+    perm_R: jax.Array | None = None,
+    phase_R: jax.Array | None = None,
+    spin_axes: tuple[int, int] = (1, 2),
+) -> jax.Array:
+    """γ̃·γ̃ double contraction over two spin axes → drop spin rank by 2.
+
+        Σ_{αβα'β'} γ̃_L_{αα'} γ̃_R_{ββ'} P_l_conj[..., α, β, ...] P_r[..., α', β', ...]
+          = Σ_{αβ} phase_L[α]·phase_R[β]
+                · P_l_conj[..., α, β, ...]
+                · P_r[..., perm_L[α], perm_R[β], ...]
+
+    γ̃ identity shortcut: pass ``perm_L=None`` (and/or ``perm_R=None``)
+    to mean γ̃_L = I_4 (and/or γ̃_R = I_4); both None ⇒ pure
+    Σ_{αβ} P_l_conj · P_r Frobenius reduction (charge channel).
+
+    Three implementation strategies, selected via cohsex.in
+    ``gamma_contract_mode`` (set once at config-build time by
+    ``set_gamma_contract_mode``):
+
+      * ``take``   (default) — ``jnp.take`` + multiply chain (the
+                   historical impl; ~5 concurrent rank-5 slots).
+      * ``einsum`` — single 4-tensor ``jnp.einsum`` with materialised
+                   4×4 γ̃ matrices (predicted 3 concurrent rank-5 slots).
+      * ``scan``   — ``lax.scan`` over ns² spin pairs, rank-3 slices
+                   only (predicted 2 concurrent rank-5 slots).
+
+    The three are mathematically identical; the variation is purely
+    in how XLA lays out intermediate buffers.
+
+    Inputs:
+        P_l_conj, P_r : same shape; the two specified ``spin_axes``
+                        are size ns=4 each.
+        spin_axes     : tuple ``(left_axis, right_axis)`` indexing the
+                        two spin axes to contract.  Default ``(1, 2)``
+                        matches the (k, a, b, μ, ν/r) layout used by
+                        ``pair_density``.  Non-default falls back to
+                        the ``take`` path.
+
+    Output: same shape as P_l_conj minus the two spin axes.
+    """
+    if _GAMMA_CONTRACT_MODE == "einsum":
+        return _gamma_double_contract_einsum(
+            P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
+    if _GAMMA_CONTRACT_MODE == "scan":
+        return _gamma_double_contract_scan(
+            P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
+    return _gamma_double_contract_take(
+        P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
+
+
+# Module-level mode set at config-build time via
+# :func:`set_gamma_contract_mode`.  Default ``take`` matches the
+# historical path; cohsex.in ``gamma_contract_mode`` overrides it.
+_GAMMA_CONTRACT_MODE: str = "take"
+
+
+def set_gamma_contract_mode(mode: str) -> None:
+    """Set the global γ̃-double-contract kernel variant (``take`` |
+    ``einsum`` | ``scan``).  Called once by the driver from
+    ``cfg.backend.gamma_contract_mode``.  Mutating this after kernels
+    have been traced will not retroactively re-trace them.
+    """
+    global _GAMMA_CONTRACT_MODE
+    m = str(mode).strip().lower()
+    if m not in ("take", "einsum", "scan"):
+        raise ValueError(
+            f"gamma_contract_mode={mode!r} not in (take, einsum, scan)")
+    _GAMMA_CONTRACT_MODE = m
+
+
+__all__ = [
+    "sigma_x", "sigma_y", "sigma_z", "paulis",
+    "gamma0", "gamma1", "gamma2", "gamma3", "gamma5",
+    "gammas_perm", "gammas_phase",
+    "gamma_perm_phase", "gamma_apply", "gamma_double_contract",
+    "current_fit_terms",
+]

@@ -1,0 +1,1118 @@
+"""Fermi level and occupations from an eigenvalue set.
+
+ON DEVICE, FOR THE SYNC AND NOT THE ARITHMETIC.  The sort and the
+cumulative sum are microseconds on a ``(nk, nb)`` input either way, but
+``fermi_level_step`` runs every self-consistent iteration on ``E`` fresh
+off the eigh (``sc_iteration.gw_iteration_map``,
+``rebuild_hartree_dft_basis``), so a numpy body cost a readback of the
+whole eigenvalue block and a pipeline sync mid-iteration.  The body is one
+``jax.jit`` kernel over ``E``; the only thing that crosses to the host is
+a 3-vector (E_F, the degeneracy flag, the boundary energy), at the one
+point the caller needs a Python float anyway (``rotate_wavefunctions``
+takes ``efermi: float``).
+
+THE DEGENERATE REFUSAL IS A RETURNED FLAG, NOT A RAISE.  A ``raise``
+cannot fire inside a traced kernel, so the kernel computes the condition
+and ships it in that same 3-vector and the host wrapper raises the same
+``ValueError``.  ``checkify`` was rejected: it would force every caller
+into the checkify transform to recover a condition that already crosses
+on the transfer carrying E_F.  The refusal itself is load-bearing —
+``qsgw_density.distributed_eigh_bands``'s gauge argument depends on it, ρ
+being invariant under the arbitrary unitary inside a degenerate subspace
+only because f is constant across that subspace.
+
+OPERANDS.  ``E_kn`` is the device operand.  ``kweights`` is a k-table of
+``n_k`` numbers, built once per run, and stays host numpy — passed into
+the kernel as an argument, so no recompilation per call.
+
+WHY THIS IS ITS OWN MODULE.  ``sc_iteration._diagonalize_and_get_efermi``
+computes a midgap E_F from a FIXED integer ``n_occ``, i.e. it assumes band
+``n_occ`` is the last occupied one at EVERY k and ignores the k-weights.
+That is right for a gapped insulator on a uniform grid and wrong for a
+metal, for a semimetal, and for any k-set with non-uniform weights — which
+is the IBZ, i.e. the case the self-consistent density has to run on.  This
+module answers the general question and the self-consistency code calls it
+rather than growing a second convention inline.
+
+UNITS: BAND OCCUPANCY, NOT ELECTRONS.  Every quantity here counts
+*occupied bands*, weighted by ``kweights``:
+
+    Σ_k w_k Σ_n f_nk  ==  n_occ_bands
+
+The spin degeneracy ``f_spin`` (2 for a spin-restricted scalar
+calculation, 1 for a spinor one — ``psp.get_DFT_mtxels.
+spin_degeneracy_factor``) multiplies BOTH the electron count and the
+occupancy, so it cancels out of E_F exactly.  Carrying it here would be an
+invitation to apply it twice; it belongs in ρ's normalisation, where it
+does not cancel.
+
+MP1 APIs below count physical electrons.  ``WfnLoader.num_electrons`` is
+the weighted WFN occupation count; do not substitute
+``WfnLoader.nelec=max(ifmax)``, which is only a band boundary in a metal.
+Pass the canonical
+``spin_degeneracy_factor(wfn)`` as ``state_capacity``: 1 for a fully
+relativistic spinor WFN and 2 for a spin-restricted scalar WFN.  Their
+``broadening_ry`` follows BerkeleyGW ``occ_broadening``: the MP1
+argument is ``(E-mu)/(2*broadening_ry)``.  Matching QE therefore uses
+``broadening_ry=degauss/2``.
+
+TWO OCCUPANCY RULES LIVE HERE AND THEY ARE NOT THE SAME RULE.
+:func:`band_in_occupation_window` decides which bands are in a
+Green's-function branch -- the support ``|w| >= 1e-5`` of the branch weight.
+``occupation_clamp_tol`` (:func:`clamp_occupation_tail`) decides whether a meaningless value exists
+in the table at all, and it is applied once, at evaluation, so every
+consumer sees the same support.  Neither subsumes the other and neither
+should be collapsed into the other.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+from functools import partial
+from dataclasses import dataclass
+
+import numpy as np
+
+import jax
+import jax.numpy as jnp
+
+from common.units import RYD_TO_EV
+
+
+__all__ = [
+    "OCCUPATION_CLAMP_TOL_DEFAULT",
+    "OCCUPATION_CLAMP_TOL_MAX",
+    "OCCUPATION_WEIGHT_FLOOR",
+    "MP1_LOBE_EXTREMUM",
+    "OccupationState", "assert_fixed_n", "assert_wfn_occupation_consistency",
+    "band_in_occupation_window", "clamp_occupation_tail", "fermi_level_step",
+    "legacy_square_mesh_occupation_digests",
+    "mp1_negative_derivative", "mp1_occupations",
+    "occupation_clamp_tol", "occupation_digest", "occupation_floor_reach_ry",
+    "occupied_band_count", "resolve_sigma_efermi_ry",
+    "solve_mp1_occupations", "solve_smearing_occupations", "fd_occupations",
+    "step_occupations",
+]
+
+
+#: The three legal ``fermi_reference`` values and what each NAMES.  Kept
+#: beside the resolver so the vocabulary and its interpretation cannot
+#: drift apart (``gw_config.DynamicSigmaConfig.__post_init__`` validates
+#: membership; this decides what membership MEANS).
+SIGMA_FERMI_REFERENCES = ("vbm", "midgap", "mp1_fixed_n")
+
+
+def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
+    """THE energy the Sigma omega axis is measured from, and where it came from.
+
+    Returns ``(efermi_ry, provenance)`` -- the second value is the string
+    ``file_io.write_sigma_omega_h5`` stamps as
+    ``omega_reference_provenance``, so a post-hoc consumer never has to
+    guess (audit A2 measured a 2.79 eV mis-sampling of Sigma_c(omega) on
+    the sodium metal deck from exactly that guess).
+
+    WHY THIS IS A FUNCTION AND NOT THREE INLINE BRANCHES.  The MPA Sigma
+    branch used to read ``occupation_state.mu_ry or wfn.efermi`` directly
+    and never look at ``fermi_reference`` at all, while the PPM branch
+    honored it.  ``wfn.efermi`` happens to BE the midgap
+    (``wfn_loader.loader`` sets ``0.5*(vbm + cbm)``), so the default
+    ``midgap`` agreed by coincidence and only ``vbm`` was silently wrong --
+    which is the worst shape for a defect to have, because the one deck
+    that would expose it is the one nobody runs by default.
+
+      ``mp1_fixed_n``  the fixed-N chemical potential of the chosen family for THIS
+                       iteration.  Requires an ``occupation_state``; a
+                       metal has one and ``gw_config`` refuses the
+                       combination without it.
+      ``midgap``       ``0.5*(vbm + cbm)`` -- the loader's ``efermi``.
+      ``vbm``          the valence-band maximum, ``wfn.vbm``.
+
+    An ``occupation_state`` present with a gap-derived reference is a
+    contradiction, not a preference: the state exists because the deck
+    solved a fixed-N chemical potential, and measuring Sigma against a
+    different reference than the occupations were built at is the
+    confound this refusal exists to make unspellable.
+    """
+    name = str(fermi_reference).strip().lower()
+    if name not in SIGMA_FERMI_REFERENCES:
+        raise ValueError(
+            f"fermi_reference must be one of {SIGMA_FERMI_REFERENCES}; "
+            f"got {fermi_reference!r}.")
+    if name == "mp1_fixed_n":
+        if occupation_state is None:
+            raise ValueError(
+                "fermi_reference = mp1_fixed_n names the fixed-N "
+                "chemical potential, but no occupation_state reached the "
+                "Sigma dispatch.  The QSGW driver passes one; a direct "
+                "caller must construct it from the current spectrum.")
+        return float(occupation_state.mu_ry), "fixed-N mu"
+    if occupation_state is not None:
+        raise ValueError(
+            f"fermi_reference = {name!r} is a gap-derived reference, but "
+            f"this iteration carries a fixed-N occupation_state (mu = "
+            f"{float(occupation_state.mu_ry):.6f} Ry).  Measuring Sigma "
+            f"against a different reference than the occupations were "
+            f"solved at is a confound, not a choice: set fermi_reference "
+            f"= mp1_fixed_n.")
+    if name == "midgap":
+        return float(wfn.efermi), "midgap"
+    return float(wfn.vbm), "vbm"
+
+
+# ---------------------------------------------------------------------------
+#  The branch-weight floor that decides whether a band is in a
+#  Green's-function branch at all.  ONE predicate, ONE floor -- every
+#  consumer imports from here rather than re-spelling the rule.  The
+#  consumers are the Sigma branch supports (``gw.ppm_windows``), the MPA
+#  pole-window geometry (``gw.mpa.sigma_windows``), the chi0
+#  fractional-occupation supports (``gw.w_isdf``) and the shared-pole
+#  response-bank samples (``gw.response_bank``).
+# ---------------------------------------------------------------------------
+
+#: The branch-weight floor: a band is in a branch iff ``|w| >= 1e-5``.  For
+#: a Fermi-Dirac state that is ``|E - mu| <= kBT * ln(1e5 - 1) = 11.5 kBT``
+#: on either side of mu.  The support sets the Sigma box widths, and the tau
+#: cost grows linearly with them: the float64 floor 2**-53 (36.7 kBT) took Fe
+#: 4^3 from 798 to 1159 tau pairs and its cold rule plan from 58 s to 98 s
+#: (CLAIMS 2863), for states that carry no weight.
+#:
+#: THE BOUND.  A state that crosses the cut between SC maps switches one
+#: branch term on or off.  Its weight is below the floor, so Sigma moves by
+#: at most about the floor times the term the weight multiplies: 5.38 meV
+#: at 0.005 on Fe (CLAIMS 2793), about 0.01 meV at 1e-5.  The weights the
+#: floor drops bound the one-shot truncation the same way (Fe 4^3 against
+#: 2**-53: eqp0 <= 0.10 meV, CLAIMS 2867).  eqp1 carries the change times
+#: Z, so a resonance row (Z > 1) amplifies it.
+#: No deck key: the one-shot and every SC map read this constant.
+OCCUPATION_WEIGHT_FLOOR = 1e-5
+
+
+def sigma_frame_mu_ev(config, wfn, E_full_ry, efermi_ry, occupation_state):
+    """The E_F the Sigma build measures its omega grid from, in eV.
+
+    Grid growth and the tail mask must judge coverage in THIS frame.  The
+    GN/HL-PPM Sigma is built about the current spectrum's VBM or midgap
+    (``ppm_sigma.ppm_fermi_frame`` on the step occupations the QP bundle
+    gets at ``efermi_ry``), which on MoS2 3x3 QSGW sat 1.4 eV above the
+    DFT midgap the partition uses; judged in the partition frame, a state
+    the grid "covered" still read Sigma(0), and the growth that finally
+    covered it moved its map output 2.8 eV (CLAIMS 2725).  MPA measures
+    from ``gw.efermi.resolve_sigma_efermi_ry``.
+    """
+    if config.compute_mode.ppm_model is not None:
+        from .ppm_sigma import ppm_fermi_frame
+        if efermi_ry is None:
+            raise ValueError("the PPM Sigma frame needs this map's occupation step")
+        e = jnp.asarray(E_full_ry, dtype=jnp.float64)
+        frame = ppm_fermi_frame(
+            e, (e < float(efermi_ry)).astype(jnp.float64),
+            jnp.asarray(config.sigma.fermi_reference == "midgap"))
+        return float(jax.device_get(frame)) * RYD_TO_EV
+    ref_ry, _ = resolve_sigma_efermi_ry(
+        config.sigma.fermi_reference, occupation_state=occupation_state,
+        wfn=wfn)
+    return float(ref_ry) * RYD_TO_EV
+
+
+def occupation_floor_reach_ry(occupation_state):
+    """How far past mu a band still carries floor weight, in Ry (None on a step).
+
+    A state enters a Sigma branch on its wrong side of mu (a conduction state
+    below mu, a valence state above it) only while its weight there reaches
+    :data:`OCCUPATION_WEIGHT_FLOOR` (:func:`band_in_occupation_window`); that
+    weight is ``w(|E - mu|)`` for both branches.  The reach X solves
+    ``|w(X)| = floor``:
+
+    * Fermi-Dirac: ``w = 1 / (1 + exp(u / kBT))``, X = kBT ln(1/floor - 1)
+      (11.51 kBT; Fe 4^3 at 0.02 Ry: 3.13 eV).
+    * MP1: ``|f(x)|`` with ``x = u / (2 W)`` falls monotonically past its lobe
+      extremum at sqrt(3/2) (:data:`MP1_LOBE_EXTREMUM`), so X is the bisection
+      root there.
+    * A step (``"fixed"``) or no state: None.  An insulator's branches are not
+      clipped at mu (an inverted or small-gap state may sit on its wrong side;
+      ``mpa.sigma._branches``), so it has no reach.
+    """
+    if occupation_state is None or occupation_state.smearing_family == "fixed":
+        return None
+    width = float(occupation_state.smearing_width_ry)
+    floor = OCCUPATION_WEIGHT_FLOOR
+    if occupation_state.smearing_family == "fd":
+        return width * math.log(1.0 / floor - 1.0)
+
+    def excess(x):
+        f = 0.5 * math.erfc(x) - x * math.exp(-x * x) / (2.0 * math.sqrt(math.pi))
+        return abs(f) - floor
+
+    lo, hi = math.sqrt(1.5), float(_MP1_BRACKET_WIDTHS)
+    for _ in range(_MP1_BISECTION_STEPS):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if excess(mid) > 0.0 else (lo, mid)
+    return 2.0 * width * hi
+
+
+def band_in_occupation_window(weight):
+    """``abs(weight) >= OCCUPATION_WEIGHT_FLOOR`` -- the one band-inclusion predicate.
+
+    ONE SUPPORT FOR ONE-SHOT AND EVERY SC MAP.  The weight floor 0.005
+    (5.3 kBT, until 2026-09-26) dropped states that carry weight: 2.6 meV
+    RMS / 8.4 meV max of Fe 4^3 Sigma against the same model (CLAIMS 2451),
+    and a 5.4 meV switch of one occupied-branch term when an SC state
+    crossed it (CLAIMS 2793).  At 1e-5 that switch is about 0.01 meV
+    (:data:`OCCUPATION_WEIGHT_FLOOR`).
+
+    WHAT THE FLOOR DECIDES.  The Sigma executor multiplies each band's factor
+    ``exp(-i (E - E_ref) t)`` by its weight, and the planner puts ``E_ref`` at
+    the edge of the states it admits, so no factor grows with the weight's
+    size: the conditioning is gated per window by ``factor_growth`` in
+    ``gw.sigma_box_plan``, whatever the support.  What the support decides
+    is the box, and the tau cost is linear in its width.  Exact nonzero
+    support keeps a valence weight ``f`` down to its underflow, about 700
+    kBT above mu -- every band of a metal deck; the float64 floor ``2**-53``
+    reaches 36.7 kBT; 1e-5 reaches 11.5 kBT.
+
+    MAGNITUDE, NEVER A ONE-SIDED CUT.  :attr:`OccupationState.f_kn` is never
+    clipped; under an MP1 state a band just above mu carries a NEGATIVE
+    occupied-branch weight (down to about -0.0355 at the lobe minimum), and
+    ``abs`` keeps it.  Exact zeros stay excluded.
+
+    Works on numpy and jax arrays alike; returns whatever ``abs``/``>=`` give
+    for the operand type, so a caller keeps its own array library.
+    """
+    return abs(weight) >= OCCUPATION_WEIGHT_FLOOR
+
+
+# ---------------------------------------------------------------------------
+#  The far-tail clamp.  ADDITIVE TO, NOT A REPLACEMENT FOR, the branch
+#  floor above: they answer different questions.  The floor decides which
+#  bands are in a Green's-function branch;
+#  the clamp decides whether a meaningless value exists in the table at all.
+# ---------------------------------------------------------------------------
+
+#: MP1's extremum outside [0, 1], reached at ``x = sqrt(3/2) = 1.224745``:
+#: ``f = -0.0354579065701`` below mu's mirror point and ``1.0354579065701``
+#: above it.  Closed form, not a measurement — ``f'(x) = 0`` for
+#: ``f(x) = erfc(x)/2 - x*exp(-x^2)/(2*sqrt(pi))`` is ``2x^2 = 3``.  This
+#: number is the ONLY thing standing between the clamp and the overshoot,
+#: so it is a named constant and :func:`occupation_clamp_tol` refuses
+#: anything that could approach it.
+MP1_LOBE_EXTREMUM = 0.0354579065701095
+
+#: Hard ceiling on the clamp tolerance: 35x below :data:`MP1_LOBE_EXTREMUM`.
+#: A tolerance at or above the extremum would flatten the whole negative
+#: lobe to zero, i.e. delete part of the configured quadrature.  Refusing
+#: at 1e-3 makes that unreachable BY CONSTRUCTION rather than by the
+#: default happening to be small.
+OCCUPATION_CLAMP_TOL_MAX = 1e-3
+
+#: Deck default for ``occupation_clamp_tol``.  Puts the MP1 table's own
+#: support at ``|x| < 4.30834``, i.e. ``|E - mu| < 8.6167 * W`` — 1.17 eV at
+#: ``W = 0.01 Ry``.  The unclamped table's support edge sits instead at
+#: ``x = 27.2971``, which is ``sqrt(-ln(smallest float64 subnormal)) =
+#: 27.2844`` to four figures: the radius at which ``exp(-x^2)`` stops being
+#: REPRESENTABLE, not any physical scale.  That is 54.59 * W = 7.43 eV at
+#: ``W = 0.01 Ry``, 5.4x room-temperature kT.
+OCCUPATION_CLAMP_TOL_DEFAULT = 1e-8
+
+
+def occupation_clamp_tol(value) -> float:
+    """Validate the far-tail clamp tolerance and return it as a float.
+
+    ``0.0`` disables the clamp exactly — ``abs(f) < 0.0`` is false for every
+    finite ``f`` — which is the A/B control and the bit-for-bit escape hatch.  The upper bound is :data:`OCCUPATION_CLAMP_TOL_MAX`; see
+    :func:`clamp_occupation_tail` for why it is where it is.
+    """
+    t = float(value)
+    if not (np.isfinite(t) and 0.0 <= t <= OCCUPATION_CLAMP_TOL_MAX):
+        raise ValueError(
+            "occupation_clamp_tol must be in [0.0, "
+            f"{OCCUPATION_CLAMP_TOL_MAX!r}]; got {value!r}.  It is the "
+            "distance from 0 or 1 within which an MP1 occupation is snapped "
+            "to exactly 0 or 1.  The ceiling is 35x below MP1's overshoot "
+            f"extremum {MP1_LOBE_EXTREMUM!r}, which is part of the "
+            "configured quadrature and must never be clamped away; 0.0 "
+            "disables the clamp bit-for-bit.")
+    return t
+
+
+def clamp_occupation_tail(f, clamp_tol):
+    """Snap the FAR TAIL of an occupation table to exact 0 / 1.
+
+    ``abs(f) < tol -> 0.0`` and ``abs(1 - f) < tol -> 1.0``.  Nothing else
+    moves, and nothing moves by more than ``tol``.
+
+    WHY THE TABLE AND NOT EACH CONSUMER.  Left unclamped, an MP1 table's
+    support is set by where ``exp(-x^2)`` underflows — ``x = 27.2971``,
+    which is ``sqrt(-ln(5e-324))`` to four figures.  That is a float64
+    property, not a physical one: it puts nonzero weight on states 54.59
+    smearing widths from mu (7.43 eV at ``W = 0.01 Ry``) and it moves if a
+    backend flushes subnormals.  Fixing the table once makes every
+    downstream support backend-independent, instead of leaving each
+    consumer to defend against underflow separately.  At the default
+    ``tol = 1e-8`` the support becomes ``|x| < 4.30834``, i.e.
+    ``|E - mu| < 8.6167 * W``.
+
+    IT CANNOT REACH THE OVERSHOOT, BY CONSTRUCTION.  ``f_kn`` is never
+    clipped: MP1 overshoots [0, 1] near the Fermi surface and that
+    overshoot is part of the configured quadrature (measured -0.0316 to
+    1.0022 on the Na bcc SOC deck; closed-form extremum
+    :data:`MP1_LOBE_EXTREMUM` = 0.03546 at ``x = sqrt(3/2)``).  This is a
+    clamp on the VALUE's distance from 0 or 1, and
+    :func:`occupation_clamp_tol` caps that distance at 1e-3 — 35x below the
+    extremum — so no admissible tolerance can move a value by enough to
+    reach it.  The largest change this function can make to any element is
+    ``tol``; the smallest change that would damage the overshoot is
+    ``MP1_LOBE_EXTREMUM``.  The one place the clamp does fire inside the
+    lobe is the isolated zero crossing at ``x = 0.841882``, where ``f``
+    passes through 0 and is already within ``tol`` of it over a window
+    ``4.5e-8`` wide in ``x``; setting a value of 1e-9 to 0 there is the
+    intent, not a violation of it.
+
+    NOT APPLIED TO ``-df/dE``.  :func:`mp1_negative_derivative` is a
+    different quantity with different consumers (the Fermi-surface weight),
+    and this key says nothing about it.  Deliberate, not an oversight.
+
+    ON AN INSULATING TABLE THIS IS A NO-OP BY CONSTRUCTION: every entry is
+    already exactly 0.0 or 1.0, so both ``where`` predicates select the
+    identity branch at every element.
+
+    Traced-safe: pure ``jnp`` on float64, no host readback, so it composes
+    inside the fixed-N root as well as after it.
+    """
+    f = jnp.asarray(f, dtype=jnp.float64)
+    tol = jnp.asarray(clamp_tol, dtype=jnp.float64)
+    f = jnp.where(jnp.abs(f) < tol, 0.0, f)
+    return jnp.where(jnp.abs(1.0 - f) < tol, 1.0, f)
+
+
+# Tolerance for "the cumulative occupancy lands exactly on the target",
+# i.e. the gapped case.  Scaled by the target so it is relative.
+_EXACT_FILL_RTOL = 1e-9
+
+# Fixed bracket/iteration counts keep one lowering for all per-iteration
+# broadening values at fixed (nk, nb).  At either endpoint |x| >= 8, so the
+# MP1 tail is below 1e-27 in float64.
+_MP1_BRACKET_WIDTHS = 16.0
+_MP1_BISECTION_STEPS = 64
+
+
+def _mp1_values(E, chemical_potential, broadening, clamp_tol):
+    """BerkeleyGW v4 MP1 formula on float64 JAX operands, tail-clamped.
+
+    THE CLAMP IS APPLIED HERE, AT THE POINT OF EVALUATION, and therefore
+    inside the fixed-N root as well: ``_solve_smearing_kernel``'s ``count(mu)``
+    calls this function, so the mu it finds is the one that makes the
+    CLAMPED table hit the electron target.  Clamping the table after the
+    root instead would round the tail and then fail
+    :func:`assert_fixed_n` — the invariant would be asserted against a
+    table nobody solved for.  See :func:`clamp_occupation_tail`.
+    """
+    x = (E - chemical_potential) / (2.0 * broadening)
+    gaussian = jnp.exp(-jnp.square(x))
+    # For an absurdly small width, avoid leaking the limiting inf*0 as NaN.
+    correction = jnp.where(jnp.isfinite(x), x * gaussian, 0.0)
+    return clamp_occupation_tail(
+        0.5 * (1.0 - jax.lax.erf(x)) - correction / (2.0 * jnp.sqrt(jnp.pi)),
+        clamp_tol)
+
+
+def fd_occupations(E_kn, chemical_potential, broadening_ry):
+    """Exact Fermi-Dirac f(E) on (nk, nb) energies in Ry, without tail clamping.
+
+    ``broadening_ry`` is kBT, not MP1's half-width. The stable sigmoid
+    evaluates 1/(1+exp((E-mu)/kBT)) without overflowing either tail.
+    """
+    return jax.nn.sigmoid(
+        (jnp.asarray(chemical_potential, dtype=jnp.float64)
+         - jnp.asarray(E_kn, dtype=jnp.float64))
+        / jnp.asarray(broadening_ry, dtype=jnp.float64))
+
+
+def _mp1_negative_derivative_values(E, chemical_potential, broadening):
+    """``-df/dE`` for BerkeleyGW's first-order MP occupation."""
+    x = (E - chemical_potential) / (2.0 * broadening)
+    gaussian = jnp.exp(-jnp.square(x))
+    return ((1.5 - jnp.square(x)) * gaussian
+            / (2.0 * broadening * jnp.sqrt(jnp.pi)))
+
+
+@jax.jit
+def _mp1_occupations_kernel(E_kn, chemical_potential, broadening_ry,
+                            clamp_tol) -> jax.Array:
+    return _mp1_values(
+        jnp.asarray(E_kn, dtype=jnp.float64),
+        jnp.asarray(chemical_potential, dtype=jnp.float64),
+        jnp.asarray(broadening_ry, dtype=jnp.float64),
+        jnp.asarray(clamp_tol, dtype=jnp.float64))
+
+
+def mp1_occupations(E_kn, chemical_potential, broadening_ry,
+                    clamp_tol=OCCUPATION_CLAMP_TOL_DEFAULT) -> jax.Array:
+    """First-order MP occupations with BerkeleyGW width semantics.
+
+    ``broadening_ry`` is ``occ_broadening`` converted to Ry; the
+    argument is ``(E-mu)/(2*broadening_ry)``.  MP1's small overshoot beyond
+    [0, 1] is deliberately retained; only the FAR TAIL is snapped to exact
+    0/1, at ``clamp_tol`` (:func:`clamp_occupation_tail`).  Pass
+    ``clamp_tol=0.0`` for the unclamped table.
+    """
+    return _mp1_occupations_kernel(
+        E_kn, chemical_potential, broadening_ry,
+        occupation_clamp_tol(clamp_tol))
+
+
+@jax.jit
+def mp1_negative_derivative(
+    E_kn, chemical_potential, broadening_ry,
+) -> jax.Array:
+    """Return the exact MP1 Fermi-surface weight ``-df/dE`` in Ry^-1.
+
+    First-order Methfessel-Paxton is not a positive distribution: its small
+    negative side lobes are part of the configured quadrature and are kept.
+    The width convention is identical to :func:`mp1_occupations`.
+    """
+    return _mp1_negative_derivative_values(
+        jnp.asarray(E_kn, dtype=jnp.float64),
+        jnp.asarray(chemical_potential, dtype=jnp.float64),
+        jnp.asarray(broadening_ry, dtype=jnp.float64))
+
+
+@partial(jax.jit, static_argnames=("family",))
+def _solve_smearing_kernel(E, w, target, broadening, capacity, clamp_tol, family):
+    """Pure fixed-shape device root plus final occupations.
+
+    The selected family evaluates both the count and the returned table.
+    MP1 clamps its tail inside the root; FD retains its exact thermal tail.
+    """
+    E = jnp.asarray(E, dtype=jnp.float64)
+    w = jnp.asarray(w, dtype=jnp.float64)
+    target = jnp.asarray(target, dtype=jnp.float64)
+    broadening = jnp.asarray(broadening, dtype=jnp.float64)
+    capacity = jnp.asarray(capacity, dtype=jnp.float64)
+    clamp_tol = jnp.asarray(clamp_tol, dtype=jnp.float64)
+    values = (fd_occupations if family == "fd" else
+              lambda e, mu, width: _mp1_values(e, mu, width, clamp_tol))
+    tail = (64.0 if family == "fd" else _MP1_BRACKET_WIDTHS) * broadening
+    bracket0 = (jnp.min(E) - tail, jnp.max(E) + tail)
+
+    def count(mu):
+        return capacity * jnp.einsum(
+            "k,kn->", w, values(E, mu, broadening))
+
+    def bisect(_iteration, bracket):
+        lo, hi = bracket
+        mid = 0.5 * (lo + hi)
+        below = count(mid) < target
+        return (jnp.where(below, mid, lo), jnp.where(below, hi, mid))
+
+    # MP1 is locally non-monotone near a level.  Opposite-sign bisection is
+    # safeguarded against that derivative; a bare Newton step is not.
+    lo, hi = jax.lax.fori_loop(
+        0, _MP1_BISECTION_STEPS, bisect, bracket0)
+    mu = 0.5 * (lo + hi)
+    return mu, values(E, mu, broadening)
+
+
+def solve_smearing_occupations(
+    E_kn, kweights, n_electrons: float, broadening_ry: float, *,
+    state_capacity: float,
+    family: str,
+    logical_nband: int | None = None,
+    clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
+) -> tuple[jax.Array, jax.Array]:
+    """Return ``(mu_ry, f_kn)`` satisfying the fixed-electron constraint.
+
+    Solves ``state_capacity * sum_k w_k sum_n f_kn = n_electrons``.
+    ``kweights`` are normalized weights for the supplied k-set (normalized
+    star multiplicities on an IBZ).  A fully relativistic state has
+    ``state_capacity=1``; a restricted scalar state has 2.  Use the
+    canonical ``spin_degeneracy_factor(wfn)``.
+
+    For MP1, ``clamp_tol`` snaps the far tail inside the root; FD ignores
+    this MP1-specific setting and retains the exact Fermi-Dirac table.
+    The width is the BerkeleyGW half-width for MP1 and kBT for FD, in Ry.
+
+    ``logical_nband`` is the physical prefix of the (nk, nb_carrier)
+    energy array, supplied by the caller's band layout. If omitted, all
+    bands are physical. Only that prefix enters the root and charge count;
+    the returned carrier has exact-zero occupations beyond it. Padding
+    energies are never inspected, and physical occupations are not clipped.
+
+    Validation is host-only and reads no eigenvalues.  Root and occupations
+    are one fixed-iteration JAX kernel with no Python loop or scalar readback.
+    """
+    if family not in ("mp1", "fd"):
+        raise ValueError("occupation solve family must be 'mp1' or 'fd'")
+    shape = tuple(int(s) for s in np.shape(E_kn))
+    w = np.asarray(kweights, dtype=np.float64)
+    if len(shape) != 2 or min(shape, default=0) < 1:
+        raise ValueError(
+            f"solve_smearing_occupations: E_kn must be nonempty (nk, nb); got {shape}")
+    import operator
+    try:
+        logical = shape[1] if logical_nband is None else operator.index(logical_nband)
+    except TypeError as exc:
+        raise ValueError("occupation solve logical_nband must be an integer") from exc
+    if isinstance(logical_nband, (bool, np.bool_)) or not (1 <= logical <= shape[1]):
+        raise ValueError(
+            "occupation solve logical_nband must lie inside the energy carrier; "
+            f"got {logical_nband!r}, carrier={shape[1]}")
+    if w.shape != (shape[0],):
+        raise ValueError(
+            f"solve_smearing_occupations: kweights must be ({shape[0]},); got {w.shape}")
+    if not np.all(np.isfinite(w)) or np.any(w < 0.0):
+        raise ValueError("solve_smearing_occupations: kweights must be finite/nonnegative")
+    weight_sum = float(w.sum())
+    if not np.isclose(weight_sum, 1.0, rtol=0.0, atol=1e-10):
+        raise ValueError(
+            f"solve_smearing_occupations: kweights must sum to 1; got {weight_sum:.17g}")
+
+    target = float(n_electrons)
+    broadening = float(broadening_ry)
+    capacity = float(state_capacity)
+    if not np.isfinite(broadening) or broadening <= 0.0:
+        raise ValueError(
+            "solve_smearing_occupations: broadening_ry "
+            f"({'kBT' if family == 'fd' else 'BerkeleyGW half-width'}, Ry) "
+            "must be finite and > 0")
+    if not np.isfinite(capacity) or capacity <= 0.0:
+        raise ValueError("solve_smearing_occupations: state_capacity must be finite and > 0")
+    maximum = capacity * weight_sum * logical
+    if not np.isfinite(target) or not (0.0 < target < maximum):
+        raise ValueError(
+            f"solve_smearing_occupations: n_electrons={target!r} outside (0, {maximum})")
+
+    mu, physical_f = _solve_smearing_kernel(
+        jnp.asarray(E_kn, dtype=jnp.float64)[:, :logical], w, target, broadening, capacity,
+        occupation_clamp_tol(clamp_tol), family)
+    return mu, jnp.pad(physical_f, ((0, 0), (0, shape[1] - logical)),
+                       mode="constant", constant_values=0.0)
+
+
+def solve_mp1_occupations(E_kn, kweights, n_electrons, broadening_ry, *,
+                          state_capacity, clamp_tol=OCCUPATION_CLAMP_TOL_DEFAULT):
+    """MP1 specialization of the common fixed-N bisection owner."""
+    return solve_smearing_occupations(
+        E_kn, kweights, n_electrons, broadening_ry, family="mp1",
+        state_capacity=state_capacity, clamp_tol=clamp_tol)
+
+
+@jax.jit
+def _fermi_level_step_kernel(E, w, target):
+    """``(E_F, degenerate, E_boundary)`` as one f64 3-vector.
+
+    Both branches are computed and selected with ``jnp.where``: each is a
+    handful of scalar ops on already-sorted data, so evaluating both beats
+    any control flow.  Out-of-range indices are clamped explicitly next to
+    the ``where`` that discards them.
+    """
+    E = jnp.asarray(E, dtype=jnp.float64)
+    w = jnp.asarray(w, dtype=jnp.float64)
+    target = jnp.asarray(target, dtype=jnp.float64)
+    nb = int(E.shape[1])
+
+    # One weight per (k, n) state, then sort every state by energy.
+    # ``jnp.argsort`` is stable, matching the host form's kind="stable":
+    # degenerate states keep k-major order, which is what makes the
+    # boundary comparison below reproducible.
+    w_state = jnp.broadcast_to(w[:, None], E.shape).reshape(-1)
+    flat = E.reshape(-1)
+    order = jnp.argsort(flat)
+    E_sorted = flat[order]
+    cum = jnp.cumsum(w_state[order])
+    size = int(E_sorted.shape[0])
+
+    # First state at which the running occupancy reaches the target.  THE
+    # SEARCH IS AT ``target − tol``, NOT AT ``target``: in the gapped case
+    # ``cum`` lands on the target to round-off and which side it lands on
+    # depends on the summation order, i.e. on the backend.  One ulp above
+    # and ``searchsorted`` returns the next index, where the exact-fill
+    # test compares against a partial sum a whole state too high, fails,
+    # and the metallic branch puts E_F ~1e-14 into the gap — at the VBM,
+    # so ``E < E_F`` drops one band per k from ρ.  Searching at
+    # ``target − tol`` removes the cliff without a second branch: any
+    # ``cum[j]`` in ``[target − tol, target)`` is the exact-fill state,
+    # and if none is there both searches return the same index.
+    tol = _EXACT_FILL_RTOL * jnp.maximum(target, 1.0)
+    i = jnp.searchsorted(cum, target - tol, side="left")
+    over = i >= size
+    i_c = jnp.clip(i, 0, size - 1)
+    exact = jnp.abs(cum[i_c] - target) <= tol
+
+    # A STEP OCCUPATION CANNOT SPLIT A DEGENERATE MANIFOLD.  E_F has to be
+    # placeable strictly between the highest occupied and the lowest
+    # unoccupied energy; if the boundary falls inside a set of states that
+    # share an energy, ``E < E_F`` takes all of them or none.  Flagged for
+    # the caller to refuse — that case needs fractional occupations.
+    # Because it is refused, ``nxt`` is the next DISTINCT energy whenever
+    # the result is used, which is what the exact-fill midpoint needs.
+    boundary = jnp.where(exact, i_c, i_c - 1)
+    nxt = boundary + 1
+    b_c = jnp.clip(boundary, 0, size - 1)
+    n_c = jnp.clip(nxt, 0, size - 1)
+    degenerate = ((boundary >= 0) & (nxt < size)
+                  & (E_sorted[n_c] == E_sorted[b_c]) & jnp.logical_not(over))
+
+    # EXACT FILL (gapped).  State i is the last occupied one, so E_F must
+    # sit ABOVE it: midpoint to the next distinct energy.
+    e_exact = jnp.where(nxt >= size,
+                        E_sorted[i_c] + 1.0,
+                        0.5 * (E_sorted[i_c] + E_sorted[n_c]))
+
+    # PARTIAL FILL (metal).  The step at state i carries the count across
+    # the target; interpolate the ENERGY across that step.
+    #
+    # The realised occupancy is then ``cum[i-1]``, which is BELOW the
+    # target by up to one state's weight — a step function can only
+    # realise counts that are partial sums of ``kweights``.  That is
+    # inherent, not a defect here, and it is why a metal needs fractional
+    # occupations.  Callers that care must check with
+    # :func:`occupied_band_count`; the shortfall is bounded by
+    # ``max(kweights)``.
+    im1 = jnp.clip(i_c - 1, 0, size - 1)
+    has_below = i_c > 0
+    cum_below = jnp.where(has_below, cum[im1], 0.0)
+    E_below = jnp.where(has_below, E_sorted[im1], E_sorted[0])
+    span = cum[i_c] - cum_below
+    frac = jnp.where(span <= 0.0, 0.0, (target - cum_below) / span)
+    e_partial = E_below + frac * (E_sorted[i_c] - E_below)
+
+    # Every state occupied and still short — caught by the caller's range
+    # check except for round-off; return just above the top.
+    e_f = jnp.where(over, E_sorted[size - 1] + 1.0,
+                    jnp.where(exact, e_exact, e_partial))
+    return jnp.stack([e_f, degenerate.astype(jnp.float64), E_sorted[b_c]])
+
+
+def fermi_level_step(E_kn, kweights, n_occ_bands: float) -> float:
+    """E_F for step (T = 0) occupations, k-weighted.
+
+    Parameters
+    ----------
+    E_kn : (nk, nb) real
+        Eigenvalues, on a device or on the host.  A ``jax.Array`` is not
+        read back; only the 3-vector of scalars crosses.  Any consistent
+        energy unit; E_F comes back in it.
+    kweights : (nk,) real
+        k-weights of the SAME k-set as ``E_kn``, summing to 1 over the
+        set (the IBZ convention ``WfnLoader.kweights`` uses).  A weighted
+        count is the whole reason this is not ``E_sorted[n_occ]``.  Host
+        numpy.
+    n_occ_bands : float
+        Target Σ_k w_k Σ_n f_nk — a BAND count, see the module note.
+
+    Returns
+    -------
+    float
+        Two regimes, and the distinction is not cosmetic:
+
+        * **Partial fill (metal).**  The cumulative occupancy steps ACROSS
+          the target at some state.  E_F is linearly interpolated between
+          the last state below the target and the first at or above it,
+          weighted by how far into that step the target falls.
+        * **Exact fill (gapped).**  The cumulative occupancy lands ON the
+          target — the target is reached exactly at the VBM.  Returning
+          the VBM energy would then make ``E < E_F`` EXCLUDE the VBM and
+          undercount by one band, so E_F is placed at the midpoint of the
+          VBM and the next state up (the CBM).  That is also the
+          convention ``sc_iteration._diagonalize_and_get_efermi`` uses
+          (``0.5·(vbm + cbm)``), so the two agree on the case they share.
+
+    Raises
+    ------
+    ValueError
+        When the target falls inside a DEGENERATE MANIFOLD.  No step
+        occupation can realise it — ``E < E_F`` takes every state at that
+        energy or none — so returning a number would only show up later as
+        a wrong electron count.  That case needs fractional occupations.
+        Detected inside the kernel and raised here; see the module note.
+
+    ON EXACTNESS.  In the gapped case the realised count equals the target
+    exactly.  In the metallic case it does NOT and cannot: a step function
+    realises only partial sums of ``kweights``, so the count lands at the
+    last partial sum below the target, short by less than
+    ``max(kweights)``.  Check with :func:`occupied_band_count` when it
+    matters; this is the precise sense in which step occupations are a
+    placeholder for the Fermi–Dirac treatment.
+    """
+    # Shape and range checks stay on the host: shapes are static and
+    # ``kweights`` is host numpy, so refusing here reports the numbers
+    # rather than a flag to decode.
+    shape = tuple(int(s) for s in np.shape(E_kn))
+    w = np.asarray(kweights, dtype=np.float64)
+    if len(shape) != 2:
+        raise ValueError(f"fermi_level_step: E_kn must be (nk, nb); got {shape}")
+    if w.shape != (shape[0],):
+        raise ValueError(
+            f"fermi_level_step: kweights must be (nk,) = ({shape[0]},) to "
+            f"match E_kn; got {w.shape}.  Passing full-BZ weights with IBZ "
+            f"energies (or the reverse) silently rescales the electron count.")
+    target = float(n_occ_bands)
+    if not (0.0 < target <= float(w.sum()) * shape[1] + _EXACT_FILL_RTOL):
+        raise ValueError(
+            f"fermi_level_step: n_occ_bands={target} outside (0, "
+            f"sum(w)*nb={float(w.sum()) * shape[1]}]; there are not enough "
+            f"bands to hold it.")
+
+    e_f, degenerate, e_boundary = (
+        float(v) for v in np.asarray(_fermi_level_step_kernel(E_kn, w, target)))
+    if degenerate != 0.0:
+        raise ValueError(
+            f"fermi_level_step: n_occ_bands={target} puts E_F inside a "
+            f"degenerate manifold at E={e_boundary!r} — the "
+            f"target is reached partway through a set of states that share "
+            f"an energy, so no step occupation can realise it (E < E_F takes "
+            f"all of them or none).  This needs fractional occupations.")
+    return e_f
+
+
+def step_occupations(E_kn, e_fermi) -> jax.Array:
+    """``f_nk = 1.0 if E_nk < E_F else 0.0``, as float64.
+
+    float64 rather than a boolean or an integer BY DESIGN: these are the
+    per-state weights ρ contracts against, and the full finite-temperature
+    treatment replaces this function's body with a Fermi–Dirac factor
+    without any consumer changing.  Keeping the dtype and the shape fixed
+    now is what makes that a one-function change later.
+
+    Returns a ``jax.Array`` so the occupations feed
+    ``qsgw_density.rho_from_wfns`` without a round trip; ``e_fermi`` may be
+    a Python float or a device scalar.
+
+    Strict ``<`` is correct given :func:`fermi_level_step`, which never
+    returns an energy equal to an occupied state's: the exact-fill branch
+    places E_F strictly between the VBM and the CBM.
+    """
+    return (jnp.asarray(E_kn, dtype=jnp.float64)
+            < jnp.asarray(e_fermi, dtype=jnp.float64)).astype(jnp.float64)
+
+
+def occupation_digest(f_kn, *, band_extent: int | None = None) -> str:
+    """Hash an occupation table without making zero padding physical.
+
+    With no explicit extent, common trailing columns that are exactly zero on
+    every k point are removed before hashing.  ``band_extent`` exists only for
+    authenticating legacy stores whose digest included a producer mesh's zero
+    pad: nonzero columns may never be truncated, and a larger extent appends
+    exact zeros.  The numerical carrier itself is never changed.
+    """
+    f = np.asarray(f_kn, dtype=np.float64)
+    if f.ndim != 2 or min(f.shape) < 1:
+        raise ValueError(
+            f"occupation_digest: f_kn must be nonempty (nk,nb); got {f.shape}")
+    if not np.all(np.isfinite(f)):
+        raise ValueError("occupation_digest: f_kn must be finite")
+    if band_extent is None:
+        occupied_columns = np.flatnonzero(np.any(f != 0.0, axis=0))
+        stop = int(occupied_columns[-1]) + 1 if occupied_columns.size else 1
+    else:
+        stop = int(band_extent)
+        if stop < 1:
+            raise ValueError(
+                f"occupation_digest: band_extent must be positive; got {stop}")
+        if stop < int(f.shape[1]) and np.any(f[:, stop:] != 0.0):
+            raise ValueError(
+                "occupation_digest: requested legacy extent would truncate "
+                "nonzero occupations")
+    if stop <= int(f.shape[1]):
+        canonical = f[:, :stop]
+    else:
+        canonical = np.pad(f, ((0, 0), (0, stop - int(f.shape[1]))),
+                           mode="constant", constant_values=0.0)
+    return hashlib.sha256(
+        np.ascontiguousarray(canonical).tobytes()).hexdigest()[:16]
+
+
+def legacy_square_mesh_occupation_digests(
+        f_kn, logical_nband: int, *, max_mesh_side: int = 16,
+) -> frozenset[str]:
+    """Reproduce old occupation hashes for exact-zero square-mesh padding.
+
+    Before :func:`occupation_digest` became mesh invariant, a producer hashed
+    its complete band carrier.  That carrier was rounded up to a multiple of
+    ``P = side**2``.  This migration helper enumerates those old encodings
+    from the *live* table, so compatibility never means trusting a supplied
+    hash or dropping a nonzero occupation.  ``max_mesh_side`` bounds the
+    legacy geometries this release promises to authenticate; it is not a
+    numerical tolerance.
+    """
+    f = np.asarray(f_kn, dtype=np.float64)
+    logical = int(logical_nband)
+    side_max = int(max_mesh_side)
+    if f.ndim != 2 or min(f.shape) < 1:
+        raise ValueError(
+            "legacy_square_mesh_occupation_digests: f_kn must be nonempty "
+            f"(nk,nb); got {f.shape}")
+    if not (1 <= logical <= int(f.shape[1])):
+        raise ValueError(
+            "legacy_square_mesh_occupation_digests: logical_nband must lie "
+            f"inside the live carrier; got logical={logical}, shape={f.shape}")
+    if side_max < 1:
+        raise ValueError(
+            "legacy_square_mesh_occupation_digests: max_mesh_side must be "
+            f"positive; got {side_max}")
+    if np.any(f[:, logical:] != 0.0):
+        raise ValueError(
+            "legacy_square_mesh_occupation_digests: live occupations are "
+            "nonzero outside logical_nband; refusing to call that tail "
+            "process padding")
+    from runtime.padding import padded_axis, product_divisor
+    extents = {
+        padded_axis(
+            logical, product_divisor(side, side),
+            name="legacy occupation band carrier").carrier
+        for side in range(1, side_max + 1)
+    }
+    return frozenset(
+        occupation_digest(f, band_extent=extent) for extent in extents)
+
+
+@dataclass(frozen=True)
+class OccupationState:
+    """The one per-iteration occupation record every metal consumer reads.
+
+    Frozen cross-agent contract (ARCHITECTURE.md, metal_mpa_plan_2026-08-15):
+    chi body, head, Σ_x/Hartree, Σ_c and the provenance stamps all consume
+    THIS object, so (f, μ, family, width) never thread loose through five
+    signatures — that is the shadow-accounting failure class.  It owns the
+    fixed-N invariant: both constructors assert the realised electron count
+    against the target (``assert_fixed_n``), and ``__post_init__`` binds
+    ``occ_hash`` to the physical bytes of ``f_kn`` so a stamp can never
+    describe a table it was not computed from. Common trailing exact-zero band
+    columns are process padding and are excluded from that digest.
+
+    ``f_kn`` is NEVER clipped — MP1's overshoot beyond [0, 1] is part of the
+    configured quadrature (see :func:`mp1_occupations`).  The far tail IS
+    snapped to exact 0/1 (:func:`clamp_occupation_tail`), which is a
+    different operation on a disjoint part of the table: the clamp happens
+    inside :func:`solve_mp1_occupations`'s root, BEFORE this object exists,
+    so ``occ_hash`` and the fixed-N assertion both describe the clamped
+    table and no consumer sees a value the solver did not solve for.
+    """
+
+    f_kn: jax.Array          # (nk, nb), float64, never clipped
+    mu_ry: float             # fixed-N chemical potential, or step E_F
+    smearing_family: str     # "mp1" | "fd" | "fixed" ("fixed" = insulating step)
+    smearing_width_ry: float # broadening_ry; 0.0 for "fixed"
+    n_electrons: float       # physical electron target (capacity-weighted)
+    occ_hash: str = ""       # sha256[:16] of f_kn bytes; derived, see below
+
+    def __post_init__(self):
+        f = np.asarray(self.f_kn, dtype=np.float64)
+        if f.ndim != 2 or min(f.shape) < 1:
+            raise ValueError(
+                f"OccupationState: f_kn must be nonempty (nk, nb); got {f.shape}")
+        if not np.all(np.isfinite(f)):
+            raise ValueError("OccupationState: f_kn must be finite")
+        if self.smearing_family not in ("mp1", "fd", "fixed"):
+            raise ValueError(
+                "OccupationState: smearing_family must be 'mp1', 'fd' or 'fixed'; "
+                f"got {self.smearing_family!r}")
+        width = float(self.smearing_width_ry)
+        if self.smearing_family == "fixed" and width != 0.0:
+            raise ValueError(
+                f"OccupationState: family 'fixed' requires width 0.0; got {width!r}")
+        if self.smearing_family in ("mp1", "fd") and not (np.isfinite(width) and width > 0.0):
+            raise ValueError(
+                f"OccupationState: family {self.smearing_family!r} requires width > 0; got {width!r}")
+        if not np.isfinite(self.mu_ry):
+            raise ValueError(f"OccupationState: mu_ry must be finite; got {self.mu_ry!r}")
+        digest = occupation_digest(f)
+        if self.occ_hash and self.occ_hash != digest:
+            raise ValueError(
+                "OccupationState: supplied occ_hash does not match f_kn "
+                f"(got {self.occ_hash!r}, recomputed {digest!r})")
+        object.__setattr__(self, "occ_hash", digest)
+
+    @classmethod
+    def solve_smearing(cls, E_kn, kweights, n_electrons: float, width_ry: float, *,
+                  state_capacity: float, family: str,
+                  logical_nband: int | None = None,
+                  clamp_tol: float = OCCUPATION_CLAMP_TOL_DEFAULT,
+                  ) -> "OccupationState":
+        """Fixed-N state of the selected family through the common bisection.
+
+        ``state_capacity`` follows the module convention (1 for a fully
+        relativistic spinor state, 2 for a restricted scalar one).  The
+        frozen interface sketch omitted it; without it the fixed-N invariant
+        is wrong by a factor of 2 on scalar decks.
+
+        ``logical_nband`` excludes layout padding inside the solve and
+        returns exact-zero padding. The MP1 ``clamp_tol`` is applied inside
+        its root; ``assert_fixed_n`` tests the table actually carried.
+        """
+        mu, f = solve_smearing_occupations(
+            E_kn, kweights, float(n_electrons), float(width_ry),
+            state_capacity=float(state_capacity), family=family,
+            logical_nband=logical_nband,
+            clamp_tol=float(clamp_tol))
+        state = cls(f_kn=f, mu_ry=float(mu), smearing_family=family,
+                    smearing_width_ry=float(width_ry),
+                    n_electrons=float(n_electrons))
+        assert_fixed_n(state, kweights, state_capacity=float(state_capacity))
+        return state
+
+    @classmethod
+    def solve_mp1(cls, E_kn, kweights, n_electrons, width_ry, *,
+                  state_capacity, clamp_tol=OCCUPATION_CLAMP_TOL_DEFAULT):
+        """Construct the MP1 specialization through the common solver."""
+        return cls.solve_smearing(
+            E_kn, kweights, n_electrons, width_ry, family="mp1",
+            state_capacity=state_capacity, clamp_tol=clamp_tol)
+
+    @classmethod
+    def step(cls, E_kn, kweights, n_occ_bands: float, *,
+             state_capacity: float = 1.0) -> "OccupationState":
+        """Insulating step state via the existing E_F/step machinery.
+
+        Refuses the metallic partial-fill case by name: a step function
+        realises only partial sums of the k-weights, so an inexact fill
+        means the deck needs :meth:`solve_mp1`, not a silently short count.
+        """
+        e_f = fermi_level_step(E_kn, kweights, float(n_occ_bands))
+        f = step_occupations(E_kn, e_f)
+        realized = occupied_band_count(f, kweights)
+        target = float(n_occ_bands)
+        tol = _EXACT_FILL_RTOL * max(target, 1.0)
+        if abs(realized - target) > tol:
+            raise ValueError(
+                f"OccupationState.step: step occupations realise "
+                f"{realized:.12f} of the {target:.12f} requested bands "
+                f"(short by {target - realized:.3e}) — a partial fill means "
+                "this is a metal; use OccupationState.solve_mp1.")
+        state = cls(f_kn=f, mu_ry=float(e_f), smearing_family="fixed",
+                    smearing_width_ry=0.0,
+                    n_electrons=float(state_capacity) * target)
+        assert_fixed_n(state, kweights, state_capacity=float(state_capacity),
+                       atol=float(state_capacity) * tol)
+        return state
+
+
+def assert_fixed_n(state: OccupationState, kweights, *,
+                   state_capacity: float, atol: float = 1e-10) -> float:
+    """The fixed-N invariant: capacity-weighted count equals the target.
+
+    Separate from ``__post_init__`` because the invariant needs ``kweights``
+    and ``state_capacity``, which are constructor-scope, not state fields.
+    Padding ``f_kn`` with exact-zero bands (the parallel-transport storage
+    convention) does not move the count, so padded tables assert too.
+    Returns the realised count.
+    """
+    realized = float(state_capacity) * occupied_band_count(state.f_kn, kweights)
+    if abs(realized - float(state.n_electrons)) > atol:
+        raise ValueError(
+            f"OccupationState fixed-N invariant violated: realised "
+            f"{realized:.12f} electrons against target "
+            f"{state.n_electrons:.12f} (|Δ| = "
+            f"{abs(realized - state.n_electrons):.3e} > {atol:.1e}).  "
+            "Mismatched kweights/k-set is the usual cause.")
+    return realized
+
+
+def assert_wfn_occupation_consistency(
+    state: OccupationState, wfn_occ_kn, kweights, *,
+    state_capacity: float, num_electrons: float,
+    occ_atol: float = 1e-6, nelec_atol: float = 1e-8,
+) -> float:
+    """LORRAX↔WFN smearing consistency at metal-run startup.
+
+    Recomputes the electron count from the solved state and compares the
+    solved occupations against the WFN's OWN stored table over the shared
+    band window.  A family/width mismatch (the classic one: passing QE's
+    ``degauss`` where the BerkeleyGW convention wants ``degauss/2``, module
+    header) shows up here as an occupation deviation far above round-off.
+    Deliberate deviation from the plan's letter: ``wfn.efermi`` is derived
+    by the midgap/VBM convention in the loader and cannot equal a smeared
+    metallic μ to 1e-6 Ry even when everything is right, so μ is reported
+    by the caller's log rather than asserted against that field.
+    Returns the max occupation deviation.
+    """
+    realized = float(state_capacity) * occupied_band_count(state.f_kn, kweights)
+    if abs(realized - float(num_electrons)) > nelec_atol:
+        raise ValueError(
+            f"occupation consistency: realised {realized:.12f} electrons vs "
+            f"WFN num_electrons {float(num_electrons):.12f} "
+            f"(|Δ| > {nelec_atol:.1e})")
+    ours = np.asarray(state.f_kn, dtype=np.float64)
+    theirs = np.asarray(wfn_occ_kn, dtype=np.float64)
+    if ours.shape[0] != theirs.shape[0]:
+        raise ValueError(
+            f"occupation consistency: k-set mismatch {ours.shape[0]} vs "
+            f"{theirs.shape[0]}")
+    nb = min(ours.shape[1], theirs.shape[1])
+    deviation = float(np.max(np.abs(ours[:, :nb] - theirs[:, :nb])))
+    if deviation > occ_atol:
+        raise ValueError(
+            f"occupation consistency: solved occupations deviate from the "
+            f"WFN's stored table by {deviation:.3e} (> {occ_atol:.1e}) over "
+            f"the first {nb} bands.  Check the smearing family and width — "
+            "matching QE 'mp' uses broadening_ry = degauss/2 (module header).")
+    return deviation
+
+
+def occupied_band_count(occ_kn, kweights) -> float:
+    """``Σ_k w_k Σ_n f_nk`` — the number :func:`fermi_level_step` targets.
+
+    The round-trip check: feeding this the occupations built from
+    ``fermi_level_step``'s output must return the requested count.  Cheap
+    enough to assert on every self-consistent iteration, and it is the
+    one number that catches a k-weight set that does not match the k-set.
+    The contraction runs where ``occ_kn`` lives; only the scalar crosses.
+    """
+    return float(jnp.einsum("k,kn->",
+                            jnp.asarray(kweights, dtype=jnp.float64),
+                            jnp.asarray(occ_kn, dtype=jnp.float64)))
+
+
+def solve_oneshot_occupations(config, wfn, wfns, material_class,
+                                  mesh_xy=None, print_fn=print):
+	"""Solve the fixed-N MP1 state consumed by one-shot metallic MPA or exchange.
+
+	The self-consistent driver already solves this state at map entry.  A
+	non-SC driver must solve it once from the DFT spectrum and thread that same
+	record to the MPA fit and Sigma; reconstructing either the chemical
+	potential or occupations at a consumer would violate the one-state rule.
+
+	One state per RUN also means one state across RANKS: the head fit is
+	stamped with rank 0's ``occ_hash`` and every rank's Sigma body asserts
+	against it, so the table is solved locally and then rank 0's copy is
+	broadcast (one psum) to all processes.  Measured on Na 8x8x8 at P=16
+	(2026-09-01): ranks 2 and 7 solved a table whose bytes differed from
+	rank 0's at the same mu to 12 digits and refused with "head fit and
+	Sigma body carry different occupation states".
+	"""
+	if material_class != "metal":
+		return None
+	from psp.get_DFT_mtxels import spin_degeneracy_factor
+	from common.collectives import process_count, process_rank, psum_replicate
+	from common.units import RYD_TO_EV
+
+	energies = np.asarray(wfns.enk, dtype=np.float64)
+	if energies.ndim != 2 or min(energies.shape) < 1:
+		raise ValueError(
+			"one-shot metallic occupation energies must be nonempty "
+			f"(nk,nb), got {energies.shape}")
+	nk = int(energies.shape[0])
+	kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
+	local = OccupationState.solve_smearing(
+		energies, kweights, float(wfn.num_electrons),
+		float(config.occ_broadening_ry),
+		family=config.occ_smearing_family,
+		logical_nband=wfns.slices.nb_full_logical,
+		state_capacity=spin_degeneracy_factor(wfn),
+		clamp_tol=float(config.occupation_clamp_tol))
+	if mesh_xy is None or process_count() <= 1:
+		return local
+	root = 1.0 if process_rank() == 0 else 0.0
+	f_kn = psum_replicate(np.asarray(local.f_kn, dtype=np.float64) * root, mesh_xy)
+	mu_ry = float(psum_replicate(np.array([float(local.mu_ry)]) * root, mesh_xy)[0])
+	state = OccupationState(
+		f_kn=f_kn, mu_ry=mu_ry, smearing_family=local.smearing_family,
+		smearing_width_ry=float(local.smearing_width_ry),
+		n_electrons=float(local.n_electrons))
+	if state.occ_hash != local.occ_hash:
+		print_fn(
+			f"  one-shot occupations: rank {process_rank()} solved occ_hash="
+			f"{local.occ_hash} (mu={float(local.mu_ry):.12g}); using rank 0's "
+			f"{state.occ_hash} (mu={mu_ry:.12g}) so head and body agree")
+	return state

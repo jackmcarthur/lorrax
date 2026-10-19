@@ -1,0 +1,978 @@
+"""Fixed-shape kernels for neighbouring-k parallel transport.
+
+The stored forward link has the orientation
+
+``L_i(k) X(k+b_i) L_i(k)^H``
+
+and therefore transports a band-space operator from ``k+b_i`` back to
+``k``. Wavefunctions use the WfnLoader sphere layout
+``(1, nb_pad, nspinor, ngkmax)``. The link kernel gathers the neighbour
+onto the central G sphere, shards central bands over ``x`` and neighbour
+bands over ``y``, and forms the raw overlap at ``P("x", "y")``. G and
+spin are replicated contraction axes, so no process owns a full band matrix.
+The planned distributed polar factor is called inside that same compiled
+graph: the raw overlap never crosses a Python dispatch boundary.
+"""
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec as P
+
+from common.wfn_layout import band_sphere_spec
+
+
+__all__ = [
+    "build_neighbor_table",
+    "build_g_wrap_lookup",
+    "band_storage_extent",
+    "link_connection",
+    "link_covariant_derivative",
+    "LinkStencil",
+    "link_stencil",
+    "g_wrap_for_step",
+    "inverse_neighbor_table",
+    "make_cross_k_overlap",
+    "make_distributed_band_matmul",
+    "MIN_STENCIL_POINTS",
+    "collapsed_axes",
+    "collapsed_axis_center",
+    "collapsed_axis_vacuum_gap",
+    "collapsed_axis_coordinate",
+    "link_stencil_orders",
+    "undersampled_link_axes",
+    "WFN_FINGERPRINT_SCHEME",
+    "bind_wfn_fingerprint",
+    "fingerprint_from_binding",
+    "fingerprint_update_value",
+    "wfn_fingerprint",
+]
+
+#: Minimum distinct mesh points a reduced direction needs for the
+#: fourth-order +/-2 link stencil.  Below it, 3 or 4 points take the
+#: second-order +/-1 stencil; 1 point is a COLLAPSED (non-periodic, vacuum-
+#: padded) direction and takes no stencil at all but the real-space
+#: position operator (:func:`link_stencil_orders`); 2 points support no
+#: derivative and are refused (:func:`undersampled_link_axes`).  THE ONE
+#: PLACE THESE THRESHOLDS ARE DECIDED -- the artifact producer
+#: (``file_io.parallel_transport``), the connection/derivative kernels and
+#: the driver-entry preflight (``gw.sc_iteration.load_head_velocity_source``)
+#: read these names rather than each carrying its own literals.
+MIN_STENCIL_POINTS: int = 5
+
+#: :func:`link_stencil_orders` value for a collapsed direction.
+COLLAPSED_AXIS: int = 0
+
+
+def link_stencil_orders(kgrid) -> tuple[int, int, int]:
+    """Per reduced axis: ``4`` (>= 5 points), ``2`` (3 or 4 points), or
+    :data:`COLLAPSED_AXIS` (1 point).  A 2-point axis is refused by name:
+    its +/-1 neighbours are the same point and no finite difference exists.
+
+    A collapsed axis is a direction the cell is NOT periodic in physically
+    (a slab normal, a wire's two transverse axes): the wavefunctions vanish
+    in the vacuum, the position along it is a genuine bounded operator on
+    the cell, and the Berry connection along that reduced axis is its band
+    matrix ``Z_a = <m| b_a . r |n>`` (:func:`collapsed_axis_coordinate`).
+    The covariant derivative there is ``-i[Z_a, O]`` exactly; no k
+    derivative is fabricated (the old refusal's "analytic zero" is not
+    this: the connection term is kept, only the vanishing ``d_k`` is not).
+    """
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    orders = []
+    for axis, n in zip("xyz", grid):
+        if n <= 0:
+            raise ValueError(f"kgrid must be positive; got {grid}")
+        if n == 1:
+            orders.append(COLLAPSED_AXIS)
+        elif n == 2:
+            raise ValueError(
+                "GATE pt_two_point_axis: a reduced k axis with exactly two "
+                f"mesh points ({axis}: kgrid={grid}) supports no finite "
+                "difference (its +/-1 neighbours coincide) and is not a "
+                "collapsed vacuum direction either; densify it to >= 3 "
+                "points or collapse it to 1.")
+        elif n < MIN_STENCIL_POINTS:
+            orders.append(2)
+        else:
+            orders.append(4)
+    return tuple(orders)
+
+
+def collapsed_axes(kgrid) -> tuple[int, ...]:
+    """Indices of the reduced axes with one mesh point."""
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    return tuple(i for i, n in enumerate(grid) if n == 1)
+
+
+def undersampled_link_axes(kgrid) -> list[str]:
+    """Cartesian directions whose mesh cannot support ANY link stencil.
+
+    Applies PER AXIS, and ONLY to the stages that differentiate along k.
+    It does NOT apply to the unconditional, gauge-free exact-DFT-velocity
+    write (``v = p + i[r,V_NL]`` needs no neighbouring k at all).
+
+    Since 2026-09-05 only a TWO-point axis is unsupported: a collapsed axis
+    (``kgrid[i] == 1``) takes the real-space position operator as its
+    connection and 3- or 4-point axes take the second-order stencil
+    (:func:`link_stencil_orders`).  Before that, every axis below
+    :data:`MIN_STENCIL_POINTS` was refused, which shut every 2D and 1D deck
+    out of the covariant head and the current carriers' Sigma-velocity.
+
+    Returns
+    -------
+    list[str]
+        The unsupported axis names, a subset of ``["x", "y", "z"]``, in
+        that fixed order.  Empty iff every direction has a derivative rule.
+    """
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    return [axis for axis, n in zip("xyz", grid) if n == 2]
+
+
+#: Search box of the neighbour-shell enumeration, in mesh steps per axis.
+#: Wannier90's kmesh search uses the same order of reach; a lattice whose
+#: B1 condition is not met inside it refuses by name.
+_SHELL_SEARCH_REACH: int = 3
+#: Relative length tolerance that groups mesh vectors into one shell, and
+#: the tolerance of the B1 residual ``sum_b w_b b b^T - P`` (P: projector
+#: on the sampled directions, so the residual is relative).  A DFT cell is
+#: symmetric only to its printed digits: the MoS2 fixture's hexagonal
+#: reciprocal vectors differ in length by 7e-7 and its 60 degree angle by
+#: 2e-6, which a 1e-6 grouping splits into a false second shell.
+_SHELL_LENGTH_RTOL: float = 1.0e-5
+_SHELL_B1_ATOL: float = 1.0e-5
+
+
+@dataclass(frozen=True)
+class LinkStencil:
+    """The one neighbour set every finite-link derivative uses.
+
+    ``steps`` ``(nd, 3)`` are integer mesh steps, one of each +/- pair of a
+    Marzari-Vanderbilt shell set (Phys. Rev. B 56, 12847, App. B): whole
+    shells of equal-length mesh vectors, added shortest first until
+    ``sum_b w_b b b^T = P`` holds with one weight per shell (``P`` is the
+    projector on the sampled reciprocal directions; a collapsed axis has no
+    step).  A shell is closed under every isometry of the mesh lattice, so
+    under the crystal point group too: the O(h^2) error of the derivative is
+    covariant.  The search reads the lattice only; no symmetry is assumed.
+
+    ``coefficients`` ``(nd, 3)``: the reduced derivative is
+    ``d/dkappa_a O = sum_d coefficients[d, a] D_d O`` with ``D_d`` the
+    central difference per unit step ``d`` (``b_d . grad``): ``(T_+ - T_-)/2``
+    at ``orders[d] == 2``, the +/-2 Richardson form at 4.  ``axis_rules``
+    is :func:`link_stencil_orders` (``COLLAPSED_AXIS`` marks a position-
+    operator axis, whose coefficients column is zero).
+    """
+
+    steps: np.ndarray
+    orders: tuple
+    coefficients: np.ndarray
+    weights: np.ndarray
+    axis_rules: tuple
+
+    @property
+    def ndir(self) -> int:
+        return int(self.steps.shape[0])
+
+
+def _line_points(step, grid) -> int:
+    """Distinct mesh points on the line ``k + m*step`` (order in Z_N)."""
+    from math import gcd
+    order = 1
+    for n, N in zip(step, grid):
+        if n:
+            period = int(N) // gcd(abs(int(n)), int(N))
+            order = order * period // gcd(order, period)
+    return order
+
+
+def link_stencil(kgrid, bvec_cart) -> LinkStencil:
+    """THE ONE OWNER of the finite-link neighbour set and its weights.
+
+    ``bvec_cart`` are the reciprocal lattice vectors as ROWS (Cartesian,
+    ``k_cart = kappa @ B``).  Mesh vectors ``b = (n / N) @ B`` with integer
+    ``n`` (zero on a collapsed axis) are grouped into shells by length and
+    accepted shortest first; a shell is skipped when one of its vectors is
+    parallel to an accepted one, when it adds no rank to the B1 system, or
+    when a member has fewer than 3 distinct points on its mesh line (no
+    central difference).  On an orthogonal lattice the result is the three
+    reduced axes with the historical per-axis stencil; on bcc (fcc reciprocal
+    mesh) it is the 12-vector first shell, on fcc (bcc mesh) the 8-vector
+    one, on a hexagonal plane the 6-vector one.  A shell takes the fourth-
+    order +/-2 form when each of its lines has >= :data:`MIN_STENCIL_POINTS`
+    points, else the second-order +/-1 form.
+    """
+    from itertools import product
+
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    axis_rules = link_stencil_orders(grid)
+    B = np.asarray(bvec_cart, dtype=np.float64)
+    if B.shape != (3, 3) or abs(float(np.linalg.det(B))) < 1.0e-14:
+        raise ValueError(
+            f"bvec_cart must be a nonsingular (3, 3) matrix; got {B.shape}")
+    sampled = [a for a in range(3) if axis_rules[a] != COLLAPSED_AXIS]
+    if not sampled:
+        return LinkStencil(
+            steps=np.zeros((0, 3), dtype=np.int32), orders=(),
+            coefficients=np.zeros((0, 3)), weights=np.zeros((0,)),
+            axis_rules=axis_rules)
+    Bs = B[sampled]
+    # Projector on the sampled reciprocal span (the B1 target).
+    target = Bs.T @ np.linalg.solve(Bs @ Bs.T, Bs)
+    iu = np.triu_indices(3)
+    reach = [(_SHELL_SEARCH_REACH if a in sampled else 0) for a in range(3)]
+    cands = []
+    for n in product(*(range(-r, r + 1) for r in reach)):
+        if not any(n):
+            continue
+        cart = (np.asarray(n, dtype=np.float64) / np.asarray(grid)) @ B
+        cands.append((float(np.linalg.norm(cart)), n, cart))
+    cands.sort(key=lambda row: row[0])
+    shells, current = [], []
+    for row in cands:
+        if current and row[0] > current[0][0] * (1.0 + _SHELL_LENGTH_RTOL):
+            shells.append(current)
+            current = []
+        current.append(row)
+    if current:
+        shells.append(current)
+
+    accepted, columns, residual = [], [], None
+    for shell in shells:
+        vecs = np.array([c for _, _, c in shell])
+        units = vecs / np.linalg.norm(vecs, axis=1)[:, None]
+        if any(np.max(np.abs(units @ (c / np.linalg.norm(c)))) > 1.0 - 1e-8
+               for sh in accepted for _, _, c in sh):
+            continue
+        if min(_line_points(n, grid) for _, n, _ in shell) < 3:
+            continue
+        col = (vecs.T @ vecs)[iu]
+        trial = np.array(columns + [col]).T
+        if columns and np.linalg.matrix_rank(
+                trial, tol=1e-6 * float(np.max(np.abs(trial)))) <= len(columns):
+            continue
+        accepted.append(shell)
+        columns.append(col)
+        w, *_ = np.linalg.lstsq(trial, target[iu], rcond=None)
+        residual = float(np.max(np.abs(trial @ w - target[iu])))
+        if residual < _SHELL_B1_ATOL:
+            break
+    if residual is None or residual >= _SHELL_B1_ATOL:
+        raise ValueError(
+            "GATE pt_link_shell_incomplete: no Marzari-Vanderbilt shell set "
+            f"within +/-{_SHELL_SEARCH_REACH} mesh steps satisfies "
+            f"sum_b w_b b b^T = 1 (kgrid={grid}, residual={residual}).")
+
+    steps, orders, weights = [], [], []
+    for shell, weight in zip(accepted, w):
+        order = 4 if min(_line_points(n, grid) for _, n, _ in shell) \
+            >= MIN_STENCIL_POINTS else 2
+        for _, n, _ in shell:
+            first = next(x for x in n if x)
+            if first > 0:                      # one of each +/- pair
+                steps.append(n)
+                orders.append(order)
+                weights.append(float(weight))
+    rank = {tuple(n): i for i, n in enumerate(steps)}
+    order_idx = sorted(range(len(steps)), key=lambda i: (
+        sum(abs(x) for x in steps[i]) != 1, sum(abs(x) for x in steps[i]),
+        tuple(-x for x in steps[i]), rank[tuple(steps[i])]))
+    steps = np.asarray([steps[i] for i in order_idx], dtype=np.int32)
+    orders = tuple(int(orders[i]) for i in order_idx)
+    weights = np.asarray([weights[i] for i in order_idx], dtype=np.float64)
+    cart = (steps / np.asarray(grid, dtype=np.float64)) @ B
+    # d/dkappa_a = B[a] . grad, grad = sum_{+/-b} w_b b [f(k+b) - f(k)]
+    # = sum_d 2 w_d b_d D_d with D_d the per-step central difference.
+    coefficients = 2.0 * weights[:, None] * (cart @ B.T)
+    coefficients[:, [a for a in range(3) if a not in sampled]] = 0.0
+    # Exactness on linear functions of the sampled reduced coordinates.
+    check = coefficients.T @ (steps / np.asarray(grid, dtype=np.float64))
+    want = np.zeros((3, 3))
+    want[sampled, sampled] = 1.0
+    if not np.allclose(check, want, rtol=0.0, atol=_SHELL_B1_ATOL):
+        raise AssertionError(
+            f"link shell is not exact on linear functions: {check}")
+    return LinkStencil(steps=steps, orders=orders, coefficients=coefficients,
+                       weights=weights, axis_rules=axis_rules)
+
+
+#: Width of the density probe around a collapsed axis's branch cut, as a
+#: fraction of the largest vacuum gap (its middle tenth: the density the
+#: sawtooth's jump actually wraps, not the tails near the atom planes).
+COLLAPSED_CUT_PROBE_GAP_FRACTION: float = 0.1
+#: Refusal threshold on the fraction of the OCCUPIED window bands' charge
+#: inside that probe (``GATE pt_collapsed_axis_cut_density``).  A share ``s``
+#: wrapped by the cut moves ``Z`` by at most ``2 pi s``, so at the threshold
+#: the cut costs 0.2 % of ``max|Z| ~ pi``, an order below the 1.6 % plane-wave
+#: floor of the velocity identity.  Measured on MoS2 in a 12 A cell: 1.2e-5
+#: (3x3x1 fixture, 16 Ry) and 2.0e-6 (6x6x1, 30 Ry) with the cut in the
+#: vacuum, 0.33 with the cut forced through the slab.
+COLLAPSED_CUT_DENSITY_MAX: float = 1.0e-3
+
+
+def collapsed_axis_vacuum_gap(atom_crys, axis: int) -> tuple[float, float]:
+    """``(f_cut, gap)``: the midpoint and the width of the largest empty
+    interval of the atoms' fractional coordinates along reduced axis ``a``,
+    on the circle (the largest vacuum gap).
+
+    THE ONE PLACEMENT RULE for a collapsed axis's branch cut.  It puts the
+    cut as far from every atom plane as the cell allows, whatever the slab
+    looks like: a slab straddling the cell boundary (atoms at 0.9 and 0.1),
+    an asymmetric slab, an adsorbate, two slabs in one cell, a thick slab.
+    The atoms' circular mean (the rule before this port) agrees with it
+    only for a mirror-symmetric single slab; for an asymmetric one it can
+    put the cut through the density.  The density at the cut is measured by
+    the producer and refused above :data:`COLLAPSED_CUT_DENSITY_MAX`.
+    """
+    a = int(axis)
+    if a not in (0, 1, 2):
+        raise ValueError(f"axis must be 0, 1 or 2; got {axis}")
+    frac = np.asarray(atom_crys, dtype=np.float64)
+    if frac.ndim != 2 or frac.shape[1] != 3 or frac.shape[0] == 0:
+        raise ValueError(
+            f"atom_crys must be (nat, 3) fractional coordinates; got "
+            f"{frac.shape}")
+    f = np.sort(np.mod(frac[:, a], 1.0))
+    gaps = np.diff(np.concatenate([f, f[:1] + 1.0]))
+    i = int(np.argmax(gaps))
+    return float(np.mod(f[i] + 0.5 * gaps[i], 1.0)), float(gaps[i])
+
+
+def collapsed_axis_center(atom_crys, axis: int) -> float:
+    """``f_a^0``: the zero of the position sawtooth along reduced axis
+    ``a``, half a cell from its branch cut, which sits at the centre of the
+    largest vacuum gap (:func:`collapsed_axis_vacuum_gap`)."""
+    cut, _ = collapsed_axis_vacuum_gap(atom_crys, axis)
+    return float(np.mod(cut + 0.5, 1.0))
+
+
+def collapsed_axis_coordinate(fft_grid, atom_crys, axis: int):
+    """``zeta_a(r) = 2 pi * wrap(f_a(r) - f_a^0)`` SAMPLED on the FFT grid,
+    and ``f_a^0``.  A diagnostic / reference form: the production operator
+    (``common.mtxel_sweep.collapsed_position_operator``) applies the same
+    sawtooth through its exact Fourier coefficients instead, because the
+    grid sample aliases the ``1/g`` tail into the pair densities.
+
+    ``f_a`` is the fractional coordinate along reduced axis ``a`` of every
+    FFT-grid point, ``f_a^0`` = :func:`collapsed_axis_center`, and the wrap
+    puts the branch cut of the sawtooth half a cell away from it, at the
+    centre of the largest vacuum gap where the wavefunctions vanish.  ``2 pi f_a = b_a . r`` is the
+    coordinate conjugate to the reduced k component ``kappa_a``, so
+    ``-i[<zeta_a>, O]`` is the reduced-coordinate covariant derivative
+    along ``a`` and needs the SAME ``reduced_covector_to_cartesian`` as the
+    stencil axes.  Returns ``(zeta_r (nx, ny, nz) float64, f_a^0)``.
+    """
+    grid = tuple(int(n) for n in fft_grid)
+    a = int(axis)
+    center = collapsed_axis_center(atom_crys, a)
+    f = np.arange(grid[a], dtype=np.float64) / float(grid[a])
+    wrapped = np.mod(f - center + 0.5, 1.0) - 0.5
+    zeta_line = 2.0 * np.pi * wrapped
+    shape = [1, 1, 1]
+    shape[a] = grid[a]
+    zeta_r = np.broadcast_to(zeta_line.reshape(shape), grid).copy()
+    return zeta_r, center
+
+_BAND_MATMUL_CACHE = {}
+
+# This name is intentionally stable and printed by provenance checks in the
+# dipole-fingerprint regression.  Changing the sampled content below requires
+# a new scheme name so artifacts can state exactly what was compared.
+WFN_FINGERPRINT_SCHEME = (
+    "mean-field-content-v1:full-mf-header+bounded-wfns")
+_WFN_GVEC_SAMPLE_COUNT = 17
+_WFN_COEFF_BAND_SAMPLE_COUNT = 7
+_WFN_COEFF_G_SAMPLE_COUNT = 11
+
+
+def band_storage_extent(mesh, nbands: int) -> int:
+    """Return the one physical band extent shared by all PT layouts.
+
+    Wavefunctions shard bands over the composite mesh while matrices shard
+    their two band axes separately. Rounding to the full mesh product is
+    accepted by both layouts, including rectangular meshes.
+    """
+    names = tuple(str(a) for a in mesh.axis_names)
+    if names != ("x", "y"):
+        raise ValueError(
+            "parallel transport requires mesh axes ('x','y'); "
+            f"got {names!r}")
+    from runtime.padding import padded_axis
+    return padded_axis(
+        int(nbands), mesh, name="parallel-transport band carrier",
+        spec=band_sphere_spec(), axis=1).carrier
+
+
+def fingerprint_update_value(digest, label: str, value) -> None:
+    """Add an ndarray-like value to ``digest`` without object-pointer bytes."""
+    array = np.asarray(value)
+    digest.update(label.encode("utf-8"))
+    digest.update(repr(tuple(int(n) for n in array.shape)).encode("ascii"))
+    digest.update(array.dtype.str.encode("ascii"))
+    if array.dtype.kind in ("O", "S", "U"):
+        # HDF5 text metadata can arrive as bytes, unicode, or object arrays.
+        # ``repr(array.tolist())`` is stable for those values; ``tobytes`` on
+        # an object array would instead digest process-local pointers.
+        digest.update(repr(array.tolist()).encode("utf-8"))
+    else:
+        digest.update(np.ascontiguousarray(array).tobytes())
+
+
+def _fingerprint_sample_indices(size: int, count: int) -> np.ndarray:
+    """Return deterministic, endpoint-inclusive indices bounded by ``count``."""
+    if size <= 0:
+        return np.empty((0,), dtype=np.int64)
+    return np.unique(np.linspace(
+        0, size - 1, num=min(size, count), dtype=np.int64))
+
+
+def _fingerprint_h5_attrs(digest, label: str, obj) -> None:
+    for key in sorted(obj.attrs):
+        fingerprint_update_value(
+            digest, f"attr:{label}:{key}", obj.attrs[key])
+
+
+def _fingerprint_wfn_file(digest, path) -> None:
+    """Hash semantic WFN content without hashing its pathname or inode."""
+    import h5py
+
+    with h5py.File(path, "r") as h5:
+        _fingerprint_h5_attrs(digest, "/", h5)
+
+        # The mean-field header is small relative to the coefficients, so its
+        # complete dataset and attribute content is part of the identity.
+        if "mf_header" in h5:
+            header_objects = [("mf_header", h5["mf_header"])]
+            h5["mf_header"].visititems(
+                lambda name, obj: header_objects.append(
+                    (f"mf_header/{name}", obj)))
+            for name, obj in sorted(header_objects, key=lambda pair: pair[0]):
+                _fingerprint_h5_attrs(digest, name, obj)
+                if isinstance(obj, h5py.Dataset):
+                    fingerprint_update_value(
+                        digest, f"dataset:{name}", obj[()])
+
+        if "wfns" not in h5:
+            raise ValueError(f"WFN file {path!s} has no 'wfns' group")
+        wfns = h5["wfns"]
+        _fingerprint_h5_attrs(digest, "wfns", wfns)
+        for dataset_name in ("gvecs", "coeffs"):
+            if dataset_name not in wfns:
+                raise ValueError(
+                    f"WFN file {path!s} has no 'wfns/{dataset_name}' dataset")
+            dataset = wfns[dataset_name]
+            _fingerprint_h5_attrs(
+                digest, f"wfns/{dataset_name}", dataset)
+            fingerprint_update_value(
+                digest, f"contract:wfns/{dataset_name}",
+                np.asarray(dataset.shape, dtype=np.int64))
+            digest.update(dataset.dtype.str.encode("ascii"))
+
+        gvecs = wfns["gvecs"]
+        if gvecs.ndim != 2:
+            raise ValueError(
+                f"WFN wfns/gvecs must be rank 2; got shape {gvecs.shape}")
+        for ig in _fingerprint_sample_indices(
+                gvecs.shape[0], _WFN_GVEC_SAMPLE_COUNT):
+            fingerprint_update_value(
+                digest, f"sample:wfns/gvecs:{int(ig)}", gvecs[int(ig), :])
+
+        coeffs = wfns["coeffs"]
+        if coeffs.ndim != 4:
+            raise ValueError(
+                f"WFN wfns/coeffs must be rank 4; got shape {coeffs.shape}")
+        bands = _fingerprint_sample_indices(
+            coeffs.shape[0], _WFN_COEFF_BAND_SAMPLE_COUNT)
+        g_rows = _fingerprint_sample_indices(
+            coeffs.shape[2], _WFN_COEFF_G_SAMPLE_COUNT)
+        for ib in bands:
+            for ig in g_rows:
+                # Spinor and real/imag axes are small and are included whole.
+                fingerprint_update_value(
+                    digest,
+                    f"sample:wfns/coeffs:{int(ib)}:{int(ig)}",
+                    coeffs[int(ib), :, int(ig), :],
+                )
+
+
+def wfn_fingerprint(wfn) -> str:
+    """Cheap, location-independent SHA-256 identity for a fixed-gauge WFN.
+
+    The digest includes the complete ``mf_header`` tree and bounded,
+    endpoint-inclusive samples of ``wfns/gvecs`` and ``wfns/coeffs``.  It
+    therefore detects every header change and changes in the sampled
+    wavefunction rows, while byte-identical copies have the same identity.
+
+    This deliberately is not a full coefficient checksum: a change confined
+    to unsampled G-vector or coefficient rows can collide.  Hashing all
+    coefficients at each consumer startup would make the provenance check as
+    expensive as reading the entire WFN.  Path, inode, timestamps, and HDF5
+    storage layout are not part of the mean-field identity.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    digest.update(WFN_FINGERPRINT_SCHEME.encode("ascii"))
+    for label, value in (
+        ("loaded:energies", np.asarray(wfn.energies, dtype=np.float64)),
+        ("loaded:kpoints", np.asarray(wfn.kpoints, dtype=np.float64)),
+    ):
+        fingerprint_update_value(digest, label, value)
+    fingerprint_update_value(
+        digest, "loaded:counts",
+        np.asarray(
+            [int(wfn.nelec), int(wfn.nspinor), int(wfn.nbands)],
+            dtype=np.int64),
+    )
+
+    path = getattr(wfn, "path", None)
+    if path is not None:
+        _fingerprint_wfn_file(digest, path)
+    return digest.hexdigest()
+
+
+class _BoundWfnFingerprint:
+    """Host-only proof that one digest was computed from one loaded WFN."""
+
+    __slots__ = ("_source", "_fingerprint")
+
+    def __init__(self, source) -> None:
+        object.__setattr__(self, "_source", source)
+        object.__setattr__(self, "_fingerprint", wfn_fingerprint(source))
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("WFN fingerprint bindings are immutable")
+
+    def __reduce__(self):
+        raise TypeError("WFN fingerprint bindings are host-only and transient")
+
+
+def bind_wfn_fingerprint(wfn):
+    """Scan ``wfn`` once and bind the canonical digest to that exact object.
+
+    The opaque host-only result is an orchestration proof, not a numerical
+    JAX operand or a serializable artifact.  Consumers must extract its digest
+    through :func:`fingerprint_from_binding`, which refuses a different
+    loaded WFN even when it has the same path or array shapes.
+    """
+    return _BoundWfnFingerprint(wfn)
+
+
+def fingerprint_from_binding(binding, wfn) -> str:
+    """Return a bound canonical digest for the exact loaded ``wfn``."""
+    if not isinstance(binding, _BoundWfnFingerprint):
+        raise TypeError(
+            "expected the host-only result of bind_wfn_fingerprint; got "
+            f"{type(binding).__name__}")
+    if binding._source is not wfn:
+        raise ValueError(
+            "canonical WFN fingerprint binding belongs to a different "
+            "loaded WFN object; path or shape equality is not source "
+            "identity")
+    return binding._fingerprint
+
+
+def build_neighbor_table(
+    kvecs_asints: np.ndarray,
+    kgrid: Sequence[int],
+    steps: np.ndarray,
+) -> np.ndarray:
+    """Return full-BZ indices for arbitrary integer mesh displacements."""
+    coords = np.asarray(kvecs_asints, dtype=np.int64)
+    grid = np.asarray(kgrid, dtype=np.int64)
+    step_rows = np.asarray(steps, dtype=np.int64)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError(
+            "kvecs_asints must have shape (nk, 3); "
+            f"got {tuple(coords.shape)}")
+    if grid.shape != (3,) or np.any(grid <= 0):
+        raise ValueError(f"kgrid must be three positive integers; got {grid}")
+    if step_rows.ndim != 2 or step_rows.shape[1] != 3:
+        raise ValueError(
+            f"steps must have shape (nstep, 3); got {step_rows.shape}")
+    if coords.shape[0] != int(np.prod(grid)):
+        raise ValueError(
+            "neighbor lookup requires a complete uniform full-BZ grid: "
+            f"got {coords.shape[0]} rows for kgrid {tuple(grid)}")
+
+    canonical = np.mod(coords, grid[None, :])
+    row_for = {tuple(int(x) for x in row): i
+               for i, row in enumerate(canonical)}
+    if len(row_for) != canonical.shape[0]:
+        raise ValueError("kvecs_asints contains duplicate full-grid rows")
+
+    out = np.empty((canonical.shape[0], step_rows.shape[0]), dtype=np.int32)
+    for ik, row in enumerate(canonical):
+        for istep, step in enumerate(step_rows):
+            target = np.mod(row + step, grid)
+            try:
+                out[ik, istep] = row_for[tuple(int(x) for x in target)]
+            except KeyError as exc:
+                raise ValueError(
+                    "full-grid neighbour is absent: "
+                    f"k row {ik}, step {step.tolist()}, "
+                    f"target {target.tolist()}") from exc
+    return out
+
+
+def inverse_neighbor_table(forward: np.ndarray) -> np.ndarray:
+    """Invert a ``(nk, nd)`` forward-neighbour permutation table."""
+    plus = np.asarray(forward, dtype=np.int64)
+    if plus.ndim != 2:
+        raise ValueError(
+            f"forward neighbour table must be (nk, nd); got {plus.shape}")
+    nk = plus.shape[0]
+    minus = np.empty_like(plus, dtype=np.int32)
+    want = np.arange(nk, dtype=np.int64)
+    for idir in range(plus.shape[1]):
+        col = plus[:, idir]
+        if np.any(col < 0) or np.any(col >= nk) \
+                or not np.array_equal(np.sort(col), want):
+            raise ValueError(
+                f"direction {idir} is not a permutation of the full k grid")
+        minus[col, idir] = want
+    return minus
+
+
+def g_wrap_for_step(
+    unfolded_kpts: np.ndarray,
+    center_full: int,
+    neighbor_full: int,
+    step_grid: Sequence[int],
+    kgrid: Sequence[int],
+    *,
+    atol: float = 2.0e-7,
+) -> np.ndarray:
+    """Return G_wrap for an integer mesh step from center to neighbour."""
+    kpts = np.asarray(unfolded_kpts, dtype=np.float64)
+    grid = np.asarray(kgrid, dtype=np.int64)
+    step_int = np.asarray(step_grid, dtype=np.int64)
+    if kpts.ndim != 2 or kpts.shape[1] != 3:
+        raise ValueError(f"unfolded_kpts must be (nk, 3); got {kpts.shape}")
+    if grid.shape != (3,) or step_int.shape != (3,):
+        raise ValueError(
+            f"kgrid and step_grid must be 3-vectors; got "
+            f"{grid.shape} and {step_int.shape}")
+    step = step_int.astype(np.float64) / grid.astype(np.float64)
+    delta = kpts[int(center_full)] + step - kpts[int(neighbor_full)]
+    wrap = np.rint(delta).astype(np.int32)
+    if not np.allclose(delta, wrap, rtol=0.0, atol=float(atol)):
+        raise ValueError(
+            "neighbour does not differ by the requested mesh step plus a "
+            f"reciprocal vector: center={center_full}, "
+            f"neighbor={neighbor_full}, step={step_int.tolist()}, "
+            f"delta={delta.tolist()}")
+    return wrap
+
+
+def build_g_wrap_lookup(
+    g_neighbor: np.ndarray,
+    g_center: np.ndarray,
+    g_wrap: np.ndarray,
+    *,
+    ngk_neighbor: int,
+    ngk_center: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map the fixed central G sphere into a wrapped neighbour sphere.
+
+    Missing plane waves and all ``ngkmax`` pad rows receive index zero with
+    a false mask.
+    """
+    g_n = np.asarray(g_neighbor)
+    g_c = np.asarray(g_center)
+    wrap = np.asarray(g_wrap)
+    if g_n.ndim != 2 or g_n.shape[1] != 3:
+        raise ValueError(f"g_neighbor must be (ngkmax, 3); got {g_n.shape}")
+    if g_c.shape != g_n.shape:
+        raise ValueError(
+            "central and neighbour fixed G tables must have equal shapes; "
+            f"got {g_c.shape} and {g_n.shape}")
+    if wrap.shape != (3,):
+        raise ValueError(f"g_wrap must have shape (3,); got {wrap.shape}")
+    ngn = int(ngk_neighbor)
+    ngc = int(ngk_center)
+    if not (0 <= ngn <= g_n.shape[0] and 0 <= ngc <= g_c.shape[0]):
+        raise ValueError(
+            f"logical ngk outside ngkmax={g_n.shape[0]}: "
+            f"neighbor={ngn}, center={ngc}")
+
+    row_for = {tuple(int(x) for x in row): i
+               for i, row in enumerate(g_n[:ngn])}
+    index = np.zeros(g_c.shape[0], dtype=np.int32)
+    valid = np.zeros(g_c.shape[0], dtype=bool)
+    for ig, target in enumerate(g_c[:ngc] + wrap[None, :]):
+        hit = row_for.get(tuple(int(x) for x in target))
+        if hit is not None:
+            index[ig] = hit
+            valid[ig] = True
+    return index, valid
+
+
+def make_cross_k_overlap(mesh):
+    """Return the sharded raw overlap used by finite-q density vertices.
+
+    The result is ``rho_nm(k,q)=<u_n,k|u_m,k+q>`` with both band axes
+    distributed as ``P('x','y')``. A rank-1 G lookup returns one band
+    matrix; a rank-3 lookup batches k-by-q and returns
+    ``P(None,None,'x','y')``. Spinor components and G are contraction axes,
+    so scalar, Pauli and four-component wavefunctions use the same path. The
+    batched form shares this contraction rather than introducing a second
+    density-vertex implementation.
+    """
+    sphere_x = NamedSharding(mesh, P(None, "x", None, None))
+    sphere_y = NamedSharding(mesh, P(None, "y", None, None))
+    sphere_kqy = NamedSharding(mesh, P(None, None, "y", None, None))
+    block_xy = NamedSharding(mesh, P("x", "y"))
+
+    @jax.jit
+    def center_on_x(center_xy):
+        return jax.lax.with_sharding_constraint(center_xy, sphere_x)
+
+    @jax.jit
+    def overlap(center_x, neighbor_xy, g_index, g_valid):
+        if g_index.ndim == 1:
+            neighbor = jnp.take(neighbor_xy, g_index, axis=-1)
+            neighbor = jnp.where(
+                g_valid[None, None, None, :], neighbor,
+                jnp.zeros((), dtype=neighbor.dtype))
+            neighbor_y = jax.lax.with_sharding_constraint(neighbor, sphere_y)
+            raw = jnp.einsum(
+                "kbsg,knsg->kbn", jnp.conj(center_x), neighbor_y,
+                optimize=True)[0]
+            raw = jax.lax.with_sharding_constraint(raw, block_xy)
+        elif g_index.ndim == 3:
+            neighbor = jax.vmap(
+                lambda psi_k, index_k: jax.vmap(
+                    lambda psi, index: jnp.take(psi, index, axis=-1),
+                    in_axes=(0, 0))(psi_k, index_k),
+                in_axes=(0, 0))(neighbor_xy, g_index)
+            neighbor = jnp.where(
+                g_valid[:, :, None, None, :], neighbor,
+                jnp.zeros((), dtype=neighbor.dtype))
+            neighbor_y = jax.lax.with_sharding_constraint(
+                neighbor, sphere_kqy)
+            raw = jnp.einsum(
+                "kbsg,kqnsg->qkbn", jnp.conj(center_x), neighbor_y,
+                optimize=True)
+            raw = jax.lax.with_sharding_constraint(
+                raw, NamedSharding(mesh, P(None, None, "x", "y")))
+        else:
+            raise ValueError(
+                "cross-k overlap G lookup must have rank 1 or 3; "
+                f"got rank {g_index.ndim}")
+        return raw
+
+    return center_on_x, overlap
+
+
+def make_distributed_band_matmul(mesh, *, n_batch_axes: int):
+    """Return ``C = A B`` with no full band matrix on any process.
+
+    The caller's batch axes are replicated. ``A`` is gathered only along
+    the column mesh axis to ``P(...,'x',None)``; ``B`` is gathered only
+    along the row mesh axis to ``P(...,None,'y')``. Their contracted band
+    axis is then replicated locally and the result remains
+    ``P(...,'x','y')``. This is one-axis gathering of band slabs, never an
+    all-gather of an ``nb*nb`` matrix.
+    """
+    n_batch = int(n_batch_axes)
+    key = (id(mesh), n_batch)
+    hit = _BAND_MATMUL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    batch = (None,) * n_batch
+    left_spec = P(*batch, "x", None)
+    right_spec = P(*batch, None, "y")
+    out_spec = P(*batch, "x", "y")
+    left_sharding = NamedSharding(mesh, left_spec)
+    right_sharding = NamedSharding(mesh, right_spec)
+    out_sharding = NamedSharding(mesh, out_spec)
+
+    @jax.jit
+    def matmul(left, right):
+        left_x = jax.lax.with_sharding_constraint(left, left_sharding)
+        right_y = jax.lax.with_sharding_constraint(right, right_sharding)
+        out = jnp.einsum("...ij,...jk->...ik", left_x, right_y,
+                         optimize=True)
+        return jax.lax.with_sharding_constraint(out, out_sharding)
+
+    _BAND_MATMUL_CACHE[key] = matmul
+    return matmul
+
+
+def _check_stencil_inputs(links, plus, stencil, collapsed_position):
+    """Validate the link set against the stencil; return the position."""
+    nd = stencil.ndir
+    if links.ndim != 4 or links.shape[0] != nd \
+            or links.shape[-2] != links.shape[-1]:
+        raise ValueError(
+            f"forward_links must be ({nd}, nk, nb, nb) for the "
+            f"{nd}-direction link stencil; got {tuple(links.shape)}")
+    if plus.shape != (links.shape[1], nd):
+        raise ValueError(
+            f"forward_neighbors must be ({links.shape[1]}, {nd}); "
+            f"got {plus.shape}")
+    shape = (3,) + tuple(links.shape[1:])
+    if COLLAPSED_AXIS in stencil.axis_rules:
+        if collapsed_position is None:
+            raise ValueError(
+                "GATE pt_collapsed_axis_needs_position: a collapsed axis "
+                f"(axis rules {stencil.axis_rules}) needs the real-space "
+                "position operator Z_a (3, nk, nb, nb); none was supplied.  "
+                "The artifact's collapsed_position_reduced dataset carries "
+                "it.")
+        position = jnp.asarray(collapsed_position)
+        if tuple(position.shape) != shape:
+            raise ValueError(
+                f"collapsed_position must have shape {shape}; got "
+                f"{tuple(position.shape)}")
+        return position
+    if collapsed_position is not None:
+        raise ValueError(
+            "collapsed_position was supplied but no axis is collapsed "
+            f"(axis rules {stencil.axis_rules})")
+    return None
+
+
+def _dagger(x):
+    return jnp.swapaxes(jnp.conj(x), -1, -2)
+
+
+def link_connection(
+    forward_links: jax.Array,
+    forward_neighbors: np.ndarray,
+    stencil: LinkStencil,
+    *,
+    band_matmul,
+    collapsed_position=None,
+) -> jax.Array:
+    """The Hermitian reduced-coordinate connection on the link stencil.
+
+    ``forward_links`` ``(nd, nk, nb, nb)`` (tileable
+    ``P(None,None,'x','y')``) follow ``stencil.steps``.  Per step ``d`` the
+    directional connection is ``(i/2)(L_+ - L_-)`` (order 2) or the +/-2
+    Richardson form (order 4); the reduced components are
+    ``A_a = sum_d stencil.coefficients[d, a] A_d`` (:func:`link_stencil`).
+    A collapsed axis takes ``A_a = Z_a`` from ``collapsed_position``.
+    """
+    links = jnp.asarray(forward_links)
+    plus = np.asarray(forward_neighbors, dtype=np.int32)
+    position = _check_stencil_inputs(links, plus, stencil, collapsed_position)
+    minus = inverse_neighbor_table(plus)
+    coeff = np.asarray(stencil.coefficients, dtype=np.float64)
+    acc = [None, None, None]
+
+    def _add(a, term):
+        acc[a] = term if acc[a] is None else acc[a] + term
+
+    for d in range(stencil.ndir):
+        lp1 = links[d]
+        km1 = minus[:, d]
+        lm1 = _dagger(lp1[km1])
+        if stencil.orders[d] == 2:
+            Ad = 0.5j * (lp1 - lm1)
+        else:
+            km2 = minus[km1, d]
+            lp2 = band_matmul(lp1, lp1[plus[:, d]])
+            lm2 = band_matmul(lm1, _dagger(lp1[km2]))
+            Ad = (1.0j / 12.0) * (-lp2 + 8.0 * lp1 - 8.0 * lm1 + lm2)
+        for a in range(3):
+            if coeff[d, a] != 0.0:
+                _add(a, float(coeff[d, a]) * Ad)
+    components = []
+    for a in range(3):
+        if stencil.axis_rules[a] == COLLAPSED_AXIS:
+            A = position[a]
+        else:
+            A = acc[a]
+        components.append(0.5 * (A + _dagger(A)))
+    return jnp.stack(components, axis=0)
+
+
+def link_covariant_derivative(
+    operator_k: jax.Array,
+    forward_links: jax.Array,
+    forward_neighbors: np.ndarray,
+    stencil: LinkStencil,
+    *,
+    band_matmul,
+    collapsed_position=None,
+) -> jax.Array:
+    r"""Differentiate a band operator after finite-link parallel transport.
+
+    The stored forward link has the orientation
+
+    ``L_d(k) O(k+b_d) L_d(k)^H``.
+
+    Each neighbour is expressed in the central ``k`` basis before the
+    stencil is applied: the discrete, structurally gauge-covariant spelling
+    of ``partial O - i[A, O]`` (no two large gauge-dependent terms have to
+    cancel on a finite grid).  Per step ``d`` of :func:`link_stencil`,
+    ``D_d O = (T_+ O - T_- O)/2`` (order 2) or the +/-2 Richardson form
+    (order 4); the reduced components are
+    ``sum_d stencil.coefficients[d, a] D_d O``.  The step set is a
+    Marzari-Vanderbilt shell set, closed under the lattice point group, so
+    the O(h^2) error is covariant.  A COLLAPSED axis (one mesh point, a
+    vacuum direction) takes ``-i[Z_a, O]`` with ``Z_a`` from
+    ``collapsed_position`` ``(3, nk, nb, nb)``.
+
+    ``operator_k`` is ``(nk, nb, nb)`` at ``P(None,'x','y')``;
+    ``forward_links`` ``(nd, nk, nb, nb)`` at ``P(None,None,'x','y')``;
+    ``forward_neighbors`` the host ``(nk, nd)`` table of ``k + steps[d]``;
+    ``band_matmul`` a distributed batched product over one batch axis.
+    Returns the ``(3, nk, nb, nb)`` reduced-coordinate derivative.
+    """
+    operator = jnp.asarray(operator_k)
+    links = jnp.asarray(forward_links)
+    plus = np.asarray(forward_neighbors, dtype=np.int32)
+    if operator.ndim != 3 or operator.shape[-2] != operator.shape[-1]:
+        raise ValueError(
+            "operator_k must be (nk,nb,nb); "
+            f"got {tuple(operator.shape)}")
+    if tuple(links.shape[1:]) != tuple(operator.shape):
+        raise ValueError(
+            f"forward_links must have shape (nd,) + {tuple(operator.shape)}; "
+            f"got {tuple(links.shape)}")
+    position = _check_stencil_inputs(links, plus, stencil, collapsed_position)
+    minus = inverse_neighbor_table(plus)
+    coeff = np.asarray(stencil.coefficients, dtype=np.float64)
+
+    def _transport(transport, neighbour_operator):
+        return band_matmul(
+            band_matmul(transport, neighbour_operator), _dagger(transport))
+
+    acc = [None, None, None]
+    for d in range(stencil.ndir):
+        lp1 = links[d]
+        kp1 = plus[:, d]
+        km1 = minus[:, d]
+        lm1 = _dagger(lp1[km1])
+        tp1 = _transport(lp1, operator[kp1])
+        tm1 = _transport(lm1, operator[km1])
+        if stencil.orders[d] == 2:
+            Dd = 0.5 * (tp1 - tm1)
+        else:
+            kp2 = plus[kp1, d]
+            km2 = minus[km1, d]
+            lp2 = band_matmul(lp1, lp1[kp1])
+            lm2 = band_matmul(lm1, _dagger(lp1[km2]))
+            tp2 = _transport(lp2, operator[kp2])
+            tm2 = _transport(lm2, operator[km2])
+            Dd = (-tp2 + 8.0 * tp1 - 8.0 * tm1 + tm2) / 12.0
+        for a in range(3):
+            if coeff[d, a] != 0.0:
+                term = float(coeff[d, a]) * Dd
+                acc[a] = term if acc[a] is None else acc[a] + term
+    rows = []
+    for a in range(3):
+        if stencil.axis_rules[a] == COLLAPSED_AXIS:
+            Z = position[a]
+            rows.append((-1.0j) * (
+                band_matmul(Z, operator) - band_matmul(operator, Z)))
+        else:
+            rows.append(acc[a])
+    return jnp.stack(rows, axis=0)

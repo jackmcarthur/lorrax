@@ -1,0 +1,225 @@
+# Orbital magnetization from a spinor wavefunction — modern theory, explicit dH/dk
+
+This note documents the physics implemented in `psp/orbital_magnetization.py`:
+the per-cell **orbital magnetic moment** of a spin–orbit-coupled crystal,
+computed from a DFT wavefunction by the *modern theory of orbital
+magnetization* in its **sum-over-states (k·p)** form, with the
+Brillouin-zone derivative of the Hamiltonian taken **analytically** through
+`dH/dk = 2(k+G) + dV_NL/dk`. No finite differences enter the velocity
+operator.
+
+## 0. Units
+
+Rydberg atomic units throughout: `ħ = 1`, `2 mₑ = 1` (so `mₑ = ½`), `e² = 2`,
+lengths in Bohr `a₀`, energies in Rydberg `Ry`. The velocity operator is
+
+```
+v = dH/dk = 2(k+G)_cart  +  dV_NL/dk      [Ry·Bohr]
+```
+
+i.e. the kinetic part is `2(k+G)` because a plane wave has kinetic energy
+`T = |k+G|²` (Ry) and `dT/dk = 2(k+G)`; this factor of 2 is exactly what
+distinguishes the *velocity* `dH/dk` from the bare *momentum* `⟨p⟩ = (k+G)`
+(`v = 2p` since `mₑ = ½`). In LORRAX the kinetic action is owned by
+`dft_operators.apply_kinetic_velocity_to_ket`; the nonlocal derivative is
+owned by `vnl_ops.vnl_velocity_matrix`.
+
+## 1. Master formula (modern theory)
+
+The orbital magnetization of a crystal — the orbital magnetic moment per unit
+volume — is the gauge-invariant Brillouin-zone integral
+[Thonhauser–Ceresoli–Vanderbilt–Resta 2005; Ceresoli et al. 2006; Xiao–Chang–Niu 2010]:
+
+```
+        e          ⌠  dᵈk
+M = + ─────  Im  Σ  ⎮ ─────  f_nk  ⟨∂_k u_nk| × (H_k + ε_nk − 2μ) |∂_k u_nk⟩
+       2ħ       n  ⌡ (2π)ᵈ
+```
+
+(SI; in Gaussian-cgs replace `e/2ħ → e/2ħc`). Here `u_nk` is the cell-periodic
+Bloch state, `H_k = e^{−ik·r} H e^{ik·r}` the k-dependent Hamiltonian whose
+eigenvalue is `ε_nk`, `f_nk` the occupation, and `μ` the chemical potential.
+The prefactor is **positive** for this bra/ket order and electron charge
+`q=-e`. In the local-circulation term `H-epsilon_n`, the energy numerator
+is `epsilon_m-epsilon_n`, so the velocity sum carries a **negative** sign:
+`m_n/mu_B = -1/2 Im sum_m (v_nm cross v_mn)/(epsilon_n-epsilon_m)`.
+Using `v_nm=i(epsilon_n-epsilon_m)r_nm` recovers `m=-mu_B L/hbar`.
+The previous additional leading minus reversed that physical atomic limit.
+
+
+### Local / itinerant decomposition
+
+Writing `H + ε − 2μ = (H − ε) + 2(ε − μ)` splits `M` into the **local
+circulation** (self-rotation of the wavepacket, the `H − ε` term) and the
+**itinerant circulation** (center-of-mass motion, the Berry-curvature-weighted
+`2(ε − μ)` term). The combined form above is gauge-invariant and is what we
+evaluate; the `−2μ` term is why `M` is referenced to the chemical potential.
+
+## 2. Sum-over-states reduction (the explicit-dH/dk method)
+
+Insert a complete set of eigenstates into `|∂_k u_n⟩`. Off-diagonal
+derivatives follow from first-order perturbation theory ("Sternheimer"):
+
+```
+⟨u_m | ∂_{k_a} u_n⟩ = ⟨u_m | ∂_{k_a} H | u_n⟩ / (ε_n − ε_m) = v^a_mn / (ε_n − ε_m),   m ≠ n
+```
+
+with `v^a_mn ≡ ⟨u_m | dH/dk_a | u_n⟩` the velocity matrix element. Because the
+eigenbasis diagonalizes `H`,
+
+```
+⟨u_m | (H + ε_n − 2μ) | u_{m'}⟩ = (ε_m + ε_n − 2μ) δ_{m m'},
+```
+
+so the matrix element collapses to a single sum over `m`:
+
+```
+⟨∂_a u_n| (H+ε_n−2μ) |∂_b u_n⟩ = Σ_{m≠n} v^a_nm v^b_mn (ε_m+ε_n−2μ)/(ε_n−ε_m)²
+```
+
+(using `⟨∂_a u_n|u_m⟩ = v^a_nm/(ε_n−ε_m)` and Hermiticity `v^a_mn* = v^a_nm`).
+Taking the antisymmetric (cross-product) combination `ε_{γab}` gives the final
+**sum-over-states formula** for component γ:
+
+```
+        e                                v^a_nm v^b_mn (ε_m + ε_n − 2μ)
+M_γ = + ── Im Σ ∫ dᵈk/(2π)ᵈ f_n Σ   ε_γab ──────────────────────────────
+       2ħ      n               m≠n                  (ε_n − ε_m)²
+```
+
+The **outer sum `n` runs over occupied bands**; the **inner sum `m` runs over
+*all* bands** (occupied and empty — it is a resolution of the identity).
+Because the summand decays as `1/|ε_n − ε_m|` for distant bands, truncating the
+`m`-sum at a finite band ceiling converges — this is the "large but truncated
+set of bands" summed in practice (script flag `--nbnd`, diagnostic
+`--convergence`).
+
+## 3. Per-cell moment in Bohr magnetons (Rydberg units)
+
+On a uniform `N_k` mesh, `∫dᵈk/(2π)ᵈ → (1/V_cell) Σ_k w_k` with `Σ_k w_k = 1`.
+The per-cell moment is `m = M · V_cell`, so **V_cell cancels** and no cell
+volume appears. Dividing the SI prefactor `e/2ħ` by `μ_B = eħ/2mₑ` gives
+`mₑ/ħ²`, and with energy in Ry and length in Bohr,
+`ħ²/(mₑ a₀²) = 2 Ry ⇒ mₑ/ħ² = 1/(2 Ry·a₀²)`. Hence, feeding the **true
+velocity** `v = dH/dk` (Ry·Bohr) directly:
+
+```
+                       1
+m_γ / μ_B = (+1) · ─────  Σ_k w_k  Im Σ      Σ    ε_γab v^a_nm v^b_mn (ε_m+ε_n−2μ)/(ε_n−ε_m)²
+                       2             n occ  m≠n
+```
+
+> **Master-formula prefactor = +½**, with `v[a,n,m]=<n|v_a|m>`.
+> The local moment still has the electron's negative gyromagnetic sign,
+> as the bound-state commutator check above shows. There is no extra spin
+> degeneracy factor: each spinor band is counted once.
+
+
+For an out-of-plane easy-axis monolayer (CrI₃) the physical moment is `m_z`
+(γ = z, ab = xy): `cross_z = v^x_nm v^y_mn − v^y_nm v^x_mn`. In code,
+`v^a_nm = v[a, n, m]` (bra n, ket m) so `cross_z = v[0]·v[1]ᵀ − v[1]·v[0]ᵀ`.
+
+## 4. Chemical potential and Chern dependence
+
+`μ` is set midgap by default, `μ = ½(VBM + CBM)`. For a true insulator the
+result is **independent of where μ sits in the gap iff the occupied-band Chern
+number is zero** (`dM/dμ ∝ −C`, the anomalous-Hall relation). Monolayer CrI₃
+is a quantum-anomalous-Hall *candidate*, so the `--mu-scan` diagnostic reports
+`m_z` at μ = VBM, midgap, CBM to expose any `dM/dμ ≠ 0`. On a coarse mesh the
+DFT indirect gap can come out slightly negative (band overlap across different
+k); the moment then genuinely depends on μ and the result should be read as
+under-converged in k.
+
+## 5. Spin–orbit coupling is mandatory
+
+Without SOC a collinear ferromagnet block-diagonalizes into two **spinless**
+spin channels, each obeying spinless time-reversal `H(−k) = H(k)*`. That forces
+the Berry curvature and wavepacket orbital moment to be odd in k,
+`Ω_n(−k) = −Ω_n(k)`, so the BZ integral vanishes band-by-band: **M_orb ≡ 0**.
+It is SOC that ties the orbital/k degrees of freedom to the time-reversal-
+breaking spin order. The script therefore requires `nspinor == 2` (hard error
+otherwise).
+
+## 6. Sign relative to the spin moment
+
+The formula contains no spin operator: the orbital moment's orientation
+relative to the spin is a result, not a convention. The CLI computes the
+spin moment from the same wavefunction with the same electron-charge sign,
+
+```
+m_spin = − μ_B Σ_k w_k Σ_{n occ} ⟨σ⟩_nk     (a vector; g = 2),
+```
+
+and reports `m_orb · m̂_spin` (positive = parallel), so an in-plane magnet is
+read on its own axis. htransform's totals use `g_e = 2.00232` and QE's
+magnetization axis `n̂` instead, and print both moments and their sum along
+it. The free-ion Hund's-rule expectation for Cr³⁺ (3d³) is orbital
+antiparallel to spin; crystal field and covalency can change this in the
+solid, so the computed sign is reported, not assumed.
+
+## 7. Validation and the velocity
+
+* **Velocity source.** The CLI reads the dipole producer's distributed q=0
+  DFT velocity (`velocity_only.h5` beside the WFN, authenticated against the
+  WFN fingerprint, k grid, reciprocal lattice and band manifold) or runs the
+  same band-sharded sweep (`common.mtxel_sweep.dipole_operator`) itself;
+  both are unfolded to the full BZ by the typed polar action. It refuses a
+  QP WFN: a DFT velocity divided by QP gaps is not `∂H_QP/∂k`. The QP
+  velocity is `U†(v_DFT + D_k ΔH)U` (`gw.qsgw_head.qp_velocity`), which an SC
+  run writes as `dipole_qsgw.h5` beside its `WFN_qp.h5`;
+  `python -m bandstructure.htransform --velocity dipole_qsgw.h5` on that WFN
+  forms the QP moment.
+* **Hellmann–Feynman group velocity.** The diagonal `Re⟨n|dH/dk|n⟩` of the
+  loaded velocity is compared with the band group velocity `∂ε_n/∂k`
+  (finite-differenced on the k-mesh). This validates the kinetic magnitude,
+  units and frame of a stored velocity and is insensitive to the nonlocal
+  sign: `dV_NL/dk` is almost purely off-diagonal (~900× on CrI₃).
+* **Nonlocal-velocity sign.** A direct off-diagonal finite difference of
+  `⟨m|V_NL(k)|n⟩` (ψ held fixed) equals the analytic `+dV_NL/dk` to ratio
+  +1.000, so the physical velocity is `v = p + vNL`, the dipole producer's
+  default arm (`VNL_VELOCITY_SIGN_FLIPPED = +1`). The other arm flips the
+  orbital moment (CrI₃: `+0.026` → `−0.081 μ_B`).
+* **Symmetry.** `m_x, m_y ≈ 0` for an out-of-plane ferromagnet.
+
+## Sources
+
+1. T. Thonhauser, D. Ceresoli, D. Vanderbilt, R. Resta, *Orbital Magnetization
+   in Periodic Insulators*, Phys. Rev. Lett. **95**, 137205 (2005).
+   https://doi.org/10.1103/PhysRevLett.95.137205
+2. D. Ceresoli, T. Thonhauser, D. Vanderbilt, R. Resta, *Orbital magnetization
+   in crystalline solids…*, Phys. Rev. B **74**, 024408 (2006).
+   https://doi.org/10.1103/PhysRevB.74.024408
+3. J. Shi, G. Vignale, D. Xiao, Q. Niu, *Quantum Theory of Orbital
+   Magnetization and Its Generalization to Interacting Systems*, Phys. Rev.
+   Lett. **99**, 197202 (2007). https://doi.org/10.1103/PhysRevLett.99.197202
+4. D. Xiao, M.-C. Chang, Q. Niu, *Berry phase effects on electronic
+   properties*, Rev. Mod. Phys. **82**, 1959 (2010) — orbital magnetization
+   section. https://doi.org/10.1103/RevModPhys.82.1959
+5. M. G. Lopez, D. Vanderbilt, T. Thonhauser, I. Souza, *Wannier-based
+   calculation of the orbital magnetization in crystals*, Phys. Rev. B **85**,
+   014435 (2012). https://doi.org/10.1103/PhysRevB.85.014435
+6. D. Vanderbilt, *Berry Phases in Electronic Structure Theory* (Cambridge,
+   2018), Ch. 5–6.
+
+## Metallic occupations, band colors, and the Dirac comparison (2026-09-21)
+
+`psp.orbital_response` owns the shared velocity contractions. Band colors use
+wavepacket moments before occupation weighting. Exactly degenerate individual
+bands have no gauge-independent color; the returned flags identify these
+multiplets, whose trace against external states remains meaningful.
+For finite-T Fermi-Dirac metals, the thermodynamic moment is
+`sum_kn w_k [f_n m_n + Omega_n T log(1+exp((mu-epsilon_n)/T))]`
+in Ry/Bohr units with the conversion to mu_B already included. Use the
+self-consistent fixed-N chemical potential and width, not a midgap estimate.
+The CLI's integer-nocc route is an insulator routine; htransform's totals take
+the metal's fixed-N Fermi–Dirac μ.
+
+`common.bispinor_init.apply_dirac_velocity_to_ket` applies `c alpha_i` to
+already lifted four-component kets; `c=2/alpha_fs` in Ry units. For the raw
+lift `[psi; (alpha_fs/2) sigma.p psi]`, its same-k band matrix is exactly
+`<psi|2 p_i|psi>`, by the Pauli anticommutator. The normalized RKB lift changes
+that equality. Neither a bare Dirac current nor bare DFT velocity supplies
+the nonlocal QP velocity correction. The existing covariant-link derivative
+owns that correction; omitting it must be reported as an approximation.
+A full relativistic magnetic moment also includes spin magnetization and
+cannot be relabelled as a purely orbital moment from the current alone.

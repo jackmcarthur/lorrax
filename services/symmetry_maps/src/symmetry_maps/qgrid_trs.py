@@ -1,0 +1,1121 @@
+"""The q-grid time-reversal policy — one source of truth, MEASURED.
+
+WHAT THIS MODULE OWNS
+---------------------
+Every decision the IBZ→full-BZ q unfold takes about *time reversal*:
+
+1. which spatial row each full-BZ q uses (pair coherence across q/−q),
+2. whether a q/−q pair may be composed through Θ at all,
+3. whether the one-element Θ projector fires at a self-negative q,
+4. how much anti-Θ component that projector removed (it is reported, not
+   silently discarded),
+5. and the measurement of the point-group covariance the unfold assumes
+   of the finite ISDF ζ basis.
+
+Three charge-channel producers consume it — bare ``V_q``
+(``gw/v_q_g_flat.py``), RPA ``W_q`` (``gw/screening.py``) and ladder
+``W_q`` (``gw/screening_bse.py``) — through the one adapter
+``gw.qgrid_symmetry.qgrid_trs_policy_for``, which supplies rank-0 and the
+once-per-run announcement.  ``tests/test_qgrid_trs_policy.py`` is the
+ratchet that keeps it to one entry point.
+
+WHY IT EXISTS: TRS IS MEASURED, NEVER ASSUMED
+---------------------------------------------
+The three producers used to compose q with −q through time reversal
+*unconditionally*, and to project every self-negative q row onto its
+Θ-invariant part, with no reference to whether time reversal is a symmetry
+of the wavefunctions at hand.  ``density_symmetry_check`` already MEASURES
+that from the occupied two-component DFT subspaces and publishes the verdict
+as ``WfnLoader.trs_holds`` → ``SymMaps.trs_allowed``; nothing on the q axis
+read it.
+
+On ferromagnetic CrI3 (JID 57271494) the consequence was terminal: q and
+−q are *independent* irreducible parents there, so the composition had no
+relation to fabricate, and the run died in the unfold after a 685.96-GB ζ
+fit had already completed.  Had the parents happened to coincide, the
+composition would instead have silently overwritten one independently
+solved row with the conjugate of the other — a fabricated symmetry, no
+symptom, wrong screening.
+
+So the policy has no *global-TR* branch to guess: ``trs_measured`` is a
+REQUIRED constructor argument with no default.  When it is false, the
+projector and arbitrary q/−q rewiring are no-ops.  A QE-authenticated
+magnetic-space-group operation may nevertheless be antiunitary; the policy
+accepts only the exact unitary/antiunitary rows authorized by the schema and
+refuses every other selected row.
+
+WHAT IS *NOT* A TRS STATEMENT, AND MUST NOT BE GATED ON THE VERDICT
+-------------------------------------------------------------------
+``V_{−q} = conj(V_q)`` for the charge-channel ISDF operator is NOT a
+consequence of time-reversal symmetry of the wavefunctions.  The pair
+densities fitted at −q, ``{u*_{n,k} u_{m,k−q}}``, are the complex
+conjugates of those fitted at ``+q`` with bra and ket relabelled, for any
+mean field whatsoever; ``v(|q+G|)`` is real and even in ``q+G``.  So the
+reciprocity is a statement about the conjugation-equivariance of the fit,
+it holds on a ferromagnet, and ``common.sanity.check_q_conjugate_reciprocity``
+stays armed on a TRS-broken deck.  What changes on a magnet is only that
+the relation is no longer *imposed* by the unfold: q and −q are solved
+independently, so the gate becomes an independent measurement instead of
+an identity — which is strictly more informative.
+
+THE COVARIANCE ASSUMPTION, AND WHY IT IS MEASURED HERE
+------------------------------------------------------
+``unfold_isdf_operator`` reconstructs ``V_full[q]`` from
+``V_ibz[i(q)]`` by permuting centroids and applying an umklapp phase.  For
+that to be well defined the *stored parent tile* must be invariant under
+the little group of its own q — an exact property of the continuum
+operator and only an approximate one of a finite, possibly
+ill-conditioned, ISDF fit.  It was measured at **1.240e-02** at Γ on the
+Na 8×8×8 SOC c464 deck (47 of 48 ops), where the q↔−q reciprocity gate
+simultaneously read 3.9e-17 because at a self-negative q that gate
+degenerates to "``V_q`` is real".  :func:`little_group_covariance_residual`
+is the statistic that is not blind there: it applies the unfold's OWN
+formula with an op that maps the parent to itself and asks whether the
+tile comes back.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+__all__ = [
+    "QgridTrsPolicy",
+    "build_qgrid_trs_policy",
+    "little_group_covariance_residual",
+    "project_little_group_operator",
+    "little_group_projection_is_identity",
+    "minus_q_parent_partners",
+    "self_negative_q_mask",
+    "trs_pair_coherent_unfold_sym_idx",
+    "trs_project_self_negative_q_rows",
+]
+
+
+def minus_q_parent_partners(q_irr_full_idx, irr_idx_q, sym_idx_q, *, kgrid,
+                            sym_mats_k, antiunitary, authorized_rows):
+    """The raw parent and unitary operation that carry each parent's −q.
+
+    For every raw parent ``p`` (``q_irr_full_idx[p]`` in canonical C order on
+    the unshifted ``kgrid``) return ``p'`` and an operation row ``s`` with
+
+        S_s · q(p') ≡ −q(p)   (mod the grid),   ``S_s = sym_mats_k[s]``,
+
+    so ``W_{−q(p)} = R_s[W_{q(p')}]`` with the unfold's centroid permutation
+    and umklapp phase of row ``s`` (``unfold_operator_local``). ``p'`` is the
+    table's representative of −q, ``irr_idx_q[neg]``; ``s`` is the table's row
+    ``sym_idx_q[neg]`` when that row is authorized and unitary, otherwise the
+    lowest authorized unitary row with the same image. A self-negative parent
+    (q ≡ −q) returns itself with its own table row (the identity).
+
+    The integer q action ``S_s · q_int mod grid`` is the convention of
+    ``find_irreducible_bz_points``; it is AUTHENTICATED against the whole
+    table first (every full q must be ``S_{sym_idx_q[q]}`` applied to its
+    parent), so a table built with another convention refuses here instead
+    of pairing the wrong operation.
+
+    REFUSES BY NAME when −q of a parent is reachable only through an
+    antiunitary row: an antiunitary operation maps a sample at z to −z̄,
+    which a bank of fixed supports does not hold, so there is no partner to
+    realize (``GATE minus_q_partner``).
+
+    Returns ``(partner_parent, partner_row)``, int32 arrays of length
+    ``len(q_irr_full_idx)``.
+    """
+    from .maps import q_negation_index
+
+    grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
+    n_full = int(np.prod(grid))
+    full = np.asarray(q_irr_full_idx, dtype=np.int64).reshape(-1)
+    irr = np.asarray(irr_idx_q, dtype=np.int64).reshape(-1)
+    sym = np.asarray(sym_idx_q, dtype=np.int64).reshape(-1)
+    mats = np.asarray(sym_mats_k, dtype=np.int64)
+    anti = np.asarray(antiunitary, dtype=bool).reshape(-1)
+    allowed = np.zeros(mats.shape[0], dtype=bool)
+    rows = np.asarray(authorized_rows, dtype=np.int64).reshape(-1)
+    if (grid.shape != (3,) or irr.shape != (n_full,) or sym.shape != (n_full,)
+            or mats.ndim != 3 or mats.shape[1:] != (3, 3) or anti.shape != (mats.shape[0],)
+            or np.any(rows < 0) or np.any(rows >= mats.shape[0])
+            or np.any(sym < 0) or np.any(sym >= mats.shape[0])
+            or np.any(full < 0) or np.any(full >= n_full)
+            or not np.array_equal(irr[full], np.arange(full.size))):
+        raise ValueError(
+            "GATE minus_q_partner: got: tables grid="
+            f"{grid.tolist()}, irr_idx_q={irr.shape}, sym_idx_q={sym.shape}, "
+            f"sym_mats_k={mats.shape}, antiunitary={anti.shape}, "
+            f"q_irr_full_idx={full.shape}; want: full-grid tables whose parents "
+            "are their own representatives; why: the −q partner is read from them.")
+    allowed[rows] = True
+    coords = np.stack(np.unravel_index(np.arange(n_full), tuple(grid)), axis=1)
+    images = np.einsum("qij,qj->qi", mats[sym], coords[full[irr]]) % grid
+    bad = np.flatnonzero(np.any(images != coords, axis=1))
+    if bad.size:
+        q = int(bad[0])
+        raise ValueError(
+            "GATE minus_q_partner: got: full q "
+            f"{coords[q].tolist()} (index {q}) is not sym_mats_k[{int(sym[q])}] "
+            f"applied to its parent {coords[full[irr[q]]].tolist()} "
+            f"({bad.size} of {n_full} rows disagree); want: S_s·q_int mod grid "
+            "on every row; why: the partner search uses the table's own q action.")
+    neg = np.asarray(q_negation_index(tuple(grid)), dtype=np.int64)
+    partner_parent = np.empty(full.size, dtype=np.int32)
+    partner_row = np.empty(full.size, dtype=np.int32)
+    for p, q in enumerate(full):
+        target = int(neg[q])
+        parent = int(irr[target])
+        row = int(sym[target])
+        if not allowed[row] or anti[row]:
+            hits = np.flatnonzero(allowed & ~anti & np.all(
+                (mats @ coords[full[parent]]) % grid == coords[target], axis=1))
+            if not hits.size:
+                raise ValueError(
+                    "GATE minus_q_partner: got: parent "
+                    f"{p} q={coords[q].tolist()} has −q={coords[target].tolist()} "
+                    f"only through antiunitary row {row} from parent {parent}; "
+                    "want: an authorized unitary operation S with "
+                    "S·q(parent) ≡ −q; why: an antiunitary row maps a sample at "
+                    "z to −conj(z), which the bank does not hold.")
+            row = int(hits[0])
+        partner_parent[p], partner_row[p] = parent, row
+    return partner_parent, partner_row
+
+
+def self_negative_q_mask(q_full_idx, *, kgrid) -> np.ndarray:
+    """``q ≡ −q`` (mod the mesh) for each row of ``q_full_idx``.
+
+    These are the one-element orbits of the ``q → −q`` involution — the
+    TRIM points of an even mesh, and Γ alone on a fully odd one.  They are
+    the rows a pair composition can never touch (there is no partner) and
+    the only rows the Θ projector may act on.
+    """
+    grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
+    qidx = np.asarray(q_full_idx, dtype=np.int64).reshape(-1)
+    n_full = int(np.prod(grid))
+    if np.any(qidx < 0) or np.any(qidx >= n_full):
+        raise ValueError(
+            "GATE trs_fixed_q_projector: q_full_idx got: "
+            f"{qidx.tolist()}; want: every index in [0, {n_full}); why: "
+            "the fixed-q projector can act only on named full-grid rows.")
+    coords = np.stack(np.unravel_index(qidx, tuple(grid)), axis=1)
+    return np.all((2 * coords) % grid[None, :] == 0, axis=1)
+
+
+def trs_pair_coherent_unfold_sym_idx(
+    irr_idx, sym_idx, *, kgrid, q_irr_full_idx, n_sym_spatial,
+):
+    """Choose one spatial realization for every non-TRIM q/−q pair.
+
+    THE MEASURED-TRS ARM ONLY.  Callers reach this through
+    :class:`QgridTrsPolicy`, which refuses to call it at all when the
+    density measurement says time reversal is broken.  It is public
+    because the two policy arms must be separately testable, not because a
+    driver may pick one.
+
+    A centrosymmetric crystal can map both q and −q from one irreducible
+    parent using two unrelated *spatial* rows.  That is mathematically
+    equivalent only when the operator stored in the finite ISDF basis is
+    exactly point-group covariant — the assumption
+    :func:`little_group_covariance_residual` measures, and which the Na
+    8×8×8 SOC c464 deck violates by 1.2e-2.  The scalar-Si production
+    discriminator showed the same shape: its closed 50-band wavefunction
+    subspace is covariant at 2.19e-9, while the 648-centroid fitted
+    operator is not covariant closely enough to survive the
+    ill-conditioned ζ solve, and the unrelated-coset choice converted that
+    ordinary fit error into a forbidden 9.7e-2 TRS error.
+
+    Keep one member's selected spatial row and make the other member use
+    the same row composed with time reversal.  ``unfold_isdf_operator``
+    then applies its derived conjugation rule, so q/−q reciprocity depends
+    only on Θ and not on an unrelated spatial gauge.  When every full-BZ q
+    row was solved independently there is no unfold relation to choose:
+    return the original rows unchanged.  Irreducible representatives and
+    self-negative q rows are unchanged; no value is averaged or projected.
+    """
+    grid = tuple(int(v) for v in kgrid)
+    n_full = int(np.prod(grid))
+    irr = np.asarray(irr_idx, dtype=np.int32)
+    original = np.asarray(sym_idx, dtype=np.int32)
+    n_spatial = int(n_sym_spatial)
+    if irr.shape != (n_full,) or original.shape != (n_full,):
+        raise ValueError(
+            "GATE trs_pair_unfold_map: table_shapes got: "
+            f"irr_idx={irr.shape}, sym_idx={original.shape}; want: each "
+            f"({n_full},) for kgrid={grid}; why: q/-q pairing addresses "
+            "every full-grid row.")
+    if (n_spatial <= 0 or np.any(original < 0)
+            or np.any(original >= 2 * n_spatial)):
+        lo = int(original.min()) if original.size else 0
+        hi = int(original.max()) if original.size else -1
+        raise ValueError(
+            "GATE trs_pair_unfold_map: sym_idx range got: "
+            f"[{lo}, {hi}] with n_sym_spatial={n_spatial}; want: every row "
+            f"in [0, {2 * n_spatial}); why: each unfold row must name an "
+            "authenticated unitary or antiunitary action.")
+
+    reps = set(int(v) for v in np.asarray(q_irr_full_idx).reshape(-1))
+    out = original.copy()
+    # An orbit-closed centroid set can still have no q reduction, for example
+    # when the WFN exposes only the identity spatial operation.  Every q is
+    # then a solved source row.  Rewiring q/−q would discard one independent
+    # result and the guard below correctly rejects their distinct parents;
+    # the owning policy is instead the identity map.
+    if len(reps) == n_full:
+        return out
+    # The q-axis convention is owned by maps.q_negation_index; this policy
+    # consumes the table instead of carrying another C-order spelling.
+    from .maps import q_negation_index
+    neg = q_negation_index(grid)
+    for iq, jq_value in enumerate(neg):
+        jq = int(jq_value)
+        if iq >= jq:
+            continue
+        if int(irr[iq]) != int(irr[jq]):
+            raise ValueError(
+                "GATE trs_pair_unfold_map: q_pair_parents got: "
+                f"q={iq}->{int(irr[iq])}, -q={jq}->{int(irr[jq])}; want: "
+                "one shared irreducible parent; why: a TRS composition is "
+                "valid only "
+                "for one solved wedge row; do not fabricate reciprocity "
+                "across two independently solved rows.  On a deck whose "
+                "DFT reference check says TIME REVERSAL IS BROKEN this is the "
+                "expected table and the policy must not have reached here: "
+                "build QgridTrsPolicy with trs_measured=False so the rows "
+                "stay independent.")
+
+        if iq in reps:
+            source = iq
+        elif jq in reps:
+            source = jq
+        elif (original[iq] < n_spatial) != (original[jq] < n_spatial):
+            source = iq if original[iq] < n_spatial else jq
+        else:
+            source = iq
+        partner = jq if source == iq else iq
+        source_row = int(original[source])
+        out[partner] = (source_row + n_spatial
+                        if source_row < n_spatial
+                        else source_row - n_spatial)
+    return out
+
+
+def trs_project_self_negative_q_rows(operator, q_full_idx, *, kgrid):
+    """Apply the one-element Θ group projector at ``q == −q``.
+
+    THE MEASURED-TRS ARM ONLY — see
+    :meth:`QgridTrsPolicy.project_fixed_q`, which is the entry point and which
+    also returns the residual this removes.
+
+    Pair-coherent unfold handles every two-element q/−q orbit without
+    changing a solved value.  A TRIM row is a one-element orbit, so there
+    is no partner row from which to reconstruct it: the exact constraint
+    is ``A_q = conj(A_q)`` in the restart convention.  A finite band sum
+    or an ill-conditioned ISDF backsolve can leave a small anti-Θ
+    component even when the non-TRIM pairs are exact.  Remove only that
+    component with the unique group average ``(A + conj(A))/2``.
+
+    ``operator`` remains distributed exactly as supplied; this is an
+    elementwise operation and performs no host gather.  ``q_full_idx``
+    names the full-grid point represented by each leading-axis row, so the
+    helper works on either an irreducible wedge or the full BZ.
+    """
+    import jax.numpy as jnp
+
+    fixed = self_negative_q_mask(q_full_idx, kgrid=kgrid)
+    n_rows = int(fixed.size)
+    if int(operator.shape[0]) != n_rows:
+        raise ValueError(
+            "GATE trs_fixed_q_projector: operator_q_extent got: "
+            f"{int(operator.shape[0])}; want: q_full_idx extent={n_rows}; "
+            "why: the projector mask must address every operator q row.")
+    mask = jnp.asarray(fixed).reshape((n_rows,) + (1,) * (operator.ndim - 1))
+    projected = 0.5 * (operator + jnp.conj(operator))
+    return jnp.where(mask, projected, operator)
+
+
+# Compiled kernels are cached on nothing but their own identity, because
+# ``jax.jit`` keys on the FUNCTION OBJECT: a fresh ``@jax.jit`` inside a
+# helper recompiles on every call, which on a self-consistency loop is one
+# compile per iteration.  Same reason ``common.sanity`` caches ``_herm_stats``
+# and ``_negq_stats``.  Everything that varies (the mask, the permutation,
+# the phase) is a traced ARGUMENT, so one module serves every call at a
+# given shape.
+_JIT_CACHE: dict = {}
+
+
+def _anti_trs_stats_fn():
+    fn = _JIT_CACHE.get("anti_trs")
+    if fn is None:
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def fn(a, mask):
+            anti = jnp.where(mask, jnp.abs(a - jnp.conj(a)), 0.0)
+            return jnp.stack([
+                jnp.max(anti).astype(jnp.float64),
+                jnp.max(jnp.abs(a)).astype(jnp.float64),
+            ])
+
+        _JIT_CACHE["anti_trs"] = fn
+    return fn
+
+
+def _fixed_q_anti_trs_residual(operator, fixed_mask):
+    """``[max|A − conj(A)| on Θ-fixed rows, max|A|]`` — one reduction.
+
+    The number the projector is about to delete.  TASTE's calibration rule
+    is that one never repairs a downstream object to make an identity
+    true; the projector is kept because at a one-element orbit it is the
+    exact group average and not a repair, but the size of what it removes
+    is evidence and is reported rather than discarded.
+    """
+    mask = np.asarray(fixed_mask).reshape(
+        (int(fixed_mask.size),) + (1,) * (operator.ndim - 1))
+    return _anti_trs_stats_fn()(operator, mask)
+
+
+def _covariance_residual_fn():
+    """``(V, p, alpha, qL, antiunitary) -> (max|V|, residual per pair)`` — unfold arithmetic.
+
+    ONE compiled module for every sampled (parent, op) pair at a given shape:
+    a ``lax.map`` over the pairs, each a fused double gather, umklapp phase and
+    reduction to one scalar, so one (μ,μ) image is live at a time and none is
+    materialised outside the sharded graph.  Eager operator-by-operator
+    arithmetic here would resolve the gather/transpose shardings by
+    all-gathering the tile onto every rank — the trap
+    ``common.sanity._herm_stats`` documents.
+    """
+    fn = _JIT_CACHE.get("covariance")
+    if fn is None:
+        import jax
+        import jax.numpy as jnp
+
+        @jax.jit
+        def fn(V, p, alpha, qL, antiunitary):
+            def one(pair):
+                p, alpha, qL, antiunitary = pair
+                phase = jnp.exp(1j * qL)
+                row = jnp.take(V, p, axis=0)
+                image = jnp.take(jnp.take(row, alpha, axis=0), alpha, axis=1)
+                image = image * (phase[:, None] * jnp.conj(phase)[None, :])
+                image = jnp.where(antiunitary, jnp.conj(image), image)
+                return jnp.max(jnp.abs(image - row)).astype(jnp.float64)
+            return (jnp.max(jnp.abs(V)).astype(jnp.float64),
+                    jax.lax.map(one, (p, alpha, qL, antiunitary)))
+
+        _JIT_CACHE["covariance"] = fn
+    return fn
+
+
+# ---------------------------------------------------------------------------
+# The covariance the unfold ASSUMES — measured, not assumed
+# ---------------------------------------------------------------------------
+
+_COVARIANCE_OPS_BUDGET = 64
+
+
+def _little_group_operations(q_full_idx, *, kgrid, sym_mats_k,
+                             active_symmetry_rows):
+    """Exact, complete stabilizers on an unshifted rectangular q mesh.
+
+    The caller supplies authenticated canonical operation rows. Reciprocal
+    matrices already contain the antiunitary minus. Integer common-denominator
+    coordinates keep the test exact also when mesh dimensions differ.
+    """
+    grid = np.asarray(kgrid)
+    reps = np.asarray(q_full_idx)
+    rotations = np.asarray(sym_mats_k)
+    active = np.asarray(active_symmetry_rows)
+    if (grid.shape != (3,) or grid.dtype.kind not in "iu"
+            or np.any(grid <= 0)):
+        raise ValueError("little-group kgrid must contain three positive integers")
+    if (reps.ndim != 1 or reps.size == 0 or reps.dtype.kind not in "iu"
+            or np.any(reps < 0) or np.any(reps >= np.prod(grid))
+            or np.unique(reps).size != reps.size):
+        raise ValueError("little-group q_full_idx must name distinct valid mesh rows")
+    if (rotations.ndim != 3 or rotations.shape[1:] != (3, 3)
+            or rotations.dtype.kind not in "iu"):
+        raise ValueError("little-group reciprocal matrices must be integer [row,3,3]")
+    if (active.ndim != 1 or active.size == 0 or active.dtype.kind not in "iu"
+            or np.unique(active).size != active.size or np.any(active < 0)
+            or np.any(active >= rotations.shape[0])):
+        raise ValueError("little-group authorized rows must be distinct valid canonical IDs")
+    denominator = int(np.lcm.reduce(grid.astype(np.int64)))
+    coords = np.stack(np.unravel_index(reps, tuple(grid)), axis=1)
+    scaled = coords * (denominator // grid)[None, :]
+    return [active[np.all(
+        (rotations[active] @ point - point) % denominator == 0, axis=1)]
+        for point in scaled]
+
+
+_LITTLE_GROUP_PROJECTORS = {}
+
+#: Streaming bytes one extra segment's dispatches cost (its sub-batch gather,
+#: scatter and loop launch); the segment planner weighs it against the tile
+#: transforms a segment saves.  An order-of-magnitude constant, not a tuning dial.
+_SEGMENT_OVERHEAD_BYTES = 64 * 2**20
+
+
+def _little_group_segments(counts, *, tile_bytes):
+    """Cheapest split of the projection steps into [lo, hi) segments.
+
+    ``counts[p]`` is parent p's little-group order.  A segment transforms the
+    parents with ``counts > lo`` for ``hi - lo`` steps (4 tile passes each); a
+    segment on a strict subset also gathers and scatters it (2 passes per
+    member) and pays one dispatch overhead.  Boundaries are the distinct
+    orders; exact dynamic programming over them.  Uniform groups keep one
+    all-parent segment (the unsegmented loop).
+    """
+    counts = np.asarray(counts, dtype=np.int64)
+    b = int(counts.size)
+    overhead = _SEGMENT_OVERHEAD_BYTES / max(int(tile_bytes), 1)
+    points = [0] + sorted({int(c) for c in counts})
+
+    def cost(lo, hi):
+        members = int(np.count_nonzero(counts > lo))
+        return 4.0*(hi - lo)*members + (0.0 if members == b else 2.0*members + overhead)
+
+    best = {0: (0.0, None)}
+    for j in range(1, len(points)):
+        best[points[j]] = min((best[points[i]][0] + cost(points[i], points[j]), points[i])
+                              for i in range(j))
+    cuts, point = [], points[-1]
+    while point:
+        cuts.append(point)
+        point = best[point][1]
+    bounds = [0] + cuts[::-1]
+    return tuple((lo, hi, tuple(int(p) for p in np.flatnonzero(counts > lo)))
+                 for lo, hi in zip(bounds[:-1], bounds[1:]))
+
+
+def little_group_projection_is_identity(q_full_idx, *, kgrid, sym_mats_k, sym_perm, L_table,
+                                        active_symmetry_rows, n_sym_spatial):
+    """Whether :func:`project_little_group_operator` is the identity on these q rows.
+
+    True exactly when every stabilizer is one authenticated identity row (identity rotation,
+    identity source map, zero wraps): the Reynolds average of one element of weight 1 is the
+    pair itself, so neither orientation reads the other.  Host metadata only.
+    """
+    rotations, perm, wraps = (np.asarray(x) for x in (sym_mats_k, sym_perm, L_table))
+    active, nsp = np.asarray(active_symmetry_rows), int(n_sym_spatial)
+    m = int(perm.shape[1])
+    identity = {int(s) for s in active if s < nsp
+                and np.array_equal(rotations[s], np.eye(3, dtype=int))
+                and np.array_equal(perm[s], np.arange(m)) and np.all(wraps[s] == 0)}
+    if not identity:
+        return False
+    stabilizers = _little_group_operations(
+        np.asarray(q_full_idx), kgrid=kgrid, sym_mats_k=rotations, active_symmetry_rows=active)
+    return all(rows.size == 1 and int(rows[0]) in identity for rows in stabilizers)
+
+
+def project_little_group_operator(
+    operator, *, transposed_partner, q_full_idx, q_irr_frac, sym_mats_k,
+    sym_perm, L_table, active_symmetry_rows, kgrid, n_sym_spatial, mesh,
+    active_mask=None,
+):
+    r"""Reynolds projection of scalar parent operators at one complex time.
+
+    Every AUTHORIZED unitary and antiunitary stabilizer of each q contributes
+    once. At the same complex time the latter transforms residue endpoints,
+    not the scalar time weight: supply ``transposed_partner = operator.T``.
+    Returns ``(average, average.T)`` in ``P(None,'x','y')``. No TRS or spatial
+    operation is inferred from the values being projected.
+
+    ``sym_perm`` and ``L_table`` are the canonical centroid source/wrap action
+    in the operator's actual (possibly orbit-packed) endpoint order. Inputs
+    must be authenticated group tables; the service checks their carrier,
+    row identities and q indexing, but does not discover a physical group.
+    Numerical arrays remain dynamic operands of a cached callable.
+
+    One fixed-shape ``fori_loop`` streams into one parent-sized accumulator.
+    The canonical permutation backend uses volume-preserving all-to-all for
+    nonlocal endpoint maps; each matrix intermediate has at most b*M*M/P
+    entries on a rank. There is no operation axis on a matrix or factor.
+    Aggregate live memory still includes the inputs and permutation scratch.
+
+    Applied pole by pole this is an average of PSD residue congruences, hence
+    preserves positivity and the real poles. It changes the symmetry-breaking
+    part of an approximate model; callers must measure that scientific change.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from jax import shard_map
+    from .maps import (_apply_unfold_phase_and_trs_local,
+                       _permute_isdf_operator_axes_local,
+                       certify_endpoint_locality)
+
+    shape = tuple(operator.shape)
+    if (len(shape) != 3 or shape[1] != shape[2]
+            or transposed_partner.shape != operator.shape
+            or transposed_partner.dtype != operator.dtype
+            or np.dtype(operator.dtype).kind != "c"):
+        raise ValueError("little-group projection requires matching complex square parent tiles")
+    b, m, _ = shape
+    qids, qfrac = np.asarray(q_full_idx), np.asarray(q_irr_frac)
+    perm, wraps = np.asarray(sym_perm), np.asarray(L_table)
+    rotations, active = np.asarray(sym_mats_k), np.asarray(active_symmetry_rows)
+    nsp = int(n_sym_spatial)
+    if (nsp < 1 or rotations.shape != (2*nsp, 3, 3)
+            or perm.shape != (2*nsp, m) or wraps.shape != (2*nsp, m, 3)
+            or perm.dtype.kind not in "iu" or wraps.dtype.kind not in "iu"):
+        raise ValueError("little-group source/wrap/reciprocal tables must cover both canonical row halves")
+    if (qids.shape != (b,) or qfrac.shape != (b, 3)
+            or not np.all(np.isfinite(qfrac))):
+        raise ValueError("little-group q metadata must address every parent tile")
+    stabilizers = _little_group_operations(
+        qids, kgrid=kgrid, sym_mats_k=rotations,
+        active_symmetry_rows=active)
+    coords = np.stack(np.unravel_index(qids, tuple(kgrid)), axis=1)
+    delta = qfrac - coords/np.asarray(kgrid)[None, :]
+    if not np.allclose(delta, np.rint(delta), rtol=0., atol=1e-12):
+        raise ValueError("little-group q_irr_frac disagrees with canonical mesh rows")
+    identity = [int(s) for s in active if s < nsp
+                and np.array_equal(rotations[s], np.eye(3, dtype=int))
+                and np.array_equal(perm[s], np.arange(m))
+                and np.all(wraps[s] == 0)]
+    if not identity or any(rows.size == 0 for rows in stabilizers):
+        raise ValueError("little-group authorized operations must include the identity")
+    mask = np.ones(m, dtype=bool) if active_mask is None else np.asarray(active_mask, dtype=bool)
+    if mask.shape != (m,):
+        raise ValueError("little-group active_mask must address the centroid carrier")
+    # Content and placement key. No JAX value enters a process-global cache.
+    key = (shape, np.dtype(operator.dtype).str, mesh, nsp, tuple(kgrid),
+           tuple((x.shape, x.dtype.str, x.tobytes()) for x in
+                 (qids, qfrac, rotations, perm, wraps, active, mask)))
+    compiled = _LITTLE_GROUP_PROJECTORS.get(key)
+    if compiled is None:
+        certificates = {axis: certify_endpoint_locality(
+            perm, mesh=mesh, mesh_axis=axis, active_mask=mask)
+            for axis in ("x", "y")}
+        px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+        if (not all(c["is_local"] for c in certificates.values())
+                and m % (px*py)):
+            raise ValueError("little-group nonlocal operator carrier must already divide Px*Py")
+        counts = np.asarray([rows.size for rows in stabilizers], dtype=np.int32)
+        steps = int(counts.max())
+        ops = np.full((steps, b), identity[0], dtype=np.int32)
+        valid = np.zeros((steps, b), dtype=np.float64)
+        for parent, rows in enumerate(stabilizers):
+            ops[:rows.size, parent] = rows
+            valid[:rows.size, parent] = 1./rows.size
+        if steps == 1 and np.isin(ops[0], identity).all():
+            # Every stabilizer is the authenticated identity alone (identity rotation, identity
+            # source map, zero wraps, weight 1): the Reynolds average IS the pair.  Return it
+            # instead of a gather-and-phase pass over both tiles (Fe 4x4x4 noncollinear: 272 ms
+            # of 5.83 s Sigma GPU time, 2 x 24.9 MB per tau per rank; syn lane 2026-10-16).
+            # Same values; only the sign of an exact zero can differ from 1*(+0j) arithmetic.
+            def identity_pair(plus, partner):
+                return plus, partner
+            compiled = _LITTLE_GROUP_PROJECTORS[key] = identity_pair
+            return compiled(operator, transposed_partner)
+        # Steps run in segments; a segment [lo, hi) transforms only the parents
+        # whose group has operations past lo.  Padding every parent to the
+        # largest group made the loop cost n_parents x max|G_q| tile transforms
+        # instead of sum|G_q| (bcc 8^3: 2784 vs 430, ~37 ms of a Na shared-pole
+        # Sigma tau node).  Each parent still adds its operations in the same
+        # order, and a parent's padded steps add exact zeros, as before; the
+        # phase is formed over all parents.
+        segments = _little_group_segments(
+            counts, tile_bytes=16*m*m//(int(mesh.shape["x"])*int(mesh.shape["y"])))
+
+        def local(plus, partner):
+            # This rank's tiles of the average and of its TRANSPOSE, the latter
+            # from the swapped pair in the same step (see
+            # _apply_unfold_phase_and_trs_local).
+            x, y = jax.lax.axis_index("x"), jax.lax.axis_index("y")
+            ml, nl = plus.shape[1:]
+            totals = (jnp.zeros_like(plus),)*2
+            # Up to 8 steps per loop trip.  One trip per step made every step
+            # its own pass over the accumulators and its own dispatch (Na 8^3
+            # at P4: 96 trips, ~10 ms of a ~30 ms Sigma tau node); unrolled,
+            # XLA fuses consecutive steps.  Each parent still adds its
+            # operations in the same order; the fused multiply-adds round
+            # differently (Na SC maps 1-2 move <= 0.13 meV, Fe 4^3 bitwise).
+            def unroll(lo, hi):
+                return max(1, min(8, hi - lo))
+
+            for lo, hi, members in segments:
+                whole = len(members) == b
+                sel = None if whole else jnp.asarray(members, dtype=jnp.int32)
+                sub_plus = plus if whole else plus[sel]
+                sub_partner = partner if whole else partner[sel]
+                # The segment's own operation and weight rows, host constants.
+                sub_ops = ops if whole else ops[:, list(members)]
+                sub_valid = valid if whole else valid[:, list(members)]
+
+                def step(index, accs, sel=sel, sub_plus=sub_plus, sub_partner=sub_partner,
+                         sub_ops=sub_ops, sub_valid=sub_valid):
+                    rows_all = jnp.asarray(ops)[index]
+                    phase = jnp.exp(2j*jnp.pi*jnp.einsum(
+                        "qi,qmi->qm", jnp.asarray(qfrac), jnp.asarray(wraps)[rows_all]))
+                    rows = jnp.asarray(sub_ops)[index]
+                    weight = jnp.asarray(sub_valid)[index]
+                    if sel is not None:
+                        phase = phase[sel]
+                    anti = rows >= nsp
+                    selected_perm = jnp.asarray(perm)[rows]
+                    left = certificates["x"]["local_perm"]
+                    right = certificates["y"]["local_perm"]
+                    phase_x = jax.lax.dynamic_slice_in_dim(phase, x*ml, ml, axis=1)
+                    phase_y = jax.lax.dynamic_slice_in_dim(phase, y*nl, nl, axis=1)
+                    out = []
+                    for transposed, acc in zip((False, True), accs):
+                        source = (jnp.where(anti[:, None, None], sub_plus, sub_partner)
+                                  if transposed else
+                                  jnp.where(anti[:, None, None], sub_partner, sub_plus))
+                        transformed = _permute_isdf_operator_axes_local(
+                            source, selected_perm, selected_perm, mesh_x=px, mesh_y=py,
+                            left_local_source_map=(None if left is None else jnp.asarray(left)[rows]),
+                            right_local_source_map=(None if right is None else jnp.asarray(right)[rows]))
+                        transformed = _apply_unfold_phase_and_trs_local(
+                            transformed, phase_x, phase_y, anti, pair_transpose=True,
+                            transposed=transposed)
+                        out.append(acc + weight[:, None, None]*transformed)
+                    return tuple(out)
+                if whole:
+                    totals = jax.lax.fori_loop(lo, hi, step, totals, unroll=unroll(lo, hi))
+                else:
+                    parts = jax.lax.fori_loop(lo, hi, step, tuple(t[sel] for t in totals),
+                                              unroll=unroll(lo, hi))
+                    # Members are sorted and unique (flatnonzero).  Unmarked,
+                    # XLA GPU expanded this overwrite into a loop of one tile
+                    # copy per member.
+                    totals = tuple(t.at[sel].set(v, indices_are_sorted=True, unique_indices=True)
+                                   for t, v in zip(totals, parts))
+            return totals
+
+        # The average's transpose is the average of the swapped pair,
+        # (T_s W)^T = T'_s(W^T, W), formed on every rank's own tile in the
+        # same step: no transpose exchange, so diagonal and off-diagonal ranks
+        # do equal work (an exchange moves the off-diagonal tiles while the
+        # diagonal ranks copy theirs and wait, claim 2954).  Bitwise the
+        # exchanged transpose when the partner is the operator's exact
+        # transpose.  Nonlocal maps route both through the same all-to-all.
+        pair = shard_map(local, mesh=mesh, in_specs=(P(None, "x", "y"),)*2,
+                         out_specs=(P(None, "x", "y"),)*2, check_vma=False)
+
+        @jax.jit
+        def project(plus, partner):
+            return pair(plus, partner)
+        compiled = _LITTLE_GROUP_PROJECTORS[key] = project
+    return compiled(operator, transposed_partner)
+
+
+def little_group_covariance_residual(
+    V_ibz,
+    *,
+    q_irr_frac,
+    q_irr_full_idx,
+    sym_mats_k,
+    sym_perm,
+    L_table,
+    kgrid,
+    n_sym_spatial,
+    active_symmetry_rows=None,
+    parents="self_negative",
+    ops_budget: int = _COVARIANCE_OPS_BUDGET,
+) -> dict:
+    """Does the stored parent tile survive its OWN little group?
+
+    THE STATISTIC THE q↔−q GATE CANNOT SEE.  ``unfold_isdf_operator``
+    reconstructs a full-BZ row as
+
+        ``V[q,μ,ν] = C_s[e^{2πi q_p·(L_{s,μ}−L_{s,ν})}
+        V_p[α_s(μ), α_s(ν)]]``
+
+    where ``C_s`` is complex conjugation for an antiunitary row and the
+    identity otherwise.
+
+    For ``s`` in the little group of ``q_p`` (``S_s q_p ≡ q_p``) that
+    formula must return ``V_p`` itself, because the reconstructed point is
+    the parent.  It is exact for the continuum operator and only
+    approximate for a finite ISDF fit, so the residual
+
+        ``max_s max_{μν} |phase·V_p[α_s μ, α_s ν] − V_p[μ,ν]| / max|V_p|``
+
+    is the whole of the assumption, stated in the unfold's own arithmetic
+    and needing no second convention.  On Na 8×8×8 SOC c464 it reads
+    **1.240e-02 at Γ** and 2.411e-02 at H, exactly where
+    ``check_q_conjugate_reciprocity`` reads 3.9e-17 and 6.4e-17.
+
+    SENSITIVITY, stated because a null here would otherwise be quoted as
+    coverage it does not have.  This sees the covariance of the STORED
+    PARENT TILES only.  It is blind to an error in the centroid
+    permutation tables themselves (they are the reference), to the Coulomb
+    kernel (a Gram defect shows identically with ``v ≡ 1``), and to
+    anything about the full-BZ rows that are not parents.
+
+    Parameters
+    ----------
+    V_ibz
+        ``(n_q_ibz, n_rmu, n_rmu)`` — the *pre-unfold* wedge, at whatever
+        sharding the producer holds.  Nothing is gathered: every op is a
+        centroid-axis double gather plus one reduction to two scalars.
+    parents
+        ``"self_negative"`` (default) restricts to the parents whose q is
+        its own negative — the rows where the reciprocity gate is blind
+        and where the defect was largest.  ``"all"`` sweeps every parent.
+    active_symmetry_rows
+        Canonical rows authorized for this reference.  Defaults to the
+        unitary first half for backward compatibility.  Typed antiunitary
+        rows use the same conjugation rule as :func:`unfold_isdf_operator`.
+    ops_budget
+        Upper bound on ``(parent, op)`` pairs actually evaluated.  When the
+        little groups are larger than this the ops are STRIDE-sampled
+        (deterministic, reproducible, and reported as
+        ``n_ops_sampled``/``n_ops_available``) rather than truncated to a
+        prefix, because a prefix would systematically favour the low-index
+        ops and the identity is always index 0.
+
+    Cost.  One centroid-axis double gather per evaluated pair — the SAME
+    operation :func:`unfold_isdf_operator` performs once per full-BZ q.
+    The default budget is therefore bounded by a fraction of the unfold
+    that immediately follows it (≤64 against 512 on an 8×8×8 mesh), and
+    nothing is gathered to the host: each pair reduces to one scalar.
+
+    Returns
+    -------
+    dict
+        ``max_rel``, ``max_abs``, ``scale``, ``worst_parent``,
+        ``worst_sym``, ``n_ops_sampled``, ``n_ops_available``,
+        ``n_parents``.  ``max_rel`` is ``nan`` when no ``(parent, op)``
+        pair other than the identity exists — an unanswerable question is
+        returned as unanswerable rather than as a pass.
+    """
+    import jax
+
+    if parents not in ("self_negative", "all"):
+        raise ValueError(
+            "little_group_covariance_residual: parents must be "
+            f"'self_negative' or 'all'; got {parents!r}.")
+    grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
+    reps = np.asarray(q_irr_full_idx, dtype=np.int64).reshape(-1)
+    n_spatial = int(n_sym_spatial)
+    perm = np.asarray(sym_perm, dtype=np.int32)
+    L_arr = np.asarray(L_table, dtype=np.float64)
+    q_frac = np.asarray(q_irr_frac, dtype=np.float64)
+    S_all = np.asarray(sym_mats_k, dtype=np.int64)
+    if active_symmetry_rows is None:
+        active = np.arange(n_spatial, dtype=np.int32)
+    else:
+        active = np.asarray(active_symmetry_rows, dtype=np.int32)
+    if (active.ndim != 1 or active.size < 1
+            or np.unique(active).size != active.size
+            or np.any(active < 0) or np.any(active >= 2 * n_spatial)):
+        raise ValueError(
+            "little_group_covariance_residual: active_symmetry_rows must be "
+            f"a nonempty unique subset of [0,{2 * n_spatial}); got "
+            f"{active.tolist()}.")
+    if np.any(active >= S_all.shape[0]):
+        raise ValueError(
+            "little_group_covariance_residual: active symmetry row is not "
+            f"present in sym_mats_k with {S_all.shape[0]} rows.")
+    if (perm.shape[0] <= int(active.max())
+            or L_arr.shape[0] <= int(active.max())):
+        raise ValueError(
+            "little_group_covariance_residual: centroid source/wrap tables "
+            "do not cover every active symmetry row.")
+    if np.any(np.sort(perm[active], axis=1) != np.arange(perm.shape[1])):
+        raise ValueError("little_group_covariance_residual: requested centroid action is unavailable or not bijective")
+    S = S_all[active]
+
+    if int(V_ibz.shape[0]) != int(reps.size):
+        raise ValueError(
+            "little_group_covariance_residual: V_ibz has "
+            f"{int(V_ibz.shape[0])} q rows but q_irr_full_idx names "
+            f"{int(reps.size)}.  Pass the PRE-unfold wedge.")
+    if int(perm.shape[-1]) != int(V_ibz.shape[-1]):
+        raise ValueError(
+            "little_group_covariance_residual: sym_perm centroid extent "
+            f"{int(perm.shape[-1])} != V_ibz extent {int(V_ibz.shape[-1])}; "
+            "both carry the μ pad from _resolve_ibz_q_list.")
+
+    coords = np.stack(np.unravel_index(reps, tuple(grid)), axis=1)
+    if parents == "self_negative":
+        keep = np.flatnonzero(np.all((2 * coords) % grid[None, :] == 0, axis=1))
+    else:
+        keep = np.arange(reps.size, dtype=np.int64)
+
+    # Little group of each retained parent, in INTEGER mesh coordinates so
+    # the ``≡ mod grid`` is exact (no float tolerance anywhere).
+    stabilizers = _little_group_operations(
+        reps, kgrid=grid, sym_mats_k=S_all, active_symmetry_rows=active)
+    pairs: list[tuple[int, int]] = []
+    for p in keep:
+        for row in stabilizers[int(p)]:
+            s = int(row)
+            is_identity = (
+                s < n_spatial
+                and np.array_equal(S_all[s], np.eye(3, dtype=np.int64))
+                and np.array_equal(perm[s], np.arange(perm.shape[1]))
+                and np.all(L_arr[s] == 0))
+            if is_identity:
+                continue
+            pairs.append((int(p), s))
+    n_available = len(pairs)
+    if n_available == 0:
+        return {
+            "max_rel": float("nan"), "max_abs": float("nan"),
+            "scale": float("nan"), "worst_parent": -1, "worst_sym": -1,
+            "n_ops_sampled": 0, "n_ops_available": 0,
+            "n_parents": int(keep.size),
+        }
+    budget = max(1, int(ops_budget))
+    if n_available > budget:
+        stride = int(np.ceil(n_available / budget))
+        pairs = pairs[::stride][:budget]
+
+    # Host tables in, one program and one transfer out for all pairs.
+    ps, ss = (np.asarray(v) for v in zip(*pairs))
+    qL = np.stack([2.0 * np.pi * (L_arr[s] @ q_frac[p]) for p, s in pairs])
+    scale, devs = jax.device_get(_covariance_residual_fn()(
+        V_ibz, ps.astype(np.int32), perm[ss], qL, ss >= n_spatial))
+    scale = float(scale)
+    worst_abs, worst_parent, worst_sym = -1.0, -1, -1
+    for (p, s), dev in zip(pairs, devs.tolist()):
+        if dev > worst_abs:
+            worst_abs, worst_parent, worst_sym = dev, p, s
+    return {
+        "max_rel": (worst_abs / scale) if scale > 0.0 else worst_abs,
+        "max_abs": worst_abs,
+        "scale": scale,
+        "worst_parent": int(worst_parent),
+        "worst_sym": int(worst_sym),
+        "n_ops_sampled": len(pairs),
+        "n_ops_available": int(n_available),
+        "n_parents": int(keep.size),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The policy object every driver consumes
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class QgridTrsPolicy:
+    """What time reversal is allowed to do to this deck's q axis.
+
+    Built by :func:`build_qgrid_trs_policy` (or, in the monorepo, by the
+    announcing adapter ``gw.qgrid_symmetry.qgrid_trs_policy_for``).  A
+    driver reads :attr:`unfold_sym_idx` and calls :meth:`project_fixed_q`;
+    it takes NO time-reversal decision of its own and has no ``if trs:``
+    branch left to get wrong.
+
+    ``trs_measured`` is the verdict ``density_symmetry_check`` obtained
+    from the two-component DFT reference check, arriving through
+    ``SymMaps.trs_allowed``.  It has no default anywhere on this path.
+    """
+
+    trs_measured: bool
+    kgrid: tuple[int, int, int]
+    n_sym_spatial: int
+    unfold_sym_idx: np.ndarray
+    self_negative_q: np.ndarray
+    n_pair_rewired: int
+    context: str = ""
+    _selected_sym_idx: np.ndarray = field(default=None, repr=False)
+    _active_symmetry_rows: np.ndarray = field(default=None, repr=False)
+
+    @property
+    def n_self_negative(self) -> int:
+        return int(np.count_nonzero(self.self_negative_q))
+
+    def project_fixed_q(self, operator, q_full_idx, *,
+                        transposed_partner=None, measure=True):
+        """``(operator, removed)`` — the Θ projector, and what it removed.
+
+        On a measured-TRS deck this applies the one-element group average
+        at every ``q ≡ −q`` row and returns the anti-Θ residual it deleted
+        so the caller can print it: a projector that silently absorbs a
+        1e-2 defect is the "instrument that measures and proceeds" failure
+        wearing a repair's clothes.
+
+        With ``transposed_partner`` (same shape, dtype and rectangular
+        sharding as ``operator``), use the pair-transpose average at the
+        same complex time instead. No transpose or conjugation is formed.
+        ``measure=True`` returns a device vector of per-row Frobenius
+        ``||W-W^T||/||W||`` (zero on non-fixed rows); ``False`` omits the
+        reduction and is suitable inside a collective-free shard_map.
+        This additive path is JIT-compatible; q_full_idx is host metadata.
+
+        On a TRS-BROKEN deck it is the identity and ``removed`` is
+        ``None``.  There is no warrant for the projection there: the rows
+        were solved independently and Θ is not a symmetry of this mean
+        field, so ``V_q`` at a TRIM point is whatever the fit produced and
+        the reciprocity gate should see it.
+        """
+        # At complex time, Θ acts on the residue endpoints, not on the
+        # time weight. The supplied partner is W^T at the SAME tau.
+        if transposed_partner is not None:
+            import jax.numpy as jnp
+
+            if (transposed_partner.shape != operator.shape
+                    or transposed_partner.dtype != operator.dtype):
+                raise ValueError("pair-transpose partner must match operator shape/dtype")
+            fixed = self_negative_q_mask(q_full_idx, kgrid=self.kgrid)
+            if int(operator.shape[0]) != int(fixed.size):
+                raise ValueError("pair-transpose q_full_idx must address every operator row")
+            if not self.trs_measured or not np.any(fixed):
+                return operator, None
+            mask = jnp.asarray(fixed).reshape((-1,) + (1,) * (operator.ndim - 1))
+            out = jnp.where(mask, 0.5 * (operator + transposed_partner), operator)
+            if not measure:
+                return out, None
+            axes = tuple(range(1, operator.ndim))
+            dev = jnp.sqrt(jnp.sum(jnp.abs(operator - transposed_partner)**2, axis=axes))
+            scale = jnp.sqrt(jnp.sum(jnp.abs(operator)**2, axis=axes))
+            relative = dev / jnp.where(scale > 0, scale, 1.0)
+            return out, jnp.where(jnp.asarray(fixed), relative, 0.0)
+        if not self.trs_measured:
+            return operator, None
+        fixed = self_negative_q_mask(q_full_idx, kgrid=self.kgrid)
+        if int(operator.shape[0]) != int(fixed.size):
+            raise ValueError(
+                "GATE trs_fixed_q_projector: operator_q_extent got: "
+                f"{int(operator.shape[0])}; want: q_full_idx extent="
+                f"{int(fixed.size)}; why: the projector mask must address "
+                "every operator q row.")
+        if not np.any(fixed):
+            return operator, None
+        import jax
+
+        stats = _fixed_q_anti_trs_residual(operator, fixed)
+        out = trs_project_self_negative_q_rows(
+            operator, q_full_idx, kgrid=self.kgrid)
+        dev, scale = (float(v) for v in np.asarray(jax.device_get(stats)))
+        removed = (dev / scale) if scale > 0.0 else dev
+        return out, removed
+
+    def measure_covariance(self, V_ibz, **kwargs) -> dict:
+        """:func:`little_group_covariance_residual` with the policy's grid.
+
+        For a globally TR-invariant reference, unitary rows suffice: pure
+        TR plus those rows generates the antiunitary half, and the separate
+        fixed-q statistic measures the pure-TR residual.  When global TR is
+        broken, the sweep instead uses the exact schema-authorized mixed
+        unitary/antiunitary row set, including conjugation. Only available
+        centroid actions enter this diagnostic; the closure announcement
+        identifies partial-group coverage, without changing the physical group.
+        """
+        kwargs.setdefault("kgrid", self.kgrid)
+        kwargs.setdefault("n_sym_spatial", self.n_sym_spatial)
+        covariance_rows = (
+            np.arange(self.n_sym_spatial, dtype=np.int32)
+            if self.trs_measured else self._active_symmetry_rows)
+        available = np.all(np.asarray(kwargs["sym_perm"]) >= 0, axis=1)
+        kwargs.setdefault("active_symmetry_rows", covariance_rows[available[covariance_rows]])
+        return little_group_covariance_residual(V_ibz, **kwargs)
+
+    def announcement(self) -> str:
+        where = f" [{self.context}]" if self.context else ""
+        if not self.trs_measured:
+            n_typed_anti = int(np.count_nonzero(
+                np.asarray(self._selected_sym_idx) >= self.n_sym_spatial))
+            return (
+                f"q-grid TRS policy{where}: the DFT reference check says "
+                f"GLOBAL TIME REVERSAL IS BROKEN for this WFN.  Every "
+                f"full-BZ q row keeps the typed QE parent it was solved "
+                f"from ({n_typed_anti} rows use operation-specific "
+                f"antiunitary actions); no arbitrary q/-q "
+                f"composition and no fixed-q TRS projector is applied.  "
+                f"q<->-q reciprocity of V/W is still gated — on this deck it "
+                f"is an independent measurement rather than an identity of "
+                f"the unfold.")
+        return (
+            f"q-grid TRS policy{where}: time reversal MEASURED to hold; "
+            f"{int(self.n_pair_rewired)} of {int(self.unfold_sym_idx.size)} "
+            f"q rows use a TRS-composed partner so q and -q share one "
+            f"spatial realization, and {self.n_self_negative} self-negative "
+            f"q rows carry the one-element TRS projector.")
+
+    @property
+    def announce_key(self) -> str:
+        return (f"qgrid_trs_policy:{int(bool(self.trs_measured))}:"
+                f"{self.kgrid}:{self.context}")
+
+
+def build_qgrid_trs_policy(
+    *,
+    trs_measured: bool,
+    irr_idx_q,
+    sym_idx_q,
+    q_irr_full_idx,
+    kgrid,
+    n_sym_spatial: int,
+    active_symmetry_rows=None,
+    context: str = "",
+) -> QgridTrsPolicy:
+    """Resolve the q-axis time-reversal policy for one centroid set.
+
+    ``trs_measured`` is keyword-only and has NO DEFAULT: a caller that has
+    not consulted the density measurement gets a ``TypeError`` rather than
+    the historically permissive branch.  This is the same shape the tree
+    already uses for ``trs_reference`` (13 explicit call sites, no
+    default) and for the same reason — the wrong branch is invisible in
+    the output.
+    """
+    grid = tuple(int(v) for v in kgrid)
+    n_full = int(np.prod(grid))
+    selected = np.asarray(sym_idx_q, dtype=np.int32)
+    n_spatial = int(n_sym_spatial)
+    if selected.shape != (n_full,):
+        raise ValueError(
+            "GATE trs_pair_unfold_map: sym_idx_q.shape got: "
+            f"{selected.shape}; want: ({n_full},) for kgrid={grid}; why: "
+            "q/-q pairing addresses every full-grid row.")
+
+    if active_symmetry_rows is None:
+        active = np.arange(
+            2 * n_spatial if bool(trs_measured) else n_spatial,
+            dtype=np.int32)
+    else:
+        active = np.asarray(active_symmetry_rows, dtype=np.int32)
+    if (active.ndim != 1 or active.size < 1
+            or np.unique(active).size != active.size
+            or np.any(active < 0) or np.any(active >= 2 * n_spatial)):
+        raise ValueError(
+            "GATE trs_active_rows: active_symmetry_rows got: "
+            f"{active.tolist()}; want: a nonempty unique subset of "
+            f"[0, {2 * n_spatial}); why: the TRS policy may select only "
+            "authenticated unitary or antiunitary actions.")
+
+    if not bool(trs_measured):
+        # No guard, no branch, no projector: on a magnetic deck the policy
+        # simply contains no time-reversal operation.  The one thing left
+        # to check is that the TABLES agree with the VERDICT — a Θ row in
+        # ``sym_idx_q`` means the wedge was reduced using a symmetry the
+        # reference verdict says is absent, and the outcome is a refusal
+        # rather than an unfold that conjugates a magnetic wavefunction.
+        offenders = np.flatnonzero(~np.isin(selected, active))
+        if offenders.size:
+            raise ValueError(
+                "GATE trs_measured_vs_tables: the reference verdict says "
+                "global time reversal is BROKEN for this WFN, but the "
+                f"q-grid symmetry table selects unauthorized rows at "
+                f"{offenders.size} of {n_full} q "
+                f"(first at q={int(offenders[0])}, row "
+                f"{int(selected[offenders[0]])}; active rows are "
+                f"{active.tolist()}).  Build SymMaps from the loader that "
+                "carries both the DFT-reference verdict and authenticated "
+                "QE operation typing; do not pass hand-built tables.")
+        return QgridTrsPolicy(
+            trs_measured=False, kgrid=grid, n_sym_spatial=n_spatial,
+            unfold_sym_idx=selected.copy(),
+            self_negative_q=self_negative_q_mask(
+                np.arange(n_full), kgrid=grid),
+            n_pair_rewired=0, context=context,
+            _selected_sym_idx=selected.copy(),
+            _active_symmetry_rows=active.copy())
+
+    coherent = trs_pair_coherent_unfold_sym_idx(
+        irr_idx_q, selected, kgrid=grid, q_irr_full_idx=q_irr_full_idx,
+        n_sym_spatial=n_spatial)
+    return QgridTrsPolicy(
+        trs_measured=True, kgrid=grid, n_sym_spatial=n_spatial,
+        unfold_sym_idx=coherent,
+        self_negative_q=self_negative_q_mask(np.arange(n_full), kgrid=grid),
+        n_pair_rewired=int(np.count_nonzero(coherent != selected)),
+        context=context, _selected_sym_idx=selected.copy(),
+        _active_symmetry_rows=active.copy())

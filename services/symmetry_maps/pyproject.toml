@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symmetry_maps"
+version = "0.1.0"
+description = "Crystal symmetry tables, unfolds, orbit maps, and the two-component DFT time-reversal check"
+requires-python = ">=3.12"
+
+# ``psp`` and ``file_io`` are not dependencies. The 2c reference check uses
+# raw coefficient slabs supplied by the loader and NumPy overlaps.
+# lxkit is the shared foundation (Gate/probe vocabulary/jax-version shims);
+# this package reaches it through its test tier today and depends on it the
+# same way distrib_la does.  jax is the substrate the unfolds are written
+# in — `unfold_isdf_operator` is a `shard_map` over an ('x','y') mesh — and numpy is
+# the substrate the tables are: `SymMaps` builds them eagerly on the host.
+dependencies = ["lxkit", "jax", "numpy"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0.0", "numpy"]
+# `qirr_store` is the ONE module here that opens a file, and h5py is
+# declared as an EXTRA rather than a runtime dependency so that the
+# statement above stays true: an installed symmetry_maps still imports on
+# a machine with no h5py and still answers every table question from
+# arrays.  The module imports h5py lazily, inside the functions that open
+# the file, and `test_symmetry_maps_import_isolation.py` measures that
+# `import symmetry_maps` leaves h5py out of `sys.modules` even with the
+# store on the public API.
+store = ["h5py"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The SAME two markers the monorepo registers.  Declared in both places on
+# purpose: `pytest services/symmetry_maps/tests` from the monorepo root
+# picks THIS file as its rootdir config (it is the nearest pyproject.toml
+# above the argument), so a service that only registered them upstairs
+# emits PytestUnknownMarkWarning on exactly the invocation the charter
+# calls its standalone one.
+markers = [
+    "services: a standalone service's own suite, staged into the main one",
+    "symmetry_maps: the symmetry_maps service suite",
+]
