@@ -415,8 +415,9 @@ def validate_dense_h_inputs(
     # ---- the dense matrices against the one device budget (warn only) ----
     need = dense_h_bytes(n_basis_max)
     if need > float(budget_bytes):
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"dense H_k (N = {int(n_basis_max)})", need, budget_bytes)
+        from lxkit import memory
+        memory.admit(f"dense H_k (N = {int(n_basis_max)})",
+                     memory.priced(need, "closed form"), budget_bytes)
 
     return validate_operator_inputs(pseudos, crystal, sys_dim=int(sys_dim),
                                     caller="dense_h")

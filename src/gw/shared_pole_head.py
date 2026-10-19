@@ -72,16 +72,21 @@ def _gamma_gemm_route(mesh, b_shape, budget_bytes):
     ``budget_bytes`` is the same on every rank, so is the route; the provider
     is ``panel_matmul``, an XLA program that opens no vendor context."""
     import distrib_la
-    from common.gpu_utils import admit_local
+    from lxkit import memory
     q, n, k = (int(v) for v in b_shape)
     ranks = int(mesh.size)
     local = -(-q // ranks)
     shapes = ((local, n, k), (local, k, n), (local, n, n))
     fits = distrib_la.fits_local(SimpleNamespace(mesh=mesh), "gemm", shapes, np.complex128,
                                  int(budget_bytes), batch=q)
-    if admit_local(f"shared-pole head Gamma GEMM {q} x {n} x {k}",
-                   16 * sum(int(np.prod(s)) for s in shapes), int(budget_bytes), fits=fits,
-                   distributed_bytes=-(-16 * q * (2 * n * k + n * n) // ranks), provider=False):
+    # The staged route runs where distrib_la.fits_local says (its workspace and gathered cap).
+    staged = memory.priced(16 * sum(int(np.prod(s)) for s in shapes), "whole matrices per rank",
+                           term="operands")
+    faces = memory.priced(0, "A, B and D faces", term="operands",
+                          spread=16 * q * (2 * n * k + n * n), ranks=ranks)
+    if memory.admit(f"shared-pole head Gamma GEMM {q} x {n} x {k}",
+                    (("staged", staged, int(budget_bytes) if fits else 0),
+                     ("faces", faces)), int(budget_bytes)) == "staged":
         return "off", distrib_la.ROUTE_BATCH_RESHARD
     return "auto", "auto"
 
@@ -266,9 +271,9 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         if ledger.U_bytes_per_rank != unit:
             raise ValueError("GATE shared_pole_head_capacity: store/current-map geometry mismatch")
         if projection_bytes > logical:
-            from common.gpu_utils import warn_over_budget
-            warn_over_budget("shared-pole head Gamma projection (all-P logical bound)",
-                             projection_bytes, logical)
+            from lxkit import memory
+            memory.admit("shared-pole head Gamma projection (all-P logical bound)",
+                         memory.priced(projection_bytes, "closed form"), logical)
         iq = int(parents[0])
         realize = shared_pole_operator_realizer(meta, header,
             q_full_idx=np.asarray([0]), mesh_xy=mesh_xy)

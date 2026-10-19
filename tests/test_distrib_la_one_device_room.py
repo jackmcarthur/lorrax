@@ -2,7 +2,7 @@
 
 ``one_device`` holds whole matrices on a rank.  A caller that hands
 ``distributed`` a room (``plan(budget_bytes=)``) has found that whole matrices
-per rank do not fit it (``common.gpu_utils.admit_local``, memory-model.md#routes),
+per rank do not fit it (``lxkit.memory.admit``, memory-model.md#routes),
 so the size route takes ``one_device`` only where ONE whole matrix's priced
 program (``distrib_la._one_device.one_device_bytes``) fits that room; otherwise
 the leg's library runs.  Without a room the route is unchanged; on CUDA (no size

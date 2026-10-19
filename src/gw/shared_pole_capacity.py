@@ -235,7 +235,7 @@ def face_eigh_room(admission, held=0, *, stage):
     ``held`` what is live beside it that the row does not hold: the receipt's
     upper bound on the factors every parent keeps. Both are shape prices,
     so every rank agrees on the room. It is floored to a whole GiB at or above 1 GiB and
-    exact below (``common.gpu_utils.room_bucket``).
+    exact below (``lxkit.memory.bucket``).
     """
     # ponytail: the face programs are keyed on the plan, and so on this
     # floored room; a room that crosses a GiB between SC maps recompiles the
@@ -243,9 +243,9 @@ def face_eigh_room(admission, held=0, *, stage):
     # tuple (route, matrices per rank, rounds) instead of the room.
     available = int(admission['available_device_bytes_per_rank'])
     priced = int(admission['aggregate_bytes_per_rank']) + int(held)
-    from common.gpu_utils import room_bucket
+    from lxkit import memory
     from distrib_la import room_or_exhausted
-    return room_or_exhausted(room_bucket(available - priced), stage=stage, priced_bytes=priced,
+    return room_or_exhausted(memory.bucket(available - priced), stage=stage, priced_bytes=priced,
                              available_bytes=available)
 
 
@@ -354,8 +354,8 @@ class ConstructorCapacity:
 
     def plan(self, side=None, *, phase=None, sample_batch=1,
              selection_faces=None, eigen_side=None, cross_original_sides=None,
-             padding_output_bytes_per_rank=0):
-        """Admit this phase's actual live set before allocating it.
+             padding_output_bytes_per_rank=0, runs_in=None):
+        """Admit this phase's actual live set before allocating it, priced in ``runs_in``.
 
         ``side`` is the pencil side this price is for; omit it to reprice the
         side already in hand.
@@ -371,7 +371,7 @@ class ConstructorCapacity:
                                    cross_original_sides=cross_original_sides,
                                    padding_output_bytes_per_rank=padding_output_bytes_per_rank)
         self._workspace = sum(native.values())
-        row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
+        row = self._reserve("constructor.plan", price["resident_bytes_per_rank"], runs_in)
         row['execution'] = self.execution
         return dict(row, price=price, native_workspace=dict(native))
 
@@ -460,9 +460,9 @@ class ConstructorCapacity:
                             sum(_shard_bytes(a) for a in unique.values()))
         self._ledger.live_stages = (*self._upstream, row["stage"])
 
-    def _reserve(self, kind, resident_bytes_per_rank):
+    def _reserve(self, kind, resident_bytes_per_rank, runs_in=None):
         return self._ledger.reserve(
             f"{kind}.{len(self._ledger.entries)}",
             resident_bytes_per_rank=resident_bytes_per_rank,
             workspace_bytes_per_rank=self._workspace,
-            concurrent_with=self._upstream)
+            concurrent_with=self._upstream, runs_in=runs_in)

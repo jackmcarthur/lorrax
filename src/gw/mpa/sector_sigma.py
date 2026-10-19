@@ -325,7 +325,7 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     # A static node is priced in its caller's section (exchange, static COHSEX, W∞ − V).
     label = "Sigma static" if static else "Sigma tau"
     memory.book(memory.priced(price["new"],
-                              f"{label} {keys[0]}, {len(windows)} row pass(es)"),
+                              f"{label} {keys[0]}, {len(windows)} row pass(es)", increment=True),
                 stage=None if static else "sigma.tau_sweep")
     if jax.process_index() == 0:
         print(f"{label} stream {''.join('CT'[f] for f in (int(lefts != (0,)), int(rights != (0,))))}: "

@@ -905,7 +905,7 @@ def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
 
     The room cap is the capacity half of the route: ``one_device`` holds whole
     matrices on a rank, exactly what a caller that hands ``distributed`` a room
-    has found does not fit (``common.gpu_utils.admit_local``, memory-model.md#routes).
+    has found does not fit (``lxkit.memory.admit``, memory-model.md#routes).
     A shape price against a caller value every rank shares: no exchange, no sync."""
     platform = mesh_platform(mesh_xy)
     bound = one_device_max_n(op, platform, room)
