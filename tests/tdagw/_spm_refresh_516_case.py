@@ -213,27 +213,26 @@ def main():
         return hits[0] if hits else None
 
     def w_sites_cmp(path_a, path_b):
-        """W^c of model b against model a at a's recipe sites: max over q of ||W_b - W_a||_F / ||W_a||_F.
+        """W^c of model b against model a at a's recipe sites: per site the max over q of ||W_b - W_a||_F / ||W_a||_F.
 
         Ordered store (header normalization, scripts/sv3_host.py): W^c(q, z) = sum_j C_j C_j^H /
-        (2 W_j (z - W_j)) - sum_j conj(C_j(-q)) C_j(-q)^T / (2 W_j(-q) (z + W_j(-q))).  Rank 0, on
-        its own device; per site role (fit / held) the max over q and the site of the max.
+        (2 W_j (z - W_j)) - sum_j conj(C_j(-q)) C_j(-q)^T / (2 W_j(-q) (z + W_j(-q))).  Every rank, host
+        NumPy only (no device program: a rank-0-only device op deadlocks the runtime's compile
+        agreement), the q rows split over the processes and gathered to every rank.
         """
-        if not rank0 or path_a is None or path_b is None:
-            return None
-        import jax.numpy as jnp
+        from jax.experimental import multihost_utils
         from symmetry_maps import q_negation_index
         t1 = time.perf_counter()
-        dev = jax.local_devices()[0]
+        have = np.asarray([float(path_a is not None and path_b is not None)])
+        if not np.all(np.asarray(multihost_utils.process_allgather(have))):
+            return None
 
-        def load(path):
+        def header(path):
             with h5py.File(path, "r") as f:
                 raw = f["header_json"][()]
-                hdr = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
-                K = np.asarray(hdr["K"], np.int64)
-                return hdr, K, f["poles2_ry2"][()], f["factor"][()]
-        ha, Ka, la, Ca = load(path_a)
-        hb, Kb, lb, Cb = load(path_b)
+            return json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+        ha, hb = header(path_a), header(path_b)
+        Ka, Kb = np.asarray(ha["K"], np.int64), np.asarray(hb["K"], np.int64)
         rec = ha["recipe"]
         codes = rec["role_codes"]
         z = np.array([complex(d["real"], d["imag"]) for d in rec["z_ry"]])
@@ -241,31 +240,31 @@ def main():
         fit = np.isin(role, [codes["line"], codes["imaginary"]])
         held = np.isin(role, [codes["held_line"], codes["held_imaginary"]])
         keep = fit | held
+        zk, fk = z[keep], fit[keep]
+        nq = int(len(Ka))
         neg = np.asarray(q_negation_index((6, 6, 1)))
-
-        def w_all(K, lam, C, q):
-            om = jnp.sqrt(jax.device_put(np.asarray(lam[q, :K[q]], np.float64), dev))
-            Cq = jax.device_put(np.asarray(C[q, :, :, :K[q]]).reshape(-1, int(K[q])), dev)
-            p = int(neg[q])
-            omm = jnp.sqrt(jax.device_put(np.asarray(lam[p, :K[p]], np.float64), dev))
-            Cm = jax.device_put(np.asarray(C[p, :, :, :K[p]]).reshape(-1, int(K[p])), dev)
-            out = []
-            for zz in z[keep]:
-                a_ = 1.0 / (2.0 * om * (zz - om))
-                b_ = 1.0 / (2.0 * omm * (zz + omm))
-                out.append((Cq * a_) @ Cq.conj().T - (Cm.conj() * b_) @ Cm.T)
-            return out
-        worst = dict(fit=0.0, held=0.0)
-        per_q = []
-        for q in range(int(la.shape[0])):
-            wa, wb = w_all(Ka, la, Ca, q), w_all(Kb, lb, Cb, q)
-            rel = [float(jnp.linalg.norm(y - x) / jnp.linalg.norm(x)) for x, y in zip(wa, wb)]
-            per_q.append(max(rel))
-            for r_, f_ in zip(rel, fit[keep]):
-                k_ = "fit" if f_ else "held"
-                worst[k_] = max(worst[k_], r_)
-        return dict(max_rel_fit=worst["fit"], max_rel_held=worst["held"], per_q_max=per_q,
-                    n_sites=int(keep.sum()), K=[[int(Ka.min()), int(Ka.max())], [int(Kb.min()), int(Kb.max())]],
+        rel = np.zeros((nq, len(zk)))
+        with h5py.File(path_a, "r") as fa, h5py.File(path_b, "r") as fb:
+            def load(f, K, q):
+                om = np.sqrt(np.asarray(f["poles2_ry2"][q, :K[q]], np.float64))
+                return om, np.asarray(f["factor"][q, :, :, :K[q]]).reshape(-1, int(K[q]))
+            for q in range(jax.process_index(), nq, jax.process_count()):
+                p = int(neg[q])
+                (oa, Ca), (ma, Da) = load(fa, Ka, q), load(fa, Ka, p)
+                (ob, Cb), (mb, Db) = load(fb, Kb, q), load(fb, Kb, p)
+                for i, zz in enumerate(zk):
+                    wa = ((Ca / (2 * oa * (zz - oa))) @ Ca.conj().T
+                          - (Da.conj() / (2 * ma * (zz + ma))) @ Da.T)
+                    wb = ((Cb / (2 * ob * (zz - ob))) @ Cb.conj().T
+                          - (Db.conj() / (2 * mb * (zz + mb))) @ Db.T)
+                    rel[q, i] = np.linalg.norm(wb - wa) / np.linalg.norm(wa)
+        rel = np.asarray(multihost_utils.process_allgather(rel)).reshape(-1, nq, len(zk)).max(axis=0)
+        per_site = rel.max(axis=0)
+        return dict(max_rel_fit=float(per_site[fk].max()) if fk.any() else None,
+                    max_rel_held=float(per_site[~fk].max()) if (~fk).any() else None,
+                    per_site_max=per_site.tolist(), site_z_ev=[[float(x.real * RYD_TO_EV), float(x.imag * RYD_TO_EV)] for x in zk],
+                    per_q_max=rel.max(axis=1).tolist(), n_sites=int(len(zk)),
+                    K=[[int(Ka.min()), int(Ka.max())], [int(Kb.min()), int(Kb.max())]],
                     paths=[path_a, path_b], seconds=time.perf_counter() - t1)
 
     def band_rates(g_out, g_in):
