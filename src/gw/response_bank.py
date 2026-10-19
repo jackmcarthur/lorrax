@@ -7,7 +7,6 @@ enter through ``distrib_la``.
 """
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import partial
 from functools import lru_cache
 import hashlib
 import os
@@ -184,14 +183,20 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                                    in_shardings=(face,) * inputs)
         return wrap
 
-    def mm(a, b):
+    def mm(a, b, transa="N", transb="N"):
         if backend == "off":
-            return a @ b
-        return matmul(a, b, mesh=mesh_xy, backend=backend,
+            op = lambda x, t: jnp.conj(jnp.swapaxes(x, -1, -2)) if t == "C" else x
+            return op(a, transa) @ op(b, transb)
+        return matmul(a, b, transa=transa, transb=transb, mesh=mesh_xy, backend=backend,
                       batched_route=route)
 
-    def congruence(h, a):
-        return mm(mm(h, a), h)
+    # H = L of V = L Lᴴ (_coulomb_cholesky): the whitened X = Hᴴ a H is V^½ a V^½ up to a
+    # unitary rotation (same spectrum), and H X Hᴴ maps back to the physical operator.
+    def whiten(h, a):
+        return mm(mm(h, a, transa="C"), h)
+
+    def unwhiten(h, x):
+        return mm(mm(h, x), h, transb="C")
 
     def derivative(w, dchi_raw):
         # Full W on BOTH sides; no adjoint at complex frequency.
@@ -201,14 +206,14 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
         """The solve-bearing bodies over ``solve``: name -> (body, inputs, outputs,
         resident, layout)."""
         def wc(h, chi_raw):
-            x = pref * congruence(h, chi_raw)
+            x = pref * whiten(h, chi_raw)
             identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
             e = solve(identity - x, identity.copy())
-            return congruence(h, mm(x, e))
+            return unwhiten(h, mm(x, e))
 
         def pair(h, chi_raw, dchi_raw):
             value = wc(h, chi_raw)
-            return value, derivative(value + mm(h, h), dchi_raw)
+            return value, derivative(value + mm(h, h, transb="C"), dchi_raw)
 
         if volume is None:
             # One sample's value and slope in one program: the roots H stay laid out
@@ -274,34 +279,34 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     if volume is None:
         @program(3)
         def slope(h, wc, dchi_raw):
-            return derivative(wc + mm(h, h), dchi_raw)
+            return derivative(wc + mm(h, h, transb="C"), dchi_raw)
 
         @program(3, 2)
         def moments(h, a0, a1):
             # chi_scaled=A0/s+A1/s²; whitened Dyson coefficients are
-            # B0=H A0 H, B1=H A1 H, S0=B0, S1=B1+B0².
-            b0 = congruence(h, a0)
-            b1 = congruence(h, a1)
-            return (0.5 * congruence(h, b0),
-                    0.5 * congruence(h, b1 + mm(b0, b0)))
+            # B0=Hᴴ A0 H, B1=Hᴴ A1 H, S0=B0, S1=B1+B0².
+            b0 = whiten(h, a0)
+            b1 = whiten(h, a1)
+            return (0.5 * unwhiten(h, b0),
+                    0.5 * unwhiten(h, b1 + mm(b0, b0)))
         if ordered:
             @program(5, 4)
             def moments(h, a0, a1, o0, o1):
                 # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
-                # reversal or reality assumption; X_k = H chi_k H and
-                # Wc = H X (I-X)^-1 H. Coefficients C1..C4 of 1/z..1/z^4 keep
+                # reversal or reality assumption; X_k = Hᴴ chi_k H and
+                # Wc = H X (I-X)^-1 Hᴴ. Coefficients C1..C4 of 1/z..1/z^4 keep
                 # every X1 cross term (o0 vanishes only in a complete basis).
                 # Returns M0=C1/2, M1=C2/2, M2=C3/2, M3=C4/2 (M_k = C_(k+1)/2, the
                 # constructor's convention); with o0=o1=0 the even pair reduces
                 # to the incumbent M1/M3 exactly.
-                x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
+                x1, x2, x3, x4 = (whiten(h, v) for v in (o0, a0, o1, a1))
                 x11 = mm(x1, x1)
                 c2 = x2 + x11
                 c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
                 c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
                       + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
-                return (0.5 * congruence(h, x1), 0.5 * congruence(h, c2),
-                        0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
+                return (0.5 * unwhiten(h, x1), 0.5 * unwhiten(h, c2),
+                        0.5 * unwhiten(h, c3), 0.5 * unwhiten(h, c4))
 
     else:
         @program(3)
@@ -925,7 +930,7 @@ def _reserve(meta, stage, resident, workspace=0):
 
 
 @lru_cache(maxsize=32)
-def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
+def response_dense_workspace(mesh_xy, n, batch, layout):
     """Query the dense provider on actual bank shapes, before allocation."""
     from distrib_la import plan, workspace_bytes_per_rank
     from .gw_config import linalg_resolution
@@ -934,8 +939,7 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
         backend="off" if layout == "local" else "distributed",
         batched_route=resolution.batched_route)
     gemm = workspace_bytes_per_rank(policy,"gemm",((batch,n,n),(batch,n,n)),np.complex128)
-    eig = workspace_bytes_per_rank(policy,"eigh",((batch,n,n),),np.complex128) if with_eigh else 0
-    return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
+    return dict(gemm=gemm,total=gemm,scope="actual-shape ISERV query; GEMM persistent")
 
 
 _COMPILED = {}
@@ -989,8 +993,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 receipt["memory"].append(row)
             elif not stream:
                 layout = dense_layout(meta, config, mesh_xy, args[0].shape[-1])
-                native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
-                    with_eigh=stage=="coulomb_sqrt")
+                native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout)
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
                 _, row = _reserve(meta, stage, memory.argument_size_in_bytes,
                     memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"])
@@ -1014,33 +1017,33 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     return execute
 
 
-@lru_cache(maxsize=8)
-def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
-    """One cached service plan for H=V^(1/2) and its supported inverse."""
-    from distrib_la import checked_program, matmul, plan
-    from .gw_config import linalg_resolution
-    resolution = linalg_resolution({"linalg": layout})
-    backend = "off" if resolution.layout == "local" else "distributed"
-    eig = plan("eigh", mesh_xy, backend=backend, n=n_packed,
-               batched_route=resolution.batched_route)
-    face = NamedSharding(mesh_xy, P(None, "x", "y"))
-    rep = NamedSharding(mesh_xy, P())
+def _coulomb_cholesky(meta, basis, mesh_xy, v):
+    """H = L and H⁻¹ = L⁻¹ of V = L Lᴴ per parent, on the face (distrib_la Cholesky).
 
-    # The checked eigh returns its status: no host callback.
-    @partial(checked_program, mesh=mesh_xy, out_shardings=(face, face, rep, rep), in_shardings=(face,))
-    def sqrt_v(value):
-        lam, vectors = eig.batched(value)
-        tolerance = n_logical * np.finfo(np.float64).eps
-        scale = jnp.max(jnp.abs(lam), axis=-1, keepdims=True)
-        supported = lam > tolerance * scale
-        root = jnp.sqrt(jnp.where(supported, lam, 0.0))
-        h = matmul(vectors * root[:, None, :], vectors, transb="C",
-                   mesh=mesh_xy, backend=backend, batched_route=resolution.batched_route)
-        inverse = jnp.where(supported, 1.0 / jnp.where(supported, root, 1.0), 0.0)
-        hi = matmul(vectors * inverse[:, None, :], vectors, transb="C",
-                    mesh=mesh_xy, backend=backend, batched_route=resolution.batched_route)
-        return h, hi, jnp.any(lam < -tolerance * scale), jnp.sum(supported, axis=-1)
-    return sqrt_v
+    The pad slots carry identity through the factor (decoupled, so the logical block is
+    the logical factor's) and are zeroed in both outputs; L⁻¹ = (V⁻¹ L)ᴴ is one solve
+    with L as its right-hand side. A V that is not positive definite refuses by name.
+    """
+    from distrib_la import cholesky_factor, cholesky_lower, cholesky_solve
+    nq, n, _ = v.shape
+    _reserve(meta, "coulomb_cholesky", 0, 6 * 16 * nq * n * n // mesh_xy.size)
+    m = jnp.asarray(basis.active_mask, v.dtype)
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    try:
+        F = cholesky_factor(jax.jit(lambda v: v + jnp.diag(1 - m), out_shardings=face)(v), mesh_xy)
+        L = cholesky_lower(F)
+        hi = cholesky_solve(F, L + 0)          # cuSOLVERMp's potrs consumes its right-hand side
+        del F
+        h, hi, ok = jax.jit(lambda L, x: (L * m[:, None] * m, jnp.conj(jnp.swapaxes(x, -1, -2)) * m[:, None] * m,
+                                          jnp.all(jnp.isfinite(L)) & jnp.all(jnp.isfinite(x))),
+                            out_shardings=(face, face, None))(L, hi)
+        ok = bool(ok)
+    except (RuntimeError, ValueError) as error:   # the library's info surfaces where L is first read
+        ok, h, hi = False, None, str(error)
+    if not ok:
+        raise ValueError(f"GATE response_coulomb_psd: V of {nq} parent(s) is not positive definite on its "
+                         f"{basis.n_logical} centroids: its Cholesky broke down ({hi if isinstance(hi, str) else 'non-finite factor'}).")
+    return h, hi
 
 
 @lru_cache(maxsize=8)
@@ -1156,29 +1159,6 @@ def _coulomb_canonical_pack(basis, mesh_xy, q0, q1):
                                                  spec=P(None, "x", "y")), out_shardings=face)
 
 
-def _packed_v(mesh_xy, n_q, n_packed):
-    """The abstract packed V of ``n_q`` parents, as ``_coulomb_roots`` hands it to H = V^(1/2)."""
-    return jax.ShapeDtypeStruct((int(n_q), int(n_packed), int(n_packed)), jnp.complex128,
-                                sharding=NamedSharding(mesh_xy, P(None, "x", "y")))
-
-
-def compile_coulomb_roots_ahead(meta, config, mesh_xy, n_q):
-    """Submit H = V^(1/2) of the parents (0, n_q) to a helper thread's compile.
-
-    Its shape is the centroid basis's and the q wedge's, known before the
-    zeta fit, and it is the bank's largest compile; the bank's
-    ``_coulomb_roots`` then finds it compiled. A deck whose ``linalg`` is
-    local is skipped: there the bank's ledger picks the layout.
-    """
-    from .gw_config import linalg_resolution
-    basis = meta.mu_basis
-    if linalg_resolution({"linalg": config.backend.linalg}).layout == "local":
-        return
-    layout = dense_layout(meta, config, mesh_xy, basis.n_packed)
-    _compiled(_coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout),
-              (_packed_v(mesh_xy, n_q, basis.n_packed),), ahead=True)
-
-
 def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     """The PSD roots of the q span of V through the service plan.
 
@@ -1188,10 +1168,6 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     from file_io.slab_io import SlabIO
     shape = (q_span[1]-q_span[0], basis.n_canonical, basis.n_canonical)
     spec = P(None, "x", "y")
-    # A span the W-model setup did not submit (compile_coulomb_roots_ahead)
-    # compiles beside the read and the pack below instead of after them.
-    kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
-    _compiled(kernel, (_packed_v(mesh_xy, shape[0], basis.n_packed),), ahead=True)
     if resource.get("path") is None:
         values = _COULOMB_OPERATORS[resource["operator"]]
         program = _coulomb_canonical_pack(basis, mesh_xy, int(q_span[0]), int(q_span[1]))
@@ -1211,10 +1187,9 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
                 offset=(q_span[0], 0, 0), partition_spec=spec)
             v = compiled(canonical)
         del canonical
-    h, hi, negative, ranks = execute(kernel, (v,), "coulomb_sqrt")
-    if bool(negative):
-        raise ValueError("GATE response_coulomb_psd: resolved negative eigenvalue")
-    return h, hi, np.asarray(ranks).tolist()
+    with timing.section("bank.coulomb_cholesky", announce=True):
+        h, hi = _coulomb_cholesky(meta, basis, mesh_xy, v)
+    return h, hi, [basis.n_logical] * shape[0]
 
 
 def bank_points(sample_plan):
@@ -2469,7 +2444,7 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
         return 0, 0
     face = jax.ShapeDtypeStruct((int(nq), int(n), int(n)), jnp.complex128, sharding=sharding)
     h = jax.ShapeDtypeStruct((int(nq),) + tuple(roots.shape[1:]), roots.dtype, sharding=sharding)
-    native = response_dense_workspace(mesh_xy, int(n), int(nq), layout, with_eigh=False)["total"]
+    native = response_dense_workspace(mesh_xy, int(n), int(nq), layout)["total"]
     held = 16 * int(nq) * int(n) * int(n) // int(mesh_xy.size)
     if mirrored:
         from runtime.tiles import TILE_BYTES
