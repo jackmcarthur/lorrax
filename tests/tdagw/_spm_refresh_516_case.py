@@ -105,6 +105,10 @@ def main():
     ap.add_argument("--spf-variants", default="", help="SPF variants (default: --variants)")
     ap.add_argument("--head-scan", default="", help="SPH: hot amounts (band b_lo+1 -> b_lo+2) at which "
                     "the first H variant refits the head alone, with and without D")
+    ap.add_argument("--head-decomp", action="store_true",
+                    help="SPH: the static slot's change dS(0) of the first H variant by pair class "
+                    "(cross-gap, intra-valence, intra-conduction) and splitting, at the --head-scan "
+                    "amounts and the --states populations, without body refits (host NumPy)")
     a = ap.parse_args()
     sections = set(a.sections.split(","))
 
@@ -626,6 +630,74 @@ def main():
                         spd[tag] = rs
                         _save()
 
+    def sph_states():
+        """(name, window populations) of the hot scan amounts and the --states files' peak / end."""
+        sts = []
+        for amt in (float(x) for x in a.head_scan.split(",") if x):
+            f_s = f_eq_b.copy()
+            f_s[:, 1] -= amt
+            f_s[:, 2] += amt
+            sts.append((f"hot{amt:g}", f_s))
+        for p_ in sorted(glob.glob(a.states)) if a.states else []:
+            z_ = np.load(p_)
+            tg = os.path.basename(p_)[len("states_"):-len(".npz")]
+            for nm in ("peak", "end"):
+                if f"{nm}_f_b" in z_:
+                    sts.append((f"{tg}:{nm}", np.asarray(z_[f"{nm}_f_b"])))
+        return sts
+
+    def head_decomp(cv, states, f_eq_b):
+        """dS(0) of the head's static slot by pair class and splitting (host NumPy, every rank).
+
+        The run's weight (``gw.qsgw_head._interband_weight`` at the static sample z = i eta,
+        pairs split by more than TOL_DEGENERACY_RY): S_ab = pref sum_kij conj(v^a) w v^b,
+        w = f_diff / (dE (z^2 - dE^2)), i above j.  The eq total is checked against the
+        run's S_direct (rel).  Classes by the run's 0/1 table: cross-gap (j full, i empty),
+        intra-valence (both full), intra-conduction (both empty); bins by dE.
+        """
+        from common.collectives import gather_to_host
+        from common.units import RYD_TO_EV
+        from gw.degen_average import TOL_DEGENERACY_RY
+        hctx, scr = cv["head_ctx"], cv["screening"]
+        nb = hctx["nb"]
+        v = np.asarray(gather_to_host(hctx["velocity"]))[:, :, :nb, :nb]
+        e, f_eq = hctx["e"], hctx["f_eq"]
+        pref = 4.0 / (hctx["nk"] * max(hctx["nspin"], 1) * max(hctx["nspinor"], 1))
+        z = 1j * hctx["eta_ry"]
+        dE = e[:, :, None] - e[:, None, :]
+        trans = dE >= TOL_DEGENERACY_RY
+        full = f_eq >= 0.5
+        up_empty, lo_full = ~full[:, :, None], full[:, None, :]
+        classes = dict(cross=trans & up_empty & lo_full, intra_valence=trans & ~up_empty & lo_full,
+                       intra_conduction=trans & up_empty & ~lo_full)
+        edges_ev = (0.0, 0.1, 0.5, 1.0e9)
+        bins = {f"dE_{lo_:g}-{hi_:g}eV": trans & (dE * RYD_TO_EV >= lo_) & (dE * RYD_TO_EV < hi_)
+                for lo_, hi_ in zip(edges_ev[:-1], edges_ev[1:])}
+        inplane = lambda m: float(0.5 * np.real(m[0, 0] + m[1, 1]))
+
+        def s_of(f, mask):
+            fd = f[:, None, :] - f[:, :, None]
+            w = np.where(mask, pref * fd / np.where(mask, dE * (z * z - dE * dE), 1.0), 0.0)
+            return np.einsum("akij,kij,bkij->ab", np.conj(v), w, v, optimize=True)
+
+        s_eq_run = np.real(np.asarray(jax.device_get(hctx["response"].S_direct))[0])
+        s_eq_np = s_of(f_eq, trans)
+        rows = [dict(state="eq", S_inplane_np=inplane(s_eq_np), S_inplane_run=inplane(s_eq_run),
+                     rel_np_vs_run=float(np.max(np.abs(np.real(s_eq_np) - s_eq_run))
+                                         / max(np.max(np.abs(s_eq_run)), 1e-300)))]
+        for nm, f_b in states:
+            f_full = scr["f_eq"].copy()
+            f_full[scr["rows"], scr["win"]] = np.asarray(f_b, np.float64)
+            f = f_full[:, :nb]
+            row = dict(state=nm, n_c=float(np.sum(np.clip(f - f_eq, 0.0, None)) / hctx["nk"]))
+            for key, m in list(classes.items()) + list(bins.items()):
+                row[key] = inplane(s_of(f, m) - s_of(f_eq, m))
+            row["total"] = inplane(s_of(f, trans) - s_eq_np)
+            k_inv = [(f[:, b + 1] - f[:, b]) for b in range(int(scr["win"].start) - 1, int(scr["win"].stop))]
+            row["inverted_adjacent_pairs"] = int(sum(int(np.sum(x > 0.0)) for x in k_inv))
+            rows.append(row)
+        return dict(eq_S_inplane=inplane(s_eq_np), rows=rows)
+
     if "SPH" in sections:
         with section("SPH"):
             sph = out.setdefault("SPH", {})
@@ -637,6 +709,9 @@ def main():
                     if f"{nm}_f_b" in z_:
                         states.append((f"{tg}:{nm}", np.asarray(z_[f"{nm}_f_b"])))
             hv = [V for V in variants if head_of(V) and V in colls]
+            if a.head_decomp and hv:
+                sph["head_decomp"] = head_decomp(colls[hv[0]], sph_states(), f_eq_b)
+                _save()
             if a.head_scan and hv:
                 cv = colls[hv[0]]
                 scan = sph.setdefault("head_scan", dict(variant=hv[0], rows=[]))
