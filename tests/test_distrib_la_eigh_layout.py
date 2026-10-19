@@ -196,7 +196,7 @@ def test_lu_relabels_from_4x4_and_keeps_the_2x2_bound():
 def test_the_gathered_retry_is_priced_against_the_plans_room(monkeypatch):
     """run30k: cuSOLVERMp 0.9.1 left the n 30000 direction eigh with no correct attempt. The
     gathered retry joins the chain where 2 n^2 and the local eigh workspace fit the plan's room
-    (no room: the 64 MiB rule). The workspace is LAPACK's heevd x CUDA_HEEVD_FACTOR on CUDA, from
+    (no room: the 64 MiB rule). The workspace is LAPACK's heevd x 2.0 on CUDA (the leg's measured row), from
     the shape: planning issues no vendor query (one at trace time could create a handle mid-run)."""
     import sys
     import lxkit

@@ -43,7 +43,8 @@ def resolve_device_budget_gb(deck_gb: float = 0.0, linalg: str = "local") -> flo
         ordinal = int(getattr(jax.local_devices()[0], "local_hardware_id", 0) or 0)
         total, outside = device_total_bytes(ordinal), outside_pool_bytes(ordinal)
     return memory.resolve(float(deck_gb or 0.0) * 1e9, str(linalg), total=total,
-                          outside=outside) / 1e9
+                          outside=outside,
+                          agree=lambda v: minimum_process_budget_gb(v / 1e9) * 1e9) / 1e9
 
 
 def device_budget_bytes() -> float:
