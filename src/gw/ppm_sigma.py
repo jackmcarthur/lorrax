@@ -2083,7 +2083,10 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
                  held=bool(geometry.get("sc_fixed_quadrature", False)),
                  rebuilds=int(geometry.get("sc_fixed_rebuilds_this_iteration", 0)))
     hr = head_rows(res.efermi_ry)
-    point = res.sigma_c_kij.point(0).with_head(hr)
+    # The pole executor returns a band-count cube (count 0: the window's sum); the
+    # shared-pole executor (gw.mpa.sigma) its OnShellSigma directly.
+    first = lambda x: x.point(0) if hasattr(x, "point") else x
+    point = first(res.sigma_c_kij).with_head(hr)
     pair = np.asarray(gather_to_host(block4(point.pair)))
     diag = np.einsum("kii->ki", pair[0])
     Uh = np.conj(np.swapaxes(U, -1, -2))
@@ -2099,7 +2102,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
             (np.zeros((nk, n_a)),) * 3)
     if branches:
         from .mpa.sigma import BRANCH_SPACES
-        tabs = {space: np.array(gather_to_host(block4(res.branches[space].point(0).pair)))
+        tabs = {space: np.array(gather_to_host(block4(first(res.branches[space]).pair)))
                 for space in BRANCH_SPACES}
         idx = np.arange(n_a)
         tabs["val"][:, :, idx, idx] += hole[None]
@@ -2120,7 +2123,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     if omega_ry is not None:
         grid = np.asarray(omega_ry, np.float64)
         res_w = run(grid)
-        cube = res_w.sigma_c_kij.point(0)
+        cube = first(res_w.sigma_c_kij)
         Sw = np.asarray(gather_to_host(block4(cube)))
         hr_w = head_rows(res_w.efermi_ry)
         if hr_w is not None:

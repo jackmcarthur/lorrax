@@ -70,7 +70,8 @@ def main():
     ap.add_argument("--v2-imag", default="0.1,0.25,0.5", help="V2: imaginary sites (eV) added")
     ap.add_argument("--v2-height", type=float, default=1.0, help="V2: line height (eV); 0 = the run's")
     ap.add_argument("--hot-amount", type=float, default=0.05)
-    ap.add_argument("--eta-list", default="0.25,0.1,0.05", help="SPC: window-sweep Lorentzians, eV")
+    ap.add_argument("--eta-list", default="", help="SPC: window-sweep Lorentzians, eV (default: the "
+                    "source's; the shared-pole Sigma stage refuses any other: the recipe stamps eta)")
     ap.add_argument("--eq-fs", type=float, default=2.5)
     ap.add_argument("--refresh-fs", type=float, default=0.5)
     ap.add_argument("--refresh-df", type=float, default=1e-3)
@@ -80,7 +81,7 @@ def main():
     ap.add_argument("--cd-cadences", default="0.5,0.25,0.125")
     ap.add_argument("--cd-variants", default="V1")
     ap.add_argument("--cd-tag", default="")
-    ap.add_argument("--eta-low", type=float, default=0.1)
+    ap.add_argument("--eta-low", default="0.1,0.05", help="SPE: the lower etas (eV), each a rerun source")
     ap.add_argument("--states", default="", help="SPE: glob of SPD states_*.npz files")
     a = ap.parse_args()
     sections = set(a.sections.split(","))
@@ -284,7 +285,8 @@ def main():
     f_hot_b = f_eq_b.copy()
     f_hot_b[:, 1] -= a.hot_amount
     f_hot_b[:, 2] += a.hot_amount
-    etas = [float(x) for x in a.eta_list.split(",") if x]
+    etas = ([float(x) for x in a.eta_list.split(",") if x]
+            or [float(src["config"].sigma.regularization_ev)])
 
     def state_measure(V, f_b, label, *, per_q=True, at_eq_too=True):
         """The refit at window populations f_b (bundle rows): record, rates on W(state), on W_eq, eta list."""
@@ -300,10 +302,10 @@ def main():
             tabs0 = cv["sweep"](f_b, at=None)
             r["rates_W_eq"] = band_rates(tabs0["g_out"], tabs0["g_in"])
         r["eta"] = [eta_rates(src, at, f_b, e_, bo) for e_ in etas]
-        r["eta_split"] = eta_split(r["eta"])
+        if len(etas) > 1:
+            r["eta_split"] = eta_split(r["eta"])
         if at_eq_too:
             r["eta_W_eq"] = [eta_rates(src, cv["poles"], f_b, e_, bo) for e_ in etas]
-            r["eta_split_W_eq"] = eta_split(r["eta_W_eq"])
         del at
         return r
 
@@ -453,17 +455,8 @@ def main():
 
     if "SPE" in sections:
         with section("SPE"):
-            spe = out.setdefault("SPE", dict(eta_ev=a.eta_low))
-            src_e = D.gw_window_source(spm_deck, mesh,
-                                       workdir=os.path.join(os.path.abspath(a.out), "driver_eta"),
-                                       screening=True, overrides={"sigma_regularization_ev": a.eta_low},
-                                       say=say)
-            re_ = src_e["meta"].shared_pole_recipe
-            spe["source"] = dict(wall_s=src_e["wall_s"], eta_ev=float(src_e["config"].sigma.regularization_ev),
-                                 K=[min(src_e["model"]["K"]), max(src_e["model"]["K"])],
-                                 line_ev=list(map(float, re_["line_ev"])),
-                                 imaginary_ev=list(map(float, re_["imaginary_ev"])),
-                                 height_ev=float(re_["height_ev"]))
+            import gc
+            spe = out.setdefault("SPE", {})
             states = [("eq", f_eq_b), ("hot", f_hot_b)]
             for p_ in sorted(glob.glob(a.states)) if a.states else []:
                 z = np.load(p_)
@@ -471,27 +464,42 @@ def main():
                 for nm in ("peak", "end"):
                     if f"{nm}_f_b" in z:
                         states.append((f"{tg}:{nm}", np.asarray(z[f"{nm}_f_b"])))
-            for V in variants:
-                v2e = "" if V == "V1" else _v2_sites(
-                    re_, [float(x) for x in a.v2_line.split(",") if x],
-                    [float(x) for x in a.v2_imag.split(",") if x],
-                    a.v2_height if a.v2_height > 0 else None)
-                ce = D.window_collision(
-                    src_e, sysw.ops, mesh=mesh, k_frac=sysw.hdr["kpts"], b_lo=b_lo, ntr=1,
-                    form="subtracted", hermitian="dynamic", sweep="active", screening="shared_pole",
-                    spm_support_sites=v2e,
-                    spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_eta_{V}"), say=say)
-                se = dict(t0_line=ce["t0"].get("line", ""), sites=v2e, states={})
-                for nm, f_b in states:
-                    at, rec = D.spm_refit(ce["screening"], f_b, label="e_state")
-                    se["states"][nm] = dict(
-                        refit=refit_out(rec, per_q=False),
-                        rates=eta_rates(src_e, at, f_b, a.eta_low, ce["bundle_of"]))
-                    del at
+            for eta_e in (float(x) for x in a.eta_low.split(",") if x):
+                key = f"eta{eta_e:g}"
+                src_e = D.gw_window_source(
+                    spm_deck, mesh, workdir=os.path.join(os.path.abspath(a.out), f"driver_{key}"),
+                    screening=True, overrides={"sigma_regularization_ev": eta_e}, say=say)
+                re_ = src_e["meta"].shared_pole_recipe
+                spe[key] = dict(eta_ev=eta_e, source=dict(
+                    wall_s=src_e["wall_s"], eta_ev=float(src_e["config"].sigma.regularization_ev),
+                    K=[min(src_e["model"]["K"]), max(src_e["model"]["K"])],
+                    line_ev=list(map(float, re_["line_ev"])),
+                    imaginary_ev=list(map(float, re_["imaginary_ev"])),
+                    height_ev=float(re_["height_ev"])))
+                for V in variants:
+                    v2e = "" if V == "V1" else _v2_sites(
+                        re_, [float(x) for x in a.v2_line.split(",") if x],
+                        [float(x) for x in a.v2_imag.split(",") if x],
+                        a.v2_height if a.v2_height > 0 else None)
+                    ce = D.window_collision(
+                        src_e, sysw.ops, mesh=mesh, k_frac=sysw.hdr["kpts"], b_lo=b_lo, ntr=1,
+                        form="subtracted", hermitian="dynamic", sweep="active",
+                        screening="shared_pole", spm_support_sites=v2e,
+                        spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{key}_{V}"), say=say)
+                    se = dict(t0_line=ce["t0"].get("line", ""), sites=v2e, states={})
+                    for nm, f_b in states:
+                        at, rec = D.spm_refit(ce["screening"], f_b, label="e_state")
+                        se["states"][nm] = dict(
+                            refit=refit_out(rec, per_q=False),
+                            rates=eta_rates(src_e, at, f_b, eta_e, ce["bundle_of"]))
+                        del at
+                        _save()
+                    spe[key][V] = se
+                    del ce
+                    gc.collect()
                     _save()
-                spe[V] = se
-                del ce
-                _save()
+                del src_e
+                gc.collect()
 
     if "SV3" in sections and "V1" in colls:
         with section("SV3"):
@@ -534,8 +542,10 @@ def sv3(coll, f_hot_b, src, say):
         return None
     dev = jax.local_devices()[0]
     recipe = scr["meta"].shared_pole_recipe
-    z = np.asarray(recipe["z_ry"])
-    held = np.asarray(recipe["held"], bool)
+    codes = recipe["role_codes"]
+    z, role = np.asarray(recipe["z_ry"]), np.asarray(recipe["role"])
+    fit_m = np.isin(role, [codes["line"], codes["imaginary"]])
+    held_m = np.isin(role, [codes["held_line"], codes["held_imaginary"]])
 
     def load(path, q):
         with h5py.File(path, "r") as f:
@@ -558,7 +568,7 @@ def sv3(coll, f_hot_b, src, say):
     for q in (0, int(len(at["model"]["K"]) // 2)):
         lam0, b0 = (put(x) for x in load(coll["poles"]["model"]["path"], q))
         lamh, bh = (put(x) for x in load(at["model"]["path"], q))
-        fit_z, held_z = z[~held], z[held]
+        fit_z, held_z = z[fit_m], z[held_m]
         gram = jnp.abs(jnp.conj(b0).T @ b0) ** 2
         A = jnp.zeros(gram.shape, jnp.complex128)
         y = jnp.zeros(gram.shape[0], jnp.complex128)
