@@ -2035,6 +2035,38 @@ def _head_wing_kernel_face(
     return kernel
 
 
+def static_head_wings_host(response, mesh: Mesh):
+    """The ω = 0 direct head tensor and its two ISDF wings on the host, or None.
+
+    ``response`` is an :class:`IterationHeadResponse` built with wings.  Returns
+    ``{"S_direct": (3, 3), "L": (3, μ_carrier), "R": (μ_carrier, 3)}``, the
+    ω = 0 rows of ``S_direct``, ``Y_x`` and ``Z_y`` (in the run's μ basis), or
+    ``None`` without wings or without an ω = 0 sample.  These are the q → 0
+    quantities of ``docs/theory/bgw_epsmat_export.md`` §5 (E9): the left wing
+    is the q-linear G = 0 row of the ISDF polarizability,
+    ``χ₀(0, G) = −Σ_μ (q·L)_μ conj(ζ̃_μ(G))``.  Replication is bounded by the
+    small dimension: 3 · μ · 16 B per wing (86 kB at μ = 1800), one read.
+    """
+    if response is None or response.Y_x is None or response.Z_y is None:
+        return None
+    omegas = np.asarray(response.omegas, dtype=np.complex128).reshape(-1)
+    hit = np.flatnonzero(np.abs(omegas) <= 1.0e-14)
+    if hit.size == 0:
+        return None
+    i = int(hit[0])
+    rep = NamedSharding(mesh, P())
+    S_all = response.S_direct
+    if not isinstance(S_all, jax.Array):
+        S_all = np.asarray(S_all, dtype=np.complex128)
+    rows = jax.jit(lambda y, z, s: (y[i], z[i], s[i]),
+                   out_shardings=(rep, rep, rep))(response.Y_x, response.Z_y, S_all)
+    from common.host_read import host_tree
+    L, R, S = host_tree(rows)
+    return {"S_direct": np.asarray(S, dtype=np.complex128),
+            "L": np.asarray(L, dtype=np.complex128),
+            "R": np.asarray(R, dtype=np.complex128)}
+
+
 def _pad_head_band_manifold_to(v, e, f, surface, *, mesh: Mesh, width: int):
     """Like ``_pad_head_band_manifold`` but pads to an EXPLICIT ``width``
     rather than inferring one from ``v``'s own current extent.

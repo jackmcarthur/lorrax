@@ -36,6 +36,8 @@ need SlabIO plus a shape contract the BGW format does not currently state.
 import h5py
 import numpy as np
 
+from .bgw_epsmat import DIAGONAL, MATRIX
+
 class EPSReader:
     def __init__(self, filename):
         """Initialize EPSMATReader with epsmat.h5 file."""
@@ -86,7 +88,7 @@ class EPSReader:
         self.vcoul = gspace['vcoul'][:]
 
         self.gvec_ind_max = int(np.amax(self.gind_eps2rho))
-        self.comps = self._file['mf_header/gspace/components'][:self.gvec_ind_max,:]
+        self.comps = self._file['mf_header/gspace/components'][:self.gvec_ind_max + 1, :]
         
 
         # Subspace group (if exists)
@@ -104,8 +106,8 @@ class EPSReader:
         # six numbers.  Every accessor below already slices, so a handle
         # turns each of them into an HDF5 hyperslab read of exactly the block
         # asked for.
-        self.matrix = self._file['mats/matrix']
-        self.matrix_diagonal = self._file['mats/matrix-diagonal']
+        self.matrix = self._file[MATRIX]
+        self.matrix_diagonal = self._file[DIAGONAL]
 
         # you should only really want this for eps0. TODO: frequency dep.
         # Two scalar reads, not a whole-array indexing of a resident copy.
@@ -151,15 +153,11 @@ class EPSReader:
 
 
     def get_eps_matrix(self, iq, ifreq=0, imatrix=0):
-        """Get the epsilon matrix for a specific q-point and frequency.
-        
-        Args:
-            iq (int): Q-point index
-            ifreq (int): Frequency index (default=0 for static)
-            imatrix (int): Matrix index (default=0)
-            
-        Returns:
-            np.ndarray: Complex epsilon matrix of shape (nmtx[iq], nmtx[iq])
+        """ε⁻¹_q(G, G') at one q and frequency, rows G and columns G'.
+
+        Returns ``(nmtx[iq], nmtx[iq])`` complex in the file's eps order.  The
+        stored block is the transpose (``file_io.bgw_epsmat`` layout), so this
+        returns ``block.T``; ``W(G, G') = ε⁻¹(G, G') v(q+G')``.
         """
         # int() because these indices now reach h5py's selection parser
         # rather than numpy's: a numpy scalar bound is accepted by numpy
@@ -167,7 +165,7 @@ class EPSReader:
         iq, imatrix, ifreq = int(iq), int(imatrix), int(ifreq)
         nmtx_q = int(self.nmtx[iq])
         block = self.matrix[iq, imatrix, ifreq, :nmtx_q, :nmtx_q, :]
-        return block[..., 0] + 1j * block[..., 1]
+        return (block[..., 0] + 1j * block[..., 1]).T
     
     def get_eps_minus_delta_matrix(self, iq, ifreq=0, imatrix=0):
         """Get the epsilon matrix for a specific q-point and frequency.
@@ -207,17 +205,10 @@ class EPSReader:
     # — and it handles τ.
 
     def get_eps_diagonal(self, iq):
-        """Get the static diagonal elements for a specific q-point.
-        
-        Args:
-            iq (int): Q-point index
-            
-        Returns:
-            np.ndarray: Complex diagonal elements
-        """
+        """``mats/matrix-diagonal`` of one q: ε⁻¹_q(G, G) at ω = 0, ``(nmtx[iq],)`` complex."""
         iq = int(iq)
-        diag = self.matrix_diagonal[:, :int(self.nmtx[iq]), iq]
-        return diag[0] + 1j * diag[1]
+        diag = self.matrix_diagonal[iq, :int(self.nmtx[iq]), :]
+        return diag[..., 0] + 1j * diag[..., 1]
 
 if __name__ == "__main__":
     # Example usage

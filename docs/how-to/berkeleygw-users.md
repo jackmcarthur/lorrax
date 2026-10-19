@@ -235,7 +235,9 @@ $\omega = 0$. $q$ is stored on the irreducible parents when the centroids are
 closed under the symmetry orbits, otherwise on the full grid; readers unfold
 it. The BSE consumes this file in place of BerkeleyGW's `eps0mat.h5` and
 `epsmat.h5` ([BSE inputs](../architecture/bse.md#inputs)). `tmp/zeta_q.h5`
-holds the fitted interpolation vectors $\zeta_q(G)$.
+holds the fitted interpolation vectors $\zeta_q(G)$. `gw.epsmat_cli` writes the static W of
+this bundle as `eps0mat.h5` / `epsmat.h5` and projects BerkeleyGW's files back
+onto ζ ([theory](../theory/bgw_epsmat_export.md)).
 
 ### 3.6 `qp_wfn_rotations.h5` and `WFN_qp.h5`
 

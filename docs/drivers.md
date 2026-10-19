@@ -15,11 +15,13 @@ LORRAX has six core drivers in seven modules: GW preprocessing is two modules
 
 [`gw.downfold_cli`](#downfold-gwdownfold_cli) sits beside the chain: it
 compresses a finished GW restart for the two BSE drivers.
+[`gw.epsmat_cli`](#epsmat-gwepsmat_cli) also sits beside it: it converts a
+finished bundle's static W to and from BerkeleyGW's ε⁻¹ files.
 
 Every driver brings up the runtime with one module-top call,
 `runtime.initialize_communicator_stack` (mesh, communicators, startup report).
-`gw_jax`, `kin_ion_io`, `kmeans_cli` and `downfold_cli` answer `--help` and bad
-arguments before that call (`runtime.cli_seam`). Launch geometry is owned by
+`gw_jax`, `kin_ion_io`, `kmeans_cli`, `downfold_cli` and `epsmat_cli` answer
+`--help` and bad arguments before that call (`runtime.cli_seam`). Launch geometry is owned by
 the machine pages ([Perlmutter](environment/machines/perlmutter.md),
 [Frontera](environment/machines/frontera.md)); every deck key is in the
 [input reference](input_reference.md). The tables below list only the keys
@@ -228,6 +230,17 @@ which both BSE drivers read unmodified. Invoke:
 [The downfold page](downfold.md) owns the equations, the procedure, the
 outputs and the refusals; the `[downfold]` keys are in the
 [input reference](input_reference.md#downfold-the-downfold-input-file).
+
+## epsmat — `gw.epsmat_cli`
+
+Writes a finished GW bundle's static W as BerkeleyGW 4.0 `eps0mat.h5` /
+`epsmat.h5` (`mode = export`), or projects BerkeleyGW's files onto the
+bundle's ζ and writes a copy of the bundle whose `W0_qmunu` is theirs
+(`mode = project`). Invoke: `python3 -u -m gw.epsmat_cli -i epsmat.in`
+(`--print-schema` lists the keys). [The theory page](theory/bgw_epsmat_export.md)
+owns the equations, the outputs and the refusals; the `[epsmat]` keys are in the
+[input reference](input_reference.md#epsmat-the-epsmat-input-file).
+
 
 ## htransform — `bandstructure.htransform`
 
