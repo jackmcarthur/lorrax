@@ -251,6 +251,31 @@ refits at $\rho^{\rm eq}$ and at the 5% hot state but is refused by
 min −5.8×10⁻⁷ at 1.5 fs, −7.8×10⁻⁶ at the pulse peak, against the rounding
 floor 10⁻⁷; no PSD repair), so a driven run with V2′ stops at its sixth refresh;
 V1 refits at every state measured.
+
+**χ₀ in four blocks** (`collision_spm_chi0_active = [a0, a1]`, refits only; unset = the
+GW run's one rule on every pair, unchanged). The refit's $\chi_0$ is split by hole space
+× electron space, as $\delta\chi_0$ is (§1.3): F, the bands outside the active range
+A = [a0, a1), at their 0/1 step; A, with f = diag ρ on the window. Hole weights f
+($G^<$), electron weights 1 − f ($G^>$), so
+$\chi_0=\chi_0^{FF}+\chi_0^{FA}+\chi_0^{AF}+\chi_0^{AA}$ exactly
+(`gw.response_bank.response_blocks`). Each block has its own transition interval,
+from band energies only (F's occupied bands as holes, F's empty bands as electrons, every
+A band on both sides): on 516 with A = [88, 144), FF 16.19–83.40 eV, FA 6.99–80.15 eV,
+AF 0.81–11.64 eV and AA ±8.40 eV (the nearer gaps around the window, 0.01–0.05 eV, would leave
+FA and AF barely positive). Only AA crosses zero, and it is built without the
+occupation envelope (decay rate 0). The intervals do not depend on f(t), so every
+block's rule is built at the first refit and held for the run: no per-refresh rule
+construction. Where a sample's AA pencil fails (V2's 0.25 and 0.1 eV sites), the
+closed-form imaginary-axis set is taken in Gauss–Legendre panels of at most 384 nodes
+with the quadrature's own weights, whose contributions add (`minimax`
+`ResponseGroupTree(panels=True)`: 472 nodes at 0.25 eV, 1180 at 0.1 eV). The blocks
+share the one compiled direct stream (union band bounds; each block's masked weights
+and gauge references as operands) and add into one carry. Dyson, the exact moments
+and the constructor are unchanged. A must end at band gaps (FA, AF strictly
+positive) and F must stay 0/1, else `GATE response_blocks_*` refuses. On CPU
+(`tests/test_response_bank_blocks_cpu.py`) the four blocks match the exact
+ordered-pair scan (`compute_chi0_direct_fractional`) to 8.7×10⁻¹⁰ down to
+Im z = 0.1 eV with fractional populations.
 Holding the equilibrium poles and refitting only one real residue scale per
 pole (V3) leaves 18–28% of the hot state's change of $W^c$ at the fit sites
 (V1 target; 48–69% for V2′) and needs negative scales: the poles must move,
