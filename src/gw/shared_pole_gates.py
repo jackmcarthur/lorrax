@@ -48,7 +48,7 @@ def ordered_pole_bound_ry(m1, inverse_coulomb_sqrt, *, energy_span_ry, gap_ry, m
     """
     if not float(gap_ry) > 0:
         return jnp.full((m1.shape[0],), jnp.inf)
-    whitened = hermitian_part(matmul(inverse_coulomb_sqrt, matmul(2 * m1, inverse_coulomb_sqrt)))
+    whitened = hermitian_part(matmul(inverse_coulomb_sqrt, matmul(2 * m1, inverse_coulomb_sqrt, transb="C")))
     top = eigh(whitened)[0][:, -1]
     return float(energy_span_ry) + jnp.maximum(top, 0) / float(gap_ry)
 
@@ -210,7 +210,7 @@ def shared_pole_operator_passivity(wc, inverse_coulomb_sqrt, *, matmul, eigh, ga
     and memory admission, including the two square GEMMs and eigensolve.
     """
     inverse = inverse_coulomb_sqrt
-    response = -matmul(matmul(inverse, wc), inverse)
+    response = -matmul(matmul(inverse, wc), inverse, transb="C")
     return _passivity_response_checks(response, eigh=eigh, gates=gates)
 
 

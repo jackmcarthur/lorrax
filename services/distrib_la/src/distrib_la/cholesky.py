@@ -41,3 +41,13 @@ def solve(F: Cholesky, B):
     tri = jax.lax.linalg.triangular_solve
     y = tri(F.handle, B, left_side=True, lower=True)
     return tri(F.handle, y, left_side=True, lower=True, conjugate_a=True, transpose_a=True)
+
+
+def lower(F: Cholesky):
+    """L per q, (nq, n, n) on the face, lower triangle only."""
+    if F.backend == "cusolvermp":
+        from distrib_la._cusolvermp import cholesky_handle_to_natural_L
+        return cholesky_handle_to_natural_L(F.handle)
+    if F.backend == "slate":
+        return jnp.stack([h.to_jax_lower() for h in F.handle])
+    return F.handle
