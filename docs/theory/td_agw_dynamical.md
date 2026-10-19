@@ -197,7 +197,12 @@ the explicit set that works at carrier states is V2′: the ladder plus a low
 line at 0.25–2.3 eV, the whole line at height 1.0 eV, and imaginary sites 0.25
 and 0.5 eV. An imaginary site at 0.1 eV is refused at carrier states by the
 bank's rule construction (the response exponential fit, `tol 1e-8`, fails once
-the occupation interval crosses zero); at $\rho^{\rm eq}$ it is admitted.
+the occupation interval crosses zero); at $\rho^{\rm eq}$ it is admitted. V2′ itself
+refits at $\rho^{\rm eq}$ and at the 5% hot state but is refused by
+`GATE shared_pole_gram_valid` at q = 0 at the driven 3×10⁹ V/m states (Gram
+min −5.8×10⁻⁷ at 1.5 fs, −7.8×10⁻⁶ at the pulse peak, against the rounding
+floor 10⁻⁷; no PSD repair), so a driven run with V2′ stops at its sixth refresh;
+V1 refits at every state measured.
 Holding the equilibrium poles and refitting only one real residue scale per
 pole (V3) leaves 18–28% of the hot state's change of $W^c$ at the fit sites
 (V1 target; 48–69% for V2′) and needs negative scales: the poles must move,
@@ -812,10 +817,12 @@ screening is refused). Its source is the GW driver on `collision_source`
 the refreshed run is one program per run (no recompiles over 15–63 refreshes);
 at $\rho^{\rm eq}$ the collision stays zero through the refreshes (max
 deviation $5\times10^{-14}$, held flow $3\times10^{-11}$ meV). Cadence
-($\max_t|\Delta n_c|/\max n_c$, 8 fs drives): at 5×10⁸ V/m 0.25 fs is within
-0.9% of 0.125 fs (25 as samples) and 0.5 fs within 2.4%; at 3×10⁹ V/m 0.5 fs
-is within 0.5% of 0.25 fs (1.6% at the end). The refreshed W moves P(t) by
-4.6% against the frozen shared-pole W at 3×10⁹ V/m, 0.07% at 5×10⁸ V/m.
+($\max_t|\Delta n_c|/\max n_c$, 8 fs drives, against 0.125 fs with 25 as
+samples): 0.25 fs is within 0.9% at 5×10⁸ and 3×10⁹ V/m, 0.5 fs within 2.4% and
+0.9%; P(t) within 0.35%. The refreshed W moves P(t) by 4.6% against the frozen
+shared-pole W at 3×10⁹ V/m, 0.07% at 5×10⁸ V/m; the held $\Delta\Sigma^{\rm h}$
+jumps by at most 13.8 meV at a refresh (3×10⁹ V/m; GN-PPM refreshed screening:
+77 meV), the pole count stays K = 1761 and no gate refuses (V1).
 
 ## 8. Validation {#validation}
 
