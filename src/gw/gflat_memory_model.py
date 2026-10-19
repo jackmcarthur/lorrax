@@ -333,9 +333,10 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     br.update(ws(b, n_pg, c_out, n_blk))
     hwm = sum(br.values())
     if not fits:
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"zeta mu-batch ({b // P_} centroids per owner, whole orbits of up "
-                         f"to {c_orb}, {c_out} row(s) x {n_blk} plane block(s))", hwm, target)
+        from lxkit import memory
+        memory.admit(f"zeta mu-batch ({b // P_} centroids per owner, whole orbits of up "
+                     f"to {c_orb}, {c_out} row(s) x {n_blk} plane block(s))",
+                     memory.priced(hwm, "closed form"), target)
     store_total = n_v * Q * mu * N_G * 16.0
     transfer = {
         f"pair-projector all-to-all (floor {t_a2a_floor:.0f} s)":
@@ -411,8 +412,8 @@ def route_g_plane_chunk(plan: MuBatchPlan, c_src: int, n_ranks: int) -> tuple[in
         plan.working_set, plan.target_bytes, c_plan=c_plan, c_src=c_src,
         n_pg=int(plan.r_sub), n_planes=int(plan.n_planes), n_ranks=P_)
     if not fits and int(c_src) > c_plan:
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"zeta mu-batch orbit bins ({int(c_src)} centroids per owner)",
-                         plan.working_set(P_ * int(c_src), int(plan.r_sub), c_out, n_blk),
-                         plan.target_bytes)
+        from lxkit import memory
+        memory.admit(f"zeta mu-batch orbit bins ({int(c_src)} centroids per owner)",
+                     memory.priced(plan.working_set(P_ * int(c_src), int(plan.r_sub), c_out, n_blk),
+                                   "closed form"), plan.target_bytes)
     return c_out, n_blk

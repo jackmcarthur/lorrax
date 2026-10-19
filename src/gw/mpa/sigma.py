@@ -1085,8 +1085,9 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                                            extents=extents)
     projection_bytes = 16*b*rows_w*cols_w/(px*py)
     if not sector and projection_bytes > U:
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"{stage} parent star (all-P logical bound)", projection_bytes, U)
+        from lxkit import memory
+        memory.admit(f"{stage} parent star (all-P logical bound)",
+                     memory.priced(projection_bytes, "closed form"), U)
     receipt = capacity.reserve(
         f"{stage}.synthesis", resident_bytes_per_rank=resident,
         workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],

@@ -1113,9 +1113,9 @@ def _write_w_av_stage(
     working_bytes_per_k = fixed_bytes + 2 * streamed_q_bytes
     if working_bytes_per_k > tile_budget_bytes:
         # The smallest k=1, q=1 raw-density tile runs.
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("W-av raw-density tile (k=1, q=1)", working_bytes_per_k,
-                         tile_budget_bytes)
+        from lxkit import memory
+        memory.admit("W-av raw-density tile (k=1, q=1)",
+                     memory.priced(working_bytes_per_k, "closed form"), tile_budget_bytes)
     k_batch = max(1, min(
         nk, int(tile_budget_bytes // max(1, working_bytes_per_k))))
     if jax.process_index() == 0:

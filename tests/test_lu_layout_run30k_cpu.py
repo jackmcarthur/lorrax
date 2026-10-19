@@ -10,7 +10,7 @@ import pytest
 
 from distrib_la import _cusolvermp as cm
 from distrib_la import resolve
-from common.gpu_utils import room_bucket
+from lxkit.memory import bucket as room_bucket
 
 N, P = 30000, 4
 

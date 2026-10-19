@@ -488,7 +488,8 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
         chunk *= 2
     chunk = min(max(chunk, floor), max(int(nsamples), floor))
     memory.book(memory.priced(chunk * per_sample,
-                              f"direct Gamma head, chunk {chunk} over {n_dev} ranks"))
+                              f"direct Gamma head, chunk {chunk} over {n_dev} ranks",
+                              increment=True))
     return int(chunk), split
 
 
@@ -584,7 +585,8 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
         sds((rows,), jnp.float64, sharding=split), *operands).compile()
     temp = float(getattr(compiled.memory_analysis(), "temp_size_in_bytes", 0))
     memory.book(memory.priced(temp + 8.0 * (3 + 16 + 1) * rows / n_dev,
-                              f"direct Gamma head, slab polygon {rows} nodes over {n_dev} ranks"))
+                              f"direct Gamma head, slab polygon {rows} nodes over {n_dev} ranks",
+                              increment=True))
     ladder = []
     for chunk in receipt.chunks:
         q = np.zeros((rows, 3))

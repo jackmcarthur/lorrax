@@ -397,6 +397,12 @@ def _fit_mubatch(
         figure=lambda ex: compiled_new_bytes(
             ex, extra=int(ex.memory_analysis().output_size_in_bytes)),
         stage="zeta route-G mu batch, plane blocks")
+    # The stage's price: the batch executable's compiled figure beside the resident set (the
+    # analytic working set only chose the chunk).
+    from lxkit import memory
+    memory.book(memory.priced(compiled_new_bytes(batch_executable, extra=int(
+        batch_executable.memory_analysis().output_size_in_bytes)),
+        "route-G mu batch executable (memory_analysis + FFT plans + outputs)", increment=True))
     if n_run != n_blk:
         kern_args = dict(kern_args, n_blk=n_run)
         n_blk, kernel = n_run, zmb.make_route_g_kernel(**kern_args)

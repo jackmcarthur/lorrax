@@ -48,7 +48,7 @@ from lxkit.gate import (
     rank_id,
     reset_gate_state,
 )
-from lxkit import legs, native_provider
+from lxkit import legs, memory, native_provider
 from lxkit.legs import (
     LEGS,
     PlatformLeg,
@@ -99,7 +99,7 @@ __all__ = [
     "ordered_transient_bytes", "install_reduction_guard",
     "install_reduction_guard_from_env", "reduction_trace",
     # the platform legs of the native-provider ABI
-    "legs", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
+    "legs", "memory", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
     "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_vendor",
     "process_accelerator_leg",
     # native-provider policy (the tables remain with each caller)

@@ -403,15 +403,18 @@ class CapacityLedger:
         return result
 
     def reserve(self, stage, *, resident_bytes_per_rank,
-                workspace_bytes_per_rank, concurrent_with=()):
-        """Admit actual-batch bytes before allocation; over the budget, warn and admit.
+                workspace_bytes_per_rank, concurrent_with=(), runs_in=None):
+        """Admit actual-batch bytes before allocation (``lxkit.memory.admit``).
+
+        The price is booked to ``runs_in``, the timing section that allocates it (default:
+        the section open now), so its receipt measures the allocation, not the admission.
 
         Returns a detached JSON row. ``concurrent_with`` is an iterable of
         accepted stage names, not their byte totals. Caller-live allocations
         must be charged here OR in a named concurrent reservation, never both.
         No runtime peak is inferred from a successful analytical admission.
         A row over the available budget keeps ``device_budget_status`` FAIL
-        and prints one line (``common.gpu_utils.warn_over_budget``).
+        and prints one line (``lxkit.memory.admit``).
         """
         if not isinstance(stage, str) or not stage.strip() or stage in self._accepted:
             raise ValueError(f"capacity stage must be a new nonempty name; got {stage!r}")
@@ -421,16 +424,25 @@ class CapacityLedger:
         row['stage'] = stage
         row['live_stages'] = sorted(set(row['concurrent_with']) | {stage})
         self.entries.append(row)
-        from common.gpu_utils import warn_over_budget
         from lxkit import memory
         if row['device_budget_status'] != 'PASS':
-            warn_over_budget(f"shared-pole ledger {stage}", row['aggregate_bytes_per_rank'],
-                             row['available_device_bytes_per_rank'])
+            memory.admit(f"shared-pole ledger {stage}", self.price(row['aggregate_bytes_per_rank']),
+                         row['available_device_bytes_per_rank'], runs_in=runs_in)
         self._accepted[stage] = row
         # Priced as the pool measures it: the ledger's bytes and what was live beside it at bind.
-        memory.book(memory.priced(row['aggregate_bytes_per_rank'] + self.baseline_bytes_per_rank,
-                                  self.price_label()))
+        memory.book(self.price(row['aggregate_bytes_per_rank'], self.baseline_bytes_per_rank),
+                    stage=runs_in)
         return copy.deepcopy(row)
+
+    def price(self, aggregate, baseline=0):
+        """The ledger's bytes as a Price: face-tiled reservations (spread over the mesh) beside
+        the driver's arrays live at bind (``baseline``, held at this P)."""
+        from lxkit import memory
+        ranks = self.geometry['px'] * self.geometry['py']
+        return memory.Price(
+            operands=memory.Term(float(baseline), source="live outside the ledger at bind"),
+            xla=memory.Term(spread=float(aggregate) * ranks, source=self.price_label()),
+            ranks=ranks, label=self.price_label())
 
     def preview(self, *, resident_bytes_per_rank,
                 workspace_bytes_per_rank, concurrent_with=()):
@@ -1234,12 +1246,12 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
         raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
     # The run's budget in decimal GB (was per_device_gb * 2**30: GiB, 7.4% over the deck).
-    from common.gpu_utils import device_budget_bytes, shared_device_room_bytes
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
     budget = int(device_budget_bytes())
-    # What is live outside the ledger now (the driver's arrays), the largest over processes:
-    # shared_device_room_bytes gathers every process's room and takes the minimum, so every
-    # rank enters the same call here and gets the same baseline (no rank-divergent flow).
-    baseline = max(0, budget - int(shared_device_room_bytes()))
+    # What the allocator holds outside the ledger now (the driver's arrays), the largest over
+    # processes: memory.room takes the minimum room, so every rank gets the same baseline.
+    baseline = max(0, budget - memory.room(bucketed=False))
     meta.shared_pole_capacity = CapacityLedger(
         meta, mesh_xy=mesh_xy, device_budget_bytes=budget, baseline_bytes=baseline)
     print_fn(f"shared-pole ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "

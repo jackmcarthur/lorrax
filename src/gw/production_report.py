@@ -870,9 +870,9 @@ class GWProductionReport:
         self._routes()
 
     def _routes(self) -> None:
-        """Every memory-driven route the run took and why (``common.gpu_utils.routes``)."""
-        from common.gpu_utils import routes
-        taken = routes()
+        """Every memory-driven route the run took and why (``lxkit.memory.routes``)."""
+        from lxkit import memory
+        taken = memory.routes()
         if not taken:
             return
         self.heading("Routes")
@@ -891,7 +891,7 @@ class GWProductionReport:
         which never falls) at the row's last exit and the rise the row's own
         intervals caused, each the max over ranks.  No planner prices the host.
         """
-        from common import timing
+        from common import gpu_utils, timing
         from lxkit import memory
         paths = [tuple(r.get("path", (r["name"],))) for r in rows]
         selfs = [_rank_peaks(r, "peak_self") for r in rows]
@@ -926,8 +926,7 @@ class GWProductionReport:
         priced = [(row, np.where(m >= 0, m, np.nan)) for row in memory.receipts()
                   for m in (_rank_peaks(row, "measured"),)]
         self.heading("Major-stage device and host memory")
-        from common import gpu_utils
-        budget = gpu_utils._RUN_DEVICE_BUDGET_GB
+        budget = memory.run().get("budget", 0.0) / 1e9
         run_peak = max((np.nanmax(v) for v in selfs if np.any(np.isfinite(v))), default=0.0)
         self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
                   f"rank(s); γ = peak / planner price")
@@ -974,6 +973,7 @@ class GWProductionReport:
                 self.emit("    " + memory.receipt_line(row["stage"], row["price"], worst,
                                                        row["exact"], row["source"])
                           + f" [x{row['count']}]")
+        self.emit("  " + memory.sizing()["line"])
         reads, seconds = timing.instrument_cost()
         self.emit(f"  instrument: {memory.source() or 'none'}; {reads} boundary "
                   f"reads on rank 0 took {seconds * 1e3:.1f} ms "

@@ -2042,7 +2042,7 @@ def _w_solve_pref_scalar(meta) -> float:
 
 def _dyson_route(dyson, n, stack, mesh_xy):
     """``("local" | "distributed", room)``: the deck's W plan, with the local plan
-    admitted only where one rank's whole matrices fit (``common.gpu_utils.admit_local``),
+    admitted only where one rank's whole matrices fit (``lxkit.memory.admit``),
     and the distributed plan's room per rank beside the faces (None on one rank).
     The room goes to the solve plan, so a leg's size route (distrib_la resolve guard
     1b, ``one_device``) cannot put the whole matrices that did not fit back on a rank.
@@ -2052,26 +2052,33 @@ def _dyson_route(dyson, n, stack, mesh_xy):
     one face-tiled LU pair. Priced from the shapes against the fixed device
     budget, not a live ledger; φ in the memory rule covers XLA's temporaries.
     """
-    from common.gpu_utils import admit_local, device_budget_bytes
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
     ranks = int(mesh_xy.size)
     site = f"W Dyson {int(stack)} x {int(n)}^2"
     faces = 16.0 * n * n * 3 * int(stack) / ranks
     room = max(0, int(device_budget_bytes() - faces)) if ranks > 1 else None
     if dyson == "distributed":
-        admit_local(site, 0, 0, forced="distributed")
+        memory.admit(site, (), 0, forced="distributed")
         return "distributed", room
     if ranks <= 1:
         return "local", None
-    whole = 16.0 * n * n * (3 * -(-int(stack) // ranks) + 2)
+    n2 = 16.0 * n * n
+    local_price = memory.Price(operands=memory.Term(
+        spread=3 * int(stack) * n2, grid=lambda p: n2 * (3 * -(-int(stack) // p) + 2),
+        source="V, chi, W faces + whole for ceil(stack/P) parents + one LU pair"), ranks=ranks)
+    mesh_price = memory.Price(operands=memory.Term(
+        spread=(3 * int(stack) + 2) * n2, source="V, chi, W faces + one face-tiled LU pair"),
+        outside=memory.contexts(), ranks=ranks)
 
     def probe():
         from ffi import _services
         _services.ensure_on_path()
         from distrib_la import resolve_backend
         resolve_backend("solve_lu", "distributed", mesh_xy)
-    local = admit_local(site, faces + whole, device_budget_bytes(),
-                        distributed_bytes=faces + 2 * 16.0 * n * n / ranks, probe=probe)
-    return ("local", None) if local else ("distributed", room)
+    route = memory.admit(site, (("local", local_price), ("distributed", mesh_price)),
+                         device_budget_bytes(), probe=probe)
+    return ("local", None) if route == "local" else ("distributed", room)
 
 
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,

@@ -477,7 +477,7 @@ def fit_gn_ppm_from_wc_pair(
     _qb = _gn_ppm_fit_q_block(_nq, *_fit_bytes, _free)
     from lxkit import memory
     memory.book(memory.priced(_qb * _fit_bytes[0] + 2 * _nq * _fit_bytes[1],
-                              f"GN-PPM fit, q block {_qb}/{_nq}"))
+                              f"GN-PPM fit, q block {_qb}/{_nq}", increment=True))
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
     # (one extra (nq, mu, nu) c128 tile, needed again after the tail policy
@@ -689,9 +689,10 @@ def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
     room = int(free_bytes) - 2 * int(nq) * int(out_bytes_per_q)
     qb = room // max(1, int(block_bytes_per_q))
     if qb < 1:
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("GN-PPM fit q block",
-                         int(block_bytes_per_q) + 2 * int(nq) * int(out_bytes_per_q), free_bytes)
+        from lxkit import memory
+        memory.admit("GN-PPM fit q block",
+                     memory.priced(int(block_bytes_per_q) + 2 * int(nq) * int(out_bytes_per_q),
+                                   "closed form"), free_bytes)
     return max(1, min(int(nq), int(qb)))
 
 

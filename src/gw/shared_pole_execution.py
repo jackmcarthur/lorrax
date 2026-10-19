@@ -107,10 +107,10 @@ def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole pa
     rank; ``carry`` is a resident the work runs beside. The face is the full
     mesh, one parent after another, priced only when the local route does not
     fit (its plan opens the provider). Decided and recorded by
-    ``common.gpu_utils.admit_local``. Returns ``(execution, resident,
+    ``lxkit.memory.admit``. Returns ``(execution, resident,
     workspace)``, the prices of the chosen route.
     """
-    from common.gpu_utils import admit_local
+    from lxkit import memory
     prices = {}
 
     def aggregate(execution):
@@ -119,10 +119,12 @@ def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole pa
                               workspace_bytes_per_rank=workspace,
                               concurrent_with=ledger.live_stages)
     row = aggregate('local')
-    local = admit_local(site, row['aggregate_bytes_per_rank'], row['available_device_bytes_per_rank'],
-                        distributed_bytes=lambda: aggregate('face')['aggregate_bytes_per_rank'],
-                        names=('local', 'face'))
-    execution = 'local' if local else 'face'
+    ledger_price = lambda r: memory.priced(r['aggregate_bytes_per_rank'], "shared-pole ledger")
+    execution = memory.admit(site, (
+        ('local', ledger_price(row)),
+        ('face', lambda: ledger_price(aggregate('face'))
+         + memory.Price(outside=memory.contexts()))),
+        row['available_device_bytes_per_rank'])
     if execution not in prices:
         aggregate(execution)
     return (execution, *prices[execution])
@@ -231,15 +233,18 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     reduction_phase = 'cross_reduction' if cross_original_sides is not None else 'reduction'
     reduction_args = (dict(cross_original_sides=cross_original_sides)
                       if cross_original_sides is not None else {})
-    from common.gpu_utils import admit_local, last_decision
+    from lxkit import memory
+    last_decision = memory.last_decision
 
     def admitted(rows):
         # The face's own batch fills the room later (face_batch_width), so its
         # price here is the provider's contexts alone; the caller records the
         # map's final route.
         need = max(row['aggregate_bytes_per_rank'] for row in rows)
-        return admit_local('shared-pole constructor', need, rows[0]['available_device_bytes_per_rank'],
-                           names=('local', 'face'), quiet=True)
+        return memory.admit('shared-pole constructor', (
+            ('local', memory.priced(need, "shared-pole ledger")),
+            ('face', memory.Price(outside=memory.contexts()))),
+            rows[0]['available_device_bytes_per_rank'], quiet=True) == 'local'
     receipt = dict(requested_layout=resolution.layout, conservative_pencil_side=side,
                    selection_face_count=selection_faces,
                    retained_output_upper_bound_bytes_per_rank=retained_outputs)
@@ -755,11 +760,11 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
     """The plan of one staged eigh stack ``stack`` (nb, n, n): route (c), whole matrices per rank,
     when its shape price (``distrib_la.eigh_stack_bytes``) beside ``beside`` bytes per rank and
     the ``live`` ledger stages fits the budget; otherwise the whole mesh
-    (``common.gpu_utils.admit_local``, which records the route). Shapes and the
+    (``lxkit.memory.admit``, which records the route). Shapes and the
     deck budget only, so every rank decides alike. ``backend`` is the deck's
     eigh request (``LinalgResolution.eigh_backend``) for the whole mesh."""
     import distrib_la
-    from common.gpu_utils import admit_local
+    from lxkit import memory
     from gw.shared_pole_capacity import _local_eigenplan
     n = int(stack[-1])
     local = _local_eigenplan(mesh, n)
@@ -773,9 +778,12 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
                      + distrib_la.eigh_stack_bytes(mesh_plan, stack, np.complex128))
     except RuntimeError as refusal:      # no whole-mesh library here: route (c) or that refusal
         mesh_plan, no_mesh, mesh_need = None, refusal, 0
-    if admit_local(f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2",
-                   row['aggregate_bytes_per_rank'], row['available_device_bytes_per_rank'],
-                   distributed_bytes=mesh_need, names=('route (c)', 'whole mesh')):
+    site = f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2"
+    if memory.admit(site, (
+            ('route (c)', memory.priced(row['aggregate_bytes_per_rank'], "eigh_stack_bytes")),
+            ('whole mesh', memory.priced(mesh_need, "eigh_stack_bytes (mesh)")
+             + memory.Price(outside=memory.contexts()))),
+            row['available_device_bytes_per_rank']) == 'route (c)':
         return local
     if no_mesh is not None:
         raise no_mesh

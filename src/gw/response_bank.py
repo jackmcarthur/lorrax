@@ -926,13 +926,14 @@ def dense_layout(meta, config, mesh_xy, n):
     return "local" if execution == "local" else "distributed"
 
 
-def _reserve(meta, stage, resident, workspace=0):
-    """Reserve a uniquely named actual-batch footprint in the shared ledger."""
+def _reserve(meta, stage, resident, workspace=0, runs_in=None):
+    """Reserve a uniquely named actual-batch footprint in the shared ledger, priced in the
+    section that allocates it (``runs_in``)."""
     ledger = meta.shared_pole_capacity
     name = f"{stage}:{len(ledger.entries)}"
     row = ledger.reserve(name, resident_bytes_per_rank=int(resident),
                         workspace_bytes_per_rank=int(workspace),
-                        concurrent_with=ledger.live_stages)
+                        concurrent_with=ledger.live_stages, runs_in=runs_in)
     return name, row
 
 
@@ -997,7 +998,8 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 # The caller reserves the sole carry; admit the actual
                 # Green/FFT workspace, without compiling a legacy comparator.
                 _, row = _reserve(meta, stage + "_temporaries", 0,
-                                  memory.temp_size_in_bytes + int(runtime_bytes))
+                                  memory.temp_size_in_bytes + int(runtime_bytes),
+                                  runs_in="bank.dispatch." + stage)
                 receipt["memory"].append(row)
             elif not stream:
                 layout = dense_layout(meta, config, mesh_xy, args[0].shape[-1])
@@ -1005,7 +1007,8 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
                 _, row = _reserve(meta, stage, memory.argument_size_in_bytes,
-                    memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"])
+                    memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"],
+                    runs_in="bank.dispatch." + stage)
                 receipt["memory"].append(row)
             receipt["compiled"].append(dict(stage=stage,
                 arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
@@ -1035,7 +1038,7 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout, room=None):
     backend = "off" if resolution.layout == "local" else "distributed"     # the root's GEMMs
     if resolution.layout == "local":
         # place() decides the root's eigh in the room beside the bank's live set (the caller's
-        # common.gpu_utils.shared_device_room_bytes, bucketed): whole matrices per rank only
+        # lxkit.memory.room, bucketed): whole matrices per rank only
         # where they fit (a whole n^2 per rank unpriced was 115 GB/rank at n 30000).
         if room is None:
             from common.gpu_utils import shared_device_room
