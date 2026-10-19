@@ -46,6 +46,7 @@ import math
 import os
 import threading
 import time
+import warnings
 from functools import lru_cache, partial
 
 import numpy as np
@@ -429,6 +430,33 @@ SELECT_MODE_DEFAULT: str = "deliver"
 SELECT_MODE_ENV = "LORRAX_CENTROID_SELECT"
 
 
+def select_mode() -> str:
+    """The resolved ``LORRAX_CENTROID_SELECT``; a mis-spelled mode refuses."""
+    mode = (os.environ.get(SELECT_MODE_ENV) or SELECT_MODE_DEFAULT
+            ).strip().lower()
+    if mode not in SELECT_MODES:
+        raise ValueError(
+            f"{SELECT_MODE_ENV}={mode!r} is not one of {SELECT_MODES}.  "
+            f"A mis-spelled mode is not silently 'deliver'.")
+    return mode
+
+
+def certified_group_prefix(piv_used, dense_group_id, d_taken, floor) -> int:
+    """Points in the longest whole-group prefix whose every pivot clears ``floor``.
+
+    Group-block selection admits a group whole, so a dependent row can sit
+    mid-order (the 2nd and 3rd images of an orbit whose first image was taken
+    just above the floor).  The cut is the start of the group holding the
+    first pivot at or below the floor; every earlier group is complete.
+    """
+    piv_used = np.asarray(piv_used)
+    below = np.flatnonzero(np.asarray(d_taken)[:piv_used.size] <= floor)
+    if below.size == 0:
+        return int(piv_used.size)
+    groups = np.asarray(dense_group_id)[piv_used]
+    return int(np.flatnonzero(groups == groups[below[0]])[0])
+
+
 def refuse_unless_select_certified(
     piv,
     rank: int,
@@ -580,12 +608,7 @@ def refuse_unless_select_certified(
     #
     # docs/architecture/rank_truncation_policy.md §7 owns this ruling.
     if rank_i < int(n_keep):
-        mode = (os.environ.get(SELECT_MODE_ENV) or SELECT_MODE_DEFAULT
-                ).strip().lower()
-        if mode not in SELECT_MODES:
-            raise ValueError(
-                f"{SELECT_MODE_ENV}={mode!r} is not one of {SELECT_MODES}.  "
-                f"A mis-spelled mode is not silently 'deliver'.")
+        mode = select_mode()
         note = (
             f"pivoted-Cholesky: asked for {int(n_keep)} {unit}, DELIVERED "
             f"{n_sel}, but only {rank_i} of them add an independent "
@@ -606,9 +629,13 @@ def refuse_unless_select_certified(
             f"  NOT the fix on this deck: widening the prune window "
             f"(--prune-n-cond / --prune-window vc_x_vc) changes sigTOT by "
             f"<2x here and never recovers the orbit-mode loss.  If you want "
-            f"a rank-clean set, LOWER N to {rank_i}.\n"
-            f"  strict : {SELECT_MODE_ENV}=strict restores the 2026-08-07 "
-            f"refusal.")
+            f"a rank-clean set, set {SELECT_MODE_ENV}=strict: in orbit "
+            f"(group-block) mode it delivers the longest whole-orbit prefix "
+            f"whose pivots all clear the floor.  Lowering N to {rank_i} is "
+            f"enough only in point mode; in orbit mode dependent points can "
+            f"sit mid-order.\n"
+            f"  strict : {SELECT_MODE_ENV}=strict delivers that prefix in "
+            f"orbit mode and refuses in point mode (the 2026-08-07 rule).")
         if mode == "strict":
             raise RuntimeError("pivoted-Cholesky REFUSES ("
                                + SELECT_MODE_ENV + "=strict):\n" + note)
@@ -1060,6 +1087,19 @@ def prune_candidates_by_pivoted_cholesky(
         n_delivered = int(keep_idx.shape[0])
         rank_i = int(rank)
         diag_host = np.real(np.asarray(jnp.diag(G)))[:M]
+        if rank_i < n_delivered and select_mode() == "strict":
+            floor = (float(np.sqrt(np.finfo(np.float64).eps)) if tol_rel is None
+                     else float(tol_rel)) * float(diag_host.max())
+            cut = certified_group_prefix(piv_used, dense_id,
+                                         np.asarray(d_taken), floor)
+            warnings.warn(
+                f"pivoted-Cholesky ({SELECT_MODE_ENV}=strict): {n_delivered} "
+                f"points selected but only {rank_i} independent; delivering "
+                f"the certified whole-orbit prefix of {cut} points (every "
+                f"pivot above the floor {floor:.3e}).", RuntimeWarning)
+            keep_idx, in_kept, order, piv_used = _emit_complete_groups(
+                cand_idx, dense_id, piv_used[:cut])
+            n_delivered = rank_i = int(keep_idx.shape[0])
         psd_host = (
             float(np.asarray(psd_info[0])), int(np.asarray(psd_info[1])),
             int(np.asarray(psd_info[2])))
