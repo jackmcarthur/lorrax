@@ -243,6 +243,9 @@ bundle's ζ and writes a copy of the bundle whose `W0_qmunu` is theirs
 (`--print-schema` lists the keys). [The theory page](theory/bgw_epsmat_export.md)
 owns the equations, the outputs and the refusals; the `[epsmat]` keys are in the
 [input reference](input_reference.md#epsmat-the-epsmat-input-file).
+`epsmat_ecut` (Ry, default 0 = the full sphere) sets the G cutoff of the
+written files; a smaller value writes the leading sub-block of the converged
+ε⁻¹, not a re-inversion ([theory §3](theory/bgw_epsmat_export.md#ecut)).
 
 
 ## bsemat — `bse.bsemat_cli`
@@ -269,6 +272,12 @@ per combination from a single load of the bundle, head split and gauge map, name
 `<stem>_<tag><ext>` after `-o` (for example `--kernel tda extended` writes
 `bsemat_tda.h5` and `bsemat_ext.h5`). Each `<file>.json` carries `stages`, the wall
 seconds of every stage, and rank 0 prints the `common.timing` stage table at the end.
+`--exciton-Q Q1 Q2 Q3` (crystal, default 0) writes the finite-momentum TDA kernel
+(BerkeleyGW `exciton_Q_shift` = −Q): on the restart grid from the restart's own
+states (`qflag` 2); off it, `--wfn-co` is the restart grid shifted by +Q, the
+electron leg comes from the deck's htransform and `--wfnq-co` is the restart
+grid's WFN (`qflag` 0). BerkeleyGW 4.0's absorption needs a compensating
+`eqp.dat` at `qflag` 2 ([theory](theory/bgw-bsemat-export.md#finite-q)).
 [The theory page](theory/bgw-bsemat-export.md) owns the equations, the conventions and the
 refusals.
 

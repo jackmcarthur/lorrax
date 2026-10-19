@@ -49,7 +49,7 @@ load (`wfn_loader.WfnLoader`); use a noncollinear calculation for magnetism.
 | `number_bands` (epsilon) | `number_bands_chi` | bands in $\chi_0$ |
 | `number_bands` (sigma) | `number_bands_sigma` | bands in the $\Sigma$ sum; `number_bands` sets both |
 | `band_index_min/max`, `diag` | `ncond`, or `number_bands_protected` (the total band count of the request: every occupied band plus conduction bands up to that total) | $\Sigma$ bands are always $[1, n_\mathrm{occ} + $`ncond`$]$; `nval` does not change them ([its roles](../input_reference.md#system)) |
-| `epsilon_cutoff`, `screened_coulomb_cutoff` | none | W is built in the ISDF basis from the same $V_q$ as $\Sigma_x$ (§4.1) |
+| `epsilon_cutoff`, `screened_coulomb_cutoff` | none in the GW run; `epsmat_ecut` of the ε⁻¹ export | W is built in the ISDF basis from the same $V_q$ as $\Sigma_x$ (§4.1); the exported `epsmat.h5` holds the leading sub-block of that ε⁻¹ at `epsmat_ecut` ([export §3](../theory/bgw_epsmat_export.md#ecut)) |
 | `bare_coulomb_cutoff` (sigma) | `bare_coulomb_cutoff` | default the WFN's `ecutwfc` in both codes |
 | `cell_average_cutoff` (sigma) | `mc_average_vcoul_body` | §4.1 |
 | `write_vcoul` (sigma) | `use_bgw_vcoul`, `bgw_vcoul_file` | LORRAX reads that table (§4.1) |
