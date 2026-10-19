@@ -2330,31 +2330,38 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                     th = time.perf_counter()
                     f_full = scr["f_eq"].copy()
                     f_full[scr["rows"], scr["win"]] = fb
+                    pin_error = None
                     if spm_head == "sites":
                         head_t, srec_h = spm_head_refit_sites(hctx, f_full)
                         td = time.perf_counter()
                         head_s += td - th
-                        _, hrec = spm_head_refit(hctx, f_full)          # diagnostic: the z = 0 pin
                         hbare = None
+                        try:                              # diagnostic: the z = 0 pin, never fatal here
+                            _, hrec = spm_head_refit(hctx, f_full)
+                        except ValueError as exc:
+                            hrec, pin_error = None, f"{type(exc).__name__}: {exc}"[:600]
                     else:
                         head_t, hrec = spm_head_refit(hctx, f_full)
                         td = time.perf_counter()
                         head_s += td - th
                         _, hbare = spm_head_refit(hctx, f_full, drude=False)      # diagnostic
                         srec_h = None
-                    hd = spm_head_diagnostics(hctx, f_full, hrec, hbare)
-                    line_h = spm_head_line(hd, screen_eq["head"]["wc0"])
+                    hd = {} if hrec is None else spm_head_diagnostics(hctx, f_full, hrec, hbare)
+                    line_h = ("; z = 0 pin (diagnostic): refused (" + pin_error[:160] + ")"
+                              if hrec is None else spm_head_line(hd, screen_eq["head"]["wc0"]))
                     if srec_h is not None:
                         line_h = (f"; head (sites): W^c_h(0) {srec_h['w0'].real:.6g} Ry bohr^3 "
                                   f"(site-model change {srec_h['delta'].real:+.6g}, cond "
                                   f"{srec_h['condition']:.2e}, {srec_h['n_valid']} poles)"
                                   + line_h.replace("; head refit:", "; z = 0 pin (diagnostic):"))
                     head_recs.append(_plain(dict(
-                        hd, line=line_h, mode=spm_head,
+                        hd, line=line_h, mode=spm_head, pin_error=pin_error,
                         refit_s=(srec_h["fit_s"] if srec_h is not None
                                  else hrec["response_s"] + hrec["fit_s"]),
                         diag_s=time.perf_counter() - td,
-                        poles=hrec["poles"], residues=hrec["residues"], drude=hrec["drude"],
+                        poles=None if hrec is None else hrec["poles"],
+                        residues=None if hrec is None else hrec["residues"],
+                        drude=None if hrec is None else hrec["drude"],
                         sites=None if srec_h is None else dict(
                             w0=srec_h["w0"], delta=srec_h["delta"], w_model=srec_h["w_model"],
                             condition=srec_h["condition"], n_valid=srec_h["n_valid"],

@@ -318,6 +318,37 @@ cell (a disc of the cell's area, slab Coulomb, the state's interband
 $\varepsilon$), and the gap shift that implies. The bound is a diagnostic,
 outside the propagation.
 
+On 516 (2v2c, 3×10⁹ V/m, V1BH against V1B) the $z=0$ pin is not usable for
+dynamics. At every carrier state, ≥ 99% of $\delta S(0)$ comes from pairs
+inside the valence or conduction manifold, split by < 0.5 eV (the DFT minimum
+in and next to the window is 27–48 meV), with weight
+$\propto(f_j-f_i)|v|^2/d^3$. The cross-gap pairs (Pauli blocking) give ≤ 1%.
+During the pulse the k-averaged $f_{131}>f_{130}$, and these inverted pairs
+anti-screen: $W^c_h(0)$ rises by up to 67%, the gap opens by +214 meV, and
+P(t) changes by 33% of max|P|. Such pairs respond on $\hbar/d$ ≈ 15–50 fs, so
+their adiabatic static limit is ill-posed for a non-thermal, inverted
+population, and the change is an artifact of the pin. The slab $q\to0$ cell
+average also refuses the pinned head, in two cases:
+- $|S(0)|$ grows by ≈ 19× (a uniform 5% shift);
+- $S(0)$ reaches the anti-screening zero of $1-v(q)q^2S$ inside the $q=0$
+  cell (+0.058 on 516, reached at 7×10⁹ V/m at 2.5 fs).
+
+`collision_spm_head = sites` reads the same response,
+$S(z;f)+D(\delta f)/z^2$, at the body recipe's support sites $z_s$ (the line
+at its height and the imaginary sites). It fits the scalar pole model there,
+without a $z=0$ sample, and moves the run's static value by the model's
+change:
+$$
+W^c_h(0;t)=W^c_h(0;{\rm run})+[M_f(0)-M_{\rm eq}(0)].
+$$
+The run's residues are rescaled to that value; the window Σ reads only the
+static value. A pair split by $d\ll|z_s|$ then enters as $\sim d/z_s^2$, as
+it does in the body. The refresh lines keep the $z=0$ pin as a diagnostic. On
+516 there are 20 sites: a line at height 2.60 eV with real parts 2.60–18.3 eV,
+and imaginary sites at 1.49, 4.89 and 16.0 eV. The fit keeps the poles below
+2 max|z_s|. At $\rho^{\rm eq}$ the site model gives −5413 Ry bohr³, against
+the pinned −5397 (0.3%).
+
 ### 1.5 The on-shell collision term {#damping}
 
 The dynamical members keep the anti-Hermitian part of the on-shell average and
@@ -1054,11 +1085,13 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    4×4). Change: separate encode (all bands) and decode (window) faces.
 7. **Head of $\delta\chi_0$.** `qsgw_head.build_dft_head_response` (:4175)
    builds the head from the DFT state. Done for the shared-pole refresh
-   (`collision_spm_head = refit`, §1.4): $S(z;f^{\rm eq})+S(z;\delta f)$ from the
-   head velocities and populations, plus the carriers' band-curvature Drude
-   term at $z\neq0$ (`qsgw_head.population_head_response`). Open: the GN-PPM
-   `refreshed` member, and the folded (`head_correction = full`) and metallic
-   heads (refused).
+   (`collision_spm_head = refit | sites`, §1.4): $S(z;f^{\rm eq})+S(z;\delta f)$
+   from the head velocities and populations, plus the carriers'
+   band-curvature Drude term at $z\neq0$ (`qsgw_head.population_head_response`).
+   The $z=0$ pin (`refit`) is an artifact for inverted, non-thermal
+   populations; `sites` reads the change where the body reads $W$. Open: the
+   GN-PPM `refreshed` member, and the folded (`head_correction = full`) and
+   metallic heads (refused).
 8. **In-jit refusals.** The prototype poisons ΔΣ with NaN and names the gate on
    the host (`dynsig.check_state`); the propagator should return the gate
    flags with each chunk.
