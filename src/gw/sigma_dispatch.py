@@ -1590,9 +1590,12 @@ def _compute_mpa_sigma(
             body = sector_result
     elif cd_handle is not None:
         from .cd.sigma import compute_sigma_c_cd_omega_grid
+        # The CD body takes an explicit frequency axis: the on-shell request's
+        # distinct frequencies, or the deck grid under sigma_omega_grid_debug.
         body = compute_sigma_c_cd_omega_grid(
             wfns, cd_handle, meta, mesh_xy, sym=sym, config=config, run_dir=input_dir,
-            sig_x=sig_x, **body_options)
+            sig_x=sig_x, **dict(body_options, omega_grid_ry=(
+                config.omega_grid_ry if request is None else request.frequencies_ry)))
     else:
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
