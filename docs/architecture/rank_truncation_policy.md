@@ -10,6 +10,14 @@ A user never chooses a truncation. Conditioning worsens with system size, so
 every rank cut either stays inside a certified regime or refuses, naming the
 number, the site and the fix.
 
+**The charge ζ solve (2026-10-19).** The charge CCT is no longer rank-cut: it
+is factored by a distributed Cholesky on the face (`isdf.cplus`) and certified
+by κ ≤ 1/`zeta_rcond` (power iteration for λ_max, inverse iteration for
+λ_min). An over-complete centroid set, which the eigh pseudo-inverse used to
+truncate, refuses as `GATE zeta_charge_conditioning` with the numerical rank
+against N_μ and the remedy (`LORRAX_CENTROID_SELECT=strict`, fewer centroids,
+more bands). The sections below still govern the other truncation sites.
+
 | module (L2) | owns |
 |---|---|
 | `common/rank_criterion` | how many directions survive, whether that was allowed, and the `RankReport` |

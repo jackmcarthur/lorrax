@@ -2623,21 +2623,11 @@ def _refit_kernels(nk, nb, ns, n_mu, zeta_solve):
 
     @jax.jit
     def _solve_zeta(C, Z):
-        # THE PRODUCER'S SOLVE, not a second implementation of it.  This
-        # used to be a plain Cholesky with a fixed 1e-14·|tr C| ridge, under
-        # a comment citing a private ridged-Cholesky helper of ``isdf.core``
-        # — a symbol that has never existed in this tree.  The production
-        # charge path is
-        # ``replicated_rank_truncate``: an eigh pseudo-inverse that DROPS
-        # every direction with λ < zeta_rcond·λ_max.  A ridged Cholesky
-        # KEEPS those directions and amplifies them by up to four orders
-        # more than the producer's κ cap allows, so ζ' differed from ζ in
-        # precisely the near-null subspace — and V_Q is quadratic in ζ.
-        # The tile identity ``refit_ongrid_null`` measured the consequence
-        # on five parents: worst-tile error monotone in the DISCARDED
-        # fraction (4.7 % → 3.289, 7.9 % → 16.0, 39.4 % → 50.9, 58.6 % →
-        # 139.9) against a 5.0e-02 bracket, while the htransform Galerkin
-        # residual moved eight orders and the tile null did not follow it
+        # THE PRODUCER'S SOLVE, not a second implementation of it: the charge
+        # channel's certified Cholesky (isdf.cplus), which refuses by name where
+        # the old eigh pseudo-inverse would have dropped near-null directions.
+        # A ridged Cholesky that KEEPS those directions amplified them past the
+        # producer's κ cap; V_Q is quadratic in ζ, so ζ' must match ζ exactly
         # (tests/known_failures/2026-08-11-narrowed-zeta-window-clears-fh-\
         # and-the-tile-null-still-refuses.md §4).
         return solve_zeta_charge_dense(

@@ -472,6 +472,39 @@ def distributed_cholesky(
     return SlateLowerL(raw=L_raw_T, mesh=mesh, n=n, nb=nb)
 
 
+_TRSM_FFI_TARGET = "lorrax_slate_trsm"
+
+
+_TRSM_JIT: dict = {}
+
+
+def distributed_trsm(L: "SlateLowerL", B: jax.Array, *, mesh: Mesh, op: str = "N") -> jax.Array:
+    """Solve ``L X = B`` (``op='N'``) or ``L^H X = B`` (``op='C'``) for a :class:`SlateLowerL`
+    factor; ``B`` and ``X`` are 2-D at ``P('x','y')`` (restored from 8deacaeae^ for the
+    Cholesky solve, the handle path only)."""
+    if op not in ("N", "C"):
+        raise ValueError(f"distributed_trsm: op must be 'N' or 'C'; got {op!r}")
+    p, q = validate_mesh(mesh)
+    n, m = L.n, int(B.shape[1])
+    if B.ndim != 2 or B.shape[0] != n or B.shape[0] % p or m % q or L.raw.dtype != B.dtype:
+        raise ValueError(f"distributed_trsm: B {B.shape} {B.dtype} against L n={n} {L.raw.dtype} on {p}x{q}")
+    ensure_registered(mesh, _TRSM_FFI_TARGET)
+    key = (mesh, n, m, L.nb, op, B.dtype, int(context_key(mesh)))
+    fn = _TRSM_JIT.get(key)
+    if fn is None:      # one program per shape: an eager shard_map would re-trace every call
+        attrs = dict(n=n, m=m, nb=L.nb, side=0, uplo=0, op={"N": 0, "C": 2}[op], diag=0,
+                     alpha_re=1.0, alpha_im=0.0, ctx_key=key[-1])
+        X_local_T = jax.ShapeDtypeStruct((m // q, n // p), B.dtype)
+
+        @partial(shard_map, mesh=mesh, in_specs=(P("y", "x"), P("x", "y")), out_specs=P("x", "y"),
+                 check_vma=False)
+        def _trsm(local_L, local_B):
+            X_T = jax.ffi.ffi_call(_TRSM_FFI_TARGET, X_local_T)(local_L, jnp.transpose(local_B, (1, 0)), **attrs)
+            return jnp.transpose(X_T, (1, 0))
+        fn = _TRSM_JIT[key] = jax.jit(_trsm)
+    return fn(L.raw, B)
+
+
 # =========================================================================
 #  eigh  (merged from slate/eigh.py)
 # =========================================================================

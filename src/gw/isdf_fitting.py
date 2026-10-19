@@ -813,22 +813,20 @@ def fit_zeta_to_h5(
             timing.stage_wait(C_q_flat)
 
         with timing.section("zeta_fit.cholesky"):
-            # Route G applies a WHOLE-TILE factor on each G tile: the charge
-            # channel's rank-truncated pseudo-inverse, or a current channel's
-            # local pivoted LU.
-            _kind = 'lu' if v != 0 else _resolve_solver_kind(
-                0, solver_kind,
-                n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]))
+            # The charge channel's certified face Cholesky (ζ solved on the
+            # face per G tile), or a current channel's whole-tile pivoted LU.
+            _kind = 'lu' if v != 0 else _resolve_solver_kind(0, solver_kind)
             _factor = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=v,
                 n_rmu_logical=n_rmu_solve, solver_kind=_kind,
                 zeta_rcond=zeta_rcond)
             # The charge factor is one array; a current factor is (factor, piv).
             L_q, lu_piv = _factor if v != 0 else (_factor, None)
-            timing.stage_wait(L_q)
-            print_fn(f"  μ_L={v} factor: {_kind} -> "
-                     f"{'hoisted pivoted LU' if lu_piv is not None else 'whole-tile'} "
-                     f"{tuple(L_q.shape)}, back-solve on the q owners")
+            if lu_piv is not None:
+                timing.stage_wait(L_q)
+            print_fn(f"  μ_L={v} factor: {_kind} -> " + (
+                f"hoisted pivoted LU {tuple(L_q.shape)}, back-solve on the q owners" if lu_piv is not None
+                else f"{L_q.backend} Cholesky on the face, back-solve on the face"))
         with timing.section("zeta_fit.factor_residency"):
             L_q, lu_piv = zeta_factor_resident(
                 L_q, lu_piv, mesh_xy, solver_kind=_kind)
