@@ -12,7 +12,8 @@ sweep).  Arms: the 04 shared-pole run at each --etas, the source rerun at that e
 (``sigma_regularization_ev`` override: the recipe couples eta to W, so W is refitted at
 every eta), at rho_eq and at the hot state (--hot-amount of band 129 moved to 130 at
 every k) with W refitted there (``tdagw.dynsig.spm_refit``; V1 the production ladder,
-V2 --v2-* supports); the 07 GN-PPM run (W independent of eta) at each eta, rho_eq.
+V2 --v2-* supports) and, as the control, with the equilibrium W (state ``hot_Weq``); the 07
+GN-PPM run (W independent of eta) at each eta, rho_eq.
 --qp-g: also the 04 arm at those etas with the window's energies in G set to the run's
 own eqp1 (an eigenvalue-updated G on the window bands only).  Rank 0 writes one npz per
 sweep (DIR/sig_<arm>_<state>_eta<eta>.npz: pair, omega cube of the block, grid, the
@@ -144,7 +145,7 @@ def main():
                 say(f"[qp_516] eta {eta:g}: every sweep exists, source skipped (--resume)")
                 continue
             src = D.gw_window_source(deck, mesh, workdir=os.path.join(os.path.abspath(a.out), f"driver_spm_{eta:g}"),
-                                     screening=any(s.startswith("hot") for s in states),
+                                     screening=any(s.startswith("hot_V") for s in states),
                                      overrides={"sigma_regularization_ev": eta}, say=say)
             occ = np.asarray(jax.device_get(src["wfns"].occ), np.float64)
             if "eqp1_vs_enk_ev" not in out:      # eqp1's k order and DFT column against the carrier's
@@ -167,6 +168,9 @@ def main():
                 out.setdefault("qp_g_note", f"window energies in G = eqp1 (abs eV); E_F {efermi_ev:.4f} eV")
             for st in states:
                 if not st.startswith("hot") or have(f"spm_{st}_eta{eta:g}"):
+                    continue
+                if st == "hot_Weq":            # control: the hot populations in G, the equilibrium W
+                    sweep(f"spm_{st}_eta{eta:g}", src, src["poles"], f_hot, eta)
                     continue
                 V = st.split("_")[1]
                 sites = "" if V == "V1" else _v2_sites(
