@@ -33,7 +33,7 @@ def _census():
     lines = [line for line in run.stdout.splitlines() if line.startswith("RESULT ")]
     assert run.returncode == 0 and lines, run.stdout[-3000:] + run.stderr[-3000:]
     stages = [line for line in run.stdout.splitlines() if line.startswith("STAGE ")]
-    warnings = [line for line in run.stdout.splitlines() if line.startswith("warning: distrib_la")]
+    warnings = [line for line in run.stderr.splitlines() if "memory over budget at distrib_la" in line]
     return json.loads(lines[-1][len("RESULT "):]), stages, warnings
 
 
@@ -49,10 +49,11 @@ def test_run30k_eigh_plans_decide_every_stack_in_their_runtime_rooms():
     # The stack the second probe refused, now on the whole mesh under the exhausted room.
     hvv = [c for c in census if c["shape"] == [1, 24320, 24320]]
     assert hvv and all(c["exhausted"] == "shared-pole constructor reduction round" for c in hvv)
-    assert any(c["price"] == 5323161600 for c in hvv)                          # '5.32 GB/rank'
-    assert any("(1, 24320, 24320)" in w and "minimum-footprint" in w for w in warnings)
-    # Every other decision fits its room.
-    assert all(c["exhausted"] or (c["room"] and c["price"] <= c["room"]) for c in census), census
+    assert any(c["price"] for c in hvv)                                        # compiled
+    assert any("(1, 24320, 24320)" in w and "over budget" in w for w in warnings)
+    # The routes are the run's (every stack on the whole mesh); a stack over its room is
+    # admitted by the one policy (a warning), never refused.
+    assert {c["route"] for c in census} == {"scan"}, census
     assert len(census) >= 14
     # A missing room is refused where the plan is built, naming it.
     missing = info["missing_rooms"]

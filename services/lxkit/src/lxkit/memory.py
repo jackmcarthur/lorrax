@@ -532,16 +532,22 @@ def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int,
              f"n {row.n[0]}-{row.n[1]}, P {row.p[0]}-{row.p[1]}")
     if row is not None and row.n[0] <= n <= row.n[1] and row.p[0] <= ranks <= row.p[1]:
         where = None
-    if where and STRICT:
-        raise RuntimeError(f"GATE memory_unpriced: got: {where}; want: a measurement there")
     if where:
-        _warn(f"unpriced {leg.key}/{lib}/{op}", 0.0, f"memory: {where}; "
-              + ("priced 0" if row is None else "extrapolated"), local=False)
+        unpriced(where, "priced 0" if row is None else "extrapolated")
     if row is None:
         return Term(0.0, source=f"UNPRICED {leg.key}/{lib}/{op}")
     nbytes = row.ratio * (row.unit(int(n), int(ranks), int(itemsize)) if unit is None else unit)
     return Term(nbytes, source=("EXTRAPOLATED " if where else "")
                 + f"{row.ratio:g} x {row.unit_name} ({row.source})")
+
+
+def unpriced(what: str, then: str = "priced 0") -> None:
+    """A figure no compile, query or measurement gives here: GATE memory_unpriced under STRICT,
+    else one warning per kind."""
+    if STRICT:
+        raise RuntimeError(f"GATE memory_unpriced: got: {what}; want: a compiled figure, a "
+                           "library query or a measurement there")
+    _warn(f"unpriced {what.split(' ')[0]}", 0.0, f"memory: {what}; {then}", local=False)
 
 
 # ---------------------------------------------------------------------------

@@ -244,6 +244,7 @@ class StackRoute(NamedTuple):
 #: Decided stack routes, one per (mesh, op, B, n, dtype, room, phase, backend,
 #: route), and the keys
 #: :func:`new_stack_routes` has already reported.
+_MESH_PROGRAMS: dict = {}
 _STACK_ROUTES: dict = {}
 _REPORTED: set = set()
 
@@ -281,32 +282,32 @@ def new_stack_routes() -> list[str]:
 PHASES = ("all", "first", "retry")
 
 
-def _stack_price(op, mesh, nb, n, dtype, rounds, gathered=False) -> int:
-    """Per-rank device bytes of a route-(c) stack program in ``rounds``, priced from the shapes.
-
-    :data:`BATCH_EIGH_TILES` n^2 per whole matrix a rank holds at a time (the
-    first attempt, its exchanges, the local solve with its workspace and the
-    vectors, as :func:`distrib_la.eigh_stack_bytes` prices it), plus the
-    checked chain's temporaries (:data:`CHECKED_EIGH_TILES`) and its gathered
-    retry where admitted. The same on every rank: nothing is compiled to be
-    measured and no size is exchanged.
-    """
-    ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
-    per_rank = -(-(-(-nb // rounds)) // ranks)
-    item = np.dtype(dtype).itemsize
-    whole = BATCH_EIGH_TILES * n * n * item
-    checked = CHECKED_EIGH_TILES * (n * n // ranks) * item
-    if op != "normal_eigh" and gathered:
-        checked += _gathered_bytes((n, n), dtype)
-    return per_rank * whole + checked
+def compiled_bytes(program, mesh, shape, dtype) -> int:
+    """Per-rank bytes ``program`` allocates beside its operand, one face stack ``shape``
+    (``P(None,'x','y')``; a matrix ``P('x','y')``; replicated where it does not tile the
+    mesh, which changes only the argument): ``memory_analysis`` temp + output - alias of
+    ``lower().compile()`` at the abstract operand, never run; cached per program, mesh, shape
+    and dtype.  The same on every rank."""
+    key = (program, mesh_key(mesh), tuple(int(v) for v in shape), np.dtype(dtype).name)
+    if key not in _COMPILED:
+        tiles = key[2][-2] % int(mesh.shape["x"]) == 0 and key[2][-1] % int(mesh.shape["y"]) == 0
+        spec = P() if not tiles else P(None, "x", "y") if len(shape) == 3 else P("x", "y")
+        operand = jax.ShapeDtypeStruct(key[2], np.dtype(dtype), sharding=NamedSharding(mesh, spec))
+        _COMPILED[key] = int(_program_bytes(program, (operand,)) or 0)
+    return _COMPILED[key]
 
 
-def _mesh_price(n, dtype, ranks) -> int:
-    """Per-rank bytes of one n x n eigh on the whole mesh, from the shape: the checked chain's
-    temporaries (:data:`CHECKED_EIGH_TILES`), the vectors and the provider's workspace (one
-    n^2/P tile each; cuSOLVERMp 0.9.1's aligned workspace is 1.1 n^2/P at 4x4, n 100000,
-    A100; other providers unmeasured)."""
-    return (CHECKED_EIGH_TILES + 2) * -(-n * n * np.dtype(dtype).itemsize // ranks)
+_COMPILED: dict = {}
+
+
+def _stack_bytes(op, mesh, nb, n, dtype, rounds, phase="all", gathered=False) -> int:
+    """Route (c)'s program for an (nb, n, n) stack in ``rounds`` and ``phase``, compiled at the
+    extent padded to the mesh tile (the route takes a tiling face; callers pad to it)."""
+    tile = math.lcm(int(mesh.shape["x"]), int(mesh.shape["y"]))
+    n = -(-int(n) // tile) * tile
+    program = _reshard_stack_program(op, mesh, (int(nb), int(n), int(n)), np.dtype(dtype).name,
+                                     int(rounds), phase, None, bool(gathered))
+    return compiled_bytes(program, mesh, (nb, n, n), dtype)
 
 
 #: Measured eigh walls by platform, complex128: CUDA = A100-SXM4-80GB, ``dla_sweep`` P4 2x2 (the
@@ -340,69 +341,45 @@ def _eigh_seconds(kind, n, ranks=4, platform="CUDA"):
     return pts[0][1] + (t - pts[0][1]) * 4 / ranks
 
 
-def place(op, mesh, nb, n, dtype, room, provider, backend=None) -> StackRoute:
+def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> StackRoute:
     """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank: the faster of the
     routes whose price fits, priced from the shapes only (no vendor query) and timed by
     :func:`_eigh_seconds`, so every rank decides alike with no exchange.
 
-    Route (c) at the most whole matrices per rank whose program (:func:`_stack_price`) fits,
-    ceil(nb/P) one-device solves; the whole mesh (:func:`_mesh_price`), nb mesh solves. A
-    single large matrix goes to the mesh (route (c) pads it to every rank and solves it on
-    one); a small stack stays whole per rank. A ``one_device`` plan's fallback holds one whole
-    matrix per rank (resolve's size route), priced so. :meth:`Plan.stack_route` refuses by
-    name a fallback over ``room`` (no route fits). Route (c) never costs less than the mesh
-    (8 n^2 + 7 n^2/P against 9 n^2/P), so a mesh over the room has no route (c) under it.
+    Route (c) at the most whole matrices per rank whose compiled program (:func:`_stack_bytes`)
+    fits, ceil(nb/P) one-device solves; else the whole mesh (``mesh_bytes()``: the plan's own
+    program compiled, plus its provider's workspace query), nb mesh solves. A single large
+    matrix goes to the mesh (route (c) pads it to every rank and solves it on one); a small
+    stack stays whole per rank. The rounds step down in proportion to the compiled figure
+    (a chooser); the compiled figure of each candidate decides. :meth:`Plan.stack_route`
+    refuses by name a fallback over ``room`` (no route fits).
     """
     x, y = int(mesh.shape["x"]), int(mesh.shape["y"])
-    ranks, gathered = x * y, _gathered_admitted((n, n), dtype, room)
+    ranks, gathered = x * y, _gathered_admitted(mesh, (n, n), dtype, room)
     platform = mesh_platform(mesh)
-    whole = StackRoute(provider, 0, 1, (BATCH_EIGH_TILES * n * n * np.dtype(dtype).itemsize
-                                        if backend == ONE_DEVICE else _mesh_price(n, dtype, ranks)), room)
     if n % x == 0 and n % y == 0:
         per_rank = -(-nb // ranks)
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             tried = -(-(-(-nb // rounds)) // ranks)
-            price = _stack_price(op, mesh, nb, n, dtype, rounds, gathered)
+            price = _stack_bytes(op, mesh, nb, n, dtype, rounds, phase, gathered)
             if price <= room:
                 one, on_mesh = (_eigh_seconds(k, n, ranks, platform) for k in ("one", "mesh"))
                 if one is None or -(-nb // ranks) * one <= nb * on_mesh:
                     return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
                 break
             per_rank = min(per_rank - 1, max(1, per_rank * room // price))
-    return whole
+    return StackRoute(provider, 0, 1, mesh_bytes(), room)
 
 
-def _gathered_admitted(shape, dtype, room=None) -> bool:
-    """Whether an eigh's gathered retry joins its chain: the matrices, their
-    vectors and the solver's copy (GATHERED_EIGH_FACTOR n^2 elements each)
-    within GATHERED_EIGH_BYTES, or with the local heevd/syevd workspace within the
-    plan's room (its ``budget_bytes``; the programs that hold the retry are priced
-    in it: :func:`_stack_price`, ``distrib_la.workspace``). Shapes and a caller's
-    agreed room: the same on every rank. cuSOLVERMp 0.9.1 left n 30000 (run30k) with
-    no correct attempt short of this one."""
-    small = GATHERED_EIGH_FACTOR * np.dtype(dtype).itemsize * int(np.prod(tuple(shape)))
-    return small <= GATHERED_EIGH_BYTES or (room is not None and _gathered_bytes(shape, dtype) <= room)
-
-
-def local_eigh_workspace(n, dtype, platform) -> int:
-    """Device bytes of one local n x n eigh's workspace (``lxkit.memory.vendor``: a remembered
-    query, else the leg's measured row -- cusolverDnXsyevd = 2.0 x LAPACK heevd on CUDA, LAPACK
-    itself on the host).  No vendor query is issued while planning (a query at trace time could
-    create a handle mid-run)."""
-    from lxkit import leg_for_platform, memory
-    cuda = platform == "CUDA"
-    return int(memory.vendor(leg_for_platform("CUDA" if cuda else "cpu"), "cusolverdn" if cuda
-                             else "lapack", "heevd", int(n), 1, np.dtype(dtype).itemsize).fixed)
-
-
-def _gathered_bytes(shape, dtype) -> int:
-    """Per-rank bytes the gathered retry reserves: GATHERED_EIGH_FACTOR n^2 per matrix and the
-    local eigh workspace (:func:`local_eigh_workspace`)."""
-    from lxkit import device_vendor
-    item, elems, n = np.dtype(dtype).itemsize, int(np.prod(tuple(shape))), int(shape[-1])
-    platform = "CUDA" if device_vendor(jax.devices()[0]) == "cuda" else "other"
-    return GATHERED_EIGH_FACTOR * item * elems + elems // (n * n) * local_eigh_workspace(n, dtype, platform)
+def _gathered_admitted(mesh, shape, dtype, room=None) -> bool:
+    """Whether an eigh's gathered retry joins its chain: the gathered solve's compiled figure
+    (the whole matrix, its vectors and the local solve's workspace on every rank) within
+    GATHERED_EIGH_BYTES, or within the plan's room (its ``budget_bytes``).  The chain that holds
+    it is priced compiled in the same room.  cuSOLVERMp 0.9.1 left n 30000 (run30k) with no
+    correct attempt short of this one."""
+    need = compiled_bytes(_gathered_program(mesh), mesh, tuple(int(v) for v in shape), dtype)
+    return need <= GATHERED_EIGH_BYTES or (room is not None and need <= room)
 
 
 @lru_cache(maxsize=None)
@@ -526,23 +503,17 @@ def _eigh_columns(backend: str, lam, Q):
     return lam, Q
 
 
-#: Per-rank bytes a gathered local eigh retry may take when the plan has no
-#: budget, and the n x n element copies it holds per rank. XLA reserves the
-#: retry inside every program that contains the eigh, executed or not:
-#: 1.75 n^2 per rank measured (memory_analysis, n 3328, P16), so the cap is
-#: small (n <= 1448 complex128) and planners price it (workspace.py).
+#: The compiled bytes a gathered retry may take when the plan has no room (a cap on a
+#: compiled figure: XLA reserves the retry in every program that contains the eigh).
 GATHERED_EIGH_BYTES = 64 << 20
-GATHERED_EIGH_FACTOR = 2
-#: The checked eigh chain's own XLA temporaries per rank, in units of
-#: n^2 / P elements (deflation, probes, retries; measured 7.0-7.1 at n 3328
-#: and 9152, P16, against 1-2 for a bare deflated eigh).
-CHECKED_EIGH_TILES = 7
-#: What route (c) adds per rank for each whole n x n matrix the rank holds, in
-#: n^2 elements: the staged exchanges, the local solve with its workspace, the
-#: vectors and the first attempt's check, the operand excluded. Compiled size
-#: plus the vendor query on A100 (bundle B11, one or two matrices per rank):
-#: 7.96-7.98 at P64 for n 6144-18432, 7.9-8.0 at P4 for n 984-7936.
+#: What the one-device chooser proposes per whole matrix a rank holds (n^2 elements); the
+#: compiled one-device program decides (``distrib_la._one_device``).
 BATCH_EIGH_TILES = 8
+
+
+@lru_cache(maxsize=None)
+def _gathered_program(mesh):
+    return jax.jit(partial(_gathered_eigh, mesh=mesh))
 
 
 def _gathered_eigh(A, *, mesh):
@@ -1030,13 +1001,13 @@ def _native2d_trace_fn(impl: Callable, mesh: Mesh) -> Callable:
 def _describe_stack(route: StackRoute) -> str:
     """One phrase for a decided stack route (log line and :meth:`Plan.describe`)."""
     gb = lambda v: "n/a" if v is None else f"{v / 1e9:.2f} GB"
-    sized = ", priced from the shapes" if route.program_bytes is not None else ""
+    sized = ", compiled, never run" if route.program_bytes is not None else ""
     if route.route == ROUTE_BATCH_RESHARD:
         return (f"{route.route}, {route.per_rank} whole matrix(es) per rank, "
-                f"{route.rounds} round(s), compiled {gb(route.program_bytes)}/rank of room "
+                f"{route.rounds} round(s), {gb(route.program_bytes)}/rank of room "
                 f"{gb(route.room)}{sized}")
     if route.program_bytes is None:
-        return f"{route.route} on the whole mesh (room {gb(route.room)})"
+        return f"{route.route} on the whole mesh (unpriced on this host; room {gb(route.room)})"
     return f"{route.route} on the whole mesh ({gb(route.program_bytes)}/rank of room {gb(route.room)}{sized})"
 
 
@@ -1314,19 +1285,18 @@ class Plan:
             if decided.route != ROUTE_BATCH_RESHARD:
                 self.require_capacity(
                     f"the eigh stack {shape} ({_describe_stack(decided)})")
-                if decided.program_bytes > decided.room and self.room_exhausted is not None:
-                    # The stage was admitted over budget: the whole mesh is the smallest route.
-                    x = self.room_exhausted
-                    print(f"warning: distrib_la {op} stack {shape} {np.dtype(dtype).name}: room "
-                          f"exhausted by the admitted over-budget stage {x.stage} (priced "
-                          f"{x.priced_bytes / 1e9:.2f} GB/rank of {x.available_bytes / 1e9:.2f}); "
-                          f"on the whole mesh at {decided.program_bytes / 1e9:.2f} GB/rank, the "
-                          f"minimum-footprint route (an OOM is possible)", flush=True)
-                elif decided.program_bytes > decided.room:
-                    raise RuntimeError(
-                        f"GATE distrib_la_capacity: the {op} stack {shape} {np.dtype(dtype).name} "
-                        f"needs {decided.program_bytes / 1e9:.2f} GB/rank on the whole mesh, over its "
-                        f"room {decided.room / 1e9:.2f} GB/rank (route (c) holds whole matrices: more).")
+                if decided.program_bytes is not None and decided.program_bytes > decided.room:
+                    # Over the room (an over-budget stage exhausted it, or the mesh is over it):
+                    # the whole mesh is the smallest route; the one policy warns.  Its bytes are
+                    # a part of the stage it runs in (sizing and the banner read that stage).
+                    from lxkit import memory
+                    stack = f"distrib_la {op} stack {shape} {np.dtype(dtype).name} on the whole mesh"
+                    memory.admit(stack,
+                                 memory.Price(xla=memory.Term(
+                                     spread=float(decided.program_bytes) * self.mesh.size,
+                                     source="the plan's program, compiled (+ provider workspace "
+                                            "query), face-sharded"), ranks=self.mesh.size),
+                                 decided.room, runs_in=stack, device=False)
             _STACK_ROUTES[key] = decided
         return decided
 
@@ -1352,7 +1322,42 @@ class Plan:
         return static
 
     def _decide_stack(self, op, nb, n, dtype, phase, traced=True) -> StackRoute:
-        return place(op, self.mesh, nb, n, dtype, int(self.budget_bytes), self.batched_route, self.backend)
+        return place(op, self.mesh, nb, n, dtype, int(self.budget_bytes), self.batched_route,
+                     lambda: self.mesh_bytes(op, nb, n, dtype, phase), phase)
+
+    def mesh_bytes(self, op, nb, n, dtype, phase="all") -> int | None:
+        """The bytes per rank of this plan's own program for an (nb, n, n) stack off route (c):
+        compiled (``lower().compile()`` at the abstract face operand, ``phase`` of the checked
+        chain), plus the workspace the provider allocates outside XLA (its size query,
+        ``distrib_la.workspace_bytes_per_rank``).  None where the library cannot be lowered on
+        this host (GATE memory_unpriced under STRICT).  one_device: the size route's figure
+        (``_one_device.one_device_bytes`` per held matrix, the chooser resolve selects it by)."""
+        if self.backend == ONE_DEVICE:
+            from distrib_la import _one_device as od, resolve as _resolve
+            ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
+            platform = _resolve.mesh_platform(self.mesh)
+            bound = _resolve.one_device_max_n(op, platform, self.budget_bytes) or int(n)
+            return od.held_per_rank(int(nb), int(n), ranks, _resolve.one_device_round_n(
+                op, platform, bound)) * od.one_device_bytes("eigh", int(n), np.dtype(dtype).itemsize)
+        import distrib_la
+        from distrib_la._result_check import _in_phase
+        key = ("mesh", self.backend, self.batched_route, op, phase, self.budget_bytes)
+        program = _MESH_PROGRAMS.get(key + (mesh_key(self.mesh),))
+        if program is None:
+            route = self.batched_route if self.batched_route != ROUTE_BATCH_RESHARD else ROUTE_SCAN
+            program = _MESH_PROGRAMS[key + (mesh_key(self.mesh),)] = _in_phase(
+                lambda A: self.batched(A, _route=route), phase)
+        try:
+            compiled = compiled_bytes(program, self.mesh, (nb, n, n), dtype)
+        except Exception as exc:                               # noqa: BLE001
+            from lxkit import memory
+            memory.unpriced(f"distrib_la/{self.backend}/{op} program at n {int(n)} does not "
+                            f"lower on this host ({type(exc).__name__}: {str(exc)[:120]})",
+                            "the route is decided without its price")
+            return None
+        vendor = (distrib_la.workspace_bytes_per_rank(self, "eigh", ((int(nb), int(n), int(n)),), dtype)
+                  if self.backend == "cusolvermp" else 0)
+        return compiled + int(vendor)
 
     @property
     def native_fn(self) -> Callable:
@@ -1529,7 +1534,7 @@ class Plan:
             # A gathered local solve, where the whole matrix, its vectors and the
             # solver's copy fit GATHERED_EIGH_BYTES, or with its workspace the plan's
             # room, on every rank (_gathered_admitted; priced in the same room).
-            if _gathered_admitted(A.shape, A.dtype, self.budget_bytes):
+            if _gathered_admitted(mesh, A.shape[-2:], A.dtype, self.budget_bytes):
                 attempts.append(partial(_gathered_eigh, mesh=mesh))
             # An eager call's first program holds the first attempt; its retry
             # program the rest (Plan._program). A traced call holds them all.
@@ -1703,7 +1708,7 @@ class Plan:
         def program(phase):
             return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), phase,
                                           cut if cut is None or callable(cut) else float(cut),
-                                          _gathered_admitted(shape[-2:], dtype, self.budget_bytes))
+                                          _gathered_admitted(self.mesh, shape[-2:], dtype, self.budget_bytes))
         if op == "normal_eigh":
             return program("all")(A)
         if isinstance(A, jax.core.Tracer):

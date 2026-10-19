@@ -44,7 +44,11 @@ import gw.shared_pole_execution as spe
 def mesh_plan(mesh, n, backend):
     p = distrib_la.plan("eigh", mesh, n=int(n), backend="off", batched_route="auto", budget_bytes=0,
                         price_only=True)
-    return dataclasses.replace(p, backend="cusolvermp")
+    return as_mp(p)
+def as_mp(p):
+    """A plan as the leg's cuSOLVERMp plan: its backend and its face operand layouts."""
+    return dataclasses.replace(p, backend="cusolvermp", in_sharding=NamedSharding(p.mesh, P("x", "y")),
+                               batch_in_sharding=NamedSharding(p.mesh, P(None, "x", "y")))
 spe._face_eigh = mesh_plan
 # cuSOLVERMp's workspace is a native query (GPU only): the run's measured 7.38 GB/rank. Local
 # plans price theirs from the leg's measured cusolverDn row (distrib_la.workspace).
@@ -66,16 +70,16 @@ def stack_route(self, shape, dtype, op="eigh", traced=True):
                        exhausted=None if self.room_exhausted is None else self.room_exhausted.stage))
     return d
 _pl.Plan.stack_route = stack_route
-# Below the decision: the vendor solve as shapes (route_for -> stack_route already ran).
-_batched = _pl.Plan.batched
-def batched(self, A, *args, **kw):
-    if self.backend == "cusolvermp" and self.op == "eigh":
-        self.route_for(A.shape, A.dtype, isinstance(A, jax.core.Tracer))
-        kw.pop("cut", None)
-        w, v = jnp.linalg.eigh(A)
-        return w, v
-    return _batched(self, A, *args, **kw)
-_pl.Plan.batched = batched
+# Below the decision: the library call as shapes, so the service's own checked chain compiles
+# around it.  cuSOLVERMp holds an operand copy (it destroys an aliased one) and returns the
+# vectors at A's face layout and the values replicated; its workspace is the query above.
+import distrib_la._cusolvermp as _mp
+def _mp_eigh(A, *, mesh, compute_evecs=True, block=None, side=None):
+    face = NamedSharding(mesh, P("x", "y"))
+    work = jax.lax.with_sharding_constraint(A * (1 + 0j), face)
+    return (jax.lax.with_sharding_constraint(jnp.zeros(A.shape[-1], jnp.float64), NamedSharding(mesh, P())),
+            jax.lax.with_sharding_constraint(work * 1, face))
+_mp.distributed_eigh = _mp_eigh
 
 def stage(name, fn):
     if name.startswith("constructor"):
@@ -135,7 +139,7 @@ def bank_coulomb():
     from gw import response_bank as rb
     room = gpu_utils.shared_device_room("shared-pole bank Coulomb root eigh")
     p = distrib_la.plan("eigh", mesh, n=N, budget_bytes=room)
-    p = dataclasses.replace(p, backend="cusolvermp") if p.backend != "cusolvermp" else p
+    p = as_mp(p) if p.backend != "cusolvermp" else p
     p.stack_route((1, N, N), np.complex128)
     return dict(room=int(room))
 stage("bank Coulomb root eigh", bank_coulomb)
@@ -143,7 +147,7 @@ stage("bank Coulomb root eigh", bank_coulomb)
 def isdf_charge():
     room = gpu_utils.shared_device_room("isdf zeta charge eigh")
     p = distrib_la.plan("eigh", mesh, n=N, budget_bytes=room)
-    p = dataclasses.replace(p, backend="cusolvermp") if p.backend != "cusolvermp" else p
+    p = as_mp(p) if p.backend != "cusolvermp" else p
     p.stack_route((1, N, N), np.complex128)
     return dict(room=int(room))
 stage("isdf zeta charge eigh", isdf_charge)

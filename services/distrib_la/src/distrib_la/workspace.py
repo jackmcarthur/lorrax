@@ -6,7 +6,6 @@ import operator
 import numpy as np
 
 from distrib_la.resolve import ONE_DEVICE, mesh_platform
-from lxkit import device_vendor
 
 
 def _shapes(shapes):
@@ -57,6 +56,19 @@ def _local_gemm_temp(shapes, dtype, device):
     if memory is None:
         raise RuntimeError('local GEMM compiler did not return workspace accounting')
     return int(memory.temp_size_in_bytes)
+
+
+@lru_cache(maxsize=128)
+def _local_eigh_temp(shape, dtype, device):
+    """Compile the local batched eigh at ``shape`` on one device, without running it: its
+    temp + outputs (the solver's workspace is an XLA buffer on CUDA)."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import SingleDeviceSharding
+    sh = SingleDeviceSharding(device)
+    fn = jax.jit(jnp.linalg.eigh, in_shardings=sh)
+    memory = fn.lower(jax.ShapeDtypeStruct(shape, np.dtype(dtype), sharding=sh)).compile().memory_analysis()
+    return int(memory.temp_size_in_bytes) + int(memory.output_size_in_bytes)
 
 
 def _off_cuda(plan, op, shapes, dtype):
@@ -123,49 +135,25 @@ def _workspace_details(plan, op, shapes, dtype):
         ctx = 0 if local else get_or_init_context(plan.mesh)
         side = n
         if local:
-            from distrib_la.plan import local_eigh_workspace
-            device, host = local_eigh_workspace(n, dtype, 'CUDA'), 0
+            # cusolverDn syevd's workspace is an XLA buffer of the compiled program.
+            device, host = 0, 0
         else:
             from distrib_la._cusolvermp import solve_layout
             side, block = solve_layout(n, px)
             device, host = _vendor_query(ctx, op, (side, block), dtype.str)
-        # Local kernels need an info integer in addition to vendor work.
-        # Mp info is persistent context state, not per-operation scratch.
-        # A native auto route executes the whole batch, and route (c) its
-        # ceil(b/P) local rows, in one batched call; reserve one vendor
-        # workspace/info per member rather than assume serial reuse.
+        # Mp's workspace is allocated outside XLA, one per member a call holds; the checked
+        # chain, its padded operand and the gathered retry are XLA buffers of the compiled
+        # program (distrib_la.plan.compiled_bytes), not workspace.
         batch = int(shapes[0][0]) if local and len(shapes[0]) == 3 else 1
-        if one_device:
-            from distrib_la._one_device import held_per_rank
-            from distrib_la import resolve as _resolve
-            bound = _resolve.one_device_max_n('eigh', _resolve.mesh_platform(plan.mesh),
-                                              plan.budget_bytes) or n
-            copies = held_per_rank(batch, n, px * py, _resolve.one_device_round_n(
-                'eigh', _resolve.mesh_platform(plan.mesh), bound))
-        else:
-            copies = (-(-batch // (px * py))
-                      if plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
-        scratch = copies*(device + (4 if local else 0))
-        checked = 0
-        if not local:
-            # A distributed eigh is checked and retried inside the program
-            # (distrib_la._result_check): its XLA temporaries, and the gathered
-            # retry's replicated copies where the plan admits one.
-            from distrib_la.plan import CHECKED_EIGH_TILES, _gathered_admitted, _gathered_bytes
-            checked = CHECKED_EIGH_TILES * (n * n // (px * py)) * dtype.itemsize
-            if side > n:
-                # The padded operand and the padded vectors before the slice.
-                checked += 2 * (side * side // (px * py)) * dtype.itemsize
-            if _gathered_admitted((n, n), dtype, plan.budget_bytes):
-                checked += _gathered_bytes((n, n), dtype)
-        scratch += checked
+        copies = (-(-batch // (px * py)) if not one_device and
+                  plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
+        scratch = copies * device
         return dict(device_bytes=scratch, host_bytes=host,
-                    vendor_device_bytes=device if local else None,
-                    native_device_bytes=device,
-                    dynamic_xla_scratch_bytes=scratch,
-                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes are the aligned vendor workspace (ABI 10: the solver destroys an aliased XLA copy of the operand, within checked); checked = CHECKED_EIGH_TILES n^2/P (+ 2 N^2/P at a padded solve side N, + the gathered retry: 2 n^2 and the heevd workspace, when admitted)',
-                    checked_device_bytes=checked,
-                    copies=copies,
+                    vendor_device_bytes=None if local else device, native_device_bytes=device,
+                    dynamic_xla_scratch_bytes=0, local=local,
+                    formula='cusolverMp size query (the aligned vendor workspace), one per member; '
+                            'local and XLA-held bytes are in the compiled program',
+                    checked_device_bytes=0, copies=copies,
                     provider=('cusolverDn (one_device)' if one_device else 'cusolverDn')
                     if local else 'cusolverMp')
     if op not in ('gemm', 'matmul'):
@@ -255,9 +243,7 @@ def _local_kernel_workspace(mesh, op, shapes, dtype):
     if op == 'eigh':
         n = max(s[-1] for s in shapes)
         rows = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
-        from distrib_la.plan import local_eigh_workspace
-        cuda = any(device_vendor(d) == 'cuda' for d in mesh.devices.flat)
-        return rows * local_eigh_workspace(n, dtype, 'CUDA' if cuda else 'other')
+        return _local_eigh_temp((rows, n, n), dtype.str, jax.local_devices()[0])
     if op in ('gemm', 'matmul'):
         return _local_gemm_temp(tuple(shapes[:2]), dtype.str, jax.local_devices()[0])
     raise ValueError('fits_local op must be eigh or gemm')
@@ -360,27 +346,16 @@ def lu_workspace_bytes(mesh, n, dtype) -> int:
 
 def eigh_stack_bytes(plan, shape, dtype) -> int:
     """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
-    its operand, priced as :func:`distrib_la.plan.place` prices it: on route (c) its program
-    (``_stack_price``) and the leg's batched eigh workspace (at most one fixed tile); on the whole
-    mesh one solve (``_mesh_price``) beside the other matrices' vector faces and the values.
-    Shapes only: every rank computes the same figure.
-    """
-    from distrib_la.plan import (BATCH_EIGH_TILES, ROUTE_BATCH_RESHARD, _gathered_admitted,
-                                 _mesh_price, _stack_price)
+    its operand: the program that runs it, compiled at the abstract operand and never run
+    (route (c): ``distrib_la.plan._stack_bytes``, plus the ROCm leg's rocSOLVER batched
+    workspace, which XLA does not see; otherwise ``Plan.mesh_bytes``, the plan's own program
+    plus its provider's workspace query).  Every rank computes the same figure."""
+    from distrib_la.plan import ROUTE_BATCH_RESHARD, _gathered_admitted, _stack_bytes
     nb, n = int(shape[0]), int(shape[-1])
     ranks = int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
-    item = np.dtype(dtype).itemsize
     if plan.batched_route == ROUTE_BATCH_RESHARD:
         from distrib_la.local_eigh import batched_workspace_bytes
-        return (_stack_price('eigh', plan.mesh, nb, n, dtype, 1,
-                             _gathered_admitted((n, n), dtype, plan.budget_bytes))
+        return (_stack_bytes('eigh', plan.mesh, nb, n, dtype, 1, 'all',
+                             _gathered_admitted(plan.mesh, (n, n), dtype, plan.budget_bytes))
                 + batched_workspace_bytes((-(-nb // ranks), n, n), dtype, mesh_platform(plan.mesh)))
-    if plan.backend == ONE_DEVICE:
-        # Whole matrices per rank, in the route's bounded rounds.
-        from distrib_la._one_device import held_per_rank
-        from distrib_la import resolve as _resolve
-        bound = _resolve.one_device_max_n("eigh", _resolve.mesh_platform(plan.mesh),
-                                          plan.budget_bytes) or n
-        return held_per_rank(nb, n, ranks, _resolve.one_device_round_n(
-            "eigh", _resolve.mesh_platform(plan.mesh), bound)) * BATCH_EIGH_TILES * n * n * item
-    return -(-(nb - 1) * n * n * item // ranks) + nb * n * 8 + _mesh_price(n, dtype, ranks)
+    return plan.mesh_bytes('eigh', nb, n, dtype)
