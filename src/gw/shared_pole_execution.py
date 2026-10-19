@@ -294,12 +294,9 @@ def face_program(fn, mesh, *, outputs='matrices'):
     Matrix-only glue preserves every output's trailing two mesh axes,
     including real matrices. Mixed reducer contracts name their matrix
     leaves explicitly; diagnostics and spectra alone replicate. Its checked
-    eighs hold their first attempts; a set flag reruns it whole-chain on the
-    whole mesh (``distrib_la.checked_program``).
+    eighs run once each; a failed check refuses the round by name
+    (``distrib_la.checked_program``).
     """
-    # ponytail: a failed check reruns the whole round on the whole mesh (one
-    # cached compile; CrI3 saw 1-10 failures per map). Upgrade path: retry
-    # only the failed stack.
     import distrib_la
     compiled = {}
     def program(*args):
@@ -842,6 +839,8 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
                                bool(retain_span), gram_keep, None if carrier is None else int(carrier))
     (stage1, stage2, stage3, stage4), passthrough = programs
     hvv_eigh, schur_eigh, reduced_eigh = (plan.batched for plan in eigh_plans)
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    cut = gates["normalized_gram_keep"]["threshold"] if gram_keep is None else gram_keep  # keep_stage's cut
     from gw.shared_pole_local import pack_panels
     widths = [int(s[1].shape[-1]) for s in states]
 
@@ -869,13 +868,13 @@ def face_reduce_decoupled(states, infinity, tables, *, mesh, eigh_plans, width, 
     with timing.section('decoupled.eigh_hvv'):
         hermitian = _hermitian_stack(mesh)(stage['h_vv'])
         with priced(0, eigh_plans[0], hermitian):
-            gamma, u = hvv_eigh(hermitian)
+            gamma, u = hvv_eigh(hermitian, cut=cut)
         del hermitian
     with timing.section('decoupled.keep'):
         stage = advance('keep', stage2, stage, gamma, u)
     del gamma, u
     with timing.section('decoupled.eigh_schur'), priced(1, eigh_plans[1], stage['schur']):
-        gamma_r, u_r = schur_eigh(stage['schur'])
+        gamma_r, u_r = schur_eigh(stage['schur'], cut=cut)
     with timing.section('decoupled.paired'):
         stage = advance('paired', stage3, stage, gamma_r, u_r)
     del gamma_r, u_r
@@ -938,7 +937,8 @@ def face_cross_decoupled(pencil, *, mesh, eigh_plans, width, eigh_rows=None):
     keep, output = _cross_stage_programs(mesh)
     run = partial(_run_stages, mesh, nq, width)
     with timing.section('decoupled.eigh_metric'), priced(0, eigh_plans[0], pencil[0]):
-        gamma, u = eigh_plans[0].batched(pencil[0])
+        from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+        gamma, u = eigh_plans[0].batched(pencil[0], cut=gates["normalized_gram_keep"]["threshold"])
     with timing.section('decoupled.keep'):
         stage = run(keep, *pencil, gamma, u)
     del gamma, u
