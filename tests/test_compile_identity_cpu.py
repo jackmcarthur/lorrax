@@ -49,7 +49,8 @@ def test_stack_route_is_priced_from_the_shapes():
     p = _plan(_mesh())
     traced = p.stack_route((4, 8, 8), np.complex128, traced=True)
     eager = p.stack_route((4, 8, 8), np.complex128, traced=False)
-    price = plan_mod._stack_price("eigh", _mesh(), 4, 8, "complex128", 1)
+    price = plan_mod._stack_price("eigh", _mesh(), 4, 8, "complex128", 1,
+                                  plan_mod._gathered_admitted((8, 8), "complex128"))
     assert traced.route == eager.route == plan_mod.ROUTE_BATCH_RESHARD
     assert traced.program_bytes == eager.program_bytes == price
     assert price >= 4 * plan_mod.BATCH_EIGH_TILES * 8 * 8 * 16 and eager.per_rank == 4 and eager.rounds == 1

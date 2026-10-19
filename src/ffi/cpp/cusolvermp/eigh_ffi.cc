@@ -347,9 +347,12 @@ extern "C" int lrx_eigh_workspace_bytes_block(
         (complex128 != 0 && complex128 != 1)) return -1;
     *device_bytes = 0; *host_bytes = 0;
     if (ctx_handle == 0) {
-        cusolverDnHandle_t handle = nullptr;
-        auto status = cusolverDnCreate(&handle);
-        if (status != CUSOLVER_STATUS_SUCCESS) return int(status);
+        // One handle for the process, never destroyed: cusolverDnDestroy (cublasDestroy)
+        // synchronizes the device, so a query issued after XLA programs were dispatched
+        // waited on all of them (4+ min in cuCtxSynchronize at n 48640, run30k try 7).
+        static cusolverDnHandle_t handle = nullptr;
+        auto status = handle ? CUSOLVER_STATUS_SUCCESS : cusolverDnCreate(&handle);
+        if (status != CUSOLVER_STATUS_SUCCESS) { handle = nullptr; return int(status); }
         // The 64-bit generic query (size_t workspace, int64 n): the legacy 32-bit
         // Zheevd_bufferSize answered INVALID_VALUE at n 30000 (int lwork; run30k).
         cusolverDnParams_t params = nullptr;
@@ -378,7 +381,6 @@ extern "C" int lrx_eigh_workspace_bytes_block(
                 lwork = std::max(lwork, jacobi);
             }
         }
-        cusolverDnDestroy(handle);
         if (status == CUSOLVER_STATUS_SUCCESS) {
             *device_bytes = std::max<uint64_t>(ws_device, uint64_t(lwork) * (complex128 ? 16 : 8));
             *host_bytes = ws_host;

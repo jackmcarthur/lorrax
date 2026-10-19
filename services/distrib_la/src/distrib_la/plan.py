@@ -238,7 +238,7 @@ def new_stack_routes() -> list[str]:
 PHASES = ("all", "first", "retry")
 
 
-def _stack_price(op, mesh, nb, n, dtype, rounds) -> int:
+def _stack_price(op, mesh, nb, n, dtype, rounds, gathered=False) -> int:
     """Per-rank device bytes of a route-(c) stack program in ``rounds``, priced from the shapes.
 
     :data:`BATCH_EIGH_TILES` n^2 per whole matrix a rank holds at a time (the
@@ -253,39 +253,24 @@ def _stack_price(op, mesh, nb, n, dtype, rounds) -> int:
     item = np.dtype(dtype).itemsize
     whole = BATCH_EIGH_TILES * n * n * item
     checked = CHECKED_EIGH_TILES * (n * n // ranks) * item
-    if op != "normal_eigh" and _gathered_admitted((n, n), dtype):
+    if op != "normal_eigh" and gathered:
         checked += _gathered_bytes((n, n), dtype)
     return per_rank * whole + checked
 
 
-#: The run's per-device budget in bytes, from the caller (LORRAX's common.gpu_utils
-#: set_device_budget_gb, the minimum over processes): every rank holds the same value.
-_GATHERED_ROOM: int | None = None
-
-
-def set_gathered_room(bytes_per_device):
-    """Set the device budget that prices the gathered retry (:func:`_gathered_admitted`)."""
-    global _GATHERED_ROOM
-    _GATHERED_ROOM = None if bytes_per_device is None else int(bytes_per_device)
-
-
-def _gathered_admitted(shape, dtype) -> bool:
+def _gathered_admitted(shape, dtype, room=None) -> bool:
     """Whether an eigh's gathered retry joins its chain: the matrices, their
     vectors and the solver's copy (GATHERED_EIGH_FACTOR n^2 elements each)
     within GATHERED_EIGH_BYTES, or with the local heevd/syevd workspace within the
-    run's device budget (:func:`set_gathered_room`), whatever a caller's room (XLA
-    reserves the retry in every program that holds it). Shapes and an agreed budget:
-    the same on every rank. cuSOLVERMp 0.9.1 left n 30000 (run30k) with no correct
-    attempt short of this one."""
+    plan's room (its ``budget_bytes``; the programs that hold the retry are priced
+    in it: :func:`_stack_price`, ``distrib_la.workspace``). Shapes and a caller's
+    agreed room: the same on every rank. cuSOLVERMp 0.9.1 left n 30000 (run30k) with
+    no correct attempt short of this one."""
     small = GATHERED_EIGH_FACTOR * np.dtype(dtype).itemsize * int(np.prod(tuple(shape)))
-    # The LAPACK floor first (the price is never below it): a shape it refuses needs no
-    # vendor query (a native call; one sat 5.5 min in run30k try 7's reduction admission).
-    return small <= GATHERED_EIGH_BYTES or (_GATHERED_ROOM is not None
-                                            and _gathered_bytes(shape, dtype, vendor=False) <= _GATHERED_ROOM
-                                            and _gathered_bytes(shape, dtype) <= _GATHERED_ROOM)
+    return small <= GATHERED_EIGH_BYTES or (room is not None and _gathered_bytes(shape, dtype) <= room)
 
 
-def _gathered_bytes(shape, dtype, vendor=True) -> int:
+def _gathered_bytes(shape, dtype) -> int:
     """Per-rank bytes the gathered retry reserves: GATHERED_EIGH_FACTOR n^2 per matrix
     and the local heevd/syevd workspace: LAPACK lwork + lrwork, or on CUDA the vendor's
     own query where larger (cusolverDnXsyevd: 57.7 GB at n 30000 complex, twice LAPACK's)."""
@@ -293,14 +278,15 @@ def _gathered_bytes(shape, dtype, vendor=True) -> int:
     item, elems, n = np.dtype(dtype).itemsize, int(np.prod(tuple(shape))), int(shape[-1])
     heevd = (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) if np.dtype(dtype).kind == "c"
              else 8 * (1 + 6 * n + 2 * n * n))
-    if vendor and device_vendor(jax.devices()[0]) == "cuda":
+    if device_vendor(jax.devices()[0]) == "cuda":
         from distrib_la.workspace import _vendor_query
         heevd = max(heevd, _vendor_query(0, "eigh", (n,), np.dtype(dtype).str)[0])
     return GATHERED_EIGH_FACTOR * item * elems + elems // (n * n) * heevd
 
 
 @lru_cache(maxsize=None)
-def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, phase: str, cut=None):
+def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, phase: str, cut=None,
+                           gathered=False):
     """The jitted route-(c) program for one face stack and ``phase`` (:data:`PHASES`).
 
     ``rounds`` slices (:func:`distrib_la._batch_reshard.reshard_rounds_call`),
@@ -321,7 +307,7 @@ def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds
     if op == "normal_eigh":
         return jax.jit(solve, out_shardings=out)
     attempts = [solve, partial(reshard_rounds_call, op, mesh, rounds=int(rounds), shifted=True)]
-    if _gathered_admitted(shape, dtype):
+    if gathered:
         attempts.append(partial(_gathered_eigh, mesh=mesh))
     attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[phase]
     return jax.jit(lambda a: checked("eigh", tuple(attempts), lambda r: _local_eigh_errors(a, *r, mesh=mesh, cut=cut),
@@ -1212,7 +1198,7 @@ class Plan:
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             tried = -(-(-(-nb // rounds)) // ranks)
-            price = _stack_price(op, self.mesh, nb, n, dtype, rounds)
+            price = _stack_price(op, self.mesh, nb, n, dtype, rounds, _gathered_admitted((n, n), dtype, room))
             if price <= room:
                 return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
             per_rank = min(per_rank - 1, max(1, per_rank * room // price))
@@ -1390,12 +1376,10 @@ class Plan:
                 if block is not None:
                     attempts = [attempts[0], deflate(partial(solve, block=block)), attempts[1],
                                 deflate(partial(solve, block=block), shift=True)]
-            # A gathered local solve, where the whole matrix, its vectors and
-            # the solver's copy fit GATHERED_EIGH_BYTES on every rank (a shape
-            # rule, the same on every rank). XLA reserves it in every program
-            # that holds it, so a caller's room (a face plan's budget) does
-            # not raise the limit.
-            if _gathered_admitted(A.shape, A.dtype):
+            # A gathered local solve, where the whole matrix, its vectors and the
+            # solver's copy fit GATHERED_EIGH_BYTES, or with its workspace the plan's
+            # room, on every rank (_gathered_admitted; priced in the same room).
+            if _gathered_admitted(A.shape, A.dtype, self.budget_bytes):
                 attempts.append(partial(_gathered_eigh, mesh=mesh))
             # An eager call's first program holds the first attempt; its retry
             # program the rest (Plan._program). A traced call holds them all.
@@ -1568,7 +1552,8 @@ class Plan:
 
         def program(phase):
             return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), phase,
-                                          cut if cut is None or callable(cut) else float(cut))
+                                          cut if cut is None or callable(cut) else float(cut),
+                                          _gathered_admitted(shape[-2:], dtype, self.budget_bytes))
         if op == "normal_eigh":
             return program("all")(A)
         if isinstance(A, jax.core.Tracer):

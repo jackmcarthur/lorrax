@@ -215,62 +215,31 @@ def test_lu_relabels_from_4x4_and_keeps_the_2x2_bound():
     assert rhs_block(9152, 9152, 2, 2, 4576) == 4576
 
 
-def test_the_gathered_retry_is_priced_against_the_run_budget(monkeypatch):
-    """run30k: cuSOLVERMp 0.9.1 left the n 30000 direction eigh with no correct attempt; the
-    gathered retry (one whole matrix per rank, the native eigh) joins the chain where 2 n^2 and
-    the heevd workspace fit the agreed device budget, and the ledger prices that reservation."""
-    import sys
-    import distrib_la  # noqa: F401
-    pl = sys.modules["distrib_la.plan"]                  # the module (distrib_la.plan is also a function)
-    monkeypatch.setattr(pl, "_GATHERED_ROOM", None)
-    assert pl._gathered_admitted((1448, 1448), np.complex128)          # the fixed rule stands
-    assert not pl._gathered_admitted((30000, 30000), np.complex128)
-    pl.set_gathered_room(63e9)
-    assert pl._gathered_bytes((30000, 30000), np.complex128) == 2 * 16 * 30000 ** 2 + (
-        16 * (2 * 30000 + 30000 ** 2) + 8 * (1 + 5 * 30000 + 2 * 30000 ** 2))    # 57.6 GB
-    assert pl._gathered_admitted((30000, 30000), np.complex128)
-    pl.set_gathered_room(40e9)
-    assert not pl._gathered_admitted((30000, 30000), np.complex128)
-
-
-def test_the_admission_queries_the_vendor_once_per_shape_and_never_past_the_floor(monkeypatch):
-    """run30k try 7 sat 5.5 min in one native workspace query inside the reduction admission.
-    The constructor's quotes over its candidate extents (selection n, the rounds' reduction
-    sides, repeated per phase) reach the vendor at most once per distinct shape, and never for a
-    shape whose LAPACK floor (2 n^2 and LAPACK's heevd work) is already over the room."""
+def test_the_gathered_retry_is_priced_against_the_plans_room(monkeypatch):
+    """run30k: cuSOLVERMp 0.9.1 left the n 30000 direction eigh with no correct attempt. The
+    gathered retry joins the chain where 2 n^2 and the local eigh workspace fit the plan's room
+    (no room: the 64 MiB rule), and the local query runs once per shape for the process."""
     import sys
     import lxkit
     import distrib_la  # noqa: F401
     from distrib_la import loader, workspace
-    pl = sys.modules["distrib_la.plan"]
+    pl = sys.modules["distrib_la.plan"]                  # the module (distrib_la.plan is also a function)
     calls = []
 
-    def query(ctx, n, cplx, device, host):        # cusolverDnXsyevd_bufferSize: ~2x LAPACK's heevd
+    def query(ctx, n, cplx, device, host):              # cusolverDnXsyevd_bufferSize: ~2x LAPACK heevd
         calls.append(int(n))
         device._obj.value, host._obj.value = 2 * (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n)), 0
         return 0
-
     monkeypatch.setattr(loader, "get_lib", lambda platform: type("Lib", (), {
         "lrx_eigh_workspace_bytes": staticmethod(query)})())
     monkeypatch.setattr(lxkit, "device_vendor", lambda device: "cuda")
     workspace._vendor_query.cache_clear()
-    monkeypatch.setattr(pl, "_GATHERED_ROOM", None)
-    pl.set_gathered_room(70e9)
     try:
-        candidates = [29998, 29998, 9152, 9152, 4576, 41250, 41250, 30000, 9152, 29998]
-        admitted = {n: pl._gathered_admitted((n, n), np.complex128) for n in candidates}
-        assert sorted(calls) == [4576, 9152, 29998, 30000]          # once each; 41250 never
-        assert admitted[9152] and admitted[4576] and not admitted[41250]
-        assert not admitted[29998] and not admitted[30000]          # 86.4 GB > 70 GB, by the vendor
-        # try 7: quote(side=48640) at the 63.41 GB room; neither the gathered admission nor a
-        # local fit reaches the native query (its stack alone is 75.7 GB).
-        before = len(calls)
-        pl.set_gathered_room(63.41e9)
-        monkeypatch.setattr(workspace, "device_vendor", lambda device: "cuda")
-        mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
-        held = type("P", (), {"mesh": mesh})()
-        assert not pl._gathered_admitted((48640, 48640), np.complex128)
-        assert not workspace.fits_local(held, "eigh", ((1, 48640, 48640),) * 2, np.complex128, int(63.41e9))
-        assert len(calls) == before
+        assert pl._gathered_admitted((1448, 1448), np.complex128) and not calls      # the fixed rule
+        assert not pl._gathered_admitted((9152, 9152), np.complex128)               # no room
+        assert pl._gathered_admitted((9152, 9152), np.complex128, 63.41e9)           # 8.0 GB
+        assert not pl._gathered_admitted((30000, 30000), np.complex128, 63.41e9)     # 86.4 GB
+        assert pl._gathered_admitted((30000, 30000), np.complex128, 90e9)
+        assert sorted(calls) == [9152, 30000]                                         # once each
     finally:
         workspace._vendor_query.cache_clear()
