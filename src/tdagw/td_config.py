@@ -121,7 +121,7 @@ COLLISION_SCREENINGS = ("frozen", "refreshed", "shared_pole")
 #: ``lorrax.collision_rebase``: C[rho_eq] on the refreshed W (``auto``: on for shared_pole).
 COLLISION_REBASE = ("auto", "on", "off")
 #: ``lorrax.collision_spm_head``: the q -> 0 head of the shared-pole refresh (``tdagw.dynsig.SPM_HEADS``).
-COLLISION_SPM_HEADS = ("frozen", "refit")
+COLLISION_SPM_HEADS = ("frozen", "refit", "sites")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
 #: Sample names the driver keeps for its own per-chunk record (``tdagw.propagate.PROGRESS``);
@@ -988,7 +988,12 @@ TD_KEY_DOCS = {
         "z = 0 slot keeps the interband S(0; f) (order of limits; no Thomas–Fermi slot for "
         "a non-thermal population), and the static limit subtracted from ΔΣ^h keeps the "
         "run's head, so on shell ΔΣ^h gains (½ − f)[W^c_h(0; t) − W^c_h(0; eq)]/(ΩN_k). "
-        "Bitwise the run's head at ρ_eq (checked at t0). Needs a source with "
+        "Bitwise the run's head at ρ_eq (checked at t0). `sites`, the same response "
+        "(S(z; f) + D(δf)/z²) read at the body recipe's support sites instead: W^c_h there, "
+        "the scalar pole fit on those sites (no z = 0 sample), and W^c_h(0; t) = W^c_h(0; run) "
+        "+ [M_f(0) − M_eq(0)] from that model, so a pair split by d ≪ |z_s| enters as ~ d/z_s² "
+        "and not as its 1/d³ static limit (the refresh lines keep the z = 0 pin as a "
+        "diagnostic). Needs a source with "
         "`head_correction = no_local_fields`. The refresh lines add the head's static "
         "value with and without the Drude term, D and ω_p of the electrons and holes, and "
         "a quasi-equilibrium bound (the 2D static screening the carriers would give if "

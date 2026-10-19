@@ -1503,7 +1503,12 @@ def spm_t0_line(screen_eq: dict) -> str:
                f"; head refit at rho_eq "
                f"{'bitwise' if screen_eq['head']['bitwise'] else 'NOT bitwise'} the run's head "
                f"(W^c_h(0) {screen_eq['head']['wc0'].real:.6g} Ry bohr^3, <v> "
-               f"{screen_eq['head']['vc0'].real:.6g}; {screen_eq['head']['refit_s']:.2f} s)"))
+               f"{screen_eq['head']['vc0'].real:.6g}; {screen_eq['head']['refit_s']:.2f} s)")
+            + ("" if (screen_eq.get("head") or {}).get("mode") != "sites" else
+               f"; head mode sites: {len(screen_eq['head']['sites_ev'][0])} recipe sites, site model "
+               f"W^c_h(0) at rho_eq {screen_eq['head']['sites_model_w0_eq']:.6g} (cond "
+               f"{screen_eq['head']['sites_condition_eq']:.2e}, "
+               f"{screen_eq['head']['sites_n_valid_eq']} poles)"))
 
 
 # ===========================================================================
@@ -1511,8 +1516,9 @@ def spm_t0_line(screen_eq: dict) -> str:
 # ===========================================================================
 
 #: ``window_collision``'s head (``[lorrax] collision_spm_head``): the run's head throughout,
-#: or the head of the instantaneous populations refit at every refresh.
-SPM_HEADS = ("frozen", "refit")
+#: the head of the instantaneous populations refit at every refresh with its z = 0 sample
+#: pinned (``refit``), or its carrier change fitted on the body's recipe sites (``sites``).
+SPM_HEADS = ("frozen", "refit", "sites")
 
 
 def spm_head_context(source: dict, *, mesh: Mesh, b_lo: int, n_active: int) -> dict:
@@ -1576,6 +1582,93 @@ def spm_head_context(source: dict, *, mesh: Mesh, b_lo: int, n_active: int) -> d
                 head0=source["head"], nk=int(meta.nk_tot), cell_volume=float(meta.cell_volume),
                 nspin=int(wfn.nspin), nspinor=int(meta.nspinor_wfnfile),
                 eta_ry=float(config.head.wcoul0_eta), bvec=bvec)
+
+
+def spm_head_sites(hctx: dict, recipe: dict) -> dict:
+    """The ``sites`` head: the body recipe's training sites and the equilibrium site model.
+
+    The sites are the recipe's distinct, unheld support points (``z_ry``, ``held``);
+    an odd count drops the highest line site (the scalar fit takes 2 n_p samples).
+    The equilibrium W^c_h at the sites (:func:`_head_wc_at_sites` at f_eq) is fitted
+    once; each state's head is the run's head plus the change of the site model's
+    static value.  Collective.
+    """
+    z_all = np.asarray(recipe["z_ry"], np.complex128).reshape(-1)
+    held = np.asarray(recipe["held"], bool).reshape(-1)
+    z = []
+    for zz in z_all[~held]:
+        if zz not in z:
+            z.append(complex(zz))
+    z = np.asarray(z, np.complex128)
+    if z.size % 2:
+        line = np.nonzero(np.abs(z.imag - np.max(z.imag[z.real > 0])) < 1e-12)[0]
+        drop = line[np.argmax(z.real[line])] if line.size else int(np.argmax(np.abs(z)))
+        z = np.delete(z, drop)
+    hctx = dict(hctx, sites_z=z)
+    wc_eq = _head_wc_at_sites(hctx, hctx["f_eq"])
+    fit_eq = _head_site_fit(hctx, wc_eq)
+    hctx.update(sites_wc_eq=wc_eq, sites_fit_eq=fit_eq, sites_w0_eq=fit_eq["w0"])
+    return hctx
+
+
+def _head_wc_at_sites(hctx: dict, f, *, drude: bool = True):
+    """W^c_h(z_s) of populations f (nk, nb) at the site list: S(z_s; f) + D(f - f_eq)/z_s^2, cell average."""
+    from gw.qsgw_head import head_s_tensor_sharded, head_samples_from_s, population_drude_tensor_sharded
+    nb, v, z = hctx["nb"], hctx["velocity"], hctx["sites_z"]
+    f = np.asarray(f, np.float64)[:, :nb]
+    pad = ((0, 0), (0, int(v.shape[-1]) - nb))
+    e_c, f_c, df_c = (np.pad(x, pad) for x in (hctx["e"], f, f - hctx["f_eq"]))
+    kw = dict(mesh=hctx["mesh"], nb_logical=nb, cell_volume=hctx["cell_volume"], nk_tot=hctx["nk"],
+              nspin=hctx["nspin"], nspinor=hctx["nspinor"])
+    S = head_s_tensor_sharded(v, e_c, f_c, z, eta_ry=hctx["eta_ry"], **kw)
+    S = np.asarray(jax.device_get(S), np.complex128)
+    if drude and np.any(df_c):
+        D = np.asarray(population_drude_tensor_sharded(v, e_c, df_c, **kw), np.complex128)
+        zz = z + 1j * hctx["eta_ry"]
+        S = S + D[None] / (zz ** 2)[:, None, None]
+    samples = head_samples_from_s(S, z, wfn=hctx["wfn"], meta=hctx["meta"], config=hctx["config"])
+    return np.asarray([complex(x.wcoul0) - complex(x.vc0) for x in samples], np.complex128)
+
+
+def _head_site_fit(hctx: dict, wc) -> dict:
+    """The scalar pole fit of W^c_h on the sites (no static pin) and its static value."""
+    from gw.mpa.fit_driver import fit_scalar_samples
+    z = hctx["sites_z"]
+    fit = fit_scalar_samples(np.asarray(wc), z, z.size // 2,
+                             solve=hctx["config"].mpa.pole_solver)
+    om, b = np.asarray(fit["Omega_p"]), np.asarray(fit["B_p"])
+    return dict(w0=complex(-2.0 * np.sum(b / om)), poles=om, residues=b,
+                condition=fit["condition"], backward_error=fit["backward_error"],
+                n_valid=int(om.size))
+
+
+def spm_head_refit_sites(hctx: dict, f_full, *, drude: bool = True):
+    """The ``sites`` head of populations ``f_full``: the run's head with its static value moved.
+
+    W^c_h(0; t) = W^c_h(0; run) + [M_f(0) - M_eq(0)], M the scalar pole model fitted on
+    the body recipe's sites (|z| at the line and imaginary sites, no z = 0 sample):
+    the carriers' change is read where the body reads W, so a pair split by d << |z_s|
+    enters as ~ d/z_s^2 and not as its 1/d^3 static limit.  The run's residues are
+    rescaled to that static value (the window Sigma reads the head on shell, where only
+    W^c_h(0) enters).  ``f = f_eq`` returns the run's head.  Collective.
+    """
+    import time
+    t0 = time.perf_counter()
+    f = np.asarray(f_full, np.float64)[:, :hctx["nb"]]
+    head0 = hctx["head0"]
+    w_run = complex(-2.0 * np.sum(np.asarray(head0.residues_ry) / np.asarray(head0.poles_ry)))
+    if not np.any(f != hctx["f_eq"]):
+        return head0, dict(fit_s=0.0, w0=w_run, delta=0.0j, w_model=hctx["sites_w0_eq"],
+                           condition=hctx["sites_fit_eq"]["condition"], wc=hctx["sites_wc_eq"],
+                           n_valid=hctx["sites_fit_eq"]["n_valid"])
+    wc = _head_wc_at_sites(hctx, f, drude=drude)
+    fit = _head_site_fit(hctx, wc)
+    delta = fit["w0"] - hctx["sites_w0_eq"]
+    scale = 1.0 + float(delta.real) / float(w_run.real)        # the on-shell head is real
+    head = dataclasses.replace(head0, residues_ry=np.asarray(head0.residues_ry) * scale)
+    return head, dict(fit_s=time.perf_counter() - t0, w0=w_run + delta.real, delta=delta,
+                      w_model=fit["w0"], condition=fit["condition"], wc=wc,
+                      n_valid=fit["n_valid"], poles=fit["poles"], residues=fit["residues"])
 
 
 def _head_static(head: dict) -> complex:
@@ -1996,9 +2089,11 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                          model_vs_run=_model_payload_cmp(source["model"]["path"],
                                                          poles_eq["model"]["path"]))
     hctx = head_eq_rec = None
-    if spm_head == "refit":
+    if spm_head in ("refit", "sites"):
         t_h = time.perf_counter()
         hctx = spm_head_context(source, mesh=mesh, b_lo=int(b_lo), n_active=nb)
+        if spm_head == "sites":
+            hctx = spm_head_sites(hctx, source["meta"].shared_pole_recipe)
         t_h1 = time.perf_counter()
         head_eq, head_eq_rec = spm_head_refit(hctx, scr["f_eq"])
         run_head = source["head"]
@@ -2008,7 +2103,13 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                                  refit_s=head_eq_rec["response_s"] + head_eq_rec["fit_s"],
                                  wc0=float(np.real(head_eq_rec["wc_static"])),
                                  wc0_imag=float(np.imag(head_eq_rec["wc_static"])),
-                                 vc0=float(np.real(head_eq_rec["vc0"])))
+                                 vc0=float(np.real(head_eq_rec["vc0"])), mode=spm_head)
+        if spm_head == "sites":
+            from common.units import RYD_TO_EV as _ry_ev
+            fe = hctx["sites_fit_eq"]
+            screen_eq["head"].update(
+                sites_ev=_plain(hctx["sites_z"] * _ry_ev), sites_model_w0_eq=float(fe["w0"].real),
+                sites_condition_eq=float(fe["condition"]), sites_n_valid_eq=fe["n_valid"])
         if not same:
             _refuse("dynsig_spm_head_eq", "a head refit at rho_eq that is not the run's head bitwise",
                     "the run's poles and residues", "the refit must reuse the run's response at f_eq")
@@ -2229,15 +2330,37 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                     th = time.perf_counter()
                     f_full = scr["f_eq"].copy()
                     f_full[scr["rows"], scr["win"]] = fb
-                    head_t, hrec = spm_head_refit(hctx, f_full)
-                    td = time.perf_counter()
-                    head_s += td - th
-                    _, hbare = spm_head_refit(hctx, f_full, drude=False)          # diagnostic
+                    if spm_head == "sites":
+                        head_t, srec_h = spm_head_refit_sites(hctx, f_full)
+                        td = time.perf_counter()
+                        head_s += td - th
+                        _, hrec = spm_head_refit(hctx, f_full)          # diagnostic: the z = 0 pin
+                        hbare = None
+                    else:
+                        head_t, hrec = spm_head_refit(hctx, f_full)
+                        td = time.perf_counter()
+                        head_s += td - th
+                        _, hbare = spm_head_refit(hctx, f_full, drude=False)      # diagnostic
+                        srec_h = None
                     hd = spm_head_diagnostics(hctx, f_full, hrec, hbare)
+                    line_h = spm_head_line(hd, screen_eq["head"]["wc0"])
+                    if srec_h is not None:
+                        line_h = (f"; head (sites): W^c_h(0) {srec_h['w0'].real:.6g} Ry bohr^3 "
+                                  f"(site-model change {srec_h['delta'].real:+.6g}, cond "
+                                  f"{srec_h['condition']:.2e}, {srec_h['n_valid']} poles)"
+                                  + line_h.replace("; head refit:", "; z = 0 pin (diagnostic):"))
                     head_recs.append(_plain(dict(
-                        hd, line=spm_head_line(hd, screen_eq["head"]["wc0"]),
-                        refit_s=hrec["response_s"] + hrec["fit_s"], diag_s=time.perf_counter() - td,
-                        poles=hrec["poles"], residues=hrec["residues"], drude=hrec["drude"])))
+                        hd, line=line_h, mode=spm_head,
+                        refit_s=(srec_h["fit_s"] if srec_h is not None
+                                 else hrec["response_s"] + hrec["fit_s"]),
+                        diag_s=time.perf_counter() - td,
+                        poles=hrec["poles"], residues=hrec["residues"], drude=hrec["drude"],
+                        sites=None if srec_h is None else dict(
+                            w0=srec_h["w0"], delta=srec_h["delta"], w_model=srec_h["w_model"],
+                            condition=srec_h["condition"], n_valid=srec_h["n_valid"],
+                            wc=srec_h["wc"]))))
+                    if srec_h is not None:                # the head used is the site model's
+                        head_recs[-1]["wc0_used"] = float(np.real(srec_h["w0"]))
                 heads_now.append(head_t)
             elif refreshed:
                 at, _, srec = screen_populations(scr, fb, valid_prev=state["valid_prev"][tr])

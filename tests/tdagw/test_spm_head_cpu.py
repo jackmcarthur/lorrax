@@ -289,8 +289,9 @@ _SPM = dict(collision_screening="shared_pole", collision_source="/a/04/oneshot.i
 def test_deck_key_default_and_refit():
     from tdagw.td_config import parse_td_deck
     assert parse_td_deck(_raw(**_SPM), source="cpu").values["lorrax.collision_spm_head"] == "frozen"
-    v = parse_td_deck(_raw(**_SPM, collision_spm_head="refit"), source="cpu").values
-    assert v["lorrax.collision_spm_head"] == "refit"
+    for mode in ("refit", "sites"):
+        v = parse_td_deck(_raw(**_SPM, collision_spm_head=mode), source="cpu").values
+        assert v["lorrax.collision_spm_head"] == mode
 
 
 def test_deck_key_refused_and_inactive():
@@ -311,3 +312,61 @@ def test_window_collision_refuses_the_head_off_its_member(kw):
     with pytest.raises(Exception, match="GATE dynsig_collision_spm_head"):
         D.window_collision({"member": member}, None, mesh=None, k_frac=None, b_lo=0, ntr=1,
                            sweep="active", **kw)
+
+
+# --------------------------------------------------------------------------- the sites head
+
+def _pole_model(z, om, b):
+    """The MPA scalar form W(z) = sum_p 2 Omega_p B_p / (z^2 - Omega_p^2); W(0) = -2 sum B/Omega."""
+    z = np.asarray(z)[:, None]
+    return np.sum(2.0 * om * b / (z * z - om * om), axis=1)
+
+
+def _sites():
+    line = np.array([0.11, 0.16, 0.22, 0.3]) + 0.0735j          # Ry: a line at height 1 eV
+    imag = 1j * np.array([0.02, 0.2])
+    return np.concatenate([line, imag])
+
+
+def test_site_fit_static_value_is_the_model_s():
+    from tdagw import dynsig as D
+    z = _sites()
+    om = np.array([0.12 - 0.005j, 0.2 - 0.01j, 0.28 - 0.02j])   # inside 2 max|z_s| (the fit's box)
+    b = np.array([120.0 - 3.0j, 800.0 - 10.0j, 2500.0 - 40.0j])        # W^c(0) < 0: screening
+    hctx = dict(sites_z=z, config=SimpleNamespace(mpa=SimpleNamespace(pole_solver="loewner")))
+    fit = D._head_site_fit(hctx, _pole_model(z, om, b))
+    w0 = -2.0 * np.sum(b / om)
+    assert fit["n_valid"] == 3
+    assert abs(fit["w0"] - w0) < 1e-7 * abs(w0), (fit["w0"], w0)
+
+
+def test_sites_head_moves_only_the_static_value(monkeypatch):
+    """spm_head_refit_sites: the run's poles, residues rescaled to W_run + [M_f(0) - M_eq(0)]."""
+    import dataclasses
+    from tdagw import dynsig as D
+
+    @dataclasses.dataclass(frozen=True)
+    class _Head:
+        poles_ry: np.ndarray
+        residues_ry: np.ndarray
+
+    z = _sites()
+    om = np.array([0.12 - 0.005j, 0.2 - 0.01j, 0.28 - 0.02j])   # inside 2 max|z_s| (the fit's box)
+    b_eq = np.array([120.0 - 3.0j, 800.0 - 10.0j, 2500.0 - 40.0j])
+    b_f = b_eq * np.array([0.7, 1.0, 1.02])
+    cfg = SimpleNamespace(mpa=SimpleNamespace(pole_solver="loewner"))
+    head0 = _Head(poles_ry=np.array([0.3 + 0.0j, 0.9 + 0.0j]),
+                  residues_ry=np.array([300.0 + 0.0j, 1200.0 + 0.0j]))
+    f_eq = np.zeros((2, 3)); f_eq[:, 0] = 1.0
+    hctx = dict(sites_z=z, config=cfg, nb=3, f_eq=f_eq, head0=head0)
+    fit_eq = D._head_site_fit(hctx, _pole_model(z, om, b_eq))
+    hctx.update(sites_w0_eq=fit_eq["w0"], sites_fit_eq=fit_eq, sites_wc_eq=_pole_model(z, om, b_eq))
+    monkeypatch.setattr(D, "_head_wc_at_sites", lambda h, f, drude=True: _pole_model(z, om, b_f))
+    same, rec0 = D.spm_head_refit_sites(hctx, f_eq)
+    assert same is head0 and rec0["delta"] == 0.0
+    f = f_eq.copy(); f[0, 0], f[0, 1] = 0.9, 0.1
+    head, rec = D.spm_head_refit_sites(hctx, f)
+    static = lambda h: complex(-2.0 * np.sum(np.asarray(h.residues_ry) / np.asarray(h.poles_ry)))
+    want = static(head0) + (-2.0 * np.sum(b_f / om) - (-2.0 * np.sum(b_eq / om))).real
+    assert np.array_equal(head.poles_ry, head0.poles_ry)
+    assert abs(static(head) - want) < 1e-7 * abs(want), (static(head), want)

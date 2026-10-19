@@ -207,10 +207,13 @@ def main():
                          a.v2_height if a.v2_height > 0 else None)
     sites = dict(V1="", V2=v2_text, V2P=v2p_text)
     sites.update({k + "B": v for k, v in list(sites.items())})
-    sites.update({k + "H": v for k, v in list(sites.items())})
+    base_sites = list(sites.items())
+    sites.update({k + "H": v for k, v in base_sites})
+    sites.update({k + "HS": v for k, v in base_sites})
     active = "auto" if a.chi0_active == "auto" else [int(x) for x in a.chi0_active.split(",")]
-    head_of = lambda V: V.endswith("H")
-    core = lambda V: V[:-1] if head_of(V) else V
+    head_mode = lambda V: "sites" if V.endswith("HS") else "refit" if V.endswith("H") else "frozen"
+    head_of = lambda V: head_mode(V) != "frozen"
+    core = lambda V: V[:-2] if V.endswith("HS") else V[:-1] if V.endswith("H") else V
     blocks_of = lambda V: active if core(V).endswith("B") else None
     out["variants"] = sites
 
@@ -361,7 +364,7 @@ def main():
                     form="subtracted", hermitian="dynamic", sweep="active",
                     screening="shared_pole", spm_support_sites=sites[V],
                     spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{V}"),
-                    spm_chi0_active=blocks_of(V), spm_head="refit" if head_of(V) else "frozen",
+                    spm_chi0_active=blocks_of(V), spm_head=head_mode(V),
                     say=say)
                 t0r = colls[V]["t0"]
                 sc = t0r.get("screen_eq") or {}
@@ -437,6 +440,12 @@ def main():
         if ref is not None:
             out["drude"] = ref["drude"]
             out["diagnostics"] = D.spm_head_diagnostics(hctx, f_full, ref, hb)
+        if "sites_z" in hctx:                        # the sites head of an HS variant
+            try:
+                _, sr = D.spm_head_refit_sites(hctx, f_full)
+                out["sites"] = {k: sr[k] for k in ("w0", "delta", "w_model", "condition", "n_valid", "wc")}
+            except Exception as exc:
+                out["error_sites"] = f"{type(exc).__name__}: {exc}"[:1500]
         out["refit_s"] = out["refit_drude_s"]
         return head_t, out
 
@@ -497,7 +506,7 @@ def main():
             if blocks_of(variant) is not None:
                 raw["lorrax"]["collision_spm_chi0_active"] = blocks_of(variant)
             if head_of(variant):
-                raw["lorrax"]["collision_spm_head"] = "refit"
+                raw["lorrax"]["collision_spm_head"] = head_mode(variant)
         return raw
 
     def td_run(tag, raw, source):

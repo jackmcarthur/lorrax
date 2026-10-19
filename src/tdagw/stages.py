@@ -610,7 +610,9 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
               f"; chi0 in four blocks, active bands {v['lorrax.collision_spm_chi0_active']}")
            + ("" if v["lorrax.collision_spm_head"] == "frozen" else
               "; q->0 head refit every refresh: S(z; f) + D(df)/z^2 at z != 0, static slot "
-              "interband")
+              "interband" if v["lorrax.collision_spm_head"] == "refit" else
+              "; q->0 head every refresh at the body recipe's sites: S(z_s; f) + D(df)/z_s^2, "
+              "the site model's static change")
            + ")")
         + ("" if v["lorrax.collision_screening"] == "frozen" else
            f"; C[rho_eq] {'rebased on W(t)' if built['rebase'] else 'at the t0 rates'}")
