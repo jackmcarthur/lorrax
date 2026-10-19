@@ -404,7 +404,7 @@ class CapacityLedger:
         return result
 
     def reserve(self, stage, *, resident_bytes_per_rank,
-                workspace_bytes_per_rank, concurrent_with=(), runs_in=None):
+                workspace_bytes_per_rank, concurrent_with=(), runs_in=None, whole=False):
         """Admit actual-batch bytes before allocation (``lxkit.memory.admit``).
 
         The price is booked to ``runs_in``, the timing section that allocates it (default:
@@ -422,7 +422,7 @@ class CapacityLedger:
         row = self.preview(resident_bytes_per_rank=resident_bytes_per_rank,
                            workspace_bytes_per_rank=workspace_bytes_per_rank,
                            concurrent_with=concurrent_with)
-        row['stage'] = stage
+        row['stage'], row['whole'] = stage, bool(whole)
         row['live_stages'] = sorted(set(row['concurrent_with']) | {stage})
         self.entries.append(row)
         from lxkit import memory
@@ -443,7 +443,8 @@ class CapacityLedger:
     def price(self, row):
         """A ledger row as THE Price admission, receipt and sizing use: its own bytes and its
         live concurrent rows (face-tiled: spread over the mesh) beside the driver's arrays live
-        at bind (the baseline, held at this P)."""
+        at bind (the baseline, held at this P).  A row of whole matrices per rank (``whole``:
+        the local constructor) holds its own bytes at any P (fixed)."""
         from lxkit import memory
         ranks = self.geometry['px'] * self.geometry['py']
         own = float(row['resident_bytes_per_rank'] + row['workspace_bytes_per_rank'])
@@ -451,7 +452,8 @@ class CapacityLedger:
         return memory.Price(
             operands=memory.Term(float(self.baseline_bytes_per_rank), beside * ranks,
                                  source="live outside the ledger at bind + live ledger rows"),
-            xla=memory.Term(spread=own * ranks, source=f"{row.get('stage', 'ledger')} (shared-pole ledger)"),
+            xla=memory.Term(own if row.get('whole') else 0.0, 0.0 if row.get('whole') else own * ranks,
+                            source=f"{row.get('stage', 'ledger')} (shared-pole ledger)"),
             ranks=ranks, label=self.price_label())
 
     def preview(self, *, resident_bytes_per_rank,

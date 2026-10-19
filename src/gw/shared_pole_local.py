@@ -899,15 +899,16 @@ def book_check_eighs(eigh_plan, n):
     from lxkit import memory
     route = max((eigh_plan.stack_route((b, n, n), np.complex128) for b in (1, 2)),
                 key=lambda r: int(r.program_bytes or 0))
-    # Route (c)'s stack price holds its local workspace; a provider route's holds one n^2/P tile
-    # for it, so the provider's own query is its vendor term.
+    # The stack's program compiled (face-sharded: spread over the mesh); off route (c) its
+    # figure holds the provider's workspace query, booked as the vendor term.
     vendor = (0 if route.route == "batch_reshard" else
               distrib_la.workspace_bytes_per_rank(eigh_plan, "eigh", ((n, n),), np.complex128))
+    ranks = int(eigh_plan.mesh.size)
     memory.book(memory.Price(
-        xla=memory.Term(float(route.program_bytes or 0), source=f"passivity eigh stack, {route.route} "
-                        "(distrib_la stack price)"),
+        xla=memory.Term(spread=float(int(route.program_bytes or 0) - vendor) * ranks,
+                        source=f"passivity eigh stack, {route.route} (compiled, never run)"),
         vendor=memory.Term(float(vendor), source="provider eigh workspace (distrib_la query)"),
-        label="passivity eigh stacks"), stage="spole.passivity_held")
+        ranks=ranks,         label="passivity eigh stacks"), stage="spole.passivity_held")
 
 
 def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_directions, *, real, nodes, eta_ry,
