@@ -214,7 +214,21 @@ def _normal_svd(A, eigh):
     return _singular_values(evals), v
 
 
-def _shifted_normal_eigh(g, eigh, mesh=None):
+@dataclass(frozen=True)
+class _ShiftedCut:
+    """Check what you use on I + G/||G||_F: the columns mu - 1 > c (max mu - 1), i.e.
+    lambda_G > c lambda_max. The direction cut keeps lambda > tau^2 lambda_max and its
+    boundary multiplet (relative gap <= multiplet_tol << 1/2), so c = tau^2 / 2 checks every
+    column it reads. The rejected columns are G's null cluster at mu = 1, where cuSOLVERMp
+    0.9.1 returns non-orthonormal vectors (n 30000, run30k); a kept column it corrupts still
+    refuses by name. A value, so the programs keyed on it are shared."""
+    c: float
+
+    def __call__(self, mu):
+        return (mu - 1) > self.c * (jnp.max(mu, axis=-1, keepdims=True) - 1)
+
+
+def _shifted_normal_eigh(g, eigh, mesh=None, cut=None):
     """eigh of the PSD normal matrix G as I + G/||G||_F, eigenvalues mapped back.
 
     cuSOLVERMp STEDC failed (info 4, in58730813.3/.4) on the zero cluster of a
@@ -229,7 +243,7 @@ def _shifted_normal_eigh(g, eigh, mesh=None):
              ordered_norm(g, axis=(-2, -1), mesh=mesh, spec=P(*((None,) * (g.ndim - 2)), "x", "y")))
     scale = jnp.where(scale > 0, scale, 1)
     eye = jnp.eye(g.shape[-1], dtype=g.dtype)
-    mu, v = eigh(g / scale[..., None, None] + eye)
+    mu, v = eigh(g / scale[..., None, None] + eye, **({} if cut is None else {"cut": cut}))
     return (mu - 1) * scale[..., None], v
 
 
@@ -557,7 +571,7 @@ def retain_leading_eigenvectors(
 
 
 @lru_cache(maxsize=16)
-def _direction_svd_kernel(eigh_plan, ndim):
+def _direction_svd_kernel(eigh_plan, ndim, tau=None):
     """Right singular vectors of the current face-tiled responses from the m x m normal matrix.
 
     A batch-reshard plan moves whole matrices and forms W.H W and its eigh
@@ -580,7 +594,8 @@ def _direction_svd_kernel(eigh_plan, ndim):
             g = matmul(stack, stack, mesh=eigh_plan.mesh, transa="C",
                        backend=gemm_backend, batched_route="auto")
             if eigh_plan.backend == "cusolvermp":
-                evals, v = _shifted_normal_eigh(g, eigh_plan.batched, eigh_plan.mesh)
+                evals, v = _shifted_normal_eigh(g, eigh_plan.batched, eigh_plan.mesh,
+                                                None if tau is None else _ShiftedCut(0.5 * tau ** 2))
             else:
                 evals, v = eigh_plan.batched(g)
             s = _singular_values(evals)
@@ -661,7 +676,7 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         from distrib_la._batch_reshard import batch_layout_eigh_call
         s, v = batch_layout_eigh_call("normal_eigh", eigh_plan.mesh, W, real_rows=real_rows)
     else:
-        s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
+        s, v = _direction_svd_kernel(eigh_plan, W.ndim, float(tau))(W)
     def cut(row):
         count = int(np.count_nonzero(row > tau * row[0]))
         if max_rank is not None:

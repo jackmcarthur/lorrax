@@ -248,7 +248,8 @@ def used_probes(values, dtype, cut=None):
     x = probes(values.shape[-1], dtype)
     if cut is None:
         return x, None
-    used = values > cut * jnp.max(values, axis=-1, keepdims=True)
+    # A callable cut selects on its own (polar's shifted normal eigh: mu - 1 > c (max mu - 1)).
+    used = cut(values) if callable(cut) else values > cut * jnp.max(values, axis=-1, keepdims=True)
     return x * used[..., :, None].astype(dtype), used[..., :, None]
 
 

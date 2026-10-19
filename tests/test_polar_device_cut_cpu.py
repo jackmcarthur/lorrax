@@ -110,3 +110,33 @@ def test_singular_cut_word_matches_the_host_cut(monkeypatch):
     q, spectra = distrib_la.right_singular_vectors(perp, 0.1, eigh_plan=plan, column_extent=_extent,
                                                    multiplet_tol=1e-3, max_rank=6)
     assert all(1 <= r.size <= 6 for r in spectra)
+
+
+def test_the_shifted_direction_eigh_checks_only_the_columns_it_reads():
+    """I + G/||G||_F with an exact null cluster at mu = 1: the shift-aware cut drops exactly the
+    cluster, so a non-orthonormal cluster (cuSOLVERMp 0.9.1 at n 30000) passes, while the same
+    defect in a kept column still fails at the existing tolerance."""
+    from distrib_la._result_check import eigh_errors
+    from distrib_la.tolerance import roundoff_tol
+    from distrib_la.polar import _ShiftedCut
+    rng, n, tau, tol = np.random.default_rng(3), 64, 1e-3, 1e-6
+    lam = np.zeros(n)                               # the trailing 40 columns: the exact null cluster
+    lam[:24] = np.r_[np.geomspace(1.0, 2e-6, 20), tau ** 2 * (1 + tol / 2), tau ** 2, tau ** 2 * (1 - tol / 2), 1.1e-6]
+    u, _ = np.linalg.qr(rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n)))
+    g = (u * lam) @ u.conj().T
+    a = np.eye(n) + g / np.linalg.norm(g)
+    mu, v = np.linalg.eigh(a)
+    used = np.asarray(_ShiftedCut(0.5 * tau ** 2)(jnp.asarray(mu)))
+    assert used.sum() == 24 and np.all(mu[~used] - 1 < 1e-12)          # the cluster, exactly
+
+    def errors(vectors, cut):
+        return tuple(float(e) for e in eigh_errors(jnp.asarray(a), jnp.asarray(mu), jnp.asarray(vectors), cut=cut))
+    accept = roundoff_tol(n, a.dtype)
+    bad = v.copy()
+    null = np.flatnonzero(~used)
+    bad[:, null[1:]] += 0.05 * bad[:, null[:1]]                        # non-orthonormal null cluster
+    assert max(errors(bad, _ShiftedCut(0.5 * tau ** 2))) < accept
+    assert errors(bad, None)[1] > accept
+    kept = v.copy()
+    kept[:, np.flatnonzero(used)[-1]] += 0.05 * kept[:, null[0]]          # the same defect on a kept column
+    assert max(errors(kept, _ShiftedCut(0.5 * tau ** 2))) > accept

@@ -1565,7 +1565,7 @@ class Plan:
 
         def program(phase):
             return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), phase,
-                                          None if cut is None else float(cut))
+                                          cut if cut is None or callable(cut) else float(cut))
         if op == "normal_eigh":
             return program("all")(A)
         if isinstance(A, jax.core.Tracer):
