@@ -278,11 +278,14 @@ def _gathered_admitted(shape, dtype) -> bool:
     the same on every rank. cuSOLVERMp 0.9.1 left n 30000 (run30k) with no correct
     attempt short of this one."""
     small = GATHERED_EIGH_FACTOR * np.dtype(dtype).itemsize * int(np.prod(tuple(shape)))
+    # The LAPACK floor first (the price is never below it): a shape it refuses needs no
+    # vendor query (a native call; one sat 5.5 min in run30k try 7's reduction admission).
     return small <= GATHERED_EIGH_BYTES or (_GATHERED_ROOM is not None
+                                            and _gathered_bytes(shape, dtype, vendor=False) <= _GATHERED_ROOM
                                             and _gathered_bytes(shape, dtype) <= _GATHERED_ROOM)
 
 
-def _gathered_bytes(shape, dtype) -> int:
+def _gathered_bytes(shape, dtype, vendor=True) -> int:
     """Per-rank bytes the gathered retry reserves: GATHERED_EIGH_FACTOR n^2 per matrix
     and the local heevd/syevd workspace: LAPACK lwork + lrwork, or on CUDA the vendor's
     own query where larger (cusolverDnXsyevd: 57.7 GB at n 30000 complex, twice LAPACK's)."""
@@ -290,7 +293,7 @@ def _gathered_bytes(shape, dtype) -> int:
     item, elems, n = np.dtype(dtype).itemsize, int(np.prod(tuple(shape))), int(shape[-1])
     heevd = (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) if np.dtype(dtype).kind == "c"
              else 8 * (1 + 6 * n + 2 * n * n))
-    if device_vendor(jax.devices()[0]) == "cuda":
+    if vendor and device_vendor(jax.devices()[0]) == "cuda":
         from distrib_la.workspace import _vendor_query
         heevd = max(heevd, _vendor_query(0, "eigh", (n,), np.dtype(dtype).str)[0])
     return GATHERED_EIGH_FACTOR * item * elems + elems // (n * n) * heevd

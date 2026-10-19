@@ -25,7 +25,7 @@ def _shapes(shapes):
 UNPRICED_LOCAL_BYTES = 1 << 50
 
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=None)      # one native call per (context, op, sizes, dtype) for the process
 def _vendor_query(ctx, op, sizes, dtype):
     from distrib_la.loader import get_lib
     lib = get_lib('CUDA')
@@ -117,7 +117,12 @@ def _workspace_details(plan, op, shapes, dtype):
             raise ValueError('distributed eigh workspace query supports cusolvermp only')
         ctx = 0 if local else get_or_init_context(plan.mesh)
         side = n
-        if local:
+        from distrib_la.plan import _GATHERED_ROOM
+        if local and _GATHERED_ROOM is not None and 2 * n * n * dtype.itemsize > _GATHERED_ROOM:
+            # The matrix and its vectors alone exceed the run's device room: unpriced, with no
+            # native query (one at n 48640 sat in cuCtxSynchronize, run30k try 7).
+            device, host = UNPRICED_LOCAL_BYTES, 0
+        elif local:
             device, host = _vendor_query(ctx, op, (n,), dtype.str)
         else:
             from distrib_la._cusolvermp import solve_layout
@@ -291,7 +296,8 @@ def fits_local(plan, op, shapes, dtype, budget_bytes) -> bool:
         raise TypeError('fits_local supports float64 and complex128')
     budget = operator.index(budget_bytes)
     live = sum(int(np.prod(s)) for s in shapes) * dtype.itemsize
-    return live + int(_local_kernel_workspace(plan.mesh, op, shapes, dtype)) <= budget
+    # The live set first: an n^2 stack already over the budget needs no native query.
+    return live <= budget and live + int(_local_kernel_workspace(plan.mesh, op, shapes, dtype)) <= budget
 
 
 def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
