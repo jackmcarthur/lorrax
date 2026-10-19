@@ -1838,10 +1838,17 @@ def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal
     request = None if request_for is None else request_for(efermi)
     omega = omega_grid_ry if request is None else request.frequencies_ry
     s = wfns_t.slices
+    # The shared-pole executor's branches run over the Σ band sum (``slices.sigma_sum``,
+    # gw.mpa.sigma._branches), which the faces carry; ``pop`` is on ``slices.full``.
+    nb_all = int(np.asarray(jax.device_get(wfns_t.enk)).shape[1])
+    cols = np.arange(nb_all)[s.full]
+    sel = np.searchsorted(cols, np.arange(nb_all)[s.sigma_sum])
+    w = pop if internal_bands is None else internal_bands.weights(pop)
     branches = _population_branches(
-        omega, np.asarray(jax.device_get(wfns_t.enk), np.float64)[:, s.full], efermi,
-        pop if internal_bands is None else internal_bands.weights(pop),
-        internal=None if internal_bands is None else internal_bands.mask)
+        omega, np.asarray(jax.device_get(wfns_t.enk), np.float64)[:, s.sigma_sum], efermi,
+        np.asarray(w)[:, sel],
+        internal=None if internal_bands is None else
+        np.broadcast_to(np.asarray(internal_bands.mask, bool), np.shape(w))[:, sel])
     res = compute_sigma_c_mpa_omega_grid(
         wfns_t, model["path"], meta_t, mesh_xy, sigma_w_model="shared_pole",
         fit_identity=model["identity"], fit_digest=model["digest"], request=request,
