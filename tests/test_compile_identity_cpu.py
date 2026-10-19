@@ -43,12 +43,12 @@ def _plan(mesh):
 
 
 def test_stack_route_is_priced_from_the_shapes():
-    """Eager and traced decisions take the same shape price: no sizing compile, no exchange."""
+    """Eager and traced calls share one decision, priced from the shapes: no sizing compile, no exchange."""
     plan_mod = importlib.import_module("distrib_la.plan")
     plan_mod._STACK_ROUTES.clear()
     p = _plan(_mesh())
-    traced = p.stack_route((4, 8, 8), np.complex128, traced=True)
-    eager = p.stack_route((4, 8, 8), np.complex128, traced=False)
+    traced = p.stack_route((4, 8, 8), np.complex128)
+    eager = p.stack_route((4, 8, 8), np.complex128)
     price = plan_mod._stack_price("eigh", _mesh(), 4, 8, "complex128", 1)
     assert traced.route == eager.route == plan_mod.ROUTE_BATCH_RESHARD
     assert traced.program_bytes == eager.program_bytes == price
