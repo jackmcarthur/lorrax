@@ -355,7 +355,8 @@ def main():
         finally:
             jax.config.update("jax_log_compiles", False)
         res = dict(tag=tag, wall_s=time.perf_counter() - t1, compiles=log_compiles.names[n0:],
-                   lines=lines[-60:], error=err)
+                   lines=lines[-20:], error=err,
+                   refresh_lines=[l for l in lines if "collision" in l])
         if stats:
             res.update(steps=int(stats["accepted"]), programs=int(stats["programs"]),
                        jit_cache=int(stats["jit_cache"]), refreshes=int(stats["refreshes"]),
@@ -371,25 +372,35 @@ def main():
         res["times_fs"] = np.asarray(outs.mtsteps) / FS_AU
         return res
 
-    def summarize(r):
-        keep = {k: v for k, v in r.items() if k not in ("rho_t", "pol", "nc", "times_fs")}
-        if "rho_t" not in r:
-            return keep
-        rho_t = r["rho_t"][:len(r["rho_t"])]
-        n = rho_t.shape[0]
-        tr = np.real(np.einsum("tkii->t", rho_t)) / rho_t.shape[1]
-        pops = np.real(np.einsum("tkii->ti", rho_t)) / rho_t.shape[1]
-        dev = np.max(np.abs(rho_t - rho_eq_w[None]), axis=(1, 2, 3))
-        pol, nc = (np.asarray(r[k]).reshape(n, -1) for k in ("pol", "nc"))
-        keep.update(max_dev=float(dev.max()), dev_t=dev.tolist(), trace_t=(tr - tr[0]).tolist(),
-                    pops_t=pops.tolist(), pol_t=np.real(pol).tolist(), nc_t=np.real(nc).tolist(),
-                    times_fs=np.asarray(r["times_fs"])[:n].tolist())
+    def refresh_rows(r):
+        """The refresh records of a run (its t0 receipt excluded), on every rank."""
         hist = (r.get("collision") or {}).get("history") or []
-        keep["refresh_summary"] = [dict(
-            n=h["n"], t_fs=h["t_fs"], why=h.get("why"), wall_s=h["wall_s"], sweep_s=h["sweep_s"],
-            rebase_s=h.get("rebase_s"), held_max_mev=h["held_max_mev"], min_rate_mev=h["min_rate_mev"],
-            frozen_s=h.get("frozen_s"), active_s=h.get("active_s"),
-            screen=h.get("screen")) for h in hist]
+        keys = ("n", "t_fs", "why", "df", "wall_s", "sweep_s", "rates_s", "build_s", "hermitian_s",
+                "rebase_s", "held_max_mev", "min_rate_mev", "frozen_s", "active_s", "out_per_fs",
+                "in_per_fs", "d_trace", "c_eq_now", "screen")
+        return [{k: h.get(k) for k in keys} for h in hist if "n" in h]
+
+    def summarize(r):
+        """Host summary of a run (rank 0 has the arrays); never raises (the ranks stay in step)."""
+        keep = {k: v for k, v in r.items() if k not in ("rho_t", "pol", "nc", "times_fs", "collision")}
+        try:
+            keep["refresh_summary"] = refresh_rows(r)
+            col = r.get("collision") or {}
+            if col.get("history"):
+                keep["t0"] = {k: v for k, v in col["history"][0].items() if k != "line"}
+            if "rho_t" not in r:
+                return keep
+            rho_t = r["rho_t"]
+            n = rho_t.shape[0]
+            tr = np.real(np.einsum("tkii->t", rho_t)) / rho_t.shape[1]
+            pops = np.real(np.einsum("tkii->ti", rho_t)) / rho_t.shape[1]
+            dev = np.max(np.abs(rho_t - rho_eq_w[None]), axis=(1, 2, 3))
+            pol, nc = (np.asarray(r[k]).reshape(n, -1) for k in ("pol", "nc"))
+            keep.update(max_dev=float(dev.max()), dev_t=dev.tolist(), trace_t=(tr - tr[0]).tolist(),
+                        pops_t=pops.tolist(), pol_t=np.real(pol).tolist(), nc_t=np.real(nc).tolist(),
+                        times_fs=np.asarray(r["times_fs"])[:n].tolist())
+        except Exception as exc:                   # a summary bug must not desynchronize the ranks
+            keep["summary_error"] = repr(exc)
         return keep
 
     if "SPF" in sections:
@@ -400,7 +411,8 @@ def main():
                 r = summarize(td_run(f"eq_{V}", raw, src))
                 spf[V] = {k: r.get(k) for k in ("max_dev", "dev_t", "trace_t", "refreshes", "steps",
                                                 "wall_s", "programs", "jit_cache", "compiles",
-                                                "refresh_summary", "error", "lines")}
+                                                "refresh_summary", "error", "lines", "refresh_lines",
+                                                "t0", "summary_error")}
                 _save()
 
     def save_states(tag, r):
