@@ -68,7 +68,7 @@ def test_sector_reduction_eigh_operand_is_hermitian():
                    ((metric + metric.conj().T) / 2, (v + v.conj().T) / 2, *panels))
     seen = []
 
-    def eigh(a):
+    def eigh(a, **_):
         seen.append(np.asarray(a))
         return jnp.linalg.eigh(a)
 

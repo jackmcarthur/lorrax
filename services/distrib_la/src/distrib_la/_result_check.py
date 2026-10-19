@@ -121,7 +121,7 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
     ~ eps (||A|| + s) <= eps sqrt(n) ||A||_2.
     """
     pin = (lambda r: r) if constrain is None else constrain
-    def solve(a):
+    def solve(a, cut=None):     # ``cut`` is the checked routes' (checked_eigh); a bare solve ignores it
         n = a.shape[-1]
         dead = jnp.all(a == 0, axis=-1)
         # Every live eigenvalue lies in [-b, b] (Gershgorin).
@@ -239,14 +239,29 @@ def _all_ranks(flag, mesh):
     return reduce(flag) > 0
 
 
-def eigh_errors(a, values, vectors, *, mesh=None):
-    """Largest probe residual and orthogonality error of a (stack of) eigh result(s)."""
-    x = probes(a.shape[-1], vectors.dtype)
+def used_probes(values, dtype, cut=None):
+    """The probes, restricted to the columns a caller uses: rows ``w > cut * max(w)`` (all with ``cut`` None).
+
+    Check what you use: a caller that keeps only ``w > c max(w)`` passes ``cut <= c``, so a
+    defect inside the discarded near-zero cluster (cuSOLVERMp's non-orthonormal vectors
+    there) is outside the check and needs no retry. ``(X_used, mask or None)``."""
+    x = probes(values.shape[-1], dtype)
+    if cut is None:
+        return x, None
+    used = values > cut * jnp.max(values, axis=-1, keepdims=True)
+    return x * used[..., :, None].astype(dtype), used[..., :, None]
+
+
+def eigh_errors(a, values, vectors, *, mesh=None, cut=None):
+    """Largest probe residual and orthogonality error of a (stack of) eigh result(s), on the used columns."""
+    x, used = used_probes(values, vectors.dtype, cut)
     vx = vectors @ x
     nd = a.ndim
+    gram = jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x
+    norm_x = jnp.maximum(_norm(x), jnp.finfo(values.dtype).tiny)      # replicated, per matrix
     residual = _norm(a @ vx - vectors @ (values[..., :, None] * x), mesh, _rows(nd)) / (
-        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * _norm(x))
-    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x, mesh, _rows(nd)) / _norm(x)
+        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * norm_x)
+    orthogonality = _norm(gram if used is None else jnp.where(used, gram, 0), mesh, _rows(nd)) / norm_x
     finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
     return (jnp.where(finite, jnp.max(residual), jnp.inf),
             jnp.where(finite, jnp.max(orthogonality), jnp.inf))
@@ -441,10 +456,11 @@ def eigh_layout(mesh, ndim):
                       jax.lax.with_sharding_constraint(r[1], vectors))
 
 
-def checked_eigh(attempts, a, *, mesh=None, final=True):
-    """A distributed eigh, checked: ``attempts`` solve ``a`` in order of preference; ``(result, failed)``."""
+def checked_eigh(attempts, a, *, mesh=None, final=True, cut=None):
+    """A distributed eigh, checked on the columns ``w > cut * max(w)`` (all by default): ``attempts`` solve ``a``
+    in order of preference; ``(result, failed)``. A caller that keeps only ``w > c max(w)`` passes ``cut <= c``."""
     constrain = None if mesh is None else eigh_layout(mesh, a.ndim)
-    return checked("eigh", attempts, lambda r: eigh_errors(a, *r, mesh=mesh), (a,),
+    return checked("eigh", attempts, lambda r: eigh_errors(a, *r, mesh=mesh, cut=cut), (a,),
                    constrain=constrain, final=final)
 
 

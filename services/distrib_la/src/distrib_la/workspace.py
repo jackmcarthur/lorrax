@@ -144,7 +144,7 @@ def _workspace_details(plan, op, shapes, dtype):
                     vendor_device_bytes=device if local else None,
                     native_device_bytes=device,
                     dynamic_xla_scratch_bytes=scratch,
-                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes include aligned vendor workspace and a private operand tile; checked = CHECKED_EIGH_TILES n^2/P (+ 2 N^2/P at a padded solve side N, + GATHERED_EIGH_FACTOR n^2 when admitted)',
+                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes are the aligned vendor workspace (ABI 10: the solver destroys an aliased XLA copy of the operand, within checked); checked = CHECKED_EIGH_TILES n^2/P (+ 2 N^2/P at a padded solve side N, + GATHERED_EIGH_FACTOR n^2 when admitted)',
                     checked_device_bytes=checked,
                     copies=copies,
                     provider=('cusolverDn (one_device)' if one_device else 'cusolverDn')

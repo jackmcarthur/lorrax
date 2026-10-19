@@ -121,6 +121,13 @@ def main():
             a = jax.jit(build, static_argnums=(0, 1), out_shardings=face)(n, m)
             case(f"{family} n/p={m}", a)
             del a
+    # The cuSOLVERMp 0.9.1 defect's second seed (largenmu 2026-10-19): gram (rank n/2) and
+    # low-rank (rank n/4) at n 9152 on P4, seed 7 (seed n/p = 4576 above), through the plan.
+    if p == 2:
+        for family, build in (("gram", gram), ("low-rank", low_rank)):
+            a = jax.jit(build, static_argnums=(0, 1), out_shardings=face)(9152, 7)
+            case(f"{family} n=9152 seed 7", a)
+            del a
     for path in sys.argv[1:]:
         whole = np.load(path)
         if whole.shape[-1] % p:
