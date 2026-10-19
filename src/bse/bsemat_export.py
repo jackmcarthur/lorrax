@@ -333,14 +333,15 @@ def head_split_keys(keys, z_keys, V_flat, W_flat, *, zeta_path, tables, sym, gri
     plan = dla.plan("eigh", mesh_xy, backend="distributed" if jax.process_count() > 1 else "native",
                     n=n_rmu_pad)
     iqs = np.asarray([self_iq[p] for p in parents], dtype=np.int32)
-    stack = jax.jit(lambda v, i: (lambda t: 0.5 * (t + jnp.conj(jnp.swapaxes(t, 1, 2))))(
-        jnp.moveaxis(jnp.take(v, i, axis=2), 2, 0)),
-        out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(V_flat, jnp.asarray(iqs))
-    t_e = time.time()
-    lam_all, U_all = plan.batched(stack)
-    lam_all = np.asarray(rep(lam_all))
+    t_e, lam_all, U_all = time.time(), None, None
+    if parents:                                       # a Γ-only grid has no split to make
+        stack = jax.jit(lambda v, i: (lambda t: 0.5 * (t + jnp.conj(jnp.swapaxes(t, 1, 2))))(
+            jnp.moveaxis(jnp.take(v, i, axis=2), 2, 0)),
+            out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(V_flat, jnp.asarray(iqs))
+        lam_all, U_all = plan.batched(stack)
+        lam_all = np.asarray(rep(lam_all))
+        del stack
     t_eigh = time.time() - t_e
-    del stack
     pick = jax.jit(lambda u, i: u[i], out_shardings=face)
 
     # 2. one solve per parent slot, with the parent's own gates
