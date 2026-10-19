@@ -173,10 +173,35 @@ coherences, §1.1); the operator at the instantaneous energies, Eq. (8) of §1.5
 (no Hermitian projection; [on-shell Σ](sigma-on-shell.md) for the
 evaluation), rotated back with $U$.
 
-**Shared-pole member** (designed). $W(z)=\sum_jb_j(q)R_j/(z-\Omega_j)$ with
-poles shared per $q$; Eq. (6) at the bank's supports, then the pencil and
-constructor of `gw.shared_pole_*`. Measured on 516 the constructor alone is
-16.2 s of a 30 s W stage (§7), so it is the expensive member.
+**Shared-pole member** (`collision_screening = shared_pole`, implemented for the
+collision term, §1.5). $W^c(q,z)=\sum_j b_j(q)b_j(q)^\dagger/(z^2-\Omega_j^2)$
+with poles shared per $q$ (the even store; the ordered store pairs $q$ with
+$-q$). A refresh is a **full refit**: the GW run's own W stage
+(`gw.shared_pole_screening.screen_shared_poles`: response bank, moments,
+constructor) rerun at the instantaneous occupation table — the run's step
+occupations outside the window, diag ρ inside (dress none, §1.1) — after the
+recipe is re-resolved at that state's census (`bind_shared_pole_census` +
+`resolve_shared_pole_recipe`). $\chi_0(f(t))$ is the bank's own: it takes
+fractional occupations at every complex support natively (the metallic route,
+item 3), same-side pairs exact at $z\neq0$; no support is at $z=0$, so no
+principal value enters. Eq. (6) is not used: the bank's Dyson solve is the
+run's, with $v$. The head is frozen (the refit's `head_correction = off`; the
+window Σ adds the run's head). At $\rho^{\rm eq}$ the refit is bitwise the run's
+model (§6.1). The static limit subtracted from $\Delta\Sigma^{\rm h}$ is the
+equilibrium model's own $W^c(0)$ (`gw.mpa.sigma.shared_pole_static_wc`; it
+differs from the Dyson $W_0$ of the TD model's $K\delta\rho$ by the model's
+static error, $1.6\times10^{-5}$ max-relative on 516). Two support sets:
+the production ladder re-resolved at every state (V1), or an explicit set
+(`collision_spm_support_sites_ev`, "line | imaginary | height" in eV). On 516
+the explicit set that works at carrier states is V2′: the ladder plus a low
+line at 0.25–2.3 eV, the whole line at height 1.0 eV, and imaginary sites 0.25
+and 0.5 eV. An imaginary site at 0.1 eV is refused at carrier states by the
+bank's rule construction (the response exponential fit, `tol 1e-8`, fails once
+the occupation interval crosses zero); at $\rho^{\rm eq}$ it is admitted.
+Holding the equilibrium poles and refitting only one real residue scale per
+pole (V3) leaves 18–28% of the hot state's change of $W^c$ at the fit sites
+(V1 target; 48–69% for V2′) and needs negative scales: the poles must move,
+so the refresh refits them.
 
 **Head.** The prototype keeps the run's $W_h$ (band-diagonal SX/COH shifts,
 [static head](four-current-head-corrections.md#static-head)) frozen: $\delta\chi_0$
@@ -676,7 +701,7 @@ the full zone:
 | system (bands in the sums) | $N_k$, $N_\mu$ | $\chi_0$ static + probe | Dyson, full $q$ | window Σ | refresh | frozen `apply` |
 |---|---|---|---|---|---|---|
 | 516 6×6, 2v2c (160), GN-PPM (`07` replay, warm) | 36, 978 | 0.92 s (the run's χ0 stage, both supports) | 0.15 s (`screening_update`: both solves + fit) | 3.1 s (`window_sigma_c`) | **~4.2 s** | 2.95 ms |
-| 516 6×6, 2v2c (160), shared-pole (`04`) | 36, 978 | bank 12.5 s + moments 1.3 s | in the bank | 7.0 s | **~37 s** (constructor 16.2 s) | 2.95 ms |
+| 516 6×6, 2v2c (160), shared-pole (`04`), full refit (measured, below) | 36, 978 | bank 10.0 s + moments 0.7 s | in the bank | 5.1 s + rebase 4.1 s | **34.3 s** (constructor 13.8 s) | 2.95 ms |
 | 471 8×8 (898), N_μ 3000 (`14_bseprod_c3000`) | 64, 3000 | 1.1 + 2.4 s | 2 × 0.2 × 6.4 = 2.6 s | 16.6 + 11.7 s | **~34 s** | — |
 | 471 8×8 (898), N_μ 6000 (`15_bseprod_c6000`) | 64, 6000 | 3.7 + 8.7 s | 2 × 0.9 × 6.4 = 11.5 s | 86.4 + 12.4 s | **~123 s** | — |
 | 30×30, 42v × 14c (`34_bseprodb_df3000r8_w88_144`) | via the 8×8 parent | as 8×8 | as 8×8 | window on 30×30 | **8×8 + densify** | 95.4 ms |
@@ -715,6 +740,27 @@ Dyson + fit 1.58 s. The frozen part's τ count is set by the window's own
 energies (48 or 76 τ against 181–207 τ on the GW list); the active part's by its
 live branches. δχ0 on the window is the bubble's change only ($\chi_0^{ff}$ is in
 $W_0$): its same-side sum grows with $n_A$ (2v2c 1.85 s, 10v14c 5.16 s).
+
+**Measured per refresh, the shared-pole collision term** (branch
+`feat/td-agw-dynsig-spm-2026-10-18`; 516 6×6, 160 bands, $N_\mu$ 978, K = 1761
+poles at every q, 4 × A100, warm; medians over the refreshes of the driven runs):
+
+| refresh (2v2c window [128, 132)) | wall per refresh |
+|---|---|
+| refit, V1 (5×10⁸ V/m, 0.25 fs, 31 refreshes) | **34.3 s** |
+|   bank: direct 2.1, Dyson 3.4, lines 2.1, rule nodes and host 2.4 | 10.0 s |
+|   moments | 0.7 s |
+|   constructor: Gram 8.0, directions 2.0, writer 2.9, other 0.9 | 13.8 s |
+|   window Σ: frozen part 2.1 (52 τ), active part 3.0, census 0.4 | 5.5 s |
+|   rebase: $C[\rho^{\rm eq}]$ on $W(t)$ | 4.1 s |
+| refit, V1, 3×10⁹ V/m (hot sweeps, 130 τ) | 35.6 s |
+| refit, V2′ ($\rho^{\rm eq}$; bank 18.7 s with 156 rule nodes, constructor 18.6 s) | 46.9 s |
+| frozen shared-pole W, sweep only | 2.9 s |
+
+The refit is 72% of a refresh. Against the GN-PPM refresh (4.3–5.4 s) it is
+7×, against the frozen-W split (1.46 s) 23×. The constructor wall varies
+between runs (13.7–18.1 s median; the Gram reduction 8–12 s). At a 0.25 fs
+cadence an 8 fs drive spends 31 × 34 s ≈ 18 min in refreshes on 4 A100.
 
 The 30×30 W update runs on the 8×8 parent (the 30×30 NSCF has 200 bands, not
 the 898 of the sums) and is densified as W already is
@@ -758,6 +804,19 @@ takes $C[\rho^{\rm eq}]$ at the rates of $\rho^{\rm eq}$ on $W(t)$ (one more spl
 sweep at $f^{\rm eq}$, 2.1 s on 516 2v2c); on the 516 drives it removes the
 spurious carriers (§1.5) and should be the refreshed screening's default.
 
+**Shared-pole screening** (`collision_screening = shared_pole`, §1.4) refits
+the whole W stage at each refresh and rebases $C[\rho^{\rm eq}]$ on $W(t)$ by
+default (`collision_rebase = auto`: on for shared_pole; `on` with frozen
+screening is refused). Its source is the GW driver on `collision_source`
+(the SPM deck; it may differ from `bundle_input` only for shared_pole). On 516
+the refreshed run is one program per run (no recompiles over 15–63 refreshes);
+at $\rho^{\rm eq}$ the collision stays zero through the refreshes (max
+deviation $5\times10^{-14}$, held flow $3\times10^{-11}$ meV). Cadence
+($\max_t|\Delta n_c|/\max n_c$, 8 fs drives): at 5×10⁸ V/m 0.25 fs is within
+0.9% of 0.125 fs (25 as samples) and 0.5 fs within 2.4%; at 3×10⁹ V/m 0.5 fs
+is within 0.5% of 0.25 fs (1.6% at the end). The refreshed W moves P(t) by
+4.6% against the frozen shared-pole W at 3×10⁹ V/m, 0.07% at 5×10⁸ V/m.
+
 ## 8. Validation {#validation}
 
 `tests/test_tdagw_dynsig.py` (synthetic 3×2×1 k, 9 bands = 3 frozen
@@ -781,6 +840,17 @@ with `screening="frozen"` gives P(t) and ρ(t_f) equal to `isdf_model`'s to the
 last bit; the literal Eq. (1) in a rotated instantaneous basis at ρ(t_f) equals
 $-K^W\delta\rho$ to $1.1\times10^{-11}$ (twin without coherences 12.2); the
 static member as in §4 and §7.
+
+`tests/tdagw/test_spm_refresh_cpu.py` (CPU, NumPy references): the pole
+census against a direct NumPy sum over a synthetic store, the occupation
+duck, recipe-site equality, the "| height" field of the support sites, the
+deck keys and their refusals, the refit receipts and refresh lines, and one
+capacity ledger per Σ evaluation. `tests/tdagw/_spm_refresh_516_case.py` (516,
+4 A100): the refit at $\rho^{\rm eq}$ is bitwise the run's model (factor,
+poles, K); $W^c(0)$ of the model against the exact $W^c$ $1.6\times10^{-5}$, and
+$V + W^c(0)$ against the COHSEX bundle's $W_0$ $2.1\times10^{-6}$ max-relative;
+with the shared-pole options off, the GW outputs of the `04` and `07` decks and
+the GN-PPM collision case are bitwise origin/main's.
 
 ## 9. Refactors for a production member {#refactors}
 
@@ -817,7 +887,12 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    `(PPMBuildResult, (W(0), W(iω_p)))`. The GW driver calls the same
    `pole_fit_plan` + `fit_pole_model` (`ppm_pipeline` :813, :830), so the TD
    update and the run share one fit; the run's outputs are bitwise unchanged
-   (§6.1). The shared-pole half is not done.
+   (§6.1). **Done for the shared-pole member** (branch
+   `feat/td-agw-dynsig-spm-2026-10-18`): `tdagw.dynsig.spm_refit` reruns the
+   source's W stage (`gw.shared_pole_screening`, the entry seam of
+   `gw_window_source`) at the instantaneous occupation table and returns the
+   model on the store the window Σ reads; the bank and constructor are the GW
+   driver's, the recipe is re-resolved at the state's census.
 5. **Σ τ sweep on a window.** `ppm_pipeline.compute_ppm_sigma_pipeline` (:690)
    takes `wfns`, `config`, `meta`, `head_resolver`, `band_slices`, `wfn`,
    `sym`. Change: an array-level entry (`psi_full` faces, $G$ weights at the Σ
@@ -874,11 +949,15 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
     part's session planned on the same envelope, so that no rule is re-fitted
     when $e(t)$ moves.
 12. **Rebased subtraction and smooth invalid modes for refreshed screening.**
-    `window_collision(rebase=True)` as the default with refreshed screening (a deck
-    key after a deck-route check); and an invalid-mode treatment continuous in
-    $\Omega^2$ (a blend of the pole and its static limit across $\Omega^2=0$, or
-    the shared-pole member), since the flips set the jumps of $\Delta\Sigma^{\rm h}$.
+    The deck key exists (`collision_rebase`, `auto` = on for shared_pole); the
+    default for `refreshed` (GN-PPM) remains off pending its deck-route check. The
+    invalid-mode treatment continuous in $\Omega^2$ is still open for GN-PPM; the
+    shared-pole member has no invalid modes (every pole is passive), which is the
+    route measured on 516.
 13. **Pole census.** $\max|\Delta\Omega|$ is set from the first refresh
     (δW/W0 ~ 10⁻⁹ on 516: 25 eV) by modes whose fit is ill-conditioned
     ($W^c(0)\to\mathrm{Re}\,W^c(i\omega_p)$); a residue-weighted measure would
-    report the modes that move Σ.
+    report the modes that move Σ. **Done for the shared-pole member**
+    (`tdagw.dynsig.pole_census`: residue $|b_j|^2/2\Omega_j$ and static
+    $|b_j|^2/2\Omega_j^2$ weights below 0.3 and 1 eV, $\Omega_{\min}$, q-resolved
+    histograms, one line per refresh).

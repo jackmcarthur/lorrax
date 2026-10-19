@@ -260,10 +260,34 @@ does not (§1.6).
 Refreshed screening is a measured prototype, not a production setting. On the
 516 drives the subtracted form keeps `C[rho_eq]` at the t0 rates, and the
 change of its regularization tails with W raises the carrier density by
-43–58 %; the Python option `window_collision(rebase=True)` (no deck key yet)
-removes it. At 3e9 V/m the held ΔΣ^h jumps by up to 77 meV between refreshes,
-following the invalid-mode flips in the refresh lines, and P(t) does not
-converge with the cadence. Read the flips column before trusting a run.
+43–58 %; `collision_rebase = "on"` (deck key; `auto` leaves it off for
+refreshed GN-PPM screening) removes it. At 3e9 V/m the held ΔΣ^h jumps by up
+to 77 meV between refreshes, following the invalid-mode flips in the refresh
+lines, and P(t) does not converge with the cadence. Read the flips column
+before trusting a run.
+
+### Shared-pole screening {#collision-shared-pole}
+
+```toml
+collision_screening = "shared_pole"       # full refit of the source's shared-pole W per refresh
+collision_source = "../04_gw_oneshot_mpa_eqp/oneshot.in"   # the SPM GW deck (default: bundle_input)
+collision_refresh_sweep = "active"
+collision_refresh_fs = 0.25
+# collision_rebase = "auto"               # on for shared_pole: C[rho_eq] on W(t)
+# collision_spm_support_sites_ev = "<line> | <imaginary> | <height>"   # explicit supports (V2'); default: the ladder
+```
+
+Every refresh reruns the source deck's W stage (response bank, moments,
+constructor) at the instantaneous populations and re-resolves the recipe there
+([TD-aGW dynamical §1.4](../theory/td_agw_dynamical.md#w)); at ρ_eq the refit is
+bitwise the run's model. On 516 2v2c it costs 34 s per refresh (refit 25 s,
+window Σ 5 s, rebase 4 s; [§7](../theory/td_agw_dynamical.md#cost)) and the
+run stays one program. Each refresh line adds the refit walls, K, the census
+(Ω_min and the residue and static weight below 0.3 and 1 eV) and the gates
+that did not pass (capacity:WARN is the run's own). Explicit support sites
+take eV lists; an imaginary site at 0.1 eV is refused at carrier states by
+the bank's rule construction, so V2′ uses 0.25 and 0.5 eV. Measured prototype,
+not a production setting.
 
 ## Choosing an integrator {#integrators}
 
