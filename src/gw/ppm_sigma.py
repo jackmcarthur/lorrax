@@ -2060,8 +2060,10 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     def run(omega_grid=None, keep_branches=False):
         """On shell (``omega_grid`` None) or on that grid (the debug route)."""
         if spm:
+            # each Sigma evaluation (the on-shell pair, the grid) is its own capacity phase:
+            # the ledger's stage names are unique per ledger, so every call gets a fresh one
             return _shared_pole_window_run(
-                wfns_t, poles, meta_t, mesh_xy, plan, pop, internal_bands,
+                wfns_t, poles, fresh_shared_pole_capacity(meta_t, mesh_xy), mesh_xy, plan, pop, internal_bands,
                 request_for=request_for if omega_grid is None else None,
                 omega_grid_ry=omega_grid, keep_branches=keep_branches, print_fn=quiet)
         return compute_sigma_c_ppm_omega_grid(

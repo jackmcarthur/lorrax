@@ -192,3 +192,27 @@ def test_refit_receipts_and_lines(tmp_path):
     from tdagw.td_log import TdReport
     summary = TdReport._screening_summary([dict(screen=rec, frozen_s=1.1, active_s=0.9, rebase_s=2.0)])
     assert "shared-pole refits" in summary and "capacity:WARN" in summary
+
+
+def test_fresh_capacity_per_phase(monkeypatch):
+    """Each window Sigma evaluation (on-shell pair, then the omega grid) prices on its own ledger.
+
+    Regression (2026-10-19): window_sigma_c(omega_ry=...) reserved 'sigma.panel_budget' twice on
+    one ledger (the pair, then the grid) and the ledger refused the repeated stage name.
+    """
+    from types import SimpleNamespace
+    import common.gpu_utils as G
+    from gw import ppm_sigma as PS
+    monkeypatch.setattr(G, "device_budget_bytes", lambda: 4.0e9)
+    meta = SimpleNamespace(nk_tot=4, nspinor=1, n_rmu=8)
+    mesh = SimpleNamespace(shape={"x": 1, "y": 1})
+    a = PS.fresh_shared_pole_capacity(meta, mesh)
+    b = PS.fresh_shared_pole_capacity(a, mesh)
+    kw = dict(resident_bytes_per_rank=8, workspace_bytes_per_rank=8)
+    a.shared_pole_capacity.reserve("sigma.panel_budget", **kw)
+    with pytest.raises(ValueError, match="new nonempty name"):
+        a.shared_pole_capacity.reserve("sigma.panel_budget", **kw)
+    b.shared_pole_capacity.reserve("sigma.panel_budget", **kw)
+    assert a.shared_pole_capacity is not b.shared_pole_capacity
+    assert b.shared_pole_capacity.live_stages == ()
+    assert not hasattr(meta, "shared_pole_capacity")
