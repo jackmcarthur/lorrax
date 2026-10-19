@@ -279,10 +279,11 @@ _EIGH_SECONDS = {"CUDA": {"one": ((312, 0.022 / 16), (8192, 2.05), (16384, 13.7)
 def _eigh_seconds(kind, n, ranks=4, platform="CUDA"):
     """Expected seconds of one n x n eigh, ``kind`` 'one' (one device) or 'mesh' (``ranks``), or
     None without a measured row: the points log-log interpolated, n^3 past the last, the fixed
-    cost below the first. Past n 16384 the mesh's part above its fixed cost scales as 4/P (n
-    100000 at P16: 412 s predicted, 312 s measured, eighmem 2026-10-18); below it the mesh is
-    held at its P4 time on every P, since P16 is unmeasured there (open: a P16 sweep at n
-    2048-8192)."""
+    cost below the first. On P <= 4 the mesh's part above its fixed cost scales as 4/P. On P > 4
+    the mesh is held at its P4 time up to the last measured n (16384; P16 is unmeasured there,
+    open: a P16 sweep at n 2048-8192), and past it only the growth beyond t(16384) scales as 4/P,
+    so the curve is continuous (n 100000 at P16: 417 s predicted, 312 s measured, eighmem
+    2026-10-18)."""
     pts = _EIGH_SECONDS.get(str(platform), {}).get(kind)
     if pts is None:
         return None
@@ -290,8 +291,10 @@ def _eigh_seconds(kind, n, ranks=4, platform="CUDA"):
     for (a, ta), (b, tb) in zip(pts, pts[1:]):
         if a < n <= b:
             t = ta * (tb / ta) ** (math.log(n / a) / math.log(b / a))
-    if kind == "one" or (ranks > 4 and n <= pts[-1][0]):
+    if kind == "one":
         return t
+    if ranks > 4:
+        return t if n <= pts[-1][0] else pts[-1][1] + (t - pts[-1][1]) * 4 / ranks
     return pts[0][1] + (t - pts[0][1]) * 4 / ranks
 
 

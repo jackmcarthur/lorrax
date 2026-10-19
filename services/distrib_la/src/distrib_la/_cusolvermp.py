@@ -269,6 +269,20 @@ def rhs_block(n: int, nrhs: int, Px: int, Py: int, mb: int) -> int:
     return local if mb == n // Px else largest_divisor(local, _BLOCK_MAX)
 
 
+def _announce_lu(kind, mesh, nq, n, nrhs, mb_a, nb_a, mb_b=None, nb_b=None):
+    """One rank-0 line per distributed LU program built: its descriptors, so a run's log shows
+    the layout it solved at (run30k 2026-10-19: a stalled Dyson LU printed none)."""
+    if int(jax.process_index()) != 0:
+        return
+    Px, Py = (int(v) for v in _validate_mesh(mesh))
+    rhs = ("" if nb_b is None else
+           f"; B {n}x{nrhs} mb_b {mb_b} nb_b {nb_b}, {(nrhs // Py) // max(1, nb_b)} RHS block(s) per rank "
+           "(getrs chunks them under its 2 GiB workspace cap)")
+    relabel = "relabeled block-cyclic" if (mb_a, nb_a) != (n // Px, n // Py) else "one tile per rank"
+    print(f"  [distrib_la.cusolvermp] {kind} {nq} x {n}^2 on the {Px}x{Py} mesh: A mb {mb_a} nb {nb_a} "
+          f"({relabel}){rhs}.", flush=True)
+
+
 def lu_blocks(n: int, Px: int, Py: int) -> tuple[int, int]:
     """``(mb, nb)`` of the LU descriptors: one tile per rank, or a square relabeled
     block on a square mesh from 4x4 up, or where the local edge exceeds
@@ -632,6 +646,7 @@ def batched_distributed_getrf(
            int(ctx_key))
     jit_getrf = _JIT_CACHE.get(key)
     if jit_getrf is None:
+        _announce_lu("getrf", mesh, nq, n, None, mb, nb)
         LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
         ipiv_local = jax.ShapeDtypeStruct((nq, ipiv_len), jnp.int64)
         attrs = dict(nq=nq, n=n, mb=mb, nb=nb,
@@ -686,6 +701,7 @@ def batched_distributed_getrs(
            LU.mb, LU.nb, mb_b, nb_b, int(ctx_key))
     jit_getrs = _JIT_CACHE.get(key)
     if jit_getrs is None:
+        _announce_lu("getrs", mesh, LU.nbatch, LU.n, nrhs, LU.mb, LU.nb, mb_b, nb_b)
         X_local_T = jax.ShapeDtypeStruct(
             (LU.nbatch, nrhs // Py, LU.n // Px), B.dtype)
         attrs = dict(nq=LU.nbatch, n=LU.n, nrhs=nrhs,
@@ -974,6 +990,7 @@ def batched_distributed_solve_lu(
            nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_key))
     jit_solve = _JIT_CACHE.get(key)
     if jit_solve is None:
+        _announce_lu("solve_lu", mesh, nq, n, nrhs, mb_a, nb_a, mb_b, nb_b)
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
         LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
         attrs = dict(nq=nq, n=n, nrhs=nrhs,

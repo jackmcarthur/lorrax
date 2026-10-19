@@ -91,6 +91,23 @@ def device_budget_bytes() -> float:
     return _RUN_DEVICE_BUDGET_GB * 1e9
 
 
+def shared_device_room_bytes() -> int:
+    """The room beside what is live now: the run budget less this process's live device bytes
+    per local device, the minimum over processes so every rank decides alike. Every process must
+    enter this call."""
+    import jax
+    live = sum(s.data.nbytes for a in jax.live_arrays() for s in a.addressable_shards)
+    return int(minimum_process_budget_gb(
+        max(0.0, device_budget_bytes() - live / len(jax.local_devices())) / 1e9) * 1e9)
+
+
+def room_bucket(room) -> int:
+    """A room as planners key on it: floored to a whole GiB at or above 1 GiB, exact below
+    (a sub-GiB room that fits is not rounded to none), 0 when negative."""
+    room = int(room)
+    return (room >> 30) << 30 if room >= 1 << 30 else max(room, 0)
+
+
 # ============================================================================
 # Routes: every memory-driven local-or-distributed choice, decided and recorded
 # ============================================================================

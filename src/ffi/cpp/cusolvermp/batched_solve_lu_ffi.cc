@@ -58,6 +58,9 @@
 #include <string>
 
 #include <algorithm>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <cuda_runtime.h>
 #include <cusolverMp.h>
 
@@ -147,6 +150,24 @@ static ffi::Error getrs_chunking(LorraxCusolverMpCtx* ctx, int64_t n, int64_t nr
         while (nk > 1 && blk_local % nk) --nk;
         k = std::max<int64_t>(1, nk);
     }
+}
+
+// Under LORRAX_DEBUG_PRINT, once per process and shape: the descriptors and the getrs chunking a
+// solve runs at (ws_f < 0: a getrs-only call, its getrf ran before).
+static void debug_lu_layout(const char* kind, int64_t n, int64_t nrhs, int64_t mb_a, int64_t nb_a,
+                            int64_t mb_b, int64_t nb_b, int64_t n_chunks, int64_t chunk_cols,
+                            double ws_f, double ws_s) {
+    static std::mutex mu;
+    static std::set<std::tuple<std::string, int64_t, int64_t>> seen;
+    const char* dbg = std::getenv("LORRAX_DEBUG_PRINT");
+    if (!dbg || !*dbg || *dbg == '0') return;
+    std::lock_guard<std::mutex> lock(mu);
+    if (!seen.insert({kind, n, nrhs}).second) return;
+    std::fprintf(stderr, "[cusolvermp %s] n=%lld nrhs=%lld A mb/nb %lld/%lld B mb/nb %lld/%lld: getrs "
+                 "%lld chunk(s) of %lld local columns; workspace getrf %s GB, getrs %.2f GB\n", kind,
+                 (long long)n, (long long)nrhs, (long long)mb_a, (long long)nb_a, (long long)mb_b,
+                 (long long)nb_b, (long long)n_chunks, (long long)chunk_cols,
+                 ws_f < 0 ? "n/a" : std::to_string(ws_f / 1e9).substr(0, 5).c_str(), ws_s / 1e9);
 }
 
 template <typename T>
@@ -242,6 +263,7 @@ static ffi::Error BatchedSolveLuImpl(
     descB = nullptr;
     const int64_t chunk_cols = kc * nb_b;                         // local columns per chunk
     const int64_t n_chunks = (B_local_cols / nb_b) / kc;
+    debug_lu_layout("solve_lu", n, nrhs, mb_a, nb_a, mb_b, nb_b, n_chunks, chunk_cols, double(d_ws_f), double(d_ws_s));
     LORRAX_LIB_CHECK(
         cusolverMpCreateMatrixDesc(&descB, ctx->grid, mp::CudaDataTypeOf<T>::value,
                                    n, chunk_cols * Py, mb_b, nb_b, 0, 0, lld_A),
@@ -486,6 +508,7 @@ static ffi::Error BatchedGetrsImpl(
     }
     const int64_t chunk_cols = kc * nb_b;
     const int64_t n_chunks = (B_local_cols / nb_b) / kc;
+    debug_lu_layout("getrs", n, nrhs, mb_a, nb_a, mb_b, nb_b, n_chunks, chunk_cols, -1.0, double(d_ws));
     cusolverMpDestroyMatrixDesc(descB);
     descB = nullptr;
     LORRAX_LIB_CHECK(
@@ -708,7 +731,52 @@ static ffi::Error BatchedSolveLuDispatch(
                           nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, ctx_key);
 }
 
+// Query-only (no matrix, no solve): the device and host workspace one solve allocates beside
+// its operands per matrix -- getrf's and the chunked getrs's (separate buffers, both live) and
+// the pivots -- at the descriptors BatchedSolveLuImpl builds, on the persistent context (no
+// handle is created). Mp sizing reads no matrix data but rejects null pointers: the context's
+// info allocation is the address token.
+template <typename T>
+static int lu_workspace(LorraxCusolverMpCtx* ctx, int64_t n, int64_t nrhs, int64_t mb_a,
+                        int64_t nb_a, int64_t mb_b, int64_t nb_b, uint64_t* device_bytes,
+                        uint64_t* host_bytes) {
+    const int64_t lld_A = (n + ctx->p - 1) / ctx->p;
+    cusolverMpMatrixDescriptor_t descA = nullptr;
+    cusolverStatus_t st = cusolverMpCreateMatrixDesc(&descA, ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                                     n, n, mb_a, nb_a, 0, 0, lld_A);
+    if (st != CUSOLVER_STATUS_SUCCESS) return int(st);
+    T* token = reinterpret_cast<T*>(ctx->d_info);
+    int64_t* ipiv = reinterpret_cast<int64_t*>(ctx->d_info);
+    size_t df = 0, hf = 0, ds = 0, hs = 0;
+    int64_t k = 1;
+    st = mp::GetrfBufferSize<T>(ctx->handle, n, n, token, 1, 1, descA, ipiv, &df, &hf);
+    int rc = int(st);
+    if (st == CUSOLVER_STATUS_SUCCESS)
+        rc = getrs_chunking<T>(ctx, n, nrhs, mb_b, nb_b, lld_A, descA, token, ipiv, token,
+                               &k, &ds, &hs).success() ? 0 : -3;
+    cusolverMpDestroyMatrixDesc(descA);
+    if (rc == 0) {
+        *device_bytes = uint64_t(df + ds) + uint64_t(lld_A + mb_a) * sizeof(int64_t);
+        *host_bytes = uint64_t(hf + hs);
+    }
+    return rc;
+}
+
 }  // namespace lorrax_ffi::cusolvermp_batched_solve_lu
+
+extern "C" int lrx_lu_workspace_bytes(
+    int64_t ctx_handle, int64_t n, int64_t nrhs, int64_t mb_a, int64_t nb_a, int64_t mb_b,
+    int64_t nb_b, int complex128, uint64_t* device_bytes, uint64_t* host_bytes) {
+    if (!device_bytes || !host_bytes || ctx_handle == 0 || n < 1 || nrhs < 1 || mb_a < 1 ||
+        nb_a < 1 || mb_b < 1 || nb_b < 1 || (complex128 != 0 && complex128 != 1)) return -1;
+    *device_bytes = 0; *host_bytes = 0;
+    auto* ctx = reinterpret_cast<lorrax_ffi::cusolvermp::LorraxCusolverMpCtx*>(ctx_handle);
+    namespace lu = lorrax_ffi::cusolvermp_batched_solve_lu;
+    return complex128
+        ? lu::lu_workspace<std::complex<double>>(ctx, n, nrhs, mb_a, nb_a, mb_b, nb_b,
+                                                 device_bytes, host_bytes)
+        : lu::lu_workspace<double>(ctx, n, nrhs, mb_a, nb_a, mb_b, nb_b, device_bytes, host_bytes);
+}
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CusolverMpBatchedSolveLuFactorsFfi,

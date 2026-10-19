@@ -170,7 +170,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     never on the room that decides it; on ``off`` they solve locally and are built once.
     """
     from types import SimpleNamespace
-    from distrib_la import batch_layout, checked_program, local_batch, matmul, plan
+    from distrib_la import batch_layout, checked_program, local_batch, lu_workspace_bytes, matmul, plan
 
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     key = (mesh_xy, n, backend, route, pref, ordered, volume)
@@ -264,13 +264,17 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
 
     def bind(room):
         lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
-        # The provider beside the room: one factor face and the getrs right-hand-side chunk
-        # (batched_solve_lu_ffi's 2 GB cap, at most a face); over it, no route fits.
-        faces = 16 * int(n) * int(n) // int(mesh_xy.size)
-        if room is not None and lu.backend != "one_device" and faces + min(2_000_000_000, faces) > room:
-            raise RuntimeError(f"GATE response_dyson_capacity: the Dyson LU n={n} on the {lu.backend} "
-                               f"mesh needs {(faces + min(2e9, faces)) / 1e9:.2f} GB/rank beside its "
-                               f"operands, over the room {room / 1e9:.2f} GB/rank.")
+        # The provider beside the room: one factor face and its getrf/getrs workspace and pivots
+        # (the vendor's sizing on CUDA, nrhs = n: the Dyson bodies solve against I or V), else the
+        # getrs workspace cap (batched_solve_lu_ffi: 2 GB, at most a face); over it, no route fits.
+        if room is not None and lu.backend != "one_device":
+            faces = 16 * int(n) * int(n) // int(mesh_xy.size)
+            ws = lu_workspace_bytes(lu, n, np.complex128)
+            need = faces + (min(2_000_000_000, faces) if ws is None else ws)
+            if need > room:
+                raise RuntimeError(f"GATE response_dyson_capacity: the Dyson LU n={n} on the {lu.backend} "
+                                   f"mesh needs {need / 1e9:.2f} GB/rank beside its operands (factor face "
+                                   f"{faces / 1e9:.2f} + workspace), over the room {room / 1e9:.2f} GB/rank.")
         progs = local or {name: _Decided(key, name, room, lu) for name in names}
         pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
         resident = backend == "off" and volume is None
@@ -1022,17 +1026,20 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
 
 
 @lru_cache(maxsize=8)
-def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
+def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout, room=None):
     """One cached service plan for H=V^(1/2) and its supported inverse."""
     from distrib_la import checked_program, matmul, plan
     from .gw_config import linalg_resolution
     resolution = linalg_resolution({"linalg": layout})
     backend = "off" if resolution.layout == "local" else "distributed"     # the root's GEMMs
     if resolution.layout == "local":
-        # place() decides the root's eigh in the run budget: whole matrices per rank only
+        # place() decides the root's eigh in the room beside the bank's live set (the caller's
+        # common.gpu_utils.shared_device_room_bytes, bucketed): whole matrices per rank only
         # where they fit (a whole n^2 per rank unpriced was 115 GB/rank at n 30000).
-        from common.gpu_utils import device_budget_bytes
-        eig = plan("eigh", mesh_xy, n=n_packed, budget_bytes=int(device_budget_bytes()))
+        if room is None:
+            from common.gpu_utils import room_bucket, shared_device_room_bytes
+            room = room_bucket(shared_device_room_bytes())
+        eig = plan("eigh", mesh_xy, n=n_packed, budget_bytes=int(room))
     else:
         eig = plan("eigh", mesh_xy, backend="distributed", n=n_packed,
                    batched_route=resolution.batched_route)
@@ -1203,7 +1210,13 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     spec = P(None, "x", "y")
     # A span the W-model setup did not submit (compile_coulomb_roots_ahead)
     # compiles beside the read and the pack below instead of after them.
-    kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
+    # Under linalg = local the root's eigh is placed in the room beside what the bank holds now
+    # (bucketed: the program is cached on it); every rank enters the agreement.
+    from .gw_config import linalg_resolution
+    from common.gpu_utils import room_bucket, shared_device_room_bytes
+    room = (room_bucket(shared_device_room_bytes())
+            if linalg_resolution({"linalg": layout}).layout == "local" else None)
+    kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout, room)
     _compiled(kernel, (_packed_v(mesh_xy, shape[0], basis.n_packed),), ahead=True)
     if resource.get("path") is None:
         values = _COULOMB_OPERATORS[resource["operator"]]

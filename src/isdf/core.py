@@ -1481,17 +1481,15 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     n_log = int(n_rmu_logical)
     rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
     face, rep = NamedSharding(mesh_xy, P(None, 'x', 'y')), NamedSharding(mesh_xy, P())
-    key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond))
+    # distrib_la.plan.place decides the stack in the room beside what the zeta stage holds now
+    # (C, the stores; common.gpu_utils.shared_device_room_bytes, the same on every rank): whole
+    # matrices per rank where they fit (Fe: 64 q, n 312), else the whole mesh (a Gamma deck:
+    # nq 1, n 29998). The room's bucket keys the program, so a later call decides in its own room.
+    from common.gpu_utils import room_bucket, shared_device_room_bytes
+    room = room_bucket(shared_device_room_bytes())
+    key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond), room)
     if key not in _charge_face_cache:
-        # distrib_la.plan.place decides the stack in the room beside what the zeta stage holds
-        # now (C, the stores): the run budget less each device's live bytes, the minimum over
-        # processes so every rank decides alike. Whole matrices per rank where they fit (Fe:
-        # 64 q, n 312), else the whole mesh (a Gamma deck: nq 1, n 29998).
-        from common.gpu_utils import device_budget_bytes, minimum_process_budget_gb
-        live = sum(s.data.nbytes for a in jax.live_arrays() for s in a.addressable_shards)
-        room = minimum_process_budget_gb(
-            max(0.0, device_budget_bytes() - live / len(jax.local_devices())) / 1e9)
-        eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=int(room * 1e9))
+        eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=room)
         live = np.arange(int(n)) < n_log
 
         @partial(checked_program, mesh=mesh_xy, out_shardings=(face, rep), in_shardings=(face,))

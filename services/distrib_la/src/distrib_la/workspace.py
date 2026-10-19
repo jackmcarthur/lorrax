@@ -324,6 +324,34 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
     return int(_workspace_details(plan, op, shapes, dtype)['device_bytes'])
 
 
+def lu_workspace_bytes(plan, nrhs, dtype):
+    """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system with ``nrhs`` right-hand
+    sides allocates beside its operands, per matrix: getrf's and the chunked getrs's workspace
+    (separate buffers, both live; cudaMallocAsync, outside XLA's pool) and the pivots, from the
+    vendor's sizing at the descriptors the solve runs at (``lu_blocks``, ``rhs_block``), on the
+    plan mesh's persistent context (no handle is created). None where it does not apply (not a
+    CUDA cuSOLVERMp plan)."""
+    if plan.backend != 'cusolvermp' or mesh_platform(plan.mesh) != 'CUDA':
+        return None
+    from distrib_la.loader import get_lib
+    from distrib_la._cusolvermp import get_or_init_context, lu_blocks, rhs_block
+    px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
+    n, nrhs = int(plan.n), int(nrhs)
+    mb, nb = lu_blocks(n, px, py)
+    lib = get_lib('CUDA')
+    if not hasattr(lib, 'lrx_lu_workspace_bytes'):
+        raise RuntimeError('the LU workspace query requires a native build exporting lrx_lu_workspace_bytes')
+    fn = lib.lrx_lu_workspace_bytes
+    fn.argtypes = [ctypes.c_int64] * 7 + [ctypes.c_int] + [ctypes.POINTER(ctypes.c_uint64)] * 2
+    fn.restype = ctypes.c_int
+    device, host = ctypes.c_uint64(), ctypes.c_uint64()
+    rc = fn(get_or_init_context(plan.mesh), n, nrhs, mb, nb, mb, rhs_block(n, nrhs, px, py, mb),
+            int(np.dtype(dtype).kind == 'c'), ctypes.byref(device), ctypes.byref(host))
+    if rc:
+        raise RuntimeError(f'lrx_lu_workspace_bytes failed with status={rc}, n={n}, nrhs={nrhs}')
+    return int(device.value)
+
+
 def eigh_stack_bytes(plan, shape, dtype) -> int:
     """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
     its operand, priced as :func:`distrib_la.plan.place` prices it: on route (c) its program

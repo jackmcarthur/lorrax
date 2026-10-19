@@ -218,7 +218,8 @@ def face_eigh_room(admission, held=0):
     ``admission`` is a face batch admission row (``face_batch_width``) and
     ``held`` what is live beside it that the row does not hold: the receipt's
     upper bound on the factors every parent keeps. Both are shape prices,
-    so every rank agrees on the room. It is floored to a whole GiB.
+    so every rank agrees on the room. It is floored to a whole GiB at or above 1 GiB and
+    exact below (``common.gpu_utils.room_bucket``).
     """
     # ponytail: the face programs are keyed on the plan, and so on this
     # floored room; a room that crosses a GiB between SC maps recompiles the
@@ -226,7 +227,8 @@ def face_eigh_room(admission, held=0):
     # tuple (route, matrices per rank, rounds) instead of the room.
     room = (int(admission['available_device_bytes_per_rank'])
             - int(admission['aggregate_bytes_per_rank']) - int(held))
-    return (room >> 30) << 30 if room >= 1 << 30 else 0
+    from common.gpu_utils import room_bucket
+    return room_bucket(room)
 
 
 def check_eigh_room(model_row, price):
