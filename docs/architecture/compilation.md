@@ -258,9 +258,8 @@ request number there. XLA then compiles on one of min(8, physical cores)
 helper threads. Whichever of the helper and the live call reaches the compile
 first compiles under that number, and the other waits, so a program compiles
 once and takes one number on every rank, whatever the timing. Two owners
-submit: the scalar shared-pole W-model setup, before the ζ fit (V^(1/2) of
-the bare V's parents under a distributed `linalg`, and the MPA scalar head
-fit when a head correction is on), and a streamed bank (all its row passes at
+submit: the scalar shared-pole W-model setup, before the ζ fit (the MPA
+scalar head fit when a head correction is on), and a streamed bank (all its row passes at
 once). On the P4 hsuite this takes release cold from 336.7 to 326.3 s, with
 requests and compiles unchanged and eqp byte-identical; the CrI3 6×6
 bispinor deck moves by less than 1 s (claim 4210). The LLVM flag shortens
