@@ -1143,7 +1143,7 @@ def _occupation_duck(f_kn, mu_ry: float):
 
 
 def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
-                  support_sites: str = "", scratch: str) -> dict:
+                  support_sites: str = "", scratch: str, chi0_active=None) -> dict:
     """The held objects of the shared-pole refit of the collision term (§1.4, §7.1).
 
     A refit is the GW run's own W stage (``gw.shared_pole_screening.
@@ -1160,6 +1160,14 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     ``"<line eV> | <imaginary eV> [| <line height eV>]"``), resolved at the run's
     census.  Models go to ``scratch``; a refit's directory is removed when its
     label is reused.
+
+    ``chi0_active`` (None: chi0 over all pairs on one rule, the GW run's path):
+    ``(a0, a1)``, the active bands A on the W carrier's band axis (0-based,
+    half-open, containing the window).  The refits then take chi0 as four
+    (hole x electron) blocks FF, FA, AF, AA with F the other bands at their
+    0/1 step (``gw.response_bank.response_blocks``): only AA crosses zero,
+    every block's interval comes from band energies, and its rule is built at
+    the first refit and held for the run (``meta.shared_pole_response_blocks``).
 
     Returns dict: ``inputs`` (the run's W-stage arguments), ``recipe_inputs``,
     ``meta`` (the refit's metadata copy), ``config`` (the run's with the head off
@@ -1197,11 +1205,22 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     config = dataclasses.replace(
         config_run, sigma=sigma,
         head=dataclasses.replace(config_run.head, correction=HeadCorrection.OFF))
+    if chi0_active is not None:
+        a0, a1 = (int(x) for x in chi0_active)
+        if not (0 <= a0 <= win.start and win.stop <= a1 <= f_eq.shape[1]):
+            _refuse("dynsig_spm_chi0_active", f"active bands [{a0}, {a1})",
+                    f"a range of the W carrier's {f_eq.shape[1]} bands containing the window "
+                    f"[{win.start}, {win.stop})", "the window's populations are A's")
     scr = dict(inputs=inp, recipe_inputs=dict(source["recipe_inputs"]), meta=_copy.copy(meta_run),
                config=config, f_eq=f_eq, rows=np.arange(enk_w.shape[0]), win=win, mu_ry=mu,
                variant=("production" if override is None else "override"),
                support_sites="" if override is None else override["text"], scratch=scratch,
                efermi_ry=float(source["efermi_ry"]), linalg=source.get("linalg"), n=0)
+    if chi0_active is not None:
+        # Read by gw.response_bank (response_support, response_quadrature): the
+        # refit's own meta copy only; the block rules are held in "held".
+        scr["meta"].shared_pole_response_blocks = dict(active=(a0, a1), held={})
+    scr["chi0_active"] = None if chi0_active is None else [a0, a1]
     # The production variant's reference is the run's own recipe; an override is
     # resolved at the run's census (the same resolver, another support set).
     scr["recipe0"] = meta_run.shared_pole_recipe if override is None else _spm_recipe(scr, f_eq)
@@ -1491,7 +1510,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                      check_truncation: bool = False, odd_same_side: bool = True,
                      screening_gamma_ev: float = 0.0, rebase: bool | None = None,
                      spm_support_sites: str = "", spm_scratch: str | None = None,
-                     say=print, record=None):
+                     spm_chi0_active=None, say=print, record=None):
     """The held collision term at t0 and its refresh hook (§1.5, §7.1), GN-PPM or shared pole.
 
     Parameters
@@ -1552,6 +1571,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     spm_support_sites : ``"shared_pole"`` only: :func:`spm_screening`'s support set (""
         the run's production ladder, re-resolved at every state).
     spm_scratch : ``"shared_pole"`` only: the refits' model directory (required).
+    spm_chi0_active : ``"shared_pole"`` only: :func:`spm_screening`'s ``chi0_active``
+        (None: one rule on all pairs; ``(a0, a1)``: chi0 as four blocks).
     say : the stdout line of each refresh; ``record`` (or None) gets each
         refresh's dict (the run log's section, the case scripts' tables).
 
@@ -1661,7 +1682,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     if screening == "shared_pole":
         t_s = time.perf_counter()
         scr = spm_screening(source, mesh=mesh, b_lo=int(b_lo), n_active=nb,
-                            support_sites=spm_support_sites, scratch=spm_scratch)
+                            support_sites=spm_support_sites, scratch=spm_scratch,
+                            chi0_active=spm_chi0_active)
         t_b0 = time.perf_counter()
         poles_eq, screen_eq = spm_refit(scr, f_b, label="eq")
         if scr["variant"] == "override":

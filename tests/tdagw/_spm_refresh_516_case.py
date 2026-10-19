@@ -29,6 +29,10 @@ SPD  driven runs: --cd-pulses x --cd-cadences x --cd-variants (V1, V2, frozen = 
 SPE  eta: the source rerun at sigma_regularization_ev = --eta-low (deck override; the
      recipe couples eta to W) and the refits at rho_eq, the hot state and the --states
      files (the peak / end populations of SPD runs): band rates at --eta-low vs 0.25 eV
+Variants with the suffix B (V1B, V2B, V2PB) take the refits' chi0 in four blocks on the
+     active bands --chi0-active (``collision_spm_chi0_active``); V2P is V2 with the imaginary
+     sites --v2p-imag.  SP0 and SPC then also record the B model's W at the recipe sites
+     against the run's model (rho_eq) and against the one-rule refit (the same state).
 SV3  the V3 comparator at the hot state (rank 0, host): the equilibrium poles held,
      one residue scale per pole fitted to the V1 refit's W^c at its fit sites; the
      misfit at the fit and held sites against V1's and the weight it cannot place
@@ -69,6 +73,9 @@ def main():
                     help="V2: line sites (eV) added below the production ladder")
     ap.add_argument("--v2-imag", default="0.1,0.25,0.5", help="V2: imaginary sites (eV) added")
     ap.add_argument("--v2-height", type=float, default=1.0, help="V2: line height (eV); 0 = the run's")
+    ap.add_argument("--v2p-imag", default="0.25,0.5", help="V2P: imaginary sites (eV) added")
+    ap.add_argument("--chi0-active", default="88,144",
+                    help="B variants: the active bands [a0, a1) of the four chi0 blocks")
     ap.add_argument("--hot-amount", type=float, default=0.05)
     ap.add_argument("--eta-list", default="", help="SPC: window-sweep Lorentzians, eV (default: the "
                     "source's; the shared-pole Sigma stage refuses any other: the recipe stamps eta)")
@@ -176,7 +183,13 @@ def main():
     v2_text = _v2_sites(rec0, [float(x) for x in a.v2_line.split(",") if x],
                         [float(x) for x in a.v2_imag.split(",") if x],
                         a.v2_height if a.v2_height > 0 else None)
-    sites = dict(V1="", V2=v2_text)
+    v2p_text = _v2_sites(rec0, [float(x) for x in a.v2_line.split(",") if x],
+                         [float(x) for x in a.v2p_imag.split(",") if x],
+                         a.v2_height if a.v2_height > 0 else None)
+    sites = dict(V1="", V2=v2_text, V2P=v2p_text)
+    sites.update({k + "B": v for k, v in list(sites.items())})
+    active = [int(x) for x in a.chi0_active.split(",")]
+    blocks_of = lambda V: active if V.endswith("B") else None
     out["variants"] = sites
 
     # ---- the TD system of the window (the 07 bundle, deck route) ----
@@ -189,6 +202,69 @@ def main():
         out["system"] = dict(nk=sysw.nk, nk_pad=sysw.nk_pad, nb=sysw.nb, bands=list(sysw.bands),
                              model=model.name)
     rho_eq_w = np.asarray(gather_to_host(sysw.ops.rho_eq))[:sysw.nk]
+
+    def model_path(V, label):
+        """The model file of variant V's refit ``label`` (its scratch slot)."""
+        hits = sorted(glob.glob(os.path.join(os.path.abspath(a.out), f"refits_{V}",
+                                             label + "_shared_pole", "**", "*.h5"), recursive=True))
+        hits = [h for h in hits if "model" in os.path.basename(h)] or hits
+        return hits[0] if hits else None
+
+    def w_sites_cmp(path_a, path_b):
+        """W^c of model b against model a at a's recipe sites: max over q of ||W_b - W_a||_F / ||W_a||_F.
+
+        Ordered store (header normalization, scripts/sv3_host.py): W^c(q, z) = sum_j C_j C_j^H /
+        (2 W_j (z - W_j)) - sum_j conj(C_j(-q)) C_j(-q)^T / (2 W_j(-q) (z + W_j(-q))).  Rank 0, on
+        its own device; per site role (fit / held) the max over q and the site of the max.
+        """
+        if not rank0 or path_a is None or path_b is None:
+            return None
+        import jax.numpy as jnp
+        from symmetry_maps import q_negation_index
+        t1 = time.perf_counter()
+        dev = jax.local_devices()[0]
+
+        def load(path):
+            with h5py.File(path, "r") as f:
+                raw = f["header_json"][()]
+                hdr = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw))
+                K = np.asarray(hdr["K"], np.int64)
+                return hdr, K, f["poles2_ry2"][()], f["factor"][()]
+        ha, Ka, la, Ca = load(path_a)
+        hb, Kb, lb, Cb = load(path_b)
+        rec = ha["recipe"]
+        codes = rec["role_codes"]
+        z = np.array([complex(d["real"], d["imag"]) for d in rec["z_ry"]])
+        role = np.asarray(rec["role"])
+        fit = np.isin(role, [codes["line"], codes["imaginary"]])
+        held = np.isin(role, [codes["held_line"], codes["held_imaginary"]])
+        keep = fit | held
+        neg = np.asarray(q_negation_index((6, 6, 1)))
+
+        def w_all(K, lam, C, q):
+            om = jnp.sqrt(jax.device_put(np.asarray(lam[q, :K[q]], np.float64), dev))
+            Cq = jax.device_put(np.asarray(C[q, :, :, :K[q]]).reshape(-1, int(K[q])), dev)
+            p = int(neg[q])
+            omm = jnp.sqrt(jax.device_put(np.asarray(lam[p, :K[p]], np.float64), dev))
+            Cm = jax.device_put(np.asarray(C[p, :, :, :K[p]]).reshape(-1, int(K[p])), dev)
+            out = []
+            for zz in z[keep]:
+                a_ = 1.0 / (2.0 * om * (zz - om))
+                b_ = 1.0 / (2.0 * omm * (zz + omm))
+                out.append((Cq * a_) @ Cq.conj().T - (Cm.conj() * b_) @ Cm.T)
+            return out
+        worst = dict(fit=0.0, held=0.0)
+        per_q = []
+        for q in range(int(la.shape[0])):
+            wa, wb = w_all(Ka, la, Ca, q), w_all(Kb, lb, Cb, q)
+            rel = [float(jnp.linalg.norm(y - x) / jnp.linalg.norm(x)) for x, y in zip(wa, wb)]
+            per_q.append(max(rel))
+            for r_, f_ in zip(rel, fit[keep]):
+                k_ = "fit" if f_ else "held"
+                worst[k_] = max(worst[k_], r_)
+        return dict(max_rel_fit=worst["fit"], max_rel_held=worst["held"], per_q_max=per_q,
+                    n_sites=int(keep.sum()), K=[[int(Ka.min()), int(Ka.max())], [int(Kb.min()), int(Kb.max())]],
+                    paths=[path_a, path_b], seconds=time.perf_counter() - t1)
 
     def band_rates(g_out, g_in):
         """Per band: k-mean, k-min, k-max of the diagonal rates (meV), TD rows."""
@@ -263,7 +339,8 @@ def main():
                     src, sysw.ops, mesh=mesh, k_frac=sysw.hdr["kpts"], b_lo=b_lo, ntr=1,
                     form="subtracted", hermitian="dynamic", sweep="active",
                     screening="shared_pole", spm_support_sites=sites[V],
-                    spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{V}"), say=say)
+                    spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{V}"),
+                    spm_chi0_active=blocks_of(V), say=say)
                 t0r = colls[V]["t0"]
                 sc = t0r.get("screen_eq") or {}
                 bo = colls[V]["bundle_of"]
@@ -273,6 +350,12 @@ def main():
                     refit_eq=refit_out(sc, per_q=True) if sc else None,
                     rates_eq=band_rates(colls[V]["eq"]["g_out"], colls[V]["eq"]["g_in"]),
                     memory=mem())
+                if V.endswith("B"):
+                    out["SP0"][V]["w_sites_vs_run"] = w_sites_cmp(
+                        src["model"]["path"], model_path(V, "eq"))
+                    if V[:-1] in colls:
+                        out["SP0"][V]["w_sites_vs_one_rule"] = w_sites_cmp(
+                            model_path(V[:-1], "eq"), model_path(V, "eq"))
                 _save()
             if "V1" in colls and "V2" in colls:
                 import jax.numpy as jnp
@@ -319,6 +402,10 @@ def main():
                               hot=state_measure(V, f_hot_b, "c_hot"))
                 spc[V]["hot"]["state"] = dict(from_band=b_lo + 1, to_band=b_lo + 2,
                                               amount=a.hot_amount)
+                if V.endswith("B") and V[:-1] in colls:
+                    for st in ("eq", "hot"):
+                        spc[V][st]["w_sites_vs_one_rule"] = w_sites_cmp(
+                            model_path(V[:-1], "c_" + st), model_path(V, "c_" + st))
                 _save()
 
     log_compiles = base.CompileLog()
@@ -334,6 +421,8 @@ def main():
             raw["lorrax"]["collision_source"] = spm_deck
             if sites[variant]:
                 raw["lorrax"]["collision_spm_support_sites_ev"] = sites[variant]
+            if blocks_of(variant) is not None:
+                raw["lorrax"]["collision_spm_chi0_active"] = blocks_of(variant)
         return raw
 
     def td_run(tag, raw, source):
@@ -497,7 +586,8 @@ def main():
                         src_e, sysw.ops, mesh=mesh, k_frac=sysw.hdr["kpts"], b_lo=b_lo, ntr=1,
                         form="subtracted", hermitian="dynamic", sweep="active",
                         screening="shared_pole", spm_support_sites=v2e,
-                        spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{key}_{V}"), say=say)
+                        spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{key}_{V}"),
+                        spm_chi0_active=blocks_of(V), say=say)
                     se = dict(t0_line=ce["t0"].get("line", ""), sites=v2e, states={})
                     for nm, f_b in states:
                         at, rec = D.spm_refit(ce["screening"], f_b, label="e_state")

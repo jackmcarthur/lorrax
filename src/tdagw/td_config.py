@@ -92,6 +92,7 @@ TD_DEFAULTS = {
     "lorrax.collision_screening_gamma_ev": 0.001,
     "lorrax.collision_rebase": "auto",
     "lorrax.collision_spm_support_sites_ev": "",
+    "lorrax.collision_spm_chi0_active": None,
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -228,6 +229,16 @@ def _check_collision(vals: dict) -> None:
             raise _gate("td_collision", f"collision_spm_support_sites_ev = {sites!r}",
                         "'<line eV list> | <imaginary eV list> [| <line height eV>]'",
                         str(exc)) from None
+    ca = vals["lorrax.collision_spm_chi0_active"]
+    if ca is not None:
+        ok = (isinstance(ca, (list, tuple)) and len(ca) == 2
+              and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in ca)
+              and ca[0] < ca[1])
+        if not ok:
+            raise _gate("td_collision", f"collision_spm_chi0_active = {ca!r}",
+                        "[a0, a1], two integers 0 <= a0 < a1 (0-based W-carrier bands)",
+                        "set [lorrax] collision_spm_chi0_active or leave it unset")
+        vals["lorrax.collision_spm_chi0_active"] = [int(n) for n in ca]
     for key in ("lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"):
         try:
             ok = float(vals[key]) >= 0.0
@@ -543,9 +554,10 @@ def inactive_keys(deck) -> dict:
           "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
           "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
           "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev",
-          "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev"),
+          "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev",
+          "lorrax.collision_spm_chi0_active"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
-        (("lorrax.collision_spm_support_sites_ev",),
+        (("lorrax.collision_spm_support_sites_ev", "lorrax.collision_spm_chi0_active"),
          v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "shared_pole",
          "collision_screening = 'shared_pole' only"),
         (("lorrax.collision_screening_gamma_ev",),
@@ -948,6 +960,14 @@ TD_KEY_DOCS = {
         "replacing the production ladder re-resolved at every state; the equilibrium "
         "model is then refitted on this set at t0 and is the run's reference (its "
         "difference from the source's model is in the t0 line).",
+        ("td_collision",)),
+    "lorrax.collision_spm_chi0_active": (
+        "= one rule on every pair", "With `collision_screening = shared_pole`: `[a0, a1]`, the "
+        "active bands A of the refits' chi0 (0-based on the W carrier's band axis, half-open, "
+        "containing the window). chi0 is then four (hole × electron) blocks FF, FA, AF, AA, F "
+        "the other bands at their 0/1 step: only AA crosses zero, each block's rule comes "
+        "from band energies and is built at the first refit and held for the run. A must "
+        "end at band gaps (FA, AF strictly positive) and F must stay 0/1, else refused.",
         ("td_collision",)),
     "lorrax.collision_frozen_bands": (
         "= every frozen band", "With `collision_screening = refreshed` or `shared_pole` and "

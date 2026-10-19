@@ -1919,8 +1919,156 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
         band_ranges = session["band_ranges"]
     if jax.process_index() == 0:
         print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
-    return dict(f=f, u=u, refs=refs, lo=lo, hi=hi, mu=mu, decay_rate=decay_rate,
-                amplitude=amplitude, band_ranges=band_ranges)
+    support = dict(f=f, u=u, refs=refs, lo=lo, hi=hi, mu=mu, decay_rate=decay_rate,
+                   amplitude=amplitude, band_ranges=band_ranges)
+    spec = getattr(meta, "shared_pole_response_blocks", None)
+    if spec is not None:
+        # The TD refit only (tdagw.dynsig.spm_screening): chi0 as four blocks on the
+        # same stream; the band bounds above enclose every block's weights.
+        support["blocks"] = response_blocks(energy, f, u, spec["active"])
+    return support
+
+
+#: The TD refit's chi0 pair blocks (hole space x electron space): F the frozen
+#: bands (occupations 0/1 throughout), A the active range.  Only AA crosses zero.
+RESPONSE_BLOCKS = ("FF", "FA", "AF", "AA")
+
+
+def response_blocks(energy, f, u, active):
+    """chi0 as four (hole x electron) blocks, each with its own transition interval.
+
+    ``active`` = (a0, a1): the active bands A (0-based, half-open, on the band
+    axis of ``energy``); F is every other live band and must hold 0/1
+    occupations.  Hole weights are f (G^<), electron weights u = 1 - f (G^>),
+    as on the one-block path; a block's weights are f and u masked to its
+    hole and electron bands, so sum_b f_b u_b^T = f u^T exactly.  Each block's
+    interval and references come from band energies only (F's occupied bands
+    as holes and empty bands as electrons, every A band on both sides), never
+    from the populations, so its rule is built once and held for the run
+    (:func:`response_quadrature`).  FF, FA and AF must be strictly positive;
+    AA, on [-span_A, +span_A], is the one crossing block (no occupation
+    envelope: decay rate 0).  A block without hole or electron bands is dropped.
+    """
+    a0, a1 = (int(x) for x in active)
+    band = np.arange(energy.shape[1])[None, :]
+    live = (f != 0) | (u != 0)
+    inside = (band >= a0) & (band < a1)
+    A, F = inside & live, ~inside & live
+    if not (0 <= a0 < a1 <= energy.shape[1]) or not np.any(A):
+        raise ValueError(f"GATE response_blocks_active: got active bands [{a0}, {a1}) of "
+                         f"{energy.shape[1]}; want a nonempty range of live chi0 bands")
+    bad = F & (((f != 0) & (f != 1)) | ((u != 0) & (u != 1)))
+    if np.any(bad):
+        k, b = (int(x[0]) for x in np.nonzero(bad))
+        raise ValueError("GATE response_blocks_frozen_fractional: got a fractional occupation "
+                         f"f = {f[k, b]:.6g} on frozen band {b} (k row {k}) outside the active "
+                         f"bands [{a0}, {a1}); want 0/1 on every frozen band; why: the frozen "
+                         "blocks' rules are positive-interval rules built once for the run")
+    holes, electrons = dict(F=F & (f == 1), A=A), dict(F=F & (u == 1), A=A)
+    out = []
+    for name in RESPONSE_BLOCKS:
+        h, e = holes[name[0]], electrons[name[1]]
+        if not np.any(h) or not np.any(e):
+            continue
+        refs = np.array([energy[h].max(), energy[e].min()])
+        lo, hi = float(refs[1] - refs[0]), float(energy[e].max() - energy[h].min())
+        if name != "AA" and not lo > 0:
+            raise ValueError(f"GATE response_blocks_interval: got the {name} block's interval "
+                             f"[{lo*RYD_TO_EV:.6g}, {hi*RYD_TO_EV:.6g}] eV with active bands "
+                             f"[{a0}, {a1}); want lo > 0 (a band gap between A and F on that "
+                             "side); fix: widen the active range to the next gap")
+        out.append(dict(name=name, f=np.where(h, f, 0.), u=np.where(e, u, 0.), refs=refs,
+                        lo=lo, hi=hi))
+    return out
+
+
+def _block_quadrature(meta, sample_plan, receipt, support, *, group_size, print_fn=print):
+    """Every block's rule (held for the run) and the evaluation groups that add the blocks.
+
+    A block's rule is built once on every sample (decay rate 0, its own
+    interval and gauge reference; minimax ``panels`` for a sample whose pencil
+    fails) and held in the block spec (``meta.shared_pole_response_blocks
+    ["held"]``) while its interval and the samples are unchanged.  An
+    evaluation group is at most ``group_size`` samples in the one-block order
+    (:func:`response_groups`); its passes are every block rule group with a
+    member in it, that rule's weights placed at the group's slots (zeros
+    elsewhere), so every pass runs the one stream program into the group's
+    one carry (:func:`integrate_response_group`).
+    """
+    import minimax
+    from .sigma_box_plan import snap_outward
+    from .response_pencil import response_pencil_source
+    spec = meta.shared_pole_response_blocks
+    held = spec.setdefault("held", {})
+    z = bank_points(sample_plan)
+    rel_tol = float(sample_plan["bank_rule_tolerance"])
+    pencil = response_pencil_source()
+    blocks, plans, reused = support["blocks"], [], []
+    for blk in blocks:
+        lo, hi = snap_outward(blk["lo"], 1., -1), snap_outward(blk["hi"], 1., +1)
+        old = held.get(blk["name"])
+        keep = (old is not None and old["lo"] == lo and old["hi"] == hi
+                and old["rel_tol"] == rel_tol and np.array_equal(old["z"], z))
+        if not keep:
+            def tree(members, lo=lo, hi=hi):
+                return minimax.ResponseGroupTree(lo, hi, z[members], rel_tol=rel_tol,
+                                                 decay_rate=0., pencil=pencil, panels=True)
+            requests = response_groups(z, len(z))
+            with timing.section("bank.rule_construction", announce=True):
+                rule_groups = [dict(rule, members=[members[m] for m in rule["members"]])
+                               for members, rules in zip(requests, _gather_group_rules(requests, tree))
+                               for rule in rules]
+            held[blk["name"]] = old = dict(name=blk["name"], lo=lo, hi=hi, z=z, rel_tol=rel_tol,
+                                           reference=lo, rule_groups=rule_groups)
+        plans.append(old)
+        reused.append(keep)
+    order = response_groups(z, len(z))[0]
+    groups = []
+    for a in range(0, len(order), group_size):
+        members = order[a:a+group_size]
+        slot = {m: i for i, m in enumerate(members)}
+        passes = []
+        for b, plan in enumerate(plans):
+            for rule in plan["rule_groups"]:
+                rows = [(slot[m], j) for j, m in enumerate(rule["members"]) if m in slot]
+                if rows:
+                    passes.append(dict(block=b, rule=rule, rows=rows))
+        error = np.zeros((len(members), 2, 2))
+        mass = np.zeros((len(members), 2, 2))
+        for p in passes:
+            for i, j in p["rows"]:
+                error[i] += p["rule"]["sampled_error"][j]
+                mass[i] = np.maximum(mass[i], p["rule"]["coefficient_mass"][j])
+        groups.append(dict(members=members, passes=passes,
+                           count=int(sum(p["rule"]["count"] for p in passes)),
+                           sampled_error=error, coefficient_mass=mass))
+    receipt["rule_provider"] = ("minimax shared-node group fits per chi0 block (FF, FA, AF positive; "
+                                "AA crossing, decay rate 0; closed-form panels where a pencil fails)")
+    receipt["rule"] = dict(
+        interval_ry=[min(p["lo"] for p in plans), max(p["hi"] for p in plans)],
+        group_size=group_size, decay_rate_ry_inv=0., occupation_amplitude=1., reused=all(reused),
+        blocks=[dict(name=p["name"], interval_ry=[p["lo"], p["hi"]], reused=r,
+                     nodes=int(sum(g["count"] for g in p["rule_groups"])),
+                     groups=[dict(members=[int(m) for m in g["members"]], count=int(g["count"]),
+                                  panel=g.get("panel"), sampled_error=g["sampled_error"].tolist())
+                             for g in p["rule_groups"]])
+                for p, r in zip(plans, reused)],
+        groups=[dict(members=[int(m) for m in g["members"]], count=g["count"], passes=len(g["passes"]),
+                     sampled_error=g["sampled_error"].tolist()) for g in groups])
+    receipt["nodes"] = int(sum(g["count"] for g in groups))
+    if jax.process_index() == 0:
+        for p, r in zip(plans, reused):
+            print_fn(f"Response block {p['name']}: interval (eV) [{p['lo']*RYD_TO_EV:.8g}, "
+                     f"{p['hi']*RYD_TO_EV:.8g}], {len(p['rule_groups'])} rule group(s), "
+                     f"{sum(g['count'] for g in p['rule_groups'])} nodes; "
+                     + ("held" if r else "constructed"), flush=True)
+        print_fn(f"Response quadrature: {len(z)} samples in {len(groups)} evaluation group(s) "
+                 f"(planned size {group_size}), {sum(len(g['passes']) for g in groups)} block passes, "
+                 f"{receipt['nodes']} total Green-pair evaluations", flush=True)
+    return dict(plan=None, groups=groups, slots=group_size, f=support["f"], u=support["u"],
+                refs=support["refs"], band_ranges=support["band_ranges"],
+                blocks=[dict(name=blk["name"], f=blk["f"], u=blk["u"], refs=blk["refs"],
+                             reference=plan["reference"]) for blk, plan in zip(blocks, plans)])
 
 
 def response_quadrature(meta, sample_plan, receipt, support, *, group_size, print_fn=print):
@@ -1930,8 +2078,12 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
     and reverse orientation (see ``minimax.response_group_rules``).  The rule
     is fitted on all samples at once, so its nodes and eqp do not depend on
     ``group_size``; the evaluation streams the rule's nodes for at most
-    ``group_size`` members per pass (``groups``).
+    ``group_size`` members per pass (``groups``).  A support with ``blocks``
+    (the TD refit) takes :func:`_block_quadrature`.
     """
+    if "blocks" in support:
+        return _block_quadrature(meta, sample_plan, receipt, support,
+                                 group_size=group_size, print_fn=print_fn)
     import minimax
     from .sigma_box_plan import snap_outward
     z = bank_points(sample_plan)
@@ -2051,6 +2203,64 @@ def _group_stream_arguments(rules, group):
     return times, weights
 
 
+def _block_pass_arguments(rules, group, p):
+    """Times and [forward/reverse, value/ds per slot, node] weights of one block pass.
+
+    The rule's member rows go to the evaluation group's slots, every other
+    slot is zero; the gauge is the block's (its references and its rule's
+    reference), as :func:`_group_stream_arguments` does for the one block.
+    """
+    blk, rule = rules["blocks"][p["block"]], p["rule"]
+    times = rule["t"]
+    shift = -(blk["refs"][1]-blk["refs"][0]-blk["reference"])
+    gauge = (np.exp(shift*times), np.exp(shift*np.conj(times)))
+    weights = np.zeros((2, 2*max(len(group["members"]), int(rules["slots"])), times.size), np.complex128)
+    for side in (0, 1):
+        for slot, j in p["rows"]:
+            weights[side, 2*slot] = -rule["value"][j, side]*gauge[side]
+            weights[side, 2*slot+1] = -rule["derivative"][j, side]*gauge[side]
+    return times, weights
+
+
+def _integrate_block_passes(wfns, meta, mesh_xy, rules, group, *, q_ids, execute, receipt,
+                            ordered, vertex, bank, outputs):
+    """:func:`integrate_response_group` for an evaluation group of chi0 blocks.
+
+    Every pass runs the one stream program (union band bounds, the block's
+    masked weights and references as operands) and adds into the group's one
+    donated carry, the previous pass's output.
+    """
+    n = meta.mu_basis.n_packed if vertex is None else vertex.n
+    tails = [(stream_weights(wfns, blk["f"], mesh_xy), stream_weights(wfns, blk["u"], mesh_xy),
+              jnp.asarray(blk["refs"])) for blk in rules["blocks"]]
+    args = [(p["block"], *_block_pass_arguments(rules, group, p)) for p in group["passes"]]
+    width = args[0][2].shape[1]
+    scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
+    receipt["correlation_count"] += int(group["count"])
+    if bank is not None:
+        passes = _passes_ahead(bank.shapes, (width, len(q_ids)), mesh_xy,
+            (jnp.asarray(args[0][1]), jnp.asarray(args[0][2])), tails[args[0][0]],
+            lambda p: response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
+                n_outputs=width, pair_mode="direct", bank_carry=True, ordered=ordered,
+                vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=p))
+        for p, (kernel, fixed, shape) in enumerate(passes):
+            raw = _group_zeros(mesh_xy, shape)
+            for b, times, weights in args:
+                raw = execute(kernel, (jnp.asarray(times), jnp.asarray(weights)) + tuple(fixed)
+                              + tails[b] + (raw, jnp.int32(p)), "direct", runtime_bytes=scratch)
+            bank.put(p, raw, outputs)
+            del raw
+        return None
+    kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
+        q_ids=q_ids, n_outputs=width, pair_mode="direct", bank_carry=True,
+        ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
+    raw = _group_zeros(mesh_xy, (width, len(q_ids), n, n))
+    for b, times, weights in args:
+        raw = execute(kernel, (jnp.asarray(times), jnp.asarray(weights)) + tuple(fixed) + tails[b]
+                      + (raw,), "direct", runtime_bytes=scratch)
+    return raw
+
+
 def _group_zeros(mesh_xy, shape):
     """The donated group carry [member, q, mu_X, nu_Y], made on device (no fill-value transfer)."""
     return _group_zeros_program(mesh_xy, tuple(int(n) for n in shape))()
@@ -2093,8 +2303,13 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
     With a streamed ``bank`` (``file_io.slab_io.StreamedBank``) the scan runs one row
     pass at a time into that pass's carry, and each finished pass goes to the
     bank (carry row ``r`` as bank output ``o`` for ``(r, o)`` in ``outputs``)
-    while the next pass computes; nothing is returned.
+    while the next pass computes; nothing is returned.  An evaluation group of
+    chi0 blocks (``passes``) takes :func:`_integrate_block_passes`.
     """
+    if "passes" in group:
+        return _integrate_block_passes(wfns, meta, mesh_xy, rules, group, q_ids=q_ids,
+            execute=execute, receipt=receipt, ordered=ordered, vertex=vertex, bank=bank,
+            outputs=outputs)
     times, weights = _group_stream_arguments(rules, group)
     n = meta.mu_basis.n_packed if vertex is None else vertex.n
     common = (jnp.asarray(times), jnp.asarray(weights))
