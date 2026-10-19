@@ -178,3 +178,25 @@ def test_route_c_takes_the_cut():
                            jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "x", "y")))
     (w, v), failed = _reshard_stack_program("eigh", mesh, (2, 256, 256), "complex128", 1, "all", 1e-8)(stack)
     assert not bool(np.asarray(failed[0]).any()) and np.isfinite(np.asarray(w)).all()
+
+
+def test_a_local_workspace_the_vendor_rejects_is_inadmissible(monkeypatch, capsys):
+    """run30k: cusolverDnZheevd_bufferSize answers status 3 at n 30000. The LOCAL candidate's
+    query fails closed (priced past any room, so admission takes the whole mesh); a failure of
+    the distributed (context) query still raises."""
+    from types import SimpleNamespace
+    from distrib_la import loader, workspace
+
+    class _Rejects:                                   # a bufferSize query that answers INVALID_VALUE
+        def __call__(self, *args):
+            return 3
+    monkeypatch.setattr(loader, "get_lib", lambda platform: SimpleNamespace(lrx_eigh_workspace_bytes=_Rejects()))
+    workspace._vendor_query.cache_clear()
+    try:
+        assert workspace._vendor_query(0, "eigh", (30000,), "<c16") == (workspace.UNPRICED_LOCAL_BYTES, 0)
+        assert workspace.UNPRICED_LOCAL_BYTES > 1e15
+        assert "the local eigh is unpriced" in capsys.readouterr().out
+        with pytest.raises(RuntimeError, match="status=3"):
+            workspace._vendor_query(7, "eigh", (30000,), "<c16")
+    finally:
+        workspace._vendor_query.cache_clear()

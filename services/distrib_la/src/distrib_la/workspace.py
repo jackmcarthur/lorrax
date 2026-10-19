@@ -19,6 +19,12 @@ def _shapes(shapes):
     return result
 
 
+#: The price of a LOCAL (whole matrix on one device) eigh the vendor's bufferSize query rejects:
+#: no room holds it, so every admission fails closed onto the whole mesh. cusolverDnZheevd_bufferSize
+#: (32-bit lwork) answers CUSOLVER_STATUS_INVALID_VALUE at n 30000 (run30k, 2026-10-19).
+UNPRICED_LOCAL_BYTES = 1 << 50
+
+
 @lru_cache(maxsize=128)
 def _vendor_query(ctx, op, sizes, dtype):
     from distrib_la.loader import get_lib
@@ -39,6 +45,14 @@ def _vendor_query(ctx, op, sizes, dtype):
     device, host = ctypes.c_uint64(), ctypes.c_uint64()
     rc = fn(ctx, *sizes, int(np.dtype(dtype).kind == 'c'),
             ctypes.byref(device), ctypes.byref(host))
+    if rc and ctx == 0:
+        # A local candidate the vendor cannot size is inadmissible, not an error (the
+        # distributed query below still raises); cached, so one notice per shape, on rank 0.
+        import jax
+        if jax.process_index() == 0:
+            print(f"  distrib_la: {name} status={rc} at sizes={sizes}: the local {op} is unpriced, "
+                  f"so it is inadmissible (whole mesh)", flush=True)
+        return UNPRICED_LOCAL_BYTES, 0
     if rc:
         raise RuntimeError(f'{name} failed with status={rc}, sizes={sizes}, local={ctx == 0}')
     return int(device.value), int(host.value)
