@@ -40,7 +40,9 @@ Variants with the suffix H (V1H, V2PH, ...) refit the q -> 0 head at every state
      diagnostics of ``tdagw.dynsig.spm_head_diagnostics``) and the rates on W(state) with that head.
 SPH  per variant, the refit at rho_eq, the hot state and the --states files' peak / end
      populations: the refit's gates (a refused refit is recorded by name, the section goes on),
-     the q = 0 census, and for H variants the head of the state (as in SPC)
+     the q = 0 census, and for H variants the head of the state (as in SPC; a refused head refit
+     is recorded by name too); --head-scan: the first H variant's head alone at hot states of
+     the listed amounts, with and without D, and its static slot S(0)
 SV3  the V3 comparator at the hot state (rank 0, host): the equilibrium poles held,
      one residue scale per pole fitted to the V1 refit's W^c at its fit sites; the
      misfit at the fit and held sites against V1's and the weight it cannot place
@@ -101,6 +103,8 @@ def main():
     ap.add_argument("--eta-low", default="0.1,0.05", help="SPE: the lower etas (eV), each a rerun source")
     ap.add_argument("--states", default="", help="SPE, SPH: glob of SPD states_*.npz files")
     ap.add_argument("--spf-variants", default="", help="SPF variants (default: --variants)")
+    ap.add_argument("--head-scan", default="", help="SPH: hot amounts (band b_lo+1 -> b_lo+2) at which "
+                    "the first H variant refits the head alone, with and without D")
     a = ap.parse_args()
     sections = set(a.sections.split(","))
 
@@ -386,20 +390,51 @@ def main():
             or [float(src["config"].sigma.regularization_ev)])
 
     def head_measure(hctx, scr, f_b):
-        """The head of window populations f_b (bundle rows): samples with and without D, diagnostics."""
+        """The head of window populations f_b (bundle rows): samples with and without D, diagnostics.
+
+        A refit refused by a gate (the same on every rank: the head inputs are replicated)
+        is recorded by name and returns head None (the caller then reads the run's head).
+        """
         f_full = scr["f_eq"].copy()
         f_full[scr["rows"], scr["win"]] = np.asarray(f_b, np.float64)
-        t1 = time.perf_counter()
-        head_t, hr = D.spm_head_refit(hctx, f_full)
-        t2 = time.perf_counter()
-        _, hb = D.spm_head_refit(hctx, f_full, drude=False)
-        diag = D.spm_head_diagnostics(hctx, f_full, hr, hb)
+        out, fits = {}, {}
+        head_t = None
+        for drude in (True, False):
+            key = "drude" if drude else "no_drude"
+            t1 = time.perf_counter()
+            try:
+                h_, r_ = D.spm_head_refit(hctx, f_full, drude=drude)
+                fits[key] = r_
+                if drude:
+                    head_t = h_
+            except Exception as exc:              # a refused refit: recorded, the measure goes on
+                out[f"error_{key}"] = f"{type(exc).__name__}: {exc}"[:1500]
+            out[f"refit_{key}_s"] = time.perf_counter() - t1
+        hr, hb = fits.get("drude"), fits.get("no_drude")
+        from gw.qsgw_head import population_head_response
+        resp, _ = population_head_response(                 # the static slot, also when both fits refuse
+            hctx["response"], hctx["velocity"], hctx["e"], hctx["f_eq"], f_full[:, :hctx["nb"]],
+            mesh=hctx["mesh"], nb_logical=hctx["nb"], cell_volume=hctx["cell_volume"],
+            nk_tot=hctx["nk"], nspin=hctx["nspin"], nspinor=hctx["nspinor"], eta_ry=hctx["eta_ry"])
+        s_all = np.asarray(jax.device_get(resp.S_direct))
+        s_eq = np.asarray(jax.device_get(hctx["response"].S_direct))
+        out["S_static"] = np.real(s_all[0]).tolist()
+        out["S_static_inplane"] = float(0.5 * np.real(s_all[0][0, 0] + s_all[0][1, 1]))
+        out["S_static_inplane_eq"] = float(0.5 * np.real(s_eq[0][0, 0] + s_eq[0][1, 1]))
+        out["S_max_rel_change"] = float(np.max(np.abs(s_all - s_eq)) / max(np.max(np.abs(s_eq)), 1e-300))
+        del resp
         eps_inv = lambda x: ((x["wc"] + x["vc0"]) / x["vc0"])
-        return head_t, dict(
-            refit_s=t2 - t1, z_ry=hr["z"], wc=hr["wc"], wc_no_drude=hb["wc"],
-            eps_inv=eps_inv(hr), eps_inv_no_drude=eps_inv(hb), vc0=hr["vc0"],
-            poles_ry=hr["poles"], residues=hr["residues"], poles_no_drude_ry=hb["poles"],
-            residues_no_drude=hb["residues"], drude=hr["drude"], diagnostics=diag)
+        for key, x in fits.items():
+            sfx = "" if key == "drude" else "_no_drude"
+            out.update({f"z_ry{sfx}": x["z"], f"wc{sfx}": x["wc"], f"eps_inv{sfx}": eps_inv(x),
+                        f"vc0{sfx}": x["vc0"], f"poles{sfx}_ry": x["poles"],
+                        f"residues{sfx}": x["residues"], f"wc_static{sfx}": x["wc_static"]})
+        ref = hr if hr is not None else hb
+        if ref is not None:
+            out["drude"] = ref["drude"]
+            out["diagnostics"] = D.spm_head_diagnostics(hctx, f_full, ref, hb)
+        out["refit_s"] = out["refit_drude_s"]
+        return head_t, out
 
     def state_measure(V, f_b, label, *, per_q=True, at_eq_too=True):
         """The refit at window populations f_b (bundle rows): record, rates on W(state), on W_eq, eta list."""
@@ -410,6 +445,7 @@ def main():
         head_t = None
         if head_of(V) and cv.get("head_ctx") is not None:
             head_t, r["head"] = head_measure(cv["head_ctx"], scr, f_b)
+            r["head"]["used_in_sweep"] = head_t is not None
         t1 = time.perf_counter()
         tabs = cv["sweep"](f_b, at=at, head=head_t)
         r["rates_W_state"] = band_rates(tabs["g_out"], tabs["g_in"])
@@ -600,6 +636,17 @@ def main():
                 for nm in ("peak", "end"):
                     if f"{nm}_f_b" in z_:
                         states.append((f"{tg}:{nm}", np.asarray(z_[f"{nm}_f_b"])))
+            hv = [V for V in variants if head_of(V) and V in colls]
+            if a.head_scan and hv:
+                cv = colls[hv[0]]
+                scan = sph.setdefault("head_scan", dict(variant=hv[0], rows=[]))
+                for amt in (float(x) for x in a.head_scan.split(",") if x):
+                    f_s = f_eq_b.copy()
+                    f_s[:, 1] -= amt
+                    f_s[:, 2] += amt
+                    _, hrow = head_measure(cv["head_ctx"], cv["screening"], f_s)
+                    scan["rows"].append(dict(amount=amt, head=hrow))
+                    _save()
             for V in variants:
                 if V not in colls:
                     continue
