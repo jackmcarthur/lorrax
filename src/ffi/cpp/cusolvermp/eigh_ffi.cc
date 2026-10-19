@@ -36,6 +36,7 @@
 #include "../common/ffi_helpers.h"
 #include "cusolvermp_interface.h"
 #include "ctx.h"
+#include "mp_plan_cache.h"
 #include "info.h"
 
 namespace lorrax_ffi::cusolvermp {
@@ -104,35 +105,33 @@ static ffi::Error EighImpl(
     if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[1], ctx->stream));
 
     const int64_t llda = (n + ctx->p - 1) / ctx->p;   // = n/p when exact
-    cusolverMpMatrixDescriptor_t descA = nullptr, descQ = nullptr;
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descA, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, n, mb, nb, 0, 0, llda),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descQ, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, n, mb, nb, 0, 0, llda),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(Q)");
-    if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[2], ctx->stream));
-
+    // The descriptors and the Syevd workspace sizes, once per shape (mp_plan_cache.h): no
+    // bufferSize query, and so no cuBLASMp grid or communicator, on the per-call path.
     const char jobz = compute_evecs ? 'V' : 'N';
-    size_t d_ws_bytes = 0, h_ws_bytes = 0;
-
-    cusolverStatus_t mp_st = mp::SyevdBufferSize<T>(
-        ctx->handle, jobz, CUBLAS_FILL_MODE_LOWER, n,
-        d_A, 1, 1, descA,
-        d_W,
-        d_Q, 1, 1, descQ,
-        &d_ws_bytes, &h_ws_bytes);
-    if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-        cusolverMpDestroyMatrixDesc(descA);
-        cusolverMpDestroyMatrixDesc(descQ);
+    const MpPlan* plan = nullptr;
+    const int plan_rc = mp_plan(MpPlanKey{kMpEigh, reinterpret_cast<int64_t>(ctx),
+            int64_t(mp::CudaDataTypeOf<T>::value), n, mb, nb, llda, int64_t(jobz), 0, 0, 0},
+        &plan, [&](MpPlan& p) -> int {
+            auto st = cusolverMpCreateMatrixDesc(&p.desc[0], ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                                 n, n, mb, nb, 0, 0, llda);
+            if (st == CUSOLVER_STATUS_SUCCESS)
+                st = cusolverMpCreateMatrixDesc(&p.desc[1], ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                                n, n, mb, nb, 0, 0, llda);
+            if (st == CUSOLVER_STATUS_SUCCESS)
+                st = mp::SyevdBufferSize<T>(ctx->handle, jobz, CUBLAS_FILL_MODE_LOWER, n,
+                                            d_A, 1, 1, p.desc[0], d_W, d_Q, 1, 1, p.desc[1],
+                                            &p.d_ws, &p.h_ws);
+            return int(st);
+        });
+    if (plan_rc) {
         std::ostringstream os;
-        os << "cusolverMpSyevd_bufferSize failed: status=" << (int)mp_st;
+        os << "cusolverMp eigh plan (descriptors, Syevd_bufferSize) failed: status=" << plan_rc;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
+    cusolverMpMatrixDescriptor_t descA = plan->desc[0], descQ = plan->desc[1];
+    if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[2], ctx->stream));
+    const size_t d_ws_bytes = plan->d_ws, h_ws_bytes = plan->h_ws;
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
     if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[3], ctx->stream));
 
     // Device workspace from XLA's scratch pool, i.e. inside XLA's reserved
@@ -145,8 +144,6 @@ static ffi::Error EighImpl(
     const size_t scratch_bytes = eigh_scratch_bytes(d_ws_bytes);
     auto ws_opt = scratch.Allocate(scratch_bytes);
     if (!ws_opt.has_value()) {
-        cusolverMpDestroyMatrixDesc(descA);
-        cusolverMpDestroyMatrixDesc(descQ);
         std::ostringstream os;
         os << "eigh: XLA scratch allocator failed to provide "
            << scratch_bytes << " bytes";
@@ -166,8 +163,6 @@ static ffi::Error EighImpl(
         if (ctx->h_workspace) std::free(ctx->h_workspace);
         ctx->h_workspace = std::malloc(h_ws_bytes);
         if (!ctx->h_workspace) {
-            cusolverMpDestroyMatrixDesc(descA);
-            cusolverMpDestroyMatrixDesc(descQ);
             return ffi::Error(ffi::ErrorCode::kInternal,
                               "malloc(host_workspace) failed");
         }
@@ -189,8 +184,6 @@ static ffi::Error EighImpl(
         ctx->d_info);
     if (prof) LORRAX_GPU_CHECK(cudaEventRecord(ev[4], ctx->stream));
 
-    cusolverMpDestroyMatrixDesc(descA);
-    cusolverMpDestroyMatrixDesc(descQ);
 
     if (mp_st != CUSOLVER_STATUS_SUCCESS) {
         std::ostringstream os;
@@ -395,33 +388,33 @@ extern "C" int lrx_eigh_workspace_bytes_block(
     auto* ctx = reinterpret_cast<LorraxCusolverMpCtx*>(ctx_handle);
     if (ctx->p != ctx->q || n % ctx->p || n % ctx->q || mb < 1 || (n / ctx->p) % mb)
         return -2;
-    cusolverMpMatrixDescriptor_t a = nullptr, q = nullptr;
+    // The plan EighImpl uses for this shape (mp_plan_cache.h): sized once, then cached. Mp
+    // sizing rejects null pointers, although it reads no matrix data: the context's device-info
+    // allocation is the address token.
+    const int64_t llda = n / ctx->p;
     const auto dtype = complex128 ? CUDA_C_64F : CUDA_R_64F;
-    auto status = cusolverMpCreateMatrixDesc(&a, ctx->grid, dtype,
-        n, n, mb, mb, 0, 0, n/ctx->p);
-    if (status != CUSOLVER_STATUS_SUCCESS) return int(status);
-    status = cusolverMpCreateMatrixDesc(&q, ctx->grid, dtype,
-        n, n, mb, mb, 0, 0, n/ctx->p);
-    // Mp sizing rejects null pointers, although it reads no matrix data.
-    // Reuse the context's existing device-info allocation as an address
-    // token; no operand-sized allocation or data access is required.
-    size_t dw = 0, hw = 0;
-    if (status == CUSOLVER_STATUS_SUCCESS) {
-        if (complex128) status = mp::SyevdBufferSize<std::complex<double>>(
-            ctx->handle, 'V', CUBLAS_FILL_MODE_LOWER, n,
-            reinterpret_cast<const std::complex<double>*>(ctx->d_info), 1, 1, a,
-            reinterpret_cast<double*>(ctx->d_info),
-            reinterpret_cast<std::complex<double>*>(ctx->d_info), 1, 1, q, &dw, &hw);
-        else status = mp::SyevdBufferSize<double>(ctx->handle, 'V',
-            CUBLAS_FILL_MODE_LOWER, n, reinterpret_cast<const double*>(ctx->d_info), 1, 1, a,
-            reinterpret_cast<double*>(ctx->d_info), reinterpret_cast<double*>(ctx->d_info),
-            1, 1, q, &dw, &hw);
-    }
-    if (q) cusolverMpDestroyMatrixDesc(q);
-    cusolverMpDestroyMatrixDesc(a);
-    if (status == CUSOLVER_STATUS_SUCCESS) {
-        *device_bytes = eigh_scratch_bytes(dw);
-        *host_bytes = hw;
-    }
-    return int(status);
+    const MpPlan* plan = nullptr;
+    const int rc = mp_plan(MpPlanKey{kMpEigh, reinterpret_cast<int64_t>(ctx), int64_t(dtype), n, mb,
+                                     mb, llda, int64_t('V'), 0, 0, 0},
+        &plan, [&](MpPlan& p) -> int {
+            auto st = cusolverMpCreateMatrixDesc(&p.desc[0], ctx->grid, dtype, n, n, mb, mb, 0, 0, llda);
+            if (st == CUSOLVER_STATUS_SUCCESS)
+                st = cusolverMpCreateMatrixDesc(&p.desc[1], ctx->grid, dtype, n, n, mb, mb, 0, 0, llda);
+            if (st != CUSOLVER_STATUS_SUCCESS) return int(st);
+            if (complex128)
+                return int(mp::SyevdBufferSize<std::complex<double>>(ctx->handle, 'V',
+                    CUBLAS_FILL_MODE_LOWER, n,
+                    reinterpret_cast<const std::complex<double>*>(ctx->d_info), 1, 1, p.desc[0],
+                    reinterpret_cast<double*>(ctx->d_info),
+                    reinterpret_cast<std::complex<double>*>(ctx->d_info), 1, 1, p.desc[1],
+                    &p.d_ws, &p.h_ws));
+            return int(mp::SyevdBufferSize<double>(ctx->handle, 'V', CUBLAS_FILL_MODE_LOWER, n,
+                reinterpret_cast<const double*>(ctx->d_info), 1, 1, p.desc[0],
+                reinterpret_cast<double*>(ctx->d_info), reinterpret_cast<double*>(ctx->d_info),
+                1, 1, p.desc[1], &p.d_ws, &p.h_ws));
+        });
+    if (rc) return rc;
+    *device_bytes = eigh_scratch_bytes(plan->d_ws);
+    *host_bytes = plan->h_ws;
+    return 0;
 }

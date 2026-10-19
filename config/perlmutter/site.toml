@@ -27,6 +27,12 @@ FI_CXI_DISABLE_HOST_REGISTER = "1"
 FI_CXI_RDZV_THRESHOLD = "0"
 NCCL_CROSS_NIC = "2"
 NCCL_SOCKET_IFNAME = "hsn"
+# libfabric 2.3.1's registration-cache monitor. Its default is memhooks ("memhooks is the default
+# if available", fi_info -e), which intercepts mmap: one rank of run30k deadlocked in
+# ofi_intercept_mmap (util_mem_hooks.c) inside an NCCL communicator split that cuSOLVERMp's
+# bufferSize starts (2026-10-19, gdb on 16 ranks). kdreg2 is HPE's kernel-module monitor (NERSC,
+# 2024-02-22; /dev/kdreg2 present); userfaultfd needs vm.unprivileged_userfaultfd, which is 0.
+FI_MR_CACHE_MONITOR = "kdreg2"
 
 # The collective cost model gw.comm_model prices receipts with, fitted by
 # tools/comm_model_bench.py: T = alpha0 + alpha_peer * n_peers + V / beta.

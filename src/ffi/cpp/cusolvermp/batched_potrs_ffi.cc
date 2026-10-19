@@ -32,6 +32,7 @@
 #include "../common/ffi_helpers.h"
 #include "cusolvermp_interface.h"
 #include "ctx.h"
+#include "mp_plan_cache.h"
 #include "info.h"
 
 namespace lorrax_ffi::cusolvermp_batched_potrs {
@@ -40,6 +41,10 @@ namespace ffi = ::xla::ffi;
 using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
 using lorrax_ffi::cusolvermp::ensure_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
+using lorrax_ffi::cusolvermp::MpPlan;
+using lorrax_ffi::cusolvermp::MpPlanKey;
+using lorrax_ffi::cusolvermp::mp_plan;
+using lorrax_ffi::cusolvermp::kMpPotrs;
 
 struct NvtxRange {
     explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
@@ -89,41 +94,31 @@ static ffi::Error BatchedPotrsImpl(
             cudaMemcpyDeviceToDevice, ctx->stream));
     }
 
-    cusolverMpMatrixDescriptor_t descA = nullptr, descB = nullptr;
-    {
-        NvtxRange range("potrs.CreateMatrixDesc[A]");
-        LORRAX_LIB_CHECK(
-            cusolverMpCreateMatrixDesc(&descA, ctx->grid,
-                                       mp::CudaDataTypeOf<T>::value,
-                                       n, n, mb_a, nb_a, 0, 0, lld_A),
-            CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
-    }
-    {
-        NvtxRange range("potrs.CreateMatrixDesc[B]");
-        LORRAX_LIB_CHECK(
-            cusolverMpCreateMatrixDesc(&descB, ctx->grid,
-                                       mp::CudaDataTypeOf<T>::value,
-                                       n, mrhs, mb_b, nb_b, 0, 0, lld_B),
-            CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B)");
-    }
-
-    size_t d_ws = 0, h_ws = 0;
-    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
-    {
-        NvtxRange range("potrs.BufferSize");
-        mp_st = mp::PotrsBufferSize<T>(
-            ctx->handle, CUBLAS_FILL_MODE_LOWER, n, mrhs,
-            d_L,     1, 1, descA,
-            d_X_out, 1, 1, descB,
-            &d_ws, &h_ws);
-    }
-    if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-        cusolverMpDestroyMatrixDesc(descA);
-        cusolverMpDestroyMatrixDesc(descB);
+    // The descriptors and the Potrs workspace sizes, once per shape (mp_plan_cache.h).
+    const MpPlan* plan = nullptr;
+    const int plan_rc = mp_plan(MpPlanKey{kMpPotrs, reinterpret_cast<int64_t>(ctx),
+            int64_t(mp::CudaDataTypeOf<T>::value), n, mrhs, mb_a, nb_a, mb_b, nb_b, lld_A, lld_B},
+        &plan, [&](MpPlan& p) -> int {
+            NvtxRange range("potrs.plan");
+            auto st = cusolverMpCreateMatrixDesc(&p.desc[0], ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                                 n, n, mb_a, nb_a, 0, 0, lld_A);
+            if (st == CUSOLVER_STATUS_SUCCESS)
+                st = cusolverMpCreateMatrixDesc(&p.desc[1], ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                                n, mrhs, mb_b, nb_b, 0, 0, lld_B);
+            if (st == CUSOLVER_STATUS_SUCCESS)
+                st = mp::PotrsBufferSize<T>(ctx->handle, CUBLAS_FILL_MODE_LOWER, n, mrhs,
+                                            d_L, 1, 1, p.desc[0], d_X_out, 1, 1, p.desc[1],
+                                            &p.d_ws, &p.h_ws);
+            return int(st);
+        });
+    if (plan_rc) {
         std::ostringstream os;
-        os << "cusolverMpPotrs_bufferSize failed: status=" << (int)mp_st;
+        os << "cusolverMp potrs plan (descriptors, Potrs_bufferSize) failed: status=" << plan_rc;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
+    cusolverMpMatrixDescriptor_t descA = plan->desc[0], descB = plan->desc[1];
+    size_t d_ws = plan->d_ws, h_ws = plan->h_ws;
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
     // Device workspace from XLA's scratch allocator (inside the pool, released
     // when the call's stream work is done -- the exit cross-stream wait orders
     // it), as eigh_ffi.cc does.  The context's grow-only cudaMalloc workspace
@@ -134,16 +129,12 @@ static ffi::Error BatchedPotrsImpl(
         NvtxRange range("potrs.ensure_workspace");
         ensure_workspace(ctx, 0, h_ws);
     } catch (const std::exception& ex) {
-        cusolverMpDestroyMatrixDesc(descA);
-        cusolverMpDestroyMatrixDesc(descB);
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
     }
     void* d_work = nullptr;
     if (d_ws > 0) {
         auto ws_opt = scratch.Allocate(d_ws);
         if (!ws_opt.has_value()) {
-            cusolverMpDestroyMatrixDesc(descA);
-            cusolverMpDestroyMatrixDesc(descB);
             std::ostringstream os;
             os << "cuSOLVERMp potrs: XLA scratch allocator failed to provide " << d_ws
                << " bytes of workspace (n=" << n << ")";
@@ -160,8 +151,6 @@ static ffi::Error BatchedPotrsImpl(
         T* A_slice_ptr = const_cast<T*>(d_L) + q * A_slice;
         T* X_slice_ptr = d_X_out + q * B_slice;
         if (auto err = reset_info(ctx); !err.success()) {
-            cusolverMpDestroyMatrixDesc(descA);
-            cusolverMpDestroyMatrixDesc(descB);
             return err;
         }
         mp_st = mp::Potrs<T>(
@@ -172,27 +161,21 @@ static ffi::Error BatchedPotrsImpl(
             ctx->h_workspace, ctx->h_workspace_bytes,
             ctx->d_info);
         if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-            cusolverMpDestroyMatrixDesc(descA);
-            cusolverMpDestroyMatrixDesc(descB);
             std::ostringstream os;
             os << "cusolverMpPotrs (q=" << q << ") failed: status=" << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
         }
         if (auto err = read_info(ctx, "cusolverMpPotrs", "the solve failed", n, mb_a, q);
                 !err.success()) {
-            cusolverMpDestroyMatrixDesc(descA);
-            cusolverMpDestroyMatrixDesc(descB);
             return err;
         }
     }
 
     {
         NvtxRange range("potrs.DestroyMatrixDesc[A]");
-        cusolverMpDestroyMatrixDesc(descA);
     }
     {
         NvtxRange range("potrs.DestroyMatrixDesc[B]");
-        cusolverMpDestroyMatrixDesc(descB);
     }
 
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(

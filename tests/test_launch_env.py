@@ -117,6 +117,7 @@ PERLMUTTER_DEFAULTS = {
     "NCCL_NET_PLUGIN": "/global/common/software/nersc9/nccl/2.29.2-cu13/plugin/lib/libnccl-net.so",
     "NCCL_NET_GDR_LEVEL": "PHB", "FI_CXI_DISABLE_HOST_REGISTER": "1",
     "FI_CXI_RDZV_THRESHOLD": "0", "NCCL_CROSS_NIC": "2", "NCCL_SOCKET_IFNAME": "hsn",
+    "FI_MR_CACHE_MONITOR": "kdreg2",
 }
 TWO_NODES = dict(SLURM_STEP_NODELIST="nid[001000-001001]", SLURM_NETWORK="no_vni",
                  LD_LIBRARY_PATH="/shim")      # gpu_env.sh's libcudart.so link
@@ -239,7 +240,7 @@ def test_perlmutter_explicit_transport_fills_only_the_fabric_settings():
     assert result["policy"] == "explicit transport"
     assert result["launch_libraries"] == ["libcudart.so"]
     assert set(result["applied"]) == {"NCCL_NET_GDR_LEVEL", "FI_CXI_DISABLE_HOST_REGISTER",
-                                      "NCCL_CROSS_NIC", "NCCL_SOCKET_IFNAME"}
+                                      "NCCL_CROSS_NIC", "NCCL_SOCKET_IFNAME", "FI_MR_CACHE_MONITOR"}
     assert result["mpi_before_collectives"] is False
 
 

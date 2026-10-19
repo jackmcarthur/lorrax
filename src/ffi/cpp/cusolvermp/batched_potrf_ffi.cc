@@ -34,6 +34,7 @@
 #include "../common/ffi_helpers.h"
 #include "cusolvermp_interface.h"
 #include "ctx.h"
+#include "mp_plan_cache.h"
 #include "info.h"
 
 namespace lorrax_ffi::cusolvermp_batched_potrf {
@@ -42,6 +43,10 @@ namespace ffi = ::xla::ffi;
 using lorrax_ffi::cusolvermp::LorraxCusolverMpCtx;
 using lorrax_ffi::cusolvermp::ensure_workspace;
 namespace mp = lorrax_ffi::cusolvermp::mp;
+using lorrax_ffi::cusolvermp::MpPlan;
+using lorrax_ffi::cusolvermp::MpPlanKey;
+using lorrax_ffi::cusolvermp::mp_plan;
+using lorrax_ffi::cusolvermp::kMpPotrf;
 
 struct NvtxRange {
     explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
@@ -89,30 +94,27 @@ static ffi::Error BatchedPotrfImpl(
             cudaMemcpyDeviceToDevice, ctx->stream));
     }
 
-    cusolverMpMatrixDescriptor_t descA = nullptr;
-    {
-        NvtxRange range("potrf.CreateMatrixDesc");
-        LORRAX_LIB_CHECK(
-            cusolverMpCreateMatrixDesc(&descA, ctx->grid,
-                                       mp::CudaDataTypeOf<T>::value,
-                                       n, n, mb, nb, 0, 0, lld_A),
-            CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
-    }
-
-    size_t d_ws = 0, h_ws = 0;
-    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
-    {
-        NvtxRange range("potrf.BufferSize");
-        mp_st = mp::PotrfBufferSize<T>(
-            ctx->handle, CUBLAS_FILL_MODE_LOWER, n,
-            d_L_out, 1, 1, descA, &d_ws, &h_ws);
-    }
-    if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-        cusolverMpDestroyMatrixDesc(descA);
+    // The descriptor and the Potrf workspace sizes, once per shape (mp_plan_cache.h).
+    const MpPlan* plan = nullptr;
+    const int plan_rc = mp_plan(MpPlanKey{kMpPotrf, reinterpret_cast<int64_t>(ctx),
+            int64_t(mp::CudaDataTypeOf<T>::value), n, mb, nb, lld_A, 0, 0, 0, 0},
+        &plan, [&](MpPlan& p) -> int {
+            NvtxRange range("potrf.plan");
+            auto st = cusolverMpCreateMatrixDesc(&p.desc[0], ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                                 n, n, mb, nb, 0, 0, lld_A);
+            if (st == CUSOLVER_STATUS_SUCCESS)
+                st = mp::PotrfBufferSize<T>(ctx->handle, CUBLAS_FILL_MODE_LOWER, n,
+                                            d_L_out, 1, 1, p.desc[0], &p.d_ws, &p.h_ws);
+            return int(st);
+        });
+    if (plan_rc) {
         std::ostringstream os;
-        os << "cusolverMpPotrf_bufferSize failed: status=" << (int)mp_st;
+        os << "cusolverMp potrf plan (descriptor, Potrf_bufferSize) failed: status=" << plan_rc;
         return ffi::Error(ffi::ErrorCode::kInternal, os.str());
     }
+    cusolverMpMatrixDescriptor_t descA = plan->desc[0];
+    size_t d_ws = plan->d_ws, h_ws = plan->h_ws;
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
     // Device workspace from XLA's scratch allocator (inside the pool, released
     // when the call's stream work is done -- the exit cross-stream wait orders
     // it), as eigh_ffi.cc does.  The context's grow-only cudaMalloc workspace
@@ -123,14 +125,12 @@ static ffi::Error BatchedPotrfImpl(
         NvtxRange range("potrf.ensure_workspace");
         ensure_workspace(ctx, 0, h_ws);
     } catch (const std::exception& ex) {
-        cusolverMpDestroyMatrixDesc(descA);
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
     }
     void* d_work = nullptr;
     if (d_ws > 0) {
         auto ws_opt = scratch.Allocate(d_ws);
         if (!ws_opt.has_value()) {
-            cusolverMpDestroyMatrixDesc(descA);
             std::ostringstream os;
             os << "cuSOLVERMp potrf: XLA scratch allocator failed to provide " << d_ws
                << " bytes of workspace (n=" << n << ")";
@@ -146,7 +146,6 @@ static ffi::Error BatchedPotrfImpl(
         NvtxRange range(tag);
         T* slice_ptr = d_L_out + q * slice_elems;
         if (auto err = reset_info(ctx); !err.success()) {
-            cusolverMpDestroyMatrixDesc(descA);
             return err;
         }
         mp_st = mp::Potrf<T>(
@@ -156,21 +155,18 @@ static ffi::Error BatchedPotrfImpl(
             ctx->h_workspace, ctx->h_workspace_bytes,
             ctx->d_info);
         if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-            cusolverMpDestroyMatrixDesc(descA);
             std::ostringstream os;
             os << "cusolverMpPotrf (q=" << q << ") failed: status=" << (int)mp_st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
         }
         if (auto err = read_info(ctx, "cusolverMpPotrf",
                 "the leading minor is not positive definite", n, mb, q); !err.success()) {
-            cusolverMpDestroyMatrixDesc(descA);
             return err;
         }
     }
 
     {
         NvtxRange range("potrf.DestroyMatrixDesc");
-        cusolverMpDestroyMatrixDesc(descA);
     }
 
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(

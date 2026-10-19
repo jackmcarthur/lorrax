@@ -58,6 +58,7 @@
 #include <string>
 
 #include <algorithm>
+#include <map>
 #include <mutex>
 #include <set>
 #include <tuple>
@@ -121,7 +122,8 @@ template <typename T>
 static ffi::Error getrs_chunking(LorraxCusolverMpCtx* ctx, int64_t n, int64_t nrhs,
                                  int64_t mb_b, int64_t nb_b, int64_t lld,
                                  cusolverMpMatrixDescriptor_t descA, T* d_A, int64_t* d_ipiv,
-                                 T* d_X, int64_t* k_out, size_t* d_ws, size_t* h_ws) {
+                                 T* d_X, int64_t* k_out, size_t* d_ws, size_t* h_ws,
+                                 cusolverMpMatrixDescriptor_t* keep = nullptr) {
     const int Py = ctx->q;
     const int64_t blk_local = ((nrhs + Py - 1) / Py) / nb_b;     // column blocks per rank
     if (blk_local < 1 || ((nrhs + Py - 1) / Py) % nb_b)
@@ -138,18 +140,75 @@ static ffi::Error getrs_chunking(LorraxCusolverMpCtx* ctx, int64_t n, int64_t nr
         cusolverStatus_t st = mp::GetrsBufferSize<T>(
             ctx->handle, CUBLAS_OP_N, n, k * nb_b * Py, d_A, 1, 1, descA, d_ipiv,
             d_X, 1, 1, dB, &d, &h);
-        cusolverMpDestroyMatrixDesc(dB);
         if (st != CUSOLVER_STATUS_SUCCESS) {
+            cusolverMpDestroyMatrixDesc(dB);
             std::ostringstream os;
             os << "cusolverMpGetrs_bufferSize failed: status=" << (int) st;
             return ffi::Error(ffi::ErrorCode::kInternal, os.str());
         }
         *d_ws = d; *h_ws = h; *k_out = k;
-        if (d <= kGetrsWorkspaceCap || k == 1) return ffi::Error::Success();
+        if (d <= kGetrsWorkspaceCap || k == 1) {
+            if (keep) *keep = dB; else cusolverMpDestroyMatrixDesc(dB);
+            return ffi::Error::Success();
+        }
+        cusolverMpDestroyMatrixDesc(dB);
         int64_t nk = k / 2;
         while (nk > 1 && blk_local % nk) --nk;
         k = std::max<int64_t>(1, nk);
     }
+}
+
+// One process-lifetime plan per (context, dtype, n, nrhs, blocks): the descriptors a solve runs
+// at and the vendor's workspace sizes. cuSOLVERMp 0.9.1's getrs_bufferSize builds a cuBLASMp
+// grid for the descriptors it is given (cublasMpGridCreate -> ncclCommSplit -> ncclCommInitRank),
+// so a query per call made a communicator per call; one rank deadlocked in libfabric's memory
+// hooks inside that split and stalled run30k's first Dyson dispatch (2026-10-19, gdb on all 16
+// ranks). The plan is built once under a lock, on the first call of every rank alike (the
+// calls are collective), and never freed: its descriptors live as long as the context.
+struct LuPlan {
+    cusolverMpMatrixDescriptor_t descA = nullptr;
+    cusolverMpMatrixDescriptor_t descB = nullptr;       // the getrs chunk, chunk_cols * Py wide
+    size_t d_ws_f = 0, h_ws_f = 0, d_ws_s = 0, h_ws_s = 0;
+    int64_t kc = 1;
+    bool getrf = false, getrs = false;
+};
+
+template <typename T>
+static ffi::Error lu_plan(LorraxCusolverMpCtx* ctx, int64_t n, int64_t nrhs, int64_t mb_a,
+                          int64_t nb_a, int64_t mb_b, int64_t nb_b, bool getrf, bool getrs,
+                          T* d_A, int64_t* d_ipiv, T* d_X, const LuPlan** out) {
+    using Key = std::tuple<const void*, int, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
+    static std::mutex mu;
+    static std::map<Key, LuPlan> plans;                 // node-based: references stay valid
+    std::lock_guard<std::mutex> lock(mu);
+    LuPlan& p = plans[Key{ctx, int(mp::CudaDataTypeOf<T>::value), n, getrs ? nrhs : 0, mb_a, nb_a,
+                          getrs ? mb_b : 0, getrs ? nb_b : 0}];
+    const int64_t lld_A = (n + ctx->p - 1) / ctx->p;
+    if (!p.descA) {
+        cusolverMpMatrixDescriptor_t d = nullptr;
+        if (cusolverMpCreateMatrixDesc(&d, ctx->grid, mp::CudaDataTypeOf<T>::value,
+                                       n, n, mb_a, nb_a, 0, 0, lld_A) != CUSOLVER_STATUS_SUCCESS)
+            return ffi::Error(ffi::ErrorCode::kInternal, "cusolverMpCreateMatrixDesc(A)");
+        p.descA = d;
+    }
+    if (getrf && !p.getrf) {
+        cusolverStatus_t st = mp::GetrfBufferSize<T>(ctx->handle, n, n, d_A, 1, 1, p.descA, d_ipiv,
+                                                     &p.d_ws_f, &p.h_ws_f);
+        if (st != CUSOLVER_STATUS_SUCCESS) {
+            std::ostringstream os;
+            os << "cusolverMpGetrf_bufferSize failed: status=" << (int)st;
+            return ffi::Error(ffi::ErrorCode::kInternal, os.str());
+        }
+        p.getrf = true;
+    }
+    if (getrs && !p.getrs) {
+        if (auto e = getrs_chunking<T>(ctx, n, nrhs, mb_b, nb_b, lld_A, p.descA, d_A, d_ipiv, d_X,
+                                       &p.kc, &p.d_ws_s, &p.h_ws_s, &p.descB); !e.success())
+            return e;
+        p.getrs = true;
+    }
+    *out = &p;
+    return ffi::Error::Success();
 }
 
 // Under LORRAX_DEBUG_PRINT, once per process and shape: the descriptors and the getrs chunking a
@@ -219,55 +278,26 @@ static ffi::Error BatchedSolveLuImpl(
         reinterpret_cast<void**>(&d_ipiv), ipiv_bytes));
     LORRAX_GPU_CHECK(cudaMemsetAsync(d_ipiv, 0, ipiv_bytes, ctx->stream));
 
-    cusolverMpMatrixDescriptor_t descA = nullptr, descB = nullptr;
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descA, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, n, mb_a, nb_a, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descB, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, nrhs, mb_b, nb_b, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B)");
-
-    auto cleanup = [&]() {
-        cusolverMpDestroyMatrixDesc(descA);
-        cusolverMpDestroyMatrixDesc(descB);
+    // The descriptors and the vendor's workspace sizes, once per shape (lu_plan): no bufferSize
+    // query, and so no cuBLASMp grid or communicator, on the per-call path.
+    const LuPlan* plan = nullptr;
+    if (auto e = lu_plan<T>(ctx, n, nrhs, mb_a, nb_a, mb_b, nb_b, true, true, d_A_factored_out,
+                            d_ipiv, d_X_out, &plan); !e.success()) {
         cudaFree(d_ipiv);
-    };
-
-    // The NVIDIA mp_getrf_getrs sample allocates SEPARATE workspaces
-    // for Getrf and Getrs — sharing one workspace buffer gave
-    // non-deterministic wrong answers on 2D grids.  Allocate both per-
-    // call via cudaMallocAsync so the CUDA pool can recycle them.
-    size_t d_ws_f = 0, h_ws_f = 0, d_ws_s = 0, h_ws_s = 0;
-    cusolverStatus_t mp_st = mp::GetrfBufferSize<T>(
-        ctx->handle, n, n,
-        d_A_factored_out, 1, 1, descA,
-        d_ipiv, &d_ws_f, &h_ws_f);
-    if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-        cleanup();
-        std::ostringstream os;
-        os << "cusolverMpGetrf_bufferSize failed: status=" << (int)mp_st;
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-    }
-    int64_t kc = 1;
-    if (auto e = getrs_chunking<T>(ctx, n, nrhs, mb_b, nb_b, lld_A, descA, d_A_factored_out,
-                                   d_ipiv, d_X_out, &kc, &d_ws_s, &h_ws_s); !e.success()) {
-        cleanup();
         return e;
     }
-    // descB is replaced by one chunk-width descriptor (every chunk is the same width).
-    cusolverMpDestroyMatrixDesc(descB);
-    descB = nullptr;
+    cusolverMpMatrixDescriptor_t descA = plan->descA, descB = plan->descB;
+    auto cleanup = [&]() { cudaFree(d_ipiv); };
+    // The NVIDIA mp_getrf_getrs sample allocates SEPARATE workspaces for Getrf and Getrs --
+    // sharing one workspace buffer gave non-deterministic wrong answers on 2D grids. Both are
+    // allocated per call via cudaMallocAsync so the CUDA pool can recycle them.
+    const size_t d_ws_f = plan->d_ws_f, h_ws_f = plan->h_ws_f;
+    const size_t d_ws_s = plan->d_ws_s, h_ws_s = plan->h_ws_s;
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
+    const int64_t kc = plan->kc;
     const int64_t chunk_cols = kc * nb_b;                         // local columns per chunk
     const int64_t n_chunks = (B_local_cols / nb_b) / kc;
     debug_lu_layout("solve_lu", n, nrhs, mb_a, nb_a, mb_b, nb_b, n_chunks, chunk_cols, double(d_ws_f), double(d_ws_s));
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descB, ctx->grid, mp::CudaDataTypeOf<T>::value,
-                                   n, chunk_cols * Py, mb_b, nb_b, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B chunk)");
     void* d_ws_f_buf = nullptr;
     void* d_ws_s_buf = nullptr;
     void* h_ws_f_buf = nullptr;
@@ -402,34 +432,25 @@ static ffi::Error BatchedGetrfImpl(
     LORRAX_GPU_CHECK(cudaMemsetAsync(
         d_ipiv_out, 0, nq * ipiv_len * sizeof(int64_t), ctx->stream));
 
-    cusolverMpMatrixDescriptor_t descA = nullptr;
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descA, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, n, mb, nb, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
     const bool no_pivot = lu_no_pivot();
     int64_t* piv0 = no_pivot ? nullptr : d_ipiv_out;
-    size_t d_ws = 0, h_ws = 0;
-    cusolverStatus_t mp_st = mp::GetrfBufferSize<T>(
-        ctx->handle, n, n, d_LU_out, 1, 1, descA, piv0, &d_ws, &h_ws);
-    if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-        cusolverMpDestroyMatrixDesc(descA);
-        std::ostringstream os;
-        os << "cusolverMpGetrf_bufferSize failed: status=" << (int)mp_st;
-        return ffi::Error(ffi::ErrorCode::kInternal, os.str());
-    }
+    // The descriptor and the vendor's workspace size, once per shape (lu_plan).
+    const LuPlan* plan = nullptr;
+    if (auto e = lu_plan<T>(ctx, n, 0, mb, nb, 0, 0, true, false, d_LU_out, piv0, nullptr, &plan);
+            !e.success())
+        return e;
+    cusolverMpMatrixDescriptor_t descA = plan->descA;
+    const size_t d_ws = plan->d_ws_f, h_ws = plan->h_ws_f;
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
     try {
         ensure_workspace(ctx, d_ws, h_ws);
     } catch (const std::exception& ex) {
-        cusolverMpDestroyMatrixDesc(descA);
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
     }
     for (int64_t q = 0; q < nq; ++q) {
         T* LU_q = d_LU_out + q * A_slice;
         int64_t* piv_q = no_pivot ? nullptr : d_ipiv_out + q * ipiv_len;
         if (auto err = reset_info(ctx); !err.success()) {
-            cusolverMpDestroyMatrixDesc(descA);
             return err;
         }
         mp_st = mp::Getrf<T>(
@@ -437,7 +458,6 @@ static ffi::Error BatchedGetrfImpl(
             ctx->d_workspace, ctx->d_workspace_bytes,
             ctx->h_workspace, ctx->h_workspace_bytes, ctx->d_info);
         if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-            cusolverMpDestroyMatrixDesc(descA);
             std::ostringstream os;
             os << "cusolverMpGetrf (q=" << q << ") failed: status="
                << (int)mp_st;
@@ -445,11 +465,9 @@ static ffi::Error BatchedGetrfImpl(
         }
         if (auto err = read_info(ctx, "cusolverMpGetrf", "U has an exactly zero diagonal entry",
                                  n, mb, q); !err.success()) {
-            cusolverMpDestroyMatrixDesc(descA);
             return err;
         }
     }
-    cusolverMpDestroyMatrixDesc(descA);
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         xla_stream, ctx->stream, ctx->ev_ctx_out));
     return ffi::Error::Success();
@@ -483,38 +501,20 @@ static ffi::Error BatchedGetrsImpl(
             d_X_out, d_B_in, nq * B_slice * sizeof(T),
             cudaMemcpyDeviceToDevice, ctx->stream));
     }
-    cusolverMpMatrixDescriptor_t descA = nullptr, descB = nullptr;
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descA, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, n, mb_a, nb_a, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(A)");
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descB, ctx->grid,
-                                   mp::CudaDataTypeOf<T>::value,
-                                   n, nrhs, mb_b, nb_b, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B)");
     const bool no_pivot = lu_no_pivot();
     int64_t* piv0 = no_pivot ? nullptr : const_cast<int64_t*>(d_ipiv);
-    size_t d_ws = 0, h_ws = 0;
-    int64_t kc = 1;
-    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
-    if (auto e = getrs_chunking<T>(ctx, n, nrhs, mb_b, nb_b, lld_A, descA,
-                                   const_cast<T*>(d_LU), piv0, d_X_out, &kc, &d_ws, &h_ws);
-            !e.success()) {
-        cusolverMpDestroyMatrixDesc(descA);
-        cusolverMpDestroyMatrixDesc(descB);
+    // The descriptors and the vendor's workspace size, once per shape (lu_plan).
+    const LuPlan* plan = nullptr;
+    if (auto e = lu_plan<T>(ctx, n, nrhs, mb_a, nb_a, mb_b, nb_b, false, true, const_cast<T*>(d_LU),
+                            piv0, d_X_out, &plan); !e.success())
         return e;
-    }
+    cusolverMpMatrixDescriptor_t descA = plan->descA, descB = plan->descB;
+    const size_t d_ws = plan->d_ws_s, h_ws = plan->h_ws_s;
+    const int64_t kc = plan->kc;
+    cusolverStatus_t mp_st = CUSOLVER_STATUS_SUCCESS;
     const int64_t chunk_cols = kc * nb_b;
     const int64_t n_chunks = (B_local_cols / nb_b) / kc;
     debug_lu_layout("getrs", n, nrhs, mb_a, nb_a, mb_b, nb_b, n_chunks, chunk_cols, -1.0, double(d_ws));
-    cusolverMpDestroyMatrixDesc(descB);
-    descB = nullptr;
-    LORRAX_LIB_CHECK(
-        cusolverMpCreateMatrixDesc(&descB, ctx->grid, mp::CudaDataTypeOf<T>::value,
-                                   n, chunk_cols * Py, mb_b, nb_b, 0, 0, lld_A),
-        CUSOLVER_STATUS_SUCCESS, "cusolverMpCreateMatrixDesc(B chunk)");
     // This workspace may be the same persistent allocation getrf used.
     // Reuse is safe across the SPLIT handlers because getrf records
     // ev_ctx_out and makes the XLA stream wait before returning its LU/ipiv;
@@ -525,8 +525,6 @@ static ffi::Error BatchedGetrsImpl(
     try {
         ensure_workspace(ctx, d_ws, h_ws);
     } catch (const std::exception& ex) {
-        cusolverMpDestroyMatrixDesc(descA);
-        cusolverMpDestroyMatrixDesc(descB);
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, ex.what());
     }
     for (int64_t q = 0; q < nq; ++q) {
@@ -536,8 +534,6 @@ static ffi::Error BatchedGetrsImpl(
                                   : const_cast<int64_t*>(d_ipiv)
                                         + q * ipiv_len;
         if (auto err = reset_info(ctx); !err.success()) {
-            cusolverMpDestroyMatrixDesc(descA);
-            cusolverMpDestroyMatrixDesc(descB);
             return err;
         }
         for (int64_t c = 0; c < n_chunks && mp_st == CUSOLVER_STATUS_SUCCESS; ++c)
@@ -547,8 +543,6 @@ static ffi::Error BatchedGetrsImpl(
                 ctx->d_workspace, ctx->d_workspace_bytes,
                 ctx->h_workspace, ctx->h_workspace_bytes, ctx->d_info);
         if (mp_st != CUSOLVER_STATUS_SUCCESS) {
-            cusolverMpDestroyMatrixDesc(descA);
-            cusolverMpDestroyMatrixDesc(descB);
             std::ostringstream os;
             os << "cusolverMpGetrs (q=" << q << ") failed: status="
                << (int)mp_st;
@@ -556,13 +550,9 @@ static ffi::Error BatchedGetrsImpl(
         }
         if (auto err = read_info(ctx, "cusolverMpGetrs", "the solve failed", n, mb_a, q);
                 !err.success()) {
-            cusolverMpDestroyMatrixDesc(descA);
-            cusolverMpDestroyMatrixDesc(descB);
             return err;
         }
     }
-    cusolverMpDestroyMatrixDesc(descA);
-    cusolverMpDestroyMatrixDesc(descB);
     FFI_RETURN_IF_ERROR(cross_stream_wait_pooled(
         xla_stream, ctx->stream, ctx->ev_ctx_out));
     return ffi::Error::Success();
@@ -740,26 +730,17 @@ template <typename T>
 static int lu_workspace(LorraxCusolverMpCtx* ctx, int64_t n, int64_t nrhs, int64_t mb_a,
                         int64_t nb_a, int64_t mb_b, int64_t nb_b, uint64_t* device_bytes,
                         uint64_t* host_bytes) {
-    const int64_t lld_A = (n + ctx->p - 1) / ctx->p;
-    cusolverMpMatrixDescriptor_t descA = nullptr;
-    cusolverStatus_t st = cusolverMpCreateMatrixDesc(&descA, ctx->grid, mp::CudaDataTypeOf<T>::value,
-                                                     n, n, mb_a, nb_a, 0, 0, lld_A);
-    if (st != CUSOLVER_STATUS_SUCCESS) return int(st);
+    // Through the same plan a solve uses (lu_plan): sized once per shape, then cached. Mp sizing
+    // reads no matrix data but rejects null pointers: the context's info allocation is the token.
     T* token = reinterpret_cast<T*>(ctx->d_info);
-    int64_t* ipiv = reinterpret_cast<int64_t*>(ctx->d_info);
-    size_t df = 0, hf = 0, ds = 0, hs = 0;
-    int64_t k = 1;
-    st = mp::GetrfBufferSize<T>(ctx->handle, n, n, token, 1, 1, descA, ipiv, &df, &hf);
-    int rc = int(st);
-    if (st == CUSOLVER_STATUS_SUCCESS)
-        rc = getrs_chunking<T>(ctx, n, nrhs, mb_b, nb_b, lld_A, descA, token, ipiv, token,
-                               &k, &ds, &hs).success() ? 0 : -3;
-    cusolverMpDestroyMatrixDesc(descA);
-    if (rc == 0) {
-        *device_bytes = uint64_t(df + ds) + uint64_t(lld_A + mb_a) * sizeof(int64_t);
-        *host_bytes = uint64_t(hf + hs);
-    }
-    return rc;
+    const LuPlan* plan = nullptr;
+    if (!lu_plan<T>(ctx, n, nrhs, mb_a, nb_a, mb_b, nb_b, true, true, token,
+                    reinterpret_cast<int64_t*>(ctx->d_info), token, &plan).success())
+        return -3;
+    const int64_t lld_A = (n + ctx->p - 1) / ctx->p;
+    *device_bytes = uint64_t(plan->d_ws_f + plan->d_ws_s) + uint64_t(lld_A + mb_a) * sizeof(int64_t);
+    *host_bytes = uint64_t(plan->h_ws_f + plan->h_ws_s);
+    return 0;
 }
 
 }  // namespace lorrax_ffi::cusolvermp_batched_solve_lu
