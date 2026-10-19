@@ -1735,10 +1735,10 @@ def _plan_route_g_for_channel(
 			_n_a, math.ceil(2.4 * _r) + 1))),
 		n_vertex=int(n_vertex), n_parent=n_parent,
 		orbit_width=widest_unfold_orbit(k_unfold_plan))
-	from common.gpu_utils import record_stage_price
-	record_stage_price("zeta fit, plan_zeta_route_g HWM", mubatch_plan.hwm_bytes,
-	                   section=("gw_jax.zeta_fit_chunked" if int(n_vertex) == 1
-	                            else "gw_jax.zeta_fit_transverse"))
+	from lxkit import memory
+	memory.book(memory.priced(mubatch_plan.hwm_bytes, "zeta fit, plan_zeta_route_g HWM"),
+	            stage=("gw_jax.zeta_fit_chunked" if int(n_vertex) == 1
+	                   else "gw_jax.zeta_fit_transverse"))
 	if jax.process_index() == 0:
 		print_fn(mubatch_plan.format())
 	return {

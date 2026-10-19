@@ -75,6 +75,8 @@ def resolve_device_budget_gb(deck_gb: float = 0.0, linalg: str = "local") -> flo
     budget = min(deck, rule) if deck > 0 else rule
     _RUN_LINALG = str(linalg)
     _ROUTES.clear()     # a new run (the hsuite runs its drivers in one process)
+    from lxkit import memory
+    memory.reset()
     set_device_budget_gb(budget)
     return budget
 
@@ -219,32 +221,6 @@ def admit_local(site: str, local_bytes: float, room_bytes: float, *,
     raise RuntimeError(f"GATE route_capacity: {site}: {reason} over room {gb(other_room)}: no "
                        f"route fits" + ("; linalg = distributed reserves the provider contexts' "
                                         "room at startup" if contexts else ""))
-
-
-# ============================================================================
-# Planner prices: what each planner said its stage would hold, per rank
-# ============================================================================
-
-_STAGE_PRICES: list[dict] = []
-
-
-def record_stage_price(stage: str, price_bytes: float, *, section: str | None = None) -> None:
-    """Record a planner's per-rank price for the stage it plans.
-
-    ``price_bytes`` is the live set the planner compared against its budget;
-    ``section`` names the timing section whose device peak the price is judged
-    against (default: the innermost open section at the call).  The run's
-    stage-memory table prints peak / price as γ, or "no planner".
-    """
-    from common import timing
-    path = timing.current_path()
-    _STAGE_PRICES.append({"stage": str(stage), "bytes": float(price_bytes),
-                          "path": path, "section": section or (path[-1] if path else None)})
-
-
-def stage_prices() -> list[dict]:
-    """Every price recorded this run, in call order."""
-    return [dict(row) for row in _STAGE_PRICES]
 
 
 _HOST_HOLDS: dict[str, float] = {}

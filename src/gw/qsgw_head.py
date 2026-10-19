@@ -106,11 +106,11 @@ def head_wing_mu_block(*, mu_local, nk, ns, nb_full, n_ends):
     the fixed tile (``runtime.tiles``) wins, at least ``_HEAD_WING_MU_MIN`` (or
     the whole tile when it is narrower) and at most the rank's whole mu tile.
     """
-    from common.gpu_utils import record_stage_price
+    from lxkit import memory
     from runtime.tiles import tile_units
     per_mu = 16.0 * int(nk) * int(ns) * int(nb_full) * int(n_ends)
     block = tile_units(per_mu, int(mu_local), floor=_HEAD_WING_MU_MIN)
-    record_stage_price(f"head wings, mu block {block}/{int(mu_local)}", block * per_mu)
+    memory.book(memory.priced(block * per_mu, f"head wings, mu block {block}/{int(mu_local)}"))
     return block
 # Width three is the incumbent Rydberg velocity.  Width eight has the same
 # energy-denominator contract: for a literal long-wave transition derivative

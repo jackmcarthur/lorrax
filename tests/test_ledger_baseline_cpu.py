@@ -16,8 +16,9 @@ BUDGET, BASELINE = 63_414_637_611, 3_130_000_000
 
 def test_the_baseline_is_taken_from_every_admission_and_room(monkeypatch):
     prices = []
-    from common import gpu_utils
-    monkeypatch.setattr(gpu_utils, "record_stage_price", lambda stage, b: prices.append((stage, b)))
+    from lxkit import memory
+    monkeypatch.setattr(memory, "book", lambda price, stage=None: prices.append(
+        (price.label, price.bytes())))
     bare = CapacityLedger(META, mesh_xy=MESH, device_budget_bytes=BUDGET)
     held = CapacityLedger(META, mesh_xy=MESH, device_budget_bytes=BUDGET, baseline_bytes=BASELINE)
     a = bare.preview(resident_bytes_per_rank=10**9, workspace_bytes_per_rank=0)

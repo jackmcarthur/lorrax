@@ -321,11 +321,12 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     loads = lambda space=None: (g_load, w_loads[space == 'val'])
     psi_bytes = 16 * n_parent * ns * (nb + nb_sig) * (local_rows + nu)
     price = dict(d=ns, ns=ns, passes=len(windows), new=float(R * row_bytes + psi_bytes))
-    from common.gpu_utils import record_stage_price
+    from lxkit import memory
     # A static node is priced in its caller's section (exchange, static COHSEX, W∞ − V).
     label = "Sigma static" if static else "Sigma tau"
-    record_stage_price(f"{label} {keys[0]}, {len(windows)} row pass(es)", price["new"],
-                       section=None if static else "sigma.tau_sweep")
+    memory.book(memory.priced(price["new"],
+                              f"{label} {keys[0]}, {len(windows)} row pass(es)"),
+                stage=None if static else "sigma.tau_sweep")
     if jax.process_index() == 0:
         print(f"{label} stream {''.join('CT'[f] for f in (int(lefts != (0,)), int(rights != (0,))))}: "
               f"{len(windows)} row pass(es) of {R} local rows ({local_rows} per rank)", flush=True)
