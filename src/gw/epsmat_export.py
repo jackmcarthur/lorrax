@@ -805,8 +805,8 @@ def q0_wing_inputs(cfg, src, q0, W_face, *, mesh):
     omega = float(src.geometry.cell_volume)
     v0 = float(bare_v_bgw_units(src, q0, np.zeros((1, 3), int))[0]) / omega
     chi00 = omega * complex(q0c @ h["S_direct"] @ q0c)
-    rep = NamedSharding(mesh, P())
-    wl_d, wr_d = jax.device_put(wl, rep), jax.device_put(wr, rep)
+    # Host vectors (3·μ-class) enter the replicated jit argument as epsinv_block's v does.
+    wl_d, wr_d = jnp.asarray(wl, jnp.complex128), jnp.asarray(wr, jnp.complex128)
     Ww, _ = _face_matvec(mesh)(W_face, wr_d, wl_d)
     fold = complex(np.dot(wl, np.asarray(Ww)))
     stored = (omega * complex(q0c @ (h["S_cart"] - h["S_direct"]) @ q0c)
