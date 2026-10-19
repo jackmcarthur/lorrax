@@ -40,20 +40,48 @@ the GW run's sums is **frozen**: its energy and occupation are the
 equilibrium ones. In the window
 
 $$
-H^G_{A,k}(t)=\mathrm{diag}\big(\varepsilon^G_{A,k}\big)+\lambda\,\Delta\Sigma^{(0)}_k[\delta\rho]
+H^G_{A,k}(t)=\mathrm{diag}\big(\varepsilon^G_{A,k}\big)+\lambda\,\big(K\,\delta\rho^{\rm pop}\big)_k
 =U_k\,\mathrm{diag}(e_k)\,U_k^\dagger,\qquad
-\tilde\psi_{ik}=\textstyle\sum_m\psi_{mk}U_{k,mi},\qquad
-f_{ik}=\mathrm{Re}\,\big(U_k^\dagger\rho_kU_k\big)_{ii}. \tag{2}
+\delta\rho^{\rm pop}_k=U_k\,\mathrm{diag}(f_k)\,U_k^\dagger-\rho^{\rm eq}_k,\qquad
+f_{ik}=\mathrm{Re}\,\big(U_k^\dagger\rho_kU_k\big)_{ii}, \tag{2}
 $$
 
+and the instantaneous orbitals are $\tilde\psi_{ik}=\sum_m\psi_{mk}U_{k,mi}$.
 $\varepsilon^G$ are the energies the GW run's $G$ used (DFT for
 `one_shot_dft`), so that $\Sigma[\rho^{\rm eq}]$ is the run's own $\Sigma$
-(§6.1). $\lambda=0$ (`dress = "none"`) keeps $U=1$, $e=\varepsilon^G$;
-$\lambda=1$ (`dress = "instantaneous"`) diagonalizes the field-free
-$H^G+\Delta\Sigma^{(0)}$ with $\Delta\Sigma^{(0)}=K\,\delta\rho$ the frozen-W
-update, a pure function of $\rho$ (a self-consistent dressing would iterate
-Eq. 1 inside one call). The field term stays out of $H^G$: the basis follows
-the carriers, not the optical cycle.
+(§6.1). $\lambda=0$ (`dress = "none"`) keeps $U=1$, $e=\varepsilon^G$.
+$\lambda=1$ (`dress = "instantaneous"`) dresses the basis with the frozen-W
+update $K$ of the **populations alone**, so Eq. (2) is a fixed point in
+$(U,e,f)$, solved in every call.
+
+* **Why the populations alone.** Neither the field $e\mathbf E\cdot\mathbf r$
+  nor the coherences $(U^\dagger\rho U)_{i\neq j}$ enter $H^G$. The coherent
+  part of $K\delta\rho$ is the induced field (depolarization through $K^H$,
+  the electron–hole attraction through $K^W$); it oscillates at $O(E)$ with
+  the drive, like $e\mathbf E\cdot\mathbf r$, while $\delta\rho^{\rm pop}$ is
+  $O(E^2)$ and moves on the envelope. The basis follows the carriers, not the
+  optical cycle, and linear response is the BSE (§2). Dressing with the whole
+  $\delta\rho$ (`dress = "coherent"`, one diagonalization of
+  $\mathrm{diag}\,\varepsilon^G+K\delta\rho$) moves $e$ and $U$ at $O(E)$; it
+  exists only as the red twin that measures that defect.
+* **The fixed point** (`tdagw.dynsig._population_basis`): from $U=1$,
+  $f=\mathrm{diag}\,\rho$, `DRESS_STEPS` = 32 evaluations of the map
+  $\delta\rho^{\rm pop}\mapsto U\,\mathrm{diag}(f)\,U^\dagger-\rho^{\rm eq}$,
+  Anderson-mixed over `DRESS_HISTORY` = 16 steps. Rotating $U$ rotates the
+  equilibrium occupations, so the map carries the window's static response to
+  its own carriers, and the plain iteration contracts only at that response's
+  rate: Jacobian eigenvalue $-0.88$ on the synthetic driven state of §8; on
+  CrI3 516 2v2c it stalls (relative residual 2.4–$2.6\times10^{-2}$ from
+  step 12 to 40). With the DFT $\varepsilon^G$ of that run the response is
+  near-singular: at the fixed point of a weak drive $\max|\delta\rho^{\rm pop}|$
+  is 15× the populations; Anderson reaches $4\times10^{-11}$ relative in 32
+  steps there, and at populations $\sim5\times10^{-4}$ no history converges
+  in 40 steps. Dressing with the carriers alone, $U\mathrm{diag}(f-f^{\rm eq})U^\dagger$
+  (not implemented), has no rotation feedback: on the same states the plain
+  iteration converges in 3–5 steps, also at $5\times10^{-4}$. A residual
+  $\max|U\mathrm{diag}(f)U^\dagger-\rho^{\rm eq}-\delta\rho^{\rm pop}|$ above
+  `DRESS_TOL` = $10^{-8}$ makes ΔΣ NaN (`GATE dynsig_dress_not_converged`,
+  named by `check_state`).
 
 **The approximation for the coherences.** $\rho$ is not diagonal in the
 instantaneous basis. The scheme uses it in two ways:
@@ -545,10 +573,16 @@ through the propagator equals `isdf_model` bitwise on a pulse on both.
 With a frozen *dynamical* $W$, the linearization of $\Sigma^c[G_\rho,W_0]$ in
 $\delta\rho$ is $K$ plus a dynamical correction that vanishes as the pole
 energies $\to\infty$ (static $W$). With $W$ updated, $\delta W\propto\delta f$
-and the populations are $O(E^2)$ (`dress = "none"`: $U=1$, $f=\mathrm{diag}\rho$),
-so linear response is exactly TD-aGW, the full BSE of the kernel page.
-`dress = "instantaneous"` shifts $e$ at $O(E)$ through $K\delta\rho^{\rm coh}$
-and changes the screening at $O(E)$: its linear response is not the BSE.
+and the populations are $O(E^2)$, so linear response is exactly TD-aGW, the
+full BSE of the kernel page, with either `dress`: `"none"` keeps $U=1$,
+$f=\mathrm{diag}\rho$, and `"instantaneous"` dresses with
+$K\delta\rho^{\rm pop}=O(E^2)$ (§1.1), so $U-1$, $e-\varepsilon^G$ and $\delta W$
+are $O(E^2)$. Measured (§8) for $\rho=V\rho^{\rm eq}V^\dagger$,
+$V=e^{-i\epsilon A}$ with $A$ valence–conduction: the dynamic correction scales
+as $\epsilon^{2.00}$ dressed, and is zero on the pure coherence $\epsilon X$,
+$X=-i[A,\rho^{\rm eq}]$; the coherent twin, which shifts $e$ at $O(E)$ through
+$K\delta\rho^{\rm coh}$, scales as $\epsilon^{1.02}$. On CrI3 516 ($A$ the
+$x$-dipole valence–conduction block) the exponents are 2.002 and 1.002.
 
 TDMODEL's outlook ([td_agw.md](td_agw.md), outlook) keeps $K\delta\rho^{\rm coh}$
 and adds $\Sigma^{\rm dyn}[f]-\Sigma^{\rm dyn}[f^{\rm eq}]$ for the populations.
@@ -571,8 +605,8 @@ is the term their split drops.
 * $\rho=\rho^{\rm eq}$ is a fixed point, $\Delta\Sigma=0$ exactly;
 * covariance under a rotation of the window basis: the populations are those
   of the instantaneous basis, not of the band gauge (the red twin that reads
-  them in the fixed basis misses the reference by 10%);
-* linear response = TD-aGW = BSE (§2).
+  them in the fixed basis misses the reference by 3%);
+* linear response = TD-aGW = BSE (§2), dressed or not.
 
 ### 3.2 Lost
 
@@ -832,8 +866,13 @@ sharing no code with `tdagw.dynsig`; CPU, 2×2 mesh of host devices):
 $\chi_0^{ff}+\chi_0^{fa}+\chi_0^{aa}$ = dense $1.4\times10^{-12}$ (twin without
 $\chi_0^{fa}$ 0.47); equilibrium COHSEX $5.9\times10^{-16}$; $\delta\chi_0$ of an
 excited state $4.7\times10^{-13}$ (twins: no Pauli blocking $4.8\times10^{-3}$,
-no same-side pairs 0.81); total ΔΣ $1.5\times10^{-13}$, dressed
-$9.4\times10^{-14}$ (twin, fixed-basis populations, 0.10); literal static limit
+no same-side pairs 0.81); total ΔΣ $1.5\times10^{-13}$; dressed (Eq. 2 after
+32 steps against a NumPy plain iteration to $10^{-15}$) $1.1\times10^{-13}$ on
+the driven state and $7.5\times10^{-14}$ on a hot-carrier state (twins:
+fixed-basis populations 0.032, the coherent dressing 0.18); the dressing's
+residual $2.1\times10^{-15}$ (driven) and $8.9\times10^{-16}$ (hot); the
+dynamic correction of a weak unitary drive $\propto\epsilon^{2.00}$ dressed,
+$\epsilon^{1.02}$ coherent, $\epsilon^{2.00}$ undressed; literal static limit
 $1.4\times10^{-14}$ (twin without coherences 1.75); frozen mode on a pulse
 = `isdf_model` exactly; `static_rpa` departure $\propto E_0^{2.2}$. The same
 script on 4 A100 (one rank per GPU, the runtime's communicator stack)
@@ -846,7 +885,13 @@ own head); §6.1 as stated there; a 6 fs pulse (rk4, 20 as, 1200 ΔΣ calls)
 with `screening="frozen"` gives P(t) and ρ(t_f) equal to `isdf_model`'s to the
 last bit; the literal Eq. (1) in a rotated instantaneous basis at ρ(t_f) equals
 $-K^W\delta\rho$ to $1.1\times10^{-11}$ (twin without coherences 12.2); the
-static member as in §4 and §7.
+static member as in §4 and §7. Dressed (§1.1, cross-gap member): the dynamic
+correction of a weak $x$-drive scales as $\epsilon^{2.002}$ (coherent twin
+$\epsilon^{1.002}$, undressed $\epsilon^{2.000}$) and is 5.6× the undressed one;
+on 5 fs pulses of $5\times10^{7}$ and $10^{8}$ V/m (rk4, 50 as) P(t) dressed
+minus undressed scales as $E^{3.01}$ (relative $7.6\times10^{-6}$,
+$3.0\times10^{-5}$), every dressed call converged (residual
+$\le4.4\times10^{-13}$) at 1.2× the undressed wall.
 
 `tests/tdagw/test_spm_refresh_cpu.py` (CPU, NumPy references): the pole
 census against a direct NumPy sum over a synthetic store, the occupation

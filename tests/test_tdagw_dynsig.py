@@ -25,8 +25,10 @@ G2  Sigma^SX, Sigma^COH at rho_eq from W0 == dense COHSEX                 rel <=
 G3  dchi0 of an excited state (holes, carriers, unequal same-side
     populations, coherences) == dense chi0(t) - chi0(0)                  rel <= 1e-7
 G4  dSigma (static_rpa, dress none) == dense Sigma[rho] - Sigma[rho_eq]   rel <= 1e-7
-G4b the same with dress = instantaneous (populations in the eigenbasis of
-    diag(eps^G) + K drho)                                                 rel <= 1e-7
+G4b the same with dress = instantaneous: the population-dressed basis, the
+    fixed point of diag(eps^G) + K drho_pop (drho_pop = U diag(f) U^H - rho_eq),
+    iterated to convergence in NumPy                                     rel <= 1e-7
+G4c the same on a hot-carrier state (populations only, up to 0.39)       rel <= 1e-7
 G5  rho = rho_eq gives dSigma == 0 exactly;  G6 dSigma_k Hermitian        <= 1e-12
 G7  literal Eq. (1) in a rotated instantaneous basis, frozen W:
     Sigma^SX[rho] - Sigma^SX[rho_eq] == -K^W drho (TD model)              rel <= 1e-12
@@ -37,7 +39,18 @@ G9  static_rpa (cross-gap member, same_side = False) through the propagator:
 D9  (diagnostic, not a gate) the same with the exact same-side pairs: the
     static carrier screening (f_a - f_b)/(E_a - E_b) of near-degenerate
     pairs at different k makes the departure grow faster than E0^2
+G10 linear response: drho = V rho_eq V^H - rho_eq, V = exp(-i eps A) (A
+    valence-conduction), eps = 2.5, 5, 10 x 1e-4: the dynamic correction with
+    dress = instantaneous scales as eps^2 (fit slope in [1.9, 2.1]), and on the
+    pure coherence drho = eps X, X = -i[A, rho_eq], it is round-off (<= 1e-9 of
+    the coherent twin's)
+G11 the dressing's fixed-point residual after DRESS_STEPS steps on the driven
+    state of G3 and on the hot-carrier state of G4c                      <= 1e-9
+D10 (diagnostic, not a gate) the slope of G10 with dress = none
 R1  populations read in the fixed basis (occupation = fixed_basis) fails G4b
+R6  the coherent dressing (dress = coherent: diag(eps^G) + K drho, the whole drho)
+    fails G4b
+R7  the coherent dressing scales as eps (slope ~1) and fails G10
 R2  chi0^fa dropped fails G1
 R3  the Pauli-blocking product dropped fails G3
 R4  coherences dropped from G^< fails G7
@@ -161,6 +174,57 @@ def _excited(rng, nk):
     return x + g + np.conj(np.swapaxes(g, -1, -2))
 
 
+def _dense_kernel(psi_w, zeta, v, W0):
+    """K x = K^H x - K^W x on the window (Ry): the TD-aGW kernel of the frozen W0."""
+    return lambda x: _dense_hartree(psi_w, zeta, v, x) - _dense_w_apply(psi_w, W0, x)
+
+
+def _dense_dressed(e_w, f_w, x, K, tol=1e-15, cap=4000):
+    """The population-dressed basis by plain iteration to convergence: U, e, f, (steps, residual).
+
+    h = diag(e_w) + K drho_pop, drho_pop = U diag(f) U^H - rho_eq, f = Re diag(U^H rho U).
+    """
+    rho_eq = np.stack([np.diag(fk) for fk in f_w]).astype(complex)
+    rho = rho_eq + x
+    h0 = np.stack([np.diag(ek) for ek in e_w]).astype(complex)
+    P = np.stack([np.diag(np.real(np.diag(xk))) for xk in x]).astype(complex)
+    for n in range(1, cap + 1):
+        ev, U = np.linalg.eigh(h0 + K(P))
+        fr = np.real(np.einsum("kmi,kmn,kni->ki", np.conj(U), rho, U))
+        Pn = np.einsum("kmi,ki,kni->kmn", U, fr, np.conj(U)) - rho_eq
+        r, P = float(np.max(np.abs(Pn - P))), Pn
+        if r < tol:
+            break
+    ev, U = np.linalg.eigh(h0 + K(P))
+    return U, ev, np.real(np.einsum("kmi,kmn,kni->ki", np.conj(U), rho, U)), (n, r)
+
+
+def _hot(rng, nk):
+    """drho of hot carriers: populations only (holes up to 0.39, carriers up to 0.36)."""
+    pops = np.array([-0.30, -0.22, 0.28, 0.24])
+    x = np.zeros((nk, NA, NA), complex)
+    for k in range(nk):
+        x[k, np.arange(NA), np.arange(NA)] = pops * (1.0 + 0.3 * np.tanh(rng.standard_normal(NA)))
+    return x
+
+
+def _drive_family(rng, nk, f_w):
+    """(A, unitary(eps), X): A Hermitian valence-conduction (nk, NA, NA); unitary(eps) =
+    V rho_eq V^H - rho_eq with V = exp(-i eps A); X = -i[A, rho_eq], its O(eps) part."""
+    nv = int(np.sum(f_w[0] > 0.5))
+    A = np.zeros((nk, NA, NA), complex)
+    b = rng.standard_normal((nk, nv, NA - nv)) + 1j * rng.standard_normal((nk, nv, NA - nv))
+    A[:, :nv, nv:] = b
+    A[:, nv:, :nv] = np.conj(np.swapaxes(b, -1, -2))
+    rho_eq = np.stack([np.diag(fk) for fk in f_w]).astype(complex)
+
+    def unitary(eps):
+        w, Q = np.linalg.eigh(A)
+        Vu = np.einsum("kab,kb,kcb->kac", Q, np.exp(-1j * eps * w), np.conj(Q))
+        return np.einsum("kab,kbc,kdc->kad", Vu, rho_eq, np.conj(Vu)) - rho_eq
+    return A, unitary, -1j * (A @ rho_eq - rho_eq @ A)
+
+
 def run_checks(mesh):
     import jax
     import jax.numpy as jnp
@@ -170,7 +234,6 @@ def run_checks(mesh):
     from ffi import fft as F
     from runtime.padding import padded_mu_extent, round_up
     from tdagw.model import ZETA_G_SPEC, V_G_SPEC, assemble_td_model, build_td_agw_apply
-    from tdagw.self_energy import isdf_model
     from tdagw import dynsig as D
     from tdagw import propagate as tp
 
@@ -254,33 +317,44 @@ def run_checks(mesh):
             m_dyn.params, tp.place_state(rho_eq_h[None], mesh)))
         rows["G5"] = float(np.max(np.abs(z)))
 
-        # G4b / R1: dress = instantaneous; the reference diagonalizes diag(eps^G) + K drho
-        Kx = 2.0 * gather(jax.jit(lambda prm, r: isdf_model(td, mesh, k_frac=kf, rho_eq=rho_eq)
-                                  .apply(prm, r, 0.0))(
-            isdf_model(td, mesh, k_frac=kf, rho_eq=rho_eq).params, rho))[0, :nk]   # Ry
-        h = np.stack([np.diag(e[k, B_LO:B_LO + NA]) for k in range(nk)]) + Kx
-        h = 0.5 * (h + np.conj(np.swapaxes(h, -1, -2)))
-        ev, Uv = np.linalg.eigh(h)
-        rt = np.einsum("kmi,kmn,knj->kij", np.conj(Uv), rho_h[0, :nk], Uv)
-        psi_r = psi.copy()
-        psi_r[:, B_LO:B_LO + NA] = np.einsum("kmsu,kmi->kisu", psi_w, Uv)
-        e_r, f_r = e.copy(), f.copy()
-        e_r[:, B_LO:B_LO + NA] = ev
-        f_r[:, B_LO:B_LO + NA] = np.real(np.einsum("kii->ki", rt))
-        chi_r = _dense_chi(psi_r, e_r, f_r, x_sep=rule["e_sep"])
-        W_r = _dense_dyson(V, chi_r)
-        ref_b = (_dense_sigma(psi, e, f, rho_h[0, :nk], W_r, V)
-                 - _dense_sigma(psi, e, f, rho_eq_h[:nk], W0, V) + _dense_hartree(psi_w, zeta, v, x))
+        # G4b / G4c / R1 / R6: dress = instantaneous; the reference iterates the population
+        # dressing diag(eps^G) + K drho_pop to its fixed point (dense K, plain iteration)
+        K_dense = _dense_kernel(psi_w, zeta, v, W0)
+        e_w, f_w = e[:, B_LO:B_LO + NA], f[:, B_LO:B_LO + NA]
+
+        def dressed_ref(xx):
+            Uv, ev, fr, conv = _dense_dressed(e_w, f_w, xx, K_dense)
+            psi_r = psi.copy()
+            psi_r[:, B_LO:B_LO + NA] = np.einsum("kmsu,kmi->kisu", psi_w, Uv)
+            e_r, f_r = e.copy(), f.copy()
+            e_r[:, B_LO:B_LO + NA], f_r[:, B_LO:B_LO + NA] = ev, fr
+            W_r = _dense_dyson(V, _dense_chi(psi_r, e_r, f_r, x_sep=rule["e_sep"]))
+            return (_dense_sigma(psi, e, f, rho_eq_h[:nk] + xx, W_r, V)
+                    - _dense_sigma(psi, e, f, rho_eq_h[:nk], W0, V)
+                    + _dense_hartree(psi_w, zeta, v, xx)), conv
+        ref_b, rows["G4b_ref_steps_residual"] = dressed_ref(x)
         # the dressed levels move: the rule is planned with a margin (static_rule docstring)
         dyn_m = D.assemble_dynsig_bundle(
             td, put(pad_mu(psi), P(None, None, None, "x")), e, f, put(sq(W0), D.CHI_SPEC),
             mesh_xy=mesh, rule=D.static_rule(e, f, target_error=1e-11, margin=0.5),
             V_q=put(sq(V), D.CHI_SPEC))
-        for tag, kw in (("G4b", {}), ("R1", dict(occupation="fixed_basis"))):
+        rng2 = np.random.default_rng(20261019)       # the new states; rng's stream is unchanged
+        x_hot = _hot(rng2, nk)
+        rho_hot = np.zeros_like(rho_h)
+        rho_hot[0, :nk] = rho_eq_h[:nk] + x_hot
+        ref_c, rows["G4c_ref_steps_residual"] = dressed_ref(x_hot)
+        for tag, kw, r_, ref_ in (
+                ("G4b", dict(dress="instantaneous"), rho, ref_b),
+                ("R1", dict(dress="instantaneous", occupation="fixed_basis"), rho, ref_b),
+                ("R6", dict(dress="coherent"), rho, ref_b),
+                ("G4c", dict(dress="instantaneous"), tp.place_state(rho_hot, mesh), ref_c)):
             mb = D.dynsig_model(dyn_m, mesh, k_frac=kf, rho_eq=rho_eq, screening="static_rpa",
-                                dress="instantaneous", **kw)
-            gb = gather(jax.jit(lambda prm, r: mb.apply(prm, r, 0.0))(mb.params, rho))
-            rows[tag] = _rel(2.0 * gb[0, :nk], ref_b)
+                                **kw)
+            gb = gather(jax.jit(lambda prm, r: mb.apply(prm, r, 0.0))(mb.params, r_))
+            rows[tag] = _rel(2.0 * gb[0, :nk], ref_)
+
+        # G10 / R7 / G11: the dynamic correction itself (Ry), K = the TD model (static_dsigma)
+        rows.update(_dress_checks(mesh, td, dyn_m, kern, x, x_hot, f_w, nk, rng2))
 
         # G7 / R4: the literal definition in a rotated basis, frozen W
         hrot = np.stack([np.diag(e[k, B_LO:B_LO + NA]) for k in range(nk)]) + 0.3 * (
@@ -300,6 +374,65 @@ def run_checks(mesh):
 
         # G8 / G9: the propagator on a pulse
         rows.update(_pulse_checks(mesh, td, dyn, e, kf, rho_eq, rho_eq_h, nk, p, rng))
+    return rows
+
+
+def _dress_checks(mesh, td, dyn_m, kern, x_drv, x_hot, f_w, nk, rng):
+    """G10 / R7 (eps scaling of the dynamic correction) and G11 (fixed-point residuals)."""
+    import functools
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import multihost_utils
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit import device_put_process_local
+    from tdagw import dynsig as D
+    from tdagw.model import build_td_agw_apply
+    from tdagw.self_energy import _ISDF_OPERANDS
+    gather = lambda a: np.asarray(multihost_utils.process_allgather(a, tiled=True))
+    put = lambda a: device_put_process_local(np.asarray(a), NamedSharding(mesh, P()))
+    A_m, S_m = D.split_bundle(dyn_m)
+    ops = tuple(td[k] for k in _ISDF_OPERANDS)
+
+    def static_ds(ops_):                         # K drho on the window, Ry (as _dyn_apply)
+        app = build_td_agw_apply(mesh, dict(zip(_ISDF_OPERANDS, ops_), kgrid=td["kgrid"],
+                                            nspinor=td["nspinor"]))
+        pad = int(td["nb_pad"]) - NA
+        return lambda y: app(jnp.pad(y, ((0, 0), (0, pad), (0, pad)))[None])[0, :, :NA, :NA]
+
+    def corr(A_, ops_, xx, dress):
+        d, fl = D.dynamic_correction({**S_m, **A_}, kern, xx, static_dsigma=static_ds(ops_),
+                                     dress=dress)
+        return d, fl["dress_residual"], fl["dress_unconverged"]
+
+    def basis(A_, ops_, xx, steps):
+        dd = {**S_m, **A_}
+        fw = dd["f_full"][:, B_LO:B_LO + NA]
+        return D._population_basis(dd["e_full"][:, B_LO:B_LO + NA], xx + D._band_diag(fw),
+                                   D._band_diag(fw), static_ds(ops_), steps=steps)
+    fns = {dr: jax.jit(functools.partial(corr, dress=dr))
+           for dr in ("instantaneous", "coherent", "none")}
+    rows = {}
+    A, unitary, X = _drive_family(rng, nk, f_w)
+    epss = (2.5e-4, 5e-4, 1e-3)
+    for tag, dr in (("G10", "instantaneous"), ("R7", "coherent"), ("D10", "none")):
+        amp = [float(np.max(np.abs(gather(fns[dr](A_m, ops, put(unitary(s)))[0])))) for s in epss]
+        rows[f"{tag}_amp"] = amp
+        rows[f"{tag}_slope"] = float(np.polyfit(np.log(epss), np.log(amp), 1)[0])
+    pure = {dr: float(np.max(np.abs(gather(fns[dr](A_m, ops, put(epss[1] * X))[0]))))
+            for dr in ("instantaneous", "coherent")}
+    rows["G10_pure"] = pure["instantaneous"] / pure["coherent"]
+    rows["G10_pure_amp"] = [pure["instantaneous"], pure["coherent"]]
+    steps = D.DRESS_STEPS
+    basis_prev = jax.jit(functools.partial(basis, steps=steps - 1))
+    basis_last = jax.jit(functools.partial(basis, steps=steps))
+    for tag, xx in (("driven", x_drv), ("hot", x_hot)):
+        _, res, unc = fns["instantaneous"](A_m, ops, put(xx))
+        f_prev = gather(basis_prev(A_m, ops, put(xx))[2])
+        f_last = gather(basis_last(A_m, ops, put(xx))[2])
+        rows[f"G11_{tag}"] = float(gather(res))
+        rows[f"G11_{tag}_df"] = float(np.max(np.abs(f_last - f_prev)))
+        rows[f"G11_{tag}_unconverged"] = int(gather(unc))
+    rows["G11_steps"] = steps
     return rows
 
 
@@ -360,16 +493,21 @@ def _pulse_checks(mesh, td, dyn, e, kf, rho_eq, rho_eq_h, nk, p, rng):
     return rows
 
 
-GATES = dict(G1=1e-8, G2=1e-12, G3=1e-7, G4=1e-7, G4b=1e-7, G5=1e-12, G6=1e-12, G7=1e-12,
-             G8=1e-13)
-TWINS = dict(R1="G4b", R2="G1", R3="G3", R4="G7", R5="G3")
+GATES = dict(G1=1e-8, G2=1e-12, G3=1e-7, G4=1e-7, G4b=1e-7, G4c=1e-7, G5=1e-12, G6=1e-12,
+             G7=1e-12, G8=1e-13, G10_pure=1e-9)
+TWINS = dict(R1="G4b", R2="G1", R3="G3", R4="G7", R5="G3", R6="G4b")
+G10_SLOPE, G11_TOL = (1.9, 2.1), 1e-9
 
 
 def verdict(rows):
     ok = {g: rows[g] <= tol for g, tol in GATES.items()}
     ok["G9"] = rows["G9_finite"] and 1.6 <= rows["G9_slope"] <= 2.4
+    ok["G10"] = G10_SLOPE[0] <= rows["G10_slope"] <= G10_SLOPE[1]
+    ok["G11"] = all(rows[f"G11_{s}"] <= G11_TOL and not rows[f"G11_{s}_unconverged"]
+                    for s in ("driven", "hot"))
     for r, g in TWINS.items():
         ok[r] = rows[r] > GATES[g]
+    ok["R7"] = not G10_SLOPE[0] <= rows["R7_slope"] <= G10_SLOPE[1]
     return ok
 
 
