@@ -17,11 +17,14 @@ LORRAX has six core drivers in seven modules: GW preprocessing is two modules
 compresses a finished GW restart for the two BSE drivers.
 [`gw.epsmat_cli`](#epsmat-gwepsmat_cli) also sits beside it: it converts a
 finished bundle's static W to and from BerkeleyGW's ε⁻¹ files.
+So does [`bse.bsemat_cli`](#bsemat-bsebsemat_cli): it writes a
+finished bundle's static W as BerkeleyGW 4.0's `bsemat.h5`.
 
 Every driver brings up the runtime with one module-top call,
 `runtime.initialize_communicator_stack` (mesh, communicators, startup report).
-`gw_jax`, `kin_ion_io`, `kmeans_cli`, `downfold_cli` and `epsmat_cli` answer
-`--help` and bad arguments before that call (`runtime.cli_seam`). Launch geometry is owned by
+`gw_jax`, `kin_ion_io`, `kmeans_cli`, `downfold_cli`, `epsmat_cli` and
+`bsemat_cli` answer `--help` and bad arguments before that call
+(`runtime.cli_seam`). Launch geometry is owned by
 the machine pages ([Perlmutter](environment/machines/perlmutter.md),
 [Frontera](environment/machines/frontera.md)); every deck key is in the
 [input reference](input_reference.md). The tables below list only the keys
@@ -241,6 +244,27 @@ bundle's ζ and writes a copy of the bundle whose `W0_qmunu` is theirs
 owns the equations, the outputs and the refusals; the `[epsmat]` keys are in the
 [input reference](input_reference.md#epsmat-the-epsmat-input-file).
 
+
+## bsemat — `bse.bsemat_cli`
+
+Writes BerkeleyGW 4.0's kernel file `bsemat.h5` (TDA, or `extended_kernel` with
+`--extended`) from a finished static-Dyson GW bundle. The head, wing and body at
+every q come from the stored V, W and one ζ column per q, so no plane-wave pair
+density is formed. Invoke:
+`python3 -u -m bse.bsemat_cli -i cohsex.in --wfn-co WFN_co.h5 --n-val NV --n-cond NC --bgw-eps epsmat.h5`
+on a square mesh. `--wfn-co` is the explicit full-grid WFN that BerkeleyGW's
+absorption reads (`no_symmetries_coarse_grid`); the file is written in its
+coefficient gauge and k order. `--bgw-eps` supplies the q list that fixes
+BerkeleyGW's head slot at zone-boundary ties. The run prints BerkeleyGW's
+`kernel.out` Frobenius lines and writes `<output>.json` with every gate's
+measured value. `--mu-small` (default `off`) first downfolds the bundle onto the
+file's band window (an integer, `kx` = k·N_b of the parent's centroids with
+N_b = NV + NC, or `auto` for the eigenvalue-rank ceiling; `--downfold-rcond`) with
+the [downfold](downfold.md) driver's selection and transfer, and builds the rows
+by GEMMs over the small W; the theory page gives its measured accuracy. `--q0-body dipole` adds the
+3-D q0 body term from the bundle's stored q → 0 wings. [The theory
+page](theory/bgw-bsemat-export.md) owns the equations, the conventions and the
+refusals.
 
 ## htransform — `bandstructure.htransform`
 

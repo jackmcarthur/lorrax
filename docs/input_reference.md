@@ -21,6 +21,13 @@ parser no longer accepts, or a default cell differs from the code.
 
 The last two sections document other input files: the `[downfold]` and
 `[epsmat]` decks.
+`bse.bsemat_cli` adds no deck keys: it reads the producer GW deck named by `-i`
+and takes its own flags ([drivers](drivers.md#bsemat-bsebsemat_cli)). Its
+`--mu-small` is the centroid count of the downfold it runs first: an integer, `kx` =
+k·N_b with N_b = `--n-val` + `--n-cond` (the file's band window, the same set for
+TDA and `--extended`), `auto` (the window Gram's eigenvalue rank at
+`--downfold-rcond`, the largest accepted count) or `off` (the default). It is the
+`[downfold]` deck's `mu_small` with the window fixed to the file's bands.
 
 ## System
 
