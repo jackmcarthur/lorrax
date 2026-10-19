@@ -317,6 +317,10 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev")}
         if v.get("lorrax.collision_spm_chi0_active") is not None:   # absent when unset
             fp["collision"]["lorrax.collision_spm_chi0_active"] = v["lorrax.collision_spm_chi0_active"]
+        for key, default in (("lorrax.collision_in_scattering", "populations"),
+                             ("lorrax.collision_rate_intermediates", "all")):
+            if v.get(key, default) != default:                       # absent at the default
+                fp["collision"][key] = v[key]
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
               nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
               measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
@@ -591,13 +595,17 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
                              rebase=rebase,
                              spm_support_sites=v["lorrax.collision_spm_support_sites_ev"],
                              spm_chi0_active=v["lorrax.collision_spm_chi0_active"],
+                             in_scattering=v["lorrax.collision_in_scattering"],
+                             rate_intermediates=v["lorrax.collision_rate_intermediates"],
                              spm_scratch=os.path.join(os.path.abspath(str(
                                  v["control.files.outdir"])), "collision_refits"), say=emit)
     every = policy.every * tdgw_io.T_IN_ATTOSEC / 1000.0
     fb = v["lorrax.collision_frozen_bands"]
     say(f"  collision       : {v['lorrax.collision']}, hermitian "
         f"{v['lorrax.collision_hermitian']}, {v['lorrax.collision_refresh_sweep']} sweep, "
-        f"{v['lorrax.collision_screening']} screening"
+        f"{v['lorrax.collision_screening']} screening, in-scattering "
+        f"{v['lorrax.collision_in_scattering']}, rate intermediates "
+        f"{v['lorrax.collision_rate_intermediates']}"
         + ("" if v["lorrax.collision_screening"] != "refreshed" else
            f" (same-side principal value {v['lorrax.collision_screening_gamma_ev']:g} eV)")
         + ("" if v["lorrax.collision_screening"] != "shared_pole" else

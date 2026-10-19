@@ -1368,6 +1368,7 @@ def compute_sigma_c_ppm_omega_grid(
     internal: 'InternalBands | None' = None,
     keep_branches=False,
     print_fn=print,
+    particle_weights=None,
 ) -> SigmaOmegaResult:
     """Compute GN/HL-PPM Sigma_c through the shared MPA dynamic route.
 
@@ -1385,6 +1386,11 @@ def compute_sigma_c_ppm_omega_grid(
     the intermediate-state band sum: both causal branches and the invalid-pole
     term's occupied projector run over its bands, and the windows are planned
     on their energies.  ``None`` is the whole sum.
+
+    ``particle_weights`` (``(nk, nb_full)`` real, with ``populations`` only): the
+    conduction branch's weights where they are not 1 - f (the full-ρ internal
+    line's pseudo-bands, :func:`_full_rho_carrier`); ``populations`` stays the
+    valence weight and the occupied projector's.  None is 1 - f.
 
     The PPM fit remains the two-point algebra in :func:`fit_ppm`.  This stage
     applies the established invalid-pole policy, hands that result to the
@@ -1487,6 +1493,10 @@ def compute_sigma_c_ppm_omega_grid(
             "GATE ppm_sigma_internal: got an internal-band restriction without band "
             "populations; want populations (the split is of a population sum); fix: "
             "pass populations with internal")
+    if particle_weights is not None and populations is None:
+        raise ValueError(
+            "GATE ppm_sigma_particle_weights: got particle weights without band "
+            "populations; want both branch weights; fix: pass populations with them")
     if populations is not None:
         if occupation_state is not None:
             raise ValueError(
@@ -1552,7 +1562,8 @@ def compute_sigma_c_ppm_omega_grid(
             val_mask=state.val_mask)
     else:
         branches = _population_branches(omega_req, enk_full, state.efermi, populations,
-                                        internal=None if internal is None else internal.mask)
+                                        internal=None if internal is None else internal.mask,
+                                        particle_weights=particle_weights)
     result = compute_sigma_c_mpa_omega_grid(
         wfns, poles, meta, mesh_xy,
         request=request,
@@ -1617,7 +1628,8 @@ def _population_state(populations, meta, shape):
                            / float(meta.nk_tot))
 
 
-def _population_branches(omega_ry, enk_full, efermi, populations, internal=None):
+def _population_branches(omega_ry, enk_full, efermi, populations, internal=None,
+                         particle_weights=None):
     """Causal branches of band populations: valence weight f, conduction 1 - f, energies unclipped.
 
     ``gw.mpa.sigma._branches``' occupation-state form on the PPM frame
@@ -1625,17 +1637,22 @@ def _population_branches(omega_ry, enk_full, efermi, populations, internal=None)
     own (negative) energy, which the step split's clipped ``E_cond`` could not
     represent.  ``internal`` (nk, nb) bool keeps only those intermediate states
     in both branches (:class:`InternalBands`); None keeps every band.
+    ``particle_weights`` (nk, nb) real: the conduction (particle) branch's
+    weights where they are not 1 - f — the signed weights of the full-ρ
+    internal line's pseudo-bands (:func:`_full_rho_carrier`); None is 1 - f.
+    A branch keeps a band where its own weight is nonzero.
     """
     f = jnp.asarray(populations, dtype=jnp.float64)
+    cw = 1.0 - f if particle_weights is None else jnp.asarray(particle_weights, jnp.float64)
     energy = jnp.asarray(enk_full, dtype=jnp.float64) - efermi
     if internal is None:
         return branches_for_omega_grid(
-            omega_ry, E_cond=energy, H_val=-energy, cond_mask=(f != 1.0), val_mask=(f != 0.0),
-            cond_weight=1.0 - f, val_weight=f)
+            omega_ry, E_cond=energy, H_val=-energy, cond_mask=(cw != 0.0), val_mask=(f != 0.0),
+            cond_weight=cw, val_weight=f)
     keep = jnp.asarray(internal, dtype=bool)
     return branches_for_omega_grid(
-        omega_ry, E_cond=energy, H_val=-energy, cond_mask=(f != 1.0) & keep,
-        val_mask=(f != 0.0) & keep, cond_weight=jnp.where(keep, 1.0 - f, 0.0),
+        omega_ry, E_cond=energy, H_val=-energy, cond_mask=(cw != 0.0) & keep,
+        val_mask=(f != 0.0) & keep, cond_weight=jnp.where(keep, cw, 0.0),
         val_weight=jnp.where(keep, f, 0.0))
 
 
@@ -1711,6 +1728,80 @@ def _rotate_faces(psi_nmu, psi_mun, U, b_lo, keep):
     fn = _window_rotation_fn(int(b_lo), int(U.shape[-1]), psi_nmu.sharding, psi_mun.sharding,
                              tuple(psi_nmu.shape), tuple(psi_mun.shape))
     return fn(psi_nmu, psi_mun, jnp.asarray(U), jnp.asarray(keep))
+
+
+@lru_cache(maxsize=8)
+def _full_rho_faces_fn(b_hi, n_a, n_pad, nmu_spec, mun_spec, mesh_xy, full_nmu, full_mun):
+    """Both faces with the full-ρ pseudo-bands inserted after the window (Eq. 8a).
+
+    [0, b_hi) | psi_A (1 + R) | psi_A (1 - R) | n_pad zero bands | [b_hi, nb): the
+    window psi_A = [b_hi - n_a, b_hi) already in the instantaneous basis, R (nk, n_a,
+    n_a) the off-diagonal part of rho' there; column m of psi_A (1 +- R) is psi_m +-
+    sum_n psi_n R_nm.  Both layouts hold non-conjugated orbitals, so one R serves both.
+    """
+    win = slice(int(b_hi) - int(n_a), int(b_hi))
+    out = (NamedSharding(mesh_xy, nmu_spec), NamedSharding(mesh_xy, mun_spec))
+
+    def build(psi_nmu, psi_mun, R):
+        a_n, a_m = psi_nmu[:, win], psi_mun[..., win]
+        y_n = jnp.einsum("kmsu,kmi->kisu", a_n, R.astype(psi_nmu.dtype))
+        y_m = jnp.einsum("ksum,kmi->ksui", a_m, R.astype(psi_mun.dtype))
+        pad_n = jnp.zeros(psi_nmu.shape[:1] + (int(n_pad),) + psi_nmu.shape[2:], psi_nmu.dtype)
+        pad_m = jnp.zeros(psi_mun.shape[:3] + (int(n_pad),), psi_mun.dtype)
+        nmu = jnp.concatenate([psi_nmu[:, :b_hi], a_n + y_n, a_n - y_n, pad_n,
+                               psi_nmu[:, b_hi:]], axis=1)
+        mun = jnp.concatenate([psi_mun[..., :b_hi], a_m + y_m, a_m - y_m, pad_m,
+                               psi_mun[..., b_hi:]], axis=-1)
+        return nmu, mun
+    return jax.jit(build, out_shardings=out)
+
+
+def _full_rho_carrier(psi_nmu, psi_mun, R, b_hi, mesh_xy):
+    """(psi_nmu, psi_mun, n_pad) with the full-ρ pseudo-bands (:func:`_full_rho_faces_fn`).
+
+    ``n_pad`` zero bands keep the band axis a multiple of both mesh axes (the faces
+    shard it over x and y).
+    """
+    import math
+    n_a = int(R.shape[-1])
+    div = math.lcm(*(int(n) for n in mesh_xy.devices.shape))
+    n_pad = (-(int(psi_nmu.shape[1]) + 2 * n_a)) % div
+    fn = _full_rho_faces_fn(int(b_hi), n_a, int(n_pad), psi_nmu.sharding.spec,
+                            psi_mun.sharding.spec, mesh_xy, tuple(psi_nmu.shape),
+                            tuple(psi_mun.shape))
+    nmu, mun = fn(psi_nmu, psi_mun, jnp.asarray(R))
+    return nmu, mun, int(n_pad)
+
+
+def _window_rho(window: dict, U, f, internal, omit_frozen):
+    """The window's rho' (instantaneous basis) of a full-ρ internal line, Hermitized, or None.
+
+    Refused unless the sweep is the active part's (the frozen bands' populations never
+    change) and the populations are rho''s diagonal.
+    """
+    rho = window.get("rho")
+    if rho is None:
+        return None
+    if internal != "active" or omit_frozen:
+        raise ValueError(
+            f"GATE window_sigma_full_rho: got rho with internal={internal!r}, omit_frozen="
+            f"{bool(omit_frozen)}; want internal='active' (the full-ρ internal line is the "
+            "window's own bands); fix: sweep the frozen part on the populations")
+    rho = np.asarray(rho, np.complex128)
+    if rho.shape != U.shape:
+        raise ValueError(f"GATE window_sigma_shapes: got rho {rho.shape}; want {U.shape}")
+    rh = np.conj(np.swapaxes(rho, -1, -2))
+    scale = max(1.0, float(np.max(np.abs(rho))))
+    if float(np.max(np.abs(rho - rh))) > 1e-10 * scale:
+        raise ValueError("GATE window_sigma_rho_hermitian: rho' is not Hermitian (max|rho - "
+                         f"rho^H| = {float(np.max(np.abs(rho - rh))):.3e}); fix: pass the state's "
+                         "density matrix in the instantaneous basis")
+    rho = 0.5 * (rho + rh)
+    d = np.real(np.einsum("kii->ki", rho))
+    if float(np.max(np.abs(d - f))) > 1e-10:
+        raise ValueError("GATE window_sigma_rho_populations: f is not diag(rho') (max diff "
+                         f"{float(np.max(np.abs(d - f))):.3e}); fix: pass f = diag(rho')")
+    return rho
 
 
 def _with_frequencies(request: OnShellRequest, extra_ry) -> OnShellRequest:
@@ -1823,14 +1914,15 @@ def fresh_shared_pole_capacity(meta, mesh_xy):
 
 
 def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal_bands, *,
-                            request_for, omega_grid_ry, keep_branches, print_fn):
+                            request_for, omega_grid_ry, keep_branches, print_fn, particle=None):
     """One window sweep of a shared-pole model: the run's shared-pole Σ stage on the window carrier.
 
     ``gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`` (``sigma_w_model =
     "shared_pole"``) with the causal branches of the band populations ``pop``
-    (:func:`_population_branches`, restricted to ``internal_bands``), the run's
-    ω frame, broadening and quadrature, and the plan's held session.  Returns
-    the executor's result with ``efermi_ry`` set to the frame.
+    (:func:`_population_branches`, restricted to ``internal_bands``; ``particle``
+    the conduction weights where they are not 1 - pop, the full-ρ pseudo-bands),
+    the run's ω frame, broadening and quadrature, and the plan's held session.
+    Returns the executor's result with ``efermi_ry`` set to the frame.
     """
     from .mpa.sigma import compute_sigma_c_mpa_omega_grid
     model, efermi = source["model"], float(source["efermi_ry"])
@@ -1844,11 +1936,15 @@ def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal
     cols = np.arange(nb_all)[s.full]
     sel = np.searchsorted(cols, np.arange(nb_all)[s.sigma_sum])
     w = pop if internal_bands is None else internal_bands.weights(pop)
+    cw = None if particle is None else (
+        np.asarray(particle, np.float64) if internal_bands is None
+        else internal_bands.weights(particle))
     branches = _population_branches(
         omega, np.asarray(jax.device_get(wfns_t.enk), np.float64)[:, s.sigma_sum], efermi,
         np.asarray(w)[:, sel],
         internal=None if internal_bands is None else
-        np.broadcast_to(np.asarray(internal_bands.mask, bool), np.shape(w))[:, sel])
+        np.broadcast_to(np.asarray(internal_bands.mask, bool), np.shape(w))[:, sel],
+        particle_weights=None if cw is None else np.asarray(cw)[:, sel])
     res = compute_sigma_c_mpa_omega_grid(
         wfns_t, model["path"], meta_t, mesh_xy, sigma_w_model="shared_pole",
         fit_identity=model["identity"], fit_digest=model["digest"], request=request,
@@ -1896,7 +1992,16 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         bundle's band axis: U (nk, n_A, n_A) the instantaneous orbitals'
         columns in the band basis, e (nk, n_A) their energies (Ry, the
         bundle's absolute frame), f (nk, n_A) their populations; full-k rows
-        in the bundle's k order.
+        in the bundle's k order.  Optional ``rho`` (nk, n_A, n_A): the window's
+        density matrix rho' = U^H rho U in the instantaneous basis (f its
+        diagonal; ``internal = "active"`` only): the internal line is then the
+        full-ρ one, hole rho'_mn and particle (1 - rho')_mn with the symmetric
+        energy prescription 1/2 g(e_m) + 1/2 g(e_n) (td_agw_dynamical.md §1.5,
+        Eq. 8a), on 2 n_A pseudo-bands psi_A (1 +- R) inserted after the window
+        (R the off-diagonal part of rho'; weights +-1/4 hole, -+1/4 particle),
+        which also carry the coherences into the occupied projector of the
+        static terms.  At a diagonal rho' it is the populations' sweep to
+        rounding.
     plan : :func:`window_sigma_plan`.
     meta, mesh_xy : the run's.
     omega_ry : optional (n_omega,) frequencies measured from the body's omega
@@ -2008,28 +2113,69 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
                                  "sum needs internal='frozen'")
             mask = mask & np.broadcast_to(np.asarray(keep_frozen, bool), pop.shape)
         internal_bands = InternalBands(mask=mask, coulomb_hole=(internal == "frozen"))
+    rho_w = _window_rho(window, U, f, internal, omit_frozen)
     psi_nmu, psi_mun = _rotate_faces(carrier.psi_nmu, carrier.psi_mun, U, b_lo, keep)
     rep = NamedSharding(mesh_xy, P(None, None))
     from common.collectives import device_put_process_local
     put = lambda a: device_put_process_local(np.ascontiguousarray(a), rep)
     rows = np.asarray(kplan.parent_full_rows if kplan.parent_full_rows is not None
                       else np.arange(nk))
+    n_ps, part, occ_c = 0, None, carrier.occ
+    if rho_w is not None:
+        # The full-ρ internal line (Eq. 8a): 2 n_A pseudo-bands after the window, inside
+        # the Sigma window [0, b_hi + n_ps) so the occupied projector of the static terms
+        # (diag of the weights over the Sigma window) carries the coherences too.
+        R = rho_w - np.einsum("kii->ki", rho_w)[:, :, None] * np.eye(n_a)[None]
+        psi_nmu, psi_mun, n_pad = _full_rho_carrier(psi_nmu, psi_mun, R, b_hi, mesh_xy)
+        n_ps = 2 * n_a + n_pad
+        q4, z = np.full((nk, n_a), 0.25), np.zeros((nk, n_pad))
+        ins = lambda a, blk: np.concatenate([a[:, :b_hi], blk, a[:, b_hi:]], axis=1)
+        part = ins(1.0 - pop, np.concatenate([-q4, q4, z], axis=1))
+        pop = ins(pop, np.concatenate([q4, -q4, z], axis=1))
+        # a pad row sits at the window's first energy and step occupation: no new
+        # frequency and no change of the omega frame
+        enk_t = ins(enk_t, np.concatenate([e, e, np.repeat(e[:, :1], n_pad, axis=1)], axis=1))
+        occ_t = ins(occ, np.concatenate([occ[:, win], occ[:, win],
+                                         np.repeat(occ[:, b_lo:b_lo + 1], n_pad, axis=1)],
+                                        axis=1))
+        live = np.zeros(pop.shape, bool)
+        live[:, win] = True
+        live[:, b_hi:b_hi + 2 * n_a] = True
+        internal_bands = InternalBands(mask=live, coulomb_hole=False)
+        occ_c = put(occ_t[rows])
     carrier_t = replace(carrier, psi_nmu=psi_nmu, psi_mun=psi_mun,
-                        enk=put(enk_t[rows]), occ=carrier.occ)
-    slices_t = BandSlices.from_band_edges(
-        s.b0, min(int(s.b1), int(s.b0) + b_hi), s.b2, int(s.b0) + b_hi, s.b4,
-        b4_chi=s.b4_chi, b4_sigma=s.b4_sigma, b4_logical=s.b4_logical)
+                        enk=put(enk_t[rows]), occ=occ_c)
+    if n_ps:
+        top = lambda edge: (int(edge) or int(s.b4))
+        chi = top(s.b4_chi)
+        slices_t = BandSlices.from_band_edges(
+            s.b0, min(int(s.b1), int(s.b0) + b_hi), s.b2, int(s.b0) + b_hi + n_ps,
+            int(s.b4) + n_ps, b4_chi=chi + (n_ps if chi > int(s.b0) + b_hi else 0),
+            b4_sigma=top(s.b4_sigma) + n_ps, b4_logical=top(s.b4_logical) + n_ps)
+    else:
+        slices_t = BandSlices.from_band_edges(
+            s.b0, min(int(s.b1), int(s.b0) + b_hi), s.b2, int(s.b0) + b_hi, s.b4,
+            b4_chi=s.b4_chi, b4_sigma=s.b4_sigma, b4_logical=s.b4_logical)
     # The Sigma stage reads the parent carrier only; full-k faces, if the
     # bundle holds any, would be the unrotated window and are dropped.
     wfns_t = replace(wfns, enk=put(enk_t), slices=slices_t, green_parent=carrier_t,
                      psi_nmu=None, psi_mun=None)
+    if n_ps:
+        wfns_t = replace(wfns_t, occ=put(occ_t))
     spm = isinstance(poles, dict) and poles.get("member") == "shared_pole"
     if spm and static_limit and static_limit_wc0 is None:
         raise ValueError("GATE window_sigma_static_wc0: got a shared-pole source without "
                          "static_limit_wc0; want the model's W^c(0) (gw.mpa.sigma."
                          "shared_pole_static_wc); fix: pass static_limit_wc0")
     meta_src = poles.get("meta", meta) if spm else meta
-    meta_t = dataclasses.replace(meta_src, b_id_3=int(meta.b_id_0) + b_hi)
+    meta_t = dataclasses.replace(meta_src, b_id_3=int(meta.b_id_0) + b_hi + n_ps)
+    if n_ps:
+        lo = int(meta.b_id_0) + b_hi
+        shift = lambda edge: int(edge) + (n_ps if int(edge) > lo else 0)
+        meta_t = dataclasses.replace(
+            meta_t, b_id_4=int(meta_src.b_id_4) + n_ps,
+            b_id_4_user=int(meta_src.b_id_4_user or meta_src.b_id_4) + n_ps,
+            b_id_4_chi=shift(meta_src.b_id_4_chi), b_id_4_sigma=shift(meta_src.b_id_4_sigma))
     if spm:
         # The shared-pole Σ stage reads the map's recipe and census, set on the run's
         # metadata as attributes outside its fields (gw_jax), which dataclasses.replace
@@ -2065,7 +2211,8 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
             return _shared_pole_window_run(
                 wfns_t, poles, fresh_shared_pole_capacity(meta_t, mesh_xy), mesh_xy, plan, pop, internal_bands,
                 request_for=request_for if omega_grid is None else None,
-                omega_grid_ry=omega_grid, keep_branches=keep_branches, print_fn=quiet)
+                omega_grid_ry=omega_grid, keep_branches=keep_branches, print_fn=quiet,
+                particle=part)
         return compute_sigma_c_ppm_omega_grid(
             wfns_t, poles, meta_t, mesh_xy, ppm_cfg=plan["ppm_cfg"],
             sigma_cfg=plan["sigma_cfg"], mpa_cfg=plan["mpa_cfg"],
@@ -2073,7 +2220,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
             plan=None, fixed_quadrature_session=plan.get("session"),
             request_for=request_for if omega_grid is None else None,
             omega_grid_ry=omega_grid, populations=pop, internal=internal_bands,
-            keep_branches=keep_branches, print_fn=quiet)
+            keep_branches=keep_branches, print_fn=quiet, particle_weights=part)
 
     def head_rows(efermi_ry):
         return None if head is None else replace(
@@ -2104,7 +2251,9 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     S = 0.5 * (pair[0] + pair[1])
     out = dict(pair=pair, diag=diag, onshell=U @ S @ Uh, efermi_ry=float(res.efermi_ry),
                request=built.get("request"), carrier=dict(slices=slices_t, nb_sigma=nb_sig),
-               sweep=sweep)
+               sweep=sweep, full_rho=(None if rho_w is None else dict(
+                   n_pseudo=int(n_ps), max_offdiag=float(np.max(np.abs(
+                       rho_w - np.einsum("kii->ki", rho_w)[:, :, None] * np.eye(n_a)[None]))))))
     if branches or static_limit:
         req = built["request"]
         table = req.tables_ry[req.slot("pair")]
@@ -2146,5 +2295,6 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
       + (" (RED TWIN: frozen bands omitted from G)" if omit_frozen else "")
       + (", branches kept" if branches else "")
       + ("" if internal is None else f", internal bands {internal}")
+      + ("" if rho_w is None else f", full-rho internal line ({n_ps} pseudo-bands)")
       + f", {sweep['distinct_tau']} tau in {sweep['n_windows']} windows")
     return out

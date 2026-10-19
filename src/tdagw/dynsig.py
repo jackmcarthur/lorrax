@@ -1531,6 +1531,12 @@ def _shift_window_part(base: dict, new: dict, old: dict) -> dict:
 
 #: ``window_collision``'s refresh sweeps (``[lorrax] collision_refresh_sweep``).
 REFRESH_SWEEPS = ("full", "active")
+#: The internal line of the active part's rates (``[lorrax] collision_in_scattering``):
+#: the populations (diag rho) or the full window rho (td_agw_dynamical.md §1.5, Eq. 8a).
+IN_SCATTERINGS = ("populations", "full")
+#: The intermediate states of the rates (``[lorrax] collision_rate_intermediates``): every
+#: band, or the window's own (the frozen part then enters the Hermitian part only).
+RATE_INTERMEDIATES = ("all", "active")
 
 
 def _sweep_nodes(out: dict) -> dict:
@@ -1549,7 +1555,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                      check_truncation: bool = False, odd_same_side: bool = True,
                      screening_gamma_ev: float = 0.0, rebase: bool | None = None,
                      spm_support_sites: str = "", spm_scratch: str | None = None,
-                     spm_chi0_active=None, say=print, record=None):
+                     spm_chi0_active=None, in_scattering: str = "populations",
+                     rate_intermediates: str = "all", say=print, record=None):
     """The held collision term at t0 and its refresh hook (§1.5, §7.1), GN-PPM or shared pole.
 
     Parameters
@@ -1612,12 +1619,23 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     spm_scratch : ``"shared_pole"`` only: the refits' model directory (required).
     spm_chi0_active : ``"shared_pole"`` only: :func:`spm_screening`'s ``chi0_active``
         (None: one rule on all pairs; ``(a0, a1)``: chi0 as four blocks).
+    in_scattering : :data:`IN_SCATTERINGS`, ``sweep = "active"`` for ``"full"``: the
+        active part's internal line is the populations (diag rho, the incumbent) or the
+        full window rho, hole rho_mn and particle (1 - rho)_mn with the symmetric energy
+        prescription (``window_sigma_c``'s ``rho``; td_agw_dynamical.md §1.5, Eq. 8a).
+        Every active sweep then runs on the pseudo-band carrier (its held session is
+        planned on it), at t0 on rho_eq.
+    rate_intermediates : :data:`RATE_INTERMEDIATES`, ``sweep = "active"`` for
+        ``"active"``: the rates G~> and G~< (both branches' widths) of every
+        intermediate band (the incumbent) or of the window's own; the frozen part then
+        enters S~ (the Hermitian part, Delta Sigma^h) only, so frozen populations, which
+        never update, are no particle source or sink of the window.
     say : the stdout line of each refresh; ``record`` (or None) gets each
         refresh's dict (the run log's section, the case scripts' tables).
 
     The instantaneous basis is the band basis (``dress = "none"``: U = 1, e =
-    eps^G of the run, f = diag rho of the window), the coherences are not in the
-    rates.  Every rate and table is per trial and per k on the propagator's k
+    eps^G of the run, f = diag rho of the window); the coherences are in the rates
+    with ``in_scattering = "full"`` only.  Every rate and table is per trial and per k on the propagator's k
     rows; the window Sigma runs one tau sweep per trial with both branches kept
     (``gw.ppm_sigma.window_sigma_c(branches=True)``).  Returns dict: ``diss`` the
     t0 :class:`tdagw.collision.Dissipator` (k-sharded), ``held`` the t0 held
@@ -1645,6 +1663,19 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     if check_full and sweep != "active":
         _refuse("dynsig_collision_check", "check_full with sweep = 'full'", "sweep = 'active'",
                 "the check compares the split refresh with the full one")
+    if in_scattering not in IN_SCATTERINGS:
+        _refuse("dynsig_collision_in_scattering", repr(in_scattering), " | ".join(IN_SCATTERINGS),
+                "pick one")
+    if rate_intermediates not in RATE_INTERMEDIATES:
+        _refuse("dynsig_collision_rate_intermediates", repr(rate_intermediates),
+                " | ".join(RATE_INTERMEDIATES), "pick one")
+    full_rho = in_scattering == "full"
+    active_rates = rate_intermediates == "active"
+    if (full_rho or active_rates) and (sweep != "active" or check_full):
+        _refuse("dynsig_collision_in_scattering", f"in_scattering = {in_scattering!r}, "
+                f"rate_intermediates = {rate_intermediates!r} with sweep = {sweep!r}"
+                + (", check_full" if check_full else ""), "sweep = 'active', no check_full",
+                "both act on the active part of the split sweep (the full sweep has no parts)")
     if screening not in COLLISION_SCREENINGS:
         _refuse("dynsig_collision_screening", repr(screening), " | ".join(COLLISION_SCREENINGS),
                 "pick one")
@@ -1704,12 +1735,17 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     def to_td(a):                         # bundle rows (nk, ...) -> TD rows
         return np.asarray(a)[bundle_of]
 
-    def window(f_bundle, plan, internal=None, *, at=None, keep=None, wc0=None, static=None):
-        """One window Sigma (both branches) at window populations f (bundle rows), poles ``at``."""
+    def window(f_bundle, plan, internal=None, *, at=None, keep=None, wc0=None, static=None,
+               rho=None):
+        """One window Sigma (both branches) at window populations f (bundle rows), poles ``at``.
+
+        ``rho`` (bundle rows, nk, nb, nb): the full-ρ internal line (active part only)."""
         t = time.perf_counter()
         st = dynamic if static is None else bool(static)
-        out = window_sigma_c(wfns, poles if at is None else at,
-                             dict(b_lo=int(b_lo), U=eye, e=e_g, f=f_bundle), plan, meta=meta,
+        w = dict(b_lo=int(b_lo), U=eye, e=e_g, f=f_bundle)
+        if rho is not None:
+            w["rho"] = rho
+        out = window_sigma_c(wfns, poles if at is None else at, w, plan, meta=meta,
                              mesh_xy=mesh, branches=True, static_limit=st,
                              internal=internal, keep_frozen=keep,
                              static_limit_wc0=(W0c if (spm and st and wc0 is None) else wc0))
@@ -1764,6 +1800,11 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
             gamma_ev=float(screening_gamma_ev))
         del poles_eq
 
+    def diag_rho(f_bundle):
+        """diag(f) as a window rho (bundle rows): the full-ρ line at populations alone."""
+        return np.einsum("ki,ij->kij", np.asarray(f_bundle, np.float64),
+                         np.eye(nb)).astype(np.complex128)
+
     held_parts, plans = {}, {}
     t_split = time.perf_counter()
     if sweep == "active":
@@ -1784,7 +1825,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         if frozen_plan == "window":
             window(f_b, plans["frozen"], "frozen")
         held_parts["frozen"] = window(f_b, plans["frozen"], "frozen")
-        window(np.full_like(f_b, 0.5), plans["active"], "active")
+        half_f = np.full_like(f_b, 0.5)
+        window(half_f, plans["active"], "active", rho=diag_rho(half_f) if full_rho else None)
         if keep is not None:
             plans["frozen_keep"] = window_sigma_plan(cfg, head=None, session={}, window_only=True)
             window(f_b, plans["frozen_keep"], "frozen", keep=keep, static=False)
@@ -1792,9 +1834,14 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                                                static=False)
     t_split = time.perf_counter() - t_split
 
-    def tables(out):
-        """The rates, S~ and the static-W limit of one window output, on the TD k rows."""
+    def tables(out, rates_of=None):
+        """The rates, S~ and the static-W limit of one window output, on the TD k rows.
+
+        ``rates_of``: the output whose branches give the rates (the active part, with
+        ``rate_intermediates = "active"``); S~ and the static limit stay ``out``'s."""
         g_out, g_in, s = window_branch_rates(out["branch_pair"])
+        if rates_of is not None:
+            g_out, g_in, _ = window_branch_rates(rates_of["branch_pair"])
         static = None
         if dynamic:
             idx = np.arange(nb)
@@ -1822,8 +1869,11 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
             out["static_limit"] = held_parts["frozen"]["static_limit"]
         return out, fz
 
-    def sweep_tables(f_bundle, at=None):
-        """The refresh's window Sigma at window populations f (bundle rows), poles ``at``."""
+    def sweep_tables(f_bundle, at=None, rho=None):
+        """The refresh's window Sigma at window populations f (bundle rows), poles ``at``.
+
+        ``rho`` (bundle rows): the window's density matrix, read with ``in_scattering =
+        "full"`` (None: diag f, the populations' state)."""
         if sweep == "full":
             return full_sweep(f_bundle, at=at)
         extra = {}
@@ -1831,12 +1881,16 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         if at is not None:
             frozen, fz = frozen_part(f_bundle, at)
             extra = dict(frozen_s=fz["wall_s"], frozen_nodes=_sweep_nodes(fz))
+        r_in = None
+        if full_rho:
+            r_in = diag_rho(f_bundle) if rho is None else rho
         act = window(f_bundle, plans["active"], "active", at=at,
-                     wc0=None if at is None else W0c)
+                     wc0=None if at is None else W0c, rho=r_in)
         scratch["act"] = act
         out = add_window_parts(frozen, act)
         out["wall_s"] = act["wall_s"] + extra.get("frozen_s", 0.0)
-        return dict(tables(out), nodes=_sweep_nodes(act), active_s=act["wall_s"], **extra)
+        return dict(tables(out, rates_of=act if active_rates else None),
+                    nodes=_sweep_nodes(act), active_s=act["wall_s"], **extra)
 
     put = lambda a: tp.place_window_blocks(a, mesh, nk_pad)
     stack = lambda key, parts: np.stack([p[key] for p in parts]) * half
@@ -1885,7 +1939,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
             np.swapaxes(eq["g_in"], -1, -2)))).min() * ry_mev),
         c_eq_diag=float(res["c_eq_diag"]), c_eq_offdiag=float(res["c_eq_offdiag"]),
         trace=[float(v) for v in np.asarray(res["trace"])], form=form, hermitian=hermitian,
-        sweep=sweep, nodes=eq["nodes"],
+        sweep=sweep, nodes=eq["nodes"], in_scattering=in_scattering,
+        rate_intermediates=rate_intermediates,
         frozen=(None if not held_parts else dict(
             nodes=_sweep_nodes(held_parts["frozen"]), wall_s=held_parts["frozen"]["wall_s"],
             setup_s=t_split)), screening=screening, screen_eq=screen_eq)
@@ -1900,7 +1955,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     state = dict(t_last=0.0, f_last=np.broadcast_to(f_td, (ntr, nk, nb)).copy(), n=0,
                  trace_last=np.asarray(res["trace"]).copy(), history=[receipt],
                  held_max_mev=0.0, valid_prev=[None] * ntr)
-    line = (f"  collision t0     : {form}, hermitian {hermitian}; rates at rho_eq: diag "
+    line = (f"  collision t0     : {form}, hermitian {hermitian}, in-scattering {in_scattering}, "
+            f"rate intermediates {rate_intermediates}; rates at rho_eq: diag "
             f"out [{receipt['rate_out_diag_mev'][0]:.3g}, {receipt['rate_out_diag_mev'][1]:.3g}] meV, "
             f"in [{receipt['rate_in_diag_mev'][0]:.3g}, {receipt['rate_in_diag_mev'][1]:.3g}] meV, "
             f"min eig G~ {receipt['min_rate_mev']:.3g} meV (G~> {receipt['min_eig_out_mev']:.3g}, "
@@ -1933,11 +1989,16 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         if not due:
             return None
         t1 = time.perf_counter()
+        rho_h = np.asarray(gather_to_host(rho))[:, :nk] if full_rho else None
         parts, f_rows, screens, poles_now = [], [], [], []
         for tr in range(ntr):
             fb = np.empty((kb_frac.shape[0], nb))
             fb[bundle_of] = f[tr]
             f_rows.append(fb)
+            rb = None
+            if full_rho:
+                rb = np.empty((kb_frac.shape[0], nb, nb), np.complex128)
+                rb[bundle_of] = rho_h[tr]
             at = None
             if screening == "shared_pole":       # two slots per trial: this refresh's and the last
                 at, srec = spm_refit(scr, fb, label=f"s{(state['n'] + 1) % 2}t{tr}")
@@ -1948,14 +2009,15 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                 state["valid_prev"][tr] = at.valid_mask_q
                 screens.append(srec)
                 poles_now.append(at)
-            parts.append(sweep_tables(fb, at=at))
+            parts.append(sweep_tables(fb, at=at, rho=rb))
             if check_truncation:
                 fz = window(fb, plans["frozen"], "frozen", at=at, static=False)
                 whole = dict(fz)
                 if "static_limit" in held_parts["frozen"]:
                     whole["static_limit"] = held_parts["frozen"]["static_limit"]
-                alt = dict(tables(add_window_parts(whole, scratch["act"])), nodes=_sweep_nodes(fz),
-                           wall_s=fz["wall_s"])
+                alt = dict(tables(add_window_parts(whole, scratch["act"]),
+                                  rates_of=scratch["act"] if active_rates else None),
+                           nodes=_sweep_nodes(fz), wall_s=fz["wall_s"])
                 parts[-1]["_truncation"] = alt
         t2 = time.perf_counter()
         g_out, g_in = put(stack("g_out", parts)), put(stack("g_in", parts))
@@ -2073,4 +2135,5 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     return dict(diss=res["diss"], held=held0, refresh=refresh, t0=receipt, state=state,
                 c_eq=c_eq, rates_eq=(g_out_eq, g_in_eq), sweep=sweep_tables, program=program,
                 eq=eq, bundle_of=bundle_of, parts=held_parts, plans=plans, screening=scr,
-                window=window, tables=tables, keep=keep, rebase=rebase, W0c=W0c, poles=poles)
+                window=window, tables=tables, keep=keep, rebase=rebase, W0c=W0c, poles=poles,
+                in_scattering=in_scattering, rate_intermediates=rate_intermediates)

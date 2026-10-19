@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-19 — TD-aGW collision: full-ρ in-scattering, active rate intermediates (opt-in)
+
+Two `[lorrax]` keys of the split refresh (`collision_refresh_sweep = "active"`);
+with both unset results are unchanged and the run fingerprint is unchanged.
+
+- **`collision_in_scattering = "full"`** (default `"populations"`): the active
+  part's internal line is the window's whole ρ (hole ρ_mn, particle (1 − ρ)_mn,
+  symmetric ½ g(ε_m) + ½ g(ε_n); [TD-aGW dynamical §1.5, Eq. 8a](docs/theory/td_agw_dynamical.md#damping)),
+  swept on 2 n_A pseudo-bands after the window. `gw.ppm_sigma.window_sigma_c`
+  takes an optional `window["rho"]` (instantaneous basis, `internal = "active"`
+  only); `_population_branches`, `compute_sigma_c_ppm_omega_grid` and the
+  shared-pole window run take explicit particle weights.
+- **`collision_rate_intermediates = "active"`** (default `"all"`): the rates
+  G~> and G~< use the window's own intermediate states; the frozen part keeps
+  only its Hermitian contribution.
+- With both on, Σ_k Tr C[ρ] = 0 for any Hermitian ρ up to the τ-quadrature
+  tolerance when W is reciprocal (`tests/test_tdagw_collision_fullrho.py`).
+
 ## 2026-10-18 — TD-aGW collision term on main: split refresh, refreshed GN-PPM screening
 
 The on-shell collision term of TD-aGW (`[lorrax] collision`, [TD-aGW dynamical

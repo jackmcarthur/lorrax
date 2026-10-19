@@ -93,6 +93,8 @@ TD_DEFAULTS = {
     "lorrax.collision_rebase": "auto",
     "lorrax.collision_spm_support_sites_ev": "",
     "lorrax.collision_spm_chi0_active": None,
+    "lorrax.collision_in_scattering": "populations",
+    "lorrax.collision_rate_intermediates": "all",
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -119,6 +121,11 @@ COLLISION_REFRESH_SWEEPS = ("full", "active")
 COLLISION_SCREENINGS = ("frozen", "refreshed", "shared_pole")
 #: ``lorrax.collision_rebase``: C[rho_eq] on the refreshed W (``auto``: on for shared_pole).
 COLLISION_REBASE = ("auto", "on", "off")
+#: ``lorrax.collision_in_scattering``: the rates' internal line (``tdagw.dynsig.IN_SCATTERINGS``).
+COLLISION_IN_SCATTERINGS = ("populations", "full")
+#: ``lorrax.collision_rate_intermediates``: the rates' intermediate bands
+#: (``tdagw.dynsig.RATE_INTERMEDIATES``).
+COLLISION_RATE_INTERMEDIATES = ("all", "active")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
 #: Sample names the driver keeps for its own per-chunk record (``tdagw.propagate.PROGRESS``);
@@ -239,6 +246,17 @@ def _check_collision(vals: dict) -> None:
                         "'auto' or [a0, a1], two integers 0 <= a0 < a1 (0-based W-carrier bands)",
                         "set [lorrax] collision_spm_chi0_active or leave it unset")
         vals["lorrax.collision_spm_chi0_active"] = [int(n) for n in ca]
+    for key, allowed in (("lorrax.collision_in_scattering", COLLISION_IN_SCATTERINGS),
+                         ("lorrax.collision_rate_intermediates", COLLISION_RATE_INTERMEDIATES)):
+        if vals[key] not in allowed:
+            raise _gate("td_collision", f"{key.split('.')[1]} = {vals[key]!r}", " | ".join(allowed),
+                        f"set [lorrax] {key.split('.')[1]}")
+        if (vals[key] != allowed[0]
+                and vals["lorrax.collision_refresh_sweep"] != "active"):
+            raise _gate("td_collision", f"{key.split('.')[1]} = {vals[key]!r} with "
+                        f"collision_refresh_sweep = {vals['lorrax.collision_refresh_sweep']!r}",
+                        "collision_refresh_sweep = 'active'",
+                        "it acts on the active part of the split sweep")
     for key in ("lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"):
         try:
             ok = float(vals[key]) >= 0.0
@@ -555,7 +573,8 @@ def inactive_keys(deck) -> dict:
           "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
           "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev",
           "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev",
-          "lorrax.collision_spm_chi0_active"),
+          "lorrax.collision_spm_chi0_active", "lorrax.collision_in_scattering",
+          "lorrax.collision_rate_intermediates"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
         (("lorrax.collision_spm_support_sites_ev", "lorrax.collision_spm_chi0_active"),
          v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "shared_pole",
@@ -960,6 +979,28 @@ TD_KEY_DOCS = {
         "replacing the production ladder re-resolved at every state; the equilibrium "
         "model is then refitted on this set at t0 and is the run's reference (its "
         "difference from the source's model is in the t0 line).",
+        ("td_collision",)),
+    "lorrax.collision_in_scattering": (
+        "= populations", "With `collision_refresh_sweep = active` for `full`: the internal "
+        "line of the active part's rates. `populations`: the band populations f = diag ρ "
+        "(hole f_m, particle 1 − f_m), the coherences of ρ are not in the rates. `full`: the "
+        "window's whole ρ, hole ρ_mn and particle (1 − ρ)_mn, with the symmetric energy "
+        "prescription ½ g(ε_m) + ½ g(ε_n) of each off-diagonal pair "
+        "([td_agw_dynamical.md §1.5, Eq. 8a](theory/td_agw_dynamical.md)); it is swept on "
+        "2 n_A pseudo-bands ψ_A(1 ± R) after the window (R the off-diagonal part of ρ), so "
+        "the active sweep runs over 3 n_A intermediate states, and at a diagonal ρ it is "
+        "`populations` to rounding. The frozen part is unchanged (its populations never "
+        "change).",
+        ("td_collision",)),
+    "lorrax.collision_rate_intermediates": (
+        "= all", "With `collision_refresh_sweep = active` for `active`: the intermediate "
+        "bands of the dissipative rates G~> and G~< (both branches' widths). `all`: every "
+        "band of the Σ sum. `active`: the window's own; the frozen bands' part then enters "
+        "S~, the Hermitian part (ΔΣ^h, and under refreshed W its change), only. Frozen "
+        "populations never update, so their transitions into the window (energy-forbidden "
+        "at T = 0, alive only in the η tails) are a particle source or sink; with "
+        "`active` and a closed window Σ_k Tr C[ρ] = 0 holds to rounding for "
+        "`in_scattering = full`.",
         ("td_collision",)),
     "lorrax.collision_spm_chi0_active": (
         "= one rule on every pair", "With `collision_screening = shared_pole`: `auto` or `[a0, a1]`, "

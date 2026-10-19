@@ -524,6 +524,54 @@ $\max|\delta f|\ge10^{-3}$; $E_g$ = 3.37 eV, the 07 arm's QP gap):
   modes turn invalid and the smallest rate eigenvalue reaches −1.8 eV: outside
   the member's range.
 
+**Full-ρ in-scattering and active rate intermediates (2026-10-19, opt-in).**
+Two deck keys change the rates of the split refresh (`collision_refresh_sweep =
+active`); both default to the incumbent.
+
+* `collision_in_scattering = full`. The internal line of the active part is the
+  window's whole density matrix in the instantaneous basis, $\rho'=U^\dagger\rho U$
+  ($U=1$ with dress none): hole $\rho'_{mn}$, particle $(1-\rho')_{mn}$, each
+  off-diagonal pair at the symmetric prescription
+  $$
+  G_{\rm int}=\Psi'\,\tfrac12\{g(\epsilon),M\}\,\Psi'^\dagger,\qquad
+  M=\rho'\ \text{(hole)},\ 1-\rho'\ \text{(particle)}, \tag{8a}
+  $$
+  i.e. $\tfrac12[g(\epsilon_m)+g(\epsilon_n)]$ for $M_{mn}$ (owner's ruling). With
+  $M=D+R$ ($D$ diagonal), the off-diagonal part is carried by $2n_A$ pseudo-bands
+  $\chi^\pm=\Psi'(1\pm R)$ at the energies of their parent columns, inserted after
+  the window inside the Σ window, with weights $\pm\tfrac14$ (hole) and
+  $\mp\tfrac14$ (particle): $\tfrac14(\chi^+_m\chi^{+\dagger}_m-\chi^-_m\chi^{-\dagger}_m)
+  =\tfrac12(\psi_m\tilde y_m^\dagger+\tilde y_m\psi_m^\dagger)$, $\tilde y_m=\sum_n\psi_n R_{nm}$.
+  The executor is unchanged (signed band weights; the particle weights are passed
+  explicitly, `_population_branches(particle_weights=)`), and because the
+  pseudo-bands lie inside the Σ window the occupied projector of the static terms
+  (the static limit subtracted from ΔΣ^h) is $\Psi'\rho'\Psi'^\dagger$ too. The
+  active sweep runs over $3n_A$ intermediate states and $b_{\rm hi}+2n_A$ external
+  rows; at a diagonal $\rho'$ it is the populations' sweep to rounding. The
+  natural-orbital route (rotating the carrier to the eigenvectors of $\rho'$) is
+  not used: it has no energy for the internal line.
+* `collision_rate_intermediates = active`. $\tilde\Gamma^>$ and $\tilde\Gamma^<$
+  take the window's own intermediate states only; the frozen part enters
+  $\tilde\Sigma$, the Hermitian part (ΔΣ^h, and under refreshed $W$ its change),
+  only. Frozen populations never update, so their η-tail transitions into the
+  window are a particle source or sink.
+* **Particle number.** With both keys the window is closed and
+  $\sum_k\mathrm{Tr}\,C[\rho]=0$ for any Hermitian $\rho$ when $W^<(q)=W^>(-q)^{\rm T}$
+  (pole form: $R_-(q)=R_+(-q)^{\rm T}$, $\Omega(q)=\Omega(-q)^{\rm T}$): the
+  in-scattering of $k$ from $k-q$ and the out-scattering of $k-q$ into $k$ carry
+  the same symmetric energy factor $\tfrac14\sum_{x\in\{i,j\},y\in\{m,n\}}
+  L(e_x-\epsilon_y+\Omega)$. A left-index prescription $g(\epsilon_m)$ breaks it.
+  CPU gates (`tests/test_tdagw_collision_fullrho.py`, GN-PPM synthetic magnet, 2v2c
+  window, random Hermitian ρ with spectrum in [0, 1]): diagonal ρ == populations
+  to 2.8×10⁻¹⁶; both branches == the dense full-ρ reference to 1.1×10⁻⁸;
+  covariance $U^\dagger\tilde\Gamma[\rho]U=\tilde\Gamma'[U^\dagger\rho U]$ at a unitary
+  mixing degenerate states to 9×10⁻¹⁵ (populations alone: 3×10⁻²). Trace residual
+  relative to the out-flux, on the fixture's poles made reciprocal: 2.5×10⁻⁸ (code,
+  quadrature ε 10⁻⁷) and 3×10⁻¹⁶ (dense); left-index 0.34; populations + active
+  5.6×10⁻²; full + all 0.18; populations + all 0.22. The fixture's own GN fit
+  violates reciprocity at O(1) (residues 0.76, poles 0.70 relative), which leaves
+  3.0×10⁻² for code and dense alike.
+
 ### 1.6 The active space: band window or disentangled subspace (proposed) {#active-space}
 
 The split refresh of §1.5 uses the window as the active space of the
