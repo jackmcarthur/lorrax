@@ -31,9 +31,12 @@ RNG = np.random.default_rng(23)
 
 
 def _mesh():
-    if len(jax.devices()) < 4:
-        pytest.skip("needs 4 host devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
-    return Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    # The CPU clause: an emulated 2x2 HOST mesh, also inside a GPU process (`lx test`), where
+    # jax.devices() are CUDA devices and SlabIO's serial (emulation) tier refuses them.
+    cpu = jax.devices("cpu")
+    if len(cpu) < 4:
+        pytest.skip("needs 4 host CPU devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    return Mesh(np.array(cpu[:4]).reshape(2, 2), ("x", "y"))
 
 
 # ---------------------------------------------------------------------------
