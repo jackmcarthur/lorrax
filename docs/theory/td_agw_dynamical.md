@@ -233,8 +233,8 @@ recipe is re-resolved at that state's census (`bind_shared_pole_census` +
 fractional occupations at every complex support natively (the metallic route,
 item 3), same-side pairs exact at $z\neq0$; no support is at $z=0$, so no
 principal value enters. Eq. (6) is not used: the bank's Dyson solve is the
-run's, with $v$. The head is frozen (the refit's `head_correction = off`; the
-window Σ adds the run's head). At $\rho^{\rm eq}$ the refit is bitwise the run's
+run's, with $v$. The refit's bank carries no head (`head_correction = off`); the
+window Σ adds the run's head, frozen or refit (**Head** below). At $\rho^{\rm eq}$ the refit is bitwise the run's
 model (§6.1). The static limit subtracted from $\Delta\Sigma^{\rm h}$ is the
 equilibrium model's own $W^c(0)$ (`gw.mpa.sigma.shared_pole_static_wc`; it
 differs from the Dyson $W_0$ of the TD model's $K\delta\rho$ by the model's
@@ -256,11 +256,42 @@ pole (V3) leaves 18–28% of the hot state's change of $W^c$ at the fit sites
 (V1 target; 48–69% for V2′) and needs negative scales: the poles must move,
 so the refresh refits them.
 
-**Head.** The prototype keeps the run's $W_h$ (band-diagonal SX/COH shifts,
-[static head](four-current-head-corrections.md#static-head)) frozen: $\delta\chi_0$
-carries no $q\to0$ head. The head change is $q\cdot\delta S\cdot q$ from the
-window's dipoles and populations (the `qsgw_head` route), plus a Drude term
-once carriers exist (§4).
+**Head.** With `collision_spm_head = frozen` (the default) the refreshes keep the
+run's $W_h$ (band-diagonal SX/COH shifts,
+[static head](four-current-head-corrections.md#static-head)): $\delta\chi_0$
+carries no $q\to0$ head. With `refit` (shared pole, `head_correction =
+no_local_fields` source) each refresh refits the head at the populations
+(`tdagw.dynsig.spm_head_refit`, `gw.qsgw_head.population_head_response`):
+$$
+S(z;f)=S(z;f^{\rm eq})+S(z;\delta f)+\frac{D(\delta f)}{z^{2}}\quad(z\neq0),\qquad
+\delta f=f-f^{\rm eq},
+$$
+with $S(z;\delta f)$ the run's direct tensor on the signed pair weights (Pauli
+blocking of the interband pairs, and the window's own pairs) and $D$ the
+carriers' Drude tensor, the k·p band curvature $\sum_{nk}\delta f_{nk}\,
+\partial^2E_{nk}/\partial k_a\partial k_b$ (the diamagnetic $2\delta_{ab}$ plus
+the interband sum over the head velocities; $\partial^2V_{\rm NL}/\partial k^2$
+dropped), normalized as $S$. It is not $-\partial f/\partial E$: the
+populations are not thermal. The run's $q=0$ cell average and pole fit then
+give the head the window Σ reads. The exact $z=0$ slot keeps the interband
+$S(0;f)$: the Drude term is the $\omega\to0$ limit taken after $q\to0$, and a
+non-thermal population has no Thomas–Fermi slot. The fit pins its $z=0$
+sample, so on shell the head is $(\tfrac12-f)W^c_h(0;t)/(\Omega N_k)$, real,
+and the carriers' Drude weight enters only the off-shell samples. The static
+limit subtracted from $\Delta\Sigma^{\rm h}$ keeps the run's head
+(`gw.ppm_sigma.window_sigma_c(static_limit_head=...)`; the refit's own would
+cancel it), so $\Delta\Sigma^{\rm h}$ gains
+$(\tfrac12-f)[W^c_h(0;t)-W^c_h(0;{\rm eq})]/(\Omega N_k)$ on the diagonal and
+no rates. At $\rho^{\rm eq}$ the refit reuses the run's response object and is
+bitwise the run's head (checked at t0, `GATE dynsig_spm_head_eq`). The refresh
+lines add $W^c_h(0)$ with and without the Drude term, $D$ and the in-plane
+$\omega_p$ of the electrons and holes, and a quasi-equilibrium bound: the 2D
+static screening wavevector the carriers would have if thermalized at their
+mean excess energy $T$, $q_s=2\pi e^2 n f_{\max}/(T[-\ln(1-f_{\max})])$ per
+species, the factor by which it would reduce $\langle W(0)\rangle$ on the $q=0$
+cell (a disc of the cell's area, slab Coulomb, the state's interband
+$\varepsilon$), and the gap shift that implies. The bound is a diagnostic,
+outside the propagation.
 
 ### 1.5 The on-shell collision term {#damping}
 
@@ -997,9 +1028,12 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    decodes onto the encode's band set (the prototype decodes 160×160 to keep
    4×4). Change: separate encode (all bands) and decode (window) faces.
 7. **Head of $\delta\chi_0$.** `qsgw_head.build_dft_head_response` (:4175)
-   builds the head from the DFT state. Change: the window's
-   $q\cdot\delta S\cdot q$ from its dipoles and populations, plus the Drude term
-   of carriers ([self-consistency §7](../self_consistency.md#7-metals)).
+   builds the head from the DFT state. Done for the shared-pole refresh
+   (`collision_spm_head = refit`, §1.4): $S(z;f^{\rm eq})+S(z;\delta f)$ from the
+   head velocities and populations, plus the carriers' band-curvature Drude
+   term at $z\neq0$ (`qsgw_head.population_head_response`). Open: the GN-PPM
+   `refreshed` member, and the folded (`head_correction = full`) and metallic
+   heads (refused).
 8. **In-jit refusals.** The prototype poisons ΔΣ with NaN and names the gate on
    the host (`dynsig.check_state`); the propagator should return the gate
    flags with each chunk.

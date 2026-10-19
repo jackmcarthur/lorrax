@@ -1459,7 +1459,249 @@ def spm_t0_line(screen_eq: dict) -> str:
                "NOT bitwise the run's" if cmp else "vs the run's on rank 0")
             + f", K {min(screen_eq['K'])}-{max(screen_eq['K'])}, supports "
             f"{'MOVED' if screen_eq['sites_moved'] else 'fixed'}"
-            + ("" if not c else f", Omega_min {c['omega_min_ev']:.3f} eV"))
+            + ("" if not c else f", Omega_min {c['omega_min_ev']:.3f} eV")
+            + ("" if not screen_eq.get("head") else
+               f"; head refit at rho_eq "
+               f"{'bitwise' if screen_eq['head']['bitwise'] else 'NOT bitwise'} the run's head "
+               f"(W^c_h(0) {screen_eq['head']['wc0'].real:.6g} Ry bohr^3, <v> "
+               f"{screen_eq['head']['vc0'].real:.6g}; {screen_eq['head']['refit_s']:.2f} s)"))
+
+
+# ===========================================================================
+# The q -> 0 head of the shared-pole member at the populations (§1.4 "Head", §9 item 7)
+# ===========================================================================
+
+#: ``window_collision``'s head (``[lorrax] collision_spm_head``): the run's head throughout,
+#: or the head of the instantaneous populations refit at every refresh.
+SPM_HEADS = ("frozen", "refit")
+
+
+def spm_head_context(source: dict, *, mesh: Mesh, b_lo: int, n_active: int) -> dict:
+    """The held objects of the head refit: the run's direct head response, velocity and plan.
+
+    The source's head (``head_correction = no_local_fields``: the direct tensor S(z)
+    of ``gw.qsgw_head.build_dft_head_response`` on the MPA head plan, averaged over the
+    q = 0 cell and fitted by ``gw.shared_pole_head.build_shared_pole_head``) is taken
+    at its seams (the W stage's ``iteration_head_response`` and ``mpa_plan``); the
+    head velocity is rebuilt once by the run's own route
+    (``read_authenticated_dipole_velocity`` + ``qp_velocity`` at DeltaH = 0) from the
+    source's ``dipole.h5``.  Refuses a folded (``full``) or metallic head, and a Sigma
+    carrier whose chi0-manifold energies or occupations differ from the W carrier's
+    (the populations are written on the W carrier's table, the head reads the Sigma
+    carrier's).  Collective: every process calls it.
+    """
+    from gw.gw_config import HeadCorrection
+    from gw.qsgw_head import _head_bvec, qp_velocity, read_authenticated_dipole_velocity
+    inp = source.get("screening_inputs")
+    if inp is None:
+        _refuse("dynsig_spm_head_source", "a source without the run's W-stage inputs",
+                "gw_window_source(..., screening=True) on a shared-pole deck",
+                "rebuild the source with screening=True")
+    kw = inp["kwargs"]
+    config, meta, wfn = inp["config"], inp["meta"], kw["wfn"]
+    mode = getattr(config.head.correction, "value", config.head.correction)
+    if config.head.correction is not HeadCorrection.NO_LOCAL_FIELDS:
+        _refuse("dynsig_spm_head_mode", f"head_correction = {mode}",
+                "no_local_fields (the direct head; a folded or Thomas-Fermi head is not refit)",
+                "use collision_spm_head = frozen")
+    resp, plan = kw.get("iteration_head_response"), kw.get("mpa_plan")
+    if resp is None or plan is None or source.get("head") is None:
+        _refuse("dynsig_spm_head_source", "no direct head response, head plan or head in the source",
+                "a one-shot shared-pole source with head_correction = no_local_fields",
+                "use collision_spm_head = frozen")
+    if (resp.Y_x is not None or resp.drude_tensor is not None
+            or resp.static_kappa2_bohr2 is not None):
+        _refuse("dynsig_spm_head_mode", "a folded or metallic head response",
+                "the direct insulating response", "use collision_spm_head = frozen")
+    b0, nb = int(meta.b_id_0), int(meta.b_id_4_chi_user) - int(meta.b_id_0)
+    if b0 != 0:
+        _refuse("dynsig_spm_head_bands", f"head manifold from band {b0}", "every band from 0",
+                "run the source on the full band set")
+    host = lambda a: np.asarray(jax.device_get(a), np.float64)
+    e, f_eq = host(source["wfns"].enk)[:, :nb], host(source["wfns"].occ)[:, :nb]
+    e_w, f_w = host(inp["wfns"].enk)[:, :nb], host(inp["wfns"].occ)[:, :nb]
+    if e.shape != e_w.shape or not (np.array_equal(e, e_w) and np.array_equal(f_eq, f_w)):
+        _refuse("dynsig_spm_head_carriers", "the Sigma and W carriers' chi0-manifold tables differ",
+                "one k order and band axis", "run the shared-pole source on an identity-only grid")
+    win = slice(int(b_lo), int(b_lo) + int(n_active))
+    if win.stop > nb:
+        _refuse("dynsig_spm_head_bands", f"window [{win.start}, {win.stop})",
+                f"inside the head manifold [0, {nb})", "widen number_bands_chi")
+    velocity = qp_velocity(read_authenticated_dipole_velocity(
+        os.path.join(source["workdir"], "dipole.h5"), wfn=wfn, meta=meta, config=config,
+        mesh=mesh), jnp.asarray(f_eq), mesh=mesh, nb_logical=nb).dft_cart
+    bvec = np.asarray(_head_bvec(wfn), np.float64)
+    return dict(response=resp, plan=plan, velocity=velocity, e=e, f_eq=f_eq, nb=nb, win=win,
+                mesh=mesh, meta=meta, config=config, wfn=wfn, wfns=source["wfns"],
+                handle=source["model"], V_q=inp["V_q"], material_class=kw.get("material_class"),
+                head0=source["head"], nk=int(meta.nk_tot), cell_volume=float(meta.cell_volume),
+                nspin=int(wfn.nspin), nspinor=int(meta.nspinor_wfnfile),
+                eta_ry=float(config.head.wcoul0_eta), bvec=bvec)
+
+
+def _head_static(head: dict) -> complex:
+    """W^c_h(0) = -2 sum_p B_p/Omega_p of a scalar head fit (Ry bohr^3): its on-shell value."""
+    om = np.asarray(head["Omega_p"], np.complex128).reshape(-1)
+    b = np.asarray(head["B_p"], np.complex128).reshape(-1)
+    return complex(-2.0 * np.sum(b / om)) if om.size else 0.0j
+
+
+def spm_head_refit(hctx: dict, f_full, *, drude: bool = True):
+    """The q -> 0 head of the W-carrier population table ``f_full`` (nk, nb_W).
+
+    S(z; f) = the run's S(z; f_eq) + S(z; f - f_eq) + D(f - f_eq)/z^2 at z != 0
+    (``gw.qsgw_head.population_head_response``; ``drude`` False drops D), then the run's
+    own cell average and MPA fit on the run's plan
+    (``gw.shared_pole_head.build_shared_pole_head``, response route).  The fit pins
+    its z = 0 sample, so on shell the head is (1/2 - f) W^c_h(0)/(Omega N_k) with
+    W^c_h(0) the interband static head of f.  ``f = f_eq`` reuses the run's response
+    object: the head is the run's bitwise.  Collective.
+
+    Returns (head, rec): ``head`` the run's ``HeadSigmaDiag`` with the refit poles and
+    residues; ``rec`` the walls, the Drude tensor added, W^c_h(0) of the fit and of
+    the static sample, <v> and the samples (z, W^c).
+    """
+    import time
+    from gw.qsgw_head import population_head_response
+    from gw.shared_pole_head import build_shared_pole_head
+    t0 = time.perf_counter()
+    f = np.asarray(f_full, np.float64)[:, :hctx["nb"]]
+    resp, parts = population_head_response(
+        hctx["response"], hctx["velocity"], hctx["e"], hctx["f_eq"], f, mesh=hctx["mesh"],
+        nb_logical=hctx["nb"], cell_volume=hctx["cell_volume"], nk_tot=hctx["nk"],
+        nspin=hctx["nspin"], nspinor=hctx["nspinor"], eta_ry=hctx["eta_ry"], drude=drude)
+    t1 = time.perf_counter()
+    head, samples = build_shared_pole_head(
+        hctx["handle"], None, hctx["V_q"], hctx["wfns"], hctx["meta"], hctx["config"],
+        mesh_xy=hctx["mesh"], wfn=hctx["wfn"], response=resp, head_resolver=None,
+        plan=hctx["plan"], material_class=hctx["material_class"], occupation_state=None)
+    t2 = time.perf_counter()
+    diag = dataclasses.replace(hctx["head0"],
+                               poles_ry=np.asarray(head["Omega_p"], np.complex128).reshape(-1),
+                               residues_ry=np.asarray(head["B_p"]).reshape(-1))
+    z = np.asarray(head["sample_z"], np.complex128).reshape(-1)
+    wc = np.asarray(head["sample_Wc"], np.complex128).reshape(-1)
+    s0 = int(np.argmin(np.abs(z)))
+    S0 = np.real(np.asarray(jax.device_get(resp.S_direct))[s0])
+    rec = dict(response_s=t1 - t0, fit_s=t2 - t1, changed=bool(parts["changed"]),
+               drude=np.asarray(parts["drude"]), wc_static=_head_static(head),
+               wc_sample0=complex(wc[s0]), vc0=complex(samples.samples[s0].vc0),
+               z=z, wc=wc, S0=S0, poles=np.asarray(head["Omega_p"], np.complex128).reshape(-1),
+               residues=np.asarray(head["B_p"], np.complex128).reshape(-1))
+    return diag, rec
+
+
+def _plain(o):
+    """A record's values as JSON-plain Python: complex -> [re, im], arrays -> lists."""
+    if isinstance(o, dict):
+        return {k: _plain(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_plain(x) for x in o]
+    if isinstance(o, (complex, np.complexfloating)):
+        return [float(np.real(o)), float(np.imag(o))]
+    if isinstance(o, np.ndarray):
+        return ([np.real(o).tolist(), np.imag(o).tolist()] if np.iscomplexobj(o) else o.tolist())
+    if isinstance(o, np.generic):
+        return o.item()
+    return o
+
+
+def _species_rows(f_eq, df):
+    """(electrons, holes) population changes: df on the run's empty (f_eq = 0) and full (1) states."""
+    return (np.where(f_eq == 0.0, df, 0.0), np.where(f_eq == 1.0, df, 0.0))
+
+
+def spm_head_diagnostics(hctx: dict, f_full, rec: dict, rec_bare: dict | None = None) -> dict:
+    """Diagnostics of one head refit (they do not enter the propagation).
+
+    * D(t) split into the electrons' and the holes' parts (the population changes on
+      the run's empty and full states), and omega_p = sqrt(8 pi eig D) in the plane (eV;
+      ``gw.qsgw_head.plasma_frequencies_ev``'s convention on the slab's in-plane block);
+    * W^c_h(0) of the refit with and without the dynamic Drude term (``rec_bare``: the
+      refit with ``drude=False``; equal to rounding, both pinned to the interband
+      static sample) and the run's;
+    * the quasi-equilibrium bound: the 2D static screening wavevector the carriers would
+      have if thermalized at their mean excess energy T (Ry), per species,
+      q_s = 2 pi e^2 n f_max / (T (-ln(1 - f_max))) (the 2D Fermi-Dirac dn/dmu at the
+      observed peak state occupation f_max: Debye 2 pi e^2 n/T for f_max -> 0, Thomas-
+      Fermi 2 pi e^2 N0 for f_max -> 1), and the factor by which it would reduce the
+      screened head <W(0)> on the q = 0 cell (a disc of the cell's area, the slab
+      Coulomb 8 pi/q^2 (1 - exp(-q z_c)), the interband eps(q) of the state's S(0)),
+      with the band-gap shift it would give on shell, Delta W^c / (Omega N_k).
+    Host, every rank (the inputs are replicated).
+    """
+    from common.units import RYD_TO_EV
+    from gw.qsgw_head import population_drude_tensor_sharded
+    f = np.asarray(f_full, np.float64)[:, :hctx["nb"]]
+    f_eq, e, nk, om = hctx["f_eq"], hctx["e"], hctx["nk"], hctx["cell_volume"]
+    df = f - f_eq
+    de, dh = _species_rows(f_eq, df)
+    v = hctx["velocity"]
+    pad = ((0, 0), (0, int(v.shape[-1]) - hctx["nb"]))
+    kw = dict(mesh=hctx["mesh"], nb_logical=hctx["nb"], cell_volume=om, nk_tot=nk,
+              nspin=hctx["nspin"], nspinor=hctx["nspinor"])
+    D_e = population_drude_tensor_sharded(v, np.pad(e, pad), np.pad(de, pad), **kw)
+    D_h = population_drude_tensor_sharded(v, np.pad(e, pad), np.pad(dh, pad), **kw)
+    inplane = lambda D: np.sqrt(np.maximum(8.0 * np.pi * np.linalg.eigvalsh(
+        0.5 * (D[:2, :2] + D[:2, :2].T)), 0.0)) * RYD_TO_EV
+    b = hctx["bvec"]
+    area_bz = float(abs(np.cross(b[0], b[1])[2]))
+    lz = 2.0 * np.pi / float(np.linalg.norm(b[2]))
+    area = om / lz
+    cap = 2.0 / (max(hctx["nspin"], 1) * max(hctx["nspinor"], 1))
+    empty, full = f_eq == 0.0, f_eq == 1.0
+    cbm, vbm = float(e[empty].min()), float(e[full].max())
+
+    def species(d, edge, sign):
+        w = np.abs(d)
+        n_cell = cap * float(w.sum()) / nk                       # carriers per cell
+        if n_cell <= 0.0:
+            return dict(n_cell=0.0, n_bohr2=0.0, T_ry=0.0, f_max=0.0, q_s=0.0)
+        T = float(np.sum(w * sign * (e - edge)) / w.sum())
+        fmax = float(min(w.max(), 1.0 - 1e-12))
+        n2 = n_cell / area
+        q_s = 4.0 * np.pi * n2 * fmax / (max(T, 1e-12) * (-np.log1p(-fmax)))   # 2 pi e^2, e^2 = 2
+        return dict(n_cell=n_cell, n_bohr2=n2, T_ry=T, f_max=fmax, q_s=q_s)
+
+    se, sh = species(de, cbm, +1.0), species(dh, vbm, -1.0)
+    q_s = se["q_s"] + sh["q_s"]
+    s0 = 0.5 * (rec["S0"][0, 0] + rec["S0"][1, 1])               # in-plane static interband S
+    q_c = np.sqrt(area_bz / (np.pi * nk))
+    x, wq = np.polynomial.legendre.leggauss(400)
+    q = 0.5 * q_c * (x + 1.0)
+    wq = 0.5 * q_c * wq * 2.0 * q / q_c ** 2                      # disc measure, normalized
+    vq = 8.0 * np.pi / q ** 2 * (1.0 - np.exp(-q * 0.5 * lz))
+    eps_i = 1.0 - vq * q ** 2 * s0
+    eps_c = eps_i + vq * q_s / (4.0 * np.pi * lz)
+    v_avg, w_i, w_c = (float(np.sum(wq * a)) for a in (vq, vq / eps_i, vq / eps_c))
+    dwc = w_c - w_i
+    gap_mev = dwc / (om * nk) * RYD_TO_EV * 1e3
+    return dict(
+        D_e=D_e.tolist(), D_h=D_h.tolist(), omega_p_e_ev=inplane(D_e).tolist(),
+        omega_p_h_ev=inplane(D_h).tolist(), omega_p_ev=inplane(D_e + D_h).tolist(),
+        wc0_drude=complex(rec["wc_static"]), wc0_sample=complex(rec["wc_sample0"]),
+        wc0_bare=None if rec_bare is None else complex(rec_bare["wc_static"]),
+        vc0=complex(rec["vc0"]),
+        qe=dict(electrons=se, holes=sh, q_s_bohr_inv=q_s, q_cell_bohr_inv=float(q_c),
+                lz_bohr=lz, area_bohr2=area, s0=float(s0),
+                disc_wc0_interband=w_i - v_avg, disc_v_avg=v_avg,
+                factor_screened_head=(w_c / w_i) if w_i else None,
+                dwc0=dwc, gap_shift_mev=gap_mev))
+
+
+def spm_head_line(d: dict, wc0_eq: complex) -> str:
+    """The head part of a refresh line: D, omega_p, W^c_h(0) and the quasi-equilibrium bound."""
+    from common.units import RYD_TO_EV
+    q = d["qe"]
+    wp = lambda xs: "/".join(f"{x:.3g}" for x in xs)
+    return (f"; head refit: W^c_h(0) {d['wc0_drude'].real:.6g} Ry bohr^3 (no Drude "
+            + ("n/a" if d["wc0_bare"] is None else f"{d['wc0_bare'].real:.6g}")
+            + f", run {complex(wc0_eq).real:.6g}), omega_p in-plane e {wp(d['omega_p_e_ev'])} h "
+            f"{wp(d['omega_p_h_ev'])} eV; QE bound (diagnostic): n_e {q['electrons']['n_cell']:.2e} "
+            f"n_h {q['holes']['n_cell']:.2e} /cell, T_e {q['electrons']['T_ry'] * RYD_TO_EV:.3f} "
+            f"T_h {q['holes']['T_ry'] * RYD_TO_EV:.3f} eV, q_s {q['q_s_bohr_inv']:.3e} bohr^-1 "
+            f"(q cell {q['q_cell_bohr_inv']:.3e}), <W(0)> x{(q['factor_screened_head'] or 0.0):.4f}, "
+            f"gap shift {q['gap_shift_mev']:+.2f} meV if statically screened")
 
 
 def window_branch_rates(tabs: dict):
@@ -1510,7 +1752,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                      check_truncation: bool = False, odd_same_side: bool = True,
                      screening_gamma_ev: float = 0.0, rebase: bool | None = None,
                      spm_support_sites: str = "", spm_scratch: str | None = None,
-                     spm_chi0_active=None, say=print, record=None):
+                     spm_chi0_active=None, spm_head: str = "frozen", say=print, record=None):
     """The held collision term at t0 and its refresh hook (§1.5, §7.1), GN-PPM or shared pole.
 
     Parameters
@@ -1573,6 +1815,15 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     spm_scratch : ``"shared_pole"`` only: the refits' model directory (required).
     spm_chi0_active : ``"shared_pole"`` only: :func:`spm_screening`'s ``chi0_active``
         (None: one rule on all pairs; ``(a0, a1)``: chi0 as four blocks).
+    spm_head : :data:`SPM_HEADS`, ``"shared_pole"`` only.  ``"frozen"``: the run's q -> 0
+        head throughout (the incumbent).  ``"refit"`` (§1.4 "Head", §9 item 7): every
+        refresh refits the head at the populations (:func:`spm_head_refit`: the run's
+        S(z; f_eq) + S(z; df) + D(df)/z^2 at z != 0, the run's cell average and fit), the
+        window Sigma reads that head, and the static limit subtracted from Delta Sigma^h
+        keeps the run's head (as the body keeps the equilibrium W^c(0)), so Delta
+        Sigma^h gains (1/2 - f) [W^c_h(0; t) - W^c_h(0; eq)]/(Omega N_k).  At rho_eq the
+        refit is the run's head bitwise (checked at t0).  Each refresh also logs the
+        diagnostics of :func:`spm_head_diagnostics` (they do not enter the propagation).
     say : the stdout line of each refresh; ``record`` (or None) gets each
         refresh's dict (the run log's section, the case scripts' tables).
 
@@ -1633,6 +1884,12 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     if check_truncation and frozen_bands is None:
         _refuse("dynsig_collision_check", "check_truncation without frozen_bands",
                 "frozen_bands", "the check compares the truncated frozen part with the whole")
+    if spm_head not in SPM_HEADS:
+        _refuse("dynsig_collision_spm_head", repr(spm_head), " | ".join(SPM_HEADS), "pick one")
+    if spm_head != "frozen" and screening != "shared_pole":
+        _refuse("dynsig_collision_spm_head", f"spm_head = {spm_head!r} with screening = "
+                f"{screening!r}", "screening = 'shared_pole'", "the head refit is the shared-pole "
+                "member's (its source carries the direct head response)")
     policy = C.RefreshPolicy() if policy is None else policy
     wfns, meta, poles, splan = source["wfns"], source["meta"], source["poles"], source["plan"]
     nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
@@ -1665,15 +1922,22 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     def to_td(a):                         # bundle rows (nk, ...) -> TD rows
         return np.asarray(a)[bundle_of]
 
-    def window(f_bundle, plan, internal=None, *, at=None, keep=None, wc0=None, static=None):
-        """One window Sigma (both branches) at window populations f (bundle rows), poles ``at``."""
+    def window(f_bundle, plan, internal=None, *, at=None, keep=None, wc0=None, static=None,
+               head=None):
+        """One window Sigma (both branches) at window populations f (bundle rows), poles ``at``.
+
+        ``head`` (a refit ``HeadSigmaDiag``, or None: the plan's) replaces the plan's head;
+        the static limit then keeps the run's head (``static_limit_head``).
+        """
         t = time.perf_counter()
         st = dynamic if static is None else bool(static)
+        pl = plan if head is None or plan.get("head") is None else dict(plan, head=head)
         out = window_sigma_c(wfns, poles if at is None else at,
-                             dict(b_lo=int(b_lo), U=eye, e=e_g, f=f_bundle), plan, meta=meta,
+                             dict(b_lo=int(b_lo), U=eye, e=e_g, f=f_bundle), pl, meta=meta,
                              mesh_xy=mesh, branches=True, static_limit=st,
                              internal=internal, keep_frozen=keep,
-                             static_limit_wc0=(W0c if (spm and st and wc0 is None) else wc0))
+                             static_limit_wc0=(W0c if (spm and st and wc0 is None) else wc0),
+                             static_limit_head=(plan.get("head") if pl is not plan else None))
         out["wall_s"] = time.perf_counter() - t
         return out
 
@@ -1692,6 +1956,23 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                          support_sites=scr["support_sites"],
                          model_vs_run=_model_payload_cmp(source["model"]["path"],
                                                          poles_eq["model"]["path"]))
+    hctx = head_eq_rec = None
+    if spm_head == "refit":
+        t_h = time.perf_counter()
+        hctx = spm_head_context(source, mesh=mesh, b_lo=int(b_lo), n_active=nb)
+        t_h1 = time.perf_counter()
+        head_eq, head_eq_rec = spm_head_refit(hctx, scr["f_eq"])
+        run_head = source["head"]
+        same = (np.array_equal(np.asarray(head_eq.poles_ry), np.asarray(run_head.poles_ry))
+                and np.array_equal(np.asarray(head_eq.residues_ry), np.asarray(run_head.residues_ry)))
+        screen_eq["head"] = dict(bitwise=bool(same), context_s=t_h1 - t_h,
+                                 refit_s=head_eq_rec["response_s"] + head_eq_rec["fit_s"],
+                                 wc0=float(np.real(head_eq_rec["wc_static"])),
+                                 wc0_imag=float(np.imag(head_eq_rec["wc_static"])),
+                                 vc0=float(np.real(head_eq_rec["vc0"])))
+        if not same:
+            _refuse("dynsig_spm_head_eq", "a head refit at rho_eq that is not the run's head bitwise",
+                    "the run's poles and residues", "the refit must reuse the run's response at f_eq")
     if spm:                                             # the model's own W^c(0) (owner ruling)
         from gw.mpa.sigma import shared_pole_static_wc
         from gw.ppm_sigma import fresh_shared_pole_capacity
@@ -1765,8 +2046,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                     static=None if static is None else to_td(static), raw=out,
                     wall_s=out["wall_s"])
 
-    def full_sweep(f_bundle, at=None):
-        out = window(f_bundle, splan, at=at, wc0=None if at is None else W0c)
+    def full_sweep(f_bundle, at=None, head=None):
+        out = window(f_bundle, splan, at=at, wc0=None if at is None else W0c, head=head)
         return dict(tables(out), nodes=_sweep_nodes(out))
 
     scratch = {}
@@ -1783,17 +2064,17 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
             out["static_limit"] = held_parts["frozen"]["static_limit"]
         return out, fz
 
-    def sweep_tables(f_bundle, at=None):
-        """The refresh's window Sigma at window populations f (bundle rows), poles ``at``."""
+    def sweep_tables(f_bundle, at=None, head=None):
+        """The refresh's window Sigma at window populations f (bundle rows), poles ``at``, head ``head``."""
         if sweep == "full":
-            return full_sweep(f_bundle, at=at)
+            return full_sweep(f_bundle, at=at, head=head)
         extra = {}
         frozen = held_parts["frozen"]
         if at is not None:
             frozen, fz = frozen_part(f_bundle, at)
             extra = dict(frozen_s=fz["wall_s"], frozen_nodes=_sweep_nodes(fz))
         act = window(f_bundle, plans["active"], "active", at=at,
-                     wc0=None if at is None else W0c)
+                     wc0=None if at is None else W0c, head=head)
         scratch["act"] = act
         out = add_window_parts(frozen, act)
         out["wall_s"] = act["wall_s"] + extra.get("frozen_s", 0.0)
@@ -1894,22 +2175,38 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         if not due:
             return None
         t1 = time.perf_counter()
-        parts, f_rows, screens, poles_now = [], [], [], []
+        parts, f_rows, screens, poles_now, heads_now, head_recs = [], [], [], [], [], []
+        head_s = 0.0
         for tr in range(ntr):
             fb = np.empty((kb_frac.shape[0], nb))
             fb[bundle_of] = f[tr]
             f_rows.append(fb)
-            at = None
+            at = head_t = None
             if screening == "shared_pole":       # two slots per trial: this refresh's and the last
                 at, srec = spm_refit(scr, fb, label=f"s{(state['n'] + 1) % 2}t{tr}")
                 screens.append(srec)
                 poles_now.append(at)
+                if hctx is not None:             # the head of the populations (§9 item 7)
+                    th = time.perf_counter()
+                    f_full = scr["f_eq"].copy()
+                    f_full[scr["rows"], scr["win"]] = fb
+                    head_t, hrec = spm_head_refit(hctx, f_full)
+                    td = time.perf_counter()
+                    head_s += td - th
+                    _, hbare = spm_head_refit(hctx, f_full, drude=False)          # diagnostic
+                    hd = spm_head_diagnostics(hctx, f_full, hrec, hbare)
+                    head_recs.append(_plain(dict(
+                        hd, line=spm_head_line(hd, screen_eq["head"]["wc0"]),
+                        refit_s=hrec["response_s"] + hrec["fit_s"], diag_s=time.perf_counter() - td,
+                        poles=hrec["poles"], residues=hrec["residues"], drude=hrec["drude"])))
+                heads_now.append(head_t)
             elif refreshed:
                 at, _, srec = screen_populations(scr, fb, valid_prev=state["valid_prev"][tr])
                 state["valid_prev"][tr] = at.valid_mask_q
                 screens.append(srec)
                 poles_now.append(at)
-            parts.append(sweep_tables(fb, at=at))
+                heads_now.append(None)
+            parts.append(sweep_tables(fb, at=at, head=head_t))
             if check_truncation:
                 fz = window(fb, plans["frozen"], "frozen", at=at, static=False)
                 whole = dict(fz)
@@ -1923,7 +2220,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         g_eq_now, rebase_s = (g_out_eq, g_in_eq), 0.0
         if rebase:
             tr0 = time.perf_counter()
-            eqs = [sweep_tables(f_b, at=p_) for p_ in poles_now]
+            eqs = [sweep_tables(f_b, at=p_, head=h_) for p_, h_ in zip(poles_now, heads_now)]
             g_eq_now = (put(stack("g_out", eqs)), put(stack("g_in", eqs)))
             rebase_s = time.perf_counter() - tr0
         t3 = time.perf_counter()
@@ -1956,6 +2253,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                                                 [float(out["c_eq_diag"]), float(out["c_eq_offdiag"])]))
         if screening == "shared_pole":
             rec.update(screen=spm_record(screens, screen_eq))
+            if head_recs:
+                rec["screen"]["head"] = dict(head_recs[0], head_s=head_s)
         elif refreshed:
             worst = lambda key: max(sr[key] for sr in screens)
             rec.update(screen=dict(
@@ -2006,6 +2305,8 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                 + (f" ({rec['nodes']['rebuilds']} rules rebuilt)" if rec["nodes"]["rebuilds"] else "")
                 + ("" if "screen" not in rec or screening != "shared_pole" else
                    spm_line(rec))
+                + ("" if "screen" not in rec or "head" not in rec["screen"] else
+                   f" (head {rec['screen']['head']['head_s']:.2f} s)" + rec["screen"]["head"]["line"])
                 + ("" if "screen" not in rec or screening == "shared_pole" else
                    f"; W(t): dchi0 {rec['screen']['dchi_s']:.2f} s, Dyson+fit "
                    f"{rec['screen']['fit_s']:.2f} s"
@@ -2034,4 +2335,5 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     return dict(diss=res["diss"], held=held0, refresh=refresh, t0=receipt, state=state,
                 c_eq=c_eq, rates_eq=(g_out_eq, g_in_eq), sweep=sweep_tables, program=program,
                 eq=eq, bundle_of=bundle_of, parts=held_parts, plans=plans, screening=scr,
-                window=window, tables=tables, keep=keep, rebase=rebase, W0c=W0c, poles=poles)
+                window=window, tables=tables, keep=keep, rebase=rebase, W0c=W0c, poles=poles,
+                head_ctx=hctx)

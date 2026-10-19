@@ -1866,7 +1866,8 @@ def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal
 def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omega_ry=None,
                    omit_frozen: bool = False, branches: bool = False,
                    static_limit: bool = False, internal: str | None = None,
-                   keep_frozen=None, static_limit_wc0=None, print_fn=None) -> dict:
+                   keep_frozen=None, static_limit_wc0=None, static_limit_head=None,
+                   print_fn=None) -> dict:
     """Sigma^c of a band window at an instantaneous state, from a pole model (Ry).
 
     docs/theory/td_agw_dynamical.md §1.2-1.5 (Eqs. 2-3, 8) and §9 item 5.  The GW
@@ -1933,6 +1934,11 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         ``gw.mpa.sigma.shared_pole_static_wc``).  A refreshed-screening collision term
         sweeps the poles of W(t) and subtracts the static limit of the run's W0, the
         part K drho already holds (td_agw_dynamical.md §7.1).
+    static_limit_head : with ``static_limit`` only: the ``head_correction.HeadSigmaDiag``
+        whose static value is the static limit's head part (default the plan's head).
+        A refreshed head (td_agw_dynamical.md §1.4 "Head") sweeps the head of the
+        state and subtracts the equilibrium head's static limit, as the body does with
+        ``static_limit_wc0``.
 
     Returns
     -------
@@ -2111,6 +2117,10 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         hole, particle, head_static = (
             _head_branch_rows(hr, table, win) if hr is not None else
             (np.zeros((nk, n_a)),) * 3)
+        if static_limit and static_limit_head is not None and hr is not None:
+            head_static = _head_branch_rows(replace(
+                static_limit_head, enk_ry=hr.enk_ry, occupations=hr.occupations,
+                efermi_ry=hr.efermi_ry), table, win)[2]
     if branches:
         from .mpa.sigma import BRANCH_SPACES
         tabs = {space: np.array(gather_to_host(block4(first(res.branches[space]).pair)))

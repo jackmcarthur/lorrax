@@ -33,6 +33,14 @@ Variants with the suffix B (V1B, V2B, V2PB) take the refits' chi0 in four blocks
      active bands --chi0-active (``collision_spm_chi0_active``); V2P is V2 with the imaginary
      sites --v2p-imag.  SP0 and SPC then also record the B model's W at the recipe sites
      against the run's model (rho_eq) and against the one-rule refit (the same state).
+Variants with the suffix H (V1H, V2PH, ...) refit the q -> 0 head at every state as well
+     (``collision_spm_head = refit``, td_agw_dynamical.md §1.4 "Head"): SP0 checks the head refit
+     at rho_eq against the run's head (bitwise), SPC records the head of each state (its samples
+     W^c_h(z) and eps^-1_h(z) = <W>/<v> with and without the Drude term, its poles, D and the
+     diagnostics of ``tdagw.dynsig.spm_head_diagnostics``) and the rates on W(state) with that head.
+SPH  per variant, the refit at rho_eq, the hot state and the --states files' peak / end
+     populations: the refit's gates (a refused refit is recorded by name, the section goes on),
+     the q = 0 census, and for H variants the head of the state (as in SPC)
 SV3  the V3 comparator at the hot state (rank 0, host): the equilibrium poles held,
      one residue scale per pole fitted to the V1 refit's W^c at its fit sites; the
      misfit at the fit and held sites against V1's and the weight it cannot place
@@ -89,7 +97,8 @@ def main():
     ap.add_argument("--cd-variants", default="V1")
     ap.add_argument("--cd-tag", default="")
     ap.add_argument("--eta-low", default="0.1,0.05", help="SPE: the lower etas (eV), each a rerun source")
-    ap.add_argument("--states", default="", help="SPE: glob of SPD states_*.npz files")
+    ap.add_argument("--states", default="", help="SPE, SPH: glob of SPD states_*.npz files")
+    ap.add_argument("--spf-variants", default="", help="SPF variants (default: --variants)")
     a = ap.parse_args()
     sections = set(a.sections.split(","))
 
@@ -188,8 +197,11 @@ def main():
                          a.v2_height if a.v2_height > 0 else None)
     sites = dict(V1="", V2=v2_text, V2P=v2p_text)
     sites.update({k + "B": v for k, v in list(sites.items())})
+    sites.update({k + "H": v for k, v in list(sites.items())})
     active = [int(x) for x in a.chi0_active.split(",")]
-    blocks_of = lambda V: active if V.endswith("B") else None
+    head_of = lambda V: V.endswith("H")
+    core = lambda V: V[:-1] if head_of(V) else V
+    blocks_of = lambda V: active if core(V).endswith("B") else None
     out["variants"] = sites
 
     # ---- the TD system of the window (the 07 bundle, deck route) ----
@@ -330,7 +342,7 @@ def main():
     variants = [v for v in a.variants.split(",") if v]
     if "SPD" in sections:          # the driven runs' variants need their t0 objects (states)
         variants = sorted(set(variants) | {v for v in a.cd_variants.split(",") if v and v != "frozen"})
-    if sections & {"SP0", "SPC", "SV3", "SPF", "SPD"}:
+    if sections & {"SP0", "SPC", "SV3", "SPF", "SPD", "SPH"}:
         with section("SP0"):
             out["SP0"] = {}
             for V in variants:
@@ -340,7 +352,8 @@ def main():
                     form="subtracted", hermitian="dynamic", sweep="active",
                     screening="shared_pole", spm_support_sites=sites[V],
                     spm_scratch=os.path.join(os.path.abspath(a.out), f"refits_{V}"),
-                    spm_chi0_active=blocks_of(V), say=say)
+                    spm_chi0_active=blocks_of(V), spm_head="refit" if head_of(V) else "frozen",
+                    say=say)
                 t0r = colls[V]["t0"]
                 sc = t0r.get("screen_eq") or {}
                 bo = colls[V]["bundle_of"]
@@ -350,7 +363,7 @@ def main():
                     refit_eq=refit_out(sc, per_q=True) if sc else None,
                     rates_eq=band_rates(colls[V]["eq"]["g_out"], colls[V]["eq"]["g_in"]),
                     memory=mem())
-                if V.endswith("B"):
+                if core(V).endswith("B"):
                     out["SP0"][V]["w_sites_vs_run"] = w_sites_cmp(
                         src["model"]["path"], model_path(V, "eq"))
                     if V[:-1] in colls:
@@ -371,14 +384,33 @@ def main():
     etas = ([float(x) for x in a.eta_list.split(",") if x]
             or [float(src["config"].sigma.regularization_ev)])
 
+    def head_measure(hctx, scr, f_b):
+        """The head of window populations f_b (bundle rows): samples with and without D, diagnostics."""
+        f_full = scr["f_eq"].copy()
+        f_full[scr["rows"], scr["win"]] = np.asarray(f_b, np.float64)
+        t1 = time.perf_counter()
+        head_t, hr = D.spm_head_refit(hctx, f_full)
+        t2 = time.perf_counter()
+        _, hb = D.spm_head_refit(hctx, f_full, drude=False)
+        diag = D.spm_head_diagnostics(hctx, f_full, hr, hb)
+        eps_inv = lambda x: ((x["wc"] + x["vc0"]) / x["vc0"])
+        return head_t, dict(
+            refit_s=t2 - t1, z_ry=hr["z"], wc=hr["wc"], wc_no_drude=hb["wc"],
+            eps_inv=eps_inv(hr), eps_inv_no_drude=eps_inv(hb), vc0=hr["vc0"],
+            poles_ry=hr["poles"], residues=hr["residues"], poles_no_drude_ry=hb["poles"],
+            residues_no_drude=hb["residues"], drude=hr["drude"], diagnostics=diag)
+
     def state_measure(V, f_b, label, *, per_q=True, at_eq_too=True):
         """The refit at window populations f_b (bundle rows): record, rates on W(state), on W_eq, eta list."""
         cv = colls[V]
         scr, bo = cv["screening"], cv["bundle_of"]
         at, rec = D.spm_refit(scr, f_b, label=label)
         r = dict(refit=refit_out(rec, per_q=per_q))
+        head_t = None
+        if head_of(V) and cv.get("head_ctx") is not None:
+            head_t, r["head"] = head_measure(cv["head_ctx"], scr, f_b)
         t1 = time.perf_counter()
-        tabs = cv["sweep"](f_b, at=at)
+        tabs = cv["sweep"](f_b, at=at, head=head_t)
         r["rates_W_state"] = band_rates(tabs["g_out"], tabs["g_in"])
         r["sweep_W_state_s"] = time.perf_counter() - t1
         if at_eq_too:
@@ -423,6 +455,8 @@ def main():
                 raw["lorrax"]["collision_spm_support_sites_ev"] = sites[variant]
             if blocks_of(variant) is not None:
                 raw["lorrax"]["collision_spm_chi0_active"] = blocks_of(variant)
+            if head_of(variant):
+                raw["lorrax"]["collision_spm_head"] = "refit"
         return raw
 
     def td_run(tag, raw, source):
@@ -495,7 +529,7 @@ def main():
     if "SPF" in sections:
         with section("SPF"):
             spf = out.setdefault("SPF", {})
-            for V in variants:
+            for V in ([v for v in a.spf_variants.split(",") if v] or variants):
                 raw = td_deck(f"eq_{V}", tf_fs=a.eq_fs, refresh_fs=a.refresh_fs, variant=V)
                 r = summarize(td_run(f"eq_{V}", raw, src))
                 spf[V] = {k: r.get(k) for k in ("max_dev", "dev_t", "trace_t", "refreshes", "steps",
@@ -553,6 +587,34 @@ def main():
                                             for k, v in sts.items()}
                         spd[tag] = rs
                         _save()
+
+    if "SPH" in sections:
+        with section("SPH"):
+            sph = out.setdefault("SPH", {})
+            states = [("eq", f_eq_b), ("hot", f_hot_b)]
+            for p_ in sorted(glob.glob(a.states)) if a.states else []:
+                z_ = np.load(p_)
+                tg = os.path.basename(p_)[len("states_"):-len(".npz")]
+                for nm in ("peak", "end"):
+                    if f"{nm}_f_b" in z_:
+                        states.append((f"{tg}:{nm}", np.asarray(z_[f"{nm}_f_b"])))
+            for V in variants:
+                if V not in colls:
+                    continue
+                cv = colls[V]
+                sv = sph.setdefault(V, {})
+                for nm, f_b in states:
+                    row = dict(n_c=float(np.sum(np.clip(np.asarray(f_b) - f_eq_b, 0.0, None)) / nk))
+                    try:
+                        at, rec = D.spm_refit(cv["screening"], f_b, label="h_state")
+                        row["refit"] = refit_out(rec, per_q=True)
+                        del at
+                    except Exception as exc:          # a refused refit: recorded, the section goes on
+                        row["refit_error"] = f"{type(exc).__name__}: {exc}"[:1500]
+                    if head_of(V) and cv.get("head_ctx") is not None:
+                        _, row["head"] = head_measure(cv["head_ctx"], cv["screening"], f_b)
+                    sv[nm] = row
+                    _save()
 
     if "SPE" in sections:
         with section("SPE"):

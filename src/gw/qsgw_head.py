@@ -2633,6 +2633,184 @@ def head_drude_tensor_sharded(
     return tensor, np.asarray(gather_to_host(result[1]))
 
 
+# ---------------------------------------------------------------------------
+# The head of a non-thermal population table (TD-aGW, td_agw_dynamical.md
+# §1.4 "Head" and §9 item 7)
+# ---------------------------------------------------------------------------
+
+def _curvature_drude_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
+    """Compile the k.p band-curvature contraction of a population change once per band shape.
+
+    Returns ``X_ab = sum_{k, i != j, |E_i - E_j| >= TOL} conj(v^a_ij) df_i
+    v^b_ij / (E_i - E_j)`` replicated, ``(3, 3)``; ``2 Re X`` is the interband
+    part of ``sum_i df_i d^2E_i/dk_a dk_b`` (:func:`population_drude_tensor_sharded`).
+    The pair cut is the S kernel's (:data:`gw.degen_average.TOL_DEGENERACY_RY`),
+    so a pair excluded from ``S`` is excluded here too.
+    """
+    key = ("head_curvature_drude", id(mesh), int(nb_logical))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(v_local, e_x, e_y, df_x):
+        nx, ny = v_local.shape[-2:]
+        ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
+        iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
+        dE = e_x[:, :, None] - e_y[:, None, :]
+        pair = ((((ix[:, None] < nb_logical) & (iy[None, :] < nb_logical)
+                  & (ix[:, None] != iy[None, :]))[None, :, :])
+                & (jnp.abs(dE) >= TOL_DEGENERACY_RY))
+        weight = jnp.where(pair, df_x[:, :, None] / jnp.where(pair, dE, 1.0), 0.0)
+        local = jnp.einsum("akij,kij,bkij->ab", jnp.conj(v_local),
+                           weight.astype(v_local.dtype), v_local, optimize=True)
+        return ordered_psum(local, (ax_x, ax_y))
+
+    sm = shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=(P(None, None, "x", "y"), P(None, "x"), P(None, "y"), P(None, "x")),
+        out_specs=P(None, None),
+        check_vma=False,
+    )
+    kernel = jax.jit(sm)
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def population_drude_tensor_sharded(
+    velocity_cart,
+    energies_kn_ry,
+    delta_occupations_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+) -> np.ndarray:
+    r"""The Drude tensor of a population change, by the k.p band curvature (Ry).
+
+    .. math::
+        D_{ab} = \frac{C}{\Omega N_k}\sum_{k,n}\delta f_{nk}\,
+        \frac{\partial^2 E_{nk}}{\partial k_a\partial k_b},\qquad
+        \frac{\partial^2 E_n}{\partial k_a\partial k_b} = 2\delta_{ab}
+        + \sum_{m:\,|E_m-E_n|\ge\delta}\frac{2\,\mathrm{Re}\,(v^a_{nm}v^b_{mn})}{E_n-E_m},
+
+    the intraband q -> 0, |z| >> q v limit of the density response of any
+    real population change ``delta_occupations_kn`` (no -df/dE: the TD
+    populations are not thermal), ``chi = q.D.q / z^2`` in the convention of
+    :func:`head_drude_tensor_sharded` (free electrons give ``D = 2n``,
+    ``omega_p^2 = 8 pi qhat.D.qhat``).  ``C = 2/(n_spin n_spinor)``.  The
+    m sum runs over the head manifold ``[0, nb_logical)`` with the S kernel's
+    degeneracy cut: an exactly degenerate pair is an O(q) splitting with no
+    O(q^2) intraband or interband content, so it is dropped from both, and a
+    near-degenerate pair's ``1/(E_n - E_m)`` here cancels the same pair's
+    interband ``S`` at ``|z| >> |E_n - E_m|``.  The second derivative of the
+    nonlocal pseudopotential is not in the velocity artifact and is dropped;
+    the diamagnetic ``2 delta_ab`` and the truncated remote bands enter with
+    ``sum df``, which a particle-conserving change makes zero.  Returns a real
+    symmetric ``(3, 3)`` host array.  Exactly zero for ``df = 0``.
+    """
+    v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
+    e = np.asarray(energies_kn_ry, dtype=np.float64)
+    df = np.asarray(delta_occupations_kn, dtype=np.float64)
+    if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
+        raise ValueError(f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
+    if e.shape != df.shape or tuple(e.shape) != tuple(v.shape[1:3]):
+        raise ValueError(
+            f"energies {e.shape} and population changes {df.shape} must match "
+            f"velocity (nk,nb)={tuple(v.shape[1:3])}.")
+    if not (0 < int(nb_logical) <= int(v.shape[2])):
+        raise ValueError(
+            f"need 0 < nb_logical <= stored nb, got {nb_logical}, {v.shape[2]}.")
+    total = float(np.sum(df[:, :int(nb_logical)]))
+    v, e, df, _ = _pad_head_band_manifold(v, e, df, df, mesh=mesh)
+    X = np.asarray(_curvature_drude_kernel(mesh, nb_logical=int(nb_logical))(
+        v, e, e, df))
+    pref = 2.0 / (float(cell_volume) * float(nk_tot)
+                  * float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
+    return pref * (2.0 * total * np.eye(3) + 2.0 * np.real(X))
+
+
+def population_head_response(
+    response: "IterationHeadResponse",
+    velocity_cart,
+    energies_kn_ry,
+    reference_occupations_kn,
+    occupations_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    cell_volume: float,
+    nk_tot: int,
+    nspin: int,
+    nspinor: int,
+    eta_ry: float = 0.0,
+    drude: bool = True,
+):
+    r"""The direct head response of a population table ``f`` from a run's at ``f_ref``.
+
+    ``response`` is the run's direct (``no_local_fields``) response on its
+    plan, built at ``f_ref`` (:func:`build_dft_head_response`).  The
+    Adler-Wiser tensor is linear in the occupations, so
+
+    .. math::
+        S(z; f) = S(z; f_{\rm ref}) + S(z; f - f_{\rm ref})
+                  + D(f - f_{\rm ref})\,/\,(z + i\eta)^2 \quad (z \ne 0),
+
+    the change ``S(z; df)`` from :func:`head_s_tensor_sharded` (every pair,
+    signed weights, so Pauli blocking and the window's own pairs of both
+    signs), and the intraband term of the change from
+    :func:`population_drude_tensor_sharded` with ``drude``.  The exact
+    ``z = 0`` slot takes no intraband term (the order of limits of
+    :func:`head_s_tensor_sharded`; a non-thermal population has no
+    Thomas-Fermi slot), so the static head of ``f`` is the interband
+    ``S(0; f)``.  ``f = f_ref`` returns ``response`` itself (bitwise the run's
+    head).  ``velocity_cart`` is the run's head velocity on its carrier
+    (``(3, nk, S, S)``, zero past ``nb_logical``); the ``(nk, nb_logical)``
+    tables are host arrays in the velocity's k order.
+
+    Returns ``(response', parts)``: ``parts`` holds ``drude`` (the ``(3, 3)``
+    tensor added, zero without ``drude``), ``inv_z2`` (the per-sample factor
+    it was added with) and ``changed``.
+    """
+    e = np.asarray(energies_kn_ry, dtype=np.float64)
+    f0 = np.asarray(reference_occupations_kn, dtype=np.float64)
+    f = np.asarray(occupations_kn, dtype=np.float64)
+    nb = int(nb_logical)
+    if not (e.shape == f0.shape == f.shape) or e.shape[1] != nb:
+        raise ValueError(
+            f"population head tables must share (nk, nb_logical={nb}): energies {e.shape}, "
+            f"reference {f0.shape}, populations {f.shape}")
+    z = np.asarray(response.omegas, dtype=np.complex128).reshape(-1)
+    zz = z + 1j * float(eta_ry)
+    inv_z2 = np.where(np.abs(zz) > 1.0e-15, 1.0 / np.where(np.abs(zz) > 1.0e-15, zz, 1.0) ** 2,
+                      0.0 + 0.0j)
+    df = f - f0
+    if not np.any(df):
+        return response, dict(drude=np.zeros((3, 3)), inv_z2=inv_z2, changed=False)
+    carrier = int(velocity_cart.shape[-1])
+    pad = ((0, 0), (0, carrier - nb))
+    e_c, df_c = np.pad(e, pad), np.pad(df, pad)
+    dS = head_s_tensor_sharded(
+        velocity_cart, e_c, df_c, z, mesh=mesh, nb_logical=nb,
+        cell_volume=float(cell_volume), nk_tot=int(nk_tot), nspin=int(nspin),
+        nspinor=int(nspinor), eta_ry=float(eta_ry))
+    D = (population_drude_tensor_sharded(
+        velocity_cart, e_c, df_c, mesh=mesh, nb_logical=nb,
+        cell_volume=float(cell_volume), nk_tot=int(nk_tot), nspin=int(nspin),
+        nspinor=int(nspinor)) if drude else np.zeros((3, 3)))
+    S = (response.S_direct + dS
+         + jnp.asarray(D, dtype=jnp.complex128)[None, :, :]
+         * jnp.asarray(inv_z2, dtype=jnp.complex128)[:, None, None])
+    n_sig = int(np.asarray(response.sigma_occupations).shape[1])
+    occ_sig = (f[:, :n_sig] if n_sig <= nb else np.asarray(response.sigma_occupations))
+    return (dataclasses.replace(response, S_direct=S, sigma_occupations=occ_sig),
+            dict(drude=np.asarray(D), inv_z2=inv_z2, changed=True))
+
+
 @dataclass(frozen=True)
 class MetalPairSplit:
     """Inputs of the metallic head's Taylor-radius pair split.

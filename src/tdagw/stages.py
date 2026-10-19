@@ -317,6 +317,8 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev")}
         if v.get("lorrax.collision_spm_chi0_active") is not None:   # absent when unset
             fp["collision"]["lorrax.collision_spm_chi0_active"] = v["lorrax.collision_spm_chi0_active"]
+        if v.get("lorrax.collision_spm_head", "frozen") != "frozen":   # absent when frozen
+            fp["collision"]["lorrax.collision_spm_head"] = v["lorrax.collision_spm_head"]
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
               nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
               measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
@@ -591,6 +593,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
                              rebase=rebase,
                              spm_support_sites=v["lorrax.collision_spm_support_sites_ev"],
                              spm_chi0_active=v["lorrax.collision_spm_chi0_active"],
+                             spm_head=v["lorrax.collision_spm_head"],
                              spm_scratch=os.path.join(os.path.abspath(str(
                                  v["control.files.outdir"])), "collision_refits"), say=emit)
     every = policy.every * tdgw_io.T_IN_ATTOSEC / 1000.0
@@ -605,6 +608,9 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
            f"{v['lorrax.collision_spm_support_sites_ev'] or 'the production ladder'}"
            + ("" if v["lorrax.collision_spm_chi0_active"] is None else
               f"; chi0 in four blocks, active bands {v['lorrax.collision_spm_chi0_active']}")
+           + ("" if v["lorrax.collision_spm_head"] == "frozen" else
+              "; q->0 head refit every refresh: S(z; f) + D(df)/z^2 at z != 0, static slot "
+              "interband")
            + ")")
         + ("" if v["lorrax.collision_screening"] == "frozen" else
            f"; C[rho_eq] {'rebased on W(t)' if built['rebase'] else 'at the t0 rates'}")

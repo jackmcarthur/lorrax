@@ -93,6 +93,7 @@ TD_DEFAULTS = {
     "lorrax.collision_rebase": "auto",
     "lorrax.collision_spm_support_sites_ev": "",
     "lorrax.collision_spm_chi0_active": None,
+    "lorrax.collision_spm_head": "frozen",
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -119,6 +120,8 @@ COLLISION_REFRESH_SWEEPS = ("full", "active")
 COLLISION_SCREENINGS = ("frozen", "refreshed", "shared_pole")
 #: ``lorrax.collision_rebase``: C[rho_eq] on the refreshed W (``auto``: on for shared_pole).
 COLLISION_REBASE = ("auto", "on", "off")
+#: ``lorrax.collision_spm_head``: the q -> 0 head of the shared-pole refresh (``tdagw.dynsig.SPM_HEADS``).
+COLLISION_SPM_HEADS = ("frozen", "refit")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
 #: Sample names the driver keeps for its own per-chunk record (``tdagw.propagate.PROGRESS``);
@@ -239,6 +242,9 @@ def _check_collision(vals: dict) -> None:
                         "[a0, a1], two integers 0 <= a0 < a1 (0-based W-carrier bands)",
                         "set [lorrax] collision_spm_chi0_active or leave it unset")
         vals["lorrax.collision_spm_chi0_active"] = [int(n) for n in ca]
+    if vals["lorrax.collision_spm_head"] not in COLLISION_SPM_HEADS:
+        raise _gate("td_collision", f"collision_spm_head = {vals['lorrax.collision_spm_head']!r}",
+                    " | ".join(COLLISION_SPM_HEADS), "set [lorrax] collision_spm_head")
     for key in ("lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"):
         try:
             ok = float(vals[key]) >= 0.0
@@ -555,9 +561,10 @@ def inactive_keys(deck) -> dict:
           "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
           "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev",
           "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev",
-          "lorrax.collision_spm_chi0_active"),
+          "lorrax.collision_spm_chi0_active", "lorrax.collision_spm_head"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
-        (("lorrax.collision_spm_support_sites_ev", "lorrax.collision_spm_chi0_active"),
+        (("lorrax.collision_spm_support_sites_ev", "lorrax.collision_spm_chi0_active",
+          "lorrax.collision_spm_head"),
          v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "shared_pole",
          "collision_screening = 'shared_pole' only"),
         (("lorrax.collision_screening_gamma_ev",),
@@ -968,6 +975,25 @@ TD_KEY_DOCS = {
         "the other bands at their 0/1 step: only AA crosses zero, each block's rule comes "
         "from band energies and is built at the first refit and held for the run. A must "
         "end at band gaps (FA, AF strictly positive) and F must stay 0/1, else refused.",
+        ("td_collision",)),
+    "lorrax.collision_spm_head": (
+        "= the run's head", "With `collision_screening = shared_pole`: the q → 0 head of the refits. "
+        "`frozen`, the run's head throughout. `refit`, every refresh refits the head at the "
+        "populations: the run's direct tensor plus its change, S(z; f) = S(z; f_eq) + "
+        "S(z; f − f_eq) (signed pair weights, so Pauli blocking and the window's own pairs), "
+        "plus the carriers' Drude term D(δf)/z² at every z ≠ 0 sample, with D the k·p band "
+        "curvature Σ δf ∂²E/∂k² (no −df/dE: the populations are not thermal); the run's "
+        "q = 0 cell average and pole fit then give the head the window Σ reads. The exact "
+        "z = 0 slot keeps the interband S(0; f) (order of limits; no Thomas–Fermi slot for "
+        "a non-thermal population), and the static limit subtracted from ΔΣ^h keeps the "
+        "run's head, so on shell ΔΣ^h gains (½ − f)[W^c_h(0; t) − W^c_h(0; eq)]/(ΩN_k). "
+        "Bitwise the run's head at ρ_eq (checked at t0). Needs a source with "
+        "`head_correction = no_local_fields`. The refresh lines add the head's static "
+        "value with and without the Drude term, D and ω_p of the electrons and holes, and "
+        "a quasi-equilibrium bound (the 2D static screening the carriers would give if "
+        "thermalized at their mean excess energy, and the gap shift it would imply); "
+        "these are diagnostics, outside the propagation "
+        "([td_agw_dynamical.md §1.4](theory/td_agw_dynamical.md#w)).",
         ("td_collision",)),
     "lorrax.collision_frozen_bands": (
         "= every frozen band", "With `collision_screening = refreshed` or `shared_pole` and "
