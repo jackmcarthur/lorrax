@@ -347,7 +347,11 @@ it does in the body. The refresh lines keep the $z=0$ pin as a diagnostic. On
 516 there are 20 sites: a line at height 2.60 eV with real parts 2.60–18.3 eV,
 and imaginary sites at 1.49, 4.89 and 16.0 eV. The fit keeps the poles below
 2 max|z_s|. At $\rho^{\rm eq}$ the site model gives −5413 Ry bohr³, against
-the pinned −5397 (0.3%).
+the pinned −5397 (0.3%). With the $z=0$ pin kept only as a diagnostic, `sites` moves P(t)
+against the no-head runs by ≤ 0.22% of max|P| at 3×10⁹ V/m and ≤ 0.88% at
+7×10⁹ V/m, with gap shifts of ≤ −1.2 meV and ≤ −5.3 meV. On the same
+trajectories the pin reaches +197 meV and +336 meV, and at 7×10⁹ V/m it is
+refused at 6 of 31 refreshes.
 
 ### 1.5 The on-shell collision term {#damping}
 
