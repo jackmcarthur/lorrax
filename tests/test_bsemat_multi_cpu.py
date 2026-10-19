@@ -38,11 +38,15 @@ N_VAL, N_COND, NS = 2, 3, 2
 
 
 def _mesh():
+    # The CPU clause: an emulated 2x2 HOST mesh, also inside a GPU process (`lx test`), where
+    # jax.devices() are CUDA devices and SlabIO's serial (emulation) tier refuses them
+    # (as tests/test_bgw_epsmat_cpu.py and tests/test_epsmat_q0_wing_cpu.py do).
     from bse.bse_ring_comm import create_mesh_2d
     from common.collectives import mesh_is_emulated
-    if jax.device_count() != 4:
-        pytest.skip("needs 4 host devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
-    mesh = create_mesh_2d()
+    cpu = jax.devices("cpu")
+    if len(cpu) < 4:
+        pytest.skip("needs 4 host CPU devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    mesh = create_mesh_2d(devices=cpu[:4])
     if not mesh_is_emulated(mesh):
         pytest.skip("needs the emulated single-process mesh (serial SlabIO)")
     return mesh
