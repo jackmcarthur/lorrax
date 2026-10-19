@@ -1653,6 +1653,7 @@ _DEFAULTS = {
     "cd_chi0_rule_tolerance": 1e-8,
     "cd_chi0_rule_capacity": 1088,
     "cd_chi0_rules_file": "",
+    "cd_band_tile": 0,
     # "" = the shared-pole resolver's own line and imaginary ladders.
     # "<line eV list> | <imaginary eV list>" replaces both with explicit
     # sites (gw.shared_pole_recipe.parse_support_sites); the height, held
@@ -2235,7 +2236,7 @@ def _resolve_cd_inputs(params):
             f"GATE cd_enum: sigma_frequency_integration got: {value!r}; "
             "want: pole_model | contour_deformation; why: unknown frequency integration")
     params["sigma_frequency_integration"] = value
-    cd_keys = ("cd_imaginary_nodes", "cd_knot_step_ev", "cd_residue_reach_ev", "cd_knot_chunk",
+    cd_keys = ("cd_imaginary_nodes", "cd_knot_step_ev", "cd_residue_reach_ev", "cd_knot_chunk", "cd_band_tile",
                "cd_chi0_rule_tolerance", "cd_chi0_rule_capacity", "cd_chi0_rules_file")
     if value != "contour_deformation":
         for key in cd_keys:
@@ -2310,6 +2311,9 @@ def _resolve_cd_inputs(params):
                          "pencil's rank and the stream's node slots")
     params["cd_chi0_rule_capacity"] = cap
     params["cd_chi0_rules_file"] = str(params.get("cd_chi0_rules_file") or "").strip()
+    if int(params["cd_band_tile"]) < 0:
+        raise ValueError(f"GATE cd_band_tile: got: {params['cd_band_tile']!r}; want: >= 0 (0 = planner: the bands "
+                         "of the l sum contracted at a time, gw.cd.sigma.band_bytes_per_unit)")
     patches = str(params.get("sigma_omega_patches_ev", "") or "").strip()
     if patches:
         for item in patches.split(","):
@@ -2683,6 +2687,7 @@ def _input_response(
         cd_chi0_rule_tolerance=float(params["cd_chi0_rule_tolerance"]),
         cd_chi0_rule_capacity=int(params["cd_chi0_rule_capacity"]),
         cd_chi0_rules_file=str(params["cd_chi0_rules_file"]),
+        cd_band_tile=int(params["cd_band_tile"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
@@ -4146,6 +4151,7 @@ class DynamicSigmaConfig:
     cd_chi0_rule_tolerance: float = 1e-8
     cd_chi0_rule_capacity: int = 1088
     cd_chi0_rules_file: str = ""
+    cd_band_tile: int = 0
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
     #: resolver's own ladders) or "<line eV list> | <imaginary eV list>",
     #: an explicit support geometry for support-rule studies.  Parsed and

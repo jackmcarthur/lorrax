@@ -18,7 +18,7 @@ SCRIPT = textwrap.dedent(r'''
     jax.config.update("jax_enable_x64", True)
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from gw.cd import laws
-    from gw.cd.sigma import build_contraction_kernels, contract
+    from gw.cd.sigma import build_contraction_kernels, contract, carrier_band_blocks, pair_psi_slabs
     assert jax.device_count() == 4, jax.devices()
     mesh = Mesh(np.array(jax.devices()).reshape(2, 2), ("x", "y"))
     rng = np.random.default_rng(7)
@@ -39,7 +39,9 @@ SCRIPT = textwrap.dedent(r'''
     u_all, w_all = np.array([0.01, 0.03, 0.2]), np.array([0.02, 0.05, 0.3])
     rep = NamedSharding(mesh, P())
     put = lambda a: jax.device_put(np.asarray(a), rep)
-    T = dict(psi_L=put(psi), psi_M=put(psi[:, :m]), KMQ=put(KMQ_pad.astype(np.int32)), kw=put(kw.astype(np.int32)),
+    psi_q, psi_nq = pair_psi_slabs(carrier_band_blocks(put(psi), mesh), mesh, rows_q=KMQ_pad[:, kw],
+                                   rows_nq=KMQ_pad[qneg_pad][:, kw], l0=0, L=L, L_neg=L, block_bands=2)
+    T = dict(psi_q=psi_q, psi_nq=psi_nq, psi_M=put(psi[:, :m]), KMQ=put(KMQ_pad.astype(np.int32)), kw=put(kw.astype(np.int32)),
              enk=put(enk), f=put(f), omega=put(omega), eps_own=put(eps_own), qneg=put(qneg_pad.astype(np.int32)),
              qvalid=put(qvalid), u_all=put(u_all), w_all=put(w_all))
     beta = tuple(float(b) for b in laws.BETA_RY)

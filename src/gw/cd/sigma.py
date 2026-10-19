@@ -20,13 +20,22 @@ chunks of ``runtime.tiles.tile_units`` (TASTE 96: the tile is sized from the chu
 never from free memory or the deck budget; the last chunk is padded with zero-weight nodes or
 unreferenced knots so every chunk has one shape):
 
-    chi(z) [nz, nq_irr, n, n] face --(q,z)-major flat, local batched LU--> W_c, dW_c/ds
-      --unfold per z (wedge decks)--> [nz, nq_pad, n, n] q-parallel P(None, ('x','y'))
-      --shard_map over q: scan over the rank's q, scan over z--> accumulators [E, kw, m, n]
+    chi(z) [nz, nq_irr, n, n] face --(q,z)-major flat, zero rows to a multiple of P, local batched LU-->
+      W_c, dW_c/ds --unfold per z (wedge decks)--> [nz, nq_pad, n, n] q-parallel P(None, ('x','y'))
+      --shard_map over q: scan over the rank's q, scan over band tiles, scan over z--> accumulators [E, kw, m, n]
+
+A chunk may hold any number of nodes or knots: the (q, z) flat axis is padded with zero rows (their
+W_c is exactly zero and is dropped) to a multiple of P, so the chunk is not rounded up to
+P / gcd(nq_irr, P).  The pair densities rho[kw, m, l, n] exist one band tile at a time
+(:func:`tile_sum`; ``tile_units`` of :func:`band_bytes_per_unit`), and a tile that covers every band
+runs the untiled program bit for bit.  psi enters as per-rank pair slabs, q-sharded like W
+(:func:`pair_psi_slabs`: the rows k - q of the rank's own pairs, and of the pairs -q up to the last
+band an x < 0 residue reads), streamed from the band carrier one band block at a time; the Coulomb
+roots stay on the face.  Nothing of psi or of the roots is replicated whole (:func:`cd_memory_plan`).
 
 The real axis needs no W_{-q} gather: the rank holding W_q' adds pair q''s x >= 0 residues
 (contractions with W_q') and pair (-q')'s x < 0 residues (contractions with W_q'^T), recomputing
-the pair densities rho_{-q'} from the replicated tables.  A residue at (E, l) reads only the two knots
+the pair densities rho_{-q'} from its pair slab.  A residue at (E, l) reads only the two knots
 bracketing |x|, so each knot chunk contracts, per branch, only the (k, l) rows some residue of that
 branch reads in the chunk (:func:`residue_band_tables`, host-built once; widths padded to BAND_RUNG
 so a handful of shapes compile); every other row would add an exact zero.  FD-9 ghost knots roll from chunk to
@@ -70,7 +79,10 @@ CD_RECIPE = dict(version="cd_production_v3", laws="ordered_cd TRREF / Run211 jet
                       "integrate_response_group value rows, ordered=True",
                  dyson="response_bank pair equations, local batched jnp.linalg.solve over (q, z)",
                  tile="runtime.tiles.tile_units", real_axis="owner-rank branches, no W_-q gather",
-                 residue_rows="banded per knot chunk and branch (live bands, BAND_RUNG 8; exact)")
+                 residue_rows="banded per knot chunk and branch (live bands, BAND_RUNG 8; exact)",
+                 band_tiles="tile_sum over l (runtime.tiles.tile_units; exact up to summation order)",
+                 psi_tables="q-sharded pair slabs streamed from the band carrier (pair_psi_slabs)",
+                 qz_flat="zero rows to a multiple of P (chunk free of P / gcd(nq_irr, P))")
 
 
 def _say(print_fn, started, msg):
@@ -130,6 +142,88 @@ def chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, *, axis):
     return 16.0 * n * n * per / ndev
 
 
+def band_bytes_per_unit(kw, m, n, ns, n_omega):
+    """Per-rank bytes one intermediate band l adds to a contraction kernel's band tile (complex128).
+
+    16 kw [n (3 m + s) + 8 m^2 + 12 E]: the pair density rho and two contraction intermediates
+    [kw, m, n] (the anchor's value and slope, the real axis' W and dW/ds), the psi rows [kw, s, n], the
+    m x m contractions with their daggers and concatenations, and the per-(k, E) weights (imaginary
+    selectors, anchor and Hermite coefficients).  :func:`build_contraction_kernels` takes the tile as
+    ``tile_units(band_bytes_per_unit(...), L)``.
+    """
+    return 16.0 * kw * (n * (3 * m + ns) + 8 * m * m + 12 * n_omega)
+
+
+def knot_chunk(units, count, *, ndev, nq_irr):
+    """Nodes or knots per chunk from ``units`` (the deck's cd_knot_chunk, else the planner's ``tile_units``).
+
+    At least one, at most ``count``.  A chunk of at least zq_mult = P / gcd(nq_irr, P) units is rounded up
+    to a multiple of zq_mult, as before (its (q, z) flat axis divides P, no zero rows); a smaller chunk is
+    kept, and :func:`qz_flat_programs` pads its flat axis with zero rows.  Before, every chunk was rounded
+    up to zq_mult: 8 knots at P = 64 with 8 irreducible q, whatever the per-knot bytes.
+    """
+    zq_mult = int(ndev) // int(np.gcd(int(nq_irr), int(ndev)))
+    units = int(max(1, min(int(units), int(count))))
+    return units if units < zq_mult else -(-units // zq_mult) * zq_mult
+
+
+def cd_memory_plan(*, n, nq_irr, nk, n_carrier_k, nb_carrier, n_rows, nb_s, L, L_neg, ns, n_omega, ndev,
+                   mesh_y, chunk_imag, chunk_real, band_tile, slab_block, wedge):
+    """Per-rank bytes of the CD stage by object and phase, from the shapes alone (complex128 = 16 B).
+
+    The planner of record for the memory a CD run needs on one rank; it reads no device state.  Phases:
+    ``setup`` (pair-slab build: the carrier on the ``axis`` layout and one replicated band block),
+    ``sigma_x``, ``imag`` (one node chunk: chi face, the padded (q, z) flats of chi, roots and W_c, the
+    LU workspace, then W on the full zone), ``real`` (one knot chunk: the rolling FD-9 ghost tail, chi,
+    dchi/ds, the Dyson pair, W and dW/ds on the full zone).  Every phase adds the resident objects (pair
+    slabs, psi_M, accumulators, Coulomb roots on the face, energy tables) and one band tile.  The
+    batched-LU workspace is an estimate: 4 (value) / 5 (pair) n x n matrices per local flat row.  Objects
+    the CD stage does not own (the psi carrier, V_q) are not counted.
+
+    Returns ``dict(resident=..., phases=..., peak_bytes=..., peak_phase=..., layout=...)``, bytes per rank.
+    """
+    from runtime.padding import padded_axis
+    P = int(ndev)
+    u = 16.0 * n * n
+    nq_pad = -(-nk // P) * P
+    nq_loc = nq_pad // P
+
+    def flat_rows(nz):           # local rows of the zero-padded (q, z) flat axis
+        return padded_axis(nq_irr * nz, P, name="cd (q, z) flat").carrier // P
+
+    resident = dict(
+        psi_pair_slab=16.0 * nq_loc * n_rows * L * ns * n,
+        psi_neg_pair_slab=16.0 * nq_loc * n_rows * L_neg * ns * n,
+        psi_M=16.0 * n_rows * nb_s * ns * n,
+        accumulators=3 * 16.0 * (n_omega * n_rows * nb_s * nb_s + n_rows * nb_s),
+        coulomb_roots_face=u * nq_irr / P,
+        energy_tables=16.0 * nk * L,
+        band_tile=band_tile * band_bytes_per_unit(n_rows, nb_s, n, ns, n_omega))
+    base = sum(resident.values())
+    wedge_tr = (u * nk / P) if wedge else 0.0              # one z's full-zone face from QirrOperator.unfold
+    zi, zr = int(chunk_imag), int(chunk_real)
+    fi, fr = flat_rows(zi), flat_rows(zr)
+    tail = 2 * GH * nq_irr * u / P
+    phases = dict(
+        setup=base - resident["band_tile"] + 16.0 * n_carrier_k * nb_carrier * ns * n / mesh_y
+        + 16.0 * slab_block * ns * n * (n_carrier_k + nk + 2 * nq_loc * n_rows),
+        sigma_x=base + u * nk / P + u * nq_loc,
+        imag_dyson=base + zi * nq_irr * u / P + fi * u * (3 + 4),
+        imag_unfold=base + fi * u + zi * nq_loc * u * (2 if wedge else 1) + wedge_tr,
+        imag_contract=base + zi * nq_loc * u,
+        real_chi=base + tail + (2 * zr + 2 * GH) * nq_irr * u / P,
+        real_slope=base + tail + (zr + 2 * GH + 2 * zr) * nq_irr * u / P,
+        real_dyson=base + tail + 2 * zr * nq_irr * u / P + fr * u * (5 + 5),
+        real_unfold=base + tail + 2 * fr * u + 2 * zr * nq_loc * u * (1.5 if wedge else 1) + wedge_tr,
+        real_contract=base + tail + 2 * zr * nq_loc * u)
+    peak_phase = max(phases, key=phases.get)
+    layout = dict(P=P, n=n, nq_pad=nq_pad, nq_loc=nq_loc, chunk_imag=zi, chunk_real=zr,
+                  flat_rows_local_imag=fi, flat_rows_local_real=fr, band_tile=int(band_tile), slab_block=int(slab_block),
+                  L=int(L), L_neg=int(L_neg))
+    return dict(resident=resident, phases=phases, peak_bytes=phases[peak_phase], peak_phase=peak_phase,
+                layout=layout)
+
+
 # ------------------------------------------------------------------------------- residue band tables
 #: Width rung of the banded residue tables.  A knot chunk's per-branch band count (the most live bands of
 #: any (q, k) row) is padded up to a multiple of BAND_RUNG, capped at L, so the real-axis kernel compiles
@@ -168,8 +262,9 @@ def residue_band_tables(enk_L, f_L, KMQ_pad, qneg_pad, rows, omega, eps_own, h_r
     [nq_pad, kw, Lb] (one per branch that chunk c reads; Lb = :func:`band_rung` of the chunk's largest
     live count) listing per (q, k) the live bands in ascending order, then dead bands as padding, and the
     matching tuple of branch flags.  Padding needs no mask: a dead band's weights at the chunk's knots are
-    exact zeros.  ``summary`` holds the widths and live/contracted fractions for the receipt.  Storage is
-    one bit per (branch, q, k, l, chunk).
+    exact zeros.  ``summary`` holds the widths and live/contracted fractions for the receipt, and
+    ``extent_pos_neg``: per branch, every table entry is below it (the pair slab of the x < 0 branch
+    holds only those bands).  Storage is one bit per (branch, q, k, l, chunk).
     """
     enk_L, f_L = np.asarray(enk_L, np.float64), np.asarray(f_L, np.float64)
     rows, omega, eps_own = np.asarray(rows), np.asarray(omega, np.float64), np.asarray(eps_own, np.float64)
@@ -179,6 +274,7 @@ def residue_band_tables(enk_L, f_L, KMQ_pad, qneg_pad, rows, omega, eps_own, h_r
     packed = np.zeros((2, nq_pad, nbytes, kw, L), np.uint8)
     width = np.zeros((2, int(n_chunks)), np.int64)
     live_rows = np.zeros(2)
+    top_live = np.full(2, -1, np.int64)                                  # highest live band per branch
     ne = omega.size + eps_own.shape[1]
     qb = max(1, int((64 << 20) // (2 * kw * ne * L * 8)))                 # q block: x below 64 MiB
     pair_g = np.arange(nq_pad)
@@ -204,6 +300,8 @@ def residue_band_tables(enk_L, f_L, KMQ_pad, qneg_pad, rows, omega, eps_own, h_r
             flat[base[sel] + (knot[sel] // int(chunk)) * (kw * L)] = True
         packed[:, g0:g1] = np.packbits(hit, axis=2)
         counts = hit.sum(axis=-1)                                        # [2, qb, n_chunks, kw]
+        any_l = hit.reshape(2, -1, L).any(axis=1)                        # [2, L]
+        top_live = np.maximum(top_live, np.where(any_l.any(axis=1), L - 1 - np.argmax(any_l[:, ::-1], axis=1), -1))
         width = np.maximum(width, counts.max(axis=(1, 3)))
         live_rows += counts.sum(axis=(1, 2, 3))
 
@@ -224,27 +322,46 @@ def residue_band_tables(enk_L, f_L, KMQ_pad, qneg_pad, rows, omega, eps_own, h_r
     for c in range(int(n_chunks)):
         key = f"{widths[0, c]}/{widths[1, c]}"
         pairs[key] = pairs.get(key, 0) + 1
+    # Every entry of a branch's tables lies below extent = max(top live band + 1, widest table): a row
+    # lists its live bands, then the lowest dead ones, and the j-th lowest dead band is <= j + #live.
+    extent = [int(max(top_live[b] + 1, widths[b].max(initial=0))) for b in (0, 1)]
     summary = dict(rung=BAND_RUNG, L=L, n_chunks=int(n_chunks), live_fraction=[float(v / dense) for v in live_rows],
                    contracted_fraction=[float(widths[b].sum() / (L * n_chunks)) for b in (0, 1)],
-                   empty_chunks=[int((widths[b] == 0).sum()) for b in (0, 1)], widths_pos_neg=pairs)
+                   empty_chunks=[int((widths[b] == 0).sum()) for b in (0, 1)], widths_pos_neg=pairs,
+                   extent_pos_neg=extent)
     return tables, summary
 
 
 # ------------------------------------------------------------------------------- pair-basis kernels
-def pair_rows(T, q, bands=None):
-    """Pair densities and energy tables of pair q (k -> k - q) at the file-wedge rows.
+#: Keys of the per-rank pair slabs in the table dict T (:func:`pair_psi_slabs`): q-sharded like W.
+#: Every other table is replicated.
+PAIR_SLAB_KEYS = ("psi_q", "psi_nq")
 
-    T (replicated): psi_L [nk, L, s, n], psi_M [kw, m, s, n], KMQ [nq_pad, nk], kw [kw],
-    enk [nk, L], f [nk, L], omega [E], eps_own [kw, m].  ``bands`` [kw, Lb] int32 (optional): the
-    intermediate bands to keep per row (a :func:`residue_band_tables` table at this q); all L if None.
+
+def table_specs(T, axes=("x", "y")):
+    """shard_map specs of the table dict T: the pair slabs on the q axis, every other table replicated."""
+    return {key: (P(axes) if key in PAIR_SLAB_KEYS else P()) for key in T}
+
+
+def pair_rows(T, q, psi_rows, lo=0, width=None, bands=None):
+    """Pair densities and energy tables of pair q (k -> k - q) at the file-wedge rows, on one band tile.
+
+    T (replicated): psi_M [kw, m, s, n], KMQ [nq_pad, nk], kw [kw], enk [nk, L], f [nk, L], omega [E],
+    eps_own [kw, m].  ``psi_rows`` [kw, Ls, s, n] is this rank's pair slab of pair q (psi at the rows
+    KMQ[q][kw], bands from 0).  The bands kept are [lo, lo + width) (``lo`` may be traced; every band
+    of the slab when ``width`` is None), or ``bands`` [kw, Lb] int32 when given: per row the bands to
+    keep (a :func:`residue_band_tables` table at this q, or a column tile of one).
     Returns rho [kw, m, Lb, n] = conj(psi_{k-q,l}) psi_{k,m} summed over spinor, x [kw, E, Lb],
-    x_own [kw, m, Lb] (Ry, omega - eps_l(k-q)), f [kw, Lb].
+    x_own [kw, m, Lb] (Ry, omega - eps_l(k - q)), f [kw, Lb].
     """
     rows = T["KMQ"][q][T["kw"]]
     if bands is None:
-        psi_l, e, f = T["psi_L"][rows], T["enk"][rows], T["f"][rows]
+        psi_l, e, f = psi_rows, T["enk"][rows], T["f"][rows]
+        if width is not None:
+            psi_l, e, f = (jax.lax.dynamic_slice_in_dim(a, lo, width, axis=1) for a in (psi_l, e, f))
     else:
-        psi_l, e, f = (T[key][rows[:, None], bands] for key in ("psi_L", "enk", "f"))
+        psi_l = psi_rows[jnp.arange(bands.shape[0])[:, None], bands]
+        e, f = (T[key][rows[:, None], bands] for key in ("enk", "f"))
     rho = jnp.einsum("klsu,kmsu->kmlu", jnp.conj(psi_l), T["psi_M"])
     x = T["omega"][None, :, None] - e[:, None, :]
     x_own = T["eps_own"][:, :, None] - e[:, None, :]
@@ -257,19 +374,49 @@ def contract(rho, op, nk):
     return -jnp.einsum("kmlv,knlv->kmnl", t, rho) / nk
 
 
-def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
-    """The four q-parallel CD kernels (jitted shard_maps; tables T and accumulators replicated).
+def tile_sum(body, count, tile, zero):
+    """sum over the band tiles [lo, lo + width) of [0, count) of ``body(lo, width)``, in tile order.
+
+    ``tile`` None or >= count: the one call ``body(0, None)`` (the untiled program, bit for bit).
+    Otherwise a ``lax.scan`` over the count // tile full tiles (``lo`` traced, ``width = tile``) from the
+    pytree ``zero``, then, when tile does not divide count, one tail call (static ``lo``, ``width =
+    count % tile``): two tile shapes whatever the count.  ``body`` returns a pytree shaped like ``zero``.
+    The l sum is the untiled one regrouped by tile (exact up to summation order).
+    """
+    count = int(count)
+    if tile is None or int(tile) >= count:
+        return body(0, None)
+    tile = int(tile)
+    n_full, tail = divmod(count, tile)
+
+    def add(a, b):
+        return jax.tree_util.tree_map(jnp.add, a, b)
+
+    def step(carry, t):
+        return add(carry, body(t * tile, tile)), None
+    out, _ = jax.lax.scan(step, zero, jnp.arange(n_full, dtype=jnp.int32), unroll=1)
+    return add(out, body(n_full * tile, tail)) if tail else out
+
+
+def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile=None):
+    """The four q-parallel CD kernels (jitted shard_maps; accumulators and tables replicated, pair slabs q-sharded).
 
     sigma_x(V [nq_pad, n, n] q-par, acc [kw, m, m], T)                     -> acc + Sigma_x
     imag(W [nz, nq_pad, n, n] q-par, u [nz], w [nz], acc [E,kw,m,m], own [kw,m], T) -> (acc', own')
     real(W, dW, z [nz], node0, acc, own, T, bands, negative)                -> (acc', own')
     anchor(W0, dW0 [nq_pad, n, n] at z = i eta, acc, own, T)                -> (acc', own')
     Every kernel returns its input accumulator plus the psum over ranks of its own increment.
+    T["psi_q"] and T["psi_nq"] are the pair slabs of :func:`pair_psi_slabs` (q on ('x', 'y')): pair q's
+    rows over every band of the l sum, and pair -q's rows over the bands the x < 0 tables read.
+    The l sum runs ``band_tile`` bands at a time (:func:`tile_sum`; on the real axis, ``band_tile``
+    columns of each branch's table): pair densities exist one tile at a time.  None, or a tile no
+    narrower than the band count (the widest table), is the untiled program bit for bit.
     ``real`` contracts only the banded rows of the chunk: ``bands`` are the replicated int32 tables
     [nq_pad, kw, Lb] of :func:`residue_band_tables` for the branches that read the chunk, ``negative``
     their branch flags (static).  Full tables (every l, both branches) give the dense contraction.
     """
     axes = ("x", "y")
+    tile = int(band_tile) if band_tile else None
 
     def q0():
         return (jax.lax.axis_index("x") * mesh_xy.shape["y"] + jax.lax.axis_index("y")) * nq_loc
@@ -279,29 +426,39 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
         # independent of the GPU placement
         return acc + ordered_psum(inc, axes)
 
+    def zeros2(acc, own):
+        return jnp.zeros_like(acc), jnp.zeros_like(own)
+
     def cd_sigma_x(V, acc, T):
         def over_q(s, iq):
             g = q0() + iq
-            rho, _, _, f = pair_rows(T, g)
-            a = contract(rho, V[iq], nk)
-            return s + T["qvalid"][g] * jnp.einsum("kmnl,kl->kmn", a, f), None
+
+            def band_tile_(lo, width):
+                rho, _, _, f = pair_rows(T, g, T["psi_q"][iq], lo, width)
+                return jnp.einsum("kmnl,kl->kmn", contract(rho, V[iq], nk), f)
+            part = tile_sum(band_tile_, T["psi_q"].shape[2], tile, jnp.zeros_like(acc))
+            return s + T["qvalid"][g] * part, None
         inc, _ = jax.lax.scan(over_q, jnp.zeros_like(acc), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc)
 
     def cd_imag_contract(W, u_c, w_c, acc, own, T):
         def over_q(carry, iq):
             g = q0() + iq
-            rho, x, x_own, f = pair_rows(T, g)
 
-            def over_z(c2, iz):
-                a = contract(rho, W[iz, iq], nk)
-                ops, wts = laws.imag_node_terms(a, u_c[iz], w_c[iz], x, f, eta)
-                _, wts_own = laws.imag_node_terms(a, u_c[iz], w_c[iz], x_own, f, eta)
-                return (c2[0] + laws.apply(ops, wts), c2[1] + laws.own_apply(ops, wts_own)), None
-            (s_acc, s_own), _ = jax.lax.scan(over_z, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(W.shape[0]), unroll=1)
+            def band_tile_(lo, width):
+                rho, x, x_own, f = pair_rows(T, g, T["psi_q"][iq], lo, width)
+
+                def over_z(c2, iz):
+                    a = contract(rho, W[iz, iq], nk)
+                    ops, wts = laws.imag_node_terms(a, u_c[iz], w_c[iz], x, f, eta)
+                    _, wts_own = laws.imag_node_terms(a, u_c[iz], w_c[iz], x_own, f, eta)
+                    return (c2[0] + laws.apply(ops, wts), c2[1] + laws.own_apply(ops, wts_own)), None
+                out, _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
+                return out
+            s_acc, s_own = tile_sum(band_tile_, T["psi_q"].shape[2], tile, zeros2(acc, own))
             v = T["qvalid"][g]
             return (carry[0] + v * s_acc, carry[1] + v * s_own), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc), unroll=1)
+        (inc, inc_own), _ = jax.lax.scan(over_q, zeros2(acc, own), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc), psum_add(own, inc_own)
 
     def cd_real_contract(W, dW, z_c, node0, acc, own, T, bands, negative):
@@ -310,56 +467,87 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
         ``negative`` (static, one flag per table): False = x >= 0 residues of pair g against W_g,
         True = x < 0 residues of pair -g against W_g^T.  Per (chunk, q) the pair densities are gathered
         on the table's bands only and the Hermite coefficients are built once; per knot only the
-        ``index == node`` selection, the contractions and the apply remain.
+        ``index == node`` selection, the contractions and the apply remain.  When a table is wider than
+        the band tile, each branch runs its own column tiles (:func:`tile_sum`) and applies per branch.
         """
+        single = tile is None or all(int(t.shape[-1]) <= tile for t in bands)
+
         def over_q(carry, iq):
             g = q0() + iq
-            sides = []
-            for table, neg in zip(bands, negative):
-                rho, x, x_own, f = pair_rows(T, T["qneg"][g] if neg else g, table[g])
-                sides.append((rho, laws.hermite_branch_coefficients(x, f, h_ry, neg),
-                              laws.hermite_branch_coefficients(x_own, f, h_ry, neg), neg))
+            if single:
+                sides = []
+                for table, neg in zip(bands, negative):
+                    rho, x, x_own, f = pair_rows(T, T["qneg"][g] if neg else g, T["psi_nq" if neg else "psi_q"][iq],
+                                                 bands=table[g])
+                    sides.append((rho, laws.hermite_branch_coefficients(x, f, h_ry, neg),
+                                  laws.hermite_branch_coefficients(x_own, f, h_ry, neg), neg))
 
-            def over_z(c2, iz):
-                node, z = node0 + iz, z_c[iz]
-                Wz, dWz = W[iz, iq], dW[iz, iq]
-                ops, wts, inc_own = [], [], 0
-                for rho, coeffs, coeffs_own, neg in sides:
-                    op = laws.real_knot_operators(z, contract(rho, Wz.T if neg else Wz, nk),
-                                                  contract(rho, dWz.T if neg else dWz, nk))
-                    ops.append(op)
-                    wts.append(laws.real_knot_select(node, coeffs))
-                    inc_own = inc_own + laws.own_apply(op, laws.real_knot_select(node, coeffs_own))
-                inc = laws.apply(jnp.concatenate(ops, -1), jnp.concatenate(wts, -1))
-                return (c2[0] + inc, c2[1] + inc_own), None
-            (s_acc, s_own), _ = jax.lax.scan(over_z, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(W.shape[0]), unroll=1)
+                def over_z(c2, iz):
+                    node, z = node0 + iz, z_c[iz]
+                    Wz, dWz = W[iz, iq], dW[iz, iq]
+                    ops, wts, inc_own = [], [], 0
+                    for rho, coeffs, coeffs_own, neg in sides:
+                        op = laws.real_knot_operators(z, contract(rho, Wz.T if neg else Wz, nk),
+                                                      contract(rho, dWz.T if neg else dWz, nk))
+                        ops.append(op)
+                        wts.append(laws.real_knot_select(node, coeffs))
+                        inc_own = inc_own + laws.own_apply(op, laws.real_knot_select(node, coeffs_own))
+                    inc = laws.apply(jnp.concatenate(ops, -1), jnp.concatenate(wts, -1))
+                    return (c2[0] + inc, c2[1] + inc_own), None
+                (s_acc, s_own), _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
+            else:
+                s_acc, s_own = zeros2(acc, own)
+                for table, neg in zip(bands, negative):
+                    tab, psi_rows, pair = table[g], T["psi_nq" if neg else "psi_q"][iq], T["qneg"][g] if neg else g
+
+                    def column_tile(lo, width, tab=tab, psi_rows=psi_rows, pair=pair, neg=neg):
+                        cols = tab if width is None else jax.lax.dynamic_slice_in_dim(tab, lo, width, axis=1)
+                        rho, x, x_own, f = pair_rows(T, pair, psi_rows, bands=cols)
+                        coeffs = laws.hermite_branch_coefficients(x, f, h_ry, neg)
+                        coeffs_own = laws.hermite_branch_coefficients(x_own, f, h_ry, neg)
+
+                        def over_z(c2, iz):
+                            node, z = node0 + iz, z_c[iz]
+                            Wz, dWz = W[iz, iq], dW[iz, iq]
+                            op = laws.real_knot_operators(z, contract(rho, Wz.T if neg else Wz, nk),
+                                                          contract(rho, dWz.T if neg else dWz, nk))
+                            return (c2[0] + laws.apply(op, laws.real_knot_select(node, coeffs)),
+                                    c2[1] + laws.own_apply(op, laws.real_knot_select(node, coeffs_own))), None
+                        out, _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
+                        return out
+                    b_acc, b_own = tile_sum(column_tile, tab.shape[-1], tile, zeros2(acc, own))
+                    s_acc, s_own = s_acc + b_acc, s_own + b_own
             v = T["qvalid"][g]
             return (carry[0] + v * s_acc, carry[1] + v * s_own), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc), unroll=1)
+        (inc, inc_own), _ = jax.lax.scan(over_q, zeros2(acc, own), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc), psum_add(own, inc_own)
 
     def cd_anchor(W0, dW0, acc, own, T):
         def over_q(carry, iq):
             g = q0() + iq
-            rho, x, x_own, f = pair_rows(T, g)
-            a0, d0 = contract(rho, W0[iq], nk), contract(rho, dW0[iq], nk)
-            total, cp, cm = laws.anchor_part(a0, d0, x, f, eta, beta)
-            sub = laws.anchor_subtraction(cp, cm, laws.imag_anchor_sums(T["u_all"], T["w_all"], x, f, eta, beta))
-            total_o, _, _ = laws.anchor_part(a0, d0, x_own, f, eta, beta, apply_fn=laws.own_apply)
-            sub_o = laws.anchor_subtraction(cp, cm, laws.imag_anchor_sums(T["u_all"], T["w_all"], x_own, f, eta, beta),
-                                            apply_fn=laws.own_apply)
+
+            def band_tile_(lo, width):
+                rho, x, x_own, f = pair_rows(T, g, T["psi_q"][iq], lo, width)
+                a0, d0 = contract(rho, W0[iq], nk), contract(rho, dW0[iq], nk)
+                total, cp, cm = laws.anchor_part(a0, d0, x, f, eta, beta)
+                sub = laws.anchor_subtraction(cp, cm, laws.imag_anchor_sums(T["u_all"], T["w_all"], x, f, eta, beta))
+                total_o, _, _ = laws.anchor_part(a0, d0, x_own, f, eta, beta, apply_fn=laws.own_apply)
+                sub_o = laws.anchor_subtraction(cp, cm, laws.imag_anchor_sums(T["u_all"], T["w_all"], x_own, f, eta, beta),
+                                                apply_fn=laws.own_apply)
+                return total - sub, total_o - sub_o
+            s_acc, s_own = tile_sum(band_tile_, T["psi_q"].shape[2], tile, zeros2(acc, own))
             v = T["qvalid"][g]
-            return (carry[0] + v * (total - sub), carry[1] + v * (total_o - sub_o)), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, (jnp.zeros_like(acc), jnp.zeros_like(own)), jnp.arange(nq_loc), unroll=1)
+            return (carry[0] + v * s_acc, carry[1] + v * s_own), None
+        (inc, inc_own), _ = jax.lax.scan(over_q, zeros2(acc, own), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc), psum_add(own, inc_own)
 
     q3, q4 = P(axes), P(None, axes)
 
     def wrap(fn, in_specs, out_specs, name=None):
-        sm = shard_map(fn, mesh=mesh_xy, in_specs=in_specs, out_specs=out_specs, check_vma=False)
-
+        """jit(shard_map(fn)); the entry "T" of ``in_specs`` takes the table dict's :func:`table_specs`."""
         def named(*args):
-            return sm(*args)
+            specs = tuple(table_specs(a, axes) if isinstance(s, str) else s for s, a in zip(in_specs, args))
+            return shard_map(fn, mesh=mesh_xy, in_specs=specs, out_specs=out_specs, check_vma=False)(*args)
         named.__name__ = named.__qualname__ = name or fn.__name__
         return jax.jit(named)
 
@@ -374,15 +562,16 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
         if negative not in real_programs:
             def body(W, dW, z_c, node0, acc, own, T, bands):
                 return cd_real_contract(W, dW, z_c, node0, acc, own, T, bands, negative)
-            real_programs[negative] = wrap(body, (q4, q4, P(), P(), P(), P(), P(), P()), (P(), P()),
+            real_programs[negative] = wrap(body, (q4, q4, P(), P(), P(), P(), "T", P()), (P(), P()),
                                            name="cd_real_contract")
         return real_programs[negative](W, dW, z_c, node0, acc, own, T, tuple(bands))
 
     return SimpleNamespace(
-        sigma_x=wrap(cd_sigma_x, (q3, P(), P()), P()),
-        imag=wrap(cd_imag_contract, (q4, P(), P(), P(), P(), P()), (P(), P())),
+        sigma_x=wrap(cd_sigma_x, (q3, P(), "T"), P()),
+        imag=wrap(cd_imag_contract, (q4, P(), P(), P(), P(), "T"), (P(), P())),
         real=real,
-        anchor=wrap(cd_anchor, (q3, q3, P(), P(), P()), (P(), P())))
+        anchor=wrap(cd_anchor, (q3, q3, P(), P(), "T"), (P(), P())),
+        band_tile=tile)
 
 
 def build_dyson_kernels(mesh_xy, *, n, pref):
@@ -412,20 +601,121 @@ def build_dyson_kernels(mesh_xy, *, n, pref):
     return (jax.jit(cd_dyson_pair, out_shardings=(flat, flat)), jax.jit(cd_dyson_value, out_shardings=flat))
 
 
+def qz_flat_programs(mesh_xy, *, nq_irr, n):
+    """The (q, z) flat layout of the Dyson step: row q * nz + z on P(('x','y'), None, None), zero rows to a multiple of P.
+
+    to_qz(chi4 [nz, nq_irr, n, n] face)  -> [F, n, n], F = ``padded_axis(nq_irr nz, mesh)`` (the chunk need
+                                            not make nq_irr nz divisible by P)
+    roots_qz(h [nq_irr, n, n] face, nz)  -> h repeated over z on the same rows: the Coulomb roots stay on
+                                            the face (no replicated copy); the values are copies
+    rows(flat, nz)                       -> the nq_irr nz live rows (static slice; identity when F = nq_irr nz)
+    A zero row has chi = 0 and H = 0, so its W_c and dW_c/ds are exactly zero; no consumer reads it.
+    """
+    from runtime.padding import padded_axis
+    mid3 = NamedSharding(mesh_xy, P("x", None, "y"))
+    zq_par = NamedSharding(mesh_xy, P(("x", "y"), None, None))
+
+    def flat_rows(nz_):
+        return padded_axis(nq_irr * int(nz_), mesh_xy, name="cd (q, z) flat").carrier
+
+    def cd_to_qz(chi4):
+        """[nz, nq_irr, n, n] face -> [(q, z) padded, n, n] q-major flat on the (q,z)-parallel layout."""
+        nz_ = chi4.shape[0]
+        flat = jnp.swapaxes(chi4, 0, 1).reshape((nq_irr * nz_, n, n))
+        pad = flat_rows(nz_) - nq_irr * nz_
+        if pad:
+            flat = jnp.pad(flat, ((0, pad), (0, 0), (0, 0)))
+        flat = jax.lax.with_sharding_constraint(flat, mid3)
+        return jax.lax.with_sharding_constraint(flat, zq_par)
+
+    def cd_roots_qz(h, nz_):
+        return cd_to_qz(jnp.broadcast_to(h[None], (nz_,) + tuple(h.shape)))
+
+    def rows(flat, nz_):
+        return flat if int(flat.shape[0]) == nq_irr * nz_ else flat[:nq_irr * nz_]
+    return SimpleNamespace(to_qz=jax.jit(cd_to_qz), roots_qz=jax.jit(cd_roots_qz, static_argnums=1, out_shardings=zq_par),
+                           rows=rows, flat_rows=flat_rows)
+
+
+def carrier_band_blocks(src, mesh_xy, *, unfold=None):
+    """``block(lo, width)`` -> psi[:, lo:lo + width] on the full k grid, replicated: one band block of the carrier.
+
+    ``src`` [nk_src, nb, s, n] is the psi carrier in any placement (the face ``PSI_NMU_SPEC`` in production);
+    ``unfold`` None (src spans the full k grid) or a function [nk_src, b, s, n] -> [nk, b, s, n] (the typed
+    parent action, replicated in and out).  The carrier is placed once on the ``axis`` layout
+    (``common.wfn_layout.psi_specs``: bands local, mu on y; 1/P_y of the carrier per rank), so a block is a
+    local band slice gathered over y and then unfolded: nothing wider than one block is replicated.
+    ``width`` is static (one compile per width), ``lo`` is not; ``lo + width`` must not exceed nb.
+    """
+    from common.wfn_layout import psi_specs
+    target = NamedSharding(mesh_xy, psi_specs("axis")[0])
+    held = src if getattr(src, "sharding", None) == target else jax.jit(lambda a: a * 1.0, out_shardings=target)(src)
+    nb = int(held.shape[1])
+    rep = NamedSharding(mesh_xy, P())
+    take = jax.jit(lambda a, lo, w: jax.lax.dynamic_slice_in_dim(a, lo, w, axis=1) * 1.0, static_argnums=2,
+                   out_shardings=rep)
+
+    def block(lo, width):
+        lo, width = int(lo), int(width)
+        if lo < 0 or lo + width > nb:
+            raise ValueError(f"GATE cd_band_block: bands [{lo}, {lo + width}) outside the carrier's {nb}")
+        out = take(held, jnp.int32(lo), width)
+        return out if unfold is None else unfold(out)
+    return block
+
+
+def pair_psi_slabs(block, mesh_xy, *, rows_q, rows_nq, l0, L, L_neg, block_bands):
+    """Per-rank pair slabs (q-sharded like W): psi at the rows k - q of each rank's own pairs.
+
+    ``block`` is :func:`carrier_band_blocks`; ``rows_q`` / ``rows_nq`` [nq_pad, kw] int: the k - q rows of
+    pair q (dense kernels and x >= 0 residues) and of pair -q (x < 0 residues).  Returns
+    ``(psi_q [nq_pad, kw, L, s, n], psi_nq [nq_pad, kw, L_neg, s, n])`` on P(('x','y')): the bands l0 + [0, L)
+    and l0 + [0, L_neg).  Bands stream ``block_bands`` at a time: each block is gathered once and every
+    rank writes its own q rows into its (donated) slab.  The values are copies of the carrier's.
+    """
+    axes = ("x", "y")
+    qsh = NamedSharding(mesh_xy, P(axes))
+    rows_q, rows_nq = np.asarray(rows_q, np.int32), np.asarray(rows_nq, np.int32)
+    nq_pad, kw = rows_q.shape
+    rq, rn = (jax.make_array_from_callback(r.shape, qsh, lambda idx, r=r: r[idx]) for r in (rows_q, rows_nq))
+    first = block(l0, min(int(block_bands), int(L)))
+    ns, n, dtype = int(first.shape[2]), int(first.shape[3]), first.dtype
+
+    def zeros(width):
+        return jax.jit(lambda: jnp.zeros((nq_pad, kw, width, ns, n), dtype), out_shardings=qsh)()
+
+    def write_local(slab, blk, rows, b0):
+        return jax.lax.dynamic_update_slice_in_dim(slab, blk[rows], b0, axis=2)
+    put = jax.jit(shard_map(write_local, mesh=mesh_xy, in_specs=(P(axes), P(), P(axes), P()), out_specs=P(axes),
+                            check_vma=False), donate_argnums=0)
+    psi_q, psi_nq = zeros(int(L)), zeros(int(L_neg))
+    for b0 in range(0, int(L), int(block_bands)):
+        w = min(int(block_bands), int(L) - b0)
+        blk = first if b0 == 0 else block(l0 + b0, w)
+        psi_q = put(psi_q, blk, rq, jnp.int32(b0))
+        if b0 < L_neg:
+            wn = min(w, int(L_neg) - b0)
+            psi_nq = put(psi_nq, blk if wn == w else blk[:, :wn], rn, jnp.int32(b0))
+        del blk
+    del first
+    return psi_q, psi_nq
+
+
 # ------------------------------------------------------------------------------- chi0 provider
 def cd_chunk_plan(n, nq_irr, nq_pad, ndev, n_imag, J, override=0):
     """``(chunk_imag, chunk_real, n_imag_pad, J_pad)`` of the CD streams (TASTE 96).
 
     The tile is ``runtime.tiles.tile_units`` of the chunk's own per-unit bytes (or the
-    ``cd_knot_chunk`` override), rounded up so the (q, z) flat axis divides by P; the counts are
-    padded to whole chunks.  The precompute CLI (``gw.cd.chi0_rules``) plans the same windows.
+    ``cd_knot_chunk`` override), sized by :func:`knot_chunk`: a chunk below P / gcd(nq_irr, P) units is
+    kept and the (q, z) flat axis takes zero rows (:func:`qz_flat_programs`), a larger one is rounded up
+    so the flat axis divides by P.  The counts are padded to whole chunks.  The precompute CLI
+    (``gw.cd.chi0_rules``) plans the same windows.
     """
     from runtime.tiles import tile_units
-    zq_mult = ndev // int(np.gcd(nq_irr, ndev))
 
     def tile(axis, count):
-        units = override or tile_units(chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis=axis), count)
-        return int(-(-max(1, min(units, count)) // zq_mult) * zq_mult)
+        return knot_chunk(override or tile_units(chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis=axis), count),
+                          count, ndev=ndev, nq_irr=nq_irr)
     chunk_i, chunk_r = tile("imag", n_imag), tile("real", J)
     return chunk_i, chunk_r, -(-n_imag // chunk_i) * chunk_i, -(-J // chunk_r) * chunk_r
 
@@ -563,7 +853,7 @@ def compute_sigma_c_cd_omega_grid(
     from gw import response_bank as rb
     from gw.ppm_sigma import SigmaOmegaResult, sigma_band_axis
     from gw.w_isdf import _w_solve_pref_scalar
-    from runtime.tiles import TILE_BYTES
+    from runtime.tiles import TILE_BYTES, tile_units
     from symmetry_maps import (kgrid_shift_map, q_negation_index, star_tables_of,
                                unfold_file_wedge_band_operator, unfold_wavefunction_local)
 
@@ -586,7 +876,6 @@ def compute_sigma_c_cd_omega_grid(
     face4 = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     qpar3 = NamedSharding(mesh_xy, P(("x", "y"), None, None))
     qpar4 = NamedSharding(mesh_xy, P(None, ("x", "y"), None, None))
-    mid3 = NamedSharding(mesh_xy, P("x", None, "y"))
     ndev = jax.device_count()
     ledger = []
 
@@ -675,7 +964,7 @@ def compute_sigma_c_cd_omega_grid(
     J = int(np.ceil(reach_ry / h_ry)) + 2
     u_ry_all, w_ry_all = (np.asarray(v) / EV for v in tan_mapped_gauss_rule(n_imag, eta * EV))
 
-    # ---- tiles (TASTE 96): from the chunk's shapes; (q, z) flat axis divisible by P -------------------
+    # ---- tiles (TASTE 96): from the chunk's shapes; any chunk (the (q, z) flat axis takes zero rows) -----
     override = int(cd_handle.get("knot_chunk") or 0)
     chunk_i, chunk_r, n_imag_pad, J_pad = cd_chunk_plan(n, nq_irr, nq_pad, ndev, n_imag, J, override)
     u_ry = np.concatenate([u_ry_all, np.full(n_imag_pad - n_imag, u_ry_all[-1])])
@@ -694,35 +983,53 @@ def compute_sigma_c_cd_omega_grid(
     band_summary["build_s"] = round(time.monotonic() - t_bands, 3)
     _say(print_fn, started, "residue band tables (the rows each knot chunk contracts): " + json.dumps(band_summary))
 
-    # ---- wavefunctions at every full k (parents unfolded by the typed centroid action) ---------------
+    # ---- wavefunctions: per-rank pair slabs, streamed from the carrier one band block at a time ---------
     carrier = wfns.green_parent
+    unfold = None
     if wfns.psi_nmu is not None and (carrier is None or int(wfns.psi_nmu.shape[0]) == nk):
-        psi_full = jax.jit(lambda a: a * 1.0, out_shardings=rep)(wfns.psi_nmu)      # [nk, nb, s, n]
+        src = wfns.psi_nmu                                                           # [nk, nb, s, n]
     else:
         plan = carrier.plan
-        psi_par = jax.jit(lambda a: a * 1.0, out_shardings=rep)(carrier.psi_nmu)   # [n_parent, nb, s, n]
-        if int(plan.n_parent) == nk:
-            psi_full = psi_par
-        else:
-            psi_full = jax.jit(lambda a: unfold_wavefunction_local(
+        src = carrier.psi_nmu                                                        # [n_parent, nb, s, n]
+        if int(plan.n_parent) != nk:                 # parents unfolded per block by the typed centroid action
+            unfold = jax.jit(lambda a: unfold_wavefunction_local(
                 a, irr_idx=np.asarray(plan.irr_idx), sym_idx=np.asarray(plan.sym_idx),
                 k_irr_frac=np.asarray(plan.k_parent_frac), local_perm=np.asarray(plan.sym_perm),
                 L_table=np.asarray(plan.L_table), spin_action_full=np.asarray(plan.spin_action_full),
-                n_sym_spatial=int(plan.n_sym_spatial), spin_axis=2, mu_axis=3), out_shardings=rep)(psi_par)
-    if tuple(int(v) for v in psi_full.shape[:2]) != (nk, nb_full) or int(psi_full.shape[-1]) != n:
-        raise ValueError(f"GATE cd_psi_shape: {psi_full.shape} vs (nk={nk}, nb_full={nb_full}, s, n={n})")
-    psi_L = jax.jit(lambda a: a[:, l0:l1] * 1.0, out_shardings=rep)(psi_full)               # [nk, L, s, n]
-    psi_M = jax.jit(lambda a, r: a[r, m0:m1] * 1.0, out_shardings=rep)(psi_full, jnp.asarray(rows_all))
-    del psi_full
+                n_sym_spatial=int(plan.n_sym_spatial), spin_axis=2, mu_axis=3), out_shardings=rep)
+    if int(src.shape[1]) != nb_full or int(src.shape[-1]) != n:
+        raise ValueError(f"GATE cd_psi_shape: {tuple(src.shape)} vs (k, nb_full={nb_full}, s, n={n})")
+    ns = int(src.shape[2])
+    L_neg = max(1, int(band_summary["extent_pos_neg"][1]))          # the x < 0 tables read bands [0, L_neg) only
+    band_tile = int(cd_handle.get("band_tile") or 0) or tile_units(band_bytes_per_unit(n_rows, nb_s, n, ns, nE), L)
+    slab_block = tile_units(16.0 * ns * n * (int(src.shape[0]) + nk + 2 * nq_loc * n_rows), L)
+    mem_plan = cd_memory_plan(n=n, nq_irr=nq_irr, nk=nk, n_carrier_k=int(src.shape[0]), nb_carrier=nb_full,
+                              n_rows=n_rows, nb_s=nb_s, L=L, L_neg=L_neg, ns=ns, n_omega=nE, ndev=ndev,
+                              mesh_y=int(mesh_xy.shape["y"]), chunk_imag=chunk_i, chunk_real=chunk_r,
+                              band_tile=min(band_tile, L), slab_block=slab_block, wedge=nq_irr != nk)
+    _say(print_fn, started, f"band tile {min(band_tile, L)} of L={L} (x < 0 slab {L_neg} bands), slab block "
+         f"{slab_block}; memory plan per rank (GB, cd_memory_plan): "
+         + json.dumps({k: round(v / 1e9, 2) for k, v in mem_plan["phases"].items()})
+         + f" peak {mem_plan['peak_bytes'] / 1e9:.2f} ({mem_plan['peak_phase']})")
+    block = carrier_band_blocks(src, mesh_xy, unfold=unfold)
+    psi_m_full = block(m0, nb_s)                                                     # [nk, nb_s, s, n] replicated
+    if int(psi_m_full.shape[0]) != nk:
+        raise ValueError(f"GATE cd_psi_shape: unfolded carrier has {int(psi_m_full.shape[0])} k rows vs nk={nk}")
+    psi_M = jax.jit(lambda a, r: a[r] * 1.0, out_shardings=rep)(psi_m_full, jnp.asarray(rows_all))
+    del psi_m_full
+    psi_q, psi_nq = pair_psi_slabs(block, mesh_xy, rows_q=KMQ_pad[:, rows_all], rows_nq=KMQ_pad[qneg_pad][:, rows_all],
+                                   l0=l0, L=L, L_neg=L_neg, block_bands=slab_block)
+    del block
 
     def _rep(a):
         return replicate_to_mesh(np.asarray(a), mesh_xy)
-    tabs = dict(psi_L=psi_L, psi_M=psi_M, KMQ=_rep(KMQ_pad.astype(np.int32)), kw=_rep(rows_all.astype(np.int32)),
-                enk=_rep(enk_L), f=_rep(f_L), omega=_rep(omega), eps_own=_rep(eps_own),
-                qneg=_rep(qneg_pad.astype(np.int32)), qvalid=_rep(qvalid), u_all=_rep(u_ry_all), w_all=_rep(w_ry_all))
+    tabs = dict(psi_q=psi_q, psi_nq=psi_nq, psi_M=psi_M, KMQ=_rep(KMQ_pad.astype(np.int32)),
+                kw=_rep(rows_all.astype(np.int32)), enk=_rep(enk_L), f=_rep(f_L), omega=_rep(omega),
+                eps_own=_rep(eps_own), qneg=_rep(qneg_pad.astype(np.int32)), qvalid=_rep(qvalid), u_all=_rep(u_ry_all),
+                w_all=_rep(w_ry_all))
     u_dev, w_dev = _rep(u_ry), _rep(w_ry)
     beta = tuple(float(b) for b in laws.BETA_RY)
-    K = build_contraction_kernels(mesh_xy, nk=nk, nq_loc=nq_loc, eta=eta, h_ry=h_ry, beta=beta)
+    K = build_contraction_kernels(mesh_xy, nk=nk, nq_loc=nq_loc, eta=eta, h_ry=h_ry, beta=beta, band_tile=band_tile)
 
     # ---- Coulomb: wedge operator, full zone, roots ------------------------------------------------------
     V_q = cd_handle["V_q"]
@@ -749,39 +1056,29 @@ def compute_sigma_c_cd_omega_grid(
     h_irr, _, negative, support = sqrt_v(v_irr)
     if bool(np.any(host(negative))):
         raise ValueError("GATE cd_coulomb_psd: negative eigenvalue in V_q")
-    h_rep = jax.jit(lambda a: a * 1.0, out_shardings=rep)(h_irr)                      # [nq_irr, n, n]
-    zq_par = NamedSharding(mesh_xy, P(("x", "y"), None, None))
+    # The roots stay on the face; roots_qz lays them on the (q, z) flat rows as chi is laid (no replicated copy).
     dyson_pair, dyson_value = build_dyson_kernels(mesh_xy, n=n, pref=pref)
-
-    def cd_to_qz(chi4):
-        """[nz, nq_irr, n, n] face -> [(q, z), n, n] q-major flat on the (q,z)-parallel layout."""
-        nz_ = chi4.shape[0]
-        flat = jnp.swapaxes(chi4, 0, 1).reshape((nq_irr * nz_, n, n))
-        flat = jax.lax.with_sharding_constraint(flat, mid3)
-        return jax.lax.with_sharding_constraint(flat, zq_par)
-    to_qz = jax.jit(cd_to_qz)
-    roots_qz = jax.jit(lambda h, nz_: jnp.repeat(h, nz_, axis=0, total_repeat_length=nq_irr * nz_),
-                       static_argnums=1, out_shardings=zq_par)
+    QZ = qz_flat_programs(mesh_xy, nq_irr=nq_irr, n=n)
+    to_qz, roots_qz = QZ.to_qz, QZ.roots_qz
 
     pad_rows = nq_pad - nk
 
-    def cd_full_zone_direct(flat):
-        nz_ = flat.shape[0] // nq_irr
-        w = jnp.swapaxes(flat.reshape((nq_irr, nz_, n, n)), 0, 1)
+    def cd_full_zone_direct(flat, nz_):
+        w = jnp.swapaxes(QZ.rows(flat, nz_).reshape((nq_irr, nz_, n, n)), 0, 1)
         return jnp.pad(w, ((0, 0), (0, pad_rows), (0, 0), (0, 0))) if pad_rows else w
-    full_zone_direct = jax.jit(cd_full_zone_direct, out_shardings=qpar4)
-    take_z = jax.jit(lambda flat, iz: jax.lax.dynamic_index_in_dim(
-        flat.reshape((nq_irr, flat.shape[0] // nq_irr, n, n)), iz, axis=1, keepdims=False), out_shardings=face)
+    full_zone_direct = jax.jit(cd_full_zone_direct, static_argnums=1, out_shardings=qpar4)
+    take_z = jax.jit(lambda flat, nz_, iz: jax.lax.dynamic_index_in_dim(
+        QZ.rows(flat, nz_).reshape((nq_irr, nz_, n, n)), iz, axis=1, keepdims=False), static_argnums=1,
+        out_shardings=face)
     to_qpar = jax.jit(lambda a: (jnp.pad(a, ((0, pad_rows), (0, 0), (0, 0))) if pad_rows else a * 1.0),
                       out_shardings=qpar3)
     stack_q = jax.jit(lambda *a: jnp.stack(a), out_shardings=qpar4)
 
-    def full_zone(flat):
-        """[(q, z) flat] -> [nz, nq_pad, n, n] q-parallel (unfold per z on wedge decks)."""
+    def full_zone(flat, nz_):
+        """[(q, z) flat] -> [nz, nq_pad, n, n] q-parallel (zero rows dropped; unfold per z on wedge decks)."""
         if unfold_w is None:
-            return full_zone_direct(flat)
-        nz_ = flat.shape[0] // nq_irr
-        return stack_q(*[to_qpar(unfold_w(take_z(flat, iz))) for iz in range(nz_)])
+            return full_zone_direct(flat, nz_)
+        return stack_q(*[to_qpar(unfold_w(take_z(flat, nz_, iz))) for iz in range(nz_)])
 
 
     def cd_fd9_slope(chi_e, z_core):
@@ -845,6 +1142,7 @@ def compute_sigma_c_cd_omega_grid(
     sx_cd = K.sigma_x(to_qpar(v_full), zeros(n_rows, nb_s, nb_s), tabs)
     sx_cd = sx_cd[:nk_red] if cert else sx_cd
     jax.block_until_ready(sx_cd)
+    del v_full                                                     # the full-zone V_q is read by Sigma_x only
     clock("sigma_x", t0)
     sx_cd_h = host(sx_cd)
     sx_note = "sig_x not comparable (shape)"
@@ -875,12 +1173,12 @@ def compute_sigma_c_cd_omega_grid(
         jax.block_until_ready(chi)
         clock("chi0", t0)
         t0 = time.monotonic()
-        w_flat = dyson_value(roots_qz(h_rep, chunk_i), to_qz(chi))
+        w_flat = dyson_value(roots_qz(h_irr, chunk_i), to_qz(chi))
         del chi
         jax.block_until_ready(w_flat)
         clock("dyson", t0)
         t0 = time.monotonic()
-        W = full_zone(w_flat)
+        W = full_zone(w_flat, chunk_i)
         del w_flat
         jax.block_until_ready(W)
         clock("unfold", t0)
@@ -910,12 +1208,12 @@ def compute_sigma_c_cd_omega_grid(
         dchi = slope_fn(chi_e, z_core)
         chi_c = core_fn(chi_e)
         del chi_e
-        wc_flat, dw_flat = dyson_pair(roots_qz(h_rep, chunk_r), to_qz(chi_c), to_qz(dchi))
+        wc_flat, dw_flat = dyson_pair(roots_qz(h_irr, chunk_r), to_qz(chi_c), to_qz(dchi))
         del chi_c, dchi
         jax.block_until_ready(dw_flat)
         clock("dyson", t0)
         t0 = time.monotonic()
-        W, dW = full_zone(wc_flat), full_zone(dw_flat)
+        W, dW = full_zone(wc_flat, chunk_r), full_zone(dw_flat, chunk_r)
         del wc_flat, dw_flat
         jax.block_until_ready(dW)
         clock("unfold", t0)
@@ -978,7 +1276,10 @@ def compute_sigma_c_cd_omega_grid(
                    seconds=timings, elapsed_s=time.monotonic() - started, sigma_x_identity=sx_note,
                    coulomb_support_ranks=[int(host(support).min()), int(host(support).max())],
                    full_bz=full_bz, kw_rows=kw_rows.tolist(), finite=finite, ndev=ndev, symmetry_certificate=cert_note,
-                   residue_bands=band_summary, chi0_rule=chi_rule)
+                   residue_bands=band_summary, chi0_rule=chi_rule, band_tile=min(band_tile, L),
+                   psi_slab_bands=[L, L_neg], slab_block=slab_block, qz_flat_rows=[QZ.flat_rows(chunk_i), QZ.flat_rows(chunk_r)],
+                   memory_plan_gb=dict({k: v / 1e9 for k, v in mem_plan["phases"].items()},
+                                       peak=mem_plan["peak_bytes"] / 1e9, peak_phase=mem_plan["peak_phase"]))
     if rank0 and run_dir is not None:
         np.savez(os.path.join(run_dir, "cd_sigma_own_energy.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
                  eps_own_ry=eps_own[:nk_red], sigma_c_own_ry=own, sigma_c_anchor_own_ry=parts["anchor"],

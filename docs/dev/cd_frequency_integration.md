@@ -36,7 +36,7 @@ The laws are `gw.cd.laws`, pinned on CPU against the ordered (time-reversal-exac
 | W_c, dW_c/ds | the response bank's pair equations, X = pref·HχH, W_c = HX(1−X)⁻¹H, dW_c/ds = W(pref·dχ)W, as a local batched LU over the (q, z) flat axis (`gw.cd.sigma.build_dyson_kernels`) |
 | W at star q | `symmetry_maps.QirrOperator.unfold` with the general-operator `pair_transpose` rule |
 | Σ_c(k) at star k | `symmetry_maps.unfold_file_wedge_band_operator` (rule `transpose`) from the file wedge |
-| the contraction | `gw.cd.sigma.build_contraction_kernels`: one `shard_map` over q; pair densities ρ_q[k,m,l,μ] recomputed per q from replicated ψ tables; on the real axis only the banded rows of each knot chunk (below) |
+| the contraction | `gw.cd.sigma.build_contraction_kernels`: one `shard_map` over q; pair densities ρ_q[k,m,l,μ] recomputed per q and per band tile from the rank's pair slab; on the real axis only the banded rows of each knot chunk (below) |
 
 ## Banded residue rows (real axis)
 
@@ -65,14 +65,35 @@ sized from per-unit bytes alone:
     imaginary node: 16 n² (2 N_q,irr + N_q) / P        real knot: 16 n² (5 N_q,irr + 2 N_q) / P
 
 (n = packed centroids, N_q padded to a multiple of P with zero W rows).  The last chunk is padded with
-zero-weight nodes or unreferenced knots, so every chunk has one shape.  The real axis needs no W_−q
-gather: the rank that holds W_q′ adds pair q′'s x ≥ 0 residues and pair (−q′)'s x < 0 residues,
-recomputing ρ_−q′ from the replicated tables.  Each kernel returns acc + psum(increment).
+zero-weight nodes or unreferenced knots, so every chunk has one shape.  A chunk of at least
+P / gcd(N_q,irr, P) units is rounded up to a multiple of it (its (q, z) flat axis divides P); a smaller
+chunk is kept, and the flat axis takes zero rows up to a multiple of P (`qz_flat_programs`; a zero row
+has χ = 0 and H = 0, so its W_c is exactly zero and is dropped before the unfold).  `knot_chunk` holds the
+rule; at the ZnO anchor deck (n ≈ 9600, P = 64) one knot is 3.9 GB, so the chunk is 1, where the old
+rounding forced 8.  The real axis needs no W_−q gather: the rank that holds W_q′ adds pair q′'s x ≥ 0
+residues and pair (−q′)'s x < 0 residues, recomputing ρ_−q′ from its pair slab.  Each kernel returns
+acc + psum(increment).
 
-Per-rank resident objects that do **not** divide by P (implementation limit of the first landing):
-the ψ tables (N_k·L·N_s·n·16 B) and the three accumulators (N_ω·N_k,red·N_Σ²·16 B each).  At the
-Fe 64-k, 26-band, 401-ω deck these are 22 MB and 3 × 278 MB.  A face-sharded accumulator is the
-step that removes the limit.
+**Band tiles.**  The l sum of every kernel runs `cd_band_tile` bands at a time (`tile_sum`: a scan over
+the full tiles and one tail; on the real axis, columns of each branch's band table), so ρ[k,m,l,μ] and the
+contraction intermediates exist for one tile only.  The planner tile is `tile_units` of
+`band_bytes_per_unit` = 16 k_w [n (3 m + s) + 8 m² + 12 N_ω] (ZnO: 181 MB per band, tile 5 of 2503).  A
+tile at least the band count (at least the widest table on the real axis) is the untiled program bit for
+bit; smaller tiles change only the summation order (CPU pins `tests/test_cd_band_tiles.py`,
+`tests/test_cd_consumer_tiles.py`: ≤ 1e-14 relative).
+
+**ψ and the Coulomb roots.**  ψ enters as per-rank pair slabs, q-sharded like W (`pair_psi_slabs`):
+ψ_{k−q,l} at the file-wedge rows of the rank's own pairs over every band of the l sum, and of the pairs
+−q over the bands the x < 0 tables read (`residue_band_tables` reports that extent; the occupied bands
+for an insulator).  They are built once, one band block at a time (`carrier_band_blocks`: the carrier
+placed on the `axis` layout, a block gathered and unfolded, each rank writing its own rows), so no ψ
+array wider than one block is replicated.  The Coulomb roots H stay on the face; `roots_qz` lays them on
+the (q, z) flat rows as χ is laid.
+
+**Per-rank plan.**  `cd_memory_plan` gives the resident objects (pair slabs, ψ_M, the three
+accumulators N_ω·N_k,red·N_Σ²·16 B, the roots on the face, one band tile) and the peak of each phase
+(slab build, Σ_x, imaginary chunk, real chunk); the run log and the receipt (`memory_plan_gb`) carry it.
+The accumulators remain replicated (3 × 44 MB at the ZnO deck).
 
 ## Refusals (`GATE cd_*`, parse time unless noted)
 
@@ -89,7 +110,8 @@ only), `cd_band_extrapolation_unimplemented`, `cd_single_eta` (no per-window η)
 
 `cd_sigma_own_energy.npz` (the diagonal at the DFT energies and its anchor, imaginary and real parts),
 `cd_sigma_receipt.json` (recipe, J, reach, chunks and per-unit bytes, per-stage seconds, Σ_x identity,
-symmetry certificate, `residue_bands` widths and live/contracted fractions), `cd_leak_ledger.csv` (per chunk: seconds, bytes in use, pool high-water read without reset --
+symmetry certificate, `residue_bands` widths, live/contracted fractions and extents, `band_tile`,
+`psi_slab_bands`, `qz_flat_rows`, `memory_plan_gb`), `cd_leak_ledger.csv` (per chunk: seconds, bytes in use, pool high-water read without reset --
 cumulative since the enclosing stage boundary, which `common.timing` owns -- and live arrays; a leak
 shows as a rise after the first chunk).  `LORRAX_CD_STAR_CERTIFICATE=N` (instrument, off by default) computes
 one non-identity member of N k stars directly and compares it with the wedge-unfolded cube.

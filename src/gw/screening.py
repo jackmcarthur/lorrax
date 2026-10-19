@@ -771,7 +771,7 @@ def compute_screening_model(
                 V_q=V_q, imaginary_nodes=int(config.sigma.cd_imaginary_nodes),
                 knot_step_ev=float(config.sigma.cd_knot_step_ev),
                 residue_reach_ev=config.sigma.cd_residue_reach_ev,
-                knot_chunk=int(config.sigma.cd_knot_chunk),
+                knot_chunk=int(config.sigma.cd_knot_chunk), band_tile=int(config.sigma.cd_band_tile),
                 chi0_rule_tolerance=float(config.sigma.cd_chi0_rule_tolerance),
                 chi0_rule_capacity=int(config.sigma.cd_chi0_rule_capacity),
                 chi0_rules_file=str(config.sigma.cd_chi0_rules_file), run_dir=run_dir)}
