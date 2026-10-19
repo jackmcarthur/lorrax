@@ -135,9 +135,20 @@ def get_or_init_context(mesh: Mesh, *, col_major: bool = True) -> int:
         h = _CTX_CACHE.get(key)
         if h is not None:
             return h
+        import time
+        started = time.monotonic()
         h = _make_ctx(mesh, col_major)
         _CTX_KEYS[key] = loader.bind_context("CUDA", _ctx_config(key), h)
         _CTX_CACHE[key] = h
+        if int(jax.process_index()) == 0:
+            # Where in the run each context (its NCCL communicator, cuSOLVERMp handle and
+            # grid) is created: a first one created late, inside a solve's dispatch path,
+            # shows here.
+            p, q, _ = key
+            print(f"  [distrib_la.cusolvermp] context {len(_CTX_CACHE)} created: grid {p}x{q} "
+                  f"{'column' if col_major else 'row'}-major over {int(jax.process_count())} "
+                  f"process(es) in {time.monotonic() - started:.2f} s"
+                  + (" (the process's first)" if len(_CTX_CACHE) == 1 else ""), flush=True)
         return h
 
 

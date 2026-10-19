@@ -977,6 +977,60 @@ def _compiled(kernel, args, *, ahead=False):
     return future if ahead else future.result()
 
 
+#: A dispatch argument of at most this many bytes may reach its executable in another
+#: placement (scalars, quadrature rules): JAX moves it at the call for nothing.
+DISPATCH_MOVE_BYTES = 1 << 20
+#: Stages whose argument placements print once per process (rank 0).
+DISPATCH_PRINT_STAGES = ("sample_dyson",)
+_DISPATCH_PRINTED: set = set()
+
+
+def _dispatch_layout(executable, args, stage):
+    """Check each argument leaf against the placement ``executable`` was compiled for.
+
+    A committed ``jax.Array`` in another sharding is refused by JAX itself; a host array
+    (numpy) or an uncommitted array is silently moved at the call -- inside the dispatch,
+    unseen by the ledger and the stage timer -- and so is a leaf in another memory kind.
+    Refuses by name (GATE response_dispatch_layout) any such leaf over
+    :data:`DISPATCH_MOVE_BYTES` (run30k restart, 2026-10-19: sample_dyson ran 300 s with
+    SMs idle and PCIe RX ~2.7 GB/s). Returns the rows, printed once on rank 0 for
+    :data:`DISPATCH_PRINT_STAGES`."""
+    want = jax.tree.leaves(executable.input_shardings[0])
+    got = jax.tree.leaves(args)
+    if len(want) != len(got):
+        raise ValueError(f"GATE response_dispatch_layout: {stage}: {len(got)} argument leaves "
+                         f"for {len(want)} compiled inputs")
+    rows, bad = [], []
+    for i, (x, w) in enumerate(zip(got, want)):
+        shape = tuple(np.shape(x))
+        nbytes = int(np.prod(shape, dtype=np.int64)) * np.dtype(getattr(x, "dtype", np.float64)).itemsize
+        if isinstance(x, jax.Array):
+            sharding = x.sharding
+            placed = (f"{getattr(sharding, 'spec', type(sharding).__name__)} "
+                      f"{sharding.memory_kind}" + ("" if x.committed else " uncommitted"))
+            ok = (x.committed and sharding.memory_kind == w.memory_kind
+                  and sharding.is_equivalent_to(w, len(shape)))
+        else:
+            placed, ok = f"host {type(x).__name__}", False
+        row = (i, shape, nbytes, placed, f"{getattr(w, 'spec', w)} {w.memory_kind}", ok)
+        rows.append(row)
+        if not ok and nbytes > DISPATCH_MOVE_BYTES:
+            bad.append(row)
+    if stage in DISPATCH_PRINT_STAGES and stage not in _DISPATCH_PRINTED:
+        _DISPATCH_PRINTED.add(stage)
+        if jax.process_index() == 0:
+            for i, shape, nbytes, placed, wanted, ok in rows:
+                print(f"  [response dispatch] {stage} arg {i} {shape} {nbytes / 1e9:.3f} GB: "
+                      f"{placed}; compiled {wanted}{'' if ok else '  <- moved at the call'}", flush=True)
+    if bad:
+        raise RuntimeError(
+            f"GATE response_dispatch_layout: {stage}: " + "; ".join(
+                f"arg {i} {shape} ({nbytes / 1e9:.2f} GB) arrives {placed}, compiled for {wanted}"
+                for i, shape, nbytes, placed, wanted, _ in bad)
+            + ": JAX would move it inside the dispatch; place it as compiled first.")
+    return rows
+
+
 def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage, runtime_bytes=0):
@@ -1015,6 +1069,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 stream_temporaries_admitted=stream))
         with timing.section('bank.dispatch.' + stage, announce=stream,
                             label=f"shared-pole bank {stage} dispatch"):
+            _dispatch_layout(executable, args, stage)
             started = time.monotonic()
             result = executable(*args)
             # A checked program's executable returns its status too (checked_program).
