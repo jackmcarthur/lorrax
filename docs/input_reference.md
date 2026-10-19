@@ -20,6 +20,8 @@ generated: `python3 tools/gen_input_reference.py` rewrites each default cell fro
 parser no longer accepts, or a default cell differs from the code.
 
 The last section documents a different input file, the `[downfold]` deck.
+`bse.bsemat_cli` adds no deck keys: it reads the producer GW deck named by `-i`
+and takes its own flags ([drivers](drivers.md#bsemat-bsebsemat_cli)).
 
 ## System
 

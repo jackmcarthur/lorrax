@@ -94,6 +94,7 @@ nav:
       - S-tensor convention: theory/s-tensor-convention.md
       - LT splitting and the exchange head: theory/lt-exchange-head.md
       - SR/LR W densification: theory/w-srlr-densification.md
+      - BerkeleyGW bsemat export: theory/bgw-bsemat-export.md
       - The velocity operator: theory/qp-velocity.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
       - Non-Hermitian GN-PPM: theory/gn-ppm-nonhermitian.md
