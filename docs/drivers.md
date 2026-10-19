@@ -243,8 +243,14 @@ absorption reads (`no_symmetries_coarse_grid`); the file is written in its
 coefficient gauge and k order. `--bgw-eps` supplies the q list that fixes
 BerkeleyGW's head slot at zone-boundary ties. The run prints BerkeleyGW's
 `kernel.out` Frobenius lines and writes `<output>.json` with every gate's
-measured value. [The theory page](theory/bgw-bsemat-export.md) owns the
-equations, the conventions and the refusals.
+measured value. `--mu-small` (default `off`) first downfolds the bundle onto the
+file's band window (an integer, `kx` = k·N_b of the parent's centroids with
+N_b = NV + NC, or `auto` for the eigenvalue-rank ceiling; `--downfold-rcond`) with
+the [downfold](downfold.md) driver's selection and transfer, and builds the rows
+by GEMMs over the small W; the theory page gives its measured accuracy. `--q0-body dipole` adds the
+3-D q0 body term from the bundle's stored q → 0 wings. [The theory
+page](theory/bgw-bsemat-export.md) owns the equations, the conventions and the
+refusals.
 
 ## htransform — `bandstructure.htransform`
 

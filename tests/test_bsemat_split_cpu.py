@@ -180,3 +180,33 @@ def test_q0_dipole_body_equals_block_inverse():
     assert fig_bad["fold_gate"] > 1e-2
     assert np.linalg.norm(W - want) > 1e4 * np.linalg.norm(got - want)
     assert np.linalg.norm(add_q0_body_update(W, A, -D) - want) > 1e-1 * np.linalg.norm(want - W)
+
+
+def test_downfold_carries_the_parent_split():
+    """Z_S = Z T†, so W_S = T W T† is the parent's plane-wave W seen through ζ_S: the child
+    kernel's exact head/wing/body is the parent split carried by T (W₁₁ unchanged, z_S = T̄ z,
+    y_S = T̄ y). Re-splitting the child keeps a = V_S⁺ z_S* exact but recovers W₁₁ only where
+    the head plane wave lies in the child's span (head_row_S = 1)."""
+    rng, Z, v, V, W, Wpw = _system(60, 24, seed=3)
+    sp = head_split(V, W, Z[0], v[0], eigh=_eigh)
+    cplx = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)
+    n_s = 10
+    T = cplx(n_s, 24)
+    Zs = Z @ T.conj().T                                     # ζ_S = conj(T) ζ_L, index form
+    Vs, Ws = T @ V @ T.conj().T, T @ W @ T.conj().T
+    assert np.allclose(Vs, Zs.conj().T @ (v[:, None] * Zs), atol=1e-10)
+    assert np.allclose(Ws, Zs.conj().T @ Wpw @ Zs, atol=1e-10)
+    zS, yS = T.conj() @ Z[0], T.conj() @ sp.y
+    assert np.allclose(zS, Zs[0])
+    b, nc, nv = 3, 2, 3
+    Ccc, Cvv = cplx(b, nc, nc, n_s), cplx(b, nv, nv, n_s)
+    lam = rng.uniform(0.2, 1.0, b)
+    got = direct_parts(Ccc, Cvv, np.broadcast_to(Ws, (b, n_s, n_s)), np.broadcast_to(zS, (b, n_s)),
+                       np.broadcast_to(yS, (b, n_s)), np.full(b, sp.W11), omega=OMEGA, lam_q=lam)
+    want = _dense_parts(Ccc, Cvv, Zs, Wpw, lam)
+    for g, w, name in zip(got, want, ("head", "wing", "body")):
+        assert np.linalg.norm(g - w) < 1e-9 * np.linalg.norm(w), name
+    sc = head_split(Vs, Ws, zS, v[0], eigh=_eigh)
+    assert sc.figures["solve_residual"] < 1e-9
+    assert sc.figures["head_row"] < 1 - 1e-6
+    assert abs(sc.W11 - sp.W11) > 1e-6 * abs(sp.W11)

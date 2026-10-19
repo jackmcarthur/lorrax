@@ -140,6 +140,41 @@ BerkeleyGW combines the kernel with its own WFN coefficients. The writer therefo
 per k, the polar factor of the least-squares fit of LORRAX's ψ by the file's
 states evaluated at the centroids (the dipfix construction).
 
+## The downfold stage {#downfold}
+
+The parent's W lives on centroids fitted to the GW band range. The file needs
+only its own window, the N_b = n_v + n_c bands of the layout (TDA and
+`extended_kernel` share it). `--mu-small` (an integer, `kx` = k·N_b, `auto`) runs
+the downfold driver's own stages (docs/downfold.md) on that window before the
+rows. The default is `off`: on Si 4³ and MoS₂ 9×9 (N_b = 16) the stage adds
+20–24 meV and 14–19 meV at 7–14·N_b. At the certified ceiling (rcond 10⁻⁸;
+31·N_b and 47·N_b) it still adds 1.7 and 2.5 meV, against the parent file's 0.014 and
+0.245 meV from BerkeleyGW's own kernel. It reaches 0.05 meV only at
+0.84 μ_L (Si, rcond 10⁻¹⁰, outside the rank policy's certified κ). At these sizes the rows
+are not the cost, so the stage adds time and memory (REPORT, downfold sweep). The stages are the pair-density Gram, the orbit-closed CUR
+selection of μ_S parent centroids, and the transfer
+$T_q=S_{SS}(q)^+S_{SL}(q)$ at `--downfold-rcond`. The CUR fit
+$C_L\approx T_q^\dagger C_S$ of the window's pair amplitudes is the statement
+$Z_S=Z_LT_q^\dagger$ ($\zeta_S=\bar T\zeta_L$), so
+
+$$V_S=Z_S^\dagger vZ_S,\qquad W_S=T_qW_LT_q^\dagger=Z_S^\dagger W_{\rm PW}Z_S,\qquad
+z_S=\bar T_q z,\quad y_S=\bar T_q y,\quad W_{11}^S=W_{11}. \tag{E9}$$
+
+The plane-wave W does not change; only the pair densities it is contracted
+with do, $\rho_S=Z_SC_S$. The exact head, wing and body of the child kernel
+$C_S^\dagger W_SC_S$ are therefore E6–E7 with the parent's split carried by T.
+The writer splits at μ_L and transports $(z,y)$ with $\bar T_q$, $W$ with
+the congruence, and $\bar V_\Gamma$ with $T_0$. The rows then contract
+GEMMs of size μ_S. Re-splitting the child from $(V_S,W_S,z_S)$ alone keeps
+the solve exact, since $z_S^*=Z_S^\dagger e_1\in\mathrm{range}(V_S)$. It
+recovers $W_{11}$ only where $e_1\in\mathrm{span}(v^{1/2}Z_S)$, which is
+head_row_S = 1; with μ_S below the number of G that is not guaranteed. The writer
+runs it as a diagnostic: it gates the residual (`bsemat_downfold_head_solve`,
+10⁻⁶) and reports head_row_S and $|W_{11}^S/W_{11}-1|$.
+`tests/test_bsemat_split_cpu.py` checks E9 against the dense partition of
+$\rho_S^\dagger W_{\rm PW}\rho_S$. `--mu-small off` builds the rows on the
+parent's centroids.
+
 ## Gates {#gates}
 
 | rule | refuses when |
@@ -153,4 +188,5 @@ states evaluated at the centroids (the dipfix construction).
 | `bsemat_band_offset` | the WFN_co window energies differ from the restart's by more than 0.05 Ry |
 | `bsemat_q_list`, `bsemat_head_parent`, `bsemat_head_label`, `bsemat_head_length` | a pair's head momentum is missing from the q list, off the lattice, or not a shortest $q+G$ |
 | `bsemat_q0_wings_source`, `bsemat_q0_vector`, `bsemat_q0_body_dim` | `--q0-body dipole` without the bundle's stored wings, without a q₀ direction, or in a slab |
+| `bsemat_downfold_head_solve` | the child's $\lVert V_Sa-z_S^*\rVert/\lVert z_S^*\rVert>10^{-6}$; the downfold driver's own refusals (μ_S above the window Gram's eigenvalue rank, a budget below the first orbit) apply unchanged |
 | `bsemat_q0_wing_fold` | the stored fold $S_{\rm eff}-S_{\rm d}$ disagrees with $LW(\Gamma)R/\Omega$ on this W by more than 10⁻³ |

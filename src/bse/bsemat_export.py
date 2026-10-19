@@ -297,6 +297,104 @@ def _direct_row(psiL_X, psiL_Y, psiR_X, psiR_Y, W_flat, iq_pair, key_pair, z_key
     return order(head), order(wing), order(body)
 
 
+def _downfold_stage(*, mu_small, rcond, restart, psi_win, psi_1, psi_2, n_rmu, W_flat, V_flat,
+                    z_keys, y_keys, W11, keys, v_head_q, Vbar, grid, mesh_xy):
+    """The downfold (``gw.downfold``; docs/downfold.md) as the writer's first kernel stage.
+
+    The window is the file's own band set (``psi_win``: the n_v + n_c bands, bundle k
+    order); the pair-density Gram, the orbit-closed CUR selection and the transfer
+    T_q = S_SS⁺ S_SL are the driver's functions, unmodified. Every linear object of the
+    kernel then rides T: W_S = T W T†, V̄_Γ,S = T₀ V̄_Γ T₀†, and the split's vectors
+    z_S = T̄ z, y_S = T̄ y (Z_S = Z T†, so the plane-wave head W₁₁ is unchanged and the
+    child's head, wing and body are the parent's carried by T; docs/theory/bgw-bsemat-export.md
+    #downfold). ψ at the kept centroids is the column slice. The child split
+    (a = V_S⁺ z_S*) runs as a gated diagnostic: its residual is exact by construction,
+    its W₁₁ equals the parent's only where head_row_S = 1.
+    """
+    from gw.downfold import (BandWindow, pair_density_gram, select_cur_centroids,
+                             slice_psi_to_centroids, build_transfer, congruence, epsilon_w)
+    from file_io.restart_bundle import read_interaction_orbits
+    from runtime.padding import padded_mu_extent
+    from common.collectives import device_put_process_local
+
+    t0 = time.time()
+    sh = lambda *spec: NamedSharding(mesh_xy, P(*spec))
+    put = lambda a, *spec: device_put_process_local(np.ascontiguousarray(a), sh(*spec))
+    rep = jax.jit(lambda a: a, out_shardings=sh())
+    nw = int(psi_win.shape[1])
+    window = BandWindow(left=(0, nw), right=(0, nw))
+    kg = tuple(int(g) for g in grid)
+    psiY = put(psi_win, None, None, None, "y")
+    psiX = put(np.conj(psi_win).transpose(0, 3, 1, 2), None, "x", None, None)
+    S_LL = pair_density_gram(psiX, psiY, window, kgrid=kg, mesh_xy=mesh_xy)
+    S_q0 = jax.jit(lambda a: a[0], out_shardings=sh("x", "y"))(S_LL)
+    tables = read_interaction_orbits(restart, n_rmu, _log)
+    keep_idx, sel = select_cur_centroids(
+        S_q0, mu_small, rcond=rcond, select_tol=None, mesh_xy=mesh_xy, mu_large_logical=n_rmu,
+        print_fn=_log, sym_perm=None if tables is None else np.asarray(tables.sym_perm)[:, :n_rmu])
+    _log(sel.describe())
+    mu_S = int(sel.mu_small)
+    mu_S_pad = int(padded_mu_extent(mu_S, mesh_xy))
+    keep = np.asarray(keep_idx, dtype=np.int64)
+    psiSX, psiSY = slice_psi_to_centroids(psiX, psiY, keep, mu_S_pad, mesh_xy)
+    S_cross = pair_density_gram(psiSX, psiY, window, kgrid=kg, mesh_xy=mesh_xy)
+    S_SS = pair_density_gram(psiSX, psiSY, window, kgrid=kg, mesh_xy=mesh_xy)
+    T_x, T_y, reports = build_transfer(S_SS, S_cross, mesh_xy, rcond=rcond, print_fn=_log)
+    project = congruence(mesh_xy, T_x, T_y)
+    qmaj = jax.jit(lambda w: jnp.moveaxis(w, 2, 0), out_shardings=sh(None, "x", "y"))
+    flat = jax.jit(lambda w: jnp.moveaxis(w, 0, 2), out_shardings=sh("x", "y", None))
+    Wq = qmaj(W_flat)
+    W_Sq = project(Wq)
+    eps_W, _, _ = epsilon_w(Wq, S_LL, W_Sq, S_SS, mesh_xy)
+    del Wq, S_LL
+    V_Sq = project(qmaj(V_flat))
+    V0 = jax.jit(lambda v: v[None], out_shardings=sh(None, "x", "y"))(Vbar)
+    Vbar_S = jax.jit(lambda v: v[0], out_shardings=sh("x", "y"))(
+        congruence(mesh_xy, T_x[:1], T_y[:1])(V0))
+    T_h = np.asarray(rep(T_x))                                  # (nq, μ_S_pad, μ_L_pad)
+    zS = np.stack([np.conj(T_h[iq]) @ z_keys[k] for k, (iq, _) in enumerate(keys)])
+    yS = np.stack([np.conj(T_h[iq]) @ y_keys[k] for k, (iq, _) in enumerate(keys)])
+    del T_h
+    t_df = time.time() - t0
+
+    # The child split, as a diagnostic of the identity the downfold must keep.
+    V_h, W_h = np.asarray(rep(V_Sq)), np.asarray(rep(W_Sq))
+    res, hrow, w11 = [], [], []
+    for k, (iq, _) in enumerate(keys):
+        if iq == 0:
+            continue
+        sp = A.head_split(V_h[iq], W_h[iq], zS[k], float(v_head_q[iq]),
+                          eigh=np.linalg.eigh, xp=np, rcond=A.RCOND)
+        res.append(float(sp.figures["solve_residual"]))
+        hrow.append(float(sp.figures["head_row"]))
+        w11.append(abs(float(sp.W11) / float(W11[k]) - 1.0))
+    del V_h, W_h, V_Sq
+    if max(res) > 1e-6:
+        raise ValueError(f"GATE bsemat_downfold_head_solve: |V_S a - z_S*|/|z_S*| = {max(res):.2e} "
+                         "> 1e-6; z_S* must lie in range(V_S) = range(Z_S†) by construction.")
+    cut = lambda a: np.ascontiguousarray(np.pad(np.take(a, keep, axis=-1),
+                                                [(0, 0)] * (a.ndim - 1) + [(0, mu_S_pad - mu_S)]))
+    eps = np.asarray(eps_W, dtype=np.float64).ravel()
+    fig = {"mu_L": int(n_rmu), "mu_S_requested": int(sel.mu_small_requested or mu_S),
+           "mu_S": mu_S, "mu_S_pad": mu_S_pad, "N_b": nw, "rcond": float(rcond),
+           "ceiling_eigen_rank_pool": int(sel.eigen_rank_pool), "eigen_rank_kept": int(sel.eigen_rank_kept),
+           "orbits_kept": sel.n_orbits_kept, "orbits_pool": sel.n_orbits_pool,
+           "rank_per_q_min": int(min(r.rank_criterion for r in reports)),
+           "rank_per_q_max": int(max(r.rank_criterion for r in reports)),
+           "eps_W_min": float(np.nanmin(eps)), "eps_W_median": float(np.nanmedian(eps)),
+           "eps_W_max": float(np.nanmax(eps)),
+           "child_solve_residual_max": max(res), "child_head_row_min": min(hrow),
+           "child_head_row_max": max(hrow), "child_W11_rel_max": max(w11),
+           "wall_downfold_s": t_df}
+    _log(f"[bsemat] downfold: mu_L {n_rmu} -> mu_S {mu_S} (requested {fig['mu_S_requested']}, "
+         f"ceiling {fig['ceiling_eigen_rank_pool']} at rcond {rcond:g}); eps_W "
+         f"{fig['eps_W_min']:.2e}/{fig['eps_W_median']:.2e}/{fig['eps_W_max']:.2e}; child split: residual "
+         f"{max(res):.1e}, head_row {min(hrow):.6f}-{max(hrow):.6f}, |W11_S/W11 - 1| {max(w11):.1e}; "
+         f"{t_df:.1f} s")
+    return dict(W_flat=flat(W_Sq), z_keys=zS, y_keys=yS, Vbar=Vbar_S,
+                psi_1=cut(psi_1), psi_2=cut(psi_2), fig=fig)
+
+
 @partial(jax.jit, static_argnames=("omega",))
 def _exchange_row(T_cv, Ccv, kp, *, omega):
     """BerkeleyGW exchange of row k′ for all k, (nk, n2′, n2, n1′, n1) (E7).
@@ -316,7 +414,8 @@ def _ri(a):
 
 def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=False,
                       use_gauge_map=True, rcond=A.RCOND, bgw_eps=None, q0_body="head_less",
-                      q0_vector=None, q0_body_update=None, mesh_xy):
+                      q0_vector=None, q0_body_update=None, mu_small=None,
+                      downfold_rcond=None, mesh_xy):
     """Write ``out_path`` (BerkeleyGW bsemat.h5) from the deck's restart. Returns a summary dict.
 
     ``bgw_eps`` (an ``epsmat.h5``) supplies BerkeleyGW's own q wedge, so the
@@ -330,6 +429,9 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     ``S_cart_head_direct``; ``bsemat_algebra.q0_dipole_body_rows``) along
     BerkeleyGW's q0 (``q0_vector`` crystal, else the ``eps0mat.h5`` beside
     ``bgw_eps``); 3-D only, the term is O(q0) in a slab.
+    ``mu_small`` (int or ``"auto"``) runs the downfold on the file's band window
+    before the rows (``_downfold_stage``), at ``downfold_rcond`` (default the
+    downfold driver's); ``None`` builds the rows on the parent's μ.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -564,6 +666,19 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
 
     # Exchange operands: C_{n2 n1}(k) = Σ conj(ψ_n2) ψ_n1, T = C V̄_Γ.
     Vbar = data["V_q0"]
+    df_fig = None
+    if mu_small is not None:
+        from gw.downfold import DEFAULT_RCOND
+        dfo = _downfold_stage(
+            mu_small=mu_small, rcond=float(downfold_rcond or DEFAULT_RCOND), restart=restart,
+            psi_win=psi_win, psi_1=psi_1, psi_2=psi_2, n_rmu=n_rmu, W_flat=W_flat, V_flat=V_flat,
+            z_keys=z_keys, y_keys=y_keys, W11=W11, keys=keys, v_head_q=v_head_q, Vbar=Vbar,
+            grid=grid, mesh_xy=mesh_xy)
+        data["W_q"] = data["V_q_full"] = None
+        W_flat, V_flat = dfo["W_flat"], None
+        z_keys, y_keys, Vbar, psi_1, psi_2 = (dfo[k] for k in ("z_keys", "y_keys", "Vbar", "psi_1", "psi_2"))
+        df_fig = dfo["fig"]
+        p1x, p1y, p2x, p2y = put(psi_1, sx), put(psi_1, sy), put(psi_2, sx), put(psi_2, sy)
     vim = float(jnp.linalg.norm(Vbar.imag) / jnp.linalg.norm(Vbar))
     Ccv = A.pair_amplitudes(p2x, p1x, xp=jnp)                  # (nk, n2, n1, μ)
     T_cv = jnp.einsum("kcvm,mn->kcvn", Ccv, Vbar)
@@ -606,7 +721,7 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     for nm, v in zip(names, np.sqrt(fro)):
         _log(f" - {nm} : {v:21.12E}")
     summary = {"nk": nk, "n1b": n1b, "n2b": n2b, "keys": len(keys), "ties": n_ties,
-               "q0_body": q0_body, "q0_dipole": q0_fig,
+               "q0_body": q0_body, "q0_dipole": q0_fig, "downfold": df_fig,
                "frobenius": dict(zip(("head", "wing", "body", "exchange"), np.sqrt(fro).tolist())),
                "split": figs, "gauge": gfig, "vbar_imag_rel": vim,
                "wall_total_s": t_end - t0, "wall_rows_s": t_end - t_rows,
