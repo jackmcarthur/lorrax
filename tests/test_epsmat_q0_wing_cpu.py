@@ -212,7 +212,7 @@ def test_q0_body_policy_with_dipole_wings_writes_3d():
 def test_q0_wings_key_is_validated(tmp_path):
     from gw.epsmat_config import EpsmatConfig
     base = ("[epsmat]\nsource_restart = r.h5\nparent_input_file = gw.in\noutput_dir = out\n"
-            "epsilon_cutoff = 5\n")
+            "epsmat_ecut = 5\n")
     p = tmp_path / "a.in"; p.write_text(base)
     assert EpsmatConfig.from_input_file(str(p)).q0_wings == "dipole"
     p.write_text(base + "q0_wings = zero\n")

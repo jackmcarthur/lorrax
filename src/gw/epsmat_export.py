@@ -680,38 +680,67 @@ class QPlan(NamedTuple):
     gspace: object               # bgw_epsmat.QGspace
 
 
+def resolve_ecut(epsmat_ecut, full_ecuts, *, source):
+    """The written G cutoff (Ry): ``epsmat_ecut``, or the full sphere when it is 0.
+
+    ``full_ecuts`` is the largest cutoff the export can write, ``source``
+    names it for the receipt (``bgw_reference``'s ecuts, or the producer's
+    bare-Coulomb sphere). A cutoff below it selects the leading G of the same
+    BerkeleyGW order, so the file is the sub-block of the converged ε⁻¹
+    (docs/theory/bgw_epsmat_export.md#ecut); one above it refuses.
+    Returns ``(ecut, receipt)``.
+    """
+    full = float(full_ecuts)
+    e = float(epsmat_ecut)
+    if e <= 0.0:
+        return full, f"{full} Ry (full sphere: {source})"
+    if e > full + 1e-9:
+        _refuse("epsmat_ecut_beyond_sphere", f"epsmat_ecut {e} Ry",
+                f"<= {full} Ry ({source})",
+                "the export writes a sub-block of the stored ε⁻¹; G outside the full sphere "
+                "carry no response", "lower epsmat_ecut, or leave it 0 for the full sphere")
+    return e, f"{e} Ry (sub-block of the full sphere {full} Ry: {source})"
+
+
 def plan_export(cfg, src, *, print_fn=print):
     """The q rows and G lists of each output file, refusing unmatched q.
 
     With ``bgw_reference`` the q list, q0, ecuts and G order are BerkeleyGW's
     own (the order is also recomputed and must agree); otherwise every
     stored q ≠ 0 goes to ``epsmat.h5`` and Γ to ``eps0mat.h5`` at
-    ``q0_vector``.
+    ``q0_vector``. ``epsmat_ecut`` (0: the full sphere) keeps the leading
+    ``gcutoff`` G of that order at every q (:func:`resolve_ecut`).
     """
     import h5py
     from file_io import bgw_epsmat as be
     with h5py.File(src.wfn_file, "r") as w:
         comps = np.asarray(w["mf_header/gspace/components"][()], dtype=np.int64)
         bdot = np.asarray(w["mf_header/crystal/bdot"][()], dtype=np.float64)
+        ecutwfc = float(w["mf_header/kpoints/ecutwfc"][()])
+    bare_set = src.config.head.bare_coulomb_cutoff
+    bare = ecutwfc if bare_set is None else float(bare_set)    # gw_init's resolution of the V sphere
     gamma = np.flatnonzero(np.all(np.abs(src.q_stored) < 1e-12, axis=1))
     plans = {}
     for name in cfg.files:
         ref = os.path.join(cfg.bgw_reference, f"{name}.h5") if cfg.bgw_reference else ""
         if ref:
             h = be.read_epsmat_header(ref)
-            q_file, ecuts = h["qpts"], float(h["params/ecuts"])
+            q_file, full = h["qpts"], float(h["params/ecuts"])
+            src_name = f"ecuts of {ref}"
         elif name == "eps0mat":
-            q_file, ecuts = np.asarray([cfg.q0_vector]), cfg.epsilon_cutoff
+            q_file, full = np.asarray([cfg.q0_vector]), bare
+            src_name = "the producer's bare_coulomb_cutoff"
         else:
             keep = np.setdiff1d(np.arange(src.q_stored.shape[0]), gamma)
-            q_file, ecuts = np.mod(src.q_stored[keep], 1.0), cfg.epsilon_cutoff
+            q_file, full = np.mod(src.q_stored[keep], 1.0), bare
             q_file[np.abs(q_file - 1.0) < 1e-12] = 0.0
-        if src.config.head.bare_coulomb_cutoff is not None and ecuts > float(
-                src.config.head.bare_coulomb_cutoff) + 1e-9:
-            _refuse("epsmat_ecuts_beyond_coulomb", f"ecuts {ecuts} Ry",
-                    f"<= bare_coulomb_cutoff {src.config.head.bare_coulomb_cutoff} Ry",
+            src_name = "the producer's bare_coulomb_cutoff"
+        if bare_set is not None and full > bare + 1e-9:
+            _refuse("epsmat_ecuts_beyond_coulomb", f"ecuts {full} Ry",
+                    f"<= bare_coulomb_cutoff {bare} Ry",
                     "LORRAX's V and W carry v = 0 beyond the bare cutoff",
-                    "lower epsilon_cutoff or rerun GW with a larger bare_coulomb_cutoff")
+                    "lower epsmat_ecut or rerun GW with a larger bare_coulomb_cutoff")
+        ecuts, ecut_receipt = resolve_ecut(cfg.epsmat_ecut, full, source=src_name)
         rows = []
         for i, q in enumerate(q_file):
             if name == "eps0mat":
@@ -724,7 +753,7 @@ def plan_export(cfg, src, *, print_fn=print):
                         "a symmetry-rotated W is not reconstructed by this export",
                         "use a bundle stored on the full zone or a BerkeleyGW q list "
                         "of its stored wedge")
-            qg = be.q_gspace(comps, bdot, q, ecuts, is_q0=(name == "eps0mat"))
+            qg = be.q_gspace(comps, bdot, q, full, is_q0=(name == "eps0mat"))
             if ref:
                 qref, _ = be.read_q_gspace(ref, i)
                 if qref.nmtx != qg.nmtx or not np.array_equal(
@@ -734,12 +763,14 @@ def plan_export(cfg, src, *, print_fn=print):
                             "BerkeleyGW's own sortrx order", "Sigma maps rows by gind",
                             "report: the sort emulation disagrees with the reference")
                 qg = qref
+            if ecuts < full:                       # the leading G of the same order: a sub-block
+                qg = qg._replace(nmtx=be.gcutoff(qg.ekin[qg.order], ecuts))
             if name == "eps0mat" and np.any(comps[qg.order[0]] != 0):
                 _refuse("epsmat_q0_head_first", f"first eps G {comps[qg.order[0]].tolist()}",
                         "G = 0 first at q → 0", "the head is row 0", "report")
             rows.append(QPlan(i, int(idx[0]), np.asarray(q), g0[0], qg))
         plans[name] = (np.asarray(q_file), ecuts, rows)
-        print_fn(f"  {name}.h5: {len(rows)} q, ecuts {ecuts} Ry, nmtx "
+        print_fn(f"  {name}.h5: {len(rows)} q, ecuts {ecut_receipt}, nmtx "
                  f"{min(r.gspace.nmtx for r in rows)}..{max(r.gspace.nmtx for r in rows)}"
                  f"{'  (q list, q0 and G order from ' + ref + ')' if ref else ''}")
     return plans, comps

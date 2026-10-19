@@ -34,8 +34,12 @@ EPSMAT_DEFAULTS = {
     # export: q list, q0, ecuts and G order are taken from it.  project: the
     # files projected.
     "bgw_reference": "",
-    # export without bgw_reference: BerkeleyGW epsilon_cutoff in Ry.
-    "epsilon_cutoff": 0.0,
+    # export: the G cutoff of the written files in Ry, |q+G|² <= epsmat_ecut
+    # (BerkeleyGW's gcutoff).  The block written is the SUB-BLOCK of the
+    # converged ε⁻¹ on that G set, not a re-inversion on a truncated basis.
+    # 0 = the full sphere: bgw_reference's ecuts, else the producer's
+    # bare_coulomb_cutoff (the sphere V_q carries).
+    "epsmat_ecut": 0.0,
     # export without bgw_reference: the q -> 0 vector, crystal coordinates.
     "q0_vector": "0.001 0 0",
     # export: which files to write.
@@ -57,6 +61,11 @@ EPSMAT_DEFAULTS = {
 
 _FILES = ("eps0mat", "epsmat")
 
+#: Keys that existed once and now refuse by name, with the key that replaced them.
+_RETIRED = {
+    "epsilon_cutoff": "epsmat_ecut (Ry; 0 = the full sphere, which no longer needs to be given)",
+}
+
 
 def read_epsmat_input(filename: str) -> dict:
     """Parse an ``[epsmat]`` file into a dict of typed values; unknown keys refuse."""
@@ -70,6 +79,12 @@ def read_epsmat_input(filename: str) -> dict:
             f"own input, not a GW deck; fix: write an [epsmat] file "
             f"(docs/input_reference.md)")
     named = {k.lower(): v for k, v in parser.items("epsmat")}
+    retired = sorted(set(named) & set(_RETIRED))
+    if retired:
+        raise ValueError(
+            f"GATE epsmat_retired_key: got {retired}; want "
+            f"{[_RETIRED[k] for k in retired]}; why: one key now sets the G cutoff with or "
+            f"without bgw_reference; fix: rename it")
     unknown = sorted(set(named) - set(EPSMAT_DEFAULTS))
     if unknown:
         raise ValueError(
@@ -97,7 +112,7 @@ class EpsmatConfig:
     parent_input_file: str
     output_dir: str
     bgw_reference: str
-    epsilon_cutoff: float
+    epsmat_ecut: float
     q0_vector: tuple
     files: tuple
     rcond: float
@@ -152,17 +167,16 @@ class EpsmatConfig:
             raise ValueError(f"GATE epsmat_q0_wings_value: got {wings!r}; want dipole | zero; "
                              f"why: the q → 0 wing source; fix: set q0_wings")
         ref = path("bgw_reference", mode == "project")
-        ecut = float(p["epsilon_cutoff"])
-        if mode == "export" and not ref and ecut <= 0.0:
-            raise ValueError(
-                "GATE epsmat_epsilon_cutoff: got no epsilon_cutoff and no "
-                "bgw_reference; want one of them; why: the BerkeleyGW G list is "
-                "|q+G|² <= ecuts; fix: set epsilon_cutoff (Ry) or bgw_reference")
+        ecut = float(p["epsmat_ecut"])
+        if not ecut >= 0.0:
+            raise ValueError(f"GATE epsmat_ecut_value: got {ecut}; want >= 0 Ry (0 = the full "
+                             f"sphere); why: the G list is |q+G|² <= epsmat_ecut; fix: set "
+                             f"epsmat_ecut")
         return cls(mode=mode, source_restart=path("source_restart", True),
                    zeta_file=path("zeta_file", False),
                    parent_input_file=path("parent_input_file", True),
                    output_dir=path("output_dir", True), bgw_reference=ref,
-                   epsilon_cutoff=ecut, q0_vector=q0, files=files, rcond=rcond,
+                   epsmat_ecut=ecut, q0_vector=q0, files=files, rcond=rcond,
                    q0_head=head, q0_body_3d=body, q0_wings=wings)
 
     def describe(self) -> str:
