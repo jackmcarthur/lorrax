@@ -22,11 +22,11 @@ from typing import Dict, Literal, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P
 
 from distrib_la import loader
 from lxkit import native_provider as _native
-from distrib_la._cyclic import cyclic_to_block, largest_divisor, pad_with_sentinels
+from distrib_la._cyclic import cyclic_to_block, largest_divisor
 from jax import shard_map
 from distrib_la.resolve import mesh_key, mesh_platform
 
@@ -525,9 +525,8 @@ def eigh_layout(n: int, p: int) -> Tuple[int, int]:
     :data:`_EIGH_BLOCK_MAX`, when that is at least :data:`_EIGH_BLOCK_MIN` or
     ``n/p`` is at most :data:`_EIGH_BLOCK_MAX` (then ``nb = n/p``, one tile per
     rank).  Otherwise each rank's tile is padded to the smallest edge with a
-    divisor in the range (at most ``_EIGH_BLOCK_MIN - 1`` rows per rank); the
-    padded rows carry sentinel eigenvalues below the spectrum
-    (:func:`distrib_la._cyclic.pad_with_sentinels`), dropped on return.
+    divisor in the range (at most ``_EIGH_BLOCK_MIN - 1`` rows per rank): the
+    plan zero-pads to that side and deflates the pads.
     """
     local = n // p
     block = largest_divisor(local, _EIGH_BLOCK_MAX)
@@ -544,7 +543,6 @@ def distributed_eigh(
     mesh: Mesh,
     compute_evecs: bool = True,
     block_size: int | None = None,
-    side: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition via SLATE's ``heev``.
 
@@ -552,7 +550,8 @@ def distributed_eigh(
     ----------
     A
         Square ``(n, n)`` array, dtype ``float64`` (symmetric) or
-        ``complex128`` (Hermitian), sharded ``P('x','y')`` on ``mesh``.
+        ``complex128`` (Hermitian), sharded ``P('x','y')`` on ``mesh``;
+        ``n`` must be :func:`eigh_layout`'s side (the plan zero-pads to it).
     mesh
         2-D ``Mesh`` labelled ``('x','y')``.  Must be *square*
         (``mesh.shape['x'] == mesh.shape['y']``) — SLATE's heev rejects
@@ -564,9 +563,6 @@ def distributed_eigh(
         SLATE's tile ``nb``, a divisor of the solve tile ``N/p``; default
         :func:`eigh_layout`'s.  Any divisor is layout-safe (relabeling, see
         the section note); ``N/p`` is the former one-tile-per-rank layout.
-    side
-        The solve side ``N >= n``, a multiple of ``p``; default
-        :func:`eigh_layout`'s (``side=n`` is the unpadded layout, for benches).
 
     Returns
     -------
@@ -590,13 +586,12 @@ def distributed_eigh(
     ensure_registered(mesh, _EIGH_FFI_TARGET)
     ctx_key = context_key(mesh)
 
-    if side is None:
-        side, default = eigh_layout(n, p)
-    else:
-        side = int(side)
-        default = largest_divisor(side // p, _EIGH_BLOCK_MAX)
+    side, default = eigh_layout(n, p)
+    if side != n:
+        raise ValueError(f"distributed_eigh: n={n} is not a solve side on a {p}x{q} mesh; "
+                         f"pad it to {side} first (distrib_la.plan pads with zero rows)")
     nb = default if block_size is None else int(block_size)
-    if side < n or side % p or nb < 1 or (side // p) % nb:
+    if nb < 1 or (side // p) % nb:
         raise ValueError(
             f"distributed_eigh: tile {nb} does not divide the solve tile "
             f"{side // p} (side {side}, {p}x{q} mesh).")
@@ -640,18 +635,8 @@ def distributed_eigh(
                 Q_T = cyclic_to_block(Q_T, n=side, p=q, mb=nb, axis="y")
             return W, jnp.transpose(Q_T, (1, 0))
 
-        face = NamedSharding(mesh, P("x", "y"))
-
-        def _padded(a):
-            whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)
-            W, Q = _call(whole)
-            # The sentinels are the side - n lowest eigenpairs; Q holds
-            # columns, of which the first n rows are a's.
-            W, Q = W[side - n:], Q[:n, side - n:]
-            return W, jax.lax.with_sharding_constraint(Q, face)
-
         # No donation: plan.DONATES declares eigh as donating nothing.
-        jit_eigh = jax.jit(_call if side == n else _padded)
+        jit_eigh = jax.jit(_call)
         _JIT_CACHE[key] = jit_eigh
 
     return jit_eigh(A)

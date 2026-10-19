@@ -85,8 +85,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la._result_check import (_flag, _notices, deflate_zero_rows, in_checked_retry, native_eigh,
-                                      traced_phase)
+from distrib_la._result_check import deflate_zero_rows, drop_side, native_eigh, pad_side
 from distrib_la.resolve import (NATIVE, NATIVE2D, ONE_DEVICE, OPS, backend_module,
                                 mesh_key, mesh_platform, resolve_backend,
                                 resolve_eigh_capacity, size_route_note)
@@ -198,8 +197,8 @@ class StackRoute(NamedTuple):
     room: int | None = None
 
 
-#: Decided stack routes, one per (mesh, op, B, n, dtype, room, phase, backend,
-#: route), and the keys
+#: Decided stack routes, one per (mesh, op, B, n, dtype, room, backend, route),
+#: and the keys
 #: :func:`new_stack_routes` has already reported.
 _STACK_ROUTES: dict = {}
 _REPORTED: set = set()
@@ -222,65 +221,38 @@ def new_stack_routes() -> list[str]:
     for key, route in _STACK_ROUTES.items():
         if key not in _REPORTED:
             _REPORTED.add(key)
-            where = "first attempt" if key[6] == "first" else "whole chain"
-            lines.append(f"{key[1]} stack {key[2]} x {key[3]}^2 {key[4]} ({where}): "
-                         f"{_describe_stack(route)}")
+            lines.append(f"{key[1]} stack {key[2]} x {key[3]}^2 {key[4]}: {_describe_stack(route)}")
     return lines
-
-
-#: What a route-(c) program reserves, by caller. An eager call's first program,
-#: and a traced one inside distrib_la.checked_program's first program, holds
-#: the first attempt and its check ("first"); an eager call's retries run as a
-#: separate program ("retry") only when that check failed. Any other traced
-#: caller's program holds the whole checked chain ("all": first attempt,
-#: retries, refusal); a checked_program's own whole-chain program runs every
-#: stack on the whole mesh (Plan.stack_route).
-PHASES = ("all", "first", "retry")
 
 
 def _stack_price(op, mesh, nb, n, dtype, rounds) -> int:
     """Per-rank device bytes of a route-(c) stack program in ``rounds``, priced from the shapes.
 
     :data:`BATCH_EIGH_TILES` n^2 per whole matrix a rank holds at a time (the
-    first attempt, its exchanges, the local solve with its workspace and the
-    vectors, as :func:`distrib_la.eigh_stack_bytes` prices it), plus the
-    checked chain's temporaries (:data:`CHECKED_EIGH_TILES`) and its gathered
-    retry where admitted. The same on every rank: nothing is compiled to be
-    measured and no size is exchanged.
+    solve, its exchanges, the local solve with its workspace and the vectors,
+    as :func:`distrib_la.eigh_stack_bytes` prices it), plus the check's
+    temporaries (:data:`CHECKED_EIGH_TILES`). The same on every rank: nothing
+    is compiled to be measured and no size is exchanged.
     """
     ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
     per_rank = -(-(-(-nb // rounds)) // ranks)
     item = np.dtype(dtype).itemsize
     whole = BATCH_EIGH_TILES * n * n * item
-    checked = CHECKED_EIGH_TILES * (n * n // ranks) * item
-    if op != "normal_eigh" and _gathered_admitted((n, n), dtype):
-        checked += GATHERED_EIGH_FACTOR * n * n * item
-    return per_rank * whole + checked
-
-
-def _gathered_admitted(shape, dtype) -> bool:
-    """Whether an eigh's gathered retry joins its chain: the matrices, their
-    vectors and the solver's copy (GATHERED_EIGH_FACTOR n^2 elements each)
-    within GATHERED_EIGH_BYTES on every rank, whatever a caller's room (XLA
-    reserves the retry in every program that holds it). A shape rule, the
-    same on every rank."""
-    return (GATHERED_EIGH_FACTOR * np.dtype(dtype).itemsize * int(np.prod(tuple(shape)))
-            <= GATHERED_EIGH_BYTES)
+    return per_rank * whole + CHECKED_EIGH_TILES * (n * n // ranks) * item
 
 
 @lru_cache(maxsize=None)
-def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, phase: str):
-    """The jitted route-(c) program for one face stack and ``phase`` (:data:`PHASES`).
+def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, cut=None):
+    """The jitted route-(c) program for one face stack.
 
     ``rounds`` slices (:func:`distrib_la._batch_reshard.reshard_rounds_call`),
     and for an eigh the service's probe check on the Hermitian part of the
-    input (:func:`_local_eigh_errors`) with the distributed eigh's chain:
-    the first attempt, then shifted slice by slice (vectors
-    re-orthonormalized by each slice's GEMMs), then gathered when admitted. Returns
-    ``((values, vectors), failed)``; a result no attempt repairs is
-    NaN-poisoned, ``failed`` set and, outside ``"first"``, named (GATE
-    distrib_la_result_check). ``normal_eigh`` (polar's right singular
-    vectors) returns ``(values, vectors)`` and is not probe-checked here.
+    input (:func:`_local_eigh_errors`), on the columns ``w > cut * max(w)``
+    (all by default). Returns ``((values, vectors),
+    failed)``; a result that fails its check is NaN-poisoned and ``failed``
+    set (GATE distrib_la_result_check). ``normal_eigh`` (polar's right
+    singular vectors) returns ``(values, vectors)`` and is not probe-checked
+    here.
     """
     from distrib_la._batch_reshard import reshard_rounds_call
     from distrib_la._result_check import checked, eigh_layout
@@ -289,33 +261,45 @@ def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds
     out = (replicated, NamedSharding(mesh, P(None, "x", "y")))
     if op == "normal_eigh":
         return jax.jit(solve, out_shardings=out)
-    attempts = [solve, partial(reshard_rounds_call, op, mesh, rounds=int(rounds), shifted=True)]
-    if _gathered_admitted(shape, dtype):
-        attempts.append(partial(_gathered_eigh, mesh=mesh))
-    attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[phase]
-    return jax.jit(lambda a: checked("eigh", tuple(attempts), lambda r: _local_eigh_errors(a, *r, mesh=mesh),
-                                     (a,), constrain=eigh_layout(mesh, 3),
-                                     final=phase != "first"),
+    return jax.jit(lambda a: checked("eigh", solve, lambda r: _local_eigh_errors(a, *r, mesh=mesh, cut=cut),
+                                     (a,), constrain=eigh_layout(mesh, 3)),
                    out_shardings=(out, replicated))
 
 
-def _local_eigh_errors(a, values, vectors, *, mesh=None):
+def _local_eigh_errors(a, values, vectors, *, mesh=None, cut=None):
     """:func:`distrib_la._result_check.eigh_errors` against Herm(a) = (a + a^H)/2,
     the matrix the local solver diagonalizes (``jnp.linalg.eigh`` symmetrizes
     its input). a^H V X is read as (X^H V^H a)^H, so the face-tiled stack is
     never transposed."""
-    from distrib_la._result_check import _all_ranks, _norm, probes
-    x = probes(a.shape[-1], vectors.dtype)
+    from distrib_la._result_check import _all_ranks, _norm, used_probes
+    x, used = used_probes(values, vectors.dtype, cut)
     vx = vectors @ x
     left = jnp.conj(jnp.swapaxes(jnp.conj(jnp.swapaxes(vx, -1, -2)) @ a, -1, -2))
     from distrib_la._result_check import _face, _rows
     nd = a.ndim
+    norm_x = jnp.maximum(_norm(x), jnp.finfo(values.dtype).tiny)
+    gram = jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x
     residual = _norm(0.5 * (a @ vx + left) - vectors @ (values[..., :, None] * x), mesh, _rows(nd)) / (
-        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * _norm(x))
-    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x, mesh, _rows(nd)) / _norm(x)
+        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * norm_x)
+    orthogonality = _norm(gram if used is None else jnp.where(used, gram, 0), mesh, _rows(nd)) / norm_x
     finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
     return (jnp.where(finite, jnp.max(residual), jnp.inf),
             jnp.where(finite, jnp.max(orthogonality), jnp.inf))
+
+
+def _eigh_side(backend: str, n: int, p: int, dtype) -> int:
+    """The side ``backend``'s eigh solves an ``n x n`` operand at on a ``p x p`` grid
+    (its layout rule); the plan zero-pads to it (:meth:`Plan._checked_eigh`)."""
+    if backend == "cusolvermp":
+        from distrib_la._cusolvermp import solve_layout
+        return solve_layout(n, p)[0]
+    if backend == "elpa":
+        from distrib_la._elpa import eigh_layout
+        return eigh_layout(n, p, dtype)[0]
+    if backend == "slate":
+        from distrib_la._slate import eigh_layout
+        return eigh_layout(n, p)[0]
+    return n
 
 
 def ensure_sharding(x, sharding: NamedSharding):
@@ -386,31 +370,20 @@ def _eigh_columns(backend: str, lam, Q):
     return lam, Q
 
 
-#: Per-rank bytes a gathered local eigh retry may take when the plan has no
-#: budget, and the n x n element copies it holds per rank. XLA reserves the
-#: retry inside every program that contains the eigh, executed or not:
-#: 1.75 n^2 per rank measured (memory_analysis, n 3328, P16), so the cap is
-#: small (n <= 1448 complex128) and planners price it (workspace.py).
-GATHERED_EIGH_BYTES = 64 << 20
-GATHERED_EIGH_FACTOR = 2
-#: The checked eigh chain's own XLA temporaries per rank, in units of
-#: n^2 / P elements (deflation, probes, retries; measured 7.0-7.1 at n 3328
-#: and 9152, P16, against 1-2 for a bare deflated eigh).
-CHECKED_EIGH_TILES = 7
+#: The checked eigh's own XLA temporaries per rank, in units of n^2 / P
+#: elements (deflation, probes, the check; one attempt). XLA:CPU buffer
+#: assignment, complex128: the plan's cuSOLVERMp program (ABI 10 stand-in
+#: handler) 2.04 at n 51200 and 2.00 at 100000, P16; route (c)'s check share
+#: 1.08 (P4, 4 x 2048), 0.99 (P16, 16 x 1024), 3.00 (P16, 4 x 2048). The
+#: retry chain this replaced: 7 in main's comment (7.0-7.1 at n 3328 and 9152,
+#: P16); the same XLA:CPU analysis gives its traced chain 8.8-8.9 (n 51200, 100000).
+CHECKED_EIGH_TILES = 3
 #: What route (c) adds per rank for each whole n x n matrix the rank holds, in
 #: n^2 elements: the staged exchanges, the local solve with its workspace, the
 #: vectors and the first attempt's check, the operand excluded. Compiled size
 #: plus the vendor query on A100 (bundle B11, one or two matrices per rank):
 #: 7.96-7.98 at P64 for n 6144-18432, 7.9-8.0 at P4 for n 984-7936.
 BATCH_EIGH_TILES = 8
-
-
-def _gathered_eigh(A, *, mesh):
-    """Eigh of the whole matrix on every rank: the last retry of a checked distributed eigh."""
-    whole = jax.lax.with_sharding_constraint(A, NamedSharding(mesh, P()))
-    values, vectors = native_eigh(whole)
-    face = NamedSharding(mesh, P(*([None] * (A.ndim - 2)), "x", "y"))
-    return values, jax.lax.with_sharding_constraint(vectors, face)
 
 
 #: (op, backend) → how to call it.
@@ -1058,9 +1031,9 @@ class Plan:
             return ROUTE_BACKEND_BATCHED
         return ROUTE_SCAN
 
-    def route_for(self, shape, dtype, traced: bool = True) -> str:
+    def route_for(self, shape, dtype) -> str:
         """The route :meth:`batched` takes for one operand stack (:meth:`stack_route`)."""
-        return self.stack_route(shape, dtype, traced=traced).route
+        return self.stack_route(shape, dtype).route
 
     def decision(self, A, *args) -> tuple:
         """What :meth:`batched` traces for this call signature, without the room.
@@ -1076,14 +1049,14 @@ class Plan:
                                       "stack (stack_route); not covered")
         return self._decide(A, args)
 
-    def _decide(self, A, args, traced: bool = True, route: str | None = None) -> tuple:
+    def _decide(self, A, args, route: str | None = None) -> tuple:
         """``(backend, route, rounds)`` :meth:`batched` runs ``A``, ``args`` with: the one place
         it is decided.  ``rounds`` is set on ``one_device``'s stacked entry only: the measured
         size route's (:func:`_measured_rounds`; 0 the leg library), else one_device's own round
         rule (:func:`distrib_la._one_device.rounds_for` against
         :func:`distrib_la.resolve.one_device_round_n` of the bound: the leg row, or on a room leg
         the room this plan was resolved against, capped by the leg's round row).  ``route`` is the gates' override."""
-        route = self.route_for(A.shape, A.dtype, traced) if route is None else route
+        route = self.route_for(A.shape, A.dtype) if route is None else route
         rounds = None
         if route == ROUTE_BACKEND_BATCHED and self.backend == ONE_DEVICE:
             if self._measured_applies():
@@ -1101,7 +1074,7 @@ class Plan:
                                        int(args[0].shape[-1]) if self.op == "solve_lu" else None)
         return (self.backend, route, rounds)
 
-    def stack_route(self, shape, dtype, op: str = "eigh", traced: bool = True) -> StackRoute:
+    def stack_route(self, shape, dtype, op: str = "eigh") -> StackRoute:
         """How :meth:`batched` runs one operand stack: the service's decision.
 
         :attr:`batched_route` is the answer for every stack except one case:
@@ -1113,8 +1086,7 @@ class Plan:
         that needs. When not even one whole matrix per rank fits, it runs on the
         whole mesh. The room is a caller value every rank shares and the price
         is a shape formula, so every rank takes the same route and rounds with
-        no exchange. ``traced`` says what the program reserves
-        (:data:`PHASES`). Every decision is listed by
+        no exchange. Every decision is listed by
         :meth:`describe`, and :func:`new_stack_routes` hands each to a driver
         log once.
         """
@@ -1128,25 +1100,22 @@ class Plan:
         if (self.requested_batched_route != "auto" or self.budget_bytes is None
                 or (self.is_native and capacity) or self.op != "eigh"):
             return StackRoute(static)
-        if self.budget_bytes == 0 or (capacity and in_checked_retry()):
-            # A checked program's retry is the whole-mesh program its caller
-            # sized; a plan with no whole mesh retries on its decided route.
+        if self.budget_bytes == 0:
             self.require_capacity(f"an eigh stack {shape} with no room")
             return StackRoute(static, room=0)
-        key = self._stack_key(op, nb, shape[-1], dtype, traced)
+        key = self._stack_key(op, nb, shape[-1], dtype)
         decided = _STACK_ROUTES.get(key)
         if decided is None:
-            decided = self._decide_stack(op, nb, key[3], key[4], key[6], traced)
+            decided = self._decide_stack(op, nb, key[3], key[4])
             if decided.route != ROUTE_BATCH_RESHARD:
                 self.require_capacity(
                     f"the eigh stack {shape} ({_describe_stack(decided)})")
             _STACK_ROUTES[key] = decided
         return decided
 
-    def _stack_key(self, op, nb, n, dtype, traced):
-        phase = "all" if op == "normal_eigh" else traced_phase() if traced else "first"
+    def _stack_key(self, op, nb, n, dtype):
         return (mesh_key(self.mesh), op, int(nb), int(n), np.dtype(dtype).name,
-                self.budget_bytes, phase, self.backend, self.batched_route)
+                self.budget_bytes, self.backend, self.batched_route)
 
     def known_route(self, shape, dtype) -> str:
         """The route a stack takes when :meth:`stack_route` already decided it,
@@ -1158,13 +1127,10 @@ class Plan:
             return static
         shape = tuple(int(v) for v in shape)
         nb = shape[0] if len(shape) == 3 else 1
-        for traced in (True, False):
-            decided = _STACK_ROUTES.get(self._stack_key("eigh", nb, shape[-1], dtype, traced))
-            if decided is not None:
-                return decided.route
-        return static
+        decided = _STACK_ROUTES.get(self._stack_key("eigh", nb, shape[-1], dtype))
+        return static if decided is None else decided.route
 
-    def _decide_stack(self, op, nb, n, dtype, phase, traced=True) -> StackRoute:
+    def _decide_stack(self, op, nb, n, dtype) -> StackRoute:
         """Route (c) at the most whole matrices per rank whose priced program fits the room.
 
         The candidates (whole matrices per rank, from ceil(nb/P) down) and their
@@ -1263,9 +1229,8 @@ class Plan:
 
         An FFI eigh or LU solve comes back checked (:mod:`distrib_la._result_check`,
         ``post`` None), because the libraries fail silently: eigh with its zero
-        rows deflated, retried shifted, in another layout and gathered, and
-        refused by name if no attempt passes; an LU solve refused by name (its
-        operands are consumed).
+        rows deflated, one attempt, refused by name if its check fails; an LU
+        solve refused by name (its operands are consumed).
         """
         spec = _IMPL[(self.op, self.backend)]
         name = spec[key]
@@ -1303,84 +1268,45 @@ class Plan:
         host), so a repeated eager call compiles once from every call site.
         """
         if any(isinstance(o, jax.core.Tracer) for o in ops):
-            return fn(*ops, mesh=self.mesh, _phase=traced_phase(), **kwargs)
+            return fn(*ops, mesh=self.mesh, **kwargs)
         mesh = self.mesh
-
-        def program(phase, donate):
-            key = scan_signature(self.op, self.backend, mesh, ops, kwargs,
-                                 extra=(tag, phase))
-            return cached_scan(key, lambda: jax.jit(
-                lambda *o: fn(*o, mesh=mesh, _phase=phase, **kwargs),
-                donate_argnums=donate))
-        if self.op != "eigh":
-            return program("all", self.donates)(*ops)
-        # An eager eigh runs its first attempt and check alone; the retries
-        # are a separate program, compiled and run only on the reduced
-        # failure flag, so their buffers are never reserved beside the first
-        # attempt's (EIGHSTACK: n 18304, P4, 80 GB).
-        out = program("first", ())(*ops)
-        if not _flag(out[-1], int(ops[0].shape[-1]), ops[0].dtype):
-            return out
-        _notices(out[-1], self.op, int(ops[0].shape[-1]), ops[0].dtype, site, final=False)
-        del out
-        return program("retry", ())(*ops)
+        key = scan_signature(self.op, self.backend, mesh, ops, kwargs, extra=(tag,))
+        return cached_scan(key, lambda: jax.jit(lambda *o: fn(*o, mesh=mesh, **kwargs),
+                                                donate_argnums=self.donates))(*ops)
 
     def _checked_eigh(self, call, post):
-        from distrib_la._result_check import checked_eigh, eigh_layout, shifted
-        from distrib_la.matmul import matmul
+        from distrib_la._result_check import checked_eigh, eigh_layout, shifted, spectral_shift
         backend = self.backend
 
-        def safe(A, *, mesh, _phase="all", **kwargs):
-            def solve(a, **extra):
-                return post(backend, *call(a, mesh=mesh, **kwargs, **extra))
-            # Zero rows leave the solver as distinct sentinels (deflate_zero_rows),
-            # on every attempt. A failed check solves again: shifted (a near-zero
-            # cluster moved off the origin, the vectors re-orthonormalized), then
-            # gathered.
-            # The face SUMMA (panel_matmul): a single matrix never batch-reshards onto one device.
-            gemm = partial(matmul, mesh=mesh, backend="distributed", batched_route="auto")
-            pin = eigh_layout(mesh, A.ndim)
-            deflate = partial(deflate_zero_rows, constrain=pin, mesh=mesh)
-            attempts = [deflate(solve), deflate(shifted(solve, matmul=gemm, mesh=mesh))]
+        def safe(A, *, mesh, cut=None, **kwargs):
+            # THE one padding mechanism: the operand is zero-padded to the
+            # backend's solve side, every zero row (pads included) leaves the
+            # solver as a sentinel (deflate_zero_rows), and the pads, which
+            # come out first, are dropped by count. One attempt, checked on
+            # the columns the caller uses (``cut``); a failure refuses by name.
+            # The library solves the deflated operand shifted by ||A||_F/sqrt(n)
+            # (spectral_shift: the cuSOLVERMp 0.9.1 low-rank defect).
             n = int(A.shape[-1])
-            if backend == "cusolvermp":
-                # cuSOLVERMp 0.9.1 syevd returns vectors that are not orthonormal
-                # inside a near-zero cluster, with status 0 and info 0, at some
-                # (matrix, layout, shift) and not others; no one of them is safe
-                # (EIGHOOM, n 7908 and 11776-15872, P4). The retries change one
-                # at a time: the layout first (retry_block, a smaller block on the
-                # same side: no more workspace), then the shift with
-                # re-orthonormalization, then the shift at the smaller block.
-                from distrib_la._cusolvermp import retry_block
-                block = retry_block(n, int(mesh.shape["x"]))
-                if block is not None:
-                    attempts = [attempts[0], deflate(partial(solve, block=block)), attempts[1],
-                                deflate(partial(solve, block=block), shift=True)]
-            # A gathered local solve, where the whole matrix, its vectors and
-            # the solver's copy fit GATHERED_EIGH_BYTES on every rank (a shape
-            # rule, the same on every rank). XLA reserves it in every program
-            # that holds it, so a caller's room (a face plan's budget) does
-            # not raise the limit.
-            if _gathered_admitted(A.shape, A.dtype):
-                attempts.append(partial(_gathered_eigh, mesh=mesh))
-            # An eager call's first program holds the first attempt; its retry
-            # program the rest (Plan._program). A traced call holds them all.
-            attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[_phase]
-            (values, vectors), failed = checked_eigh(attempts, A, mesh=mesh, final=_phase != "first")
+            side = _eigh_side(backend, n, int(mesh.shape["x"]), A.dtype)
+            pin = eigh_layout(mesh, A.ndim)
+            solve = shifted(lambda a: post(backend, *call(a, mesh=mesh, **kwargs)), spectral_shift(A, mesh=mesh))
+            deflated = deflate_zero_rows(solve, constrain=pin, mesh=mesh)
+            (values, vectors), failed = checked_eigh(
+                lambda a: pin(drop_side(*deflated(pad_side(a, side)), n)), A, mesh=mesh, cut=cut)
             return values, vectors, failed
         return safe
 
     def _checked_solve(self, call):
         from distrib_la._result_check import checked, matrix_sketch, rhs_sketch, solve_errors
 
-        def safe(A, B, *, mesh, _phase="all", **kwargs):
+        def safe(A, B, *, mesh, **kwargs):
             # The sketch is taken before the call, which consumes A and B: the LU
             # factors are an output aliased to A and X one aliased to B.  The
             # barrier keeps XLA from scheduling the sketch after the call.
             sketch = (*matrix_sketch(A, mesh), *rhs_sketch(B, mesh))
             sketch, A, B = jax.lax.optimization_barrier((sketch, A, B))
             X = call(A, B, mesh=mesh, **kwargs)
-            return checked("solve_lu", (lambda x: x,), lambda x: solve_errors(sketch, x, mesh),
+            return checked("solve_lu", lambda x: x, lambda x: solve_errors(sketch, x, mesh),
                            (X,), n=A.shape[-1], dtype=A.dtype)
         return safe
 
@@ -1447,8 +1373,7 @@ class Plan:
             # serve them, whatever the plan's route (no movement, one batched solve).
             from distrib_la._batch_reshard import batch_layout_eigh_call
             return batch_layout_eigh_call("eigh", self.mesh, A)
-        traced = isinstance(A, jax.core.Tracer)
-        route = self.route_for(A.shape, A.dtype, traced) if _route is None else _route
+        route = self.route_for(A.shape, A.dtype) if _route is None else _route
         if route not in BATCHED_ROUTES:
             raise ValueError(
                 f"unknown batched route {route!r} "
@@ -1459,10 +1384,11 @@ class Plan:
         # the same face sharding, including on an explicit native plan.
         if route == ROUTE_BATCH_RESHARD:
             if self.op == "eigh":
+                cut = kwargs.pop("cut", None)
                 self._reshard_options(kwargs)
                 rounds = (1 if _route is not None else
-                          self.stack_route(A.shape, A.dtype, traced=traced).rounds)
-                return self._checked_reshard("eigh", A, rounds)
+                          self.stack_route(A.shape, A.dtype).rounds)
+                return self._checked_reshard("eigh", A, rounds, cut)
             return self._batch_reshard((A, *args), kwargs)
 
         if self.is_native:
@@ -1474,7 +1400,7 @@ class Plan:
                     f"{ROUTE_BATCH_RESHARD!r}.")
             return self(A, *args, **kwargs)
 
-        rounds = _rounds if _rounds is not None else self._decide(A, args, traced, route)[2]
+        rounds = _rounds if _rounds is not None else self._decide(A, args, route)[2]
         if rounds == 0:
             return self._library_plan().batched(A, *args, **kwargs)
         ops = tuple(ensure_sharding(x, self.batch_in_sharding)
@@ -1497,16 +1423,7 @@ class Plan:
             if self._is_checked():
                 from distrib_la._result_check import call_site
                 site = call_site()
-                if self.op != "eigh" or isinstance(A, jax.core.Tracer):
-                    phase = traced_phase() if isinstance(A, jax.core.Tracer) else "all"
-                    return self._finish(self._scan_over_single(ops, kwargs, phase=phase), A, site)
-                # Eager: the retries run as a second scan only when a matrix failed.
-                out = self._scan_over_single(ops, kwargs, phase="first")
-                if _flag(out[-1], int(A.shape[-1]), A.dtype):
-                    _notices(out[-1], self.op, int(A.shape[-1]), A.dtype, site, final=False)
-                    del out
-                    out = self._scan_over_single(ops, kwargs, phase="retry")
-                return self._finish(out, A, site)
+                return self._finish(self._scan_over_single(ops, kwargs), A, site)
             return self._scan_over_single(ops, kwargs)
         raise AssertionError(f"unhandled batched route {route!r}")
 
@@ -1514,37 +1431,22 @@ class Plan:
         """Route (c) for a face stack: ``op`` is ``eigh``, ``checked_eigh`` or
         ``normal_eigh`` (polar's right singular vectors), in this plan's
         decided rounds (:meth:`stack_route`), checked as :meth:`_checked_reshard`."""
-        traced = isinstance(A, jax.core.Tracer)
-        return self._checked_reshard(op, A, self.stack_route(A.shape, A.dtype, op, traced).rounds)
+        return self._checked_reshard(op, A, self.stack_route(A.shape, A.dtype, op).rounds)
 
-    def _checked_reshard(self, op: str, A, rounds: int):
-        """Route (c) in ``rounds`` slices, checked (:func:`_reshard_stack_program`).
-
-        A traced caller inlines its phase of the chain (:data:`PHASES`). An eager call runs
-        its first attempt alone and the retries as a second program only when the
-        first check failed; a result no attempt repairs refuses by name.
-        """
+    def _checked_reshard(self, op: str, A, rounds: int, cut=None):
+        """Route (c) in ``rounds`` slices, checked (:func:`_reshard_stack_program`); a failure refuses by name."""
         from distrib_la._batch_reshard import validate_batch_reshard_operands
         from distrib_la._result_check import call_site, raise_if_failed
         validate_batch_reshard_operands(op if op != "normal_eigh" else "eigh", self.mesh, (A,))
         face = NamedSharding(self.mesh, P(None, "x", "y"))
         A = ensure_sharding(A, face)
         shape, dtype, site = tuple(int(v) for v in A.shape), str(A.dtype), call_site()
-
-        def program(phase):
-            return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), phase)
+        program = _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds),
+                                         None if cut is None else float(cut))
         if op == "normal_eigh":
-            return program("all")(A)
-        if isinstance(A, jax.core.Tracer):
-            values_vectors, failed = program(traced_phase())(A)
-            raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
-            return values_vectors
-        values_vectors, failed = program("first")(A)
-        if _flag(failed, shape[-1], A.dtype):
-            _notices(failed, "eigh", shape[-1], A.dtype, site, final=False)
-            del values_vectors
-            values_vectors, failed = program("retry")(A)
-            raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
+            return program(A)
+        values_vectors, failed = program(A)
+        raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
         return values_vectors
 
     def _reshard_options(self, kwargs: dict):
@@ -1575,7 +1477,7 @@ class Plan:
         ops = tuple(ensure_sharding(x, self.batch_in_sharding) for x in ops)
         return batch_reshard_call(self.op, self.mesh, ops)
 
-    def _scan_over_single(self, ops: tuple, kwargs: dict, *, phase=None):
+    def _scan_over_single(self, ops: tuple, kwargs: dict):
         """Route (a): ``lax.scan`` over this plan's own single-matrix call.
 
         The body is exactly what :meth:`__call__` does to one tile —
@@ -1611,9 +1513,8 @@ class Plan:
         def _build():
             def _one_matrix(carry, tiles):
                 # A checked entry returns its failure flag too; the scan stacks it.
-                extra = {} if phase is None else {"_phase": phase}
                 out = one(*(ensure_sharding(t, tile) for t in tiles),
-                          mesh=mesh, **extra, **kwargs)
+                          mesh=mesh, **kwargs)
                 return carry, (post(backend, *out) if post is not None
                                else out)
 
@@ -1627,7 +1528,7 @@ class Plan:
 
             return jax.jit(_scanned)
 
-        key = scan_signature(self.op, self.backend, mesh, ops, kwargs, extra=(phase,))
+        key = scan_signature(self.op, self.backend, mesh, ops, kwargs)
         return cached_scan(key, _build)(*ops)
 
 

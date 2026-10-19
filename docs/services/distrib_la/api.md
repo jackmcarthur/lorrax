@@ -117,55 +117,64 @@ rank-deficient PSD responses with no zero row (n 432 to 18304) and on a
 sentinel-padded H'_vv (n 9152, 4×4). So:
 
 - Every eigh route (native, route (c), normal and polar kernels, every
-  distributed attempt) replaces exact-zero rows by distinct diagonal
+  distributed solve) replaces exact-zero rows by distinct diagonal
   sentinels in [−4b, −2b], b the Gershgorin bound of the rest, and returns
-  them as exact zero eigenvalues with unit vectors, in ascending order
-  (`deflate_zero_rows`; a matrix with no zero row passes through unchanged;
-  the columns are reordered only when a live eigenvalue is negative).
-- Every distributed eigh (cuSOLVERMp, SLATE, ScaLAPACK; single, scanned or
-  stacked) is checked against 8 fixed-seed probe columns X, the same on every
-  rank: ‖(AZ − Z diag(w))X‖/(‖A‖‖X‖) and ‖(ZᴴZ − I)X‖/‖X‖ within
-  `roundoff_tol(n, dtype)` = 64·n·eps, at O(n²k) beside the O(n³) solve. A
-  failed check is noted on rank 0's stderr and solved again: shifted
-  (A + sI, s the Frobenius norm of the rows that are not sentinels, which
-  moves a large near-zero cluster off the origin; its vectors are then
-  re-orthonormalized by a Newton–Schulz polar iteration, GEMMs only, which
-  converges while the singular values of Z lie in (0, √3) and otherwise falls
-  through to the next attempt), then gathered on every rank when its two n²
-  copies fit 64 MiB
-  (`GATHERED_EIGH_BYTES`, n ≤ 1448 complex; a face plan's room does not
-  raise it, because XLA reserves the retry in every program). XLA reserves every
-  retry inside the program whether or not it runs. On cuSOLVERMp, which
-  returns vectors that are not orthonormal inside a near-zero cluster with
-  status 0 and info 0 at some (matrix, block, shift) and not others, the
-  chain changes one thing at a time: unshifted, unshifted at a smaller block
-  (`retry_block`, whose workspace is not larger), shifted and
-  re-orthonormalized, shifted at the smaller block, then gathered when
-  admitted. The one-tile-per-rank layout is never a retry: at n 7908 on P4
-  its workspace is 2.0 GB against 0.25–0.32 GB at blocks 6–172. The chain's temporaries
-  (7 n²/P per rank, measured) and an admitted gathered retry are priced by
+  them as exact zero eigenvalues with unit vectors (`deflate_zero_rows`).
+  **Contract:** the deflated pairs come first (lowest row first), the live
+  pairs after them in ascending order; nothing is reordered, so a negative
+  live eigenvalue sits after the zeros and consumers read the smallest by
+  value (`jnp.min`), never as `w[0]`. A matrix with no zero row passes
+  through unchanged.
+- **One padding mechanism.** A distributed eigh solves at its backend's
+  side (`_cusolvermp.solve_layout`, `_slate.eigh_layout`,
+  `_elpa.eigh_layout`): the plan zero-pads the operand to it (`pad_side`),
+  the pads deflate with the other zero rows, come out first (they have the
+  lowest indices) and are dropped by count (`drop_side`). The wrappers
+  never pad: they refuse an operand that is not a solve side.
+- Every distributed eigh (cuSOLVERMp, SLATE, ELPA, ScaLAPACK; single, scanned
+  or stacked) is checked against 8 fixed-seed probe columns X, the same on
+  every rank: ‖(AZ − Z diag(w))X‖/(‖A‖‖X‖) and ‖(ZᴴZ − I)X‖/‖X‖ within
+  `roundoff_tol(n, dtype)` = 64·n·eps, at O(n²k) beside the O(n³) solve.
+  **One attempt:** a failed check NaN-poisons the eigenvalues on every rank
+  and is refused by name (GATE distrib_la_result_check), eagerly or at its
+  `checked_program`'s finish, as a consumed LU solve is. There is no
+  retry, so no program reserves one. **Shift:** every checked eigh (every
+  backend, route (c) too) solves A + sI, s = ‖A‖_F/√n (`spectral_shift`,
+  inside the deflation), and returns w − s. Unshifted, cuSOLVERMp 0.9.1
+  returns wrong KEPT pairs of an exactly low-rank PSD operand (BᴴB/n, n 9152,
+  P = 4: 4 of 6 seeds × blocks); shifted, all 9 measured cases pass, and ELPA
+  is unaffected. Vectors inside an exactly degenerate cluster stay
+  non-orthonormal, so a full-check caller of such an operand refuses by
+  name; none of LORRAX's measured operands has one. **Check what you use:** a caller that
+  keeps only w > c·max(w) passes `cut=c` (`plan.batched(A, cut=c)`, every
+  route), and only those columns are probed. cuSOLVERMp's known defect,
+  non-orthonormal vectors inside a near-zero cluster of a rank-deficient PSD
+  Gram, lies in the discarded columns. The shared-pole Gram, H′_vv, Schur and
+  sector-metric eighs pass their keep cut; the Ritz eighs and the response
+  directions (cut at n·eps) keep the full check. The check's temporaries
+  (`CHECKED_EIGH_TILES` = 3 n²/P per rank, measured) are priced by
   `workspace_bytes_per_rank`.
 - Every route-(c) eigh is checked the same way on its face-layout result,
-  against the Hermitian part of the input (the local solver symmetrizes),
-  with the same retries after the first attempt: shifted slice by slice,
-  then gathered when admitted. Measured cost at P4: 0.3–4.1 ms per eigh at
+  against the Hermitian part of the input (the local solver symmetrizes).
+  Measured cost at P4: 0.3–4.1 ms per eigh at
   n = 3328–18304 (at most 0.2 % of the solve). polar's direction SVD
   (`normal_eigh`, the eigh of WᴴW) is not probe-checked on route (c); its
   spectrum is refused when non-finite. A non-Hermitian operand of
   `leading_eigenvectors` is refused before either route ("requires finite
-  Hermitian W"), never retried as a solver failure.
+  Hermitian W").
 - Every distributed LU solve (`plan('solve_lu').batched`) and every
   distributed Cholesky is checked on its actual solution through
   sketches taken before the library consumes A and B:
   ‖Wᴴ(AX − B)‖/(√k (‖A‖‖X‖ + ‖B‖)) within `roundoff_tol(n)`. Its operands are
-  gone, so there is no retry.
-- A result that still fails comes back NaN-poisoned on every rank, so a
+  gone.
+- A result that fails comes back NaN-poisoned on every rank (an eigh's
+  eigenvalues, a solve's X), so a
   caller's finite-result gate refuses; an eager call and a `checked_program`
   print `GATE distrib_la_result_check` (op, n, the call site, the errors) on
   rank 0's stderr and raise it if any matrix of the call failed. The verdict
   is one mesh-reduced scalar, so every rank takes the same branch. The
-  program returns every attempt's errors beside its flag and the host prints
-  the notices after the call: a checked program carries no host callback,
+  program returns the check's errors beside its flag and the host prints
+  the refusal after the call: a checked program carries no host callback,
   so JAX's persistent compile cache can store it (it never stores one with a
   callback). A status traced outside a `checked_program` (a caller's own jit,
   scan or cond) still names its refusal, through a host callback in that
@@ -267,16 +276,12 @@ route (c), and refuses by name at the first stack that needs the whole mesh
 
 - **Route (c)** when the program that runs the stack, priced from the shapes
   (`_stack_price`: `BATCH_EIGH_TILES` = 8 n² per whole matrix a rank holds,
-  plus the checked chain's temporaries), fits the room. An eager call's
-  program, and a traced one inside `checked_program`'s first program, holds
-  its first attempt, and the retries run as a second program only when that
-  check fails (`checked_program`'s retry runs on the whole mesh); any other
-  traced caller, and a solve inside a scan, cond or shard_map of that program,
-  holds the whole chain. The most whole matrices per rank that fit win, and
+  plus the check's temporaries), fits the room; eager and traced calls hold
+  the same one-attempt program. The most whole matrices per rank that fit win, and
   the stack runs in that many slices, one `lax.scan` over slice starts writing
   the face outputs in place.
 - **The whole-mesh provider** otherwise, including room 0 (an `auto` plan
-  with no provider refuses here; its checked retry stays on route (c)).
+  with no provider refuses here).
 - **Every rank decides alike.** The candidates and their prices follow from
   the shape and the room only: nothing is compiled to be measured and no size
   is exchanged between ranks.
@@ -294,8 +299,8 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   a caller that caches programs per (signature, decision) compiles once per
   decision, not per room (`gw.response_bank`'s Dyson programs do). An eigh plan
   with a room decides per stack (`stack_route`) and refuses `decision`.
-- **Reporting.** Each decision is printed once per (op, B, n, dtype, room,
-  phase: first attempt or whole chain) by `new_stack_routes()`, which a driver prints through its
+- **Reporting.** Each decision is printed once per (op, B, n, dtype, room)
+  by `new_stack_routes()`, which a driver prints through its
   reporter, and listed by `describe()`. `known_route` is the pure query for
   pricing: the decided route, or the provider when none was made.
 - There are no sub-meshes or rank groups: whole mesh or whole matrices per
@@ -310,14 +315,12 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   whole-mesh plan (`gw.shared_pole_execution.staged_eigh`): no room, no
   sizing compile and no exchange.
 - **`checked_program(fn, mesh, out_shardings)`** jits a caller's program
-  over checked solves in two phases: the first holds every solve's first
-  attempt and returns their mesh-reduced failure flag; a failed first attempt
-  returns zeros (finite) so the rest of that program runs. Only when the flag
-  is set does the whole-chain program run: every solve's whole chain, every
-  stack on the whole mesh, refused by name if a solve fails every attempt.
-  `call.lower` lowers that program, so a caller that admits it by its compiled
-  size has sized the retry and runs the first program in the room it leaves.
-  `checked_shapes(fn, *args)` is `jax.eval_shape` of the first phase.
+  over checked solves as one program that also returns their mesh-reduced
+  failure flag and error tables; the host reads the flag once and, only when
+  it is set, names each failed solve and raises. `call.lower` lowers that
+  program and `call.finish(args, result)` reads the flag of a result run
+  from the caller's own executable. `checked_shapes(fn, *args)` is
+  `jax.eval_shape` of it.
 
 ### Resident operands: `batch_layout` and `local_batch`
 
@@ -601,9 +604,11 @@ nothing and accept `float64` or `complex128` only.
 
 - `workspace_bytes_per_rank(plan, op, shapes, dtype)`: the device workspace
   per rank of a resolved CUDA `Plan` or `GemmPlan`. For a distributed `eigh`
-  it is the cuSOLVERMp workspace rounded to 256 bytes plus one private operand
-  tile `(n/P_x)(n/P_y)·itemsize`, which keeps eigh non-donating despite the
-  destructive tridiagonalization; do not add that tile again. A local eigh
+  it is the cuSOLVERMp workspace rounded to 256 bytes, plus the checked
+  chain's XLA tiles (`checked_device_bytes`). The operand the
+  tridiagonalization destroys is no longer a private tile in the handler's
+  scratch: it is an XLA result aliased to the solver's input (ABI 10), the
+  chain's deflated copy, counted among those tiles. A local eigh
   returns the cuSolverDn workspace plus a 4-byte info word. A distributed
   `gemm` has none: `panel_matmul`'s panels are XLA's. Query collectively on
   the real mesh; off CUDA it returns 0.

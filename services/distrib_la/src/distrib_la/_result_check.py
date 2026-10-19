@@ -7,10 +7,10 @@ responses (n 432 to 18304) and a sentinel-padded H'_vv (CrI3, n 9152), all
 reproduced outside LORRAX. So every eigh takes its exact-zero rows out of the
 solver (:func:`deflate_zero_rows`), and every distributed eigh and LU solve is
 checked on its own output against fixed-seed random probes before it is
-returned (:func:`checked`), at O(n^2 k) beside the O(n^3) solve. A failed
-check retries where the operands survive; a result that still fails is
-NaN-poisoned on every rank, named on rank 0's stderr (GATE
-distrib_la_result_check) and raised. The device returns each check's
+returned (:func:`checked`), at O(n^2 k) beside the O(n^3) solve. There is one
+attempt: a result that fails its check is NaN-poisoned on every rank (an
+eigh's eigenvalues, a solve's X), named on rank 0's stderr (GATE distrib_la_result_check) and raised, as a consumed LU
+solve always was. The device returns each check's
 errors with its flag (:func:`checked`) and the host prints the notices after
 the call, so no program carries a host callback: JAX's persistent compile
 cache never stores a program with one, and every checked program would
@@ -47,14 +47,43 @@ PROBES = 8
 #: The probe seed: every rank draws the same probes, so every rank reaches
 #: the same verdict from the same reduced norms.
 _SEED = 20261002
-#: Newton-Schulz steps the shifted retry may take (it stops at n * eps).
-ORTHONORMALIZE_STEPS = 12
 
 
 def accept(n, dtype=np.complex128):
     """The accepted backward error of a checked result of side ``n``: roundoff_tol(n, dtype)."""
     from distrib_la.tolerance import roundoff_tol
     return roundoff_tol(n, dtype)
+
+
+def spectral_shift(a, *, mesh=None):
+    """The always-on eigh shift ``s = ||A||_F / sqrt(n)`` of each matrix of ``a`` (batch shape).
+
+    A checked eigh solves ``A + s I`` and moves the values back by ``s``
+    (:func:`shifted`), one attempt on every backend. Measured (largenmu,
+    2026-10-19; checked on the columns ``w > 1e-8 max(w)``): cuSOLVERMp 0.9.1
+    (P=4, 2x2) returns wrong kept pairs for the exactly low-rank operand
+    ``B^H B / n`` (``B`` n/4 x n) at n=9152 in 4 of 6 seeds x blocks (residual ~3e-4,
+    orthogonality ~0.1), and this shift repairs 9 of 9 measured cases (those six,
+    flat and graded 18304, full-rank Hermitian 9152; residual <= 1e-16,
+    orthogonality <= 7e-15). ``+max|diag|`` and ``+||A||_F`` do not. On ELPA
+    2026.02.001 it is harmless (all columns pass). It does NOT give orthonormal
+    vectors inside an exactly degenerate cluster (rounding-level eigenvalues,
+    all-column orthogonality 2e-2..3e-1 there): a caller that checks ALL
+    columns of such an operand refuses by name; none of our operands measured
+    has one. The eigenvalues move by ~``s eps <= ||A||_2 eps``.
+    """
+    square = jnp.abs(a) ** 2      # rank-ordered on a face (deflate_zero_rows' rule): no topology order
+    total = (jnp.sum(square, axis=(-2, -1)) if mesh is None else
+             ordered_sum(square, axis=(-2, -1), mesh=mesh, spec=_face(a.ndim)))
+    return jnp.sqrt(total / a.shape[-1])
+
+
+def shifted(eigh, s):
+    """``eigh`` (``a -> (w, v)``) solved on ``a + s I``, its values moved back by ``s``."""
+    def run(a):
+        w, v = eigh(a + s[..., None, None].astype(a.dtype) * _eye_like(a))
+        return w - s[..., None].astype(w.dtype), v
+    return run
 
 
 def _eye_like(a):
@@ -82,20 +111,7 @@ def _norm(a, mesh=None, spec=None):
     return ordered_norm(a, axis=(-2, -1), mesh=mesh, spec=spec)
 
 
-def _live_norm(a, mesh=None):
-    """||A||_F without the rows that carry only a diagonal entry (sentinels, zero rows)."""
-    diagonal = jnp.diagonal(a, axis1=-2, axis2=-1)
-    decoupled = jnp.all((a == 0) | (_eye_like(a) != 0), axis=-1)
-    if mesh is None:
-        live = jnp.sum(jnp.abs(a) ** 2, axis=(-2, -1)) - jnp.sum(
-            jnp.where(decoupled, jnp.abs(diagonal) ** 2, 0), axis=-1)
-    else:   # rank order on the face; the diagonal is one-owner (exact), summed in rank order too
-        live = ordered_sum(jnp.abs(a) ** 2, axis=(-2, -1), mesh=mesh, spec=_face(a.ndim)) - ordered_sum(
-            jnp.where(decoupled, jnp.abs(diagonal) ** 2, 0), axis=-1, mesh=mesh, spec=P(*((None,) * (a.ndim - 1))))
-    return jnp.sqrt(jnp.maximum(live, 0))
-
-
-def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
+def deflate_zero_rows(eigh, *, constrain=None, mesh=None):
     """Wrap a Hermitian eigensolver so exact zero rows never reach it.
 
     Capacity padding and unselected columns reach eigensolvers as exact zero
@@ -104,24 +120,23 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
     eigenpairs with info 0. Those rows are decoupled, so they are replaced by
     distinct diagonal sentinels in [-4b, -2b], b the Gershgorin bound of the
     rest (relative to A, so a small-norm matrix keeps the gap), solved, and
-    reported back as exact zero eigenvalues with their unit eigenvectors in
-    ascending order: the spectrum and vectors of the zero-padded matrix,
-    without a zero block inside the solver. The eigenvector columns are
-    reordered only when a live eigenvalue is negative (a PSD matrix comes out
-    of the solver in order already), because reordering a distributed matrix's
-    columns is a cross-device permutation. A matrix with no zero row passes
-    through unchanged. ``constrain`` pins a distributed result to its layout
-    (values replicated, vectors on the operand's faces), so the cond's output
-    is never left to propagation, which replicated it (n^2 per rank).
-    ``shift`` also adds s = ||live A||_F to the live diagonal in the same
-    pass (one copy of A, as without it) and takes s off the eigenvalues: the
-    solver sees the live spectrum in [s - b, s + b], so a (near-)zero
-    cluster sits at s, away from the origin (:func:`shifted`, without its
-    re-orthonormalization). The eigenvalues come back with an absolute error
-    ~ eps (||A|| + s) <= eps sqrt(n) ||A||_2.
+    reported back as exact zero eigenvalues with their unit eigenvectors.
+
+    THE CONTRACT: the deflated pairs come FIRST (value 0, unit vectors, the
+    lowest row index first), then the live pairs in ascending order. A live
+    eigenvalue below zero (round-off on a PSD operand, or an indefinite one)
+    sits after the deflated zeros, not before them: consumers select by value
+    or mask (``jnp.min`` for the smallest), never by sorted position. Nothing
+    is reordered, so no program holds a cross-device column permutation. A
+    matrix with no zero row passes through unchanged and comes out sorted.
+    The service pads a solve side the same way (:func:`pad_side`): its zero
+    rows have the lowest indices, so they come out first and are dropped by
+    count. (ELPA returns wrong pairs when the zero rows form a block at the
+    global TAIL, 4e-3 at n 4608, and not at the head: Frontier 2x2, 2026-10-19.) ``constrain`` pins a distributed result to its layout (values
+    replicated, vectors on the operand's faces).
     """
     pin = (lambda r: r) if constrain is None else constrain
-    def solve(a):
+    def solve(a, cut=None):     # ``cut`` is the checked routes' (checked_eigh); a bare solve ignores it
         n = a.shape[-1]
         dead = jnp.all(a == 0, axis=-1)
         # Every live eigenvalue lies in [-b, b] (Gershgorin).
@@ -129,21 +144,23 @@ def deflate_zero_rows(eigh, *, constrain=None, shift=False, mesh=None):
                 ordered_sum(jnp.abs(a), axis=-1, mesh=mesh, spec=_face(a.ndim)))
         bound = jnp.max(rows, axis=-1)
         bound = jnp.where(bound > 0, bound, 1)
-        sentinel = -2 * bound[..., None] * (1 + jnp.arange(n, dtype=bound.dtype) / n)
-        s = _live_norm(a, mesh)[..., None] if shift else 0
-        diagonal = jnp.where(dead, sentinel, s).astype(a.dtype)
+        sentinel = -2 * bound[..., None] * (2 - jnp.arange(n, dtype=bound.dtype) / n)   # row 0 lowest
+        diagonal = jnp.where(dead, sentinel, 0).astype(a.dtype)
         values, vectors = pin(eigh(a + diagonal[..., :, None] * _eye_like(a)))
-        restored = jnp.where(values < -1.5 * bound[..., None], 0, values - s)
-        # Sentinels come out first; only a negative live eigenvalue must move ahead of the zeros.
-        live_negative = jnp.any((restored < 0) & jnp.any(dead, axis=-1, keepdims=True))
-
-        def reorder(operands):
-            w, v = operands
-            order = jnp.argsort(w, axis=-1, stable=True)
-            return pin((jnp.take_along_axis(w, order, axis=-1),
-                        jnp.take_along_axis(v, order[..., None, :], axis=-1)))
-        return pin(jax.lax.cond(live_negative, reorder, pin, (restored, vectors)))
+        return pin((jnp.where(values < -1.5 * bound[..., None], 0, values), vectors))
     return solve
+
+
+def pad_side(a, side: int):
+    """``a`` (.., n, n) zero-padded to ``side`` at the HEAD: the pads deflate first and are dropped by count."""
+    n = int(a.shape[-1])
+    return jnp.pad(a, [(0, 0)] * (a.ndim - 2) + [(side - n, 0), (side - n, 0)])
+
+
+def drop_side(values, vectors, n: int):
+    """The ``n``-row result of a :func:`pad_side` solve: the first ``side - n`` pairs and rows are the pads."""
+    side = int(values.shape[-1])
+    return values[..., side - n:], vectors[..., side - n:, side - n:]
 
 
 #: The local (one-device) eigh of every native route: eigh_local (jnp.linalg.eigh with the
@@ -154,63 +171,6 @@ native_eigh = jax.jit(deflate_zero_rows(_eigh_local))
 #: non-finite (shared_pole_constructor / shared_pole_sectors, on their host-read diagnostics).
 from distrib_la.local_eigh import eigh_local_jacobi as _eigh_local_jacobi
 native_eigh_jacobi = jax.jit(deflate_zero_rows(_eigh_local_jacobi))
-
-
-def orthonormalize(vectors, *, matmul, mesh=None):
-    """Newton-Schulz polar iteration V <- V (3I - V^H V) / 2, GEMMs only.
-
-    Returns the vectors and the number of steps taken. A solve whose vectors
-    are eigenvectors but not orthonormal inside a degenerate cluster
-    (cuSOLVERMp at n 18304: residual 2e-15, orthogonality 2e-2) is repaired
-    without leaving the cluster: V^H V couples only near-parallel columns,
-    which share an eigenvalue. The iteration converges, quadratically, while
-    the singular values of V lie in (0, sqrt 3); it stops at n * eps or after
-    ORTHONORMALIZE_STEPS, and the result check decides either way (a failure
-    falls through to the next attempt). n 18304, 4x4: 6 steps, 2e-2 -> 8e-15.
-    """
-    n = vectors.shape[-1]
-    eye = _eye_like(vectors)
-    target = n * float(np.finfo(vectors.real.dtype).eps)
-
-    def gram(v):
-        g = matmul(v, v, transa="C")
-        return g, jnp.max(_norm(g - eye, mesh, _face(g.ndim))) / np.sqrt(n)
-
-    def unfinished(state):
-        steps, _, _, defect = state
-        return (steps < ORTHONORMALIZE_STEPS) & (defect > target)
-
-    def step(state):
-        steps, v, g, _ = state
-        v = matmul(v, (3 * eye - g) / 2)
-        g, defect = gram(v)
-        return steps + 1, v, g, defect
-
-    g, defect = gram(vectors)
-    steps, vectors, _, _ = jax.lax.while_loop(unfinished, step, (jnp.int32(0), vectors, g, defect))
-    return vectors, steps
-
-
-def shifted(eigh, *, matmul, mesh=None):
-    """Solve A + s I, s = ||live part of A||_F, re-orthonormalize, return A's eigenpairs.
-
-    The shift moves a large (near-)zero cluster away from the origin.
-    cuSOLVERMp's silent failures on rank-deficient PSD responses (n 432, no
-    zero row, every block size), on the CT metric's zero block (n 2688, block
-    224) and on a sentinel-padded H'_vv (n 9152, 4x4) all pass shifted (probe
-    residual <= 1.3e-15). Where the shifted vectors are still not orthonormal
-    inside a cluster (n 18304, a 3/4-wide near-zero cluster: orthogonality
-    2e-2), ``orthonormalize`` repairs them. s excludes rows that carry only a
-    diagonal entry (deflation sentinels). The eigenvalues come back with an
-    absolute error ~ eps (||A|| + s) <= eps sqrt(n) ||A||_2, below the
-    n eps lambda_max support line of the response callers.
-    """
-    def solve(a):
-        s = _live_norm(a, mesh)
-        values, vectors = eigh(a + s[..., None, None] * _eye_like(a))
-        vectors, _ = orthonormalize(vectors, matmul=matmul, mesh=mesh)
-        return values - s[..., None], vectors
-    return solve
 
 
 def probes(n, dtype, k=PROBES, salt=0):
@@ -239,14 +199,29 @@ def _all_ranks(flag, mesh):
     return reduce(flag) > 0
 
 
-def eigh_errors(a, values, vectors, *, mesh=None):
-    """Largest probe residual and orthogonality error of a (stack of) eigh result(s)."""
-    x = probes(a.shape[-1], vectors.dtype)
+def used_probes(values, dtype, cut=None):
+    """The probes, restricted to the columns a caller uses: rows ``w > cut * max(w)`` (all with ``cut`` None).
+
+    Check what you use: a caller that keeps only ``w > c max(w)`` passes ``cut <= c``, so a
+    defect inside the discarded near-zero cluster (cuSOLVERMp's non-orthonormal vectors
+    there) is outside the check and needs no retry. ``(X_used, mask or None)``."""
+    x = probes(values.shape[-1], dtype)
+    if cut is None:
+        return x, None
+    used = values > cut * jnp.max(values, axis=-1, keepdims=True)
+    return x * used[..., :, None].astype(dtype), used[..., :, None]
+
+
+def eigh_errors(a, values, vectors, *, mesh=None, cut=None):
+    """Largest probe residual and orthogonality error of a (stack of) eigh result(s), on the used columns."""
+    x, used = used_probes(values, vectors.dtype, cut)
     vx = vectors @ x
     nd = a.ndim
+    gram = jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x
+    norm_x = jnp.maximum(_norm(x), jnp.finfo(values.dtype).tiny)      # replicated, per matrix
     residual = _norm(a @ vx - vectors @ (values[..., :, None] * x), mesh, _rows(nd)) / (
-        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * _norm(x))
-    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x, mesh, _rows(nd)) / _norm(x)
+        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * norm_x)
+    orthogonality = _norm(gram if used is None else jnp.where(used, gram, 0), mesh, _rows(nd)) / norm_x
     finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
     return (jnp.where(finite, jnp.max(residual), jnp.inf),
             jnp.where(finite, jnp.max(orthogonality), jnp.inf))
@@ -263,21 +238,19 @@ def call_site():
     return "unknown caller"
 
 
-def refusal_message(op, n, dtype, site, attempts, *errors):
+def refusal_message(op, n, dtype, site, *errors):
     detail = ", ".join(f"{name} {float(value):.2e}" for name, value in
                        zip(("residual", "orthogonality"), errors))
     return (f"GATE distrib_la_result_check: {op} n={n} at {site}: "
-            f"{detail or 'no attempt passed'} after {attempts} attempt(s) "
-            f"(accept {accept(n, dtype):.1e}); the distributed solver returned a wrong result "
-            f"and no retry repaired it; result set to NaN")
+            f"{detail or 'failed its check'} "
+            f"(accept {accept(n, dtype):.1e}); the distributed solver returned a wrong result; "
+            f"result set to NaN")
 
 
 #: Host reads of check statuses: ``id(array) -> (array, bit)`` for a failure flag
-#: (``status[0]``) and for a notice bit (keyed by its error table ``status[1]``, which
-#: several tables of one program share no flag with).  The array is held so its id
+#: (``status[0]``), so a flag is read at most once. The array is held so its id
 #: cannot be reused while the entry lives.
 _FAILED: dict = {}
-_NOTICE: dict = {}
 
 
 def _memo(table, array):
@@ -291,146 +264,53 @@ def _remember(table, array, bit):
     table[id(array)] = (array, bit)
 
 
-def _word_program(tols):
-    """``[failed, notice_0, ..]`` of a status and its tables on the device: one int32 word, one host read.
-
-    ``notice_i`` is exactly :func:`_notices`' print condition for table ``i``: some
-    matrix's first attempt neither all-NaN nor within ``tols[i]`` (its loop stops at
-    the first such row).
-    """
-    @jax.jit
-    def word(failed, tables):
-        bits = [jnp.any(failed)]
-        for tol, errors in zip(tols, tables):
-            first = errors.reshape(-1, *errors.shape[-2:])[:, 0]
-            shown = ~jnp.all(jnp.isnan(first), axis=-1) & ~jnp.all(first <= tol, axis=-1)
-            bits.append(jnp.any(shown))
-        return jnp.stack(bits).astype(jnp.int32)
-    return word
+def _flag(status):
+    """Whether a replicated check status ``(failed, errors)`` failed: one read of its flag, every rank alike."""
+    failed = _memo(_FAILED, status[0])
+    if failed is None:
+        failed = bool(np.any(np.asarray(jax.device_get(status[0].addressable_data(0)))))
+        _remember(_FAILED, status[0], failed)
+    return failed
 
 
-_WORDS: dict = {}
+def _notices(status, op, n, dtype, site):
+    """Print the refusal of each failed matrix of a status on rank 0 (a stack names each one).
 
-
-def _read_status(failed, tables, infos):
-    """Read a replicated status's failure bit and every table's notice bit in ONE transfer.
-
-    Every rank calls it for the same status (it gates the retry and the refusal on all of
-    them), so every rank compiles and runs the same program, on its own replica
-    (INVARIANTS 21: no rank-conditional compile); only the printing is rank 0's.
-    ``infos`` are the tables' ``(n, dtype)``.
-    """
-    tols = tuple(float(accept(int(n), dtype)) for n, dtype in infos)
-    program = _WORDS.get(tols) or _WORDS.setdefault(tols, _word_program(tols))
-    word = np.asarray(program(failed.addressable_data(0),
-                              tuple(t.addressable_data(0) for t in tables)))
-    for table, bit in zip(tables, word[1:]):
-        _remember(_NOTICE, table, bool(bit))
-    _remember(_FAILED, failed, bool(word[0]))
-    return bool(word[0])
-
-
-def _status(status, n=None, dtype=None):
-    """``(failed, notice)`` of a replicated status, each read at most once per array.
-
-    With ``(n, dtype)`` (and a device table) both bits come in one transfer, on
-    every rank alike; without them only the failure bit is read (notice None).
-    """
-    failed, notice = _memo(_FAILED, status[0]), None
-    want = n is not None and not isinstance(status[1], np.ndarray)
-    if want:
-        notice = _memo(_NOTICE, status[1])
-    if (failed is not None) and (notice is not None or not want):
-        return failed, notice
-    if want:
-        _read_status(status[0], (status[1],), ((n, dtype),))
-        return _memo(_FAILED, status[0]), _memo(_NOTICE, status[1])
-    failed = bool(np.any(np.asarray(jax.device_get(status[0].addressable_data(0)))))
-    _remember(_FAILED, status[0], failed)
-    return failed, notice
-
-
-def _flag(status, n=None, dtype=None):
-    """Whether a replicated check status ``(failed, errors)`` failed (every rank reads the same bytes).
-
-    With ``(n, dtype)`` rank 0 reads the notice bit in the same transfer, so the
-    :func:`_notices` that follows reads the error table only when it will print.
-    """
-    return _status(status, n, dtype)[0]
-
-
-def _notices(status, op, n, dtype, site, *, final):
-    """Print a check status's notices on rank 0: each failed attempt, then the refusal.
-
-    ``errors`` [..., k, e] holds every attempt's errors (NaN where an attempt
-    did not run); a stack (a scan) reports each matrix that failed. A failed
-    last attempt is the refusal when ``final``, else the first program's
-    retry notice. Only the printing depends on the rank.
+    Called only once :func:`_flag` says the status failed, so the error table is
+    read only for a refusal. Only the printing depends on the rank.
     """
     if jax.process_index() != 0:
         return
-    if not isinstance(status[1], np.ndarray) and _memo(_NOTICE, status[1]) is False:
-        return              # read with the failure bit (_flag/_read_status): no attempt to name
     errors = status[1]
     errors = np.asarray(errors if isinstance(errors, np.ndarray) else jax.device_get(errors.addressable_data(0)))
     tol = accept(n, dtype)
-    for table in errors.reshape(-1, *errors.shape[-2:]):
-        for i, row in enumerate(table):
-            if np.isnan(row).all() or np.all(row <= tol):
-                break
-            if i + 1 == len(table) and final:
-                print(refusal_message(op, n, dtype, site, len(table), *row), file=sys.stderr, flush=True)
-                break
-            what = ("solving again in a separate program" if i + 1 == len(table) else
-                    f"attempt {i + 1} of {len(table)} failed; solving again")
-            detail = ", ".join(f"{name} {float(value):.2e}" for name, value in
-                               zip(("residual", "orthogonality"), row))
-            print(f"distrib_la: {op} n={n} at {site} failed its result check ({detail}, "
-                  f"accept {tol:.1e}); {what}", file=sys.stderr, flush=True)
+    for row in errors.reshape(-1, errors.shape[-1]):
+        if not np.all(row <= tol):
+            print(refusal_message(op, n, dtype, site, *row), file=sys.stderr, flush=True)
 
 
-def checked(op, attempts, errors_of, operands, *, n=None, dtype=None, constrain=None, final=True):
-    """Run ``attempts`` until one passes ``errors_of``: ``(result, (failed, errors))``.
+def checked(op, solve, errors_of, operands, *, n=None, dtype=None, constrain=None):
+    """Run ``solve`` once and check it with ``errors_of``: ``(result, (failed, errors))``.
 
-    Each attempt maps ``operands`` to a result; ``errors_of(result)`` returns
-    replicated (mesh-reduced) scalars, accepted at ``accept(n, dtype)``. Later
-    attempts run only when the earlier ones failed (``lax.cond``). ``failed``
-    is a replicated bool, ``errors`` [len(attempts), e] every attempt's
-    errors (NaN where it did not run); the caller's host prints the notices
-    (:func:`raise_if_failed`). A final failure poisons the result with NaN on
-    every rank. ``constrain`` pins each result (and each cond's output) to its
-    layout. ``final=False`` (a first program, whose retries run in a separate
-    program on its flag) returns zeros, not NaN, so the rest of that program
-    stays finite.
+    ``solve`` maps ``operands`` to a result; ``errors_of(result)`` returns
+    replicated (mesh-reduced) scalars, accepted at ``accept(n, dtype)``.
+    ``failed`` is a replicated bool, ``errors`` [e] the check's errors; the
+    caller's host names a failure (:func:`raise_if_failed`). A failure poisons
+    the result's first part with NaN on every rank (an eigh's eigenvalues, a
+    solve's X: n or n x nrhs elements, selected in place; poisoning the
+    vectors too would copy them: +16 n^2/P at P16, 16 matrices, route (c)),
+    and the failure is refused by name, eager or at its checked_program's
+    finish. ``constrain`` pins the result to its layout.
     """
     pin = (lambda r: r) if constrain is None else constrain
     n = int(operands[0].shape[-1]) if n is None else int(n)
     dtype = operands[0].dtype if dtype is None else dtype
-    k = len(attempts)
-
-    def verdict(errors):
-        return jnp.all(errors <= accept(n, dtype))
-
-    def run(index, table):
-        result = pin(attempts[index](*operands))
-        errors = jnp.stack(errors_of(result)).astype(jnp.float64)
-        if table is None:
-            table = jnp.full((k, errors.shape[0]), jnp.nan, jnp.float64)
-        table = table.at[index].set(errors)
-
-        def accepted(r):
-            return pin(r), jnp.bool_(False), table
-        if index + 1 == k:
-            def refuse(r):
-                return (pin(jax.tree.map(lambda a: jnp.full_like(a, jnp.nan if final else 0), r)),
-                        jnp.bool_(True), table)
-            out, failed, table = jax.lax.cond(verdict(errors), accepted, refuse, result)
-            return pin(out), failed, table
-        out, failed, table = jax.lax.cond(verdict(errors), accepted,
-                                          lambda _: run(index + 1, table), result)
-        return pin(out), failed, table
-    out, failed, table = run(0, None)
-    return out, (failed, table)
+    result = pin(solve(*operands))
+    errors = jnp.stack(errors_of(result)).astype(jnp.float64)
+    ok = jnp.all(errors <= accept(n, dtype))
+    nan = lambda a: jnp.where(ok, a, jnp.array(jnp.nan, a.dtype))
+    out = (nan(result[0]), *result[1:]) if isinstance(result, tuple) else nan(result)
+    return pin(out), (~ok, errors)
 
 
 def eigh_layout(mesh, ndim):
@@ -441,17 +321,17 @@ def eigh_layout(mesh, ndim):
                       jax.lax.with_sharding_constraint(r[1], vectors))
 
 
-def checked_eigh(attempts, a, *, mesh=None, final=True):
-    """A distributed eigh, checked: ``attempts`` solve ``a`` in order of preference; ``(result, failed)``."""
+def checked_eigh(solve, a, *, mesh=None, cut=None):
+    """A distributed eigh, checked on the columns ``w > cut * max(w)`` (all by default): ``(result, failed)``."""
     constrain = None if mesh is None else eigh_layout(mesh, a.ndim)
-    return checked("eigh", attempts, lambda r: eigh_errors(a, *r, mesh=mesh), (a,),
-                   constrain=constrain, final=final)
+    return checked("eigh", solve, lambda r: eigh_errors(a, *r, mesh=mesh, cut=cut), (a,),
+                   constrain=constrain)
 
 
-#: Inside :func:`checked_program`'s trace: (phase, entries, trace). A checked
-#: solve traced at that level holds only that phase of its chain and hands
-#: its status and (op, n, dtype, site) here; elsewhere (no program, or a
-#: nested scan, cond or shard_map trace) it holds the whole chain ("all").
+#: Inside :func:`checked_program`'s trace: (entries, trace). A checked solve
+#: traced at that level hands its status and (op, n, dtype, site) here;
+#: elsewhere (no program, or a nested scan, cond or shard_map trace) it
+#: names its own failure (:func:`raise_if_failed`).
 _TRACED = contextvars.ContextVar("distrib_la_traced", default=None)
 
 
@@ -459,35 +339,24 @@ def _program_context():
     """The enclosing :func:`checked_program` when tracing at its level, else None."""
     from jax._src.core import trace_ctx
     ctx = _TRACED.get()
-    return ctx if ctx is not None and ctx[2] is trace_ctx.trace else None
-
-
-def traced_phase():
-    """The phase a traced checked solve compiles: its program's, else "all"."""
-    ctx = _program_context()
-    return "all" if ctx is None else ctx[0]
-
-
-def in_checked_retry():
-    """Tracing a :func:`checked_program`'s whole-chain program, whose stacks run on the whole mesh."""
-    return traced_phase() == "all" and _program_context() is not None
+    return ctx if ctx is not None and ctx[1] is trace_ctx.trace else None
 
 
 def _signature(args):
     return jax.tree.structure(args), tuple((tuple(a.shape), str(a.dtype)) for a in jax.tree.leaves(args))
 
 
-def _in_phase(fn, phase):
-    """``fn`` traced with its checked solves on ``phase``: ``(out, ())`` or
+def _collected(fn):
+    """``fn`` traced with its checked solves collected: ``(out, ())`` or
     ``(out, (reduced failure flag, every solve's error table))``; each trace's
     (op, n, dtype, site) per solve is kept in ``run.infos`` by signature."""
     infos = {}
 
     def run(*args):
         from jax._src.core import trace_ctx
-        token = _TRACED.set((phase, [], trace_ctx.trace))
+        token = _TRACED.set(([], trace_ctx.trace))
         try:
-            out, entries = fn(*args), _TRACED.get()[1]
+            out, entries = fn(*args), _TRACED.get()[0]
         finally:
             _TRACED.reset(token)
         infos[_signature(args)] = tuple(info for _, info in entries)
@@ -500,57 +369,41 @@ def _in_phase(fn, phase):
 
 
 def checked_shapes(fn, *args):
-    """``jax.eval_shape`` of ``fn`` as :func:`checked_program`'s first program traces it."""
-    return jax.eval_shape(_in_phase(fn, "first"), *args)[0]
+    """``jax.eval_shape`` of ``fn`` as :func:`checked_program` traces it."""
+    return jax.eval_shape(_collected(fn), *args)[0]
 
 
 def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options=None):
-    """A caller's jitted program over checked solves, run as an eager eigh is.
+    """A caller's jitted program over checked solves: one program, its failure read once.
 
-    The first program holds each checked solve's first attempt and check and
-    returns their mesh-reduced failure flag and error tables; only when the
-    flag is set does the whole-chain program run: every solve's whole chain,
-    every stack on the whole mesh, refused by name if a solve fails every
-    attempt. The notices print on the host from the returned tables. A
-    program with no checked solve returns no flag and is never synced on.
-    ``call.lower`` lowers the whole-chain program, so a caller that admits it
-    by its compiled size has sized the retry, and a first program run beside
-    that size fits. A caller that runs ``call.lower(*args).compile()`` itself
-    hands that executable's ``(out, status)`` to ``call.finish(args, result)``,
-    which prints the notices, refuses by name and returns ``out``.
+    The program returns each checked solve's result and the mesh-reduced
+    failure flag with every solve's error table; the host reads the flag
+    (one transfer) and, only when it is set, prints each failed solve's
+    refusal and raises by name. A program with no checked solve returns no
+    flag and is never synced on. A caller that runs
+    ``call.lower(*args).compile()`` itself hands that executable's
+    ``(out, status)`` to ``call.finish(args, result)``.
     """
     rep = NamedSharding(mesh, P())
-    phases = {phase: _in_phase(fn, phase) for phase in ("first", "all")}
+    traced = _collected(fn)
     shardings = {} if in_shardings is None else dict(in_shardings=in_shardings)
     if compiler_options is not None:
         # Top-level jit only (the XLA option set, e.g. the latency-hiding scheduler).
         shardings["compiler_options"] = dict(compiler_options)
-    first, again = (jax.jit(phases[phase], out_shardings=(out_shardings, rep), **shardings)
-                    for phase in ("first", "all"))
-
-    def report(phase, args, status, final):
-        for (op, n, dtype, site), table in zip(phases[phase].infos[_signature(args)], status[1]):
-            _notices((status[0], table), op, n, dtype, site, final=final)
+    program = jax.jit(traced, out_shardings=(out_shardings, rep), **shardings)
 
     def finish(args, result):
         out, status = result
-        if status:
-            infos = phases["all"].infos[_signature(args)]
-            _read_status(status[0], tuple(status[1]), [(n, dtype) for _, n, dtype, _ in infos])
-            report("all", args, status, final=True)
-            if _flag(status):
-                raise ValueError(f"GATE distrib_la_result_check: a checked solve in the program at "
-                                 f"{call_site()} failed every attempt (named above); result set to NaN")
+        if status and _flag(status):
+            for (op, n, dtype, site), table in zip(traced.infos[_signature(args)], status[1]):
+                _notices((status[0], table), op, n, dtype, site)
+            raise ValueError(f"GATE distrib_la_result_check: a checked solve in the program at "
+                             f"{call_site()} failed its check (named above); result set to NaN")
         return out
 
     def call(*args):
-        out, status = first(*args)
-        if not status or not _flag(status):
-            return out
-        report("first", args, status, final=False)
-        del out
-        return finish(args, again(*args))
-    call.lower, call.finish = again.lower, finish
+        return finish(args, program(*args))
+    call.lower, call.finish = program.lower, finish
     return call
 
 
@@ -559,7 +412,7 @@ _UNCACHEABLE: set = set()
 
 
 def raise_if_failed(status, op, n, dtype, site):
-    """An eager call's notices and refusal: raise by name when any matrix failed every attempt.
+    """An eager call's refusal: raise by name when any matrix failed its check.
 
     ``status`` is :func:`checked`'s ``(failed, errors)`` (or a stack of them,
     from a scan), replicated, so every rank reads the same values and raises
@@ -571,7 +424,7 @@ def raise_if_failed(status, op, n, dtype, site):
     """
     if isinstance(status[0], jax.core.Tracer):
         if _program_context() is not None:
-            _program_context()[1].append((status, (op, int(n), dtype, site)))
+            _program_context()[0].append((status, (op, int(n), dtype, site)))
         else:
             if site not in _UNCACHEABLE and jax.process_index() == 0:
                 print(f"distrib_la: UNCACHEABLE: a checked {op} at {site} is traced outside "
@@ -580,13 +433,15 @@ def raise_if_failed(status, op, n, dtype, site):
                       f"process); build that program with distrib_la.checked_program",
                       file=sys.stderr, flush=True)
             _UNCACHEABLE.add(site)
-            jax.debug.callback(lambda failed, errors: _notices((failed, errors), op, int(n), dtype, site,
-                                                               final=True), *status)
+            # No array math in the callback: np.any on a jax Array compiles a reduction, and
+            # only on the ranks that reach it (a rank-divergent compile). _notices prints only
+            # failed rows, on rank 0, from host copies.
+            jax.debug.callback(lambda failed, errors: _notices((failed, errors), op, int(n), dtype, site),
+                               *status)
         return
-    failed = _flag(status, n, dtype)          # every rank: the failure and notice bits, one read
-    _notices(status, op, n, dtype, site, final=True)
-    if failed:
-        raise ValueError(refusal_message(op, n, dtype, site, "every"))
+    if _flag(status):                         # every rank: the failure bit, one read
+        _notices(status, op, n, dtype, site)
+        raise ValueError(refusal_message(op, n, dtype, site))
 
 
 def matrix_sketch(a, mesh=None):

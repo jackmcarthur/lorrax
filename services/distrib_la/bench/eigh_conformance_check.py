@@ -13,16 +13,22 @@ built on the devices from fixed seeds:
              shape of the PSD responses on which cuSOLVERMp returned wrong
              vectors (n 432, rank 105); also at n = 216 p
   real       .npy matrices named on the command line (dumps of failing solves)
+At P4 also low-rank n 9152, seeds 4576/7 x blocks 208/176/104 (the shift's cases), kept columns judged.
 Per case: bare cuSOLVERMp at its default block (reported, not judged) and
 distrib_la.plan('eigh', backend='distributed').batched, which must pass:
 probe residual and orthogonality within accept, and the eigenvalues equal to
-host LAPACK to 1e-11 * max|w| where n <= 3000. Exit 1 on any FAIL.
+host LAPACK to 1e-11 * max|w| where n <= 3000. Exit 1 on any FAIL. The gram and
+low-rank families are judged as their callers use them, checked above the keep
+cut (CUT, w > CUT max w; the eigenvalue comparison stays over all of them); the
+full check there is reported, not judged (one attempt: the near-zero cluster's
+vectors may refuse it).
 
     lx run --pool POOL -N 1 -G 4 -n 4 -- bash -c 'source config/perlmutter/gpu_env.sh; \
         python3 -u services/distrib_la/bench/eigh_conformance_check.py [dump.npy ...]'
     (P16: -N 4 -G 4 -n 16)
 """
 import sys
+from functools import partial
 
 # runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
 from runtime import initialize_communicator_stack, run_main_and_finalize
@@ -31,6 +37,7 @@ import numpy as np  # noqa: E402
 RUNTIME = initialize_communicator_stack()
 LOCAL_SIZES = (257, 389, 1144, 4576)
 LAPACK_LIMIT = 3000
+CUT = 1e-8          # the shared-pole sites' keep cut (normalized_gram_keep)
 
 
 def main():
@@ -89,17 +96,20 @@ def main():
     errors = jax.jit(eigh_errors, out_shardings=rep)
     plan_cache = {}
 
-    def case(name, a):
+    def case(name, a, cut=None):
         n = int(a.shape[-1])
         bare = jax.jit(lambda x: _eigh_columns("cusolvermp", *_cusolvermp.distributed_eigh(x, mesh=mesh)))
-        bare_r, bare_o = (float(x) for x in errors(a, *bare(a)))
+        try:
+            bare_r, bare_o = (float(x) for x in errors(a, *bare(a)))
+        except ValueError:      # not a solve side: the wrapper refuses it (the checked plan pads)
+            bare_r = bare_o = float("nan")
         if n not in plan_cache:
             plan_cache[n] = distrib_la.plan("eigh", mesh, n=n, backend="distributed", batched_route="auto")
         stack = jax.jit(lambda x: x[None], out_shardings=NamedSharding(mesh, P(None, "x", "y")))(a)
-        w, v = jax.jit(plan_cache[n].batched)(stack)
-        r, o = (float(x) for x in errors(a, w[0], v[0]))
+        w, v = jax.jit(lambda s: plan_cache[n].batched(s, cut=cut))(stack)
+        r, o = (float(x) for x in jax.jit(partial(eigh_errors, cut=cut), out_shardings=rep)(a, w[0], v[0]))
         ok = r <= accept(n) and o <= accept(n)
-        note = ""
+        note = "" if cut is None else f" cut={cut:g} full_check={'pass' if np.isfinite(np.asarray(gather_to_host(jax.jit(plan_cache[n].batched)(stack)[0]))).all() else 'refused'}"
         if n <= LAPACK_LIMIT:
             whole = np.asarray(gather_to_host(a))
             ref = np.linalg.eigvalsh(whole)
@@ -119,8 +129,39 @@ def main():
         for family, build in (("zero-row", zero_row), ("small-zero-row", small_zero_row),
                               ("gram", gram), ("low-rank", low_rank), ("sentinel", sentinel)):
             a = jax.jit(build, static_argnums=(0, 1), out_shardings=face)(n, m)
-            case(f"{family} n/p={m}", a)
+            case(f"{family} n/p={m}", a, CUT if family in ("gram", "low-rank") else None)
             del a
+    # The always-on shift's cases (distrib_la._result_check.spectral_shift): the low-rank family at
+    # n 9152 (P4), seeds 4576 and 7 x cuSOLVERMp blocks 208, 176, 104, through the plan's checked
+    # eigh at a forced block. Unshifted, 4 of the 6 returned wrong kept pairs (largenmu 2026-10-19).
+    # The kept columns must pass; the full check is reported (cluster vectors may refuse it).
+    if p == 2:
+        from types import SimpleNamespace
+        from distrib_la.plan import Plan
+        default = _cusolvermp.solve_layout
+        safe = Plan._checked_eigh(SimpleNamespace(backend="cusolvermp"), _cusolvermp.distributed_eigh,
+                                  _eigh_columns)
+        for seed in (4576, 7):
+            a = jax.jit(low_rank, static_argnums=(0, 1), out_shardings=face)(9152, seed)
+            for block in (208, 176, 104):
+                _cusolvermp.solve_layout = lambda n_, p_, b=block: (n_, b)
+                name = f"low-rank 9152 s{seed} b{block}"
+                try:
+                    w, v, status = jax.jit(lambda x: safe(x, mesh=mesh, cut=CUT))(a)
+                    r, o = (float(x) for x in jax.jit(partial(eigh_errors, cut=CUT), out_shardings=rep)(a, w, v))
+                    ok = not bool(np.asarray(gather_to_host(status[0]))) and max(r, o) <= accept(9152)
+                    full = "pass" if np.isfinite(np.asarray(gather_to_host(
+                        jax.jit(lambda x: safe(x, mesh=mesh))(a)[0]))).all() else "refused"
+                except Exception as exc:            # a refusal by name
+                    r = o = float("nan"); ok = False; full = type(exc).__name__
+                if not ok:
+                    failed.append(name)
+                if lead:
+                    print(f"eigh_conformance P4 {name:24s} n=  9152 block={block:4d} shifted checked "
+                          f"residual={r:.1e} orth={o:.1e} cut={CUT:g} full_check={full} {'PASS' if ok else 'FAIL'}",
+                          flush=True)
+            del a
+        _cusolvermp.solve_layout = default
     for path in sys.argv[1:]:
         whole = np.load(path)
         if whole.shape[-1] % p:
