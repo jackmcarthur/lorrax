@@ -402,21 +402,29 @@ def main():
                 _save()
 
     def save_states(tag, r):
-        """The window populations (bundle rows) at the pulse peak and at the end of a run."""
-        if "rho_t" not in r:
-            return None
-        t = np.asarray(r["times_fs"])[:r["rho_t"].shape[0]]
-        i_pk, i_end = int(np.argmin(np.abs(t - a.peak_fs))), r["rho_t"].shape[0] - 1
+        """The window populations (bundle rows) at the pulse peak and at the end of a run.
+
+        Rank 0 reads the run's output file; the states are broadcast so every rank
+        takes the same branch (the refits that follow are collective).
+        """
+        from jax.experimental import multihost_utils
         bo = next(iter(colls.values()))["bundle_of"]
-        sts = {}
-        for name, i in (("peak", i_pk), ("end", i_end)):
-            f_td = np.real(np.einsum("kii->ki", r["rho_t"][i]))
-            f_b = np.empty_like(f_td)
-            f_b[bo] = f_td
-            sts[name] = dict(t_fs=float(t[i]), f_b=f_b)
-        np.savez(os.path.join(a.out, f"states_{tag}.npz"),
-                 **{f"{k}_f_b": v["f_b"] for k, v in sts.items()},
-                 **{f"{k}_t_fs": v["t_fs"] for k, v in sts.items()})
+        have, buf, tt = np.zeros(1), np.zeros((2, nk, nA)), np.zeros(2)
+        if "rho_t" in r:
+            n = r["rho_t"].shape[0]
+            t = np.asarray(r["times_fs"])[:n]
+            for j, i in enumerate((int(np.argmin(np.abs(t - a.peak_fs))), n - 1)):
+                buf[j][bo] = np.real(np.einsum("kii->ki", r["rho_t"][i]))
+                tt[j] = t[i]
+            have[0] = 1.0
+        have, buf, tt = (np.asarray(multihost_utils.broadcast_one_to_all(x)) for x in (have, buf, tt))
+        if have[0] == 0.0:
+            return None
+        sts = dict(peak=dict(t_fs=float(tt[0]), f_b=buf[0]), end=dict(t_fs=float(tt[1]), f_b=buf[1]))
+        if rank0:
+            np.savez(os.path.join(a.out, f"states_{tag}.npz"),
+                     **{f"{k}_f_b": v["f_b"] for k, v in sts.items()},
+                     **{f"{k}_t_fs": v["t_fs"] for k, v in sts.items()})
         return sts
 
     if "SPD" in sections:
