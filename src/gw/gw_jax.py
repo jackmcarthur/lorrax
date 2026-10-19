@@ -345,7 +345,8 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
     from .screening import refuse_full_shared_pole_with_trs, refuse_w_bse_without_trs
     from .ppm_pipeline import refuse_hl_ppm_without_trs
     refuse_unsupported_shared_pole_head(
-        config, trs_allowed=sym.trs_allowed, nspinor=wfn.nspinor)
+        config, trs_allowed=sym.trs_allowed, nspinor=wfn.nspinor,
+        material_class=material_class)
     refuse_w_bse_without_trs(config, sym)
     refuse_full_shared_pole_with_trs(config, sym)
     refuse_hl_ppm_without_trs(config, sym)

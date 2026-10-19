@@ -4320,7 +4320,7 @@ def uses_metal_direct_drude_head(config) -> bool:
     velocity (``response_bank.compute_photon_bank``).  The folded head (``full``, intraband
     wings and the static fold) is admitted on scalar decks (owner ruling
     2026-09-25: full on time-reversal-even metals on the frozen and the
-    per-map routes); an ordered (time-reversal-broken) store still refuses
+    per-map routes); an ordered (time-reversal-broken) metal still refuses
     it at the head (``GATE shared_pole_head_ordered``).
 
     ``parallel_transport`` is admitted on scalar and four-current decks:

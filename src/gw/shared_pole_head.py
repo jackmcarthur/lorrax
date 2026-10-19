@@ -16,8 +16,15 @@ on both stores. Certified by ``tests/test_shared_pole_head_two_component.py``
 rotation leaves it invariant).
 
 An ordered store (measured broken time reversal, ``scalar-ordered-ph``)
-carries the DIRECT frequency-dependent head only, ``head_correction =
-no_local_fields``: the Cartesian tensor ``S_ab(z)`` of
+takes the same fold with its signed forms.  Its Gamma body is the store's
+normalization at ``-q = q``,
+
+    Wc(z) = b D+(z) b^H - [b D-(z) b^H]^T,  D+-(z) = 1/(2 W (z -+ W)),  W = sqrt(Lambda),
+
+evaluated at ``z`` (not ``z^2``; real ``b`` gives back ``b (z^2 - Lambda)^-1
+b^H``), and its wings take the Lehmann weight of every ordered pair
+(``gw.qsgw_head._head_wing_interband_weight``), which keeps the odd-in-z
+part time reversal removes.  The Cartesian tensor ``S_ab(z)`` of
 ``gw.qsgw_head.head_s_tensor_sharded`` needs no time-reversal assumption.
 Its two Lehmann terms for one unordered pair combine at the same ``k``,
 
@@ -30,15 +37,17 @@ conjugation and the denominator ``D [(z + i eta)^2 - D^2]`` all survive;
 what time reversal removed was only the antisymmetric ``Im T_ab`` part
 (nonzero on a magnet, odd in ``z``), which the mini-BZ quadratic form
 ``q.S.q`` annihilates whatever weight it carries.  The k sum runs over the
-full zone unfolded by the measured magnetic group.  The wing/body fold of a
-signed store is NOT implemented (owner scope 2026-09-21), so
-``head_correction = full`` refuses on an ordered store by name; the
-delivered ordered head is direct-term-only and on the one-shot and
-``sc_head_update = off`` routes carry no intraband Drude/Thomas-Fermi
-piece. The direct-only SC route may instead select ``dft_velocity``: it
-rotates the authenticated DFT dipole into each map's QP basis and uses that
-map's Fermi-surface weights in the common Drude/Thomas-Fermi kernels. The
-ordered interband tensor is checked in ``tests/test_head_direct_ordered.py``.
+full zone unfolded by the measured magnetic group.  The scalar head stays
+even in ``z``: the Lehmann form gives ``chi_ab(-z) = chi_ba(z)`` for the
+tensor, the wings (``Y(-z) = Z(z)^T``) and the body (``W(-z) = W(z)^T``), so
+``S_eff(-z) = S_eff(z)^T`` and ``q.S_eff.q`` with real ``q`` is even; the
+``s = z^2`` MPA head fit applies unchanged.  ``head_correction = full``
+still refuses an ordered METAL by name (``GATE shared_pole_head_ordered``):
+its exact ``z = 0`` slot folds the static Matsubara wings and body
+(``qsgw_head._metal_static_head``), not certified without time reversal.
+Such a deck takes ``no_local_fields`` (the direct head; the SC route may
+select ``dft_velocity`` for the Drude/Thomas-Fermi piece) or ``off``.  The
+signed fold is checked in ``tests/test_shared_pole_head_ordered_fold.py``.
 """
 from types import SimpleNamespace
 from functools import lru_cache
@@ -78,27 +87,35 @@ def _gamma_gemm_route(mesh, b_shape, budget_bytes):
 
 
 @lru_cache(maxsize=None)
-def _gamma_body(mesh, route):
-    """Raw latent body; current factors are operands of one retained callable.
+def _gamma_body(mesh, route, ordered=False):
+    """Raw latent body at complex ``z``; current factors are operands of one retained callable.
 
-    ``route`` is the GEMM's ``(backend, batched_route)`` (:func:`_gamma_gemm_route`)."""
+    ``route`` is the GEMM's ``(backend, batched_route)`` (:func:`_gamma_gemm_route`).
+    TRS-even store: ``V + b (z^2 - Lambda)^-1 b^H``.  Ordered store (module
+    docstring): ``V + b D+ b^H - [b D- b^H]^T``, the second GEMM transposed in
+    its faces as ``mpa.sigma.shared_pole_static_wc`` does at ``-q = q``."""
     from distrib_la import matmul
     from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import transpose_xy
     face = NamedSharding(mesh, P(None, "x", "y"))
     backend, batched_route = route
 
     @jax.jit(out_shardings=face)
-    def evaluate(s, b, poles, counts, v):
+    def evaluate(z, b, poles, counts, v):
         active = jnp.arange(b.shape[-1])[None, :] < counts[:, None]
-        weights = jnp.where(active, 1/(s-poles), 0)
-        return v+matmul(b*weights[:, None, :], b, mesh=mesh, backend=backend,
-                        batched_route=batched_route, transb="C")
+        wc = lambda weights: matmul(b*jnp.where(active, weights, 0)[:, None, :], b, mesh=mesh,
+                                    backend=backend, batched_route=batched_route, transb="C")
+        if not ordered:
+            return v + wc(1/(z*z-poles))
+        w = jnp.sqrt(poles)
+        minus = jax.lax.with_sharding_constraint(transpose_xy(wc(1/(2*w*(z+w))), mesh), face)
+        return v + wc(1/(2*w*(z-w))) - minus
     return evaluate
 
 
 @lru_cache(maxsize=None)
-def _realized_gamma_body(mesh, realize, route):
-    """One admitted all-P executable for V + Pi_G Wc at complex z².
+def _realized_gamma_body(mesh, realize, route, ordered=False):
+    """One admitted all-P executable for V + Pi_G Wc at complex z.
 
     Only residue endpoints transform under antiunitary operations. Taking
     the conjugate of a completed W(z²) would conjugate its causal scalar
@@ -107,18 +124,18 @@ def _realized_gamma_body(mesh, realize, route):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import transpose_xy
     face = NamedSharding(mesh, P(None, "x", "y"))
-    raw = _gamma_body(mesh, route)
+    raw = _gamma_body(mesh, route, ordered)
 
     @jax.jit(out_shardings=face)
-    def evaluate(s, b, poles, counts, v):
-        wc = raw(s, b, poles, counts, jnp.zeros_like(v))
+    def evaluate(z, b, poles, counts, v):
+        wc = raw(z, b, poles, counts, jnp.zeros_like(v))
         partner = jax.lax.with_sharding_constraint(transpose_xy(wc, mesh), face)
         wc, _ = realize(wc, partner)
         return v + wc
     return evaluate
 
 
-def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
+def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor, material_class):
     """Refuse, at input resolution, a full shared-pole head the Gamma body cannot evaluate.
 
     Called once from ``gw_jax._load_system_inputs`` right after the WFN
@@ -127,7 +144,8 @@ def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
     the bank, moments and constructor had run and ``model.h5`` was committed,
     so a rerun in that directory then refused on the committed model (Q0HEAD
     2026-09-16).  ``trs_allowed`` is the final ``SymMaps.trs_allowed`` the
-    store's representation follows; ``nspinor`` is the source WFN's. The
+    store's representation follows; ``nspinor`` is the source WFN's;
+    ``material_class`` is the WFN-occupation verdict. The
     bare-transverse shared-pole route stores its charge operator on the
     four-component carrier, so its preflight must use that store extent.
     """
@@ -137,32 +155,31 @@ def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor):
         return
     store_nspinor = (4 if (bool(getattr(config, "bispinor", False))
                           and uses_bare_transverse_shared_pole(config)) else nspinor)
-    _refuse_head_representation(trs_allowed=trs_allowed, nspinor=store_nspinor)
+    _refuse_head_representation(trs_allowed=trs_allowed, nspinor=store_nspinor,
+                                metal=material_class == "metal")
 
 
-def _refuse_head_representation(*, trs_allowed, nspinor):
-    """The one owner of what the full Gamma head evaluates: the TRS-even charge body.
+def _refuse_head_representation(*, trs_allowed, nspinor, metal):
+    """The one owner of what the full Gamma head evaluates: the scalar charge body.
 
     ``nspinor`` 1 or 2 is the charge representation (module docstring): the
     two-component store holds the same spin-traced charge operator and its
     head vertices trace the spinor index, so both evaluate identically. The
     four-component charge carrier has no certified scalar wing/body fold.
-    The full photon layout has a separate Gamma completion.
+    The full photon layout has a separate Gamma completion.  Either store
+    representation folds (module docstring); an ordered metal refuses.
     """
-    remedy = ("On this store head_correction = no_local_fields delivers the direct "
-              "frequency-dependent head (exact without time reversal; the k sum runs over "
-              "the full zone under the measured magnetic group), which is the ordered head "
-              "the owner asked for (2026-09-21); head_correction = off is the headless "
-              "brute-grid development mode (owner policy 2026-09-18).")
-    if not bool(trs_allowed):
+    if not bool(trs_allowed) and bool(metal):
         raise ValueError(
             "GATE shared_pole_head_ordered: got time-reversal-broken symmetry (an ordered "
-            "store, representation scalar-ordered-ph) with head_correction = full; want "
-            "scalar-trs-even-s for full; why: full folds the wings through the Gamma body, "
-            "and the body evaluator is the time-reversal-even form b (s - Lambda)^-1 b^dagger, "
-            "not the signed particle-hole model an ordered store declares; the signed "
-            "wing/body fold is not implemented (owner scope 2026-09-21, wings and body "
-            "fold deferred). " + remedy)
+            "store, representation scalar-ordered-ph) on a metal with head_correction = "
+            "full; want an insulator, or time reversal, for full; why: the metal's exact "
+            "z = 0 slot folds the static Matsubara wings and body "
+            "(qsgw_head._metal_static_head), which are not certified without time "
+            "reversal. head_correction = no_local_fields delivers the direct "
+            "frequency-dependent head (exact without time reversal; the SC route may "
+            "select dft_velocity for the Drude/Thomas-Fermi piece); head_correction = off "
+            "is the headless brute-grid development mode (owner policy 2026-09-18).")
     if int(nspinor) not in (1, 2):
         raise ValueError(
             f"GATE shared_pole_head_nspinor: got N_spinor = {int(nspinor)}; want 1 or 2 (the "
@@ -193,7 +210,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
                            material_class, occupation_state):
     """Return a small MPA head fit and current-map scalar head samples.
 
-    The total Gamma body is V + Pi_G[b(z²-Lambda)^-1 b†], in Ry. Its factor
+    The total Gamma body is V + Pi_G[Wc(z)], in Ry (module docstring). Its factor
     matrix and every mu² result are sharded over both processor axes.
     The fit uses unbroadened complex sample coordinates; the existing MPA
     Sigma-head consumer owns its causal evaluation convention.
@@ -230,9 +247,9 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
                 mesh_xy=mesh_xy, capacity=ledger)
         # Decks are refused at input resolution (refuse_unsupported_shared_pole_head);
         # this re-reads the same owner on the store actually opened.
-        _refuse_head_representation(
-            trs_allowed=str(header.get("representation", "")) == "scalar-trs-even-s",
-            nspinor=int(header["nspinor"]))
+        ordered = str(header.get("representation", "")) != "scalar-trs-even-s"
+        _refuse_head_representation(trs_allowed=not ordered, nspinor=int(header["nspinor"]),
+                                    metal=material_class == "metal")
         parents = np.flatnonzero(np.asarray(header["q_irr_full_idx"]) == 0)
         if len(parents) != 1:
             raise ValueError("GATE shared_pole_head: expected one Gamma parent")
@@ -264,7 +281,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         resident = int(b.size*b.dtype.itemsize//mesh_xy.size + poles.size*8)
         route = _gamma_gemm_route(mesh_xy, b.shape,
                                   ledger.room_bytes_per_rank(ambient) - resident)
-        evaluate = _realized_gamma_body(mesh_xy, realize, route)
+        evaluate = _realized_gamma_body(mesh_xy, realize, route, ordered)
         from symmetry_maps import QirrOperator
         # q = 0 is its own orbit: its wedge row is the full-zone row.
         args = (b, poles, counts, QirrOperator.of(V_q).representative_row(0)[None])
@@ -286,7 +303,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         for index, point in enumerate(points):
             total = None
             if full:
-                value = evaluate(jnp.asarray(point*point, jnp.complex128), *args)
+                value = evaluate(jnp.asarray(point, jnp.complex128), *args)
                 total = value[0]
             if response is None:
                 samples.append(head_resolver.at(point))
