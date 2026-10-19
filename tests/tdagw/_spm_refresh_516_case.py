@@ -75,7 +75,9 @@ def main():
     ap.add_argument("--v2-height", type=float, default=1.0, help="V2: line height (eV); 0 = the run's")
     ap.add_argument("--v2p-imag", default="0.25,0.5", help="V2P: imaginary sites (eV) added")
     ap.add_argument("--chi0-active", default="88,144",
-                    help="B variants: the active bands [a0, a1) of the four chi0 blocks")
+                    help="B variants: the active bands [a0, a1) of the four chi0 blocks, or auto")
+    ap.add_argument("--no-state-measure", action="store_true",
+                    help="SPD: skip the refits and eta rates at the peak / end states")
     ap.add_argument("--hot-amount", type=float, default=0.05)
     ap.add_argument("--eta-list", default="", help="SPC: window-sweep Lorentzians, eV (default: the "
                     "source's; the shared-pole Sigma stage refuses any other: the recipe stamps eta)")
@@ -188,7 +190,7 @@ def main():
                          a.v2_height if a.v2_height > 0 else None)
     sites = dict(V1="", V2=v2_text, V2P=v2p_text)
     sites.update({k + "B": v for k, v in list(sites.items())})
-    active = [int(x) for x in a.chi0_active.split(",")]
+    active = "auto" if a.chi0_active == "auto" else [int(x) for x in a.chi0_active.split(",")]
     blocks_of = lambda V: active if V.endswith("B") else None
     out["variants"] = sites
 
@@ -548,7 +550,8 @@ def main():
                         rs.update(amp=amp, cadence_fs=cad, variant=V, dtm_as=dtm,
                                   states_t_fs=None if sts is None else
                                   {k: v["t_fs"] for k, v in sts.items()})
-                        if sts is not None and V != "frozen" and cad == 0.25 and V in colls:
+                        if (sts is not None and V != "frozen" and cad == 0.25 and V in colls
+                                and not a.no_state_measure):
                             rs["states"] = {k: state_measure(V, v["f_b"], f"d_{k}")
                                             for k, v in sts.items()}
                         spd[tag] = rs

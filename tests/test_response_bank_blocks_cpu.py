@@ -231,3 +231,23 @@ if __name__ == "__main__":
         dump(sys.argv[2])
     else:
         sys.exit(pytest.main([__file__, "-q", "-s"]))
+
+
+def test_chi0_active_group_extends_to_isolated_groups():
+    """``tdagw.dynsig.chi0_active_group``: edges move out to the first positive gap; refused only if none."""
+    from tdagw.dynsig import chi0_active_group
+    rng = np.random.default_rng(5)
+    nk = 6
+    e = _energies(rng, nk)                       # positive gaps 1|2, 4|5, 6|7; 2|3, 3|4 overlap
+    assert chi0_active_group(e, slice(3, 5), "auto")[:2] == (2, 5)
+    assert chi0_active_group(e, slice(3, 5), (2, 7))[:2] == (2, 7)
+    lo, hi, gaps = chi0_active_group(e, slice(2, 7), "auto")
+    assert (lo, hi) == (2, 7) and min(gaps) > 0
+    flat = np.tile(np.linspace(-1, 1, FX.NBF), (nk, 1))
+    flat[:, 1:] -= 0.3                           # every gap negative: no isolated group
+    flat = np.sort(flat + rng.uniform(0, 0.6, flat.shape), axis=1)
+    flat[:, 1:] = np.maximum(flat[:, 1:], flat[:, :-1])
+    flat[0] -= 0.0
+    if all(flat[:, b].min() - flat[:, b - 1].max() <= 0 for b in range(1, FX.NBF)):
+        with pytest.raises(Exception, match="dynsig_spm_chi0_active"):
+            chi0_active_group(flat, slice(3, 5), "auto")
