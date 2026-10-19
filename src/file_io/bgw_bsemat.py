@@ -28,7 +28,7 @@ import numpy as np
 
 __all__ = ["MATRICES", "VERSION", "FLAVOR", "ICUTV_OF_SYS_DIM", "matrix_shape",
            "create_bsemat_file", "register_matrices", "read_bsemat_header",
-           "read_wfn_k_list", "read_wfn_coefficients"]
+           "read_wfn_k_list"]
 
 #: TDA/BSE (theory = 0) order of ``bsewrite.f90:126-130``.
 MATRICES = ("mats/head", "mats/wing", "mats/body", "mats/exchange")
@@ -54,21 +54,6 @@ def read_wfn_k_list(wfn_file):
         return (rk, np.asarray(m["kpoints/kgrid"][()], dtype=np.int64),
                 np.asarray(m["crystal/bdot"][()], dtype=np.float64),
                 float(m["crystal/celvol"][()]))
-
-
-def read_wfn_coefficients(wfn_file, k, b_lo, b_hi):
-    """One k of a WFN: ``(gvecs (ngk, 3) int, coeffs (nb, ns, ngk) complex, el (nb,) Ry)``.
-
-    Bands ``b_lo:b_hi`` (0-based), spin 1. Host numpy, serial h5py.
-    """
-    with h5py.File(wfn_file, "r") as w:
-        ngk = np.asarray(w["mf_header/kpoints/ngk"][()], dtype=np.int64)
-        off = np.concatenate([[0], np.cumsum(ngk)])
-        g = np.asarray(w["wfns/gvecs"][off[k]:off[k + 1]], dtype=np.int64)
-        c = w["wfns/coeffs"][b_lo:b_hi, :, off[k]:off[k + 1], :]
-        el = np.asarray(w["mf_header/kpoints/el"][()], dtype=np.float64)
-        el = el.reshape(-1, el.shape[-2], el.shape[-1])[0, k, b_lo:b_hi]
-    return g, c[..., 0] + 1j * c[..., 1], el
 
 
 def create_bsemat_file(path, *, wfn_file, kpts, kgrid, nvb, ncb, extended, icutv,
