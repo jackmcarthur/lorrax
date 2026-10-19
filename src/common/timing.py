@@ -632,7 +632,7 @@ class TimingCollector:
 				node.host_rise_ranks = [nan(row[3]) for row in hit]
 		# Every rank's receipt figure per priced stage (lxkit.memory), the same way.
 		from lxkit import memory
-		rows = memory._RECEIPTS.values()
+		rows = memory.receipts()
 		local = np.array([(key((r["stage"],)), int(r["measured"])) for r in rows],
 		                 dtype=np.int64).reshape(-1, 2)
 		counts = np.asarray(all_gather_processes(np.asarray(len(local), dtype=np.int64))).reshape(-1)

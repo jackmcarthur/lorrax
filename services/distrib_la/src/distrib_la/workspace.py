@@ -64,7 +64,7 @@ def _off_cuda(plan, op, shapes, dtype):
     (zero vendor bytes); a ROCm eigh's vendor bytes are the leg's measured rows
     (``lxkit.memory.vendor``: ELPA distributed, the rocSOLVER batched target locally), and a
     library without a row is GATE memory_unpriced under STRICT."""
-    from lxkit import LEGS, memory
+    from lxkit import leg_for_platform, memory
     from distrib_la.plan import Plan
     local = (not isinstance(plan, Plan) or plan.is_native or plan.backend == ONE_DEVICE
              or len(shapes[0]) == 3)
@@ -77,7 +77,8 @@ def _off_cuda(plan, op, shapes, dtype):
                                              dtype, 'ROCM')
             src = 'rocSOLVER batched row (local_eigh.BATCHED_EIGH_ROUTE)' if device else src
         else:
-            term = memory.vendor(LEGS['ROCM'], plan.backend, 'eigh', n, ranks, dtype.itemsize)
+            term = memory.vendor(leg_for_platform('ROCM'), plan.backend, 'eigh', n, ranks,
+                                 dtype.itemsize)
             device, src = int(term.fixed), term.source
     return dict(device_bytes=device, host_bytes=0, vendor_device_bytes=device or None,
                 dynamic_xla_scratch_bytes=device, local=local, formula=src,
@@ -89,7 +90,6 @@ def _workspace_details(plan, op, shapes, dtype):
     import jax
     from distrib_la.plan import Plan, ROUTE_BATCH_RESHARD
     from distrib_la.matmul_plan import GemmPlan
-    from distrib_la._cusolvermp import get_or_init_context
     if not isinstance(plan, (Plan, GemmPlan)):
         raise TypeError('workspace query requires a resolved distrib_la Plan or GemmPlan')
     shapes = _shapes(shapes)
@@ -118,6 +118,8 @@ def _workspace_details(plan, op, shapes, dtype):
             raise ValueError('eigh shape must tile the plan mesh')
         if not local and plan.backend != 'cusolvermp':
             raise ValueError('distributed eigh workspace query supports cusolvermp only')
+        if not local:
+            from distrib_la._cusolvermp import get_or_init_context
         ctx = 0 if local else get_or_init_context(plan.mesh)
         side = n
         if local:
@@ -348,11 +350,11 @@ def lu_workspace_bytes(mesh, n, dtype) -> int:
     only: no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL communicator
     split) per call, which deadlocked a rank in libfabric's memory hooks (run30k, 2026-10-19)."""
     from distrib_la._cusolvermp import lu_blocks
-    from lxkit import LEGS, memory
+    from lxkit import leg_for_platform, memory
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     mb, nb = lu_blocks(int(n), px, py)
     item = np.dtype(dtype).itemsize
-    return int(memory.vendor(LEGS["CUDA"], "cusolvermp", "solve_lu", int(n), px * py, item,
+    return int(memory.vendor(leg_for_platform("CUDA"), "cusolvermp", "solve_lu", int(n), px * py, item,
                              unit=(int(n) // px + mb) * nb * item).fixed)
 
 

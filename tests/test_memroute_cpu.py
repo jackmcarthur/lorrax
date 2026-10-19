@@ -37,11 +37,11 @@ def test_deck_above_budget_runs_at_budget():
 def test_enforced_limit_only_for_bfc(monkeypatch):
     stats = {"bytes_limit": 30 * 10**9}
     monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "cuda_async")
-    assert not memory._enforced(stats)
+    assert not memory.enforced(stats)
     monkeypatch.setenv("XLA_PYTHON_CLIENT_ALLOCATOR", "bfc")
-    assert memory._enforced(stats)
+    assert memory.enforced(stats)
     monkeypatch.delenv("XLA_PYTHON_CLIENT_ALLOCATOR")
-    assert memory._enforced(stats)
+    assert memory.enforced(stats)
 
 
 def test_fastest_that_fits_prints_once(capsys):
@@ -79,8 +79,8 @@ def test_lazy_price_probe_forced_quiet():
     assert memory.admit("SC eigh", (), 0, forced="distributed") == "distributed"
     n = len(memory.routes())
     assert memory.admit("constructor", (("local", P(5 * GB, "t")), ("face", P(0, "t"))),
-                        4 * GB, quiet=True) == "face"
-    assert len(memory.routes()) == n and memory.last_decision()["route"] == "face"
+                        4 * GB, quiet=True, detail=True)["route"] == "face"
+    assert len(memory.routes()) == n
 
 
 def test_report_lists_routes():

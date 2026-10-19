@@ -926,15 +926,6 @@ def dense_layout(meta, config, mesh_xy, n):
     return "local" if execution == "local" else "distributed"
 
 
-def _book_beside(meta, row, stage):
-    """Book a ledger ``row``'s own bytes to the next ``stage`` section, over what is resident
-    as it opens (the solve's live W(z) panels included); sizing sees the ledger aggregate."""
-    from lxkit import memory
-    ledger = meta.shared_pole_capacity
-    memory.book(ledger.own_price(row), stage=stage, planned=ledger.price(
-        row["aggregate_bytes_per_rank"], ledger.baseline_bytes_per_rank))
-
-
 def _reserve(meta, stage, resident, workspace=0, runs_in=None):
     """Reserve a uniquely named actual-batch footprint in the shared ledger, priced in the
     section that allocates it (``runs_in``)."""
@@ -993,12 +984,6 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     def execute(kernel, args, stage, runtime_bytes=0):
         """``runtime_bytes``: what the executable draws at run time outside its
         buffer assignment (mathdx mode 11's split arm), admitted with it."""
-        from lxkit import memory as _memory
-        _memory.book(_memory.priced(sum(int(x.addressable_shards[0].data.nbytes)
-                                        for x in jax.tree.leaves(args) if hasattr(x, "addressable_shards")),
-                                    "bank.compile: XLA autotuning operand copies (<= the program's "
-                                    "arguments, provisional bound)", increment=True),
-                     stage='bank.compile.' + stage)
         with timing.section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
             executable = _compiled(kernel, args)
@@ -1551,10 +1536,9 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     # ledger's live set plus one batch's tile (the stream's peak is the stream's).
     from lxkit import memory
     with timing.section("bank.moment_batches"):
-        memory.book(memory.priced(ledger.preview(
+        memory.book(ledger.price(ledger.preview(
             resident_bytes_per_rank=(per_q * qwidth + 16) * face_bytes, workspace_bytes_per_rank=0,
-            concurrent_with=ambient)["aggregate_bytes_per_rank"],
-            f"moment bank, q width {qwidth}/{len(qids)}"))
+            concurrent_with=ambient)))
         for q0 in range(0,len(qids),qwidth):
             q1 = min(q0+qwidth,len(qids))
             ledger.live_stages = ambient
@@ -3090,19 +3074,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         constant = read_constant(span, bank_handle)
                         value, slope = solve(rows, 0, *span, bank_handle, sample, layout=line_layout,
                                              constant=constant)
-                        _book_beside(meta, selection_row, 'bank.line_select')
+                        memory.book(ledger.price(selection_row), stage='bank.line_select')
                         with timing.section('bank.line_select'):
                             lines = sel.select(sample, value, slope)
                         del value, slope
                         if ordered:
                             value, slope = solve(rows, 1, *span, bank_handle, sample, layout=line_layout,
                                                  constant=constant)
-                            _book_beside(meta, selection_row, 'bank.line_mirror')
+                            memory.book(ledger.price(selection_row), stage='bank.line_mirror')
                             with timing.section('bank.line_mirror'):
                                 sel.mirror(sample, lines, value, slope)
                             del value, slope
                         del constant
-                        _book_beside(meta, selection_row, 'bank.line_panels')
+                        memory.book(ledger.price(selection_row), stage='bank.line_panels')
                         with timing.section('bank.line_panels'):
                             span_panels.append((span, sel.panels(sample, lines)))
                         del lines, rows

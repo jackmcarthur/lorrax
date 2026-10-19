@@ -1115,7 +1115,7 @@ def _write_w_av_stage(
         # The smallest k=1, q=1 raw-density tile runs.
         from lxkit import memory
         memory.admit("W-av raw-density tile (k=1, q=1)",
-                     memory.priced(working_bytes_per_k, "closed form"), tile_budget_bytes)
+                     memory.priced(working_bytes_per_k, "closed form"), tile_budget_bytes, device=False)
     k_batch = max(1, min(
         nk, int(tile_budget_bytes // max(1, working_bytes_per_k))))
     if jax.process_index() == 0:

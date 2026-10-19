@@ -2129,7 +2129,7 @@ def _centroid_fft_scan_chunk(
         from lxkit import memory
         memory.admit("centroid load (one FFT scan row)",
                      memory.priced(persistent_bytes + min_scan_bytes, "closed form"),
-                     gpu_mem_bytes)
+                     gpu_mem_bytes, device=False)
 
     # Translate legacy hints (band_chunk_size, k_chunk_size) into the new
     # flat-row count.  In either arm the tile bound applies last.
