@@ -1136,18 +1136,26 @@ class CdCheckpoint:
                     timings=dict(state.get("timings") or {}), commit=str(commit), host=host)
 
     def write(self, axis, chunk, accs, *, timings=None, host=None):
-        """Collective: every rank calls it after the chunk; returns the write's seconds."""
-        from common.collectives import gather_to_host
-        from file_io.sigma_checkpoint import CD_SCHEMA, write_sigma_checkpoint
+        """Every rank calls it after the chunk; rank 0 alone writes (``write_state_checkpoint``, serial h5py).
+
+        The accumulators are replicated, so rank 0 reads its own replica: no gather, and no collective
+        (parallel-HDF5) open of the staging file, which hung ~15 min on Lustre in the ZnO CD J3 leg.
+        Returns the write's seconds."""
+        from file_io.sigma_checkpoint import CD_SCHEMA, write_state_checkpoint
         t0 = time.monotonic()
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        arrays = {k: np.asarray(gather_to_host(v)) if isinstance(v, jax.Array) else np.asarray(v)
-                  for k, v in accs.items()}
-        state = dict(axis=str(axis), chunk=int(chunk), accs=arrays,
-                     timings={k: float(v) for k, v in (timings or {}).items()})
-        nbytes, _ = write_sigma_checkpoint(self.path, identity=self.identity, cubes={}, mesh=self.mesh,
-                                           host=dict(host or {}, axis=str(axis), chunk=int(chunk)),
-                                           schema=CD_SCHEMA, state=state)
+        not_replicated = sorted(k for k, v in accs.items()
+                                if isinstance(v, jax.Array) and not v.sharding.is_fully_replicated)
+        if not_replicated:              # metadata only: every rank raises alike, before rank 0 writes
+            raise ValueError(f"GATE cd_checkpoint_replicated: accumulators {not_replicated} are not replicated; "
+                             "why: rank 0 writes its own replica")
+
+        def state():
+            arrays = {k: np.asarray(v.addressable_shards[0].data) if isinstance(v, jax.Array) else np.asarray(v)
+                      for k, v in accs.items()}
+            return dict(axis=str(axis), chunk=int(chunk), accs=arrays,
+                        timings={k: float(v) for k, v in (timings or {}).items()})
+        nbytes, _ = write_state_checkpoint(self.path, identity=self.identity, schema=CD_SCHEMA, state=state,
+                                           host=dict(host or {}, axis=str(axis), chunk=int(chunk)))
         dt = time.monotonic() - t0
         self.writes, self.seconds, self.nbytes = self.writes + 1, self.seconds + dt, int(nbytes)
         return dt

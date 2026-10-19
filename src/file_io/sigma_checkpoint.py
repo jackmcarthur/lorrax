@@ -10,7 +10,8 @@ carry beside each warm seed, ``sc_seed/sc_checkpoint.h5`` (``SC_SCHEMA``), so a
 fresh process continues the trajectory (docs/self_consistency.md §8).  The
 contour-deformation route (``gw.cd.sigma.CdCheckpoint``) keeps its replicated
 accumulators after every chunk as ``state`` (``CD_SCHEMA``, no cubes), so
-``cd_checkpoint = resume`` continues after the last completed chunk.
+``cd_checkpoint = resume`` continues after the last completed chunk; rank 0
+writes that file alone with serial h5py (:func:`write_state_checkpoint`).
 
 The cubes go through SlabIO from their own shards: no gather, no copy. The
 host record (JSON) and, for the SC loop, one ``state`` blob are written by
@@ -243,6 +244,59 @@ def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
                                        validate_file=validate)
     nbytes = sum(int(np.prod(c.shape)) * np.dtype(c.dtype).itemsize for c in present.values())
     return nbytes + sizes[0], time.monotonic() - started
+
+
+#: ``cubes_digest`` of a checkpoint with no cubes: :func:`_cubes_digest` over no names XORs nothing.
+NO_CUBES_DIGEST = "0" * 64
+
+
+def write_state_checkpoint(path, *, identity, schema, state, host=None):
+    """Write a checkpoint with no cubes (``CD_SCHEMA``): rank 0 alone, serial h5py, published by ``os.replace``.
+
+    The file is the one :func:`write_sigma_checkpoint` writes with ``cubes={}`` (record with ``cubes = {}``
+    and ``cubes_digest`` = :data:`NO_CUBES_DIGEST`, ``state`` blob, ``commit`` attribute last), so
+    :func:`read_sigma_checkpoint` authenticates it unchanged.  There is no SlabIO and no collective
+    parallel-HDF5 open: the CD accumulators are replicated, so rank 0 holds the state whole, and the
+    collective open of the staging file hung ~15 min on Lustre (ZnO CD J3 leg).  ``state`` is a plain
+    container or a callable returning one; a callable is evaluated on rank 0 only, inside the transaction, so
+    its failure reaches every rank (``common.collectives.rank0_transaction``).  Every rank calls this.
+    Returns (state bytes on rank 0, else 0; seconds).
+    """
+    import os
+
+    import h5py
+    from common.collectives import process_rank, rank0_transaction
+
+    started = time.monotonic()
+    path = Path(path)
+    sizes = [0]
+
+    def write():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for orphan in path.parent.glob(f".{path.name}.*.tmp"):
+            if orphan.stat().st_mtime < _STARTED:
+                orphan.unlink(missing_ok=True)
+        blob = pickle.dumps(state() if callable(state) else state, protocol=pickle.HIGHEST_PROTOCOL)
+        _plain_loads(blob)
+        sizes[0] = len(blob)
+        record = dict(schema=schema, identity=identity, cubes={}, host=host, cubes_digest=NO_CUBES_DIGEST,
+                      state_sha256=hashlib.sha256(blob).hexdigest())
+        text = _json(record)
+        staging = path.parent / f".{path.name}.{os.getpid()}.tmp"
+        try:
+            with h5py.File(staging, "w") as f:
+                f.create_dataset("state", data=np.frombuffer(blob, np.uint8))
+                f.create_dataset("record", data=np.bytes_(text))
+                f.attrs["commit"] = hashlib.sha256(text.encode()).hexdigest()
+            with h5py.File(staging, "r") as f:
+                if hashlib.sha256(bytes(f["record"][()])).hexdigest() != str(f.attrs["commit"]):
+                    raise ValueError("checkpoint record does not match its commit")
+            os.replace(staging, path)
+        finally:
+            staging.unlink(missing_ok=True)
+
+    rank0_transaction(path, stage="checkpoint.state_write", write=write)
+    return (sizes[0] if process_rank() == 0 else 0), time.monotonic() - started
 
 
 def discard_sigma_checkpoint(path):
