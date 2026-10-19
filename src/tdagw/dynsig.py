@@ -1142,6 +1142,44 @@ def _occupation_duck(f_kn, mu_ry: float):
                            smearing_width_ry=0.0, occ_hash=None, n_electrons=float(f.sum()))
 
 
+def chi0_active_group(enk, win: slice, request="auto"):
+    """The refits' chi0 active bands A: the smallest isolated band group containing ``request``.
+
+    ``request`` is ``"auto"`` (the window ``win``) or ``(a0, a1)``.  A band group
+    [a0, a1) is isolated when the gap below a0 and the gap above a1 - 1 are both
+    positive, min_k E(a0) - max_k E(a0 - 1) > 0 and min_k E(a1) - max_k E(a1 - 1) > 0:
+    then the frozen-leg blocks FA and AF (``gw.response_bank.response_blocks``) are
+    strictly positive.  Each edge moves outward to the first positive gap; the extra
+    bands sit at their 0/1 step inside A (the AA block).  ``enk`` [nk, nb] are the
+    W carrier's physical bands.  Returns (a0, a1, (gap below, gap above) in Ry; a
+    missing side is +inf).  Refuses only when no isolated group exists (A would be
+    every band).
+    """
+    enk = np.asarray(enk, np.float64)
+    nb = enk.shape[1]
+    lo, hi = ((win.start, win.stop) if isinstance(request, str) else
+              (int(request[0]), int(request[1])))
+    if isinstance(request, str) and request != "auto":
+        _refuse("dynsig_spm_chi0_active", f"chi0_active = {request!r}", "'auto' or (a0, a1)",
+                "pick one")
+    lo, hi = min(lo, win.start), max(hi, win.stop)
+    if not (0 <= lo < hi <= nb):
+        _refuse("dynsig_spm_chi0_active", f"active bands [{lo}, {hi})",
+                f"a range of the W carrier's {nb} bands", "the window's populations are A's")
+    gap = lambda b: float(enk[:, b].min() - enk[:, b - 1].max())   # below band b
+    a0 = lo
+    while a0 > 0 and not gap(a0) > 0:
+        a0 -= 1
+    a1 = hi
+    while a1 < nb and not gap(a1) > 0:
+        a1 += 1
+    if a0 == 0 and a1 == nb:
+        _refuse("dynsig_spm_chi0_active", f"no isolated band group contains [{lo}, {hi})",
+                "a positive gap below and above an active range", "use the one-rule chi0 "
+                "(leave collision_spm_chi0_active unset)")
+    return a0, a1, (gap(a0) if a0 > 0 else float("inf"), gap(a1) if a1 < nb else float("inf"))
+
+
 def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
                   support_sites: str = "", scratch: str, chi0_active=None) -> dict:
     """The held objects of the shared-pole refit of the collision term (§1.4, §7.1).
@@ -1162,8 +1200,8 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     label is reused.
 
     ``chi0_active`` (None: chi0 over all pairs on one rule, the GW run's path):
-    ``(a0, a1)``, the active bands A on the W carrier's band axis (0-based,
-    half-open, containing the window).  The refits then take chi0 as four
+    ``"auto"`` or ``(a0, a1)``, extended to the smallest isolated band group
+    containing it and the window (:func:`chi0_active_group`).  The refits then take chi0 as four
     (hole x electron) blocks FF, FA, AF, AA with F the other bands at their
     0/1 step (``gw.response_bank.response_blocks``): only AA crosses zero,
     every block's interval comes from band energies, and its rule is built at
@@ -1180,6 +1218,7 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
     from jax.experimental import multihost_utils
     from gw.gw_config import HeadCorrection
     from gw.shared_pole_recipe import parse_support_sites
+    from common.units import RYD_TO_EV
     if "screening_inputs" not in source or "recipe_inputs" not in source:
         _refuse("dynsig_spm_source", "a source without the run's W-stage inputs",
                 "gw_window_source(..., screening=True) on a shared-pole deck",
@@ -1206,11 +1245,9 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
         config_run, sigma=sigma,
         head=dataclasses.replace(config_run.head, correction=HeadCorrection.OFF))
     if chi0_active is not None:
-        a0, a1 = (int(x) for x in chi0_active)
-        if not (0 <= a0 <= win.start and win.stop <= a1 <= f_eq.shape[1]):
-            _refuse("dynsig_spm_chi0_active", f"active bands [{a0}, {a1})",
-                    f"a range of the W carrier's {f_eq.shape[1]} bands containing the window "
-                    f"[{win.start}, {win.stop})", "the window's populations are A's")
+        stop = min(int(getattr(meta_run, "b_id_4_chi_user", enk_w.shape[1])),
+                   int(wfns_w.slices.b4_logical), enk_w.shape[1])
+        a0, a1, edge_gaps = chi0_active_group(enk_w[:, :stop], win, chi0_active)
     scr = dict(inputs=inp, recipe_inputs=dict(source["recipe_inputs"]), meta=_copy.copy(meta_run),
                config=config, f_eq=f_eq, rows=np.arange(enk_w.shape[0]), win=win, mu_ry=mu,
                variant=("production" if override is None else "override"),
@@ -1220,7 +1257,9 @@ def spm_screening(source: dict, *, mesh: Mesh, b_lo: int, n_active: int,
         # Read by gw.response_bank (response_support, response_quadrature): the
         # refit's own meta copy only; the block rules are held in "held".
         scr["meta"].shared_pole_response_blocks = dict(active=(a0, a1), held={})
-    scr["chi0_active"] = None if chi0_active is None else [a0, a1]
+    scr["chi0_active"] = None if chi0_active is None else dict(
+        requested=chi0_active if isinstance(chi0_active, str) else [int(x) for x in chi0_active],
+        bands=[a0, a1], edge_gaps_ev=[g * RYD_TO_EV for g in edge_gaps])
     # The production variant's reference is the run's own recipe; an override is
     # resolved at the run's census (the same resolver, another support set).
     scr["recipe0"] = meta_run.shared_pole_recipe if override is None else _spm_recipe(scr, f_eq)
