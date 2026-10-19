@@ -111,3 +111,70 @@ def test_unshifted_deflation_is_unchanged_bitwise():
     old = jax.jit(before)(a)
     assert np.array_equal(np.asarray(new[0]), np.asarray(old[0]))
     assert np.array_equal(np.asarray(new[1]), np.asarray(old[1]))
+
+
+def _low_rank_psd(n, rank, seed):
+    """A rank-deficient PSD Gram: a (n - rank)-wide cluster at rounding level (the CrI3 failure shape)."""
+    return _hermitian(n, rank, seed)
+
+
+def _damaged(solve, columns):
+    """A solver whose vectors are non-orthonormal in ``columns`` (cuSOLVERMp's near-zero-cluster defect)."""
+    def bad(a, **_):
+        w, v = solve(a)
+        i, j = columns
+        return w, v.at[:, i].set((v[:, i] + 0.3 * v[:, j]) / np.sqrt(1.09))
+    return bad
+
+
+@pytest.mark.parametrize("where,cut,refused", [
+    ("cluster", 1e-8, False),     # defect among discarded columns: outside the check
+    ("cluster", None, True),      # full check (Ritz eighs, site-5 directions): refused
+    ("kept", 1e-8, True),         # defect in a used column: refused whatever the cut
+])
+def test_check_what_you_use(where, cut, refused):
+    from distrib_la._result_check import checked_eigh
+    n, rank = 64, 16
+    a = jnp.asarray(_low_rank_psd(n, rank, 7))
+    w = np.linalg.eigvalsh(np.asarray(a))
+    assert np.sum(w > 1e-8 * w[-1]) == rank
+    columns = (3, 5) if where == "cluster" else (n - 2, n - 1)
+    (values, vectors), (failed, errors) = jax.jit(
+        lambda x: checked_eigh((_damaged(jnp.linalg.eigh, columns),), x, cut=cut))(a)
+    assert bool(failed) == refused, np.asarray(errors)
+    assert bool(np.isnan(np.asarray(values)).all()) == refused
+
+
+@pytest.mark.parametrize("rows", [np.arange(61, 64), np.arange(3), np.arange(30, 33), np.arange(64), np.arange(0)])
+def test_elpa_last_row_is_coupled_before_the_solve(rows):
+    """ELPA's tail-block defect: the wrapper swaps the last row with the last coupled one; the
+    solver must see a coupled last row (unless none is coupled), and the pairs come back exact."""
+    from distrib_la._elpa import _last_row_coupled
+    n = 64
+    a = _hermitian(n, n, 9)
+    a[rows, :] = 0
+    a[:, rows] = 0
+    a[rows, rows] = -5.0 - np.arange(len(rows))
+    seen = []
+
+    def solve(x):
+        seen.append(x)
+        return jnp.linalg.eigh(x)
+    w, q = (np.asarray(t) for t in jax.jit(_last_row_coupled(solve))(jnp.asarray(a)))
+    if len(rows) < n:
+        last = np.asarray(jax.jit(lambda x: _last_row_coupled(lambda y: (y[-1], y))(x)[0])(jnp.asarray(a)))
+        assert np.any(last[:-1] != 0)
+    assert np.linalg.norm(a @ q - q * w) < 1e-12 * np.linalg.norm(a)
+    assert np.linalg.norm(q.conj().T @ q - np.eye(n)) < 1e-12
+
+
+def test_route_c_takes_the_cut():
+    """The cut reaches route (c)'s checked program (check what you use, on every attempt of main's chain)."""
+    from jax.sharding import Mesh
+    from distrib_la.plan import _reshard_stack_program
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    a = _low_rank_psd(256, 40, 8)
+    stack = jax.device_put(jnp.asarray(np.stack([a] * 2)),
+                           jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "x", "y")))
+    (w, v), failed = _reshard_stack_program("eigh", mesh, (2, 256, 256), "complex128", 1, "all", 1e-8)(stack)
+    assert not bool(np.asarray(failed[0]).any()) and np.isfinite(np.asarray(w)).all()

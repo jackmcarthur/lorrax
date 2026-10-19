@@ -228,7 +228,8 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
     g = scale[:, :, None] * g * scale[:, None, :]
     h = scale[:, :, None] * h * scale[:, None, :]
     output = output * scale[:, None, :]
-    gamma, u = eigh(hermitian_part(g))
+    # Checked on the columns the keep cut below can retain (check what you use).
+    gamma, u = eigh(hermitian_part(g), cut=gates["normalized_gram_keep"]["threshold"])
     gram_eigh_finite = jnp.all(jnp.isfinite(gamma), axis=-1) & jnp.all(jnp.isfinite(u), axis=(-2, -1))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
@@ -408,11 +409,12 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     This map stays inside the parent-local round.
     """
     stage = paired_members(pencil, active_columns, gates=gates, matrix_sharding=matrix_sharding)
-    gamma, u = eigh(tile_hermitian(stage["h_vv"], matrix_sharding))
+    cut = gates["normalized_gram_keep"]["threshold"] if gram_keep is None else gram_keep
+    gamma, u = eigh(tile_hermitian(stage["h_vv"], matrix_sharding), cut=cut)     # checked where kept
     stage = keep_stage(stage, gamma, u, matmul=matmul, gates=gates, keep_budget=keep_budget,
                        retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep,
                        carrier=carrier)
-    gamma_r, u_r = eigh(stage["schur"])
+    gamma_r, u_r = eigh(stage["schur"], cut=cut)
     stage = paired_stage(stage, gamma_r, u_r, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding,
                          gram_keep=gram_keep)
     mu, rotation = eigh(stage["reduced"])

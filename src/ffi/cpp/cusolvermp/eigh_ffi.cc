@@ -42,15 +42,13 @@ namespace lorrax_ffi::cusolvermp {
 
 namespace ffi = ::xla::ffi;
 
-// Keep the destructive vendor operand in the same XLA scratch allocation as
-// its workspace. Both the execution and query entry points use this byte layout.
-static size_t operand_offset(size_t workspace_bytes) {
+// The scratch is the vendor workspace alone. The operand the solver destroys
+// is a result aliased to the input (ABI 10, the third Ret): XLA owns it, as an
+// intermediate the program hands over or a copy of a live parameter, so no
+// private operand tile sits in the scratch any more (EIGHMEM). Both the
+// execution and query entry points use this size.
+static size_t eigh_scratch_bytes(size_t workspace_bytes) {
     return (workspace_bytes + 255) & ~size_t(255);
-}
-
-static size_t eigh_scratch_bytes(size_t workspace_bytes, int64_t n,
-                                 const LorraxCusolverMpCtx* ctx, size_t itemsize) {
-    return operand_offset(workspace_bytes) + size_t(n / ctx->p) * (n / ctx->q) * itemsize;
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +87,7 @@ static ffi::Error EighImpl(
     ffi::ScratchAllocator& scratch,
     LorraxCusolverMpCtx* ctx,
     const T* d_A,
+    T* d_operand,
     mp::RealOf_t<T>* d_W,
     T* d_Q)
 {
@@ -143,7 +142,7 @@ static ffi::Error EighImpl(
     // the reservation, so those bytes fit only because the driver releases
     // idle reserved memory to them on demand (docs/environment/overview.md
     // §2.1).  What never fits is XLA's LIVE bytes plus these.
-    const size_t scratch_bytes = eigh_scratch_bytes(d_ws_bytes, n, ctx, sizeof(T));
+    const size_t scratch_bytes = eigh_scratch_bytes(d_ws_bytes);
     auto ws_opt = scratch.Allocate(scratch_bytes);
     if (!ws_opt.has_value()) {
         cusolverMpDestroyMatrixDesc(descA);
@@ -154,11 +153,13 @@ static ffi::Error EighImpl(
         return ffi::Error(ffi::ErrorCode::kResourceExhausted, os.str());
     }
     void* d_workspace = *ws_opt;
-    auto* d_operand = reinterpret_cast<T*>(
-        static_cast<char*>(d_workspace) + operand_offset(d_ws_bytes));
-    const size_t operand_bytes = size_t(n / ctx->p) * (n / ctx->q) * sizeof(T);
-    LORRAX_GPU_CHECK(cudaMemcpyAsync(d_operand, d_A, operand_bytes,
-                                     cudaMemcpyDeviceToDevice, ctx->stream));
+    // input_output_aliases={0: 2} makes the destroyed-operand result the input
+    // buffer itself; the copy below runs only if a caller bound them apart.
+    if (static_cast<const void*>(d_operand) != static_cast<const void*>(d_A)) {
+        const size_t operand_bytes = size_t(n / ctx->p) * (n / ctx->q) * sizeof(T);
+        LORRAX_GPU_CHECK(cudaMemcpyAsync(d_operand, d_A, operand_bytes,
+                                         cudaMemcpyDeviceToDevice, ctx->stream));
+    }
 
     // Host workspace stays on Ctx (scratch is device-only).
     if (h_ws_bytes > ctx->h_workspace_bytes) {
@@ -176,8 +177,8 @@ static ffi::Error EighImpl(
     // The status reports API errors only; a STEDC failure is in d_info (info.h).
     FFI_RETURN_IF_ERROR(reset_info(ctx));
 
-    // The public eigh operation does not donate A. cuSOLVERMp overwrites its
-    // operand during tridiagonalisation, so only the private tile may be passed.
+    // cuSOLVERMp overwrites its operand during tridiagonalisation: it is
+    // given the destroyed-operand result, never the caller's A.
     mp_st = mp::Syevd<T>(
         ctx->handle, jobz, CUBLAS_FILL_MODE_LOWER, n,
         d_operand, 1, 1, descA,
@@ -236,6 +237,7 @@ static ffi::Error EighDispatch(
     ffi::AnyBuffer A,
     ffi::Result<ffi::AnyBuffer> W_out,
     ffi::Result<ffi::AnyBuffer> Q_out,
+    ffi::Result<ffi::AnyBuffer> A_out,
     int64_t n, int64_t mb, int64_t nb,
     int64_t ctx_key, bool compute_evecs)
 {
@@ -248,6 +250,12 @@ static ffi::Error EighDispatch(
     }
 
     const auto dtype = A.element_type();
+    if (A_out->element_type() != dtype ||
+        A_out->size_bytes() != A.size_bytes()) {
+        return ffi::Error(
+            ffi::ErrorCode::kInvalidArgument,
+            "eigh: the destroyed-operand result must match A (aliased to it)");
+    }
     if (Q_out->element_type() != dtype) {
         return ffi::Error(
             ffi::ErrorCode::kInvalidArgument,
@@ -269,6 +277,7 @@ static ffi::Error EighDispatch(
             return EighImpl<double>(
                 n, mb, nb, compute_evecs, stream, scratch, ctx,
                 static_cast<const double*>(A.untyped_data()),
+                static_cast<double*>(A_out->untyped_data()),
                 static_cast<double*>(W_out->untyped_data()),
                 static_cast<double*>(Q_out->untyped_data()));
         case ffi::DataType::C128:
@@ -276,6 +285,7 @@ static ffi::Error EighDispatch(
             return EighImpl<C128>(
                 n, mb, nb, compute_evecs, stream, scratch, ctx,
                 static_cast<const C128*>(A.untyped_data()),
+                static_cast<C128*>(A_out->untyped_data()),
                 static_cast<double*>(W_out->untyped_data()),
                 static_cast<C128*>(Q_out->untyped_data()));
         default: {
@@ -300,6 +310,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()              // A
         .Ret<xla::ffi::AnyBuffer>()              // W (evals)
         .Ret<xla::ffi::AnyBuffer>()              // Q (evecs)
+        .Ret<xla::ffi::AnyBuffer>()              // A, destroyed (aliased to the Arg)
         .Attr<int64_t>("n")
         .Attr<int64_t>("mb")
         .Attr<int64_t>("nb")
@@ -397,7 +408,7 @@ extern "C" int lrx_eigh_workspace_bytes_block(
     if (q) cusolverMpDestroyMatrixDesc(q);
     cusolverMpDestroyMatrixDesc(a);
     if (status == CUSOLVER_STATUS_SUCCESS) {
-        *device_bytes = eigh_scratch_bytes(dw, n, ctx, complex128 ? 16 : 8);
+        *device_bytes = eigh_scratch_bytes(dw);
         *host_bytes = hw;
     }
     return int(status);

@@ -60,6 +60,7 @@ def gate_cases(mesh):
     import jax.numpy as jnp
     from jax.experimental import multihost_utils
     from jax.sharding import NamedSharding, PartitionSpec as P
+    import distrib_la
     from distrib_la import _elpa
     p = int(mesh.shape["x"])
     out = {}
@@ -84,6 +85,33 @@ def gate_cases(mesh):
                     m["orth"] = float(np.max(np.abs(np.conj(q.T) @ q - np.eye(n))))
                 key = f"{np.dtype(dtype).name} n={n} side={side} nb={nb} evecs={evecs}"
                 out[key] = m
+    # Zero-row blocks (ELPA 2026.02.001 returns wrong pairs, orth ~4e-3, for a block at the
+    # global TAIL; ELPA_TAIL_BLOCK_UPSTREAM.md): head, tail and padded sides, and a caller's tail
+    # block past 16384 (the shared-pole face constructor's shape), through the checked plan. The
+    # wrapper's last-row swap makes every case correct; a refusal fails.
+    n = 2304 * p
+    cases = (("head", n, np.arange(32)), ("tail", n, np.arange(n - 32, n)), ("padded", n - 32, None),
+             ("caller tail", 18432, np.arange(18432 - 300, 18432)))
+    for where, m_, rows in cases:
+        a = _herm(m_, np.complex128, seed=11)
+        if rows is not None:
+            a[rows, :] = 0
+            a[:, rows] = 0
+        A = jax.make_array_from_callback(a.shape, face, lambda idx: a[idx])
+        key = f"zero-rows {where} n={m_}"
+        try:
+            W, Q = distrib_la.plan("eigh", mesh, backend="elpa", n=m_)(A)
+        except ValueError:
+            out[key] = dict(dw=float("inf"), res=0.0, orth=0.0)
+            continue
+        scale = float(jnp.max(jnp.abs(W)))   # ||A||_2: the backward error AQ - QW is ~ n eps ||A||_2
+        res, orth = jax.jit(lambda A, W, Q: (jnp.max(jnp.abs(A @ Q - Q * W[None, :])),
+                                             jnp.max(jnp.abs(jnp.conj(Q.T) @ Q - jnp.eye(Q.shape[0], dtype=Q.dtype)))))(A, W, Q)
+        w = np.asarray(multihost_utils.process_allgather(W, tiled=True))
+        out[key] = dict(dw=float(np.max(np.abs(np.sort(w) - np.linalg.eigvalsh(a))) / scale) if m_ <= 9216 else 0.0,
+                        res=float(res) / scale, orth=float(orth),
+                        res_maxa=float(res) / float(np.max(np.abs(a))))   # the max|a| scale, reported beside
+        del A, W, Q
     out.update(refusal_cases(mesh))
     return out
 
@@ -157,7 +185,7 @@ def main() -> int:
             print(f"r{jax.process_index()} {tag} {k}  {'refused' if m['refused'] else m['why']}", flush=True)
         else:
             print(f"r{jax.process_index()} {tag} {k}  res {m['res']:.1e} orth {m['orth']:.1e} "
-                  f"dw {m['dw']:.1e}", flush=True)
+                  f"dw {m['dw']:.1e}" + (f" res/max|a| {m['res_maxa']:.1e}" if "res_maxa" in m else ""), flush=True)
     print(f"r{jax.process_index()} ELPA_EIGH_GATE {'PASS' if not bad else 'FAIL'} on "
           f"{tuple(mesh.devices.shape)}: {len(out) - len(bad)}/{len(out)} (tol {TOL:g})", flush=True)
     rc = 1 if bad else 0
