@@ -47,6 +47,7 @@ import jax
 import jax.numpy as jnp
 from jax import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
+from lxkit import ordered_psum
 
 from common.units import RYD_TO_EV
 from gw.cd import laws
@@ -267,7 +268,9 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta):
         return (jax.lax.axis_index("x") * mesh_xy.shape["y"] + jax.lax.axis_index("y")) * nq_loc
 
     def psum_add(acc, inc):
-        return acc + jax.lax.psum(inc, axes)
+        # rank-ordered adds (lxkit.ordered_psum; tests/test_reduction_lint.py): same sum, bits
+        # independent of the GPU placement
+        return acc + ordered_psum(inc, axes)
 
     def cd_sigma_x(V, acc, T):
         def over_q(s, iq):
