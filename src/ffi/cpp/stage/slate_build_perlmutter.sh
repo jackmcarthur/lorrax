@@ -119,6 +119,27 @@ if [[ "${FRESH}" == "--fresh" ]]; then
 fi
 mkdir -p "${BUILD}"
 
+# Up-to-date install: skip the reconfigure/relink.  A relink re-runs CMake's
+# MPI detection, which on the Cray wrappers reports the NON-OpenMP libsci
+# (libsci_gnu_mpi.so;libsci_gnu.so) and puts a second libsci beside the _mp
+# one every other host-leg library links (write_checkout_closure refuses it).
+STAMP="${PREFIX}/.lorrax_slate_stamp"
+WANT_STAMP="commit=${COMMIT} variant=${VARIANT} libsci=${LORRAX_PM_LIBSCI_MODULE:-} mpich=$(module -t list 2>&1 | grep -m1 '^cray-mpich' || true)"
+_slate_lib() { ls "${PREFIX}"/lib64/libslate.so.*.*.* "${PREFIX}"/lib/libslate.so.*.*.* 2>/dev/null | head -1 || true; }
+_nonmp_libsci() { readelf -d "$1" 2>/dev/null | grep NEEDED | grep -oE 'libsci_gnu(_mpi)?[.]so[^]]*' || true; }
+if [[ "${FRESH}" != "--fresh" && -f "${STAMP}" && "$(cat "${STAMP}")" == "${WANT_STAMP}" ]] \
+        && lib="$(_slate_lib)" && [[ -n "${lib}" && -z "$(_nonmp_libsci "${lib}")" ]]; then
+    echo "[slate-build] ${VARIANT} install is up to date (${STAMP}); skipping configure/relink"
+    exit 0
+fi
+# Not up to date: configure in a FRESH build dir.  Re-configuring an existing
+# one keeps stale cache (MPI_CXX_LIB_NAMES with the non-OpenMP libsci) and
+# BLAS++'s "Using cached blas settings" path then leaves blaspp_defines empty
+# (no -DBLAS_FORTRAN_ADD_), so lapackpp fails its Fortran-mangling #error.
+if [[ -z "${LORRAX_SLATE_KEEP_BUILD:-}" ]]; then
+    rm -rf "${BUILD}"; mkdir -p "${BUILD}"
+fi
+
 if [[ "${VARIANT}" == gpu ]]; then
     BACKEND=cuda
     # A100 only; skipping other archs keeps nvcc time down.
@@ -127,6 +148,14 @@ else
     BACKEND=none
     EXTRA_CMAKE=()
 fi
+
+# Stale MPI cache: a build dir configured under another PE set can carry
+# MPI_CXX_LIB_NAMES=sci_gnu_mpi;sci_gnu;... (the NON-OpenMP libsci), and a
+# relink then puts a second libsci beside the _mp one SLATE's OpenMP link and
+# every other host-leg library use (write_checkout_closure: "two libsci").  A
+# fresh FindMPI on the CC wrapper records no libsci (the wrapper supplies it),
+# so drop every cached MPI_* entry and let it re-detect.
+MPI_CMAKE=(-U "MPI_*")
 
 # Flag notes:
 #  * CXX=CC etc.: Cray wrappers, so libsci + MPICH (+ GTL on gpu) are linked
@@ -155,10 +184,23 @@ cmake -S "${SRC}" -B "${BUILD}" \
     -Dgpu_backend="${BACKEND}" \
     -DSCALAPACK_LIBRARIES="" \
     -Dbuild_tests=yes \
+    "${MPI_CMAKE[@]}" \
     "${EXTRA_CMAKE[@]}"
+
+grep -E '^MPI_(C|CXX|Fortran)_LIB_NAMES|^MPI_libsci' "${BUILD}/CMakeCache.txt" 2>/dev/null | sed 's/^/[slate-build] /' || true
+if [[ -n "${LORRAX_SLATE_CONFIGURE_ONLY:-}" ]]; then
+    echo "[slate-build] LORRAX_SLATE_CONFIGURE_ONLY set: stopping after configure"
+    exit 0
+fi
 
 cmake --build "${BUILD}" --parallel "${JOBS}"
 cmake --install "${BUILD}"
+lib="$(_slate_lib)"
+if [[ -n "${lib}" && -n "$(_nonmp_libsci "${lib}")" ]]; then
+    echo "[slate-build] FAILED: ${lib} needs the non-OpenMP libsci: $(_nonmp_libsci "${lib}" | tr '\n' ' ')" >&2
+    exit 7
+fi
+echo "${WANT_STAMP}" > "${STAMP}"
 
 echo
 echo "[slate-build] ${VARIANT} done."
