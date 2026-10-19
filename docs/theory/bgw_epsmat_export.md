@@ -172,8 +172,8 @@ the Schur fold's operands) and stores their ω = 0 values beside `S_cart_head`
 (`head_wing_L` (3, N_μ), `head_wing_R` (N_μ, 3), `S_cart_head_direct`):
 
 $$
-\chi_0(0,G)=\sum_\mu (q\!\cdot\!L)_\mu\,\overline{\tilde\zeta_\mu(G)},\qquad
-\chi_0(G,0)=\sum_\mu \tilde\zeta_\mu(G)\,(Rq)_\mu,\qquad
+\chi_0(0,G)=-\sum_\mu (q\!\cdot\!L)_\mu\,\overline{\tilde\zeta_\mu(G)},\qquad
+\chi_0(G,0)=-\sum_\mu \tilde\zeta_\mu(G)\,(Rq)_\mu,\qquad
 \chi_{00}=\Omega\,q^{\mathsf T}S_{\rm d}\,q,
 $$
 $$
@@ -184,12 +184,17 @@ $$
 
 q Cartesian in 1/bohr, $v$ the velocity (with the V_NL commutator) that builds
 $S$. Replacing the centroid pair product by the density jet $D=v/\Delta E$
-gives $L=-\Omega S_{\rm d}$: the identity that fixes $g$, the sign and the
-conjugation (`tests/test_epsmat_q0_wing_cpu.py`, with a red twin). The stored
-head is the fold $S_{\rm eff}=S_{\rm d}+L\,W(\Gamma)\,R/\Omega$
-(`head_correction = full`, `head_source = head_schur`).
+gives $L=-\Omega S_{\rm d}$: the identity that fixes $g$ and the conjugation
+(`tests/test_epsmat_q0_wing_cpu.py`, with a red twin). The stored head is the
+fold $S_{\rm eff}=S_{\rm d}+L\,W(\Gamma)\,R/\Omega$ (`head_correction = full`,
+`head_source = head_schur`), which no overall sign of L can change. The sign
+of the q-linear G = 0 density against ζ̃'s Fourier convention — the minus in
+the first two relations — is fixed on BerkeleyGW's own eps0mat: with the
+opposite sign every wing entry of Si 4³ (centrosymmetric) and MoS₂ 9×9 (not)
+is −1.0000 × BerkeleyGW's (residual 1.4e-3 on the MoS₂ row wing), and the
+conjugated assignment fails (residual 1).
 
-Write $\omega=Rq_0$, $\tilde\omega=q_0\!\cdot\!L$ and, with the export's Γ
+Write $\omega=-Rq_0$, $\tilde\omega=-q_0\!\cdot\!L$ and, with the export's Γ
 factors $V$, $\chi^{\mu}=BKB^\dagger$ and $W=V+V\chi^{\mu}V$,
 
 $$

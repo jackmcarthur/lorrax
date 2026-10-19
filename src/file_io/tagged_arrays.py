@@ -1268,12 +1268,12 @@ def write_head_wings_to_h5(
       ``S + L W(Γ) R / Ω`` when the head is ``head_schur``.
     - ``head_wing_L`` ``(3, N_μ)`` complex: the left wing, the q-linear
       G = 0 row of the ISDF polarizability,
-      ``χ₀(0, G) = Σ_μ (q·L)_μ conj(ζ̃_μ(G))`` with ``q`` Cartesian (1/bohr),
+      ``χ₀(0, G) = −Σ_μ (q·L)_μ conj(ζ̃_μ(G))`` with ``q`` Cartesian (1/bohr),
       ``ζ̃_μ`` the restart's Γ interpolation vectors and ``V = Zᴴ diag(v/Ω) Z``
       (Ry); ``L_aμ = Σ_{k,c,v} conj(v^a_{cv,k}) g_{cv,k} ψ*_c(r_μ) ψ_v(r_μ)``,
       ``g = 4 / (N_k n_spin n_spinor ΔE²)`` (``qsgw_head._head_wing_kernel``).
     - ``head_wing_R`` ``(N_μ, 3)`` complex: the right wing,
-      ``χ₀(G, 0) = Σ_μ ζ̃_μ(G) (R q)_μ``; ``R = Lᴴ`` for a static gapped
+      ``χ₀(G, 0) = −Σ_μ ζ̃_μ(G) (R q)_μ``; ``R = Lᴴ`` for a static gapped
       response.
 
     Charge channel only: the wings carry the spin/spinor sum of the density
@@ -1301,9 +1301,9 @@ def write_head_wings_to_h5(
                 ds.attrs["omega_ry"] = 0.0
             f["S_cart_head_direct"].attrs["convention"] = "cartesian_q2_coefficient_direct"
             f["head_wing_L"].attrs["convention"] = (
-                "chi0(0,G) = sum_mu (q.L)_mu conj(zeta_mu(G)); q Cartesian 1/bohr; "
+                "chi0(0,G) = -sum_mu (q.L)_mu conj(zeta_mu(G)); q Cartesian 1/bohr; "
                 "V = Z^H diag(v/Omega) Z in Ry; S_cart_head = S_direct + L W(Gamma) R / Omega")
-            f["head_wing_R"].attrs["convention"] = "chi0(G,0) = sum_mu zeta_mu(G) (R q)_mu"
+            f["head_wing_R"].attrs["convention"] = "chi0(G,0) = -sum_mu zeta_mu(G) (R q)_mu"
             set_commit_state(f, True)
     rank0_transaction(filename, stage="restart.head_wings", write=_write)
 

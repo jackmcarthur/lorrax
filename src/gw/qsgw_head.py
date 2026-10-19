@@ -2044,7 +2044,7 @@ def static_head_wings_host(response, mesh: Mesh):
     ``None`` without wings or without an ω = 0 sample.  These are the q → 0
     quantities of ``docs/theory/bgw_epsmat_export.md`` §5 (E9): the left wing
     is the q-linear G = 0 row of the ISDF polarizability,
-    ``χ₀(0, G) = Σ_μ (q·L)_μ conj(ζ̃_μ(G))``.  Replication is bounded by the
+    ``χ₀(0, G) = −Σ_μ (q·L)_μ conj(ζ̃_μ(G))``.  Replication is bounded by the
     small dimension: 3 · μ · 16 B per wing (86 kB at μ = 1800), one read.
     """
     if response is None or response.Y_x is None or response.Z_y is None:

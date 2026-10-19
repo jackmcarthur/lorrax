@@ -360,7 +360,7 @@ def q0_dipole_terms(Zf, chi, V, W, wl, wr, v_eps, *, mesh, v0, chi00):
     ----------
     Zf : (1, μ_pad, n_pad) face — ζ̃ of Γ on the eps0mat G list.
     chi, V, W : (1, μ_pad, μ_pad) faces — Γ's χ^μ = B K Bᴴ, V and W = V + VχV (Ry).
-    wl, wr : (μ_pad,) complex — the contracted wings q0·L and R q0 (E9).
+    wl, wr : (μ_pad,) complex — the q-contracted wings of χ₀, −q0·L and −R q0 (E9).
     v_eps : (n,) — v(q0 + G)/Ω (Ry), zero in the G = 0 slot.
     v0 : float — v(q0)/Ω, the bare (truncated) Coulomb of the head slot (Ry).
     chi00 : complex — Ω q0ᵀ S_direct q0, the direct head of χ₀.
@@ -778,10 +778,10 @@ def _q0_head_value(cfg, src, q0):
 def q0_wing_inputs(cfg, src, q0, W_face, *, mesh):
     """``(wl, wr, v0, chi00, figures)`` of (E9) at ``q0`` from the bundle's wings, or refuse.
 
-    ``wl = q0·L``, ``wr = R q0`` padded to μ_pad (replicated), ``v0 = v(q0)/Ω``
+    ``wl = −q0·L``, ``wr = −R q0`` padded to μ_pad (replicated), ``v0 = v(q0)/Ω``
     and ``chi00 = Ω q0ᵀ S_direct q0``.  GATE ``epsmat_q0_wing_fold``: the
     stored head tensor must be the fold of the stored wings through this
-    file's W(Γ), ``Ω q0ᵀ(S_cart_head − S_direct)q0 = wlᵀ W wr``.
+    file's W(Γ), ``Ω q0ᵀ(S_cart_head − S_direct)q0 = wlᵀ W wr`` (sign-invariant).
     """
     h = src.head
     if h["L"] is None or h["R"] is None or h["S_direct"] is None:
@@ -796,7 +796,12 @@ def q0_wing_inputs(cfg, src, q0, W_face, *, mesh):
     q0c = np.asarray(q0, dtype=np.float64) @ src.geometry.bvec
     L = np.zeros((3, src.mu_pad), np.complex128); L[:, : src.n_mu] = h["L"]
     R = np.zeros((src.mu_pad, 3), np.complex128); R[: src.n_mu] = h["R"]
-    wl, wr = q0c @ L, R @ q0c
+    # The q-linear G = 0 density enters with a minus sign against ζ̃'s Fourier
+    # convention (E9): χ₀(0, G) = −Σ_μ (q·L)_μ conj(ζ̃_μ(G)), χ₀(G, 0) = −Σ_μ ζ̃_μ(G)(R q)_μ.
+    # Fixed on BerkeleyGW's own eps0mat (Si 4³ and MoS₂ 9×9): with +L every wing entry is
+    # −1.0000 × BerkeleyGW's (residual 1.4e-3), the conjugated assignment fails (residual 1);
+    # the head and the fold L W R are sign-invariant.
+    wl, wr = -(q0c @ L), -(R @ q0c)
     omega = float(src.geometry.cell_volume)
     v0 = float(bare_v_bgw_units(src, q0, np.zeros((1, 3), int))[0]) / omega
     chi00 = omega * complex(q0c @ h["S_direct"] @ q0c)
