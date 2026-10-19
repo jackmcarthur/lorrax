@@ -574,7 +574,7 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     d = next((d for d in divisors if rows(d) / mx * tile <= TILE_BYTES), 1)
     from lxkit import memory
     memory.book(memory.priced(new(d),
-                              f"Sigma tau, sigma_spin_block d={d}/{int(ns)}"),
+                              f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", increment=True),
                 stage="sigma.tau_sweep")
     if plan is not None:
         plan.update(d=int(d), ns=int(ns), new=float(new(d)), scratch=int(scratch(d)),
@@ -621,4 +621,4 @@ def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner
     from lxkit import memory
     new = (2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
            + chi0_kconv_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
-    memory.book(memory.priced(new, "chi0 node, price_chi0_node"), stage="chi.exec")
+    memory.book(memory.priced(new, "chi0 node, price_chi0_node", increment=True), stage="chi.exec")

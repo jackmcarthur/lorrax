@@ -15,11 +15,6 @@ pytest.importorskip("jax")
 from distrib_la import _slate  # noqa: E402
 
 
-def test_allowance_is_the_memory_models():
-    runtime = pytest.importorskip("runtime")
-    assert _slate._SLATE_OUTSIDE_ALLOWANCE_BYTES == runtime.DISTRIBUTED_LINALG_OUTSIDE_BYTES
-
-
 def test_eigh_workspace_is_the_per_rank_rule():
     """A: max(lower, full - mt/2); Z: local; Z1d: mt x this rank's 1 x P columns --
     equal on every rank of 2x2, so the uniform workspace holds no rank's unused bytes."""

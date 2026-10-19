@@ -58,6 +58,7 @@ Stdlib-only, like the rest of :mod:`lxkit`.
 from __future__ import annotations
 
 import glob
+import math
 import os
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -112,10 +113,21 @@ class PlatformLeg:
     #: runtime libraries, ``setdefault`` by ``runtime.set_default_env`` before
     #: the backend starts (a caller's export wins).  () = none.
     runtime_env_defaults: tuple = ()
-    #: ``O`` of the memory rule on this leg: device bytes a process holds
-    #: outside XLA's pool at ``linalg = local`` (docs/architecture/memory-model.md#rule).
-    #: None = ``runtime.OUTSIDE_POOL_BYTES``.
-    outside_pool_bytes: Optional[float] = None
+    #: Bytes a process may hold outside the allocator at ``linalg = local`` (context,
+    #: modules, XLA's communicators, FFT plans): the measured maximum with its margin
+    #: (``lxkit.memory.outside_allowance``; provenance on each leg).
+    outside_allowance: float = 3.6e9
+    #: The allocator's fragmentation reserve, a fraction of its limit, that the planning
+    #: budget leaves free (``lxkit.memory.resolve``; provenance on each leg).
+    memory_reserve: float = 0.0
+    #: Devices of this leg in one node of the site's GPU partition (``lxkit.memory.sizing``).
+    node_devices: int = 1
+    #: The allocator high-water reader of ``lxkit.memory``: "pool" (CUDA mempool
+    #: USED_MEM_HIGH, resettable), "bfc" (``peak_bytes_in_use``, first raise exact, else a
+    #: polled lower bound) or "live" (live arrays).
+    peak_reader: str = "live"
+    #: ``((library, op), MeasuredRow)``: vendor workspace measured where no query exists.
+    vendor_rows: tuple = ()
     #: collective library of the leg's XLA collectives; the section of
     #: ``config/<site>/site.toml`` that runtime.network_env applies ("" = none).
     collective_library: str = ""
@@ -128,12 +140,40 @@ class PlatformLeg:
     profiler: tuple = ()
 
 
+@dataclass(frozen=True)
+class MeasuredRow:
+    """A measured vendor workspace: ``ratio * unit(n, P, itemsize)`` bytes per rank on the
+    measured ``n`` and ``P`` ranges (inclusive), with provenance (``lxkit.memory.vendor``)."""
+    ratio: float
+    unit: Callable
+    unit_name: str
+    n: tuple = (1, float("inf"))
+    p: tuple = (1, float("inf"))
+    source: str = ""
+
+
+def heevd_bytes(n, p, item):
+    """LAPACK ?heevd/?syevd optimal lwork, lrwork and liwork, bytes."""
+    if item == 16:
+        return 16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) + 4 * (3 + 5 * n)
+    return 8 * (1 + 6 * n + 2 * n * n) + 4 * (3 + 5 * n)
+
+
+def _mp_lu_panels(n, p, item):
+    """cuSOLVERMp LU local panels (n/Px + mb) nb at its square-grid blocks."""
+    side = n // math.isqrt(p)
+    nb = side if side <= 16384 else 250
+    return (side + nb) * nb * item
+
+
 HOST = PlatformLeg(
     key="cpu", vendor="cpu",
     so_name="liblorrax_ffi_host.so", so_env="LORRAX_FFI_HOST_SO",
     build_subdir="build_host", c_abi_suffix="_host",
     abi_symbol="lorrax_ffi_host_abi_version", accelerator=False,
-    jax_platforms=("cpu",))
+    jax_platforms=("cpu",), memory_reserve=0.18567,
+    vendor_rows=((("lapack", "heevd"), MeasuredRow(
+        1.0, heevd_bytes, "LAPACK heevd workspace", source="LAPACK optimal workspace, exact")),))
 
 #: Every leg, by XLA platform key.  The CUDA library keeps its historical
 #: file name and pin (``liblorrax_ffi.so``, ``LORRAX_FFI_SO``) so sealed
@@ -161,7 +201,26 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         outside_pool_api="cuda_driver_mempool",
         memory_telemetry="nvidia-smi",
         collective_library="nccl", collective_net_plugin="libnccl-net.so",
-        profiler=("nsys", "libToolsInjection", 0)),
+        profiler=("nsys", "libToolsInjection", 0),
+        # 3.0 GB outside the pool (context, modules, XLA NCCL communicators, cuFFT
+        # plans; sandbox claim 3978) x 1.2; 1.66 GB measured after warm-up, before the
+        # Mp contexts (MEMORY_MODEL_AUDIT §2).
+        outside_allowance=3.6e9,
+        # PROVISIONAL: the 2026-10-08 rule's in-use overshoot phi 0.19 x margin 1.2,
+        # as a share of the limit (0.228 / 1.228), so the budget is the rule's until
+        # the gate legs measure max(peak - priced) over passing stages.
+        memory_reserve=0.18567,
+        node_devices=4,                  # Perlmutter GPU node: 4 A100
+        peak_reader="pool",
+        vendor_rows=(
+            (("cusolverdn", "heevd"), MeasuredRow(
+                2.0, heevd_bytes, "LAPACK heevd workspace", n=(4096, 41250), p=(1, 1),
+                source="cusolverDnXsyevd_bufferSize = 2.0 x LAPACK, exact at n 4096-41250, "
+                       "A100 (eighmem 2026-10)")),
+            (("cusolvermp", "solve_lu"), MeasuredRow(
+                11.2, _mp_lu_panels, "local LU panels (n/Px + mb) nb", n=(4096, 30000),
+                p=(4, 4), source="lrx_lu_workspace_bytes 9.64-11.16 panels (getrf, getrs "
+                "nrhs = n, pivots), 2x2 A100, 2026-10-19, max taken; 4x4 unmeasured")))),
     "ROCM": PlatformLeg(
         key="ROCM", vendor="rocm",
         so_name="liblorrax_ffi_rocm.so", so_env="LORRAX_FFI_ROCM_SO",
@@ -187,7 +246,8 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
                            ("--xla_gpu_disable_async_collectives", "ALLCOLLECTIVES")),
         # The pool policy's arena: BFC (cuda_async does not exist on ROCm),
         # preallocated at runtime.pool_fraction (0.8760 of a 68.70 GB GCD,
-        # 60.18 GB, after outside_pool_bytes below) instead of jaxlib's 0.75 (51.53 GB).  Outside the arena
+        # 60.18 GB, after outside_allowance below) instead of jaxlib's 0.75 (51.53 GB).
+        # Outside the arena
         # after RCCL init, 512 MiB psum/all_to_all, a 3D FFT and a GEMM:
         # 0.99-1.08 GB per rank at P4, against the 7.20 GB left; hsuite walls
         # unchanged, planner budget 41.96 -> 50.08 GB (Runtime-LEGS lane 2026-10-15).
@@ -238,8 +298,22 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         # hsuite kmeans (2.71 GB with HSA_NO_SCRATCH_RECLAIM=0) and 3.30 GB on Fe
         # V2 (2.13 GB), resident from the first ISDF stage on; 3 GB (the CUDA
         # figure) no longer covers it (comm lane 2026-10-16, pool logs comm_mhs_*,
-        # comm_mfe_*).  R = M - 1.2 (O + 3 GB): 60.18 of 68.70 GB.
-        outside_pool_bytes=4.1e9,
+        # comm_mfe_*).  4.1 GB x 1.2; R = M - (4.92 + 3.6) GB: 60.18 of 68.70 GB.
+        outside_allowance=4.92e9,
+        # PROVISIONAL, as on CUDA: 0.228 / 1.228 of the BFC bytes_limit (48.99 of 60.18 GB).
+        memory_reserve=0.18567,
+        node_devices=8,                  # Frontier node: 4 MI250X, 8 GCDs
+        peak_reader="bfc",
+        vendor_rows=(
+            (("elpa", "eigh"), MeasuredRow(
+                1.0, lambda n, p, item: (24.0 if item == 16 else 16.0) * (n / math.isqrt(p)) ** 2
+                + 2048.0 * n / math.isqrt(p), "(24|16) (N/p)^2 + 2048 N/p", p=(4, 16),
+                source="ELPA 2026.02.001 allocator-hook high-water, MI250X P 4 and 16 "
+                       "(ELPA_ROCM_REPORT.md, table pool)")),
+            (("slate", "solve_lu"), MeasuredRow(
+                3.0, lambda n, p, item: n * n * item / p, "copies of A per rank",
+                n=(1, 40960), p=(4, 4), source="SLATE LU ~3 copies of A, OOM at n 51200 P4 "
+                "(LA_ROUTING_AUDIT)"))),
         outside_pool_api="hip_runtime_arena",
         # In process: amd-smi takes 1.0 s a sample and rocm-smi 0.45 s, and both
         # number all eight GCDs, not the one ROCR_VISIBLE_DEVICES leaves visible.
@@ -250,6 +324,13 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
 })
 
 _BY_VENDOR = {leg.vendor: leg for leg in LEGS.values()}
+
+#: Bytes the distributed linear-algebra providers open outside the allocator under
+#: ``linalg = distributed`` (cuSOLVERMp/cuBLASMp contexts, their NCCL communicators and
+#: workspace: 5.9 GB outside at P4 against 2.9), with the 1.2 margin; and its provenance.
+#: A route that opens them carries it as its ``outside`` term (``lxkit.memory``).
+DISTRIBUTED_CONTEXT_BYTES = (3.6e9, "cuSOLVERMp/cuBLASMp contexts + NCCL: 3.0 GB measured "
+                             "at P4 (5.9 vs 2.9 outside) x 1.2")
 
 
 def accelerator_legs() -> tuple:

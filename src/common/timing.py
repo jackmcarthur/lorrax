@@ -630,8 +630,18 @@ class TimingCollector:
 				node.peak_self_ranks = [nan(row[1]) for row in hit]
 				node.host_ranks = [nan(row[2]) for row in hit]
 				node.host_rise_ranks = [nan(row[3]) for row in hit]
+		# Every rank's receipt figure per priced stage (lxkit.memory), the same way.
 		from lxkit import memory
-		memory.gather(all_gather_processes)
+		rows = memory._RECEIPTS.values()
+		local = np.array([(key((r["stage"],)), int(r["measured"])) for r in rows],
+		                 dtype=np.int64).reshape(-1, 2)
+		counts = np.asarray(all_gather_processes(np.asarray(len(local), dtype=np.int64))).reshape(-1)
+		padded = np.full((max(1, int(counts.max(initial=0))), 2), -1, dtype=np.int64)
+		padded[:len(local)] = local
+		table = np.asarray(all_gather_processes(padded))
+		ranks = [dict(table[r, :int(counts[r])].tolist()) for r in range(len(counts))]
+		for row in rows:
+			row["measured_ranks"] = [nan(rank.get(key((row["stage"],)), -1)) for rank in ranks]
 
 	def format(self, **kwargs) -> list[str]:
 		_, rows = self._rows(kwargs.get("min_percent"), kwargs.get("max_depth"))

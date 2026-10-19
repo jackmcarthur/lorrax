@@ -312,7 +312,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                         from gw.shared_pole_execution import face_reduction_bytes
                         budget.program_bytes = face_reduction_bytes(mesh_xy, len(ids), **dict(sizing, side=side))
                     budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
-                        round_states, infinity, widths, infinity_width))
+                        round_states, infinity, widths, infinity_width), runs_in="spole.gram_reduction")
                 finally:
                     budget.program_bytes = admitted
                 round_states, infinity = pad_states(round_states, widths, infinity, infinity_width)

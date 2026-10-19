@@ -23,7 +23,9 @@ _rs.resolve_eigh_capacity = _cap
 if hasattr(_pl, "resolve_eigh_capacity"):
     _pl.resolve_eigh_capacity = _cap
 from common import gpu_utils
-gpu_utils._RUN_DEVICE_BUDGET_GB = 63.41
+from lxkit import memory
+memory.set_budget(63.41e9, limit_bytes=77.89e9, per_node=4, platform="NVIDIA A100-SXM4-80GB",
+                  linalg="distributed")
 mesh = Mesh(np.array(jax.devices()[:16]).reshape(4, 4), ("x", "y"))
 N, NLOG, BUDGET, NATIVE_EIGH = 30000, 29998, 63414637611, 7382397440
 POLE_BUDGET, INFINITY_W, IMAG_W, LINE_CAP, STATE_W = 14999, 3750, 7500, 1875, 4612
@@ -90,7 +92,8 @@ BASELINE = 3_130_000_000
 ledger = CapacityLedger(SimpleNamespace(nk_tot=1, nspinor=2, n_rmu=NLOG), mesh_xy=mesh,
                         device_budget_bytes=BUDGET, baseline_bytes=BASELINE)
 # The room helpers that measure live arrays see the same floor.
-gpu_utils.shared_device_room_bytes = lambda: BUDGET - BASELINE
+memory.room = lambda stage="", *, bucketed=True: (
+    memory.bucket if bucketed else int)(BUDGET - BASELINE)
 face_bytes = 16 * N * N // mesh.size
 ledger.reserve("coulomb_roots:2", resident_bytes_per_rank=face_bytes, workspace_bytes_per_rank=0)
 ledger.live_stages = ("coulomb_roots:2",)
@@ -247,3 +250,4 @@ stage("missing rooms", missing_rooms)
 
 print("RESULT " + json.dumps(dict(info={k: v for k, v in info.items() if k != "receipt"},
                                   census=census, refusals=refusals), default=str))
+print("SIZING " + memory.sizing()["line"])

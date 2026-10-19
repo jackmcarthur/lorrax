@@ -596,8 +596,10 @@ class ParkedVTiles:
             0 if cap is None or any(same) else local_bytes(cap.X_ibz))
         have = host_bytes_per_process()
         if need > have:
-            from common.gpu_utils import warn_over_budget
-            warn_over_budget(f"four-current V_q host park ({what})", need, have, local=True)
+            from lxkit import memory
+            memory.admit(f"four-current V_q host park ({what})",
+                         memory.priced(need, "closed form"), have, local=True,
+                         limit_bytes=float("inf"))
         if jax.process_index() == 0:
             print_fn(f"  μ-batch V_q: {what} parked on host, {need / 1e9:.2f} "
                      f"GB/rank of a {have / 1e9:.1f} GB host share")

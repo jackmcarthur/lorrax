@@ -1388,7 +1388,8 @@ def _band_chunk(geom, ops, nb_rank: int, step_bytes: float) -> int:
     n_chunks = -(-nb_rank // fit)
     chunk = -(-nb_rank // n_chunks)
     memory.book(memory.priced(step_bytes + chunk * box,
-                              f"matrix-element sweep, plan_sweep {chunk}/{nb_rank} bands"))
+                              f"matrix-element sweep, plan_sweep {chunk}/{nb_rank} bands",
+                              increment=True))
     return chunk
 
 

@@ -116,7 +116,7 @@ class Sampler:
         except Exception:                                       # noqa: BLE001
             pass
         st = self.dev.memory_stats() or {}
-        hw = memory.high_water() if self.cuda else None
+        hw = memory.boundary() if self.cuda else None
         self.result = dict(
             arena_in_use_max=self.max_in,
             arena_peak_cumulative=int(st.get("peak_bytes_in_use", 0)),

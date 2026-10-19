@@ -113,14 +113,15 @@ def test_the_passivity_eigh_room_hands_back_its_own_reservation():
 
 def test_constructor_refuses_a_whole_41250_parent_per_rank(monkeypatch):
     """The plausibility deck's largest constructor eigh (one 41250 x 41250 parent, nq 1): route (c)
-    would hold the whole matrix per rank; its shape price is over an 80 GB room, so admit_local
+    would hold the whole matrix per rank; its shape price is over an 80 GB room, so lxkit.memory.admit
     sends it to the whole mesh (staged_eigh)."""
     import distrib_la
-    from common import gpu_utils
+    from lxkit import memory
     from gw.shared_pole_capacity import _local_eigenplan
-    monkeypatch.setattr(gpu_utils, "_RUN_DEVICE_BUDGET_GB", 80.0)
+    memory.set_budget(80e9)
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
     price = distrib_la.eigh_stack_bytes(_local_eigenplan(mesh, 41250), (1, 41250, 41250), np.complex128)
     assert price > 80e9
-    assert not gpu_utils.admit_local("test constructor eigh 1 x 41250^2", price, 80e9,
-                                     distributed_bytes=2 * 16 * 41250 ** 2 // 16, names=("route (c)", "whole mesh"))
+    assert memory.admit("test constructor eigh 1 x 41250^2", (
+        ("route (c)", memory.priced(price, "eigh_stack_bytes")),
+        ("whole mesh", memory.priced(2 * 16 * 41250 ** 2 // 16, "faces"))), 80e9) == "whole mesh"

@@ -376,7 +376,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     # A static node is priced in its caller's section (Σ exchange, static COHSEX).
     label = "Sigma static" if static else "Sigma tau"
     memory.book(memory.priced(price["new"],
-                              f"{label}, {len(windows)} row pass(es)"),
+                              f"{label}, {len(windows)} row pass(es)", increment=True),
                 stage=None if static else "sigma.tau_sweep")
     if jax.process_index() == 0:
         print(f"{label} stream: {len(windows)} row pass(es) of {R} local rows "

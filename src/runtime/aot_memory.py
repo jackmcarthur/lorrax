@@ -630,7 +630,7 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     directly, ``floor((room - fixed) / per_unit)``, and compiled once more.
     No bisection: a chunk already at ``minimum``, or a second figure still
     over the room, prints one warning line
-    (``common.gpu_utils.warn_over_budget``) and the stage runs at that chunk.
+    (``lxkit.memory.admit``) and the stage runs at that chunk.
     Every figure is the largest any rank read (:func:`agreed_chunk`) before
     it is compared, so every rank recompiles, or not, in lockstep (INVARIANTS 21).
     """
@@ -644,10 +644,11 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     started = time.perf_counter()
     got = figure(chunk, compiled)
     seconds = time.perf_counter() - started
-    from common.gpu_utils import warn_over_budget
+    from lxkit import memory
     if got <= room or chunk <= minimum:
         if got > room:
-            warn_over_budget(f"{stage or 'compiled chunk'} (chunk {chunk}, compiled)", got, room)
+            memory.admit(f"{stage or 'compiled chunk'} (chunk {chunk}, compiled)",
+                         memory.priced(got, "compiled"), room)
         return ChunkCheck(chunk, compiled, analytic, got, max(analytic, got),
                           float(per_unit), False, seconds)
     slope = max(float(per_unit), (got - float(fixed)) / chunk)
@@ -662,5 +663,6 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     again = figure(solved, compiled)
     seconds += time.perf_counter() - started
     if again > room:
-        warn_over_budget(f"{stage or 'compiled chunk'} (chunk {solved}, compiled)", again, room)
+        memory.admit(f"{stage or 'compiled chunk'} (chunk {solved}, compiled)",
+                     memory.priced(again, "compiled"), room)
     return ChunkCheck(solved, compiled, analytic, got, again, slope, True, seconds)

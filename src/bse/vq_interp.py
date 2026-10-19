@@ -511,7 +511,7 @@ def build_cq_q_chunk(*, nq, nb, ns, n_mu, n_r, mesh_xy):
     from lxkit import memory
     chunk = tile_units(per_q, int(nq))
     memory.book(memory.priced(fixed + chunk * per_q,
-                              f"exciton_bands build_cq, q chunk {chunk}/{int(nq)}"))
+                              f"exciton_bands build_cq, q chunk {chunk}/{int(nq)}", increment=True))
     return chunk
 
 
