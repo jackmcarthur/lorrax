@@ -2033,9 +2033,11 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     if spm:
         # The shared-pole Σ stage reads the map's recipe and census, set on the run's
         # metadata as attributes outside its fields (gw_jax), which dataclasses.replace
-        # does not carry; its capacity ledger is this call's own.
-        fields_ = {f.name for f in dataclasses.fields(meta_src)}
-        meta_t.__dict__.update({k: v for k, v in vars(meta_src).items() if k not in fields_})
+        # does not carry (its __post_init__ rederives nb_sigma and the band edges from
+        # b_id_3); its capacity ledger is this call's own.
+        for name in ("shared_pole_recipe", "shared_pole_census", "shared_pole_state_identity"):
+            if hasattr(meta_src, name):
+                setattr(meta_t, name, getattr(meta_src, name))
         meta_t = fresh_shared_pole_capacity(meta_t, mesh_xy)
     head = None if internal == "frozen" else plan.get("head")
     nb_sig = int(slices_t.nb_sigma)
