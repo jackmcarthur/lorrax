@@ -2628,7 +2628,7 @@ def _refit_kernels(nk, nb, ns, n_mu, zeta_solve):
         # a comment citing a private ridged-Cholesky helper of ``isdf.core``
         # — a symbol that has never existed in this tree.  The production
         # charge path is
-        # ``replicated_rank_truncate``: an eigh pseudo-inverse that DROPS
+        # ``rank_truncate``: an eigh pseudo-inverse that DROPS
         # every direction with λ < zeta_rcond·λ_max.  A ridged Cholesky
         # KEEPS those directions and amplifies them by up to four orders
         # more than the producer's κ cap allows, so ζ' differed from ζ in

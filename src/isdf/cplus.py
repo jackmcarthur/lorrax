@@ -8,7 +8,8 @@ figures, which ``report`` prints on the host after the program; ``apply`` is
 fit (``isdf.zeta_mubatch``), the dense refit (``solve_zeta_charge_dense``) and
 the per-q factor stacks of ``isdf.core`` -- so a different conditioning
 procedure replaces this file and nothing else.  Callers own the logical
-extent (``runtime.padding.solve_at_logical``); nothing here sees a pad.
+extent (``runtime.padding.solve_at_logical``), or zero the pads so the
+face's checked eigh deflates them below the cut (``isdf.core._factor_c_q_face``).
 """
 from __future__ import annotations
 
@@ -25,10 +26,12 @@ def apply(B, Z):
     return B @ (jnp.conj(jnp.swapaxes(B, -1, -2)) @ Z)
 
 
-def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
+def factor(C_log, *, rcond: float, rank_log: bool, n_log: int, eigh=eigh_local):
     """``(B, figures)``: B with B Bᴴ = C⁺ for a logical C_q stack, and the
     cut's per-q figures, which the caller hands to :func:`report` on the host
-    after the program; see the module docstring."""
+    after the program; see the module docstring.  ``eigh`` is the whole-tile
+    local eigh, or the face's checked distributed eigh (``isdf.core._factor_c_q_face``,
+    whose zeroed pads deflate below the cut)."""
     from isdf.core import _certify_the_cut, _close_the_cut
     # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
     # n_μ over-completes the pair-density rank (κ~1e13); plain
@@ -36,8 +39,8 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
     # errors that GN-PPM magnifies to tens of eV.  Rank-truncation
     # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
     # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
-    lam, V = eigh_local(C_log)      # Hermitian-SPD, λ ascending
-    lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
+    lam, V = eigh(C_log)             # Hermitian-PSD (the face's deflated pads come first)
+    lam_max = jnp.max(lam, axis=-1, keepdims=True)   # (nqb,1) largest λ per q
     keep = lam > (rcond * lam_max)       # near-null cut
     # …and the near-null cut is not allowed to stop mid-multiplet.  THIS
     # IS THE SEAM the 6×6×6 saga's §6 conjectured about

@@ -1395,8 +1395,8 @@ _DEFAULTS = {
     # Σc blow-up / device-count / nband instability).  "cholesky" = the
     # historical replicated/cuSolverMp Cholesky path (kept as an internal
     # implementation arm).
-    # The ζ back-solve applies each whole-tile factor on its q owners
-    # (isdf.core.zeta_factor_resident); nothing O(Q·μ²) is replicated.
+    # The charge ζ back-solve runs on the face; a current channel applies its
+    # whole-tile LU on its q owners (isdf.core.zeta_factor_resident).
     # Rank-truncation cutoff (relative to λ_max, per q).  DEFAULT 1e-8 —
     # the LOW end of the over-complete recovery plateau.  An over-complete
     # basis needs it: at MoS2 4×4/1204c, 1e-10 only partially recovers (MAE

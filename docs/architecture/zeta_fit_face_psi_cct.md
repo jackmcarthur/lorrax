@@ -115,15 +115,17 @@ A binding cut is certified against κ ≤ 1e8 and against a discarded spectral
 weight of at most 1e-3 (`LORRAX_RANK_POLICY` = refuse | warn | off)
 ([rank-truncation policy](rank_truncation_policy.md)).
 
-The factor runs replicated, in q batches of at most 4 GiB per rank
-(`factor_c_q_replicated_batched`). On P > 1 with Q·μ³ ≥ 5e9 it runs
-q-parallel instead, with each rank factoring ceil(Q/P) whole matrices. The
-cost is O(Q·μ³), divided by min(P, Q) when q-parallel. A q batch that cannot
-be replicated refuses, and the refusal names the per-batch bytes.
+The eigh runs on the face (`isdf.core._factor_c_q_face`): distrib_la's
+checked eigh, checked on the columns the cut keeps, with the pad block zeroed
+(its pairs deflate below the cut). B is face-tiled, `16·Q·μ²/P` bytes per rank.
+The kept rank can differ between grids or backends only for an eigenvalue
+within rounding of the cut (accepted 2026-10-19; it was the reason the factor
+used to run replicated).
 
-**Back-solve.** Rank p holds ceil(Q/P) whole factors, `16·⌈Q/P⌉·μ²` bytes
-(`zeta_factor_resident` moves them to the batch layout once), and only the
-right-hand side moves. With Q < P the ranks past Q hold pad rows and idle in
+**Back-solve.** The charge channel forms ζ = B(BᴴZ) on the face per G tile
+(two face GEMMs, `ZetaG._contract_v_face`). A current channel's rank p holds
+ceil(Q/P) whole LU factors, `16·⌈Q/P⌉·μ²` bytes (`zeta_factor_resident` moves
+them to the batch layout once), and only the right-hand side moves. With Q < P the ranks past Q hold pad rows and idle in
 the solve; nothing O(Q·μ²) is replicated. `linalg = distributed` distributes
 the W Dyson solve, the transverse LU and the eigensolvers, never the ζ
 back-solve. Route G applies the factor tile
