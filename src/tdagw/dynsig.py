@@ -25,13 +25,15 @@ spin-traced (``Gc_R x conj(Gv_R)``, as ``gw.w_isdf``'s chi0 kernel).
 
 The instantaneous state (the approximation, stated)
 ---------------------------------------------------
-* The active window's G Hamiltonian H^G_A(t) = diag(eps^G) [+ K drho_pop]
+* The active window's G Hamiltonian H^G_A(t) = diag(eps^G) [+ K drho_car]
   is diagonalized per k, H^G = U diag(e) U^H (``dress``: ``"none"`` keeps U = 1
-  and e = eps^G; ``"instantaneous"`` adds the frozen-W update of the populations
-  alone, drho_pop = U diag(f) U^H - rho_eq, a fixed point per call
-  (:func:`_population_basis`): the coherences and the field stay out, so U and e
-  move at O(E^2) and linear response is the BSE; ``"coherent"``, the red twin,
-  adds K drho of the whole drho, whose coherent part moves them at O(E)).
+  and e = eps^G; ``"instantaneous"`` adds the frozen-W update of the carriers,
+  drho_car = U diag(f - f_eq) U^H, a fixed point per call (:func:`_population_basis`):
+  the coherences, the field and the rotation of the equilibrium occupations stay
+  out, so U and e move at O(E^2) and linear response is the BSE.  Red twins:
+  ``"coherent"`` adds K drho of the whole drho, whose coherent part moves them at
+  O(E); ``"sea_rotation"`` dresses with U diag(f) U^H - rho_eq, whose rotation of
+  the equilibrium occupations feeds back through K).
   eps^G are the energies the GW run's G used (DFT for one_shot_dft), so that
   Sigma[rho_eq] is the run's own Sigma.
 * Screening: chi0 sees the populations f_i = Re (U^H rho U)_ii of the rotated
@@ -552,49 +554,44 @@ def _sigma_window(dyn, kern, X_win, d_full, W_R):
     return jnp.moveaxis(Y, -1, 0)[:, b_lo:b_lo + nA, b_lo:b_lo + nA]
 
 
-#: ``dress = "instantaneous"`` (docs/theory/td_agw_dynamical.md §1.1): the fixed point's
-#: static step count, its Anderson history, and the residual (population units) above which
-#: a correction is refused (GATE dynsig_dress_not_converged).  The plain iteration contracts
-#: only at the window's static response (Jacobian eigenvalue -0.88 on the synthetic driven
-#: state of tests/test_tdagw_dynsig.py; on CrI3 516 2v2c it stalls at 2.6e-2 relative), so
-#: the steps are Anderson-mixed; 32 steps of history 16 reach 4e-11 relative on a weak 516
-#: drive (measured; docs §1.1).
-DRESS_STEPS, DRESS_HISTORY, DRESS_TOL = 32, 16, 1e-8
+#: ``dress = "instantaneous"`` (docs/theory/td_agw_dynamical.md §1.1): the fixed point's static
+#: number of plain steps, and the residual (population units) above which a correction is
+#: refused (GATE dynsig_dress_not_converged).  Measured on CrI3 516 2v2c: round-off in 3, 5
+#: and 23 steps at populations 5e-6, 5e-4 and 1.2e-2 (contraction per step ~ p^1.1; the gate
+#: holds to populations ~2e-2, extrapolated).  On tests/test_tdagw_dynsig.py's bundle, to 1e-12:
+#: 4 steps at 1.6e-3, 17 at 7e-2, 36 at 0.39; 32 steps keep its hot state's dSigma within 2e-9
+#: of the converged one.
+DRESS_STEPS, DRESS_TOL = 32, 1e-8
 
 
-def _population_basis(e_win, rho, rho_eq, static_dsigma, steps: int = DRESS_STEPS,
-                      history: int = DRESS_HISTORY):
-    """The population-dressed window basis, Eq. (2): U, e, f and the fixed point's residual.
+def _population_basis(e_win, rho, f_eq, static_dsigma, steps: int = DRESS_STEPS,
+                      sea: bool = False):
+    """The carrier-dressed window basis, Eq. (2): U, e, f and the fixed point's residual.
 
-    h = diag(e_win) + K drho_pop, drho_pop = U diag(f) U^H - rho_eq, (U, e, f) =
-    :func:`instantaneous_basis` (h, rho).  ``steps`` evaluations of the map
-    P -> U[P] diag(f[P]) U[P]^H - rho_eq from P = diag(rho) - rho_eq (U = 1, f = diag
-    rho), Anderson-mixed over ``history`` steps (real inner product on the Hermitian
-    iterates).  rho, rho_eq (nk, nA, nA); ``static_dsigma`` is K (Ry, model order).
-    Returns U, e, f of the last evaluation and its residual max |U diag(f) U^H - rho_eq
-    - P| (population units; 0 at the fixed point).
+    h = diag(e_win) + K drho_car, drho_car = U diag(f - f_eq) U^H, (U, e, f) =
+    :func:`instantaneous_basis` (h, rho): ``steps`` plain evaluations of the map
+    P -> U[P] diag(f[P] - f_eq) U[P]^H from P = diag(rho) - diag(f_eq) (U = 1, f = diag rho).
+    ``sea=True`` is the red twin ``dress = "sea_rotation"``, P -> U diag(f) U^H - rho_eq: its
+    rotation of the equilibrium occupations feeds back through K, which on CrI3 516 stalls
+    the plain iteration (design page §1.1).  rho (nk, nA, nA), f_eq (nk, nA); ``static_dsigma``
+    is K (Ry, model order).  Returns U, e, f of the last evaluation and its residual
+    max |P_out - P_in| (population units; 0 at the fixed point).
     """
     h0 = _band_diag(e_win)
     f0 = jnp.real(jnp.diagonal(rho, axis1=-2, axis2=-1))
-    buf = jnp.zeros((history,) + rho.shape, rho.dtype)
 
-    def step(c, it):
-        P, P_prev, R_prev, dP, dR, _ = c
+    def step(c, _):
+        P, _ = c
         U, e, f = instantaneous_basis(h0 + static_dsigma(P), rho)
-        R = (U * f[..., None, :]) @ jnp.conj(jnp.swapaxes(U, -1, -2)) - rho_eq - P
-        dP = jnp.where(it > 0, jnp.roll(dP, 1, axis=0).at[0].set(P - P_prev), dP)
-        dR = jnp.where(it > 0, jnp.roll(dR, 1, axis=0).at[0].set(R - R_prev), dR)
-        M = jnp.real(jnp.einsum("i...,j...->ij", jnp.conj(dR), dR))
-        g = jnp.linalg.solve(M + (1e-12 * jnp.trace(M) + 1e-300) * jnp.eye(history),
-                             jnp.real(jnp.einsum("i...,...->i", jnp.conj(dR), R)))
-        P_next = P + R - jnp.einsum("i,i...->...", g, dP + dR)
-        return (P_next, P, R, dP, dR, (U, e, f, jnp.max(jnp.abs(R)))), None
+        P_out = (U * (f if sea else f - f_eq)[..., None, :]) @ jnp.conj(jnp.swapaxes(U, -1, -2))
+        if sea:
+            P_out = P_out - _band_diag(f_eq)
+        return (P_out, (U, e, f, jnp.max(jnp.abs(P_out - P)))), None
 
-    P0 = _band_diag(f0) - rho_eq
     out0 = (jnp.broadcast_to(jnp.eye(rho.shape[-1], dtype=rho.dtype), rho.shape), e_win, f0,
             jnp.zeros((), f0.dtype))
-    c, _ = lax.scan(step, (P0, P0, jnp.zeros_like(P0), buf, buf, out0), jnp.arange(steps))
-    return c[-1]
+    c, _ = lax.scan(step, (_band_diag(f0 - f_eq), out0), None, length=steps)
+    return c[1]
 
 
 def _active_state(dyn, x, *, dress, static_dsigma):
@@ -610,10 +607,10 @@ def _active_state(dyn, x, *, dress, static_dsigma):
         return U, e_win, jnp.real(jnp.diagonal(rho, axis1=-2, axis2=-1)), zero
     if dress == "coherent":                # red twin: the whole drho, e and U move at O(E)
         return (*instantaneous_basis(_band_diag(e_win) + static_dsigma(x), rho), zero)
-    if dress != "instantaneous":
+    if dress not in ("instantaneous", "sea_rotation"):
         _refuse("dynsig_dress", repr(dress), "'none' | 'instantaneous'",
-                "'coherent' exists only as the red twin")
-    return _population_basis(e_win, rho, _band_diag(f_eq), static_dsigma)
+                "'coherent' and 'sea_rotation' exist only as red twins")
+    return _population_basis(e_win, rho, f_eq, static_dsigma, sea=(dress == "sea_rotation"))
 
 
 def dynamic_correction(dyn: dict, kern: DynsigKernels, x, *, static_dsigma=None,
@@ -766,7 +763,8 @@ def dynsig_model(dyn: dict, mesh_xy: Mesh, *, k_frac, rho_eq, screening: str = "
     k_frac, rho_eq : as :func:`tdagw.self_energy.isdf_model` (TDGW k order).
     screening : ``"frozen"`` (W = W0: exactly the ISDF TD-aGW model) |
         ``"static_rpa"`` (W rebuilt each call, Eqs. 3-5).
-    dress : ``"none"`` | ``"instantaneous"`` (module docstring; ``"coherent"`` is a red twin).
+    dress : ``"none"`` | ``"instantaneous"`` (module docstring; ``"coherent"`` and
+        ``"sea_rotation"`` are red twins).
     opts : ``pauli``, ``same_side``, ``occupation`` (red twins only).
     """
     from tdagw.model import flat_k_rows
