@@ -96,6 +96,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
     def phase(name):
         """One named constructor stage; its wall adds to ``walls[name]`` (the per-map summary)."""
         started = time.monotonic()
+        if getattr(meta, "shared_pole_capacity", None) is not None:
+            meta.shared_pole_capacity.at_phase()
         with timing.section("spole." + name):
             yield
         walls[name] = walls.get(name, 0.0) + time.monotonic() - started

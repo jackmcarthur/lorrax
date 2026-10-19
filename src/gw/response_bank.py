@@ -984,6 +984,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     def execute(kernel, args, stage, runtime_bytes=0):
         """``runtime_bytes``: what the executable draws at run time outside its
         buffer assignment (mathdx mode 11's split arm), admitted with it."""
+        meta.shared_pole_capacity.at_phase()
         with timing.section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
             executable = _compiled(kernel, args)

@@ -361,6 +361,7 @@ class CapacityLedger:
         if self.device_budget_bytes_per_rank <= 0:
             raise ValueError("capacity device budget must be positive")
         self.baseline_bytes_per_rank = self._bytes(baseline_bytes)
+        self.room_bytes = None           # the device room at the last agreed phase point
         self.entries = []
         self._accepted = {}
         self._live_stages = None
@@ -432,6 +433,13 @@ class CapacityLedger:
         memory.book(self.price(row), stage=runs_in)
         return copy.deepcopy(row)
 
+    def at_phase(self):
+        """Read the device room (``lxkit.memory.room``) at an agreed phase point: the ledger
+        bind, a constructor phase's entry, a bank kernel's admission (every process enters)."""
+        from lxkit import memory
+        if "budget" in memory.run():
+            self.room_bytes = int(memory.room(bucketed=False))
+
     def price(self, row):
         """A ledger row as THE Price admission, receipt and sizing use: its own bytes and its
         live concurrent rows (face-tiled: spread over the mesh) beside the driver's arrays live
@@ -467,7 +475,10 @@ class CapacityLedger:
             self._accepted[name]['resident_bytes_per_rank']
             + self._accepted[name]['workspace_bytes_per_rank'] for name in live)
         scaling_passed = total <= self.limit_bytes_per_rank
-        available = max(0, self.device_budget_bytes_per_rank - self.baseline_bytes_per_rank)
+        # The room read at the last agreed phase point (at_phase) with the live rows it already
+        # holds handed back; a standalone ledger (no room read) prices against its budget.
+        available = (max(0, self.device_budget_bytes_per_rank - self.baseline_bytes_per_rank)
+                     if self.room_bytes is None else self.room_bytes + total - resident - workspace)
         passed = total <= available
         g = self.geometry
         max_ranks = math.floor(self.limit_bytes_per_rank * g['px'] * g['py'] / total) if total else None
@@ -1239,6 +1250,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     baseline = max(0, budget - memory.room(bucketed=False))
     meta.shared_pole_capacity = CapacityLedger(
         meta, mesh_xy=mesh_xy, device_budget_bytes=budget, baseline_bytes=baseline)
+    meta.shared_pole_capacity.room_bytes = budget - baseline
     print_fn(f"shared-pole ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "
              f"live outside the ledger at bind (the driver's arrays); admissions see "
              f"{(budget - baseline) / 1e9:.2f} GB/rank")
