@@ -767,7 +767,7 @@ def _compute_V_q_g_flat_tiles(
         s['v'] = v
 
     # ---- G panel and q-tile from the V_q budget ------------------------
-    from common.gpu_utils import record_stage_price
+    from lxkit import memory
     budget = _vq_budget_bytes(budget_bytes)
     # A ζ q-tile read stages each rank's slab in its phdf5 file context's host
     # buffer (``ctx->read_buf``); the context retires a buffer above 32 MiB
@@ -779,7 +779,7 @@ def _compute_V_q_g_flat_tiles(
               n_sub=n_sub if s['one_leg'] else 0) for s in specs],
         rows=mu_pad, n_q=n_q_ibz, ngkmax=ngkmax, mesh_xy=mesh_xy,
         g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
-    record_stage_price(f"V_q, vq_tile_bytes q_tile={q_tile}", priced['priced'])
+    memory.book(memory.priced(priced['priced'], f"V_q, vq_tile_bytes q_tile={q_tile}"))
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:

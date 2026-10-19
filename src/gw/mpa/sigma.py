@@ -1370,7 +1370,7 @@ class SynthesisTau:
             # kernel's row passes), from the window executable
             # (runtime.aot_memory): its new bytes beside the synthesis's resident
             # operands plus the synthesis GEMM's native workspace.
-            from common.gpu_utils import record_stage_price
+            from lxkit import memory
             got = int(peak.resident_increment) + int(self._native)
             shape = (f"{plan['passes']} row pass(es)" if "passes" in plan
                      else f"d={plan['d']}/{plan['ns']}")
@@ -1379,8 +1379,9 @@ class SynthesisTau:
             second = 3 * self._synthesis.tile_bytes if self.overlap else 0
             if second:
                 shape += ", two nodes per trip"
-            record_stage_price(f"Sigma tau, compiled window {shape}",
-                               counted + max(plan["new"] + second, got), section="sigma.tau_sweep")
+            memory.book(memory.priced(counted + max(plan["new"] + second, got),
+                                      f"Sigma tau, compiled window {shape}"),
+                        stage="sigma.tau_sweep")
 
 
 def _sigma_window_table(accumulator, synthesis, plan, capacity):
