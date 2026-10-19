@@ -10,7 +10,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax import shard_map
 
 from common import rank_criterion
-from common import spectral_closure
 from runtime.padding import (
 	bounded_partition_tile,
 	solve_at_logical,
@@ -1294,90 +1293,13 @@ def _identity_pad_block_diagonal(
     return jax.lax.with_sharding_constraint(M_id_pad, sharding)
 
 
-# Replication cap for the mesh-INVARIANT charge factor: together with
-# ``_REPLICATED_FACTOR_MAX_BATCH_BYTES`` it bounds the one q-batch the
-# replicated rank-truncated eigh holds per device (see
-# :func:`_replicate_rank_truncate_ok`).  Raise it with
-# LORRAX_ZETA_REPLICATE_CAP_GIB when the device budget allows.
-_REPLICATED_CHOL_MAX_STACK_BYTES = int(
-    float(os.environ.get("LORRAX_ZETA_REPLICATE_CAP_GIB", "4")) * 1024**3)
-
-
-def _replicate_rank_truncate_ok(nq: int | None, n_rmu: int | None) -> bool:
-    """True when the rank-truncating charge factor can run replicated; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    if nq is None or n_rmu is None:
-        return False
-    n = int(n_rmu)
-    batch = _replicated_factor_q_chunk(int(nq), n)
-    return batch * n * n * 16 <= max(_REPLICATED_CHOL_MAX_STACK_BYTES,
-                                     _REPLICATED_FACTOR_MAX_BATCH_BYTES)
-
-
-#: Per-channel tail of :func:`_rank_truncate_capacity_error`.  Only the
-#: charge channel runs a rank-truncating factor.
-_RANK_TRUNCATE_CHANNEL_ADVICE = {
-    'charge': (
-        "The charge channel's ζ is route G's, which needs this whole-tile "
-        "factor; there is no distributed charge factor."),
-}
-
-
-def _rank_truncate_capacity_error(nq, n_rmu, *, channel: str) -> ValueError:
-    """THE refusal for a replicated rank-truncating eigh that will not fit; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    stack = (int(nq) * int(n_rmu) ** 2 * 16 / 1024**3
-             if nq and n_rmu else 0.0)
-    batch = (_replicated_factor_q_chunk(int(nq), int(n_rmu))
-             if nq and n_rmu else 1)
-    need = (batch * int(n_rmu) ** 2 * 16 / 1024**3
-            if nq and n_rmu else 0.0)
-    # The exact mu ceiling this route carries, from the two 4 GiB caps:
-    # batch collapses to 1 once one (mu, mu) c128 matrix exceeds
-    # _REPLICATED_FACTOR_MAX_BATCH_BYTES, so the criterion reduces to
-    # mu <= sqrt(max(cap, factor_cap) / 16).
-    cap = max(_REPLICATED_CHOL_MAX_STACK_BYTES,
-              _REPLICATED_FACTOR_MAX_BATCH_BYTES)
-    mu_max = int(math.isqrt(cap // 16))
-    key, mu_name = 'charge_zeta_solve', 'n_mu'
-    try:
-        advice = _RANK_TRUNCATE_CHANNEL_ADVICE[channel]
-    except KeyError:  # pragma: no cover - programming error
-        raise AssertionError(f"unknown channel {channel!r}") from None
-    return ValueError(
-        f"{key}='rank_truncate' needs the replicated factor, and the "
-        f"binding limit is ONE q-batch, not the stack: batch={batch} x "
-        f"({mu_name}={n_rmu})^2 x 16 B = {need:.2f} GiB > the "
-        f"{cap / 1024**3:.2f} GiB per-batch cap.  "
-        f"(The whole CCT stack, nq={nq}, is {stack:.2f} GiB -- context "
-        f"only; it is NOT what failed.)  On this route the replicated "
-        f"factor is allocated one q-batch at a time, so the ceiling is "
-        f"{mu_name} <= {mu_max}.  "
-        f"Set LORRAX_ZETA_REPLICATE_CAP_GIB={-(-need // 1) + 1:.0f} to "
-        f"clear it if the device budget allows -- but note the factor "
-        f"is a dense whole-tile eigh per q (q-parallel over devices "
-        f"above the fold threshold, so per-rank ceil(nq/P)*{mu_name}^3; "
-        f"the ALL-RANKS execution measured 4712 s at n_mu=10015 on "
-        f"64 ranks, so ~20 h at n_mu=24933 before the fold and still "
-        f"hours-per-q after it): raising the "
-        f"cap makes this RESOLVE, not finish.  {advice}")
-
-
-def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, *,
-                         n_rmu: int | None = None,
-                         nq: int | None = None) -> str:
-    """Resolve ``auto`` to the one factor each ζ channel runs; see docs/architecture/zeta_fit_face_psi_cct.md.
-
-    A current channel (``vertex_mu_L != 0``) runs the hoisted pivoted LU
-    (``'lu'``).  The charge channel runs the replicated rank-truncated
-    pseudo-inverse (``'replicated_rank_truncate'``), and refuses when one
-    q-batch of it cannot be held replicated (:func:`_rank_truncate_capacity_error`).
-    """
+def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, **_) -> str:
+    """Resolve ``auto`` to the one factor each ζ channel runs: a current channel's hoisted
+    pivoted LU (``'lu'``), the charge channel's certified face Cholesky (``'cholesky'``,
+    :mod:`isdf.cplus`); see docs/architecture/zeta_fit_face_psi_cct.md."""
     if solver_kind != 'auto':
         return solver_kind
-    if int(vertex_mu_L) != 0:
-        return 'lu'
-    if not _replicate_rank_truncate_ok(nq, n_rmu):
-        raise _rank_truncate_capacity_error(nq, n_rmu, channel='charge')
-    return 'replicated_rank_truncate'
+    return 'lu' if int(vertex_mu_L) != 0 else 'cholesky'
 
 
 # ---------------------------------------------------------------------------
@@ -1440,177 +1362,16 @@ def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
     return val
 
 
-_replicated_chol_cache = {}  # replicated dense charge-factor kernel (keyed by shape)
-
-
-def _closure_mode():
-    # The DRIVER reads the dial and passes it: ``common.spectral_closure`` is
-    # L2 mathematics and ``tests/test_layering.py`` requires it to be a
-    # function of its arguments.  The variable's NAME is still declared once,
-    # in the guard module, so nothing is duplicated but the lookup itself.
-    return spectral_closure.resolve_mode(os.environ.get(spectral_closure.MODE_ENV))
-
-
-def _policy_mode():
-    # The DRIVER reads the dial and passes it — same rule as _closure_mode.
-    return rank_criterion.resolve_policy_mode(os.environ.get(rank_criterion.POLICY_MODE_ENV))
-
-
-def _close_the_cut(spectrum, keep, *, where: str):
-    """Move a ζ rank cut off any degenerate block it slices, by DROPPING the block; ``(keep, figures)``, the figures for :func:`_report_the_cut`; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    mode = _closure_mode()
-    if mode == "off":
-        return keep, {}
-    keep_new, n_pre, n_post = spectral_closure.close_keep_mask(
-        spectrum, keep, rtol=spectral_closure.DEFAULT_RTOL)
-    return (keep_new if mode == "snap" else keep), {"closure": (n_pre, n_post)}
-
-
-def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> None:
-    """The host half of :func:`_close_the_cut` and :func:`_certify_the_cut`: their notices and findings.
-
-    The figures leave the factor program as outputs, so it holds no host
-    callback and JAX's persistent cache stores it (claim 3255).
-    """
-    if "closure" in figures:
-        n_pre, n_post = figures["closure"]
-        mode = _closure_mode()
-        # ``!=``, not ``>``: the default direction moves the rank DOWN.  A ``>``
-        # here would have read every firing as silence after the flip, which is
-        # the shape of a guard that reports a clean bill for the wrong reason.
-        if np.any(n_post != n_pre):
-            print(f"*** [spectral-closure] {where}: the rank cut falls INSIDE "
-                  "a degenerate block of the ISDF Gram on at least one q of this "
-                  f"batch — retained rank/q {n_pre} closes at {n_post} (the whole straddled "
-                  "block is DROPPED, owner ruling 2026-08-10).  A cut through a "
-                  "degenerate block retains a symmetry-ARBITRARY slice of an "
-                  "eigenspace, so zeta's span differs between q and Sq and the "
-                  f"k-star identity fails for W and Sigma_x alike.  Mode={mode}. ***", flush=True)
-            if mode == "strict":
-                spectral_closure.note_device_snap(where, n_pre.max(), n_post.max())
-    if "certify" in figures:
-        kappa, n_drop, dropped_w, over = figures["certify"]
-        if np.any(over):
-            kcert = ("uncertified" if kappa_certified is None
-                     else f"{float(kappa_certified):.3e}")
-            print(f"*** [rank-policy] {where}: the rank cut BOUND and left "
-                  f"the certified regime on at least one q.  rcond={float(rcond):.1e} "
-                  f"(cap 1/rcond={1.0 / float(rcond):.3e}), certified kappa ceiling "
-                  f"{kcert}.  n_drop/q={n_drop} kappa/q={kappa} discarded_weight/q={dropped_w} "
-                  f"(ceiling {rank_criterion.DISCARDED_WEIGHT_MAX:.1e}). "
-                  "A cut that binds at kappa >= ~1e10 is measured wrong by "
-                  "electron-volts (R19 rcond ladder; Si 4x4x4 1776 centroids -> "
-                  f"Sigma_c MAE 54.4 eV at exit 0).  Mode={_policy_mode()}. ***", flush=True)
-            rank_criterion.note_device_finding(
-                where,
-                "the cut bound (max %d directions dropped on one q) at "
-                "kappa_eff up to %.3e against a certified ceiling of %s, "
-                "discarding up to %.3e of tr|C|.  Reduce the centroid "
-                "budget, or raise zeta_rcond back onto the certified "
-                "plateau (1e-8 .. 1e-4)."
-                % (int(n_drop.max()), float(kappa.max()), kcert, float(dropped_w.max())))
-
-
-def _certify_the_cut(spectrum, keep, *, kappa_certified, exclude=None):
-    """GATE the ζ rank cut against the certified regime: the figures for :func:`_report_the_cut`; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    if _policy_mode() == "off":
-        return {}
-    mag = jnp.abs(spectrum)
-    # ``exclude`` marks positions that are not physics at all — the
-    # distributed tier's identity pad.  They are removed from EVERY
-    # reduction rather than being called kept or dropped, because either
-    # label makes a finding a function of the device count.
-    phys = jnp.ones(mag.shape, dtype=bool) if exclude is None else ~exclude
-    mag = jnp.where(phys, mag, 0.0)
-    keep = keep & phys
-    mag_max = jnp.max(mag, axis=-1)
-    mag_min_kept = jnp.min(jnp.where(keep, mag, jnp.inf), axis=-1)
-    kappa = mag_max / mag_min_kept
-    n_drop = jnp.sum(phys & ~keep, axis=-1)
-    tot = jnp.sum(mag, axis=-1)
-    dropped_w = jnp.sum(jnp.where(keep, 0.0, mag), axis=-1) / jnp.where(
-        tot > 0.0, tot, 1.0)
-    bound = n_drop > 0
-    over_w = bound & (dropped_w > rank_criterion.DISCARDED_WEIGHT_MAX)
-    if kappa_certified is None:
-        over_k = jnp.zeros_like(bound)
-    else:
-        over_k = bound & (kappa > float(kappa_certified))
-    return {"certify": (kappa, n_drop, dropped_w, over_k | over_w)}
-
-
-def _charge_factor_math(C_log, *, n_log: int, rcond: float, rank_log: bool):
-    """The per-q dense factor arithmetic — ONE kernel, shared bit-for-bit by the all-ranks (replicated) and q-parallel executions of the replicated plan (:func:`_factor_c_q_replicated`, :func:`_factor_c_q_replicated_qparallel`): ``(F, figures)`` (``isdf.cplus.factor``); see docs/architecture/zeta_fit_face_psi_cct.md."""
-    from isdf import cplus
-    return cplus.factor(C_log, rcond=rcond, rank_log=rank_log, n_log=n_log)
-
-
-def _factor_at_logical(C, n_log, rcond, constrain=lambda c: c):
-    """:func:`_charge_factor_math` at the logical extent, zero-embedded: ``(F, figures)``."""
-    figures = []
-
-    def _factor_log(C_log):
-        F, got = _charge_factor_math(constrain(C_log), n_log=n_log, rcond=rcond, rank_log=True)
-        figures.append(got)
-        return F
-    return solve_at_logical(_factor_log, n_log, (C,), pad_axes=(-2, -1)), figures[0]
-
-
 def solve_zeta_charge_dense(C, Z, *, charge_zeta_solve: str,
                             zeta_rcond: float, rank_log: bool = True):
     """THE producer's charge-ζ solve on ONE whole, unpadded (n_μ, n_μ) tile: ``(ζ, figures)``, the figures for ``isdf.cplus.report`` after the program; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    mode = str(charge_zeta_solve).strip().lower()
-    if mode == 'cholesky':
-        raise ValueError("solve_zeta_charge_dense: charge_zeta_solve='cholesky' is retired (2026-09-25); the charge solve is 'rank_truncate' — refit this ζ.")
-    if mode != 'rank_truncate':
+    del rank_log
+    if str(charge_zeta_solve).strip().lower() not in ('cholesky', 'rank_truncate'):
         raise ValueError(
-            f"solve_zeta_charge_dense: charge_zeta_solve={charge_zeta_solve!r} "
-            f"is not a charge-channel solve.  Expected 'rank_truncate'.  The "
-            f"transverse ridge family solves an INDEFINITE CCT and does not "
-            f"belong on this entry point.")
-    n_log = int(C.shape[-1])
-    F, figures = _charge_factor_math(
-        C[None, ...], n_log=n_log, rcond=float(zeta_rcond),
-        rank_log=bool(rank_log))
+            f"solve_zeta_charge_dense: charge_zeta_solve={charge_zeta_solve!r} is not a charge-channel "
+            f"solve; the charge solve is the certified Cholesky ('cholesky'; 'rank_truncate' names it too).")
     from isdf import cplus
-    return cplus.apply(F[0], Z), figures
-
-
-def _factor_c_q_replicated(
-    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-    zeta_rcond: float = ZETA_RCOND_DEFAULT,
-) -> jax.Array:
-    """Dense, fully REPLICATED rank-truncated factor of the identity-padded charge CCT; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    nq, n_rmu, _ = C_q.shape
-    n_log = int(n_rmu_logical)
-    # Deprecated env twin of the charge input key.
-    rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    rep_sh = NamedSharding(mesh_xy, P())
-    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond))
-    if key not in _replicated_chol_cache:
-        _rc = rcond
-        @partial(jax.jit, out_shardings=(out_sh, rep_sh))
-        def _fn(C):
-            # Replicate the logical block so every device factors the
-            # WHOLE matrix — this is what makes the factor grid-agnostic
-            # (a block-cyclic accumulation would not be).
-            # The arithmetic itself lives in ``_charge_factor_math`` —
-            # ONE traced kernel shared with the q-parallel execution so
-            # the two schedules cannot drift (bit-identity contract).
-            F_log, figures = _factor_at_logical(
-                C, n_log, _rc, lambda c: jax.lax.with_sharding_constraint(c, rep_sh))
-            # Pad-block factor = identity (√1 = 1 for L; for B the pad block
-            # is sliced off in the back-solve, so identity is just a
-            # non-singular filler): re-embed via the shared helper (no-op
-            # when n_log == n_rmu).
-            return _identity_pad_block_diagonal(
-                F_log, n_rmu_logical=n_log, mesh_xy=mesh_xy), figures
-        _replicated_chol_cache[key] = _fn
-    from isdf import cplus
-    F, figures = _replicated_chol_cache[key](C_q)
-    cplus.report(figures, rcond=rcond, n_log=n_log)
-    return F
+    return cplus.dense(C, Z, rcond=float(zeta_rcond))
 
 
 # Largest REPLICATED q-batch handed to one dense factor call.  The factor is
@@ -1624,28 +1385,9 @@ _REPLICATED_FACTOR_MAX_BATCH_BYTES = 4 * 1024**3
 
 
 def _replicated_factor_q_chunk(nq: int, n_rmu: int) -> int:
-    """q-batch size for :func:`factor_c_q_replicated_batched`."""
+    """q-batch size of the hoisted transverse LU (:func:`_factor_c_q_transverse_lu`)."""
     per_q = max(1, int(n_rmu) ** 2 * 16)
     return max(1, min(int(nq), _REPLICATED_FACTOR_MAX_BATCH_BYTES // per_q))
-
-
-def factor_c_q_replicated_batched(
-    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int, **kw
-) -> jax.Array:
-    """:func:`_factor_c_q_replicated` over q in bounded batches; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    nq, n_rmu, _ = C_q.shape
-    if _qparallel_factor_ok(nq, int(n_rmu_logical), mesh_xy):
-        _qparallel_announce(nq, n_rmu, int(n_rmu_logical), mesh_xy)
-        return _factor_c_q_replicated_qparallel(
-            C_q, mesh_xy, n_rmu_logical, **kw)
-    step = _replicated_factor_q_chunk(nq, n_rmu)
-    if step >= nq:
-        return _factor_c_q_replicated(C_q, mesh_xy, n_rmu_logical, **kw)
-    parts = [_factor_c_q_replicated(C_q[q0:min(q0 + step, nq)], mesh_xy,
-                                    n_rmu_logical, **kw)
-             for q0 in range(0, nq, step)]
-    return jax.device_put(jnp.concatenate(parts, axis=0),
-                          NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
 
 # ---------------------------------------------------------------------------
@@ -1684,7 +1426,6 @@ def factor_c_q_replicated_batched(
 # LORRAX_ZETA_QPARALLEL (below) is the schedule escape hatch / test hook.
 _QPARALLEL_MIN_NQ_MU3 = 5.0e9
 
-_qparallel_factor_cache: dict = {}
 _qparallel_announced: set = set()
 
 
@@ -1699,110 +1440,6 @@ def _qparallel_factor_ok(nq: int, n_rmu_logical: int, mesh_xy: Mesh) -> bool:
                 and float(nq) * float(n_rmu_logical) ** 3
                 >= _QPARALLEL_MIN_NQ_MU3)
     return env_bool("LORRAX_ZETA_QPARALLEL", False)
-
-
-def _qparallel_announce(nq: int, n_rmu: int, n_log: int,
-                        mesh_xy: Mesh) -> None:
-    """One line naming the schedule the factor actually runs (rank 0,
-    deduplicated) — a fold that silently stopped engaging would otherwise
-    be invisible until the 105-s stage reappeared."""
-    if jax.process_index() != 0:
-        return
-    ndev = int(mesh_xy.devices.size)
-    sig = (_mesh_key(mesh_xy), int(nq), int(n_rmu), int(n_log))
-    if sig in _qparallel_announced:
-        return
-    _qparallel_announced.add(sig)
-    from runtime.padding import padded_axis
-    q_axis = padded_axis(
-        int(nq), mesh_xy, name="zeta-factor q carrier",
-        spec=P(('x', 'y'), None, None), axis=0)
-    blk = q_axis.carrier // ndev
-    print(f"  [zeta factor] replicated plan, q-parallel execution: "
-          f"nq={nq} scattered over {ndev} devices "
-          f"(ceil(nq/P)={blk} whole ({n_rmu},{n_rmu}) tile(s)/device, "
-          f"q-pad {q_axis.pad}); factors are "
-          f"bit-identical to the all-ranks execution "
-          f"(LORRAX_ZETA_QPARALLEL=0 restores it)", flush=True)
-
-
-def _factor_c_q_replicated_qparallel(
-    C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-    zeta_rcond: float = ZETA_RCOND_DEFAULT,
-) -> jax.Array:
-    """The replicated charge factor, EXECUTED q-parallel; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    nq, n_rmu, _ = C_q.shape
-    n_log = int(n_rmu_logical)
-    # Deprecated env twin of the charge input key.
-    rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
-    ndev = int(mesh_xy.devices.size)
-    py = int(mesh_xy.shape['y'])
-    from runtime.padding import padded_axis
-    nq_pad = padded_axis(
-        int(nq), mesh_xy, name="zeta-factor q carrier",
-        spec=P(('x', 'y'), None, None), axis=0).carrier
-    out_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
-    q_sh = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-    mid_sh = NamedSharding(mesh_xy, P('x', None, 'y'))
-
-    key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, float(rcond))
-    if key not in _qparallel_factor_cache:
-        _rc = rcond
-        blk = nq_pad // ndev
-
-        def _local_factor(C_loc):
-            # C_loc: (blk, n_rmu, n_rmu) — whole tiles for the q's this
-            # device owns (global q of local slot i = dev·blk + i, in the
-            # ('x','y') row-major order the flattened q-shard uses).
-            dev = jax.lax.axis_index('x') * py + jax.lax.axis_index('y')
-
-            def _fact(C1):
-                return _factor_at_logical(C1, n_log, _rc)
-
-            # A q-pad slot factors nothing: zeros of the factor's and the
-            # figures' shapes, sliced off below.
-            shapes = jax.eval_shape(_fact, C_loc[:1])
-
-            def _skip(C1):
-                return jax.tree.map(lambda s: jnp.zeros(s.shape, s.dtype), shapes)
-
-            def _one(i, acc):
-                C1 = jax.lax.dynamic_slice_in_dim(C_loc, i, 1, axis=0)
-                got = jax.lax.cond(dev * blk + i < nq, _fact, _skip, C1)
-                return jax.tree.map(
-                    lambda a, g: jax.lax.dynamic_update_slice_in_dim(a, g, i, axis=0), acc, got)
-
-            return jax.lax.fori_loop(0, blk, _one, jax.tree.map(
-                lambda s: jnp.zeros((blk,) + s.shape[1:], s.dtype), shapes))
-
-        _sm = shard_map(_local_factor, mesh=mesh_xy,
-                        in_specs=P(('x', 'y'), None, None),
-                        out_specs=(P(('x', 'y'), None, None), P(('x', 'y'))),
-                        check_vma=False)
-
-        @partial(jax.jit, out_shardings=(out_sh, NamedSharding(mesh_xy, P())))
-        def _fn(C):
-            if nq_pad > nq:
-                C = jnp.pad(C, ((0, nq_pad - nq), (0, 0), (0, 0)))
-            # Single-axis staging both ways: the composite reshard makes
-            # SPMD replicate-then-partition (the w_isdf reshard_mid
-            # measurement); each stage moves ONE mesh axis.
-            C = jax.lax.with_sharding_constraint(C, mid_sh)
-            C = jax.lax.with_sharding_constraint(C, q_sh)
-            F, figures = _sm(C)
-            F = F[:nq]
-            F = jax.lax.with_sharding_constraint(F, mid_sh)
-            # Pad-block factor = identity — same re-embed (and same final
-            # P(None,'x','y') constraint) as the all-ranks execution;
-            # no-op when n_log == n_rmu.
-            return _identity_pad_block_diagonal(
-                F, n_rmu_logical=n_log, mesh_xy=mesh_xy), jax.tree.map(lambda a: a[:nq], figures)
-
-        _qparallel_factor_cache[key] = _fn
-    from isdf import cplus
-    F, figures = _qparallel_factor_cache[key](C_q)
-    cplus.report(figures, rcond=rcond, n_log=n_log)
-    return F
 
 
 # =============================================================================
@@ -2275,17 +1912,16 @@ def factor_c_q(
             eta_q, where="zeta transverse ridge (LU)")
         return LU_q, perm_q
 
-    solver_kind = _resolve_solver_kind(
-        0, solver_kind, n_rmu=n_rmu_logical, nq=int(nq))
-    if solver_kind != 'replicated_rank_truncate':
+    solver_kind = _resolve_solver_kind(0, solver_kind)
+    if solver_kind not in ('cholesky', 'rank_truncate'):
         raise ValueError(
             f"factor_c_q: unknown charge solver_kind {solver_kind!r}; the "
-            f"charge channel runs 'replicated_rank_truncate'.")
-    # The mesh-INVARIANT whole-tile charge factor: every q is factored as ONE
-    # dense rank-truncated eigh (q-parallel over devices above the fold
-    # threshold); see _factor_c_q_replicated.
-    return factor_c_q_replicated_batched(
-        C_q, mesh_xy, n_rmu_logical, zeta_rcond=zeta_rcond)
+            f"charge channel runs the certified face Cholesky ('cholesky').")
+    # The charge factor: a distributed Cholesky on the face, certified (kappa <= 1/rcond)
+    # or refused by name (isdf.cplus); ζ = C⁻¹Z is applied on the face per G tile.
+    from isdf import cplus
+    rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
+    return cplus.factor(C_q, mesh_xy, rcond=rcond, n_log=int(n_rmu_logical))
 
 
 def _lu_solve_local(LU, piv, Z):
@@ -2313,16 +1949,11 @@ def _zeta_logical_solvers(
             lambda LU_log, Z_log: _lu_solve_local(LU_log, piv, Z_log),
             n_log, (LU,), Z)
 
-    def _pinv_matmul_logical(B: jax.Array, Z: jax.Array) -> jax.Array:
-        """Charge rank-truncation back-solve at the LOGICAL μ extent: ζ = C⁺Z = B(BᴴZ), two matmuls (B is the pseudo-inverse factor, B Bᴴ = C⁺); see docs/architecture/zeta_fit_face_psi_cct.md."""
-        from isdf import cplus
-        return solve_at_logical(cplus.apply, n_log, (B,), Z)
-
-    return _ridge_indef_solve, _lu_apply_logical, _pinv_matmul_logical
+    return _ridge_indef_solve, _lu_apply_logical
 
 
-#: Solver kinds whose factor is a whole-tile ARRAY applied per q.
-_WHOLE_TILE_KINDS = frozenset({'replicated_rank_truncate', 'lu'})
+#: Solver kinds whose factor is a whole-tile ARRAY applied per q (the charge Cholesky is a face token).
+_WHOLE_TILE_KINDS = frozenset({'lu'})
 
 
 def _whole_tile_solve_kind(solver_kind):
