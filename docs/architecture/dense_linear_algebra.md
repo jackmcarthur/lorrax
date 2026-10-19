@@ -373,9 +373,10 @@ summation order:
 - a GEMM stage width changes how many parents share one exchange, and moves no
   number.
 
-The charge ζ factor is the one solve kept off the distributed route: its
-rank-truncating eigh would make the retained rank depend on the grid, which
-GN-PPM amplifies, so it is the replicated whole-tile eigh on every layout.
+The charge ζ factor is a distributed Cholesky on the face (`isdf.cplus`):
+it keeps every direction, so no retained rank depends on the grid; a κ
+certificate (power and inverse iteration) refuses where the old rank cut
+would have bound ([rank truncation](rank_truncation_policy.md)).
 
 ## 8 Portability {#portability}
 
@@ -415,8 +416,8 @@ With $\mu$ the padded centroid count and $Q$ the stage's q extent:
 | stage | `linalg = local` | `linalg = distributed` |
 |---|---|---|
 | ζ `C_q` build | `P(None,'x','y')`, $sQ\mu^2/P$ | same |
-| ζ charge factor (`rank_truncate`) | replicated whole-tile eigh pseudo-inverse, one q batch at a time under `LORRAX_ZETA_REPLICATE_CAP_GIB`; q-parallel above $Q\mu^3 \ge 5\cdot10^9$, $\lceil Q/P\rceil\mu^3$ work per device | same |
-| ζ back-solve, per G tile | whole-tile factor on its q owner, $s\lceil Q/P\rceil\mu^2$ per device; only the right-hand side moves | same |
+| ζ charge factor (`cholesky`) | certified face Cholesky per q (cuSOLVERMp potrf, SLATE potrf, native2d), $sQ\mu^2/P$ | same |
+| ζ back-solve, per G tile | charge: potrs (SLATE: two trsm) on the face; currents: whole-tile factor on its q owner, $s\lceil Q/P\rceil\mu^2$ per device; only the right-hand side moves | same |
 | ζ transverse factor (ridge LU) | whole-tile local LU once per q and channel, applied per G tile ([the solve seam](zeta_fit_mubatch.md#the-solve-seam)) | same |
 | W Dyson solve (`gw.w_isdf.solve_w`) | per-q dense LU, $\lceil Q/P\rceil$ whole $(\mu,\mu)$ tiles per device; the distributed plan when they do not fit the budget ([memory model § routes](memory-model.md#routes)) | `plan('solve_lu', backend='distributed').batched`, $sQ\mu^2/P$; the μ axes never leave the face |
 | W ladder resolvent (`bse.w_ladder`, `screening_diagrams = w_bse`) | one code path for both layouts; no whole-$\mu^2$ object per device | same |
