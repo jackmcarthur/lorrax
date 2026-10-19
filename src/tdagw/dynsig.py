@@ -1613,8 +1613,9 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                                                          poles_eq["model"]["path"]))
     if spm:                                             # the model's own W^c(0) (owner ruling)
         from gw.mpa.sigma import shared_pole_static_wc
-        W0c = shared_pole_static_wc(poles["model"], poles["meta"], mesh_xy=mesh,
-                                    rows=np.arange(int(meta.nk_tot)))
+        from gw.ppm_sigma import fresh_shared_pole_capacity
+        W0c = shared_pole_static_wc(poles["model"], fresh_shared_pole_capacity(poles["meta"], mesh),
+                                    mesh_xy=mesh, rows=np.arange(int(meta.nk_tot)))
     else:
         W0c = poles.Wc0_q                               # the run's W^c(0): the static limit's
     keep = None

@@ -1804,6 +1804,24 @@ def shared_pole_window_source(model: dict, meta, *, efermi_ry: float, linalg) ->
                 linalg=linalg)
 
 
+def fresh_shared_pole_capacity(meta, mesh_xy):
+    """A shallow copy of ``meta`` with its own shared-pole capacity ledger, no stage live.
+
+    The ledger (``gw.shared_pole_recipe.CapacityLedger``) prices one map's phases
+    under unique stage names; a window Sigma or a static-W call after the GW run
+    (TD-aGW, every refresh) is its own phase, so each gets a fresh ledger with no
+    upstream reservation live (the run's bank and constructor are gone by then).
+    """
+    import copy
+    from common.gpu_utils import device_budget_bytes
+    from .shared_pole_recipe import CapacityLedger
+    out = copy.copy(meta)
+    out.shared_pole_capacity = CapacityLedger(out, mesh_xy=mesh_xy,
+                                              device_budget_bytes=int(device_budget_bytes()))
+    out.shared_pole_capacity.live_stages = ()
+    return out
+
+
 def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal_bands, *,
                             request_for, omega_grid_ry, keep_branches, print_fn):
     """One window sweep of a shared-pole model: the run's shared-pole Σ stage on the window carrier.
@@ -2005,6 +2023,13 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
                          "shared_pole_static_wc); fix: pass static_limit_wc0")
     meta_src = poles.get("meta", meta) if spm else meta
     meta_t = dataclasses.replace(meta_src, b_id_3=int(meta.b_id_0) + b_hi)
+    if spm:
+        # The shared-pole Σ stage reads the map's recipe and census, set on the run's
+        # metadata as attributes outside its fields (gw_jax), which dataclasses.replace
+        # does not carry; its capacity ledger is this call's own.
+        fields_ = {f.name for f in dataclasses.fields(meta_src)}
+        meta_t.__dict__.update({k: v for k, v in vars(meta_src).items() if k not in fields_})
+        meta_t = fresh_shared_pole_capacity(meta_t, mesh_xy)
     head = None if internal == "frozen" else plan.get("head")
     nb_sig = int(slices_t.nb_sigma)
     built = {}
