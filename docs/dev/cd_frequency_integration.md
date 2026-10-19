@@ -116,9 +116,10 @@ chunks with `cd_stop_receipt.json`.
 `cd_applicability` (CD needs `compute_mode = mpa` and `screening_diagrams = w_rpa`; pole-model keys
 refuse), `cd_head_unimplemented` (`head_correction = off` only), `cd_linalg_local` (`linalg = local`
 only), `cd_band_extrapolation_unimplemented`, `cd_single_eta` (no per-window η), `cd_knot_step`,
-`cd_imaginary_nodes`, `cd_chi0_rule_tolerance`, `cd_chi0_rule_capacity`, `cd_own_energy_band_min`,
-`cd_checkpoint`, `cd_stop_after` (run time), `cd_residue_reach` / `cd_residue_coverage` (run time),
-`cd_chi0_rule` / `cd_chi0_rule_unfit` / `cd_chi0_rules_identity` / `cd_chi0_point_unplanned` (run time,
+`cd_imaginary_nodes`, `cd_chi0_rule_tolerance`, `cd_chi0_rule_capacity`, `cd_chi0_band_windows`,
+`cd_chi0_remote_margin_ev`, `cd_own_energy_band_min`, `cd_checkpoint`, `cd_stop_after` (run time), `cd_residue_reach` / `cd_residue_coverage` (run time),
+`cd_chi0_rule` / `cd_chi0_rule_unfit` / `cd_chi0_rules_identity` / `cd_chi0_point_unplanned` /
+`cd_chi0_band_windows` (run time,
 `gw.cd.chi0_rules`), `cd_sigma_x_identity`
 (run time: the CD pair densities must reproduce the static Σ_x to 1e-3 meV,
 `SIGMA_X_IDENTITY_TOL_MEV`; measured 3.3e-10 meV Fe, 2.1e-11 meV Si), `cd_finite`.
@@ -164,3 +165,27 @@ options, the snapped interval and envelope, the CD points and windows) and a cen
 (`FILE.census.csv`: window, provider, points, z ranges, nodes, sampled error, κ, wall).  The run loads
 `cd_chi0_rules_file` and refuses any identity mismatch; without it the rules are built in the job
 (rank-parallel, `_gather_group_rules`) and written to `cd_chi0_rules.pkl` beside the deck.
+
+### Band windows (`cd_chi0_band_windows = auto`)
+
+The whole-interval knot rules refuse on wide decks: a pole inside [lo, hi] with hi/η in the
+thousands (ZnO: (hi − lo)/η = 3705) fails the sampled-error test on every pencil geometry.  With
+`auto`, each knot window's pair space is split by band ranges (`chi0_rules.band_windows`; R = the
+window's max |Re z|, m = `cd_chi0_remote_margin_ev`):
+
+| window | occupied × empty bands | rule |
+|---|---|---|
+| crossing | [s, nocc) × [nocc, c) | `minimax.response_imaginary_rule` on its own [lo, hi]: t = i s, Gauss–Legendre, n = ⌈(hi − lo)/η · horizon/4⌉ nodes (≤ 2 × `cd_chi0_rule_capacity`), coefficient mass O(1) |
+| remote valence | [s, nocc) × [c, nb) | `minimax.response_laplace_rule` on its own interval (even-only where refused on a time-reversal deck) |
+| remote semicore | [0, s) × [nocc, nb) | as remote valence |
+
+c is the first empty band whose lowest energy exceeds E_VBM + R + m; s is the count of leading
+occupied bands whose top lies below E_CBM − (R + m); so every remote transition exceeds R + m.  The
+windows' band weights (f kept on the occupied range, u on the empty range, exact zeros elsewhere)
+partition f u, and each window's chi0 is a sum over its own pairs: their sum is the whole window's
+chi0.  Every group runs on the direct stream with its window's weights, references [max occupied, min
+empty] (reference lo, no gauge shift) and its kind's union band ranges (`chi0_rules.stream_rules`);
+`bank_chi0` adds the windows' rows.  A masked band of a union range keeps a finite exponential
+(`GATE cd_chi0_band_windows` past max Re t · excess = 300).  The band-window definitions are part of
+the rule identity (route `cd-windowed`); precompute with `--band-windows auto --remote-margin-ev M`.
+Windows whose points all lie below lo (the imaginary nodes) keep the whole-interval Laplace rule.

@@ -440,6 +440,32 @@ def _imaginary_panels(lo, hi, poles, tol, decay_rate, capacity, limit=RESPONSE_P
     return [times[j*m:(j+1)*m] for j in range(k)], fits
 
 
+def response_imaginary_rule(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, node_capacity=RESPONSE_NODE_CAPACITY,
+                            max_kappa=_RESPONSE_MAX_KAPPA):
+    """The closed-form imaginary-time rule of every pole of ``z_ry`` on one shared node set, or None.
+
+    :func:`_imaginary_times` on the forward and reverse poles of ``z_ry`` (:func:`_poles`) over the
+    transition interval [lo_ry, hi_ry] (Ry): t = i s, Gauss-Legendre in s on [0, horizon/eta],
+    n = ceil((hi - lo)/eta * horizon/4) nodes; the coefficients are the projection and acceptance of the
+    pencil groups (sampled error at rel_tol/2 per pole, coefficient-mass gate ``max_kappa``).  Returned
+    as :func:`_rule` rows (``t`` padded to ``node_capacity``, forward/reverse value and d/d(z^2) rows,
+    ``sampled_error``, ``coefficient_mass``) with ``reference_ry = lo_ry``, the projections' origin.
+    None when n exceeds ``node_capacity`` or a pole fails the acceptance.  The rule of a group whose
+    poles sit inside its interval, where the shift pencils' decaying nodes cannot carry them
+    (``ResponseGroupTree._attempt`` uses the same set as its fallback).
+    """
+    lo, hi = float(lo_ry), float(hi_ry)
+    z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
+    if (not z.size or not np.isfinite([lo, hi, rel_tol]).all() or not np.isfinite(z).all() or hi <= lo
+            or np.any(z.imag <= 0) or not 1e-13 <= rel_tol < .1 or int(node_capacity) < 8):
+        raise ValueError('invalid response frequency/domain/tolerance/capacity')
+    poles = _poles(z)
+    got = _imaginary_times(lo, hi, poles, rel_tol/2, 0., int(node_capacity), max_kappa)
+    if got is None:
+        return None
+    return dict(_rule(z, [(got[0], poles, got[1])], int(node_capacity)), reference_ry=lo)
+
+
 def _rule(z, sets, node_capacity=RESPONSE_NODE_CAPACITY):
     """Scatter pole fits on node sets into forward and reverse sample rows.
 

@@ -9,7 +9,8 @@ imaginary-probe, and regularized crossing screening rules in process. Sigma's
 complex denominator rectangles use ``analytic_box_rule``. The shared-pole W
 bank uses ``response_group_rules`` because it needs current-frequency value
 and derivative projections; the GN-PPM imaginary probe uses
-``response_laplace_rule``. ``response_bank_rule`` has no production caller. Finite-temperature
+``response_laplace_rule``; the CD band-windowed crossing window uses
+``response_imaginary_rule``. ``response_bank_rule`` has no production caller. Finite-temperature
 KMS response has ``matsubara_response_rule``. The GN-PPM odd kernel shares
 its even rule's times through ``augment_odd_laplace``. MPA's damped line and
 rectangle time rules are built through the four ``damped_*_rule`` names.
@@ -98,7 +99,8 @@ _DAMPED_RULE_NAMES = (
 )
 
 
-_RESPONSE_RULE_NAMES = ("RESPONSE_RULE_CAPACITY", "RESPONSE_NODE_CAPACITY", "RESPONSE_MAX_KAPPA", "response_bank_rule", "response_laplace_rule", "response_group_rules", "ResponseGroupTree")
+_RESPONSE_RULE_NAMES = ("RESPONSE_RULE_CAPACITY", "RESPONSE_NODE_CAPACITY", "RESPONSE_MAX_KAPPA", "response_bank_rule", "response_laplace_rule", "response_group_rules", "ResponseGroupTree",
+                        "response_imaginary_rule")
 
 # Finite-temperature bosonic Matsubara rules (KMS-bounded tau correlations).
 # SciPy (pivoted QR), so lazy.

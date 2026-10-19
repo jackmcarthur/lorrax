@@ -22,6 +22,16 @@ Green-pair sweep is that of its own members:
 Sampled errors are accepted against the tolerance exactly as in the bank; only the node capacity and
 the coefficient-mass gate are the CD's own (the bank's defaults are untouched).
 
+Band windows (deck ``cd_chi0_band_windows = auto``; :func:`band_windows`, :func:`band_plan`): a real-knot
+window's pair space is split by band ranges into a crossing window (valence x low empty bands, the pairs
+whose transitions can reach the window's points) and remote windows (valence x high empty bands; semicore
+x every empty band), every remote transition above max|Re z| + ``cd_chi0_remote_margin_ev``.  The
+crossing window takes the closed-form imaginary-time rule ``minimax.response_imaginary_rule`` on its own
+interval, each remote window the Laplace rule on its own interval (:func:`_laplace_group`), and every
+group runs on the same direct stream with its window's band weights, references and band ranges
+(:func:`stream_rules`).  The windows' band weights partition f u exactly, so their sum is the whole
+window's chi0.  ``off`` (the default) is the route above, bitwise.
+
 Precompute: ``python -m gw.cd.chi0_rules`` builds the same rules from the energy table and the CD
 geometry and writes them with their identity (:func:`rule_identity`); a CD run given
 ``cd_chi0_rules_file`` loads them and refuses any mismatch (GATE cd_chi0_rules_identity).
@@ -53,6 +63,14 @@ CD_KAPPA_ROUNDING_SHARE = 1e-2
 #: A point the Laplace certificate refuses takes the bank tree when its pencil has at most this many
 #: samples (the real-knot windows' pencils are 16,619 on the ZnO deck: ~44 GB of host memory).
 CD_FALLBACK_PENCIL_SIZE = 20000
+#: ``cd_chi0_remote_margin_ev`` default: a remote band window's lowest transition exceeds the chunk's
+#: max |Re z| by more than this (eV), which bounds the Laplace rule's degree (ratio (hi + R)/(lo - R)).
+CD_REMOTE_MARGIN_EV = 4.0
+#: Band-window kinds, in group order (``band_window`` of a rule group indexes :func:`band_plan`'s defs).
+BAND_WINDOW_KINDS = ("crossing", "remote_valence", "remote_semicore")
+#: Largest exponent a masked band of a kind's union band range may reach on a band window's stream,
+#: max Re t * (e - refs) (its weight is an exact zero; the exponential must stay finite).
+CD_MASKED_EXPONENT_MAX = 300.0
 _PLAN_KEYS = ("lo", "hi", "decay_rate", "amplitude", "metallic", "reference")
 _SLICED = ("value", "derivative", "sampled_error", "coefficient_mass")
 
@@ -107,6 +125,138 @@ def window_members(imag, real):
     return np.asarray(list(index), dtype=np.complex128), windows
 
 
+# ------------------------------------------------------------------------------- band windows
+def band_windows(energy, f, u, z, margin_ry):
+    """Band windows of one CD chunk: crossing, remote valence x high empty, remote semicore x every empty.
+
+    ``energy``, ``f``, ``u`` [nk, nb] (Ry; the response support's band table and sample weights on the
+    full or wedge k grid, an insulator: the occupied bands [o0, o1) lie below the empty bands [e0, e1));
+    ``z`` the chunk's points (Ry); ``margin_ry`` > 0.  With R = max |Re z|:
+
+    * empty cut c: the first empty band whose lowest energy exceeds E_VBM + R + margin (``E_c``);
+    * semicore s: the leading occupied bands whose highest energy lies below E_CBM - (R + margin).
+
+    Returns window dicts ``kind``, ``occ`` = [b0, b1), ``emp`` = [b0, b1) (half-open band ranges), ``lo``,
+    ``hi`` (Ry: the window's transition interval over every k pair), ``refs`` = [max occupied energy, min
+    empty energy] (so refs[1] - refs[0] = lo), ``reach`` = R.  Kinds present: crossing [s, o1) x [e0, c);
+    remote_valence [s, o1) x [c, e1); remote_semicore [o0, s) x [e0, e1).  Every (occupied, empty) band
+    pair lies in exactly one window (the partition), and every remote window has lo > R + margin.
+    """
+    energy, f, u = (np.asarray(a, dtype=np.float64) for a in (energy, f, u))
+    occ = np.flatnonzero(np.any(f != 0, axis=0))
+    emp = np.flatnonzero(np.any(u != 0, axis=0))
+    if (not occ.size or not emp.size or not np.array_equal(occ, np.arange(occ[0], occ[-1] + 1))
+            or not np.array_equal(emp, np.arange(emp[0], emp[-1] + 1)) or occ[-1] >= emp[0]):
+        raise ValueError("GATE cd_chi0_band_windows: got: occupied/empty band supports that overlap or are not "
+                         "contiguous; want: an insulator (the occupied bands below the empty bands, no band in "
+                         "both); why: the windows are band ranges whose products partition f u")
+    o0, o1, e0, e1 = int(occ[0]), int(occ[-1]) + 1, int(emp[0]), int(emp[-1]) + 1
+    low, high = energy.min(axis=0), energy.max(axis=0)          # per band over k (star-invariant)
+    vbm, cbm = float(high[o0:o1].max()), float(low[e0:e1].min())
+    reach = float(np.abs(np.asarray(z, dtype=np.complex128).real).max())
+    cut = reach + float(margin_ry)
+    s = o0
+    while s < o1 and high[s] < cbm - cut:
+        s += 1
+    c = e0
+    while c < e1 and not low[c] - vbm > cut:
+        c += 1
+
+    def window(kind, oa, ob, ea, eb):
+        top, bottom = float(high[oa:ob].max()), float(low[ea:eb].min())
+        return dict(kind=kind, occ=[oa, ob], emp=[ea, eb], lo=bottom - top,
+                    hi=float(high[ea:eb].max() - low[oa:ob].min()), refs=[top, bottom], reach=reach)
+    out = []
+    if s < o1 and e0 < c:
+        out.append(window("crossing", s, o1, e0, c))
+    if s < o1 and c < e1:
+        out.append(window("remote_valence", s, o1, c, e1))
+    if o0 < s:
+        out.append(window("remote_semicore", o0, s, e0, e1))
+    return out
+
+
+def band_plan(wfns, meta, support, points, windows, pid, margin_ry, *, route="cd"):
+    """The band windows of every real-knot CD window: ``dict(margin_ry, defs, per_window, ranges)``.
+
+    A CD window whose points all have |Re z| < lo keeps the whole-interval Laplace route and has no band
+    windows.  ``defs`` are the distinct :func:`band_windows` dicts (``reach`` dropped); ``per_window``
+    ``[[window index, [def indices]], ...]``; ``ranges`` ``{kind: [[o0, o1], [e0, e1]]}`` the union band
+    ranges of each kind (compiled into that kind's direct stream; a window's bands outside its own ranges
+    carry exact-zero weight).  Deterministic in the energy table, so it is part of the rule identity.
+    """
+    from gw import response_bank as rb
+    if route != "cd" or pid["decay_rate"] != 0.0 or pid["metallic"] or not pid["lo"] > 0.0:
+        raise ValueError("GATE cd_chi0_band_windows: got: a metallic / decaying response support or the bank "
+                         "route; want: an insulating support on the CD windows; why: the windows split an "
+                         "insulator's occupied and empty bands")
+    f, u = np.asarray(support["f"]), np.asarray(support["u"])
+    energy = rb.response_weights(wfns, meta)[0][:, :f.shape[-1]]
+    points = np.asarray(points, dtype=np.complex128)
+    defs, per_window, key = [], [], {}
+    for i, w in enumerate(windows):
+        z = points[list(w["members"])]
+        if np.all(np.abs(z.real) < pid["lo"]):
+            continue
+        ids = []
+        for bw in band_windows(energy, f, u, z, margin_ry):
+            k = (bw["kind"], tuple(bw["occ"]), tuple(bw["emp"]))
+            if k not in key:
+                key[k] = len(defs)
+                defs.append({k2: v for k2, v in bw.items() if k2 != "reach"})
+            ids.append(key[k])
+        per_window.append([int(i), ids])
+    ranges = {}
+    for d in defs:
+        r = ranges.setdefault(d["kind"], [list(d["occ"]), list(d["emp"])])
+        r[0] = [min(r[0][0], d["occ"][0]), max(r[0][1], d["occ"][1])]
+        r[1] = [min(r[1][0], d["emp"][0]), max(r[1][1], d["emp"][1])]
+    return dict(margin_ry=float(margin_ry), defs=defs, per_window=per_window, ranges=ranges)
+
+
+def _band_extent(wfns, meta, support):
+    """Per-band (lowest, highest) energy over k (Ry), each [nb]: the support's band table."""
+    from gw import response_bank as rb
+    energy = np.asarray(rb.response_weights(wfns, meta)[0])[:, :np.asarray(support["f"]).shape[-1]]
+    return energy.min(axis=0), energy.max(axis=0)
+
+
+def _masked_exponent_check(groups, window, ranges, extent):
+    """GATE: a band of the kind's union range outside ``window`` keeps a finite exponential on its stream.
+
+    The stream runs every band of ``ranges`` with factors exp((e_v - refs[0]) t) (occupied) and
+    exp(-(e_c - refs[1]) t) (empty); bands outside the window have exact-zero weight, so only their
+    exponent max Re t * excess must stay below :data:`CD_MASKED_EXPONENT_MAX` (imaginary times: 0).
+    """
+    low, high = extent
+    (oa, ob), (ea, eb) = ranges
+    top, bottom = window["refs"]
+    excess = max([0.0] + [float(high[b] - top) for b in range(oa, ob)] + [float(bottom - low[b]) for b in range(ea, eb)])
+    for g in groups:
+        reach = float(np.max(np.asarray(g["t"]).real, initial=0.0)) * excess
+        if reach > CD_MASKED_EXPONENT_MAX:
+            raise ValueError(f"GATE cd_chi0_band_windows: got: a masked band exponent {reach:.4g} on the "
+                             f"{window['kind']} window (occ {window['occ']} x emp {window['emp']}); want: <= "
+                             f"{CD_MASKED_EXPONENT_MAX:g}; why: the kind's union band range streams masked bands "
+                             "whose exponentials must stay finite (0 x inf is NaN)")
+
+
+def _imaginary_cover(points, members, window, rel_tol, node_capacity, max_kappa):
+    """Crossing-window groups: ``minimax.response_imaginary_rule`` on ``members``, halved where a pole fails."""
+    import minimax
+    z = points[list(members)]
+    rule = minimax.response_imaginary_rule(window["lo"], window["hi"], z, rel_tol=rel_tol,
+                                           node_capacity=node_capacity, max_kappa=max_kappa)
+    if rule is not None:
+        return [dict(rule, members=[int(m) for m in members], provider="imaginary")], []
+    if len(members) == 1:
+        return [], list(members)
+    half = len(members) // 2
+    a, ra = _imaginary_cover(points, members[:half], window, rel_tol, node_capacity, max_kappa)
+    b, rb_ = _imaginary_cover(points, members[half:], window, rel_tol, node_capacity, max_kappa)
+    return a + b, ra + rb_
+
+
 # ------------------------------------------------------------------------------- identity
 def _star_sha(table):
     """sha256 of the distinct k rows: equal for a wedge table and its star-unfolded copy."""
@@ -143,9 +293,15 @@ def plan_identity(support, metallic):
                 reference=0. if decay else float(lo))
 
 
-def rule_identity(energy, occupied, points, windows, plan, tolerance, options, route):
-    """What the rules are a function of; a loaded file must match every entry."""
-    return dict(version=RULES_VERSION, route=route, tolerance=float(tolerance),
+def rule_identity(energy, occupied, points, windows, plan, tolerance, options, route, band=None):
+    """What the rules are a function of; a loaded file must match every entry.
+
+    ``band`` (:func:`band_plan`, band-window rules only) adds the ``band_windows`` entry and the route
+    ``cd-windowed``; without it the identity is the whole-interval route's, unchanged.
+    """
+    extra = {} if band is None else dict(band_windows=band)
+    return dict(version=RULES_VERSION, route=route if band is None else "cd-windowed", tolerance=float(tolerance),
+                **extra,
                 options={k: float(v) for k, v in sorted((options or {}).items())},
                 plan={k: plan[k] for k in _PLAN_KEYS}, points=int(points.size),
                 points_sha256=hashlib.sha256(np.ascontiguousarray(points).tobytes()).hexdigest(),
@@ -206,8 +362,15 @@ def _laplace_cover(points, members, plan, rel_tol, node_capacity, ordered=True):
 
 # ------------------------------------------------------------------------------- build / stream
 def build_rules(wfns, meta, points, windows, *, mu_ry, tolerance, slots, capacity=None,
-                time_reversal=False, route="cd", serial=False, build=None, print_fn=print):
+                time_reversal=False, route="cd", serial=False, build=None, band_windows=False,
+                margin_ry=None, print_fn=print):
     """The rule payload of ``windows`` (see module doc) and the bank support it was built on.
+
+    ``band_windows`` (deck ``cd_chi0_band_windows = auto``) builds every real-knot window as band-window
+    groups (:func:`band_plan` with ``margin_ry``, default :data:`CD_REMOTE_MARGIN_EV`): the crossing
+    window by ``minimax.response_imaginary_rule``, each remote window by the Laplace rule (even-only on
+    a time-reversal deck where the ordered certificate refuses); every group carries ``band_window``
+    (index into the payload's ``band_windows.defs``).  Off, the payload is the whole-interval route's.
 
     ``route="bank"`` is the bank's own single request over every point (no Laplace windows, the bank's
     capacity and gate).  ``serial`` builds the pencil windows one request at a time (per-window wall
@@ -232,7 +395,9 @@ def build_rules(wfns, meta, points, windows, *, mu_ry, tolerance, slots, capacit
     options = {} if route == "bank" else cd_rule_options(tolerance, capacity)
     node_capacity = 2 * int(options.get("capacity", minimax.RESPONSE_RULE_CAPACITY))
     rel_tol = float(tolerance) / pid["amplitude"]
-    ident = rule_identity(energy, occupied, points, windows, pid, tolerance, options, route)
+    margin = CD_REMOTE_MARGIN_EV / EV if margin_ry is None else float(margin_ry)
+    band = band_plan(wfns, meta, support, points, windows, pid, margin, route=route) if band_windows else None
+    ident = rule_identity(energy, occupied, points, windows, pid, tolerance, options, route, band=band)
     laplace_ok = route == "cd" and pid["decay_rate"] == 0.0 and pid["lo"] > 0.0
     built = list(range(len(windows))) if build is None else sorted(int(i) for i in build)
     chosen = [windows[i] for i in built]
@@ -240,6 +405,38 @@ def build_rules(wfns, meta, points, windows, *, mu_ry, tolerance, slots, capacit
     pen = [w for w in chosen if w not in lap]
     seconds = {}
     groups, fallback, even, refused = [], [], [], []
+    expected = _expected_cover(ident, built)
+    if band is not None:
+        per = dict((i, ids) for i, ids in band["per_window"])
+        extent = _band_extent(wfns, meta, support)
+        started = time.monotonic()
+        for i in built:
+            for g in per.get(i, []):
+                d, members = band["defs"][g], list(windows[i]["members"])
+                if d["kind"] == "crossing":
+                    got, rest = _imaginary_cover(points, members, d, rel_tol, node_capacity, options["max_kappa"])
+                    rest_even = []
+                else:
+                    plan_w = dict(lo=d["lo"], hi=d["hi"], reference=d["lo"])
+                    got, rest_even = _laplace_cover(points, members, plan_w, rel_tol, node_capacity, True)
+                    rest = []
+                    if rest_even and time_reversal:
+                        more, rest = _laplace_cover(points, rest_even, plan_w, rel_tol, node_capacity, False)
+                        got += more
+                    elif rest_even:
+                        rest = rest_even
+                if rest:
+                    zs = ", ".join(f"{complex(points[m]) * EV:.4g}" for m in rest[:8])
+                    raise ValueError(
+                        f"GATE cd_chi0_rule_unfit: got: {len(rest)} CD point(s) (z/eV: {zs}) of window "
+                        f"{windows[i]['kind']}:{windows[i]['chunk']} that the {d['kind']} band window's rule refuses "
+                        f"(bands occ {d['occ']} x emp {d['emp']}, interval [{d['lo'] * EV:.4g}, {d['hi'] * EV:.4g}] eV, "
+                        f"tolerance {tolerance:g}, node capacity {node_capacity}); want: a certified rule per band "
+                        "window; why: chi0 has one provider, the bank quadrature (decide: a larger capacity or margin)")
+                _masked_exponent_check(got, d, band["ranges"][d["kind"]], extent)
+                groups += [dict(r, band_window=int(g)) for r in got]
+        seconds["band_windows"] = time.monotonic() - started
+        pen = []
     started = time.monotonic()
     for w in lap:
         got, rest = _laplace_cover(points, list(w["members"]), pid, rel_tol, node_capacity, True)
@@ -290,18 +487,48 @@ def build_rules(wfns, meta, points, windows, *, mu_ry, tolerance, slots, capacit
                              "chi0_rules.plan_identity; want: one snapping rule (update plan_identity)")
     seconds["pencil"] = time.monotonic() - started
     groups = pencil_groups + groups
-    covered = sorted(m for g in groups for m in g["members"])
-    if covered != sorted(int(m) for w in chosen for m in w["members"]):
-        raise ValueError("GATE cd_chi0_rules_cover: the rule groups do not cover every built point exactly once")
+    if _covered(groups) != expected:
+        raise ValueError("GATE cd_chi0_rules_cover: the rule groups do not cover every built point (and band "
+                         "window) exactly once")
     payload = dict(identity=ident, plan=pid, rule_groups=groups, seconds=seconds,
                    requests=[[int(m) for m in r] for r in requests], built=built,
                    partial=len(built) != len(windows))
-    payload["census"] = census_rows(points, windows, groups, seconds if serial else None, requests)
+    payload["census"] = census_rows(points, windows, groups, seconds if serial else None, requests,
+                                    band_defs=None if band is None else band["defs"])
     return payload, support
 
 
-def stream_rules(payload, support, slots):
-    """The ``rules`` dict ``integrate_response_group`` reads (``response_quadrature``'s return layout)."""
+def _covered(groups):
+    """Sorted (point, band window) pairs of ``groups``; -1 marks a whole-band group."""
+    return sorted((int(m), -1 if g.get("band_window") is None else int(g["band_window"]))
+                  for g in groups for m in g["members"])
+
+
+def _expected_cover(identity, built):
+    """The (point, band window) pairs the rules of windows ``built`` must cover once each (see :func:`_covered`)."""
+    per = dict((int(i), ids) for i, ids in identity.get("band_windows", {}).get("per_window", []))
+    return sorted((int(m), int(g)) for i in built for m in identity["windows"][i][2] for g in (per.get(int(i)) or [-1]))
+
+
+def stream_rules(payload, support, slots, band_window=None):
+    """The ``rules`` dict ``integrate_response_group`` reads (``response_quadrature``'s return layout).
+
+    ``band_window`` (an index into the identity's ``band_windows.defs``) gives that window's stream: f
+    [nk, nb] kept on its occupied bands and u on its empty bands (exact zeros elsewhere, so the windows'
+    f u products partition the whole one), refs = [max occupied, min empty] energy (Ry) of the window,
+    plan lo/hi its interval and reference = lo (no gauge shift), band_ranges its kind's union ranges.
+    """
+    if band_window is not None:
+        band = payload["identity"]["band_windows"]
+        d = band["defs"][int(band_window)]
+        f, u = np.asarray(support["f"]), np.asarray(support["u"])
+        fw, uw = np.zeros_like(f), np.zeros_like(u)
+        fw[..., d["occ"][0]:d["occ"][1]] = f[..., d["occ"][0]:d["occ"][1]]
+        uw[..., d["emp"][0]:d["emp"][1]] = u[..., d["emp"][0]:d["emp"][1]]
+        plan = dict(payload["plan"], lo=float(d["lo"]), hi=float(d["hi"]), reference=float(d["lo"]))
+        ranges = tuple(tuple(int(b) for b in r) for r in band["ranges"][d["kind"]])
+        return dict(plan=plan, slots=int(slots), f=fw, u=uw, refs=np.array(d["refs"], dtype=np.float64),
+                    band_ranges=ranges)
     refs = np.array(support["refs"], dtype=np.float64, copy=True)
     if payload["plan"]["decay_rate"]:
         refs[:] = support["mu"]
@@ -309,8 +536,11 @@ def stream_rules(payload, support, slots):
                 band_ranges=support["band_ranges"])
 
 
-def census_rows(points, windows, groups, seconds=None, requests=None):
-    """One row per rule group: window, provider, points, z ranges (eV), nodes, sampled error, kappa."""
+def census_rows(points, windows, groups, seconds=None, requests=None, band_defs=None):
+    """One row per rule group: window, band window, provider, points, z ranges (eV), nodes, sampled error, kappa.
+
+    ``band_window`` is the group's band-window kind and band ranges (``band_defs``), or ``all``.
+    """
     EV = float(RYD_TO_EV)
     label = {}
     for w in windows:
@@ -324,7 +554,12 @@ def census_rows(points, windows, groups, seconds=None, requests=None):
     rows = []
     for g in groups:
         z = points[list(g["members"])]
-        rows.append(dict(window=label.get(int(g["members"][0]), "?"), provider=g.get("provider", "pencil"),
+        bw = g.get("band_window")
+        bw = "all" if bw is None or band_defs is None else (
+            f"{band_defs[bw]['kind']}:occ{band_defs[bw]['occ'][0]}-{band_defs[bw]['occ'][1]}"
+            f":emp{band_defs[bw]['emp'][0]}-{band_defs[bw]['emp'][1]}")
+        rows.append(dict(window=label.get(int(g["members"][0]), "?"), band_window=bw,
+                         provider=g.get("provider", "pencil"),
                          points=len(g["members"]), re_ev_min=float(z.real.min() * EV),
                          re_ev_max=float(z.real.max() * EV), im_ev_min=float(z.imag.min() * EV),
                          im_ev_max=float(z.imag.max() * EV), nodes=int(g["count"]),
@@ -387,9 +622,11 @@ def merge_payloads(parts):
         built |= set(p["built"])
         census += p["census"]
         seconds.update({f"{k}@{len(seconds)}": v for k, v in p["seconds"].items()})
-    covered = sorted(m for g in groups for m in g["members"])
-    if covered != list(range(base["points"])) or built != set(range(len(base["windows"]))):
-        raise ValueError("GATE cd_chi0_rules_cover: the merged parts do not cover every CD window exactly once")
+    every = range(len(base["windows"]))
+    if (built != set(every) or _covered(groups) != _expected_cover(base, every)
+            or sorted(int(m) for w in base["windows"] for m in w[2]) != list(range(base["points"]))):
+        raise ValueError("GATE cd_chi0_rules_cover: the merged parts do not cover every CD window (and band "
+                         "window) exactly once")
     return dict(identity=base, plan=parts[0]["plan"], rule_groups=groups, seconds=seconds,
                 built=sorted(built), census=census, requests=[], partial=False)
 
@@ -440,6 +677,10 @@ def precompute(argv=None):
     ap.add_argument("--tolerance", type=float, default=1e-8, help="cd_chi0_rule_tolerance")
     ap.add_argument("--capacity", type=int, default=CD_RULE_CAPACITY, help="cd_chi0_rule_capacity")
     ap.add_argument("--time-reversal", action="store_true", help="the deck's SymMaps.trs_allowed")
+    ap.add_argument("--band-windows", choices=("off", "auto"), default="off",
+                    help="cd_chi0_band_windows: auto splits each real-knot window into crossing/remote band windows")
+    ap.add_argument("--remote-margin-ev", type=float, default=CD_REMOTE_MARGIN_EV,
+                    help="cd_chi0_remote_margin_ev: remote band windows start this far above max |Re z| (eV)")
     ap.add_argument("--windows", default="all", help="all, or a comma list of imag:C / real:C / real:-1 (census)")
     ap.add_argument("--merge", nargs="+", help="merge partial rule files into --out")
     ap.add_argument("--out", required=True)
@@ -497,10 +738,12 @@ def precompute(argv=None):
     sub = [windows[i] for i in pick]
     print(json.dumps(dict(J=J, J_pad=J_pad, chunk_imag=chunk_i, chunk_real=chunk_r, n_imag_pad=n_imag_pad,
                           points=int(points.size), windows=len(windows), building=[f"{w['kind']}:{w['chunk']}" for w in sub],
-                          mu_ev=mu * EV, tolerance=args.tolerance, capacity=args.capacity)), flush=True)
+                          mu_ev=mu * EV, tolerance=args.tolerance, capacity=args.capacity,
+                          band_windows=args.band_windows, remote_margin_ev=args.remote_margin_ev)), flush=True)
     payload, _ = build_rules(wfns, meta, points, windows, mu_ry=mu, tolerance=float(args.tolerance), slots=slots,
                              capacity=int(args.capacity), time_reversal=bool(args.time_reversal), serial=True,
-                             build=pick)
+                             build=pick, band_windows=args.band_windows == "auto",
+                             margin_ry=float(args.remote_margin_ev) / EV)
     sha = save_rules(args.out, payload)
     for row in payload["census"]:
         print(json.dumps(row), flush=True)

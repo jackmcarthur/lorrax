@@ -732,7 +732,7 @@ def cd_chunk_plan(n, nq_irr, nq_pad, ndev, n_imag, J, override=0):
 
 def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots, windows=None,
               rule_capacity=None, rules_file=None, time_reversal=False, save_path=None, allow_partial=False,
-              print_fn=print):
+              band_windows=False, remote_margin_ry=None, print_fn=print):
     """chi0 at the CD points from the shared-pole bank's own response quadrature.
 
     ``z_ry`` lists every point the CD streams evaluate (imaginary nodes ``i u`` and real knots
@@ -751,6 +751,11 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
     sequence of the points (repeats allowed; a repeat is a copy); ``note`` is the rule receipt
     (census rows, source), updated as chunks stream.  ``allow_partial`` (instrument runs only) loads a
     partial ``rules_file``; a point no built rule group holds then refuses (GATE cd_chi0_rule_unbuilt).
+
+    ``band_windows`` (deck ``cd_chi0_band_windows = auto``, margin ``remote_margin_ry``): the knot
+    windows' rules are band-window groups (``chi0_rules.band_plan``); each group streams with its own
+    band window's weights (``chi0_rules.stream_rules(..., band_window=)``) and a point's chi0 is the sum
+    over its band windows (placed by add; off, by set, as before).
     """
     from common.collectives import device_put_process_local_cached
     from gw import response_bank as rb
@@ -765,24 +770,31 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
     if windows is None:
         windows = [dict(kind="all", chunk=0, members=list(range(points.size)))]
     sha = None
+    margin = cr.CD_REMOTE_MARGIN_EV / EV if remote_margin_ry is None else float(remote_margin_ry)
     if rules_file:
         plan, energy, occupied = cr.sample_plan(wfns, meta, points, mu_ry=mu_ry, tolerance=rule_tolerance)
         support = rb.response_support(wfns, meta, plan, {}, print_fn=print_fn)
         options = {} if route == "bank" else cr.cd_rule_options(rule_tolerance, rule_capacity)
         payload = cr.load_rules(rules_file, allow_partial=allow_partial)
+        pid = cr.plan_identity(support, plan["census"]["partial_at_mu"])
+        band = (cr.band_plan(wfns, meta, support, points, windows, pid, margin, route=route)
+                if band_windows else None)
         cr.check_identity(payload["identity"], cr.rule_identity(
-            energy, occupied, points, windows, cr.plan_identity(support, plan["census"]["partial_at_mu"]),
-            rule_tolerance, options, route))
+            energy, occupied, points, windows, pid, rule_tolerance, options, route, band=band))
         source = f"loaded {rules_file}"
     else:
         payload, support = cr.build_rules(wfns, meta, points, windows, mu_ry=mu_ry, tolerance=rule_tolerance,
                                           slots=slots, capacity=rule_capacity, time_reversal=time_reversal,
-                                          route=route, print_fn=print_fn)
+                                          route=route, band_windows=band_windows, margin_ry=margin,
+                                          print_fn=print_fn)
         source = "built in job"
         if save_path and jax.process_index() == 0:
             sha = cr.save_rules(save_path, payload)
             source += f", saved {save_path}"
     rules = cr.stream_rules(payload, support, slots)
+    band = payload["identity"].get("band_windows")
+    band_rules = {} if band is None else {g: cr.stream_rules(payload, support, slots, band_window=g)
+                                          for g in range(len(band["defs"]))}
     groups = payload["rule_groups"]
     plan = payload["plan"]
     sliced = ("value", "derivative", "sampled_error", "coefficient_mass")
@@ -795,7 +807,13 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
                 occupation_amplitude=plan["amplitude"], decay_rate_ry_inv=plan["decay_rate"],
                 partial_at_mu=plan["metallic"], band_ranges=list(support["band_ranges"]),
                 rule_nodes=int(sum(int(g["count"]) for g in groups)), rule_groups=payload["census"],
-                passes=0, green_pair_evaluations=0)
+                passes=0, green_pair_evaluations=0,
+                band_windows=None if band is None else dict(
+                    margin_ev=band["margin_ry"] * EV,
+                    defs=[[d["kind"], list(d["occ"]), list(d["emp"]), d["lo"] * EV, d["hi"] * EV] for d in band["defs"]],
+                    ranges=band["ranges"],
+                    nodes={k: int(sum(int(g["count"]) for g in groups if g.get("band_window") is not None
+                                      and band["defs"][g["band_window"]]["kind"] == k)) for k in band["ranges"]}))
     receipt = {"correlation_count": 0}
     q_ids = tuple(int(q) for q in np.asarray(q_ids).ravel())
     n = int(meta.mu_basis.n_packed)
@@ -809,7 +827,10 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
 
     def _place(out, carry, src, dst):
         return out.at[dst].set(carry[2 * src], mode="drop")              # carry rows 2r: member r's value
-    place = jax.jit(_place, out_shardings=face4, donate_argnums=(0,))
+
+    def _accumulate(out, carry, src, dst):
+        return out.at[dst].add(carry[2 * src], mode="drop")              # band windows: sum over windows
+    place = jax.jit(_place if band is None else _accumulate, out_shardings=face4, donate_argnums=(0,))
     blank = {}
 
     def chi(points_):
@@ -831,7 +852,8 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
                 part = hit[a:a + int(slots)]
                 sub = dict(rule, members=[rule["members"][p] for p in part],
                            **{key: np.asarray(rule[key])[part] for key in sliced})
-                carry = rb.integrate_response_group(wfns, meta, mesh_xy, rules, sub, q_ids=q_ids,
+                stream = rules if rule.get("band_window") is None else band_rules[int(rule["band_window"])]
+                carry = rb.integrate_response_group(wfns, meta, mesh_xy, stream, sub, q_ids=q_ids,
                                                     execute=execute, receipt=receipt, ordered=True)
                 row = {m: r for r, m in enumerate(sub["members"])}
                 pairs = [(row[i], d) for d, i in enumerate(ids) if i in row]
@@ -850,6 +872,7 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
         note["green_pair_evaluations"] = int(receipt["correlation_count"])
         return out
     chi.rules, chi.groups, chi.points, chi.payload = rules, groups, points, payload   # (tests)
+    chi.band_rules = band_rules                                                       # (tests)
     return chi, note
 
 
@@ -1368,11 +1391,14 @@ def compute_sigma_c_cd_omega_grid(
     if rules_file and run_dir is not None and not os.path.isabs(rules_file):
         rules_file = os.path.join(run_dir, rules_file)
     trs = bool(getattr(sym, "trs_allowed", False))
+    band_on = str(cd_handle.get("chi0_band_windows") or "off") == "auto"
+    margin_ev = float(cd_handle.get("chi0_remote_margin_ev") or cd_rules.CD_REMOTE_MARGIN_EV)
     _say(print_fn, started, "chi0 rule geometry (precompute: python -m gw.cd.chi0_rules ... --out FILE; deck "
          f"cd_chi0_rules_file = FILE): --knots {J} --ndev {ndev} --nq-irr {nq_irr} --nk {nk} --n-packed {n} "
          f"--knot-chunk {override} --imaginary-nodes {n_imag} --eta-ev {eta * EV:.10g} --knot-step-ev "
          f"{h_ry * EV:.10g} --nb-chi {int(meta.b_id_4_chi_user)} --b4-logical {int(slices.b4_logical)} --mu-ev "
          f"{mu * EV:.12g}" + (" --time-reversal" if trs else "")
+         + (f" --band-windows auto --remote-margin-ev {margin_ev:.10g}" if band_on else "")
          + f"; {points_cd.size} points in {len(windows_cd)} windows")
     bank_chi, chi_rule = bank_chi0(
         wfns, meta, mesh_xy, points_cd, q_ids=q_irr, mu_ry=mu,
@@ -1381,12 +1407,15 @@ def compute_sigma_c_cd_omega_grid(
         rule_capacity=int(cd_handle.get("chi0_rule_capacity") or cd_rules.CD_RULE_CAPACITY),
         rules_file=rules_file or None, time_reversal=trs,
         save_path=None if (rules_file or run_dir is None) else os.path.join(run_dir, "cd_chi0_rules.pkl"),
-        allow_partial=instrument, print_fn=print_fn)
+        allow_partial=instrument, band_windows=band_on, remote_margin_ry=margin_ev / EV, print_fn=print_fn)
     clock("chi0_rule", t0)
     _say(print_fn, started, f"chi0 rule ({chi_rule['source']}): {chi_rule['points']} points, "
          f"{len(chi_rule['rule_groups'])} groups in {chi_rule['windows']} windows, {chi_rule['rule_nodes']} nodes, "
          f"tolerance {chi_rule['rule_tolerance']:.1e}, max sampled error "
-         f"{max(g['sampled_error'] for g in chi_rule['rule_groups']):.2e}")
+         f"{max(g['sampled_error'] for g in chi_rule['rule_groups']):.2e}"
+         + ("" if chi_rule["band_windows"] is None else
+            f"; band windows (margin {chi_rule['band_windows']['margin_ev']:g} eV): "
+            + ", ".join(f"{k} {v} nodes" for k, v in chi_rule["band_windows"]["nodes"].items())))
 
     # ---- Sigma_x identity (INVARIANT: the CD pair densities reproduce the static exchange) ------------
     t0 = time.monotonic()
@@ -1435,6 +1464,7 @@ def compute_sigma_c_cd_omega_grid(
             chi0_rule_tolerance=float(cd_handle.get("chi0_rule_tolerance", CD_CHI0_RULE_TOLERANCE)),
             chi0_rule_capacity=cd_handle.get("chi0_rule_capacity"), chi0_rule_nodes=chi_rule.get("rule_nodes"),
             chi0_rule_windows=chi_rule.get("windows"),
+            **({} if not band_on else dict(chi0_band_windows="auto", chi0_remote_margin_ev=margin_ev)),
             n_packed=n, nk=nk, nq_irr=nq_irr, nk_red=nk_red, rows=rows_all.tolist(), window=[m0, m1],
             own_window=[m0 + o0, m1], l_sum=[l0, l1], n_omega=nE,
             omega_sha256=hashlib.sha256(np.ascontiguousarray(omega).tobytes()).hexdigest(), eta_ry=eta,

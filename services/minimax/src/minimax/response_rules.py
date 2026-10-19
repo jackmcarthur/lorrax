@@ -10,6 +10,7 @@ import math
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 from .complex_response import (RESPONSE_MAX_KAPPA, RESPONSE_NODE_CAPACITY, RESPONSE_RULE_CAPACITY, ResponseGroupTree,
+                               response_imaginary_rule,
                                response_group_rules)
 
 

@@ -775,6 +775,8 @@ def compute_screening_model(
                 chi0_rule_tolerance=float(config.sigma.cd_chi0_rule_tolerance),
                 chi0_rule_capacity=int(config.sigma.cd_chi0_rule_capacity),
                 chi0_rules_file=str(config.sigma.cd_chi0_rules_file),
+                chi0_band_windows=str(config.sigma.cd_chi0_band_windows),
+                chi0_remote_margin_ev=float(config.sigma.cd_chi0_remote_margin_ev),
                 own_energy_band_min=int(config.sigma.cd_own_energy_band_min),
                 checkpoint=str(config.sigma.cd_checkpoint), run_dir=run_dir)}
         if config.sigma.w_model == "shared_pole":

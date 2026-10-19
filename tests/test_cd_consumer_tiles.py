@@ -46,14 +46,15 @@ SCRIPT = textwrap.dedent(r'''
 
     def fake_bank_chi0(wfns_, meta_, mesh_, z_ry, *, q_ids, mu_ry, rule_tolerance, slots, windows=None,
                        rule_capacity=None, rules_file=None, time_reversal=False, save_path=None, allow_partial=False,
-                       print_fn=print):
+                       band_windows=False, remote_margin_ry=None, print_fn=print):
         face4 = NamedSharding(mesh_, P(None, None, "x", "y"))
 
         def chi(points):
             z = np.asarray(points, np.complex128).ravel()[:, None, None, None]
             return jax.device_put(B[None] / (z - 0.9) - np.conj(np.swapaxes(B, 1, 2))[None] / (z + 0.9), face4)
         return chi, dict(source="analytic test chi0", points=int(np.asarray(z_ry).size), windows=len(windows or []),
-                         rule_groups=[dict(sampled_error=0.0)], rule_nodes=0, rule_tolerance=float(rule_tolerance))
+                         rule_groups=[dict(sampled_error=0.0)], rule_nodes=0, rule_tolerance=float(rule_tolerance),
+                         band_windows=None)
     cd.bank_chi0 = fake_bank_chi0
     omega = np.linspace(-0.25, 0.3, 5)
 

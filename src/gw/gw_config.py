@@ -1654,6 +1654,10 @@ _DEFAULTS = {
     "cd_chi0_rule_tolerance": 1e-8,
     "cd_chi0_rule_capacity": 1088,
     "cd_chi0_rules_file": "",
+    # ``cd_chi0_band_windows``: off | auto (gw.cd.chi0_rules.band_windows: crossing / remote band windows
+    # of the knot windows' pair space); ``cd_chi0_remote_margin_ev``: remote windows' margin above max|Re z|.
+    "cd_chi0_band_windows": "off",
+    "cd_chi0_remote_margin_ev": 4.0,
     "cd_band_tile": 0,
     # ``cd_own_energy_band_min``: 1-based first band of the CD own-energy rows (the DFT-energy
     # diagonal and the reach rule); the omega-grid cube keeps the whole Sigma window.  1 = whole window.
@@ -2244,7 +2248,7 @@ def _resolve_cd_inputs(params):
     params["sigma_frequency_integration"] = value
     cd_keys = ("cd_imaginary_nodes", "cd_knot_step_ev", "cd_residue_reach_ev", "cd_knot_chunk", "cd_band_tile",
                "cd_chi0_rule_tolerance", "cd_chi0_rule_capacity", "cd_chi0_rules_file",
-               "cd_own_energy_band_min", "cd_checkpoint")
+               "cd_chi0_band_windows", "cd_chi0_remote_margin_ev", "cd_own_energy_band_min", "cd_checkpoint")
     if value != "contour_deformation":
         for key in cd_keys:
             if key in named:
@@ -2318,6 +2322,16 @@ def _resolve_cd_inputs(params):
                          "pencil's rank and the stream's node slots")
     params["cd_chi0_rule_capacity"] = cap
     params["cd_chi0_rules_file"] = str(params.get("cd_chi0_rules_file") or "").strip()
+    bands = str(params["cd_chi0_band_windows"]).strip().lower()
+    if bands not in ("off", "auto"):
+        raise ValueError(f"GATE cd_chi0_band_windows: got: {params['cd_chi0_band_windows']!r}; want: off | auto; "
+                         "why: auto splits the knot windows' pair space into crossing / remote band windows")
+    params["cd_chi0_band_windows"] = bands
+    margin = float(params["cd_chi0_remote_margin_ev"])
+    if not (np.isfinite(margin) and 0.0 < margin <= 100.0):
+        raise ValueError(f"GATE cd_chi0_remote_margin_ev: got: {params['cd_chi0_remote_margin_ev']!r}; want: 0 < "
+                         "margin <= 100 eV; why: a remote band window starts this far above the chunk's max |Re z|")
+    params["cd_chi0_remote_margin_ev"] = margin
     if int(params["cd_band_tile"]) < 0:
         raise ValueError(f"GATE cd_band_tile: got: {params['cd_band_tile']!r}; want: >= 0 (0 = planner: the bands "
                          "of the l sum contracted at a time, gw.cd.sigma.band_bytes_per_unit)")
@@ -2703,6 +2717,8 @@ def _input_response(
         cd_chi0_rule_tolerance=float(params["cd_chi0_rule_tolerance"]),
         cd_chi0_rule_capacity=int(params["cd_chi0_rule_capacity"]),
         cd_chi0_rules_file=str(params["cd_chi0_rules_file"]),
+        cd_chi0_band_windows=str(params["cd_chi0_band_windows"]),
+        cd_chi0_remote_margin_ev=float(params["cd_chi0_remote_margin_ev"]),
         cd_band_tile=int(params["cd_band_tile"]),
         cd_own_energy_band_min=int(params["cd_own_energy_band_min"]),
         cd_checkpoint=str(params["cd_checkpoint"]),
@@ -4169,6 +4185,8 @@ class DynamicSigmaConfig:
     cd_chi0_rule_tolerance: float = 1e-8
     cd_chi0_rule_capacity: int = 1088
     cd_chi0_rules_file: str = ""
+    cd_chi0_band_windows: str = "off"
+    cd_chi0_remote_margin_ev: float = 4.0
     cd_band_tile: int = 0
     cd_own_energy_band_min: int = 1
     cd_checkpoint: str = "off"
