@@ -45,7 +45,8 @@ SCRIPT = textwrap.dedent(r'''
     B = c(nk, n, n) / 40
 
     def fake_bank_chi0(wfns_, meta_, mesh_, z_ry, *, q_ids, mu_ry, rule_tolerance, slots, windows=None,
-                       rule_capacity=None, rules_file=None, time_reversal=False, save_path=None, print_fn=print):
+                       rule_capacity=None, rules_file=None, time_reversal=False, save_path=None, allow_partial=False,
+                       print_fn=print):
         face4 = NamedSharding(mesh_, P(None, None, "x", "y"))
 
         def chi(points):

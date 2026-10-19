@@ -1,13 +1,16 @@
 """Checkpoints of sharded cubes plus a small host record, read back by authenticated identity.
 
-Two owners use it. ``gw.sigma_dispatch`` keeps a one-shot shared-pole Σ sweep
+Three owners use it. ``gw.sigma_dispatch`` keeps a one-shot shared-pole Σ sweep
 between the τ sweep and finalize: on shell (the default) its pair and slots,
 ``tmp/sigma_checkpoint_oneshot_on_shell.h5``, and on the omega grid
 (``sigma_omega_grid_debug``) its cubes, ``tmp/sigma_checkpoint_oneshot.h5``.
 A rerun with ``restart = true`` whose state authenticates goes straight to
 finalize.  The SC loop (``gw.sc_iteration``) keeps its Anderson window and
 carry beside each warm seed, ``sc_seed/sc_checkpoint.h5`` (``SC_SCHEMA``), so a
-fresh process continues the trajectory (docs/self_consistency.md §8).
+fresh process continues the trajectory (docs/self_consistency.md §8).  The
+contour-deformation route (``gw.cd.sigma.CdCheckpoint``) keeps its replicated
+accumulators after every chunk as ``state`` (``CD_SCHEMA``, no cubes), so
+``cd_checkpoint = resume`` continues after the last completed chunk.
 
 The cubes go through SlabIO from their own shards: no gather, no copy. The
 host record (JSON) and, for the SC loop, one ``state`` blob are written by
@@ -31,6 +34,9 @@ import numpy as np
 
 SCHEMA = "sigma-sweep-checkpoint-v1"
 SC_SCHEMA = "sc-anderson-checkpoint-v1"
+#: The CD route's per-chunk accumulator checkpoint (``gw.cd.sigma.CdCheckpoint``): no cubes, the
+#: replicated accumulators as the ``state`` blob.
+CD_SCHEMA = "cd-accumulator-checkpoint-v1"
 #: Staging files older than this process's first checkpoint use are orphans.
 _STARTED = time.time()
 CUBES = ("body", "unextrap", "odd")

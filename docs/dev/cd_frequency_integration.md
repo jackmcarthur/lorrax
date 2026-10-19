@@ -95,14 +95,27 @@ accumulators N_ω·N_k,red·N_Σ²·16 B, the roots on the face, one band tile) 
 (slab build, Σ_x, imaginary chunk, real chunk); the run log and the receipt (`memory_plan_gb`) carry it.
 The accumulators remain replicated (3 × 44 MB at the ZnO deck).
 
+## Own-energy rows, checkpoints and the stop-after instrument
+
+`cd_own_energy_band_min` restricts the own-energy diagonal (and with it the `auto` reach) to window
+bands at or above it; the kernels slice the operators to the kept block before `laws.own_apply`, so the
+kept rows are the full-window values at the same knots (`tests/test_cd_resume_window.py`).  The two chunk
+loops are `stream_cd_chunks`.  Under `cd_checkpoint = write | resume`, `CdCheckpoint` writes the six
+replicated accumulators after every chunk through `file_io.sigma_checkpoint` (state blob, schema
+`CD_SCHEMA`); a resume skips the completed chunks and re-runs the chi0 calls from `real_replay_start`
+to rebuild the FD-9 ghost tail, which reproduces the uninterrupted accumulators bitwise on CPU.
+`LORRAX_CD_STOP_AFTER` (docs/reference/env_vars.md) ends a timing probe after a stated number of
+chunks with `cd_stop_receipt.json`.
+
 ## Refusals (`GATE cd_*`, parse time unless noted)
 
 `cd_applicability` (CD needs `compute_mode = mpa` and `screening_diagrams = w_rpa`; pole-model keys
 refuse), `cd_head_unimplemented` (`head_correction = off` only), `cd_linalg_local` (`linalg = local`
 only), `cd_band_extrapolation_unimplemented`, `cd_single_eta` (no per-window η), `cd_knot_step`,
-`cd_imaginary_nodes`, `cd_chi0_rule_tolerance`, `cd_chi0_rule_capacity`, `cd_residue_reach` /
-`cd_residue_coverage` (run time), `cd_chi0_rule` / `cd_chi0_rule_unfit` / `cd_chi0_rules_identity` /
-`cd_chi0_point_unplanned` (run time, `gw.cd.chi0_rules`), `cd_sigma_x_identity`
+`cd_imaginary_nodes`, `cd_chi0_rule_tolerance`, `cd_chi0_rule_capacity`, `cd_own_energy_band_min`,
+`cd_checkpoint`, `cd_stop_after` (run time), `cd_residue_reach` / `cd_residue_coverage` (run time),
+`cd_chi0_rule` / `cd_chi0_rule_unfit` / `cd_chi0_rules_identity` / `cd_chi0_point_unplanned` (run time,
+`gw.cd.chi0_rules`), `cd_sigma_x_identity`
 (run time: the CD pair densities must reproduce the static Σ_x to 1e-3 meV,
 `SIGMA_X_IDENTITY_TOL_MEV`; measured 3.3e-10 meV Fe, 2.1e-11 meV Si), `cd_finite`.
 

@@ -1654,6 +1654,11 @@ _DEFAULTS = {
     "cd_chi0_rule_capacity": 1088,
     "cd_chi0_rules_file": "",
     "cd_band_tile": 0,
+    # ``cd_own_energy_band_min``: 1-based first band of the CD own-energy rows (the DFT-energy
+    # diagonal and the reach rule); the omega-grid cube keeps the whole Sigma window.  1 = whole window.
+    "cd_own_energy_band_min": 1,
+    # ``cd_checkpoint``: off | write (accumulators after every chunk, tmp/cd_checkpoint.h5) | resume.
+    "cd_checkpoint": "off",
     # "" = the shared-pole resolver's own line and imaginary ladders.
     # "<line eV list> | <imaginary eV list>" replaces both with explicit
     # sites (gw.shared_pole_recipe.parse_support_sites); the height, held
@@ -2237,7 +2242,8 @@ def _resolve_cd_inputs(params):
             "want: pole_model | contour_deformation; why: unknown frequency integration")
     params["sigma_frequency_integration"] = value
     cd_keys = ("cd_imaginary_nodes", "cd_knot_step_ev", "cd_residue_reach_ev", "cd_knot_chunk", "cd_band_tile",
-               "cd_chi0_rule_tolerance", "cd_chi0_rule_capacity", "cd_chi0_rules_file")
+               "cd_chi0_rule_tolerance", "cd_chi0_rule_capacity", "cd_chi0_rules_file",
+               "cd_own_energy_band_min", "cd_checkpoint")
     if value != "contour_deformation":
         for key in cd_keys:
             if key in named:
@@ -2314,6 +2320,15 @@ def _resolve_cd_inputs(params):
     if int(params["cd_band_tile"]) < 0:
         raise ValueError(f"GATE cd_band_tile: got: {params['cd_band_tile']!r}; want: >= 0 (0 = planner: the bands "
                          "of the l sum contracted at a time, gw.cd.sigma.band_bytes_per_unit)")
+    if int(params["cd_own_energy_band_min"]) < 1:
+        raise ValueError(f"GATE cd_own_energy_band_min: got: {params['cd_own_energy_band_min']!r}; want: a 1-based "
+                         "band >= 1 (the upper bound, the Sigma window top, is checked by gw.cd.sigma)")
+    params["cd_own_energy_band_min"] = int(params["cd_own_energy_band_min"])
+    ckpt = str(params["cd_checkpoint"]).strip().lower()
+    if ckpt not in ("off", "write", "resume"):
+        raise ValueError(f"GATE cd_checkpoint: got: {params['cd_checkpoint']!r}; want: off | write | resume; "
+                         "why: a resume is requested by name, never inferred from a file")
+    params["cd_checkpoint"] = ckpt
     patches = str(params.get("sigma_omega_patches_ev", "") or "").strip()
     if patches:
         for item in patches.split(","):
@@ -2688,6 +2703,8 @@ def _input_response(
         cd_chi0_rule_capacity=int(params["cd_chi0_rule_capacity"]),
         cd_chi0_rules_file=str(params["cd_chi0_rules_file"]),
         cd_band_tile=int(params["cd_band_tile"]),
+        cd_own_energy_band_min=int(params["cd_own_energy_band_min"]),
+        cd_checkpoint=str(params["cd_checkpoint"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
@@ -4152,6 +4169,8 @@ class DynamicSigmaConfig:
     cd_chi0_rule_capacity: int = 1088
     cd_chi0_rules_file: str = ""
     cd_band_tile: int = 0
+    cd_own_energy_band_min: int = 1
+    cd_checkpoint: str = "off"
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
     #: resolver's own ladders) or "<line eV list> | <imaginary eV list>",
     #: an explicit support geometry for support-rule studies.  Parsed and

@@ -41,6 +41,10 @@ branch reads in the chunk (:func:`residue_band_tables`, host-built once; widths 
 so a handful of shapes compile); every other row would add an exact zero.  FD-9 ghost knots roll from chunk to
 chunk (chi0 runs once per knot).  The q axis is padded to a multiple of P with zero W rows
 (``qvalid`` masks them).  Accumulators are replicated; each kernel returns acc + psum(increment).
+The two chunk loops are :func:`stream_cd_chunks`; ``cd_checkpoint`` keeps the replicated accumulators
+after every chunk (:class:`CdCheckpoint`, ``file_io.sigma_checkpoint``), and a resume re-runs only the
+chi0 calls that rebuild the ghost tail (:func:`real_replay_start`), so it reproduces the uninterrupted
+accumulators.
 
 Units: Ry throughout (omega, eta, energies, Sigma).  Occupations: the fixed-N ``OccupationState``
 of a metal, or the loaded step table of an insulator.
@@ -398,7 +402,7 @@ def tile_sum(body, count, tile, zero):
     return add(out, body(n_full * tile, tail)) if tail else out
 
 
-def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile=None):
+def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile=None, own0=0):
     """The four q-parallel CD kernels (jitted shard_maps; accumulators and tables replicated, pair slabs q-sharded).
 
     sigma_x(V [nq_pad, n, n] q-par, acc [kw, m, m], T)                     -> acc + Sigma_x
@@ -414,9 +418,15 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
     ``real`` contracts only the banded rows of the chunk: ``bands`` are the replicated int32 tables
     [nq_pad, kw, Lb] of :func:`residue_band_tables` for the branches that read the chunk, ``negative``
     their branch flags (static).  Full tables (every l, both branches) give the dense contraction.
+    ``own0`` (static, ``cd_own_energy_band_min``): the own-energy diagonal covers window rows m >= own0
+    (``own`` [kw, m - own0]; T["eps_own"] holds those rows only); the omega-grid cube keeps every row.
+    0 is the whole window, the same program as before the key existed.
     """
     axes = ("x", "y")
     tile = int(band_tile) if band_tile else None
+    # The own-energy terms read the diagonal of operators built on the whole window; the kept block
+    # [own0:, own0:] is the diagonal's tail, so slicing the operator is exact (laws.own_apply unchanged).
+    own_apply = laws.own_apply if not own0 else (lambda a, w: laws.own_apply(a[:, own0:, own0:], w))
 
     def q0():
         return (jax.lax.axis_index("x") * mesh_xy.shape["y"] + jax.lax.axis_index("y")) * nq_loc
@@ -452,7 +462,7 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
                     a = contract(rho, W[iz, iq], nk)
                     ops, wts = laws.imag_node_terms(a, u_c[iz], w_c[iz], x, f, eta)
                     _, wts_own = laws.imag_node_terms(a, u_c[iz], w_c[iz], x_own, f, eta)
-                    return (c2[0] + laws.apply(ops, wts), c2[1] + laws.own_apply(ops, wts_own)), None
+                    return (c2[0] + laws.apply(ops, wts), c2[1] + own_apply(ops, wts_own)), None
                 out, _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
                 return out
             s_acc, s_own = tile_sum(band_tile_, T["psi_q"].shape[2], tile, zeros2(acc, own))
@@ -491,7 +501,7 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
                                                       contract(rho, dWz.T if neg else dWz, nk))
                         ops.append(op)
                         wts.append(laws.real_knot_select(node, coeffs))
-                        inc_own = inc_own + laws.own_apply(op, laws.real_knot_select(node, coeffs_own))
+                        inc_own = inc_own + own_apply(op, laws.real_knot_select(node, coeffs_own))
                     inc = laws.apply(jnp.concatenate(ops, -1), jnp.concatenate(wts, -1))
                     return (c2[0] + inc, c2[1] + inc_own), None
                 (s_acc, s_own), _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
@@ -512,7 +522,7 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
                             op = laws.real_knot_operators(z, contract(rho, Wz.T if neg else Wz, nk),
                                                           contract(rho, dWz.T if neg else dWz, nk))
                             return (c2[0] + laws.apply(op, laws.real_knot_select(node, coeffs)),
-                                    c2[1] + laws.own_apply(op, laws.real_knot_select(node, coeffs_own))), None
+                                    c2[1] + own_apply(op, laws.real_knot_select(node, coeffs_own))), None
                         out, _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
                         return out
                     b_acc, b_own = tile_sum(column_tile, tab.shape[-1], tile, zeros2(acc, own))
@@ -531,9 +541,9 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
                 a0, d0 = contract(rho, W0[iq], nk), contract(rho, dW0[iq], nk)
                 total, cp, cm = laws.anchor_part(a0, d0, x, f, eta, beta)
                 sub = laws.anchor_subtraction(cp, cm, laws.imag_anchor_sums(T["u_all"], T["w_all"], x, f, eta, beta))
-                total_o, _, _ = laws.anchor_part(a0, d0, x_own, f, eta, beta, apply_fn=laws.own_apply)
+                total_o, _, _ = laws.anchor_part(a0, d0, x_own, f, eta, beta, apply_fn=own_apply)
                 sub_o = laws.anchor_subtraction(cp, cm, laws.imag_anchor_sums(T["u_all"], T["w_all"], x_own, f, eta, beta),
-                                                apply_fn=laws.own_apply)
+                                                apply_fn=own_apply)
                 return total - sub, total_o - sub_o
             s_acc, s_own = tile_sum(band_tile_, T["psi_q"].shape[2], tile, zeros2(acc, own))
             v = T["qvalid"][g]
@@ -721,7 +731,8 @@ def cd_chunk_plan(n, nq_irr, nq_pad, ndev, n_imag, J, override=0):
 
 
 def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots, windows=None,
-              rule_capacity=None, rules_file=None, time_reversal=False, save_path=None, print_fn=print):
+              rule_capacity=None, rules_file=None, time_reversal=False, save_path=None, allow_partial=False,
+              print_fn=print):
     """chi0 at the CD points from the shared-pole bank's own response quadrature.
 
     ``z_ry`` lists every point the CD streams evaluate (imaginary nodes ``i u`` and real knots
@@ -738,7 +749,8 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
     ``mu_ry`` is the current chemical potential.  ``slots`` is the largest chunk.  Returns
     ``(chi, note)``: ``chi(points)`` -> ``[nz, nq, n, n]`` at ``P(None, None, 'x', 'y')`` for any
     sequence of the points (repeats allowed; a repeat is a copy); ``note`` is the rule receipt
-    (census rows, source), updated as chunks stream.
+    (census rows, source), updated as chunks stream.  ``allow_partial`` (instrument runs only) loads a
+    partial ``rules_file``; a point no built rule group holds then refuses (GATE cd_chi0_rule_unbuilt).
     """
     from common.collectives import device_put_process_local_cached
     from gw import response_bank as rb
@@ -757,7 +769,7 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
         plan, energy, occupied = cr.sample_plan(wfns, meta, points, mu_ry=mu_ry, tolerance=rule_tolerance)
         support = rb.response_support(wfns, meta, plan, {}, print_fn=print_fn)
         options = {} if route == "bank" else cr.cd_rule_options(rule_tolerance, rule_capacity)
-        payload = cr.load_rules(rules_file)
+        payload = cr.load_rules(rules_file, allow_partial=allow_partial)
         cr.check_identity(payload["identity"], cr.rule_identity(
             energy, occupied, points, windows, cr.plan_identity(support, plan["census"]["partial_at_mu"]),
             rule_tolerance, options, route))
@@ -777,7 +789,7 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
     note = dict(provider="gw.response_bank shared-node quadrature on the CD memory windows (gw.cd.chi0_rules): "
                          "Laplace rule (imaginary windows) / ResponseGroupTree (knot windows), "
                          "integrate_response_group value rows (ordered=True)",
-                source=source, rules_sha256=sha, route=route, rule_tolerance=float(rule_tolerance),
+                source=source, rules_sha256=sha, route=route, partial_rules=bool(payload.get("partial")), rule_tolerance=float(rule_tolerance),
                 options=payload["identity"]["options"], time_reversal=bool(time_reversal),
                 points=int(points.size), windows=len(windows), interval_ev=[plan["lo"] * EV, plan["hi"] * EV],
                 occupation_amplitude=plan["amplitude"], decay_rate_ry_inv=plan["decay_rate"],
@@ -811,8 +823,10 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
         if nz not in blank:
             blank[nz] = jax.jit(lambda: jnp.zeros((nz, len(q_ids), n, n), jnp.complex128), out_shardings=face4)
         out = blank[nz]()
+        held = set()
         for rule in groups:
             hit = [p for p, m in enumerate(rule["members"]) if m in want]
+            held.update(rule["members"][p] for p in hit)
             for a in range(0, len(hit), int(slots)):
                 part = hit[a:a + int(slots)]
                 sub = dict(rule, members=[rule["members"][p] for p in part],
@@ -828,10 +842,236 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
                             device_put_process_local_cached(dst, rep))
                 del carry
                 note["passes"] += 1
+        if want - held:
+            miss = sorted(want - held)
+            raise ValueError(f"GATE cd_chi0_rule_unbuilt: got: {len(miss)} point(s) (first z = {points[miss[0]]} Ry) "
+                             "that no built rule group holds; want: every evaluated window built; why: a partial "
+                             "(census) rule file serves only the windows it built, never a silent zero")
         note["green_pair_evaluations"] = int(receipt["correlation_count"])
         return out
     chi.rules, chi.groups, chi.points, chi.payload = rules, groups, points, payload   # (tests)
     return chi, note
+
+
+# ------------------------------------------------------------------- own-energy rows, reach, checkpoints
+#: ``cd_checkpoint`` (docs/input_reference.md): ``off`` writes nothing; ``write`` rewrites the accumulator
+#: checkpoint after every completed chunk; ``resume`` first continues from an authenticated checkpoint,
+#: then writes as ``write``.  A resume is never inferred from a file's presence.
+CD_CHECKPOINT_MODES = ("off", "write", "resume")
+#: Beside the deck, in ``tmp/`` like the one-shot sweep checkpoint of ``gw.sigma_dispatch``.
+CD_CHECKPOINT_FILE = os.path.join("tmp", "cd_checkpoint.h5")
+#: Deck keys a continuation leg rewrites without changing the result; :func:`cd_deck_digest` drops them.
+CD_RESUME_FREE_KEYS = ("cd_checkpoint", "restart")
+
+
+def residue_reach_need(omega, eps_own, enk_L, f_L):
+    """The largest live |E - eps_l| (Ry) over E = the omega grid and the own energies (GATE cd_residue_coverage).
+
+    Occupied l (f > 0) are read from the lowest E (x < 0 residues reach eps_l - E_min), unoccupied l
+    (1 - f > 0) from the highest (x >= 0 residues reach E_max - eps_l).  ``omega`` [E] and ``eps_own``
+    [rows, m] absolute Ry; ``enk_L``, ``f_L`` [nk, L] the band-sum tables.
+    """
+    E_all = np.concatenate([np.asarray(omega, np.float64).ravel(), np.asarray(eps_own, np.float64).ravel()])
+    need_neg = np.where(f_L > 0, np.maximum(0.0, enk_L - E_all.min()), 0.0).max()
+    need_pos = np.where(1.0 - f_L > 0, np.maximum(0.0, E_all.max() - enk_L), 0.0).max()
+    return float(max(need_neg, need_pos))
+
+
+def own_energy_window(m0, m1, band_min):
+    """Offset ``o0`` of the own-energy rows in the Sigma window [m0, m1) under ``cd_own_energy_band_min``.
+
+    ``band_min`` is a 1-based band index.  The own-energy rows (the DFT-energy diagonal: ``eps_own``, the
+    own accumulators and the reach rule) are the window bands >= band_min; the omega-grid cube and the
+    finalizer keep the whole window, so a band below it is read out of grid exactly as without CD.
+    1 (the default) is the whole window.
+    """
+    o0 = max(0, int(band_min) - 1 - int(m0))
+    if o0 >= int(m1) - int(m0):
+        raise ValueError(f"GATE cd_own_energy_band_min: cd_own_energy_band_min got: {band_min}; want: <= {m1} "
+                         f"(1-based, inside the Sigma window [{m0 + 1}, {m1}]); why: the own-energy rows are a "
+                         "non-empty subset of the window")
+    return o0
+
+
+class CdStopAfter(RuntimeError):
+    """``LORRAX_CD_STOP_AFTER`` reached: the run stops after its last chunk's checkpoint (a timing probe)."""
+
+
+def parse_stop_after(text):
+    """``LORRAX_CD_STOP_AFTER`` -> ``{'imag': N, 'real': M, 'real_from': K}`` (each None if absent).
+
+    ``imag:N`` runs N imaginary chunks and then leaves the imaginary axis; ``real:M`` stops after M
+    real-axis chunks; ``real_from:K`` starts the real axis at chunk K (negative: from the end; the ghost
+    tail is rebuilt as on a resume) with zero real accumulators.  Counts are chunks executed by this
+    process, after any resume.  ``imag`` and ``real_from`` change the result (no longer a Sigma), so the
+    checkpoint identity records them; ``real`` alone only stops early (docs/reference/env_vars.md).
+    """
+    out = dict(imag=None, real=None, real_from=None)
+    text = (text or "").strip()
+    for item in filter(None, (t.strip() for t in text.split(","))):
+        axis, _, count = item.partition(":")
+        axis, count = axis.strip().lower(), count.strip()
+        signed = count[1:] if (axis == "real_from" and count.startswith("-")) else count
+        if axis not in out or not signed.isdigit():
+            raise ValueError(f"GATE cd_stop_after: LORRAX_CD_STOP_AFTER got: {text!r}; want: "
+                             "'imag:N,real:M,real_from:K' (each part optional; N, M >= 0; K may be negative); "
+                             "why: a mistyped instrument must not run a production-length job")
+        out[axis] = int(count)
+    return out
+
+
+def cd_deck_digest(path):
+    """sha256 of the deck as the parser reads it, without :data:`CD_RESUME_FREE_KEYS`.
+
+    The SC checkpoint's rule (``gw.sc_iteration._sc_checkpoint_identity``): comments and blank lines are
+    dropped, each line is read as ``key = value`` or ``key: value`` with the key lower-cased, so spelling
+    does not count.  An empty path digests the empty deck.
+    """
+    import hashlib
+    import re
+    lines = []
+    if path:
+        with open(path) as fh:
+            for raw in fh:
+                line = raw.split("#", 1)[0].strip()
+                pair = re.match(r"([^=:]*)[=:](.*)", line)
+                key = (pair.group(1) if pair else line).strip().lower()
+                if line and key not in CD_RESUME_FREE_KEYS:
+                    lines.append(f"{key}={pair.group(2).strip()}" if pair else line)
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
+def real_replay_start(start, chunk, gh=GH):
+    """First knot chunk whose chi0 window a resume at real chunk ``start`` re-runs (no Dyson, no contraction).
+
+    The FD-9 ghost tail entering chunk ``start`` holds knots [start*chunk - gh, start*chunk + gh).  Each knot
+    came from exactly one planned window call (``gw.cd.chi0_rules.cd_windows``: chunk 0 covers
+    [-gh, chunk + gh), chunk c > 0 its new knots [c*chunk + gh, (c+1)*chunk + gh)).  The calls of chunks
+    r = start - ceil(2 gh / chunk) .. start - 1 (r >= 0) cover the tail, each with its uninterrupted z
+    batch and only planned points, so the rebuilt tail is bit-identical to the uninterrupted one.
+    """
+    start = int(start)
+    return 0 if start <= 0 else max(0, start - (-(-2 * int(gh) // int(chunk))))
+
+
+def stream_cd_chunks(*, imag_chunks, real_chunks, chi_real, join, tail_of, imag_step, real_step, accs,
+                     resume=None, on_chunk=None, stop_after=None, gh=GH):
+    """The CD chunk loops: imaginary nodes, then real knots with rolling FD-9 ghosts; resumable.
+
+    imag_chunks, real_chunks : lists of (start, stop) unit ranges (the padded tiling).
+    chi_real(ic)             : chi0 at real chunk ic's planned window (one call = one z batch): chunk 0
+                               with both ghost sides, chunk c > 0 its new knots (gw.cd.chi0_rules.cd_windows).
+    join(tail, new), tail_of(chi_e) : the ghost roll (concatenate; the last 2 gh knots).
+    imag_step(ic, c0, c1, accs) -> accs : one node chunk (chi0 -> Dyson -> contraction).
+    real_step(ic, j0, j1, box, accs) -> accs : one knot chunk on the ghost-extended chi0 ``box.pop()``;
+        ``box`` is a one-element list so this loop holds no reference while the step runs.
+    accs : dict of the replicated accumulators.  resume : None or ``CdCheckpoint.read()``'s dict (axis,
+    chunk = the last completed chunk, accs); the imaginary chunks up to it are skipped, and on the real
+    axis the chi0 calls from :func:`real_replay_start` on are re-run to rebuild the ghost tail.
+    on_chunk(axis, ic, accs) : after every completed chunk (the checkpoint writer).
+    stop_after : :func:`parse_stop_after`'s dict (``real_from`` starts the real axis at that chunk).
+    Returns ``(accs, info)``; info: resumed_from, imag_run, real_run, replayed, imag_truncated, stopped.
+    """
+    stop_after = stop_after or {}
+    lim_i, lim_r, real_from = stop_after.get("imag"), stop_after.get("real"), stop_after.get("real_from")
+    n_i, n_r = len(imag_chunks), len(real_chunks)
+    start_i = start_r = 0
+    if real_from is not None and n_r:
+        start_r = int(real_from) % n_r
+    if resume is not None:
+        accs = dict(resume["accs"])
+        if resume["axis"] == "imag":
+            start_i = int(resume["chunk"]) + 1
+        elif resume["axis"] == "real":
+            start_i, start_r = n_i, max(start_r, int(resume["chunk"]) + 1)
+        else:
+            raise ValueError(f"GATE cd_resume_axis: checkpoint axis {resume['axis']!r}; want imag | real")
+    info = dict(resumed_from=None if resume is None else [str(resume["axis"]), int(resume["chunk"])],
+                imag_run=0, real_run=0, replayed=0, imag_truncated=False, stopped=False)
+    for ic in range(start_i, n_i):
+        if lim_i is not None and info["imag_run"] >= lim_i:
+            info["imag_truncated"] = True
+            break
+        c0, c1 = imag_chunks[ic]
+        accs = imag_step(ic, c0, c1, accs)
+        info["imag_run"] += 1
+        if on_chunk is not None:
+            on_chunk("imag", ic, accs)
+    chunk = (real_chunks[0][1] - real_chunks[0][0]) if n_r else 1
+    tail = rebuilt = None
+    for ic in range(real_replay_start(start_r, chunk, gh), n_r):
+        if ic >= start_r and lim_r is not None and info["real_run"] >= lim_r:
+            info["stopped"] = True
+            break
+        j0, j1 = real_chunks[ic]
+        new = chi_real(ic)
+        if ic < start_r:                              # replay: the planned calls that cover the ghost tail
+            rebuilt = new if rebuilt is None else join(rebuilt, new)
+            info["replayed"] += 1
+            if ic == start_r - 1:
+                tail, rebuilt = tail_of(rebuilt), None
+            del new
+            continue
+        chi_e = new if tail is None else join(tail, new)
+        del new
+        tail = tail_of(chi_e)
+        box = [chi_e]
+        del chi_e
+        accs = real_step(ic, j0, j1, box, accs)
+        info["real_run"] += 1
+        if on_chunk is not None:
+            on_chunk("real", ic, accs)
+    del tail
+    return accs, info
+
+
+class CdCheckpoint:
+    """Per-chunk checkpoint of the replicated CD accumulators (``file_io.sigma_checkpoint``, ``CD_SCHEMA``).
+
+    One file, ``<run_dir>/tmp/cd_checkpoint.h5``, rewritten after every completed chunk through
+    ``write_sigma_checkpoint`` (published by ``os.replace``: a kill mid-write leaves the previous chunk's
+    file).  The accumulators travel as the host ``state`` blob (plain numpy; they are replicated, so
+    rank 0 holds them whole) with the axis, chunk index and stage seconds; the record's ``identity`` is
+    the driver's dict (deck digest, tree, chi0 provider and rule tolerance, geometry and tiling), and
+    ``host`` tags the axis and chunk.  :meth:`read` returns the ``resume`` dict of
+    :func:`stream_cd_chunks`, or None for an absent or foreign file (left in place and named).
+    """
+
+    def __init__(self, path, identity, mesh, *, print_fn=print):
+        self.path, self.identity, self.mesh, self.print_fn = str(path), identity, mesh, print_fn
+        self.writes, self.seconds, self.nbytes = 0, 0.0, 0
+
+    def read(self):
+        from common.collectives import replicate_to_mesh
+        from file_io.sigma_checkpoint import CD_SCHEMA, read_sigma_checkpoint
+        found = read_sigma_checkpoint(self.path, identity=self.identity, mesh=self.mesh, print_fn=self.print_fn,
+                                      schema=CD_SCHEMA, discard=False, cubes=False)
+        if found[0] is None:
+            if found[1] != "absent":
+                self.print_fn(f"  WARNING CD resume: {self.path} does not continue this run ({found[1]}); "
+                              "starting at chunk 0 (this run's first checkpoint replaces the file)")
+            return None
+        _, host, state, commit = found
+        accs = {k: replicate_to_mesh(np.asarray(v), self.mesh) for k, v in state["accs"].items()}
+        return dict(axis=str(state["axis"]), chunk=int(state["chunk"]), accs=accs,
+                    timings=dict(state.get("timings") or {}), commit=str(commit), host=host)
+
+    def write(self, axis, chunk, accs, *, timings=None, host=None):
+        """Collective: every rank calls it after the chunk; returns the write's seconds."""
+        from common.collectives import gather_to_host
+        from file_io.sigma_checkpoint import CD_SCHEMA, write_sigma_checkpoint
+        t0 = time.monotonic()
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        arrays = {k: np.asarray(gather_to_host(v)) if isinstance(v, jax.Array) else np.asarray(v)
+                  for k, v in accs.items()}
+        state = dict(axis=str(axis), chunk=int(chunk), accs=arrays,
+                     timings={k: float(v) for k, v in (timings or {}).items()})
+        nbytes, _ = write_sigma_checkpoint(self.path, identity=self.identity, cubes={}, mesh=self.mesh,
+                                           host=dict(host or {}, axis=str(axis), chunk=int(chunk)),
+                                           schema=CD_SCHEMA, state=state)
+        dt = time.monotonic() - t0
+        self.writes, self.seconds, self.nbytes = self.writes + 1, self.seconds + dt, int(nbytes)
+        return dt
 
 
 # ------------------------------------------------------------------------------- the Sigma consumer
@@ -846,8 +1086,11 @@ def compute_sigma_c_cd_omega_grid(
     ``regularization_width_ry`` is eta.  The rest of ``body_options`` is the pole executor's.
     Returns :class:`gw.ppm_sigma.SigmaOmegaResult`, cube at ``P(None, None, 'x', 'y')`` on the padded
     Sigma band carrier.  Rank 0 writes beside the deck: ``cd_sigma_receipt.json``,
-    ``cd_sigma_own_energy.npz`` (diagonal at the DFT energies and its three contour parts),
-    ``cd_leak_ledger.csv`` and the partial dumps ``cd_partial_{imag,anchor}.npz``.
+    ``cd_sigma_own_energy.npz`` (diagonal at the DFT energies on the own-energy rows ``bands0`` and its
+    three contour parts; ``sigma_x_diag_ry`` on the whole window ``window_bands0``),
+    ``cd_leak_ledger.csv`` and the partial dumps ``cd_partial_{imag,anchor}.npz``.  ``cd_checkpoint``
+    (write | resume) keeps ``tmp/cd_checkpoint.h5`` after every chunk (:class:`CdCheckpoint`);
+    ``LORRAX_CD_STOP_AFTER`` ends an instrument run with ``cd_stop_receipt.json`` and :class:`CdStopAfter`.
     """
     from common.collectives import barrier, gather_to_host, replicate_to_mesh
     from gw import response_bank as rb
@@ -944,18 +1187,20 @@ def compute_sigma_c_cd_omega_grid(
     m0, m1 = int(sig.start or 0), int(sig.stop)
     l0, l1 = int(lsum.start or 0), int(lsum.stop)
     nb_s, L = m1 - m0, l1 - l0
+    # Own-energy rows (cd_own_energy_band_min): window bands >= the key.  The omega-grid cube, psi_M and the
+    # finalizer keep the whole window [m0, m1), so a band below the key is read out of grid as without CD.
+    o0 = own_energy_window(m0, m1, cd_handle.get("own_energy_band_min", 1))
+    nb_o = nb_s - o0
     pref = float(_w_solve_pref_scalar(meta))
     omega = np.asarray(omega_grid_ry, dtype=np.float64) + float(efermi_ry)   # absolute Ry
     nE = int(omega.size)
     enk_L = energy[:, l0:l1]
     f_L = f_cd[:, l0:l1]
-    eps_own = energy[rows_all, m0:m1]                              # [rows, nb_s] own energies
+    eps_own = energy[rows_all, m0 + o0:m1]                         # [rows, nb_o] own energies
 
     # residue coverage (GATE cd_residue_coverage): the largest |x| any live residue reads
-    E_all = np.concatenate([omega, eps_own.ravel()])
-    need_neg = np.where(f_L > 0, np.maximum(0.0, enk_L - E_all.min()), 0.0).max()
-    need_pos = np.where(1.0 - f_L > 0, np.maximum(0.0, E_all.max() - enk_L), 0.0).max()
-    need = float(max(need_neg, need_pos))
+    need = residue_reach_need(omega, eps_own, enk_L, f_L)
+    need_window = need if not o0 else residue_reach_need(omega, energy[rows_all, m0:m1], enk_L, f_L)
     reach = cd_handle.get("residue_reach_ev", "auto")
     if reach != "auto" and float(reach) / EV < need:
         raise ValueError(f"GATE cd_residue_coverage: cd_residue_reach_ev got: {reach}; want: >= {need * EV:.3f} eV "
@@ -973,7 +1218,8 @@ def compute_sigma_c_cd_omega_grid(
     _say(print_fn, started, f"geometry nk={nk} nq_irr={nq_irr} nq_pad={nq_pad} nk_red={nk_red} n_packed={n} "
          f"window m=[{m0},{m1}) l=[{l0},{l1}) nE={nE} eta={eta * EV:.4f} eV h={h_ry * EV:.4f} eV J={J} "
          f"(padded {J_pad}) knots to {real_ry[J - 1] * EV:.3f} eV (need {need * EV:.3f} eV) imag nodes={n_imag} "
-         f"(padded {n_imag_pad}) mu={mu * EV:.6f} eV full_bz={full_bz}; tile {TILE_BYTES / 2**30:.0f} GiB/rank: "
+         f"(padded {n_imag_pad}) own rows [{m0 + o0},{m1}) (whole-window need {need_window * EV:.3f} eV) "
+         f"mu={mu * EV:.6f} eV full_bz={full_bz}; tile {TILE_BYTES / 2**30:.0f} GiB/rank: "
          f"chunk imag {chunk_i} ({chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis='imag') / 2**20:.1f} MiB/node), "
          f"real {chunk_r} ({chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis='real') / 2**20:.1f} MiB/knot)"
          + (f" [cd_knot_chunk override {override}]" if override else ""))
@@ -1029,7 +1275,8 @@ def compute_sigma_c_cd_omega_grid(
                 w_all=_rep(w_ry_all))
     u_dev, w_dev = _rep(u_ry), _rep(w_ry)
     beta = tuple(float(b) for b in laws.BETA_RY)
-    K = build_contraction_kernels(mesh_xy, nk=nk, nq_loc=nq_loc, eta=eta, h_ry=h_ry, beta=beta, band_tile=band_tile)
+    K = build_contraction_kernels(mesh_xy, nk=nk, nq_loc=nq_loc, eta=eta, h_ry=h_ry, beta=beta, band_tile=band_tile,
+                                  own0=o0)
 
     # ---- Coulomb: wedge operator, full zone, roots ------------------------------------------------------
     V_q = cd_handle["V_q"]
@@ -1093,7 +1340,7 @@ def compute_sigma_c_cd_omega_grid(
 
     def zeros(*shape):
         return jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=rep)()
-    acc_shape, own_shape = (nE, n_rows, nb_s, nb_s), (n_rows, nb_s)
+    acc_shape, own_shape = (nE, n_rows, nb_s, nb_s), (n_rows, nb_o)
     acc_imag, own_imag = zeros(*acc_shape), zeros(*own_shape)
     acc_real, own_real = zeros(*acc_shape), zeros(*own_shape)
     acc_anc, own_anc = zeros(*acc_shape), zeros(*own_shape)
@@ -1105,8 +1352,12 @@ def compute_sigma_c_cd_omega_grid(
     def partial_dump(name, **arrays):
         out = {k: host(v)[:nk_red] for k, v in arrays.items()}       # collective on every rank; wedge rows
         if rank0 and run_dir is not None:
-            np.savez(os.path.join(run_dir, f"cd_partial_{name}.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
+            np.savez(os.path.join(run_dir, f"cd_partial_{name}.npz"), kw_rows=kw_rows, bands0=np.arange(m0 + o0, m1),
                      elapsed_s=time.monotonic() - started, **out)
+
+    # LORRAX_CD_STOP_AFTER (instrument): parsed before the rules, which it may load partially.
+    stop_after = parse_stop_after(os.environ.get("LORRAX_CD_STOP_AFTER", ""))
+    instrument = any(v is not None for v in stop_after.values())
 
     # chi0 at every CD point from the bank response rules, one request per CD memory window
     # (gw.cd.chi0_rules); each chunk below evaluates exactly its window's points.
@@ -1130,7 +1381,7 @@ def compute_sigma_c_cd_omega_grid(
         rule_capacity=int(cd_handle.get("chi0_rule_capacity") or cd_rules.CD_RULE_CAPACITY),
         rules_file=rules_file or None, time_reversal=trs,
         save_path=None if (rules_file or run_dir is None) else os.path.join(run_dir, "cd_chi0_rules.pkl"),
-        print_fn=print_fn)
+        allow_partial=instrument, print_fn=print_fn)
     clock("chi0_rule", t0)
     _say(print_fn, started, f"chi0 rule ({chi_rule['source']}): {chi_rule['points']} points, "
          f"{len(chi_rule['rule_groups'])} groups in {chi_rule['windows']} windows, {chi_rule['rule_nodes']} nodes, "
@@ -1165,13 +1416,48 @@ def compute_sigma_c_cd_omega_grid(
     _say(print_fn, started, f"Sigma_x identity: {sx_note}")
     ledger.append(ledger_sample("sigma_x", 0, time.monotonic() - t0))
 
-    # ---- imaginary axis -----------------------------------------------------------------------------
-    for ic, c0 in enumerate(range(0, n_imag_pad, chunk_i)):
-        c1 = c0 + chunk_i
+    # ---- the chunk loops (stream_cd_chunks): resumable from cd_checkpoint, stoppable by LORRAX_CD_STOP_AFTER ----
+    ckpt_mode = str(cd_handle.get("checkpoint", "off") or "off").strip().lower()
+    if ckpt_mode not in CD_CHECKPOINT_MODES:
+        raise ValueError(f"GATE cd_checkpoint: cd_checkpoint got: {ckpt_mode!r}; want: {' | '.join(CD_CHECKPOINT_MODES)}")
+    imag_chunks = [(c0, c0 + chunk_i) for c0 in range(0, n_imag_pad, chunk_i)]
+    real_chunks = [(j0, j0 + chunk_r) for j0 in range(0, J_pad, chunk_r)]
+    ckpt = resume = None
+    if ckpt_mode != "off":
+        import hashlib
+        from gw.kin_ion_io import _generator_commit
+        if run_dir is None:
+            raise ValueError("GATE cd_checkpoint: cd_checkpoint got: a mode with no run directory; want: a deck run")
+        # Everything the accumulators depend on; json round trip so the stored record compares equal.
+        identity = json.loads(json.dumps(dict(
+            deck_sha256=cd_deck_digest(getattr(config, "input_file", "") or ""), tree=_generator_commit(),
+            recipe=CD_RECIPE, chi0=CD_RECIPE.get("chi0"),
+            chi0_rule_tolerance=float(cd_handle.get("chi0_rule_tolerance", CD_CHI0_RULE_TOLERANCE)),
+            chi0_rule_capacity=cd_handle.get("chi0_rule_capacity"), chi0_rule_nodes=chi_rule.get("rule_nodes"),
+            chi0_rule_windows=chi_rule.get("windows"),
+            n_packed=n, nk=nk, nq_irr=nq_irr, nk_red=nk_red, rows=rows_all.tolist(), window=[m0, m1],
+            own_window=[m0 + o0, m1], l_sum=[l0, l1], n_omega=nE,
+            omega_sha256=hashlib.sha256(np.ascontiguousarray(omega).tobytes()).hexdigest(), eta_ry=eta,
+            knot_step_ry=h_ry, J=J, J_pad=J_pad, imaginary_nodes=n_imag, n_imag_pad=n_imag_pad,
+            chunk_imag=chunk_i, chunk_real=chunk_r, stop_after_imag=stop_after["imag"],
+            stop_after_real_from=stop_after["real_from"]), default=str))
+        ckpt = CdCheckpoint(os.path.join(run_dir, CD_CHECKPOINT_FILE), identity, mesh_xy, print_fn=print_fn)
+        if ckpt_mode == "resume":
+            resume = ckpt.read()
+        _say(print_fn, started, f"checkpoint {ckpt_mode}: {ckpt.path} " + (
+            f"resumes after {resume['axis']} chunk {resume['chunk']} (commit {resume['commit'][:16]})"
+            if resume is not None else "(fresh)"))
+    if instrument:
+        _say(print_fn, started, f"LORRAX_CD_STOP_AFTER {json.dumps(stop_after)}: instrument run, no Sigma is finalized")
+    chi_started, chi0_calls = [None], []
+
+    def imag_step(ic, c0, c1, accs):
         t_chunk = t0 = time.monotonic()
         chi = bank_chi(imag_pts[ic])
         jax.block_until_ready(chi)
         clock("chi0", t0)
+        chi0_calls.append(dict(axis="imag", chunk=int(ic), points=int(len(imag_pts[ic])),
+                               seconds=round(time.monotonic() - t0, 3)))
         t0 = time.monotonic()
         w_flat = dyson_value(roots_qz(h_irr, chunk_i), to_qz(chi))
         del chi
@@ -1183,27 +1469,28 @@ def compute_sigma_c_cd_omega_grid(
         jax.block_until_ready(W)
         clock("unfold", t0)
         t0 = time.monotonic()
-        acc_imag, own_imag = K.imag(W, u_dev[c0:c1], w_dev[c0:c1], acc_imag, own_imag, tabs)
-        jax.block_until_ready(acc_imag)
+        acc, own = K.imag(W, u_dev[c0:c1], w_dev[c0:c1], accs["acc_imag"], accs["own_imag"], tabs)
+        jax.block_until_ready(acc)
         clock("contract_imag", t0)
         del W
         ledger.append(ledger_sample("imag", ic, time.monotonic() - t_chunk))
         _say(print_fn, started, f"imaginary nodes {min(c1, n_imag)}/{n_imag} " + json.dumps({k: round(v, 1) for k, v in timings.items()}))
-    partial_dump("imag", sigma_c_imag_own_ry=own_imag)
+        return dict(accs, acc_imag=acc, own_imag=own)
 
-    # ---- real axis: knot chunks with rolling FD-9 ghosts; knot 0 carries the anchor -----------------
-    tail = None
-    for ic, j0 in enumerate(range(0, J_pad, chunk_r)):
-        j1 = j0 + chunk_r
-        t_chunk = t0 = time.monotonic()
-        if tail is None:
-            chi_e = bank_chi(real_pts[ic])
-        else:
-            chi_e = join_fn(tail, bank_chi(real_pts[ic]))
+    def chi_real(ic):
+        """chi0 at real chunk ``ic``'s planned window (gw.cd.chi0_rules.cd_windows: chunk 0 with both ghost
+        sides, later chunks their new knots); the ghost roll is stream_cd_chunks'."""
+        chi_started[0] = t0 = time.monotonic()
+        chi_e = bank_chi(real_pts[ic])
         jax.block_until_ready(chi_e)
         clock("chi0", t0)
-        t0 = time.monotonic()
-        tail = tail_fn(chi_e)
+        chi0_calls.append(dict(axis="real", chunk=int(ic), points=int(len(real_pts[ic])),
+                               seconds=round(time.monotonic() - t0, 3)))
+        return chi_e
+
+    def real_step(ic, j0, j1, box, accs):
+        t_chunk, t0 = chi_started[0] or time.monotonic(), time.monotonic()
+        chi_e = box.pop()
         z_core = jnp.asarray(real_ry[j0:j1] + 1j * eta)
         dchi = slope_fn(chi_e, z_core)
         chi_c = core_fn(chi_e)
@@ -1217,24 +1504,76 @@ def compute_sigma_c_cd_omega_grid(
         del wc_flat, dw_flat
         jax.block_until_ready(dW)
         clock("unfold", t0)
+        acc_a, own_a = accs["acc_anc"], accs["own_anc"]
         if j0 == 0:
             t0 = time.monotonic()
-            acc_anc, own_anc = K.anchor(W[0], dW[0], acc_anc, own_anc, tabs)
-            jax.block_until_ready(acc_anc)
+            acc_a, own_a = K.anchor(W[0], dW[0], acc_a, own_a, tabs)
+            jax.block_until_ready(acc_a)
             clock("anchor", t0)
-            partial_dump("anchor", sigma_c_anchor_own_ry=own_anc, sigma_c_imag_own_ry=own_imag)
+            partial_dump("anchor", sigma_c_anchor_own_ry=own_a, sigma_c_imag_own_ry=accs["own_imag"])
         t0 = time.monotonic()
+        acc_r, own_r = accs["acc_real"], accs["own_real"]
         bands, negative = band_tables(ic)
         if bands:                                       # a chunk no live residue reads adds an exact zero
-            acc_real, own_real = K.real(W, dW, z_core, jnp.int32(j0), acc_real, own_real, tabs,
-                                        tuple(_rep(b) for b in bands), negative)
-            jax.block_until_ready(acc_real)
+            acc_r, own_r = K.real(W, dW, z_core, jnp.int32(j0), acc_r, own_r, tabs,
+                                  tuple(_rep(b) for b in bands), negative)
+            jax.block_until_ready(acc_r)
         clock("contract_real", t0)
         del W, dW
         ledger.append(ledger_sample("real", ic, time.monotonic() - t_chunk))
         if ic % 10 == 0 or j1 >= J_pad:
             _say(print_fn, started, f"real knots {min(j1, J)}/{J} " + json.dumps({k: round(v, 1) for k, v in timings.items()}))
-    del tail
+        return dict(accs, acc_anc=acc_a, own_anc=own_a, acc_real=acc_r, own_real=own_r)
+
+    def on_chunk(axis, ic, accs):
+        if axis == "imag" and ic == len(imag_chunks) - 1:
+            partial_dump("imag", sigma_c_imag_own_ry=accs["own_imag"])
+        if ckpt is not None:
+            t0 = time.monotonic()
+            ckpt.write(axis, ic, accs, timings=timings,
+                       host=dict(n_imag_chunks=len(imag_chunks), n_real_chunks=len(real_chunks)))
+            clock("checkpoint", t0)
+
+    accs, loop_info = stream_cd_chunks(
+        imag_chunks=imag_chunks, real_chunks=real_chunks, chi_real=chi_real, join=join_fn, tail_of=tail_fn,
+        imag_step=imag_step, real_step=real_step, resume=resume, on_chunk=on_chunk, stop_after=stop_after,
+        accs=dict(acc_imag=acc_imag, own_imag=own_imag, acc_real=acc_real, own_real=own_real,
+                  acc_anc=acc_anc, own_anc=own_anc))
+    acc_imag, own_imag, acc_real, own_real, acc_anc, own_anc = (
+        accs[k] for k in ("acc_imag", "own_imag", "acc_real", "own_real", "acc_anc", "own_anc"))
+    del accs
+    ckpt_note = dict(mode=ckpt_mode, path=None if ckpt is None else ckpt.path,
+                     writes=0 if ckpt is None else ckpt.writes, seconds=0.0 if ckpt is None else ckpt.seconds,
+                     state_bytes=0 if ckpt is None else ckpt.nbytes,
+                     seconds_before_resume=None if resume is None else resume["timings"], **loop_info)
+    if instrument and (
+            loop_info["stopped"] or loop_info["imag_truncated"] or stop_after["real_from"] is not None):
+        # LORRAX_CD_STOP_AFTER: the run is a timing probe.  Its record, then the same refusal on every rank.
+        stop = dict(recipe=CD_RECIPE, stop_after=stop_after, loop=ckpt_note, seconds=timings,
+                    elapsed_s=time.monotonic() - started, J=J, J_pad=J_pad, reach_ev=real_ry[J - 1] * EV,
+                    need_ev=need * EV, need_window_ev=need_window * EV, imaginary_nodes=n_imag,
+                    n_imag_pad=n_imag_pad, chunk_imag=chunk_i, chunk_real=chunk_r,
+                    n_imag_chunks=len(imag_chunks), n_real_chunks=len(real_chunks), nk=nk, nq_irr=nq_irr,
+                    nq_pad=nq_pad, n_packed=n, window=[m0, m1], own_window=[m0 + o0, m1], ndev=ndev,
+                    bytes_per_node_imag=chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis="imag"),
+                    bytes_per_knot_real=chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis="real"),
+                    sigma_x_identity=sx_note, residue_bands=band_summary, chi0_rule=chi_rule,
+                    chi0_calls=chi0_calls, band_tile=min(band_tile, L), slab_block=slab_block,
+                    qz_flat_rows=[QZ.flat_rows(chunk_i), QZ.flat_rows(chunk_r)],
+                    memory_plan_gb=dict({k: v / 1e9 for k, v in mem_plan["phases"].items()},
+                                        peak=mem_plan["peak_bytes"] / 1e9, peak_phase=mem_plan["peak_phase"]))
+        if rank0 and run_dir is not None:
+            with open(os.path.join(run_dir, "cd_stop_receipt.json"), "w") as fh:
+                json.dump(stop, fh, indent=1, default=str)
+            with open(os.path.join(run_dir, "cd_leak_ledger.csv"), "w") as fh:
+                cols = list(ledger[0])
+                fh.write(",".join(cols) + "\n")
+                for row in ledger:
+                    fh.write(",".join(str(row[c]) for c in cols) + "\n")
+        barrier("cd_stop_after")
+        _say(print_fn, started, "stop-after reached " + json.dumps({k: round(v, 1) for k, v in timings.items()}))
+        raise CdStopAfter(f"LORRAX_CD_STOP_AFTER {json.dumps(stop_after)} reached after {json.dumps(loop_info)}; "
+                          "cd_stop_receipt.json written; no Sigma is finalized (instrument run)")
 
     # ---- assemble: cube on the file wedge -> padded band carrier -> full BZ ---------------------------
     t0 = time.monotonic()
@@ -1279,9 +1618,12 @@ def compute_sigma_c_cd_omega_grid(
                    residue_bands=band_summary, chi0_rule=chi_rule, band_tile=min(band_tile, L),
                    psi_slab_bands=[L, L_neg], slab_block=slab_block, qz_flat_rows=[QZ.flat_rows(chunk_i), QZ.flat_rows(chunk_r)],
                    memory_plan_gb=dict({k: v / 1e9 for k, v in mem_plan["phases"].items()},
-                                       peak=mem_plan["peak_bytes"] / 1e9, peak_phase=mem_plan["peak_phase"]))
+                                       peak=mem_plan["peak_bytes"] / 1e9, peak_phase=mem_plan["peak_phase"]),
+                   own_energy_band_min=m0 + o0 + 1, own_window=[m0 + o0, m1], need_window_ev=need_window * EV,
+                   checkpoint=ckpt_note)
     if rank0 and run_dir is not None:
-        np.savez(os.path.join(run_dir, "cd_sigma_own_energy.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
+        np.savez(os.path.join(run_dir, "cd_sigma_own_energy.npz"), kw_rows=kw_rows, bands0=np.arange(m0 + o0, m1),
+                 window_bands0=np.arange(m0, m1),
                  eps_own_ry=eps_own[:nk_red], sigma_c_own_ry=own, sigma_c_anchor_own_ry=parts["anchor"],
                  sigma_c_imag_own_ry=parts["imag"], sigma_c_real_own_ry=parts["real"],
                  sigma_x_diag_ry=np.real(np.diagonal(sx_cd_h, axis1=1, axis2=2)),

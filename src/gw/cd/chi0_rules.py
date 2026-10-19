@@ -354,8 +354,13 @@ def save_rules(path, payload):
     return sha
 
 
-def load_rules(path):
-    """Read a complete rule file (sha256 sidecar checked when present)."""
+def load_rules(path, *, allow_partial=False):
+    """Read a complete rule file (sha256 sidecar checked when present).
+
+    ``allow_partial`` admits a partial (``--windows`` census) build; only an instrument run of
+    ``LORRAX_CD_STOP_AFTER`` passes it, and ``gw.cd.sigma.bank_chi0`` then refuses any point of an
+    unbuilt window (GATE cd_chi0_rule_unbuilt).
+    """
     with open(path, "rb") as fh:
         data = fh.read()
     side = path + ".sha256"
@@ -366,7 +371,7 @@ def load_rules(path):
     payload = pickle.loads(data)
     if payload.get("identity", {}).get("version") != RULES_VERSION:
         raise ValueError(f"GATE cd_chi0_rules_file: {path} is not a {RULES_VERSION} rule file")
-    if payload.get("partial"):
+    if payload.get("partial") and not allow_partial:
         raise ValueError(f"GATE cd_chi0_rules_file: {path} is a partial (census) build; merge every window first")
     return payload
 

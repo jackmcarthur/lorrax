@@ -774,7 +774,9 @@ def compute_screening_model(
                 knot_chunk=int(config.sigma.cd_knot_chunk), band_tile=int(config.sigma.cd_band_tile),
                 chi0_rule_tolerance=float(config.sigma.cd_chi0_rule_tolerance),
                 chi0_rule_capacity=int(config.sigma.cd_chi0_rule_capacity),
-                chi0_rules_file=str(config.sigma.cd_chi0_rules_file), run_dir=run_dir)}
+                chi0_rules_file=str(config.sigma.cd_chi0_rules_file),
+                own_energy_band_min=int(config.sigma.cd_own_energy_band_min),
+                checkpoint=str(config.sigma.cd_checkpoint), run_dir=run_dir)}
         if config.sigma.w_model == "shared_pole":
             from .shared_pole_screening import screen_shared_poles
             return screen_shared_poles(
