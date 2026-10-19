@@ -647,6 +647,24 @@ def qz_flat_programs(mesh_xy, *, nq_irr, n):
                            rows=rows, flat_rows=flat_rows)
 
 
+def cd_to_qpar_program(mesh_xy, pad_rows):
+    """[nq, n, n] face -> [nq + pad_rows, n, n] on P(('x','y'), None, None), staged like qz_flat_programs' to_qz.
+
+    q is padded on the face (q is unsharded there: a local pad), then x and then y move onto q, one
+    all-to-all each.  The fused pad + reshard of an nq that P does not divide (ZnO: 48 q, P = 64) makes XLA
+    replicate the whole operator ("involuntary full rematerialization", 82 GB per device at n = 9600).
+    """
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    mid3 = NamedSharding(mesh_xy, P("x", None, "y"))
+    qpar3 = NamedSharding(mesh_xy, P(("x", "y"), None, None))
+
+    def cd_to_qpar(a):
+        a = jnp.pad(a, ((0, pad_rows), (0, 0), (0, 0))) if pad_rows else a * 1.0
+        a = jax.lax.with_sharding_constraint(a, face)
+        return jax.lax.with_sharding_constraint(a, mid3)
+    return jax.jit(cd_to_qpar, out_shardings=qpar3)
+
+
 def carrier_band_blocks(src, mesh_xy, *, unfold=None):
     """``block(lo, width)`` -> psi[:, lo:lo + width] on the full k grid, replicated: one band block of the carrier.
 
@@ -1404,8 +1422,7 @@ def compute_sigma_c_cd_omega_grid(
     take_z = jax.jit(lambda flat, nz_, iz: jax.lax.dynamic_index_in_dim(
         QZ.rows(flat, nz_).reshape((nq_irr, nz_, n, n)), iz, axis=1, keepdims=False), static_argnums=1,
         out_shardings=face)
-    to_qpar = jax.jit(lambda a: (jnp.pad(a, ((0, pad_rows), (0, 0), (0, 0))) if pad_rows else a * 1.0),
-                      out_shardings=qpar3)
+    to_qpar = cd_to_qpar_program(mesh_xy, pad_rows)
     stack_q = jax.jit(lambda *a: jnp.stack(a), out_shardings=qpar4)
 
     def full_zone(flat, nz_):
