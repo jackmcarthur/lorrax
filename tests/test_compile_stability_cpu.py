@@ -251,22 +251,15 @@ def test_polar_stack_has_no_host_callback():
 
 
 def test_zeta_factor_has_no_host_callback(capsys):
-    """The charge ζ factor, replicated and q-parallel, holds no host callback; its
-    rank receipt prints on the host, and the two schedules agree: B bit for bit on cpu,
-    the gauge-free C⁺ = B Bᴴ to rounding on a GPU (:func:`_stack_matches_single`)."""
+    """The charge ζ factor (the rank-truncated pseudo-inverse, its eigh on the face) holds no
+    host callback; its rank receipt prints on the host."""
     from isdf import core
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
     c = jax.device_put(_hermitian(8, b=4, seed=5), NamedSharding(mesh, P(None, "x", "y")))
-    f = core._factor_c_q_replicated(c, mesh, 8, zeta_rcond=1e-8)
-    g = core._factor_c_q_replicated_qparallel(c, mesh, 8, zeta_rcond=1e-8)
-    programs = [cache[next(k for k in cache if k[1:] == (4, 8, 8, 1e-8))]
-                for cache in (core._replicated_chol_cache, core._qparallel_factor_cache)]
-    assert [_host_callbacks(p.lower(c)) for p in programs] == [0, 0]
-    if jax.default_backend() == "cpu":
-        assert np.array_equal(np.asarray(f), np.asarray(g))
-    else:   # B's columns carry the eigensolver's phase; C⁺ = B Bᴴ does not
-        _stack_matches_single(*(b @ jnp.conj(jnp.swapaxes(b, -1, -2)) for b in (f, g)))
-    assert capsys.readouterr().out.count("[zeta rank_truncate] n_log=8 rcond=1.0e-08 n_keep/q=[8 8 8 8]") == 2
+    core._factor_c_q_face(c, mesh, 8, zeta_rcond=1e-8)
+    program = core._charge_face_cache[next(k for k in core._charge_face_cache if k[1:] == (4, 8, 8, 1e-8))]
+    assert _host_callbacks(program.lower(c)) == 0
+    assert capsys.readouterr().out.count("[zeta rank_truncate] n_log=8 rcond=1.0e-08 n_keep/q=[8 8 8 8]") == 1
 
 
 _REUSE = textwrap.dedent("""
