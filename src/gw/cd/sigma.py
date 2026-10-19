@@ -885,6 +885,19 @@ CD_CHECKPOINT_MODES = ("off", "write", "resume")
 CD_CHECKPOINT_FILE = os.path.join("tmp", "cd_checkpoint.h5")
 #: Deck keys a continuation leg rewrites without changing the result; :func:`cd_deck_digest` drops them.
 CD_RESUME_FREE_KEYS = ("cd_checkpoint", "restart")
+#: The code the replicated accumulators are computed by (:func:`cd_accumulator_code_digest`): these
+#: functions of this module, the Sigma consumer up to :data:`CD_ASSEMBLE_MARKER`, and the modules the chi0
+#: values, the knot laws and the imaginary-axis rule come from.  The checkpoint identity carries their digest,
+#: not the repository commit, so a continuation leg on a commit that changes only post-processing (the
+#: assemble/unfold tail, :func:`cd_on_shell_body`, the finalize and the output stage) resumes.
+CD_ACCUMULATOR_FUNCTIONS = (
+    "residue_reach_need", "own_energy_window", "band_rung", "residue_band_tables", "table_specs", "pair_rows",
+    "contract", "tile_sum", "build_contraction_kernels", "build_dyson_kernels", "qz_flat_programs",
+    "carrier_band_blocks", "pair_psi_slabs", "knot_chunk", "cd_chunk_plan", "chunk_bytes_per_unit",
+    "band_bytes_per_unit", "cd_memory_plan", "bank_chi0", "real_replay_start", "stream_cd_chunks")
+CD_ACCUMULATOR_MODULES = ("gw.cd.chi0_rules", "gw.cd.laws", "gw.cd.rule", "gw.response_bank")
+#: Where the Sigma consumer's accumulator part ends (the source line of its assemble step).
+CD_ASSEMBLE_MARKER = "# ---- assemble:"
 
 
 def residue_reach_need(omega, eps_own, enk_L, f_L):
@@ -962,6 +975,49 @@ def cd_deck_digest(path):
                 if line and key not in CD_RESUME_FREE_KEYS:
                     lines.append(f"{key}={pair.group(2).strip()}" if pair else line)
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()
+
+
+def cd_accumulator_code_digest(sources=None):
+    """sha256 of the code the CD accumulators are computed by (:data:`CD_ACCUMULATOR_FUNCTIONS`, the Sigma
+    consumer up to :data:`CD_ASSEMBLE_MARKER`, :data:`CD_ACCUMULATOR_MODULES`, ``GH``, ``FD9``, ``CD_RECIPE``).
+
+    ``sources`` (tests): a name -> source text map that replaces :func:`inspect.getsource` for those names.
+    GATE cd_accumulator_digest: the consumer's source must carry the marker, so the boundary cannot drift
+    silently past the accumulators.
+    """
+    import hashlib
+    import importlib
+    import inspect
+    import sys
+    mod = sys.modules[__name__]
+    sources = sources or {}
+
+    def text(name, obj):
+        return sources[name] if name in sources else inspect.getsource(obj)
+    h = hashlib.sha256()
+    for name in CD_ACCUMULATOR_FUNCTIONS:
+        h.update(f"\0{name}\0".encode())
+        h.update(text(name, getattr(mod, name)).encode())
+    head, found, _ = text("compute_sigma_c_cd_omega_grid", compute_sigma_c_cd_omega_grid).partition(
+        CD_ASSEMBLE_MARKER)
+    if not found:
+        raise ValueError(f"GATE cd_accumulator_digest: compute_sigma_c_cd_omega_grid has no {CD_ASSEMBLE_MARKER!r} "
+                         "line; why: the checkpoint identity hashes the consumer up to its assemble step")
+    h.update(b"\0compute_sigma_c_cd_omega_grid\0")
+    h.update(head.encode())
+    for name in CD_ACCUMULATOR_MODULES:
+        h.update(f"\0{name}\0".encode())
+        h.update(text(name, importlib.import_module(name)).encode())
+    h.update(json.dumps(dict(GH=GH, FD9=[float(v) for v in FD9], CD_RECIPE=CD_RECIPE), sort_keys=True,
+                        default=str).encode())
+    return h.hexdigest()
+
+
+def cd_checkpoint_identity(**parts):
+    """The :class:`CdCheckpoint` identity: the run's inputs (``parts``: deck digest, chi0 rule, geometry,
+    tiling) and :func:`cd_accumulator_code_digest`; json round trip so the stored record compares equal.
+    No repository commit: the commit rides in the record's ``host`` as provenance only."""
+    return json.loads(json.dumps(dict(parts, accumulator_code=cd_accumulator_code_digest()), default=str))
 
 
 def real_replay_start(start, chunk, gh=GH):
@@ -1451,15 +1507,17 @@ def compute_sigma_c_cd_omega_grid(
         raise ValueError(f"GATE cd_checkpoint: cd_checkpoint got: {ckpt_mode!r}; want: {' | '.join(CD_CHECKPOINT_MODES)}")
     imag_chunks = [(c0, c0 + chunk_i) for c0 in range(0, n_imag_pad, chunk_i)]
     real_chunks = [(j0, j0 + chunk_r) for j0 in range(0, J_pad, chunk_r)]
-    ckpt = resume = None
+    ckpt = resume = ckpt_tree = None
     if ckpt_mode != "off":
-        import hashlib
         from gw.kin_ion_io import _generator_commit
+        ckpt_tree = _generator_commit()                # provenance only (record host), not identity
+        import hashlib
         if run_dir is None:
             raise ValueError("GATE cd_checkpoint: cd_checkpoint got: a mode with no run directory; want: a deck run")
-        # Everything the accumulators depend on; json round trip so the stored record compares equal.
-        identity = json.loads(json.dumps(dict(
-            deck_sha256=cd_deck_digest(getattr(config, "input_file", "") or ""), tree=_generator_commit(),
+        # Everything the accumulators depend on: the inputs below and the accumulator code digest
+        # (cd_checkpoint_identity), not the repository commit, which rides in the record's host.
+        identity = cd_checkpoint_identity(
+            deck_sha256=cd_deck_digest(getattr(config, "input_file", "") or ""),
             recipe=CD_RECIPE, chi0=CD_RECIPE.get("chi0"),
             chi0_rule_tolerance=float(cd_handle.get("chi0_rule_tolerance", CD_CHI0_RULE_TOLERANCE)),
             chi0_rule_capacity=cd_handle.get("chi0_rule_capacity"), chi0_rule_nodes=chi_rule.get("rule_nodes"),
@@ -1470,7 +1528,7 @@ def compute_sigma_c_cd_omega_grid(
             omega_sha256=hashlib.sha256(np.ascontiguousarray(omega).tobytes()).hexdigest(), eta_ry=eta,
             knot_step_ry=h_ry, J=J, J_pad=J_pad, imaginary_nodes=n_imag, n_imag_pad=n_imag_pad,
             chunk_imag=chunk_i, chunk_real=chunk_r, stop_after_imag=stop_after["imag"],
-            stop_after_real_from=stop_after["real_from"]), default=str))
+            stop_after_real_from=stop_after["real_from"])
         ckpt = CdCheckpoint(os.path.join(run_dir, CD_CHECKPOINT_FILE), identity, mesh_xy, print_fn=print_fn)
         if ckpt_mode == "resume":
             resume = ckpt.read()
@@ -1561,7 +1619,7 @@ def compute_sigma_c_cd_omega_grid(
         if ckpt is not None:
             t0 = time.monotonic()
             ckpt.write(axis, ic, accs, timings=timings,
-                       host=dict(n_imag_chunks=len(imag_chunks), n_real_chunks=len(real_chunks)))
+                       host=dict(n_imag_chunks=len(imag_chunks), n_real_chunks=len(real_chunks), tree=ckpt_tree))
             clock("checkpoint", t0)
 
     accs, loop_info = stream_cd_chunks(
