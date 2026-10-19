@@ -1789,6 +1789,55 @@ def add_window_parts(a: dict, b: dict) -> dict:
     return out
 
 
+def shared_pole_window_source(model: dict, meta, *, efermi_ry: float, linalg) -> dict:
+    """The ``poles`` argument of :func:`window_sigma_c` for a scalar shared-pole model.
+
+    ``model`` is the screening handle (``path``, ``identity``, ``digest``, ``K``) of
+    ``gw.shared_pole_screening.screen_shared_poles``; ``meta`` the bundle whose
+    ``shared_pole_recipe`` and ``shared_pole_capacity`` built it (the Σ stage's
+    eta gate and model validation read them); ``efermi_ry`` the omega frame of the
+    run's shared-pole Σ stage (``efermi.resolve_sigma_efermi_ry``); ``linalg`` the
+    deck's resolved dense layout (``gw_config.linalg_resolution(...).layout``),
+    which places the W(τ) synthesis.
+    """
+    return dict(member="shared_pole", model=dict(model), meta=meta, efermi_ry=float(efermi_ry),
+                linalg=linalg)
+
+
+def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal_bands, *,
+                            request_for, omega_grid_ry, keep_branches, print_fn):
+    """One window sweep of a shared-pole model: the run's shared-pole Σ stage on the window carrier.
+
+    ``gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`` (``sigma_w_model =
+    "shared_pole"``) with the causal branches of the band populations ``pop``
+    (:func:`_population_branches`, restricted to ``internal_bands``), the run's
+    ω frame, broadening and quadrature, and the plan's held session.  Returns
+    the executor's result with ``efermi_ry`` set to the frame.
+    """
+    from .mpa.sigma import compute_sigma_c_mpa_omega_grid
+    model, efermi = source["model"], float(source["efermi_ry"])
+    cfg = plan["sigma_cfg"]
+    request = None if request_for is None else request_for(efermi)
+    omega = omega_grid_ry if request is None else request.frequencies_ry
+    s = wfns_t.slices
+    branches = _population_branches(
+        omega, np.asarray(jax.device_get(wfns_t.enk), np.float64)[:, s.full], efermi,
+        pop if internal_bands is None else internal_bands.weights(pop),
+        internal=None if internal_bands is None else internal_bands.mask)
+    res = compute_sigma_c_mpa_omega_grid(
+        wfns_t, model["path"], meta_t, mesh_xy, sigma_w_model="shared_pole",
+        fit_identity=model["identity"], fit_digest=model["digest"], request=request,
+        omega_grid_ry=None if request is not None else omega_grid_ry, efermi_ry=efermi,
+        regularization_width_ry=float(cfg.regularization_ev) / RYD_TO_EV,
+        edge_factor=float(cfg.window_edge_factor), quadrature_eps=float(cfg.quadrature_eps),
+        omega_grid_step_ry=float(cfg.omega_step_ev) / RYD_TO_EV,
+        pole_batch_size=int(plan["mpa_cfg"].pole_batch_size),
+        expected_screening_diagrams=plan["screening_diagrams"], sigma_branches=branches,
+        fixed_quadrature_session=plan.get("session"), linalg=source.get("linalg"),
+        keep_branches=keep_branches, print_fn=print_fn)
+    return replace(res, efermi_ry=efermi)
+
+
 def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omega_ry=None,
                    omit_frozen: bool = False, branches: bool = False,
                    static_limit: bool = False, internal: str | None = None,
@@ -1812,7 +1861,12 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         at the centroids, ``green_parent``; energies ``enk`` and step
         occupations ``occ``, Ry).  Held for the run, never modified.  Its parent
         rows must be the full zone (a general drive breaks the point group).
-    poles : :class:`PPMBuildResult` — :func:`fit_pole_model` / :func:`screening_update`.
+    poles : :class:`PPMBuildResult` (:func:`fit_pole_model` / :func:`screening_update`), or a
+        shared-pole source, :func:`shared_pole_window_source`: the scalar shared-pole model
+        of a GW run (or of a refit at other occupations) swept by the run's own
+        shared-pole Σ stage (``gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`` with
+        ``sigma_w_model = "shared_pole"``); it has no invalid modes, so its
+        ``branch_pair['static']`` is zero.
     window : ``dict(b_lo, U, e, f)`` — the active window [b_lo, b_lo + n_A) on the
         bundle's band axis: U (nk, n_A, n_A) the instantaneous orbitals'
         columns in the band basis, e (nk, n_A) their energies (Ry, the
@@ -1849,9 +1903,11 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     keep_frozen : with ``internal = "frozen"`` only: (nb_full,) bool, the frozen
         bands kept in the sum (a truncation; its error is measured, not bounded).
     static_limit_wc0 : with ``static_limit`` only: the W^c(0) of the static limit,
-        (nq, mu, mu) as ``poles.Wc0_q`` (default ``poles.Wc0_q``).  A refreshed-
-        screening collision term sweeps the poles of W(t) and subtracts the static
-        limit of the run's W0, the part K drho already holds (td_agw_dynamical.md §7.1).
+        (nq, mu, mu) as ``poles.Wc0_q`` (default ``poles.Wc0_q``; required for a
+        shared-pole source, whose static value is its model's,
+        ``gw.mpa.sigma.shared_pole_static_wc``).  A refreshed-screening collision term
+        sweeps the poles of W(t) and subtracts the static limit of the run's W0, the
+        part K drho already holds (td_agw_dynamical.md §7.1).
 
     Returns
     -------
@@ -1942,7 +1998,13 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     # bundle holds any, would be the unrotated window and are dropped.
     wfns_t = replace(wfns, enk=put(enk_t), slices=slices_t, green_parent=carrier_t,
                      psi_nmu=None, psi_mun=None)
-    meta_t = dataclasses.replace(meta, b_id_3=int(meta.b_id_0) + b_hi)
+    spm = isinstance(poles, dict) and poles.get("member") == "shared_pole"
+    if spm and static_limit and static_limit_wc0 is None:
+        raise ValueError("GATE window_sigma_static_wc0: got a shared-pole source without "
+                         "static_limit_wc0; want the model's W^c(0) (gw.mpa.sigma."
+                         "shared_pole_static_wc); fix: pass static_limit_wc0")
+    meta_src = poles.get("meta", meta) if spm else meta
+    meta_t = dataclasses.replace(meta_src, b_id_3=int(meta.b_id_0) + b_hi)
     head = None if internal == "frozen" else plan.get("head")
     nb_sig = int(slices_t.nb_sigma)
     built = {}
@@ -1963,6 +2025,11 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
 
     def run(omega_grid=None, keep_branches=False):
         """On shell (``omega_grid`` None) or on that grid (the debug route)."""
+        if spm:
+            return _shared_pole_window_run(
+                wfns_t, poles, meta_t, mesh_xy, plan, pop, internal_bands,
+                request_for=request_for if omega_grid is None else None,
+                omega_grid_ry=omega_grid, keep_branches=keep_branches, print_fn=quiet)
         return compute_sigma_c_ppm_omega_grid(
             wfns_t, poles, meta_t, mesh_xy, ppm_cfg=plan["ppm_cfg"],
             sigma_cfg=plan["sigma_cfg"], mpa_cfg=plan["mpa_cfg"],
@@ -2020,7 +2087,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         from .cohsex_sigma import build_Gij
         sigma_sx, _, W_all = _invalid_static_kernels(
             wfns_t, poles.Wc0_q if static_limit_wc0 is None else static_limit_wc0, True,
-            meta_t, mesh_xy, poles.q_wedge)
+            meta_t, mesh_xy, None if spm else poles.q_wedge)
         state = _population_state(pop if internal_bands is None else
                                   internal_bands.weights(pop), meta_t, pop.shape)
         sx = sigma_sx(wfns_t, build_Gij(meta_t, mesh_xy, state), W_all)

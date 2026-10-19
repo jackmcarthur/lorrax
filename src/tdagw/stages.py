@@ -313,7 +313,8 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             "lorrax.collision", "lorrax.collision_source", "lorrax.collision_hermitian",
             "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
             "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
-            "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev")}
+            "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev",
+            "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev")}
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
               nk=int(system.nk), nb=int(system.nb), nspinor=int(system.nspinor),
               measurements=[[n, t, {k: kw[k] for k in sorted(kw)}]
@@ -534,11 +535,12 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
 
 
 def collision_source(deck: TdDeck, mesh, *, say=None):
-    """The GN-PPM source of ``[lorrax] collision`` (None when off).
+    """The GW source of ``[lorrax] collision`` (None when off): a GN-PPM or shared-pole run.
 
     Runs the GW driver on a copy of ``collision_source`` in
-    ``outdir/collision_source`` (``tdagw.dynsig.gnppm_source``: the run's own
-    carrier, poles and head; no restart written).  Collective; call it before
+    ``outdir/collision_source`` (``tdagw.dynsig.gw_window_source``: the run's own
+    carrier, screening model and head, and with refreshed or shared-pole screening
+    the inputs of its W stage; no restart written).  Collective; call it before
     the TD driver's ``RunSession`` (the GW driver owns the timing table and
     stdout while it runs).  ``say`` gets its one line (None: kept in the
     returned dict's ``line`` for the run log).
@@ -546,12 +548,12 @@ def collision_source(deck: TdDeck, mesh, *, say=None):
     v = deck.values
     if v["lorrax.collision"] == "off":
         return None
-    from tdagw.dynsig import gnppm_source
+    from tdagw.dynsig import gw_window_source
     lines = []
     work = os.path.join(os.path.abspath(str(v["control.files.outdir"])), "collision_source")
-    src = gnppm_source(v["lorrax.collision_source"], mesh, workdir=work,
-                       screening=v["lorrax.collision_screening"] == "refreshed",
-                       say=say or lines.append)
+    src = gw_window_source(v["lorrax.collision_source"], mesh, workdir=work,
+                           screening=v["lorrax.collision_screening"] in ("refreshed", "shared_pole"),
+                           say=say or lines.append)
     src["line"] = lines[0] if lines else ""
     return src
 
@@ -560,7 +562,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
                       mesh, *, say, log):
     """The held collision term on the operators (``ops.collision``) and the model (§1.5).
 
-    ``tdagw.dynsig.gnppm_collision`` at ρ_eq: the dissipator of the equilibrium
+    ``tdagw.dynsig.window_collision`` at ρ_eq: the dissipator of the equilibrium
     rates (``ops.collision``; the Magnus steps' remainder, ``cfg.remainder``),
     the held ΔΣ^h (zero at t0; ``tdagw.self_energy.with_held_term``) and the
     refresh hook.  Its stdout lines go to ``log.refresh`` (the log's
@@ -568,7 +570,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
     model, cfg).
     """
     from tdagw import collision as C
-    from tdagw.dynsig import gnppm_collision
+    from tdagw.dynsig import window_collision
     from tdagw.self_energy import with_held_term
     v = deck.values
     emit = say if log is None else log.refresh
@@ -576,13 +578,18 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
         emit(source["line"])
     policy = C.RefreshPolicy(every=float(v["lorrax.collision_refresh_fs"]),
                              df=float(v["lorrax.collision_refresh_df"]))
-    built = gnppm_collision(source, system.ops, mesh=mesh, k_frac=system.hdr["kpts"],
-                            b_lo=int(system.bands[0]) - 1, ntr=len(deck.trials),
-                            form=v["lorrax.collision"], hermitian=v["lorrax.collision_hermitian"],
-                            policy=policy, sweep=v["lorrax.collision_refresh_sweep"],
-                            screening=v["lorrax.collision_screening"],
-                            frozen_bands=v["lorrax.collision_frozen_bands"],
-                            screening_gamma_ev=v["lorrax.collision_screening_gamma_ev"], say=emit)
+    rebase = {"auto": None, "on": True, "off": False}[v["lorrax.collision_rebase"]]
+    built = window_collision(source, system.ops, mesh=mesh, k_frac=system.hdr["kpts"],
+                             b_lo=int(system.bands[0]) - 1, ntr=len(deck.trials),
+                             form=v["lorrax.collision"], hermitian=v["lorrax.collision_hermitian"],
+                             policy=policy, sweep=v["lorrax.collision_refresh_sweep"],
+                             screening=v["lorrax.collision_screening"],
+                             frozen_bands=v["lorrax.collision_frozen_bands"],
+                             screening_gamma_ev=v["lorrax.collision_screening_gamma_ev"],
+                             rebase=rebase,
+                             spm_support_sites=v["lorrax.collision_spm_support_sites_ev"],
+                             spm_scratch=os.path.join(os.path.abspath(str(
+                                 v["control.files.outdir"])), "collision_refits"), say=emit)
     every = policy.every * tdgw_io.T_IN_ATTOSEC / 1000.0
     fb = v["lorrax.collision_frozen_bands"]
     say(f"  collision       : {v['lorrax.collision']}, hermitian "
@@ -590,6 +597,11 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
         f"{v['lorrax.collision_screening']} screening"
         + ("" if v["lorrax.collision_screening"] != "refreshed" else
            f" (same-side principal value {v['lorrax.collision_screening_gamma_ev']:g} eV)")
+        + ("" if v["lorrax.collision_screening"] != "shared_pole" else
+           f" (full refit every refresh; supports "
+           f"{v['lorrax.collision_spm_support_sites_ev'] or 'the production ladder'})")
+        + ("" if v["lorrax.collision_screening"] == "frozen" else
+           f"; C[rho_eq] {'rebased on W(t)' if built['rebase'] else 'at the t0 rates'}")
         + ("" if fb is None else f" (frozen change over {fb[0]} + {fb[1]} bands)") + "; refresh "
         + (" or ".join(([f"every {every:g} fs"] if policy.every else [])
                        + ([f"max|df| >= {policy.df:g}"] if policy.df else []))

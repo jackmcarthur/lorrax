@@ -1614,6 +1614,17 @@ def _compute_mpa_sigma(
             occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+    from .ppm_pipeline import observing_window_source, publish_window_source
+    if (sigma_w_model == "shared_pole" and observing_window_source()
+            and sector_handle.get("representation") != "sector-ordered-ph"):
+        # TD-aGW's window Sigma reads the scalar shared-pole Sigma stage here
+        # (ppm_pipeline.observe_window_sigma_source); with no open block this
+        # is one empty list test and the stage is unchanged.
+        publish_window_source(
+            member="shared_pole", wfns=wfns, meta=meta, config=config,
+            model=dict(W_by_role["shared_pole"]), head=head_diag, efermi_ry=sigma_efermi_ry,
+            request=request, occupation_state=occupation_state,
+            linalg=linalg_resolution({"linalg": config.backend.linalg}).layout)
     body_omega, body_odd = body.sigma_c_kij, body.sigma_c_odd_kij
     body_unextrap = extrap_payload = None
     if plan is not None:

@@ -260,7 +260,7 @@ does not (§1.6).
 Refreshed screening is a measured prototype, not a production setting. On the
 516 drives the subtracted form keeps `C[rho_eq]` at the t0 rates, and the
 change of its regularization tails with W raises the carrier density by
-43–58 %; the Python option `gnppm_collision(rebase=True)` (no deck key yet)
+43–58 %; the Python option `window_collision(rebase=True)` (no deck key yet)
 removes it. At 3e9 V/m the held ΔΣ^h jumps by up to 77 meV between refreshes,
 following the invalid-mode flips in the refresh lines, and P(t) does not
 converge with the cadence. Read the flips column before trusting a run.

@@ -5,7 +5,7 @@
 
 docs/theory/td_agw_dynamical.md §1.5.  One JSON file DIR/collision_516.json (rank
 0; rewritten after every section) and ``RESULT {...}``.  The 07 arm is read-only:
-the collision source is the production one (``tdagw.dynsig.gnppm_source``: the
+the collision source is the production one (``tdagw.dynsig.gw_window_source``: the
 GW driver in this process on a copy of the deck in DIR/driver), the TD runs go
 through ``tdagw.stages.propagate(collision=...)``.
 
@@ -252,7 +252,7 @@ def main():
     # ---- the collision source: the GW driver in this process (production path) ----
     src = None
     with section("source"):
-        src = D.gnppm_source(os.path.join(ref, "oneshot.in"), mesh,
+        src = D.gw_window_source(os.path.join(ref, "oneshot.in"), mesh,
                              workdir=os.path.join(os.path.abspath(a.out), "driver"),
                              screening=bool({"CS", "C0", "CD"} & sections), say=say)
         meta = src["meta"]
@@ -300,7 +300,7 @@ def main():
     # ---- the t0 collision term on the window (production member) ----
     coll = None
     with section("t0"):
-        coll = D.gnppm_collision(src, sysw.ops, mesh=mesh, k_frac=sysw.hdr["kpts"], b_lo=b_lo,
+        coll = D.window_collision(src, sysw.ops, mesh=mesh, k_frac=sysw.hdr["kpts"], b_lo=b_lo,
                                  ntr=1, form="subtracted", hermitian="dynamic", say=say)
         out["t0"] = {k: v for k, v in coll["t0"].items() if k != "line"}
     bundle_of = None if coll is None else coll["bundle_of"]
@@ -686,12 +686,12 @@ def main():
             raw = _td_deck(ref, (b_lo, b_hi), os.path.join(a.out, "td", "drive_sub_active"),
                            tf_fs=a.drive_fs, efield=PULSE, collision="subtracted",
                            refresh_fs=a.refresh_fs, refresh_df=a.refresh_df, sweep="active")
-            orig = D.gnppm_collision
-            D.gnppm_collision = lambda *x, **kw: orig(*x, **dict(kw, check_full=True))
+            orig = D.window_collision
+            D.window_collision = lambda *x, **kw: orig(*x, **dict(kw, check_full=True))
             try:
                 rr = summarize_run(td_run("drive_sub_active", raw, sysw, model), rho_eq_w)
             finally:
-                D.gnppm_collision = orig
+                D.window_collision = orig
             sd = dict(run=rr)
             hist = (rr.get("collision") or {}).get("history", [])
             fv = [h["full_vs_split"] for h in hist if "full_vs_split" in h]
@@ -891,18 +891,18 @@ def main():
                                        screening=scr_, degeneracy=deg,
                                        frozen_bands=fb if scr_ == "refreshed" else None,
                                        gamma_ev=a.cd_gamma_ev)
-                        orig = D.gnppm_collision
+                        orig = D.window_collision
                         extra = {}
                         if a.cd_check_trunc and scr_ == "refreshed" and fb is not None:
                             extra["check_truncation"] = True
                         if a.cd_rebase and scr_ == "refreshed":
                             extra["rebase"] = True
                         if extra:
-                            D.gnppm_collision = lambda *x, **kw: orig(*x, **dict(kw, **extra))
+                            D.window_collision = lambda *x, **kw: orig(*x, **dict(kw, **extra))
                         try:
                             r = summarize_run(td_run(tag, raw, sys_cd, model_cd), rho_eq_cd)
                         finally:
-                            D.gnppm_collision = orig
+                            D.window_collision = orig
                         cd[tag] = dict(r, window=[lo, hi], amp=amp, cadence_fs=cad, screening=scr_,
                                        frozen_bands=fb)
                         _save()

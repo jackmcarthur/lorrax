@@ -972,15 +972,20 @@ def parse_support_sites(text):
     and the Zolotarev imaginary geometric ladder together. Sites are strictly
     increasing; line sites are >= 0 and imaginary sites > 0, with at least two
     imaginary sites so the held geometric midpoints stay defined. The height
-    (4*eta), the held fractions, the widths and every gate are unchanged, so an
-    override run is the same construction on a different support set.
+    (max(2.6 eV, 4*eta)), the held fractions, the widths and every gate are
+    unchanged, so an override run is the same construction on a different
+    support set. An optional third field ``"| <height eV>"`` (> 0) sets the line
+    ladder's height Im z instead (every line and held line site): a lower line
+    resolves structure closer to the real axis (TD-aGW's low-energy support set,
+    docs/theory/td_agw_dynamical.md §1.4); the two-field text is the
+    incumbent, bit for bit.
     """
     text = str(text).strip()
     if not text:
         return None
     parts = text.split('|')
-    if len(parts) != 2:
-        raise ValueError(f"GATE shared_pole_support_sites: got: {text!r}; want: '<line eV list> | <imaginary eV list>'; why: the override replaces both ladders or neither")
+    if len(parts) not in (2, 3):
+        raise ValueError(f"GATE shared_pole_support_sites: got: {text!r}; want: '<line eV list> | <imaginary eV list> [| <line height eV>]'; why: the override replaces both ladders or neither")
 
     def sites(raw, name, floor, minimum):
         try:
@@ -999,11 +1004,20 @@ def parse_support_sites(text):
     imaginary = sites(parts[1], 'imaginary', 0.0, 2)
     if imaginary[0] <= 0.0:
         raise ValueError(f"GATE shared_pole_support_sites: got: imaginary site {imaginary[0]} eV; want: > 0; why: the imaginary ladder is geometric")
+    height = None
+    if len(parts) == 3:
+        try:
+            height = float(parts[2].strip())
+        except ValueError:
+            raise ValueError(f"GATE shared_pole_support_sites: got: {parts[2]!r} for the line height; want: one eV number; why: the line ladder has one height") from None
+        if not math.isfinite(height) or height <= 0.0:
+            raise ValueError(f"GATE shared_pole_support_sites: got: line height {height} eV; want: finite > 0; why: a support on the real axis has no bank evaluation")
     # repr round-trips a double exactly, so the canonical text that enters
     # recipe_hash is the geometry the stream samples, to the last bit.
     canonical = (','.join(repr(v) for v in line) + '|'
-                 + ','.join(repr(v) for v in imaginary))
-    return {'line_ev': line, 'imaginary_ev': imaginary, 'text': canonical}
+                 + ','.join(repr(v) for v in imaginary)
+                 + ('' if height is None else '|' + repr(height)))
+    return {'line_ev': line, 'imaginary_ev': imaginary, 'height_ev': height, 'text': canonical}
 
 
 def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
@@ -1269,10 +1283,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                                               height, reads, n),
             line_count, line_count_rule, support_receipt, support_session)
     if override is not None:
-        # Both ladders are replaced together; height, held fractions, widths,
-        # zero policy and every gate stay the resolver's own. u_min/u_max/kappa
-        # follow the delivered imaginary ladder so the reported scalars and the
-        # sampled geometry cannot disagree.
+        # Both ladders are replaced together; held fractions, widths, zero
+        # policy and every gate stay the resolver's own, and so does the height
+        # unless the override names one. u_min/u_max/kappa follow the delivered
+        # imaginary ladder so the reported scalars and the sampled geometry
+        # cannot disagree.
+        if override.get('height_ev') is not None:
+            height = float(override['height_ev'])
         line = np.asarray(override['line_ev'], dtype=np.float64)
         imaginary = np.asarray(override['imaginary_ev'], dtype=np.float64)
         count = int(imaginary.size)

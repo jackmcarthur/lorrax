@@ -89,26 +89,38 @@ _WINDOW_SOURCE_OBSERVERS: list = []
 
 
 class observe_window_sigma_source:
-    """Collect, from the GN/HL-PPM Sigma stage that runs inside the block, what a window Sigma reuses.
+    """Collect, from the Sigma stage that runs inside the block, what a window Sigma reuses.
 
-    TD-aGW's frozen-screening collision term (docs/theory/td_agw_dynamical.md
-    §1.5, §9 item 5) evaluates ``gw.ppm_sigma.window_sigma_c`` on the GW run's
-    own carrier and pole model.  A GN-PPM run persists W(0) but neither
-    W(i w_p) nor its poles, so the TD driver runs the GW driver in its own
-    process and reads them here, at the return of
-    :func:`compute_ppm_sigma_pipeline`: no stage is re-implemented and the
-    driver's outputs are unchanged (with no open block the seam is one empty
-    list test).  ``with observe_window_sigma_source() as src: gw_jax.main(...)``
-    leaves in ``src``: ``wfns`` (the Sigma carrier), ``meta``, ``config``,
-    ``poles`` (``PPMBuildResult``), ``head`` (``HeadSigmaDiag`` or None),
-    ``efermi_ry``, ``request`` (the run's ``OnShellRequest`` or None), ``V_q``,
-    ``quad``.  The device fields of the poles and the carrier are copied at the
-    seam (a later stage may donate the originals); the last Sigma stage of the
-    block wins.  ``screening=True`` also leaves ``fit_plan`` (the run's
-    :func:`gw.ppm_sigma.pole_fit_plan`) and ``W_supports`` (copies of the fit's
-    two W samples, W(0) and W(probe) on the fit's q set, taken right after the
-    fit): the held inputs of the TD-aGW screening update
-    (``gw.ppm_sigma.screening_update``, docs/theory/td_agw_dynamical.md Eq. 6).
+    TD-aGW's collision term (docs/theory/td_agw_dynamical.md §1.5, §9 item 5)
+    evaluates ``gw.ppm_sigma.window_sigma_c`` on the GW run's own carrier and
+    screening model.  A GN-PPM run persists W(0) but neither W(i w_p) nor its
+    poles, and a shared-pole one-shot keeps its ``model.h5`` but not the inputs
+    of its W stage, so the TD driver runs the GW driver in its own process and
+    reads them here: no stage is re-implemented and the driver's outputs are
+    unchanged (with no open block every seam is one empty list test).
+    ``with observe_window_sigma_source() as src: gw_jax.main(...)`` leaves in
+    ``src``: ``member`` (``"gn_ppm"`` or ``"shared_pole"``), ``wfns`` (the Sigma
+    carrier), ``meta``, ``config``, ``head`` (``HeadSigmaDiag`` or None),
+    ``efermi_ry``, ``request`` (the run's ``OnShellRequest`` or None) and
+
+    * GN/HL-PPM (:func:`compute_ppm_sigma_pipeline`'s return): ``poles``
+      (``PPMBuildResult``), ``V_q``, ``quad``; ``screening=True`` also
+      ``fit_plan`` (the run's :func:`gw.ppm_sigma.pole_fit_plan`) and
+      ``W_supports`` (copies of the fit's two W samples, W(0) and W(probe) on
+      the fit's q set, taken right after the fit), the held inputs of the
+      GN-PPM screening update (``gw.ppm_sigma.screening_update``, Eq. 6);
+    * shared pole (``gw.sigma_dispatch``'s scalar shared-pole Sigma stage):
+      ``model`` (the screening handle: ``path``, ``identity``, ``digest``,
+      ``K``), ``occupation_state`` (the run's), ``linalg``; ``screening=True``
+      also ``screening_inputs``, the arguments of the run's
+      ``gw.shared_pole_screening.screen_shared_poles`` (``wfns``, ``V_q``,
+      ``meta``, ``config``, ``kwargs``), taken at its entry: the held inputs of
+      the shared-pole refit (the W stage re-run at other occupations), and
+      ``recipe_inputs`` (``gw.gw_jax``'s census inputs and requested reads),
+      with which the refit re-resolves the recipe at its own census.
+
+    The device fields of the poles and the carriers are copied at the seam (a
+    later stage may donate the originals); the last stage of the block wins.
     """
 
     def __init__(self, screening: bool = False):
@@ -125,19 +137,48 @@ class observe_window_sigma_source:
 
 
 #: The fields only a ``screening=True`` observer receives.
-_SCREENING_FIELDS = ("fit_plan", "W_supports")
+_SCREENING_FIELDS = ("fit_plan", "W_supports", "screening_inputs", "recipe_inputs")
 
 
-def _publish_window_source(**fields):
-    """Hand the Sigma stage's objects to every open :class:`observe_window_sigma_source`."""
-    poles = fields["poles"]
+def observing_window_source() -> bool:
+    """Whether an :class:`observe_window_sigma_source` block is open (the seams' one test)."""
+    return bool(_WINDOW_SOURCE_OBSERVERS)
+
+
+def _copy_device(tree):
+    return jax.tree.map(lambda a: jnp.copy(a) if isinstance(a, jax.Array) else a, tree)
+
+
+def publish_window_source(**fields):
+    """Hand a Sigma or W stage's objects to every open :class:`observe_window_sigma_source`.
+
+    Device arrays of ``poles`` (a ``PPMBuildResult``), ``wfns`` and
+    ``screening_inputs`` (its ``wfns`` and ``V_q``) are copied; everything else
+    is passed by reference.  Fields in :data:`_SCREENING_FIELDS` reach only
+    ``screening=True`` observers, and are copied only when one is open.
+    """
+    if not _WINDOW_SOURCE_OBSERVERS:
+        return
+    wanted = any(obs.screening for obs in _WINDOW_SOURCE_OBSERVERS)
+    fields = {k: v for k, v in fields.items() if wanted or k not in _SCREENING_FIELDS}
     copy = lambda a: None if a is None else jnp.copy(a)
-    fields["poles"] = dataclasses.replace(
-        poles, B_q=copy(poles.B_q), Omega_q=copy(poles.Omega_q),
-        valid_mask_q=copy(poles.valid_mask_q), Wc0_q=copy(poles.Wc0_q),
-        B_odd_q=copy(poles.B_odd_q))
-    fields["wfns"] = jax.tree.map(
-        lambda a: jnp.copy(a) if isinstance(a, jax.Array) else a, fields["wfns"])
+    poles = fields.get("poles")
+    if poles is not None:
+        fields["poles"] = dataclasses.replace(
+            poles, B_q=copy(poles.B_q), Omega_q=copy(poles.Omega_q),
+            valid_mask_q=copy(poles.valid_mask_q), Wc0_q=copy(poles.Wc0_q),
+            B_odd_q=copy(poles.B_odd_q))
+    if "wfns" in fields:
+        fields["wfns"] = _copy_device(fields["wfns"])
+    if "screening_inputs" in fields:
+        inputs = dict(fields["screening_inputs"])
+        V = inputs["V_q"]                       # a jax.Array or a q-wedge operator over one
+        if isinstance(V, jax.Array):
+            V = jnp.copy(V)
+        elif dataclasses.is_dataclass(V) and isinstance(getattr(V, "values", None), jax.Array):
+            V = dataclasses.replace(V, values=jnp.copy(V.values))
+        inputs.update(wfns=_copy_device(inputs["wfns"]), V_q=V)
+        fields["screening_inputs"] = inputs
     for obs in _WINDOW_SOURCE_OBSERVERS:
         obs.source.update({k: v for k, v in fields.items()
                            if obs.screening or k not in _SCREENING_FIELDS})
@@ -984,8 +1025,9 @@ def compute_ppm_sigma_pipeline(
         del sigma_c_body_omega_n3
 
     if _WINDOW_SOURCE_OBSERVERS:              # TD-aGW's window Sigma (observe_window_sigma_source)
-        _publish_window_source(
-            wfns=wfns, meta=meta, config=config, poles=ppm, head=head_sigma_diag_w_kn_ry,
+        publish_window_source(
+            member="gn_ppm", wfns=wfns, meta=meta, config=config, poles=ppm,
+            head=head_sigma_diag_w_kn_ry,
             efermi_ry=sigma_omega.efermi_ry, request=getattr(sigma_c_body_omega, "request", None),
             V_q=V_q, quad=quad, **screening_source)
     return PPMOutputs(

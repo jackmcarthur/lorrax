@@ -571,8 +571,26 @@ class TdReport(ScientificProductionReport):
         scr = [h["screen"] for h in refs if h.get("screen")]
         if not scr:
             return ""
-        inv = [c["n_invalid"] for c in scr]
         mean = lambda key: sum(h.get(key, 0.0) for h in refs) / len(refs)
+        if scr[0].get("member") == "shared_pole":
+            avg = lambda f: sum(f(c) for c in scr) / len(scr)
+            low = [c["census"]["frac_residue_below"]["1"] for c in scr if c.get("census")]
+            return (f"; shared-pole refits: {avg(lambda c: c['refit_s']):.3g} s per refresh (bank "
+                    f"{avg(lambda c: c['walls']['bank']):.3g}, moments "
+                    f"{avg(lambda c: c['walls']['moments']):.3g}, constructor "
+                    f"{avg(lambda c: c['walls']['constructor']):.3g})"
+                    + (f", frozen sweep {mean('frozen_s'):.3g} s, active {mean('active_s'):.3g} s"
+                       if any("frozen_s" in h for h in refs) else "")
+                    + (f", rebase {mean('rebase_s'):.3g} s" if any(h.get("rebase_s") for h in refs)
+                       else "")
+                    + f"; K {min(c['K_min'] for c in scr)}-{max(c['K_max'] for c in scr)}, supports "
+                    + ("moved at " + str(sum(c["sites_moved"] for c in scr)) + " refresh(es)"
+                       if any(c["sites_moved"] for c in scr) else "fixed")
+                    + ", gates not PASS: " + (", ".join(sorted({g for c in scr
+                                                                 for g in c["gates_not_pass"]}))
+                                              or "none")
+                    + ("" if not low else f"; residue weight below 1 eV {min(low):.2e}-{max(low):.2e}"))
+        inv = [c["n_invalid"] for c in scr]
         return (f"; refreshed screening: dchi0 {sum(c['dchi_s'] for c in scr) / len(scr):.3g} s, "
                 f"Dyson+fit {sum(c['fit_s'] for c in scr) / len(scr):.3g} s"
                 + (f", frozen sweep {mean('frozen_s'):.3g} s, active {mean('active_s'):.3g} s"

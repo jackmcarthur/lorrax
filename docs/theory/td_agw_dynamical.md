@@ -259,7 +259,7 @@ the widths of the correlated ground state, and the subtraction removes both.
 held flow, the Hermitian update) → `tdagw.propagate.collision_program` (one
 jitted `shard_map`: the dissipator, $C[\rho^{\rm eq}]$, the trace split) →
 `ops.collision`, refreshed by `run_propagation`'s chunk-end hook
-(`tdagw.dynsig.gnppm_collision`); deck keys `[lorrax] collision*`
+(`tdagw.dynsig.window_collision`); deck keys `[lorrax] collision*`
 ([input reference](../input_reference.md#td-agw)). Where it differs from the
 text above:
 
@@ -753,7 +753,7 @@ $|\Delta\Omega|$ over the modes valid in both, $\max|\delta W|/|W_0|$ at both
 supports and the degenerate pairs taken at their principal value.
 The subtracted form keeps $C[\rho^{\rm eq}]$ at the t0 rates (W0); with $W(t)$
 the regularization tails of $C[\rho^{\rm eq}]$ (28 meV on the diagonal at
-516) change with $W$ and are no longer cancelled. `gnppm_collision(rebase=True)`
+516) change with $W$ and are no longer cancelled. `window_collision(rebase=True)`
 takes $C[\rho^{\rm eq}]$ at the rates of $\rho^{\rm eq}$ on $W(t)$ (one more split
 sweep at $f^{\rm eq}$, 2.1 s on 516 2v2c); on the 516 drives it removes the
 spurious carriers (§1.5) and should be the refreshed screening's default.
@@ -874,7 +874,7 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
     part's session planned on the same envelope, so that no rule is re-fitted
     when $e(t)$ moves.
 12. **Rebased subtraction and smooth invalid modes for refreshed screening.**
-    `gnppm_collision(rebase=True)` as the default with refreshed screening (a deck
+    `window_collision(rebase=True)` as the default with refreshed screening (a deck
     key after a deck-route check); and an invalid-mode treatment continuous in
     $\Omega^2$ (a blend of the pole and its static limit across $\Omega^2=0$, or
     the shared-pole member), since the flips set the jumps of $\Delta\Sigma^{\rm h}$.
