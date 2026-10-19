@@ -792,6 +792,8 @@ class ZetaG:
         ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``;
         ``with_v=False`` (:meth:`write_file`) forms and writes ζ only.
         """
+        if self.solver_kind == 'cholesky':
+            return self._contract_v_face(v_table, keep=keep, zeta_io=zeta_io, print_fn=print_fn, with_v=with_v)
         t0 = time.perf_counter()
         print_fn = print_fn or self.print_fn
         st = self.store
@@ -869,6 +871,48 @@ class ZetaG:
             print_fn(self.receipt)
         return V
 
+    def _contract_v_face(self, v_table, *, keep, zeta_io, print_fn, with_v):
+        """:meth:`contract_v` for the charge channel's face Cholesky (:mod:`isdf.cplus`): each Z
+        tile moves to the face, ζ = C⁻¹Z is solved there, and V and the shell accumulate in
+        their final layouts (V at ``P(None,'x','y')``), so no rank holds a whole (μ, μ) tile."""
+        from isdf import cplus
+        t0 = time.perf_counter()
+        print_fn = print_fn or self.print_fn
+        st, mesh, Q = self.store, self.mesh, self.store.Q
+        keep = np.asarray(keep, dtype=np.int32)
+        if keep.ndim != 2 or keep.shape[0] != Q:
+            raise ValueError(f"ZetaG.contract_v: keep must be (Q={Q}, n) slots; got {keep.shape}.")
+        v = jnp.asarray(pad_to_axis(jnp.asarray(v_table, dtype=jnp.complex128), st.g_axis, axis=1))
+        ngk, sl = jnp.asarray(self.ngk_per_q, jnp.int32), jnp.asarray(keep)
+        to_face, acc = _face_kernels(mesh, Q, st.g_tile, bool(with_v))
+        mu = int(st.mu_pad)
+        V = jnp.zeros((Q, mu, mu), jnp.complex128, device=NamedSharding(mesh, P(None, 'x', 'y'))) if with_v else None
+        S = jnp.zeros((Q, mu, int(sl.shape[1])), jnp.complex128, device=NamedSharding(mesh, P(None, _XY, None)))
+        nxt = st.read_tile(0)
+        for t in range(st.n_Gt):
+            Zt = nxt
+            nxt = st.read_tile(t + 1) if t + 1 < st.n_Gt else None
+            V, S, zt = acc(cplus.solve(self.factor, to_face(Zt)), v, ngk, sl, jnp.int32(t), V, S)
+            if zeta_io is not None:
+                zt = self.mu_basis.unpack_axis(zt, 1) if self.mu_basis is not None else zt
+                zeta_io.write_slab('zeta_q_G', zt, offset=(0, 0, int(t * st.g_tile)))
+                if st.placement == 'disk':
+                    zeta_io.sync_writes()
+            del Zt, zt
+        where = f"{st.n_Gt} G tiles, on the face, {time.perf_counter() - t0:.2f}s (store read {st.t_read:.2f}s)"
+        if not with_v:
+            self.receipt = f"  μ-batch ζ pass: {where}; zeta file written"
+            return None
+        if self.mu_basis is not None:
+            V, S = self.mu_basis.unpack_operator(V), self.mu_basis.unpack_axis(S, 1)
+        self.shell, self.shell_slots = S, keep
+        peak = (jax.local_devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0)
+        self.receipt = (f"  μ-batch V_q: {where}; zeta file {'written' if zeta_io is not None else 'not written'}; "
+                        f"device peak so far {peak / 1e9:.2f} GB")
+        if jax.process_index() == 0:
+            print_fn(self.receipt)
+        return V
+
     def _write_tile(self, zeta_io, zt, g0):
         """One masked ζ tile into ``zeta_q_G`` (canonical μ order, clipped)."""
         zt = _to_mu_owner(self.mesh, self.store.Q, 'mu')(zt)   # the writer's layout
@@ -902,14 +946,13 @@ def _logical_solve(solver_kind: str, n_log: int):
     per channel (``'lu'``, operand ``(LU, pivots)``, κ_lb certified at
     factor time).
     """
-    from isdf import cplus
     from isdf.core import _zeta_logical_solvers
-    from runtime.padding import solve_at_logical
     n_log = int(n_log)
-    if solver_kind == 'lu':
-        lu_apply = _zeta_logical_solvers(n_log)[1]
-        return lambda F, Z: lu_apply(F[0], F[1], Z)
-    return lambda B, Z: solve_at_logical(cplus.apply, n_log, (B,), Z)
+    if solver_kind != 'lu':
+        raise ValueError(f"the q-owner ζ kernels run the current channels' LU; the charge "
+                         f"channel's {solver_kind!r} runs on the face (ZetaG._contract_v_face)")
+    lu_apply = _zeta_logical_solvers(n_log)[1]
+    return lambda F, Z: lu_apply(F[0], F[1], Z)
 
 
 def _factor_specs(solver_kind: str):
@@ -922,6 +965,32 @@ def _factor_specs(solver_kind: str):
 
 #: Accumulator layout: q-local blocks on their owners.
 _ACC_SPEC = P(_XY, None, None)
+
+
+def _face_kernels(mesh, Q, g_tile, with_v):
+    """The charge channel's per-tile programs on the face: Z (q-owner) -> its first Q rows at
+    ``P(None,'x','y')``; then ζ masked by ngk, ``V += conj(ζ) v ζᵀ`` at ``P(None,'x','y')`` and
+    the shell gather at ``P(None,('x','y'),None)``, ζ returned in the writer's layout."""
+    key = ('face', _mesh_id(mesh), int(Q), int(g_tile), bool(with_v))
+    hit = _kernel_cache.get(key)
+    if hit is not None:
+        return hit
+    face, mush = NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P(None, _XY, None))
+    to_face = jax.jit(lambda Z: Z[:Q], out_shardings=face)
+
+    def acc(zeta, v, ngk, sl, t, V, S):
+        g_idx = t * g_tile + jnp.arange(zeta.shape[-1], dtype=jnp.int32)
+        mask = g_idx[None, :] < ngk[:, None]                                   # (q, g)
+        zeta = jnp.where(mask[:, None, :], zeta, 0)
+        if with_v:
+            vt = jnp.where(mask, jnp.take(v, jnp.clip(g_idx, 0, v.shape[-1] - 1), axis=1), 0)
+            V = jax.lax.with_sharding_constraint(V + jnp.einsum('qmg,qg,qng->qmn', jnp.conj(zeta), vt, zeta), face)
+        hit = (sl[:, None, :] == g_idx[None, :, None]).astype(zeta.dtype)
+        S = jax.lax.with_sharding_constraint(S + jnp.einsum('qmg,qgs->qms', zeta, hit), mush)
+        return V, S, jax.lax.with_sharding_constraint(zeta, mush)
+    fn = (to_face, jax.jit(acc, donate_argnums=(5, 6)))
+    _kernel_cache[key] = fn
+    return fn
 
 
 def _v_tile_kernel(mesh, solver_kind, n_log, g_tile, *, debug_m, with_v=True):
@@ -1049,8 +1118,9 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     v_dev = device_put_process_local(v, NamedSharding(mesh, P(None, _XY, None)))
     ngk_dev = device_put_process_local(ngk, NamedSharding(mesh, P(_XY)))
     sl_dev = device_put_process_local(sl, NamedSharding(mesh, P(_XY, None)))
-    form = [_v_tile_kernel(mesh, z.solver_kind, z.n_rmu_solve, st0.g_tile,
-                           debug_m=False, with_v=False) for z in zetas]
+    form = [_face_former(mesh, st0, z.ngk_per_q) if z.solver_kind == 'cholesky' else
+            _v_tile_kernel(mesh, z.solver_kind, z.n_rmu_solve, st0.g_tile, debug_m=False, with_v=False)
+            for z in zetas]
     stub = [_zero_accumulators(mesh, st0.Q_pad, int(st0.mu_pad), 1,
                                debug_m=False, with_v=False) for _ in zetas]
     step = _pair_tile_kernel(mesh, st0.g_tile, pairs)
@@ -1090,6 +1160,23 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     if jax.process_index() == 0:
         print_fn(receipt)
     return out
+
+
+def _face_former(mesh, st, ngk_per_q):
+    """``contract_v_group``'s ζ former for a face-Cholesky channel, in the q-owner kernel's call
+    shape: ζ solved on the face and handed to the pair kernel at ``P(('x','y'), None, None)``."""
+    from isdf import cplus
+    to_face, acc = _face_kernels(mesh, st.Q, st.g_tile, False)
+    owner = jax.jit(lambda z: jnp.pad(z, ((0, st.Q_pad - st.Q), (0, 0), (0, 0))),
+                    out_shardings=NamedSharding(mesh, _ACC_SPEC))
+    ngk, sl = jnp.asarray(np.asarray(ngk_per_q, np.int32)), jnp.zeros((st.Q, 1), jnp.int32)
+
+    def form(F, Z, v, ngk_dev, sl_dev, t, V, M, S):
+        _, _, zt = acc(cplus.solve(F, to_face(Z)), None, ngk, sl, t, None,
+                       jnp.zeros((st.Q, int(st.mu_pad), 1), jnp.complex128,
+                                 device=NamedSharding(mesh, P(None, _XY, None))))
+        return V, M, S, owner(zt)
+    return form
 
 
 def _zero_accumulators(mesh, Q_pad, mu, n_sh, *, debug_m, with_v=True):

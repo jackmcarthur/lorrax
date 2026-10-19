@@ -1,14 +1,14 @@
-"""Charge ISDF conditioning, the one seam: C_q⁺ by rank truncation.
+"""Charge ISDF conditioning, the one seam: ζ = C⁻¹Z by a certified Cholesky.
 
-``factor`` turns the logical, Hermitian-PSD C_q stack ``(nq, n, n)`` into B
-with ``B Bᴴ = C⁺`` (keep ``λ > rcond·λ_max``, the cut closed over degenerate
-multiplets and certified against the Gram ceiling), with the cut's per-q
-figures, which ``report`` prints on the host after the program; ``apply`` is
-``ζ = C⁺Z = B(BᴴZ)``.  Every charge producer calls these -- the μ-batch
-fit (``isdf.zeta_mubatch``), the dense refit (``solve_zeta_charge_dense``) and
-the per-q factor stacks of ``isdf.core`` -- so a different conditioning
-procedure replaces this file and nothing else.  Callers own the logical
-extent (``runtime.padding.solve_at_logical``); nothing here sees a pad.
+``factor`` Cholesky-factors the Hermitian-PD charge C_q stack ``(nq, n, n)`` on the face
+(``distrib_la.cholesky_factor``: cuSOLVERMp, SLATE or native2d) and ``solve`` is ζ = C⁻¹Z there;
+``dense`` is the same arithmetic on one whole local tile (the BSE refit), its figures read by
+``report`` after the program. The previous seam truncated the spectrum at λ > rcond·λ_max
+(an eigh pseudo-inverse) and so silently absorbed an over-complete centroid set (Cr:Al2O3
+Γ: pivoted-Cholesky rank 18,779 of 29,998 centroids). This one REFUSES BY NAME wherever that
+cut would have bound: κ(C_q) > 1/rcond (the certificate: λ_max by power iteration, λ_min by
+inverse iteration through the factor, on the logical rows) or a factor that breaks down,
+naming the numerical rank against N_μ and the remedy.
 """
 from __future__ import annotations
 
@@ -16,116 +16,94 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from common import rank_criterion
-from distrib_la import eigh_local
+#: Probe columns and iterations of the κ certificate (λ_max by power iteration on C,
+#: λ_min by inverse iteration through the factor).
+PROBES, ITERS = 8, 24
+REMEDY = ("set LORRAX_CENTROID_SELECT=strict, or use fewer centroids, or more bands "
+          "(the deck must represent the pair densities of the bands it fits)")
 
 
-def apply(B, Z):
-    """ζ = C⁺Z = B(BᴴZ) for the factor ``B`` of :func:`factor`."""
-    return B @ (jnp.conj(jnp.swapaxes(B, -1, -2)) @ Z)
+def _probes(nq, n, n_log, dtype):
+    x = jax.random.normal(jax.random.key(20261019), (nq, n, PROBES), jnp.float64).astype(dtype)
+    return jnp.where((jnp.arange(n) < n_log)[None, :, None], x, 0)   # the logical rows only
 
 
-def factor(C_log, *, rcond: float, rank_log: bool, n_log: int):
-    """``(B, figures)``: B with B Bᴴ = C⁺ for a logical C_q stack, and the
-    cut's per-q figures, which the caller hands to :func:`report` on the host
-    after the program; see the module docstring."""
-    from isdf.core import _certify_the_cut, _close_the_cut
-    # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
-    # n_μ over-completes the pair-density rank (κ~1e13); plain
-    # Cholesky then amplifies ULP/mesh/nband roundoff into O(1) V_q
-    # errors that GN-PPM magnifies to tens of eV.  Rank-truncation
-    # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
-    # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
-    lam, V = eigh_local(C_log)      # Hermitian-SPD, λ ascending
-    lam_max = lam[..., -1:]              # (nqb,1) largest λ per q
-    keep = lam > (rcond * lam_max)       # near-null cut
-    # …and the near-null cut is not allowed to stop mid-multiplet.  THIS
-    # IS THE SEAM the 6×6×6 saga's §6 conjectured about
-    # (tests/known_failures/2026-08-10-ibz-cascade-vs-full-bz-sigma-\
-    # 6x6x6.md): C_q commutes with the point group when the centroid set
-    # is orbit-closed and the band window degeneracy-closed, so a
-    # symmetry maps each C_q eigenspace onto itself and mixes a degenerate
-    # block's members freely.  Cut between blocks and ζ's retained span is
-    # invariant, so C_{Sq} = P C_q P† survives the truncation; cut THROUGH
-    # a block and the span is a round-off-chosen slice that differs
-    # between q and Sq, and the k-star identity fails for W and Σ_x alike.
-    # That deck turned out to be covariant by luck — 0 of 16 q-stars
-    # carried a non-constant n_keep, MEASURED after the fact, enforced by
-    # nothing.  This is the enforcement.
-    keep, figures = _close_the_cut(lam, keep, where="zeta rank_truncate")
-    # …and a cut that lands in a gap can still be a cut nobody has
-    # certified.  THE GATE: when the criterion BINDS, the achieved
-    # amplification must not exceed the ceiling any measurement supports
-    # for a PSD overlap Gram (1e8 — R19's rcond ladder and the Si 4×4×4
-    # 1776-centroid run, both in ``common/rank_criterion``).  Until
-    # 2026-08-22 the ``rank_log`` block below announced exactly these
-    # numbers and gated on neither.
-    figures.update(_certify_the_cut(
-        lam, keep, kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM))
-    # B = V·diag(1/√λ_kept) ⇒ B Bᴴ = Σ_{keep} vᵢvᵢᴴ/λᵢ = C⁺.
-    # Double-``where`` keeps rsqrt off the dropped (tiny/≤0) modes.
-    inv_sqrt = jnp.where(
-        keep, jax.lax.rsqrt(jnp.where(keep, lam, 1.0)), 0.0)
-    # OBSERVABILITY: the retained-mode count IS the conditioning
-    # signal for this route — it is what tells you whether n_μ has
-    # over-completed the pair-density rank (κ blow-up) and by how
-    # much.  It leaves the program as figures; :func:`report` prints it.
-    # ``n_keep`` per q + the spectral span λ_max/λ_min(kept).
-    # Mandatory conditioning receipt; there is no silence knob.
-    #
-    # THE CRITERION, stated: ``keep`` above is NOT a search for a
-    # gap in λ — a real ISDF charge spectrum is smooth and has
-    # none.  It is a CAP on how much C⁺ may amplify round-off:
-    # κ_eff = λ_max/λ_min(kept) ≤ 1/zeta_rcond by construction.
-    # ``common/rank_criterion`` carries the derivation, the three
-    # standard alternatives (discrepancy principle / L-curve /
-    # GCV) and the measurement that refutes each of them here.
-    #
-    # The three extra fields below are the ones a run needs in
-    # order to be auditable without a sweep:
-    #   kappa/q     achieved amplification — the invariant
-    #   ldrop_hi/q  the LARGEST discarded λ, i.e. the top of the
-    #               discarded band (paired with lam_min_kept it
-    #               gives the whole cut, and shows there is no
-    #               plateau at the cut — there never is)
-    #   margin/q    fractional rank inflation from loosening
-    #               rcond by 1e-4.  §R19 measured +41 % of rank
-    #               costing 5000 eV, so a LARGE margin means the
-    #               basis is over-complete and rcond must NOT be
-    #               loosened on this run.
-    if rank_log:
-        lam_keep_min = jnp.min(
-            jnp.where(keep, lam, jnp.inf), axis=-1)
-        n_keep = jnp.sum(keep, axis=-1)
-        lam_drop_hi = jnp.max(
-            jnp.where(keep, -jnp.inf, lam), axis=-1)
-        n_loose = jnp.sum(lam > (rcond * 1e-4 * lam_max), axis=-1)
-        margin = (n_loose - n_keep) / jnp.maximum(n_keep, 1)
-        figures["rank"] = (n_keep, lam_max[..., 0], lam_keep_min, lam_max[..., 0] / lam_keep_min,
-                           lam_drop_hi, jnp.min(lam, axis=-1), margin)
-    return V * inv_sqrt[..., None, :].astype(V.dtype), figures
+def _orth(x):
+    return jnp.linalg.qr(x)[0]
+
+
+def _extreme(apply, x, iters):
+    """Largest |eigenvalue| of ``apply`` (Hermitian PSD on the probes' span) per q: block power iteration."""
+    for _ in range(iters):
+        x = _orth(apply(x))
+    y = apply(x + 0)                 # cuSOLVERMp's potrs consumes its right-hand side
+    return jnp.max(jnp.real(jnp.einsum("qnk,qnk->qk", jnp.conj(x), y)), axis=-1)
+
+
+def _refusal(where, n_log, rcond, kappa=None, rank=None, detail=""):
+    figure = ("" if kappa is None else f"kappa(C_q) up to {float(np.max(kappa)):.3e} > 1/rcond = {1 / rcond:.3e}; "
+              if np.all(np.isfinite(kappa)) else "the factor is not finite (C_q is not positive definite); ")
+    ranks = "" if rank is None else f"numerical rank/q {np.asarray(rank).tolist()} (eigenvalues above rcond·λ_max) of "
+    return (f"GATE zeta_charge_conditioning: {where}: the charge Gram C_q is not certified: {figure}"
+            f"{ranks}N_mu = {n_log}{(' (' + detail + ')') if detail else ''}. The centroid set "
+            f"over-completes the pair-density rank; {REMEDY}.")
+
+
+def _rank(C, mesh, n_log, rcond):
+    """Refusal path only: per q, the eigenvalues of the logical block above rcond·λ_max (the
+    old cut's kept rank); the pads are the tail rows (core._identity_pad_block_diagonal)."""
+    from distrib_la import plan
+    from jax.experimental import multihost_utils
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    eigh, rank = plan("eigh", mesh, n=n_log), []
+    for q in range(C.shape[0]):
+        a = jax.device_put(C[q, :n_log, :n_log], NamedSharding(mesh, P("x", "y")))
+        w = np.asarray(multihost_utils.process_allgather(eigh(a)[0], tiled=True))
+        rank.append(int(np.sum(w > rcond * w.max())))
+    return rank
+
+
+def factor(C, mesh, *, rcond: float, n_log: int, where="zeta charge"):
+    """The certified face Cholesky of ``C``; refuses by name (``_refusal``)."""
+    from distrib_la import cholesky_factor, cholesky_solve
+    nq, n, _ = C.shape
+    x = _probes(nq, n, n_log, C.dtype)
+    lam_max = np.asarray(jax.jit(lambda c, v: _extreme(lambda y: c @ y, v, ITERS))(C, x))
+    try:     # the library's info (not positive definite) surfaces where the factor is first read
+        F = cholesky_factor(C, mesh)
+        lam_inv = np.asarray(_extreme(lambda y: cholesky_solve(F, y), x, ITERS))
+    except (RuntimeError, ValueError) as error:
+        raise ValueError(_refusal(where, n_log, rcond, rank=_rank(C, mesh, n_log, rcond),
+                                  detail=f"the Cholesky broke down: {error}")) from None
+    kappa = lam_max * lam_inv
+    if not (np.all(np.isfinite(kappa)) and np.max(kappa) <= 1 / rcond):
+        del F
+        raise ValueError(_refusal(where, n_log, rcond, kappa, _rank(C, mesh, n_log, rcond)))
+    if jax.process_index() == 0:
+        print(f"[zeta charge cholesky] n_log={n_log} kappa/q={np.array2string(kappa, precision=3)} "
+              f"(cap 1/rcond={1 / rcond:.1e})", flush=True)
+    return F
+
+
+def solve(F, Z):
+    """ζ = C⁻¹Z for the factor of :func:`factor`, ``Z`` (nq, n, m) on the face."""
+    from distrib_la import cholesky_solve
+    return cholesky_solve(F, Z)
+
+
+def dense(C, Z, *, rcond: float):
+    """``(ζ, figures)`` on ONE whole local tile ``C`` (n, n): the same factor and certificate,
+    traceable; :func:`report` refuses on the host."""
+    n = C.shape[-1]
+    L = jnp.linalg.cholesky(C)
+    cho = lambda y: jax.scipy.linalg.cho_solve((L, True), y[0])[None]
+    x = _probes(1, n, n, C.dtype)
+    kappa = _extreme(lambda y: C @ y, x, ITERS) * _extreme(cho, x, ITERS)
+    return cho(Z[None])[0], {"kappa": kappa[0]}
 
 
 def report(figures, *, rcond: float, n_log: int) -> None:
-    """Print a :func:`factor` program's notices and conditioning receipt on the host, and record its findings."""
-    from isdf.core import _report_the_cut
-    from common.host_read import host_tree
-    # Replicated figures in ONE device-to-host read; otherwise each leaf from its own copy.
-    replicated = all(getattr(a, "is_fully_replicated", False) for a in jax.tree.leaves(figures)
-                     if isinstance(a, jax.Array))
-    figures = host_tree(figures) if replicated else jax.tree.map(_host, figures)
-    _report_the_cut(figures, where="zeta rank_truncate",
-                    kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM, rcond=rcond)
-    if "rank" in figures:
-        k, mx, mn, kp, dh, lo, mg = figures["rank"]
-        print(f"[zeta rank_truncate] n_log={n_log} rcond={rcond:.1e} "
-              f"n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
-              f"kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
-              f"margin/q={mg}", flush=True)
-
-
-def _host(a):
-    """A program output as NumPy; a replicated one is read from this process's own copy."""
-    if getattr(a, "is_fully_replicated", False):
-        return np.asarray(a.addressable_data(0))
-    return np.asarray(jax.device_get(a))
+    """The host half of :func:`dense`: refuse by name when the tile was not certified."""
+    kappa = float(np.asarray(jax.device_get(figures["kappa"])))
+    if not (np.isfinite(kappa) and kappa <= 1 / rcond):
+        raise ValueError(_refusal("zeta charge (dense refit)", n_log, rcond, np.asarray([kappa])))

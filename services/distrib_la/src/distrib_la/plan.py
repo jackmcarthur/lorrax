@@ -1503,8 +1503,8 @@ class Plan:
                 f"{self.op} backend {self.backend!r} has no batched entry "
                 f"point and its single-tile entry returns a library HANDLE "
                 f"rather than an array, so there is no stack for a scan to "
-                f"build.  Use distrib_la.factor()/solve(), which carries "
-                f"the handle in an opaque token instead of flattening it.")
+                f"build.  Use distrib_la.cholesky_factor()/cholesky_solve(), "
+                f"which carry the handles per tile instead of flattening them.")
 
         mesh, backend, tile = self.mesh, self.backend, self.in_sharding
 

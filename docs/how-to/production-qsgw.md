@@ -112,8 +112,9 @@ number_bands = N        # >= 2 n_occ, the one count for chi0 and Sigma
   law gives r ≈ 2220 and the probe 2085, so N_μ ≈ 1050–1100; the production
   deck takes 1200.
 - The ζ fit is built on the Gram of **all bands that enter Σ**
-  (`zeta_nband = number_bands`). If the strict rank ceiling refuses, set `zeta_rcond`
-  explicitly; do not drop to a smaller basis.
+  (`zeta_nband = number_bands`). If `GATE zeta_charge_conditioning` refuses,
+  the centroid set is over-complete for those bands: follow its remedy
+  (`LORRAX_CENTROID_SELECT=strict`, fewer centroids, or more bands).
 - Band extrapolation stays on. An explicit `use_band_extrapolation` on a
   stage that does not consume it refuses.
 - **Band structures** come from htransform fitted on the whole WFN band set,
