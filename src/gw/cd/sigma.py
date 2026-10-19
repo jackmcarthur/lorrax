@@ -52,6 +52,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from lxkit import ordered_psum
 
 from common.units import RYD_TO_EV
+from gw.cd import chi0_rules as cd_rules
 from gw.cd import laws
 from gw.cd.rule import tan_mapped_gauss_rule
 
@@ -412,76 +413,88 @@ def build_dyson_kernels(mesh_xy, *, n, pref):
 
 
 # ------------------------------------------------------------------------------- chi0 provider
-def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots, print_fn=print):
+def cd_chunk_plan(n, nq_irr, nq_pad, ndev, n_imag, J, override=0):
+    """``(chunk_imag, chunk_real, n_imag_pad, J_pad)`` of the CD streams (TASTE 96).
+
+    The tile is ``runtime.tiles.tile_units`` of the chunk's own per-unit bytes (or the
+    ``cd_knot_chunk`` override), rounded up so the (q, z) flat axis divides by P; the counts are
+    padded to whole chunks.  The precompute CLI (``gw.cd.chi0_rules``) plans the same windows.
+    """
+    from runtime.tiles import tile_units
+    zq_mult = ndev // int(np.gcd(nq_irr, ndev))
+
+    def tile(axis, count):
+        units = override or tile_units(chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis=axis), count)
+        return int(-(-max(1, min(units, count)) // zq_mult) * zq_mult)
+    chunk_i, chunk_r = tile("imag", n_imag), tile("real", J)
+    return chunk_i, chunk_r, -(-n_imag // chunk_i) * chunk_i, -(-J // chunk_r) * chunk_r
+
+
+def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots, windows=None,
+              rule_capacity=None, rules_file=None, time_reversal=False, save_path=None, print_fn=print):
     """chi0 at the CD points from the shared-pole bank's own response quadrature.
 
     ``z_ry`` lists every point the CD streams evaluate (imaginary nodes ``i u`` and real knots
-    ``j h + i eta`` with their FD-9 ghosts; Im z > 0; a repeat is evaluated once).  One rule set serves
-    all of them, built
-    exactly as the bank builds its sample rules: ``response_bank.response_support`` (occupation
-    weights, transition interval, envelope, band support) and ``response_bank.response_quadrature``
-    (``minimax.ResponseGroupTree`` over every point, ``rel_tol = rule_tolerance / amplitude``, groups
-    halved until each meets it).  chi0(q, z) is the value row of
+    ``j h + i eta`` with their FD-9 ghosts; Im z > 0; a repeat is evaluated once).  The rules are
+    :mod:`gw.cd.chi0_rules`': one request per CD memory window (``windows``, from
+    ``chi0_rules.window_members``: the Laplace rule on the imaginary windows, the bank tree at the
+    CD capacity and mass gate on the knot windows), loaded from ``rules_file`` after its identity
+    check when given, else built here (rank 0 writes them to ``save_path``).  ``windows=None`` is the
+    bank's own single request over every point.  chi0(q, z) is the value row of
     ``response_bank.integrate_response_group`` (``ordered=True``: the physical ``FT_q[chi]`` at the
-    full-grid rows ``q_ids``), one Green-pair scan per rule group a chunk touches.  A chunk's members
-    are taken out of their rule groups by index; every other rule key is the bank's.  No Lehmann sum.
+    full-grid rows ``q_ids``), one Green-pair scan per rule group a chunk touches; a chunk's members
+    are taken out of their rule groups by index, every other rule key is the bank's.  No Lehmann sum.
 
-    ``mu_ry`` is the current chemical potential; ``partial_at_mu`` follows the census rule of
-    ``shared_pole_recipe.bind_shared_pole_census`` (a partially occupied band crossing mu).  ``slots``
-    is the largest chunk.  Returns ``(chi, note)``: ``chi(points)`` -> ``[nz, nq, n, n]`` at
-    ``P(None, None, 'x', 'y')`` for any sequence of points of ``z_ry`` (repeats allowed; a repeat is a
-    copy); ``note`` is the rule receipt, updated as chunks stream.
+    ``mu_ry`` is the current chemical potential.  ``slots`` is the largest chunk.  Returns
+    ``(chi, note)``: ``chi(points)`` -> ``[nz, nq, n, n]`` at ``P(None, None, 'x', 'y')`` for any
+    sequence of the points (repeats allowed; a repeat is a copy); ``note`` is the rule receipt
+    (census rows, source), updated as chunks stream.
     """
-    from common.collectives import device_put_process_local_cached, gather_to_host
+    from common.collectives import device_put_process_local_cached
     from gw import response_bank as rb
+    from gw.cd import chi0_rules as cr
 
     EV = float(RYD_TO_EV)
     index = {}
-    for z in np.asarray(z_ry, dtype=np.complex128).ravel().tolist():     # one evaluation per distinct point
+    for z in np.asarray(z_ry, dtype=np.complex128).ravel().tolist():       # one evaluation per distinct point
         index.setdefault(complex(z), len(index))
-    z_ry = np.asarray(list(index), dtype=np.complex128)
-    if not z_ry.size or not np.all(np.isfinite(z_ry)) or not np.all(z_ry.imag > 0):
-        raise ValueError("GATE cd_chi0_points: got: an empty, nonfinite or non-causal CD point set; want: "
-                         "finite points with Im z > 0; why: the bank rule fits upper-half-plane evaluations")
-    if getattr(meta, "shared_pole_response_rules", None) is not None:
-        raise ValueError("GATE cd_chi0_session: got: a held shared-pole rule session on meta; want: none; "
-                         "why: the CD rule must neither reuse nor overwrite the bank's held-map rules")
-    stop = int(wfns.slices.b4_logical) - int(wfns.slices.b0)
-    energy = np.asarray(gather_to_host(wfns.enk), dtype=np.float64)[:, :stop]
-    occupied = np.asarray(gather_to_host(wfns.occ), dtype=np.float64)[:, :stop]
-    crossing = (energy.min(axis=0) <= mu_ry) & (energy.max(axis=0) >= mu_ry)
-    partial = np.any((occupied > 0.0) & (occupied < 1.0), axis=0)
-    plan = dict(z_ry=z_ry, distinct_id=np.arange(z_ry.size), held=np.zeros(z_ry.size, dtype=bool),
-                role=np.full(z_ry.size, "cd_point"), bank_rule_tolerance=float(rule_tolerance),
-                census=dict(mu_ry=float(mu_ry), partial_at_mu=bool(np.any(partial & crossing))))
-    receipt = {"correlation_count": 0}
-    support = rb.response_support(wfns, meta, plan, receipt, print_fn=print_fn)
-    try:
-        rules = rb.response_quadrature(meta, plan, receipt, support, group_size=int(slots), print_fn=print_fn)
-    except ValueError as exc:
-        raise ValueError(
-            f"GATE cd_chi0_rule: got: the bank response rule refused the CD points ({exc}); smallest Im z "
-            f"{z_ry.imag.min() * EV:.4g} eV over {z_ry.size} points, transition interval "
-            f"[{support['lo'] * EV:.4g}, {support['hi'] * EV:.4g}] eV, tolerance {rule_tolerance:g}; want: a rule "
-            "meeting cd_chi0_rule_tolerance at every point; why: chi0 has one provider, the bank quadrature "
-            "(its pencil grows like (hi - lo) / min Im z)") from exc
-    groups = rules["plan"]["rule_groups"]
+    points = np.asarray(list(index), dtype=np.complex128)
+    route = "bank" if windows is None else "cd"
+    if windows is None:
+        windows = [dict(kind="all", chunk=0, members=list(range(points.size)))]
+    sha = None
+    if rules_file:
+        plan, energy, occupied = cr.sample_plan(wfns, meta, points, mu_ry=mu_ry, tolerance=rule_tolerance)
+        support = rb.response_support(wfns, meta, plan, {}, print_fn=print_fn)
+        options = {} if route == "bank" else cr.cd_rule_options(rule_tolerance, rule_capacity)
+        payload = cr.load_rules(rules_file)
+        cr.check_identity(payload["identity"], cr.rule_identity(
+            energy, occupied, points, windows, cr.plan_identity(support, plan["census"]["partial_at_mu"]),
+            rule_tolerance, options, route))
+        source = f"loaded {rules_file}"
+    else:
+        payload, support = cr.build_rules(wfns, meta, points, windows, mu_ry=mu_ry, tolerance=rule_tolerance,
+                                          slots=slots, capacity=rule_capacity, time_reversal=time_reversal,
+                                          route=route, print_fn=print_fn)
+        source = "built in job"
+        if save_path and jax.process_index() == 0:
+            sha = cr.save_rules(save_path, payload)
+            source += f", saved {save_path}"
+    rules = cr.stream_rules(payload, support, slots)
+    groups = payload["rule_groups"]
+    plan = payload["plan"]
     sliced = ("value", "derivative", "sampled_error", "coefficient_mass")
-    note = dict(provider="gw.response_bank shared-node quadrature: response_support + response_quadrature "
-                         "rules, integrate_response_group value rows (ordered=True)",
-                rule_tolerance=float(rule_tolerance), points=int(z_ry.size),
-                interval_ev=[float(v) * EV for v in receipt["rule"]["interval_ry"]],
-                occupation_amplitude=float(receipt["rule"]["occupation_amplitude"]),
-                decay_rate_ry_inv=float(receipt["rule"]["decay_rate_ry_inv"]),
-                partial_at_mu=plan["census"]["partial_at_mu"], band_ranges=list(support["band_ranges"]),
-                rule_nodes=int(sum(int(g["count"]) for g in groups)),
-                rule_groups=[dict(points=len(g["members"]), nodes=int(g["count"]),
-                                  sampled_error=float(np.max(g["sampled_error"])),
-                                  re_ev=[float(z_ry[list(g["members"])].real.min() * EV),
-                                         float(z_ry[list(g["members"])].real.max() * EV)],
-                                  im_ev=[float(z_ry[list(g["members"])].imag.min() * EV),
-                                         float(z_ry[list(g["members"])].imag.max() * EV)]) for g in groups],
+    note = dict(provider="gw.response_bank shared-node quadrature on the CD memory windows (gw.cd.chi0_rules): "
+                         "Laplace rule (imaginary windows) / ResponseGroupTree (knot windows), "
+                         "integrate_response_group value rows (ordered=True)",
+                source=source, rules_sha256=sha, route=route, rule_tolerance=float(rule_tolerance),
+                options=payload["identity"]["options"], time_reversal=bool(time_reversal),
+                points=int(points.size), windows=len(windows), interval_ev=[plan["lo"] * EV, plan["hi"] * EV],
+                occupation_amplitude=plan["amplitude"], decay_rate_ry_inv=plan["decay_rate"],
+                partial_at_mu=plan["metallic"], band_ranges=list(support["band_ranges"]),
+                rule_nodes=int(sum(int(g["count"]) for g in groups)), rule_groups=payload["census"],
                 passes=0, green_pair_evaluations=0)
+    receipt = {"correlation_count": 0}
     q_ids = tuple(int(q) for q in np.asarray(q_ids).ravel())
     n = int(meta.mu_basis.n_packed)
     face4 = NamedSharding(mesh_xy, P(None, None, "x", "y"))
@@ -497,9 +510,9 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
     place = jax.jit(_place, out_shardings=face4, donate_argnums=(0,))
     blank = {}
 
-    def chi(points):
+    def chi(points_):
         try:
-            ids = [index[complex(z)] for z in np.asarray(points, dtype=np.complex128).ravel()]
+            ids = [index[complex(z)] for z in np.asarray(points_, dtype=np.complex128).ravel()]
         except KeyError as exc:
             raise ValueError(f"GATE cd_chi0_point_unplanned: got: z = {exc} Ry outside the planned CD points; "
                              "want: a point of the rule set; why: one rule set serves every chunk") from None
@@ -527,7 +540,7 @@ def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots,
                 note["passes"] += 1
         note["green_pair_evaluations"] = int(receipt["correlation_count"])
         return out
-    chi.rules, chi.points = rules, z_ry                # the bank rule set and its distinct points (tests)
+    chi.rules, chi.groups, chi.points, chi.payload = rules, groups, points, payload   # (tests)
     return chi, note
 
 
@@ -550,7 +563,7 @@ def compute_sigma_c_cd_omega_grid(
     from gw import response_bank as rb
     from gw.ppm_sigma import SigmaOmegaResult, sigma_band_axis
     from gw.w_isdf import _w_solve_pref_scalar
-    from runtime.tiles import tile_units, TILE_BYTES
+    from runtime.tiles import TILE_BYTES
     from symmetry_maps import (kgrid_shift_map, q_negation_index, star_tables_of,
                                unfold_file_wedge_band_operator, unfold_wavefunction_local)
 
@@ -663,15 +676,8 @@ def compute_sigma_c_cd_omega_grid(
     u_ry_all, w_ry_all = (np.asarray(v) / EV for v in tan_mapped_gauss_rule(n_imag, eta * EV))
 
     # ---- tiles (TASTE 96): from the chunk's shapes; (q, z) flat axis divisible by P -------------------
-    zq_mult = ndev // int(np.gcd(nq_irr, ndev))
     override = int(cd_handle.get("knot_chunk") or 0)
-
-    def tile(axis, count):
-        units = override or tile_units(chunk_bytes_per_unit(n, nq_irr, nq_pad, ndev, axis=axis), count)
-        return int(-(-max(1, min(units, count)) // zq_mult) * zq_mult)
-    chunk_i, chunk_r = tile("imag", n_imag), tile("real", J)
-    n_imag_pad = -(-n_imag // chunk_i) * chunk_i
-    J_pad = -(-J // chunk_r) * chunk_r
+    chunk_i, chunk_r, n_imag_pad, J_pad = cd_chunk_plan(n, nq_irr, nq_pad, ndev, n_imag, J, override)
     u_ry = np.concatenate([u_ry_all, np.full(n_imag_pad - n_imag, u_ry_all[-1])])
     w_ry = np.concatenate([w_ry_all, np.zeros(n_imag_pad - n_imag)])         # padded nodes weigh zero
     real_ry = h_ry * np.arange(J_pad)                                         # knots >= J are never referenced
@@ -805,17 +811,33 @@ def compute_sigma_c_cd_omega_grid(
             np.savez(os.path.join(run_dir, f"cd_partial_{name}.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
                      elapsed_s=time.monotonic() - started, **out)
 
-    # chi0 at every CD point (imaginary nodes; real knots -GH .. J_pad + GH - 1 with the FD-9 ghosts)
-    # from one bank response rule set (bank_chi0); the chunks below take their points from it.
+    # chi0 at every CD point from the bank response rules, one request per CD memory window
+    # (gw.cd.chi0_rules); each chunk below evaluates exactly its window's points.
     t0 = time.monotonic()
-    z_cd = np.concatenate([1j * u_ry_all, h_ry * np.arange(-GH, J_pad + GH) + 1j * eta])
+    imag_pts, real_pts = cd_rules.cd_windows(u_ry, h_ry, eta, J_pad, chunk_i, chunk_r, GH)
+    points_cd, windows_cd = cd_rules.window_members(imag_pts, real_pts)
+    rules_file = str(cd_handle.get("chi0_rules_file") or "")
+    if rules_file and run_dir is not None and not os.path.isabs(rules_file):
+        rules_file = os.path.join(run_dir, rules_file)
+    trs = bool(getattr(sym, "trs_allowed", False))
+    _say(print_fn, started, "chi0 rule geometry (precompute: python -m gw.cd.chi0_rules ... --out FILE; deck "
+         f"cd_chi0_rules_file = FILE): --knots {J} --ndev {ndev} --nq-irr {nq_irr} --nk {nk} --n-packed {n} "
+         f"--knot-chunk {override} --imaginary-nodes {n_imag} --eta-ev {eta * EV:.10g} --knot-step-ev "
+         f"{h_ry * EV:.10g} --nb-chi {int(meta.b_id_4_chi_user)} --b4-logical {int(slices.b4_logical)} --mu-ev "
+         f"{mu * EV:.12g}" + (" --time-reversal" if trs else "")
+         + f"; {points_cd.size} points in {len(windows_cd)} windows")
     bank_chi, chi_rule = bank_chi0(
-        wfns, meta, mesh_xy, z_cd, q_ids=q_irr, mu_ry=mu,
+        wfns, meta, mesh_xy, points_cd, q_ids=q_irr, mu_ry=mu,
         rule_tolerance=float(cd_handle.get("chi0_rule_tolerance", CD_CHI0_RULE_TOLERANCE)),
-        slots=max(chunk_i, chunk_r + 2 * GH), print_fn=print_fn)
+        slots=max(chunk_i, chunk_r + 2 * GH), windows=windows_cd,
+        rule_capacity=int(cd_handle.get("chi0_rule_capacity") or cd_rules.CD_RULE_CAPACITY),
+        rules_file=rules_file or None, time_reversal=trs,
+        save_path=None if (rules_file or run_dir is None) else os.path.join(run_dir, "cd_chi0_rules.pkl"),
+        print_fn=print_fn)
     clock("chi0_rule", t0)
-    _say(print_fn, started, f"chi0 rule: {chi_rule['points']} points in {len(chi_rule['rule_groups'])} groups, "
-         f"{chi_rule['rule_nodes']} nodes, tolerance {chi_rule['rule_tolerance']:.1e}, max sampled error "
+    _say(print_fn, started, f"chi0 rule ({chi_rule['source']}): {chi_rule['points']} points, "
+         f"{len(chi_rule['rule_groups'])} groups in {chi_rule['windows']} windows, {chi_rule['rule_nodes']} nodes, "
+         f"tolerance {chi_rule['rule_tolerance']:.1e}, max sampled error "
          f"{max(g['sampled_error'] for g in chi_rule['rule_groups']):.2e}")
 
     # ---- Sigma_x identity (INVARIANT: the CD pair densities reproduce the static exchange) ------------
@@ -849,7 +871,7 @@ def compute_sigma_c_cd_omega_grid(
     for ic, c0 in enumerate(range(0, n_imag_pad, chunk_i)):
         c1 = c0 + chunk_i
         t_chunk = t0 = time.monotonic()
-        chi = bank_chi(1j * u_ry[c0:c1])
+        chi = bank_chi(imag_pts[ic])
         jax.block_until_ready(chi)
         clock("chi0", t0)
         t0 = time.monotonic()
@@ -877,9 +899,9 @@ def compute_sigma_c_cd_omega_grid(
         j1 = j0 + chunk_r
         t_chunk = t0 = time.monotonic()
         if tail is None:
-            chi_e = bank_chi(h_ry * np.arange(j0 - GH, j1 + GH) + 1j * eta)
+            chi_e = bank_chi(real_pts[ic])
         else:
-            chi_e = join_fn(tail, bank_chi(h_ry * np.arange(j0 + GH, j1 + GH) + 1j * eta))
+            chi_e = join_fn(tail, bank_chi(real_pts[ic]))
         jax.block_until_ready(chi_e)
         clock("chi0", t0)
         t0 = time.monotonic()

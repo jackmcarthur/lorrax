@@ -31,7 +31,7 @@ The laws are `gw.cd.laws`, pinned on CPU against the ordered (time-reversal-exac
 
 | quantity | owner |
 |---|---|
-| χ⁰(z) at every node and knot | the shared-pole bank's response quadrature (`gw.cd.sigma.bank_chi0`): one `response_bank.response_support` / `response_quadrature` shared-node rule set over every CD point (imaginary nodes, real knots and FD-9 ghosts) at `cd_chi0_rule_tolerance` (default 1e-8), evaluated by `response_bank.integrate_response_group` (`ordered=True`, value rows); a chunk takes its points out of the rule groups by index. No Lehmann sum (`compute_chi0_direct_fractional` is a test reference only) |
+| χ⁰(z) at every node and knot | the shared-pole bank's response quadrature on the CD memory windows (`gw.cd.sigma.bank_chi0`, rules from `gw.cd.chi0_rules`): one rule request per chunk the streams evaluate; an insulator's imaginary windows take the ordered `minimax.response_laplace_rule` (positive real times, certified; a refused point takes the bank tree when its pencil is small, else the even-only rule on a time-reversal-authenticated deck, else `GATE cd_chi0_rule_unfit`), the knot windows `response_bank.response_quadrature` (`minimax.ResponseGroupTree` at `cd_chi0_rule_capacity` nodes and the CD mass gate max(5000, 0.01 tol/eps)); evaluated by `response_bank.integrate_response_group` (`ordered=True`, value rows). No Lehmann sum (`compute_chi0_direct_fractional` is a test reference only). Rules are precomputed with `python -m gw.cd.chi0_rules` and loaded with an identity check (`cd_chi0_rules_file`) |
 | dχ⁰/ds at a knot | 9-point central d/dx on the knot grid, (dχ/dx)/(2z); ghost knots roll from chunk to chunk |
 | W_c, dW_c/ds | the response bank's pair equations, X = pref·HχH, W_c = HX(1−X)⁻¹H, dW_c/ds = W(pref·dχ)W, as a local batched LU over the (q, z) flat axis (`gw.cd.sigma.build_dyson_kernels`) |
 | W at star q | `symmetry_maps.QirrOperator.unfold` with the general-operator `pair_transpose` rule |
@@ -79,7 +79,9 @@ step that removes the limit.
 `cd_applicability` (CD needs `compute_mode = mpa` and `screening_diagrams = w_rpa`; pole-model keys
 refuse), `cd_head_unimplemented` (`head_correction = off` only), `cd_linalg_local` (`linalg = local`
 only), `cd_band_extrapolation_unimplemented`, `cd_single_eta` (no per-window η), `cd_knot_step`,
-`cd_imaginary_nodes`, `cd_residue_reach` / `cd_residue_coverage` (run time), `cd_sigma_x_identity`
+`cd_imaginary_nodes`, `cd_chi0_rule_tolerance`, `cd_chi0_rule_capacity`, `cd_residue_reach` /
+`cd_residue_coverage` (run time), `cd_chi0_rule` / `cd_chi0_rule_unfit` / `cd_chi0_rules_identity` /
+`cd_chi0_point_unplanned` (run time, `gw.cd.chi0_rules`), `cd_sigma_x_identity`
 (run time: the CD pair densities must reproduce the static Σ_x to 1e-3 meV,
 `SIGMA_X_IDENTITY_TOL_MEV`; measured 3.3e-10 meV Fe, 2.1e-11 meV Si), `cd_finite`.
 
@@ -91,3 +93,33 @@ symmetry certificate, `residue_bands` widths and live/contracted fractions), `cd
 cumulative since the enclosing stage boundary, which `common.timing` owns -- and live arrays; a leak
 shows as a rise after the first chunk).  `LORRAX_CD_STAR_CERTIFICATE=N` (instrument, off by default) computes
 one non-identity member of N k stars directly and compares it with the wedge-unfolded cube.
+
+## χ⁰ rules (`gw.cd.chi0_rules`)
+
+One rule request per CD memory window: the chunk the imaginary or real stream evaluates, FD-9 ghosts
+included (`cd_windows`), so a window's Green-pair sweep is that of its own members.  An insulator's
+imaginary windows (every |Re z| < lo) take the ordered `minimax.response_laplace_rule` (reference lo;
+forward rows even + odd, reverse rows even − odd on the direct stream).  A point its certificate
+refuses takes the bank tree when its pencil has ≤ 20,000 samples (large u), else the even-only rule
+when `SymMaps.trs_allowed` (the two orientations are equal, the odd channel is exactly zero), else
+`GATE cd_chi0_rule_unfit`.  Knot windows take `response_bank.response_quadrature` with the window as its
+request and the CD options of `minimax.ResponseGroupTree`: `cd_chi0_rule_capacity` nodes (default 1088;
+the bank's 192 unchanged) and the mass gate max(5000, 0.01 tol/ε) (κ·ε ≤ 1 % of the tolerance); the
+sampled error is accepted against the tolerance as in the bank.  A non-default capacity builds on the
+host pencils.
+
+Precompute on a CPU node (the knot windows' pencils grow like (hi − lo)/η: 16,619 samples, ~44 GB of
+host memory each, on the ZnO 2503-band deck):
+
+    python -m gw.cd.chi0_rules --wfn WFN.h5 --nocc N --nb-chi NB --b4-logical NB \
+        --knots J --ndev P --nq-irr NQ --nk NK --n-packed N_MU --knot-chunk C \
+        --imaginary-nodes 96 --eta-ev 0.25 --knot-step-ev 0.0625 [--time-reversal] \
+        --tolerance 1e-8 --out cd_chi0_rules.pkl
+
+The run prints these arguments on its `chi0 rule geometry` line.  `--windows imag:0,real:3,real:-1`
+builds a partial (census) file and `--merge part*.pkl --out FILE` joins partial builds, one CPU process
+each.  Every file carries its identity (energies and occupations as k-star-invariant hashes, tolerance,
+options, the snapped interval and envelope, the CD points and windows) and a census
+(`FILE.census.csv`: window, provider, points, z ranges, nodes, sampled error, κ, wall).  The run loads
+`cd_chi0_rules_file` and refuses any identity mismatch; without it the rules are built in the job
+(rank-parallel, `_gather_group_rules`) and written to `cd_chi0_rules.pkl` beside the deck.

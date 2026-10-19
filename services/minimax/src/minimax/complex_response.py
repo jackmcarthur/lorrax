@@ -82,17 +82,20 @@ def _poles(z):
     return np.asarray(poles)
 
 
-def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
+def _fits(lo, hi, poles, times, tol, decay_rate, order=None, max_kappa=_RESPONSE_MAX_KAPPA):
     """Project every pole on shared times; stop at the first rejected pole.
 
     ``order`` is a caller-owned list of pole indices; a rejected pole moves to
     its front, so the next candidate is tested on the hardest pole first.
     """
-    return _fits_mass(lo, hi, poles, times, tol, decay_rate, order)[:3]
+    return _fits_mass(lo, hi, poles, times, tol, decay_rate, order, max_kappa)[:3]
 
 
-def _fits_mass(lo, hi, poles, times, tol, decay_rate, order=None):
-    """:func:`_fits` and the coefficient mass of the rejected pole (nan when accepted or unfitted)."""
+def _fits_mass(lo, hi, poles, times, tol, decay_rate, order=None, max_kappa=_RESPONSE_MAX_KAPPA):
+    """:func:`_fits` and the coefficient mass of the rejected pole (nan when accepted or unfitted).
+
+    ``max_kappa`` is the coefficient-mass gate (default the bank's ``_RESPONSE_MAX_KAPPA``).
+    """
     order = list(range(len(poles))) if order is None else order
     fits = [None]*len(poles)
     worst = 0.
@@ -100,7 +103,7 @@ def _fits_mass(lo, hi, poles, times, tol, decay_rate, order=None):
         pole = poles[index]
         fit = _project(lo, hi, pole, times, decay_rate)
         error = np.inf if fit is None else float(np.max(fit[1]*[1., pole.imag/(2*abs(pole))]))
-        mass_rejected = fit is not None and error <= tol and fit[2][0] > _RESPONSE_MAX_KAPPA
+        mass_rejected = fit is not None and error <= tol and fit[2][0] > max_kappa
         if fit is None or not error <= tol or not np.isfinite(fit[2]).all() or mass_rejected:
             order.insert(0, order.pop(position))
             return None, error, bool(mass_rejected), (np.nan if fit is None else float(fit[2][0]))
@@ -127,18 +130,21 @@ def _pencil(lo, hi, poles, tol, decay_rate):
     return eta, zps, geometry, size
 
 
-def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None, pencil=None):
+def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None, pencil=None,
+                  capacity=RESPONSE_RULE_CAPACITY, max_kappa=_RESPONSE_MAX_KAPPA):
     """Complex times shared by every pole, or None.
 
     A stacked (multi-channel) Hankel shift pencil: each pole contributes the
     Hankel matrix of 1/(x - z_p) sampled at the group's finest scale; their
     common row space holds the shared exponentials. Coefficients are then the
     per-pole linear projection of the single-pole construction, with the same
-    sampled-error and coefficient-mass acceptance.
+    sampled-error and coefficient-mass acceptance.  ``capacity`` is the host
+    pencil's rank (the largest node count scanned) and ``max_kappa`` the mass
+    gate; the defaults are the bank's.
     """
     order = list(range(len(poles)))
     if previous is not None and len(previous):
-        fits, _, _ = _fits(lo, hi, poles, previous, tol, decay_rate, order)
+        fits, _, _ = _fits(lo, hi, poles, previous, tol, decay_rate, order, max_kappa)
         if fits is not None:
             return previous, fits
     eta, zps, geometry, size = _pencil(lo, hi, poles, tol, decay_rate)
@@ -146,11 +152,13 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
     steps = [(padding, (geometry+padding)/(2*size)) for padding, _ in _GEOMETRIES]
     # Each geometry's pencil depends on its padding only, never on a decision,
     # so a source may build the next one while this one is scanned.
-    source = (host_pencils if pencil is None else pencil)(zps, size, columns, steps)
+    source = (host_pencils(zps, size, columns, steps, rank=capacity) if pencil is None
+              else pencil(zps, size, columns, steps))
     try:
         for g, ((_, flatten), (_, step), (s, shift)) in enumerate(zip(_GEOMETRIES, steps, source)):
             start = list(order)
-            got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift)
+            got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift,
+                        max_kappa=max_kappa)
             if got is not None and pencil is not None and not _resolved(pencil, s, got[2]):
                 # The source cannot resolve the accepted count's smallest
                 # singular value: the geometry is decided on the reference
@@ -159,8 +167,9 @@ def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=Non
                 # when the source's earlier decisions match); a rejection
                 # there is the reference's, and the scan goes on.
                 order[:] = start
-                s, shift = next(host_pencils(zps, size, columns, steps[g:g+1]))
-                got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift)
+                s, shift = next(host_pencils(zps, size, columns, steps[g:g+1], rank=capacity))
+                got = _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift,
+                            max_kappa=max_kappa)
             if got is not None:
                 return got[:2]
     finally:
@@ -202,7 +211,7 @@ def _pencil_columns(size, npoles):
     return np.unique(np.r_[ids[:16], np.round(np.geomspace(16, size-1, width)).astype(int)])
 
 
-def host_pencils(zps, size, columns, steps):
+def host_pencils(zps, size, columns, steps, rank=RESPONSE_RULE_CAPACITY):
     """The reference shift pencils, one ``(s, shift)`` per ``(padding, step)``, lazily.
 
     Pole p's block is ``B_p[i, c] = 1/(-padding + (i + columns[c])*step - zp)``
@@ -212,7 +221,7 @@ def host_pencils(zps, size, columns, steps):
     small ``R^H = U S W^H`` gives H's singular triplets at QR cost. ``s`` holds
     the singular values in descending order (at least ``rank``) and ``shift``
     is the ``rank x rank`` projection ``U_r^H [shifted] Q W_r``, ``rank =
-    min(RESPONSE_RULE_CAPACITY, len(s))``.
+    min(rank, len(s))`` (``rank`` defaults to ``RESPONSE_RULE_CAPACITY``).
 
     This is the contract of the ``pencil`` argument of
     :class:`ResponseGroupTree`: a source with the same signature (a generator
@@ -233,8 +242,8 @@ def host_pencils(zps, size, columns, steps):
         # triplets as a direct SVD of the wide stack, at QR cost.
         q, r = la.qr(np.hstack(blocks).conj().T, mode="economic", check_finite=False)
         u, s, wh = la.svd(r.conj().T, check_finite=False)
-        rank = min(RESPONSE_RULE_CAPACITY, len(s))
-        yield s, u[:, :rank].conj().T@(np.hstack(shifted)@q)@wh[:rank].conj().T
+        r = min(int(rank), len(s))
+        yield s, u[:, :r].conj().T@(np.hstack(shifted)@q)@wh[:r].conj().T
 
 
 #: The abandon test of a geometry's scan (:func:`_abandoned`). log10(sampled
@@ -292,7 +301,8 @@ def _abandoned(history, last):
     return ebar + slope*(last - kbar) - width > 0
 
 
-def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift, abandon=True):
+def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s, shift, abandon=True,
+          max_kappa=_RESPONSE_MAX_KAPPA):
     """Node counts n = 8, 12, ... of one geometry's pencil: ``(times, fits, n)`` or None.
 
     ``abandon``: apply :func:`_abandoned` after each rejected candidate.
@@ -312,7 +322,7 @@ def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s
             times = times[times.real <= decay_rate]
         if not len(times):
             continue
-        fits, error, mass_rejected, mass = _fits_mass(lo, hi, poles, times, tol, decay_rate, order)
+        fits, error, mass_rejected, mass = _fits_mass(lo, hi, poles, times, tol, decay_rate, order, max_kappa)
         if fits is not None:
             return times, fits, n
         if mass_rejected:
@@ -328,7 +338,7 @@ def _scan(lo, hi, poles, tol, decay_rate, patience, order, eta, step, flatten, s
     return None
 
 
-def _imaginary_times(lo, hi, poles, tol, decay_rate, capacity):
+def _imaginary_times(lo, hi, poles, tol, decay_rate, capacity, max_kappa=_RESPONSE_MAX_KAPPA):
     """Closed-form times on the imaginary axis shared by every pole, or None.
 
     The pencil's decaying nodes (Re t > 0) must carry a pole at Re z with
@@ -350,7 +360,7 @@ def _imaginary_times(lo, hi, poles, tol, decay_rate, capacity):
         return None
     u, _ = np.polynomial.legendre.leggauss(n)
     times = 1j*horizon*(u+1)/(2*eta)
-    fits, _, _ = _fits(lo, hi, poles, times, tol, decay_rate)
+    fits, _, _ = _fits(lo, hi, poles, times, tol, decay_rate, max_kappa=max_kappa)
     return None if fits is None else (times, fits)
 
 
@@ -424,7 +434,7 @@ def _imaginary_panels(lo, hi, poles, tol, decay_rate, capacity, limit=RESPONSE_P
     return [times[j*m:(j+1)*m] for j in range(k)], fits
 
 
-def _rule(z, sets):
+def _rule(z, sets, node_capacity=RESPONSE_NODE_CAPACITY):
     """Scatter pole fits on node sets into forward and reverse sample rows.
 
     ``sets`` is a list of (times, poles, fits). A node t is one Green pair
@@ -434,9 +444,9 @@ def _rule(z, sets):
     """
     times = np.concatenate([t for t, _, _ in sets])
     count = len(times)
-    t = np.zeros(RESPONSE_NODE_CAPACITY, complex)
+    t = np.zeros(node_capacity, complex)
     t[:count] = times
-    shape = (len(z), 2, RESPONSE_NODE_CAPACITY)
+    shape = (len(z), 2, node_capacity)
     value, derivative = np.zeros(shape, complex), np.zeros(shape, complex)
     errors, mass = np.zeros((len(z), 2, 2)), np.zeros((len(z), 2, 2))
     for j, point in enumerate(z):
@@ -462,7 +472,8 @@ def _rule(z, sets):
 
 
 def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-                         decay_rate=0., pencil=None, panels=False):
+                         decay_rate=0., pencil=None, panels=False, capacity=None,
+                         max_kappa=None):
     """Shared complex-time rules for a group of response samples.
 
     Built at the Sigma rule builder's pinned BLAS thread count: the Hankel
@@ -506,9 +517,16 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     whose pencil and closed-form set both fail takes the closed-form set in
     panels of at most ``RESPONSE_NODE_CAPACITY`` nodes (:func:`_imaginary_panels`):
     several rules with the same member, whose contributions the caller adds.
+
+    ``capacity`` (default ``RESPONSE_RULE_CAPACITY``) is the largest node count
+    of one shared set (the host pencil's rank; ``t`` and the rows are padded to
+    ``2 * capacity``) and ``max_kappa`` (default ``_RESPONSE_MAX_KAPPA``) the
+    coefficient-mass gate. Every other acceptance test is unchanged; a
+    non-default capacity needs the host pencils (``pencil=None``).
     """
     return ResponseGroupTree(lo_ry, hi_ry, z_ry, rel_tol=rel_tol, previous=previous,
-                             decay_rate=decay_rate, pencil=pencil, panels=panels).rules()
+                             decay_rate=decay_rate, pencil=pencil, panels=panels,
+                             capacity=capacity, max_kappa=max_kappa).rules()
 
 
 class ResponseGroupTree:
@@ -528,7 +546,7 @@ class ResponseGroupTree:
     """
 
     def __init__(self, lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None, decay_rate=0.,
-                 pencil=None, panels=False):
+                 pencil=None, panels=False, capacity=None, max_kappa=None):
         lo, hi = float(lo_ry), float(hi_ry)
         z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
         if (not z.size or not np.isfinite([lo, hi, rel_tol, decay_rate]).all()
@@ -537,6 +555,18 @@ class ResponseGroupTree:
             raise ValueError('invalid response frequency/domain/tolerance')
         self.lo, self.hi, self.z, self.rel_tol, self.decay_rate = lo, hi, z, rel_tol, decay_rate
         self.pencil, self.panels = pencil, bool(panels)
+        # The bank's capacity and mass gate unless a caller sets its own
+        # (response_group_rules); the device pencils serve the bank's rank only.
+        self.capacity = RESPONSE_RULE_CAPACITY if capacity is None else int(capacity)
+        self.max_kappa = _RESPONSE_MAX_KAPPA if max_kappa is None else float(max_kappa)
+        if self.capacity < 8 or not np.isfinite(self.max_kappa) or self.max_kappa <= 0:
+            raise ValueError('invalid response rule capacity/mass gate')
+        if pencil is not None and self.capacity != RESPONSE_RULE_CAPACITY:
+            raise ValueError('a device pencil source serves RESPONSE_RULE_CAPACITY only; '
+                             'a custom capacity builds on the host pencils')
+        if self.panels and (self.capacity != RESPONSE_RULE_CAPACITY
+                            or self.max_kappa != _RESPONSE_MAX_KAPPA):
+            raise ValueError('closed-form panels serve the bank capacity and mass gate only')
         self.reference = 0. if decay_rate else lo
         self.root = tuple(range(len(z)))
         self._old = {frozenset(rule["members"]): rule["t"][:rule["count"]]
@@ -593,15 +623,15 @@ class ResponseGroupTree:
         got = _shared_times(lo, hi, poles, tol, self._old.get(frozenset(members)), decay_rate,
                             patience=(None if len(members) == 1 and not self.panels
                                       else _STAGNATION_NODES),
-                            pencil=self.pencil)
+                            pencil=self.pencil, capacity=self.capacity, max_kappa=self.max_kappa)
         if got is None:
             # Where the pencil fails, the closed-form imaginary-axis set serves
             # every pole when it fits the pencil's capacity (two pencils' for
             # one sample, whose poles could otherwise take two sets).
-            got = _imaginary_times(lo, hi, poles, tol, decay_rate, RESPONSE_NODE_CAPACITY
-                                   if len(members) == 1 else RESPONSE_RULE_CAPACITY)
+            got = _imaginary_times(lo, hi, poles, tol, decay_rate, 2*self.capacity
+                                   if len(members) == 1 else self.capacity, self.max_kappa)
         if got is not None:
-            rule = _rule(z[members], [(*got[:1], poles, got[1])])
+            rule = _rule(z[members], [(*got[:1], poles, got[1])], 2*self.capacity)
             return [dict(rule, members=list(members), reference_ry=self.reference)]
         if len(members) > 1:
             return None
@@ -623,12 +653,13 @@ class ResponseGroupTree:
         sets = []
         for pole in poles:
             one = np.asarray([pole])
-            got = _shared_times(lo, hi, one, tol, None, decay_rate, pencil=self.pencil)
+            got = _shared_times(lo, hi, one, tol, None, decay_rate, pencil=self.pencil,
+                                capacity=self.capacity, max_kappa=self.max_kappa)
             if got is None:
                 raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
                                  f'sample={z[members[0]]}, pole={pole}, tolerance={self.rel_tol}')
             sets.append((got[0], one, got[1]))
-        rule = _rule(z[members], sets)
+        rule = _rule(z[members], sets, 2*self.capacity)
         return [dict(rule, members=list(members), reference_ry=self.reference)]
 
     def pending(self, attempts):

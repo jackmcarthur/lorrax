@@ -2098,7 +2098,8 @@ def _block_quadrature(meta, sample_plan, receipt, support, *, group_size, print_
                              reference=plan["reference"]) for blk, plan in zip(blocks, plans)])
 
 
-def response_quadrature(meta, sample_plan, receipt, support, *, group_size, print_fn=print):
+def response_quadrature(meta, sample_plan, receipt, support, *, group_size, print_fn=print,
+                        requests=None, rule_options=None):
     """Plan the shared complex-time rule on every sample; replicate small rules.
 
     Each node is ONE Green-pair evaluation that serves every member's forward
@@ -2107,8 +2108,17 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
     ``group_size``; the evaluation streams the rule's nodes for at most
     ``group_size`` members per pass (``groups``).  A support with ``blocks``
     (the TD refit) takes :func:`_block_quadrature`.
+
+    ``requests`` (default: every sample in one request, the bank's own) lists
+    the member sets the rule trees are built on, one tree each (the CD memory
+    windows, ``gw.cd.chi0_rules``); samples in no request get no rule.
+    ``rule_options`` (``capacity``, ``max_kappa``) go to
+    ``minimax.ResponseGroupTree``; a non-default capacity builds on the host
+    pencils. The bank passes neither.
     """
     if "blocks" in support:
+        if requests is not None or rule_options is not None:
+            raise ValueError('the TD refit block quadrature takes no requests or rule_options')
         return _block_quadrature(meta, sample_plan, receipt, support,
                                  group_size=group_size, print_fn=print_fn)
     import minimax
@@ -2151,10 +2161,14 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
         # One rule on every sample, whatever the evaluation group: the node set
         # (and so eqp) never depends on the memory budget; the group only
         # batches the evaluation below.
-        requests = response_groups(z, len(z))
+        requests = (response_groups(z, len(z)) if requests is None
+                    else [[int(m) for m in r] for r in requests])
         previous = [] if old is None else old["rule_groups"]
         from .response_pencil import response_pencil_source
+        options = dict(rule_options or {})
         pencil = response_pencil_source()
+        if options.get("capacity") not in (None, minimax.RESPONSE_RULE_CAPACITY):
+            pencil = None                     # the device pencils serve the bank's rank only
         if jax.process_index() == 0:
             print_fn("Response rule pencils: " + ("device QR + dilation eigh, decisions on host"
                      if pencil is not None else "host LAPACK"), flush=True)
@@ -2166,7 +2180,7 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
             return minimax.ResponseGroupTree(
                 plan["lo"], plan["hi"], z[members],
                 rel_tol=sample_plan["bank_rule_tolerance"]/amplitude,
-                decay_rate=decay_rate, previous=warm, pencil=pencil)
+                decay_rate=decay_rate, previous=warm, pencil=pencil, **options)
 
         with timing.section("bank.rule_construction", announce=True):
             plan["rule_groups"] = [

@@ -1651,6 +1651,8 @@ _DEFAULTS = {
     "cd_residue_reach_ev": "auto",
     "cd_knot_chunk": 0,
     "cd_chi0_rule_tolerance": 1e-8,
+    "cd_chi0_rule_capacity": 1088,
+    "cd_chi0_rules_file": "",
     # "" = the shared-pole resolver's own line and imaginary ladders.
     # "<line eV list> | <imaginary eV list>" replaces both with explicit
     # sites (gw.shared_pole_recipe.parse_support_sites); the height, held
@@ -2234,7 +2236,7 @@ def _resolve_cd_inputs(params):
             "want: pole_model | contour_deformation; why: unknown frequency integration")
     params["sigma_frequency_integration"] = value
     cd_keys = ("cd_imaginary_nodes", "cd_knot_step_ev", "cd_residue_reach_ev", "cd_knot_chunk",
-               "cd_chi0_rule_tolerance")
+               "cd_chi0_rule_tolerance", "cd_chi0_rule_capacity", "cd_chi0_rules_file")
     if value != "contour_deformation":
         for key in cd_keys:
             if key in named:
@@ -2301,6 +2303,13 @@ def _resolve_cd_inputs(params):
         raise ValueError(f"GATE cd_chi0_rule_tolerance: got: {params['cd_chi0_rule_tolerance']!r}; want: "
                          "1e-13 <= tol < 1e-2; why: the relative error of the bank response rule serving chi0")
     params["cd_chi0_rule_tolerance"] = tol
+    cap = int(params["cd_chi0_rule_capacity"])
+    if not 192 <= cap <= 8192:
+        raise ValueError(f"GATE cd_chi0_rule_capacity: got: {params['cd_chi0_rule_capacity']!r}; want: 192 <= "
+                         "capacity <= 8192 (nodes of one shared rule set; the bank's own is 192); why: the host "
+                         "pencil's rank and the stream's node slots")
+    params["cd_chi0_rule_capacity"] = cap
+    params["cd_chi0_rules_file"] = str(params.get("cd_chi0_rules_file") or "").strip()
     patches = str(params.get("sigma_omega_patches_ev", "") or "").strip()
     if patches:
         for item in patches.split(","):
@@ -2672,6 +2681,8 @@ def _input_response(
         cd_residue_reach_ev=str(params["cd_residue_reach_ev"]),
         cd_knot_chunk=int(params["cd_knot_chunk"]),
         cd_chi0_rule_tolerance=float(params["cd_chi0_rule_tolerance"]),
+        cd_chi0_rule_capacity=int(params["cd_chi0_rule_capacity"]),
+        cd_chi0_rules_file=str(params["cd_chi0_rules_file"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
@@ -4133,6 +4144,8 @@ class DynamicSigmaConfig:
     cd_residue_reach_ev: str = "auto"
     cd_knot_chunk: int = 0
     cd_chi0_rule_tolerance: float = 1e-8
+    cd_chi0_rule_capacity: int = 1088
+    cd_chi0_rules_file: str = ""
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
     #: resolver's own ladders) or "<line eV list> | <imaginary eV list>",
     #: an explicit support geometry for support-rule studies.  Parsed and
