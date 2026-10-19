@@ -234,6 +234,18 @@ class ParentGreenCarrier:
     unfold is collective-free and every full-k operator -- Σ_k after the FFT
     convolution, V, W -- projects onto them directly).  ``n_parent`` k rows:
     the parent carrier holds no full-k wavefunction.
+
+    ``green_left`` / ``green_right``: the orbital panels of the Green
+    contraction G_k(mu, nu, tau) = L_k diag(w(tau)) R_k^H when they are not the
+    faces themselves -- ``green_left`` in ``psi_mun``'s layout (L, the direct
+    operand), ``green_right`` in ``psi_nmu``'s (R, conjugated inside
+    ``build_G``), each on the faces' parent rows and band axis.  None (the
+    default) is the face: L = R = psi, the incumbent operands.  A non-diagonal
+    internal line C in the window (TD-aGW, docs/theory/td_agw_dynamical.md
+    §1.5, Eq. 8c) is L = psi', R = psi' C or L = psi' C, R = psi'.  The band
+    projection always reads the faces.  Both panels sit at the faces' k; a
+    line that connects k and k + q (a phonon vertex) would add the right
+    panel's own rows here.
     """
 
     psi_nmu: jax.Array
@@ -242,6 +254,8 @@ class ParentGreenCarrier:
     occ: jax.Array
     plan: object
     layout: str = 'face'
+    green_left: jax.Array | None = None
+    green_right: jax.Array | None = None
 
     def __post_init__(self):
         """Validate the static layout independently of the spinor extent."""
@@ -265,7 +279,7 @@ class ParentGreenCarrier:
 
 jax.tree_util.register_dataclass(
     ParentGreenCarrier,
-    data_fields=['psi_nmu', 'psi_mun', 'enk', 'occ'],
+    data_fields=['psi_nmu', 'psi_mun', 'enk', 'occ', 'green_left', 'green_right'],
     meta_fields=['plan', 'layout'],
 )
 
@@ -434,15 +448,18 @@ def parent_sigma_operands(wfns: "Wavefunctions"):
     conjugated inside ``build_G``), the same faces for the band projection
     (first operand conjugated inside the projector), and the parent-row
     energy/occupation tables.  Same six roles the full-k face call sites
-    fill from ``wfns`` itself.
+    fill from ``wfns`` itself.  The carrier's ``green_left`` / ``green_right``
+    panels, when set, replace the G contraction's pair (L direct, R conjugated);
+    the projection pair stays the faces.
     """
     carrier = wfns.green_parent
     if carrier is None:
         raise ValueError(
             "parent_sigma_operands: the bundle carries no parent carrier.")
     proj_nmu, proj_mun = carrier.projection_faces()
-    return (carrier.psi_mun, carrier.psi_nmu, proj_nmu, proj_mun,
-            carrier.enk, carrier.occ)
+    left = carrier.psi_mun if carrier.green_left is None else carrier.green_left
+    right = carrier.psi_nmu if carrier.green_right is None else carrier.green_right
+    return (left, right, proj_nmu, proj_mun, carrier.enk, carrier.occ)
 
 
 

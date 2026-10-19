@@ -536,20 +536,13 @@ active`); both default to the incumbent.
   G_{\rm int}=\Psi'\,\tfrac12\{g(\epsilon),M\}\,\Psi'^\dagger,\qquad
   M=\rho'\ \text{(hole)},\ 1-\rho'\ \text{(particle)}, \tag{8a}
   $$
-  i.e. $\tfrac12[g(\epsilon_m)+g(\epsilon_n)]$ for $M_{mn}$ (owner's ruling). With
-  $M=D+R$ ($D$ diagonal), the off-diagonal part is carried by $2n_A$ pseudo-bands
-  $\chi^\pm=\Psi'(1\pm R)$ at the energies of their parent columns, inserted after
-  the window inside the Σ window, with weights $\pm\tfrac14$ (hole) and
-  $\mp\tfrac14$ (particle): $\tfrac14(\chi^+_m\chi^{+\dagger}_m-\chi^-_m\chi^{-\dagger}_m)
-  =\tfrac12(\psi_m\tilde y_m^\dagger+\tilde y_m\psi_m^\dagger)$, $\tilde y_m=\sum_n\psi_n R_{nm}$.
-  The executor is unchanged (signed band weights; the particle weights are passed
-  explicitly, `_population_branches(particle_weights=)`), and because the
-  pseudo-bands lie inside the Σ window the occupied projector of the static terms
-  (the static limit subtracted from ΔΣ^h) is $\Psi'\rho'\Psi'^\dagger$ too. The
-  active sweep runs over $3n_A$ intermediate states and $b_{\rm hi}+2n_A$ external
-  rows; at a diagonal $\rho'$ it is the populations' sweep to rounding. The
-  natural-orbital route (rotating the carrier to the eigenvectors of $\rho'$) is
-  not used: it has no energy for the internal line.
+  i.e. $\tfrac12[g(\epsilon_m)+g(\epsilon_n)]$ for $M_{mn}$ (owner's ruling). It is
+  contracted in the Σ sweep as $G=L\,\mathrm{diag}(w)\,R^\dagger$ on the panels $\Psi'$ and
+  $\Psi'\rho'$ (Eq. 8c below; the $2n_A$ pseudo-bands $\Psi'(1\pm R)$ of the first version
+  gave the same tables to 9×10⁻¹⁶), and the occupied projector of the static terms (the
+  static limit subtracted from ΔΣ^h) is $\Psi'\rho'\Psi'^\dagger$. At a diagonal $\rho'$ it is
+  the populations' sweep to rounding. The natural-orbital route (rotating the carrier to
+  the eigenvectors of $\rho'$) is not used: it has no energy for the internal line.
 * `collision_rate_intermediates = active`. $\tilde\Gamma^>$ and $\tilde\Gamma^<$
   take the window's own intermediate states only; the frozen part enters
   $\tilde\Sigma$, the Hermitian part (ΔΣ^h, and under refreshed $W$ its change),
@@ -571,6 +564,77 @@ active`); both default to the incumbent.
   5.6×10⁻²; full + all 0.18; populations + all 0.22. The fixture's own GN fit
   violates reciprocity at O(1) (residues 0.76, poles 0.70 relative), which leaves
   3.0×10⁻² for code and dense alike.
+
+**Instantaneous basis, non-diagonal G builder and vertex pairing (2026-10-19, opt-in).**
+The Markov step behind Eq. (8) must rotate the lines with the Hamiltonian that propagates ρ.
+The GKBA hole line is $G^<(t,t-\tau)=i\,e^{-iH\tau}\rho(t-\tau)$ (particle: $1-\rho$), and the
+interaction-picture step $\rho(t-\tau)=e^{iH\tau}\rho(t)e^{-iH\tau}$ turns it into
+$i\,\rho(t)\,e^{-iH\tau}$: populations do not rotate, coherences do. `collision_basis =
+instantaneous` takes the basis from the slow part of the propagator's Hamiltonian,
+$$
+H_{\rm slow}=\mathrm{diag}(e)+\Delta\Sigma\big[\rho^{\rm eq}+U\,\mathrm{diag}(f-f^{\rm eq})\,U^\dagger\big]
+=U\,\mathrm{diag}(E)\,U^\dagger,\qquad f=\mathrm{diag}(U^\dagger\rho U), \tag{8b}
+$$
+$e$ the propagator's window energies, a fixed point in $U$ per trial and refresh (`tdagw.dynsig.slow_basis_step`; ΔΣ the
+propagator's model with its held ΔΣ^h: the carrier dressing of §1.1 on the propagator's
+energies). On the CrI3 516 decks the propagator runs on the bundle's $\epsilon^G$ (no eqp
+file), so propagator and collision share $\epsilon^G$ and the instantaneous basis covers the
+slow mean-field part, $K[P]$ plus the held ΔΣ^h. The drive $E(t)\cdot r$ and the $O(E)$ coherent mean field are left out:
+they oscillate near 2 eV, faster than the memory time $\hbar/\eta$. $E$ serves the external
+(on-shell) energies and the internal propagation, $\rho'=U^\dagger\rho U$ is the internal line,
+and the rates are rotated back, $U\tilde\Gamma' U^\dagger$. At $\rho^{\rm eq}$, $U=1$ and $E=e$.
+Frozen bands keep ψ and their 0/1 occupation and sit at $\epsilon^G(k)+\Delta_{\rm edge}(k)$,
+$\Delta_{\rm edge}=e-\epsilon^G$ of the window's edge band on their side (lowest window band
+below the window, highest above; 0 when the propagator runs on $\epsilon^G$); deep-state QP
+corrections of an eqp file are not read. Their external states rotate, so the frozen part is
+swept at every refresh; its static limit is t0's rotated (frequency independent).
+
+*GEMM form.* The Σ executor builds $G_k(\mu,\nu,\tau)=L_k\,\mathrm{diag}(w(\tau))\,R_k^\dagger$ in
+one GEMM per τ node, $L,R$ the $(N_\mu\times n_{\rm int})$ orbital panels at the centroids
+(`ParentGreenCarrier.green_left`, `green_right`; None is the faces) and $w$ the branch's τ
+weight at the inner index's energy. The incumbent is $L=R=\Psi$ with the occupation in $w$
+(unchanged, bitwise). A non-diagonal line $C$ ($\rho'$ hole, $1-\rho'$ particle) carries no
+occupation in $w$:
+$$
+G_L=\Psi' e^{-iE\tau}C\,\Psi'^\dagger:\ L=\Psi',\ R=\Psi'C;\qquad
+G_R=\Psi' C\,e^{-iE\tau}\Psi'^\dagger:\ L=\Psi'C,\ R=\Psi'. \tag{8c}
+$$
+A state is live in a branch when $\max_n|C_{mn}|$ clears the occupation-weight floor
+($10^{-5}$). The Σ box needs live states in both branches of every sweep, so the particle line
+is the identity block minus the hole panels, $G_L[1-\rho']=\Psi'w\Psi'^\dagger-\Psi'w\rho'\Psi'^\dagger$:
+the extra columns ($n_A$ per block, inserted after the window inside the Σ window) carry
+$\Psi'$ or $\Psi'\rho'$, and the occupied projector of the static terms is $\Psi'\rho'\Psi'^\dagger$.
+$\Psi'\rho'$ is one $k$-local product per refresh on the μ-sharded faces. $L$ and $R$ are
+separate panels, so they may later sit at different $k$ (the phonon line $d_{q\nu}G_{k+q,k}$).
+
+*Vertex pairing.* In $\Sigma^<_{ij}(t,t-\tau)\,G^A_{jj}$ the external line closes on $j$ with
+$e^{iE_j\tau}$ and the internal line $\rho'_{mn}e^{-iE_n\tau}$ puts $n$ on the $j$ vertex
+($M^*_{jn}$): the phase is $e^{i(E_j-E_n-\Omega)\tau}$. Each external index pairs with the
+internal index on its own vertex, so $T_1=\Sigma_{ij}(E_i)$ takes $G_L$ and $T_2=\Sigma_{ij}(E_j)$
+takes $G_R$, $\tilde\Sigma=\tfrac12(T_1+T_2)$ as before (`collision_internal_pairing = vertex`:
+two sweeps, each window block with an $n_A$ identity block). `symmetric` keeps
+$\tfrac12\{g(E),\rho'\}$, i.e. $\tfrac12(G_L+G_R)$, in both tables (Eq. 8a; one sweep on
+$3n_A$ internal columns), which adds the two cross-vertex combinations. The q → 0 head pairs
+each index with its own ($m=i$, $n=j$): $C_{ij}h_i$ and $C_{ij}h_j$ in either pairing.
+
+*Particle number.* With $W^<(q)=W^>(-q)^{\rm T}$ the in-scattering of $k$ from $k-q$ and the
+out-scattering of $k-q$ into $k$ carry the same product $M_{im}C_{mn}M^*_{jn}$; they cancel in
+$\sum_k\mathrm{Tr}\,C[\rho]$ when the energy factor is even in Ω and symmetric under swapping the
+vertex pairs $\{(i,m),(j,n)\}$. Vertex pairing gives $\tfrac12[L(E_i-E_m+\Omega)+L(E_j-E_n+\Omega)]$,
+symmetric pairing $\tfrac14\sum_{x\in\{i,j\},y\in\{m,n\}}L(E_x-E_y+\Omega)$: both conserve; a
+left-index factor $g(E_m)$ in both tables does not.
+
+CPU gates (`tests/test_tdagw_collision_instbasis.py`, the same fixture; random Hermitian
+ρ with spectrum in [0, 1]): diagonal ρ' == populations for both pairings to 5.9×10⁻¹⁶;
+vertex pairing == the dense vertex reference to 9.5×10⁻⁹; covariance at a unitary mixing
+degenerate states to 7.7×10⁻¹⁵ (both pairings); trace residual on reciprocal poles
+2.9×10⁻⁹ (vertex) and 6.8×10⁻¹⁰ (symmetric), dense vertex 4.5×10⁻¹⁶; G~> and G~<
+Hermitian exactly; the basis map's fixed point to 4×10⁻¹⁴, U = 1 and E = e at ρ_eq.
+End to end (`window_collision` on hand-built propagator operators, two trials): at ΔΣ = 0
+and e = ε^G the instantaneous basis is the band basis to 1.4×10⁻¹³, and a refresh at
+ρ_eq reproduces t0 exactly. The equilibrium path (no ρ) is bitwise the previous tree's,
+the GW run's Σ(ω) cube included. Fixture walls: populations 1.04 s, symmetric 1.14 s,
+vertex 2.24 s per sweep.
 
 ### 1.6 The active space: band window or disentangled subspace (proposed) {#active-space}
 

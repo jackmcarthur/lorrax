@@ -95,6 +95,8 @@ TD_DEFAULTS = {
     "lorrax.collision_spm_chi0_active": None,
     "lorrax.collision_in_scattering": "populations",
     "lorrax.collision_rate_intermediates": "all",
+    "lorrax.collision_basis": "band",
+    "lorrax.collision_internal_pairing": "symmetric",
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -126,6 +128,11 @@ COLLISION_IN_SCATTERINGS = ("populations", "full")
 #: ``lorrax.collision_rate_intermediates``: the rates' intermediate bands
 #: (``tdagw.dynsig.RATE_INTERMEDIATES``).
 COLLISION_RATE_INTERMEDIATES = ("all", "active")
+#: ``lorrax.collision_basis``: the lines' basis and energies (``tdagw.dynsig.COLLISION_BASES``).
+COLLISION_BASES = ("band", "instantaneous")
+#: ``lorrax.collision_internal_pairing``: the internal line's energy pairing
+#: (``tdagw.dynsig.INTERNAL_PAIRINGS``).
+COLLISION_INTERNAL_PAIRINGS = ("symmetric", "vertex")
 METHODS = ("dp54", "rk4", "etdrk4", "magnus2", "cfm4")
 MODELS = ("none", "tdgw_kernel", "isdf")
 #: Sample names the driver keeps for its own per-chunk record (``tdagw.propagate.PROGRESS``);
@@ -247,7 +254,9 @@ def _check_collision(vals: dict) -> None:
                         "set [lorrax] collision_spm_chi0_active or leave it unset")
         vals["lorrax.collision_spm_chi0_active"] = [int(n) for n in ca]
     for key, allowed in (("lorrax.collision_in_scattering", COLLISION_IN_SCATTERINGS),
-                         ("lorrax.collision_rate_intermediates", COLLISION_RATE_INTERMEDIATES)):
+                         ("lorrax.collision_rate_intermediates", COLLISION_RATE_INTERMEDIATES),
+                         ("lorrax.collision_basis", COLLISION_BASES),
+                         ("lorrax.collision_internal_pairing", COLLISION_INTERNAL_PAIRINGS)):
         if vals[key] not in allowed:
             raise _gate("td_collision", f"{key.split('.')[1]} = {vals[key]!r}", " | ".join(allowed),
                         f"set [lorrax] {key.split('.')[1]}")
@@ -257,6 +266,18 @@ def _check_collision(vals: dict) -> None:
                         f"collision_refresh_sweep = {vals['lorrax.collision_refresh_sweep']!r}",
                         "collision_refresh_sweep = 'active'",
                         "it acts on the active part of the split sweep")
+    for key in ("lorrax.collision_basis", "lorrax.collision_internal_pairing"):
+        if (vals[key] != TD_DEFAULTS[key]
+                and vals["lorrax.collision_in_scattering"] != "full"):
+            raise _gate("td_collision", f"{key.split('.')[1]} = {vals[key]!r} with "
+                        f"collision_in_scattering = {vals['lorrax.collision_in_scattering']!r}",
+                        "collision_in_scattering = 'full'",
+                        "it acts on the full-rho internal line")
+    if (vals["lorrax.collision_basis"] == "instantaneous"
+            and vals["lorrax.collision_screening"] != "frozen"):
+        raise _gate("td_collision", "collision_basis = 'instantaneous' with collision_screening "
+                    f"= {vals['lorrax.collision_screening']!r}", "collision_screening = 'frozen'",
+                    "the slow Hamiltonian's basis is defined at fixed W (td_agw_dynamical.md §1.5)")
     for key in ("lorrax.collision_refresh_fs", "lorrax.collision_refresh_df"):
         try:
             ok = float(vals[key]) >= 0.0
@@ -574,7 +595,8 @@ def inactive_keys(deck) -> dict:
           "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev",
           "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev",
           "lorrax.collision_spm_chi0_active", "lorrax.collision_in_scattering",
-          "lorrax.collision_rate_intermediates"),
+          "lorrax.collision_rate_intermediates", "lorrax.collision_basis",
+          "lorrax.collision_internal_pairing"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
         (("lorrax.collision_spm_support_sites_ev", "lorrax.collision_spm_chi0_active"),
          v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "shared_pole",
@@ -984,13 +1006,11 @@ TD_KEY_DOCS = {
         "= populations", "With `collision_refresh_sweep = active` for `full`: the internal "
         "line of the active part's rates. `populations`: the band populations f = diag ρ "
         "(hole f_m, particle 1 − f_m), the coherences of ρ are not in the rates. `full`: the "
-        "window's whole ρ, hole ρ_mn and particle (1 − ρ)_mn, with the symmetric energy "
-        "prescription ½ g(ε_m) + ½ g(ε_n) of each off-diagonal pair "
-        "([td_agw_dynamical.md §1.5, Eq. 8a](theory/td_agw_dynamical.md)); it is swept on "
-        "2 n_A pseudo-bands ψ_A(1 ± R) after the window (R the off-diagonal part of ρ), so "
-        "the active sweep runs over 3 n_A intermediate states, and at a diagonal ρ it is "
-        "`populations` to rounding. The frozen part is unchanged (its populations never "
-        "change).",
+        "window's whole ρ, hole ρ_mn and particle (1 − ρ)_mn, contracted in the Σ sweep as "
+        "G = L diag(w) R^H on the orbital panels ψ and ψC with the energy pairing of "
+        "`collision_internal_pairing` ([td_agw_dynamical.md §1.5, Eqs. 8a and "
+        "8c](theory/td_agw_dynamical.md)); at a diagonal ρ it is `populations` to rounding. "
+        "The frozen part is unchanged (its populations never change).",
         ("td_collision",)),
     "lorrax.collision_rate_intermediates": (
         "= all", "With `collision_refresh_sweep = active` for `active`: the intermediate "
@@ -1001,6 +1021,30 @@ TD_KEY_DOCS = {
         "at T = 0, alive only in the η tails) are a particle source or sink; with "
         "`active` and a closed window Σ_k Tr C[ρ] = 0 holds to rounding for "
         "`in_scattering = full`.",
+        ("td_collision",)),
+    "lorrax.collision_basis": (
+        "= band", "With `collision_in_scattering = full` for `instantaneous`: the basis and "
+        "energies of the rates' lines. `band`: the band basis at the collision source's "
+        "bundle energies (the GW run's ε^G). `instantaneous`: at every refresh the "
+        "eigenbasis U of the propagator's slow Hamiltonian, H_slow = diag(e) + ΔΣ^h + "
+        "ΔΣ[ρ_eq + U diag(f − f_eq) U^†], e the propagator's window energies and f = "
+        "diag(U^† ρ U) (a fixed point; the drive "
+        "and the coherent O(E) mean field are left out), its eigenvalues as the external "
+        "and internal energies and ρ' = U^† ρ U as the internal line; the rates are rotated "
+        "back to the band basis. The frozen bands keep ψ and their step occupation and sit "
+        "at ε^G + Δ_edge(k), Δ_edge = e − ε^G of the window's edge band on their "
+        "side (lowest window band below, highest above); their part is swept at every "
+        "refresh (its external states rotate). Needs `collision_screening = frozen` "
+        "([td_agw_dynamical.md §1.5, Eq. 8b](theory/td_agw_dynamical.md)).",
+        ("td_collision",)),
+    "lorrax.collision_internal_pairing": (
+        "= symmetric", "With `collision_in_scattering = full`: the energy pairing of the "
+        "internal line in the two on-shell tables Σ_ij(ε_i), Σ_ij(ε_j). `symmetric`: "
+        "½ {g(ε'), C} in both (one sweep per branch on 2 n_A internal columns). `vertex`: "
+        "each external index with the internal index on its own vertex, Σ_ij(ε_i) from "
+        "G_L = ψ' e^{−iε'τ} C ψ'^† and Σ_ij(ε_j) from G_R = ψ' C e^{−iε'τ} ψ'^† (four "
+        "sweeps); both conserve Σ_k Tr C[ρ] on reciprocal poles "
+        "([td_agw_dynamical.md §1.5, Eq. 8c](theory/td_agw_dynamical.md)).",
         ("td_collision",)),
     "lorrax.collision_spm_chi0_active": (
         "= one rule on every pair", "With `collision_screening = shared_pole`: `auto` or `[a0, a1]`, "

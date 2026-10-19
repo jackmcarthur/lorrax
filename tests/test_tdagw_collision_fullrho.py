@@ -27,7 +27,7 @@ FC  closed window (active intermediates): sum_k Tr C[rho] / sum_k |Tr G~> rho| f
     (populations + active, full + all) and neither (populations + all)
 FU  covariance at a unitary U mixing degenerate window states (e_v1 = e_v2,
     e_c1 = e_c2 per k): U^H G~[rho] U == G~'[U^H rho U] (both rates)     rel <= 1e-10;
-    the populations' internal line fails it (RED twin, > 100 x)
+    the populations' internal line fails it (control variant, > 100 x)
 FW  the wall of an active full-ρ sweep over the populations' one (reported)
 """
 import json
@@ -207,7 +207,7 @@ def run_checks(mesh):
         rows["FW_populations_s"] = min(sweep(win_p)["wall_s"] for _ in range(2))
         rows["FW_full_s"] = min(sweep(dict(win_p, rho=np.einsum("ki,ij->kij", f_x, np.eye(NA))
                                             .astype(complex)))["wall_s"] for _ in range(2))
-        rows["n_pseudo"] = int(dia["full_rho"]["n_pseudo"])
+        rows["n_insert"] = int(dia["full_rho"]["n_insert"])
 
         # ---- FD / FB: random Hermitian rho' vs the dense full-rho reference
         rho = _random_rho(rng2, nk, NA, coh=1.0)

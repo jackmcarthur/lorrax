@@ -5,6 +5,31 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-19 — TD-aGW collision: instantaneous basis, vertex pairing, G = L diag(w) R^H (opt-in)
+
+Two `[lorrax]` keys of the full-ρ internal line (`collision_in_scattering = "full"`);
+with both unset results are unchanged and the run fingerprint is unchanged.
+
+- **`collision_basis = "instantaneous"`** (default `"band"`; frozen screening): the
+  lines' basis and energies are the eigenpairs of the propagator's slow
+  Hamiltonian diag(e) + ΔΣ[ρ_eq + U diag(f − f_eq) U^†] (e its window energies;
+  a fixed point per trial and refresh, its held ΔΣ^h included; [TD-aGW dynamical
+  §1.5, Eq. 8b](docs/theory/td_agw_dynamical.md#damping)) instead of the band
+  basis at the bundle's ε^G. Frozen bands sit at ε^G + Δ_edge(k), Δ_edge = e − ε^G
+  of the window's edge band on their side (0 when the propagator runs on ε^G), and
+  their part is swept at every refresh.
+- **`collision_internal_pairing = "vertex"`** (default `"symmetric"`): Σ_ij(ε_i)
+  and Σ_ij(ε_j) take the internal energy of the index on their own vertex (two
+  sweeps); `symmetric` keeps ½ {g(ε), ρ} in both (one sweep).
+- **Code.** `gw.wavefunction_bundle.ParentGreenCarrier` takes optional
+  `green_left` / `green_right` panels (G = L diag(w) R^H; None is the faces,
+  bitwise the previous operands). `gw.ppm_sigma.window_sigma_c` takes `pairing`
+  and `window["e_frozen"]`; the full-ρ line runs on these panels instead of the
+  2 n_A pseudo-bands (same tables to 9×10⁻¹⁶). With `rho` its
+  `static_limit["sx"]` holds the head's static part (`head` zero).
+  `tdagw.dynsig.window_collision` takes `basis`, `pairing` and `model`.
+  Tests: `tests/test_tdagw_collision_instbasis.py`.
+
 ## 2026-10-19 — TD-aGW collision: full-ρ in-scattering, active rate intermediates (opt-in)
 
 Two `[lorrax]` keys of the split refresh (`collision_refresh_sweep = "active"`);
