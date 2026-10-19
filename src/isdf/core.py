@@ -1467,6 +1467,27 @@ def _charge_factor_math(C_log, *, n_log: int, rcond: float, rank_log: bool):
 _charge_face_cache: dict = {}
 
 
+def _charge_eigh_local(mesh_xy, nq: int, n: int, dtype) -> bool:
+    """Whether the charge factor's eigh runs native (``plan('eigh')``'s ``auto``: the whole q stack
+    on EVERY rank, an eigh does not partition) rather than one matrix at a time on the mesh.
+
+    Native only where the stack has a matrix per rank and three whole ``(nq, n, n)`` stacks
+    (operand, vectors, B) with the local eigh workspace fit the run budget
+    (``distrib_la.fits_local``, ``common.gpu_utils.device_budget_bytes``): Fe (64 q, n 312)
+    stays native; a Gamma deck (nq 1, n 29998, P 16) took native and ran out of device memory in
+    the syevBatched workspace (run30k, 2026-10-19). Shapes and the agreed budget only, so every
+    rank decides alike; the decision is recorded (``record_route``).
+    """
+    from common.gpu_utils import device_budget_bytes, record_route
+    from distrib_la import fits_local, plan
+    ranks, room = int(mesh_xy.devices.size), int(device_budget_bytes())
+    whole = 3 * nq * n * n * np.dtype(dtype).itemsize
+    local = nq >= ranks and fits_local(plan("eigh", mesh_xy, n=n), "eigh", ((nq, n, n),) * 3, dtype, room)
+    record_route(f"zeta charge factor eigh {nq} x {n}^2", "native" if local else "distributed",
+                 f"{nq} q on {ranks} ranks, whole stacks {whole / 1e9:.2f} GB/rank, room {room / 1e9:.2f} GB")
+    return local
+
+
 def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT):
     """The charge factor B (B Bᴴ = C⁺) of the identity-padded CCT stack, ON THE FACE; see docs/architecture/zeta_fit_face_psi_cct.md.
 
@@ -1481,9 +1502,12 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     n_log = int(n_rmu_logical)
     rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
     face, rep = NamedSharding(mesh_xy, P(None, 'x', 'y')), NamedSharding(mesh_xy, P())
-    key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond))
+    local = _charge_eigh_local(mesh_xy, int(nq), int(n), C_q.dtype)
+    key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond), local)
     if key not in _charge_face_cache:
-        eig = plan("eigh", mesh_xy, n=int(n), batched_route="auto")
+        # The native eigh holds the whole stack on every rank; else one matrix at a time on the mesh.
+        eig = (plan("eigh", mesh_xy, n=int(n), batched_route="auto") if local else
+               plan("eigh", mesh_xy, n=int(n), backend="distributed", batched_route="auto"))
         live = np.arange(int(n)) < n_log
 
         @partial(checked_program, mesh=mesh_xy, out_shardings=(face, rep), in_shardings=(face,))

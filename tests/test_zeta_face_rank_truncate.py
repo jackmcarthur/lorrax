@@ -23,20 +23,49 @@ def _gram(n, rank, seed):
 @pytest.mark.parametrize("rank", [128, 40])     # well conditioned, and over-complete (the cut binds)
 def test_the_face_factor_is_main_s_pseudo_inverse(rank, capsys):
     mesh, n_log, n = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y")), 120, 128
-    c = np.zeros((2, n, n), complex)
-    for q in range(2):
+    c = np.zeros((4, n, n), complex)                         # one q per rank: the native route (_charge_eigh_local)
+    for q in range(4):
         c[q, :n_log, :n_log] = _gram(n_log, min(rank, 2 * n_log), 3 + q)
     c[:, n_log:, n_log:] = np.eye(n - n_log)               # factor_c_q's identity pad block
     B = np.asarray(core._factor_c_q_face(jax.device_put(jnp.asarray(c), NamedSharding(mesh, P(None, "x", "y"))),
                                          mesh, n_log, zeta_rcond=RCOND))
     face = capsys.readouterr().out
     z = np.random.default_rng(9).standard_normal((n_log, 6)) + 0j
-    for q in range(2):
+    for q in range(4):
         zeta, _ = core.solve_zeta_charge_dense(jnp.asarray(c[q, :n_log, :n_log]), jnp.asarray(z),
                                                charge_zeta_solve="rank_truncate", zeta_rcond=RCOND)
         got = B[q] @ (B[q].conj().T @ np.pad(z, ((0, n - n_log), (0, 0))))
         assert np.max(np.abs(got[:n_log] - np.asarray(zeta))) <= 1e-9 * np.max(np.abs(zeta))
         assert not np.any(got[n_log:])                    # pad rows of ζ stay zero
     keep = [int(np.sum(np.linalg.eigvalsh(c[q, :n_log, :n_log]) > RCOND * np.linalg.eigvalsh(c[q, :n_log, :n_log]).max()))
-            for q in range(2)]
-    assert f"n_keep/q=[{keep[0]} {keep[1]}]" in face
+            for q in range(4)]
+    assert f"n_keep/q=[{' '.join(map(str, keep))}]" in face
+
+
+def test_charge_eigh_route_takes_the_mesh_where_native_would_not_fit(monkeypatch):
+    """run30k (nq 1, n 29998, P 16, 80 GB): the charge factor's eigh runs on the mesh, not native
+    (whole stack per rank, syevBatched out of memory); Fe (64 q, n 312) stays native."""
+    from types import SimpleNamespace
+    from common import gpu_utils
+    from isdf.core import _charge_eigh_local
+    monkeypatch.setattr(gpu_utils, "_RUN_DEVICE_BUDGET_GB", 80.0)
+    p16 = SimpleNamespace(devices=np.empty((4, 4)))           # one q on 16 ranks: decided before any plan
+    assert not _charge_eigh_local(p16, 1, 29998, np.complex128)
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    assert _charge_eigh_local(mesh, 64, 312, np.complex128)                       # Fe: unchanged
+    assert not _charge_eigh_local(mesh, 64, 29998, np.complex128)                 # 3 x 64 x n^2 over 80 GB
+
+
+def test_constructor_refuses_a_whole_41250_parent_per_rank(monkeypatch):
+    """The plausibility deck's largest constructor eigh (one 41250 x 41250 parent, nq 1): route (c)
+    would hold the whole matrix per rank; its shape price is over an 80 GB room, so admit_local
+    sends it to the whole mesh (staged_eigh)."""
+    import distrib_la
+    from common import gpu_utils
+    from gw.shared_pole_capacity import _local_eigenplan
+    monkeypatch.setattr(gpu_utils, "_RUN_DEVICE_BUDGET_GB", 80.0)
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    price = distrib_la.eigh_stack_bytes(_local_eigenplan(mesh, 41250), (1, 41250, 41250), np.complex128)
+    assert price > 80e9
+    assert not gpu_utils.admit_local("test constructor eigh 1 x 41250^2", price, 80e9,
+                                     distributed_bytes=2 * 16 * 41250 ** 2 // 16, names=("route (c)", "whole mesh"))

@@ -257,7 +257,7 @@ def test_zeta_factor_has_no_host_callback(capsys):
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
     c = jax.device_put(_hermitian(8, b=4, seed=5), NamedSharding(mesh, P(None, "x", "y")))
     core._factor_c_q_face(c, mesh, 8, zeta_rcond=1e-8)
-    program = core._charge_face_cache[next(k for k in core._charge_face_cache if k[1:] == (4, 8, 8, 1e-8))]
+    program = core._charge_face_cache[next(k for k in core._charge_face_cache if k[1:5] == (4, 8, 8, 1e-8))]
     assert _host_callbacks(program.lower(c)) == 0
     assert capsys.readouterr().out.count("[zeta rank_truncate] n_log=8 rcond=1.0e-08 n_keep/q=[8 8 8 8]") == 1
 
