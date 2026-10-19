@@ -146,7 +146,7 @@ def admit_local(site: str, local_bytes: float, room_bytes: float, *,
     provider's contexts outside the pool (``provider``: the route opens
     cuSOLVERMp), so they are charged here
     (``runtime.DISTRIBUTED_LINALG_OUTSIDE_BYTES``).  When neither fits, the
-    route less over, with a warning naming both prices; ``distributed_bytes``
+    distributed route (it divides the work), with a warning naming both prices; ``distributed_bytes``
     may be a callable, priced only then.  ``probe()`` raises
     when the distributed route cannot run here (platform, mesh, build): the
     local route stays, warned.  ``forced`` is a route the deck named.  Every
@@ -186,12 +186,11 @@ def admit_local(site: str, local_bytes: float, room_bytes: float, *,
     if other <= other_room:
         record(site, other_name, reason + f" of room {gb(other_room)}")
         return False
-    keep_local = local_bytes - room < other - other_room
-    record(site, local_name if keep_local else other_name, reason + f" over room {gb(other_room)}",
-           warning="both routes are over their room; this one is less over"
+    record(site, other_name, reason + f" over room {gb(other_room)}",
+           warning=f"both routes are over their room; the {other_name} one runs"
            + ("; linalg = distributed reserves the provider contexts' room at startup"
               if contexts else ""))
-    return keep_local
+    return False
 
 
 # ============================================================================

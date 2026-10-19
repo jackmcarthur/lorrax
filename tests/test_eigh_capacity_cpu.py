@@ -95,10 +95,13 @@ def test_auto_with_room_equals_distributed_where_it_resolves(mesh, monkeypatch):
     d = distrib_la.plan("eigh", mesh, n=8, backend="distributed", budget_bytes=1 << 30)
     assert a.capacity_refusal is None and a.backend == d.backend == "scalapack"
     assert dataclasses.replace(a, requested="distributed") == d
-    for room in (1 << 30, 10, 0):
+    for room in (1 << 30, 0):
         ra = dataclasses.replace(a, budget_bytes=room).stack_route((4, 8, 8), np.complex128)
         rd = dataclasses.replace(d, budget_bytes=room).stack_route((4, 8, 8), np.complex128)
         assert ra == rd
+    for p in (a, d):                  # a whole mesh over its room is refused by name, alike
+        with pytest.raises(RuntimeError, match="GATE distrib_la_capacity"):
+            dataclasses.replace(p, budget_bytes=10).stack_route((4, 8, 8), np.complex128)
 
 
 def test_staged_whole_mesh_refuses_by_name_without_library(mesh):

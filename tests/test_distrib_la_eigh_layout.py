@@ -180,10 +180,9 @@ def test_route_c_takes_the_cut():
     assert not bool(np.asarray(failed[0]).any()) and np.isfinite(np.asarray(w)).all()
 
 
-def test_a_local_workspace_the_vendor_rejects_is_inadmissible(monkeypatch, capsys):
-    """run30k: cusolverDnZheevd_bufferSize answers status 3 at n 30000. The LOCAL candidate's
-    query fails closed (priced past any room, so admission takes the whole mesh); a failure of
-    the distributed (context) query still raises."""
+def test_a_local_workspace_the_vendor_rejects_is_inadmissible(monkeypatch):
+    """run30k: cusolverDnZheevd_bufferSize answered status 3 at n 30000. A query the vendor
+    rejects raises; a local fit it cannot size is no local candidate (fits_local False)."""
     from types import SimpleNamespace
     from distrib_la import loader, workspace
 
@@ -191,13 +190,13 @@ def test_a_local_workspace_the_vendor_rejects_is_inadmissible(monkeypatch, capsy
         def __call__(self, *args):
             return 3
     monkeypatch.setattr(loader, "get_lib", lambda platform: SimpleNamespace(lrx_eigh_workspace_bytes=_Rejects()))
+    monkeypatch.setattr(workspace, "device_vendor", lambda device: "cuda")
     workspace._vendor_query.cache_clear()
     try:
-        assert workspace._vendor_query(0, "eigh", (30000,), "<c16") == (workspace.UNPRICED_LOCAL_BYTES, 0)
-        assert workspace.UNPRICED_LOCAL_BYTES > 1e15
-        assert "the local eigh is unpriced" in capsys.readouterr().out
         with pytest.raises(RuntimeError, match="status=3"):
-            workspace._vendor_query(7, "eigh", (30000,), "<c16")
+            workspace._vendor_query(0, "eigh", (30000,), "<c16")
+        mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
+        assert not workspace.fits_local(SimpleNamespace(mesh=mesh), "eigh", ((1, 64, 64),), np.complex128, 10**12)
     finally:
         workspace._vendor_query.cache_clear()
 

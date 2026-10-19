@@ -258,6 +258,38 @@ def _stack_price(op, mesh, nb, n, dtype, rounds, gathered=False) -> int:
     return per_rank * whole + checked
 
 
+def _mesh_price(n, dtype, ranks) -> int:
+    """Per-rank bytes of one n x n eigh on the whole mesh, from the shape: the checked chain's
+    temporaries (:data:`CHECKED_EIGH_TILES`), the vectors and the provider's workspace (one
+    n^2/P tile each; cuSOLVERMp 0.9.1's aligned workspace is 1.1 n^2/P at 4x4, n 100000,
+    A100; other providers unmeasured)."""
+    return (CHECKED_EIGH_TILES + 2) * -(-n * n * np.dtype(dtype).itemsize // ranks)
+
+
+def place(op, mesh, nb, n, dtype, room, provider) -> StackRoute:
+    """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank, priced from the
+    shapes only (no vendor query), so every rank decides alike with no exchange.
+
+    Route (c) at the most whole matrices per rank whose program (:func:`_stack_price`) fits;
+    a stack smaller than the rank count only where one such program is within
+    GATHERED_EIGH_BYTES (route (c) pads it to every rank: a replicated matrix, with P - nb
+    ranks idle). Otherwise the whole mesh (:func:`_mesh_price`), which
+    :meth:`Plan.stack_route` refuses by name when even that is over ``room``.
+    """
+    x, y = int(mesh.shape["x"]), int(mesh.shape["y"])
+    ranks, gathered = x * y, _gathered_admitted((n, n), dtype, room)
+    if n % x == 0 and n % y == 0:
+        per_rank = -(-nb // ranks)
+        while per_rank >= 1:
+            rounds = -(-(-(-nb // ranks)) // per_rank)
+            tried = -(-(-(-nb // rounds)) // ranks)
+            price = _stack_price(op, mesh, nb, n, dtype, rounds, gathered)
+            if price <= room and (nb >= ranks or price <= GATHERED_EIGH_BYTES):
+                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
+            per_rank = min(per_rank - 1, max(1, per_rank * room // price))
+    return StackRoute(provider, 0, 1, _mesh_price(n, dtype, ranks), room)
+
+
 def _gathered_admitted(shape, dtype, room=None) -> bool:
     """Whether an eigh's gathered retry joins its chain: the matrices, their
     vectors and the solver's copy (GATHERED_EIGH_FACTOR n^2 elements each)
@@ -915,10 +947,8 @@ def _describe_stack(route: StackRoute) -> str:
                 f"{route.rounds} round(s), compiled {gb(route.program_bytes)}/rank of room "
                 f"{gb(route.room)}{sized}")
     if route.program_bytes is None:
-        why = "no priced candidate fits" if route.room else ""
-        return f"{route.route} on the whole mesh (room {gb(route.room)}{', ' + why if why else ''})"
-    return (f"{route.route} on the whole mesh ({route.per_rank} whole matrix(es) per rank "
-            f"compile to {gb(route.program_bytes)} against room {gb(route.room)}{sized})")
+        return f"{route.route} on the whole mesh (room {gb(route.room)})"
+    return f"{route.route} on the whole mesh ({gb(route.program_bytes)}/rank of room {gb(route.room)}{sized})"
 
 
 @dataclass(frozen=True)
@@ -1159,6 +1189,11 @@ class Plan:
             if decided.route != ROUTE_BATCH_RESHARD:
                 self.require_capacity(
                     f"the eigh stack {shape} ({_describe_stack(decided)})")
+                if decided.program_bytes > decided.room:
+                    raise RuntimeError(
+                        f"GATE distrib_la_capacity: the {op} stack {shape} {np.dtype(dtype).name} "
+                        f"needs {decided.program_bytes / 1e9:.2f} GB/rank on the whole mesh, over its "
+                        f"room {decided.room / 1e9:.2f} GB/rank (route (c) holds whole matrices: more).")
             _STACK_ROUTES[key] = decided
         return decided
 
@@ -1184,25 +1219,7 @@ class Plan:
         return static
 
     def _decide_stack(self, op, nb, n, dtype, phase, traced=True) -> StackRoute:
-        """Route (c) at the most whole matrices per rank whose priced program fits the room.
-
-        The candidates (whole matrices per rank, from ceil(nb/P) down) and their
-        prices (:func:`_stack_price`) follow from the shape and the room only,
-        so every rank reaches the same answer without an exchange.
-        """
-        ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
-        room, provider = int(self.budget_bytes), self.batched_route
-        if n % int(self.mesh.shape["x"]) or n % int(self.mesh.shape["y"]):
-            return StackRoute(provider, room=room)
-        per_rank, tried, price = -(-nb // ranks), 0, None
-        while per_rank >= 1:
-            rounds = -(-(-(-nb // ranks)) // per_rank)
-            tried = -(-(-(-nb // rounds)) // ranks)
-            price = _stack_price(op, self.mesh, nb, n, dtype, rounds, _gathered_admitted((n, n), dtype, room))
-            if price <= room:
-                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
-            per_rank = min(per_rank - 1, max(1, per_rank * room // price))
-        return StackRoute(provider, tried, 1, price, room)
+        return place(op, self.mesh, nb, n, dtype, int(self.budget_bytes), self.batched_route)
 
     @property
     def native_fn(self) -> Callable:

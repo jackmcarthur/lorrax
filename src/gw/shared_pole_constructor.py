@@ -438,9 +438,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
                     real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
                     mesh_xy=mesh_xy, eigh_plan=eig if execution == 'face' else local_eigh, ordered=ordered,
-                    # A face check decides its eighs beside the model phase and its own program.
+                    # A face check decides its eighs beside the model phase and its own program; the
+                    # model row's eigh reservation is that eigh's own (run30k: 8 GiB room, not 15).
                     room=lambda price: face_eigh_room(dict(model_row, aggregate_bytes_per_rank=(
-                        model_row['aggregate_bytes_per_rank'] + price))))
+                        model_row['aggregate_bytes_per_rank'] + price
+                        - model_row['native_workspace'].get('eigh', 0)))))
                 del inverse_sqrt, held, exact
             with phase("gates"):
                 for slot, q in enumerate(ids[:real]):

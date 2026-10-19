@@ -376,7 +376,7 @@ def matmul(
         a = (local,) + _op_shape((int(A.shape[-2]), int(A.shape[-1])), transa)
         b = (local,) + _op_shape((int(B.shape[-2]), int(B.shape[-1])), transb)
         d = (local, a[1], b[2])
-        if fits_local(SimpleNamespace(mesh=mesh), "gemm", (a, b, d), A.dtype, budget_bytes):
+        if fits_local(SimpleNamespace(mesh=mesh), "gemm", (a, b, d), A.dtype, budget_bytes, batch=nb):
             route = ROUTE_BATCH_RESHARD
     provider = resolve_matmul_backend(backend, mesh, batched_route=route)
     px, py = _mesh_shape(mesh)

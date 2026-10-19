@@ -42,18 +42,27 @@ def test_the_face_factor_is_main_s_pseudo_inverse(rank, capsys):
     assert f"n_keep/q=[{' '.join(map(str, keep))}]" in face
 
 
-def test_charge_eigh_route_takes_the_mesh_where_native_would_not_fit(monkeypatch):
-    """run30k (nq 1, n 29998, P 16, 80 GB): the charge factor's eigh runs on the mesh, not native
-    (whole stack per rank, syevBatched out of memory); Fe (64 q, n 312) stays native."""
-    from types import SimpleNamespace
-    from common import gpu_utils
-    from isdf.core import _charge_eigh_local
-    monkeypatch.setattr(gpu_utils, "_RUN_DEVICE_BUDGET_GB", 80.0)
-    p16 = SimpleNamespace(devices=np.empty((4, 4)))           # one q on 16 ranks: decided before any plan
-    assert not _charge_eigh_local(p16, 1, 29998, np.complex128)
+def test_place_decides_whole_matrices_per_rank_or_the_mesh():
+    """distrib_la.plan.place, the one eigh placement: Fe's charge stack (64 q, n 312, P 4) runs 16
+    whole matrices per rank; a stack smaller than the rank count stays route (c) only where one
+    whole matrix is within GATHERED_EIGH_BYTES (run30k: nq 1, n 29998, P 16 takes the mesh); the
+    whole mesh is priced from the shape and refused by name over its room."""
+    import sys
+    import distrib_la
+    pl = sys.modules["distrib_la.plan"]
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
-    assert _charge_eigh_local(mesh, 64, 312, np.complex128)                       # Fe: unchanged
-    assert not _charge_eigh_local(mesh, 64, 29998, np.complex128)                 # 3 x 64 x n^2 over 80 GB
+    fe = pl.place("eigh", mesh, 64, 312, np.complex128, int(80e9), "scan")
+    assert (fe.route, fe.per_rank, fe.rounds) == (pl.ROUTE_BATCH_RESHARD, 16, 1)
+    assert pl.place("eigh", mesh, 2, 96, np.complex128, int(80e9), "scan").route == pl.ROUTE_BATCH_RESHARD
+    one = pl.place("eigh", mesh, 1, 1456, np.complex128, int(80e9), "scan")        # 0.27 GB whole
+    assert one.route == "scan" and one.program_bytes == (pl.CHECKED_EIGH_TILES + 2) * 1456 ** 2 * 16 // 4
+    big = pl.place("eigh", mesh, 1, 30000, np.complex128, int(8e9), "scan")       # 32.4 GB on 2x2
+    assert big.route == "scan" and big.program_bytes > big.room
+    import dataclasses
+    plan = dataclasses.replace(distrib_la.plan("eigh", mesh, n=30000, backend="off", batched_route="auto",
+                                               budget_bytes=int(8e9)), backend="scalapack")
+    with pytest.raises(RuntimeError, match="GATE distrib_la_capacity"):
+        plan.stack_route((1, 30000, 30000), np.complex128)
 
 
 def test_constructor_refuses_a_whole_41250_parent_per_rank(monkeypatch):

@@ -69,7 +69,7 @@ def _gamma_gemm_route(mesh, b_shape, budget_bytes):
     local = -(-q // ranks)
     shapes = ((local, n, k), (local, k, n), (local, n, n))
     fits = distrib_la.fits_local(SimpleNamespace(mesh=mesh), "gemm", shapes, np.complex128,
-                                 int(budget_bytes))
+                                 int(budget_bytes), batch=q)
     if admit_local(f"shared-pole head Gamma GEMM {q} x {n} x {k}",
                    16 * sum(int(np.prod(s)) for s in shapes), int(budget_bytes), fits=fits,
                    distributed_bytes=-(-16 * q * (2 * n * k + n * n) // ranks), provider=False):

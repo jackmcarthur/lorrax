@@ -19,12 +19,6 @@ def _shapes(shapes):
     return result
 
 
-#: The price of a LOCAL (whole matrix on one device) eigh the vendor's bufferSize query rejects:
-#: no room holds it, so every admission fails closed onto the whole mesh. cusolverDnZheevd_bufferSize
-#: (32-bit lwork) answers CUSOLVER_STATUS_INVALID_VALUE at n 30000 (run30k, 2026-10-19).
-UNPRICED_LOCAL_BYTES = 1 << 50
-
-
 @lru_cache(maxsize=None)      # one native call per (context, op, sizes, dtype) for the process
 def _vendor_query(ctx, op, sizes, dtype):
     from distrib_la.loader import get_lib
@@ -45,14 +39,6 @@ def _vendor_query(ctx, op, sizes, dtype):
     device, host = ctypes.c_uint64(), ctypes.c_uint64()
     rc = fn(ctx, *sizes, int(np.dtype(dtype).kind == 'c'),
             ctypes.byref(device), ctypes.byref(host))
-    if rc and ctx == 0:
-        # A local candidate the vendor cannot size is inadmissible, not an error (the
-        # distributed query below still raises); cached, so one notice per shape, on rank 0.
-        import jax
-        if jax.process_index() == 0:
-            print(f"  distrib_la: {name} status={rc} at sizes={sizes}: the local {op} is unpriced, "
-                  f"so it is inadmissible (whole mesh)", flush=True)
-        return UNPRICED_LOCAL_BYTES, 0
     if rc:
         raise RuntimeError(f'{name} failed with status={rc}, sizes={sizes}, local={ctx == 0}')
     return int(device.value), int(host.value)
@@ -259,7 +245,7 @@ def _local_kernel_workspace(mesh, op, shapes, dtype):
     raise ValueError('fits_local op must be eigh or gemm')
 
 
-def fits_local(plan, op, shapes, dtype, budget_bytes) -> bool:
+def fits_local(plan, op, shapes, dtype, budget_bytes, batch=None) -> bool:
     """Whether one rank holds the caller's live set and the local kernel's workspace.
 
     Parameters
@@ -279,6 +265,10 @@ def fits_local(plan, op, shapes, dtype, budget_bytes) -> bool:
         Device bytes per rank the caller admits for this stage. Pass a value
         every rank agrees on (a deck budget), never a per-rank measurement:
         the answer selects collectives.
+    batch : int, optional
+        The caller's whole stack count. Below the rank count the batch layout
+        pads every rank to a whole matrix with ``P - batch`` of them idle, so it
+        fits only within ``GATHERED_EIGH_BYTES`` (``distrib_la.plan.place``).
 
     Returns
     -------
@@ -291,7 +281,14 @@ def fits_local(plan, op, shapes, dtype, budget_bytes) -> bool:
         raise TypeError('fits_local supports float64 and complex128')
     budget = operator.index(budget_bytes)
     live = sum(int(np.prod(s)) for s in shapes) * dtype.itemsize
-    return live + int(_local_kernel_workspace(plan.mesh, op, shapes, dtype)) <= budget
+    if batch is not None and int(batch) < plan.mesh.devices.size:
+        from distrib_la.plan import GATHERED_EIGH_BYTES
+        budget = min(budget, GATHERED_EIGH_BYTES)
+    try:
+        workspace = int(_local_kernel_workspace(plan.mesh, op, shapes, dtype))
+    except RuntimeError:            # a shape the vendor cannot size is no local candidate
+        return False
+    return live + workspace <= budget
 
 
 def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
@@ -330,21 +327,21 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
 
 def eigh_stack_bytes(plan, shape, dtype) -> int:
     """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
-    its operand, from the shapes alone: on route (c) ``BATCH_EIGH_TILES`` n^2 elements per whole
-    matrix a rank holds, plus the leg's batched eigh workspace (at most one fixed tile); on the whole mesh the vectors stack, the values and one solve's
-    workspace (:func:`workspace_bytes_per_rank`, 0 off CUDA). Every rank computes the same figure.
+    its operand, priced as :func:`distrib_la.plan.place` prices it: on route (c) its program
+    (``_stack_price``) and the leg's batched eigh workspace (at most one fixed tile); on the whole
+    mesh one solve (``_mesh_price``) beside the other matrices' vector faces and the values.
+    Shapes only: every rank computes the same figure.
     """
-    from distrib_la.plan import BATCH_EIGH_TILES, ROUTE_BATCH_RESHARD
+    from distrib_la.plan import (BATCH_EIGH_TILES, ROUTE_BATCH_RESHARD, _gathered_admitted,
+                                 _mesh_price, _stack_price)
     nb, n = int(shape[0]), int(shape[-1])
     ranks = int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
     item = np.dtype(dtype).itemsize
     if plan.batched_route == ROUTE_BATCH_RESHARD:
-        # Plus the leg's batched native eigh workspace on the held stack (XLA scratch, at most
-        # one fixed tile; distrib_la.local_eigh.batched_workspace_bytes, 0 where no row takes it).
         from distrib_la.local_eigh import batched_workspace_bytes
-        held = -(-nb // ranks)
-        return (held * BATCH_EIGH_TILES * n * n * item
-                + batched_workspace_bytes((held, n, n), dtype, mesh_platform(plan.mesh)))
+        return (_stack_price('eigh', plan.mesh, nb, n, dtype, 1,
+                             _gathered_admitted((n, n), dtype, plan.budget_bytes))
+                + batched_workspace_bytes((-(-nb // ranks), n, n), dtype, mesh_platform(plan.mesh)))
     if plan.backend == ONE_DEVICE:
         # Whole matrices per rank, in the route's bounded rounds.
         from distrib_la._one_device import held_per_rank
@@ -353,5 +350,4 @@ def eigh_stack_bytes(plan, shape, dtype) -> int:
                                           plan.budget_bytes) or n
         return held_per_rank(nb, n, ranks, _resolve.one_device_round_n(
             "eigh", _resolve.mesh_platform(plan.mesh), bound)) * BATCH_EIGH_TILES * n * n * item
-    return (-(-nb * n * n * item // ranks) + nb * n * 8
-            + workspace_bytes_per_rank(plan, 'eigh', ((n, n),), dtype))
+    return -(-(nb - 1) * n * n * item // ranks) + nb * n * 8 + _mesh_price(n, dtype, ranks)

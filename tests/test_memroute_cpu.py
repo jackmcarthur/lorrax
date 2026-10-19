@@ -78,9 +78,9 @@ def test_local_layout_charges_provider_contexts():
     row = gpu_utils.routes()[0]
     assert row["route"] == "distributed" and row["warning"] is not None
     assert "linalg = distributed" in row["warning"] and "provider contexts 3.00 GB" in row["reason"]
-    # The less-over route wins when local is the closer one.
-    assert gpu_utils.admit_local("other", 31 * GB, 30 * GB, distributed_bytes=29 * GB) is True
-    assert gpu_utils.routes()[1]["route"] == "local" and gpu_utils.routes()[1]["warning"]
+    # Both over: the distributed route runs, warned (no fail-open onto one rank).
+    assert gpu_utils.admit_local("other", 31 * GB, 30 * GB, distributed_bytes=29 * GB) is False
+    assert gpu_utils.routes()[1]["route"] == "distributed" and gpu_utils.routes()[1]["warning"]
     # A route that opens no vendor context (an XLA program) is not charged.
     assert gpu_utils.admit_local("xla", 40 * GB, 30 * GB, distributed_bytes=28 * GB,
                                  provider=False) is False
