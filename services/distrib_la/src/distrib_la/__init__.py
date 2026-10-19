@@ -104,6 +104,7 @@ punctilio — it is the failure mode.
 
 from __future__ import annotations
 
+from distrib_la.cholesky import Cholesky, factor as cholesky_factor, solve as cholesky_solve
 from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
                                hermitian_part, join_columns, on_face)
 from distrib_la.subspace import plan_orthogonalization, plan_subspace, subspace_route, SUBSPACE_ROUTE
@@ -160,6 +161,7 @@ from distrib_la.local_lu import (LOCAL_LU_ROUTE, lu_solve_local, solve_local, ro
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
 __all__ = [
+    "Cholesky", "cholesky_factor", "cholesky_solve",
     "eigh_local", "eigh_route", "COMPLEX_EIGH_ROUTE",
     "solve_local", "lu_solve_local", "tri_solve_local", "local_lu_routes", "LOCAL_LU_ROUTE",
     "local_batch", "batch_layout", "is_batch_layout",

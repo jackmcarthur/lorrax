@@ -161,6 +161,7 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_phdf5_read_multi":        "PhdfReadMultiFfi",
     "lorrax_slate_eigh":              "SlateEighFfi",
     "lorrax_slate_potrf":             "SlatePotrfFfi",
+    "lorrax_slate_trsm" :             "SlateTrsmFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmFfi",
 }
@@ -190,6 +191,7 @@ _CUDA_TARGET_SYMBOLS = {
 _HOST_TARGET_SYMBOLS = {
     "lorrax_slate_eigh":              "SlateEighHostFfi",
     "lorrax_slate_potrf":             "SlatePotrfHostFfi",
+    "lorrax_slate_trsm" :             "SlateTrsmHostFfi",
     "lorrax_slate_batched_potrf":     "SlateBatchedPotrfHostFfi",
     "lorrax_slate_batched_trsm":      "SlateBatchedTrsmHostFfi",
     "lorrax_scalapack_batched_solve_lu_factors": "ScalapackBatchedSolveLuFactorsHostFfi",
