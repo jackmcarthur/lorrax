@@ -84,8 +84,13 @@ from gw.shared_pole_execution import (line_selection_execution, line_selection_r
 from gw.shared_pole_capacity import (face_eigh_room, check_eigh_room, ConstructorCapacity,
                                      constructor_eigenplan)
 from gw.shared_pole_directions import charge_line_selection, port_extent
+# The driver's arrays live beside the ledger: leg 59998942 measured a 3.13 GB/rank floor
+# ('spole other'; Sigma rule plan 3.17, QP 3.19), what the bind's baseline measures.
+BASELINE = 3_130_000_000
 ledger = CapacityLedger(SimpleNamespace(nk_tot=1, nspinor=2, n_rmu=NLOG), mesh_xy=mesh,
-                        device_budget_bytes=BUDGET)
+                        device_budget_bytes=BUDGET, baseline_bytes=BASELINE)
+# The room helpers that measure live arrays see the same floor.
+gpu_utils.shared_device_room_bytes = lambda: BUDGET - BASELINE
 face_bytes = 16 * N * N // mesh.size
 ledger.reserve("coulomb_roots:2", resident_bytes_per_rank=face_bytes, workspace_bytes_per_rank=0)
 ledger.live_stages = ("coulomb_roots:2",)

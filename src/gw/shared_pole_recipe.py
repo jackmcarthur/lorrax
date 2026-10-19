@@ -318,6 +318,11 @@ class CapacityLedger:
     device_budget_bytes : int, optional
         Resolved per-device budget in bytes. Production supplies the deck
         budget; standalone synthetic callers default conservatively to 3U.
+    baseline_bytes : int, optional
+        Device bytes per rank live outside the ledger when it is bound (the
+        driver's arrays: wavefunctions, V, the ISDF tensors). Every admission
+        sees the budget less this and the inherited peak. Production measures it
+        collectively at bind (:func:`resolve_shared_pole_recipe`); 0 by default.
 
     Each reservation owns disjoint device resident/workspace bytes computed by its
     caller for its ACTUAL batch sizes, including packing and native workspace.
@@ -332,7 +337,7 @@ class CapacityLedger:
     copy larger than its device panel (coordinator ruling 11).
     """
 
-    def __init__(self, meta, *, mesh_xy, device_budget_bytes=None):
+    def __init__(self, meta, *, mesh_xy, device_budget_bytes=None, baseline_bytes=0):
         geometry = dict(nq=meta.nk_tot, nspinor=meta.nspinor, nmu=meta.n_rmu,
                         px=mesh_xy.shape['x'], py=mesh_xy.shape['y'])
         self.geometry = {}
@@ -355,6 +360,7 @@ class CapacityLedger:
             else self._bytes(device_budget_bytes))
         if self.device_budget_bytes_per_rank <= 0:
             raise ValueError("capacity device budget must be positive")
+        self.baseline_bytes_per_rank = self._bytes(baseline_bytes)
         self.entries = []
         self._accepted = {}
         self._live_stages = None
@@ -420,7 +426,8 @@ class CapacityLedger:
             warn_over_budget(f"shared-pole ledger {stage}", row['aggregate_bytes_per_rank'],
                              row['available_device_bytes_per_rank'])
         self._accepted[stage] = row
-        record_stage_price("shared-pole ledger", row['aggregate_bytes_per_rank'])
+        # Priced as the pool measures it: the ledger's bytes and what was live beside it at bind.
+        record_stage_price(self.price_label(), row['aggregate_bytes_per_rank'] + self.baseline_bytes_per_rank)
         return copy.deepcopy(row)
 
     def preview(self, *, resident_bytes_per_rank,
@@ -449,7 +456,7 @@ class CapacityLedger:
         inherited = max((row.get('value', {}).get('shared_bytes_per_rank') or 0
                          for row in (self.stream_peak, self.sigma_peak)
                          if isinstance(row.get('value'), dict)), default=0)
-        available = max(0, self.device_budget_bytes_per_rank - inherited)
+        available = max(0, self.device_budget_bytes_per_rank - inherited - self.baseline_bytes_per_rank)
         passed = total <= available
         g = self.geometry
         max_ranks = math.floor(self.limit_bytes_per_rank * g['px'] * g['py'] / total) if total else None
@@ -471,15 +478,22 @@ class CapacityLedger:
                    limit_bytes_per_rank=self.limit_bytes_per_rank,
                    device_budget_bytes_per_rank=self.device_budget_bytes_per_rank,
                    inherited_peak_bytes_per_rank=inherited,
+                   baseline_bytes_per_rank=self.baseline_bytes_per_rank,
                    available_device_bytes_per_rank=available,
                    device_budget_status='PASS' if passed else 'FAIL',
                    concurrent_with=sorted(live), live_stages=sorted(live),
                    geometry=dict(g), max_mesh_ranks_at_fixed_bytes=max_ranks)
         return copy.deepcopy(row)
 
+    def price_label(self):
+        """The stage name a reservation's price is recorded under (``record_stage_price``)."""
+        if not self.baseline_bytes_per_rank:
+            return "shared-pole ledger"
+        return f"shared-pole ledger + {self.baseline_bytes_per_rank / 1e9:.2f} GB baseline"
+
     def room_bytes_per_rank(self, concurrent_with=()):
         """What a new reservation beside ``concurrent_with`` may still take: the device
-        budget less the inherited peak and the named live stages (never negative).  A
+        budget less the inherited peak, the baseline and the named live stages (never negative).  A
         planner sizes its batch from this, then reserves the batch it chose."""
         row = self.preview(resident_bytes_per_rank=0, workspace_bytes_per_rank=0,
                            concurrent_with=concurrent_with)
@@ -1218,9 +1232,17 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
         raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
     # The run's budget in decimal GB (was per_device_gb * 2**30: GiB, 7.4% over the deck).
-    from common.gpu_utils import device_budget_bytes
+    from common.gpu_utils import device_budget_bytes, shared_device_room_bytes
+    budget = int(device_budget_bytes())
+    # What is live outside the ledger now (the driver's arrays), the largest over processes:
+    # shared_device_room_bytes gathers every process's room and takes the minimum, so every
+    # rank enters the same call here and gets the same baseline (no rank-divergent flow).
+    baseline = max(0, budget - int(shared_device_room_bytes()))
     meta.shared_pole_capacity = CapacityLedger(
-        meta, mesh_xy=mesh_xy, device_budget_bytes=int(device_budget_bytes()))
+        meta, mesh_xy=mesh_xy, device_budget_bytes=budget, baseline_bytes=baseline)
+    print_fn(f"shared-pole ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "
+             f"live outside the ledger at bind (the driver's arrays); admissions see "
+             f"{(budget - baseline) / 1e9:.2f} GB/rank")
     recipe = shared_real_pole_v1_r3b
     tier = config.sigma.w_accuracy
     policy = recipe[tier]
