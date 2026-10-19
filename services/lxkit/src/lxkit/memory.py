@@ -23,7 +23,12 @@ STRICT = os.environ.get("LORRAX_MEMORY_STRICT", "") == "1"
 CENSUS_BYTES = 64 << 20
 #: Calibrate (and STRICT): priced stages wait on their work and a BFC leg polls, so receipts
 #: are exact.  Production: no wait, no poll, receipts ``~``; the CPU leg reads priced stages only.
-CALIBRATE = STRICT or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
+#: ``LORRAX_MEMORY_TRACE=<path>`` (implies calibrate): at every section's open and close and at
+#: its in-section peak, the live arrays (shape, dtype, sharding, bytes per device, the stage
+#: that created them), the allocator's bytes in use and peak, and every executable compiled in
+#: it (``memory_analysis``); one JSON per process at exit (``tools/memory_residuals.py``).
+TRACE = os.environ.get("LORRAX_MEMORY_TRACE", "")
+CALIBRATE = STRICT or bool(TRACE) or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
 
 
 @dataclass(frozen=True)
@@ -120,9 +125,16 @@ def _backend_up() -> bool:
     return bool(bridge and getattr(bridge, "_backends", None))
 
 
+def _held(a) -> tuple:
+    """(bytes on each device holding ``a``, those devices), from its sharding: reading
+    ``addressable_shards[i].data`` would create the single-device arrays it counts."""
+    shard = math.prod(a.sharding.shard_shape(a.shape)) * a.dtype.itemsize
+    return int(shard), a.sharding.addressable_devices
+
+
 def _live_bytes() -> int:
     import jax
-    return sum(int(s.data.nbytes) for a in jax.live_arrays() for s in a.addressable_shards)
+    return sum(n * len(d) for n, d in map(_held, jax.live_arrays()))
 
 
 def _setup() -> Optional[str]:
@@ -213,12 +225,13 @@ def instrument_cost() -> tuple:
 class Tracker:
     """An open section's high-waters: ``whole``, ``own`` (outside children), ``metered``
     (since its first part was booked: the receipt's figure)."""
-    __slots__ = ("name", "parts", "whole", "own", "metered", "exact", "mark0", "base", "reserved")
+    __slots__ = ("name", "parts", "whole", "own", "metered", "exact", "mark0", "base", "reserved",
+                 "rec")
 
     def __init__(self, name, parts):
         self.name, self.parts = str(name), dict(parts or {})
         self.whole = self.own = self.metered = self.reserved = -1
-        self.exact, self.mark0, self.base = True, None, -1
+        self.exact, self.mark0, self.base, self.rec = True, None, -1, None
 
     @property
     def price(self) -> Optional[Price]:
@@ -238,6 +251,105 @@ _PENDING: dict = {}              # stage -> {label: Price} booked before it open
 _RECEIPTS: dict = {}             # stage -> receipt row (max over calls)
 _FINDINGS: list = []             # the census's findings (STRICT)
 _SINK = [None]
+
+
+# ---------------------------------------------------------------------------
+# Trace (LORRAX_MEMORY_TRACE): what is live, what the allocator holds, what compiled
+# ---------------------------------------------------------------------------
+_T: dict = {"sections": [], "born": {}, "hooked": False}
+
+
+def _snapshot() -> dict:
+    """The live arrays grouped by (shape, dtype, sharding, creating stage), bytes per device."""
+    import jax
+    devices, groups, per_device = jax.local_devices(), {}, {}
+    stage = _OPEN[-1].name if _OPEN else "(top level)"
+    born, alive = _T["born"], set()
+    for a in jax.live_arrays():
+        alive.add(id(a))
+        if id(a) not in born:
+            born[id(a)] = stage
+        nbytes, held = _held(a)
+        for device in held:
+            per_device[device.id] = per_device.get(device.id, 0) + nbytes
+        key = (tuple(a.shape), str(a.dtype), str(getattr(a.sharding, "spec", type(a.sharding).__name__)),
+               born[id(a)])
+        groups.setdefault(key, [0, nbytes])[0] += 1
+    for gone in set(born) - alive:
+        del born[gone]
+    stats = [d.memory_stats() or {} for d in devices]
+    return dict(live=max(per_device.values(), default=0),
+                in_use=max(int(st.get("bytes_in_use", 0)) for st in stats),
+                peak=max(int(st.get("peak_bytes_in_use", 0)) for st in stats),
+                arrays=[dict(shape=list(k[0]), dtype=k[1], spec=k[2], born=k[3], count=v[0],
+                             bytes_per_device=v[1]) for k, v in
+                        sorted(groups.items(), key=lambda kv: -kv[1][0] * kv[1][1])])
+
+
+def _hook_compiles() -> None:
+    """Record every executable XLA compiles (cache hits included) under the open section."""
+    from jax._src import compiler
+    original = compiler.compile_or_get_cached
+
+    def traced(backend, computation, *args, **kwargs):
+        executable = original(backend, computation, *args, **kwargs)
+        try:
+            m = executable.get_compiled_memory_stats()
+            row = dict(program=str(computation.operation.attributes["sym_name"]).strip('"'),
+                       temp=int(m.temp_size_in_bytes), argument=int(m.argument_size_in_bytes),
+                       output=int(m.output_size_in_bytes), alias=int(m.alias_size_in_bytes),
+                       code=int(m.generated_code_size_in_bytes))
+            for t in _OPEN:
+                if t.rec is not None:
+                    t.rec["compiles"].append(row)
+        except Exception:                                      # noqa: BLE001
+            pass
+        return executable
+    compiler.compile_or_get_cached, _T["hooked"] = traced, True
+    import atexit
+    atexit.register(trace_dump)
+
+
+def _trace(tracker: Tracker, event: str) -> None:
+    try:
+        if not _T["hooked"]:
+            _hook_compiles()
+        last = _T.get("last")
+        snap = last[1] if last and last[0] == _COST[0] else _snapshot()
+        _T["last"] = (_COST[0], snap)
+        if event == "open":
+            tracker.rec = dict(name=tracker.name, depth=len(_OPEN) - 1, open=snap, peak=snap,
+                               compiles=[], t_open=time.time())
+        for t in ([tracker] if event == "close" else _OPEN):
+            if t.rec is not None and snap["live"] > t.rec["peak"]["live"]:
+                t.rec["peak"] = snap
+        if event == "close" and tracker.rec is not None:
+            price = tracker.price
+            tracker.rec.update(close=snap, t_close=time.time(), measured=tracker.whole,
+                               exact=tracker.exact, source=_I["source"],
+                               priced=None if price is None else price.terms())
+            _T["sections"].append(tracker.rec)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def trace_dump(path: str = "") -> Optional[str]:
+    """Write the trace (``path``, else LORRAX_MEMORY_TRACE; ``.p<i>`` on process i > 0)."""
+    import json
+    path = path or TRACE
+    if not path or not _T["sections"]:
+        return None
+    try:
+        import jax
+        index = jax.process_index()
+    except Exception:                                          # noqa: BLE001
+        index = 0
+    path = path if index == 0 else f"{path}.p{index}"
+    with open(path, "w") as out:
+        json.dump(dict(run=dict(_RUN), process=index, sections=_T["sections"],
+                       receipts=[{k: v for k, v in r.items() if k != "price"} for r in receipts()]),
+                  out, default=str)
+    return path
 
 
 def set_sink(sink=None) -> None:
@@ -290,6 +402,8 @@ def boundary() -> Optional[int]:
                 t.reserved = max(t.reserved, reserved)
         if _OPEN:
             _OPEN[-1].own = max(_OPEN[-1].own, high)
+    if TRACE and _OPEN:
+        _trace(_OPEN[-1], "boundary")
     return high
 
 
@@ -309,6 +423,8 @@ def open_tracker(name: str, price: Optional[Price] = None) -> Optional[Tracker]:
         boundary()
     tracker.base = _I["live"]
     _OPEN.append(tracker)
+    if TRACE and _backend_up():
+        _trace(tracker, "open")
     return tracker
 
 
@@ -326,6 +442,8 @@ def close_tracker(tracker: Optional[Tracker]) -> tuple:
         # First raise: a stage that lifted the never-resetting mark peaked at it exactly.
         tracker.exact = _I["mark"] > tracker.mark0
         tracker.metered = _I["mark"] if tracker.exact else tracker.metered
+    if TRACE and tracker.rec is not None:
+        _trace(tracker, "close")
     if tracker.parts:
         _receipt(tracker)
     elif (STRICT and _I["source"] == "live" and tracker.whole - tracker.base > CENSUS_BYTES
@@ -686,6 +804,7 @@ def sizing(stages: Optional[dict] = None, *, limit_bytes: Optional[float] = None
 def reset(*, run: bool = False) -> None:
     """Forget receipts, bookings, routes and plans (a new run in the same process); ``run``:
     the run's figures too."""
+    _T["sections"].clear()
     for table in (_RECEIPTS, _PENDING, _ROUTES, _PLANNED, _DOOMED, _WARNED, _FINDINGS) + (
             (_RUN,) if run else ()):
         table.clear()
