@@ -126,9 +126,11 @@ class PlatformLeg:
     peak_reader: str = "live"
     #: ``((library, op), MeasuredRow)``: vendor workspace measured where no query exists.
     vendor_rows: tuple = ()
-    #: ``(stage, bytes, provenance)``: bytes a stage adds outside the allocator (runtime
-    #: arenas that grow during it), priced as its ``outside`` term (``memory.stage_outside``).
-    stage_outside: tuple = ()
+    #: ``(bytes, provenance)``: what the distributed linear-algebra providers open outside the
+    #: allocator under ``linalg = distributed`` (contexts, communicators, workspace), with the
+    #: 1.2 margin: a route that opens them carries it as its ``outside`` term.
+    distributed_context: tuple = (3.6e9, "cuSOLVERMp/cuBLASMp contexts + NCCL: 3.0 GB measured "
+                                         "at P4 (5.9 vs 2.9 outside) x 1.2")
     #: collective library of the leg's XLA collectives; the section of
     #: ``config/<site>/site.toml`` that runtime.network_env applies ("" = none).
     collective_library: str = ""
@@ -308,8 +310,6 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
                 3.0, lambda n, p, item: n * n * item / p, "copies of A per rank",
                 n=(1, 40960), p=(4, 4), source="SLATE LU ~3 copies of A, OOM at n 51200 P4 "
                 "(LA_ROUTING_AUDIT)"))),
-        stage_outside=(("spole.bank", 2.12e9, "MI250X ZnO SPM P16: rocm-smi VRAM outside the "
-                        "BFC arena 1.0 GB at init -> 3.12 GB in the bank (CAL_PASS1, provisional)"),),
         outside_pool_api="hip_runtime_arena",
         collective_library="rccl", collective_net_plugin="librccl-net.so",
         # rocprofv3 --kernel-trace deadlocks RCCL at P=4 (Screening lane, 2026-10-14).
@@ -317,14 +317,6 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
 })
 
 _BY_VENDOR = {leg.vendor: leg for leg in LEGS.values()}
-
-#: Bytes the distributed linear-algebra providers open outside the allocator under
-#: ``linalg = distributed`` (cuSOLVERMp/cuBLASMp contexts, their NCCL communicators and
-#: workspace: 5.9 GB outside at P4 against 2.9), with the 1.2 margin; and its provenance.
-#: A route that opens them carries it as its ``outside`` term (``lxkit.memory``).
-DISTRIBUTED_CONTEXT_BYTES = (3.6e9, "cuSOLVERMp/cuBLASMp contexts + NCCL: 3.0 GB measured "
-                             "at P4 (5.9 vs 2.9 outside) x 1.2")
-
 
 def accelerator_legs() -> tuple:
     """The device legs, in :data:`LEGS` order."""
@@ -334,6 +326,11 @@ def accelerator_legs() -> tuple:
 def leg_for_vendor(vendor: str) -> Optional[PlatformLeg]:
     """The leg whose devices report ``vendor``, or ``None`` (no LORRAX leg)."""
     return _BY_VENDOR.get(vendor)
+
+
+def leg_for_platform(platform: str) -> PlatformLeg:
+    """The leg of a mesh platform (``distrib_la.mesh_platform``: "CUDA", "ROCM"), else the host."""
+    return LEGS.get(str(platform), LEGS["cpu"])
 
 
 def leg_for_jax_platform(name: str) -> Optional[PlatformLeg]:

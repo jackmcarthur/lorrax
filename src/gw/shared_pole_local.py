@@ -890,6 +890,26 @@ def _mm(a, b, *, transa='N', transb='N'):
     return jnp.matmul(op(a, transa), op(b, transb))
 
 
+def book_check_eighs(eigh_plan, n):
+    """Book the passivity checks' eigh stacks (one and two matrices per parent) as their own
+    part of ``spole.passivity_held``: the plan's stack price (distrib_la; provider workspace
+    included) for the route it takes in the room it was given."""
+    import numpy as np
+    import distrib_la
+    from lxkit import memory
+    route = max((eigh_plan.stack_route((b, n, n), np.complex128) for b in (1, 2)),
+                key=lambda r: int(r.program_bytes or 0))
+    # Route (c)'s stack price holds its local workspace; a provider route's holds one n^2/P tile
+    # for it, so the provider's own query is its vendor term.
+    vendor = (0 if route.route == "batch_reshard" else
+              distrib_la.workspace_bytes_per_rank(eigh_plan, "eigh", ((n, n),), np.complex128))
+    memory.book(memory.Price(
+        xla=memory.Term(float(route.program_bytes or 0), source=f"passivity eigh stack, {route.route} "
+                        "(distrib_la stack price)"),
+        vendor=memory.Term(float(vendor), source="provider eigh workspace (distrib_la query)"),
+        label="passivity eigh stacks"), stage="spole.passivity_held")
+
+
 def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_directions, *, real, nodes, eta_ry,
                 mesh_xy, eigh_plan, ordered, room=None):
     """Run ``round_checks`` through the plan matching the arrays' layout.
@@ -921,6 +941,7 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
                 # The same deck eigh request as the round's own face plan.
                 eigh_plan, room = face_eigh(mesh_xy, n, room=room(face_check_bytes(mesh_xy, n, int(model[0].shape[-1]))),
                                             backend=eigh_plan.requested), None
+                book_check_eighs(eigh_plan, n)
             rows.append(jax.tree.map(np.asarray, program(eigh_plan)(*args)))
         return jax.tree.map(lambda *v: np.concatenate(v, axis=0), *rows)
 

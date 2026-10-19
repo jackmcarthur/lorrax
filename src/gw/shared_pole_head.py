@@ -273,7 +273,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         if projection_bytes > logical:
             from lxkit import memory
             memory.admit("shared-pole head Gamma projection (all-P logical bound)",
-                         memory.priced(projection_bytes, "closed form"), logical)
+                         memory.priced(projection_bytes, "closed form"), logical, device=False)
         iq = int(parents[0])
         realize = shared_pole_operator_realizer(meta, header,
             q_full_idx=np.asarray([0]), mesh_xy=mesh_xy)

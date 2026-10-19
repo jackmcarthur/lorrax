@@ -599,7 +599,7 @@ class ParkedVTiles:
             from lxkit import memory
             memory.admit(f"four-current V_q host park ({what})",
                          memory.priced(need, "closed form"), have, local=True,
-                         limit_bytes=float("inf"))
+                         device=False)
         if jax.process_index() == 0:
             print_fn(f"  μ-batch V_q: {what} parked on host, {need / 1e9:.2f} "
                      f"GB/rank of a {have / 1e9:.1f} GB host share")

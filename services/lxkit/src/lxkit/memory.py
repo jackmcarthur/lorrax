@@ -1,25 +1,10 @@
-"""Device memory: one price per stage, one room, one admission policy, one receipt.
+"""Device memory: one price per stage, one room, one admission policy, one receipt
+(MEMORY_MODEL_AUDIT §3).  Platform differences are data in ``lxkit.LEGS``.
 
-The single implementation of LORRAX's device-memory model (MEMORY_MODEL_AUDIT §3).
-Physics code builds shapes and programs and calls this module; platform
-differences are data in ``lxkit.LEGS`` (peak reader, outside allowance, reserve,
-measured vendor rows, devices per node).
-
-* :class:`Price`: per-rank bytes in four terms (``operands``, ``xla``, ``vendor``,
-  ``outside``), each a :class:`Term` ``fixed + spread / P (+ grid(P))`` with provenance,
-  so one Price holds at any process count.
-* :func:`stage` / :func:`book`: every ``common.timing`` section is a tracker; a priced
-  one waits on the work before it, meters the allocator high-water, waits on its own
-  work and prints ``memory <stage>: priced P (operands a, xla b, vendor c, outside d) |
-  measured M | γ g`` (γ = measured / priced; ``>=M`` a polled lower bound, ``live M``
-  the CPU live-array reading).
-* :func:`resolve` / :func:`room`: budget = (limit - pending outside) x (1 - reserve) - T_ord;
-  room = budget - bytes in use, the minimum over processes.
-* :func:`admit`: the one admission policy (owner 2026-10-19); :func:`sizing`: the
-  smallest legal process count at which every planned stage fits, from the same Prices.
-
-Stdlib-only at import; jax is imported lazily.  An instrument never raises.
-"""
+:class:`Price` (four sourced terms, ``fixed + spread / P``) -> :func:`book` (a stage's price
+is the sum of its parts; its receipt ``memory <stage>: priced P | measured M | γ``) ->
+:func:`resolve` / :func:`room` -> :func:`admit` (the one policy) -> :func:`sizing` (minimum P).
+Stdlib-only at import; jax is imported lazily.  An instrument never raises."""
 
 from __future__ import annotations
 
@@ -28,22 +13,16 @@ import os
 import re
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 TERMS = ("operands", "xla", "vendor", "outside")
-#: The census (``LORRAX_MEMORY_STRICT=1``): a MEASURED row outside its range raises ``GATE
-#: memory_unpriced``, and :func:`findings` lists every section that allocated more than
-#: :data:`CENSUS_BYTES` outside a priced stage and every price term without provenance.
-#: Off, an out-of-range row is extrapolated, warned once, its provenance saying so.
+#: The census: a vendor row outside its range raises GATE memory_unpriced; :func:`findings`
+#: lists sections over CENSUS_BYTES outside a priced stage and terms without provenance.
 STRICT = os.environ.get("LORRAX_MEMORY_STRICT", "") == "1"
 CENSUS_BYTES = 64 << 20
-#: ``LORRAX_MEMORY_RECEIPTS=calibrate`` (and STRICT): a priced stage waits on its work at
-#: entry and exit, every timing section reads the allocator, and a BFC leg polls
-#: ``bytes_in_use``, so receipts are exact.  Default (production): no wait and no poll; the
-#: allocator is read only where a priced stage opens or closes, and its receipt is ``~``
-#: (work still in flight at the boundary is charged to the next one).
+#: Calibrate (and STRICT): priced stages wait on their work and a BFC leg polls, so receipts
+#: are exact.  Production: no wait, no poll, receipts ``~``; the CPU leg reads priced stages only.
 CALIBRATE = STRICT or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
 
 
@@ -62,25 +41,22 @@ class Term:
 
 @dataclass(frozen=True)
 class Price:
-    """One stage's per-rank price at ``ranks`` processes."""
+    """One stage's per-rank price at ``ranks`` processes.  ``increment``: the stage's
+    resident set is the allocator's bytes in use when it is metered (:meth:`settled`)."""
     operands: Term = Term()
     xla: Term = Term()
     vendor: Term = Term()
     outside: Term = Term()
     ranks: int = 1
     label: str = ""
-    #: An increment: the stage's resident set is the allocator's bytes in use when it is
-    #: metered, added as ``operands`` then (:meth:`settled`).
     increment: bool = False
 
     def settled(self) -> "Price":
         if not self.increment:
             return self
-        live = Term(in_use(), source="resident at stage entry (allocator bytes in use)")
-        return replace(self, operands=Term(self.operands.at(self.ranks) + live.fixed,
-                                           source=" + ".join(s for s in (self.operands.source,
-                                                                          live.source) if s)),
-                       increment=False)
+        return replace(self, increment=False, operands=Term(
+            self.operands.at(self.ranks) + in_use(), source=" + ".join(s for s in (
+                self.operands.source, "resident at stage entry (allocator bytes in use)") if s)))
 
     def terms(self, ranks: Optional[int] = None) -> dict:
         return {n: getattr(self, n).at(self.ranks if ranks is None else ranks) for n in TERMS}
@@ -101,14 +77,13 @@ class Price:
                         " + ".join(s for s in (a.source, b.source) if s),
                         (lambda p: sum(g(p) for g in grids)) if grids else None)
         return Price(*(join(getattr(self, n), getattr(other, n)) for n in TERMS),
-                     ranks=max(self.ranks, other.ranks),
+                     ranks=max(self.ranks, other.ranks), increment=self.increment or other.increment,
                      label=" + ".join(s for s in (self.label, other.label) if s))
 
 
 def priced(nbytes: float, source: str, *, term: str = "xla", spread: float = 0.0,
            ranks: int = 1, increment: bool = False) -> Price:
-    """A Price of one term: ``nbytes`` per rank (``fixed``) plus ``spread`` / P;
-    ``increment``: new bytes beside the resident set, which the stage adds when it meters."""
+    """A one-term Price: ``nbytes`` per rank plus ``spread`` / P."""
     return replace(Price(ranks=int(ranks), label=source, increment=bool(increment)),
                    **{term: Term(float(nbytes), float(spread), source)})
 
@@ -132,8 +107,7 @@ def _leg():
 # ---------------------------------------------------------------------------
 # Instrument: the allocator high-water per interval between boundaries
 # ---------------------------------------------------------------------------
-#: Sampler period of the BFC ``bytes_in_use`` poll, seconds.
-POLL_SECONDS = 0.01
+POLL_SECONDS = 0.01              # the BFC bytes_in_use poll (calibrate only)
 _I = {"source": None, "lib": None, "handle": None, "device": None, "mark": -1, "poll": -1,
       "live": -1, "reserved": None}
 _LOCK = threading.Lock()
@@ -152,8 +126,7 @@ def _live_bytes() -> int:
 
 
 def _setup() -> Optional[str]:
-    """The leg's peak reader once the backend is up: "pool" (CUDA mempool USED_MEM_HIGH,
-    resettable), "bfc" (peak_bytes_in_use, never resets) or "live" (CPU)."""
+    """The leg's reader: "pool" (CUDA mempool, resettable), "bfc" (never resets), "live" (CPU)."""
     if not _backend_up():
         return None
     import ctypes
@@ -197,8 +170,7 @@ def _sample() -> None:
 
 
 def _interval() -> tuple:
-    """(high-water since the last boundary, exact); starts the next interval.  Sets
-    ``_I["reserved"]``: the allocator's reserved high-water over it (None where unread)."""
+    """(high-water since the last boundary, exact); sets ``_I["reserved"]`` likewise."""
     src = _I["source"] or _setup()
     _I["reserved"] = None
     if src == "pool":
@@ -238,31 +210,31 @@ def instrument_cost() -> tuple:
     return int(_COST[0]), float(_COST[1])
 
 
-# ---------------------------------------------------------------------------
-# Trackers, stages, receipts
-# ---------------------------------------------------------------------------
-
 class Tracker:
-    """An open section: ``whole``/``own`` high-water (own: outside open children);
-    ``metered``: since its price was attached, after a wait (the receipt's figure)."""
-    __slots__ = ("name", "price", "whole", "own", "metered", "exact", "mark0", "base", "reserved")
+    """An open section's high-waters: ``whole``, ``own`` (outside children), ``metered``
+    (since its first part was booked: the receipt's figure)."""
+    __slots__ = ("name", "parts", "whole", "own", "metered", "exact", "mark0", "base", "reserved")
 
-    def __init__(self, name, price):
-        self.name, self.price = str(name), price
+    def __init__(self, name, parts):
+        self.name, self.parts = str(name), dict(parts or {})
         self.whole = self.own = self.metered = self.reserved = -1
         self.exact, self.mark0, self.base = True, None, -1
+
+    @property
+    def price(self) -> Optional[Price]:
+        return sum(self.parts.values(), Price()) if self.parts else None
 
     def meter(self) -> None:
         if self.mark0 is None and _backend_up():
             _sync()
             boundary()
             self.metered, self.exact, self.mark0, self.reserved = -1, CALIBRATE, _I["mark"], -1
-        if self.price is not None and self.price.increment and _backend_up():
-            self.price = self.price.settled()
+        if _backend_up():
+            self.parts = {k: p.settled() for k, p in self.parts.items()}
 
 
 _OPEN: list = []                 # the main thread's open trackers, outermost first
-_PENDING: dict = {}              # stage -> booked Price
+_PENDING: dict = {}              # stage -> {label: Price} booked before it opens
 _RECEIPTS: dict = {}             # stage -> receipt row (max over calls)
 _FINDINGS: list = []             # the census's findings (STRICT)
 _SINK = [None]
@@ -286,13 +258,16 @@ def _main() -> bool:
 
 
 def _sync() -> None:
-    if not CALIBRATE:
-        return
-    try:
-        import jax
-        jax.block_until_ready(jax.live_arrays())
-    except Exception:                                          # noqa: BLE001
-        pass
+    if CALIBRATE:
+        try:
+            import jax
+            jax.block_until_ready(jax.live_arrays())
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+def _reads_every_section() -> bool:
+    return CALIBRATE or (_I["source"] or _setup()) in ("pool", "bfc")
 
 
 def boundary() -> Optional[int]:
@@ -319,20 +294,18 @@ def boundary() -> Optional[int]:
 
 
 def open_tracker(name: str, price: Optional[Price] = None) -> Optional[Tracker]:
-    """Open a tracker (``common.timing`` sections call this); it takes a price booked to
-    ``name``, and a doomed stage repeats its banner."""
+    """Open a tracker with the parts booked to ``name``; repeat its banner if it has one."""
     if not _main():
         return None
-    booked = _PENDING.pop(str(name), None)
-    if booked is not None and (price is None or booked.bytes() > price.bytes()):
-        price = booked
-    tracker = Tracker(name, price)
+    parts = _PENDING.pop(str(name), {})
+    if price is not None:
+        parts[price.label] = price
+    tracker = Tracker(name, parts)
     if str(name) in _DOOMED:
         _say(_DOOMED[str(name)])
-    if price is not None:
-        _ROOM[0] = None
+    if tracker.parts:
         tracker.meter()
-    elif CALIBRATE:
+    elif _backend_up() and _reads_every_section():
         boundary()
     tracker.base = _I["live"]
     _OPEN.append(tracker)
@@ -340,13 +313,12 @@ def open_tracker(name: str, price: Optional[Price] = None) -> Optional[Tracker]:
 
 
 def close_tracker(tracker: Optional[Tracker]) -> tuple:
-    """Close ``tracker``: (whole, own, exact); a priced one waits and records its receipt."""
+    """Close ``tracker``: (whole, own, exact); a priced one records its receipt."""
     if tracker is None:
         return -1, -1, False
     if tracker.mark0 is not None:
         _sync()
-        _ROOM[0] = None
-    if tracker.mark0 is not None or CALIBRATE:
+    if tracker.mark0 is not None or _reads_every_section():
         boundary()
     if tracker in _OPEN:
         _OPEN.remove(tracker)
@@ -354,20 +326,19 @@ def close_tracker(tracker: Optional[Tracker]) -> tuple:
         # First raise: a stage that lifted the never-resetting mark peaked at it exactly.
         tracker.exact = _I["mark"] > tracker.mark0
         tracker.metered = _I["mark"] if tracker.exact else tracker.metered
-    if tracker.price is not None:
+    if tracker.parts:
         _receipt(tracker)
     elif (STRICT and _I["source"] == "live" and tracker.whole - tracker.base > CENSUS_BYTES
-          and not any(t.price is not None for t in _OPEN)):
+          and not any(t.parts for t in _OPEN)):
         _FINDINGS.append(f"unpriced: {tracker.name} allocated "
                          f"{_gb(tracker.whole - tracker.base)} outside a priced stage")
     return tracker.whole, tracker.own, tracker.exact
 
 
-def book(price: Price, stage: Optional[str] = None, *, planned: Optional[Price] = None) -> None:
-    """Book ``price`` to ``stage``: its open tracker (innermost), else the next to open;
-    ``None``: the innermost open tracker.  The largest price booked to a stage stands.
-    ``planned``: the price :func:`sizing` sees instead (a ledger's planning aggregate beside a
-    receipt priced as an increment over what is resident)."""
+def book(price: Price, stage: Optional[str] = None) -> None:
+    """Book ``price`` as one part of ``stage`` (its open tracker, innermost; else the next to
+    open; ``None``: the innermost open tracker).  A stage's price is the sum of its parts;
+    a part booked again under the same label keeps the larger."""
     if not isinstance(price, Price):
         raise TypeError(f"memory.book takes a memory.Price, got {type(price).__name__}")
     if STRICT and price.unsourced():
@@ -376,41 +347,22 @@ def book(price: Price, stage: Optional[str] = None, *, planned: Optional[Price] 
     if _main():
         target = (_OPEN[-1] if _OPEN else None) if stage is None else next(
             (t for t in reversed(_OPEN) if t.name == stage), None)
+    parts = target.parts if target is not None else _PENDING.setdefault(
+        str(stage if stage is not None else price.label), {})
+    old = parts.get(price.label)
+    if old is None or price.bytes() > old.bytes():
+        parts[price.label] = price
+    key = target.name if target is not None else str(stage or price.label)
+    _PLANNED.setdefault(key, {})["parts"] = dict(parts)
     if target is not None:
-        if target.price is None or price.bytes() > target.price.bytes():
-            target.price = price
         target.meter()
-        _plan_booked(target.name, planned or target.price)
-        return
-    key = str(stage if stage is not None else price.label)
-    _plan_booked(key, planned or price)
-    if stage is None:
-        return                   # no section open (a planning replay): sizing only
-    if key not in _PENDING or price.bytes() > _PENDING[key].bytes():
-        _PENDING[key] = price
-
-
-def _plan_booked(key: str, price: Price) -> None:
-    """Sizing sees the largest price booked to ``key``; an admission's routes supersede it."""
-    old = _PLANNED.get(key)
-    if old is None or (old[0][0][0] == "booked" and price.bytes() > old[0][0][1].bytes()):
-        _PLANNED[key] = ((("booked", price),), None)
-
-
-@contextmanager
-def stage(name: str, price: Optional[Price] = None):
-    """A priced stage outside ``common.timing`` (a service's own)."""
-    tracker = open_tracker(name, price)
-    try:
-        yield tracker
-    finally:
-        close_tracker(tracker)
+    elif stage is None:
+        _PENDING.pop(price.label, None)      # no section open (a planning replay): sizing only
 
 
 def receipt_line(name: str, price: Price, measured: float, exact: bool, src: str,
                  reserved: float = -1) -> str:
-    """``memory <stage>: priced P (terms) | measured M | γ g [| reserved R (slack S)]``: R the
-    allocator's reserved high-water, S = R - M (fragmentation and cached free blocks)."""
+    """``memory <stage>: priced P (terms) | measured M | γ g [| reserved R (slack R - M)]``."""
     total = price.bytes()
     if measured is None or measured < 0:
         meas, gamma = "not measured", "–"
@@ -426,109 +378,81 @@ def receipt_line(name: str, price: Price, measured: float, exact: bool, src: str
 
 
 def _receipt(t: Tracker) -> None:
-    src = _I["source"] or "none"
+    src, price = _I["source"] or "none", t.price
     row = _RECEIPTS.setdefault(t.name, dict(stage=t.name, count=0, priced=0.0, measured=-1.0,
-                                            exact=True, price=t.price, source=src, reserved=-1.0))
+                                            exact=True, price=price, source=src, reserved=-1.0))
     row["reserved"] = max(row["reserved"], float(t.reserved))
     first, row["count"] = row["count"] == 0, row["count"] + 1
-    rise = t.metered > row["measured"] or t.price.bytes() > row["priced"]
-    if t.price.bytes() >= row["priced"]:
-        row["priced"], row["price"] = t.price.bytes(), t.price
+    rise = t.metered > row["measured"] or price.bytes() > row["priced"]
+    if price.bytes() >= row["priced"]:
+        row["priced"], row["price"] = price.bytes(), price
     if t.metered > row["measured"]:
         row["measured"], row["exact"] = float(t.metered), t.exact
-    row["path"] = tuple(o.name for o in _OPEN) + (t.name,)
     if first or rise:
-        _say(receipt_line(t.name, t.price, t.metered, t.exact, src, t.reserved))
+        _say(receipt_line(t.name, price, t.metered, t.exact, src, t.reserved))
 
 
 def receipts() -> list:
-    """Every priced stage this run, max over its calls on this process."""
-    return [dict(row) for row in _RECEIPTS.values()]
-
-
-def pending() -> dict:
-    """Prices booked to stages that never opened (a census finding)."""
-    return dict(_PENDING)
+    """The receipt rows (max over calls; the report's gather adds ``measured_ranks``)."""
+    return list(_RECEIPTS.values())
 
 
 def findings() -> list:
-    """The census's findings this run (:data:`STRICT`), and prices never taken."""
+    """The census's findings, and parts booked to stages that never opened."""
     return list(_FINDINGS) + [f"never opened: {name}" for name in _PENDING]
 
 
 # ---------------------------------------------------------------------------
-# Vendor workspace: a cached plan-time query, else the leg's MEASURED row in range
+# Vendor workspace: the leg's MEASURED row in its range (no query at trace time)
 # ---------------------------------------------------------------------------
-_VENDOR: dict = {}
-
-
-def remember(lib: str, op: str, n: int, ranks: int, itemsize: int, nbytes: float,
-             source: str) -> None:
-    """Cache a workspace query issued at plan construction (never at trace time)."""
-    _VENDOR[(lib, op, int(n), int(ranks), int(itemsize))] = (float(nbytes), str(source))
-
-
 def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int,
            unit: Optional[float] = None) -> Term:
-    """The vendor workspace term per rank on ``leg``: a remembered query, else the leg's
-    measured row (``PlatformLeg.vendor_rows``), GATE memory_unpriced outside its range
-    under :data:`STRICT`."""
-    hit = _VENDOR.get((lib, op, int(n), int(ranks), int(itemsize)))
-    if hit is not None:
-        return Term(hit[0], source=hit[1])
+    """The vendor workspace per rank: ``leg``'s measured row (GATE outside it under STRICT)."""
     row = dict(leg.vendor_rows).get((lib, op))
+    where = (f"no measured row for {leg.key}/{lib}/{op}" if row is None else
+             f"{leg.key}/{lib}/{op} at n {int(n)}, P {int(ranks)} outside the measured "
+             f"n {row.n[0]}-{row.n[1]}, P {row.p[0]}-{row.p[1]}")
+    if row is not None and row.n[0] <= n <= row.n[1] and row.p[0] <= ranks <= row.p[1]:
+        where = None
+    if where and STRICT:
+        raise RuntimeError(f"GATE memory_unpriced: got: {where}; want: a measurement there")
+    if where:
+        _warn(f"unpriced {leg.key}/{lib}/{op}", 0.0, f"memory: {where}; "
+              + ("priced 0" if row is None else "extrapolated"), local=False)
     if row is None:
-        where = f"no query and no measured row for {leg.key}/{lib}/{op}"
-        if STRICT:
-            raise RuntimeError(f"GATE memory_unpriced: got: {where}; want: memory.remember "
-                               f"at plan construction or a measured row")
-        _warn(f"unpriced {leg.key}/{lib}/{op}", 0.0, f"memory: {where}; priced 0", local=False)
         return Term(0.0, source=f"UNPRICED {leg.key}/{lib}/{op}")
     nbytes = row.ratio * (row.unit(int(n), int(ranks), int(itemsize)) if unit is None else unit)
-    src = f"{row.ratio:g} x {row.unit_name} ({row.source})"
-    if not (row.n[0] <= n <= row.n[1] and row.p[0] <= ranks <= row.p[1]):
-        where = (f"{leg.key}/{lib}/{op} at n {int(n)}, P {int(ranks)} outside the measured "
-                 f"n {row.n[0]}-{row.n[1]}, P {row.p[0]}-{row.p[1]}")
-        if STRICT:
-            raise RuntimeError(f"GATE memory_unpriced: got: {where}; want: a measurement there")
-        _warn(f"unpriced {leg.key}/{lib}/{op}", 0.0, f"memory: {where}; extrapolated", local=False)
-        src = "EXTRAPOLATED " + src
-    return Term(nbytes, source=src)
+    return Term(nbytes, source=("EXTRAPOLATED " if where else "")
+                + f"{row.ratio:g} x {row.unit_name} ({row.source})")
 
 
 # ---------------------------------------------------------------------------
 # Limit, budget, room
 # ---------------------------------------------------------------------------
 _RUN: dict = {}
-
-
-def stage_outside(stage: str) -> Term:
-    """The bytes ``stage`` adds outside the allocator on this leg (``LEGS.stage_outside``)."""
-    leg = _leg()
-    row = next((r for r in getattr(leg, "stage_outside", ()) if r[0] == stage), None)
-    return Term() if row is None else Term(float(row[1]), source=row[2])
+_AGREE: list = [None]
 
 
 def outside_allowance(leg, linalg: str = "local") -> float:
-    """Bytes a process may hold outside the allocator (the leg's row; plus the distributed
-    providers' contexts under ``linalg = distributed``)."""
-    from lxkit.legs import DISTRIBUTED_CONTEXT_BYTES
-    return float(leg.outside_allowance) + (DISTRIBUTED_CONTEXT_BYTES[0]
+    """Bytes outside the allocator: the leg's row, plus its providers' contexts if distributed."""
+    return float(leg.outside_allowance) + (float(leg.distributed_context[0])
                                            if linalg == "distributed" else 0.0)
 
 
 def pool_reservation(total: float, leg) -> float:
-    """The pool a process reserves before the deck is read: the card less the larger outside
-    allowance, at least half the card."""
+    """The pool reserved before the deck: the card less the distributed allowance, >= half."""
     return max(float(total) - outside_allowance(leg, "distributed"), 0.5 * float(total))
 
 
-_AGREE: list = [None]
+def contexts() -> Term:
+    """The providers' contexts a route opens, where the budget did not withhold them (local)."""
+    leg = _leg()
+    size, src = getattr(leg, "distributed_context", (0.0, ""))
+    return Term(size if _RUN.get("linalg", "local") == "local" else 0.0, source=src)
 
 
 def _agree(value: float) -> float:
-    """The minimum over processes, through the caller's collective (:func:`resolve`'s
-    ``agree``: the source tree's all-gather; lxkit owns none)."""
+    """The minimum over processes, through :func:`resolve`'s ``agree`` collective."""
     if _AGREE[0] is not None:
         return float(_AGREE[0](float(value)))
     import jax
@@ -538,24 +462,18 @@ def _agree(value: float) -> float:
     return float(value)
 
 
-def _enforced(stats) -> bool:
+def enforced(stats) -> bool:
     """The allocator refuses past ``bytes_limit`` (a BFC arena; not cuda_async's threshold)."""
-    import os
     allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
     return allocator in ("default", "bfc") and bool((stats or {}).get("bytes_limit"))
 
 
 def resolve(deck_bytes: float = 0.0, linalg: str = "local", *, total: Optional[float] = None,
             outside: Optional[float] = None, agree: Optional[Callable] = None) -> float:
-    """THE run budget, bytes per device, recorded once (every process enters).
-
-    limit = ``bytes_limit`` where the allocator enforces it, else ``total`` less the bytes
-    ``outside`` it now (at least the leg's allowance); CPU: ``total`` (the host share) over
-    the local devices.  budget = (limit - pending outside) x (1 - reserve) - T_ord, the
-    minimum over processes; ``pending``: the distributed providers' contexts, which open
-    later outside an allocator that does not enforce its limit.  A positive deck value can
-    only lower it.  ``total``/``outside`` come from the caller's card readers, ``agree``
-    (value -> minimum over processes) from its collectives; :func:`room` reuses it."""
+    """THE run budget per device (every process enters): limit = an enforced ``bytes_limit``,
+    else ``total`` less what is ``outside`` (>= the leg's allowance), CPU the host share;
+    budget = (limit - pending contexts) x (1 - reserve) - T_ord, minimum over processes
+    (``agree``), never above a positive deck value."""
     import jax
     from lxkit import ordered_transient_bytes
     _AGREE[0] = agree
@@ -563,7 +481,7 @@ def resolve(deck_bytes: float = 0.0, linalg: str = "local", *, total: Optional[f
     stats = jax.local_devices()[0].memory_stats() or {}
     if leg is None or not leg.accelerator:
         lim, pending_out = float(total or 0.0) / max(1, jax.local_device_count()), 0.0
-    elif _enforced(stats) or not total:
+    elif enforced(stats) or not total:
         lim, pending_out = float(stats.get("bytes_limit", 0)), 0.0
     else:
         lim = float(total) - max(float(outside or 0.0), outside_allowance(leg))
@@ -598,6 +516,7 @@ def budget() -> float:
 
 
 def run() -> dict:
+    """The run's figures (empty before :func:`resolve`)."""
     return dict(_RUN)
 
 
@@ -616,19 +535,6 @@ def room(stage: str = "", *, bucketed: bool = True) -> int:
     return bucket(left) if bucketed else left
 
 
-_ROOM: list = [None]
-
-
-def stage_room() -> Optional[int]:
-    """:func:`room` (exact) read once per stage boundary: the first call after a tracker opens
-    or closes reads it (every process enters), later calls reuse it; None before a budget."""
-    if "budget" not in _RUN:
-        return None
-    if _ROOM[0] is None:
-        _ROOM[0] = room(bucketed=False)
-    return _ROOM[0]
-
-
 def bucket(value) -> int:
     """A whole GiB at or above 1 GiB, exact below, 0 when negative."""
     value = int(value)
@@ -639,9 +545,8 @@ def bucket(value) -> int:
 # Admission: the one policy point (owner 2026-10-19), and the sizing estimate
 # ---------------------------------------------------------------------------
 _ROUTES: dict = {}
-_PLANNED: dict = {}              # stage -> (((route, Price), ...), physical limit or None)
-_DOOMED: dict = {}               # stage -> banner, repeated when it opens
-_LAST: dict = {}
+_PLANNED: dict = {}      # stage -> {"routes": ((name, Price), ...), "limit": bytes, "parts": {...}}
+_DOOMED: dict = {}       # stage -> banner, repeated when it opens
 _WARNED: dict = {}
 
 
@@ -661,35 +566,24 @@ def routes() -> list:
     return [dict(row) for row in _ROUTES.values()]
 
 
-def last_decision() -> dict:
-    return dict(_LAST)
-
-
-def admit(stage: str, routes, room_bytes: float, *, probe=None, forced=None,
-          quiet: bool = False, runs_in: Optional[str] = None, local: bool = False,
-          limit_bytes: Optional[float] = None) -> str:
-    """THE admission policy.  ``routes``: ``(name, Price | callable -> Price[, room])``,
-    fastest first (or one Price), each against its room (default ``room_bytes``), the
-    planning room (rank-invariant).
-
-    1. A route fits its room: the fastest that fits.
-    2. None fits and the cheapest exceeds the physical limit (``limit_bytes``, default its
-       room plus the run's reserve): a loud banner now and when ``runs_in`` opens (terms,
-       limit, shortfall, the minimum process count); the cheapest runs.  Never raises.
-    3. None fits, the cheapest is within the limit: one warning; it runs.
-
-    ``probe()`` raising: the routes after the first cannot run here, the first stays.
-    ``forced``: a deck-named route.  ``quiet``: the caller records the route.  ``local``: a
-    rank-local price, warned on its rank.  Returns the route's name."""
+def admit(stage: str, routes, room_bytes: float, *, probe=None, forced=None, quiet: bool = False,
+          runs_in: Optional[str] = None, local: bool = False, device: bool = True,
+          detail: bool = False):
+    """THE admission policy (owner 2026-10-19).  ``routes``: ``(name, Price | callable[, room])``
+    fastest first, each against its room (default the rank-invariant ``room_bytes``).
+    1. The fastest route that fits.  2. None fits and the cheapest is over the physical limit
+    (room + reserve): a banner now and when its stage (``runs_in``, else the open one) opens,
+    with the minimum process count; it runs, never raises.  3. Otherwise one warning; it runs.
+    ``device=False`` (a host share, a tile cap): never a banner, not in :func:`sizing`.
+    ``probe()`` raising drops the later routes; ``forced``: a deck-named route; ``quiet``: the
+    caller records it; ``local``: warned on its rank.  Returns the name (``detail``: a dict)."""
     routes = (("chosen", routes),) if isinstance(routes, Price) else tuple(routes)
-    key = str(runs_in or stage)
+    key = str(runs_in or (_OPEN[-1].name if _OPEN and _main() else stage))
 
     def record(route, reason, warning=None):
-        _LAST.clear()
-        _LAST.update(route=route, reason=reason, warning=warning)
         if not quiet and len(routes) > 1:
             record_route(stage, route, reason, warning=warning)
-        return route
+        return dict(route=route, reason=reason, warning=warning) if detail else route
     if forced is not None:
         return record(forced, "named")
     done = []                    # (name, price, room)
@@ -705,43 +599,36 @@ def admit(stage: str, routes, room_bytes: float, *, probe=None, forced=None,
         done.append((name, price() if callable(price) else price, room))
         if STRICT and done[-1][1].unsourced():
             _FINDINGS.append(f"no provenance: {stage} ({name}): {', '.join(done[-1][1].unsourced())}")
-        _PLANNED[key] = (tuple(d[:2] for d in done), room + _RUN.get("reserve", 0.0))
+        if device:
+            _PLANNED.setdefault(key, {}).update(routes=tuple(d[:2] for d in done),
+                                                limit=room + _RUN.get("reserve", 0.0))
         if done[-1][1].bytes() <= room:
             return record(name, "".join(f"{n} {_gb(p.bytes())}/rank over room {_gb(r)}; "
                                         for n, p, r in done[:-1])
                           + f"{_gb(done[-1][1].bytes())}/rank of room {_gb(room)}")
     name, price, room = min(done, key=lambda item: item[1].bytes() - item[2])
-    physical = room + _RUN.get("reserve", 0.0) if limit_bytes is None else float(limit_bytes)
-    _PLANNED[key] = (_PLANNED[key][0], physical)
+    physical = room + _RUN.get("reserve", 0.0) if device else float("inf")
     reason = "; ".join(f"{n} {_gb(p.bytes())}/rank over room {_gb(r)}" for n, p, r in done)
     if price.bytes() <= physical:
         _warn(stage, price.bytes(), f"memory over budget at {stage}: {name} needs "
-              f"{_gb(price.bytes())}/rank, room {_gb(room)}/rank, within the allocator "
-              f"limit {_gb(physical)}; continuing (an OOM is possible)", local=local)
+              f"{_gb(price.bytes())}/rank, room {_gb(room)}/rank"
+              + (f", within the allocator limit {_gb(physical)}" if device else "")
+              + "; continuing (an OOM is possible)", local=local)
         return record(name, reason, warning="no route fits the planning room")
-    line = sizing()["line"]
-    rule = "!" * 78
+    line, rule = sizing()["line"], "!" * 78
     _DOOMED[key] = "\n".join([
-        rule, f"!! MEMORY: {stage} WILL NOT FIT. It runs anyway; the allocator will fail.",
+        rule, f"!! MEMORY: {stage} is PRICED OVER the allocator limit. It runs anyway.",
         f"!!   {name}: priced {_gb(price.bytes())}/rank ({price.describe()})",
         f"!!   allocator limit beside what is live {_gb(physical)}; short by "
         f"{_gb(price.bytes() - physical)}", "!!   " + line, rule])
     _say(_DOOMED[key], local=local)
-    _warn(stage, price.bytes(), f"memory: {stage} will not fit ({name} {_gb(price.bytes())}"
-          f"/rank over the {_gb(physical)} limit); {line}", local=local)
-    return record(name, reason, warning="over the allocator limit: this run will run out of memory")
-
-
-def contexts() -> Term:
-    """The distributed providers' contexts a route opens outside the allocator, charged where
-    the run's budget did not withhold them (``linalg = local``)."""
-    from lxkit.legs import DISTRIBUTED_CONTEXT_BYTES as C
-    return Term(C[0] if _RUN.get("linalg", "local") == "local" else 0.0, source=C[1])
+    _warn(stage, price.bytes(), f"memory: {stage} priced over the limit ({name} "
+          f"{_gb(price.bytes())}/rank over {_gb(physical)}); {line}", local=local)
+    return record(name, reason, warning="priced over the allocator limit")
 
 
 def _warn(stage: str, need: float, message: str, *, local: bool) -> None:
-    """Once per stage kind (trailing ``.N``/``:N`` dropped) and process, again only when a
-    later call needs more.  Rank 0: a RuntimeWarning (kept by production reports)."""
+    """A RuntimeWarning once per stage kind (``.N``/``:N`` dropped), again only if it grows."""
     import sys
     import warnings
     kind = re.sub(r"([.:]\d+)+$", "", str(stage))
@@ -754,51 +641,51 @@ def _warn(stage: str, need: float, message: str, *, local: bool) -> None:
         print("WARNING: " + message, file=sys.stderr, flush=True)
 
 
-def legal_ranks(per_node: int, largest: int = 4096) -> list:
-    """Square meshes (the runtime mesh builder and ``distrib_la.place`` take p x p only)
-    in whole nodes of ``per_node`` devices."""
-    return [p * p for p in range(1, math.isqrt(largest) + 1) if (p * p) % max(1, per_node) == 0]
+def legal_ranks(largest: int = 4096) -> list:
+    """Every count the mesh builder takes: p x p (``collectives.resolve_mesh``), any nodes."""
+    return [p * p for p in range(1, math.isqrt(largest) + 1)]
 
 
 def sizing(stages: Optional[dict] = None, *, limit_bytes: Optional[float] = None,
            per_node: Optional[int] = None, platform: Optional[str] = None) -> dict:
-    """The smallest legal P at which every planned stage's best route fits its limit (the
-    physical limit beside what was live at its admission; a booked price, which holds its
-    resident set, the run's limit), from the admitted and booked Prices: ``p``, ``nodes``,
-    ``binding``, ``line``.  ``stages``: ``{stage: ((route, Price), ...)}``."""
+    """The smallest legal P at which every device stage fits: its price the larger of its best
+    admitted route and its booked parts, its limit the admission's (else the run's);
+    ``binding`` the least headroom there.  ``stages``: ``{stage: ((route, Price), ...)}``."""
     run_lim = float(_RUN.get("limit", 0.0) if limit_bytes is None else limit_bytes)
-    planned = _PLANNED if stages is None else {k: (v, None) for k, v in stages.items()}
-    limits = {k: run_lim if lim is None else float(lim) for k, (_, lim) in planned.items()}
-    stages = {k: routes for k, (routes, _) in planned.items()}
-    per = int(_RUN.get("per_node", 1) if per_node is None else per_node)
+    plans = _PLANNED if stages is None else {k: dict(routes=v) for k, v in stages.items()}
+    per = max(1, int(_RUN.get("per_node", 1) if per_node is None else per_node))
     plat = _RUN.get("platform", "this platform") if platform is None else platform
-    grid = legal_ranks(per)
-    best = lambda routes, p: min(price.bytes(p) for _, price in routes)
-    for stage_name, routes in stages.items():
-        lim = limits[stage_name]
-        if best(routes, grid[-1]) > lim:
-            route, price = min(routes, key=lambda item: item[1].bytes(grid[-1]))
+    limit = {k: float(v.get("limit", run_lim)) for k, v in plans.items()}
+
+    def need(k, p):
+        plan = plans[k]
+        best = min((pr.bytes(p) for _, pr in plan.get("routes", ())), default=0.0)
+        return max(best, sum(pr.bytes(p) for pr in plan.get("parts", {}).values()))
+    grid = legal_ranks()
+    if not plans:
+        return dict(p=None, nodes=None, binding=None, line="minimum to complete: no priced stage")
+    for k in plans:
+        if need(k, grid[-1]) > limit[k]:
+            price = sum(plans[k].get("parts", {}).values(), Price()) + min(
+                (pr for _, pr in plans[k].get("routes", ())), default=Price(),
+                key=lambda pr: pr.bytes(grid[-1]))
             term = max(TERMS, key=lambda n: getattr(price, n).fixed)
-            change = {"operands": "its replicated operands sharded over the mesh",
-                      "outside": "a route that opens no provider context"}.get(
-                term, "a distributed route for its whole-matrix local work")
-            return dict(p=None, nodes=None, binding=stage_name, line=(
-                f"minimum to complete: no P suffices: {stage_name} ({route}) holds "
-                f"{_gb(getattr(price, term).fixed)}/rank of {term} that no mesh divides "
-                f"({getattr(price, term).source}) against the {_gb(lim)} limit; needs {change}"))
-    binding = None
+            return dict(p=None, nodes=None, binding=k, line=(
+                f"minimum to complete: no P suffices: {k} holds {_gb(getattr(price, term).fixed)}"
+                f"/rank of {term} that no mesh divides ({getattr(price, term).source}) against "
+                f"the {_gb(limit[k])} limit"))
     for p in grid:
-        over = [s for s, routes in stages.items() if best(routes, p) > limits[s]]
-        if not over:
-            nodes = p // per
+        if all(need(k, p) <= limit[k] for k in plans):
+            nodes = -(-p // per)
+            binding = max(plans, key=lambda k: need(k, p) / limit[k], default=None)
             return dict(p=p, nodes=nodes, binding=binding, line=(
                 f"minimum to complete: P = {p} ({nodes} node{'s' * (nodes != 1)} of {plat})"
                 + (f"; binding stage {binding}" if binding else "")))
-        binding = max(over, key=lambda s: best(stages[s], p))
-    return dict(p=None, nodes=None, binding=None, line="minimum to complete: no priced stage")
 
 
-def reset() -> None:
-    """Forget receipts, bookings, routes and plans (a new run in the same process)."""
-    for table in (_RECEIPTS, _PENDING, _ROUTES, _PLANNED, _DOOMED, _LAST, _WARNED, _FINDINGS):
+def reset(*, run: bool = False) -> None:
+    """Forget receipts, bookings, routes and plans (a new run in the same process); ``run``:
+    the run's figures too."""
+    for table in (_RECEIPTS, _PENDING, _ROUTES, _PLANNED, _DOOMED, _WARNED, _FINDINGS) + (
+            (_RUN,) if run else ()):
         table.clear()

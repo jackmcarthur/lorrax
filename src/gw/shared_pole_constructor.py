@@ -303,15 +303,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # Resolve before either reduction program is traced; the ledger
                 # warns when the route price is over the budget.
                 local_eigh = budget.eigenplan(side)
-                # The reservation prices this round's program at its actual side, not the batch's
-                # conservative one (run30k: 48640 vs 84480, 137.9 -> 64 GB/rank); the eigh rooms
-                # below still subtract the admitted (conservative) program.
+                # The reservation holds the round's operands; a face round's program is priced by
+                # its compiled figure where it runs (face_reduce_round). The eigh rooms below still
+                # subtract the admitted (conservative) program.
                 admitted = budget.program_bytes
                 try:
                     if execution == 'face':
-                        from gw.shared_pole_execution import face_reduction_bytes
-                        budget.program_bytes = face_reduction_bytes(mesh_xy, len(ids), **dict(sizing, side=side))
-                    budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
+                        budget.program_bytes = 0
+                    reduction_row = budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
                         round_states, infinity, widths, infinity_width), runs_in="spole.gram_reduction")
                 finally:
                     budget.program_bytes = admitted
@@ -332,7 +331,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                         round_states, infinity, tables, mesh=mesh_xy,
                         budget=budget, ordered=ordered, odd_moments=odd_moments,
                         keep_budget=keep_budget, eigh_backend=resolution.eigh_backend,
-                        admit=False, room=room, carrier=sizing['carrier'])
+                        admit=False, room=room, carrier=sizing['carrier'],
+                        beside=budget.ledger.price(reduction_row))
                 else:
                     round_model, round_signed, vectors, round_diagnostics = reduce_round(
                         round_states, infinity, tables, real=real, mesh_xy=mesh_xy,

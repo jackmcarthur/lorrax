@@ -119,10 +119,9 @@ def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole pa
                               workspace_bytes_per_rank=workspace,
                               concurrent_with=ledger.live_stages)
     row = aggregate('local')
-    ledger_price = lambda r: memory.priced(r['aggregate_bytes_per_rank'], "shared-pole ledger")
     execution = memory.admit(site, (
-        ('local', ledger_price(row)),
-        ('face', lambda: ledger_price(aggregate('face'))
+        ('local', ledger.price(row)),
+        ('face', lambda: ledger.price(aggregate('face'))
          + memory.Price(outside=memory.contexts()))),
         row['available_device_bytes_per_rank'])
     if execution not in prices:
@@ -234,31 +233,29 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     reduction_args = (dict(cross_original_sides=cross_original_sides)
                       if cross_original_sides is not None else {})
     from lxkit import memory
-    last_decision = memory.last_decision
+    decision = {}
 
     def admitted(rows):
         # The face's own batch fills the room later (face_batch_width), so its
         # price here is the provider's contexts alone; the caller records the
         # map's final route.
-        need = max(row['aggregate_bytes_per_rank'] for row in rows)
-        return memory.admit('shared-pole constructor', (
-            ('local', memory.priced(need, "shared-pole ledger")),
+        decision.update(memory.admit('shared-pole constructor', (
+            ('local', ledger.price(max(rows, key=lambda r: r['aggregate_bytes_per_rank']))),
             ('face', memory.Price(outside=memory.contexts()))),
-            rows[0]['available_device_bytes_per_rank'], quiet=True) == 'local'
+            rows[0]['available_device_bytes_per_rank'], quiet=True, detail=True))
+        return decision['route'] == 'local'
     receipt = dict(requested_layout=resolution.layout, conservative_pencil_side=side,
                    selection_face_count=selection_faces,
                    retained_output_upper_bound_bytes_per_rank=retained_outputs)
     resident_rows = (resident_preview('selection', **selection_args),
                      resident_preview(reduction_phase, **reduction_args))
     if not admitted(resident_rows):
-        decision = last_decision()
         return decision['route'], dict(
             receipt, reason='local resident lower bound: ' + decision['reason'],
             warning=decision['warning'],
             local_selection=resident_rows[0], local_reduction=resident_rows[1])
     rows = (preview('selection', **selection_args), preview(reduction_phase, **reduction_args))
     local = admitted(rows)
-    decision = last_decision()
     return ('local' if local else 'face'), dict(
         receipt, reason=('capacity-admitted local parent: ' if local else
                          'local parent: ') + decision['reason'],
@@ -355,7 +352,9 @@ def face_program(fn, mesh, *, outputs='matrices'):
                 raise ValueError('unknown explicit constructor output contract '+outputs)
             compiled[signature]=distrib_la.checked_program(fn,mesh,out,compiler_options=FACE_COMPILER_OPTIONS)
         return compiled[signature]
-    return lambda *args: program(*args)(*args)
+    run = lambda *args: program(*args)(*args)
+    run.checked = program
+    return run
 
 
 @lru_cache(maxsize=None)
@@ -475,7 +474,8 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
 
 
 def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
-                      keep_budget,eigh_backend,room,retain_span=False,admit=True,gram_keep=None,carrier=None):
+                      keep_budget,eigh_backend,room,retain_span=False,admit=True,gram_keep=None,carrier=None,
+                      beside=None):
     """A fixed-width batch of parents with every matrix tiled over all ranks.
 
     ``room`` is the room the pencil's eigh stacks are decided against
@@ -501,10 +501,28 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     if callable(room):
         room=room(face_reduction_bytes(mesh,int(tables['active'].shape[0]),rows=int(states[0][1].shape[-2]),
                                        side=side,carrier=carrier,retain_span=retain_span))
-    result=program(room)(*args)
+    executable,run=program(room).checked(*args).compiled(*args)
+    if beside is not None:
+        price_round(executable,mesh,beside)
+    result=run(*args)
     model,signed,diagnostics=result[:3]
     output=model,signed,model[1:],diagnostics
     return (*output,result[3]) if retain_span else output
+
+
+def price_round(executable, mesh, beside):
+    """Admit and book a face round at the executable that runs (``memory_analysis``; the
+    conservative ``face_reduction_bytes`` only chose the width and the eigh room) beside the
+    reservation that holds its operands (``beside``, a ledger Price), in the open stage."""
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+    ranks = int(mesh.size)
+    part = memory.Price(xla=memory.Term(spread=float(compiled_new_bytes(executable)) * ranks,
+                                        source="face parent program (memory_analysis temp + "
+                                               "outputs - alias)"),
+                        ranks=ranks, label="reduction round executable")
+    memory.admit("shared-pole reduction round", beside + part, memory.budget())
+    memory.book(part)
 
 
 @lru_cache(maxsize=None)
@@ -779,10 +797,11 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
     except RuntimeError as refusal:      # no whole-mesh library here: route (c) or that refusal
         mesh_plan, no_mesh, mesh_need = None, refusal, 0
     site = f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2"
+    mesh_row = dict(row, aggregate_bytes_per_rank=mesh_need, workspace_bytes_per_rank=0,
+                    resident_bytes_per_rank=mesh_need - row['aggregate_bytes_per_rank'] + need)
     if memory.admit(site, (
-            ('route (c)', memory.priced(row['aggregate_bytes_per_rank'], "eigh_stack_bytes")),
-            ('whole mesh', memory.priced(mesh_need, "eigh_stack_bytes (mesh)")
-             + memory.Price(outside=memory.contexts()))),
+            ('route (c)', ledger.price(row)),
+            ('whole mesh', ledger.price(mesh_row) + memory.Price(outside=memory.contexts()))),
             row['available_device_bytes_per_rank']) == 'route (c)':
         return local
     if no_mesh is not None:

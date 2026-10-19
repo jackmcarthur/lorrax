@@ -51,7 +51,7 @@ def device_budget_bytes() -> float:
     """THE per-device budget in bytes every planner prices against; a driver without a
     ``memory_per_device_gb`` key resolves it on its first call, which every process enters."""
     from lxkit import memory
-    if "budget" not in memory._RUN:
+    if "budget" not in memory.run():
         resolve_device_budget_gb()
     return memory.budget()
 

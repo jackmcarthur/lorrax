@@ -417,7 +417,7 @@ def validate_dense_h_inputs(
     if need > float(budget_bytes):
         from lxkit import memory
         memory.admit(f"dense H_k (N = {int(n_basis_max)})",
-                     memory.priced(need, "closed form"), budget_bytes)
+                     memory.priced(need, "closed form"), budget_bytes, device=False)
 
     return validate_operator_inputs(pseudos, crystal, sys_dim=int(sys_dim),
                                     caller="dense_h")

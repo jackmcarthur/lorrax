@@ -362,6 +362,11 @@ class ConstructorCapacity:
             self.native_queries[key] = distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128)
         return self.native_queries[key]
 
+    @property
+    def ledger(self):
+        """The shared ledger this construction reserves in (``CapacityLedger``)."""
+        return self._ledger
+
     def plan(self, side=None, *, phase=None, sample_batch=1,
              selection_faces=None, eigen_side=None, cross_original_sides=None,
              padding_output_bytes_per_rank=0, runs_in=None):
