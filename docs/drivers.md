@@ -232,11 +232,15 @@ Operating at thousands of centroids (the distributed plan, per-rank scalings):
 
 The one dynamic-Σ dispatch (`gw.sigma_dispatch._compute_mpa_sigma`) and the one finalizer
 (`finalize_dynamic_sigma`) are shared with the pole models; only the body kernel changes.
-`gw.cd.sigma.compute_sigma_c_cd_omega_grid` streams the exact ISDF W(z) at the CD nodes and knots
-and accumulates Σ_c on the file k wedge inside one `shard_map` over q; W(z) is never persisted.
-Besides `sigma_mnk.h5` the run writes `cd_sigma_own_energy.npz`, `cd_sigma_receipt.json` and
-`cd_leak_ledger.csv`.  Keys: [input reference](input_reference.md#sigma); equations, owners,
-memory and refusals: [dev note](dev/cd_frequency_integration.md).
+`gw.cd.sigma.compute_sigma_c_cd_omega_grid` streams the ISDF W(z) at the CD nodes and knots, built
+from the shared-pole bank's response-quadrature χ⁰ (`gw.cd.sigma.bank_chi0`), and accumulates Σ_c on
+the file k wedge inside one `shard_map` over q; W(z) is never persisted.  Besides `sigma_mnk.h5` the
+run writes `cd_sigma_own_energy.npz`, `cd_sigma_receipt.json` and `cd_leak_ledger.csv`; with
+`cd_checkpoint = write | resume` also `tmp/cd_checkpoint.h5`, and under `LORRAX_CD_STOP_AFTER`
+`cd_stop_receipt.json`.  The χ⁰ rules are built in the job (written to `cd_chi0_rules.pkl`) or
+precomputed on a CPU node with `python -m gw.cd.chi0_rules ... --out FILE` and read through
+`cd_chi0_rules_file`.  Keys: [input reference](input_reference.md#sigma); equations, owners,
+memory, rules and refusals: [dev note](dev/cd_frequency_integration.md).
 
 ## downfold — `gw.downfold_cli`
 

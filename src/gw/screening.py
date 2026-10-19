@@ -763,7 +763,7 @@ def compute_screening_model(
         if static_only:
             return {}
         if getattr(config.sigma, "frequency_integration", "pole_model") == "contour_deformation":
-            # Contour deformation (gw.cd): the exact W(z) is streamed by the
+            # Contour deformation (gw.cd): the ISDF W(z) is streamed by the
             # Sigma consumer from this handle; nothing is fitted or persisted.
             print_fn("  screening: contour_deformation -- W(z) streamed at the CD nodes by "
                      "gw.cd.sigma (bank response-quadrature chi0, bank Dyson pair); no W bank written")

@@ -1,9 +1,13 @@
 # Contour-deformation frequency integration of Σ_c (`gw.cd`)
 
 `sigma_frequency_integration = contour_deformation` evaluates the correlation self-energy on the
-exact ISDF screened interaction instead of a pole model.  Only the body kernel changes: dispatch
+ISDF screened interaction W(z) itself (χ⁰ from the bank quadrature) instead of a pole model.  Only the body kernel changes: dispatch
 (`gw.sigma_dispatch._compute_mpa_sigma`), η, the Fermi reference, occupations and the one finalizer
 (`finalize_dynamic_sigma`) are the dynamic-Σ path every ansatz shares.
+
+This is LORRAX's only contour-deformation implementation.  χ⁰ is never a Lehmann sum on this path;
+the ordered Lehmann χ⁰ (`w_isdf.compute_chi0_direct_fractional(ordered=True)`) appears only as the
+reference of `tests/test_cd_bank_chi0.py`.
 
 ## What is computed
 
@@ -128,6 +132,8 @@ symmetry certificate, `residue_bands` widths, live/contracted fractions and exte
 cumulative since the enclosing stage boundary, which `common.timing` owns -- and live arrays; a leak
 shows as a rise after the first chunk).  `LORRAX_CD_STAR_CERTIFICATE=N` (instrument, off by default) computes
 one non-identity member of N k stars directly and compares it with the wedge-unfolded cube.
+Under `cd_checkpoint = write | resume` the run keeps `tmp/cd_checkpoint.h5`; a run that builds its χ⁰
+rules in the job writes `cd_chi0_rules.pkl`; `LORRAX_CD_STOP_AFTER` writes `cd_stop_receipt.json`.
 
 ## χ⁰ rules (`gw.cd.chi0_rules`)
 

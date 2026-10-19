@@ -1,4 +1,4 @@
-"""Sigma_c(omega) by contour deformation on the exact ISDF W(z): the production CD route.
+"""Sigma_c(omega) by contour deformation on the ISDF W(z) (bank-quadrature chi0): the production CD route.
 
 Where this sits (docs/dev/cd_frequency_integration.md): ``gw.sigma_dispatch._compute_mpa_sigma``
 calls :func:`compute_sigma_c_cd_omega_grid` instead of the pole executor when the deck says

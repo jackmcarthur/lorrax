@@ -1644,7 +1644,8 @@ _DEFAULTS = {
     # frequency.  pole_model = the time-domain/pole executor of
     # sigma_w_model = mpa | shared_pole (every existing deck, bit-identical);
     # contour_deformation = imaginary-axis quadrature + real-axis residues on
-    # the exact ISDF W(z), streamed (gw.cd).  The cd_* sub-keys are its own.
+    # the ISDF W(z) from the bank-quadrature chi0, streamed (gw.cd).  The cd_*
+    # sub-keys are its own.
     "sigma_frequency_integration": "pole_model",
     "cd_imaginary_nodes": 96,
     "cd_knot_step_ev": 0.0625,
