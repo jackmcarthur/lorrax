@@ -350,14 +350,18 @@ extern "C" int lrx_eigh_workspace_bytes_block(
         cusolverDnHandle_t handle = nullptr;
         auto status = cusolverDnCreate(&handle);
         if (status != CUSOLVER_STATUS_SUCCESS) return int(status);
+        // The 64-bit generic query (size_t workspace, int64 n): the legacy 32-bit
+        // Zheevd_bufferSize answered INVALID_VALUE at n 30000 (int lwork; run30k).
+        cusolverDnParams_t params = nullptr;
+        size_t ws_device = 0, ws_host = 0;
+        const cudaDataType type = complex128 ? CUDA_C_64F : CUDA_R_64F;
+        status = cusolverDnCreateParams(&params);
+        if (status == CUSOLVER_STATUS_SUCCESS)
+            status = cusolverDnXsyevd_bufferSize(handle, params, CUSOLVER_EIG_MODE_VECTOR,
+                CUBLAS_FILL_MODE_LOWER, n, type, nullptr, n, CUDA_R_64F, nullptr, type,
+                &ws_device, &ws_host);
+        if (params) cusolverDnDestroyParams(params);
         int lwork = 0;
-        if (complex128) {
-            status = cusolverDnZheevd_bufferSize(handle, CUSOLVER_EIG_MODE_VECTOR,
-                CUBLAS_FILL_MODE_LOWER, int(n), nullptr, int(n), nullptr, &lwork);
-        } else {
-            status = cusolverDnDsyevd_bufferSize(handle, CUSOLVER_EIG_MODE_VECTOR,
-                CUBLAS_FILL_MODE_LOWER, int(n), nullptr, int(n), nullptr, &lwork);
-        }
         // JAX selects Jacobi for small matrices. Cover that path as well.
         if (status == CUSOLVER_STATUS_SUCCESS && n <= 32) {
             syevjInfo_t info = nullptr;
@@ -375,8 +379,10 @@ extern "C" int lrx_eigh_workspace_bytes_block(
             }
         }
         cusolverDnDestroy(handle);
-        if (status == CUSOLVER_STATUS_SUCCESS)
-            *device_bytes = uint64_t(lwork) * (complex128 ? 16 : 8);
+        if (status == CUSOLVER_STATUS_SUCCESS) {
+            *device_bytes = std::max<uint64_t>(ws_device, uint64_t(lwork) * (complex128 ? 16 : 8));
+            *host_bytes = ws_host;
+        }
         return int(status);
     }
     using namespace lorrax_ffi::cusolvermp;

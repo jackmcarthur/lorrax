@@ -213,3 +213,21 @@ def test_lu_relabels_from_4x4_and_keeps_the_2x2_bound():
     assert lu_blocks(30000, 2, 2) == (250, 250)          # local 15000 > 8192: relabeled before too
     assert lu_blocks(9152, 2, 2) == (4576, 4576)          # local <= 8192 on 2x2: one tile, unchanged
     assert rhs_block(9152, 9152, 2, 2, 4576) == 4576
+
+
+def test_the_gathered_retry_is_priced_against_the_run_budget(monkeypatch):
+    """run30k: cuSOLVERMp 0.9.1 left the n 30000 direction eigh with no correct attempt; the
+    gathered retry (one whole matrix per rank, the native eigh) joins the chain where 2 n^2 and
+    the heevd workspace fit the agreed device budget, and the ledger prices that reservation."""
+    import sys
+    import distrib_la  # noqa: F401
+    pl = sys.modules["distrib_la.plan"]                  # the module (distrib_la.plan is also a function)
+    monkeypatch.setattr(pl, "_GATHERED_ROOM", None)
+    assert pl._gathered_admitted((1448, 1448), np.complex128)          # the fixed rule stands
+    assert not pl._gathered_admitted((30000, 30000), np.complex128)
+    pl.set_gathered_room(63e9)
+    assert pl._gathered_bytes((30000, 30000), np.complex128) == 2 * 16 * 30000 ** 2 + (
+        16 * (2 * 30000 + 30000 ** 2) + 8 * (1 + 5 * 30000 + 2 * 30000 ** 2))    # 57.6 GB
+    assert pl._gathered_admitted((30000, 30000), np.complex128)
+    pl.set_gathered_room(40e9)
+    assert not pl._gathered_admitted((30000, 30000), np.complex128)

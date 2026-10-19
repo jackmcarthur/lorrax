@@ -254,18 +254,41 @@ def _stack_price(op, mesh, nb, n, dtype, rounds) -> int:
     whole = BATCH_EIGH_TILES * n * n * item
     checked = CHECKED_EIGH_TILES * (n * n // ranks) * item
     if op != "normal_eigh" and _gathered_admitted((n, n), dtype):
-        checked += GATHERED_EIGH_FACTOR * n * n * item
+        checked += _gathered_bytes((n, n), dtype)
     return per_rank * whole + checked
+
+
+#: The run's per-device budget in bytes, from the caller (LORRAX's common.gpu_utils
+#: set_device_budget_gb, the minimum over processes): every rank holds the same value.
+_GATHERED_ROOM: int | None = None
+
+
+def set_gathered_room(bytes_per_device):
+    """Set the device budget that prices the gathered retry (:func:`_gathered_admitted`)."""
+    global _GATHERED_ROOM
+    _GATHERED_ROOM = None if bytes_per_device is None else int(bytes_per_device)
 
 
 def _gathered_admitted(shape, dtype) -> bool:
     """Whether an eigh's gathered retry joins its chain: the matrices, their
     vectors and the solver's copy (GATHERED_EIGH_FACTOR n^2 elements each)
-    within GATHERED_EIGH_BYTES on every rank, whatever a caller's room (XLA
-    reserves the retry in every program that holds it). A shape rule, the
-    same on every rank."""
-    return (GATHERED_EIGH_FACTOR * np.dtype(dtype).itemsize * int(np.prod(tuple(shape)))
-            <= GATHERED_EIGH_BYTES)
+    within GATHERED_EIGH_BYTES, or with the local heevd/syevd workspace within the
+    run's device budget (:func:`set_gathered_room`), whatever a caller's room (XLA
+    reserves the retry in every program that holds it). Shapes and an agreed budget:
+    the same on every rank. cuSOLVERMp 0.9.1 left n 30000 (run30k) with no correct
+    attempt short of this one."""
+    small = GATHERED_EIGH_FACTOR * np.dtype(dtype).itemsize * int(np.prod(tuple(shape)))
+    return small <= GATHERED_EIGH_BYTES or (_GATHERED_ROOM is not None
+                                            and _gathered_bytes(shape, dtype) <= _GATHERED_ROOM)
+
+
+def _gathered_bytes(shape, dtype) -> int:
+    """Per-rank bytes the gathered retry reserves: GATHERED_EIGH_FACTOR n^2 per matrix
+    and the local heevd/syevd workspace (LAPACK lwork + lrwork), a shape formula."""
+    item, elems, n = np.dtype(dtype).itemsize, int(np.prod(tuple(shape))), int(shape[-1])
+    heevd = (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) if np.dtype(dtype).kind == "c"
+             else 8 * (1 + 6 * n + 2 * n * n))
+    return GATHERED_EIGH_FACTOR * item * elems + elems // (n * n) * heevd
 
 
 @lru_cache(maxsize=None)

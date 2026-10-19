@@ -145,20 +145,19 @@ def _workspace_details(plan, op, shapes, dtype):
             # A distributed eigh is checked and retried inside the program
             # (distrib_la._result_check): its XLA temporaries, and the gathered
             # retry's replicated copies where the plan admits one.
-            from distrib_la.plan import (CHECKED_EIGH_TILES, GATHERED_EIGH_FACTOR,
-                                         _gathered_admitted)
+            from distrib_la.plan import CHECKED_EIGH_TILES, _gathered_admitted, _gathered_bytes
             checked = CHECKED_EIGH_TILES * (n * n // (px * py)) * dtype.itemsize
             if side > n:
                 # The padded operand and the padded vectors before the slice.
                 checked += 2 * (side * side // (px * py)) * dtype.itemsize
             if _gathered_admitted((n, n), dtype):
-                checked += GATHERED_EIGH_FACTOR * n * n * dtype.itemsize
+                checked += _gathered_bytes((n, n), dtype)
         scratch += checked
         return dict(device_bytes=scratch, host_bytes=host,
                     vendor_device_bytes=device if local else None,
                     native_device_bytes=device,
                     dynamic_xla_scratch_bytes=scratch,
-                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes are the aligned vendor workspace (ABI 10: the solver destroys an aliased XLA copy of the operand, within checked); checked = CHECKED_EIGH_TILES n^2/P (+ 2 N^2/P at a padded solve side N, + GATHERED_EIGH_FACTOR n^2 when admitted)',
+                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes are the aligned vendor workspace (ABI 10: the solver destroys an aliased XLA copy of the operand, within checked); checked = CHECKED_EIGH_TILES n^2/P (+ 2 N^2/P at a padded solve side N, + the gathered retry: 2 n^2 and the heevd workspace, when admitted)',
                     checked_device_bytes=checked,
                     copies=copies,
                     provider=('cusolverDn (one_device)' if one_device else 'cusolverDn')

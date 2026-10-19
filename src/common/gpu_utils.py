@@ -47,6 +47,8 @@ def set_device_budget_gb(gb: float) -> None:
     if not value > 0:
         raise ValueError(f"the device budget must be positive GB, got {gb!r}")
     _RUN_DEVICE_BUDGET_GB = value
+    import distrib_la                  # the same agreed budget prices its gathered eigh retry
+    distrib_la.set_gathered_room(int(value * 1e9))
 
 
 def resolve_device_budget_gb(deck_gb: float = 0.0, linalg: str = "local") -> float:
