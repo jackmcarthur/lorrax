@@ -61,6 +61,8 @@ def main():
     ap.add_argument("--arms", default="spm,gn")
     ap.add_argument("--states", default="eq,hot_V1,hot_V2")
     ap.add_argument("--qp-g", default="0.05,0.025", help="etas of the 04 eqp1-in-G sweep ('' none)")
+    ap.add_argument("--gn-etas", default="", help="etas of the 07 arm (default: --etas)")
+    ap.add_argument("--resume", action="store_true", help="skip sweeps whose npz exists (and a source whose sweeps all exist)")
     a = ap.parse_args()
     stack = runtime.initialize_communicator_stack()
     import jax
@@ -74,6 +76,16 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     out = dict(win=list(a.win), etas=a.etas, head=os.environ.get("LEG_HEAD", ""), sweeps=[])
     jname = os.path.join(a.out, "qp_516.json")
+    if a.resume and os.path.exists(jname):
+        with open(jname) as f:
+            prev = json.load(f)
+        for key in ("sweeps", "sources", "refits", "refusals"):
+            if prev.get(key):
+                out.setdefault(key, []).extend(prev[key])
+        out["resumed_from"] = prev.get("head", "")
+
+    def have(tag):
+        return a.resume and os.path.exists(os.path.join(a.out, f"sig_{tag}.npz"))
 
     def save():
         if rank0:
@@ -85,12 +97,16 @@ def main():
     nA = hi - lo
     etas = [float(x) for x in a.etas.split(",") if x]
     qpg = [float(x) for x in a.qp_g.split(",") if x]
+    gn_etas = [float(x) for x in a.gn_etas.split(",") if x] or etas
 
     def eta_plan(plan, eta_ev):
         import dataclasses
         return dict(plan, sigma_cfg=dataclasses.replace(plan["sigma_cfg"], regularization_ev=float(eta_ev)))
 
     def sweep(tag, src, poles, f_blk, eta, *, e_blk=None):
+        if have(tag):
+            say(f"[qp_516] sweep {tag}: npz exists, skipped (--resume)")
+            return None
         wfns, meta = src["wfns"], src["meta"]
         nk = int(meta.nk_tot)
         enk = np.asarray(jax.device_get(wfns.enk), np.float64)
@@ -123,6 +139,10 @@ def main():
         deck = os.path.join(os.path.abspath(a.spm_ref), "oneshot.in")
         e_qp_ev, _ = _eqp(os.path.join(os.path.abspath(a.spm_ref), "eqp1.dat"))
         for eta in etas:
+            tags = [f"spm_{st}_eta{eta:g}" for st in states] + ([f"spm_eqQPG_eta{eta:g}"] if eta in qpg else [])
+            if all(have(t) for t in tags):
+                say(f"[qp_516] eta {eta:g}: every sweep exists, source skipped (--resume)")
+                continue
             src = D.gw_window_source(deck, mesh, workdir=os.path.join(os.path.abspath(a.out), f"driver_spm_{eta:g}"),
                                      screening=any(s.startswith("hot") for s in states),
                                      overrides={"sigma_regularization_ev": eta}, say=say)
@@ -146,7 +166,7 @@ def main():
                 sweep(f"spm_eqQPG_eta{eta:g}", src, src["poles"], f_eq, eta, e_blk=e_qp)
                 out.setdefault("qp_g_note", f"window energies in G = eqp1 (abs eV); E_F {efermi_ev:.4f} eV")
             for st in states:
-                if not st.startswith("hot"):
+                if not st.startswith("hot") or have(f"spm_{st}_eta{eta:g}"):
                     continue
                 V = st.split("_")[1]
                 sites = "" if V == "V1" else _v2_sites(
@@ -169,14 +189,14 @@ def main():
                 sweep(f"spm_{st}_eta{eta:g}", src, at, f_hot, eta)
                 del at, scr
             del src
-    if "gn" in arms:
+    if "gn" in arms and not all(have(f"gn_eq_eta{eta:g}") for eta in gn_etas):
         deck = os.path.join(os.path.abspath(a.gn_ref), "oneshot.in")
         src = D.gw_window_source(deck, mesh, workdir=os.path.join(os.path.abspath(a.out), "driver_gn"),
                                  screening=False, say=say)
         occ = np.asarray(jax.device_get(src["wfns"].occ), np.float64)
         out.setdefault("sources", []).append(dict(arm="gn", eta_ev=float(src["config"].sigma.regularization_ev),
                                                   wall_s=src["wall_s"]))
-        for eta in etas:
+        for eta in gn_etas:
             sweep(f"gn_eq_eta{eta:g}", src, src["poles"], occ[:, lo:hi].copy(), eta)
     out["wall_s"] = time.perf_counter() - t_all
     save()
