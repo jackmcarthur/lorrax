@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from bse.bsemat_algebra import (add_q0_body_update, direct_parts, exchange_part,
-                                head_split, check_split)
+                                head_split, check_split, q0_dipole_body_rows)
 
 OMEGA = 270.0
 
@@ -127,3 +127,56 @@ def test_q0_hook_moves_only_the_body():
     want = OMEGA / (8 * np.pi) * 0.7 * np.einsum("bcd,bwu->bcdwu", a_c, a_v.conj())
     assert np.allclose(h1, h0) and np.allclose(w1, w0) and not np.any(w1)
     assert np.linalg.norm((b1 - b0) - want) < 1e-10 * np.linalg.norm(want)
+
+
+def _q0_block(seed=5, n_g=40, n_mu=16, omega=270.0):
+    """A dense G-space q0 system in the eps export's E8a/E9 convention."""
+    rng = np.random.default_rng(seed)
+    cplx = lambda *s: rng.standard_normal(s) + 1j * rng.standard_normal(s)
+    Z = cplx(n_g, n_mu)                                   # ζ̃_μ(G), body G
+    vb = 8 * np.pi / rng.uniform(0.5, 4.0, n_g) / omega   # v(q0+G)/Ω
+    X = cplx(n_mu, n_mu); chi0 = -0.01 * (X @ X.conj().T)  # μ-space χ0, ≤ 0
+    V = Z.conj().T @ (vb[:, None] * Z)
+    chi = np.linalg.solve(np.eye(n_mu) - chi0 @ V, chi0)
+    W = V + V @ chi @ V
+    L = 0.05 * cplx(3, n_mu); R = L.conj().T
+    Y = rng.standard_normal((3, 3)); S_d = -0.002 * (Y @ Y.T + np.eye(3))
+    S_eff = S_d + L @ W @ R / omega
+    return Z, vb, chi0, V, W, L, R, S_d, S_eff, omega
+
+
+def _bgw_q0_body(Z, vb, chi0, L, R, S_d, omega, q0):
+    """Z† (ε⁻¹ v)_bb Z from the full (head + body) block inverse of E8a."""
+    n_g = Z.shape[0]
+    v0 = 8 * np.pi / (q0 @ q0) / omega
+    chi_bb = Z @ chi0 @ Z.conj().T
+    chi_0b = -(q0 @ L) @ Z.conj().T
+    chi_b0 = -Z @ (R @ q0)
+    chi_00 = omega * q0 @ S_d @ q0
+    eps = np.zeros((n_g + 1, n_g + 1), complex)
+    eps[0, 0] = 1 - v0 * chi_00
+    eps[0, 1:] = -v0 * chi_0b
+    eps[1:, 0] = -vb * chi_b0
+    eps[1:, 1:] = np.eye(n_g) - vb[:, None] * chi_bb
+    W_bb = np.linalg.inv(eps)[1:, 1:] * vb[None, :]
+    return Z.conj().T @ W_bb @ Z
+
+
+def test_q0_dipole_body_equals_block_inverse():
+    """W(Γ) + AᴴDA from the stored wings equals the full-inverse q0 body (E13); red twins fail."""
+    Z, vb, chi0, V, W, L, R, S_d, S_eff, omega = _q0_block()
+    q0 = np.array([2.5e-4, -1.0e-4, 3.0e-4])
+    want = _bgw_q0_body(Z, vb, chi0, L, R, S_d, omega, q0)
+    A, D, fig = q0_dipole_body_rows(W, L, R, S_eff, S_d, q0, omega)
+    got = add_q0_body_update(W, A, D)
+    rel = np.linalg.norm(got - want) / np.linalg.norm(want - W)
+    assert rel < 1e-6, rel
+    assert fig["fold_gate"] < 1e-10 and fig["R_vs_LH"] < 1e-14
+    # the term is O(1): a 10x shorter q0 along the same direction gives the same body
+    want_s = _bgw_q0_body(Z, vb, chi0, L, R, S_d, omega, q0 / 10)
+    assert np.linalg.norm(want_s - want) < 1e-4 * np.linalg.norm(want - W)
+    # red twins: unconjugated R; the head-less body; the term with the wrong sign
+    _, _, fig_bad = q0_dipole_body_rows(W, L, L.T, S_eff, S_d, q0, omega)
+    assert fig_bad["fold_gate"] > 1e-2
+    assert np.linalg.norm(W - want) > 1e4 * np.linalg.norm(got - want)
+    assert np.linalg.norm(add_q0_body_update(W, A, -D) - want) > 1e-1 * np.linalg.norm(want - W)

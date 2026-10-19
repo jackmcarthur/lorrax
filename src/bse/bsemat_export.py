@@ -315,8 +315,8 @@ def _ri(a):
 # ---------------------------------------------------------------------------
 
 def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=False,
-                      use_gauge_map=True, rcond=A.RCOND, bgw_eps=None, q0_body_update=None,
-                      mesh_xy):
+                      use_gauge_map=True, rcond=A.RCOND, bgw_eps=None, q0_body="head_less",
+                      q0_vector=None, q0_body_update=None, mesh_xy):
     """Write ``out_path`` (BerkeleyGW bsemat.h5) from the deck's restart. Returns a summary dict.
 
     ``bgw_eps`` (an ``epsmat.h5``) supplies BerkeleyGW's own q wedge, so the
@@ -325,7 +325,11 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     ``q0_body_update`` ``(A (n, μ), D (n, n))`` is the q → 0 hook
     (``bsemat_algebra.add_q0_body_update``): the wing-mediated body term of
     BerkeleyGW's eps0mat, from the eps export's dipole wing vector. ``None``
-    keeps the head-less Γ body.
+    keeps the head-less Γ body. ``q0_body = "dipole"`` builds it from the
+    restart's stored wings (``head_wing_L``/``head_wing_R``, ``S_cart_head``,
+    ``S_cart_head_direct``; ``bsemat_algebra.q0_dipole_body_rows``) along
+    BerkeleyGW's q0 (``q0_vector`` crystal, else the ``eps0mat.h5`` beside
+    ``bgw_eps``); 3-D only, the term is O(q0) in a slab.
     """
     from ffi import _services
     _services.ensure_on_path()
@@ -435,6 +439,48 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
                      out_shardings=NamedSharding(mesh_xy, P("x", "y", None)))(data["W_q"])
     V_flat = jax.jit(lambda w: w.reshape(w.shape[0], w.shape[1], -1),
                      out_shardings=NamedSharding(mesh_xy, P("x", "y", None)))(data["V_q_full"])
+    q0_fig = None
+    if q0_body not in ("head_less", "dipole"):
+        raise ValueError(f"q0_body must be head_less or dipole, got {q0_body!r}")
+    if q0_body == "dipole":
+        if sys_dim != 3:
+            raise ValueError("GATE bsemat_q0_body_dim: the dipole q0 body term is O(q0) in a slab "
+                             "(BerkeleyGW's own body moves 8e-8); fix: --q0-body head-less.")
+        names = ("head_wing_L", "head_wing_R", "S_cart_head", "S_cart_head_direct")
+        with h5py.File(restart, "r") as f:
+            miss = [n for n in names if n not in f]
+            if miss:
+                raise ValueError(f"GATE bsemat_q0_wings_source: {restart} lacks {miss}; the dipole "
+                                 "q0 body needs the GW bundle's stored q -> 0 wings. fix: rerun GW "
+                                 "with wing storage, or --q0-body head-less.")
+            Lw, Rw, S_eff, S_d = (np.asarray(f[n][()]) for n in names)
+        if q0_vector is None:
+            eps0 = os.path.join(os.path.dirname(os.path.abspath(bgw_eps)), "eps0mat.h5") if bgw_eps else None
+            if not eps0 or not os.path.exists(eps0):
+                raise ValueError("GATE bsemat_q0_vector: the dipole q0 body is direction dependent; "
+                                 "give --q0-vector (crystal) or an eps0mat.h5 beside --bgw-eps.")
+            with h5py.File(eps0, "r") as e:
+                q0_vector = np.asarray(e["eps_header/qpoints/qpts"][()], np.float64)[0]
+        q0_cart = np.asarray(q0_vector, np.float64) @ bvec
+        if Lw.shape != (3, n_rmu) or Rw.shape != (n_rmu, 3):
+            raise ValueError(f"GATE bsemat_q0_wing_fold: wings {Lw.shape}/{Rw.shape}, the bundle has {n_rmu} μ")
+        Lp = np.zeros((3, n_rmu_pad), np.complex128); Lp[:, :n_rmu] = Lw
+        Rp = np.zeros((n_rmu_pad, 3), np.complex128); Rp[:n_rmu] = Rw
+        rs = NamedSharding(mesh_xy, P())
+        dip = jax.jit(lambda w, l, r, se, sd: A.q0_dipole_body_rows(
+            w[:, :, 0], l, r, se, sd, q0_cart, omega, xp=jnp), out_shardings=rs)
+        A_d, D_d, fig = dip(W_flat, *(device_put_process_local(np.asarray(x, np.complex128), rs)
+                                      for x in (Lp, Rp, S_eff, S_d)))
+        q0_fig = {k: (complex(np.asarray(v)) if np.iscomplexobj(np.asarray(v)) else float(np.asarray(v)))
+                  for k, v in fig.items()}
+        q0_fig["q0_vector"] = [float(x) for x in q0_vector]
+        if not q0_fig["fold_gate"] <= 1e-3 or not q0_fig["R_vs_LH"] <= 1e-10:
+            raise ValueError(f"GATE bsemat_q0_wing_fold: Ω q̂(S_eff − S_d)q̂ vs q̂ L W R q̂ on this W "
+                             f"differs by {q0_fig['fold_gate']:.2e} (R vs Lᴴ {q0_fig['R_vs_LH']:.2e}); "
+                             "L's μ order or normalisation is not this bundle's.")
+        q0_body_update = (np.asarray(A_d)[:, :n_rmu], np.asarray(D_d))
+        _log(f"[bsemat] q0 body: dipole term along q0 = {q0_fig['q0_vector']} (crystal), "
+             f"ε_M = {q0_fig['eps_M']:.4f}, fold gate {q0_fig['fold_gate']:.1e}")
     if q0_body_update is not None:
         A0 = np.zeros((np.asarray(q0_body_update[0]).shape[0], n_rmu_pad), np.complex128)
         A0[:, :n_rmu] = np.asarray(q0_body_update[0])[:, :n_rmu]
@@ -560,6 +606,7 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     for nm, v in zip(names, np.sqrt(fro)):
         _log(f" - {nm} : {v:21.12E}")
     summary = {"nk": nk, "n1b": n1b, "n2b": n2b, "keys": len(keys), "ties": n_ties,
+               "q0_body": q0_body, "q0_dipole": q0_fig,
                "frobenius": dict(zip(("head", "wing", "body", "exchange"), np.sqrt(fro).tolist())),
                "split": figs, "gauge": gfig, "vbar_imag_rel": vim,
                "wall_total_s": t_end - t0, "wall_rows_s": t_end - t_rows,

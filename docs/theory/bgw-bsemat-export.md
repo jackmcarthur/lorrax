@@ -112,10 +112,28 @@ those blocks moves.
 ## q = 0 and the gauge {#q0}
 
 At k = k′ the head is $\Omega\,m m^*$ with $m=\sum g_0^*C\approx\delta$. The wing is
-zero (BerkeleyGW's semiconductor convention). The body is the head-less Γ tile
-of W, so it omits the O(q⁰) wing-mediated term of BerkeleyGW's full ε⁻¹ body. That
-term needs the q → 0 dipole wing vector of the eps export, and `bsemat_export`
-leaves a hook for it.
+zero: `calc_wings` (BSE/mtxel_kernel.f90) zeroes the q = 0 wings under
+`screening_semiconductor`. The default body (`--q0-body head-less`) is the head-less Γ
+tile of W. BerkeleyGW's q0 body is the body block of its fully inverted ε at q₀,
+so in 3D it also carries an O(q⁰) wing-mediated term. The eps export's stored q → 0
+wings give it (its theory page, E9–E13: `head_wing_L` L (3, N_μ),
+`head_wing_R` R = Lᴴ, `S_cart_head` S_eff = S_d + L W(Γ) R/Ω, `S_cart_head_direct` S_d).
+Projecting its E13 with $Z^\dagger\cdots Z$, using $Z^\dagger v_bZ=V$ and
+$V(1+\chi^\mu V)=W$, gives
+
+$$W_{q_0}=W(\Gamma)+\frac{8\pi}{\Omega\,\varepsilon_M}\,a\,a^\dagger,\qquad
+a=W(\Gamma)\,R\,\hat q_0,\qquad \varepsilon_M=1-8\pi\,\hat q_0^{\mathsf T}S_{\rm eff}\,\hat q_0 ,
+\tag{E8}$$
+
+independent of $|q_0|$ but not of its direction. `--q0-body dipole`
+(`bsemat_algebra.q0_dipole_body_rows`) adds it along BerkeleyGW's q₀, taken from
+the `eps0mat.h5` beside `--bgw-eps` or from `--q0-vector`. GATE
+`bsemat_q0_wing_fold` refuses unless $\Omega\hat q_0^{\mathsf T}(S_{\rm eff}-S_{\rm d})\hat q_0
+=\hat q_0^{\mathsf T}LW(\Gamma)R\hat q_0$ to 10⁻³ on the writer's own W, which certifies L's μ
+order and normalisation. In a slab the term is O(q₀), so the option refuses there
+(`bsemat_q0_body_dim`). `tests/test_bsemat_split_cpu.py` checks E8 against the
+block inverse of a dense G-space q₀ system, and fails an unconjugated R and the
+wrong sign.
 
 BerkeleyGW combines the kernel with its own WFN coefficients. The writer therefore rotates
 ψ at the centroids into the WFN file's coefficient gauge with one window unitary
@@ -134,3 +152,5 @@ states evaluated at the centroids (the dipfix construction).
 | `bsemat_full_grid`, `bsemat_k_bijection`, `bsemat_k_on_grid`, `bsemat_k_order` | WFN_co is not the explicit full grid of the restart, in any order |
 | `bsemat_band_offset` | the WFN_co window energies differ from the restart's by more than 0.05 Ry |
 | `bsemat_q_list`, `bsemat_head_parent`, `bsemat_head_label`, `bsemat_head_length` | a pair's head momentum is missing from the q list, off the lattice, or not a shortest $q+G$ |
+| `bsemat_q0_wings_source`, `bsemat_q0_vector`, `bsemat_q0_body_dim` | `--q0-body dipole` without the bundle's stored wings, without a q₀ direction, or in a slab |
+| `bsemat_q0_wing_fold` | the stored fold $S_{\rm eff}-S_{\rm d}$ disagrees with $LW(\Gamma)R/\Omega$ on this W by more than 10⁻³ |

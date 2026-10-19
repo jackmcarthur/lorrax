@@ -175,3 +175,33 @@ def add_q0_body_update(W0, A, D, xp=np):
     """
     A = xp.asarray(A)
     return W0 + xp.conj(A).T @ xp.asarray(D) @ A
+
+
+def q0_dipole_body_rows(W0, L, R, S_eff, S_direct, q0_cart, omega, xp=np):
+    """(A, D) of BerkeleyGW's 3-D q0 body term from the restart's stored q → 0 wings.
+
+    ``head_wing_L`` L (3, μ), ``head_wing_R`` R (μ, 3) = Lᴴ, ``S_cart_head`` S_eff and
+    ``S_cart_head_direct`` S_d follow the eps export's convention
+    (docs/theory/bgw_epsmat_export.md E9 on the eps branch). Block inversion
+    (E13) projected onto μ (Z† ⋯ Z, Z† v_b Z = V, W = V + Vχ^μV) gives
+    BerkeleyGW's q0 body as W(Γ) + c (W R q₀)(q₀ᵀ L W), c = v(q₀)/(Ω ε_M),
+    v(q₀) = 8π/|q₀|², ε_M = 1 − v(q₀) q₀ᵀ S_eff q₀ (E11). With q̂ = q₀/|q₀| that is
+    ``Aᴴ D A`` for ``add_q0_body_update``: A = (W R q̂)† (1, μ), D = 8π/(Ω ε_M),
+    O(1) and independent of |q₀|. ``q0_cart`` is BerkeleyGW's q0 direction (1/bohr).
+
+    Returns ``A, D, fig`` with ``fig['fold_gate']`` the relative mismatch of
+    Ω q̂ᵀ(S_eff − S_d)q̂ and q̂ᵀ L W R q̂ on THIS W: it certifies L's μ order and
+    normalisation where the term consumes them.
+    """
+    q = xp.asarray(q0_cart, dtype=xp.float64)
+    qh = q / xp.linalg.norm(q)
+    a = W0 @ (R @ qh)
+    fold_W = qh @ (L @ a)
+    fold_S = omega * (qh @ ((S_eff - S_direct) @ qh))
+    eps_M = 1.0 - 8.0 * np.pi * xp.real(qh @ (S_eff @ qh))
+    A = xp.conj(a)[None, :]
+    D = xp.reshape(8.0 * np.pi / (omega * eps_M), (1, 1)).astype(A.dtype)
+    fig = {"eps_M": eps_M, "fold_W": fold_W, "fold_S": fold_S,
+           "fold_gate": xp.abs(fold_S - fold_W) / xp.abs(fold_W),
+           "R_vs_LH": xp.linalg.norm(R - xp.conj(L).T) / xp.linalg.norm(L)}
+    return A, D, fig
