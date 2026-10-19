@@ -218,7 +218,13 @@ def head_columns(keys, *, zeta_path, tables, sym, grid, n_rmu, n_rmu_pad, mesh_x
 # 4. gauge map into the coarse WFN's coefficient gauge
 # ---------------------------------------------------------------------------
 
-def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, enk_win,
+#: Bytes of one FFT-box chunk in the gauge map's ψ_file(r_μ) evaluation (``gflat_to_rmu`` scan).
+GAUGE_BOX_CHUNK_BYTES = 1 << 28
+#: Relative singular-value cut of the block polar factor (the parallel-transport links' value).
+GAUGE_POLAR_RCOND = 1.0e-10
+
+
+def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, enk_win, mesh_xy,
               guard=8):
     """Window unitaries ``U[k] (nb, nb)`` with ψ_LX ≈ ψ_file U, valence and conduction blocks.
 
@@ -229,45 +235,105 @@ def gauge_map(psi, *, wfn_co, k_rows, bands_abs, centroid_frac, fft_grid, nv, en
     window plus ``guard`` bands each side are evaluated at the (grid-rounded)
     centroids, ψ_LX is fitted by least squares (the centroids are not a
     quadrature, dipfix), and each block's polar factor is kept. Returns
-    ``(U (nk_wfn, nb, nb), figures)``.
+    ``(U (nk_wfn, nb, nb) host, figures)``.
+
+    Device route, all existing LORRAX paths: ``WfnLoader.load(k='ibz')`` reads the
+    file's own rows (no unfold; the collective read at P > 1) and the GW face
+    transform ``gflat_to_rmu`` evaluates them at the centroid grid points,
+    ``ψ_file,b(r_μ) = Σ_G c_b(G) e^{2πi(G+k)·r_μ}`` (``norm='forward'``, the
+    loader's own k table). The normal equations ``(A*Aᵀ) X = A*Bᵀ`` are formed
+    with μ over the whole mesh and solved batched over k; the block polar factors
+    go through ``distrib_la.plan_polar_factor(...).batched`` on the batch-reshard
+    route, as the parallel-transport links do. ``mesh_xy`` is the run's mesh.
     """
-    from file_io.bgw_bsemat import read_wfn_coefficients
-    grid = np.asarray(fft_grid, dtype=np.int64)
-    rmu = np.mod(np.rint(np.asarray(centroid_frac) * grid[None, :]).astype(np.int64),
-                 grid[None, :]) / grid[None, :]
+    import distrib_la as dla
+    from wfn_loader import WfnLoader
+    from common.collectives import device_put_process_local
+    from common.gvec_fft_box import build_sphere_box_index
+    from common.wfn_layout import band_sphere_spec
+    from common.wfn_transforms import gflat_to_rmu, load_psi_gflat_padded
+    from runtime.padding import padded_axis
+    t0 = time.time()
+    grid = tuple(int(n) for n in fft_grid)
+    r_mu = np.mod(np.rint(np.asarray(centroid_frac) * np.asarray(grid)[None, :]).astype(np.int64),
+                  np.asarray(grid)[None, :]).astype(np.int32)
+    nb, ns, n_mu = int(psi.shape[1]), int(psi.shape[2]), len(r_mu)
+    nc = nb - nv
+    k_rows = np.asarray(k_rows, dtype=np.int64)
     with h5py.File(wfn_co, "r") as w:
-        nb_file = int(w["mf_header/kpoints/mnband"][()])
-        rk = np.asarray(w["mf_header/kpoints/rk"][()], dtype=np.float64)
-    if rk.shape[0] == 3 and rk.shape[1] != 3:
-        rk = rk.T
+        el = np.asarray(w["mf_header/kpoints/el"][()], dtype=np.float64)
+    el = el.reshape(-1, el.shape[-2], el.shape[-1])[0]                 # (nk_wfn, mnband) Ry, spin 1
+    nk_w, nb_file = el.shape
     b_lo, b_hi = max(0, int(bands_abs[0]) - guard), min(nb_file, int(bands_abs[-1]) + 1 + guard)
-    nb, n_mu = psi.shape[1], len(rmu)
-    sl_v, sl_c = slice(0, nv), slice(nv, nb)
-    w0 = int(bands_abs[0]) - b_lo
-    U = np.zeros((len(rk), nb, nb), np.complex128)
-    fig = {"lsq_residual_max": 0.0, "sv_spread_max": 0.0, "cross_block_max": 0.0,
-           "energy_mismatch_max_ry": 0.0}
-    for j in range(len(rk)):
-        g, c, el = read_wfn_coefficients(wfn_co, j, b_lo, b_hi)
-        de = float(np.max(np.abs(el[int(bands_abs[0]) - b_lo:int(bands_abs[-1]) + 1 - b_lo]
-                                  - enk_win[k_rows[j]])))
-        fig["energy_mismatch_max_ry"] = max(fig["energy_mismatch_max_ry"], de)
-        if de > 5.0e-2:
-            raise ValueError(f"GATE bsemat_band_offset: WFN_co row {j} window energies differ "
-                             f"from the restart's by {de:.3e} Ry; want the same bands.")
-        ph = np.exp(2j * np.pi * ((g + rk[j][None, :]) @ rmu.T))            # full-Bloch convention
-        Af = np.einsum("bsg,gm->bsm", c, ph).reshape(b_hi - b_lo, -1)
-        Bm = psi[k_rows[j], :, :, :n_mu].reshape(nb, -1)
-        X = np.linalg.solve(Af.conj() @ Af.T, Af.conj() @ Bm.T)             # ψ_LX ≈ ψ_file X
-        res = np.linalg.norm(Bm - X.T @ Af) / np.linalg.norm(Bm)
-        Xw = X[w0:w0 + nb]
-        for sl in (sl_v, sl_c):
-            Wl, s, Vh = np.linalg.svd(Xw[sl, sl])
-            U[j][sl, sl] = Wl @ Vh
-            fig["sv_spread_max"] = max(fig["sv_spread_max"], float((s.max() - s.min()) / s.max()))
-        cross = (np.linalg.norm(Xw[sl_v, sl_c]) + np.linalg.norm(Xw[sl_c, sl_v])) / np.linalg.norm(Xw)
-        fig["lsq_residual_max"] = max(fig["lsq_residual_max"], float(res))
-        fig["cross_block_max"] = max(fig["cross_block_max"], float(cross))
+    nbg, w0 = b_hi - b_lo, int(bands_abs[0]) - b_lo
+    de = np.max(np.abs(el[:, int(bands_abs[0]):int(bands_abs[-1]) + 1] - enk_win[k_rows]), axis=1)
+    if np.any(de > 5.0e-2):
+        j = int(np.flatnonzero(de > 5.0e-2)[0])
+        raise ValueError(f"GATE bsemat_band_offset: WFN_co row {j} window energies differ "
+                         f"from the restart's by {de[j]:.3e} Ry; want the same bands.")
+
+    # ψ_file(r_μ): (nk_wfn, nbg_pad, ns, μ), bands over XY (zero pad bands).
+    with WfnLoader(wfn_co, mesh=mesh_xy) as loader:
+        if int(loader.nspinor) != ns or int(loader.nkpts) != nk_w:
+            raise ValueError(f"GATE bsemat_gauge_layout: WFN_co has nspinor {int(loader.nspinor)}, "
+                             f"{int(loader.nkpts)} k; ψ_LX has {ns}, the file's energies {nk_w}.")
+        ngk = loader.ngk_valid(k="ibz")
+        g_index = build_sphere_box_index(loader.gvecs(k="ibz"), grid, int(loader.ngkmax),
+                                         ngk_valid=ngk)
+        for j in range(nk_w):
+            if np.unique(g_index[j, :ngk[j]]).size != int(ngk[j]):
+                raise ValueError(f"GATE bsemat_gauge_box_alias: WFN_co row {j}'s G sphere aliases "
+                                 f"on the FFT grid {grid}; the centroid grid must hold the sphere.")
+        psi_G = load_psi_gflat_padded(loader, (b_lo, b_hi), mesh_xy=mesh_xy, bispinor=False, k="ibz")
+        A_r = gflat_to_rmu(
+            psi_G, device_put_process_local(g_index, NamedSharding(mesh_xy, P(None, None))), r_mu,
+            mesh=mesh_xy, fft_grid=grid, kvecs_frac=loader.kvecs(k="ibz"), norm="forward",
+            chunk_size=max(1, GAUGE_BOX_CHUNK_BYTES // (ns * int(np.prod(grid)) * 16)))
+        del psi_G
+
+    # Least squares ψ_LX ≈ ψ_file X per k, μ over the whole mesh (zero μ pad is inert).
+    mu_w = padded_axis(n_mu, mesh_xy, name="bsemat gauge centroid axis").carrier
+    s_mu = NamedSharding(mesh_xy, P(None, None, None, ("x", "y")))
+    rep = NamedSharding(mesh_xy, P())
+    B = np.zeros((nk_w, nb, ns, mu_w), np.complex128)
+    B[..., :n_mu] = np.asarray(psi)[k_rows][..., :n_mu]
+    B = device_put_process_local(B, s_mu)
+
+    @partial(jax.jit, out_shardings=(rep, rep, rep))
+    def fit(a, b):
+        a = jnp.pad(a, ((0, 0), (0, 0), (0, 0), (0, mu_w - n_mu)))
+        a = jax.lax.with_sharding_constraint(a, s_mu)[:, :nbg]
+        gram = jax.lax.with_sharding_constraint(jnp.einsum("kbsm,kcsm->kbc", jnp.conj(a), a), rep)
+        rhs = jax.lax.with_sharding_constraint(jnp.einsum("kbsm,knsm->kbn", jnp.conj(a), b), rep)
+        x = jnp.linalg.solve(gram, rhs)                                   # (nk, nbg, nb)
+        ssq = lambda m: jnp.sum(jnp.abs(m) ** 2, axis=tuple(range(1, m.ndim)))   # per k
+        res = jnp.sqrt(ssq(b - jnp.einsum("kbn,kbsm->knsm", x, a)) / ssq(b))
+        xw = x[:, w0:w0 + nb]
+        cross = (jnp.sqrt(ssq(xw[:, :nv, nv:])) + jnp.sqrt(ssq(xw[:, nv:, :nv]))) / jnp.sqrt(ssq(xw))
+        return xw, res, cross
+
+    Xw, res, cross = fit(A_r, B)
+    del A_r, B
+
+    # Block polar factors, one (2·nk, n, n) stack at P(None, x, y); zero pad directions drop.
+    n_blk = padded_axis(max(nv, nc), mesh_xy, name="bsemat gauge polar block",
+                        spec=band_sphere_spec(), axis=1).carrier
+    pol = dla.plan_polar_factor(mesh_xy, n=n_blk, backend="native", rcond=GAUGE_POLAR_RCOND,
+                                batched_route=dla.ROUTE_BATCH_RESHARD)
+    pad = lambda m: jnp.pad(m, ((0, 0), (0, n_blk - m.shape[1]), (0, n_blk - m.shape[2])))
+    stack = jax.jit(lambda x: jnp.concatenate([pad(x[:, :nv, :nv]), pad(x[:, nv:, nv:])]),
+                    out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(Xw)
+    link, sv = pol.batched(stack)
+    link = np.asarray(jax.jit(lambda a: a, out_shardings=rep)(link))
+    sv = np.asarray(sv)
+    U = np.zeros((nk_w, nb, nb), np.complex128)
+    U[:, :nv, :nv] = link[:nk_w, :nv, :nv]
+    U[:, nv:, nv:] = link[nk_w:, :nc, :nc]
+    s_v, s_c = sv[:nk_w, :nv], sv[nk_w:, :nc]
+    spread = max(float(np.max((s.max(1) - s.min(1)) / s.max(1))) for s in (s_v, s_c))
+    fig = {"lsq_residual_max": float(np.max(np.asarray(res))), "sv_spread_max": spread,
+           "cross_block_max": float(np.max(np.asarray(cross))),
+           "energy_mismatch_max_ry": float(np.max(de)), "wall_s": round(time.time() - t0, 3)}
     return U, fig
 
 
@@ -641,7 +707,7 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     if use_gauge_map:
         Ug, gfig = gauge_map(psi_win, wfn_co=wfn_co, k_rows=b2l, bands_abs=bands_abs,
                              centroid_frac=cent_frac, fft_grid=wfn.fft_grid, nv=n_val,
-                             enk_win=enk_win)
+                             enk_win=enk_win, mesh_xy=mesh_xy)
     else:
         Ug = np.broadcast_to(np.eye(n_val + n_cond), (nk, n_val + n_cond, n_val + n_cond)).copy()
         gfig = {"gauge_map": "identity (red twin)"}

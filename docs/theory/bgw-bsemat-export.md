@@ -138,7 +138,12 @@ wrong sign.
 BerkeleyGW combines the kernel with its own WFN coefficients. The writer therefore rotates
 ψ at the centroids into the WFN file's coefficient gauge with one window unitary
 per k, the polar factor of the least-squares fit of LORRAX's ψ by the file's
-states evaluated at the centroids (the dipfix construction).
+states evaluated at the centroids (the dipfix construction). The file's states
+reach the centroids through the GW face transform (`WfnLoader.load(k="ibz")`,
+the file's own rows, then `gflat_to_rmu`); the fit is batched over k on the mesh
+and the block polar factors are `distrib_la`'s batched polar, the
+parallel-transport route. `tests/test_bsemat_gauge_cpu.py` holds it to the
+per-k host fit and fails a re-phased file, a k mismatch and an aliased grid.
 
 ## The downfold stage {#downfold}
 
