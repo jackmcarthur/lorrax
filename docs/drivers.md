@@ -248,8 +248,14 @@ file's band window (an integer, `kx` = k·N_b of the parent's centroids with
 N_b = NV + NC, or `auto` for the eigenvalue-rank ceiling; `--downfold-rcond`) with
 the [downfold](downfold.md) driver's selection and transfer, and builds the rows
 by GEMMs over the small W; the theory page gives its measured accuracy. `--q0-body dipole` adds the
-3-D q0 body term from the bundle's stored q → 0 wings. [The theory
-page](theory/bgw-bsemat-export.md) owns the equations, the conventions and the
+3-D q0 body term from the bundle's stored q → 0 wings. `--kernel`
+(`--extended` = `--kernel extended`), `--gauge` (`--no-gauge-map` = `--gauge identity`),
+`--q0-body` and `--mu-small` each take several values; one run then writes one file
+per combination from a single load of the bundle, head split and gauge map, named
+`<stem>_<tag><ext>` after `-o` (for example `--kernel tda extended` writes
+`bsemat_tda.h5` and `bsemat_ext.h5`). Each `<file>.json` carries `stages`, the wall
+seconds of every stage, and rank 0 prints the `common.timing` stage table at the end.
+[The theory page](theory/bgw-bsemat-export.md) owns the equations, the conventions and the
 refusals.
 
 ## htransform — `bandstructure.htransform`
