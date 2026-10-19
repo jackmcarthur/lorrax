@@ -30,8 +30,12 @@ _STAGNATION_NODES = 24
 def _project(lo, hi, pole, times, decay_rate=0.):
     eta = abs(pole.imag)
     span, zp = (hi-lo)/eta, (pole-lo)/eta
+    # Fit rows: 1400 Chebyshev points, or two per node above 700 nodes.  A
+    # closed-form set of ~1640 nodes (ZnO crossing window) is nearly square on
+    # 1400 + 500 rows and oscillates between them; n <= 700 is unchanged, bitwise.
+    ncheb = max(1400, 2*np.size(times))
     x = np.unique(np.r_[0., span,
-        span/2*(1-np.cos(np.pi*(np.arange(1400)+.5)/1400)),
+        span/2*(1-np.cos(np.pi*(np.arange(ncheb)+.5)/ncheb)),
         zp.real+np.linspace(-5, 5, 500)])
     x = x[(x >= 0) & (x <= span)]
     f = 1/(x-zp)
