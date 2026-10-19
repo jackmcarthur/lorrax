@@ -30,6 +30,10 @@ SOLVE_RESIDUAL_TOL = 1.0e-6
 #: v₁ z V⁺ z* ≤ 1 is V_b = V − v₁ zᴴz ≽ 0, i.e. z is V's head row. A wrong
 #: (unfolded, conjugated, other-slot) z breaks it by O(1).
 HEAD_ROW_TOL = 1.0e-6
+#: s = aᴴ(W − V)a is invariant under the centroid action that carries the
+#: parent q to a star member. A key's s against its parent's beyond this
+#: (relative) means its W tile is not the parent's W under that action.
+ROTATION_S_TOL = 1.0e-8
 
 
 class HeadSplit(NamedTuple):
@@ -43,6 +47,44 @@ class HeadSplit(NamedTuple):
     y: object
     z: object
     figures: dict
+
+
+def head_solve(lam, U, z, *, xp=np, rcond=RCOND):
+    """E3: ``a = V⁺ z*`` from V's eigenpairs, and the kept rank.
+
+    ``lam`` (μ,) ascending (real part used) and ``U`` (μ, μ) columns of the
+    Hermitian V; ``z`` (μ,) the head column. The span cut keeps
+    λ > rcond · λ_max, the one rule every caller uses. The eigenpairs may come
+    from V itself or from a parent tile V_q of which V = M V_q M† (``M`` a
+    centroid action): the spectrum is the same, so is the cut.
+    """
+    lam = xp.asarray(lam).real
+    keep = lam > rcond * xp.max(lam)
+    inv = xp.where(keep, 1.0 / xp.where(keep, lam, 1.0), 0.0)
+    a = U @ (inv * (xp.conj(U).T @ xp.conj(z)))             # V⁺ z*   (E3)
+    return a, xp.sum(keep)
+
+
+def head_rows(V, W, z, a, v1, *, rank, xp=np):
+    """E3 residual, E4 and E5 at one q from a solution ``a`` of ``V a = z*``.
+
+    ``a`` may be any solution: r and s do not see its ker V part (E3), so a
+    solve rotated in from the parent q serves the star member's own tiles.
+    ``rank`` is the kept rank of the solve that produced ``a`` (a figure).
+    Shapes and units as :func:`head_split`.
+    """
+    zc = xp.conj(z)
+    resid = float(xp.linalg.norm(V @ a - zc) / xp.linalg.norm(zc))
+    D = W - V
+    r = xp.conj(a) @ D                                       # aᴴ(W − V), row
+    s = float(xp.real(r @ a))
+    W11 = float(v1 + v1 * v1 * s)                            # (E4)
+    y = v1 * r - (v1 * v1 * s) * z                           # (E5)
+    head_row = float(v1 * xp.real(z @ a))                    # v₁ z V⁺ z*
+    figures = {"solve_residual": resid, "head_row": head_row,
+               "eps_inv_head": W11 / float(v1), "rank": int(rank),
+               "s": s}
+    return HeadSplit(W11, y, z, figures)
 
 
 def head_split(V, W, z, v1, *, eigh, xp=np, rcond=RCOND):
@@ -67,22 +109,8 @@ def head_split(V, W, z, v1, *, eigh, xp=np, rcond=RCOND):
     HeadSplit
     """
     lam, U = eigh(V)
-    lam = xp.asarray(lam).real
-    keep = lam > rcond * xp.max(lam)
-    inv = xp.where(keep, 1.0 / xp.where(keep, lam, 1.0), 0.0)
-    zc = xp.conj(z)
-    a = U @ (inv * (xp.conj(U).T @ zc))                     # V⁺ z*   (E3)
-    resid = float(xp.linalg.norm(V @ a - zc) / xp.linalg.norm(zc))
-    D = W - V
-    r = xp.conj(a) @ D                                       # aᴴ(W − V), row
-    s = float(xp.real(r @ a))
-    W11 = float(v1 + v1 * v1 * s)                            # (E4)
-    y = v1 * r - (v1 * v1 * s) * z                           # (E5)
-    head_row = float(v1 * xp.real(z @ a))                    # v₁ z V⁺ z*
-    figures = {"solve_residual": resid, "head_row": head_row,
-               "eps_inv_head": W11 / float(v1), "rank": int(xp.sum(keep)),
-               "s": s}
-    return HeadSplit(W11, y, z, figures)
+    a, rank = head_solve(lam, U, z, xp=xp, rcond=rcond)
+    return head_rows(V, W, z, a, v1, rank=rank, xp=xp)
 
 
 def check_split(split: HeadSplit, *, where: str):
@@ -106,6 +134,21 @@ def check_split(split: HeadSplit, *, where: str):
             f"{f['eps_inv_head']:.6f}; want in (0, 1]; why: a static "
             "screened head lies between 0 and the bare v; fix: W is not the "
             "static W0 of this V.")
+
+
+def check_rotation(split: HeadSplit, s_parent: float, *, where: str):
+    """Refuse a key whose s differs from its parent q's (rule id, got, want, why, fix)."""
+    s = float(split.figures["s"])
+    rel = abs(s - float(s_parent)) / max(abs(float(s_parent)), 1e-300)
+    if not rel <= ROTATION_S_TOL:
+        raise ValueError(
+            f"GATE bsemat_head_rotation: {where}: |s - s_parent|/|s_parent| = "
+            f"{rel:.3e}; want <= {ROTATION_S_TOL:g}; why: s is invariant under "
+            "the centroid action that carries the parent q to this star "
+            "member, so this W tile is not the parent's W under the action "
+            "that carried a; fix: the restart's W and V q-star tables differ, "
+            "or W was unfolded by another rule.")
+    return rel
 
 
 def pair_amplitudes(psi_l, psi_r, xp=np):

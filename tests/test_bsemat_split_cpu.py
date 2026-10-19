@@ -6,14 +6,18 @@ a dominant head slot, a negative-semidefinite μ-space χ, ``V = Zᴴ v Z``,
 file-only split (E3–E6) and the kernel parts (E7) must equal the
 plane-wave head/wing/body of E1 to rounding, with V full rank (N_G > N_μ)
 and rank-deficient (N_G < N_μ, the stored-sphere case). Red twins: dropping
-E5's head term, conjugating z, and V in place of W − V each fail.
+E5's head term, conjugating z, and V in place of W − V each fail. The split
+of a star member from its parent's solve (one eigh per wedge q, a carried as
+ζ is) equals the member's own solve, unitary and antiunitary; a wrong
+centroid permutation or a missing conjugation is refused by the gates.
 Unit cells: exempt from the four-GPU rule (pure host algebra).
 """
 import numpy as np
 import pytest
 
 from bse.bsemat_algebra import (add_q0_body_update, direct_parts, exchange_part,
-                                head_split, check_split, q0_dipole_body_rows)
+                                head_rows, head_solve, head_split, check_rotation, check_split,
+                                q0_dipole_body_rows)
 
 OMEGA = 270.0
 
@@ -210,3 +214,89 @@ def test_downfold_carries_the_parent_split():
     assert sc.figures["solve_residual"] < 1e-9
     assert sc.figures["head_row"] < 1 - 1e-6
     assert abs(sc.W11 - sp.W11) > 1e-6 * abs(sp.W11)
+
+
+def _star_member(seed, n_g, n_mu, antiunitary):
+    """A parent q and one star member S q in the convention of symmetry_maps' unfolds.
+
+    Z_Sq[σ(g), μ] = c_g φ_μ Z_q[g, π(μ)] (conjugated when antiunitary), v_Sq[σ(g)] = v_q[g]
+    and χ carried by the same centroid action, so V_Sq = M V_q M† and W_Sq = M W_q M†
+    (unfold_isdf_operator) while ζ columns move by unfold_isdf_one_leg's rule
+    u(x)[μ] = c φ_μ x[π(μ)] (conjugated when antiunitary).
+    """
+    rng, Zp, vp, Vp, Wp, _ = _system(n_g, n_mu, seed=seed)
+    A_ = (rng.standard_normal((n_mu, n_mu)) + 1j * rng.standard_normal((n_mu, n_mu))) / n_mu
+    chi_p = -0.5 * A_ @ A_.conj().T
+    Vp = Zp.conj().T @ (vp[:, None] * Zp)
+    Wp = np.linalg.solve(np.eye(n_mu) - Vp @ chi_p, Vp)
+    pi = rng.permutation(n_mu)
+    phi = np.exp(2j * np.pi * rng.uniform(size=n_mu))
+    c = np.exp(2j * np.pi * rng.uniform(size=n_g))
+    sig = rng.permutation(n_g)
+    cj = np.conj if antiunitary else (lambda x: x)
+    Zk = np.empty_like(Zp)
+    Zk[sig] = cj(c[:, None] * phi[None, :] * Zp[:, pi])
+    vk = np.empty_like(vp)
+    vk[sig] = vp
+    M = np.zeros((n_mu, n_mu), complex)
+    M[np.arange(n_mu), pi] = np.conj(phi)
+    chi_k = cj(M @ chi_p @ M.conj().T)
+    Vk = Zk.conj().T @ (vk[:, None] * Zk)
+    Wk = np.linalg.solve(np.eye(n_mu) - Vk @ chi_k, Vk)
+    Wpw_k = np.linalg.solve(np.eye(n_g) - (vk[:, None] * Zk) @ chi_k @ Zk.conj().T, np.diag(vk))
+    unfold = lambda x, perm=pi: cj(c[0] * phi * x[perm])                 # the head slot's carrier
+    return dict(Zp=Zp, vp=vp, Vp=Vp, Wp=Wp, Zk=Zk, vk=vk, Vk=Vk, Wk=Wk, Wpw_k=Wpw_k,
+                head_k=int(sig[0]), unfold=unfold, pi=pi)
+
+
+@pytest.mark.parametrize("antiunitary", [False, True])
+@pytest.mark.parametrize("n_g,n_mu", [(60, 24), (16, 24)])
+def test_split_from_parent_solve_equals_members_own(n_g, n_mu, antiunitary):
+    """The member's split from the parent's eigh, a carried as ζ is, equals its own split and the PW truth."""
+    m = _star_member(5 + n_g, n_g, n_mu, antiunitary)
+    zp, zk, g1 = m["Zp"][0], m["Zk"][m["head_k"]], m["head_k"]
+    assert np.allclose(m["unfold"](zp), zk, atol=1e-13)                 # the model unfold is ζ's
+    assert np.allclose(m["Zk"].conj().T @ m["Wpw_k"] @ m["Zk"], m["Wk"], atol=1e-10)
+    v1 = float(m["vp"][0])
+    assert v1 == float(m["vk"][g1])
+    lam, U = _eigh(m["Vp"])
+    a_p, rank_p = head_solve(lam, U, zp)
+    sp_p = head_rows(m["Vp"], m["Wp"], zp, a_p, v1, rank=rank_p)
+    a_k = np.conj(m["unfold"](np.conj(a_p)))                            # conj(a) moves as z
+    rot = head_rows(m["Vk"], m["Wk"], zk, a_k, v1, rank=rank_p)
+    direct = head_split(m["Vk"], m["Wk"], zk, v1, eigh=_eigh)
+    check_split(rot, where="rotated")
+    assert check_rotation(rot, sp_p.figures["s"], where="rotated") < 1e-12
+    assert rot.figures["rank"] == direct.figures["rank"]               # same spectrum, same cut
+    assert abs(rot.W11 - direct.W11) < 1e-11 * abs(direct.W11)
+    assert np.linalg.norm(rot.y - direct.y) < 1e-10 * np.linalg.norm(direct.y)
+    rest = np.delete(np.arange(n_g), g1)                                # and both are the PW head row
+    assert abs(rot.W11 - m["Wpw_k"][g1, g1].real) < 1e-9 * abs(m["Wpw_k"][g1, g1])
+    y_pw = m["Wpw_k"][g1, rest] @ m["Zk"][rest]
+    assert np.linalg.norm(rot.y - y_pw) < 1e-9 * np.linalg.norm(y_pw)
+
+
+@pytest.mark.parametrize("antiunitary", [False, True])
+def test_split_from_parent_red_twins(antiunitary):
+    """A wrong centroid permutation, or the conjugation dropped on an antiunitary row, is refused."""
+    m = _star_member(17, 60, 24, antiunitary)
+    zp, zk = m["Zp"][0], m["Zk"][m["head_k"]]
+    v1 = float(m["vp"][0])
+    lam, U = _eigh(m["Vp"])
+    a_p, rank_p = head_solve(lam, U, zp)
+    bad = m["pi"].copy()
+    bad[[0, 1]] = bad[[1, 0]]                                           # two centroids swapped
+    a_bad = np.conj(m["unfold"](np.conj(a_p), perm=bad))
+    with pytest.raises(ValueError, match="bsemat_head_solve"):
+        check_split(head_rows(m["Vk"], m["Wk"], zk, a_bad, v1, rank=rank_p), where="red twin")
+    a_flip = m["unfold"](np.conj(a_p))                                 # conjugation dropped / added
+    with pytest.raises(ValueError, match="bsemat_head_solve"):
+        check_split(head_rows(m["Vk"], m["Wk"], zk, a_flip, v1, rank=rank_p), where="red twin")
+    # a W tile carried by another action: the residual passes, the s invariance refuses it
+    sp_p = head_rows(m["Vp"], m["Wp"], zp, a_p, v1, rank=rank_p)
+    a_k = np.conj(m["unfold"](np.conj(a_p)))
+    W_bad = m["Wk"] + 1e-3 * m["Vk"] @ m["Vk"]
+    sp_bad = head_rows(m["Vk"], W_bad, zk, a_k, v1, rank=rank_p)
+    check_split(sp_bad, where="red twin W")
+    with pytest.raises(ValueError, match="bsemat_head_rotation"):
+        check_rotation(sp_bad, sp_p.figures["s"], where="red twin W")
