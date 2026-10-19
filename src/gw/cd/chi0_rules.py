@@ -58,9 +58,9 @@ _SLICED = ("value", "derivative", "sampled_error", "coefficient_mass")
 
 
 def cd_max_kappa(tolerance):
-    """The CD mass gate: the bank's ``_RESPONSE_MAX_KAPPA``, or larger where kappa * eps <= 1 % of tol."""
-    from minimax import complex_response as cr
-    return max(float(cr._RESPONSE_MAX_KAPPA),
+    """The CD mass gate: the bank's ``minimax.RESPONSE_MAX_KAPPA``, or larger where kappa * eps <= 1 % of tol."""
+    import minimax
+    return max(float(minimax.RESPONSE_MAX_KAPPA),
                CD_KAPPA_ROUNDING_SHARE * float(tolerance) / float(np.finfo(np.float64).eps))
 
 

@@ -19,6 +19,8 @@ RESPONSE_RULE_CAPACITY = 192
 # single sample whose forward and reverse poles need separate sets uses two.
 RESPONSE_NODE_CAPACITY = 2*RESPONSE_RULE_CAPACITY
 _RESPONSE_MAX_KAPPA = 5000.
+#: Public name of the bank's coefficient-mass gate (``minimax.RESPONSE_MAX_KAPPA``; read by gw.cd.chi0_rules).
+RESPONSE_MAX_KAPPA = _RESPONSE_MAX_KAPPA
 # A group's pencil geometry is abandoned after this many more exponentials
 # without a decade of accuracy; the next geometry, then a smaller group, is
 # tried. A single sample keeps the full scan, so it never refuses earlier.
