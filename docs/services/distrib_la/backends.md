@@ -59,13 +59,9 @@ re-interpreting the dial:
 
 The charge ζ factor is the rank-truncating eigh pseudo-inverse in both
 layouts, and its eigh is always the replicated local one:
-it is the only route that carries the rank conditioning of $V_q$, and a
-block-cyclic factor would make its result depend on the grid, which GN-PPM
-amplifies. It therefore runs replicated, one q-batch at a time. When one batch
-`q_batch·n_μ²·16 B` exceeds `LORRAX_ZETA_REPLICATE_CAP_GIB` (default 4 GiB),
-`isdf.core._rank_truncate_capacity_error` refuses and names the cap that would
-clear it. Raising the cap lets the route resolve but does not shrink the work:
-each rank still solves `⌈n_q/P⌉` dense `n_μ × n_μ` eigenproblems. Per-stage
+it carries the rank conditioning of $V_q$. Its eigh runs on the face through the
+checked plan (`isdf.core._factor_c_q_face`), checked on the kept columns; the kept
+rank can differ between grids only for an eigenvalue within rounding of the cut. Per-stage
 plans and per-rank memory are in
 [dense solves and GEMMs on P devices](../../architecture/dense_linear_algebra.md#stage-plans).
 

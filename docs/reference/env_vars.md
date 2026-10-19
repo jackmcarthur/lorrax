@@ -51,7 +51,6 @@ with the run.
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
-| `LORRAX_ZETA_REPLICATE_CAP_GIB` | `4` | routing-affecting | Float GiB, read at import of `isdf/core.py` (a malformed value fails the import). Cap on the `(nq, μ, μ)` c128 charge stack below which the ζ factor is replicated, and therefore mesh-invariant; above it `rank_truncate` refuses and names the value to set. |
 | `LORRAX_WFN_BACKEND` | unset (auto) | routing-affecting | Stripped, lower-cased: `eager` or `phdf5` forces the WFN read backend (`services/wfn_loader/src/wfn_loader/loader.py::_auto_pick_backend`); `phdf5_host` refuses; any other value takes the auto pick without comment. A mesh-less loader always reads eager. At P>1 with no loadable FFI the auto pick refuses, and `eager` is the way through. |
 
 ---

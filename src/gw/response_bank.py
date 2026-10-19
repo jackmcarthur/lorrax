@@ -1029,8 +1029,8 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
     # The checked eigh returns its status: no host callback.
     @partial(checked_program, mesh=mesh_xy, out_shardings=(face, face, rep, rep), in_shardings=(face,))
     def sqrt_v(value):
-        lam, vectors = eig.batched(value)
         tolerance = n_logical * np.finfo(np.float64).eps
+        lam, vectors = eig.batched(value, cut=tolerance)     # checked on the supported columns
         scale = jnp.max(jnp.abs(lam), axis=-1, keepdims=True)
         supported = lam > tolerance * scale
         root = jnp.sqrt(jnp.where(supported, lam, 0.0))
