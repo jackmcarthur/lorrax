@@ -109,8 +109,7 @@ def _slow_basis_rows():
     step = D.slow_basis_step(apply, jnp.asarray(rho_eq), jnp.asarray(e_qp), jnp.asarray(f_eq))
     rows = {}
     r0 = np.broadcast_to(rho_eq, (ntr, nk, nb, nb)).copy()
-    U, E, f, _, rec = D.collision_basis_state(step, jnp.asarray(K), jnp.asarray(r0),
-                                              jnp.asarray(f_eq), 0.0)
+    U, E, f, _, rec = D.collision_basis_state(step, jnp.asarray(K), jnp.asarray(r0), 0.0)
     U, E, f = D._track_bands(U, E, f)
     rows["IS_eq"] = max(float(np.max(np.abs(U - np.eye(nb)))), float(np.max(np.abs(E - e_qp))),
                         float(np.max(np.abs(f - f_eq))), float(rec["residual"]))
@@ -118,11 +117,10 @@ def _slow_basis_rows():
     rho = np.stack([0.85 * rho_eq + 0.15 * FR._random_rho(rng, nk, nb, coh=0.3)
                     for _ in range(ntr)])
     rho = FR._herm(rho)
-    rec_prod = D.collision_basis_state(step, jnp.asarray(K), jnp.asarray(rho),
-                                       jnp.asarray(f_eq), 0.0)[4]
+    rec_prod = D.collision_basis_state(step, jnp.asarray(K), jnp.asarray(rho), 0.0)[4]
     rows["IS_production_tol"] = dict(tol=D.DRESS_TOL, **rec_prod)
-    U, E, f, _, rec = D.collision_basis_state(step, jnp.asarray(K), jnp.asarray(rho),
-                                              jnp.asarray(f_eq), 0.0, steps=64, tol=1e-12)
+    U, E, f, _, rec = D.collision_basis_state(step, jnp.asarray(K), jnp.asarray(rho), 0.0,
+                                              steps=64, tol=1e-12)
     U, E, f = D._track_bands(U, E, f)
     Uh = np.conj(np.swapaxes(U, -1, -2))
     P = (U * (f - f_eq[None])[..., None, :]) @ Uh

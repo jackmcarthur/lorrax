@@ -1549,36 +1549,47 @@ INTERNAL_PAIRINGS = ("symmetric", "vertex")
 def slow_basis_step(apply, rho_eq, e_qp, f_eq):
     """One evaluation of the collision basis map (td_agw_dynamical.md §1.5, Eq. 8b), jitted.
 
-    (params, rho, P, t) -> (U, E, f, P_out, residual, dSigma): H_slow = diag(e) +
+    ``step(params, rho, P, t)`` -> (U, E, f, P_out, residual, dSigma): H_slow = diag(e) +
     dSigma, dSigma = apply(params, rho_eq + P, t) (``apply`` the propagator's, its held
     term included: the drive and the coherences' O(E) mean field are left out), (U, E, f)
     = :func:`instantaneous_basis` (H_slow, rho), P_out = U diag(f - f_eq) U^H and the
-    residual max|P_out - P|.  rho, P (ntr, nk, nb, nb); rho_eq (nk, nb, nb); e_qp, f_eq
-    (nk, nb): the propagator's layout and units (Ha).
+    residual max|P_out - P|; ``step.start(rho)`` the map's start, P = diag(rho) - diag(f_eq)
+    (U = 1, f = diag rho).  rho, P (ntr, nk, nb, nb); rho_eq (nk, nb, nb); e_qp, f_eq
+    (nk, nb): the propagator's layout and units (Ha).  The operators enter the programs
+    as arguments (a multi-process array cannot be a closed-over constant).
     """
     nb = int(e_qp.shape[-1])
-    idx = jnp.arange(nb)
-    h0 = jnp.zeros(rho_eq.shape, rho_eq.dtype).at[:, idx, idx].set(e_qp.astype(rho_eq.dtype))
 
-    def step(params, rho, P, t):
+    def _step(params, rho, P, t, rho_eq, e_qp, f_eq):
+        idx = jnp.arange(nb)
+        h0 = jnp.zeros(rho_eq.shape, rho_eq.dtype).at[:, idx, idx].set(e_qp.astype(rho_eq.dtype))
         dsig = apply(params, rho_eq[None] + P, t)
         U, e, f = instantaneous_basis(h0[None] + dsig, rho)
         P_out = (U * (f - f_eq[None]).astype(U.dtype)[..., None, :]) @ jnp.conj(
             jnp.swapaxes(U, -1, -2))
         return U, e, f, P_out, jnp.max(jnp.abs(P_out - P)), dsig
-    return jax.jit(step)
+
+    def _start(rho, f_eq):
+        d = jnp.real(jnp.diagonal(rho, axis1=-2, axis2=-1)) - f_eq[None]
+        return d.astype(rho.dtype)[..., :, None] * jnp.eye(rho.shape[-1], dtype=rho.dtype)
+
+    run, start = jax.jit(_step), jax.jit(_start)
+
+    def step(params, rho, P, t):
+        return run(params, rho, P, t, rho_eq, e_qp, f_eq)
+    step.start = lambda rho: start(rho, f_eq)
+    return step
 
 
-def collision_basis_state(step, params, rho, f_eq, t, *, steps: int = DRESS_STEPS,
+def collision_basis_state(step, params, rho, t, *, steps: int = DRESS_STEPS,
                           tol: float = DRESS_TOL):
-    """The fixed point of :func:`slow_basis_step`: plain evaluations from P = diag(rho) -
-    diag(f_eq) (U = 1, f = diag rho), at most ``steps``, stopped at residual <= ``tol``.
+    """The fixed point of :func:`slow_basis_step`'s map from ``step.start(rho)``: at most
+    ``steps`` evaluations, stopped at residual <= ``tol``.
 
     Returns U, E (Ha), f, the dSigma of H_slow (device, the propagator's layout) and
     dict(residual, iterations).
     """
-    d = jnp.real(jnp.diagonal(rho, axis1=-2, axis2=-1)) - f_eq[None]
-    P = d.astype(rho.dtype)[..., :, None] * jnp.eye(rho.shape[-1], dtype=rho.dtype)
+    P = step.start(rho)
     res, it = float("nan"), 0
     for it in range(1, int(steps) + 1):
         U, E, f, P, r, dsig = step(params, rho, P, t)
@@ -1878,7 +1889,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         e_g_td = to_td(e_g)
         rho_eq_td = np.asarray(gather_to_host(ops.rho_eq))[:nk]
         slow_apply = model.apply if hermitian == "none" else with_held_term(model, None).apply
-        f_eq_dev = jnp.real(jnp.diagonal(ops.rho_eq, axis1=-2, axis2=-1))
+        f_eq_dev = jax.jit(lambda r: jnp.real(jnp.diagonal(r, axis1=-2, axis2=-1)))(ops.rho_eq)
         step = slow_basis_step(slow_apply, ops.rho_eq, ops.e_qp, f_eq_dev)
 
     def basis_at(rho_dev, params, t):
@@ -1888,7 +1899,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         split into K = dSigma - held and the held Delta Sigma^h: max and rms over k and
         window states of |E - eps^G| and of diag(U^H X U), and max |offdiag X| in the
         band basis."""
-        U, E, f, dsig, rec = collision_basis_state(step, params, rho_dev, f_eq_dev, t)
+        U, E, f, dsig, rec = collision_basis_state(step, params, rho_dev, t)
         U, E, f = _track_bands(np.asarray(gather_to_host(U))[:, :nk],
                                np.asarray(gather_to_host(E))[:, :nk],
                                np.asarray(gather_to_host(f))[:, :nk])
