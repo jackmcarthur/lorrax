@@ -156,21 +156,12 @@ class MeasuredRow:
     source: str = ""
 
 
-def heevd_bytes(n, p, item):
-    """LAPACK ?heevd/?syevd optimal lwork, lrwork and liwork, bytes."""
-    if item == 16:
-        return 16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) + 4 * (3 + 5 * n)
-    return 8 * (1 + 6 * n + 2 * n * n) + 4 * (3 + 5 * n)
-
-
 HOST = PlatformLeg(
     key="cpu", vendor="cpu",
     so_name="liblorrax_ffi_host.so", so_env="LORRAX_FFI_HOST_SO",
     build_subdir="build_host", c_abi_suffix="_host",
     abi_symbol="lorrax_ffi_host_abi_version", accelerator=False,
-    jax_platforms=("cpu",), memory_reserve=0.18567,
-    vendor_rows=((("lapack", "heevd"), MeasuredRow(
-        1.0, heevd_bytes, "LAPACK heevd workspace", source="LAPACK optimal workspace, exact")),))
+    jax_platforms=("cpu",), memory_reserve=0.18567)
 
 #: Every leg, by XLA platform key.  The CUDA library keeps its historical
 #: file name and pin (``liblorrax_ffi.so``, ``LORRAX_FFI_SO``) so sealed
@@ -209,14 +200,10 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         node_devices=4,                  # Perlmutter GPU node: 4 A100
         peak_reader="pool",
         vendor_rows=(
-            (("cusolverdn", "heevd"), MeasuredRow(
-                2.0, heevd_bytes, "LAPACK heevd workspace", n=(4096, 41250), p=(1, 1),
-                source="cusolverDnXsyevd_bufferSize = 2.0 x LAPACK, exact at n 4096-41250, "
-                       "A100 (eighmem 2026-10)")),
             (("cusolvermp", "solve_lu"), MeasuredRow(
                 11.2, None, "local LU panels (n/Px + mb) nb", n=(4096, 30000),
                 p=(4, 4), source="lrx_lu_workspace_bytes 9.64-11.16 panels (getrf, getrs "
-                "nrhs = n, pivots), 2x2 A100, 2026-10-19, max taken; 4x4 unmeasured")))),
+                "nrhs = n, pivots), 2x2 A100, 2026-10-19, max taken; 4x4 unmeasured")),)),
     "ROCM": PlatformLeg(
         key="ROCM", vendor="rocm",
         so_name="liblorrax_ffi_rocm.so", so_env="LORRAX_FFI_ROCM_SO",

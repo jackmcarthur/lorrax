@@ -42,19 +42,20 @@ def _plan(mesh):
                 requested_batched_route="auto", budget_bytes=1 << 30)
 
 
-def test_stack_route_is_priced_from_the_shapes():
-    """Eager and traced decisions take the same shape price: no sizing compile, no exchange."""
+def test_stack_route_is_priced_from_its_compiled_program():
+    """A decision takes its phase's program compiled at the abstract stack (never run): the
+    eager first attempt and the traced whole chain each at their own figure, no exchange."""
     plan_mod = importlib.import_module("distrib_la.plan")
     plan_mod._STACK_ROUTES.clear()
     p = _plan(_mesh())
     traced = p.stack_route((4, 8, 8), np.complex128, traced=True)
     eager = p.stack_route((4, 8, 8), np.complex128, traced=False)
-    price = plan_mod._stack_price("eigh", _mesh(), 4, 8, "complex128", 1,
-                                  plan_mod._gathered_admitted((8, 8), "complex128"))
+    gathered = plan_mod._gathered_admitted(_mesh(), (8, 8), "complex128", 1 << 30)
+    price = lambda phase: plan_mod._stack_bytes("eigh", _mesh(), 4, 8, "complex128", 1, phase, gathered)
     assert traced.route == eager.route == plan_mod.ROUTE_BATCH_RESHARD
-    assert traced.program_bytes == eager.program_bytes == price
-    assert price >= 4 * plan_mod.BATCH_EIGH_TILES * 8 * 8 * 16 and eager.per_rank == 4 and eager.rounds == 1
-    assert "priced from the shapes" in plan_mod._describe_stack(eager)
+    assert traced.program_bytes == price("all") and eager.program_bytes == price("first")
+    assert 0 < eager.program_bytes <= traced.program_bytes and eager.per_rank == 4 and eager.rounds == 1
+    assert "compiled, never run" in plan_mod._describe_stack(eager)
 
 
 def test_face_plans_differ_by_room_share_programs(monkeypatch):
@@ -76,7 +77,7 @@ def test_face_plans_differ_by_room_share_programs(monkeypatch):
 def test_program_keys_hold_no_site_or_budget():
     import inspect
     plan_mod = importlib.import_module("distrib_la.plan")
-    for fn in (plan_mod._stack_price, plan_mod._reshard_stack_program):
+    for fn in (plan_mod._stack_bytes, plan_mod._reshard_stack_program):
         names = inspect.signature(getattr(fn, "__wrapped__", fn)).parameters
         assert not {"site", "budget_bytes", "room"} & set(names), (fn.__name__, list(names))
 

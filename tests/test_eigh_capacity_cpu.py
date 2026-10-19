@@ -102,9 +102,9 @@ def test_auto_with_room_equals_distributed_where_it_resolves(mesh, monkeypatch):
     assert dataclasses.replace(a, requested="distributed") == d
     ra = dataclasses.replace(a, budget_bytes=1 << 30).stack_route((4, 8, 8), np.complex128)
     assert ra == dataclasses.replace(d, budget_bytes=1 << 30).stack_route((4, 8, 8), np.complex128)
-    for p in (a, d):                  # a whole mesh over the room: refused by name, alike
-        with pytest.raises(RuntimeError, match="GATE distrib_la_capacity"):
-            dataclasses.replace(p, budget_bytes=10).stack_route((4, 8, 8), np.complex128)
+    for p in (a, d):                  # the library does not lower on this host: unpriced, alike
+        r = dataclasses.replace(p, budget_bytes=10).stack_route((4, 8, 8), np.complex128)
+        assert r.route != plan_mod.ROUTE_BATCH_RESHARD and r.program_bytes is None
         # no room: refused where the plan is built, not at the stack
         with pytest.raises(RuntimeError, match="GATE distrib_la_room"):
             dataclasses.replace(p, budget_bytes=0)
