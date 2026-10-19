@@ -1,6 +1,6 @@
 """LORRAX static W -> BerkeleyGW 4.0 ``bsemat.h5`` (TDA or extended); see docs/theory/bgw-bsemat-export.md.
 
-The outline, in the order it runs:
+The outline, in the order it runs. Once per restart (``_export_context``):
 
 1. the restart bundle at full q (``bse_loading``): ψ at the centroids, V(q),
    W(q) and the head-less Γ tiles, all canonical centroid order;
@@ -9,9 +9,14 @@ The outline, in the order it runs:
 3. the file-only split E3–E5 (``bse.bsemat_algebra``): one batched eigh of V per
    wedge q, the solve carried to every head key as ζ is, E3–E5 on each key's
    own V/W faces with its gates (``head_split_keys``);
-4. the gauge map of ψ into the coarse WFN's coefficient gauge;
-5. one k′ row of the file at a time: E7 against W(k − k′) for all k, then the
-   exchange row, each written as one hyperslab per matrix through SlabIO.
+4. the gauge map of ψ into the coarse WFN's coefficient gauge.
+
+Then once per file written (``_write_output``; ``run_bsemat_exports`` writes
+several from one load): the q → 0 body, ψ in the file's gauge and band order,
+the optional downfold, and one k′ row of the file at a time: E7 against
+W(k − k′) for all k, then the exchange row, each written as one hyperslab per
+matrix through SlabIO. Every stage is a ``common.timing`` row
+(``SHARED_STAGES``, ``OUTPUT_STAGES``).
 
 Staging: W and V stay resident at ``P('x','y',None)``. A row materialises
 C (n_k, n²·μ/√P), W permuted to the row's q order, and the (n_k, n², n²) outputs,
@@ -29,6 +34,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+import common.timing as timing
 from . import bsemat_algebra as A
 
 EIGHT_PI = 8.0 * np.pi
@@ -665,6 +671,51 @@ def _ri(a):
 # driver
 # ---------------------------------------------------------------------------
 
+#: The writer's ``common.timing`` rows, in run order. The shared stages run once
+#: per process (top-level ``bsemat.<stage>``); the output stages run once per file
+#: written (children of ``bsemat.output``). The CLI adds the pre-``main`` rows
+#: ``bsemat.runtime_stack.<phase>`` and ``bsemat.imports`` (``runtime.run_session``).
+SHARED_STAGES = ("deferred_imports", "restart_load", "wfn_co_read", "head_columns", "head_split",
+                 "psi_gauge")
+OUTPUT_STAGES = ("q0_body", "psi_map", "downfold", "rows", "exchange", "write")
+_OPEN_STAGE = []
+
+
+def _stage(name, *, error=None):
+    """Close the running shared-stage section, then open ``bsemat.<name>`` (``None``: close only).
+
+    The shared stages are consecutive spans of one body (``_export_context``),
+    marked in sequence rather than indented into ``with`` blocks so each span's
+    code reads as it does in a one-stage edit. ``error`` closes a span an
+    exception left open (``run_bsemat_exports``). Rank 0 announces each span's
+    entry and exit, with a 60 s heartbeat while it runs (``common.timing``).
+    """
+    if _OPEN_STAGE:
+        sec = _OPEN_STAGE.pop()
+        sec.__exit__(None if error is None else type(error), error, None)
+    if name is not None:
+        sec = timing.section(f"bsemat.{name}", announce=True)
+        sec.__enter__()
+        _OPEN_STAGE.append(sec)
+
+
+def _stage_walls(parent=()):
+    """``{name: inclusive s}`` of the ``common.timing`` rows directly under the path ``parent``."""
+    d = len(parent)
+    return {str(r["name"]): float(r["inclusive"]) for r in timing.records()
+            if r["depth"] == d and tuple(r["path"][:d]) == tuple(parent)}
+
+
+def output_spec(out_path, *, extended=False, use_gauge_map=True, q0_body="head_less",
+                q0_vector=None, q0_body_update=None, mu_small=None, downfold_rcond=None):
+    """One file of an export: ``run_bsemat_export``'s per-file options as a plain dict."""
+    if q0_body not in ("head_less", "dipole"):
+        raise ValueError(f"q0_body must be head_less or dipole, got {q0_body!r}")
+    return dict(out_path=out_path, extended=bool(extended), use_gauge_map=bool(use_gauge_map),
+                q0_body=q0_body, q0_vector=q0_vector, q0_body_update=q0_body_update,
+                mu_small=mu_small, downfold_rcond=downfold_rcond)
+
+
 def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=False,
                       use_gauge_map=True, rcond=A.RCOND, bgw_eps=None, q0_body="head_less",
                       q0_vector=None, q0_body_update=None, mu_small=None,
@@ -685,7 +736,74 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     ``mu_small`` (int or ``"auto"``) runs the downfold on the file's band window
     before the rows (``_downfold_stage``), at ``downfold_rcond`` (default the
     downfold driver's); ``None`` builds the rows on the parent's μ.
+    One file of ``run_bsemat_exports``, which shares the load across files.
     """
+    return run_bsemat_exports(
+        input_file=input_file, wfn_co=wfn_co, n_val=n_val, n_cond=n_cond, rcond=rcond,
+        bgw_eps=bgw_eps, mesh_xy=mesh_xy,
+        outputs=[output_spec(out_path, extended=extended, use_gauge_map=use_gauge_map,
+                             q0_body=q0_body, q0_vector=q0_vector,
+                             q0_body_update=q0_body_update, mu_small=mu_small,
+                             downfold_rcond=downfold_rcond)])[0]
+
+
+def run_bsemat_exports(*, input_file, wfn_co, n_val, n_cond, outputs, rcond=A.RCOND,
+                       bgw_eps=None, mesh_xy):
+    """Write several bsemat files from one load of the deck's restart; one summary per file.
+
+    ``outputs`` are ``output_spec`` dicts with distinct ``out_path``; they may differ
+    in kernel form, gauge, q → 0 body and downfold. The bundle, BerkeleyGW's head
+    momenta and ζ columns, the split (E3–E5) and the gauge map are built once
+    (``_export_context``); each file then applies its own q → 0 body, ψ map,
+    downfold and rows (``_write_output``), and files of one shape reuse the
+    compiled row kernels. The split reads W only at q ≠ 0, so a per-file q → 0
+    body leaves it exact, and every file equals its one-file export bit for bit
+    (tests/test_bsemat_multi_cpu.py). Each summary carries ``stages`` (the shared
+    stages' and its own walls, s), ``wall_shared_s``, and ``wall_total_s`` from
+    the start of the export to the end of that file.
+    """
+    outputs = list(outputs)
+    paths = [os.path.abspath(o["out_path"]) for o in outputs]
+    if not paths or len(set(paths)) != len(paths):
+        raise ValueError(f"run_bsemat_exports: want one or more distinct output paths, got {paths}")
+    t0, w0 = time.time(), _stage_walls()
+    try:
+        ctx = _export_context(input_file=input_file, wfn_co=wfn_co, n_val=n_val, n_cond=n_cond,
+                              rcond=rcond, bgw_eps=bgw_eps,
+                              use_gauge_map=any(o["use_gauge_map"] for o in outputs),
+                              mesh_xy=mesh_xy)
+    except BaseException as exc:
+        _stage(None, error=exc)
+        raise
+    if all(o["mu_small"] is None for o in outputs):
+        ctx["V_flat"] = None                         # past the split only the downfold reads V
+    w1, t_shared = _stage_walls(), time.time() - t0
+    shared = {n: w1[f"bsemat.{n}"] - w0.get(f"bsemat.{n}", 0.0)
+              for n in SHARED_STAGES if f"bsemat.{n}" in w1}
+    summaries = []
+    for i, out in enumerate(outputs):
+        before = _stage_walls(("bsemat.output",))
+        s = _write_output(ctx, out, release=i == len(outputs) - 1)
+        after = _stage_walls(("bsemat.output",))
+        s["stages"] = {"shared": shared, "output": {n: after[n] - before.get(n, 0.0)
+                                                    for n in OUTPUT_STAGES if n in after}}
+        s["wall_shared_s"] = t_shared
+        s["wall_total_s"] = time.time() - t0
+        summaries.append(s)
+    ctx["wfn"].close()
+    return summaries
+
+
+def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_gauge_map,
+                    mesh_xy):
+    """The shared stages of an export, once per restart; returns the plain dict ``_write_output`` reads.
+
+    The bundle at full q (1), BerkeleyGW's head momenta and ζ columns (2), the
+    split per key on V's face (3) and the gauge map (4), fitted when
+    ``use_gauge_map`` (some file wants the coarse WFN's gauge). W and V stay
+    resident flattened at ``P('x','y',None)``; the bundle's own copies are dropped.
+    """
+    _stage("deferred_imports")
     from ffi import _services
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
@@ -693,14 +811,12 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     from symmetry_maps import read_tables
     from file_io import bgw_bsemat as F
     from file_io.restart_bundle import _find_restart_file, read_metadata
-    from file_io.slab_io import SlabIO
     from file_io.centroids import load_centroids
     from gw.lr_channels import slab_shells
-    from common.collectives import device_put_process_local
     from .bse_loading import load_bse_data_from_restart_sharded
     from .bse_window import resolve_n_occ
 
-    t0 = time.time()
+    _stage("restart_load")
     restart = _find_restart_file(input_file)
     params = _deck_params(input_file)
     sys_dim = int(params.get("sys_dim", 3))
@@ -730,6 +846,7 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     if k_int.shape != fft_int.shape or not np.array_equal(np.mod(k_int, grid), fft_int):
         raise ValueError("GATE bsemat_k_order: SymMaps' k rows are not the bundle's flat fft order")
 
+    _stage("wfn_co_read")
     # BerkeleyGW's coarse k list and its map onto the bundle's k rows.
     kpts, kgrid_w, bdot, celvol = F.read_wfn_k_list(wfn_co)
     if len(kpts) != nk:
@@ -738,7 +855,11 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     b2l = grid_index(kpts, grid)
     if len(set(b2l.tolist())) != nk:
         raise ValueError("GATE bsemat_k_bijection: WFN_co k points do not cover the grid once")
+    with h5py.File(wfn_co, "r") as w:
+        el_all = np.asarray(w["mf_header/kpoints/el"][()]).reshape(-1, nk, int(w["mf_header/kpoints/mnband"][()]))[0]
+        ecutwfc = float(w["mf_header/kpoints/ecutwfc"][()])
 
+    _stage("head_columns")
     # ── 2. head momenta and ζ columns ─────────────────────────────────────
     with h5py.File(restart, "r") as f:
         tables = read_tables(f, "W0_qmunu")
@@ -788,62 +909,12 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     v_head_q = np.asarray(ch.v)[:, c0]
     K_ch = q_full_L + np.asarray(ch.gvec)[:, c0]
 
+    _stage("head_split")
     # ── 3. the split per key, on V's face ─────────────────────────────────
     W_flat = jax.jit(lambda w: w.reshape(w.shape[0], w.shape[1], -1),
                      out_shardings=NamedSharding(mesh_xy, P("x", "y", None)))(data["W_q"])
     V_flat = jax.jit(lambda w: w.reshape(w.shape[0], w.shape[1], -1),
                      out_shardings=NamedSharding(mesh_xy, P("x", "y", None)))(data["V_q_full"])
-    q0_fig = None
-    if q0_body not in ("head_less", "dipole"):
-        raise ValueError(f"q0_body must be head_less or dipole, got {q0_body!r}")
-    if q0_body == "dipole":
-        if sys_dim != 3:
-            raise ValueError("GATE bsemat_q0_body_dim: the dipole q0 body term is O(q0) in a slab "
-                             "(BerkeleyGW's own body moves 8e-8); fix: --q0-body head-less.")
-        names = ("head_wing_L", "head_wing_R", "S_cart_head", "S_cart_head_direct")
-        with h5py.File(restart, "r") as f:
-            miss = [n for n in names if n not in f]
-            if miss:
-                raise ValueError(f"GATE bsemat_q0_wings_source: {restart} lacks {miss}; the dipole "
-                                 "q0 body needs the GW bundle's stored q -> 0 wings. fix: rerun GW "
-                                 "with wing storage, or --q0-body head-less.")
-            Lw, Rw, S_eff, S_d = (np.asarray(f[n][()]) for n in names)
-        if q0_vector is None:
-            eps0 = os.path.join(os.path.dirname(os.path.abspath(bgw_eps)), "eps0mat.h5") if bgw_eps else None
-            if not eps0 or not os.path.exists(eps0):
-                raise ValueError("GATE bsemat_q0_vector: the dipole q0 body is direction dependent; "
-                                 "give --q0-vector (crystal) or an eps0mat.h5 beside --bgw-eps.")
-            with h5py.File(eps0, "r") as e:
-                q0_vector = np.asarray(e["eps_header/qpoints/qpts"][()], np.float64)[0]
-        q0_cart = np.asarray(q0_vector, np.float64) @ bvec
-        if Lw.shape != (3, n_rmu) or Rw.shape != (n_rmu, 3):
-            raise ValueError(f"GATE bsemat_q0_wing_fold: wings {Lw.shape}/{Rw.shape}, the bundle has {n_rmu} μ")
-        Lp = np.zeros((3, n_rmu_pad), np.complex128); Lp[:, :n_rmu] = Lw
-        Rp = np.zeros((n_rmu_pad, 3), np.complex128); Rp[:n_rmu] = Rw
-        rs = NamedSharding(mesh_xy, P())
-        dip = jax.jit(lambda w, l, r, se, sd: A.q0_dipole_body_rows(
-            w[:, :, 0], l, r, se, sd, q0_cart, omega, xp=jnp), out_shardings=rs)
-        A_d, D_d, fig = dip(W_flat, *(device_put_process_local(np.asarray(x, np.complex128), rs)
-                                      for x in (Lp, Rp, S_eff, S_d)))
-        q0_fig = {k: (complex(np.asarray(v)) if np.iscomplexobj(np.asarray(v)) else float(np.asarray(v)))
-                  for k, v in fig.items()}
-        q0_fig["q0_vector"] = [float(x) for x in q0_vector]
-        if not q0_fig["fold_gate"] <= 1e-3 or not q0_fig["R_vs_LH"] <= 1e-10:
-            raise ValueError(f"GATE bsemat_q0_wing_fold: Ω q̂(S_eff − S_d)q̂ vs q̂ L W R q̂ on this W "
-                             f"differs by {q0_fig['fold_gate']:.2e} (R vs Lᴴ {q0_fig['R_vs_LH']:.2e}); "
-                             "L's μ order or normalisation is not this bundle's.")
-        q0_body_update = (np.asarray(A_d)[:, :n_rmu], np.asarray(D_d))
-        _log(f"[bsemat] q0 body: dipole term along q0 = {q0_fig['q0_vector']} (crystal), "
-             f"ε_M = {q0_fig['eps_M']:.4f}, fold gate {q0_fig['fold_gate']:.1e}")
-    if q0_body_update is not None:
-        A0 = np.zeros((np.asarray(q0_body_update[0]).shape[0], n_rmu_pad), np.complex128)
-        A0[:, :n_rmu] = np.asarray(q0_body_update[0])[:, :n_rmu]
-        rs = NamedSharding(mesh_xy, P())
-        upd = jax.jit(lambda w, a, d: w.at[:, :, 0].set(A.add_q0_body_update(w[:, :, 0], a, d, xp=jnp)),
-                      out_shardings=W_flat.sharding)
-        W_flat = upd(W_flat, device_put_process_local(A0, rs),
-                     device_put_process_local(np.asarray(q0_body_update[1], np.complex128), rs))
-        _log(f"[bsemat] q -> 0 body update of rank {A0.shape[0]} applied")
     W11, y_keys, figs, split_stats = head_split_keys(
         keys, z_keys, V_flat, W_flat, zeta_path=zeta_path, tables=tables, sym=sym, grid=grid,
         n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, v_head_q=v_head_q, q_frac=q_full_L, head_K=K_ch,
@@ -854,6 +925,7 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
              min(f.get("head_row", 1) for f in figs), max(f.get("head_row", 0) for f in figs),
              min(f.get("eps_inv_head", 1) for f in figs), max(f.get("eps_inv_head", 0) for f in figs)))
 
+    _stage("psi_gauge")
     # ── 4. gauge map ──────────────────────────────────────────────────────
     bw = header.get("band_window")
     b0 = int(np.asarray(bw).reshape(-1)[0]) if bw is not None else 0
@@ -874,16 +946,6 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
         Ug = np.broadcast_to(np.eye(n_val + n_cond), (nk, n_val + n_cond, n_val + n_cond)).copy()
         gfig = {"gauge_map": "identity (red twin)"}
     _log(f"[bsemat] gauge map: {gfig}")
-    # ψ_file,n = Σ_m ψ_LX,m conj(U[n, m]); rows of the file in WFN_co order.
-    psi_map = np.einsum("knsr,kmn->kmsr", psi_win[b2l], np.conj(Ug))
-    psi_v_b = psi_map[:, :n_val][:, ::-1]                     # BerkeleyGW: iv = 1 highest
-    psi_c_b = psi_map[:, n_val:]
-    psi_1 = np.concatenate([psi_v_b, psi_c_b], axis=1) if extended else psi_v_b
-    psi_2 = psi_1 if extended else psi_c_b
-    sx = NamedSharding(mesh_xy, P(None, None, None, "x"))
-    sy = NamedSharding(mesh_xy, P(None, None, None, "y"))
-    put = lambda a, s: device_put_process_local(np.ascontiguousarray(a), s)
-    p1x, p1y, p2x, p2y = put(psi_1, sx), put(psi_1, sy), put(psi_2, sx), put(psi_2, sy)
 
     # q = 0 head column check against the bundle's G = 0 vector.
     q0 = [kk for kk, (iq, G) in enumerate(keys) if iq == 0 and G == (0, 0, 0)][0]
@@ -892,69 +954,209 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
         dz = np.linalg.norm(z_keys[q0][:n_rmu] * np.sqrt(omega) - g0) / np.linalg.norm(g0)
         _log(f"[bsemat] q=0 column vs bundle G0 vector: rel. diff {dz:.2e}")
 
-    # Exchange operands: C_{n2 n1}(k) = Σ conj(ψ_n2) ψ_n1, T = C V̄_Γ.
-    Vbar = data["V_q0"]
-    df_fig = None
-    if mu_small is not None:
-        from gw.downfold import DEFAULT_RCOND
-        dfo = _downfold_stage(
-            mu_small=mu_small, rcond=float(downfold_rcond or DEFAULT_RCOND), restart=restart,
-            psi_win=psi_win, psi_1=psi_1, psi_2=psi_2, n_rmu=n_rmu, W_flat=W_flat, V_flat=V_flat,
-            z_keys=z_keys, y_keys=y_keys, W11=W11, keys=keys, v_head_q=v_head_q, Vbar=Vbar,
-            grid=grid, mesh_xy=mesh_xy)
-        data["W_q"] = data["V_q_full"] = None
-        W_flat, V_flat = dfo["W_flat"], None
-        z_keys, y_keys, Vbar, psi_1, psi_2 = (dfo[k] for k in ("z_keys", "y_keys", "Vbar", "psi_1", "psi_2"))
-        df_fig = dfo["fig"]
-        p1x, p1y, p2x, p2y = put(psi_1, sx), put(psi_1, sy), put(psi_2, sx), put(psi_2, sy)
-    vim = float(jnp.linalg.norm(Vbar.imag) / jnp.linalg.norm(Vbar))
-    Ccv = A.pair_amplitudes(p2x, p1x, xp=jnp)                  # (nk, n2, n1, μ)
-    T_cv = jnp.einsum("kcvm,mn->kcvn", Ccv, Vbar)
-
-    # ── 5. rows ───────────────────────────────────────────────────────────
-    n1b, n2b = psi_1.shape[1], psi_2.shape[1]
-    lam_pair = qlen if sys_dim == 3 else np.ones_like(qlen)
-    with h5py.File(wfn_co, "r") as w:
-        el_all = np.asarray(w["mf_header/kpoints/el"][()]).reshape(-1, nk, int(w["mf_header/kpoints/mnband"][()]))[0]
-        ecutwfc = float(w["mf_header/kpoints/ecutwfc"][()])
     nocc_abs = int(bands_abs[n_val])
     efermi = 0.5 * (el_all[:, :nocc_abs].max() + el_all[:, nocc_abs:].min()) * 13.605693122994
-    if jax.process_index() == 0:
-        shape = F.create_bsemat_file(
-            out_path, wfn_file=wfn_co, kpts=kpts, kgrid=kgrid_w, nvb=n_val, ncb=n_cond,
-            extended=extended, icutv=F.ICUTV_OF_SYS_DIM[sys_dim],
-            ecuts=ecutwfc, ecutg=ecutwfc, efermi=efermi,
-            nspinor=int(psi_v.shape[2]))
-    shape = F.matrix_shape(nk, n1b, n2b)
-    _barrier()
-    fro = np.zeros(4)
-    r_sh = NamedSharding(mesh_xy, P())
-    zk, yk, w11k = (device_put_process_local(np.ascontiguousarray(a), r_sh) for a in (z_keys, y_keys, W11))
-    iqp, kyp, lmp = (device_put_process_local(np.ascontiguousarray(a), r_sh)
-                     for a in (iq_pair.astype(np.int32), key_pair.astype(np.int32), lam_pair))
-    t_rows = time.time()
-    with SlabIO(out_path, mode="a", mesh=mesh_xy) as io:
-        F.register_matrices(io, shape)
-        for jp in range(nk):
-            h, w_, b = _direct_row(p1x, p1y, p2x, p2y, W_flat, iqp, kyp, zk, yk, w11k, lmp, jp,
-                                   omega=omega)
-            x = _exchange_row(T_cv, Ccv, jp, omega=omega)
-            for m, arr in enumerate((h, w_, b, x)):
-                arr = rep(_ri(arr))
-                fro[m] += float(jnp.sum(arr ** 2))
-                io.write_slab(F.MATRICES[m], arr, offset=(jp, 0, 0, 0, 0, 0, 0))
-    t_end = time.time()
-    wfn.close()
-    names = ("Head", "Wing", "Body", "X   ")
-    for nm, v in zip(names, np.sqrt(fro)):
-        _log(f" - {nm} : {v:21.12E}")
-    summary = {"nk": nk, "n1b": n1b, "n2b": n2b, "keys": len(keys), "ties": n_ties,
-               "q0_body": q0_body, "q0_dipole": q0_fig, "downfold": df_fig,
-               "frobenius": dict(zip(("head", "wing", "body", "exchange"), np.sqrt(fro).tolist())),
-               "split": figs, "head_split": split_stats, "gauge": gfig, "vbar_imag_rel": vim,
-               "wall_total_s": t_end - t0, "wall_rows_s": t_end - t_rows,
-               "peak_device_bytes": _peak_device_bytes()}
-    return summary
+    _stage(None)
+    data["W_q"] = data["V_q_full"] = None            # the flattened copies above stay resident
+    return dict(restart=restart, sys_dim=sys_dim, bgw_eps=bgw_eps, wfn=wfn, wfn_co=wfn_co,
+                mesh_xy=mesh_xy, rep=rep, n_val=n_val, n_cond=n_cond, nk=nk, grid=grid,
+                n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, nspinor=int(psi_v.shape[2]), omega=omega,
+                bvec=bvec, kpts=kpts, kgrid_w=kgrid_w, b2l=b2l, ecutwfc=ecutwfc, efermi=efermi,
+                keys=keys, n_ties=n_ties, iq_pair=iq_pair, key_pair=key_pair,
+                lam_pair=qlen if sys_dim == 3 else np.ones_like(qlen),
+                z_keys=z_keys, y_keys=y_keys, W11=W11, figs=figs, split_stats=split_stats,
+                v_head_q=v_head_q,
+                W_flat=W_flat, V_flat=V_flat, Vbar=data["V_q0"], psi_win=psi_win,
+                use_gauge_map=use_gauge_map, Ug=Ug, gfig=gfig, q0_dipole={},
+                q0_update=jax.jit(lambda w, a, d: w.at[:, :, 0].set(
+                    A.add_q0_body_update(w[:, :, 0], a, d, xp=jnp)), out_shardings=W_flat.sharding))
+
+
+def _q0_dipole_rows(ctx, q0_vector, W_flat):
+    """``(A, D, figures)`` of BerkeleyGW's 3-D q0 body term along q0 (``bsemat_algebra.q0_dipole_body_rows``).
+
+    From the restart's stored q → 0 wings and the head-less Γ tile of ``W_flat``
+    (before any q0 update), gated; computed once per q0 direction per export
+    (``ctx['q0_dipole']``). ``q0_vector`` (crystal) or ``None`` for the
+    ``eps0mat.h5`` beside ``bgw_eps``.
+    """
+    from common.collectives import device_put_process_local
+    restart, sys_dim, bgw_eps, bvec = ctx["restart"], ctx["sys_dim"], ctx["bgw_eps"], ctx["bvec"]
+    n_rmu, n_rmu_pad, omega, mesh_xy = ctx["n_rmu"], ctx["n_rmu_pad"], ctx["omega"], ctx["mesh_xy"]
+    memo = None if q0_vector is None else tuple(float(x) for x in q0_vector)
+    if memo in ctx["q0_dipole"]:
+        return ctx["q0_dipole"][memo]
+    if sys_dim != 3:
+        raise ValueError("GATE bsemat_q0_body_dim: the dipole q0 body term is O(q0) in a slab "
+                         "(BerkeleyGW's own body moves 8e-8); fix: --q0-body head-less.")
+    names = ("head_wing_L", "head_wing_R", "S_cart_head", "S_cart_head_direct")
+    with h5py.File(restart, "r") as f:
+        miss = [n for n in names if n not in f]
+        if miss:
+            raise ValueError(f"GATE bsemat_q0_wings_source: {restart} lacks {miss}; the dipole "
+                             "q0 body needs the GW bundle's stored q -> 0 wings. fix: rerun GW "
+                             "with wing storage, or --q0-body head-less.")
+        Lw, Rw, S_eff, S_d = (np.asarray(f[n][()]) for n in names)
+    if q0_vector is None:
+        eps0 = os.path.join(os.path.dirname(os.path.abspath(bgw_eps)), "eps0mat.h5") if bgw_eps else None
+        if not eps0 or not os.path.exists(eps0):
+            raise ValueError("GATE bsemat_q0_vector: the dipole q0 body is direction dependent; "
+                             "give --q0-vector (crystal) or an eps0mat.h5 beside --bgw-eps.")
+        with h5py.File(eps0, "r") as e:
+            q0_vector = np.asarray(e["eps_header/qpoints/qpts"][()], np.float64)[0]
+    q0_cart = np.asarray(q0_vector, np.float64) @ bvec
+    if Lw.shape != (3, n_rmu) or Rw.shape != (n_rmu, 3):
+        raise ValueError(f"GATE bsemat_q0_wing_fold: wings {Lw.shape}/{Rw.shape}, the bundle has {n_rmu} μ")
+    Lp = np.zeros((3, n_rmu_pad), np.complex128); Lp[:, :n_rmu] = Lw
+    Rp = np.zeros((n_rmu_pad, 3), np.complex128); Rp[:n_rmu] = Rw
+    rs = NamedSharding(mesh_xy, P())
+    dip = jax.jit(lambda w, l, r, se, sd: A.q0_dipole_body_rows(
+        w[:, :, 0], l, r, se, sd, q0_cart, omega, xp=jnp), out_shardings=rs)
+    A_d, D_d, fig = dip(W_flat, *(device_put_process_local(np.asarray(x, np.complex128), rs)
+                                  for x in (Lp, Rp, S_eff, S_d)))
+    q0_fig = {k: (complex(np.asarray(v)) if np.iscomplexobj(np.asarray(v)) else float(np.asarray(v)))
+              for k, v in fig.items()}
+    q0_fig["q0_vector"] = [float(x) for x in q0_vector]
+    if not q0_fig["fold_gate"] <= 1e-3 or not q0_fig["R_vs_LH"] <= 1e-10:
+        raise ValueError(f"GATE bsemat_q0_wing_fold: Ω q̂(S_eff − S_d)q̂ vs q̂ L W R q̂ on this W "
+                         f"differs by {q0_fig['fold_gate']:.2e} (R vs Lᴴ {q0_fig['R_vs_LH']:.2e}); "
+                         "L's μ order or normalisation is not this bundle's.")
+    out = (np.asarray(A_d)[:, :n_rmu], np.asarray(D_d), q0_fig)
+    _log(f"[bsemat] q0 body: dipole term along q0 = {q0_fig['q0_vector']} (crystal), "
+         f"ε_M = {q0_fig['eps_M']:.4f}, fold gate {q0_fig['fold_gate']:.1e}")
+    ctx["q0_dipole"][memo] = out
+    return out
+
+
+def _write_output(ctx, out, *, release):
+    """One bsemat file from the shared context: q → 0 body, ψ map, downfold, rows (E7), write.
+
+    ``ctx`` (``_export_context``) is only read, except that ``release`` (the last
+    file) hands its W and V to this file, so the rows run with the resident
+    copies a one-file export holds, and the dipole term is memoised per q0.
+    ``out`` an ``output_spec``. Returns the file's summary dict.
+    """
+    from common.collectives import device_put_process_local
+    from file_io import bgw_bsemat as F
+    from file_io.slab_io import SlabIO
+
+    mesh_xy, rep, omega, nk = ctx["mesh_xy"], ctx["rep"], ctx["omega"], ctx["nk"]
+    n_val, n_cond, n_rmu, n_rmu_pad = ctx["n_val"], ctx["n_cond"], ctx["n_rmu"], ctx["n_rmu_pad"]
+    out_path, extended, mu_small = out["out_path"], out["extended"], out["mu_small"]
+    q0_body, q0_body_update = out["q0_body"], out["q0_body_update"]
+    W_flat, V_flat = ctx["W_flat"], ctx["V_flat"]
+    if release:
+        ctx["W_flat"] = ctx["V_flat"] = None
+    with timing.section("bsemat.output", announce=True,
+                        label=f"bsemat.output {os.path.basename(out_path)}"):
+        # ── the q → 0 body of this file (the split never reads q = 0) ──────
+        with timing.section("q0_body"):
+            q0_fig = None
+            if q0_body == "dipole":
+                A_d, D_d, q0_fig = _q0_dipole_rows(ctx, out["q0_vector"], W_flat)
+                q0_body_update = (A_d, D_d)
+            if q0_body_update is not None:
+                A0 = np.zeros((np.asarray(q0_body_update[0]).shape[0], n_rmu_pad), np.complex128)
+                A0[:, :n_rmu] = np.asarray(q0_body_update[0])[:, :n_rmu]
+                rs = NamedSharding(mesh_xy, P())
+                W_flat = ctx["q0_update"](
+                    W_flat, device_put_process_local(A0, rs),
+                    device_put_process_local(np.asarray(q0_body_update[1], np.complex128), rs))
+                _log(f"[bsemat] q -> 0 body update of rank {A0.shape[0]} applied")
+
+        # ── ψ in the file's gauge, k order and band order ─────────────────
+        with timing.section("psi_map"):
+            Ug, gfig = ctx["Ug"], ctx["gfig"]
+            if ctx["use_gauge_map"] and not out["use_gauge_map"]:     # red twin beside mapped files
+                nb = n_val + n_cond
+                Ug = np.broadcast_to(np.eye(nb), (nk, nb, nb)).copy()
+                gfig = {"gauge_map": "identity (red twin)"}
+                _log(f"[bsemat] gauge map: {gfig}")
+            # ψ_file,n = Σ_m ψ_LX,m conj(U[n, m]); rows of the file in WFN_co order.
+            psi_map = np.einsum("knsr,kmn->kmsr", ctx["psi_win"][ctx["b2l"]], np.conj(Ug))
+            psi_v_b = psi_map[:, :n_val][:, ::-1]                     # BerkeleyGW: iv = 1 highest
+            psi_c_b = psi_map[:, n_val:]
+            psi_1 = np.concatenate([psi_v_b, psi_c_b], axis=1) if extended else psi_v_b
+            psi_2 = psi_1 if extended else psi_c_b
+            sx = NamedSharding(mesh_xy, P(None, None, None, "x"))
+            sy = NamedSharding(mesh_xy, P(None, None, None, "y"))
+            put = lambda a, s: device_put_process_local(np.ascontiguousarray(a), s)
+            p1x, p1y, p2x, p2y = put(psi_1, sx), put(psi_1, sy), put(psi_2, sx), put(psi_2, sy)
+
+        z_keys, y_keys, Vbar = ctx["z_keys"], ctx["y_keys"], ctx["Vbar"]
+        df_fig = None
+        if mu_small is not None:
+            with timing.section("downfold"):
+                from gw.downfold import DEFAULT_RCOND
+                dfo = _downfold_stage(
+                    mu_small=mu_small, rcond=float(out["downfold_rcond"] or DEFAULT_RCOND),
+                    restart=ctx["restart"], psi_win=ctx["psi_win"], psi_1=psi_1, psi_2=psi_2,
+                    n_rmu=n_rmu, W_flat=W_flat, V_flat=V_flat, z_keys=z_keys, y_keys=y_keys,
+                    W11=ctx["W11"], keys=ctx["keys"], v_head_q=ctx["v_head_q"], Vbar=Vbar,
+                    grid=ctx["grid"], mesh_xy=mesh_xy)
+                W_flat = dfo["W_flat"]
+                z_keys, y_keys, Vbar, psi_1, psi_2 = (dfo[k] for k in ("z_keys", "y_keys", "Vbar", "psi_1", "psi_2"))
+                df_fig = dfo["fig"]
+                p1x, p1y, p2x, p2y = put(psi_1, sx), put(psi_1, sy), put(psi_2, sx), put(psi_2, sy)
+        V_flat = None
+
+        # Exchange operands: C_{n2 n1}(k) = Σ conj(ψ_n2) ψ_n1, T = C V̄_Γ.
+        with timing.section("exchange"):
+            vim = float(jnp.linalg.norm(Vbar.imag) / jnp.linalg.norm(Vbar))
+            Ccv = A.pair_amplitudes(p2x, p1x, xp=jnp)                  # (nk, n2, n1, μ)
+            T_cv = jnp.einsum("kcvm,mn->kcvn", Ccv, Vbar)
+
+        # ── 5. rows ───────────────────────────────────────────────────────
+        n1b, n2b = psi_1.shape[1], psi_2.shape[1]
+        with timing.section("write"):
+            if jax.process_index() == 0:
+                F.create_bsemat_file(
+                    out_path, wfn_file=ctx["wfn_co"], kpts=ctx["kpts"], kgrid=ctx["kgrid_w"],
+                    nvb=n_val, ncb=n_cond, extended=extended,
+                    icutv=F.ICUTV_OF_SYS_DIM[ctx["sys_dim"]], ecuts=ctx["ecutwfc"],
+                    ecutg=ctx["ecutwfc"], efermi=ctx["efermi"], nspinor=ctx["nspinor"])
+            shape = F.matrix_shape(nk, n1b, n2b)
+            _barrier()
+        fro = np.zeros(4)
+        with timing.section("rows"):
+            r_sh = NamedSharding(mesh_xy, P())
+            zk, yk, w11k = (device_put_process_local(np.ascontiguousarray(a), r_sh)
+                            for a in (z_keys, y_keys, ctx["W11"]))
+            iqp, kyp, lmp = (device_put_process_local(np.ascontiguousarray(a), r_sh)
+                             for a in (ctx["iq_pair"].astype(np.int32), ctx["key_pair"].astype(np.int32),
+                                       ctx["lam_pair"]))
+        t_rows = time.time()
+        with SlabIO(out_path, mode="a", mesh=mesh_xy) as io:
+            F.register_matrices(io, shape)
+            for jp in range(nk):
+                # Each matrix of row k′ = jp: the replicated (Re, Im) block and its Frobenius
+                # sum (the host read that ends the stage's device work), then one hyperslab.
+                with timing.section("rows"):
+                    h, w_, b = _direct_row(p1x, p1y, p2x, p2y, W_flat, iqp, kyp, zk, yk, w11k, lmp,
+                                           jp, omega=omega)
+                for m, arr in enumerate((h, w_, b)):
+                    with timing.section("rows"):
+                        arr = rep(_ri(arr))
+                        fro[m] += float(jnp.sum(arr ** 2))
+                    with timing.section("write"):
+                        io.write_slab(F.MATRICES[m], arr, offset=(jp, 0, 0, 0, 0, 0, 0))
+                with timing.section("exchange"):
+                    arr = rep(_ri(_exchange_row(T_cv, Ccv, jp, omega=omega)))
+                    fro[3] += float(jnp.sum(arr ** 2))
+                with timing.section("write"):
+                    io.write_slab(F.MATRICES[3], arr, offset=(jp, 0, 0, 0, 0, 0, 0))
+            with timing.section("write"):
+                io.sync_writes()                      # the queued hyperslabs, before the close
+        t_end = time.time()
+        names = ("Head", "Wing", "Body", "X   ")
+        for nm, v in zip(names, np.sqrt(fro)):
+            _log(f" - {nm} : {v:21.12E}")
+    return {"out_path": out_path, "extended": extended, "use_gauge_map": out["use_gauge_map"],
+            "mu_small": mu_small, "nk": nk, "n1b": n1b, "n2b": n2b, "keys": len(ctx["keys"]),
+            "ties": ctx["n_ties"], "q0_body": q0_body, "q0_dipole": q0_fig, "downfold": df_fig,
+            "frobenius": dict(zip(("head", "wing", "body", "exchange"), np.sqrt(fro).tolist())),
+            "split": ctx["figs"], "head_split": ctx["split_stats"], "gauge": gfig, "vbar_imag_rel": vim,
+            "wall_rows_s": t_end - t_rows, "peak_device_bytes": _peak_device_bytes()}
 
 
 def _deck_params(input_file):
