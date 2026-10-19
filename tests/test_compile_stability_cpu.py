@@ -156,11 +156,9 @@ def test_response_programs_have_no_host_callback(checked_service):
     built = rb._response_programs(mesh, n, "distributed", "auto", 0.5, False, None)
     dyson, moments, _ = built.bind(None)
     slope = built.slope
-    sqrt_v = rb._coulomb_algebra.__wrapped__(mesh, n, n, "distributed")
     counts = {"dyson.value": _host_callbacks(dyson.value.lower(face, face)),
               "slope": _host_callbacks(slope.lower(face, face, face)),
-              "moments": _host_callbacks(moments.lower(face, face, face)),
-              "sqrt_v": _host_callbacks(sqrt_v.lower(face))}
+              "moments": _host_callbacks(moments.lower(face, face, face))}
     assert counts == dict.fromkeys(counts, 0)
 
 

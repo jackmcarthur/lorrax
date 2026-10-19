@@ -152,6 +152,9 @@ $$
 \tag{W 9}
 $$
 
+(W 9) holds for any factor $v=LL^\dagger$ in place of $v^{1/2}$ (the whitened
+operators differ by a unitary, so their spectra agree); the code whitens with the
+Cholesky factor $L$, as $L^\dagger\chi_0L$ and $L^{-1}W_cL^{-\dagger}$.
 (W 9) holds **with broken time reversal**; the anti-Hermitian part is the odd
 channel and has no pointwise sign. It is a necessary condition, checked on the
 model and never imposed on it.
