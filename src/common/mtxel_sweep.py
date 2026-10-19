@@ -1381,14 +1381,14 @@ def _band_chunk(geom, ops, nb_rank: int, step_bytes: float) -> int:
                  default=0)
     if not copies:
         return nb_rank
-    from common.gpu_utils import record_stage_price
+    from lxkit import memory
     from runtime.tiles import tile_units
     box = copies * float(geom.ns) * float(np.prod(geom.fft_grid)) * 16.0
     fit = tile_units(box, nb_rank)
     n_chunks = -(-nb_rank // fit)
     chunk = -(-nb_rank // n_chunks)
-    record_stage_price(f"matrix-element sweep, plan_sweep {chunk}/{nb_rank} bands",
-                       step_bytes + chunk * box)
+    memory.book(memory.priced(step_bytes + chunk * box,
+                              f"matrix-element sweep, plan_sweep {chunk}/{nb_rank} bands"))
     return chunk
 
 

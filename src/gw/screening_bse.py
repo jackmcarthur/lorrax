@@ -708,7 +708,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
         stream = None
         if on_z is not None:
             import time
-            from runtime.xla_memory import pool_high_water
+            from lxkit import memory
             clock = {"t": time.perf_counter()}
 
             def stream(iz, zz, wc_z, resid_z, iters_z):
@@ -716,7 +716,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                 live = np.asarray(iters_z)[np.asarray(iters_z) > 0]
                 worst_z = float(np.max(resid_z)) if resid_z.size else 0.0
                 hot_z = int(np.max(iters_z)) if iters_z.size else 0
-                peak = pool_high_water(reset=False)
+                peak = memory.high_water()
                 print_fn(
                     f"  Ladder W(z) {_resolvent_diagram_name(include_w)} "
                     f"z[{iz}] = "

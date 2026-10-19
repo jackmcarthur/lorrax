@@ -475,9 +475,9 @@ def fit_gn_ppm_from_wc_pair(
     _fit_bytes = _gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu, *_kargs)
     _free = _gn_ppm_fit_free_bytes(_nq, *_fit_bytes)
     _qb = _gn_ppm_fit_q_block(_nq, *_fit_bytes, _free)
-    from common.gpu_utils import record_stage_price
-    record_stage_price(f"GN-PPM fit, q block {_qb}/{_nq}",
-                       _qb * _fit_bytes[0] + 2 * _nq * _fit_bytes[1])
+    from lxkit import memory
+    memory.book(memory.priced(_qb * _fit_bytes[0] + 2 * _nq * _fit_bytes[1],
+                              f"GN-PPM fit, q block {_qb}/{_nq}"))
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
     # (one extra (nq, mu, nu) c128 tile, needed again after the tail policy

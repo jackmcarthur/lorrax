@@ -1531,11 +1531,12 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
         [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))])
     # The q batches in their own section: the price judged against their peak is the
     # ledger's live set plus one batch's tile (the stream's peak is the stream's).
-    from common.gpu_utils import record_stage_price
+    from lxkit import memory
     with timing.section("bank.moment_batches"):
-        record_stage_price(f"moment bank, q width {qwidth}/{len(qids)}", ledger.preview(
+        memory.book(memory.priced(ledger.preview(
             resident_bytes_per_rank=(per_q * qwidth + 16) * face_bytes, workspace_bytes_per_rank=0,
-            concurrent_with=ambient)["aggregate_bytes_per_rank"])
+            concurrent_with=ambient)["aggregate_bytes_per_rank"],
+            f"moment bank, q width {qwidth}/{len(qids)}"))
         for q0 in range(0,len(qids),qwidth):
             q1 = min(q0+qwidth,len(qids))
             ledger.live_stages = ambient
@@ -2747,7 +2748,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 ambient += (tables,)
                 ledger.live_stages = ambient
         from runtime.aot_memory import agreed_chunk, check_chunk
-        from common.gpu_utils import record_stage_price
+        from lxkit import memory
         scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
 
         def device_groups():
@@ -2820,8 +2821,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     break
                 disk_group = -(-disk_group // 2)
         if residence == "device":
-            record_stage_price(f"response direct stream, group {group_size}/{len(z)}",
-                               live + check.price, section="bank.dispatch.direct")
+            memory.book(memory.priced(live + check.price,
+                                      f"response direct stream, group {group_size}/{len(z)}"),
+                        stage="bank.dispatch.direct")
             receipt["group_check"] = dict(chunk=check.chunk, agreed=group_size, analytic=check.analytic,
                 compiled=check.compiled_bytes, price=check.price, live=live, room=room,
                 recompiled=check.recompiled, seconds=check.seconds)

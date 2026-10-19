@@ -421,13 +421,15 @@ class CapacityLedger:
         row['stage'] = stage
         row['live_stages'] = sorted(set(row['concurrent_with']) | {stage})
         self.entries.append(row)
-        from common.gpu_utils import record_stage_price, warn_over_budget
+        from common.gpu_utils import warn_over_budget
+        from lxkit import memory
         if row['device_budget_status'] != 'PASS':
             warn_over_budget(f"shared-pole ledger {stage}", row['aggregate_bytes_per_rank'],
                              row['available_device_bytes_per_rank'])
         self._accepted[stage] = row
         # Priced as the pool measures it: the ledger's bytes and what was live beside it at bind.
-        record_stage_price(self.price_label(), row['aggregate_bytes_per_rank'] + self.baseline_bytes_per_rank)
+        memory.book(memory.priced(row['aggregate_bytes_per_rank'] + self.baseline_bytes_per_rank,
+                                  self.price_label()))
         return copy.deepcopy(row)
 
     def preview(self, *, resident_bytes_per_rank,
@@ -486,7 +488,7 @@ class CapacityLedger:
         return copy.deepcopy(row)
 
     def price_label(self):
-        """The stage name a reservation's price is recorded under (``record_stage_price``)."""
+        """The stage name a reservation's price is recorded under (``lxkit.memory.book``)."""
         if not self.baseline_bytes_per_rank:
             return "shared-pole ledger"
         return f"shared-pole ledger + {self.baseline_bytes_per_rank / 1e9:.2f} GB baseline"
