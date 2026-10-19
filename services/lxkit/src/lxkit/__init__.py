@@ -56,6 +56,7 @@ from lxkit.legs import (
     accelerator_legs,
     leg_device_present,
     leg_for_jax_platform,
+    leg_for_platform,
     leg_for_vendor,
     process_accelerator_leg,
 )
@@ -100,7 +101,7 @@ __all__ = [
     "install_reduction_guard_from_env", "reduction_trace",
     # the platform legs of the native-provider ABI
     "legs", "memory", "LEGS", "PlatformLeg", "accelerator_leg_to_open_first",
-    "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_vendor",
+    "accelerator_legs", "leg_device_present", "leg_for_jax_platform", "leg_for_platform", "leg_for_vendor",
     "process_accelerator_leg",
     # native-provider policy (the tables remain with each caller)
     "native_provider",

@@ -8,14 +8,10 @@ from functools import lru_cache
 from types import SimpleNamespace
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import lxkit, distrib_la
-from distrib_la import loader, workspace
+from distrib_la import workspace
 import importlib
 _pl, _rs = (importlib.import_module("distrib_la." + m) for m in ("plan", "resolve"))
-_pl.mesh_platform = _rs.mesh_platform = lambda mesh: "CUDA"
-def query(ctx, n, cplx, device, host):      # cusolverDnXsyevd_bufferSize: 2x LAPACK (A100, measured)
-    device._obj.value, host._obj.value = 2 * (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n)), 0
-    return 0
-loader.get_lib = lambda platform: type("Lib", (), {"lrx_eigh_workspace_bytes": staticmethod(query)})()
+_pl.mesh_platform = _rs.mesh_platform = workspace.mesh_platform = lambda mesh: "CUDA"
 lxkit.device_vendor = lambda device: "cuda"; workspace.device_vendor = lambda device: "cuda"
 # The leg's capacity probe: cuSOLVERMp's whole-mesh eigh is present on the A100 leg.
 _cap = lambda mesh_xy, *, n=None: ("cusolvermp", None)
@@ -38,12 +34,11 @@ def mesh_plan(mesh, n, backend):
                         price_only=True)
     return dataclasses.replace(p, backend="cusolvermp")
 spe._face_eigh = mesh_plan
-def wbpr(plan, op, shapes, dtype):
-    if plan.backend == "cusolvermp":
-        return NATIVE_EIGH
-    nb, n = int(shapes[0][0]), int(shapes[0][-1])
-    return -(-nb // mesh.size) * 2 * (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n))
-distrib_la.workspace_bytes_per_rank = wbpr
+# cuSOLVERMp's workspace is a native query (GPU only): the run's measured 7.38 GB/rank. Local
+# plans price theirs from the leg's measured cusolverDn row (distrib_la.workspace).
+_wbpr = distrib_la.workspace_bytes_per_rank
+distrib_la.workspace_bytes_per_rank = lambda plan, op, shapes, dtype: (
+    NATIVE_EIGH if plan.backend == "cusolvermp" else _wbpr(plan, op, shapes, dtype))
 
 census, refusals = [], []
 _stack_route = _pl.Plan.stack_route
@@ -86,6 +81,8 @@ from gw.shared_pole_execution import (line_selection_execution, line_selection_r
 from gw.shared_pole_capacity import (face_eigh_room, check_eigh_room, ConstructorCapacity,
                                      constructor_eigenplan)
 from gw.shared_pole_directions import charge_line_selection, port_extent
+from gw.shared_pole_local import book_check_eighs
+from common import timing
 # The driver's arrays live beside the ledger: leg 59998942 measured a 3.13 GB/rank floor
 # ('spole other'; Sigma rule plan 3.17, QP 3.19), what the bind's baseline measures.
 BASELINE = 3_130_000_000
@@ -166,10 +163,12 @@ def constructor_selection():
 stage("constructor direction selection", constructor_selection)
 
 def constructor_reduction():
+    # shared_pole_constructor: the reservation holds the round's operands (program 0); the
+    # round's program is priced by its compiled figure in gram_reduction (price_round).
     receipt = info["receipt"]
     admitted = budget.program_bytes
     actual = face_reduction_bytes(mesh, 1, rows=N, side=SIDE, carrier=carrier)
-    budget.program_bytes = actual
+    budget.program_bytes = 0
     try:
         reserved = budget.plan(SIDE, phase="reduction", runs_in="spole.gram_reduction")
     finally:
@@ -201,25 +200,27 @@ def constructor_reduction():
     args = (tables["points"], tables["active"], S(1, N, F), S(1, N, F), S(1, N, F),
             tuple(S(1, N, extent(INFINITY_W)) for _ in range(5)))
     info["reduction"]["side"] = side
-    with memory.stage("spole.gram_reduction"):      # the phase the reduction's price is booked to
-        pass
-    try:
-        program(*args)
-    except _Traced:
-        pass
+    with timing.section("spole.gram_reduction"):
+        executable, _ = program.checked(*args).compiled(*args)
+        spe.price_round(executable, mesh, budget.ledger.price(reserved))
+    info["reduction"]["compiled_gb"] = executable.memory_analysis().temp_size_in_bytes / 1e9
     return info["reduction"]
 
-class _Traced(Exception):
-    pass
 from distrib_la import _result_check as _rc
-def fake_checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options=None):
-    def call(*args):
-        jax.eval_shape(_rc._in_phase(fn, "all"), *args)      # the whole-chain retry's decisions
-        raise _Traced()
+_checked_program = distrib_la.checked_program
+def census_checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options=None):
+    """The real checked program (compiled on CPU), whose whole-chain retry decisions are also
+    traced for the census (jax.eval_shape)."""
+    call = _checked_program(fn, mesh, out_shardings, in_shardings, compiler_options)
+    compiled = call.compiled
+    def traced(*args):
+        jax.eval_shape(_rc._in_phase(fn, "all"), *args)
+        return compiled(*args)
+    call.compiled = traced
     return call
-distrib_la.checked_program = fake_checked_program
+distrib_la.checked_program = census_checked_program
 spe.distrib_la = distrib_la
-stage("constructor gram_reduction (eval_shape of face_parent_program)", constructor_reduction)
+stage("constructor gram_reduction (compiled face_parent_program)", constructor_reduction)
 
 def constructor_passivity():
     # shared_pole_constructor: model_row = budget.plan(side, phase="model", sample_batch=len(held_ids))
@@ -228,12 +229,9 @@ def constructor_passivity():
     price = spe.face_check_bytes(mesh, N, extent(POLE_BUDGET))
     info["passivity"] = dict(model_gb=model_row["aggregate_bytes_per_rank"] / 1e9, price_gb=price / 1e9)
     r = check_eigh_room(model_row, price)
-    plan = face_eigh(mesh, N, room=r, backend="auto")
-    for nb in (1, 2):
-        plan.stack_route((nb, N, N), np.complex128, "eigh")
+    with timing.section("spole.passivity_held"):      # shared_pole_local.check_round
+        book_check_eighs(face_eigh(mesh, N, room=r, backend="auto"), N)
     info["passivity"]["room"] = str(r)
-    with memory.stage("spole.passivity_held"):      # the phase the check's price is booked to
-        pass
     return info["passivity"]
 stage("constructor passivity_held", constructor_passivity)
 

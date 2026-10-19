@@ -390,9 +390,10 @@ def local_eigh_workspace(n, dtype, platform) -> int:
     query, else the leg's measured row -- cusolverDnXsyevd = 2.0 x LAPACK heevd on CUDA, LAPACK
     itself on the host).  No vendor query is issued while planning (a query at trace time could
     create a handle mid-run)."""
-    from lxkit import LEGS, memory
-    leg, lib = (LEGS["CUDA"], "cusolverdn") if platform == "CUDA" else (LEGS["cpu"], "lapack")
-    return int(memory.vendor(leg, lib, "heevd", int(n), 1, np.dtype(dtype).itemsize).fixed)
+    from lxkit import leg_for_platform, memory
+    cuda = platform == "CUDA"
+    return int(memory.vendor(leg_for_platform("CUDA" if cuda else "cpu"), "cusolverdn" if cuda
+                             else "lapack", "heevd", int(n), 1, np.dtype(dtype).itemsize).fixed)
 
 
 def _gathered_bytes(shape, dtype) -> int:

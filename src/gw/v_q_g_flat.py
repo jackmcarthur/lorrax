@@ -456,11 +456,12 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
         if host_per_q > host_budget_bytes:
             memory.admit("V_q host read staging (one q)",
                          memory.priced(host_per_q, "closed form"), host_budget_bytes,
-                         limit_bytes=float("inf"))
+                         device=False)
         else:
             memory.admit("V_q tile (one q)",
                          memory.priced(resident + work + per_q, "closed form"),
-                         TILE_BYTES if budget_bytes is None else budget_bytes)
+                         TILE_BYTES if budget_bytes is None else budget_bytes,
+                         device=budget_bytes is not None)
         q_fit = 1
     q_max = min(int(n_q), q_fit)
     n_tiles = -(-int(n_q) // q_max)

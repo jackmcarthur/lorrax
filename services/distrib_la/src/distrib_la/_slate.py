@@ -456,8 +456,8 @@ def distributed_cholesky(
         # only) only when its reservation exceeds this allowance (cpp/slate/potrf_ffi.cc).
         # Seeded only past the distributed providers' outside allowance (lxkit.legs): within
         # it unseeded SLATE fits outside the arena.
-        from lxkit.legs import DISTRIBUTED_CONTEXT_BYTES
-        attrs["seed_min_bytes"] = int(DISTRIBUTED_CONTEXT_BYTES[0])
+        from lxkit import LEGS
+        attrs["seed_min_bytes"] = int(LEGS["ROCM"].distributed_context[0])
 
     @partial(shard_map, mesh=mesh,
              in_specs=P("x", "y"), out_specs=P("y", "x"),

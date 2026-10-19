@@ -71,7 +71,7 @@ R = M − O_leg − O_dist             the pool's reservation (memory.pool_reser
 
 `O_leg` is the leg's `outside_allowance` (CUDA 3.6 GB, ROCm 4.92 GB: the measured
 outside bytes, 3.0 and 4.1 GB, with the 1.2 margin), `O_dist` the distributed
-providers' contexts (`lxkit.legs.DISTRIBUTED_CONTEXT_BYTES`, 3.6 GB), `O_pend` =
+providers' contexts (`PlatformLeg.distributed_context`, 3.6 GB), `O_pend` =
 `O_dist` under `linalg = distributed` where the allocator does not enforce its
 limit (the contexts open later, outside it), `r` the leg's `memory_reserve`, and
 `T_ord` the rank-order reductions' fixed transient, `lxkit.ORDERED_TRANSIENT_SLABS`

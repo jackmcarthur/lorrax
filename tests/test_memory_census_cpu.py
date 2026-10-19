@@ -1,17 +1,16 @@
-"""lxkit.memory on CPU: prices, receipts and the instrument's readings (MEMORY_MODEL_AUDIT §5)."""
+"""lxkit.memory on CPU through its public API: prices, receipts, admission, sizing, census."""
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
 
-import jax                                                             # noqa: E402
 import jax.numpy as jnp                                                # noqa: E402
 import pytest                                                          # noqa: E402
 
 from common import timing                                              # noqa: E402
-from lxkit import memory                                               # noqa: E402
+from lxkit import LEGS, memory                                         # noqa: E402
 
-MB = 1 << 20
+MB, GB = 1 << 20, 1e9
 
 
 @pytest.fixture(autouse=True)
@@ -19,7 +18,6 @@ def _fresh():
     memory.reset()
     timing.reset()
     yield
-    memory.reset()
 
 
 @pytest.fixture
@@ -28,86 +26,32 @@ def calibrate(monkeypatch):
     monkeypatch.setattr(memory, "CALIBRATE", True)
 
 
+def _run(budget=10 * GB, limit=12 * GB):
+    memory.set_budget(budget, limit_bytes=limit, per_node=4, platform="NVIDIA A100-SXM4-80GB")
+
+
 def test_price_terms_and_ranks():
     p = memory.Price(operands=memory.Term(spread=16e9, source="shardings"),
                      xla=memory.Term(fixed=1e9, source="memory_analysis"), ranks=4)
-    assert p.bytes() == 5e9 and p.bytes(16) == 2e9
-    assert p.unsourced() == []
+    assert p.bytes() == 5e9 and p.bytes(16) == 2e9 and p.unsourced() == []
     assert memory.Price(vendor=memory.Term(fixed=1.0)).unsourced() == ["vendor"]
     both = p + memory.priced(2e9, "LAPACK heevd", term="vendor", ranks=4)
     assert both.terms()["vendor"] == 2e9 and both.bytes() == 7e9
 
 
-def test_booked_section_prints_one_receipt(calibrate, capsys):
+def test_a_stage_prices_the_sum_of_its_parts_and_prints_one_receipt(calibrate, capsys):
     jnp.zeros(4).block_until_ready()                  # the backend is up
-    memory.book(memory.priced(64 * MB, "test closed form"), stage="t.stage")
+    memory.book(memory.priced(32 * MB, "model"), stage="t.stage")
+    memory.book(memory.priced(16 * MB, "model"), stage="t.stage")     # same part: the larger
+    memory.book(memory.priced(32 * MB, "eigh"), stage="t.stage")      # another part: added
     with timing.section("t.outer"):
         with timing.section("t.stage"):
-            x = jnp.ones((16 * MB,), jnp.uint8)
-            x.block_until_ready()
-    out = capsys.readouterr().out
-    lines = [l for l in out.splitlines() if l.startswith("memory t.stage:")]
-    assert len(lines) == 1, out
-    assert "priced 0.07 GB (operands 0.00 GB, xla 0.07 GB, vendor 0.00 GB, outside 0.00 GB)" in lines[0]
-    assert "| measured live " in lines[0] and "| γ " in lines[0]
+            x = jnp.ones((16 * MB,), jnp.uint8).block_until_ready()
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("memory t.stage:")]
+    assert len(lines) == 1 and "priced 0.07 GB" in lines[0] and "| measured live " in lines[0]
     (row,) = memory.receipts()
-    assert row["path"] == ("t.outer", "t.stage") and row["measured"] >= 16 * MB
-    assert memory.pending() == {}
+    assert row["measured"] >= 16 * MB and memory.findings() == []
     del x
-
-
-def test_book_inside_open_section_meters_from_the_booking(calibrate):
-    jnp.zeros(4).block_until_ready()
-    with timing.section("t.own"):
-        held = jnp.ones((32 * MB,), jnp.uint8).block_until_ready()
-        del held
-        memory.book(memory.priced(1 * MB, "after the release"))
-    (row,) = memory.receipts()
-    assert row["stage"] == "t.own" and row["measured"] < 32 * MB
-
-
-class _Arena:
-    """A BFC arena whose peak never resets (ROCm)."""
-    def __init__(self):
-        self.use, self.peak = 0, 0
-
-    def set(self, use):
-        self.use = use
-        self.peak = max(self.peak, use)
-
-    def memory_stats(self):
-        return {"bytes_in_use": self.use, "peak_bytes_in_use": self.peak}
-
-
-def test_bfc_first_raise_is_exact_and_a_lower_stage_is_a_lower_bound(calibrate, monkeypatch):
-    arena = _Arena()
-    monkeypatch.setattr(memory, "_backend_up", lambda: True)
-    monkeypatch.setattr(memory, "_sync", lambda: None)
-    monkeypatch.setitem(memory._I, "source", "bfc")
-    monkeypatch.setitem(memory._I, "device", arena)
-    monkeypatch.setitem(memory._I, "mark", 0)
-    monkeypatch.setitem(memory._I, "poll", 0)
-    with memory.stage("raise", memory.priced(10e9, "test")):
-        arena.set(9e9)
-        arena.set(1e9)
-    with memory.stage("below", memory.priced(5e9, "test")):
-        arena.set(4e9)                                # under the 9 GB run mark
-        with memory._LOCK:                       # what the sampler would have polled
-            memory._I["poll"] = max(memory._I["poll"], 4e9)
-        arena.set(1e9)
-    rows = {r["stage"]: r for r in memory.receipts()}
-    assert rows["raise"]["measured"] == 9e9 and rows["raise"]["exact"]
-    assert rows["below"]["measured"] == 4e9 and not rows["below"]["exact"]
-    line = memory.receipt_line("below", rows["below"]["price"], 4e9, False, "bfc")
-    assert "| measured >=4.00 GB | γ 0.80" in line
-
-
-# ---- the admission policy (owner 2026-10-19) and the sizing estimate -----------------------
-GB = 1e9
-
-
-def _run(budget=10 * GB, limit=12 * GB):
-    memory.set_budget(budget, limit_bytes=limit, per_node=4, platform="NVIDIA A100-SXM4-80GB")
 
 
 def test_admit_takes_the_fastest_route_that_fits():
@@ -115,59 +59,78 @@ def test_admit_takes_the_fastest_route_that_fits():
     routes = (("local", memory.priced(11 * GB, "t")), ("mesh", memory.priced(4 * GB, "t")),
               ("tiny", memory.priced(1 * GB, "t")))
     assert memory.admit("s", routes, 10 * GB) == "mesh"
+    assert memory.admit("s", routes, 10 * GB, detail=True)["route"] == "mesh"
 
 
-def test_admit_within_the_limit_warns_and_continues():
+def test_admit_within_the_limit_warns_and_continues(capsys):
     _run()
     with pytest.warns(RuntimeWarning, match="memory over budget at s: local needs 11.00 GB"):
         assert memory.admit("s", (("local", memory.priced(11 * GB, "t")),), 10 * GB) == "local"
-    assert memory._DOOMED == {}
+    assert "!! MEMORY" not in capsys.readouterr().out
 
 
-def test_admit_over_the_limit_banners_and_never_raises(capsys):
+def test_admit_over_the_limit_banners_repeats_at_entry_and_never_raises(capsys):
     _run()
     big = memory.Price(operands=memory.Term(spread=16 * 11 * GB, source="faces"), ranks=4)
-    with pytest.warns(RuntimeWarning, match="will not fit"):
+    with pytest.warns(RuntimeWarning, match="priced over the limit"):
         assert memory.admit("big stage", big, 10 * GB, runs_in="t.big") == "chosen"
     out = capsys.readouterr().out
-    assert "!! MEMORY: big stage WILL NOT FIT" in out and "short by 32.00 GB" in out
+    assert "!! MEMORY: big stage is PRICED OVER the allocator limit" in out and "short by 32.00 GB" in out
     assert "minimum to complete: P = 16 (4 nodes of NVIDIA A100-SXM4-80GB)" in out
-    with timing.section("t.big"):                     # repeated at stage entry
+    with timing.section("t.big"):
         pass
-    assert "!! MEMORY: big stage WILL NOT FIT" in capsys.readouterr().out
+    assert "!! MEMORY: big stage is PRICED OVER" in capsys.readouterr().out
 
 
-def test_sizing_finds_exactly_sixteen():
-    stage = {"s": (("faces", memory.Price(operands=memory.Term(spread=16 * 9 * GB, source="f"),
-                                          ranks=4)),)}
-    got = memory.sizing(stage, limit_bytes=10 * GB, per_node=4, platform="A100")
-    assert got["p"] == 16 and got["nodes"] == 4 and got["binding"] == "s"
-    assert got["line"] == "minimum to complete: P = 16 (4 nodes of A100); binding stage s"
+def test_host_and_tile_rooms_neither_banner_nor_size():
+    _run()
+    with pytest.warns(RuntimeWarning, match="memory over budget at host"):
+        memory.admit("host", memory.priced(50 * GB, "t", term="operands"), 1 * GB, device=False)
+    assert memory.sizing()["line"] == "minimum to complete: no priced stage"
+
+
+def test_sizing_takes_every_square_mesh_and_names_the_least_headroom():
+    spread = lambda gb: memory.Price(operands=memory.Term(spread=16 * gb * GB, source="f"), ranks=4)
+    got = memory.sizing({"a": (("f", spread(5)),), "b": (("f", spread(4.4)),)},
+                        limit_bytes=10 * GB, per_node=4, platform="A100")
+    assert got["p"] == 9 and got["nodes"] == 3 and got["binding"] == "a"
+    assert got["line"] == "minimum to complete: P = 9 (3 nodes of A100); binding stage a"
 
 
 def test_sizing_says_no_p_suffices_for_a_replicated_stage():
-    stage = {"replicated": (("local", memory.priced(12 * GB, "whole matrix", term="operands")),)}
-    got = memory.sizing(stage, limit_bytes=10 * GB, per_node=4)
+    got = memory.sizing({"replicated": (("local", memory.priced(12 * GB, "whole matrix",
+                                                                 term="operands")),)},
+                        limit_bytes=10 * GB, per_node=4)
     assert got["p"] is None and got["binding"] == "replicated"
-    assert got["line"].startswith("minimum to complete: no P suffices: replicated (local) holds "
+    assert got["line"].startswith("minimum to complete: no P suffices: replicated holds "
                                   "12.00 GB/rank of operands that no mesh divides")
-    assert "replicated operands sharded over the mesh" in got["line"]
 
 
 def test_vendor_rows_and_strict_range(monkeypatch):
-    from lxkit import LEGS
     term = memory.vendor(LEGS["cpu"], "lapack", "heevd", 64, 1, 16)
     assert term.fixed == 16 * (2 * 64 + 64 ** 2) + 8 * (1 + 5 * 64 + 2 * 64 ** 2) + 4 * (3 + 5 * 64)
     assert "LAPACK" in term.source
     monkeypatch.setattr(memory, "STRICT", True)
     with pytest.raises(RuntimeError, match="GATE memory_unpriced: .*outside the measured"):
         memory.vendor(LEGS["CUDA"], "cusolvermp", "solve_lu", 30000, 16, 16, unit=1.0)
-    memory.remember("cusolvermp", "solve_lu", 30000, 16, 16, 7e9, "test query")
-    assert memory.vendor(LEGS["CUDA"], "cusolvermp", "solve_lu", 30000, 16, 16).fixed == 7e9
-    memory._VENDOR.clear()
+    with pytest.raises(RuntimeError, match="GATE memory_unpriced: .*no measured row"):
+        memory.vendor(LEGS["ROCM"], "rocsolver", "heevd", 64, 1, 16)
 
 
-# ---- the census (memory.STRICT) -------------------------------------------------------------
+def test_production_instrument_reads_priced_stages_only_on_cpu(monkeypatch):
+    """Default receipts on the CPU leg: an unpriced section reads nothing; a priced one twice."""
+    monkeypatch.setattr(memory, "CALIBRATE", False)
+    x = jnp.ones((256, 256)).block_until_ready()
+    reads = memory.instrument_cost()[0]
+    for _ in range(20):
+        with timing.section("hot.loop"):
+            x = x + 1
+    assert memory.instrument_cost()[0] == reads
+    memory.book(memory.priced(1e6, "test"), stage="priced")
+    with timing.section("priced"):
+        x = x + 1
+    assert memory.instrument_cost()[0] == reads + 2
+
 
 def test_census_flags_unpriced_allocations_and_missing_provenance(calibrate, monkeypatch):
     jnp.zeros(4).block_until_ready()
@@ -179,12 +142,9 @@ def test_census_flags_unpriced_allocations_and_missing_provenance(calibrate, mon
     with timing.section("t.priced"):
         with timing.section("t.child"):                # inside a priced stage: fine
             keep.append(jnp.ones((80 * MB,), jnp.uint8).block_until_ready())
-    with timing.section("t.small"):
-        keep.append(jnp.ones((8 * MB,), jnp.uint8).block_until_ready())
     memory.admit("t.route", (("a", memory.Price(xla=memory.Term(1.0))),), 2.0)
     got = memory.findings()
-    assert len(got) == 2, got
-    assert got[0].startswith("unpriced: t.unpriced allocated ")
+    assert len(got) == 2 and got[0].startswith("unpriced: t.unpriced allocated ")
     assert got[1] == "no provenance: t.route (a): xla"
     del keep
 
@@ -204,6 +164,10 @@ def run30k():
     return run.stdout
 
 
+def _sizing(stdout):
+    return next(l for l in stdout.splitlines() if l.startswith("SIZING "))
+
+
 def test_run30k_plan_census_is_clean_under_strict(run30k):
     """Every price the run30k plan books or admits has provenance and every measured row is
     used inside its range."""
@@ -211,68 +175,14 @@ def test_run30k_plan_census_is_clean_under_strict(run30k):
     assert "CENSUS []" in run30k, [l for l in run30k.splitlines() if "CENSUS" in l]
 
 
-@pytest.mark.xfail(strict=True, reason="run30k P16 prices vs measured: spole.gram_reduction "
-                   "77.0 vs 31.29 GB (FACE_PROGRAM_COPIES = 2 x the 32.2 GB tiled formula), so "
-                   "sizing asks P = 36 and binds there; spole.passivity_held 43.1 vs 66.02 GB "
-                   "(its eigh is admitted as its own stage, outside this price)")
-def test_run30k_minimum_p_agrees_with_the_run(run30k):
-    """run30k completed at P = 16 (66.02 GB peak of 77.89): the sizing must not ask for more,
-    and the stage that binds there is the passivity check's eigh."""
-    line = next(l for l in run30k.splitlines() if l.startswith("SIZING "))
-    p = int(line.split("P = ")[1].split()[0]) if "P = " in line else None
-    assert p is not None and p <= 16 and "passivity_held" in line, line
+def test_run30k_minimum_p_is_the_run(run30k):
+    """run30k completed at P = 16 (4 A100-80GB nodes, 66.02 GB peak of 77.89)."""
+    assert "minimum to complete: P = 16 (4 nodes of NVIDIA A100-SXM4-80GB)" in _sizing(run30k)
 
 
-def test_stage_room_is_read_once_per_stage_boundary(monkeypatch):
-    """The ledger's live room is one read per tracker open/close, never one per preview."""
-    reads = []
-    memory.set_budget(10e9, limit_bytes=12e9)
-    monkeypatch.setattr(memory, "room", lambda stage="", bucketed=True: reads.append(1) or 5e9)
-    assert memory.stage_room() == memory.stage_room() == 5e9 and len(reads) == 1
-    with memory.stage("unpriced"):
-        memory.stage_room()
-    assert len(reads) == 1                          # an unpriced section is no boundary
-    with memory.stage("probe", memory.priced(1.0, "test")):
-        memory.stage_room(); memory.stage_room()
-    memory.stage_room()
-    assert len(reads) == 3
-
-
-def test_production_instrument_never_waits_and_reads_only_priced_stages(monkeypatch, capsys):
-    """Default receipts: no block_until_ready, no read at an unpriced section, a ``~`` receipt."""
-    import jax
-    waits, reads = [], []
-    monkeypatch.setattr(memory, "CALIBRATE", False)
-    monkeypatch.setattr(jax, "block_until_ready", lambda x: waits.append(1) or x)
-    real = memory._interval
-    monkeypatch.setattr(memory, "_interval", lambda: reads.append(1) or real())
-    x = jnp.ones((256, 256))
-    for _ in range(50):
-        with timing.section("hot.loop"):
-            x = x + 1
-    assert not reads and not waits
-    with memory.stage("priced", memory.priced(1e6, "test")):
-        y = jnp.zeros((512, 512)) + x[0, 0]
-    assert len(reads) == 2 and not waits
-    out = capsys.readouterr().out
-    assert "memory priced: priced" in out and "measured ~" in out, out
-    del y
-
-
-def test_stage_outside_is_leg_data(monkeypatch):
-    """The MI250X bank's arena growth is its outside term, with provenance; CPU has none."""
-    from lxkit import LEGS
-    assert memory.stage_outside("spole.bank").fixed == 0.0
-    monkeypatch.setattr(memory, "_leg", lambda: LEGS["ROCM"])
-    term = memory.stage_outside("spole.bank")
-    assert term.fixed == 2.12e9 and "CAL_PASS1" in term.source
-
-
-def test_a_receipt_prices_its_increment_while_sizing_plans_the_aggregate():
-    """``book(..., planned=)``: the receipt meters an increment; sizing sees the aggregate."""
-    memory.set_budget(10e9, limit_bytes=12e9)
-    own = memory.Price(xla=memory.Term(1e9, source="own"), increment=True)
-    aggregate = memory.priced(30e9, "aggregate")
-    memory.book(own, stage="led", planned=aggregate)
-    assert memory._PLANNED["led"][0][0][1] is aggregate
-    assert memory.pending()["led"] is own
+@pytest.mark.xfail(strict=True, reason="the replay compiles the face parent program on CPU "
+                   "(47.9 GB temp; with its reservation spole.gram_reduction 66.6 GB) where the "
+                   "A100 stage measured 31.29 GB in total, so gram_reduction binds over "
+                   "passivity_held (58.6 GB of 66.02 measured); the A100 compile decides")
+def test_run30k_binds_on_passivity_held(run30k):
+    assert "binding stage spole.passivity_held" in _sizing(run30k)

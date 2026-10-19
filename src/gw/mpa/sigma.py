@@ -1087,7 +1087,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     if not sector and projection_bytes > U:
         from lxkit import memory
         memory.admit(f"{stage} parent star (all-P logical bound)",
-                     memory.priced(projection_bytes, "closed form"), U)
+                     memory.priced(projection_bytes, "closed form"), U, device=False)
     receipt = capacity.reserve(
         f"{stage}.synthesis", resident_bytes_per_rank=resident,
         workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
@@ -1359,9 +1359,6 @@ class SynthesisTau:
         counted = sum(int(x.addressable_shards[0].data.nbytes)
                       for x in jax.tree.leaves(self._synthesis.resident_operands()))
         from runtime.aot_memory import aot_kernel_peak_bytes
-        from lxkit import memory
-        memory.book(memory.priced(0, "tau.memcheck: reads memory_analysis, allocates nothing",
-                                  increment=True), stage="tau.memcheck")
         with timing.section('tau.memcheck'):
             peak = aot_kernel_peak_bytes(compiled)
         _admit(compiled, self._meta, self._stage, native=self._native, counted=counted,
@@ -1478,13 +1475,6 @@ def _integrate_sigma_batches(
     # None``), which is never fenced whatever a harness has installed.
     synthesis = w_synthesis is not None
     fence = _band_fence if synthesis else _unfenced
-    from lxkit import memory
-    carrier = wfns.green_parent
-    psi_pair = sum(int(x.addressable_shards[0].data.nbytes) for x in (carrier.psi_mun, carrier.psi_nmu))
-    copies = 4 if carrier.layout == "axis" else 3
-    memory.book(memory.priced(copies * psi_pair, f"tau.setup: projection transposes, band pads and "
-                              f"row-pass copies of the parent psi pair (<= {copies} x its shard "
-                              f"bytes, provisional bound)", increment=True), stage="tau.setup")
     fence('tau.setup', sync_ranks=True)
     with timing.section('tau.setup'):
         s = wfns.slices
@@ -1651,9 +1641,6 @@ def _integrate_sigma_batches(
                 if synthesis else _batch_rows(row, batch))
             if selected is None:
                 continue
-            memory.book(memory.priced(psi_pair, "tau.window_arguments: one window's selected "
-                                      "operands (<= the parent psi pair, provisional bound)",
-                                      increment=True), stage="tau.window_arguments")
             fence('tau.window_arguments', sync_ranks=True)
             with timing.section('tau.window_arguments'):
                 win = row.window

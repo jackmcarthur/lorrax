@@ -634,7 +634,7 @@ def _plan_rows_pass(geom: dict, *, rows: int, omega_rows: int,
             need = _rows_pass_bytes(geom, rows=1, fft_rows=1, local_cols=cols,
                                     omega_rows=omega_rows, resident=resident)
             memory.admit(f"Galerkin fit {name} (one state)",
-                         memory.priced(need, "closed form"), capacity)
+                         memory.priced(need, "closed form"), capacity, device=False)
             break
         groups *= 2
     fft = _largest_fit(per, lambda f: _rows_pass_bytes(
@@ -668,7 +668,7 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
         memory.admit(f"Galerkin all-states projection (band carrier {band_carrier})",
                      memory.priced(_projection_bytes(geom, band_carrier=band_carrier, rank=rank,
                                                      local_cols=1, k_tile=1), "closed form"),
-                     capacity)
+                     capacity, device=False)
     groups = 1
     while True:
         per = -(-int(rows) // groups)
@@ -683,7 +683,7 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
         from lxkit import memory
         need = _rows_pass_bytes(geom, rows=per, fft_rows=1, local_cols=1, omega_rows=0,
                                 resident=x_resident)
-        memory.admit("Galerkin selected-row pass", memory.priced(need, "closed form"), capacity)
+        memory.admit("Galerkin selected-row pass", memory.priced(need, "closed form"), capacity, device=False)
     cols = x_cols
     k_tile = max(d for d in range(1, nk + 1) if nk % d == 0 and (
         d == 1 or _projection_bytes(

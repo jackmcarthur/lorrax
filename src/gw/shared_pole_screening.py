@@ -674,9 +674,6 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 write=lambda: path.write_text(_json(receipt) + "\n"))
             print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
                      f"seconds={receipt.get('seconds', {})}")
-    from lxkit import memory
-    memory.book(memory.Price(outside=memory.stage_outside("spole.bank"), increment=True,
-                             label="spole.bank"), stage="spole.bank")
     with timing.section("spole.bank"):
         if resume_constructor:
             print_fn('shared-pole bank: not produced; '
