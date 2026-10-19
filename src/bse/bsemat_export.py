@@ -232,17 +232,35 @@ def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy):
     return psi, enk, receipts
 
 
+def exchange_tile_momentum(Q):
+    """The tile momentum of the finite-Q exchange: wrap(+Q), crystal.
+
+    Row k's exchange contracts conj(ρ_vc) on the left and ρ_v'c' on the right,
+    ρ_vc = ψ*_{v,k−Q} ψ_{c,k}, a density of momentum +Q. LORRAX's tile V_q
+    contracts a left density of momentum −q against a right one of momentum
+    +q (the direct term takes W(k − k') with C_cc', momentum k' − k, on the
+    left), so the exchange takes q = +Q (docs/theory/bgw-bsemat-export.md#finite-q,
+    E12). At Q = 0 both labels are one tile; at finite Q they are different
+    tiles (conjugate under time reversal) and only +Q reproduces the plane-wave
+    exchange (``tests/test_bsemat_finite_q_cpu.py``).
+    """
+    q = np.asarray(Q, dtype=np.float64).reshape(3)
+    return q - np.round(q)
+
+
 def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad, mesh_xy):
     """The exchange tile the file contracts (μ, ν) at ``P('x','y')``, and its receipt.
 
     At Q = 0 this is the head-less Γ tile: kernel.x drops G = 0 (E1d). At
-    finite Q it is V at tile momentum wrap(−Q) with every G kept. That is
-    BerkeleyGW's ``energy_loss`` exchange v(−Q+G) (``kernel_main.f90``:
-    ``vcoularray(:, nf+1)`` at ``finiteq``), taken from
-    ``bse.exchange_path.exchange_tiles``, the evaluator ``bse.exciton_bands``
-    solves with. On the grid it is the stored tile (``ongrid``, exact); off
-    the grid it is the per-Q ζ refit on the BSE window (``refit``, the
-    arbitrary-Q route).
+    finite Q it is V at tile momentum :func:`exchange_tile_momentum` (Q) =
+    wrap(+Q) with every G kept: BerkeleyGW's ``energy_loss`` exchange, whose
+    plane wave e^{i(Q_s+G)·r} (``kernel_main.f90``: ``vcoularray(:, nf+1)`` at
+    ``finiteq`` = Q_s = −Q) picks the density component of momentum Q − G
+    (E12). The tile comes from ``bse.exchange_path.exchange_tiles``, the
+    evaluator ``bse.exciton_bands`` solves with; that evaluator labels the
+    tile of its argument Q' as wrap(−Q'), so it is called with −Q. On the
+    grid it is the stored tile (``ongrid``, exact); off the grid it is the
+    per-Q ζ refit on the BSE window (``refit``, the arbitrary-Q route).
     """
     from .exchange_path import exchange_tiles
     if qflag == 1:
@@ -258,16 +276,19 @@ def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad
         rst = vq_interp.refit_prepare(input_file, mesh_xy, zx, log_fn=_log, policy=zx.get("policy"),
                                       keep_idx=None, window_mode="bse")
         route, refit = "refit", (rst["zx_fit"], rst)
+    q_tile = exchange_tile_momentum(Q)
     V_stack, _, _, _ = exchange_tiles(
-        np.asarray(Q, dtype=np.float64).reshape(1, 3), route=route, mesh_xy=mesh_xy,
+        -q_tile.reshape(1, 3), route=route, mesh_xy=mesh_xy,          # its tile is wrap(-arg) = q_tile
         V_q0=data["V_q0"], V_ongrid=data.get("V_q_full"), kgrid_vq=np.asarray(grid),
         n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, refit=refit, log_fn=_log)
     V = jax.jit(lambda s: s[0], out_shardings=NamedSharding(mesh_xy, P("x", "y")))(V_stack)
     if rst is not None:
         from . import vq_interp
         vq_interp.close_refit_state(rst)
-    return V, ("stored tile V[wrap(-Q)], every G (energy_loss)" if qflag == 2 else
-               "per-Q zeta refit on the BSE window at wrap(-Q), every G (energy_loss)")
+    return V, (f"stored tile V[wrap(+Q) = {np.round(q_tile, 9).tolist()}], every G (energy_loss)"
+               if qflag == 2 else
+               f"per-Q zeta refit on the BSE window at wrap(+Q) = {np.round(q_tile, 9).tolist()}, "
+               "every G (energy_loss)")
 
 
 # ---------------------------------------------------------------------------

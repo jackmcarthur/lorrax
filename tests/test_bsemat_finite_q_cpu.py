@@ -1,4 +1,4 @@
-"""Finite-Q bsemat bookkeeping (``bse.bsemat_export.finite_q_legs``, the header), host only.
+"""Finite-Q bsemat bookkeeping (``bse.bsemat_export.finite_q_legs``, the exchange tile momentum, the header), host only.
 
 CPU clause of the four-GPU rule: index arithmetic and file layout, no mesh. The
 finite-Q kernel itself is verified end to end by BerkeleyGW absorption on the file
@@ -40,6 +40,43 @@ def test_on_grid_q_pairs_are_exciton_bands_pairs():
     # Red twin: the opposite sign (hole at k + Q) is the exciton at −Q, a different pair set.
     wrong = set(zip(_gi(K + Q).tolist(), _gi(K).tolist()))
     assert wrong != exb_pairs
+
+
+def _toy_tile(q, r_mu, ns, v):
+    """V_q of a 1-D toy whose centroids are every grid point (ISDF exact on the band window)."""
+    n = np.arange(-ns // 2, ns // 2)
+    p = q + 2 * np.pi * n                                         # plane waves of momentum q + G
+    zh = np.exp(-1j * np.outer(p, r_mu)) / ns                     # FT of zeta_{q mu}: (1/N) e^{-i p r_mu}
+    return (zh.conj().T * v(p)) @ zh, p
+
+
+def test_exchange_tile_momentum_is_plus_q_against_plane_waves():
+    """E12: conj(rho_vc) V_q rho_v'c' with rho = psi*_{v,k-Q} psi_{c,k} reproduces the plane-wave exchange only
+    at q = exchange_tile_momentum(Q) = +Q. Red twin: the tile at -Q (the conjugate label) does not."""
+    from bse.bsemat_export import exchange_tile_momentum
+    rng = np.random.default_rng(7)
+    N, Q = 16, np.array([0.25, 0.0, 0.0])
+    r = np.arange(N) / N
+    v = lambda p: 1.0 / (p ** 2 + 0.3)
+    def bloch(k):                                                 # band-limited u, |G| <= 2
+        c = rng.normal(size=5) + 1j * rng.normal(size=5)
+        return np.exp(1j * k * r) * (c @ np.exp(2j * np.pi * np.outer(np.arange(-2, 3), r)))
+    ks = 2 * np.pi * np.array([0.0, 0.25, 0.5])
+    rho = np.array([bloch(k - 2 * np.pi * Q[0]).conj() * bloch(k) for k in ks])   # momentum +Q
+    # plane-wave exchange: L sum_p conj(rho(p)) v(p) rho'(p), p in Q + 2 pi Z
+    n = np.arange(-N // 2, N // 2)
+    p = 2 * np.pi * (Q[0] + n)
+    rh = rho @ np.exp(-1j * np.outer(r, p)) / N
+    X_pw = (rh.conj() * v(p)) @ rh.T
+    q = exchange_tile_momentum(Q)
+    assert np.allclose(q, [0.25, 0, 0], rtol=0, atol=1e-15)
+    V_plus, _ = _toy_tile(2 * np.pi * q[0], r, N, v)
+    V_minus, _ = _toy_tile(-2 * np.pi * q[0], r, N, v)
+    X_plus = rho.conj() @ V_plus @ rho.T
+    X_minus = rho.conj() @ V_minus @ rho.T
+    assert np.linalg.norm(X_plus - X_pw) / np.linalg.norm(X_pw) < 1e-12
+    assert np.linalg.norm(X_minus - X_pw) / np.linalg.norm(X_pw) > 1e-2, "the -Q tile must not reproduce it"
+    assert np.allclose(exchange_tile_momentum([0, 0, 0]), 0.0) and np.allclose(exchange_tile_momentum([1.25, 0, 0]), [0.25, 0, 0])
 
 
 def test_off_grid_q_needs_the_shifted_wfn_co():
