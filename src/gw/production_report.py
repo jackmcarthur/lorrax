@@ -188,6 +188,30 @@ class _Band:
         return under(self.plus) and not under(self.minus)
 
 
+#: Sections whose own device peak the memory table prints beside the stage rows.
+_SUBSTAGE_PEAKS = ("spole.gram_reduction", "spole.passivity_held", "head.sample_terms")
+
+
+def _substage_peak_lines(paths, rows):
+    """Lines of the memory table for :data:`_SUBSTAGE_PEAKS`: each section's own pool
+    high-water (max over its calls, max / min over ranks) and where it ran."""
+    sub = {}
+    for path, row in zip(paths, rows):
+        if path and path[-1] in _SUBSTAGE_PEAKS:
+            peak = _rank_peaks(row, "peak")
+            if np.any(np.isfinite(peak)):
+                old = sub.get(path[-1])
+                sub[path[-1]] = (peak if old is None else np.fmax(old[0], peak), path)
+    if not sub:
+        return []
+    lines = ["  constructor sub-stages, each section's own pool high-water (max over its calls):"]
+    for name in _SUBSTAGE_PEAKS:
+        if name in sub:
+            peak, path = sub[name]
+            lines.append(f"    {name}: peak {_gb_pair(peak, 0)} GB; {' > '.join(path[-3:])}")
+    return lines
+
+
 def _rank_peaks(row, key):
     """Every rank's value of a record's peak (bytes; NaN = unmeasured)."""
     ranks = row.get(key + "_ranks")
@@ -953,6 +977,10 @@ class GWProductionReport:
                 tail = f"{'–':>9}  no planner"
             self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}  {host}  "
                       f"{' > '.join(setter[-2:])}")
+        # Constructor sub-stages with their own pool high-water (TimingNode.peak), so a leg
+        # measures what the reduction, passivity and head prices are calibrated against.
+        for line in _substage_peak_lines(paths, rows):
+            self.emit(line)
         if priced:
             self.emit("  planner prices, each against the own peak of the section it names:")
             for price, node, peak in priced:

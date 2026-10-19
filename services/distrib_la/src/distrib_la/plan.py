@@ -184,6 +184,48 @@ def cached_scan(key, build):
     return fn
 
 
+class RoomExhausted(NamedTuple):
+    """A room of 0 that a caller KNOWS: its stage was admitted over budget.
+
+    The shared-pole ledger warns and continues (owner ruling 2026-10-01), so an eigh
+    inside such a stage has no budgeted room. The whole mesh is then the
+    minimum-footprint route: :meth:`Plan.stack_route` takes it and prints one
+    warning line, and route (c) stays fail-closed. A plan given room 0 WITHOUT
+    this (a missing room) is refused when it is built (``GATE distrib_la_room``).
+    Pass it as ``budget_bytes``; it counts as 0 bytes.
+    """
+    stage: str             #: the admitted stage that left no room
+    priced_bytes: int      #: its admitted aggregate per rank
+    available_bytes: int   #: the device budget per rank it was admitted against
+
+    def __index__(self):
+        return 0
+
+
+def room_or_exhausted(room, *, stage, priced_bytes, available_bytes):
+    """``room`` when positive, else :class:`RoomExhausted` naming ``stage``."""
+    room = int(room)
+    if room > 0:
+        return room
+    return RoomExhausted(str(stage), int(priced_bytes), int(available_bytes))
+
+
+def _plan_caller(depth=3):
+    """The first frames outside distrib_la that built a plan: 'file:line function' <- ..."""
+    import inspect
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = []
+    for frame in inspect.stack()[2:]:
+        path = os.path.abspath(frame.filename)
+        if path.startswith(here) or os.path.basename(path) in ("dataclasses.py", "functools.py", "<string>"):
+            continue
+        out.append(f"{os.path.relpath(path)}:{frame.lineno} {frame.function}")
+        if len(out) == depth:
+            break
+    return " <- ".join(out) or "?"
+
+
 class StackRoute(NamedTuple):
     """How :meth:`Plan.batched` runs one eigh stack ``(B, n, n)``.
 
@@ -1057,6 +1099,37 @@ class Plan:
     capacity_refusal: str | None = None
     #: What the ``distributed`` size route decided (resolve guard 1b), or None.
     size_route: str | None = field(default=None, compare=False)
+    #: Set when the room is 0 because an admitted over-budget stage exhausted it
+    #: (:class:`RoomExhausted`): the whole mesh with a warning, not a refusal.
+    room_exhausted: RoomExhausted | None = field(default=None, compare=False)
+    #: A plan for pricing only (``distrib_la.workspace`` queries, ``known_route``):
+    #: built with no room, it may never decide or run a stack (:meth:`stack_route`).
+    price_only: bool = False
+
+    def __post_init__(self):
+        # Plan construction (plan() and every dataclasses.replace) is where a missing room
+        # is refused: a room-0 plan whose stacks the room decides would refuse every one,
+        # far from the caller that forgot it.
+        if self.price_only or not self.room_decides:
+            return
+        if int(self.budget_bytes) > 0 or self.room_exhausted is not None:
+            return
+        px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
+        raise RuntimeError(
+            f"GATE distrib_la_room: got: an executing {self.op} plan (n={self.n}) on the {px}x{py} "
+            f"mesh with room 0 and no stage that exhausted it; want: the caller's room per rank "
+            f"(> 0), RoomExhausted(stage, ...) where an admitted over-budget stage leaves none, "
+            f"or plan(..., price_only=True) to price; why: room 0 refuses every stack; "
+            f"caller: {_plan_caller()}")
+
+    @property
+    def room_decides(self) -> bool:
+        """True when :meth:`stack_route` decides this plan's eigh stacks from its room."""
+        if (self.op != "eigh" or self.requested_batched_route != "auto" or self.budget_bytes is None
+                or (self.is_native and self.capacity_refusal is None)
+                or self.batched_route == ROUTE_BATCH_RESHARD):
+            return False
+        return int(self.mesh.shape["x"]) * int(self.mesh.shape["y"]) > 1
 
     # ---- introspection -------------------------------------------------
     @property
@@ -1219,6 +1292,11 @@ class Plan:
         :meth:`describe`, and :func:`new_stack_routes` hands each to a driver
         log once.
         """
+        if self.price_only:
+            raise RuntimeError(
+                f"GATE distrib_la_price_only: got: a stack {tuple(shape)} decided on a price-only "
+                f"{self.op} plan; want: an executing plan with the caller's room; why: a pricing "
+                f"plan has no room; caller: {_plan_caller()}")
         static = self.batched_route
         shape = tuple(int(v) for v in shape)
         nb = shape[0] if len(shape) == 3 else 1
@@ -1241,7 +1319,15 @@ class Plan:
             if decided.route != ROUTE_BATCH_RESHARD:
                 self.require_capacity(
                     f"the eigh stack {shape} ({_describe_stack(decided)})")
-                if decided.program_bytes > decided.room:
+                if decided.program_bytes > decided.room and self.room_exhausted is not None:
+                    # The stage was admitted over budget: the whole mesh is the smallest route.
+                    x = self.room_exhausted
+                    print(f"warning: distrib_la {op} stack {shape} {np.dtype(dtype).name}: room "
+                          f"exhausted by the admitted over-budget stage {x.stage} (priced "
+                          f"{x.priced_bytes / 1e9:.2f} GB/rank of {x.available_bytes / 1e9:.2f}); "
+                          f"on the whole mesh at {decided.program_bytes / 1e9:.2f} GB/rank, the "
+                          f"minimum-footprint route (an OOM is possible)", flush=True)
+                elif decided.program_bytes > decided.room:
                     raise RuntimeError(
                         f"GATE distrib_la_capacity: the {op} stack {shape} {np.dtype(dtype).name} "
                         f"needs {decided.program_bytes / 1e9:.2f} GB/rank on the whole mesh, over its "
@@ -1745,7 +1831,8 @@ def _size_routed_library(op: str, requested: str, mesh_xy: Mesh, n, resolved: st
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
          n: int | None = None,
          batched_route: str | None = None,
-         budget_bytes: int | None = None) -> Plan:
+         budget_bytes: int | RoomExhausted | None = None,
+         price_only: bool = False) -> Plan:
     """Resolve ``op`` on ``mesh_xy`` ONCE and return the callable plan.
 
     Every guard (vocabulary, platform, known-broken combinations,
@@ -1791,12 +1878,22 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         The room also caps an explicit ``distributed`` request's size route
         (resolve guard 1b): ``one_device`` only where one whole matrix fits it.
 
+    ``budget_bytes`` may be :class:`RoomExhausted` (0 bytes, a stage admitted over
+    budget: the whole mesh with a warning). An ``auto`` eigh plan that its room
+    decides refuses room 0 otherwise (``GATE distrib_la_room``, naming the caller)
+    unless ``price_only=True``: a plan for pricing queries that never decides or
+    runs a stack (``GATE distrib_la_price_only``).
+
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
     on every plan and :meth:`Plan.batched` is always available), so it could
     only be a second way to say what the call already says — which is the
     kind of concept this extraction exists to remove, not add.
     """
+    # A room exhausted by an admitted over-budget stage counts as 0 bytes (RoomExhausted).
+    exhausted = budget_bytes if isinstance(budget_bytes, RoomExhausted) else None
+    if exhausted is not None:
+        budget_bytes = 0
     if op not in OPS:
         raise ValueError(f"unknown linalg op {op!r} (known: {'|'.join(OPS)})")
     route_defaulted = batched_route is None and budget_bytes is None
@@ -1844,4 +1941,5 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
                 in_sharding=tile, batch_in_sharding=stack,
                 requested_batched_route=batched_route,
                 budget_bytes=budget_bytes, capacity_refusal=capacity_refusal,
-                size_route=size_route_note(op, backend, mesh_xy, n, resolved, budget_bytes))
+                size_route=size_route_note(op, backend, mesh_xy, n, resolved, budget_bytes),
+                room_exhausted=exhausted, price_only=bool(price_only))

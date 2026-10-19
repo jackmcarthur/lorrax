@@ -84,11 +84,11 @@ def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     """
     import math
     import distrib_la
-    from gw.shared_pole_capacity import constructor_eigenplan
+    from gw.shared_pole_capacity import constructor_price_plan
     ranks = int(mesh.size)
     blocks = sum(int(a) * int(b) for a in rows for b in rows)
     largest = max(int(r) for r in rows)
-    plan = constructor_eigenplan(mesh, largest, execution, backend=eigh_backend)
+    plan = constructor_price_plan(mesh, largest, execution, backend=eigh_backend)
     if execution == 'local':
         resident = 16 * 2 * math.ceil(int(nq) / ranks) * (blocks + largest ** 2)
         workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((int(nq), largest, largest),), np.complex128)
@@ -150,7 +150,8 @@ def line_selection_room(ledger, resident, *, carry=0):
     from gw.shared_pole_capacity import face_eigh_room
     return face_eigh_room(ledger.preview(resident_bytes_per_rank=int(resident) + int(carry),
                                          workspace_bytes_per_rank=0,
-                                         concurrent_with=ledger.live_stages))
+                                         concurrent_with=ledger.live_stages),
+                          stage="shared-pole line selection")
 
 
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
@@ -375,11 +376,11 @@ def face_matmul(mesh):
 @lru_cache(maxsize=None)
 def _face_eigh(mesh, n, backend):
     from distrib_la import plan
-    return plan('eigh',mesh,n=int(n),backend=backend,budget_bytes=0)
+    return plan('eigh',mesh,n=int(n),backend=backend,budget_bytes=0,price_only=True)
 
 
-def face_eigh(mesh, n, room=None, *, backend):
-    """The whole-mesh constructor's n x n eigh plan.
+def face_eigh(mesh, n, *, room, backend):
+    """The whole-mesh constructor's n x n eigh plan, deciding each stack in ``room``.
 
     ``backend`` is the deck's eigh request, ``LinalgResolution.eigh_backend``
     (``gw.gw_config.resolve_linalg``): ``auto`` under ``linalg = local``
@@ -387,18 +388,31 @@ def face_eigh(mesh, n, room=None, *, backend):
     does not, refused by name where the leg has none), ``distributed`` under
     ``linalg = distributed`` (refused at plan time where the leg has none).
 
-    ``room`` is the caller's device bytes per rank beside its admitted live
-    set (``face_eigh_room``), the same on every rank. distrib_la decides each
-    stack from it: whole matrices per rank where the program that runs it
-    fits the room, else the whole mesh. Without a room (``None``: the pricing
-    plans of ``line_selection_price`` and ``ConstructorCapacity.quote``) the
-    room is 0, and distrib_la refuses any stack an executing caller hands it:
-    a caller that runs stacks passes its stage's room. The room rides on the plan as its decision input and is in no
-    cache key: plans that differ only by room are equal, so the programs
-    built on them (``face_parent_program`` and the others) are shared.
+    ``room`` is required: the caller's device bytes per rank beside its admitted
+    live set (``face_eigh_room``), the same on every rank, or
+    ``distrib_la.RoomExhausted`` when an admitted over-budget stage left none
+    (the whole mesh, with a warning). ``None`` is refused here by name and room
+    0 by distrib_la when the plan is built (``GATE distrib_la_room``); a pricing
+    caller uses :func:`face_eigh_price`. The room rides on the plan as its
+    decision input and is in no cache key: plans that differ only by room are
+    equal, so the programs built on them (``face_parent_program`` and the
+    others) are shared.
     """
     import dataclasses
-    return dataclasses.replace(_face_eigh(mesh, int(n), str(backend)), budget_bytes=int(room or 0))
+    if room is None:
+        raise ValueError("GATE shared_pole_eigh_room: got: face_eigh(room=None); want: the caller's "
+                         "room (face_eigh_room) or RoomExhausted; why: a face plan with no room "
+                         "refuses every stack; a pricing caller uses face_eigh_price")
+    from distrib_la import RoomExhausted
+    exhausted = room if isinstance(room, RoomExhausted) else None
+    return dataclasses.replace(_face_eigh(mesh, int(n), str(backend)), budget_bytes=int(room),
+                               room_exhausted=exhausted, price_only=False)
+
+
+def face_eigh_price(mesh, n, *, backend):
+    """The whole-mesh n x n eigh plan for pricing only (``distrib_la.workspace_bytes_per_rank``,
+    ``known_route``): no room, and distrib_la refuses to decide or run a stack on it."""
+    return _face_eigh(mesh, int(n), str(backend))
 
 
 def face_ritz_carrier(mesh, keep_budget):
@@ -456,7 +470,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
 
 
 def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
-                      keep_budget,eigh_backend,retain_span=False,admit=True,gram_keep=None,room=None,carrier=None):
+                      keep_budget,eigh_backend,room,retain_span=False,admit=True,gram_keep=None,carrier=None):
     """A fixed-width batch of parents with every matrix tiled over all ranks.
 
     ``room`` is the room the pencil's eigh stacks are decided against
@@ -473,7 +487,7 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     if admit:
         budget.plan(side,phase='reduction')
     program=lambda room: face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
-                                             face_eigh(mesh,side,room,backend=eigh_backend),
+                                             face_eigh(mesh,side,room=room,backend=eigh_backend),
                                              None if carrier is None else int(carrier))
     from gw.shared_pole_local import pack_panels
     packed=pack_panels(tuple([s[k] for s in states] for k in (1,2,3)),tables['order'],
@@ -730,9 +744,11 @@ def _mesh_eigh(mesh, n, backend):
     # No room: the staged stack did not fit whole matrices per rank, so the size route
     # (distrib_la resolve guard 1b) may not choose them again. The caller priced the mesh,
     # so the plan names its provider route (a room-0 decision would refuse).
-    p = distrib_la.plan('eigh', mesh, n=int(n), backend=backend, budget_bytes=0,
+    # Built price-only (room 0 with an 'auto' request is refused at construction), then
+    # pinned to its provider route, which no room decides.
+    p = distrib_la.plan('eigh', mesh, n=int(n), backend=backend, budget_bytes=0, price_only=True,
                         **({} if backend == 'auto' else dict(batched_route='auto')))
-    return dataclasses.replace(p, requested_batched_route=p.batched_route)
+    return dataclasses.replace(p, requested_batched_route=p.batched_route, price_only=False)
 
 
 def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):

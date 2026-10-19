@@ -63,11 +63,13 @@ def test_face_plans_differ_by_room_share_programs(monkeypatch):
     from gw.shared_pole_execution import face_eigh
     mesh = _mesh()
     monkeypatch.setattr(spe, "_face_eigh", lambda mesh, n, backend: _plan(mesh))   # CPU has no distributed eigh
-    a, b = face_eigh(mesh, 8, 1 << 30, backend="distributed"), face_eigh(mesh, 8, 1 << 31, backend="distributed")
+    a, b = face_eigh(mesh, 8, room=1 << 30, backend="distributed"), face_eigh(mesh, 8, room=1 << 31, backend="distributed")
     assert a == b and hash(a) == hash(b) and a.budget_bytes != b.budget_bytes
-    face = lambda room: constructor_eigenplan(mesh, 8, "face", room, backend="distributed")
-    assert face(1 << 30) == face(None)
-    local = lambda room=None: constructor_eigenplan(mesh, 8, "local", room, backend="distributed")
+    face = lambda room: constructor_eigenplan(mesh, 8, "face", room=room, backend="distributed")
+    assert face(1 << 30) == face(1 << 31)
+    with pytest.raises(ValueError, match="GATE shared_pole_eigh_room"):
+        face(None)                     # a missing room is refused by name
+    local = lambda room=None: constructor_eigenplan(mesh, 8, "local", room=room, backend="distributed")
     assert local() is local(1 << 30)
 
 

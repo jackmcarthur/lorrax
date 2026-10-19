@@ -223,8 +223,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             # admitted batch and the retained factors: whole matrices per rank
             # where they fit, else the whole mesh.
             retained_bound = execution_receipt['retained_output_upper_bound_bytes_per_rank']
-            budget.face_room = face_eigh_room(execution_receipt['face_batch']['selection'], retained_bound)
-            execution_receipt['face_eigh_room_bytes_per_rank'] = dict(selection=budget.face_room)
+            budget.face_room = face_eigh_room(execution_receipt['face_batch']['selection'], retained_bound,
+                                              stage="shared-pole constructor selection")
+            execution_receipt['face_eigh_room_bytes_per_rank'] = dict(selection=int(budget.face_room))
             eig = budget.eigenplan(n)
         from gw.shared_pole_local import parent_rounds
         # One fixed width per route; a short last round repeats its last real parent.
@@ -325,7 +326,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     # with the round's price at its actual side for the batch's.
                     row = execution_receipt['face_batch']['reduction']
                     room = lambda price: face_eigh_room(dict(row, aggregate_bytes_per_rank=(
-                        row['aggregate_bytes_per_rank'] - budget.program_bytes + price)), retained_bound)
+                        row['aggregate_bytes_per_rank'] - budget.program_bytes + price)), retained_bound,
+                        stage="shared-pole constructor reduction round")
                     round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                         round_states, infinity, tables, mesh=mesh_xy,
                         budget=budget, ordered=ordered, odd_moments=odd_moments,

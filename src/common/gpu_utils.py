@@ -101,6 +101,17 @@ def shared_device_room_bytes() -> int:
         max(0.0, device_budget_bytes() - live / len(jax.local_devices())) / 1e9) * 1e9)
 
 
+def shared_device_room(stage: str):
+    """A planner's room beside what is live now: :func:`shared_device_room_bytes`, bucketed
+    (:func:`room_bucket`), or ``distrib_la.RoomExhausted`` naming ``stage`` when the live set
+    already fills the budget (its eigh stacks then take the whole mesh with a warning, not a
+    refusal). Every process must enter this call."""
+    from distrib_la import room_or_exhausted
+    budget, room = int(device_budget_bytes()), shared_device_room_bytes()
+    return room_or_exhausted(room_bucket(room), stage=stage, priced_bytes=budget - room,
+                             available_bytes=budget)
+
+
 def room_bucket(room) -> int:
     """A room as planners key on it: floored to a whole GiB at or above 1 GiB, exact below
     (a sub-GiB room that fits is not rounded to none), 0 when negative."""

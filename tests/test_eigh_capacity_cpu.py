@@ -77,8 +77,13 @@ def test_auto_with_room_runs_route_c_and_refuses_by_name(mesh):
     tiny = dataclasses.replace(p, budget_bytes=10)
     with pytest.raises(RuntimeError, match="GATE eigh_capacity_route"):
         tiny.stack_route((4, 8, 8), np.complex128)
+    # A missing room is refused where the plan is built, naming the caller.
+    with pytest.raises(RuntimeError, match="GATE distrib_la_room.*caller: .*test_eigh_capacity_cpu.py"):
+        dataclasses.replace(p, budget_bytes=0)
+    # A room an over-budget stage exhausted still needs the whole mesh: none here, refused by name.
+    gone = distrib_la.RoomExhausted("a stage", 2 << 30, 1 << 30)
     with pytest.raises(RuntimeError, match="GATE eigh_capacity_route"):
-        dataclasses.replace(p, budget_bytes=0).stack_route((4, 8, 8), np.complex128)
+        dataclasses.replace(p, budget_bytes=0, room_exhausted=gone).stack_route((4, 8, 8), np.complex128)
     with pytest.raises(RuntimeError, match="GATE eigh_capacity_route"):
         p.require_capacity("a whole-mesh stack")
 
@@ -97,10 +102,24 @@ def test_auto_with_room_equals_distributed_where_it_resolves(mesh, monkeypatch):
     assert dataclasses.replace(a, requested="distributed") == d
     ra = dataclasses.replace(a, budget_bytes=1 << 30).stack_route((4, 8, 8), np.complex128)
     assert ra == dataclasses.replace(d, budget_bytes=1 << 30).stack_route((4, 8, 8), np.complex128)
-    for p in (a, d):                  # no room, or a whole mesh over it: refused by name, alike
-        for room in (10, 0):
-            with pytest.raises(RuntimeError, match="GATE distrib_la_capacity"):
-                dataclasses.replace(p, budget_bytes=room).stack_route((4, 8, 8), np.complex128)
+    for p in (a, d):                  # a whole mesh over the room: refused by name, alike
+        with pytest.raises(RuntimeError, match="GATE distrib_la_capacity"):
+            dataclasses.replace(p, budget_bytes=10).stack_route((4, 8, 8), np.complex128)
+        # no room: refused where the plan is built, not at the stack
+        with pytest.raises(RuntimeError, match="GATE distrib_la_room"):
+            dataclasses.replace(p, budget_bytes=0)
+        with pytest.raises(RuntimeError, match="GATE distrib_la_room"):
+            distrib_la.plan("eigh", mesh, n=8, backend=p.requested, budget_bytes=0)
+        # a room an admitted over-budget stage exhausted: the whole mesh, one warning line
+        plan_mod._STACK_ROUTES.clear()
+        gone = distrib_la.plan("eigh", mesh, n=8, backend=p.requested,
+                               budget_bytes=distrib_la.RoomExhausted("stage s", 70 << 30, 63 << 30))
+        assert gone.room_exhausted.stage == "stage s" and gone.budget_bytes == 0
+        assert gone.stack_route((4, 8, 8), np.complex128).route != plan_mod.ROUTE_BATCH_RESHARD
+    # price-only plans never decide a stack
+    priced = distrib_la.plan("eigh", mesh, n=8, backend="auto", budget_bytes=0, price_only=True)
+    with pytest.raises(RuntimeError, match="GATE distrib_la_price_only"):
+        priced.stack_route((4, 8, 8), np.complex128)
 
 
 def test_staged_whole_mesh_refuses_by_name_without_library(mesh):

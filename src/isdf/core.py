@@ -1485,8 +1485,8 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     # (C, the stores; common.gpu_utils.shared_device_room_bytes, the same on every rank): whole
     # matrices per rank where they fit (Fe: 64 q, n 312), else the whole mesh (a Gamma deck:
     # nq 1, n 29998). The room's bucket keys the program, so a later call decides in its own room.
-    from common.gpu_utils import room_bucket, shared_device_room_bytes
-    room = room_bucket(shared_device_room_bytes())
+    from common.gpu_utils import shared_device_room
+    room = shared_device_room("isdf zeta charge eigh")
     key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond), room)
     if key not in _charge_face_cache:
         eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=room)

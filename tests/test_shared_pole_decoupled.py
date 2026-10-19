@@ -270,7 +270,7 @@ def test_scalar_face_round_matches_local(monkeypatch):
                          ordered=True, odd_moments=True, keep_budget=8, gram_keep=gram_keep)
     fs, fi = place(NamedSharding(mesh, P(None, "x", "y")))
     face = ex.face_reduce_round(fs, fi, tables, mesh=mesh, budget=None, ordered=True, odd_moments=True,
-                                keep_budget=8, eigh_backend="auto", admit=False, gram_keep=gram_keep,
+                                keep_budget=8, eigh_backend="auto", room=1 << 30, admit=False, gram_keep=gram_keep,
                                 carrier=ex.face_ritz_carrier(mesh, 8))
     (lb, lp, la), (fb, fp, fa) = ([np.asarray(a) for a in r[0]] for r in (local, face))
     assert np.array_equal(la, fa)

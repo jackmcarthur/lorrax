@@ -488,7 +488,7 @@ class LineSelection:
         self.ordered, self.execution, self.nq = bool(ordered), execution, int(nq)
         self.extent = port_extent(mesh_xy)
         self.to_face = selection_layout(mesh_xy, execution, self.nq)[2]
-        self.plans = {f["name"]: constructor_eigenplan(mesh_xy, f["rows"], execution, room,
+        self.plans = {f["name"]: constructor_eigenplan(mesh_xy, f["rows"], execution, room=room,
                                                        backend=eigh_backend)
                       for f in families}
 

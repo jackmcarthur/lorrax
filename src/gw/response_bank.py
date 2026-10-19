@@ -1038,9 +1038,9 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout, room=None):
         # common.gpu_utils.shared_device_room_bytes, bucketed): whole matrices per rank only
         # where they fit (a whole n^2 per rank unpriced was 115 GB/rank at n 30000).
         if room is None:
-            from common.gpu_utils import room_bucket, shared_device_room_bytes
-            room = room_bucket(shared_device_room_bytes())
-        eig = plan("eigh", mesh_xy, n=n_packed, budget_bytes=int(room))
+            from common.gpu_utils import shared_device_room
+            room = shared_device_room("shared-pole bank Coulomb root eigh")
+        eig = plan("eigh", mesh_xy, n=n_packed, budget_bytes=room)
     else:
         eig = plan("eigh", mesh_xy, backend="distributed", n=n_packed,
                    batched_route=resolution.batched_route)
@@ -1214,8 +1214,8 @@ def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
     # Under linalg = local the root's eigh is placed in the room beside what the bank holds now
     # (bucketed: the program is cached on it); every rank enters the agreement.
     from .gw_config import linalg_resolution
-    from common.gpu_utils import room_bucket, shared_device_room_bytes
-    room = (room_bucket(shared_device_room_bytes())
+    from common.gpu_utils import shared_device_room
+    room = (shared_device_room("shared-pole bank Coulomb root eigh")
             if linalg_resolution({"linalg": layout}).layout == "local" else None)
     kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout, room)
     _compiled(kernel, (_packed_v(mesh_xy, shape[0], basis.n_packed),), ahead=True)

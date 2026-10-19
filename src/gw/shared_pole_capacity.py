@@ -158,14 +158,25 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
             "sample_face_count": sample_faces}
 
 
-def constructor_eigenplan(mesh_xy, side, execution, room=None, *, backend):
+def constructor_eigenplan(mesh_xy, side, execution, *, room, backend):
     """The eigh service plan of a constructor layout: whole parents per rank
-    ('local', the q-local kernel) or the complete mesh ('face', ``face_eigh``:
-    distrib_la decides each stack against ``room``, which is in no cache key,
-    for the deck's eigh request ``backend``, ``LinalgResolution.eigh_backend``)."""
+    ('local', the q-local kernel; ``room`` None) or the complete mesh ('face',
+    ``face_eigh``: distrib_la decides each stack against ``room``, required, which
+    is in no cache key, for the deck's eigh request ``backend``,
+    ``LinalgResolution.eigh_backend``). Pricing uses :func:`constructor_price_plan`."""
     if execution == "face":
         from gw.shared_pole_execution import face_eigh
-        return face_eigh(mesh_xy, int(side), room, backend=backend)
+        return face_eigh(mesh_xy, int(side), room=room, backend=backend)
+    return _local_eigenplan(mesh_xy, int(side))
+
+
+def constructor_price_plan(mesh_xy, side, execution, *, backend):
+    """The plan a constructor layout's eigh workspace is priced on: the local
+    kernel, or the whole-mesh plan with no room (``face_eigh_price``), which never
+    decides or runs a stack."""
+    if execution == "face":
+        from gw.shared_pole_execution import face_eigh_price
+        return face_eigh_price(mesh_xy, int(side), backend=backend)
     return _local_eigenplan(mesh_xy, int(side))
 
 
@@ -212,8 +223,13 @@ def staged_cross_bytes(*, parents, ranks, side, rows):
     return per_rank(pencil + k * k + keep), ((k, per_rank(pencil)), (k, per_rank(keep + n * k)))
 
 
-def face_eigh_room(admission, held=0):
-    """Room per rank for a face constructor's eigh stacks (0: none, which distrib_la refuses).
+def face_eigh_room(admission, held=0, *, stage):
+    """Room per rank for a face constructor's eigh stacks, or ``distrib_la.RoomExhausted``.
+
+    ``stage`` names the admission. Where the admitted row leaves no room (the
+    ledger admitted it over budget and warned), the result is
+    ``RoomExhausted(stage, priced, available)``: the stacks take the whole mesh,
+    the minimum-footprint route, with a warning (lead ruling 2026-10-19).
 
     ``admission`` is a face batch admission row (``face_batch_width``) and
     ``held`` what is live beside it that the row does not hold: the receipt's
@@ -225,10 +241,12 @@ def face_eigh_room(admission, held=0):
     # floored room; a room that crosses a GiB between SC maps recompiles the
     # face parent program. Upgrade path: key the programs on the decision
     # tuple (route, matrices per rank, rounds) instead of the room.
-    room = (int(admission['available_device_bytes_per_rank'])
-            - int(admission['aggregate_bytes_per_rank']) - int(held))
+    available = int(admission['available_device_bytes_per_rank'])
+    priced = int(admission['aggregate_bytes_per_rank']) + int(held)
     from common.gpu_utils import room_bucket
-    return room_bucket(room)
+    from distrib_la import room_or_exhausted
+    return room_or_exhausted(room_bucket(available - priced), stage=stage, priced_bytes=priced,
+                             available_bytes=available)
 
 
 def check_eigh_room(model_row, price):
@@ -236,7 +254,8 @@ def check_eigh_room(model_row, price):
     ``price``, with the row's own reservation of that same n x n eigh handed back (the model
     phase prices it; run30k: 8 GiB without the hand-back, 15 with it)."""
     return face_eigh_room(dict(model_row, aggregate_bytes_per_rank=(
-        model_row['aggregate_bytes_per_rank'] + price - model_row['native_workspace'].get('eigh', 0))))
+        model_row['aggregate_bytes_per_rank'] + price - model_row['native_workspace'].get('eigh', 0))),
+        stage="shared-pole passivity/held checks")
 
 
 def _shard_bytes(array):
@@ -318,7 +337,7 @@ class ConstructorCapacity:
                              "its room; want: face_room = face_eigh_room(admission) first; why: "
                              "distrib_la refuses every eigh stack in room 0")
         return constructor_eigenplan(self._mesh_xy, int(side), self.execution,
-                                     self.face_room if self.execution == "face" else None,
+                                     room=self.face_room if self.execution == "face" else None,
                                      backend=self._resolution.eigh_backend)
 
     def query_workspace(self, op, shapes, plan):
@@ -374,8 +393,8 @@ class ConstructorCapacity:
         # stack one whole matrix per rank is what this admission leaves over.
         self._native_maxima["eigh"] = max(self.query_workspace(
             "eigh", ((self.batch_width, extent, extent),),
-            constructor_eigenplan(self._mesh_xy, int(extent), self.execution,
-                                  backend=self._resolution.eigh_backend))
+            constructor_price_plan(self._mesh_xy, int(extent), self.execution,
+                                   backend=self._resolution.eigh_backend))
             for extent in sorted(extents))
         self._workspace = sum(self._native_maxima.values())
 
