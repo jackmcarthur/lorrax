@@ -25,9 +25,13 @@ spin-traced (``Gc_R x conj(Gv_R)``, as ``gw.w_isdf``'s chi0 kernel).
 
 The instantaneous state (the approximation, stated)
 ---------------------------------------------------
-* The active window's G Hamiltonian H^G_A(t) = diag(eps^G) [+ dSigma^static]
+* The active window's G Hamiltonian H^G_A(t) = diag(eps^G) [+ K drho_pop]
   is diagonalized per k, H^G = U diag(e) U^H (``dress``: ``"none"`` keeps U = 1
-  and e = eps^G; ``"instantaneous"`` adds the frozen-W update K drho).
+  and e = eps^G; ``"instantaneous"`` adds the frozen-W update of the populations
+  alone, drho_pop = U diag(f) U^H - rho_eq, a fixed point per call
+  (:func:`_population_basis`): the coherences and the field stay out, so U and e
+  move at O(E^2) and linear response is the BSE; ``"coherent"``, the red twin,
+  adds K drho of the whole drho, whose coherent part moves them at O(E)).
   eps^G are the energies the GW run's G used (DFT for one_shot_dft), so that
   Sigma[rho_eq] is the run's own Sigma.
 * Screening: chi0 sees the populations f_i = Re (U^H rho U)_ii of the rotated
@@ -548,18 +552,68 @@ def _sigma_window(dyn, kern, X_win, d_full, W_R):
     return jnp.moveaxis(Y, -1, 0)[:, b_lo:b_lo + nA, b_lo:b_lo + nA]
 
 
+#: ``dress = "instantaneous"`` (docs/theory/td_agw_dynamical.md §1.1): the fixed point's
+#: static step count, its Anderson history, and the residual (population units) above which
+#: a correction is refused (GATE dynsig_dress_not_converged).  The plain iteration contracts
+#: only at the window's static response (Jacobian eigenvalue -0.88 on the synthetic driven
+#: state of tests/test_tdagw_dynsig.py; on CrI3 516 2v2c it stalls at 2.6e-2 relative), so
+#: the steps are Anderson-mixed; 32 steps of history 16 reach 4e-11 relative on a weak 516
+#: drive (measured; docs §1.1).
+DRESS_STEPS, DRESS_HISTORY, DRESS_TOL = 32, 16, 1e-8
+
+
+def _population_basis(e_win, rho, rho_eq, static_dsigma, steps: int = DRESS_STEPS,
+                      history: int = DRESS_HISTORY):
+    """The population-dressed window basis, Eq. (2): U, e, f and the fixed point's residual.
+
+    h = diag(e_win) + K drho_pop, drho_pop = U diag(f) U^H - rho_eq, (U, e, f) =
+    :func:`instantaneous_basis` (h, rho).  ``steps`` evaluations of the map
+    P -> U[P] diag(f[P]) U[P]^H - rho_eq from P = diag(rho) - rho_eq (U = 1, f = diag
+    rho), Anderson-mixed over ``history`` steps (real inner product on the Hermitian
+    iterates).  rho, rho_eq (nk, nA, nA); ``static_dsigma`` is K (Ry, model order).
+    Returns U, e, f of the last evaluation and its residual max |U diag(f) U^H - rho_eq
+    - P| (population units; 0 at the fixed point).
+    """
+    h0 = _band_diag(e_win)
+    f0 = jnp.real(jnp.diagonal(rho, axis1=-2, axis2=-1))
+    buf = jnp.zeros((history,) + rho.shape, rho.dtype)
+
+    def step(c, it):
+        P, P_prev, R_prev, dP, dR, _ = c
+        U, e, f = instantaneous_basis(h0 + static_dsigma(P), rho)
+        R = (U * f[..., None, :]) @ jnp.conj(jnp.swapaxes(U, -1, -2)) - rho_eq - P
+        dP = jnp.where(it > 0, jnp.roll(dP, 1, axis=0).at[0].set(P - P_prev), dP)
+        dR = jnp.where(it > 0, jnp.roll(dR, 1, axis=0).at[0].set(R - R_prev), dR)
+        M = jnp.real(jnp.einsum("i...,j...->ij", jnp.conj(dR), dR))
+        g = jnp.linalg.solve(M + (1e-12 * jnp.trace(M) + 1e-300) * jnp.eye(history),
+                             jnp.real(jnp.einsum("i...,...->i", jnp.conj(dR), R)))
+        P_next = P + R - jnp.einsum("i,i...->...", g, dP + dR)
+        return (P_next, P, R, dP, dR, (U, e, f, jnp.max(jnp.abs(R)))), None
+
+    P0 = _band_diag(f0) - rho_eq
+    out0 = (jnp.broadcast_to(jnp.eye(rho.shape[-1], dtype=rho.dtype), rho.shape), e_win, f0,
+            jnp.zeros((), f0.dtype))
+    c, _ = lax.scan(step, (P0, P0, jnp.zeros_like(P0), buf, buf, out0), jnp.arange(steps))
+    return c[-1]
+
+
 def _active_state(dyn, x, *, dress, static_dsigma):
-    """U, e, f of the window for drho = x (nk, nA, nA) model order (Ry)."""
+    """U, e, f of the window for drho = x (nk, nA, nA) model order (Ry), and the dressing's
+    fixed-point residual (:func:`_population_basis`; 0 for ``"none"`` and the twin)."""
     b_lo, nA = dyn["band_lo"], dyn["n_active"]
     e_win = dyn["e_full"][:, b_lo:b_lo + nA]
     f_eq = dyn["f_full"][:, b_lo:b_lo + nA]
     rho = x + _band_diag(f_eq)
+    zero = jnp.zeros((), e_win.dtype)
     if dress == "none":
         U = jnp.broadcast_to(jnp.eye(nA, dtype=x.dtype), x.shape)
-        return U, e_win, jnp.real(jnp.diagonal(rho, axis1=-2, axis2=-1))
+        return U, e_win, jnp.real(jnp.diagonal(rho, axis1=-2, axis2=-1)), zero
+    if dress == "coherent":                # red twin: the whole drho, e and U move at O(E)
+        return (*instantaneous_basis(_band_diag(e_win) + static_dsigma(x), rho), zero)
     if dress != "instantaneous":
-        _refuse("dynsig_dress", repr(dress), "'none' | 'instantaneous'", "pick one")
-    return instantaneous_basis(_band_diag(e_win) + static_dsigma(x), rho)
+        _refuse("dynsig_dress", repr(dress), "'none' | 'instantaneous'",
+                "'coherent' exists only as the red twin")
+    return _population_basis(e_win, rho, _band_diag(f_eq), static_dsigma)
 
 
 def dynamic_correction(dyn: dict, kern: DynsigKernels, x, *, static_dsigma=None,
@@ -576,9 +630,10 @@ def dynamic_correction(dyn: dict, kern: DynsigKernels, x, *, static_dsigma=None,
     (``gw.cohsex_sigma``: occupied and band-sum completeness Greens) at fixed V.
     ``occupation = "fixed_basis"`` (red twin) reads the populations from diag(rho)
     in the given gauge instead of the instantaneous basis.  A raised gate makes
-    dsig NaN (:func:`check_state` names it on the host).
+    dsig NaN (:func:`check_state` names it on the host); ``flags['dress_residual']``
+    is the dressing's fixed-point residual (0 for ``dress = "none"``).
     """
-    U, e_A, f_A = _active_state(dyn, x, dress=dress, static_dsigma=static_dsigma)
+    U, e_A, f_A, res = _active_state(dyn, x, dress=dress, static_dsigma=static_dsigma)
     if occupation == "fixed_basis":
         b_lo, nA = dyn["band_lo"], dyn["n_active"]
         f_A = jnp.real(jnp.diagonal(x, axis1=-2, axis2=-1)) + dyn["f_full"][:, b_lo:b_lo + nA]
@@ -589,7 +644,9 @@ def dynamic_correction(dyn: dict, kern: DynsigKernels, x, *, static_dsigma=None,
     W = screened_update(dyn["W0_q"], dchi, kern.mesh, dyn["n_rmu"])
     dW_R = _w_R(W - dyn["W0_q"], kern)
     dsig = _sigma_window(dyn, kern, -x, 0.5 * dyn["live"] - dyn["f_full"], dW_R)
-    bad = flags["crossed"] + flags["out_of_rule"] + flags["degenerate"]
+    flags = dict(flags, dress_residual=res,
+                 dress_unconverged=jnp.logical_not(res <= DRESS_TOL).astype(jnp.int32))
+    bad = flags["crossed"] + flags["out_of_rule"] + flags["degenerate"] + flags["dress_unconverged"]
     return jnp.where(bad > 0, jnp.nan, 1.0) * dsig, dict(flags, dchi=dchi, W=W)
 
 
@@ -709,7 +766,7 @@ def dynsig_model(dyn: dict, mesh_xy: Mesh, *, k_frac, rho_eq, screening: str = "
     k_frac, rho_eq : as :func:`tdagw.self_energy.isdf_model` (TDGW k order).
     screening : ``"frozen"`` (W = W0: exactly the ISDF TD-aGW model) |
         ``"static_rpa"`` (W rebuilt each call, Eqs. 3-5).
-    dress : ``"none"`` | ``"instantaneous"`` (module docstring).
+    dress : ``"none"`` | ``"instantaneous"`` (module docstring; ``"coherent"`` is a red twin).
     opts : ``pauli``, ``same_side``, ``occupation`` (red twins only).
     """
     from tdagw.model import flat_k_rows
@@ -745,6 +802,10 @@ def check_state(dyn: dict, flags: dict) -> None:
         _refuse("dynsig_degenerate_population", f"{f['degenerate']} same-side pairs with "
                 "|dE| <= deg_tol and different populations", "none", "the static limit of "
                 "such a pair is a Drude term (design page, 'carriers')")
+    if int(np.asarray(flags.get("dress_unconverged", 0))):
+        _refuse("dynsig_dress_not_converged", f"population-dressing residual "
+                f"{float(np.asarray(flags['dress_residual'])):.3g} after {DRESS_STEPS} steps",
+                f"<= {DRESS_TOL:g}", "raise DRESS_STEPS, or dress = 'none' (design page §1.1)")
 
 
 
