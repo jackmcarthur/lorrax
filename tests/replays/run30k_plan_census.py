@@ -251,3 +251,4 @@ stage("missing rooms", missing_rooms)
 print("RESULT " + json.dumps(dict(info={k: v for k, v in info.items() if k != "receipt"},
                                   census=census, refusals=refusals), default=str))
 print("SIZING " + memory.sizing()["line"])
+print("CENSUS " + json.dumps(memory.findings()))

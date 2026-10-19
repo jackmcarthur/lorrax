@@ -324,23 +324,19 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
     return int(_workspace_details(plan, op, shapes, dtype)['device_bytes'])
 
 
-#: cuSOLVERMp 0.9.1's LU device workspace per matrix (getrf, getrs at nrhs = n chunked under its
-#: 2 GiB cap, and the pivots), in local panels of (n/Px + mb) * nb elements: 9.64-11.16 measured
-#: on 2x2 A100 (lrx_lu_workspace_bytes, n 4096-16384 one tile per rank, 20000-30000 block 250;
-#: 2026-10-19), the maximum taken. 4x4 unmeasured.
-CUSOLVERMP_LU_PANELS = 11.2
-
-
 def lu_workspace_bytes(mesh, n, dtype) -> int:
     """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system against n right-hand
-    sides allocates beside its operands (cudaMallocAsync, outside XLA's pool), per matrix, at the
-    blocks it solves at (``lu_blocks``): :data:`CUSOLVERMP_LU_PANELS` local panels. Shapes only:
-    no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL communicator
+    sides allocates beside its operands (cudaMallocAsync, outside XLA's pool), per matrix: the
+    CUDA leg's measured row, 11.2 local panels at its blocks (``lxkit.memory.vendor``). Shapes
+    only: no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL communicator
     split) per call, which deadlocked a rank in libfabric's memory hooks (run30k, 2026-10-19)."""
     from distrib_la._cusolvermp import lu_blocks
+    from lxkit import LEGS, memory
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     mb, nb = lu_blocks(int(n), px, py)
-    return int(CUSOLVERMP_LU_PANELS * (int(n) // px + mb) * nb * np.dtype(dtype).itemsize)
+    item = np.dtype(dtype).itemsize
+    return int(memory.vendor(LEGS["CUDA"], "cusolvermp", "solve_lu", int(n), px * py, item,
+                             unit=(int(n) // px + mb) * nb * item).fixed)
 
 
 def eigh_stack_bytes(plan, shape, dtype) -> int:

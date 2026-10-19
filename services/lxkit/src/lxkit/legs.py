@@ -143,7 +143,8 @@ class PlatformLeg:
 @dataclass(frozen=True)
 class MeasuredRow:
     """A measured vendor workspace: ``ratio * unit(n, P, itemsize)`` bytes per rank on the
-    measured ``n`` and ``P`` ranges (inclusive), with provenance (``lxkit.memory.vendor``)."""
+    measured ``n`` and ``P`` ranges (inclusive), with provenance (``lxkit.memory.vendor``);
+    ``unit`` None: the caller computes the unit (its library's own layout)."""
     ratio: float
     unit: Callable
     unit_name: str
@@ -157,13 +158,6 @@ def heevd_bytes(n, p, item):
     if item == 16:
         return 16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) + 4 * (3 + 5 * n)
     return 8 * (1 + 6 * n + 2 * n * n) + 4 * (3 + 5 * n)
-
-
-def _mp_lu_panels(n, p, item):
-    """cuSOLVERMp LU local panels (n/Px + mb) nb at its square-grid blocks."""
-    side = n // math.isqrt(p)
-    nb = side if side <= 16384 else 250
-    return (side + nb) * nb * item
 
 
 HOST = PlatformLeg(
@@ -218,7 +212,7 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
                 source="cusolverDnXsyevd_bufferSize = 2.0 x LAPACK, exact at n 4096-41250, "
                        "A100 (eighmem 2026-10)")),
             (("cusolvermp", "solve_lu"), MeasuredRow(
-                11.2, _mp_lu_panels, "local LU panels (n/Px + mb) nb", n=(4096, 30000),
+                11.2, None, "local LU panels (n/Px + mb) nb", n=(4096, 30000),
                 p=(4, 4), source="lrx_lu_workspace_bytes 9.64-11.16 panels (getrf, getrs "
                 "nrhs = n, pivots), 2x2 A100, 2026-10-19, max taken; 4x4 unmeasured")))),
     "ROCM": PlatformLeg(
