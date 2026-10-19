@@ -265,12 +265,13 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def bind(room):
         lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
         # The provider beside the room: one factor face and its getrf/getrs workspace and pivots
-        # (the vendor's sizing on CUDA, nrhs = n: the Dyson bodies solve against I or V), else the
-        # getrs workspace cap (batched_solve_lu_ffi: 2 GB, at most a face); over it, no route fits.
+        # (cuSOLVERMp: distrib_la.lu_workspace_bytes, measured panels, nrhs = n: the Dyson bodies
+        # solve against I or V; no vendor query at bind), else the getrs workspace cap
+        # (batched_solve_lu_ffi: 2 GB, at most a face); over it, no route fits.
         if room is not None and lu.backend != "one_device":
             faces = 16 * int(n) * int(n) // int(mesh_xy.size)
-            ws = lu_workspace_bytes(lu, n, np.complex128)
-            need = faces + (min(2_000_000_000, faces) if ws is None else ws)
+            need = faces + (lu_workspace_bytes(mesh_xy, n, np.complex128) if lu.backend == "cusolvermp"
+                            else min(2_000_000_000, faces))
             if need > room:
                 raise RuntimeError(f"GATE response_dyson_capacity: the Dyson LU n={n} on the {lu.backend} "
                                    f"mesh needs {need / 1e9:.2f} GB/rank beside its operands (factor face "

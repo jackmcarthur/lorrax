@@ -41,10 +41,22 @@ def test_the_lu_layout_is_announced_once_per_program(capsys, monkeypatch):
     assert "A mb 250 nb 250 (relabeled block-cyclic)" in out and "30 RHS block(s) per rank" in out
 
 
-def test_lu_workspace_query_applies_only_to_a_cuda_cusolvermp_plan():
+@pytest.mark.parametrize("n, measured", [(30000, 680619408), (24000, 540338384), (16384, 20708678656),
+                                         (4096, 1402455040)])
+def test_the_lu_workspace_price_is_within_the_measured_band_on_2x2(n, measured):
+    # lrx_lu_workspace_bytes on 2x2 A100 (2026-10-19): getrf + getrs (nrhs = n) + pivots.
     import distrib_la
-    plan = types.SimpleNamespace(backend="one_device", mesh=None, n=N)
-    assert distrib_la.lu_workspace_bytes(plan, N, np.complex128) is None
+    mesh = types.SimpleNamespace(shape={"x": 2, "y": 2})
+    price = distrib_la.lu_workspace_bytes(mesh, n, np.complex128)
+    assert measured <= price <= 1.25 * measured
+
+
+def test_the_run30k_dyson_lu_workspace_is_priced_from_shapes_alone(monkeypatch):
+    import distrib_la
+    from distrib_la import workspace
+    monkeypatch.setattr(workspace, "_vendor_query", lambda *a: pytest.fail("vendor query at bind"))
+    mesh = types.SimpleNamespace(shape={"x": P, "y": P})
+    assert distrib_la.lu_workspace_bytes(mesh, N, np.complex128) == int(11.2 * (7500 + 250) * 250 * 16)
 
 
 def test_room_bucket_floors_to_gib_and_keeps_a_sub_gib_room():

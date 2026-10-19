@@ -324,32 +324,23 @@ def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
     return int(_workspace_details(plan, op, shapes, dtype)['device_bytes'])
 
 
-def lu_workspace_bytes(plan, nrhs, dtype):
-    """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system with ``nrhs`` right-hand
-    sides allocates beside its operands, per matrix: getrf's and the chunked getrs's workspace
-    (separate buffers, both live; cudaMallocAsync, outside XLA's pool) and the pivots, from the
-    vendor's sizing at the descriptors the solve runs at (``lu_blocks``, ``rhs_block``), on the
-    plan mesh's persistent context (no handle is created). None where it does not apply (not a
-    CUDA cuSOLVERMp plan)."""
-    if plan.backend != 'cusolvermp' or mesh_platform(plan.mesh) != 'CUDA':
-        return None
-    from distrib_la.loader import get_lib
-    from distrib_la._cusolvermp import get_or_init_context, lu_blocks, rhs_block
-    px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
-    n, nrhs = int(plan.n), int(nrhs)
-    mb, nb = lu_blocks(n, px, py)
-    lib = get_lib('CUDA')
-    if not hasattr(lib, 'lrx_lu_workspace_bytes'):
-        raise RuntimeError('the LU workspace query requires a native build exporting lrx_lu_workspace_bytes')
-    fn = lib.lrx_lu_workspace_bytes
-    fn.argtypes = [ctypes.c_int64] * 7 + [ctypes.c_int] + [ctypes.POINTER(ctypes.c_uint64)] * 2
-    fn.restype = ctypes.c_int
-    device, host = ctypes.c_uint64(), ctypes.c_uint64()
-    rc = fn(get_or_init_context(plan.mesh), n, nrhs, mb, nb, mb, rhs_block(n, nrhs, px, py, mb),
-            int(np.dtype(dtype).kind == 'c'), ctypes.byref(device), ctypes.byref(host))
-    if rc:
-        raise RuntimeError(f'lrx_lu_workspace_bytes failed with status={rc}, n={n}, nrhs={nrhs}')
-    return int(device.value)
+#: cuSOLVERMp 0.9.1's LU device workspace per matrix (getrf, getrs at nrhs = n chunked under its
+#: 2 GiB cap, and the pivots), in local panels of (n/Px + mb) * nb elements: 9.64-11.16 measured
+#: on 2x2 A100 (lrx_lu_workspace_bytes, n 4096-16384 one tile per rank, 20000-30000 block 250;
+#: 2026-10-19), the maximum taken. 4x4 unmeasured.
+CUSOLVERMP_LU_PANELS = 11.2
+
+
+def lu_workspace_bytes(mesh, n, dtype) -> int:
+    """Device bytes per rank one cuSOLVERMp solve_lu of an n x n system against n right-hand
+    sides allocates beside its operands (cudaMallocAsync, outside XLA's pool), per matrix, at the
+    blocks it solves at (``lu_blocks``): :data:`CUSOLVERMP_LU_PANELS` local panels. Shapes only:
+    no vendor query -- cuSOLVERMp's bufferSize builds a cuBLASMp grid (an NCCL communicator
+    split) per call, which deadlocked a rank in libfabric's memory hooks (run30k, 2026-10-19)."""
+    from distrib_la._cusolvermp import lu_blocks
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    mb, nb = lu_blocks(int(n), px, py)
+    return int(CUSOLVERMP_LU_PANELS * (int(n) // px + mb) * nb * np.dtype(dtype).itemsize)
 
 
 def eigh_stack_bytes(plan, shape, dtype) -> int:
