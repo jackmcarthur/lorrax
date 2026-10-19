@@ -264,6 +264,41 @@ observer field. Nothing in a deck has to change.
   observer, or without the opt-in, the driver does nothing new.
   `gw.ppm_sigma.window_sigma_c` takes `static_limit_wc0=`.
 
+## 2026-10-19 — Contour-deformation Σ_c (`sigma_frequency_integration = contour_deformation`)
+
+A second Σ frequency integration evaluates Σ_c by contour deformation: an imaginary-axis
+Gauss–Legendre sum plus the real-axis residues of G, read from Hermite knots at Im z = η, on the ISDF
+W(z) built from the shared-pole bank's response-quadrature χ⁰ and the bank's Dyson pair equations
+(`gw.cd`; [dev note](docs/dev/cd_frequency_integration.md)).  It is the only contour-deformation route
+in LORRAX.
+
+- **Existing decks.** The default `sigma_frequency_integration = pole_model` leaves every deck on its
+  pole-model path; the `cd_*` keys refuse by name outside the CD route (`GATE cd_applicability`).
+- **Deck keys (CD only).** `cd_imaginary_nodes` (96), `cd_knot_step_ev` (0.0625, at most η/4),
+  `cd_residue_reach_ev` (`auto`), `cd_knot_chunk` (0 = planner), `cd_band_tile` (0 = planner),
+  `cd_chi0_rule_tolerance` (1e-8), `cd_chi0_rule_capacity` (1088), `cd_chi0_rules_file` (empty = build
+  in the job), `cd_own_energy_band_min` (1), `cd_checkpoint` (`off` | `write` | `resume`).
+  [Input reference](docs/input_reference.md#sigma).
+- **Limits (named refusals).** `compute_mode = mpa`, `screening_diagrams = w_rpa`,
+  `head_correction = off`, `linalg = local`, `use_band_extrapolation = false`, one η; the pole-model
+  keys (`sigma_w_model`, `sigma_w_accuracy`, `sigma_w_support_sites_ev`, `write_w`, `write_poles`,
+  `mpa_*`) refuse beside it.
+- **Instruments.** `LORRAX_CD_STAR_CERTIFICATE=N` (symmetry certificate of the unfolded cube) and
+  `LORRAX_CD_STOP_AFTER=imag:N,real:M,real_from:K` (timing probe; `cd_stop_receipt.json`).
+  [Environment registry](docs/reference/env_vars.md).
+- **χ⁰ rule CLI.** `python -m gw.cd.chi0_rules ... --out FILE` precomputes the rule file on a CPU
+  node (the run's log prints the geometry arguments); `cd_chi0_rules_file` reads it and refuses any
+  identity mismatch (`GATE cd_chi0_rules_identity`).
+- **Outputs.** `cd_sigma_own_energy.npz`, `cd_sigma_receipt.json`, `cd_leak_ledger.csv`,
+  `cd_chi0_rules.pkl` (rules built in the job), `tmp/cd_checkpoint.h5` (`cd_checkpoint`).
+- **Service API.** `minimax.RESPONSE_MAX_KAPPA` is public (value unchanged);
+  `response_bank.response_quadrature` takes optional `requests=` and `rule_options=` (the bank passes
+  neither, so its rules are unchanged).
+- **Retired, not supported.** The CD tools that did not land: the ordered-Lehmann CD of
+  `wip/cd-production`, the fe_cd/CDMETAL harness, cd_modern (spectral-density χ⁰), the cdref plane-wave
+  reference factory, the cd_expansion and CD replay scripts, and the `internal_ff_cd` branches.  Their
+  decks and caches do not carry over; write a CD deck with the keys above.
+
 ## 2026-10-18 — On-shell Sigma sweep checkpointed (one-shot restart)
 
 A one-shot shared-pole run on the default on-shell path now writes its swept
