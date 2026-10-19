@@ -926,6 +926,15 @@ def dense_layout(meta, config, mesh_xy, n):
     return "local" if execution == "local" else "distributed"
 
 
+def _book_beside(meta, row, stage):
+    """Book a ledger ``row``'s own bytes to the next ``stage`` section, over what is resident
+    as it opens (the solve's live W(z) panels included); sizing sees the ledger aggregate."""
+    from lxkit import memory
+    ledger = meta.shared_pole_capacity
+    memory.book(ledger.own_price(row), stage=stage, planned=ledger.price(
+        row["aggregate_bytes_per_rank"], ledger.baseline_bytes_per_rank))
+
+
 def _reserve(meta, stage, resident, workspace=0, runs_in=None):
     """Reserve a uniquely named actual-batch footprint in the shared ledger, priced in the
     section that allocates it (``runs_in``)."""
@@ -984,6 +993,12 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     def execute(kernel, args, stage, runtime_bytes=0):
         """``runtime_bytes``: what the executable draws at run time outside its
         buffer assignment (mathdx mode 11's split arm), admitted with it."""
+        from lxkit import memory as _memory
+        _memory.book(_memory.priced(sum(int(x.addressable_shards[0].data.nbytes)
+                                        for x in jax.tree.leaves(args) if hasattr(x, "addressable_shards")),
+                                    "bank.compile: XLA autotuning operand copies (<= the program's "
+                                    "arguments, provisional bound)", increment=True),
+                     stage='bank.compile.' + stage)
         with timing.section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
             executable = _compiled(kernel, args)
@@ -2824,9 +2839,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     break
                 disk_group = -(-disk_group // 2)
         if residence == "device":
-            memory.book(memory.priced(live + check.price,
-                                      f"response direct stream, group {group_size}/{len(z)}"),
-                        stage="bank.dispatch.direct")
+            memory.book(memory.Price(
+                operands=memory.Term(float(live), source="live ledger stages + bind baseline "
+                                     "(response_group_size)"),
+                xla=memory.Term(float(check.price), source=f"compiled direct stream, group "
+                                f"{group_size}/{len(z)} (temp + outputs + carry + scratch)"),
+                label="response direct stream"), stage="bank.dispatch.direct")
             receipt["group_check"] = dict(chunk=check.chunk, agreed=group_size, analytic=check.analytic,
                 compiled=check.compiled_bytes, price=check.price, live=live, room=room,
                 recompiled=check.recompiled, seconds=check.seconds)
@@ -3053,7 +3071,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     if np.asarray(header["line_written"], bool)[:, sample-p0].any():
                         raise ValueError(f"GATE response_line_panel: sample {sample} is partly committed; "
                                          "a line sample commits every parent at once; fix: rebuild the bank")
-                    stage, _ = _reserve(meta, "line_selection", selection_resident, selection_workspace)
+                    stage, selection_row = _reserve(meta, "line_selection", selection_resident,
+                                                    selection_workspace)
                     live = ledger.live_stages
                     ledger.live_stages = live + (stage,)
                     # line_selection times the selection alone: this sample's Dyson
@@ -3071,16 +3090,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         constant = read_constant(span, bank_handle)
                         value, slope = solve(rows, 0, *span, bank_handle, sample, layout=line_layout,
                                              constant=constant)
+                        _book_beside(meta, selection_row, 'bank.line_select')
                         with timing.section('bank.line_select'):
                             lines = sel.select(sample, value, slope)
                         del value, slope
                         if ordered:
                             value, slope = solve(rows, 1, *span, bank_handle, sample, layout=line_layout,
                                                  constant=constant)
+                            _book_beside(meta, selection_row, 'bank.line_mirror')
                             with timing.section('bank.line_mirror'):
                                 sel.mirror(sample, lines, value, slope)
                             del value, slope
                         del constant
+                        _book_beside(meta, selection_row, 'bank.line_panels')
                         with timing.section('bank.line_panels'):
                             span_panels.append((span, sel.panels(sample, lines)))
                         del lines, rows

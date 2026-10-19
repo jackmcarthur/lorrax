@@ -37,8 +37,8 @@ differs between legs and that more than one service needs lives in
   guard implement (owner ``runtime``; Runtime-LEGS lane, 2026-10-15):
   ``fft_plan_scratch`` (whose plan-workspace query prices the FFT scratch
   XLA's buffer assignment cannot see, :mod:`runtime.aot_memory`),
-  ``outside_pool_api`` and ``memory_telemetry`` (the readers of bytes outside
-  the XLA pool and of whole-device used memory, :mod:`runtime.xla_memory`),
+  ``outside_pool_api`` (the reader of bytes outside the XLA pool,
+  :mod:`runtime.xla_memory`), the memory model's rows (:mod:`lxkit.memory`),
   ``collective_library`` and ``collective_net_plugin`` (the collective
   library of the leg's XLA collectives, which names the site profile's
   section, and the net plugin it dlopens by name,
@@ -107,8 +107,6 @@ class PlatformLeg:
     fft_plan_scratch: str = ""
     #: bytes-outside-the-pool reader in runtime.xla_memory ("" = none).
     outside_pool_api: str = ""
-    #: whole-device used-memory sampler in runtime.xla_memory ("" = none).
-    memory_telemetry: str = ""
     #: ``(env, value)`` pairs: process-environment defaults of the leg's
     #: runtime libraries, ``setdefault`` by ``runtime.set_default_env`` before
     #: the backend starts (a caller's export wins).  () = none.
@@ -128,6 +126,9 @@ class PlatformLeg:
     peak_reader: str = "live"
     #: ``((library, op), MeasuredRow)``: vendor workspace measured where no query exists.
     vendor_rows: tuple = ()
+    #: ``(stage, bytes, provenance)``: bytes a stage adds outside the allocator (runtime
+    #: arenas that grow during it), priced as its ``outside`` term (``memory.stage_outside``).
+    stage_outside: tuple = ()
     #: collective library of the leg's XLA collectives; the section of
     #: ``config/<site>/site.toml`` that runtime.network_env applies ("" = none).
     collective_library: str = ""
@@ -193,7 +194,6 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
         device_memory_api="cuda_driver",
         fft_plan_scratch="cufft",
         outside_pool_api="cuda_driver_mempool",
-        memory_telemetry="nvidia-smi",
         collective_library="nccl", collective_net_plugin="libnccl-net.so",
         profiler=("nsys", "libToolsInjection", 0),
         # 3.0 GB outside the pool (context, modules, XLA NCCL communicators, cuFFT
@@ -308,10 +308,9 @@ LEGS: Mapping[str, PlatformLeg] = MappingProxyType({
                 3.0, lambda n, p, item: n * n * item / p, "copies of A per rank",
                 n=(1, 40960), p=(4, 4), source="SLATE LU ~3 copies of A, OOM at n 51200 P4 "
                 "(LA_ROUTING_AUDIT)"))),
+        stage_outside=(("spole.bank", 2.12e9, "MI250X ZnO SPM P16: rocm-smi VRAM outside the "
+                        "BFC arena 1.0 GB at init -> 3.12 GB in the bank (CAL_PASS1, provisional)"),),
         outside_pool_api="hip_runtime_arena",
-        # In process: amd-smi takes 1.0 s a sample and rocm-smi 0.45 s, and both
-        # number all eight GCDs, not the one ROCR_VISIBLE_DEVICES leaves visible.
-        memory_telemetry="hip_runtime",
         collective_library="rccl", collective_net_plugin="librccl-net.so",
         # rocprofv3 --kernel-trace deadlocks RCCL at P=4 (Screening lane, 2026-10-14).
         profiler=("rocprofv3", "librocprofiler-sdk-tool", 1)),

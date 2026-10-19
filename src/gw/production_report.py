@@ -971,13 +971,15 @@ class GWProductionReport:
             for row, peak in priced:
                 worst = float(np.nanmax(peak)) if np.any(np.isfinite(peak)) else -1.0
                 self.emit("    " + memory.receipt_line(row["stage"], row["price"], worst,
-                                                       row["exact"], row["source"])
+                                                       row["exact"], row["source"],
+                                                       row.get("reserved", -1))
                           + f" [x{row['count']}]")
         self.emit("  " + memory.sizing()["line"])
         for finding in memory.findings() if memory.STRICT else ():
             self.emit("  memory census: " + finding)
         reads, seconds = timing.instrument_cost()
-        self.emit(f"  instrument: {memory.source() or 'none'}; {reads} boundary "
+        self.emit(f"  instrument: {memory.source() or 'none'} "
+                  f"({'calibrate' if memory.CALIBRATE else 'production'}); {reads} boundary "
                   f"reads on rank 0 took {seconds * 1e3:.1f} ms "
                   f"({100.0 * seconds / wall if wall else 0.0:.4f}% of the wall)")
 

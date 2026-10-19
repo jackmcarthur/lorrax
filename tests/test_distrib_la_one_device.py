@@ -32,6 +32,17 @@ def mesh():
     return Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
 
 
+#: One MI250X GCD's allocator limit (``memory_stats()['bytes_limit']``, ROCm 7.14.1 wheels,
+#: jax 0.9.1, frontier07938): the run's limit the ROCM solve_lu size row reads.
+GCD_LIMIT = 60_183_563_895
+
+
+@pytest.fixture(autouse=True)
+def _gcd_run():
+    from lxkit import memory
+    memory.set_budget(48.99e9, limit_bytes=GCD_LIMIT, per_node=8, platform="MI250X")
+
+
 @pytest.fixture
 def rocm(monkeypatch):
     """The ROCM leg's resolution on a CPU mesh (its library has no handler here)."""
@@ -58,7 +69,8 @@ def _eigh_ok(a, w, v):
 
 
 def test_size_route_rows_and_room_legs():
-    assert set(resolve_mod.ONE_DEVICE_MAX_N) == {("eigh", "ROCM"), ("solve_lu", "ROCM")}
+    assert set(resolve_mod.ONE_DEVICE_MAX_N) == {("eigh", "ROCM")}
+    assert resolve_mod.ONE_DEVICE_BY_LIMIT == {("solve_lu", "ROCM")}
     assert resolve_mod.ONE_DEVICE_BY_ROOM == {("eigh", "CUDA"), ("solve_lu", "CUDA")}
     assert resolve_mod.one_device_max_n("eigh", "CUDA") is None          # no room, no bound
     assert resolve_mod.one_device_max_n("eigh", "CUDA", 0) is None
@@ -67,11 +79,10 @@ def test_size_route_rows_and_room_legs():
         assert resolve_mod.one_device_max_n(op, "CUDA", need) == 312
         assert resolve_mod.one_device_max_n(op, "CUDA", need - 1) == 311
     assert resolve_mod.one_device_max_n("eigh", "cpu", 1 << 40) is None
-    # ROCM solve_lu is one GCD's capacity: the priced one-device program within the allocator.
-    lim = resolve_mod._ROCM_GCD_BYTES_LIMIT
-    assert resolve_mod._ROCM_LU_BYTES_PER_N2 == od.one_device_bytes("solve_lu", 1)
-    n = resolve_mod.ONE_DEVICE_MAX_N[("solve_lu", "ROCM")]
-    assert n == 27427 and od.one_device_bytes("solve_lu", n) <= lim < od.one_device_bytes("solve_lu", n + 1)
+    # ROCM solve_lu is one GCD's capacity: the priced one-device program within the run's limit.
+    n = resolve_mod.size_row("solve_lu", "ROCM")
+    assert n == 27427 and od.one_device_bytes("solve_lu", n) <= GCD_LIMIT < od.one_device_bytes(
+        "solve_lu", n + 1)
     assert "one_device" in resolve_mod.EIGH_BACKENDS and "one_device" in resolve_mod.LU_BACKENDS
 
 
@@ -118,7 +129,7 @@ def test_a_single_matrix_above_mains_row_is_one_device_one_per_round(mesh, rocm)
 def test_distributed_takes_the_size_route_on_rocm(mesh, rocm, capsys):
     bound = resolve_mod.ONE_DEVICE_MAX_N[("eigh", "ROCM")]
     assert resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64) == "one_device"
-    lu_bound = resolve_mod.ONE_DEVICE_MAX_N[("solve_lu", "ROCM")] // 2 * 2   # n divisible by the 2x2 mesh
+    lu_bound = resolve_mod.size_row("solve_lu", "ROCM") // 2 * 2   # n divisible by the 2x2 mesh
     assert resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=lu_bound) == "one_device"
     # Beyond the bound and with n unknown: the leg library, refused on this host by name --
     # ELPA for eigh (the ROCM distributed eigh since 0018), SLATE still for solve_lu.

@@ -171,7 +171,7 @@ def constructor_reduction():
     actual = face_reduction_bytes(mesh, 1, rows=N, side=SIDE, carrier=carrier)
     budget.program_bytes = actual
     try:
-        reserved = budget.plan(SIDE, phase="reduction")
+        reserved = budget.plan(SIDE, phase="reduction", runs_in="spole.gram_reduction")
     finally:
         budget.program_bytes = admitted
     row = receipt["reduction"]
@@ -201,6 +201,8 @@ def constructor_reduction():
     args = (tables["points"], tables["active"], S(1, N, F), S(1, N, F), S(1, N, F),
             tuple(S(1, N, extent(INFINITY_W)) for _ in range(5)))
     info["reduction"]["side"] = side
+    with memory.stage("spole.gram_reduction"):      # the phase the reduction's price is booked to
+        pass
     try:
         program(*args)
     except _Traced:
@@ -230,6 +232,8 @@ def constructor_passivity():
     for nb in (1, 2):
         plan.stack_route((nb, N, N), np.complex128, "eigh")
     info["passivity"]["room"] = str(r)
+    with memory.stage("spole.passivity_held"):      # the phase the check's price is booked to
+        pass
     return info["passivity"]
 stage("constructor passivity_held", constructor_passivity)
 
