@@ -1610,19 +1610,28 @@ def _interband_weight(dE, f_diff, z, prefactor):
 def _head_wing_interband_weight(
     dE, f_diff, z, prefactor, transition,
 ):
-    r"""Adler--Wiser mixed head/body weight in the ``P=-dE*D`` basis.
+    r"""Lehmann mixed head/body weight of one ORDERED pair in the ``P=-dE*D`` basis.
 
-    Replacing one density-jet leg ``D`` of the direct response by the
-    energy-scaled head vertex ``P=-dE*D`` contributes the explicit minus
-    below.  Both wing layouts call this owner.  The finite-frequency
+    The wing is the Lehmann sum over every ordered pair ``x != y``,
+    ``(f_y - f_x) conj(D_xy) rho_xy / (z - dE)``; with ``D = -P/dE`` one
+    pair weighs ``-(c/2) f_diff / (dE (z - dE)) = -(c/2) f_diff [1 + z/dE]
+    / (z^2 - dE^2)``.  A pair and its reverse (``A = conj(P) rho`` and
+    ``-conj(A)``) sum to ``-(c/2) [f (A + conj A) + (f z/dE)(A - conj A)] /
+    (z^2 - dE^2)``; time reversal cancels ``A - conj A`` over the zone,
+    leaving the even form ``-c f A / (z^2 - dE^2)`` of one energy-ordered
+    pair, and a magnet keeps the odd-in-z term.  That term is taken only on
+    pairs split by :data:`gw.degen_average.TOL_DEGENERACY_RY`, so a
+    roundoff-split multiplet cannot amplify by ``1/dE`` what time reversal
+    cancels (the even part needs no such cut).  The finite-frequency
     intraband surface term is not a ``D -> P`` substitution and remains the
-    separate positive ``pref_surface*surface_weight/z`` contribution in the
-    two kernels.
+    separate positive ``pref_surface*surface_weight/z`` contribution.
     """
     denom = z * z - dE * dE
+    split = jnp.abs(dE) >= TOL_DEGENERACY_RY
+    odd = jnp.where(split, z / jnp.where(split, dE, 1.0), 0.0)
     return jnp.where(
         transition & (jnp.abs(denom) > 1.0e-16),
-        -prefactor * f_diff / denom,
+        -0.5 * prefactor * f_diff * (1.0 + odd) / denom,
         jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
     )
 
@@ -1850,7 +1859,9 @@ def _head_wing_kernel_face(
         logical2d = ((ix[:, None] < nb_logical) & (iy[None, :] < nb_logical))[None, :, :]
         dE = e_x[:, :, None] - e_y[:, None, :]
         f_diff = f_y[:, None, :] - f_x[:, :, None]
-        transition = logical2d & (dE > 0.0)
+        # Every ordered pair (_head_wing_interband_weight); both orders, so a
+        # magnet's odd-in-z wing survives.
+        transition = logical2d & (dE != 0.0)
         if include_surface:
             s_x = jax.lax.dynamic_slice_in_dim(surface_weight, x0, nbx, axis=1)
             diagonal = logical2d & (ix[:, None] == iy[None, :])[None, :, :]

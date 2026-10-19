@@ -782,7 +782,7 @@ from `qsgw_head.qp_velocity` (§3); the one-shot and the fixed DFT head
 Any other metal combination refuses (`GATE metal_sc_head_update_disabled`,
 `gw_config.uses_metal_direct_drude_head`): a folded bispinor metal head has no
 derived completion, and the `bare_transverse` head has no link consumer.
-`full` on an ordered (time-reversal-broken) store refuses on every route
+`full` on an ordered (time-reversal-broken) metal refuses on every route
 (`GATE shared_pole_head_ordered`), and so does `occ_broadening > 0` next to a
 metal width (`GATE metal_sc_head_update_disabled`).
 

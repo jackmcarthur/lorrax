@@ -438,8 +438,9 @@ measured map-1 q = 0 Gram risk. The dense-k grid is the intended convergence
 limit: the missing head is a finite-grid term, so the headless map is judged
 by its own convergence. The Gram gate is unchanged; a headless run may still
 refuse at `GATE shared_pole_gram_valid`. An ordered (time-reversal-broken)
-store refuses `head_correction = full` (`GATE shared_pole_head_ordered`) and
-carries the direct head (`no_local_fields`) instead.
+store refused `head_correction = full` (`GATE shared_pole_head_ordered`) and
+carried the direct head (`no_local_fields`) instead; since 2026-10-19 it folds
+the signed body and Lehmann wings, and only an ordered metal refuses.
 
 ## 2026-09-06 — The GW carrier is the raw parent
 

@@ -249,8 +249,9 @@ The derivation and branch assignment are owned by
   holds without time reversal. The k sum runs over the full zone, unfolded
   by the measured magnetic group. HL's real probe cannot resolve an odd
   residue and keeps the single-residue fit.
-* A time-reversal-broken shared-pole store carries only the direct head
-  (`no_local_fields`); `full` refuses (`GATE shared_pole_head_ordered`).
+* On a time-reversal-broken scalar shared-pole store `full` folds the signed
+  body and Lehmann wings (`gw.shared_pole_head`); an ordered metal refuses it
+  (`GATE shared_pole_head_ordered`).
 
 ## 4. The packed static photon head
 
