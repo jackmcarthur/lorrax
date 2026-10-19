@@ -9,8 +9,8 @@ The recipes are their bank receipts' counts (production accuracy, four held supp
 * CrI3 24x24 bispinor P64 (08_sectfast2_sigma_20261007): 61 parents, 16 sites, 72 GB, 7.44 GB
   upstream: one staged round of 61. At that leg's sides (TT 25856, CC 19264, CT 17408) every eigh
   stack takes route (c), the TT reduced stack (61 x 18432^2) at 68.5 of 72 GB; at the recipe's
-  conservative sides TT's H'_vv and both CT stacks would go to the mesh, so the eigh routes are
-  decided per round at the round's shapes.
+  conservative sides TT's H'_vv would go to the mesh and both CT stacks would be refused (no
+  route fits), so the eigh routes are decided per round at the round's shapes.
 * Fe 4^3 bispinor P4 (13 parents, 28 sites): q-local at 40 GB, staged rounds of 4 at 4 GB.
 * CrI3 6x6 bispinor P4 (7 parents, 19 sites, 40 GB): q-local.
 """
@@ -29,7 +29,7 @@ from gw.shared_pole_sectors import sector_route
 import gw.shared_pole_execution as ex
 from gw.shared_pole_capacity import staged_sector_bytes, staged_cross_bytes
 from gw.shared_pole_execution import face_ritz_carrier, face_reduction_bytes, stage_width, staged_eigh
-ex._mesh_eigh = lambda mesh, n, backend: NS(batched_route='scan', mesh=mesh,   # the mesh plan needs the native bundle
+ex._mesh_eigh = lambda mesh, n, backend: NS(batched_route='scan', backend='distributed', mesh=mesh,   # the mesh plan needs the native bundle
                                             require_capacity=lambda what: None)
 CASES = {  # name: (lines, imaginary, n, (CC logical, packed), (T logical, packed), nk, mesh side, nq, [(GB, upstream GB)])
     'ni14': (14, 4, 1194, (1194, 1216), (598, 640), 8000, 8, 641, [(36, 1.59)]),
@@ -49,6 +49,15 @@ def ledger_for(mesh, meta, budget, up_gb):
     return ledger, up
 
 
+def staged(mesh, stack, beside, **kw):
+    # A staged eigh stack's decision: route (c), the mesh, or refused by name (no route fits).
+    try:
+        plan = staged_eigh(mesh, stack, beside, backend='distributed', **kw)
+    except RuntimeError as e:
+        return 'refused' if 'GATE route_capacity' in str(e) else str(e)
+    return 'c' if plan.batched_route == 'batch_reshard' else 'mesh'
+
+
 def round_decisions(mesh, ledger, up, rows, sides, cross_side, infinity):
     # One staged round at the given sides: TT, then CC beside TT's held outputs, then CT beside
     # both sectors' models; each eigh's route and each stage's width, as staged_sector decides.
@@ -59,8 +68,7 @@ def round_decisions(mesh, ledger, up, rows, sides, cross_side, infinity):
     for row in (rows[1], rows[0]):
         name, packed = row['sector'], int(row['packed_extent'])
         stack = (R * max(1, tiles[name]['dense']), packed, packed)
-        plan = staged_eigh(mesh, stack, R * tiles[name]['unit'], ledger=ledger, live=live, label=name, backend='distributed')
-        got[name + '.selection'] = 'c' if plan.batched_route == 'batch_reshard' else 'mesh'
+        got[name + '.selection'] = staged(mesh, stack, R * tiles[name]['unit'], ledger=ledger, live=live, label=name)
     for row in (rows[1], rows[0]):
         name, packed = row['sector'], int(row['packed_extent'])
         side, iw, carrier = sides[name], infinity[name], face_ritz_carrier(mesh, row['pole_budget'])
@@ -71,11 +79,10 @@ def round_decisions(mesh, ledger, up, rows, sides, cross_side, infinity):
         stage = stage_width(ledger, stacks + held + dw, program, R, live=live)
         routes = []
         for m, bound in boundaries:
-            plan = staged_eigh(mesh, (R, m, m), bound + held, ledger=ledger, live=live, label=name, backend='distributed')
+            route = staged(mesh, (R, m, m), bound + held, ledger=ledger, live=live, label=name)
             row_ = ledger.preview(resident_bytes_per_rank=bound + held + -(-R // P) * 8 * m * m * 16,
                                   workspace_bytes_per_rank=0, concurrent_with=live)
-            routes.append(('c' if plan.batched_route == 'batch_reshard' else 'mesh',
-                           round(row_['aggregate_bytes_per_rank'] / GB, 2)))
+            routes.append((route, round(row_['aggregate_bytes_per_rank'] / GB, 2)))
         got[name] = dict(stage=stage, eighs=routes)
         outputs = ledger.reserve(f'held.{name}.{len(ledger.entries)}', resident_bytes_per_rank=held + per_rank(2 * packed * side + side * 2 * (carrier or side // 2)),
                                  workspace_bytes_per_rank=0, concurrent_with=live)['stage']
@@ -85,8 +92,7 @@ def round_decisions(mesh, ledger, up, rows, sides, cross_side, infinity):
     stacks, boundaries = staged_cross_bytes(parents=R, ranks=P, side=cross_side, rows=[r['packed_extent'] for r in rows])
     routes = []
     for m, bound in boundaries:
-        plan = staged_eigh(mesh, (R, m, m), bound, ledger=ledger, live=(up, models), label='CT', backend='distributed')
-        routes.append('c' if plan.batched_route == 'batch_reshard' else 'mesh')
+        routes.append(staged(mesh, (R, m, m), bound, ledger=ledger, live=(up, models), label='CT'))
     got['CT'] = dict(eighs=routes)
     return got
 
@@ -111,11 +117,9 @@ for name, (lines, imag, n, cc, tt, nk, side, nq, budgets) in CASES.items():
         if mode == 'face':
             # The selection of the whole round at once: its eigh stacks [R x dense, n, n].
             R, tiles = route['width'], rows[0]['staged_route']
-            row['selection'] = {r['sector']: 'c' if staged_eigh(
+            row['selection'] = {r['sector']: staged(
                 mesh, (R * max(1, tiles[r['sector']]['dense']), int(r['packed_extent']), int(r['packed_extent'])),
-                R * tiles[r['sector']]['unit'], ledger=ledger, live=(up,), label=r['sector'],
-                backend='distributed').batched_route == 'batch_reshard'
-                else 'mesh' for r in rows}
+                R * tiles[r['sector']]['unit'], ledger=ledger, live=(up,), label=r['sector']) for r in rows}
         if name == 'cri3_p64':
             row['actual'] = round_decisions(mesh, ledger, up, rows, dict(TT=25856, CC=19264), 17408, dict(TT=640, CC=416))
             row['conservative'] = round_decisions(mesh, ledger, up, rows, dict(TT=32000, CC=20800), 29700,
@@ -153,9 +157,10 @@ def test_sector_route_replay():
     assert actual['CT']['eighs'] == ['c', 'c'], actual
     assert 68 < actual['TT']['eighs'][2][1] < 72, actual['TT']
     assert actual['TT']['stage'] >= 2 and actual['CC']['stage'] >= actual['TT']['stage'], actual
-    # At the recipe's conservative sides TT's H'_vv and the CT stacks would leave route (c).
+    # At the recipe's conservative sides TT's H'_vv leaves route (c); the CT stacks fit no route
+    # (the mesh with its solve, 73.8 GB + 3 GB of contexts, is over 72 GB) and are refused by name.
     conservative = cri3['conservative']
-    assert conservative['TT']['eighs'][0][0] == 'mesh' and conservative['CT']['eighs'] == ['mesh', 'mesh']
+    assert conservative['TT']['eighs'][0][0] == 'mesh' and conservative['CT']['eighs'] == ['refused', 'refused']
     assert got['fe/40']['mode'] == 'local' and got['fe/40']['route'] == dict(width=4, rounds=4)
     assert got['fe/4']['mode'] == 'face' and got['fe/4']['route'] == dict(width=4, rounds=4)
     assert got['fe/4']['selection'] == dict(CC='c', TT='c') and got['cri3_p64/72']['selection'] == dict(CC='c', TT='c')

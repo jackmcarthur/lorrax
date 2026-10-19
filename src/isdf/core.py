@@ -1483,10 +1483,15 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     face, rep = NamedSharding(mesh_xy, P(None, 'x', 'y')), NamedSharding(mesh_xy, P())
     key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond))
     if key not in _charge_face_cache:
-        # distrib_la.plan.place decides the stack in the run budget: whole matrices per rank
-        # where they fit (Fe: 64 q, n 312), else the whole mesh (a Gamma deck: nq 1, n 29998).
-        from common.gpu_utils import device_budget_bytes
-        eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=int(device_budget_bytes()))
+        # distrib_la.plan.place decides the stack in the room beside what the zeta stage holds
+        # now (C, the stores): the run budget less each device's live bytes, the minimum over
+        # processes so every rank decides alike. Whole matrices per rank where they fit (Fe:
+        # 64 q, n 312), else the whole mesh (a Gamma deck: nq 1, n 29998).
+        from common.gpu_utils import device_budget_bytes, minimum_process_budget_gb
+        live = sum(s.data.nbytes for a in jax.live_arrays() for s in a.addressable_shards)
+        room = minimum_process_budget_gb(
+            max(0.0, device_budget_bytes() - live / len(jax.local_devices())) / 1e9)
+        eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=int(room * 1e9))
         live = np.arange(int(n)) < n_log
 
         @partial(checked_program, mesh=mesh_xy, out_shardings=(face, rep), in_shardings=(face,))

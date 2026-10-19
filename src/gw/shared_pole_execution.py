@@ -707,13 +707,14 @@ def _mesh_eigh(mesh, n, backend):
     """The whole-mesh plan of a staged stack for the deck's eigh request: an
     explicit ``distributed`` as named; ``auto`` with no room, which is the same
     plan wherever the leg has a whole-mesh eigh and refuses by name where not."""
+    import dataclasses
     import distrib_la
-    if backend == 'auto':
-        return distrib_la.plan('eigh', mesh, n=int(n), backend='auto', budget_bytes=0)
-    # No room either: the staged stack did not fit whole matrices per rank, so
-    # the size route (distrib_la resolve guard 1b) may not choose them again.
-    return distrib_la.plan('eigh', mesh, n=int(n), backend=backend, batched_route='auto',
-                           budget_bytes=0)
+    # No room: the staged stack did not fit whole matrices per rank, so the size route
+    # (distrib_la resolve guard 1b) may not choose them again. The caller priced the mesh,
+    # so the plan names its provider route (a room-0 decision would refuse).
+    p = distrib_la.plan('eigh', mesh, n=int(n), backend=backend, budget_bytes=0,
+                        **({} if backend == 'auto' else dict(batched_route='auto')))
+    return dataclasses.replace(p, requested_batched_route=p.batched_route)
 
 
 def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
@@ -730,14 +731,20 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
     local = _local_eigenplan(mesh, n)
     need = int(beside) + distrib_la.eigh_stack_bytes(local, stack, np.complex128)
     row = ledger.preview(resident_bytes_per_rank=need, workspace_bytes_per_rank=0, concurrent_with=live)
-    # The whole mesh holds the stack's input and vector faces beside the same live set.
-    mesh_need = (row['aggregate_bytes_per_rank'] - need + int(beside)
-                 + -(-2 * 16 * int(np.prod(stack)) // int(mesh.size)))
+    # The whole mesh holds the stack's input face beside the same live set, and its solve as
+    # place() prices it (eigh_stack_bytes: one mesh solve, the other matrices' vectors, values).
+    try:
+        mesh_plan, no_mesh = _mesh_eigh(mesh, n, str(backend)), None
+        mesh_need = (row['aggregate_bytes_per_rank'] - need + int(beside) + -(-16 * int(np.prod(stack)) // int(mesh.size))
+                     + distrib_la.eigh_stack_bytes(mesh_plan, stack, np.complex128))
+    except RuntimeError as refusal:      # no whole-mesh library here: route (c) or that refusal
+        mesh_plan, no_mesh, mesh_need = None, refusal, 0
     if admit_local(f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2",
                    row['aggregate_bytes_per_rank'], row['available_device_bytes_per_rank'],
                    distributed_bytes=mesh_need, names=('route (c)', 'whole mesh')):
         return local
-    mesh_plan = _mesh_eigh(mesh, n, str(backend))
+    if no_mesh is not None:
+        raise no_mesh
     mesh_plan.require_capacity(f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2")
     return mesh_plan
 

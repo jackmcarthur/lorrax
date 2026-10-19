@@ -74,13 +74,13 @@ def test_distributed_layout_charges_no_contexts():
 
 def test_local_layout_charges_provider_contexts():
     # 28 GB fits 30 alone, but not with the 3 GB of contexts the local rule never withheld.
-    assert gpu_utils.admit_local("site", 40 * GB, 30 * GB, distributed_bytes=28 * GB) is False
+    # Both over (28 GB + 3 GB of contexts > 30): no route fits, refused by name.
+    with pytest.raises(RuntimeError, match="GATE route_capacity: site: .*linalg = distributed"):
+        gpu_utils.admit_local("site", 40 * GB, 30 * GB, distributed_bytes=28 * GB)
     row = gpu_utils.routes()[0]
-    assert row["route"] == "distributed" and row["warning"] is not None
-    assert "linalg = distributed" in row["warning"] and "provider contexts 3.00 GB" in row["reason"]
-    # Both over: the distributed route runs, warned (no fail-open onto one rank).
-    assert gpu_utils.admit_local("other", 31 * GB, 30 * GB, distributed_bytes=29 * GB) is False
-    assert gpu_utils.routes()[1]["route"] == "distributed" and gpu_utils.routes()[1]["warning"]
+    assert row["warning"] is not None and "provider contexts 3.00 GB" in row["reason"]
+    with pytest.raises(RuntimeError, match="GATE route_capacity"):
+        gpu_utils.admit_local("other", 31 * GB, 30 * GB, distributed_bytes=29 * GB)
     # A route that opens no vendor context (an XLA program) is not charged.
     assert gpu_utils.admit_local("xla", 40 * GB, 30 * GB, distributed_bytes=28 * GB,
                                  provider=False) is False
@@ -139,9 +139,9 @@ def test_w_dyson_route(monkeypatch):
     route, room = w._dyson_route("distributed", 64, 8, mesh)
     assert route == "distributed" and room == int(31.6 * GB - 16.0 * 64 * 64 * 3 * 8 / 4)
     # n = 8192, 64 parents at P4: whole matrices 16 n^2 (3*16 + 2) = 53.7 GB/rank beside
-    # 51.5 GB of faces; the distributed 52.1 + 3 GB of contexts is over too, but less.
-    assert w._dyson_route("local", 8192, 64, mesh)[0] == "distributed"
-    assert gpu_utils.routes()[-1]["warning"]
+    # 51.5 GB of faces; the distributed 52.1 + 3 GB of contexts is over too: refused by name.
+    with pytest.raises(RuntimeError, match="GATE route_capacity: W Dyson"):
+        w._dyson_route("local", 8192, 64, mesh)
     # n = 4096, 16 parents: local 3.2 + 3.8 GB fits 31.6.
     assert w._dyson_route("local", 4096, 16, mesh) == ("local", None)
     # n = 6144, 16 parents: local 7.2 + 8.5 = 15.7 GB > 12 GB; distributed 7.5 + 3 GB of contexts fits.

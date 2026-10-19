@@ -206,7 +206,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         # (``parent_rounds``); a short last round repeats its last parent.
         face_batch = 1
         if execution == 'face':
-            from gw.shared_pole_capacity import face_eigh_room
+            from gw.shared_pole_capacity import check_eigh_room, face_eigh_room
             from gw.shared_pole_execution import face_batch_width, face_reduction_bytes, face_ritz_carrier
             keep_budget = recipe.get("pole_budget")
             sizing = dict(rows=n, side=conservative_side,
@@ -305,12 +305,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # conservative one (run30k: 48640 vs 84480, 137.9 -> 64 GB/rank); the eigh rooms
                 # below still subtract the admitted (conservative) program.
                 admitted = budget.program_bytes
-                if execution == 'face':
-                    from gw.shared_pole_execution import face_reduction_bytes
-                    budget.program_bytes = face_reduction_bytes(mesh_xy, len(ids), **dict(sizing, side=side))
-                budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
-                    round_states, infinity, widths, infinity_width))
-                budget.program_bytes = admitted
+                try:
+                    if execution == 'face':
+                        from gw.shared_pole_execution import face_reduction_bytes
+                        budget.program_bytes = face_reduction_bytes(mesh_xy, len(ids), **dict(sizing, side=side))
+                    budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
+                        round_states, infinity, widths, infinity_width))
+                finally:
+                    budget.program_bytes = admitted
                 round_states, infinity = pad_states(round_states, widths, infinity, infinity_width)
             with phase("gram_reduction"):
                 if execution == 'face':
@@ -446,11 +448,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
                     real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
                     mesh_xy=mesh_xy, eigh_plan=eig if execution == 'face' else local_eigh, ordered=ordered,
-                    # A face check decides its eighs beside the model phase and its own program; the
-                    # model row's eigh reservation is that eigh's own (run30k: 8 GiB room, not 15).
-                    room=lambda price: face_eigh_room(dict(model_row, aggregate_bytes_per_rank=(
-                        model_row['aggregate_bytes_per_rank'] + price
-                        - model_row['native_workspace'].get('eigh', 0)))))
+                    # A face check decides its eighs beside the model phase and its own program.
+                    room=lambda price: check_eigh_room(model_row, price))
                 del inverse_sqrt, held, exact
             with phase("gates"):
                 for slot, q in enumerate(ids[:real]):

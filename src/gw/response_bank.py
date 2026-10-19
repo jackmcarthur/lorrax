@@ -264,6 +264,13 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
 
     def bind(room):
         lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
+        # The provider beside the room: one factor face and the getrs right-hand-side chunk
+        # (batched_solve_lu_ffi's 2 GB cap, at most a face); over it, no route fits.
+        faces = 16 * int(n) * int(n) // int(mesh_xy.size)
+        if room is not None and lu.backend != "one_device" and faces + min(2_000_000_000, faces) > room:
+            raise RuntimeError(f"GATE response_dyson_capacity: the Dyson LU n={n} on the {lu.backend} "
+                               f"mesh needs {(faces + min(2e9, faces)) / 1e9:.2f} GB/rank beside its "
+                               f"operands, over the room {room / 1e9:.2f} GB/rank.")
         progs = local or {name: _Decided(key, name, room, lu) for name in names}
         pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
         resident = backend == "off" and volume is None
@@ -1020,9 +1027,15 @@ def _coulomb_algebra(mesh_xy, n_packed, n_logical, layout):
     from distrib_la import checked_program, matmul, plan
     from .gw_config import linalg_resolution
     resolution = linalg_resolution({"linalg": layout})
-    backend = "off" if resolution.layout == "local" else "distributed"
-    eig = plan("eigh", mesh_xy, backend=backend, n=n_packed,
-               batched_route=resolution.batched_route)
+    backend = "off" if resolution.layout == "local" else "distributed"     # the root's GEMMs
+    if resolution.layout == "local":
+        # place() decides the root's eigh in the run budget: whole matrices per rank only
+        # where they fit (a whole n^2 per rank unpriced was 115 GB/rank at n 30000).
+        from common.gpu_utils import device_budget_bytes
+        eig = plan("eigh", mesh_xy, n=n_packed, budget_bytes=int(device_budget_bytes()))
+    else:
+        eig = plan("eigh", mesh_xy, backend="distributed", n=n_packed,
+                   batched_route=resolution.batched_route)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     rep = NamedSharding(mesh_xy, P())
 

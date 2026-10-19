@@ -180,27 +180,6 @@ def test_route_c_takes_the_cut():
     assert not bool(np.asarray(failed[0]).any()) and np.isfinite(np.asarray(w)).all()
 
 
-def test_a_local_workspace_the_vendor_rejects_is_inadmissible(monkeypatch):
-    """run30k: cusolverDnZheevd_bufferSize answered status 3 at n 30000. A query the vendor
-    rejects raises; a local fit it cannot size is no local candidate (fits_local False)."""
-    from types import SimpleNamespace
-    from distrib_la import loader, workspace
-
-    class _Rejects:                                   # a bufferSize query that answers INVALID_VALUE
-        def __call__(self, *args):
-            return 3
-    monkeypatch.setattr(loader, "get_lib", lambda platform: SimpleNamespace(lrx_eigh_workspace_bytes=_Rejects()))
-    monkeypatch.setattr(workspace, "device_vendor", lambda device: "cuda")
-    workspace._vendor_query.cache_clear()
-    try:
-        with pytest.raises(RuntimeError, match="status=3"):
-            workspace._vendor_query(0, "eigh", (30000,), "<c16")
-        mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
-        assert not workspace.fits_local(SimpleNamespace(mesh=mesh), "eigh", ((1, 64, 64),), np.complex128, 10**12)
-    finally:
-        workspace._vendor_query.cache_clear()
-
-
 def test_lu_relabels_from_4x4_and_keeps_the_2x2_bound():
     """run30k: n 30000 on 4x4 (local 7500) factors block-cyclic at block 250 with a chunkable RHS
     (30 local column blocks); 2x2 keeps its measured rule (relabel only past local 8192)."""
@@ -217,28 +196,22 @@ def test_lu_relabels_from_4x4_and_keeps_the_2x2_bound():
 def test_the_gathered_retry_is_priced_against_the_plans_room(monkeypatch):
     """run30k: cuSOLVERMp 0.9.1 left the n 30000 direction eigh with no correct attempt. The
     gathered retry joins the chain where 2 n^2 and the local eigh workspace fit the plan's room
-    (no room: the 64 MiB rule), and the local query runs once per shape for the process."""
+    (no room: the 64 MiB rule). The workspace is LAPACK's heevd x CUDA_HEEVD_FACTOR on CUDA, from
+    the shape: planning issues no vendor query (one at trace time could create a handle mid-run)."""
     import sys
     import lxkit
     import distrib_la  # noqa: F401
-    from distrib_la import loader, workspace
+    from distrib_la import loader
     pl = sys.modules["distrib_la.plan"]                  # the module (distrib_la.plan is also a function)
-    calls = []
 
-    def query(ctx, n, cplx, device, host):              # cusolverDnXsyevd_bufferSize: ~2x LAPACK heevd
-        calls.append(int(n))
-        device._obj.value, host._obj.value = 2 * (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n)), 0
-        return 0
-    monkeypatch.setattr(loader, "get_lib", lambda platform: type("Lib", (), {
-        "lrx_eigh_workspace_bytes": staticmethod(query)})())
+    def refuse(platform):
+        raise AssertionError("a vendor query while planning")
+    monkeypatch.setattr(loader, "get_lib", refuse)
     monkeypatch.setattr(lxkit, "device_vendor", lambda device: "cuda")
-    workspace._vendor_query.cache_clear()
-    try:
-        assert pl._gathered_admitted((1448, 1448), np.complex128) and not calls      # the fixed rule
-        assert not pl._gathered_admitted((9152, 9152), np.complex128)               # no room
-        assert pl._gathered_admitted((9152, 9152), np.complex128, 63.41e9)           # 8.0 GB
-        assert not pl._gathered_admitted((30000, 30000), np.complex128, 63.41e9)     # 86.4 GB
-        assert pl._gathered_admitted((30000, 30000), np.complex128, 90e9)
-        assert sorted(calls) == [9152, 30000]                                         # once each
-    finally:
-        workspace._vendor_query.cache_clear()
+    lapack = 16 * (2 * 30000 + 30000 ** 2) + 8 * (1 + 5 * 30000 + 2 * 30000 ** 2) + 4 * (3 + 5 * 30000)
+    assert pl._gathered_bytes((30000, 30000), np.complex128) == 2 * 16 * 30000 ** 2 + 2 * lapack   # 86.4 GB
+    assert pl._gathered_admitted((1448, 1448), np.complex128)                    # the fixed rule
+    assert not pl._gathered_admitted((9152, 9152), np.complex128)               # no room
+    assert pl._gathered_admitted((9152, 9152), np.complex128, 63.41e9)           # 8.0 GB
+    assert not pl._gathered_admitted((30000, 30000), np.complex128, 63.41e9)
+    assert pl._gathered_admitted((30000, 30000), np.complex128, 90e9)

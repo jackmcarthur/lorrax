@@ -267,29 +267,35 @@ def _mesh_price(n, dtype, ranks) -> int:
     return (CHECKED_EIGH_TILES + 2) * -(-n * n * np.dtype(dtype).itemsize // ranks)
 
 
-#: Measured eigh walls, complex128, A100-SXM4-80GB, ``dla_sweep`` P4 2x2 (the rows behind
-#: resolve.ONE_DEVICE_BY_ROOM): seconds per matrix on one device (jaxlib cuSOLVER, one rank's
-#: batch) and per call on the whole mesh (cuSOLVERMp 0.9.1): n 312 x64 0.022 / 1.97 s, 8192 x4
-#: 2.05 / 6.53 s, 16384 x4 13.7 / 29.0 s. Scope: CUDA; ROCm and float64 take the same table
-#: (unmeasured); a one-device batch of small matrices is charged per matrix.
-_EIGH_SECONDS = {"one": ((312, 0.022 / 16), (8192, 2.05), (16384, 13.7)),
-                 "mesh": ((312, 1.97 / 64), (8192, 6.53 / 4), (16384, 29.0 / 4))}
+#: Measured eigh walls by platform, complex128: CUDA = A100-SXM4-80GB, ``dla_sweep`` P4 2x2 (the
+#: rows behind resolve.ONE_DEVICE_BY_ROOM): seconds per matrix on one device (jaxlib cuSOLVER,
+#: one rank's batch) and per call on the whole mesh (cuSOLVERMp 0.9.1): n 312 x64 0.022 / 1.97 s,
+#: 8192 x4 2.05 / 6.53 s, 16384 x4 13.7 / 29.0 s. A platform without a row (ROCm: unmeasured)
+#: decides by memory alone (route (c) where it fits). float64 takes the complex128 row.
+_EIGH_SECONDS = {"CUDA": {"one": ((312, 0.022 / 16), (8192, 2.05), (16384, 13.7)),
+                          "mesh": ((312, 1.97 / 64), (8192, 6.53 / 4), (16384, 29.0 / 4))}}
 
 
-def _eigh_seconds(kind, n, ranks=4) -> float:
-    """Expected seconds of one n x n eigh, ``kind`` 'one' (one device) or 'mesh' (``ranks``):
-    the measured points log-log interpolated, n^3 past the last, the fixed cost below the
-    first. The mesh's part above its fixed cost scales as 4/P (n 100000 at P16 predicts
-    412 s against 312 s measured, eighmem 2026-10-18; P16 below n 16384 unmeasured)."""
-    pts = _EIGH_SECONDS[kind]
+def _eigh_seconds(kind, n, ranks=4, platform="CUDA"):
+    """Expected seconds of one n x n eigh, ``kind`` 'one' (one device) or 'mesh' (``ranks``), or
+    None without a measured row: the points log-log interpolated, n^3 past the last, the fixed
+    cost below the first. Past n 16384 the mesh's part above its fixed cost scales as 4/P (n
+    100000 at P16: 412 s predicted, 312 s measured, eighmem 2026-10-18); below it the mesh is
+    held at its P4 time on every P, since P16 is unmeasured there (open: a P16 sweep at n
+    2048-8192)."""
+    pts = _EIGH_SECONDS.get(str(platform), {}).get(kind)
+    if pts is None:
+        return None
     t = pts[-1][1] * (n / pts[-1][0]) ** 3 if n > pts[-1][0] else pts[0][1]
     for (a, ta), (b, tb) in zip(pts, pts[1:]):
         if a < n <= b:
             t = ta * (tb / ta) ** (math.log(n / a) / math.log(b / a))
-    return t if kind == "one" else pts[0][1] + (t - pts[0][1]) * 4 / ranks
+    if kind == "one" or (ranks > 4 and n <= pts[-1][0]):
+        return t
+    return pts[0][1] + (t - pts[0][1]) * 4 / ranks
 
 
-def place(op, mesh, nb, n, dtype, room, provider) -> StackRoute:
+def place(op, mesh, nb, n, dtype, room, provider, backend=None) -> StackRoute:
     """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank: the faster of the
     routes whose price fits, priced from the shapes only (no vendor query) and timed by
     :func:`_eigh_seconds`, so every rank decides alike with no exchange.
@@ -297,12 +303,16 @@ def place(op, mesh, nb, n, dtype, room, provider) -> StackRoute:
     Route (c) at the most whole matrices per rank whose program (:func:`_stack_price`) fits,
     ceil(nb/P) one-device solves; the whole mesh (:func:`_mesh_price`), nb mesh solves. A
     single large matrix goes to the mesh (route (c) pads it to every rank and solves it on
-    one); a small stack stays whole per rank. :meth:`Plan.stack_route` refuses by name a
-    whole mesh over ``room`` (no route fits).
+    one); a small stack stays whole per rank. A ``one_device`` plan's fallback holds one whole
+    matrix per rank (resolve's size route), priced so. :meth:`Plan.stack_route` refuses by
+    name a fallback over ``room`` (no route fits). Route (c) never costs less than the mesh
+    (8 n^2 + 7 n^2/P against 9 n^2/P), so a mesh over the room has no route (c) under it.
     """
     x, y = int(mesh.shape["x"]), int(mesh.shape["y"])
     ranks, gathered = x * y, _gathered_admitted((n, n), dtype, room)
-    whole = StackRoute(provider, 0, 1, _mesh_price(n, dtype, ranks), room)
+    platform = mesh_platform(mesh)
+    whole = StackRoute(provider, 0, 1, (BATCH_EIGH_TILES * n * n * np.dtype(dtype).itemsize
+                                        if backend == ONE_DEVICE else _mesh_price(n, dtype, ranks)), room)
     if n % x == 0 and n % y == 0:
         per_rank = -(-nb // ranks)
         while per_rank >= 1:
@@ -310,8 +320,8 @@ def place(op, mesh, nb, n, dtype, room, provider) -> StackRoute:
             tried = -(-(-(-nb // rounds)) // ranks)
             price = _stack_price(op, mesh, nb, n, dtype, rounds, gathered)
             if price <= room:
-                faster = -(-nb // ranks) * _eigh_seconds("one", n) <= nb * _eigh_seconds("mesh", n, ranks)
-                if faster or whole.program_bytes > room:
+                one, on_mesh = (_eigh_seconds(k, n, ranks, platform) for k in ("one", "mesh"))
+                if one is None or -(-nb // ranks) * one <= nb * on_mesh:
                     return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
                 break
             per_rank = min(per_rank - 1, max(1, per_rank * room // price))
@@ -330,18 +340,29 @@ def _gathered_admitted(shape, dtype, room=None) -> bool:
     return small <= GATHERED_EIGH_BYTES or (room is not None and _gathered_bytes(shape, dtype) <= room)
 
 
+#: cusolverDnXsyevd_bufferSize over LAPACK's heevd lwork + lrwork, complex128 (A100, cuSOLVER
+#: 12.2.6.9, 2026-10-19): 1.08 / 0.54 GB at n 4096, 57.7 / 28.8 GB at 30000, 109 / 54.4 GB at
+#: 41250. float64 unmeasured (the same factor).
+CUDA_HEEVD_FACTOR = 2.0
+
+
+def local_eigh_workspace(n, dtype, platform) -> int:
+    """Device bytes of one local n x n eigh's workspace, from the shape: LAPACK ?heevd/?syevd
+    lwork, lrwork and liwork, times CUDA_HEEVD_FACTOR on CUDA. No vendor query is issued while
+    planning (a query at trace time could create a handle mid-run)."""
+    n = int(n)
+    lapack = (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) if np.dtype(dtype).kind == "c"
+              else 8 * (1 + 6 * n + 2 * n * n)) + 4 * (3 + 5 * n)
+    return int(lapack * (CUDA_HEEVD_FACTOR if platform == "CUDA" else 1))
+
+
 def _gathered_bytes(shape, dtype) -> int:
-    """Per-rank bytes the gathered retry reserves: GATHERED_EIGH_FACTOR n^2 per matrix
-    and the local heevd/syevd workspace: LAPACK lwork + lrwork, or on CUDA the vendor's
-    own query where larger (cusolverDnXsyevd: 57.7 GB at n 30000 complex, twice LAPACK's)."""
+    """Per-rank bytes the gathered retry reserves: GATHERED_EIGH_FACTOR n^2 per matrix and the
+    local eigh workspace (:func:`local_eigh_workspace`)."""
     from lxkit import device_vendor
     item, elems, n = np.dtype(dtype).itemsize, int(np.prod(tuple(shape))), int(shape[-1])
-    heevd = (16 * (2 * n + n * n) + 8 * (1 + 5 * n + 2 * n * n) if np.dtype(dtype).kind == "c"
-             else 8 * (1 + 6 * n + 2 * n * n))
-    if device_vendor(jax.devices()[0]) == "cuda":
-        from distrib_la.workspace import _vendor_query
-        heevd = max(heevd, _vendor_query(0, "eigh", (n,), np.dtype(dtype).str)[0])
-    return GATHERED_EIGH_FACTOR * item * elems + elems // (n * n) * heevd
+    platform = "CUDA" if device_vendor(jax.devices()[0]) == "cuda" else "other"
+    return GATHERED_EIGH_FACTOR * item * elems + elems // (n * n) * local_eigh_workspace(n, dtype, platform)
 
 
 @lru_cache(maxsize=None)
@@ -1205,7 +1226,7 @@ class Plan:
         if (self.requested_batched_route != "auto" or self.budget_bytes is None
                 or (self.is_native and capacity) or self.op != "eigh"):
             return StackRoute(static)
-        if self.budget_bytes == 0 or (capacity and in_checked_retry()):
+        if capacity and in_checked_retry():
             # A checked program's retry is the whole-mesh program its caller
             # sized; a plan with no whole mesh retries on its decided route.
             self.require_capacity(f"an eigh stack {shape} with no room")
@@ -1247,7 +1268,7 @@ class Plan:
         return static
 
     def _decide_stack(self, op, nb, n, dtype, phase, traced=True) -> StackRoute:
-        return place(op, self.mesh, nb, n, dtype, int(self.budget_bytes), self.batched_route)
+        return place(op, self.mesh, nb, n, dtype, int(self.budget_bytes), self.batched_route, self.backend)
 
     @property
     def native_fn(self) -> Callable:

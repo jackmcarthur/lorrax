@@ -347,12 +347,16 @@ extern "C" int lrx_eigh_workspace_bytes_block(
         (complex128 != 0 && complex128 != 1)) return -1;
     *device_bytes = 0; *host_bytes = 0;
     if (ctx_handle == 0) {
-        // One handle for the process, never destroyed: cusolverDnDestroy (cublasDestroy)
-        // synchronizes the device, so a query issued after XLA programs were dispatched
-        // waited on all of them (4+ min in cuCtxSynchronize at n 48640, run30k try 7).
-        static cusolverDnHandle_t handle = nullptr;
-        auto status = handle ? CUSOLVER_STATUS_SUCCESS : cusolverDnCreate(&handle);
-        if (status != CUSOLVER_STATUS_SUCCESS) { handle = nullptr; return int(status); }
+        // One handle for the process, created once (a function-local static: thread-safe
+        // initialization) and never destroyed: cusolverDnDestroy (cublasDestroy) synchronizes
+        // the device, so a query issued after XLA programs were dispatched waited on all of
+        // them (4+ min in cuCtxSynchronize at n 48640, run30k try 7).
+        static const cusolverDnHandle_t handle = [] {
+            cusolverDnHandle_t h = nullptr;
+            return cusolverDnCreate(&h) == CUSOLVER_STATUS_SUCCESS ? h : nullptr;
+        }();
+        if (!handle) return int(CUSOLVER_STATUS_NOT_INITIALIZED);
+        cusolverStatus_t status = CUSOLVER_STATUS_SUCCESS;
         // The 64-bit generic query (size_t workspace, int64 n): the legacy 32-bit
         // Zheevd_bufferSize answered INVALID_VALUE at n 30000 (int lwork; run30k).
         cusolverDnParams_t params = nullptr;

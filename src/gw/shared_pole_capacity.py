@@ -213,7 +213,7 @@ def staged_cross_bytes(*, parents, ranks, side, rows):
 
 
 def face_eigh_room(admission, held=0):
-    """Room per rank for a face constructor's eigh stacks, or None.
+    """Room per rank for a face constructor's eigh stacks (0: none, which distrib_la refuses).
 
     ``admission`` is a face batch admission row (``face_batch_width``) and
     ``held`` what is live beside it that the row does not hold: the receipt's
@@ -226,7 +226,15 @@ def face_eigh_room(admission, held=0):
     # tuple (route, matrices per rank, rounds) instead of the room.
     room = (int(admission['available_device_bytes_per_rank'])
             - int(admission['aggregate_bytes_per_rank']) - int(held))
-    return (room >> 30) << 30 if room >= 1 << 30 else None
+    return (room >> 30) << 30 if room >= 1 << 30 else 0
+
+
+def check_eigh_room(model_row, price):
+    """The passivity/held checks' eigh room: beside the model row and the check program's
+    ``price``, with the row's own reservation of that same n x n eigh handed back (the model
+    phase prices it; run30k: 8 GiB without the hand-back, 15 with it)."""
+    return face_eigh_room(dict(model_row, aggregate_bytes_per_rank=(
+        model_row['aggregate_bytes_per_rank'] + price - model_row['native_workspace'].get('eigh', 0))))
 
 
 def _shard_bytes(array):
