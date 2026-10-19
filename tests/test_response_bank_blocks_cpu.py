@@ -210,7 +210,9 @@ def dump(path):
     mesh = Mesh(devs[:4].reshape(2, 2), ("x", "y"))
     out = {}
     with F.xla_reference():
-        for name, frac, zz in (("step", False, Z_EV[1:]), ("frac", True, Z_EV[2:])):
+        # the one-rule path refuses 3+0.5i eV at the fractional state (its envelope interval);
+        # the dump keeps the samples it builds there
+        for name, frac, zz in (("step", False, Z_EV[1:]), ("frac", True, Z_EV[2:4])):
             wfns, meta, kmq, f = system(mesh, fractional=frac)
             z = np.asarray(zz) / RY
             bank, rules, receipt, raws = bank_chi(wfns, meta, mesh, z)
