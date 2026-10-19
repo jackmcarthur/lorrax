@@ -482,8 +482,16 @@ def distributed_eigh(
                  out_specs=(P(), P("x", "y")),
                  check_vma=False)
         def _call(local_A):
-            W, Q = jax.ffi.ffi_call(
-                _EIGH_TARGET, (W_local, Q_local))(local_A, **attrs)
+            # The third result is the operand the solver destroys, aliased to
+            # the input (ABI 10): the handler solves in that buffer instead of
+            # a private copy in its scratch. Where the input is an
+            # intermediate (the checked chain's deflated copy) XLA hands its
+            # buffer over; where it is a caller's live array (a parameter
+            # this wrapper does not donate) XLA copies it first, so the
+            # caller's A is never written (EIGHMEM).
+            W, Q, _destroyed = jax.ffi.ffi_call(
+                _EIGH_TARGET, (W_local, Q_local, Q_local),
+                input_output_aliases={0: 2})(local_A, **attrs)
             # Q's rows (axis 0, over 'x') are the eigenvalue index, which
             # cuSOLVERMp lays out block-cyclically like A's; put them back
             # in W's ascending order.

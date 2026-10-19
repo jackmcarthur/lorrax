@@ -258,7 +258,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 
 	``zeta_rcond`` records the EFFECTIVE value, i.e. after
 	``LORRAX_ZETA_RCOND`` is applied exactly as
-	``isdf/core._factor_c_q_replicated`` applies it.  Recording the cfg value
+	``isdf/core._factor_c_q_face`` applies it.  Recording the cfg value
 	instead would be a correctness hole: a rerun that drops the env
 	override would match the provenance and silently reuse a ζ fit at a
 	different conditioning cutoff.  ``zeta_ridge`` is retired and refused

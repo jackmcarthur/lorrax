@@ -145,6 +145,13 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   its workspace is 2.0 GB against 0.25–0.32 GB at blocks 6–172. The chain's temporaries
   (7 n²/P per rank, measured) and an admitted gathered retry are priced by
   `workspace_bytes_per_rank`.
+  **Check what you use:** a caller that keeps only w > c·max(w) passes `cut=c`
+  (`plan.batched(A, cut=c)`, every route; every attempt of the chain is
+  probed on those columns only). The shared-pole Gram, H′_vv, Schur and
+  sector-metric eighs pass their keep cut, the passivity eigh 1e-8 (its
+  verdict reads eigenvalues only), the charge ζ factor `zeta_rcond` and the
+  Coulomb root its support tolerance; the Ritz eighs and the response
+  directions keep the full check.
 - Every route-(c) eigh is checked the same way on its face-layout result,
   against the Hermitian part of the input (the local solver symmetrizes),
   with the same retries after the first attempt: shifted slice by slice,

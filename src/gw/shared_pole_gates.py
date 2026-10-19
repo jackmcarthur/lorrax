@@ -201,6 +201,15 @@ def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, 
     return _passivity_response_checks(response, eigh=eigh, gates=gates)
 
 
+#: The passivity eigh's check cut (check what you use, distrib_la._result_check.used_probes):
+#: the verdict reads eigenvalues only (min and max), and those are backward-stable even where
+#: a clustered set of vectors loses orthogonality, as cuSOLVERMp's do in the near-zero
+#: cluster of a rank-deficient whitened response. Its columns above the cut are checked (the
+#: solve is not garbage); the cluster's vectors, never read, cannot refuse the gate, and
+#: its eigenvalues still decide lambda_min.
+PASSIVITY_CHECK_CUT = 1e-8
+
+
 def shared_pole_operator_passivity(wc, inverse_coulomb_sqrt, *, matmul, eigh, gates):
     """Test an evaluated physical Wc(i eta) against the actual V support.
 
@@ -220,7 +229,7 @@ def _passivity_response_checks(response, *, eigh, gates):
     norm = jnp.linalg.norm(herm, axis=(-2, -1))
     anti = jnp.linalg.norm(response - _adjoint(response), axis=(-2, -1))
     anti = anti / jnp.where(norm > 0, 2 * norm, 1)
-    values, _ = eigh(herm)
+    values, _ = eigh(herm, cut=PASSIVITY_CHECK_CUT)
     minimum, maximum = values[:, 0], values[:, -1]
     limit = gates["passivity"]["threshold"].get("antihermitian_relative_max")
     passed = ((minimum >= gates["passivity"]["threshold"]["eigenvalue_min"])

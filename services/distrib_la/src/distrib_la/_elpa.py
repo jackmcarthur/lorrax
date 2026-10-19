@@ -164,6 +164,36 @@ def workspace_bytes(side: int, p: int, dtype, threads: int | None = None) -> int
     return pool_bytes(side, p, dtype) + rocblas_bytes(side, p, dtype, threads)
 
 
+def _last_row_coupled(solve):
+    """``solve`` (an eigh returning ``(W, Q)``, Q's rows the operand's) with the operand's last row coupled.
+
+    ELPA (2026.02.001, 1-stage, AMD GPU) returns wrong pairs when the LAST row is decoupled
+    (a zero-row or sentinel block at the global tail; standalone reproducer, upstream report
+    ELPA_TAIL_BLOCK_UPSTREAM.md, largenmu 2026-10-19), and not when the same block sits at
+    the head or in the middle: swap the last row/column with the last coupled one (O(n)
+    movement) and the vectors' rows back. One swap suffices: the block then ends one row
+    before the tail, where ELPA solves it.
+    """
+    def run(a):
+        side = a.shape[-1]
+        i = jnp.arange(side)
+        coupled = jnp.any((a != 0) & (i[:, None] != i[None, :]), axis=-1)
+        j = jnp.where(jnp.any(coupled), side - 1 - jnp.argmax(coupled[::-1]), side - 1)
+        W, Q = solve(_swap(_swap(a, j, 0), j, 1))
+        return W, _swap(Q, j, 0)
+    return run
+
+
+def _swap(a, j, axis):
+    """``a`` with its index ``j`` and its last index exchanged along ``axis`` (0 rows, 1 columns), by
+    selects on the operand's own tiles (no gather): the two lines are masked sums."""
+    n = a.shape[axis]
+    i = jnp.arange(n)
+    at = (lambda k: i[:, None] == k) if axis == 0 else (lambda k: i[None, :] == k)
+    line = lambda k: jnp.sum(jnp.where(at(k), a, 0), axis=axis, keepdims=True)
+    return jnp.where(at(j), line(n - 1), jnp.where(at(n - 1), line(j), a))
+
+
 def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
                      block_size: int | None = None,
                      side: int | None = None) -> Tuple[jax.Array, jax.Array]:
@@ -224,6 +254,7 @@ def distributed_eigh(A: jax.Array, *, mesh: Mesh, compute_evecs: bool = True,
             return W, jnp.transpose(Q_T, (1, 0))
 
         face = NamedSharding(mesh, P("x", "y"))
+        _call = _last_row_coupled(_call)    # the padded side's sentinel tail included
 
         def _padded(a):
             whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)

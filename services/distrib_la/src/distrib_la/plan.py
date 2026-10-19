@@ -269,7 +269,7 @@ def _gathered_admitted(shape, dtype) -> bool:
 
 
 @lru_cache(maxsize=None)
-def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, phase: str):
+def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, phase: str, cut=None):
     """The jitted route-(c) program for one face stack and ``phase`` (:data:`PHASES`).
 
     ``rounds`` slices (:func:`distrib_la._batch_reshard.reshard_rounds_call`),
@@ -293,26 +293,28 @@ def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds
     if _gathered_admitted(shape, dtype):
         attempts.append(partial(_gathered_eigh, mesh=mesh))
     attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[phase]
-    return jax.jit(lambda a: checked("eigh", tuple(attempts), lambda r: _local_eigh_errors(a, *r, mesh=mesh),
+    return jax.jit(lambda a: checked("eigh", tuple(attempts), lambda r: _local_eigh_errors(a, *r, mesh=mesh, cut=cut),
                                      (a,), constrain=eigh_layout(mesh, 3),
                                      final=phase != "first"),
                    out_shardings=(out, replicated))
 
 
-def _local_eigh_errors(a, values, vectors, *, mesh=None):
+def _local_eigh_errors(a, values, vectors, *, mesh=None, cut=None):
     """:func:`distrib_la._result_check.eigh_errors` against Herm(a) = (a + a^H)/2,
     the matrix the local solver diagonalizes (``jnp.linalg.eigh`` symmetrizes
     its input). a^H V X is read as (X^H V^H a)^H, so the face-tiled stack is
     never transposed."""
-    from distrib_la._result_check import _all_ranks, _norm, probes
-    x = probes(a.shape[-1], vectors.dtype)
+    from distrib_la._result_check import _all_ranks, _norm, used_probes
+    x, used = used_probes(values, vectors.dtype, cut)
     vx = vectors @ x
     left = jnp.conj(jnp.swapaxes(jnp.conj(jnp.swapaxes(vx, -1, -2)) @ a, -1, -2))
     from distrib_la._result_check import _face, _rows
     nd = a.ndim
+    norm_x = jnp.maximum(_norm(x), jnp.finfo(values.dtype).tiny)
+    gram = jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x
     residual = _norm(0.5 * (a @ vx + left) - vectors @ (values[..., :, None] * x), mesh, _rows(nd)) / (
-        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * _norm(x))
-    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x, mesh, _rows(nd)) / _norm(x)
+        jnp.maximum(_norm(a, mesh, _face(nd)), jnp.finfo(values.dtype).tiny) * norm_x)
+    orthogonality = _norm(gram if used is None else jnp.where(used, gram, 0), mesh, _rows(nd)) / norm_x
     finite = _all_ranks(jnp.all(jnp.isfinite(values)), mesh)
     return (jnp.where(finite, jnp.max(residual), jnp.inf),
             jnp.where(finite, jnp.max(orthogonality), jnp.inf))
@@ -1330,7 +1332,8 @@ class Plan:
         from distrib_la.matmul import matmul
         backend = self.backend
 
-        def safe(A, *, mesh, _phase="all", **kwargs):
+        def safe(A, *, mesh, _phase="all", cut=None, **kwargs):
+            # ``cut``: check what you use (checked_eigh), on every attempt of the chain.
             def solve(a, **extra):
                 return post(backend, *call(a, mesh=mesh, **kwargs, **extra))
             # Zero rows leave the solver as distinct sentinels (deflate_zero_rows),
@@ -1366,7 +1369,7 @@ class Plan:
             # An eager call's first program holds the first attempt; its retry
             # program the rest (Plan._program). A traced call holds them all.
             attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[_phase]
-            (values, vectors), failed = checked_eigh(attempts, A, mesh=mesh, final=_phase != "first")
+            (values, vectors), failed = checked_eigh(attempts, A, mesh=mesh, final=_phase != "first", cut=cut)
             return values, vectors, failed
         return safe
 
@@ -1459,10 +1462,11 @@ class Plan:
         # the same face sharding, including on an explicit native plan.
         if route == ROUTE_BATCH_RESHARD:
             if self.op == "eigh":
+                cut = kwargs.pop("cut", None)
                 self._reshard_options(kwargs)
                 rounds = (1 if _route is not None else
                           self.stack_route(A.shape, A.dtype, traced=traced).rounds)
-                return self._checked_reshard("eigh", A, rounds)
+                return self._checked_reshard("eigh", A, rounds, cut)
             return self._batch_reshard((A, *args), kwargs)
 
         if self.is_native:
@@ -1517,7 +1521,7 @@ class Plan:
         traced = isinstance(A, jax.core.Tracer)
         return self._checked_reshard(op, A, self.stack_route(A.shape, A.dtype, op, traced).rounds)
 
-    def _checked_reshard(self, op: str, A, rounds: int):
+    def _checked_reshard(self, op: str, A, rounds: int, cut=None):
         """Route (c) in ``rounds`` slices, checked (:func:`_reshard_stack_program`).
 
         A traced caller inlines its phase of the chain (:data:`PHASES`). An eager call runs
@@ -1532,7 +1536,8 @@ class Plan:
         shape, dtype, site = tuple(int(v) for v in A.shape), str(A.dtype), call_site()
 
         def program(phase):
-            return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), phase)
+            return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), phase,
+                                          None if cut is None else float(cut))
         if op == "normal_eigh":
             return program("all")(A)
         if isinstance(A, jax.core.Tracer):
