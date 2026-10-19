@@ -1516,7 +1516,7 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):
     Existing normalized-Gram thresholds control rank revelation; no
     cross-sector passivity or PSD repair is applied.
     """
-    gamma, u = eigh(pencil[0])
+    gamma, u = eigh(pencil[0], cut=gates["normalized_gram_keep"]["threshold"])   # checked where kept
     finite = jnp.all(jnp.isfinite(gamma), axis=-1) & jnp.all(jnp.isfinite(u), axis=(-2, -1))
     stage = joint_keep_stage(pencil, gamma, u, matmul=matmul, gates=gates, matrix_sharding=matrix_sharding)
     values, rotation = eigh(stage["reduced"])
@@ -1539,7 +1539,7 @@ def joint_keep_stage(pencil, gamma, u, *, matmul, gates, matrix_sharding=None):
 
     metric, value, oc, ot = pencil
     top = gamma[:, -1]
-    ratio = gamma[:, 0] / jnp.where(top > 0, top, 1)
+    ratio = jnp.min(gamma, axis=-1) / jnp.where(top > 0, top, 1)
     valid = ((top > 0) & jnp.all(jnp.isfinite(gamma), axis=-1)
              & (ratio >= gates["normalized_gram_validity"]["threshold"]))
     keep = ((top[:, None] > 0) &

@@ -1,7 +1,7 @@
 """Host reads batched or kept on device (CPU, seconds).
 
-A checked solve's status costs rank 0 one read (failure and notice bits together),
-and its error table is read only when a notice prints; the bank's reciprocity
+A checked solve's status costs every rank one read of its failure flag, and its
+error table is read only when that flag is set (one attempt: the refusal); the bank's reciprocity
 census is read once at the receipt; the store's verdicts are read once per call.
 """
 import contextlib
@@ -19,41 +19,41 @@ def _prints(status, n):
     from distrib_la import _result_check as rc
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
-        rc._notices((status[0], np.asarray(status[1])), "eigh", n, np.complex128, "test", final=True)
-    return bool(err.getvalue())
+        rc._notices((status[0], np.asarray(status[1])), "eigh", n, np.complex128, "test")
+    return err.getvalue()
 
 
-@pytest.mark.parametrize("rows", [
-    [[1e-16, 1e-16], [np.nan, np.nan]],          # accepted first attempt: no notice
-    [[1e-3, 1e-16], [1e-16, 1e-16]],             # first attempt failed, retry passed: notice
-    [[np.nan, np.nan], [np.nan, np.nan]],        # nothing ran
-    [[np.inf, np.inf], [1e-3, 1e-3]],            # every attempt failed: refusal
+@pytest.mark.parametrize("rows,named", [
+    ([1e-16, 1e-16], 0),           # accepted: nothing printed
+    ([1e-3, 1e-16], 1),            # failed its check: one refusal per failed matrix
+    ([np.inf, np.inf], 1),
 ])
-def test_notice_bit_matches_the_printed_notices(rows):
+def test_refusal_names_each_failed_matrix(rows, named):
     from distrib_la import _result_check as rc
-    rc._FAILED.clear(); rc._NOTICE.clear()
-    n = 64
-    table = jnp.asarray([rows, rows[::-1]])      # a stack of two matrices
-    failed = jnp.asarray(bool(np.all(np.asarray(rows)[-1] > rc.accept(n))))
-    status = (failed, table)
-    got_failed, notice = rc._status(status, n, np.complex128)
-    assert notice == _prints(status, n)          # the host table takes the original path
-    assert got_failed == bool(failed)
+    table = jnp.asarray([rows, [1e-16, 1e-16]])      # a stack of two matrices, the second accepted
+    printed = _prints((jnp.asarray(bool(named)), table), 64)
+    assert printed.count("GATE distrib_la_result_check") == named
 
 
 def test_status_is_read_once_per_array(monkeypatch):
+    """One read of the failure flag per status array; the table is never read while it passed."""
     from distrib_la import _result_check as rc
-    rc._FAILED.clear(); rc._NOTICE.clear()
+    rc._FAILED.clear()
     reads = []
     real = jax.device_get
     monkeypatch.setattr(jax, "device_get", lambda x: reads.append(1) or real(x))
-    status = (jnp.asarray(False), jnp.full((2, 2), 1e-16))
+    status = (jnp.asarray(False), jnp.full((2,), 1e-16))
     for _ in range(3):
-        assert rc._flag(status, 64, np.complex128) is False
-    assert rc._flag(status) is False
-    assert reads == []          # the packed word is read with np.asarray, once, not device_get
-    other = (status[0], jnp.full((2, 2), 1.0))       # same flag, another table
-    assert rc._status(other, 64, np.complex128)[1] is True
+        assert rc._flag(status) is False
+    assert reads == [1]
+
+
+def test_raise_if_failed_reads_the_table_only_on_failure(monkeypatch):
+    from distrib_la import _result_check as rc
+    rc._FAILED.clear()
+    rc.raise_if_failed((jnp.asarray(False), jnp.full((2,), np.inf)), "eigh", 64, np.complex128, "ok")
+    with pytest.raises(ValueError, match="GATE distrib_la_result_check: eigh n=64 at bad"):
+        rc.raise_if_failed((jnp.asarray(True), jnp.full((2,), 1e-3)), "eigh", 64, np.complex128, "bad")
 
 
 def test_reciprocity_rows_resolve_in_order_from_one_read():
@@ -79,23 +79,3 @@ def test_store_verdicts_refuse_the_first_bad_entry():
         sps._refuse_invalid([True, jnp.asarray(True), jnp.asarray(False)])
     with pytest.raises(Exception, match="invalid inactive sentinel"):
         sps._refuse_invalid([False])
-
-
-def test_notices_without_a_read_word_still_read_the_table():
-    """No memo (no _flag/_read_status before): the table is read and the notice prints."""
-    from distrib_la import _result_check as rc
-    rc._FAILED.clear(); rc._NOTICE.clear()
-    status = (jnp.asarray(False), jnp.asarray([[1e-3, 1e-3], [1e-16, 1e-16]]))
-    assert _prints(status, 64)
-
-
-def test_one_word_covers_every_table_of_a_program():
-    from distrib_la import _result_check as rc
-    rc._FAILED.clear(); rc._NOTICE.clear()
-    quiet = jnp.asarray([[1e-16, 1e-16], [np.nan, np.nan]])
-    loud = jnp.asarray([[1e-3, 1e-3], [1e-16, 1e-16]])
-    failed = jnp.asarray(False)
-    assert rc._read_status(failed, (quiet, loud), [(64, np.complex128)] * 2) is False
-    assert rc._memo(rc._NOTICE, quiet) is False and rc._memo(rc._NOTICE, loud) is True
-    assert rc._flag((failed, (quiet, loud))) is False          # memo: no second read
-    assert not _prints((failed, quiet), 64) and _prints((failed, loud), 64)

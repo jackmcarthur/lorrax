@@ -22,29 +22,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["largest_divisor", "pad_with_sentinels", "cyclic_to_block"]
+__all__ = ["largest_divisor", "cyclic_to_block"]
 
 
 def largest_divisor(local: int, cap: int) -> int:
     """The largest divisor of a tile edge ``local`` that is at most ``cap``."""
     return max(d for d in range(1, min(local, cap) + 1) if local % d == 0)
-
-
-def pad_with_sentinels(a, side: int):
-    """``a`` (n x n) padded to ``side``, the padded diagonal below its spectrum.
-
-    The padded rows and columns are zero except their diagonal, which holds
-    distinct sentinels ``-2 b (1 + j/side)``, ``b`` the Gershgorin bound of
-    ``a``: decoupled eigenpairs below every eigenvalue of ``a``.
-    """
-    n = int(a.shape[-1])
-    bound = jnp.max(jnp.sum(jnp.abs(a), axis=-1))
-    bound = jnp.where(bound > 0, bound, 1).astype(jnp.float64)
-    row = jax.lax.broadcasted_iota(jnp.int32, (side, side), 0)
-    col = jax.lax.broadcasted_iota(jnp.int32, (side, side), 1)
-    sentinel = -2 * bound * (1 + (col - n).astype(jnp.float64) / side)
-    whole = jnp.pad(a, ((0, side - n), (0, side - n)))
-    return whole + jnp.where((row == col) & (col >= n), sentinel, 0).astype(a.dtype)
 
 
 def cyclic_to_block(Q, *, n: int, p: int, mb: int, axis: str = "x"):
