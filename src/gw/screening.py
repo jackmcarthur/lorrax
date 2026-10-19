@@ -766,12 +766,13 @@ def compute_screening_model(
             # Contour deformation (gw.cd): the exact W(z) is streamed by the
             # Sigma consumer from this handle; nothing is fitted or persisted.
             print_fn("  screening: contour_deformation -- W(z) streamed at the CD nodes by "
-                     "gw.cd.sigma (exact ordered Lehmann chi0, bank Dyson pair); no W bank written")
+                     "gw.cd.sigma (bank response-quadrature chi0, bank Dyson pair); no W bank written")
             return {"cd_stream": dict(
                 V_q=V_q, imaginary_nodes=int(config.sigma.cd_imaginary_nodes),
                 knot_step_ev=float(config.sigma.cd_knot_step_ev),
                 residue_reach_ev=config.sigma.cd_residue_reach_ev,
-                knot_chunk=int(config.sigma.cd_knot_chunk), run_dir=run_dir)}
+                knot_chunk=int(config.sigma.cd_knot_chunk),
+                chi0_rule_tolerance=float(config.sigma.cd_chi0_rule_tolerance), run_dir=run_dir)}
         if config.sigma.w_model == "shared_pole":
             from .shared_pole_screening import screen_shared_poles
             return screen_shared_poles(

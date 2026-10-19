@@ -31,7 +31,7 @@ The laws are `gw.cd.laws`, pinned on CPU against the ordered (time-reversal-exac
 
 | quantity | owner |
 |---|---|
-| χ⁰(z) at every node and knot | `gw.w_isdf.compute_chi0_direct_fractional(ordered=True)`: the exact ordered Lehmann band-pair sum; band-pair tiles whose f_a − f_b vanishes at every k are skipped exactly |
+| χ⁰(z) at every node and knot | the shared-pole bank's response quadrature (`gw.cd.sigma.bank_chi0`): one `response_bank.response_support` / `response_quadrature` shared-node rule set over every CD point (imaginary nodes, real knots and FD-9 ghosts) at `cd_chi0_rule_tolerance` (default 1e-8), evaluated by `response_bank.integrate_response_group` (`ordered=True`, value rows); a chunk takes its points out of the rule groups by index. No Lehmann sum (`compute_chi0_direct_fractional` is a test reference only) |
 | dχ⁰/ds at a knot | 9-point central d/dx on the knot grid, (dχ/dx)/(2z); ghost knots roll from chunk to chunk |
 | W_c, dW_c/ds | the response bank's pair equations, X = pref·HχH, W_c = HX(1−X)⁻¹H, dW_c/ds = W(pref·dχ)W, as a local batched LU over the (q, z) flat axis (`gw.cd.sigma.build_dyson_kernels`) |
 | W at star q | `symmetry_maps.QirrOperator.unfold` with the general-operator `pair_transpose` rule |

@@ -4,8 +4,10 @@ Where this sits (docs/dev/cd_frequency_integration.md): ``gw.sigma_dispatch._com
 calls :func:`compute_sigma_c_cd_omega_grid` instead of the pole executor when the deck says
 ``sigma_frequency_integration = contour_deformation``; the result is the same
 :class:`gw.ppm_sigma.SigmaOmegaResult` the one finalizer consumes.  No physics is rebuilt here:
-chi0 is ``gw.w_isdf.compute_chi0_direct_fractional(ordered=True)`` (exact ordered Lehmann sum at
-every node and knot), the Dyson pair is the response bank's equation set (W_c = H X (1-X)^-1 H,
+chi0 at every node and knot is the shared-pole bank's own response quadrature (:func:`bank_chi0`:
+``response_bank.response_support`` / ``response_quadrature`` shared-node rules at
+``cd_chi0_rule_tolerance``, value rows of ``response_bank.integrate_response_group``,
+``ordered=True``; no Lehmann sum), the Dyson pair is the response bank's equation set (W_c = H X (1-X)^-1 H,
 dW_c/ds = W (pref dchi/ds) W, roots H of ``response_bank._coulomb_algebra``), the q-wedge unfold is
 ``symmetry_maps`` (``QirrOperator.unfold``, general-operator ``pair_transpose`` rule), the k unfold
 of the cube is ``symmetry_maps.unfold_file_wedge_band_operator``, the contour laws are
@@ -58,9 +60,13 @@ GH = 4
 FD9 = np.array([1 / 280, -4 / 105, 1 / 5, -4 / 5, 0.0, 4 / 5, -1 / 5, 4 / 105, -1 / 280])
 #: Occupation floor (fe_cd): f below it is 0, 1 - f below it is 1 (moves f by <= 1e-14).
 OCCUPATION_FLOOR = 1e-14
-CD_RECIPE = dict(version="cd_production_v2", laws="ordered_cd TRREF / Run211 jets",
+#: Default relative tolerance of the bank response rule serving chi0 at every CD point
+#: (``cd_chi0_rule_tolerance``; the shared-pole production ``bank_rule_tolerance``).
+CD_CHI0_RULE_TOLERANCE = 1e-8
+CD_RECIPE = dict(version="cd_production_v3", laws="ordered_cd TRREF / Run211 jets",
                  beta_ev=[0.5, 4.0], slope="fd9 rolling ghosts", imaginary_rule="tan_mapped_gauss two-panel",
-                 chi0="w_isdf.compute_chi0_direct_fractional(ordered=True)",
+                 chi0="response_bank shared-node rules (response_support, response_quadrature) + "
+                      "integrate_response_group value rows, ordered=True",
                  dyson="response_bank pair equations, local batched jnp.linalg.solve over (q, z)",
                  tile="runtime.tiles.tile_units", real_axis="owner-rank branches, no W_-q gather",
                  residue_rows="banded per knot chunk and branch (live bands, BAND_RUNG 8; exact)")
@@ -405,6 +411,126 @@ def build_dyson_kernels(mesh_xy, *, n, pref):
     return (jax.jit(cd_dyson_pair, out_shardings=(flat, flat)), jax.jit(cd_dyson_value, out_shardings=flat))
 
 
+# ------------------------------------------------------------------------------- chi0 provider
+def bank_chi0(wfns, meta, mesh_xy, z_ry, *, q_ids, mu_ry, rule_tolerance, slots, print_fn=print):
+    """chi0 at the CD points from the shared-pole bank's own response quadrature.
+
+    ``z_ry`` lists every point the CD streams evaluate (imaginary nodes ``i u`` and real knots
+    ``j h + i eta`` with their FD-9 ghosts; Im z > 0; a repeat is evaluated once).  One rule set serves
+    all of them, built
+    exactly as the bank builds its sample rules: ``response_bank.response_support`` (occupation
+    weights, transition interval, envelope, band support) and ``response_bank.response_quadrature``
+    (``minimax.ResponseGroupTree`` over every point, ``rel_tol = rule_tolerance / amplitude``, groups
+    halved until each meets it).  chi0(q, z) is the value row of
+    ``response_bank.integrate_response_group`` (``ordered=True``: the physical ``FT_q[chi]`` at the
+    full-grid rows ``q_ids``), one Green-pair scan per rule group a chunk touches.  A chunk's members
+    are taken out of their rule groups by index; every other rule key is the bank's.  No Lehmann sum.
+
+    ``mu_ry`` is the current chemical potential; ``partial_at_mu`` follows the census rule of
+    ``shared_pole_recipe.bind_shared_pole_census`` (a partially occupied band crossing mu).  ``slots``
+    is the largest chunk.  Returns ``(chi, note)``: ``chi(points)`` -> ``[nz, nq, n, n]`` at
+    ``P(None, None, 'x', 'y')`` for any sequence of points of ``z_ry`` (repeats allowed; a repeat is a
+    copy); ``note`` is the rule receipt, updated as chunks stream.
+    """
+    from common.collectives import device_put_process_local_cached, gather_to_host
+    from gw import response_bank as rb
+
+    EV = float(RYD_TO_EV)
+    index = {}
+    for z in np.asarray(z_ry, dtype=np.complex128).ravel().tolist():     # one evaluation per distinct point
+        index.setdefault(complex(z), len(index))
+    z_ry = np.asarray(list(index), dtype=np.complex128)
+    if not z_ry.size or not np.all(np.isfinite(z_ry)) or not np.all(z_ry.imag > 0):
+        raise ValueError("GATE cd_chi0_points: got: an empty, nonfinite or non-causal CD point set; want: "
+                         "finite points with Im z > 0; why: the bank rule fits upper-half-plane evaluations")
+    if getattr(meta, "shared_pole_response_rules", None) is not None:
+        raise ValueError("GATE cd_chi0_session: got: a held shared-pole rule session on meta; want: none; "
+                         "why: the CD rule must neither reuse nor overwrite the bank's held-map rules")
+    stop = int(wfns.slices.b4_logical) - int(wfns.slices.b0)
+    energy = np.asarray(gather_to_host(wfns.enk), dtype=np.float64)[:, :stop]
+    occupied = np.asarray(gather_to_host(wfns.occ), dtype=np.float64)[:, :stop]
+    crossing = (energy.min(axis=0) <= mu_ry) & (energy.max(axis=0) >= mu_ry)
+    partial = np.any((occupied > 0.0) & (occupied < 1.0), axis=0)
+    plan = dict(z_ry=z_ry, distinct_id=np.arange(z_ry.size), held=np.zeros(z_ry.size, dtype=bool),
+                role=np.full(z_ry.size, "cd_point"), bank_rule_tolerance=float(rule_tolerance),
+                census=dict(mu_ry=float(mu_ry), partial_at_mu=bool(np.any(partial & crossing))))
+    receipt = {"correlation_count": 0}
+    support = rb.response_support(wfns, meta, plan, receipt, print_fn=print_fn)
+    try:
+        rules = rb.response_quadrature(meta, plan, receipt, support, group_size=int(slots), print_fn=print_fn)
+    except ValueError as exc:
+        raise ValueError(
+            f"GATE cd_chi0_rule: got: the bank response rule refused the CD points ({exc}); smallest Im z "
+            f"{z_ry.imag.min() * EV:.4g} eV over {z_ry.size} points, transition interval "
+            f"[{support['lo'] * EV:.4g}, {support['hi'] * EV:.4g}] eV, tolerance {rule_tolerance:g}; want: a rule "
+            "meeting cd_chi0_rule_tolerance at every point; why: chi0 has one provider, the bank quadrature "
+            "(its pencil grows like (hi - lo) / min Im z)") from exc
+    groups = rules["plan"]["rule_groups"]
+    sliced = ("value", "derivative", "sampled_error", "coefficient_mass")
+    note = dict(provider="gw.response_bank shared-node quadrature: response_support + response_quadrature "
+                         "rules, integrate_response_group value rows (ordered=True)",
+                rule_tolerance=float(rule_tolerance), points=int(z_ry.size),
+                interval_ev=[float(v) * EV for v in receipt["rule"]["interval_ry"]],
+                occupation_amplitude=float(receipt["rule"]["occupation_amplitude"]),
+                decay_rate_ry_inv=float(receipt["rule"]["decay_rate_ry_inv"]),
+                partial_at_mu=plan["census"]["partial_at_mu"], band_ranges=list(support["band_ranges"]),
+                rule_nodes=int(sum(int(g["count"]) for g in groups)),
+                rule_groups=[dict(points=len(g["members"]), nodes=int(g["count"]),
+                                  sampled_error=float(np.max(g["sampled_error"])),
+                                  re_ev=[float(z_ry[list(g["members"])].real.min() * EV),
+                                         float(z_ry[list(g["members"])].real.max() * EV)],
+                                  im_ev=[float(z_ry[list(g["members"])].imag.min() * EV),
+                                         float(z_ry[list(g["members"])].imag.max() * EV)]) for g in groups],
+                passes=0, green_pair_evaluations=0)
+    q_ids = tuple(int(q) for q in np.asarray(q_ids).ravel())
+    n = int(meta.mu_basis.n_packed)
+    face4 = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    rep = NamedSharding(mesh_xy, P())
+
+    def execute(kernel, args, stage, runtime_bytes=0):
+        """The bank's compile cache (``response_bank._compiled``); the CD tiles own the memory plan."""
+        result = rb._compiled(kernel, args)(*args)
+        return kernel.finish(args, result) if hasattr(kernel, "finish") else result
+
+    def _place(out, carry, src, dst):
+        return out.at[dst].set(carry[2 * src], mode="drop")              # carry rows 2r: member r's value
+    place = jax.jit(_place, out_shardings=face4, donate_argnums=(0,))
+    blank = {}
+
+    def chi(points):
+        try:
+            ids = [index[complex(z)] for z in np.asarray(points, dtype=np.complex128).ravel()]
+        except KeyError as exc:
+            raise ValueError(f"GATE cd_chi0_point_unplanned: got: z = {exc} Ry outside the planned CD points; "
+                             "want: a point of the rule set; why: one rule set serves every chunk") from None
+        want = set(ids)
+        nz = len(ids)
+        if nz not in blank:
+            blank[nz] = jax.jit(lambda: jnp.zeros((nz, len(q_ids), n, n), jnp.complex128), out_shardings=face4)
+        out = blank[nz]()
+        for rule in groups:
+            hit = [p for p, m in enumerate(rule["members"]) if m in want]
+            for a in range(0, len(hit), int(slots)):
+                part = hit[a:a + int(slots)]
+                sub = dict(rule, members=[rule["members"][p] for p in part],
+                           **{key: np.asarray(rule[key])[part] for key in sliced})
+                carry = rb.integrate_response_group(wfns, meta, mesh_xy, rules, sub, q_ids=q_ids,
+                                                    execute=execute, receipt=receipt, ordered=True)
+                row = {m: r for r, m in enumerate(sub["members"])}
+                pairs = [(row[i], d) for d, i in enumerate(ids) if i in row]
+                src = np.zeros(nz, np.int32)
+                dst = np.full(nz, nz, np.int32)                                  # out of range: dropped
+                src[:len(pairs)], dst[:len(pairs)] = zip(*pairs)
+                out = place(out, carry, device_put_process_local_cached(src, rep),
+                            device_put_process_local_cached(dst, rep))
+                del carry
+                note["passes"] += 1
+        note["green_pair_evaluations"] = int(receipt["correlation_count"])
+        return out
+    chi.rules, chi.points = rules, z_ry                # the bank rule set and its distinct points (tests)
+    return chi, note
+
+
 # ------------------------------------------------------------------------------- the Sigma consumer
 def compute_sigma_c_cd_omega_grid(
     wfns, cd_handle, meta, mesh_xy, *, sym, config, omega_grid_ry, efermi_ry,
@@ -423,7 +549,7 @@ def compute_sigma_c_cd_omega_grid(
     from common.collectives import barrier, gather_to_host, replicate_to_mesh
     from gw import response_bank as rb
     from gw.ppm_sigma import SigmaOmegaResult, sigma_band_axis
-    from gw.w_isdf import compute_chi0_direct_fractional, _w_solve_pref_scalar
+    from gw.w_isdf import _w_solve_pref_scalar
     from runtime.tiles import tile_units, TILE_BYTES
     from symmetry_maps import (kgrid_shift_map, q_negation_index, star_tables_of,
                                unfold_file_wedge_band_operator, unfold_wavefunction_local)
@@ -501,14 +627,12 @@ def compute_sigma_c_cd_omega_grid(
     if occupation_state is not None:
         f_state = np.asarray(occupation_state.f_kn, dtype=np.float64)
         mu = float(occupation_state.mu_ry)
-        occ_for_chi = occupation_state
         if f_state.shape != tuple(wfns.occ.shape):
             raise ValueError(f"GATE cd_occupations_shape: OccupationState {f_state.shape} vs carrier {tuple(wfns.occ.shape)}")
         wfns = dataclasses.replace(wfns, occ=replicate_to_mesh(f_state, mesh_xy))
     else:
         f_state = np.asarray(host(wfns.occ), dtype=np.float64)
         mu = float(efermi_ry)
-        occ_for_chi = SimpleNamespace(f_kn=f_state, mu_ry=mu, smearing_family="step")
     if f_state.shape[1] < nb_full:
         f_state = np.pad(f_state, ((0, 0), (0, nb_full - f_state.shape[1])))
     f_cd = np.where(f_state < OCCUPATION_FLOOR, 0.0, np.where(1.0 - f_state < OCCUPATION_FLOOR, 1.0, f_state))
@@ -518,7 +642,6 @@ def compute_sigma_c_cd_omega_grid(
     m0, m1 = int(sig.start or 0), int(sig.stop)
     l0, l1 = int(lsum.start or 0), int(lsum.stop)
     nb_s, L = m1 - m0, l1 - l0
-    nb_log = int(meta.b_id_4_chi_user) - int(slices.b0)
     pref = float(_w_solve_pref_scalar(meta))
     omega = np.asarray(omega_grid_ry, dtype=np.float64) + float(efermi_ry)   # absolute Ry
     nE = int(omega.size)
@@ -654,13 +777,6 @@ def compute_sigma_c_cd_omega_grid(
         nz_ = flat.shape[0] // nq_irr
         return stack_q(*[to_qpar(unfold_w(take_z(flat, iz))) for iz in range(nz_)])
 
-    def direct_chi(z_ry):
-        chi = compute_chi0_direct_fractional(
-            wfns, np.asarray(z_ry, np.complex128), meta, mesh_xy, occupation_state=occ_for_chi,
-            kminq_rows=KMQ[q_irr], nb_logical=nb_log, ordered=True)
-        if len(z_ry) == 1:
-            chi = chi[None]
-        return jax.jit(lambda a: a * 1.0, out_shardings=face4)(chi)
 
     def cd_fd9_slope(chi_e, z_core):
         """FD-9 d/dx on the knot grid -> dchi/ds at the core knots: [nz, nq_irr, n, n]."""
@@ -688,6 +804,19 @@ def compute_sigma_c_cd_omega_grid(
         if rank0 and run_dir is not None:
             np.savez(os.path.join(run_dir, f"cd_partial_{name}.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
                      elapsed_s=time.monotonic() - started, **out)
+
+    # chi0 at every CD point (imaginary nodes; real knots -GH .. J_pad + GH - 1 with the FD-9 ghosts)
+    # from one bank response rule set (bank_chi0); the chunks below take their points from it.
+    t0 = time.monotonic()
+    z_cd = np.concatenate([1j * u_ry_all, h_ry * np.arange(-GH, J_pad + GH) + 1j * eta])
+    bank_chi, chi_rule = bank_chi0(
+        wfns, meta, mesh_xy, z_cd, q_ids=q_irr, mu_ry=mu,
+        rule_tolerance=float(cd_handle.get("chi0_rule_tolerance", CD_CHI0_RULE_TOLERANCE)),
+        slots=max(chunk_i, chunk_r + 2 * GH), print_fn=print_fn)
+    clock("chi0_rule", t0)
+    _say(print_fn, started, f"chi0 rule: {chi_rule['points']} points in {len(chi_rule['rule_groups'])} groups, "
+         f"{chi_rule['rule_nodes']} nodes, tolerance {chi_rule['rule_tolerance']:.1e}, max sampled error "
+         f"{max(g['sampled_error'] for g in chi_rule['rule_groups']):.2e}")
 
     # ---- Sigma_x identity (INVARIANT: the CD pair densities reproduce the static exchange) ------------
     t0 = time.monotonic()
@@ -720,7 +849,7 @@ def compute_sigma_c_cd_omega_grid(
     for ic, c0 in enumerate(range(0, n_imag_pad, chunk_i)):
         c1 = c0 + chunk_i
         t_chunk = t0 = time.monotonic()
-        chi = direct_chi(1j * u_ry[c0:c1])
+        chi = bank_chi(1j * u_ry[c0:c1])
         jax.block_until_ready(chi)
         clock("chi0", t0)
         t0 = time.monotonic()
@@ -748,9 +877,9 @@ def compute_sigma_c_cd_omega_grid(
         j1 = j0 + chunk_r
         t_chunk = t0 = time.monotonic()
         if tail is None:
-            chi_e = direct_chi(h_ry * np.arange(j0 - GH, j1 + GH) + 1j * eta)
+            chi_e = bank_chi(h_ry * np.arange(j0 - GH, j1 + GH) + 1j * eta)
         else:
-            chi_e = join_fn(tail, direct_chi(h_ry * np.arange(j0 + GH, j1 + GH) + 1j * eta))
+            chi_e = join_fn(tail, bank_chi(h_ry * np.arange(j0 + GH, j1 + GH) + 1j * eta))
         jax.block_until_ready(chi_e)
         clock("chi0", t0)
         t0 = time.monotonic()
@@ -827,7 +956,7 @@ def compute_sigma_c_cd_omega_grid(
                    seconds=timings, elapsed_s=time.monotonic() - started, sigma_x_identity=sx_note,
                    coulomb_support_ranks=[int(host(support).min()), int(host(support).max())],
                    full_bz=full_bz, kw_rows=kw_rows.tolist(), finite=finite, ndev=ndev, symmetry_certificate=cert_note,
-                   residue_bands=band_summary)
+                   residue_bands=band_summary, chi0_rule=chi_rule)
     if rank0 and run_dir is not None:
         np.savez(os.path.join(run_dir, "cd_sigma_own_energy.npz"), kw_rows=kw_rows, bands0=np.arange(m0, m1),
                  eps_own_ry=eps_own[:nk_red], sigma_c_own_ry=own, sigma_c_anchor_own_ry=parts["anchor"],

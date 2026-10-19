@@ -1650,6 +1650,7 @@ _DEFAULTS = {
     "cd_knot_step_ev": 0.0625,
     "cd_residue_reach_ev": "auto",
     "cd_knot_chunk": 0,
+    "cd_chi0_rule_tolerance": 1e-8,
     # "" = the shared-pole resolver's own line and imaginary ladders.
     # "<line eV list> | <imaginary eV list>" replaces both with explicit
     # sites (gw.shared_pole_recipe.parse_support_sites); the height, held
@@ -2232,7 +2233,8 @@ def _resolve_cd_inputs(params):
             f"GATE cd_enum: sigma_frequency_integration got: {value!r}; "
             "want: pole_model | contour_deformation; why: unknown frequency integration")
     params["sigma_frequency_integration"] = value
-    cd_keys = ("cd_imaginary_nodes", "cd_knot_step_ev", "cd_residue_reach_ev", "cd_knot_chunk")
+    cd_keys = ("cd_imaginary_nodes", "cd_knot_step_ev", "cd_residue_reach_ev", "cd_knot_chunk",
+               "cd_chi0_rule_tolerance")
     if value != "contour_deformation":
         for key in cd_keys:
             if key in named:
@@ -2294,6 +2296,11 @@ def _resolve_cd_inputs(params):
     params["cd_residue_reach_ev"] = reach
     if int(params["cd_knot_chunk"]) < 0:
         raise ValueError(f"GATE cd_knot_chunk: got: {params['cd_knot_chunk']!r}; want: >= 0 (0 = planner)")
+    tol = float(params["cd_chi0_rule_tolerance"])
+    if not (np.isfinite(tol) and 1e-13 <= tol < 1e-2):
+        raise ValueError(f"GATE cd_chi0_rule_tolerance: got: {params['cd_chi0_rule_tolerance']!r}; want: "
+                         "1e-13 <= tol < 1e-2; why: the relative error of the bank response rule serving chi0")
+    params["cd_chi0_rule_tolerance"] = tol
     patches = str(params.get("sigma_omega_patches_ev", "") or "").strip()
     if patches:
         for item in patches.split(","):
@@ -2664,6 +2671,7 @@ def _input_response(
         cd_knot_step_ev=float(params["cd_knot_step_ev"]),
         cd_residue_reach_ev=str(params["cd_residue_reach_ev"]),
         cd_knot_chunk=int(params["cd_knot_chunk"]),
+        cd_chi0_rule_tolerance=float(params["cd_chi0_rule_tolerance"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
@@ -4124,6 +4132,7 @@ class DynamicSigmaConfig:
     cd_knot_step_ev: float = 0.0625
     cd_residue_reach_ev: str = "auto"
     cd_knot_chunk: int = 0
+    cd_chi0_rule_tolerance: float = 1e-8
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
     #: resolver's own ladders) or "<line eV list> | <imaginary eV list>",
     #: an explicit support geometry for support-rule studies.  Parsed and
