@@ -124,7 +124,7 @@ def read_sector_round(io, meta, bank, header, ids, endpoints, *, sample_span=Non
     return out
 
 
-def sector_line_selection(bank, meta, *, mesh_xy, execution, nq, eigh_backend):
+def sector_line_selection(bank, meta, *, mesh_xy, execution, nq, eigh_backend, room=None):
     """The photon bank's C and T families for the producer's line selection.
 
     Each endpoint block is cut from the face-tiled photon operator exactly as
@@ -153,7 +153,7 @@ def sector_line_selection(bank, meta, *, mesh_xy, execution, nq, eigh_backend):
             recipe=sector_recipe(meta.shared_pole_recipe,n),logical_n=n,
             rows=(3 if family else 1)*int(basis.n_packed),cross=True))
     return LineSelection(families,block,mesh_xy=mesh_xy,ordered=True,execution=execution,nq=nq,
-                         eigh_backend=eigh_backend)
+                         eigh_backend=eigh_backend,room=room)
 
 
 def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=print):

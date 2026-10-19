@@ -192,7 +192,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         conservative_side = constructor_side_upper_bound(
             recipe, ordered=ordered, odd_moments=odd_moments,
             logical_n=logical_n, column_extent=column_extent)
-        eig = budget.eigenplan(n)
+        # A face plan waits for its room (face_eigh_room, below).
+        eig = budget.eigenplan(n) if execution != 'face' else None
         receipts, factors, store_poles, store_counts, placed = {}, [], [], [], []
         receipt_entry_start = 0
         held_ids = [int(i) for i in recipe["held_ids"]]

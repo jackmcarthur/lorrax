@@ -311,7 +311,12 @@ class ConstructorCapacity:
 
     def eigenplan(self, side):
         """One service plan per configured execution layout and actual side;
-        a face plan decides its stacks against ``face_room``."""
+        a face plan decides its stacks against ``face_room``, which the face
+        admission sets first (``face_eigh_room``; unset is refused by name)."""
+        if self.execution == "face" and self.face_room is None:
+            raise ValueError("GATE shared_pole_face_room: got: a face constructor eigh plan before "
+                             "its room; want: face_room = face_eigh_room(admission) first; why: "
+                             "distrib_la refuses every eigh stack in room 0")
         return constructor_eigenplan(self._mesh_xy, int(side), self.execution,
                                      self.face_room if self.execution == "face" else None,
                                      backend=self._resolution.eigh_backend)

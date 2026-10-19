@@ -137,6 +137,22 @@ def line_selection_execution(rows, *, mesh, ledger, nq, eigh_backend, carry=0):
         ledger=ledger, carry=carry, site=f"shared-pole line selection {int(nq)} parents")
 
 
+def line_selection_room(ledger, resident, *, carry=0):
+    """Room per rank for a face line selection's eigh stacks (``face_eigh``).
+
+    What the device budget leaves beside the selection's admitted resident
+    (``resident`` and ``carry`` beside ``ledger.live_stages``, as
+    :func:`line_selection_execution` admits it), with its eigh workspace not
+    reserved: distrib_la prices each stack's solve itself (``place``), as
+    ``check_eigh_room`` hands that reservation back. A shape price, the same
+    on every rank; 0 (no room) refuses by name.
+    """
+    from gw.shared_pole_capacity import face_eigh_room
+    return face_eigh_room(ledger.preview(resident_bytes_per_rank=int(resident) + int(carry),
+                                         workspace_bytes_per_rank=0,
+                                         concurrent_with=ledger.live_stages))
+
+
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
                           ordered, odd_moments, selection_faces, sample_batch,
                           parent_count=1, retained_output_families=1,
@@ -374,8 +390,10 @@ def face_eigh(mesh, n, room=None, *, backend):
     ``room`` is the caller's device bytes per rank beside its admitted live
     set (``face_eigh_room``), the same on every rank. distrib_la decides each
     stack from it: whole matrices per rank where the program that runs it
-    fits the room, else the whole mesh. Without a room every stack runs on
-    the mesh. The room rides on the plan as its decision input and is in no
+    fits the room, else the whole mesh. Without a room (``None``: the pricing
+    plans of ``line_selection_price`` and ``ConstructorCapacity.quote``) the
+    room is 0, and distrib_la refuses any stack an executing caller hands it:
+    a caller that runs stacks passes its stage's room. The room rides on the plan as its decision input and is in no
     cache key: plans that differ only by room are equal, so the programs
     built on them (``face_parent_program`` and the others) are shared.
     """

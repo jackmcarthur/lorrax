@@ -473,16 +473,22 @@ class LineSelection:
     the rectangles (g, f) and (f, g), g the other family, on its directions.
     ``execution`` is 'local' (whole parents per rank, the q-local kernels) or
     'face'; ``eigh_backend`` is the deck's eigh request for a face plan
-    (``LinalgResolution.eigh_backend``).
+    (``LinalgResolution.eigh_backend``), ``room`` a face plan's room per rank
+    (``line_selection_room``: what the selection's admission leaves).
     """
 
-    def __init__(self, families, block, *, mesh_xy, ordered, execution, nq, eigh_backend):
+    def __init__(self, families, block, *, mesh_xy, ordered, execution, nq, eigh_backend, room=None):
         from gw.shared_pole_capacity import constructor_eigenplan
+        if execution == "face" and room is None:
+            raise ValueError("GATE shared_pole_line_room: got: a face line selection with no room; "
+                             "want: line_selection_room of its admission; why: distrib_la refuses "
+                             "every eigh stack in room 0")
+        self.room = room
         self.families, self.block, self.mesh = families, block, mesh_xy
         self.ordered, self.execution, self.nq = bool(ordered), execution, int(nq)
         self.extent = port_extent(mesh_xy)
         self.to_face = selection_layout(mesh_xy, execution, self.nq)[2]
-        self.plans = {f["name"]: constructor_eigenplan(mesh_xy, f["rows"], execution,
+        self.plans = {f["name"]: constructor_eigenplan(mesh_xy, f["rows"], execution, room,
                                                        backend=eigh_backend)
                       for f in families}
 
@@ -565,7 +571,7 @@ class LineSelection:
         return out
 
 
-def charge_line_selection(meta, *, mesh_xy, ordered, execution, nq, eigh_backend):
+def charge_line_selection(meta, *, mesh_xy, ordered, execution, nq, eigh_backend, room=None):
     """The charge bank's one family: the packed centroid operator, its padding zeroed.
 
     Zeroing the padded centroid rows and columns is the reader's round trip
@@ -578,7 +584,7 @@ def charge_line_selection(meta, *, mesh_xy, ordered, execution, nq, eigh_backend
                                logical_n=int(meta.n_rmu), rows=int(basis.n_packed), cross=False)],
                          lambda value, _: axis(move(mask(value))),
                          mesh_xy=mesh_xy, ordered=ordered, execution=execution, nq=nq,
-                         eigh_backend=eigh_backend)
+                         eigh_backend=eigh_backend, room=room)
 
 
 @lru_cache(maxsize=None)

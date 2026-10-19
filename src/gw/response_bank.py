@@ -2659,7 +2659,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ambient = ledger.live_stages
     from file_io.shared_pole_store import (dense_sample_rows, read_shared_pole_bank,
                                            shared_pole_bank_writer)
-    from .shared_pole_execution import line_selection_execution
+    from .shared_pole_execution import line_selection_execution, line_selection_room
     response_rows = panel_rows(0, len(qids))
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
@@ -2697,17 +2697,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         execution, resident, workspace = line_selection_execution(
             rows, mesh=mesh_xy, ledger=ledger, nq=width, carry=carry,
             eigh_backend=face_eigh_backend)
-        return line_selector(execution, width), resident, workspace
+        # A face selection's eigh stacks are decided in the room its admission leaves.
+        room = line_selection_room(ledger, resident, carry=carry) if execution == "face" else None
+        return line_selector(execution, width, room), resident, workspace
 
-    def line_selector(execution, width):
+    def line_selector(execution, width, room):
         if vertex is None:
             from .shared_pole_directions import charge_line_selection
             return charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
                                          execution=execution, nq=width,
-                                         eigh_backend=face_eigh_backend)
+                                         eigh_backend=face_eigh_backend, room=room)
         from .shared_pole_sectors import sector_line_selection
         return sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution, nq=width,
-                                     eigh_backend=face_eigh_backend)
+                                     eigh_backend=face_eigh_backend, room=room)
 
     if p1 > p0:
         # The line selection runs beside one sample's carry; its route is
