@@ -271,9 +271,12 @@ def rhs_block(n: int, nrhs: int, Px: int, Py: int, mb: int) -> int:
 
 def lu_blocks(n: int, Px: int, Py: int) -> tuple[int, int]:
     """``(mb, nb)`` of the LU descriptors: one tile per rank, or a square relabeled
-    block when the local edge exceeds :data:`_LU_RELABEL_LOCAL_MIN` on a square mesh."""
+    block on a square mesh from 4x4 up, or where the local edge exceeds
+    :data:`_LU_RELABEL_LOCAL_MIN` (the 2x2 bound, measured on one node). At one tile
+    per rank on 4x4 (n 30000, run30k, 2026-10-19) getrf/getrs ran in 4 serialized
+    7500-wide panel steps across nodes and the RHS could not be chunked: SMs idle."""
     one = (n // Px, n // Py)
-    if Px != Py or Px == 1 or n // Px <= _LU_RELABEL_LOCAL_MIN:
+    if Px != Py or Px == 1 or (Px < 4 and n // Px <= _LU_RELABEL_LOCAL_MIN):
         return one
     block = _largest_block(n // Px)
     return (block, block) if block >= _BLOCK_MIN else one

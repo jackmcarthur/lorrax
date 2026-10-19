@@ -200,3 +200,16 @@ def test_a_local_workspace_the_vendor_rejects_is_inadmissible(monkeypatch, capsy
             workspace._vendor_query(7, "eigh", (30000,), "<c16")
     finally:
         workspace._vendor_query.cache_clear()
+
+
+def test_lu_relabels_from_4x4_and_keeps_the_2x2_bound():
+    """run30k: n 30000 on 4x4 (local 7500) factors block-cyclic at block 250 with a chunkable RHS
+    (30 local column blocks); 2x2 keeps its measured rule (relabel only past local 8192)."""
+    from distrib_la._cusolvermp import lu_blocks, rhs_block
+    mb, nb = lu_blocks(30000, 4, 4)
+    assert (mb, nb) == (250, 250)
+    nb_b = rhs_block(30000, 30000, 4, 4, mb)
+    assert nb_b == 250 and (30000 // 4) // nb_b == 30
+    assert lu_blocks(30000, 2, 2) == (250, 250)          # local 15000 > 8192: relabeled before too
+    assert lu_blocks(9152, 2, 2) == (4576, 4576)          # local <= 8192 on 2x2: one tile, unchanged
+    assert rhs_block(9152, 9152, 2, 2, 4576) == 4576
