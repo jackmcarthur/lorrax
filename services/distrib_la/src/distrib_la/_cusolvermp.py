@@ -24,11 +24,11 @@ from typing import Dict, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, PartitionSpec as P
 
 from distrib_la import loader
 from distrib_la._collectives import broadcast_bytes
-from distrib_la._cyclic import cyclic_to_block, largest_divisor, pad_with_sentinels
+from distrib_la._cyclic import cyclic_to_block, largest_divisor
 from distrib_la._shape import ipiv_local_len
 from jax import shard_map
 from distrib_la.resolve import mesh_key
@@ -300,8 +300,8 @@ def solve_layout(n: int, p: int) -> tuple[int, int]:
     ``(n, _block_size(n, p))`` when that block is at least :data:`_BLOCK_MIN`
     or ``n/p`` is at most :data:`_BLOCK_MAX`. Otherwise each rank's tile is
     padded to the smallest edge with a divisor in [128, 256] (at most 127
-    rows per rank; 3954 -> 3956, block 172), and the padded rows carry
-    sentinel eigenvalues below the spectrum (:func:`distributed_eigh`).
+    rows per rank; 3954 -> 3956, block 172): the plan zero-pads to that
+    side and deflates the pads (:meth:`distrib_la.plan.Plan._checked_eigh`).
     """
     local = n // p
     block = _largest_block(local)
@@ -310,35 +310,6 @@ def solve_layout(n: int, p: int) -> tuple[int, int]:
     padded = next(m for m in range(local + 1, local + _BLOCK_MIN + 1)
                   if _largest_block(m) >= _BLOCK_MIN)
     return p * padded, _largest_block(padded)
-
-
-def drop_sentinels(W, Q, n: int):
-    """The ``n`` live eigenpairs of a :func:`pad_with_sentinels` solve, raw layout.
-
-    The sentinels are the ``side - n`` lowest eigenvalues; ``Q``'s rows are
-    the eigenvalue index (cuSOLVERMp's raw buffer), its columns the operand's
-    rows, of which the first ``n`` are ``a``'s.
-    """
-    side = int(W.shape[-1])
-    return W[side - n:], Q[side - n:, :n]
-
-
-def retry_block(n: int, p: int) -> int | None:
-    """A smaller block for the same solve side, or None: the retry layout.
-
-    The largest divisor of the solve tile (:func:`solve_layout`) at most half
-    the default block. The checked eigh solves there again when the default
-    layout's result fails its check; the solve side, its operand and its
-    output are the first attempt's, and the vendor workspace of a smaller
-    block is not larger (n 7912, P4, complex: 284 MB at block 86, 317 MB at
-    172), so the retry needs no more memory than the attempt it replaces. One
-    tile per rank is never a retry: its workspace is 2.0 GB there and its wall
-    exceeds the default's at large n/p. Below block 8 there is none (blocks
-    1-4 ran 5-34x slower than one tile).
-    """
-    side, block = solve_layout(n, p)
-    local = side // p
-    return next((d for d in range(block // 2, 7, -1) if local % d == 0), None)
 
 
 def _cyclic_rows_to_block(Q, *, n: int, p: int, mb: int):
@@ -364,8 +335,6 @@ def distributed_eigh(
     *,
     mesh: Mesh,
     compute_evecs: bool = True,
-    block: int | None = None,
-    side: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition via cuSOLVERMp.
 
@@ -381,22 +350,12 @@ def distributed_eigh(
     compute_evecs
         Must be True.  ``False`` (jobz='N') is REFUSED — see the guard
         below and ``resolve.resolve_backend`` guard 2c (bug L-3).
-    block
-        The square block edge, a divisor of the solve tile; default
-        :func:`solve_layout`'s block. :func:`retry_block` is the smaller
-        block the checked eigh retries at.
-    side
-        The solve side ``N >= n``, a multiple of the mesh; default
-        :func:`solve_layout`'s (``side=n`` with ``block=_block_size(n, p)``
-        is the unpadded layout, for benches).
 
-    The solve runs block-cyclic on the operand's own tiles (the relabeling
-    note above :data:`_BLOCK_MAX`). Where the tile has no divisor in
-    [128, 256] it runs on a padded side ``N`` (:func:`solve_layout`): the
-    padded rows and columns are zero except their diagonal, which holds
-    distinct sentinels ``-2 b (1 + j/N)`` below the Gershgorin bound ``b`` of
-    ``A``, so they are decoupled, come out as the ``N - n`` lowest
-    eigenpairs, and are dropped. The result is ``A``'s ``n`` eigenpairs.
+    The solve runs block-cyclic on the operand's own tiles at
+    :func:`solve_layout`'s block (the relabeling note above
+    :data:`_BLOCK_MAX`). ``n`` must be :func:`solve_layout`'s side: the
+    plan zero-pads an operand to it and deflates the pads
+    (:meth:`distrib_la.plan.Plan._checked_eigh`), the one padding mechanism.
 
     Returns
     -------
@@ -444,13 +403,11 @@ def distributed_eigh(
     loader.get_lib("CUDA")                  # load the .so, register targets
     ctx_key = context_key(mesh)  # NCCL + cal_comm + cusolverMp
 
-    if side is None:
-        side, default = solve_layout(n, p)
-    else:
-        side, default = int(side), _block_size(int(side), p)
-    mb = nb = default if block is None else int(block)
-    if side < n or side % p or (side // p) % mb:
-        raise ValueError(f"distributed_eigh: block {mb} does not divide the solve tile {side // p}")
+    side, mb = solve_layout(n, p)
+    nb = mb
+    if side != n:
+        raise ValueError(f"distributed_eigh: n={n} is not a solve side on a {p}x{q} mesh; "
+                         f"pad it to {side} first (distrib_la.plan pads with zero rows)")
 
     # jit(shard_map(...)) with a per-signature cache — the shape EVERY other
     # FFI wrapper in this package has.  This one was the exception: it
@@ -482,8 +439,16 @@ def distributed_eigh(
                  out_specs=(P(), P("x", "y")),
                  check_vma=False)
         def _call(local_A):
-            W, Q = jax.ffi.ffi_call(
-                _EIGH_TARGET, (W_local, Q_local))(local_A, **attrs)
+            # The third result is the operand the solver destroys, aliased to
+            # the input (ABI 10): the handler solves in that buffer instead of
+            # a private copy in its scratch. Where the input is an
+            # intermediate (the checked chain's deflated copy) XLA hands its
+            # buffer over; where it is a caller's live array (a parameter
+            # this wrapper does not donate) XLA copies it first, so the
+            # caller's A is never written (EIGHMEM).
+            W, Q, _destroyed = jax.ffi.ffi_call(
+                _EIGH_TARGET, (W_local, Q_local, Q_local),
+                input_output_aliases={0: 2})(local_A, **attrs)
             # Q's rows (axis 0, over 'x') are the eigenvalue index, which
             # cuSOLVERMp lays out block-cyclically like A's; put them back
             # in W's ascending order.
@@ -491,20 +456,12 @@ def distributed_eigh(
                 Q = _cyclic_rows_to_block(Q, n=side, p=p, mb=mb)
             return W, Q
 
-        face = NamedSharding(mesh, P("x", "y"))
-
-        def _padded(a):
-            whole = jax.lax.with_sharding_constraint(pad_with_sentinels(a, side), face)
-            W, Q = _call(whole)
-            W, Q = drop_sentinels(W, Q, n)
-            return W, jax.lax.with_sharding_constraint(Q, face)
-
         # NO donate_argnums / input_output_aliases, deliberately: this
         # wrapper never donated its operand and distrib_la.plan.DONATES
         # declares eigh as donating nothing.  Adding donation here would
         # silently invalidate A for the caller — and the serial batched
         # path slices A[q] out of a stack the next iteration still needs.
-        jit_eigh = jax.jit(_call if side == n else _padded)
+        jit_eigh = jax.jit(_call)
         _JIT_CACHE[key] = jit_eigh
 
     return jit_eigh(A)

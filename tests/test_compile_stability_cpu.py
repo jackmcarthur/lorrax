@@ -68,7 +68,7 @@ def _lowerings():
 
 def _checked_eigh(a, site="test eigh"):
     from distrib_la import _result_check as rc
-    (w, v), status = rc.checked_eigh((jnp.linalg.eigh,), a)
+    (w, v), status = rc.checked_eigh(jnp.linalg.eigh, a)
     rc.raise_if_failed(status, "eigh", a.shape[-1], a.dtype, site)
     return w, v
 
@@ -118,7 +118,7 @@ class _CheckedPlan:
             return _checked_eigh(A)
         B, = rest
         sketch = (*rc.matrix_sketch(A), *rc.rhs_sketch(B))
-        X, status = rc.checked("solve_lu", (lambda x: x,), lambda x: rc.solve_errors(sketch, x),
+        X, status = rc.checked("solve_lu", lambda x: x, lambda x: rc.solve_errors(sketch, x),
                                (jnp.linalg.solve(A, B),), n=A.shape[-1],
                                dtype=A.dtype)
         rc.raise_if_failed(status, "solve_lu", A.shape[-1], A.dtype, "test solve")
@@ -291,7 +291,7 @@ _REUSE = textwrap.dedent("""
     monitoring.register_event_listener(
         lambda name, **kw: hits.append(1) if name == "/jax/compilation_cache/cache_hits" else None)
     def fn(a):
-        (w, v), status = rc.checked_eigh((jnp.linalg.eigh,), a)
+        (w, v), status = rc.checked_eigh(jnp.linalg.eigh, a)
         rc.raise_if_failed(status, "eigh", a.shape[-1], a.dtype, "reuse")
         return w
     mesh = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y"))

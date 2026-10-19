@@ -317,8 +317,8 @@ compiled to be measured and no size is exchanged, so every rank decides alike
 
 **Checks.** No distributed eigh result is returned unchecked: eight
 fixed-seed probe columns test $\|(AZ - Z\Lambda)X\|$ and $\|(Z^\dagger Z - I)X\|$
-against $64\,n\,\varepsilon$, and a failure is solved again, shifted, then
-gathered when it fits. Exact-zero rows are deflated to sentinels first, because
+against $64\,n\,\varepsilon$, once: a failure is refused by name. Exact-zero
+rows (capacity padding included) are deflated to sentinels first, because
 cuSOLVERMp returned wrong vectors with status 0 on such matrices
 ([API § dense factorizations](../services/distrib_la/api.md#dense-factorizations)).
 
@@ -342,9 +342,7 @@ never from an on-device residual, so every rank runs the same program
 (`_metric_inverse_root`, `src/gw/shared_pole_reduction.py:20`). For the paired
 sector metric, which is the identity to about $10^{-8}$ by construction, that is
 one iteration; an eigh-based root of the same stack costs more (claim 3425).
-The receipt reports $\max\|ZAZ - I\|_F/\sqrt R$. The checked eigh chain
-re-orthonormalizes the vectors of a shifted retry by the related Newton–Schulz
-polar iteration, also GEMMs only.
+The receipt reports $\max\|ZAZ - I\|_F/\sqrt R$.
 
 ## 6 Memory
 
