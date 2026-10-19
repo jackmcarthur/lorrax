@@ -3547,8 +3547,6 @@ def finalize_iteration_head_samples(
         # asked to account for it -- so it is a pure scheduling change with
         # no bit-exactness impact.
         jax.block_until_ready(W_gamma)
-        from gw.isdf_fitting import mem_probe
-        mem_probe("qsgw_head.finalize_head_samples.pre_fold")
         if (
             int(W_gamma.shape[-2]) != int(response.Y_x.shape[-1])
             or int(W_gamma.shape[-1]) != int(response.Z_y.shape[-2])
@@ -3567,7 +3565,6 @@ def finalize_iteration_head_samples(
             mesh_xy=mesh,
         )
         jax.block_until_ready(S_effective)
-        mem_probe("qsgw_head.finalize_head_samples.post_fold")
     intraband = _metal_intraband(response)
     static_kappa2 = response.static_kappa2_bohr2
     if use_fold and static_kappa2 is not None and any(
@@ -3649,7 +3646,6 @@ def head_samples_from_s(
     """
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
-    from gw.isdf_fitting import mem_probe
     from gw.vcoul import compute_q0_averages, compute_q0_averages_screened
 
     # This is the first host readback of ``S_cart_omega`` for callers that
@@ -3659,7 +3655,6 @@ def head_samples_from_s(
     # per-sample ``finalize_iteration_head_sample`` diagnostic entry point,
     # or a future one) still gets an attributable snapshot instead of a bare
     # RESOURCE_EXHAUSTED at this line.
-    mem_probe("qsgw_head.head_samples_from_s.pre_readback")
     S_host = np.asarray(S_cart_omega, dtype=np.complex128)
     intraband_drude = None if intraband is None else intraband.drude_tensor
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
@@ -4345,8 +4340,6 @@ def build_dft_head_response(
     # readback -- see the matching boundary + comment in
     # ``finalize_iteration_head_samples``.  Pure scheduling change.
     jax.block_until_ready((S, Y_x, Z_y))
-    from gw.isdf_fitting import mem_probe
-    mem_probe("qsgw_head.build_dft_head_response.post_response")
     e_host = np.asarray(energies)
     n_occ_local = max(0, min(int(meta.nelec) - b0, nb_logical))
     if occupation_state is not None:

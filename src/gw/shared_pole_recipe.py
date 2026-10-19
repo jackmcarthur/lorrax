@@ -337,7 +337,8 @@ class CapacityLedger:
     copy larger than its device panel (coordinator ruling 11).
     """
 
-    def __init__(self, meta, *, mesh_xy, device_budget_bytes=None, baseline_bytes=0):
+    def __init__(self, meta, *, mesh_xy, device_budget_bytes=None, baseline_bytes=0,
+                 live_room=False):
         geometry = dict(nq=meta.nk_tot, nspinor=meta.nspinor, nmu=meta.n_rmu,
                         px=mesh_xy.shape['x'], py=mesh_xy.shape['y'])
         self.geometry = {}
@@ -361,6 +362,7 @@ class CapacityLedger:
         if self.device_budget_bytes_per_rank <= 0:
             raise ValueError("capacity device budget must be positive")
         self.baseline_bytes_per_rank = self._bytes(baseline_bytes)
+        self.live_room = bool(live_room)
         self.entries = []
         self._accepted = {}
         self._live_stages = None
@@ -429,9 +431,11 @@ class CapacityLedger:
             memory.admit(f"shared-pole ledger {stage}", self.price(row['aggregate_bytes_per_rank']),
                          row['available_device_bytes_per_rank'], runs_in=runs_in)
         self._accepted[stage] = row
-        # Priced as the pool measures it: the ledger's bytes and what was live beside it at bind.
-        memory.book(self.price(row['aggregate_bytes_per_rank'], self.baseline_bytes_per_rank),
-                    stage=runs_in)
+        # The receipt: this row's own bytes over what is resident when its stage opens (its
+        # live concurrent stages and the baseline are in use then; reserved ones not yet
+        # allocated are not).  Sizing plans on the aggregate beside the bind baseline.
+        memory.book(self.own_price(row), stage=runs_in,
+                    planned=self.price(row['aggregate_bytes_per_rank'], self.baseline_bytes_per_rank))
         return copy.deepcopy(row)
 
     def price(self, aggregate, baseline=0):
@@ -443,6 +447,16 @@ class CapacityLedger:
             operands=memory.Term(float(baseline), source="live outside the ledger at bind"),
             xla=memory.Term(spread=float(aggregate) * ranks, source=self.price_label()),
             ranks=ranks, label=self.price_label())
+
+    def own_price(self, row):
+        """A row's own bytes (resident + workspace, face-tiled) as an increment over the
+        allocator's bytes in use at stage entry (``lxkit.memory.Price.settled``)."""
+        from lxkit import memory
+        ranks = self.geometry['px'] * self.geometry['py']
+        own = float(row['resident_bytes_per_rank'] + row['workspace_bytes_per_rank'])
+        return memory.Price(xla=memory.Term(spread=own * ranks, source=f"{row.get('stage', 'ledger')}"
+                                            " own bytes (shared-pole ledger)"),
+                            ranks=ranks, label=self.price_label(), increment=True)
 
     def preview(self, *, resident_bytes_per_rank,
                 workspace_bytes_per_rank, concurrent_with=()):
@@ -466,6 +480,13 @@ class CapacityLedger:
             + self._accepted[name]['workspace_bytes_per_rank'] for name in live)
         scaling_passed = total <= self.limit_bytes_per_rank
         available = max(0, self.device_budget_bytes_per_rank - self.baseline_bytes_per_rank)
+        if self.live_room:
+            # The room read at this stage boundary (lxkit.memory.stage_room) plus the named live
+            # reservations it already holds: it tightens the bind figure when the driver grew.
+            from lxkit import memory
+            room = memory.stage_room()
+            if room is not None:
+                available = min(available, room + total - resident - workspace)
         passed = total <= available
         g = self.geometry
         max_ranks = math.floor(self.limit_bytes_per_rank * g['px'] * g['py'] / total) if total else None
@@ -1236,7 +1257,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     # processes: memory.room takes the minimum room, so every rank gets the same baseline.
     baseline = max(0, budget - memory.room(bucketed=False))
     meta.shared_pole_capacity = CapacityLedger(
-        meta, mesh_xy=mesh_xy, device_budget_bytes=budget, baseline_bytes=baseline)
+        meta, mesh_xy=mesh_xy, device_budget_bytes=budget, baseline_bytes=baseline,
+        live_room=True)
     print_fn(f"shared-pole ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "
              f"live outside the ledger at bind (the driver's arrays); admissions see "
              f"{(budget - baseline) / 1e9:.2f} GB/rank")

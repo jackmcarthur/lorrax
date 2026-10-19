@@ -2783,8 +2783,6 @@ def _prepare_fresh_coulomb(
         basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym,
         wfn, zeta_path):
     """Produce Coulomb tensors and their canonical Gamma vectors."""
-    from gw.isdf_fitting import mem_probe as _mem_probe
-    _mem_probe("pre_v_q")
     V_qmunu, G0, head_channel, photon_g0_vectors = compute_V_q(
     	zeta_path, wfn, meta, mesh_xy, cfg,
     	mem_est=mem_est, print_fn=print0,
@@ -2796,7 +2794,6 @@ def _prepare_fresh_coulomb(
     		for channel, vector in enumerate(photon_g0_vectors))
     if debug_print_enabled():
     	jax.block_until_ready(V_qmunu)
-    _mem_probe("post_v_q")
     return (V_qmunu, G0, head_channel, photon_g0_vectors)
 
 def _write_fresh_restart(

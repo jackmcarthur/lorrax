@@ -35,116 +35,6 @@ from isdf.core import (
 )
 
 
-# Running max of whole-device used MB across all probe points within a run
-# (this rank's GPU only), from the device leg's ``memory_telemetry``
-# (runtime.xla_memory.device_used_sample: nvidia-smi on CUDA, hipMemGetInfo
-# on ROCm).  jax.device_memory_stats() returned None on the JAX 0.8 / CUDA
-# 12.9 Perlmutter stack, so this sample is the way to observe the TRUE
-# per-rank HBM peak including FFT plan workspace, collective buffers, and
-# other XLA-arena-external allocations.
-_NVSMI_PEAK_MB = 0
-_NVSMI_LAST_MB = 0
-_NVSMI_LABEL = "nvsmi"
-
-
-
-
-
-
-
-
-def mem_probe(label, *, only_rank0=True):
-    """Driver-debug runtime probe of process-wide HBM at named sites.
-
-    Reports the JAX/XLA allocator ``bytes_in_use+peak`` plus the top-10
-    ``jax.live_arrays()`` shapes.  Module-level so both ``fit_zeta_to_h5``
-    (r-chunk loop) and ``gw_init.prepare_isdf_and_wavefunctions`` (V_q
-    sites) call the SAME helper — single source of truth for the full
-    ζ-fit + V_q HBM lifecycle map.  HLO buffer-assignment.txt is per-jit
-    and cannot prove cross-jit liveness; this fills the gap.  Cheap when
-    unset (env-var check only; no JAX calls in the early-exit path).
-
-    Round-0 (commit 5c884ac) wired this at three points per r-chunk in
-    fit_zeta_to_h5; Round-1 extends to zeta_fit_start, pre_rchunk_loop,
-    zeta_fit_end, pre_v_q, post_v_q for the full lifecycle.  Round-7
-    (faithfulness audit) adds the ``nvidia-smi`` per-rank true-HBM
-    sample — the *canonical* OOM-relevance metric since
-    ``device.memory_stats()`` returns ``None`` on this stack.
-    """
-    if not debug_print_enabled():
-        return
-    if only_rank0 and jax.process_index() != 0:
-        return
-    # local_devices(), not devices(): jax.devices() is the GLOBAL list, so
-    # jax.devices()[0] is process 0's device on every rank.  ``only_rank0``
-    # is a DEFAULT, not a guarantee — callers pass only_rank0=False to get a
-    # per-rank sample, and that sample must describe the rank's own pool.
-    dev = jax.local_devices()[0]
-    stats = dev.memory_stats() if hasattr(dev, "memory_stats") else {}
-    if stats is None:
-        stats = {}
-    bytes_in_use = stats.get("bytes_in_use", -1)
-    peak_bytes_in_use = stats.get("peak_bytes_in_use", -1)
-    live = jax.live_arrays()
-    by_shape = {}
-    total_live = 0
-    for arr in live:
-        if not hasattr(arr, "shape"):
-            continue
-        try:
-            sz = int(np.prod(arr.shape)) * arr.dtype.itemsize
-        except Exception:
-            continue
-        total_live += sz
-        key = (tuple(arr.shape), str(arr.dtype))
-        entry = by_shape.get(key)
-        if entry is None:
-            by_shape[key] = [1, sz]
-        else:
-            entry[0] += 1
-            entry[1] += sz
-    nvsmi_mb = _nvsmi_used_mb_local_gpu()
-    tag = _NVSMI_LABEL
-    print(f"[mem_probe {label}] in_use={bytes_in_use/1e9:.2f} GB  "
-          f"peak={peak_bytes_in_use/1e9:.2f} GB  "
-          f"live_count={len(live)} live_total={total_live/1e9:.2f} GB  "
-          f"{tag}={nvsmi_mb/1024:.2f} GB {tag}_peak={_NVSMI_PEAK_MB/1024:.2f} GB",
-          flush=True)
-    top = sorted(by_shape.items(), key=lambda kv: -kv[1][1])[:10]
-    for (shape, dtype), (cnt, sz) in top:
-        print(f"[mem_probe {label}]   {dtype} {shape} x {cnt} = "
-              f"{sz/1e9:.2f} GB", flush=True)
-
-
-def _nvsmi_used_mb_local_gpu():
-    """Sample the local rank's whole-device used memory, in MiB, or 0.
-
-    The sampler is the device leg's ``memory_telemetry``
-    (:func:`runtime.xla_memory.device_used_sample`: ``nvidia-smi`` of the
-    first ``CUDA_VISIBLE_DEVICES`` entry on CUDA, ``hipMemGetInfo`` on ROCm).
-    Updates module-level ``_NVSMI_PEAK_MB`` running max.  Silently returns
-    0 on any failure (no sampler, tool missing, parse error, timeout) —
-    never raises.
-    """
-    global _NVSMI_PEAK_MB, _NVSMI_LAST_MB, _NVSMI_LABEL
-    try:
-        from runtime.xla_memory import device_used_sample
-        ordinal = int(getattr(jax.local_devices()[0], "local_hardware_id", 0) or 0)
-        label, used = device_used_sample(ordinal)
-        if used is None:
-            return 0
-        _NVSMI_LABEL = label
-        mb = int(used) // 2**20
-        _NVSMI_LAST_MB = mb
-        if mb > _NVSMI_PEAK_MB:
-            _NVSMI_PEAK_MB = mb
-        return mb
-    except Exception:
-        return 0
-
-
-
-
 def add_pad_diagonal_sharded(C, active_mask, n_logical, *, mesh_xy):
     """``C + (tr C / n_logical) diag(~active_mask)`` with every operand a rank-local tile.
 
@@ -596,7 +486,6 @@ def fit_zeta_to_h5(
             f"fit_zeta_to_h5: channels {vertices} must be (0,) (charge) or a "
             "subset of the current channels (1, 2, 3).")
     transverse = vertices != (0,)
-    mem_probe("zeta_fit_start")
 
     # Two μ extents (common/meta.py): ``n_rmu`` is the LOGICAL centroid count
     # (the file extent); ``n_rmu_padded`` the in-memory carrier.  The dense
@@ -905,5 +794,4 @@ def fit_zeta_to_h5(
     print_fn(f"  Zeta output μ_L={list(vertices)} (n_q_disk={n_q_disk}, "
              f"n_rmu={n_rmu}); μ-batch fit {time.perf_counter() - t_mb0:.1f}s, "
              f"device peak {_track_peak_mb / 1e9:.2f} GB")
-    mem_probe("zeta_fit_end")
     return _track_peak_mb, zetas

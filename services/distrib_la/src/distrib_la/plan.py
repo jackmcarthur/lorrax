@@ -797,7 +797,7 @@ def _incumbent(p, shapes, single: bool) -> int:
     exchange, no sync."""
     from distrib_la import resolve as _resolve
     from distrib_la._one_device import rounds_for
-    row = _resolve.ONE_DEVICE_MAX_N.get((p.op, _resolve.mesh_platform(p.mesh)))
+    row = _resolve.size_row(p.op, _resolve.mesh_platform(p.mesh))
     if row is None:
         return 0
     if single:
@@ -1810,7 +1810,7 @@ def _size_routed_library(op: str, requested: str, mesh_xy: Mesh, n, resolved: st
             or resolved in (NATIVE, ONE_DEVICE)):
         return False
     platform = _resolve.mesh_platform(mesh_xy)
-    bound = _resolve.ONE_DEVICE_MAX_N.get((op, platform))
+    bound = _resolve.size_row(op, platform)
     if bound is None or int(n) <= int(bound):
         return False
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])

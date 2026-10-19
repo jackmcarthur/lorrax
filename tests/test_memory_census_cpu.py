@@ -22,6 +22,12 @@ def _fresh():
     memory.reset()
 
 
+@pytest.fixture
+def calibrate(monkeypatch):
+    """``LORRAX_MEMORY_RECEIPTS=calibrate``: synced, exact, every section read."""
+    monkeypatch.setattr(memory, "CALIBRATE", True)
+
+
 def test_price_terms_and_ranks():
     p = memory.Price(operands=memory.Term(spread=16e9, source="shardings"),
                      xla=memory.Term(fixed=1e9, source="memory_analysis"), ranks=4)
@@ -32,7 +38,7 @@ def test_price_terms_and_ranks():
     assert both.terms()["vendor"] == 2e9 and both.bytes() == 7e9
 
 
-def test_booked_section_prints_one_receipt(capsys):
+def test_booked_section_prints_one_receipt(calibrate, capsys):
     jnp.zeros(4).block_until_ready()                  # the backend is up
     memory.book(memory.priced(64 * MB, "test closed form"), stage="t.stage")
     with timing.section("t.outer"):
@@ -50,7 +56,7 @@ def test_booked_section_prints_one_receipt(capsys):
     del x
 
 
-def test_book_inside_open_section_meters_from_the_booking():
+def test_book_inside_open_section_meters_from_the_booking(calibrate):
     jnp.zeros(4).block_until_ready()
     with timing.section("t.own"):
         held = jnp.ones((32 * MB,), jnp.uint8).block_until_ready()
@@ -73,7 +79,7 @@ class _Arena:
         return {"bytes_in_use": self.use, "peak_bytes_in_use": self.peak}
 
 
-def test_bfc_first_raise_is_exact_and_a_lower_stage_is_a_lower_bound(monkeypatch):
+def test_bfc_first_raise_is_exact_and_a_lower_stage_is_a_lower_bound(calibrate, monkeypatch):
     arena = _Arena()
     monkeypatch.setattr(memory, "_backend_up", lambda: True)
     monkeypatch.setattr(memory, "_sync", lambda: None)
@@ -163,7 +169,7 @@ def test_vendor_rows_and_strict_range(monkeypatch):
 
 # ---- the census (memory.STRICT) -------------------------------------------------------------
 
-def test_census_flags_unpriced_allocations_and_missing_provenance(monkeypatch):
+def test_census_flags_unpriced_allocations_and_missing_provenance(calibrate, monkeypatch):
     jnp.zeros(4).block_until_ready()
     monkeypatch.setattr(memory, "STRICT", True)
     keep = []
@@ -183,9 +189,9 @@ def test_census_flags_unpriced_allocations_and_missing_provenance(monkeypatch):
     del keep
 
 
-def test_run30k_plan_census_is_clean_under_strict():
-    """Every price the run30k plan books or admits has provenance and every measured row is
-    used inside its range (the replay of the 16-device plan, tests/replays)."""
+@pytest.fixture(scope="module")
+def run30k():
+    """The replay of run30k's 16-device plan under STRICT (tests/replays), run once."""
     import subprocess
     import sys
     from pathlib import Path
@@ -195,5 +201,78 @@ def test_run30k_plan_census_is_clean_under_strict():
     run = subprocess.run([sys.executable, str(root / "tests/replays/run30k_plan_census.py")],
                          env=env, capture_output=True, text=True, timeout=600)
     assert run.returncode == 0, run.stderr[-3000:]
-    assert '"refusals": []' in run.stdout
-    assert "CENSUS []" in run.stdout, [l for l in run.stdout.splitlines() if "CENSUS" in l]
+    return run.stdout
+
+
+def test_run30k_plan_census_is_clean_under_strict(run30k):
+    """Every price the run30k plan books or admits has provenance and every measured row is
+    used inside its range."""
+    assert '"refusals": []' in run30k
+    assert "CENSUS []" in run30k, [l for l in run30k.splitlines() if "CENSUS" in l]
+
+
+@pytest.mark.xfail(strict=True, reason="run30k P16 prices vs measured: spole.gram_reduction "
+                   "77.0 vs 31.29 GB (FACE_PROGRAM_COPIES = 2 x the 32.2 GB tiled formula), so "
+                   "sizing asks P = 36 and binds there; spole.passivity_held 43.1 vs 66.02 GB "
+                   "(its eigh is admitted as its own stage, outside this price)")
+def test_run30k_minimum_p_agrees_with_the_run(run30k):
+    """run30k completed at P = 16 (66.02 GB peak of 77.89): the sizing must not ask for more,
+    and the stage that binds there is the passivity check's eigh."""
+    line = next(l for l in run30k.splitlines() if l.startswith("SIZING "))
+    p = int(line.split("P = ")[1].split()[0]) if "P = " in line else None
+    assert p is not None and p <= 16 and "passivity_held" in line, line
+
+
+def test_stage_room_is_read_once_per_stage_boundary(monkeypatch):
+    """The ledger's live room is one read per tracker open/close, never one per preview."""
+    reads = []
+    memory.set_budget(10e9, limit_bytes=12e9)
+    monkeypatch.setattr(memory, "room", lambda stage="", bucketed=True: reads.append(1) or 5e9)
+    assert memory.stage_room() == memory.stage_room() == 5e9 and len(reads) == 1
+    with memory.stage("unpriced"):
+        memory.stage_room()
+    assert len(reads) == 1                          # an unpriced section is no boundary
+    with memory.stage("probe", memory.priced(1.0, "test")):
+        memory.stage_room(); memory.stage_room()
+    memory.stage_room()
+    assert len(reads) == 3
+
+
+def test_production_instrument_never_waits_and_reads_only_priced_stages(monkeypatch, capsys):
+    """Default receipts: no block_until_ready, no read at an unpriced section, a ``~`` receipt."""
+    import jax
+    waits, reads = [], []
+    monkeypatch.setattr(memory, "CALIBRATE", False)
+    monkeypatch.setattr(jax, "block_until_ready", lambda x: waits.append(1) or x)
+    real = memory._interval
+    monkeypatch.setattr(memory, "_interval", lambda: reads.append(1) or real())
+    x = jnp.ones((256, 256))
+    for _ in range(50):
+        with timing.section("hot.loop"):
+            x = x + 1
+    assert not reads and not waits
+    with memory.stage("priced", memory.priced(1e6, "test")):
+        y = jnp.zeros((512, 512)) + x[0, 0]
+    assert len(reads) == 2 and not waits
+    out = capsys.readouterr().out
+    assert "memory priced: priced" in out and "measured ~" in out, out
+    del y
+
+
+def test_stage_outside_is_leg_data(monkeypatch):
+    """The MI250X bank's arena growth is its outside term, with provenance; CPU has none."""
+    from lxkit import LEGS
+    assert memory.stage_outside("spole.bank").fixed == 0.0
+    monkeypatch.setattr(memory, "_leg", lambda: LEGS["ROCM"])
+    term = memory.stage_outside("spole.bank")
+    assert term.fixed == 2.12e9 and "CAL_PASS1" in term.source
+
+
+def test_a_receipt_prices_its_increment_while_sizing_plans_the_aggregate():
+    """``book(..., planned=)``: the receipt meters an increment; sizing sees the aggregate."""
+    memory.set_budget(10e9, limit_bytes=12e9)
+    own = memory.Price(xla=memory.Term(1e9, source="own"), increment=True)
+    aggregate = memory.priced(30e9, "aggregate")
+    memory.book(own, stage="led", planned=aggregate)
+    assert memory._PLANNED["led"][0][0][1] is aggregate
+    assert memory.pending()["led"] is own
