@@ -82,6 +82,7 @@ from typing import Any, Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import math
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -266,28 +267,55 @@ def _mesh_price(n, dtype, ranks) -> int:
     return (CHECKED_EIGH_TILES + 2) * -(-n * n * np.dtype(dtype).itemsize // ranks)
 
 
-def place(op, mesh, nb, n, dtype, room, provider) -> StackRoute:
-    """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank, priced from the
-    shapes only (no vendor query), so every rank decides alike with no exchange.
+#: Measured eigh walls, complex128, A100-SXM4-80GB, ``dla_sweep`` P4 2x2 (the rows behind
+#: resolve.ONE_DEVICE_BY_ROOM): seconds per matrix on one device (jaxlib cuSOLVER, one rank's
+#: batch) and per call on the whole mesh (cuSOLVERMp 0.9.1): n 312 x64 0.022 / 1.97 s, 8192 x4
+#: 2.05 / 6.53 s, 16384 x4 13.7 / 29.0 s. Scope: CUDA; ROCm and float64 take the same table
+#: (unmeasured); a one-device batch of small matrices is charged per matrix.
+_EIGH_SECONDS = {"one": ((312, 0.022 / 16), (8192, 2.05), (16384, 13.7)),
+                 "mesh": ((312, 1.97 / 64), (8192, 6.53 / 4), (16384, 29.0 / 4))}
 
-    Route (c) at the most whole matrices per rank whose program (:func:`_stack_price`) fits;
-    a stack smaller than the rank count only where one such program is within
-    GATHERED_EIGH_BYTES (route (c) pads it to every rank: a replicated matrix, with P - nb
-    ranks idle). Otherwise the whole mesh (:func:`_mesh_price`), which
-    :meth:`Plan.stack_route` refuses by name when even that is over ``room``.
+
+def _eigh_seconds(kind, n, ranks=4) -> float:
+    """Expected seconds of one n x n eigh, ``kind`` 'one' (one device) or 'mesh' (``ranks``):
+    the measured points log-log interpolated, n^3 past the last, the fixed cost below the
+    first. The mesh's part above its fixed cost scales as 4/P (n 100000 at P16 predicts
+    412 s against 312 s measured, eighmem 2026-10-18; P16 below n 16384 unmeasured)."""
+    pts = _EIGH_SECONDS[kind]
+    t = pts[-1][1] * (n / pts[-1][0]) ** 3 if n > pts[-1][0] else pts[0][1]
+    for (a, ta), (b, tb) in zip(pts, pts[1:]):
+        if a < n <= b:
+            t = ta * (tb / ta) ** (math.log(n / a) / math.log(b / a))
+    return t if kind == "one" else pts[0][1] + (t - pts[0][1]) * 4 / ranks
+
+
+def place(op, mesh, nb, n, dtype, room, provider) -> StackRoute:
+    """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank: the faster of the
+    routes whose price fits, priced from the shapes only (no vendor query) and timed by
+    :func:`_eigh_seconds`, so every rank decides alike with no exchange.
+
+    Route (c) at the most whole matrices per rank whose program (:func:`_stack_price`) fits,
+    ceil(nb/P) one-device solves; the whole mesh (:func:`_mesh_price`), nb mesh solves. A
+    single large matrix goes to the mesh (route (c) pads it to every rank and solves it on
+    one); a small stack stays whole per rank. :meth:`Plan.stack_route` refuses by name a
+    whole mesh over ``room`` (no route fits).
     """
     x, y = int(mesh.shape["x"]), int(mesh.shape["y"])
     ranks, gathered = x * y, _gathered_admitted((n, n), dtype, room)
+    whole = StackRoute(provider, 0, 1, _mesh_price(n, dtype, ranks), room)
     if n % x == 0 and n % y == 0:
         per_rank = -(-nb // ranks)
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             tried = -(-(-(-nb // rounds)) // ranks)
             price = _stack_price(op, mesh, nb, n, dtype, rounds, gathered)
-            if price <= room and (nb >= ranks or price <= GATHERED_EIGH_BYTES):
-                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
+            if price <= room:
+                faster = -(-nb // ranks) * _eigh_seconds("one", n) <= nb * _eigh_seconds("mesh", n, ranks)
+                if faster or whole.program_bytes > room:
+                    return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
+                break
             per_rank = min(per_rank - 1, max(1, per_rank * room // price))
-    return StackRoute(provider, 0, 1, _mesh_price(n, dtype, ranks), room)
+    return whole
 
 
 def _gathered_admitted(shape, dtype, room=None) -> bool:

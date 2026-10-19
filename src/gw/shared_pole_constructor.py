@@ -301,8 +301,16 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # Resolve before either reduction program is traced; the ledger
                 # warns when the route price is over the budget.
                 local_eigh = budget.eigenplan(side)
+                # The reservation prices this round's program at its actual side, not the batch's
+                # conservative one (run30k: 48640 vs 84480, 137.9 -> 64 GB/rank); the eigh rooms
+                # below still subtract the admitted (conservative) program.
+                admitted = budget.program_bytes
+                if execution == 'face':
+                    from gw.shared_pole_execution import face_reduction_bytes
+                    budget.program_bytes = face_reduction_bytes(mesh_xy, len(ids), **dict(sizing, side=side))
                 budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
                     round_states, infinity, widths, infinity_width))
+                budget.program_bytes = admitted
                 round_states, infinity = pad_states(round_states, widths, infinity, infinity_width)
             with phase("gram_reduction"):
                 if execution == 'face':
