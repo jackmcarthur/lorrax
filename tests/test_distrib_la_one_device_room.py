@@ -23,6 +23,14 @@ od = importlib.import_module("distrib_la._one_device")
 plan_mod = importlib.import_module("distrib_la.plan")
 
 
+
+
+@pytest.fixture(autouse=True)
+def _gcd_run():
+    """The run's allocator limit an MI250X GCD reports (the ROCM solve_lu size row's input)."""
+    from lxkit import memory
+    memory.set_budget(48.99e9, limit_bytes=60_183_563_895, per_node=8, platform="MI250X")
+
 @pytest.fixture
 def mesh():
     if len(jax.devices()) < 4:

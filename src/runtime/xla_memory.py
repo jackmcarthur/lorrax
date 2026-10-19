@@ -319,57 +319,6 @@ _OUTSIDE_POOL_READERS = {
 }
 
 
-def _nvidia_smi_used_bytes(ordinal: int = 0) -> int | None:
-    """``nvidia-smi --query-gpu=memory.used`` of this rank's GPU (the first
-    ``CUDA_VISIBLE_DEVICES`` entry, else GPU 0), in bytes (nvidia-smi's MB
-    are MiB).  ``ordinal`` is unused: nvidia-smi numbers GPUs physically."""
-    import subprocess
-    try:
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        gpu_idx = cvd.split(",")[0].strip() if cvd else "0"
-        out = subprocess.run(
-            ["nvidia-smi", f"--id={gpu_idx}",
-             "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        return int(out.stdout.strip().split("\n")[0]) * 2**20
-    except Exception:                                         # noqa: BLE001
-        return None
-
-
-def _hip_used_bytes(ordinal: int = 0) -> int | None:
-    """``total - free`` of device ``ordinal`` from ``hipMemGetInfo`` (whole
-    device, like nvidia-smi's ``memory.used``).  In process: ``amd-smi``
-    takes 1.0 s a sample and ``rocm-smi`` 0.45 s (MI250X), and both number all
-    eight GCDs rather than the one ``ROCR_VISIBLE_DEVICES`` leaves visible."""
-    info = _hip_mem_info(ordinal)
-    return None if info is None else info[1] - info[0]
-
-
-#: ``PlatformLeg.memory_telemetry`` -> (sampler, short label for probe lines).
-_TELEMETRY = {
-    "nvidia-smi": (_nvidia_smi_used_bytes, "nvsmi"),
-    "hip_runtime": (_hip_used_bytes, "hipmem"),
-}
-
-
-def device_used_sample(ordinal: int = 0) -> tuple[str, int | None]:
-    """``(label, bytes)``: whole-device used memory through this process's
-    leg's ``memory_telemetry`` (:data:`lxkit.LEGS`), the true-HBM figure that
-    includes everything outside the XLA arena.  ``("none", None)`` on CPU or
-    a leg that declares no sampler; bytes None where the sampler failed.
-    Never raises."""
-    try:
-        leg = _process_gpu_leg()
-    except Exception:                                         # noqa: BLE001
-        return "none", None
-    entry = _TELEMETRY.get(getattr(leg, "memory_telemetry", "") or "")
-    if entry is None:
-        return "none", None
-    sampler, label = entry
-    return label, sampler(ordinal)
-
-
 #: allocator -> whether the PJRT client keeps arena accounting, i.e.
 #: whether ``memory_stats()['peak_bytes_in_use']`` means anything.
 _XLA_PEAK_ACCOUNTING = {

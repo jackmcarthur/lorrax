@@ -59,12 +59,29 @@ def _local_gemm_temp(shapes, dtype, device):
     return int(memory.temp_size_in_bytes)
 
 
-# Off CUDA every dense route is an XLA program (host LAPACK eigh, XLA dot),
-# whose scratch the compiler allocates and counts; no vendor workspace sits
-# outside it, so the query answers zero device bytes.
-_XLA_MANAGED = dict(device_bytes=0, host_bytes=0, vendor_device_bytes=None,
-                    dynamic_xla_scratch_bytes=0, local=True,
-                    formula='non-CUDA mesh: XLA-managed scratch', provider='XLA')
+def _off_cuda(plan, op, shapes, dtype):
+    """Off CUDA: a host mesh and the XLA dot count their scratch in the compiled program
+    (zero vendor bytes); a ROCm eigh's vendor bytes are the leg's measured rows
+    (``lxkit.memory.vendor``: ELPA distributed, the rocSOLVER batched target locally), and a
+    library without a row is GATE memory_unpriced under STRICT."""
+    from lxkit import LEGS, memory
+    from distrib_la.plan import Plan
+    local = (not isinstance(plan, Plan) or plan.is_native or plan.backend == ONE_DEVICE
+             or len(shapes[0]) == 3)
+    device, src = 0, 'XLA-managed scratch (compiled program)'
+    if mesh_platform(plan.mesh) == 'ROCM' and op == 'eigh':
+        n, ranks = int(shapes[0][-1]), int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
+        if local:
+            from distrib_la.local_eigh import batched_workspace_bytes
+            device = batched_workspace_bytes((1,) * (len(shapes[0]) == 2) + tuple(shapes[0]),
+                                             dtype, 'ROCM')
+            src = 'rocSOLVER batched row (local_eigh.BATCHED_EIGH_ROUTE)' if device else src
+        else:
+            term = memory.vendor(LEGS['ROCM'], plan.backend, 'eigh', n, ranks, dtype.itemsize)
+            device, src = int(term.fixed), term.source
+    return dict(device_bytes=device, host_bytes=0, vendor_device_bytes=device or None,
+                dynamic_xla_scratch_bytes=device, local=local, formula=src,
+                provider=getattr(plan, 'backend', 'XLA'))
 
 
 def _workspace_details(plan, op, shapes, dtype):
@@ -80,7 +97,7 @@ def _workspace_details(plan, op, shapes, dtype):
     if dtype not in (np.dtype('float64'), np.dtype('complex128')):
         raise TypeError('workspace query supports float64 and complex128')
     if mesh_platform(plan.mesh) != 'CUDA':
-        return _XLA_MANAGED
+        return _off_cuda(plan, op, shapes, dtype)
     px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
     # one_device (the size route) runs each matrix whole on one device with the native
     # kernel: a local workspace, held_per_rank copies per round (the one-device formula).

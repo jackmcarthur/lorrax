@@ -39,6 +39,12 @@ TERMS = ("operands", "xla", "vendor", "outside")
 #: Off, an out-of-range row is extrapolated, warned once, its provenance saying so.
 STRICT = os.environ.get("LORRAX_MEMORY_STRICT", "") == "1"
 CENSUS_BYTES = 64 << 20
+#: ``LORRAX_MEMORY_RECEIPTS=calibrate`` (and STRICT): a priced stage waits on its work at
+#: entry and exit, every timing section reads the allocator, and a BFC leg polls
+#: ``bytes_in_use``, so receipts are exact.  Default (production): no wait and no poll; the
+#: allocator is read only where a priced stage opens or closes, and its receipt is ``~``
+#: (work still in flight at the boundary is charged to the next one).
+CALIBRATE = STRICT or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
 
 
 @dataclass(frozen=True)
@@ -129,7 +135,7 @@ def _leg():
 #: Sampler period of the BFC ``bytes_in_use`` poll, seconds.
 POLL_SECONDS = 0.01
 _I = {"source": None, "lib": None, "handle": None, "device": None, "mark": -1, "poll": -1,
-      "live": -1}
+      "live": -1, "reserved": None}
 _LOCK = threading.Lock()
 _COST = [0, 0.0]
 
@@ -171,7 +177,8 @@ def _setup() -> Optional[str]:
         stats = device.memory_stats()
         _I.update(source="bfc", mark=int(stats["peak_bytes_in_use"]),
                   poll=int(stats.get("bytes_in_use", 0)))
-        threading.Thread(target=_sample, name="lorrax-memory-sampler", daemon=True).start()
+        if CALIBRATE:
+            threading.Thread(target=_sample, name="lorrax-memory-sampler", daemon=True).start()
         return "bfc"
     _I["source"] = "live" if device.platform == "cpu" else "none"
     return _I["source"]
@@ -190,18 +197,26 @@ def _sample() -> None:
 
 
 def _interval() -> tuple:
-    """(high-water since the last boundary, exact); starts the next interval."""
+    """(high-water since the last boundary, exact); starts the next interval.  Sets
+    ``_I["reserved"]``: the allocator's reserved high-water over it (None where unread)."""
     src = _I["source"] or _setup()
+    _I["reserved"] = None
     if src == "pool":
         import ctypes
-        value = ctypes.c_uint64(0)
-        if _I["lib"].cuMemPoolGetAttribute(_I["handle"], 8, ctypes.byref(value)):
-            return None, False
-        high, value.value = int(value.value), 0
-        _I["lib"].cuMemPoolSetAttribute(_I["handle"], 8, ctypes.byref(value))
-        return high, True
+        out = []
+        for attr in (8, 6):           # CU_MEMPOOL_ATTR_USED_MEM_HIGH, RESERVED_MEM_HIGH
+            value = ctypes.c_uint64(0)
+            if _I["lib"].cuMemPoolGetAttribute(_I["handle"], attr, ctypes.byref(value)):
+                return None, False
+            out.append(int(value.value))
+            value.value = 0
+            _I["lib"].cuMemPoolSetAttribute(_I["handle"], attr, ctypes.byref(value))
+        _I["reserved"] = out[1]
+        return out[0], True
     if src == "bfc":
         stats = _I["device"].memory_stats() or {}
+        reserved = stats.get("peak_pool_bytes", stats.get("pool_bytes"))
+        _I["reserved"] = None if reserved is None else int(reserved)
         peak, use = int(stats.get("peak_bytes_in_use", 0)), int(stats.get("bytes_in_use", 0))
         with _LOCK:
             polled, _I["poll"] = max(_I["poll"], use), use
@@ -230,18 +245,18 @@ def instrument_cost() -> tuple:
 class Tracker:
     """An open section: ``whole``/``own`` high-water (own: outside open children);
     ``metered``: since its price was attached, after a wait (the receipt's figure)."""
-    __slots__ = ("name", "price", "whole", "own", "metered", "exact", "mark0", "base")
+    __slots__ = ("name", "price", "whole", "own", "metered", "exact", "mark0", "base", "reserved")
 
     def __init__(self, name, price):
         self.name, self.price = str(name), price
-        self.whole = self.own = self.metered = -1
+        self.whole = self.own = self.metered = self.reserved = -1
         self.exact, self.mark0, self.base = True, None, -1
 
     def meter(self) -> None:
         if self.mark0 is None and _backend_up():
             _sync()
             boundary()
-            self.metered, self.exact, self.mark0 = -1, True, _I["mark"]
+            self.metered, self.exact, self.mark0, self.reserved = -1, CALIBRATE, _I["mark"], -1
         if self.price is not None and self.price.increment and _backend_up():
             self.price = self.price.settled()
 
@@ -271,6 +286,8 @@ def _main() -> bool:
 
 
 def _sync() -> None:
+    if not CALIBRATE:
+        return
     try:
         import jax
         jax.block_until_ready(jax.live_arrays())
@@ -290,10 +307,12 @@ def boundary() -> Optional[int]:
     _COST[0] += 1
     _COST[1] += time.perf_counter() - t0
     if high is not None:
+        reserved = -1 if _I["reserved"] is None else _I["reserved"]
         for t in _OPEN:
             t.whole = max(t.whole, high)
             if t.mark0 is not None:
                 t.metered, t.exact = max(t.metered, high), t.exact and exact
+                t.reserved = max(t.reserved, reserved)
         if _OPEN:
             _OPEN[-1].own = max(_OPEN[-1].own, high)
     return high
@@ -310,7 +329,11 @@ def open_tracker(name: str, price: Optional[Price] = None) -> Optional[Tracker]:
     tracker = Tracker(name, price)
     if str(name) in _DOOMED:
         _say(_DOOMED[str(name)])
-    tracker.meter() if price is not None else boundary()
+    if price is not None:
+        _ROOM[0] = None
+        tracker.meter()
+    elif CALIBRATE:
+        boundary()
     tracker.base = _I["live"]
     _OPEN.append(tracker)
     return tracker
@@ -322,10 +345,12 @@ def close_tracker(tracker: Optional[Tracker]) -> tuple:
         return -1, -1, False
     if tracker.mark0 is not None:
         _sync()
-    boundary()
+        _ROOM[0] = None
+    if tracker.mark0 is not None or CALIBRATE:
+        boundary()
     if tracker in _OPEN:
         _OPEN.remove(tracker)
-    if tracker.mark0 is not None and _I["source"] == "bfc":
+    if tracker.mark0 is not None and _I["source"] == "bfc" and CALIBRATE:
         # First raise: a stage that lifted the never-resetting mark peaked at it exactly.
         tracker.exact = _I["mark"] > tracker.mark0
         tracker.metered = _I["mark"] if tracker.exact else tracker.metered
@@ -338,9 +363,11 @@ def close_tracker(tracker: Optional[Tracker]) -> tuple:
     return tracker.whole, tracker.own, tracker.exact
 
 
-def book(price: Price, stage: Optional[str] = None) -> None:
+def book(price: Price, stage: Optional[str] = None, *, planned: Optional[Price] = None) -> None:
     """Book ``price`` to ``stage``: its open tracker (innermost), else the next to open;
-    ``None``: the innermost open tracker.  The largest price booked to a stage stands."""
+    ``None``: the innermost open tracker.  The largest price booked to a stage stands.
+    ``planned``: the price :func:`sizing` sees instead (a ledger's planning aggregate beside a
+    receipt priced as an increment over what is resident)."""
     if not isinstance(price, Price):
         raise TypeError(f"memory.book takes a memory.Price, got {type(price).__name__}")
     if STRICT and price.unsourced():
@@ -353,14 +380,21 @@ def book(price: Price, stage: Optional[str] = None) -> None:
         if target.price is None or price.bytes() > target.price.bytes():
             target.price = price
         target.meter()
-        _PLANNED.setdefault(target.name, ((("booked", target.price),), None))
+        _plan_booked(target.name, planned or target.price)
         return
     key = str(stage if stage is not None else price.label)
-    _PLANNED.setdefault(key, ((("booked", price),), None))
+    _plan_booked(key, planned or price)
     if stage is None:
         return                   # no section open (a planning replay): sizing only
     if key not in _PENDING or price.bytes() > _PENDING[key].bytes():
         _PENDING[key] = price
+
+
+def _plan_booked(key: str, price: Price) -> None:
+    """Sizing sees the largest price booked to ``key``; an admission's routes supersede it."""
+    old = _PLANNED.get(key)
+    if old is None or (old[0][0][0] == "booked" and price.bytes() > old[0][0][1].bytes()):
+        _PLANNED[key] = ((("booked", price),), None)
 
 
 @contextmanager
@@ -373,20 +407,29 @@ def stage(name: str, price: Optional[Price] = None):
         close_tracker(tracker)
 
 
-def receipt_line(name: str, price: Price, measured: float, exact: bool, src: str) -> str:
+def receipt_line(name: str, price: Price, measured: float, exact: bool, src: str,
+                 reserved: float = -1) -> str:
+    """``memory <stage>: priced P (terms) | measured M | γ g [| reserved R (slack S)]``: R the
+    allocator's reserved high-water, S = R - M (fragmentation and cached free blocks)."""
     total = price.bytes()
     if measured is None or measured < 0:
         meas, gamma = "not measured", "–"
     else:
-        mark = "" if exact else {"bfc": ">=", "live": "live "}.get(src, "~")
+        mark = "" if exact else ({"bfc": ">=", "live": "live "}.get(src, "~") if CALIBRATE
+                                 else "~")
         meas, gamma = f"{mark}{_gb(measured)}", (f"{measured / total:.2f}" if total else "–")
-    return f"memory {name}: priced {_gb(total)} ({price.describe()}) | measured {meas} | γ {gamma}"
+    tail = (f" | reserved {_gb(reserved)} (slack {_gb(reserved - measured)})"
+            if reserved is not None and reserved >= 0 and measured is not None and measured >= 0
+            else "")
+    return (f"memory {name}: priced {_gb(total)} ({price.describe()}) | measured {meas} | "
+            f"γ {gamma}{tail}")
 
 
 def _receipt(t: Tracker) -> None:
     src = _I["source"] or "none"
     row = _RECEIPTS.setdefault(t.name, dict(stage=t.name, count=0, priced=0.0, measured=-1.0,
-                                            exact=True, price=t.price, source=src))
+                                            exact=True, price=t.price, source=src, reserved=-1.0))
+    row["reserved"] = max(row["reserved"], float(t.reserved))
     first, row["count"] = row["count"] == 0, row["count"] + 1
     rise = t.metered > row["measured"] or t.price.bytes() > row["priced"]
     if t.price.bytes() >= row["priced"]:
@@ -395,7 +438,7 @@ def _receipt(t: Tracker) -> None:
         row["measured"], row["exact"] = float(t.metered), t.exact
     row["path"] = tuple(o.name for o in _OPEN) + (t.name,)
     if first or rise:
-        _say(receipt_line(t.name, t.price, t.metered, t.exact, src))
+        _say(receipt_line(t.name, t.price, t.metered, t.exact, src, t.reserved))
 
 
 def receipts() -> list:
@@ -435,8 +478,12 @@ def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int,
         return Term(hit[0], source=hit[1])
     row = dict(leg.vendor_rows).get((lib, op))
     if row is None:
-        raise RuntimeError(f"GATE memory_unpriced: got: no query and no measured row for "
-                           f"{leg.key}/{lib}/{op}; want: memory.remember at plan construction")
+        where = f"no query and no measured row for {leg.key}/{lib}/{op}"
+        if STRICT:
+            raise RuntimeError(f"GATE memory_unpriced: got: {where}; want: memory.remember "
+                               f"at plan construction or a measured row")
+        _warn(f"unpriced {leg.key}/{lib}/{op}", 0.0, f"memory: {where}; priced 0", local=False)
+        return Term(0.0, source=f"UNPRICED {leg.key}/{lib}/{op}")
     nbytes = row.ratio * (row.unit(int(n), int(ranks), int(itemsize)) if unit is None else unit)
     src = f"{row.ratio:g} x {row.unit_name} ({row.source})"
     if not (row.n[0] <= n <= row.n[1] and row.p[0] <= ranks <= row.p[1]):
@@ -453,6 +500,13 @@ def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int,
 # Limit, budget, room
 # ---------------------------------------------------------------------------
 _RUN: dict = {}
+
+
+def stage_outside(stage: str) -> Term:
+    """The bytes ``stage`` adds outside the allocator on this leg (``LEGS.stage_outside``)."""
+    leg = _leg()
+    row = next((r for r in getattr(leg, "stage_outside", ()) if r[0] == stage), None)
+    return Term() if row is None else Term(float(row[1]), source=row[2])
 
 
 def outside_allowance(leg, linalg: str = "local") -> float:
@@ -560,6 +614,19 @@ def room(stage: str = "", *, bucketed: bool = True) -> int:
     """budget - bytes in use, the minimum over processes, bucketed (every process enters)."""
     left = int(_agree(max(0.0, budget() - in_use())))
     return bucket(left) if bucketed else left
+
+
+_ROOM: list = [None]
+
+
+def stage_room() -> Optional[int]:
+    """:func:`room` (exact) read once per stage boundary: the first call after a tracker opens
+    or closes reads it (every process enters), later calls reuse it; None before a budget."""
+    if "budget" not in _RUN:
+        return None
+    if _ROOM[0] is None:
+        _ROOM[0] = room(bucketed=False)
+    return _ROOM[0]
 
 
 def bucket(value) -> int:

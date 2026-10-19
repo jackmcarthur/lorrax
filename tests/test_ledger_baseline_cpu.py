@@ -17,8 +17,8 @@ BUDGET, BASELINE = 63_414_637_611, 3_130_000_000
 def test_the_baseline_is_taken_from_every_admission_and_room(monkeypatch):
     prices = []
     from lxkit import memory
-    monkeypatch.setattr(memory, "book", lambda price, stage=None: prices.append(
-        (price.label, price.bytes())))
+    monkeypatch.setattr(memory, "book", lambda price, stage=None, planned=None: prices.append(
+        (price.increment, price.bytes(), planned.label, planned.bytes())))
     bare = CapacityLedger(META, mesh_xy=MESH, device_budget_bytes=BUDGET)
     held = CapacityLedger(META, mesh_xy=MESH, device_budget_bytes=BUDGET, baseline_bytes=BASELINE)
     a = bare.preview(resident_bytes_per_rank=10**9, workspace_bytes_per_rank=0)
@@ -30,8 +30,10 @@ def test_the_baseline_is_taken_from_every_admission_and_room(monkeypatch):
     # Over budget only beside the baseline: warned and admitted, status FAIL.
     over = held.preview(resident_bytes_per_rank=BUDGET - BASELINE + 1, workspace_bytes_per_rank=0)
     assert over["device_budget_status"] == "FAIL"
-    # Prices are recorded as the pool measures them, the label naming the baseline.
+    # The receipt meters the row's own bytes over what is resident at its stage (the baseline is
+    # in use then); sizing plans on the aggregate beside the baseline, the label naming it.
     held.reserve("head:0", resident_bytes_per_rank=6_600_000_000, workspace_bytes_per_rank=0)
     bare.reserve("head:0", resident_bytes_per_rank=6_600_000_000, workspace_bytes_per_rank=0)
-    assert prices == [("shared-pole ledger + 3.13 GB baseline", 6_600_000_000 + BASELINE),
-                      ("shared-pole ledger", 6_600_000_000)]
+    assert prices == [(True, 6_600_000_000, "shared-pole ledger + 3.13 GB baseline",
+                       6_600_000_000 + BASELINE),
+                      (True, 6_600_000_000, "shared-pole ledger", 6_600_000_000)]

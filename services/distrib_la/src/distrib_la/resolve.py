@@ -73,6 +73,8 @@ from __future__ import annotations
 
 import math
 
+from lxkit import memory
+
 
 from lxkit import FFI_PLATFORM_MAP, announce_once, mesh_ffi_platform
 
@@ -84,7 +86,9 @@ __all__ = [
     "NATIVE2D",
     "ONE_DEVICE",
     "ONE_DEVICE_MAX_N",
+    "ONE_DEVICE_BY_LIMIT",
     "ONE_DEVICE_BY_ROOM",
+    "size_row",
     "ONE_DEVICE_ROUND_N",
     "one_device_round_n",
     "one_device_max_n",
@@ -213,10 +217,10 @@ _DISTRIBUTED_DEFAULT = {
 #:     MEASURED-COVERAGE bound, not a correctness one: jnp.linalg.eigh (rocSOLVER
 #:     zheevd) is exact at n = 20480 (60.5 s, peak 35.2 GB, resid 8.4e-15) and
 #:     24576 (120.2 s, 50.75 GB, 8.1e-15) complex128 (pool logs lurc_e_*).
-#:   solve_lu: the CAPACITY of one GCD, an explicit rule: the largest n whose
-#:     priced one-device program (``_one_device.one_device_bytes``: 5 n^2 x 16 B,
-#:     complex128) fits the GCD's XLA allocator, :data:`_ROCM_GCD_BYTES_LIMIT`
-#:     -> isqrt(60183563895 // 80) = 27427.  There is no speed crossover below
+#:   solve_lu: the CAPACITY of one GCD (:data:`ONE_DEVICE_BY_LIMIT`): the largest n
+#:     whose priced one-device program (``_one_device.one_device_bytes``: 5 n^2 x 16 B,
+#:     complex128) fits the run's allocator limit (``lxkit.memory``; 60.18 GB on an
+#:     MI250X GCD -> 27427).  There is no speed crossover below
 #:     it: one-device (distrib_la.local_lu) vs SLATE 2x2 complex128, n = 8192
 #:     0.72 vs 3.63 s, 12288 1.53 vs 10.4 s, 16384 4.10 vs 16.1 s; one-device
 #:     20480 6.18 s, 24576 13.3 s, 26624 14.2 s, 28672 22.7 s (peak 52.9 GB,
@@ -225,16 +229,21 @@ _DISTRIBUTED_DEFAULT = {
 #:     in-place path is wrong past a 2^31-byte span (ROCSOLVER_LU_REPORT.md);
 #:     local_lu solves such systems on a span-blocked path, so the native LU is
 #:     exact at every n here.
-#: One MI250X GCD's XLA allocator limit (``memory_stats()['bytes_limit']``, ROCm 7.14.1
-#: wheels, jax 0.9.1, measured on frontier07938).  The ROCM solve_lu capacity row's input.
-_ROCM_GCD_BYTES_LIMIT = 60_183_563_895
-#: ``_one_device.ONE_DEVICE_LU_TILES`` x complex128 itemsize (that module imports this one;
-#: tests/test_distrib_la_one_device.py pins the two equal).
-_ROCM_LU_BYTES_PER_N2 = 5 * 16
-ONE_DEVICE_MAX_N = {
-    ("eigh", "ROCM"):     16384,
-    ("solve_lu", "ROCM"): math.isqrt(_ROCM_GCD_BYTES_LIMIT // _ROCM_LU_BYTES_PER_N2),
-}
+ONE_DEVICE_MAX_N = {("eigh", "ROCM"): 16384}
+#: Size rows that are the run's allocator limit, not a measured n (see above).
+ONE_DEVICE_BY_LIMIT = frozenset({("solve_lu", "ROCM")})
+
+
+def size_row(op: str, platform: str) -> int | None:
+    """The leg's ``one_device`` size row for ``op``: :data:`ONE_DEVICE_MAX_N`, or on a
+    :data:`ONE_DEVICE_BY_LIMIT` leg the largest n whose one whole matrix fits the run's
+    allocator limit (``lxkit.memory.run``; None before the budget resolves)."""
+    row = ONE_DEVICE_MAX_N.get((op, str(platform)))
+    limit = memory.run().get("limit") if (op, str(platform)) in ONE_DEVICE_BY_LIMIT else None
+    if row is None and limit:
+        from distrib_la._one_device import one_device_bytes
+        row = math.isqrt(int(limit) // one_device_bytes(op, 1))
+    return row
 
 #: ``one_device`` ROUNDS by leg row: the per-rank element allowance of one round (whole
 #: matrices of n x max(n, width) elements up to ROUND_N^2 per rank, at least one), DECOUPLED
@@ -887,7 +896,7 @@ def one_device_max_n(op: str, platform: str, room: int | None = None) -> int | N
     (:data:`ONE_DEVICE_BY_ROOM`) derives it from the caller's per-rank ``room``: the
     largest ``n`` with ``one_device_bytes(op, n) <= room``; no room, no bound.  A shape
     rule on a value every rank shares: no exchange, no sync."""
-    bound = ONE_DEVICE_MAX_N.get((op, str(platform)))
+    bound = size_row(op, platform)
     if bound is not None:
         return bound
     if (op, str(platform)) in ONE_DEVICE_BY_ROOM and room is not None and int(room) > 0:
@@ -1031,7 +1040,7 @@ def _available(op: str, mesh_xy) -> list[str]:
     mesh (the pure-JAX ones always qualify)."""
     out = [NATIVE] + ([NATIVE2D] if NATIVE2D in BACKEND_CHOICES[op] else [])
     platform = mesh_platform(mesh_xy)
-    if (op, platform) in ONE_DEVICE_MAX_N:
+    if (op, platform) in ONE_DEVICE_MAX_N or (op, platform) in ONE_DEVICE_BY_LIMIT:
         out.append(ONE_DEVICE)
     for (o, b), (target, platforms) in _SPEC.items():
         if o != op or platform not in platforms:
