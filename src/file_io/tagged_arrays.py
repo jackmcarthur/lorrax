@@ -1246,6 +1246,68 @@ def write_lr_channels_to_h5(filename, *, Ft, P, gvec, v, q_frac, n_z, sys_dim,
     rank0_transaction(filename, stage="restart.lr_channels", write=_write)
 
 
+def write_head_wings_to_h5(
+    filename: str,
+    *,
+    S_direct,
+    L,
+    R,
+    n_mu_logical: int,
+):
+    """Persist the static (ω = 0) direct head tensor and its two ISDF wings.
+
+    The q → 0 data of the GW head fold (``gw.head_correction.
+    fold_small_head_wings_sharded``), so that a restart consumer can rebuild
+    the long-wavelength block of ε⁻¹ — wings, local-field head, and in 3D the
+    O(1) head-wing term of the body — from the stored body W alone
+    (``docs/theory/bgw_epsmat_export.md`` §5, E9–E14).
+
+    - ``S_cart_head_direct`` ``(3, 3)`` complex: the DIRECT (no local fields)
+      Cartesian q²-coefficient, ``χ₀₀(q) = Ω qᵀ S q`` in the μ-space
+      normalisation below; ``S_cart_head`` is its fold
+      ``S + L W(Γ) R / Ω`` when the head is ``head_schur``.
+    - ``head_wing_L`` ``(3, N_μ)`` complex: the left wing, the q-linear
+      G = 0 row of the ISDF polarizability,
+      ``χ₀(0, G) = Σ_μ (q·L)_μ conj(ζ̃_μ(G))`` with ``q`` Cartesian (1/bohr),
+      ``ζ̃_μ`` the restart's Γ interpolation vectors and ``V = Zᴴ diag(v/Ω) Z``
+      (Ry); ``L_aμ = Σ_{k,c,v} conj(v^a_{cv,k}) g_{cv,k} ψ*_c(r_μ) ψ_v(r_μ)``,
+      ``g = 4 / (N_k n_spin n_spinor ΔE²)`` (``qsgw_head._head_wing_kernel``).
+    - ``head_wing_R`` ``(N_μ, 3)`` complex: the right wing,
+      ``χ₀(G, 0) = Σ_μ ζ̃_μ(G) (R q)_μ``; ``R = Lᴴ`` for a static gapped
+      response.
+
+    Charge channel only: the wings carry the spin/spinor sum of the density
+    response (one channel per restart).  μ in the restart's canonical
+    centroid order and logical extent ``n_mu_logical``.  Rank-0-only write
+    (3 × N_μ each; no MPI-IO needed).
+    """
+    S_direct = np.asarray(S_direct, dtype=np.complex128).reshape(3, 3)
+    L = np.asarray(L, dtype=np.complex128)[:, : int(n_mu_logical)]
+    R = np.asarray(R, dtype=np.complex128)[: int(n_mu_logical), :]
+    if L.shape != (3, int(n_mu_logical)) or R.shape != (int(n_mu_logical), 3):
+        raise ValueError(
+            f"GATE restart_head_wings_shape: got L {L.shape}, R {R.shape}; want "
+            f"(3, {int(n_mu_logical)}) and ({int(n_mu_logical)}, 3); why: the wings "
+            f"index the restart's logical centroids; fix: pass the ω = 0 wings")
+
+    def _write():
+        with h5py.File(filename, "a") as f:
+            set_commit_state(f, False)
+            for name, data in (("S_cart_head_direct", S_direct),
+                               ("head_wing_L", L), ("head_wing_R", R)):
+                if name in f:
+                    del f[name]
+                ds = f.create_dataset(name, data=data)
+                ds.attrs["omega_ry"] = 0.0
+            f["S_cart_head_direct"].attrs["convention"] = "cartesian_q2_coefficient_direct"
+            f["head_wing_L"].attrs["convention"] = (
+                "chi0(0,G) = sum_mu (q.L)_mu conj(zeta_mu(G)); q Cartesian 1/bohr; "
+                "V = Z^H diag(v/Omega) Z in Ry; S_cart_head = S_direct + L W(Gamma) R / Omega")
+            f["head_wing_R"].attrs["convention"] = "chi0(G,0) = sum_mu zeta_mu(G) (R q)_mu"
+            set_commit_state(f, True)
+    rank0_transaction(filename, stage="restart.head_wings", write=_write)
+
+
 def write_head_scalars_to_h5(
     filename: str,
     *,

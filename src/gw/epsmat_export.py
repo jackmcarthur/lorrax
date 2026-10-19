@@ -29,7 +29,7 @@ from jax import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 __all__ = [
-    "match_q_umklapp", "zeta_slots", "coulomb_whitener", "q0_body_policy",
+    "match_q_umklapp", "zeta_slots", "coulomb_whitener", "q0_body_policy", "q0_dipole_terms",
     "whitened_correlation", "epsinv_block", "project_block", "coulomb_gram",
     "run_epsmat_export", "run_epsmat_projection",
 ]
@@ -41,6 +41,11 @@ _XY = ("x", "y")
 V_RECONSTRUCTION_TOL = 1.0e-9
 BLOCK_PROJECTION_TOL = 1.0e-8
 STATIC_W_HERMITIAN_TOL = 1.0e-8
+#: The stored head tensor is the fold of the stored wings through W(Γ)
+#: (``S_cart_head = S_direct + L W R / Ω``); the export re-forms that fold
+#: with the FILE's W(Γ), so the gate certifies L's μ order and normalisation
+#: where the export consumes them (relative to the fold term).
+Q0_WING_FOLD_TOL = 1.0e-3
 
 
 def _refuse(gate, got, want, why, fix):
@@ -267,20 +272,25 @@ def _block_finish(mesh, n_pad, is_q0):
     rep = NamedSharding(mesh, P())
     bsh = NamedSharding(mesh, P(None, None, None, "x", "y", None))
 
-    def run(t1, v, n_valid, head):
+    def run(t1, v, n_valid, head, w0b, wa0):
         a = jnp.arange(n_pad)[:, None]
         b = jnp.arange(n_pad)[None, :]
         t = t1[0] * v[None, :] + ((a == b) & (a < n_valid)).astype(t1.dtype)
         if is_q0:
+            # T[0, b] = ε⁻¹(G_b, 0) (E11) and T[a, 0] = ε⁻¹(0, G_a) (E12);
+            # zero vectors give the q0_wings = zero file.
             t = jnp.where((a == 0) | (b == 0), 0.0, t)
+            t = jnp.where((a == 0) & (b > 0) & (b < n_valid), w0b[None, :], t)
+            t = jnp.where((b == 0) & (a > 0) & (a < n_valid), wa0[:, None], t)
             t = jnp.where((a == 0) & (b == 0), head, t)
         blk = jnp.stack([t.real, t.imag], axis=-1)[None, None, None]
         return blk, jnp.diagonal(t)
 
-    return jax.jit(run, in_shardings=(_face(mesh), rep, rep, rep), out_shardings=(bsh, rep))
+    return jax.jit(run, in_shardings=(_face(mesh), rep, rep, rep, rep, rep),
+                   out_shardings=(bsh, rep))
 
 
-def epsinv_block(Zf, chi, v_eps, *, mesh, n_valid, q0_head_value=None):
+def epsinv_block(Zf, chi, v_eps, *, mesh, n_valid, q0_head_value=None, q0_wings=None):
     """ε⁻¹_q(G,G') on one BerkeleyGW G list, in the file's block orientation (E6).
 
     Parameters
@@ -289,7 +299,10 @@ def epsinv_block(Zf, chi, v_eps, *, mesh, n_valid, q0_head_value=None):
     chi : (1, μ_pad, μ_pad) complex128 face — :func:`response`.
     v_eps : (n,) float — LORRAX v(q+G)/Ω in Ry at the eps G list.
     n_valid : int — nmtx; rows and columns past it are zero (mesh pad).
-    q0_head_value : complex | None — at q → 0 the head ε⁻¹_00(q0); wings zero.
+    q0_head_value : complex | None — at q → 0 the head ε⁻¹_00(q0).
+    q0_wings : (w0b, wa0) | None — at q → 0 the two wing vectors ``(n_pad,)``,
+        ``w0b[b] = ε⁻¹(G_b, 0)`` and ``wa0[a] = ε⁻¹(0, G_a)`` (:func:`q0_dipole_terms`);
+        ``None`` writes zero wings.
 
     Returns
     -------
@@ -301,8 +314,85 @@ def epsinv_block(Zf, chi, v_eps, *, mesh, n_valid, q0_head_value=None):
     vv[: len(v_eps)] = np.asarray(v_eps, dtype=np.float64)
     t1 = _pm(jnp.conj(Zf), _pm(chi, Zf, mesh, transa="T"), mesh, transa="T")
     head = 1.0 + 0.0j if q0_head_value is None else complex(q0_head_value)
+    if q0_wings is None:
+        w0b = wa0 = jnp.zeros(n_pad, jnp.complex128)
+    else:
+        w0b, wa0 = (jnp.asarray(w, jnp.complex128) for w in q0_wings)
     return _block_finish(mesh, n_pad, q0_head_value is not None)(
-        t1, jnp.asarray(vv), jnp.int32(n_valid), jnp.complex128(head))
+        t1, jnp.asarray(vv), jnp.int32(n_valid), jnp.complex128(head), w0b, wa0)
+
+
+# ---------------------------------------------------------------------------
+# q → 0: the dipole wings (docs/theory/bgw_epsmat_export.md §5, E9–E14)
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=None)
+def _face_matvec(mesh):
+    """jit: face ``(1, m, m)`` A, replicated x, y ``(m,)`` -> ``(A x, yᵀ A)`` replicated."""
+    rep = NamedSharding(mesh, P())
+    return jax.jit(lambda A, x, y: (jnp.einsum("ij,j->i", A[0], x),
+                                    jnp.einsum("i,ij->j", y, A[0])),
+                   in_shardings=(_face(mesh), rep, rep), out_shardings=(rep, rep))
+
+
+@functools.lru_cache(maxsize=None)
+def _add_outer(mesh):
+    """jit: face ``χ + c u ũᵀ`` (an elementwise program; u, ũ replicated vectors)."""
+    rep = NamedSharding(mesh, P())
+    return jax.jit(lambda A, u, ut, c: A + c * u[None, :, None] * ut[None, None, :],
+                   in_shardings=(_face(mesh), rep, rep, rep), out_shardings=_face(mesh))
+
+
+@functools.lru_cache(maxsize=None)
+def _zeta_contract(mesh):
+    """jit: ζ̃ face ``Z_f (1, μ, n)`` -> ``(Z u)(G) = Σ_μ Z_f[μ,G] u_μ`` and
+    ``(ũᵀZᴴ)(G) = Σ_μ ũ_μ conj(Z_f[μ,G])``, replicated ``(n,)``."""
+    rep = NamedSharding(mesh, P())
+    return jax.jit(lambda Z, u, ut: (jnp.einsum("mg,m->g", Z[0], u),
+                                     jnp.einsum("mg,m->g", jnp.conj(Z[0]), ut)),
+                   in_shardings=(_face(mesh), rep, rep), out_shardings=(rep, rep))
+
+
+def q0_dipole_terms(Zf, chi, V, W, wl, wr, v_eps, *, mesh, v0, chi00):
+    """The q → 0 block of ε⁻¹ from the Γ body and the dipole wings (E10–E14).
+
+    Parameters
+    ----------
+    Zf : (1, μ_pad, n_pad) face — ζ̃ of Γ on the eps0mat G list.
+    chi, V, W : (1, μ_pad, μ_pad) faces — Γ's χ^μ = B K Bᴴ, V and W = V + VχV (Ry).
+    wl, wr : (μ_pad,) complex — the contracted wings q0·L and R q0 (E9).
+    v_eps : (n,) — v(q0 + G)/Ω (Ry), zero in the G = 0 slot.
+    v0 : float — v(q0)/Ω, the bare (truncated) Coulomb of the head slot (Ry).
+    chi00 : complex — Ω q0ᵀ S_direct q0, the direct head of χ₀.
+
+    Returns
+    -------
+    chi_q0 : face — χ^μ + c u ũᵀ (E13), the body's response with its head–wing term.
+    head : complex — ε⁻¹_00 = 1/ε_M (E10).
+    wings : (w0b, wa0) replicated (n_pad,) — T[0, b] = ε⁻¹(G_b, 0) (E11),
+        T[a, 0] = ε⁻¹(0, G_a) (E12).
+    figures : dict — ε_M, the fold ũᵀVω = wlᵀ W wr, |u|, |ũ|.
+    """
+    mv = _face_matvec(mesh)
+    wl = jnp.asarray(wl, jnp.complex128)
+    wr = jnp.asarray(wr, jnp.complex128)
+    Vr, lV = mv(V, wr, wl)                    # V ω, ω̃ᵀ V
+    cVr, lVc = mv(chi, Vr, lV)                # χ V ω, ω̃ᵀ V χ
+    u, ut = wr + cVr, wl + lVc                # (1 + χV) ω, ω̃ᵀ(1 + Vχ)       (E11, E12)
+    Ww, _ = mv(W, wr, wl)
+    fold = complex(jnp.dot(wl, Ww))           # ω̃ᵀ W ω = ũᵀ V ω                (E10)
+    eps_m = 1.0 - float(v0) * (complex(chi00) + fold)
+    c = float(v0) / eps_m
+    chi_q0 = _add_outer(mesh)(chi, u, ut, jnp.complex128(c))
+    zu, zut = _zeta_contract(mesh)(Zf, u, ut)
+    n_pad = int(Zf.shape[2])
+    vv = np.zeros(n_pad, dtype=np.float64)
+    vv[: len(v_eps)] = np.asarray(v_eps, dtype=np.float64)
+    w0b = jnp.asarray(vv) * zu / eps_m
+    wa0 = c * zut
+    figures = {"eps_M": eps_m, "fold": fold, "chi00": complex(chi00), "v0": float(v0),
+               "u_norm": float(jnp.linalg.norm(u)), "ut_norm": float(jnp.linalg.norm(ut))}
+    return chi_q0, 1.0 / eps_m, (w0b, wa0), figures
 
 
 @functools.lru_cache(maxsize=None)
@@ -424,6 +514,10 @@ def open_export_source(cfg, mesh, *, print_fn=print):
                         wfn.symmetry().kvecs_asints, np.asarray(kgrid)))
         n_mu = int(f["V_qmunu"].shape[-1])
         head = {"S_cart": (np.asarray(f["S_cart_head"][()]) if "S_cart_head" in f else None),
+                "S_direct": (np.asarray(f["S_cart_head_direct"][()])
+                             if "S_cart_head_direct" in f else None),
+                "L": np.asarray(f["head_wing_L"][()]) if "head_wing_L" in f else None,
+                "R": np.asarray(f["head_wing_R"][()]) if "head_wing_R" in f else None,
                 "G0": (np.asarray(f["G0_mu_nu"][()]) if "G0_mu_nu" in f else None),
                 "whead": (np.asarray(f["whead"][()]) if "whead" in f else None),
                 "head_correction": (str(f["whead"].attrs.get("head_correction", ""))
@@ -449,7 +543,9 @@ def open_export_source(cfg, mesh, *, print_fn=print):
                  f"takes the distributed solver")
     print_fn(f"  bundle      {bundle}\n  zeta        {zeta_path}\n"
              f"  stored q    {q_stored.shape[0]} ({storage}) on k-grid {kgrid}, "
-             f"μ {n_mu} (carrier {mu_pad})\n  head        {head['head_correction']}")
+             f"μ {n_mu} (carrier {mu_pad})\n  head        {head['head_correction']}"
+             + (f"; q0 wings L/R (3 x {n_mu}) and S_direct stored" if head["L"] is not None
+                else "; no q0 wings stored"))
     return ExportSource(bundle=bundle, zeta=zl, q_stored=q_stored, kgrid=kgrid,
                         n_mu=n_mu, mu_pad=mu_pad, geometry=geometry, config=gw,
                         head=head, wfn_file=gw.paths.wfn_file, eigh=eigh)
@@ -679,7 +775,47 @@ def _q0_head_value(cfg, src, q0):
     return complex(float(w_h) / v_h)
 
 
-def q0_body_policy(files, sys_dim, q0_body_3d):
+def q0_wing_inputs(cfg, src, q0, W_face, *, mesh):
+    """``(wl, wr, v0, chi00, figures)`` of (E9) at ``q0`` from the bundle's wings, or refuse.
+
+    ``wl = q0·L``, ``wr = R q0`` padded to μ_pad (replicated), ``v0 = v(q0)/Ω``
+    and ``chi00 = Ω q0ᵀ S_direct q0``.  GATE ``epsmat_q0_wing_fold``: the
+    stored head tensor must be the fold of the stored wings through this
+    file's W(Γ), ``Ω q0ᵀ(S_cart_head − S_direct)q0 = wlᵀ W wr``.
+    """
+    h = src.head
+    if h["L"] is None or h["R"] is None or h["S_direct"] is None:
+        _refuse("epsmat_q0_wings_source", "a bundle without head_wing_L/R and S_cart_head_direct",
+                "the GW run's ω = 0 head wings (written by gw_jax since this branch)",
+                "the q → 0 wings, local-field head and 3-D body come from them",
+                "rerun the producer GW on this branch, or set q0_wings = zero")
+    if cfg.q0_head != "s_tensor":
+        _refuse("epsmat_q0_wings_head", f"q0_head = {cfg.q0_head}",
+                "q0_head = s_tensor with q0_wings = dipole",
+                "the dipole head is 1/ε_M of the same wings", "set q0_head = s_tensor or q0_wings = zero")
+    q0c = np.asarray(q0, dtype=np.float64) @ src.geometry.bvec
+    L = np.zeros((3, src.mu_pad), np.complex128); L[:, : src.n_mu] = h["L"]
+    R = np.zeros((src.mu_pad, 3), np.complex128); R[: src.n_mu] = h["R"]
+    wl, wr = q0c @ L, R @ q0c
+    omega = float(src.geometry.cell_volume)
+    v0 = float(bare_v_bgw_units(src, q0, np.zeros((1, 3), int))[0]) / omega
+    chi00 = omega * complex(q0c @ h["S_direct"] @ q0c)
+    rep = NamedSharding(mesh, P())
+    wl_d, wr_d = jax.device_put(wl, rep), jax.device_put(wr, rep)
+    Ww, _ = _face_matvec(mesh)(W_face, wr_d, wl_d)
+    fold = complex(np.dot(wl, np.asarray(Ww)))
+    stored = (omega * complex(q0c @ (h["S_cart"] - h["S_direct"]) @ q0c)
+              if h["S_cart"] is not None else None)
+    err = abs(stored - fold) / max(abs(fold), 1e-300) if stored is not None else float("nan")
+    if stored is not None and not err <= Q0_WING_FOLD_TOL:
+        _refuse("epsmat_q0_wing_fold",
+                f"|Ω q0(S_cart − S_direct)q0 − wl W wr| / |wl W wr| = {err:.3e}",
+                f"<= {Q0_WING_FOLD_TOL:.0e}", "the wings are not in this file's μ basis or normalisation",
+                "report the bundle; export with q0_wings = zero")
+    return wl_d, wr_d, v0, chi00, {"fold_file_W": fold, "fold_stored_S": stored, "fold_gate": err}
+
+
+def q0_body_policy(files, sys_dim, q0_body_3d, q0_wings="zero"):
     """How ``eps0mat``'s body is written (§5), or the refusal; a receipt string.
 
     In 2D the head–wing term ε_b0 ε_00⁻¹ ε_0b of the block inverse is O(q)
@@ -691,6 +827,8 @@ def q0_body_policy(files, sys_dim, q0_body_3d):
     if "eps0mat" not in files:
         return "no eps0mat"
     sys_dim = int(sys_dim)
+    if q0_wings == "dipole" and sys_dim in (2, 3):
+        return "complete: head-wing term c u ũᵀ from the dipole wings (E13)"
     if sys_dim == 2:
         return "q -> 0 limit (head-wing term O(q))"
     if sys_dim != 3:
@@ -719,7 +857,7 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
     from file_io.slab_io import SlabIO
 
     src = open_export_source(cfg, mesh, print_fn=print_fn)
-    q0_body = q0_body_policy(cfg.files, src.config.sys_dim, cfg.q0_body_3d)
+    q0_body = q0_body_policy(cfg.files, src.config.sys_dim, cfg.q0_body_3d, cfg.q0_wings)
     print_fn(f"  q0 body     {q0_body}")
     plans, comps = plan_export(cfg, src, print_fn=print_fn)
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -755,8 +893,21 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
                 head = _q0_head_value(cfg, src, r.q_file) if name == "eps0mat" else None
                 n_pad = _pad_to(max(n, 1), p * p)
                 Zf = zeta_face(Z, slots, mesh=mesh, n_pad=n_pad)
+                wings, qw = None, {}
+                if name == "eps0mat" and cfg.q0_wings == "dipole":
+                    W_face = V + Wc
+                    wl, wr, v0, chi00, qw = q0_wing_inputs(cfg, src, r.q_file, W_face, mesh=mesh)
+                    head_e8 = head
+                    chi, head, wings, tf = q0_dipole_terms(Zf, chi, V, W_face, wl, wr, v_eps,
+                                                           mesh=mesh, v0=v0, chi00=chi00)
+                    del W_face
+                    qw.update(tf, head_E8=complex(head_e8), head_E10=complex(head))
+                    print_fn(f"    eps0mat q0 wings (dipole): ε_M = {complex(tf['eps_M']).real:.6f} "
+                             f"(E8 from S_cart_head: {(1 / complex(head_e8)).real:.6f}); fold gate "
+                             f"{qw['fold_gate']:.2e}; |T[a,0]|max = {float(jnp.max(jnp.abs(wings[1]))):.4e}, "
+                             f"|T[0,b]|max = {float(jnp.max(jnp.abs(wings[0]))):.4e}")
                 blk6, diag = epsinv_block(Zf, chi, v_eps, mesh=mesh, n_valid=n,
-                                          q0_head_value=head)
+                                          q0_head_value=head, q0_wings=wings)
                 offset, _ = be.matrix_block_window(r.iq_file, 0, n_pad)
                 io.write_slab(be.MATRIX, blk6, offset=offset)
                 proj = project_block(blk6, Zf, v_eps, mesh=mesh, n_valid=n,
@@ -771,7 +922,8 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
                 figs.append({"q": np.round(r.q_file, 6).tolist(), "iq_file": int(r.iq_file),
                              "iq_store": int(r.iq_store), "g0": np.asarray(r.g0).tolist(),
                              "nmtx": n, "projection_err": err, "roundtrip_vs_W": rt,
-                             "head": (None if head is None else complex(head)), **qd})
+                             "head": (None if head is None else complex(head)),
+                             **({"q0_wings": qw} if qw else {}), **qd})
                 print_fn(f"    {name}[{r.iq_file}] nmtx {n}: block identity {err:.2e}, "
                          f"Zᴴ(ε⁻¹−1)vZ vs W−V {rt:.2e}"
                          + ("" if head is None else f", head ε⁻¹_00(q0)={complex(head):.6f}"))

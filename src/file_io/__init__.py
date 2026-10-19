@@ -51,6 +51,7 @@ from .tagged_arrays import (
     write_restart_state_to_h5,
     write_w0_qmunu_to_h5,
     write_head_scalars_to_h5,
+    write_head_wings_to_h5,
     write_lr_channels_to_h5,
 )
 from .restart_bundle import (

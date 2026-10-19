@@ -45,7 +45,12 @@ EPSMAT_DEFAULTS = {
     # ε⁻¹_00(q0): ``s_tensor`` (the bundle's direct q² tensor) or
     # ``unscreened`` (1; debug).
     "q0_head": "s_tensor",
-    # sys_dim 3 eps0mat: the q -> 0 body omits the O(1) head-wing term
+    # q -> 0 wings of eps0mat: ``dipole`` (the bundle's stored ω = 0 head
+    # wings L, R: local-field head 1/ε_M, both wings and, in 3D, the body's
+    # head-wing term; docs §5 E9–E14) or ``zero`` (wings 0, head from
+    # S_cart_head, body without the head-wing term: the behaviour before).
+    "q0_wings": "dipole",
+    # sys_dim 3 eps0mat with q0_wings = zero: the q -> 0 body omits the O(1) head-wing term
     # ε_b0 ε_00⁻¹ ε_0b.  ``refuse`` or ``omit_head_wing`` (write that body).
     "q0_body_3d": "refuse",
 }
@@ -98,6 +103,7 @@ class EpsmatConfig:
     rcond: float
     q0_head: str
     q0_body_3d: str
+    q0_wings: str
 
     @classmethod
     def from_input_file(cls, filename: str) -> "EpsmatConfig":
@@ -141,6 +147,10 @@ class EpsmatConfig:
                              f"omit_head_wing; why: the 3-D q → 0 body without its "
                              f"head–wing term is an approximation taken by name; fix: set "
                              f"q0_body_3d")
+        wings = p["q0_wings"].lower()
+        if wings not in ("dipole", "zero"):
+            raise ValueError(f"GATE epsmat_q0_wings_value: got {wings!r}; want dipole | zero; "
+                             f"why: the q → 0 wing source; fix: set q0_wings")
         ref = path("bgw_reference", mode == "project")
         ecut = float(p["epsilon_cutoff"])
         if mode == "export" and not ref and ecut <= 0.0:
@@ -153,7 +163,7 @@ class EpsmatConfig:
                    parent_input_file=path("parent_input_file", True),
                    output_dir=path("output_dir", True), bgw_reference=ref,
                    epsilon_cutoff=ecut, q0_vector=q0, files=files, rcond=rcond,
-                   q0_head=head, q0_body_3d=body)
+                   q0_head=head, q0_body_3d=body, q0_wings=wings)
 
     def describe(self) -> str:
         """The resolved input, one key per line, for the run banner."""
