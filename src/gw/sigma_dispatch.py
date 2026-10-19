@@ -1596,6 +1596,12 @@ def _compute_mpa_sigma(
             wfns, cd_handle, meta, mesh_xy, sym=sym, config=config, run_dir=input_dir,
             sig_x=sig_x, **dict(body_options, omega_grid_ry=(
                 config.omega_grid_ry if request is None else request.frequencies_ry)))
+        if request is not None:
+            # The CD body holds Sigma_c on the request's distinct frequencies; the
+            # finalize reads it as the SPM/MPA route's on-shell operand
+            # (OnShellSigma), never as an omega-grid cube on the deck's grid.
+            from .cd.sigma import cd_on_shell_body
+            body = cd_on_shell_body(body, request, mesh_xy, print_fn=print_fn)
     else:
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,

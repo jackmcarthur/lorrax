@@ -1671,3 +1671,89 @@ def compute_sigma_c_cd_omega_grid(
     return SigmaOmegaResult(omega_ry=np.asarray(omega_grid_ry, np.float64),
                             omega_ev=np.asarray(omega_grid_ry, np.float64) * EV,
                             sigma_c_kij=cube, band_axis=axis, band_counts=(), efermi_ry=float(efermi_ry))
+
+
+# ------------------------------------------------------------------------- the on-shell handoff (post-processing)
+#: GATE cd_on_shell_lookup: a request table entry must be one of the body's frequencies to this (Ry); the
+#: request's star-invariance gate (``gw.ppm_sigma.on_shell_request``) bounds the parent/star drift the same way.
+CD_ON_SHELL_LOOKUP_RY = 1.0e-9
+
+
+def cd_linear_on_axis(values, axis, points):
+    """``values[w, k, n]`` linearly interpolated along the increasing ``axis`` at ``points[k, n]`` (inside it)."""
+    axis = np.asarray(axis, dtype=np.float64)
+    j = np.clip(np.searchsorted(axis, points, side="right"), 1, axis.size - 1)
+    t = (points - axis[j - 1]) / (axis[j] - axis[j - 1])
+    k, n = np.meshgrid(np.arange(points.shape[0]), np.arange(points.shape[1]), indexing="ij")
+    return values[j - 1, k, n] * (1.0 - t) + values[j, k, n] * t
+
+
+def cd_on_shell_body(body, request, mesh_xy, *, dE_ev=None, print_fn=print):
+    """The CD body on the on-shell request -> the SPM/MPA finalize's operand (``gw.ppm_sigma.OnShellSigma``).
+
+    :func:`compute_sigma_c_cd_omega_grid` evaluates Sigma_c(omega) on ``request.frequencies_ry`` (the sorted
+    distinct union of the request's tables, ``gw.sigma_dispatch._compute_mpa_sigma``), so every table entry
+    is a sample of the cube.  The pair and the value slots read the cube at their table's entry, no
+    interpolation (GATE cd_on_shell_lookup).  CD has no exact dSigma/domega: the derivative slot (on the
+    ``pair`` table, where the eqp readers take Z) is the central difference +-dE of the sampled diagonal
+    (``eqp_bgw.Z_FINITE_DIFFERENCE_EV``, BerkeleyGW's finite_difference_spacing), probes linearly
+    interpolated between request frequencies (:func:`cd_linear_on_axis`, the linear rule of
+    ``qsgw_utils.interp_along_omega`` without its omega = 0 fallback: the probes are clamped onto the sampled
+    range) -- ``eqp_bgw.compute_z_factor_from_omega_grid``'s rule on this axis.  NOT the SPM/MPA slot's
+    definition: there it is the exact on-shell derivative of the sweep's quadrature; CD has no derivative
+    accumulator, so its Z is the BerkeleyGW-style secant Z.  Every rank enters (the
+    diagonal read is collective).  Returns ``body`` with ``sigma_c_kij`` the :class:`OnShellSigma`.
+    """
+    from common.collectives import gather_to_host, replicate_to_mesh
+    from gw.eqp_bgw import Z_FINITE_DIFFERENCE_EV
+    from gw.ppm_sigma import OnShellSigma, slots_from_diagonal
+
+    F = np.asarray(body.omega_ry, dtype=np.float64)
+    if not np.array_equal(F, np.asarray(request.frequencies_ry, dtype=np.float64)):
+        raise ValueError(f"GATE cd_on_shell_axis: the CD body holds {F.size} frequencies, the request "
+                         f"{np.asarray(request.frequencies_ry).size}; want: the request's frequencies_ry "
+                         "(omega_grid_ry of the CD call); why: the finalize reads the request's tables")
+    cube = body.sigma_c_kij                                      # [E, nk, nbc, nbc] Ry, P(None, None, 'x', 'y')
+    n_e, nk, nbc = (int(v) for v in cube.shape[:3])
+    tables = np.asarray(request.tables_ry, dtype=np.float64)    # [n_table, nk, nb_logical], Ry from E_F
+    n_table, nk_t, nb = tables.shape
+    if nk_t != nk or nb > nbc or n_e != F.size:
+        raise ValueError(f"GATE cd_on_shell_shape: tables {tables.shape} vs cube {tuple(cube.shape)}")
+    j = np.clip(np.searchsorted(F, tables), 1, max(n_e - 1, 1))
+    idx = np.where(np.abs(F[j - 1] - tables) <= np.abs(F[np.minimum(j, n_e - 1)] - tables), j - 1,
+                   np.minimum(j, n_e - 1))
+    dev = float(np.abs(F[idx] - tables).max(initial=0.0))
+    if dev > CD_ON_SHELL_LOOKUP_RY:
+        raise ValueError(f"GATE cd_on_shell_lookup: a request table entry is {dev:.3e} Ry from every CD frequency; "
+                         f"want: <= {CD_ON_SHELL_LOOKUP_RY:g}; why: the operand reads samples, not interpolants")
+    idx = np.pad(idx, ((0, 0), (0, 0), (0, nbc - nb)))         # padded bands read entry 0, an exact zero there
+    rep = NamedSharding(mesh_xy, P())
+    spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    diag = np.asarray(gather_to_host(jax.jit(lambda c: jnp.diagonal(c, axis1=2, axis2=3),
+                                             out_shardings=rep)(cube)))          # [E, nk, nbc]
+    kk, nn = np.meshgrid(np.arange(nk), np.arange(nbc), indexing="ij")
+    values = diag[idx, kk[None], nn[None]]                      # [n_table, nk, nbc]
+    dE = float(Z_FINITE_DIFFERENCE_EV if dE_ev is None else dE_ev) / float(RYD_TO_EV)
+    e = tables[request.slot("pair")]
+    ep, em = np.clip(e + dE, F[0], F[-1]), np.clip(e - dE, F[0], F[-1])
+    clamped = (ep != e + dE) | (em != e - dE)
+    span = np.where(clamped, ep - em, 2.0 * dE)
+    d_log = diag[:, :, :nb]
+    rise = cd_linear_on_axis(d_log, F, ep) - cd_linear_on_axis(d_log, F, em)
+    deriv = np.where(span > 0.0, rise / np.where(span > 0.0, span, 1.0), 0.0)
+    rows = np.concatenate([values, np.pad(deriv, ((0, 0), (0, nbc - nb)))[None]]).astype(np.complex128)
+    p_y = int(mesh_xy.shape["y"])
+    slots = jax.jit(lambda r: slots_from_diagonal(r, p_y), out_shardings=spec)(replicate_to_mesh(rows, mesh_xy))
+
+    def cd_on_shell_pair(c, i):
+        shape = (1,) + tuple(c.shape[1:])
+        at_m = jnp.take_along_axis(c, jnp.broadcast_to(i[None, :, :, None], shape), axis=0)[0]
+        at_n = jnp.take_along_axis(c, jnp.broadcast_to(i[None, :, None, :], shape), axis=0)[0]
+        return jnp.stack([at_m, at_n])
+    pair = jax.jit(cd_on_shell_pair, out_shardings=spec)(
+        cube, replicate_to_mesh(idx[request.slot("pair")].astype(np.int32), mesh_xy))
+    print_fn(f"  CD on shell: {n_table} table(s) {tuple(request.names)} read at {n_e} CD frequencies (max lookup "
+             f"{dev:.1e} Ry); dSigma/domega by +-{dE * float(RYD_TO_EV):g} eV central difference on them "
+             f"({int(clamped.sum())} of {clamped.size} states clamped at the sampled range)")
+    return dataclasses.replace(body, sigma_c_kij=OnShellSigma(pair=pair, slots=slots, request=request,
+                                                              mesh_xy=mesh_xy))
