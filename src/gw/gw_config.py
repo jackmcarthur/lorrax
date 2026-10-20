@@ -1495,7 +1495,7 @@ _DEFAULTS = {
     # DIFFERENT from the coarse restart/WFN grid, the GENERAL BSE init
     # (``bse_io.load_bse_data_from_restart_sharded``) interpolates the ENTIRE
     # BSE problem — ψ, QP ε (htransform fH), V_Q exchange (vq_interp), and the
-    # W direct term (zero-pad in R) — from the coarse grid onto this fine grid
+    # W direct term (per-pair WS embedding in R) — from the coarse grid onto this fine grid
     # BEFORE any solve, so EVERY BSE solver (exciton_bands / feast / nontda /
     # kpm / resolvent) transparently runs on the fine grid.  Each fine length
     # must be at least the matching coarse length; integer nesting is not

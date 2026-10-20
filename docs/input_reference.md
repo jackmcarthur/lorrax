@@ -21,6 +21,13 @@ parser no longer accepts, or a default cell differs from the code.
 
 The last three sections document other input files: the `[downfold]` deck,
 the TD-aGW `tdgw.toml` and the `[epsmat]` deck.
+`bse.bsemat_cli` adds no deck keys: it reads the producer GW deck named by `-i`
+and takes its own flags ([drivers](drivers.md#bsemat-bsebsemat_cli)). Its
+`--mu-small` is the centroid count of the downfold it runs first: an integer, `kx` =
+k·N_b with N_b = `--n-val` + `--n-cond` (the file's band window, the same set for
+TDA and `--extended`), `auto` (the window Gram's eigenvalue rank at
+`--downfold-rcond`, the largest accepted count) or `off` (the default). It is the
+`[downfold]` deck's `mu_small` with the window fixed to the file's bands.
 
 ## System
 
@@ -413,4 +420,5 @@ and `--print-schema` prints them.
 | `files` | `eps0mat epsmat` | `export`: the files to write. |
 | `rcond` | `1e-8` | Coulomb-whitening cut: eigenvalues of V_q above `rcond`·λ_max are kept (amplification ≤ 1/`rcond`), the cut closed over degenerate multiplets. |
 | `q0_head` | `s_tensor` | ε⁻¹₀₀(q0): `s_tensor`, the direct head 1/(1 − v(q0) q0ᵀSq0) from the bundle's `S_cart_head`; `unscreened` writes 1 (debug). |
-| `q0_body_3d` | `refuse` | `sys_dim = 3` with `eps0mat` in `files`: the q → 0 body lacks the O(1) head–wing term ε_b0 ε_00⁻¹ ε_0b ([theory](theory/bgw_epsmat_export.md#5-q-0)). `refuse` stops before writing (`GATE epsmat_q0_body_3d`); `omit_head_wing` writes that body and records it in the receipt. Slab decks ignore it. |
+| `q0_body_3d` | `refuse` | Only with `q0_wings = zero`: a `sys_dim = 3` `eps0mat` body then lacks the O(1) head–wing term ε_b0 ε_00⁻¹ ε_0b ([theory](theory/bgw_epsmat_export.md#5-q-0)). `refuse` stops before writing (`GATE epsmat_q0_body_3d`); `omit_head_wing` writes that body and records it in the receipt. Slab decks ignore it. |
+| `q0_wings` | `dipole` | The q → 0 wings of `eps0mat` ([theory](theory/bgw_epsmat_export.md#5-q-0), E9–E13). `dipole`: from the bundle's stored ω = 0 head wings `head_wing_L`/`head_wing_R` and `S_cart_head_direct` (written by `gw_jax` since 2026-10-18): local-field head 1/ε_M, both wings, and in 3D the body's head–wing term, so no `q0_body_3d` choice is needed; refuses a bundle without them (`GATE epsmat_q0_wings_source`) and one whose stored head is not their fold through the file's W(Γ) (`GATE epsmat_q0_wing_fold`). `zero`: wings 0 and the head from `S_cart_head` (the file before the wings). |

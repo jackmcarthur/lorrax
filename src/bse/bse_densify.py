@@ -1,11 +1,14 @@
 """Coarse k-grid to fine: the exact interpolation, and the one densifier.
 
-AUTHORITY RULE — coarse to fine is a ZERO-PAD IN REAL SPACE.  Zero-padding the
-R-lattice evaluates the exact band-limited trigonometric polynomial defined by
-the coarse samples on ANY finer uniform grid.  When the grids nest it passes
-through every coarse sample; for a non-divisor target (for example 8→12) it
-passes through the subset of points the two grids share.  When the requested
-grid equals the coarse one the bundle is returned untouched, byte for byte.
+AUTHORITY RULE — coarse to fine is a PER-PAIR WIGNER–SEITZ EMBEDDING IN REAL
+SPACE.  Each centroid pair's coarse R classes go to their images of minimal
+|R + L T + r_μ − r_ν| on the finer R lattice (``common.ws_images``), which
+evaluates a band-limited trigonometric polynomial of the coarse samples on ANY
+finer uniform grid, covariant under every operation that maps the centroid set
+onto itself.  When the grids nest it passes through every coarse sample; for a
+non-divisor target (for example 8→12) it passes through the subset of points
+the two grids share.  When the requested grid equals the coarse one the bundle
+is returned untouched, byte for byte.
 There is exactly one sharded implementation of that densification
 (``make_w_densifier``), the (μ, ν) sharding survives it end to end, and no step
 materialises a replicated N_μ²-class array.
@@ -42,124 +45,113 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import make_kfft_kminor
+from common.ws_images import lattice_bohr, pair_ws_embed, pair_ws_images
 
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_window import PAD_EPS_GUARD_RY
 
 
-def _zeropad_R_axis(x: jax.Array, axis: int, n_fine: int) -> jax.Array:
-    """Spectral zero-pad one real-space (R) axis from a coarse to a fine k-lattice.
-
-    ``x`` is a real-space tensor whose ``axis`` is the R-lattice DUAL to a
-    COARSE BZ axis of length ``n_c = x.shape[axis]`` (i.e. an ``ifft`` over that
-    BZ axis already happened).  We embed the ``n_c`` coarse Fourier coefficients
-    into ``n_fine`` slots so that an ``fft`` back to ``n_fine`` BZ points is the
-    exact band-limited trigonometric interpolant of the coarse ``W(k)``.  The
-    coefficient embedding is defined for every ``n_fine >= n_c``; if the two
-    uniform grids nest it passes through all coarse samples, and otherwise it
-    passes through the points common to both grids.
-
-    Per-element R-lattice index map (the crux).  numpy/JAX FFT order maps array
-    index ``i∈[0,N)`` to the physical lattice-vector rep ``n = fftfreq(N)*N``:
-
-        n = i        for 0 ≤ i < ⌈N/2⌉     (the non-negative reps 0,1,…)
-        n = i − N    for ⌈N/2⌉ ≤ i < N      (the negative reps …,−2,−1, wrapped)
-
-    Embedding coarse→fine with ``s = ⌈n_c/2⌉ = (n_c+1)//2`` non-negative reps:
-
-        coarse i_c ∈ [0, s)      (reps n = 0 … s−1)      → fine i_f = i_c
-        coarse i_c ∈ [s, n_c)    (reps n = −(n_c−s) … −1) → fine i_f = i_c + (n_fine − n_c)
-
-    i.e. the low block keeps its indices, the high (negative-freq) block slides
-    to the TOP of the fine axis, and the gap between them is ZERO (the high-|R|
-    coefficients absent from the coarse cell).  Realised as
-    ``concat([low, zeros, high])`` — the textbook fft zero-insertion.
-
-    Even ``n_c``: the coarse Nyquist coefficient X(−n_c/2) = X(+n_c/2) is SPLIT,
-    weight ½ at both fine reps ±n_c/2.  Coarse samples are unchanged
-    (e^{±iπj} agree there), and the rep set is symmetric under R → −R, so a
-    W(k) Hermitian at every coarse k stays Hermitian at every fine k.  Kept
-    single-sided (weight 1 at −n_c/2) every off-grid tile picks up the
-    antisymmetric i·sin(k n_c/2) X_N term: MoS₂ 6→12 tiles came out 20–63 %
-    non-Hermitian.  Odd ``n_c`` has no Nyquist rep and takes the plain path.
-
-    NOTE: scale is applied ONCE by the caller (``pad_W_R_to_grid``), not here.
-    """
-    n_c = x.shape[axis]
-    if n_fine == n_c:
-        return x
-    if n_fine < n_c:
-        raise ValueError(
-            f"_zeropad_R_axis: fine length {n_fine} must be at least the "
-            f"coarse length {n_c}; spectral zero-padding cannot coarsen an "
-            f"axis.")
-    s = (n_c + 1) // 2
-    lo = jax.lax.slice_in_dim(x, 0, s, axis=axis)
-    hi = jax.lax.slice_in_dim(x, s, n_c, axis=axis)
-    n_gap = n_fine - n_c
-    if n_c % 2 == 0:
-        half = 0.5 * jax.lax.slice_in_dim(x, s, s + 1, axis=axis)
-        lo = jnp.concatenate([lo, half], axis=axis)
-        hi = jnp.concatenate(
-            [half, jax.lax.slice_in_dim(x, s + 1, n_c, axis=axis)], axis=axis)
-        n_gap -= 1
-    zshape = list(x.shape)
-    zshape[axis] = n_gap
-    zeros = jnp.zeros(zshape, dtype=x.dtype)
-    return jnp.concatenate([lo, zeros, hi], axis=axis)
-
-
-def pad_W_R_to_grid(W_R_coarse: jax.Array,
-                    fine_grid: tuple[int, int, int]) -> jax.Array:
-    """Zero-pad a coarse-k-grid real-space ``W_R`` onto a finer k-lattice.
+def pad_W_R_to_grid(W_R_coarse: jax.Array, fine_grid: tuple[int, int, int],
+                    *, embedding: dict | None, sharding=None) -> jax.Array:
+    """Embed a coarse-grid real-space ``W_R`` into a finer R lattice.
 
     Enables a CHEAP coarse-grid W (e.g. GW/W on 6×6) to drive the BSE direct
-    term on an arbitrarily FINE interpolated exciton sampling (e.g. 8×8 W on a
-    12×12 exciton grid): zero-padding in R is EXACT trigonometric interpolation
-    in k.  It agrees with the coarse ``W(k)`` at every k-point common to the two
-    grids (all coarse points when the grids nest).
+    term on a FINE exciton sampling (e.g. 12×12).  The tile
+    ``W_{μν}(R)`` couples ``r_μ + R`` with ``r_ν`` (the full-Bloch gauge of
+    the ISDF centroids), so each centroid pair keeps the images of minimal
+    ``|R + L T + r_μ − r_ν|`` with ``1/N_deg`` (``common.ws_images``,
+    Wannier90's ``use_ws_distance``); a fine ``fftn`` of the result is the
+    covariant trigonometric interpolant of the coarse ``W(k)``, exact at
+    every k common to both grids.
 
     Parameters
     ----------
-    W_R_coarse : (..., ncx, ncy, ncz)
-        Screened interaction on the real-space (R) lattice DUAL to a COARSE BZ
-        grid, i.e. ``ifftn(W_q_coarse, axes=last-3, norm='ortho')``.  Leading
-        axes (μ, ν, spin, …) are carried through untouched; only the trailing
-        three (kx, ky, kz) R-axes are re-embedded.
-    fine_grid : (nfx, nfy, nfz)
-        Target BZ grid.  Each ``nf`` must be at least the matching coarse
-        length; integer nesting is not required.
+    W_R_coarse : (n_mu, n_mu, ncx, ncy, ncz)
+        ``ifftn(W_q_coarse, axes=last-3, norm='ortho')``; μ and ν share the
+        centroid positions of ``embedding['pos']``.
+    fine_grid : (nfx, nfy, nfz), each at least the coarse extent.
+    embedding : the ``common.ws_images.pair_ws_images`` table of the coarse
+        grid (:func:`w_pair_embedding`); may be None only when ``fine_grid``
+        equals the coarse grid.
+    sharding : optional ``NamedSharding`` of the (μ, ν, R) carrier (inside a
+        jit: pins the scan carry and the per-class weights to W's layout).
 
     Returns
     -------
-    W_R_fine : (..., nfx, nfy, nfz)
-        Such that ``fftn(W_R_fine, norm='ortho')`` sampled at the fine BZ points
-        coinciding with the coarse grid equals ``W_q_coarse`` bit-close, i.e.
-        ``W_R_fine == ifftn(W_q_fine_interpolant, norm='ortho')`` — a drop-in for
-        the matvec's ``W_R`` on the FINE grid.
-
-    Scale.  ortho FFTs carry ``1/√N``, and ``N`` grows coarse→fine.  For the
-    fine ``fft`` of the embedded coefficients to reproduce the coarse samples,
-    the padded tensor is multiplied by ``√(∏nf / ∏nc)`` (= 2 for 6×6×1→12×12×1).
-
-    Degenerate ``fine_grid == coarse shape``: returns ``W_R_coarse`` UNCHANGED
-    (exact byte-identical no-op — scale is 1 and no axis is padded).
+    W_R_fine : (n_mu, n_mu, nfx, nfy, nfz), scaled by ``√(∏nf/∏nc)`` so the
+        ortho ``fftn`` reproduces the coarse samples.  ``fine == coarse``
+        returns ``W_R_coarse`` unchanged (byte-identical no-op, any shape).
     """
-    if W_R_coarse.ndim < 3:
-        raise ValueError(
-            f"pad_W_R_to_grid: expected trailing (kx,ky,kz) axes, got ndim="
-            f"{W_R_coarse.ndim}")
-    coarse_grid = tuple(int(s) for s in W_R_coarse.shape[-3:])
-    fine_grid = tuple(int(s) for s in fine_grid)
-    if fine_grid == coarse_grid:
+    coarse = tuple(int(s) for s in W_R_coarse.shape[-3:])
+    fine = tuple(int(s) for s in fine_grid)
+    if fine == coarse:
         return W_R_coarse                         # exact no-op (fast path)
-    out = W_R_coarse
-    for ax, nf in zip((-3, -2, -1), fine_grid):
-        out = _zeropad_R_axis(out, ax, nf)
-    n_c_tot = coarse_grid[0] * coarse_grid[1] * coarse_grid[2]
-    n_f_tot = fine_grid[0] * fine_grid[1] * fine_grid[2]
-    scale = jnp.sqrt(jnp.asarray(n_f_tot / n_c_tot, dtype=out.real.dtype))
-    return out * scale
+    if W_R_coarse.ndim != 5:
+        raise ValueError(
+            f"pad_W_R_to_grid: expected (mu, nu, kx, ky, kz), got shape "
+            f"{tuple(W_R_coarse.shape)}")
+    if embedding is None or tuple(embedding["kgrid"]) != coarse:
+        raise ValueError(
+            f"pad_W_R_to_grid: densifying {coarse} -> {fine} needs the "
+            f"per-pair Wigner-Seitz table of exactly this coarse grid "
+            f"(w_pair_embedding); got "
+            f"{None if embedding is None else tuple(embedding['kgrid'])}.")
+    pin = ((lambda x: jax.lax.with_sharding_constraint(x, sharding))
+           if sharding is not None else None)
+    out = pair_ws_embed(W_R_coarse, embedding, fine, pin=pin)
+    scale = jnp.sqrt(jnp.asarray(np.prod(fine) / np.prod(coarse),
+                                 dtype=W_R_coarse.real.dtype))
+    out = out * scale
+    return out if pin is None else pin(out)
+
+
+def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx, n_mu: int,
+                     n_mu_carrier: int, sys_dim: int, *, restart_file,
+                     log_fn=print) -> dict:
+    """The per-pair Wigner–Seitz table of a W tile's μ axis.
+
+    The positions are the centroid table's FFT points ``idx / N`` (the
+    full-Bloch gauge of every μ-indexed ISDF tile), in tile order: the
+    ordered child rows ``keep_idx`` of a downfolded bundle, else every row
+    (``bse.exciton_bands.resolve_isdf_basis`` resolves both).  Their index
+    digest must match the ``centroids_charge_md5`` receipt ``restart_file``
+    carries (GW and the downfold stamp it over the tile's own rows), so the
+    embedding cannot sit on another run's centroids; a restart without a
+    receipt is not checked, and ``log_fn`` says so in one line.  The table
+    must have exactly the tile's logical ``n_mu`` rows; carrier pad rows up
+    to ``n_mu_carrier`` take the first centroid's position (their tiles are
+    zero).
+    """
+    import h5py
+    from file_io.centroids import load_centroids
+    from file_io.wfn_basis import centroid_table_md5
+    grid = np.asarray(tuple(int(x) for x in wfn.fft_grid), dtype=np.int64)
+    idx = np.asarray(load_centroids(centroids_file, tuple(grid))[1],
+                     dtype=np.int64)
+    if keep_idx is not None:
+        idx = idx[np.asarray(keep_idx, dtype=np.int64)]
+    if idx.shape[0] != int(n_mu):
+        raise ValueError(
+            f"GATE w_pair_centroids: {centroids_file} gives {idx.shape[0]} "
+            f"centroid rows for a W tile of {int(n_mu)} rows; the W "
+            f"densifier would embed the tile on the wrong positions.")
+    with h5py.File(restart_file, "r") as f:
+        receipt = f.attrs.get("centroids_charge_md5")
+    if receipt is not None:
+        receipt = receipt.decode() if isinstance(receipt, bytes) else str(receipt)
+        if receipt != centroid_table_md5(idx):
+            raise ValueError(
+                f"GATE w_pair_centroids: the centroid rows of "
+                f"{centroids_file} are not the μ axis {restart_file} was "
+                f"built on (index digest {centroid_table_md5(idx)} vs "
+                f"receipt {receipt}); the W densifier would embed the tile "
+                f"on the wrong positions.")
+    else:
+        log_fn(f"  w_pair_embedding: {restart_file} carries no "
+               f"centroids_charge_md5 receipt; the centroid rows of "
+               f"{centroids_file} are not checked against the W tile.")
+    return pair_ws_images(coarse_grid, lattice_bohr(wfn), idx / grid[None, :],
+                          int(sys_dim), n_carrier=int(n_mu_carrier))
 
 
 def make_w_densifier(
@@ -168,15 +160,18 @@ def make_w_densifier(
     fine_grid: tuple[int, int, int],
     *,
     output: str = "k",
+    embedding: dict | None = None,
 ):
     """THE coarse→fine W densifier — the ONE sharded implementation.
 
     Returns a jitted ``fn(W_q_coarse) -> W_fine`` that takes a coarse-grid
     ``W_q`` of shape ``(μ, ν, ncx, ncy, ncz)`` sharded as ``w_spec`` (the k
     axes must be replicated in ``w_spec``; only μ/ν may be sharded) and
-    produces the fine-grid W via  ifftn(k→R) → zero-pad R
-    (:func:`pad_W_R_to_grid`, exact trig interpolation) → optionally
-    fftn(R→k):
+    produces the fine-grid W via  ifftn(k→R) → per-pair Wigner–Seitz
+    embedding into the fine R lattice (:func:`pad_W_R_to_grid` with
+    ``embedding`` from :func:`w_pair_embedding`; covariant trig
+    interpolation) → optionally fftn(R→k).  ``embedding`` may be None only
+    for the degenerate ``fine_grid == coarse`` call (plain sharded ifftn):
 
       * ``output='R'`` → ``W_R_fine`` — what the exciton_bands
         ``--w-coarse-grid`` path feeds the matvec directly;
@@ -186,7 +181,7 @@ def make_w_densifier(
 
     SHARDING / SCALING ENVELOPE.  Both transforms are the k-convolution
     router's sharded k-minor factory (:func:`common.fft_helpers.make_kfft_kminor`:
-    nvidia-mathdx on CUDA, the plan route on cpu) and the R-axis zero-pad is traced INSIDE one ``jax.jit`` whose
+    nvidia-mathdx on CUDA, the plan route on cpu) and the per-pair R embedding is traced INSIDE one ``jax.jit`` whose
     ``out_shardings`` pins ``w_spec``, so the (μ,ν) sharding survives end to
     end: per-rank peak stays at the local ``(μ_loc, ν_loc, nk_fine)`` tile.
     No step materializes a replicated N_μ²-class array — the eager
@@ -204,7 +199,9 @@ def make_w_densifier(
     def _densify(W_q_coarse):
         coarse = tuple(int(n) for n in W_q_coarse.shape[-3:])
         _ifftn = make_kfft_kminor(mesh_xy, coarse, w_spec, kind="ifftn", norm="ortho")
-        W_R_fine = pad_W_R_to_grid(_ifftn(W_q_coarse), fine_grid)
+        W_R_fine = pad_W_R_to_grid(
+            _ifftn(W_q_coarse), fine_grid, embedding=embedding,
+            sharding=NamedSharding(mesh_xy, P(*tuple(w_spec)[:2], None)))
         if output == "R":
             return W_R_fine
         return _fftn(W_R_fine)
@@ -1292,7 +1289,7 @@ def _interpolate_bse_data_to_grid(
         and the deck head.  Until 2026-08-09 this path forced the ON branch
         unconditionally, ignoring the key — see the block comment below.
       * W direct ← ``make_w_densifier(output='k')`` — the ONE sharded
-        coarse→fine densifier (shard_map FFTs + jitted R zero-pad, (μ,ν)
+        coarse→fine densifier (shard_map FFTs + jitted per-pair R embedding, (μ,ν)
         sharding preserved end to end); the exciton_bands ``--w-coarse-grid``
         flag runs the SAME factory with ``output='R'``.  ``bse_k_grid`` drives
         it automatically (the banner below is the "W-pad fired" proof).
@@ -1354,7 +1351,7 @@ def _interpolate_bse_data_to_grid(
     log_fn(f"[bse_k_grid] coarse {coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}"
            f" → fine {fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
            f"({nk_f} k-pts); interpolating ψ/ε (htransform), V_Q (vq_interp), "
-           f"W (zero-pad in R)")
+           f"W (per-pair Wigner-Seitz embedding in R)")
 
     params = read_lorrax_input(input_file)
     _distrib_la_batched_route = resolve_distrib_la_batched_route(
@@ -1562,8 +1559,8 @@ def _interpolate_bse_data_to_grid(
                "Set head_minibz_average=true to rebuild with the fine mini-BZ "
                "head instead.")
 
-    # ── W direct: coarse W_q → ifft(R) → zero-pad R → fine → fft back, all
-    # inside the ONE sharded densifier (shard_map FFTs + jitted pad with
+    # ── W direct: coarse W_q → ifft(R) → per-pair WS embedding → fine → fft
+    # back, all inside the ONE sharded densifier (shard_map FFTs + jitted embedding with
     # out_shardings) — the (μ,ν) sharding never drops, so per-rank peak is the
     # local (μ_loc, ν_loc, nk_fine) tile, never a replicated N_μ² array.
     # ``srlr``: the interpolant sees W minus its fitted long-range model
@@ -1582,12 +1579,16 @@ def _interpolate_bse_data_to_grid(
             mesh_xy=mesh_xy, input_file=input_file, log_fn=log_fn)
         W_coarse = _add_rank_lr(W_coarse, A_c, D_c, mesh_xy, -1.0)
     densify_W = make_w_densifier(
-        mesh_xy, P("x", "y", None, None, None), fine_grid, output="k")
+        mesh_xy, P("x", "y", None, None, None), fine_grid, output="k",
+        embedding=w_pair_embedding(coarse_grid, wfn, centroids_path, keep,
+                                   n_rmu, int(W_coarse.shape[0]),
+                                   meta.sys_dim, restart_file=restart_file,
+                                   log_fn=log_fn))
     W_q_fine = densify_W(W_coarse)
     del W_coarse
     if srlr:
         W_q_fine = _add_rank_lr(W_q_fine, A_f, D_f, mesh_xy, 1.0)
-    log_fn(f"[bse_k_grid] W zero-padded in R "
+    log_fn(f"[bse_k_grid] W embedded per centroid pair (Wigner-Seitz) in R "
            f"{coarse_grid[0]}x{coarse_grid[1]}x{coarse_grid[2]}→"
            f"{fine_grid[0]}x{fine_grid[1]}x{fine_grid[2]} "
            f"(exact trig-interp; direct term now on the fine grid)"

@@ -14,8 +14,9 @@ stated twice in that source, identically:
      multiplied by |q|), and the complete body element."
 
 LORRAX's coarse→fine densifier (``bse.bse_io.make_w_densifier``) inverse-FFTs
-``W_q`` to the coarse R-lattice, zero-pads R and FFTs back — exact band-limited
-trigonometric interpolation.  Until this module existed, its operand was the
+``W_q`` to the coarse R-lattice, places each centroid pair's R classes at their
+minimal per-pair Wigner–Seitz images on the fine R-lattice (``common.ws_images``)
+and FFTs back — band-limited trigonometric interpolation.  Until this module existed, its operand was the
 POST-injection tile ``W_body0(q) + Δ·δ_{q,0}``, with
 ``Δ = (whead/Ω)·conj(g₀)⊗g₀`` — a Kronecker delta carrying a ~2600 meV
 geometric prefactor on the Si anchor deck.  A Kronecker delta is the one

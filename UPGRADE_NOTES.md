@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — W densifier: per-centroid-pair Wigner–Seitz embedding
+
+`bse_k_grid` and `exciton_bands --w-coarse-grid` now embed each coarse R class
+of the W tile W_μν(R) at the fine-lattice images R + L·T of minimal
+|R + L·T + r_μ − r_ν|, weight 1/N_deg over ties
+(`bse.bse_densify.pad_W_R_to_grid` through `common.ws_images`). This entry
+supersedes the 2026-10-16 W-densifier entry: the lattice-coordinate box
+(`_zeropad_R_axis`, with its Nyquist split) is gone, because it is not
+covariant under point operations that fold the centroids into the home cell
+non-uniformly (Si 4³→8³ W body: star covariance 0.24–0.28 with the box,
+1.3–1.5 × 10⁻⁷ now). The densifier refuses (`GATE w_pair_centroids`) a
+centroid table that does not match the restart's `centroids_charge_md5`
+receipt or the tile's μ row count.
+
+- **Results.** Every densified run moves and must be recomputed:
+  `bse_k_grid` with a fine grid other than the coarse one and
+  `exciton_bands --w-coarse-grid`, `c1` and `srlr` alike, odd coarse axes
+  included (Si 4³→8³: the W body changes by 19–27 % at the first three
+  off-grid shells). Undensified runs are unchanged. No deck change is needed.
+
 ## 2026-10-19 — screening statistical preparation: CPU references and scope
 
 New small CPU references distinguish correlated Gibbs, isolated adiabatic,

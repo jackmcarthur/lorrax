@@ -152,40 +152,106 @@ orientation on BerkeleyGW's own data) and $\|K_{\text{BGW}}-K\|_2/\|K\|_2$.
 
 ## 5. q → 0
 
-`eps0mat.h5` sits at $q_0$ (`q0_vector`, or the reference file's). Its three
-parts are written differently.
-
-* **Body** (G, G′ ≠ 0): (E6) with $\chi^{\mu}$ and ζ̃ of the bundle's Γ entry,
-  whose V and W carry v(G = 0) = 0, so the body is $(\varepsilon_{bb})^{-1}$,
-  and rows scaled by $v(q_0+G)$, the factor BerkeleyGW's
-  $W=\varepsilon^{-1}v(q_0+G')$ pairs with; W is then Hermitian, and using
-  Γ's χ and ζ̃ at $q_0$ is an O($q_0$) step. In 2D (slab) the body is
-  the q → 0 limit: the head–wing term of the block inverse,
-  $\varepsilon_{b0}\varepsilon_{00}^{-1}\varepsilon_{0b}$, is O(q). In 3D it
-  is O(1) ($v(q)\propto q^{-2}$, $\chi_{0G}\propto q$) and the bundle's body
-  omits it, so a `sys_dim = 3` export of `eps0mat` refuses
-  (`GATE epsmat_q0_body_3d`) unless the deck names the approximation,
-  `q0_body_3d = omit_head_wing`; the receipt then records it. Other
-  `sys_dim` refuse (`GATE epsmat_q0_body_sys_dim`).
-* **Wings**: written 0. They vanish as O(q) in 2D, and BerkeleyGW's Sigma
-  zeroes them at $q_0$ for semiconductor screening under every truncation
-  (`fixwings`).
-* **Head**: the direct (no-local-field) head from the bundle's S tensor
-  ([convention](s-tensor-convention.md)),
+`eps0mat.h5` sits at $q_0$ (`q0_vector`, or the reference file's). In the
+{G = 0, body} partition the dielectric matrix at $q_0$ is
 
 $$
-\varepsilon^{-1}_{00}(q_0) = \frac{1}{1-v(q_0)\,q_0^{\mathsf T}Sq_0},
+\varepsilon=\begin{pmatrix}1-v_0\chi_{00} & -v_0\chi_{0b}\\ -v_b\chi_{b0} & 1-v_b\chi_{bb}\end{pmatrix},
+\qquad v_0=v(q_0)/\Omega,\; v_b=v(q_0+G)/\Omega ,
+\tag{E8a}
+$$
+
+with the body $\chi_{bb}=Z\chi_0^{\mu}Z^\dagger$ of §1 (Γ's ζ̃ and χ, rows at
+$v(q_0+G)$: an O($q_0$) step) and BerkeleyGW's $W=\varepsilon^{-1}v(q_0+G')$.
+The bundle's Γ body has $v(G=0)=0$, so its χ^μ gives $(\varepsilon_{bb})^{-1}$
+and nothing about the head or the wings.
+
+**The wings L.** At q → 0 the G = 0 row and column of the polarizability are
+linear in q. GW forms them where it forms the head (`qsgw_head.head_wings_sharded`,
+the Schur fold's operands) and stores their ω = 0 values beside `S_cart_head`
+(`head_wing_L` (3, N_μ), `head_wing_R` (N_μ, 3), `S_cart_head_direct`):
+
+$$
+\chi_0(0,G)=-\sum_\mu (q\!\cdot\!L)_\mu\,\overline{\tilde\zeta_\mu(G)},\qquad
+\chi_0(G,0)=-\sum_\mu \tilde\zeta_\mu(G)\,(Rq)_\mu,\qquad
+\chi_{00}=\Omega\,q^{\mathsf T}S_{\rm d}\,q,
+$$
+$$
+L_{a\mu}=\sum_{k,c,v}\overline{v^a_{cv,k}}\;\frac{4}{N_k n_s n_{\rm spinor}\,\Delta E_{cvk}^2}\;
+\psi^*_{ck}(r_\mu)\psi_{vk}(r_\mu),\qquad R=L^\dagger\ (\omega=0),
+\tag{E9}
+$$
+
+q Cartesian in 1/bohr, $v$ the velocity (with the V_NL commutator) that builds
+$S$. Replacing the centroid pair product by the density jet $D=v/\Delta E$
+gives $L=-\Omega S_{\rm d}$: the identity that fixes $g$ and the conjugation
+(`tests/test_epsmat_q0_wing_cpu.py`, with a red twin). The stored head is the
+fold $S_{\rm eff}=S_{\rm d}+L\,W(\Gamma)\,R/\Omega$ (`head_correction = full`,
+`head_source = head_schur`), which no overall sign of L can change. The sign
+of the q-linear G = 0 density against ζ̃'s Fourier convention — the minus in
+the first two relations — is fixed on BerkeleyGW's own eps0mat: with the
+opposite sign every wing entry of Si 4³ (centrosymmetric) and MoS₂ 9×9 (not)
+is −1.0000 × BerkeleyGW's (residual 1.4e-3 on the MoS₂ row wing), and the
+conjugated assignment fails (residual 1).
+
+Write $\omega=-Rq_0$, $\tilde\omega=-q_0\!\cdot\!L$ and, with the export's Γ
+factors $V$, $\chi^{\mu}=BKB^\dagger$ and $W=V+V\chi^{\mu}V$,
+
+$$
+u=(1+\chi^{\mu}V)\,\omega,\qquad \tilde u^{\mathsf T}=\tilde\omega^{\mathsf T}(1+V\chi^{\mu}).
+\tag{E10}
+$$
+
+Block inversion of (E8a), using $\varepsilon_{bb}^{-1}=1+v_bZ\chi^{\mu}Z^\dagger$ and
+$Z^\dagger v_bZ=V$, gives every piece from μ-space vectors:
+
+$$
+\varepsilon^{-1}_{00}=\frac1{\varepsilon_M},\qquad
+\varepsilon_M=1-v_0\big(\chi_{00}+\tilde\omega^{\mathsf T}W\omega\big)
+=1-v(q_0)\,q_0^{\mathsf T}S_{\rm eff}\,q_0 ,
+\tag{E11}
+$$
+$$
+\varepsilon^{-1}(G,0)=\frac{v_b(G)\,[Zu](G)}{\varepsilon_M},\qquad
+\varepsilon^{-1}(0,G')=\frac{v_0}{\varepsilon_M}\,[\tilde u^{\mathsf T}Z^\dagger](G'),
+\tag{E12}
+$$
+$$
+\varepsilon^{-1}_{bb}-1=v_b\,Z\big(\chi^{\mu}+c\,u\tilde u^{\mathsf T}\big)Z^\dagger,\qquad c=\frac{v_0}{\varepsilon_M}.
+\tag{E13}
+$$
+
+(E11) is the local-field head, $1/(\varepsilon_{00}-\varepsilon_{0b}\varepsilon_{bb}^{-1}\varepsilon_{b0})$;
+(E13) is $\varepsilon_{bb}^{-1}+\varepsilon_{bb}^{-1}\varepsilon_{b0}\,\varepsilon^{-1}_{00}\,\varepsilon_{0b}\varepsilon_{bb}^{-1}$,
+the same as $(\varepsilon_{bb}-\varepsilon_{b0}\varepsilon_{00}^{-1}\varepsilon_{0b})^{-1}$.
+Orders in $q_0$: $v_0\propto q_0^{-2}$ (3D) or $q_0^{-1}$ (slab), $u,\tilde u\propto q_0$, so the
+column wing is O($q_0$), the row wing O($q_0^{-1}$) in 3D and O(1) in a slab, and the body
+term $c\,u\tilde u^{\mathsf T}$ is O(1) in 3D and O($q_0$) in a slab. Every step is a face
+mat-vec or an elementwise face program, O($N_\mu^2/P$) per $q_0$ (`epsmat_export.q0_dipole_terms`).
+
+`q0_wings` selects the file:
+
+* **`dipole`** (default): head (E11), wings (E12), body (E13). GATE
+  `epsmat_q0_wing_fold` re-forms the fold with the FILE's W(Γ) and refuses
+  unless $\Omega q_0^{\mathsf T}(S_{\rm eff}-S_{\rm d})q_0=\tilde\omega^{\mathsf T}W\omega$
+  to 1e-3 of the fold term, which certifies L's μ order and normalisation where
+  they are consumed. A bundle without stored wings refuses
+  (`epsmat_q0_wings_source`): rerun its GW on this branch, or set `zero`.
+* **`zero`**: today's file before the wings. Wings 0; head
+$$
+\varepsilon^{-1}_{00}(q_0)=\frac{1}{1-v(q_0)\,q_0^{\mathsf T}Sq_0}
 \tag{E8}
 $$
+  from the stored `S_cart_head` ($v(q_0)$ the truncated $8\pi/|q_0|^2$ in Ry bohr³,
+  without 1/Ω). With a `head_schur` bundle $S=S_{\rm eff}$ and (E8) already IS the
+  local-field head (E11); with `head_correction = no_local_fields` it is the direct
+  head. The body is $(\varepsilon_{bb})^{-1}$: in 2D the q → 0 limit, in 3D missing
+  the O(1) term of (E13), so a `sys_dim = 3` export refuses (`GATE epsmat_q0_body_3d`)
+  unless `q0_body_3d = omit_head_wing`. `q0_head = unscreened` writes 1.
 
-  with $v(q_0)$ the truncated $8\pi/|q_0|^2$ in Ry bohr³, without 1/Ω: the
-  owner's pointwise head (`gw.head_densify`) divided by the bare $v(q_0)$.
-  Dividing v by Ω weakens the head by Ω; on CrI3 6×6 that gives
-  $1-\varepsilon^{-1}_{00}=2.6\times10^{-6}$ against BerkeleyGW's
-  $1.6\times10^{-2}$. BerkeleyGW's head includes local fields; the bundle's `head_correction` says which head
-  LORRAX had (`no_local_fields` on CrI3 6×6). Sigma rebuilds its q → 0 head
-  from this $\varepsilon^{-1}_{00}(q_0)$, so (E8) is what reaches Σ.
-  `q0_head = unscreened` writes 1.
+Scope: L is the q → 0 object only — the eps0mat wings, the local-field head and the
+3-D q0 body here, and the k = k′ (q = 0) blocks of a BSE kernel file. Head, wing and
+body of W at q ≠ 0 come from the stored V, W and ζ̃ alone and need no L.
 
 ## 6. Comparing with BerkeleyGW's own ε⁻¹
 
@@ -265,4 +331,4 @@ to 1.5 × 10⁻¹⁴.
 ## 9. Not exported
 
 * A frequency axis (`freq_dep` 2 or 3): the bundle holds W(0) only.
-* Symmetry-rotated q (§7) and the local-field head (§5).
+* Symmetry-rotated q (§7).

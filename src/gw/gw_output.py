@@ -401,6 +401,7 @@ def persist_w0_and_head(
     static_head_only: bool = False,
     static_head_sample=None,
     photon_response=None,
+    head_wings=None,
     print_fn=print,
 ):
     """Persist W0_qmunu + q=0 head scalars to the ISDF restart file.
@@ -460,6 +461,14 @@ def persist_w0_and_head(
     packed-photon producer uses it with ``static_head_only`` because its
     screened Gamma completion is embedded in CC: the additional screened
     scalar is zero, while the bare scalar still completes the bare GW body.
+
+    ``head_wings`` (``qsgw_head.static_head_wings_host``) adds the ω = 0
+    direct head tensor and the two ISDF wings (3 × N_μ each,
+    ``file_io.write_head_wings_to_h5``), the q → 0 data a consumer needs to
+    rebuild the long-wavelength block of ε⁻¹ from the stored body alone.
+    Written only beside the head it produced: a run whose persisted head is
+    not the one-shot direct response's fold (an iteration head, a supplied
+    static receipt) passes ``None``.
 
     ``iteration_head`` is the QSGW map's resolved head sample set.  When it is
     present it is the sole source of the persisted head scalars; the DFT-basis
@@ -652,6 +661,18 @@ def persist_w0_and_head(
                 getattr(head_static, "response_kind", None)),
             head_source=head_static.source,
         )
+    if head_wings is not None and iteration_head is None and static_head_sample is None:
+        from file_io import write_head_wings_to_h5
+        L, R = head_wings["L"], head_wings["R"]
+        mu_basis = getattr(meta, "mu_basis", None)
+        if mu_basis is not None:
+            # Files keep the canonical centroid order (as W0 above).
+            L, R = mu_basis.unpack_host(L, axis=1), mu_basis.unpack_host(R, axis=0)
+        with _tmg.section("persist_w0.write_head_wings"):
+            write_head_wings_to_h5(tensors_filename, S_direct=head_wings["S_direct"],
+                                   L=L, R=R, n_mu_logical=int(meta.n_rmu))
+        print_fn(f"  Persisted q=0 head wings: head_wing_L/R (3 x {int(meta.n_rmu)}), "
+                 f"S_cart_head_direct (docs/theory/bgw_epsmat_export.md E9)")
     print_fn(
         f"  Persisted W0_qmunu + q=0 head scalars: "
         f"vhead={head_static.vc0.real:.3f} a.u.,  "

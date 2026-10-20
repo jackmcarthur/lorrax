@@ -1,8 +1,8 @@
 # Long-range W densification (SR/LR)
 
 `bse_k_grid` evaluates the static W on a fine q grid from its coarse-grid
-tiles by trigonometric interpolation (zero-padding in R,
-`bse.bse_densify.make_w_densifier`). The interpolant is exact on the coarse
+tiles by trigonometric interpolation (the per-centroid-pair Wigner–Seitz
+embedding in R, `bse.bse_densify.make_w_densifier`). The interpolant is exact on the coarse
 points and accurate where W is analytic in q. Near Γ it is not: the screened
 head goes as $v/\varepsilon$ ($1/q^2$ in bulk), and the slab-truncated kernel
 $v(\mathbf K)=\frac{8\pi}{K^2}\big(1-e^{-z_c K_\parallel}\cos K_z z_c\big)$ is
