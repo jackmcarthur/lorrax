@@ -12,7 +12,13 @@ and reproduce a GN-PPM run at t = 0 (§6.1). The collision wiring and earlier
 population-based shared-pole refreshes are described below; the corrected
 column-sampled MGKBA split is specified in §1.5. The full-density snapshot
 modules implement general lesser/greater bubbles, a reduced rational Keldysh
-interaction, and a converged material/coherent-self-energy update. Their
+interaction, and a converged material/coherent-self-energy update. The
+`retarded_reference` choice instead builds only the full-density retarded
+response and uses an explicitly equilibrium-like pole-branch self-energy
+[reference](#retarded-reference). The
+explicit `lossless_bath` alternative uses secular screening statistics with
+full-density electronic lines, as specified in the
+[transition-bath prescription](#lossless-transition-bath). Their
 finite rank, support, regulator and refresh approximations are explicit. The
 equation of motion, integrators and layout are owned by
 [TD-aGW propagation](td_agw_propagation.md); the frozen-W kernel by
@@ -736,8 +742,12 @@ vertex 2.24 s per sweep.
 
 #### Full-matrix nonequilibrium screening {#keldysh-screening}
 
-`collision_screening = joint` constructs the full-density snapshot bubbles
-and the general response/noise realization described below.
+`collision_screening = joint` constructs the snapshot interaction.
+With `collision_statistics = finite_lag` this uses the full-density bubbles
+and general response/noise realization described below; `retarded_reference`
+uses their full-density retarded difference with an equilibrium-like
+self-energy reference; `lossless_bath`
+selects the separate [secular transition-bath prescription](#lossless-transition-bath).
 `joint_frozen` uses the identical reduced equilibrium interaction throughout
 the run, providing a matched screening control. The passive GW shared-pole
 constructor retains its original contracts, owned by
@@ -836,12 +846,14 @@ leave an unintended density-dependent term.
 The separate controls are density rank, rational order/support count,
 fit-support height, collision regularization, and the declared exponential
 finite lag decay of the lag kernels (historical key `collision_adiabatic_ev`).
-Active `joint` and `joint_frozen` propagation requires explicit
-`collision_statistics = "finite_lag"`; the default `unspecified` refuses
-before GW setup. This selection acknowledges a statistical model, not a
-validated physical adiabatic limit. Screened equilibrium FDT is known not
-to hold in general, even when this decay tends to zero. Lossless collective
-initial statistics/physical adiabatic switch-on are not implemented.
+Active `joint` and `joint_frozen` propagation requires an explicit
+`collision_statistics` selection; the default `unspecified` refuses before
+GW setup. `finite_lag` acknowledges the earlier statistical model, not a
+validated physical adiabatic limit. Its screened equilibrium FDT is known
+not to hold in general, even when this decay tends to zero. The separate
+`lossless_bath` choice below declares collective statistics directly; it
+does not implement physical adiabatic preparation of arbitrary coherent
+states.
 
 An exact scalar counterexample needs no rational fit. Take zero-temperature
 bare transition functions
@@ -1070,12 +1082,292 @@ frequency-only screening algebra. An endpoint collision can instead integrate
 the anchored $\Sigma^{</>}(T,T-\tau)$ directly with its column phases; its
 finite internal window and numerical representation still need validation.
 
-Thus the production statistical guard remains in force. The new CPU
-references establish a corrected thermal RPA target and reject two tempting
-but incorrect completions; they do not certify a full-coherence,
-nonequilibrium rho-only statistical closure. Bosonic covariance positivity
+These references do not certify a full-coherence, nonequilibrium rho-only
+statistical closure. The explicitly secular screening approximation below
+provides a narrower implementation choice. Bosonic covariance positivity
 and the separate nonsecular electronic collision positivity problem must
 both be assessed before interpreting damping in a propagated trajectory.
+
+##### Retarded-only equilibrium reference {#retarded-reference}
+
+`collision_statistics = "retarded_reference"` is an explicitly approximate
+equilibrium-like GW member. At each instantaneous Hamiltonian snapshot it
+uses the complete density matrix in the ordered retarded bubble
+$P^R=\bar P^>-\bar P^<$ and screens
+$W^R=(I-P^R)^{-1}$ in projected Coulomb coordinates. Only this response is
+fitted and independently checked. Screening does not pinch the density.
+The input response has the declared finite lag decay
+`collision_adiabatic_ev`; collision evaluation uses its separate $\eta$.
+
+For the causal pole expansion $W_c^R(z)=\sum_\ell R_\ell/(z-p_\ell)$,
+the self-energy uses the zero-temperature reference branches
+
+$$
+B^-_\ell=-\theta(-\operatorname{Re}p_\ell)R_\ell,\qquad
+B^+_\ell=\theta(\operatorname{Re}p_\ell)R_\ell,\qquad
+\theta(0)=\tfrac12.
+$$
+
+Thus the internal hole line carries $\rho_{mn}B^-_\ell$ and the particle
+line $(I-\rho)_{mn}B^+_\ell$, each with denominator
+$E_b-e_n-p_\ell+i\eta$ at external column $b$. The complete complex
+matrices enter Eq. (8): the Hermitian part contributes to the instantaneous
+Hamiltonian, and the anti-Hermitian/injection terms define the collision.
+No diagonal-density, diagonal-self-energy or real-self-energy replacement
+is made. For a usual equilibrium pair of poles $\pm\Omega$ with residues
+$\pm R$, these are the standard empty-boson particle/hole GW branches.
+
+This branch choice is a reference ansatz for computing $\Sigma$ from
+$W^R$, not a reconstruction of exact nonequilibrium lesser fluctuations.
+There is no independent noise fit, bath-temperature solve, FDT test or
+noise-positivity admission gate. Signed and complex residues are retained.
+Fluctuations absent from the retarded response are intentionally absent
+from this approximation: for example, $P^R=0$ gives $W_c^R=0$ and no
+correlation self-energy from this member, even when fractional occupations
+would carry noise in a fuller nonequilibrium treatment. Hartree/Fock and
+the electronic lines still use the full density.
+
+The retarded fit must reproduce held-out response samples. Its bare
+polarization retains the declared lower-half-plane transition poles.
+Causality of the feedback response does not require BIBO stability: a
+positive-lag kernel may grow as $e^{\operatorname{Im}p_\ell\tau}$.
+For this reference member, the self-energy integral is admitted only when
+$\eta>\max_\ell\operatorname{Im}p_\ell$, so its explicit
+$e^{-\eta\tau}$ factor makes the integral converge. Receipts report the
+growth bound and positive evaluation-height margin; poles are never moved.
+Supports interpreted as Laplace samples must also lie above this growth
+bound. This finite-memory prescription does not assert a stationary
+Fourier spectrum for a growing response. Distinct
+q/$-q$ responses are paired algebraically, and self-inverse-q polarization
+fits obey their crossing relation before Dyson feedback. The symmetric
+zero-frequency branch convention preserves this pairing. Frozen and
+updated controls use the same reference branch rule. Number drift and
+Pauli bounds remain measured properties of the electronic propagation;
+this approximation makes no general complete-positivity claim. The
+separate nonequilibrium statistical constructions below remain research
+alternatives and are not prerequisites for this reference calculation.
+
+##### Lossless transition-bath prescription {#lossless-transition-bath}
+
+`collision_statistics = "lossless_bath"` declares a stationary, lossless
+screening bath at each snapshot. This is an additional approximation: only
+the **screening** density is pinched into the instantaneous Hamiltonian's
+spectral subspaces,
+
+$$
+\rho^{\rm bath}=\sum_E\Pi_E\rho\Pi_E.
+$$
+
+Within an exactly degenerate subspace it may be diagonalized without
+changing the Hamiltonian; off-diagonal entries between different energies
+are excluded from both response and statistical screening. The propagated
+density, Hartree/Fock update, internal electronic lines and column-sampled
+MGKBA collision retain the full density matrix. This is therefore not a
+repair that preserves the earlier arbitrary-coherence screening bubble.
+The discarded norm must be reported so its size can be compared with the
+frozen/updated screening difference. Screening occupations outside $[0,1]$
+by at most $10^{-12}$ are bounded only to make their logarithms well defined;
+the correction is recorded, and larger violations refuse. This numerical
+domain correction does not modify the propagated density or establish
+electronic Pauli bounds.
+
+For each ordered transition $j=(k,b; k-q,d)$, write
+$e_j=E_{bk}-E_{d,k-q}$, $d_j=f_{d,k-q}-f_{bk}$, and let $v_j$ denote its
+projected Coulomb vertex, including the square root of the k/spin weight.
+The screening bath resolves transition gaps only to $10^{-12}$ Ry:
+$\bar e_j=0$ when $|e_j|\le10^{-12}$ Ry, and $\bar e_j=e_j$ otherwise.
+This is a declared statistical approximation, so a tiny computed splitting
+does not silently select an infinite positive or negative transition
+temperature. Receipts record the count and maximum gap adjustment.
+Hamiltonian and electronic self-energy energies are unchanged; held-out
+response checks still compare the final bank with the original gaps.
+For resolved nonzero gaps the lossless projected polarization and pair
+temperature are
+
+$$
+P_f^R(z)=\sum_{j:\bar e_j\ne0}\frac{d_jv_jv_j^\dagger}{z-\bar e_j},\qquad
+\beta_j=\frac1{\bar e_j}\log\frac{(1-f_{bk})f_{d,k-q}}
+ {f_{bk}(1-f_{d,k-q})}.
+$$
+
+The occupations specify **transition reservoir** temperatures, not a single
+temperature fitted to the density. For populations that are Fermi--Dirac
+on the resolved screening spectrum, all finite-gap $\beta_j=\beta$ and
+degenerate levels have equal populations. Arbitrary occupation differences
+at original tiny gaps are not such a thermal state after gap resolution.
+Inverted transitions retain negative $\beta_j$ and gain.
+The latter is a finite-level transition prescription, not a thermal state
+of an unbounded boson at negative temperature.
+
+Let the screened correlation response have distinct nonzero real poles
+$\lambda$ and Hermitian residues $R_\lambda$. The lesser and greater
+residues are prescribed by
+
+$$
+L_\lambda=R_\lambda S_\lambda R_\lambda,\qquad
+G_\lambda=L_\lambda+R_\lambda,\qquad
+S_{\lambda,f}=\sum_{j:\bar e_j\ne0}\frac{d_j n_B(\beta_j\lambda)}
+ {(\lambda-\bar e_j)^2}v_jv_j^\dagger. \tag{8f}
+$$
+
+For a bath with only resolved finite-gap transitions,
+$S_\lambda=S_{\lambda,f}$; the degenerate-reservoir term is specified below.
+
+This is the weak colored-transition-bath pole prescription. For an
+isolated collective pole it follows by giving the input transitions a
+common small width $\gamma$: the off-resonant source is
+$2\gamma S_\lambda+o(\gamma)$, and the dressed squared pole yields
+$2\gamma R_\lambda S_\lambda R_\lambda/
+[(\omega-\lambda)^2+\gamma^2]$. The declaration takes this pole limit
+before evaluating the electronic collision. It does not assert that the
+finite-width input source is positive for arbitrary complex vertices or
+that a finite-width rational bank obeys exact frequency-by-frequency FDT.
+
+Thermal correctness is a matrix identity. The residue of Dyson feedback
+satisfies
+
+$$
+R_\lambda[-\partial_zP^R(\lambda)]R_\lambda=R_\lambda.
+$$
+
+Consequently a common $\beta$ on the resolved screening model gives
+$L_\lambda=n_B(\beta\lambda)R_\lambda$ and
+$G_\lambda=[n_B(\beta\lambda)+1]R_\lambda$ for the **screened** poles.
+At zero temperature the positive-frequency lesser residues vanish,
+including the scalar example that gives the spurious $0.0107233047034$
+weight with bare Lorentzian noise. This is a lossless residue KMS/FDT
+statement. A subsequently applied collision evaluation width is a
+separate approximation. `collision_adiabatic_ev` does not enter this
+lossless bank and is recorded as unused; the collision evaluation uses its
+own declared regularization.
+
+The production reduction must preserve that same identity. On a signed
+transition branch, take $s=\operatorname{sign}d_j$,
+$C_j=\sqrt{|d_j|}v_j^\dagger$, an orthonormal Krylov basis $Q$ for the
+diagonal transition energies, $D_Q=Q^\dagger DQ$ and $C_Q=Q^\dagger C$.
+The reduced response is
+$sC_Q^\dagger(z-D_Q)^{-1}C_Q$. Its bath source is projected on the
+**same** subspace:
+
+$$
+S_{\lambda,Q}=sC_Q^\dagger(\lambda-D_Q)^{-1}
+ Q^\dagger\operatorname{diag}[n_B(\beta_j\lambda)]Q
+ (\lambda-D_Q)^{-1}C_Q.
+$$
+
+Using the unreduced transition derivative with approximate screened poles
+would break thermal normalization. This signed Hermitian reduction keeps
+bare poles real; screening stability is checked after feedback. Arbitrary
+complex poles may not be projected onto the real axis.
+
+An optional preliminary Galerkin projection groups transitions into energy
+bins before the Krylov stage. For a rank-one branch with coupling $c_j$,
+the normalized vector in a bin is $Q_j=c_j/\sqrt{\sum|c_j|^2}$, its energy
+is $\sum|c_j|^2e_j/\sum|c_j|^2$, and its colored occupation at a collective
+pole is $\sum|c_j|^2 n_B(\beta_j\lambda)/\sum|c_j|^2$.
+Averaging $\beta_j$ before applying $n_B$ would change the prescription.
+For a matrix coupling, the local orthonormal basis projects the energy,
+coupling and the full matrix $Q^\dagger\operatorname{diag}(n_B)Q$.
+Composing this projection with Krylov preserves the same-subspace thermal
+identity and avoids an all-transition by final-order basis. Held-out
+microscopic response checks certify the complete projection, including
+the binning approximation.
+
+Equal occupations are handled before division: as $f_b,f_d\to f$,
+$d_j n_B(\beta_j\lambda)\to f(1-f)e_j/\lambda$. Transitions with
+$d_j=0$ therefore require their own noise representation. They contribute
+this continuous limit to $S_\lambda$ **and** carry bare-pole noise. For a
+noise-only spectral residue $F_e=\sum_{j:e_j=e}f(1-f)v_jv_j^\dagger$,
+the latter has screened lesser and greater residue
+$W^R(e)F_eW^R(e)^\dagger$. These are separate peak families of the weak
+limit, so keeping only one loses fluctuations. In particular, when
+$\rho=fI$, $W_c^R=0$ while both noise channels survive. A collective pole
+coincident with a coupled noise-only bare pole can make this limit
+singular; it needs an explicit collision/coincidence gate rather than a
+small denominator replacement.
+
+Resolved zero gaps have two explicitly different statistical preparations.
+Writing $a_j=f_{bk}(1-f_{d,k-q})$, aggregate them as
+
+$$
+D_0=\sum_{\bar e_j=0}d_jv_jv_j^\dagger,\qquad
+N_{\rm res}=\sum_{\bar e_j=0,\ d_j\ne0}a_jv_jv_j^\dagger,\qquad
+N_{\rm static}=\sum_{\bar e_j=0,\ d_j=0}f_j(1-f_j)v_jv_j^\dagger.
+$$
+
+The response is $P^R=P_f^R+D_0/z$. Unequal-population degenerate
+transitions are declared weak shot-noise reservoirs: their lesser input
+has $2\gamma a_jv_jv_j^\dagger/(\omega^2+\gamma^2)$, with greater
+coefficient $a_j+d_j=(1-f_{bk})f_{d,k-q}$. Both coefficients are
+nonnegative, and the commutator is preserved. Their nonzero collective
+lesser contribution is $R_\lambda N_{\rm res}R_\lambda/\lambda^2$;
+thus $S_\lambda=S_{\lambda,f}+N_{\rm res}/\lambda^2$.
+This preparation does not infer a temperature by dividing by a zero gap.
+
+Equal-population zero-gap transitions instead retain **exactly static**
+Wick covariance, a literal zero-frequency noise pole. They have no
+collective-tail contribution. Treating this static covariance as the
+previous weak Lorentzian reservoir would add such tails and break finite-T
+thermal residue KMS. The two preparations are distinguished before taking
+limits; the zero-gap, equal-population and weak-width limits do not commute.
+For a thermal state of the resolved model there are no unequal-population
+zero-gap channels, so the common-$\beta$ screened-pole KMS result remains
+valid, including its zero-temperature limit.
+
+To retain zero-frequency noise after response cancellations, let the
+columns of $N$ span $\ker D_0$. The zero-frequency screened limit is the
+Schur-complement expression
+
+$$
+W_0=N[N^\dagger(I-P_f^R(0))N]^{-1}N^\dagger,\qquad
+L_0=G_0=W_0(N_{\rm res}+N_{\rm static})W_0^\dagger.
+$$
+
+For full-rank $D_0$, $W_0=0$. For $D_0=0$, this retains ordinary screened
+static noise even when individual response contributions cancel. Signed
+eigenfactors of the aggregate $D_0$ supply its response; keeping separate
+canceling zero-transition realizations would create spurious dark/Jordan
+states. A singular restricted inverse or a genuine unresolved collective
+zero mode refuses. The reported numerical rank tolerance only removes
+certified roundoff of the aggregate response.
+
+Each admitted pole bank must pass full-matrix lesser/greater residue,
+component identity and q/$-q$ reciprocity checks, including retained
+noise-only poles. Under the paired transition map
+$(e,d,v)\mapsto(-e,-d,v^*)$, $\beta$ is unchanged and
+$n_B(-x)=-1-n_B(x)$. Thus
+$R_{-q,-\lambda}=-R_{q,\lambda}^*$ and
+$S_{-q,-\lambda}=[S_{q,\lambda}-\partial_zP_q^R(\lambda)]^*$
+give $L_{-q,-\lambda}=G_{q,\lambda}^*$. A reduced calculation needs
+paired subspaces or an independent check of this identity; separate
+accurate response fits alone do not establish noise reciprocity.
+The degenerate reservoir has the same crossing because reversing a
+transition sends $d\mapsto-d$ and $a\mapsto a+d$.
+The runtime derives one member of a distinct q/$-q$ pair algebraically
+from the representative and checks its response against the actual partner
+transitions. At a self-inverse q, it explicitly averages the screened bank
+with its crossing partner:
+
+$$
+W_{c,s}=\tfrac12(W_c-\mathcal M W_c),\qquad
+\bar W_s^<=\tfrac12[\bar W^<+\mathcal M(W_c+\bar W^<)],\qquad
+\mathcal M X(z)=-\operatorname{conj}X(-\operatorname{conj}z).
+$$
+
+This is a convex mixture of two paired screened bath approximations.
+It preserves positive lesser/greater residue matrices and thermal residue
+KMS by linearity, and enforces crossing exactly. Its final response need
+not be the Dyson response of the original compressed polarization; the
+actual microscopic held-out response check is therefore repeated on the
+mixed bank. Derivative normalization refers to its constituent reduced
+Dyson banks, not a claimed single-polarization identity for the mixture.
+Nonthermal baths are not automatically positive after
+the projection; $L_\lambda\succeq0$ and $G_\lambda\succeq0$ must be
+checked, and unstable or unresolved poles refused. These bath checks do
+not prove positivity of the nonsecular electronic collision operator.
+The electronic number residual, both gain/loss boundary matrices and
+the propagated density eigenvalues remain independent acceptance checks;
+no clipping or Pauli-bound guarantee is implied.
 
 `snapshot_collision.q_sigma_operators` evaluates the same ISDF
 product in projected vertices, with column energy $E_b$ and internal phase

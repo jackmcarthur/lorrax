@@ -53,6 +53,14 @@ def rational_factors(system, *, condition_limit=1e10, tolerance=1e-7):
     if A.shape[0] == 0:
         return dict(poles=np.empty(0, complex), left=np.empty((C.shape[0], 0), complex),
                     right=np.empty((0, B.shape[1]), complex), condition=1.0, residual=0.0)
+    # A canonical pole bank already IS its eigenbasis. Preserve all repeated
+    # states/residues exactly, avoiding cubic solves at every collision eta.
+    # This is an exact structural test, not a small-offdiagonal approximation.
+    poles = np.diag(A).copy()
+    if np.count_nonzero(A) == np.count_nonzero(poles):
+        if not all(np.isfinite(x).all() for x in (A, B, C, D)):
+            raise ValueError("GATE td_snapshot_sigma_poles: non-finite pole bank")
+        return dict(poles=poles, left=C, right=B, condition=1.0, residual=0.0)
     poles, vectors = sla.eig(A)
     condition = float(np.linalg.cond(vectors))
     if not np.isfinite(condition) or condition > condition_limit:

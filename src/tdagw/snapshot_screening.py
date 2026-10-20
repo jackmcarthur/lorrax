@@ -7,10 +7,13 @@ operators are ``F WcR F.H`` and ``F Wless F.H``.  Electronic bands are
 never truncated by this projection.  Frozen bands enter through their
 diagonal occupations in the same full density matrix as the active block.
 
-Finite complex supports are used, with a common full-block Loewner
+The finite-lag model uses finite complex supports, with a common full-block Loewner
 realization of the stacked one-sided ``[P<; P>]``.  No frequency integral,
 passive residue constraint, or dense all-transition state space is used.
 The fit is admitted only after independent full-matrix sample checks.
+The separate lossless transition-bath model explicitly pinches the screening
+density and uses signed Hermitian Galerkin/Krylov response reduction with
+same-subspace statistical weights and algebraically paired q/−q banks.
 """
 
 from __future__ import annotations
@@ -664,3 +667,503 @@ def screen_snapshot_partner(representative, sampler, check_sites, *, fit_toleran
                    lesser_tail=wl[2] @ wl[1])
     return {"retarded": wr, "correlation": wc, "lesser": wl,
             "polarization_lesser": pl, "polarization_greater": pg, "receipt": receipt}
+
+
+def retarded_reference_snapshot(sampler, fit_sites, check_sites, *, max_order=48,
+                                fit_tolerance=0.02, max_pencil_bytes=128 * 1024**2,
+                                representative=None, self_negative=False, collision_eta=0.0):
+    """Fit only full-density retarded screening and assign reference branches.
+
+    ``sampler(sites)`` supplies ordered [P<,P>] in reduced Coulomb
+    coordinates, but ONLY their difference PR enters the fit, checks, and
+    retarded Dyson equation. The lesser array returned for the existing
+    Sigma executor is the equilibrium-style T=0 frequency branch of WR,
+    with no independent fluctuation fit or noise/PSD acceptance gate.
+    Frozen and updated modes can therefore use precisely the same
+    retarded approximation while retaining full rho in electronic lines.
+    Supports and pole frequencies use Ry; the sampler owns its explicitly
+    declared positive response lag decay, independent of collision eta.
+    A growing theta(t) response is admitted only when both the declared
+    collision_eta and every Laplace sample height exceed its pole growth.
+    """
+    fit_sites, check_sites = (np.asarray(x, complex) for x in (fit_sites, check_sites))
+    if (fit_sites.ndim != 1 or check_sites.ndim != 1 or fit_sites.size < 4
+            or not check_sites.size or not np.isfinite(fit_sites).all()
+            or not np.isfinite(check_sites).all() or np.any(fit_sites.imag <= 0)
+            or np.any(check_sites.imag <= 0) or np.intersect1d(fit_sites, check_sites).size
+            or not np.isfinite(fit_tolerance) or fit_tolerance <= 0):
+        raise ValueError("GATE snapshot_check_support: positive disjoint retarded fit/check supports required")
+    exact_channels = np.asarray(sampler(check_sites))
+    exact = exact_channels[1] - exact_channels[0]
+    rank = exact.shape[-1]
+    fit = None
+    if representative is None:
+        channels = np.asarray(sampler(fit_sites))
+        target = channels[1] - channels[0]
+        fit = joint_loewner(fit_sites, np.stack((np.zeros_like(target), target)),
+            max_order=max_order, max_pencil_bytes=max_pencil_bytes)
+        pr = fit["greater"]
+        if self_negative:
+            pr = kr.scale(kr.add(pr, kr.scale(mirror(pr), -1.0)), 0.5)
+            pr = compact_causal_realization(pr, check_sites)
+        wr = kr.screen_retarded(pr, np.eye(rank))
+        wc = (*wr[:3], np.zeros((rank, rank), complex))
+        # Bound the retarded/branch/common-Sigma dense work before modal
+        # allocation; each pole receives one state, not rank states.
+        n = wc[0].shape[0]
+        dense_bytes = 16 * (8 * n**2 + 16 * n * rank)
+        if dense_bytes > max_pencil_bytes:
+            raise ValueError("GATE snapshot_reference_workspace: retarded/branch union exceeds max_pencil_bytes")
+        branches = kr.retarded_reference_branches(wc, evaluation_height=collision_eta)
+        wc, wl = branches["correlation"], branches["lesser"]
+        wr = (*wc[:3], np.eye(rank, dtype=complex))
+    else:
+        pr = kr.scale(mirror(representative["polarization_retarded"]), -1.0)
+        wc = kr.scale(mirror(representative["correlation"]), -1.0)
+        wr = (*wc[:3], np.eye(rank, dtype=complex))
+        # The symmetric frequency branch rule commutes with crossing.
+        branches = kr.retarded_reference_branches(wc, evaluation_height=collision_eta)
+        wc, wl = branches["correlation"], branches["lesser"]
+        wr = (*wc[:3], np.eye(rank, dtype=complex))
+    growth = branches["maximum_pole_growth"]
+    support_margin = float(min(np.min(fit_sites.imag), np.min(check_sites.imag)) - growth)
+    if support_margin <= 1e-12:
+        raise ValueError(f"GATE snapshot_reference_support_height: Laplace supports must exceed "
+                         f"retarded pole growth {growth:.9g}; margin={support_margin:.3e}")
+    approximate = np.stack([kr.evaluate(pr, z) for z in check_sites])
+    bubble_error = _relative_error(approximate, exact)
+    expected_w = np.stack([np.linalg.solve(np.eye(rank) - p, np.eye(rank)) - np.eye(rank)
+                           for p in exact])
+    screened_error = _relative_error(np.stack([kr.evaluate(wc, z) for z in check_sites]), expected_w)
+    training_error = float(fit["refit_error"]) if fit is not None else 0.0
+    if max(bubble_error, screened_error, training_error) > fit_tolerance:
+        raise ValueError(f"GATE snapshot_reference_fit: bubble={bubble_error:.3e}, "
+                         f"response={screened_error:.3e}, train={training_error:.3e}; "
+                         f"tolerance={fit_tolerance:.3e}")
+    inherited = representative["receipt"] if representative is not None else {}
+    receipt = dict(inherited, density_rank=rank, fit_order=pr[0].shape[0],
+        projection_order=wc[0].shape[0] + wl[0].shape[0], bubble_check_error=bubble_error,
+        screening_check_error=screened_error, noise_check_error=0.0,
+        fit_tolerance=float(fit_tolerance), training_refit_error=training_error,
+        fit_method="retarded_only_loewner_vacuum_reference", noise_check_kind="not_applicable_retarded_reference",
+        screening_density_approximation="full_matrix_ordered_snapshot",
+        noise_approximation="no_independent_noise_retarded_T0_reference_branches",
+        lag_decay_used=True, derived_by_crossing=representative is not None,
+        self_negative_crossing=bool(self_negative),
+        reference_zero_frequency_count=branches["zero_frequency_count"],
+        reference_signed_gain_pole_count=branches["signed_gain_pole_count"],
+        reference_complex_residue_pole_count=branches["complex_residue_pole_count"],
+        reference_maximum_pole_growth_ry=growth,
+        reference_collision_eta_ry=branches["evaluation_height"],
+        reference_laplace_margin_ry=branches["laplace_margin"],
+        reference_support_margin_ry=support_margin,
+        reference_modal_condition=branches["condition"],
+        reference_modal_error=branches["reconstruction_error"],
+        retarded_poles_ry=branches["poles"], lesser_order=wl[0].shape[0],
+        fit_pencil_shape=tuple(fit["pencil_shape"]) if fit is not None else inherited.get("fit_pencil_shape"),
+        fit_pencil_bytes=int(fit["pencil_bytes"]) if fit is not None else inherited.get("fit_pencil_bytes"))
+    return dict(retarded=wr, correlation=wc, lesser=wl, polarization_retarded=pr, receipt=receipt)
+
+
+def _lossless_bath_projection(energy, coupling, sites, order, budget):
+    """Project a diagonal transition Hamiltonian on an orthonormal Krylov basis."""
+    n, rank = coupling.shape
+    bin_index, bin_weights = None, None
+    original_count = n
+    # A preliminary disjoint-bin Galerkin space bounds host work for the
+    # production rank-one case. Its local vector is the normalized coupling,
+    # its Hamiltonian is the coupling-weighted mean energy, and its bath
+    # averages Bose WEIGHTS at the queried collective frequency, never beta.
+    # Both reductions are subsequently checked against original transitions.
+    bin_count = max(256, 16 * int(order))
+    if rank == 1 and n > 2 * bin_count and np.ptp(energy) > 0:
+        raw_index = np.minimum(((energy - energy.min()) / np.ptp(energy)
+                               * bin_count).astype(int), bin_count - 1)
+        weight = abs(coupling[:, 0]) ** 2
+        sums = np.bincount(raw_index, weights=weight, minlength=bin_count)
+        live = sums > 0
+        mapping = np.cumsum(live) - 1
+        bin_index = mapping[raw_index]
+        bin_weights = weight / sums[raw_index]
+        energy = (np.bincount(raw_index, weights=weight * energy,
+                              minlength=bin_count) / np.where(live, sums, 1))[live]
+        coupling = np.sqrt(sums[live])[:, None].astype(complex)
+        n = energy.size
+    capacity = min(n, int(order))
+    required = 16 * n * (capacity + 4 * rank) + (16 * original_count if bin_index is not None else 0)
+    if required > budget:
+        raise ValueError(f"GATE snapshot_bath_workspace: {required} bytes exceeds {budget}; "
+                         "increase max_pencil_bytes or reduce max_order")
+    basis = np.empty((n, capacity), complex)
+    used, candidate = 0, coupling
+    sorted_sites = np.asarray(sites)[np.argsort(np.asarray(sites).real)]
+    shifts = sorted_sites[np.linspace(0, sorted_sites.size - 1, capacity, dtype=int)]
+    while used < capacity:
+        for _ in range(2):
+            if used:
+                candidate -= basis[:, :used] @ (basis[:, :used].conj().T @ candidate)
+        q, singular, _ = sla.svd(candidate, full_matrices=False)
+        live = singular > max(float(np.max(singular, initial=0.0)) * 1e-12,
+                              np.linalg.norm(coupling) * 1e-14)
+        q = q[:, live][:, :capacity - used]
+        if not q.shape[1]:
+            break
+        basis[:, used:used + q.shape[1]] = q
+        used += q.shape[1]
+        shift = shifts[(used // max(rank, 1)) % shifts.size]
+        candidate = q / (energy[:, None] - shift)
+    basis = basis[:, :used]
+    h = basis.conj().T @ (energy[:, None] * basis)
+    h = 0.5 * (h + h.conj().T)
+    c = basis.conj().T @ coupling
+    return dict(h=h, c=c, basis=basis, energy=energy, workspace_bytes=required,
+                bin_index=bin_index, bin_weights=bin_weights,
+                original_transition_count=original_count, projected_transition_count=n)
+
+
+def _bath_bose(beta, frequency):
+    """Evaluate Bose weights with explicit zero-temperature signed limits."""
+    argument = beta * frequency
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        result = 1.0 / np.expm1(argument)
+    result = np.where(argument > 700, 0.0, result)
+    result = np.where(argument < -700, -1.0, result)
+    if not np.isfinite(result).all():
+        raise ValueError("GATE snapshot_bath_temperature: unresolved zero pair temperature")
+    return result
+
+
+def _lossless_response_check(correlation, energy, difference, vertices, sites):
+    """Compare reduced Dyson response with independent microscopic samples."""
+    rank = vertices.shape[1]
+    exact, approximate = [], []
+    for z in sites:
+        p = np.einsum("j,jr,js->rs", difference / (z - energy),
+                      vertices, vertices.conj(), optimize=True)
+        exact.append(np.linalg.solve(np.eye(rank) - p, np.eye(rank)) - np.eye(rank))
+        approximate.append(kr.evaluate(correlation, z))
+    return _relative_error(np.asarray(approximate), np.asarray(exact))
+
+
+def _lossless_dense_workspace(n_response, n_noise, rank, *, self_negative,
+                              basis_bytes, feedback_order, budget):
+    """Bound canonical banks and their downstream common-union allocation."""
+    nc = rank * n_response * (2 if self_negative else 1)
+    nl = rank * ((3 * n_response + 2 * n_noise) if self_negative
+                 else (2 * n_response + n_noise))
+    # Include a reciprocal partner's larger lesser union, the final Sigma
+    # union, construction copies, and small feedback/metric work arrays.
+    dense_bytes = 16 * (2 * nc**2 + 2 * nl**2 + (nc + nl)**2
+                        + 4 * feedback_order**2 + 8 * rank * (nc + nl))
+    required = int(basis_bytes + dense_bytes)
+    if required > int(budget):
+        raise ValueError(f"GATE snapshot_bath_dense_workspace: {required} bytes exceeds {budget}; "
+                         "reduce density rank/order or increase max_pencil_bytes")
+    return required
+
+
+def lossless_bath_snapshot(vertices, energy, density, partner, fit_sites, check_sites, *,
+                           spin_weight=1.0, max_order=48, fit_tolerance=0.02,
+                           max_pencil_bytes=128 * 1024 ** 2, representative=None,
+                           self_negative=False):
+    """Construct a secular lossless colored-bath RPA screening approximation.
+
+    All inputs are replicated host arrays for ONE q: vertices [k,b,d,r],
+    energies [k,b] in Ry, and full density [k,b,b]. Screening explicitly
+    pinches density between distinct energy eigenspaces; coherences inside
+    exactly degenerate blocks are diagonalized with their vertices. The
+    electronic self-energy must continue to use the original full density.
+
+    A signed Hermitian rational Krylov projection replaces the transition
+    Hamiltonian, and the colored bath is projected on the SAME subspace.
+    Collective lesser residues are R S_beta R. Independent zero-response
+    noise supplies both collective tails and its dressed bare poles.
+    Gaps within the declared 1e-12 Ry screening resolution use an aggregated static
+    Wick transition reservoir, with collective tails and a bare-zero
+    nullspace remnant. Equal-population zero-gap noise is a separate exact
+    static delta contribution and has no collective tails. Nonzero gaps,
+    above that resolution retain their frequency-dependent colored bath weights.
+    Exact thermal KMS refers to the resolved screening Hamiltonian. The
+    response check still uses original electronic gaps, and Sigma phases
+    retain the original energies.
+    Real poles use only the subsequent electronic collision eta; no lag
+    decay, real-frequency grid, or positive-residue clipping is used.
+    """
+    T, energy, rho = (np.asarray(x) for x in (vertices, energy, density))
+    fit_sites, check_sites = (np.asarray(x, complex) for x in (fit_sites, check_sites))
+    if (fit_sites.ndim != 1 or check_sites.ndim != 1 or not fit_sites.size or not check_sites.size
+            or not np.isfinite(fit_sites).all() or not np.isfinite(check_sites).all()
+            or np.any(fit_sites.imag <= 0) or np.any(check_sites.imag <= 0)
+            or np.intersect1d(fit_sites, check_sites).size
+            or not np.isfinite(fit_tolerance) or fit_tolerance <= 0):
+        raise ValueError("GATE snapshot_check_support: positive disjoint bath fit/check supports required")
+    partner = np.asarray(partner, int)
+    nk, nb = energy.shape
+    rank = T.shape[-1]
+    if (T.shape[:3] != (nk, nb, nb) or rho.shape != (nk, nb, nb)
+            or partner.shape != (nk,) or not np.array_equal(np.sort(partner), np.arange(nk))
+            or max_order < 2 or not np.isfinite(T).all() or not np.isfinite(energy).all()
+            or not np.isfinite(rho).all()
+            or np.max(abs(rho - rho.conj().transpose(0, 2, 1))) > 1e-10):
+        raise ValueError("GATE snapshot_bath_input: incompatible transition tables")
+    # Exact degeneracy is a gauge freedom. Rotate only within those blocks,
+    # then discard matrix entries between different frozen energy values.
+    rotations = np.broadcast_to(np.eye(nb, dtype=complex), rho.shape).copy()
+    pinched = rho * (abs(energy[:, :, None] - energy[:, None, :]) <= 1e-12)
+    discarded_coherence = float(np.linalg.norm(rho - pinched))
+    f = np.real(np.diagonal(rho, axis1=-2, axis2=-1)).copy()
+    for k in range(nk):
+        remaining = set(range(nb))
+        while remaining:
+            first = min(remaining)
+            block = np.flatnonzero(abs(energy[k] - energy[k, first]) <= 1e-12)
+            remaining.difference_update(block.tolist())
+            if block.size > 1:
+                values, vectors = sla.eigh(rho[k][np.ix_(block, block)])
+                rotations[k][np.ix_(block, block)] = vectors
+                f[k, block] = values
+    if np.any(f < -1e-12) or np.any(f > 1 + 1e-12):
+        raise ValueError("GATE snapshot_bath_density: screening populations outside [0,1]")
+    bounded_f = np.minimum(1.0, np.maximum(0.0, f))
+    population_roundoff = float(np.max(abs(bounded_f - f)))
+    f = bounded_f
+    T = np.einsum("kab,kacr->kbcr", rotations, T, optimize=True)
+    T = np.einsum("kdcr,kce->kder", T, rotations[partner].conj(), optimize=True)
+    e = (energy[:, :, None] - energy[partner, None, :]).reshape(-1)
+    fb = np.broadcast_to(f[:, :, None], (nk, nb, nb)).reshape(-1)
+    fd = np.broadcast_to(f[partner, None, :], (nk, nb, nb)).reshape(-1)
+    d = fd - fb
+    v = T.reshape(-1, rank) * np.sqrt(float(spin_weight) / nk)
+    vertex_live = np.linalg.norm(v, axis=1) > 0
+    original_e = e
+    gap_resolution = 1e-12
+    resolved_zero = abs(original_e) <= gap_resolution
+    gap_adjustment = float(np.max(abs(original_e[resolved_zero & vertex_live]), initial=0.0))
+    projected_gap_count = int(np.count_nonzero(resolved_zero & (original_e != 0) & vertex_live))
+    e = np.where(resolved_zero, 0.0, original_e)
+    if representative is not None:
+        n_response = representative["correlation"][0].shape[0] // rank
+        n_noise = representative["lesser"][0].shape[0] // rank - n_response
+        dense_workspace_bytes = _lossless_dense_workspace(n_response, n_noise, rank,
+            self_negative=False, basis_bytes=0, feedback_order=0, budget=max_pencil_bytes)
+        wr = kr.scale(mirror(representative["retarded"]), -1.0)
+        wc = kr.scale(mirror(representative["correlation"]), -1.0)
+        wl = mirror(kr.add(representative["correlation"], representative["lesser"]))
+        error = _lossless_response_check(wc, original_e, d, v, check_sites)
+        if error > fit_tolerance:
+            raise ValueError(f"GATE snapshot_bath_partner_fit: response={error:.3e} "
+                             f"exceeds {fit_tolerance:.3e}")
+        receipt = dict(representative["receipt"], derived_by_crossing=True,
+            self_negative_crossing=False, bubble_check_error=error,
+            screening_check_error=error, discarded_screening_coherence_norm=discarded_coherence,
+            lesser_order=wl[0].shape[0], screening_population_roundoff_correction=population_roundoff,
+            dense_workspace_bytes=dense_workspace_bytes,
+            screening_gap_resolution_ry=gap_resolution,
+            screening_gap_projection_count=projected_gap_count,
+            maximum_screening_gap_adjustment_ry=gap_adjustment,
+            final_screened_model="reciprocal_partner_of_projected_bath")
+        return dict(retarded=wr, correlation=wc, lesser=wl, receipt=receipt)
+    scale = max(float(np.ptp(energy)), 1.0)
+    static = (e == 0) & vertex_live
+    static_response = np.einsum("j,jr,js->rs", d[static], v[static], v[static].conj(), optimize=True)
+    static_reservoir = static & (d != 0)
+    static_exact = static & (d == 0)
+    static_noise = np.einsum("j,jr,js->rs", fb[static_reservoir] * (1 - fd[static_reservoir]),
+                             v[static_reservoir], v[static_reservoir].conj(), optimize=True)
+    static_exact_noise = np.einsum("j,jr,js->rs", fb[static_exact] * (1 - fd[static_exact]),
+                                   v[static_exact], v[static_exact].conj(), optimize=True)
+    static_response = 0.5 * (static_response + static_response.conj().T)
+    static_noise = 0.5 * (static_noise + static_noise.conj().T)
+    static_total_noise = static_noise + static_exact_noise
+    static_absolute_response = np.einsum("j,jr,js->rs", abs(d[static]),
+        v[static], v[static].conj(), optimize=True)
+    static_values, static_vectors = sla.eigh(static_response)
+    static_scale = max(np.linalg.norm(static_absolute_response), 1e-300)
+    static_roundoff = 64 * np.finfo(float).eps * static_scale
+    static_live = abs(static_values) > static_roundoff
+    static_null = static_vectors[:, ~static_live]
+    static_rank_error = float(np.linalg.norm(static_values[~static_live]) / static_scale)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        beta = (np.log1p(d / fb) + np.log1p(d / (1 - fd))) / e
+    branches = []
+    order = max(1, int(max_order) // 2)
+    for sign in (1, -1):
+        live = (d * sign > 0) & vertex_live & ~static
+        if not np.any(live):
+            continue
+        branch = _lossless_bath_projection(e[live], np.sqrt(abs(d[live]))[:, None] * v[live].conj(),
+            fit_sites, order, int(max_pencil_bytes) - sum(b["workspace_bytes"] for b in branches))
+        branch.update(sign=sign, beta=beta[live])
+        choices = (np.inf, -np.inf, branch["beta"][0])
+        baseline = max(choices, key=lambda value: np.count_nonzero(branch["beta"] == value))
+        branch.update(baseline_beta=baseline, exceptional_beta=branch["beta"] != baseline)
+        branches.append(branch)
+    zero = (d == 0) & (fb > 0) & (fb < 1) & vertex_live & ~static
+    noise = None
+    if np.any(zero):
+        noise = _lossless_bath_projection(e[zero], np.sqrt(fb[zero] * (1 - fb[zero]))[:, None]
+            * v[zero].conj(), fit_sites, int(max_order), int(max_pencil_bytes)
+            - sum(b["workspace_bytes"] for b in branches))
+    for sign in (1, -1):
+        live = static_live & (static_values * sign > 0)
+        if not np.any(live):
+            continue
+        count = int(np.count_nonzero(live))
+        c = np.sqrt(abs(static_values[live]))[:, None] * static_vectors[:, live].conj().T
+        branches.append(dict(h=np.zeros((count, count), complex), c=c, sign=sign,
+            static_aggregate=True, workspace_bytes=16 * (count**2 + count * rank),
+            original_transition_count=int(np.count_nonzero(static)), projected_transition_count=count))
+    planned_basis_bytes = sum(b["workspace_bytes"] for b in branches) + (noise["workspace_bytes"] if noise else 0)
+    planned_feedback_order = sum(b["h"].shape[0] for b in branches)
+    planned_noise_count = (noise["h"].shape[0] if noise else 0) + int(
+        bool(np.any(static_total_noise) and static_null.shape[1]))
+    _lossless_dense_workspace(planned_feedback_order, planned_noise_count, rank,
+        self_negative=self_negative, basis_bytes=planned_basis_bytes,
+        feedback_order=planned_feedback_order, budget=max_pencil_bytes)
+    if branches:
+        A = sla.block_diag(*(b["h"] for b in branches))
+        B = np.vstack([b["c"] for b in branches])
+        C = np.hstack([b["sign"] * b["c"].conj().T for b in branches])
+        pr = (A, B, C, np.zeros((rank, rank), complex))
+    else:
+        pr = kr.pole_residue_realization([], np.zeros((0, rank, rank)))
+    wr = kr.screen_retarded(pr, np.eye(rank))
+    metric = sla.block_diag(*(b["sign"] * np.eye(b["h"].shape[0]) for b in branches)) if branches else None
+    poles, residues, transition_factors = kr.lossless_residues(wr, metric=metric,
+                                                            transition_factors=True)
+    basis_bytes = sum(b["workspace_bytes"] for b in branches) + (noise["workspace_bytes"] if noise else 0)
+    static_bare_noise = bool(np.any(static_total_noise) and static_null.shape[1])
+    noise_count = (noise["h"].shape[0] if noise else 0) + int(static_bare_noise)
+    dense_workspace_bytes = _lossless_dense_workspace(len(poles), noise_count, rank,
+        self_negative=self_negative, basis_bytes=basis_bytes, feedback_order=pr[0].shape[0],
+        budget=max_pencil_bytes)
+    wc = kr.pole_residue_realization(poles, residues)
+    wr = (*wc[:3], np.eye(rank, dtype=complex))
+    # Independent exact upper-half-plane response checks certify projection.
+    error = _lossless_response_check(wc, original_e, d, v, check_sites)
+    if error > fit_tolerance:
+        raise ValueError(f"GATE snapshot_bath_fit: response={error:.3e} exceeds {fit_tolerance:.3e}; "
+                         "increase max_order or supports")
+    lesser = []
+    minimum, normalization_error = 0.0, 0.0
+    for pole, residue, transition in zip(poles, residues, transition_factors):
+        if abs(pole) < 1e-10 * scale:
+            raise ValueError("GATE snapshot_bath_zero_mode: collective zero mode unresolved")
+        value = np.zeros((rank, rank), complex)
+        derivative = np.zeros_like(value)
+        offset = 0
+        for b in branches:
+            stop = offset + b["h"].shape[0]
+            reduced = transition[offset:stop]
+            offset = stop
+            norm = reduced.conj().T @ reduced
+            derivative += b["sign"] * norm
+            if b.get("static_aggregate", False):
+                continue
+            baseline = float(_bath_bose(np.asarray(b["baseline_beta"]), pole))
+            value += b["sign"] * baseline * norm
+            exceptional = b["exceptional_beta"]
+            if np.any(exceptional):
+                weight = _bath_bose(b["beta"][exceptional], pole) - baseline
+                if b["bin_index"] is None:
+                    g = b["basis"][exceptional] @ reduced
+                else:
+                    weight = np.bincount(b["bin_index"][exceptional],
+                        weights=b["bin_weights"][exceptional] * weight,
+                        minlength=b["projected_transition_count"])
+                    g = b["basis"] @ reduced
+                value += b["sign"] * g.conj().T @ (weight[:, None] * g)
+        value += residue @ static_noise @ residue / pole**2
+        normalization_error = max(normalization_error,
+            _relative_error(derivative, residue))
+        if normalization_error > 1e-6:
+            raise ValueError("GATE snapshot_bath_normalization: collective derivative normalization failed")
+        if noise is not None:
+            h, c = noise["h"], noise["c"]
+            if np.min(abs(pole - sla.eigvalsh(h))) < 1e-10 * scale:
+                raise ValueError("GATE snapshot_bath_coincidence: collective and noise poles coincide")
+            g = sla.solve(pole * np.eye(h.shape[0]) - h, c)
+            value += residue @ (g.conj().T @ (h @ g) / pole) @ residue
+        value = 0.5 * (value + value.conj().T)
+        for component in (value, value + residue):
+            eig = sla.eigvalsh(component)
+            minimum = min(minimum, float(eig[0]))
+            if eig[0] < -1e-8 * max(np.linalg.norm(component), np.linalg.norm(residue), 1e-30):
+                raise ValueError("GATE snapshot_bath_noise_psd: negative lesser/greater collective residue")
+        lesser.append(value)
+    lesser_poles = list(poles)
+    if static_bare_noise:
+        finite_p0 = np.zeros((rank, rank), complex)
+        for b in branches:
+            if b.get("static_aggregate", False):
+                continue
+            if np.linalg.cond(b["h"]) > 1e12:
+                raise ValueError("GATE snapshot_bath_zero_limit: unresolved finite-gap response at zero")
+            finite_p0 += b["sign"] * b["c"].conj().T @ sla.solve(-b["h"], b["c"])
+        restricted = static_null.conj().T @ (np.eye(rank) - finite_p0) @ static_null
+        if np.linalg.cond(restricted) > 1e12:
+            raise ValueError("GATE snapshot_bath_zero_limit: singular zero-gap nullspace screening")
+        w0 = static_null @ sla.solve(restricted, static_null.conj().T)
+        lesser_poles.append(0.0)
+        lesser.append(w0 @ static_total_noise @ w0.conj().T)
+    if noise is not None:
+        values, vectors = sla.eigh(noise["h"])
+        outputs = noise["c"].conj().T @ vectors
+        for pole, output in zip(values, outputs.T):
+            if poles.size and np.min(abs(poles - pole)) < 1e-10 * scale:
+                raise ValueError("GATE snapshot_bath_coincidence: independent noise and collective poles coincide")
+            dressed = kr.evaluate(wr, pole) @ output
+            lesser_poles.append(float(pole))
+            lesser.append(np.outer(dressed, dressed.conj()))
+    wl = kr.pole_residue_realization(np.asarray(lesser_poles),
+        np.asarray(lesser).reshape(-1, rank, rank))
+    # A self-inverse q uses the convex mixture of a projected bath and its
+    # reciprocal partner. This final screened-model reduction preserves
+    # noise PSD/KMS and enforces crossing exactly, even at finite order.
+    if self_negative:
+        lp = np.asarray(lesser_poles)
+        lr = np.asarray(lesser).reshape(-1, rank, rank)
+        wc = kr.pole_residue_realization(np.concatenate((poles, -poles)),
+            0.5 * np.concatenate((residues, -residues.conj())))
+        wl = kr.pole_residue_realization(np.concatenate((lp, -lp, -poles)),
+            0.5 * np.concatenate((lr, lr.conj(), residues.conj())))
+        wr = (*wc[:3], np.eye(rank, dtype=complex))
+        error = _lossless_response_check(wc, original_e, d, v, check_sites)
+        if error > fit_tolerance:
+            raise ValueError(f"GATE snapshot_bath_self_crossing_fit: response={error:.3e} "
+                             f"exceeds {fit_tolerance:.3e}")
+    receipt = dict(density_rank=rank, fit_order=pr[0].shape[0],
+        projection_order=wc[0].shape[0] + wl[0].shape[0], bubble_check_error=error,
+        screening_check_error=error, noise_check_error=normalization_error,
+        fit_tolerance=float(fit_tolerance), fit_method="lossless_hermitian_rational_krylov_bath",
+        training_refit_error=0.0, fit_pencil_shape=(0, 0),
+        fit_pencil_bytes=basis_bytes, dense_workspace_bytes=dense_workspace_bytes,
+        preliminary_transition_projection="rank_one_disjoint_energy_bin_Galerkin",
+        original_transition_counts=[b["original_transition_count"] for b in branches],
+        projected_transition_counts=[b["projected_transition_count"] for b in branches],
+        screening_density_approximation="spectral_pinching_in_instantaneous_H",
+        discarded_screening_coherence_norm=discarded_coherence,
+        screening_population_roundoff_correction=population_roundoff,
+        noise_approximation="same_subspace_weak_colored_bath",
+        noise_check_kind="collective_lesser_greater_residue_psd",
+        minimum_noise_residue=minimum, lag_decay_used=False,
+        collective_normalization_error=normalization_error, zero_gap_noise="static_wick",
+        zero_gap_statistics="aggregated_static_Wick_transition_reservoir",
+        zero_gap_transition_count=int(np.count_nonzero(static)),
+        zero_gap_unequal_population_count=int(np.count_nonzero(static & (d != 0))),
+        zero_gap_equal_population_static_count=int(np.count_nonzero(static_exact)),
+        zero_gap_response_rank=int(np.count_nonzero(static_live)),
+        zero_gap_response_roundoff_residual=static_rank_error,
+        zero_gap_discarded_roundoff_response_norm=float(np.linalg.norm(static_values[~static_live])),
+        near_zero_unequal_population_count=int(np.count_nonzero(vertex_live & (d != 0)
+            & (original_e != 0) & resolved_zero)),
+        minimum_nonzero_transition_gap_ry=float(np.min(abs(original_e[vertex_live & (original_e != 0)]), initial=np.inf)),
+        screening_gap_resolution_ry=gap_resolution,
+        screening_gap_projection_count=projected_gap_count,
+        maximum_screening_gap_adjustment_ry=gap_adjustment,
+        retarded_poles_ry=np.concatenate((poles, -poles)) if self_negative else poles,
+        lesser_order=wl[0].shape[0], noise_only_poles_allowed=True,
+        self_negative_crossing=bool(self_negative),
+        final_screened_model=("selfnegative_screened_model_convex_crossing" if self_negative
+                              else "projected_transition_Dyson"))
+    return dict(retarded=wr, correlation=wc, lesser=wl, receipt=receipt)

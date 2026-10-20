@@ -373,7 +373,8 @@ def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkey
 
 
 @pytest.mark.parametrize("with_head", [False, True])
-def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head):
+@pytest.mark.parametrize("statistics", ["finite_lag", "lossless_bath", "retarded_reference"])
+def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head, statistics):
     from common.units import RYD_TO_EV
     from tdagw import collision as C
     from tdagw import propagate as tp
@@ -403,7 +404,7 @@ def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head):
     ops = Ops(jax.device_put(np.asarray(source["wfns"].enk)[:, 1:3] * RYD_TO_EV / HA_IN_EV, spec2),
               jax.device_put(rhoeq, spec3), jax.device_put(np.full(4, 0.25), spec1))
     model = zero_model()
-    options = dict(statistics="finite_lag", density_rank=1, max_order=48, fit_samples=192, fit_tolerance=2e-3,
+    options = dict(statistics=statistics, density_rank=1, max_order=48, fit_samples=192, fit_tolerance=2e-3,
                    adiabatic_ev=0.15, fit_height_ev=0.3, policy=C.RefreshPolicy(every=1.0),
                    # Isolate the coupled HF/Sigma runtime from adaptive
                    # rational fit order changes: both consume the identical
@@ -419,9 +420,19 @@ def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head):
     assert built["state"]["history"][-1]["snapshot"]["iterations"] == 1
     assert len(built["state"]["basis_last"]) == 1
     assert all(row["screening_s"] >= 0.0 for row in built["t0"]["q_receipts"])
-    assert built["t0"]["statistics"] == "finite_lag"
-    assert built["t0"]["screened_equilibrium_fdt"] == "known_not_generally_satisfied"
-    assert built["state"]["history"][-1]["physical_lossless_statistics"] == "not_implemented"
+    assert built["t0"]["statistics"] == statistics
+    if statistics == "finite_lag":
+        assert built["t0"]["screened_equilibrium_fdt"] == "known_not_generally_satisfied"
+        assert built["state"]["history"][-1]["physical_lossless_statistics"] == "not_implemented"
+    elif statistics == "lossless_bath":
+        assert built["t0"]["screened_equilibrium_fdt"] == "same_subspace_residue_KMS"
+        assert built["state"]["history"][-1]["screening_density_approximation"] == (
+            "spectral_pinching_in_instantaneous_H")
+        assert all(not row["lag_decay_used"] for row in built["t0"]["q_receipts"])
+    else:
+        assert built["t0"]["screened_equilibrium_fdt"] == "not_a_nonequilibrium_statistics_claim"
+        assert built["state"]["history"][-1]["screening_density_approximation"] == (
+            "full_matrix_ordered_snapshot")
     if not with_head:
         excited = rhoeq[None].copy()
         excited[..., 0, 0], excited[..., 1, 1] = 0.9, 0.1

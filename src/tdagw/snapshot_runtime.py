@@ -368,7 +368,18 @@ def make_snapshot_evaluator(prepared, options):
             partner = prepared["kmq"][iq]
             T = rotate_pair_vertices(T, U, partner, active)
             t_project = time.perf_counter()
-            if equilibrium or mode == "joint":
+            if (equilibrium or mode == "joint") and options.get("statistics") == "lossless_bath":
+                negative = int(prepared["q_negative"][iq])
+                screen = SS.lossless_bath_snapshot(T[:, :n_chi, :n_chi],
+                    energy[:, :n_chi], density[:, :n_chi, :n_chi], partner,
+                    fit_sites, check_sites, spin_weight=prepared["spin_weight"],
+                    max_order=int(options.get("max_order", 48)),
+                    fit_tolerance=float(options.get("fit_tolerance", 0.02)),
+                    max_pencil_bytes=int(options.get("max_pencil_bytes", 128 * 1024 ** 2)),
+                    representative=current_screens.get(negative) if negative < iq else None,
+                    self_negative=negative == iq)
+                current_screens[iq] = screen
+            elif equilibrium or mode == "joint":
                 Tdev = device_put_process_local(np.pad(T[:, :n_chi, :n_chi],
                     ((0, nk_pad - nk), (0, 0), (0, 0), (0, 0))), vertex_sh)
                 partner_dev = replicated(partner)
@@ -377,7 +388,14 @@ def make_snapshot_evaluator(prepared, options):
                         Tdev, energy_dev, density_dev, partner_dev, replicated(sites),
                         replicated(gamma), replicated(prepared["spin_weight"]))))
                 negative = int(prepared["q_negative"][iq])
-                if negative < iq:
+                if options.get("statistics") == "retarded_reference":
+                    screen = SS.retarded_reference_snapshot(sampler, fit_sites, check_sites,
+                        max_order=int(options.get("max_order", 48)),
+                        fit_tolerance=float(options.get("fit_tolerance", 0.02)),
+                        max_pencil_bytes=int(options.get("max_pencil_bytes", 128 * 1024 ** 2)),
+                        representative=current_screens.get(negative) if negative < iq else None,
+                        self_negative=negative == iq, collision_eta=eta)
+                elif negative < iq:
                     screen = SS.screen_snapshot_partner(current_screens[negative], sampler, check_sites)
                 else:
                     screen = SS.screen_snapshot(sampler, fit_sites, check_sites,
@@ -417,6 +435,41 @@ def make_snapshot_evaluator(prepared, options):
                 training_refit_error=receipt.get("training_refit_error"),
                 fit_pencil_shape=receipt.get("fit_pencil_shape"),
                 fit_pencil_bytes=receipt.get("fit_pencil_bytes"),
+                screening_density_approximation=receipt.get("screening_density_approximation"),
+                discarded_screening_coherence_norm=receipt.get("discarded_screening_coherence_norm"),
+                noise_approximation=receipt.get("noise_approximation"),
+                noise_check_kind=receipt.get("noise_check_kind"),
+                collective_normalization_error=receipt.get("collective_normalization_error"),
+                minimum_noise_residue=receipt.get("minimum_noise_residue"),
+                zero_gap_noise=receipt.get("zero_gap_noise"),
+                zero_gap_statistics=receipt.get("zero_gap_statistics"),
+                zero_gap_transition_count=receipt.get("zero_gap_transition_count"),
+                zero_gap_unequal_population_count=receipt.get("zero_gap_unequal_population_count"),
+                zero_gap_equal_population_static_count=receipt.get("zero_gap_equal_population_static_count"),
+                zero_gap_response_rank=receipt.get("zero_gap_response_rank"),
+                zero_gap_response_roundoff_residual=receipt.get("zero_gap_response_roundoff_residual"),
+                zero_gap_discarded_roundoff_response_norm=receipt.get("zero_gap_discarded_roundoff_response_norm"),
+                near_zero_unequal_population_count=receipt.get("near_zero_unequal_population_count"),
+                minimum_nonzero_transition_gap_ry=receipt.get("minimum_nonzero_transition_gap_ry"),
+                screening_gap_resolution_ry=receipt.get("screening_gap_resolution_ry"),
+                screening_gap_projection_count=receipt.get("screening_gap_projection_count"),
+                maximum_screening_gap_adjustment_ry=receipt.get("maximum_screening_gap_adjustment_ry"),
+                dense_workspace_bytes=receipt.get("dense_workspace_bytes"),
+                lag_decay_used=receipt.get("lag_decay_used"),
+                screening_population_roundoff_correction=receipt.get("screening_population_roundoff_correction"),
+                preliminary_transition_projection=receipt.get("preliminary_transition_projection"),
+                original_transition_counts=receipt.get("original_transition_counts"),
+                projected_transition_counts=receipt.get("projected_transition_counts"),
+                final_screened_model=receipt.get("final_screened_model"),
+                reference_zero_frequency_count=receipt.get("reference_zero_frequency_count"),
+                reference_signed_gain_pole_count=receipt.get("reference_signed_gain_pole_count"),
+                reference_complex_residue_pole_count=receipt.get("reference_complex_residue_pole_count"),
+                reference_maximum_pole_growth_ry=receipt.get("reference_maximum_pole_growth_ry"),
+                reference_collision_eta_ry=receipt.get("reference_collision_eta_ry"),
+                reference_laplace_margin_ry=receipt.get("reference_laplace_margin_ry"),
+                reference_support_margin_ry=receipt.get("reference_support_margin_ry"),
+                reference_modal_condition=receipt.get("reference_modal_condition"),
+                reference_modal_error=receipt.get("reference_modal_error"),
                 project_s=t_project - tq, screening_s=t_screen - t_project,
                 sigma_s=time.perf_counter() - t_screen))
         Uh = U.conj().swapaxes(-1, -2)
@@ -446,9 +499,13 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     ``density_rank, max_order, fit_samples, fit_tolerance, adiabatic_ev,
     fit_height_ev, eta_ev, snapshot_steps, snapshot_tol_ev,
     snapshot_mixing, snapshot_acceleration, screening, statistics, form, hermitian, policy, basis``.
-    ``statistics='finite_lag'`` must be selected explicitly: this statistical
-    model does not generally satisfy screened equilibrium FDT, and is not a
-    validated physical lossless/adiabatic statistical closure.
+    Statistical preparation must be selected explicitly. ``finite_lag``
+    does not generally satisfy screened equilibrium FDT. ``lossless_bath``
+    declares spectral pinching in the screening bath, a same-subspace
+    weak-colored-bath prescription, and real poles with collision eta only.
+    ``retarded_reference`` fits only full-rho PR/WR and uses equilibrium-style
+    T=0 reference branches in Sigma, without independent fluctuation noise.
+    All retain the original full density in the electronic self-energy.
     ``hamiltonian='hf'`` (default) uses the authenticated absolute
     ``hHF[rho]+MH[rho,H]`` and solves its coherent correction already at
     t0. The supplied DFT density is then explicitly a prepared quench.
@@ -468,13 +525,18 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     from tdagw.tdgw_io import HA_IN_EV
 
     options = dict(options or {})
-    if options.get("statistics", "unspecified") != "finite_lag":
-        raise ValueError("GATE td_collision_statistics: explicitly select statistics='finite_lag'; "
-                         "screened equilibrium FDT is not generally satisfied; "
-                         "physical lossless statistics are not implemented")
-    statistical_status = dict(statistics="finite_lag",
+    statistics = options.get("statistics", "unspecified")
+    if statistics not in ("finite_lag", "lossless_bath", "retarded_reference"):
+        raise ValueError("GATE td_collision_statistics: explicitly select finite_lag, lossless_bath or retarded_reference")
+    statistical_status = (dict(statistics="finite_lag",
         screened_equilibrium_fdt="known_not_generally_satisfied",
-        physical_lossless_statistics="not_implemented")
+        physical_lossless_statistics="not_implemented") if statistics == "finite_lag" else
+        dict(statistics="retarded_reference", screened_equilibrium_fdt="not_a_nonequilibrium_statistics_claim",
+             physical_lossless_statistics="not_requested_retarded_vacuum_reference",
+             screening_density_approximation="full_matrix_ordered_snapshot") if statistics == "retarded_reference" else
+        dict(statistics="lossless_bath", screened_equilibrium_fdt="same_subspace_residue_KMS",
+             physical_lossless_statistics="secular_weak_colored_bath_approximation",
+             screening_density_approximation="spectral_pinching_in_instantaneous_H"))
     form, hermitian = options.get("form", "subtracted"), options.get("hermitian", "dynamic")
     mode = options.get("screening", "joint")
     convention = options.get("hamiltonian", "hf")

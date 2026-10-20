@@ -377,7 +377,7 @@ modules meet at one contract, ΔΣ = `apply(params, rho, t)`.
 | `collision.py` | The column-sampled one-sided MGKBA branch operator, equilibrium counterterm and held affine collision flow. |
 | `dynsig.py` | The instantaneous self-energy stages and collision refresh: frozen/active sweeps, basis dressing and screening snapshots ([theory](theory/td_agw_dynamical.md)). |
 | `keldysh_rational.py` | Small-matrix transfer products, sharp, retarded Dyson feedback and causal Schur/Sylvester projection, independently checked against real-frequency integration. |
-| `snapshot_screening.py` | Full-rho projected polarization, bounded full-block joint Loewner/causal-basis refit, screened response/noise error checks and compact general Keldysh realizations. |
+| `snapshot_screening.py` | Full-rho projected polarization with bounded joint Loewner/causal-basis refits, or explicit spectral-pinched lossless transition-bath screening; screened response/noise checks and paired Keldysh realizations ([theory](theory/td_agw_dynamical.md#lossless-transition-bath)). |
 | `snapshot_collision.py` | General biorthogonal interaction factors and column-sampled GW coefficients in projected density vertices. |
 | `snapshot_runtime.py` | Distributed Coulomb projection, streamed full-band vertices and converged joint/frozen snapshots. `hf_reference_window` authenticates the captured kinetic/ionic + Hartree + Fock baseline; `bare_hf_coherent_model` installs routed bare exchange, its exact head increment and the explicit HF/reference convention. |
 | `self_energy.py` | The ΔΣ[ρ] contract and its models: none, dense TDGW kernel, low-rank, the ISDF adapter. |

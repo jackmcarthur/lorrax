@@ -1,6 +1,7 @@
 """Dense reference algebra for snapshot Keldysh screening transfer functions.
 
-This module is a host-side validation owner, not a production screening path.
+This module owns host-side transfer algebra for small references and the
+explicitly bounded reduced snapshot screening path.
 It represents a matrix rational function as the plain array tuple
 ``(A, B, C, D)`` with
 
@@ -94,6 +95,9 @@ def evaluate(system, z):
     A, B, C, D = _arrays(system)
     if A.shape[0] == 0:
         return D.copy()
+    poles = np.diag(A)
+    if np.count_nonzero(A) == np.count_nonzero(poles):
+        return D + C @ (B / (complex(z) - poles)[:, None])
     return D + C @ np.linalg.solve(complex(z) * np.eye(A.shape[0]) - A, B)
 
 
@@ -214,6 +218,150 @@ def screen_retarded(retarded_p, bare):
     if np.max(np.abs(D), initial=0.0) > 1e-12:
         raise ValueError("the retarded polarization must be strictly proper")
     return A + B @ bare @ C, B @ bare, bare @ C, bare.copy()
+
+
+def lossless_residues(system, *, tolerance=1e-8, metric=None, transition_factors=False):
+    """Resolve real collective poles and Hermitian residues without pole shifts.
+
+    The small host realization has a square output. Degenerate poles are
+    grouped before testing Hermiticity; growing or complex collective modes
+    and defective feedback are refused. Energies retain the caller's units.
+    """
+    A, B, C, D = _arrays(system)
+    if not A.size:
+        empty = (np.empty(0), np.empty((0, D.shape[0], D.shape[1]), complex))
+        return (*empty, []) if transition_factors else empty
+    poles, vectors = sla.eig(A)
+    span = max(float(np.max(abs(poles))), 1.0)
+    if np.max(abs(poles.imag)) > tolerance * span or np.linalg.cond(vectors) > 1e10:
+        raise ValueError("GATE snapshot_lossless_stability: nonreal or defective collective poles")
+    left, right = C @ vectors, sla.solve(vectors, B)
+    if metric is not None:
+        metric = np.asarray(metric)
+        norms = np.einsum("aj,ab,bj->j", vectors.conj(), metric, vectors).real
+        if np.any(abs(norms) < 1e-10):
+            raise ValueError("GATE snapshot_lossless_stability: singular collective metric")
+        # For A.H S = S A and C = B.H S the residue is explicitly
+        # Hermitian: (C x)(C x).H / (x.H S x). No sign is constrained.
+        right = left.conj().T / norms[:, None]
+    order = np.argsort(poles.real)
+    groups, residues, indices = [], [], []
+    for j in order:
+        residue = np.outer(left[:, j], right[j])
+        if groups and abs(poles[j].real - groups[-1]) < tolerance * span:
+            residues[-1] += residue
+            indices[-1].append(j)
+        else:
+            groups.append(float(poles[j].real))
+            residues.append(residue)
+            indices.append([j])
+    factors = []
+    if metric is not None:
+        for i, group in enumerate(indices):
+            x = vectors[:, group]
+            gram = x.conj().T @ metric @ x
+            factor = x @ sla.solve(gram, x.conj().T @ metric @ B)
+            factors.append(factor)
+            residues[i] = C @ factor
+    residues = np.asarray(residues)
+    residue_scale = max(float(np.linalg.norm(residues, axis=(1, 2)).max()), 1e-30)
+    for residue in residues:
+        if np.linalg.norm(residue - residue.conj().T) > tolerance * residue_scale:
+            raise ValueError("GATE snapshot_lossless_residue: collective residue is not Hermitian")
+    if metric is not None:
+        for z in span * np.asarray([-0.4 + 0.7j, 0.3 + 0.6j, 1.1 + 0.9j]):
+            reconstructed = D + np.sum(residues / (z - np.asarray(groups))[:, None, None], axis=0)
+            expected = evaluate(system, z)
+            if np.linalg.norm(reconstructed - expected) > tolerance * max(np.linalg.norm(expected), 1e-30):
+                raise ValueError("GATE snapshot_lossless_residue: metric residue reconstruction failed")
+    # Symmetrization removes only certified roundoff, never a negative eigenvalue.
+    result = (np.asarray(groups), 0.5 * (residues + residues.conj().transpose(0, 2, 1)))
+    return (*result, factors) if transition_factors else result
+
+
+def retarded_reference_branches(system, *, condition_limit=1e10, tolerance=1e-7,
+                                evaluation_height=0.0):
+    """Assign equilibrium-style T=0 branches to a causal retarded response.
+
+    This is a declared reference prescription for Sigma, not independent
+    nonequilibrium fluctuation statistics. For each retarded pole p with
+    residue R, the lesser reference has residue -R for Re(p)<0 and zero
+    for Re(p)>0. A roundoff-zero real frequency receives -R/2. The greater
+    reference is their exact sum with the retarded response. Signed and
+    complex residues are retained without a noise-positivity assumption.
+
+    Parameters
+    ----------
+    system : tuple of ndarray
+        Strictly proper square correlation response (A,B,C,D=0), in any
+        consistent energy units. Poles must lie below evaluation_height.
+    evaluation_height : float
+        Positive-lag damping in the subsequent Sigma transform. The
+        default zero requires decaying response poles. A positive height
+        also admits a growing causal theta(t) response when this damping
+        dominates every growth rate; no pole is moved or clipped.
+
+    Returns
+    -------
+    dict
+        Canonical shared-modal ``correlation``, ``lesser``, ``greater`` and
+        pole/reconstruction receipts. No poles or amplitudes are shifted.
+    """
+    A, B, C, D = _arrays(system)
+    evaluation_height = float(evaluation_height)
+    if not np.isfinite(evaluation_height) or evaluation_height < 0:
+        raise ValueError("GATE snapshot_reference_height: finite nonnegative evaluation height required")
+    if D.shape[0] != D.shape[1] or np.max(abs(D), initial=0.0) > 1e-12:
+        raise ValueError("GATE snapshot_reference_direct: strictly proper square response required")
+    if not A.size:
+        return dict(correlation=system, lesser=system, greater=system,
+                    poles=np.empty(0, complex), zero_frequency_count=0,
+                    condition=1.0, reconstruction_error=0.0,
+                    signed_gain_pole_count=0, complex_residue_pole_count=0,
+                    maximum_pole_growth=0.0, evaluation_height=evaluation_height,
+                    laplace_margin=evaluation_height)
+    poles, vectors = sla.eig(A)
+    condition = float(np.linalg.cond(vectors))
+    if not np.isfinite(condition) or condition > condition_limit:
+        raise ValueError("GATE snapshot_reference_poles: defective retarded modal realization")
+    maximum_growth = float(np.max(poles.imag))
+    margin = evaluation_height - maximum_growth
+    if margin <= 1e-12:
+        raise ValueError(f"GATE snapshot_reference_causality: Sigma Laplace damping "
+                         f"{evaluation_height:.9g} must exceed pole growth {maximum_growth:.9g}; "
+                         f"margin={margin:.3e}")
+    left, right = C @ vectors, sla.solve(vectors, B)
+    modal = (np.diag(poles), right, left, D.copy())
+    scale = max(float(np.max(abs(poles))), 1.0)
+    zero_tolerance = 64 * np.finfo(float).eps * scale
+    zero = abs(poles.real) <= zero_tolerance
+    weights = np.where(poles.real < -zero_tolerance, -1.0, 0.0)
+    weights[zero] = -0.5
+    lesser = (modal[0], right, left * weights[None], D.copy())
+    greater = (modal[0], right, left * (1 + weights)[None], D.copy())
+    gain_count, complex_count = 0, 0
+    for pole, l, r in zip(poles, left.T, right):
+        residue = np.outer(l, r)
+        norm = max(float(np.linalg.norm(residue)), 1e-30)
+        hermitian = 0.5 * (residue + residue.conj().T)
+        complex_count += int(np.linalg.norm(residue - residue.conj().T) > tolerance * norm)
+        if abs(pole.real) > zero_tolerance:
+            gain_count += int(sla.eigvalsh(np.sign(pole.real) * hermitian)[0] < -tolerance * norm)
+    error = 0.0
+    probes = scale * np.asarray([-.37 + .51j, .23 + .87j, 1.13 + .43j])
+    probes += 1j * max(maximum_growth, 0.0)
+    for z in probes:
+        reference = evaluate(system, z)
+        error = max(error, float(np.linalg.norm(evaluate(modal, z) - reference)
+            / max(np.linalg.norm(reference), 1e-30)))
+    if not np.isfinite(error) or error > tolerance:
+        raise ValueError("GATE snapshot_reference_reconstruction: retarded modal reconstruction failed")
+    return dict(correlation=modal, lesser=lesser, greater=greater, poles=poles,
+        zero_frequency_count=int(np.count_nonzero(zero)), condition=condition,
+        reconstruction_error=error, zero_frequency_tolerance=zero_tolerance,
+        signed_gain_pole_count=gain_count, complex_residue_pole_count=complex_count,
+        maximum_pole_growth=maximum_growth, evaluation_height=evaluation_height,
+        laplace_margin=margin)
 
 
 def screened_lesser(retarded_w, lesser_p, *, pole_tolerance=1e-12):

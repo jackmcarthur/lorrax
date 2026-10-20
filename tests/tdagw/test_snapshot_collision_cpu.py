@@ -96,6 +96,24 @@ def test_general_factors_reconstruct_signed_nonnormal_bank():
         np.testing.assert_allclose(got, kr.evaluate(bank, z), rtol=1e-12, atol=1e-12)
 
 
+def test_diagonal_repeated_pole_bank_uses_exact_factors_without_dense_solve(monkeypatch):
+    poles = np.array([-.3, -.3, .7, .7])
+    b = np.array([[1., .2j], [.3j, -.4], [1., -.1j], [.6, .2j]])
+    c = np.array([[.1j, .7, -.3, .2], [-.2, .4j, .5, -.6j]])
+    bank = (np.diag(poles), b, c, np.zeros((2, 2)))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("diagonal realization needs neither eig nor solves")
+
+    monkeypatch.setattr(sc.sla, "eig", forbidden)
+    monkeypatch.setattr(sc.sla, "solve", forbidden)
+    factors = sc.rational_factors(bank)
+    np.testing.assert_array_equal(factors["poles"], poles)
+    np.testing.assert_array_equal(factors["left"], c)
+    np.testing.assert_array_equal(factors["right"], b)
+    assert factors["residual"] == 0.0
+
+
 def test_joint_union_keeps_noise_only_poles_and_exact_greater_sum():
     ret = kr.pole_residue_realization([0.6 - 0.2j],
         np.array([[[0.2, 0.1j], [-0.05j, -0.1]]]))

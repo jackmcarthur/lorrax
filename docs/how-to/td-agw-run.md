@@ -187,24 +187,45 @@ gate refuses still closes its log: the gate's lines, the refusal's message and a
 
 ## The collision term {#collision}
 
-For a full-density screening comparison, use `collision_basis = "instantaneous"`
+For an updated-screening comparison, use `collision_basis = "instantaneous"`
 and `collision_screening = "joint"`. The material Hamiltonian and coherent
 self-energy converge together at each refresh, using one set of energies for
 the polarization, internal lines and column shells. `joint_frozen` provides
-the matched reduced equilibrium-screening control. A small exploratory setup
-is:
+the matched reduced equilibrium-screening control. Choose the statistics
+explicitly; an unspecified statistical preparation refuses before GW setup.
 
-Warning: this example explicitly selects a finite-lag statistical **model**,
-not physical equilibrium/lossless GW statistics. Its screened equilibrium FDT
-is known to fail in general, including as the lag decay tends to zero.
-Physical collective initial statistics/adiabatic switch-on are not implemented.
-Without this explicit acknowledgement, active joint modes refuse before GW
-setup. Do not interpret a trajectory as validated physical thermal relaxation.
+`collision_statistics = "lossless_bath"` uses the
+[lossless transition-bath prescription](../theory/td_agw_dynamical.md#lossless-transition-bath).
+It pinches the screening density between distinct instantaneous energies;
+the electronic collision, coherent Hamiltonian and propagated density retain
+the full matrix. Exact energy degeneracies are treated as subspaces, not
+discarded as coherences. Its collective-pole statistics satisfy thermal
+KMS within the same reduced response model. This is a declared secular
+screening approximation, not full-coherence screening or full-frequency
+Dyson self-consistency. `collision_adiabatic_ev` and
+`collision_fit_real_axis` are unused in this mode. Collision broadening
+remains independent. Increase `collision_pole_order` and
+`collision_pencil_mb` together when converging the retained transition
+basis; low orders adequate for a damped fit need not resolve real poles.
+The lossless memory guard also accounts for dense pole-bank and common-union
+workspaces; raising the pole order can require more than the default 128 MiB.
+Check the reported discarded screening-coherence norm, paired-q symmetry,
+response residuals and statistical residues. Positive screened-noise
+residues do not guarantee Pauli bounds for the electronic equation.
+
+The primary instantaneous-quasiparticle comparison can instead select
+`retarded_reference`. This fits only the full-density retarded response and
+uses equilibrium-style zero-temperature pole branches for the collision.
+No independent lesser screening model or dressed-noise fit is performed.
+The electronic self-energy retains the instantaneous energies and full
+density, its principal-value and dissipative parts, and off-diagonal entries.
+This explicitly assumes reference bath statistics; it does not claim the
+nonequilibrium lesser interaction is determined exactly by retarded W.
 
 ```toml
 collision_basis = "instantaneous"
 collision_screening = "joint"
-collision_statistics = "finite_lag"
+collision_statistics = "retarded_reference"
 collision_hamiltonian = "reference"
 collision_source = ".../04_gw_oneshot_mpa_eqp/oneshot.in"
 collision = "raw"
@@ -218,10 +239,10 @@ collision_snapshot_steps = 32
 collision_snapshot_tol_ev = 0.0001
 collision_snapshot_mixing = 0.7
 collision_snapshot_acceleration = "anderson"
-collision_density_rank = 8
+collision_density_rank = 1
 collision_pole_order = 48
 collision_projection_order = 400
-collision_pencil_mb = 128
+collision_pencil_mb = 256
 collision_fit_samples = 192
 collision_fit_real_axis = false
 collision_fit_tolerance = 0.02
@@ -229,9 +250,11 @@ collision_adiabatic_ev = 0.05
 collision_fit_height_ev = 0.15
 ```
 
-These are explicit underconverged controls within that statistical model.
-Vary finite lag decay, fit height and collision regularization separately;
-numerical convergence does not cure the known statistical/FDT failure.
+These are explicit underconverged controls within that reference-bath model.
+Vary response lag decay, fit height and collision regularization separately.
+The historical `finite_lag` selection additionally reconstructs independent
+lesser fluctuations; its known statistical/FDT failure is not cured by
+numerical convergence. Neither option guarantees electronic Pauli bounds.
 Compare a zero-field
 trajectory before interpreting pulse decay, and inspect the density spectrum,
 number balance, snapshot residual and response/noise fit errors. `subtracted`

@@ -25,6 +25,73 @@ receipt or the tile's μ row count.
   included (Si 4³→8³: the W body changes by 19–27 % at the first three
   off-grid shells). Undensified runs are unchanged. No deck change is needed.
 
+## 2026-10-19 — retarded-only equilibrium-reference GW snapshots
+
+`collision_statistics = "retarded_reference"` selects an explicitly
+equilibrium-like approximation: full instantaneous density and Hamiltonian
+build the retarded polarization and screened interaction; their positive
+and negative frequency pole branches supply the zero-temperature GW
+self-energy reference. All electronic density entries and all complex
+self-energy entries are retained, including off-diagonal coherent and
+dissipative terms at the instantaneous column energies.
+
+This choice fits only the retarded response and does not require an
+independent lesser/noise model or its positivity/FDT gates. Signed residues
+are retained; fit accuracy, q/$-q$ pairing and runtime electronic
+diagnostics still apply. Growing retarded poles are permitted only when
+the explicit collision evaluation height exceeds their growth bound, so
+the one-sided self-energy integral converges; the margin is reported and
+no pole is shifted. Response lag decay and collision
+regularization remain separate controls. The branch rule is an explicit
+approximation, not an inference of exact nonequilibrium fluctuations from
+retarded screening. Frozen and updated runs use the same rule.
+
+## 2026-10-19 — explicit lossless transition-bath screening statistics
+
+Joint collision modes accept the opt-in
+`collision_statistics = "lossless_bath"` prescription described in
+[theory](docs/theory/td_agw_dynamical.md#lossless-transition-bath).
+It constructs real-pole RPA screening with transition-specific colored-bath
+occupations, keeping response-free fractional-population noise. Thermal
+populations give screened collective-pole KMS weights, including zero
+positive-frequency lesser weight at zero temperature. The earlier
+`finite_lag` model remains a separately labelled choice.
+
+This approximation excludes coherences between distinct instantaneous
+energies from **screening only**. The density propagated by the electronic
+equation, coherent Hamiltonian and column-sampled electronic collision
+lines retain the full density matrix. It must not be interpreted as
+full-coherence screening. `joint_frozen` freezes the same bath construction
+at equilibrium for matched comparisons. The lossless pole bank does not use
+`collision_adiabatic_ev`; collision regularization remains a separate
+control. No restart is interchangeable across statistical selections.
+
+Screening transition gaps at or below `1e-12` Ry are resolved as degenerate;
+the receipt reports the gap adjustments, while Hamiltonian and electronic
+self-energy energies are unchanged. The final response is checked against
+the original gaps. Unequal-population degenerate channels use an explicit
+weak shot-noise reservoir; equal-population degenerate channels retain
+exactly static Wick noise without finite-frequency collective tails.
+Their response is aggregated before screening, and a kernel Schur solve
+retains bare zero-frequency noise after response cancellation. Thermal KMS
+applies to occupations thermal on this resolved screening model, including
+equal populations at degenerate levels. It is not a claim for arbitrary
+original tiny-gap occupation mismatches.
+
+The reduction preserves signed Hermitian transition structure and thermal
+residue normalization; it does not clamp complex poles or infer noise from
+the retarded residues alone. An optional preliminary energy-bin Galerkin
+projection reduces transition-space cost while projecting the same colored
+statistics. Distinct q/$-q$ partners are derived algebraically. Self-inverse
+q banks use an explicit convex average with their crossing partner at the
+screened-interaction level; this final average need not equal Dyson screening
+of the original compressed polarization. Independent microscopic response
+checks bound the final approximation. Unstable, unresolved or singular pole banks
+refuse. Full-matrix bath checks do not establish an electronic Pauli theorem:
+number, gain/loss boundary and propagated-density checks remain necessary.
+The construction changes collision results and supplies a declared
+approximation for testing damping, not a completed material validation.
+
 ## 2026-10-19 — screening statistical preparation: CPU references and scope
 
 New small CPU references distinguish correlated Gibbs, isolated adiabatic,

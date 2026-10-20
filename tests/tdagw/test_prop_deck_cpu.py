@@ -210,7 +210,7 @@ def test_joint_snapshot_controls_parse_and_refuse_invalid_closures():
 
 
 @pytest.mark.parametrize("screening", ["joint", "joint_frozen"])
-def test_joint_statistics_requires_explicit_finite_lag_before_setup(screening):
+def test_joint_statistics_requires_explicit_selection_before_setup(screening):
     raw = _bundle(collision="raw", collision_screening=screening,
                   collision_basis="instantaneous")
     assert _refuses(raw, "td_collision_statistics")
@@ -218,9 +218,21 @@ def test_joint_statistics_requires_explicit_finite_lag_before_setup(screening):
     assert _refuses(raw, "td_collision_statistics")
     raw["lorrax"]["collision_statistics"] = "finite_lag"
     assert parse_td_deck(raw).values["lorrax.collision_statistics"] == "finite_lag"
+    raw["lorrax"]["collision_statistics"] = "lossless_bath"
+    assert parse_td_deck(raw).values["lorrax.collision_statistics"] == "lossless_bath"
+    raw["lorrax"]["collision_statistics"] = "retarded_reference"
+    assert parse_td_deck(raw).values["lorrax.collision_statistics"] == "retarded_reference"
     off = _bundle(collision_screening=screening)
     assert parse_td_deck(off).values["lorrax.collision_statistics"] == "unspecified"
     assert parse_td_deck(_bundle(collision="raw")).values["lorrax.collision_statistics"] == "unspecified"
+
+
+@pytest.mark.parametrize("statistics", ["lossless_bath", "retarded_reference"])
+def test_snapshot_statistical_selection_requires_joint_screening(statistics):
+    assert _refuses(_bundle(collision="raw", collision_statistics=statistics),
+                    "td_collision_statistics")
+    assert parse_td_deck(_bundle(collision_statistics=statistics)).values[
+        "lorrax.collision_statistics"] == statistics
 
 
 def test_population_and_symmetric_comparisons_are_not_propagation_modes():
@@ -279,18 +291,29 @@ def test_collision_keys_inactive_when_off_and_fingerprint():
     fp_lag = json.loads(restart_fingerprint(finite_lag, sysm, model, 0.1))
     assert fp_lag["collision"]["lorrax.collision_statistics"] == "finite_lag"
     assert fp_lag != fp_on
+    lossless = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+        collision_basis="instantaneous", collision_statistics="lossless_bath"))
+    fp_lossless = json.loads(restart_fingerprint(lossless, sysm, model, 0.1))
+    assert fp_lossless["collision"]["lorrax.collision_statistics"] == "lossless_bath"
+    assert fp_lossless != fp_lag
+    reference = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+        collision_basis="instantaneous", collision_statistics="retarded_reference"))
+    fp_reference = json.loads(restart_fingerprint(reference, sysm, model, 0.1))
+    assert fp_reference["collision"]["lorrax.collision_statistics"] == "retarded_reference"
+    assert fp_reference != fp_lossless
     real_fit = parse_td_deck(_bundle(collision="subtracted", collision_fit_real_axis=True))
     fp_real = json.loads(restart_fingerprint(real_fit, sysm, model, 0.1))
     assert fp_real["collision"]["lorrax.collision_fit_real_axis"] is True
     assert fp_real != fp_on
 
 
-def test_joint_capacity_controls_forward_from_deck_to_runtime(monkeypatch):
+@pytest.mark.parametrize("statistics", ["finite_lag", "lossless_bath", "retarded_reference"])
+def test_joint_capacity_controls_forward_from_deck_to_runtime(monkeypatch, statistics):
     from types import SimpleNamespace as NS
     from tdagw import stages, snapshot_runtime
 
     deck = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
-        collision_statistics="finite_lag",
+        collision_statistics=statistics,
         collision_basis="instantaneous", collision_projection_order=800, collision_pencil_mb=256,
         collision_fit_real_axis=True))
     captured = {}
@@ -308,4 +331,4 @@ def test_joint_capacity_controls_forward_from_deck_to_runtime(monkeypatch):
     assert captured["max_projection_order"] == 800
     assert captured["max_pencil_bytes"] == 256 * 1024 ** 2
     assert captured["real_axis_fit"] is True
-    assert captured["statistics"] == "finite_lag"
+    assert captured["statistics"] == statistics
