@@ -86,6 +86,19 @@ def _off_cuda(plan, op, shapes, dtype):
                 provider=getattr(plan, 'backend', 'XLA'))
 
 
+@lru_cache(maxsize=None)
+def local_eigh_workspace(mesh, share, n, dtype) -> int:
+    """The device bytes a rank's local eigh of ``share`` (n, n) matrices allocates outside its
+    program's buffers: on CUDA the native cusolverDn size query (jaxlib's syevd FFI has no
+    workspace output; one matrix's, the handler solves them one at a time), on ROCm the
+    batched rocSOLVER workspace, none on CPU."""
+    platform = mesh_platform(mesh)
+    if platform == 'CUDA':
+        return _vendor_query(0, 'eigh', (int(n),), np.dtype(dtype).str)[0]
+    from distrib_la.local_eigh import batched_workspace_bytes
+    return batched_workspace_bytes((int(share), int(n), int(n)), dtype, platform)
+
+
 def _workspace_details(plan, op, shapes, dtype):
     """Internal receipt producer; the public contract returns device bytes."""
     import jax
@@ -140,8 +153,9 @@ def _workspace_details(plan, op, shapes, dtype):
         ctx = 0 if local else get_or_init_context(plan.mesh)
         side = n
         if local:
-            # cusolverDn syevd's workspace is an XLA buffer of the compiled program.
-            device, host = 0, 0
+            # jaxlib's cusolverDn syevd allocates its workspace outside the program's
+            # buffers (no workspace output): the native size query, process handle.
+            device, host = _vendor_query(0, op, (n,), dtype.str)
         else:
             from distrib_la._cusolvermp import solve_layout
             side, block = solve_layout(n, px)
@@ -289,19 +303,17 @@ def eigh_stack_proposal(mesh, shape, dtype) -> int:
     """Route (c)'s first attempt on the face stack ``shape`` (nb, n, n) in closed form, where the
     program that will run is not known yet (its cut and room are the call's): five matrices per
     rank's share of the batch (the operand in batch layout, the vectors both ways, the solver's
-    work; the CPU compile reads 3.1-4.5 at n 64-512), plus the ROCm leg's batched workspace,
-    which XLA does not see.  A proposal: the run's own program is the price."""
-    from distrib_la.local_eigh import batched_workspace_bytes
+    work; the CPU compile reads 3.1-4.5 at n 64-512), plus the solver workspace outside the
+    program (``local_eigh_workspace``).  A proposal: the run's own program is the price."""
     share, n = -(-int(shape[0]) // int(mesh.size)), int(shape[-1])
-    return (5 * share * n * n * np.dtype(dtype).itemsize
-            + batched_workspace_bytes((share, n, n), dtype, mesh_platform(mesh)))
+    return 5 * share * n * n * np.dtype(dtype).itemsize + local_eigh_workspace(mesh, share, n, dtype)
 
 
 def eigh_stack_bytes(plan, shape, dtype, phase="all") -> int:
     """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
     its operand: the program that runs it, compiled at the abstract operand and never run
-    (route (c): ``distrib_la.plan._stack_bytes``, plus the ROCm leg's rocSOLVER batched
-    workspace, which XLA does not see; otherwise ``Plan.mesh_bytes``, the plan's own program
+    (route (c): ``distrib_la.plan._stack_bytes``, plus the solver workspace outside the
+    program, ``local_eigh_workspace``; otherwise ``Plan.mesh_bytes``, the plan's own program
     plus its provider's workspace query).  ``phase`` is the one the plan runs (``Plan`` line
     ``phase = ...``): "first" for an eager call, whose retries price their own program, "all"
     for a stack traced in a caller's program.  Every rank computes the same figure."""
@@ -309,8 +321,7 @@ def eigh_stack_bytes(plan, shape, dtype, phase="all") -> int:
     nb, n = int(shape[0]), int(shape[-1])
     ranks = int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
     if plan.batched_route == ROUTE_BATCH_RESHARD:
-        from distrib_la.local_eigh import batched_workspace_bytes
         return (_stack_bytes('eigh', plan.mesh, nb, n, dtype, 1, phase,
                              _gathered_admitted(plan.mesh, (n, n), dtype, plan.budget_bytes))
-                + batched_workspace_bytes((-(-nb // ranks), n, n), dtype, mesh_platform(plan.mesh)))
+                + local_eigh_workspace(plan.mesh, -(-nb // ranks), n, dtype))
     return plan.mesh_bytes('eigh', nb, n, dtype, phase)

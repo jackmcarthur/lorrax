@@ -128,12 +128,13 @@ a provider context under `linalg = local` carries it as its `outside` term
   known when the stage is admitted (its cut and room are the call's), a closed form
   proposes: a local constructor's and the line selection's eigh stacks take
   `distrib_la.eigh_stack_proposal` (five matrices per rank's share of the batch, plus
-  the ROCm batched workspace). The run then admits its own executable before it
-  executes: an eager route-(c) first attempt (`Plan._checked_reshard`) checks its
-  `memory_analysis` plus the ROCm batched workspace against the agreed room
-  (`memory.room`, the minimum over ranks); over it, twice the rounds (slices of half
-  as many matrices), each compiled only when the one before is over, and when none
-  fits the smallest runs under `admit`'s warning. A local reduction round is admitted
+  the solver workspace outside the program, `distrib_la.local_eigh_workspace`). The run then admits its own executable before it
+  executes: an eager route-(c) attempt, first or retry (`Plan._checked_reshard`),
+  checks its `memory_analysis` plus the solver workspace outside it (CUDA: the native
+  cusolverDn size query; ROCm: the batched row) against the agreed room (`memory.room`,
+  the minimum over ranks); over it, twice the rounds while a rank's share still
+  shrinks, each compiled only when the one before is over, and when none fits the
+  smallest runs under `admit`'s warning. Every rank runs the largest choice any rank made. A local reduction round is admitted
   at its compiled round program (`shared_pole_execution.price_round`). The receipt
   shows the proposal; the run's check prints when it is over.
 - **Room classes.** A room enters a program or a price only through tests of
@@ -717,8 +718,8 @@ and reads every section; `LORRAX_MEMORY_STRICT=1` adds the census;
 arrays, allocator, the executables that ran) in either mode, without waits
 (`lxkit.memory_residuals`). An increment price
 (`priced(..., increment=True)`) adds the allocator's bytes in use at entry as its
-`operands`; one increment part per stage takes them, since a stage's parts are
-summed. The shared-pole store's admissions are booked so, beside what the caller
+`operands` as a part of its own (`resident at stage entry`), read once per stage, so
+rows booked under one label cannot drop it. The shared-pole store's admissions are booked so, beside what the caller
 holds whether or not a live ledger row names it. The reader is the leg's `peak_reader`: CUDA's pool
 `CU_MEMPOOL_ATTR_USED_MEM_HIGH`, reset at each boundary (exact); BFC's
 `peak_bytes_in_use`, which never resets, exact where the stage raised the mark

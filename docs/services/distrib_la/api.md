@@ -317,7 +317,7 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   whole-mesh plan (`gw.shared_pole_execution.staged_eigh`): no room, no
   sizing compile and no exchange.  `eigh_stack_proposal(mesh, shape, dtype)` is the
   route-(c) first attempt in closed form (five matrices per rank's share of the batch, plus
-  the ROCm batched workspace), for a caller whose run program is not known yet (the line
+  the solver workspace outside the program, `local_eigh_workspace`), for a caller whose run program is not known yet (the line
   selection: its cut and room are the call's); the run's program remains the price: an
   eager route-(c) call admits its first attempt's executable against `lxkit.memory.room`
   before it runs, and over it runs in twice the rounds (compiled only then).

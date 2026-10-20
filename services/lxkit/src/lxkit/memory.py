@@ -251,13 +251,13 @@ def _meter(t: dict) -> None:
         _sync()
         boundary()
         t.update(metered=-1, exact=CALIBRATE, mark0=_I["mark"])
-    # The bytes in use join one increment part only: a stage's parts are summed.
-    resident = "resident at stage entry (allocator bytes in use)"
-    for k, p in t["parts"].items():
-        if p.increment:
-            held = 0.0 if t.get("held") else _in_use()
-            t["parts"][k], t["held"] = replace(p, increment=False, operands=Term(
-                p.operands.at(p.ranks) + held, source=_join(p.operands.source, resident))), True
+    # An increment's base, the bytes in use, is its own part of the stage's price, read once.
+    if any(p.increment for p in t["parts"].values()) and ENTRY not in t["parts"]:
+        t["parts"][ENTRY] = Price(operands=Term(float(_in_use()), source=ENTRY), label=ENTRY)
+    t["parts"] = {k: replace(p, increment=False) if p.increment else p for k, p in t["parts"].items()}
+
+
+ENTRY = "resident at stage entry (allocator bytes in use)"
 
 
 def open_tracker(name: str) -> Optional[dict]:

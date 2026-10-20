@@ -304,9 +304,11 @@ room instead lets `distrib_la` decide each stack by the same price
 the largest any rank read and no size is exchanged, so every rank decides alike.
 
 **At run time.** An eager route-(c) call admits the executable it runs before it
-executes: the first attempt's `memory_analysis` plus the ROCm batched workspace
+executes: the attempt's `memory_analysis` plus the solver workspace outside it
+(`distrib_la.local_eigh_workspace`: CUDA's cusolverDn size query, ROCm's batched row)
 against the agreed room (`lxkit.memory.room`). Over it, the call runs in twice the
-rounds, each candidate compiled only when the one before is over; when none fits,
+rounds, each candidate compiled only when the one before is over, the largest choice
+any rank made; when none fits,
 the smallest runs with one warning. A caller admitted on a closed-form proposal
 (`distrib_la.eigh_stack_proposal`) is held to the measured figure here.
 

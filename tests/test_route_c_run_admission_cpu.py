@@ -1,5 +1,5 @@
 """An eager route-(c) first attempt is admitted at the executable that runs: over the room,
-twice the rounds (smaller slices), compiled only then (distrib_la.Plan._admitted_first)."""
+twice the rounds (smaller slices), compiled only then (distrib_la.Plan._admitted)."""
 import jax
 import numpy as np
 import pytest
@@ -25,7 +25,7 @@ def test_over_the_room_doubles_the_rounds():
     memory.reset(run=True)
     try:
         memory.set_budget(memory._in_use() + (need[1] + need[nb]) // 2)
-        rounds, ex = p._admitted_first(program, A, 1)
+        rounds, ex = p._admitted(program, A, 1)
         assert rounds > 1 and ex is pl._executable(program("first", rounds), (A,))
         (w, _), failed = ex(A)
         np.testing.assert_allclose(np.asarray(w), np.linalg.eigvalsh(a), atol=1e-9)

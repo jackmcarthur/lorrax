@@ -1814,42 +1814,44 @@ class Plan:
             values_vectors, failed = program(traced_phase())(A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
             return values_vectors
-        rounds, first = self._admitted_first(program, A, int(rounds))
+        rounds, first = self._admitted(program, A, int(rounds))
         values_vectors, failed = first(A)
         if _flag(failed, shape[-1], A.dtype):
             _notices(failed, "eigh", shape[-1], A.dtype, site, final=False)
             del values_vectors
-            values_vectors, failed = _executable(program("retry", rounds), (A,))(A)
+            values_vectors, failed = self._admitted(program, A, rounds, "retry")[1](A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
         return values_vectors
 
-    def _admitted_first(self, program, A, rounds):
-        """``(rounds, executable)`` of an eager route-(c) first attempt, admitted at the executable
-        that runs: its ``memory_analysis`` plus the ROCm leg's batched workspace against the agreed
-        room (``lxkit.memory.room``, every rank enters).  Over the room, twice the rounds (slices
-        of half as many matrices), each compiled only when the one before is over; none fits, the
-        smallest runs under ``lxkit.memory.admit``'s warning.  Without a run budget (a bare
-        library call) the decided rounds run."""
+    def _admitted(self, program, A, rounds, phase="first"):
+        """``(rounds, executable)`` of an eager route-(c) attempt (``phase``), admitted at the
+        executable that runs: its ``memory_analysis`` plus the solver workspace outside it
+        (``local_eigh_workspace``) against the agreed room (``lxkit.memory.room``, every rank
+        enters).  Over the room, twice the rounds while a rank's share of a slice still shrinks,
+        each compiled only when the one before is over; none fits, the smallest runs under
+        ``lxkit.memory.admit``'s warning.  Every rank runs the largest choice any rank made.
+        Without a run budget (a bare library call) the decided rounds run."""
         from lxkit import memory
-        first = lambda r: _executable(program("first", r), (A,))
+        if int(rounds) < 1:
+            raise ValueError(f"route (c) rounds must be >= 1, got {rounds}")
+        run = lambda r: _executable(program(phase, r), (A,))
         if "budget" not in memory.run():
-            return rounds, first(rounds)
-        from distrib_la.local_eigh import batched_workspace_bytes
+            return rounds, run(rounds)
+        from distrib_la.workspace import local_eigh_workspace
         nb, n, ranks = int(A.shape[0]), int(A.shape[-1]), int(self.mesh.size)
-        tries = [rounds]
-        while tries[-1] < nb:
+        share = lambda r: -(-(-(-nb // r)) // ranks)
+        tries = [int(rounds)]
+        while tries[-1] < nb and share(min(nb, 2 * tries[-1])) < share(tries[-1]):
             tries.append(min(nb, 2 * tries[-1]))
 
         def price(r):
-            share = -(-(-(-nb // r)) // ranks)
-            return memory.priced((_analysis_bytes(first(r)) or 0) + batched_workspace_bytes(
-                (share, n, n), A.dtype, mesh_platform(self.mesh)),
-                f"distrib_la route (c) first program, {r} round(s) (compiled)")
+            return memory.priced((_analysis_bytes(run(r)) or 0) + local_eigh_workspace(
+                self.mesh, share(r), n, A.dtype), f"distrib_la route (c) {phase} program, {r} round(s) (compiled)")
         chosen = memory.admit(f"distrib_la route (c) stack {nb} x {n}^2",
                               tuple((f"{r} round(s)", lambda r=r: price(r)) for r in tries),
                               memory.room(bucketed=False), device=False)
-        r = next(t for t in tries if f"{t} round(s)" == chosen)
-        return r, first(r)
+        i = -int(memory._agree(-float([f"{t} round(s)" for t in tries].index(chosen))))
+        return tries[i], run(tries[i])
 
     def _reshard_options(self, kwargs: dict):
         """Refuse keywords route (c) cannot honour.
