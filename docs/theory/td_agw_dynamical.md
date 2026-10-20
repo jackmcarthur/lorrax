@@ -1163,7 +1163,7 @@ Consequently, neither positivity of $\rho$ nor a fitted growing pole is
 evidence that the current microscopic Dyson response is stable or unstable.
 Suspect poles need independent current-response checks and refinement.
 
-**Alternative numerical realization: transition Galerkin (NOT IMPLEMENTED).**
+**Alternative numerical realization: transition Galerkin (internal bridge proof only).**
 The preceding identity suggests preserving the known bare generator instead
 of continuing sampled $W$ into a global unconstrained rational bank. Write
 $A=T K_\rho$, $B=T$ and $D=\Delta-i\gamma I$, with exactly the same spin,
@@ -1193,6 +1193,24 @@ full moments are not automatic: for example, containing the full ranges
 of $B^\dagger$ and $\Delta B^\dagger$ suffices for the first two bare
 moments, whereas a narrow tangential seed need not contain those ranges.
 
+Current full microscopic Dyson samples can supply interpolating transition
+states without fitting a $W$ continuation. For right and left port directions
+$u,w$, the exact states are
+
+$$
+x=(z-D)^{-1}T^\dagger W_{\rm full}(z)u,\qquad
+y=(\bar z-D^\dagger)^{-1}K_\rho T^\dagger
+W_{\rm full}(z)^\dagger w.
+$$
+
+If both belong to $\operatorname{range}Q$, the reduced full interaction
+interpolates the corresponding all-port right/left actions and the shared
+tangential derivative $w^\dagger W'(z)u=-y^\dagger x$. In the dual state,
+$K_\rho$ acts **before** the adjoint diagonal resolvent, reading products
+right to left; interchanging them changes the coherent endpoint ordering.
+These are numerical basis seeds, not propagated bosonic history or an
+additional fluctuation-statistics model.
+
 This is **not** a passivity or collective-stability guarantee. An arbitrary
 orthogonal $Q$ can produce spurious collective gain by failing to preserve
 the relation between $K_\rho$ and $\Delta$. Even a stationary binary-density
@@ -1205,17 +1223,39 @@ remain required. Genuine inverted-state gain is retained, not projected
 away; no realization can cure a true microscopic pole above the specified
 collision evaluation height.
 
-A streamed block-Krylov/Galerkin implementation could reuse native endpoint
-actions and shared-pole factor storage without forming the dense transition
-interaction. It is not a cheap substitution: at 36 k points and 160 bands
+`gw.transition_galerkin` implements internal native $T/T^\dagger$, $K_\rho$
+and $D$ actions, distributed CGS2/TSQR basis construction, crossing closure,
+stationary binary-density sign sectors and one-parent full-port modal
+factors. The microscopic transition interaction is not formed. The basis
+is k-major and whole-k sharded; the combined native spin/k normalization
+is retained, including both wavefunction spin components. The tiny tests
+in `tests/test_native_transition_galerkin_bridge_cpu.py` compare coherent
+complex-time response with the existing native FFT for scalar/spinor input,
+and exercise actual native factors through complex column-shell $\Sigma$,
+dual derivative interpolation, repeated seeds, signed gain, q-crossing and
+TSQR/capacity guards. Their ports are untruncated **tiny fixture** ports;
+they do not certify a 978-port material calculation. The separate
+`tests/test_full_density_transition_galerkin_cpu.py` supplies literal algebra
+oracles.
+
+This is **not a production route**: no all-q bank, runtime/default switch,
+material response admission, cost/time-to-accuracy result or dynamics is
+established by those CPU proofs. It is not a cheap substitution: at 36 k points and 160 bands
 there are $36\times160^2=921\,600$ transition coordinates **per q**. A single
 complex128 basis with $K=1000$ costs 14.75 GB globally per parent (before
 orthogonalization workspace and other fields). Exactly zero spectator
 pairs may be omitted, but coherent pairs cannot be dropped from their
-diagonal occupations. Parent sharding, basis/workspace admission, crossing
-closure and actual time-to-accuracy would need implementation and measurement.
-`tests/test_full_density_transition_galerkin_cpu.py` is only a tiny algebra
-oracle, not a production path or a performance/stability certification.
+diagonal occupations. With the present four-band coherent window, exact
+same-filled frozen-pair elimination leaves 303,552 live coordinates; a
+32-pair tile pads the carrier to 304,128. At $K=1000$, retaining one basis
+for each of the 20 canonical parents on a 6x6x1 grid (four self-negative q)
+costs about **97.3 GB globally**, before
+vertices, duplicate basis/update buffers, seeds, provider workspace and
+source arrays. Holding all parent bases during a Hamiltonian fixed point
+and admitting their aggregate resources remain unresolved. One-parent
+capacity receipts explicitly do not admit that full retention or a material
+runtime. Numerical $P/W$/dielectric and complete complex-$\Sigma$ refinement
+remain mandatory before any trajectory interpretation.
 
 Full microscopic Dyson samples/actions feed a two-sided tangential Loewner
 realization, using the source GW shared-pole support/direction recipe. Its
