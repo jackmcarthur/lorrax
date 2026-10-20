@@ -1029,19 +1029,28 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             return lam, R
         return _eigh_batch
 
-    def _clean_split_body(lam, R, ZGq, v_ref, v_lr, idx, qfr_b):
+    def _clean_split_body(lam, R, ZGq, v_ref, v_lr, idx, qfr_b, mm=None):
+        # ``mm``: the face GEMM (distrib_la.matmul) of the face route; None, the q owner's
+        # whole-matrix einsums.
         # S_q = R g_ε(Λ) R^H  (analytic Tikhonov filter of C_q; §12.3)
         g = lam ** 2 / (lam ** 2
                         + (eps_tik * lam.max(axis=1, keepdims=True)) ** 2)
-        S = jnp.einsum("bmr,br,bnr->bmn", R, g, jnp.conj(R))
+        S = (jnp.einsum("bmr,br,bnr->bmn", R, g, jnp.conj(R)) if mm is None
+             else mm(R * g[:, None, :], R, transb="C"))
         Sc = jnp.conj(S)
         # V_ref − V_LR from the sphere factors A = ζ̃√v  (V = conj(A)A^T)
         A_ref = ZGq * jnp.sqrt(v_ref)[:, None, :]
         A_lr = ZGq * jnp.sqrt(v_lr)[:, None, :]
-        V_delta = jnp.einsum("bmg,bng->bmn", jnp.conj(A_ref), A_ref) \
-            - jnp.einsum("bmg,bng->bmn", jnp.conj(A_lr), A_lr)
-        V_SRc = Sc @ V_delta @ Sc
-        zt = S @ ZGq                     # cleaned ζ̃ on the sphere (rows μ)
+        if mm is None:
+            V_delta = jnp.einsum("bmg,bng->bmn", jnp.conj(A_ref), A_ref) \
+                - jnp.einsum("bmg,bng->bmn", jnp.conj(A_lr), A_lr)
+            V_SRc = Sc @ V_delta @ Sc
+            zt = S @ ZGq                     # cleaned ζ̃ on the sphere (rows μ)
+        else:
+            V_delta = (mm(jnp.conj(A_ref), A_ref, transb="T")
+                       - mm(jnp.conj(A_lr), A_lr, transb="T"))
+            V_SRc = mm(mm(Sc, V_delta), Sc)
+            zt = mm(S, ZGq)
         # (c) phase-factored cleaned form factors on the superset
         zt_ext = jnp.concatenate(
             [zt, jnp.zeros((zt.shape[0], n_mu, 1), zt.dtype)], axis=2)
@@ -1052,6 +1061,65 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
 
     def _make_clean_split(qb3):
         return jax.jit(_clean_split_body, out_shardings=(qb3, qb3, qb3))
+
+    # The face route (owner rule 2026-10-19: a mesh backup at every whole-matrix site): a
+    # chunk whose q count does not divide the mesh (the q-batched layout degrades to
+    # replicated) or whose whole matrices per q owner do not fit beside what is live runs
+    # with every n_μ x n_μ operand tiled: the eigh in the room through distrib_la's
+    # place() (route (c) where whole matrices fit and are faster, else the whole mesh),
+    # the products by the face GEMM. n_μ tiles the mesh, as C_q's own face does.
+    from lxkit import memory
+    from distrib_la import matmul as _face_mm
+    from common.gpu_utils import shared_device_room
+    face3 = NamedSharding(mesh_xy, P(None, "x", "y"))
+    rep = NamedSharding(mesh_xy, P())
+    _routes: dict = {}
+
+    def _on_face(nb):
+        if nb not in _routes:
+            if nb % ndev:
+                _routes[nb] = True
+            else:
+                per = 16.0 * n_mu * (6 * n_mu + 3 * ngkmax)          # C, R, S, Sc, V_delta, V_SRc; ζ̃ and A
+                whole = memory.Price(operands=memory.Term(
+                    per * (nb // ndev), source="whole q tiles per owner (closed form, chooser)"), ranks=ndev)
+                tiled = memory.Price(operands=memory.Term(
+                    spread=nb * per,
+                    source="face tiles (closed form, chooser)"), ranks=ndev)
+                _routes[nb] = memory.admit(f"BSE V(q) coarse chunk {nb} x {n_mu}^2", (
+                    ("q-batched", whole), ("face", tiled)),
+                    int(shared_device_room("BSE V(q) coarse chunk"))) == "face"
+        return _routes[nb]
+
+    _face_programs: dict = {}
+
+    def _face_chunk(sl, nb):
+        if nb not in _face_programs:
+            fplan = linalg_plan("eigh", mesh_xy, backend=eigh_backend, n=n_mu,
+                                budget_bytes=shared_device_room("BSE V(q) coarse eigh"))
+            mm = partial(_face_mm, mesh=mesh_xy, batched_route="auto",
+                         budget_bytes=int(shared_device_room("BSE V(q) coarse GEMM")))
+
+            @partial(jax.jit, out_shardings=face3)
+            def herm(c):
+                return 0.5 * (c + jnp.conj(jnp.swapaxes(c, -2, -1)))
+
+            out = _ns(mesh_xy, P(None, "x", "y"), (nb, n_mu, n_mu), "prepare_coarse.face_S")
+
+            @partial(jax.jit, out_shardings=(out, out, _ns(mesh_xy, P(None, None, ("x", "y")),
+                                                           (nb, n_mu, nG), "prepare_coarse.face_F")))
+            def split(lam, R, ZGq, v_ref, v_lr, idx, qfr_b):
+                ZG = jax.lax.with_sharding_constraint(ZGq, face3)
+                return _clean_split_body(lam, R, ZG, v_ref, v_lr, idx, qfr_b, mm=mm)
+            _face_programs[nb] = (fplan, herm, split)
+        fplan, herm, split = _face_programs[nb]
+        lam, R = fplan.batched(herm(C_q[sl]))
+        zg = _ns(mesh_xy, P(None, None, ("x", "y")), (nb, n_mu, ngkmax), "prepare_coarse.face_zeta")
+        return split(lam, R, zx["ZG"].read_q_slab(sl.start, nb, sharding=zg),
+                     device_put_process_local(v_ref_all[sl], rep),
+                     device_put_process_local(v_lr_all[sl], rep),
+                     device_put_process_local(idx_all[sl], rep),
+                     device_put_process_local(zx["qfr"][sl], rep))
 
     S_np = (np.empty((nq, n_mu, n_mu), dtype=np.complex128)
             if keep_host_mirrors else None)
@@ -1074,6 +1142,14 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     for q0 in range(0, nq, q_chunk):
         sl = slice(q0, min(q0 + q_chunk, nq))
         nb_lead = sl.stop - sl.start
+        if _on_face(nb_lead):
+            S_b, V_b, F_b = _face_chunk(sl, nb_lead)
+            if keep_host_mirrors:
+                S_np[sl], V_SRc_np[sl] = _to_host(S_b), _to_host(V_b)
+            else:
+                V_dev_chunks.append(V_b)
+            Fch[sl] = _to_host(F_b)
+            continue
         (_eigh_batch, _clean_split) = _kernels(nb_lead)
         qb2, qb3 = _qb(nb_lead)
         if (eigh_plan.is_native
