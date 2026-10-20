@@ -152,7 +152,7 @@ def gram_transfer_summary(model, gc, gb, sites, *, probe_sites=None, mixed=None,
 
 def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
             max_workspace_bytes=1024**3, probe_sites=None, basis='union', record=None):
-    from gw.shared_pole_constructor import reduce_general_pencil
+    from gw.shared_pole_constructor import reduce_general_pencil, general_pencil_workspace_bytes
     started=time.perf_counter();path=Path(path)
     digest=hashlib.sha256(path.read_bytes()).hexdigest()
     with np.load(path,allow_pickle=False) as store:
@@ -165,7 +165,7 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
         keys=list(store.files)
     if e.ndim!=2 or a.shape!=e.shape or min(e.shape)<1 or not np.isfinite(e).all() or not np.isfinite(a).all():
         raise ValueError('Finite, nonempty compatible E,A required')
-    nl,nr=e.shape;price=16*(16*nl*nr+12*min(nl,nr)**2)+sum(v.nbytes for v in optional.values())
+    nl,nr=e.shape;price=general_pencil_workspace_bytes(e.shape)+sum(v.nbytes for v in optional.values())
     if price>max_workspace_bytes:
         raise ValueError(f'Bounded analysis refuses estimated {price} > {max_workspace_bytes} bytes')
     if max_order<1 or any(not 0<t<1 for t in tolerances):

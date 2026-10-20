@@ -45,6 +45,17 @@ def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
         fixed_spaces=[fixed_spaces])[0]
 
 
+def general_pencil_workspace_bytes(shape):
+    """Conservative host bytes for current descriptor SVD/balance/modal maps.
+
+    Covers reduced E/A and frequency spaces, both SVDs and their work,
+    balanced ordinary-eigenvector/metric buffers and reconstruction products.
+    It never prices or gathers microscopic port matrices.
+    """
+    l,r=map(int,shape)
+    return 16*(16*l*r+24*min(l,r)**2)
+
+
 def general_pencil_batch_plan(shapes, *, max_order, max_workspace_bytes=4*1024**3,
                              processes=None, retained_host_bytes=0):
     """Price a prefix of at most P SMALL reduced pencils before host gather.
@@ -66,7 +77,7 @@ def general_pencil_batch_plan(shapes, *, max_order, max_workspace_bytes=4*1024**
     for width in range(1,min(world,len(shapes))+1):
         batch=shapes[:width]
         inputs=[32*l*r for l,r in batch]
-        reduce=[16*(16*l*r+12*min(l,r)**2) for l,r in batch]
+        reduce=[general_pencil_workspace_bytes((l,r)) for l,r in batch]
         orders=[min(int(max_order),l,r) for l,r in batch]
         models=[16*k*(1+2*l+2*r) for (l,r),k in zip(batch,orders)]
         words=[16*max(l,r,1)*k for (l,r),k in zip(batch,orders)]
@@ -184,8 +195,9 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     finite-pole Loewner bank. A-visible directions unresolved in E are not
     promoted into nearly infinite modal states. This is numerical rank
     resolution, not a stable-pole projection: resolved growing poles remain.
-    Generalized LAPACK eigenvectors produce unchanged complex poles and
-    independent input/output coefficient maps. No pole or residue is clipped.
+    Every CURRENT projected descriptor, including held spaces, is SVD-balanced
+    to an ordinary eigenproblem. The recovered maps retain unchanged complex
+    poles and independent input/output coefficients. No pole or residue is clipped.
     ``max_order`` bounds realization states, not the full spatial port count.
 
     Returns a plain mapping with ``poles_ry[K]``, ``output_map[r,K]`` and
@@ -206,7 +218,7 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     # Conservative inherited bound for descriptor factors/workspace, the
     # projected descriptor and both eigenspaces. This is admission, not a
     # claim that LAPACK's hidden workspace is zero.
-    price = 16 * (16 * nl * nr + 12 * min(nl, nr) ** 2)
+    price = general_pencil_workspace_bytes(E.shape)
     if price > int(max_workspace_bytes):
         raise ValueError(f"GATE shared_general_capacity: host pencil workspace {price} "
                          f"exceeds {int(max_workspace_bytes)} bytes")
@@ -233,21 +245,38 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
             raise ValueError("GATE shared_general_basis: fixed spaces differ from current pencil")
     eigen_started=time.perf_counter()
     er, ar = y.conj().T @ E @ x, y.conj().T @ A @ x
-    poles, wl, vr = la.eig(ar, er, left=True, right=True, check_finite=False)
+    balance_started=time.perf_counter()
+    ub, sb, vbh = la.svd(er,full_matrices=False,check_finite=False)
+    if (not np.isfinite(sb).all() or not sb.size or sb[0]<=0
+            or sb[-1]<=rank_tolerance*sb[0]):
+        # A held frequency space is NEVER silently rank-truncated. Its
+        # current descriptor must resolve every previously retained state.
+        raise ValueError("GATE shared_general_balance: current descriptor is unresolved or singular")
+    d=1/np.sqrt(sb)
+    right_balance=vbh.conj().T*d[None,:]
+    left_balance=ub*d[None,:]
+    balanced=left_balance.conj().T@ar@right_balance
+    balance_seconds=time.perf_counter()-balance_started
+    geev_started=time.perf_counter()
+    poles, wl, vr = la.eig(balanced,left=True,right=True,check_finite=False)
+    geev_seconds=time.perf_counter()-geev_started
     if not np.isfinite(poles).all():
         raise ValueError("GATE shared_general_poles: descriptor has an unresolved infinite pole")
-    metric = wl.conj().T @ er @ vr
+    metric = wl.conj().T @ vr
     diagonal = np.diag(metric)
-    norm = np.linalg.norm(er) * np.linalg.norm(wl, axis=0) * np.linalg.norm(vr, axis=0)
+    norm = np.linalg.norm(wl, axis=0) * np.linalg.norm(vr, axis=0)
     if np.any(np.abs(diagonal) <= 128 * np.finfo(float).eps * norm):
         raise ValueError("GATE shared_general_poles: defective or unresolved eigenvector normalization")
-    # Generalized left/right eigenvectors are biorthogonal for distinct poles.
+    # Left/right ordinary eigenvectors are biorthogonal for distinct poles.
     # In a degenerate eigenspace use its full metric, never per-column division.
     inverse = la.solve(metric, np.eye(n, dtype=complex), check_finite=False)
-    output = x @ vr
-    inputs = y @ wl @ inverse.conj().T
-    residual = np.linalg.norm(ar @ vr - (er @ vr) * poles[None]) / max(
-        np.linalg.norm(ar @ vr), np.finfo(float).tiny)
+    original_right=right_balance@vr
+    output = x @ original_right
+    inputs = y @ left_balance @ wl @ inverse.conj().T
+    # Check the ORIGINAL descriptor, not just the better-scaled ordinary
+    # equation. Balancing is an invertible coordinate change, not pole repair.
+    residual = np.linalg.norm(ar @ original_right - (er @ original_right) * poles[None]) / max(
+        np.linalg.norm(ar @ original_right), np.finfo(float).tiny)
     offdiag = metric - np.diag(diagonal)
     # Mixing distinct eigenvalues would change the transfer; only roundoff
     # off-diagonal metric is acceptable outside exactly degenerate blocks.
@@ -263,9 +292,12 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                              eigen_residual=float(residual), metric_offdiagonal=float(np.linalg.norm(offdiag)),
                              modal_commutator_error=float(commutator_error),
                              max_growth_ry=float(np.max(poles.imag)),
+                             balance_seconds=balance_seconds,ordinary_eigen_seconds=geev_seconds,
+                             current_descriptor_condition=float(sb[0]/sb[-1]),
                              svd_seconds=svd_seconds,eigen_seconds=time.perf_counter()-eigen_started,
                              host_reduce_seconds=time.perf_counter()-started,
                              numerical_spaces="two-sided-descriptor-svd",
+                             eigensolver="current-descriptor-balanced-ordinary-geev",
                              construction="general-two-sided-tangential-loewner"))
 
 

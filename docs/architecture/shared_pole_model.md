@@ -691,9 +691,16 @@ rank tolerance inherited from the source scalar bank tolerance. A-only
 directions unresolved in E are not promoted into nearly infinite modes.
 This is a numerical approximation checked against current response data,
 not a generic singular-descriptor equivalence or stable-pole projection.
-The general biorthogonal eigensolve retains resolved growing poles unchanged,
-without Hermitian/PSD projection. Held spaces remain canonical within the
-inner solve; current pencils and all response/growth checks are recomputed.
+For BOTH fresh and held spaces, the current projected descriptor is again
+SVD-balanced into an ordinary non-Hermitian eigenproblem. Its left/right
+inverse-square-root transformations recover the original descriptor maps;
+the full eigenvector metric handles degenerate blocks. Every retained state
+must remain resolved: singular/unresolved held descriptors refuse without
+rank dropping. Original-pencil backward and modal-commutator gates remain.
+Resolved growing poles stay unchanged, without Hermitian/PSD projection.
+Held spaces remain canonical within the inner solve; current pencils and
+all response/growth checks are recomputed. One common conservative host-price
+owner covers the extra SVD/balance buffers before gather or factorization.
 The resulting full-port factors obey
 
 $$
