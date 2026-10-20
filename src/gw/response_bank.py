@@ -1026,10 +1026,14 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 if lu is not None:
                     from distrib_la import lu_workspace_query
                     ledger, n_lu = meta.shared_pole_capacity, int(args[0].shape[-1])
-                    lu.chunk_room(n_lu, n_lu, max(0, ledger.room_bytes_per_rank(ledger.live_stages)
-                                                  - memory.argument_size_in_bytes - new))
+                    room = max(0, ledger.room_bytes_per_rank(ledger.live_stages) - memory.argument_size_in_bytes - new)
                     try:
-                        new += lu_workspace_query(mesh_xy, n_lu, n_lu, np.complex128)
+                        # getrf, its pivots and one block column (cap 0: the native's narrowest
+                        # chunk) sit beside the chunks: the cap is what the room leaves past them.
+                        lu.chunk_room(n_lu, n_lu, 0)
+                        cap = allocator.bucket(room - lu_workspace_query(mesh_xy, n_lu, n_lu, np.complex128, 0))
+                        lu.chunk_room(n_lu, n_lu, cap)
+                        new += lu_workspace_query(mesh_xy, n_lu, n_lu, np.complex128, cap)
                     except BaseException:
                         lu.chunk_room(n_lu, n_lu, None)
                         raise
@@ -3214,7 +3218,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # are live until its Dyson programs consume them: a named reservation every room sees.
         fields = 2 if need_value else 1
         live_rows = ledger.live_stages
-        rows_stage, _ = _reserve(meta, "sample_rows", 0, (fields + bool(partner)) * len(rows) * face_bytes)
+        rows_stage, _ = _reserve(meta, "sample_rows", 0, (fields + bool(partner)) * len(rows) * face_bytes,
+                                 book=False)
         ledger.live_stages = live_rows + (rows_stage,)
         chi, *chi_value = chi_rows((1, 0) if need_value else (1,))
         if partner:

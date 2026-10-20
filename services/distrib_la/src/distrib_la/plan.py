@@ -341,6 +341,43 @@ def _eigh_seconds(kind, n, ranks=4, platform="CUDA"):
     return pts[0][1] + (t - pts[0][1]) * 4 / ranks
 
 
+_STACK_CLASSES: dict = {}     # stack decisions by room class (Plan.stack_route)
+_ROOM_TESTS: list = []          # open recorders: [(test, outcome, room), ...] per build
+
+
+def room_test(test, room):
+    """``test(room)``, recorded for every open :func:`room_class` build: a room enters a
+    program or a price only through such tests (each a compiled figure against the room)."""
+    out = test(room)
+    for rec in _ROOM_TESTS:
+        rec.append((test, out, room))
+    return out
+
+
+def room_class(cache, key, room, build):
+    """``build()`` once per class of rooms that decide alike: an entry built at room r0 serves a
+    room r when every test the build made of r0 (:func:`room_test`) comes out the same at r (a
+    test of another room: r == r0 only).  A hit replays its tests to any enclosing build.  The
+    programs and prices it caches carry the room only through those decisions, so rounds that
+    repeat a shape in another room reuse them (decided, as response_bank's ``_Decided``)."""
+    for r0, tests, value in cache.setdefault(key, []):
+        if all(test(room) == out if r == r0 else room == r0 for test, out, r in tests):
+            for rec in _ROOM_TESTS:
+                rec.extend(tests)
+            return value
+    rec = []
+    _ROOM_TESTS.append(rec)
+    try:
+        value = build()
+    finally:
+        # By identity: nested builds' recorders compare equal while empty.
+        del _ROOM_TESTS[next(i for i, r in enumerate(_ROOM_TESTS) if r is rec)]
+    for outer in _ROOM_TESTS:
+        outer.extend(rec)
+    cache[key].append((room, tuple(rec), value))
+    return value
+
+
 def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> StackRoute:
     """THE placement of an eigh stack (nb, n, n) in ``room`` bytes per rank: the faster of the
     routes whose price fits, priced from the shapes only (no vendor query) and timed by
@@ -363,12 +400,12 @@ def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> St
             rounds = -(-(-(-nb // ranks)) // per_rank)
             tried = -(-(-(-nb // rounds)) // ranks)
             price = _stack_bytes(op, mesh, nb, n, dtype, rounds, phase, gathered)
-            if price <= room:
+            if room_test(lambda r, p=price: p <= r, room):
                 one, on_mesh = (_eigh_seconds(k, n, ranks, platform) for k in ("one", "mesh"))
                 if one is None or -(-nb // ranks) * one <= nb * on_mesh:
                     return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, price, room)
                 break
-            per_rank = min(per_rank - 1, max(1, per_rank * room // price))
+            per_rank = room_test(lambda r, k=per_rank, p=price: min(k - 1, max(1, k * r // p)), room)
     return StackRoute(provider, 0, 1, mesh_bytes(), room)
 
 
@@ -379,7 +416,7 @@ def _gathered_admitted(mesh, shape, dtype, room=None) -> bool:
     it is priced compiled in the same room.  cuSOLVERMp 0.9.1 left n 30000 (run30k) with no
     correct attempt short of this one."""
     need = compiled_bytes(_gathered_program(mesh), mesh, tuple(int(v) for v in shape), dtype)
-    return need <= GATHERED_EIGH_BYTES or (room is not None and need <= room)
+    return need <= GATHERED_EIGH_BYTES or room_test(lambda r: r is not None and need <= r, room)
 
 
 @lru_cache(maxsize=None)
@@ -885,7 +922,7 @@ def _measured_rounds(p, A, args, single: bool = False):
             inc_cost = agreed["library"] if need_library else low.get(incumbent)
     seconds = time.perf_counter() - started
     within = lambda r: (costs.get(r) is not None and inc_cost is not None and costs[r] <= inc_cost
-                        and (room is None or costs[r] <= room))
+                        and (room is None or room_test(lambda rr, c=costs[r]: c <= rr, room)))
     if need_library:
         if agreed is None:
             chosen = None                     # no library on this host: one_device's own rounds
@@ -1279,8 +1316,8 @@ class Plan:
             self.require_capacity(f"an eigh stack {shape} with no room")
             return StackRoute(static, room=0)
         key = self._stack_key(op, nb, shape[-1], dtype, traced)
-        decided = _STACK_ROUTES.get(key)
-        if decided is None:
+
+        def decide():
             decided = self._decide_stack(op, nb, key[3], key[4], key[6], traced)
             if decided.route == ROUTE_BATCH_RESHARD and self.capacity_refusal is not None:
                 from lxkit import memory                  # route (c) with no mesh beside it
@@ -1289,7 +1326,8 @@ class Plan:
             if decided.route != ROUTE_BATCH_RESHARD:
                 self.require_capacity(
                     f"the eigh stack {shape} ({_describe_stack(decided)})")
-                if decided.program_bytes is not None and decided.program_bytes > decided.room:
+                if decided.program_bytes is not None and room_test(
+                        lambda r, p=decided.program_bytes: p > r, decided.room):
                     # Over the room (an over-budget stage exhausted it, or the mesh is over it):
                     # the whole mesh is the smallest route; the one policy warns.  Its bytes are
                     # a part of the stage it runs in (sizing and the banner read that stage).
@@ -1301,7 +1339,12 @@ class Plan:
                                      source="the plan's program, compiled (+ provider workspace "
                                             "query), face-sharded"), ranks=self.mesh.size),
                                  decided.room, runs_in=stack, device=False)
-            _STACK_ROUTES[key] = decided
+            return decided
+        # Once per class of rooms that decide it alike: a hit replays its room tests to every
+        # open build (room_class), as place() records them when it decides.
+        decided = room_class(_STACK_CLASSES, key[:5] + key[6:], int(self.budget_bytes),
+                             decide)._replace(room=int(self.budget_bytes))
+        _STACK_ROUTES[key] = decided
         return decided
 
     def _gathered(self, ops) -> bool:
@@ -1352,19 +1395,23 @@ class Plan:
                 op, platform, bound)) * od.one_device_bytes("eigh", int(n), np.dtype(dtype).itemsize)
         import distrib_la
         from distrib_la._result_check import _in_phase
-        key = ("mesh", self.backend, self.batched_route, op, phase, self.budget_bytes)
-        program = _MESH_PROGRAMS.get(key + (mesh_key(self.mesh),))
-        if program is None:
-            route = self.batched_route if self.batched_route != ROUTE_BATCH_RESHARD else ROUTE_SCAN
-            program = _MESH_PROGRAMS[key + (mesh_key(self.mesh),)] = _in_phase(
-                lambda A: self.batched(A, _route=route), phase)
-        try:
-            compiled = compiled_bytes(program, self.mesh, (nb, n, n), dtype)
-        except Exception as exc:                               # noqa: BLE001
-            from lxkit import memory
-            memory.unpriced(f"distrib_la/{self.backend}/{op} program at n {int(n)} does not "
-                            f"lower on this host ({type(exc).__name__}: {str(exc)[:120]})",
-                            "the route is decided without its price")
+        route = self.batched_route if self.batched_route != ROUTE_BATCH_RESHARD else ROUTE_SCAN
+        key = ("mesh", self.backend, self.batched_route, op, phase, mesh_key(self.mesh), int(nb), int(n),
+               np.dtype(dtype).name)
+
+        def build():
+            try:
+                return compiled_bytes(_in_phase(lambda A: self.batched(A, _route=route), phase),
+                                      self.mesh, (nb, n, n), dtype)
+            except Exception as exc:                           # noqa: BLE001
+                from lxkit import memory
+                memory.unpriced(f"distrib_la/{self.backend}/{op} program at n {int(n)} does not "
+                                f"lower on this host ({type(exc).__name__}: {str(exc)[:120]})",
+                                "the route is decided without its price")
+                return None
+        # Compiled once per class of rooms deciding its stacks alike, not once per room.
+        compiled = room_class(_MESH_PROGRAMS, key, self.budget_bytes, build)
+        if compiled is None:
             return None
         # The query reads the stack's own n: a plan prices every stack place() routes, whatever
         # n it was built at (run30k 2026-10-20: h_vv beside a pencil-sized plan).
@@ -1514,10 +1561,11 @@ class Plan:
         retry = program("retry", ())
         # The fallback runs: its program, compiled at the operands, is a part of the open stage.
         from lxkit import memory
-        m = retry.lower(*ops).compile().memory_analysis()
+        executable = retry.lower(*ops).compile()
+        m = executable.memory_analysis()
         memory.book(memory.priced(m.temp_size_in_bytes + m.output_size_in_bytes - m.alias_size_in_bytes,
                                   f"distrib_la {self.op} retry program (compiled)", increment=True))
-        return retry(*ops)
+        return executable(*ops)
 
     def _checked_eigh(self, call, post):
         from distrib_la._result_check import checked_eigh, eigh_layout, shifted

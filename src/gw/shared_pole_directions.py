@@ -578,7 +578,7 @@ class LineSelection:
         if not hasattr(self, "_eigh_bytes"):
             depth = self.nq if self.execution == "local" else 1
             shapes = {f["name"]: (depth, f["rows"], f["rows"]) for f in self.families}
-            routes = {k: self.plans[k].stack_route(s, np.complex128) for k, s in shapes.items()}
+            routes = {k: self.plans[k].stack_route(s, np.complex128, traced=False) for k, s in shapes.items()}
             self._eigh_bytes = max(int(r.program_bytes) if r.program_bytes is not None else
                                    distrib_la.eigh_stack_bytes(self.plans[k], shapes[k], np.complex128)
                                    for k, r in routes.items())

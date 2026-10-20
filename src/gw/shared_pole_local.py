@@ -939,7 +939,8 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
         # A face round holds ``real`` physical parents in its leading slots;
         # the gate equations are per parent, so each is checked on its own
         # leading row (no data moves) and the replicated rows are stacked.
-        from gw.shared_pole_execution import face_check_bytes, face_eigh, face_round_check_program, plan_room
+        from gw.shared_pole_execution import (face_check_bytes, face_compiled, face_eigh,
+                                              face_round_check_program, plan_room)
         if eigh_plan.n not in (None, int(model[0].shape[-2])):
             raise ValueError('whole-mesh shared-pole checks need the n x n eigh plan')
         program = lambda plan: face_round_check_program(mesh_xy, bool(ordered), plan, plan_room(plan))
@@ -954,7 +955,8 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
                 # The same deck eigh request as the round's own face plan.
                 eigh_plan, room = face_eigh(mesh_xy, n, room=room(face_check_bytes(mesh_xy, n, int(model[0].shape[-1]))),
                                             backend=eigh_plan.requested), None
-            executable, run = program(eigh_plan).checked(*args).compiled(*args)
+            executable, run = face_compiled(("check", mesh_xy, bool(ordered), eigh_plan), eigh_plan.budget_bytes,
+                                            lambda _, plan=eigh_plan: program(plan), args)
             book_check_eighs(eigh_plan, n, executable)
             rows.append(jax.tree.map(np.asarray, run(*args)))
         return jax.tree.map(lambda *v: np.concatenate(v, axis=0), *rows)

@@ -886,10 +886,11 @@ def one_device_max_n(op: str, platform: str, room: int | None = None) -> int | N
     bound = ONE_DEVICE_MAX_N.get((op, str(platform)))
     if bound is not None:
         return bound
-    if (op, str(platform)) in ONE_DEVICE_BY_ROOM and room is not None and int(room) > 0:
+    if (op, str(platform)) in ONE_DEVICE_BY_ROOM and room is not None:
         import math
         from distrib_la._one_device import one_device_bytes
-        n = math.isqrt(int(room) // one_device_bytes(op, 1))
+        from distrib_la.plan import room_test
+        n = room_test(lambda r: math.isqrt(int(r) // one_device_bytes(op, 1)) if int(r) > 0 else 0, room)
         return n if n >= 1 else None
     return None
 
@@ -918,7 +919,8 @@ def _size_route(op: str, mesh_xy, n, room: int | None = None) -> str | None:
     if chosen == ONE_DEVICE and room is not None:
         from distrib_la._one_device import one_device_bytes
         need = one_device_bytes(op, int(n))
-        if need > int(room):
+        from distrib_la.plan import room_test
+        if room_test(lambda r: need > int(r), room):
             chosen = library
         priced = (f"; one whole matrix {need / 1e9:.2f} GB/rank "
                   f"{'over' if chosen != ONE_DEVICE else 'within'} room {int(room) / 1e9:.2f} GB")

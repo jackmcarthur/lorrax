@@ -23,6 +23,8 @@ def _vendor_query(ctx, op, sizes, dtype):
     from distrib_la.loader import get_lib
     lib = get_lib('CUDA')
     name = 'lrx_lu_workspace_bytes' if op == 'solve_lu' else 'lrx_eigh_workspace_bytes'
+    if op == 'solve_lu':
+        sizes = sizes[:-1]          # the posted getrs cap: a cache key only (the native reads it)
     if op == 'eigh' and len(sizes) == 2:
         # (side, block): the descriptor the distributed solve runs at. A
         # library without the block query prices one tile per rank at that side.
@@ -270,16 +272,17 @@ def lu_workspace_bytes(mesh, n, dtype) -> int:
                              unit=(int(n) // px + mb) * nb * item).fixed)
 
 
-def lu_workspace_query(mesh, n, nrhs, dtype) -> int:
+def lu_workspace_query(mesh, n, nrhs, dtype, cap) -> int:
     """Device bytes per rank the next cuSOLVERMp ``n x nrhs`` solve_lu allocates beside its
-    operands: the native size query (``lrx_lu_workspace_bytes``: getrf, the getrs chunk the cap
-    posted for this shape admits, pivots) on the solve's own context and descriptors, which sizes
-    and caches the plan the solve then runs.  Collective: every rank asks at the same point."""
+    operands with ``cap`` posted (``Plan.chunk_room``): the native size query
+    (``lrx_lu_workspace_bytes``: getrf, the getrs chunk ``cap`` admits, pivots) on the solve's own
+    context and descriptors, which sizes and caches the plan the solve then runs; cached per cap.
+    Collective: every rank asks at the same point."""
     from distrib_la._cusolvermp import get_or_init_context, lu_blocks, rhs_block
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     mb, nb = lu_blocks(int(n), px, py)
     sizes = (int(n), int(nrhs), mb, nb, mb, rhs_block(int(n), int(nrhs), px, py, mb))
-    return _vendor_query(get_or_init_context(mesh, col_major=False), 'solve_lu', sizes, dtype)[0]
+    return _vendor_query(get_or_init_context(mesh, col_major=False), 'solve_lu', sizes + (int(cap),), dtype)[0]
 
 
 def eigh_stack_bytes(plan, shape, dtype) -> int:

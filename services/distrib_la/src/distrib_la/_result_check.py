@@ -571,11 +571,8 @@ def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options
         report("first", args, status, final=False)
         del out
         return finish(args, again(*args))
-    def compiled(*args):
-        """The first program compiled for ``args`` (its ``memory_analysis`` is what runs) and
-        a runner that retries as :func:`call` does."""
-        executable = first.lower(*args).compile()
-
+    def runner(executable):
+        """A runner of the first program ``executable`` that retries as :func:`call` does."""
         def run(*a):
             out, status = executable(*a)
             if not status or not _flag(status):
@@ -583,8 +580,14 @@ def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options
             report("first", a, status, final=False)
             del out
             return finish(a, again(*a))
-        return executable, run
-    call.lower, call.finish, call.compiled = again.lower, finish, compiled
+        return run
+
+    def compiled(*args):
+        """The first program compiled for ``args`` (its ``memory_analysis`` is what runs) and
+        its :func:`runner`."""
+        executable = first.lower(*args).compile()
+        return executable, runner(executable)
+    call.lower, call.finish, call.compiled, call.runner = again.lower, finish, compiled, runner
     return call
 
 
