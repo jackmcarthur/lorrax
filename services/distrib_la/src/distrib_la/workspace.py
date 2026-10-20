@@ -91,12 +91,20 @@ def local_eigh_workspace(mesh, share, n, dtype) -> int:
     """The device bytes a rank's local eigh of ``share`` (n, n) matrices allocates outside its
     program's buffers: on CUDA the native cusolverDn size query (jaxlib's syevd FFI has no
     workspace output; one matrix's, the handler solves them one at a time), on ROCm the
-    batched rocSOLVER workspace, none on CPU."""
+    batched rocSOLVER workspace, or outside its window one matrix's at the same measured rate,
+    none on CPU."""
     platform = mesh_platform(mesh)
     if platform == 'CUDA':
         return _vendor_query(0, 'eigh', (int(n),), np.dtype(dtype).str)[0]
-    from distrib_la.local_eigh import batched_workspace_bytes
-    return batched_workspace_bytes((int(share), int(n), int(n)), dtype, platform)
+    from distrib_la.local_eigh import BATCHED_EIGH_ROUTE, batched_workspace_bytes
+    got = batched_workspace_bytes((int(share), int(n), int(n)), dtype, platform)
+    row = BATCHED_EIGH_ROUTE.get(platform)
+    win = None if row is None else row.windows.get(np.dtype(dtype).name)
+    if got or win is None:
+        return got
+    # Outside the batched window jaxlib's hipsolver_syevd_ffi solves one matrix per call: one
+    # matrix's rocSOLVER workspace at the window's measured rate (pool log eighc_wsq), plus E.
+    return win.workspace_tiles * int(n) ** 2 * np.dtype(dtype).itemsize + int(n) * 8
 
 
 def _workspace_details(plan, op, shapes, dtype):
