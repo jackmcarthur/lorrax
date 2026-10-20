@@ -76,7 +76,7 @@ REPLICATED.  Eigenvectors are COLUMNS.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache, partial
 from typing import Any, Callable, NamedTuple
 
@@ -1366,7 +1366,10 @@ class Plan:
                             f"lower on this host ({type(exc).__name__}: {str(exc)[:120]})",
                             "the route is decided without its price")
             return None
-        vendor = (distrib_la.workspace_bytes_per_rank(self, "eigh", ((int(nb), int(n), int(n)),), dtype)
+        # The query reads the stack's own n: a plan prices every stack place() routes, whatever
+        # n it was built at (run30k 2026-10-20: h_vv beside a pencil-sized plan).
+        sized = self if self.n in (None, int(n)) else replace(self, n=int(n))
+        vendor = (distrib_la.workspace_bytes_per_rank(sized, "eigh", ((int(nb), int(n), int(n)),), dtype)
                   if self.backend == "cusolvermp" else 0)
         return compiled + int(vendor)
 

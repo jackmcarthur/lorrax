@@ -47,3 +47,30 @@ def test_face_programs_are_keyed_by_the_plans_room():
     assert small == large
     programs = {spe.face_round_check_program(mesh, True, p, spe.plan_room(p)) for p in (small, large)}
     assert len(programs) == 2
+
+
+def test_cuda_workspace_query_reads_the_stacks_own_n(monkeypatch):
+    """place() prices any stack with the plan it holds (run30k 2026-10-20: h_vv beside a
+    pencil-sized plan raised 'eigh shape differs from the planned n' on CUDA only). The CUDA
+    branch runs here with the platform and the native query stubbed; the plan/shape guard
+    runs on every platform."""
+    import distrib_la
+    import distrib_la._cusolvermp as mp
+    from distrib_la import workspace
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    face = NamedSharding(mesh, P("x", "y"))
+
+    def stub(A, *, mesh, compute_evecs=True, block=None, side=None):
+        return (jnp.zeros(A.shape[-1], jnp.float64), jax.lax.with_sharding_constraint(A * (1 + 0j), face))
+    asked = []
+    monkeypatch.setattr(mp, "distributed_eigh", stub)
+    monkeypatch.setattr(mp, "get_or_init_context", lambda mesh, **k: 1)
+    monkeypatch.setattr(workspace, "_vendor_query", lambda ctx, op, sizes, dtype: asked.append(sizes) or (7, 0))
+    p = distrib_la.plan("eigh", mesh, n=64, backend="off", batched_route="auto", price_only=True)
+    cuda = dataclasses.replace(p, backend="cusolvermp", in_sharding=face,
+                               batch_in_sharding=NamedSharding(mesh, P(None, "x", "y")))
+    with pytest.raises(ValueError, match="planned n"):       # CPU platform: the guard still runs
+        distrib_la.workspace_bytes_per_rank(p, "eigh", ((1, 32, 32),), np.complex128)
+    monkeypatch.setattr(workspace, "mesh_platform", lambda mesh: "CUDA")
+    got = cuda.mesh_bytes("eigh", 1, 32, np.complex128)
+    assert asked and asked[-1][0] == mp.solve_layout(32, 2)[0] and got > 7, (asked, got)
