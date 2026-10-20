@@ -193,6 +193,40 @@ def test_block_equals_dense_rpa_inverse_and_red_twins():
     assert np.linalg.norm(naive - ref) / np.linalg.norm(ref - np.eye(n)) > 1.0
 
 
+def test_epsmat_ecut_is_the_leading_sub_block_not_a_reinversion():
+    """``epsmat_ecut`` keeps the leading gcutoff G of the full order: the written block is the
+    sub-block of the converged ε⁻¹ (docs/theory/bgw_epsmat_export.md#ecut).  Control
+    variant: the inverse of the dielectric matrix restricted to the cut G set, which is what a
+    fresh epsilon run at the smaller cutoff would write."""
+    from gw import epsmat_export as ee
+    from file_io import bgw_epsmat as be
+    mesh = _mesh()
+    q = (1 / 6, 1 / 3, 0.0)
+    assert ee.resolve_ecut(0.0, 5.0, source="t")[0] == 5.0          # 0 = the full sphere
+    e, _ = ee.resolve_ecut(2.5, 5.0, source="t")
+    with pytest.raises(ValueError, match="GATE epsmat_ecut_beyond_sphere"):
+        ee.resolve_ecut(5.5, 5.0, source="t")
+    full = export(mesh, q, ecuts=5.0)
+    # The prefix of the full order is BerkeleyGW's own list at the smaller cutoff.
+    qg = full["qg"]
+    pre = qg._replace(nmtx=be.gcutoff(qg.ekin[qg.order], e))
+    _, direct = bgw_list(np.asarray(q), e)
+    assert pre.nmtx == direct.nmtx and np.array_equal(pre.order[:pre.nmtx], direct.order[:direct.nmtx])
+    cut = export(mesh, q, ecuts=e)
+    n, N = cut["n"], full["n"]
+    assert 0 < n < N
+    Ec = cut["blk"][:n, :n, 0] + 1j * cut["blk"][:n, :n, 1]
+    Ef = full["blk"][:N, :N, 0] + 1j * full["blk"][:N, :N, 1]
+    one = np.linalg.norm(Ef[:n, :n] - np.eye(n))
+    assert np.linalg.norm(Ec - Ef[:n, :n]) / one < 1e-12
+    assert np.allclose(cut["diag"][:n], full["diag"][:n], rtol=0, atol=1e-12)
+    rows = rows_in_sphere(cut["sphere"], cut["miller"])
+    eps = np.eye(cut["Z"].shape[0]) - cut["v"][:, None] * (cut["Z"] @ cut["chi0"] @ cut["Z"].conj().T)
+    assert np.linalg.norm(Ec.T - np.linalg.inv(eps)[np.ix_(rows, rows)]) / one < 1e-10
+    reinv = np.linalg.inv(eps[np.ix_(rows, rows)])
+    assert np.linalg.norm(Ec.T - reinv) / one > 1e-3, "the cut must not be a re-inversion"
+
+
 def test_projection_round_trip_and_its_gate():
     from gw import epsmat_export as ee
     mesh = _mesh()
@@ -347,12 +381,16 @@ def test_umklapp_match_and_slots():
 
 def test_deck_refusals(tmp_path):
     from gw.epsmat_config import EpsmatConfig
-    good = "[epsmat]\nsource_restart = r\nparent_input_file = d.in\noutput_dir = o\nepsilon_cutoff = 10\n"
+    good = "[epsmat]\nsource_restart = r\nparent_input_file = d.in\noutput_dir = o\nepsmat_ecut = 10\n"
     (tmp_path / "a.in").write_text(good)
     cfg = EpsmatConfig.from_input_file(str(tmp_path / "a.in"))
     assert cfg.mode == "export" and cfg.files == ("eps0mat", "epsmat") and cfg.rcond == 1e-8
-    for bad, gate in ((good + "epsilon_cutof = 3\n", "epsmat_unknown_key"),
-                      (good.replace("epsilon_cutoff = 10\n", ""), "epsmat_epsilon_cutoff"),
+    assert cfg.epsmat_ecut == 10.0
+    (tmp_path / "a.in").write_text(good.replace("epsmat_ecut = 10\n", ""))
+    assert EpsmatConfig.from_input_file(str(tmp_path / "a.in")).epsmat_ecut == 0.0   # full sphere
+    for bad, gate in ((good + "epsmat_ecu = 3\n", "epsmat_unknown_key"),
+                      (good.replace("epsmat_ecut = 10", "epsilon_cutoff = 10"), "epsmat_retired_key"),
+                      (good.replace("epsmat_ecut = 10", "epsmat_ecut = -1"), "epsmat_ecut_value"),
                       (good + "mode = both\n", "epsmat_mode"),
                       (good.replace("[epsmat]", "[cohsex]"), "epsmat_deck_section")):
         (tmp_path / "b.in").write_text(bad)
@@ -483,7 +521,7 @@ def test_q0_body_3d_key_is_validated(tmp_path):
     from gw.epsmat_config import EpsmatConfig
     deck = tmp_path / "e.in"
     base = ("[epsmat]\nsource_restart = /x\nparent_input_file = /x/g.in\n"
-            "output_dir = /x/o\nepsilon_cutoff = 5.0\n")
+            "output_dir = /x/o\nepsmat_ecut = 5.0\n")
     deck.write_text(base)
     assert EpsmatConfig.from_input_file(str(deck)).q0_body_3d == "refuse"
     deck.write_text(base + "q0_body_3d = omit_head_wing\n")
