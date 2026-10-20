@@ -31,8 +31,8 @@ else.
 | `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (shared pole, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
 | `bse` | L1 | the Bethe–Salpeter equation: kernels, TDA and full solvers, absorption, exciton bands, the $W_\mathrm{BSE}$ ladder | `python -m bse.bse_jax`, `bse.exciton_bands`, `bse.absorption_haydock`, `bse.bse_feast`, `bse.bse_kpm`, `bse.bse_w_exact` | `gw.screening_bse`, `file_io.restart_bundle` (both lazily) |
 | `bandstructure` | L1 | band interpolation (htransform), fine-k wavefunctions for the BSE, band operators | `python -m bandstructure.htransform` | `bse` |
-| `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, pivoted-Cholesky pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw` |
-| `isdf` | L1 | ζ-fit primitives (pair Grams, $C_q$ conditioning, the μ-batch route) and the whole-state Galerkin basis | library | `gw`, `bandstructure`, `bse`, `centroid` |
+| `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, pivoted-Cholesky pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw`, `bandstructure` (htransform nodes) |
+| `isdf` | L1 | ζ-fit primitives (pair Grams, $C_q$ conditioning, the μ-batch route) and the nodal htransform basis | library | `gw`, `bandstructure`, `bse`, `centroid` |
 | `psp` | L1 | the plane-wave DFT layer: $T$, $V_\mathrm{loc}$, $V_\mathrm{NL}$, DFT+U and XC operators, pseudopotentials, radial tables, the preprocessing and mean-field drivers | `python -m psp.get_dipole_mtxels`, `psp.run_nscf`, `psp.run_dense_h`, `psp.run_sternheimer`, `psp.get_DFT_mtxels`, `psp.kpm_dos`, `psp.orbital_magnetization` | `gw`, `bandstructure`, `common`, `file_io`, `solvers` |
 | `postprocess` | L1 | WFN → `WFN_qp.h5` rotation | `python -m postprocess.rotate_wfn_to_qp` | nothing |
 | `tdagw` | L1 | real-time TD-aGW in TDGW's conventions: the equation of motion, the injected ΔΣ[ρ] models (TDGW kernel, low-rank, the ISDF COHSEX model of a GW restart), the jitted k-sharded propagator, TDGW's file formats | `python -m tdagw.tdgw_jax`, `tdagw.kernel_export`, `tdagw.tdgw_bridge` | nothing |
@@ -288,7 +288,7 @@ The method and the flags: [band interpolation and exciton bands](how-to/htransfo
 |---|---|
 | `__init__.py` | Package marker. |
 | `htransform.py` | The htransform driver: `python -m bandstructure.htransform`; band coloring and grid moments. |
-| `fh_interp.py` | The $f(H)$ interpolation library: the $f$-transform, `build_fH_R`, the path solve, Newton inversion, the QP rotation of the compact state. |
+| `fh_interp.py` | The $f(H)$ interpolation library: the node set (`htransform_nodes`), the $f$-transform, `build_fH_R` (with the back-map), the per-pair WS code tables, the top-block solve and its route admission, the path solve, Newton inversion, the QP rotation of the compact state. |
 | `bse_setup.py` | Fine-k wavefunctions at the coarse centroids from the same $f(H)$ (`compute_wfns_fi`), for BSE densification and exciton bands. |
 | `orbital.py` | Band operators (spin, orbital character, the stored velocity), their interpolation, the path orbital moments and coarse orbital totals, and the grid spin moments. |
 | `production_report.py` | The rank-0 report `htransform.out`. |
@@ -302,7 +302,7 @@ The method and the flags: [band interpolation and exciton bands](how-to/htransfo
 | `cplus.py` | $C_q^+$ by rank truncation: the one conditioning seam of the charge fit. |
 | `pair_kernels.py` | The pair-projector GEMM of the μ-batch ζ fit. |
 | `zeta_mubatch.py` | The μ-batch ζ fit, route G: $Z_q(G)$ by centroid batches ([μ-batch fit](architecture/zeta_fit_mubatch.md)). |
-| `galerkin.py` | The whole-state Galerkin basis of htransform: randomized-QRCP selection, factorization, projection, its artifact. |
+| `galerkin.py` | The nodal basis of htransform: values at an orbit-closed node set, the orbit-tied quadrature metric, the Löwdin frame, the back-map targets, its artifact. |
 
 ## `src/psp`
 

@@ -5,6 +5,61 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — htransform nodal basis (replaces the randomized-QRCP Galerkin basis)
+
+The htransform basis (`isdf.galerkin`) is now nodal: the fitted states'
+values at an orbit-closed node set, an orbit-tied quadrature metric and a
+per-k Löwdin frame. f(H) is a node-pair kernel continued off the coarse grid
+with per-pair Wigner–Seitz images (`common.ws_images`), and every fine-k,
+path, active-window, orbital and moment-grid solve is a top-block subspace
+solve whose route (`q-batched` or `face`) the memory model admits
+([how-to](docs/how-to/htransform-and-exciton-bands.md) §2–3).
+
+- **Results move.** Every htransform band structure, every `bse_k_grid`
+  (fine-k BSE) result, `exciton_bands` and the `vq_interp` refit inputs are
+  new numbers; recompute them. Off the coarse grid the bands are
+  star-covariant: Si 4³→8³ (default 780 nodes) star spread 239.3 meV under
+  the QRCP basis, 2.1e-7 meV now; off-grid DFT MAE 41.6 → 6.78 meV (max 204
+  → 28.0; 0.63 % / 2.6 % of the 1080.4 meV QP fundamental gap of the deck's
+  eqp1_a.dat, direct 3072.8 meV). MoS₂ 9×9→12×12 (1183 nodes): star spread
+  9.3 → 6.6e-6 meV, MAE 2.30 → 2.37 meV (0.07 % of 3230.8 meV, direct
+  3552.9). On the grid they reproduce the fitted energies.
+- **hsuite.** `reference/htransform.npz` and `reference/exciton_bands.npz` are
+  rebaselined (other references unchanged). Every hsuite path k and exciton Q
+  lies on the 5×5×1 coarse grid, where the nodal basis reproduces the
+  fixture's DFT energies to 1.8e-3 meV; the old reference carried the QRCP
+  basis's on-grid error (up to 0.584 meV in `htransform.dat`, 0.10 % of the
+  fixture's 577.2 meV QP fundamental gap, direct 841.3 meV; and −1.72 /
+  +1.65 / −4.06 meV, up to 0.70 %, in the exciton energies at Γ / X / M).
+- **Decks.** `htransform_rank_multiplier` and `htransform_qrcp_seed` refuse
+  by name (`GATE htransform_qrcp_retired`): delete them. `htransform_qr_eps`
+  is kept, but it is now only the relative pseudo-inverse cutoff of the
+  refit's node Gram; the fit has no tolerance.
+- **Centroids and nodes.** Orbit-closed sets are mandatory: a centroid or
+  node set that is not closed under the WFN's operations refuses (regenerate
+  it with `centroid.kmeans_cli --orbit`). The node count is
+  min(N_μ, 22 × fitted bands): with more ISDF centroids than that, an
+  orbit-closed k-means selection on the fitted bands is made once and cached
+  beside `galerkin_dft.h5` as `galerkin_nodes_<N>_b<b0>-<b1>_<wfn>.txt`, and
+  the states at the centroids, which the BSE consumers read, become back-map
+  targets. The fit warns when the metric eps exceeds 1e-2 (too few nodes).
+- **Files.** `galerkin_dft.h5` is format 6 (node indices and target states
+  added). An older file is left untouched and the basis is refitted in memory
+  on every run; delete it to publish the format-6 basis once.
+- **Memory.** The fine-k stage holds f(H)_R and the back-map L_R,
+  `16·N_k·N_B·(N_B + N_T)/P` bytes per rank (`N_B` = spin × nodes, `N_T` =
+  spin × centroids, 0 when the nodes are the centroids), plus int16 WS code
+  tiles `2·N_k·N_B·(N_B + N_T)/P`; the lattice-box R tensor it replaces was
+  `16·N_k·rank²/P` without the back-map. Both are admitted (`lxkit.memory`).
+  Si 4³ at P = 4: 1.69 GB per device (780 nodes, 1100 targets) against 0.10
+  GB for the QRCP box (rank 636); device peak of the fine stage 4.19 against
+  1.01 GiB. MoS₂ 9×9: 4.11 GB per device, peak 9.55 GiB.
+- **Tests.** `tests/test_nodal_htransform_cpu.py`: star covariance, on-grid
+  exactness, off-grid accuracy against the control variants (sign-flipped
+  pair displacement, one image set per class, the box), the orbit-tied
+  metric, the top-block solve at block ≪ rank with its `max_iter = power`
+  control, and the back-map through a non-uniform metric.
+
 ## 2026-10-20 — c1 head channel: the q ≠ 0 projector carries the gauge phase
 
 `w_head_densify = c1` re-attaches W's Γ head at every fine q inside the coarse

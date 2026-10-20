@@ -38,29 +38,42 @@ with $s$ the spinor component and $r$ the points of the real-space FFT grid.
 Each row is the full Bloch state, phase $e^{ik\cdot r}$ included. The row
 space of $\Psi$ contains every state LORRAX will interpolate, so it is the
 natural space, but it is too large to use directly. `isdf.galerkin.fit_galerkin_basis`
-represents every state by its values at the run's ISDF centroids, the nodes
-(charge-density-weighted k-means, orbit-closed under the crystal operations),
-sampled once through the GW centroid-face path
+represents every state by its values at a set of nodes $r_\nu$, sampled once
+through the GW centroid-face path
 (`common.wfn_transforms.load_centroids_band_chunked`):
 
 $$\Phi_k[(s,\nu), n] = \psi_{nk}(s, r_\nu).$$
 
+**Nodes.** $N_\mathrm{node} = \min(N_\mu, 22\,(b_1-b_0))$
+(`fh_interp.htransform_nodes`, `isdf.galerkin.NODES_PER_FITTED_BAND`), so the
+fit's cost follows the fitted window, not the ISDF bundle. At $N_\mu$ the nodes
+are the run's ISDF centroids. Below it they are an orbit-closed,
+charge-density-weighted k-means selection on the fitted bands
+(`centroid.kmeans_cli.orbit_kmeans_points`: `--orbit`, rho-power 1, fit window
+$b_0{:}b_1$ on both legs), written beside the basis artifact as
+`galerkin_nodes_<N>_b<b0>-<b1>_<wfn>.txt` and reused while the WFN fingerprint
+and window match. The states at the ISDF centroids, which the BSE consumers
+need, are then back-map targets (§3) rather than nodes. Orbit closure is
+mandatory for both sets.
+
 Nodal values carry no metric. The fit adds the diagonal quadrature metric
-$W = \operatorname{diag}(w_\nu)$ of the centroids: one non-negative weight per
-centroid orbit, the least-squares (NNLS) solution of
-$\Phi_k^\dagger W \Phi_k = 1$ over all coarse $k$. $W$ is invariant under the
-node permutation of every crystal operation. A per-$k$ Löwdin step then makes
+$W = \operatorname{diag}(w_\nu)$ of the nodes: one non-negative weight per
+node orbit, the least-squares (NNLS) solution of
+$\Phi_k^\dagger W \Phi_k = 1$ over all coarse $k$, folded onto the orbits a
+block of nodes at a time (a solve that does not converge refuses,
+`GATE quadrature_metric_nnls`). $W$ is invariant under the node permutation of
+every crystal operation. A per-$k$ Löwdin step then makes
 the coefficients exactly orthonormal:
 
 $$G_k = \Phi_k^\dagger W \Phi_k, \qquad c_{k} = W^{1/2}\Phi_k G_k^{-1/2},
 \qquad c_k^\dagger c_k = 1,$$
 
-shape $(N_k, b_1-b_0, N_B)$ with $N_B = N_s N_\mathrm{centroid}$. The log
-prints $\varepsilon = \max_k \|G_k - 1\|_2$ (Si 4³, 1100 centroids:
-$1.0\times10^{-3}$; MoS₂ 9×9, 1198 centroids: $1.7\times10^{-2}$), the number of
+shape $(N_k, b_1-b_0, N_B)$ with $N_B = N_s N_\mathrm{node}$. The log
+prints $\varepsilon = \max_k \|G_k - 1\|_2$ (Si 4³ at 1100 nodes:
+$1.0\times10^{-3}$; MoS₂ 9×9 at 1198: $1.7\times10^{-2}$), the number of
 zero-weight nodes (they drop out of $c$), the orbit count and the fit wall
-(seconds). There is no node selection, pivot or tolerance. A centroid set that
-is not orbit-closed (`symmetry_maps.centroid_source_map_and_wrap`) refuses,
+(seconds). The fit itself has no pivot or tolerance. A node or centroid set
+that is not orbit-closed (`symmetry_maps.centroid_source_map_and_wrap`) refuses,
 naming the remedy.
 
 **Node count.** The off-grid error follows $\varepsilon$, not the rank. On Si
@@ -76,18 +89,29 @@ $\varepsilon = 1.7\times10^{-2}$.
 fitted states, $\approx 0$ on the rest of the $N_B$ directions), so every
 fine-k, path and moment-grid solve refines only its most negative block:
 the fitted bands plus 32 columns, started from $c$ of the nearest coarse k
-plus fixed random columns. Two subspace
-steps $X \leftarrow \mathrm{qr}(-f(H)_q X)$ and a Rayleigh–Ritz
+plus fixed random columns (an operand of the program, not a constant). Two
+subspace steps $X \leftarrow \mathrm{qr}(-f(H)_q X)$ and a Rayleigh–Ritz
 eigensolve of the block follow; further steps run until the relative
-residual $\|f(H)_q v - \lambda v\|/|\lambda|$ of the returned window is
-$\le 10^{-10}$, at most 8. The log line `[top-block]` prints the iteration
-count and the residual. The cost per q is block products with the
-$N_B \times N_B$ operand instead of a full eigensolve.
+residual $\|f(H)_q v - \lambda v\|/|\lambda|$ of every band the stage's
+consumer reads (the fine-k stage: the returned window; the path and the
+moment grid: their states) is $\le 10^{-10}$ ($|\lambda|$ floored at
+$10^{-2}$ of the block's largest), at most 16. The topmost guards sit at
+$f = 0$ beside the null space; they are not read and need not converge.
+The log line `[top-block]` prints the iteration count and the residual; a
+residual above $10^{-6}$ refuses (`GATE top_block_not_converged`). The cost
+per q is block products with the $N_B \times N_B$ operand instead of a full
+eigensolve. Each such stage has two routes, admitted by the memory model
+([memory model](../architecture/memory-model.md)) from the compiled program's
+price: `q-batched` (whole $N_B \times N_B$ matrices of a rank's own q rows
+after one face→q exchange) and `face` (one q at a time, tiled over the mesh;
+`linalg = distributed` pins it).
 
-The fit writes $c$, $\Phi$ and $G^{-1/2}$ to `galerkin_dft.h5` beside the deck. A later run reuses
-the file only when its provenance matches exactly (WFN fingerprint, centroid
-SHA-256, band window, grids, spinor mode, node version); otherwise it refits
-in memory and leaves the file unchanged. The log says `REUSED`, `REFIT` or
+The fit writes $c$, $\Phi$, $G^{-1/2}$, the node FFT indices and the states
+at the targets to `galerkin_dft.h5` beside the deck (format 6). A later run
+reuses the file only when its provenance matches exactly (WFN fingerprint,
+node and target sets, band window, grids, spinor mode, node version);
+otherwise it refits in memory and leaves the file unchanged. Files of an
+older format are refitted. The log says `REUSED`, `REFIT` or
 `FITTED and published`.
 
 ## 3. The f-transform and the interpolation
@@ -134,9 +158,13 @@ diagonalizes $f(H)_q$: the eigenvalues are $f(\varepsilon_n(q))$ and the
 eigenvectors $c_n(q)$ are the states in the orthonormal nodal frame. Newton
 iteration inverts $f$ (`fh_interp.newton_inv`, converged to
 $\max|f(x)-y| \le 10^{-12}$ Ry in at most 50 steps, else refused). The BSE
-consumers take the nodal values $\psi_n(q; s, r_\nu) = [L_q c_n(q)]_\nu /
-(-f_n(q))$ from the back-map kernel $L_k = \Phi_k (-f(\varepsilon_k))
-c_k^\dagger$, interpolated the same way (`bse_setup._backmap_R`): exact on
+consumers take the states at the ISDF centroids $r_\mu$ (the targets),
+$\psi_n(q; s, r_\mu) = [L_q c_n(q)]_\mu / (-f_n(q))$, from the back-map
+kernel $L_k = \Phi^T_k (-f(\varepsilon_k)) c_k^\dagger$ with
+$\Phi^T_k[(s,\mu), n] = \psi_{nk}(s, r_\mu)$ (equal to $\Phi_k$ when the
+nodes are the centroids). It is built in the same program as $f(H)_R$
+(`fh_interp.build_fH_R(..., backmap=)`) and interpolated with the per-pair
+images of each target–node pair (`node_pair_table`, `target_code`): exact on
 the coarse grid, and the division touches only returned window bands, which
 the guard bands keep away from $f = 0$.
 
@@ -423,10 +451,11 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | `nval` / `ncond` | 5 / 5 | returned window (§3); standalone runs need `nval` = occupied bands |
 | `--guard-bands` | 4 | fitted bands above the returned window |
 | `--a-band` | top fitted band | band whose bandwidth sets $f$'s shoulder width |
-| `htransform_qr_eps` | 1e-3 | unused by the fit (§2): only cuts the Gram pseudo-inverse of the refit's grid rows |
+| `htransform_qr_eps` | 1e-3 | not a fit tolerance (§2 has none): the relative pseudo-inverse cutoff of the refit's node Gram (`vq_interp` refit) |
+| `htransform_rank_multiplier`, `htransform_qrcp_seed` | removed | refused by name (`GATE htransform_qrcp_retired`): the nodal basis has no rank search; delete the lines |
 | `-wfn` / `--wfn-file` | the deck's `wfn_file` | another WFN, for example `WFN_qp.h5` |
 | `-o` / `--output-file`, `--report-file` | `bandstructure.dat`, `htransform.out` | outputs |
-| `linalg` | `local` | operand layout of the $f(H)_q$ top-block solve |
+| `linalg` | `local` | `distributed` pins the `face` route of the top-block solves; otherwise each stage's route is admitted from its compiled price (§2) |
 | `get_centroids_fi`, `kgrid_fi`, `wfn_fi_min`/`wfn_fi_max`, `wfn_fi_q_chunk` | off | BSE handoff: fine-grid ψ at the coarse centroids (`bse_setup.compute_wfns_fi`); keep at least 4 bands between `wfn_fi_max` and the top of the window |
 | `--plot` | off | show the band plot |
 
@@ -435,6 +464,10 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | refusal | cause | fix |
 |---|---|---|
 | the nodal fit refuses: centroids not orbit-closed | the centroid file was not made in orbit-aware mode | regenerate it with `centroid.kmeans_cli` (orbit mode) |
+| `[warn] nodal metric eps` | $\varepsilon > 10^{-2}$: too few nodes for the fitted window | $N_\mathrm{node} \ge 22\,(b_1-b_0)$; with fewer ISDF centroids than that the nodes are the centroids |
+| `top_block_not_converged` | a top-block window residual above $10^{-6}$ after 16 steps | raise $N_\mathrm{node}$ or check the metric warning |
+| `quadrature_metric_nnls` | the orbit-tied NNLS did not converge | check orbit closure and the node count |
+| `htransform_qrcp_retired` | `htransform_rank_multiplier` or `htransform_qrcp_seed` in the deck | delete the line |
 | `f-shoulder` | a returned band is absent from $f(H)$ at some coarse $k$ | add guard bands |
 | Newton not converged | $\max|f(x) - y| > 10^{-12}$ Ry after 50 steps | a returned band lies in the flat part of $f$; add guard bands or set `--a-band` |
 | standalone window cuts the occupied bands | `nval` ≠ occupied bands | set `nval` to the occupied count |
