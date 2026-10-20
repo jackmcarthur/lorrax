@@ -254,6 +254,8 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
                 max_workspace_bytes=max_workspace_bytes,fixed_spaces=dict(right=x,left=yy))
             summary,values=transfer_summary(model,b,c,sites,target=target,
                 c1=optional.get('C1'),c2=optional.get('C2'))
+            summary['scope']=('captured SMALL B/C actions' if actions else
+                'first <=8 DESCRIPTOR COORDINATES ONLY; NOT physical W residues/norms; see physical_transfer separately')
             row.update(status='reduced-for-diagnostic-only',receipt=model['receipt'],transfer=summary)
             if grams:
                 try:
@@ -272,6 +274,8 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
         model={k:optional[k] for k in ('poles_ry','output_map','input_map')}
         report['captured_canonical_model']=transfer_summary(model,b,c,sites,target=target,
             c1=optional.get('C1'),c2=optional.get('C2'))[0]
+        report['captured_canonical_model']['scope']=('captured SMALL B/C actions' if actions else
+            'first <=8 DESCRIPTOR COORDINATES ONLY; NOT physical W residues/norms; see captured_canonical_physical_model separately')
         if grams:
             try:
                 report['captured_canonical_physical_model']=gram_transfer_summary(model,optional['GC'],optional['GB'],sites,
