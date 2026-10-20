@@ -2198,6 +2198,10 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     receipt.update(internal_bands=int(nb), real_destinations=int(n_a),
         rate_intermediates="active_only", virtual_intermediates="all",
         ordered_internal_phase="right_index", head="frozen_reference_current_electronic_lines",
+        bulk_evaluation_eta_ry=float(cfg.regularization_ev)/RYD_TO_EV,
+        head_pole_imaginary_parts_ry=([] if head is None else
+            np.asarray(head.poles_ry, np.complex128).imag.tolist()),
+        head_width_convention="frozen_source_poles_no_added_bulk_eta",
         full_density=True, spatial_projection=False,
         bracket_intervals=[list(x) for x in brackets])
     return dict(pair=total, diag=np.einsum("kii->ki", total[1]),
