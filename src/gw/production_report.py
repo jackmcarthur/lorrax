@@ -929,7 +929,7 @@ class GWProductionReport:
         budget = memory.run().get("budget", 0.0) / 1e9
         run_peak = max((np.nanmax(v) for v in selfs if np.any(np.isfinite(v))), default=0.0)
         self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
-                  f"rank(s); γ = peak / planner price")
+                  f"rank(s); prices and γ: the priced stages below")
         host_run = [pad(v) for v in hosts if np.any(np.isfinite(v))]
         if host_run:
             host_run = np.nanmax(np.asarray(host_run), axis=0)
@@ -943,24 +943,14 @@ class GWProductionReport:
         if budget:
             self.emit(f"  budget memory_per_device_gb = {budget:.2f} GB; run peak "
                       f"{run_peak / 1e9:.2f} GB ({'within' if run_peak <= budget * 1e9 else 'OVER'})")
-        self.emit(f"  {'stage':<{width}}  peak GB max / min   price GB           γ  "
+        self.emit(f"  {'stage':<{width}}  peak GB max / min  "
                   f"host GB    rise  set by")
         for name, band in stages:
             peak, setter = row_peak(band)
             host = row_host(band)
             if peak is None and "–" in host:
                 continue
-            mine = [(row, m) for row, m in priced if band.owns(row["path"])]
-            if mine:
-                price = max(row["priced"] for row, _ in mine)
-                worst = max((np.nanmax(m) for _, m in mine if np.any(np.isfinite(m))),
-                            default=None)
-                gamma = (f"{worst / price:10.2f}" if price > 0 and worst is not None
-                         else f"{'–':>10}")
-                tail = f"{price / 1e9:9.2f}  {gamma}"
-            else:
-                tail = f"{'–':>9}  no planner"
-            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}  {host}  "
+            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {host}  "
                       f"{' > '.join(setter[-2:])}")
         # Constructor sub-stages with their own pool high-water (TimingNode.peak), so a leg
         # measures what the reduction, passivity and head prices are calibrated against.
