@@ -201,8 +201,19 @@ and reports fresh same-gauge boundary compressions, raw/coherent collision,
 trace and Pauli excursions. Static SC convergence does not certify finite-eta
 Markov stationarity or driven admission. Any refusal is evidence, not repaired.
 Fine full-coherent TD has 64 q rows rather than the SC run's 10 symmetry
-parents; no SC wall time is claimed as its refresh cost. A later 30v14c window
-and nonlinear pulse need separate bright-target/window and resource gates.
+parents; no SC wall time is claimed as its refresh cost. The callback now
+accepts only the two explicit zero-gate windows: `[128,132)` (2v2c) and
+`[100,144)` (30v14c). The latter has its own prepared
+`inputs/sc750_zero_joint_44band_0p6fs.toml`, full44 `rho_full` measurement,
+44-dimensional reference/rates and truthful gauge/window labels. It is not
+admitted by a completed four-band gate. Both retain full750 virtual bands
+and require the same own-grid accepted source/head/tail authentication.
+The single-trial observer retains only its latest full native row, checks
+basis-object identity at capture, and leaves the actual evaluator caches
+unchanged. Host tests do not qualify material44 dynamics; the matching
+zero-field, bright-target/window and resource gates remain required before
+a nonlinear MGKBA pulse; the independent static-A calibration does not
+assert that collision admission.
 
 Focused local parser/gauge/provenance tests are
 `test_sc750_td_callback.py` and `test_native_frozen_map_probe.py`; they do not

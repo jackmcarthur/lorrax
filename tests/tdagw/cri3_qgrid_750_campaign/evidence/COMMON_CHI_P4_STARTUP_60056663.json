@@ -1,0 +1,18 @@
+{
+  "status": "HARNESS_CONFIG_FAILURE_BEFORE_CHI_EXECUTION",
+  "source_revision": "5049adccc25127774c7f058de1aec8ee605f725d",
+  "job_step": "60056663.12",
+  "start_utc": "2026-10-20 23:46:16",
+  "end_utc": "2026-10-20 23:46:27",
+  "processes": 4,
+  "gpus": 4,
+  "step_wall_seconds": 11,
+  "active_gpu_hours": 0.012222222222222223,
+  "error": "The software-proof helper called LorraxConfig() without its 42 required constructor arguments.",
+  "scope": "Native bootstrap/source/backend checks passed; no response dispatch, native chi result, or material verdict was produced.",
+  "correction": "Use the existing real input parser with resolve_hardware=False to construct the execution-owner policy. Tiny proof geometry remains explicit and does not launch the material deck.",
+  "corrected_helper_sha256": "a74a07e36c8477c13f9687f6b6b69727c94e3616400aafe9067bc0e6004f10ab",
+  "corrected_host_check": "Actual parser construction and callback contracts: 18 passed in 0.57s (root independent run).",
+  "corrected_native_execution": "PENDING",
+  "local_log_prefix": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/p4_commonchi5049_60056663.rank"
+}

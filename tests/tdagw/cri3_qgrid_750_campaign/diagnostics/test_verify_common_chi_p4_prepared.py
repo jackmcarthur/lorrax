@@ -45,3 +45,12 @@ def test_harness_literal_density_order_and_exact_moments_match_independent_indic
             delta,amplitude=spectrum
             want=np.einsum('t,tij->ij',delta**power,amplitude)
             np.testing.assert_allclose(moments/np.sqrt(3),want,rtol=2e-14,atol=2e-15)
+
+
+def test_native_bank_execution_config_is_built_by_real_parser_not_empty_constructor():
+    from gw.gw_config import LorraxConfig
+    config=runpy.run_path(str(HARNESS))['bank_config']()
+    assert isinstance(config,LorraxConfig)
+    assert config.backend.linalg=='local'
+    assert config.sigma.w_model=='shared_pole'
+    assert config.bands.chi==750

@@ -33,6 +33,70 @@ def test_real_zero_deck_uses_legal_full_MH_mode_and_no_stale_source():
     assert value.values["lorrax.collision_refresh_fs"]*24.188843265857/1000 == pytest.approx(.5)
 
 
+def test_explicit_matching44_zero_gate_has_full_measurement_and_same_prescription():
+    from tdagw.td_config import read_td_deck
+    wide=read_td_deck(str(Path(__file__).with_name('inputs')/'sc750_zero_joint_44band_0p6fs.toml'))
+    assert callback.validate_probe_deck(wide)==pytest.approx(.6)
+    active=callback.probe_active_window(wide)
+    assert (active.start,active.stop)==(100,144)
+    assert (130-active.start,active.stop-130)==(30,14)
+    small=deck()
+    excluded={'system.ibndmin','system.ibndmax'}
+    assert {k:v for k,v in wide.values.items() if k not in excluded}=={
+        k:v for k,v in small.values.items() if k not in excluded}
+    assert wide.measurements[-1]==('rho_full','density_matrix',
+                                  dict(brange1=[101,145],brange2=[101,145]))
+    stale=wide._replace(measurements=small.measurements)
+    with pytest.raises(ValueError,match='matching full active rho_full'):
+        callback.validate_probe_deck(stale)
+
+
+def test_callback_uses_validated_window_for_reference_size_and_diagnostic_scope():
+    tree=ast.parse(Path(callback.__file__).read_text())
+    run=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run_td_probe')
+    build=next(n for n in ast.walk(run) if isinstance(n,ast.Call)
+               and isinstance(n.func,ast.Attribute) and n.func.attr=='build_sc_td_reference')
+    assert ast.unparse(next(k.value for k in build.keywords if k.arg=='active'))=='active'
+    system=next(n for n in ast.walk(run) if isinstance(n,ast.Call)
+                and isinstance(n.func,ast.Attribute) and n.func.attr=='TdSystem')
+    assert ast.unparse(system.args[4])=='n_active'
+    source=ast.get_source_segment(Path(callback.__file__).read_text(),run)
+    assert '[128,132)' not in source and '4x4 accepted' not in source
+    assert 'actual_active=active_bands' in source
+
+
+def test_single_trial_observer_retains_only_latest_complete_row_and_requires_identity():
+    import gc
+    import weakref
+    tree=ast.parse(Path(callback.__file__).read_text())
+    run=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run_td_probe')
+    factory=next(n for n in run.body if isinstance(n,ast.FunctionDef) and n.name=='factory')
+    held=[];events=[];cache=object()
+    def original_factory():
+        def evaluate(basis,**kwargs):
+            return dict(retarded_pair=np.full((2,64,44,44),complex(basis['value'])))
+        return evaluate,cache
+    scope=dict(original_factory=original_factory,evaluated=held,
+               resources=lambda label:events.append(label))
+    exec(compile(ast.Module(body=[factory],type_ignores=[]),'<actual callback factory>','exec'),scope)
+    observed,returned_cache=scope['factory']()
+    assert returned_cache is cache
+    init=dict(value=1);result=observed(init,equilibrium=True)
+    first=weakref.ref(result['retarded_pair'])
+    assert callback.latest_snapshot_row(held,init) is result
+    del result
+    intermediate=dict(value=2);observed(intermediate)
+    final=dict(value=3);result=observed(final)
+    gc.collect()
+    assert first() is None and len(held)==1
+    assert callback.latest_snapshot_row(held,final) is result
+    np.testing.assert_array_equal(result['retarded_pair'],3.)
+    assert result['retarded_pair'].shape==(2,64,44,44)
+    with pytest.raises(ValueError,match='latest single-trial evaluated basis'):
+        callback.latest_snapshot_row(held,init)
+    assert events==['before_native_snapshot','after_native_snapshot']*3
+
+
 @pytest.mark.parametrize("key,value", [
     ("system.Efunc.E_x", 1.e9), ("lorrax.collision", "subtracted"),
     ("lorrax.collision_hamiltonian", "hf"), ("lorrax.collision_hermitian", "none"),

@@ -26,7 +26,10 @@
     }
   ],
   "gpu_helper": "verify_common_coherent_chi_p4.py",
-  "gpu_helper_sha256": "f8130b9ef5bdf67a0ccb9519bff70bee24d51c42bffb5d6cc9663d3551cb2fda",
+  "gpu_helper_sha256": "a74a07e36c8477c13f9687f6b6b69727c94e3616400aafe9067bc0e6004f10ab",
+  "gpu_startup_attempt": "5049 P4 attempt failed all ranks before chi/JIT: invalid empty LorraxConfig constructor; NOT a chi correctness/performance verdict",
+  "helper_config_correction": "Use native LorraxConfig.from_input_file on preserved campaign deck with resolve_hardware=False; no default constructor, kernel or numerical change",
+  "helper_config_smoke": "3 host preparation tests PASS0.48s, including actual real typed-config parser call; no GPU claim",
   "gpu_launch": "python verify_common_coherent_chi_p4.py --source-root IMMUTABLE_ROOT --source-revision EXACT_SHA --out FRESH_DIRECTORY --max-wall-seconds 180",
   "gpu_contract": "Native CUDA/mathdx, four MPI processes/one GPU each, mesh2x2; explicit typed current identity plan and real compiled/native execution admission; no reference override or native rebuild"
 }

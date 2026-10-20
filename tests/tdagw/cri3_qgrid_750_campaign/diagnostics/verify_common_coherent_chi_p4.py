@@ -11,6 +11,18 @@ import time
 import traceback
 
 
+def bank_config():
+    """Real typed config for the execution owner, parsed without device queries.
+
+    Only its execution policy is passed to _bank_execution; the tiny chi
+    geometry/operands below, not this campaign SC deck, define the proof.
+    No SC, WFN load or material calculation is launched by this parser.
+    """
+    from gw.gw_config import LorraxConfig
+    path=Path(__file__).resolve().parents[1]/'inputs'/'corrected_protected160_750_q8.in'
+    return LorraxConfig.from_input_file(str(path),resolve_hardware=False,print_fn=lambda *a:None)
+
+
 def literal(psi, energy, left, right, coordinates, grid, times, moment_power=None):
     """Independent transition-index sum, including spin and both density legs."""
     import numpy as np
@@ -35,7 +47,6 @@ def response_stage(c):
     from jax.sharding import PartitionSpec as P
     from common.collectives import gather_to_host
     from gw.greens_function_kernel import density_left_endpoint
-    from gw.gw_config import LorraxConfig
     from gw.ppm_sigma import fresh_shared_pole_capacity
     from gw.response_bank import _bank_execution, full_density_bare_moments
     from gw.w_isdf import full_density_response_stream, _get_chi_fractional_contour_kernel_face
@@ -67,7 +78,7 @@ def response_stage(c):
             resident_bytes_per_rank=16*nq*8*mu*mu//mesh.size,workspace_bytes_per_rank=0)
         meta.shared_pole_capacity.live_stages=(row['stage'],)
         execution=dict(seconds={},memory=[],compiled=[])
-        execute=_bank_execution(meta,mesh,execution,LorraxConfig())
+        execute=_bank_execution(meta,mesh,execution,bank_config())
         for current in range(2):
             energy=c['energy']+.03*current*np.sin(np.arange(nk*nb).reshape(nk,nb))
             ed=c['put'](energy,P())

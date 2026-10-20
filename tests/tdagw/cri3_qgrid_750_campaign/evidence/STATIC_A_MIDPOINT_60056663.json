@@ -1,0 +1,55 @@
+{
+  "status": "A_CALIBRATION_ONLY_COMPLETE_BC_NOT_ATTEMPTED",
+  "source_revision": "f44fbc8d0294e7189312549c1163dcb29f600c1b",
+  "source_archive_sha256": "87082de646a8fbafea0b604369a6d5394a65c820ad4fd79cfeb7d13f6cef69c3",
+  "job_step": "60056663.11",
+  "active_bands_zero_based_half_open": [100, 144],
+  "virtual_bands": 750,
+  "electronic_kgrid": [8, 8, 1],
+  "response_qgrid": [4, 4, 1],
+  "response_window": "fejer",
+  "centroids": 3000,
+  "reference_frame": "frame_0007_call_0007",
+  "input_h_sha256": "616107c9a528915ebf57ec5db1199449836f0e74663be14ac58ceec31b031a40",
+  "bse_sha256": "2cd24fe227670dcc631983cbf7b2d5bfc7571ce48d2d75f190be8e58abefc650",
+  "target_root_zero_based": 22,
+  "target_energy_ev": 1.9770533686449936,
+  "target_axis": "x",
+  "duration_fs": 10.0,
+  "dt_as": 25.0,
+  "measure_as": 50.0,
+  "pulse_support_fs": [1.0, 5.0],
+  "selection_factor": 2.0,
+  "selected": [
+    {
+      "amplitude_v_m": 800000000.0,
+      "target_carriers_per_cell": 0.01,
+      "actual_peak_carriers_per_cell": 0.008134541908854378,
+      "calibration_tag": "A_calibration_00"
+    },
+    {
+      "amplitude_v_m": 3200000000.0,
+      "target_carriers_per_cell": 0.1,
+      "actual_peak_carriers_per_cell": 0.15942947210084762,
+      "calibration_tag": "A_calibration_01"
+    }
+  ],
+  "cost": {
+    "nodes": 4,
+    "gpus": 16,
+    "step_wall_seconds": 380,
+    "active_gpu_hours_including_fresh_source_startup": 1.6888888888888889,
+    "callback_wall_seconds": 113.6451724810031
+  },
+  "scope": {
+    "coherent_functional": "accepted SC anchor + delta bare Hartree - delta frozen screened exchange",
+    "collision": "NOT_ATTEMPTED",
+    "screening_updates": "NOT_ATTEMPTED",
+    "damping_inference": "NONE",
+    "optical_or_cutoff_convergence": "NOT_CLAIMED",
+    "finite_plan_history": "Original five-amplitude grid completed but missed the unchanged 0.01 target bracket; these two measured midpoint amplitudes satisfy both brackets without relaxing them."
+  },
+  "local_evidence_directory": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/material_Astaticf44_midpoint_60056663",
+  "evidence_files": ["manifest.json", "calibration_00.json", "calibration_01.json", "calibration_selected.json", "complete.json", "static_control.json"],
+  "note": "The manifest records startup; complete.json and calibration_selected.json provide the terminal verdict. Static-A success is not admission for raw MGKBA."
+}

@@ -60,6 +60,28 @@ def fine_bare_head_coefficient(source):
     return float(coefficient.real)/(volume*math.prod(source["meta"].kgrid))
 
 
+def probe_active_window(deck):
+    """Resolve the two explicit campaign windows, never an inferred resize."""
+    v=deck.values
+    request=(v['system.ibndmin'],v['system.ibndmax'],v['system.ivbm'])
+    if request not in ((129,132,130),(101,144,130)):
+        raise ValueError('GATE sc750_td_window: explicit [128,132) or [100,144) window required')
+    active=slice(request[0]-1,request[1])
+    expected=[active.start+1,active.stop+1]
+    if not any(typ=='density_matrix' and name=='rho_full'
+               and kwargs.get('brange1')==expected and kwargs.get('brange2')==expected
+               for name,typ,kwargs in deck.measurements):
+        raise ValueError('GATE sc750_td_window: matching full active rho_full measurement required')
+    return active
+
+
+def latest_snapshot_row(evaluated, basis):
+    """Single-trial capture must join the latest evaluated basis by identity."""
+    if len(evaluated)!=1 or evaluated[0][0] is not basis:
+        raise ValueError('GATE sc750_td_capture: latest single-trial evaluated basis does not match snapshot state')
+    return evaluated[0][1]
+
+
 def validate_probe_deck(deck, *, tf_fs_limit=1.0):
     """Keep this first gate zero-field, short, raw, and reference anchored."""
     v = deck.values
@@ -72,8 +94,7 @@ def validate_probe_deck(deck, *, tf_fs_limit=1.0):
             raise ValueError(f"GATE sc750_td_deck: {key} must be {value!r}")
     if v["lorrax.collision_screening"] not in ("joint", "joint_frozen"):
         raise ValueError("GATE sc750_td_deck: native joint/joint_frozen screening required")
-    if (v["system.ibndmin"], v["system.ibndmax"], v["system.ivbm"]) != (129, 132, 130):
-        raise ValueError("GATE sc750_td_window: first probe is active [128,132), not an implicit enlargement")
+    probe_active_window(deck)
     if v["lorrax.intraband"] or v["system.depopulation"] or v["system.dephasing"]:
         raise ValueError("GATE sc750_td_deck: no added phenomenological damping or intraband model")
     # Parser times are Ha atomic units; this is a duration, not an output index.
@@ -120,6 +141,9 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
     deck_path = Path(deck_path).resolve()
     deck = read_td_deck(str(deck_path))
     duration = validate_probe_deck(deck)
+    active = probe_active_window(deck)
+    active_bands = [active.start,active.stop]
+    n_active = active.stop-active.start
     values = dict(deck.values)
     values["control.files.outdir"] = str(out)
     values["lorrax.bundle_input"] = source["input_deck"]
@@ -195,9 +219,9 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
         original_psi=source["original_psi"], velocity_dft_ry=host(velocity),
         wfn_fingerprint=frame["wfn_fingerprint"], velocity_wfn_fingerprint=frame["wfn_fingerprint"],
         structure=_structure(source["input_deck"]), bare_head_coefficient_ry=head_coefficient)
-    built = sr.build_sc_td_reference(source, arrays, inputs, mesh=mesh, active=slice(128, 132))
+    built = sr.build_sc_td_reference(source, arrays, inputs, mesh=mesh, active=active)
     hdr, ops = built["header"], built["ops"]
-    system = stages.TdSystem(hdr, ops, 64, built["receipts"]["nk_pad"], 4,
+    system = stages.TdSystem(hdr, ops, 64, built["receipts"]["nk_pad"], n_active,
         float(inputs["structure"]["cell_volume"]), int(hdr["nspinor"]), hdr["bands"],
         receipts=built["receipts"])
     save("reference.json", record=dict(**built["receipts"],
@@ -212,13 +236,15 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
         runtime_source_paths={key: values[key] for key in ("lorrax.bundle_input",
             "lorrax.collision_source", "lorrax.dipole_file", "control.files.outdir")},
         runtime_path_scope="authenticated callback source; no standalone bundle reload",
-        snapshot_U_scope="relative instantaneous rotation within fixed accepted-SC active [128,132)",
+        actual_active=active_bands, active_size=n_active,
+        reference_occupied_active=130-active.start, reference_empty_active=active.stop-130,
+        snapshot_U_scope=f"relative instantaneous rotation within fixed accepted-SC active [{active.start},{active.stop})",
         DFT_gauge_reconstruction="requires external accepted full U160 and active embedding; not snapshot U alone",
-        snapshot_gap_scope="four-active-band material H, not complete750 fundamental gap after external reordering",
+        snapshot_gap_scope=f"{n_active}-active-band material H, not complete750 fundamental gap after external reordering",
         sigma_eta_ev=float(source["config"].sigma.regularization_ev),
         response_gamma_ev=float(values["lorrax.collision_adiabatic_ev"]),
         spectral_tail="actual native accepted-state producer fit; fullvirtual MH only",
-        active_rate_intermediates=[128, 132], virtual_MH_bands=750,
+        active_rate_intermediates=active_bands, virtual_MH_bands=750,
         absolute_HF_not_published=True, H_anchor="accepted SC H once + bareHF delta + MH-MH_eq",
         Vcorr_scope="implicit accepted SC anchor; no separately published absolute HF/Vcorr decomposition",
         raw_collision_unsubtracted=True, clipping=False, trace_repair=False))
@@ -231,8 +257,10 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
         def observed(basis, **kwargs):
             resources("before_native_snapshot")
             row = evaluate(basis, **kwargs)
-            evaluated.append((basis, row))
-            del evaluated[:-64]
+            # One trial only. Init and refresh publish the basis from their
+            # latest evaluate; never retain64 full44 operator rows just for
+            # an identity lookup. The actual evaluator caches are untouched.
+            evaluated[:] = [(basis,row)]
             resources("after_native_snapshot")
             return row
         return observed, cache
@@ -245,7 +273,7 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
             nonlocal n
             state = collision["state"]
             basis = state["basis_last"][0]
-            row = next(r for b, r in reversed(evaluated) if b is basis)
+            row = latest_snapshot_row(evaluated,basis)
             data = dict(U=basis["U"], E_ry=basis["e"], rho_in_basis=basis["rho"],
                 Gamma_ry=host(row["gamma"]), D_ry=host(row["injection"]), MH_ry=host(row["m_h"]),
                 MH_eq_ry=host(collision["eq"]["m_h"]), bundle_of=collision["bundle_of"],
@@ -275,7 +303,8 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
                 occupation_tolerance=1e-8, rate_unit="Ry", per_k=boundary,
                 weighted_trace_rate_ry=float(np.mean(np.trace(raw, axis1=-2, axis2=-1).real)),
                 basis="Gamma,D,MH,rho_source in fixed accepted-SC active basis; BUNDLE k order",
-                H_material_scope="4x4 accepted-SC-active gauge; U relative within this window, not original DFT gauge",
+                actual_active=active_bands, active_size=n_active,
+                H_material_scope=f"{n_active}x{n_active} accepted-SC-active gauge; U relative within this window, not original DFT gauge",
                 gap_scope="active-window eigenvalue separation only, not a full750 gap certificate",
                 raw_branch_basis="instantaneous basis; BUNDLE k order; no arithmetic shell averaging",
                 guarantee="state-local neighborhood diagnostic, not nonlinear Pauli invariance"))
@@ -311,6 +340,8 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
             raise ValueError("GATE sc750_td_refresh: no actual updated-W refresh was reached")
         save("complete.json", record=dict(status="SHORT_ZERO_FIELD_PROBE_COMPLETE_NOT_DRIVEN_ADMISSION",
             frame=frame["frame"], stats=stats, accepted_refreshes=refreshes,
+            completed=True, zero_gate=True, amplitude_v_m=0., duration_fs=duration,
+            actual_active=active_bands, active_size=n_active,
             response_qgrid=list(meta.qgrid), response_window=response_policy["response_window"],
             wall_s=time.perf_counter()-started,
             active_GPUh=jax.process_count()*(time.perf_counter()-started)/3600,

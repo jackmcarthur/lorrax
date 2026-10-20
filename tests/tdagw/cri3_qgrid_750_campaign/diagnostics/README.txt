@@ -235,4 +235,9 @@ Run with --source-root ROOT --source-revision SHA --out FRESH_DIRECTORY.
 Both this file and the fixture owner verify_fejer_p4_38dbea1.py must remain
 in the immutable source archive. Only agreed normal completion writes PASS;
 rank-local exceptions print/rethrow without a new failure-path collective.
-Host preparation tests are test_verify_common_chi_p4_prepared.py (2PASS).
+Host preparation tests are test_verify_common_chi_p4_prepared.py (3PASS),
+including the actual typed execution config parsed by its native factory.
+The first5049 P4 attempt stopped before chi/JIT at an invalid empty config
+constructor; it provides no chi correctness verdict. The corrected helper
+uses LorraxConfig.from_input_file(resolve_hardware=False), not a fabricated
+full config. It still requires a separate successful native execution.
