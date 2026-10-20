@@ -5,6 +5,42 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — `head_dense_file`: a dense-k direct head for insulators
+
+New deck key, off by default (`""`): a deck without it, or naming the GW mesh's
+own `dipole.h5`, builds today's head bit for bit.  It names a `dipole.h5` of a
+denser NSCF of the same crystal and Hamiltonian; its full-zone S_d(z) replaces
+the GW mesh's at every response node, while the wings, W(Γ) and the mini-BZ
+cell stay the GW mesh's.  The fold is the GW mesh's local-field fold scaled by
+M = S_d,dense S_d,mesh⁻¹ (`gw.head_correction.scaled_head_fold`; +1.2 % in
+ε_M on Si 4³ with an 8³ set, docs/theory/s-tensor-convention.md#scaled-fold).
+The persisted `S_cart_head`, and so the BSE, inherit it.  Metals refuse
+(`GATE head_dense_metal`), as do another operator, crystal or band window
+(`GATE head_dense_operator` / `head_dense_lattice` / `head_dense_window`).
+Recipe: QE NSCF on the dense mesh from the GW deck's SCF (nbnd ≥ occupied + 28),
+pw2bgw, then `python -m psp.get_dipole_mtxels -i <dense deck>`.
+Test: `tests/test_head_dense_source.py`.
+
+## 2026-10-20 — one velocity operator: the V_NL sign is gone; regenerate old velocity files
+
+The velocity is $\partial_k H = i[H, r] = p + i[V_\mathrm{NL}, r]$, a unique
+operator, so the knob that could subtract the nonlocal term is deleted: the
+deck key `vnl_velocity_sign`, the dipole step's `--vnl-velocity-sign`, the
+`prov_vnl_velocity_sign` stamp, and the sign argument of
+`common.mtxel_sweep.dipole_operator` / `uniform_gauge_operator` and
+`psp.get_dipole_mtxels.compute_finite_q_mtxels` (whose keyword default was
+the subtraction).  A deck that still names the key reports it as unrecognized.
+`--skip-vnl` (bare $p$) stays: it is another operator, not a sign.
+
+Files: `dipole.h5` now carries `format_version = 2`, and every reader refuses a
+file without it (`GATE dipole_format_version`); parallel-transport artifacts
+move to schema 5 and Hall artifacts to schema 3, and their readers refuse older
+schemas (the velocity reader of `sc_head_update = dft_velocity` used to accept
+schemas 2–4 without checking the operator).  Regenerate all three with
+`python -m psp.get_dipole_mtxels -i <deck>`.  Values built at the former
+default (+1) are unchanged; the Hall operator fingerprint of a +1 artifact is
+byte-identical.
+
 ## 2026-10-20 — `band_extrapolation_checkpoints`: several Σ band counts from one sweep
 
 New deck key, off by default (`""`): a run without it is unchanged (same plan,
@@ -3131,14 +3167,11 @@ one whose q axis does not reduce stores every q. Both layouts still read; BSE
 unfolds the parents on load in bounded q tiles, into the full-q layout its
 kernels use. Nothing to regenerate; results are bitwise.
 
-## 2026-09-30 — the Hall current takes `vnl_velocity_sign`; regenerate −1 Hall artifacts
+## 2026-09-30 — the Hall current takes the dipole's V_NL operator
 
-`get_dipole_mtxels --static-gauge-hall-only` now builds the Hall current with
-the same V_NL sign it stamps (`prov_vnl_velocity_sign`), as `dipole.h5` does.
-Before, the current always used the +1 arm, so a `--vnl-velocity-sign -1`
-artifact carried the +1 σ_H under a −1 label. Artifacts built at +1 (the
-default) are bitwise. Regenerate any Hall artifact built at −1; its σ_H and
-operator fingerprint change.
+`get_dipole_mtxels --static-gauge-hall-only` builds the Hall current with the
+same nonlocal operator as `dipole.h5`. Superseded by the one-operator entry of
+2026-10-20, which refuses every Hall artifact older than schema 3.
 
 ## 2026-09-30 — `parallel_transport`: the Σ term is served whenever the links are usable
 

@@ -206,7 +206,8 @@ def test_window_dipoles_refusals(tmp_path, monkeypatch):
         f["dipole_cart"] = np.zeros((3, 4, 2, 2), complex)
         f["band_energies"] = np.tile([-1.0, 1.0], (4, 1))
         f.attrs.update({"nk": 4, "nbands": 2, "basis": "dft",
-                        "prov_wfn_sha256": "sha-of-the-deck-wfn"})
+                        "prov_wfn_sha256": "sha-of-the-deck-wfn",
+                        dipole.DIPOLE_FORMAT_ATTR: dipole.DIPOLE_FORMAT_VERSION})
     coarse = dict(dense, densified=False)
     with pytest.raises(ValueError, match="GATE dipole_k_grid"):
         window_dipoles(coarse, path, n_occ=1, wfn_path="WFN.h5")
@@ -222,6 +223,11 @@ def test_window_dipoles_refusals(tmp_path, monkeypatch):
                 f.attrs["prov_wfn_sha256"] = stamp
         with pytest.raises(ValueError, match="GATE velocity_wfn_fingerprint"):
             window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
+    # A file older than the one-operator format (no stamp) refuses by name.
+    with h5py.File(path, "a") as f:
+        del f.attrs[dipole.DIPOLE_FORMAT_ATTR]
+    with pytest.raises(ValueError, match="GATE dipole_format_version"):
+        window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
 
 
 def test_on_grid_identity_follows_the_fh_band_order():

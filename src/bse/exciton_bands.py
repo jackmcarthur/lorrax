@@ -469,7 +469,6 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
         os.path.join(os.path.dirname(os.path.abspath(args.input)), "dipole.h5")
     dipole_cart, deltaE, attrs = load_dipole_h5(
         path, wfn_path=_parse_wfn_path(args.input))
-    sign = attrs.get("prov_vnl_velocity_sign")
     skip_vnl = attrs.get("skip_vnl")
     from file_io.dipole import require_dipole_k_grid
     require_dipole_k_grid(attrs, nk, dipole_path=path)
@@ -480,7 +479,7 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
                                     n_val_pad=nv_pad)      # (3, c, v, k)
     log(f"  [head-tensor] dipoles from {os.path.basename(path)} "
         f"(nk={attrs['nk']}, nbands={attrs['nbands']}, n_occ={n_occ}, "
-        f"velocity_sign={sign!r}, skip_vnl={skip_vnl!r}); "
+        f"skip_vnl={skip_vnl!r}); "
         f"max|d|^2 = {float(np.max(np.abs(d_vec)**2)):.4g} bohr^2")
     return np.conj(np.transpose(d_vec, (3, 1, 2, 0)))      # (k, c, v, 3)
 

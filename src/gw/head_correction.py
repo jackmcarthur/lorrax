@@ -388,13 +388,13 @@ def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
 def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     """Was ``dipole.h5`` built from THIS DFT solution, THIS band window and THIS velocity operator?; see docs/theory/bispinor-gw.md#head.
 
-    The velocity operator (V_NL included, the analytic arm, the deck's
-    resolved ``vnl_velocity_sign``, the DFT+U i[r, V_U] stamp) is REFUSED by
-    name on a mismatch, whatever ``LORRAX_SANITY`` says, as the SC and full
-    heads refuse it (``qsgw_head.read_authenticated_dipole_velocity``): a
-    missing or flipped i[r, V_NL] changes S(ω) by tens of percent (31 % in Si
-    ε₀₀), a missing i[r, V_U] by ~5 % of |v_cv| (VI3, U = 6 eV), and either
-    leaves the file's shape intact.  The WFN and band-window stamps go through
+    The velocity operator (V_NL included, the analytic arm, the DFT+U
+    i[V_U, r] stamp) is REFUSED by name on a mismatch, whatever
+    ``LORRAX_SANITY`` says, as the SC and full heads refuse it
+    (``qsgw_head.read_authenticated_dipole_velocity``): a missing i[V_NL, r]
+    changes S(ω) by tens of percent (15 % in Si ε₀₀), a missing i[V_U, r] by
+    ~5 % of |v_cv| (VI3, U = 6 eV), and either leaves the file's shape
+    intact.  The WFN and band-window stamps go through
     ``common.sanity`` as before.
     """
     import os
@@ -403,14 +403,10 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
         check_dipole_provenance,
         dipole_operator_mismatches,
     )
-    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
     from psp.hubbard_ops import hubbard_provenance_for
 
     nval, ncond, nband = _dipole_window_from_params(params, wfn)
-    operator = dict(
-        skip_vnl=False, vnl_mode="analytic",
-        vnl_velocity_sign=resolve_vnl_velocity_sign(
-            None, params.get("vnl_velocity_sign", "")))
+    operator = dict(skip_vnl=False, vnl_mode="analytic")
     hubbard = hubbard_provenance_for(
         params.get("hubbard_input", ""), params.get("hubbard_occupations", ""),
         wfn=wfn, base_dir=os.path.dirname(os.path.abspath(dipole_path)),
@@ -423,10 +419,10 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
             "GATE static_head_dipole_operator: the q->0 head received a "
             "dipole built with a different velocity operator.\n"
             f"  got:  dipole_file = {str(dipole_path)!r}; {detail}\n"
-            "  want: p - i[r, V_NL] (+ i[r, V_U] on a DFT+U deck), analytic "
-            "arm, the deck's vnl_velocity_sign (regenerate with python -m "
+            "  want: i[H, r] = p + i[V_NL, r] (+ i[V_U, r] on a DFT+U deck), "
+            "analytic arm (regenerate with python -m "
             "psp.get_dipole_mtxels -i <deck>)\n"
-            "  why:  S(omega) would lack or flip a nonlocal commutator "
+            "  why:  S(omega) would lack a nonlocal commutator "
             "while the file keeps its shape")
     if not sanity.sanity_enabled():
         return
@@ -647,6 +643,39 @@ def fold_small_head_wings_sharded(
     return folded
 
 
+def head_fold_scale(S_sum, S_cell) -> jax.Array:
+    """``M(z) = S_d,sum(z) S_d,cell(z)^-1``, ``(..., 3, 3)``: the scaled fold's ratio.
+
+    ``S_sum`` is the direct head of the dense sum set and ``S_cell`` that of
+    the GW mesh, at the same response nodes (leading axes), both replicated
+    3x3 Cartesian tensors in the S convention
+    (docs/theory/s-tensor-convention.md#sum-set-and-cell-set).
+    """
+    S_sum = jnp.asarray(S_sum, dtype=jnp.complex128)
+    S_cell = jnp.asarray(S_cell, dtype=jnp.complex128)
+    # M S_cell = S_sum  <=>  S_cell^T M^T = S_sum^T
+    return jnp.swapaxes(jnp.linalg.solve(
+        jnp.swapaxes(S_cell, -1, -2), jnp.swapaxes(S_sum, -1, -2)), -1, -2)
+
+
+def scaled_head_fold(S_direct, fold, fold_scale) -> jax.Array:
+    """``S_eff = S_d,sum + (M F + F M^T)/2``: the GW mesh's fold scaled to the sum set.
+
+    ``F = Y W(Gamma) Z / Omega`` is the local-field fold of the GW mesh
+    (``S_eff,cell - S_d,cell``), ``M = head_fold_scale(S_d,sum, S_d,cell)``
+    and ``S_direct = S_d,sum``; all ``(..., 3, 3)``.  The model holds the
+    local-field fraction ``S_d^-1 F`` fixed while the direct head converges in
+    k: exact when ``S_d,sum = r S_d,cell`` (then ``r F``), covariant under the
+    point group, linear in ``F``.  The symmetrized product is what
+    ``q.S_eff.q`` sees.  It is an approximation (+1.2 % in eps_M on Si 4^3
+    against native 8^3, docs/theory/s-tensor-convention.md#scaled-fold) and
+    undefined for a metal, whose fold carries the Fermi-surface wing
+    (``GATE head_dense_metal``).
+    """
+    M = jnp.asarray(fold_scale, dtype=jnp.complex128)
+    return S_direct + 0.5 * (M @ fold + fold @ jnp.swapaxes(M, -1, -2))
+
+
 def fold_cartesian_head_wings_sharded(
     S_direct: jax.Array,
     Y_x: jax.Array,
@@ -655,10 +684,21 @@ def fold_cartesian_head_wings_sharded(
     cell_volume: float,
     *,
     mesh_xy: Mesh,
+    fold_scale=None,
 ) -> jax.Array:
-    """Charge-head adapter to :func:`fold_small_head_wings_sharded`; see docs/theory/bispinor-gw.md#head."""
-    return fold_small_head_wings_sharded(
-        S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
+    """Charge-head adapter to :func:`fold_small_head_wings_sharded`; see docs/theory/bispinor-gw.md#head.
+
+    ``fold_scale`` (``IterationHeadResponse.fold_scale``) is ``None`` for the
+    GW mesh's own head (today's fold, bit for bit) or ``M`` of a dense sum
+    set, which folds by :func:`scaled_head_fold`.
+    """
+    if fold_scale is None:
+        return fold_small_head_wings_sharded(
+            S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
+    fold = fold_small_head_wings_sharded(
+        jnp.zeros_like(S_direct), Y_x, W_body_xy, Z_y, cell_volume,
+        mesh_xy=mesh_xy)
+    return scaled_head_fold(S_direct, fold, fold_scale)
 
 
 @functools.partial(jax.jit, static_argnames=("mesh_xy",))
@@ -1380,7 +1420,6 @@ class HeadResolver:
             "nval": config.nval,
             "ncond": config.ncond,
             "nband": config.nband,
-            "vnl_velocity_sign": getattr(config, "vnl_velocity_sign", ""),
             "hubbard_input": getattr(config, "hubbard_input", ""),
             "hubbard_occupations": getattr(config, "hubbard_occupations", ""),
             "_charge_bispinor": representation.scalar_head_bispinor,

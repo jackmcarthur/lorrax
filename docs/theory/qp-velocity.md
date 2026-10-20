@@ -46,15 +46,15 @@ $$v_a = 2(k+G)_a \;+\; s\,\frac{\partial V_\mathrm{NL}(k)}{\partial k_a}
   matrix, spin–orbit included), the derivative is analytic,
   $\partial_k V_\mathrm{NL} = (\partial Z) E Z^\dagger + Z E (\partial Z)^\dagger$
   (`psp.vnl_ops.vnl_velocity_block_from_coefficients`).
-- **Sign.** $s$ is `vnl_velocity_sign` (deck key, or `--vnl-velocity-sign`
-  of the dipole step). The default $s = +1$ gives $\hat v = \partial_k H$,
-  the physical velocity. $s = -1$ exists only to reproduce velocity files made
-  with that sign; it is stamped as `prov_vnl_velocity_sign`, and every consumer
-  refuses a file whose sign differs from the deck's, so the two never mix. The
-  term matters: on a bulk Si test deck (100 bands), against BerkeleyGW's head of
-  the dielectric matrix without local fields on the same mean field, $s = +1$
-  agrees to $10^{-5}$ relative; omitting the term overestimates that head by
-  15 %, and $s = -1$ by 31 %.
+- **One operator.** The term is added: $\hat v = \partial_k H = i[H, r] =
+  p + i[V_\mathrm{NL}, r]$, since $\partial_k O_k = i[O, r]_k$. There is no
+  other velocity and no knob; `dipole.h5` format 2, parallel-transport schema 5
+  and Hall schema 3 are the first artifacts that can hold only this operator,
+  and every reader refuses an older one (regenerate it with the dipole step).
+  The term matters: on a bulk Si test deck (100 bands), against BerkeleyGW's
+  head of the dielectric matrix without local fields on the same mean field,
+  $\hat v$ agrees to $10^{-5}$ relative; omitting the term overestimates that
+  head by 15 %.
 - **DFT+U.** With `hubbard_input` and `hubbard_occupations`, the derivative of
   QE's ortho-atomic $V_U(k)$ is added (`psp.hubbard_ops`); it refuses $s = -1$.
   The one-shot static head refuses a `dipole.h5` built with another velocity
@@ -357,7 +357,7 @@ version 4 (`SCHEMA_VERSION`).
 | links | `links_ibz` $(n_k, n_d, n_b, n_b)$, orientation $L_d(k)\,X(k+b_d)\,L_d(k)^\dagger$; `singular_values_ibz`; `source_steps` and the neighbour tables |
 | stencil | `link_stencil_orders`, `link_stencil_step_orders`, `link_stencil_coefficients`, `collapsed_axis_flags`, `collapsed_axis_center_frac` |
 | connection | `berry_connection_reduced`, `berry_connection_cart` |
-| stamps | `schema_version`, `band_stop` (the outer count), `vnl_velocity_sign`, `vnl_included`, the WFN fingerprint, `kgrid`, unit stamps, `connection_complete`, `velocity_validation_complete`, and the validation results (`velocity_validation_head_set_relative_l2` is $\epsilon_\mathrm{link}$) |
+| stamps | `schema_version` (5), `band_stop` (the outer count), `vnl_included`, the WFN fingerprint, `kgrid`, unit stamps, `connection_complete`, `velocity_validation_complete`, and the validation results (`velocity_validation_head_set_relative_l2` is $\epsilon_\mathrm{link}$) |
 
 Links are stored for the irreducible wedge only when the steps are the three
 axes and the point group acts on them as signed permutations; otherwise

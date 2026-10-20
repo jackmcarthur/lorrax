@@ -97,7 +97,9 @@ def test_qp_route_of_window_dipoles_takes_the_dipole_file_gates(tmp_path,
             f["dipole_cart"] = v[:, rows]
             f["band_energies"] = e[rows]
             f.attrs.update({"nk": nk_file, "nbands": nb, "basis": "dft",
-                            "prov_wfn_sha256": "sha-of-the-deck-wfn"})
+                            "prov_wfn_sha256": "sha-of-the-deck-wfn",
+                            dipole.DIPOLE_FORMAT_ATTR:
+                                dipole.DIPOLE_FORMAT_VERSION})
             for key, value in attrs.items():
                 if value is None:
                     del f.attrs[key]

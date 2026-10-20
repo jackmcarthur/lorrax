@@ -20,6 +20,8 @@ from gw.degen_average import TOL_DEGENERACY_RY
 
 __all__ = [
     "DftVelocityHeadData",
+    "HEAD_DENSE_MIN_CONDUCTION",
+    "HeadSource",
     "InterbandCommutatorHeadData",
     "IterationHeadResponse",
     "IterationHeadSamples",
@@ -31,6 +33,8 @@ __all__ = [
     "build_iteration_head_samples",
     "build_iteration_head_response",
     "build_dft_head_response",
+    "head_source",
+    "read_head_sum_set",
     "covariant_link_derivative",
     "head_s_tensor_sharded",
     "head_wings_sharded",
@@ -483,11 +487,10 @@ def load_parallel_transport_head(
         if ints["schema_version"] != int(SCHEMA_VERSION):
             refusals.append(
                 f"schema_version={ints['schema_version']}, "
-                f"expected {int(SCHEMA_VERSION)} (schema 4 stores links on "
-                "the point-group-closed shell of common.parallel_transport."
-                "link_stencil; fix: rerun the dipole step, get_dipole_mtxels, "
-                "to rebuild the links; sc_head_update = dft_velocity still "
-                "reads the old file)"
+                f"expected {int(SCHEMA_VERSION)} (schema 5 stores the one "
+                "velocity i[H, r] and links on the point-group-closed shell "
+                "of common.parallel_transport.link_stencil; fix: rerun the "
+                "dipole step, get_dipole_mtxels, to regenerate the artifact)"
             )
         if ints["connection_complete"] != 1:
             refusals.append("connection_complete is not 1")
@@ -772,12 +775,13 @@ def load_dft_velocity_head(
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
         )
         refusals = []
-        # Schemas 3 and 4 change only the link-consumer contract (4: the
-        # link_stencil shell).  The DFT velocity payload and all provenance
-        # fields are schema-2 compatible, and this mode consumes no links.
-        if schema not in (2, 3, int(SCHEMA_VERSION)):
+        # Schema 5 is the first whose velocity can only be i[H, r]; older
+        # artifacts may hold the retired assembly.
+        if schema != int(SCHEMA_VERSION):
             refusals.append(
-                f"schema_version={schema}, expected 2, 3 or {SCHEMA_VERSION}")
+                f"schema_version={schema}, expected {SCHEMA_VERSION}; "
+                "regenerate the artifact with the dipole step "
+                "(python -m psp.get_dipole_mtxels -i <deck>)")
         if band_start != 0 or band_stop < nb:
             refusals.append(
                 f"band manifold [{band_start},{band_stop}) does not contain "
@@ -3235,6 +3239,11 @@ class IterationHeadResponse:
     #: :func:`qp_velocity` (why the Sigma term is zero, or None), for the
     #: per-map head block (``sc_iteration._record_head_block``).
     velocity_terms: tuple | None = None
+    #: Dense sum set only (``head_dense_file``): ``M(z) = S_d,sum S_d,cell^-1``
+    #: ``(n_omega, 3, 3)``, with ``S_direct`` the sum set's and ``Y_x``/``Z_y``
+    #: the GW mesh's; the fold is ``head_correction.scaled_head_fold``.
+    #: ``None``: the GW mesh is the sum set and the fold is today's.
+    fold_scale: jax.Array | None = None
 
 
 @dataclass(frozen=True)
@@ -3479,6 +3488,8 @@ def iteration_head_sample_terms(
             response.Z_y[index],
             float(meta.cell_volume),
             mesh_xy=mesh,
+            fold_scale=(None if response.fold_scale is None
+                        else response.fold_scale[index]),
         )
     intraband = _metal_intraband(response)
     static_kappa2 = None if intraband is not None else response.static_kappa2_bohr2
@@ -3592,6 +3603,7 @@ def finalize_iteration_head_samples(
             response.Z_y,
             float(meta.cell_volume),
             mesh_xy=mesh,
+            fold_scale=response.fold_scale,
         )
         jax.block_until_ready(S_effective)
     intraband = _metal_intraband(response)
@@ -4095,21 +4107,17 @@ def _head_velocity_operator(config, meta):
     carrier ``dipole.h5``) and :func:`head_hall_operator_stamps` (the Hall
     artifact), so the two cannot name different operators.
     """
-    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
     from common.four_current_model import resolve_four_current_representation
     representation = resolve_four_current_representation(
         bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
         getattr(config, "bispinor_gw", "bare_transverse"))
-    return representation, dict(
-        skip_vnl=False, vnl_mode="analytic",
-        vnl_velocity_sign=resolve_vnl_velocity_sign(
-            None, config.vnl_velocity_sign))
+    return representation, dict(skip_vnl=False, vnl_mode="analytic")
 
 
 def head_hall_operator_stamps(config, *, meta) -> dict:
     """The Hall-artifact stamps of this deck's live charge/current carrier.
 
-    The V_NL skip/mode/sign of the charge head's ``dipole.h5``
+    The V_NL skip/mode of the charge head's ``dipole.h5``
     (:func:`_head_velocity_operator`) plus the current's kinetic-balance
     lift, in :func:`file_io.static_gauge_head.hall_operator_stamps` form.
     """
@@ -4125,8 +4133,8 @@ def head_dipole_operator_stamps(config, *, wfn, meta, fallback_dir) -> dict:
 
     One resolver for the head reader and for the SC's ``dipole_qsgw.h5``
     stamp (:func:`stamp_qsgw_dipole_provenance`): the window, the full
-    analytic ``p + i[r, V_NL]`` operator with the resolved V_NL sign, the
-    head representation and the DFT+U stamp.
+    analytic ``i[H, r] = p + i[V_NL, r]`` operator, the head representation
+    and the DFT+U stamp.
     """
     representation, velocity = _head_velocity_operator(config, meta)
     return dict(
@@ -4155,13 +4163,12 @@ def read_authenticated_dipole_velocity(
     rank its band tile (``file_io.restart_bundle.read_dipole_parent_window``).
     """
     from symmetry_maps import unfold_file_wedge_polar_matrix
-    from common.collectives import device_put_process_tiles
 
     # Fail before the host read and every sharded head allocation.  Shape does
     # not identify a velocity artifact: in particular, a two-spinor dipole and
     # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
-    # The producer owns both the stamp grammar and sign resolution; consume
-    # those owners directly rather than mirroring either convention here.
+    # The producer owns the stamp grammar; consume that owner directly
+    # rather than mirroring its convention here.
     from file_io.restart_bundle import (
         check_dipole_provenance,
     )
@@ -4185,7 +4192,20 @@ def read_authenticated_dipole_velocity(
     from file_io.restart_bundle import read_dipole_parent_window
     parents = read_dipole_parent_window(
         dipole_path, sym.kirr_fullids, b0, b4, nk_full=sym.nk_tot, mesh=mesh)
-    nk, nb = int(sym.nk_tot), b4 - b0
+    return _velocity_on_head_carrier(
+        int(sym.nk_tot), b4 - b0, mesh,
+        lambda rows: unfold_file_wedge_polar_matrix(sym, parents, rows=rows))
+
+
+def _velocity_on_head_carrier(nk: int, nb: int, mesh: Mesh, rows_of):
+    """``(3, nk, S, S)`` at ``P(None, None, 'x', 'y')`` from host k-row blocks.
+
+    ``rows_of(rows)`` returns the ``(len(rows), 3, nb, nb)`` host velocity of
+    those full-BZ rows.  Each process places only its own band tile, one
+    bounded block of k at a time (``2^28`` B of rows); rows and columns past
+    ``nb`` on the head carrier ``S = head_storage_extent(mesh, nb)`` are zero.
+    """
+    from common.collectives import device_put_process_tiles
     carrier = head_storage_extent(mesh, nb)
     step = max(1, (1 << 28) // (48 * nb * nb))
 
@@ -4198,8 +4218,7 @@ def read_authenticated_dipole_velocity(
         if rn and cn:
             for k0 in range(0, nk, step):
                 k1 = min(nk, k0 + step)
-                block = unfold_file_wedge_polar_matrix(
-                    sym, parents, rows=np.arange(k0, k1))
+                block = rows_of(np.arange(k0, k1))
                 out[:, k0:k1, :rn, :cn] = np.moveaxis(block, 1, 0)[
                     :, :, r0:r0 + rn, c0:c0 + cn]
         return out
@@ -4207,6 +4226,174 @@ def read_authenticated_dipole_velocity(
     return device_put_process_tiles(
         (3, nk, carrier, carrier),
         NamedSharding(mesh, P(None, None, "x", "y")), tile)
+
+
+#: Conduction bands a dense head sum set must hold above the occupied ones
+#: (or the whole chi window, if smaller).  Si SOC: 28 conduction spinor bands
+#: put S_d within 0.06 % (4^3) / 0.02 % (8^3) of 92 (head design note §3);
+#: counted in the WFN's own bands, so a scalar deck is held to twice that.
+HEAD_DENSE_MIN_CONDUCTION = 28
+
+#: Lattice and atom-position agreement a dense set must meet (bohr).
+_HEAD_DENSE_LATTICE_TOL_BOHR = 1.0e-8
+
+
+@dataclass(frozen=True)
+class HeadSource:
+    """The k set the direct head sums over: the SUM set (one per run).
+
+    ``dense=False`` is the GW mesh itself, read as today from
+    ``velocity_path`` through :func:`read_authenticated_dipole_velocity`;
+    with ``dense=True`` that reader still serves the cell set from the GW
+    mesh's ``<input_dir>/dipole.h5``.
+    ``dense=True`` is a ``head_dense_file``: its full-BZ velocity and band
+    energies, read whole from the file (the producer stored them unfolded),
+    on ``nk_sum`` k of ``kgrid_sum``.  Its ``wfn`` (the file's
+    ``prov_wfn_file``) only authenticates it (:func:`head_source`).  The CELL
+    set -- the mini-BZ cell, its Sobol draws, ``W(Gamma)`` and the wings --
+    stays the GW mesh's ``meta`` and bundle, never this object
+    (docs/theory/s-tensor-convention.md#sum-set-and-cell-set).
+    """
+
+    velocity_path: str
+    wfn: object
+    nk_sum: int
+    kgrid_sum: tuple[int, int, int]
+    band_window: tuple[int, int]
+    dense: bool = False
+
+
+def head_source(config, *, wfn, meta, input_dir) -> HeadSource:
+    """Resolve and authenticate the head's sum set (``head_dense_file``).
+
+    Unset is the GW mesh's ``<input_dir>/dipole.h5``, bit for bit today's
+    head.  A named file is refused unless it carries this deck's velocity
+    operator (``GATE head_dense_operator``: V_NL included, analytic, the
+    deck's DFT+U stamp, representation, spin, cutoff), its WFN is this
+    crystal (``GATE head_dense_lattice``), its band window holds every
+    occupied band plus :data:`HEAD_DENSE_MIN_CONDUCTION` conduction bands of
+    the chi window at the same filling (``GATE head_dense_window``), and its
+    ``prov_wfn_sha256`` is the fingerprint of its ``prov_wfn_file``
+    (``GATE dft_head_dipole_provenance``).  A file of the GW mesh's own WFN
+    is the GW mesh.
+    """
+    b0, b4 = int(meta.b_id_0), int(meta.b_id_4_chi_user)
+    mesh_source = HeadSource(
+        velocity_path=os.path.join(input_dir, "dipole.h5"), wfn=wfn,
+        nk_sum=int(meta.nk_tot), kgrid_sum=tuple(int(n) for n in wfn.kgrid),
+        band_window=(b0, b4))
+    name = str(getattr(config.head, "dense_file", "") or "")
+    if not name:
+        return mesh_source
+    path = name if os.path.isabs(name) else os.path.join(
+        getattr(config, "input_dir", "") or input_dir, name)
+    from common.parallel_transport import wfn_fingerprint
+    from file_io.restart_bundle import (
+        check_dipole_provenance, dipole_operator_mismatches,
+        read_dipole_metadata)
+    from wfn_loader import WfnLoader
+    attrs = read_dipole_metadata(path)
+    text = lambda v: v.decode() if isinstance(v, bytes) else str(v)
+    dense_wfn = WfnLoader(text(attrs["prov_wfn_file"]))
+    representation, velocity = _head_velocity_operator(config, meta)
+    hubbard = expected_hubbard_stamp(
+        config, wfn=dense_wfn, fallback_dir=os.path.dirname(os.path.abspath(path)),
+        caller="head_dense_file")
+    bad = [f"{k}: file={g!r} deck={w!r}" for k, g, w in dipole_operator_mismatches(
+        path, hubbard=hubbard, **velocity)]
+    for label, got, want in (
+            ("prov_bispinor", attrs.get("prov_bispinor"),
+             representation.scalar_head_bispinor),
+            ("nspinor", int(dense_wfn.nspinor), int(wfn.nspinor)),
+            ("nspin", int(dense_wfn.nspin), int(wfn.nspin)),
+            ("ecutwfc", float(dense_wfn.ecutwfc), float(wfn.ecutwfc))):
+        if got is None or (type(want)(got) != want):
+            bad.append(f"{label}: file={got!r} deck={want!r}")
+    if bad:
+        raise ValueError(
+            "GATE head_dense_operator: the dense head set was built with "
+            "another velocity operator or Hamiltonian.\n"
+            f"  got:  head_dense_file = {path!r}; " + "; ".join(bad) + "\n"
+            "  want: the deck's operator i[H, r] (V_NL included, analytic, the "
+            "deck's DFT+U stamp) on the same representation, spin and cutoff\n"
+            "  fix:  rerun the dense NSCF and python -m psp.get_dipole_mtxels "
+            "with the GW deck's pseudopotentials, cutoff and Hubbard keys")
+    a_deck = np.asarray(wfn.avec, float) * float(wfn.alat)
+    a_file = np.asarray(dense_wfn.avec, float) * float(dense_wfn.alat)
+    x_deck = np.asarray(wfn.atom_positions, float) * float(wfn.alat)
+    x_file = np.asarray(dense_wfn.atom_positions, float) * float(dense_wfn.alat)
+    if (a_deck.shape != a_file.shape or x_deck.shape != x_file.shape
+            or not np.array_equal(np.asarray(wfn.atom_types),
+                                  np.asarray(dense_wfn.atom_types))
+            or np.abs(a_deck - a_file).max() > _HEAD_DENSE_LATTICE_TOL_BOHR
+            or np.abs(x_deck - x_file).max() > _HEAD_DENSE_LATTICE_TOL_BOHR):
+        raise ValueError(
+            "GATE head_dense_lattice: the dense head set is another crystal.\n"
+            f"  got:  {text(attrs['prov_wfn_file'])!r} lattice/atoms differ "
+            f"from the GW WFN beyond {_HEAD_DENSE_LATTICE_TOL_BOHR} bohr\n"
+            "  want: the GW deck's cell, species and positions\n"
+            "  fix:  run the dense NSCF from the GW deck's structure")
+    if not check_dipole_provenance(
+            path, wfn=dense_wfn, nval=int(attrs["prov_nval"]),
+            ncond=int(attrs["prov_ncond"]), nband=int(attrs["prov_nband"]),
+            bispinor=representation.scalar_head_bispinor, hubbard=hubbard,
+            **velocity):
+        raise ValueError(
+            "GATE dft_head_dipole_provenance: head_dense_file is not "
+            "authenticated by its own WFN.\n"
+            f"  got:  {path!r} (prov_wfn_file "
+            f"{text(attrs['prov_wfn_file'])!r})\n"
+            "  want: dipole.h5 regenerated from that WFN\n"
+            "  why:  the dense head must sum the transitions of one DFT solution")
+    if wfn_fingerprint(dense_wfn) == wfn_fingerprint(wfn):
+        return dataclasses.replace(mesh_source, velocity_path=path)
+    nb_file = int(attrs["prov_nb_written"])
+    n_occ = int(meta.nelec)
+    b4_sum = min(b4, nb_file)
+    need = min(b4 - n_occ, HEAD_DENSE_MIN_CONDUCTION)
+    if (b0 != 0 or int(dense_wfn.nelec) != n_occ
+            or not dense_wfn.occupations_are_exact_integer
+            or b4_sum - n_occ < need):
+        raise ValueError(
+            "GATE head_dense_window: the dense head set does not cover the "
+            "head's transitions.\n"
+            f"  got:  bands [0,{nb_file}) at {int(dense_wfn.nelec)} occupied "
+            f"(integer occupations: {bool(dense_wfn.occupations_are_exact_integer)}); "
+            f"chi window [{b0},{b4}) at {n_occ} occupied\n"
+            f"  want: a chi window from band 0, the same {n_occ} occupied bands, "
+            f"and >= {need} conduction bands (HEAD_DENSE_MIN_CONDUCTION = "
+            f"{HEAD_DENSE_MIN_CONDUCTION}, or the chi window)\n"
+            "  fix:  raise nbnd in the dense NSCF")
+    return HeadSource(
+        velocity_path=path, wfn=dense_wfn, nk_sum=int(attrs["nk"]),
+        kgrid_sum=tuple(int(n) for n in dense_wfn.kgrid),
+        band_window=(b0, b4_sum), dense=True)
+
+
+def read_head_sum_set(source: HeadSource, *, mesh: Mesh):
+    """A dense sum set's ``(velocity_cart, energies_kn)`` for the S kernel.
+
+    ``velocity_cart`` is ``(3, nk_sum, S, S)`` at ``P(None, None, 'x', 'y')``
+    on the head carrier of its window (zero past it); ``energies_kn`` the
+    host ``(nk_sum, nb)`` band energies (Ry).  Both are the file's full-BZ
+    tables, so no second unfold runs.  COLLECTIVE over ``mesh``: one SlabIO
+    read of every row, each rank its band rows, then ``48 nk_sum nb^2`` B of
+    host window per process (255 MB for Si 16^3 at 36 bands), transient.
+    """
+    from file_io.dipole import read_band_energies
+    from file_io.restart_bundle import read_dipole_parent_window
+    b0, b4 = source.band_window
+    nk = int(source.nk_sum)
+    table = read_dipole_parent_window(
+        source.velocity_path, np.arange(nk), b0, b4, nk_full=nk, mesh=mesh)
+    velocity = _velocity_on_head_carrier(nk, b4 - b0, mesh,
+                                         lambda rows: table[rows])
+    energies = read_band_energies(source.velocity_path)[:, b0:b4]
+    if energies.shape != (nk, b4 - b0):
+        raise ValueError(
+            f"{source.velocity_path}: band_energies {energies.shape} do not "
+            f"match the velocity window ({nk}, {b4 - b0})")
+    return velocity, np.ascontiguousarray(energies)
 
 
 def build_dft_head_response(
@@ -4222,6 +4409,7 @@ def build_dft_head_response(
     wings: bool = True,
     occupation_state=None,
     frozen_parts: dict | None = None,
+    source: HeadSource | None = None,
 ) -> IterationHeadResponse:
     """Build the one-shot DFT head on exactly the chi0 band manifold.
 
@@ -4256,15 +4444,33 @@ def build_dft_head_response(
     occ_hash)``.  A frozen SC head (``sc_head_update = off``) keeps that key
     while its frequency plan follows the QP energy span, so each map then
     builds only S(z) and the wings.
-    """
-    import os
 
+    ``source`` is the head's sum set (:func:`head_source`, resolved from
+    ``config.head.dense_file`` when ``None``).  The GW mesh's own set is
+    today's head.  A dense set (insulators only, ``GATE head_dense_metal``)
+    replaces ``S_direct`` by its own Adler-Wiser sum at every node and
+    returns ``fold_scale = S_d,sum S_d,cell^-1``; the wings, ``W(Gamma)`` and
+    the mini-BZ cell stay the GW mesh's (``head_correction.scaled_head_fold``).
+    """
     z = np.asarray(omegas_ry, dtype=np.complex128).reshape(-1)
     parts_key = (bool(wings), any(abs(complex(v)) <= 1.0e-14 for v in z),
                  None if occupation_state is None else
                  (float(occupation_state.mu_ry), occupation_state.occ_hash))
     parts = None if frozen_parts is None else frozen_parts.get(parts_key)
-    dipole_path = os.path.join(input_dir, "dipole.h5")
+    if source is None:
+        source = head_source(config, wfn=wfn, meta=meta, input_dir=input_dir)
+    if source.dense and occupation_state is not None:
+        raise ValueError(
+            "GATE head_dense_metal: head_dense_file is an insulator-only head.\n"
+            f"  got:  head_dense_file = {source.velocity_path!r} on a metal "
+            f"(fixed-N state, mu = {float(occupation_state.mu_ry):.6f} Ry)\n"
+            "  want: an insulator, or no head_dense_file\n"
+            "  why:  the scaled fold holds S_d^-1 F fixed, but a metal's fold "
+            "carries the Fermi-surface wing and its D/z^2 head has no k-fixed "
+            "local-field fraction")
+    # The cell set's velocity (S_d,cell, the wings) is always the GW mesh's.
+    dipole_path = (os.path.join(input_dir, "dipole.h5") if source.dense
+                   else source.velocity_path)
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)
     nb_logical = b4 - b0
@@ -4340,13 +4546,18 @@ def build_dft_head_response(
         else:
             (surface, drude_tensor, fermi_surface, pair_split, static_kappa2,
              static_Y_x, static_Z_y, static_chi_body_gamma) = parts["metal"]
+    sum_set = None
+    if source.dense:
+        sum_set = (read_head_sum_set(source, mesh=mesh) if parts is None
+                   else parts["sum_set"])
     if parts is None and frozen_parts is not None:
         frozen_parts.clear()
         frozen_parts[parts_key] = dict(
             velocity_cart=velocity_cart,
             metal=(surface, drude_tensor, fermi_surface, pair_split,
                    static_kappa2, static_Y_x, static_Z_y,
-                   static_chi_body_gamma))
+                   static_chi_body_gamma),
+            sum_set=sum_set)
     surface_c = None if surface is None else on_carrier(surface)
     S = head_s_tensor_sharded(
         velocity_cart, on_carrier(energies), on_carrier(occupations), z,
@@ -4362,13 +4573,32 @@ def build_dft_head_response(
             mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin), nspinor=normalization_nspinor,
             eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface_c)
+    fold_scale = None
+    if sum_set is not None:
+        # The sum set's direct head on the same kernel and nodes, normalized
+        # by its own N_k; the GW mesh's S stays only as the fold's ratio.
+        from gw.head_correction import head_fold_scale
+        v_sum, e_sum = sum_set
+        nb_sum = int(e_sum.shape[1])
+        f_sum = np.zeros_like(e_sum)
+        f_sum[:, :max(0, int(meta.nelec) - b0)] = 1.0
+        pad = head_storage_extent(mesh, nb_sum) - nb_sum
+        S_cell = S
+        S = head_s_tensor_sharded(
+            v_sum, jnp.pad(jnp.asarray(e_sum), ((0, 0), (0, pad))),
+            jnp.pad(jnp.asarray(f_sum), ((0, 0), (0, pad))), z,
+            mesh=mesh, nb_logical=nb_sum,
+            cell_volume=float(meta.cell_volume), nk_tot=int(source.nk_sum),
+            nspin=int(wfn.nspin), nspinor=normalization_nspinor,
+            eta_ry=float(config.head.wcoul0_eta))
+        fold_scale = head_fold_scale(S, S_cell)
     # Hard lifetime boundary: this module previously had zero
     # ``block_until_ready`` calls (unlike ``screening.py``'s per-stage
     # discipline), so the direct head/wings built here stayed queued,
     # unattributed, until whatever LATER stage first forced a host
     # readback -- see the matching boundary + comment in
     # ``finalize_iteration_head_samples``.  Pure scheduling change.
-    jax.block_until_ready((S, Y_x, Z_y))
+    jax.block_until_ready((S, Y_x, Z_y, fold_scale))
     e_host = np.asarray(energies)
     n_occ_local = max(0, min(int(meta.nelec) - b0, nb_logical))
     if occupation_state is not None:
@@ -4388,7 +4618,7 @@ def build_dft_head_response(
         sigma_energies_ry=e_host[:, :int(meta.nb_sigma)],
         sigma_occupations=np.asarray(occupations)[:, :int(meta.nb_sigma)],
         efermi_ry=efermi, drude_tensor=drude_tensor,
-        fermi_surface=fermi_surface)
+        fermi_surface=fermi_surface, fold_scale=fold_scale)
 
 
 def _head_bvec(wfn):

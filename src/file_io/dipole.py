@@ -4,8 +4,8 @@ Layout (``psp.get_dipole_mtxels`` writes it, the GW head and BSE absorption
 read it):
 
 * ``dipole_cart`` — ``(3, nk, nb, nb)`` complex128, ⟨mk|v̂_α|nk⟩ in Ry
-  units on the full BZ, at the arm the file's ``prov_vnl_velocity_sign``
-  names.
+  units on the full BZ: the band velocity ``v = i[H, r] = p + i[V_NL, r]``
+  (``p`` alone when the root attribute ``skip_vnl`` is set).
 * ``band_energies`` — ``(nk, nb)`` float64, the WFN mean-field eigenvalue of
   each band at each full-BZ k (Ry): the star parent's row, which is the
   energy ψ(Sk) carries.
@@ -14,8 +14,13 @@ read it):
   ``ward_residual_cvkq``).
 * root attributes — ``nbands``, ``nk``, ``skip_vnl``, ``note``, ``basis``
   (``"dft"`` or ``"qp"``: whose states the band indices label; absent reads
-  ``"dft"``) and the ``prov_*`` provenance stamp
-  (``psp.get_dipole_mtxels.dipole_provenance``).
+  ``"dft"``), ``format_version`` (:data:`DIPOLE_FORMAT_VERSION`) and the
+  ``prov_*`` provenance stamp (``psp.get_dipole_mtxels.dipole_provenance``).
+
+FORMAT VERSION.  Version 2 (2026-10-20) is the first format whose velocity
+can only be ``i[H, r]``.  Every reader calls :func:`require_dipole_format`
+first, so a file without the stamp (version 1, which may hold the retired
+``p - i[V_NL, r]`` assembly) refuses by name instead of being read.
 
 ΔE IS DERIVED ON READ.  ``ΔE[k, m, n] = E_m(k) − E_n(k)`` carries no
 information beyond ``band_energies`` and was 14 % of every file.
@@ -40,20 +45,27 @@ LEGACY_DELTA_E_DATASET = "deltaE"
 FINITE_Q_GROUP = "finite_q"
 #: Root attribute: the one-particle basis the band indices label.
 DIPOLE_BASIS_ATTR = "basis"
+#: Root attribute and value of the current layout; absent reads 1.
+DIPOLE_FORMAT_ATTR = "format_version"
+DIPOLE_FORMAT_VERSION = 2
 
 __all__ = [
     "BAND_ENERGIES_DATASET",
     "DIPOLE_BASIS_ATTR",
     "DIPOLE_DATASET",
+    "DIPOLE_FORMAT_ATTR",
+    "DIPOLE_FORMAT_VERSION",
     "FINITE_Q_GROUP",
     "LEGACY_DELTA_E_DATASET",
     "band_energies_on_full_bz",
     "require_dipole_basis",
+    "require_dipole_format",
     "require_dipole_k_grid",
     "velocity_stamp",
     "wfn_psi_basis",
     "delta_e",
     "delta_e_cv",
+    "read_band_energies",
     "energy_extent",
     "finite_q_payload",
     "write_dipole",
@@ -157,6 +169,24 @@ def require_dipole_basis(attrs, *, dipole_path, wfn_path) -> None:
             f"dipole_qsgw.h5 pairs only with a QP WFN.")
 
 
+def require_dipole_format(attrs, *, dipole_path) -> None:
+    """Refuse a ``dipole.h5`` written before :data:`DIPOLE_FORMAT_VERSION`.
+
+    ``attrs`` are the file's root attributes (an h5py ``AttributeManager`` or
+    a dict).  A version-1 file (no stamp) predates the one-operator velocity
+    and cannot say which assembly built it.
+    """
+    raw = attrs.get(DIPOLE_FORMAT_ATTR, 1)
+    got = int(np.asarray(raw).reshape(-1)[0])
+    if got != DIPOLE_FORMAT_VERSION:
+        raise ValueError(
+            f"GATE dipole_format_version: {dipole_path!s} has dipole format "
+            f"version {got}; want {DIPOLE_FORMAT_VERSION}; why: files before "
+            f"version {DIPOLE_FORMAT_VERSION} may hold a velocity other than "
+            f"i[H, r] and carry no stamp that says which; fix: regenerate "
+            f"dipole.h5 (python -m psp.get_dipole_mtxels -i <deck>).")
+
+
 def require_dipole_k_grid(attrs, nk: int, *, dipole_path) -> None:
     """Refuse a dipole whose full-BZ k list is not the BSE bundle's.
 
@@ -211,6 +241,7 @@ def velocity_stamp(path, *, wfn, wfn_path) -> tuple[str, str, np.ndarray]:
     with h5py.File(str(path), "r") as h5:
         attrs = dict(h5.attrs)
         energies = np.asarray(h5[BAND_ENERGIES_DATASET][()], dtype=np.float64)
+    require_dipole_format(attrs, dipole_path=path)
     require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
     require_dipole_wfn_fingerprint(attrs, dipole_path=path, wfn_path=wfn_path,
                                    want=wfn_fingerprint(wfn))
@@ -263,7 +294,8 @@ def write_dipole(path, velocity_kmajor, band_energies, *, mesh, attrs,
                     io.stamp_dataset_attrs(f"{FINITE_Q_GROUP}/{name}",
                                            ds_attrs)
             io.stamp_dataset_attrs(FINITE_Q_GROUP, dict(finite_q["attrs"]))
-        io.stamp_dataset_attrs("/", dict(attrs))
+        io.stamp_dataset_attrs(
+            "/", {**dict(attrs), DIPOLE_FORMAT_ATTR: DIPOLE_FORMAT_VERSION})
 
 
 def energy_extent(h5) -> tuple[int, ...] | None:
@@ -289,6 +321,23 @@ def _whole_float64(h5, name) -> np.ndarray | None:
 
 def _band_energies(h5) -> np.ndarray | None:
     return _whole_float64(h5, BAND_ENERGIES_DATASET)
+
+
+def read_band_energies(path) -> np.ndarray:
+    """``(nk, nb)`` float64 ``band_energies`` of a current-format ``dipole.h5`` (Ry).
+
+    The full-BZ eigenvalues the producer wrote beside ``dipole_cart``; a
+    file without the table (written before 2026-09-25) or of an older format
+    refuses.
+    """
+    import h5py
+    with h5py.File(str(path), "r") as h5:
+        require_dipole_format(h5.attrs, dipole_path=path)
+        energies = _band_energies(h5)
+    if energies is None:
+        raise KeyError(f"{path!s} has no {BAND_ENERGIES_DATASET!r} table; "
+                       "regenerate it with python -m psp.get_dipole_mtxels")
+    return energies
 
 
 def delta_e(h5) -> np.ndarray:

@@ -176,8 +176,8 @@ solid, so the computed sign is reported, not assumed.
   sign: `dV_NL/dk` is almost purely off-diagonal (~900× on CrI₃).
 * **Nonlocal-velocity sign.** A direct off-diagonal finite difference of
   `⟨m|V_NL(k)|n⟩` (ψ held fixed) equals the analytic `+dV_NL/dk` to ratio
-  +1.000, so the physical velocity is `v = p + vNL`, the dipole producer's
-  default arm (`VNL_VELOCITY_SIGN_FLIPPED = +1`). The other arm flips the
+  +1.000, so the physical velocity is `v = p + vNL = i[H, r]`, the one
+  operator the dipole producer assembles. Subtracting `vNL` instead flips the
   orbital moment (CrI₃: `+0.026` → `−0.081 μ_B`).
 * **Symmetry.** `m_x, m_y ≈ 0` for an out-of-plane ferromagnet.
 

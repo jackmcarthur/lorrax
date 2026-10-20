@@ -631,6 +631,38 @@ def refuse_unsupported_screening_diagrams(config) -> None:
             f"screening_diagrams.")
 
 
+def refuse_unsupported_head_dense(config) -> None:
+    """Refuse ``head_dense_file`` where the head is not the scalar DFT charge response, at PARSE time.
+
+    The dense set holds the DFT velocity of the scalar charge head
+    (``gw.qsgw_head.head_source``).  A head that is off, four-current, or
+    rebuilt each SC map from QP velocities (``sc_head_update`` not ``off``)
+    would ignore it or mix two operators.  Metals refuse at the head build
+    (``GATE head_dense_metal``), where the occupation state is known.
+    """
+    if not getattr(config.head, "dense_file", ""):
+        return
+    why = None
+    if config.head.correction is HeadCorrection.OFF:
+        why = "head_correction = off builds no head"
+    elif bool(config.bispinor):
+        why = "bispinor = true: the four-current head has no dense source"
+    elif (config.qp_solver is QPSolver.SELF_CONSISTENT
+            and config.sc.head_update != "off"):
+        why = (f"sc_head_update = {config.sc.head_update} rebuilds the head "
+               "each map from the QP velocity of the GW mesh")
+    if why is not None:
+        raise ValueError(
+            "GATE head_dense_operator: head_dense_file names a dense DFT "
+            "charge head this deck cannot use.\n"
+            f"  got:  head_dense_file = {config.head.dense_file!r}; {why}\n"
+            "  want: a scalar head (head_correction = full | no_local_fields) "
+            "built from the DFT response: one-shot, BSE screening, or SC with "
+            "sc_head_update = off\n"
+            "  fix:  drop head_dense_file, or change the head settings\n"
+            "  doc:  docs/input_reference.md, head_dense_file.")
+
+
 def sigma_channels_for(mode) -> frozenset[SigmaChannel]:
     """The Σ channels ``mode`` builds, per :data:`MODE_SIGMA_CHANNELS`."""
     resolved = coerce_compute_mode(mode)
@@ -1289,25 +1321,6 @@ _DEFAULTS = {
     # Orthogonal four-current screening policy.  The historical
     # charge-screened + bare-transverse exchange path remains the default.
     "bispinor_gw": "bare_transverse",
-    # The relative sign of the i[r, V_NL] commutator in the assembled
-    # velocity, read by ``psp.get_dipole_mtxels`` and passed to
-    # ``common.mtxel_sweep.dipole_operator``.  ``-1`` is the legacy shipped
-    # assembly and ``+1`` the arm that reproduces BerkeleyGW's q -> 0
-    # head; the words "shipped" / "flipped" spell the same two.  Empty is
-    # NOT DECLARED and resolves to ``+1`` -- and for that
-    # reason it must be a STRING default: a float default would make
-    # "unset" and an explicit "-1" indistinguishable, and the whole point
-    # of the stamp this feeds is to say which arm a dipole.h5 was built
-    # with.
-    #
-    # IT HAS TO BE HERE.  ``read_lorrax_input`` builds ``params`` from
-    # this table alone, so a key absent from it is parsed, reported as
-    # unrecognized and dropped -- the producer then reads its own default
-    # and the run is the other arm.  Measured, not argued: the first
-    # flipped-arm dipole.h5 came back stamped ``-1.0`` with
-    # "1 unrecognized deck key(s)" in the log, which is this project's
-    # named failure mode reproduced in one line of a deck.
-    "vnl_velocity_sign": "",
     # DFT+U mean field (QE ortho-atomic): the pw.x input carrying the HUBBARD
     # card, and that run's prefix.save/occup.txt.  Read by psp.hubbard_ops'
     # one resolver, which the dipole/velocity producer and every velocity
@@ -1486,6 +1499,11 @@ _DEFAULTS = {
     # head (microscopic local fields folded exactly once); the other two are
     # convergence/diagnostic arms, not alternative diagram sets.
     "head_correction": "full",
+    # Dense-k direct head (insulators): a dipole.h5 on a denser k mesh of the
+    # same crystal and Hamiltonian.  Empty = the GW mesh's own dipole.h5, bit
+    # for bit.  Its S_d replaces the GW mesh's; the local-field fold is the GW
+    # mesh's, scaled by S_d,dense S_d,mesh^-1 (gw.head_correction.scaled_head_fold).
+    "head_dense_file": "",
     # Opt-in finite-q W-av preprocessing.  The flags select the first and
     # second reciprocal-grid stencil shells written beside the PT data; they
     # do not activate the not-yet-complete metallic finite-q screening path.
@@ -2636,6 +2654,7 @@ def _input_head(
     _resolved_do_g0 = _head_correction is not HeadCorrection.OFF
     head = HeadConfig(
         correction=_head_correction,
+        dense_file=str(params["head_dense_file"] or "").strip(),
         wcoul0_source=str(params["wcoul0_source"]).strip().lower(),
         wcoul0_eta=float(params["wcoul0_eta"] or 0.0),
         vhead=params["vhead"],
@@ -2956,7 +2975,6 @@ def _assemble_input_config(
         do_screened=bool(params["do_screened"]),
         bispinor=bool(params["bispinor"]),
         bispinor_gw=coerce_bispinor_gw_mode(params["bispinor_gw"]),
-        vnl_velocity_sign=str(params["vnl_velocity_sign"] or ""),
         hubbard_input=str(params["hubbard_input"] or ""),
         hubbard_occupations=str(params["hubbard_occupations"] or ""),
         do_G0=_resolved_do_g0,
@@ -3055,6 +3073,7 @@ def _apply_input_envelope(
             "(docs/input_reference.md, restart)")
     refuse_unsupported_bgw_metal_q0_treatment(resolved)
     refuse_unsupported_screening_diagrams(resolved)
+    refuse_unsupported_head_dense(resolved)
     refuse_unsupported_bispinor_gw(resolved)
     warn_headless_shared_pole_self_consistency(resolved, print_fn=print_fn)
     announce_legacy_sigma_axis_keys(
@@ -4053,6 +4072,7 @@ def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
 class HeadConfig:
     """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs; see docs/dev/gw_config_contracts.md."""
     correction: HeadCorrection    # full | no_local_fields | off
+    dense_file: str               # dense-k sum set dipole.h5; "" = the GW mesh
     wcoul0_source: str            # "s_tensor" | "epshead"
     wcoul0_eta: float
     vhead: float | None           # explicit override v_h[ω=0]
@@ -4909,10 +4929,6 @@ class LorraxConfig:
     do_screened: bool
     bispinor: bool
     bispinor_gw: BispinorGWMode
-    #: Raw deck spelling resolved by the canonical dipole producer at the
-    #: point of use.  Keeping the spelling (rather than a second resolver in
-    #: gw_config) lets every velocity consumer take the producer's exact arm.
-    vnl_velocity_sign: str
     #: DFT+U velocity inputs (deck-relative spellings); resolved at the point
     #: of use by ``psp.hubbard_ops.resolve_hubbard_input``.
     hubbard_input: str
