@@ -1936,7 +1936,7 @@ def write_results(
             assembly=assembly,
             file_wedge_full_bz_rows=np.asarray(
                 reduce_full_bz_to_file_wedge(
-                    sym, np.arange(
+                    wfn.symmetry(), np.arange(
                         int(np.shape(sym.unfolded_kpts)[0]),
                         dtype=np.int64))),
             degeneracy_policy=degeneracy_policy,

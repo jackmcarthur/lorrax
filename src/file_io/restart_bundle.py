@@ -1867,6 +1867,8 @@ def read_eqp_assembly_receipt(filepath):
 	unknown/partial canonical schema refuses rather than falling back to raw.
 	v6 additionally authenticates aggregate ``Hdir`` against persisted scalar
 	``V_H`` and transverse ``H_T``; v5 refuses those companions entirely.
+	Full raw evaluation energies may be exactly selected onto the receipt's
+	authenticated file rows. Nontrivial star substitution remains forbidden.
 	"""
 	from file_io.sigma_output import (
 		EQP_ASSEMBLY_BAND_START_ATTR,
@@ -2104,6 +2106,33 @@ def read_eqp_assembly_receipt(filepath):
 				f"malformed {EQP_ASSEMBLY_DEGENERACY_TOL_ATTR}={tol_ry!r}.")
 		eval_rel_ev, eval_provenance, eval_coverage = (
 			_eval_metadata_from_open_h5(h5))
+		eval_source_coverage = None
+		if eval_rel_ev is not None:
+			# A full independent computational k set and the source WFN's
+			# file rows need not coincide. Exact row selection is legal only
+			# when every raw k is present, never by substituting a star parent.
+			star = read_star_map(abs_path, "sigma_c_kij_ev", k_axis=1)
+			nk_raw = int(h5["sigma_c_kij_ev"].shape[1])
+			compact = None if star is None else np.asarray(star[0])
+			full_storage = (compact is None or (nk_raw == compact.size and
+				np.array_equal(compact, np.arange(nk_raw)) and not np.any(star[1])))
+			if (full_storage and eval_rel_ev.shape == (nk_raw, values.shape[2])
+					and not np.array_equal(file_rows, np.arange(nk_raw))):
+				if file_rows.size and int(file_rows.max()) >= nk_raw:
+					raise ValueError("EQP receipt file rows exceed the full raw Sigma k axis")
+				eval_rel_ev = eval_rel_ev[file_rows]
+				if eval_coverage is not None:
+					eval_source_coverage = dict(eval_coverage, scope="raw_full_bz")
+					# The conditioned on-shell receipt owns the exact selected
+					# coverage mask. An omega-grid aggregate alone cannot be
+					# reassigned to a subset, so leave that subset unmeasured.
+					if on_shell:
+						covered = np.real(c_omega[-1]) != 0.0
+						eval_coverage = dict(eval_coverage,
+							n_uncovered=int(np.count_nonzero(~covered)),
+							fraction_uncovered=float(np.mean(~covered)), scope="file_wedge")
+					else:
+						eval_coverage = None
 		if eval_rel_ev is not None and eval_rel_ev.shape != values.shape[1:]:
 			# The stamp is on the star wedge (the cube writer put it there);
 			# the receipt is on the file wedge.  Pairing them would hand a
@@ -2143,6 +2172,8 @@ def read_eqp_assembly_receipt(filepath):
 			"eval_energies_rel_ev": eval_rel_ev,
 			"eval_energies_provenance": eval_provenance,
 			"eval_coverage": eval_coverage,
+			**({} if eval_source_coverage is None else
+			   {"eval_source_coverage": eval_source_coverage}),
 			"band_start": b0,
 			"band_stop": b1,
 			"file_wedge_full_bz_rows": file_rows,

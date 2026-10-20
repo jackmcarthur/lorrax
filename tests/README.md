@@ -12,6 +12,9 @@ A new test needs no bootstrap import of its own.
   magnetic H2⁻ fixture at P4 ([README](hsuite/README.md)).
 - `test_layering.py`, `test_crossfile_requests.py`, `test_env_registry.py`,
   `test_env_grammar.py`, `test_fft_shardmap_context.py`: static AST suites.
+- `test_eqp_file_domain_cpu.py`: the live EQP writer's source-file row
+  witness and receipt round-trip beside full independent raw Sigma;
+  exact evaluation-energy selection, scoped coverage and strict reduced-star guards.
 - `test_sc_checkpoint_resume.py`: SC continuation on toy inputs (CPU): the
   Anderson trajectory across a stop, a refused held Σ rule, the band carrier,
   the checkpoint cube digest split over ranks (the same at any P).

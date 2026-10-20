@@ -1943,7 +1943,10 @@ def append_eqp_assembly_receipt_h5(
 
 	``file_wedge_full_bz_rows`` is checked, not trusted: one row per
 	assembly row, distinct, in range for the cube's mesh, and every stored
-	star reached by at least one row.  The last is the part with content —
+	reduced star reached by at least one row. A full raw operator (including
+	an identity row/action stamp) may instead be sampled on the source file's
+	rows without reconstructing any of its other independent k points.
+	For a genuinely reduced cube the last check has content —
 	a file wedge reaches the whole zone under the group, so an assembly
 	short a star, or on another deck's k-set, fails it.
 	"""
@@ -2051,7 +2054,12 @@ def append_eqp_assembly_receipt_h5(
 			f"{int(file_rows.max())} is out of range for the "
 			f"{nk_full}-k mesh {os.path.basename(abs_path)} describes; the "
 			"assembly and the cube are not from the same run.")
-	if compact is not None:
+	# An identity stamp stores every full-BZ row, despite the historical
+	# ``ibz`` spelling. A file-wedge diagnostic may sample that full raw
+	# operator without covering all independent computational k points.
+	full_storage = (compact is None or (nk_raw == nk_full and
+		np.array_equal(compact, np.arange(nk_full)) and not np.any(star[1])))
+	if not full_storage:
 		covered = np.unique(compact[file_rows])
 		if covered.size != nk_raw:
 			raise ValueError(
