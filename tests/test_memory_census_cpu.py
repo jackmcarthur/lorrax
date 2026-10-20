@@ -175,9 +175,9 @@ def test_run30k_plan_census_is_clean_under_strict(run30k):
     assert "CENSUS []" in run30k, [l for l in run30k.splitlines() if "CENSUS" in l]
 
 
-@pytest.mark.xfail(strict=True, reason="compile-only prices on XLA:CPU over-price the A100 programs (the checked eigh chain 10.0 L against 7.4-8.0 L measured on 2x2, the face program 47.9 against 31.29 GB), so sizing on the CPU replay asks P = 25 (passivity_held 83.8 GB at P = 16, its eigh stacks 40.7 GB compiled on CPU); run30k ran at P = 16 (the GPU trace decides)")
 def test_run30k_minimum_p_is_the_run(run30k):
-    """run30k completed at P = 16 (4 A100-80GB nodes, 66.02 GB peak of 77.89)."""
+    """run30k completed at P = 16 (4 A100-80GB nodes, 66.02 GB peak of 77.89).  The CPU replay
+    asked P = 25 until C7e: its eigh stack (1, 30000^2) reused a larger room's program."""
     assert "minimum to complete: P = 16 (4 nodes of NVIDIA A100-SXM4-80GB)" in _sizing(run30k)
 
 
