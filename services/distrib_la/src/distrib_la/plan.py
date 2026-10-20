@@ -1511,7 +1511,13 @@ class Plan:
             return out
         _notices(out[-1], self.op, int(ops[0].shape[-1]), ops[0].dtype, site, final=False)
         del out
-        return program("retry", ())(*ops)
+        retry = program("retry", ())
+        # The fallback runs: its program, compiled at the operands, is a part of the open stage.
+        from lxkit import memory
+        m = retry.lower(*ops).compile().memory_analysis()
+        memory.book(memory.priced(m.temp_size_in_bytes + m.output_size_in_bytes - m.alias_size_in_bytes,
+                                  f"distrib_la {self.op} retry program (compiled)", increment=True))
+        return retry(*ops)
 
     def _checked_eigh(self, call, post):
         from distrib_la._result_check import checked_eigh, eigh_layout, shifted

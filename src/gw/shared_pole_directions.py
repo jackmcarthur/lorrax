@@ -570,14 +570,18 @@ class LineSelection:
                     line["cross"] += self._cross(family, rectangles, line["mirrors"], mirror=True)
 
     def eigh_bytes(self):
-        """The selection's eigh stack as its own plan prices it (``distrib_la.eigh_stack_bytes``:
-        the program place() routes, compiled at the abstract stack, plus the provider's query):
-        the largest family's, every parent at once on the local route, one on the face."""
+        """The selection's eigh stack as it runs (eagerly, ``polar._direction_svd_kernel``): the
+        route its own plan decides (``place``: the first attempt compiled, + the provider's
+        query; route (c): its compiled chain), the largest family's, every parent at once on the
+        local route, one on the face.  A failed check books its retry program when it runs."""
         import distrib_la
         if not hasattr(self, "_eigh_bytes"):
             depth = self.nq if self.execution == "local" else 1
-            self._eigh_bytes = max(distrib_la.eigh_stack_bytes(self.plans[f["name"]], (depth, f["rows"], f["rows"]),
-                                                               np.complex128) for f in self.families)
+            shapes = {f["name"]: (depth, f["rows"], f["rows"]) for f in self.families}
+            routes = {k: self.plans[k].stack_route(s, np.complex128) for k, s in shapes.items()}
+            self._eigh_bytes = max(int(r.program_bytes) if r.program_bytes is not None else
+                                   distrib_la.eigh_stack_bytes(self.plans[k], shapes[k], np.complex128)
+                                   for k, r in routes.items())
         return self._eigh_bytes
 
     def panel_fields(self, lines):
