@@ -235,7 +235,7 @@ def face_eigh_room(admission, held=0, *, stage):
     ``held`` what is live beside it that the row does not hold: the receipt's
     upper bound on the factors every parent keeps. Both are shape prices,
     so every rank agrees on the room. It is floored to a whole GiB at or above 1 GiB and
-    exact below (``common.gpu_utils.room_bucket``).
+    exact below (``lxkit.memory.bucket``).
     """
     # ponytail: the face programs are keyed on the plan, and so on this
     # floored room; a room that crosses a GiB between SC maps recompiles the
@@ -243,19 +243,30 @@ def face_eigh_room(admission, held=0, *, stage):
     # tuple (route, matrices per rank, rounds) instead of the room.
     available = int(admission['available_device_bytes_per_rank'])
     priced = int(admission['aggregate_bytes_per_rank']) + int(held)
-    from common.gpu_utils import room_bucket
+    from lxkit import memory
     from distrib_la import room_or_exhausted
-    return room_or_exhausted(room_bucket(available - priced), stage=stage, priced_bytes=priced,
+    return room_or_exhausted(memory.bucket(available - priced), stage=stage, priced_bytes=priced,
                              available_bytes=available)
 
 
 def check_eigh_room(model_row, price):
-    """The passivity/held checks' eigh room: beside the model row and the check program's
-    ``price``, with the row's own reservation of that same n x n eigh handed back (the model
-    phase prices it; run30k: 8 GiB without the hand-back, 15 with it)."""
-    return face_eigh_room(dict(model_row, aggregate_bytes_per_rank=(
-        model_row['aggregate_bytes_per_rank'] + price - model_row['native_workspace'].get('eigh', 0))),
-        stage="shared-pole passivity/held checks")
+    """The passivity/held checks' eigh room: beside the model row and ``price`` (the check
+    program's proposed size, ``face_check_bytes``), with the row's own reservation of that
+    same n x n eigh handed back (the model phase prices it; run30k: 8 GiB without the
+    hand-back, 15 with it).  The model row is booked to ``spole.passivity_held``; the check
+    program is booked there compiled (``shared_pole_local.book_check_eighs``)."""
+    from lxkit import memory
+    held = model_row['aggregate_bytes_per_rank'] - model_row['native_workspace'].get('eigh', 0)
+    aggregate = held + price
+    geometry = model_row.get('geometry', {})
+    ranks = int(geometry.get('px', 1)) * int(geometry.get('py', 1))
+    memory.book(memory.Price(
+        operands=memory.Term(float(model_row.get('baseline_bytes_per_rank', 0)),
+                             source="live outside the ledger at bind"),
+        xla=memory.Term(spread=float(held) * ranks, source="model ledger row"),
+        ranks=ranks, label="spole.passivity_held"), stage="spole.passivity_held")
+    return face_eigh_room(dict(model_row, aggregate_bytes_per_rank=aggregate),
+                          stage="shared-pole passivity/held checks")
 
 
 def _shard_bytes(array):
@@ -340,22 +351,27 @@ class ConstructorCapacity:
                                      room=self.face_room if self.execution == "face" else None,
                                      backend=self._resolution.eigh_backend)
 
-    def query_workspace(self, op, shapes, plan):
-        """Native workspace bytes per rank for one op at one shape, cached."""
+    def eigh_bytes(self, extent):
+        """The eigh stack's compiled figure at ``extent`` (``distrib_la.eigh_stack_bytes``),
+        cached and recorded in the receipt's ``native_queries``."""
         import distrib_la
+        shapes = ((self.batch_width, int(extent), int(extent)),)
+        if ("eigh", shapes) not in self.native_queries:
+            self.native_queries[("eigh", shapes)] = distrib_la.eigh_stack_bytes(
+                constructor_price_plan(self._mesh_xy, int(extent), self.execution,
+                                       backend=self._resolution.eigh_backend),
+                shapes[0], np.complex128)
+        return self.native_queries[("eigh", shapes)]
 
-        # Receipt schema owns a stable ``(op, shapes)`` key. Execution is
-        # recorded on every capacity row and one ConstructorCapacity never
-        # mixes layouts, so it does not belong in this map key.
-        key = (op, shapes)
-        if key not in self.native_queries:
-            self.native_queries[key] = distrib_la.workspace_bytes_per_rank(plan, op, shapes, np.complex128)
-        return self.native_queries[key]
+    @property
+    def ledger(self):
+        """The shared ledger this construction reserves in (``CapacityLedger``)."""
+        return self._ledger
 
     def plan(self, side=None, *, phase=None, sample_batch=1,
              selection_faces=None, eigen_side=None, cross_original_sides=None,
-             padding_output_bytes_per_rank=0):
-        """Admit this phase's actual live set before allocating it.
+             padding_output_bytes_per_rank=0, runs_in=None):
+        """Admit this phase's actual live set before allocating it, priced in ``runs_in``.
 
         ``side`` is the pencil side this price is for; omit it to reprice the
         side already in hand.
@@ -371,7 +387,7 @@ class ConstructorCapacity:
                                    cross_original_sides=cross_original_sides,
                                    padding_output_bytes_per_rank=padding_output_bytes_per_rank)
         self._workspace = sum(native.values())
-        row = self._reserve("constructor.plan", price["resident_bytes_per_rank"])
+        row = self._reserve("constructor.plan", price["resident_bytes_per_rank"], runs_in)
         row['execution'] = self.execution
         return dict(row, price=price, native_workspace=dict(native))
 
@@ -388,14 +404,11 @@ class ConstructorCapacity:
             eigen_side = max(side // 2, 2 * min(side // 2, int(self.ritz_budget)))
         extents = {n} if phase == "selection" else (
             {side if eigen_side is None else int(eigen_side)} if phase in ("reduction", "cross_reduction") else {n})
-        # Eigh scratch is transient: replace it at each phase boundary. It is
-        # priced on the whole-mesh plan: the room distrib_la reads to run a
-        # stack one whole matrix per rank is what this admission leaves over.
-        self._native_maxima["eigh"] = max(self.query_workspace(
-            "eigh", ((self.batch_width, extent, extent),),
-            constructor_price_plan(self._mesh_xy, int(extent), self.execution,
-                                   backend=self._resolution.eigh_backend))
-            for extent in sorted(extents))
+        # Eigh scratch is transient: replace it at each phase boundary. It is the eigh
+        # stack's program compiled at its shape on the whole-mesh plan (never run), plus its
+        # provider's workspace query: the room distrib_la reads to run a stack one whole
+        # matrix per rank is what this admission leaves over.
+        self._native_maxima["eigh"] = max(self.eigh_bytes(e) for e in sorted(extents))
         self._workspace = sum(self._native_maxima.values())
 
         return price, dict(self._native_maxima)
@@ -460,9 +473,9 @@ class ConstructorCapacity:
                             sum(_shard_bytes(a) for a in unique.values()))
         self._ledger.live_stages = (*self._upstream, row["stage"])
 
-    def _reserve(self, kind, resident_bytes_per_rank):
+    def _reserve(self, kind, resident_bytes_per_rank, runs_in=None):
         return self._ledger.reserve(
             f"{kind}.{len(self._ledger.entries)}",
             resident_bytes_per_rank=resident_bytes_per_rank,
             workspace_bytes_per_rank=self._workspace,
-            concurrent_with=self._upstream)
+            concurrent_with=self._upstream, runs_in=runs_in, whole=self.execution != "face")

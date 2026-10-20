@@ -38,19 +38,18 @@ def test_the_runtime_vendor_facts_are_declared_per_leg():
     """The CUDA row carries the values the runtime hard-coded before they were leg facts;
     the host leg declares none (exact-zero scratch, no reader, no collective library)."""
     cuda, rocm, host = legs.LEGS["CUDA"], legs.LEGS["ROCM"], legs.LEGS["cpu"]
-    fields = ("fft_plan_scratch", "outside_pool_api", "memory_telemetry",
-              "collective_library", "collective_net_plugin")
+    fields = ("fft_plan_scratch", "outside_pool_api", "collective_library",
+              "collective_net_plugin")
     assert tuple(getattr(cuda, f) for f in fields) == (
-        "cufft", "cuda_driver_mempool", "nvidia-smi", "nccl", "libnccl-net.so")
+        "cufft", "cuda_driver_mempool", "nccl", "libnccl-net.so")
     assert tuple(getattr(rocm, f) for f in fields) == (
-        "hipfft", "hip_runtime_arena", "hip_runtime", "rccl", "librccl-net.so")
+        "hipfft", "hip_runtime_arena", "rccl", "librccl-net.so")
     assert all(not getattr(host, f) for f in fields) and host.profiler == ()
     assert cuda.profiler[2] == 0 and rocm.profiler == ("rocprofv3", "librocprofiler-sdk-tool", 1)
     from runtime import aot_memory, xla_memory
     for leg in (cuda, rocm):
         assert leg.fft_plan_scratch in aot_memory._PLAN_APIS
         assert leg.outside_pool_api in xla_memory._OUTSIDE_POOL_READERS
-        assert leg.memory_telemetry in xla_memory._TELEMETRY
 
 
 def test_every_leg_fact_that_must_be_distinct_is_distinct():

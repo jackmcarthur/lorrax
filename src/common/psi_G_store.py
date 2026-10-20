@@ -45,6 +45,20 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from runtime.padding import spec_divisor
 
 
+
+_EXECUTABLES: dict = {}
+
+
+def _priced_executable(kernel, args, stage):
+    """``kernel`` compiled for ``args``, once per signature (a stage that cannot bind: no price
+    of its own; the trace measures it)."""
+    key = (kernel, tuple((tuple(a.shape), str(a.dtype), getattr(a, "sharding", None))
+                         for a in jax.tree.leaves(args)))
+    if key not in _EXECUTABLES:
+        _EXECUTABLES[key] = kernel.lower(*args).compile()
+    executable = _EXECUTABLES[key]
+    return executable
+
 def _zero_user_band_pad_in_shard(
     shard_data: np.ndarray,
     *,
@@ -1214,10 +1228,11 @@ def load_parent_psi_G(
         t1 = _time.perf_counter()
         kern = _gslot_face_kernel(mesh_xy, fft_grid, nk, wc, ns, ngk_c,
                                   int(mu_pad), int(mu_t), with_faces)
+        args = (chunk, sidx, kvecs_dev, r_mu_dev, w_mu_dev, acc_y, acc_x, jnp.int32(lo - b0))
+        executable = _priced_executable(kern, args, "psi_G_store.gslot.a2a_faces")
         with timing.section("psi_G_store.gslot.a2a_faces"):
-            g_chunk, acc_y, acc_x = kern(chunk, sidx, kvecs_dev, r_mu_dev,
-                                         w_mu_dev, acc_y, acc_x,
-                                         jnp.int32(lo - b0))
+            g_chunk, acc_y, acc_x = executable(*args)
+            del args
             del chunk
             jax.block_until_ready((g_chunk, acc_y, acc_x))
         t2 = _time.perf_counter()

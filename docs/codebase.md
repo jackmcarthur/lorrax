@@ -169,7 +169,7 @@ else.
 | `fourier_plan.py` | `LocalFourierPlan`: one local separable DFT with restricted per-axis supports. |
 | `gamma_matrices.py` | Supplies spinor gamma-matrix conventions. |
 | `gauss_legendre.py` | Compatibility re-export of `vcoul`'s finite-interval rule; no importers. |
-| `gpu_utils.py` | The per-device budget (`memory_per_device_gb`), stage prices, `warn_over_budget` and memory detection. |
+| `gpu_utils.py` | The run budget from this card's readers (`lxkit.memory.resolve`), the room, and host memory detection. |
 | `grouped_layout.py` | Describes grouped array layouts and transformations. |
 | `gvec_fft_box.py` | Maps reciprocal-vector spheres to and from FFT boxes. |
 | `jax_compile_cache.py` | Configures and audits JAX compilation caches. |

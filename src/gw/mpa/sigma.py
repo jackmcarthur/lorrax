@@ -1062,7 +1062,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                                                 factors=factors) if e == "local"
                        else (_shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy,
                                                          layout=layout, extents=extents), 0)),
-            ledger=capacity)
+            ledger=capacity, whole=int(meta.n_rmu))
         if execution == "local":
             receipt = capacity.reserve(
                 f"{stage}.synthesis", resident_bytes_per_rank=whole_resident,
@@ -1085,8 +1085,9 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                                            extents=extents)
     projection_bytes = 16*b*rows_w*cols_w/(px*py)
     if not sector and projection_bytes > U:
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"{stage} parent star (all-P logical bound)", projection_bytes, U)
+        from lxkit import memory
+        memory.admit(f"{stage} parent star (all-P logical bound)",
+                     memory.priced(projection_bytes, "closed form"), U, device=False)
     receipt = capacity.reserve(
         f"{stage}.synthesis", resident_bytes_per_rank=resident,
         workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
@@ -1370,7 +1371,7 @@ class SynthesisTau:
             # kernel's row passes), from the window executable
             # (runtime.aot_memory): its new bytes beside the synthesis's resident
             # operands plus the synthesis GEMM's native workspace.
-            from common.gpu_utils import record_stage_price
+            from lxkit import memory
             got = int(peak.resident_increment) + int(self._native)
             shape = (f"{plan['passes']} row pass(es)" if "passes" in plan
                      else f"d={plan['d']}/{plan['ns']}")
@@ -1379,8 +1380,12 @@ class SynthesisTau:
             second = 3 * self._synthesis.tile_bytes if self.overlap else 0
             if second:
                 shape += ", two nodes per trip"
-            record_stage_price(f"Sigma tau, compiled window {shape}",
-                               counted + max(plan["new"] + second, got), section="sigma.tau_sweep")
+            memory.book(memory.Price(
+                operands=memory.Term(float(counted), source="synthesis resident operands "
+                                     "(shard bytes)"),
+                xla=memory.Term(float(max(plan["new"] + second, got)),
+                                source=f"Sigma tau, compiled window {shape}"),
+                label="Sigma tau sweep"), stage="sigma.tau_sweep")
 
 
 def _sigma_window_table(accumulator, synthesis, plan, capacity):

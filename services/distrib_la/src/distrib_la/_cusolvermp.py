@@ -155,7 +155,10 @@ def context_key(mesh: Mesh, *, col_major: bool = True) -> int:
 def _atexit_teardown() -> None:
     # Best-effort.  On abnormal exits (signals, segfaults) this may not
     # run, but the OS reclaims GPU memory when the process dies and the
-    # destroy calls are idempotent/null-guarded.
+    # destroy calls are idempotent/null-guarded.  No context, nothing to destroy: loading the
+    # CUDA library at exit on a host without one (a login node) crashes the process.
+    if not _CTX_CACHE:
+        return
     try:
         loader.get_lib("CUDA")
     except Exception:                                          # noqa: BLE001

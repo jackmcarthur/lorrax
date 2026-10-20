@@ -62,6 +62,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
 
 import distrib_la as D  # noqa: E402
 from runtime import xla_memory as XM  # noqa: E402
+from lxkit import memory  # noqa: E402
 
 R0 = jax.process_index() == 0
 
@@ -84,7 +85,7 @@ class Sampler:
         self.stop = threading.Event()
         self.max_in, self.max_out, self.max_sum, self.n = 0, 0, 0, 0
         if self.cuda:
-            XM.pool_high_water(reset=True)
+            memory.boundary()
         self.t = threading.Thread(target=self._run, daemon=True)
         self.t.start()
         return self
@@ -115,7 +116,7 @@ class Sampler:
         except Exception:                                       # noqa: BLE001
             pass
         st = self.dev.memory_stats() or {}
-        hw = XM.pool_high_water() if self.cuda else None
+        hw = memory.boundary() if self.cuda else None
         self.result = dict(
             arena_in_use_max=self.max_in,
             arena_peak_cumulative=int(st.get("peak_bytes_in_use", 0)),

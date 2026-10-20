@@ -21,11 +21,11 @@ from common import timing
 def _print_eigh_stack_routes(print_fn):
     """Record the route distrib_la chose for each new eigh stack shape."""
     import distrib_la
-    from common.gpu_utils import record_route
+    from lxkit import memory
     for line in distrib_la.new_stack_routes():
         stack, decision = line.split(": ", 1)
         route, _, reason = decision.partition(" ")
-        record_route(f"distrib_la {stack}", route.rstrip(","), reason.strip(" ,"))
+        memory.record_route(f"distrib_la {stack}", route.rstrip(","), reason.strip(" ,"))
 
 
 def _json(value):
@@ -719,14 +719,14 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         from .shared_pole_sectors import construct_sector_poles
         result = construct_sector_poles(bank, meta, config,
             mesh_xy=mesh_xy, output=str(root / "model.h5"), print_fn=print_fn)
-        from common.gpu_utils import record_route
+        from lxkit import memory
         from .shared_pole_execution import route_summary
         rows = result.get("execution") or ()
         if rows:
             routes = [(row["sector"], row) for row in rows] + [("CT", rows[0]["joint"])]
             for name, row in routes:
-                record_route(f"shared-pole sector constructor {name}", row["mode"],
-                             route_summary(row["mode"], row), warning=row.get("warning"))
+                memory.record_route(f"shared-pole sector constructor {name}", row["mode"],
+                                    route_summary(row["mode"], row), warning=row.get("warning"))
             _print_eigh_stack_routes(print_fn)
     else:
         # An SC map keeps its model on the devices when it fits; an export
@@ -745,12 +745,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 mesh_xy=mesh_xy, output=str(root / "model.h5"), residence=model_rule)
         walls = dict(result.get("seconds", {}))
         rounds = walls.pop("rounds", 0)
-        from common.gpu_utils import record_route
+        from lxkit import memory
         from .shared_pole_execution import route_summary
         route = result.get("execution")
         if route is not None:
-            record_route("shared-pole constructor", route["mode"], route_summary(route["mode"], route),
-                         warning=route.get("warning"))
+            memory.record_route("shared-pole constructor", route["mode"],
+                                route_summary(route["mode"], route),
+                                warning=route.get("warning"))
         print_fn("Shared-pole constructor: "
                  + f"{rounds} round(s); seconds "
                  + " ".join(f"{name}={value:.2f}" for name, value in
