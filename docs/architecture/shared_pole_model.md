@@ -620,6 +620,12 @@ The identity $B(R,L;-\bar t)=\overline{B(L,R;t)}$ supplies both primitives
 from one product; replacing $-\bar t$ by $t$ is not valid. Endpoint masks
 enter the Green owner's phase selector, preventing unused deep-band
 exponentials from forming $0\times\infty$ without changing any live phase.
+Separate per-parent endpoint band ranges also enter the existing
+`build_G_tau`/`panel_matmul` product. They skip only structurally zero
+RIGHT columns: exact 0/1 spectators and the block's fixed support. Every
+propagated coherent column remains live even at a zero diagonal occupation.
+The full-band faces, current energies, coherences and all virtual transitions
+are unchanged; no band repacking or physical band cutoff is introduced.
 
 Supports are grouped by actual height and noncrossing geometry. Noncrossing
 groups use the public continuum-checked `minimax.response_laplace_rule`;
@@ -634,6 +640,14 @@ The full signed unpaired stream remains an exact-moment/independent-oracle
 tool, with bounded shared-pencil planning, not an automatic production
 fallback when a block rule refuses. Node counts and output-node updates
 are reported separately; fewer carried outputs do not imply fewer Greens.
+
+All original native fit and held supports retain their exact IDs, order and
+values. Only the **additional** low-height verification supports are confined
+to the current propagated active energy-difference span (including zero,
+midpoint and edge), through `active_eta_verification_sites`. This is a
+verification geometry choice, not a self-energy error certificate. Full
+complex self-energy refinement, including real/offdiagonal components and
+collision operators, remains necessary before claiming numerical convergence.
 
 Only scalar rules whose signed interval contains the current complete-band
 gap interval, with identical shifted support sites and tolerance, are held

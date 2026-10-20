@@ -18,6 +18,30 @@ import numpy as np
 from common import timing
 
 
+def active_eta_verification_sites(native_sites, energy, active, eta_ry):
+    """Keep native IDs, append verification sites inside the active gap span.
+
+    Energies/sites are Ry. These are verification geometry, NOT a bound on
+    full complex Sigma error. Every native fit/held site stays byte-identical
+    in the original order; full-Sigma refinement remains independently needed.
+    """
+    native=np.asarray(native_sites,dtype=np.complex128)
+    energy=np.asarray(energy,float)
+    if (native.ndim!=1 or energy.ndim!=2 or not np.isfinite(native).all()
+            or not np.isfinite(energy).all() or not np.isfinite(eta_ry) or eta_ry<=0
+            or not 0<=active.start<active.stop<=energy.shape[1]):
+        raise ValueError('GATE shared_general_verification: finite native sites and active energies required')
+    span=float(np.ptp(energy[:,active]))
+    real=np.unique(np.r_[native.real[(native.real>0)&(native.real<=span)],0.,.5*span,span])
+    extra=np.array([complex(x,eta_ry) for x in real if complex(x,eta_ry) not in native],complex)
+    receipt=dict(native_count=len(native),extra_count=len(extra),eta_ry=float(eta_ry),
+        active_bands=[active.start,active.stop],active_transition_span_ry=span,
+        extra_real_sites_ry=extra.real.tolist(),native_ids_unchanged=True,
+        scope='verification geometry only; not a Sigma error certificate',
+        required_refinement='full complex Sigma including real/offdiagonal and collision operators')
+    return np.concatenate((native,extra)),receipt
+
+
 def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapshot,
                                  run_dir, label, fit_basis=None, print_fn=print):
     """Full microscopic instantaneous-rho W, with general shared frequency poles.
@@ -110,9 +134,10 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # Geometry and selection are numerical spaces held only within this
     # physical refresh. Current census and scientific identity stay current.
     recipe = dict(fit_basis.setdefault("recipe", resolved), census=current_meta.shared_pole_census)
-    general_gates = dict(version="full-density-general-shared-pole-gates-v2",
+    general_gates = dict(version="full-density-general-shared-pole-gates-v3",
         source_policy_version=recipe.get("recipe_version", recipe.get("version")),
         scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
+        eta_verification='propagated_active_span_v1',
         full_microscopic_support=True, finite_density_and_residues=True,
         scalar_rule_tolerance=float(recipe["bank_rule_tolerance"]),
         full_matrix_fit_held_tolerance=float(snapshot.get("fit_tolerance", .02)),
@@ -158,8 +183,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # Extra held supports at the actual electronic smoothing height measure
     # the continuation relevant to Sigma, not only the high native fit line.
     eta = float(snapshot["eta_ry"])
-    probe = np.asarray([complex(z.real, eta) for z in sites if z.real > 0])
-    sites = np.concatenate((sites, np.unique(probe)))
+    sites,verification_geometry=active_eta_verification_sites(sites,energy,active,eta)
     widths = [int(recipe["imaginary_width"]) if z.real == 0 else
               int(recipe.get("line_direction_cap") or nmu) for z in sites[:len(fit_ids)]]
     side_bound = sum(extent for z, extent in zip(sites[:len(fit_ids)], widths) if z.real != 0)
@@ -208,6 +232,19 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         lm, rm = block['u'] != 0, block['f'] != 0
         block['bounds'] = [float(energy[lm].min()),float(energy[lm].max()),
                            float(energy[rm].min()),float(energy[rm].max())]
+        # Only spectator columns with EXACT 0/1 density may be skipped.
+        # Every propagated coherent column stays live regardless of its
+        # diagonal occupation; rho need not commute with current energies.
+        coherent = (band >= active.start)&(band < active.stop)
+        left_support = lm & ((coherent | (occupations != 1)) if block['name'][1]=='A' else True)
+        right_support = rm & ((coherent | (occupations != 0)) if block['name'][0]=='A' else True)
+        ranges = []
+        for support in (left_support,right_support):
+            nonempty = support.any(axis=1)
+            lower = np.where(nonempty,np.argmax(support,axis=1),0)
+            upper = np.where(nonempty,nb-np.argmax(support[:,::-1],axis=1),0)
+            ranges.append(np.stack([lower,upper]))
+        block['band_ranges'] = np.asarray(ranges,np.int32)
         remote = (np.abs(sites.real) < block['lo']) if block['lo'] > 0 else np.zeros(len(sites),bool)
         groups = sorted(set(zip(remote.tolist(),heights.tolist())))
         for is_remote,height in groups:
@@ -246,7 +283,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         right = (ph if block['name'][0] == 'A' else pm)*jnp.asarray(block['f'])[:,None,None]
         stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
             q_ids=np.arange(nk), n_outputs=len(rule["members"]), layout=layout,
-            rule_reference_ry=rule["reference_ry"],pair_bounds_ry=block['bounds'])
+            rule_reference_ry=rule["reference_ry"],pair_bounds_ry=block['bounds'],
+            pair_band_ranges=block['band_ranges'])
         raw = stream(jnp.asarray(rule["times"]), jnp.asarray(rule["weights"]), left, pn, right, energy_d)
         for j, sid in enumerate(rule["members"]):
             value = raw[:, j]
@@ -442,6 +480,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                     elapsed_seconds=time.monotonic()-started,artifact=str(path),
                     full_microscopic_host_payload=False,n_mu=int(meta.n_rmu),n_q=nk,screening_bands=stop,
                     response_active_bands=[response_active.start,response_active.stop])
+                report['verification_geometry']=verification_geometry
                 arrays=dict(E=pencils[batch_index][0],A=pencils[batch_index][1],
                     poles_ry=model['poles_ry'],output_map=model['output_map'],input_map=model['input_map'],
                     space_right=model['spaces']['right'],space_left=model['spaces']['left'],
@@ -501,7 +540,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                                     tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),paired=True)
                                 for rule in prules:
                                     stream=full_density_response_stream(mesh_xy,grid,(nk,nb,nmu,ns),q_ids=[iq],
-                                        n_outputs=1,layout=layout,rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'])
+                                        n_outputs=1,layout=layout,rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'],
+                                        pair_band_ranges=block['band_ranges'])
                                     part=stream(jnp.asarray(rule['times']),jnp.asarray(rule['weights']),left,pn,right,energy_d)[:,0]
                                     raw_probe=part if raw_probe is None else raw_probe+part
                             exact=dyson.value(H[iq:iq+1],raw_probe)
@@ -579,9 +619,11 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         algebra=algebra, spatial_projection=False, screening_density="full_matrix",
         reference_statistics="retarded_reference", general_gates=general_gates)
     receipt["capacity"] = price
+    receipt['verification_geometry']=verification_geometry
     receipt['response_active_bands'] = [response_active.start,response_active.stop]
     receipt['response_blocks'] = [dict(name=b['name'],interval_ry=[b['lo'],b['hi']],
-                                      endpoint_bounds_ry=b['bounds']) for b in blocks]
+                                      endpoint_bounds_ry=b['bounds'],
+                                      structural_band_ranges=b['band_ranges'].tolist()) for b in blocks]
     receipt['quadrature_work'] = dict(ordered_green_pairs=sum(len(r['times']) for r in rules),
         product_greens_per_node=2,output_node_updates=sum(len(r['times'])*len(r['members']) for r in rules),
         largest_output_count=max(len(r['members']) for r in rules),

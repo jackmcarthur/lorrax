@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 
 import numpy as np
@@ -150,7 +151,7 @@ def gram_transfer_summary(model, gc, gb, sites, *, probe_sites=None, mixed=None,
 
 
 def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
-            max_workspace_bytes=1024**3, probe_sites=None):
+            max_workspace_bytes=1024**3, probe_sites=None, record=None):
     from gw.shared_pole_constructor import reduce_general_pencil
     started=time.perf_counter();path=Path(path)
     digest=hashlib.sha256(path.read_bytes()).hexdigest()
@@ -217,7 +218,12 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
         union_and_descriptor_svd_seconds=time.perf_counter()-svd_start,
         versions=dict(numpy=np.__version__,scipy=scipy.__version__),
         thread_environment={k:os.environ.get(k) for k in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS')},
-        studies=[])
+        status='RUNNING_DIAGNOSTIC_NOT_ADMITTED',studies=[])
+    def checkpoint():
+        report['analysis_seconds']=time.perf_counter()-started
+        if record is not None:
+            record(finite(report))
+    checkpoint()
     try:
         from threadpoolctl import threadpool_info
         report['loaded_blas_threadpools']=threadpool_info()
@@ -247,15 +253,20 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
         except (ValueError,la.LinAlgError) as exc:
             row.update(status='refused',error=str(exc))
         report['studies'].append(row)
+        checkpoint()
     if {'poles_ry','output_map','input_map'}<=optional.keys():
         model={k:optional[k] for k in ('poles_ry','output_map','input_map')}
         report['captured_canonical_model']=transfer_summary(model,b,c,sites,target=target,
             c1=optional.get('C1'),c2=optional.get('C2'))[0]
         if grams:
-            report['captured_canonical_physical_model']=gram_transfer_summary(model,optional['GC'],optional['GB'],sites,
-                probe_sites=optional.get('probe_sites_ry'),mixed=optional.get('probe_mixed_J'),
-                exact_sq=optional.get('probe_exact_norm_sq'))
-    report['analysis_seconds']=time.perf_counter()-started
+            try:
+                report['captured_canonical_physical_model']=gram_transfer_summary(model,optional['GC'],optional['GB'],sites,
+                    probe_sites=optional.get('probe_sites_ry'),mixed=optional.get('probe_mixed_J'),
+                    exact_sq=optional.get('probe_exact_norm_sq'))
+            except (ValueError,la.LinAlgError) as exc:
+                report['captured_canonical_physical_model']=dict(status='unresolved_metric',error=str(exc))
+    report['status']='COMPLETE_DIAGNOSTIC_NOT_ADMITTED'
+    checkpoint()
     return finite(report)
 
 
@@ -267,12 +278,23 @@ def main():
     parser.add_argument('--tolerances',default='1e-8,1e-9,1e-10,1e-11')
     parser.add_argument('--max-workspace-gib',type=float,default=1.)
     args=parser.parse_args()
-    if args.output.exists():raise SystemExit('Refusing to overwrite an existing diagnostic report')
+    args.output.parent.mkdir(parents=True,exist_ok=True)
+    with args.output.open('x') as handle:
+        json.dump(dict(status='RUNNING_DIAGNOSTIC_NOT_ADMITTED',phase='before_input_and_svd',
+                       input=str(args.input)),handle,indent=2)
+        handle.write('\n')
+    def record(report):
+        # This invocation created the destination exclusively above. Keep
+        # completed rank studies if a later factorization hits the outer cap.
+        with tempfile.NamedTemporaryFile('w',dir=args.output.parent,
+                prefix=args.output.name+'.',suffix='.pending',delete=False) as handle:
+            json.dump(report,handle,indent=2,allow_nan=False)
+            handle.write('\n')
+            temporary=handle.name
+        os.replace(temporary,args.output)
     report=analyze(args.input,max_order=args.max_order,
         tolerances=tuple(map(float,args.tolerances.split(','))),
-        max_workspace_bytes=int(args.max_workspace_gib*1024**3))
-    args.output.parent.mkdir(parents=True,exist_ok=True)
-    args.output.write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+        max_workspace_bytes=int(args.max_workspace_gib*1024**3),record=record)
     print(json.dumps(dict(output=str(args.output),seconds=report['analysis_seconds'],
         studies=[dict(tolerance=r['rank_tolerance'],order=r['selected_order'],status=r['status']) for r in report['studies']]),indent=2))
 

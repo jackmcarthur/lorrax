@@ -35,6 +35,34 @@ def test_no_actions_means_descriptor_only_and_capacity_refuses_before_svd(tmp_pa
     assert report['studies'][0]['status']=='reduced-for-diagnostic-only'
 
 
+def test_progress_records_completed_ranks_without_claiming_admission(tmp_path):
+    capture=tmp_path/'progress.npz'
+    np.savez(capture,E=np.eye(2),A=np.diag([-.1j,-.3j]))
+    records=[]
+    report=helper.analyze(capture,max_order=2,tolerances=(1e-8,),record=records.append)
+    assert len(records)==3
+    assert records[0]['studies']==[]
+    assert records[1]['status']=='RUNNING_DIAGNOSTIC_NOT_ADMITTED'
+    assert len(records[1]['studies'])==1
+    assert records[-1]['status']==report['status']=='COMPLETE_DIAGNOSTIC_NOT_ADMITTED'
+
+
+def test_cli_creates_exclusively_and_preserves_completed_report(tmp_path, monkeypatch, capsys):
+    import json
+    capture=tmp_path/'cli.npz';output=tmp_path/'report.json'
+    np.savez(capture,E=np.eye(2),A=np.diag([-.1j,-.3j]))
+    monkeypatch.setattr('sys.argv',['analyze_general_pencil.py','--input',str(capture),
+        '--output',str(output),'--max-order','2','--tolerances','1e-8'])
+    helper.main()
+    capsys.readouterr()
+    saved=output.read_bytes()
+    assert json.loads(saved)['status']=='COMPLETE_DIAGNOSTIC_NOT_ADMITTED'
+    assert not list(tmp_path.glob('*.pending'))
+    with pytest.raises(FileExistsError):
+        helper.main()
+    assert output.read_bytes()==saved
+
+
 def test_frequency_only_grams_and_mixed_actions_equal_literal_complex_full_port_norms(tmp_path):
     from gw.shared_pole_constructor import reduce_general_pencil
     rng=np.random.default_rng(175)

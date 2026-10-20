@@ -346,3 +346,94 @@ def test_paired_long_real_lag_masks_inactive_deep_states_before_exponentiation()
         live=np.any(res!=0,axis=(1,2))
         expected.append(np.einsum('i,ijk->jk',np.exp(-(gap[live]-ref)*times[0]),res[live])[None])
     np.testing.assert_allclose(got,np.stack(expected),rtol=5e-12,atol=5e-14)
+
+
+def test_extra_eta_verification_keeps_all_original_ids_and_only_active_span_extensions():
+    from gw.shared_pole_screening import active_eta_verification_sites
+    # Cross-k frozen overlaps deliberately invalidate a strict denominator-
+    # sign argument, but remain inside the global propagated active span.
+    energy=np.array([[-.02,0.,.1,.12],[.78,.8,.9,.92]])
+    active=slice(1,3);eta=.07
+    native=np.array([.2+.3j,4.+.3j,0.+.8j,.4+.3j,.2+.3j,-.4+.3j])
+    got,receipt=active_eta_verification_sites(native,energy,active,eta)
+    np.testing.assert_array_equal(got[:len(native)].view(np.uint64),native.view(np.uint64))
+    extra=got[len(native):];span=np.ptp(energy[:,active])
+    assert receipt['native_count']==len(native) and receipt['native_ids_unchanged']
+    assert receipt['extra_count']==len(extra) and receipt['active_transition_span_ry']==span
+    assert set(extra)=={complex(x,eta) for x in (0.,.2,.4,.5*span,span)}
+    assert np.all((extra.real>=0)&(extra.real<=span)) and np.all(extra.imag==eta)
+    assert 4.+.3j in got and 4.+1j*eta not in got # native far-frequency held point survives
+    assert 'not a Sigma error certificate' in receipt['scope']
+    # Every possible frozen wrong-sign real resonance is covered even when
+    # its band is outside the four-state collision intermediate window.
+    ext=energy[:,active].reshape(-1)
+    delta_occ=ext[:,None]-energy[:,0][None,:]
+    delta_empty=ext[:,None]-energy[:,-1][None,:]
+    assert np.any(delta_occ<0) and np.any(delta_empty>0)
+    assert np.all(delta_occ[delta_occ<0]>=-span)
+    assert np.all(delta_empty[delta_empty>0]<=span)
+
+
+def test_extra_eta_verification_uses_current_energies_and_exact_native_deduplication():
+    from gw.shared_pole_screening import active_eta_verification_sites
+    eta=.125;native=np.array([0.+1j*eta,.5+1j*eta,20.+.4j,.5+1j*eta])
+    original=native.copy()
+    energy=np.array([[-10.,0.,1.,8.]])
+    first,_=active_eta_verification_sites(native,energy,slice(1,3),eta)
+    assert len(first)==len(native)+1 and first[-1]==1.+1j*eta
+    energy[:,2]=2.
+    second,receipt=active_eta_verification_sites(native,energy,slice(1,3),eta)
+    assert receipt['active_transition_span_ry']==2.
+    assert set(second[len(native):])=={1.+1j*eta,2.+1j*eta}
+    np.testing.assert_array_equal(native,original)
+    for bad_eta in (0.,-1.,np.nan):
+        with pytest.raises(ValueError,match='shared_general_verification'):
+            active_eta_verification_sites(native,energy,slice(1,3),bad_eta)
+
+
+def test_structural_endpoint_band_ranges_match_literal_nonstationary_all_q():
+    import jax
+    from jax.sharding import Mesh
+    from ffi import fft as fft
+    from gw.greens_function_kernel import density_left_endpoint
+    from gw.w_isdf import full_density_response_stream
+    jax.config.update('jax_enable_x64',True)
+    mesh=Mesh(np.asarray(jax.devices('cpu')[:1]).reshape(1,1),('x','y'))
+    psi,energy,rho,partners=case();nk,nb,ns,nmu=psi.shape
+    # Frozen exactly0/1 spectators vary with k. FF then includes an empty
+    # electron endpoint at k2 and an empty hole endpoint at k1. This stresses
+    # separate endpoint/per-parent ranges, not a shared global band slice.
+    rho[1,0,0]=0.;rho[2,3,3]=1.
+    pm=psi.transpose(0,2,3,1);endpoint=density_left_endpoint(mesh,pm.shape)
+    times=np.array([.13+.21j,-.11+.29j,.03-.17j])
+    weights=np.zeros((2,2*len(times),len(times)),complex)
+    weights[0,:len(times)]=np.eye(len(times));weights[1,len(times):]=np.eye(len(times))
+    for left,right in four_block_panels(rho,slice(1,3)).values():
+        ranges=[];bounds=[]
+        for panel in (left,right):
+            support=np.any(panel!=0,axis=1) # M[a,b]: exact support of RIGHT phase index b
+            edges=np.zeros((2,nk),np.int32)
+            for k in range(nk):
+                live=np.flatnonzero(support[k])
+                if len(live):edges[:,k]=[live[0],live[-1]+1]
+            ranges.append(edges);bounds.extend([energy[support].min(),energy[support].max()])
+        expected=[]
+        for partner in partners:
+            f=pair_spectrum(psi,energy,left,right,partner);r=pair_spectrum(psi,energy,right,left,partner)
+            expected.append(np.concatenate((pair_time(f,times),pair_time(r,-times.conjugate()))))
+        # A nonzero gauge reference verifies cancellation independently of
+        # zero-column skipping, for both signs of Re(t) and both orientations.
+        reference=.123
+        expected=np.stack(expected)*np.concatenate((np.exp(reference*times),
+                                                   np.exp(reference*times.conjugate())))[None,:,None,None]
+        values=[]
+        with fft.xla_reference():
+            for structural in (None,np.asarray(ranges)):
+                stream=full_density_response_stream(mesh,(3,1,1),(nk,nb,nmu,ns),q_ids=[0,1,2],
+                    n_outputs=2*len(times),pair_bounds_ry=bounds,rule_reference_ry=reference,
+                    pair_band_ranges=structural)
+                values.append(np.asarray(stream(times,weights,endpoint(pm,left),psi,
+                    endpoint(pm,right),energy))/np.sqrt(nk))
+        for value in values:
+            np.testing.assert_allclose(value,expected,rtol=4e-12,atol=5e-14)
+        np.testing.assert_allclose(values[1],values[0],rtol=4e-12,atol=5e-14)

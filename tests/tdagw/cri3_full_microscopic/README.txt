@@ -29,6 +29,16 @@ reference has a different coherent functional and alone cannot isolate
 collision damping. The matched B/C comparison isolates W updates only
 subject to the documented numerical and statistical approximations.
 
+Requested larger-window follow-up: 30 valence plus14 conduction corresponds
+to zero-based[100,144), or system ibndmin=101, ibndmax=144, ivbm=130.
+It is not a completed run or an automatic option of these 2v2c helpers.
+Chi already includes all160 bands, but larger external-energy transforms,
+full44x44 collision matrices, wider active phases and snapshot storage
+still need pricing. Adapt the window authentication/plotting before using
+these helpers on44 bands; do not relabel 2v2c data as the larger window.
+Existing band-extrapolation constraints and missing TD adapter are described
+in docs/theory/band-extrapolation.md; do not enable it on this160-band case.
+
 plot_full_native.py requires actual native authenticated B/C outputs and
 matching time/field/k/weight data. It refuses missing or nonmatching data.
 Explicit --allow-partial crops to checkpoint-written samples and labels
@@ -70,3 +80,6 @@ Gram norm differences retain raw squared norms and roundoff bounds because
 small defects may be cancellation limited. Its tiny tests demonstrate a
 possible unobservable high-growth pole and validate physical Gram metrics;
 they do not diagnose the material refusal without the actual capture.
+The report is created exclusively and updated atomically after the union
+SVD and each rank study. An interrupted report retains its explicit RUNNING
+status and completed studies, never a false completion/admission claim.

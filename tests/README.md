@@ -26,7 +26,8 @@ A new test needs no bootstrap import of its own.
   (CPU).
 - `test_full_density_blocks_oracle_cpu.py`: literal coherent FF/FA/AF/AA
   products, independent reverse phases, enlarged numerical response groups,
-  moments and native paired FFT/quadrature (CPU).
+  moments and native paired FFT/quadrature, exact structural endpoint band
+  ranges and native-preserving active-span verification geometry (CPU).
 - `test_full_density_block_planning_cpu.py`: public noncrossing and crossing
   primitive signs, measured endpoint intervals and scalar accuracy (CPU).
 - `test_general_pencil_batch_cpu.py`: capacity-bounded concurrent reduced
