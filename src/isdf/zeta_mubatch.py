@@ -898,6 +898,24 @@ class ZetaG:
         V = jnp.zeros((Q, mu, mu), jnp.complex128, device=NamedSharding(mesh, P(None, 'x', 'y'))) if with_v else None
         S = jnp.zeros((Q, mu, int(sl.shape[1])), jnp.complex128, device=NamedSharding(mesh, P(None, _XY, None)))
         nxt = st.read_tile(0)
+        # The pass's price over what is live now (V, S, the first tile): the next tile read
+        # ahead and the chain's largest step, each program compiled at its operands (never
+        # run): to_face, apply beside the face tile, acc beside apply's output.
+        from lxkit import memory
+        from runtime.aot_memory import compiled_new_bytes
+
+        def compiled(fn, *args):
+            ex = fn.lower(*args).compile()
+            return ex, jax.tree.map(lambda o, s: jax.ShapeDtypeStruct(o.shape, o.dtype, sharding=s),
+                                    jax.eval_shape(fn, *args), ex.output_shardings)
+        e1, face = compiled(to_face, nxt)
+        e2, applied = compiled(apply, self.factor, face)
+        e3, _ = compiled(acc, applied, v, ngk, sl, jnp.int32(0), V, S)
+        out = lambda ex: int(ex.memory_analysis().output_size_in_bytes)
+        step = max(compiled_new_bytes(e1), out(e1) + compiled_new_bytes(e2), out(e2) + compiled_new_bytes(e3))
+        tile = math.prod(nxt.sharding.shard_shape(nxt.shape)) * nxt.dtype.itemsize
+        memory.book(memory.priced(tile + step, f"zeta face G-tile chain {st.g_tile} (to_face, apply, acc "
+                                  "compiled) + the prefetched tile", increment=True))
         for t in range(st.n_Gt):
             Zt = nxt
             nxt = st.read_tile(t + 1) if t + 1 < st.n_Gt else None
