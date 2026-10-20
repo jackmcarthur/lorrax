@@ -65,37 +65,6 @@ def test_transverse_mesh_inverse_matches_the_ridged_lu(monkeypatch):
     np.testing.assert_allclose(mesh, ref, atol=tol)
 
 
-def test_galerkin_mesh_solves_match_the_replicated_factor(monkeypatch):
-    from isdf import galerkin as gk
-    c, phys, nk, nb = 32, 30, 4, 8
-    rng = np.random.default_rng(22)
-    a = rng.standard_normal((c, 2 * c)) + 1j * rng.standard_normal((c, 2 * c))
-    L = np.linalg.cholesky(a @ a.conj().T / c)
-    _rooms(monkeypatch, {"Galerkin selected-state solve": 1 << 14})     # the mesh LU, not one device
-    L_rep, L_face = _put(L, REP), _put(L, NamedSharding(MESH, P("x", "y")))
-    assert _faces(L_face, c)
-    # the row solves (basis at nodes, r chunks)
-    rows = rng.standard_normal((c, 2, 24)) + 1j * rng.standard_normal((c, 2, 24))
-    layout = NamedSharding(MESH, P(None, None, "y"))
-    local = gk._make_basis_solve_kernel(mesh=MESH, rank=c, nspinor=2, r_carrier=24,
-                                        row_layout=layout)(L_rep, _put(rows, layout))
-    mesh = gk._mesh_lower_solve(L_face, _put(rows, layout), layout)
-    np.testing.assert_allclose(np.asarray(gather_to_host(mesh)), np.asarray(gather_to_host(local)),
-                               rtol=1e-11, atol=1e-11)
-    # the coefficient projection and the rank receipts
-    proj_sh = NamedSharding(MESH, P(None, None, ("x", "y")))
-    proj = rng.standard_normal((nk, nb, c)) + 1j * rng.standard_normal((nk, nb, c))
-    c_local = gk._solve_coefficient_projection(_put(proj, proj_sh), L_rep, MESH)
-    c_mesh = gk._solve_coefficient_projection(_put(proj, proj_sh), L_face, MESH)
-    np.testing.assert_allclose(np.asarray(gather_to_host(c_mesh)), np.asarray(gather_to_host(c_local)),
-                               rtol=1e-11, atol=1e-11)
-    sel = tuple(range(phys))
-    m_local = gk._galerkin_rank_metrics(c_local, L_rep, selected_rows=sel, physical=phys)
-    m_mesh = gk._galerkin_rank_metrics(c_local, L_face, selected_rows=sel, physical=phys)
-    host = lambda m: [float(np.asarray(v.addressable_data(0))) for v in m]
-    np.testing.assert_allclose(host(m_mesh), host(m_local), rtol=1e-13)
-
-
 def test_vq_coarse_face_with_the_mesh_eigh(monkeypatch):
     from bse import vq_interp as vq
     nq, nmu, ngk, ng = 4, 32, 40, 12

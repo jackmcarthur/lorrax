@@ -1020,6 +1020,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
 
     out = interpolate_band_operator(ops, basis.ctilde, coeffs, q_frac,
                                     tuple(coarse_grid), mesh_xy,
+                                    B_at_mu=basis.basis_at_nodes,
                                     image_record_fn=_record)
     del ops, coeffs
     v_cv = np.asarray(gather_to_host(jax.jit(

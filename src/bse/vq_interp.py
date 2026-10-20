@@ -2325,8 +2325,8 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
           density while guard rows participate only in B(r_chunk).
       n_guard, nb_wide, window_abs (ζ), window_abs_fh (wide) — the contract,
           recorded so a reader of ``rst`` never has to infer which is which
-      r_chunk_ranges, galerkin_rel — bounded schedule + compact projection
-          receipt; no full-grid Psi/B/Z/zeta is retained.
+      r_chunk_ranges, galerkin_rel — bounded schedule + full-r residual
+          receipt (NaN: not measured for the nodal basis); no full-grid Psi/B/Z/zeta is retained.
       zeta_solve  ``(charge_zeta_solve, zeta_rcond)`` of the fit
           on disk — read from the ζ file's own ``isdf_header/fit_provenance``
           and NOT from the deck.  ``refit_vq`` refuses without it.
@@ -2537,21 +2537,13 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         (r0, min(r0 + int(r_chunk), n_rtot))
         for r0 in range(0, n_rtot, int(r_chunk)))
 
-    # B is orthonormal by construction, so the full-r projection residual is
-    # exactly sqrt(1-mean(||C_state||²)) for normalized WFN states.  Read the
-    # receipt from compact C rather than reconstructing full Ψ and B merely to
-    # measure the same projector norm.
-    @jax.jit
-    def _projection_residual(c):
-        captured = jnp.sum(jnp.abs(c) ** 2, axis=-1)
-        return jnp.sqrt(jnp.maximum(0.0, 1.0 - jnp.mean(captured)))
-
-    gal = float(_projection_residual(ctilde))
-    gal_zeta = float(_projection_residual(ctilde[:, :nb]))
-    log_fn(f"  [refit] Galerkin full-r residual ‖cB−ψ‖/‖ψ‖ = {gal:.3e} over "
-           f"the fH window ({nb_wide} bands), {gal_zeta:.3e} over the ζ-fit "
-           f"window ({nb} bands) — the ζ one is the refit-vs-stored on-grid "
-           f"floor, since only ζ-window pair densities enter the tile")
+    # The nodal basis rows are the centroid cardinal functions, ψ ≈ Σ_ν
+    # ψ(r_ν) ζ_ν(r); ‖c‖² is not a projector norm, and the full-r residual
+    # of that fit is not measured here (NaN in the receipt).
+    gal = gal_zeta = float("nan")
+    log_fn(f"  [refit] nodal Galerkin rows (centroid cardinal functions): "
+           f"fH window {nb_wide} bands, ζ-fit window {nb} bands; full-r "
+           f"residual not measured")
     # Coordinates and on-grid lookup stay owned by SymMaps.  In particular,
     # unfolded_kpts includes a shifted Monkhorst-Pack offset while the integer
     # star labels do not.
