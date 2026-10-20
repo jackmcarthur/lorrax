@@ -783,8 +783,6 @@ def _compute_V_q_g_flat_tiles(
               n_sub=n_sub if s['one_leg'] else 0) for s in specs],
         rows=mu_pad, n_q=n_q_ibz, ngkmax=ngkmax, mesh_xy=mesh_xy,
         g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
-    memory.book(memory.priced(priced['priced'], f"V_q, vq_tile_bytes q_tile={q_tile}",
-                              increment=True))
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:
@@ -872,6 +870,31 @@ def _compute_V_q_g_flat_tiles(
         # are dispatched, and the kernels complete before the next tile's read
         # is issued.  With every q in one tile — whenever they fit the budget —
         # this is the old single batched pre-read followed by the launches.
+        # The planner's q-tile admitted at its kernels' compiled figure (the widest tile's),
+        # every distinct ζ tile read beside it (runtime.aot_memory.check_chunk).
+        from runtime.aot_memory import check_chunk
+        z_sh = NamedSharding(mesh_xy, P(None, ('x', 'y'), None))
+        zeta = lambda c, mu: jax.ShapeDtypeStruct((c, mu, ngkmax), jnp.complex128, sharding=z_sh)
+        per_q = 16.0 * sum(mu_pad) * ngkmax / mesh_xy.devices.size
+
+        def build(c):
+            from runtime.aot_memory import compiled_new_bytes
+            return max((_make_q_tile_kernel(
+                mesh_xy, s['nL'], s['nR'], ngkmax, g_chunk, c, write_g0=bool(s['write_g0'] and not use_ibz),
+                same_zeta=s['same_zeta']).lower(
+                    s['V'], s['g0'], zeta(c, mu_pad[slot(s['L'])]),
+                    zeta(c, mu_pad[slot(s['L'] if s['same_zeta'] else s['R'])]),
+                    jax.ShapeDtypeStruct((c, ngkmax), jnp.complex128, sharding=v_rows_sh),
+                    jnp.int32(0)).compile() for s in specs), key=compiled_new_bytes)
+        resident = priced['priced'] - priced['work'] - q_tile * priced['per_q']   # the accumulators
+        room = (budget - resident if budget is not None
+                else memory.room("V(q) q tile") if memory.run() else float("inf"))
+        check = check_chunk(q_tile, build=build, stage="V(q) q tile", fixed=priced['work'],
+                            per_unit=per_q, room=room, extra=lambda c, _: c * per_q)
+        q_tile = check.chunk
+        n_tiles = -(-n_q_ibz // q_tile)
+        memory.book(memory.priced(check.price, f"V(q) q-tile kernel {q_tile} (compiled) + its ζ "
+                                  "tiles", increment=True))
         import time as _t
         _read_total = 0.0
         _kernel_total = 0.0
