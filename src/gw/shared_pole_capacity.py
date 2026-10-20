@@ -250,19 +250,20 @@ def face_eigh_room(admission, held=0, *, stage):
 
 
 def check_eigh_room(model_row, price):
-    """The passivity/held checks' eigh room: beside the model row and the check program's
-    ``price``, with the row's own reservation of that same n x n eigh handed back (the model
-    phase prices it; run30k: 8 GiB without the hand-back, 15 with it).  The model row and the
-    check program are the price booked to ``spole.passivity_held``."""
+    """The passivity/held checks' eigh room: beside the model row and ``price`` (the check
+    program's proposed size, ``face_check_bytes``), with the row's own reservation of that
+    same n x n eigh handed back (the model phase prices it; run30k: 8 GiB without the
+    hand-back, 15 with it).  The model row is booked to ``spole.passivity_held``; the check
+    program is booked there compiled (``shared_pole_local.book_check_eighs``)."""
     from lxkit import memory
-    aggregate = model_row['aggregate_bytes_per_rank'] + price - model_row['native_workspace'].get('eigh', 0)
+    held = model_row['aggregate_bytes_per_rank'] - model_row['native_workspace'].get('eigh', 0)
+    aggregate = held + price
     geometry = model_row.get('geometry', {})
     ranks = int(geometry.get('px', 1)) * int(geometry.get('py', 1))
     memory.book(memory.Price(
         operands=memory.Term(float(model_row.get('baseline_bytes_per_rank', 0)),
                              source="live outside the ledger at bind"),
-        xla=memory.Term(spread=float(aggregate) * ranks,
-                        source="model ledger row + face_check_bytes"),
+        xla=memory.Term(spread=float(held) * ranks, source="model ledger row"),
         ranks=ranks, label="spole.passivity_held"), stage="spole.passivity_held")
     return face_eigh_room(dict(model_row, aggregate_bytes_per_rank=aggregate),
                           stage="shared-pole passivity/held checks")
