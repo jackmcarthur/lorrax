@@ -303,8 +303,12 @@ def _select(k, W, entries, kind, index, recipe, *, real, eigh_plan, column_exten
             stack, recipe["direction_cutoff"], eigh_plan=eigh_plan, column_extent=column_extent,
             multiplet_tol=tol, real_rows=spectral_rows, max_rank=recipe.get("line_direction_cap"))
     width = min(logical_n, max(1, int(recipe["imaginary_width"])))
+    # The take's stack is dropped before the solve: the Hermitian part and the solve's own
+    # flatten are the two stacks live, as the face selection prices (selection_stack_copies).
+    herm = k.negative_hermitian(stack)
+    del stack
     return leading_response_directions(
-        k.negative_hermitian(stack), width, eigh_plan=eigh_plan, column_extent=column_extent,
+        herm, width, eigh_plan=eigh_plan, column_extent=column_extent,
         multiplet_tol=tol, real_rows=spectral_rows)
 
 
