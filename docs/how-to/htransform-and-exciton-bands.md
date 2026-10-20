@@ -70,9 +70,19 @@ $\varepsilon$ = 0.37 / 0.12 / 1.6×10⁻² / 1.9×10⁻³ / 1.0×10⁻³ at 312 
 at 312 nodes against 6.76 meV (max 27.4) at 780. The fit warns when
 $\varepsilon > 10^{-2}$ and names the count $N_\mathrm{node} \ge 22\,(b_1-b_0)$
 that reached it on Si; MoS₂ 9×9 at 22.2 nodes per band (1198/54) reads
-$\varepsilon = 1.7\times10^{-2}$. The fine-grid cost is one eigh of rank
-$N_s N_\mathrm{node}$ per fine k, so this count prices the fine stage at
-2–3× the former QRCP basis (rank ≈ 17.7 per fitted band on Si).
+$\varepsilon = 1.7\times10^{-2}$.
+
+**Fine-k solve.** $f(H)_q$ is numerically of rank $b_1-b_0$ ($f \le 0$ on the
+fitted states, $\approx 0$ on the rest of the $N_B$ directions), so every
+fine-k, path and moment-grid solve refines only its most negative block:
+the fitted bands plus 32 columns, started from $c$ of the nearest coarse k
+plus fixed random columns. Two subspace
+steps $X \leftarrow \mathrm{qr}(-f(H)_q X)$ and a Rayleigh–Ritz
+eigensolve of the block follow; further steps run until the relative
+residual $\|f(H)_q v - \lambda v\|/|\lambda|$ of the returned window is
+$\le 10^{-10}$, at most 8. The log line `[top-block]` prints the iteration
+count and the residual. The cost per q is block products with the
+$N_B \times N_B$ operand instead of a full eigensolve.
 
 The fit writes $c$, $\Phi$ and $G^{-1/2}$ to `galerkin_dft.h5` beside the deck. A later run reuses
 the file only when its provenance matches exactly (WFN fingerprint, centroid
@@ -413,10 +423,10 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | `nval` / `ncond` | 5 / 5 | returned window (§3); standalone runs need `nval` = occupied bands |
 | `--guard-bands` | 4 | fitted bands above the returned window |
 | `--a-band` | top fitted band | band whose bandwidth sets $f$'s shoulder width |
-| `htransform_qr_eps` / `htransform_rank_multiplier` / `htransform_qrcp_seed` | 1e-3 / 20 / 0 | unused by the fit (§2): qr_eps only cuts the Gram pseudo-inverse of the refit's grid rows |
+| `htransform_qr_eps` | 1e-3 | unused by the fit (§2): only cuts the Gram pseudo-inverse of the refit's grid rows |
 | `-wfn` / `--wfn-file` | the deck's `wfn_file` | another WFN, for example `WFN_qp.h5` |
 | `-o` / `--output-file`, `--report-file` | `bandstructure.dat`, `htransform.out` | outputs |
-| `linalg` | `local` | layout of the $f(H)_q$ eigensolve |
+| `linalg` | `local` | operand layout of the $f(H)_q$ top-block solve |
 | `get_centroids_fi`, `kgrid_fi`, `wfn_fi_min`/`wfn_fi_max`, `wfn_fi_q_chunk` | off | BSE handoff: fine-grid ψ at the coarse centroids (`bse_setup.compute_wfns_fi`); keep at least 4 bands between `wfn_fi_max` and the top of the window |
 | `--plot` | off | show the band plot |
 
