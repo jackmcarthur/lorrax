@@ -474,7 +474,7 @@ def _shared_pole_static_key(meta, header, tables, *, mesh_xy, layout):
     return _static_key((
         mesh_xy, layout, ffi_dial_key(),
         {name: header.get(name) for name in (
-            "representation", "grid", "q_order", "q_shift", "q_irr_full_idx",
+            "representation", "grid", "electronic_grid", "q_order", "q_shift", "q_irr_full_idx",
             "n_q_irr", "n_q_full", "n_mu_logical", "nspinor", "qirr", "operations")},
         (header.get("recipe") or {}).get("operator_realization"),
         (int(basis.n_packed), getattr(basis, "n_logical", None),
@@ -750,6 +750,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                            close, native_workspace, key, tile_bytes=16 * nq * m * m // int(mesh_xy.size),
                            window_intervals=window_intervals)
     synthesis.q_wedge = q_wedge
+    synthesis.qgrid = tuple(int(v) for v in header["grid"])
+    electronic_grid = tuple(int(v) for v in (meta.nkx, meta.nky, meta.nkz))
+    if tuple(header.get("electronic_grid", header["grid"])) != electronic_grid:
+        raise ValueError("GATE sigma_qgrid: model electronic grid differs from the Green carrier")
     synthesis.branch_orientation = branch_orientation
     synthesis.w_kernel_for = lambda space: w_kernels[branch_orientation(space)]
     def _rows(space):
@@ -1592,7 +1596,8 @@ def _integrate_sigma_batches(
             from gw.ppm_tau_kernel import sigma_kconv_tables, sigma_pass_price
             sigma_kij = _get_sigma_kij_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, brackets=brackets,
-                q_wedge=w_synthesis.q_wedge, **face_kwargs)
+                q_wedge=w_synthesis.q_wedge,
+                qgrid=getattr(w_synthesis, "qgrid", kgrid), **face_kwargs)
 
             def scalar_spatial(xn, yr, xr, yn, energies, weight, e_ref, t, interactions,
                                g_load, sigma_kij=sigma_kij):
@@ -1600,6 +1605,7 @@ def _integrate_sigma_batches(
                                  g_load)
             scalar_spatial.price = sigma_pass_price(sigma_kij)
             spatial_key = ("scalar-parent", mesh_xy, kgrid, brackets,
+                           tuple(getattr(w_synthesis, "qgrid", kgrid)),
                            w_synthesis.q_wedge.wedge_key(),
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
             # The Green kconv call's tables, placed once per run and plan: a window argument.
@@ -2122,6 +2128,7 @@ def _ordered_shared_pole_synthesis(io, meta, header, *, mesh_xy):
         native, ("ordered-full-port", mesh_xy, nq, m, width),
         tile_bytes=16 * nq * m * m // int(mesh_xy.size), window_intervals=intervals)
     synthesis.q_wedge = wedge
+    synthesis.qgrid = tuple(int(v) for v in header["grid"])
     return synthesis
 
 

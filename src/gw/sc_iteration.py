@@ -426,6 +426,10 @@ class SCInputs:
     #: comes from an FFT over the k-grid — then crosses the map's one output
     #: seam (decisions.md, TRS veto scope).
     kstar: object | None = None
+    # Correlation W may use a distinct full-BZ bosonic quadrature. Bare
+    # Fock/Hartree and electronic rotations keep V_q / sym on the fine grid.
+    V_q_screen: object | None = None
+    q_sym: object | None = None
     wfns_transverse: Wavefunctions | None = None
     bispinor_v_q_path: str | None = None
     mu_bases: tuple | None = None
@@ -3060,8 +3064,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 cache.get("mapping") if cache is not None else None)
             if screening_reuse is None:
                 screening_reuse = inputs.screening_model_fn(
-                    inputs.config.compute_mode, inputs.wfns_dft, inputs.V_q,
-                    quad=inputs.quad, e_ref=inputs.e_ref, sym=inputs.sym,
+                    inputs.config.compute_mode, inputs.wfns_dft,
+                    inputs.V_q if inputs.V_q_screen is None else inputs.V_q_screen,
+                    quad=inputs.quad, e_ref=inputs.e_ref,
+                    sym=inputs.sym if inputs.q_sym is None else inputs.q_sym,
                     centroid_indices=inputs.centroid_indices,
                     config=inputs.config, meta=inputs.meta,
                     mesh_xy=inputs.mesh_xy,
@@ -3359,8 +3365,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         with timing.section("sc.w_response", announce=True,
                             label="SC W response"):
             produced = used_producer(
-                inputs.config.compute_mode, wfns_qp, inputs.V_q,
-                quad=used_quad, e_ref=inputs.e_ref, sym=inputs.sym,
+                inputs.config.compute_mode, wfns_qp,
+                inputs.V_q if inputs.V_q_screen is None else inputs.V_q_screen,
+                quad=used_quad, e_ref=inputs.e_ref,
+                sym=inputs.sym if inputs.q_sym is None else inputs.q_sym,
                 centroid_indices=inputs.centroid_indices, config=inputs.config,
                 meta=inputs.meta, mesh_xy=inputs.mesh_xy,
                 run_dir=os.path.join(inputs.input_dir, "tmp", "mpa"),
@@ -3682,11 +3690,18 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             raise RuntimeError(
                 "MPA screening did not return its sampled QSGW head")
         if bool(inputs.config.do_G0):
+            two_grid_head = {}
+            nq = int(getattr(inputs.meta, "nq_tot", inputs.meta.nk_tot))
+            if nq != int(inputs.meta.nk_tot):
+                two_grid_head = dict(
+                    bare_vc0=inputs.head_resolver.direct_at(0.0 + 0.0j).vc0,
+                    correlation_nq_tot=nq)
             iteration_static_head_terms = compute_static_head_terms_from_sample(
                 iteration_head.at(0.0 + 0.0j),
                 occ=np.asarray(head_occ_kn[:, :inputs.meta.nb_sigma]),
                 cell_volume=float(inputs.meta.cell_volume),
                 nk_tot=int(inputs.meta.nk_tot),
+                **two_grid_head,
             )
     elif iteration_head_response is not None:
         head_body_by_role = W_by_role if requests else None
@@ -6273,6 +6288,8 @@ def run_sc_driver(
     V_q: jax.Array,
     kin_ion: jax.Array,
     *,
+    V_q_screen=None,
+    q_sym=None,
     head_channel=None,
     wfns_transverse=None,
     bispinor_v_q_path=None,
@@ -6444,6 +6461,7 @@ def run_sc_driver(
         seed_path = os.path.join(input_dir, seed_path)
     inputs = SCInputs(
         wfns_dft=wfns, V_q=V_q, kin_ion_dft=kin_ion,
+        V_q_screen=V_q_screen, q_sym=q_sym,
         wfns_transverse=wfns_transverse, bispinor_v_q_path=bispinor_v_q_path,
         mu_bases=mu_bases,
         photon_g0_vectors=photon_g0_vectors,

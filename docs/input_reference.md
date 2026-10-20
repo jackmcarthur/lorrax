@@ -36,6 +36,7 @@ TDA and `--extended`), `auto` (the window Gram's eigenvalue rank at
 | `nval` | int | `5` | Valence edge of the Σ window: b1 = nelec − nval. It sets the ISDF pair-density right window, not the bottom of the QP window. On a dynamic run it also sets the semicore (coarse) class, every occupied state below the lowest requested valence band: an SC map reads the class on the coarse windows at η 5 eV, and the one-shot reads there only the members outside its requested set ([self-consistency §2](self_consistency.md#2-band-treatment)). |
 | `number_bands_protected` | int | unset | The documented form of the QP request: every occupied band plus conduction bands up to this total (resolved against the WFN: nval = the occupied count, ncond = the rest). On a dynamic run the coarse (semicore) class is then every occupied band below a band gap of at least 4 eV, read as `nval` describes ([self-consistency §2](self_consistency.md#2-band-treatment)). Giving it with `nval` or `ncond` refuses (`GATE band_request_forms`). |
 | `ncond` | int | `5` | Conduction bands in the Σ/QP window. Σ diagonals are computed for bands [0, nelec + ncond). On a dynamic self-consistent run (`qp_solver = self_consistent`) the QP matrix [b0, nelec + ncond) rotates among itself and the bands above are the scissored tail ([self-consistency §2](self_consistency.md#2-band-treatment)); it must lie inside `zeta_nband` (`GATE qp_matrix_zeta_left`). |
+| `qgrid` | str | `""` | Optional full-BZ bosonic grid, e.g. `6 6 1` with electronic WFN grid `24 24 1`. χ is truncated near the origin in real lattice space before transforming to this grid; it is not a small-q patch. Each positive component must divide the electronic grid. Empty or the electronic grid preserves existing arithmetic. A differing grid currently requires scalar MPA, `sigma_w_model = shared_pole`, `screening_diagrams = w_rpa`, and no 3D body-cell Monte Carlo averaging; unsupported routes refuse before the ζ fit. Electronic bands/Green phases remain on the WFN grid. The correlation head uses the bosonic cell and weight; bare exchange retains the electronic grid. See [the lattice restriction](architecture/kconv.md#bosonic-response-grid). |
 | `number_bands` | int | `100` | Umbrella band count. It sets both the χ0/W band sum and the Σ band sum. |
 | `number_bands_chi` | int | unset (= `number_bands`) | Band count of the χ0/W sum. Its edge takes a strict `band_degeneracy` check and refuses on a split multiplet (`LORRAX_BAND_DEGENERACY=snap` warns instead). Setting it and `number_bands` to different values refuses. Changing it on `restart = true` refuses. |
 | `number_bands_sigma` | int | unset (= `number_bands`) | Band count of the Σ sum; the band-extrapolation brackets are fractions of this count. It has the same strict degeneracy check and the same conflict refusal as `number_bands_chi`. It may change on `restart = true`, because no restart tensor depends on it. |
@@ -51,6 +52,18 @@ TDA and `--extended`), `auto` (the window Gram's eigenvalue rank at
 The ISDF fit is sized by max(`number_bands_chi`, `number_bands_sigma`), rounded
 up to the world size, and the pad bands are zero. The startup band-count banner
 names which count sets it.
+
+A differing `qgrid` is an explicit real-lattice approximation. Its rectangular
+cutoff does not preserve the original spatial reductions, so electronic
+propagation/Σ uses the full electronic grid as well. Initially this mode
+requires `write_restart_tensors = false` and `write_wfn_h5 = false`: the
+legacy mixed restart bundle and reduced QP-WFN exporter cannot represent
+independent bosonic grids and independent off-wedge electronic states. An SC
+run additionally uses `qp_rotations_k_storage = full`; its full U/E companion
+is the complete state. EQP tables sample their explicitly listed original
+WFN k points and are not the full nonsymmetric spectrum. No flag is silently
+changed to enter this route. Native passivity gates remain enabled; the
+lattice cutoff must be converged for the intended observable.
 
 ## Occupations and Fermi level
 

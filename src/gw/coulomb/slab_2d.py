@@ -59,6 +59,7 @@ class Slab2D(vcoul.Slab2D):
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
         certificate_fn=None,
+        qgrid=None,
     ):
         """``(wfn, meta)``-facing :meth:`vcoul.Slab2D.q0_average`.
 
@@ -70,7 +71,7 @@ class Slab2D(vcoul.Slab2D):
         """
         return super().q0_average(
             CoulombGeometry.from_wfn(wfn),
-            (meta.nkx, meta.nky, meta.nkz),
+            ((meta.nkx, meta.nky, meta.nkz) if qgrid is None else tuple(qgrid)),
             S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,
             rule=rule,
             nsamples=nsamples,

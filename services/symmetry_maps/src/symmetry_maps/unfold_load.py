@@ -326,15 +326,28 @@ class QirrOperator:
                              "onto another wedge")
         return dataclasses.replace(wedge, values=_rows_of(self.values, wedge.full_rows))
 
-    def at_rows(self, q_full_rows):
+    def at_rows(self, q_full_rows, *, mesh_xy=None):
         """The values at full-zone rows ``q_full_rows`` (the wedge's representatives, in
-        order, or any rows of a whole-zone operator): no unfold involved."""
+        order, or any rows of a whole-zone operator). For other rows of a
+        reduced operator, ``mesh_xy`` explicitly requests the symmetry
+        owner's bounded unfold of ONLY the selected rows, never the whole
+        fine q domain or a host centroid gather.
+        """
         rows = np.asarray(q_full_rows).reshape(-1)
+        if rows.dtype.kind not in "iu" or np.any(rows < 0) or np.any(rows >= self.n_full):
+            raise ValueError("QirrOperator.at_rows: full-zone rows must be valid integer IDs")
         if np.array_equal(rows, np.asarray(self.full_rows)):
             return self.values
         if not self.is_whole_zone():
-            raise ValueError("QirrOperator.at_rows: rows other than the wedge's "
-                             "representatives need the unfold")
+            if mesh_xy is None:
+                raise ValueError("QirrOperator.at_rows: rows other than the wedge's "
+                                 "representatives need mesh_xy for the unfold")
+            from symmetry_maps.maps import unfold_isdf_operator
+            return unfold_isdf_operator(
+                self.values, irr_idx=np.asarray(self.irr_idx)[rows],
+                sym_idx=np.asarray(self.sym_idx)[rows], sym_perm=self.sym_perm,
+                L_table=self.L_table, q_irr_frac=self.q_irr_frac, mesh_xy=mesh_xy,
+                n_sym_spatial=self.n_sym_spatial, trs_rule=self.trs_rule)
         return _rows_of(self.values, rows)
 
     def star_sizes(self) -> np.ndarray:

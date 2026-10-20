@@ -933,6 +933,8 @@ def driver_persists_w0(mode, config) -> bool:
     no mode/diagram arithmetic, and so the reasons sit next to the fork
     that creates them.
     """
+    if not bool(getattr(config, "write_restart_tensors", True)):
+        return False
     if not mode.needs_screening:
         return False
     diagrams = coerce_screening_diagrams(

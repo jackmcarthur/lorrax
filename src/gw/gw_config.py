@@ -932,6 +932,9 @@ _DEFAULTS = {
     # System geometry
     "nval": 5,
     "ncond": 5,
+    # Optional compact real-lattice χ cutoff, giving the full-BZ χ/W grid.
+    # Empty follows the electronic WFN kgrid, without a change of arithmetic.
+    "qgrid": "",
     # The QP request as one band count (owner 2026-09-29, the documented
     # form): every occupied band plus conduction bands up to this total.
     # Exclusive with nval/ncond (GATE band_request_forms); resolved against
@@ -2926,6 +2929,27 @@ def _band_request_form(params, named_keys):
     return value
 
 
+def parse_qgrid(value):
+    """Return the optional three-integer bosonic grid (not a small-q patch).
+
+    Commensurability is checked against the WFN by ``Meta.from_system``,
+    before the ISDF fit. Empty input preserves the electronic grid.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        pieces = tuple(re.split(r"[\s,]+", value.strip())
+                       if isinstance(value, str) else value)
+        if any(not re.fullmatch(r"[0-9]+", str(n)) for n in pieces):
+            raise ValueError
+        grid = tuple(int(n) for n in pieces)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("qgrid must be three positive integers, e.g. '6 6 1'") from exc
+    if len(grid) != 3 or any(n <= 0 for n in grid):
+        raise ValueError("qgrid must be three positive integers, e.g. '6 6 1'")
+    return grid
+
+
 def _assemble_input_config(
         _bands, _effective_named_keys, _occ_family, _occ_width, _qp_rot_k_storage,
         _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug,
@@ -2934,6 +2958,7 @@ def _assemble_input_config(
     resolved = cls(
         nval=int(params["nval"]),
         ncond=int(params["ncond"]),
+        qgrid=parse_qgrid(params["qgrid"]),
         number_bands_protected=_band_request_form(params, _effective_named_keys),
         nband=int(_bands.isdf),
         bands=_bands,
@@ -4964,6 +4989,9 @@ class LorraxConfig:
     #: against the WFN (:meth:`with_band_request`), nval = the occupied count
     #: and ncond = this total minus it.
     number_bands_protected: int | None = None
+    #: Full-BZ bosonic χ/W grid from a compact real-lattice χ cutoff.
+    #: None follows the electronic WFN grid. Resolved on Meta, never nk_tot.
+    qgrid: tuple[int, int, int] | None = None
 
     def __post_init__(self):
         """Refuse head settings outside their landed scope."""

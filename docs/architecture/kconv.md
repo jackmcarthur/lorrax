@@ -456,6 +456,46 @@ formed in the tile with no full-k accumulator, through `lorrax_mathdx_kconv_chi_
 XLA backend ([router](#router)): every grid whose split-arm plane tile fits
 holds mode 11 too.
 
+### Distinct electronic and response lattices {#bosonic-response-grid}
+
+The optional scalar response `qgrid` is a full-BZ grid, not a near-Γ patch
+or a downsample of electronic input Greens. The Greens and mode-11 inverse
+transforms retain the complete electronic `kgrid`. Before the χ forward
+transform, `common.fft_helpers.make_response_lattice_fftn` restricts their
+real-space spin product to the response lattice. For an even response axis
+of length m it keeps |R| < m/2 at unit weight, keeps both ±m/2 images at half
+weight and folds those images into the single periodic Nyquist slot; the
+axis weights multiply at edges/corners. Odd axes keep |R| ≤ (m−1)/2. Each
+response axis divides its electronic axis. Equal grids return the legacy
+transform without any changed arithmetic.
+
+The response transform is unitary on its own grid and multiplied by
+√(Nq/Nk); the native physical prefactor still uses the electronic Nk. Thus
+24×24 electronic Greens and a 6×6 response lattice give a raw factor 1/4,
+not a new 1/36 electronic normalization. `selected_q`/`q_ids` then index the
+coarse full BZ. The old fused fine-grid q-store is disabled for this case:
+the existing R-space mode-11 output is restricted before the smaller FFT.
+This explicit rectangular lattice-window approximation is inversion symmetric
+but does not assert the original point-group or centroid-home-cell covariance;
+the response-domain owner must not reuse an unauthenticated old IBZ reduction.
+
+For Σ, mode 9 inverse-transforms W on `qgrid`. Its real-lattice values are
+periodically tiled onto the electronic lattice, using `R mod qgrid` and a
+factor √(Nk/Nq), before the unchanged mode-7 electronic convolution. This
+implements `Σ_k = (1/Nq) sum_q G_(k−q) W_q` at the coarse full-BZ quadrature
+points. Zero-padding W(R) would instead interpolate W onto fine q and is
+not this approximation. The host-plan route converts its q-space prepared
+operand through the same FFT owner before/after this tiling; equal grids
+retain the original preparation. The pole-store header records `grid`
+(bosonic) and `electronic_grid` separately; old headers mean equal grids.
+
+The cutoff does not guarantee passivity or lattice-window convergence.
+Native validity gates remain in force, and a smaller grid must be checked
+against Σ and the intended dynamics. The current implementation retains
+the fine electronic Green transforms and R-space product; its saving is
+the smaller χ/W storage, Dyson solves and shared-pole construction, not a
+reduction of the electronic band sum or ζ fit.
+
 ## 6. Row passes and the `live` operand {#live-rows}
 
 The Σ τ kernel and the χ₀ direct stream do not convolve a rank's whole

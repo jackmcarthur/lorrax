@@ -182,7 +182,7 @@ def _copy_device(tree):
 def publish_window_source(**fields):
     """Hand a Sigma or W stage's objects to every open :class:`observe_window_sigma_source`.
 
-    Device arrays of ``poles`` (a ``PPMBuildResult``), ``wfns`` and
+    Device arrays of ``poles`` (a ``PPMBuildResult``), ``wfns``, bare ``V_q`` and
     ``screening_inputs`` (its ``wfns`` and ``V_q``) are copied; everything else
     is passed by reference.  Fields in :data:`_SCREENING_FIELDS` reach only
     ``screening=True`` observers, and are copied only when one is open.
@@ -200,13 +200,17 @@ def publish_window_source(**fields):
             B_odd_q=copy(poles.B_odd_q))
     if "wfns" in fields:
         fields["wfns"] = _copy_device(fields["wfns"])
+    def copy_interaction(V):
+        if isinstance(V, jax.Array):
+            return jnp.copy(V)
+        if dataclasses.is_dataclass(V) and isinstance(getattr(V, "values", None), jax.Array):
+            return dataclasses.replace(V, values=jnp.copy(V.values))
+        return V
+    if "V_q" in fields:
+        fields["V_q"] = copy_interaction(fields["V_q"])
     if "screening_inputs" in fields:
         inputs = dict(fields["screening_inputs"])
-        V = inputs["V_q"]                       # a jax.Array or a q-wedge operator over one
-        if isinstance(V, jax.Array):
-            V = jnp.copy(V)
-        elif dataclasses.is_dataclass(V) and isinstance(getattr(V, "values", None), jax.Array):
-            V = dataclasses.replace(V, values=jnp.copy(V.values))
+        V = copy_interaction(inputs["V_q"])
         inputs.update(wfns=_copy_device(inputs["wfns"]), V_q=V)
         fields["screening_inputs"] = inputs
     for obs in _WINDOW_SOURCE_OBSERVERS:

@@ -250,6 +250,28 @@ def test_native_preparation_keeps_original_faces_without_spatial_sketch(monkeypa
     assert not ({"vertices", "omega", "rank"} & prepared.keys())
 
 
+def test_native_preparation_authenticates_two_grids_and_keeps_fine_bare_v():
+    from tdagw import snapshot_runtime as sr
+    source, mesh, _, _ = _source()
+    source["meta"].qgrid = (2, 1, 1)
+    qsym = NS(q_irr_full_idx=np.arange(2),
+              q_irr_kgrid_int=np.array([[0, 0, 0], [1, 0, 0]]))
+    coarse_v = source["V_q"][::2]
+    source["screening_inputs"] = dict(V_q=coarse_v, kwargs=dict(sym=qsym))
+    prepared = sr.prepare_native_source(source, mesh)
+    assert prepared["nk"] == 4 and prepared["nq"] == 2
+    assert prepared["kgrid"] == (4, 1, 1) and prepared["qgrid"] == (2, 1, 1)
+    assert prepared["V_q"] is source["V_q"]
+    assert prepared["V_q"].shape[0] == 4
+    assert source["screening_inputs"]["V_q"] is coarse_v
+    assert prepared["flat_grid"]["response_grid"] == [2, 1, 1]
+    with pytest.raises(ValueError, match="td_projected_qgrid"):
+        prepare_projected_source(source, mesh)
+    qsym.q_irr_kgrid_int[1, 0] = 2
+    with pytest.raises(ValueError, match="td_native_response_grid"):
+        sr.prepare_native_source(source, mesh)
+
+
 def test_joint_fit_refusal_does_not_install_a_snapshot(monkeypatch):
     from common.units import RYD_TO_EV
     from tdagw import collision as C

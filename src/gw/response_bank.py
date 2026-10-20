@@ -171,7 +171,8 @@ def full_density_bare_moments(operands, meta, *, mesh_xy, q_ids):
     grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     def term(a, b):
         stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
-                                               moment_powers=(a, b), **common)
+                                               moment_powers=(a, b),
+                                               qgrid=getattr(meta, 'qgrid', None), **common)
         return stream(jnp.zeros(1, complex), jnp.ones((1, 1), complex), pm, pn, ph, energy)[:, 0]
     return term(0, 0), term(1, 0)-term(0, 1)
 
@@ -321,7 +322,7 @@ def _dyson_room(meta, mesh_xy, n):
         live = ledger.live_stages
     except ValueError:
         return None
-    faces = 16 * int(n) * int(n) * 3 * int(meta.nk_tot) // ranks
+    faces = 16 * int(n) * int(n) * 3 * int(getattr(meta, "nq_tot", meta.nk_tot)) // ranks
     return max(0, ledger.room_bytes_per_rank(concurrent_with=live) - faces)
 
 
@@ -795,6 +796,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     ``[len(q_ids), n_outputs, mu_p, mu_p]`` with both endpoints sharded.
     ``ordered`` (time reversal measured broken) returns the physical
     orientation ``chi_q = FT_q[chi]`` that Sigma's contraction assumes.
+    ``q_ids`` index ``meta.qgrid`` when supplied: a coarse full-BZ response
+    from the real-space lattice restriction, while Greens still use Nk.
     ``stream_pass`` runs one segment of the direct stream's row-pass engine
     into that segment's carry (the streamed bank, :func:`stream_segments`):
     the program serves every segment of its stream (the four-current stream:
@@ -805,7 +808,13 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
 
     from file_io.shared_pole_store import charge_representation
 
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    requested_qgrid = getattr(meta, "qgrid", None)
+    qgrid = kgrid if requested_qgrid is None else tuple(requested_qgrid)
+
     if vertex is not None:
+        if qgrid != kgrid:
+            raise ValueError("GATE response_qgrid: coarse bosonic lattice serves scalar charge only")
         if pair_mode == "laplace":
             raise ValueError("GATE response_vertex: photon Laplace cells must retain odd rows")
         n_input = vertex.families.n_parent
@@ -836,6 +845,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
         pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges,
+        qgrid=qgrid,
         # One segment program for every pass; the segment index is a runtime argument.
         **({} if stream_pass is None else dict(stream_pass=0)))
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
@@ -1926,7 +1936,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
 
 def _self_negative(q_full, meta):
     """True where q = -q on the canonical C-ordered full grid (a TRIM parent)."""
-    grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    grid = tuple(getattr(meta, "qgrid", None) or (meta.nkx, meta.nky, meta.nkz))
     return all((2*int(i)) % n == 0 for i, n in zip(np.unravel_index(q_full, grid), grid))
 
 
@@ -2894,6 +2904,8 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
     given runs as one stack of rows.
     """
     from symmetry_maps import bgw_integer_q_to_fractional, unfold_isdf_operator
+    if tuple(getattr(meta, "qgrid", None) or meta.kgrid) != tuple(meta.kgrid):
+        return None
     from .photon_layout import _empty, _insert, photon_block_view
     plans, layout = tuple(families.plans), families.packed_layout
     rows = {_unitary_inversion(plan) for plan in plans}
@@ -2901,8 +2913,8 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
         return None
     inversion = rows.pop()
     sym = plans[0].sym
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    q_frac = np.asarray(bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, kgrid))
+    qgrid = tuple(getattr(meta, "qgrid", None) or (meta.nkx, meta.nky, meta.nkz))
+    q_frac = np.asarray(bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, qgrid))
     classes = tuple(tuple((C, D) for C in ((1, 2, 3) if a else (0,))
                           for D in ((1, 2, 3) if b else (0,))) for a in (0, 1) for b in (0, 1))
 
@@ -2948,12 +2960,17 @@ def _minus_q_mirror(plan, sym, meta, mesh_xy):
     parents ``[q0, q1)`` mirrored.
     """
     from symmetry_maps import bgw_integer_q_to_fractional, unfold_isdf_operator
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    qgrid = tuple(getattr(meta, "qgrid", None) or kgrid)
+    if qgrid != kgrid:
+        # Real-R restriction is not assumed spatially covariant, including
+        # inversion. Stream the independently labelled coarse q orientations.
+        return None
     n_spatial = int(plan.n_sym_spatial)
     inversion = _unitary_inversion(plan)
     if inversion is None:
         return None
-    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    q_frac = np.asarray(bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, kgrid))
+    q_frac = np.asarray(bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, qgrid))
 
     def mirror(fields, q0, q1):
         n = int(q1) - int(q0)

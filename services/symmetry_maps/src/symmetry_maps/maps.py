@@ -1474,7 +1474,7 @@ def _unimodular_inverse(S_full, s):
 
 def _one_leg_star_rows(*, sym, sym_idx, q_irr_frac, kgrid, n_q_parent):
     """Validated full-q star rows shared by the one-leg relabel and action."""
-    q_full_int = np.asarray(sym.kvecs_asints, dtype=np.int64)
+    q_full_int = np.asarray(getattr(sym, "qvecs_asints", sym.kvecs_asints), dtype=np.int64)
     grid = np.asarray(kgrid, dtype=np.int64).reshape(3)
     q_parent_int = np.asarray(sym.q_irr_kgrid_int, dtype=np.int64)
     n_q_full = int(np.prod(grid))
@@ -2151,6 +2151,55 @@ def _unwrapped_grid_q_tables(coords, grid):
 
 
 class SymMaps:
+    def qgrid_view(self, qgrid, *, kgrid=None):
+        """Independent full bosonic q domain on the same electronic maps.
+
+        ``qgrid`` contains three positive divisors of the electronic
+        ``kgrid``. The returned shallow view preserves every electronic
+        k/parent and basis-operation array; only its q tables and permitted
+        response symmetry rows change. Real-space restriction need not
+        preserve the spatial group, so every coarse q is an explicit parent.
+        ``q_to_fine_full`` maps those rows to their exact physical rows of
+        the original fine difference grid, including noncanonical row order.
+        An equal grid returns ``self`` unchanged.
+        """
+        from copy import copy
+        coords = np.asarray(self.kvecs_asints, dtype=np.int32)
+        fine = np.asarray(kgrid if kgrid is not None else coords.max(axis=0) + 1)
+        coarse = np.asarray(qgrid)
+        if (fine.shape != (3,) or coarse.shape != (3,)
+                or fine.dtype.kind not in "iu" or coarse.dtype.kind not in "iu"
+                or any(isinstance(v, (bool, np.bool_)) for v in np.asarray(qgrid, dtype=object).flat)
+                or np.any(fine <= 0) or np.any(coarse <= 0)
+                or np.any(fine % coarse)):
+            raise ValueError("GATE qgrid_domain: qgrid must contain three positive "
+                             "integer divisors of the electronic kgrid")
+        lookup = _integer_grid_lookup(coords, fine)
+        if lookup is None:
+            raise ValueError("GATE qgrid_domain: electronic rows must cover the complete kgrid")
+        if np.array_equal(coarse, fine):
+            return self
+        identity = np.flatnonzero(
+            np.all(np.asarray(self.sym_matrices) == np.eye(3, dtype=int), axis=(1, 2))
+            & np.all(np.isclose(self.translations, 0, atol=1e-12), axis=1))
+        if identity.size != 1:
+            raise ValueError("GATE qgrid_domain: one authenticated identity operation required")
+        qcoords = np.stack(np.meshgrid(*(np.arange(int(n)) for n in coarse),
+                                      indexing="ij"), axis=-1).reshape(-1, 3).astype(np.int32)
+        fine_coords = qcoords * (fine // coarse)[None, :]
+        flat = np.ravel_multi_index(fine_coords.T, tuple(fine))
+        view = copy(self)
+        view.qgrid = tuple(int(n) for n in coarse)
+        view.qvecs_asints = qcoords
+        view.q_to_fine_full = lookup[flat].copy()
+        view.q_irr_full_idx = np.arange(len(qcoords), dtype=np.int32)
+        view.q_irr_kgrid_int = qcoords.copy()
+        view.irr_idx_q = view.q_irr_full_idx.copy()
+        view.sym_idx_q = np.full(len(qcoords), int(identity[0]), dtype=np.int32)
+        view.active_symmetry_rows = identity.astype(np.int32)
+        view.q_domain_policy = "full-identity-real-space-restriction"
+        return view
+
     def trivial_view(self):
         """Restrict the computational group to identity over loader-unfolded full-k parents."""
         from copy import copy
@@ -2848,7 +2897,7 @@ class SymMaps:
     @property
     def q_irr_is_full_identity(self):
         """Whether the q-IBZ table is exactly the ordered full q table; see docs/architecture/symmetry_register.md."""
-        q_full = np.asarray(self.kvecs_asints, dtype=np.int32)
+        q_full = np.asarray(getattr(self, "qvecs_asints", self.kvecs_asints), dtype=np.int32)
         n_q = int(q_full.shape[0])
         identity = np.arange(n_q, dtype=np.int32)
         return bool(
