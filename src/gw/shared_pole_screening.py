@@ -124,9 +124,17 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         fit_basis = {}
     previous_direction_bytes = sum(a.size*a.dtype.itemsize for a in fit_basis.get("directions", {}).values())
     nk = int(meta.nk_tot)
-    if not np.array_equal(np.asarray(sym.q_irr_full_idx), np.arange(nk)):
-        raise ValueError("GATE shared_general_full_q: every current q must be an explicit parent")
     grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    qgrid = tuple(int(n) for n in (getattr(meta, "qgrid", None) or grid))
+    nq = int(np.prod(qgrid))
+    sym = getattr(meta, "q_sym", sym)
+    if not np.array_equal(np.asarray(sym.q_irr_full_idx), np.arange(nq)):
+        raise ValueError("GATE shared_general_full_q: every current q must be an explicit parent")
+    qcoords = np.asarray(sym.q_irr_kgrid_int)
+    canonical_qcoords = np.indices(qgrid).reshape(3, -1).T
+    if (qcoords.shape != (nq, 3) or qcoords.dtype.kind not in "iu"
+            or not np.array_equal(qcoords % np.asarray(qgrid), canonical_qcoords)):
+        raise ValueError("GATE shared_general_full_q: canonical unshifted bosonic q coordinates required")
     active = snapshot["active_slice"]
     if not isinstance(active, slice):
         active = slice(*active)
@@ -182,7 +190,9 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             or plan.parent_full_rows is None
             or not np.array_equal(np.asarray(plan.parent_full_rows), np.arange(nk))):
         raise ValueError("GATE shared_general_full_k: native flat-grid identity row order required")
-    grid_receipt = authenticate_canonical_full_grid(plan, grid, sym=sym)
+    grid_receipt = authenticate_canonical_full_grid(
+        plan, grid, sym=sym if qgrid == grid else None)
+    grid_receipt.update(response_grid=list(qgrid), n_q=nq, response_q_order="canonical-C")
     pm, pn = carrier.psi_mun, carrier.psi_nmu
     layout = carrier.layout
     ns, nmu, nb = map(int, pm.shape[1:])
@@ -195,9 +205,9 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     pm, pn = pm*band_mask[None, None, None], pn*band_mask[None, :, None, None]
     rho[:, stop:, :] = 0; rho[:, :, stop:] = 0
     v = QirrOperator.of(V_q)
-    if not v.is_whole_zone() or v.n_full != nk:
+    if not v.is_whole_zone() or v.n_full != nq:
         raise ValueError("GATE shared_general_full_q: full native Coulomb operator required")
-    V = v.at_rows(np.arange(nk))
+    V = v.at_rows(np.arange(nq))
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     rep = NamedSharding(mesh_xy, P())
     mm = face_matmul(mesh_xy)
@@ -222,9 +232,9 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     side_bound = sum(extent for z, extent in zip(sites[fit_positions], widths) if z.real != 0)
     side_bound += sum(widths)+2*int(recipe["infinity_width"])
     ranks = int(mesh_xy.size)
-    bank_bytes = 16*nk*len(sites)*nmu*nmu//ranks
-    action_bytes = 16*nk*4*nmu*side_bound//ranks
-    pencil_bytes = 32*nk*side_bound*side_bound//ranks
+    bank_bytes = 16*nq*len(sites)*nmu*nmu//ranks
+    action_bytes = 16*nq*4*nmu*side_bound//ranks
+    pencil_bytes = 32*nq*side_bound*side_bound//ranks
     green_bytes = 16*nk*(ns*nmu)**2*6//ranks
     price = current_meta.shared_pole_capacity.reserve("general_full_map",
         resident_bytes_per_rank=bank_bytes+action_bytes+pencil_bytes,
@@ -315,7 +325,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             left = pm*jnp.asarray(block['u'])[:,None,None]
         right = (ph if block['name'][0] == 'A' else pm)*jnp.asarray(block['f'])[:,None,None]
         stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
-            q_ids=np.arange(nk), n_outputs=len(rule["members"]), layout=layout,
+            q_ids=np.arange(nq), n_outputs=len(rule["members"]), layout=layout, qgrid=qgrid,
             rule_reference_ry=rule["reference_ry"],pair_bounds_ry=block['bounds'],
             pair_band_ranges=block['band_ranges'])
         raw = stream(jnp.asarray(rule["times"]), jnp.asarray(rule["weights"]), left, pn, right, energy_d)
@@ -346,8 +356,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     eig = distrib_la.plan("eigh", mesh_xy, n=nmu)
     directions = fit_basis.setdefault("directions", {})
     begin("directions")
-    coords = np.unravel_index(np.arange(nk), grid)
-    minus = np.ravel_multi_index(tuple((-c) % n for c, n in zip(coords, grid)), grid)
+    coords = np.unravel_index(np.arange(nq), qgrid)
+    minus = np.ravel_multi_index(tuple((-c) % n for c, n in zip(coords, qgrid)), qgrid)
     left_states, right_states = [], []
     for training_index,i in enumerate(fit_positions):
         W = values[i]
@@ -394,7 +404,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # They are not forced to be Hermitian/even for a coherent finite-band
     # projected density algebra. Gamma shifts X2 by -i gamma X1 once.
     x1, x2 = full_density_bare_moments((pm, pn, ph, energy_d), meta,
-                                      mesh_xy=mesh_xy, q_ids=np.arange(nk))
+                                      mesh_xy=mesh_xy, q_ids=np.arange(nq))
     pref = float(algebra["prefactor"])
     c1 = mm(V, mm(pref*x1, V))
     c2 = mm(V, mm(pref*(x2-1j*gamma*x1), V))+mm(V, mm(pref*x1, mm(V, mm(pref*x1, V))))
@@ -453,7 +463,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     stop_after=snapshot.get('stop_after_model_q')
     if stop_after is not None and int(stop_after)!=0:
         raise ValueError('GATE shared_general_diagnostic: only stop_after_model_q=0 is supported')
-    parents=[0] if stop_after is not None else [iq for iq in range(nk) if iq <= int(minus[iq])]
+    parents=[0] if stop_after is not None else [iq for iq in range(nq) if iq <= int(minus[iq])]
     position=0
     while position<len(parents):
         retained=sum(a.nbytes for space in spaces.values() for a in space.values())
@@ -527,7 +537,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                     direct_dyson_probes_file=f'q_{iq:03d}_direct_probes.json' if bad_growth else None,
                     model_receipt=model['receipt'],phase_seconds=phases,
                     elapsed_seconds=time.monotonic()-started,artifact=str(path),
-                    full_microscopic_host_payload=False,n_mu=int(meta.n_rmu),n_q=nk,screening_bands=stop,
+                    full_microscopic_host_payload=False,n_mu=int(meta.n_rmu),n_q=nq,screening_bands=stop,
                     response_active_bands=[response_active.start,response_active.stop])
                 report['verification_geometry']=verification_geometry
                 report['frequency_coordinates']=frequency_coordinates
@@ -606,7 +616,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                                     tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),paired=True)
                                 for rule in prules:
                                     stream=full_density_response_stream(mesh_xy,grid,(nk,nb,nmu,ns),q_ids=[iq],
-                                        n_outputs=1,layout=layout,rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'],
+                                        n_outputs=1,layout=layout,qgrid=qgrid,rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'],
                                         pair_band_ranges=block['band_ranges'])
                                     part=stream(jnp.asarray(rule['times']),jnp.asarray(rule['weights']),left,pn,right,energy_d)[:,0]
                                     raw_probe=part if raw_probe is None else raw_probe+part
@@ -683,7 +693,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # mirrored partner and self-negative convex crossing mixture.
     begin("checks")
     checks, moment_checks = [], []
-    for iq in range(nk):
+    for iq in range(nq):
         l, r, p = banks[iq]
         growth = float(np.max(p.imag, initial=-np.inf))
         if eta <= growth+1e-12 or np.min(sites.imag) <= growth+1e-12:
@@ -706,6 +716,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         hamiltonian=hashlib.sha256((energy.tobytes()+np.asarray(snapshot["U_active"]).tobytes())).hexdigest(),
         wavefunctions=operator_digest(merge_spin_centroid(pm, 1, 2), mesh_xy),
         centroids=hashlib.sha256(np.asarray(meta.mu_basis.canonical_indices).tobytes()).hexdigest())
+    if qgrid != grid:
+        identity.update(electronic_grid=list(grid), response_grid=list(qgrid))
     tables = _shared_pole_tables(meta, sym, meta.mu_basis.canonical_indices)
     root = Path(run_dir)/f"{label}_general_shared_pole"
     if jax.process_index() == 0:
@@ -714,14 +726,15 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # All physical banks are known before persistence. Compact only exact
     # unused file columns; never discard a fitted pole to meet storage cost.
     kmax = extent(max(len(bank[2]) for bank in banks.values()))
-    for iq in range(nk):
+    for iq in range(nq):
         l, r, p = banks.pop(iq)
         header = write_general_shared_pole_model(str(path), l[:, :, None], r[:, :, None],
             put(p[None]), [len(p)], q_span=(iq, iq+1), meta=current_meta, tables=tables,
             recipe=recipe, receipts=dict(identity=identity), kmax=kmax)
     end("persist")
     receipt = dict(construction="full-microscopic-general-shared-pole", n_mu=int(meta.n_rmu),
-        n_q=nk, screening_bands=stop, poles=receipts, checks=checks, moment_checks=moment_checks, sample_seconds=sample_wall,
+        n_q=nq, n_k=nk, electronic_grid=list(grid), response_grid=list(qgrid),
+        screening_bands=stop, poles=receipts, checks=checks, moment_checks=moment_checks, sample_seconds=sample_wall,
         seconds=time.monotonic()-started, response_rules=[{k:v for k,v in r.items() if k not in ("times", "weights")}
                                                        for r in rules],
         input_density_coherence_norm=float(np.linalg.norm(rho-np.eye(nb)[None]*rho.diagonal(axis1=1, axis2=2)[:, :, None])),
@@ -743,7 +756,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     receipt["native_positive_pole_budget"] = positive_cap
     receipt["general_signed_pole_budget"] = int(cap)
     receipt["stored_Kmax"] = int(kmax)
-    receipt["stored_payload_bytes"] = 32*nk*int(meta.n_rmu)*kmax+16*nk*kmax
+    receipt["stored_payload_bytes"] = 32*nq*int(meta.n_rmu)*kmax+16*nq*kmax
     receipt["reduced_host_pencil_shape"] = [nl, nr]
     receipt["reduced_host_workspace_bytes_per_rank"] = host_price
     receipt["held_reduced_host_basis_bytes_per_rank"] = sum(
@@ -756,7 +769,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     receipt["held_direction_bytes_per_rank"] = retained//ranks
     if jax.process_index() == 0:
         (root/"receipt.json").write_text(_json(receipt))
-        print_fn(f"General shared-pole W: {nk}q, {meta.n_rmu}mu, {stop}bands; {receipt['seconds']:.3f}s")
+        print_fn(f"General shared-pole W: {nq}q, {meta.n_rmu}mu, {stop}bands; {receipt['seconds']:.3f}s")
     return dict(shared_pole=dict(path=str(path), identity=identity, digest=header["digest"],
                                  K=header["K"], header=header, representation="ordered_complex"),
                 meta=current_meta, receipt=receipt)
@@ -927,7 +940,8 @@ def _coulomb_resource(value, meta, sym, mesh_xy):
     basis = meta.mu_basis
     qids = np.asarray(sym.q_irr_full_idx, np.int64)
     op = QirrOperator.of(value)
-    if op.n_full != meta.nk_tot or tuple(op.values.shape[1:]) != (basis.n_packed, basis.n_packed):
+    nq = int(np.prod(getattr(meta, "qgrid", None) or (meta.nkx, meta.nky, meta.nkz)))
+    if op.n_full != nq or tuple(op.values.shape[1:]) != (basis.n_packed, basis.n_packed):
         raise ValueError("GATE shared_pole_coulomb: expected the packed bare V")
     # The parents' rows are one array for the run (the wedge's own values, or
     # one gather of a whole-zone operator), so the held roots and the digest
@@ -1160,7 +1174,7 @@ def _shared_pole_tables(meta, sym, centroid_indices):
         np.asarray(meta.fft_grid), extend_trs=True)
     qt = QirrTables(irr_idx_q=sym.irr_idx_q, sym_idx_q=sym.sym_idx_q,
         q_irr_frac=bgw_integer_q_to_fractional(
-            sym.q_irr_kgrid_int, (meta.nkx, meta.nky, meta.nkz)),
+            sym.q_irr_kgrid_int, getattr(meta, "qgrid", None) or (meta.nkx, meta.nky, meta.nkz)),
         sym_perm=perm, L_table=wraps, n_sym_spatial=len(sym.sym_matrices))
     return dict(qirr=qt, q_irr_full_idx=np.asarray(sym.q_irr_full_idx, np.int64), sym=sym)
 
@@ -1177,6 +1191,7 @@ def compile_w_model_ahead(config, meta, sym, mesh_xy):
     from .gw_config import HeadCorrection, uses_full_bispinor_shared_pole
     if config.sigma.w_model != "shared_pole" or uses_full_bispinor_shared_pole(config):
         return
+    sym = getattr(meta, "q_sym", sym)
     from .response_bank import compile_coulomb_roots_ahead
     compile_coulomb_roots_ahead(meta, config, mesh_xy, len(sym.q_irr_full_idx))
     if config.head.correction is not HeadCorrection.OFF:
@@ -1197,6 +1212,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     SC labels own separate map scratch. ``restart`` may restore the invariant
     ISDF basis, but never skips the current response or W construction.
     """
+    sym = getattr(meta, "q_sym", sym)
     source_wfn = None
     from .gw_config import uses_full_bispinor_shared_pole
     photon = uses_full_bispinor_shared_pole(config)

@@ -84,6 +84,10 @@ class StaticHeadTerms:
     wcoul0: complex
     wc_head_0: complex
     source: str
+    # With two grids the bare-X head uses electronic Nk; correlation uses
+    # a different bare cell and bosonic Nq. None retains the original grid.
+    correlation_vc0: complex | None = None
+    correlation_nq_tot: int | None = None
 
 
 _STATIC_GAUGE_WARD_RESIDUAL_MAX = 1.0e-8
@@ -1415,6 +1419,11 @@ class HeadResolver:
         """The WFN whose transition manifold this provider validates."""
         return self._wfn
 
+    @property
+    def q0_certificate_fn(self):
+        """The reporting callback shared by fine bare and coarse W cells."""
+        return self._params.get("_q0_certificate_fn")
+
     def direct_at(self, omega) -> HeadSample:
         """Return the configured no-local-field/direct diagnostic sample."""
         key = self._cache_key(omega)
@@ -1684,6 +1693,8 @@ def compute_static_head_terms(
     cell_volume: float,
     nk_tot: int,
     source: str = "unknown",
+    correlation_vc0: complex | None = None,
+    correlation_nq_tot: int | None = None,
 ) -> StaticHeadTerms:
     """Build exact static COHSEX head terms (Σ^X, Σ^SX, Σ^{SX-X}, Σ^COH) in band space; see docs/theory/four-current-head-corrections.md#static-head."""
 
@@ -1699,6 +1710,16 @@ def compute_static_head_terms(
     sigma_sx_diag = -(w_h * pref) * occ_arr
     sigma_sx_minus_x_diag = -(wc_h * pref) * occ_arr
     sigma_coh_diag = 0.5 * (wc_h * pref) * ones
+    if correlation_vc0 is not None or correlation_nq_tot is not None:
+        corr_v = v_h if correlation_vc0 is None else jnp.asarray(
+            correlation_vc0, dtype=jnp.complex128)
+        corr_nq = nk_tot if correlation_nq_tot is None else correlation_nq_tot
+        corr_pref = jnp.asarray(1.0 / (float(cell_volume) * float(corr_nq)),
+                               dtype=jnp.complex128)
+        wc_h = w_h - corr_v
+        sigma_sx_minus_x_diag = -(wc_h * corr_pref) * occ_arr
+        sigma_sx_diag = sigma_x_diag + sigma_sx_minus_x_diag
+        sigma_coh_diag = 0.5 * (wc_h * corr_pref) * ones
 
     return StaticHeadTerms(
         sigma_x_diag=sigma_x_diag,
@@ -1707,18 +1728,25 @@ def compute_static_head_terms(
         sigma_coh_diag=sigma_coh_diag,
         vc0=complex(vc0),
         wcoul0=complex(wcoul0_static),
-        wc_head_0=complex(wcoul0_static) - complex(vc0),
+        wc_head_0=complex(wcoul0_static) - complex(
+            vc0 if correlation_vc0 is None else correlation_vc0),
         source=source,
+        correlation_vc0=correlation_vc0,
+        correlation_nq_tot=correlation_nq_tot,
     )
 
 
 def compute_static_head_terms_from_sample(head: HeadSample, *,
                                           occ, cell_volume: float,
-                                          nk_tot: int) -> StaticHeadTerms:
+                                          nk_tot: int, bare_vc0=None,
+                                          correlation_nq_tot=None) -> StaticHeadTerms:
     """Build exact static COHSEX head terms from a resolved head sample."""
-    return compute_static_head_terms(vc0=head.vc0, wcoul0_static=head.wcoul0,
+    return compute_static_head_terms(vc0=head.vc0 if bare_vc0 is None else bare_vc0,
+                                     wcoul0_static=head.wcoul0,
                                      occ=occ, cell_volume=cell_volume,
-                                     nk_tot=nk_tot, source=head.source)
+                                     nk_tot=nk_tot, source=head.source,
+                                     correlation_vc0=None if bare_vc0 is None else head.vc0,
+                                     correlation_nq_tot=correlation_nq_tot)
 
 
 #: Two ladder energies closer than this (Ry) are one exactly degenerate multiplet.

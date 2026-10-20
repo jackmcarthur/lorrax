@@ -235,7 +235,8 @@ def _capacity(meta):
     if ledger is None:
         _refuse("missing map CapacityLedger before tensor I/O")
     ledger.live_stages
-    expected = dict(nq=int(meta.nk_tot),nspinor=int(meta.nspinor),
+    qgrid = getattr(meta, "qgrid", None)
+    expected = dict(nq=(int(meta.nk_tot) if qgrid is None else int(np.prod(qgrid))),nspinor=int(meta.nspinor),
                     nmu=int(meta.mu_basis.n_logical),
                     px=int(meta.mu_basis.mesh_xy.shape["x"]),
                     py=int(meta.mu_basis.mesh_xy.shape["y"]))
@@ -463,6 +464,12 @@ def _check_basis(meta, header, basis=None):
             or int(meta.nspinor) != header["nspinor"]
             or digest != header["centroid_digest"]):
         _refuse("reader/writer logical centroid or spin identity changed")
+    if "grid" in header and all(hasattr(meta, name) for name in ("nkx", "nky", "nkz")):
+        electronic = tuple(int(v) for v in (meta.nkx, meta.nky, meta.nkz))
+        response = tuple(int(v) for v in (getattr(meta, "qgrid", None) or electronic))
+        if (tuple(header["grid"]) != response
+                or tuple(header.get("electronic_grid", header["grid"])) != electronic):
+            _refuse("reader/writer electronic or bosonic response grid changed")
     return basis
 
 
@@ -496,6 +503,14 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
                 else "TRS-broken representation is unsupported")
     qt = tables["qirr"].logical(basis.n_logical).canonical()
     validate_qirr_tables(qt, qt.n_q_ibz, basis.n_logical)
+    electronic_grid = tuple(int(v) for v in (meta.nkx, meta.nky, meta.nkz))
+    qgrid = tuple(int(v) for v in (getattr(meta, "qgrid", None) or electronic_grid))
+    if (len(qgrid) != 3 or min(qgrid) < 1
+            or any(k % q for k, q in zip(electronic_grid, qgrid))
+            or int(np.prod(qgrid)) != int(qt.n_q_full)):
+        _refuse("bosonic qgrid must divide the electronic grid and match the q tables")
+    if qgrid != electronic_grid and (photon or sector is not None or int(meta.nspinor) == 4):
+        _refuse("independent bosonic qgrid is supported only by the standard scalar route")
     qids = np.asarray(tables["q_irr_full_idx"])
     if (qids.dtype.kind not in "iu" or qids.shape != (qt.n_q_ibz,)
             or np.any(qids < 0) or np.any(qids >= qt.n_q_full)
@@ -530,7 +545,8 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
         "n_q_irr": qt.n_q_ibz, "n_q_full": qt.n_q_full,
         "n_mu_logical": basis.n_logical, "nspinor": int(meta.nspinor),
         "centroid_digest": centroid_hash,
-        "grid": [int(meta.nkx), int(meta.nky), int(meta.nkz)],
+        "grid": list(qgrid),
+        "electronic_grid": list(electronic_grid),
         "fft_grid": np.asarray(meta.fft_grid).tolist(),
         "q_order": "canonical-full-flat", "q_shift": [0.0, 0.0, 0.0],
         "q_irr_full_idx": qids.tolist(),

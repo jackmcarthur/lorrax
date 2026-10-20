@@ -3727,11 +3727,16 @@ def head_samples_from_s(
                      else "kappa2", z, S, extra_chi, is_static_metal))
     screened = [i for i, r in enumerate(rows) if r[0] == "screened"]
     averages = {}
+    # Electronic velocities/S tensors retain their Nk normalization. Only
+    # the interaction-cell average follows the independent bosonic grid.
+    cell_grid = getattr(meta, "qgrid", None)
+    cell_options = ({} if cell_grid is None or tuple(cell_grid) == tuple(meta.kgrid)
+                    else {"qgrid": cell_grid})
     if screened:
         vc0, wcoul0 = compute_q0_averages_screened(
             wfn, meta, [rows[i][2] for i in screened],
             extra_chi_rows=_extra_chi_rows([rows[i][3] for i in screened], intraband),
-            analytic_sphere=analytic_sphere)
+            analytic_sphere=analytic_sphere, **cell_options)
         vc0 = complex(vc0)
         averages.update(zip(screened, ((vc0, w) for w in wcoul0)))
     for i, row in enumerate(rows):
@@ -3740,7 +3745,7 @@ def head_samples_from_s(
                 wfn, jnp.asarray(0.0, dtype=jnp.float64), meta,
                 S_cart=None,
                 static_kappa2=jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64),
-                analytic_sphere=analytic_sphere, extra_chi=None)
+                analytic_sphere=analytic_sphere, extra_chi=None, **cell_options)
     # Pass 2: read back once per row, in the caller's order.
     out = []
     for i, (label, z, S, _, is_static_metal) in enumerate(rows):

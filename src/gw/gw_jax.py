@@ -316,6 +316,23 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
     validate_material_inputs(config, material_class)
     print0(f"  Material class: {material_class} (inferred from WFN occupations)")
     sym = wfn.symmetry()
+    from .gw_init import validate_qgrid_route
+    validate_qgrid_route(config, wfn.kgrid)
+    requested_qgrid = getattr(config, "qgrid", None)
+    if requested_qgrid is not None and tuple(requested_qgrid) != tuple(wfn.kgrid):
+        # A rectangular real-R restriction need not commute with the input
+        # point group. Neither G's parents nor the output Sigma/SC state may
+        # be spatially folded through that group. WfnLoader still owns the
+        # measured source-file symmetry for authenticated input unfolding.
+        sym = sym.trivial_view()
+        report.progress(
+            "Q-grid mode   : independent full-BZ electronic parents/state; "
+            f"kgrid={tuple(wfn.kgrid)}, qgrid={tuple(requested_qgrid)}. "
+            "Real-space-restricted response, full coarse-q BZ; fine bare "
+            "exchange retained. EQP text rows sample the listed source-WFN "
+            "k points, not a symmetry completion; full SC state is the "
+            "canonical full-k QP rotations artifact. Restart/BSE tensors "
+            "and reduced WFN_qp export are explicitly disabled by the deck.")
     centroid_basis = load_centroid_basis(
         config.paths.centroids_file, wfn.fft_grid, sym=sym)
     centroid_sets = [centroid_basis]
@@ -428,6 +445,10 @@ def _prepare_isdf_carriers(
             bgw_v_grid_fn=bgw_v_grid_fn,
         )
     V_qmunu = isdf.V_qmunu
+    from .ppm_pipeline import publish_window_source
+    # The source's bare HF operator always retains the fine electronic
+    # domain. screening_inputs.V_q separately names the coarse W operator.
+    publish_window_source(V_q=V_qmunu)
     wfns = isdf.wf_bundle
     green_parent_carrier = getattr(isdf, 'green_parent_carrier', None)
     wfns_sigma = wfns
@@ -640,6 +661,8 @@ def _run_oneshot_screening(
         oneshot_mpa_plan, oneshot_occupation_state, print0, qp_solver, quad, report, sym,
         tensors_filename, tmp_dir, wfn, wfns_screening, wfns_transverse):
     """Produce the one-shot screening roles and packed response."""
+    V_screen = getattr(isdf, "V_q_screen", V_q)
+    q_sym = getattr(isdf, "q_sym", sym)
     photon_response = None
     if qp_solver is QPSolver.SELF_CONSISTENT:
         W_by_role = {}
@@ -657,7 +680,7 @@ def _run_oneshot_screening(
                 _W_charge = None
                 if not _screens_current or _dynamic_packed:
                     W_by_role = compute_screening_model(
-                        mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
+                        mode, wfns_screening, V_screen, quad=quad, e_ref=e_ref, sym=q_sym,
                         centroid_indices=centroid_indices, config=config,
                         meta=meta, mesh_xy=mesh_xy,
                         run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
@@ -705,7 +728,7 @@ def _run_oneshot_screening(
                 _report_packed_screening(_dynamic_packed, _screens_current, mode, photon_response, print0, report)
             else:
                 W_by_role = compute_screening_model(
-                    mode, wfns_screening, V_q, quad=quad, e_ref=e_ref, sym=sym,
+                    mode, wfns_screening, V_screen, quad=quad, e_ref=e_ref, sym=q_sym,
                     centroid_indices=centroid_indices, config=config, meta=meta,
                     mesh_xy=mesh_xy, run_dir=os.path.join(tmp_dir, "mpa"), wfn=wfn,
                     wfn_fingerprint_binding=isdf.wfn_fingerprint_binding,
@@ -948,6 +971,8 @@ def _solve_qp_stage(
                             label="self-consistent QSGW driver"):
             sc_result = run_sc_driver(
                 wfns_sigma, V_q, kin_ion,
+                V_q_screen=getattr(isdf, "V_q_screen", V_q),
+                q_sym=getattr(isdf, "q_sym", sym),
                 wfns_transverse=wfns_transverse,
                 bispinor_v_q_path=bispinor_v_q_path, mu_bases=isdf.mu_bases,
                 photon_g0_vectors=isdf.photon_g0_vectors,

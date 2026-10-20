@@ -2523,6 +2523,23 @@ def _coulomb_on_wedge(V_full, *, sym, centroid_indices, meta):
     return op
 
 
+def screening_coulomb_view(V_q, *, meta, mesh_xy):
+    """Bare V at the exact physical coarse q, leaving fine-grid Fock V intact.
+
+    Point-body Coulomb only on differing grids (the early route gate refuses
+    3D cell-averaged bodies). The symmetry service unfolds only selected
+    fine-grid rows into a full coarse q carrier, with no host matrix gather.
+    """
+    if tuple(meta.qgrid) == tuple(meta.kgrid):
+        return V_q
+    from symmetry_maps import QirrOperator, bgw_integer_q_to_fractional
+    sym_q = meta.q_sym
+    values = QirrOperator.of(V_q).at_rows(sym_q.q_to_fine_full, mesh_xy=mesh_xy)
+    return replace(QirrOperator.whole_zone(values),
+                   q_irr_frac=bgw_integer_q_to_fractional(
+                       sym_q.q_irr_kgrid_int, meta.qgrid))
+
+
 def _finalize_vq_views(
         G0_all, V_q_raw, head_channel, meta, photon_g0_vectors, print_fn):
     """Produce the packed Coulomb operator and validate its physical invariants."""
@@ -3316,6 +3333,7 @@ def prepare_isdf_and_wavefunctions(
 	# the identity, so the full zone is not kept past this line.
 	V_qmunu = _coulomb_on_wedge(V_qmunu, sym=sym, centroid_indices=centroid_indices,
 	                            meta=meta)
+	V_q_screen = screening_coulomb_view(V_qmunu, meta=meta, mesh_xy=mesh_xy)
 	if green_parent_carrier is not None:
 		wfns = replace(wfns, green_parent=green_parent_carrier)
 	for family, bundle in (("charge", wfns), ("current", wfns_transverse)):
@@ -3337,6 +3355,8 @@ def prepare_isdf_and_wavefunctions(
 			wfns_transverse, transverse_basis_receipt))
 	return SimpleNamespace(
 		V_qmunu=V_qmunu,
+		V_q_screen=V_q_screen,
+		q_sym=meta.q_sym,
 		wf_bundle=wfns,
 		wf_bundle_transverse=wfns_transverse,
 		mu_bases=(meta.mu_basis, basis_T),
@@ -3409,11 +3429,84 @@ def coarse_class_for_deck(config, wfn, print0):
     return coarse
 
 
+def validate_qgrid_route(config, kgrid):
+    """Refuse unsupported mixed-grid physics before fitting any ISDF tensors.
+
+    ``kgrid`` is the electronic WFN grid. An omitted or exactly equal
+    ``config.qgrid`` leaves every legacy route unchanged.
+    """
+    from .gw_config import (ComputeMode, QPSolver, ScreeningDiagrams,
+                            coerce_screening_diagrams)
+    requested = getattr(config, "qgrid", None)
+    if requested is None or tuple(requested) == tuple(kgrid):
+        return
+    supported = (
+        not bool(config.bispinor)
+        and config.compute_mode == ComputeMode.MPA
+        and config.sigma.w_model == "shared_pole"
+        and coerce_screening_diagrams(config.screening.diagrams) == ScreeningDiagrams.W_RPA)
+    if not supported:
+        raise ValueError(
+            "GATE qgrid_route: qgrid different from the electronic kgrid is currently "
+            "supported only for scalar compute_mode=mpa, sigma_w_model=shared_pole, "
+            "screening_diagrams=w_rpa; omit qgrid or set it equal to kgrid for "
+            "the unchanged legacy routes")
+    if int(config.sys_dim) == 3 and bool(config.head.mc_average_vcoul_body):
+        raise ValueError(
+            "GATE qgrid_coulomb_cell: differing qgrid with 3D "
+            "mc_average_vcoul_body=true needs a separately averaged coarse-cell "
+            "Coulomb build; fine-cell V cannot be reused. Keep qgrid equal to "
+            "kgrid until that route is implemented; no flag is changed automatically")
+    if bool(getattr(config, "restart", False)):
+        raise ValueError(
+            "GATE qgrid_restart_input: differing qgrid requires restart=false; "
+            "legacy ISDF restart inputs also bind fine-grid W0. Import an "
+            "authenticated SC Hamiltonian through sc_initial_qp_rotations_file "
+            "instead of reusing that mixed-domain cache")
+    if (bool(getattr(config, "do_G0", True))
+            and str(getattr(config.head, "wcoul0_source", "s_tensor")) == "epshead"):
+        raise ValueError(
+            "GATE qgrid_epshead: epshead has no authenticated coarse-cell "
+            "response source; use wcoul0_source=s_tensor or do_G0=false")
+    if bool(getattr(config.head, "uses_bgw_metal_q0shift", False)):
+        raise ValueError(
+            "GATE qgrid_metal_shift: the BGW finite-q metal replacement is "
+            "not defined on the separate coarse bosonic cell")
+    if getattr(config, "occ_smearing_width_ry", None) is not None:
+        raise ValueError(
+            "GATE qgrid_metal_response: differing qgrid currently serves "
+            "insulating input only; explicit Fermi-Dirac pair response and "
+            "coarse Gamma-cell metal completion are not implemented")
+    if any(getattr(config.head, name, None) is not None
+           for name in ("vhead", "whead_0freq", "whead_imfreq")):
+        raise ValueError(
+            "GATE qgrid_head_override: manual vhead/whead overrides cannot "
+            "authenticate both the fine bare cell and coarse correlation cell; "
+            "remove the overrides rather than reusing a fine-cell number")
+    if bool(getattr(config, "write_restart_tensors", True)):
+        raise ValueError(
+            "GATE qgrid_restart_artifact: differing qgrid requires explicit "
+            "write_restart_tensors=false; the fine-electronic ISDF restart/BSE "
+            "bundle does not yet represent a separate coarse W0 q domain")
+    if bool(config.debug.write_wfn_h5):
+        raise ValueError(
+            "GATE qgrid_wfn_artifact: differing qgrid requires explicit "
+            "write_wfn_h5=false; the original WFN spatial reduction cannot "
+            "represent the generally nonsymmetric coarse-W QP state")
+    if (config.qp_solver == QPSolver.SELF_CONSISTENT
+            and config.qp_rotations_k_storage != "full"):
+        raise ValueError(
+            "GATE qgrid_qp_rotations: differing qgrid SC requires explicit "
+            "qp_rotations_k_storage=full; every fine-grid accepted state is "
+            "independent after the real-space response restriction")
+
+
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
     """Produce the physical and padded band windows on the packed centroid basis."""
     from common import Meta
     from .wavefunction_bundle import BandSlices
     from .gw_config import uses_four_spinor_finite_q_charge
+    validate_qgrid_route(config, wfn.kgrid)
     charge_bispinor = uses_four_spinor_finite_q_charge(
         config.bispinor, config.bispinor_gw)
     from common.centroid_basis import PackedCentroidBasis
@@ -3431,12 +3524,15 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
                             n_rmu, charge_bispinor,
                             nband_chi=config.bands.chi,
                             nband_sigma=config.bands.sigma,
-                            mesh_xy=mesh_xy, mu_basis=mu_basis)
+                            mesh_xy=mesh_xy, mu_basis=mu_basis,
+                            qgrid=getattr(config, "qgrid", None))
     meta.rank = jax.process_index()
     meta.n_proc = jax.process_count()
     meta.sys_dim = config.sys_dim
     meta.coarse_class = coarse
     meta.bispinor = charge_bispinor
+    meta.q_sym = (sym if tuple(meta.qgrid) == tuple(meta.kgrid) else
+                  sym.qgrid_view(meta.qgrid, kgrid=meta.kgrid))
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,
         b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)

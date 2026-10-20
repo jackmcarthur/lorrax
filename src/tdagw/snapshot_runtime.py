@@ -39,11 +39,23 @@ def prepare_native_source(source, mesh):
         raise ValueError("GATE td_native_parent_carrier: explicit full-grid parent faces required")
     kgrid = tuple(int(x) for x in meta.kgrid)
     nk = int(np.prod(kgrid))
+    qgrid = tuple(int(x) for x in (getattr(meta, "qgrid", None) or kgrid))
+    nq = int(np.prod(qgrid))
     rows = carrier.plan
     frac = np.asarray(rows.k_parent_frac, float)
     from gw.centroid_k_unfold import authenticate_canonical_full_grid
     qsym = source.get("screening_inputs", {}).get("kwargs", {}).get("sym", getattr(rows, "sym", None))
-    flat_grid = authenticate_canonical_full_grid(rows, kgrid, sym=qsym)
+    # A separate bosonic q view must not be mistaken for the electronic
+    # carrier's symmetry table. Authenticate both physical domains below.
+    flat_grid = authenticate_canonical_full_grid(
+        rows, kgrid, sym=qsym if qgrid == kgrid else getattr(rows, "sym", None))
+    if qgrid != kgrid:
+        if (qsym is None or any(k % q for k, q in zip(kgrid, qgrid))
+                or not np.array_equal(np.asarray(qsym.q_irr_full_idx), np.arange(nq))
+                or not np.array_equal(np.asarray(qsym.q_irr_kgrid_int),
+                                      np.indices(qgrid).reshape(3, -1).T)):
+            raise ValueError("GATE td_native_response_grid: canonical full coarse q domain required")
+        flat_grid.update(response_grid=list(qgrid), n_q=nq)
     if (frac.shape != (nk, 3) or not np.array_equal(np.asarray(rows.irr_idx), np.arange(nk))
             or (rows.parent_full_rows is not None and
                 not np.array_equal(np.asarray(rows.parent_full_rows), np.arange(nk)))):
@@ -71,7 +83,7 @@ def prepare_native_source(source, mesh):
         raise ValueError("GATE td_native_spin_weight: positive file spin multiplicities required")
     return dict(energy=np.asarray(gather_to_host(wfns.enk))[:, :nb],
         occupations=np.asarray(gather_to_host(wfns.occ))[:, :nb], k_frac=frac,
-        kgrid=kgrid, nk=nk, nb=nb, nb_chi=nb_chi, nb_sigma=nb_sigma,
+        kgrid=kgrid, nk=nk, qgrid=qgrid, nq=nq, nb=nb, nb_chi=nb_chi, nb_sigma=nb_sigma,
         mesh=mesh, nmu_logical=int(meta.n_rmu), spin_weight=2.0/(nspin*nspinor),
         psi=psi, V_q=V, head=source.get("head"),
         efermi_ry=float(source.get("efermi_ry") or 0.0), native_full_microscopic=True,
@@ -190,6 +202,9 @@ def prepare_projected_source(source, mesh, *, rank=8):
     plan = carrier.plan
     kgrid = tuple(int(x) for x in meta.kgrid)
     nk = int(np.prod(kgrid))
+    if tuple(getattr(meta, "qgrid", None) or kgrid) != kgrid:
+        raise ValueError("GATE td_projected_qgrid: the projected diagnostic does not "
+                         "implement the real-lattice cutoff; use the native microscopic route")
     k_frac = np.asarray(plan.k_parent_frac, float)
     irr = np.asarray(getattr(plan, "irr_idx", np.arange(nk)))
     if k_frac.shape != (nk, 3) or not np.array_equal(irr, np.arange(nk)):

@@ -39,6 +39,7 @@ def compute_q0_averages(
 	analytic_sphere: bool = False,
 	certificate_fn=None,
 	extra_chi=None,
+	qgrid=None,
 ):
 	"""Compute q=0 averages (vc0_mean, wcoul0) for the system's dimensionality.
 
@@ -72,6 +73,9 @@ def compute_q0_averages(
 	For a 3D metal at exactly zero frequency, ``static_kappa2`` selects the
 	Thomas-Fermi order of limits, ``<8*pi/(q^2+kappa_TF^2)>``.  It is mutually
 	exclusive with the finite-frequency ``S_cart`` representation.
+	``qgrid`` overrides only the interaction-cell geometry; the default is
+	the electronic cell (also used by bare exchange). Screened-head callers
+	pass ``meta.qgrid`` without changing the electronic transition sum.
 	"""
 	from .coulomb import get_kernel
 	kernel = get_kernel(getattr(meta, 'sys_dim', None))
@@ -84,6 +88,8 @@ def compute_q0_averages(
 				"extra_chi (the metallic finite-q intraband response) is "
 				"defined for the 3D bulk head only")
 		kwargs["extra_chi"] = extra_chi
+	if qgrid is not None:
+		kwargs["qgrid"] = tuple(qgrid)
 	return kernel.q0_average(
 		wfn, meta,
 		S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,
@@ -103,6 +109,7 @@ def compute_q0_averages_screened(
 	method: str = "auto",
 	qmc_reps: int = 10,
 	analytic_sphere: bool = False,
+	qgrid=None,
 ):
 	"""``compute_q0_averages(S_cart=S_i, extra_chi=chi_i)`` for every row on one draw.
 
@@ -119,7 +126,7 @@ def compute_q0_averages_screened(
 		return get_kernel(3).q0_average_screened(
 			wfn, meta, S_carts=S_carts, extra_chi_rows=extra_chi_rows,
 			nsamples=nsamples, method=method, qmc_reps=qmc_reps,
-			analytic_sphere=analytic_sphere)
+			analytic_sphere=analytic_sphere, **({} if qgrid is None else {"qgrid": tuple(qgrid)}))
 	if extra_chi_rows is not None:
 		raise NotImplementedError(
 			"extra_chi (the metallic finite-q intraband response) is "
@@ -127,6 +134,6 @@ def compute_q0_averages_screened(
 	rows = [compute_q0_averages(
 		wfn, jnp.asarray(0.0, dtype=jnp.float64), meta, S_cart=S,
 		nsamples=nsamples, method=method, qmc_reps=qmc_reps,
-		analytic_sphere=analytic_sphere)
+		analytic_sphere=analytic_sphere, qgrid=qgrid)
 		for S in S_carts]
 	return (rows[0][0] if rows else None), [w for _, w in rows]

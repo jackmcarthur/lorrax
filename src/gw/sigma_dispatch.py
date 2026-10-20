@@ -1670,7 +1670,8 @@ def _compute_mpa_sigma(
             efermi_ry=sigma_efermi_ry,
             occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
-            cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+            cell_volume=float(meta.cell_volume),
+            nk_tot=int(getattr(meta, "nq_tot", meta.nk_tot)))
     from .ppm_pipeline import observing_window_source, publish_window_source
     if (sigma_w_model == "shared_pole" and observing_window_source()
             and sector_handle.get("representation") != "sector-ordered-ph"):

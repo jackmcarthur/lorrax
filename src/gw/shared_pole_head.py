@@ -310,7 +310,29 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
                 value = evaluate(jnp.asarray(point, jnp.complex128), *args)
                 total = value[0]
             if response is None:
-                samples.append(head_resolver.at(point))
+                sample = head_resolver.at(point)
+                qgrid = getattr(meta, "qgrid", None)
+                if (qgrid is not None and tuple(qgrid) != tuple(meta.kgrid)
+                        and sample.response_kind.value != "override"):
+                    # HeadResolver's direct samples stay on the electronic
+                    # cell for bare exchange. Re-average the SAME optical S
+                    # on the bosonic cell for this W fit, without a second
+                    # electronic transition sum.
+                    if sample.S_cart is None:
+                        raise ValueError(
+                            "GATE shared_pole_head_qgrid: a changed bosonic "
+                            "cell requires the optical S tensor, not a "
+                            "scalar epshead from the electronic grid")
+                    from .vcoul import compute_q0_averages
+                    vc0, wc0 = compute_q0_averages(
+                        wfn, jnp.asarray(0.0, jnp.float64), meta,
+                        S_cart=sample.S_cart,
+                        analytic_sphere=bool(config.head.head_minibz_average),
+                        certificate_fn=getattr(head_resolver, "q0_certificate_fn", None),
+                        qgrid=qgrid)
+                    sample = dataclasses.replace(sample, vc0=complex(vc0), wcoul0=complex(wc0),
+                                                 source=sample.source + f" qgrid={qgrid}")
+                samples.append(sample)
             else:
                 terms.append(iteration_head_sample_terms(response, index, total,
                     meta=meta, config=config, mesh=mesh_xy))
@@ -344,6 +366,10 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
             model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
             solve=config.mpa.pole_solver, occupation_state=occupation_state)
     head.update(identity=handle["identity"], body_digest=handle["digest"], completion=True)
+    qgrid = getattr(meta, "qgrid", None)
+    if qgrid is not None and tuple(qgrid) != tuple(meta.kgrid):
+        head.update(qgrid=list(qgrid), electronic_grid=list(meta.kgrid),
+                    cell_policy="bosonic W cell; bare exchange retains electronic cell")
     iteration = IterationHeadSamples(omegas=points, samples=tuple(samples),
         sigma_energies_ry=np.asarray(wfns.enk[:, wfns.slices.sigma]),
         sigma_occupations=np.asarray(wfns.occ[:, wfns.slices.sigma]) if occupation_state is None else

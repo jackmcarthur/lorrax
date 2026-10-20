@@ -256,6 +256,92 @@ def make_flat_k_fftn(
                            norm=norm, out_spec=out_spec)
 
 
+def make_response_lattice_fftn(
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    qgrid: tuple[int, int, int] | None,
+    spec: P,
+) -> Callable:
+    """Restrict a response lattice product, then transform to the full q BZ.
+
+    The operand is ``(prod(kgrid), *trail)`` with a replicated lattice axis
+    and centroid-sharded trailing axes, specified in the usual three-axis
+    FFT vocabulary. Electronic Green transforms still use ``kgrid``.
+    ``qgrid`` must divide ``kgrid`` axis by axis. For a smaller even axis m,
+    retain |R| < m/2 with unit weight and R = +/-m/2 with half weight;
+    periodize the two boundary images into the one Nyquist slot. In several
+    dimensions the weights multiply. An odd axis retains |R| <= (m-1)/2.
+
+    Returns the unitary q-grid FFT times ``sqrt(Nq/Nk)``. Thus the existing
+    physical response prefactor ``spin_weight/sqrt(Nk)`` is unchanged. This
+    is an explicit lattice-window approximation, not fine-grid q selection,
+    and does not assert point-group or centroid-home-cell covariance.
+    A missing/equal q grid returns the legacy FFT callable, with no crop,
+    multiplication or changed arithmetic.
+    """
+    from itertools import product
+    import numpy as np
+    from ffi.fft import validate_flat_spec
+
+    def grid(value, name):
+        raw = np.asarray(value)
+        if (raw.shape != (3,) or not np.issubdtype(raw.dtype, np.integer)
+                or np.any(raw < 1)):
+            raise ValueError(f"GATE response_qgrid: {name} must be three positive integers")
+        return tuple(int(n) for n in raw)
+
+    source = grid(kgrid, "kgrid")
+    target = source if qgrid is None else grid(qgrid, "qgrid")
+    if any(n % m for n, m in zip(source, target)):
+        raise ValueError("GATE response_qgrid: qgrid must divide the electronic kgrid")
+    fft = make_flat_k_fftn(mesh, target, spec, norm="ortho")
+    if source == target:
+        return fft
+
+    flat_spec = validate_flat_spec(spec, "response lattice")
+    nk, nq = int(np.prod(source)), int(np.prod(target))
+    coordinates = np.indices(target).reshape(3, -1)
+    base, alternatives, boundary_axes = [], [], []
+    for axis, (n, m) in enumerate(zip(source, target)):
+        r = np.where(coordinates[axis] <= (m-1)//2,
+                     coordinates[axis], coordinates[axis]-m)
+        base.append(r % n)
+        alternatives.append(np.where(r == -(m//2), m//2, r) % n)
+        if m != n and m % 2 == 0:
+            boundary_axes.append(axis)
+    images, weights = [], []
+    for choice in product((0, 1), repeat=len(boundary_axes)):
+        rows = list(base)
+        weight = np.ones(nq)
+        for axis, alternate in zip(boundary_axes, choice):
+            boundary = coordinates[axis] == target[axis]//2
+            weight *= np.where(boundary, .5, 0. if alternate else 1.)
+            if alternate:
+                rows[axis] = alternatives[axis]
+        images.append(np.ravel_multi_index(tuple(rows), source).astype(np.int32))
+        weights.append(weight)
+    # Small static geometry, not closed-over process-local device arrays.
+    images, weights = np.stack(images), np.stack(weights)
+
+    def local(value):
+        if value.shape[0] != nk:
+            raise ValueError(f"response lattice expects {nk} electronic R rows, got {value.shape[0]}")
+        initial = jnp.zeros((nq, *value.shape[1:]), dtype=value.dtype)
+
+        def image(total, row):
+            indices, weight = row
+            selected = jnp.take(value, indices, axis=0)
+            return total + selected * weight.reshape((nq,) + (1,)*(value.ndim-1)), None
+
+        return jax.lax.scan(image, initial,
+                            (jnp.asarray(images), jnp.asarray(weights, dtype=value.real.dtype)))[0]
+
+    crop = shard_map(local, mesh=mesh, in_specs=(flat_spec,), out_specs=flat_spec,
+                     check_vma=False)
+    scale = float(np.sqrt(nq/nk))
+    return jax.jit(lambda value: fft(crop(value)) * scale)
+
+
 def make_local_flat_k_fftn(
     mesh: Mesh,
     kgrid: tuple[int, int, int],

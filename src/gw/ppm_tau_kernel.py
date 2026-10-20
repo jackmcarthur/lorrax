@@ -52,6 +52,29 @@ _sigma_shared_tau_kernel_cache: dict[
 _SIGMA_KCONV_TABLES: dict = {}
 
 
+def sigma_lattice_tile(value, kgrid, qgrid):
+    """Tile a unitary bosonic real-lattice transform onto the electronic grid.
+
+    ``value`` has shape ``(prod(qgrid), ...)`` with an unsharded leading
+    lattice axis. The result is ``(prod(kgrid), ...)`` on the same endpoint
+    shards. Multiplication by ``sqrt(Nk/Nq)`` makes the incumbent electronic
+    convolution's ``1/sqrt(Nk)`` exactly the coarse quadrature ``1/Nq``.
+    This is periodic tiling, NOT zero embedding or W interpolation.
+    """
+    kgrid, qgrid = tuple(map(int, kgrid)), tuple(map(int, qgrid))
+    if (len(kgrid) != 3 or len(qgrid) != 3 or min(*kgrid, *qgrid) < 1
+            or any(k % q for k, q in zip(kgrid, qgrid))):
+        raise ValueError("GATE sigma_qgrid: positive qgrid must divide the electronic kgrid")
+    if int(value.shape[0]) != int(np.prod(qgrid)):
+        raise ValueError("GATE sigma_qgrid: W lattice axis differs from its bosonic qgrid")
+    if qgrid == kgrid:
+        return value
+    coordinates = np.indices(kgrid).reshape(3, -1)
+    rows = np.ravel_multi_index(coordinates % np.asarray(qgrid)[:, None], qgrid)
+    return jnp.take(value, jnp.asarray(rows, jnp.int32), axis=0) * np.sqrt(
+        float(np.prod(kgrid)) / float(np.prod(qgrid)))
+
+
 def sigma_kconv_tables(mesh_xy: Mesh, k_unfold_plan):
     """The mode-7 Green kconv call's load tables on the devices, placed once per mesh and plan.
 
@@ -281,7 +304,7 @@ def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, 
 
 
 def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_extent,
-                          energy_windows, k_unfold_plan, q_wedge, static=False):
+                          energy_windows, k_unfold_plan, q_wedge, static=False, qgrid=None):
     """Σ_k(τ) for W(τ) on the q wedge, row pass by row pass (``gw.subtile_stream``).
 
         Σ_mn(k) = Σ_{μ ∈ passes} Σ_ν ψ*_m(μ) [G ⋆ W](k)_{μν} ψ_n(ν)
@@ -326,6 +349,12 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                                  window_tables)
 
     kgrid = tuple(int(v) for v in kgrid)
+    qgrid = kgrid if qgrid is None else tuple(int(v) for v in qgrid)
+    if (len(qgrid) != 3 or min(qgrid) < 1
+            or any(k % q for k, q in zip(kgrid, qgrid))):
+        raise ValueError("GATE sigma_qgrid: positive qgrid must divide the electronic kgrid")
+    if int(q_wedge.n_full) != int(np.prod(qgrid)):
+        raise ValueError("GATE sigma_qgrid: W unfold tables differ from the bosonic qgrid")
     nk = int(np.prod(kgrid))
     _, nb, n_rmu, ns = (int(v) for v in face_shape)
     nb_sig = nb if face_band_extent is None else int(face_band_extent)
@@ -350,7 +379,21 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     R, windows = plan_windows(local_rows, row_bytes, lambda: sorted(
         set(orbit_cuts(g_tables.lsrc, px, ns)) & set(orbit_cuts(w_tables.lsrc, px, 1))))
     whole = len(windows) == 1
-    kconv9 = make_kfft_klead_unfold(mesh_xy, kgrid, w_tables, norm="ortho")
+    kconv9 = make_kfft_klead_unfold(mesh_xy, qgrid, w_tables, norm="ortho")
+    # The host plan's gw_conv transforms W internally, so its mode-9 prep
+    # is in q space; the other routes prepare R space. Respect each router
+    # contract, adapting only the unequal-grid path through owner FFTs.
+    q_to_r = r_to_k = None
+    if qgrid != kgrid:
+        from ffi.fft import kconv_backend
+        from common.fft_helpers import make_flat_k_ifftn, make_flat_k_fftn
+        # FFT owners take the three-replicated-axis vocabulary even though
+        # the runtime lattice is stored on one explicit flat leading axis.
+        spec = P(None, None, None, "x", "y")
+        if kconv_backend(mesh_xy, qgrid) == "plan":
+            q_to_r = make_flat_k_ifftn(mesh_xy, qgrid, spec, norm="ortho")
+        if kconv_backend(mesh_xy, kgrid) == "plan":
+            r_to_k = make_flat_k_fftn(mesh_xy, kgrid, spec, norm="ortho")
     mult = -1.0 / np.sqrt(float(nk))
     # One window shape for every pass: the host tables give the k-convolution
     # its shapes, and each pass reads g_load's cut (subtile_stream.window_load).
@@ -429,6 +472,11 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
             # ``rows_live``: a padded window's live rows [lo, hi); the
             # k-convolutions skip the rest and return them zero.
             w_prep = kconv9(W, Wt, w_load, live=rows_live)
+            if q_to_r is not None:
+                w_prep = q_to_r(w_prep)
+            w_prep = sigma_lattice_tile(w_prep, kgrid, qgrid)
+            if r_to_k is not None:
+                w_prep = r_to_k(w_prep)
             faces = (jnp.conj(left), faces_right)
             out = []
             for b, (sel, band_range) in enumerate(zip(bracket_masks, bracket_ranges)):
@@ -488,6 +536,7 @@ def _get_sigma_kij_kernel(
     k_unfold_plan=None,
     q_wedge=None,
     static: bool = False,
+    qgrid=None,
 ) -> Callable[..., jax.Array]:
     """Build Green functions with band-range masks and contract each bracket against one prepared W.
 
@@ -505,18 +554,21 @@ def _get_sigma_kij_kernel(
         raise ValueError("Sigma tau requires canonical face shapes and a typed parent unfold plan.")
     if static and q_wedge is None:
         raise ValueError("Sigma static node: the interaction's q wedge is required")
+    qgrid = tuple(map(int, kgrid if qgrid is None else qgrid))
+    if qgrid != tuple(map(int, kgrid)) and (q_wedge is None or static):
+        raise ValueError("GATE sigma_qgrid: two-grid W requires the scalar dynamic q-wedge route")
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
-           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key(), bool(static))
+           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key(), bool(static), qgrid)
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     if q_wedge is not None:
         kernel, price = _sigma_subtile_kernel(
             mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets, face_shape=face_shape,
             face_band_extent=face_band_extent, energy_windows=energy_windows,
-            k_unfold_plan=k_unfold_plan, q_wedge=q_wedge, static=static)
+            k_unfold_plan=k_unfold_plan, q_wedge=q_wedge, static=static, qgrid=qgrid)
         _sigma_kij_kernel_cache[key] = kernel
         _SIGMA_PASS_PRICE[id(kernel)] = price
         return kernel

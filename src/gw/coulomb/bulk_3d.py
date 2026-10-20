@@ -44,10 +44,11 @@ class Bulk3D(vcoul.Bulk3D):
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
         extra_chi=None,
+        qgrid=None,
     ):
         return super().q0_average(
             CoulombGeometry.from_wfn(wfn),
-            (meta.nkx, meta.nky, meta.nkz),
+            ((meta.nkx, meta.nky, meta.nkz) if qgrid is None else tuple(qgrid)),
             S_cart=S_cart, epshead=epshead, static_kappa2=static_kappa2,
             nsamples=nsamples,
             method=method, qmc_reps=qmc_reps,
@@ -63,10 +64,11 @@ class Bulk3D(vcoul.Bulk3D):
         method: str = "sobol",
         qmc_reps: int = 10,
         analytic_sphere: bool = False,
+        qgrid=None,
     ):
         return super().q0_average_screened(
             CoulombGeometry.from_wfn(wfn),
-            (meta.nkx, meta.nky, meta.nkz),
+            ((meta.nkx, meta.nky, meta.nkz) if qgrid is None else tuple(qgrid)),
             S_carts=S_carts, extra_chi_rows=extra_chi_rows,
             nsamples=nsamples, method=method, qmc_reps=qmc_reps,
             analytic_sphere=analytic_sphere,

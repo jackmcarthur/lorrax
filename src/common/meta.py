@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import operator
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -64,6 +65,9 @@ class Meta:
     # The dynamic SC run's coarse (semicore) Σ read class
     # (gw.band_partition.CoarseClass), from the DFT ladder by gw_init; None elsewhere.
     coarse_class: object = None
+    # Bosonic χ/W grid. None preserves the electronic-grid calculation.
+    # The electronic kgrid/nk_tot and all wavefunction layouts stay unchanged.
+    qgrid: tuple | None = None
 
     @property
     def mu_solve_extent(self) -> int:
@@ -114,6 +118,20 @@ class Meta:
         self.kgrid = (self.nkx, self.nky, self.nkz)
         self.kgrid_np = np.asarray(self.kgrid, dtype=np.int32)
         self.kgrid_jax = jnp.asarray(self.kgrid_np)
+        try:
+            self.qgrid = (self.kgrid if self.qgrid is None else
+                          tuple(operator.index(n) for n in self.qgrid))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("qgrid must contain three positive integers") from exc
+        if (len(self.qgrid) != 3 or any(n <= 0 for n in self.qgrid)
+                or any(k % q != 0 for k, q in zip(self.kgrid, self.qgrid))):
+            raise ValueError(
+                f"qgrid={self.qgrid} must contain three positive divisors "
+                f"of the electronic kgrid={self.kgrid}; finer or "
+                "incommensurate bosonic grids are not supported")
+        self.nq_tot = int(np.prod(self.qgrid))
+        self.qgrid_np = np.asarray(self.qgrid, dtype=np.int32)
+        self.qgrid_jax = jnp.asarray(self.qgrid_np)
         self.fft_grid_np = np.asarray(self.fft_grid, dtype=np.int32)
         self.fft_grid_jax = jnp.asarray(self.fft_grid_np)
         b0, b1, b2, b3, b4 = (
@@ -149,6 +167,7 @@ class Meta:
         nband_sigma: int | None = None,
         mesh_xy=None,
         mu_basis=None,
+        qgrid=None,
     ):
         rank = jax.process_index()
         rank_topo = np.where(np.asarray(jax.devices()) == rank)
@@ -262,4 +281,5 @@ class Meta:
             b_id_4_chi=b_id_4_chi,
             b_id_4_sigma=b_id_4_sigma,
             mu_basis=mu_basis,
+            qgrid=qgrid,
         )
