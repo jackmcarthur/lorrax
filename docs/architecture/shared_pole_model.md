@@ -606,32 +606,55 @@ of $P^>-P^<$ using the native spin-traced momentum FFT product. Quadratic
 density terms cancel algebraically, but neither remaining insertion can be
 replaced by the stationary conjugation shortcut. Frozen-active virtual
 transitions remain. `response_bank.full_density_sample_rules` supplies
-sampled-error-checked shared complex-time nodes over the signed transition interval;
+scalar rules over each exact endpoint transition interval;
 `full_density_bare_moments` supplies the leading moments, including a
 possible nonzero $1/z$ coefficient. No sampled dense-frequency integral
 or fixed spatial Coulomb basis is introduced.
 
-The full-density scalar planner collectively gathers `ResponseGroupTree`
-attempts through the response-bank owner: all ranks receive identical node
-counts and bytes before entering collective FFTs. Before any Hankel pencil
-allocation or preparation it applies a conservative 4 GiB host workspace
-bound. Oversized groups first try the minimax owner's existing composite
-imaginary-time Gauss panels, shared across every sample in the group. The
-explicit capacity is 32 panels of at most 384 nodes; rejection splits the
-group, and no single-sample fallback can escape the bound. The ordinary
-value/derivative sampled-error and coefficient-mass tests are unchanged.
-This is a larger frequency quadrature, not a smaller physical band or
-centroid space; its Green-pair count is printed before streaming.
+The primary stream expands the exact coherent products into FF/FA/AF/AA,
+with separately weighted $\Psi\rho$ and $\Psi(I-\rho)$ endpoints. The numerical
+response group can contain more bands than the propagated window; added
+bands keep their actual original 0/1 density and current energies. Current
+global endpoint gaps, never band-index ordering, determine signed ranges.
+The identity $B(R,L;-\bar t)=\overline{B(L,R;t)}$ supplies both primitives
+from one product; replacing $-\bar t$ by $t$ is not valid. Endpoint masks
+enter the Green owner's phase selector, preventing unused deep-band
+exponentials from forming $0\times\infty$ without changing any live phase.
+
+Supports are grouped by actual height and noncrossing geometry. Noncrossing
+groups use the public continuum-checked `minimax.response_laplace_rule`;
+crossing groups use centered `minimax.response_bank_rule` real-time panels.
+The adapter certifies physical $d/d(z^2)$ chain factors and each support's
+own height normalization, not merely the minimum height. Both primitive
+signs and the original $10^{-8}$ scalar criterion remain. Every panel's
+polarization is summed before one Dyson solve. Small canonical rules cross
+ranks through the existing response-bank gather owner. The explicit limit
+is 32 carriers of at most 384 nodes per group; all physical bands/ports stay.
+The full signed unpaired stream remains an exact-moment/independent-oracle
+tool, with bounded shared-pencil planning, not an automatic production
+fallback when a block rule refuses. Node counts and output-node updates
+are reported separately; fewer carried outputs do not imply fewer Greens.
 
 Only scalar rules whose signed interval contains the current complete-band
 gap interval, with identical shifted support sites and tolerance, are held
-inside one Hamiltonian solve. A new interval uses the response owner's
-4 eV hold pad. Current phases, density insertions and W are recomputed.
+inside one Hamiltonian solve. New block intervals use at most the response
+owner's 4 eV hold pad, bounded by their own width and noncrossing margin.
+Current phases, density insertions and W are recomputed.
 The compiled response factory is keyed on topology, FFT dialect, shapes
 and moment powers; energies and the scalar reference are dynamic operands.
 Flushed phase starts and synchronized wall times distinguish planning,
 streaming, Dyson, directions, pencil assembly, host reduction, checks and
 persistence. No physics gate is inferred from these resource receipts.
+
+Each fitted parent checks its Laplace-growth margin before fitting the next
+batch. A refusal publishes collective-safe frequency-only E/A, canonical
+maps/spaces/poles, final-bank per-column residue norm bounds and sample/
+moment errors before raising. Optional frequency-only action Grams describe
+the **raw** reduced transfer, not the later self-negative crossing mixture.
+Independent microscopic Dyson probes near suspect poles distinguish fitting
+defects from evidence for gain; neither shifts poles nor admits a failed
+model. `stop_after_model_q=0` intentionally stops after this unadmitted
+partial diagnostic, with no full-q model or self-energy claim.
 
 The source GW recipe sets finite support sites and tangential direction
 widths. Its pole budget counts positive-frequency modes; the general

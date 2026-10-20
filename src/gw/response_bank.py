@@ -95,6 +95,41 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
                          sampled_error=rule['certificate']['maximum_bound'],coefficient_mass=mass,
                          construction='continuum_noncrossing_laplace')]
         groups = _gather_group_rules([request], build=remote)[0]
+    elif paired:
+        def crossing(members):
+            z=shifted[list(members)]
+            center=.5*(lo+hi)
+            points=np.concatenate((z-center,z+center))
+            # The public derivative is d/d(points²), whereas this owner
+            # reports d/d(z²). Certify the chain factor, never loosen it.
+            chain=abs(points/np.tile(z,2))
+            ratio=np.tile(z.imag,2)/float(np.min(z.imag))
+            requested=float(tolerance)/max(1.,float(np.max(ratio)),float(np.max(ratio**3*chain)))
+            rule=minimax.response_bank_rule(points,.5*(hi-lo),rel_tol=requested)
+            n=len(z);v=rule['projection_value'];dv=rule['projection_derivative']
+            value=np.stack((-1j*v[:n],1j*v[n:]),axis=1)
+            derivative=np.stack((-1j*dv[:n]*(points[:n]/z)[:,None],
+                                  1j*dv[n:]*(points[n:]/z)[:,None]),axis=1)
+            mass=np.stack((z.imag[:,None]*np.sum(abs(value),axis=-1),
+                           z.imag[:,None]**3*np.sum(abs(derivative),axis=-1)),axis=-1)
+            error=max(float(np.max(np.array(rule['certificate']['value_bound'])*ratio)),
+                      float(np.max(np.array(rule['certificate']['derivative_bound'])*ratio**3*chain)))
+            if (not np.isfinite(mass).all() or np.max(mass[...,0])>5000.
+                    or not np.isfinite(error) or error>tolerance):
+                raise ValueError('GATE response_full_density: crossing primitive certificate/mass')
+            if len(rule['t'])>32*384:
+                raise ValueError('GATE response_full_density: crossing rule exceeds 32 node carriers')
+            out=[]
+            for begin in range(0,len(rule['t']),384):
+                end=min(begin+384,len(rule['t']))
+                # Response-bank t is physical real time. The Green owner
+                # uses Laplace t=i*time and a real interval-centre reference.
+                out.append(dict(t=1j*rule['t'][begin:end],count=end-begin,
+                    value=-value[:,:,begin:end],members=list(members),reference_ry=center,
+                    sampled_error=error,coefficient_mass=mass,
+                    construction='continuum_crossing_real_time'))
+            return out
+        groups=_gather_group_rules([request],build=crossing)[0]
     else:
         tree = lambda members: minimax.ResponseGroupTree(lo, hi, shifted[list(members)],
             rel_tol=tolerance, panels=True, max_pencil_bytes=bound, max_panel_count=32)

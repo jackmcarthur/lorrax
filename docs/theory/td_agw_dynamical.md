@@ -24,7 +24,27 @@ equation of motion, integrators and layout are owned by
 [TD-aGW propagation](td_agw_propagation.md); the frozen-W kernel by
 [TD-aGW interaction](td_agw.md). Equations in Ry unless stated.
 
+The current full-microscopic snapshot contract is the
+[retarded reference](#retarded-reference): full instantaneous density and
+energies, column-sampled complex self-energy, and the material closure
+$H^s=h_{\rm HF}[\rho]+M_H[\rho,H^s]$. It does not subtract a reference
+collision source. Earlier carrier-only dressing and reference-subtracted
+formulas below describe the earlier members, not additional operations to
+apply to this closure. A DFT-prepared initial density is a preparation
+quench, not an asserted stationary full-frequency GW ground state.
+Implementation and small-matrix checks are not evidence that a material
+pole bank has been admitted or a physical trajectory completed; the
+[current numerical evidence](#full-microscopic-evidence) distinguishes them.
+
 ## 1. The scheme {#scheme}
+
+This opening reference-increment scheme and §1.1's carrier-only reference
+are retained to explain the earlier static/GN-PPM members. Their diagonal
+reference energies are those actually supplied by the run: DFT bundle
+energies when no `eqp_file` is set, QP energies otherwise. The label
+$\varepsilon^{\rm QP}$ below does not imply that the historical CrI3 516
+decks supplied QP energies. For the current full-microscopic member use
+§1.5's explicit material Hamiltonian and counterterm choice instead.
 
 The propagator integrates
 $i\dot\rho_k=[H_k(t),\rho_k]+\dots$ with
@@ -1812,6 +1832,54 @@ jumps by at most 13.8 meV at a refresh (3×10⁹ V/m; GN-PPM refreshed screening
 77 meV), the pole count stays K = 1761 and no gate refuses (V1).
 
 ## 8. Validation {#validation}
+
+### 8.1 Full-microscopic implementation evidence {#full-microscopic-evidence}
+
+The 20 October 2026 CrI3 516 proof used all 978 ISDF ports, all 36 q points,
+all 160 virtual bands, and the full coherent density in the four-band
+propagation window. Its input was a saved strong-drive snapshot at 9.5 fs
+from an earlier projected-model run, not a new full-microscopic trajectory
+or a converged material-Hamiltonian fixed point. The new screening
+evaluation itself used no spatial projection. At source tree
+`e58a455620e21903e8925271a0652c7a5da3b369` (commit `9021da7`), the model
+**refused before self-energy evaluation**: the q=0 rational fit contained
+a pole with growth 12.078764 Ry, above both the 0.1 eV collision evaluation
+height and the response supports. This is an unadmitted fitted pole, not
+evidence of physical gain or an unstable exact Dyson response. That run
+did not retain the failed pencil before refusal; it cannot support a
+retrospective pole-residue diagnosis or a damping claim.
+
+The measured single-node P4 phase walls were:
+
+| phase | seconds |
+|---|---:|
+| source preparation | 77.77 |
+| scalar response planning | 18.28 |
+| full-microscopic response stream | 302.44 |
+| Dyson solves | 3.41 |
+| direction selection | 7.99 |
+| pencil construction | 9.47 |
+| serial canonical host reductions | 700.17 |
+
+The stream evaluated 8162 Green pairs for 43 frequency targets. A separate
+five-second process sample found the rank-zero main thread actively using
+one CPU core while the other ranks waited; it did not find a collective
+deadlock. It does not establish the BLAS thread configuration for every
+phase. These measurements motivate exact response blocking and concurrent
+per-parent reductions, not a reduced spatial model or a relaxed pole gate.
+The allocation was released after refusal.
+
+The source, logs, failure receipt, accounting and process sample are
+preserved in
+`/home/jackm/mgkba_campaign_20261019/full_microscopic_v3_20261020/`.
+The earlier all-rank P4 hsuite pass belongs to source tree `507b2793`, not
+this final material-proof tree. Focused CPU oracles check the full complex
+branch algebra and tiny native builder; neither substitutes for admission
+of the full material model, self-energy convergence, or matched frozen-W
+and updated-W trajectories. No full-microscopic 10 fs damping result is
+established by this evidence.
+
+### 8.2 Acceptance checks and earlier-member evidence
 
 The corrected column-sampled MGKBA collision requires an independent dense
 positive-time or direct-resolvent reference with noncommuting $H_s$ and

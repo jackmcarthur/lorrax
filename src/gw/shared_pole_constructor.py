@@ -1,4 +1,4 @@
-"""Tangential Hermite/Ritz construction of physical shared real-pole W.
+"""Passive shared-real-pole and general ordered-pole constructors.
 
 The physical convention is W(s) = b (s - Lambda)^-1 b.H, s = z_Ry**2;
 S_m = 2 M_(2m+1).  Thus b has units Ry**(3/2), Lambda Ry**2, and
@@ -6,8 +6,10 @@ M1/M3 are physical moments in Ry**3/Ry**5, never bare chi coefficients.
 
 Sample matrices are consumed in bounded batches.  Only narrow direction,
 output and derivative-action panels survive to the pencil assembly.  Dense
-products and eigensolves are supplied by the resolved distrib_la operations;
-there is no local vendor or alternative eigensolver in this physics owner.
+products and eigensolves of the passive constructor use resolved distrib_la
+operations. The explicit general, non-Hermitian route instead gathers only
+its capacity-bounded reduced frequency pencil for canonical host SciPy/LAPACK
+reduction; microscopic port factors remain distributed.
 """
 
 from __future__ import annotations
