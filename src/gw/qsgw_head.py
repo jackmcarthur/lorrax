@@ -4700,7 +4700,7 @@ def build_dft_head_response(
         S_cell = S
         S = head_s_tensor_sharded(
             v_sum, jnp.pad(jnp.asarray(e_sum), ((0, 0), (0, pad))),
-            jnp.pad(jnp.asarray(f_sum), ((0, 0), (0, pad))), z,
+            jnp.pad(jnp.asarray(f_sum), ((0, 0), (0, pad))), nodes,
             mesh=mesh, nb_logical=nb_sum,
             cell_volume=float(meta.cell_volume), nk_tot=int(source.nk_sum),
             nspin=int(wfn.nspin), nspinor=normalization_nspinor,
