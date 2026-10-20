@@ -97,7 +97,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .shared_pole_directions import _sample_point
     from .shared_pole_execution import face_matmul
     from .shared_pole_pencil import general_tangential_pencil, tile_join, tile_block, join_vectors
-    from .shared_pole_constructor import general_pencil_batch_plan, collective_general_pencil_batch
+    from .shared_pole_constructor import (general_pencil_batch_plan, collective_general_pencil_batch,
+                                          general_pencil_workspace_bytes)
     from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
     from types import SimpleNamespace
     from file_io.shared_pole_store import write_general_shared_pole_model
@@ -150,11 +151,12 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # Geometry and selection are numerical spaces held only within this
     # physical refresh. Current census and scientific identity stay current.
     recipe = dict(fit_basis.setdefault("recipe", resolved), census=current_meta.shared_pole_census)
-    general_gates = dict(version="full-density-general-shared-pole-gates-v4",
+    general_gates = dict(version="full-density-general-shared-pole-gates-v5",
         source_policy_version=recipe.get("recipe_version", recipe.get("version")),
         scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
         eta_training_verification='active_span_3train_2interlaced_held_v1',
         numerical_spaces='two-sided-descriptor-svd',
+        eigensolver='current-descriptor-balanced-ordinary-geev',
         descriptor_rank_tolerance=float(recipe['bank_rule_tolerance']),
         full_microscopic_support=True, finite_density_and_residues=True,
         scalar_rule_tolerance=float(recipe["bank_rule_tolerance"]),
@@ -426,7 +428,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # explicit numerical admission bound, not a pole budget chosen to fit RAM.
     workspace = int(snapshot.get("host_workspace_bytes", 4*1024**3))
     nl, nr = map(int, E.shape[-2:])
-    host_price = 16*(16*nl*nr+12*min(nl, nr)**2)
+    host_price = general_pencil_workspace_bytes((nl,nr))
     if host_price > workspace:
         raise ValueError(f"GATE shared_general_capacity: reduced host pencil {nl}x{nr} "
                          f"needs {host_price}>{workspace} bytes before any host gather")

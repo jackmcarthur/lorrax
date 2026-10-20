@@ -83,3 +83,14 @@ they do not diagnose the material refusal without the actual capture.
 The report is created exclusively and updated atomically after the union
 SVD and each rank study. An interrupted report retains its explicit RUNNING
 status and completed studies, never a false completion/admission claim.
+
+benchmark_balanced_eig.py preserves the one-pencil ordinary-eigenvalue CPU
+experiment. It requires an existing QZ report (does NOT rerun QZ), records
+source/capture hashes, and compares raw descriptor-coordinate transfer only,
+not full-port W or Sigma. The recorded material experiment used CPU2 threads
+and an explicit120s external cap. Example:
+ timeout 120s env OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 python \
+   benchmark_balanced_eig.py <CAPTURE.NPZ> --qz-report <QZ_REPORT.JSON> \
+   --out <NEW_REPORT.JSON>
+This diagnostic assumes fresh E-SVD spaces. Production also rebalances the
+CURRENT projected E within held spaces; no branch silently reuses old phases.

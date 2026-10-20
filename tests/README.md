@@ -38,7 +38,8 @@ A new test needs no bootstrap import of its own.
 - `tdagw/test_collision_boundary_cpu.py`: global versus current-density
   empty/filled-subspace boundary diagnostics, with no state repair (CPU).
 - `tdagw/cri3_full_microscopic/`: archived full-native campaign preparation,
-  observation and plotting helpers; prepared, not a completed trajectory.
+  observation/plotting and bounded reduced-pencil timing helpers; prepared,
+  not a completed trajectory or model admission.
 - `tdagw/full_microscopic_saved_state.py`: P4 compute-node saved-state native
   proof. `--chi0-active LO:HI` selects a numerical response partition only;
   `--stop-after-model-q 0` retains a frequency-only diagnostic and never
