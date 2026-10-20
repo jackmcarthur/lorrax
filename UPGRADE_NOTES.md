@@ -51,7 +51,9 @@ cuSOLVERMp LU chunks `getrs` to the posted room.
   the conservative side and the selection eigh), and it binds the minimum-P line.
   After the landing gate (run30k, REPORT6) `spole.bank` 2.0x, `spole.moment_read` 2.2x and
   `spole.sample_batch_read` 1.6x are over too. (`bank.moment_batches`, 54.73 vs 10.36 GB, was a
-  closed-form batch tile booked beside its compiled dispatches; it books none now.) The
+  closed-form batch tile booked beside its compiled dispatches; it books none now. Its store
+  write rows still price each field as output + temporary + the live input, 4 x 4.5 GB for
+  M0..M3 at run30k against about 2.7 GB of measured staging.) The
   selection's `phase_dense_temporaries` (24 n^2/P per parent, 21.6 GB at run30k) duplicates
   the direction-SVD program, which should price it at the stack it runs. The
   native ncclMin agreement in the LU workspace query (B3) and the eigh memory change

@@ -721,7 +721,8 @@ def _check_bare_hermitian(mesh_xy, q0, receipt, **moments):
     24x24, n = 3328); the replicated ratios make every rank refuse alike.
     """
     from distrib_la import roundoff_tol
-    ratios = np.asarray(_anti_hermitian_ratios(mesh_xy)(*moments.values()), dtype=np.float64)
+    ratios = np.asarray(_run_priced(_anti_hermitian_ratios(mesh_xy), *moments.values(),
+                                    label="bare moment Hermiticity check"), dtype=np.float64)
     receipt["bare_anti_hermitian_max"] = max(float(np.nanmax(ratios, initial=0.0)),
                                              receipt.get("bare_anti_hermitian_max", 0.0))
     tol = roundoff_tol(next(iter(moments.values())).shape[-1])
@@ -1434,6 +1435,17 @@ def _moment_batch_major(mesh_xy, n_out, width, n_batch):
     return jax.jit(order, out_shardings=spec)
 
 
+def _run_priced(program, *args, label):
+    """Run ``program`` as the executable it books in the open section: its own temp and outputs
+    (``runtime.aot_memory.compiled_new_bytes``) beside the bytes in use, compiled once per signature."""
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+    from gw.shared_pole_execution import compiled_for
+    executable = compiled_for(program, args)
+    memory.book(memory.priced(compiled_new_bytes(executable), f"{label} (compiled)", increment=True))
+    return executable(*args)
+
+
 @lru_cache(maxsize=8)
 def _moment_batch_split(mesh_xy, n_out, rows):
     """One q batch's bank run ``[n_out, width, m, n]`` → its ``n_out`` totals ``[rows, m, n]``."""
@@ -1608,8 +1620,8 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                 with _moment_phase(receipt, "correlations"):
                     if runs is not None:
                         run = next(runs)
-                        totals = _moment_batch_split(mesh_xy, n_total, q1 - q0)(
-                            run if finish is None else finish(run))
+                        totals = _run_priced(_moment_batch_split(mesh_xy, n_total, q1 - q0),
+                                             run if finish is None else finish(run), label="moment batch split")
                         del run
                         a0, a1, o0, o1 = totals if ordered else (*totals, None, None)
                         del totals
