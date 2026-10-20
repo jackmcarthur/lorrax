@@ -67,6 +67,15 @@ __all__ = [
 
 
 NODE_SELECTION_VERSION = "centroid-nodes-orbit-nnls-loewdin-v1"
+
+#: Metric quality above which the fit warns.  Si 4^3 (36 fitted spinor
+#: bands, orbit-closed k-means, fit window 0:36): eps 0.37 / 0.12 / 1.6e-2 /
+#: 1.9e-3 / 1.0e-3 at 312 / 432 / 588 / 780 / 1100 nodes; off-grid DFT MAE
+#: 8.03 meV (max 62.7) at 312 nodes against 6.76 (max 27.4) at 780.
+NODE_METRIC_EPS_WARN = 1.0e-2
+#: Node count per fitted band that reached eps <= 1e-2 on Si 4^3 (780/36);
+#: MoS2 9x9 at 22.2 nodes per band (1198/54) reads eps 1.7e-2.
+NODES_PER_FITTED_BAND = 22
 _BASIS_FORMAT = 4
 _BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_nodal", "galerkin_loewdin")
 _BASIS_META = "galerkin_"
@@ -601,6 +610,14 @@ def fit_galerkin_basis(
         f"{eps:.3e}, {n_zero} zero-weight node(s); rank {rank_phys} (+"
         f"{carrier - rank_phys} pad); fit {seconds:.2f} s (sampling "
         f"{t_sample:.2f} s)")
+    if eps > NODE_METRIC_EPS_WARN:
+        log_fn(
+            f"  [warn] nodal metric eps {eps:.3e} > {NODE_METRIC_EPS_WARN:.0e}: "
+            "the Loewdin frame mixes window-edge states and the off-grid "
+            "error grows.  Use an orbit-closed k-means set with N_node >= "
+            f"{NODES_PER_FITTED_BAND} x {nb} fitted bands = "
+            f"{NODES_PER_FITTED_BAND * nb} (centroid.kmeans_cli --orbit "
+            f"--fit-window 0:{nb},0:{nb}); this set has {n_mu}.")
     basis = GalerkinBasis(
         ctilde=ctilde,
         basis_at_nodes=_centroid_nodes(idx, nodal, meta=meta, wfn=wfn,
