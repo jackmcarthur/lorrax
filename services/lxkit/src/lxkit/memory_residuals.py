@@ -44,7 +44,7 @@ def rows(trace: dict) -> list:
     tol = max(0.02 * limit, 0.25 * GB)
     best, ran = {}, {}
     for s in trace["sections"]:
-        for c in s.get("runs", s["compiles"]):
+        for c in s["runs"] if "runs" in s else s["compiles"]:
             ran[s["name"]] = max(ran.get(s["name"], 0), c["temp"] + c["output"] - c["alias"])
     for s in trace["sections"]:
         live = float(s["open"]["live"])

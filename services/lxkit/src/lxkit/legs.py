@@ -113,7 +113,7 @@ class PlatformLeg:
     runtime_env_defaults: tuple = ()
     #: Bytes a process may hold outside the allocator at ``linalg = local`` (context,
     #: modules, XLA's communicators, FFT plans): the measured maximum with its margin
-    #: (``lxkit.memory.outside_allowance``; provenance on each leg).
+    #: (``lxkit.memory.resolve``; provenance on each leg).
     outside_allowance: float = 3.6e9
     #: The allocator's fragmentation reserve, a fraction of its limit, that the planning
     #: budget leaves free (``lxkit.memory.resolve``; provenance on each leg).
