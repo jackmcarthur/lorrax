@@ -301,18 +301,17 @@ def test_native_stationary_sector_basis_and_selfcrossing_closure_are_structural(
     np.testing.assert_allclose(np.linalg.eigvals(mr).imag,-gamma,atol=3e-12)
 
 
-def test_binary_reserved_catalogue_refuses_without_silently_removing_Kzero_rows():
+def test_binary_reserved_catalogue_retains_Kzero_rows_in_held_basis():
     _,psi,energy,rho,partners=_case();rho[:]=np.diag([1.,1.,0.,0.])
     bridge,cat,_=_bridge(_mesh(),psi,energy,rho,partners[0])
-    # Reservation retains same-filled active coordinates for a later
-    # coherent state. The internal stationary initializer does not yet
-    # support those K=0 rows and must not silently shrink the held catalogue.
     assert cat["receipt"]["coherent_reservation"]==[1,3]
     original=cat["valid"].copy()
     seed=np.ones((1,*cat["valid"].shape),complex)
-    with pytest.raises(ValueError,match="transition_sectors.*exact live catalogue"):
-        owner.transition_basis(bridge,[seed],cat,rho,capacity=4,
-            rank_tolerance=1e-10,max_block_size=1)
+    basis,receipt=owner.transition_basis(bridge,[seed],cat,rho,capacity=4,
+        rank_tolerance=1e-10,max_block_size=1)
+    assert receipt["order"]==3  # independent -1,0,+1 states, not only live +/-
+    weighted=bridge["K"](basis,rho,cat["kmq"],cat["b"],cat["d"],cat["valid"])
+    assert np.count_nonzero(np.linalg.norm(np.asarray(weighted).reshape(3,-1),axis=1)==0)==1
     np.testing.assert_array_equal(cat["valid"],original)
 
 
@@ -337,3 +336,86 @@ def test_native_parent_model_retains_true_inverted_growth_without_pole_projectio
     literal_p=ordered_pr(psi,energy,rho,np.arange(nk),[pole],gamma,spin_weight=2.)[0]
     epsilon=np.eye(nmu)-np.asarray(v)@literal_p
     assert np.linalg.svd(epsilon,compute_uv=False)[-1]<3e-13
+
+
+def test_exact_dark_Jordan_reduction_retains_held_states_and_future_coherence_uses_full_generator():
+    mesh=_mesh();nk,nb,ns,nmu=8,4,1,2
+    psi=np.ones((nk,nb,ns,nmu),complex)
+    energy=np.broadcast_to(np.array([0.,1.,2.5,3.7]),(nk,nb)).copy()
+    rho=np.broadcast_to(np.diag([1.,0.,0.,0.]),(nk,nb,nb)).astype(complex).copy()
+    coords=np.stack(np.unravel_index(np.arange(nk),(4,2,1)),axis=-1)
+    partners=[]
+    for q in [np.array([1,0,0]),np.array([3,0,0])]:
+        p=(coords-q)%np.array([4,2,1]);partners.append(np.ravel_multi_index(tuple(p.T),(4,2,1)))
+    cat=owner.transition_catalogue(energy,rho,partners[0],coherent_slice=slice(0,3),pair_tile=2)
+    bridge=owner.make_transition_bridge(mesh,psi.shape,cat["b"].shape[1],
+        normalization=owner.physical_transition_normalization(nk,1,1),pair_tile=2)
+    t=bridge["vertex"](psi,cat["kmq"],cat["b"],cat["d"],cat["valid"])
+    q=np.zeros((2,*cat["valid"].shape),complex)
+    live=np.flatnonzero(cat["valid"][0]&(cat["b"][0]==1)&(cat["d"][0]==0))[0]
+    dark=np.flatnonzero(cat["valid"][0]&(cat["b"][0]==2)&(cat["d"][0]==1))[0]
+    q[0,0,live]=1;q[1,0,dark]=1
+    basis=jax.device_put(q,bridge["state_sharding"]);saved=np.asarray(basis).copy()
+    v=jax.device_put(np.eye(nmu,dtype=complex),NamedSharding(mesh,P("x","y")));gamma=.04
+    model=owner.transition_parent_model(bridge,t,cat,energy,rho,v,basis,gamma,max_block_size=1)
+    full=np.asarray(model["projected_generator"])
+    np.testing.assert_allclose(full,[[1.5-1j*gamma,0],[.5,1.5-1j*gamma]],atol=3e-15)
+    # This FULL projected generator is genuinely defective: diagonalizing
+    # it is unnecessary because its lower dark block is exactly unobservable.
+    assert np.linalg.matrix_rank(full-(1.5-1j*gamma)*np.eye(2),tol=1e-12)==1
+    assert model["count"]==1
+    assert model["receipt"]["held_order"]==2
+    assert model["receipt"]["exact_dark_certificate"]
+    assert model["receipt"]["exact_dark_Kzero_indices"]==[1]
+    ar,br,_,_=_reduced_from_native(bridge,cat,t,basis,energy,rho,np.asarray(v),gamma)
+    def factor_response(m,z):
+        n=m["count"];l=np.asarray(m["left"])[0,:,:n];r=np.asarray(m["right"])[0,:,:n]
+        return (l/(z-m["poles_ry"][:n]))@r.conj().T
+    for z in [.2+.3j,1.7+.4j,-.6+.2j]:
+        exact=np.asarray(v)@ar@np.linalg.solve(z*np.eye(2)-full,br.conj().T@np.asarray(v))
+        np.testing.assert_allclose(factor_response(model,z),exact,rtol=3e-13,atol=3e-14)
+    np.testing.assert_array_equal(basis,saved)
+    # A later physical coherent projector activates the retained Q0 row.
+    # It MUST restore the full generator rather than reuse the dark deletion.
+    angle=.23;u=np.eye(nb,dtype=complex)
+    u[0,0]=u[2,2]=np.cos(angle);u[0,2]=u[2,0]=1j*np.sin(angle)
+    current=np.broadcast_to(u@rho[0]@u.conj().T,rho.shape).copy()
+    coherent=owner.transition_parent_model(bridge,t,cat,energy,current,v,basis,gamma,max_block_size=1)
+    assert coherent["count"]==2
+    assert not coherent["receipt"]["exact_dark_certificate"]
+    assert coherent["receipt"]["exact_dark_Kzero_indices"]==[]
+    ac,bc,_,mc=_reduced_from_native(bridge,cat,t,basis,energy,current,np.asarray(v),gamma)
+    for z in [.2+.4j,-.7+.3j]:
+        exact=np.asarray(v)@ac@np.linalg.solve(z*np.eye(2)-mc,bc.conj().T@np.asarray(v))
+        np.testing.assert_allclose(factor_response(coherent,z),exact,rtol=2e-12,atol=3e-14)
+    reverse_cat=owner.transition_catalogue(energy,current,partners[1],coherent_slice=slice(0,3),pair_tile=2)
+    crossing=owner.transition_crossing_map(cat,reverse_cat)
+    reverse_t=bridge["vertex"](psi,reverse_cat["kmq"],reverse_cat["b"],reverse_cat["d"],reverse_cat["valid"])
+    reverse_basis=bridge["cross"](basis,crossing,reverse_cat["valid"])
+    reverse_model=owner.transition_parent_model(bridge,reverse_t,reverse_cat,energy,current,v,reverse_basis,gamma,max_block_size=1)
+    assert reverse_model["count"]==2
+    for z in [.2+.4j,-.7+.3j]:
+        np.testing.assert_allclose(factor_response(reverse_model,z),
+            factor_response(coherent,-z.conjugate()).conj(),rtol=3e-12,atol=3e-14)
+
+
+def test_entirely_Kzero_reserved_basis_has_exact_zero_transfer_without_eigensolve(monkeypatch):
+    from gw import shared_pole_constructor
+    _,psi,energy,rho,partners=_case();rho[:]=np.eye(4);mesh=_mesh()
+    cat=owner.transition_catalogue(energy,rho,partners[0],coherent_slice=slice(0,4),pair_tile=4)
+    bridge=owner.make_transition_bridge(mesh,psi.shape,cat["b"].shape[1],
+        normalization=owner.physical_transition_normalization(8,1,2),pair_tile=4)
+    t=bridge["vertex"](psi,cat["kmq"],cat["b"],cat["d"],cat["valid"])
+    q=np.zeros((2,*cat["valid"].shape),complex);q[0,0,0]=1;q[1,1,1]=1
+    basis=jax.device_put(q,bridge["state_sharding"])
+    v=jax.device_put(np.eye(4,dtype=complex),NamedSharding(mesh,P("x","y")))
+    def forbidden(*args,**kwargs):
+        raise AssertionError("exact dark zero transfer entered eigensolver")
+    monkeypatch.setattr(shared_pole_constructor,"collective_general_pencil",forbidden)
+    model=owner.transition_parent_model(bridge,t,cat,energy,rho,v,basis,.04,max_block_size=1)
+    assert model["count"]==0
+    assert model["receipt"]["held_order"]==2
+    assert model["receipt"]["exact_dark_certificate"]
+    np.testing.assert_array_equal(model["left"],0)
+    np.testing.assert_array_equal(model["right"],0)
+    np.testing.assert_array_equal(basis,q)
