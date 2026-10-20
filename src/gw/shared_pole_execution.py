@@ -608,12 +608,12 @@ def _face_price(mesh, rows, width, side, phase, **terms):
 
 def face_round_compiled_bytes(mesh, width, *, rows, finite, infinity_width, infinities, ordered,
                               odd_moments, keep_budget, carrier, eigh_backend, room):
-    """Per-rank bytes of ``face_parent_program`` for ``width`` parents, compiled (temp + outputs
-    - alias; never run) at abstract operands of the round's layout: ``finite`` packed columns of
+    """Per-rank bytes of ``face_parent_program`` for ``width`` parents, compiled
+    (``compiled_new_bytes``, the largest any rank read; never run) at abstract operands of the round's layout: ``finite`` packed columns of
     ``rows`` rows (Q, WQ, dWQ on the face), ``infinities`` infinity panels of ``infinity_width``,
     the pencil side ``finite`` plus the infinity block, its eighs decided in ``room``."""
     import jax
-    from runtime.aot_memory import compiled_new_bytes
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     block = (2 * int(infinity_width) if odd_moments else 0) if ordered else int(infinity_width)
     side, b, n = int(finite) + block, int(width), int(rows)
@@ -624,7 +624,7 @@ def face_round_compiled_bytes(mesh, width, *, rows, finite, infinity_width, infi
     plan = face_eigh(mesh, side, room=room, backend=eigh_backend)
     program = face_parent_program(mesh, bool(ordered), bool(odd_moments), keep_budget, False, side,
                                   None, plan, None if carrier is None else int(carrier), plan_room(plan))
-    return int(compiled_new_bytes(program.checked(*args).compiled(*args)[0]))
+    return -agreed_chunk(-compiled_new_bytes(program.checked(*args).compiled(*args)[0]))
 
 
 def face_reduction_bytes(mesh, width, *, rows, side, carrier, retain_span=False):
