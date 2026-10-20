@@ -126,7 +126,8 @@ def main():
     parser.add_argument("--out", required=True, help="fresh original-runner output directory")
     parser.add_argument("--log-prefix", required=True, help="fresh shared parent/rank JSONL prefix")
     parser.add_argument("--wall-cap", type=float, default=480.)
-    parser.add_argument("--stack-after", type=float, default=120.)
+    parser.add_argument("--stack-after", type=float, default=86400.,
+                        help="archived runner requires >0; default exceeds the <=2h wrapper cap")
     args = parser.parse_args()
     if not 0 < args.wall_cap <= 7200 or args.stack_after <= 0:
         parser.error("positive wall cap <=7200 seconds and stack interval required")

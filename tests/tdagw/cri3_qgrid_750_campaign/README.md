@@ -12,8 +12,24 @@ protected U, original-basis input H and small centroid/k provenance, never
 retaining spatial faces. A reference is ready only when a proper converged
 solver returns that exact input H and the native driver subsequently completes.
 Budget-ended and one-map results are never promoted to converged references.
-The campaign's original external copy ran with source `1134957`; changing
-these backup tests does not alter its recorded source/helper hashes.
+The campaign's original external copy ran with source `1134957`. This
+repository helper is now a SAFER variant, not byte-identical to archived
+runner SHA `31f545b6…`: periodic Python traceback walking defaults OFF
+(`--stack-after 0`), and its wall watchdog emits a marker and exits without
+walking Python frames. An explicit positive interval opts back into periodic
+walking. Fatal handlers and external GDB remain unchanged. Job 60052556
+captured a real SIGSEGV in CPython's `faulthandler_thread -> dump_frame`;
+that fault must not be mislabeled a constructor eigensolver failure.
+Changing this repository copy does not alter archived or running payloads.
+
+The preserved diagnostic wrappers intentionally authenticate the ORIGINAL
+archived runner SHA `31f545b6…`; they cannot use this safer repository helper
+without a separately reviewed hash change. Their repository defaults now
+pass `--stack-after 86400`, beyond their maximum two-hour process cap, because
+the archived runner accepts only positive intervals. These changed wrapper
+hashes are not the hashes of earlier actual launches. An explicit launch
+argument still controls the recorded run. The active external corrected
+launch already passes 86400 and is not modified here.
 
 `native_frozen_map_probe.py` is a prepared, **not yet hardware-verified**
 same-input q8/q4 probe. Its scope is full64 electronic rows, 750 bands and a
@@ -36,3 +52,13 @@ The current probe reports full microscopic W comparison and reproduction of
 the original accepted fine Sigma as **NOT_MEASURED**. Band-operator differences
 alone are not a cutoff-convergence certificate. Neither helper weakens a
 scientific gate, clips populations/poles, or substitutes a projected W model.
+
+`inputs/` preserves the corrected protected-form q8 deck (SHA `534a2c24…`)
+and a prepared q4 deck (SHA `1712d907…`) with a deliberately absent
+`seed_from_accepted_q8` path. The q4 seed can be staged only after the genuine
+q8 terminal artifact, accepted input and completed driver are authenticated.
+`evidence/` preserves the small header-only native guard (SHA `c697f567…`)
+and the pending q4 handoff plan. These are input/provenance checks, not
+converged SC results. `diagnostics/README.txt` records the actual fault-time
+CPython stack, selector-policy correction, and explicitly partial progress
+of corrected run 60053348; no current intermediate map is a reference.

@@ -1,0 +1,39 @@
+{
+  "status": "PREPARED_PENDING_CONVERGED_Q8_NOT_RUN",
+  "deck": "corrected_protected160_750_q4_from_accepted_q8.in",
+  "deck_sha256": "1712d907f1468a518afe8c8a4fdd17b7d7909392fbd97e22c6e7d11996b9c299",
+  "electronic_grid": [8, 8, 1],
+  "qgrid": [4, 4, 1],
+  "logical_band_sums": [750, 750],
+  "protected_band_request": 160,
+  "resolved_dipole_counts": [130, 30],
+  "centroid_count": 3000,
+  "native_SC": {
+    "max_iter": 30,
+    "tol_ev": 0.001,
+    "semicore": "dft",
+    "density_self_consistent": true,
+    "head": "full+dft_velocity",
+    "estimator": "spectral_shell",
+    "fresh_Anderson": true,
+    "input_tail": "native warm import intentionally regenerates N750 tail; not exact frozen-state replay"
+  },
+  "seed": {
+    "relative_path": "seed_from_accepted_q8/qp_wfn_rotations.h5",
+    "present": false,
+    "sha256": null,
+    "required_source": "terminal accepted-input q8 artifact from corrected protected-form proper SC, not sc_seed/map output",
+    "required_driver_reference_ready": true,
+    "required_solver_status": "CONVERGED_ACCEPTED_INPUT",
+    "required_solver_flags": ["accepted_input_join", "proper_sc_requested", "native_converged"],
+    "required_original_WFN_fingerprint": "23ef46e99bfd6217b5acf161b0e0d5c0f9d267566f0252fe1a51755302d10db7",
+    "required_artifact_band_range": [0, 160],
+    "required_full_krows": 64,
+    "required_frame_join": "artifact U diag(E) U^H agrees with authenticated accepted q8 input-H on typed loop/full rows",
+    "forbidden_sources": ["original 898 warm guess", "60052556 wrong-policy map output", "any unjoined or nonconverged map-output seed"]
+  },
+  "capacity": "native actual-program/provider admission required; no budget waiver or allocation requested by this file",
+  "reuse": "no W bank, SC history, mutable scratch or stale tail is implicitly copied",
+  "comparison": "q4 proper SC is a new self-consistent closure; use same-state q8/q4 probe separately to isolate cutoff effects",
+  "parser_proof_scope": "local CPU native-config resolution only, not remote data/provenance/provider validation"
+}

@@ -129,6 +129,83 @@ def test_unknown_or_different_final_input_cannot_be_converged():
     assert result["accepted_input_join"] is False
 
 
+@pytest.mark.parametrize("interval,scheduled", [(None, False), ("0", False), ("15", True)])
+def test_stack_timer_is_opt_in_and_wall_guard_never_walks_frames(tmp_path, monkeypatch,
+                                                               interval, scheduled):
+    """Stop before native imports; invoke only the host watchdog with mocks."""
+    calls, threads = [], []
+
+    class BootstrapReached(Exception):
+        pass
+
+    def mark(phase, **fields):
+        calls.append((phase, fields))
+        if phase == "native_driver_import_begin":
+            raise BootstrapReached
+
+    def forbidden_frame_walk(*args, **kwargs):
+        raise AssertionError("wall watchdog must not walk Python frames")
+
+    def exit_process(code):
+        raise SystemExit(code)
+
+    class FakeThread:
+        def __init__(self, *, target, **kwargs):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(helper, "mark", mark)
+    monkeypatch.setattr(helper.threading, "Thread", FakeThread)
+    monkeypatch.setattr(helper.threading, "Event", lambda: NS(wait=lambda _: False))
+    monkeypatch.setattr(helper.os, "_exit", exit_process)
+    monkeypatch.setattr(helper, "faulthandler", NS(
+        enable=lambda **kw: calls.append(("enable", kw)),
+        dump_traceback_later=lambda *a, **kw: calls.append(("timer", (a, kw))),
+        dump_traceback=forbidden_frame_walk))
+    argv = ["--source", str(tmp_path), "--source-revision", "test-only",
+            "--deck", str(tmp_path / "not-read.in"), "--out", str(tmp_path / "fresh")]
+    if interval is not None:
+        argv.extend(["--stack-after", interval])
+    with pytest.raises(BootstrapReached):
+        helper.main(argv)
+    timer_calls = [row for row in calls if row[0] == "timer"]
+    assert bool(timer_calls) is scheduled
+    if scheduled:
+        assert timer_calls == [("timer", ((15.,), {"repeat": True}))]
+    with pytest.raises(SystemExit) as stopped:
+        threads[0].target()
+    assert stopped.value.code == 124
+    assert calls[-1][0] == "reference_wall_stop"
+
+
+@pytest.mark.parametrize("interval", ["-1", "nan", "inf"])
+def test_invalid_stack_interval_refuses_before_imports(tmp_path, interval):
+    with pytest.raises(SystemExit) as stopped:
+        helper.main(["--source", str(tmp_path), "--source-revision", "test-only",
+                     "--deck", "unused", "--out", str(tmp_path / "fresh"),
+                     "--stack-after", interval])
+    assert stopped.value.code == 2
+
+
+@pytest.mark.parametrize("name", ["debug_sc_first_map_native.py",
+                                 "debug_sc_protected160_native.py"])
+def test_archived_runner_wrapper_timer_default_exceeds_process_cap(name):
+    """Inspect stdlib-only CLI source; do not import/initialize a GPU driver."""
+    import ast
+    path = Path(__file__).with_name("diagnostics") / name
+    tree = ast.parse(path.read_text())
+    defaults = [kw.value.value for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "--stack-after"
+                for kw in node.keywords if kw.arg == "default"]
+    assert defaults == [86400.]
+    assert 'RUNNER_SHA256 = "31f545b6' in path.read_text()
+
+
 def test_real_native_metadata_contract_without_wavefunction_faces(tmp_path):
     """Real config/basis/SCInputs/fingerprint types; no native numerical stage."""
     import jax

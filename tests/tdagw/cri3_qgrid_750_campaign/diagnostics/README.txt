@@ -96,26 +96,55 @@ shows first h_vv eigensolve route/price compilation (_stack_bytes), not
 proof of gathered fallback execution. A follow-up stack-route reproducer
 needs its exact batch/round metadata; do not guess those from parent count.
 
-Separate actual-material replay: RUNNING 60052556, no result claimed
------------------------------------------------------------------
+Separate actual-material replay: 60052556 fault evidence
+------------------------------------------------------
 debug_sc_first_map_native.py and p16_material_gdb_v2.commands preserve the
 reviewed external payload for the actual N750, electronic 8 x 8 / q8
 proper-SC replay. This is NOT another synthetic gathered-eigh test and
-does not inherit that test's PASS. Ops owns job 60052556; its pending
-first-map/SC outcome must be read from that job's own evidence.
+does not inherit that test's PASS. Its first W constructor and first map
+completed, but step 60052556.0 then faulted during map 1. GDB captured
+SIGSEGV in CPython dump_frame -> dump_traceback -> _Py_DumpTracebackThreads
+-> faulthandler_thread. This identifies the immediate faulting path, not
+proof that no earlier memory corruption exists. No converged SC reference
+was obtained. Consult this step's own evidence, not the synthetic result.
 
 This replay pins original source 1134957c6e63d3d5c8ac141799e0eb17e9423233
-and the exact original q8-v2 physical input deck, not a modified solver:
+and the actual explicit-count q8-v2 input deck, not a modified solver:
   deck SHA256
     8e6df25ebfce57a3dbbc7055cdd4f8c37def5a5e76a1c8b15d42f457bb1c00bf
   original run_sc_reference_frames.py SHA256
     31f545b6d5a58d7c8c5d053249f8967dc607191cc8d2684a8ff094117b4a3e3b
-  debug wrapper SHA256
+  actually launched external debug wrapper SHA256
     d734585e3bca8e68ae01cea8a811f1f63a9aebc82e00cfd47ea2f3e54535f0e5
   enhanced GDB commands SHA256
     c7cc6c95c73218242d904a94c00c626c733a7f228b7339a9898b1e79670a58b3
 The wrapper also recognizes reviewed source a0 for a separately pinned
 replay; that does not change which source this job actually launched.
+
+Actual fault-time GDB evidence is in external material_sc113_60052556.rank8.log
+(around line 2780; full downloaded log SHA256
+15a7354d05286a470f1dd6fc42ac1f4f1d40eb0641aec6274e6990740aed9295):
+  Thread 98 "python" received signal SIGSEGV
+  #0 dump_frame
+  #1 dump_traceback
+  #2 _Py_DumpTracebackThreads
+  #3 faulthandler_thread
+  #4 pythread_wrapper.llvm
+The first W construction had already completed (143.767 s), as had native
+map 0. The immediate faulting call was a periodic Python traceback walk,
+not the earlier sampled constructor stack. Removing that timer is a scoped
+instrumentation correction; it does not prove every native solver/value is
+correct, nor establish the cause of the older untraced 60050061 failure.
+
+The explicit-count deck also had a separate scientific selector error:
+nval=130/ncond=30 and number_bands_protected=160 resolve to the same M160,
+but NOT the same semicore class. band_partition.semicore_floor uses the
+lowest explicitly requested valence band in the first form (no coarse
+class when all occupied bands are requested), and the gap rule in the
+protected form. The explicit run reported zero coarse states and allowed
+deep shifts up to 29.113 eV; the intended protected form pins 880 coarse
+(k,label) entries. This was not evidence that the band-tail correction
+alone caused a 29 eV shift. Do not relabel the two decks identical physics.
 
 Every rank durably appends its own JSONL before/after the original host
 pricing/compilation functions. Static metadata includes the exact op,
@@ -136,6 +165,58 @@ use the exact last durable BEGIN and GDB fault backtrace. Enhanced GDB
 captures the stopped fault thread's bt 60, registers and shared libraries
 before all-thread bt 20. Repeated faulthandler timeout stacks remain
 sampled timeout stacks, not fault-time native backtraces.
+
+Safer repository copies, distinct from actual archived launch hashes
+------------------------------------------------------------------
+The repository run_sc_reference_frames.py defaults --stack-after to 0/off,
+allows nonnegative intervals, and its wall watchdog marks/exits without a
+Python frame walk. Fatal handlers and GDB remain unchanged. This is NOT
+byte-identical to archived runner SHA 31f545b6...; do not substitute it for
+that file while retaining a wrapper's old runner hash authentication.
+
+Both repository debug wrappers intentionally still require that archived
+31f545b6... runner. Their repository default --stack-after is now 86400,
+beyond the maximum two-hour wrapper lifetime, because the original runner
+requires a positive interval. Their new repository hashes therefore differ
+from the actual runtime frozen wrappers. Archived/running external files
+were NOT modified. Replays must record the supplied CLI interval and hashes.
+Current repository helper SHA256:
+  8a7c5d8c12e18cd0161b8b4d1675192c8d97ccb52494dc3d366f311777b738bf
+Current repository debug_sc_first_map_native.py SHA256:
+  3a63a5de92b50b822c2aaf0756d039e7300781021347c49eda360b855dfa0c2c
+Current repository debug_sc_protected160_native.py SHA256:
+  69e25ff95621a40cf0b5d59be097d4d8346ba4e3401f3f13161fa9d0324aa395
+debug_sc_protected160_native.py additionally authenticates the corrected
+protected160 q8 deck SHA 534a2c249e95ca2e8b4d35ba036fc8ed17bb32c01ddbfa20f86cfcacce197eb5;
+the original explicit-nval deck erases the semicore class despite the same
+resolved M160. It must not be called the same SC prescription.
+
+Corrected protected-form run: ONGOING 60053348, not converged
+---------------------------------------------------------
+The new run uses source 1134957, corrected q8 deck SHA 534a2c24... and the
+original authenticated 898-map-output warm guess, NOT the wrong-policy
+60052556 map output. Its external wrapper hash is 28082c4e17215de683bb3ef994e4d6ed02349405455f0434a7eeb79e523c3e3e.
+The launched CLI supplies --stack-after 86400, beyond the job duration;
+all-rank GDB and the external wall guard remain. Actual startup confirmed
+880 coarse entries. Corrected map 0 still had raw output gap -0.153337 eV,
+but its actual next INPUT remained gapped at 2.484721 eV after native half
+mixing; do not treat the map output as the advanced/converged state.
+
+Progress snapshot through map 3: output gap 4.211208 eV, maximum protected
+displacement 0.838951 eV, RMS 0.273604 eV. Maximum displacement is not
+monotone (map 2: 0.820516 eV); all remain far above the unchanged 0.001 eV
+criterion. Native Anderson SC continues without a claimed convergence or
+cutoff-accuracy result. Only later authenticated completion can supersede
+this explicitly partial snapshot.
+
+Corrected inputs are preserved in ../inputs/ and header-only provenance
+guard c697f567... in ../evidence/. The guard validates resolved counts and
+dipole/head provenance; it is NOT SC or GPU/provider verification. The q4
+deck 1712d907... is PREPARED_PENDING_CONVERGED_Q8_NOT_RUN. Its separate
+seed_from_accepted_q8 path intentionally remains absent until the q8
+terminal artifact joins a genuine converged accepted input and completed
+driver. The companion prepared JSON lists the required checks. Never stage
+an intermediate sc_seed/map output as that accepted reference.
 
 No allocation launcher or hardcoded remote submission script is preserved
 here. This directory requests no additional allocation or GPU stage.

@@ -1,0 +1,20 @@
+{
+  "accepted": true,
+  "deck_sha256": "534a2c249e95ca2e8b4d35ba036fc8ed17bb32c01ddbfa20f86cfcacce197eb5",
+  "head_expected": {
+    "bispinor": false,
+    "hubbard": "none",
+    "nband": 750,
+    "ncond": 30,
+    "nval": 130,
+    "skip_vnl": false,
+    "vnl_mode": "analytic",
+    "vnl_velocity_sign": 1.0
+  },
+  "ncond": 30,
+  "number_bands_protected": 160,
+  "nval": 130,
+  "scope": "native config.with_band_request + native head stamp/provenance guard; header-only; actual measured MF lookup fixture; import communicator mocked",
+  "status": "PASS_NATIVE_CORRECTED_PROTECTED160_GENERATED750_HEADER",
+  "warnings": []
+}

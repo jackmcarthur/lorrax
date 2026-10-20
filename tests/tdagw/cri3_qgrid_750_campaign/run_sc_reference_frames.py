@@ -3,6 +3,8 @@
 External measurement helper, not an SC implementation or physics verification.
 No wavefunction/ISDF/Coulomb faces are retained. A launcher-enforced hard step
 deadline remains mandatory; the Python watchdog is only a redundant safeguard.
+Periodic Python traceback walking is opt-in (default off). The watchdog
+marks and exits without walking frames; fatal handlers/GDB remain separate.
 """
 import argparse
 import dataclasses
@@ -265,13 +267,15 @@ def main(argv=None):
     parser.add_argument("--deck", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--wall-cap", type=float, default=1140.)
-    parser.add_argument("--stack-after", type=float, default=120.)
+    parser.add_argument("--stack-after", type=float, default=0.,
+                        help="optional periodic Python stack interval; 0 disables it (default)")
     parser.add_argument("--expected-bands", type=int, default=750)
     parser.add_argument("--source-revision", required=True,
                         help="immutable source commit authenticated by the external launcher")
     args = parser.parse_args(argv)
-    if args.wall_cap <= 0 or args.stack_after <= 0:
-        parser.error("positive wall/stack intervals required")
+    if (not math.isfinite(args.wall_cap) or args.wall_cap <= 0
+            or not math.isfinite(args.stack_after) or args.stack_after < 0):
+        parser.error("finite positive wall cap and nonnegative stack interval required")
     source, deck, out = (Path(value).resolve() for value in
                          (args.source, args.deck, args.out))
     if out.exists():
@@ -279,13 +283,13 @@ def main(argv=None):
     sys.path.insert(0, str(source / "src"))
     sys.path.insert(0, str(source))
     faulthandler.enable(all_threads=True)
-    faulthandler.dump_traceback_later(args.stack_after, repeat=True)
+    if args.stack_after > 0:
+        faulthandler.dump_traceback_later(args.stack_after, repeat=True)
     done = threading.Event()
 
     def watchdog():
         if not done.wait(args.wall_cap):
             mark("reference_wall_stop", seconds=args.wall_cap)
-            faulthandler.dump_traceback(all_threads=True)
             os._exit(124)
 
     threading.Thread(target=watchdog, daemon=True, name="SC-reference-wall-cap").start()
@@ -340,7 +344,8 @@ def main(argv=None):
     finally:
         restore()
         done.set()
-        faulthandler.cancel_dump_traceback_later()
+        if args.stack_after > 0:
+            faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":
