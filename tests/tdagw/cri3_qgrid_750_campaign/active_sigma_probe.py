@@ -53,6 +53,15 @@ def active_request(energy, occupations, config):
     return request, float(efermi), policy
 
 
+def validate_reference(source):
+    """Use the same authenticated own-grid contract as zero/driven callbacks."""
+    path = Path(__file__).with_name("sc750_td_callback.py")
+    spec = importlib.util.spec_from_file_location("active_sigma_reference_contract", path)
+    owner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(owner)
+    return owner.source_response_policy(source)
+
+
 def run_pre_sigma_probe(source, *, out):
     """Cold and held-session SAME-W sweeps; native gates are unchanged.
 
@@ -67,8 +76,7 @@ def run_pre_sigma_probe(source, *, out):
     from gw.ppm_sigma import fresh_shared_pole_capacity
     from gw.mpa.sigma import compute_sigma_c_mpa_omega_grid
     meta, config, mesh = source["meta"], source["config"], source["mesh"]
-    if tuple(meta.kgrid) != (8, 8, 1) or tuple(meta.qgrid) != (8, 8, 1):
-        raise ValueError("this benchmark requires actual full8x8 electronic/bosonic grids")
+    response_policy = validate_reference(source)
     energy = np.asarray(gather_to_host(source["energy_ry"]))
     occ = np.asarray(gather_to_host(source["occupations"]))
     request, efermi, frame_policy = active_request(energy, occ, config)
@@ -91,6 +99,7 @@ def run_pre_sigma_probe(source, *, out):
     save("started.json", record=dict(status="STARTED_NOT_COMPLETED", frame=source["frame"],
         execution_revision=os.environ.get("LEG_HEAD"),
         helper_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        response_policy=response_policy,
         active_destination_zero_based=[100, 144], virtual_bands=750,
         energy_frame_ry=efermi, energy_frame_policy=frame_policy,
         external_energy_range_ev=[float(energy[:, 100:144].min()*RYD_TO_EV),
@@ -140,6 +149,7 @@ def run_pre_sigma_probe(source, *, out):
                 scope="same physical W/endpoints, different certified rules possible; NOT a convergence verdict")
     save("complete.json", record=dict(status="ACTIVE44_RAW750_BODY_TIMING_COMPLETE", sweeps=records,
         active_destination_zero_based=[100, 144], virtual_bands=750, model_digest=model["digest"],
+        response_policy=response_policy,
         frame=source["frame"]["frame"], no_SC_update=True, no_TD_propagation=True,
         head_evaluated=False, band_extrapolation_evaluated=False,
         cold_held_difference=difference,

@@ -73,6 +73,21 @@ def test_dispatch_has_compact_destinations_and_no_hidden_fullprefix_or_optical_s
                    for n in ast.walk(run))
 
 
+def test_own_q4_reference_is_allowed_but_q8_relabel_or_policy_mismatch_refuses():
+    frame = dict(frame="accepted_q4_input", input_h_sha256="H", deck_sha256="deck", qgrid=[4, 4, 1])
+    policy = dict(qgrid=[4, 4, 1], response_window="fejer", accepted_input_frame=frame["frame"],
+                  input_h_sha256="H", accepted_deck_sha256="deck")
+    source = dict(meta=SimpleNamespace(kgrid=(8, 8, 1), qgrid=(4, 4, 1)),
+                  config=SimpleNamespace(qgrid_response_window="fejer"), frame=frame,
+                  reference_policy=policy)
+    actual = probe.validate_reference(source)
+    assert actual["response_q_count"] == 16 and actual["response_window"] == "fejer"
+    with pytest.raises(ValueError, match="relabeled"):
+        probe.validate_reference(dict(source, frame=dict(frame, qgrid=[8, 8, 1])))
+    with pytest.raises(ValueError, match="accepted-deck"):
+        probe.validate_reference(dict(source, reference_policy=dict(policy, response_window="sharp")))
+
+
 def test_settings_use_the_real_native_config_before_W_not_a_flat_fake():
     from gw.gw_config import LorraxConfig
     path = Path(probe.__file__).with_name("inputs")/"corrected_protected160_750_q4_from_accepted_q8.in"

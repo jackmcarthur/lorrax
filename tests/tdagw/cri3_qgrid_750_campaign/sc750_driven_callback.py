@@ -139,7 +139,7 @@ def make_deck(plan, source, out, active, energy_ev, amplitude, arm):
     return parse_td_deck(raw, source="explicit SC750 driven campaign JSON plan")
 
 
-def validate_material_prerequisites(plan, frame):
+def validate_material_prerequisites(plan, frame, *, response_policy=None):
     """Read only actual tiny BSE/zero artifacts; no scalar gap surrogate."""
     import numpy as np
     import h5py
@@ -150,6 +150,11 @@ def validate_material_prerequisites(plan, frame):
     for record in (bse["frame"], ref):
         if any(record.get(k) != frame.get(k) for k in ("frame", "input_h_sha256", "wfn_fingerprint")):
             raise ValueError("GATE driven_reference: BSE/zero and live accepted input identities differ")
+    if response_policy is not None and response_policy["response_qgrid"] != [8, 8, 1]:
+        for record in (bse, ref):
+            if (record.get("response_qgrid") != response_policy["response_qgrid"]
+                    or record.get("response_window") != response_policy["response_window"]):
+                raise ValueError("GATE driven_reference: BSE/zero response grid/window must match own coarse reference")
     if (ref.get("sigma_eta_ev") != plan["eta_ev"]
             or ref.get("response_gamma_ev") != plan["response_gamma_ev"]):
         raise ValueError("GATE driven_zero: zero-field eta/gamma differ from planned B/C closure")
@@ -279,14 +284,15 @@ def run_td_probe(source, *, out, deck_path):
     plan = validate_plan(json.loads(plan_path.read_text()))
     for key in ("bse_report", "zero_directory"):
         plan[key] = str((plan_path.parent/plan[key]).resolve())
-    prereq = validate_material_prerequisites(plan, source["frame"])
     mesh, meta, arrays = source["mesh"], source["meta"], source["frame_arrays"]
-    if (tuple(meta.kgrid) != (8, 8, 1) or tuple(meta.qgrid) != (8, 8, 1)
-            or arrays["energy_ry"].shape != (64, 750)
+    zero = sibling("sc750_td_callback")
+    response_policy = zero.source_response_policy(source)
+    prereq = validate_material_prerequisites(plan, source["frame"], response_policy=response_policy)
+    if (arrays["energy_ry"].shape != (64, 750)
             or arrays["U_active"].shape != (64, 160, 160)
             or source.get("spectral_tail_reference") is None
             or source.get("head") is None or source.get("driver_complete", {}).get("reference_ready") is not True):
-        raise ValueError("GATE driven_source: authentic fine full64/750 post-Sigma source and tail required")
+        raise ValueError("GATE driven_source: own-grid accepted full64/750 post-Sigma source and tail required")
     if float(source["config"].sigma.regularization_ev) != plan["eta_ev"]:
         raise ValueError("GATE driven_eta: campaign and native source eta differ")
     nv, nc = resolve_band_window(arrays["energy_ry"][:, :160], 130, 30, 14,
@@ -295,7 +301,6 @@ def run_td_probe(source, *, out, deck_path):
     bse = prereq["bse"]
     if active.start > 130-int(bse["nval"]) or active.stop < 130+int(bse["ncond"]):
         raise ValueError("GATE driven_BSE_window: TD must contain the actual finite BSE window")
-    zero = sibling("sc750_td_callback")
     io, static_owner = sibling("run_sc_reference_frames"), sibling("sc750_static_control")
     started = time.perf_counter()
     rank0_transaction(out, stage="driven/new_output", write=lambda: out.mkdir(parents=True, exist_ok=False))
@@ -344,15 +349,12 @@ def run_td_probe(source, *, out, deck_path):
     budget("before_reference")
     velocity = jax.jit(lambda v: v[:, :, :160, :160], out_shardings=NamedSharding(mesh, P()))(
         source["velocity_dft_cart"])
-    head = source["iteration_head"].at(0.)
-    if abs(complex(head.vc0).imag) > 1.e-10:
-        raise ValueError("GATE driven_head: real electronic-cell bare coefficient required")
     inputs = dict(frame_receipt=source["frame"], driver_complete=source["driver_complete"],
         original_psi=source["original_psi"], velocity_dft_ry=host(velocity),
         wfn_fingerprint=source["frame"]["wfn_fingerprint"],
         velocity_wfn_fingerprint=source["frame"]["wfn_fingerprint"],
         structure=_structure(source["input_deck"]),
-        bare_head_coefficient_ry=float(np.real(head.vc0))/(float(meta.cell_volume)*64))
+        bare_head_coefficient_ry=zero.fine_bare_head_coefficient(source))
     reference = sr.build_sc_td_reference(source, arrays, inputs, mesh=mesh, active=active)
     system = stages.TdSystem(reference["header"], reference["ops"], 64,
         reference["receipts"]["nk_pad"], active.stop-active.start, float(meta.cell_volume),
@@ -366,7 +368,10 @@ def run_td_probe(source, *, out, deck_path):
         callback_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         snapshot_runtime_sha256=hashlib.sha256(Path(sr.__file__).read_bytes()).hexdigest(),
         static_control_sha256=hashlib.sha256(Path(static_owner.__file__).read_bytes()).hexdigest(),
-        microscopic_W="all3000centroids/full64q/full750virtual; no rank-one proxy",
+        microscopic_W=dict(centroids=3000, response_q_count=math.prod(meta.qgrid),
+            response_qgrid=list(meta.qgrid), response_window=response_policy["response_window"],
+            electronic_k_count=64, virtual_bands=750, spatial_rank_truncation=False),
+        response_policy=response_policy,
         scope="exploratory matched discretization, not optical/TD/positivity convergence"))
     w = host(system.ops.w_k)[:64]
     req = host(system.ops.rho_eq)[:64]

@@ -2,7 +2,8 @@
 
 Called collectively by the frozen-state native GW probe after its W producer
 returns. This assembles the existing BSE payload, not another BSE kernel or
-screening solve. It initially admits only equal electronic and bosonic grids.
+screening solve. A nested coarse bosonic grid uses its explicit ordinary-q
+quadrature comb, not W interpolation, on the fine electronic BSE grid.
 """
 from __future__ import annotations
 
@@ -138,8 +139,16 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
     # Refuse a missing/mis-associated vector BEFORE W0 or BSE allocations.
     packed_g0 = source_fit_g0(source)
     grid = tuple(int(x) for x in meta.kgrid)
-    if tuple(getattr(meta, "qgrid", None) or grid) != grid:
-        raise ValueError("BSE probe presently requires qgrid=kgrid; no implicit W interpolation")
+    qgrid = tuple(int(x) for x in (getattr(meta, "qgrid", None) or grid))
+    if qgrid != grid:
+        from common.fft_helpers import make_bosonic_q_comb
+        comb_program = make_bosonic_q_comb(mesh, grid, qgrid)
+        qsym = getattr(meta, "q_sym", None)
+        nq = int(np.prod(qgrid))
+        if (qsym is None or not np.array_equal(qsym.q_irr_full_idx, np.arange(nq))
+                or not np.array_equal(qsym.q_irr_kgrid_int,
+                    np.indices(qgrid).reshape(3, -1).T)):
+            raise ValueError("BSE coarse quadrature needs canonical unshifted full-q rows")
     if not source["frame"].get("reference_ready", False):
         raise ValueError("BSE target requires an authenticated converged input reference")
     wfns, energy, f = source["wfns"], np.asarray(source["energy_ry"]), np.asarray(source["occupations"])
@@ -177,15 +186,18 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
     if not V.is_whole_zone() or V.n_full != nk:
         raise ValueError("BSE probe needs full fine-grid bare V")
     head = source["W_by_role"]["iteration_head"]
+    interaction = V if qgrid == grid else QirrOperator.of(source["V_screen"])
+    if not interaction.is_whole_zone() or interaction.n_full != int(np.prod(qgrid)):
+        raise ValueError("BSE W0 needs the matching full bosonic-grid bare interaction")
     wm = fresh_shared_pole_capacity(meta, mesh)
     # All ranks bind the real allocator room while the source's full-band
     # faces/V/velocity remain live. This ledger prices static W synthesis,
     # not the later BSE payload/workspaces or a measured material peak.
     wm.shared_pole_capacity.at_phase()
-    W0, hs = build_static_screened_w(None, V, config=config, meta=wm,
+    W0, hs = build_static_screened_w(None, interaction, config=config, meta=wm,
         mesh_xy=mesh, shared_pole=source["W_by_role"]["shared_pole"], head_resolver=head)
     wvalues = QirrOperator.of(W0).unfold(mesh)
-    W = jax.jit(lambda w: jnp.moveaxis(w, 0, -1).reshape(w.shape[1], w.shape[2], *grid),
+    W = jax.jit(lambda w: jnp.moveaxis(w, 0, -1).reshape(w.shape[1], w.shape[2], *qgrid),
                 out_shardings=sh.W)(wvalues)
     v0 = jax.jit(lambda v: v[0], out_shardings=sh.V)(V.values)
     # G0 is ALREADY small replicated host metadata from its native producer.
@@ -193,8 +205,32 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
     # a second slab axis and is not the vector-metadata path.
     gx = device_put_process_local(packed_g0, NamedSharding(mesh, P('x')))
     gy = device_put_process_local(packed_g0, NamedSharding(mesh, P('y')))
-    v0, W, head_log = _inject_q0_head(v0, W, gx, gy, hs.vc0,
+    # direct_at defaults explicitly to the ELECTRONIC cell (vcoul adapter),
+    # even when meta.qgrid is coarse; hs is the BOSONIC W-cell sample.
+    bare_sample = hs if qgrid == grid else source["head_resolver"].direct_at(0.0j)
+    v0, W, head_log = _inject_q0_head(v0, W, gx, gy, bare_sample.vc0,
         jnp.asarray([hs.wcoul0]), float(meta.cell_volume), w0_ready=True)
+    comb_receipt = None
+    if qgrid != grid:
+        # Inject BEFORE embedding: both W body and its single coarse q0 head
+        # acquire Nk/Nq. Bare fine-grid exchange is neither tiled nor scaled.
+        flat = jax.jit(lambda w: jnp.moveaxis(w.reshape(w.shape[0], w.shape[1], -1), -1, 0),
+            out_shardings=NamedSharding(mesh, P(None, 'x', 'y')))(W)
+        embed = jax.jit(lambda w: jnp.moveaxis(comb_program(w), 0, -1).reshape(
+            w.shape[1], w.shape[2], *grid), out_shardings=sh.W)
+        compiled = embed.lower(flat).compile()
+        stats = compiled.memory_analysis()
+        if stats is None:
+            raise ValueError("BSE coarse q-comb needs its actual compiled memory price")
+        from runtime.aot_memory import compiled_new_bytes
+        new_bytes = compiled_new_bytes(compiled)
+        wm.shared_pole_capacity.at_phase()
+        resident = max(0, int(stats.output_size_in_bytes)-int(stats.alias_size_in_bytes))
+        comb_receipt = wm.shared_pole_capacity.reserve("bse.coarse_q_comb",
+            resident_bytes_per_rank=resident,
+            workspace_bytes_per_rank=max(0, new_bytes-resident))
+        W = compiled(flat)
+        del flat
     ev = pad_axis(energy[:, nocc-nval:nocc], int(mesh.shape['y']), axis=1, fill=-1.e6).array
     ec = pad_axis(energy[:, nocc:nocc+ncond], int(mesh.shape['x']), axis=1, fill=1.e6).array
     data = dict(psi_c_X=pc, psi_c_Y=pcy, psi_v_X=pv, psi_v_Y=pvy,
@@ -247,6 +283,13 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
     report["band_pair_weights"] = band_pair_summary(
         np.asarray(gather_to_host(pair_power)), nocc=nocc)
     report.update(nval=int(nval), ncond=int(ncond), nk=nk,
+        bosonic_grid=list(qgrid), electronic_grid=list(grid),
+        response_qgrid=list(qgrid), electronic_kgrid=list(grid),
+        response_window=getattr(meta, "qgrid_response_window", "sharp"),
+        q_quadrature="ordinary coarse full-BZ q sum; NOT WS interpolation",
+        q_comb_weight=float(nk/np.prod(qgrid)), q_comb_capacity=comb_receipt,
+        bare_head_grid=list(grid), screened_head_grid=list(qgrid),
+        head_applications=dict(bare=1, screened=1),
         iterations=int(iterations), maxiter=maxiter, head=head_log,
         screening_model=dict(source['W_by_role']['shared_pole']),
         frame=source['frame'], elapsed_s=time.perf_counter()-start)

@@ -92,6 +92,23 @@ def test_actual_prerequisite_records_checkpoint_crop_and_fresh_number_gate(tmp_p
         driver.validate_material_prerequisites(plan, frame)
 
 
+def test_coarse_driven_requires_same_response_policy_in_BSE_and_zero(tmp_path):
+    plan, frame, zero = _prerequisites(tmp_path)
+    policy = dict(response_qgrid=[4, 4, 1], response_window="fejer")
+    with pytest.raises(ValueError, match="response grid/window"):
+        driver.validate_material_prerequisites(plan, frame, response_policy=policy)
+    for path in (Path(plan["bse_report"]), zero/"reference.json"):
+        record = json.loads(path.read_text())
+        path.write_text(json.dumps(dict(record, **policy)))
+    assert driver.validate_material_prerequisites(plan, frame, response_policy=policy)["target_energy_ev"] == 2.731
+    path = Path(plan["bse_report"])
+    record = json.loads(path.read_text())
+    record["response_window"] = "sharp"
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="response grid/window"):
+        driver.validate_material_prerequisites(plan, frame, response_policy=policy)
+
+
 def test_unresolved_or_mismatched_material_target_is_not_a_pulse_choice(tmp_path):
     plan, frame, _ = _prerequisites(tmp_path)
     with pytest.raises(ValueError, match="identities differ"):

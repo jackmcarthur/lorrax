@@ -108,6 +108,40 @@ def band_pair_comparison(fine, coarse):
     return result
 
 
+def selected_qgrids(only):
+    """Select full-BZ response legs, never a fine-q patch."""
+    return ((8, 8, 1), (4, 4, 1)) if only is None else ((int(only), int(only), 1),)
+
+
+def accepted_response_policy(frame, deck_path):
+    """Bind the actual converged producer deck, not the probe's new q label."""
+    from gw.gw_config import read_lorrax_input, parse_qgrid
+    path = Path(deck_path).resolve()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != frame.get("deck_sha256"):
+        raise ValueError("accepted response policy needs the exact converged producer deck SHA")
+    values = read_lorrax_input(str(path))
+    grid = tuple(parse_qgrid(values.get("qgrid")) or frame["kgrid"])
+    if grid != tuple(frame.get("qgrid", ())):
+        raise ValueError("accepted producer deck and frame qgrid disagree")
+    return dict(accepted_deck_sha256=digest, qgrid=list(grid),
+        response_window=values.get("qgrid_response_window", "sharp"),
+        accepted_input_frame=frame["frame"], input_h_sha256=frame["input_h_sha256"])
+
+
+def validate_callback_reference(frame, grid, policy, window):
+    """A material callback needs its OWN converged response-policy reference."""
+    grid = tuple(grid)
+    if grid != tuple(frame.get("qgrid", ())):
+        raise ValueError("callback requires its own converged qgrid reference, not a relabeled state")
+    if grid == (4, 4, 1) and (not policy or tuple(policy.get("qgrid", ())) != grid
+            or policy.get("accepted_input_frame") != frame["frame"]
+            or policy.get("input_h_sha256") != frame["input_h_sha256"]
+            or policy.get("accepted_deck_sha256") != frame.get("deck_sha256")
+            or policy.get("response_window") != window):
+        raise ValueError("q4 callback requires authenticated accepted deck/window/frame policy")
+
+
 def run_pre_sigma_only(callback, current, *, out, publish, finished):
     """Stop only AFTER a successful collective callback, before broad Sigma.
 
@@ -115,9 +149,11 @@ def run_pre_sigma_only(callback, current, *, out, publish, finished):
     fine/coarse comparison verdict. Callback exceptions propagate unchanged.
     """
     callback(current, out=out)
+    grid = tuple(getattr(current.get("meta"), "qgrid", (8, 8, 1)))
     publish("pre_sigma_complete.json", record=dict(status="PRE_SIGMA_ONLY_COMPLETE",
         accepted_input_frame=current["frame"]["frame"],
-        broad_protected_Sigma_performed=False, coarse_leg_performed=False,
+        response_qgrid=list(grid), broad_protected_Sigma_performed=False,
+        coarse_leg_performed=grid == (4, 4, 1), second_leg_performed=False,
         new_SC_convergence_claim=False, cutoff_accuracy_verdict=False))
     finished.append("PRE_SIGMA_ONLY")
     raise StopIteration("EXTERNAL_PRE_SIGMA_PROBE_COMPLETE")
@@ -126,7 +162,7 @@ def run_pre_sigma_only(callback, current, *, out, publish, finished):
 def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
                         directory, publish, gather, G0_canonical=None,
                         source_callback=None, post_sigma_callback=None, input_deck=None,
-                        G0_receipt=None):
+                        G0_receipt=None, reference_policy=None):
     """Evaluate one existing native map; source callback is synchronous only."""
     import numpy as np
     import jax
@@ -162,6 +198,8 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
     meta.q_sym = inputs.sym.qgrid_view(meta.qgrid, kgrid=meta.kgrid)
     config = dataclasses.replace(inputs.config, qgrid=tuple(qgrid),
         debug=dataclasses.replace(inputs.config.debug, sigma_freq_debug_output=True))
+    if source_callback is not None or post_sigma_callback is not None:
+        validate_callback_reference(frame, qgrid, reference_policy, config.qgrid_response_window)
     paths = {key: str(directory / Path(getattr(config.paths, key)).name)
              for key in ("sigma_diag_file", "eqp0_file", "eqp1_file", "report_file",
                          "sigma_omega_h5_file")}
@@ -217,6 +255,7 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
                 mesh=inputs.mesh_xy, head_resolver=resolver,
                 iteration_head=roles.get("iteration_head"), input_dir=inputs.input_dir,
                 G0_canonical=G0_canonical, G0_receipt=G0_receipt,
+                reference_policy=reference_policy,
                 spectral_tail_reference=captured.get("spectral_tail_reference"),
                 velocity_dft_cart=(None if inputs.parallel_transport is None else
                                    inputs.parallel_transport.velocity_dft_cart),
@@ -360,6 +399,9 @@ def main(argv=None):
     parser.add_argument("--setup-deck", required=True,
                         help="native q4/full64 proper-SC setup deck, not a max_iter1 wrapper")
     parser.add_argument("--frames", required=True)
+    parser.add_argument("--only-qgrid", choices=("4", "8"),
+                        help="evaluate ONLY this full-BZ response grid; skip the other W rebuild")
+    parser.add_argument("--accepted-deck", help="exact accepted producer deck; required for own-q4 callbacks")
     parser.add_argument("--out", required=True)
     pre_sigma = parser.add_mutually_exclusive_group()
     pre_sigma.add_argument("--bse-helper")
@@ -398,6 +440,11 @@ def main(argv=None):
         if not Path(module.__file__).resolve().is_relative_to(source):
             raise RuntimeError("unexpected native source origin")
     arrays, frame = load_accepted_frame(args.frames)
+    grids = selected_qgrids(args.only_qgrid)
+    policy = (None if not args.accepted_deck else accepted_response_policy(frame, args.accepted_deck))
+    if (args.bse_helper or args.pre_sigma_helper or args.td_helper) and grids[0] == (4, 4, 1):
+        if policy is None:
+            policy = accepted_response_policy(frame, args.setup_deck)
     finished, G0, G0_receipts = [], [], []
     original_solver = sc_iteration.run_self_consistency
     original_vq = gw_init._finalize_vq_views
@@ -432,7 +479,7 @@ def main(argv=None):
             + 64 * 1024**2)
         if small_preflight > 2 * 1024**3:
             raise MemoryError("fixed-state band/fit capture exceeds2GiB host bound before maps")
-        directories = [out / "fine_q8", out / "coarse_q4"]
+        directories = [out / ("fine_q8" if grid == (8, 8, 1) else "coarse_q4") for grid in grids]
         def stage():
             out.mkdir(parents=True, exist_ok=True)
             for directory in directories:
@@ -454,13 +501,14 @@ def main(argv=None):
             accepted_frame=frame["frame"], accepted_frame_npz_sha256=frame["frame_npz_sha256"],
             accepted_frame_source_revision=frame["source_revision"],
             logical_bands=750, protected_bands=160, electronic_grid=[8, 8, 1],
+            evaluated_response_grids=[list(grid) for grid in grids], reference_policy=policy,
             source_lifetime="immutable DFT source held; current faces not retained across Sigma",
             host_band_metadata_bound_bytes=2 * 1024**3,
             host_band_metadata_price_bytes=small_preflight,
             pre_sigma_only=(None if not args.pre_sigma_helper else dict(
                 helper=str(Path(args.pre_sigma_helper).resolve()),
                 helper_sha256=hashlib.sha256(Path(args.pre_sigma_helper).read_bytes()).hexdigest(),
-                scope="fine current W and explicit callback only; no broad160 Sigma/coarse leg/TD")),
+                scope="selected current W and explicit callback only; no broad160 Sigma/other leg/TD")),
             no_material_capacity_admission_claim=True))
         if G0_receipts:
             publish("source_fit_G0.json", record=G0_receipts[0])
@@ -474,7 +522,8 @@ def main(argv=None):
             if hasattr(pre, "validate_config"):
                 pre.validate_config(inputs.config)
             callback = lambda current: run_pre_sigma_only(pre.run_pre_sigma_probe, current,
-                out=out/"fine_pre_sigma", publish=publish, finished=finished)
+                out=out/("fine_pre_sigma" if grids[0] == (8, 8, 1) else "coarse_pre_sigma"),
+                publish=publish, finished=finished)
         if args.bse_helper:
             spec = importlib.util.spec_from_file_location("native_bse_probe", args.bse_helper)
             bse = importlib.util.module_from_spec(spec)
@@ -483,22 +532,23 @@ def main(argv=None):
                 bse.source_fit_g0(dict(meta=inputs.meta,
                     G0_canonical=None if not G0 else G0[0],
                     G0_receipt=None if not G0_receipts else G0_receipts[0]))
-            callback = lambda current: bse.run_bse_probe(current, out=out / "fine_bse",
+            callback = lambda current: bse.run_bse_probe(current,
+                out=out / ("fine_bse" if grids[0] == (8, 8, 1) else "coarse_bse"),
                 nval=4, ncond=4, nroots=24, maxiter=200)
         if args.td_helper:
             spec = importlib.util.spec_from_file_location("sc750_td_callback", args.td_helper)
             td = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(td)
             td_callback = lambda current: td.run_td_probe(current,
-                out=out / "fine_td", deck_path=args.td_deck)
+                out=out / ("fine_td" if grids[0] == (8, 8, 1) else "coarse_td"), deck_path=args.td_deck)
         results = []
-        for grid, directory in zip(((8, 8, 1), (4, 4, 1)), directories):
+        for index, (grid, directory) in enumerate(zip(grids, directories)):
             results.append(evaluate_frozen_leg(sc_iteration, initial, inputs, arrays,
                 frame, qgrid=grid, directory=directory, publish=publish,
                 gather=gather_to_host, G0_canonical=None if not G0 else G0[0],
                 G0_receipt=None if not G0_receipts else G0_receipts[0],
-                source_callback=callback if grid == (8, 8, 1) else None,
-                post_sigma_callback=td_callback if grid == (8, 8, 1) else None,
+                source_callback=callback if index == 0 else None,
+                post_sigma_callback=td_callback if index == 0 else None, reference_policy=policy,
                 input_deck=str(Path(args.setup_deck).resolve())))
         # Conservative four copies of the two band-only payloads and accepted
         # frame cover retained arrays, NPZ staging, norms/differences and BLAS
@@ -507,11 +557,15 @@ def main(argv=None):
                                 + sum(value.nbytes for value in arrays.values()))
         if small_host_price > 2 * 1024**3:
             raise MemoryError("fixed-state small-band host working price exceeds2GiB/process")
-        publish("comparison.json", record=dict(status="FROZEN_BAND_OPERATOR_COMPARISON",
-            raw750=band_pair_comparison(results[0]["raw750_pair_ry"], results[1]["raw750_pair_ry"]),
-            extrapolated=band_pair_comparison(results[0]["extrapolated_pair_ry"], results[1]["extrapolated_pair_ry"]),
-            full_W_comparison="NOT_MEASURED", accepted_fine_reproduction="NOT_MEASURED",
-            no_cutoff_accuracy_verdict=True, no_new_convergence_claim=True))
+        if len(results) == 2:
+            publish("comparison.json", record=dict(status="FROZEN_BAND_OPERATOR_COMPARISON",
+                raw750=band_pair_comparison(results[0]["raw750_pair_ry"], results[1]["raw750_pair_ry"]),
+                extrapolated=band_pair_comparison(results[0]["extrapolated_pair_ry"], results[1]["extrapolated_pair_ry"]),
+                full_W_comparison="NOT_MEASURED", accepted_fine_reproduction="NOT_MEASURED",
+                no_cutoff_accuracy_verdict=True, no_new_convergence_claim=True))
+        else:
+            publish("selected_leg_complete.json", record=dict(status="SINGLE_FROZEN_LEG_COMPLETE",
+                qgrid=list(grids[0]), comparison_performed=False, no_new_convergence_claim=True))
         finished.append(True)
         # Intentional external harness boundary: do not continue native SC or
         # run its terminal writers using an unevaluated/output carry.

@@ -6,6 +6,25 @@ or automatic job submission is bundled here. Launch collectively through the
 normal authenticated native environment and a separately enforced wall cap.
 The small tests check metadata/owner contracts, not GPU or material accuracy.
 
+Latest actual reference: allocation 60056663 step4 completed eight q4 Fejér
+SC maps on source `861d228`, meeting the 1 meV native criterion with a
+0.974317 meV residual. The completed driver authenticates the accepted INPUT
+gap 3.073808 eV, not the final raw OUTPUT gap. The exact provenance and timings
+are in `evidence/Q4_FEJER_ACCEPTED_REFERENCE_60056663.json`. Warm P16 material
+maps take about 45.2 s for W and 17.3 s for the protected160-output Sigma
+sweep; these are not compact44 or coherent TD-refresh timings. Fejér is an
+explicit response-smoothing policy, not a successful sharp-cutoff replay or
+a conserving-closure claim. Matching q4 BSE/TD remain unverified on material.
+
+The prepared BSE and static-TD control share the native `make_bosonic_q_comb`
+owner: inject the coarse screened head once, embed nested q rows with Nk/Nq,
+then use existing fine-grid Fourier owners. This is ordinary coarse-q
+quadrature, not W interpolation. Bare Hartree/exchange keep their fine-cell
+normalization. Enlarged Fourier carriers are compiled/priced before dispatch.
+Tiny literal full-complex BSE/static-control oracles pass on CPU; the separate
+`diagnostics/verify_bse_coarse_q_p4.py` is the bounded native GPU proof, not a
+material eigensolve or trajectory.
+
 `run_sc_reference_frames.py` runs the unchanged native GW CLI and records the
 actual input of each scalar SC map before donation. It saves full current E/f,
 protected U, original-basis input H and small centroid/k provenance, never
@@ -75,6 +94,24 @@ CPython stack, selector-policy correction, and explicitly partial progress
 of corrected run 60053348; no current intermediate map is a reference.
 
 ## Accepted-SC750 short zero-field callback
+
+The probe also supports `--only-qgrid 4` or `--only-qgrid 8` to evaluate one
+response leg without rebuilding the other. A selected q4 callback uses
+`coarse_bse`, `coarse_td`, or `coarse_pre_sigma` output paths, and records a
+single-leg completion rather than a fine/coarse comparison. Its reference
+must be an actually converged **q4 input frame**; the accepted q8 state may
+not be relabeled as that reference. Pass `--accepted-deck` with the exact
+producer deck (or use its identical copy as `--setup-deck`): its SHA must
+match the accepted frame, and the native parser authenticates qgrid and
+sharp/Fejér window before W is built. The existing paired frozen-state
+comparison remains a separate calculation on one fixed input.
+
+Electronic k rows remain full64 and virtual bands remain750. Bare HF uses
+the fine-cell `head_resolver.direct_at(0j).vc0/(volume*64)`; the correlation
+kernel keeps the actual q4 or q8 screened head and quadrature. Zero/driven
+receipts expose the response grid/window, and coarse driven prerequisites
+must use BSE and zero-field results from that same accepted response policy.
+These are prepared adapter contracts, not a material TD or cutoff verdict.
 
 `sc750_td_callback.py` is a prepared, not material-verified adapter from the
 authenticated accepted input to the existing native snapshot and TD owners.

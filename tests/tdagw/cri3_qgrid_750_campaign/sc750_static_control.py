@@ -7,7 +7,8 @@ This campaign adapter has not been admitted on the material/GPU trajectory.
 """
 
 
-def static_control_from_body(reference, W0, head, *, packed_G0, cell_volume):
+def static_control_from_body(reference, W0, head, *, packed_G0, cell_volume,
+                             capacity=None):
     """Reuse native Hartree/Fock owners with a declared pre-head static body.
 
     ``reference`` is build_sc_td_reference's authenticated plain bundle.
@@ -15,7 +16,9 @@ def static_control_from_body(reference, W0, head, *, packed_G0, cell_volume):
     is separate, as returned by build_static_screened_w. ``head.wcoul0`` is
     FULL SCREENED W, NOT Wc: never add vc0 to it. ``packed_G0`` is small host
     metadata in the source mu_basis packing. Large arrays stay distributed.
-    Equal electronic/bosonic grids only; no implicit coarse-W interpolation.
+    A nested coarse bosonic grid uses ordinary coarse-q quadrature, not W
+    interpolation. Its enlarged fine-grid Fourier carrier is admitted using
+    ``capacity`` before dispatch. Equal grids retain their existing path.
     """
     import math
     import numpy as np
@@ -31,16 +34,22 @@ def static_control_from_body(reference, W0, head, *, packed_G0, cell_volume):
 
     prepared, bare = reference["prepared"], reference["model"]
     grid, mesh = tuple(prepared["kgrid"]), prepared["mesh"]
-    if tuple(prepared.get("qgrid", grid)) != grid:
-        raise ValueError("GATE static_agw_grid: initial control requires qgrid=kgrid")
+    qgrid = tuple(prepared.get("qgrid", grid))
+    comb = None
+    if qgrid != grid:
+        from common.fft_helpers import make_bosonic_q_comb
+        comb = make_bosonic_q_comb(mesh, grid, qgrid)
+        if capacity is None:
+            raise ValueError("GATE static_agw_capacity: coarse q-comb requires its live capacity ledger")
     if getattr(bare.apply, "func", None) is not _native_hf_apply:
         raise ValueError("GATE static_agw_reference: authenticated native HF-delta operand owner required")
     op = QirrOperator.of(W0)
-    if not op.is_whole_zone() or op.n_full != int(prepared["nk"]):
-        raise ValueError("GATE static_agw_W: whole electronic-grid static W required")
-    if not np.array_equal(np.asarray(op.full_rows), np.arange(int(prepared["nk"]))):
+    nq = int(np.prod(qgrid))
+    if not op.is_whole_zone() or op.n_full != nq:
+        raise ValueError("GATE static_agw_W: whole bosonic-grid static W required")
+    if not np.array_equal(np.asarray(op.full_rows), np.arange(nq)):
         raise ValueError("GATE static_agw_W_rows: canonical full-q rows required before FFT")
-    if tuple(op.values.shape) != tuple(prepared["V_q"].shape):
+    if tuple(op.values.shape[1:]) != tuple(prepared["V_q"].shape[1:]):
         raise ValueError("GATE static_agw_W: static W and bare V centroid carriers differ")
     g0 = np.asarray(packed_G0)
     if g0.shape != (op.values.shape[-1],) or not np.isfinite(g0).all():
@@ -52,7 +61,7 @@ def static_control_from_body(reference, W0, head, *, packed_G0, cell_volume):
         raise ValueError("GATE static_agw_head: real static screened head and positive volume required")
     gx = device_put_process_local(g0, NamedSharding(mesh, P("x")))
     gy = device_put_process_local(g0, NamedSharding(mesh, P("y")))
-    wgrid = jax.jit(lambda w: jnp.moveaxis(w, 0, -1).reshape(w.shape[1], w.shape[2], *grid),
+    wgrid = jax.jit(lambda w: jnp.moveaxis(w, 0, -1).reshape(w.shape[1], w.shape[2], *qgrid),
         out_shardings=NamedSharding(mesh, WR_SPEC))(op.values)
     # Keep G=0-excluded Hartree V0 unchanged. The injector touches W only:
     # wcoul0/volume once, with NO extra vc0 and NO scalar exchange head later.
@@ -62,8 +71,27 @@ def static_control_from_body(reference, W0, head, *, packed_G0, cell_volume):
     flat = jax.jit(lambda w: jnp.moveaxis(w.reshape(w.shape[0], w.shape[1], -1), -1, 0),
         out_shardings=NamedSharding(mesh, P(None, "x", "y")))(wgrid)
     kernel = make_dynsig_kernels(mesh, grid)
-    wr = jax.jit(lambda w: _w_R(w, kernel),
-        out_shardings=NamedSharding(mesh, WR_SPEC))(flat)
+    comb_receipt = None
+    if comb is None:
+        wr = jax.jit(lambda w: _w_R(w, kernel),
+            out_shardings=NamedSharding(mesh, WR_SPEC))(flat)
+    else:
+        # Head is already in the COARSE q0 cell. The same Nk/Nq weight applies
+        # to it and the body; Hartree remains the original fine-grid bare V0.
+        from runtime.aot_memory import compiled_new_bytes
+        program = jax.jit(lambda w: _w_R(comb(w), kernel),
+            out_shardings=NamedSharding(mesh, WR_SPEC))
+        compiled = program.lower(flat).compile()
+        stats = compiled.memory_analysis()
+        if stats is None:
+            raise ValueError("GATE static_agw_capacity: compiled q-comb memory price required")
+        new_bytes = compiled_new_bytes(compiled)
+        resident = max(0, int(stats.output_size_in_bytes)-int(stats.alias_size_in_bytes))
+        capacity.at_phase()
+        comb_receipt = capacity.reserve("static_agw.coarse_q_comb",
+            resident_bytes_per_rank=resident,
+            workspace_bytes_per_rank=max(0, new_bytes-resident))
+        wr = compiled(flat)
     px, py, _, vh, rho_eq, _ = bare.params
     model = SelfEnergyModel(apply=bare.apply, params=(px, py, wr, vh, rho_eq, 0.),
         linear=True, name="static TD-aGW: bare Hartree plus screened W0 exchange; NO GW collision")
@@ -72,6 +100,9 @@ def static_control_from_body(reference, W0, head, *, packed_G0, cell_volume):
         W_head_scope="HeadSample.wcoul0 is full screened W; injected once, scalar head=0",
         Hartree="original G0-excluded bare V0 unchanged", spatial_projection=False,
         anchor="accepted SC H once; delta_Hartree[Vbar]-delta_SEX[W0]",
+        kgrid=list(grid), qgrid=list(qgrid), q_comb_weight=float(prepared["nk"]/nq),
+        q_quadrature="ordinary coarse full-BZ q sum; NOT W interpolation",
+        q_comb_capacity=comb_receipt,
         collision="off; not frozen-W MGKBA", material_admission="NOT_RUN"))
 
 
@@ -81,16 +112,18 @@ def build_static_control(source, reference):
     from gw.static_screening import build_static_screened_w
     mesh, meta = source["mesh"], source["meta"]
     if tuple(meta.qgrid) != tuple(meta.kgrid):
-        raise ValueError("GATE static_agw_grid: initial control requires qgrid=kgrid")
+        from common.fft_helpers import make_bosonic_q_comb
+        make_bosonic_q_comb(mesh, tuple(meta.kgrid), tuple(meta.qgrid))
     receipt, frame = reference["receipts"], source["frame"]
     if any(receipt.get(key) != frame.get(key) for key in
            ("frame", "input_h_sha256", "wfn_fingerprint")):
         raise ValueError("GATE static_agw_reference: W source and accepted TD reference identities differ")
     wm = fresh_shared_pole_capacity(meta, mesh)
     wm.shared_pole_capacity.at_phase()
-    W0, head = build_static_screened_w(None, source["V_q"], config=source["config"],
+    interaction = source["V_q"] if tuple(meta.qgrid) == tuple(meta.kgrid) else source["V_screen"]
+    W0, head = build_static_screened_w(None, interaction, config=source["config"],
         meta=wm, mesh_xy=mesh, shared_pole=source["W_by_role"]["shared_pole"],
         head_resolver=source["W_by_role"]["iteration_head"])
     return static_control_from_body(reference, W0, head,
         packed_G0=meta.mu_basis.pack_host(source["G0_canonical"]),
-        cell_volume=float(meta.cell_volume))
+        cell_volume=float(meta.cell_volume), capacity=wm.shared_pole_capacity)

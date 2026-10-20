@@ -24,6 +24,42 @@ def snapshot_boundary_report(gamma, injection, U, rho_in_basis):
     return rho, loss, raw, boundary
 
 
+def source_response_policy(source):
+    """Require an own-grid accepted reference, including the coarse window."""
+    meta, frame = source["meta"], source["frame"]
+    electronic, grid = tuple(meta.kgrid), tuple(meta.qgrid)
+    window = getattr(source["config"], "qgrid_response_window", "sharp")
+    if getattr(meta, "qgrid_response_window", window) != window:
+        raise ValueError("GATE sc750_response_grid: config/meta response windows differ")
+    if electronic != (8, 8, 1) or grid not in ((8, 8, 1), (4, 4, 1)):
+        raise ValueError("GATE sc750_response_grid: electronic8 and response8 or4 required")
+    if grid != tuple(frame.get("qgrid", ())):
+        raise ValueError("GATE sc750_response_reference: own converged qgrid frame required, not relabeled q8")
+    policy = source.get("reference_policy")
+    if grid != electronic and (not policy or tuple(policy.get("qgrid", ())) != grid
+            or policy.get("response_window") != window
+            or policy.get("accepted_input_frame") != frame["frame"]
+            or policy.get("input_h_sha256") != frame["input_h_sha256"]
+            or policy.get("accepted_deck_sha256") != frame.get("deck_sha256")):
+        raise ValueError("GATE sc750_response_reference: authenticated coarse accepted-deck/window join required")
+    return dict(electronic_kgrid=list(electronic), response_qgrid=list(grid),
+        response_q_count=math.prod(grid), response_window=window,
+        effective_response_window="identity" if grid == electronic else window,
+        accepted_response_policy=policy)
+
+
+def fine_bare_head_coefficient(source):
+    """Bare HF uses the fine electronic cell, never the coarse correlation head."""
+    import numpy as np
+    sample = source["head_resolver"].direct_at(0j)
+    coefficient = complex(sample.vc0)
+    volume = float(source["meta"].cell_volume)
+    if not (np.isfinite(coefficient) and abs(coefficient.imag) <= 1.e-10
+            and math.isfinite(volume) and volume > 0):
+        raise ValueError("GATE sc750_td_bare_head: verified real fine electronic-cell head required")
+    return float(coefficient.real)/(volume*math.prod(source["meta"].kgrid))
+
+
 def validate_probe_deck(deck, *, tf_fs_limit=1.0):
     """Keep this first gate zero-field, short, raw, and reference anchored."""
     v = deck.values
@@ -74,13 +110,13 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
         raise ValueError("positive finite explicit probe budgets required")
     mesh, meta = source["mesh"], source["meta"]
     frame, arrays, complete = source["frame"], source["frame_arrays"], source["driver_complete"]
-    if (tuple(meta.kgrid) != (8, 8, 1) or tuple(meta.qgrid) != (8, 8, 1)
-            or arrays["energy_ry"].shape != (64, 750)
+    response_policy = source_response_policy(source)
+    if (arrays["energy_ry"].shape != (64, 750)
             or arrays["U_active"].shape != (64, 160, 160)
             or not complete or not complete.get("reference_ready")
             or source.get("spectral_tail_reference") is None
             or source.get("head") is None or source.get("efermi_ry") is None):
-        raise ValueError("GATE sc750_td_source: accepted fine-q full750 post-Sigma source/tail/head required")
+        raise ValueError("GATE sc750_td_source: own-grid accepted full750 post-Sigma source/tail/head required")
     deck_path = Path(deck_path).resolve()
     deck = read_td_deck(str(deck_path))
     duration = validate_probe_deck(deck)
@@ -154,10 +190,7 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
     velocity = jax.jit(lambda v: v[:, :, :nb, :nb],
         out_shardings=NamedSharding(mesh, P()))(velocity)
     # Same bare-head owner/normalization as ppm_pipeline.publish_window_hf_reference.
-    sample = source["iteration_head"].at(0.)
-    if abs(complex(sample.vc0).imag) > 1e-10:
-        raise ValueError("GATE sc750_td_bare_head: real fine-electronic-cell coefficient required")
-    head_coefficient = float(np.real(sample.vc0))/(float(meta.cell_volume)*64)
+    head_coefficient = fine_bare_head_coefficient(source)
     inputs = dict(frame_receipt=frame, driver_complete=complete,
         original_psi=source["original_psi"], velocity_dft_ry=host(velocity),
         wfn_fingerprint=frame["wfn_fingerprint"], velocity_wfn_fingerprint=frame["wfn_fingerprint"],
@@ -171,6 +204,7 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
         status="AUTHENTICATED_REFERENCE_NOT_COLLISION_STATIONARITY",
         deck_sha256=hashlib.sha256(deck_path.read_bytes()).hexdigest(),
         reference_producer_revision=frame["source_revision"], duration_fs=duration,
+        **response_policy,
         execution_revision=os.environ.get("LEG_HEAD"),
         execution_source_archive_sha256=os.environ.get("LEG_SOURCE_ARCHIVE_SHA256"),
         execution_snapshot_runtime_sha256=hashlib.sha256(Path(sr.__file__).read_bytes()).hexdigest(),
@@ -277,6 +311,7 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
             raise ValueError("GATE sc750_td_refresh: no actual updated-W refresh was reached")
         save("complete.json", record=dict(status="SHORT_ZERO_FIELD_PROBE_COMPLETE_NOT_DRIVEN_ADMISSION",
             frame=frame["frame"], stats=stats, accepted_refreshes=refreshes,
+            response_qgrid=list(meta.qgrid), response_window=response_policy["response_window"],
             wall_s=time.perf_counter()-started,
             active_GPUh=jax.process_count()*(time.perf_counter()-started)/3600,
             stationarity="measure raw drift; not inferred from static SC convergence"))

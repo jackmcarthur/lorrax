@@ -1,4 +1,5 @@
 from typing import Callable
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -10,6 +11,67 @@ from jax import shard_map
 # registered Sigma-path class (``docs/architecture/ffi_layout.md``, the
 # engine-swap parity rule), not a bit-equality promise between FFT engines.
 FLAT_K_FFT_VALUE_RTOL = 1.0e-12
+
+
+def _bosonic_q_identity(value):
+    return value
+
+
+def make_bosonic_q_comb(mesh_xy: Mesh, kgrid, qgrid) -> Callable:
+    """Represent ordinary coarse-q quadrature on a nested fine full BZ.
+
+    The callable maps ``[prod(qgrid),mu,nu]`` at ``P(None,'x','y')`` to
+    ``[prod(kgrid),mu,nu]`` on the SAME endpoint shards. Only canonical
+    unshifted coarse rows are accepted by this contract (the caller must
+    authenticate their physical coordinates). Fine rows at those nested
+    points contain ``Nk/Nq * value``; all other rows are exactly zero.
+    This is the Fourier dual of periodic real-lattice tiling with factor
+    ``sqrt(Nk/Nq)``, NOT W interpolation or WS zero embedding. Both grids
+    must have three positive integer extents and qgrid must divide kgrid.
+
+    Equal grids return an identity callable, without arithmetic or copying.
+    The caller prices the chosen program compiled at its actual operands
+    before allocating the larger output; this factory owns no value cache.
+    """
+    import numpy as np
+    grids = []
+    for raw in (kgrid, qgrid):
+        value = np.asarray(raw)
+        if (value.shape != (3,) or value.dtype.kind not in 'iu'
+                or np.any(value <= 0)):
+            raise ValueError("GATE bosonic_q_comb: grids must have three positive integer extents")
+        grids.append(tuple(map(int, value)))
+    fine, coarse = grids
+    if any(k % q for k, q in zip(fine, coarse)):
+        raise ValueError("GATE bosonic_q_comb: qgrid must divide kgrid")
+    if fine == coarse:
+        return _bosonic_q_identity
+    return _bosonic_q_comb_program(mesh_xy, fine, coarse)
+
+
+@lru_cache(maxsize=8)
+def _bosonic_q_comb_program(mesh_xy, kgrid, qgrid):
+    import numpy as np
+    from jax.sharding import NamedSharding
+    nk, nq = int(np.prod(kgrid)), int(np.prod(qgrid))
+    coords = np.indices(qgrid).reshape(3, -1)*(
+        np.asarray(kgrid)//np.asarray(qgrid))[:, None]
+    rows = np.ravel_multi_index(coords, kgrid).astype(np.int32)
+    spec = P(None, 'x', 'y')
+    face = NamedSharding(mesh_xy, spec)
+
+    def local(value):
+        output = jnp.zeros((nk, *value.shape[1:]), value.dtype)
+        return output.at[jnp.asarray(rows)].set(value*(nk/nq))
+
+    operation = shard_map(local, mesh=mesh_xy, in_specs=spec, out_specs=spec, check_vma=False)
+
+    @jax.jit(in_shardings=face, out_shardings=face)
+    def apply(value):
+        if value.ndim != 3 or value.shape[0] != nq:
+            raise ValueError("GATE bosonic_q_comb: expected [Nq,mu,nu] canonical face")
+        return operation(value)
+    return apply
 
 
 # ============================================================================
