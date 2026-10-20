@@ -6,8 +6,14 @@ f-transform ``f(ε) = shift − a·ε^n``-type map of :func:`f_transform_eigs`,
 which compresses the window's spectrum into a band-limited kernel,
 
     fH(R)   = Σ_k e^{−ik·R} C̃_k f(E_k) C̃_k†          (build_fH_R)
-    fH(k')  = Σ_R e^{ik'·R} fH(R)                      (h_transform, per path k')
+    fH(k')  = Σ_R Σ_{T∈WS(R)} N_R⁻¹ e^{ik'·(R+LT)} fH(R)   (h_transform, per path k')
     E(k')   = f^{-1}(eig fH(k'))                       (newton_inv)
+
+Off the coarse grid each R class is represented by its Wigner–Seitz images in
+the supercell ``L = diag(kgrid)`` with ``1/N_deg`` weights
+(:func:`build_ws_R_images_np`, :func:`ws_fourier_phase`); every off-grid
+consumer (``h_transform``, ``bse_setup.compute_wfns_fi``, ``orbital``) uses
+that one set.  On the coarse grid it equals the plain sum.
 
 ``h_transform`` runs that on a k path; ``bandstructure.bse_setup`` runs the
 same fH on a fine grid for the BSE.  The CLI is ``bandstructure.htransform``.
@@ -322,6 +328,111 @@ def build_R_grid_np(kgrid: tuple[int, int, int]) -> np.ndarray:
     return np.stack(np.meshgrid(
         _shift(kgrid[0]), _shift(kgrid[1]), _shift(kgrid[2]), indexing='ij'),
         axis=-1).reshape(-1, 3)
+
+
+#: Relative tie tolerance on the squared Cartesian length of supercell images
+#: (``build_ws_R_images_np``).  Distinct lattice-vector lengths of a real cell
+#: differ by far more; images related by a point operation agree to rounding.
+WS_TIE_RTOL = 1.0e-6
+
+
+def lattice_bohr(wfn) -> np.ndarray:
+    """Real-space lattice ``(3, 3)`` in bohr, ROWS ``a_i`` (``wfn.avec·alat``).
+
+    The one conversion every off-grid Fourier consumer uses to build its
+    Wigner–Seitz images (:func:`build_ws_R_images_np`).
+    """
+    return np.asarray(wfn.avec, dtype=np.float64) * float(wfn.alat)
+
+
+def build_ws_R_images_np(kgrid: tuple[int, int, int], lattice: np.ndarray,
+                         *, tie_rtol: float = WS_TIE_RTOL,
+                         search: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """Wigner–Seitz images of the coarse-grid lattice vectors, with weights.
+
+    A Γ-centred ``kgrid`` determines ``f(R) = N⁻¹ Σ_k e^{2πik·R} f(k)`` only on
+    the classes ``R + L·T`` of the supercell ``L = diag(kgrid)``.  Off the grid
+    the interpolant must choose representatives, and that choice is the whole
+    off-grid model.  The lattice-coordinate box of :func:`build_R_grid_np`
+    chooses ``R_i ∈ [−n/2, n/2)``: its ``−n/2`` faces have no ``+n/2`` partner
+    and, for a non-cubic metric (FCC, hexagonal), the box is not invariant
+    under the point group, so star members ``Sk`` of an off-grid ``k`` see
+    different R sets (Si 4³→8³: 239 meV star spread of band energies).
+
+    Here each class keeps EVERY image of minimal Cartesian length
+    ``|(R + L·T)·A|`` (the Wigner–Seitz cell of the supercell) with weight
+    ``1/N_deg`` (Wannier90's ``ndegen``).  The image set is invariant under
+    every lattice point operation and under ``R → −R``, and on the coarse
+    grid ``e^{−2πik·L·T} = 1`` with ``Σ w = 1`` reproduces the box sum
+    exactly.  Axes with a single k point carry no images (slab z, wires):
+    their ``T_i`` is 0, so no phase along them is ever created.
+
+    Parameters
+    ----------
+    kgrid : (3,) int
+        Coarse Γ-centred mesh ``(n1, n2, n3)``.
+    lattice : (3, 3) float
+        Real-space lattice, ROWS ``a_i`` in bohr (:func:`lattice_bohr`).
+    tie_rtol : float
+        Images whose squared length is within ``tie_rtol`` (relative) of the
+        class minimum are degenerate.
+    search : int
+        Supercell translations ``T_i ∈ [−search, search]`` searched per
+        periodic axis; an image found on the search boundary refuses.
+
+    Returns
+    -------
+    R_tab : (nk, n_deg_max, 3) float64
+        Lattice coordinates of the images, class rows in
+        :func:`build_R_grid_np` order (the ``make_flat_k_ifftn`` R index).
+    w_tab : (nk, n_deg_max) float64
+        ``1/N_deg`` on images, 0 on pad slots; every row sums to 1.
+    """
+    grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
+    lat = np.asarray(lattice, dtype=np.float64)
+    if grid.shape != (3,) or np.any(grid <= 0) or lat.shape != (3, 3):
+        raise ValueError(
+            f"build_ws_R_images_np: invalid k grid {tuple(grid)} or lattice "
+            f"shape {lat.shape}")
+    base = build_R_grid_np(tuple(grid))                         # (nk, 3)
+    rng = [np.arange(-search, search + 1) if n > 1 else np.zeros(1)
+           for n in grid]
+    T = np.stack(np.meshgrid(*rng, indexing='ij'), axis=-1).reshape(-1, 3)
+    img = base[:, None, :] + (T * grid)[None, :, :]             # (nk, nT, 3)
+    d2 = np.einsum('kti,ij,ktj->kt', img, lat @ lat.T, img)
+    dmin = d2.min(axis=1, keepdims=True)
+    keep = d2 <= dmin * (1.0 + float(tie_rtol)) + 1e-12 * float(np.trace(
+        lat @ lat.T))
+    on_edge = np.any(np.abs(T) == search, axis=1) & np.any(grid > 1)
+    if np.any(keep & on_edge[None, :] & (search > 0)):
+        raise ValueError(
+            f"build_ws_R_images_np: a minimal image of the {tuple(grid)} "
+            f"supercell lies on the T = ±{search} search boundary; the cell "
+            f"is too skewed for this search radius.  Raise ``search``.")
+    n_deg = keep.sum(axis=1)
+    n_max = int(n_deg.max())
+    R_tab = np.zeros((base.shape[0], n_max, 3), dtype=np.float64)
+    w_tab = np.zeros((base.shape[0], n_max), dtype=np.float64)
+    for r in range(base.shape[0]):
+        sel = img[r, keep[r]]
+        R_tab[r, :sel.shape[0]] = sel
+        w_tab[r, :sel.shape[0]] = 1.0 / sel.shape[0]
+    return R_tab, w_tab
+
+
+def ws_fourier_phase(k: jax.Array, R_tab, w_tab) -> jax.Array:
+    """Off-grid Fourier weights ``(..., nk)`` of the Wigner–Seitz R classes.
+
+    ``Σ_d w_tab[R, d] · exp(−2πi k·R_tab[R, d])`` — the phase row that
+    contracts against an ``(nk, ...)`` lattice image in
+    :func:`build_R_grid_np` order (``fH_R``, operator images).  ``k`` is
+    ``(..., 3)`` fractional; the result is periodic in ``k``, so no wrap of
+    ``k`` is needed or assumed.  Tables come from
+    :func:`build_ws_R_images_np` (host constants).
+    """
+    arg = jnp.einsum('...x,rdx->...rd', k, jnp.asarray(R_tab))
+    return jnp.einsum('...rd,rd->...r', jnp.exp(-2j * jnp.pi * arg),
+                      jnp.asarray(w_tab, dtype=jnp.float64))
 
 
 def outer_r_shell_mask(kgrid: tuple[int, int, int]) -> np.ndarray:
@@ -1467,8 +1578,10 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     log_fn(f"  [route] fH_q metric: identity (selected-state Galerkin basis; "
            f"no dense {rank}x{rank} identity object)")
 
-    R_grid = jnp.asarray(build_R_grid_np(kgrid))
-    jax.block_until_ready(R_grid)                            # instrument:
+    # Off-grid R set: Wigner–Seitz images of the coarse supercell with 1/N_deg
+    # weights (host constants), so star members of an off-grid k see the same
+    # model.  On the coarse grid this is the box sum exactly.
+    R_tab, w_tab = build_ws_R_images_np(kgrid, lattice_bohr(wfn))
     timing.record("ht.S_chol", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
@@ -1497,7 +1610,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
 
     def _fourier_matrix(batch_k, operator_R):
         """The one path-q contraction for both fH and active character."""
-        phase = jnp.exp(-2j * jnp.pi * (batch_k @ R_grid.T))
+        phase = ws_fourier_phase(batch_k, R_tab, w_tab)
         mat = 0.5 * jnp.einsum(
             'bk,kij->bij', phase, operator_R, optimize=True)
         mat = jax.lax.with_sharding_constraint(mat, face_ij_shard)

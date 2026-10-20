@@ -1726,7 +1726,8 @@ def main(argv=None):
         _path_quality_records = []
         bundle = compute_wfns_fi(
             ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
-            kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
+            kgrid_co=kgrid_co_ct, lattice_bohr=ht.lattice_bohr(wfn),
+            band_window_fi=(b_min, b_max),
             mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
             batch_size=int(params.get("wfn_fi_q_chunk", 0)),
             eigh_backend=args.eigh_backend,

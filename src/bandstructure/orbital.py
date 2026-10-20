@@ -243,8 +243,8 @@ def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry):
 
 
 def path_orbital_moments(parents, sym, window, source_coefficients,
-                         path_coefficients, kpath, kgrid, mesh, energies,
-                         deps_tol_ry):
+                         path_coefficients, kpath, kgrid, lattice, mesh,
+                         energies, deps_tol_ry):
     """Wavepacket moments ``(q, 3, band)`` mu_B of the path states.
 
     The ``window`` of the parent velocity, unfolded by the polar time-odd
@@ -259,7 +259,7 @@ def path_orbital_moments(parents, sym, window, source_coefficients,
         1, 0), NamedSharding(mesh, P()))
     v_path = gather_to_host(interpolate_band_operator(
         velocity, source_coefficients, path_coefficients, np.asarray(kpath),
-        kgrid, mesh))[:len(energies)]
+        kgrid, lattice, mesh))[:len(energies)]
     return np.asarray(orbital_moments(v_path, energies,
                                       deps_tol_ry=deps_tol_ry)[0])
 
@@ -293,17 +293,19 @@ def _check_shapes(operator_cart, source_coefficients, kgrid):
 
 
 def interpolate_band_operator(operator_cart, source_coefficients,
-                              path_coefficients, kpath, kgrid, mesh):
+                              path_coefficients, kpath, kgrid, lattice, mesh):
     """Return (q_carrier,component,band,band) matrices in the path basis.
 
     ``operator_cart`` is (component,k,n,n), ``source_coefficients`` is
     (k,n,rank), and ``path_coefficients`` is (q_carrier,rank,band), exactly
-    as returned by htransform.  Matrix elements use bra n, ket m.  The q
+    as returned by htransform; ``lattice`` (3, 3) bohr rows a_i sets the
+    Wigner–Seitz R images of the off-grid phase sum
+    (``fh_interp.build_ws_R_images_np``).  Matrix elements use bra n, ket m.  The q
     carrier is cut into passes of one q per device; one ``lax.scan`` runs
     every pass of a component (the phase sum is local on the matrix face,
     one face->q exchange per pass, then the local band rotation).
     """
-    from bandstructure.fh_interp import build_R_grid_np
+    from bandstructure.fh_interp import build_ws_R_images_np, ws_fourier_phase
     _check_shapes(operator_cart, source_coefficients, kgrid)
     rank = int(source_coefficients.shape[2])
     nq_carrier = int(path_coefficients.shape[0])
@@ -317,7 +319,7 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     # Device d holds carrier rows [d*n_pass, (d+1)*n_pass); pass p takes
     # row d*n_pass + p on every device, so no coefficient moves.
     q_tab = np.swapaxes(q_tab.reshape(step, n_pass, 3), 0, 1)
-    R = jnp.asarray(build_R_grid_np(kgrid))
+    R_tab, w_tab = build_ws_R_images_np(kgrid, lattice)
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     batch = NamedSharding(mesh, P(('x', 'y'), None, None))
     exchange = face_to_batch_reshard(mesh)
@@ -330,7 +332,7 @@ def interpolate_band_operator(operator_cart, source_coefficients,
 
         def one_pass(_, xs):
             q, c = xs
-            phase = jnp.exp(-2j * jnp.pi * (q @ R.T))
+            phase = ws_fourier_phase(q, R_tab, w_tab)
             value = 0.5 * jnp.einsum('qk,kmn->qmn', phase, operator_R)
             value = exchange(jax.lax.with_sharding_constraint(value, face))
             value = value + jnp.conj(jnp.swapaxes(value, -1, -2))
@@ -352,33 +354,31 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     return jnp.stack(parts, axis=1)
 
 
-def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
+def grid_moments(fH_R, f_params, operator_R_builders, kgrid, lattice, grid,
                  n_states, mesh):
     """Energies and band diagonals of the fitted states on a uniform q grid.
 
     Returns ``(E (Nq, n_states) Ry, D (n_op, Nq, n_states), newton
     residual)`` with q in C order over ``grid``.  One pass is one q_z plane:
-    a separable phase sum ``z -> y -> x`` over the coarse lattice R (local on
-    the ``(rank, rank)`` face; no dense-grid FFT carrier) and one face->q
+    one dense ``(plane, nk)`` phase over the Wigner–Seitz images of the
+    coarse supercell (``lattice`` (3, 3) bohr rows a_i;
+    ``fh_interp.build_ws_R_images_np``), contracted locally on the
+    ``(rank, rank)`` face (no dense-grid FFT carrier), and one face->q
     exchange.  The first ``lax.scan`` solves fH on every plane and keeps the
     fitted-state eigenvectors; ``fH_R`` is then deleted (consumed) and each
     operator's lattice image, built by its ``operator_R_builders`` entry
     only when needed, is read by a second scan.  At most one dense
     ``(nk, rank, rank)`` image is resident.
     """
-    from bandstructure.fh_interp import build_R_grid_np, newton_inv
+    from bandstructure.fh_interp import (build_ws_R_images_np, newton_inv,
+                                         ws_fourier_phase)
     a_f, n_f, shift = f_params
-    nx, ny, nz = (int(v) for v in kgrid)
     Nx, Ny, Nz = (int(v) for v in grid)
     rank = int(fH_R.shape[-1])
-    R = build_R_grid_np(kgrid).reshape(nx, ny, nz, 3)
-
-    def phases(N, Rvals):
-        return np.exp(-2j * np.pi * np.outer(np.arange(N) / N, Rvals))
-
-    Px = jnp.asarray(phases(Nx, R[:, 0, 0, 0]))
-    Py = jnp.asarray(phases(Ny, R[0, :, 0, 1]))
-    Pz = jnp.asarray(phases(Nz, R[0, 0, :, 2]))
+    R_tab, w_tab = build_ws_R_images_np(kgrid, lattice)
+    q_xy = np.stack(np.meshgrid(np.arange(Nx) / Nx, np.arange(Ny) / Ny,
+                                indexing='ij'), axis=-1).reshape(-1, 2)
+    Pz = jnp.asarray(np.arange(Nz) / Nz)
     n_plane = Nx * Ny
     carrier = padded_axis(n_plane, mesh, name="moment grid plane",
                           spec=P(('x', 'y'), None, None), axis=0).carrier
@@ -387,12 +387,11 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
     plane_q = NamedSharding(mesh, P(None, ('x', 'y'), None))
     plane_v = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
 
-    def plane(pz, X):
-        X = X.reshape(nx, ny, nz, rank, rank)
-        A = jnp.einsum('z,xyzab->xyab', pz, X)
-        A = jnp.einsum('jy,xyab->xjab', Py, A)
-        A = 0.5 * jnp.einsum('ix,xjab->ijab', Px, A).reshape(
-            n_plane, rank, rank)
+    def plane(qz, X):
+        q = jnp.concatenate([jnp.asarray(q_xy),
+                             jnp.full((n_plane, 1), qz)], axis=1)
+        A = 0.5 * jnp.einsum('qk,kab->qab', ws_fourier_phase(q, R_tab, w_tab),
+                             X)
         A = pad_axis(A, carrier, axis=0).array
         A = exchange(jax.lax.with_sharding_constraint(A, face))
         return A + jnp.conj(jnp.swapaxes(A, -1, -2))

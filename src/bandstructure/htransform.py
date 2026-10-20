@@ -41,7 +41,7 @@ from runtime.run_session import RunSession
 from .production_report import HTransformProductionReport
 from .fh_interp import (
     GALERKIN_BASIS_FILE, _build_mesh_xy, compact_galerkin_state,
-    h_transform, initialize_kpath, initialize_wfns,
+    h_transform, initialize_kpath, initialize_wfns, lattice_bohr,
     resolve_qp_hamiltonian_state, setup_wfn_and_sym,
 )
 # The library half is bandstructure.fh_interp.  These names stay importable
@@ -198,6 +198,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
     report.heading("Band character and moments")
     log = report.emit
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    lattice = lattice_bohr(wfn)
     nk, nb_fit = int(ctilde.shape[0]), int(ctilde.shape[1])
     band_start = int(result["band_start"])
     # Electrons in the window: the count, less one per (spinor) band below.
@@ -283,7 +284,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         nq = int(kpath_frac.shape[0])
         path_ops = gather_to_host(interpolate_band_operator(
             ops, wfn_ctilde, result["coeffs_on_path"],
-            np.asarray(kpath_frac), kgrid, mesh))[:nq]
+            np.asarray(kpath_frac), kgrid, lattice, mesh))[:nq]
         expect = np.einsum('qaii->qai', path_ops).real
         extra = {}
         if "orbital" in colors:
@@ -292,7 +293,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
             m_path = path_orbital_moments(
                 parents, sym, slice(band_start, band_start + nb_fit),
                 wfn_ctilde, result["coeffs_on_path"], kpath_frac, kgrid,
-                mesh, E_path, deps_tol)
+                lattice, mesh, E_path, deps_tol)
             m_n = average_within_degenerate_sets(
                 np.einsum('a,qai->qi', axis, m_path), E_path, deps_tol)
             clip = float(np.percentile(np.abs(m_n), 95))
@@ -336,7 +337,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde,
                             kgrid, mesh) for i in range(3)]
         E, D, residual = grid_moments(
-            fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
+            fH_R, f_params, builders, kgrid, lattice, grid, n_return_bands,
+            mesh)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
             np.asarray(gather_to_host(E)), np.asarray(gather_to_host(D)),
@@ -633,6 +635,7 @@ def main(argv=None):
                 wfns_fi = compute_wfns_fi(
                     ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
                     kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+                    lattice_bohr=lattice_bohr(wfn),
                     kgrid_fi=params["kgrid_fi"],
                     band_window_fi=(b_min, b_max),
                     mesh_xy=mesh_xy, a_band_index=args.a_band,

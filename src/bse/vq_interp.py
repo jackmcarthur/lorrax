@@ -2250,7 +2250,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         read_lorrax_input,
         resolve_distrib_la_batched_route,
     )
-    from bandstructure.fh_interp import initialize_wfns
+    from bandstructure.fh_interp import initialize_wfns, lattice_bohr
     from common.psi_G_store import build_psi_G_store
     from common.wfn_layout import band_sphere_spec
     # THE ζ SOLVE, BEFORE ANYTHING EXPENSIVE.  A refit whose solve does not
@@ -2469,6 +2469,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             "zeta_solve": _zeta_solve,
             "ctilde": ctilde, "B_at_mu": B_at_mu, "enk_sigma": enk_sigma,
             "kgrid_co": (int(meta.nkx), int(meta.nky), int(meta.nkz)),
+            "lattice_bohr": lattice_bohr(wfn),
             "basis": basis, "psi_source": psi_source, "wfn": wfn,
             "meta": meta, "sym": sym, "k_frac": k_frac,
             "r_chunk_ranges": r_chunk_ranges, "n_rtot": n_rtot,
@@ -2771,6 +2772,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
         bundle = compute_wfns_fi(
             ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
             enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
+            lattice_bohr=rst["lattice_bohr"],
             band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
             return_coeffs=True,
             distrib_la_batched_route=rst.get(
