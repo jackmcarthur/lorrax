@@ -1444,6 +1444,7 @@ def _integrate_sigma_batches(
     tau_capacity=None,
     omega_grid_ry=None,
     keep_branches=False,
+    projection_bands=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
@@ -1485,8 +1486,14 @@ def _integrate_sigma_batches(
     fence('tau.setup', sync_ranks=True)
     with timing.section('tau.setup'):
         s = wfns.slices
-        sigma_axis = sigma_band_axis(
-            int(s.nb_sigma), mesh_xy, ansatz="dynamic")
+        n_project = int(s.nb_sigma)
+        if projection_bands is not None:
+            lo, hi = map(int, projection_bands)
+            if not (0 <= lo < hi <= int(s.nb_sigma)):
+                raise ValueError("GATE sigma_projection_bands: destination interval must lie "
+                                 "inside the Sigma projection window")
+            n_project = hi - lo
+        sigma_axis = sigma_band_axis(n_project, mesh_xy, ansatz="dynamic")
         bracketed = brackets is not None
         if bracketed:
             brackets = tuple(
@@ -1498,6 +1505,11 @@ def _integrate_sigma_batches(
         k_unfold_plan = wfns.green_parent.plan
         (psi_coh_xn, psi_coh_yr,
          psi_proj_xr, psi_proj_yn, _, _) = parent_sigma_operands(wfns)
+        if projection_bands is not None:
+            # The two internal Green faces still contain the full band sum.
+            psi_proj_xr, psi_proj_yn = _sigma_projection_faces(
+                tuple(projection_bands), psi_proj_xr.sharding,
+                psi_proj_yn.sharding)(psi_proj_xr, psi_proj_yn)
         psi_proj_xr = pad_to_axis(
             psi_proj_xr, sigma_axis, axis=1)
         psi_proj_yn = pad_to_axis(
@@ -1856,6 +1868,279 @@ def _integrate_sigma_batches(
             branches=branches)
 
 
+@lru_cache(maxsize=16)
+def _sigma_projection_faces(bands, left_sharding, right_sharding):
+    """Select real destinations on device, independent of the internal Green.
+
+    Faces are ``(k,band,spin,mu)`` and ``(k,spin,mu,band)``. Only their
+    destination band axes change; centroid layouts are retained, with no
+    orbital face gathered to the host.
+    """
+    lo, hi = map(int, bands)
+    return jax.jit(lambda left, right: (left[:, lo:hi], right[..., lo:hi]),
+                   out_shardings=(left_sharding, right_sharding))
+
+
+def _ordered_pole_real(poles, *, xp=np):
+    """Reference-sector classifier, without changing any physical pole.
+
+    The roundoff-zero policy is the established retarded-reference one:
+    64 float64 eps times max(max|p|,1), independently per q bank.
+    """
+    scale = xp.maximum(xp.max(xp.abs(poles), axis=-1, keepdims=True), 1.0)
+    zero = xp.abs(poles.real) <= 64*np.finfo(np.float64).eps*scale
+    return xp.where(zero, 0.0, poles.real)
+
+
+def ordered_shared_pole_plan(poles, counts, branches, omega_ry, *, eta_ry, eps, scope=None):
+    """Plan retarded reference branches of a general two-endpoint shared bank.
+
+    ``poles`` is the small replicated complex ``(q,K)`` census in Ry,
+    ``counts`` its active prefixes. Unlike the equilibrium oscillator store,
+    poles are signed and may grow. Both electronic branches use the literal
+    denominator ``omega - e - p + i eta``; no real/PSD pole projection or
+    Hermitian completion is permitted. Only scalar extrema reach the shared
+    certified box-rule builder. Product windows keep the spatial executor
+    independent of the state-pole product.
+
+    ``branches`` carry electronic energies relative to the common frequency
+    frame in BOTH spaces, and the exact full-density panel weights. All
+    returned rows use positive-time retarded integration. The small final
+    hole tables are converted to the legacy advanced convention by their
+    consumer, not by altering the native convolution.
+    """
+    from gw.efermi import band_in_occupation_window
+    from gw.ppm_windows import _SigmaWindow
+    from gw.sigma_box_plan import (make_sigma_box_spec, fit_sigma_box_specs,
+                                   sigma_box_executor_nodes)
+    from .sigma_windows import SharedSigmaWindow
+
+    p = np.asarray(poles, np.complex128)
+    n = np.asarray(counts, np.int64)
+    omega = np.asarray(omega_ry, np.float64)
+    eta = float(eta_ry)
+    if p.ndim != 2 or n.shape != p.shape[:1] or np.any(n < 0) or np.any(n > p.shape[1]):
+        raise ValueError("GATE ordered_sigma_census: expected complex (q,K) poles and active counts")
+    live = np.arange(p.shape[1])[None] < n[:, None]
+    frequency = _ordered_pole_real(p)
+    if np.any(~np.isfinite(p[live])) or not np.isfinite(eta) or eta <= 0.0:
+        raise ValueError("GATE ordered_sigma_census: finite active poles and positive eta required")
+    growth = max(0.0, float(np.max(p.imag[live], initial=0.0)))
+    if eta <= growth:
+        raise ValueError(f"GATE ordered_sigma_laplace: eta {eta:.12g} Ry must exceed "
+                         f"collective growth {growth:.12g} Ry")
+    if omega.ndim != 1 or not omega.size or not np.all(np.isfinite(omega)):
+        raise ValueError("GATE ordered_sigma_frequencies: finite nonempty frequency vector required")
+    specs = []
+    for branch in branches:
+        energy = np.asarray(jax.device_get(branch.E_A), np.float64)
+        mask = np.asarray(jax.device_get(branch.base_mask_A), bool)
+        weight = branch.band_weight
+        if weight is not None:
+            mask &= np.asarray(band_in_occupation_window(jax.device_get(weight)), bool)
+        if not np.any(mask):
+            continue
+        sign = 1 if branch.space == "cond" else -1
+        pole_live = live & (sign * frequency >= 0.0)
+        if not np.any(pole_live):
+            continue
+        # The reference ansatz partitions by Re p; the zero-frequency
+        # convention is half in each branch, applied by the W synthesis.
+        pole_near = max(abs(float(omega.min())), abs(float(omega.max())))
+        pole_near += max(0.0, -float((sign * energy[mask]).min())) + 1.5 * eta
+        cut = sign * pole_near
+        pole_parts = ((-np.inf, cut), (cut, 0.0)) if sign < 0 else ((0.0, cut), (cut, np.inf))
+        for ip, (plo, phi) in enumerate(pole_parts):
+            select = pole_live & (frequency >= plo if np.isneginf(plo) or plo == 0.0 else frequency > plo)
+            select &= frequency <= phi
+            if not np.any(select):
+                continue
+            selected = p[select]
+            # States far from every resonance are separate sign-definite
+            # boxes, rather than widening the expensive crossing box.
+            elo = float(omega.min() - selected.real.max() - 1.5 * eta)
+            ehi = float(omega.max() - selected.real.min() + 1.5 * eta)
+            state_parts = ((-np.inf, elo), (elo, ehi), (ehi, np.inf))
+            stats, parents = [], []
+            bounds = []
+            for q in range(p.shape[0]):
+                v = p[q, select[q]]
+                if v.size:
+                    parents.append(q)
+                    stats.append((float(v.real.min()), float(v.real.max()),
+                                  float((-v.imag).min()), float((-v.imag).max())))
+                    bounds.append((plo, phi, -np.inf, -np.inf, np.inf, np.inf))
+            for ie, (lo, hi) in enumerate(state_parts):
+                state_mask = mask & (energy > lo) & (energy <= hi)
+                if not np.any(state_mask):
+                    continue
+                for negative in (False, True):
+                    columns = np.flatnonzero((omega < 0.0) == negative)
+                    if not columns.size:
+                        continue
+                    name = f"ordered:{branch.space}:p{ip}:e{ie}:w{int(negative)}"
+                    spec = make_sigma_box_spec(name=name, frequencies=omega[columns],
+                        states=energy[state_mask], pole_stats=stats, pole_sign=1.0, eta_ry=eta)
+                    if spec["kind"] == "crossing":
+                        # Crossing rules can visit both imaginary-time
+                        # directions. Center BOTH independent factors in
+                        # their actual supports rather than assuming a
+                        # positive oscillator spectrum at zero reference.
+                        # These phases cancel exactly in the scalar fold;
+                        # no pole, denominator or rule is changed.
+                        ev = energy[state_mask]
+                        spec["E_ref_A"] = 0.5*(float(ev.min())+float(ev.max()))
+                        spec["E_ref_B"] = 0.5*(min(x[0] for x in stats)+max(x[1] for x in stats))
+                    spec.update(branch=branch, mask=state_mask, omega_idx=columns,
+                                omega_abs=abs(omega[columns]),
+                                bounds=np.asarray(bounds, np.float64),
+                                pole_indices=np.asarray(parents, np.int32),
+                                external_sign=-1 if negative else 1)
+                    specs.append(spec)
+    fits, _ = fit_sigma_box_specs(specs, eta, eps=float(eps), scope=scope)
+    rows, receipts = [], []
+    for spec, fit in zip(specs, fits):
+        window = _SigmaWindow(name=spec["name"],
+            nodes=sigma_box_executor_nodes(fit, 1.0, eta), mask_A=spec["mask"],
+            E_ref_A=spec["E_ref_A"], E_ref_B=spec["E_ref_B"],
+            omega_sign=spec["external_sign"], project="full", prefactor=-1.0,
+            max_error=fit["sup_error"], provenance=fit["one_line"])
+        rows.append(SharedSigmaWindow(window=window, E_A=spec["branch"].E_A,
+            omega_abs=spec["omega_abs"], omega_idx=spec["omega_idx"],
+            pole_indices=spec["pole_indices"], bounds=spec["bounds"],
+            phase_real=np.zeros(len(spec["pole_indices"]), bool),
+            band_weight=spec["branch"].band_weight, space=spec["branch"].space))
+        receipts.append(dict(name=spec["name"], box_ry=list(spec["box"]),
+            node_count=int(window.n_tau), sup_error=float(fit["sup_error"]),
+            eps=float(eps), runtime_noise_bound=float(fit["noise_bound"]),
+            project="full", growth_bound_ry=growth))
+    return rows, dict(n_windows=len(rows), window_tau_pairs=sum(r.window.n_tau for r in rows),
+                      growth_bound_ry=growth, evaluation_margin_ry=eta - growth, windows=receipts)
+
+
+def _ordered_shared_pole_synthesis(io, meta, header, *, mesh_xy):
+    """Bind full-port ``L exp[-i(p-ref)tau] R†`` to the existing native sweep.
+
+    General models have every q as an explicit parent. Thus their native
+    mode-9 load reads the current q directly in BOTH retarded branches;
+    there is no real-pole crossing shortcut, q-negated advanced weight,
+    spatial rank reduction, or pole axis on the synthesized W tile.
+    """
+    from file_io.shared_pole_store import read_general_shared_pole_faces
+    from distrib_la import gemm_plan, matmul_workspace_bytes_per_rank
+    nq, m = int(header["n_q_irr"]), int(meta.mu_basis.n_packed)
+    ledger = meta.shared_pole_capacity
+    ambient = ledger.live_stages
+    left, right, poles, counts = read_general_shared_pole_faces(
+        io, (0, nq), meta=meta, header=header)
+    width = int(poles.shape[1])
+    resident = sum(int(a.addressable_shards[0].data.nbytes)
+                   for a in (left, right, poles, counts))
+    stage = "sigma.general.resident"
+    ledger.reserve(stage, resident_bytes_per_rank=resident, workspace_bytes_per_rank=0,
+                   concurrent_with=ambient)
+    ledger.live_stages = (*ambient, stage)
+    wedge, loads, trs = _shared_pole_q_wedge(meta, header, mesh_xy=mesh_xy, with_trs=True)
+    if np.any(trs != 0) or not np.array_equal(np.asarray(header["q_irr_full_idx"]), np.arange(nq)):
+        raise ValueError("GATE ordered_sigma_full_q: general model must retain identity full-q parents")
+    gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=nq, dtype=np.complex128,
+                     layout="face", enable_active_range=True, warmup=False)
+    native = matmul_workspace_bytes_per_rank(mesh_xy, ((nq, m, width), (nq, width, m)),
+                                             np.complex128, backend="distributed", batched_route="auto")
+
+    def w_kernel(left, right, poles, counts, bounds, branch, load, ref, tau):
+        index = jnp.arange(width)[None]
+        active = index < counts[:, None]
+        lower, upper = bounds[:, :1], bounds[:, 1:]
+        frequency = _ordered_pole_real(poles, xp=jnp)
+        selected = active & ((frequency > lower) | ((lower == 0.0) & (frequency == 0.0)))
+        selected &= (frequency <= upper) & (branch * frequency >= 0.0)
+        # R+ = theta(Re p) R, R- = -theta(-Re p) R. The factors store
+        # literal first-order residues: never divide them by 2 Omega.
+        reference_weight = branch * jnp.where(frequency == 0.0, 0.5, 1.0)
+        phase = jnp.where(selected, poles - ref, 0j)
+        weight = jnp.where(selected, reference_weight * jnp.exp(-1j * phase * tau), 0j)
+        lo = jnp.min(jnp.where(selected, index, width), axis=1)
+        hi = jnp.max(jnp.where(selected, index + 1, 0), axis=1)
+        ranges = jnp.stack((jnp.minimum(lo, hi), hi), axis=1)
+        value = _shared_pole_contract(left, right, weight, gemm=gemm, layout="face", intervals=ranges)
+        # Full-q identity loads never read the second slot. Keep the one
+        # operator aliased there, rather than manufacture an unjustified
+        # Hermitian/transposed residue or a second full tile.
+        return value, value, load
+
+    kernel = _synthesis_program(("ordered-full-port", mesh_xy, nq, m, width),
+                                lambda: jax.jit(w_kernel))
+
+    def intervals(indices, bounds):
+        out = np.tile(np.asarray((1.0, 0.0)), (nq, 1))
+        out[np.asarray(indices, int)] = np.asarray(bounds)[:, :2]
+        return out
+
+    branch_sign = {space: device_put_process_local(np.asarray(value, np.float64),
+                                                   NamedSharding(mesh_xy, P()))
+                   for space, value in (("cond", 1), ("val", -1))}
+
+    def operands(space, bounds):
+        return left, right, poles, counts, bounds, branch_sign[space], loads[0]
+
+    def close(result=None):
+        nonlocal left, right, poles, counts
+        try:
+            jax.block_until_ready(result if result is not None else (left, right, poles, counts))
+        finally:
+            left = right = poles = counts = None
+            ledger.live_stages = ambient
+
+    synthesis = WSynthesis(kernel, operands, lambda: (left, right, poles, counts), close,
+        native, ("ordered-full-port", mesh_xy, nq, m, width),
+        tile_bytes=16 * nq * m * m // int(mesh_xy.size), window_intervals=intervals)
+    synthesis.q_wedge = wedge
+    return synthesis
+
+
+def ordered_shared_pole_sigma(wfns, model, meta, mesh_xy, *, request, sigma_branches,
+                             regularization_width_ry, quadrature_eps, projection_bands,
+                             band_brackets=None,
+                             print_fn=print):
+    """Full microscopic, both-retarded Σ from a general shared-frequency bank.
+
+    ``model`` is the authenticated full-port screening handle. Returns the
+    usual ``SigmaOmegaResult`` with literal retarded ``cond`` and ``val``
+    branch tables, in Ry, plus its certified quadrature receipt. The same
+    native face Green, FFT convolution, destination projection, device node
+    loop and capacity admission as every production GW Σ are used.
+    """
+    from file_io.shared_pole_store import (validate_general_shared_pole_model,
+                                          open_shared_pole_model)
+    header = validate_general_shared_pole_model(model["path"], expected_identity=model["identity"],
+        mesh_xy=mesh_xy, capacity=meta.shared_pole_capacity)
+    if header["digest"] != model["digest"]:
+        raise ValueError("GATE ordered_sigma_identity: model handle digest differs from store")
+    with open_shared_pole_model(model["path"], mesh_xy=mesh_xy) as io:
+        synthesis = _ordered_shared_pole_synthesis(io, meta, header, mesh_xy=mesh_xy)
+        try:
+            poles, counts = (np.asarray(jax.device_get(a)) for a in synthesis.resident_operands()[2:])
+            plan, receipt = ordered_shared_pole_plan(poles, counts, sigma_branches,
+                request.frequencies_ry, eta_ry=regularization_width_ry, eps=quadrature_eps,
+                scope=(f"ordered:{header['digest']}:{float(regularization_width_ry):.16g}:"
+                       f"{float(quadrature_eps):.16g}"))
+            print_fn(f"  native full-port Sigma: {header['n_mu_logical']} mu, "
+                     f"{header['n_q_full']} q, Kmax {header['Kmax']}, "
+                     f"{receipt['window_tau_pairs']} tau pairs; "
+                     f"Laplace margin {receipt['evaluation_margin_ry'] * RYD_TO_EV:.6g} eV")
+            result = _integrate_sigma_batches(wfns, ((0, None, None, None),),
+                int(header["n_q_irr"]), plan, request, meta, mesh_xy,
+                pole_batch_size=1, w_synthesis=synthesis, keep_branches=True,
+                brackets=band_brackets,
+                projection_bands=projection_bands, print_fn=print_fn)
+            synthesis.close(result.sigma_c_kij)
+            return result, receipt
+        except BaseException:
+            synthesis.close()
+            raise
+
+
 #: The causal branches of the Sigma sweep (``gw.ppm_windows._iter_branches``'s
 #: ``space``): ``cond`` sums the particle propagator (weight 1 - f, residue
 #: R_+), ``val`` the hole propagator (weight f, residue R_-).
@@ -2165,6 +2450,7 @@ def integrate_sigma_store(
     tau_kernel_factory=None,
     omega_grid_ry=None,
     keep_branches=False,
+    projection_bands=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -2209,7 +2495,7 @@ def integrate_sigma_store(
             band_counts=band_counts, odd_residue_off=odd_residue_off,
             q_wedge=q_wedge, tau_capacity=tau_capacity,
             tau_kernel_factory=tau_kernel_factory, omega_grid_ry=omega_grid_ry,
-            keep_branches=keep_branches, print_fn=print_fn)
+            keep_branches=keep_branches, projection_bands=projection_bands, print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -2302,6 +2588,7 @@ def compute_sigma_c_mpa_omega_grid(
     group_fixed=None,
     linalg=None,
     keep_branches=False,
+    projection_bands=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -2344,6 +2631,9 @@ def compute_sigma_c_mpa_omega_grid(
     result also carries the Sigma of each causal branch from the same sweep
     (``SigmaOmegaResult.branches``); the D = 0 observability twin, when it
     runs, is not branch-resolved.
+    ``projection_bands`` restricts the real destination interval on the
+    loaded band axis, without truncating the internal band sum. The
+    on-shell request must use the same compact destination energies.
     """
     if sigma_w_model not in ("mpa", "shared_pole"):
         raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
@@ -2590,7 +2880,8 @@ def compute_sigma_c_mpa_omega_grid(
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
                         tau_capacity=geometry.get("sc_tau_capacity"), omega_grid_ry=grid_ry,
-                        keep_branches=keep_branches, print_fn=print_fn)
+                        keep_branches=keep_branches, projection_bands=projection_bands,
+                        print_fn=print_fn)
                 except BaseException:
                     if owned:
                         synthesis.close()
@@ -2605,7 +2896,8 @@ def compute_sigma_c_mpa_omega_grid(
                     band_counts=band_counts,
                     tau_capacity=geometry.get("sc_tau_capacity"),
                     tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
-                    keep_branches=keep_branches, print_fn=print_fn)
+                    keep_branches=keep_branches, projection_bands=projection_bands,
+                    print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
         # extra sweep whose sigma_c_odd_kij nobody reads.
@@ -2621,6 +2913,7 @@ def compute_sigma_c_mpa_omega_grid(
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=True,
             tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
+            projection_bands=projection_bands,
             print_fn=lambda *args, **kwargs: None)
         return _attach_ordered_odd_sigma(total, even)
 

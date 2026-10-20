@@ -103,7 +103,7 @@ TD_DEFAULTS = {
     "lorrax.collision_snapshot_tol_ev": 1e-4,
     "lorrax.collision_snapshot_mixing": 0.7,
     "lorrax.collision_snapshot_acceleration": "anderson",
-    "lorrax.collision_density_rank": 8,
+    "lorrax.collision_density_rank": None,
     "lorrax.collision_pole_order": 48,
     "lorrax.collision_projection_order": 400,
     "lorrax.collision_pencil_mb": 128,
@@ -226,9 +226,18 @@ def _check_collision(vals: dict) -> None:
     if (form != "off" and vals["lorrax.collision_screening"] in ("joint", "joint_frozen")
             and statistics == "unspecified"):
         raise _gate("td_collision_statistics", "joint screening statistics not explicitly selected",
-                    "collision_statistics = 'retarded_reference', 'finite_lag' or 'lossless_bath'",
-                    "select the statistical model explicitly; finite_lag is not generally thermal; "
-                    "lossless_bath pinches screening coherences and uses a weak colored-bath prescription")
+                    "collision_statistics = 'retarded_reference'",
+                    "select the reference branch approximation explicitly")
+    if form != "off" and vals["lorrax.collision_screening"] in ("joint", "joint_frozen"):
+        if statistics != "retarded_reference":
+            raise _gate("td_collision_full_microscopic", f"collision_statistics = {statistics!r}",
+                        "collision_statistics = 'retarded_reference'",
+                        "finite_lag and lossless_bath are archived projected-model experiments, "
+                        "not full microscopic screening adapters")
+        if vals["lorrax.collision_density_rank"] is not None:
+            raise _gate("td_collision_full_microscopic", "collision_density_rank was set",
+                        "the complete microscopic ISDF density space",
+                        "remove collision_density_rank; no spatial projection is made")
     if (form != "off" and statistics in ("lossless_bath", "retarded_reference")
             and vals["lorrax.collision_screening"] not in ("joint", "joint_frozen")):
         raise _gate("td_collision_statistics", f"{statistics} without joint screening",
@@ -249,16 +258,22 @@ def _check_collision(vals: dict) -> None:
             "td_collision_keldysh_screening",
             f"collision_screening = {vals['lorrax.collision_screening']!r}",
             "collision_screening = 'frozen', 'joint' or 'joint_frozen'",
-            "use the equilibrium W branches; the refreshed and shared-pole paths rebuild only "
-            "retarded W from populations and do not supply the nonequilibrium W< required by "
-            "the column-sampled MGKBA collision operator",
+            "the older refreshed/shared-pole adapters update populations only; use the "
+            "full-density instantaneous-energy native joint adapter with its explicitly "
+            "selected retarded_reference branch approximation",
         )
-    for key in ("collision_snapshot_steps", "collision_density_rank", "collision_pole_order",
+    for key in ("collision_snapshot_steps", "collision_pole_order",
                 "collision_projection_order", "collision_pencil_mb", "collision_fit_samples"):
         value = vals[f"lorrax.{key}"]
         if (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise _gate("td_collision_snapshot", f"{key} = {value!r}",
                         "a positive integer", f"set [lorrax] {key}")
+    density_rank = vals["lorrax.collision_density_rank"]
+    if density_rank is not None and (isinstance(density_rank, bool)
+            or not isinstance(density_rank, int) or density_rank < 1):
+        raise _gate("td_collision_snapshot", f"collision_density_rank = {density_rank!r}",
+                    "unset (legacy prototype: a positive integer)",
+                    "remove collision_density_rank")
     if vals["lorrax.collision_fit_samples"] < 4:
         raise _gate("td_collision_snapshot", "collision_fit_samples < 4",
                     "at least four distinct supports", "increase collision_fit_samples")
@@ -699,9 +714,18 @@ def inactive_keys(deck) -> dict:
           "lorrax.collision_rate_intermediates", "lorrax.collision_basis",
           "lorrax.collision_internal_pairing"),
          v["lorrax.collision"] == "off", "the collision term's; collision = 'off'"),
-        (("lorrax.collision_spm_support_sites_ev", "lorrax.collision_spm_chi0_active"),
+        (("lorrax.collision_spm_support_sites_ev",),
+         v["lorrax.collision"] != "off"
+         and v["lorrax.collision_screening"] not in ("shared_pole", "joint", "joint_frozen"),
+         "shared-pole screening only"),
+        (("lorrax.collision_spm_chi0_active",),
          v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "shared_pole",
-         "collision_screening = 'shared_pole' only"),
+         "legacy population-only shared_pole adapter only; native joint retains full rho"),
+        (("lorrax.collision_density_rank", "lorrax.collision_pole_order",
+          "lorrax.collision_projection_order", "lorrax.collision_pencil_mb",
+          "lorrax.collision_fit_samples", "lorrax.collision_fit_real_axis",
+          "lorrax.collision_fit_height_ev"),
+         True, "archived projected-model controls; native joint uses the source GW shared-pole recipe"),
         (("lorrax.collision_screening_gamma_ev",),
          v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "refreshed",
          "collision_screening = 'refreshed' only"),
@@ -1071,16 +1095,16 @@ TD_KEY_DOCS = {
     "lorrax.collision_screening": (
         "", "The W of the collision coefficients and of ΔΣ^h. The column-sampled MGKBA "
         "operator admits `frozen`, the GW run's equilibrium W0 and its explicit "
-        "lesser/greater branches; `joint`, snapshot rational "
-        "screening at every converged snapshot; and `joint_frozen`, the identical "
-        "reduced equilibrium screening held fixed as a control. Joint modes require "
-        "`collision_basis = instantaneous`. Density rank, rational supports/order, "
-        "held-out errors and finite lag decay have explicit controls below. Joint modes "
-        "also require explicit `collision_statistics`: `retarded_reference` fits only "
-        "full-rho retarded response and uses equilibrium-style reference branches; "
-        "`finite_lag` is the historical "
-        "nonthermal statistical model; `lossless_bath` uses an explicitly secular "
-        "screening bath with lossless RPA modes and weak colored-transition statistics. "
+        "lesser/greater branches; `joint`, full microscopic shared-pole screening at "
+        "every converged snapshot; and `joint_frozen`, the identical microscopic "
+        "equilibrium screening held fixed as a control. Joint modes require "
+        "`collision_basis = instantaneous` and `collision_statistics = retarded_reference`. "
+        "The native response and momentum-FFT self-energy retain all ISDF directions, "
+        "all supplied virtual bands, and the complete active density. The source GW "
+        "shared-pole recipe owns frequency supports, directions and pole capacity; "
+        "`collision_spm_support_sites_ev` overrides its sites. There is no fixed "
+        "spatial Coulomb projection. The historical finite_lag/lossless_bath adapters "
+        "were projected-model experiments and are refused on the native joint route. "
         "`refreshed` and `shared_pole` are refused by "
         "`td_collision_keldysh_screening`: those experimental paths reconstruct retarded W from "
         "instantaneous populations but lack the full instantaneous-energy/density snapshot "
@@ -1116,18 +1140,10 @@ TD_KEY_DOCS = {
         "then define the reference collision, without fitting independent lesser "
         "fluctuations. Signed/complex residues are retained; this is not a complete "
         "nonequilibrium Keldysh model or a positivity guarantee. "
-        "`finite_lag` explicitly accepts a lag-decay "
-        "statistical model whose screened equilibrium FDT is known not to hold in "
-        "general, even as the decay tends to zero. `lossless_bath` instead declares "
-        "a stationary screening bath: instantaneous-energy screening coherences are "
-        "pinched, while full rho remains in the material Hamiltonian and electronic "
-        "collision lines. A bounded signed Hermitian response reduction supplies real "
-        "RPA poles; weak colored-transition baths assign fluctuation residues, including "
-        "independent response-free noise. The common-temperature limit obeys the "
-        "reduced model's equilibrium FDT. Stability, covariance and held-out response "
-        "checks must pass. This is an explicit approximation, not exact coherent "
-        "screening or an electronic Pauli-bound guarantee. This key is not a fit or "
-        "convergence tolerance. Legacy frozen screening and collision-off defaults "
+        "`finite_lag` and `lossless_bath` remain recognized names for archived "
+        "projected-model experiments, but native joint propagation refuses them "
+        "rather than silently changing spatial or statistical models. This key "
+        "is not a fit or convergence tolerance. Legacy frozen screening and collision-off defaults "
         "are unchanged.", ("td_collision_statistics",)),
     "lorrax.collision_rebase": (
         "= auto", "With refreshed or shared-pole screening and `collision = subtracted`: "
@@ -1208,61 +1224,42 @@ TD_KEY_DOCS = {
         "Anderson accelerator with bounded history; `linear` uses bounded mixing alone. "
         "Both obey the same sweep budget and physical residual acceptance test.", ("td_collision",)),
     "lorrax.collision_density_rank": (
-        "", "With `joint` or `joint_frozen` screening: rank of the fixed Coulomb "
-        "density-space projection. All supplied electronic bands remain in the "
-        "polarization; screening coherences are retained by retarded_reference and "
-        "finite_lag but explicitly "
-        "pinched by lossless_bath. Converge this independent spatial "
-        "approximation against collision coefficients and dynamics.", ("td_collision",)),
+        "", "Retired spatial-projection control, recognized to diagnose old prototype "
+        "decks. Native `joint`/`joint_frozen` refuses any set value; remove the key. "
+        "The complete microscopic ISDF space is retained.", ("td_collision_full_microscopic",)),
     "lorrax.collision_pole_order": (
-        "", "Maximum rational response order for retarded_reference, common "
-        "lesser/greater order for finite_lag, or reduced response order for lossless_bath. Response "
-        "and fluctuation statistics use the same reduced model; independent "
-        "response-free noise must also be retained.", ("td_collision",)),
+        "", "Archived projected-model frequency-order control; unused by native "
+        "joint screening. The source GW shared-pole recipe owns its pole capacity, "
+        "not this former small-model bound.", ("td_collision",)),
     "lorrax.collision_projection_order": (
-        "", "With finite_lag: maximum reduced state count in the causal Keldysh projection workspace. "
-        "This explicit capacity guard defaults to 400; increase it when converging "
-        "rational order only if the required dense host memory and cubic solve cost "
-        "are available. Unused by lossless_bath. It does not relax response or noise acceptance.", ("td_collision",)),
+        "", "Archived projected finite_lag causal-projection workspace guard; "
+        "unused by native joint screening.", ("td_collision",)),
     "lorrax.collision_pencil_mb": (
-        "MiB", "Maximum size of each complex full-block Loewner pencil, in MiB "
-        "(2^20 bytes). Factorization workspace and copies require approximately eight "
-        "such arrays. For lossless_bath it instead bounds the retained orthonormal "
-        "transition basis plus conservative dense pole-bank, reciprocal-bank and "
-        "downstream common-union workspace estimates. This explicit capacity guard "
-        "does not choose rational order or "
-        "relax response or noise acceptance.", ("td_collision",)),
+        "MiB", "Archived projected-model workspace guard; unused by native joint "
+        "screening, which prices its reduced tangential pencil and distributed "
+        "full-ISDF factors separately.", ("td_collision",)),
     "lorrax.collision_fit_samples": (
-        "", "Number of finite complex frequency supports for joint rational fitting "
-        "or lossless rational Krylov shifts. Independent held-out response checks "
-        "must pass; finite_lag additionally checks dressed noise on held-out frequencies, "
-        "while lossless_bath certifies collective normalization and statistical residues. "
-        "Retarded_reference checks response only, without an independent noise fit.",
+        "", "Archived projected-model support count; unused by native joint "
+        "screening. Its support sites come from the source GW shared-pole recipe "
+        "or collision_spm_support_sites_ev.",
         ("td_collision",)),
     "lorrax.collision_fit_real_axis": (
-        "", "Also train the joint rational fit on exact real parts of its complex "
-        "fit supports. The declared positive finite lag decay makes these boundary "
-        "samples finite. Real training supports are disjoint from the independent "
-        "real dressed-noise checks. This adds sampling and pencil cost, not frequency "
-        "integration, a regulator change or relaxed acceptance. Unused by lossless_bath "
-        "and retarded_reference.", ("td_collision",)),
+        "", "Archived projected finite_lag boundary-support option; unused by "
+        "native joint screening.", ("td_collision",)),
     "lorrax.collision_fit_tolerance": (
-        "", "Relative held-out tolerance in reduced Coulomb coordinates: finite_lag "
-        "checks both fluctuation bubbles, retarded screening and dressed fluctuation noise; "
-        "lossless_bath checks retarded screening, with separate normalization and "
-        "lesser/greater residue-positivity gates. Retarded_reference checks the "
-        "retarded polarization and screened response only.",
+        "", "Relative held-out full microscopic retarded-response fit tolerance. "
+        "A passed W fit is not a self-energy convergence certificate: additionally "
+        "converge the complete complex column-shell self-energy and dynamics.",
         ("td_collision",)),
     "lorrax.collision_adiabatic_ev": (
-        "eV", "Declared positive exponential decay of frozen polarization lag kernels "
-        "in finite_lag or retarded_reference response sampling. The historical key name does not imply "
-        "a validated physical adiabatic limit: screened equilibrium FDT can fail even "
-        "as this decay tends to zero. Separate from collision eta and fit offsets. "
-        "Unused by lossless_bath: statistical weights are defined before collision "
-        "regularization rather than selected by artificial damping.", ("td_collision",)),
+        "eV", "Declared positive exponential decay of the frozen polarization lag "
+        "kernel. Separate from collision eta and the source recipe's sampling "
+        "offsets. The historical name does not imply adiabatic statistical preparation "
+        "or exact nonequilibrium fluctuation-dissipation.", ("td_collision",)),
     "lorrax.collision_fit_height_ev": (
-        "eV", "Imaginary offset of the rational fit supports. It is numerical sampling "
-        "geometry and is separate from finite lag decay and collision broadening.",
+        "eV", "Archived projected-model sampling offset; unused by native joint "
+        "screening. The source GW recipe owns its support heights, independently "
+        "of polarization lag decay and collision broadening.",
         ("td_collision",)),
     "lorrax.collision_internal_pairing": (
         "= vertex", "With `collision_in_scattering = full`: the energy pairing of the "

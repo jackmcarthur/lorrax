@@ -26,6 +26,80 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from .efermi import OCCUPATION_WEIGHT_FLOOR, band_in_occupation_window
 
 
+def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=None):
+    """Native shared-node scalar quadrature for the FULL signed gap interval.
+
+    Energies/sites use Ry; all screening bands participate, including frozen
+    to active virtual transitions. The interval and rule use no population
+    threshold. Only the forward ``1/(d-z)`` rule is needed because the full
+    commutator stream retains both independent rho-insertion terms itself.
+    The returned small plain dictionaries contain ``times`` in 1/Ry and
+    ``weights[member,node]`` for ``1/(z-d+i gamma)``. Native minimax panels
+    handle a rule exceeding one node carrier; no dense frequency grid enters.
+    """
+    import minimax
+    energy, sites = np.asarray(energy, float), np.asarray(sites, complex)
+    if (energy.ndim != 2 or sites.ndim != 1 or not sites.size or gamma_ry <= 0
+            or not np.isfinite(energy).all() or not np.isfinite(sites).all()
+            or np.any(sites.imag+gamma_ry <= 0)):
+        raise ValueError("GATE response_full_density: finite full bands and upper Laplace supports required")
+    extent = float(energy.max()-energy.min())
+    shifted = sites+1j*gamma_ry
+    # Hold ONLY accepted scalar quadrature on a containing interval, never
+    # current density, W, physical poles, or wavefunctions. The refresh owner
+    # supplies a fresh dictionary at each physical Hamiltonian solve.
+    key = (shifted.tobytes(), float(tolerance))
+    if (held is not None and held.get("key") == key
+            and float(held["extent_ry"]) >= extent):
+        return held["rules"]
+    if held is not None:
+        extent += RESPONSE_HOLD_PAD_EV/RYD_TO_EV
+    # Different hardware/BLAS must not choose different node counts and hence
+    # different FFT collectives. Gather attempts through the response owner.
+    bound = 4*1024**3
+    tree = lambda members: minimax.ResponseGroupTree(-extent, extent, shifted[list(members)],
+        rel_tol=tolerance, panels=True, max_pencil_bytes=bound, max_panel_count=32)
+    groups = _gather_group_rules([tuple(range(len(sites)))], tree)[0]
+    result = []
+    for group in groups:
+        count = int(group["count"])
+        times = np.asarray(group["t"][:count], complex)
+        reference = float(group["reference_ry"])
+        # The stream carries the reference in its bounded Green phases; do
+        # not separately form a tiny coefficient times an overflowing Green.
+        weights = -np.asarray(group["value"][:, 0, :count])
+        result.append(dict(members=list(map(int, group["members"])), times=times,
+                           weights=weights, reference_ry=reference,
+                           sampled_error=float(np.max(group["sampled_error"])),
+                           coefficient_mass=float(np.max(group["coefficient_mass"])),
+                           construction=group.get("construction", "shared_hankel"),
+                           interval_ry=[-extent, extent], max_pencil_bytes=bound,
+                           max_panel_count=32))
+    if held is not None:
+        held.update(key=key, extent_ry=extent, rules=result)
+    return result
+
+
+def full_density_bare_moments(operands, meta, *, mesh_xy, q_ids):
+    """Exact full-rho coefficients X1/X2 of the native raw polarization.
+
+    ``operands=(psi_mun,psi_nmu,psi_rho_mun,energy)`` are the same native
+    faces as the full-density time stream. Three zero-time ordered products
+    evaluate powers 0 and Eb-Ed exactly by the binomial identity. No
+    finite-frequency fit or large-frequency subtraction supplies moments.
+    """
+    from .w_isdf import full_density_response_stream
+    pm, pn, ph, energy = operands
+    nk, ns, nmu, nb = pm.shape
+    common = dict(q_ids=q_ids, n_outputs=1, layout="face")
+    grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    def term(a, b):
+        stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
+                                               moment_powers=(a, b), **common)
+        return stream(jnp.zeros(1, complex), jnp.ones((1, 1), complex), pm, pn, ph, energy)[:, 0]
+    return term(0, 0), term(1, 0)-term(0, 1)
+
+
 def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     """Plan physical Dyson samples and exact high-frequency moments.
 
@@ -1836,7 +1910,13 @@ def _rule_round(trees, known, world):
                 else:
                     descend(i, half, odds, depth+1)
         for i, node in need:
-            descend(i, node, min(1., trees[i].size(node)/wide), 1)
+            # Explicitly bounded trees can use verified panel quadrature
+            # INSTEAD of their metadata-sized Hankel pencil. Its cubic cost
+            # estimate would otherwise fill idle ranks with dozens of costly
+            # child QR attempts even when the needed whole group succeeds.
+            # Still distribute all NEEDED nodes; only idle speculation stops.
+            if getattr(trees[i], "max_pencil_bytes", None) is None:
+                descend(i, node, min(1., trees[i].size(node)/wide), 1)
         for *_, i, node in sorted(candidates):
             r = min(range(world), key=lambda r: (load[r], r))
             if load[r] + estimate(i, node) <= span or (

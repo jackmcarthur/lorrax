@@ -36,6 +36,36 @@ def _adjoint(a):
     return jnp.conj(jnp.swapaxes(a, -1, -2))
 
 
+def general_tangential_pencil(left, right, *, matmul):
+    """Two-sided Loewner pencil of a general, full-port retarded response.
+
+    ``left=(mu,Q,V)`` contains support frequencies ``mu[l]`` in Ry,
+    directions ``Q[...,n,l]`` and left actions ``V[...,l,n]=Q.H W(mu)``.
+    ``right=(lambda,Q,O)`` contains ``lambda[r]``, ``Q[...,n,r]`` and
+    ``O[...,n,r]=W(lambda) Q``. Directions select frequency interpolation
+    conditions, not a spatial basis: both action endpoints retain all n ports.
+    The caller supplies the native distributed GEMM; no Hermitian, positive
+    residue, real-pole, or equilibrium symmetry assumption enters.
+
+    Returns ``(E,A,B,C)`` for ``C (z E-A)^-1 B``. Left/right frequencies
+    must be disjoint (confluent derivative conditions are not used here).
+    All matrix products preserve the caller's native matrix layout.
+    """
+    mu, ql, vl = left
+    lam, qr, wr = right
+    mu, lam = jnp.asarray(mu), jnp.asarray(lam)
+    if (mu.ndim != 1 or lam.ndim != 1 or ql.shape[-1] != mu.size
+            or qr.shape[-1] != lam.size or vl.shape[-2] != mu.size
+            or wr.shape[-1] != lam.size or ql.shape[-2] != qr.shape[-2]):
+        raise ValueError("GATE shared_general_pencil: inconsistent tangential action shapes")
+    a = matmul(vl, qr)
+    b = matmul(ql, wr, transa="C")
+    denominator = mu[:, None] - lam[None, :]
+    # Host support tables are validated before tracing by the constructor.
+    return (-(a - b) / denominator,
+            -(mu[:, None] * a - lam[None, :] * b) / denominator, vl, wr)
+
+
 # ---- the tile-interleaved block order of a face pencil ----
 #
 # A pencil axis is a run of logical blocks: the originals and mirrors of the finite

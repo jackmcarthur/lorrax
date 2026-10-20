@@ -202,6 +202,18 @@ def _pencil_columns(size, npoles):
     return np.unique(np.r_[ids[:16], np.round(np.geomspace(16, size-1, width)).astype(int)])
 
 
+def _pencil_workspace_bytes(size, npoles):
+    """Conservative live host bytes of the reference Hankel QR/SVD.
+
+    Include the square sampling grid, blocks and their stack, the adjoint
+    QR operands/results and SVD work arrays. This is admission metadata, not
+    an allocation or a change of the approximation's acceptance criteria.
+    """
+    width = npoles*len(_pencil_columns(size, npoles))
+    rank = min(size, width)
+    return 16*(size*size + 8*size*width + 12*rank*rank)
+
+
 def host_pencils(zps, size, columns, steps):
     """The reference shift pencils, one ``(s, shift)`` per ``(padding, step)``, lazily.
 
@@ -358,7 +370,7 @@ def _imaginary_times(lo, hi, poles, tol, decay_rate, capacity):
 RESPONSE_PANEL_LIMIT = 16
 
 
-def _sampled(lo, hi, pole, times, coeff, decay_rate):
+def _sampled(lo, hi, pole, times, coeff, decay_rate, probe=None):
     """Sampled error and mass of given coefficients of 1/(d-p) and 1/(d-p)^2.
 
     :func:`_project`'s probe, basis and units (errors of eta/(d-p) and
@@ -367,11 +379,12 @@ def _sampled(lo, hi, pole, times, coeff, decay_rate):
     """
     eta = abs(pole.imag)
     span, zp = (hi-lo)/eta, (pole-lo)/eta
-    x = np.unique(np.r_[0., span,
-        span/2*(1-np.cos(np.pi*(np.arange(1400)+.5)/1400)),
-        zp.real+np.linspace(-5, 5, 500)])
-    x = x[(x >= 0) & (x <= span)]
-    probe = np.unique(np.r_[x, np.linspace(0, span, 2501)])
+    if probe is None:
+        x = np.unique(np.r_[0., span,
+            span/2*(1-np.cos(np.pi*(np.arange(1400)+.5)/1400)),
+            zp.real+np.linspace(-5, 5, 500)])
+        x = x[(x >= 0) & (x <= span)]
+        probe = np.unique(np.r_[x, np.linspace(0, span, 2501)])
     origin = 0. if decay_rate else lo
     scaled = coeff*np.array([eta, eta*eta])
     error = np.zeros(2)
@@ -385,7 +398,46 @@ def _sampled(lo, hi, pole, times, coeff, decay_rate):
     return error, np.sum(abs(scaled), axis=0)
 
 
-def _imaginary_panels(lo, hi, poles, tol, decay_rate, capacity, limit=RESPONSE_PANEL_LIMIT):
+def _sampled_shared(lo, hi, poles, times, coefficients, decay_rate):
+    """The SAME sampled tests, sharing common probes at identical pole height.
+
+    Chebyshev/uniform rows depend on height but not pole real part. Evaluate
+    that exponential matrix once per height and batch the coefficient
+    products; retain every member's 500 near-resonance probes separately.
+    Sixteen bounded row blocks, no sampled matrix retained between groups.
+    """
+    errors = np.zeros((len(poles), 2))
+    masses = np.zeros_like(errors)
+    origin = 0. if decay_rate else lo
+    for eta in np.unique(poles.imag):
+        ids = np.flatnonzero(poles.imag == eta)
+        span = (hi-lo)/eta
+        common = np.unique(np.r_[0., span, span/2*(1-np.cos(np.pi*(np.arange(1400)+.5)/1400)),
+                                  np.linspace(0, span, 2501)])
+        scaled = np.hstack([coefficients[j]*[eta, eta*eta] for j in ids])
+        for xx in np.array_split(common, 16):
+            d = lo+eta*xx
+            damp = np.minimum(decay_rate*d, 0.)
+            a = np.exp(damp[:, None]-(d[:, None]-origin)*times)
+            got = (a@scaled).reshape(len(xx), len(ids), 2)
+            exact = 1/(xx[:, None]-(poles[ids]-lo)[None]/eta)
+            target = np.exp(damp)[:, None, None]*np.stack((exact, exact*exact), axis=-1)
+            errors[ids] = np.maximum(errors[ids], np.max(abs(got-target), axis=0))
+        for j in ids:
+            zp = (poles[j]-lo)/eta
+            probe = zp.real+np.linspace(-5, 5, 500)
+            probe = probe[(probe >= 0) & (probe <= span)]
+            if probe.size:
+                error, mass = _sampled(lo, hi, poles[j], times, coefficients[j], decay_rate, probe=probe)
+                errors[j] = np.maximum(errors[j], error)
+            else:
+                mass = np.sum(abs(coefficients[j]*[eta, eta*eta]), axis=0)
+            masses[j] = mass
+    return list(zip(errors, masses))
+
+
+def _imaginary_panels(lo, hi, poles, tol, decay_rate, capacity, limit=RESPONSE_PANEL_LIMIT,
+                      shared_checks=False):
     """The closed-form imaginary-axis set of :func:`_imaginary_times` in panels, or None.
 
     For Im p > 0, 1/(d-p) = i int_0^inf exp(i(p-o)s) exp(-i(d-o)s) ds (o the
@@ -412,11 +464,15 @@ def _imaginary_panels(lo, hi, poles, tol, decay_rate, capacity, limit=RESPONSE_P
     ws = np.tile(w*length/2, k)
     times = 1j*s
     origin = 0. if decay_rate else lo
-    fits = []
+    coefficients = []
     for pole in poles:
         phase = np.exp(1j*(pole-origin)*s)
-        coeff = np.column_stack((1j*ws*phase, -ws*s*phase))
-        error, mass = _sampled(lo, hi, pole, times, coeff, decay_rate)
+        coefficients.append(np.column_stack((1j*ws*phase, -ws*s*phase)))
+    fits = []
+    checked = (_sampled_shared(lo, hi, poles, times, coefficients, decay_rate) if shared_checks else
+               (_sampled(lo, hi, p, times, c, decay_rate) for p, c in zip(poles, coefficients)))
+    for pole, coeff, (error, mass) in zip(poles, coefficients,
+                                        checked):
         if (not np.isfinite(error).all() or float(np.max(error*[1., pole.imag/(2*abs(pole))])) > tol
                 or not mass[0] <= _RESPONSE_MAX_KAPPA):
             return None
@@ -462,7 +518,8 @@ def _rule(z, sets):
 
 
 def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-                         decay_rate=0., pencil=None, panels=False):
+                         decay_rate=0., pencil=None, panels=False,
+                         max_pencil_bytes=None, max_panel_count=RESPONSE_PANEL_LIMIT):
     """Shared complex-time rules for a group of response samples.
 
     Built at the Sigma rule builder's pinned BLAS thread count: the Hankel
@@ -506,9 +563,22 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     whose pencil and closed-form set both fail takes the closed-form set in
     panels of at most ``RESPONSE_NODE_CAPACITY`` nodes (:func:`_imaginary_panels`):
     several rules with the same member, whose contributions the caller adds.
+
+    ``max_pencil_bytes`` is an optional conservative HOST workspace admission
+    bound, checked before any Hankel allocation or device-source preparation.
+    With ``panels=True``, an oversized GROUP first tries the existing verified
+    composite imaginary-axis Gauss rule shared by all members; if rejected,
+    the tree splits, and a single-member refusal cannot escape the bound.
+    ``max_panel_count`` bounds its total node carriers (default 16). A larger
+    declared count adds quadrature work, never changes tolerances, error or
+    coefficient-mass checks. ``None`` preserves the unbounded legacy pencil
+    walk. Callers must collectively gather the returned small rules, exactly
+    as for all other response rule builders.
     """
     return ResponseGroupTree(lo_ry, hi_ry, z_ry, rel_tol=rel_tol, previous=previous,
-                             decay_rate=decay_rate, pencil=pencil, panels=panels).rules()
+                             decay_rate=decay_rate, pencil=pencil, panels=panels,
+                             max_pencil_bytes=max_pencil_bytes,
+                             max_panel_count=max_panel_count).rules()
 
 
 class ResponseGroupTree:
@@ -528,7 +598,8 @@ class ResponseGroupTree:
     """
 
     def __init__(self, lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None, decay_rate=0.,
-                 pencil=None, panels=False):
+                 pencil=None, panels=False, max_pencil_bytes=None,
+                 max_panel_count=RESPONSE_PANEL_LIMIT):
         lo, hi = float(lo_ry), float(hi_ry)
         z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
         if (not z.size or not np.isfinite([lo, hi, rel_tol, decay_rate]).all()
@@ -537,6 +608,11 @@ class ResponseGroupTree:
             raise ValueError('invalid response frequency/domain/tolerance')
         self.lo, self.hi, self.z, self.rel_tol, self.decay_rate = lo, hi, z, rel_tol, decay_rate
         self.pencil, self.panels = pencil, bool(panels)
+        if ((max_pencil_bytes is not None and int(max_pencil_bytes) <= 0)
+                or int(max_panel_count) < 1):
+            raise ValueError('invalid response planning capacity')
+        self.max_pencil_bytes = None if max_pencil_bytes is None else int(max_pencil_bytes)
+        self.max_panel_count = int(max_panel_count)
         self.reference = 0. if decay_rate else lo
         self.root = tuple(range(len(z)))
         self._old = {frozenset(rule["members"]): rule["t"][:rule["count"]]
@@ -557,8 +633,15 @@ class ResponseGroupTree:
         out = []
         for ps in [poles] + ([poles[i:i+1] for i in range(len(poles))] if len(members) == 1 else []):
             size = _pencil(self.lo, self.hi, ps, self.rel_tol/2, self.decay_rate)[3]
-            out.append((size, len(ps), len(_pencil_columns(size, len(ps)))))
+            if self.max_pencil_bytes is None or _pencil_workspace_bytes(size, len(ps)) <= self.max_pencil_bytes:
+                out.append((size, len(ps), len(_pencil_columns(size, len(ps)))))
         return out
+
+    def _oversized(self, poles):
+        if self.max_pencil_bytes is None:
+            return False
+        size = _pencil(self.lo, self.hi, poles, self.rel_tol/2, self.decay_rate)[3]
+        return _pencil_workspace_bytes(size, len(poles)) > self.max_pencil_bytes
 
     def warm(self, members):
         """True when an earlier rule on the node's member set is tried first (``previous``)."""
@@ -577,6 +660,11 @@ class ResponseGroupTree:
         # fit after all six geometries (Si 40 and Fe 27 samples; Si 22
         # samples reaching 22-42 eV; CHIRULE 2026-10-06), so the halves
         # are built directly, exactly as they were after that failure.
+        # An oversized node first tries the existing, verified composite
+        # imaginary-axis rule shared by ALL its members. Splitting it first
+        # would repeat the same Green-pair times once per sample.
+        if self.panels and self._oversized(_poles(self.z[list(members)])):
+            return True
         halves = self.children(members)
         return not halves or self.size(members) <= max(self.size(h) for h in halves)
 
@@ -588,6 +676,21 @@ class ResponseGroupTree:
     def _attempt(self, members):
         lo, hi, z, tol, decay_rate = self.lo, self.hi, self.z, self.rel_tol/2, self.decay_rate
         poles = _poles(z[members])
+        oversized = self._oversized(poles)
+        if oversized:
+            # Admission happens before host allocation AND before a device
+            # pencil source's prepare. The scalar error and coefficient-mass
+            # tests are exactly the ordinary imaginary-panel tests below.
+            if self.panels:
+                got = _imaginary_panels(lo, hi, poles, tol, decay_rate,
+                                        RESPONSE_NODE_CAPACITY, self.max_panel_count, shared_checks=True)
+                if got is not None:
+                    return self._panel_rules(members, poles, got, construction='bounded_imaginary_panels')
+            if len(members) > 1:
+                return None
+            raise ValueError('response planning capacity: Hankel pencil exceeds '
+                             f'{self.max_pencil_bytes} bytes and verified imaginary '
+                             f'panels did not fit/accept (limit={self.max_panel_count})')
         # A single sample keeps the full scan (its refusal is final) unless panels
         # follow a failed pencil: then it stops at the group's stagnation patience too.
         got = _shared_times(lo, hi, poles, tol, self._old.get(frozenset(members)), decay_rate,
@@ -608,21 +711,17 @@ class ResponseGroupTree:
         if self.panels:
             # The closed-form set in panels: one rule per panel, same member;
             # the caller adds their contributions (gw.response_bank chi0 blocks).
-            got = _imaginary_panels(lo, hi, poles, tol, decay_rate, RESPONSE_NODE_CAPACITY)
+            got = _imaginary_panels(lo, hi, poles, tol, decay_rate, RESPONSE_NODE_CAPACITY,
+                                    self.max_panel_count)
             if got is not None:
-                times, fits = got
-                out, start = [], 0
-                for j, t in enumerate(times):
-                    part = [(c[start:start+len(t)], e, m) for c, e, m in fits]
-                    out.append(dict(_rule(z[members], [(t, poles, part)]), members=list(members),
-                                    reference_ry=self.reference, panel=[j, len(times)]))
-                    start += len(t)
-                return out
+                return self._panel_rules(members, poles, got)
         # Forward and reverse poles on separate node sets: each node then
         # serves one orientation, exactly as separate per-pole rules do.
         sets = []
         for pole in poles:
             one = np.asarray([pole])
+            if self._oversized(one):
+                raise ValueError('response planning capacity: separate-pole Hankel exceeds bound')
             got = _shared_times(lo, hi, one, tol, None, decay_rate, pencil=self.pencil)
             if got is None:
                 raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
@@ -630,6 +729,17 @@ class ResponseGroupTree:
             sets.append((got[0], one, got[1]))
         rule = _rule(z[members], sets)
         return [dict(rule, members=list(members), reference_ry=self.reference)]
+
+    def _panel_rules(self, members, poles, got, construction='imaginary_panels'):
+        times, fits = got
+        out, start = [], 0
+        for j, t in enumerate(times):
+            part = [(c[start:start+len(t)], e, m) for c, e, m in fits]
+            out.append(dict(_rule(self.z[members], [(t, poles, part)]), members=list(members),
+                            reference_ry=self.reference, panel=[j, len(times)],
+                            construction=construction))
+            start += len(t)
+        return out
 
     def pending(self, attempts):
         """Tried nodes of the serial walk whose attempts are not in ``attempts``, in walk order."""

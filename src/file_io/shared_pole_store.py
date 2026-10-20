@@ -32,11 +32,183 @@ from file_io.commit_state import (agree_io_refusal, assert_committed, open_h5_se
 from symmetry_maps import QirrTables, validate_qirr_tables
 
 SCHEMA = "lorrax.shared-real-pole.v1"
+GENERAL_SCHEMA = "lorrax.shared-general-pole.v1"
 BANK_SCHEMA = "lorrax.shared-real-pole-bank.v3"
 SECTOR_SCHEMA = "lorrax.shared-real-pole-sectors.v1"
 _TABLE_KEYS = ("irr_idx_q", "sym_idx_q", "q_irr_frac", "sym_perm", "L_table")
 _IDENTITY_KEYS = ("iteration_id", "hamiltonian", "energies", "occupations",
                   "wavefunctions", "centroids")
+
+
+def _general_digest(path, header):
+    """Hash a general model through bounded canonical FILE row reads.
+
+    Called inside the store's collective rank0 transaction. At most 16
+    centroid rows of one parent/factor are read; no full-mu or q payload is
+    gathered from the devices. The explicit slow file digest avoids a second
+    replicated factor bank in this initial general-model implementation.
+    """
+    scientific = {k: v for k, v in header.items() if k not in ("digest", "finalized")}
+    digest = hashlib.sha256(_json(scientific).encode())
+    with open_h5_settled(path, "r") as f:
+        for name in ("left", "right"):
+            a = f[name]
+            for q in range(a.shape[0]):
+                for row in range(0, a.shape[1], 16):
+                    digest.update(np.asarray(a[q, row:row+16], dtype="<c16").tobytes())
+        digest.update(np.asarray(f["poles_ry"][:], dtype="<c16").tobytes())
+    return digest.hexdigest()
+
+
+def write_general_shared_pole_model(path, left, right, poles, K, *, q_span, meta,
+                                    tables, recipe, receipts, kmax):
+    """Commit a full-port, general complex-pole model one parent batch at a time.
+
+    ``left,right[b,mu_p,1,Kp]`` complex128 use the existing constructor face
+    handoff ``P(None,'x',None,'y')``. ``poles[b,Kp]`` (complex Ry) and int64
+    ``K[b]`` are small replicated tables. Every current full-grid q must be
+    an explicit parent: no equilibrium little-group averaging is permitted.
+    The store retains *independent* factors, including signed/complex
+    residues, and never adjusts poles. ``kmax`` is a declared fixed file
+    capacity; exceeding it refuses before any write, not a spatial truncation.
+    """
+    basis, mesh = meta.mu_basis, meta.mu_basis.mesh_xy
+    header = _metadata(meta, tables, recipe, receipts["identity"], None)
+    if header["n_q_irr"] != header["n_q_full"]:
+        _refuse("general current-density model requires every full-grid q as a parent")
+    header.update(schema=GENERAL_SCHEMA, representation="ordered_complex",
+                  normalization="Wc=left diag(1/(z_Ry-poles_Ry)) right_dagger",
+                  units={"poles_ry": "Ry", "residue": "Ry^2"},
+                  reference_statistics="retarded_reference", zero_frequency_weight=0.5,
+                  Kmax=int(kmax), factor_components=1)
+    if int(kmax) < 1:
+        _refuse("general model requires a positive declared column capacity")
+    want = NamedSharding(mesh, P(None, "x", None, "y"))
+    K = np.asarray(K, np.int64)
+    for a in (left, right):
+        if (not isinstance(a, jax.Array) or not a.sharding.is_equivalent_to(want, 4)
+                or a.shape != left.shape or a.shape[1:3] != (basis.n_packed, 1)):
+            _refuse("general factors require matching full-port native XY faces")
+    if (poles.shape != (left.shape[0], left.shape[-1]) or K.shape != (left.shape[0],)
+            or np.any(K < 0) or np.any(K > min(left.shape[-1], int(kmax)))):
+        _refuse("general pole counts exceed declared factor/file capacity")
+    active = jnp.arange(left.shape[-1])[None] < jnp.asarray(K)[:, None]
+    valid = (jnp.all(jnp.isfinite(left)) & jnp.all(jnp.isfinite(right))
+             & jnp.all(jnp.isfinite(poles))
+             & jnp.all(jnp.where(active[:, None, None], True, left == 0))
+             & jnp.all(jnp.where(active[:, None, None], True, right == 0)))
+    if not bool(valid):
+        _refuse("general factors/poles are nonfinite or have live inactive columns")
+    lo, hi = _span(q_span, header["n_q_irr"], "q_span")
+    if hi-lo != left.shape[0]:
+        _refuse("general factor batch differs from q span")
+    ledger = _capacity(meta)
+    arg, out, temporary = _conversion_bytes(basis, left.shape, want.spec, unpack=True)
+    _admit(ledger, "write_general_model", 2*out, temporary+2*arg,
+           device_panel=max(arg, out), native_host=True)
+    old = _read_staging_header(path)
+    if old is None:
+        header.update(K=[0]*header["n_q_irr"], written_q=[False]*header["n_q_irr"],
+                      construction_receipts=[])
+        with SlabIO(path, mode="w", mesh=mesh) as io:
+            _write_metadata(io, header)
+            _write_header(io, header)
+            shape = (header["n_q_irr"], basis.n_logical, 1, int(kmax))
+            io.create_dataset("left", shape=shape, dtype=np.complex128)
+            io.create_dataset("right", shape=shape, dtype=np.complex128)
+            io.create_dataset("poles_ry", shape=(header["n_q_irr"], int(kmax)), dtype=np.complex128)
+    else:
+        if old["finalized"]:
+            _refuse("finalized general models are immutable")
+        for key in ("identity", "recipe_hash", "schema", "Kmax", "centroid_digest", "qirr"):
+            if _json(old[key]) != _json(header[key]):
+                _refuse(f"general staging identity changed: {key}")
+        header = old
+    if any(header["written_q"][lo:hi]):
+        _refuse("general q span already committed")
+    width = min(left.shape[-1], int(kmax))
+    with SlabIO(path, mode="a", mesh=mesh) as io:
+        for name, a in (("left", left), ("right", right)):
+            canonical = basis.unpack_axis(a[..., :width], 1)
+            io.write_slab(name, canonical, offset=(lo, 0, 0, 0),
+                global_shape=(header["n_q_irr"], basis.n_logical, 1, int(kmax)), require_finite=True)
+        io.write_slab("poles_ry", poles[:, :width], offset=(lo, 0),
+            global_shape=(header["n_q_irr"], int(kmax)), require_finite=True)
+    header["K"][lo:hi], header["written_q"][lo:hi] = K.tolist(), [True]*(hi-lo)
+    header["construction_receipts"].append(dict(q_span=[lo, hi], receipt=receipts))
+    with SlabIO(path, mode="a", mesh=mesh) as io:
+        _write_header(io, header)
+    if all(header["written_q"]):
+        header["digest"] = rank0_read(path, stage="general_pole/digest", read=lambda: _general_digest(path, header))
+        header["finalized"] = True
+        with SlabIO(path, mode="a", mesh=mesh) as io:
+            io.write_attr("K", np.asarray(header["K"], np.int64))
+            io.write_attr("written_q", np.asarray(header["written_q"], np.int8))
+            io.write_attr("final_commit", np.bytes_(header["digest"]))
+            _write_header(io, header)
+        _record_finalized_digest(path, header["digest"])
+    return header
+
+
+def read_general_shared_pole_faces(io, q_span, *, meta, header, column_span=None):
+    """Full-port general factors: ``left_X,right_Y,poles,K`` on native faces.
+
+    The endpoint layouts match ``distrib_la.batch_gram(...,right=...)``:
+    ``P(None,'x',None,'y')`` and ``P(None,'y',None,'x')``. Poles/counts are
+    replicated. No factor transpose, spectral sign change or branch selection
+    occurs at the storage boundary.
+    """
+    if header.get("schema") != GENERAL_SCHEMA or not header.get("finalized"):
+        _refuse("general face reads require a finalized general model")
+    basis = _check_basis(meta, header)
+    ledger = _capacity(meta)
+    _check_io_capacity(ledger, io.mesh, header)
+    lo, hi = _span(q_span, header["n_q_irr"], "q_span")
+    c0, c1 = _span(column_span or (0, header["Kmax"]), header["Kmax"], "column_span")
+    width = face_width(io.mesh, header["Kmax"], (c0, c1))
+    counts = np.clip(np.asarray(header["K"][lo:hi])-c0, 0, c1-c0).astype(np.int64)
+    shapes = (hi-lo, basis.n_canonical, 1, width)
+    resident = 32*(hi-lo)*basis.n_packed*width//int(io.mesh.size)
+    _admit(ledger, "read_general_faces", resident, resident,
+           device_panel=max(16*width*basis.n_canonical, 1), native_host=True, io=io)
+    result = []
+    for name, axis, other in (("left", "x", "y"), ("right", "y", "x")):
+        spec = P(None, axis, None, other)
+        raw = io.read_slab(name, shape=shapes, offset=(lo, 0, 0, c0),
+                           valid_shape=(hi-lo, basis.n_logical, 1, c1-c0), partition_spec=spec)
+        result.append(_live_face(basis.pack_axis(raw, 1, spec=spec), counts, basis.active_mask))
+    poles = io.read_slab("poles_ry", shape=(hi-lo, width), offset=(lo, c0),
+                         valid_shape=(hi-lo, c1-c0), partition_spec=P())
+    poles = jnp.where(jnp.arange(width)[None] < jnp.asarray(counts)[:, None], poles, 0j)
+    return *result, poles, jnp.asarray(counts)
+
+
+def validate_general_shared_pole_model(path, *, expected_identity, mesh_xy, capacity):
+    """Collectively authenticate the general model, including bounded file hash."""
+    def check():
+        header = _read_header(path)
+        _check_identity(header["identity"], expected_identity)
+        if (header.get("schema") != GENERAL_SCHEMA or not header.get("finalized")
+                or not all(header["written_q"]) or header["n_q_irr"] != header["n_q_full"]):
+            _refuse("incomplete or non-full-q general model")
+        with open_h5_settled(path, "r") as f:
+            for name, shape, dtype in (
+                ("left", (header["n_q_irr"], header["n_mu_logical"], 1, header["Kmax"]), np.complex128),
+                ("right", (header["n_q_irr"], header["n_mu_logical"], 1, header["Kmax"]), np.complex128),
+                ("poles_ry", (header["n_q_irr"], header["Kmax"]), np.complex128)):
+                if name not in f or f[name].shape != shape or f[name].dtype != dtype:
+                    _refuse(f"invalid general model dataset {name}")
+            if ("final_commit" not in f or f["final_commit"][()].decode() != header["digest"]
+                    or not np.array_equal(f["K"][:], header["K"])):
+                _refuse("general count/commit metadata mismatch")
+        if not _finalized_digest_current(path, header["digest"]):
+            if _general_digest(path, header) != header["digest"]:
+                _refuse("general model payload digest mismatch")
+            _record_finalized_digest(path, header["digest"])
+        return header
+    header = rank0_read(path, stage="general_pole/validate", read=check)
+    _check_io_capacity(capacity, mesh_xy, header)
+    return header
 
 
 def _refuse(message):

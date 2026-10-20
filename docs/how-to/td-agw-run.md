@@ -191,29 +191,10 @@ For an updated-screening comparison, use `collision_basis = "instantaneous"`
 and `collision_screening = "joint"`. The material Hamiltonian and coherent
 self-energy converge together at each refresh, using one set of energies for
 the polarization, internal lines and column shells. `joint_frozen` provides
-the matched reduced equilibrium-screening control. Choose the statistics
-explicitly; an unspecified statistical preparation refuses before GW setup.
+the matched microscopic equilibrium-screening control. Select
+`collision_statistics = "retarded_reference"` explicitly.
 
-`collision_statistics = "lossless_bath"` uses the
-[lossless transition-bath prescription](../theory/td_agw_dynamical.md#lossless-transition-bath).
-It pinches the screening density between distinct instantaneous energies;
-the electronic collision, coherent Hamiltonian and propagated density retain
-the full matrix. Exact energy degeneracies are treated as subspaces, not
-discarded as coherences. Its collective-pole statistics satisfy thermal
-KMS within the same reduced response model. This is a declared secular
-screening approximation, not full-coherence screening or full-frequency
-Dyson self-consistency. `collision_adiabatic_ev` and
-`collision_fit_real_axis` are unused in this mode. Collision broadening
-remains independent. Increase `collision_pole_order` and
-`collision_pencil_mb` together when converging the retained transition
-basis; low orders adequate for a damped fit need not resolve real poles.
-The lossless memory guard also accounts for dense pole-bank and common-union
-workspaces; raising the pole order can require more than the default 128 MiB.
-Check the reported discarded screening-coherence norm, paired-q symmetry,
-response residuals and statistical residues. Positive screened-noise
-residues do not guarantee Pauli bounds for the electronic equation.
-
-The primary instantaneous-quasiparticle comparison can instead select
+The primary instantaneous-quasiparticle comparison selects
 `retarded_reference`. This fits only the full-density retarded response and
 uses equilibrium-style zero-temperature pole branches for the collision.
 No independent lesser screening model or dressed-noise fit is performed.
@@ -239,22 +220,24 @@ collision_snapshot_steps = 32
 collision_snapshot_tol_ev = 0.0001
 collision_snapshot_mixing = 0.7
 collision_snapshot_acceleration = "anderson"
-collision_density_rank = 1
-collision_pole_order = 48
-collision_projection_order = 400
-collision_pencil_mb = 256
-collision_fit_samples = 192
-collision_fit_real_axis = false
 collision_fit_tolerance = 0.02
 collision_adiabatic_ev = 0.05
-collision_fit_height_ev = 0.15
 ```
 
-These are explicit underconverged controls within that reference-bath model.
-Vary response lag decay, fit height and collision regularization separately.
-The historical `finite_lag` selection additionally reconstructs independent
-lesser fluctuations; its known statistical/FDT failure is not cured by
-numerical convergence. Neither option guarantees electronic Pauli bounds.
+The collision source's GW shared-pole recipe supplies support sites,
+frequency directions and pole capacity. `collision_spm_support_sites_ev`
+can override its sites. All microscopic ISDF directions and supplied
+virtual bands remain; the self-energy uses the native momentum FFT
+convolution, not projected pair vertices or host momentum sums. General
+independent left/right residue factors retain signed and complex modes
+without a PSD floor or pole shift. Old decks setting
+`collision_density_rank` refuse, even if the value equals the centroid count.
+
+These tolerances and cadence are starting points, not convergence evidence.
+Vary polarization lag decay, source-recipe support geometry/frequency order
+and collision regularization separately. Check the full complex column-shell
+self-energy and dynamics, not only real quasiparticle energies or a W fit.
+This nonsecular operator has no automatic electronic Pauli-bound guarantee.
 Compare a zero-field
 trajectory before interpreting pulse decay, and inspect the density spectrum,
 number balance, snapshot residual and response/noise fit errors. `subtracted`
@@ -265,47 +248,26 @@ Hartree/Fock plus M_H material Hamiltonian; a DFT-prepared density need not be
 stationary there. Both use bare HF increments, with no static reduced-W
 subtraction. See the [theory owner](../theory/td_agw_dynamical.md#damping).
 
-For `retarded_reference`, each Hamiltonian solve fixes its numerical
-polarization fitting basis after its first sweep and refits current
-response amplitudes on every subsequent sweep. The screened interaction
-and self-energy still update every time. A new physical refresh builds a
-new basis. If the fixed basis no longer meets the response checks, the
-refresh refuses; its failure record includes the Hamiltonian residual
-history. This does not relax `collision_snapshot_tol_ev`.
-
-Converge density rank together with rational order and support count. If a
-capacity guard refuses the larger fit, explicitly raise
-`collision_projection_order` (causal-projection state count, default 400) or
-`collision_pencil_mb` (each block Loewner pencil, default 128 MiB) to match
-available host resources. Self-inverse q crossing can increase the realized
-order before projection. Dense projection cost grows cubically with state
-count; pencil factorization and copies require approximately eight times the
-per-pencil storage. These controls raise capacity only: the independent
-response and noise checks keep the same tolerances.
-
-If upper-half-plane fits poorly resolve boundary noise, optionally set
-`collision_fit_real_axis = true`. This also samples the exact bubble at the
-real parts of the complex training supports and includes those values in
-the same joint fit. The declared positive finite lag decay `collision_adiabatic_ev` makes
-these boundary samples finite; it is not replaced by a tiny fit offset.
-The real training grid must be disjoint from the real dressed-noise check
-grid, so those check values remain independent and all acceptance gates
-are unchanged. This doubles training supports (roughly quadrupling pencil
-storage), adds sampling cost, and may require explicit capacity increases.
-It is finite rational fitting, not real-frequency integration or a claim
-of converged dynamics.
+The snapshot Hamiltonian must meet its physical residual tolerance; a last
+unconverged iterate is never installed. Frozen electronic bands retain their
+reference occupations and identity rotation, with the documented edge
+scissor on each side. They participate in virtual screening and the
+Hermitian self-energy, but real collision intermediates/destinations remain
+inside the active window. The screening head stays the frozen reference
+head; the electronic line energies are current.
 
 The joint snapshot's stability gate probes its installed coherent Hamiltonian.
 It follows paired field-free trajectories, so a physical HF quench is not
 mistaken for numerical perturbation growth. The stiff-split/joint-snapshot
 combination is currently refused rather than using an unvalidated basis.
 
-This exploratory executor projects the microscopic Coulomb interaction before
-fitting both polarization components. It retains separate exact response and
-noise realizations on their union pole bank; the small projected self-energy
-is evaluated by direct momentum sums on the host. It is not the large-grid
-FFT collision executor. Density rank and transfer order must be converged
-before making quantitative claims.
+The earlier projected executor and `finite_lag`/`lossless_bath` statistical
+models remain archived research helpers, not native propagation choices.
+Their rank-one trajectories are prototype results, not a full microscopic
+screening comparison. The old `collision_pole_order`,
+`collision_projection_order`, `collision_pencil_mb`, `collision_fit_samples`,
+`collision_fit_real_axis` and `collision_fit_height_ev` controls belong to
+those helpers and are marked unused in the native run log.
 
 `[lorrax] collision = "subtracted"` adds the on-shell GW collision term of a
 GN-PPM bundle ([TD-aGW dynamical §1.5](../theory/td_agw_dynamical.md#damping)):

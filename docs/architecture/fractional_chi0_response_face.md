@@ -9,6 +9,12 @@ sample takes which kernel, is owned by
 finite-occupation χ₀ is `compute_chi0_matsubara` at ν = 0, not either kernel
 here.
 
+The full-density TD snapshot uses the separate nonstationary ordered-lag
+contract in [shared-pole implementation §11](shared_pole_model.md#general-snapshot).
+Its native `full_density_response_stream` evaluates two independent density
+insertions; it must not use the diagonal-occupation reverse-product shortcut
+below for a density that does not commute with the Hamiltonian.
+
 ## Carrier
 
 | array | shape | face layout | axis layout |

@@ -23,6 +23,161 @@ from gw.shared_pole_directions import (_round_kernels, _sample_point, line_panel
 from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 
+def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
+                             max_workspace_bytes=4*1024**3, fixed_spaces=None):
+    """One canonical owner of a reduced host pencil's modal gauges.
+
+    Every rank supplies the same gathered ``E,A[l,r]``; ONLY rank zero runs
+    LAPACK. A bounded success/error record crosses first, then the exact
+    uint64 bits of the five reduced complex arrays (poles, two coefficient
+    maps and two held frequency spaces). No microscopic port or q stack
+    crosses this handoff. Distributed faces must not mix independent host
+    SVD/eigenvector gauges, even on homogeneous hardware.
+    """
+    import json
+    import numpy as np
+    from common.collectives import all_gather_processes, process_count, process_rank
+    from jax.experimental.multihost_utils import broadcast_one_to_all
+    world, rank = int(process_count()), int(process_rank())
+    options = dict(max_order=max_order, rank_tolerance=rank_tolerance,
+                   max_workspace_bytes=max_workspace_bytes, fixed_spaces=fixed_spaces)
+    if world == 1:
+        return reduce_general_pencil(E, A, **options)
+    model, status = None, None
+    if rank == 0:
+        try:
+            if not jax.config.x64_enabled:
+                raise ValueError("GATE shared_general_precision: canonical complex128 handoff requires JAX x64")
+            nl, nr = E.shape
+            # The existing reduction price covers returned maps/spaces and
+            # the later one-array-at-a-time bit broadcast. Add bounded host
+            # control records explicitly; never truncate order to fit RAM.
+            price = 16*(16*nl*nr+12*min(nl, nr)**2)+8192*(world+2)
+            if price > int(max_workspace_bytes):
+                raise ValueError(f"GATE shared_general_capacity: canonical host workspace {price} "
+                                 f"exceeds {int(max_workspace_bytes)} bytes")
+            model = reduce_general_pencil(E, A, **options)
+            arrays = [model[k] for k in ("poles_ry", "output_map", "input_map")]
+            arrays += [model["spaces"][k] for k in ("right", "left")]
+            status = dict(error=None, shapes=[list(a.shape) for a in arrays],
+                          receipt=dict(model["receipt"], canonical_owner_rank=0,
+                                       canonical_host_workspace_bytes=price))
+        except Exception as error:
+            status = dict(error=f"{type(error).__name__}: {str(error)[:1000]}")
+    payload = b'' if rank else json.dumps(status, separators=(',', ':')).encode('ascii')
+    lengths = np.asarray(all_gather_processes(np.asarray(len(payload), np.int64))).reshape(-1)
+    count = int(lengths[0])
+    # Status is bounded metadata, never eigenvector payload in a control RPC.
+    if not 0 < count <= 8192:
+        raise ValueError("GATE shared_general_owner: invalid canonical status extent")
+    record = np.zeros(count, np.uint8)
+    if rank == 0:
+        record[:] = np.frombuffer(payload, np.uint8)
+    status = json.loads(np.asarray(all_gather_processes(record))[0].tobytes())
+    if status["error"] is not None:
+        raise ValueError("GATE shared_general_owner: "+status["error"])
+    result = []
+    for i, shape in enumerate(status["shapes"]):
+        array = (np.ascontiguousarray(arrays[i], dtype=np.complex128) if rank == 0
+                 else np.zeros(shape, np.complex128))
+        # uint8 broadcast promotes under x64; uint64 preserves IEEE bits,
+        # including tiny signs/complex phases and the zero-length model.
+        bits = array.view(np.uint64)
+        if bits.size:
+            bits = np.asarray(broadcast_one_to_all(bits, is_source=rank == 0))
+        result.append(np.ascontiguousarray(bits).view(np.complex128).reshape(shape))
+    return dict(zip(("poles_ry", "output_map", "input_map"), result[:3]),
+                spaces=dict(right=result[3], left=result[4]), receipt=status["receipt"])
+
+
+def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
+                          max_workspace_bytes=4 * 1024 ** 3, fixed_spaces=None):
+    """Bounded host reduction of ONE general tangential frequency pencil.
+
+    Only ``E,A[l,r]`` (complex128) cross this seam, never full microscopic
+    response samples, q stacks, or port factors. A two-sided SVD of the
+    horizontal/vertical pencil unions chooses numerical frequency spaces;
+    generalized LAPACK eigenvectors produce unchanged complex poles and
+    independent input/output coefficient maps. No pole or residue is clipped.
+    ``max_order`` bounds realization states, not the full spatial port count.
+
+    Returns a plain mapping with ``poles_ry[K]``, ``output_map[r,K]`` and
+    ``input_map[l,K]``. Native GEMMs form full-port factors as
+    ``left=C@output_map`` and ``right=B.H@input_map``, so
+    ``Wc(z)=left@diag(1/(z-poles_ry))@right.H``. Workspace is conservatively
+    priced before any factorization. Infinite/defective poles refuse.
+    """
+    import numpy as np
+    import scipy.linalg as la
+
+    E, A = np.asarray(E, complex), np.asarray(A, complex)
+    if (E.ndim != 2 or A.shape != E.shape or min(E.shape) < 1
+            or not np.isfinite(E).all() or not np.isfinite(A).all()
+            or int(max_order) < 1 or not 0 < rank_tolerance < 1):
+        raise ValueError("GATE shared_general_pencil: finite compatible pencils required")
+    nl, nr = E.shape
+    # Both concatenated SVD operands, their factors/workspace, the projected
+    # descriptor and both eigenspaces. This is an admission bound, not a
+    # claim that LAPACK's hidden workspace is zero.
+    price = 16 * (16 * nl * nr + 12 * min(nl, nr) ** 2)
+    if price > int(max_workspace_bytes):
+        raise ValueError(f"GATE shared_general_capacity: host pencil workspace {price} "
+                         f"exceeds {int(max_workspace_bytes)} bytes")
+    scale = max(float(np.linalg.norm(E)), float(np.linalg.norm(A)))
+    if scale == 0:
+        return dict(poles_ry=np.empty(0, complex), output_map=np.zeros((nr, 0), complex),
+                    input_map=np.zeros((nl, 0), complex),
+                    spaces=dict(right=np.zeros((nr, 0), complex), left=np.zeros((nl, 0), complex)),
+                    receipt=dict(order=0, workspace_bytes=price, rank_tolerance=rank_tolerance))
+    if fixed_spaces is None:
+        y, sy, _ = la.svd(np.concatenate((E, A), axis=1) / scale,
+                         full_matrices=False, check_finite=False)
+        _, sx, xh = la.svd(np.concatenate((E, A), axis=0) / scale,
+                          full_matrices=False, check_finite=False)
+        n = min(int(max_order), int(np.count_nonzero(sy > rank_tolerance * sy[0])),
+                int(np.count_nonzero(sx > rank_tolerance * sx[0])))
+        if not n:
+            raise ValueError("GATE shared_general_rank: nonzero response has no resolved frequency span")
+        y, x = y[:, :n], xh[:n].conj().T
+    else:
+        x, y = (np.asarray(fixed_spaces[key], complex) for key in ("right", "left"))
+        n = x.shape[1]
+        if x.shape != (nr, n) or y.shape != (nl, n) or not n:
+            raise ValueError("GATE shared_general_basis: fixed spaces differ from current pencil")
+    er, ar = y.conj().T @ E @ x, y.conj().T @ A @ x
+    poles, wl, vr = la.eig(ar, er, left=True, right=True, check_finite=False)
+    if not np.isfinite(poles).all():
+        raise ValueError("GATE shared_general_poles: descriptor has an unresolved infinite pole")
+    metric = wl.conj().T @ er @ vr
+    diagonal = np.diag(metric)
+    norm = np.linalg.norm(er) * np.linalg.norm(wl, axis=0) * np.linalg.norm(vr, axis=0)
+    if np.any(np.abs(diagonal) <= 128 * np.finfo(float).eps * norm):
+        raise ValueError("GATE shared_general_poles: defective or unresolved eigenvector normalization")
+    # Generalized left/right eigenvectors are biorthogonal for distinct poles.
+    # In a degenerate eigenspace use its full metric, never per-column division.
+    inverse = la.solve(metric, np.eye(n, dtype=complex), check_finite=False)
+    output = x @ vr
+    inputs = y @ wl @ inverse.conj().T
+    residual = np.linalg.norm(ar @ vr - (er @ vr) * poles[None]) / max(
+        np.linalg.norm(ar @ vr), np.finfo(float).tiny)
+    offdiag = metric - np.diag(diagonal)
+    # Mixing distinct eigenvalues would change the transfer; only roundoff
+    # off-diagonal metric is acceptable outside exactly degenerate blocks.
+    commutator = inverse @ np.diag(poles) - np.diag(poles) @ inverse
+    commutator_error = np.linalg.norm(commutator) / max(
+        np.linalg.norm(inverse) * np.max(np.abs(poles)), np.finfo(float).tiny)
+    if residual > 1e-9 or commutator_error > 1e-9:
+        raise ValueError("GATE shared_general_eigenvectors: unresolved general modal reconstruction")
+    order = np.lexsort((poles.imag, poles.real))
+    return dict(poles_ry=poles[order], output_map=output[:, order], input_map=inputs[:, order],
+                spaces=dict(right=x, left=y),
+                receipt=dict(order=n, workspace_bytes=price, rank_tolerance=rank_tolerance,
+                             eigen_residual=float(residual), metric_offdiagonal=float(np.linalg.norm(offdiag)),
+                             modal_commutator_error=float(commutator_error),
+                             max_growth_ry=float(np.max(poles.imag)),
+                             construction="general-two-sided-tangential-loewner"))
+
+
 def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordered,
                       odd_moments, nq):
     """Resolve local or whole-mesh parent execution for one map's bank.

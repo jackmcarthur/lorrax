@@ -202,8 +202,9 @@ The runtime dispatches `joint` and `joint_frozen` to the full-density
 `tdagw.snapshot_runtime.snapshot_collision` adapter described in
 [the response/noise contract](#keldysh-screening).
 Both `refreshed` and `shared_pole` refuse with
-`GATE dynsig_collision_keldysh_screening`: their population-based retarded
-refits do not supply the required nonequilibrium lesser interaction.
+`GATE dynsig_collision_keldysh_screening`: their older population-only
+refits lack the full-density instantaneous-energy adapter and explicit
+reference-branch prescription of the native joint route.
 The refit machinery below is retained for development and its earlier
 arithmetic-operator benchmarks; those population-refit modes remain refused.
 
@@ -742,18 +743,20 @@ vertex 2.24 s per sweep.
 
 #### Full-matrix nonequilibrium screening {#keldysh-screening}
 
-`collision_screening = joint` constructs the snapshot interaction.
-With `collision_statistics = finite_lag` this uses the full-density bubbles
-and general response/noise realization described below; `retarded_reference`
-uses their full-density retarded difference with an equilibrium-like
-self-energy reference; `lossless_bath`
-selects the separate [secular transition-bath prescription](#lossless-transition-bath).
-`joint_frozen` uses the identical reduced equilibrium interaction throughout
-the run, providing a matched screening control. The passive GW shared-pole
-constructor retains its original contracts, owned by
+`collision_screening = joint` constructs the full microscopic snapshot
+interaction with `collision_statistics = retarded_reference`.
+`joint_frozen` uses the identical microscopic equilibrium interaction
+throughout the run, providing a matched screening control. The native
+response and self-energy retain every ISDF direction; frequency compression
+is not a fixed spatial Coulomb projection. General signed/complex pole
+residues have independent left and right factors. The passive equilibrium
+GW shared-pole constructor retains its original contracts, owned by
 [shared-pole theory](shared-pole-w-model.md) and its
 [implementation](../architecture/shared_pole_model.md). The earlier
 population-only `refreshed` and `shared_pole` TD modes remain refused.
+The `finite_lag` and `lossless_bath` projected-model implementations below
+are archived research helpers, not native propagation selections. Their
+rank-one trajectories do not test full microscopic screening.
 
 The snapshot stationary closure uses the one-sided transform
 $\bar X(z)=\int_0^\infty d\tau\,e^{iz\tau}X(\tau)$ and its inverse/full
@@ -808,7 +811,7 @@ with the direct real-frequency Cauchy integral, exercise a repeated pole, and
 retain the $\rho=fI$ noise pole when $W_c^R=0$. It refuses a pole on the real
 axis until the caller declares a positive finite lag decay.
 
-The production snapshot modules use a fixed Coulomb factor
+The archived projected snapshot helpers use a fixed Coulomb factor
 $v_q\simeq F_qF_q^\dagger$ of declared `collision_density_rank`. In its
 coordinates, $\widetilde P=F_q^\dagger P F_q$ and the bare interaction is the
 identity. Centroid wavefunctions and $v_q$ remain distributed; a projected
@@ -828,9 +831,9 @@ the dressed full-frequency noise. Unstable or unresolved poles refuse.
 This reduces the joint polarization before the screening algebra rather than
 fitting the screened retarded function alone.
 
-Joint screening uses the bare Hartree/Fock increment $\Delta h_{\rm HF}$,
+Both native and archived snapshot models use the bare Hartree/Fock increment $\Delta h_{\rm HF}$,
 not the reference screened-exchange kernel. With `collision_hamiltonian = hf`
-the coherent fixed point is exactly the specified projected-model closure,
+the coherent fixed point is the specified material-Hamiltonian closure,
 $H^s=h_{\rm HF}^{\rm eq}+\Delta h_{\rm HF}+M_H[\rho,H^s]$.
 The authenticated kinetic/ionic plus equilibrium Hartree and Fock matrices
 provide $h_{\rm HF}^{\rm eq}$. A DFT-prepared density need not commute with
@@ -846,9 +849,10 @@ leave an unintended density-dependent term.
 The separate controls are density rank, rational order/support count,
 fit-support height, collision regularization, and the declared exponential
 finite lag decay of the lag kernels (historical key `collision_adiabatic_ev`).
-Active `joint` and `joint_frozen` propagation requires an explicit
-`collision_statistics` selection; the default `unspecified` refuses before
-GW setup. `finite_lag` acknowledges the earlier statistical model, not a
+Native `joint` and `joint_frozen` propagation requires the explicit
+`collision_statistics = retarded_reference` selection; the default
+`unspecified` refuses before GW setup. In the archived research helpers,
+`finite_lag` acknowledges the earlier statistical model, not a
 validated physical adiabatic limit. Its screened equilibrium FDT is known
 not to hold in general, even when this decay tends to zero. The separate
 `lossless_bath` choice below declares collective statistics directly; it
@@ -1094,27 +1098,38 @@ both be assessed before interpreting damping in a propagated trajectory.
 equilibrium-like GW member. At each instantaneous Hamiltonian snapshot it
 uses the complete density matrix in the ordered retarded bubble
 $P^R=\bar P^>-\bar P^<$ and screens
-$W^R=(I-P^R)^{-1}$ in projected Coulomb coordinates. Only this response is
-fitted and independently checked. Screening does not pinch the density.
+$W^R=(I-vP^R)^{-1}v$ in the full microscopic density space. Only this
+response is fitted and independently checked. Screening does not pinch the density.
 The input response has the declared finite lag decay
 `collision_adiabatic_ev`; collision evaluation uses its separate $\eta$.
 
-Within each physical refresh's Hamiltonian fixed-point solve, the first
-current polarization fit chooses numerical state-space matrices $A,B$.
-Every subsequent iterate resamples the current full-density $P^R$ and
-refits only its output matrix $C$, so $P^R=C(zI-A)^{-1}B$. Dyson feedback
-and all retarded-reference self-energy branches are rebuilt at every
-iterate: neither $W$ nor its collective poles are frozen. Self-inverse q
-uses a fixed mirrored block basis, with no repeated rank selection or
-compression inside that solve. Independent current polarization and
-screened-response checks remain mandatory; a failed fixed-basis check
-refuses the solve without replacing the basis inside Anderson history.
-The numerical basis is discarded at the next physical refresh. An
-iterative absolute-HF cold solve has its own basis; a one-shot
-reference-anchored equilibrium fit is unchanged. This avoids a changing
-polarization approximation introducing a numerical floor into a tighter
-Hamiltonian residual. Refused snapshots retain their scalar unscaled
-residual history for diagnosis; the physical tolerance is unchanged.
+The full-density retarded bubble is evaluated through the native complex-time
+Green products and momentum FFT response. The ordered endpoint is
+$\Psi\rho e^{-iE\tau}\Psi^\dagger$, not
+$\Psi e^{-iE\tau}\rho\Psi^\dagger$. The terms quadratic in $\rho$ cancel
+between greater and lesser bubbles, but the two remaining density insertions
+are independent; one cannot replace the reverse product by the stationary
+conjugation shortcut. All supplied virtual bands remain, including frozen-active
+transitions. Frozen states have identity rotation and a per-side edge scissor.
+
+Full microscopic Dyson samples/actions feed a two-sided tangential Loewner
+realization, using the source GW shared-pole support/direction recipe. Its
+frequency pole bank has the form
+$W_c^R=L\,\mathrm{diag}[(z-p)^{-1}]R^\dagger$ with full-ISDF endpoint factors.
+The general pencil uses SVD rank reduction and a general eigensolve, not a
+positive Gram whitening or a forced real-pole model. The response may have a
+$1/z$ asymptote; no even-in-frequency or $z^{-2}$ constraint is imposed.
+Only the reduced pencil may be staged for bounded per-parent host LAPACK;
+full microscopic matrices/factors stay on their native distributed owners.
+The source recipe owns frequency supports and pole capacity, not the
+archived `collision_density_rank` or 48-mode prototype bound.
+
+Screening and the complete complex self-energy are rebuilt from the current
+snapshot. The Hamiltonian solve must meet its unscaled physical residual;
+no unconverged last iterate is installed. Refusals retain the scalar
+residual history. A W-fit tolerance alone is not a self-energy convergence
+certificate: support/direction refinement must also converge complex
+$\Sigma_{ab}(E_b+i\eta)$, $M_H$, $\Gamma$ and $D$.
 
 For the causal pole expansion $W_c^R(z)=\sum_\ell R_\ell/(z-p_\ell)$,
 the self-energy uses the zero-temperature reference branches
@@ -1386,7 +1401,7 @@ The electronic number residual, both gain/loss boundary matrices and
 the propagated density eigenvalues remain independent acceptance checks;
 no clipping or Pauli-bound guarantee is implied.
 
-`snapshot_collision.q_sigma_operators` evaluates the same ISDF
+The archived `snapshot_collision.q_sigma_operators` evaluates the same ISDF
 product in projected vertices, with column energy $E_b$ and internal phase
 $e_n$, and admits a general biorthogonal pole expansion only after checking
 its transfer reconstruction. Frozen states enter the coherent self-energy;
