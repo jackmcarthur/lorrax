@@ -1929,9 +1929,40 @@ the old extensive added-verification geometry. Step cost was 0.53222 GPUh;
 no self-energy or physical-time propagation was performed. The pencil,
 exact-probe receipts and accounting are preserved in
 `/home/jackm/mgkba_campaign_20261019/full_microscopic_v4_20261020/`.
-Subsequent exact zero-product skipping and scoping of only the added
-verification sites reduces the scalar work to 3038 nodes; GPU savings and
-complex-self-energy accuracy remain separate, unmeasured questions.
+The next diagnostic, tree `20537b99d2d320a1ed20cd7b4f6c2542ff85ab89`
+(commit `991ac38`), retained all native sites, skipped only structurally
+zero Green products, and trained three additional collision-height sites
+inside the active energy span, with two independent interlaced held sites.
+Its 3042-node stream took 60.58 s, versus 313.55 s above. This is a measured
+response-stage improvement with changed numerical sampling geometry, not a
+complete-refresh speedup or a self-energy convergence result. The one-q
+step used 0.25556 active GPUh and its owned allocation was released.
+
+That 1242-mode model still refused: maximum growth was 0.221185 Ry and the
+worst full-matrix sample error was 8.47%, above the unchanged 2% criterion.
+Full-port moment defects were 0.09214 and 0.002901 (diagnostics only).
+Nearby microscopic Dyson comparisons had relative errors 0.4246% and
+0.3090%, but **these do not confirm a physical growing pole**: the suspect
+rank-one pole contributes only 0.4324% and 0.3065% of the corresponding
+exact full-W norm. A weak spurious pole on a large smooth background is
+compatible with both observations. Independent dielectric invertibility
+or pole/null-vector checks, not total-W agreement alone, are needed.
+
+A bounded CPU rank study on this captured pencil at tolerances 1e-6 and
+1e-7 moved the most-growing pole substantially; both still failed the
+Laplace criterion. Its physical Gram norms were unresolved. First-eight
+descriptor-coordinate residue norms in the offline report must not be
+interpreted as physical residues. These results establish neither gain
+nor an admitted model. Captures, source hashes, probes and accounting:
+`/home/jackm/mgkba_campaign_20261019/full_microscopic_v5_20261020/`.
+
+The subsequent balanced ordinary eigensolver was checked on the captured
+V4 pencil against the existing generalized-eigenvalue result: eigen time
+fell from 46.34 s to 3.14 s on the same two-thread CPU environment, with
+the same growing modes and nearest-pole differences below 2.6e-10 Ry for
+the twelve largest-growth modes. This is a reduced-pencil benchmark,
+not a material-screening admission. No full native material self-energy
+or matched 10 fs trajectory is established by these follow-ups.
 
 ### 8.2 Acceptance checks and earlier-member evidence
 
