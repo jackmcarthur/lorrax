@@ -4564,12 +4564,6 @@ def build_dft_head_response(
     the mini-BZ cell stay the GW mesh's (``head_correction.scaled_head_fold``).
     """
     z = np.asarray(omegas_ry, dtype=np.complex128).reshape(-1)
-    nodes = metal_response_nodes(z, config, metal=occupation_state is not None)
-    parts_key = (bool(wings),
-                 bool(_static_rows(z, config, metal=occupation_state is not None).any()),
-                 None if occupation_state is None else
-                 (float(occupation_state.mu_ry), occupation_state.occ_hash))
-    parts = None if frozen_parts is None else frozen_parts.get(parts_key)
     if source is None:
         source = head_source(config, wfn=wfn, meta=meta, input_dir=input_dir)
     if source.dense and occupation_state is not None:
@@ -4581,6 +4575,12 @@ def build_dft_head_response(
             "  why:  the scaled fold holds S_d^-1 F fixed, but a metal's fold "
             "carries the Fermi-surface wing and its D/z^2 head has no k-fixed "
             "local-field fraction")
+    metal = occupation_state is not None
+    nodes = metal_response_nodes(z, config, metal=metal)
+    parts_key = (bool(wings), bool(_static_rows(z, config, metal=metal).any()),
+                 None if occupation_state is None else
+                 (float(occupation_state.mu_ry), occupation_state.occ_hash))
+    parts = None if frozen_parts is None else frozen_parts.get(parts_key)
     # The cell set's velocity (S_d,cell, the wings) is always the GW mesh's.
     dipole_path = (os.path.join(input_dir, "dipole.h5") if source.dense
                    else source.velocity_path)
