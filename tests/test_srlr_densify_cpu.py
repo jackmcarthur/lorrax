@@ -19,7 +19,7 @@ from ffi import _services  # noqa: E402
 _services.ensure_on_path()
 from vcoul import inscribed_radius, lr_channels, lr_kernel  # noqa: E402
 
-from bse.bse_densify import pad_W_R_to_grid  # noqa: E402
+from bse.bse_densify import build_pair_ws_embedding, pad_W_R_to_grid  # noqa: E402
 from gw import lr_channels as LC  # noqa: E402
 
 A_LAT, L_Z, SIGMA = 6.0, 20.0, 0.8
@@ -109,7 +109,10 @@ def test_model_subtraction_keeps_coarse_tiles():
     LR[0] = LC.lr_term(Ft[:1], P[:1], v[:1])[0]           # exact at Γ
     X = (W - LR).reshape(cg + (N_MU, N_MU)).transpose(3, 4, 0, 1, 2)
     XR = np.fft.ifftn(X, axes=(2, 3, 4), norm="ortho")
-    Xf = np.fft.fftn(np.asarray(pad_W_R_to_grid(jnp.asarray(XR), fg)),
+    A = 2 * np.pi * np.linalg.inv(BVEC).T                 # rows a_i (bohr)
+    emb = build_pair_ws_embedding(cg, fg, A, R_MU @ np.linalg.inv(A))
+    Xf = np.fft.fftn(np.asarray(pad_W_R_to_grid(jnp.asarray(XR), fg,
+                                                embedding=emb)),
                      axes=(2, 3, 4), norm="ortho")
     for i in range(cg[0]):
         for j in range(cg[1]):

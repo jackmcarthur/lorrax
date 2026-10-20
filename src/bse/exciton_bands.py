@@ -2197,8 +2197,13 @@ def main(argv=None):
                         _gamma_only_grid((nkx, nky, nkz), -head_ch["whead"]),
                         head_ch["cell_volume"])
                 W_q_coarse = decimate_W_q_to_subgrid(W_q_fine_in, cg)
-                densify_W = make_w_densifier(mesh_xy, sh.W.spec, (nkx, nky, nkz),
-                                             output="k" if head_ch else "R")
+                from .bse_densify import w_pair_embedding
+                densify_W = make_w_densifier(
+                    mesh_xy, sh.W.spec, (nkx, nky, nkz),
+                    output="k" if head_ch else "R",
+                    embedding=w_pair_embedding(
+                        cg, (nkx, nky, nkz), wfn, meta.centroid_frac,
+                        int(W_q_coarse.shape[0])))
                 W_dense = densify_W(W_q_coarse)
                 if head_ch is not None:
                     S_fine = build_w_head_channel(
