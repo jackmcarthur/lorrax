@@ -15,7 +15,9 @@ The deck value `no_local_fields` is gone and refuses as an unknown policy; use
   the head's local fields once through W(Γ). Every state moves by the same
   `ΔΣ_h = (1/2 − f) ΔW^c_h(0)/(Ω N_k)` on shell, so the gap moves by
   `ΔW^c_h(0)/(Ω N_k) = v·Δ(1/ε_M)/(Ω N_k)`; eqp1 also moves through the head's
-  frequency slope. The hsuite `sp_export` reference is regenerated.
+  frequency slope. The hsuite `sp_export` reference is not yet regenerated:
+  that GPU run is owed by the integrating agent (expected gap shift on its
+  fixture: +0.756 meV per Ry bohr^3 of Delta W^c_h(0), provisional).
 - `bispinor_gw = full_shared_pole`: `full` (now the default and the only head
   value) is the existing direct sector head; numbers are unchanged
   (`bisp_sc`, `bisp_sc3`, `bse_bisp`). The run record states "no local-field
