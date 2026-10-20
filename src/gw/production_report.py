@@ -9,38 +9,25 @@ driver-wide ``LORRAX_DEBUG_PRINT`` switch and in the launcher's own log.
 from __future__ import annotations
 
 import os
-from pathlib import Path
-import re
-from typing import Iterable
 
 import numpy as np
 
-from common.scientific_output import (
-    FLOAT_DIGITS,
-    abs_path,
-    architecture_lines,
-    band_range,
-    centroid_orbit_line,
-    file_table_lines,
-    numerical_environment_lines,
-    symmetry_sampling_lines,
-)
+from common.production_report import ProductionReport
+from common.report_blocks import (
+    LABEL, Message, Setting, TimingRow, kv_lines, timing_lines, wrap_value)
+from common.scientific_output import band_range
 from common.units import RYD_TO_EV
 from . import quadrature_log
 from .gw_config import qp_solver_semantics, sigma_requested_edges_ev
 
 
-_WARNING_WORDS = (
-    "WARNING", "FATAL", "FAILURE", "FAILED", "UNPHYSICAL",
-    "NOT TRUSTWORTHY", "DEPRECATED",
-)
-
-# Stable role labels for the driver's closing file table.  These deliberately
-# name the energy definition rather than inferring a method from ``eqpN``.
-EQP0_FILE_ROLE = "fixed-DFT-state diagonal zeroth-order energies"
-EQP1_FILE_ROLE = "fixed-DFT-state diagonal Z-linearized energies"
-QP_ROTATIONS_FILE_ROLE = "full-matrix effective-H rotations"
-QP_WFN_FILE_ROLE = "matched full-matrix QP wavefunctions"
+# Stable role labels for the driver's closing file table, at most about 40
+# columns so the table stays aligned.  They name the energy definition (the
+# diagonal on the fixed DFT states) rather than a method inferred from ``eqpN``.
+EQP0_FILE_ROLE = "QP energies, zeroth order (eqp0)"
+EQP1_FILE_ROLE = "QP energies, linearized (eqp1)"
+QP_ROTATIONS_FILE_ROLE = "QP rotations, full matrix"
+QP_WFN_FILE_ROLE = "QP wavefunctions, full matrix"
 
 
 
@@ -51,37 +38,132 @@ def _human_bytes(n_bytes: float) -> str:
         return f"{gib:.3g} GiB"
     return f"{float(n_bytes) / 2**20:.3g} MiB"
 
-def layout_dial_record_lines(
-        *, config, n_mu: int, n_q_irr: int, processes: int) -> tuple[str, ...]:
-    """Build the startup record for the two user-facing memory/layout dials."""
-    n_mu = int(n_mu)
-    q_per_task = (int(n_q_irr) + int(processes) - 1) // int(processes)
-    matrix_gib = (
-        q_per_task * n_mu * n_mu * np.dtype(np.complex128).itemsize
-        / 1024 ** 3)
-    layout = str(config.backend.linalg).strip().lower()
-    lines = [
-        f"[config provenance] linalg = {layout} "
-        f"({config.backend.linalg_provenance})",
-    ]
-    if layout == "local":
-        lines.append(
-            "linalg = local: fastest, but each task holds ceil(N_q_irr/P) "
-            "complete N_mu x N_mu dense matrices "
-            f"(here ceil({int(n_q_irr)}/{int(processes)}) x {n_mu}^2 x "
-            f"16 B = {_human_bytes(matrix_gib * 2**30)} per task, complex128) plus their "
-            "factor workspace; on large systems where that is a large "
-            "fraction of memory per task, set linalg = distributed")
-    else:
-        lines.append(
-            "linalg = distributed: dense N_mu x N_mu matrices are 2D "
-            f"distributed across the process mesh (N_mu = {n_mu})")
+#: One-line effects of the GW settings (BerkeleyGW style), by resolved value.
+_MODE_EFFECT = {
+    "x_only": "bare exchange only: no screening",
+    "cohsex": "static COHSEX: screened exchange + Coulomb hole at omega = 0",
+    "gn_ppm": "Godby-Needs plasmon pole, one pole per element",
+    "hl_ppm": "Hybertsen-Louie plasmon pole",
+    "mpa": "full-frequency W, shared-pole (multipole) model",
+}
+_SOLVER_EFFECT = {
+    "one_shot_dft": "Sigma at E_DFT; H(QP) diagonalized once",
+    "self_consistent": "QSGW: G, W, Sigma rebuilt from each map's states",
+}
+_DIM_EFFECT = {
+    3: "3D bulk: no Coulomb truncation",
+    2: "2D slab: Coulomb truncated along z",
+    1: "1D wire: Coulomb truncated in the plane",
+    0: "0D: Coulomb truncated in every direction",
+}
+_HEAD_EFFECT = {
+    "full": "q->0 head with local fields",
+    "no_local_fields": "q->0 head without local fields",
+    "off": "no q->0 cell term",
+}
+_SC_HEAD_EFFECT = {
+    "parallel_transport": "head velocity with Sigma from the links",
+    "dft_velocity": "head on the QP-rotated DFT velocity (dipole.h5)",
+    "off": "the q->0 head is not updated between maps",
+}
+#: Deck-resolution notes (``[config provenance]`` lines) a settings row states.
+_RESOLVED_BY_ROW = ("density_self_consistent was not named",
+                    "density_self_consistent = false", "sc_head_update was not named",
+                    "restart was not named", "mpa_sampling_alpha =", "linalg =")
 
-    lines.append(
-        "ψ parent carrier: band-distributed faces; band contractions gather "
-        "their band panels in memory-sized chunks; band chunks of at least "
-        f"{int(config.memory.band_chunk_size)}, sized from memory_per_device_gb.")
-    return tuple(lines)
+
+def settings_rows(config, *, n_mu: int, n_q_irr: int, processes: int,
+                  budget_gb: float | None = None, device: str | None = None) -> list:
+    """The GW SETTINGS rows: what the deck set, what was derived, and the defaults
+    that change the result, each with its one-line effect.
+
+    ``n_mu``, ``n_q_irr`` and ``processes`` size the ``linalg`` row (the whole
+    N_mu x N_mu matrices a rank holds under ``local``); ``budget_gb`` and
+    ``device`` state the per-device memory budget.
+    """
+    named = frozenset(getattr(config, "raw_input_keys", ()) or ())
+
+    def source(key, *, derived=False):
+        return "deck" if key in named else ("derived" if derived else "default")
+
+    mode, solver = config.compute_mode.value, config.qp_solver.value
+    rows = [
+        Setting("compute_mode", mode,
+                source("compute_mode", derived=config.compute_mode_raw == "auto"),
+                _MODE_EFFECT.get(mode, mode)),
+        Setting("qp_solver", solver,
+                source("qp_solver", derived=config.qp_solver_raw == "auto"),
+                _SOLVER_EFFECT.get(solver, qp_solver_semantics(solver).description)),
+    ]
+    if config.compute_mode.needs_screening:
+        diagrams = config.screening.diagrams.value
+        rows.append(Setting("screening_diagrams", diagrams, source("screening_diagrams"), {
+            "w_rpa": f"RPA Dyson series, {config.screening.method} chi0 time rules",
+            "w_bse": "electron-hole ladder series in W"}.get(diagrams, diagrams)))
+    dim = int(config.sys_dim)
+    rows.append(Setting("sys_dim", str(dim), source("sys_dim"),
+                        _DIM_EFFECT.get(dim, f"{dim}D")))
+    head = config.head.correction.value
+    rows.append(Setting("head_correction", head, source("head_correction"),
+                        _HEAD_EFFECT.get(head, head)
+                        + (f" ({config.head.wcoul0_source})" if head != "off" else "")))
+    if config.bispinor:
+        rows.append(Setting("bispinor", "true", source("bispinor"),
+                            "charge + transverse current; bispinor_gw = "
+                            + config.bispinor_gw.value))
+    if solver == "self_consistent":
+        dsc = bool(config.density_self_consistent)
+        rows.append(Setting(
+            "density_self_consistent", str(dsc).lower(),
+            source("density_self_consistent", derived=dsc),
+            "V_H rebuilt from each map's density" if dsc else
+            "V_H fixed at the DFT density: a comparison mode, not production QSGW"))
+        head_update = str(config.sc.head_update)
+        rows.append(Setting("sc_head_update", head_update,
+                            source("sc_head_update", derived=head_update != "off"),
+                            _SC_HEAD_EFFECT.get(head_update, head_update)))
+    elif not bool(config.no_degen_averaging):
+        tol = float(config.degen_avg_tol_ry)
+        rows.append(Setting("degen_avg_tol_ry", f"{tol:.3g}", source("degen_avg_tol_ry"),
+                            f"reported diagonals averaged within "
+                            f"{tol * RYD_TO_EV:.2g} eV"))
+    rows.append(Setting("restart", str(bool(config.restart)).lower(), source("restart"),
+                        "reuse the ISDF restart bundle" if config.restart else
+                        "fresh ISDF fit; no restart bundle is read"))
+    layout = str(config.backend.linalg).strip().lower()
+    q_per_rank = (int(n_q_irr) + int(processes) - 1) // int(processes)
+    rows.append(Setting(
+        "linalg", layout, str(config.backend.linalg_provenance),
+        f"{q_per_rank} whole N_mu^2 matrices per rank "
+        f"({_human_bytes(q_per_rank * int(n_mu) ** 2 * 16)})"
+        if layout == "local" else
+        f"N_mu x N_mu matrices 2D-distributed (N_mu = {int(n_mu)})"))
+    if budget_gb:
+        rows.append(Setting(
+            "memory_per_device_gb", f"{float(budget_gb):.2f}",
+            source("memory_per_device_gb", derived=True),
+            "the deck's budget per device" if "memory_per_device_gb" in named else
+            f"card rule{' on ' + device if device else ''}"))
+    rows.append(Setting("band_chunk_size", str(int(config.memory.band_chunk_size)),
+                        source("band_chunk_size"),
+                        "band panels gathered in chunks of at least this"))
+    if mode == "mpa" or "mpa_sampling_alpha" in named:
+        alpha_source = getattr(config.mpa, "sampling_alpha_provenance", "") or ""
+        rows.append(Setting("mpa_sampling_alpha", f"{config.mpa.sampling_alpha:g}",
+                            "deck" if "mpa_sampling_alpha" in named else "derived",
+                            "MPA frequency sampling exponent"
+                            + (f" ({alpha_source})" if alpha_source != "deck" else "")))
+    return rows
+
+
+def resolved_notes(lines) -> list[str]:
+    """The deck-resolution notes no settings row states, without their tag."""
+    notes = []
+    for line in lines:
+        text = " ".join(str(line).replace("[config provenance]", "").split())
+        if text and not any(fragment in text for fragment in _RESOLVED_BY_ROW):
+            notes.append(text)
+    return notes
 
 
 _SIGMA_KIND = {
@@ -221,6 +303,67 @@ def _rank_peaks(row, key):
     return np.asarray([np.nan if local is None else float(local)])
 
 
+def _peak_reader(rows):
+    """``(peak_of, n_ranks, host_run)`` for the timing records ``rows``.
+
+    ``peak_of(band)`` is every rank's pool high-water over the timing nodes the
+    stage row owns (bytes, NaN where unmeasured; ``None`` when no node was) and
+    the path of the node that set it.  ``host_run`` is every rank's resident
+    high-water over the run (bytes), or ``None`` when no host mark was read.
+    """
+    paths = [tuple(r.get("path", (r["name"],))) for r in rows]
+    selfs = [_rank_peaks(r, "peak_self") for r in rows]
+    hosts = [_rank_peaks(r, "host") for r in rows]
+    n_ranks = max([1] + [len(v) for v in selfs + hosts])
+    pad = lambda v: v if len(v) == n_ranks else np.full(n_ranks, np.nan)
+
+    def peak_of(band):
+        owned = [(p, pad(v)) for p, v in zip(paths, selfs) if band.owns(p)]
+        owned = [(p, v) for p, v in owned if np.any(np.isfinite(v))]
+        if not owned:
+            return None, ()
+        stack = np.asarray([v for _, v in owned])
+        peak = np.asarray([np.nanmax(col) if np.any(np.isfinite(col)) else np.nan
+                           for col in stack.T])
+        return peak, owned[int(np.nanargmax(np.nanmax(stack, axis=1)))][0]
+
+    marks = [pad(v) for v in hosts if np.any(np.isfinite(v))]
+    host_run = np.nanmax(np.asarray(marks), axis=0) if marks else None
+    return peak_of, n_ranks, host_run
+
+
+#: The stage each timing row belongs to, by its label (first match wins); a row
+#: that matches none is a stage of its own.
+_STAGE_OF = (
+    ("setup", ("runtime bring-up", "pre-main + imports", "input + run setup")),
+    ("ISDF basis and Coulomb metric", ("zeta", "zeta transverse", "V(q)", "restart load",
+                                       "ISDF setup + I/O")),
+    ("Screening", ("minimax quadrature", "chi0", "W", "spole ", "bank", "bank ",
+                   "screening support", "W persist + q0 head", "SC W response")),
+    ("Self-energy", ("Sigma ", "SC Sigma ")),
+    ("Quasiparticle bands", ("mean-field load", "QP solve + diagonalize", "result writes")),
+)
+
+
+def _group_stages(stages):
+    """``[(stage, [(label, band), ...]), ...]`` in first-seen order; a row of no
+    stage (``other driver work``) is ``(None, [row])``."""
+    groups: list = []
+    index: dict = {}
+    for name, band in stages:
+        stage = next((title for title, labels in _STAGE_OF
+                      if any(name == label or (label.endswith(" ") and name.startswith(label))
+                             for label in labels)), None)
+        if stage is None:
+            groups.append((None, [(name, band)]))
+            continue
+        if stage not in index:
+            index[stage] = len(groups)
+            groups.append((stage, []))
+        groups[index[stage]][1].append((name, band))
+    return groups
+
+
 def _gb_pair(values, width=6):
     """"max / min" over ranks in GB, or "–" when no rank measured it."""
     if values is None or not np.any(np.isfinite(values)):
@@ -228,197 +371,78 @@ def _gb_pair(values, width=6):
     return f"{np.nanmax(values) / 1e9:{width}.2f} / {np.nanmin(values) / 1e9:{width}.2f}"
 
 
-class GWProductionReport:
+class GWProductionReport(ProductionReport):
     """One clean GW report, owned and written only by process zero."""
 
-    def __init__(self, path: str, *, runtime, debug: bool, stdout) -> None:
-        self.path = abs_path(path)
-        self.runtime = runtime
-        self.debug = bool(debug)
-        self.stdout = stdout
-        self.rank = int(getattr(runtime, "process_index", 0))
-        self._warnings: list[str] = []
-        self._warnings_emitted = False
-        self._timings_emitted = False
-        self._stream = None
-        if self.rank == 0:
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-            self._stream = open(self.path, "w", encoding="utf-8", buffering=1)
-
-    def close(self) -> None:
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-
-    def emit(self, line: str = "") -> None:
-        """Write one rank-zero line to both the report and live stdout."""
-        if self.rank != 0:
-            return
-        text = str(line)
-        self.stdout(text)
-        if self._stream is not None:
-            self._stream.write(text + "\n")
-
-    def legacy_print(self, *args, sep: str = " ", **kwargs) -> None:
-        """Sink historical component chatter unless driver debug is enabled.
-
-        High-signal warnings are retained for one consolidated block at the
-        end.  Exceptions still use stderr through the shared fail-fast path.
-        """
-        text = sep.join(str(v) for v in args)
-        if text.startswith("  Resident ψ "):
-            self.emit(text)
-            return
+    driver = "gw"
+    purpose = "GW quasiparticles"
+    _WARNING_WORDS = (
+        "WARNING", "FATAL", "FAILURE", "FAILED", "UNPHYSICAL",
+        "NOT TRUSTWORTHY", "DEPRECATED",
+    )
+    _KEEP_PREFIXES = (
+        "  Resident ψ ",
         # The μ-batch ζ fit's plan and its measured store/timing receipts are
         # the run's record of where Z lived and what the transfers cost; the
         # ladder resolvent's per-z receipts (wall, iterations, residual,
         # high-water, fingerprints) are the same kind of record.
-        if text.startswith(("  ISDF μ-batch plan", "  μ-batch ", "  Z store: ", "  [host mem] ",
-                            "  Zeta output: ", "  Ladder W(z) ")):
-            self.emit(text)
-            return
+        "  ISDF μ-batch plan", "  μ-batch ", "  Z store: ", "  [host mem] ",
+        "  Zeta output: ", "  Ladder W(z) ",
         # Every box plan carries a durable policy and accepted-rule receipt,
         # including ordinary shared-pole runs with debug disabled.
-        if text.startswith(("Sigma quadrature receipt: ", "Response quadrature: ",
-                            "Sigma checkpoint: ", "Shared-pole constructor: ",
-                            "Shared-pole sector constructor: ", "  route ",
-                            "  WARNING: route ")):
-            self.progress(text)
-            return
+        "Sigma quadrature receipt: ", "Response quadrature: ",
+        "Sigma checkpoint: ", "Shared-pole constructor: ",
+        "Shared-pole sector constructor: ", "  route ", "  WARNING: route ",
         # Fixed-SC quadrature identity is a physics invariant, not backend
         # chatter: retain its compact receipt so every map's exact node set
         # and zero-rebuild claim remain auditable after live stdout is gone.
-        if text.startswith(("  SC fixed quadrature: ",
-                            "    SC fixed quadrature recompute: ",
-                            "    SC fixed window: ")):
-            self.progress(text)
-            return
-        # The long-loop cadence is part of the scientific run record, not
-        # component chatter.  LoopProgress owns these three stable shapes.
-        if (text.startswith("Started ") or text.startswith("Finished ")
-                or (text.startswith("[ ") and " | " in text
-                    and " / " in text)):
-            self.progress(text)
-            return
-        if self.debug:
-            self.stdout(text, **kwargs)
-            return
-        upper = text.upper()
-        if any(word in upper for word in _WARNING_WORDS):
-            self._retain_warning(text)
+        "  SC fixed quadrature: ", "    SC fixed quadrature recompute: ",
+        "    SC fixed window: ",
+    )
 
-    def _retain_warning(self, text: str) -> None:
-        """Retain one normalized warning for the final consolidated block."""
-        cleaned = " ".join(str(text).split())
-        if cleaned and cleaned not in self._warnings:
-            self._warnings.append(cleaned)
+    def __init__(self, path: str, *, runtime, debug: bool, stdout) -> None:
+        super().__init__(path, runtime=runtime, debug=debug, stdout=stdout)
+        self._timings_emitted = False
 
-    def heading(self, title: str) -> None:
-        self.emit()
-        self.emit(title.upper())
-        self.emit("-" * len(title))
+    def settings_block(self, *, config, n_mu: int, n_q_irr: int, processes: int,
+                       resolved=()) -> None:
+        """SETTINGS, before any dense data is allocated: the GW rows, then the
+        deck-resolution notes (``resolved``) that no row states."""
+        facts = getattr(self.runtime, "facts", None) or {}
+        budget = float((facts.get("device_memory") or {}).get("budget") or 0.0) / 1e9
+        self.settings(settings_rows(
+            config, n_mu=n_mu, n_q_irr=n_q_irr, processes=processes,
+            budget_gb=budget or float(config.memory.per_device_gb) or None,
+            device=facts.get("device_kind")))
+        for note in resolved_notes(resolved):
+            wrapped = wrap_value(note, first_col=LABEL + 2)
+            self.emit_lines(kv_lines([("resolved", wrapped[0])]) + wrapped[1:])
+        if (config.qp_solver.value == "self_consistent"
+                and not bool(config.density_self_consistent)):
+            self.warn(Message(
+                "WARNING", "density_not_self_consistent",
+                "V_H stays at the DFT density on every map",
+                lines=("a comparison mode, not production QSGW",),
+                fix="remove density_self_consistent = false from the deck"))
 
-    def progress(self, line: str) -> None:
-        """Write one deliberately selected rank-zero progress line."""
-        self.emit(line)
-
-    def layout_dials(
-            self, *, config, n_mu: int, n_q_irr: int, processes: int) -> None:
-        """Record resolved layout/memory dials before allocating dense data."""
-        for line in layout_dial_record_lines(
-                config=config, n_mu=n_mu, n_q_irr=n_q_irr,
-                processes=processes):
-            self.progress(line)
-
-    def begin(self, *, input_file: str, config) -> None:
-        self.emit("=" * 78)
-        self.emit("LORRAX GW CALCULATION")
-        self.emit("=" * 78)
-        self.emit(f"Input          : {abs_path(input_file)}")
-        self.emit(f"Method         : {config.compute_mode.value} / "
-                  f"{config.qp_solver.value}")
-
-    def architecture(self) -> None:
-        self.heading("Processor architecture")
-        for line in architecture_lines(
-                self.runtime, mesh_role="centroid axes X x Y"):
-            self.emit(line)
-
-    def method(self, *, config) -> None:
-        """Dense statement of the physical approximations that actually run."""
-        mode = config.compute_mode.value
-        solver = config.qp_solver.value
-        mode_text = {
-            "x_only": "bare exchange",
-            "cohsex": "static screened exchange + Coulomb hole",
-            "gn_ppm": "Godby-Needs plasmon-pole GW",
-            "hl_ppm": "Hybertsen-Louie plasmon-pole GW",
-            "mpa": "multipole-approximation GW",
-        }.get(mode, mode)
-        solver_text = qp_solver_semantics(solver).description
-        screening = getattr(config, "screening", None)
-        diagrams = getattr(getattr(screening, "diagrams", None), "value", "-")
-        diagram_text = {
-            "w_rpa": "RPA Dyson series",
-            "w_bse": "electron-hole ladder series",
-        }.get(diagrams, diagrams)
-        head = getattr(config, "head", None)
-        head_mode = getattr(getattr(head, "correction", None), "value", "-")
-        head_source = getattr(head, "wcoul0_source", "-")
-        dim = int(getattr(config, "sys_dim", 3))
-        geometry = {3: "3D bulk", 2: "2D slab", 1: "1D wire",
-                    0: "0D isolated"}.get(dim, f"{dim}D")
-
-        self.heading("Method and physical pathways")
-        self.emit(f"Self-energy    : {mode_text}; {solver_text}")
-        self.emit(
-            f"QP consistency  : {solver} | other options: one_shot_dft "
-            "(Sigma at E_DFT), self_consistent (rebuild G/W/Sigma)")
-        self.emit(f"Screening      : {diagram_text}; "
-                  f"{getattr(screening, 'method', '-')} imaginary-axis quadrature")
-        self.emit(f"Long wavelength: head={head_mode}; source={head_source}")
-        self.emit(f"Coulomb system : {geometry}; Hartree=live G-space")
-        self.emit("Spin channels  : " + (
-            "charge + transverse current (bispinor)"
-            if bool(getattr(config, "bispinor", False)) else "charge (scalar)"))
-        if solver == "self_consistent":
-            self.emit("Degenerate sets: full SC operators retained; "
-                      "no diagonal averaging in the iteration map")
-        else:
-            self.emit("Degenerate sets: " + (
-                "left in the input gauge" if bool(getattr(
-                    config, "no_degen_averaging", False))
-                else "reporting diagonals averaged at "
-                f"{float(getattr(config, 'degen_avg_tol_ry', 0.0)) * RYD_TO_EV:.5e} eV"))
-        self.emit("ISDF state     : " + (
-            "restart requested" if bool(getattr(config, "restart", False))
-            else "fresh fit requested"))
-
-    def environment(self, *, config, wfn) -> None:
+    def devices(self, *, config) -> None:
+        """The shared Devices rows plus the GW engines this run calls."""
         f = self.runtime.facts
-        backend = str(f.get("backend", "unknown")).lower()
-        platform = f.get("ffi_platform", backend)       # the device vendor's FFI key
-        self.heading("Numerical environment")
-        for line in numerical_environment_lines(self.runtime):
-            self.emit(line)
-        self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
-        self.emit(f"Dense linalg   : {config.backend.linalg} layout")
-
-        # Report only controls with a caller in this calculation.  The
-        # k-convolutions (Σ, ζ fit, ladder-W) have no dial: the router picks
-        # nvidia-mathdx on CUDA, the host plan route on cpu and the XLA backend
-        # elsewhere, and announces
-        # that choice at startup.
-        relevant = {"LORRAX_BANDS_GEMM_FFI"}
-        descriptions = {
-            "LORRAX_BANDS_GEMM_FFI": "right-GEMM contraction forming G(tau)",
-        }
+        platform = f.get("ffi_platform", str(f.get("backend", "unknown")).lower())
+        extras = [("dense linalg", f"{config.backend.linalg} layout")]
+        # The k-convolution router has no dial: it answers by device vendor
+        # (nvidia-mathdx on CUDA, the host plan route on cpu, XLA elsewhere),
+        # so the report names the engine it picks.
+        kconv = {"CUDA": "nvidia-mathdx fused cuFFTDx kernels",
+                 "cpu": "FFTW3-ABI host plan route"}.get(
+                     platform, "XLA, jnp.fft k-axis transforms")
+        extras.append(("k-convolutions", f"{platform}, {kconv} (zeta fit and Sigma)"))
+        # Report only dials with a caller in this calculation.
         for dial in f.get("ffi_dials", ()):
             name = str(dial.get("env", ""))
-            if name not in relevant:
+            if name != "LORRAX_BANDS_GEMM_FFI":
                 continue
-            supported_here = platform in tuple(dial.get("platforms", ()))
-            if not supported_here:
+            if platform not in tuple(dial.get("platforms", ())):
                 state = "NATIVE"
                 implementation = str(dial.get("off_label") or "JAX/XLA lowering")
             elif dial.get("enabled"):
@@ -427,46 +451,30 @@ class GWProductionReport:
             else:
                 state = "OFF"
                 implementation = str(dial.get("off_label") or "default lowering")
-            self.emit(f"{name:<26} = {state:<6} : "
-                      f"{descriptions[name]} ({implementation})")
-        # The k-convolution router has no dial: it answers by device vendor,
-        # so the report names the engine it picks.
-        kconv = {"CUDA": "nvidia-mathdx fused cuFFTDx kernels",
-                 "cpu": "FFTW3-ABI host plan route"}.get(platform, "XLA, jnp.fft k-axis transforms")
-        self.emit(f"{'k-convolution router':<26} = {platform:<6} : "
-                  f"k-axis convolutions of the zeta fit and Sigma ({kconv})")
+            extras.append(("G(tau) GEMM", f"{implementation} ({name} = {state})"))
+        super().devices(mesh_role="centroid axes X x Y", extras=extras)
 
-    def sampling(self, *, wfn, sym, centroids=None) -> None:
-        self.heading("Crystal symmetry and Brillouin-zone sampling")
-        for line in symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS):
-            self.emit(line)
-        if centroids is not None:
-            self.emit(centroid_orbit_line(centroids))
+    def environment(self, *, wfn) -> None:
+        self.heading("Numerical environment")
+        self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
 
-    def trs_pathways(self, *, config, sym, material_class="insulator") -> None:
-        """Record the automatic TRS-dependent branch taken by this run."""
+    @staticmethod
+    def trs_consequence(*, config, sym, material_class="insulator") -> str | None:
+        """The automatic time-reversal-dependent branch this run takes (no deck
+        key overrides it), for the symmetry block's time-reversal row."""
         allowed = bool(sym.trs_allowed)
-        self.emit(
-            "TRS pathways   : automatic from SymMaps.trs_allowed="
-            f"{str(allowed).lower()}; no input override")
         mode = config.compute_mode.value
         if mode == "mpa":
             from .mpa.model import chi0_orientation_route
-
-            self.emit(
-                "MPA chi0 route : "
-                + chi0_orientation_route(
-                    material_class, trs_allowed=allowed))
-        elif mode == "gn_ppm":
-            route = (
-                "ordered orientations with the TR-odd channel"
-                if not allowed else "incumbent symmetric completion")
-            self.emit(f"GN probe route  : {route}; dedicated probe pass")
-        elif mode == "hl_ppm":
-            self.emit(
-                "HL probe route  : incumbent real-axis completion"
-                + ("; measured-broken-TR limitation retained"
-                   if not allowed else ""))
+            return "MPA chi0: " + chi0_orientation_route(material_class, trs_allowed=allowed)
+        if mode == "gn_ppm":
+            return ("GN probe: " + ("ordered orientations with the time-odd channel"
+                                    if not allowed else "symmetric completion")
+                    + ", in its own pass")
+        if mode == "hl_ppm":
+            return ("HL probe: real-axis completion"
+                    + ("; the broken-time-reversal limitation is kept" if not allowed else ""))
+        return None
 
     def bands(self, *, config, wfn, band_slices, zeta_ranges) -> None:
         b = band_slices
@@ -576,13 +584,15 @@ class GWProductionReport:
                         affected = (f"; Sigma(E_DFT) has {n_uncovered}/"
                                     f"{mask.size} out-of-grid cells")
                 named = "; ".join(getattr(coverage, "uncovered_bands", ()))
-                self._retain_warning(
-                    "WARNING: dynamic Sigma grid is incomplete for requested "
-                    "DFT output bands (" + "; ".join(shortfalls) + f"){affected}; "
-                    f"out-of-range policy={policy_name}: those states use "
-                    "Sigma(omega=0)" + (f" ({named})" if named else "")
-                    + ". Widen sigma_omega_min_ev / sigma_omega_max_ev or add a "
-                    "sigma_omega_patches_ev window to sample them.")
+                self.warn(Message(
+                    "WARNING", "sigma_grid_incomplete",
+                    "the dynamic Sigma grid does not cover every requested band",
+                    found=("grid", "short by " + "; ".join(shortfalls) + affected.replace(
+                        "; ", ", ", 1)),
+                    lines=(f"out-of-range policy {policy_name}: those states use "
+                           "Sigma(omega=0)" + (f" ({named})" if named else ""),),
+                    fix="widen sigma_omega_min_ev / sigma_omega_max_ev, or add a "
+                        "sigma_omega_patches_ev window over them"))
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(
@@ -620,11 +630,6 @@ class GWProductionReport:
         if geometry is not None:
             for line in _sigma_rule_lines(geometry, plans):
                 self.emit(line)
-
-    def files(self, rows: Iterable[tuple[str, str, str]]) -> None:
-        self.heading("Output files and inputs")
-        for line in file_table_lines(rows, omit_paths=(self.path,)):
-            self.emit(line)
 
     def qp_gap(self, *, band_slices, e_dft_ry, e_qp_ry) -> None:
         """Summarize the fundamental gap without duplicating EQP tables."""
@@ -832,15 +837,26 @@ class GWProductionReport:
             plus=[tuple(r.get("path", (r["name"],))) for r in rows
                   if len(r.get("path", (r["name"],))) == 1],
             minus=[p for _name, band in stages for p in band.plus])))
-        self.heading("Major-stage timing")
-        detailed = any(r["name"].startswith(("bank.", "tau.")) for r in rows)
-        width = max(22, max((len(name) for name, _ in stages), default=22)) if detailed else 22
-        self.emit(f"  {'stage':<{width}}   wall (s)     fraction")
-        for name, band in stages:
-            seconds = float(band)
-            self.emit(f"  {name:<{width}} {seconds:10.2f}  "
-                      f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
-        self.emit(f"  {'total run':<{width}} {wall:10.2f}  {100.0:9.2f}%")
+        # The table: each stage row is the sum of its parts, its device column
+        # the largest pool high-water over the timing nodes the rows own.
+        peak_of, n_ranks, host_run = _peak_reader(rows)
+        table = []
+        for parent, children in _group_stages(stages):
+            parts = []
+            for name, band in children:
+                peak, _setter = peak_of(band)
+                parts.append(TimingRow(name, float(band), 1 if parent else 0,
+                                       float(np.nanmax(peak)) / 1e9
+                                       if peak is not None else None))
+            if parent:
+                gbs = [row.device_gb for row in parts if row.device_gb is not None]
+                table.append(TimingRow(parent, sum(row.seconds for row in parts), 0,
+                                       max(gbs) if gbs else None))
+            table += parts
+        leaves = [row for row in table if row.device_gb is not None
+                  and (row.depth == 1 or row.label == "other driver work")]
+        top = max(leaves, key=lambda row: row.device_gb, default=None)
+        notes = []
         # The "runtime bring-up" row is the sum of these phases; state the
         # split so a slow bring-up names its phase (Frontier Fe V2 runs ending
         # 2026-10-15 20:33-21:06 UTC: 11 of 13 took 21-74 s, against 6.9-10.1 s
@@ -849,23 +865,37 @@ class GWProductionReport:
         phases = [(str(r["name"])[len("gw_jax.runtime_stack."):], float(r["inclusive"]))
                   for r in rows if str(r["name"]).startswith("gw_jax.runtime_stack.")]
         if phases:
-            self.emit("  runtime bring-up (rank 0) = " + " + ".join(
+            notes.append("runtime bring-up (rank 0) = " + " + ".join(
                 f"{phase} {seconds:.2f}" for phase, seconds in phases) + " s")
         if any(r["name"].startswith(("bank.", "tau.")) for r in rows):
-            self.emit("  bank real_time/laplace = incumbent G/FFT correlation plus bank coefficient carry;")
-            self.emit("  these fused clocks are not FFT-only or evidence of a bandwidth limit.")
-            self.emit("  Sigma tau other is the window executables: W(tau) synthesis, G/W convolution,")
-            self.emit("  projection and frequency fold in one program. No pure-GEMM or pure-FFT wall is inferred.")
-            self.emit("  device_wait drains preceding work; rank_wait measures process alignment.")
+            notes += [
+                "bank real_time/laplace = incumbent G/FFT correlation plus bank coefficient "
+                "carry; these fused clocks are not FFT-only or evidence of a bandwidth limit.",
+                "Sigma tau other is the window executables: W(tau) synthesis, G/W convolution, "
+                "projection and frequency fold in one program. No pure-GEMM or pure-FFT wall "
+                "is inferred.",
+                "device_wait drains preceding work; rank_wait measures process alignment."]
         from common.timing import stage_sync
-        self.emit("  stage walls: " + ("device-attributed (LORRAX_STAGE_SYNC=1: every stage waits for its device work)."
-                                      if stage_sync() else
-                                      "host-attributed (no timing-only device waits; device work lands in the first "
-                                      "later stage that reads it; LORRAX_STAGE_SYNC=1 attributes it)."))
+        notes.append("stage walls: " + (
+            "device-attributed (LORRAX_STAGE_SYNC=1: every stage waits for its device work)."
+            if stage_sync() else
+            "host-attributed (no timing-only device waits; device work lands in the first "
+            "later stage that reads it; LORRAX_STAGE_SYNC=1 attributes it)."))
         if spole_rows:
-            self.emit("  spole bands: fenced host walls; wait-before rows drain prior device/effect work,")
-            self.emit("  not the named consumer. Rank synchronization is separate. Local passivity/held")
-            self.emit("  share one compiled call; their fused wall is not split into invented timings.")
+            notes.append("spole bands: fenced host walls; wait-before rows drain prior "
+                         "device/effect work, not the named consumer. Rank synchronization is "
+                         "separate. Local passivity/held share one compiled call; their fused "
+                         "wall is not split into invented timings.")
+        from lxkit import memory
+        budget = memory.run().get("budget", 0.0) / 1e9
+        self.heading("Major-stage timing")
+        self.emit_lines(timing_lines(
+            table, wall=float(wall), notes=notes, budget_gb=budget or None,
+            device_peak=(top.device_gb, top.label) if top is not None else None,
+            host_peak=((float(np.nanmax(host_run)) / 1e9, float(np.nanmin(host_run)) / 1e9)
+                       if host_run is not None else None),
+            n_ranks=n_ranks))
+        width = max([22] + [len(name) for name, _ in stages])     # the memory table's
         self._stage_memory(rows, stages, width=width, wall=wall)
         self._routes()
 
@@ -899,19 +929,8 @@ class GWProductionReport:
         rises = [_rank_peaks(r, "host_rise") for r in rows]
         if not any(np.any(np.isfinite(v)) for v in selfs + hosts):
             return
-        n_ranks = max(len(v) for v in selfs + hosts)
+        row_peak, n_ranks, _host_run = _peak_reader(rows)
         pad = lambda v: v if len(v) == n_ranks else np.full(n_ranks, np.nan)
-
-        def row_peak(band):
-            """Every rank's peak over the nodes the row owns, and the node that set it."""
-            owned = [(p, pad(v)) for p, v in zip(paths, selfs) if band.owns(p)]
-            owned = [(p, v) for p, v in owned if np.any(np.isfinite(v))]
-            if not owned:
-                return None, ()
-            stack = np.asarray([v for _, v in owned])
-            peak = np.asarray([np.nanmax(col) if np.any(np.isfinite(col)) else np.nan
-                               for col in stack.T])
-            return peak, owned[int(np.nanargmax(np.nanmax(stack, axis=1)))][0]
 
         def row_host(band):
             """Max over ranks of the row's host mark and of the rise it caused (GB)."""
@@ -925,24 +944,18 @@ class GWProductionReport:
 
         priced = [(row, np.where(m >= 0, m, np.nan)) for row in memory.receipts()
                   for m in (_rank_peaks(row, "measured"),)]
+        # The budget, the run's device peak and the host peak are the timing
+        # block's memory summary; this table is each stage's detail.
         self.heading("Major-stage device and host memory")
-        budget = memory.run().get("budget", 0.0) / 1e9
-        run_peak = max((np.nanmax(v) for v in selfs if np.any(np.isfinite(v))), default=0.0)
         self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
                   f"rank(s); prices and γ: the priced stages below")
-        host_run = [pad(v) for v in hosts if np.any(np.isfinite(v))]
-        if host_run:
-            host_run = np.nanmax(np.asarray(host_run), axis=0)
+        if any(np.any(np.isfinite(v)) for v in hosts):
             self.emit(f"  host = resident high-water (ru_maxrss) per rank at the stage's last "
                       f"exit, max over ranks; rise = what the stage added to it; unpriced")
-            self.emit(f"  host run peak {_gb_pair(host_run, 0)} GB (max / min over ranks)")
         holds = gpu_utils.host_holds()
         if holds:
             self.emit("  held on the host across stages, per rank: " + "; ".join(
                 f"{name} {nbytes / 1e9:.2f} GB" for name, nbytes in holds.items()))
-        if budget:
-            self.emit(f"  budget memory_per_device_gb = {budget:.2f} GB; run peak "
-                      f"{run_peak / 1e9:.2f} GB ({'within' if run_peak <= budget * 1e9 else 'OVER'})")
         self.emit(f"  {'stage':<{width}}  peak GB max / min  "
                   f"host GB    rise  set by")
         for name, band in stages:
@@ -971,62 +984,5 @@ class GWProductionReport:
                   f"({'calibrate' if memory.CALIBRATE else 'production'}); {reads} boundary "
                   f"reads on rank 0 took {seconds * 1e3:.1f} ms "
                   f"({100.0 * seconds / wall if wall else 0.0:.4f}% of the wall)")
-
-    def warnings(self) -> None:
-        if self._warnings_emitted:
-            return
-        self._warnings_emitted = True
-        warnings = self._display_warnings()
-        if warnings:
-            self.heading("Warnings")
-            for warning in warnings:
-                self.emit(f"  {warning}")
-
-    def _display_warnings(self) -> list[str]:
-        """Collapse repeated catalog receipts into one numerical warning."""
-        minimax = [warning for warning in self._warnings
-                   if "minimax: served " in warning and
-                   "UNCERTIFIED" in warning]
-        others = [warning for warning in self._warnings
-                  if warning not in minimax]
-        if not minimax:
-            return others
-
-        def numbers(pattern: str) -> list[float]:
-            values = []
-            for warning in minimax:
-                match = re.search(pattern, warning)
-                if match is not None:
-                    values.append(float(match.group(1)))
-            return values
-
-        targets = numbers(r"\btarget\s+([0-9.eE+-]+)")
-        errors = numbers(r"\bmax_err\s+([0-9.eE+-]+)")
-        nodes = [int(value) for value in
-                 numbers(r"->\s+([0-9]+)\s+nodes")]
-        detail = f"{len(minimax)} catalog entries used"
-        if nodes:
-            node_text = (str(nodes[0]) if min(nodes) == max(nodes) else
-                         f"{min(nodes)}-{max(nodes)}")
-            detail += f" ({node_text} nodes)"
-        if targets:
-            target_text = (f"{targets[0]:.5e}" if min(targets) == max(targets)
-                           else f"{min(targets):.5e}-{max(targets):.5e}")
-            detail += f"; requested tolerance {target_text}"
-        if errors:
-            detail += f"; worst reported error {max(errors):.5e}"
-        return [
-            "Minimax quadrature: " + detail + ". Catalog generator/backend "
-            "provenance is UNCERTIFIED.",
-            *others,
-        ]
-
-    def finish(self, *, status: str = "completed") -> None:
-        self.warnings()
-        self.emit()
-        self.emit(f"LORRAX GW calculation {status}.")
-        self.emit(f"Report written to {self.path}")
-        self.close()
-
 
 __all__ = ["GWProductionReport"]

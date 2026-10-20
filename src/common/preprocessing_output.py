@@ -2,114 +2,25 @@
 
 This module owns presentation only.  Dipole and ``kin_ion`` hand it facts
 from their canonical WFN, symmetry, metadata and operator objects; it does
-not reopen files or reconstruct any physical policy.
+not reopen files or reconstruct any physical policy.  The stream, header,
+Devices, timing, warnings, files and closing blocks are
+:class:`common.production_report.ProductionReport`'s.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Iterable
 
-from common.scientific_output import (
-    FLOAT_DIGITS,
-    abs_path,
-    architecture_lines,
-    file_table_lines,
-    htransform_quality_lines,
-    numerical_environment_lines,
-    spectral_compression_lines,
-    symmetry_sampling_lines,
-)
+from common.production_report import ProductionReport
+from common.report_blocks import Setting
 
 
-_WARNING_WORDS = (
-    "WARNING", "[WARN]", "FATAL", "FAILURE", "FAILED", "UNPHYSICAL",
-    "NOT TRUSTWORTHY", "DEPRECATED",
-)
-
-
-class ScientificProductionReport:
+class ScientificProductionReport(ProductionReport):
     """One rank-zero scientific stream for a LORRAX core driver."""
-
-    def __init__(self, path: str, *, runtime, debug: bool, stdout,
-                 driver_name: str, calculation_name: str) -> None:
-        self.path = abs_path(path)
-        self.runtime = runtime
-        self.debug = bool(debug)
-        self.stdout = stdout
-        self.driver_name = str(driver_name)
-        self.calculation_name = str(calculation_name)
-        self.rank = int(getattr(runtime, "process_index", 0))
-        self._warnings: list[str] = []
-        self._warnings_emitted = False
-        self._stream = None
-        if self.rank == 0:
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-            self._stream = open(self.path, "w", encoding="utf-8", buffering=1)
-
-    def close(self) -> None:
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-
-    def emit(self, line: str = "") -> None:
-        if self.rank != 0:
-            return
-        text = str(line)
-        self.stdout(text)
-        if self._stream is not None:
-            self._stream.write(text + "\n")
-
-    def progress(self, line: str) -> None:
-        self.emit(line)
-
-    def legacy_print(self, *args, sep: str = " ", **kwargs) -> None:
-        """Retain selected cadence/warnings; hide component chatter."""
-        text = sep.join(str(value) for value in args)
-        if (text.startswith("Started ") or text.startswith("Finished ")
-                or (text.startswith("[ ") and " | " in text
-                    and " / " in text)):
-            self.progress(text)
-            return
-        if self.debug:
-            self.stdout(text, **kwargs)
-            return
-        upper = text.upper()
-        if any(word in upper for word in _WARNING_WORDS):
-            cleaned = " ".join(text.split())
-            if cleaned and cleaned not in self._warnings:
-                self._warnings.append(cleaned)
-
-    def heading(self, title: str) -> None:
-        self.emit()
-        self.emit(title.upper())
-        self.emit("-" * len(title))
-
-    def begin(self, *, input_file: str) -> None:
-        self.emit("=" * 78)
-        self.emit(f"LORRAX {self.calculation_name.upper()}")
-        self.emit("=" * 78)
-        self.emit(f"Driver         : {self.driver_name}")
-        self.emit(f"Input          : {abs_path(input_file)}")
-
-    def architecture(self, *, mesh_role: str) -> None:
-        self.heading("Processor architecture")
-        for line in architecture_lines(self.runtime, mesh_role=mesh_role):
-            self.emit(line)
 
     def environment(self, *, wfn, lines: Iterable[str] = ()) -> None:
         self.heading("Numerical environment")
-        for line in numerical_environment_lines(self.runtime):
-            self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
-        for line in lines:
-            self.emit(str(line))
-        self.emit("Debug stream   : " + (
-            "ON via LORRAX_DEBUG_PRINT" if self.debug else
-            "OFF (set LORRAX_DEBUG_PRINT=1 for component diagnostics)"))
-
-    def pathways(self, lines: Iterable[str]) -> None:
-        self.heading("Physical and numerical pathways")
         for line in lines:
             self.emit(str(line))
 
@@ -132,65 +43,27 @@ class ScientificProductionReport:
         for line in lines:
             self.emit(str(line))
 
-    def sampling(self, *, wfn, sym) -> None:
-        self.heading("Crystal symmetry and Brillouin-zone sampling")
-        for line in symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS):
-            self.emit(line)
-
     def bands(self, lines: Iterable[str]) -> None:
         self.heading("Electronic and band spaces")
         for line in lines:
             self.emit(str(line))
 
-    def spectral_compression(self, receipt, *,
-                             title: str = "Htransform spectral compression") -> None:
-        """Print the one shared Galerkin truncation/compression receipt."""
-        self.heading(title)
-        for line in spectral_compression_lines(receipt):
-            self.emit(line)
-
-    def htransform_quality(self, receipt, *,
-                           title: str = "Htransform interpolation quality") -> None:
-        """Print the shared representation/locality receipt."""
-        self.heading(title)
-        for line in htransform_quality_lines(receipt):
-            self.emit(line)
-
-    def timings(self, stages: Iterable[tuple[str, float]], *, wall: float) -> None:
-        self.heading("Major-stage timing")
-        self.emit("  stage                    wall (s)     fraction")
-        for name, seconds in stages:
-            seconds = float(seconds)
-            fraction = 100.0 * seconds / wall if wall else 0.0
-            self.emit(f"  {str(name):<22} {seconds:14.2f}  {fraction:9.2f}%")
-        self.emit(f"  {'total run':<22} {float(wall):14.2f}  {100.0:9.2f}%")
-
-    def warnings(self) -> None:
-        if self._warnings_emitted:
-            return
-        self._warnings_emitted = True
-        if self._warnings:
-            self.heading("Warnings")
-            for warning in self._warnings:
-                self.emit(f"  {warning}")
-
-    def files(self, rows: Iterable[tuple[str, str, str]]) -> None:
-        self.heading("Output files and inputs")
-        for line in file_table_lines(rows, omit_paths=(self.path,)):
-            self.emit(line)
-
-    def finish(self, *, status: str = "completed") -> None:
-        self.warnings()
-        self.emit()
-        self.emit(f"LORRAX {self.calculation_name} {status}.")
-        self.emit(f"Report written to {self.path}")
-        self.close()
-
 
 PreprocessingProductionReport = ScientificProductionReport
+
+
+def soc_setting(resolved: str) -> Setting:
+    """The SETTINGS row of the V_NL spin-orbit treatment, from the projector
+    setup's own statement (``j-RESOLVED, from QE <spinorbit>``)."""
+    text = " ".join(str(resolved).split())
+    head, _, rest = text.partition(", ")
+    value = head.split(" (")[0].strip().lower() or "none"
+    return Setting("spin-orbit V_NL", value, "QE" if "QE" in text else "derived",
+                   rest or text)
 
 
 __all__ = [
     "PreprocessingProductionReport",
     "ScientificProductionReport",
+    "soc_setting",
 ]
