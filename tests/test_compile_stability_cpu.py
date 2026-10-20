@@ -183,7 +183,7 @@ def test_response_programs_key_on_the_solve_decision_not_the_room(fresh_bank, mo
     built = rb._response_programs(mesh, n, "distributed", "auto", 0.5, False, 1.0 if photon else None)
     calls = ({"value": (root, x[0], x[1]), "pair": (root, x[0], x[2], x[1], x[3]),
               "moments": (root, x[2], x[3], x[4], x[5], x[1])} if photon else
-             {"value": (root, x[0]), "pair": (root, x[0], x[1])})
+             {"value": (root, x[0])})   # charge on the face: value then slope, no pair
     lowerings = _lowerings()
 
     def run(room):
