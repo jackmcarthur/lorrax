@@ -340,6 +340,14 @@ def _pin_static_head_sample(wc, z, fitted, *, moment_m1=None, rcond=1.0e-13):
     minimum-norm solution of the constraints and ``N`` their null space.  A
     fit left with one pole and two constraints re-places that pole on both
     moments (the plasmon-pole limit).
+
+    LIMIT: with two or more poles the poles stay where the fit put them, so
+    the moment is carried by the residues alone and the residual at the other
+    samples grows (Si 4^3, 8 poles: max 0.89 -> 25.3 Ry bohr^3; the real-axis
+    model moves <= 1.5 % of its peak).  On-shell values and slopes are exact;
+    off-shell readers see the change.  The poles are not refitted under both
+    constraints: an unconstrained refit interpolates the samples but leaves
+    the lower half plane.
     """
     wc = np.asarray(wc, dtype=np.complex128)
     z = np.asarray(z, dtype=np.complex128)

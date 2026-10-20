@@ -15,9 +15,11 @@ xi = 0.5 Ry t/(1-t); `gw.qsgw_head.head_quadrature_rule`), each a full head
 build folded through W_body(Gamma, i xi): exact on shared-pole stores, the
 fitted elementwise body on `sigma_w_model = mpa`.  `_pin_static_head_sample`
 adds the constraint sum B/Omega^2 = M_1; M_1 is stamped in the head store
-(`fit_moment_m1`; `read_head_fit_collective` returns `moment_m1`) and each run
-prints the quadrature and unpinned-fit values.  Heads with no rule keep the
-W(0)-only pin: `off`, the BGW finite-q0 head, the w_bse ladder head.
+(`fit_moment_m1`, beside the fit's own `fit_moment_m1_unpinned`;
+`read_head_fit_collective` returns `moment_m1`); the shared-pole route prints
+both values in the rank-0 log.  Heads with no rule keep the
+W(0)-only pin and build no extra rows: `off`, the BGW finite-q0 head, the
+w_bse ladder head, the `full_shared_pole` four-current sector head.
 
 On a metal, every dynamic head row is now the generalized Drude term
 D r(z)/z^2 with a Fermi-liquid memory function (deck `head_drude_gamma0_ev`,
@@ -27,10 +29,26 @@ log-divergent in the cell's smallest q.u).  The static row is Thomas-Fermi on
 every route, folded or not.  M_1 subtracts the Drude model's own limit
 W^c(0+) = -<v>, not the Thomas-Fermi row.
 
-- **Results.** eqp0 is unchanged (W(0) pinned as before) to round-off.
-  eqp1/Z move uniformly by Delta(d Sigma/d omega) = -(M_1,quad - M_1,fit)/(Omega N_k).
-  Metals' off-shell head values and Z move (na_sc reference to regenerate).
-  The head costs 24 more head builds per screening build.
+- **Results.** eqp0 is unchanged (W(0) pinned as before): 0 at print
+  precision on Si 4^3, Si 6^3 and Fe 4^3.  The head's slope moves by the same
+  Delta(d Sigma_h/d omega) = -(M_1,quad - M_1,fit)/(Omega N_k) for every state;
+  Z and eqp1 move through it state by state.  Si (dense 16^3 head, 8 poles):
+  M_1 +0.66 % (4^3) and +0.32 % (6^3); eqp1 QP gap -0.19 meV (-0.016 % of
+  1165.0 meV) and -0.06 meV (-0.005 % of 1133.3 meV).  Fe 4^3: M_1 +11 %
+  (the fit misses the Drude head's small-xi weight), eqp1 -15.4 meV mean
+  within 1 eV of mu (spread 12.4 meV), |Delta Z| <= 0.030.  N = 24 and 48
+  agree to 3e-10 on Fe.  The hsuite `sp_export` (also the `no_local_fields`
+  deletion above) and `na_sc` references are regenerated.
+- **Off-shell cost.** The poles stay fixed, so the second constraint is
+  carried by the residues alone and the fit's residual at its other samples
+  grows: Si 4^3 0.89 -> 25.3, Si 6^3 3e-7 -> 43.3, Fe 4^3 6.6 -> 31.7
+  Ry bohr^3.  The off-shell head Sigma moves by at most 3.5 meV within 3.4 eV
+  of the shell and 22 meV within 6.8 eV (Si 4^3, eta = 0.25 eV); readers of
+  the real-axis model (`sigma_omega_grid_debug`, uncovered states, the SC
+  census) see it.  A refit of the poles under both constraints is not done.
+- **Cost.** 24 more head rows per screening build: +2.4 s on the Si
+  shared-pole head stage (1.7 -> 4.1 s); on `sigma_w_model = mpa` each row
+  also evaluates the fitted Gamma body.
 - **Users.** No deck change.  Test: `tests/test_head_quadrature_moment.py`.
 
 ## 2026-10-20 — `head_correction = no_local_fields` is deleted; `full` is the one head
@@ -43,9 +61,11 @@ The deck value `no_local_fields` is gone and refuses as an unknown policy; use
   the head's local fields once through W(Γ). Every state moves by the same
   `ΔΣ_h = (1/2 − f) ΔW^c_h(0)/(Ω N_k)` on shell, so the gap moves by
   `ΔW^c_h(0)/(Ω N_k) = v·Δ(1/ε_M)/(Ω N_k)`; eqp1 also moves through the head's
-  frequency slope. The hsuite `sp_export` reference is not yet regenerated:
-  that GPU run is owed by the integrating agent (expected gap shift on its
-  fixture: +0.756 meV per Ry bohr^3 of Delta W^c_h(0), provisional).
+  frequency slope. The hsuite `sp_export` reference is regenerated: on its
+  fixture the folded W^c_h(0) is -923.325 Ry bohr^3 against the direct
+  -1382.833, so every eqp0 moves by -173.665 meV (occupied) or +173.665 meV
+  (empty), the gap by +347.33 meV, as predicted; its eqp1 moves also through
+  the pinned M_1 (entry above).
 - `bispinor_gw = full_shared_pole`: `full` (now the default and the only head
   value) is the existing direct sector head; numbers are unchanged
   (`bisp_sc`, `bisp_sc3`, `bse_bisp`). The run record states "no local-field

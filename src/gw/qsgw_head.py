@@ -3920,13 +3920,18 @@ def head_quadrature_omegas(config) -> tuple[complex, ...]:
     Every builder evaluates the head there exactly as at a fit node (direct
     ``S``, wings, the fold through ``W_body(Gamma, i xi)``); the fit then pins
     ``M_1`` (:func:`head_moment_m1`, ``gw.mpa.model._pin_static_head_sample``).
-    None when the head is off, and none for the BGW finite-q0 head, whose
-    samples are finite-q epsilon rows of the body's own chi samples.
+    None when the head is off; none for the BGW finite-q0 head, whose
+    samples are finite-q epsilon rows of the body's own chi samples; and none
+    for the four-current sector head (``bispinor_gw = full_shared_pole``,
+    ``gw_config.uses_direct_bispinor_shared_pole_head``), which has no scalar
+    pole fit to pin (its rows were built and never read).
     """
-    from gw.gw_config import HeadCorrection, coerce_head_correction
+    from gw.gw_config import (HeadCorrection, coerce_head_correction,
+                              uses_direct_bispinor_shared_pole_head)
     head = config.head
     if (coerce_head_correction(getattr(head, "correction", HeadCorrection.FULL))
-            is HeadCorrection.OFF or bool(getattr(head, "uses_bgw_metal_q0shift", False))):
+            is HeadCorrection.OFF or bool(getattr(head, "uses_bgw_metal_q0shift", False))
+            or uses_direct_bispinor_shared_pole_head(config)):
         return ()
     xi, _ = head_quadrature_rule()
     return tuple(1j * float(x) for x in xi)
