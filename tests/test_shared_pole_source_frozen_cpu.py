@@ -59,6 +59,7 @@ def test_positive_store_adapter_native_full_rho_sigma_matches_literal(tmp_path, 
     from file_io import shared_pole_store as store
     from gw.shared_pole_reference import source_frozen_ordered_model
     from gw.shared_pole_recipe import shared_real_pole_v1_r3b
+    from gw.gw_config import DynamicSigmaConfig
     from gw.head_correction import HeadSigmaDiag
     from common.units import RYD_TO_EV
     from ffi import fft as F
@@ -97,8 +98,8 @@ def test_positive_store_adapter_native_full_rho_sigma_matches_literal(tmp_path, 
     energy[:,0] += .01
     energy[:,1:] += [.01,.02]
     config = c['fixture']._config(np.array([-2.,2.]))
-    config.sigma.regularization_ev = .14*RYD_TO_EV
-    config.sigma.quadrature_eps = 2e-7
+    config.sigma = DynamicSigmaConfig(-2*RYD_TO_EV,2*RYD_TO_EV,.25,.14*RYD_TO_EV,1.5,'midgap',False,
+                                     out_of_grid='clamp',quadrature_eps=1e-4)
     head = None
     if with_head:
         head = HeadSigmaDiag.build(omega_grid_ry=np.array([-2.,2.]),enk_ry=energy,
@@ -112,7 +113,9 @@ def test_positive_store_adapter_native_full_rho_sigma_matches_literal(tmp_path, 
         local_cache_only.setattr(store, '_finalized_digest_current', forbidden_collective)
         result = evaluate_source_frozen_snapshot(source, prepared,
             dict(U=rotation,e=energy[:,1:],rho=rho_a), b_lo=1, model=ordered,
-            print_fn=lambda *a,**k:None)
+            quadrature_eps=2e-7,print_fn=lambda *a,**k:None)
+    assert config.sigma.quadrature_eps == 1e-4  # source W/config are untouched.
+    assert all(w['eps']==2e-7 for w in result['raw']['native_receipt']['windows'])
     got = result['raw']
     psi = c['psi'].copy()
     psi[:,1:] = np.einsum('kmsu,kmi->kisu',psi[:,1:],rotation)

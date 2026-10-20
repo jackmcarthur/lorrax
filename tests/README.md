@@ -68,6 +68,8 @@ A new test needs no bootstrap import of its own.
   Σ using SOURCE-FROZEN equilibrium W and saved instantaneous electronic lines.
   No refreshed screening, Hamiltonian fixed point, or trajectory is claimed;
   this does not change the production `joint_frozen` initialization policy.
+  `--sigma-quadrature-eps` refines only the verification Σ rule, never the
+  source pole bank, collision broadening, or frozen head.
 - `test_minibz_equal_shares.py`: the shared mini-BZ head average gives every
   rank one share shape (CPU, three simulated ranks).
 - `test_stream_passes_cpu.py`: the scanned row-pass loop on a host mesh
