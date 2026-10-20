@@ -115,6 +115,7 @@ def _stamped(path, *, basis, label=None, fingerprint="wfn-a"):
         h5["band_energies"] = np.zeros((2, 4))
         h5.attrs["basis"] = basis
         h5.attrs["prov_wfn_sha256"] = fingerprint
+        h5.attrs["format_version"] = 2
         if label is not None:
             h5.attrs["velocity"] = label
     return path

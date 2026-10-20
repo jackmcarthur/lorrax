@@ -1289,25 +1289,6 @@ _DEFAULTS = {
     # Orthogonal four-current screening policy.  The historical
     # charge-screened + bare-transverse exchange path remains the default.
     "bispinor_gw": "bare_transverse",
-    # The relative sign of the i[r, V_NL] commutator in the assembled
-    # velocity, read by ``psp.get_dipole_mtxels`` and passed to
-    # ``common.mtxel_sweep.dipole_operator``.  ``-1`` is the legacy shipped
-    # assembly and ``+1`` the arm that reproduces BerkeleyGW's q -> 0
-    # head; the words "shipped" / "flipped" spell the same two.  Empty is
-    # NOT DECLARED and resolves to ``+1`` -- and for that
-    # reason it must be a STRING default: a float default would make
-    # "unset" and an explicit "-1" indistinguishable, and the whole point
-    # of the stamp this feeds is to say which arm a dipole.h5 was built
-    # with.
-    #
-    # IT HAS TO BE HERE.  ``read_lorrax_input`` builds ``params`` from
-    # this table alone, so a key absent from it is parsed, reported as
-    # unrecognized and dropped -- the producer then reads its own default
-    # and the run is the other arm.  Measured, not argued: the first
-    # flipped-arm dipole.h5 came back stamped ``-1.0`` with
-    # "1 unrecognized deck key(s)" in the log, which is this project's
-    # named failure mode reproduced in one line of a deck.
-    "vnl_velocity_sign": "",
     # DFT+U mean field (QE ortho-atomic): the pw.x input carrying the HUBBARD
     # card, and that run's prefix.save/occup.txt.  Read by psp.hubbard_ops'
     # one resolver, which the dipole/velocity producer and every velocity
@@ -2956,7 +2937,6 @@ def _assemble_input_config(
         do_screened=bool(params["do_screened"]),
         bispinor=bool(params["bispinor"]),
         bispinor_gw=coerce_bispinor_gw_mode(params["bispinor_gw"]),
-        vnl_velocity_sign=str(params["vnl_velocity_sign"] or ""),
         hubbard_input=str(params["hubbard_input"] or ""),
         hubbard_occupations=str(params["hubbard_occupations"] or ""),
         do_G0=_resolved_do_g0,
@@ -4909,10 +4889,6 @@ class LorraxConfig:
     do_screened: bool
     bispinor: bool
     bispinor_gw: BispinorGWMode
-    #: Raw deck spelling resolved by the canonical dipole producer at the
-    #: point of use.  Keeping the spelling (rather than a second resolver in
-    #: gw_config) lets every velocity consumer take the producer's exact arm.
-    vnl_velocity_sign: str
     #: DFT+U velocity inputs (deck-relative spellings); resolved at the point
     #: of use by ``psp.hubbard_ops.resolve_hubbard_input``.
     hubbard_input: str

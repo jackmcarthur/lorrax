@@ -120,8 +120,8 @@ def dft_velocity_full_bz(wfn, sym, *, nbnd, mesh, artifact, pseudos):
                   f" DFT+U stamp {hubbard})")
         return np.ascontiguousarray(v), source
 
-    from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED, SweepGeometry,
-                                    dipole_operator, sweep_matrix_elements)
+    from common.mtxel_sweep import (SweepGeometry, dipole_operator,
+                                    sweep_matrix_elements)
     from common.wfn_layout import band_sphere_spec
     from psp.dft_operators import padded_gvectors
     from psp.hubbard_ops import resolve_hubbard_input
@@ -147,8 +147,7 @@ def dft_velocity_full_bz(wfn, sym, *, nbnd, mesh, artifact, pseudos):
         ngkmax=int(psi_G.shape[3]), nb=nbnd, ns=int(psi_G.shape[2]),
         nk=int(sym.nk_red), cell_volume=float(wfn.cell_volume))
     op = dipole_operator(geom, bvec=wfn.bvec, blat=wfn.blat,
-                         vnl_setup=vnl_setup,
-                         vnl_velocity_sign=VNL_VELOCITY_SIGN_FLIPPED)
+                         vnl_setup=vnl_setup)
     H = sweep_matrix_elements(
         psi_G, operator=op, geom=geom, gvecs=gtab.gvecs, gmask=gtab.mask,
         box_index=wfn.box_index(k="ibz"), kvecs=np.asarray(gtab.kvecs))
@@ -337,7 +336,7 @@ def main(argv=None):
         f"slope {hf['slope_rms']:.4f} ({hf['nsamples']} band/k samples). "
         "Diagnostic only: the central difference spans two grid steps "
         "and follows band index, so crossings on a coarse or flat-band "
-        "grid inflate it, and it is blind to the nonlocal sign")
+        "grid inflate it, and it is blind to the off-diagonal nonlocal term")
     PA = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
     PB = np.zeros((3, nbnd, nbnd), dtype=np.complex128)
     for ik in range(nk):

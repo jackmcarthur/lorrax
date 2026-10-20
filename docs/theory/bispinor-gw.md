@@ -331,7 +331,7 @@ scalar charge channel and the packed photon operator. $S(\omega)$ has one
 `dipole.h5` build, `build_S_cart_omega` [`(3,3)` c128,
 $1/({\rm Ry\,bohr^2})$, [convention](s-tensor-convention.md)], also used
 when a restart lacks `S_cart_head`; the file's coverage and provenance (WFN
-sha256, band window, $V_{\rm NL}$, arm, `vnl_velocity_sign`) go through
+sha256, band window, $V_{\rm NL}$, arm) go through
 `common.sanity`. The fold $R^{\rm eff}=R^0+YWZ/\Omega$ takes $Y$ on `x`,
 $W$ on `(x,y)`, $Z$ on `y` and never gathers the body; `HeadResponseKind`
 `MICRO_REDUCIBLE` already contains it and is never folded again. The packed
