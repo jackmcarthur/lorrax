@@ -6,7 +6,10 @@ the whole `x × y` mesh, so its per-rank bytes fall as `1/P`; nothing large is
 materialised on fewer than all `P` ranks. This page states, stage by stage,
 what is resident per rank, how it scales, and which planner prices it.
 One implementation prices, admits and measures every stage: `lxkit.memory`
-(`services/lxkit/src/lxkit/memory.py`). No planner refuses on a price (owner
+(`services/lxkit/src/lxkit/memory.py`). Prices come from measurement: the
+stage's own program compiled and never run (its `memory_analysis`), the
+provider's size query, or a measured vendor row; a closed form only proposes a
+candidate ([§ Prices from measurement](#measured)). No planner refuses on a price (owner
 2026-10-19, `memory.admit`): the fastest route that fits runs; when none fits,
 the cheapest runs with one `RuntimeWarning`, or, when it is over the allocator's
 physical limit, with a loud banner naming the shortfall and the minimum process
@@ -108,8 +111,34 @@ a provider context under `linalg = local` carries it as its `outside` term
 |---|---|
 | W Dyson (`gw.w_isdf._dyson_route`) | local: faces + $16\mu^2(3\lceil Q/P\rceil + 2)$; distributed: faces + one LU pair + contexts |
 | SC eigh, density scan (`gw.sc_iteration`, `gw.qsgw_density`) | one $(n_b, n_b)$ tile within 1 % of `B`; cuSOLVERMp eigh / `band_2d` |
-| shared-pole whole parents, constructor, staged eigh stacks (`gw.shared_pole_execution`) | the ledger row of the local route; the face / whole mesh + contexts |
-| head Γ GEMM (`gw.shared_pole_head._gamma_gemm_route`) | staged where `distrib_la.fits_local`; `panel_matmul` faces |
+| shared-pole whole parents, constructor, staged eigh stacks (`gw.shared_pole_execution`) | the local route's compiled programs; the face / whole mesh + contexts |
+| head Γ GEMM (`gw.shared_pole_head._gamma_gemm_route`), ζ face GEMMs | staged where its program compiled fits the room (`distrib_la.staged_fits`); `panel_matmul` faces |
+| transverse ζ factor, Galerkin factor, coarse V(q) chunk | each route's own program compiled (`runtime.aot_memory.compiled_price`) |
+
+### Prices from measurement {#measured}
+
+- **Programs.** A route or a dispatch is priced by the program that runs it,
+  lowered and compiled at its abstract operands: `temp + outputs − alias` plus
+  cuFFT plan scratch (`runtime.aot_memory.compiled_new_bytes`), the largest any
+  rank read. Where the program then runs, the priced executable is the one
+  executed (the response bank, the ζ tile passes, the shared-pole rounds), so a
+  price costs no extra compile. `check_chunk` corrects a chunk once from that
+  figure ([§ The compiled check](#the-compiled-check)).
+- **Room classes.** A room enters a program or a price only through tests of
+  compiled figures against it (`distrib_la.room_test`: `place()`'s fit and
+  step, the gathered retry's admission, `staged_fits`, the size route).
+  `distrib_la.room_class` caches a program or price per class of rooms whose
+  tests come out alike, so a round that repeats a shape in another room reuses
+  its compile; a hit replays its tests to any enclosing build.
+- **Vendors.** Workspaces outside XLA come from the provider's size query
+  (cuSOLVERMp eigh; the Dyson LU at the getrs cap it posts,
+  `distrib_la.lu_workspace_query`) or a measured row (`lxkit.LEGS`
+  `vendor_rows`) within its stated range; outside it, a warning (`GATE
+  memory_unpriced` under `LORRAX_MEMORY_STRICT`).
+- **Route completeness.** No whole N_μ-scale matrix (side ≥ N_μ/2) is held on a
+  rank without a mesh route beside it: a stage whose only candidates do so
+  refuses (`GATE nmu2_no_backup`; `LORRAX_NMU2_BACKUP=report` makes it a
+  finding for a census).
 
 ### Why the pool's reserved bytes run past R {#pool-growth}
 
@@ -667,7 +696,13 @@ its own work, and prints one rank-0 line:
 memory <stage>: priced P (operands a, xla b, vendor c, outside d) | measured M | γ g
 ```
 
-with `γ = measured / priced` (gate: `1/1.3 ≤ γ ≤ 1`). An increment price
+with `γ = measured / priced` (gate: `1/1.3 ≤ γ ≤ 1`). Production reads the
+allocator at section boundaries only and never waits.
+`LORRAX_MEMORY_RECEIPTS=calibrate` waits on each priced stage at entry and exit
+and reads every section; `LORRAX_MEMORY_STRICT=1` adds the census;
+`LORRAX_MEMORY_TRACE=<path>` writes one JSON Line per closed section (live
+arrays, allocator, the executables that ran) in either mode, without waits
+(`lxkit.memory_residuals`). An increment price
 (`priced(..., increment=True)`) adds the allocator's bytes in use at entry as its
 `operands`. The reader is the leg's `peak_reader`: CUDA's pool
 `CU_MEMPOOL_ATTR_USED_MEM_HIGH`, reset at each boundary (exact); BFC's

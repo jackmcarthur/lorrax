@@ -350,9 +350,8 @@ $$
 $$
 
 with $\text{held}_S$ the diagonal sector's selected panels (zero for CT), and on the whole mesh otherwise, with one `RuntimeWarning` (`staged_eigh`,
-`src/gw/shared_pole_execution.py:682`). The $8m^2$ elements per matrix are
-`BATCH_EIGH_TILES` (`services/distrib_la/src/distrib_la/plan.py:395`), priced by
-`distrib_la.eigh_stack_bytes` (`services/distrib_la/src/distrib_la/workspace.py:306`).
+`src/gw/shared_pole_execution.py:682`). The about $8m^2$ elements per matrix are route (c)'s program compiled
+(`distrib_la.eigh_stack_bytes`).
 The boundary is the stack live beside that eigh (`staged_sector_bytes`,
 `staged_cross_bytes`, `src/gw/shared_pole_capacity.py:177,202`). Route (c) is
 where the staged route's speed comes from: the $N$ eighs of a stack run

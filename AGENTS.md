@@ -97,6 +97,13 @@ the task, flag it; do not silently violate it.
   [contributing](docs/contributing.md#the-two-rules-that-bite); the import
   direction is in [layers](docs/architecture/layers.md).
 
+### Memory
+- **A stage is priced by the program that runs it**, compiled at its operands, and by the
+  provider's size query; a closed form only proposes. Admission is `lxkit.memory.admit`
+  (no refusal on a price; a banner with the minimum P when over the limit), and no whole
+  N_μ-scale matrix is held on a rank without a mesh route
+  ([memory model](docs/architecture/memory-model.md#measured)).
+
 ### Symmetry
 - **One IBZ table and one symmetry-action helper.** ψ, ζ, V_q and W transform as
   the same kind of object under the space group and time reversal. Route every
