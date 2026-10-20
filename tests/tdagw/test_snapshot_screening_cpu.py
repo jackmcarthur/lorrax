@@ -261,3 +261,17 @@ def test_self_inverse_screening_crossing_with_full_matrix_density():
     for z in check:
         np.testing.assert_allclose(kr.evaluate(model["lesser"], z),
             kr.evaluate(ss.mirror(greater), z), rtol=1e-7, atol=1e-11)
+
+
+def test_screen_snapshot_forwards_explicit_pencil_capacity(monkeypatch):
+    captured = {}
+
+    def fit(*args, **options):
+        captured.update(options)
+        raise RuntimeError("pencil forwarding checked")
+
+    monkeypatch.setattr(ss, "joint_loewner", fit)
+    with pytest.raises(RuntimeError, match="pencil forwarding checked"):
+        ss.screen_snapshot(lambda sites: np.zeros((2, len(sites), 1, 1), complex),
+            np.arange(4) + 0.2j, np.array([0.5 + 0.3j]), max_pencil_bytes=256 * 1024 ** 2)
+    assert captured["max_pencil_bytes"] == 256 * 1024 ** 2

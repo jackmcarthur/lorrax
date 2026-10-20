@@ -175,6 +175,12 @@ def test_joint_snapshot_controls_parse_and_refuse_invalid_closures():
     assert deck.values["lorrax.collision_screening"] == "joint"
     assert deck.values["lorrax.collision_snapshot_steps"] == 32
     assert deck.values["lorrax.collision_hamiltonian"] == "hf"
+    assert deck.values["lorrax.collision_projection_order"] == 400
+    assert deck.values["lorrax.collision_pencil_mb"] == 128
+    capacity = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+        collision_basis="instantaneous", collision_projection_order=800, collision_pencil_mb=256))
+    assert capacity.values["lorrax.collision_projection_order"] == 800
+    assert capacity.values["lorrax.collision_pencil_mb"] == 256
     reference = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
         collision_basis="instantaneous", collision_hamiltonian="reference"))
     assert reference.values["lorrax.collision_hamiltonian"] == "reference"
@@ -186,6 +192,8 @@ def test_joint_snapshot_controls_parse_and_refuse_invalid_closures():
                     "td_collision_snapshot")
     for key, value in (("collision_snapshot_steps", 0), ("collision_density_rank", 0),
                        ("collision_fit_samples", 3), ("collision_snapshot_mixing", 1.1),
+                       ("collision_projection_order", 0), ("collision_projection_order", True),
+                       ("collision_pencil_mb", 0), ("collision_pencil_mb", 128.5),
                        ("collision_adiabatic_ev", 0), ("collision_fit_height_ev", float("inf")),
                        ("collision_hamiltonian", "screened")):
         assert _refuses(_bundle(collision="raw", **{key: value}), "td_collision_snapshot")
@@ -239,3 +247,27 @@ def test_collision_keys_inactive_when_off_and_fingerprint():
     fp_off = json.loads(restart_fingerprint(off, sysm, model, 0.1))
     fp_on = json.loads(restart_fingerprint(on, sysm, model, 0.1))
     assert "collision" not in fp_off and fp_on["collision"]["lorrax.collision"] == "subtracted"
+    assert fp_on["collision"]["lorrax.collision_projection_order"] == 400
+    assert fp_on["collision"]["lorrax.collision_pencil_mb"] == 128
+
+
+def test_joint_capacity_controls_forward_from_deck_to_runtime(monkeypatch):
+    from types import SimpleNamespace as NS
+    from tdagw import stages, snapshot_runtime
+
+    deck = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+        collision_basis="instantaneous", collision_projection_order=800, collision_pencil_mb=256))
+    captured = {}
+
+    def snapshot(*args, options, **kwargs):
+        captured.update(options)
+        raise RuntimeError("capacity forwarding checked")
+
+    monkeypatch.setattr(snapshot_runtime, "snapshot_collision", snapshot)
+    system = NS(ops=None, hdr={"kpts": None}, bands=[1])
+    source = dict(config=NS(sigma=NS(regularization_ev=0.1)))
+    with pytest.raises(RuntimeError, match="capacity forwarding checked"):
+        stages._attach_collision(deck, system, None, None, source, None,
+                                 say=lambda _: None, log=None)
+    assert captured["max_projection_order"] == 800
+    assert captured["max_pencil_bytes"] == 256 * 1024 ** 2

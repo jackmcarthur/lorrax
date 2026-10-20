@@ -77,6 +77,33 @@ def test_active_pair_rotation_matches_rotated_orbitals():
     np.testing.assert_allclose(rotated, expected, rtol=2e-11, atol=2e-11)
 
 
+def test_evaluator_forwards_explicit_screening_capacities(monkeypatch):
+    from tdagw import snapshot_runtime as runtime
+    _, mesh, _, _ = _source()
+    nk, nb = 4, 4
+    energy = np.tile([-0.4, -0.2, 0.3, 0.7], (nk, 1))
+    prepared = dict(mesh=mesh, nk=nk, nb_chi=nb, nb_sigma=nb,
+        energy=energy, occupations=np.tile([1.0, 1.0, 0.0, 0.0], (nk, 1)),
+        spin_weight=1.0, kmq=np.tile(np.arange(nk), (nk, 1)), q_negative=np.arange(nk),
+        vertices=lambda iq: (np.zeros((nk, nb, nb, 1), complex), {}))
+    captured = {}
+
+    def screen(*args, **options):
+        captured.update(options)
+        raise RuntimeError("screening capacities checked")
+
+    monkeypatch.setattr(runtime.SS, "make_projected_sampler", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime.SS, "screen_snapshot", screen)
+    evaluate, _ = runtime.make_snapshot_evaluator(prepared, dict(b_lo=1, n_active=2,
+        max_projection_order=800, max_pencil_bytes=256 * 1024 ** 2))
+    basis = dict(U=np.tile(np.eye(2), (nk, 1, 1)), e=energy[:, 1:3],
+                 rho=np.tile(np.diag([1.0, 0.0]), (nk, 1, 1)))
+    with pytest.raises(RuntimeError, match="screening capacities checked"):
+        evaluate(basis, equilibrium=True)
+    assert captured["max_projection_order"] == 800
+    assert captured["max_pencil_bytes"] == 256 * 1024 ** 2
+
+
 @pytest.mark.parametrize("location", ["V_q", "screening_inputs"])
 def test_typed_whole_zone_coulomb_source(location):
     from symmetry_maps import QirrOperator

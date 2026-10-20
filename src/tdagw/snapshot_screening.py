@@ -471,7 +471,7 @@ def compact_causal_realization(system, sites, *, tolerance=1e-9):
 def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
                     fit_tolerance=1e-3, rank_tolerance=1e-11,
                     pole_tolerance=1e-12, max_projection_order=400,
-                    self_negative=False):
+                    self_negative=False, max_pencil_bytes=128 * 1024 ** 2):
     """Build and certify a reduced joint screened snapshot from a callback.
 
     ``sampler(sites)`` returns exact ``[2,support,r,r]`` bubble values in
@@ -486,6 +486,9 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
     ``self_negative=True`` imposes crossing on a self-inverse q, in a real
     Coulomb factor gauge.  It averages the two fitted one-sided functions;
     the independent exact bubble/noise checks still bound this operation.
+    ``max_projection_order`` bounds causal-projection states and
+    ``max_pencil_bytes`` bounds each block Loewner pencil before allocation;
+    increasing these capacity limits does not change fit acceptance.
     """
     fit_sites, check_sites = (np.asarray(x, dtype=complex) for x in (fit_sites, check_sites))
     if (check_sites.size == 0 or not np.isfinite(fit_sites).all()
@@ -494,7 +497,8 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
             or not np.isfinite(fit_tolerance) or fit_tolerance <= 0):
         raise ValueError("GATE snapshot_check_support: positive disjoint fit/check supports required")
     data = np.asarray(sampler(fit_sites), dtype=complex)
-    fit = joint_loewner(fit_sites, data, max_order=max_order, rank_tolerance=rank_tolerance)
+    fit = joint_loewner(fit_sites, data, max_order=max_order, rank_tolerance=rank_tolerance,
+                        max_pencil_bytes=max_pencil_bytes)
     pl, pg = fit["lesser"], fit["greater"]
     if self_negative:
         A, B, Cl, D = pl

@@ -104,6 +104,8 @@ TD_DEFAULTS = {
     "lorrax.collision_snapshot_acceleration": "anderson",
     "lorrax.collision_density_rank": 8,
     "lorrax.collision_pole_order": 48,
+    "lorrax.collision_projection_order": 400,
+    "lorrax.collision_pencil_mb": 128,
     "lorrax.collision_fit_samples": 192,
     "lorrax.collision_fit_tolerance": 0.02,
     "lorrax.collision_adiabatic_ev": 0.05,
@@ -234,7 +236,7 @@ def _check_collision(vals: dict) -> None:
             "the column-sampled MGKBA collision operator",
         )
     for key in ("collision_snapshot_steps", "collision_density_rank", "collision_pole_order",
-                "collision_fit_samples"):
+                "collision_projection_order", "collision_pencil_mb", "collision_fit_samples"):
         value = vals[f"lorrax.{key}"]
         if (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise _gate("td_collision_snapshot", f"{key} = {value!r}",
@@ -1167,6 +1169,16 @@ TD_KEY_DOCS = {
         "", "Maximum common rational polarization order for the joint lesser/greater "
         "fit; retarded screening and the causal lesser realization derive from that "
         "same model. General signed, complex and noise-only modes are admitted.", ("td_collision",)),
+    "lorrax.collision_projection_order": (
+        "", "Maximum reduced state count in the causal Keldysh projection workspace. "
+        "This explicit capacity guard defaults to 400; increase it when converging "
+        "rational order only if the required dense host memory and cubic solve cost "
+        "are available. It does not relax response or noise acceptance.", ("td_collision",)),
+    "lorrax.collision_pencil_mb": (
+        "MiB", "Maximum size of each complex full-block Loewner pencil, in MiB "
+        "(2^20 bytes). Factorization workspace and copies require approximately eight "
+        "such arrays. This explicit capacity guard does not choose rational order or "
+        "relax response or noise acceptance.", ("td_collision",)),
     "lorrax.collision_fit_samples": (
         "", "Number of finite complex frequency supports for joint rational fitting. "
         "Independent held-out response and dressed-noise checks must pass before use.",

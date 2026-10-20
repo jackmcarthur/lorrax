@@ -212,6 +212,8 @@ collision_snapshot_mixing = 0.7
 collision_snapshot_acceleration = "anderson"
 collision_density_rank = 8
 collision_pole_order = 48
+collision_projection_order = 400
+collision_pencil_mb = 128
 collision_fit_samples = 192
 collision_fit_tolerance = 0.02
 collision_adiabatic_ev = 0.05
@@ -228,6 +230,16 @@ comparison to the original TD-aGW. The default `hf` instead solves the absolute
 Hartree/Fock plus M_H material Hamiltonian; a DFT-prepared density need not be
 stationary there. Both use bare HF increments, with no static reduced-W
 subtraction. See the [theory owner](../theory/td_agw_dynamical.md#damping).
+
+Converge density rank together with rational order and support count. If a
+capacity guard refuses the larger fit, explicitly raise
+`collision_projection_order` (causal-projection state count, default 400) or
+`collision_pencil_mb` (each block Loewner pencil, default 128 MiB) to match
+available host resources. Self-inverse q crossing can increase the realized
+order before projection. Dense projection cost grows cubically with state
+count; pencil factorization and copies require approximately eight times the
+per-pencil storage. These controls raise capacity only: the independent
+response and noise checks keep the same tolerances.
 
 The joint snapshot's stability gate probes its installed coherent Hamiltonian.
 It follows paired field-free trajectories, so a physical HF quench is not
