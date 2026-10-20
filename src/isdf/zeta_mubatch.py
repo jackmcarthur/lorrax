@@ -792,7 +792,7 @@ class ZetaG:
         ``zeta_io`` the masked ζ tiles are also written to ``zeta_q_G``;
         ``with_v=False`` (:meth:`write_file`) forms and writes ζ only.
         """
-        if self.solver_kind == 'rank_truncate':
+        if self.solver_kind in _FACE_KINDS:
             return self._contract_v_face(v_table, keep=keep, zeta_io=zeta_io, print_fn=print_fn, with_v=with_v)
         t0 = time.perf_counter()
         print_fn = print_fn or self.print_fn
@@ -883,7 +883,8 @@ class ZetaG:
             raise ValueError(f"ZetaG.contract_v: keep must be (Q={Q}, n) slots; got {keep.shape}.")
         v = jnp.asarray(pad_to_axis(jnp.asarray(v_table, dtype=jnp.complex128), st.g_axis, axis=1))
         ngk, sl = jnp.asarray(self.ngk_per_q, jnp.int32), jnp.asarray(keep)
-        to_face, apply, acc = _face_kernels(mesh, Q, st.g_tile, bool(with_v))
+        to_face, apply, acc = _face_kernels(mesh, Q, st.g_tile, bool(with_v),
+                                            inverse=self.solver_kind == 'inverse')
         mu = int(st.mu_pad)
         V = jnp.zeros((Q, mu, mu), jnp.complex128, device=NamedSharding(mesh, P(None, 'x', 'y'))) if with_v else None
         S = jnp.zeros((Q, mu, int(sl.shape[1])), jnp.complex128, device=NamedSharding(mesh, P(None, _XY, None)))
@@ -965,17 +966,22 @@ def _factor_specs(solver_kind: str):
 #: Accumulator layout: q-local blocks on their owners.
 _ACC_SPEC = P(_XY, None, None)
 
+#: Factor kinds whose ζ is formed on the face: the charge channel's B (ζ = B(BᴴZ)) and a
+#: current channel's mesh inverse (ζ = C⁻¹Z, isdf.core.transverse_factor_layout).
+_FACE_KINDS = ('rank_truncate', 'inverse')
 
-def _face_kernels(mesh, Q, g_tile, with_v):
-    """The charge channel's per-tile programs on the face: Z (q-owner) -> its first Q rows at
-    ``P(None,'x','y')``; ζ = B(BᴴZ) by two face GEMMs; then ζ masked by ngk, ``V += conj(ζ) v ζᵀ``
-    at ``P(None,'x','y')`` and the shell gather at ``P(None,('x','y'),None)``."""
+
+def _face_kernels(mesh, Q, g_tile, with_v, inverse=False):
+    """The face channels' per-tile programs: Z (q-owner) -> its first Q rows at
+    ``P(None,'x','y')``; ζ = B(BᴴZ) by two face GEMMs (``inverse``: ζ = C⁻¹Z, one); then ζ
+    masked by ngk, ``V += conj(ζ) v ζᵀ`` at ``P(None,'x','y')`` and the shell gather at
+    ``P(None,('x','y'),None)``."""
     # The GEMMs take whole matrices per rank only where they fit the room beside what is live
     # (distrib_la.fits_local: Q < P only within its small-matrix cap), else the face SUMMA.
     # The default staged route put a whole B (mu x mu) and Z tile on one rank at Q = 1.
     from common.gpu_utils import shared_device_room
     room = int(shared_device_room("isdf zeta face apply"))
-    key = ('face', _mesh_id(mesh), int(Q), int(g_tile), bool(with_v), room)
+    key = ('face', _mesh_id(mesh), int(Q), int(g_tile), bool(with_v), room, bool(inverse))
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -983,7 +989,8 @@ def _face_kernels(mesh, Q, g_tile, with_v):
     to_face = jax.jit(lambda Z: Z[:Q], out_shardings=face)
     from distrib_la import matmul
     gemm = partial(matmul, mesh=mesh, batched_route="auto", budget_bytes=room)
-    apply = jax.jit(lambda B, Z: gemm(B, gemm(B, Z, transa="C")), out_shardings=face)
+    apply = jax.jit((lambda F, Z: gemm(F, Z)) if inverse else
+                    (lambda B, Z: gemm(B, gemm(B, Z, transa="C"))), out_shardings=face)
 
     def acc(zeta, v, ngk, sl, t, V, S):
         g_idx = t * g_tile + jnp.arange(zeta.shape[-1], dtype=jnp.int32)
@@ -1122,6 +1129,8 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     sl = np.asarray(pad_to_axis(jnp.asarray(keep, jnp.int32), qa, axis=0))
     from common.collectives import device_put_process_local
     mesh = z0.mesh
+    if all(z.solver_kind in _FACE_KINDS for z in zetas):
+        return _contract_v_group_face(zetas, pairs, v_tables, keep, print_fn, t0)
     v_dev = device_put_process_local(v, NamedSharding(mesh, P(None, _XY, None)))
     ngk_dev = device_put_process_local(ngk, NamedSharding(mesh, P(_XY)))
     sl_dev = device_put_process_local(sl, NamedSharding(mesh, P(_XY, None)))
@@ -1167,6 +1176,64 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     if jax.process_index() == 0:
         print_fn(receipt)
     return out
+
+
+def _contract_v_group_face(zetas, pairs, v_tables, keep, print_fn, t0):
+    """:func:`contract_v_group` when every ζ is formed on the face: each ζ tile on the face
+    (:func:`_face_kernels`), each pair's V and each ζ's shell accumulated there, as
+    :meth:`ZetaG._contract_v_face` does for one ζ; no rank holds a whole (μ, μ) V."""
+    z0, st0 = zetas[0], zetas[0].store
+    mesh, Q, mu = z0.mesh, st0.Q, int(st0.mu_pad)
+    pairs = tuple((int(a), int(b)) for a, b in pairs)
+    face, mush = NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P(None, _XY, None))
+    v = jnp.stack([jnp.asarray(pad_to_axis(jnp.asarray(t, dtype=jnp.complex128), st0.g_axis, axis=1))
+                   for t in v_tables])
+    ngk, sl = jnp.asarray(z0.ngk_per_q, jnp.int32), jnp.asarray(np.asarray(keep, np.int32))
+    forms = [_face_kernels(mesh, Q, st0.g_tile, False, inverse=z.solver_kind == 'inverse')[:2]
+             for z in zetas]
+    step = _face_pair_kernel(mesh, int(st0.g_tile), pairs, len(zetas))
+    V = tuple(jnp.zeros((Q, mu, mu), jnp.complex128, device=face) for _ in pairs)
+    S = tuple(jnp.zeros((Q, mu, int(sl.shape[1])), jnp.complex128, device=mush) for _ in zetas)
+    for t in range(st0.n_Gt):
+        zt = tuple(apply(z.factor, to_face(z.store.read_tile(t))) for z, (to_face, apply) in zip(zetas, forms))
+        V, S = step(zt, v, ngk, sl, jnp.int32(t), V, S)
+        del zt
+    out = [z0.mu_basis.unpack_operator(Vp) if z0.mu_basis is not None else Vp for Vp in V]
+    for z, Sa in zip(zetas, S):
+        z.shell = z0.mu_basis.unpack_axis(Sa, 1) if z0.mu_basis is not None else Sa
+        z.shell_slots = keep
+    receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, {st0.n_Gt} G tiles, "
+               f"on the face, {time.perf_counter() - t0:.2f}s; no ζ file")
+    if jax.process_index() == 0:
+        (print_fn or z0.print_fn)(receipt)
+    return out
+
+
+def _face_pair_kernel(mesh, g_tile, pairs, n_z):
+    """One G tile of several face ζ's: ``V^{ab} += conj(ζ^a) v^{ab} ζ^bᵀ`` per pair at
+    ``P(None,'x','y')`` and each ζ's shell at ``P(None,('x','y'),None)`` (the face twin of
+    :func:`_pair_tile_kernel`, the same equations as :func:`_face_kernels`' accumulation)."""
+    key = ('face_pair', _mesh_id(mesh), int(g_tile), pairs, int(n_z))
+    fn = _kernel_cache.get(key)
+    if fn is not None:
+        return fn
+    face, mush = NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P(None, _XY, None))
+
+    def acc(Z, v, ngk, sl, t, V, S):
+        g_idx = t * g_tile + jnp.arange(Z[0].shape[-1], dtype=jnp.int32)
+        mask = g_idx[None, :] < ngk[:, None]                                   # (q, g)
+        Z = tuple(jnp.where(mask[:, None, :], z, 0) for z in Z)
+        cols = jnp.clip(g_idx, 0, v.shape[-1] - 1)
+        V = tuple(jax.lax.with_sharding_constraint(V[i] + jnp.einsum(
+            'qmg,qg,qng->qmn', jnp.conj(Z[a]), jnp.where(mask, jnp.take(v[i], cols, axis=1), 0), Z[b]),
+            face) for i, (a, b) in enumerate(pairs))
+        hit = (sl[:, None, :] == g_idx[None, :, None]).astype(Z[0].dtype)
+        S = tuple(jax.lax.with_sharding_constraint(S[a] + jnp.einsum('qmg,qgs->qms', Z[a], hit), mush)
+                  for a in range(n_z))
+        return V, S
+    fn = jax.jit(acc, donate_argnums=(5, 6))
+    _kernel_cache[key] = fn
+    return fn
 
 
 def _face_former(mesh, st, ngk_per_q):
