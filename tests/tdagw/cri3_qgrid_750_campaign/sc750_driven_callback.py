@@ -32,9 +32,9 @@ def sibling(name):
 
 def example_plan():
     """Explicit finite candidate list, not an assumption that it reaches a target."""
-    return dict(status="PREPARED_PENDING_MATERIAL_BSE_AND_ZERO_DATA", schema="sc750_driven_v1",
-        bse_report="REQUIRED_ACTUAL_FINE_BSE/bright_subgap.json",
-        zero_directory="REQUIRED_COMPLETED_ZERO_PROBE", window=[100, 144],
+    return dict(status="PREPARED_PENDING_ACTUAL_BSE_AND_MODE_SPECIFIC_GATES", schema="sc750_driven_v1",
+        bse_report="REQUIRED_ACTUAL_OWN_GRID_BSE/bright_subgap.json",
+        zero_directory="REQUIRED_ONLY_FOR_MGKBA_ZERO_PREFLIGHT", window=[100, 144],
         degeneracy_mode="strict", duration_fs=10., dt_as=25., measure_as=50.,
         pulse=dict(start_fs=1., end_fs=5., phase_rad=0., polarization=[1., 0., 0.]),
         amplitude_candidates_v_m=[1.e8, 4.e8, 1.6e9, 6.4e9, 2.56e10],
@@ -159,28 +159,16 @@ def require_matching_zero_result(result, active, response_policy):
     return result
 
 
-def validate_material_prerequisites(plan, frame, *, response_policy=None):
-    """Read only actual tiny BSE/zero artifacts; no scalar gap surrogate."""
-    import numpy as np
-    import h5py
-    bpath, zero = Path(plan["bse_report"]), Path(plan["zero_directory"])
+def validate_bse_prerequisite(plan, frame, *, response_policy=None):
+    """Authenticate the static target independently of raw GW collisions."""
+    bpath = Path(plan["bse_report"])
     bse = json.loads(bpath.read_text())
-    complete = json.loads((zero/"complete.json").read_text())
-    ref = json.loads((zero/"reference.json").read_text())
-    for record in (bse["frame"], ref):
-        if any(record.get(k) != frame.get(k) for k in ("frame", "input_h_sha256", "wfn_fingerprint")):
-            raise ValueError("GATE driven_reference: BSE/zero and live accepted input identities differ")
+    if any(bse["frame"].get(k) != frame.get(k) for k in ("frame", "input_h_sha256", "wfn_fingerprint")):
+        raise ValueError("GATE driven_reference: BSE and live accepted input identities differ")
     if response_policy is not None and response_policy["response_qgrid"] != [8, 8, 1]:
-        for record in (bse, ref):
-            if (record.get("response_qgrid") != response_policy["response_qgrid"]
-                    or record.get("response_window") != response_policy["response_window"]):
-                raise ValueError("GATE driven_reference: BSE/zero response grid/window must match own coarse reference")
-    if (ref.get("sigma_eta_ev") != plan["eta_ev"]
-            or ref.get("response_gamma_ev") != plan["response_gamma_ev"]):
-        raise ValueError("GATE driven_zero: zero-field eta/gamma differ from planned B/C closure")
-    if (complete.get("status") != "SHORT_ZERO_FIELD_PROBE_COMPLETE_NOT_DRIVEN_ADMISSION"
-            or complete.get("accepted_refreshes", 0) < 1 or complete.get("frame") != frame["frame"]):
-        raise ValueError("GATE driven_zero: completed short probe with actual refreshed W required")
+        if (bse.get("response_qgrid") != response_policy["response_qgrid"]
+                or bse.get("response_window") != response_policy["response_window"]):
+            raise ValueError("GATE driven_reference: BSE response grid/window must match own coarse reference")
     target = bse.get("target_root_index")
     if target is None or target not in bse["bright_subgap_root_indices"]:
         raise ValueError("GATE driven_BSE: no actual resolved bright subgap root")
@@ -193,6 +181,30 @@ def validate_material_prerequisites(plan, frame, *, response_policy=None):
     strength = float(bse["strength_xyz_bohr2_cell"][target][axis])
     if not math.isfinite(strength) or strength <= 1.e-8:
         raise ValueError("GATE driven_BSE_polarization: actual target is not bright on the selected Cartesian axis")
+    return dict(target_energy_ev=energy, target_root=target, target_axis="xyz"[axis],
+        target_axis_strength_bohr2_cell=strength, bse=bse,
+        bse_sha256=hashlib.sha256(bpath.read_bytes()).hexdigest())
+
+
+def validate_raw_zero_prerequisite(plan, frame, *, response_policy=None):
+    """Keep the raw-collision preflight mandatory for any B/C execution."""
+    import numpy as np
+    import h5py
+    zero = Path(plan["zero_directory"])
+    complete = json.loads((zero/"complete.json").read_text())
+    ref = json.loads((zero/"reference.json").read_text())
+    if any(ref.get(k) != frame.get(k) for k in ("frame", "input_h_sha256", "wfn_fingerprint")):
+        raise ValueError("GATE driven_reference: zero and live accepted input identities differ")
+    if response_policy is not None and response_policy["response_qgrid"] != [8, 8, 1]:
+        if (ref.get("response_qgrid") != response_policy["response_qgrid"]
+                or ref.get("response_window") != response_policy["response_window"]):
+            raise ValueError("GATE driven_reference: zero response grid/window must match own coarse reference")
+    if (ref.get("sigma_eta_ev") != plan["eta_ev"]
+            or ref.get("response_gamma_ev") != plan["response_gamma_ev"]):
+        raise ValueError("GATE driven_zero: zero-field eta/gamma differ from planned B/C closure")
+    if (complete.get("status") != "SHORT_ZERO_FIELD_PROBE_COMPLETE_NOT_DRIVEN_ADMISSION"
+            or complete.get("accepted_refreshes", 0) < 1 or complete.get("frame") != frame["frame"]):
+        raise ValueError("GATE driven_zero: completed short probe with actual refreshed W required")
     with h5py.File(zero/"tdgw.h5", "r") as f:
         n = int(f["tdgw_data/checkpoint/it_next"][()])
         if n <= 1:
@@ -211,13 +223,22 @@ def validate_material_prerequisites(plan, frame, *, response_policy=None):
             for value, count in zip(r["per_k"][name], r["per_k"][counts]):
                 if count and (value is None or value < -plan["gates"]["tangent_tolerance_ry"]):
                     raise ValueError("GATE driven_zero: actual density-boundary tangent points outward")
-    return dict(target_energy_ev=energy, target_root=target, target_axis="xyz"[axis],
-        target_axis_strength_bohr2_cell=strength, bse=bse,
-        bse_sha256=hashlib.sha256(bpath.read_bytes()).hexdigest(),
+    return dict(raw_zero_status="PASSED_REQUIRED_MGKBA_PREFLIGHT",
         zero_complete_sha256=hashlib.sha256((zero/"complete.json").read_bytes()).hexdigest(),
         zero_carrier_max=float(abs(carriers).max()), zero_boundary_records=len(boundary_paths),
         zero_active_bands=ref.get("active_bands"),
         zero_evidence_scope="PREFLIGHT_ONLY_NOT_DRIVEN_WINDOW_ADMISSION")
+
+
+def validate_material_prerequisites(plan, frame, *, response_policy=None):
+    """Static A needs BSE; B/C additionally require all raw-zero gates."""
+    result = validate_bse_prerequisite(plan, frame, response_policy=response_policy)
+    if plan["execute_mgkba"]:
+        result.update(validate_raw_zero_prerequisite(plan, frame, response_policy=response_policy))
+    else:
+        result.update(raw_zero_status="NOT_REQUIRED_STATIC_A_ONLY", zero_evidence_scope="NOT_EVALUATED",
+                      zero_evidence=None, MGKBA_execution="NOT_ATTEMPTED")
+    return result
 
 
 def completed_observables(path, *, duration_fs=None, measure_interval_fs=None):
@@ -304,7 +325,8 @@ def run_td_probe(source, *, out, deck_path):
     from common.band_degeneracy import resolve_band_window
     plan_path, out = Path(deck_path).resolve(), Path(out).resolve()
     plan = validate_plan(json.loads(plan_path.read_text()))
-    for key in ("bse_report", "zero_directory"):
+    paths = ("bse_report", "zero_directory") if plan["execute_mgkba"] else ("bse_report",)
+    for key in paths:
         plan[key] = str((plan_path.parent/plan[key]).resolve())
     mesh, meta, arrays = source["mesh"], source["meta"], source["frame_arrays"]
     zero = sibling("sc750_td_callback")
@@ -613,6 +635,7 @@ def run_td_probe(source, *, out, deck_path):
                 run_arm(f"{arm[0]}_level_{level}", arm, pick["amplitude_v_m"], reference["model"])
     save("complete.json", record=dict(
         status="THREE_ARM_EXPLORATORY_COMPLETE" if plan["execute_mgkba"] else "A_CALIBRATION_ONLY_COMPLETE_BC_NOT_ATTEMPTED",
+        raw_zero_status=prereq["raw_zero_status"], MGKBA_execution="COMPLETED" if plan["execute_mgkba"] else "NOT_ATTEMPTED",
         selected=selected, wall_s=time.perf_counter()-started,
         no_precision_or_universal_positivity_claim=True,
         A_B_difference="different coherent functionals; not isolated damping",

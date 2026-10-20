@@ -129,6 +129,16 @@ prevents both MGKBA driven arms. A amplitude calibration remains permitted
 before this larger-window gate. Identical equilibrium U/E/rho reuse the
 same checked equilibrium W and Sigma row; the actual C refresh is not skipped.
 
+For `execute_mgkba=false`, staticA amplitude calibration requires the actual
+authenticated BSE target/reference but does **not** read raw-collision zero
+artifacts. A missing or scientifically refused zero4 therefore need not
+block independent staticA carrier-target measurements. Its manifest records
+`raw_zero_status=NOT_REQUIRED_STATIC_A_ONLY`, no zero evidence and B/C not
+attempted; ordinary coherent trace/Pauli/Hermiticity checks remain active.
+Enabling B/C still requires the original rawzero preflight and both mandatory
+matching-window gates. An A-only completion is not an A/B/C comparison or
+evidence that raw MGKBA is safe.
+
 `sc750_td_callback.py` is a prepared, not material-verified adapter from the
 authenticated accepted input to the existing native snapshot and TD owners.
 The accepted q8 input of run 60053348 is recorded separately in

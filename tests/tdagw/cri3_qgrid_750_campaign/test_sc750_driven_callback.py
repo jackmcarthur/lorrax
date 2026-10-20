@@ -133,6 +133,7 @@ def test_both_mandatory_zero_results_precede_any_driven_MGKBA_loop():
 def _prerequisites(tmp_path):
     frame = dict(frame="actual_accepted_input", input_h_sha256="H", wfn_fingerprint="WFN")
     plan = driver.example_plan()
+    plan["execute_mgkba"] = True
     plan["bse_report"] = str(tmp_path/"bse.json")
     zero = tmp_path/"zero"
     zero.mkdir()
@@ -164,6 +165,42 @@ def test_actual_prerequisite_records_checkpoint_crop_and_fresh_number_gate(tmp_p
     bad["weighted_trace_rate_ry"] = 1.e-5
     path.write_text(json.dumps(bad))
     with pytest.raises(ValueError, match="fresh number flux"):
+        driver.validate_material_prerequisites(plan, frame)
+
+
+@pytest.mark.parametrize("zero_case", ["missing", "invalid", "not_named"])
+def test_A_only_valid_BSE_can_calibrate_without_raw_zero_artifacts(tmp_path, zero_case):
+    plan, frame, zero = _prerequisites(tmp_path)
+    plan["execute_mgkba"] = False
+    if zero_case == "missing":
+        plan["zero_directory"] = str(tmp_path/"does_not_exist")
+    elif zero_case == "invalid":
+        (zero/"complete.json").write_text("not valid JSON: raw zero refused")
+    else:
+        del plan["zero_directory"]
+    result = driver.validate_material_prerequisites(plan, frame)
+    assert result["target_energy_ev"] == 2.731
+    assert result["raw_zero_status"] == "NOT_REQUIRED_STATIC_A_ONLY"
+    assert result["zero_evidence"] is None and result["MGKBA_execution"] == "NOT_ATTEMPTED"
+    assert "zero_complete_sha256" not in result
+    # The same missing/refused artifact must still stop any B/C execution.
+    with pytest.raises((FileNotFoundError, json.JSONDecodeError, KeyError)):
+        driver.validate_material_prerequisites(dict(plan, execute_mgkba=True), frame)
+
+
+def test_A_only_still_refuses_bad_BSE_and_live_frame_or_coarse_policy(tmp_path):
+    plan, frame, _ = _prerequisites(tmp_path)
+    plan["execute_mgkba"] = False
+    with pytest.raises(ValueError, match="identities differ"):
+        driver.validate_material_prerequisites(plan, dict(frame, input_h_sha256="wrong"))
+    policy = dict(response_qgrid=[4, 4, 1], response_window="fejer")
+    with pytest.raises(ValueError, match="BSE response grid/window"):
+        driver.validate_material_prerequisites(plan, frame, response_policy=policy)
+    path = Path(plan["bse_report"])
+    data = json.loads(path.read_text())
+    data["target_root_index"] = None
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="no actual resolved bright"):
         driver.validate_material_prerequisites(plan, frame)
 
 

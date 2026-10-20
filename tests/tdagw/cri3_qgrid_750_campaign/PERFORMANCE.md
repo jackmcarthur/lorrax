@@ -27,6 +27,14 @@ The Σ executable includes W(τ) synthesis, Green construction, G/W convolution,
 band projection, and the frequency fold. W response includes sampling, Dyson,
 model construction, checks, and I/O; it is not just a dielectric solve.
 
+A later standalone replay on the accepted q4 input (step `60056663.7`,
+source `4b24c0e`) measured **78.0244 s** for W construction and **20.290 s**
+for its protected160 Sigma sweep (219 nodes, nine windows, 18 rules built).
+Its response bank used the host tier, 3.36 GB/rank, rather than the warmed SC
+device route. The enclosing W timer was 87.1 s because it also included the
+**8.91045 s BSE callback**; do not count that BSE twice. These are distinct
+cold/warm and residency conditions, not a single universal refresh cost.
+
 Across all eight maps, the timing tree reports Σ τ sweep **158.785 s**,
 `tau.synthesis_setup` **3.996 s**, `tau.setup` **1.806 s**, and
 `tau.initial_compile_and_probe` **9.429 s**. Setup printed 1.6 s on map 0 and
@@ -81,9 +89,22 @@ The actual accepted q4 input has protected `[0,160)` energies
 q8 reference. They establish the narrower external support, not linear
 runtime scaling with bandwidth or band count.
 
-**A successful compact44 timing is still pending in this evidence set.**
-The earlier source309 callback failed before Σ and supplies no sweep timing.
-The prepared two-sweep benchmark measures raw750 equilibrium correlation
+**The compact44 benchmark completed** on source `4b24c0e`, step
+`60056663.8`, with output shape `[2,64,44,44]` and the same authenticated q4
+reference/W:
+
+| Sweep | Wall (s) | Window/τ pairs | Windows | Rules built |
+| --- | ---: | ---: | ---: | ---: |
+| Cold | 6.378333 | 14 | 2 | 4 |
+| Held session | 2.249600 | 26 | 2 | 0 |
+
+The two full complex pairs differed by relative Frobenius **2.07e-6** and
+maximum **9.97e-7 Ry** (0.01356 meV). This is a diagnostic, not a convergence
+verdict. Actual output/receipts are in
+`material_active_sigma4bq4_60056663/coarse_pre_sigma/` under the evidence root;
+the committed summary is `evidence/ACTIVE44_SIGMA_TIMING_60056663.json`.
+The earlier source309 callback failed before Σ and supplied no sweep timing.
+This two-sweep benchmark measures raw750 equilibrium correlation
 BODY only: no head, spectral-tail extrapolation, density-coherent internal
 line, refreshed-W TD fixed point, or propagation. Its second sweep uses the
 same physical W but may use different certified held/padded rules, so it is

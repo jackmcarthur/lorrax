@@ -27,6 +27,10 @@
   "final_max_non_scissored_displacement_ev": 0.0009743172164800029,
   "final_RMS_protected_displacement_ev": 0.00017170441180795108,
   "accepted_INPUT_fundamental_gap_ev": 3.073808088648082,
+  "accepted_INPUT_conversion_ev_per_ry": 13.605693122994,
+  "native_code_RYD_TO_EV": 13.6056980659,
+  "accepted_INPUT_gap_using_native_code_conversion_ev": 3.0738092053530015,
+  "conversion_scope": "The archived accepted-input numerical summaries use the stated conversion; native BSE uses common.units.RYD_TO_EV. Their 1.12 micro-eV gap difference is conversion, not a different electronic frame.",
   "raw_final_OUTPUT_fundamental_gap_ev": 3.076791882,
   "accepted_active_100_144_energy_range_ev": [-11.205136176927029, -2.415763973836721],
   "timings_seconds": {

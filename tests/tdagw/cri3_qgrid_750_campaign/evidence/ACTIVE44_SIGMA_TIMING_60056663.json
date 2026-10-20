@@ -1,0 +1,33 @@
+{
+  "schema": "campaign_compact_sigma_timing_v1",
+  "allocation": "60056663",
+  "step": "60056663.8",
+  "execution_revision": "4b24c0e80b1537b5c5c58bdf835d3f385c88f89a",
+  "status": "ACTIVE44_RAW750_BODY_TIMING_COMPLETE",
+  "returncode": 0,
+  "frame": "frame_0007_call_0007",
+  "input_h_sha256": "616107c9a528915ebf57ec5db1199449836f0e74663be14ac58ceec31b031a40",
+  "electronic_grid": [8, 8, 1],
+  "response_grid": [4, 4, 1],
+  "response_window": "fejer",
+  "virtual_bands": 750,
+  "active_destination_zero_based": [100, 144],
+  "output_shape": [2, 64, 44, 44],
+  "projection_scope": "Compact external request AND device destination projection, not prefix execution followed by cropping",
+  "model_digest": "resident:d4942dc68560d1752ac2071bafda9735efdfc73795661848d9486c8d898e4c6c",
+  "sweeps": [
+    {"repeat": 0, "seconds": 6.37833323700761, "window_tau_pairs": 14, "windows": 2, "rules_built": 4},
+    {"repeat": 1, "seconds": 2.2496004220010946, "window_tau_pairs": 26, "windows": 2, "rules_built": 0}
+  ],
+  "cold_held_complex_pair_difference": {
+    "relative_frobenius": 2.0725682483086553e-6,
+    "max_abs_ry": 9.966488976979932e-7,
+    "scope": "Same physical W/endpoints; different certified padded rules, not an identical-kernel warm test or convergence verdict"
+  },
+  "timing_scope": "Whole raw750 equilibrium correlation BODY sweep including planning/compile/contraction. Not isolated per-node latency, SC update, or coherent TD refresh.",
+  "head_evaluated": false,
+  "band_extrapolation_evaluated": false,
+  "TD_propagated": false,
+  "original_complete_receipt_sha256": "e50e3572699f3dec2e529d4401ff198b49862e272b267d9bce8cce40418f0284",
+  "local_evidence_directory": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/material_active_sigma4bq4_60056663/coarse_pre_sigma"
+}
