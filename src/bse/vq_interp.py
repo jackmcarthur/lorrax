@@ -2443,13 +2443,13 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         (r0, min(r0 + int(r_chunk), n_rtot))
         for r0 in range(0, n_rtot, int(r_chunk)))
 
-    # The nodal basis rows are the centroid cardinal functions, ψ ≈ Σ_ν
-    # ψ(r_ν) ζ_ν(r); ‖c‖² is not a projector norm, and the full-r residual
-    # of that fit is not measured here (NaN in the receipt).
+    # The nodal rows are a least-squares fit, not an orthonormal projection,
+    # so ‖c‖² carries no residual; the full-r residual is measured during the
+    # first refit pass (iter_galerkin_rchunks receipt) and stored back here.
     gal = gal_zeta = float("nan")
-    log_fn(f"  [refit] nodal Galerkin rows (centroid cardinal functions): "
-           f"fH window {nb_wide} bands, ζ-fit window {nb} bands; full-r "
-           f"residual not measured")
+    log_fn(f"  [refit] nodal Galerkin rows (least squares on the centroid "
+           f"coefficients): fH window {nb_wide} bands, ζ-fit window {nb} "
+           f"bands; full-r residual measured on the first refit pass")
     # Coordinates and on-grid lookup stay owned by SymMaps.  In particular,
     # unfolded_kpts includes a shifted Monkhorst-Pack offset while the integer
     # star labels do not.
@@ -2548,6 +2548,9 @@ def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
         log_fn(f"  [refit-null] q=({ix},{iy},{iz}) frac="
                f"{np.array2string(qfr, precision=4)}: refit vs stored "
                f"V_qmunu rel = {rel:.3e}")
+    log_fn(f"  [refit-null] Galerkin full-r residual "
+           f"{rst['galerkin_rel']:.3e} (fH) / {rst['galerkin_rel_zeta']:.3e} "
+           f"(zeta window)")
     log_fn(f"  [refit-null] worst {worst:.3e} over {len(out)} coarse q "
            f"(bracket {tol:.1e}; the Galerkin full-r residual printed above "
            f"is the physical floor, and the kernel's own on-grid null is "
@@ -2786,10 +2789,11 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     gflat_acc = jnp.zeros((1, n_mu_padded, GS.shape[1]), jnp.complex128,
                           device=NamedSharding(mesh_xy, P(None, ('x', 'y'), None)))
     zeta_b0 = int(rst["window_abs"][0])
+    receipt = {} if not np.isfinite(rst["galerkin_rel"]) else None
     for r0, r1, basis_chunk, psi_parts in iter_galerkin_rchunks(
             rst["psi_source"], rst["basis"], rst["meta"], mesh_xy,
             r_chunk_ranges=rst["r_chunk_ranges"],
-            retained_band_range=rst["window_abs"]):
+            retained_band_range=rst["window_abs"], receipt=receipt):
         r_carrier = int(basis_chunk.shape[-1])
         if m_leg == "stored":
             psi_zeta = jnp.concatenate(
@@ -2821,6 +2825,11 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
             norm="backward",
             chunk_size=(rst["gflat_chunk_size"] or None))
         del basis_chunk, psi_parts, Z, zeta_chunk
+    if receipt:
+        rst["galerkin_rel"], rst["galerkin_rel_zeta"] = (
+            receipt["fh"], receipt["zeta"])
+        log_fn(f"  [refit] Galerkin full-r residual {receipt['fh']:.3e} (fH) "
+               f"/ {receipt['zeta']:.3e} (zeta window)")
     zt = _to_host(gflat_acc[0])[:n_mu]
     # The producer's kernel on a bulk deck, this module's slab one otherwise;
     # ``rst["v_on_set"]`` is built once in refit_prepare.  See make_v_on_set.

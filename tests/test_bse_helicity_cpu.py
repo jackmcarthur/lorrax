@@ -31,6 +31,7 @@ from bse.absorption_common import (exciton_dipole_projections,  # noqa: E402
                                    slice_dipole_to_bse_window)
 from bse.bse_densify import densified_dipoles  # noqa: E402
 from ffi.fft import xla_reference  # noqa: E402
+from isdf.galerkin import NodalInterp  # noqa: E402
 
 A1, A2 = np.array([1.0, 0.0]), np.array([0.5, np.sqrt(3.0) / 2.0])
 HALF_NN = ((1, 0), (0, 1), (-1, 1))            # the other three are -n
@@ -191,14 +192,18 @@ def test_native_and_densified_routes_give_one_table():
         unfolded_kpts=np.asarray(kc),
         cartesian_action=lambda rows, axial, time_odd: np.broadcast_to(
             np.eye(3), (len(np.asarray(rows)), 3, 3)))
+    # The toy's orbitals as co-located nodes; their nodal values are ``c``.
+    nodes = NodalInterp(jnp.asarray(c), np.zeros((c.shape[2], 3)),
+                        np.diag([1.0, 1.0, 10.0]), 2, 1)
     with xla_reference():
         fine = compute_wfns_fi(
-            ctilde=jnp.asarray(c), B_at_mu=jnp.ones((c.shape[2], 1, 4), complex),
+            ctilde=jnp.asarray(c), B_at_mu=nodes,
             enk_sigma=jnp.asarray(e.T), kgrid_co=KC, kgrid_fi=KF,
             band_window_fi=(B_MIN, B_MAX), mesh_xy=mesh, return_coeffs=True)
         dip = densified_dipoles(
             (v, e, "toy dH/dk", "toy_c3.h5"), sym=sym, fh_energies=e,
-            basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, NB)),
+            basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, NB),
+                                  basis_at_nodes=nodes),
             fine=fine, coarse_grid=KC, n_val=N_VAL, window_start=B_MIN,
             a_band_index=None, mesh_xy=mesh, log_fn=lambda *a: None)
     q = np.asarray(fine.q_frac)

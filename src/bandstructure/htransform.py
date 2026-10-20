@@ -48,8 +48,7 @@ from .fh_interp import (
 # from the CLI module for open lanes until the wave after ARCH wave 0.
 from .fh_interp import (                                             # noqa: F401
     f_transform_eigs, outer_r_shell_mask,
-    resolve_extra_rank_pad, resolve_galerkin_rank_multiplier,
-    resolve_local_vbm_index, select_active_eigenpairs,
+    resolve_extra_rank_pad, resolve_local_vbm_index, select_active_eigenpairs,
     validate_centroid_subset_idx,
 )
 
@@ -338,7 +337,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
                             kgrid, mesh) for i in range(3)]
         E, D, residual = grid_moments(
             fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh,
-            B_at_mu=B_at_mu)
+            B_at_mu=B_at_mu, ctilde=ctilde, log_fn=log)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
             np.asarray(gather_to_host(E)), np.asarray(gather_to_host(D)),

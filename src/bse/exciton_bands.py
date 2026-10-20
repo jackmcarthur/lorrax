@@ -1519,17 +1519,16 @@ def main(argv=None):
         _fine_plan = _linalg_plan(
             "eigh", mesh_xy, backend=args.eigh_backend, n=None,
             batched_route=args.distrib_la_batched_route)
-        _basis_multiplier = ht.resolve_galerkin_rank_multiplier(
-            params.get("htransform_rank_multiplier", 20.0))
         restart_file = _find_restart_file(args.input)
         report.environment(wfn=wfn, lines=(
             f"Restart tensors: {abs_path(restart_file)}",
             "Transition data: distributed band and centroid blocks on X x Y",
-            "Galerkin basis: every orbit-closed centroid as a node "
-            f"(multiplier {_basis_multiplier:g} unused); quadrature metric + "
-            "Loewdin; deterministic, no Gram eigensolve",
-            f"Fine-k eigensolve: {_fine_plan.requested} -> "
-            f"{_fine_plan.backend}; matrix extent follows retained Galerkin rank",
+            "Galerkin basis: every orbit-closed centroid as a node; "
+            "quadrature metric + Loewdin; deterministic, no Gram eigensolve",
+            f"Fine-k eigensolve: top block (fitted bands + "
+            f"{ht.TOP_BLOCK_PAD}) by subspace iteration; operand layout "
+            f"{_fine_plan.requested} -> "
+            f"{_fine_plan.backend}",
             f"Batched LA schedule: {_fine_plan.requested_batched_route} -> "
             f"{_fine_plan.batched_route}",
             "LA alternatives : native JAX; cuSOLVERMp on GPU; SLATE or "
