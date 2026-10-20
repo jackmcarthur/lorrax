@@ -54,6 +54,7 @@ again.
 from __future__ import annotations
 
 import ctypes
+import weakref
 import functools
 import os
 import re
@@ -465,6 +466,11 @@ def refuse_over_device(executable, module_name: str, platform: str) -> None:
         f"docs/architecture/memory-model.md#module-does-not-fit.")
 
 
+# One reading per executable (its HLO text, its FFT plans): a dispatch that reruns an executable
+# reads none of it again.  Weak keys: the cache never keeps an executable alive.
+_PEAKS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
 def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
                           ) -> AotPeakBreakdown:
     """Per-rank peak HBM for ``compiled`` (a ``jax.stages.Compiled``),
@@ -486,6 +492,10 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
     * CUDA or ROCm, query fails -> a conservative figure with
       ``measured = False``, announced once.
     """
+    try:
+        return _PEAKS[compiled][platform]
+    except (KeyError, TypeError):
+        pass
     m = compiled.memory_analysis()
     compiled_peak = buffer_peak_bytes(m)
     # Some planners query an executable whose arguments are already part of
@@ -528,7 +538,7 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
                 f"priced as twice the largest FFT op's data, "
                 f"{cufft_scratch / 1e9:.2f} GB for this kernel")
 
-    return AotPeakBreakdown(
+    peak = AotPeakBreakdown(
         compiled_peak=compiled_peak,
         cufft_scratch=cufft_scratch,
         total=compiled_peak + cufft_scratch,
@@ -536,6 +546,11 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
         fft_specs=fft_specs,
         resident_increment=compiled_increment + cufft_scratch,
     )
+    try:
+        _PEAKS.setdefault(compiled, {})[platform] = peak
+    except TypeError:
+        pass
+    return peak
 
 
 # ---------------------------------------------------------------------------

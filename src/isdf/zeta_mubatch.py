@@ -828,8 +828,9 @@ class ZetaG:
         from lxkit import memory
         from runtime.aot_memory import agreed_chunk, compiled_new_bytes
         tile = math.prod(nxt.sharding.shard_shape(nxt.shape)) * nxt.dtype.itemsize
-        got = -agreed_chunk(-compiled_new_bytes(step.lower(
-            L_arg, nxt, v_dev, ngk_dev, sl_dev, jnp.int32(0), V, M, shell).compile(), extra=tile))
+        # The executable priced is the one each tile runs (one compile, not a price-only one).
+        step = step.lower(L_arg, nxt, v_dev, ngk_dev, sl_dev, jnp.int32(0), V, M, shell).compile()
+        got = -agreed_chunk(-compiled_new_bytes(step, extra=tile))
         memory.book(memory.priced(got, f"ζ G-tile step {st.g_tile} (compiled) + the prefetched "
                                   "tile", increment=True))
         for t in range(st.n_Gt):
@@ -899,8 +900,8 @@ class ZetaG:
         S = jnp.zeros((Q, mu, int(sl.shape[1])), jnp.complex128, device=NamedSharding(mesh, P(None, _XY, None)))
         nxt = st.read_tile(0)
         # The pass's price over what is live now (V, S, the first tile): the next tile read
-        # ahead and the chain's largest step, each program compiled at its operands (never
-        # run): to_face, apply beside the face tile, acc beside apply's output.
+        # ahead and the chain's largest step: to_face, apply beside the face tile, acc beside
+        # apply's output, each compiled at its operands -- the executables every tile runs.
         from lxkit import memory
         from runtime.aot_memory import compiled_new_bytes
 
@@ -919,7 +920,7 @@ class ZetaG:
         for t in range(st.n_Gt):
             Zt = nxt
             nxt = st.read_tile(t + 1) if t + 1 < st.n_Gt else None
-            V, S, zt = acc(apply(self.factor, to_face(Zt)), v, ngk, sl, jnp.int32(t), V, S)
+            V, S, zt = e3(e2(self.factor, e1(Zt)), v, ngk, sl, jnp.int32(t), V, S)
             if zeta_io is not None:      # zt is already in the writer's layout (P(None,('x','y'),None), Q rows)
                 zt = self.mu_basis.unpack_axis(zt, 1) if self.mu_basis is not None else zt
                 zeta_io.write_slab('zeta_q_G', zt, offset=(0, 0, int(t * st.g_tile)))
