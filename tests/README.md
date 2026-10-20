@@ -69,7 +69,9 @@ A new test needs no bootstrap import of its own.
   <=600s cap; frequency-only diagnostics, never Sigma, a production bank or a
   trajectory. Review/push/explicit launch approval remain required.
 - `tdagw/test_collision_boundary_cpu.py`: global versus current-density
-  empty/filled-subspace boundary diagnostics, with no state repair (CPU).
+  empty/filled-subspace boundary diagnostics, finite-width positive-boson
+  trace/stationarity distinction and exact held-flow number drift, with no
+  state repair (NumPy-only arithmetic).
 - `tdagw/cri3_full_microscopic/`: archived full-native campaign preparation,
   observation/plotting and bounded reduced-pencil timing helpers; prepared,
   not a completed trajectory or model admission.

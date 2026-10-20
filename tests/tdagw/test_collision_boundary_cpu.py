@@ -58,3 +58,55 @@ def test_boundary_diagnostics_against_degenerate_outward_oracle():
     for invalid in (-1.0, 0.5, np.nan):
         with pytest.raises(ValueError, match="occupation_tolerance"):
             boundary_diagnostics(gamma, injection, rho, occupation_tolerance=invalid)
+
+
+def test_positive_boson_finite_eta_is_inward_and_number_conserving_not_stationary():
+    """Literal retarded columns, not an imposed equilibrium counterterm."""
+    from tests._full_microscopic_oracle import retarded_reference_pairs
+
+    gap, omega, coupling_squared = 0.7, 0.9, 0.13
+    energy = np.array([[0., gap]])
+    rho = np.diag([1., 0.])[None].astype(complex)
+    vertices = np.array([[0., 1.], [1., 0.]])[None, ..., None]
+    poles = np.array([omega, -omega], complex)
+    residues = np.array([coupling_squared, -coupling_squared])[:, None, None]
+    rates = []
+    dagger = lambda a: a.conj().swapaxes(-1, -2)
+    for eta in (0.2, 0.02, 1e-9):
+        particle, hole = retarded_reference_pairs(
+            vertices, energy, rho, energy, poles, residues, eta)
+        rp, rh = particle[1], hole[1]
+        gamma = 1j * (rp + rh - dagger(rp + rh))
+        injection = 1j * (rh - dagger(rh))
+        collision = injection - 0.5 * (gamma @ rho + rho @ gamma)
+        rate = 2 * coupling_squared * eta / ((gap + omega)**2 + eta**2)
+        rates.append(rate)
+        np.testing.assert_allclose(collision[0], np.diag([-rate, rate]),
+                                   rtol=2e-14, atol=1e-20)
+        got = boundary_diagnostics(gamma, injection, rho, occupation_tolerance=1e-12)
+        np.testing.assert_allclose(got["trace_rate"], 0., atol=1e-17)
+        np.testing.assert_allclose(got["empty_min_injection"], rate, rtol=2e-14)
+        np.testing.assert_allclose(got["filled_min_blocking"], rate, rtol=2e-14)
+        assert np.linalg.norm(collision) > 0.0
+    assert rates[2] < rates[1] < rates[0]
+    assert rates[2] < 1e-9
+    np.testing.assert_allclose(rates[2] / 1e-9,
+                               2 * coupling_squared / (gap + omega)**2, rtol=1e-14)
+    assert 2 * coupling_squared * 0.0 / (gap + omega)**2 == 0.0
+
+
+def test_exact_held_flow_can_drift_despite_zero_fresh_trace_and_positive_boundaries():
+    gamma = np.diag([1., 2.])
+    injection = np.diag([0.8, 0.7])
+    rho_star = 0.5 * np.eye(2)
+    fresh = boundary_diagnostics(gamma, injection, rho_star, occupation_tolerance=1e-12)
+    np.testing.assert_allclose(fresh["trace_rate"], 0., atol=1e-15)
+    assert fresh["min_injection"] > 0.0 and fresh["min_blocking"] > 0.0
+    time = 0.1
+    stationary_diagonal = np.diag(injection) / np.diag(gamma)
+    rho = np.diag(stationary_diagonal + (0.5 - stationary_diagonal)
+                  * np.exp(-np.diag(gamma) * time))
+    held = boundary_diagnostics(gamma, injection, rho, occupation_tolerance=1e-12)
+    np.testing.assert_allclose(held["trace_rate"], -np.trace(gamma @ (rho-rho_star)),
+                               atol=1e-15)
+    assert held["trace_rate"] > 0.0 and np.trace(rho) > np.trace(rho_star)

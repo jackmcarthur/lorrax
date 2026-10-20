@@ -1355,6 +1355,58 @@ this approximation makes no general complete-positivity claim. The
 separate nonequilibrium statistical constructions below remain research
 alternatives and are not prerequisites for this reference calculation.
 
+###### Fresh trace, held drift and finite-width stationarity
+
+The implemented column ordering gives a conditional **fresh-snapshot**
+number identity, not a trajectory conservation theorem. Require the same
+active internal/external space, current electronic energies and density,
+reciprocal vertices, equally weighted reversed q endpoints, and common
+converged quadrature. The reference pole pairing then gives
+$F_h^q(x)=-F_p^{-q}(-x)^*$, including the half-weight zero-frequency sector.
+Writing $A=\sum_k w_k\operatorname{Tr}[R_h(I-\rho)]$ and
+$B=\sum_k w_k\operatorname{Tr}(R_p\rho)$, exchanging the two electronic
+endpoints and q with $-q$ gives $A=-B^*$. Consequently
+$\sum_k w_k\operatorname{Tr}C=2\operatorname{Re}[i(A-B)]=0$.
+This algebra does not require $[\rho,H]=0$, positive residues, or zero
+$\eta$. A fresh numerical residual must instead be checked against these
+assumptions and quadrature error. The native advanced-hole compatibility
+conversion reverses the two slots before adjointing, so `val[0]` adjointed
+recovers exactly the retarded hole **column**, without shell averaging.
+
+If the fresh trace at $\rho_*$ is zero, holding its evaluated coefficients
+gives the exact different identity
+
+$$
+\dot N_{\rm held}[\rho]
+=-\sum_k w_k\operatorname{Tr}\{\Gamma_*[\rho-\rho_*]\}.
+$$
+
+Thus exact solution of the held affine equation can still change particle
+number. The virtual-band tail changes only the Hermitian correction, not
+the active-rate pair, and cannot repair this drift. Report the fresh trace
+residual separately from accumulated held-interval drift.
+
+Even a positive equilibrium boson need not give a stationary sharp
+electronic projector at finite width. For $E=(0,\Delta)$, $\rho=\mathrm{diag}(1,0)$,
+an off-diagonal unit vertex and boson poles $\pm\Omega$ with residues
+$\pm g^2$, $\Delta,\Omega>0$, the literal reference branches give
+
+$$
+C=\mathrm{diag}(-r,r),\qquad
+r=\frac{2g^2\eta}{(\Delta+\Omega)^2+\eta^2}.
+$$
+
+Its trace is zero and both actual empty/filled boundary compressions point
+inward, yet $C\ne0$ for $\eta>0$; this off-resonant contribution vanishes
+as $\eta\to0$. Stationarity, particle conservation and Pauli safety are
+therefore distinct tests. At an exact current-density boundary inspect
+$P_0DP_0$ and $P_1(\Gamma-D)P_1$, not the spectrum of $\Gamma$ alone.
+Global indefiniteness need not imply outward motion at that state; positive
+compressions at one state do not prove invariance at later states. In a
+held Gamma eigenbasis the matrix-element decay coefficient is
+$(\gamma_i+\gamma_j)/2$; fresh nonlinear relaxation also varies $D$ and
+$\Gamma$. None of these identities supplies a general positivity theorem.
+
 ##### Lossless transition-bath prescription {#lossless-transition-bath}
 
 `collision_statistics = "lossless_bath"` declares a stationary, lossless
