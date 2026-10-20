@@ -1238,6 +1238,16 @@ they do not certify a 978-port material calculation. The separate
 `tests/test_full_density_transition_galerkin_cpu.py` supplies literal algebra
 oracles.
 
+The held basis may retain an exactly zero occupation-gap sector at a
+stationary binary projector. Only its **current transfer** is omitted before
+modalization, and only with exact coordinate-sector support, zero projected
+free-generator crossblocks, and zero output coupling. The resulting lower
+triangular generator has exactly the live-sector transfer even at coincident
+dark eigenvalues/Jordan blocks. No computed pole is inspected or discarded;
+the complete held basis remains available, and a coherent changed density
+uses the full current generator. Tiny tests check both that exact identity
+and reactivation; this is not a gain filter or a production admission.
+
 This is **not a production route**: no all-q bank, runtime/default switch,
 material response admission, cost/time-to-accuracy result or dynamics is
 established by those CPU proofs. It is not a cheap substitution: at 36 k points and 160 bands

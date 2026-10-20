@@ -841,11 +841,9 @@ block norm. The spectral-closure owner strictly refuses a cut through a
 near-degenerate residual singular block. This is probe independence, not
 an overlap inverse or a pole-stability selection. Capacity refuses an
 admitted block that does not fit rather than trimming it. Binary stationary
-controls use separate exact K-sign sectors. This proof currently refuses a
-coherent-reserved catalogue containing K=0 rows at a stationary projector;
-it does not silently discard the reservation. Initialization of that held
-catalogue would require a separate zero-sector triangular/dark-mode proof
-and is deferred. Opposite-q bases are related by
+controls use separate exact K=-1,0,+1 sectors, including coherent-reserved
+K=0 coordinates. Normalized rows are restored to their known structural
+sector support, not selected by an occupation/amplitude floor. Opposite-q bases are related by
 conjugation and the exact $(k,b,d)\mapsto(k-q,d,b)$ permutation; self-inverse
 q seeds are completed and the resulting subspace closure is checked.
 
@@ -856,9 +854,22 @@ $$
 W_{c,Q}(z)=VA_Q[z-D_Q-B_Q^\dagger VA_Q]^{-1}B_Q^\dagger V.
 $$
 
-The existing canonical complex-pole executor diagonalizes this small
-projected generator with all retained states; it does not fit a W Loewner
-pencil or remove growing modes. Only projected frequency matrices reach
+For a stationary binary density only, a structurally separated zero sector
+may remain in the HELD Q but be omitted from MODAL MATERIALIZATION. The
+implementation requires exact pure live/zero coordinate support, both
+current projected D crossblocks exactly zero, and exactly $A_0=0$. In the
+ordering $Q=[Q_L,Q_0]$, the generator is then
+$M=\left[\begin{smallmatrix}M_L&0\\G_{0L}&D_0\end{smallmatrix}\right]$
+and the output is $[VA_L,0]$. The transfer is exactly the live-block
+transfer even for coincident dark eigenvalues/Jordan blocks; no pole is
+inspected to decide this omission. The full Q and full projected generator
+are retained. Changed coherent rho uses the full current generator; absent
+the exact structural certificate no dark reduction is made. This is not an
+approximate null-residue threshold or a growing-mode removal.
+
+The existing canonical complex-pole executor diagonalizes the materialized
+projected generator; it does not fit a W Loewner pencil or remove growing
+modes. Only projected frequency matrices reach
 the host. Returned native left/right factors distinguish logical count
 from zero padding and are tested against literal complex column/row Σ.
 
