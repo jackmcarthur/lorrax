@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — c1 head channel: the q ≠ 0 projector carries the gauge phase
+
+`w_head_densify = c1` re-attaches W's Γ head at every fine q inside the coarse
+Γ cell as `S(q)/Ω · conj(g₀(q)) ⊗ g₀(q)` with `g₀(q)_μ = g₀_μ e^{−2πi q·r_μ}`
+(`gw.head_densify.attach_head_channel`; `r_μ = idx/N` from
+`bse.bse_densify.w_tile_centroid_frac`, the rows the W densifier embeds; q the
+shortest representative). It used `g₀(q) = g₀`, the Γ vector without the
+full-Bloch gauge phase of the W tiles, which broke the star covariance of the
+c1 tile at the coarse Γ cell's boundary q (Si 4³→8³ c1: 0.17 relative at the
+first shell; the body is covariant to 2 × 10⁻⁸).
+
+- **Results.** c1 runs densified across grids move at the fine q of the coarse
+  Γ cell other than Γ: `bse_k_grid` with a fine grid other than the coarse one
+  and `exciton_bands --w-coarse-grid`. `srlr` (head at Γ only), `fine == coarse`
+  and undensified runs are unchanged bit for bit. No deck change is needed.
+- **API.** `attach_head_channel(..., *, centroid_frac, bvec)`: both keywords are
+  required.
+
 ## 2026-10-20 — `band_extrapolation_checkpoints`: several Σ band counts from one sweep
 
 New deck key, off by default (`""`): a run without it is unchanged (same plan,

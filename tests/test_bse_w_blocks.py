@@ -236,13 +236,14 @@ def run_cases(mesh, *, xla_reference=False):
 def run_densify_cases(mesh):
     """The densifier's two in-place W updates against NumPy: the SR/LR rank term in q blocks
     (``bse_densify._add_rank_lr``; whole grid, and blocks of 4 of 6 q, the last clamped onto its
-    neighbour) and the Γ head channel (``gw.head_densify.attach_head_channel``)."""
+    neighbour) and the Γ head channel (``gw.head_densify.attach_head_channel``, its q-dependent projector
+    ``g₀_μ e^{−2πi q·r_μ}`` at every fine q)."""
     import numpy as np
     from jax.experimental import multihost_utils
     from jax.sharding import NamedSharding, PartitionSpec as P
     from lxkit import device_put_process_local
     from bse.bse_densify import _add_rank_lr
-    from gw.head_densify import attach_head_channel
+    from gw.head_densify import attach_head_channel, fine_q_cart
     from runtime import tiles
     rng = np.random.default_rng(7)
     nq, n_l = int(np.prod(KGRID)), 3
@@ -258,10 +259,15 @@ def run_densify_cases(mesh):
                                                                W - term)
     g0 = cplx(N_MU)
     S = rng.standard_normal(KGRID)
+    r_mu = rng.random((N_MU, 3))
+    bvec = 2 * np.pi * np.linalg.inv(np.array([[1.0, 0.0, 0.0], [0.3, 1.1, 0.0], [0.0, 0.2, 1.4]])).T
     g0_X = device_put_process_local(g0, NamedSharding(mesh, P("x")))
     g0_Y = device_put_process_local(g0, NamedSharding(mesh, P("y")))
-    ref = W + (np.conj(g0)[:, None] * g0[None, :])[:, :, None, None, None] * (S / 2.5)[None, None]
-    out["densify head channel vs numpy"] = _rel(host(attach_head_channel(put_w(), g0_X, g0_Y, S, 2.5)), ref)
+    q = fine_q_cart(bvec, KGRID) @ np.linalg.inv(bvec)          # the head's q: shortest representative
+    g0q = g0[:, None, None, None] * np.exp(-2j * np.pi * np.einsum("ma,xyza->mxyz", r_mu, q))
+    ref = W + np.conj(g0q)[:, None] * g0q[None, :] * (S / 2.5)[None, None]
+    out["densify head channel vs numpy"] = _rel(host(attach_head_channel(put_w(), g0_X, g0_Y, S, 2.5,
+                                                                         centroid_frac=r_mu, bvec=bvec)), ref)
     return out
 
 

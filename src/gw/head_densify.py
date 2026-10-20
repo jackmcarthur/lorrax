@@ -37,7 +37,8 @@ WHAT C1 DOES
 Split the Γ head off BEFORE the densifier, densify only the body, and
 re-attach per fine q::
 
-    W_fine(q) = densify(W_body-only)(q)  +  S_fine(q) · conj(g₀) ⊗ g₀ / Ω
+    W_fine(q) = densify(W_body-only)(q)  +  S_fine(q) · conj(g₀(q)) ⊗ g₀(q) / Ω,
+    g₀(q)_μ    = g₀_μ · e^{−2πi q·r_μ}
 
     S_fine(Γ)          = ⟨ v/(1 − v qᵀS_cart q) ⟩ over the FINE mini-BZ cell
     S_fine(q ∈ Γ_c, ≠0) =   v(q)/(1 − v(q) qᵀS_cart q)   evaluated pointwise
@@ -96,10 +97,11 @@ HERMITICITY IS STRUCTURAL, NOT CHECKED
 --------------------------------------
 ``S_fine(q)`` is a REAL scalar (:func:`head_scalar_pointwise` and
 :func:`gamma_cell_head_scalar` both return float64) and the update is a real
-multiple of the rank-one Hermitian projector ``conj(g₀)⊗g₀`` added to a
+multiple of the rank-one Hermitian projector ``conj(g₀(q))⊗g₀(q)`` added to a
 Hermitian body.  Hermitian by construction, exactly as the loader's own
 injection is.  Reciprocity ``W_q = conj(W_{−q})`` survives because ``S_fine``
-depends on q only through ``v(q)`` and ``qᵀSq``, both even.  The rule that
+depends on q only through ``v(q)`` and ``qᵀSq``, both even, and the gauge
+phase ``e^{−2πi q·r_μ}`` goes to its conjugate under q → −q.  The rule that
 keeps this safe is the one the rejected two-tile shape established: **do not
 re-solve; only split and re-attach.**  Nothing here inverts anything, so no
 non-congruent product can be formed.
@@ -107,16 +109,27 @@ non-congruent product can be formed.
 THE ONE APPROXIMATION, NAMED
 ----------------------------
 For fine q-points off the coarse grid the exact projector is
-``g₀(q) = ζ̃_{q,μ}(G_q)``, and ζ exists only on the coarse grid.  This stage
-FREEZES the projector at ``g₀(Γ)`` for every fine point inside the coarse Γ
-cell.  That is an O(q·L) relative error on a term of magnitude O(1/q²) in
-bulk or O(1/|q|) in a slab — controlled inside the cell and irrelevant outside
-it, and exactly the regime ``THEORY_LT_HEAD_TENSOR.md`` §3.3 identifies as the
-cell average's validity domain.  The exact alternatives
-(``psp/finite_q_head_interp.compute_g_mu_at_q``, or ``jax.jacfwd`` on the
-closed-form b26p ζ̃ evaluator) are a later stage.
-The freeze enters at exactly one place: :func:`attach_head_channel`, which
-takes ONE ``g0`` pair and broadcasts it over every fine q.
+``g₀(q)_μ = ζ̃_{q,μ}(G_q)``, and ζ exists only on the coarse grid.  The W tiles
+are in the full-Bloch gauge: ``W_μν(R)`` couples ``r_μ + R`` with ``r_ν``,
+``r_μ = idx/N ∈ [0,1)`` the centroid's FFT point, so ``W_μν(q) =
+Σ_R e^{−2πi q·R} W(r_μ + R, r_ν)`` and its G = 0 channel carries
+``e^{+2πi q·(r_μ − r_ν)}``.  Accordingly ``ζ_{q,μ}(r) = e^{iq·(r − r_μ)} ζ̄_{q,μ}(r)``
+with ζ̄ lattice-periodic, and ``ζ̃_{q,μ}(0) = e^{−2πi q·r_μ} ζ̄̃_{q,μ}(0)``.  This
+stage keeps that gauge phase EXACTLY, at the shortest representative of q (the
+point ``S_fine`` is evaluated at), and freezes only the periodic factor at Γ:
+``g₀(q)_μ = g₀_μ e^{−2πi q·r_μ}``.  The residual is the q-dependence of
+``ζ̄̃_{q,μ}(0)``, set by the extent of ζ̄ about its own centroid, not by the cell
+— inside the coarse Γ cell, on a term of magnitude O(1/q²) in bulk or
+O(1/|q|) in a slab, the regime ``THEORY_LT_HEAD_TENSOR.md`` §3.3 identifies as
+the cell average's validity domain.  Until 2026-10-20 the phase was frozen too
+(``g₀(q) = g₀``): an O(q·L) error in the cell size L that broke the star
+covariance of every c1 tile at the coarse Γ cell's boundary q (Si 4³→8³:
+0.17 relative at the first shell, against 2e-8 for the body).  The exact
+periodic factor (``psp/finite_q_head_interp.compute_g_mu_at_q``, or
+``jax.jacfwd`` on the closed-form b26p ζ̃ evaluator) is a later stage.
+The approximation enters at exactly one place: :func:`attach_head_channel`,
+which takes ONE ``g0`` pair, the centroid positions and the lattice, and forms
+``g₀(q)`` at every fine q.
 
 WHAT THIS MODULE DOES NOT DO
 ----------------------------
@@ -836,19 +849,23 @@ def head_channel_zone_average(S_grid) -> float:
     return float(np.sum(S) / S.size)
 
 
-def attach_head_channel(W_q, g0_X, g0_Y, S_grid, cell_volume):
-    """``W_q += (S(q)/Ω) · conj(g₀) ⊗ g₀`` at EVERY fine q.  Split-and-reattach.
+def attach_head_channel(W_q, g0_X, g0_Y, S_grid, cell_volume, *, centroid_frac, bvec):
+    """``W_q += (S(q)/Ω) · conj(g₀(q)) ⊗ g₀(q)`` at EVERY fine q.  Split-and-reattach.
 
-    The same rank-one shape ``head_correction.apply_q0_head_rank1_sharded``
-    applies at the single q = 0 slice, broadcast over the k axes with a
-    per-q real coefficient.  ``g0_X`` and ``g0_Y`` are the same
-    ``ζ(0, μ, G=0)`` vector held in TWO copies — one ``P("x")`` on μ, one
-    ``P("y")`` on ν — so the outer product is process-local on every rank and
-    no ``N_μ²``-class array is ever replicated.
-
-    THE FROZEN PROJECTOR ENTERS HERE, AND ONLY HERE.  One ``g0`` pair is
-    broadcast over every fine q; the exact object would be ``g₀(q)``.  See the
-    module docstring for the bound and for what would replace it.
+    ``g₀(q)_μ = g₀_μ · e^{−2πi q·r_μ}``: the Γ vector ``g₀ = ζ̃(0, μ, G=0)`` times
+    the full-Bloch gauge phase of the W tiles (module docstring, THE ONE
+    APPROXIMATION), with ``q`` the shortest representative of each fine point
+    (:func:`fine_q_cart`, where :func:`build_fine_head_scalars` evaluates S)
+    and ``r_μ`` the tile's centroid positions ``idx/N`` — the same rows
+    ``bse.bse_densify.w_pair_embedding`` embeds
+    (``bse.bse_densify.w_tile_centroid_frac``).  The same rank-one shape
+    ``head_correction.apply_q0_head_rank1_sharded`` applies at the single
+    q = 0 slice, where the phase is exactly 1.  ``g0_X`` and ``g0_Y`` are the
+    same vector held in TWO copies — one ``P("x")`` on μ, one ``P("y")`` on ν —
+    and the positions follow the same two layouts, so ``g₀(q)`` and the outer
+    product are process-local on every rank and no ``N_μ²``-class array is ever
+    replicated.  Nothing scales with band pairs: the extra operands are
+    ``(n_μ, n_q)`` phase rows.
 
     Parameters
     ----------
@@ -863,6 +880,13 @@ def attach_head_channel(W_q, g0_X, g0_Y, S_grid, cell_volume):
     cell_volume : float
         Ω in bohr³.  Applied here — once — exactly where
         ``head_correction._head_rank1_scalars`` applies it today.
+    centroid_frac : array_like
+        ``(n_logical, 3)`` fractional centroid positions ``idx/N ∈ [0,1)`` of
+        the tile's μ axis, ``n_logical <= n_μ``; the carrier pad rows beyond it
+        hold zero tiles and zero ``g0`` and take position 0.
+    bvec : array_like
+        ``(3, 3)`` Cartesian reciprocal vectors as rows (``CoulombGeometry.bvec``),
+        the lattice :func:`build_fine_head_scalars` used.
 
     Returns
     -------
@@ -872,8 +896,12 @@ def attach_head_channel(W_q, g0_X, g0_Y, S_grid, cell_volume):
         the argument again.  One fused elementwise pass; the eager form held
         the broadcast product and the sum beside ``W_q``, three W-sized
         buffers per rank (98 GB at a 32.6 GB CrI3 30x30, N_μ 3000, P4 tile).
+        A grid that is nonzero only at Γ (the srlr head, the ``fine == coarse``
+        identity, a Γ detach) gives the frozen-projector result bit for bit.
     """
     import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import device_put_process_local
 
     S = np.asarray(S_grid, dtype=np.float64)
     if S.ndim != 3:
@@ -884,25 +912,42 @@ def attach_head_channel(W_q, g0_X, g0_Y, S_grid, cell_volume):
             f"attach_head_channel: W_q k-axes {tuple(W_q.shape[-3:])} do not "
             f"match S_grid {tuple(S.shape)} — the head scalars were built for "
             f"a different grid than the densifier produced.")
+    b = np.asarray(bvec, dtype=np.float64)
+    r = np.asarray(centroid_frac, dtype=np.float64)
+    n_mu = int(W_q.shape[0])
+    if b.shape != (3, 3) or r.ndim != 2 or r.shape[1] != 3 or r.shape[0] > n_mu:
+        raise ValueError(
+            f"attach_head_channel: want bvec (3,3) and centroid_frac (n<= {n_mu}, 3); "
+            f"got {b.shape} and {r.shape}")
+    r_pad = np.zeros((n_mu, 3), dtype=np.float64)
+    r_pad[:r.shape[0]] = r
+    q_frac = fine_q_cart(b, S.shape) @ np.linalg.inv(b)       # (nfx,nfy,nfz,3), shortest representative
+    mesh = g0_X.sharding.mesh
+    r_X = device_put_process_local(r_pad, NamedSharding(mesh, P(*tuple(g0_X.sharding.spec), None)))
+    r_Y = device_put_process_local(r_pad, NamedSharding(mesh, P(*tuple(g0_Y.sharding.spec), None)))
+    q = device_put_process_local(q_frac, NamedSharding(mesh, P()))
     s = jnp.asarray(S / float(cell_volume), dtype=W_q.dtype)
-    return _attach_head_program()(W_q, g0_X, g0_Y, s)
+    return _attach_head_program()(W_q, g0_X, g0_Y, r_X, r_Y, q, s)
 
 
 _ATTACH_HEAD: list = []
 
 
 def _attach_head_program():
-    """``W_q + (conj(g0_X) ⊗ g0_Y) ⊗ s`` as one jitted program donating ``W_q``, built once per process.
+    """``W_q + conj(g₀(q)) ⊗ g₀(q) ⊗ s`` as one jitted program donating ``W_q``, built once per process.
 
-    The outer product is process-local on every rank (``g0_X`` on ``'x'``,
-    ``g0_Y`` on ``'y'``), so the program is one elementwise fusion per tile.
+    ``g₀(q)_μ = g0_μ e^{−2πi q·r_μ}`` is formed on each copy's own layout
+    (``r_X``/``g0_X`` on ``'x'``, ``r_Y``/``g0_Y`` on ``'y'``, the q table
+    replicated), so the outer product is process-local and the program is one
+    elementwise fusion per tile.
     """
     if not _ATTACH_HEAD:
         import jax
         import jax.numpy as jnp
 
-        def attach(W_q, g0_X, g0_Y, s):
-            g0g0 = jnp.conj(g0_X)[:, None] * g0_Y[None, :]            # (μ, ν), local
-            return W_q + g0g0[:, :, None, None, None] * s[None, None, :, :, :]
+        def attach(W_q, g0_X, g0_Y, r_X, r_Y, q, s):
+            def g0q(g0, r):                                            # (μ, nfx, nfy, nfz)
+                return g0[:, None, None, None] * jnp.exp(-2j * jnp.pi * jnp.einsum("ma,xyza->mxyz", r, q))
+            return W_q + jnp.conj(g0q(g0_X, r_X))[:, None] * g0q(g0_Y, r_Y)[None, :] * s[None, None, :, :, :]
         _ATTACH_HEAD.append(jax.jit(attach, donate_argnums=(0,)))
     return _ATTACH_HEAD[0]
