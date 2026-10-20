@@ -716,7 +716,8 @@ def _downfold_stage(*, mu_small, rcond, restart, psi_win, psi_1, psi_2, n_rmu, W
     its W₁₁ equals the parent's only where head_row_S = 1.
     """
     from gw.downfold import (BandWindow, pair_density_gram, select_cur_centroids,
-                             slice_psi_to_centroids, build_transfer, congruence, epsilon_w)
+                             slice_psi_to_centroids, build_transfer, congruence, epsilon_w,
+                             record_kept_rank)
     from file_io.restart_bundle import read_interaction_orbits
     from runtime.padding import padded_mu_extent
     from common.collectives import device_put_process_local
@@ -743,18 +744,20 @@ def _downfold_stage(*, mu_small, rcond, restart, psi_win, psi_1, psi_2, n_rmu, W
     psiSX, psiSY = slice_psi_to_centroids(psiX, psiY, keep, mu_S_pad, mesh_xy)
     S_cross = pair_density_gram(psiSX, psiY, window, kgrid=kg, mesh_xy=mesh_xy)
     S_SS = pair_density_gram(psiSX, psiSY, window, kgrid=kg, mesh_xy=mesh_xy)
-    T_x, T_y, reports = build_transfer(S_SS, S_cross, mesh_xy, rcond=rcond, print_fn=_log)
-    project = congruence(mesh_xy, T_x, T_y)
+    T_x, T_y, reports, _ = build_transfer(S_SS, S_cross, mesh_xy, rcond=rcond, print_fn=_log)
+    record_kept_rank(sel, reports[0])                          # the kept-block rank, from the q = 0 solve
+    operands, project = congruence(mesh_xy)                    # A_S = project(A_L, *operands(T_x, T_y))
+    ops = operands(T_x, T_y)
     qmaj = jax.jit(lambda w: jnp.moveaxis(w, 2, 0), out_shardings=sh(None, "x", "y"))
     flat = jax.jit(lambda w: jnp.moveaxis(w, 0, 2), out_shardings=sh("x", "y", None))
     Wq = qmaj(W_flat)
-    W_Sq = project(Wq)
+    W_Sq = project(Wq, *ops)
     eps_W, _, _ = epsilon_w(Wq, S_LL, W_Sq, S_SS, mesh_xy)
     del Wq, S_LL
-    V_Sq = project(qmaj(V_flat))
+    V_Sq = project(qmaj(V_flat), *ops)
     V0 = jax.jit(lambda v: v[None], out_shardings=sh(None, "x", "y"))(Vbar)
     Vbar_S = jax.jit(lambda v: v[0], out_shardings=sh("x", "y"))(
-        congruence(mesh_xy, T_x[:1], T_y[:1])(V0))
+        project(V0, *operands(T_x[:1], T_y[:1])))
     T_h = np.asarray(rep(T_x))                                  # (nq, μ_S_pad, μ_L_pad)
     zS = np.stack([np.conj(T_h[iq]) @ z_keys[k] for k, (iq, _) in enumerate(keys)])
     yS = np.stack([np.conj(T_h[iq]) @ y_keys[k] for k, (iq, _) in enumerate(keys)])
