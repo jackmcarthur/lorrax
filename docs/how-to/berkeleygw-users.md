@@ -516,11 +516,14 @@ conventions (§4.1–4.2) carry into the kernel. To compare with BerkeleyGW's
   dipole_p_only.h5` and pass it as `--dipole`. The default `dipole.h5`
   includes the nonlocal term and is the physical velocity.
 - **QP energies.** `--eqp` takes a BerkeleyGW-format `eqp1.dat`, LORRAX's or
-  BerkeleyGW's. The reader (`file_io.restart_bundle.read_eqp_energies`)
-  requires the file's k blocks to be the WFN's irreducible wedge in WFN order
-  (it refuses otherwise) and to cover the BSE window. A BerkeleyGW file
-  qualifies when `sigma.x` ran on the WFN's k list in that order. To compare
-  kernels, give both codes the same QP energies.
+  BerkeleyGW's. The reader (`file_io.restart_bundle.apply_eqp_corrections`)
+  takes either the WFN's file wedge (one block per WFN k, unfolded through the
+  symmetry service) or a full-zone file with a block for every full-BZ k,
+  matched by crystal coordinate mod G to 1e-6; there every k takes its own
+  block, as BerkeleyGW reads it. Both refuse (`GATE eqp_star_spread`) when the
+  QP shifts $E_{QP} - E_{DFT}$ differ across a symmetry star by more than
+  1 meV in any band, so the two codes cannot apply different energies from
+  one file. To compare kernels, give both codes the same QP energies.
 - **Band counts.** `--n-val` and `--n-cond` count bands, spinor bands
   included, as BerkeleyGW's `number_val_bands` and `number_cond_bands` do. The
   occupied count comes from the WFN's `ifmax` or `--n-occ`. A window edge
