@@ -254,3 +254,95 @@ def test_native_noncrossing_paired_rules_fft_match_literal_complex_frequency():
             r=pair_spectrum(psi,energy,right,left,partner)
             expected.append(pair_frequency(f,sites,gamma)-pair_frequency(r,sites,gamma))
         np.testing.assert_allclose(got,np.stack(expected),rtol=2e-7,atol=2e-9)
+
+
+def test_crossing_primitives_preserve_each_height_value_and_physical_square_derivative(monkeypatch):
+    import minimax
+    from gw.response_bank import full_density_sample_rules
+    original=minimax.response_bank_rule; captured=[]
+    def record(*a,**kw):
+        result=original(*a,**kw);captured.append((a,kw,result));return result
+    monkeypatch.setattr(minimax,'response_bank_rule',record)
+    gamma=.031;sites=np.array([-.17+.19j,.23+.57j]);z=sites+1j*gamma
+    interval=(-.95,1.11);center=sum(interval)/2
+    rules=full_density_sample_rules(np.array([[-1.,1.]]),sites,gamma_ry=gamma,
+        interval_ry=interval,paired=True,tolerance=1e-8)
+    assert all(r['construction']=='continuum_crossing_real_time' for r in rules)
+    d=np.linspace(*interval,137)
+    got=np.zeros((2,len(z),len(d)),complex)
+    for r in rules:
+        phase=np.exp(-(d[None,:]-r['reference_ry'])*r['times'][:,None])
+        got[0,r['members']]+=r['weights'][0]@phase
+        got[1,r['members']]+=r['weights'][1]@phase.conjugate()
+    expected=np.stack((1/(z[:,None]-d),-1/(z[:,None]+d)))
+    assert np.max(abs(got-expected)*z.imag[None,:,None])<1e-8
+    (points,_),kwargs,raw=captured[0]
+    ratio=points.imag/points.imag.min();chain=abs(points/np.tile(z,2))
+    assert kwargs['rel_tol']<=1e-8/max(ratio.max(),(ratio**3*chain).max())
+    n=len(z);dv=raw['projection_derivative'];time=raw['t']
+    derivative=np.stack((-1j*dv[:n]*(points[:n]/z)[:,None],
+                         1j*dv[n:]*(points[n:]/z)[:,None]))
+    phase=np.exp(-1j*time[:,None]*(d[None,:]-center))
+    actual=np.stack((derivative[0]@phase,derivative[1]@phase.conjugate()))
+    exact=np.stack((-1/(2*z[:,None]*(z[:,None]-d)**2),
+                    1/(2*z[:,None]*(z[:,None]+d)**2)))
+    assert np.max(abs(actual-exact)*z.imag[None,:,None]**3)<1e-8
+
+
+def test_native_crossing_paired_rules_fft_match_literal_noncommuting_frequency():
+    import jax
+    from jax.sharding import Mesh
+    from ffi import fft as fft
+    from gw.greens_function_kernel import density_left_endpoint
+    from gw.w_isdf import full_density_response_stream
+    from gw.response_bank import full_density_sample_rules
+    jax.config.update('jax_enable_x64',True)
+    mesh=Mesh(np.asarray(jax.devices('cpu')[:1]).reshape(1,1),('x','y'))
+    psi,energy,rho,partners=case();nk,nb,ns,nmu=psi.shape
+    pm=psi.transpose(0,2,3,1);endpoint=density_left_endpoint(mesh,pm.shape)
+    left,right=four_block_panels(rho,slice(1,3))['AA']
+    box=pair_interval(energy,[1,2],[1,2])
+    bounds=tuple(box[k] for k in ('left_min','left_max','right_min','right_max'))
+    gamma=.031;sites=np.array([-.17+.19j,.23+.57j])
+    rules=full_density_sample_rules(energy,sites,gamma_ry=gamma,tolerance=1e-8,
+        interval_ry=(box['lo']-.07,box['hi']+.11),paired=True)
+    got=np.zeros((nk,len(sites),nmu,nmu),complex)
+    with fft.xla_reference():
+        for rule in rules:
+            stream=full_density_response_stream(mesh,(3,1,1),(nk,nb,nmu,ns),q_ids=[0,1,2],
+                n_outputs=len(rule['members']),pair_bounds_ry=bounds,rule_reference_ry=rule['reference_ry'])
+            got[:,rule['members']]+=np.asarray(stream(rule['times'],rule['weights'],
+                endpoint(pm,left),psi,endpoint(pm,right),energy))/np.sqrt(nk)
+    expected=[]
+    for partner in partners:
+        f=pair_spectrum(psi,energy,left,right,partner);r=pair_spectrum(psi,energy,right,left,partner)
+        expected.append(pair_frequency(f,sites,gamma)-pair_frequency(r,sites,gamma))
+    np.testing.assert_allclose(got,np.stack(expected),rtol=2e-7,atol=2e-9)
+
+
+def test_paired_long_real_lag_masks_inactive_deep_states_before_exponentiation():
+    import jax
+    from jax.sharding import Mesh
+    from ffi import fft as fft
+    from gw.greens_function_kernel import density_left_endpoint
+    from gw.w_isdf import full_density_response_stream
+    jax.config.update('jax_enable_x64',True)
+    mesh=Mesh(np.asarray(jax.devices('cpu')[:1]).reshape(1,1),('x','y'))
+    psi,energy,rho,partners=case();nk,nb,ns,nmu=psi.shape
+    energy[:,3]=-1000. # This completely inactive column must never form exp(+1e6).
+    left,right=four_block_panels(rho,slice(1,3))['FA']
+    box=pair_interval(energy,[1,2],[0]);ref=box['lo']
+    bounds=tuple(box[k] for k in ('left_min','left_max','right_min','right_max'))
+    times=np.array([1000.+0j]);weights=np.array([[[1.]],[[0.]]])
+    pm=psi.transpose(0,2,3,1);endpoint=density_left_endpoint(mesh,pm.shape)
+    with fft.xla_reference():
+        stream=full_density_response_stream(mesh,(3,1,1),(nk,nb,nmu,ns),q_ids=[0,1,2],
+            n_outputs=1,pair_bounds_ry=bounds,rule_reference_ry=ref)
+        got=np.asarray(stream(times,weights,endpoint(pm,left),psi,endpoint(pm,right),energy))/np.sqrt(nk)
+    assert np.isfinite(got).all()
+    expected=[]
+    for partner in partners:
+        gap,res=pair_spectrum(psi,energy,left,right,partner)
+        live=np.any(res!=0,axis=(1,2))
+        expected.append(np.einsum('i,ijk->jk',np.exp(-(gap[live]-ref)*times[0]),res[live])[None])
+    np.testing.assert_allclose(got,np.stack(expected),rtol=5e-12,atol=5e-14)

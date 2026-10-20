@@ -32,7 +32,7 @@ import jax.numpy as jnp
 __all__ = ["FORMS", "HERMITIAN_MODES", "Dissipator", "RefreshPolicy",
            "dagger", "width", "hermitian_part", "branch_operators", "collision",
            "source", "dissipator", "phi1", "flow", "rate", "hermitian_update", "trace_rates",
-           "refresh_due"]
+           "boundary_diagnostics", "refresh_due"]
 
 #: ``subtracted`` imposes the equilibrium counterterm; ``raw`` does not.
 FORMS = ("subtracted", "raw")
@@ -185,6 +185,87 @@ def trace_rates(gamma, injection, rho, gamma_eq=None, injection_eq=None, rho_eq=
         out = out + tr(gamma_eq, rho_eq)
         inn = inn - jnp.real(jnp.trace(injection_eq, axis1=-2, axis2=-1))
     return out, inn
+
+
+def boundary_diagnostics(gamma, injection, rho, *, occupation_tolerance):
+    """Measure Eq. (8)'s global and current-state Pauli boundary matrices.
+
+    Parameters
+    ----------
+    gamma, injection, rho : ndarray (..., n, n)
+        Already-host-resident, matching small window matrices. ``gamma`` and
+        effective injection ``D`` use the same energy/rate unit; ``rho`` is
+        dimensionless. For a subtracted model pass the effective injection
+        including its counterterm. No microscopic state is gathered here.
+    occupation_tolerance : float
+        Explicit dimensionless tolerance in [0, 1/2). Eigenvalues within this
+        distance of zero or one select the complete empty/filled subspace.
+
+    Returns
+    -------
+    dict of ndarray (...,)
+        ``min_injection`` and ``min_blocking`` are global eigenvalue minima
+        of D and Gamma-D. ``empty_min_injection`` and ``filled_min_blocking``
+        are minima after compression to the selected density subspaces;
+        their ``empty_count``/``filled_count`` are dimensions, with NaN for
+        a missing subspace. ``rho_min``/``rho_max`` are occupations and
+        ``trace_rate`` is Re Tr(D-Gamma rho), per block, without k weights.
+        ``gamma_hermiticity_error``, ``injection_hermiticity_error`` and
+        ``rho_hermiticity_error`` report max |A-A^H| on the original inputs;
+        quadratic forms use their Hermitian parts.
+        Rate minima and trace rate retain the supplied energy/rate unit
+        (hbar=1); occupations and counts are dimensionless.
+
+    Notes
+    -----
+    At an exact boundary the compressed D and Gamma-D give the inward
+    first derivatives: both the Hamiltonian commutator and the appropriate
+    anticommutator vanish there. At nonzero occupation tolerance these are
+    neighborhood probes, not exact derivative tests. Entire subspaces are
+    compressed, including degeneracies; diagonal expectations alone miss
+    outward directions. Passing at one state does not establish finite-time
+    or nonlinear Pauli invariance. No matrix is repaired or clipped.
+    """
+    tolerance = float(occupation_tolerance)
+    if not np.isfinite(tolerance) or not 0.0 <= tolerance < 0.5:
+        raise ValueError("occupation_tolerance must be finite and in [0, 0.5)")
+    gamma, injection, rho = (np.asarray(a, dtype=np.complex128)
+                             for a in (gamma, injection, rho))
+    if (rho.ndim < 2 or rho.shape[-1] != rho.shape[-2] or rho.shape[-1] == 0
+            or gamma.shape != rho.shape or injection.shape != rho.shape):
+        raise ValueError("boundary diagnostics require matching (..., n, n) window matrices")
+    if not all(np.isfinite(a).all() for a in (gamma, injection, rho)):
+        raise ValueError("boundary diagnostics require finite window matrices")
+    hermiticity_errors = {
+        f"{name}_hermiticity_error": np.max(
+            np.abs(a - np.conj(np.swapaxes(a, -1, -2))), axis=(-2, -1))
+        for name, a in (("gamma", gamma), ("injection", injection), ("rho", rho))}
+    # Hermitian parts define the reported quadratic forms; inputs are not
+    # modified, and their original Hermiticity defects are retained.
+    herm = lambda a: 0.5 * (a + np.conj(np.swapaxes(a, -1, -2)))
+    gamma, injection, rho = (herm(a) for a in (gamma, injection, rho))
+    blocking = gamma - injection
+    occupations, vectors = np.linalg.eigh(rho)
+    empty = np.abs(occupations) <= tolerance
+    filled = np.abs(occupations - 1.0) <= tolerance
+    shape = rho.shape[:-2]
+    result = dict(min_injection=np.linalg.eigvalsh(injection)[..., 0],
+                  min_blocking=np.linalg.eigvalsh(blocking)[..., 0],
+                  empty_count=np.count_nonzero(empty, axis=-1),
+                  filled_count=np.count_nonzero(filled, axis=-1),
+                  empty_min_injection=np.full(shape, np.nan),
+                  filled_min_blocking=np.full(shape, np.nan),
+                  rho_min=occupations[..., 0], rho_max=occupations[..., -1],
+                  trace_rate=np.real(np.trace(injection - gamma @ rho, axis1=-2, axis2=-1)))
+    result.update(hermiticity_errors)
+    for index in np.ndindex(shape):
+        for mask, matrix, key in ((empty, injection, "empty_min_injection"),
+                                  (filled, blocking, "filled_min_blocking")):
+            basis = vectors[index][:, mask[index]]
+            if basis.shape[-1]:
+                compressed = basis.conj().T @ matrix[index] @ basis
+                result[key][index] = np.linalg.eigvalsh(herm(compressed))[0]
+    return result
 
 
 class RefreshPolicy(NamedTuple):

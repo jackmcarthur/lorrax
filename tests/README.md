@@ -24,6 +24,24 @@ A new test needs no bootstrap import of its own.
   refusals on toy inputs (CPU).
 - `test_hl_head_plasma_count.py`: the HL-PPM head ω_p² counts electrons
   (CPU).
+- `test_full_density_blocks_oracle_cpu.py`: literal coherent FF/FA/AF/AA
+  products, independent reverse phases, enlarged numerical response groups,
+  moments and native paired FFT/quadrature (CPU).
+- `test_full_density_block_planning_cpu.py`: public noncrossing and crossing
+  primitive signs, measured endpoint intervals and scalar accuracy (CPU).
+- `test_general_pencil_batch_cpu.py`: capacity-bounded concurrent reduced
+  pencils, canonical raw-bit maps/spaces, collective errors and complex Σ
+  equivalence (CPU; no microscopic host matrices).
+- `test_full_micro_diagnostic_cpu.py`: native q0-only artifact publication,
+  collective early refusal and independent microscopic Dyson probes (CPU).
+- `tdagw/test_collision_boundary_cpu.py`: global versus current-density
+  empty/filled-subspace boundary diagnostics, with no state repair (CPU).
+- `tdagw/cri3_full_microscopic/`: archived full-native campaign preparation,
+  observation and plotting helpers; prepared, not a completed trajectory.
+- `tdagw/full_microscopic_saved_state.py`: P4 compute-node saved-state native
+  proof. `--chi0-active LO:HI` selects a numerical response partition only;
+  `--stop-after-model-q 0` retains a frequency-only diagnostic and never
+  claims an admitted full-q model or computes Σ.
 - `test_minibz_equal_shares.py`: the shared mini-BZ head average gives every
   rank one share shape (CPU, three simulated ranks).
 - `test_stream_passes_cpu.py`: the scanned row-pass loop on a host mesh
