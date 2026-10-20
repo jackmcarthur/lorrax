@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — metal head: thermal near-degenerate pairs leave the static interband head
+
+On a smeared metal, a pair split by less than the cell scale but off the
+tetrahedron Fermi surface (`w = 0`) kept its whole interband weight, which grows
+as `f'/Delta^2` at `z = 0`: on Fe 4^3 two pairs 1.9 eV below mu, split by
+0.19 meV, gave the static interband head `8 pi S_xx = -1.5e4` (z: -146).  The
+pair split (`gw.fermi_surface.intraband_pair_fraction`) now also moves pairs
+weighted by the smeared occupation difference; the moved share enters the
+intraband term with its tetrahedron weight, zero there.  S, the wings and the
+four-current head take the one rule; D and the atoms are unchanged.  Metals
+with such pairs move (Fe 4^3 static head isotropic, `-74`); insulators are
+bitwise unchanged.  Test: `tests/test_shared_pole_head_ordered_metal.py::test_d`.
+
 ## 2026-10-20 — htransform nodal basis (replaces the randomized-QRCP Galerkin basis)
 
 The htransform basis (`isdf.galerkin`) is now nodal: the fitted states'

@@ -1674,7 +1674,8 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int,
             from gw.fermi_surface import intraband_pair_fraction
             d_x, d_y, w_x, w_y, moment = split
             keep = 1.0 - intraband_pair_fraction(
-                v_local, dE, d_x, d_y, w_x, w_y, moment, TOL_DEGENERACY_RY)
+                v_local, dE, d_x, d_y, w_x, w_y, moment, TOL_DEGENERACY_RY,
+                f_diff=f_diff)
 
         def _one(omega):
             z = omega + 1j * eta
@@ -1894,7 +1895,7 @@ def _head_wing_kernel_face(
             share = jnp.where(logical2d, intraband_pair_fraction(
                 v_local, dE, jax.lax.dynamic_slice_in_dim(diag, x0, nbx, axis=2),
                 jax.lax.dynamic_slice_in_dim(diag, y0, nby, axis=2),
-                s_x, s_y, moment, TOL_DEGENERACY_RY), 0.0)
+                s_x, s_y, moment, TOL_DEGENERACY_RY, f_diff=f_diff), 0.0)
             keep = 1.0 - share
             surface_pair = share * 0.5 * (s_x[:, :, None] + s_y[:, None, :])
         else:
