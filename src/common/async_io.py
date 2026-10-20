@@ -134,6 +134,9 @@ class AsyncDispatcher:
                     if self._error is None:
                         self._error = exc
             finally:
+                # The task's closure holds its arrays (a write's device slab): dropped here,
+                # not when the next task arrives, so a drained queue holds nothing.
+                task = None
                 with self._cv:
                     self._pending -= 1
                     self._cv.notify_all()

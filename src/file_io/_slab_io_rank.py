@@ -526,7 +526,11 @@ class StreamedBank:
                 value = self.read_runs(runs, q_span)
                 agree_io_error(self.check_reads(), path=self.dir, stage="streamed_bank.reread")
             self.seconds["read"] += time.monotonic() - started
-            yield value
+            # Handed over, not kept: a suspended frame holding ``value`` kept each span
+            # alive beside the caller's next phase (run30k moments: 3.6 GB/rank).
+            held = [value]
+            del value
+            yield held.pop()
 
     def read_runs(self, runs, q_span=None, then=None):
         """Outputs of every run ``[(o0, o1), ...]`` as one device array ``[Σ(o1-o0), q, ...]``,

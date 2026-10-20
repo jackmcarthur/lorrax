@@ -3,9 +3,10 @@ it (:func:`book`), routed by the one policy (:func:`admit`) against :func:`room`
 against the allocator's high-water over that section (``memory <stage>: priced P | measured M |
 γ``); :func:`sizing` gives the minimum P.  Platform differences are ``lxkit.LEGS`` data.
 Production reads the allocator at section boundaries only; ``LORRAX_MEMORY_RECEIPTS=calibrate``
-(implied by STRICT and TRACE) waits on priced stages, reads every section, and on a BFC arena
+(implied by STRICT) waits on priced stages, reads every section, and on a BFC arena
 takes the first raise of its mark (exact) or a polled reading (``>=``).  ``LORRAX_MEMORY_TRACE=
-<path>``: JSON Lines per closed section (``lxkit.memory_residuals``).  ``LORRAX_MEMORY_STRICT=1``:
+<path>``: JSON Lines per closed section (``lxkit.memory_residuals``) in either mode: the boundary
+readings and the live arrays, with no wait of its own.  ``LORRAX_MEMORY_STRICT=1``:
 the census (GATE memory_unpriced, :func:`findings`).  ``LORRAX_NMU2_BACKUP=report``: GATE
 nmu2_no_backup is a finding."""
 
@@ -22,7 +23,7 @@ from typing import Callable, Optional
 TERMS = ("operands", "xla", "vendor", "outside")
 STRICT = os.environ.get("LORRAX_MEMORY_STRICT", "") == "1"
 TRACE = os.environ.get("LORRAX_MEMORY_TRACE", "")
-CALIBRATE = STRICT or bool(TRACE) or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
+CALIBRATE = STRICT or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
 NMU2_REPORT = os.environ.get("LORRAX_NMU2_BACKUP", "") == "report"
 POLL_SECONDS = 0.01                     # the BFC bytes_in_use poll (calibrate only)
 
@@ -198,7 +199,8 @@ def instrument() -> dict:
 
 
 def _reads_every_section() -> bool:
-    return CALIBRATE or (_I["source"] or _setup()) in ("pool", "bfc")
+    # A trace reads every boundary (no wait: only calibrate syncs) so each record has its own.
+    return CALIBRATE or bool(TRACE) or (_I["source"] or _setup()) in ("pool", "bfc")
 
 
 def boundary() -> Optional[int]:
