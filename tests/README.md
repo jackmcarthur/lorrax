@@ -150,3 +150,26 @@ positive-time Sigma integral), and `tdagw/test_snapshot_runtime_cpu.py`
 (distributed Coulomb projection, rotations, and a complete small refresh).
 Run the distributed cases with four host devices. These focused references
 complement the required P4 compute-node driver suite.
+
+`tdagw/test_screening_statistics_cpu.py` supplies passive Gaussian statistical
+references: scalar and noncommuting two-channel thermal RPA against Dyson,
+covariance uncertainty and stationarity, finite-width colored quantum KMS
+noise, bare-white-noise/quench statistics, isolated adiabatic versus final
+Gibbs preparation, and half-filled noise as the response vanishes. These CPU
+oracles do not implement a production statistical correction or a general
+coherent/gainful density-matrix closure.
+
+`tdagw/test_screening_coherence_limits_cpu.py` characterizes the failures
+that a statistical repair must avoid: an indefinite stationary endpoint
+spectrum for a physical coherent density, positive exact frozen two-time
+kernels, and negative thermal-reference-plus-delta-bubble noise already at
+first order in a diagonal excitation. These are characterization tests, not
+certificates of a repaired runtime.
+
+`tdagw/test_screening_two_endpoint_cpu.py` retains finite internal endpoints
+for a coherently rotated pure-projector RPA reference with explicit correlated
+quasiboson boundary covariance. It checks the equilibrium ground-state kernel,
+Kato rotation and its angle guard, preparation ambiguity at the same rho,
+commutator and positive endpoint kernels, nonstationarity, and independent
+retarded Volterra convergence. It does not model exact finite-fermion Pauli
+statistics, general mixed densities, or a production collision correction.

@@ -5,6 +5,22 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-19 — screening statistical preparation: CPU references and scope
+
+New small CPU references distinguish correlated Gibbs, isolated adiabatic,
+and quench/local-noise RPA statistics. They verify a thermal target and a
+finite two-endpoint correlated coherent-kick construction, and reject both
+the stationary arbitrary-coherence spectrum and an equilibrium-KMS plus
+old delta-bubble shortcut. Equations, assumptions and limits are in the
+[statistical preparation section](docs/theory/td_agw_dynamical.md#keldysh-screening).
+
+There is **no propagation change**: no new statistical mode, deck setting or
+restart format. The `finite_lag` guard remains; these references do not repair
+the general mixed-density runtime. The coherent-kick reference is a declared
+quasiboson preparation for isospectral pure projectors, not an exact fermionic
+covariance or a general collision-positivity result. No damping claim follows
+from its CPU tests.
+
 ## 2026-10-19 — joint collision statistics now require explicit acknowledgement
 
 Active `collision_screening = "joint"` or `"joint_frozen"` decks now refuse

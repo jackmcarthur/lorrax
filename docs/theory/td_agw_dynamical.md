@@ -871,6 +871,212 @@ initial correlations/switch-on information. No equilibrium or nonequilibrium
 statistical shortcut inferred solely from retarded $W$ is implemented.
 Subtracting the equilibrium collision term does not restore screened FDT.
 
+##### Statistical preparation: resolved references and remaining closure
+
+The counterexample above is a failure of an **equilibrium interpretation**,
+not a proof that its noise cannot describe any preparation. A scalar RPA
+oscillator makes the missing choice explicit. In units $\hbar=k_B=1$, set
+
+$$
+H_{\rm RPA}=\tfrac12p^2+\tfrac12\Omega^2q^2,\qquad
+\Omega^2=\Delta^2+2g\Delta,\qquad Q=\sqrt{2g\Delta}\,q.
+$$
+
+Its positive-frequency response residue is $R=g\Delta/\Omega$. Every
+stationary Gaussian state with occupation $N\ge0$ has
+
+$$
+W_c^R(z)=\frac{R}{z-\Omega}-\frac{R}{z+\Omega},\qquad
+\bar W^<(z)=\frac{NR}{z-\Omega}+\frac{(N+1)R}{z+\Omega}.
+$$
+
+These are lossless functions evaluated for $\operatorname{Im}z>0$; no
+arbitrary decay selects $N$. They obey $\bar W^>-\bar W^<=W_c^R$ for
+every $N$, so that component identity does not specify the statistics.
+Three distinct preparations give distinct answers:
+
+* A correlated Gibbs state has $N=n_B(\beta\Omega)$, including $N=0$
+  for the interacting ground state. It satisfies screened equilibrium FDT.
+* An isolated, gapped adiabatic switch from a bare thermal oscillator carries
+  $N=n_B(\beta\Delta)$ to the final mode. It gives the ground state at
+  zero temperature, but generally not the Gibbs state at the original finite
+  temperature. This finite-temperature distinction also occurs in
+  [GKBA initial-state preparation](https://arxiv.org/html/1806.05639v1#S5).
+* A sudden switch from the bare ground state, followed by dephasing of its
+  anomalous covariance, has
+  $N_{\rm quench}=(\Omega-\Delta)^2/(4\Omega\Delta)$.
+  Consequently $RN_{\rm quench}=r_+(0)$ above. The same occupation is
+  selected by a weak local damping/noise model tied to the bare oscillator.
+  This equality is checked for this scalar example; it is not an equivalence
+  theorem for arbitrary matrix or coherent snapshots.
+
+The corresponding stable multi-mode reference uses
+$H=\tfrac12p^Tp+\tfrac12q^TVq$, with $V=O\Omega^2O^T\succ0$.
+Its symmetrized Gibbs covariance is
+
+$$
+S_\beta=\begin{pmatrix}
+O\,\operatorname{diag}[(n_B(\beta\Omega)+1/2)/\Omega]O^T&0\\
+0&O\,\operatorname{diag}[(n_B(\beta\Omega)+1/2)\Omega]O^T
+\end{pmatrix}.
+$$
+
+It satisfies both $AS_\beta+S_\beta A^T=0$ and
+$S_\beta+iJ/2\succeq0$, where
+$A=\left(\begin{smallmatrix}0&I\\-V&0\end{smallmatrix}\right)$
+and $J=\left(\begin{smallmatrix}0&I\\-I&0\end{smallmatrix}\right)$.
+The small CPU reference checks these conditions, the microscopic Dyson
+response for noncommuting two-channel couplings, residue KMS, and a numerical
+adiabatic ramp. It specifies a preparation, rather than solving a Lyapunov
+equation with an unspecified or bare diffusion matrix and calling its result
+thermal. It does not cover unstable, zero-frequency or inverted RPA modes.
+
+**A finite-width thermal reference.** If a bath model is intended instead
+of lossless preparation, its fluctuation spectrum must also be specified.
+For a genuine thermal reference it obeys
+
+$$
+\widehat P^<(\omega)=n_B(\beta\omega)[P^R(\omega)-P^A(\omega)].
+$$
+
+The matrix Dyson identity then implies screened FDT at the same real
+frequency, including full local-field structure. Broadening transition
+residues with their **bare-frequency** Bose weights is not this equation.
+For commuting, fractional electronic populations one possible explicit
+nonequilibrium bath model assigns each transition $i\to j$, $\Delta>0$,
+the inverse temperature
+$\beta_{ij}=\log[f_i(1-f_j)/(f_j(1-f_i))]/\Delta$ and applies the
+frequency-dependent Bose factor to that transition's response. At thermal
+Fermi occupations all these temperatures coincide. The equal-occupation
+limit must be taken on the noise product, not by dividing by
+$f_i-f_j$: finite fluctuation noise survives when the response vanishes.
+Inversions give negative pair temperatures and require an independent
+screened-stability check. This is a restricted bath model, not a derivation
+for the full coherent density matrix, and is not wired into propagation.
+At finite width its Bose/zero-temperature frequency factors are not in
+general finite rational functions; a production pole representation would
+need separately certified response **and** noise approximation.
+
+**Why an equilibrium anchor alone is insufficient.** Replacing the
+equilibrium noise by KMS noise and adding the old
+$\delta\widehat P^<=\widehat P^<[\rho]-\widehat P^<[\rho_{\rm eq}]$
+does restore equilibrium FDT algebraically, but need not define a positive
+fluctuation spectrum even for diagonal populations. For a two-level system
+with $f_{\rm low}=1-p$, $f_{\rm high}=p$, the proposed effective lesser
+noise at $T=0$ and $\omega>0$ is proportional to
+
+$$
+2g\gamma\left[
+\frac{p^2}{(\omega-\Delta)^2+\gamma^2}
++\frac{-2p+p^2}{(\omega+\Delta)^2+\gamma^2}\right].
+$$
+
+It is negative for arbitrarily small positive $p$ at fixed off-resonant
+$\omega$. Dressing it by $W^R$ and $W^A$ cannot repair this scalar sign.
+The missing correlated statistical response appears already at first order;
+this reference subtraction is therefore not adopted as a physical fix.
+
+**Coherences require a separate approximation decision.** A stationary
+quasifree state of the frozen Hermitian $H$ requires $[H,\rho]=0$;
+coherences within exactly degenerate subspaces are allowed. The upper-endpoint
+line remains a defined approximation when this fails, but its stationary
+Fourier extension need not be a positive-type correlation kernel. For
+$H=\operatorname{diag}(0,\Delta)$ and
+$\rho=\left(\begin{smallmatrix}1/2&c\\c&1/2\end{smallmatrix}\right)$,
+its midpoint-frequency spectral determinant is nonnegative only if
+$|c|\le\gamma/\sqrt{4\gamma^2+\Delta^2}$. The physical pure state
+$c=1/2$ violates this condition at every finite $\gamma$ when $\Delta>0$.
+Changing only collective occupations or imposing equilibrium FDT cannot
+make that arbitrary-coherence stationary reconstruction exact.
+
+A coherent alternative retains the **two** frozen time endpoints,
+$g^<(t,t')=i\,e^{-iH(t-T)}\rho(T)e^{iH(t'-T)}$, and constructs screening
+on an internal finite contour. With a declared virtual preparation time,
+initial fluctuation covariance and switching profile, this is a snapshot
+calculation: it need not access physical history or propagate another
+physical state. A Gaussian reset plus quench, however, is the quench
+preparation above, not correlated equilibrium. An equilibrium/correlated
+preparation must be supplied explicitly and the internal window/switching
+dependence converged. Silently discarding nondegenerate coherences in the
+screening bath would instead be a different, secular-screening approximation.
+Neither change has been made to the current runtime.
+
+**Constructive two-endpoint reference (pure coherent kicks only).** The CPU
+prototype starts from a correlated quasiboson RPA reference covariance
+$C_{\rm ref}$, not a Wick-noise source alone. For equal-rank projectors
+$P_0$ and $P=\rho$, one explicit local preparation convention is the direct
+polar rotation
+
+$$
+B=PP_0+(I-P)(I-P_0),\qquad U_K=B(B^\dagger B)^{-1/2},\qquad
+C_P=\mathcal R(U_K)C_{\rm ref}\mathcal R(U_K)^\dagger.
+$$
+
+Here $\mathcal R$ is the induced action on the fluctuation operators.
+Set the auxiliary anchor $t_0=T$, $\rho(t_0)=P$, and assign $C_P$ there;
+internal times can be integrated backwards from that anchor. A different
+preparation endpoint must carry the consistently transported density and
+covariance, not the current $C_P$ relabelled at an unrelated time.
+The map refuses a singular overlap (a principal angle of $90^\circ$).
+It is covariant under a simultaneous change of working basis, but is a
+**declared preparation**: other unitaries with the same $UP_0U^\dagger=P$
+can rotate $C_{\rm ref}$ differently. The density does not determine which
+physical kick occurred. This map does not prescribe mixed/population-changing
+states.
+
+The smallest reference uses $H=\mathbf h\cdot\boldsymbol\sigma$,
+$\rho=(I+\mathbf r\cdot\boldsymbol\sigma)/2$, a density vertex
+$Q=\mathbf v\cdot\boldsymbol\sigma$, and interaction strength $\kappa$.
+For the prescribed frozen background $\dot{\mathbf r}=2\mathbf h\times\mathbf r$,
+the linearized ring fluctuation evolves with
+
+$$
+\dot F(t,s)=L(t)F(t,s),\quad F(s,s)=I,\qquad
+L(t)=2[\mathbf h]_\times+
+2\kappa(\mathbf v\times\mathbf r(t))\mathbf v^T,
+$$
+
+$$
+J(t)=-2i[\mathbf r(t)]_\times,\qquad
+LJ+JL^T=\dot J,\qquad
+C(t,s)=F(t,t_0)C_PF(s,t_0)^T.
+$$
+
+Consequently $F(t,t_0)J(t_0)F(t,t_0)^T=J(t)$, and a positive
+$C_P$ gives a positive block kernel over **both** time endpoints. For
+this real Hermitian fluctuation basis,
+$C_{ij}(t,s)=\langle\delta s_i(t)\delta s_j(s)\rangle$;
+the lesser density kernel contracts the reversed ordering
+$-i\kappa^2\mathbf v^TC(s,t)\mathbf v$. For
+$\mathbf r_0=-\hat z$, $H=\Delta\sigma_z/2$,
+$Q=\sqrt g\,\sigma_x$, $\kappa=1$, the correlated vacuum has transverse
+block $\left(\begin{smallmatrix}\Delta/\Omega&-i\\i&\Omega/\Delta\end{smallmatrix}\right)$
+and zero longitudinal variance. Its lesser kernel is
+$-i(g\Delta/\Omega)e^{+i\Omega(t-s)}$, with no spurious positive-frequency
+lesser weight. A coherent kick makes the statistical kernel nonstationary,
+even in a case where the contracted retarded response remains stationary.
+Independent ODE and time-discrete Dyson/Volterra constructions converge to
+the same retarded kernel; the CPU test checks their step refinement.
+
+This is **quasiboson** covariance positivity. In the two-level example its
+squeezed variance $C_{yy}=\Omega/\Delta>1$ is not the exact finite-fermion
+Pauli covariance at the same pure Slater density ($\sigma_y^2=I$).
+The RPA reference neglects that fermionic correlation/depletion consistency;
+no exact many-body representability claim is made. In a finite-time Keldysh
+formulation $C_P$ supplies an explicit correlated boundary/homogeneous term.
+Keeping only a bare Wick lesser bubble would put back the quench preparation.
+Nor may the resulting $C(t,s)$ be collapsed into the old stationary
+frequency-only screening algebra. An endpoint collision can instead integrate
+the anchored $\Sigma^{</>}(T,T-\tau)$ directly with its column phases; its
+finite internal window and numerical representation still need validation.
+
+Thus the production statistical guard remains in force. The new CPU
+references establish a corrected thermal RPA target and reject two tempting
+but incorrect completions; they do not certify a full-coherence,
+nonequilibrium rho-only statistical closure. Bosonic covariance positivity
+and the separate nonsecular electronic collision positivity problem must
+both be assessed before interpreting damping in a propagated trajectory.
+
 `snapshot_collision.q_sigma_operators` evaluates the same ISDF
 product in projected vertices, with column energy $E_b$ and internal phase
 $e_n$, and admits a general biorthogonal pole expansion only after checking
