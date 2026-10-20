@@ -1132,17 +1132,21 @@ def _operator_digest_program(mesh_xy, shape):
                              check_vma=False))
 
 
-def operator_digest(values, mesh_xy):
+def operator_digest(values, mesh_xy, *, cache=True):
     """A device digest of a face-tiled operator ``[nq, n, m]``: one 64-bit word per
     value position, summed with its global index, the same at every P.  Kept per
-    operator object (the bare V is one object for the run)."""
-    hit = _OPERATOR_DIGESTS.get(id(values))
+    operator object (the bare V is one object for the run). Ephemeral current
+    wavefunctions pass ``cache=False`` so no device buffer is retained.
+    The checksum arithmetic is identical in either case.
+    """
+    hit = _OPERATOR_DIGESTS.get(id(values)) if cache else None
     if hit is not None and hit[0] is values:
         return hit[1]
     mesh = values.sharding.mesh if mesh_xy is None else mesh_xy
     word = int(np.asarray(_operator_digest_program(mesh, tuple(values.shape))(values)))
     digest = hashlib.sha256(f"{tuple(values.shape)}:{word:016x}".encode()).hexdigest()
-    _OPERATOR_DIGESTS[id(values)] = (values, digest)
+    if cache:
+        _OPERATOR_DIGESTS[id(values)] = (values, digest)
     return digest
 
 

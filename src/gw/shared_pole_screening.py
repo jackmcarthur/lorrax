@@ -714,7 +714,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     identity = dict(iteration_id=str(label), energies=hashlib.sha256(energy.tobytes()).hexdigest(),
         occupations=hashlib.sha256(rho.tobytes()).hexdigest(),
         hamiltonian=hashlib.sha256((energy.tobytes()+np.asarray(snapshot["U_active"]).tobytes())).hexdigest(),
-        wavefunctions=operator_digest(merge_spin_centroid(pm, 1, 2), mesh_xy),
+        wavefunctions=operator_digest(merge_spin_centroid(pm, 1, 2), mesh_xy, cache=False),
         centroids=hashlib.sha256(np.asarray(meta.mu_basis.canonical_indices).tobytes()).hexdigest())
     if qgrid != grid:
         identity.update(electronic_grid=list(grid), response_grid=list(qgrid))
