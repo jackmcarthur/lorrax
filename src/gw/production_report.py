@@ -961,8 +961,7 @@ class GWProductionReport:
             for row, peak in priced:
                 worst = float(np.nanmax(peak)) if np.any(np.isfinite(peak)) else -1.0
                 self.emit("    " + memory.receipt_line(row["stage"], row["price"], worst,
-                                                       row["exact"], row["source"],
-                                                       row.get("reserved", -1))
+                                                       row["exact"], row["source"])
                           + f" [x{row['count']}]")
         self.emit("  " + memory.sizing()["line"])
         for finding in memory.findings() if memory.STRICT else ():
