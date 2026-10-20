@@ -16,6 +16,40 @@ for χ₀ would put screening on unfitted pairs. W's band truncation is
 converged by raising `number_bands`; its measured size is in
 [production QSGW](../how-to/production-qsgw.md#error-budget).
 
+### Instantaneous full-density window route
+
+The general complex-pole TD window route does **not** currently consume the
+equilibrium extrapolation fit. Its active-intermediate and full-virtual
+brackets in `gw.ppm_sigma._ordered_window_lines` are not the three tail-fit
+counts; `use_band_extrapolation` is disabled in the current 160-band CrI3
+source. The existing `require_extrapolation_band_floor` requires at least as
+many empty as occupied bands in the **Sigma sum**. With 130 occupied bands,
+that means at least 260 total, not 160. Enlarging only the propagated window
+to 30v14c does not satisfy the rule. A sufficiently large authenticated WFN,
+pair representation and three clean unoccupied-tail cuts are prerequisites;
+availability of a different WFN must not be assumed.
+
+A future reuse option could hold the equilibrium pooled offset and DFT/Weyl
+ladder parameters, while evaluating denominators with the current external
+energies and the consistently shifted virtual ladder. Holding these shape
+parameters does not require freezing the amplitude: the live finite-bracket
+self-energy difference could still update it with the current density and W,
+without repeating the pooled shape search. Alternatively, caching the whole
+equilibrium matrix tail amplitude would be an explicitly frozen-response
+approximation, not the refreshed-W tail. Both choices require domain and
+full complex matrix convergence checks. This extends **Sigma only**, not the
+screening band sum.
+
+The equilibrium matrix rule `(r_i+r_j)/2` belongs to its Hermitian QSGW
+construction. It must not replace the TD route's one-sided column-shell
+evaluation by a row/column energy average. Per-state ratios cannot simply
+be carried by sorted band labels through coherent mixing: a frozen matrix
+amplitude needs an explicit fixed-orbital gauge and rotation into the current
+basis, with current-energy functions and degeneracies treated consistently.
+Any additional frozen high-band tail would enter the full-virtual Hermitian
+material self-energy, not the deliberately active-only collision rates.
+No such TD tail adapter or supporting convergence validation is implemented.
+
 ## Where it runs
 
 The plasmon-pole stages (`gn_ppm`, `hl_ppm`), the scalar `mpa` stage
