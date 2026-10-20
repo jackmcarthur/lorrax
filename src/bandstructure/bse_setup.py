@@ -6,23 +6,25 @@ plus a finer uniform k-grid spec, and produces wfns at the
 already-selected coarse-grid centroids on the fine grid via the
 standard htransform pipeline:
 
-    fH_R       = build_fH_R(ctilde, enk_sigma, kgrid_co)
-    fH_q       = Σ_R e^{-2πi q·R} fH_R                       # one Fourier sum
-    (lam, c)   = eigh(fH_q)                                  # eigvals f(ε), eigvecs in α-basis
-    ψ_n,q(r_μ) = Σ_α c_n,q[α] · B_at_μ[α, s, μ]              # reconstruction
+    fH_R       = build_fH_R(ctilde, enk_sigma, kgrid_co)     # node-pair kernel
+    L_R        = ifft_k Φ_k (−f(E_k)) C̃_k†                    # back-map kernel
+    X_q        = Σ_R Σ_T w_ij e^{-2πi q·(R+LT)} X_R           # per-pair WS sum
+    (lam, c)   = eigh(fH_q)                                  # eigvals f(ε), eigvecs in C̃'s frame
+    ψ_n,q(r_μ) = [L_q c_n,q]_μ / (−lam_n)                    # nodal values (exact on-grid)
 
 The resulting wfns are returned as the canonical X/Y-sharded bundle
 used elsewhere in LORRAX (matching ``load_centroids_band_chunked``),
 ready to drop in as a BSE interpolation input.
 
 This module deliberately stays narrow: it calls the core htransform
-routines (``build_fH_R``, ``build_R_grid_np``, ``newton_inv``) and
+routines (``build_fH_R``, ``node_pair_table``, ``newton_inv``) and
 adds only the fine-grid k-list construction, the per-q eigh path, and
 the X/Y reshard.
 """
 
 from __future__ import annotations
 
+import hashlib
 import time
 from types import SimpleNamespace
 from functools import partial
@@ -57,10 +59,11 @@ from common.staged_reshard import (
 
 from .fh_interp import (
     build_fH_R,
-    build_R_grid_np,
     newton_inv,
+    node_pair_table,
     require_newton_converged,
 )
+from common.ws_images import pair_ws_code_fourier
 from distrib_la import eigh_local
 
 
@@ -318,10 +321,34 @@ def resolve_conduction_window(enk_sigma, *, nb_window: int, nval_in: int,
     return b_min, b_max, n_guard
 
 
+def _backmap_R(nodal, ctilde, f_eps, kgrid_co, mesh_xy: Mesh):
+    """Lattice image ``(nk, rank, rank)`` of ``L_k = Φ_k (−f(E_k)) C̃_k†``.
+
+    ``L_k C̃_k e_n = −f_n Φ_k e_n``: it maps a state in C̃'s orthonormal frame
+    back to its nodal values, weighted by ``−f`` so the kernel vanishes at the
+    window top like fH's.  Face-sharded ``P(None, 'x', 'y')``, ``ifftn``
+    class order, the layout of ``fH_R``.
+    """
+    from common.fft_helpers import make_flat_k_ifftn
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    inverse = make_flat_k_ifftn(
+        mesh_xy, tuple(int(v) for v in kgrid_co),
+        P(None, None, None, None, 'x', 'y'), norm='backward')
+
+    @partial(jax.jit, out_shardings=face)
+    def _run(phi, c, f):
+        d = jnp.clip(-jnp.asarray(f).T, 0.0, None)            # (nk, nb)
+        x = jnp.einsum('kna,kn,knb->kab', phi, d, jnp.conj(c), optimize=True)
+        x = jax.lax.with_sharding_constraint(x, face)
+        return inverse(x[:, None])[:, 0]
+
+    return _run(nodal, ctilde, f_eps)
+
+
 def compute_wfns_fi(
     *,
     ctilde: jax.Array,
-    B_at_mu: jax.Array,
+    B_at_mu,
     enk_sigma: jax.Array,
     kgrid_co: tuple[int, int, int],
     kgrid_fi=None,
@@ -342,10 +369,11 @@ def compute_wfns_fi(
     arbitrary_q_bse.md §1/§2a: e.g. the shifted grid {k + Q}).
 
     Args:
-        ctilde:    (nk_co, nb, rank) Galerkin coeffs in the rank-α basis.
+        ctilde:    (nk_co, nb, rank) orthonormal nodal coefficients C̃_k.
                    ``build_fH_R`` consumes paired rank-sharded views, so this
                    may arrive rank-sharded or replicated.
-        B_at_mu:   (rank, ns, n_μ) α-basis evaluated at coarse centroids.
+        B_at_mu:   :class:`isdf.galerkin.NodalInterp` — the nodal values
+                   Φ_k and node geometry; ``shape`` = (rank, ns, n_μ).
         enk_sigma: (nb, nk_co) DFT band energies in Ry.
         kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.
         kgrid_fi:  (nkx_fi, nky_fi, nkz_fi) fine k-grid; tuple/list/string.
@@ -576,9 +604,9 @@ def compute_wfns_fi(
     # ``x._value`` — a host gather of the same size per process.  It was the
     # single reason a converged k-grid could not run the htransform at any
     # device count (gw_converged_12x12_80ry_2026-07-21 §5, next-step #2).
-    rep = NamedSharding(mesh_xy, P())
-    B_rep = jax.device_put(B_at_mu, rep)
-    R_grid = jnp.asarray(build_R_grid_np(kgrid_co))
+    ws_table = node_pair_table(B_at_mu, kgrid_co, mesh_xy)
+    ws_code = ws_table["code"]
+    L_R = _backmap_R(B_at_mu.nodal, ctilde, _f_eps, kgrid_co, mesh_xy)
 
     # ── q-points (uniform fine grid or explicit list), padded to batch ───
     if q_list is None:
@@ -672,9 +700,15 @@ def compute_wfns_fi(
     # keys its own cache on avals and static args, so putting shapes here
     # would only split entries that are already correctly split.
     _mesh_id = _mesh_key(mesh_xy)
+    # The kernels close over the WS table, so the node geometry is part of
+    # the signature.
+    _geom = hashlib.sha256(
+        np.asarray(B_at_mu.node_frac, np.float64).tobytes()
+        + np.asarray(B_at_mu.lattice_bohr, np.float64).tobytes()
+        + bytes([int(B_at_mu.sys_dim)])).hexdigest()
     _sig = (_mesh_id, tuple(int(v) for v in kgrid_co), int(rank),
             int(nb_fi), int(nspinor), int(n_mu),
-            _stage_q is not None, bool(native))
+            _stage_q is not None, bool(native), _geom)
 
     # The two stages either side of the eigh are plain traceable functions,
     # shared verbatim by both backends; only the JIT BOUNDARIES differ.  The
@@ -682,8 +716,11 @@ def compute_wfns_fi(
     # full (bs, rank, rank) eigenvector batch becomes a materialised jit output
     # instead of being fused away down to the nb_fi columns actually kept
     # (10.1 GiB/device at bs=32 / rank 4452; it killed a 16 × A100-80GB run).
-    def _fourier(q, fH_R, batched):
-        """fH_q = Σ_R e^{-2πi q·R} fH_R.
+    def _fourier(q, fH_R, batched, code, hermitian=True):
+        """fH_q = Σ_R Σ_T w_ij e^{-2πi q·(R+LT)} fH_R (per-pair WS images).
+
+        ``code`` is the WS code table, a traced argument; ``hermitian=False``
+        skips the symmetrization (the back-map kernel ``L``).
 
         ``batched``: q is (bs, 3) and the output ends q-SHARDED — the
         ``_kpath_batch`` idiom (htransform.h_transform), one all-to-all after
@@ -699,24 +736,28 @@ def compute_wfns_fi(
         collective (rank²·16 B all-to-all, 22 MB/device at rank 4716 on 16
         devices), the price of not materialising the matrix.
         """
+        face_pin = lambda x: jax.lax.with_sharding_constraint(
+            x, _fit(mesh_xy, P(None, 'x', 'y'), x.shape, "bse_setup.fH_q(face)"))
         if not batched:
-            fH_q = jnp.einsum('k,kij->ij', jnp.exp(-2j * jnp.pi * (R_grid @ q)),
-                              fH_R)
+            fH_q = pair_ws_code_fourier(fH_R, ws_table, q[None], code=code,
+                                        pin=face_pin)[0]
             grid = _fit(mesh_xy, P('x', 'y'), (rank, rank),
                         "bse_setup.fH_q(one)")
             fH_q = jax.lax.with_sharding_constraint(fH_q, grid)
+            if not hermitian:
+                return fH_q
             return jax.lax.with_sharding_constraint(
                 0.5 * (fH_q + jnp.conj(fH_q).T), grid)
         bs = int(q.shape[0])
         q = jax.lax.with_sharding_constraint(
             q, _fit(mesh_xy, P(('x', 'y'), None), (bs, 3), "bse_setup.q_batch"))
-        phase = jnp.exp(-2j * jnp.pi * (q @ R_grid.T))                 # (bs, nk_co)
         # fH_R is (i, j)-sharded and the sum runs over R only → local.  Pin the
         # contraction OUTPUT to that same (i, j) layout: left free, XLA
         # materialises the whole (bs, rank, rank) batch on every device before
         # the reshard below (measured: 9 batches × 11.4 GiB at nb=36 / rank
         # 4716 — the OOM that made the wide windows unmeasurable).
-        fH_q = jnp.einsum('qk,kij->qij', phase, fH_R)
+        fH_q = pair_ws_code_fourier(fH_R, ws_table, q, code=code,
+                                    pin=face_pin)
         fH_q = jax.lax.with_sharding_constraint(
             fH_q, _fit(mesh_xy, P(None, 'x', 'y'), (bs, rank, rank),
                        "bse_setup.fH_q(face)"))
@@ -782,16 +823,23 @@ def compute_wfns_fi(
             fH_q = jax.lax.with_sharding_constraint(
                 fH_q, _fit(mesh_xy, P(('x', 'y'), None, None),
                            (bs, rank, rank), "bse_setup.fH_q(qbatch)"))
+        if not hermitian:
+            return fH_q
         return 0.5 * (fH_q + jnp.swapaxes(fH_q, -1, -2).conj())
 
-    def _project(lam, U, B, b_min, b_max):
-        """Band-window slice + ψ_n,q(r_μ) = Σ_α c_n,q[α] B_at_μ[α, s, μ].
+    def _project(lam, U, L, b_min, b_max):
+        """Band-window slice + ψ_n,q(r_μ) = [L_q c_n,q]_μ / (−lam_n).
 
-        Leading-axis agnostic (``...``): the native path hands it a whole
-        q-batch, the FFI path one q.  ONE reconstruction for both backends.
+        ``L`` is the back-map ``L_q`` (rank, rank): exact on-grid, and the
+        division only touches returned window bands, which the f-shoulder
+        gate keeps away from ``f = 0``.  Leading-axis agnostic (``...``):
+        the native path hands it a whole q-batch, the FFI path one q.  ONE
+        reconstruction for both backends.
         """
         c = U[..., b_min:b_max]                                # (..., rank, nb_fi)
-        psi = jnp.einsum('...an,asm->...nsm', c, B)            # (..., nb_fi, ns, n_μ)
+        nodal = (L @ c) / (-lam[..., None, b_min:b_max])       # (..., rank, nb_fi)
+        psi = jnp.moveaxis(nodal[..., :nspinor * n_mu, :].reshape(
+            nodal.shape[:-2] + (nspinor, n_mu, nodal.shape[-1])), -1, -3)
         # ``lam`` (ALL ``rank`` bands) comes out LAST, appended to the tuple
         # the three existing consumers already unpack, so nothing above moves.
         # It is the owner's "store eigenvalues up to the full N_band before
@@ -829,11 +877,12 @@ def compute_wfns_fi(
         def _build():
             @partial(jax.jit, static_argnames=('b_min', 'b_max'),
                      out_shardings=_qbatch_out_shardings(bs_))
-            def _q_batch(q_batch, fH_R, B, b_min, b_max):
+            def _q_batch(q_batch, fH_R, L_R, code, b_min, b_max):
                 """Native: Fourier sum → batched eigh → projection, ONE fused
                 jit."""
-                lam, U = eigh_local(_fourier(q_batch, fH_R, True))
-                return _project(lam, U, B, b_min, b_max)
+                lam, U = eigh_local(_fourier(q_batch, fH_R, True, code))
+                L = _fourier(q_batch, L_R, True, code, hermitian=False)
+                return _project(lam, U, L, b_min, b_max)
             return _q_batch
         return _cached_kernel(("q_batch", _sig, int(bs_)), _build)
 
@@ -864,7 +913,8 @@ def compute_wfns_fi(
     if native:
         _q_batch = _q_batch_kernel(bs)
         for i in range(0, q_pad.shape[0], bs):
-            _emit(*_q_batch(q_pad[i:i + bs], fH_R, B_rep, b_min, b_max))
+            _emit(*_q_batch(q_pad[i:i + bs], fH_R, L_R, ws_code, b_min,
+                            b_max))
             # RETAINED, per chunk, and it is not an oversight.  ``_q_batch``
             # materialises a (bs, rank, rank) fH_q batch INSIDE its own
             # executable, and this file records two separate OOMs caused by
@@ -977,18 +1027,20 @@ def compute_wfns_fi(
         # place and emits nothing (it compares (mesh, spec), not sharding
         # objects, for exactly this case — distrib_la.plan.ensure_sharding).
         def _build_fH_q_chunk():
-            @partial(jax.jit, out_shardings=eigh_plan.batch_in_sharding)
-            def _fH_q_chunk(q_chunk, fH_R):
-                return jax.lax.map(lambda q: _fourier(q, fH_R, False),
-                                   q_chunk)
+            @partial(jax.jit, static_argnames=('hermitian',),
+                     out_shardings=eigh_plan.batch_in_sharding)
+            def _fH_q_chunk(q_chunk, X_R, code, hermitian):
+                return jax.lax.map(
+                    lambda q: _fourier(q, X_R, False, code, hermitian),
+                    q_chunk)
             return _fH_q_chunk
 
         def _build_project_chunk():
             @partial(jax.jit, static_argnames=('b_min', 'b_max'))
-            def _project_chunk(lam, U, B, b_min, b_max):
+            def _project_chunk(lam, U, L, b_min, b_max):
                 return jax.lax.map(
-                    lambda lu: _project(lu[0], lu[1], B, b_min, b_max),
-                    (lam, U))
+                    lambda lu: _project(lu[0], lu[1], lu[2], b_min, b_max),
+                    (lam, U, L))
             return _project_chunk
 
         _fH_q_chunk = _cached_kernel(
@@ -1000,8 +1052,11 @@ def compute_wfns_fi(
         _logged = 0
         for i in range(0, nq, bs_ffi):
             lam_c, U_c = eigh_plan.batched(
-                _fH_q_chunk(q_all[i:i + bs_ffi], fH_R))
-            _emit(*_project_chunk(lam_c, U_c, B_rep, b_min, b_max))
+                _fH_q_chunk(q_all[i:i + bs_ffi], fH_R, ws_code, True))
+            _emit(*_project_chunk(
+                lam_c, U_c,
+                _fH_q_chunk(q_all[i:i + bs_ffi], L_R, ws_code, False),
+                b_min, b_max))
             # nq SERIAL distributed solves is a long, silent stretch — log the
             # rate so a stall is distinguishable from slow progress.  THE ONE
             # SYNC LEFT ON THIS ARM lives here, at the LOG cadence and not per

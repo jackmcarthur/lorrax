@@ -47,7 +47,7 @@ from .fh_interp import (
 # The library half is bandstructure.fh_interp.  These names stay importable
 # from the CLI module for open lanes until the wave after ARCH wave 0.
 from .fh_interp import (                                             # noqa: F401
-    build_R_grid_np, f_transform_eigs, outer_r_shell_mask,
+    f_transform_eigs, outer_r_shell_mask,
     resolve_extra_rank_pad, resolve_galerkin_rank_multiplier,
     resolve_local_vbm_index, select_active_eigenpairs,
     validate_centroid_subset_idx,
@@ -162,7 +162,8 @@ def add_band_character_arguments(parser):
 
 def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
                                wfn_path, params, ctilde, wfn_ctilde,
-                               enk_sigma, meta, result, mesh, input_dir,
+                               B_at_mu, enk_sigma, meta, result, mesh,
+                               input_dir,
                                n_return_bands, a_band, energy_source, report):
     """Spin / orbital path coloring, coarse orbital totals, grid moments.
 
@@ -283,7 +284,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         nq = int(kpath_frac.shape[0])
         path_ops = gather_to_host(interpolate_band_operator(
             ops, wfn_ctilde, result["coeffs_on_path"],
-            np.asarray(kpath_frac), kgrid, mesh))[:nq]
+            np.asarray(kpath_frac), kgrid, mesh, B_at_mu=B_at_mu))[:nq]
         expect = np.einsum('qaii->qai', path_ops).real
         extra = {}
         if "orbital" in colors:
@@ -292,7 +293,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
             m_path = path_orbital_moments(
                 parents, sym, slice(band_start, band_start + nb_fit),
                 wfn_ctilde, result["coeffs_on_path"], kpath_frac, kgrid,
-                mesh, E_path, deps_tol)
+                mesh, E_path, deps_tol, B_at_mu=B_at_mu)
             m_n = average_within_degenerate_sets(
                 np.einsum('a,qai->qi', axis, m_path), E_path, deps_tol)
             clip = float(np.percentile(np.abs(m_n), 95))
@@ -336,7 +337,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde,
                             kgrid, mesh) for i in range(3)]
         E, D, residual = grid_moments(
-            fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
+            fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh,
+            B_at_mu=B_at_mu)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
             np.asarray(gather_to_host(E)), np.asarray(gather_to_host(D)),
@@ -581,7 +583,8 @@ def main(argv=None):
                                  qp_corrected_band_range=qp_corrected_band_range,
                                  progress_fn=report.progress,
                                  quality_record_fn=_quality_records.append,
-                                 sym=sym, return_coeffs=bool(args.color))
+                                 sym=sym, return_coeffs=bool(args.color),
+                                 B_at_mu=B_at_mu)
         _transform_progress.step()
         _transform_progress.finish()
 
@@ -650,7 +653,7 @@ def main(argv=None):
                 colors=args.color, moments_grid=args.moments_grid,
                 velocity=args.velocity and _output_path(args.velocity),
                 wfn=wfn, sym=sym, wfn_path=_wfn_path, params=params,
-                ctilde=ctilde, wfn_ctilde=wfn_ctilde,
+                ctilde=ctilde, wfn_ctilde=wfn_ctilde, B_at_mu=B_at_mu,
                 enk_sigma=enk_sigma, meta=meta,
                 result=result, mesh=mesh_xy, input_dir=input_dir,
                 n_return_bands=n_return_bands, a_band=args.a_band,

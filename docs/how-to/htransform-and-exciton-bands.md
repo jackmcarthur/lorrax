@@ -27,7 +27,7 @@ orbitals that the user constructs. htransform needs no such orbitals: it
 expands every state in one real-space basis that does not depend on $k$, and
 Fourier-interpolates a function of the Hamiltonian in that basis.
 
-## 2. The whole-state Galerkin basis
+## 2. The nodal basis
 
 Stack the states of the fitted band window $[b_0, b_1)$ at every coarse $k$
 as the rows of one matrix
@@ -37,37 +37,37 @@ $$\Psi_{(k,n),(s,r)} = \psi_{nk}(s, r), \qquad n \in [b_0, b_1),$$
 with $s$ the spinor component and $r$ the points of the real-space FFT grid.
 Each row is the full Bloch state, phase $e^{ik\cdot r}$ included. The row
 space of $\Psi$ contains every state LORRAX will interpolate, so it is the
-natural basis. It is too large to use directly ($N_k (b_1-b_0)$ rows), so
-`isdf.galerkin.fit_galerkin_basis` selects a subset of rows:
+natural space, but it is too large to use directly. `isdf.galerkin.fit_galerkin_basis`
+represents every state by its values at the run's ISDF centroids, the nodes
+(charge-density-weighted k-means, orbit-closed under the crystal operations),
+sampled once through the GW centroid-face path
+(`common.wfn_transforms.load_centroids_band_chunked`):
 
-1. A deterministic Gaussian sketch of a random candidate subset of states,
-   followed by pivoted Cholesky of the candidates' Gram matrix, reproduces the
-   column choice of randomized QR with column pivoting (QRCP). The pivots
-   $X$ are physical states, rows of $\Psi$.
-2. The pivots are orthonormalized, $XX^\dagger = LL^\dagger$,
-   $B = L^{-1}X$. $B_\alpha(s,r)$, $\alpha = 1 \dots N_B$, is the basis.
-3. Every state is projected once: $C = \Psi B^\dagger$, so
-   $c_{nk}[\alpha] = \langle B_\alpha | \psi_{nk}\rangle$, shape
-   $(N_k, b_1-b_0, N_B)$.
+$$\Phi_k[(s,\nu), n] = \psi_{nk}(s, r_\nu).$$
 
-$N_B$ is set by one tolerance, `htransform_qr_eps` (default $10^{-3}$, the
-relative QR-diagonal threshold at which pivoting stops). The search is capped
-at $\lceil$`htransform_rank_multiplier`$\cdot (b_1-b_0)\rceil$ directions
-(default 20). A fit whose delivered rank exceeds 90 % of the cap refuses
-(unless the cap already spans every state), because then the cap and not the
-tolerance set the rank (`galerkin.fit_galerkin_basis`). `htransform_qrcp_seed`
-seeds the candidate shuffle and sketch, and the report prints the candidate
-and pivot hashes. Pivots whose sketched residuals agree to $10^{-8}$ are
-broken by the lowest index, so the basis does not depend on the process
-count.
+Nodal values carry no metric. The fit adds the diagonal quadrature metric
+$W = \operatorname{diag}(w_\nu)$ of the centroids: one non-negative weight per
+centroid orbit, the least-squares (NNLS) solution of
+$\Phi_k^\dagger W \Phi_k = 1$ over all coarse $k$. $W$ is invariant under the
+node permutation of every crystal operation. A per-$k$ Löwdin step then makes
+the coefficients exactly orthonormal:
 
-$B$ is never stored on the full grid. The fit keeps $C$, the basis values at
-the ISDF centroids $B_\alpha(s, r_\mu)$ (which the BSE consumers need) and the
-pivot factor, and writes them to `galerkin_dft.h5` beside the deck. A later
-run reuses the file only when its provenance matches exactly (WFN fingerprint,
-centroid SHA-256, band window, grids, spinor mode, QRCP controls); otherwise it
-refits in memory and leaves the file unchanged. The log says `REUSED`,
-`REFIT` or `FITTED and published`.
+$$G_k = \Phi_k^\dagger W \Phi_k, \qquad c_{k} = W^{1/2}\Phi_k G_k^{-1/2},
+\qquad c_k^\dagger c_k = 1,$$
+
+shape $(N_k, b_1-b_0, N_B)$ with $N_B = N_s N_\mathrm{centroid}$. The log
+prints $\varepsilon = \max_k \|G_k - 1\|_2$ (Si 4³, 1100 centroids:
+$1.0\times10^{-3}$; MoS₂ 9×9, 1198 centroids: $1.7\times10^{-2}$), the number of
+zero-weight nodes (they drop out of $c$), the orbit count and the fit wall
+(seconds). There is no node selection, pivot or tolerance. A centroid set that
+is not orbit-closed (`symmetry_maps.centroid_source_map_and_wrap`) refuses,
+naming the remedy.
+
+The fit writes $c$, $\Phi$ and $G^{-1/2}$ to `galerkin_dft.h5` beside the deck. A later run reuses
+the file only when its provenance matches exactly (WFN fingerprint, centroid
+SHA-256, band window, grids, spinor mode, node version); otherwise it refits
+in memory and leaves the file unchanged. The log says `REUSED`, `REFIT` or
+`FITTED and published`.
 
 ## 3. The f-transform and the interpolation
 
@@ -95,20 +95,29 @@ state near the edge is mapped to zero, the matrix
 $$f(H)_k = \sum_n f(\varepsilon_{nk})\, c_{nk} c_{nk}^\dagger$$
 
 no longer cares which states sit at the edge; it is smooth in $k$, and
-invariant under any unitary mixing of the window's states. The interpolation
-is then:
+invariant under any unitary mixing of the window's states. In the nodal basis
+it is a node-pair kernel interpolated per node pair:
 
 $$f(H)_R = \frac{1}{N_k}\sum_k e^{2\pi i k\cdot R} f(H)_k, \qquad
-f(H)_q = \sum_R e^{-2\pi i q\cdot R} f(H)_R,$$
+f(H)_q[\nu\nu'] = \sum_{R} w^{\nu\nu'}_R\, e^{-2\pi i q\cdot R} f(H)_R[\nu\nu'],$$
 
-with $R$ on the coarse grid's supercell, centred on 0
-(`fh_interp.build_fH_R`, `fh_interp.build_R_grid_np`). At each path point
-the driver diagonalizes $f(H)_q$: the eigenvalues are $f(\varepsilon_n(q))$
-and the eigenvectors $c_n(q)$ are the states in the basis $B$. Newton
+where, per node pair, $R$ runs over the Wigner--Seitz images of
+$r_\nu + R - r_{\nu'}$ in the coarse supercell, ties shared equally
+(`common.ws_images`, `fh_interp.node_pair_table`, `fh_interp.node_fourier`).
+Every crystal operation maps the images of a node pair onto those of the image
+pair and leaves $W$ invariant, so the interpolant is covariant: star-related
+$q$ give the same energies to rounding, provided the fitted window ends in a
+gap at every coarse $k$ (a window top that cuts a degenerate multiplet makes
+the coarse kernels gauge-dependent). At each path point the driver
+diagonalizes $f(H)_q$: the eigenvalues are $f(\varepsilon_n(q))$ and the
+eigenvectors $c_n(q)$ are the states in the orthonormal nodal frame. Newton
 iteration inverts $f$ (`fh_interp.newton_inv`, converged to
-$\max|f(x)-y| \le 10^{-12}$ Ry in at most 50 steps, else refused). The state
-at a centroid follows as $\psi_n(q; s, r_\mu) = \sum_\alpha c_n(q)[\alpha]\,
-B_\alpha(s, r_\mu)$, which is what the BSE consumers take.
+$\max|f(x)-y| \le 10^{-12}$ Ry in at most 50 steps, else refused). The BSE
+consumers take the nodal values $\psi_n(q; s, r_\nu) = [L_q c_n(q)]_\nu /
+(-f_n(q))$ from the back-map kernel $L_k = \Phi_k (-f(\varepsilon_k))
+c_k^\dagger$, interpolated the same way (`bse_setup._backmap_R`): exact on
+the coarse grid, and the division touches only returned window bands, which
+the guard bands keep away from $f = 0$.
 
 **Guard bands.** Inside the shoulder $f' < 1$, and at the top $f' = 0$: a band
 there is compressed and, at the $k$ where it reaches $\varepsilon_\mathrm{top}$,
@@ -204,9 +213,9 @@ element's $l$ shell (Löwdin-orthogonalized `PP_PSWFC` of the `*.upf` beside
 the deck, j-averaged radial functions: QE `projwfc`'s projector). With
 `--velocity` it also reads the stored velocity $v^a_{nm} = \langle
 nk|\partial_{k_a}H|mk\rangle$ of the WFN's states. Each operator is carried
-into the Galerkin basis as $C^T O\, C^*$ and Fourier-interpolated exactly as
-$f(H)$ is. On the `--qp-rotations` route only the eigenvectors change: $U$ is
-unitary on the fitted window, so the operator image is the same.
+into the nodal frame as $C^T O\, C^*$ and interpolated with the same node-pair
+sum as $f(H)$. On the `--qp-rotations` route only the eigenvectors change: $U$
+is unitary on the fitted window, so the operator image is the same.
 
 **Velocity.** `dipole.h5` (`psp.get_dipole_mtxels`, $p + i[V_\mathrm{NL}, r]$)
 belongs to a DFT `WFN.h5`; for QSGW, run on the SC run's `WFN_qp.h5` with its
@@ -393,7 +402,7 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | `nval` / `ncond` | 5 / 5 | returned window (§3); standalone runs need `nval` = occupied bands |
 | `--guard-bands` | 4 | fitted bands above the returned window |
 | `--a-band` | top fitted band | band whose bandwidth sets $f$'s shoulder width |
-| `htransform_qr_eps` / `htransform_rank_multiplier` / `htransform_qrcp_seed` | 1e-3 / 20 / 0 | Galerkin basis rank tolerance, search cap, seed (§2) |
+| `htransform_qr_eps` / `htransform_rank_multiplier` / `htransform_qrcp_seed` | 1e-3 / 20 / 0 | unused by the fit (§2): qr_eps only cuts the Gram pseudo-inverse of the refit's grid rows |
 | `-wfn` / `--wfn-file` | the deck's `wfn_file` | another WFN, for example `WFN_qp.h5` |
 | `-o` / `--output-file`, `--report-file` | `bandstructure.dat`, `htransform.out` | outputs |
 | `linalg` | `local` | layout of the $f(H)_q$ eigensolve |
@@ -404,7 +413,7 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 
 | refusal | cause | fix |
 |---|---|---|
-| QRCP search saturates its cap | the band window needs more basis directions than `htransform_rank_multiplier` allows | read the projection receipts in the report, then raise the multiplier |
+| the nodal fit refuses: centroids not orbit-closed | the centroid file was not made in orbit-aware mode | regenerate it with `centroid.kmeans_cli` (orbit mode) |
 | `f-shoulder` | a returned band is absent from $f(H)$ at some coarse $k$ | add guard bands |
 | Newton not converged | $\max|f(x) - y| > 10^{-12}$ Ry after 50 steps | a returned band lies in the flat part of $f$; add guard bands or set `--a-band` |
 | standalone window cuts the occupied bands | `nval` ≠ occupied bands | set `nval` to the occupied count |
