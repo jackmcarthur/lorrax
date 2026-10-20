@@ -7,6 +7,7 @@
    the soft-limit grace period still gets a capacity check, not a negative room.
 4. A W-bank field created after initialization (a line panel) that the disk
    refuses is held in host memory, so the map runs on.
+5. ``reader(spans, run=...)`` runs each span's unpack through the caller's pricer.
 """
 import mmap
 import os
@@ -149,3 +150,27 @@ def test_late_bank_field_refused_by_the_disk_is_held_in_host_memory(tmp_path, mo
         assert np.array_equal(np.asarray(back), np.ones(panel))
     finally:
         pay.release()
+
+
+def test_reader_runs_each_unpack_through_the_callers_pricer(tmp_path, monkeypatch):
+    """5. ``reader(spans, run=...)`` runs each span's unpack program through ``run`` (the
+    moment batches price their read-back there), and reads the same values."""
+    from functools import partial
+    from common import timing
+    from gw.response_bank import _run_priced
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+    _no_lfs(monkeypatch)
+    bank = _bank(tmp_path, "moments", n_out=2)
+    carry = jax.device_put(jnp.arange(2 * TILE * TILE, dtype=jnp.complex128).reshape(2, 1, TILE, TILE),
+                           NamedSharding(_mesh(), P(None, None, "x", "y")))
+    bank.put(0, carry, ((0, 0), (1, 1)))
+    bank.commit()
+    plain = np.asarray(next(bank.reader([(0, 2)])))
+    ran = []
+    with timing.section("demo.read_back"):
+        priced = np.asarray(next(bank.reader([(0, 2)], run=lambda program, *a: ran.append(
+            compiled_new_bytes(program.lower(*a).compile())) or partial(_run_priced, label="demo")(program, *a))))
+    assert np.array_equal(priced, plain) and np.array_equal(plain[:, 0], np.asarray(carry)[:, 0])
+    part = next(r["price"] for r in memory.receipts() if r["stage"] == "demo.read_back")
+    assert len(ran) == 1 and part.xla.at(1) == ran[0] > 0

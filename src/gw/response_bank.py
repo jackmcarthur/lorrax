@@ -1601,8 +1601,10 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
         qwidth = moment_width(per_q)
     receipt["q_width"] = int(qwidth)
     receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
+    # A batch's read-back and split run in turn beside the same residents: one part, the larger.
     runs = None if streamed is None else streamed.reader(
-        [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))])
+        [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))],
+        run=partial(_run_priced, label="moment correlations"))
     # The q batches in their own section. Each program a batch runs is priced by its own
     # executable in its dispatch section (bank.dispatch.coulomb_sqrt, .moment_dyson); the
     # batch's ledger row admits its outputs and is no price of this section.
@@ -1621,7 +1623,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                     if runs is not None:
                         run = next(runs)
                         totals = _run_priced(_moment_batch_split(mesh_xy, n_total, q1 - q0),
-                                             run if finish is None else finish(run), label="moment batch split")
+                                             run if finish is None else finish(run), label="moment correlations")
                         del run
                         a0, a1, o0, o1 = totals if ordered else (*totals, None, None)
                         del totals
