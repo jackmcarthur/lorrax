@@ -1810,7 +1810,7 @@ def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh, n_rmu_logical: 
     import distrib_la
     from lxkit import memory
     from common.gpu_utils import shared_device_room
-    from distrib_la.workspace import lu_workspace_bytes
+    from distrib_la import lu_workspace_bytes
     from runtime.aot_memory import compiled_price
     c = jax.ShapeDtypeStruct((int(nq), int(n_rmu), int(n_rmu)), jnp.complex128,
                              sharding=NamedSharding(mesh_xy, P(None, 'x', 'y')))
