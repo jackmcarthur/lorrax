@@ -385,6 +385,7 @@ def make_snapshot_evaluator(prepared, options):
                         fit_tolerance=float(options.get("fit_tolerance", 1e-3)),
                         max_projection_order=int(options.get("max_projection_order", 400)),
                         max_pencil_bytes=int(options.get("max_pencil_bytes", 128 * 1024 ** 2)),
+                        real_fit_sites=fit_sites.real if options.get("real_axis_fit", False) else None,
                         self_negative=negative == iq)
                 current_screens[iq] = screen
             else:

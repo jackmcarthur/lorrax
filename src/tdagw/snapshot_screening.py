@@ -337,7 +337,9 @@ def joint_loewner(sites, samples, *, max_order=96, rank_tolerance=1e-11,
     """Fit a common strictly proper realization to stacked ``[P<;P>]``.
 
     ``samples[2,support,r,r]`` and complex ``sites[support]`` are small
-    replicated host arrays; energies use Ry.  All matrix entries enter the
+    replicated host arrays; energies use Ry.  Real boundary supports are
+    allowed when the declared physical damping makes their exact samples
+    finite.  All matrix entries enter the
     full-block Loewner pencil.  Its SVD selects at most ``max_order`` modal
     candidates; the strictly lower-half-plane candidate subset defines a
     stable approximation basis.  Joint output amplitudes are then fitted
@@ -471,7 +473,8 @@ def compact_causal_realization(system, sites, *, tolerance=1e-9):
 def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
                     fit_tolerance=1e-3, rank_tolerance=1e-11,
                     pole_tolerance=1e-12, max_projection_order=400,
-                    self_negative=False, max_pencil_bytes=128 * 1024 ** 2):
+                    self_negative=False, max_pencil_bytes=128 * 1024 ** 2,
+                    real_fit_sites=None):
     """Build and certify a reduced joint screened snapshot from a callback.
 
     ``sampler(sites)`` returns exact ``[2,support,r,r]`` bubble values in
@@ -489,6 +492,11 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
     ``max_projection_order`` bounds causal-projection states and
     ``max_pencil_bytes`` bounds each block Loewner pencil before allocation;
     increasing these capacity limits does not change fit acceptance.
+    Optional ``real_fit_sites`` are exact, finite boundary training supports
+    for the same joint fit, not frequency integration nodes.  The sampler's
+    positive physical adiabatic regulator makes these samples finite.  They
+    must be disjoint from ``check_sites.real``, which remains an independent
+    dressed-noise oracle; no check values enter training.
     """
     fit_sites, check_sites = (np.asarray(x, dtype=complex) for x in (fit_sites, check_sites))
     if (check_sites.size == 0 or not np.isfinite(fit_sites).all()
@@ -496,8 +504,20 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
             or np.any(check_sites.imag <= 0) or np.intersect1d(fit_sites, check_sites).size
             or not np.isfinite(fit_tolerance) or fit_tolerance <= 0):
         raise ValueError("GATE snapshot_check_support: positive disjoint fit/check supports required")
+    real_fit_sites = (np.empty(0, complex) if real_fit_sites is None
+                      else np.asarray(real_fit_sites, dtype=complex))
+    if (real_fit_sites.ndim != 1 or not np.isfinite(real_fit_sites).all()
+            or np.any(real_fit_sites.imag != 0)
+            or np.unique(real_fit_sites).size != real_fit_sites.size
+            or np.intersect1d(real_fit_sites, check_sites.real).size):
+        raise ValueError("GATE snapshot_check_support: finite unique real training supports "
+                         "must be disjoint from real noise checks")
     data = np.asarray(sampler(fit_sites), dtype=complex)
-    fit = joint_loewner(fit_sites, data, max_order=max_order, rank_tolerance=rank_tolerance,
+    joint_sites = fit_sites
+    if real_fit_sites.size:
+        joint_sites = np.concatenate((fit_sites, real_fit_sites))
+        data = np.concatenate((data, np.asarray(sampler(real_fit_sites), dtype=complex)), axis=1)
+    fit = joint_loewner(joint_sites, data, max_order=max_order, rank_tolerance=rank_tolerance,
                         max_pencil_bytes=max_pencil_bytes)
     pl, pg = fit["lesser"], fit["greater"]
     if self_negative:
@@ -579,6 +599,7 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
                         "fit_pencil_bytes": int(fit["pencil_bytes"]),
                         "self_negative_crossing": bool(self_negative),
                         "fit_sites_ry": fit_sites.copy(), "check_sites_ry": check_sites.copy(),
+                        "real_fit_sites_ry": real_fit_sites.copy(),
                         "retarded_poles_ry": np.linalg.eigvals(wr[0]),
                         "lesser_order": wl[0].shape[0],
                         "noise_only_poles_allowed": True,

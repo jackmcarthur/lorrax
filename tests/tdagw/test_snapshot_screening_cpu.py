@@ -275,3 +275,42 @@ def test_screen_snapshot_forwards_explicit_pencil_capacity(monkeypatch):
         ss.screen_snapshot(lambda sites: np.zeros((2, len(sites), 1, 1), complex),
             np.arange(4) + 0.2j, np.array([0.5 + 0.3j]), max_pencil_bytes=256 * 1024 ** 2)
     assert captured["max_pencil_bytes"] == 256 * 1024 ** 2
+
+
+def test_real_boundary_training_keeps_noise_oracle_independent():
+    calls = []
+    pole = -0.2 - 0.08j
+
+    def sampler(sites):
+        sites = np.asarray(sites)
+        calls.append(sites.copy())
+        value = (0.01 / (sites - pole))[:, None, None]
+        return np.stack((value, value))
+
+    fit = np.linspace(-1.1, 1.1, 20) + 0.3j
+    check = np.linspace(-1, 1, 9) + 0.47j
+    real_fit = fit.real
+    model = ss.screen_snapshot(sampler, fit, check, real_fit_sites=real_fit,
+                               max_order=8, fit_tolerance=1e-8)
+    assert len(calls) == 4
+    for actual, expected in zip(calls, (fit, real_fit, check, check.real)):
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(model["receipt"]["real_fit_sites_ry"], real_fit)
+    assert model["receipt"]["noise_check_error"] < 1e-10
+
+    def corrupt_only_noise_checks(sites):
+        result = sampler(sites)
+        if np.array_equal(np.asarray(sites), check.real):
+            result *= 1.1
+        return result
+
+    with pytest.raises(ValueError, match="snapshot_noise_error"):
+        ss.screen_snapshot(corrupt_only_noise_checks, fit, check,
+            real_fit_sites=real_fit, max_order=8, fit_tolerance=1e-8)
+
+
+@pytest.mark.parametrize("real_fit", [[0.5], [0.2, 0.2], [0.2 + 0.1j], [np.nan]])
+def test_real_boundary_training_refuses_shared_or_invalid_checks(real_fit):
+    with pytest.raises(ValueError, match="snapshot_check_support"):
+        ss.screen_snapshot(lambda _: pytest.fail("invalid supports must not sample"),
+            np.arange(4) + 0.2j, np.array([0.5 + 0.3j]), real_fit_sites=real_fit)

@@ -107,6 +107,7 @@ TD_DEFAULTS = {
     "lorrax.collision_projection_order": 400,
     "lorrax.collision_pencil_mb": 128,
     "lorrax.collision_fit_samples": 192,
+    "lorrax.collision_fit_real_axis": False,
     "lorrax.collision_fit_tolerance": 0.02,
     "lorrax.collision_adiabatic_ev": 0.05,
     "lorrax.collision_fit_height_ev": 0.15,
@@ -244,6 +245,9 @@ def _check_collision(vals: dict) -> None:
     if vals["lorrax.collision_fit_samples"] < 4:
         raise _gate("td_collision_snapshot", "collision_fit_samples < 4",
                     "at least four distinct supports", "increase collision_fit_samples")
+    if not isinstance(vals["lorrax.collision_fit_real_axis"], bool):
+        raise _gate("td_collision_snapshot", "collision_fit_real_axis must be boolean",
+                    "true | false", "set [lorrax] collision_fit_real_axis")
     for key in ("collision_snapshot_tol_ev", "collision_fit_tolerance", "collision_adiabatic_ev",
                 "collision_fit_height_ev", "collision_snapshot_mixing"):
         try:
@@ -1183,6 +1187,12 @@ TD_KEY_DOCS = {
         "", "Number of finite complex frequency supports for joint rational fitting. "
         "Independent held-out response and dressed-noise checks must pass before use.",
         ("td_collision",)),
+    "lorrax.collision_fit_real_axis": (
+        "", "Also train the joint rational fit on exact real parts of its complex "
+        "fit supports. The declared positive adiabatic regulator makes these boundary "
+        "samples finite. Real training supports are disjoint from the independent "
+        "real dressed-noise checks. This adds sampling and pencil cost, not frequency "
+        "integration, a regulator change or relaxed acceptance.", ("td_collision",)),
     "lorrax.collision_fit_tolerance": (
         "", "Relative held-out tolerance for both fluctuation bubbles, retarded "
         "screening and dressed fluctuation noise in the reduced Coulomb coordinates.",

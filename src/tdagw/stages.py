@@ -326,7 +326,7 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
         for key in ("collision_snapshot_steps", "collision_snapshot_tol_ev",
                     "collision_snapshot_mixing", "collision_snapshot_acceleration", "collision_hamiltonian", "collision_density_rank",
                     "collision_pole_order", "collision_projection_order", "collision_pencil_mb",
-                    "collision_fit_samples", "collision_fit_tolerance",
+                    "collision_fit_samples", "collision_fit_real_axis", "collision_fit_tolerance",
                     "collision_adiabatic_ev", "collision_fit_height_ev"):
             fp["collision"][f"lorrax.{key}"] = v[f"lorrax.{key}"]
     fp.update(trials=[dict(t) for t in deck.trials], model=model.name,
@@ -610,6 +610,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
             max_projection_order=v["lorrax.collision_projection_order"],
             max_pencil_bytes=v["lorrax.collision_pencil_mb"] * 1024 ** 2,
             fit_samples=v["lorrax.collision_fit_samples"],
+            real_axis_fit=v["lorrax.collision_fit_real_axis"],
             fit_tolerance=v["lorrax.collision_fit_tolerance"],
             adiabatic_ev=v["lorrax.collision_adiabatic_ev"],
             fit_height_ev=v["lorrax.collision_fit_height_ev"],

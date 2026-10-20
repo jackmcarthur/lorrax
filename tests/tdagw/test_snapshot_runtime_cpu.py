@@ -77,7 +77,8 @@ def test_active_pair_rotation_matches_rotated_orbitals():
     np.testing.assert_allclose(rotated, expected, rtol=2e-11, atol=2e-11)
 
 
-def test_evaluator_forwards_explicit_screening_capacities(monkeypatch):
+@pytest.mark.parametrize("real_axis_fit", [False, True])
+def test_evaluator_forwards_explicit_screening_capacities(monkeypatch, real_axis_fit):
     from tdagw import snapshot_runtime as runtime
     _, mesh, _, _ = _source()
     nk, nb = 4, 4
@@ -95,13 +96,20 @@ def test_evaluator_forwards_explicit_screening_capacities(monkeypatch):
     monkeypatch.setattr(runtime.SS, "make_projected_sampler", lambda *args, **kwargs: None)
     monkeypatch.setattr(runtime.SS, "screen_snapshot", screen)
     evaluate, _ = runtime.make_snapshot_evaluator(prepared, dict(b_lo=1, n_active=2,
-        max_projection_order=800, max_pencil_bytes=256 * 1024 ** 2))
+        max_projection_order=800, max_pencil_bytes=256 * 1024 ** 2,
+        real_axis_fit=real_axis_fit))
     basis = dict(U=np.tile(np.eye(2), (nk, 1, 1)), e=energy[:, 1:3],
                  rho=np.tile(np.diag([1.0, 0.0]), (nk, 1, 1)))
     with pytest.raises(RuntimeError, match="screening capacities checked"):
         evaluate(basis, equilibrium=True)
     assert captured["max_projection_order"] == 800
     assert captured["max_pencil_bytes"] == 256 * 1024 ** 2
+    if real_axis_fit:
+        fit_sites, check_sites = runtime.snapshot_supports(energy, {})
+        np.testing.assert_array_equal(captured["real_fit_sites"], fit_sites.real)
+        assert np.intersect1d(captured["real_fit_sites"], check_sites.real).size == 0
+    else:
+        assert captured["real_fit_sites"] is None
 
 
 @pytest.mark.parametrize("location", ["V_q", "screening_inputs"])

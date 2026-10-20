@@ -215,6 +215,7 @@ collision_pole_order = 48
 collision_projection_order = 400
 collision_pencil_mb = 128
 collision_fit_samples = 192
+collision_fit_real_axis = false
 collision_fit_tolerance = 0.02
 collision_adiabatic_ev = 0.05
 collision_fit_height_ev = 0.15
@@ -240,6 +241,18 @@ order before projection. Dense projection cost grows cubically with state
 count; pencil factorization and copies require approximately eight times the
 per-pencil storage. These controls raise capacity only: the independent
 response and noise checks keep the same tolerances.
+
+If upper-half-plane fits poorly resolve boundary noise, optionally set
+`collision_fit_real_axis = true`. This also samples the exact bubble at the
+real parts of the complex training supports and includes those values in
+the same joint fit. The declared positive `collision_adiabatic_ev` makes
+these boundary samples finite; it is not replaced by a tiny fit offset.
+The real training grid must be disjoint from the real dressed-noise check
+grid, so those check values remain independent and all acceptance gates
+are unchanged. This doubles training supports (roughly quadrupling pencil
+storage), adds sampling cost, and may require explicit capacity increases.
+It is finite rational fitting, not real-frequency integration or a claim
+of converged dynamics.
 
 The joint snapshot's stability gate probes its installed coherent Hamiltonian.
 It follows paired field-free trajectories, so a physical HF quench is not
