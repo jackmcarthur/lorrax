@@ -209,6 +209,11 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         the split routines' order; V is not held a second time (its batch copy
         would double the largest resident of the photon bank).
         Neither routine Hermitizes its inputs or outputs.
+        The charge-only diagnostic ``dyson.dielectric(H,chi_raw)`` returns
+        the SAME native ``epsilon=I-pref*H chi_raw H`` and its checked LU
+        inverse, without fitting poles or adding an electronic eta.
+        ``dyson.dielectric_matrix(H,chi_raw)`` returns epsilon without a
+        solve, allowing a durable norm witness before a possibly singular LU.
     """
     from .gw_config import linalg_resolution
     from .w_isdf import _w_solve_pref_scalar
@@ -241,6 +246,62 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         algebra["moment_convention"] = "M_k=C_(k+1)/2 about W_infinity"
         algebra["units"].update(M0="Ry^2", M2="Ry^4", constant="Ry")
     return dyson, slope, moments, algebra
+
+
+def dielectric_inverse_bounds(epsilon_fro, inverse_fro, residual_fro, dimension, *, padding_defect=0.):
+    """Bound sigma_min(epsilon) from a verified approximate inverse.
+
+    All quantities are dimensionless, on the logical physical block (not
+    identity padding). If r bounds ||epsilon B-I||_2 and r<1, then
+    (1-r)/||B||_F <= sigma_min <= sqrt(n)*(1+r)/||B||_F.
+    An explicit FP64 product/norm allowance augments the measured Frobenius
+    residual; this is not a quadrature-error or physical-pole certificate.
+    """
+    n=int(dimension)
+    if (n<1 or not np.isfinite([epsilon_fro,inverse_fro,residual_fro]).all()
+            or min(epsilon_fro,inverse_fro)<=0 or residual_fro<0):
+        return dict(resolved=False,reason='nonfinite or invalid inverse metrics')
+    relative=64*n*np.finfo(float).eps
+    rounding=relative*(epsilon_fro*inverse_fro+np.sqrt(n))
+    r=float(residual_fro+rounding)
+    receipt=dict(resolved=r<1,residual_spectral_upper_bound=r,
+        residual_roundoff_allowance=float(rounding),dimension=n,
+        padding_defect=float(padding_defect),
+        scope='computed logical dielectric; inverse-residual algebraic bounds, not physical pole certification')
+    if not np.isfinite(padding_defect) or padding_defect>relative:
+        return dict(receipt,resolved=False,reason='padding is not decoupled identity')
+    if r>=1 or relative>=1:
+        return dict(receipt,reason='inverse residual does not resolve invertibility')
+    lower=float((1-r)/(inverse_fro*(1+relative)))
+    upper=float(np.sqrt(n)*(1+r)/(inverse_fro*(1-relative)))
+    return dict(receipt,sigma_min_lower=lower,sigma_min_upper=upper,
+        condition_two_lower=float(max(1.,epsilon_fro*(1-relative)/(np.sqrt(n)*upper))),
+        condition_two_upper=float(epsilon_fro*(1+relative)/lower))
+
+
+def dielectric_physical_metrics(epsilon, active_mask, *, matmul, inverse=None):
+    """Distributed logical-block norms; only scalars may leave the device.
+
+    ``epsilon/inverse[b,mu,nu]`` use native XY faces. The centroid owner's
+    ``active_mask[mu]`` distinguishes physical ports from identity padding.
+    Never remove physical Coulomb-null directions: their dielectric is I.
+    """
+    mask=jnp.asarray(active_mask,bool)
+    if epsilon.ndim!=3 or epsilon.shape[0]!=1 or mask.shape!=(epsilon.shape[-1],):
+        raise ValueError('GATE dielectric_diagnostic: one square native matrix and its physical port mask required')
+    outer=mask[:,None]&mask[None,:]
+    identity=jnp.eye(epsilon.shape[-1],dtype=epsilon.dtype)
+    physical=epsilon*outer[None]
+    norm=jnp.linalg.norm(physical)
+    pad=jnp.linalg.norm(epsilon-physical-identity[None]*(~mask)[None,:,None])
+    result=dict(epsilon_fro=norm,padding_defect=pad/jnp.maximum(jnp.linalg.norm(epsilon),1.))
+    if inverse is not None:
+        b=inverse*outer[None]
+        residual=matmul(physical,b)-identity[None]*mask[None,:,None]
+        inverse_pad=jnp.linalg.norm(inverse-b-identity[None]*(~mask)[None,:,None])
+        result.update(inverse_fro=jnp.linalg.norm(b),inverse_residual_fro=jnp.linalg.norm(residual),
+            inverse_padding_defect=inverse_pad/jnp.maximum(jnp.linalg.norm(inverse),1.))
+    return result
 
 
 def _dyson_room(meta, mesh_xy, n):
@@ -346,6 +407,14 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def congruence(h, a):
         return mm(mm(h, a), h)
 
+    def dielectric_polarization(h,chi_raw):
+        return pref*congruence(h,chi_raw)
+
+    def dielectric_matrix(h,chi_raw):
+        x=dielectric_polarization(h,chi_raw)
+        identity=jnp.broadcast_to(jnp.eye(n,dtype=h.dtype),x.shape)
+        return identity-x
+
     def derivative(w, dchi_raw):
         # Full W on BOTH sides; no adjoint at complex frequency.
         return mm(mm(w, pref * dchi_raw), w)
@@ -357,13 +426,18 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             # Wc = H X (I-X)^-1 H = H (I-X)^-1 X H: X is the right-hand side the LU
             # overwrites, so no identity right-hand side is held and no product follows it
             # (not H ((I-X)^-1 - I) H: that cancels to eps/||X|| as X -> 0).
-            x = pref * congruence(h, chi_raw)
+            x = dielectric_polarization(h, chi_raw)
             identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
             return congruence(h, solve(identity - x, x))
 
         def pair(h, chi_raw, dchi_raw):
             value = wc(h, chi_raw)
             return value, derivative(value + mm(h, h), dchi_raw)
+
+        def dielectric(h,chi_raw):
+            epsilon=dielectric_matrix(h,chi_raw)
+            identity=jnp.broadcast_to(jnp.eye(n,dtype=h.dtype),epsilon.shape)
+            return epsilon,solve(epsilon,identity.copy())
 
         if volume is None:
             # Local: one sample's value and slope in one program, the roots H laid out
@@ -372,7 +446,9 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             # same products): dχ/ds is not live beside the value's LU and first GEMMs.
             # The χ rows are donated (fresh rows of the carry).
             resident = (0,) if backend == "off" else ()
-            out = {"value": (wc, 2, 1, (), "face", (1,))}
+            out = {"value": (wc, 2, 1, (), "face", (1,)),
+                   "dielectric": (dielectric, 2, 2, (), "face", ()),
+                   "dielectric_matrix": (dielectric_matrix, 2, 1, (), "face", ())}
             for layout in (("face", "batch") if backend == "off" else ()):
                 out["pair:" + layout] = (pair, 3, 2, resident, layout, (1, 2))
             return out
@@ -438,6 +514,8 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
         pairs = {k.split(":", 1)[1]: v for k, v in progs.items() if k.startswith("pair:")}
         resident = backend == "off" and volume is None
         dyson = SimpleNamespace(value=progs["value"], pair=pairs.get,
+                                dielectric=progs.get('dielectric'),
+                                dielectric_matrix=progs.get('dielectric_matrix'),
                                 place=(lambda h: batch_layout(h, mesh_xy)) if resident else (lambda h: h))
         return dyson, progs.get("moments", moments), lu
 
