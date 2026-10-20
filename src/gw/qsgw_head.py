@@ -2067,7 +2067,9 @@ def _head_wing_kernel_face(
             P(),
             P(),
             P(),
-        ) + ((P(None, None, None), P(None, None)) if include_surface else ())
+        # Metal split: diag velocity (3, nk, nb_full) and Q (3, 3), replicated
+        # like the energies (N_b-class, 24 nk nb_full B; no mu axis).
+        ) + ((P(), P()) if include_surface else ())
           + ((P(None, None), P(None, None)) if classes else ()),
         out_specs=((P(None, None, "x"), P(None, "y", None)) if not classes
                    else (P(None, None, None, "x"), P(None, None, "y", None))),
