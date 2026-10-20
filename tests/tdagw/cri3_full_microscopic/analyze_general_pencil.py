@@ -151,7 +151,7 @@ def gram_transfer_summary(model, gc, gb, sites, *, probe_sites=None, mixed=None,
 
 
 def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
-            max_workspace_bytes=1024**3, probe_sites=None, record=None):
+            max_workspace_bytes=1024**3, probe_sites=None, basis='union', record=None):
     from gw.shared_pole_constructor import reduce_general_pencil
     started=time.perf_counter();path=Path(path)
     digest=hashlib.sha256(path.read_bytes()).hexdigest()
@@ -170,6 +170,8 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
         raise ValueError(f'Bounded analysis refuses estimated {price} > {max_workspace_bytes} bytes')
     if max_order<1 or any(not 0<t<1 for t in tolerances):
         raise ValueError('Explicit positive order and numerical tolerances in (0,1) required')
+    if basis not in ('union','descriptor'):
+        raise ValueError('Diagnostic basis must be union or descriptor')
     if ('B' in optional)!=('C' in optional):
         raise ValueError('B,C must be supplied together; no partial physical-transfer claims')
     actions='B' in optional
@@ -202,11 +204,19 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
     if scale==0:
         raise ValueError('Zero descriptor has no rank/growth issue to diagnose')
     svd_start=time.perf_counter()
-    y,sy,_=la.svd(np.concatenate((e,a),axis=1)/scale,full_matrices=False,check_finite=False)
-    _,sx,xh=la.svd(np.concatenate((e,a),axis=0)/scale,full_matrices=False,check_finite=False)
-    se=la.svdvals(e,check_finite=False)
+    if basis=='descriptor':
+        y,se,xh=la.svd(e,full_matrices=False,check_finite=False)
+        sy=sx=se
+    else:
+        y,sy,_=la.svd(np.concatenate((e,a),axis=1)/scale,full_matrices=False,check_finite=False)
+        _,sx,xh=la.svd(np.concatenate((e,a),axis=0)/scale,full_matrices=False,check_finite=False)
+        se=la.svdvals(e,check_finite=False)
+    reducer_path=Path(reduce_general_pencil.__code__.co_filename).resolve()
     report=dict(scope='DIAGNOSTIC numerical-rank study; not an accepted physical model or evidence of physical gain',
         input=str(path.resolve()),input_sha256=digest,input_keys=keys,shape=e.shape,
+        basis=basis,basis_method='two-sided SVD(E)' if basis=='descriptor' else 'two-sided horizontal/vertical union SVD(E,A)',
+        analysis_helper_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        production_reducer_file=str(reducer_path),production_reducer_sha256=hashlib.sha256(reducer_path.read_bytes()).hexdigest(),
         max_order=max_order,max_workspace_bytes=max_workspace_bytes,estimated_workspace_bytes=price,
         transfer_scope='RAW UNSYMMETRIZED full-port norms via frequency-only GC/GB' if grams else
             'captured SMALL physical actions' if actions else
@@ -214,7 +224,8 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
         bank_scope='All reconstructed maps describe RAW C(zE-A)^-1B. GC/GB cannot recover crossing-mirror interference. Final self-negative bank sample/moment errors require the separate producer JSON.',
         norms=dict(E_frobenius=np.linalg.norm(e),A_frobenius=np.linalg.norm(a),common_scale=scale),
         descriptor_singular_values=spectrum_summary(se),
-        left_union_singular_values=spectrum_summary(sy),right_union_singular_values=spectrum_summary(sx),
+        left_union_singular_values=spectrum_summary(sy) if basis=='union' else None,
+        right_union_singular_values=spectrum_summary(sx) if basis=='union' else None,
         union_and_descriptor_svd_seconds=time.perf_counter()-svd_start,
         versions=dict(numpy=np.__version__,scipy=scipy.__version__),
         thread_environment={k:os.environ.get(k) for k in ('OPENBLAS_NUM_THREADS','OMP_NUM_THREADS','MKL_NUM_THREADS')},
@@ -245,9 +256,12 @@ def analyze(path, *, max_order, tolerances=(1e-8,1e-9,1e-10,1e-11),
                 c1=optional.get('C1'),c2=optional.get('C2'))
             row.update(status='reduced-for-diagnostic-only',receipt=model['receipt'],transfer=summary)
             if grams:
-                row['physical_transfer']=gram_transfer_summary(model,optional['GC'],optional['GB'],sites,
-                    probe_sites=optional.get('probe_sites_ry'),mixed=optional.get('probe_mixed_J'),
-                    exact_sq=optional.get('probe_exact_norm_sq'))
+                try:
+                    row['physical_transfer']=gram_transfer_summary(model,optional['GC'],optional['GB'],sites,
+                        probe_sites=optional.get('probe_sites_ry'),mixed=optional.get('probe_mixed_J'),
+                        exact_sq=optional.get('probe_exact_norm_sq'))
+                except (ValueError,la.LinAlgError) as exc:
+                    row['physical_transfer']=dict(status='unresolved_metric',error=str(exc))
             if baseline is None:baseline=values
             else:row['absolute_transfer_change_from_first_tolerance']=np.linalg.norm(values-baseline,axis=(1,2))
         except (ValueError,la.LinAlgError) as exc:
@@ -276,12 +290,13 @@ def main():
     parser.add_argument('--output',required=True,type=Path)
     parser.add_argument('--max-order',required=True,type=int)
     parser.add_argument('--tolerances',default='1e-8,1e-9,1e-10,1e-11')
+    parser.add_argument('--basis',choices=('union','descriptor'),default='union')
     parser.add_argument('--max-workspace-gib',type=float,default=1.)
     args=parser.parse_args()
     args.output.parent.mkdir(parents=True,exist_ok=True)
     with args.output.open('x') as handle:
         json.dump(dict(status='RUNNING_DIAGNOSTIC_NOT_ADMITTED',phase='before_input_and_svd',
-                       input=str(args.input)),handle,indent=2)
+                       input=str(args.input),basis=args.basis),handle,indent=2)
         handle.write('\n')
     def record(report):
         # This invocation created the destination exclusively above. Keep
@@ -294,7 +309,7 @@ def main():
         os.replace(temporary,args.output)
     report=analyze(args.input,max_order=args.max_order,
         tolerances=tuple(map(float,args.tolerances.split(','))),
-        max_workspace_bytes=int(args.max_workspace_gib*1024**3),record=record)
+        max_workspace_bytes=int(args.max_workspace_gib*1024**3),basis=args.basis,record=record)
     print(json.dumps(dict(output=str(args.output),seconds=report['analysis_seconds'],
         studies=[dict(tolerance=r['rank_tolerance'],order=r['selected_order'],status=r['status']) for r in report['studies']]),indent=2))
 
