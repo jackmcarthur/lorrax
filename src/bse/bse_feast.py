@@ -31,7 +31,7 @@ from .bse_ring_comm import (build_bse_ring_matvec_full,
                             create_mesh_xy_from_flags, make_bse_shardings)
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
-from .bse_head import head_shifted_eps_c
+from .bse_head import head_shifted_eps_c, q0_head_keys
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_davidson_helpers import build_bse_exact_diagonal
 import common.timing as timing
@@ -689,7 +689,7 @@ def _build_gmres_data_fp32(data: dict) -> dict:
         "M": _cast_with_sharding(data["M"], jnp.complex64),  # hoisted V-term pair amplitude (P3)
         "eps_c": _cast_with_sharding(data["eps_c"], jnp.float32),
         "eps_v": _cast_with_sharding(data["eps_v"], jnp.float32),
-        "q0_head_ry": data.get("q0_head_ry", 0.0),
+        **q0_head_keys(data),              # both or neither (bse_head)
         "V_q0": _cast_with_sharding(data["V_q0"], jnp.complex64),
         "W_q": _cast_with_sharding(data["W_q"], jnp.complex64),
     }

@@ -198,6 +198,17 @@ def q0_head_diagonal(whead, cell_volume: float, nk: int) -> float:
     return float(complex(whead).real) / (float(cell_volume) * int(nk))
 
 
+def q0_head_keys(data) -> dict:
+    """The bundle's q=0 head pair ``{q0_head, q0_head_ry}``, for any copy.
+
+    A derived bundle (a dtype cast, a subset) must carry BOTH keys or neither:
+    the scalar without its mode reads as a rank-1 bundle and
+    :func:`head_shifted_eps_c` refuses it.  Spread this into the copy.
+    """
+    return {"q0_head": data.get("q0_head", "rank1"),
+            "q0_head_ry": data.get("q0_head_ry", 0.0)}
+
+
 def head_shifted_eps_c(eps_c, data):
     """Conduction diagonal of the BSE operator, ``eps_c - Delta_0``.
 
