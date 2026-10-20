@@ -89,8 +89,12 @@ def run_pre_sigma_probe(source, *, out):
     records, first = [], None
     for repeat in range(2):
         started = time.perf_counter()
+        current_meta = fresh_shared_pole_capacity(meta, mesh)
+        # Price this sweep beside the ACTUAL live750 carrier, V and W.
+        # A fresh ledger alone has no allocator baseline/room witness.
+        current_meta.shared_pole_capacity.at_phase()
         result = compute_sigma_c_mpa_omega_grid(source["wfns"], model["path"],
-            fresh_shared_pole_capacity(meta, mesh), mesh,
+            current_meta, mesh,
             fixed_quadrature_session=session, **common)
         device_pair = result.sigma_c_kij.pair
         jax.block_until_ready(device_pair)

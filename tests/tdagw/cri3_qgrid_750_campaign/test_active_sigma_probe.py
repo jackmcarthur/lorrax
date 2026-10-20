@@ -61,6 +61,13 @@ def test_dispatch_has_compact_destinations_and_no_hidden_fullprefix_or_optical_s
     projection = next(k.value for k in arguments.keywords if k.arg == "projection_bands")
     assert ast.literal_eval(projection) == (100, 144)
     run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_pre_sigma_probe")
+    loop = next(n for n in ast.walk(run) if isinstance(n, ast.For)
+                and isinstance(n.target, ast.Name) and n.target.id == "repeat")
+    phase = next(n for n in ast.walk(loop) if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute) and n.func.attr == "at_phase")
+    compute = next(n for n in ast.walk(loop) if isinstance(n, ast.Call)
+                   and isinstance(n.func, ast.Name) and n.func.id == "compute_sigma_c_mpa_omega_grid")
+    assert phase.lineno < compute.lineno
     assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                    and n.func.attr in ("run_bse_probe", "gw_iteration_map", "run_propagation")
                    for n in ast.walk(run))
