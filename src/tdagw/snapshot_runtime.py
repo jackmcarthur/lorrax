@@ -337,7 +337,12 @@ def prepare_native_source(source, mesh):
     rows = carrier.plan
     frac = np.asarray(rows.k_parent_frac, float)
     from gw.centroid_k_unfold import authenticate_canonical_full_grid
-    qsym = source.get("screening_inputs", {}).get("kwargs", {}).get("sym", getattr(rows, "sym", None))
+    # Match screen_general_shared_poles' effective response view: its caller
+    # may legitimately supply the electronic symmetry table, while meta.q_sym
+    # owns the separate bosonic domain. Never authenticate that fine table as
+    # coarse q rows, or change the electronic carrier's independent witness.
+    qsym = getattr(meta, "q_sym", source.get("screening_inputs", {}).get("kwargs", {}).get(
+        "sym", getattr(rows, "sym", None)))
     # A separate bosonic q view must not be mistaken for the electronic
     # carrier's symmetry table. Authenticate both physical domains below.
     flat_grid = authenticate_canonical_full_grid(

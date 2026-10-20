@@ -245,6 +245,17 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
                 and np.array_equal(gather(current.occ), arrays["occupation_padded"])):
             raise ValueError("native rotation did not preserve the exact frozen E/f")
         captured["rotation_authenticated"] = True
+        # Exercise the ACTUAL TD source boundary before the expensive W bank.
+        # The electronic sym table and meta.q_sym are independently owned;
+        # do not replace either with the other's physical coordinate domain.
+        from tdagw.snapshot_runtime import prepare_native_source
+        prepared = prepare_native_source(source_record(current, {}), inputs.mesh_xy)
+        publish(directory.name+"_source_preflight.json", record=dict(
+            status="NATIVE_SOURCE_METADATA_PREFLIGHT_PASS", input_frame=frame["frame"],
+            electronic_kgrid=list(prepared["kgrid"]), response_qgrid=list(prepared["qgrid"]),
+            electronic_k_count=prepared["nk"], response_q_count=prepared["nq"],
+            logical_bands=prepared["nb"], padded_bands=prepared["nb_padded"],
+            flat_grid=prepared["flat_grid"], no_W_or_Sigma_admission_claim=True))
         return current
 
     def source_record(current, roles):
