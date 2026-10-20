@@ -719,8 +719,9 @@ def inactive_keys(deck) -> dict:
          and v["lorrax.collision_screening"] not in ("shared_pole", "joint", "joint_frozen"),
          "shared-pole screening only"),
         (("lorrax.collision_spm_chi0_active",),
-         v["lorrax.collision"] != "off" and v["lorrax.collision_screening"] != "shared_pole",
-         "legacy population-only shared_pole adapter only; native joint retains full rho"),
+         v["lorrax.collision"] != "off"
+         and v["lorrax.collision_screening"] not in ("shared_pole", "joint", "joint_frozen"),
+         "shared-pole response partition only"),
         (("lorrax.collision_density_rank", "lorrax.collision_pole_order",
           "lorrax.collision_projection_order", "lorrax.collision_pencil_mb",
           "lorrax.collision_fit_samples", "lorrax.collision_fit_real_axis",
@@ -1154,7 +1155,8 @@ TD_KEY_DOCS = {
         "otherwise. The refresh lines add the rebase wall.",
         ("td_collision",)),
     "lorrax.collision_spm_support_sites_ev": (
-        "= the production ladder", "With `collision_screening = shared_pole`: the refits' "
+        "= the production ladder", "With `collision_screening = shared_pole`, `joint` or "
+        "`joint_frozen`: the refits' "
         "support set, `'<line eV list> | <imaginary eV list> [| <line height eV>]'` "
         "(`sigma_w_support_sites_ev` of the GW deck, with an optional line height), "
         "replacing the production ladder re-resolved at every state; the equilibrium "
@@ -1273,13 +1275,18 @@ TD_KEY_DOCS = {
         "([td_agw_dynamical.md §1.5, Eq. 8c](theory/td_agw_dynamical.md)).",
         ("td_collision",)),
     "lorrax.collision_spm_chi0_active": (
-        "= one rule on every pair", "With `collision_screening = shared_pole`: `auto` or `[a0, a1]`, "
+        "= legacy one-rule; native auto", "With `collision_screening = shared_pole`, `joint` "
+        "or `joint_frozen`: `auto` or `[a0, a1]`, "
         "the active bands A of the refits' chi0 (0-based on the W carrier's band axis, "
         "half-open), extended to the smallest isolated band group (positive gaps below and "
         "above) containing it and the window; `auto` starts from the window. chi0 is then "
-        "four (hole × electron) blocks FF, FA, AF, AA, F the other bands at their 0/1 step: "
-        "only AA crosses zero, each block's rule comes from band energies and is built at "
-        "the first refit and held for the run. Refused only if no isolated group exists.",
+        "four (hole × electron) blocks FF, FA, AF, AA, F the other bands at their 0/1 step. "
+        "On native joint modes this is only a numerical response partition: all supplied "
+        "bands and full propagated-window coherences remain; additional A bands keep "
+        "their exact frozen 0/1 density. Unset selects native `auto`; current energies "
+        "determine each block's quadrature. On the historical population refit only AA "
+        "crosses zero and rules are built at the first refit and held. Refused only if "
+        "no isolated group exists.",
         ("td_collision",)),
     "lorrax.collision_frozen_bands": (
         "= every frozen band", "With `collision_screening = refreshed` or `shared_pole` and "
