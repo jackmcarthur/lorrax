@@ -1358,17 +1358,19 @@ def _gamma_only_grid(kgrid, value):
     return S
 
 
-def _head_gauge(wfn, centroids_path, keep_idx, n_rmu, restart_file, log):
-    """``attach_head_channel``'s gauge keywords: the W tile's centroid positions and the lattice.
+def _w_tile_gauge(wfn, centroids_path, keep_idx, n_rmu, restart_file, log):
+    """``(r_mu, geometry)`` of the W tile, built once per ``--w-coarse-grid`` run.
 
-    The positions are the rows ``w_pair_embedding`` embeds (``bse_densify.w_tile_centroid_frac``),
-    so the head's phase ``e^{−2πi q·r_μ}`` and the body's per-pair images sit on one μ axis.
+    ``r_mu`` is ``bse_densify.w_tile_centroid_frac`` (the centroid file read and its receipt
+    checked once); the body embedding and both head attachments take it, so the head's phase
+    ``e^{−2πi q·r_μ}`` and the body's per-pair images sit on one μ axis.  ``geometry`` is the one
+    ``CoulombGeometry`` that ``S_fine`` is built on and whose ``bvec`` the attachments get.
     """
     from vcoul import CoulombGeometry
     from .bse_densify import w_tile_centroid_frac
-    return dict(centroid_frac=w_tile_centroid_frac(wfn, centroids_path, keep_idx, int(n_rmu),
-                                                   restart_file=restart_file, log_fn=log),
-                bvec=CoulombGeometry.from_wfn(wfn).bvec)
+    return (w_tile_centroid_frac(wfn, centroids_path, keep_idx, int(n_rmu),
+                                 restart_file=restart_file, log_fn=log),
+            CoulombGeometry.from_wfn(wfn))
 
 
 def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print):
@@ -2194,7 +2196,8 @@ def main(argv=None):
                 w_head_mode = resolve_w_head_densify(
                     args.w_head_densify, params, modes=("c1",))
                 W_q_fine_in, data["W_q"] = data["W_q"], None   # consumed: attach_head_channel donates it
-                head_ch = None
+                head_ch, (r_mu, geom) = None, _w_tile_gauge(
+                    wfn, centroids_path, keep_idx, n_rmu, restart_file, log)
                 if w_head_mode == "c1":
                     head_ch = _resolve_native_w_head(
                         restart_file, args.input, wfn, log=log)
@@ -2202,16 +2205,13 @@ def main(argv=None):
                     W_q_fine_in = attach_head_channel(
                         W_q_fine_in, data["g0_X"], data["g0_Y"],
                         _gamma_only_grid((nkx, nky, nkz), -head_ch["whead"]),
-                        head_ch["cell_volume"], **_head_gauge(
-                            wfn, centroids_path, keep_idx, n_rmu, restart_file, log))
+                        head_ch["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
                 W_q_coarse = decimate_W_q_to_subgrid(W_q_fine_in, cg)
                 densify_W = make_w_densifier(
                     mesh_xy, sh.W.spec, (nkx, nky, nkz),
                     output="k" if head_ch else "R",
                     embedding=w_pair_embedding(
-                        cg, wfn, centroids_path, keep_idx, int(n_rmu),
-                        int(W_q_coarse.shape[0]), meta.sys_dim,
-                        restart_file=restart_file, log_fn=log))
+                        cg, wfn, r_mu, int(W_q_coarse.shape[0]), meta.sys_dim))
                 W_dense = densify_W(W_q_coarse)
                 if head_ch is not None:
                     S_fine = build_w_head_channel(
@@ -2225,12 +2225,11 @@ def main(argv=None):
                         # would silently rescale the head by ~m².
                         ref_grid=(nkx, nky, nkz),
                         input_file=args.input, restart_file=restart_file,
-                        mesh=mesh_xy,
+                        geometry=geom, mesh=mesh_xy,
                         gamma_cell=args.w_head_gamma_cell, log_fn=log)
                     W_dense = attach_head_channel(
                         W_dense, data["g0_X"], data["g0_Y"], S_fine,
-                        head_ch["cell_volume"], **_head_gauge(
-                            wfn, centroids_path, keep_idx, n_rmu, restart_file, log))
+                        head_ch["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
                     W_R = _ifftn(W_dense)
                 else:
                     W_R = W_dense

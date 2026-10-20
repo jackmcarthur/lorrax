@@ -18,10 +18,19 @@ first shell; the body is covariant to 2 × 10⁻⁸).
 
 - **Results.** c1 runs densified across grids move at the fine q of the coarse
   Γ cell other than Γ: `bse_k_grid` with a fine grid other than the coarse one
-  and `exciton_bands --w-coarse-grid`. `srlr` (head at Γ only), `fine == coarse`
-  and undensified runs are unchanged bit for bit. No deck change is needed.
+  and `exciton_bands --w-coarse-grid`. `srlr`'s long-range model rows
+  (`_srlr_terms`) now take their Bloch phase on the same `idx/N` positions
+  instead of the centroid file's six-digit text (at most 3.3 × 10⁻⁷ in
+  fractional units on the shipped Si table), so `srlr` tiles move at that
+  rounding level. `fine == coarse` and undensified runs are unchanged bit for
+  bit. No deck change is needed.
 - **API.** `attach_head_channel(..., *, centroid_frac, bvec)`: both keywords are
-  required.
+  required. A run reads and receipt-checks the tile positions once
+  (`w_tile_centroid_frac`) and passes them on:
+  `w_pair_embedding(coarse_grid, wfn, centroid_frac, n_mu_carrier, sys_dim)`
+  takes the positions instead of the centroid file, and `_srlr_terms` takes
+  `centroid_frac=`. `build_w_head_channel(..., geometry=)` takes the
+  `CoulombGeometry` whose `bvec` the caller passes to the attach.
 
 ## 2026-10-20 — BerkeleyGW exports: `epsmat_ecut` and the finite-Q `bsemat`
 

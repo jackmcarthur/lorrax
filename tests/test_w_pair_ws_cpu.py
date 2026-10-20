@@ -14,8 +14,9 @@ coarse q:
   control variants break it: the fftfreq box with the Nyquist split (the
   previous embedding) and one Wigner–Seitz set shared by every pair.
 
-``bse_densify.w_pair_embedding`` builds the table from the centroid file and
-refuses one that is not the restart tile's μ axis (temporary files).
+``bse_densify.w_tile_centroid_frac`` reads the tile's μ positions from the
+centroid file and refuses one that is not the restart tile's μ axis, and
+``bse_densify.w_pair_embedding`` builds the table on them (temporary files).
 """
 import numpy as np
 import pytest
@@ -115,7 +116,7 @@ def test_relabelling_covariance(cg, fg, lat, dim):
 
 
 def test_w_pair_embedding_receipt_rows_and_pads(tmp_path):
-    """``w_pair_embedding`` on a temporary restart and centroid table.
+    """``w_tile_centroid_frac`` + ``w_pair_embedding`` on a temporary restart and centroid table.
 
     The table's ordered ``keep_idx`` rows are the tile's μ axis, carrier pad
     rows sit at the first centroid, and the densifier refuses a table whose
@@ -124,7 +125,7 @@ def test_w_pair_embedding_receipt_rows_and_pads(tmp_path):
     """
     h5py = pytest.importorskip("h5py")
     from types import SimpleNamespace
-    from bse.bse_densify import w_pair_embedding
+    from bse.bse_densify import w_pair_embedding, w_tile_centroid_frac
     from common.ws_images import lattice_bohr
     from file_io.wfn_basis import centroid_table_md5
 
@@ -149,24 +150,24 @@ def test_w_pair_embedding_receipt_rows_and_pads(tmp_path):
         return pair_ws_images(cg, lattice_bohr(wfn), rows / grid, 3,
                               n_carrier=n_car)["pos"]
 
-    tab = w_pair_embedding(cg, wfn, str(table), None, 8, 10, 3,
-                           restart_file=restart(idx))
+    tab = w_pair_embedding(cg, wfn, w_tile_centroid_frac(
+        wfn, str(table), None, 8, restart_file=restart(idx)), 10, 3)
     assert tab["n_logical"] == 8
     np.testing.assert_array_equal(tab["pos"], ref(idx, 10))
     np.testing.assert_array_equal(tab["pos"][8:], tab["pos"][[0, 0]])
 
-    tab = w_pair_embedding(cg, wfn, str(table), keep, 3, 4, 3,
-                           restart_file=restart(idx[keep]))
+    tab = w_pair_embedding(cg, wfn, w_tile_centroid_frac(
+        wfn, str(table), keep, 3, restart_file=restart(idx[keep])), 4, 3)
     np.testing.assert_array_equal(tab["pos"], ref(idx[keep], 4))
 
     with pytest.raises(ValueError, match="GATE w_pair_centroids"):
-        w_pair_embedding(cg, wfn, str(table), keep, 3, 4, 3,
-                         restart_file=restart(idx[[1, 5, 6]]))
+        w_tile_centroid_frac(wfn, str(table), keep, 3,
+                             restart_file=restart(idx[[1, 5, 6]]))
     with pytest.raises(ValueError, match="GATE w_pair_centroids"):
-        w_pair_embedding(cg, wfn, str(table), None, 7, 10, 3,
-                         restart_file=restart(idx))
+        w_tile_centroid_frac(wfn, str(table), None, 7,
+                             restart_file=restart(idx))
 
     lines = []
-    w_pair_embedding(cg, wfn, str(table), None, 8, 8, 3,
-                     restart_file=restart(), log_fn=lines.append)
+    w_tile_centroid_frac(wfn, str(table), None, 8, restart_file=restart(),
+                         log_fn=lines.append)
     assert len(lines) == 1 and "centroids_charge_md5" in lines[0]

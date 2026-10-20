@@ -118,8 +118,10 @@ def w_tile_centroid_frac(wfn, centroids_file, keep_idx, n_mu: int, *,
     positioned by them can sit on another run's centroids; a restart without a
     receipt is not checked, and ``log_fn`` says so in one line.  The table must
     have exactly the tile's logical ``n_mu`` rows.  The ONE source of these
-    positions for the W densifier (:func:`w_pair_embedding`) and the c1 head
-    channel's gauge phase (``gw.head_densify.attach_head_channel``).
+    positions for the W densifier (:func:`w_pair_embedding`), the c1 head
+    channel's gauge phase (``gw.head_densify.attach_head_channel``) and the
+    srlr model rows (:func:`_srlr_terms`); a run computes them once and hands
+    the same array to all three.
     """
     import h5py
     from file_io.centroids import load_centroids
@@ -146,25 +148,23 @@ def w_tile_centroid_frac(wfn, centroids_file, keep_idx, n_mu: int, *,
                 f"receipt {receipt}); the W densifier would embed the tile "
                 f"on the wrong positions.")
     else:
-        log_fn(f"  w_pair_embedding: {restart_file} carries no "
+        log_fn(f"  w_tile_centroid_frac: {restart_file} carries no "
                f"centroids_charge_md5 receipt; the centroid rows of "
                f"{centroids_file} are not checked against the W tile.")
     return idx / grid[None, :]
 
 
-def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx, n_mu: int,
-                     n_mu_carrier: int, sys_dim: int, *, restart_file,
-                     log_fn=print) -> dict:
+def w_pair_embedding(coarse_grid, wfn, centroid_frac, n_mu_carrier: int,
+                     sys_dim: int) -> dict:
     """The per-pair Wigner–Seitz table of a W tile's μ axis.
 
-    The positions are :func:`w_tile_centroid_frac` (FFT points ``idx/N`` in
+    ``centroid_frac`` is :func:`w_tile_centroid_frac` (FFT points ``idx/N`` in
     tile order, checked against the restart's ``centroids_charge_md5``
-    receipt).  Carrier pad rows up to ``n_mu_carrier`` take the first
-    centroid's position (their tiles are zero).
+    receipt), computed once per run by the caller.  Carrier pad rows up to
+    ``n_mu_carrier`` take the first centroid's position (their tiles are zero).
     """
-    pos = w_tile_centroid_frac(wfn, centroids_file, keep_idx, n_mu,
-                               restart_file=restart_file, log_fn=log_fn)
-    return pair_ws_images(coarse_grid, lattice_bohr(wfn), pos,
+    return pair_ws_images(coarse_grid, lattice_bohr(wfn),
+                          np.asarray(centroid_frac, dtype=np.float64),
                           int(sys_dim), n_carrier=int(n_mu_carrier))
 
 
@@ -337,7 +337,8 @@ def resolve_w_head_densify(mode, params=None, *, modes=W_HEAD_DENSIFY_MODES) -> 
 
 
 def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
-                         whead, ref_grid, input_file, restart_file, mesh=None,
+                         whead, ref_grid, input_file, restart_file, geometry,
+                         mesh=None,
                          gamma_cell: str = "fine", log_fn=print, static_sample=None):
     """The C1 head channel ``S_fine(q)`` for a coarse→fine W, end to end.
 
@@ -357,8 +358,7 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     Parameters
     ----------
     wfn, sym, meta : loader / symmetry table / system parameters
-        ``wfn`` supplies the Coulomb geometry (``blat·bvec`` rows and Ω) via
-        :meth:`vcoul.CoulombGeometry.from_wfn`; ``meta.sys_dim`` selects the
+        ``meta.sys_dim`` selects the
         bulk-3D or slab-2D ``vcoul`` kernel and is REQUIRED — a Meta without it
         is refused, not assumed bulk (see the body); ``sym`` is read only by the
         ``dipole.h5`` fallback route for ``S_cart`` (a restart that carries
@@ -368,11 +368,17 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     params : dict
         Deck keys.  ``head_minibz_average`` must match the GW run — it selects
         the Baldereschi-Tosatti analytic-sphere branch of the estimator.
+    geometry : vcoul.CoulombGeometry
+        The lattice (``blat·bvec`` rows and Ω) the fine q and ``S_fine`` are
+        evaluated on, ``CoulombGeometry.from_wfn(wfn)``.  The caller builds it
+        once and passes the same object's ``bvec`` to
+        ``gw.head_densify.attach_head_channel``, so the head's q and its gauge
+        phase sit on one lattice.
     coarse_grid, fine_grid, ref_grid : tuple[int, int, int]
     whead : float
         The head scalar the loader injects, Ry·bohr³, real.
     gamma_cell : {"fine", "coarse"}
-        ``"coarse"`` is the red twin; see
+        ``"coarse"`` is the control variant; see
         :func:`gw.head_densify.build_fine_head_scalars`.
 
     Returns
@@ -383,7 +389,6 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
     from gw.head_correction import resolve_head_S_cart
     from ffi import _services
     _services.ensure_on_path()
-    from vcoul import CoulombGeometry
 
     params = params or {}
 
@@ -431,7 +436,7 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
             f"GW so the restart carries S_cart_head, or by putting the run's "
             f"dipole.h5 beside the deck.")
 
-    geom = CoulombGeometry.from_wfn(wfn)
+    geom = geometry
     analytic_sphere = bool(params.get("head_minibz_average", False))
     gamma_ref = head_densify.gamma_cell_head_scalar(
         geom, ref_grid, S_cart, sys_dim=sd,
@@ -500,7 +505,8 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
 
 
 def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
-                fine_grid, n_rmu, n_rmu_pad, mesh_xy, input_file, log_fn=print):
+                fine_grid, n_rmu, n_rmu_pad, mesh_xy, input_file, centroid_frac,
+                log_fn=print):
     """The long-range W terms of ``w_head_densify = srlr``, on the coarse and fine q.
 
     W = J + F̃ᴴ D F̃ exactly at every coarse q (``gw.lr_channels``).  The
@@ -517,6 +523,10 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
     exact (on a mini-BZ-averaged 3D deck up to the coarse→fine change of the
     head's cell average); the model's own error only changes how smooth X is.
 
+    The model's Bloch phase sits on ``centroid_frac``
+    (:func:`w_tile_centroid_frac`, the FFT points the tile is collocated on and
+    the body embedding uses), not on the centroid file's rounded spelling.
+
     Returns ``(A_c, D_c, A_f, D_f)``: per coarse / fine q (flat fft order) the
     rows ``A (n_q, n_L, n_rmu_pad)`` and ``D (n_q, n_L, n_L)`` (window
     included) of the rank-n_L terms Aᴴ D A.  Host numpy, n_L·N_μ per q.
@@ -524,7 +534,6 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
     from ffi import _services
     _services.ensure_on_path()
     from vcoul import CoulombGeometry, inscribed_radius, lr_channels
-    from file_io.centroids import load_centroids
     from file_io.restart_bundle import read_lr_channels
     from gw import lr_channels as LC
     from gw.head_correction import resolve_head_S_cart
@@ -565,8 +574,7 @@ def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
     # ── the model ─────────────────────────────────────────────────────────
     q_ins = inscribed_radius(bvec, sys_dim)
     r_a, r_b = LC.WINDOW_INNER * q_ins, LC.WINDOW_OUTER * q_ins
-    frac = load_centroids(params["centroids_file"], tuple(int(x) for x in wfn.fft_grid))[0]
-    r_mu = np.asarray(frac, dtype=np.float64) @ (2.0 * np.pi * np.linalg.inv(bvec).T)
+    r_mu = np.asarray(centroid_frac, dtype=np.float64) @ (2.0 * np.pi * np.linalg.inv(bvec).T)
     S_cart, _prov = resolve_head_S_cart(
         restart_file, input_file=input_file, wfn=wfn, sym=sym, meta=meta,
         params={**params, "_mesh": mesh_xy}, print_fn=log_fn)
@@ -1582,6 +1590,10 @@ def _interpolate_bse_data_to_grid(
     # at every fine q (``_srlr_terms``).
     srlr = resolve_w_head_densify(None, params) == "srlr"
     W_coarse = data["W_q"]
+    # The tile's μ positions, read and receipt-checked ONCE: the embedding, the
+    # srlr model rows and the c1 head phase all take this array.
+    r_mu = w_tile_centroid_frac(wfn, centroids_path, keep, n_rmu,
+                                restart_file=restart_file, log_fn=log_fn)
     if srlr:
         if keep is not None:
             raise ValueError(
@@ -1590,14 +1602,13 @@ def _interpolate_bse_data_to_grid(
         A_c, D_c, A_f, D_f = _srlr_terms(
             restart_file, wfn, sym, meta, params, coarse_grid=coarse_grid,
             fine_grid=fine_grid, n_rmu=n_rmu, n_rmu_pad=int(W_coarse.shape[0]),
-            mesh_xy=mesh_xy, input_file=input_file, log_fn=log_fn)
+            mesh_xy=mesh_xy, input_file=input_file, centroid_frac=r_mu,
+            log_fn=log_fn)
         W_coarse = _add_rank_lr(W_coarse, A_c, D_c, mesh_xy, -1.0)
     densify_W = make_w_densifier(
         mesh_xy, P("x", "y", None, None, None), fine_grid, output="k",
-        embedding=w_pair_embedding(coarse_grid, wfn, centroids_path, keep,
-                                   n_rmu, int(W_coarse.shape[0]),
-                                   meta.sys_dim, restart_file=restart_file,
-                                   log_fn=log_fn))
+        embedding=w_pair_embedding(coarse_grid, wfn, r_mu,
+                                   int(W_coarse.shape[0]), meta.sys_dim))
     W_q_fine = densify_W(W_coarse)
     del W_coarse
     if srlr:
@@ -1621,25 +1632,23 @@ def _interpolate_bse_data_to_grid(
     # defect, kept only so the A/B has a shipped control.
     if head_channel is not None:
         from gw.head_densify import attach_head_channel
+        from vcoul import CoulombGeometry
+        geom = CoulombGeometry.from_wfn(wfn)
         S_fine = build_w_head_channel(
             wfn, sym, meta, params,
             coarse_grid=coarse_grid, fine_grid=fine_grid,
             whead=head_channel["whead"], ref_grid=coarse_grid,
-            input_file=input_file, restart_file=restart_file, mesh=mesh_xy,
+            input_file=input_file, restart_file=restart_file, geometry=geom,
+            mesh=mesh_xy,
             gamma_cell=head_channel.get("gamma_cell", "fine"), log_fn=log_fn,
             static_sample=head_channel.get("static_sample"))
         if srlr:
             # The model owns the head at every fine q ≠ 0; c1 keeps Γ.
             S_fine = np.where(np.arange(S_fine.size).reshape(S_fine.shape) == 0,
                               S_fine, 0.0)
-        from vcoul import CoulombGeometry
         W_q_fine = attach_head_channel(
             W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
-            head_channel["cell_volume"],
-            centroid_frac=w_tile_centroid_frac(
-                wfn, centroids_path, keep, n_rmu, restart_file=restart_file,
-                log_fn=log_fn),
-            bvec=CoulombGeometry.from_wfn(wfn).bvec)
+            head_channel["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
         log_fn("[bse_k_grid] W Γ head re-attached AFTER densification (C1): "
                "the interpolant saw the body only, and the head is analytic "
                "at every fine q inside the coarse Γ cell.  This also changes "
