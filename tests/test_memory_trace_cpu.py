@@ -38,7 +38,7 @@ def test_trace_records_live_arrays_compiles_and_residuals(tmp_path):
     assert outer["close"]["live"] == face              # b deleted
     born = {(tuple(x["shape"]), x["born"]) for x in inner["peak"]["arrays"]}
     assert {((1024, 1024), "demo.outer"), ((1024, 1024), "demo.inner")} <= born
-    matmul = [c for c in inner["compiles"] if c["output"] == face]
+    matmul = [c for c in inner["runs"] if c["output"] == face]
     assert matmul and all(k in matmul[0] for k in ("temp", "argument", "alias", "code"))
     assert any(c["output"] == face for c in inner["runs"])  # run where compiled: attributed there
     assert inner["priced"]["vendor"] == 1e6
