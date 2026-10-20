@@ -1,7 +1,7 @@
 """ISDF core primitives: ψ + centroids -> ζ interpolation vectors; see docs/architecture/zeta_fit_face_psi_cct.md."""
 import math
 import os
-from functools import partial
+from functools import lru_cache, partial
 
 import numpy as np
 import jax
@@ -1280,13 +1280,17 @@ def _identity_pad_block_diagonal(
     sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     if n_rmu_logical == n_rmu:
         return jax.lax.with_sharding_constraint(M, sharding)
-    # Build a (n_rmu, n_rmu) diagonal matrix whose only non-zeros sit
-    # on positions ``[n_rmu_logical, n_rmu)`` of the diagonal.
-    idx = jnp.arange(n_rmu)
-    pad_diag_mask = (idx >= n_rmu_logical).astype(M.dtype)
-    eye_pad = jnp.diag(pad_diag_mask)
-    M_id_pad = M + eye_pad[None, :, :]
-    return jax.lax.with_sharding_constraint(M_id_pad, sharding)
+    # The pad-block identity [n_rmu_logical, n_rmu) is traced inside one program on M's face:
+    # an eager jnp.diag built the whole (n_rmu, n_rmu) on every process's default device.
+    return _identity_pad_program(sharding, int(n_rmu), int(n_rmu_logical))(M)
+
+
+@lru_cache(maxsize=None)
+def _identity_pad_program(sharding, n_rmu, n_rmu_logical):
+    def add(M):
+        pad = (jnp.arange(n_rmu) >= n_rmu_logical).astype(M.dtype)
+        return M + jnp.diag(pad)[None, :, :]
+    return jax.jit(add, out_shardings=sharding)
 
 
 def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, **_) -> str:
@@ -1490,10 +1494,10 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond), room)
     if key not in _charge_face_cache:
         eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=room)
-        live = np.arange(int(n)) < n_log
-
         @partial(checked_program, mesh=mesh_xy, out_shardings=(face, rep), in_shardings=(face,))
         def _fn(C):
+            # A traced iota mask: the host (n, n) mask was a whole n^2 constant per rank.
+            live = jnp.arange(int(n)) < n_log
             C = jnp.where(live[:, None] & live[None, :], C, 0)
             B, figures = cplus.factor(C, rcond=rcond, rank_log=True, n_log=n_log,
                                       eigh=lambda c: eig.batched(c, cut=rcond))
