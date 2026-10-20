@@ -4368,15 +4368,15 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
     full_ev = np.asarray(_eqp_on_full_bz(sym, eqp_file, None))[:, lo:hi]
     if full_ev.shape[0] != int(sym.nk_tot):
         raise ValueError(
-            f"star_broadcast returned {full_ev.shape[0]} k-points, expected "
-            f"{int(sym.nk_tot)}")
+            f"placing {os.path.basename(eqp_file)} on the full BZ returned "
+            f"{full_ev.shape[0]} k-points, expected {int(sym.nk_tot)}")
 
     # eV on disk (BGW convention); Ry is this module's internal unit.
     return jnp.asarray(full_ev.T / RYD_TO_EV, dtype=jnp.float64)
 
 
-#: Largest spread, over every symmetry star and every band an eqp file
-#: covers, of the QP shift E_QP - E_DFT the BSE applies at the star's
+#: Largest spread, over every symmetry star and every DFT multiplet an eqp
+#: file covers, of the multiplet-mean QP shift E_QP - E_DFT at the star's
 #: members (eV).  A constant, not a deck key: a file above it is not a
 #: star-symmetric QP spectrum.
 EQP_STAR_SPREAD_TOL_EV = 1.0e-3
@@ -4385,31 +4385,44 @@ EQP_STAR_SPREAD_TOL_EV = 1.0e-3
 def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray | None) -> np.ndarray:
     """A BerkeleyGW eqp file's QP energies on the full BZ, ``(nk_tot, nb)`` eV.
 
-    The file is read in one of two forms, decided by its block coordinates:
+    The file is read in one of two forms, decided by its block count:
 
-    - FULL ZONE: a block for every full-BZ k (``sym.unfolded_kpts``), matched
-      by crystal coordinate modulo a reciprocal-lattice vector to 1e-6, the
-      tolerance ``SymMaps`` matches the WFN's own k-points with (the headers
-      are ``%13.9f``).  Every k takes its OWN block, as BerkeleyGW reads the
-      file.  Unfolding such a file from its star representatives instead
-      discarded the other members' blocks (483 of 512 on Si 8³), so the two
-      codes applied different energies whenever the file was not
-      star-symmetric.
-    - FILE WEDGE: one block per ``wfn.kpoints`` entry (``sym.nk_red``),
+    - FULL ZONE, exactly ``nk_tot`` blocks: every full-BZ k
+      (``sym.unfolded_kpts``) is matched to exactly one block by crystal
+      coordinate modulo a reciprocal-lattice vector to 1e-6, the tolerance
+      ``SymMaps`` matches the WFN's own k-points with (the headers are
+      ``%13.9f``), so the block map is a bijection.  Every k takes its OWN
+      block, as BerkeleyGW reads the file.  Unfolding such a file from its
+      star representatives instead discarded the other members' blocks (483
+      of 512 on Si 8³).  A file with MORE blocks refuses (``GATE
+      eqp_full_zone_count``): BerkeleyGW ignores extra blocks, but here they
+      mean a file from another k grid (Si 8³'s 512 blocks matched every k of
+      a Si 4³ deck).
+    - FILE WEDGE, ``sym.nk_red`` blocks (one per ``wfn.kpoints`` entry):
       unfolded through :func:`symmetry_maps.unfold_file_wedge_to_full_bz`.
 
     Either way the QP shifts about to be applied, ``E_QP - E_DFT`` with
     ``E_DFT = e_dft_full_ev`` ``(nk_tot, nb')``, must agree across every star
-    of ``sym.irr_idx_k`` to :data:`EQP_STAR_SPREAD_TOL_EV` in every band both
-    cover; a band missing at a k keeps its DFT energy, a zero shift there.
-    ``GATE eqp_star_spread`` refuses otherwise, naming the file, the band
-    (the file's 1-based label) and the two k that bound the worst star.  On
-    a wedge file the unfolded QP energies are star-constant, so the gate
-    reads the star spread of ``e_dft_full_ev`` itself.  ``e_dft_full_ev =
-    None`` measures the shifts against the file's own E_DFT column, placed on
-    the full BZ the same way (:func:`read_eqp_energies`, which holds no DFT
-    table).  An entry missing on either side is a zero shift.
+    of ``sym.irr_idx_k`` (``GATE eqp_star_spread``, tolerance
+    :data:`EQP_STAR_SPREAD_TOL_EV`).  The gated quantity is the shift's MEAN
+    over each DFT multiplet at each k (bands closer than
+    ``common.band_degeneracy.DEGENERACY_TOL_RY``): Σ restricted to a
+    symmetry multiplet is gauge-invariant only as a whole, so a producer's
+    per-band diagonal may differ between star members inside a multiplet
+    while its mean may not.  The per-band values are applied as given.  The
+    band-by-band star spread and the largest spread inside one multiplet are
+    printed (rank 0).  A multiplet that the file's top band cuts (visible
+    when ``e_dft_full_ev`` has more bands than the file) is reported, not
+    gated.  An entry missing on either side is a zero shift.
+
+    The gate covers the bands both sides carry: ``min(nb, nb')`` for the BSE
+    reader, every file band for :func:`read_eqp_energies` (``e_dft_full_ev =
+    None``: the file's own E_DFT column, placed on the full BZ the same way),
+    whose band window is cut afterwards.  On a wedge file the unfolded QP
+    energies are star-constant, so the gate reads the star spread of
+    ``e_dft_full_ev`` itself.
     """
+    from common.band_degeneracy import DEGENERACY_TOL_RY
     from symmetry_maps import unfold_file_wedge_to_full_bz
 
     name = os.path.basename(eqp_file)
@@ -4418,7 +4431,13 @@ def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray | None) -> np.
     k_full = np.asarray(sym.unfolded_kpts, dtype=np.float64)
     nk_tot = int(k_full.shape[0])
 
-    if nk_file >= nk_tot:
+    if nk_file > nk_tot:
+        raise ValueError(
+            f"GATE eqp_full_zone_count: {name} holds {nk_file} k-blocks but "
+            f"this deck's full BZ has {nk_tot} k, so {nk_file - nk_tot} blocks "
+            f"would go unused.  A full-zone eqp file needs exactly one block "
+            f"per full-BZ k; more blocks mean a file from another k grid.")
+    if nk_file == nk_tot:
         # FULL ZONE: each full-BZ k's own block, found by coordinate.
         own = np.empty(nk_tot, dtype=np.int64)
         for ik, kpt in enumerate(k_full):
@@ -4427,12 +4446,11 @@ def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray | None) -> np.
             hits = np.flatnonzero(np.max(np.abs(dk), axis=1) <= 1.0e-6)
             if hits.size != 1:
                 raise ValueError(
-                    f"{name} holds {nk_file} k-blocks, at least the {nk_tot} "
-                    f"of this deck's full BZ, but full-BZ k {ik} "
-                    f"{kpt.tolist()} matches {hits.size} of them (crystal "
-                    f"coordinates mod G to 1e-6).  A full-zone eqp file needs "
-                    f"exactly one block for every k of this wavefunction's "
-                    f"grid.")
+                    f"{name} holds {nk_file} k-blocks, as many as this deck's "
+                    f"full BZ, but full-BZ k {ik} {kpt.tolist()} matches "
+                    f"{hits.size} of them (crystal coordinates mod G to "
+                    f"1e-6).  A full-zone eqp file needs exactly one block for "
+                    f"every k of this wavefunction's grid.")
             own[ik] = hits[0]
         e_qp_full = np.asarray(e_qp_file)[own]
         if e_dft_full_ev is None:
@@ -4447,36 +4465,82 @@ def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray | None) -> np.
         raise ValueError(
             f"{name} holds {nk_file} k-blocks, but this deck's file wedge has "
             f"{int(sym.nk_red)} and its full BZ {nk_tot}.  The reader takes "
-            f"either the wedge LORRAX's GW writes or a block for every full-BZ "
-            f"k.")
+            f"either the wedge LORRAX's GW writes or exactly one block for "
+            f"every full-BZ k.")
 
     # ---- the applied shifts must be star-symmetric ---------------------
     n = min(int(e_qp_full.shape[1]), int(np.shape(e_dft_full_ev)[1]))
     if n:
         qp = e_qp_full[:, :n]
-        dft = np.asarray(e_dft_full_ev, dtype=np.float64)[:, :n]
+        dft_all = np.asarray(e_dft_full_ev, dtype=np.float64)
+        dft = dft_all[:, :n]
         shift = np.where(np.isnan(qp) | np.isnan(dft), 0.0, qp - dft)
+        nk = shift.shape[0]
+        # DFT multiplets at each k: label of each (k, band), and its members'
+        # mean shift and spread of shifts.
+        tol_deg_ev = DEGENERACY_TOL_RY * RYD_TO_EV
+        mult = np.concatenate(
+            [np.zeros((nk, 1), dtype=np.int64),
+             np.cumsum(np.diff(dft, axis=1) > tol_deg_ev, axis=1)], axis=1)
+        key = (np.arange(nk)[:, None] * n + mult).ravel()
+        count = np.bincount(key, minlength=nk * n)
+        mean = (np.bincount(key, weights=shift.ravel(), minlength=nk * n)
+                / np.maximum(count, 1))[key].reshape(nk, n)
+        top = np.full(nk * n, -np.inf)
+        bot = np.full(nk * n, np.inf)
+        np.maximum.at(top, key, shift.ravel())
+        np.minimum.at(bot, key, shift.ravel())
+        inside = (top - bot)[key].reshape(nk, n)
+        # A multiplet the file's top band cuts is reported, not gated.
+        cut = (np.abs(dft_all[:, n] - dft_all[:, n - 1]) <= tol_deg_ev
+               if dft_all.shape[1] > n else np.zeros(nk, dtype=bool))
+        gated = ~(cut[:, None] & (mult == mult[:, -1:]))
+
         labels = np.asarray(sym.irr_idx_k)
         order = np.argsort(labels, kind="stable")
         first = np.flatnonzero(np.r_[True, np.diff(labels[order]) != 0])
-        spread = (np.maximum.reduceat(shift[order], first, axis=0)
-                  - np.minimum.reduceat(shift[order], first, axis=0))
+
+        def star_spread(a):
+            return (np.maximum.reduceat(a[order], first, axis=0)
+                    - np.minimum.reduceat(a[order], first, axis=0))
+
+        spread = star_spread(np.where(gated, mean, 0.0))
         s, b = np.unravel_index(int(np.argmax(spread)), spread.shape)
         worst = float(spread[s, b])
         if worst > EQP_STAR_SPREAD_TOL_EV:
             members = np.split(order, first[1:])[s]
-            k_hi = int(members[np.argmax(shift[members, b])])
-            k_lo = int(members[np.argmin(shift[members, b])])
+            k_hi = int(members[np.argmax(mean[members, b])])
+            k_lo = int(members[np.argmin(mean[members, b])])
+            in_mult = np.flatnonzero(mult[k_hi] == mult[k_hi, b])
             raise ValueError(
                 f"GATE eqp_star_spread: {eqp_file}: the QP shift E_QP - E_DFT "
                 f"of band {band_offset + b + 1} differs by {1e3 * worst:.3f} "
-                f"meV across one symmetry star: {shift[k_hi, b]:+.6f} eV at "
+                f"meV across one symmetry star (mean over its DFT multiplet, "
+                f"bands {band_offset + in_mult[0] + 1}-"
+                f"{band_offset + in_mult[-1] + 1}): {mean[k_hi, b]:+.6f} eV at "
                 f"full-BZ k {k_hi} {k_full[k_hi].tolist()}, "
-                f"{shift[k_lo, b]:+.6f} eV at k {k_lo} "
+                f"{mean[k_lo, b]:+.6f} eV at k {k_lo} "
                 f"{k_full[k_lo].tolist()} (tolerance "
                 f"{1e3 * EQP_STAR_SPREAD_TOL_EV:.1f} meV over every star and "
-                f"band).  Symmetry-equivalent k must carry the same QP "
+                f"multiplet).  Symmetry-equivalent k must carry the same QP "
                 f"energies; regenerate the file star-symmetric.")
+        if jax.process_index() == 0:
+            kw, bw = np.unravel_index(int(np.argmax(inside)), inside.shape)
+            in_mult = np.flatnonzero(mult[kw] == mult[kw, bw])
+            print(f"  [eqp] {name}: star spread of E_QP - E_DFT "
+                  f"{1e3 * worst:.4f} meV over DFT-multiplet means (gate "
+                  f"{1e3 * EQP_STAR_SPREAD_TOL_EV:.1f} meV), "
+                  f"{1e3 * float(star_spread(shift).max()):.4f} meV band by "
+                  f"band; largest spread inside one multiplet "
+                  f"{1e3 * float(inside[kw, bw]):.4f} meV (k {int(kw)}, bands "
+                  f"{band_offset + in_mult[0] + 1}-"
+                  f"{band_offset + in_mult[-1] + 1})")
+            if cut.any():
+                print(f"  [eqp] WARNING {name}: band {band_offset + n} ends "
+                      f"inside a DFT multiplet at {int(cut.sum())} k; that "
+                      f"multiplet's star spread, "
+                      f"{1e3 * float(star_spread(np.where(gated, 0.0, mean)).max()):.4f}"
+                      f" meV, is reported and not gated.")
     return e_qp_full
 
 
