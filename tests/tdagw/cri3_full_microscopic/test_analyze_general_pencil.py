@@ -37,6 +37,7 @@ def test_no_actions_means_descriptor_only_and_capacity_refuses_before_svd(tmp_pa
     report=helper.analyze(capture,max_order=2,tolerances=(1e-8,))
     assert 'DESCRIPTOR COORDINATES ONLY' in report['transfer_scope']
     assert report['studies'][0]['status']=='reduced-for-diagnostic-only'
+    assert 'NOT physical W' in report['studies'][0]['transfer']['scope']
 
 
 def test_progress_records_completed_ranks_without_claiming_admission(tmp_path):
@@ -91,6 +92,7 @@ def test_frequency_only_grams_and_mixed_actions_equal_literal_complex_full_port_
     report=helper.analyze(capture,max_order=3,tolerances=(1e-9,))
     assert report['transfer_scope']=='RAW UNSYMMETRIZED full-port norms via frequency-only GC/GB'
     assert 'crossing-mirror interference' in report['bank_scope']
+    assert 'NOT physical W' in report['studies'][0]['transfer']['scope']
     assert len(report['studies'][0]['physical_transfer']['exact_probe_defects'])==2
 
 
