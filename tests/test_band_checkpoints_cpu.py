@@ -81,37 +81,35 @@ def _request(enk):
     e = enk[:, :NB] * RY
     return on_shell_request(e_eval_rel_ev=e, e_dft_rel_ev=e,
                             omega_range_ev=np.linspace(-1.0, 1.0, 9) * RY,
-                            out_of_grid="cover")
+                            out_of_grid="cover", irr_idx=np.arange(NK), n_parent=NK)
 
 
 def _fold(bounds, A, lam, windows, request, mesh, keep=None):
     """The executor's on-shell fold over ``bounds``: a BandCountCube on the full BZ."""
     from common.collectives import device_put_process_local
     from gw.mpa.sigma import _on_shell_reduce
-    from gw.ppm_accumulators import DeviceOmegaAccumulator, OnShellTables
+    from gw.ppm_accumulators import DeviceOmegaAccumulator
     from gw.ppm_sigma import BandCountCube
     A_br = np.stack([A[:, lo:hi].sum(axis=1) for lo, hi in bounds], axis=1)
     n_br, p_y = len(bounds), int(mesh.shape["y"])
     rep = NamedSharding(mesh, P())
     spec = NamedSharding(mesh, P(None, None, "x", "y"))
-    tables = OnShellTables(omega=device_put_process_local(request.tables_ry, rep),
-                           index=request.index, omega_host=request.tables_ry)
     n_matrix = len(keep) if keep is not None else (2 if n_br > 1 else 1)
     shape = (((2, NK, NB, NB),) * n_matrix, ((request.n_slot, NK, NB, p_y),) * n_br)
     F = request.frequencies_ry
-    acc = DeviceOmegaAccumulator(F, shape=shape, sharding=spec, omega_axis=0,
-                                 reduce=_on_shell_reduce(mesh, n_br, keep), on_shell=tables)
+    acc = DeviceOmegaAccumulator(request, carrier=NB, shape=shape, sharding=spec,
+                                 reduce=_on_shell_reduce(mesh, n_br, keep))
     A_d, lam_d = (device_put_process_local(np.asarray(x), rep) for x in (A_br, lam))
     for ext, sign, pref, e_ref, t, alpha, anti in windows:
         cols = np.nonzero(F < 0)[0] if ext < 0 else np.nonzero(F >= 0)[0]
-        acc.integrate_window(_tau_kernel, (A_d, lam_d), t, alpha, n_active=len(t),
-                             active_count=None, capacity=6, omega_sign=sign, prefactor=pref,
+        acc.integrate_window(_tau_kernel, (A_d, lam_d), t, alpha,
+                             active_count=None, capacity=max(6, len(t)), omega_sign=sign, prefactor=pref,
                              e_ref_sum=e_ref, antihermitian=anti, omega_indices=cols,
                              omega_values=ext * F[cols])
     matrices, diagonals = acc.finalize()
     return BandCountCube(matrices=list(matrices), diagonals=[], unfold=lambda v: v,
                          unfold_rows=lambda v: v, nk=NK, fresh=False, mesh_xy=mesh,
-                         on_shell=request, slot_diagonals=list(diagonals),
+                         request=request, slot_diagonals=list(diagonals),
                          matrix_index=() if keep is None else tuple(keep))
 
 
@@ -131,8 +129,13 @@ def _context(enk):
 
 def _result(cube, counts):
     from gw.ppm_sigma import SigmaOmegaResult
-    return SigmaOmegaResult(omega_ry=np.zeros(1), omega_ev=np.zeros(1), sigma_c_kij=cube,
-                            band_counts=tuple(counts), efermi_ry=0.0)
+    return SigmaOmegaResult(sigma_c_kij=cube, band_counts=tuple(counts), efermi_ry=0.0)
+
+
+def _z(point):
+    """``1/(1 - Re dSigma_nn/domega)`` at E_eval, 1 off the sampled range."""
+    d = np.real(point.diagonal("derivative"))
+    return np.where(point.request.covered_kn, 1.0 / (1.0 - d), 1.0)
 
 
 def _plans(enk, checkpoints):
@@ -210,8 +213,8 @@ def test_checkpoints_equal_their_restricted_plans_and_the_run_is_unchanged(tmp_p
                                        rtol=1e-11, atol=1e-13)
             np.testing.assert_allclose(got["raw"][name], twin.diagonal(name),
                                        rtol=1e-11, atol=1e-13)
-        np.testing.assert_allclose(got["shell"]["z"], ref.z_factor(), rtol=1e-11, atol=1e-13)
-        np.testing.assert_allclose(got["raw"]["z"], twin.z_factor(), rtol=1e-11, atol=1e-13)
+        np.testing.assert_allclose(got["shell"]["z"], _z(ref), rtol=1e-11, atol=1e-13)
+        np.testing.assert_allclose(got["raw"]["z"], _z(twin), rtol=1e-11, atol=1e-13)
         assert got["fit_vs_combination_ev"] < 1e-10
         # Something to extrapolate: the shell moved the raw sum on most states.
         if member.counts[-1] < NBAND:
