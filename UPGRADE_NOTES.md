@@ -5,6 +5,34 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — the scalar head pins its Z moment; metals: generalized Drude replaces the cell Lindhard
+
+The scalar head's pole model now carries both on-shell moments exactly:
+W^c_h(0), as before, and M_1 = sum_p B_p/Omega_p^2 = (1/pi) int_0^inf dxi
+[W^c_h(i xi) - W^c_h(0+)]/xi^2, the slope d Sigma_h/d omega = -M_1/(Omega N_k).
+M_1 comes from 24 dedicated imaginary-axis head samples (Gauss-Legendre in t,
+xi = 0.5 Ry t/(1-t); `gw.qsgw_head.head_quadrature_rule`), each a full head
+build folded through W_body(Gamma, i xi): exact on shared-pole stores, the
+fitted elementwise body on `sigma_w_model = mpa`.  `_pin_static_head_sample`
+adds the constraint sum B/Omega^2 = M_1; M_1 is stamped in the head store
+(`fit_moment_m1`; `read_head_fit_collective` returns `moment_m1`) and each run
+prints the quadrature and unpinned-fit values.  Heads with no rule keep the
+W(0)-only pin: `off`, the BGW finite-q0 head, the w_bse ladder head.
+
+On a metal, every dynamic head row is now the generalized Drude term
+D r(z)/z^2 with a Fermi-liquid memory function (deck `head_drude_gamma0_ev`,
+default 0 = the undamped D/z^2, and `head_drude_gamma_width_ev`); the
+per-sample anisotropic Lindhard function leaves the dynamic head (its M_1 is
+log-divergent in the cell's smallest q.u).  The static row is Thomas-Fermi on
+every route, folded or not.  M_1 subtracts the Drude model's own limit
+W^c(0+) = -<v>, not the Thomas-Fermi row.
+
+- **Results.** eqp0 is unchanged (W(0) pinned as before) to round-off.
+  eqp1/Z move uniformly by Delta(d Sigma/d omega) = -(M_1,quad - M_1,fit)/(Omega N_k).
+  Metals' off-shell head values and Z move (na_sc reference to regenerate).
+  The head costs 24 more head builds per screening build.
+- **Users.** No deck change.  Test: `tests/test_head_quadrature_moment.py`.
+
 ## 2026-10-20 — `head_correction = no_local_fields` is deleted; `full` is the one head
 
 The deck value `no_local_fields` is gone and refuses as an unknown policy; use

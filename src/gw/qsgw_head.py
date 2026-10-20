@@ -42,6 +42,10 @@ __all__ = [
     "static_gauge_hall_transaction",
     "static_head_wings_sharded",
     "head_samples_from_s",
+    "head_moment_m1",
+    "head_quadrature_omegas",
+    "head_quadrature_rule",
+    "drude_memory_damping",
     "metal_head_summary",
     "interband_commutator_velocity",
     "finalize_iteration_head_sample",
@@ -3556,7 +3560,7 @@ def iteration_head_sample_terms(
                         else response.fold_scale[index]),
         )
     intraband = _metal_intraband(response)
-    static_kappa2 = None if intraband is not None else response.static_kappa2_bohr2
+    static_kappa2 = response.static_kappa2_bohr2
     static_row = bool(_static_rows(
         (response.omegas[index],), config, metal=intraband is not None)[0])
     if use_fold and static_row:
@@ -3683,8 +3687,6 @@ def finalize_iteration_head_samples(
                 "static metallic head requires exactly one static response row")
         static_kappa2 = _fold_static_kappa2(
             response, W_gamma[static_indices[0]], float(meta.cell_volume), mesh)
-    elif intraband is not None:
-        static_kappa2 = None
     samples = head_samples_from_s(
         S_effective,
         response.omegas,
@@ -3706,25 +3708,19 @@ def finalize_iteration_head_samples(
     )
 
 
-def _extra_chi_rows(extras, intraband):
+def _extra_chi_rows(extras):
     """Every screened row's ``chi_extra`` [Z, n] on one mini-BZ batch ``q`` [n, 3], or None.
 
-    ``extras[i]`` is None, ``("lindhard", z)`` (the Fermi-surface Lindhard
-    term at z) or ``("constant", c)``; all Lindhard rows come from one
-    program per batch (``FermiSurfaceIntraband.density_response_rows``).
+    ``extras[i]`` is None or ``("constant", c)``: the Thomas-Fermi
+    ``-kappa^2/(8 pi)`` of a metal's static row.
     """
     if all(e is None for e in extras):
         return None
-    lindhard = [i for i, e in enumerate(extras) if e is not None and e[0] == "lindhard"]
-    zs = [extras[i][1] for i in lindhard]
-    constant = np.asarray([e[1] if e is not None and e[0] == "constant" else 0.0
-                           for e in extras], dtype=np.complex128)
+    constant = np.asarray([0.0 if e is None else e[1] for e in extras],
+                          dtype=np.complex128)
 
     def rows(q):
-        out = jnp.broadcast_to(jnp.asarray(constant)[:, None], (len(extras), q.shape[0]))
-        if lindhard:
-            out = out.at[np.asarray(lindhard)].set(intraband.density_response_rows(q, zs))
-        return out
+        return jnp.broadcast_to(jnp.asarray(constant)[:, None], (len(extras), q.shape[0]))
     return rows
 
 
@@ -3743,15 +3739,18 @@ def head_samples_from_s(
     """Convert replicated 3x3 S tensors to mini-BZ averaged head samples.
 
     ``intraband`` (``fermi_surface.FermiSurfaceIntraband``) marks a metal
-    whose ``S`` carries the q-first Drude term ``D / z^2``: at every sample
-    that term is exchanged for the anisotropic Fermi-surface Lindhard
-    response of the cell, evaluated at each q sample, which is Thomas-Fermi
-    at ``z = 0`` and Drude for ``|z| >> q u``
-    (``docs/theory/metal-q0-head.md``).  ``static_kappa2_bohr2`` names the
-    one exact-zero row whose Thomas-Fermi term is the full head's folded
-    kappa^2; on a metal that row keeps its interband ``S(0)``.  A metal's
-    static row (:func:`metal_static_rows`) was built at ``z = 0``, so its
-    ``S`` carries no ``D / z^2``.
+    whose ``S`` carries the q-first Drude term ``D / z^2``.  Every dynamic row
+    keeps it as the generalized Drude term ``D r(z) / z^2`` with the
+    Fermi-liquid memory function of :func:`drude_memory_damping`
+    (``r = 1``, the undamped Drude term, at the default ``gamma_0 = 0``);
+    ``docs/theory/metal-q0-head.md`` section 4.  The per-sample anisotropic
+    Lindhard function (the Landau continuum at ``|z| <~ q u``) is not part of
+    the dynamic head: its moment ``M_1`` diverges as ``log`` of the cell's
+    smallest ``q.u``.  ``static_kappa2_bohr2`` names the one static row whose
+    Thomas-Fermi term is the head's (folded, when the head is) kappa^2; on a
+    metal that row keeps its interband ``S(0)``.  A metal's static row
+    (:func:`metal_static_rows`) was built at ``z = 0``, so its ``S`` carries
+    no ``D / z^2``.
     """
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
@@ -3792,11 +3791,16 @@ def head_samples_from_s(
         static_row = bool(_static_rows((z,), config, metal=intraband is not None)[0])
         is_static_metal = static_kappa2_bohr2 is not None and static_row
         extra_chi = None
-        if intraband is not None and not is_static_metal:
-            drude = np.asarray(intraband_drude, dtype=np.complex128)
-            if not static_row:
-                S = S - drude / (z * z)
-            extra_chi = ("lindhard", z)
+        if intraband is not None and static_row and not is_static_metal:
+            raise ValueError(
+                "metallic head: the static row needs its Thomas-Fermi kappa^2 "
+                "(IterationHeadResponse.static_kappa2_bohr2)")
+        if intraband is not None and not static_row:
+            damping = drude_memory_damping(z, config)
+            if damping is not None:
+                # D/z^2 -> D r(z)/z^2, r = 1 - damping.
+                S = S - np.asarray(intraband_drude, dtype=np.complex128) * (
+                    damping / (z * z))
         elif is_static_metal and intraband is not None:
             # The folded static slot is the z -> 0+ limit of the same cell
             # function: interband q.S(0).q (epsilon_inf) plus Thomas-Fermi,
@@ -3810,7 +3814,7 @@ def head_samples_from_s(
     if screened:
         vc0, wcoul0 = compute_q0_averages_screened(
             wfn, meta, [rows[i][2] for i in screened],
-            extra_chi_rows=_extra_chi_rows([rows[i][3] for i in screened], intraband),
+            extra_chi_rows=_extra_chi_rows([rows[i][3] for i in screened]),
             analytic_sphere=analytic_sphere)
         vc0 = complex(vc0)
         averages.update(zip(screened, ((vc0, w) for w in wcoul0)))
@@ -3883,6 +3887,112 @@ def metal_response_nodes(omegas, config, *, metal):
         return omegas
     z = np.asarray(omegas, dtype=np.complex128).reshape(-1)
     return np.where(metal_static_rows(z, config), 0.0 + 0.0j, z)
+
+
+
+#: Order and scale ``xi_0`` (Ry) of the head's imaginary-axis moment rule
+#: (:func:`head_quadrature_rule`).  Worst relative M_1 error of ONE
+#: undamped pole (the hardest integrand; a continuum is smoother), N = 24:
+#: 1.5e-9 for Omega in [0.1, 5] Ry, 3.4e-7 in [0.03, 10] Ry, 2.4e-4 in
+#: [0.01, 30] Ry.
+HEAD_QUADRATURE_ORDER = 24
+HEAD_QUADRATURE_SCALE_RY = 0.5
+
+
+def head_quadrature_rule(order=HEAD_QUADRATURE_ORDER, scale_ry=HEAD_QUADRATURE_SCALE_RY):
+    r"""Nodes ``xi_j`` (Ry) and weights ``w_j``: ``int_0^inf dxi g(xi) ~ sum_j w_j g(xi_j)``.
+
+    Gauss-Legendre in ``t in (0, 1)`` with ``xi = xi_0 t/(1 - t)``,
+    ``dxi = xi_0 dt/(1 - t)^2``.  For one pole of the head's moment
+    integrand, ``[W^c(i xi) - W^c(0)]/xi^2 = 2B/(Omega (xi^2 + Omega^2))``,
+    the mapped integrand is smooth on the closed interval: finite at
+    ``t = 0`` and ``-W^c(0)/(xi_0 t^2)`` at ``t = 1``.
+    """
+    t, w = np.polynomial.legendre.leggauss(int(order))
+    t, w = 0.5 * (t + 1.0), 0.5 * w
+    xi = float(scale_ry) * t / (1.0 - t)
+    return xi, w * float(scale_ry) / (1.0 - t) ** 2
+
+
+def head_quadrature_omegas(config) -> tuple[complex, ...]:
+    """The moment rule's nodes ``i xi_j`` (Ry) that a head plan appends after its fit nodes.
+
+    Every builder evaluates the head there exactly as at a fit node (direct
+    ``S``, wings, the fold through ``W_body(Gamma, i xi)``); the fit then pins
+    ``M_1`` (:func:`head_moment_m1`, ``gw.mpa.model._pin_static_head_sample``).
+    None when the head is off, and none for the BGW finite-q0 head, whose
+    samples are finite-q epsilon rows of the body's own chi samples.
+    """
+    from gw.gw_config import HeadCorrection, coerce_head_correction
+    head = config.head
+    if (coerce_head_correction(getattr(head, "correction", HeadCorrection.FULL))
+            is HeadCorrection.OFF or bool(getattr(head, "uses_bgw_metal_q0shift", False))):
+        return ()
+    xi, _ = head_quadrature_rule()
+    return tuple(1j * float(x) for x in xi)
+
+
+def head_moment_m1(samples, omegas, *, metal, order=HEAD_QUADRATURE_ORDER,
+                   scale_ry=HEAD_QUADRATURE_SCALE_RY):
+    r"""``M_1 = sum_p B_p/Omega_p^2 = (1/pi) int_0^inf dxi [W^c_h(i xi) - W^c_h(0^+)]/xi^2``.
+
+    The moment the on-shell head derivative reads,
+    ``d Sigma_h/d omega (delta = 0) = -M_1/(Omega N_k)``
+    (``head_correction.compute_complex_pole_head_sigma_diag``), on the head's
+    own rows: ``samples[i]`` at ``omegas[i]``, which must contain every node
+    of :func:`head_quadrature_rule`.  ``W^c_h(0^+)`` is the ``xi -> 0`` limit
+    of the SAME dynamic model the rule samples: an insulator's ``z = 0`` row;
+    a metal's generalized Drude model, whose ``epsilon_M(i xi) -> infinity``
+    gives ``W^c_h(0^+) = -<v>``.  A metal's static row (Thomas-Fermi,
+    ``-<v> + t``) is a different limit; subtracting it would add ``-t/xi^2``.
+    Returns ``None`` when the rows carry no rule (an ``off``, BGW finite-q0
+    or ladder head).
+    """
+    z = np.asarray([complex(x) for x in omegas], dtype=np.complex128)
+    xi, weight = head_quadrature_rule(order, scale_ry)
+    rows = [np.flatnonzero(np.abs(z - 1j * x) <= 1.0e-14) for x in xi]
+    if all(r.size == 0 for r in rows):
+        return None
+    if any(r.size != 1 for r in rows):
+        raise ValueError(
+            "head moment rule: the head rows carry part of the imaginary-axis "
+            f"rule ({sum(r.size == 1 for r in rows)} of {xi.size} nodes)")
+    quad = [samples[int(r[0])] for r in rows]
+    wc = np.asarray([complex(s.wcoul0) - complex(s.vc0) for s in quad])
+    if metal:
+        limit = -np.asarray([complex(s.vc0) for s in quad])
+    else:
+        static = np.flatnonzero(np.abs(z) <= 1.0e-14)
+        if static.size != 1:
+            raise ValueError("head moment rule: an insulating head needs its z = 0 row")
+        s0 = samples[int(static[0])]
+        limit = complex(s0.wcoul0) - complex(s0.vc0)
+    return complex(np.sum(weight * (wc - limit) / xi ** 2) / np.pi)
+
+
+def drude_memory_damping(z, config):
+    r"""``1 - r(z)`` of the Fermi-liquid generalized Drude head, or ``None`` at ``gamma_0 = 0``.
+
+    ``epsilon_intra(z) = -omega_p^2 / (z (z + i M(z)))``, ``r = z/(z + i M)``,
+    with the one-pole memory function ``M(z) = gamma_0 (-i z)/(Gamma - i z)``:
+    analytic in the upper half plane (pole at ``z = -i Gamma``); on the real
+    axis ``Re M(omega) = gamma_0 omega^2/(omega^2 + Gamma^2) >= 0``, the
+    Fermi-liquid rate ``(gamma_0/Gamma^2) omega^2`` below ``Gamma`` and
+    ``gamma_0`` above; on the imaginary axis ``M(i xi) = gamma_0 xi/(xi + Gamma)``
+    is real.  ``z + i M = z (Gamma + gamma_0 - i z)/(Gamma - i z)``, so
+    ``1 - r = gamma_0/(Gamma + gamma_0 - i z)``, and
+    ``epsilon_M(i xi) ~ omega_p^2 Gamma/((Gamma + gamma_0) xi^2)`` as
+    ``xi -> 0``: ``W^c_h(i xi) + <v> = O(xi^2)`` and ``M_1`` is finite.  (A
+    constant rate, ``Gamma -> 0``, gives ``epsilon ~ omega_p^2/(gamma_0 xi)``
+    and a log-divergent ``M_1``.)  Deck ``head_drude_gamma0_ev`` (``gamma_0``,
+    default 0) and ``head_drude_gamma_width_ev`` (``Gamma``).
+    """
+    from common import RYD_TO_EV
+    gamma0 = float(getattr(config.head, "drude_gamma0_ev", 0.0)) / RYD_TO_EV
+    if gamma0 == 0.0:
+        return None
+    width = float(config.head.drude_gamma_width_ev) / RYD_TO_EV
+    return gamma0 / (width + gamma0 - 1j * complex(z))
 
 
 def _metal_static_head(wfns, surface, occupation_state, omegas, *, mesh,

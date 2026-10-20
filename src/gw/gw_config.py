@@ -1503,6 +1503,13 @@ _DEFAULTS = {
     # for bit.  Its S_d replaces the GW mesh's; the local-field fold is the GW
     # mesh's, scaled by S_d,dense S_d,mesh^-1 (gw.head_correction.scaled_head_fold).
     "head_dense_file": "",
+    # Metals: Fermi-liquid damping of the head's dynamic Drude term,
+    # eps_intra = -omega_p^2/(z (z + i M(z))), M(z) = gamma0 (-i z)/(Gamma - i z):
+    # rate gamma0 omega^2/(omega^2 + Gamma^2) on the real axis, zero at the
+    # Fermi surface.  gamma0 = 0 is the undamped Drude term
+    # (gw.qsgw_head.drude_memory_damping); Gamma must be positive.
+    "head_drude_gamma0_ev": 0.0,
+    "head_drude_gamma_width_ev": 1.0,
     # Opt-in finite-q W-av preprocessing.  The flags select the first and
     # second reciprocal-grid stencil shells written beside the PT data; they
     # do not activate the not-yet-complete metallic finite-q screening path.
@@ -2646,9 +2653,17 @@ def _input_head(
                 f"{_head_correction.value}. Prefer the named policy in "
                 "new decks.")
     _resolved_do_g0 = _head_correction is not HeadCorrection.OFF
+    if (not float(params["head_drude_gamma0_ev"]) >= 0.0
+            or not float(params["head_drude_gamma_width_ev"]) > 0.0):
+        raise ValueError(
+            "head_drude_gamma0_ev must be >= 0 and head_drude_gamma_width_ev > 0 "
+            f"(got {params['head_drude_gamma0_ev']!r}, "
+            f"{params['head_drude_gamma_width_ev']!r}); see docs/theory/metal-q0-head.md")
     head = HeadConfig(
         correction=_head_correction,
         dense_file=str(params["head_dense_file"] or "").strip(),
+        drude_gamma0_ev=float(params["head_drude_gamma0_ev"]),
+        drude_gamma_width_ev=float(params["head_drude_gamma_width_ev"]),
         wcoul0_source=str(params["wcoul0_source"]).strip().lower(),
         wcoul0_eta=float(params["wcoul0_eta"] or 0.0),
         vhead=params["vhead"],
@@ -4059,6 +4074,8 @@ class HeadConfig:
     """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs; see docs/dev/gw_config_contracts.md."""
     correction: HeadCorrection    # full | off
     dense_file: str               # dense-k sum set dipole.h5; "" = the GW mesh
+    drude_gamma0_ev: float        # metal Drude Fermi-liquid rate scale gamma0 (0 = undamped)
+    drude_gamma_width_ev: float   # its crossover Gamma (> 0)
     wcoul0_source: str            # "s_tensor" | "epshead"
     wcoul0_eta: float
     vhead: float | None           # explicit override v_h[ω=0]
