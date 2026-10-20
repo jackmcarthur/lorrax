@@ -66,26 +66,23 @@ def _gamma_gemm_route(mesh, b_shape, budget_bytes):
     """The Gamma body GEMM's ``(backend, batched_route)`` for ``distrib_la.matmul``.
 
     The staged batch route (each rank's ``ceil(Q/P)`` whole matrices, one local
-    GEMM) when one rank holds that A, B and D beside the ledger's live stages
-    (``distrib_la.fits_local``, the test ``matmul(batched_route='auto',
-    budget_bytes=)`` makes); otherwise the distributed provider on the faces.
+    GEMM) where it fits beside the ledger's live stages (``distrib_la.matmul.staged_fits``,
+    the test ``matmul(batched_route='auto', budget_bytes=)`` makes); otherwise the
+    distributed provider on the faces. Each priced by its program compiled (never run).
     Q is one Gamma parent, so the staged route puts whole N_mu x N_mu matrices
     on every rank (zero pads past the first): 66 GB/rank at N_mu 30k.
     ``budget_bytes`` is the same on every rank, so is the route; the provider
     is ``panel_matmul``, an XLA program that opens no vendor context."""
     import distrib_la
     from lxkit import memory
+    from distrib_la.matmul import route_bytes, staged_fits
     q, n, k = (int(v) for v in b_shape)
-    ranks = int(mesh.size)
-    local = -(-q // ranks)
-    shapes = ((local, n, k), (local, k, n), (local, n, n))
-    fits = distrib_la.fits_local(SimpleNamespace(mesh=mesh), "gemm", shapes, np.complex128,
-                                 int(budget_bytes), batch=q)
-    # The staged route runs where distrib_la.fits_local says (its workspace and gathered cap).
-    staged = dataclasses.replace(memory.priced(16 * sum(int(np.prod(s)) for s in shapes),
-                                               "whole matrices per rank", term="operands"), whole=min(n, k))
-    faces = memory.priced(0, "A, B and D faces", term="operands",
-                          spread=16 * q * (2 * n * k + n * n), ranks=ranks)
+    ranks, shape = int(mesh.size), (q, n, k)
+    fits = staged_fits(mesh, shape, shape, "complex128", "N", "C", int(budget_bytes))
+    staged = dataclasses.replace(memory.priced(route_bytes(mesh, shape, shape, "complex128", "N", "C"),
+                                               "staged GEMM program (compiled)"), whole=min(n, k))
+    faces = memory.priced(0, "face GEMM program (compiled)", ranks=ranks, spread=ranks * route_bytes(
+        mesh, shape, shape, "complex128", "N", "C", route="auto", backend="auto"))
     if memory.admit(f"shared-pole head Gamma GEMM {q} x {n} x {k}",
                     (("staged", staged, int(budget_bytes) if fits else 0),
                      ("faces", faces)), int(budget_bytes)) == "staged":

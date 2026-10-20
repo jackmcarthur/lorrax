@@ -977,7 +977,7 @@ def _face_kernels(mesh, Q, g_tile, with_v, inverse=False):
     masked by ngk, ``V += conj(ζ) v ζᵀ`` at ``P(None,'x','y')`` and the shell gather at
     ``P(None,('x','y'),None)``."""
     # The GEMMs take whole matrices per rank only where they fit the room beside what is live
-    # (distrib_la.fits_local: Q < P only within its small-matrix cap), else the face SUMMA.
+    # (distrib_la.matmul.staged_fits: compiled; Q < P only within its small-matrix cap), else the face SUMMA.
     # The default staged route put a whole B (mu x mu) and Z tile on one rank at Q = 1.
     from common.gpu_utils import shared_device_room
     room = int(shared_device_room("isdf zeta face apply"))

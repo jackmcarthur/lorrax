@@ -284,6 +284,32 @@ def _batch_reshard(mesh, A, B, C, *, alpha, beta, transa, transb):
     return fn(A, B, C) if has_c else fn(A, B)
 
 
+def staged_fits(mesh, a_shape, b_shape, dtype, transa, transb, budget_bytes) -> bool:
+    """Whether the staged route (each rank's ``ceil(batch/P)`` whole matrices, one local GEMM)
+    fits ``budget_bytes``: its program compiled at the abstract face operands (:func:`route_bytes`,
+    as ``plan.place`` prices route (c)). A batch below the rank count only within
+    ``GATHERED_EIGH_BYTES``: its idle ranks would each hold whole matrices."""
+    from distrib_la.plan import GATHERED_EIGH_BYTES
+    ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
+    cap = int(budget_bytes) if int(a_shape[0]) >= ranks else min(int(budget_bytes), GATHERED_EIGH_BYTES)
+    return route_bytes(mesh, tuple(a_shape), tuple(b_shape), str(dtype), str(transa).upper(),
+                       str(transb).upper()) <= cap
+
+
+@lru_cache(maxsize=None)
+def route_bytes(mesh, a_shape, b_shape, dtype, transa="N", transb="N",
+                route=ROUTE_BATCH_RESHARD, backend="off") -> float:
+    """Per-rank bytes :func:`matmul` allocates beside its face operands on ``route``: the
+    program compiled at abstract ``(batch, m, k)`` operands (temp + outputs - alias; never run)."""
+    import math
+    from distrib_la.plan import _program_bytes
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    args = [jax.ShapeDtypeStruct(tuple(s), jnp.dtype(dtype), sharding=face) for s in (a_shape, b_shape)]
+    got = _program_bytes(lambda a, b: matmul(a, b, mesh=mesh, transa=transa, transb=transb,
+                                             backend=backend, batched_route=route), args)
+    return math.inf if got is None else float(got)
+
+
 def matmul(
     A: jax.Array,
     B: jax.Array,
@@ -332,10 +358,9 @@ def matmul(
         provider.
     budget_bytes
         Optional per-rank device budget. With ``batched_route='auto'`` the
-        route becomes a capacity decision: when one rank's whole local A, B
-        and D matrices (``ceil(batch/P)`` of each) plus the local GEMM
-        temporary fit (:func:`distrib_la.workspace.fits_local`), the staged
-        route runs; otherwise the provider. Pass a value every rank shares.
+        route becomes a capacity decision: the staged route where its own
+        program, compiled at these operands, fits (:func:`staged_fits`);
+        otherwise the provider. Pass a value every rank shares.
 
     Returns
     -------
@@ -368,15 +393,8 @@ def matmul(
     out_shape = _validate_operands(A, B, C, transa, transb)
     route = str(batched_route).strip().lower()
     if route == "auto" and budget_bytes is not None:
-        from distrib_la.workspace import fits_local
-        from types import SimpleNamespace
-        ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
-        nb = int(A.shape[0]) if A.ndim == 3 else 1
-        local = -(-nb // ranks)
-        a = (local,) + _op_shape((int(A.shape[-2]), int(A.shape[-1])), transa)
-        b = (local,) + _op_shape((int(B.shape[-2]), int(B.shape[-1])), transb)
-        d = (local, a[1], b[2])
-        if fits_local(SimpleNamespace(mesh=mesh), "gemm", (a, b, d), A.dtype, budget_bytes, batch=nb):
+        stack = lambda x: tuple(int(v) for v in ((1, *x.shape) if x.ndim == 2 else x.shape))
+        if staged_fits(mesh, stack(A), stack(B), A.dtype, transa, transb, budget_bytes):
             route = ROUTE_BATCH_RESHARD
     provider = resolve_matmul_backend(backend, mesh, batched_route=route)
     px, py = _mesh_shape(mesh)
