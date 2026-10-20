@@ -37,3 +37,13 @@ def test_room_decides_gathered_attempt_per_program(monkeypatch):
                                 batch_in_sharding=NamedSharding(mesh, P(None, "x", "y")))
         got[room > need] = p.mesh_bytes("eigh", 1, n, np.complex128, "all")
     assert got[True] > got[False], (got, need)      # the refused room compiles its own chain
+
+
+def test_face_programs_are_keyed_by_the_plans_room():
+    """Face plans that differ only by room compare equal; their programs must not be shared."""
+    from gw import shared_pole_execution as spe
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    small, large = (spe.face_eigh(mesh, 256, room=r, backend="auto") for r in (1 << 20, 1 << 33))
+    assert small == large
+    programs = {spe.face_round_check_program(mesh, True, p, spe.plan_room(p)) for p in (small, large)}
+    assert len(programs) == 2

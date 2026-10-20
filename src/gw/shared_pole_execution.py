@@ -448,11 +448,12 @@ def face_ritz_carrier(mesh, keep_budget):
 
 @lru_cache(maxsize=None)
 def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None,eigh_plan=None,
-                        carrier=None):
+                        carrier=None,room=None):
     """Retained static-layout executable builder; all state values are operands.
 
     ``eigh_plan`` (``face_eigh`` at the reduction's room) decides the pencil's
-    eigh stacks, and the program is keyed on it. ``carrier``
+    eigh stacks; ``room`` (:func:`plan_room`) keys the program with it, since plan
+    equality ignores the room the stacks were decided in. ``carrier``
     (``face_ritz_carrier``) solves an ordered pencil's kept span on that many
     columns, None keeping the whole H'_vv side. The state columns arrive packed
     (``shared_pole_local.pack_panels``), so the program's shape is the round's
@@ -498,7 +499,7 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
         budget.plan(side,phase='reduction')
     program=lambda room: face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
                                              face_eigh(mesh,side,room=room,backend=eigh_backend),
-                                             None if carrier is None else int(carrier))
+                                             None if carrier is None else int(carrier),plan_room(room))
     from gw.shared_pole_local import pack_panels
     packed=pack_panels(tuple([s[k] for s in states] for k in (1,2,3)),tables['order'],
                        [int(s[1].shape[-1]) for s in states],mesh_xy=mesh,layout='face')
@@ -544,12 +545,20 @@ def price_round(executable, mesh, beside, whole=False):
     memory.book(part)
 
 
+def plan_room(room):
+    """A face program's cache key for the room its eigh plan decides stacks in (a room, a
+    ``RoomExhausted`` or a plan): plans that differ only by room compare equal."""
+    room = getattr(room, "budget_bytes", room)
+    return (int(room or 0), type(room).__name__)
+
+
 @lru_cache(maxsize=None)
-def face_round_check_program(mesh, ordered, eigh_plan):
+def face_round_check_program(mesh, ordered, eigh_plan, room=None):
     """Whole-mesh adapter for the scalar model's existing gate equations.
 
     ``eigh_plan`` is the n x n plan (``face_eigh``); distrib_la decides from
-    its room whether the passivity eighs run on the mesh or one per rank.
+    its room whether the passivity eighs run on the mesh or one per rank;
+    ``room`` (:func:`plan_room`) keys the program with it.
     """
     from gw.shared_pole_local import _round_check_equations
     from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1,
