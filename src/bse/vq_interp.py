@@ -508,10 +508,7 @@ def build_cq_q_chunk(*, nq, nb, ns, n_mu, n_r, mesh_xy):
     face = 16.0 * int(ns) ** 2 * int(n_mu) ** 2 / n_dev
     fixed = 2.0 * int(n_r) * face
     per_q = 2.0 * 16.0 * int(nb) * int(ns) * int(n_mu) + face
-    from lxkit import memory
     chunk = tile_units(per_q, int(nq))
-    memory.book(memory.priced(fixed + chunk * per_q,
-                              f"exciton_bands build_cq, q chunk {chunk}/{int(nq)}", increment=True))
     return chunk
 
 

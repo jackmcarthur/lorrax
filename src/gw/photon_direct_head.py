@@ -467,7 +467,6 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     replicate) and its compiled footprint, priced at the floor and scaled per
     sample, fits the fixed tile (``runtime.tiles``).
     """
-    from lxkit import memory
     from runtime.tiles import TILE_BYTES
     n_dev = int(mesh.devices.size)
     split = NamedSharding(mesh, P(tuple(mesh.axis_names)))
@@ -487,9 +486,6 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     while chunk * 2 <= int(nsamples) and chunk * 2 * per_sample <= TILE_BYTES:
         chunk *= 2
     chunk = min(max(chunk, floor), max(int(nsamples), floor))
-    memory.book(memory.priced(chunk * per_sample,
-                              f"direct Gamma head, chunk {chunk} over {n_dev} ranks",
-                              increment=True))
     return int(chunk), split
 
 
@@ -570,7 +566,6 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
     those of the scalar charge head and the bare TT Γ tile.
     """
     from common.collectives import device_put_process_local
-    from lxkit import memory
     from vcoul import get_kernel, slab_minibz_graded_photon_cubature
 
     receipt = slab_minibz_graded_photon_cubature(get_kernel(2), geometry, kgrid)
@@ -584,9 +579,6 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
         sds((rows, 4, 4), jnp.float64, sharding=split),
         sds((rows,), jnp.float64, sharding=split), *operands).compile()
     temp = float(getattr(compiled.memory_analysis(), "temp_size_in_bytes", 0))
-    memory.book(memory.priced(temp + 8.0 * (3 + 16 + 1) * rows / n_dev,
-                              f"direct Gamma head, slab polygon {rows} nodes over {n_dev} ranks",
-                              increment=True))
     ladder = []
     for chunk in receipt.chunks:
         q = np.zeros((rows, 3))
