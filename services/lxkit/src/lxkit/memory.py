@@ -26,7 +26,9 @@ CENSUS_BYTES = 64 << 20
 #: ``LORRAX_MEMORY_TRACE=<path>`` (implies calibrate): at every section's open and close and at
 #: its in-section peak, the live arrays (shape, dtype, sharding, bytes per device, the stage
 #: that created them), the allocator's bytes in use and peak, and every executable compiled in
-#: it (``memory_analysis``); one JSON per process at exit (``tools/memory_residuals.py``).
+#: it (``memory_analysis``); JSON Lines per process, one record per closed section as it closes
+#: and the run's receipts at exit, so a late crash keeps every closed section
+#: (``lxkit.memory_residuals``).
 TRACE = os.environ.get("LORRAX_MEMORY_TRACE", "")
 CALIBRATE = STRICT or bool(TRACE) or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
 
@@ -309,8 +311,26 @@ def _hook_compiles() -> None:
             pass
         return executable
     compiler.compile_or_get_cached, _T["hooked"] = traced, True
+    open(_trace_path(), "w").close()                  # this run's trace starts empty
     import atexit
     atexit.register(trace_dump)
+
+
+def _trace_path(path: str = "") -> str:
+    """``path`` (else LORRAX_MEMORY_TRACE), ``.p<i>`` on process i > 0."""
+    try:
+        import jax
+        index = jax.process_index()
+    except Exception:                                          # noqa: BLE001
+        index = 0
+    path = path or TRACE
+    return path if index == 0 else f"{path}.p{index}"
+
+
+def _append(record: dict, path: str = "") -> None:
+    import json
+    with open(_trace_path(path), "a") as out:
+        out.write(json.dumps(record, default=str) + "\n")
 
 
 def _trace(tracker: Tracker, event: str) -> None:
@@ -330,29 +350,25 @@ def _trace(tracker: Tracker, event: str) -> None:
             price = tracker.price
             tracker.rec.update(close=snap, t_close=time.time(), measured=tracker.whole,
                                exact=tracker.exact, source=_I["source"],
-                               priced=None if price is None else price.terms())
+                               priced=None if price is None else price.terms(), run=dict(_RUN))
             _T["sections"].append(tracker.rec)
+            _append(tracker.rec)
     except Exception:                                          # noqa: BLE001
         pass
 
 
 def trace_dump(path: str = "") -> Optional[str]:
-    """Write the trace (``path``, else LORRAX_MEMORY_TRACE; ``.p<i>`` on process i > 0)."""
-    import json
-    path = path or TRACE
-    if not path or not _T["sections"]:
+    """Append the run's figures and receipts to the trace (at exit; the sections are already
+    there).  ``path``: write the whole trace there instead."""
+    if not (path or TRACE) or not _T["sections"]:
         return None
-    try:
-        import jax
-        index = jax.process_index()
-    except Exception:                                          # noqa: BLE001
-        index = 0
-    path = path if index == 0 else f"{path}.p{index}"
-    with open(path, "w") as out:
-        json.dump(dict(run=dict(_RUN), process=index, sections=_T["sections"],
-                       receipts=[{k: v for k, v in r.items() if k != "price"} for r in receipts()]),
-                  out, default=str)
-    return path
+    if path:
+        open(_trace_path(path), "w").close()
+        for rec in _T["sections"]:
+            _append(rec, path)
+    _append(dict(run=dict(_RUN), receipts=[{k: v for k, v in r.items() if k != "price"}
+                                           for r in receipts()]), path)
+    return _trace_path(path)
 
 
 def set_sink(sink=None) -> None:

@@ -8,6 +8,9 @@ price booked (the libraries' own size queries).  A residual over max(2% of the l
 is flagged and named by the arrays new at the peak (created inside the section).
 
     python -m lxkit.memory_residuals trace.json [more.json ...] [--all]
+
+The trace is JSON Lines: a record per closed section, then (at a clean exit) the run's figures
+and receipts; a run that crashed keeps its closed sections and their ``run`` figures.
 """
 from __future__ import annotations
 
@@ -15,6 +18,22 @@ import json
 import sys
 
 GB = 1e9
+
+
+def load(path) -> dict:
+    """A trace file as ``{"sections": [...], "run": {...}, "receipts": [...]}``."""
+    trace = dict(sections=[], run={}, receipts=[])
+    with open(path) as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if "name" in rec:
+                trace["sections"].append(rec)
+                trace["run"] = rec.get("run") or trace["run"]
+            else:
+                trace.update(rec)
+    return trace
 
 
 def rows(trace: dict) -> list:
@@ -68,8 +87,7 @@ def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     everything = "--all" in args
     for path in (a for a in args if a != "--all"):
-        with open(path) as handle:
-            print(f"## {path}\n" + table(json.load(handle), everything))
+        print(f"## {path}\n" + table(load(path), everything))
     return 0
 
 
