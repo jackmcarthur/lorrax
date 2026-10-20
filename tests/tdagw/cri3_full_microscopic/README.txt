@@ -30,13 +30,17 @@ reference has a different coherent functional and alone cannot isolate
 collision damping. The matched B/C comparison isolates W updates only
 subject to the documented numerical and statistical approximations.
 
-Requested larger-window follow-up: 30 valence plus14 conduction corresponds
+Optional --active-window 30v14c
+prepares the requested larger-window follow-up. 30 valence plus14 conduction corresponds
 to zero-based[100,144), or system ibndmin=101, ibndmax=144, ivbm=130.
-It is not a completed run or an automatic option of these 2v2c helpers.
+It is not a completed run or a default of these helpers.
 Chi already includes all160 bands, but larger external-energy transforms,
 full44x44 collision matrices, wider active phases and snapshot storage
-still need pricing. Adapt the window authentication/plotting before using
-these helpers on44 bands; do not relabel 2v2c data as the larger window.
+still need pricing. Manifest/header authentication and gap/mixing diagnostics
+support both windows; plotting requires actual matching44-band static A
+data via --a-root, not the existing2v2c reference. The manifest reports the
+density-output size only, not all snapshot/source/model residency. Do not
+relabel 2v2c data as the larger window.
 The saved canonical DFT energy table (current160_energy.npz, SHA256
 e87acf02e2286cf6fb5423eed73476e064b8b982499e49883a86f3dc85254b09)
 spans6.70403eV in[100,144), versus8.39510eV in[88,144) and1.85550eV

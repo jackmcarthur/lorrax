@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 
@@ -38,6 +39,8 @@ def main():
     p.add_argument('--refresh-fs', type=float, default=.5)
     p.add_argument('--tf-fs', type=float, default=10.)
     p.add_argument('--support-sites-ev', default='')
+    p.add_argument('--active-window', choices=('2v2c', '30v14c'), default='2v2c',
+                   help='propagated window only; screening retains all160 source bands')
     p.add_argument('--leg-budget-s', type=float, default=3600.)
     p.add_argument('--storage-gib', type=float, default=64.)
     a = p.parse_args()
@@ -45,6 +48,7 @@ def main():
         p.error('--source-tree must be the complete immutable 40-character tree hash')
     if min(a.refresh_fs, a.tf_fs, a.leg_budget_s, a.storage_gib) <= 0:
         p.error('cadence, final time and explicit budgets must be positive')
+    lo, hi = (128, 132) if a.active_window == '2v2c' else (100, 144)
     root, ref, source = Path(a.out).resolve(), Path(a.ref).resolve(), Path(a.source).resolve()
     launch_root = Path(a.launch_root).resolve() if a.launch_root else root
     launch_source = str(Path(a.launch_source).resolve()) if a.launch_source else str(source)
@@ -66,10 +70,10 @@ def main():
             deck = dict(control=dict(calc_type='COHSEX',
                 timesteps=dict(t0=0., tf=a.tf_fs*1000., dt_measure=50., ntcheck=5),
                 files=dict(outdir=str(out))),
-                system=dict(ibndmin=129, ibndmax=132, ivbm=130, geometry='slab', esmear=.05,
+                system=dict(ibndmin=lo+1, ibndmax=hi, ivbm=130, geometry='slab', esmear=.05,
                     depopulation=0., dephasing=0., Efunc=dict(E_x=pulse,E_y=0.,E_z=0.)),
                 measurements=dict(types=['Efield','polarization','carrier_density','density_matrix'],
-                    **{'3':dict(dataset_name='rho_full',brange1=[129,133],brange2=[129,133])}),
+                    **{'3':dict(dataset_name='rho_full',brange1=[lo+1,hi+1],brange2=[lo+1,hi+1])}),
                 lorrax=dict(method='cfm4',dt=25.,n_corr=2,chunk=5,stiff_modes=0,
                     system='bundle',bundle_input=str(ref/'oneshot.in'),dipole_file=str(ref/'dipole.h5'),
                     model='isdf',collision='raw',collision_source=launch_source,collision_screening=arm,
@@ -89,8 +93,10 @@ def main():
     manifest = dict(status='PREPARED_NOT_AUTHORIZED_OR_RUN',source=launch_source,
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),source_tree=a.source_tree,
         source_recipe='native full-map shared-pole; no prototype rank/order/sample controls',
-        microscopic_space=dict(nmu=978,nq=36,virtual_bands=160,active_zero_based=[128,132],
+        microscopic_space=dict(nmu=978,nq=36,virtual_bands=160,active_zero_based=[lo,hi],
                                response_partition_zero_based=[88,144]),
+        active_window_status='PREPARED_ONLY; no leakage, cost or convergence admission',
+        density_output_bytes_per_trial=math.ceil(a.tf_fs/.05)*36*(hi-lo)**2*16,
         hamiltonian='absolute hHF[fullrho]+MH[rho,H], converged inner solve; NOT reference anchored',
         statistics='retarded_reference',collision='raw; no equilibrium subtraction or trace repair',
         gamma_ev=.05,eta_ev=.1,tf_fs=a.tf_fs,refresh_fs=a.refresh_fs,
@@ -101,10 +107,13 @@ def main():
         common_source_storage_gib=a.storage_gib,
         health=dict(rho_min=-1e-3,rho_max=1.001,trace_error_electrons_per_cell=1e-3,
             fresh_trace_relative=1e-8,fresh_trace_per_fs=1e-8),
-        static_A=dict(scope='existing static TD-aGW benchmarks, NOT same coherent functional as B/C',
-            root='/home/jackm/mgkba_campaign_20261019/coherent_strong_calibration_2v2c',
-            remote_root='/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/coherent_strong_calibration_2v2c',
-            tags=['E7e+09_off','E1e+10_off']),runs=rows)
+        static_A=dict(scope='static TD-aGW, NOT same coherent functional as B/C; exact active-window match required',
+            root=('/home/jackm/mgkba_campaign_20261019/coherent_strong_calibration_2v2c'
+                  if a.active_window == '2v2c' else ''),
+            remote_root=('/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/coherent_strong_calibration_2v2c'
+                         if a.active_window == '2v2c' else ''),
+            tags=['E7e+09_off','E1e+10_off'],
+            status='existing2v2c only' if a.active_window == '2v2c' else 'NO_MATCHED_STATIC_A_YET'),runs=rows)
     (root/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     print(json.dumps(manifest,indent=2))
 
