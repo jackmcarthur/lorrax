@@ -95,13 +95,11 @@ conduction window (the old `v_x_vc` default) only warns.
 ## dipole — `psp.get_dipole_mtxels`
 
 Computes the velocity matrix elements
-$\langle mk|\hat v_a|nk\rangle = \langle mk|2(k+G)_a + s\,\partial V_\mathrm{NL}/\partial k_a|nk\rangle$
+$\langle mk|\hat v_a|nk\rangle = \langle mk|2(k+G)_a + \partial V_\mathrm{NL}/\partial k_a|nk\rangle = \langle mk|i[H, r_a]|nk\rangle$
 (Ry atomic units) for every full-BZ $k$ and Cartesian $a$, with the nonlocal
-term from the analytic $k$-derivative of the projectors. The sign $s$ is
-`vnl_velocity_sign` (deck key or `--vnl-velocity-sign`; unset resolves to
-`+1`, stamped as `prov_vnl_velocity_sign`). Consumed by `gw.head_correction`
-for the $q\to0$ head $S(\omega)$ of Σ and by the BSE. The operator, its sign,
-the links and the artifact are owned by
+term from the analytic $k$-derivative of the projectors. Consumed by
+`gw.head_correction` for the $q\to0$ head $S(\omega)$ of Σ and by the BSE. The
+operator, the links and the artifact are owned by
 [the velocity operator](theory/qp-velocity.md).
 
 Reads the deck (`wfn_file`, `nval`, `ncond`, `nband`, `bispinor`) and the
@@ -109,10 +107,11 @@ Reads the deck (`wfn_file`, `nval`, `ncond`, `nband`, `bispinor`) and the
 `dipole.h5` (`file_io.dipole`): `dipole_cart` `(3, nk, nb, nb)`,
 `band_energies` `(nk, nb)` (readers derive $E_b - E_{b'}$), and root provenance attributes (`prov_wfn_sha256` and its
 fingerprint scheme, `prov_{nval,ncond,nband,nb_written,wfn_file}`, the
-representation, V_NL and $q\to0$-operator schemes). `check_dipole_provenance`
-refuses a file whose WFN, band extent, representation or V_NL convention does
-not match the run, or whose operator scheme is unstamped; the fix is to rerun
-this driver. The sweep shards bands over the mesh and SlabIO writes the
+representation, V_NL and $q\to0$-operator schemes) and `format_version` (2).
+Every reader refuses a file without format version 2 (`GATE
+dipole_format_version`), and `check_dipole_provenance` refuses a file whose
+WFN, band extent, representation or V_NL inclusion does not match the run, or
+whose operator scheme is unstamped; the fix is to rerun this driver. The sweep shards bands over the mesh and SlabIO writes the
 velocity from those shards; no rank gathers the table.
 
 Invoke: `python3 -m psp.get_dipole_mtxels -i deck.in [--out dipole.h5]`.
@@ -121,7 +120,6 @@ Invoke: `python3 -m psp.get_dipole_mtxels -i deck.in [--out dipole.h5]`.
 |---|---|---|
 | `--vnl-mode` | `analytic` | nonlocal velocity by analytic $dZ/dK$, or `numeric` finite differences (`--vnl-h`, `--vnl-h-rel`, `--vnl-num-scheme naive\|richardson`) |
 | `--skip-vnl` | off | write $\hat p$ only (BerkeleyGW `use_momentum`) |
-| `--vnl-velocity-sign` | deck, else `+1` | relative sign of $i[r,V_\mathrm{NL}]$ |
 | `--pseudo-dir` | deck directory | where the `*.upf` live |
 | `--with-finite-q` / `--iq-list` | off / all | also write the `finite_q/` group (`rho_cvkq`, symmetrized `v_cvkq`, `kminq_idx`); its conduction axis is sized by the producer's `ncond` |
 | `--parallel-transport-out` | `parallel_transport.h5` beside `--out` | the link and velocity artifact read by `sc_head_update` ([its schema](theory/qp-velocity.md#9-the-artifact-parallel_transporth5)). `--no-parallel-transport` skips it; `--parallel-transport-velocity-only` writes only the velocity stage |

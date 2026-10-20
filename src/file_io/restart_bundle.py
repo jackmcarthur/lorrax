@@ -975,8 +975,8 @@ def load_dipole_h5(path: str | Path, *, wfn_path):
 
     Returns
     -------
-    dipole_cart : (3, nk, nb, nb) complex128 — ⟨mk|v̂_α|nk⟩ (Ry), at the arm
-                  the file was built with (its ``prov_vnl_velocity_sign``).
+    dipole_cart : (3, nk, nb, nb) complex128 — ⟨mk|v̂_α|nk⟩ (Ry), the
+                  velocity i[H, r] (p alone for a ``--skip-vnl`` file).
     deltaE      : (nk, nb, nb) float64       — E_b - E_b' (Ry), derived from
                   ``band_energies`` (``file_io.dipole.delta_e``).
     attrs       : dict with ``nbands, nk``.
@@ -991,9 +991,10 @@ def load_dipole_h5(path: str | Path, *, wfn_path):
             f"``--skip-vnl`` writes the momentum operator only, which is the "
             f"arm that matches BerkeleyGW's ``use_momentum``; drop it to get "
             f"the full velocity including the nonlocal commutator.")
-    from .dipole import delta_e, require_dipole_basis
+    from .dipole import delta_e, require_dipole_basis, require_dipole_format
     with h5py.File(str(path), "r") as f:
         attrs = dict(f.attrs)
+        require_dipole_format(attrs, dipole_path=path)
         require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
         dipole_cart = np.asarray(f["dipole_cart"][:], dtype=np.complex128)
         deltaE = delta_e(f)
@@ -2382,8 +2383,11 @@ def open_zeta(path, **kwargs):
 
 def read_dipole_metadata(path):
     """Return small dipole provenance and coverage attributes."""
+    from .dipole import require_dipole_format
     with h5py.File(path, "r") as f:
-        return dict(f.attrs)
+        attrs = dict(f.attrs)
+    require_dipole_format(attrs, dipole_path=path)
+    return attrs
 
 
 def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh):
@@ -2398,9 +2402,10 @@ def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh):
     per-rank copy of the whole ``(nb, nb)`` file.  COLLECTIVE over ``mesh``.
     """
     from runtime.padding import padded_axis
-    from .dipole import LEGACY_DELTA_E_DATASET, delta_e_cv
+    from .dipole import LEGACY_DELTA_E_DATASET, delta_e_cv, require_dipole_format
     from .slab_io import SlabIO
     with h5py.File(path, "r") as f:
+        require_dipole_format(f.attrs, dipole_path=path)
         _, nk, nb, _ = f["dipole_cart"].shape
         nv = max(0, min(int(nelec), int(nb)))
         nc = int(nb) - nv
@@ -2452,9 +2457,10 @@ def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
     ``48 nk_tot nb^2``, is the larger object.
     """
     from runtime.padding import padded_axis
-    from .dipole import DIPOLE_DATASET
+    from .dipole import DIPOLE_DATASET, require_dipole_format
     from .slab_io import SlabIO
     with h5py.File(path, "r") as f:
+        require_dipole_format(f.attrs, dipole_path=path)
         _, nk_file, nb_file, _ = f[DIPOLE_DATASET].shape
     if nk_file != int(nk_full):
         raise ValueError(
@@ -2487,16 +2493,17 @@ def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
     return out
 
 
-def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, vnl_velocity_sign, hubbard=None):
+def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, hubbard=None):
     """``[(stamp, file value, run value)]`` for the velocity-operator stamps of
     ``dipole.h5`` that differ from the run's; an absent stamp counts as different
     (the operator that built the file cannot be named).  ``hubbard`` (``'none'``
     or ``psp.hubbard_ops``' JSON) joins them when given; an absent
     ``prov_hubbard`` predates V_U and reads as ``'none'``.  Empty when all agree."""
     from psp.get_dipole_mtxels import _prov_ne
-    want ={"prov_skip_vnl": skip_vnl, "prov_vnl_mode": vnl_mode,
-            "prov_vnl_velocity_sign": vnl_velocity_sign}
+    from .dipole import require_dipole_format
+    want = {"prov_skip_vnl": skip_vnl, "prov_vnl_mode": vnl_mode}
     with h5py.File(str(path), "r") as h5:
+        require_dipole_format(h5.attrs, dipole_path=path)
         attrs = {k: h5.attrs[k] for k in (*want, "prov_hubbard") if k in h5.attrs}
     bad = [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
            if k not in attrs or _prov_ne(attrs[k], v)]
@@ -3999,7 +4006,7 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
 
 def check_dipole_provenance(
     path, *, wfn, nval, ncond, nband,
-    bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
+    bispinor=None, skip_vnl=None, vnl_mode=None,
     wfn_fingerprint_binding=None,
     print_fn=print,
     hubbard=None,
@@ -4024,8 +4031,10 @@ def check_dipole_provenance(
     from common import sanity
     from common.parallel_transport import fingerprint_from_binding
 
+    from .dipole import require_dipole_format
     try:
         with h5py.File(str(path), "r") as h5:
+            require_dipole_format(h5.attrs, dipole_path=path)
             attrs = {k: h5.attrs[k] for k in _PROV_ATTRS if k in h5.attrs}
             ncond_mismatch = (
                 "prov_ncond" not in attrs
@@ -4086,7 +4095,6 @@ def check_dipole_provenance(
         "prov_bispinor": bispinor,
         "prov_skip_vnl": skip_vnl,
         "prov_vnl_mode": vnl_mode,
-        "prov_vnl_velocity_sign": vnl_velocity_sign,
     }
     want.update({key: value for key, value in optional.items()
                  if value is not None})
@@ -4137,8 +4145,6 @@ def check_dipole_provenance(
         f"  dipole.h5 provenance OK (WFN {want['prov_wfn_sha256'][:12]}…, "
         f"window nval={int(nval)} ncond={int(ncond)} nband={int(nband)}"
         + (f", bispinor={bool(bispinor)}" if bispinor is not None else "")
-        + (f", vnl_velocity_sign={float(vnl_velocity_sign):+.1f}"
-           if vnl_velocity_sign is not None else "")
         + ")")
     return True
 

@@ -4,7 +4,7 @@
 resolves the DFT+U stamp the dipole file must carry. Without the deck's
 ``hubbard_input`` / ``hubbard_occupations`` in those params, a WFN whose QE
 schema declares DFT+U refuses with ``GATE dftu_velocity_input`` before
-map 0. A dipole file without i[r, V_U] (stamp ``'none'`` or absent) refuses
+map 0. A dipole file without i[V_U, r] (stamp ``'none'`` or absent) refuses
 by name as a velocity-operator mismatch, under ``LORRAX_SANITY=0`` too. The
 schema, the card parse, the dipole file and the dipole producer module (whose
 import starts the runtime) are stubbed; the refusal rule and the params
@@ -36,7 +36,7 @@ def _config(hubbard_input, hubbard_occupations):
         bgw_metal_q0_treatment=None, correction="no_local_fields")
     return SimpleNamespace(
         head=head, bispinor=False, bispinor_gw="bare_transverse",
-        nval=4, ncond=4, nband=8, vnl_velocity_sign="+1", do_screened=True,
+        nval=4, ncond=4, nband=8, do_screened=True,
         hubbard_input=hubbard_input, hubbard_occupations=hubbard_occupations)
 
 
@@ -57,7 +57,6 @@ def dftu_schema(monkeypatch):
 
     monkeypatch.setattr(hubbard_ops, "resolve_hubbard_input", resolve)
     monkeypatch.setitem(sys.modules, "psp.get_dipole_mtxels", SimpleNamespace(
-        resolve_vnl_velocity_sign=lambda cli, deck: int(deck),
         _prov_ne=lambda got, want: str(got) != want if isinstance(want, str)
         else int(got) != int(want)))
 
@@ -93,7 +92,9 @@ def test_dftu_schema_without_hubbard_keys_still_refuses(dftu_schema):
 
 @pytest.mark.parametrize("stamp", ["none", None])
 def test_dipole_without_hubbard_stamp_refuses_with_sanity_off(dftu_schema, monkeypatch, stamp):
-    attrs = {"prov_skip_vnl": 0, "prov_vnl_mode": "analytic", "prov_vnl_velocity_sign": 1}
+    from file_io.dipole import DIPOLE_FORMAT_ATTR, DIPOLE_FORMAT_VERSION
+    attrs = {"prov_skip_vnl": 0, "prov_vnl_mode": "analytic",
+             DIPOLE_FORMAT_ATTR: DIPOLE_FORMAT_VERSION}
     if stamp is not None:
         attrs["prov_hubbard"] = stamp
 

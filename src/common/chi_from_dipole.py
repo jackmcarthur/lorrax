@@ -30,10 +30,8 @@ family — the mini-BZ exchange-head moment ``M_ab = <v(q) q_a q_b>_cell``
 is the next one — is Cartesian, and states its power of q, by the same
 rule.
 
-The velocity convention is the FILE's, not this module's: read it from
-the h5's ``prov_vnl_velocity_sign`` attribute (-1 is the legacy arm, +1
-the default since 2026-08-09; an absent attribute means a file written
-before the stamp existed, which is the legacy arm).
+The velocity is the file's ``dipole_cart``, i[H, r] (``file_io.dipole``);
+:func:`read_dipole_h5` refuses a file older than the current dipole format.
 
 Public API
 ----------
@@ -139,8 +137,9 @@ import jax.numpy as jnp
 
 
 def read_dipole_h5(path: str) -> tuple[jnp.ndarray, jnp.ndarray]:
-    from file_io.dipole import delta_e
+    from file_io.dipole import delta_e, require_dipole_format
     with h5py.File(path, "r") as h5:
+        require_dipole_format(h5.attrs, dipole_path=path)
         dipole_np = np.asarray(h5["dipole_cart"])  # (3, nk, nb, nb)
         deltaE_np = delta_e(h5)                    # (nk, nb, nb)
     return jnp.asarray(dipole_np, dtype=jnp.complex128), jnp.asarray(deltaE_np, dtype=jnp.float64)

@@ -483,11 +483,10 @@ def load_parallel_transport_head(
         if ints["schema_version"] != int(SCHEMA_VERSION):
             refusals.append(
                 f"schema_version={ints['schema_version']}, "
-                f"expected {int(SCHEMA_VERSION)} (schema 4 stores links on "
-                "the point-group-closed shell of common.parallel_transport."
-                "link_stencil; fix: rerun the dipole step, get_dipole_mtxels, "
-                "to rebuild the links; sc_head_update = dft_velocity still "
-                "reads the old file)"
+                f"expected {int(SCHEMA_VERSION)} (schema 5 stores the one "
+                "velocity i[H, r] and links on the point-group-closed shell "
+                "of common.parallel_transport.link_stencil; fix: rerun the "
+                "dipole step, get_dipole_mtxels, to regenerate the artifact)"
             )
         if ints["connection_complete"] != 1:
             refusals.append("connection_complete is not 1")
@@ -772,12 +771,13 @@ def load_dft_velocity_head(
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
         )
         refusals = []
-        # Schemas 3 and 4 change only the link-consumer contract (4: the
-        # link_stencil shell).  The DFT velocity payload and all provenance
-        # fields are schema-2 compatible, and this mode consumes no links.
-        if schema not in (2, 3, int(SCHEMA_VERSION)):
+        # Schema 5 is the first whose velocity can only be i[H, r]; older
+        # artifacts may hold the retired assembly.
+        if schema != int(SCHEMA_VERSION):
             refusals.append(
-                f"schema_version={schema}, expected 2, 3 or {SCHEMA_VERSION}")
+                f"schema_version={schema}, expected {SCHEMA_VERSION}; "
+                "regenerate the artifact with the dipole step "
+                "(python -m psp.get_dipole_mtxels -i <deck>)")
         if band_start != 0 or band_stop < nb:
             refusals.append(
                 f"band manifold [{band_start},{band_stop}) does not contain "
@@ -4095,21 +4095,17 @@ def _head_velocity_operator(config, meta):
     carrier ``dipole.h5``) and :func:`head_hall_operator_stamps` (the Hall
     artifact), so the two cannot name different operators.
     """
-    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
     from common.four_current_model import resolve_four_current_representation
     representation = resolve_four_current_representation(
         bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
         getattr(config, "bispinor_gw", "bare_transverse"))
-    return representation, dict(
-        skip_vnl=False, vnl_mode="analytic",
-        vnl_velocity_sign=resolve_vnl_velocity_sign(
-            None, config.vnl_velocity_sign))
+    return representation, dict(skip_vnl=False, vnl_mode="analytic")
 
 
 def head_hall_operator_stamps(config, *, meta) -> dict:
     """The Hall-artifact stamps of this deck's live charge/current carrier.
 
-    The V_NL skip/mode/sign of the charge head's ``dipole.h5``
+    The V_NL skip/mode of the charge head's ``dipole.h5``
     (:func:`_head_velocity_operator`) plus the current's kinetic-balance
     lift, in :func:`file_io.static_gauge_head.hall_operator_stamps` form.
     """
@@ -4125,8 +4121,8 @@ def head_dipole_operator_stamps(config, *, wfn, meta, fallback_dir) -> dict:
 
     One resolver for the head reader and for the SC's ``dipole_qsgw.h5``
     stamp (:func:`stamp_qsgw_dipole_provenance`): the window, the full
-    analytic ``p + i[r, V_NL]`` operator with the resolved V_NL sign, the
-    head representation and the DFT+U stamp.
+    analytic ``i[H, r] = p + i[V_NL, r]`` operator, the head representation
+    and the DFT+U stamp.
     """
     representation, velocity = _head_velocity_operator(config, meta)
     return dict(
@@ -4160,8 +4156,8 @@ def read_authenticated_dipole_velocity(
     # Fail before the host read and every sharded head allocation.  Shape does
     # not identify a velocity artifact: in particular, a two-spinor dipole and
     # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
-    # The producer owns both the stamp grammar and sign resolution; consume
-    # those owners directly rather than mirroring either convention here.
+    # The producer owns the stamp grammar; consume that owner directly
+    # rather than mirroring its convention here.
     from file_io.restart_bundle import (
         check_dipole_provenance,
     )

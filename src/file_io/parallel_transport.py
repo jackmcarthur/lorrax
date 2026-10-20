@@ -39,7 +39,9 @@ from file_io.slab_io import SlabIO
 from distrib_la import eigh_local
 
 
-SCHEMA_VERSION = 4
+#: 5: the velocity is the one operator v = i[H, r]; schemas <= 4 may hold
+#: the retired p - i[V_NL, r] assembly and are refused by every reader.
+SCHEMA_VERSION = 5
 LINKS_DATASET = "links_ibz"
 SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
@@ -456,7 +458,6 @@ def initialize_parallel_transport_artifact(
     velocity_dft_kmajor,
     wfn_path: str,
     wfn_fingerprint: str,
-    vnl_velocity_sign: float,
     vnl_included: bool,
     rcond: float = 1.0e-10,
     hubbard_provenance: str | None = None,
@@ -466,15 +467,10 @@ def initialize_parallel_transport_artifact(
 ) -> None:
     """Create the schema and write exact velocity before the WFN stream.
 
-    ``vnl_velocity_sign`` / ``vnl_included`` are the operator provenance of
-    the stored velocity ``p ± i[r, V_NL]``: the resolved relative sign of the
-    nonlocal term (``common.mtxel_sweep.require_vnl_velocity_sign`` — +1 is
-    the default arm, -1 the pre-2026-08-09 one) and whether V_NL is in it at
-    all.  Both are REQUIRED and written as scalar datasets
-    ``vnl_velocity_sign`` (f64) and ``vnl_included`` (i32), the same facts
-    ``dipole.h5`` stamps as ``prov_vnl_velocity_sign``/``prov_skip_vnl``,
-    so a consumer can refuse a velocity built under an arm it does not
-    implement instead of silently reading it.
+    ``vnl_included`` is the operator provenance of the stored velocity
+    ``v = p + i[V_NL, r]``: whether V_NL is in it at all.  It is REQUIRED and
+    written as the scalar dataset ``vnl_included`` (i32), the same fact
+    ``dipole.h5`` stamps as ``prov_skip_vnl``.
 
     ``collapsed_position_kmajor`` ``(nk_full, 3, nb_pad, nb_pad)`` is the
     position operator ``Z_a`` of every collapsed axis (zero elsewhere), the
@@ -508,8 +504,6 @@ def initialize_parallel_transport_artifact(
     CrI3 9x9x1 deck) refused HERE instead, before velocity -- the object
     that carries no stencil requirement at all -- was ever written.
     """
-    from common.mtxel_sweep import require_vnl_velocity_sign
-    vnl_sign = require_vnl_velocity_sign(vnl_velocity_sign)
     nb = int(nbands)
     kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
     reduced = link_symmetry_reduction_applies(sym, kgrid, wfn=wfn)
@@ -672,7 +666,6 @@ def initialize_parallel_transport_artifact(
         io.write_attr("spin_channel", np.int32(0))
         io.write_attr("effective_nspinor", np.int32(effective_nspinor))
         io.write_attr("bispinor", np.int32(bool(bispinor)))
-        io.write_attr("vnl_velocity_sign", np.float64(vnl_sign))
         io.write_attr("vnl_included", np.int32(bool(vnl_included)))
         io.write_attr("kgrid", np.asarray(wfn.kgrid, dtype=np.int32))
         io.write_attr("kgrid_shift", np.asarray(wfn.shift, dtype=np.float64))
@@ -2211,12 +2204,12 @@ def collapsed_axis_position_operators(
 
 def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
                          gtab_file, mesh, nbands, effective_nspinor, bispinor,
-                         hubbard_provenance, wfn_path, vnl_velocity_sign,
+                         hubbard_provenance, wfn_path,
                          vnl_included, rcond, emit=print,
                          velocity_kinetic=None) -> None:
     """The artifact's velocity stage, from the producer's live sweep.
 
-    The exact DFT velocity ``v = p + i[r, V_NL]`` stays sharded and is
+    The exact DFT velocity ``v = p + i[V_NL, r]`` stays sharded and is
     direction-major'd only inside the SlabIO writer
     (:func:`initialize_parallel_transport_artifact`).  A collapsed k axis (a
     slab normal, a wire's transverse pair) has no k stencil and none is
@@ -2239,7 +2232,7 @@ def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
             velocity_dft_kmajor=velocity_kmajor,
             hubbard_provenance=hubbard_provenance, wfn_path=wfn_path,
             wfn_fingerprint=wfn_fingerprint(wfn),
-            vnl_velocity_sign=vnl_velocity_sign, vnl_included=vnl_included,
+            vnl_included=vnl_included,
             rcond=rcond, collapsed_position_kmajor=position,
             collapsed_axis_centers=centers,
             velocity_kinetic_kmajor=velocity_kinetic)
