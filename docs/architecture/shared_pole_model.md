@@ -672,6 +672,20 @@ Independent microscopic Dyson probes near suspect poles distinguish fitting
 defects from evidence for gain; neither shifts poles nor admits a failed
 model. `stop_after_model_q=0` intentionally stops after this unadmitted
 partial diagnostic, with no full-q model or self-energy claim.
+On that explicit diagnostic only, a refused growing pole also probes the
+native dielectric at the fitted pole itself and two offsets. The exact
+operator is $\epsilon=I-\mathrm{pref}\,H P^R H$, using current microscopic
+response, the same Coulomb root and prefactor as the Dyson owner, and only
+the declared polarization lag decay (no additional collision eta).
+No fitted W is evaluated at its singular denominator. A basic dielectric
+Frobenius norm/padding witness is committed before the checked native LU;
+inverse norms and verified inverse residuals go into separate transactions.
+The centroid owner's mask excludes identity padding but retains physical
+Coulomb-null directions. The verified inverse residual supplies an algebraic
+interval for the logical dielectric's smallest singular value, with an
+explicit FP64 allowance; unresolved residuals/padding refuse the interval.
+These local witnesses do not certify a physical pole or quadrature error,
+and a small relative error on a large total W is not pole validation.
 
 The source GW recipe sets finite support sites and tangential direction
 widths. Its pole budget counts positive-frequency modes; the general
