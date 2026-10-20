@@ -235,7 +235,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             # admitted batch and the retained factors: whole matrices per rank
             # where they fit, else the whole mesh.
             retained_bound = execution_receipt['retained_output_upper_bound_bytes_per_rank']
-            budget.face_room = face_eigh_room(execution_receipt['face_batch']['selection'], retained_bound,
+            # The selection row reserves its eigh stacks as native workspace: handed back to them.
+            selected = execution_receipt['face_batch']['selection']
+            budget.face_room = face_eigh_room(selected, retained_bound - int(selected['workspace_bytes_per_rank']),
                                               stage="shared-pole constructor selection")
             execution_receipt['face_eigh_room_bytes_per_rank'] = dict(selection=int(budget.face_room))
             eig = budget.eigenplan(n)

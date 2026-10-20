@@ -42,9 +42,13 @@ cuSOLVERMp LU chunks `getrs` to the posted room.
 - **Open.** Sixteen route-chooser compiles still price a program that does not run
   (CPU hsuite: `matmul.route_bytes` 10, the head Γ and ζ staged GEMMs; `place()`'s
   `mesh_bytes` 4 and `_gathered_admitted` 2): the chooser should compile the caller's
-  program once at the proposed route and run it. Frontier reported 6 programs the
-  persistent cache does not keep, unidentified. `spole.gram_reduction` and `spole.bank`
-  price above the 1.3 band (the face round's row holds its program's eigh twice). The
+  program once at the proposed route and run it. Six of them, on Frontier Fe, are not
+  kept by the persistent cache: the Dyson LU decision (`gw.response_bank._Decided.resolve`
+  -> `Plan.decision` -> `place`) compiles route-(c) `solve_lu` candidates outside
+  `distrib_la.checked_program`, so each carries a host callback. `spole.gram_reduction`
+  and `spole.bank` price above the 1.3 band (the face round's row holds its program's eigh
+  twice); `spole.direction_selection` prices 1.9x its peak (run30k 46.86 vs 24.44 GB:
+  the conservative side and the selection eigh), and it binds the minimum-P line. The
   native ncclMin agreement in the LU workspace query (B3) and the eigh memory change
   (ABI 11) are not in this landing.
 

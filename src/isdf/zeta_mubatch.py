@@ -923,8 +923,9 @@ class ZetaG:
         out = lambda ex: int(ex.memory_analysis().output_size_in_bytes)
         step = max(compiled_new_bytes(e1), out(e1) + compiled_new_bytes(e2), out(e2) + compiled_new_bytes(e3))
         tile = math.prod(nxt.sharding.shard_shape(nxt.shape)) * nxt.dtype.itemsize
-        memory.book(memory.priced(tile + step, f"zeta face G-tile chain {st.g_tile} (to_face, apply, acc "
-                                  "compiled) + the prefetched tile", increment=True))
+        # Beside the chain: the prefetched tile and the last tile the asynchronous writer holds.
+        memory.book(memory.priced(2 * tile + step, f"zeta face G-tile chain {st.g_tile} (to_face, apply, "
+                                  "acc compiled) + the prefetched and the written tile", increment=True))
         for t in range(st.n_Gt):
             Zt = nxt
             nxt = st.read_tile(t + 1) if t + 1 < st.n_Gt else None
