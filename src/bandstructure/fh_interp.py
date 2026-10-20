@@ -404,6 +404,45 @@ def ws_candidate_images(kgrid: tuple[int, int, int], lattice: np.ndarray,
     return out, valid
 
 
+#: Node values per fitted α direction required of the pair-WS node set
+#: (``ws_node_indices``): the node Gram ``QᴴQ`` must resolve every α direction
+#: or the per-pair masks are amplified by 1/σ_min² (measured: MoS2 9x9 on its
+#: 1198 centroids, rank 2040 of 2396 node values, Gram cond 1.6e6, off-grid
+#: energies off by eV).
+WS_NODES_PER_RANK = 3.0
+
+
+def ws_node_indices(fft_grid, sym, n_min: int) -> np.ndarray:
+    """An orbit-closed uniform sub-grid of the FFT grid with ≥ ``n_min`` points.
+
+    The pair-WS node set (:func:`pair_ws_lattice_images`): strides
+    ``s_i | N_i`` are tried from the coarsest down; the first sub-grid with at
+    least ``n_min`` points that every spatial operation maps onto itself is
+    returned as ``(n, 3)`` integer FFT indices.  The full grid is the last
+    resort and is always closed.
+    """
+    from symmetry_maps import verify_centroid_orbit_closure
+    grid = np.asarray(tuple(int(v) for v in fft_grid), dtype=np.int64)
+    mats = np.asarray(sym.sym_matrices)
+    tnp = np.asarray(sym.translations)[:mats.shape[0]]
+    divs = [sorted({d for d in range(1, n + 1) if n % d == 0}, reverse=True)
+            for n in grid]
+    cands = sorted({(a, b, c) for a in divs[0] for b in divs[1] for c in divs[2]},
+                   key=lambda st: (int(np.prod(grid // np.asarray(st))), st))
+    for st in cands:
+        sub = grid // np.asarray(st)
+        if int(np.prod(sub)) < int(n_min):
+            continue
+        idx = np.stack(np.meshgrid(*[np.arange(0, n, s_) for n, s_ in
+                                     zip(grid, st)], indexing='ij'),
+                       axis=-1).reshape(-1, 3)
+        if verify_centroid_orbit_closure(
+                idx / grid[None, :].astype(np.float64), mats, tnp=tnp).closed:
+            return idx
+    return np.stack(np.meshgrid(*[np.arange(n) for n in grid], indexing='ij'),
+                    axis=-1).reshape(-1, 3)
+
+
 def pair_displacement_box(centroid_frac: np.ndarray):
     """Componentwise range ``(d_lo, d_hi)`` of ``r_mu − r_nu`` (lattice coords)."""
     r = np.asarray(centroid_frac, dtype=np.float64)
@@ -431,16 +470,16 @@ def _pair_ws_weights(s_mu, a_c, valid_c, out_sharding):
     return w / jnp.sum(w, axis=-1, keepdims=True)
 
 
-def pair_ws_lattice_images(images_R, kgrid, lattice, centroid_frac, B_at_mu,
+def pair_ws_lattice_images(images_R, kgrid, lattice, node_frac, B_nodes,
                            mesh_xy: Mesh, *, log_fn=None, search: int = 2):
     """Per-orbital-pair Wigner–Seitz images of α-space lattice tensors.
 
     The off-grid Fourier sum ``X(k) = Σ_R e^{−2πik·R} X(R)`` of a coarse-grid
     lattice image is fixed only on the classes ``R + L·T`` (``L =
     diag(kgrid)``).  ``X(R)`` lives in the delocalized α basis, but its
-    kernel on the centroid nodes,
+    kernel on a real-space node set,
 
-        K_R = Q X(R) Qᴴ,   Q[(s,mu), α] = B_at_mu[α, s, mu],
+        K_R = Q X(R) Qᴴ,   Q[(s,mu), α] = B_nodes[α, s, mu],
 
     is the operator between ``r_mu + R`` and ``r_nu`` (full-Bloch gauge, the
     ``make_flat_k_ifftn`` sign), so each node PAIR keeps the images of minimal
@@ -449,7 +488,10 @@ def pair_ws_lattice_images(images_R, kgrid, lattice, centroid_frac, B_at_mu,
     by every pair, is not covariant under operations that fold the home cell
     non-uniformly (Si: 36 of 48 operations, 89 meV off-grid star spread with a
     shared Wigner–Seitz set); per-pair images are, because the centroid set is
-    orbit closed.  Back in the α basis,
+    orbit closed and the node values resolve every α direction (the nodes are
+    the orbit-closed FFT sub-grid of :func:`ws_node_indices`, ≥
+    ``WS_NODES_PER_RANK`` values per α direction; on too few nodes the masks
+    are amplified by the inverse node Gram).  Back in the α basis,
 
         X(R, T) = S⁻¹ Qᴴ (W_{R,T} ∘ K_R) Q S⁻¹,   S = Qᴴ Q,
 
@@ -462,8 +504,10 @@ def pair_ws_lattice_images(images_R, kgrid, lattice, centroid_frac, B_at_mu,
         Lattice images in :func:`build_R_grid_np` order (``fH_R``, ``P_A(R)``,
         band-operator images); all share the masks.
     kgrid : (3,) int; lattice : (3, 3) bohr rows a_i
-    centroid_frac : (n_mu, 3) fractional node coordinates of ``B_at_mu``.
-    B_at_mu : (rank, ns, n_mu) the α basis at the nodes (replicated).
+    node_frac : (n_mu, 3) fractional node coordinates
+        (``meta.ws_node_frac``).
+    B_nodes : (rank, ns, n_mu) the α basis at the nodes
+        (``meta.ws_basis_at_nodes``, replicated).
 
     Returns
     -------
@@ -472,12 +516,12 @@ def pair_ws_lattice_images(images_R, kgrid, lattice, centroid_frac, B_at_mu,
         off-grid sum is ``Σ_j e^{−2πik·R_img[j]} images[j]``.
     """
     lat = np.asarray(lattice, dtype=np.float64)
-    r = np.asarray(centroid_frac, dtype=np.float64)
-    rank, ns, n_mu = (int(v) for v in B_at_mu.shape)
+    r = np.asarray(node_frac, dtype=np.float64)
+    rank, ns, n_mu = (int(v) for v in B_nodes.shape)
     if r.shape != (n_mu, 3):
         raise ValueError(
-            f"pair_ws_lattice_images: centroid_frac {r.shape} does not match "
-            f"B_at_mu's {n_mu} nodes")
+            f"pair_ws_lattice_images: node_frac {r.shape} does not match "
+            f"B_nodes' {n_mu} nodes")
     if ns * n_mu < rank:
         raise ValueError(
             f"pair_ws_lattice_images: the α basis (rank {rank}) cannot be "
@@ -491,7 +535,7 @@ def pair_ws_lattice_images(images_R, kgrid, lattice, centroid_frac, B_at_mu,
     w_sh = NamedSharding(mesh_xy, P('x', 'y', None))
     rep = NamedSharding(mesh_xy, P())
     Q = jax.device_put(
-        jnp.reshape(jnp.transpose(jnp.asarray(B_at_mu), (1, 2, 0)),
+        jnp.reshape(jnp.transpose(jnp.asarray(B_nodes), (1, 2, 0)),
                     (ns * n_mu, rank)), rep)
     # S⁺ on the physical α span: the rank carrier's exact-null mesh pad rows
     # (zero in B and in every X(R)) are left out, so Σ_T X(R,T) = X(R) holds.
@@ -1496,9 +1540,9 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             "fills the key from _DEFAULTS for every deck), or set it "
             "explicitly.  Do NOT default it here.")
     meta.sys_dim = int(params["sys_dim"])
-    # The node coordinates of ``basis.basis_at_nodes`` (the consumed FFT-grid
-    # points, fractional): with ``lattice_bohr(wfn)`` they are the geometry of
-    # every off-grid sum's per-pair Wigner–Seitz images.
+    # The centroid coordinates of ``basis.basis_at_nodes`` (the consumed
+    # FFT-grid points, fractional): the μ axis of every ISDF tile (the W
+    # densifier's per-pair embedding reads them).
     meta.centroid_frac = (np.asarray(centroid_indices, dtype=np.float64)
                           / np.asarray(wfn.fft_grid, dtype=np.float64)[None, :])
     nsigmarange, enk_sigma = load_wfns_and_enk_for_sigma(wfn, sym, nval, ncond, nband)
@@ -1535,8 +1579,21 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
     basis_path = _resolve(basis_path) if basis_path else None
+    # Pair-WS nodes (off-grid Fourier geometry): an orbit-closed FFT sub-grid
+    # with ≥ WS_NODES_PER_RANK node values per possible α direction, evaluated
+    # in the same fit as the centroids (the basis does not depend on nodes).
+    _nb_fit = int(band_range[1] - band_range[0])
+    _ceiling = min(resolve_galerkin_rank_multiplier(
+        params.get("htransform_rank_multiplier", 20.0)) * _nb_fit,
+        int(sym.nk_tot) * _nb_fit)
+    ws_nodes = ws_node_indices(
+        wfn.fft_grid, sym,
+        int(np.ceil(WS_NODES_PER_RANK * _ceiling / int(meta.nspinor))))
+    n_cent = int(np.asarray(centroid_indices).shape[0])
     basis = streaming_galerkin_solve(
-        wfn, sym, meta, centroid_indices, mesh_xy, band_range,
+        wfn, sym, meta,
+        np.concatenate([np.asarray(centroid_indices), ws_nodes]),
+        mesh_xy, band_range,
         log_fn=log_fn, bispinor=bispinor,
         rank_multiplier=params.get("htransform_rank_multiplier", 20.0),
         qr_eps=params.get("htransform_qr_eps", 1.0e-3),
@@ -1546,6 +1603,17 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         basis_path=basis_path,
         distrib_la_batched_route=distrib_la_batched_route,
     )
+    import dataclasses
+    B_all = basis.basis_at_nodes
+    meta.ws_node_frac = (ws_nodes.astype(np.float64)
+                         / np.asarray(wfn.fft_grid, dtype=np.float64)[None, :])
+    meta.ws_basis_at_nodes = jax.device_put(
+        B_all[:, :, n_cent:], NamedSharding(mesh_xy, P()))
+    basis = dataclasses.replace(basis, basis_at_nodes=B_all[:, :, :n_cent])
+    del B_all
+    log_fn(f"  [pair-WS] off-grid node set: {ws_nodes.shape[0]} orbit-closed "
+           f"FFT sub-grid points x {int(meta.nspinor)} spinor (rank ceiling "
+           f"{int(_ceiling)})")
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, "
            f"nb={band_range[1]-band_range[0]}, rank={basis.rank_carrier}")
     return wfn, sym, meta, mesh_xy, basis, enk_sigma
@@ -1610,11 +1678,10 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 band_start: int = 0, n_return_bands: int | None = None,
                 qp_corrected_band_range: tuple[int, int] | None = None,
                 progress_fn=None, quality_record_fn=None, sym=None,
-                return_coeffs: bool = False, *, basis_at_nodes,
-                centroid_frac):
-    """``basis_at_nodes`` (rank, ns, n_mu) and ``centroid_frac`` (n_mu, 3)
-    define the per-pair Wigner–Seitz images of every off-grid sum
-    (:func:`pair_ws_lattice_images`)."""
+                return_coeffs: bool = False):
+    """``meta.ws_node_frac`` / ``meta.ws_basis_at_nodes`` (stamped by
+    :func:`initialize_wfns`) define the per-pair Wigner–Seitz images of every
+    off-grid sum (:func:`pair_ws_lattice_images`)."""
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1715,7 +1782,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     # Off-grid images: per node-pair Wigner–Seitz images of the coarse
     # supercell (pair_ws_lattice_images).  fH_R is consumed; on the coarse
     # grid the image sum equals the plain R sum exactly.
-    _geometry = (kgrid, lattice_bohr(wfn), centroid_frac, basis_at_nodes)
+    _geometry = (kgrid, lattice_bohr(wfn), meta.ws_node_frac,
+                 meta.ws_basis_at_nodes)
     R_img, (fH_img,) = pair_ws_lattice_images(
         [fH_R], *_geometry, mesh_xy, log_fn=log_fn)
     fH_R.delete()

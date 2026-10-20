@@ -298,8 +298,8 @@ def interpolate_band_operator(operator_cart, source_coefficients,
 
     ``operator_cart`` is (component,k,n,n), ``source_coefficients`` is
     (k,n,rank), and ``path_coefficients`` is (q_carrier,rank,band), exactly
-    as returned by htransform; ``geometry`` = ``(lattice_bohr, centroid_frac,
-    basis_at_nodes)`` sets the per-node-pair Wigner–Seitz images of the
+    as returned by htransform; ``geometry`` = ``(lattice_bohr, node_frac,
+    basis_at_nodes)`` (``meta.ws_node_frac``/``meta.ws_basis_at_nodes``) sets the per-node-pair Wigner–Seitz images of the
     off-grid sum (``fh_interp.pair_ws_lattice_images``).  Matrix elements use
     bra n, ket m.  The q
     carrier is cut into passes of one q per device; one ``lax.scan`` runs
@@ -367,7 +367,7 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, geometry, grid,
     residual)`` with q in C order over ``grid``.  One pass is one q_z plane:
     one dense ``(plane, n_img)`` phase over the per-node-pair Wigner–Seitz
     images of the coarse supercell (``geometry`` = ``(lattice_bohr,
-    centroid_frac, basis_at_nodes)``; ``fh_interp.pair_ws_lattice_images``),
+    node_frac, basis_at_nodes)``; ``fh_interp.pair_ws_lattice_images``),
     contracted locally on the
     ``(rank, rank)`` face (no dense-grid FFT carrier), and one face->q
     exchange.  The first ``lax.scan`` solves fH on every plane and keeps the

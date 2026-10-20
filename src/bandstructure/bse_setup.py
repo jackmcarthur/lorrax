@@ -327,7 +327,7 @@ def compute_wfns_fi(
     enk_sigma: jax.Array,
     kgrid_co: tuple[int, int, int],
     lattice_bohr: np.ndarray,
-    centroid_frac: np.ndarray,
+    ws_nodes: tuple,
     kgrid_fi=None,
     band_window_fi: tuple[int, int],
     mesh_xy: Mesh,
@@ -354,8 +354,9 @@ def compute_wfns_fi(
         kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.
         lattice_bohr: (3, 3) real-space lattice, rows a_i in bohr
                    (``fh_interp.lattice_bohr(wfn)``).
-        centroid_frac: (n_μ, 3) fractional coordinates of ``B_at_mu``'s
-                   nodes (``meta.centroid_frac`` from ``initialize_wfns``).
+        ws_nodes:  ``(node_frac (n, 3), basis_at_nodes (rank, ns, n))`` — the
+                   orbit-closed node set ``initialize_wfns`` stamps on
+                   ``meta`` (``meta.ws_node_frac``, ``meta.ws_basis_at_nodes``).
                    With the lattice, defines the per-node-pair Wigner–Seitz
                    images every off-grid q is evaluated on
                    (``fh_interp.pair_ws_lattice_images``).
@@ -588,8 +589,7 @@ def compute_wfns_fi(
     # point-group covariant; on the coarse grid it is the plain sum.
     # ``fh_interp.pair_ws_lattice_images``.
     R_img, (fH_R,) = pair_ws_lattice_images(
-        [fH_R], kgrid_co, lattice_bohr, centroid_frac, B_at_mu, mesh_xy,
-        log_fn=log)
+        [fH_R], kgrid_co, lattice_bohr, *ws_nodes, mesh_xy, log_fn=log)
 
     # ── q-points (uniform fine grid or explicit list), padded to batch ───
     if q_list is None:

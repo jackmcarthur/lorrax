@@ -875,7 +875,8 @@ def _interpolate_bse_data_to_grid(
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=coarse_grid, lattice_bohr=ht.lattice_bohr(wfn),
-        centroid_frac=meta.centroid_frac, kgrid_fi=fine_grid,
+        ws_nodes=(meta.ws_node_frac, meta.ws_basis_at_nodes),
+        kgrid_fi=fine_grid,
         band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
