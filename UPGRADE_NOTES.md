@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — memory model: prices from measurement
+
+`lxkit.memory` prices, admits and receipts every stage
+([memory model](docs/architecture/memory-model.md)). Stage prices come from the
+stages' own programs compiled and from provider size queries; distributed and
+local routes are chosen by them (`distrib_la.place`, `staged_fits`, the ζ, V(q)
+and Galerkin choosers), and every whole N_μ-scale site has a mesh route. The
+cuSOLVERMp LU chunks `getrs` to the posted room.
+
+- **Results.** Unchanged within the solvers' tolerances; routes can move where
+  the compiled figure differs from the old closed form.
+- **API.** `common.gpu_utils.warn_over_budget`, `record_stage_price`,
+  `set_device_budget_gb` and `stage_prices` are gone: use `lxkit.memory.admit`,
+  `book` and `set_budget`.
+- **Environment.** New diagnostics: `LORRAX_MEMORY_RECEIPTS=calibrate`,
+  `LORRAX_MEMORY_STRICT=1`, `LORRAX_MEMORY_TRACE=<path>`, `LORRAX_NMU2_BACKUP=report`
+  ([env vars](docs/reference/env_vars.md)). No deck change.
+
 ## 2026-10-20 — W densifier: per-centroid-pair Wigner–Seitz embedding
 
 `bse_k_grid` and `exciton_bands --w-coarse-grid` now embed each coarse R class

@@ -272,9 +272,9 @@ then equals the explicit one) and otherwise none: the plan is native, runs
 route (c), and refuses by name at the first stack that needs the whole mesh
 (`GATE eigh_capacity_route`, `Plan.require_capacity`), announced once on rank 0.
 
-- **Route (c)** when the program that runs the stack, priced from the shapes
-  (`_stack_price`: `BATCH_EIGH_TILES` = 8 n² per whole matrix a rank holds,
-  plus the checked chain's temporaries), fits the room. An eager call's
+- **Route (c)** when the program that runs the stack, compiled at the abstract
+  face stack (`_stack_bytes`; about 8 n² per whole matrix a rank holds, plus the
+  checked chain's temporaries), fits the room. An eager call's
   program, and a traced one inside `checked_program`'s first program, holds
   its first attempt, and the retries run as a second program only when that
   check fails (`checked_program`'s retry runs on the whole mesh); any other
@@ -309,10 +309,10 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   rank. `_route=` on `batched` is the test-only override.
 - **A caller may decide the route itself, from the shapes.**
   `eigh_stack_bytes(plan, shape, dtype)` is what a batched eigh of a face
-  stack adds per rank beside its operand: on route (c) `BATCH_EIGH_TILES`
-  (8) n² elements per whole matrix a rank holds (compiled size plus the
-  vendor query, B11: 7.96–7.98 at P64, 7.9–8.0 at P4); on the whole mesh the
-  vectors stack, the values and one solve's workspace. The bispinor sector
+  stack adds per rank beside its operand: the program of the route `place()`
+  decides, compiled at the abstract stack, plus the provider's size query off
+  route (c) (about 8 n² per whole matrix a rank holds on route (c); on the whole
+  mesh the vectors stack, the values and one solve's workspace). The bispinor sector
   constructor prices each stack so and passes an explicit route-(c) or
   whole-mesh plan (`gw.shared_pole_execution.staged_eigh`): no room, no
   sizing compile and no exchange.
@@ -616,14 +616,6 @@ nothing and accept `float64` or `complex128` only.
   the real mesh; off CUDA it returns 0.
 - `matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend,
   batched_route)`: the same query for a `matmul` route.
-- `fits_local(plan, op, shapes, dtype, budget_bytes)`: whether
-  $\sum \mathrm{prod(shape)}\cdot\mathrm{itemsize} + \text{workspace} \le$
-  `budget_bytes` for the caller's whole per-rank set of complete matrices. The
-  workspace is the cuSolverDn query on CUDA, the LAPACK `?heevd` optimum on a
-  host (complex: `lwork = 2n + n²`, `lrwork = 1 + 5n + 2n²`,
-  `liwork = 3 + 5n`), or the compiled local GEMM temporary. The budget must be
-  the same on every rank, because the answer selects collectives.
-
 Operand carriers, transpose staging, communication buffers and persistent
 context resources are the caller's to admit.
 

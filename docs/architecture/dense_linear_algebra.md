@@ -275,19 +275,11 @@ A Hermitian stack $(B, n, n)$ on the face has two routes.
 **Route (c), whole matrices per device.** Move the stack to the batch layout
 (§2), run the native JAX eigh on each device's $\lceil B/P\rceil$ whole
 matrices, move the eigenvectors back to the face
-(`ROUTE_BATCH_RESHARD`, `services/distrib_la/src/distrib_la/plan.py:121`). No
-distributed library runs. Its price beside the operand is
-
-$$
-\texttt{eigh\_stack\_bytes} = \Big\lceil \frac{B}{P}\Big\rceil\; 8\,n^2\, s ,
-\tag{D 3}
-$$
-
-eight $n^2$ tiles per whole matrix a device holds: the input copy, the
-exchanges, the local solve with its workspace and the vectors
-(`BATCH_EIGH_TILES = 8`, `plan.py:395`, measured at 7.9–8.0 on bundle B11 at
-P4 and P64; `eigh_stack_bytes`,
-`services/distrib_la/src/distrib_la/workspace.py:306`).
+(`ROUTE_BATCH_RESHARD`). No distributed library runs. Its price beside the
+operand is the route's program compiled at the abstract face stack (never run):
+the input copy, the exchanges, the local solve with its workspace and the
+vectors, about eight $n^2$ tiles per whole matrix a device holds
+(`distrib_la.eigh_stack_bytes`).
 
 **The capacity route, the whole mesh.** Each matrix is solved by the
 platform's distributed eigensolver over all $P$ devices (cuSOLVERMp `syevd` on
@@ -295,15 +287,12 @@ CUDA, ScaLAPACK `pzheevd` on CPU), one matrix after another. Per device it
 holds the vectors stack $sBn^2/P$, the values and one solve's workspace. It is
 the only route for a matrix that does not fit one device.
 
-**The decision.** A caller prices route (c) from the shapes and takes it when
-
-$$
-\text{boundary} + \texttt{eigh\_stack\_bytes} + \text{live stages} \le \mathcal B ,
-\tag{D 4}
-$$
-
-the boundary being the arrays live beside that eigh; otherwise the whole mesh,
-with one warning. Every site asks for the whole mesh with the deck's eigh
+**The decision.** `distrib_la.place()` takes route (c), at the fewest rounds
+whose compiled program fits the caller's room, when it is also the faster
+(`_eigh_seconds`); otherwise the whole mesh, priced by its own program compiled
+plus the provider's size query, with one warning when even that is over the
+room. Each comparison is a room test, so the decision is cached per class of
+rooms that decide it alike ([memory model § prices](memory-model.md#measured)). Every site asks for the whole mesh with the deck's eigh
 request, `LinalgResolution.eigh_backend` (`resolve_linalg`, the one owner):
 `linalg = local` asks `auto`, which is the platform's capacity eigh where one
 exists and a refusal by name (`GATE eigh_capacity_route`) at the stack that
@@ -311,9 +300,8 @@ needs it where none does (ROCm today); `linalg = distributed` asks
 `distributed`, refused at plan time where the leg has none. The shared-pole sectors decide each stack so
 (`staged_eigh`, `src/gw/shared_pole_execution.py:682`); a caller that passes a
 room instead lets `distrib_la` decide each stack by the same price
-([API § eigh-stack](../services/distrib_la/api.md#eigh-stack)). Nothing is
-compiled to be measured and no size is exchanged, so every rank decides alike
-(claim 3984).
+([API § eigh-stack](../services/distrib_la/api.md#eigh-stack)). Each figure is
+the largest any rank read and no size is exchanged, so every rank decides alike.
 
 **Checks.** No distributed eigh result is returned unchecked: eight
 fixed-seed probe columns test $\|(AZ - Z\Lambda)X\|$ and $\|(Z^\dagger Z - I)X\|$
@@ -355,6 +343,14 @@ follows from the card total and the bytes outside the XLA pool, and how a deck's
 `runtime.tiles.TILE_BYTES` instead, so their results do not depend on
 $\mathcal B$. A stage priced over $\mathcal B$ warns and runs; no planner refuses
 on a price.
+
+**LU chunks.** cuSOLVERMp's `getrs` workspace grows with the right-hand-side
+width far past the right-hand side itself, so a fused `solve_lu` runs its
+right-hand sides in column chunks: the widest divisor of the local block count
+whose workspace fits the cap posted for that shape (`Plan.chunk_room`,
+`lrx_lu_getrs_room`; 2 GiB without one), agreed over the grid. The response
+bank posts what the ledger's room leaves past getrf, the pivots and one block
+column, and prices the dispatch by the native size query at that cap.
 
 ## 7 Determinism and round-off
 
@@ -425,7 +421,7 @@ With $\mu$ the padded centroid count and $Q$ the stage's q extent:
 | W Dyson solve (`gw.w_isdf.solve_w`) | per-q dense LU, $\lceil Q/P\rceil$ whole $(\mu,\mu)$ tiles per device; the distributed plan when they do not fit the budget ([memory model § routes](memory-model.md#routes)) | `plan('solve_lu', backend='distributed').batched`, $sQ\mu^2/P$; the μ axes never leave the face |
 | W ladder resolvent (`bse.w_ladder`, `screening_diagrams = w_bse`) | one code path for both layouts; no whole-$\mu^2$ object per device | same |
 | eigensolves (htransform `fH_q`, `vq_interp` `C_q`, QSGW $H_k$) | route (c): one whole matrix per device | the capacity route: one matrix over the mesh |
-| shared-pole constructor | q-local rounds, else face rounds with each eigh stack on route (c) or the mesh by (D 4) | same ([bispinor sectors §4](bispinor_shared_pole_w.md#sector-route)) |
+| shared-pole constructor | q-local rounds, else face rounds with each eigh stack on route (c) or the mesh by `place()` | same ([bispinor sectors §4](bispinor_shared_pole_w.md#sector-route)) |
 | BSE restart load, matvec, W densify | face tiles through SlabIO and `shard_map`, $s\,n_k\mu^2/P$ | same |
 
 **Where the ζ factor saturates.** The charge factor's only parallel axis is q,
@@ -466,7 +462,7 @@ parents ([bispinor sectors §8](bispinor_shared_pole_w.md#sector-byte-budget)).
 **Its eighs still run whole.** The largest stack is the TT reduced eigh,
 $m = 20480$. On the mesh it would hold $s\,m^2/P = 105$ MB per matrix per
 device and run 61 sequential distributed solves. On route (c) each device holds
-one whole matrix, $8 m^2 s = 53.7$ GB by (D 3), beside a 16.4 GB boundary:
+one whole matrix, about $8 m^2 s = 53.7$ GB (route (c)'s program), beside a 16.4 GB boundary:
 70.1 GB before the held panels, inside 72.0. All eight stacks of the round take
 route (c) (claim 4083). The gain is the concurrency: on the same deck, CT with
 route-(c) eighs took 155.7 s at map 0 against 1251.5 s on the whole-mesh scan
