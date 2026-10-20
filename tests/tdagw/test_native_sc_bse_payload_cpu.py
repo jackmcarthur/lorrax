@@ -19,6 +19,7 @@ def test_native_bse_callback_toy_static_payload_actual_solver(tmp_path, monkeypa
     from common.collectives import device_put_process_local
     from symmetry_maps import QirrOperator
     from gw.head_correction import HeadSample
+    from lxkit import memory
     import gw.static_screening as static
     from ffi import fft
 
@@ -38,8 +39,24 @@ def test_native_bse_callback_toy_static_payload_actual_solver(tmp_path, monkeypa
     sample = HeadSample(vc0=.02+0.j, wcoul0=.01+0.j,
                         source='DECLARED_TOY_STATIC_NOT_MATERIAL', omega=0.j)
     calls = []
+    room_reads = []
+    original_room = memory.room
+    def observe_room(*, bucketed=True):
+        value = original_room(bucketed=bucketed)
+        room_reads.append((bucketed, value))
+        return value
+    monkeypatch.setattr(memory, 'room', observe_room)
     def toy_static(wfns, interaction, **kwargs):
         assert wfns is None and interaction is V
+        ledger = kwargs['meta'].shared_pole_capacity
+        # The fresh ledger sees the actual retained-source phase room BEFORE
+        # the static-W consumer. No mock allocator value or gate relaxation.
+        assert room_reads and room_reads[-1][0] is False
+        assert ledger.room_bytes == room_reads[-1][1]
+        assert ledger.room_bytes is not None
+        assert ledger is not meta.shared_pole_capacity
+        price = ledger.preview(resident_bytes_per_rank=0, workspace_bytes_per_rank=0)
+        assert price['available_device_bytes_per_rank'] == ledger.room_bytes
         calls.append(kwargs)
         return W, sample
     monkeypatch.setattr(static, 'build_static_screened_w', toy_static)

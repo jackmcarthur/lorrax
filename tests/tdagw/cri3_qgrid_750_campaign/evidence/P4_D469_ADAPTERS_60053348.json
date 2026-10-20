@@ -1,0 +1,99 @@
+{
+  "status": "PASS_SOFTWARE_ONLY_NOT_MATERIAL_OR_TD",
+  "material_admitted": false,
+  "SC_calculation_performed": false,
+  "TD_propagated_fs": 0,
+  "revision": "d469c49e0e7197a384990a4fe2817f9ce1e3bafe",
+  "source_root": "/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/qgrid_20261020/source/d469c49",
+  "archive_sha256": "bf9a952e6fb7197a5fa3892559753fc3a76d37d1f8e01e213b665dad7824cfe6",
+  "harness_sha256": "cd2f837cc48dc68e9f8de8ac5b1e2e866f89985b7725ece734c8961f8b361281",
+  "max_wall_seconds": 160.0,
+  "max_active_GPUh": 0.2,
+  "fixture": {
+    "electronic_kgrid": [
+      4,
+      1,
+      1
+    ],
+    "qgrid": [
+      4,
+      1,
+      1
+    ],
+    "bands": 8,
+    "mu": 4,
+    "spinor": 2
+  },
+  "ffi_route": "mathdx",
+  "stages": {
+    "native_padding_scalar_gate": {
+      "max_seconds": 0.6921279720008897,
+      "min_seconds": 0.6909901769977296,
+      "result": {
+        "logical_bands": 7,
+        "padded_bands": 8,
+        "exact_zero_padding_accepted": true,
+        "producer_energy_sentinel_preserved": true,
+        "scope": "real_native_prepare_collective_scalar_gate_not_full_snapshot_W_fit"
+      }
+    },
+    "native_HF_delta": {
+      "max_seconds": 22.360586931001308,
+      "min_seconds": 22.359119127999293,
+      "result": {
+        "max_error_ha": 4.338508201418539e-19,
+        "native_custom_call_sites": 1,
+        "native_targets": [
+          "lorrax_mathdx_kconv_klead_outer_decode"
+        ],
+        "count_scope": "static_compiled_HF_HLO_sites_NOT_total_GPU_launches",
+        "compiled_temporary_bytes": 22032,
+        "hf_zero_at_reference": true,
+        "head_applications": 1
+      }
+    },
+    "native_ordered_Sigma_tail": {
+      "max_seconds": 28.63580328700118,
+      "min_seconds": 28.632911216001958,
+      "result": {
+        "max_complex_tail_error_ry": 8.936330254654439e-11,
+        "counts": [
+          4,
+          6,
+          8
+        ],
+        "active_rates_match": true,
+        "retained_matrix_counts": [
+          0,
+          2,
+          4
+        ],
+        "window_tau_pairs": 120,
+        "n_windows": 8,
+        "native_custom_call_launch_count": "not_instrumented; HF static-HLO count reported separately"
+      }
+    },
+    "native_BSE_declared_toy_static": {
+      "max_seconds": 11.292871718000242,
+      "min_seconds": 11.292488605999097,
+      "result": {
+        "residual_ev": [
+          2.3326452708362582e-15
+        ],
+        "energies_ev": [
+          11.565349918786755
+        ],
+        "iterations": 4,
+        "static_screening": "DECLARED_TOY_ONLY",
+        "optical_strength": 2.1873790753250737
+      }
+    }
+  },
+  "native_launch_count_scope": "not_global_instrumented",
+  "fixture_seconds": {
+    "max": 0.13547503800145932,
+    "min": 0.13434721299927332
+  },
+  "phase": "native_BSE_declared_toy_static",
+  "elapsed_s": 76.43898339400039
+}

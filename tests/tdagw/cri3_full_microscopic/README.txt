@@ -6,6 +6,15 @@ Hamiltonian fixed point, or 10 fs trajectory has passed. See the current
 numerical evidence in docs/theory/td_agw_dynamical.md before launching.
 Do not substitute the earlier spatially projected B/C trajectories.
 
+native_bse_probe.py is an optional synchronous fine-grid accepted-SC callback,
+not a material-qualified optical calculation. Before static W synthesis its
+fresh capacity ledger collectively binds the actual allocator room, with the
+full-band source faces/V/velocity still live. Native BSE owners separately
+price their payload, Krylov and matvec workspaces; the static-W ledger is not
+a complete material peak measurement or an OOM guarantee. Budget warnings
+retain the existing WARN/admit policy. The CPU toy-static payload test checks
+this live-room binding and actual BSE/head/FFT/dipole/residual owners only.
+
 prepare.py writes new source-hashed manifests and native TD decks. Supply
 the actual source deck, 516/07 bundle, new output directory, and complete
 immutable SOURCE TREE hash, not a commit hash. Use --launch-root and

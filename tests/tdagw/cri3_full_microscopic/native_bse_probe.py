@@ -109,6 +109,10 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
         raise ValueError("BSE probe needs full fine-grid bare V")
     head = source["W_by_role"]["iteration_head"]
     wm = fresh_shared_pole_capacity(meta, mesh)
+    # All ranks bind the real allocator room while the source's full-band
+    # faces/V/velocity remain live. This ledger prices static W synthesis,
+    # not the later BSE payload/workspaces or a measured material peak.
+    wm.shared_pole_capacity.at_phase()
     W0, hs = build_static_screened_w(None, V, config=config, meta=wm,
         mesh_xy=mesh, shared_pole=source["W_by_role"]["shared_pole"], head_resolver=head)
     wvalues = QirrOperator.of(W0).unfold(mesh)
