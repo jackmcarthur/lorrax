@@ -302,7 +302,8 @@ def test_bare_hf_kernel_replaces_full_screened_W_and_keeps_bare_head():
 
 
 @pytest.mark.parametrize("convention", ["hf", "reference"])
-def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkeypatch, convention):
+@pytest.mark.parametrize("statistics", ["finite_lag", "retarded_reference"])
+def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkeypatch, convention, statistics):
     from common.units import RYD_TO_EV
     from tdagw import collision as C
     from tdagw.self_energy import SelfEnergyModel, zero_model
@@ -321,9 +322,11 @@ def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkey
     hcore = source["hf_reference"]["kin_ion_ry"].at[:, 1, 2].set(0.015j).at[:, 2, 1].set(-0.015j)
     source["hf_reference"]["kin_ion_ry"] = hcore
     M = np.broadcast_to(np.array([[0.04, 0.006j], [-0.006j, -0.01]]), (nk, na, na)).copy()
+    basis_calls = []
 
     def factory(prepared, options):
-        def evaluate(basis, equilibrium=False):
+        def evaluate(basis, equilibrium=False, fit_bases=None):
+            basis_calls.append((equilibrium, fit_bases))
             U = basis["U"]
             current = U @ basis["rho"] @ U.conj().swapaxes(-1, -2)
             delta = current - rhoeq
@@ -347,7 +350,7 @@ def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkey
     # reduced static term. Only the explicitly supplied bare-HF model may
     # contribute its density increment.
     original = SelfEnergyModel(lambda p, r, t: 7.0 * (r - p[None]), reference, True, "screened red twin")
-    options = dict(statistics="finite_lag", hamiltonian=convention, hf_model=zero_model(), policy=C.RefreshPolicy(every=1.0),
+    options = dict(statistics=statistics, hamiltonian=convention, hf_model=zero_model(), policy=C.RefreshPolicy(every=1.0),
                    snapshot_tol_ev=1e-8, snapshot_steps=8)
     built = runtime.snapshot_collision(source, ops, mesh=mesh,
         k_frac=source["wfns"].green_parent.plan.k_parent_frac,
@@ -362,6 +365,13 @@ def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkey
                                    + built["state"]["one_body_counterterm_ry"], expected0, atol=1e-12)
     else:
         assert built["t0"]["prepared_density_commutator_ha"] > 0.0
+    if statistics == "retarded_reference":
+        cold_calls = [cache for equilibrium, cache in basis_calls if equilibrium]
+        if convention == "reference":
+            assert cold_calls == [None]
+        else:
+            assert all(cache is cold_calls[0] for cache in cold_calls)
+            assert cold_calls[0] is not None
     excited = rhoeq.copy()
     excited[:, 0, 0], excited[:, 1, 1] = 0.8, 0.2
     excited[:, 0, 1], excited[:, 1, 0] = 0.03j, -0.03j
@@ -370,6 +380,32 @@ def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkey
     got = built["model"].apply(result["params"][0], rho, 2.0) + result["params"][1]
     full = np.einsum("ki,ij->kij", energies, np.eye(na))[None] + np.asarray(got) * HA_IN_EV / RYD_TO_EV
     np.testing.assert_allclose(full[0], expected0 + 0.1 * (excited - rhoeq), atol=1e-9)
+    if statistics == "retarded_reference":
+        first_calls = [cache for equilibrium, cache in basis_calls if not equilibrium]
+        assert len(first_calls) > 1
+        assert first_calls[0] is not None
+        assert all(cache is first_calls[0] for cache in first_calls)
+        previous_count = len(basis_calls)
+        built["refresh"](4.0, rho, result["ops"], result["params"])
+        next_calls = [cache for equilibrium, cache in basis_calls[previous_count:] if not equilibrium]
+        assert next_calls and next_calls[0] is not first_calls[0]
+        assert all(cache is next_calls[0] for cache in next_calls)
+
+
+@pytest.mark.parametrize("acceleration", ["linear", "anderson"])
+def test_snapshot_refusal_preserves_scalar_residual_history(acceleration):
+    from tdagw.dynsig import collision_snapshot_state
+    history = []
+    _, mesh, _, _ = _source()
+    held = jax.device_put(np.zeros((1, 4, 2, 2), complex),
+        NamedSharding(mesh, P(None, ("x", "y"), None, None)))
+    shift = .001 * jnp.eye(2)
+    def evaluate(candidate):
+        return candidate + shift, None
+    with pytest.raises(ValueError, match="dynsig_collision_snapshot_convergence"):
+        collision_snapshot_state(evaluate, held, steps=3, tol_ha=1e-8,
+            acceleration=acceleration, residual_history=history)
+    np.testing.assert_allclose(history, np.full(3, .001 * np.sqrt(2)), atol=1e-14)
 
 
 @pytest.mark.parametrize("with_head", [False, True])

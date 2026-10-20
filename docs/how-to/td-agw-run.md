@@ -265,6 +265,14 @@ Hartree/Fock plus M_H material Hamiltonian; a DFT-prepared density need not be
 stationary there. Both use bare HF increments, with no static reduced-W
 subtraction. See the [theory owner](../theory/td_agw_dynamical.md#damping).
 
+For `retarded_reference`, each Hamiltonian solve fixes its numerical
+polarization fitting basis after its first sweep and refits current
+response amplitudes on every subsequent sweep. The screened interaction
+and self-energy still update every time. A new physical refresh builds a
+new basis. If the fixed basis no longer meets the response checks, the
+refresh refuses; its failure record includes the Hamiltonian residual
+history. This does not relax `collision_snapshot_tol_ev`.
+
 Converge density rank together with rational order and support count. If a
 capacity guard refuses the larger fit, explicitly raise
 `collision_projection_order` (causal-projection state count, default 400) or

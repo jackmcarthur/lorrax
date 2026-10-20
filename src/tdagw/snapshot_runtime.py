@@ -347,7 +347,7 @@ def make_snapshot_evaluator(prepared, options):
     nk_pad = ((nk + mesh.size - 1) // mesh.size) * mesh.size
     replicated = lambda value: device_put_process_local(np.asarray(value), rep)
 
-    def evaluate(basis, *, equilibrium=False):
+    def evaluate(basis, *, equilibrium=False, fit_bases=None):
         U, external, rho_a = (np.asarray(basis[k]) for k in ("U", "e", "rho"))
         energy = frozen_energy.copy()
         if options.get("frozen_edge_updates", True):
@@ -394,7 +394,9 @@ def make_snapshot_evaluator(prepared, options):
                         fit_tolerance=float(options.get("fit_tolerance", 0.02)),
                         max_pencil_bytes=int(options.get("max_pencil_bytes", 128 * 1024 ** 2)),
                         representative=current_screens.get(negative) if negative < iq else None,
-                        self_negative=negative == iq, collision_eta=eta)
+                        self_negative=negative == iq, collision_eta=eta,
+                        fit_basis=(fit_bases.setdefault(iq, {}) if fit_bases is not None
+                                   and negative >= iq else None))
                 elif negative < iq:
                     screen = SS.screen_snapshot_partner(current_screens[negative], sampler, check_sites)
                 else:
@@ -470,6 +472,8 @@ def make_snapshot_evaluator(prepared, options):
                 reference_support_margin_ry=receipt.get("reference_support_margin_ry"),
                 reference_modal_condition=receipt.get("reference_modal_condition"),
                 reference_modal_error=receipt.get("reference_modal_error"),
+                polarization_fit_basis=receipt.get("polarization_fit_basis"),
+                polarization_fit_basis_reused=receipt.get("polarization_fit_basis_reused"),
                 project_s=t_project - tq, screening_s=t_screen - t_project,
                 sigma_s=time.perf_counter() - t_screen))
         Uh = U.conj().swapaxes(-1, -2)
@@ -611,10 +615,12 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     params0 = model.params if hermitian == "none" else (model.params, held0)
     bases0 = bases_at(rho0, params0, 0.0)
     cold_snapshot = dict(iterations=1, residual=0.0, converged=True)
+    cold_fit_bases = {} if statistics == "retarded_reference" else None
     if convention == "hf" and hermitian != "none":
         def cold(candidate):
             bases = bases_at(rho0, (model.params, candidate), 0.0)
-            row = evaluate(bases[0], equilibrium=True)
+            row = (evaluate(bases[0], equilibrium=True, fit_bases=cold_fit_bases)
+                   if cold_fit_bases is not None else evaluate(bases[0], equilibrium=True))
             target = put(np.stack([row["m_h"][bundle_of]] * ntr) * ry_ha)
             return target, (row, bases)
 
@@ -681,11 +687,14 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
             return None
         wall = time.perf_counter()
         screening_iterations = []
+        fit_bases = [{} for _ in range(ntr)] if statistics == "retarded_reference" else None
+        residual_history = []
 
         def iterate(candidate):
             candidate_params = params if hermitian == "none" else held_term(params)[1](candidate)
             bases = bases_at(rho, candidate_params, t)
-            rows = [evaluate(basis) for basis in bases]
+            rows = ([evaluate(basis, fit_bases=fit_bases[trial]) for trial, basis in enumerate(bases)]
+                    if fit_bases is not None else [evaluate(basis) for basis in bases])
             screens = [row["screening_receipts"] for row in rows]
             screening_iterations.append(dict(
                 fit_orders=[[q["fit_order"] for q in trial] for trial in screens],
@@ -705,10 +714,12 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
                 steps=int(options.get("snapshot_steps", 32)),
                 tol_ha=float(options.get("snapshot_tol_ev", 1e-4)) / HA_IN_EV,
                 mixing=float(options.get("snapshot_mixing", 0.7)),
-                acceleration=options.get("snapshot_acceleration", "anderson"))
+                acceleration=options.get("snapshot_acceleration", "anderson"),
+                residual_history=residual_history)
         except ValueError as error:
             state["snapshot_failure"] = dict(t_fs=float(t) / fs, error=str(error),
-                                              screening_iterations=screening_iterations)
+                                              screening_iterations=screening_iterations,
+                                              residuals_ha=residual_history)
             raise
         snapshot["screening_iterations"] = screening_iterations
         t_swept = time.perf_counter()

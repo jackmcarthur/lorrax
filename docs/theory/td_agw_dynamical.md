@@ -1099,6 +1099,23 @@ fitted and independently checked. Screening does not pinch the density.
 The input response has the declared finite lag decay
 `collision_adiabatic_ev`; collision evaluation uses its separate $\eta$.
 
+Within each physical refresh's Hamiltonian fixed-point solve, the first
+current polarization fit chooses numerical state-space matrices $A,B$.
+Every subsequent iterate resamples the current full-density $P^R$ and
+refits only its output matrix $C$, so $P^R=C(zI-A)^{-1}B$. Dyson feedback
+and all retarded-reference self-energy branches are rebuilt at every
+iterate: neither $W$ nor its collective poles are frozen. Self-inverse q
+uses a fixed mirrored block basis, with no repeated rank selection or
+compression inside that solve. Independent current polarization and
+screened-response checks remain mandatory; a failed fixed-basis check
+refuses the solve without replacing the basis inside Anderson history.
+The numerical basis is discarded at the next physical refresh. An
+iterative absolute-HF cold solve has its own basis; a one-shot
+reference-anchored equilibrium fit is unchanged. This avoids a changing
+polarization approximation introducing a numerical floor into a tighter
+Hamiltonian residual. Refused snapshots retain their scalar unscaled
+residual history for diagnosis; the physical tolerance is unchanged.
+
 For the causal pole expansion $W_c^R(z)=\sum_\ell R_\ell/(z-p_\ell)$,
 the self-energy uses the zero-temperature reference branches
 

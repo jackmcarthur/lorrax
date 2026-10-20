@@ -99,3 +99,64 @@ def test_full_density_retarded_fit_keeps_coherence_and_crossed_partner():
     no_coherence = ss.polarization_from_vertices(v, energy, diagonal, partner, check, adiabatic_ry=.1)
     full = sampler(check)
     assert np.linalg.norm((full[1] - full[0]) - (no_coherence[1] - no_coherence[0])) > 1e-5
+
+
+@pytest.mark.parametrize("self_negative", [False, True])
+def test_fixed_polarization_basis_refits_current_response_and_is_deterministic(self_negative):
+    sites = np.linspace(-2, 2, 40) + .3j
+    checks = np.linspace(-1.9, 1.9, 17) + .47j
+    poles = np.array([-.8 - .1j, .8 - .1j])
+    output = np.array([.2, .1j])
+    residue = np.outer(output, output.conj())
+    state = dict(amplitude=1.0)
+    def sampler(z):
+        p = state["amplitude"] * (residue[None] / (np.asarray(z)[:, None, None] - poles[1])
+            - residue.conj()[None] / (np.asarray(z)[:, None, None] - poles[0]))
+        return np.stack((np.zeros_like(p), p))
+    basis = {}
+    opts = dict(max_order=12, fit_tolerance=1e-9, self_negative=self_negative, fit_basis=basis)
+    first = ss.retarded_reference_snapshot(sampler, sites, checks, **opts)
+    raw_A, raw_B = basis["raw_A"].copy(), basis["raw_B"].copy()
+    final_A, final_B = first["polarization_retarded"][:2]
+    state["amplitude"] = 1.0001
+    current = ss.retarded_reference_snapshot(sampler, sites, checks, **opts)
+    repeated = ss.retarded_reference_snapshot(sampler, sites, checks, **opts)
+    np.testing.assert_array_equal(basis["raw_A"], raw_A)
+    np.testing.assert_array_equal(basis["raw_B"], raw_B)
+    np.testing.assert_array_equal(current["polarization_retarded"][0], final_A)
+    np.testing.assert_array_equal(current["polarization_retarded"][1], final_B)
+    assert current["receipt"]["polarization_fit_basis_reused"]
+    assert not first["receipt"]["polarization_fit_basis_reused"]
+    assert np.linalg.norm(current["polarization_retarded"][2] - first["polarization_retarded"][2]) > 1e-8
+    for z in checks:
+        assert np.linalg.norm(kr.evaluate(current["retarded"], z) - kr.evaluate(first["retarded"], z)) > 1e-8
+        np.testing.assert_array_equal(kr.evaluate(current["retarded"], z), kr.evaluate(repeated["retarded"], z))
+        if self_negative:
+            np.testing.assert_allclose(kr.evaluate(current["correlation"], z),
+                -kr.evaluate(ss.mirror(current["correlation"]), z), atol=1e-11)
+            np.testing.assert_allclose(kr.evaluate(current["lesser"], z),
+                kr.evaluate(ss.mirror(kr.add(current["correlation"], current["lesser"])), z), atol=1e-11)
+
+
+def test_fixed_basis_refuses_missing_resonance_and_fresh_snapshot_can_rebuild():
+    fit = np.linspace(-2, 2, 40) + .3j
+    checks = np.linspace(-1.9, 1.9, 17) + .47j
+    state = dict(extra=False)
+    def sampler(z):
+        p = .04 / (np.asarray(z) - .6 + .1j)
+        if state["extra"]:
+            p += .03 / (np.asarray(z) + 1.1 + .13j)
+        p = p[:, None, None]
+        return np.stack((np.zeros_like(p), p))
+    basis = {}
+    opts = dict(max_order=12, fit_tolerance=1e-8)
+    ss.retarded_reference_snapshot(sampler, fit, checks, fit_basis=basis, **opts)
+    saved = basis["raw_A"].copy()
+    state["extra"] = True
+    with pytest.raises(ValueError, match="snapshot_reference_fit"):
+        ss.retarded_reference_snapshot(sampler, fit, checks, fit_basis=basis, **opts)
+    np.testing.assert_array_equal(basis["raw_A"], saved)
+    fresh_basis = {}
+    rebuilt = ss.retarded_reference_snapshot(sampler, fit, checks, fit_basis=fresh_basis, **opts)
+    assert not rebuilt["receipt"]["polarization_fit_basis_reused"]
+    assert fresh_basis["raw_A"].shape[0] > saved.shape[0]

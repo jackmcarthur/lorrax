@@ -336,6 +336,27 @@ def make_projected_sampler(mesh_xy, *, band_block=32):
         out_specs=P(), check_vma=False))
 
 
+def _fit_modal_outputs(sites, poles, right, values, *, rank_tolerance=1e-11):
+    """Fit all output entries on fixed modal poles/right directions.
+
+    ``values[s,out,in]`` and ``right[p,in]`` use a common finite support
+    array. Returned normalized output amplitudes and column norms allow
+    either normalized coordinates or the ORIGINAL fixed A/B coordinates.
+    """
+    nsite, nout, nin = values.shape
+    if not poles.size:
+        return np.zeros((nout, 0), complex), np.empty(0), _relative_error(np.zeros_like(values), values)
+    design = ((1.0 / (sites[:, None] - poles[None]))[:, :, None]
+              * right[None]).transpose(0, 2, 1).reshape(nsite * nin, -1)
+    norms = np.linalg.norm(design, axis=0)
+    norms = np.where(norms > 0.0, norms, 1.0)
+    design /= norms[None]
+    rhs = values.transpose(0, 2, 1).reshape(nsite * nin, nout)
+    coefficients = sla.lstsq(design, rhs, cond=rank_tolerance, lapack_driver="gelsd")[0]
+    reconstructed = (design @ coefficients).reshape(nsite, nin, nout).transpose(0, 2, 1)
+    return coefficients.T, norms, _relative_error(reconstructed, values)
+
+
 def joint_loewner(sites, samples, *, max_order=96, rank_tolerance=1e-11,
                   max_pencil_bytes=128 * 1024 ** 2):
     """Fit a common strictly proper realization to stacked ``[P<;P>]``.
@@ -399,18 +420,12 @@ def joint_loewner(sites, samples, *, max_order=96, rank_tolerance=1e-11,
     poles, modal_right = poles[stable], modal_right[stable]
     if poles.size == 0:
         raise ValueError("GATE snapshot_causal_poles: no causal input modal candidates")
-    design = ((1.0 / (sites[:, None] - poles[None]))[:, :, None]
-              * modal_right[None]).transpose(0, 2, 1).reshape(sites.size * rank, -1)
-    norms = np.linalg.norm(design, axis=0)
-    live = norms > 0.0
-    design, poles, modal_right, norms = design[:, live], poles[live], modal_right[live], norms[live]
-    design /= norms[None]
-    rhs = values.transpose(0, 2, 1).reshape(sites.size * rank, 2 * rank)
-    coefficients = sla.lstsq(design, rhs, cond=rank_tolerance, lapack_driver="gelsd")[0]
-    A, B, C = np.diag(poles), modal_right / norms[:, None], coefficients.T
+    live = np.linalg.norm(modal_right, axis=1) > 0.0
+    poles, modal_right = poles[live], modal_right[live]
+    C, norms, refit_error = _fit_modal_outputs(sites, poles, modal_right, values,
+                                              rank_tolerance=rank_tolerance)
+    A, B = np.diag(poles), modal_right / norms[:, None]
     order = poles.size
-    reconstructed = (design @ coefficients).reshape(sites.size, rank, 2 * rank).transpose(0, 2, 1)
-    refit_error = _relative_error(reconstructed, values)
     zero = np.zeros((rank, rank), dtype=complex)
     return {"lesser": (A, B, C[:rank], zero),
             "greater": (A, B, C[rank:], zero.copy()),
@@ -671,7 +686,8 @@ def screen_snapshot_partner(representative, sampler, check_sites, *, fit_toleran
 
 def retarded_reference_snapshot(sampler, fit_sites, check_sites, *, max_order=48,
                                 fit_tolerance=0.02, max_pencil_bytes=128 * 1024**2,
-                                representative=None, self_negative=False, collision_eta=0.0):
+                                representative=None, self_negative=False, collision_eta=0.0,
+                                fit_basis=None):
     """Fit only full-density retarded screening and assign reference branches.
 
     ``sampler(sites)`` supplies ordered [P<,P>] in reduced Coulomb
@@ -685,6 +701,10 @@ def retarded_reference_snapshot(sampler, fit_sites, check_sites, *, max_order=48
     declared positive response lag decay, independent of collision eta.
     A growing theta(t) response is admitted only when both the declared
     collision_eta and every Laplace sample height exceed its pole growth.
+    A caller-owned ``fit_basis`` dict fixes only numerical polarization
+    A/B coordinates for one physical Hamiltonian solve. Current full-rho
+    samples refit C, then rebuild Dyson/branches on every call. Self-q uses
+    a fixed mirrored block basis without adaptive inner compression.
     """
     fit_sites, check_sites = (np.asarray(x, complex) for x in (fit_sites, check_sites))
     if (fit_sites.ndim != 1 or check_sites.ndim != 1 or fit_sites.size < 4
@@ -697,15 +717,37 @@ def retarded_reference_snapshot(sampler, fit_sites, check_sites, *, max_order=48
     exact = exact_channels[1] - exact_channels[0]
     rank = exact.shape[-1]
     fit = None
+    reused_basis = fit_basis is not None and "raw_A" in fit_basis
     if representative is None:
         channels = np.asarray(sampler(fit_sites))
         target = channels[1] - channels[0]
-        fit = joint_loewner(fit_sites, np.stack((np.zeros_like(target), target)),
-            max_order=max_order, max_pencil_bytes=max_pencil_bytes)
-        pr = fit["greater"]
+        if reused_basis:
+            raw_A, raw_B = fit_basis["raw_A"], fit_basis["raw_B"]
+            C, norms, refit_error = _fit_modal_outputs(fit_sites, np.diag(raw_A), raw_B, target)
+            pr = (raw_A, raw_B, C / norms[None], np.zeros((rank, rank), complex))
+            fit = dict(fit_basis["fit_metadata"], greater=pr, refit_error=refit_error)
+        else:
+            fit = joint_loewner(fit_sites, np.stack((np.zeros_like(target), target)),
+                max_order=max_order, max_pencil_bytes=max_pencil_bytes)
+            pr = fit["greater"]
+            if fit_basis is not None:
+                fit_basis.update(raw_A=pr[0], raw_B=pr[1], fit_metadata={key: fit[key]
+                    for key in ("pencil_shape", "pencil_bytes")})
         if self_negative:
-            pr = kr.scale(kr.add(pr, kr.scale(mirror(pr), -1.0)), 0.5)
-            pr = compact_causal_realization(pr, check_sites)
+            if fit_basis is None:
+                pr = kr.scale(kr.add(pr, kr.scale(mirror(pr), -1.0)), 0.5)
+                pr = compact_causal_realization(pr, check_sites)
+            else:
+                A, B, C, D = pr
+                if "symmetric_A" not in fit_basis:
+                    n = 2 * A.shape[0]
+                    if 16 * (8 * n**2 + 16 * n * rank) > max_pencil_bytes:
+                        raise ValueError("GATE snapshot_reference_workspace: fixed self-q block/union "
+                                         "exceeds max_pencil_bytes")
+                    fit_basis.update(symmetric_A=sla.block_diag(A, -A.conj()),
+                                     symmetric_B=np.vstack((B, B.conj())))
+                pr = (fit_basis["symmetric_A"], fit_basis["symmetric_B"],
+                      0.5 * np.hstack((C, -C.conj())), D)
         wr = kr.screen_retarded(pr, np.eye(rank))
         wc = (*wr[:3], np.zeros((rank, rank), complex))
         # Bound the retarded/branch/common-Sigma dense work before modal
@@ -746,6 +788,10 @@ def retarded_reference_snapshot(sampler, fit_sites, check_sites, *, max_order=48
         screening_check_error=screened_error, noise_check_error=0.0,
         fit_tolerance=float(fit_tolerance), training_refit_error=training_error,
         fit_method="retarded_only_loewner_vacuum_reference", noise_check_kind="not_applicable_retarded_reference",
+        polarization_fit_basis=(inherited.get("polarization_fit_basis") if representative is not None
+            else "fixed_within_physical_snapshot" if fit_basis is not None else "independent_loewner"),
+        polarization_fit_basis_reused=(bool(inherited.get("polarization_fit_basis_reused"))
+            if representative is not None else bool(reused_basis)),
         screening_density_approximation="full_matrix_ordered_snapshot",
         noise_approximation="no_independent_noise_retarded_T0_reference_branches",
         lag_decay_used=True, derived_by_crossing=representative is not None,

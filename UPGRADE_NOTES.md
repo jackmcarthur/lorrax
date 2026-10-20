@@ -46,6 +46,19 @@ regularization remain separate controls. The branch rule is an explicit
 approximation, not an inference of exact nonequilibrium fluctuations from
 retarded screening. Frozen and updated runs use the same rule.
 
+The Hamiltonian inner solve now holds its numerical polarization $A,B$
+fitting space fixed and refits $C$ from current full-density samples on
+each sweep. Dyson screening and the complete complex self-energy still
+update; no physical collective pole or screened interaction is held fixed.
+The space is rebuilt at each physical refresh. This removes fresh-fit
+rank/pole selection from the inner convergence map without loosening the
+Hamiltonian or response-fit tolerances. A fixed-basis check failure refuses
+instead of silently rebuilding inside Anderson history, and failures now
+retain scalar residual histories. Updated-screening trajectories and
+iterative absolute-HF initialization can change; one-shot reference
+equilibrium fits and their frozen-screening control retain their prior
+fit path. No deck change is required.
+
 ## 2026-10-19 — explicit lossless transition-bath screening statistics
 
 Joint collision modes accept the opt-in

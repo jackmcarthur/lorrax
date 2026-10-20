@@ -1604,7 +1604,7 @@ def _snapshot_mix(old, new, mixing):
 
 def collision_snapshot_state(evaluate, held, *, steps: int = 12,
                              tol_ha: float = 1e-9, mixing: float = 0.5,
-                             acceleration: str = "linear"):
+                             acceleration: str = "linear", residual_history=None):
     """Solve the frozen-Hamiltonian Markov snapshot with full-rho lines.
 
     Parameters
@@ -1624,6 +1624,9 @@ def collision_snapshot_state(evaluate, held, *, steps: int = 12,
         owner with at most five history entries.  ``mixing`` scales the
         residual passed to Anderson; the physical acceptance test remains
         the unscaled maximum matrix Frobenius residual in Ha.
+    residual_history : list, optional
+        Caller-owned sink for scalar unscaled residuals, including when
+        convergence refuses. It must be empty on entry.
 
     Returns the converged held term, its tables, and a residual receipt.
     The accepted held term is the *input* of its final sweep, so the
@@ -1638,7 +1641,9 @@ def collision_snapshot_state(evaluate, held, *, steps: int = 12,
         _refuse("dynsig_collision_snapshot_controls", (steps, tol_ha, mixing, acceleration),
                 "steps >= 1, finite tol_ha > 0, 0 < mixing <= 1, acceleration linear or anderson",
                 "set bounded snapshot iteration controls")
-    history = []
+    if residual_history is not None and residual_history:
+        raise ValueError("snapshot residual_history must be empty on entry")
+    history = [] if residual_history is None else residual_history
     if acceleration == "anderson":
         from mixing.acceleration import anderson_nojit
 
