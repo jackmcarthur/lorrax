@@ -1,16 +1,17 @@
 """The downfold pipeline: read one restart bundle, write a smaller one.
 
-Five stages, in order, each timed under a ``downfold.*`` section so it shows
+The stages, in order, each timed under a ``downfold.*`` section so it shows
 up in the standard timing report beside ``zeta_fit`` and ``sigma.exec``:
 
-    downfold.load        the parent bundle, sharded, wedge already unfolded
-    downfold.grams       S_LL over the retained window (one kernel call)
-    downfold.select      CUR selection + the rank refusal
-    downfold.solve       T = S_SS^-1 S_cross, rank-truncated
-    downfold.congruence  V, W, the _nohead twins and g0 through T
-    downfold.residual    the per-q Pythagorean error bar
-    downfold.write       the small bundle, in the SAME format at smaller mu
-    downfold.zeta        zeta transported to the small basis, beside it
+    downfold.load         the parent bundle, sharded, wedge already unfolded
+    downfold.grams        S_LL over the retained window, column-streamed
+    downfold.select       CUR selection + the rank refusal (q = 0 face)
+    downfold.grams_small  S_cross and S_SS on the kept centroids
+    downfold.transfer     T = S_SS^+ S_cross, A_S = T A_L T^H for V, W and
+                          the _nohead twins, g0 and eps_W, streamed over q
+    downfold.star         the child's wedge-storability gate
+    downfold.write        the small bundle, in the SAME format at smaller mu
+    downfold.zeta         zeta transported to the small basis, beside it
 
 THE HEADLINE PROPERTY, and the thing to protect if anyone proposes changing
 this file: the output is a restart bundle in the **unchanged format** at a
@@ -48,6 +49,7 @@ renumbering contract.
 from __future__ import annotations
 
 import glob
+from functools import lru_cache
 import hashlib
 import os
 from dataclasses import dataclass, field
@@ -72,14 +74,16 @@ from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 from gw.downfold import (
     BandWindow,
     R19_ANCHOR,
-    build_transfer,
+    announce_ranks,
     child_unfold_tables,
-    congruence,
-    epsilon_w,
+    describe_price,
     pair_density_gram,
+    q_slab_programs,
+    record_kept_rank,
+    resident_bytes_per_rank,
     select_cur_centroids,
     slice_psi_to_centroids,
-    transform_head_vector,
+    stream_transfer,
 )
 
 __all__ = ["DownfoldResult", "resolve_restart_file", "run_downfold",
@@ -333,19 +337,27 @@ def _star_rank_constancy(rank_per_q, tables):
 
 def _unfold_roundtrip_rel(arr_full, tables, sym_perm, L_table, slots,
                           mesh_xy, n_mu_logical):
-    """max rel |unfold(arr_full[slots]) - arr_full| — one number, host-side.
+    """max |unfold(arr_full[slots]) − arr_full| / max |arr_full| — one number.
 
     The common half of the storability gate and its control, written once so
     that the two are the SAME route by construction: a control that differed
     from the thing it controls by a line of plumbing would not be a control.
+
+    ``arr_full`` ``(n_q, μ, μ)`` at ``P(None,'x','y')``.  The wedge rows are
+    taken on the device and the unfold runs over the full-BZ q in fixed tiles
+    (:func:`runtime.tiles.tile_plan` of the unfolded slice, its reference and
+    their difference, ``3·μ²/P`` per q), each tile reduced to its max on the
+    device, so nothing μ²-sized reaches a host: the parent control at
+    μ_L 6000 on an 8x8 grid gathered 37 GB per process before.
     """
     from ffi import _services
     _services.ensure_on_path()
     from symmetry_maps import unfold_isdf_operator
     from common.collectives import gather_to_host
+    from runtime.tiles import tile_plan
 
-    full = np.asarray(gather_to_host(arr_full))
-    n_pad = int(full.shape[-1]) - int(n_mu_logical)
+    n_q, n_mu = int(arr_full.shape[0]), int(arr_full.shape[-1])
+    n_pad = n_mu - int(n_mu_logical)
     perm, L = np.asarray(sym_perm), np.asarray(L_table)
     if n_pad:
         tail = np.arange(n_mu_logical, n_mu_logical + n_pad, dtype=perm.dtype)
@@ -355,15 +367,47 @@ def _unfold_roundtrip_rel(arr_full, tables, sym_perm, L_table, slots,
         L = np.concatenate(
             [L[:, :n_mu_logical],
              np.zeros((L.shape[0], n_pad, 3), L.dtype)], axis=1)
-    got = np.asarray(gather_to_host(unfold_isdf_operator(
-        jnp.asarray(full[slots]),
-        irr_idx=jnp.asarray(np.asarray(tables.irr_idx_q)),
-        sym_idx=jnp.asarray(np.asarray(tables.sym_idx_q)),
-        sym_perm=jnp.asarray(perm), L_table=jnp.asarray(L),
-        q_irr_frac=jnp.asarray(np.asarray(tables.q_irr_frac)),
-        mesh_xy=mesh_xy, n_sym_spatial=int(tables.n_sym_spatial))))
-    scale = float(np.max(np.abs(full))) or 1.0
-    return float(np.max(np.abs(got - full))) / scale
+    P_ = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
+    width, starts = tile_plan(3 * 16.0 * n_mu * n_mu / P_, n_q)
+    wedge = _take_q_rows(arr_full, np.asarray(slots, dtype=np.int32))
+    irr = np.asarray(tables.irr_idx_q)
+    sym = np.asarray(tables.sym_idx_q)
+    take, _ = q_slab_programs(mesh_xy, width)
+    worst = 0.0
+    for q0 in starts:
+        got = unfold_isdf_operator(
+            wedge, irr_idx=jnp.asarray(irr[q0:q0 + width]),
+            sym_idx=jnp.asarray(sym[q0:q0 + width]),
+            sym_perm=jnp.asarray(perm), L_table=jnp.asarray(L),
+            q_irr_frac=jnp.asarray(np.asarray(tables.q_irr_frac)),
+            mesh_xy=mesh_xy, n_sym_spatial=int(tables.n_sym_spatial))
+        d = _max_abs_diff_of(mesh_xy)(got, take(arr_full, jnp.int32(q0)))
+        worst = max(worst, float(np.asarray(gather_to_host(d))))
+    scale = float(np.asarray(gather_to_host(_max_abs_of(mesh_xy)(arr_full))))
+    return worst / (scale or 1.0)
+
+
+def _take_q_rows(arr, rows):
+    """``arr[rows]`` on the flat leading q axis, kept at ``P(None,'x','y')``."""
+    return _take_rows_of(arr.sharding.mesh)(arr, jnp.asarray(rows, jnp.int32))
+
+
+@lru_cache(maxsize=None)
+def _take_rows_of(mesh_xy):
+    return jax.jit(lambda a, r: jnp.take(a, r, axis=0),
+                   out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
+@lru_cache(maxsize=None)
+def _max_abs_diff_of(mesh_xy):
+    return jax.jit(lambda a, b: jnp.max(jnp.abs(a - b)),
+                   out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@lru_cache(maxsize=None)
+def _max_abs_of(mesh_xy):
+    return jax.jit(lambda a: jnp.max(jnp.abs(a)),
+                   out_shardings=NamedSharding(mesh_xy, P()))
 
 
 def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
@@ -683,14 +727,11 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         mu_S = int(sel.mu_small)
         mu_S_pad = int(padded_mu_extent(mu_S, mesh_xy))
     print_fn(sel.describe())
-    if sel.eigen_rank_kept < mu_S:
-        print_fn(
-            f"  [downfold/select] NOTE: {mu_S - sel.eigen_rank_kept} of the "
-            f"{mu_S} kept centroids add no independent direction at "
-            f"rcond={cfg.downfold_rcond:g}.  The transfer solve will "
-            f"truncate about that many modes per q; the small basis is "
-            f"smaller than it looks, and mu_small = auto would have reported "
-            f"that ceiling up front — a RANK statement, not an accuracy one.")
+    print_fn(describe_price(resident_bytes_per_rank(
+        nk=int(geom["nk"]), nb=int(geom["nb"]), ns=int(geom["nspinor"]),
+        n_q=n_q, mu_L_pad=mu_L_pad, mu_S_pad=mu_S_pad,
+        n_tensors=len(tensors), mesh_xy=mesh_xy,
+        residual=bool(cfg.report_residual))))
     if mu_S_pad != mu_S:
         print_fn(
             f"  [downfold] mu_S {mu_S} -> {mu_S_pad} in memory (+"
@@ -710,14 +751,28 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         S_SS = pair_density_gram(psi_S_X, psi_S_Y, window,
                                  kgrid=geom["kgrid"], mesh_xy=mesh_xy)
         S_SS.block_until_ready()
+    del psi_S_X
 
-    # ---- D3: the transfer solve ------------------------------------------
-    with timing.section("downfold.solve", announce=True,
-                        label="rank-truncated transfer solve"):
-        T_x, T_y, reports = build_transfer(
-            S_SS, S_cross, mesh_xy, rcond=cfg.downfold_rcond,
+    # ---- D3-D5: transfer, congruence, error bar — streamed over q --------
+    # q-diagonal from here on, so q runs in fixed tiles and the per-q live
+    # set never scales with n_q (gw.downfold.stream_transfer).
+    with timing.section("downfold.transfer", announce=True,
+                        label="T = S_SS+ S_cross, W_S = T W_L T-dagger, "
+                              "eps_W, streamed over q"):
+        out = stream_transfer(
+            S_LL if cfg.report_residual else None, S_SS, S_cross, tensors,
+            mesh_xy, rcond=cfg.downfold_rcond, g0_L=rs.G0_mu_nu,
             print_fn=print_fn)
-        T_x.block_until_ready()
+        out["small"]["V_qmunu"].block_until_ready()
+    small, T_store, g0_S = out["small"], out["T"], out["g0_S"]
+    reports = out["reports"]
+    del S_cross
+    print_fn(
+        f"  [downfold/stream] q streamed in {out['n_tiles']} tile(s) of "
+        f"{out['width']} (runtime.tiles.TILE_BYTES per rank; the shapes "
+        f"alone size it).")
+    announce_ranks(reports, cfg.downfold_rcond, mu_S_pad, print_fn,
+                    ev=out["ev"])
     rank_per_q = np.array([r.rank_criterion for r in reports], dtype=np.int64)
     # THE RUN'S OWN CONDITIONING, kept beside its rank because the two are
     # the same measurement read two ways and because the child-covariance
@@ -727,15 +782,16 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
     kappa_per_q = np.array(
         [r.kappa_eff if r.kappa_eff is not None else np.nan for r in reports],
         dtype=np.float64)
-
-    # ---- D4: the congruence ----------------------------------------------
-    with timing.section("downfold.congruence", announce=True,
-                        label="W_S = T W_L T-dagger"):
-        project = congruence(mesh_xy, T_x, T_y)
-        small = {name: project(arr) for name, arr in tensors.items()}
-        g0_S = (transform_head_vector(rs.G0_mu_nu, T_x, 0, mesh_xy)
-                if rs.G0_mu_nu is not None else None)
-        small["V_qmunu"].block_until_ready()
+    record_kept_rank(sel, reports[0])
+    print_fn(sel.kept_line())
+    if sel.eigen_rank_kept < mu_S:
+        print_fn(
+            f"  [downfold/select] NOTE: {mu_S - sel.eigen_rank_kept} of the "
+            f"{mu_S} kept centroids add no independent direction at "
+            f"rcond={cfg.downfold_rcond:g}.  The transfer solve will "
+            f"truncate about that many modes per q; the small basis is "
+            f"smaller than it looks, and mu_small = auto would have reported "
+            f"that ceiling up front — a RANK statement, not an accuracy one.")
     if g0_S is not None:
         print_fn(
             "  [downfold] g0_mu (zeta(G=0)) transported as g0_S = "
@@ -748,16 +804,8 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             "than answering it.")
 
     # ---- D5: the error bar ------------------------------------------------
-    eps = {}
-    norms = {}
+    eps, norms = out["eps"], out["norms"]
     if cfg.report_residual:
-        with timing.section("downfold.residual", announce=True,
-                            label="Pythagorean error bar"):
-            for name in ("W0_qmunu", "V_qmunu"):
-                e, n_L, n_S = epsilon_w(tensors[name], S_LL, small[name],
-                                        S_SS, mesh_xy)
-                eps[name] = e
-                norms[name] = (n_L, n_S)
         _announce_residual(eps, print_fn)
         worst = max(float(np.nanmax(v)) for v in eps.values())
         if (cfg.residual_refuse_above is not None
@@ -775,6 +823,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             "error bar was NOT computed, and this run therefore has no "
             "answer to 'did the downfold work' that does not require a "
             "reference calculation.  It costs two GEMMs at mu_L per q.")
+    del S_LL
 
     # ---- D5b: is the CHILD wedge-storable? --------------------------------
     # Only askable now: it is a statement about the child's TENSORS, and they
@@ -796,6 +845,8 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             "not run.  In orbit mode this cannot happen; reaching it means "
             "the selection fell back to point granularity.")
 
+    del tensors                    # the parent's μ_L² stacks end here
+
     # ---- the write --------------------------------------------------------
     with timing.section("downfold.write", announce=True,
                         label="small restart bundle"):
@@ -814,7 +865,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
     with timing.section("downfold.zeta", announce=True,
                         label="zeta transported to the small basis"):
         zeta_file = write_downfolded_zeta(
-            src, out_file, T_x, keep_idx, mu_S, n_q, geom["kgrid"], g0_S,
+            src, out_file, T_store, keep_idx, mu_S, n_q, geom["kgrid"], g0_S,
             print_fn=print_fn)
 
     _stamp_isdf_basis(out_file, parent_file, cent_file, zeta_file,
@@ -1074,9 +1125,13 @@ def _md5(path: str) -> str:
 # D6 — ζ, the one object the finite-Q consumer reads that is not in the bundle
 # ---------------------------------------------------------------------------
 
-def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
+def write_downfolded_zeta(src_restart, out_file, T, keep_idx, mu_S, n_q,
                           kgrid, g0_S, *, print_fn=print) -> str:
     """``zeta_q.h5`` in the small basis, beside the small bundle.
+
+    ``T`` is the transfer for every bundle q, ``(n_q, μ_S_pad, μ_L_pad)``
+    at ``P(None,'x','y')`` (:func:`gw.downfold.stream_transfer`); only the
+    rows of the q that ζ is stored at are gathered to the host.
 
     THE TRANSFORM IS THE HEAD VECTOR'S, AT EVERY G.  ``G0_mu_nu`` is the
     single G = 0 column of ζ̃ and :func:`gw.downfold.transform_head_vector`
@@ -1204,25 +1259,29 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
                 f"--vq-mode interp remains unavailable on this lineage, as "
                 f"it was on the parent.")
 
-        # T[q] at the LOGICAL extents.  The transfer carries the device-legal
-        # μ pads on both axes; ζ on disk is logical on both, and the pad rows
-        # are exactly zero, so the slice is a restriction and not a choice.
+        # T[q] at the LOGICAL extents, for the stored ζ q only.  The transfer
+        # carries the device-legal μ pads on both axes; ζ on disk is logical
+        # on both, and the pad rows are exactly zero, so the slice is a
+        # restriction and not a choice.
         #
-        # ``gather_to_host``, NOT ``jax.device_get``.  ``T_x`` is μ_L-SHARDED
-        # on 'x', so at P>1 its shards live on other processes and
+        # ``gather_to_host``, NOT ``jax.device_get``: ``T`` is sharded over
+        # both mesh axes, so at P>1 its shards live on other processes and
         # ``device_get`` RAISES on it — the trap ``exciton_bands._gather_host``
         # documents at length.  The service branches on
         # ``is_fully_addressable`` and issues the collective only when it is
-        # needed, so every rank calls this and they stay in lockstep; the
-        # per-rank cost is one (nq, μ_S, μ_L) host buffer, bounded by the
-        # dimension this whole exercise makes small.
+        # needed, so every rank calls this and they stay in lockstep.  The
+        # rows are taken on the device first, so the per-rank host cost is
+        # (nq_disk, μ_S, μ_L) — the ζ wedge, not the whole star.
         from common.collectives import gather_to_host
-        T_np = np.asarray(gather_to_host(T_x))[:, :int(mu_S), :mu_L_file]
+        perm = _zeta_q_to_restart_q(zl, kgrid, nq_disk, n_q=int(n_q),
+                                    print_fn=print_fn)
+        T_np = np.asarray(gather_to_host(_take_q_rows(
+            T, np.asarray(perm, dtype=np.int32))))[:, :int(mu_S), :mu_L_file]
 
         # THE SAME SWAP FOR ``g0_S``, AND HOISTED OUT OF THE RANK-0 BRANCH —
         # the two halves are one fix and neither works alone.  ``g0_S`` comes
         # off ``transform_head_vector`` constrained to ``P('y')``, so at P>1
-        # it is exactly as non-addressable as ``T_x`` and the gate's bare
+        # it is exactly as non-addressable as ``T`` and the gate's bare
         # ``jax.device_get`` refused it with "Fetching value for `jax.Array`
         # that spans non-addressable (non process local) devices" — which is
         # why ``lorrax-downfold`` could not run at P>1 AT ALL, on every rank,
@@ -1237,9 +1296,6 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
         # Cost is one μ_S host vector.
         g0_host = (None if g0_S is None
                    else np.asarray(gather_to_host(g0_S)).ravel())
-
-        perm = _zeta_q_to_restart_q(zl, kgrid, nq_disk, n_q=int(n_q),
-                                    print_fn=print_fn)
 
         ngkmax = int(zl.ngkmax_zeta)
         out_zeta = os.path.join(os.path.dirname(out_file), "zeta_q.h5")
@@ -1264,7 +1320,7 @@ def write_downfolded_zeta(src_restart, out_file, T_x, keep_idx, mu_S, n_q,
                 g0_chk = None
                 for q in range(nq_disk):
                     z_L = np.asarray(zl.read_zeta_G_local(q))   # (mu_L, ngk)
-                    z_S = np.conj(T_np[perm[q]]) @ z_L[:mu_L_file]
+                    z_S = np.conj(T_np[q]) @ z_L[:mu_L_file]
                     ds[q] = z_S
                     if perm[q] == 0:
                         g0_chk = z_S[:, 0].copy()

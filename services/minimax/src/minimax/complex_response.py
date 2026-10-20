@@ -354,6 +354,76 @@ def _imaginary_times(lo, hi, poles, tol, decay_rate, capacity):
     return None if fits is None else (times, fits)
 
 
+#: At most this many closed-form panels (:func:`_imaginary_panels`) for one sample.
+RESPONSE_PANEL_LIMIT = 16
+
+
+def _sampled(lo, hi, pole, times, coeff, decay_rate):
+    """Sampled error and mass of given coefficients of 1/(d-p) and 1/(d-p)^2.
+
+    :func:`_project`'s probe, basis and units (errors of eta/(d-p) and
+    eta^2/(d-p)^2, mass of the eta-scaled coefficients), for coefficients that
+    are not a projection.
+    """
+    eta = abs(pole.imag)
+    span, zp = (hi-lo)/eta, (pole-lo)/eta
+    x = np.unique(np.r_[0., span,
+        span/2*(1-np.cos(np.pi*(np.arange(1400)+.5)/1400)),
+        zp.real+np.linspace(-5, 5, 500)])
+    x = x[(x >= 0) & (x <= span)]
+    probe = np.unique(np.r_[x, np.linspace(0, span, 2501)])
+    origin = 0. if decay_rate else lo
+    scaled = coeff*np.array([eta, eta*eta])
+    error = np.zeros(2)
+    for xx in np.array_split(probe, 16):
+        d = lo + eta*xx
+        damp = np.minimum(decay_rate*d, 0.)
+        a = np.exp(damp[:, None] - (d[:, None]-origin)*times)
+        exact = 1/(xx-zp)
+        error = np.maximum(error, np.max(abs(a@scaled - np.exp(damp)[:, None]
+                                             * np.column_stack((exact, exact*exact))), axis=0))
+    return error, np.sum(abs(scaled), axis=0)
+
+
+def _imaginary_panels(lo, hi, poles, tol, decay_rate, capacity, limit=RESPONSE_PANEL_LIMIT):
+    """The closed-form imaginary-axis set of :func:`_imaginary_times` in panels, or None.
+
+    For Im p > 0, 1/(d-p) = i int_0^inf exp(i(p-o)s) exp(-i(d-o)s) ds (o the
+    rule's origin), cut at S = horizon/eta.  Composite Gauss-Legendre on k
+    equal panels of [0, S] with n = W*S/4 nodes in all (W = (hi-lo)/eta, the
+    count of :func:`_imaginary_times`), each panel at most ``capacity`` nodes.
+    The coefficients are the quadrature's own, i w_j exp(i(p-o)s_j) for
+    1/(d-p) and -w_j s_j exp(i(p-o)s_j) for 1/(d-p)^2, not a projection: each
+    panel is one rule on its own nodes and the panels' contributions add.
+    Accepted as a projection is (sampled error, coefficient mass).  Returns
+    ``(times per panel, fits per pole on all nodes)`` or None (more than
+    ``limit`` panels, or not accepted).
+    """
+    eta = float(poles.imag.min())
+    horizon = -np.log(tol) + np.log(-np.log(tol)) + 6.
+    n = int(np.ceil((hi-lo)/eta*horizon/4))
+    k = -(-n // int(capacity))
+    if k > limit:
+        return None
+    m = -(-n // k)
+    u, w = np.polynomial.legendre.leggauss(m)
+    length = horizon/eta/k
+    s = np.concatenate([length*(j + (u+1)/2) for j in range(k)])
+    ws = np.tile(w*length/2, k)
+    times = 1j*s
+    origin = 0. if decay_rate else lo
+    fits = []
+    for pole in poles:
+        phase = np.exp(1j*(pole-origin)*s)
+        coeff = np.column_stack((1j*ws*phase, -ws*s*phase))
+        error, mass = _sampled(lo, hi, pole, times, coeff, decay_rate)
+        if (not np.isfinite(error).all() or float(np.max(error*[1., pole.imag/(2*abs(pole))])) > tol
+                or not mass[0] <= _RESPONSE_MAX_KAPPA):
+            return None
+        fits.append((coeff, error, mass))
+    return [times[j*m:(j+1)*m] for j in range(k)], fits
+
+
 def _rule(z, sets):
     """Scatter pole fits on node sets into forward and reverse sample rows.
 
@@ -392,7 +462,7 @@ def _rule(z, sets):
 
 
 def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-                         decay_rate=0., pencil=None):
+                         decay_rate=0., pencil=None, panels=False):
     """Shared complex-time rules for a group of response samples.
 
     Built at the Sigma rule builder's pinned BLAS thread count: the Hankel
@@ -431,9 +501,14 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     the host. A geometry that accepts on another source is rebuilt on
     :func:`host_pencils` and scanned again, so an accepted node set is the
     reference's own; only rejections are decided on the source's rounding.
+
+    ``panels`` (off by default; the TD refit's chi0 blocks): a single sample
+    whose pencil and closed-form set both fail takes the closed-form set in
+    panels of at most ``RESPONSE_NODE_CAPACITY`` nodes (:func:`_imaginary_panels`):
+    several rules with the same member, whose contributions the caller adds.
     """
     return ResponseGroupTree(lo_ry, hi_ry, z_ry, rel_tol=rel_tol, previous=previous,
-                             decay_rate=decay_rate, pencil=pencil).rules()
+                             decay_rate=decay_rate, pencil=pencil, panels=panels).rules()
 
 
 class ResponseGroupTree:
@@ -453,7 +528,7 @@ class ResponseGroupTree:
     """
 
     def __init__(self, lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None, decay_rate=0.,
-                 pencil=None):
+                 pencil=None, panels=False):
         lo, hi = float(lo_ry), float(hi_ry)
         z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
         if (not z.size or not np.isfinite([lo, hi, rel_tol, decay_rate]).all()
@@ -461,7 +536,7 @@ class ResponseGroupTree:
                 or np.any(z.imag <= 0) or not 1e-13 <= rel_tol < .1):
             raise ValueError('invalid response frequency/domain/tolerance')
         self.lo, self.hi, self.z, self.rel_tol, self.decay_rate = lo, hi, z, rel_tol, decay_rate
-        self.pencil = pencil
+        self.pencil, self.panels = pencil, bool(panels)
         self.reference = 0. if decay_rate else lo
         self.root = tuple(range(len(z)))
         self._old = {frozenset(rule["members"]): rule["t"][:rule["count"]]
@@ -513,8 +588,11 @@ class ResponseGroupTree:
     def _attempt(self, members):
         lo, hi, z, tol, decay_rate = self.lo, self.hi, self.z, self.rel_tol/2, self.decay_rate
         poles = _poles(z[members])
+        # A single sample keeps the full scan (its refusal is final) unless panels
+        # follow a failed pencil: then it stops at the group's stagnation patience too.
         got = _shared_times(lo, hi, poles, tol, self._old.get(frozenset(members)), decay_rate,
-                            patience=None if len(members) == 1 else _STAGNATION_NODES,
+                            patience=(None if len(members) == 1 and not self.panels
+                                      else _STAGNATION_NODES),
                             pencil=self.pencil)
         if got is None:
             # Where the pencil fails, the closed-form imaginary-axis set serves
@@ -527,6 +605,19 @@ class ResponseGroupTree:
             return [dict(rule, members=list(members), reference_ry=self.reference)]
         if len(members) > 1:
             return None
+        if self.panels:
+            # The closed-form set in panels: one rule per panel, same member;
+            # the caller adds their contributions (gw.response_bank chi0 blocks).
+            got = _imaginary_panels(lo, hi, poles, tol, decay_rate, RESPONSE_NODE_CAPACITY)
+            if got is not None:
+                times, fits = got
+                out, start = [], 0
+                for j, t in enumerate(times):
+                    part = [(c[start:start+len(t)], e, m) for c, e, m in fits]
+                    out.append(dict(_rule(z[members], [(t, poles, part)]), members=list(members),
+                                    reference_ry=self.reference, panel=[j, len(times)]))
+                    start += len(t)
+                return out
         # Forward and reverse poles on separate node sets: each node then
         # serves one orientation, exactly as separate per-pole rules do.
         sets = []

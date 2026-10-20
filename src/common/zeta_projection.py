@@ -128,7 +128,7 @@ def _check_mesh(mesh_xy: Mesh, axes: tuple[str, str]) -> tuple[int, int]:
 
 def least_squares_transfer(
     gram_S, O_sharded, mesh_xy: Mesh, mu_axis: str, *,
-    rcond: float | None = None, print_fn=print,
+    rcond: float | None = None, print_fn=print, eig=None,
 ) -> jax.Array:
     """``T = G_S^{-1} O`` (Cholesky) or ``T = G_S^+ O`` (rank-truncated).
 
@@ -156,6 +156,10 @@ def least_squares_transfer(
     fights exactly this with its rank-truncated charge solve
     (``charge_zeta_solve = rank_truncate`` on either ``linalg`` layout).  The synthetic study could never have shown it
     (cond ≈ 20 there), which is why it had to be run on real ζ.
+
+    ``eig=(w, V)`` passes the caller's own ``distrib_la.eigh_local(gram_S)``
+    (ascending, replicated) so the matrix is factored once; omitted, it is
+    computed here.
 
     ``T`` is exact on the retained subspace, so the representability
     property of (‡) survives truncation with "representable" read as
@@ -207,7 +211,9 @@ def least_squares_transfer(
         raise ValueError(
             f"rcond must be in (0, 1) — it is a RELATIVE threshold on "
             f"λ/λ_max, got {rcond!r}.")
-    w, V = eigh_local(gram_S)              # ascending, replicated
+    # ``eig``: the caller's ``eigh_local(gram_S)``, when it already holds it
+    # (the downfold reports the same spectrum it truncates).
+    w, V = eigh_local(gram_S) if eig is None else eig   # ascending, replicated
     lam_max = jnp.max(w, axis=-1, keepdims=True)
     keep = w > (float(rcond) * lam_max)
     # CLOSURE.  The cut above is a cap on amplification; it is not allowed to

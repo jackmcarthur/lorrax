@@ -447,18 +447,25 @@ def _prepare_isdf_carriers(
         from .shared_pole_recipe import (SUPPORT_READ_PAD_EV, bind_shared_pole_census,
                                          resolve_shared_pole_recipe)
         from centroid.sampling_metric import full_k_quadrature_weights
+        census_inputs = dict(trs_allowed=sym.trs_allowed,
+                             state_capacity=wfn.occupation_state_capacity,
+                             kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
         bind_shared_pole_census(
-            wfns, meta, occupation_state=oneshot_occupation_state,
-            trs_allowed=sym.trs_allowed,
-            state_capacity=wfn.occupation_state_capacity,
-            kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
+            wfns, meta, occupation_state=oneshot_occupation_state, **census_inputs)
         from .qp_support import requested_reads_ev
         energy, states, frame_mu_ev = _oneshot_requested(
             config, enk_dft, wfn, oneshot_occupation_state, material_class)
+        support_reads_ev = frame_mu_ev + requested_reads_ev(
+            energy, states, config.sigma.omega_step_ev, pad_ev=SUPPORT_READ_PAD_EV)
         meta.shared_pole_recipe = resolve_shared_pole_recipe(
             config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0,
-            support_reads_ev=frame_mu_ev + requested_reads_ev(
-                energy, states, config.sigma.omega_step_ev, pad_ev=SUPPORT_READ_PAD_EV))
+            support_reads_ev=support_reads_ev)
+        from .ppm_pipeline import observing_window_source, publish_window_source
+        if observing_window_source():
+            # TD-aGW's shared-pole refit re-resolves this recipe at its own census
+            # (tdagw.dynsig.spm_screening); one empty list test otherwise.
+            publish_window_source(recipe_inputs=dict(
+                census_inputs, support_reads_ev=np.array(support_reads_ev, np.float64)))
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
     if config.bispinor and wfns_transverse is None:
         raise RuntimeError(

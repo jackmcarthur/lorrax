@@ -293,7 +293,8 @@ def _check_shapes(operator_cart, source_coefficients, kgrid):
 
 
 def interpolate_band_operator(operator_cart, source_coefficients,
-                              path_coefficients, kpath, kgrid, mesh):
+                              path_coefficients, kpath, kgrid, mesh, *,
+                              image_record_fn=None):
     """Return (q_carrier,component,band,band) matrices in the path basis.
 
     ``operator_cart`` is (component,k,n,n), ``source_coefficients`` is
@@ -302,6 +303,10 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     carrier is cut into passes of one q per device; one ``lax.scan`` runs
     every pass of a component (the phase sum is local on the matrix face,
     one face->q exchange per pass, then the local band rotation).
+    ``image_record_fn(component, operator_R)``, when given, sees each
+    component's lattice image (``_operator_R``) before it is consumed, so a
+    caller can take a receipt of it (``fh_interp.image_locality``) without a
+    second image ever being resident.
     """
     from bandstructure.fh_interp import build_R_grid_np
     _check_shapes(operator_cart, source_coefficients, kgrid)
@@ -346,6 +351,8 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     for a in range(operator_cart.shape[0]):
         operator_R = _operator_R(operator_cart[a:a + 1], source_coefficients,
                                  kgrid, mesh)
+        if image_record_fn is not None:
+            image_record_fn(a, operator_R)
         parts.append(jax.block_until_ready(
             _scan(q_tab, path_coefficients, operator_R)))
         del operator_R

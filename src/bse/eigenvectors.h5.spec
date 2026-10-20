@@ -17,6 +17,13 @@ Group: exciton_header
 Content: All the dimensions and scalar quantities
 #===============================================================================
 
+	Attribute: transition_basis, qp_rotations_file
+	Type: string
+	Value: LORRAX extension, written only by bse.bse_jax --qp-rotations:
+	"qp_rotations" and the absolute path of the qp_wfn_rotations.h5 whose QP
+	states the amplitudes are on (bse.bse_qp_rotation). Absent means the deck
+	WFN's DFT bands; only then do nv/nc index dipole.h5.
+
 	Dataset: version
 	Type: integer
 	Rank: 0

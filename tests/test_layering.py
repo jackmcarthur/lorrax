@@ -599,6 +599,7 @@ _DRIVER_PLUMBING_BUDGET = {
     "gw.eqp_bgw": 0,
     "postprocess.rotate_wfn_to_qp": 0,
     "gw.downfold_cli": 0,
+    "tdagw.tdgw_jax": 0,
 
     # --- not clean, with the reason ---------------------------------------
     # ``from jax.sharding import Mesh, NamedSharding, PartitionSpec`` at :90.
@@ -705,11 +706,12 @@ def test_the_plumbing_scan_does_not_cry_wolf():
 
 _DRIVER_MAIN_STATEMENTS = {
     "gw.gw_jax": (("main", "_run_gw_stages"), 57),
-    "bse.bse_jax": (("main",), 39),
+    "bse.bse_jax": (("main",), 38),
     "bse.exciton_bands": (("main",), 401),
     "bandstructure.htransform": (("main",), 124),
     "gw.kin_ion_io": (("main",), 128),
     "psp.get_dipole_mtxels": (("main",), 236),
+    "tdagw.tdgw_jax": (("main",), 12),
 }
 
 

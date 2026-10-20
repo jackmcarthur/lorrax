@@ -556,7 +556,8 @@ def test_input_reference_check_can_fail():
         "| key | default | meaning |",
         "| `d` | unset (required) | fine |",
     ])
-    new, errors = tool.sync(page, {"a": 5, "b": 1e-4}, {"d": None},
+    new, errors = tool.sync(page, {"gw": {"a": 5, "b": 1e-4},
+                                   "downfold": {"d": None}},
                             'if "old" in section: raise')
     joined = "\n".join(errors)
     assert "`a` | int | `5` (note)" in new, new
@@ -566,6 +567,107 @@ def test_input_reference_check_can_fail():
     assert "old" not in joined and "`d`" not in joined, joined
     assert tool.render_default(1e-4) == "`1e-4`"
     assert tool.render_default(None) == "unset"
+
+
+def test_input_reference_td_table_can_fail():
+    """The TD-aGW table (dotted TOML keys) is checked like the GW table."""
+    tool = _load_input_reference_tool()
+    page = "\n".join([
+        "## TD-aGW — the `tdgw.toml` deck",
+        "| key | default | meaning |",
+        "|---|---|---|",
+        "| `control.ivp.rtol` | `1e-5` | wrong default |",
+        "| `lorrax.gone` | `1` | no longer accepted |",
+    ])
+    new, errors = tool.sync(page, {"td": {"control.ivp.rtol": 1e-6,
+                                          "lorrax.method": "dp54"}}, "")
+    joined = "\n".join(errors)
+    assert "| `control.ivp.rtol` | `1e-6` |" in new, new
+    assert "`lorrax.gone` is documented" in joined, joined
+    assert "`lorrax.method` (td deck) has no row" in joined, joined
+
+
+def test_input_reference_every_registered_table_can_fail():
+    """Each ``TABLES`` heading routes its rows to its own parser's defaults.
+
+    For every registered section: a wrong default is rewritten, a stale key
+    and a missing row are refused by that table's name.  The red twin drops
+    the heading, so the same rows land in the previous section and the
+    refusals no longer name the table.
+    """
+    tool = _load_input_reference_tool()
+    names = [row[0] for row in tool.TABLES]
+    assert names[0] == "gw" and len(set(names)) == len(names), names
+    for name, heading, _path, _const in tool.TABLES[1:]:
+        rows = ["| key | default | meaning |", "|---|---|---|",
+                "| `k_wrong` | `2` | wrong default |",
+                "| `k_stale` | `1` | no longer accepted |"]
+        defaults = {name: {"k_wrong": 1, "k_missing": 3}}
+        new, errors = tool.sync("\n".join([heading + " — planted"] + rows),
+                                defaults, "")
+        joined = "\n".join(errors)
+        assert "| `k_wrong` | `1` |" in new, (name, new)
+        assert "`k_stale` is documented" in joined, (name, joined)
+        assert f"`k_missing` ({name} deck) has no row" in joined, (name, joined)
+        _, twin = tool.sync("\n".join(rows), defaults, "")
+        assert "`k_wrong` is documented" in "\n".join(twin), (name, twin)
+
+
+def test_input_reference_generated_table_can_fail():
+    """A ``DOC_TABLES`` section's table is generated whole from the parser's docs.
+
+    A hand-edited row is rewritten (so ``--check`` fails on the committed
+    page), a key without a docs entry and an entry without a key refuse, the
+    section's prose survives.  Red twin: without ``docs`` the same page goes
+    through the row check and keeps the hand edit.
+    """
+    tool = _load_input_reference_tool()
+    assert "td" in tool.DOC_TABLES
+    page = "\n".join([
+        "## TD-aGW — the `tdgw.toml` deck",
+        "prose before",
+        "| key | default | meaning | refused by |",
+        "|---|---|---|---|",
+        "| `lorrax.method` | `dp54` | hand-edited meaning | — |",
+        "",
+        "prose after",
+    ])
+    defaults = {"td": {"lorrax.method": "dp54", "lorrax.dt": None}}
+    docs = {"td": {"lorrax.method": ("", "The integrator.", ("td_method",)),
+                   "lorrax.gone": ("", "A stale entry.", ())}}
+    new, errors = tool.sync(page, defaults, "", docs=docs)
+    joined = "\n".join(errors)
+    assert "| `lorrax.method` | `dp54` | The integrator. | `td_method` |" in new, new
+    assert "hand-edited" not in new and "prose before" in new and "prose after" in new
+    assert "`lorrax.dt` (td deck) has no docs entry" in joined, joined
+    assert "`lorrax.gone` (td deck) has a docs entry but is not in" in joined, joined
+    bad = {"td": {"lorrax.method": ("", "", ()), "lorrax.dt": ("", "The step.", ())}}
+    _, errors = tool.sync(page, defaults, "", docs=bad)
+    assert any("meaning non-empty" in e for e in errors), errors
+    twin, twin_errors = tool.sync(page, defaults, "")
+    assert "hand-edited meaning" in twin
+    assert any("`lorrax.dt` (td deck) has no row" in e for e in twin_errors), twin_errors
+
+
+def test_td_key_docs_name_raised_refusals():
+    """Every refusal ``TD_KEY_DOCS`` names is raised by the TD-aGW sources.
+
+    The ids are read from the parser's literal (AST) and looked up as
+    ``GATE <id>`` or ``_gate("<id>"`` in ``src/tdagw``; a planted id is the
+    red twin.
+    """
+    tool = _load_input_reference_tool()
+    docs = tool.harvest_docs()["td"]
+    import glob
+    import re
+    text = "".join(open(f, encoding="utf-8").read()
+                   for f in glob.glob(os.path.join(_REPO, "src", "tdagw", "*.py")))
+    raised = {a or b for a, b in re.findall(r'GATE (td_[a-z0-9_]+)|_gate\("(td_[a-z0-9_]+)"', text)}
+    named = {g for _note, _meaning, gates in docs.values() for g in gates}
+    assert named, "no refusals named"
+    assert sorted(named - raised) == []
+    planted = named | {"td_no_such_refusal"}
+    assert sorted(planted - raised) == ["td_no_such_refusal"]
 
 
 if __name__ == "__main__":

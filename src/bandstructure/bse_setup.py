@@ -437,6 +437,12 @@ def compute_wfns_fi(
                                                   ``lam_all`` note at the
                                                   emit loop)
             .coeffs_fi:  (nk_fi, rank, nb_fi)     only when ``return_coeffs``
+            .q_frac:     (nk_fi, 3) host float64  fractional q of each row,
+                                                  wrapped to (−0.5, 0.5], in
+                                                  the order every array above
+                                                  uses (the one fine q list a
+                                                  consumer of ``coeffs_fi``
+                                                  evaluates at)
 
     Both wfn copies live on-device and are sharding-distinct so any
     contraction over (n_μ) along either mesh axis stays local.
@@ -1072,4 +1078,5 @@ def compute_wfns_fi(
     )
     if return_coeffs:
         out.coeffs_fi = coeffs_fi
+    out.q_frac = np.asarray(q_all, dtype=np.float64)
     return out

@@ -11,7 +11,7 @@ policy live on the owner pages of the [documentation register](index.md#register
 
 | directory | holds |
 |---|---|
-| `src/` | the application: 13 packages, importable with `src/` on `PYTHONPATH` |
+| `src/` | the application: 14 packages, importable with `src/` on `PYTHONPATH` |
 | `services/<name>/src/<name>/` | 7 standalone packages, each with its own `pyproject.toml`; some add `bench/` drivers and `docs/` |
 | `tests/` | the driver-level suite `tests/hsuite` and the static rule gates ([contributing](contributing.md)) |
 | `config/` | machine recipes: environment, native builds, the Perlmutter module |
@@ -28,13 +28,14 @@ else.
 
 | package | level | owns | entry points | imported by |
 |---|---|---|---|---|
-| `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (shared pole, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
+| `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (shared pole, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
 | `bse` | L1 | the Bethe–Salpeter equation: kernels, TDA and full solvers, absorption, exciton bands, the $W_\mathrm{BSE}$ ladder | `python -m bse.bse_jax`, `bse.exciton_bands`, `bse.absorption_haydock`, `bse.bse_feast`, `bse.bse_kpm`, `bse.bse_w_exact` | `gw.screening_bse`, `file_io.restart_bundle` (both lazily) |
 | `bandstructure` | L1 | band interpolation (htransform), fine-k wavefunctions for the BSE, band operators | `python -m bandstructure.htransform` | `bse` |
 | `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, pivoted-Cholesky pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw` |
 | `isdf` | L1 | ζ-fit primitives (pair Grams, $C_q$ conditioning, the μ-batch route) and the whole-state Galerkin basis | library | `gw`, `bandstructure`, `bse`, `centroid` |
 | `psp` | L1 | the plane-wave DFT layer: $T$, $V_\mathrm{loc}$, $V_\mathrm{NL}$, DFT+U and XC operators, pseudopotentials, radial tables, the preprocessing and mean-field drivers | `python -m psp.get_dipole_mtxels`, `psp.run_nscf`, `psp.run_dense_h`, `psp.run_sternheimer`, `psp.get_DFT_mtxels`, `psp.kpm_dos`, `psp.orbital_magnetization` | `gw`, `bandstructure`, `common`, `file_io`, `solvers` |
 | `postprocess` | L1 | WFN → `WFN_qp.h5` rotation | `python -m postprocess.rotate_wfn_to_qp` | nothing |
+| `tdagw` | L1 | real-time TD-aGW in TDGW's conventions: the equation of motion, the injected ΔΣ[ρ] models (TDGW kernel, low-rank, the ISDF COHSEX model of a GW restart), the jitted k-sharded propagator, TDGW's file formats | `python -m tdagw.tdgw_jax`, `tdagw.kernel_export`, `tdagw.tdgw_bridge` | nothing |
 | `file_io` | L1 readers and writers; L3 transport | SlabIO (the sharded HDF5 transport) and every format: the restart bundle, Σ outputs, model stores, `dipole.h5`, `kin_ion.h5`, WFN | library | `gw`, `bse`, `psp`, `bandstructure`, `centroid` |
 | `common` | mixed: L1 physics helpers, L2 `rank_criterion`, `spectral_closure`, `pivoted_cholesky`, L3 collectives and glue | shared helpers: collectives, sharding and FFT glue, timing, units, WFN transforms, parallel-transport kernels | library | every package |
 | `solvers` | L2 | iterative eigensolvers and spectral methods with no physics: Davidson, Lanczos, KPM, contour quadrature, pseudobands, Sternheimer CG | library | `bse`, `psp` |
@@ -70,6 +71,9 @@ else.
 | `downfold_run.py` | Orchestrates a downfold calculation. |
 | `dynamic_sigma.py` | Post-processes frequency-dependent self-energy data. |
 | `efermi.py` | Resolves occupations and Fermi levels. |
+| `epsmat_cli.py` | Driver: BerkeleyGW `eps0mat.h5` / `epsmat.h5` from a bundle's static W (`mode = export`), or BerkeleyGW's ε⁻¹ projected on the bundle's ζ (`mode = project`); `python -m gw.epsmat_cli`. |
+| `epsmat_config.py` | Parses and validates the `[epsmat]` input file. |
+| `epsmat_export.py` | The ζ-space W ↔ BerkeleyGW ε⁻¹(G, G′) maps, one q at a time: Coulomb whitening, the eps-sphere block, the reverse projection. |
 | `eqp_bgw.py` | Writes BerkeleyGW-compatible quasiparticle tables. |
 | `experimental/__init__.py` | Package for staged GW features not yet wired into `gw_jax`. |
 | `experimental/head_wing_schur.py` | Sharded head/wing/body Schur decomposition of W; the head-channel specs are live. |
@@ -217,6 +221,7 @@ else.
 | `_slab_io_ffi.py` | Implements the native SlabIO transport binding. |
 | `_slab_io_rank.py` | SlabIO's per-rank streamed tier: an operator written segment by segment and read back by output. |
 | `_slab_io_serial.py` | Implements serial SlabIO transport. |
+| `bgw_epsmat.py` | The BerkeleyGW 4.0 `epsmat.h5` / `eps0mat.h5` format: schema, G order, writer. |
 | `centroids.py` | Loads centroid tables through one format and symmetry entry point. |
 | `commit_state.py` | Persistent completion receipt for collective artifact writes. |
 | `dipole.py` | The `dipole.h5` format: the q → 0 velocity matrix, band energies, finite-q terms. |
@@ -254,7 +259,7 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `absorption_common.py` | Shared absorption helpers: dipole slicing to the window, the ⟨0\|r̂\|S⟩ contraction, Lorentzian, JDOS, Kramers–Kronig, `.dat`/`.h5` writers. |
 | `absorption_haydock.py` | ε₂(ω) by the Haydock continued fraction on the TDA BSE; `python -m bse.absorption_haydock`. |
 | `bse_davidson_helpers.py` | Start subspace and diagonal preconditioners for `solvers.davidson.davidson` on the BSE vector layout. |
-| `bse_densify.py` | Coarse-to-fine densification of the BSE bundle under `bse_k_grid`. |
+| `bse_densify.py` | Coarse-to-fine densification of the BSE bundle under `bse_k_grid`, its window dipoles included. |
 | `bse_feast.py` | FEAST contour eigensolver, its GMRES solves and the spectral deflation the W_BSE ladder reuses. |
 | `bse_head.py` | The q = 0 Coulomb head: its scalars and their rank-one injection. |
 | `bse_io.py` | Compatibility facade: re-exports names from `bse_window`, `bse_head`, `bse_densify`, `bse_loading` and the window names of `common.band_degeneracy`. |
@@ -351,6 +356,35 @@ Level L2: none of these modules knows what a band or a k point is.
 | `projectors.py` | Jitted subspace projectors for the Sternheimer solve. |
 | `sternheimer_precond.py` | Teter–Payne–Allan preconditioner. |
 | `sternheimer_solve.py` | The level-shifted CG Sternheimer solve; it applies `psp.dft_operators` (a registered layer exception). |
+| `time_integrators.py` | Jitted ODE steppers: SciPy-exact Dormand–Prince 5(4) with dense output, RK4, Krogstad ETDRK4, exponential midpoint and CFM4 Magnus steps, Strang splitting, the fixed-step scan. |
+
+## `src/tdagw`
+
+Real-time TD-aGW ([propagation](theory/td_agw_propagation.md),
+[interaction](theory/td_agw.md)). The propagator modules and the interaction
+modules meet at one contract, ΔΣ = `apply(params, rho, t)`.
+
+| Module | Role |
+|---|---|
+| `__init__.py` | Package marker for the TD-aGW interaction model and propagator. |
+| `tdgw_jax.py` | Driver: TDGW deck in, `tdgw.h5` + `tdgw.toml` out. |
+| `td_config.py` | Parses and validates the TD-aGW deck (TDGW's `tdgw.toml` plus `[lorrax]`). |
+| `stages.py` | The driver's stages: header and operators, ΔΣ model, outputs, propagation, report. |
+| `td_system.py` | Builds the TD system, energies and position operators from a GW restart bundle. |
+| `td_log.py` | The resolved run report, progress rows and collision refresh receipts. |
+| `eom.py` | The equation of motion, the intraband commutator and TDGW's measurements. |
+| `propagate.py` | The jitted, k-sharded chunk program around the integrators of `solvers.time_integrators`. |
+| `collision.py` | The column-sampled one-sided MGKBA branch operator, equilibrium counterterm and held affine collision flow. |
+| `dynsig.py` | The instantaneous self-energy stages and collision refresh: frozen/active sweeps, basis dressing and screening snapshots ([theory](theory/td_agw_dynamical.md)). |
+| `keldysh_rational.py` | Small-matrix transfer products, sharp, retarded Dyson feedback and causal Schur/Sylvester projection, independently checked against real-frequency integration. |
+| `snapshot_screening.py` | Full-rho projected polarization, joint lesser/greater Loewner reduction, screened response/noise error checks and compact general Keldysh realizations. |
+| `snapshot_collision.py` | General biorthogonal interaction factors and column-sampled GW coefficients in projected density vertices. |
+| `snapshot_runtime.py` | Distributed Coulomb projection, streamed full-band vertices, converged snapshot adapter and joint/frozen screening controls. |
+| `self_energy.py` | The ΔΣ[ρ] contract and its models: none, dense TDGW kernel, low-rank, the ISDF adapter. |
+| `tdgw_io.py` | TDGW's formats: header reader, operator rebuild, `kernel.h5`, `tdgw.h5` writer, the field expressions. |
+| `model.py` | The ISDF COHSEX interaction ΔΣ[Δρ] of a GW restart bundle. |
+| `kernel_export.py` | Writes a dense TDGW `kernel.h5` from the ISDF model. |
+| `tdgw_bridge.py` | Runs TDGW with the ISDF model as its ΔΣ. |
 
 ## `src/mixing` and `src/postprocess`
 
