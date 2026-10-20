@@ -105,22 +105,21 @@ def pad_W_R_to_grid(W_R_coarse: jax.Array, fine_grid: tuple[int, int, int],
     return out if pin is None else pin(out)
 
 
-def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx, n_mu: int,
-                     n_mu_carrier: int, sys_dim: int, *, restart_file,
-                     log_fn=print) -> dict:
-    """The per-pair Wigner–Seitz table of a W tile's μ axis.
+def w_tile_centroid_frac(wfn, centroids_file, keep_idx, n_mu: int, *,
+                         restart_file, log_fn=print) -> np.ndarray:
+    """``(n_mu, 3)`` positions ``r_μ = idx/N ∈ [0,1)`` of a W tile's μ axis.
 
-    The positions are the centroid table's FFT points ``idx / N`` (the
-    full-Bloch gauge of every μ-indexed ISDF tile), in tile order: the
-    ordered child rows ``keep_idx`` of a downfolded bundle, else every row
+    The centroid table's FFT points in tile order (the full-Bloch gauge of
+    every μ-indexed ISDF tile: ``W_μν(R)`` couples ``r_μ + R`` with ``r_ν``):
+    the ordered child rows ``keep_idx`` of a downfolded bundle, else every row
     (``bse.exciton_bands.resolve_isdf_basis`` resolves both).  Their index
     digest must match the ``centroids_charge_md5`` receipt ``restart_file``
-    carries (GW and the downfold stamp it over the tile's own rows), so the
-    embedding cannot sit on another run's centroids; a restart without a
-    receipt is not checked, and ``log_fn`` says so in one line.  The table
-    must have exactly the tile's logical ``n_mu`` rows; carrier pad rows up
-    to ``n_mu_carrier`` take the first centroid's position (their tiles are
-    zero).
+    carries (GW and the downfold stamp it over the tile's own rows), so nothing
+    positioned by them can sit on another run's centroids; a restart without a
+    receipt is not checked, and ``log_fn`` says so in one line.  The table must
+    have exactly the tile's logical ``n_mu`` rows.  The ONE source of these
+    positions for the W densifier (:func:`w_pair_embedding`) and the c1 head
+    channel's gauge phase (``gw.head_densify.attach_head_channel``).
     """
     import h5py
     from file_io.centroids import load_centroids
@@ -150,7 +149,22 @@ def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx, n_mu: int,
         log_fn(f"  w_pair_embedding: {restart_file} carries no "
                f"centroids_charge_md5 receipt; the centroid rows of "
                f"{centroids_file} are not checked against the W tile.")
-    return pair_ws_images(coarse_grid, lattice_bohr(wfn), idx / grid[None, :],
+    return idx / grid[None, :]
+
+
+def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx, n_mu: int,
+                     n_mu_carrier: int, sys_dim: int, *, restart_file,
+                     log_fn=print) -> dict:
+    """The per-pair Wigner–Seitz table of a W tile's μ axis.
+
+    The positions are :func:`w_tile_centroid_frac` (FFT points ``idx/N`` in
+    tile order, checked against the restart's ``centroids_charge_md5``
+    receipt).  Carrier pad rows up to ``n_mu_carrier`` take the first
+    centroid's position (their tiles are zero).
+    """
+    pos = w_tile_centroid_frac(wfn, centroids_file, keep_idx, n_mu,
+                               restart_file=restart_file, log_fn=log_fn)
+    return pair_ws_images(coarse_grid, lattice_bohr(wfn), pos,
                           int(sys_dim), n_carrier=int(n_mu_carrier))
 
 
@@ -1618,9 +1632,14 @@ def _interpolate_bse_data_to_grid(
             # The model owns the head at every fine q ≠ 0; c1 keeps Γ.
             S_fine = np.where(np.arange(S_fine.size).reshape(S_fine.shape) == 0,
                               S_fine, 0.0)
+        from vcoul import CoulombGeometry
         W_q_fine = attach_head_channel(
             W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
-            head_channel["cell_volume"])
+            head_channel["cell_volume"],
+            centroid_frac=w_tile_centroid_frac(
+                wfn, centroids_path, keep, n_rmu, restart_file=restart_file,
+                log_fn=log_fn),
+            bvec=CoulombGeometry.from_wfn(wfn).bvec)
         log_fn("[bse_k_grid] W Γ head re-attached AFTER densification (C1): "
                "the interpolant saw the body only, and the head is analytic "
                "at every fine q inside the coarse Γ cell.  This also changes "
