@@ -166,7 +166,12 @@ def _admit(ledger, stage, resident, workspace=0, *, host_payload=0,
     row = ledger.reserve(f"store.{stage}.{len(ledger.entries)}",
                          resident_bytes_per_rank=int(resident),
                          workspace_bytes_per_rank=int(workspace),
-                         concurrent_with=ledger.live_stages)
+                         concurrent_with=ledger.live_stages, book=False)
+    # Booked as an increment: beside the bytes in use at the stage's entry (measured), which
+    # hold the caller's arrays whether or not a live row names them.
+    from dataclasses import replace
+    from lxkit import memory
+    memory.book(replace(ledger.price(row), operands=memory.Term(), increment=True))
     if jax.process_index() == 0:
         print("[shared_pole_store capacity] " + _json(dict(device=row, host=host)), flush=True)
     return row

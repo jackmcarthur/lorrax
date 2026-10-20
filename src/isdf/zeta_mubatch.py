@@ -830,9 +830,10 @@ class ZetaG:
         tile = math.prod(nxt.sharding.shard_shape(nxt.shape)) * nxt.dtype.itemsize
         # The executable priced is the one each tile runs (one compile, not a price-only one).
         step = step.lower(L_arg, nxt, v_dev, ngk_dev, sl_dev, jnp.int32(0), V, M, shell).compile()
-        got = -agreed_chunk(-compiled_new_bytes(step, extra=tile))
+        # Beside the step: the prefetched tile and the last tile the asynchronous writer holds.
+        got = -agreed_chunk(-compiled_new_bytes(step, extra=2 * tile))
         memory.book(memory.priced(got, f"ζ G-tile step {st.g_tile} (compiled) + the prefetched "
-                                  "tile", increment=True))
+                                  "and the written tile", increment=True))
         for t in range(st.n_Gt):
             # Tile t+1 is read while tile t is contracted.
             Zt = nxt

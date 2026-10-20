@@ -640,6 +640,11 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(x)
             x, y, poles = batch_layout(x, mesh_xy), None, batch_layout(poles, mesh_xy)
         else:
+            # The placed copies are made while the read faces are live.
+            from lxkit import memory
+            memory.book(memory.priced(sum(math.prod(NamedSharding(mesh_xy, spec).shard_shape(a.shape))
+                                          * a.dtype.itemsize for spec, a in zip(factor_specs, (x, y))),
+                                      "factor faces placed beside the read faces", increment=True))
             x, y = (_placer(mesh_xy, spec)(a) for spec, a in zip(factor_specs, (x, y)))
         panel_factors, panel_poles = [], []
         for panel in panels:

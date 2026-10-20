@@ -91,8 +91,8 @@ def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     plan = constructor_price_plan(mesh, largest, execution, backend=eigh_backend)
     if execution == 'local':
         resident = 16 * 2 * math.ceil(int(nq) / ranks) * (blocks + largest ** 2)
-        # The batched local stack's first attempt; a failed check books its retry when it runs.
-        workspace = distrib_la.eigh_stack_bytes(plan, (int(nq), largest, largest), np.complex128, phase="first")
+        # The batched local stack's first attempt, proposed (the run's cut and room are its own).
+        workspace = distrib_la.eigh_stack_proposal(mesh, (int(nq), largest, largest), np.complex128)
     else:
         # The whole-mesh kernel forms G = W^H W and its vectors for every
         # parent of the stack at once: 2 nq largest^2 tiles.

@@ -308,14 +308,17 @@ route (c), and refuses by name at the first stack that needs the whole mesh
 - There are no sub-meshes or rank groups: whole mesh or whole matrices per
   rank. `_route=` on `batched` is the test-only override.
 - **A caller may decide the route itself, from the shapes.**
-  `eigh_stack_bytes(plan, shape, dtype)` is what a batched eigh of a face
-  stack adds per rank beside its operand: the program of the route `place()`
+  `eigh_stack_bytes(plan, shape, dtype, phase="all")` is what a batched eigh of a face
+  stack adds per rank beside its operand (`phase="first"` for an eager call): the program of the route `place()`
   decides, compiled at the abstract stack, plus the provider's size query off
   route (c) (about 8 n² per whole matrix a rank holds on route (c); on the whole
   mesh the vectors stack, the values and one solve's workspace). The bispinor sector
   constructor prices each stack so and passes an explicit route-(c) or
   whole-mesh plan (`gw.shared_pole_execution.staged_eigh`): no room, no
-  sizing compile and no exchange.
+  sizing compile and no exchange.  `eigh_stack_proposal(mesh, shape, dtype)` is the
+  route-(c) first attempt in closed form (five matrices per rank's share of the batch, plus
+  the ROCm batched workspace), for a caller whose run program is not known yet (the line
+  selection: its cut and room are the call's); the run's program remains the price.
 - **`checked_program(fn, mesh, out_shardings)`** jits a caller's program
   over checked solves in two phases: the first holds every solve's first
   attempt and returns their mesh-reduced failure flag; a failed first attempt

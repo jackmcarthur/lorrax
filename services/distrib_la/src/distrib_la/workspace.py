@@ -285,6 +285,18 @@ def lu_workspace_query(mesh, n, nrhs, dtype, cap) -> int:
     return _vendor_query(get_or_init_context(mesh, col_major=False), 'solve_lu', sizes + (int(cap),), dtype)[0]
 
 
+def eigh_stack_proposal(mesh, shape, dtype) -> int:
+    """Route (c)'s first attempt on the face stack ``shape`` (nb, n, n) in closed form, where the
+    program that will run is not known yet (its cut and room are the call's): five matrices per
+    rank's share of the batch (the operand in batch layout, the vectors both ways, the solver's
+    work; the CPU compile reads 3.1-4.5 at n 64-512), plus the ROCm leg's batched workspace,
+    which XLA does not see.  A proposal: the run's own program is the price."""
+    from distrib_la.local_eigh import batched_workspace_bytes
+    share, n = -(-int(shape[0]) // int(mesh.size)), int(shape[-1])
+    return (5 * share * n * n * np.dtype(dtype).itemsize
+            + batched_workspace_bytes((share, n, n), dtype, mesh_platform(mesh)))
+
+
 def eigh_stack_bytes(plan, shape, dtype, phase="all") -> int:
     """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
     its operand: the program that runs it, compiled at the abstract operand and never run
