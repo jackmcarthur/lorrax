@@ -1991,6 +1991,13 @@ jumps by at most 13.8 meV at a refresh (3×10⁹ V/m; GN-PPM refreshed screening
 
 ### 8.1 Full-microscopic implementation evidence {#full-microscopic-evidence}
 
+**Current status, 20 October 2026:** the new ordered full-matrix Sigma has
+been evaluated on material snapshots with source-frozen microscopic W.
+A refreshed-W material bank, converged material-Hamiltonian fixed point and
+matched 10 fs trajectories remain unadmitted. The internal transition-space
+prototype has not replaced the production screening constructor. The
+chronology below distinguishes fixed-snapshot controls from dynamics.
+
 The 20 October 2026 CrI3 516 proof used all 978 ISDF ports, all 36 q points,
 all 160 virtual bands, and the full coherent density in the four-band
 propagation window. Its input was a saved strong-drive snapshot at 9.5 fs
@@ -2190,6 +2197,11 @@ was 0.01030284 Ry, with
 off-diagonal norm 0.01023620 Ry and diagonal norm 0.00116986 Ry. Its relative
 fresh number residual was 2.094e-8. This prepared DFT state is neither a
 self-consistent full-frequency GW ground state nor an equilibrium-FDT test.
+For any projector P and Hermitian H, both $P[H,P]P$ and
+$(1-P)[H,P](1-P)$ vanish. Thus a Hamiltonian counterterm cannot cancel the
+measured empty/filled population motion while these coefficients stay fixed.
+Re-solving H can change E/U/W and the rates, but stationarity must then be
+tested again; self-consistent Hermiticity alone is not a stationarity proof.
 
 A separate cheap CPU diagnostic exponentiated the **held** captured affine
 generator exactly for at most 0.5 fs, using the saved old Hamiltonian
@@ -2235,7 +2247,13 @@ tolerance was tuned and no production bank, Sigma or trajectory was
 produced. These few-site results do not certify the full microscopic pole
 set. Native-site coverage, independent direct-versus-streamed response
 checks, converged frequency spaces, all-q capacity and full-complex Sigma
-convergence remain necessary before runtime integration. The receipt and
+convergence remain necessary before runtime integration. All 64 supplied seed
+rows survived QR; the 128-vector capacity did not bind. Material selected
+right/left interpolation errors and original-seed projection residuals were
+not measured. Those checks and an optimal rank-64 error bound from the public
+singular-vector owner should precede a larger experiment: the full-matrix
+defect alone does not identify inadequate coverage versus an implementation
+defect. The receipt and
 frequency-only capture share the final evidence directory above. The owned
 GPU allocation was released immediately after this bounded diagnostic
 (12:33:32 UTC, 20 October 2026). Slurm records all three final P4 steps as
