@@ -8,7 +8,7 @@ time nodes after current-domain certification.
 """
 from pathlib import Path
 import dataclasses
-from functools import partial
+from functools import lru_cache, partial
 import hashlib
 import json
 import shutil
@@ -16,6 +16,45 @@ import time
 
 import numpy as np
 from common import timing
+
+
+@lru_cache(maxsize=8)
+def _general_frequency_programs(mesh_xy, matrix_spec, dial_key):
+    """Reuse programs, not current samples, moments or a physical model.
+
+    The mesh, exact matrix layout and FFI dials identify the compiled factory.
+    All frequency tables and matrix operands remain runtime arguments; JAX
+    retains its ordinary shape/dtype specialization within each program.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding
+    from .shared_pole_execution import face_matmul
+    from .shared_pole_pencil import general_tangential_pencil, tile_join, tile_block
+
+    face = NamedSharding(mesh_xy, matrix_spec)
+    mm = face_matmul(mesh_xy)
+
+    def pencil(mu, lam, ql, il, qr, wr):
+        return general_tangential_pencil((mu, ql, il), (lam, qr, wr), matmul=mm)
+
+    def add_infinity(mu, lam, E, A, B, C, ql, il, qr, wr, qi, c1, c2):
+        ei = mm(qi, wr, transa="C")
+        ef = mm(il, qi)
+        ci = mm(c1, qi)
+        bi = mm(qi, c1, transa="C")
+        eii = mm(qi, ci, transa="C")
+        aii = mm(qi, mm(c2, qi), transa="C")
+        ai = ei*lam[None, None]-mm(bi, qr)
+        af = mu[None, :, None]*ef-mm(ql, ci, transa="C")
+        return (tile_block(((E, ef), (ei, eii)), face),
+                tile_block(((A, af), (ai, aii)), face),
+                tile_join((B, bi), -2, face), tile_join((C, ci), -1, face))
+
+    return (jax.jit(pencil, out_shardings=(face,)*4),
+            jax.jit(add_infinity, out_shardings=(face,)*4),
+            jax.jit(lambda w: jnp.conj(jnp.swapaxes(w, -1, -2)), out_shardings=face),
+            jax.jit(lambda a: .5*(a+jnp.conj(jnp.swapaxes(a, -1, -2))), out_shardings=face))
 
 
 def active_eta_verification_sites(native_sites, energy, active, eta_ry, *, native_fit_count=0):
@@ -84,6 +123,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     import jax.numpy as jnp
     import distrib_la
     from jax.sharding import NamedSharding, PartitionSpec as P
+    from ffi import ffi_dial_key
     from common.collectives import device_put_process_local, gather_to_host, rank0_transaction
     from common.contract_bands import merge_spin_centroid
     from symmetry_maps import QirrOperator
@@ -97,7 +137,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .w_isdf import full_density_response_stream
     from .shared_pole_directions import _sample_point
     from .shared_pole_execution import face_matmul
-    from .shared_pole_pencil import general_tangential_pencil, tile_join, tile_block, join_vectors
+    from .shared_pole_pencil import tile_join, join_vectors
     from .shared_pole_constructor import (general_pencil_batch_plan, collective_general_pencil_batch,
                                           general_pencil_workspace_bytes)
     from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
@@ -212,6 +252,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     rep = NamedSharding(mesh_xy, P())
     mm = face_matmul(mesh_xy)
+    pencil_program, infinity_program, adjoint_program, normal_program = _general_frequency_programs(
+        mesh_xy, face.spec, ffi_dial_key())
     fit_ids, held_ids = list(map(int, recipe["fit_ids"])), list(map(int, recipe["held_ids"]))
     sites = np.asarray([_sample_point(recipe, i) for i in fit_ids+held_ids], complex)
     # Fit the observed continuation scale, while keeping independent
@@ -243,9 +285,11 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     current_meta.shared_pole_capacity.live_stages = (price["stage"],)
     ph = density_left_endpoint(mesh_xy, pm.shape, layout=layout)(pm, jnp.asarray(rho))
     energy_d = jnp.asarray(energy)
-    roots = _coulomb_algebra(mesh_xy, nmu, int(meta.n_rmu),
+    H, inverse, negative, support = _coulomb_algebra(mesh_xy, nmu, int(meta.n_rmu),
                               dense_layout(meta, config, mesh_xy, nmu))(V)
-    H, _, negative, _ = roots
+    # The inverse/support are not used by this builder. Do not keep an
+    # otherwise dead full-port inverse live through response and reduction.
+    del inverse, support
     if bool(jnp.any(negative)):
         raise ValueError("GATE shared_general_coulomb: bare V has resolved negative spectrum")
     dyson, _, _, algebra = response_algebra(current_meta, config, mesh_xy=mesh_xy, n=nmu, ordered=True)
@@ -368,8 +412,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         if i not in directions:
             # Both sides use singular directions: -Herm(W) is not PSD for
             # a general coherent/gain input and must not be used as a Gram.
-            source = W if training_index % 2 else jax.jit(lambda w: jnp.conj(jnp.swapaxes(w, -1, -2)),
-                                             out_shardings=face)(W)
+            source = W if training_index % 2 else adjoint_program(W)
             q, _ = distrib_la.right_singular_vectors(source, float(recipe["direction_cutoff"]),
                 eigh_plan=eig, column_extent=extent, max_rank=width,
                 multiplet_tol=float(recipe["multiplet_relative_tolerance"]))
@@ -397,8 +440,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     lam, qr, wr = joined(right_states, False)
     end("directions", (ql, il, qr, wr))
     begin("pencil")
-    E, A, B, C = jax.jit(lambda mu, lam, ql, il, qr, wr: general_tangential_pencil(
-        (mu, ql, il), (lam, qr, wr), matmul=mm), out_shardings=(face, face, face, face))(mu, lam, ql, il, qr, wr)
+    E, A, B, C = pencil_program(mu, lam, ql, il, qr, wr)
     # General infinity rows constrain the exact 1/z and 1/z² coefficients
     # on the retained infinity directions. Full-port moment defects are
     # measured below; finite direction/reduction accuracy does not make
@@ -417,26 +459,13 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         # direction Gram, not Hermitization/positivity repair of W or rho.
         normal = (mm(c1, c1, transb="C")+mm(c1, c1, transa="C")
                   +mm(c2_scaled, c2_scaled, transb="C")+mm(c2_scaled, c2_scaled, transa="C"))
-        normal = jax.jit(lambda a: .5*(a+jnp.conj(jnp.swapaxes(a, -1, -2))),
-                         out_shardings=face)(normal)
+        normal = normal_program(normal)
         directions["infinity"], _ = distrib_la.leading_eigenvectors(normal,
             int(recipe["infinity_width"]), eigh_plan=eig, column_extent=extent,
             rcond=max(nmu*np.finfo(float).eps, float(recipe["direction_cutoff"])**2),
             multiplet_tol=float(recipe["multiplet_relative_tolerance"]))
     qi = directions["infinity"]
-    def add_infinity(mu, lam, E, A, B, C, ql, il, qr, wr, qi, c1, c2):
-        ei = mm(qi, wr, transa="C")
-        ef = mm(il, qi)
-        ci = mm(c1, qi)
-        bi = mm(qi, c1, transa="C")
-        eii = mm(qi, ci, transa="C")
-        aii = mm(qi, mm(c2, qi), transa="C")
-        ai = ei*lam[None, None]-mm(bi, qr)
-        af = mu[None, :, None]*ef-mm(ql, ci, transa="C")
-        return (tile_block(((E, ef), (ei, eii)), face),
-                tile_block(((A, af), (ai, aii)), face),
-                tile_join((B, bi), -2, face), tile_join((C, ci), -1, face))
-    E, A, B, C = jax.jit(add_infinity, out_shardings=(face,)*4)(mu, lam, E, A, B, C, ql, il, qr, wr, qi, c1, c2)
+    E, A, B, C = infinity_program(mu, lam, E, A, B, C, ql, il, qr, wr, qi, c1, c2)
     # Infinity conditions have one extra energy unit per endpoint relative
     # to finite divided differences. Match those units BEFORE numerical
     # rank selection, respecting the actual tiled join order on each axis.
