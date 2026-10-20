@@ -1,0 +1,28 @@
+{
+  "schema": "campaign_native_software_proof_v1",
+  "allocation_step": "60056663.2",
+  "execution_revision": "38dbea1665518cb13018b972bf6dd2a059910ed5",
+  "source_archive_sha256": "1b76c2729ff6776e7cf31d69029fa1e3b628381411c53c893365d9ceab3294aa",
+  "helper_sha256": "a23371f47660f0b4e30addb85da174167c46001dd1554b81dd1643edeff421f5",
+  "receipt_sha256": "1f5be7c2581119a54b717488956e86bedd9c1a1bf2a92fd9bb4d446ed76038f9",
+  "native_P": 4,
+  "mesh": [2, 2],
+  "kgrid": [8, 8, 1],
+  "qgrid": [4, 4, 1],
+  "fixture_bands": 4,
+  "fixture_centroids": 4,
+  "native_ABI": 10,
+  "exit_code": 0,
+  "status": "PASS_SOFTWARE_ONLY_NOT_MATERIAL_OR_CONSERVING_CLOSURE",
+  "elapsed_seconds": 43,
+  "active_GPU_hours": 0.047778,
+  "completed_native_stages": [
+    "coherent_and_scalar_Chi_and_moments_vs_literal_Fejer_restriction",
+    "ordinary_coarse_q_Sigma_single_tau_full_complex_matrix_vs_literal",
+    "cached_pencil_and_infinity_programs_two_current_operand_sets"
+  ],
+  "material_screening_admitted": false,
+  "SC_performed": false,
+  "TD_propagated_fs": 0,
+  "local_full_receipt": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/p4_fejer38_60056663/receipt.json"
+}

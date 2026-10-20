@@ -20,7 +20,8 @@
   "independent_review_passed": true,
   "physical_recipe_changed": false,
   "validity_gates_relaxed": false,
-  "post_fix_material_gpu_result": "PENDING",
+  "post_fix_material_gpu_result": "FINE_W_CONSTRUCTOR_PASSED_BSE_INPUT_REFUSED",
+  "post_fix_followup": "FINE_W_AND_Q4_REPLAY_60056663.json",
   "scope": "A confirmed deterministic data-association defect, not yet a measured explanation of the entire material Gram residual. The fine-grid replay also refused, so the earlier q4 refusal cannot be attributed solely to the real-space cutoff. No BSE, Sigma or TD completion occurred in either failed client.",
   "fine_refusal_evidence_archive_sha256": "119222d506f4f579cf83fe405403d12ec35331bd5e473bc32a9aa7a6f2c4dd1a",
   "session_small_evidence_manifest_sha256": "9bdf217bbb5a2f9f004e33122f7b465edbc612e6bc6d7cc5e3f90aeb21579c2b"
