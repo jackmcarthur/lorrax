@@ -1304,6 +1304,13 @@ class Plan:
             _STACK_ROUTES[key] = decided
         return decided
 
+    def _gathered(self, ops) -> bool:
+        """Whether this plan's eigh chain holds the gathered attempt (it reads ``budget_bytes``,
+        which plan equality ignores): part of every program cache key, so a program built in
+        one room never runs, or is priced, in another."""
+        return self.op == "eigh" and bool(ops) and _gathered_admitted(
+            self.mesh, tuple(ops[0].shape[-2:]), ops[0].dtype, self.budget_bytes)
+
     def _stack_key(self, op, nb, n, dtype, traced):
         phase = "all" if op == "normal_eigh" else traced_phase() if traced else "first"
         return (mesh_key(self.mesh), op, int(nb), int(n), np.dtype(dtype).name,
@@ -1486,7 +1493,7 @@ class Plan:
 
         def program(phase, donate):
             key = scan_signature(self.op, self.backend, mesh, ops, kwargs,
-                                 extra=(tag, phase))
+                                 extra=(tag, phase, self._gathered(ops)))
             return cached_scan(key, lambda: jax.jit(
                 lambda *o: fn(*o, mesh=mesh, _phase=phase, **kwargs),
                 donate_argnums=donate))
@@ -1807,7 +1814,8 @@ class Plan:
 
             return jax.jit(_scanned)
 
-        key = scan_signature(self.op, self.backend, mesh, ops, kwargs, extra=(phase,))
+        key = scan_signature(self.op, self.backend, mesh, ops, kwargs,
+                             extra=(phase, self._gathered(ops)))
         return cached_scan(key, _build)(*ops)
 
 
