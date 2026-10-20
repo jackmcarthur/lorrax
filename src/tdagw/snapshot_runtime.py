@@ -318,7 +318,9 @@ def prepare_native_source(source, mesh):
     The returned ``psi`` is the source's existing centroid face, not a
     density-channel vertex tensor. Large orbital and bare-Coulomb arrays
     remain distributed on all ranks. Only scalar metadata and the small
-    full-band energy/occupation tables are gathered.
+    full-band energy/occupation tables are gathered. ``energy/occupations``
+    retain logical physical support; ``energy_padded/occupations_padded``
+    retain the exact native carrier, with authenticated inert zero padding.
     """
     from common.collectives import gather_to_host
     from symmetry_maps import QirrOperator
@@ -354,7 +356,9 @@ def prepare_native_source(source, mesh):
     logical = int(wfns.slices.b4_logical)
     nb_chi = min(int(wfns.slices.b4_chi), logical)
     nb_sigma = min(int(wfns.slices.b4_sigma or nb_chi), logical)
-    nb = max(nb_chi, nb_sigma)
+    # The loaded physical carrier can exceed either consumer's band sum.
+    # Only rows past b4_logical are padding; chi/Sigma retain their own caps.
+    nb = logical
     V = source.get("V_q", source.get("screening_inputs", {}).get("V_q"))
     if V is None:
         raise ValueError("GATE td_native_bare_coulomb: source must retain its full bare V")
@@ -370,8 +374,22 @@ def prepare_native_source(source, mesh):
     nspinor = int(getattr(meta, "nspinor_wfnfile", psi.shape[2]))
     if min(nspin, nspinor) < 1:
         raise ValueError("GATE td_native_spin_weight: positive file spin multiplicities required")
-    return dict(energy=np.asarray(gather_to_host(wfns.enk))[:, :nb],
-        occupations=np.asarray(gather_to_host(wfns.occ))[:, :nb], k_frac=frac,
+    energy_padded = np.asarray(gather_to_host(wfns.enk))
+    occupations_padded = np.asarray(gather_to_host(wfns.occ))
+    if (energy_padded.ndim != 2 or energy_padded.shape != occupations_padded.shape
+            or energy_padded.shape != psi.shape[:2] or nb > energy_padded.shape[1]):
+        raise ValueError("GATE td_native_band_padding: orbital and energy/occupation carriers differ")
+    if energy_padded.shape[1] > nb:
+        # Native band padding is an inert carrier, not extra physical states.
+        # Preserve its producer-owned energy sentinels exactly; only a scalar
+        # orbital check leaves the distributed centroid faces.
+        padding_nonzero = bool(gather_to_host(
+            jax.jit(lambda p: jnp.any(p[:, nb:] != 0))(psi)))
+        if np.any(occupations_padded[:, nb:] != 0) or padding_nonzero:
+            raise ValueError("GATE td_native_band_padding: padded occupations/orbitals must be exact zero")
+    return dict(energy=energy_padded[:, :nb], occupations=occupations_padded[:, :nb],
+        energy_padded=energy_padded, occupations_padded=occupations_padded,
+        nb_padded=int(energy_padded.shape[1]), k_frac=frac,
         kgrid=kgrid, nk=nk, qgrid=qgrid, nq=nq, nb=nb, nb_chi=nb_chi, nb_sigma=nb_sigma,
         mesh=mesh, nmu_logical=int(meta.n_rmu), spin_weight=2.0/(nspin*nspinor),
         psi=psi, V_q=V, head=source.get("head"),
@@ -418,16 +436,21 @@ def make_native_snapshot_evaluator(source, prepared, options):
     def evaluate(basis, *, equilibrium=False, fit_bases=None):
         wall = time.perf_counter()
         U, e, rho = (np.asarray(basis[k]) for k in ("U", "e", "rho"))
-        energy = prepared["energy"].copy()
+        # Screening/line owners consume the full native padded carrier.
+        # Logical metadata/tail cuts remain capped at nb; inert padding keeps
+        # its exact source energy sentinel and zero density/orbitals.
+        energy = prepared.get("energy_padded", prepared["energy"]).copy()
+        nb = int(prepared["nb"])
         energy[:, :start] += (e[:, 0]-energy[:, start])[:, None]
-        energy[:, start+na:] += (e[:, -1]-energy[:, start+na-1])[:, None]
+        energy[:, start+na:nb] += (e[:, -1]-energy[:, start+na-1])[:, None]
         energy[:, active] = e
         cache["n"] += 1
         if mode == "joint" or equilibrium:
             # Response A is a NUMERICAL band partition, not the propagated
             # density window. Extra bands retain their original exact 0/1 rho.
             from tdagw.dynsig import chi0_active_group
-            a0, a1, _ = chi0_active_group(energy, active, options.get("spm_chi0_active") or "auto")
+            a0, a1, _ = chi0_active_group(energy[:, :nb], active,
+                options.get("spm_chi0_active") or "auto")
             snapshot = dict(U_active=U, E_active_ry=e, rho_active=rho,
                 active_slice=active, response_active_slice=slice(a0, a1), energy_ry=energy,
                 gamma_ry=float(options.get("adiabatic_ry",
