@@ -77,7 +77,7 @@ def test_literal_source_record_propagates_native_current_tail_head_and_frame():
     frame = dict(accepted_driver_complete=dict(reference_ready=True))
     scope = dict(inputs=inputs, Vscreen=object(), meta=object(), config=object(),
         U=unitary, E=np.zeros((64, 752)), f=np.zeros((64, 752)), frame=frame,
-        arrays=object(), input_deck="native.in", G0_canonical=None, resolver=object(),
+        arrays=object(), input_deck="native.in", G0_canonical=None, G0_receipt=None, resolver=object(),
         captured=dict(spectral_tail_reference=tail, sigma_head=head, efermi_ry=-.1),
         time=NS(perf_counter=lambda: 5.), leg_started=2.)
     exec(compiled, scope)

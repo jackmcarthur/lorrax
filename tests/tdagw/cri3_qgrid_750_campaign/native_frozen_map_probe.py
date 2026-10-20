@@ -108,9 +108,25 @@ def band_pair_comparison(fine, coarse):
     return result
 
 
+def run_pre_sigma_only(callback, current, *, out, publish, finished):
+    """Stop only AFTER a successful collective callback, before broad Sigma.
+
+    This explicit external-driver boundary is not an SC convergence or
+    fine/coarse comparison verdict. Callback exceptions propagate unchanged.
+    """
+    callback(current, out=out)
+    publish("pre_sigma_complete.json", record=dict(status="PRE_SIGMA_ONLY_COMPLETE",
+        accepted_input_frame=current["frame"]["frame"],
+        broad_protected_Sigma_performed=False, coarse_leg_performed=False,
+        new_SC_convergence_claim=False, cutoff_accuracy_verdict=False))
+    finished.append("PRE_SIGMA_ONLY")
+    raise StopIteration("EXTERNAL_PRE_SIGMA_PROBE_COMPLETE")
+
+
 def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
                         directory, publish, gather, G0_canonical=None,
-                        source_callback=None, post_sigma_callback=None, input_deck=None):
+                        source_callback=None, post_sigma_callback=None, input_deck=None,
+                        G0_receipt=None):
     """Evaluate one existing native map; source callback is synchronous only."""
     import numpy as np
     import jax
@@ -200,7 +216,7 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
                 energy_ry=E[:, :750], occupations=f[:, :750], frame=frame,
                 mesh=inputs.mesh_xy, head_resolver=resolver,
                 iteration_head=roles.get("iteration_head"), input_dir=inputs.input_dir,
-                G0_canonical=G0_canonical,
+                G0_canonical=G0_canonical, G0_receipt=G0_receipt,
                 spectral_tail_reference=captured.get("spectral_tail_reference"),
                 velocity_dft_cart=(None if inputs.parallel_transport is None else
                                    inputs.parallel_transport.velocity_dft_cart),
@@ -345,7 +361,9 @@ def main(argv=None):
                         help="native q4/full64 proper-SC setup deck, not a max_iter1 wrapper")
     parser.add_argument("--frames", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--bse-helper")
+    pre_sigma = parser.add_mutually_exclusive_group()
+    pre_sigma.add_argument("--bse-helper")
+    pre_sigma.add_argument("--pre-sigma-helper", help="run collective fine-W callback and STOP before broad Sigma")
     parser.add_argument("--td-helper", help="reviewed post-Sigma SC750 TD callback module")
     parser.add_argument("--td-deck", help="explicit short zero-field TD deck for that callback")
     parser.add_argument("--wall-cap", type=float, default=900.)
@@ -358,6 +376,8 @@ def main(argv=None):
         parser.error("fresh --out, positive finite wall cap and nonnegative stack interval required")
     if bool(args.td_helper) != bool(args.td_deck):
         parser.error("--td-helper and --td-deck are required together")
+    if args.pre_sigma_helper and (args.td_helper or args.td_deck):
+        parser.error("--pre-sigma-helper stops before Sigma and cannot run TD")
     if os.environ.get("LEG_HEAD") != args.source_revision:
         parser.error("--source-revision must match launcher's immutable LEG_HEAD")
     sys.path[:0] = [str(source), str(source / "src")]
@@ -378,7 +398,7 @@ def main(argv=None):
         if not Path(module.__file__).resolve().is_relative_to(source):
             raise RuntimeError("unexpected native source origin")
     arrays, frame = load_accepted_frame(args.frames)
-    finished, G0 = [], []
+    finished, G0, G0_receipts = [], [], []
     original_solver = sc_iteration.run_self_consistency
     original_vq = gw_init._finalize_vq_views
     def publish(name, **kwargs):
@@ -387,7 +407,20 @@ def main(argv=None):
                           write=lambda: h.exclusive_write(path, **kwargs))
     def capture_vq(*a, **kw):
         result = original_vq(*a, **kw)
-        G0[:] = [np.array(result[1], copy=True)]
+        # The original owner already gathers/selects the exact q=0 vector.
+        # It may carry canonical SUFFIX padding, never orbit packing.
+        vector = np.array(result[1], copy=True)
+        meta = a[3] if len(a) > 3 else kw["meta"]
+        basis = meta.mu_basis
+        G0[:] = [vector]
+        G0_receipts[:] = [dict(producer="gw.gw_init._finalize_vq_views",
+            q_fractional=[0., 0., 0.], order="canonical_suffix_padded",
+            shape=list(vector.shape), dtype=str(vector.dtype),
+            logical_extent=int(basis.n_logical), canonical_extent=int(basis.n_canonical),
+            packed_extent=int(basis.n_packed),
+            canonical_value_sha256=hashlib.sha256(np.ascontiguousarray(vector).tobytes()).hexdigest(),
+            canonical_centroids_sha256=hashlib.sha256(
+                np.ascontiguousarray(basis.canonical_indices).tobytes()).hexdigest())]
         return result
     def intercepted_solver(initial, inputs, **kwargs):
         if tuple(inputs.meta.qgrid) != (4, 4, 1):
@@ -424,13 +457,30 @@ def main(argv=None):
             source_lifetime="immutable DFT source held; current faces not retained across Sigma",
             host_band_metadata_bound_bytes=2 * 1024**3,
             host_band_metadata_price_bytes=small_preflight,
+            pre_sigma_only=(None if not args.pre_sigma_helper else dict(
+                helper=str(Path(args.pre_sigma_helper).resolve()),
+                helper_sha256=hashlib.sha256(Path(args.pre_sigma_helper).read_bytes()).hexdigest(),
+                scope="fine current W and explicit callback only; no broad160 Sigma/coarse leg/TD")),
             no_material_capacity_admission_claim=True))
+        if G0_receipts:
+            publish("source_fit_G0.json", record=G0_receipts[0])
+            publish("source_fit_G0.npz", arrays=dict(G0_canonical=G0[0]))
         callback = None
         td_callback = None
+        if args.pre_sigma_helper:
+            spec = importlib.util.spec_from_file_location("native_pre_sigma_probe", args.pre_sigma_helper)
+            pre = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(pre)
+            callback = lambda current: run_pre_sigma_only(pre.run_pre_sigma_probe, current,
+                out=out/"fine_pre_sigma", publish=publish, finished=finished)
         if args.bse_helper:
             spec = importlib.util.spec_from_file_location("native_bse_probe", args.bse_helper)
             bse = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(bse)
+            if hasattr(bse, "source_fit_g0"):
+                bse.source_fit_g0(dict(meta=inputs.meta,
+                    G0_canonical=None if not G0 else G0[0],
+                    G0_receipt=None if not G0_receipts else G0_receipts[0]))
             callback = lambda current: bse.run_bse_probe(current, out=out / "fine_bse",
                 nval=4, ncond=4, nroots=24, maxiter=200)
         if args.td_helper:
@@ -444,6 +494,7 @@ def main(argv=None):
             results.append(evaluate_frozen_leg(sc_iteration, initial, inputs, arrays,
                 frame, qgrid=grid, directory=directory, publish=publish,
                 gather=gather_to_host, G0_canonical=None if not G0 else G0[0],
+                G0_receipt=None if not G0_receipts else G0_receipts[0],
                 source_callback=callback if grid == (8, 8, 1) else None,
                 post_sigma_callback=td_callback if grid == (8, 8, 1) else None,
                 input_deck=str(Path(args.setup_deck).resolve())))
@@ -468,11 +519,14 @@ def main(argv=None):
         try:
             gw_jax.main(["-i", str(Path(args.setup_deck).resolve())])
         except StopIteration as exc:
-            if not finished or str(exc) != "EXTERNAL_FROZEN_PROBE_COMPLETE":
+            expected = ("EXTERNAL_PRE_SIGMA_PROBE_COMPLETE" if finished == ["PRE_SIGMA_ONLY"]
+                        else "EXTERNAL_FROZEN_PROBE_COMPLETE")
+            if not finished or str(exc) != expected:
                 raise
         if not finished:
             raise RuntimeError("native driver did not reach the frozen-state evaluation seam")
-        h.mark("external_frozen_probe_complete", cutoff_accuracy_verdict=False)
+        h.mark("external_frozen_probe_complete", cutoff_accuracy_verdict=False,
+               pre_sigma_only=finished == ["PRE_SIGMA_ONLY"])
     finally:
         sc_iteration.run_self_consistency, gw_init._finalize_vq_views = original_solver, original_vq
         done.set()

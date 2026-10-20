@@ -185,3 +185,24 @@ snapshots. Its report also compares polarization divided by the actual
 pulse amplitude across the two intensities. It performs no interpolation,
 equilibrium subtraction or damping-rate fit, and refuses calibration-only
 output. The host tests use explicitly synthetic small fixtures only.
+
+## Active-destination cost benchmark
+
+`--pre-sigma-helper active_sigma_probe.py` on the frozen native probe runs
+two identical-input compact native Sigma sweeps after fine W, then stops
+cleanly before the protected160 Sigma map, BSE, coarse leg or TD. Only
+external [100,144) energies and 44x44 matrices are requested; all750 physical
+internal bands remain. The two sweeps expose cold and same-session warm
+costs, actual window/tau counts and full complex branch pairs. Wall time per
+window/tau pair is an amortized whole-sweep cost, not isolated GPU latency.
+This first benchmark measures the raw750 equilibrium correlation BODY only;
+it does not include head evaluation, tail extrapolation or construction of
+the general coherent refreshed-W model. Those costs must be reported
+separately, not inferred from this sweep.
+
+The source-fit G0 handoff also accepts the native basis's exact-zero canonical
+suffix padding (3000 logical / 3008 canonical in the actual material setup).
+The captured producer/basis/value receipt and small vector are preserved
+before maps; only the existing basis owner performs orbit packing. BSE
+validates this before allocating static W. No G0 fit or large zeta export is
+substituted.

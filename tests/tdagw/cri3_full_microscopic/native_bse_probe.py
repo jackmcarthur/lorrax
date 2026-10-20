@@ -7,8 +7,50 @@ screening solve. It initially admits only equal electronic and bosonic grids.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import time
+
+
+def source_fit_g0(source):
+    """Pack the exact canonical source-fit Gamma vector, including inert pads.
+
+    The native Coulomb owner returns canonical logical OR suffix-padded
+    metadata, not orbit-packed metadata. Only the basis owner packs it.
+    No vector is inferred from V, refitted, or reconstructed from a head.
+    """
+    import numpy as np
+    meta = source["meta"]
+    basis = meta.mu_basis
+    canonical = np.asarray(source.get("G0_canonical"))
+    logical, carrier = int(basis.n_logical), int(basis.n_canonical)
+    if (canonical.ndim != 1 or logical != int(meta.n_rmu)
+            or canonical.size not in (logical, carrier)
+            or not np.isfinite(canonical).all()
+            or np.any(canonical[logical:] != 0)):
+        raise ValueError("BSE needs the exact source-fit G0 vector: canonical logical or "
+                         "basis suffix-padded extent with exact-zero padding; "
+                         f"got shape {canonical.shape}, logical={logical}, canonical={carrier}")
+    receipt = source.get("G0_receipt")
+    if receipt is not None:
+        if (receipt.get("canonical_value_sha256") != hashlib.sha256(
+                np.ascontiguousarray(canonical).tobytes()).hexdigest()
+                or receipt.get("canonical_centroids_sha256") != hashlib.sha256(
+                    np.ascontiguousarray(basis.canonical_indices).tobytes()).hexdigest()
+                or receipt.get("logical_extent") != logical
+                or receipt.get("canonical_extent") != carrier
+                or receipt.get("packed_extent") != int(basis.n_packed)
+                or receipt.get("order") != "canonical_suffix_padded"
+                or receipt.get("shape") != list(canonical.shape)
+                or receipt.get("dtype") != str(canonical.dtype)
+                or receipt.get("producer") != "gw.gw_init._finalize_vq_views"
+                or receipt.get("q_fractional") != [0., 0., 0.]):
+            raise ValueError("BSE source-fit G0 producer/basis/value receipt mismatch")
+    packed = basis.pack_host(canonical)
+    if (packed.shape != (int(basis.n_packed),)
+            or np.any(packed[~np.asarray(basis.active_mask, bool)] != 0)):
+        raise ValueError("BSE source-fit G0 packed extent/pad mismatch")
+    return packed
 
 
 def bright_subgap_summary(energies_ev, residual_ev, dipoles, *, gap_ev, nk):
@@ -93,6 +135,8 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
 
     start = time.perf_counter()
     mesh, meta, config = source["mesh"], source["meta"], source["config"]
+    # Refuse a missing/mis-associated vector BEFORE W0 or BSE allocations.
+    packed_g0 = source_fit_g0(source)
     grid = tuple(int(x) for x in meta.kgrid)
     if tuple(getattr(meta, "qgrid", None) or grid) != grid:
         raise ValueError("BSE probe presently requires qgrid=kgrid; no implicit W interpolation")
@@ -144,15 +188,9 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
     W = jax.jit(lambda w: jnp.moveaxis(w, 0, -1).reshape(w.shape[1], w.shape[2], *grid),
                 out_shardings=sh.W)(wvalues)
     v0 = jax.jit(lambda v: v[0], out_shardings=sh.V)(V.values)
-    # Native Coulomb owner captured this exact small G0 before returning V.
-    canonical = np.asarray(source["G0_canonical"])
-    basis = meta.mu_basis
-    if canonical.ndim != 1 or canonical.size != int(meta.n_rmu):
-        raise ValueError("BSE needs the exact source-fit G0 vector")
     # G0 is ALREADY small replicated host metadata from its native producer.
     # Use its host packing owner: the large-array staged conversion requires
     # a second slab axis and is not the vector-metadata path.
-    packed_g0 = basis.pack_host(canonical)
     gx = device_put_process_local(packed_g0, NamedSharding(mesh, P('x')))
     gy = device_put_process_local(packed_g0, NamedSharding(mesh, P('y')))
     v0, W, head_log = _inject_q0_head(v0, W, gx, gy, hs.vc0,
