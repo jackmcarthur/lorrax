@@ -369,17 +369,24 @@ class ConstructorCapacity:
                     shapes[0], np.complex128, phase="first"))
         return self.native_queries[("eigh", shapes)]
 
-    def direction_bytes(self, depth):
+    def direction_bytes(self, depth, part=0):
         """A face selection's direction solve of a ``depth``-row stack (parents x samples, the
-        stack ``polar`` flattens): ``distrib_la.direction_svd_bytes``, cached in ``native_queries``."""
+        stack ``polar`` flattens): ``distrib_la.direction_svd_bytes``, its price beside W (``part``
+        0) or its eigh stack's alone (1: the selection eigh's room), cached in ``native_queries``."""
         import distrib_la
         key = ("direction", int(depth), int(self._n))
         if key not in self.native_queries:
-            self.native_queries[key] = distrib_la.direction_svd_bytes(
+            self.native_queries[key] = tuple(int(v) for v in distrib_la.direction_svd_bytes(
                 constructor_price_plan(self._mesh_xy, int(self._n), self.execution,
                                        backend=self._resolution.eigh_backend),
-                (int(depth), int(self._n), int(self._n)), np.complex128)
-        return self.native_queries[key]
+                (int(depth), int(self._n), int(self._n)), np.complex128))
+        return self.native_queries[key][part]
+
+    def stack_bytes(self, depth):
+        """Per-rank bytes of one [depth, n, n] complex128 face stack (the array a take makes)."""
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        shape = (int(depth), int(self._n), int(self._n))
+        return int(np.prod(NamedSharding(self._mesh_xy, P(None, "x", "y")).shard_shape(shape))) * 16
 
     @property
     def ledger(self):
@@ -432,9 +439,14 @@ class ConstructorCapacity:
         face_selection = phase == "selection" and self.execution == "face"
         if face_selection:
             # The face direction solve is priced by the programs it runs (direction_bytes), not by
-            # the 24 n^2 dense closed form.
-            price = dict(price, resident_bytes_per_rank=price["resident_bytes_per_rank"]
-                         - price["terms_bytes_per_rank"]["phase_dense_temporaries"])
+            # the 24 n^2 dense closed form; the stacks it solves are new copies of W (k.take, and
+            # negative_hermitian for an imaginary kind), each one [parents x samples, n, n] array.
+            terms = price["terms_bytes_per_rank"]
+            copies = 2 * self.stack_bytes(self.batch_width * int(sample_batch))
+            price = dict(price, terms_bytes_per_rank=dict(terms, phase_dense_temporaries=0,
+                                                          selection_stack_copies=copies),
+                         resident_bytes_per_rank=price["resident_bytes_per_rank"]
+                         - terms["phase_dense_temporaries"] + copies)
         self._native_maxima["eigh"] = 0 if not eigh else (
             self.direction_bytes(self.batch_width * int(sample_batch)) if face_selection
             else max(self.eigh_bytes(e) for e in sorted(extents)))

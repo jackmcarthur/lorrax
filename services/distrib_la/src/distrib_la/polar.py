@@ -23,7 +23,7 @@ from lxkit import ordered_norm
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD, _analysis_bytes, _executable
+from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD, _EXECUTABLES, _analysis_bytes, _exec_key, _executable
 from distrib_la.resolve import mesh_key
 from distrib_la._collectives import device_put_process_local_cached
 
@@ -587,19 +587,22 @@ def _gemm_backend(eigh_plan):
     return "distributed" if eigh_plan.requested in ("auto", "off") else eigh_plan.requested
 
 
-def direction_svd_bytes(eigh_plan, shape, dtype) -> int:
-    """Per-rank bytes the face direction solve (:func:`right_singular_vectors`) of the stack
-    ``shape`` [e, m, m] adds beside W, from the programs it runs: on route (c) its stack's price;
-    otherwise the normal-matrix executable the solve executes, or its output beside the eigh stack
-    as the plan prices it (``eigh_stack_bytes``: first attempt + the provider's query)."""
+def direction_svd_bytes(eigh_plan, shape, dtype) -> tuple:
+    """``(price, eigh)``: per-rank bytes the face direction solve (:func:`right_singular_vectors`)
+    of the stack ``shape`` [e, m, m] adds beside W, from the programs it runs, and its eigh stack's
+    part alone (the selection eigh's room).  On route (c) the eager ``normal_eigh`` program it
+    executes; otherwise the normal-matrix executable it executes, or its output G beside the eigh
+    stack as the plan prices it (``eigh_stack_bytes``: first attempt + the provider's query)."""
+    from distrib_la.plan import _stack_bytes
     from distrib_la.workspace import eigh_stack_bytes
     mesh, shape = eigh_plan.mesh, tuple(int(v) for v in shape)
     if eigh_plan.known_route(shape, dtype) == ROUTE_BATCH_RESHARD:      # a pure query: price plans have no room
-        return eigh_stack_bytes(eigh_plan, shape, dtype, phase="first")
+        whole = _stack_bytes("normal_eigh", mesh, shape[0], shape[-1], dtype, 1, "all")
+        return whole, whole
     W = jax.ShapeDtypeStruct(shape, np.dtype(dtype), sharding=NamedSharding(mesh, P(None, 'x', 'y')))
     ex = _executable(_normal_program(mesh, 3, _gemm_backend(eigh_plan), eigh_plan.backend == "cusolvermp"), (W,))
-    return max(int(_analysis_bytes(ex) or 0), int(ex.memory_analysis().output_size_in_bytes)
-               + eigh_stack_bytes(eigh_plan, shape, dtype, phase="first"))
+    eigh = eigh_stack_bytes(eigh_plan, shape, dtype, phase="first")
+    return max(int(_analysis_bytes(ex) or 0), int(ex.memory_analysis().output_size_in_bytes) + eigh), eigh
 
 
 @lru_cache(maxsize=16)
@@ -624,10 +627,6 @@ def _direction_svd_kernel(eigh_plan, ndim, tau=None):
     stack = lambda w: w if w.ndim == 3 else w[None]
     unstack = lambda s, v: (s, v) if ndim == 3 else (s[0], v[0])
 
-    @jax.jit(out_shardings=(rep, tile))
-    def reshard(w):
-        return unstack(*eigh_plan.reshard_stack("normal_eigh", stack(w)))
-
     normal = _normal_program(mesh, ndim, _gemm_backend(eigh_plan), shifted)
 
     @jax.jit(out_shardings=(rep, tile))
@@ -636,7 +635,11 @@ def _direction_svd_kernel(eigh_plan, ndim, tau=None):
 
     def extract(w):
         if eigh_plan.stack_route(stack(w).shape, w.dtype, "normal_eigh").route == ROUTE_BATCH_RESHARD:
-            return reshard(w)
+            return unstack(*eigh_plan.reshard_stack("normal_eigh", stack(w)))     # eager: priced as it runs
+        if any(k[0] is normal for k in _EXECUTABLES) and (normal, _exec_key((w,))) not in _EXECUTABLES:
+            import warnings
+            warnings.warn(f"distrib_la: the direction solve of {tuple(w.shape)} runs a normal-matrix "
+                          "program its price compiled at another shape", RuntimeWarning, stacklevel=2)
         a, scale = _executable(normal, (w,))(w)     # the executable direction_svd_bytes prices
         mu, v = eigh_plan.batched(a, **cut)
         del a

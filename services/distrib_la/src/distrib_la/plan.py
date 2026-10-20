@@ -311,6 +311,12 @@ def _stack_bytes(op, mesh, nb, n, dtype, rounds, phase="all", gathered=False) ->
     return int(_analysis_bytes(_executable(program, (operand,))) or 0)
 
 
+def _exec_key(args):
+    """An executable's operand signature: every leaf's shape, dtype, mesh and spec."""
+    return tuple((tuple(a.shape), str(a.dtype), getattr(a.sharding, "mesh", None),
+                  getattr(a.sharding, "spec", a.sharding)) for a in jax.tree.leaves(args))
+
+
 #: Route (c)'s executables, one per program and operand signature: the compile a price reads is
 #: the one an eager call runs (:meth:`Plan._checked_reshard`).
 _EXECUTABLES: dict = {}
@@ -319,8 +325,7 @@ _EXECUTABLES: dict = {}
 def _executable(program, args):
     """``program`` (one of :func:`_reshard_stack_program`'s) compiled at ``args``, once per
     operand shape, dtype, mesh and spec."""
-    key = (program, tuple((tuple(a.shape), str(a.dtype), getattr(a.sharding, "mesh", None),
-                           getattr(a.sharding, "spec", a.sharding)) for a in jax.tree.leaves(args)))
+    key = (program, _exec_key(args))
     if key not in _EXECUTABLES:
         _EXECUTABLES[key] = program.lower(*args).compile()
     return _EXECUTABLES[key]
@@ -408,7 +413,8 @@ def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> St
     refuses by name a fallback over ``room`` (no route fits).
     """
     x, y = int(mesh.shape["x"]), int(mesh.shape["y"])
-    ranks, gathered = x * y, _gathered_admitted(mesh, (n, n), dtype, room)
+    # normal_eigh has no checked chain, so no gathered retry: its candidate is the program it runs.
+    ranks, gathered = x * y, op != "normal_eigh" and _gathered_admitted(mesh, (n, n), dtype, room)
     platform = mesh_platform(mesh)
     if n % x == 0 and n % y == 0:
         per_rank = -(-nb // ranks)
@@ -1809,7 +1815,10 @@ class Plan:
                                           cut if cut is None or callable(cut) else float(cut),
                                           _gathered_admitted(self.mesh, shape[-2:], dtype, self.budget_bytes))
         if op == "normal_eigh":
-            return program("all")(A)
+            # No check, cut or gathered retry: one program per shape and rounds, priced as it runs
+            # (polar.direction_svd_bytes).
+            normal = _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), "all", None, False)
+            return normal(A) if isinstance(A, jax.core.Tracer) else _executable(normal, (A,))(A)
         if isinstance(A, jax.core.Tracer):
             values_vectors, failed = program(traced_phase())(A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
