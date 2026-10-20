@@ -9,7 +9,6 @@ from __future__ import annotations
 import jax.numpy as jnp
 import numpy as np
 from distrib_la import hermitian_part
-from gw.shared_pole_pencil import _adjoint
 
 
 def ordered_moment_identity(signed, infinity, *, matmul):
@@ -227,8 +226,11 @@ def _passivity_response_checks(response, *, eigh, gates):
     """Common 0 <= whitened response <= I and Hermiticity gate."""
     herm = hermitian_part(response)
     norm = jnp.linalg.norm(herm, axis=(-2, -1))
-    anti = jnp.linalg.norm(response - _adjoint(response), axis=(-2, -1))
-    anti = anti / jnp.where(norm > 0, 2 * norm, 1)
+    # ||A - A^H|| / (2 ||Herm A||) read as ||A - Herm A|| / ||Herm A||: elementwise on the
+    # face. ``response - _adjoint(response)`` lowered to two whole-matrix all-gathers per
+    # rank under GSPMD (2.4 n^2 c128 per rank whatever P: run30k passivity_held).
+    anti = jnp.linalg.norm(response - herm, axis=(-2, -1))
+    anti = anti / jnp.where(norm > 0, norm, 1)
     values, _ = eigh(herm, cut=PASSIVITY_CHECK_CUT)
     minimum, maximum = values[:, 0], values[:, -1]
     limit = gates["passivity"]["threshold"].get("antihermitian_relative_max")
