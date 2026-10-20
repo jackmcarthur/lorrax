@@ -210,15 +210,25 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         face_batch = 1
         if execution == 'face':
             from gw.shared_pole_capacity import check_eigh_room, face_eigh_room
-            from gw.shared_pole_execution import face_batch_width, face_reduction_bytes, face_ritz_carrier
+            from gw.shared_pole_execution import (face_batch_width, face_reduction_bytes, face_ritz_carrier,
+                                                  face_round_compiled_bytes)
             keep_budget = recipe.get("pole_budget")
+            # The conservative round's infinity carrier and its block in the pencil side
+            # (constructor_side_upper_bound), for the width's compiled admission.
+            infinity_cap = column_extent(max(1, int(recipe["infinity_width"])))
+            infinity_block = (2 * infinity_cap if odd_moments else 0) if ordered else infinity_cap
             sizing = dict(rows=n, side=conservative_side,
                           carrier=face_ritz_carrier(mesh_xy, keep_budget) if ordered else None)
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, nq=nq,
                 selection=dict(sample_batch=len(dense_fit), selection_faces=selection_faces),
-                program_bytes=lambda width: face_reduction_bytes(mesh_xy, width, **sizing))
+                program_bytes=lambda width: face_reduction_bytes(mesh_xy, width, **sizing),
+                compiled=lambda width, room: face_round_compiled_bytes(
+                    mesh_xy, width, rows=n, finite=conservative_side - infinity_block, infinity_width=infinity_cap,
+                    infinities=1 + len(moment_fields), ordered=ordered, odd_moments=odd_moments,
+                    keep_budget=keep_budget, carrier=sizing['carrier'],
+                    eigh_backend=resolution.eigh_backend, room=room))
             # Every face round's reduction is priced at this size.
             budget.program_bytes = execution_receipt['face_batch']['program_bytes_per_rank']
             # distrib_la decides each eigh stack against the room beside the

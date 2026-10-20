@@ -165,7 +165,11 @@ def constructor_admission():
     width, receipt = face_batch_width(
         meta, resolution, mesh=mesh, ledger=ledger, upstream=upstream, side=CONSERVATIVE, nq=1,
         selection=dict(sample_batch=4, selection_faces=None),
-        program_bytes=lambda w: face_reduction_bytes(mesh, w, rows=N, side=CONSERVATIVE, carrier=carrier))
+        program_bytes=lambda w: face_reduction_bytes(mesh, w, rows=N, side=CONSERVATIVE, carrier=carrier),
+        compiled=lambda w, room: spe.face_round_compiled_bytes(
+            mesh, w, rows=N, finite=CONSERVATIVE - 2 * extent(INFINITY_W), infinity_width=extent(INFINITY_W), infinities=5,
+            ordered=True, odd_moments=True, keep_budget=POLE_BUDGET, carrier=carrier, eigh_backend="auto",
+            room=room))
     budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger, upstream=upstream,
                                  execution="face")
     budget.ritz_budget = None
