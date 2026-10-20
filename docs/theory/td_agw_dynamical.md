@@ -2045,6 +2045,25 @@ Both steps together used 0.43778 active GPUh; the owned reservation used
 small receipts and the capacity-bounded frequency pencils are preserved in
 `/home/jackm/mgkba_campaign_20261019/full_microscopic_v6_20261020/`.
 
+A conditioning-only CPU replay of the captured V5 pencil with frequency
+equilibration still produced growing fitted modes (maximum 0.363658 Ry).
+The old capture lacks authenticated finite/infinity unit masks, so this
+all-one-input-unit replay is not an exact test of the new producer policy.
+It provides no model admission or self-energy result. Further production
+fit-tolerance changes are not justified by this replay alone.
+
+Separately, `gw.shared_pole_reference` supplies a verification-only exact
+conversion of the authenticated equilibrium positive pole bank to the signed
+ordered store consumed by the new full-matrix self-energy executor. Negative
+frequency factors use the transpose at minus q, including the left/right
+factor swap. Three CPU checks cover unequal factors, odd logical counts,
+native full-density FFT self-energy and its frozen head exactly once.
+This **source-frozen** control is not the production `joint_frozen`
+initialization, does not update screening, and does not establish a material
+Hamiltonian fixed point or trajectory. Its saved-state harness is
+`tests/tdagw/source_frozen_saved_state.py`; material results, if obtained,
+must be reported separately from these small algebra checks.
+
 ### 8.2 Acceptance checks and earlier-member evidence
 
 The corrected column-sampled MGKBA collision requires an independent dense

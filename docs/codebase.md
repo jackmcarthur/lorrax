@@ -139,6 +139,7 @@ else.
 | `shared_pole_local.py` | Runs shared-pole parent rounds, one parent per rank. |
 | `shared_pole_pencil.py` | Builds resolvent-identity pencil columns for the shared-pole construction. |
 | `shared_pole_recipe.py` | Shared real-pole input recipe and gate table. |
+| `shared_pole_reference.py` | Verification-only exact positive-source to signed ordered pole conversion; does not initialize production refreshed or frozen snapshot screening. |
 | `shared_pole_reduction.py` | Ritz reduction of the shared-pole pencils. |
 | `shared_pole_screening.py` | Deck-driven shared real-pole screening stage. |
 | `shared_pole_sectors.py` | Charge/current cross pencils on parent-local stacks. |

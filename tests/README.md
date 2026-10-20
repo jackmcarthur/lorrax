@@ -52,6 +52,13 @@ A new test needs no bootstrap import of its own.
   proof. `--chi0-active LO:HI` selects a numerical response partition only;
   `--stop-after-model-q 0` retains a frequency-only diagnostic and never
   claims an admitted full-q model or computes Σ.
+- `test_shared_pole_source_frozen_cpu.py`: exact positive-source to signed
+  ordered-W conversion, independent-factor transpose, unequal logical/padded
+  counts, and full-rho native FFT Σ against literal sums, including the head once.
+- `tdagw/source_frozen_saved_state.py`: verification-only P4 ordered full-matrix
+  Σ using SOURCE-FROZEN equilibrium W and saved instantaneous electronic lines.
+  No refreshed screening, Hamiltonian fixed point, or trajectory is claimed;
+  this does not change the production `joint_frozen` initialization policy.
 - `test_minibz_equal_shares.py`: the shared mini-BZ head average gives every
   rank one share shape (CPU, three simulated ranks).
 - `test_stream_passes_cpu.py`: the scanned row-pass loop on a host mesh
