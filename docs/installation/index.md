@@ -68,7 +68,8 @@ handler ABI and its dependency closure are checked separately when it loads
 |---|---|---|
 | NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | the module stack: one venv, one source snapshot and one sealed FFI bundle, loaded with `module load`; a development clone builds its own pair and runs with plain `srun` | [Perlmutter](perlmutter.md) |
 | TACC Frontera (CPU) | a clone with the host leg from `config/frontera/build_ffi_host.sh`, run inside the site's apptainer image | [Frontera](../environment/machines/frontera.md), `config/frontera/README.md` |
-| any other machine | a clone: `uv sync` with the platform's JAX extra, both legs built and sealed from the stage scripts; `config/cloud/` is the all-wheel CUDA route for a machine with only a driver | [Building the FFI libraries](ffi-build.md), `config/cloud/README.md` |
+| a workstation, laptop or rented GPU box (one node, NVIDIA driver) | a clone built with `config/local/`: CUDA 13 from pip wheels, parallel HDF5 built once, both legs built by its scripts | `config/local/README.md` |
+| any other machine | a clone: `uv sync` with the platform's JAX extra, both legs built and sealed from the stage scripts | [Building the FFI libraries](ffi-build.md) |
 
 A site with a tuned stack keeps its recipes in one `config/<machine>/`
 directory (`config/perlmutter/`, `config/frontera/`); `config/README.md`

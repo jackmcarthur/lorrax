@@ -102,7 +102,7 @@ None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
 | Perlmutter | CUDA | `config/perlmutter/build_ffi_cuda.sh` |
 | Perlmutter module | both | `config/perlmutter/module/build.sh`, which runs the two scripts above and seals ([publishing a module](perlmutter.md#publish)) |
 | Frontera | host | `config/frontera/build_ffi_host.sh` |
-| cloud box with only a driver | both | `config/cloud/build_ffi.sh`, `config/cloud/build_ffi_host.sh` (`config/cloud/README.md`) |
+| a workstation, laptop or rented GPU box with only a driver | both | `config/local/build_ffi.sh`, `config/local/build_ffi_host.sh` (`config/local/README.md`) |
 | a Shifter container site | CUDA | `src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh` |
 | anywhere else | host | `bash src/ffi/cpp/build_host.sh`, or CMake directly (below) |
 

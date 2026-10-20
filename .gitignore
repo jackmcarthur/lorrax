@@ -90,11 +90,11 @@ h5_journal_crash.rank*.txt
 # a tracked reference output may use that suffix.
 a.out
 
-# generic-cloud lane artifacts (config/cloud/)
+# local lane artifacts (config/local/)
 .native/
-src/ffi/cpp/build_cloud/
+src/ffi/cpp/build_local/
 # ...and the host build tree build_ffi_host.sh writes beside it.
-src/ffi/cpp/build_host_cloud/
+src/ffi/cpp/build_host_local/
 
 # tests/hsuite run directories and its compile cache.
 .hsuite_runs/

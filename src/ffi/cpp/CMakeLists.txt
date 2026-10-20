@@ -31,7 +31,7 @@ project(lorrax_ffi LANGUAGES C CXX)
 # (libmpi_cxx) unless told not to; nothing links them, so a phdf5-bearing
 # .so built over Open MPI dies at dlopen with
 # `undefined symbol: _ZN3MPI8Datatype4FreeEv` (measured, Ubuntu 24.04
-# OpenMPI 4.1, config/cloud bring-up 2026-08-26).  A no-op macro on every
+# OpenMPI 4.1, config/local bring-up 2026-08-26).  A no-op macro on every
 # other MPI (Cray MPICH, Intel MPI, MPICH proper define no such guard use).
 add_compile_definitions(OMPI_SKIP_MPICXX=1)
 
@@ -301,7 +301,7 @@ endif()
 # Toolkit lib dir spellings, all real: lib64 (container/NVHPC installs),
 # targets/x86_64-linux/lib (CUDA toolkit trees), and plain lib — the pip
 # nvidia wheels' layout (site-packages/nvidia/cu13/lib), which the
-# config/cloud lane points CUDA_TOOLKIT_ROOT at directly.
+# config/local lane points CUDA_TOOLKIT_ROOT at directly.
 find_library(CUDART_LIBRARY cudart
     PATHS "${CUDA_TOOLKIT_ROOT}/lib64" "${CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib"
           "${CUDA_TOOLKIT_ROOT}/lib"

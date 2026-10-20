@@ -1659,7 +1659,7 @@ def init_jax_distributed() -> None:
             f"({_first_env(_WORLD_SIZE_ENVS, 1)[0]}) and no coordinator: this "
             f"is not a Slurm step and jax's cluster detection found none "
             f"({exc}).  Export JAX_COORDINATOR_ADDRESS=<process 0's "
-            f"host>:<free port> on every rank (config/cloud/launch.sh does), "
+            f"host>:<free port> on every rank (config/local/launch.sh does), "
             f"or launch with srun.") from exc
     _DISTRIBUTED_FORM[:] = [
         f"jax.distributed.initialize() ran with coordinator_address="
