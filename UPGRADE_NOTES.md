@@ -48,7 +48,10 @@ cuSOLVERMp LU chunks `getrs` to the posted room.
   `distrib_la.checked_program`, so each carries a host callback. `spole.gram_reduction`
   and `spole.bank` price above the 1.3 band (the face round's row holds its program's eigh
   twice); `spole.direction_selection` prices 1.9x its peak (run30k 46.86 vs 24.44 GB:
-  the conservative side and the selection eigh), and it binds the minimum-P line. The
+  the conservative side and the selection eigh), and it binds the minimum-P line.
+  After the landing gate (run30k, REPORT6) `bank.moment_batches` prices 54.73 GB
+  against 10.36 measured (5.3x) and now sets the minimum-P line; `spole.bank` 2.0x,
+  `spole.moment_read` 2.2x and `spole.sample_batch_read` 1.6x are over too. The
   native ncclMin agreement in the LU workspace query (B3) and the eigh memory change
   (ABI 11) are not in this landing.
 
