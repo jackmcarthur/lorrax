@@ -157,6 +157,7 @@ __all__ = [
     "permute_sharded_axis",
     "band_to_product_r_reshard",
     "face_to_batch_reshard",
+    "batch_to_face_reshard",
     "face_to_batch_reshard_supported",
     "shard_local_slice_pad",
     "shard_local_update",
@@ -445,12 +446,67 @@ def face_to_batch_reshard_supported(mesh: Mesh, shape, *,
             spec=P(None, None, 'y'), axis=2).carrier == n)
 
 
+def _staged_mesh_axes(mesh: Mesh, axes, who: str):
+    """(ax_x, ax_y, p_x, p_y) after the minor-axis rule both staged movers share."""
+    ax_x, ax_y = axes
+    names = tuple(mesh.axis_names)
+    if ax_x not in names or ax_y not in names:
+        raise ValueError(
+            f"{who}: mesh axes {names} do not contain axes={axes!r}")
+    if names[-1] != ax_y:
+        raise ValueError(
+            f"{who}: the mesh's minor axis is {names[-1]!r} "
+            f"but the batch axis is numbered {ax_x!r}-major by "
+            f"P(({ax_x!r}, {ax_y!r}), ...), so the exchange over the batch's "
+            f"minor blocks must run over {ax_y!r}.  On the standard "
+            f"process-ordered device layout only the LAST mesh axis has "
+            f"consecutive-rank (node-local) replica groups; on an inverted mesh "
+            f"the block numbering the caller asked for and the groups these "
+            f"collectives use stop agreeing.  Build the mesh with {ax_y!r} "
+            f"minor, or pass axes=(major, minor) matching your mesh.")
+    return ax_x, ax_y, int(mesh.shape[ax_x]), int(mesh.shape[ax_y])
+
+
+def _staged_mover(mesh: Mesh, body, in_spec, out_spec, lead: int, p_x: int,
+                  p_y: int, who: str) -> Callable:
+    """jit(shard_map(body)) plus the carrier check of a (lead..., B, M, N) operand."""
+    from jax import shard_map
+    from runtime.padding import mesh_divisor
+    ndev = mesh_divisor(mesh)
+    # jit: an eager call (the shared-pole constructor's) compiles once per
+    # shape instead of dispatching the body op by op on every call; under a
+    # caller's jit it inlines as before.
+    sm = jax.jit(shard_map(body, mesh=mesh, in_specs=(in_spec,),
+                           out_specs=out_spec, check_vma=False))
+
+    def _reshard(a):
+        shape = tuple(int(s) for s in a.shape)
+        if len(shape) != 3 + lead:
+            raise ValueError(
+                f"{who} expects a rank-{3 + lead} (lead x {lead}, B, M, N) "
+                f"array, got shape {shape}")
+        b, m, n = shape[lead:]
+        from runtime.padding import authenticate_padded_axis
+        authenticate_padded_axis(b, b, ndev, name=f"{who} batch carrier")
+        authenticate_padded_axis(m, m, p_x, name=f"{who} row carrier")
+        authenticate_padded_axis(n, n, p_y, name=f"{who} column carrier")
+        return sm(a)
+
+    # Same policy, same reason, as contract_bands_block_reshard's factory:
+    # create this mesh's cliques on the MAIN thread now so the all_to_alls
+    # inside the returned kernel hit XLA's clique cache rather than its
+    # MPI_Is_thread_main guard.  No-op off impl=mpi / already-warm mesh.
+    warm_mesh_cliques(mesh)
+    return _reshard
+
+
 @lru_cache(maxsize=None)
 def face_to_batch_reshard(mesh: Mesh, *,
-                          axes: tuple[str, str] = ("x", "y")) -> Callable:
+                          axes: tuple[str, str] = ("x", "y"),
+                          lead: int = 0) -> Callable:
     """Factory: a ``shard_map``'d ``(B, M, N)`` face→batch reshard.
 
-    Memoized per (mesh, axes): the returned kernel keeps its
+    Memoized per (mesh, axes, lead): the returned kernel keeps its
     per-shape programs, so a caller that asks again every SC map (the
     shared-pole constructor) reuses them instead of recompiling.
 
@@ -462,14 +518,18 @@ def face_to_batch_reshard(mesh: Mesh, *,
         ``(major, minor)`` mesh axis names.  ``axes[0]`` carries the M
         (row) face and cuts B first; ``axes[1]`` carries the N (column)
         face and cuts B second.
+    lead
+        Unsharded axes before B (a TD trial axis): the operand is
+        ``(lead..., B, M, N)`` and they ride along untouched.
 
     Returns
     -------
-    ``reshard(a)`` — takes ``(B, M, N)`` laid out ``P(ax_x_face)`` i.e.
-    ``P(None, ax_x, ax_y)`` and returns the same values laid out
-    ``P((ax_x, ax_y), None, None)``.  Values are UNCHANGED: the body
-    issues two ``lax.all_to_all``s and no arithmetic whatsoever, so this
-    is the bit-exact parity class (staged-reshard doctrine §4.1(a)).
+    ``reshard(a)`` — takes ``(lead..., B, M, N)`` laid out
+    ``P(lead..., None, ax_x, ax_y)`` and returns the same values laid out
+    ``P(lead..., (ax_x, ax_y), None, None)``.  Values are UNCHANGED: the
+    body issues two ``lax.all_to_all``s and no arithmetic whatsoever, so
+    this is the bit-exact parity class (staged-reshard doctrine §4.1(a)).
+    :func:`batch_to_face_reshard` is its inverse.
 
     The factory must be invoked synchronously on every rank — it warms
     this mesh's MPI cliques (``common.collectives.warm_mesh_cliques``,
@@ -479,31 +539,12 @@ def face_to_batch_reshard(mesh: Mesh, *,
     created from an intra-op pool worker dies on jaxlib's
     ``MPI_Is_thread_main`` guard.
     """
-    from jax import shard_map
-
-    ax_x, ax_y = axes
-    names = tuple(mesh.axis_names)
-    if ax_x not in names or ax_y not in names:
-        raise ValueError(
-            f"face_to_batch_reshard: mesh axes {names} do not contain "
-            f"axes={axes!r}")
-    if names[-1] != ax_y:
-        raise ValueError(
-            f"face_to_batch_reshard: the mesh's minor axis is {names[-1]!r} "
-            f"but the batch axis is numbered {ax_x!r}-major by "
-            f"P(({ax_x!r}, {ax_y!r}), ...), so the SECOND exchange must run "
-            f"over {ax_y!r}.  On the standard process-ordered device layout "
-            f"only the LAST mesh axis has consecutive-rank (node-local) "
-            f"replica groups; on an inverted mesh the block numbering the "
-            f"caller asked for and the groups these collectives use stop "
-            f"agreeing.  Build the mesh with {ax_y!r} minor, or pass "
-            f"axes=(major, minor) matching your mesh.")
-    p_x, p_y = int(mesh.shape[ax_x]), int(mesh.shape[ax_y])
-    from runtime.padding import mesh_divisor
-    ndev = mesh_divisor(mesh)
+    who = "face_to_batch_reshard"
+    ax_x, ax_y, p_x, p_y = _staged_mesh_axes(mesh, axes, who)
+    b_ax = int(lead)
 
     def _body_split_b_first(a):
-        # a: (B, M/p_x, N/p_y) — this rank's face tile of the WHOLE batch.
+        # a: (lead..., B, M/p_x, N/p_y) — this rank's face tile of the WHOLE batch.
         #
         # Stage 1, over ax_x: hand out B in p_x pieces, collect the M axis.
         # lax.all_to_all(x, axis, split_axis, concat_axis, tiled=True) gives
@@ -511,47 +552,62 @@ def face_to_batch_reshard(mesh: Mesh, *,
         # laid down along ``concat_axis`` in peer order — so afterwards rank
         # (x, y) holds B-chunk x, all of M, and its own N tile.
         if p_x > 1:
-            a = jax.lax.all_to_all(a, ax_x, split_axis=0, concat_axis=1,
+            a = jax.lax.all_to_all(a, ax_x, split_axis=b_ax, concat_axis=b_ax + 1,
                                    tiled=True)                # (B/px, M, N/py)
         # Stage 2, over ax_y: cut that B-chunk again in p_y pieces and
         # collect N.  Rank (x, y) ends holding B-block x·py + y whole —
         # which is what P((ax_x, ax_y), None, None) means.
         if p_y > 1:
-            a = jax.lax.all_to_all(a, ax_y, split_axis=0, concat_axis=2,
+            a = jax.lax.all_to_all(a, ax_y, split_axis=b_ax, concat_axis=b_ax + 2,
                                    tiled=True)             # (B/(px·py), M, N)
         return a
 
-    # jit: an eager call (the shared-pole constructor's) compiles once per
-    # shape instead of dispatching the body op by op on every call; under a
-    # caller's jit it inlines as before.
-    sm = jax.jit(shard_map(_body_split_b_first, mesh=mesh,
-                           in_specs=(P(None, ax_x, ax_y),),
-                           out_specs=P((ax_x, ax_y), None, None),
-                           check_vma=False))
+    head = (None,) * b_ax
+    return _staged_mover(mesh, _body_split_b_first, P(*head, None, ax_x, ax_y),
+                         P(*head, (ax_x, ax_y), None, None), b_ax, p_x, p_y, who)
 
-    def _reshard(a):
-        shape = tuple(int(s) for s in a.shape)
-        if len(shape) != 3:
-            raise ValueError(
-                f"face_to_batch_reshard expects a rank-3 (B, M, N) array, "
-                f"got shape {shape}")
-        b, m, n = shape
-        from runtime.padding import authenticate_padded_axis
-        authenticate_padded_axis(
-            b, b, ndev, name="face-to-batch batch carrier")
-        authenticate_padded_axis(
-            m, m, p_x, name="face-to-batch row carrier")
-        authenticate_padded_axis(
-            n, n, p_y, name="face-to-batch column carrier")
-        return sm(a)
 
-    # Same policy, same reason, as contract_bands_block_reshard's factory:
-    # create this mesh's cliques on the MAIN thread now so the all_to_alls
-    # inside the returned kernel hit XLA's clique cache rather than its
-    # MPI_Is_thread_main guard.  No-op off impl=mpi / already-warm mesh.
-    warm_mesh_cliques(mesh)
+@lru_cache(maxsize=None)
+def batch_to_face_reshard(mesh: Mesh, *,
+                          axes: tuple[str, str] = ("x", "y"),
+                          lead: int = 0) -> Callable:
+    """Factory: the inverse of :func:`face_to_batch_reshard`, batch→face.
 
-    return _reshard
+    ``reshard(a)`` takes ``(lead..., B, M, N)`` laid out
+    ``P(lead..., (ax_x, ax_y), None, None)`` (rank (x, y) holds B-block
+    x·py + y whole) and returns it laid out ``P(lead..., None, ax_x,
+    ax_y)`` (every rank all of B, its own (M, N) tile), by the two
+    exchanges of the forward move in reverse order::
+
+        stage 1   over ax_y: split N, concat B   ->  (B/px, M, N/py)
+        stage 2   over ax_x: split M, concat B   ->  (B,    M/px, N/py)
+
+    Stage 1 gathers, for fixed x, the B-blocks x·py + y' in y' order (the
+    contiguous B-chunk x); stage 2 joins the chunks in x order, so B comes
+    back in its global order.  Every intermediate holds exactly one shard
+    (no replication); values are moved, never recomputed (bit-exact).
+    The GSPMD alternative, a sharding constraint from the batch to the
+    face layout, replicates the whole array on every device ("Involuntary
+    full rematerialization", tile multisets {px·py, 1, 1} vs {1, px, py}).
+    Memoized per (mesh, axes, lead); same warm-up contract as the forward.
+    """
+    who = "batch_to_face_reshard"
+    ax_x, ax_y, p_x, p_y = _staged_mesh_axes(mesh, axes, who)
+    b_ax = int(lead)
+
+    def _body_concat_b(a):
+        # a: (lead..., B/(px·py), M, N) — this rank's whole B-block.
+        if p_y > 1:
+            a = jax.lax.all_to_all(a, ax_y, split_axis=b_ax + 2, concat_axis=b_ax,
+                                   tiled=True)             # (B/px, M, N/py)
+        if p_x > 1:
+            a = jax.lax.all_to_all(a, ax_x, split_axis=b_ax + 1, concat_axis=b_ax,
+                                   tiled=True)             # (B, M/px, N/py)
+        return a
+
+    head = (None,) * b_ax
+    return _staged_mover(mesh, _body_concat_b, P(*head, (ax_x, ax_y), None, None),
+                         P(*head, None, ax_x, ax_y), b_ax, p_x, p_y, who)
 
 
 def permute_sharded_axis(arr, axis, source_map, mesh, spec, *, pad_to=None,

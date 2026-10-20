@@ -37,4 +37,3 @@ with h5py.File(src, "r") as f, h5py.File(dst, "w") as g:
                              "stored matrix values verbatim; rho list = the 48 eps G")
     print("qpt", g["eps_header/qpoints/qpts"][()].round(6).tolist(),
           "matrix", g["mats/matrix"].shape, "e2r max", int(e2r.max()))
-

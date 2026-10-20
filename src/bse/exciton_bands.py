@@ -471,12 +471,8 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
         path, wfn_path=_parse_wfn_path(args.input))
     sign = attrs.get("prov_vnl_velocity_sign")
     skip_vnl = attrs.get("skip_vnl")
-    if int(attrs["nk"]) != int(nk):
-        raise SystemExit(
-            f"{path} has nk={attrs['nk']} but the BSE grid has nk={nk}.  The "
-            f"head tensor contracts the dipole against the BSE transition "
-            f"index, so the two k-lists must be the same list in the same "
-            f"order.  Rebuild the dipole from this deck's WFN.")
+    from file_io.dipole import require_dipole_k_grid
+    require_dipole_k_grid(attrs, nk, dipole_path=path)
     n_occ = resolve_n_occ(None, input_file=args.input)
     d_alpha, _ = slice_dipole_to_bse_window(dipole_cart, deltaE,
                                             n_occ, n_val, n_cond)
@@ -2184,7 +2180,7 @@ def main(argv=None):
                 from gw.head_densify import attach_head_channel
                 w_head_mode = resolve_w_head_densify(
                     args.w_head_densify, params, modes=("c1",))
-                W_q_fine_in = data["W_q"]
+                W_q_fine_in, data["W_q"] = data["W_q"], None   # consumed: attach_head_channel donates it
                 head_ch = None
                 if w_head_mode == "c1":
                     head_ch = _resolve_native_w_head(

@@ -5,27 +5,130 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-19 — TD-aGW collision: column-sampled one-sided MGKBA operator
 
-## 2026-10-16 — `file_io.epsreader`: ε⁻¹(G, G') in row-G order; 3-D `eps0mat` export refuses
+Collision-enabled propagation replaces the arithmetic average of the row- and
+column-shell self-energy tables with the one-sided Markov operator of
+[TD-aGW dynamical §1.5](docs/theory/td_agw_dynamical.md#damping). The particle
+retarded table is sampled at the column energy; the retarded hole table is
+the adjoint of the advanced row table. Their complex principal-value terms
+enter the coherent update once, alongside the held collision coefficients.
+This changes collision results, including off-diagonal dynamics. The defaults
+of `collision_refresh_sweep`, `collision_in_scattering`,
+`collision_rate_intermediates`, `collision_basis` and
+`collision_internal_pairing` are now respectively `active`, `full`, `active`,
+`band` and `vertex`; decks that need an earlier comparison must set
+all of its choices explicitly while the collision is off. Collision-enabled
+propagation hard-refuses populations-only lines, all-band rate intermediates,
+and symmetric internal pairing: after column sampling only the closed active,
+full-ρ vertex construction passes the reciprocal-pole number gate (the synthetic
+residual/flux is 1.39×10⁻⁸, versus 4.74×10⁻² for symmetric). Earlier collision
+measurements below describe the previous arithmetic-average operator and do not
+certify the replacement.
 
-`EPSReader.get_eps_matrix` returns ε⁻¹_q(G, G') with rows G and columns G'
-— the transpose of the stored block, whose `[a, b]` is ε⁻¹(G_b, G_a)
-(BerkeleyGW's Fortran column order; `file_io.bgw_epsmat`). It returned the
-stored block before. `get_eps_diagonal` reads `mats/matrix-diagonal` as
-`(nq, nmtx, 2)`. `tests/test_bgw_epsmat_cpu.py` pins both on a corner of a
-BerkeleyGW-written file. `gw.epsmat_cli` export now refuses a `sys_dim = 3`
-`eps0mat` (`GATE epsmat_q0_body_3d`) unless the deck sets
-`q0_body_3d = omit_head_wing`: the 3-D q → 0 body lacks the O(1) head–wing
-term. Its μ-space algebra runs on `P(None,'x','y')` faces with the
-`distrib_la` face eigensolver (cuSOLVERMp when each device has its own
-process).
+The opt-in `collision_basis = "instantaneous"` now uses the full current
+density matrix and converges the material Hamiltonian and coherent M_H
+correction together. `collision_snapshot_steps`, `collision_snapshot_tol_ev`
+and `collision_snapshot_mixing` bound the solve; an unconverged snapshot
+refuses. Accepted eigenpairs and collision tables come from the same final
+sweep. Joint screening replaces the screened-exchange increment by bare HF.
+`collision_hamiltonian = "hf"` reconstructs its absolute baseline from the
+source's authenticated kinetic/ionic, Hartree and Fock matrices, then includes
+M_H once. `reference` instead anchors the bare-HF/dynamical increments to the
+existing reference energies; this is a distinct effective reference model,
+not a claim that DFT energies solve the absolute QSGW-like closure.
 
-- **Results.** Main's one reader of the file, `gw/head_correction.py`, reads
-  `epshead` and does not move. Code that read `get_eps_matrix` as the stored
-  block must drop its transpose. Exported blocks move at the conditioning of
-  V, ≤ 3.1e-9 relative on CrI3 6×6 (κ(V) 5.7–7.6e6); projections at 1.5e-14.
-- **Decks.** A bulk export of `eps0mat` adds `q0_body_3d = omit_head_wing`
-  or exports `files = epsmat`.
+The equilibrium collision counterterm defines `subtracted`. The legacy frozen
+screened-exchange kernel additionally needs its static-W subtraction. Joint
+modes use a bare-HF kernel and no static reduced-W subtraction, avoiding a
+full-kernel/reduced-screening mismatch.
+`collision_screening = "refreshed"` and `"shared_pole"` now refuse at
+`td_collision_keldysh_screening`. Their retained machinery is a
+retarded/population snapshot; it does not implement the joint response/noise
+realization or general nonequilibrium W< required by the new operator.
+
+`collision_screening = "joint"` adds independent full-rho lesser/greater
+bubbles and their general rational Keldysh screening. `joint_frozen` holds the
+same reduced equilibrium interaction for matched comparisons. Joint modes
+require the instantaneous basis. Their Coulomb rank, rational support/order,
+held-out response/noise tolerance, adiabatic regulator and fitting height are
+explicit deck settings. The passive equilibrium GW constructor is unchanged.
+Density bounds and both positivity boundary matrices are reported without
+clipping; this nonsecular closure has no automatic Pauli-bound guarantee.
+
+## 2026-10-19 — TD-aGW collision: instantaneous basis, vertex pairing, G = L diag(w) R^H (opt-in)
+
+Two `[lorrax]` keys of the full-ρ internal line (`collision_in_scattering = "full"`);
+with both unset results are unchanged and the run fingerprint is unchanged.
+
+- **`collision_basis = "instantaneous"`** (default `"band"`; frozen screening): the
+  lines' basis and energies are the eigenpairs of the propagator's slow
+  Hamiltonian diag(e) + ΔΣ[ρ_eq + U diag(f − f_eq) U^†] (e its window energies;
+  a fixed point per trial and refresh, its held ΔΣ^h included; [TD-aGW dynamical
+  §1.5, Eq. 8b](docs/theory/td_agw_dynamical.md#damping)) instead of the band
+  basis at the bundle's ε^G. Frozen bands sit at ε^G + Δ_edge(k), Δ_edge = e − ε^G
+  of the window's edge band on their side (0 when the propagator runs on ε^G), and
+  their part is swept at every refresh.
+- **`collision_internal_pairing = "vertex"`** (default `"symmetric"`): Σ_ij(ε_i)
+  and Σ_ij(ε_j) take the internal energy of the index on their own vertex (two
+  sweeps); `symmetric` keeps ½ {g(ε), ρ} in both (one sweep).
+- **Code.** `gw.wavefunction_bundle.ParentGreenCarrier` takes optional
+  `green_left` / `green_right` panels (G = L diag(w) R^H; None is the faces,
+  bitwise the previous operands). `gw.ppm_sigma.window_sigma_c` takes `pairing`
+  and `window["e_frozen"]`; the full-ρ line runs on these panels instead of the
+  2 n_A pseudo-bands (same tables to 9×10⁻¹⁶). With `rho` its
+  `static_limit["sx"]` holds the head's static part (`head` zero).
+  `tdagw.dynsig.window_collision` takes `basis`, `pairing` and `model`.
+  Tests: `tests/test_tdagw_collision_instbasis.py`.
+
+## 2026-10-19 — TD-aGW collision: full-ρ in-scattering, active rate intermediates (opt-in)
+
+Two `[lorrax]` keys of the split refresh (`collision_refresh_sweep = "active"`);
+with both unset results are unchanged and the run fingerprint is unchanged.
+
+- **`collision_in_scattering = "full"`** (default `"populations"`): the active
+  part's internal line is the window's whole ρ (hole ρ_mn, particle (1 − ρ)_mn,
+  symmetric ½ g(ε_m) + ½ g(ε_n); [TD-aGW dynamical §1.5, Eq. 8a](docs/theory/td_agw_dynamical.md#damping)),
+  swept on 2 n_A pseudo-bands after the window. `gw.ppm_sigma.window_sigma_c`
+  takes an optional `window["rho"]` (instantaneous basis, `internal = "active"`
+  only); `_population_branches`, `compute_sigma_c_ppm_omega_grid` and the
+  shared-pole window run take explicit particle weights.
+- **`collision_rate_intermediates = "active"`** (default `"all"`): the rates
+  G~> and G~< use the window's own intermediate states; the frozen part keeps
+  only its Hermitian contribution.
+- With both on, Σ_k Tr C[ρ] = 0 for any Hermitian ρ up to the τ-quadrature
+  tolerance when W is reciprocal (`tests/test_tdagw_collision_fullrho.py`).
+
+## 2026-10-18 — TD-aGW collision term on main: split refresh, refreshed GN-PPM screening
+
+The on-shell collision term of TD-aGW (`[lorrax] collision`, [TD-aGW dynamical
+§1.5](docs/theory/td_agw_dynamical.md#damping)) is merged onto this main
+(6f7b2ca26) and gains two refresh options; the GW driver gains one opt-in
+observer field. Nothing in a deck has to change.
+
+- **Default path unchanged.** With the new keys unset, results are those of the
+  collision branch. The GW driver on the CrI3 516 GN-PPM deck is bitwise
+  main's (15/15 `sigma_mnk.h5` datasets and attributes, `sigma_diag.dat`); the
+  516 collision drives agree with the branch's to ≤ 2.4×10⁻¹² in P(t) (main's
+  driver moves Σ_c by ≤ 2.1×10⁻¹¹ eV against the branch's 07 files).
+- **`collision_refresh_sweep = "active"`** (default `"full"`). A refresh sweeps
+  the window's own intermediate bands and adds the frozen bands' part, swept
+  once at t0, each part on its own held quadrature session: 0.95 s against
+  3.3 s per refresh on 516 2v2c, equal to the full sweep to the rule tolerance
+  (rates 2×10⁻³ of their maximum). Unlike the full sweep, whose one-shot plan
+  re-plans when a state passes the occupation-weight floor (the held ΔΣ^h then
+  carries 0.38 meV of rule change), it keeps its rules.
+- **`collision_screening = "refreshed"`** (default `"frozen"`), with
+  `collision_frozen_bands` and `collision_screening_gamma_ev` (1 meV). Each
+  refresh re-screens W at 0 and iω_p from the window populations and refits the
+  run's poles: 5.0 s (2v2c) and 11.5 s (10v14c) per refresh on 516. A measured
+  prototype: the subtracted form then needs its C[ρ_eq] on the refreshed W
+  (`gnppm_collision(rebase=True)`, no deck key yet), and the invalid-mode flips
+  make ΔΣ^h jump between refreshes at strong fields (theory page §1.5).
+- **GW seam.** `gw.ppm_pipeline.observe_window_sigma_source(screening=True)`
+  also leaves the run's `fit_plan` and copies of its two W samples; with no
+  observer, or without the opt-in, the driver does nothing new.
+  `gw.ppm_sigma.window_sigma_c` takes `static_limit_wc0=`.
 
 ## 2026-10-18 — On-shell Sigma sweep checkpointed (one-shot restart)
 
@@ -269,6 +372,101 @@ faster arms; every output is bitwise identical to the previous kernels.
   Rebuild a clone's pair (`config/perlmutter/build_ffi_cuda.sh`); the Perlmutter module is
   republished with a bundle from this commit. The kernel source changed, so the cubin
   store recompiles each (mode, grid) once (about 8 s each).
+
+## 2026-10-16 — undensified BSE: the `--dipole` file must be stamped for the deck WFN
+
+`absorption_common.window_dipoles` now checks the file's `prov_wfn_sha256`
+against the deck WFN's fingerprint on undensified runs too (AUDIT B12), with
+the gate the `bse_k_grid` path already had (`GATE velocity_wfn_fingerprint`):
+another WFN's `dipole.h5` on the same k list (another NSCF, cutoff or
+structure) used to pass the nk check silently. A file with no stamp refuses;
+regenerate it with `python -m psp.get_dipole_mtxels -i <deck>`.
+
+## 2026-10-16 — `bse_k_grid` + `--eqp`: the dipoles are the exact position of the fine QP states
+
+**Changes numbers.** With `--eqp` the densified fine states diagonalize the
+interpolated QP f(H), which mixes the velocity's DFT bands off the coarse
+grid, and `d = v/ΔE` of their Rayleigh-quotient energies was not their
+position: CrI3 8×8→12×12 against the native 12×12 lost 1.4 % of Σ|d|² and
+13 % below 1.6 eV (Σ|v|² kept to 4e-4; the lowest transition's quotient
+60 meV high), 8×8→30×30 1.5 % and 19 %. `densified_dipoles(qp_states=True)`
+(the loader passes `eqp_file is not None`) forms r in the DFT eigenbasis of
+the fine states' own f(H) block and rotates it back; without `--eqp` the
+dipoles are bitwise unchanged. Oscillator strengths, ε₂ and helicity tables
+of `bse_k_grid` runs with `--eqp` move (the 30×30 CrI3 bright states are
+the ones that showed 14–23 % below native 8×8); rerun them, or re-contract a
+saved `eigenvectors.h5` with `python -m bse.dump_window_dipoles` (same
+deterministic gauge; `--check-eigenvectors --check-key d_alpha_rq` proves it
+on the old run first). `full_window` adds `r_window` (pair rule `mask` by
+default, `velocity_pair_rule` / `velocity_pair_gap_ev` on the loader) next to
+`v_window`: TD-aGW should take r from it rather than `v_window/ΔE`. The route
+label of fixed runs ends with "exact r in the fine QP states (DFT eigenbasis
+of their f(H) block, v1)".
+
+## 2026-10-16 — `bse_jax --helicity-table`: per-state σ± strengths in the report
+
+With `--lanczos --tda --write-eigs --dipole`, `--helicity-table` adds each
+written state's in-plane circular strengths to `bse.out`:
+I± = |D_x ∓ i D_y|²/(2 N_k) in bohr² per unit cell for D = ⟨0|r|S⟩, and
+η = (I+ − I−)/(I+ + I−). σ+ is the field E₀(cos ωt, sin ωt, 0), which rotates
+x → y, counter-clockwise seen from +z
+([helicity](docs/architecture/bse.md#dipoles-and-absorption)).
+
+- **Results.** Report-only and off by default: `eigenvectors.h5` and every
+  other output are unchanged. CrI3 8×8→30×30 (c1, provisional W, 42v × 14c):
+  A at 1.5777 eV is σ+ (η = +1.0000), B at 2.0223 eV σ− (−0.9997), and the
+  strongest σ+ state is at 2.3121 eV (I+ = 1.06 bohr² per cell, η = +0.9988).
+
+## 2026-10-16 — `bse_k_grid` dipoles: the deck WFN's velocity through the densifying htransform
+
+`bse_jax --write-eigs --dipole` and `absorption_haydock` sliced a `dipole.h5`
+onto a `bse_k_grid` bundle. The deck WFN's file has the coarse k list and
+failed on its shape (Haydock at trace, `bse_jax` after its eigensolve); a fine
+WFN's `dipole.h5` has the bundle's nk in that loader's own band gauge and
+contracted silently wrong (MoS₂ 9×9→12×12 SR/LR: ε₂ 18 % rms of the direct
+12×12 peak, bright A partners 29.7 and 25.4 bohr² against 45.6). The densifier
+now carries the deck WFN's velocity through the same htransform and contracts
+it with the same fine eigenvectors that build ψ
+(`bse.bse_densify.densified_dipoles`); the transition energies are the
+velocity's own DFT energies there.
+
+- **Commands.** Under `bse_k_grid`, `--dipole` names the deck (coarse) WFN's
+  `dipole.h5`, with at least the htransform window's bands. No fine NSCF is
+  needed for dipoles. Any other WFN's file refuses
+  (`GATE velocity_wfn_fingerprint`); on an undensified run a file from
+  another k grid refuses (`GATE dipole_k_grid`).
+- **Results.** MoS₂ 9×9→12×12 against the direct 12×12 run: ε₂ rms 2.01 %
+  (SR/LR) and 3.92 % (c1) of its peak; bright A pair |d|² 47.4 and 47.3,
+  B pair 53.0 and 52.7 bohr², against 45.6 and 53.1 (partners within 0.6 %;
+  the densified pairs are split by up to 0.6 meV). Without `--eqp` the window
+  dipoles match the fine NSCF's own to 6e-6 at shared k and 0.8 % rms
+  (Frobenius norm per k) off them. Densified eigenvalues are unchanged, and
+  runs without `bse_k_grid` are bit-identical.
+- **Outputs.** A densified run's `exciton_data/dipoles` (`eigenvectors.h5`)
+  and Haydock h5 metadata name the dipole route, its source file and the
+  on-grid identity.
+
+
+## 2026-10-16 — `file_io.epsreader`: ε⁻¹(G, G') in row-G order; 3-D `eps0mat` export refuses
+
+`EPSReader.get_eps_matrix` returns ε⁻¹_q(G, G') with rows G and columns G'
+— the transpose of the stored block, whose `[a, b]` is ε⁻¹(G_b, G_a)
+(BerkeleyGW's Fortran column order; `file_io.bgw_epsmat`). It returned the
+stored block before. `get_eps_diagonal` reads `mats/matrix-diagonal` as
+`(nq, nmtx, 2)`. `tests/test_bgw_epsmat_cpu.py` pins both on a corner of a
+BerkeleyGW-written file. `gw.epsmat_cli` export now refuses a `sys_dim = 3`
+`eps0mat` (`GATE epsmat_q0_body_3d`) unless the deck sets
+`q0_body_3d = omit_head_wing`: the 3-D q → 0 body lacks the O(1) head–wing
+term. Its μ-space algebra runs on `P(None,'x','y')` faces with the
+`distrib_la` face eigensolver (cuSOLVERMp when each device has its own
+process).
+
+- **Results.** Main's one reader of the file, `gw/head_correction.py`, reads
+  `epshead` and does not move. Code that read `get_eps_matrix` as the stored
+  block must drop its transpose. Exported blocks move at the conditioning of
+  V, ≤ 3.1e-9 relative on CrI3 6×6 (κ(V) 5.7–7.6e6); projections at 1.5e-14.
+- **Decks.** A bulk export of `eps0mat` adds `q0_body_3d = omit_head_wing`
+  or exports `files = epsmat`.
 
 ## 2026-10-16 — Native dependencies: recorded at build, enforced at start-up, on every route
 

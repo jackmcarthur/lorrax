@@ -866,7 +866,11 @@ def attach_head_channel(W_q, g0_X, g0_Y, S_grid, cell_volume):
     Returns
     -------
     jax.Array
-        Same shape and sharding as ``W_q``.
+        Same shape and sharding as ``W_q``, written into ``W_q``'s buffer:
+        ``W_q`` is DONATED, so the caller rebinds the result and never reads
+        the argument again.  One fused elementwise pass; the eager form held
+        the broadcast product and the sum beside ``W_q``, three W-sized
+        buffers per rank (98 GB at a 32.6 GB CrI3 30x30, N_μ 3000, P4 tile).
     """
     import jax.numpy as jnp
 
@@ -880,5 +884,24 @@ def attach_head_channel(W_q, g0_X, g0_Y, S_grid, cell_volume):
             f"match S_grid {tuple(S.shape)} — the head scalars were built for "
             f"a different grid than the densifier produced.")
     s = jnp.asarray(S / float(cell_volume), dtype=W_q.dtype)
-    g0g0 = jnp.conj(g0_X)[:, None] * g0_Y[None, :]            # (μ, ν), local
-    return W_q + g0g0[:, :, None, None, None] * s[None, None, :, :, :]
+    return _attach_head_program()(W_q, g0_X, g0_Y, s)
+
+
+_ATTACH_HEAD: list = []
+
+
+def _attach_head_program():
+    """``W_q + (conj(g0_X) ⊗ g0_Y) ⊗ s`` as one jitted program donating ``W_q``, built once per process.
+
+    The outer product is process-local on every rank (``g0_X`` on ``'x'``,
+    ``g0_Y`` on ``'y'``), so the program is one elementwise fusion per tile.
+    """
+    if not _ATTACH_HEAD:
+        import jax
+        import jax.numpy as jnp
+
+        def attach(W_q, g0_X, g0_Y, s):
+            g0g0 = jnp.conj(g0_X)[:, None] * g0_Y[None, :]            # (μ, ν), local
+            return W_q + g0g0[:, :, None, None, None] * s[None, None, :, :, :]
+        _ATTACH_HEAD.append(jax.jit(attach, donate_argnums=(0,)))
+    return _ATTACH_HEAD[0]

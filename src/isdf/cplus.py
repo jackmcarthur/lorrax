@@ -28,14 +28,14 @@ def apply(B, Z):
     return B @ (jnp.conj(jnp.swapaxes(B, -1, -2)) @ Z)
 
 
-def factor(C_log, *, rcond: float, rank_log: bool, n_log: int, eigh=eigh_local,
-           where: str = "zeta rank_truncate"):
+def factor(C_log, *, rcond: float, rank_log: bool, n_log: int,
+           where: str = "zeta rank_truncate", eigh=eigh_local):
     """``(B, figures)``: B with B Bᴴ = C⁺ for a logical C_q stack, and the
     cut's per-q figures, which the caller hands to :func:`report` on the host
-    after the program; see the module docstring.  ``eigh`` is the whole-tile
-    local eigh, or the face's checked distributed eigh (``isdf.core._factor_c_q_face``,
-    whose zeroed pads deflate below the cut).  ``where`` names the caller's
-    matrix in every notice."""
+    after the program; see the module docstring.  ``where`` names the
+    caller's matrix in every notice. ``eigh`` is the whole-tile local eigh,
+    or the face's checked distributed eigh (``isdf.core._factor_c_q_face``,
+    whose zeroed pads deflate below the cut)."""
     # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
     # n_μ over-completes the pair-density rank (κ~1e13); plain
     # Cholesky then amplifies ULP/mesh/nband roundoff into O(1) V_q
@@ -50,7 +50,7 @@ def factor_from_eigh(lam, V, *, rcond: float, rank_log: bool,
                      where: str = "zeta rank_truncate"):
     """The cut of :func:`factor` on eigenpairs already solved: ``(B, figures)``.
 
-    ``lam`` ``(nq, n)`` and ``V`` ``(nq, n, n)`` (eigenvectors as
+    ``lam`` ``(nq, n)`` ascending and ``V`` ``(nq, n, n)`` (eigenvectors as
     columns), e.g. from ``distrib_la``'s face eigensolve, where ``V`` sits at
     ``P(None,'x','y')``: ``B = V·diag(λ^(−1/2))`` over the kept modes is a
     column scaling, so ``B`` keeps ``V``'s layout and no rank holds an

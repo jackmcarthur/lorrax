@@ -28,6 +28,54 @@ A new test needs no bootstrap import of its own.
   rank one share shape (CPU, three simulated ranks).
 - `test_stream_passes_cpu.py`: the scanned row-pass loop on a host mesh
   under x64 (CPU): two windows add the bytes of one.
+- `tdagw/test_prop_*.py`: the TD-aGW propagator (CPU). `integrators`: the
+  stepper of `solvers.time_integrators` against SciPy (DP54 takes SciPy RK45's
+  steps; measured orders; Magnus unitarity; Strang order), each with a red
+  twin. `tdgw_parity`: on a frozen TDGW 0.3.0 fixture (`fixtures/syn2v2c`,
+  built by `fixtures/make_tdgw_fixture.py`) the driver's stages on a 2x2 host
+  mesh take TDGW's steps and reproduce every measurement to 1e-12; red twins
+  drop the intraband term and flip the kernel sign; four devices equal one.
+  `deck`: every parser refusal names its gate. `isdf_adapter`: the ISDF
+  adapter's dSigma equals 1/2 K (rho - rho_eq) for a synthetic TDMODEL model
+  with a permuted k order and padded k; red twins drop the Ry -> Ha halving
+  and pass rho for Delta rho.
+- `tdagw/test_collision_cpu.py`: the one-sided collision branch operator,
+  equilibrium subtraction, Hermitian update and held affine flow against
+  independent NumPy/SciPy references.
+- `tdagw/test_prop_collision_cpu.py` and its `_collision_case.py` child:
+  collision attachment through the production propagator on a 2x2 CPU mesh;
+  fixed point, integrator order, refreshes, carry/history rebasing, compile
+  reuse and k-locality against exact piecewise affine solutions.
+- `test_tdagw_collision_fullrho.py` and `test_tdagw_collision_instbasis.py`:
+  focused script gates on a 2x2 mesh for the full density-matrix internal
+  line, dense branch-table references, vertex pairing, basis covariance,
+  closed-window trace checks, instantaneous-basis fixed point and head.
+  Their pytest entries skip; run the scripts explicitly with four host
+  devices for the CPU leg.
+- `tdagw/_collision_516_case.py`: the real CrI3 GN-PPM collision diagnostic,
+  including branch tables, equilibrium drift, driven refreshes, frozen/active
+  splits and screening snapshots; run explicitly at P4 on compute nodes.
+- `tdagw/test_validation_*_cpu.py`: the TD-aGW validation ladder
+  ([theory](../docs/theory/td_agw_propagation.md#validation)), CPU on a 2x2
+  host mesh through the driver's deck -> stages -> `tdgw.h5` route; each rung
+  has red twins, tolerances are fixed a priori and every measured value is a
+  junit testsuite property (the `record` fixture). Systems and references are
+  in `tdagw/_validation_systems.py`, the response algebra in
+  `tools/td_response.py`. `rabi`: a two-level system under cw and Gaussian
+  drives, with and without relaxation, against the exact rotating-frame
+  solution and DOP853; every integrator at its observed order; the swapped
+  dipole and the 0.36 ppm Ry/Ha slip fail. `bse`: on a 3v3c window with an
+  ISDF-form Hartree + SEX kernel, P(t), per-state amplitudes and frequencies
+  and Im χ± equal the full BSE of the kernel; the TDA kernel fails.
+  `conservation`: trace, Hermiticity and purity, the energy functional with
+  its ½ and the work theorem, equilibrium stationarity, every integrator.
+  `sumrules`: m1 = o.L.u, m3 and j(0+) after an instantaneous kick (IP, full,
+  TDA); the TDA misses the full sum rule. `helicity`: σ± selection on a
+  C3-symmetric Haldane toy down to the pulse's counter-rotating leak; the
+  reversed convention and C3-broken dipoles fail. `magnetooptics`: χ_xy, ε_xy,
+  σ_xy and sheet and film Kerr/Faraday rotation from TD equal the BSE;
+  Onsager; no dc Hall term in the interband length gauge; the film converges
+  to the sheet for an anisotropic tensor.
 - `test_sigma_kconv_scratch.py`: mode 7's split-arm scratch follows the
   handler's rule and is priced in the Σ pass and the τ window checks (CPU).
 - `test_qe_reported_inputs.py`: the V_NL spin-orbit mode is QE's
@@ -59,6 +107,32 @@ A new test needs no bootstrap import of its own.
   two call sites compiles once, partner directions keep one carrier, face
   rounds share one width. The audit-row tests are strict xfails until their
   fix lands.
+- `test_bse_kgrid_dipoles_cpu.py`: the `bse_k_grid` dipoles on a toy
+  tight-binding slab (CPU, 2x2 host mesh): on-grid identities, off-grid
+  dipoles against exact ones in the densified states' gauge, a planted coarse
+  gauge invisible and a velocity-only gauge seen, DFT denominators under a
+  scissor, and the window-dipole refusals.
+- `test_bse_kgrid_dipoles_rfix_cpu.py`: `--eqp` (`qp_states`) dipoles on the same
+  toy with band-dependent QP shifts: the exact position of the fine QP states
+  to the interpolation floor (0.4 %) against the toy's full eigenbasis, the
+  pre-fix Rayleigh-quotient `v/ΔE` red twin 12x off; the DFT path bitwise
+  `v/ΔE`; `r_window` Hermitian with `d = i r[c, v]`; the pair rule equal to
+  `tdagw.td_system.position_from_velocity`'s; the rotation record.
+- `test_bse_helicity_cpu.py`: per-state in-plane helicity on a C3-symmetric
+  toy (s, p_x, p_y with an orbital Zeeman term; CPU, 2x2 host mesh): the Γ
+  transitions into p± take the field-defined σ± labels that ⟨L_z⟩ certifies;
+  the swapped and the conjugated conventions fail that check; a global phase,
+  a band gauge and the zone size leave the per-cell table unchanged; the
+  native and `bse_k_grid` routes give one table; `bse_jax` reads
+  `--helicity-table` on the Lanczos route.
+- `test_bse_qp_rotation_cpu.py`: the QP-rotated BSE basis on toy inputs
+  (CPU, 2x2 host mesh): U = I gives the `--eqp` dipole bit for bit and a
+  permuted U does not, a cross-gap-free rotation rotates the position matrix
+  exactly, the dipole equals the interband-commutator velocity over the QP gap,
+  the star gauge refuses an unconjugated antiunitary row, the QP window guard
+  refuses a cut edge and a window outside the block; the QP route of
+  `window_dipoles` equals the DFT slice at U = I and refuses a `dipole.h5` on
+  another k grid, with another WFN's stamp or none, or with `skip_vnl`.
 - `test_w_pad_nyquist_cpu.py`: the W densifier's R zero-pad (CPU): an even
   coarse axis splits its Nyquist coefficient, so coarse tiles stay exact and
   every fine tile is Hermitian; the single-sided red twin is not.
@@ -67,3 +141,12 @@ A new test needs no bootstrap import of its own.
 
 How to run the suite and regenerate its references:
 [Contributing](../docs/contributing.md#the-test-suite).
+
+The full-matrix snapshot CPU gates are
+`test_tdagw_collision_snapshot.py` (coherent fixed point),
+`tdagw/test_snapshot_screening_cpu.py` (ordered bubbles, rational response/noise,
+and projected sampler), `tdagw/test_snapshot_collision_cpu.py` (independent
+positive-time Sigma integral), and `tdagw/test_snapshot_runtime_cpu.py`
+(distributed Coulomb projection, rotations, and a complete small refresh).
+Run the distributed cases with four host devices. These focused references
+complement the required P4 compute-node driver suite.

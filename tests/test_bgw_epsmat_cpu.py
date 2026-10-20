@@ -41,6 +41,22 @@ def _mesh():
     return Mesh(np.array(cpu[:4]).reshape(2, 2), ("x", "y"))
 
 
+def _cpu_mesh():
+    """``_mesh()`` for a test that writes through SlabIO's serial tier: CPU only.
+
+    The serial tier (``file_io._slab_io_serial``) refuses a non-``cpu`` mesh
+    platform by design, so on a GPU node (``lx test``: four CUDA devices in
+    one process) such a test skips by name instead of failing.
+    """
+    mesh = _mesh()
+    platform = mesh.devices.flat[0].platform
+    if platform != "cpu":
+        pytest.skip(f"CPU only: SlabIO's serial tier refuses a {platform!r} mesh "
+                    "platform (file_io._slab_io_serial); run with JAX_PLATFORMS=cpu "
+                    "XLA_FLAGS=--xla_force_host_platform_device_count=4")
+    return mesh
+
+
 def v_slab(q, G):
     """Ismail-Beigi slab Coulomb over Ω (Ry), zero at q+G = 0; written independently."""
     K = (q[None, :] + G) @ BVEC
@@ -254,7 +270,7 @@ def test_file_layout_reads_back_as_epsinv(tmp_path):
     from file_io import bgw_epsmat as be
     from file_io.epsreader import EPSReader
     from file_io.slab_io import SlabIO
-    mesh = _mesh()
+    mesh = _cpu_mesh()
     # ecuts 2.8: nmtx 43 under a 44-row mesh pad, so the write must clip.
     q, ecuts = (1 / 6, 1 / 3, 0.0), 2.8
     r = export(mesh, q, ecuts=ecuts)

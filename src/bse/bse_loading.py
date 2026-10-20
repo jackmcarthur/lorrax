@@ -122,8 +122,19 @@ def load_bse_data_from_restart_sharded(
     htransform_rank_record_fn=None,
     htransform_quality_record_fn=None,
     eqp_file: Optional[str] = None,
+    qp_rotations_file: Optional[str] = None,
+    velocity_file: Optional[str] = None,
+    velocity_full_window: bool = False,
+    velocity_pair_rule: str = "mask",
+    velocity_pair_gap_ev: float = 0.05,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
+
+    ``qp_rotations_file`` (``--qp-rotations``) puts the window in the GW
+    run's QP basis (``bse.bse_qp_rotation``): the window is resolved on the
+    QP ladder, ψ is read for the whole rotation block and rotated, eq. (2),
+    and ε are the matched QP energies.  ``data["qp_rotation"]`` carries the
+    window's U columns for the dipoles; it is ``None`` on the DFT basis.
 
     ``bse_k_grid`` (``(nx,ny,nz)`` / ``"nx ny nz"`` / ``None``) turns on
     fine-grid densification: when set and DIFFERENT from the coarse restart
@@ -138,6 +149,19 @@ def load_bse_data_from_restart_sharded(
     the fine ε are quasiparticle; ``data["densified"]`` tells the caller
     whether it still owes the coarse QP re-slice
     (``bse_window.apply_eqp_and_reslice_bands``).
+
+    ``velocity_file`` (``--dipole``) is read only on the densified path: the
+    coarse WFN's ``dipole.h5``, carried through the same htransform as ψ, and
+    ``data["dipoles"]`` holds the window dipoles in the fine ψ gauge
+    (``bse_densify.densified_dipoles``).  Off it, the driver slices the file
+    itself (``absorption_common.window_dipoles``).  ``velocity_full_window``
+    also keeps the velocity over every window pair and its own band
+    energies (``data["dipoles"]["v_window"]``, ``["e_dft_window"]``), which
+    the TD-aGW system builder (``tdagw.td_system``) needs; off by default.
+    With it the window position ``["r_window"]`` comes too, exact in the
+    fine states (QP f(H) with ``eqp_file``), its same-occupation pairs by
+    ``velocity_pair_rule`` / ``velocity_pair_gap_ev``
+    (``bse_densify.densified_dipoles``' ``pair_rule`` / ``pair_gap_ev``).
 
     ``inject_head=False`` returns the head-LESS V_q0 / W_q bodies exactly as
     stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
@@ -179,14 +203,44 @@ def load_bse_data_from_restart_sharded(
     n_val, n_cond = min(n_val, n_occ), min(n_cond, nb_total-n_occ)
     if n_val <= 0 or n_cond <= 0:
         raise ValueError("BSE window contains no valence or conduction states")
-    n_val, n_cond = resolve_band_window(enk_full, n_occ, n_val, n_cond,
-        tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
-        where="load_bse_data_from_restart_sharded", log=_log0)
-    assert_bse_window_in_zeta_training(header, n_occ-n_val, n_occ+n_cond)
-    val_indices = np.arange(n_occ-n_val, n_occ)
-    cond_indices = np.arange(n_occ, n_occ+n_cond)
-    eps_v = jnp.asarray(enk_full[:, val_indices])
-    eps_c = jnp.asarray(enk_full[:, cond_indices])
+    # ── Is a coarse→fine densification pending?  Resolved before the window
+    # (the QP-rotated basis has no densified route yet) and before the head
+    # injection, because C1 (the default) hands the densifier the
+    # head-EXCLUDED body and re-attaches the head per fine q afterwards, so on
+    # a densifying run the rank-1 whead must NOT go on now.
+    fine_grid = _resolve_bse_k_grid(bse_k_grid, input_file)
+    densify_pending = (fine_grid is not None
+                       and fine_grid != (nkx, nky, nkz))
+    qp_rotation = None
+    if qp_rotations_file is None:
+        n_val, n_cond = resolve_band_window(enk_full, n_occ, n_val, n_cond,
+            tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
+            where="load_bse_data_from_restart_sharded", log=_log0)
+        assert_bse_window_in_zeta_training(header, n_occ-n_val, n_occ+n_cond)
+        read_val = np.arange(n_occ-n_val, n_occ)
+        read_cond = np.arange(n_occ, n_occ+n_cond)
+        eps_v = jnp.asarray(enk_full[:, read_val])
+        eps_c = jnp.asarray(enk_full[:, read_cond])
+    else:
+        if densify_pending:
+            raise ValueError(
+                f"GATE bse_qp_rotations_k_grid: got --qp-rotations with "
+                f"bse_k_grid = {fine_grid} on a {(nkx, nky, nkz)} restart; "
+                f"want the native grid.  why: the densifying htransform takes "
+                f"QP energies only (--eqp), so the fine ψ and velocity would "
+                f"stay in the DFT basis.  fix: run the native grid, or "
+                f"densify a restart built from WFN_qp.h5.")
+        from .bse_qp_rotation import load_qp_rotation
+        qp_rotation = load_qp_rotation(
+            restart_file, input_file, qp_rotations_file, header=header,
+            n_occ=n_occ, n_val=n_val, n_cond=n_cond,
+            degeneracy_mode=degeneracy_mode,
+            degeneracy_tol_ry=degeneracy_tol_ry, log=_log0)
+        n_val, n_cond = qp_rotation["n_val"], qp_rotation["n_cond"]
+        q0, q1 = qp_rotation["band_range"]
+        read_val, read_cond = np.arange(q0, n_occ), np.arange(n_occ, q1)
+        eps_v = jnp.asarray(qp_rotation["eps_v"])
+        eps_c = jnp.asarray(qp_rotation["eps_c"])
     grid_x, grid_y = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
     g0_X = g0_Y = None
     vhead_restart = header["bare_head"]
@@ -201,8 +255,12 @@ def load_bse_data_from_restart_sharded(
         g0_X = device_put_process_local(g0, NamedSharding(mesh_xy, P("x")))
         g0_Y = device_put_process_local(g0, NamedSharding(mesh_xy, P("y")))
     psi_v_X, psi_c_X, V_q0, W_q, V_q_full = read_bse_payload(
-        restart_file, input_file, mesh_xy, val_indices, cond_indices,
+        restart_file, input_file, mesh_xy, read_val, read_cond,
         nohead=use_nohead, full_exchange=load_v_full, screened_w=screened_w)
+    if qp_rotation is not None:
+        from .bse_qp_rotation import rotate_window_psi
+        psi_v_X, psi_c_X = rotate_window_psi(
+            psi_v_X, psi_c_X, qp_rotation, mesh_xy, log=_log0)
 
     if pad_bands:
         # ψ pad = 0 (bilinear ⇒ inert, and it is what decouples the pad
@@ -226,13 +284,6 @@ def load_bse_data_from_restart_sharded(
     psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
     psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
-    # ── Is a coarse→fine densification pending?  Resolved HERE, before the
-    # head injection, because C1 (the default) hands the densifier the
-    # head-EXCLUDED body and re-attaches the head per fine q afterwards, so on
-    # a densifying run the rank-1 whead must NOT go on now.
-    fine_grid = _resolve_bse_k_grid(bse_k_grid, input_file)
-    densify_pending = (fine_grid is not None
-                       and fine_grid != (nkx, nky, nkz))
     resolve_w_head_densify(                  # refuses a retired mode by name
         w_head_densify, _read_lorrax_input_quietly(input_file))
     defer_whead = densify_pending
@@ -313,6 +364,7 @@ def load_bse_data_from_restart_sharded(
         "n_val_pad": n_val_pad,
         "n_cond_pad": n_cond_pad,
         "fermi_energy": fermi_energy,
+        "qp_rotation": qp_rotation,
     }
 
     # ── bse_k_grid coarse→fine densification ─────────────────────────────
@@ -331,7 +383,12 @@ def load_bse_data_from_restart_sharded(
             htransform_a_band=htransform_a_band,
             htransform_rank_record_fn=htransform_rank_record_fn,
             htransform_quality_record_fn=htransform_quality_record_fn,
-            eqp_file=None if eqp_file is None else os.path.abspath(eqp_file))
+            eqp_file=None if eqp_file is None else os.path.abspath(eqp_file),
+            velocity_file=(None if velocity_file is None
+                           else os.path.abspath(velocity_file)),
+            velocity_full_window=bool(velocity_full_window),
+            velocity_pair_rule=str(velocity_pair_rule),
+            velocity_pair_gap_ev=float(velocity_pair_gap_ev))
     # A densified bundle's ε already carry ``eqp_file``; the drivers re-slice
     # the coarse restart's QP energies only when this is False.
     data["densified"] = bool(densify_pending)

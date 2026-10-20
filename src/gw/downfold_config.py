@@ -173,12 +173,11 @@ DOWNFOLD_DEFAULTS = {
     # The key exists so the door stays open and so an owner who wants it can
     # ask for it by name.
     "mode": "cur",
-    # ``plan``: ``auto`` and ``local`` both mean the GSPMD/local plan, which
-    # is what stage 1 implements.  ``distributed`` (mu tiled over a 2-D
-    # process grid through ``distrib_la``) is a later stage and is refused
-    # rather than silently demoted, because a demotion changes the numerical
-    # gauge and this codebase's contract is to announce demotions and refuse
-    # explicit requests it cannot honour.
+    # ``plan``: ``auto`` and ``distributed`` both name the one plan — every
+    # stack at P(None,'x','y'), the Gram streamed over its local columns and
+    # D3-D5 over q in fixed tiles (docs/downfold.md, "The distributed plan").
+    # One device is its P = 1 case.  ``local`` (the all-q GSPMD plan it
+    # replaced) is refused by name: it is not a second code path any more.
     "plan": "auto",
     # ``report_residual``: compute and print the per-q Pythagorean error bar
     # eps_W.  Default TRUE and it should stay true: it is the only number
@@ -446,22 +445,19 @@ class DownfoldConfig:
                 f"recommended and only implemented route) or 'refit' "
                 f"(reserved, refused in stage 1).")
         plan = str(params["plan"]).strip().lower()
-        if plan == "distributed":
+        if plan == "local":
             raise ValueError(
-                "downfold: plan='distributed' — mu tiled over a 2-D process "
-                "grid through distrib_la — is a later stage.  It is refused "
-                "rather than demoted to 'local', because a block-cyclic "
-                "factorisation is a different (equally valid) numerical "
-                "gauge and silently changing gauge under an explicit request "
-                "is the behaviour this repo's demotion doctrine forbids.  "
-                "The local plan emits ZERO collectives in its linear algebra "
-                "and is bit-identical across process grids, which is what "
-                "stage 1's gates are built on.")
-        if plan not in ("auto", "local"):
+                "GATE downfold_plan_local: got: plan = local; want: auto or "
+                "distributed (one plan); why: the all-q local plan was "
+                "replaced by the distributed plan, whose one-device case it "
+                "is — every stack at P(None,'x','y'), the Gram streamed over "
+                "its columns, the transfer over q in fixed tiles.  Fix: "
+                "delete the key or set plan = auto.")
+        if plan not in ("auto", "distributed"):
             raise ValueError(
-                f"downfold: plan={plan!r} is not one of 'auto', 'local' "
-                f"(both = the local/GSPMD plan in stage 1) or 'distributed' "
-                f"(a later stage).")
+                f"GATE downfold_plan: got: plan = {plan!r}; want: auto or "
+                f"distributed; why: there is one downfold plan.  Fix: delete "
+                f"the key or set plan = auto.")
 
         if os.path.abspath(source) == os.path.abspath(output):
             raise ValueError(

@@ -447,18 +447,25 @@ def _prepare_isdf_carriers(
         from .shared_pole_recipe import (SUPPORT_READ_PAD_EV, bind_shared_pole_census,
                                          resolve_shared_pole_recipe)
         from centroid.sampling_metric import full_k_quadrature_weights
+        census_inputs = dict(trs_allowed=sym.trs_allowed,
+                             state_capacity=wfn.occupation_state_capacity,
+                             kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
         bind_shared_pole_census(
-            wfns, meta, occupation_state=oneshot_occupation_state,
-            trs_allowed=sym.trs_allowed,
-            state_capacity=wfn.occupation_state_capacity,
-            kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
+            wfns, meta, occupation_state=oneshot_occupation_state, **census_inputs)
         from .qp_support import requested_reads_ev
         energy, states, frame_mu_ev = _oneshot_requested(
             config, enk_dft, wfn, oneshot_occupation_state, material_class)
+        support_reads_ev = frame_mu_ev + requested_reads_ev(
+            energy, states, config.sigma.omega_step_ev, pad_ev=SUPPORT_READ_PAD_EV)
         meta.shared_pole_recipe = resolve_shared_pole_recipe(
             config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0,
-            support_reads_ev=frame_mu_ev + requested_reads_ev(
-                energy, states, config.sigma.omega_step_ev, pad_ev=SUPPORT_READ_PAD_EV))
+            support_reads_ev=support_reads_ev)
+        from .ppm_pipeline import observing_window_source, publish_window_source
+        if observing_window_source():
+            # TD-aGW's shared-pole refit re-resolves this recipe at its own census
+            # (tdagw.dynsig.spm_screening); one empty list test otherwise.
+            publish_window_source(recipe_inputs=dict(
+                census_inputs, support_reads_ev=np.array(support_reads_ev, np.float64)))
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
     if config.bispinor and wfns_transverse is None:
         raise RuntimeError(
@@ -902,7 +909,8 @@ def _run_oneshot_sigma(
     return (sigma_result, W_by_role, photon_response)
 
 
-def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn):
+def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn, *,
+                                   sigma_result=None, static_head=None):
     """Produce the authenticated kinetic and ionic band matrix."""
     from file_io import validate_kin_ion_against_run
     _t_kin = time.perf_counter()
@@ -920,6 +928,8 @@ def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, 
         mesh=mesh_xy,
     )
     timing.record("gw_jax.kin_ion_load", time.perf_counter() - _t_kin)
+    from .ppm_pipeline import publish_window_hf_reference
+    publish_window_hf_reference(kin_ion, sigma_result, static_head, meta, band_slices)
     return (kin_ion)
 
 
@@ -1657,7 +1667,9 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    input_dir, isdf, material_class, mesh_xy, meta, mode, oneshot_occupation_state,
 	    photon_response, print0, qp_solver, quad, static_head_terms, sym, wfn, wfns_sigma,
 	    wfns_transverse)
-	(kin_ion) = _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn)
+	(kin_ion) = _load_kinetic_ionic_hamiltonian(
+	    band_slices, config, mesh_xy, meta, print0, wfn,
+	    sigma_result=sigma_result, static_head=static_head_terms)
 	(
 	    enk_dft, final_static_head_terms, kin_ion, rotations_written, sc_result,
 	    sigma_result, sigma_total) = _solve_qp_stage(

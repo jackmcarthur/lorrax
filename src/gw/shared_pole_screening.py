@@ -477,6 +477,19 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     if material_class == "metal" and not bool(getattr(sym, "trs_allowed", True)):
         print_fn("  shared-pole screening: time-reversal-broken METAL; ordered bank "
                  "(both orientations, odd channel) with fractional occupations")
+    from .ppm_pipeline import observing_window_source, publish_window_source
+    if not photon and observing_window_source():
+        # The held inputs of TD-aGW's shared-pole refit (this stage re-run at the
+        # window's populations, tdagw.dynsig.spm_screening); one empty list test
+        # when no ppm_pipeline.observe_window_sigma_source block is open.
+        publish_window_source(screening_inputs=dict(
+            wfns=wfns, V_q=V_q, meta=meta, config=config, kwargs=dict(
+                mesh_xy=mesh_xy, sym=sym, centroid_indices=centroid_indices, run_dir=run_dir,
+                label=label, wfn=wfn, wfn_fingerprint_binding=wfn_fingerprint_binding,
+                tensors_filename=tensors_filename, occupation_state=occupation_state,
+                print_fn=print_fn, head_resolver=head_resolver, mpa_plan=mpa_plan,
+                iteration_head_response=iteration_head_response,
+                material_class=material_class)))
     with timing.section("spole.screening_setup"):
         from file_io.shared_pole_store import initialize_shared_pole_bank
         from file_io.tagged_arrays import register_shared_pole_restart_member

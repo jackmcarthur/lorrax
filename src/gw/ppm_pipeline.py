@@ -46,7 +46,8 @@ from .gw_config import LorraxConfig
 from .head_correction import HeadResolver
 from .ppm_sigma import (
     compute_sigma_c_ppm_omega_grid,
-    fit_ppm,
+    fit_pole_model,
+    pole_fit_plan,
 )
 from runtime.padding import PaddedAxis
 
@@ -81,6 +82,135 @@ class PPMOutputs:
     odd_even_residue_ratio: float | None = None
     #: The body's omega reference (Ry), from ``SigmaOmegaResult.efermi_ry``.
     efermi_ry: float | None = None
+
+
+#: Open :func:`observe_window_sigma_source` blocks, innermost last.
+_WINDOW_SOURCE_OBSERVERS: list = []
+
+
+class observe_window_sigma_source:
+    """Collect, from the Sigma stage that runs inside the block, what a window Sigma reuses.
+
+    TD-aGW's collision term (docs/theory/td_agw_dynamical.md §1.5, §9 item 5)
+    evaluates ``gw.ppm_sigma.window_sigma_c`` on the GW run's own carrier and
+    screening model.  A GN-PPM run persists W(0) but neither W(i w_p) nor its
+    poles, and a shared-pole one-shot keeps its ``model.h5`` but not the inputs
+    of its W stage, so the TD driver runs the GW driver in its own process and
+    reads them here: no stage is re-implemented and the driver's outputs are
+    unchanged (with no open block every seam is one empty list test).
+    ``with observe_window_sigma_source() as src: gw_jax.main(...)`` leaves in
+    ``src``: ``member`` (``"gn_ppm"`` or ``"shared_pole"``), ``wfns`` (the Sigma
+    carrier), ``meta``, ``config``, ``head`` (``HeadSigmaDiag`` or None),
+    ``efermi_ry``, ``request`` (the run's ``OnShellRequest`` or None) and
+
+    * GN/HL-PPM (:func:`compute_ppm_sigma_pipeline`'s return): ``poles``
+      (``PPMBuildResult``), ``V_q``, ``quad``; ``screening=True`` also
+      ``fit_plan`` (the run's :func:`gw.ppm_sigma.pole_fit_plan`) and
+      ``W_supports`` (copies of the fit's two W samples, W(0) and W(probe) on
+      the fit's q set, taken right after the fit), the held inputs of the
+      GN-PPM screening update (``gw.ppm_sigma.screening_update``, Eq. 6);
+    * shared pole (``gw.sigma_dispatch``'s scalar shared-pole Sigma stage):
+      ``model`` (the screening handle: ``path``, ``identity``, ``digest``,
+      ``K``), ``occupation_state`` (the run's), ``linalg``; ``screening=True``
+      also ``screening_inputs``, the arguments of the run's
+      ``gw.shared_pole_screening.screen_shared_poles`` (``wfns``, ``V_q``,
+      ``meta``, ``config``, ``kwargs``), taken at its entry: the held inputs of
+      the shared-pole refit (the W stage re-run at other occupations), and
+      ``recipe_inputs`` (``gw.gw_jax``'s census inputs and requested reads),
+      with which the refit re-resolves the recipe at its own census.
+
+    A one-shot driver's post-Sigma seam also supplies ``hf_reference``:
+    authenticated kinetic+ionic, equilibrium Hartree and bare exchange
+    matrices in Ry, their band interval and bare-head coefficient. These
+    already computed matrices define the absolute HF baseline; no DFT Vxc
+    input or additional self-energy sweep is required.
+
+    The device fields of the poles and the carriers are copied at the seam (a
+    later stage may donate the originals); the last stage of the block wins.
+    """
+
+    def __init__(self, screening: bool = False):
+        self.source = {}
+        self.screening = bool(screening)
+
+    def __enter__(self):
+        _WINDOW_SOURCE_OBSERVERS.append(self)
+        return self.source
+
+    def __exit__(self, *exc):
+        _WINDOW_SOURCE_OBSERVERS.remove(self)
+        return False
+
+
+#: The fields only a ``screening=True`` observer receives.
+_SCREENING_FIELDS = ("fit_plan", "W_supports", "screening_inputs", "recipe_inputs")
+
+
+def observing_window_source() -> bool:
+    """Whether an :class:`observe_window_sigma_source` block is open (the seams' one test)."""
+    return bool(_WINDOW_SOURCE_OBSERVERS)
+
+
+def publish_window_hf_reference(kin_ion, sigma_result, static_head, meta, band_slices):
+    """Capture the already computed one-shot HF matrices for TD snapshots.
+
+    Arrays are ``(nk,nb,nb)`` Ry in the authenticated source WFN gauge.
+    The observer owns copies; no Hartree/Fock stage or frequency sweep is
+    repeated. This seam is a no-op when no TD source observer is open.
+    ``kin_ion`` is pristine T+Vloc+VNL, so reconstructing absolute HF
+    needs no separately supplied DFT Vxc matrix.
+    """
+    if not _WINDOW_SOURCE_OBSERVERS or sigma_result is None:
+        return
+    if sigma_result.hartree_omitted:
+        raise ValueError("GATE td_snapshot_hf_reference: source omitted its Hartree matrix")
+    reference = dict(
+        kin_ion_ry=jnp.copy(kin_ion), hartree_ry=jnp.copy(sigma_result.v_h_kij_ry),
+        exchange_ry=jnp.copy(sigma_result.sigma_x_kij_ry),
+        band_start=int(band_slices.b0), band_stop=int(band_slices.b3),
+        bare_head_coefficient_ry=(0.0 if static_head is None else
+            float(np.real(static_head.vc0)) / (float(meta.cell_volume) * int(meta.nk_tot))),
+        basis="source_wfn", kset=sigma_result.kset)
+    publish_window_source(hf_reference=reference)
+
+
+def _copy_device(tree):
+    return jax.tree.map(lambda a: jnp.copy(a) if isinstance(a, jax.Array) else a, tree)
+
+
+def publish_window_source(**fields):
+    """Hand a Sigma or W stage's objects to every open :class:`observe_window_sigma_source`.
+
+    Device arrays of ``poles`` (a ``PPMBuildResult``), ``wfns`` and
+    ``screening_inputs`` (its ``wfns`` and ``V_q``) are copied; everything else
+    is passed by reference.  Fields in :data:`_SCREENING_FIELDS` reach only
+    ``screening=True`` observers, and are copied only when one is open.
+    """
+    if not _WINDOW_SOURCE_OBSERVERS:
+        return
+    wanted = any(obs.screening for obs in _WINDOW_SOURCE_OBSERVERS)
+    fields = {k: v for k, v in fields.items() if wanted or k not in _SCREENING_FIELDS}
+    copy = lambda a: None if a is None else jnp.copy(a)
+    poles = fields.get("poles")
+    if poles is not None:
+        fields["poles"] = dataclasses.replace(
+            poles, B_q=copy(poles.B_q), Omega_q=copy(poles.Omega_q),
+            valid_mask_q=copy(poles.valid_mask_q), Wc0_q=copy(poles.Wc0_q),
+            B_odd_q=copy(poles.B_odd_q))
+    if "wfns" in fields:
+        fields["wfns"] = _copy_device(fields["wfns"])
+    if "screening_inputs" in fields:
+        inputs = dict(fields["screening_inputs"])
+        V = inputs["V_q"]                       # a jax.Array or a q-wedge operator over one
+        if isinstance(V, jax.Array):
+            V = jnp.copy(V)
+        elif dataclasses.is_dataclass(V) and isinstance(getattr(V, "values", None), jax.Array):
+            V = dataclasses.replace(V, values=jnp.copy(V.values))
+        inputs.update(wfns=_copy_device(inputs["wfns"]), V_q=V)
+        fields["screening_inputs"] = inputs
+    for obs in _WINDOW_SOURCE_OBSERVERS:
+        obs.source.update({k: v for k, v in fields.items()
+                           if obs.screening or k not in _SCREENING_FIELDS})
 
 
 def _fit_head_correction(
@@ -809,12 +939,13 @@ def compute_ppm_sigma_pipeline(
         else:
             fit_inputs = (W0_op.unfold(mesh_xy), Wp_op.unfold(mesh_xy), V_op.unfold(mesh_xy))
             wedge_kw = {}
-        ppm = fit_ppm(
-            *fit_inputs, probe_omega, mesh_xy,
-            **wedge_kw,
+        # The fit's plan and the fit are the TD-aGW screening update's too
+        # (``ppm_sigma.screening_update``, docs/theory/td_agw_dynamical.md Eq. 6).
+        fit_plan = pole_fit_plan(
+            fit_inputs[2], probe_omega, mesh_xy,
+            wedge=wedge_kw,
             fallback_omega=config.ppm.fallback_omega,
             n_nodes_static=quad.node_count,
-            print_fn=print_fn,
             model_label=label,
             n_mu_logical=int(meta.n_rmu),
             mu_active_mask=getattr(meta, 'mu_active_mask', None),
@@ -824,8 +955,14 @@ def compute_ppm_sigma_pipeline(
             # support.  This is lossy versus BGW finite-pole parity; HL is a
             # different real-axis model and is deliberately unchanged.
             coarsen_extreme_tails=not is_hl,
-            ordered_orientations=ordered,
+            ordered=ordered,
+            solve_extent=int(getattr(meta, 'mu_solve_extent', meta.n_rmu)),
         )
+        ppm = fit_pole_model(fit_inputs[0], fit_inputs[1], fit_plan, print_fn=print_fn)
+        screening_source = {}
+        if any(obs.screening for obs in _WINDOW_SOURCE_OBSERVERS):
+            screening_source = dict(fit_plan=fit_plan, W_supports=(
+                jnp.copy(fit_inputs[0]), jnp.copy(fit_inputs[1])))
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)
         #
@@ -916,6 +1053,12 @@ def compute_ppm_sigma_pipeline(
             )
         del sigma_c_body_omega_n3
 
+    if _WINDOW_SOURCE_OBSERVERS:              # TD-aGW's window Sigma (observe_window_sigma_source)
+        publish_window_source(
+            member="gn_ppm", wfns=wfns, meta=meta, config=config, poles=ppm,
+            head=head_sigma_diag_w_kn_ry,
+            efermi_ry=sigma_omega.efermi_ry, request=getattr(sigma_c_body_omega, "request", None),
+            V_q=V_q, quad=quad, **screening_source)
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
         band_axis=sigma_omega.band_axis,

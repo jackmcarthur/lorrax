@@ -1443,6 +1443,7 @@ def _integrate_sigma_batches(
     q_wedge=None,
     tau_capacity=None,
     omega_grid_ry=None,
+    keep_branches=False,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
@@ -1464,7 +1465,18 @@ def _integrate_sigma_batches(
     frequency list is the one the windows were planned on.  The result is an
     ``OnShellSigma`` (no brackets) or a ``BandCountCube``.  ``request`` None
     (``sigma_omega_grid_debug``) folds Sigma_c onto ``omega_grid_ry``: the
-    result is the ``(n_omega, nk, nb, nb)`` cube or a grid ``BandCountCube``."""
+    result is the ``(n_omega, nk, nb, nb)`` cube or a grid ``BandCountCube``.
+
+    ``keep_branches``: keep the causal branch axis.  Every planned window
+    belongs to one branch (``row.space``: ``"cond"``, the particle branch of
+    weight 1 - f, or ``"val"``, the hole branch of weight f); each branch folds
+    into its own accumulator, so the sweep is the same one sweep (the same
+    windows, nodes and compiled runner; one more output buffer per branch) and
+    ``SigmaOmegaResult.branches`` maps each space to its Sigma, of the same
+    type as ``sigma_c_kij``, which is then their sum
+    (docs/theory/td_agw_dynamical.md §1.5: the out- and in-scattering rates
+    are the branches' anti-Hermitian parts).  False is the incumbent single
+    accumulator, bit for bit."""
     # Band fences are profiling boundaries (see ``_unfenced``).  This executor
     # is shared with the incumbent elementwise-MPA route (``w_synthesis is
     # None``), which is never fenced whatever a harness has installed.
@@ -1506,20 +1518,32 @@ def _integrate_sigma_batches(
             omega = np.asarray(omega_grid_ry, np.float64)
             if omega.ndim != 1 or not omega.size:
                 raise ValueError("omega_grid_ry must be a nonempty vector")
-            accumulator = _grid_accumulator(omega, spatial_shape, output_sharding,
-                                            brackets if bracketed else None,
-                                            sigma_axis, mesh_xy)
+
+            def new_accumulator():
+                return _grid_accumulator(omega, spatial_shape, output_sharding,
+                                         brackets if bracketed else None,
+                                         sigma_axis, mesh_xy)
         else:
             if request.parent_ry.shape[1] != int(k_unfold_plan.n_parent):
                 raise ValueError(f"on-shell Sigma: the request holds {request.parent_ry.shape[1]} "
                                  f"parent k rows, the k plan {k_unfold_plan.n_parent}")
             n_counts = len(brackets) if bracketed else 1
-            accumulator = DeviceOmegaAccumulator(
-                request, carrier=sigma_axis.carrier, sharding=output_sharding,
-                reduce=_on_shell_reduce(mesh_xy, len(brackets) if bracketed else None),
-                shape=(((2, *spatial_shape),) * (2 if n_counts > 1 else 1),
-                       ((request.n_slot, spatial_shape[0], sigma_axis.carrier,
-                         int(mesh_xy.shape["y"])),) * n_counts))
+
+            def new_accumulator():
+                return DeviceOmegaAccumulator(
+                    request, carrier=sigma_axis.carrier, sharding=output_sharding,
+                    reduce=_on_shell_reduce(mesh_xy, len(brackets) if bracketed else None),
+                    shape=(((2, *spatial_shape),) * (2 if n_counts > 1 else 1),
+                           ((request.n_slot, spatial_shape[0], sigma_axis.carrier,
+                             int(mesh_xy.shape["y"])),) * n_counts))
+        # keep_branches: one total per causal branch, both always present (a
+        # branch with no window finalizes to zeros).  The window table, the
+        # window counter and the parent tables read no total and are the same
+        # for every accumulator of this call, so the first one serves them.
+        accumulators = ({space: new_accumulator() for space in BRANCH_SPACES}
+                        if keep_branches else None)
+        accumulator = (new_accumulator() if accumulators is None
+                       else accumulators[BRANCH_SPACES[0]])
 
         kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
@@ -1699,14 +1723,16 @@ def _integrate_sigma_batches(
                 antihermitian=(win.project_code == 1),
                 omega_indices=row.omega_idx, omega_values=row.omega_abs,
                 overlap=getattr(tau_kernel, "overlap", False))
+            # The total this window folds into: its branch's (keep_branches) or the one.
+            target = accumulator if accumulators is None else accumulators[row.space]
 
             def compile_window(row_kernel=row_kernel, tau_arguments=tau_arguments):
                 if synthesis:
-                    return accumulator.run_window(
+                    return target.run_window(
                         row_kernel, tau_arguments, t_pad, coeff, n_active, active_count,
                         antihermitian=window_options["antihermitian"],
                         overlap=window_options["overlap"], compile_only=True)
-                return accumulator.integrate_window(
+                return target.integrate_window(
                     row_kernel, tau_arguments, win.nodes.t,
                     win.nodes.alpha, compile_only=True, **window_options)
             if not sweep_started:
@@ -1744,7 +1770,7 @@ def _integrate_sigma_batches(
                     sweep_started = True
             if synthesis:
                 # One executable per window: the node loop runs on device.
-                total = accumulator.run_window(
+                total = target.run_window(
                     row_kernel, tau_arguments, t_pad, coeff, n_active, active_count,
                     antihermitian=window_options["antihermitian"],
                     overlap=window_options["overlap"])
@@ -1756,7 +1782,7 @@ def _integrate_sigma_batches(
                     alpha_nodes = np.asarray(
                         jax.device_get(win.nodes.alpha), np.complex128)
                 # One executable per window: the node loop runs on device.
-                total = accumulator.integrate_window(
+                total = target.integrate_window(
                     row_kernel, tau_arguments, t_nodes, alpha_nodes, **window_options)
                 n_nodes = len(t_nodes)
             for _ in range(n_nodes):
@@ -1769,12 +1795,13 @@ def _integrate_sigma_batches(
 
     fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
-        if request is None:
-            sigma = _grid_finalize(accumulator.finalize(), k_unfold_plan.sym, bracketed,
-                                   output_sharding, mesh_xy)
-        else:
+        def finish(total):
+            """One accumulator's fold -> the result's Sigma object."""
+            if request is None:
+                return _grid_finalize(total, k_unfold_plan.sym, bracketed,
+                                      output_sharding, mesh_xy)
             # The counts stay on the wedge; each is unfolded when it is read.
-            matrices, diagonals = accumulator.finalize()
+            matrices, diagonals = total
             sym = k_unfold_plan.sym
             full = _wedge_is_full_bz(sym)
             sigma = BandCountCube(
@@ -1783,9 +1810,15 @@ def _integrate_sigma_batches(
                 unfold_rows=((lambda slots: slots) if full else
                              _band_count_rows_fn(sym, mesh_xy)),
                 nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy, request=request)
-            if not bracketed:
-                # One count: the on-shell Sigma itself.
-                sigma = sigma.point(0)
+            # One count: the on-shell Sigma itself.
+            return sigma if bracketed else sigma.point(0)
+
+        branches = None
+        if accumulators is None:
+            sigma = finish(accumulator.finalize())
+        else:
+            branches = {space: finish(acc.finalize()) for space, acc in accumulators.items()}
+            sigma = sum_sigma_branches(branches)
 
         if bracketed:
             if band_counts is None:
@@ -1819,7 +1852,28 @@ def _integrate_sigma_batches(
             odd_even_residue_ratio=ratio,
             omega_ry=None if request is not None else omega,
             omega_ev=(None if request is not None else
-                      np.asarray(omega * RYD_TO_EV, np.float64)))
+                      np.asarray(omega * RYD_TO_EV, np.float64)),
+            branches=branches)
+
+
+#: The causal branches of the Sigma sweep (``gw.ppm_windows._iter_branches``'s
+#: ``space``): ``cond`` sums the particle propagator (weight 1 - f, residue
+#: R_+), ``val`` the hole propagator (weight f, residue R_-).
+BRANCH_SPACES = ("cond", "val")
+
+
+def sum_sigma_branches(branches: dict):
+    """The Sigma of a branch-resolved sweep: the sum of its branches (same type).
+
+    ``branches`` maps each of :data:`BRANCH_SPACES` to an ``OnShellSigma``, a
+    ``BandCountCube`` or a ``(n_omega, nk, nb, nb)`` cube, all of one request
+    or grid; the sum is taken on device in that layout.
+    """
+    out = None
+    for space in BRANCH_SPACES:
+        value = branches[space]
+        out = value if out is None else out + value
+    return out
 
 
 def _grid_accumulator(omega, spatial_shape, output_sharding, brackets, sigma_axis, mesh_xy):
@@ -2110,6 +2164,7 @@ def integrate_sigma_store(
     tau_capacity=None,
     tau_kernel_factory=None,
     omega_grid_ry=None,
+    keep_branches=False,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -2131,7 +2186,7 @@ def integrate_sigma_store(
 
     ``tau_kernel_factory`` replaces the resident pole route's τ body (the
     plane-wave path's ``get_shared_sigma_tau_kernel(_sigma_kij=...)``); see
-    :func:`_integrate_sigma_batches`.
+    :func:`_integrate_sigma_batches`, which also owns ``keep_branches``.
     """
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
@@ -2154,7 +2209,7 @@ def integrate_sigma_store(
             band_counts=band_counts, odd_residue_off=odd_residue_off,
             q_wedge=q_wedge, tau_capacity=tau_capacity,
             tau_kernel_factory=tau_kernel_factory, omega_grid_ry=omega_grid_ry,
-            print_fn=print_fn)
+            keep_branches=keep_branches, print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -2246,6 +2301,7 @@ def compute_sigma_c_mpa_omega_grid(
     omega_group=None,
     group_fixed=None,
     linalg=None,
+    keep_branches=False,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -2284,7 +2340,10 @@ def compute_sigma_c_mpa_omega_grid(
     the resident route's signature -- the plane-wave path
     (``gw.plane_wave_pipeline``) passes ``get_shared_sigma_tau_kernel`` over
     its own ``_sigma_kij``.  The planner, the windows and the accumulator
-    are unchanged.
+    are unchanged.  ``keep_branches`` (:func:`_integrate_sigma_batches`): the
+    result also carries the Sigma of each causal branch from the same sweep
+    (``SigmaOmegaResult.branches``); the D = 0 observability twin, when it
+    runs, is not branch-resolved.
     """
     if sigma_w_model not in ("mpa", "shared_pole"):
         raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
@@ -2531,7 +2590,7 @@ def compute_sigma_c_mpa_omega_grid(
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
                         tau_capacity=geometry.get("sc_tau_capacity"), omega_grid_ry=grid_ry,
-                        print_fn=print_fn)
+                        keep_branches=keep_branches, print_fn=print_fn)
                 except BaseException:
                     if owned:
                         synthesis.close()
@@ -2546,7 +2605,7 @@ def compute_sigma_c_mpa_omega_grid(
                     band_counts=band_counts,
                     tau_capacity=geometry.get("sc_tau_capacity"),
                     tau_kernel_factory=tau_kernel_factory, omega_grid_ry=grid_ry,
-                    print_fn=print_fn)
+                    keep_branches=keep_branches, print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
         # extra sweep whose sigma_c_odd_kij nobody reads.
