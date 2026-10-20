@@ -31,3 +31,14 @@ def test_over_the_room_doubles_the_rounds():
         np.testing.assert_allclose(np.asarray(w), np.linalg.eigvalsh(a), atol=1e-9)
     finally:
         memory.reset(run=True)
+
+
+def test_rocm_local_eigh_workspace_outside_the_batched_window(monkeypatch):
+    """Outside the batched window ROCm's loop holds one matrix's workspace at the measured rate."""
+    import importlib
+    ws = importlib.import_module("distrib_la.workspace")
+    monkeypatch.setattr(ws, "mesh_platform", lambda mesh: "ROCM")
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    assert ws.local_eigh_workspace.__wrapped__(mesh, 1, 100, np.complex128) == 4 * 100 ** 2 * 16 + 800
+    inside = ws.local_eigh_workspace.__wrapped__(mesh, 4, 200, np.complex128)
+    assert inside == min(importlib.import_module("distrib_la.local_eigh").BATCHED_EIGH_ROUTE["ROCM"].tile_bytes, 4 * 4 * 200 ** 2 * 16) + 4 * 200 * 8
