@@ -403,6 +403,20 @@ derivation of a full nonequilibrium collision operator.
   \sum_k\operatorname{Tr}(D[\rho_*]-\Gamma[\rho_*]\rho)$, which generally
   changes as $\rho$ evolves. Refresh residual and trajectory number drift are
   separate diagnostics; cadence convergence is required.
+  One unimplemented numerical alternative is to cache the two retarded-column
+  **real-linear maps on Hermitian-density coordinates**, rather than their
+  evaluated Gamma/D, at fixed W, E and U, plus their constant baseline.
+  Recontracting those maps with each current full density retains the
+  original quadratic collision functional during that interval. A literal
+  three-k/two-band CPU proof reproduces complex column/PV branch tables to
+  relative error 3e-16; reciprocal synthetic fresh/cached trace cancellation
+  is retained, while deliberately broken reciprocity remains broken. This
+  is not a native implementation or a positivity repair. Two raw complex
+  maps cost $2N_k^2n_A^4$ entries: 10.62 MB globally for 36 k and four active
+  bands, but 155.44 GB for 44 bands, before source/workspace. A viable build
+  must fuse the four active endpoints into a shared W/tau sweep, not repeat
+  one sweep per density coordinate. Changed E/U/W requires rebuilding or a
+  separately validated update; no stale maps are used in the runtime.
 * **Positivity.** For fixed held coefficients write the absolute-state flow as
   $\dot\rho=-\tfrac12\{\Gamma,\rho\}+D_{\rm eff}$, where
   $D_{\rm eff}=D$ for `raw` and includes the explicit equilibrium counterterm
@@ -433,6 +447,13 @@ derivation of a full nonequilibrium collision operator.
   (no rational fit or equilibrium subtraction). Thus a universal nonlinear
   invariance theorem would also be false. The small size of this example's
   excursion does not bound excursions in a material calculation.
+  The nonnegative electronic rates in
+  [Stefanucci and Perfetto, §VII.1, Eqs. (82)–(83)](https://arxiv.org/html/2311.03980v1#S7.SS1)
+  follow their additional diagonal internal-density/propagator restriction,
+  fixed equilibrium QP phases, static screened interaction and delta-only
+  Markov integrals (S1–S3), with no phonon coherences for that sign statement.
+  They do not supply a positivity theorem for the present full-coherence,
+  column-sampled complex self-energy with principal-value parts retained.
 * **Linear response.** Off-diagonal rates and the variation of $D$ couple
   coherences and populations; a scalar sum of two quasiparticle widths is
   valid only after further diagonal restrictions. The static-$W$ limit has
@@ -2142,6 +2163,87 @@ and both allocations were released. Authenticated raw complex branch
 tables, operators, source/snapshot hashes and accounting are preserved in
 `/home/jackm/mgkba_campaign_20261019/source_frozen_v2_20261020/` and the
 combined status in `source_frozen_20261020/COMBINED_STATUS.json`.
+
+A final bounded source-frozen refinement at commit `7cf8340` (tree
+`e54510ea24f54584daf55af4d115bc973d165e8b`) changed **only** the new Sigma
+quadrature target from 1e-4 to 1e-6. The source deck, source W, head and
+saved strong-state input were unchanged and authenticated. The new sweep
+used 136 tau pairs and 11.26 s; source preparation and conversion took
+79.35 s and 7.34 s. The fresh relative number residual improved to
+2.723e-8, but still missed the unchanged 1e-8 guard. Full complex particle
+and hole tables changed by relative Frobenius norms 1.365e-6 and 9.646e-7,
+with maximum entry differences 0.00585 and 0.00452 meV. Maximum entry
+changes in Gamma, D and the Hermitian material self-energy were 0.00364,
+0.000515 and 0.00331 meV. The negative global rate eigenvalues above are
+therefore robust to this tested rule refinement; this is not a collision
+broadening, pole-rank or screening-refresh convergence study.
+
+The same refined source-frozen executor also evaluated the DFT projector
+control ($U=I$, active occupations $(1,1,0,0)$). Its full D and Gamma-D were
+indefinite (minima -15.79 and -17.57 meV), but **the actual boundary
+compressions were strictly inward at every k**: the minimum eigenvalues of
+D restricted to the empty subspace and Gamma-D restricted to the filled
+subspace were +1.03824 and +1.07554 meV. Thus these global matrix signs do
+not demonstrate an immediate violation at this projector. The raw dissipative
+part $D-\{\Gamma,\rho\}/2$ was not stationary: its Frobenius norm over all k
+was 0.01030284 Ry, with
+off-diagonal norm 0.01023620 Ry and diagonal norm 0.00116986 Ry. Its relative
+fresh number residual was 2.094e-8. This prepared DFT state is neither a
+self-consistent full-frequency GW ground state nor an equilibrium-FDT test.
+
+A separate cheap CPU diagnostic exponentiated the **held** captured affine
+generator exactly for at most 0.5 fs, using the saved old Hamiltonian
+$U\operatorname{diag}(E)U^\dagger$, not a newly solved material Hamiltonian.
+For the strong state, the density remained physical over that diagnostic
+interval, with final bounds [0.0043663,0.9950394], while the k-mean trace
+changed by 6.842e-4 electrons/cell (1.789e-4 at 0.25 fs). For the projector,
+the final bounds were [0.0007383,0.9994091] and trace change 7.240e-5.
+No clipping, equilibrium counterterm or trace repair was used. This isolates
+the held-coefficient cadence error described in §1.5; it is **not** a
+self-consistent TD trajectory, damping prediction or general positivity
+bound. Raw coefficients, full-complex differences, compressed boundary
+spectra and the exact held-generator diagnostics are preserved in
+`/home/jackm/mgkba_campaign_20261019/source_frozen_final_20261020/`.
+
+The internal transition-Galerkin bridge was also exercised on real P4 at
+that same code tree. Its mandatory tiny distributed preflight passed before
+material source preparation: absolute Pi and checked-Dyson errors were
+5.93e-17 and 7.43e-18, with right/dual interpolation errors 1.08e-19 and
+6.94e-18. The subsequent **q=0 only** material diagnostic retained all
+978 logical ports (980 packed), all 160 bands and 303552 live transition
+coordinates. It used the declared cap of 128 frequency-basis vectors,
+eight seed directions and only two training/two held frequencies; the
+actual retained order was 64. This is an intentionally underconverged
+frequency proof, not the production shared-pole quadrature recipe or a
+reduced spatial screening model.
+
+The direct full-port Pi evaluations took 3.47 s cold and about 0.241 s warm
+per site; warm checked-Dyson solves took about 0.023 s. TSQR/CGS2 took
+17.40 s and structured parent construction 1.66 s. The declared one-parent
+memory envelope was 20.91 GB/rank, including an explicit 16 GiB source
+ceiling, below the 48 GiB diagnostic limit; this was not a measured allocator
+peak or an all-parent cache admission. The source's dense backend was
+changed from local to distributed for this diagnostic only, with its own
+authenticated one-key source-deck diff; the source-frozen Sigma controls
+above kept their original deck.
+
+The resulting 64-mode model had decaying poles (maximum imaginary part
+-0.00298802 Ry), but failed full-matrix accuracy badly: training relative
+Frobenius defects were 48.83% and 44.35%, held defects 54.45% and 47.00%,
+against the unchanged 2% criterion. No growing modes were removed, no
+tolerance was tuned and no production bank, Sigma or trajectory was
+produced. These few-site results do not certify the full microscopic pole
+set. Native-site coverage, independent direct-versus-streamed response
+checks, converged frequency spaces, all-q capacity and full-complex Sigma
+convergence remain necessary before runtime integration. The receipt and
+frequency-only capture share the final evidence directory above. The owned
+GPU allocation was released immediately after this bounded diagnostic
+(12:33:32 UTC, 20 October 2026). Slurm records all three final P4 steps as
+completed: 126, 103 and 202 s, or 0.47889 active GPUh in total; the entire
+588 s reservation cost 0.65333 GPUh, not an additional active-step cost.
+The exact `7cf8340` source passed 54 focused CPU checks and all nine static
+release checks. These checks and the real distributed diagnostic above
+are not a new full-driver hsuite run or production TD admission.
 
 ### 8.2 Acceptance checks and earlier-member evidence
 
