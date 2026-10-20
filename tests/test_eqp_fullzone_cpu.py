@@ -178,6 +178,86 @@ def test_htransform_reader_keeps_full_zone_blocks(case, tmp_path):
                           ry(np.asarray(case.unfold(case.sym, q_w[:, 1:5]))))
 
 
+def test_htransform_reader_refuses_star_asymmetric_file(case, tmp_path):
+    """``read_eqp_energies`` gates against the file's own E_DFT column."""
+    from file_io.restart_bundle import read_eqp_energies
+
+    fz = _full_zone_wfn(case.sym)
+    k_star = _k_off_its_parent(case.sym)
+    q = case.q_full.copy()
+    q[k_star, 3] += 5.0e-3
+    f = _write(tmp_path / "eqp_asym.dat", case.k_full, case.e_full, q)
+    with pytest.raises(ValueError, match=r"GATE eqp_star_spread: .*eqp_asym\.dat"
+                       r": the QP shift E_QP - E_DFT of band 4 differs by "
+                       r"5\.00\d meV"):
+        read_eqp_energies(f, fz, (1, 5))
+
+
+def test_superset_full_zone_file_refuses(case, tmp_path):
+    """More blocks than the full BZ: the block map would not be a bijection."""
+    extra = case.k_full[:3] + np.array([0.01, 0.0, 0.0])
+    kpts = np.concatenate([case.k_full, extra])
+    e = np.concatenate([case.e_full, case.e_full[:3]])
+    q = np.concatenate([case.q_full, case.q_full[:3]])
+    f = _write(tmp_path / "eqp_super.dat", kpts, e, q)
+    with pytest.raises(ValueError, match=r"GATE eqp_full_zone_count: eqp_super"
+                       r"\.dat holds 30 k-blocks but this deck's full BZ has "
+                       r"27 k, so 3 blocks would go unused"):
+        apply_eqp_corrections(case.e_full / RY, f, _deck(tmp_path))
+
+
+def test_duplicate_block_refuses(case, tmp_path):
+    kpts = case.k_full.copy()
+    kpts[6] = kpts[5] + np.array([1.0, 0.0, -1.0])     # block 6 repeats k 5
+    f = _write(tmp_path / "eqp_dup.dat", kpts, case.e_full, case.q_full)
+    with pytest.raises(ValueError, match=r"full-BZ k 5 .* matches 2 of them"):
+        apply_eqp_corrections(case.e_full / RY, f, _deck(tmp_path))
+
+
+def _degenerate_pair(case, lo):
+    """DFT spectrum with bands ``lo``, ``lo + 1`` 0.2 meV apart (one multiplet)."""
+    e_w = case.e_wedge.copy()
+    e_w[:, lo + 1] = e_w[:, lo] + 2.0e-4
+    assert np.all(np.diff(e_w, axis=1) > 0)
+    return np.asarray(case.unfold(case.sym, e_w))
+
+
+def test_gauge_split_inside_a_multiplet_passes_and_is_applied(case, tmp_path,
+                                                              capsys):
+    """The gate reads multiplet means; per-band values are applied as given.
+
+    Bands 2 and 3 form one DFT multiplet whose two shifts differ by 10 meV
+    and are swapped at one star member: a per-band gate refuses this file.
+    """
+    e_full = _degenerate_pair(case, 2)
+    shift = np.asarray(case.q_full) - np.asarray(case.e_full)[:, :NB_EQP]
+    shift[:, 2], shift[:, 3] = 0.10, 0.11
+    k_star = _k_off_its_parent(case.sym)
+    shift[k_star, 2], shift[k_star, 3] = 0.11, 0.10
+    q = e_full[:, :NB_EQP] + shift
+    f = _write(tmp_path / "eqp_gauge.dat", case.k_full, e_full, q)
+    _k, _d, q_file, _off = read_bgw_eqp(f)
+    got = apply_eqp_corrections(e_full / RY, f, _deck(tmp_path))
+    assert np.array_equal(got[:, :NB_EQP], q_file / RY)
+    out = capsys.readouterr().out
+    assert "10.0000 meV band by band" in out
+    assert "largest spread inside one multiplet 10.0000 meV" in out
+
+
+def test_multiplet_cut_by_the_file_edge_is_reported_not_gated(case, tmp_path,
+                                                              capsys):
+    """The file's top band (6) is degenerate with DFT band 7, outside the file."""
+    e_full = _degenerate_pair(case, NB_EQP - 1)
+    q = e_full[:, :NB_EQP] + (np.asarray(case.q_full)
+                              - np.asarray(case.e_full)[:, :NB_EQP])
+    q[_k_off_its_parent(case.sym), NB_EQP - 1] += 5.0e-3
+    f = _write(tmp_path / "eqp_cut.dat", case.k_full, e_full, q)
+    apply_eqp_corrections(e_full / RY, f, _deck(tmp_path))
+    out = capsys.readouterr().out
+    assert "WARNING eqp_cut.dat: band 6 ends inside a DFT multiplet at 27 k" in out
+    assert "5.0000 meV, is reported and not gated" in out
+
+
 def test_full_zone_sized_file_off_the_grid_refuses(case, tmp_path):
     kpts = case.k_full.copy()
     kpts[5] += np.array([0.01, 0.0, 0.0])

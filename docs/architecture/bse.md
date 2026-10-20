@@ -467,8 +467,8 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE bse_qp_star_gauge` | the same; `bse_qp_rotation.certify_star_gauge` | an artifact $H_{QP}(k)$, or a restart centroid band matrix of 1 or $\sigma_z$, that misses its (anti)unitary star image by more than $10^{-10}$ |
 | `GATE bse_qp_dipole_velocity` | `absorption_common.window_dipoles` | `--qp-rotations --dipole` with a momentum-only (`skip_vnl`) dipole |
 | `GATE bse_qp_rotations_k_grid` | `bse_loading.load_bse_data_from_restart_sharded` | `--qp-rotations` with `bse_k_grid` |
-| `GATE eqp_star_spread` | `restart_bundle.apply_eqp_corrections` (`_eqp_on_full_bz`) | an `--eqp` file whose QP shifts $E_{QP} - E_{DFT}$ differ across a symmetry star by more than 1 meV in some band (`EQP_STAR_SPREAD_TOL_EV`); the message names the band and the two k |
-| eqp k coverage | the same | an `--eqp` file with at least $N_k$ blocks in which some full-BZ k matches no block or two (crystal coordinates mod G to 1e-6), or a file that is neither the wedge nor the full zone |
+| `GATE eqp_star_spread` | `restart_bundle.apply_eqp_corrections` (`_eqp_on_full_bz`) | an `--eqp` file whose QP shifts $E_{QP} - E_{DFT}$, averaged over each DFT multiplet, differ across a symmetry star by more than 1 meV (`EQP_STAR_SPREAD_TOL_EV`); the message names the band, its multiplet and the two k. Per-band values are applied as given |
+| `GATE eqp_full_zone_count`, eqp k coverage | the same | an `--eqp` file with more blocks than the full BZ; a full-zone-sized file in which some full-BZ k matches no block or two (crystal coordinates mod G to 1e-6); a file that is neither the wedge nor the full zone |
 | two QP descriptions | `bse_jax.parse_args`, `file_io.qp_wfn.refuse_conflicting_qp_state_sources` | `--eqp` with `--qp-rotations`; a rotation on a QP WFN deck or on a restart from another WFN |
 | band-window degeneracy | `common.band_degeneracy.resolve_band_window` | a window edge inside a multiplet under `--band-degeneracy strict` |
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |

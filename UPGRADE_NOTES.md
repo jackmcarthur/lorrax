@@ -9,41 +9,53 @@ The binding rulings behind breaking changes are in
 
 `file_io.restart_bundle.apply_eqp_corrections`, the eqp reader of every BSE
 frontend (`bse_jax`, Haydock, Davidson, the direct restart loader, exciton
-bands), now reads a file with a block for every full-BZ k block by block,
-matched by crystal coordinate mod G to 1e-6, as BerkeleyGW does. It used to
-unfold such a file from its star representatives: on the Si 8³ full-zone WFN
-29 of 512 k kept their own block and the other 483 blocks were discarded. A
-file-wedge eqp file, what LORRAX's GW writes on a reduced WFN, is unfolded
-through the symmetry service as before.
+bands), now reads a file with exactly one block per full-BZ k block by
+block, matched by crystal coordinate mod G to 1e-6, as BerkeleyGW does. It
+used to unfold such a file from its star representatives: on the Si 8³
+full-zone WFN 29 of 512 k kept their own block and the other 483 blocks were
+discarded. A file-wedge eqp file, what LORRAX's GW writes on a reduced WFN,
+is unfolded through the symmetry service as before.
 
 - **Results move only for star-asymmetric full-zone files, and those now
-  refuse** (`GATE eqp_star_spread`: QP shifts E_QP − E_DFT that differ
-  across a symmetry star by more than 1 meV in any band; the message names
-  the file, the band and the two k). A star-symmetric file gives the old
-  energies to its print precision: Si 8³ `sidirect/d8/eqp1.dat` bit for bit,
-  `si8v2` `eqpA_main_si.dat` (htransform at 6446c17d3) within 1.0e-6 meV
-  (1.0e-7 % of its 965.03 meV QP fundamental gap, direct 3072.79 meV).
-  Wedge files are bit for bit (Si 4³ `eqp1.dat`, `eqp1_a.dat`). The old
-  Si 8³ `sidirect/eqpA_si.dat` (36 bands; QP column of bands 1–16 from
-  the QRCP htransform)
-  refuses at 476.03 meV (band 15, k = (3/8, 3/8, 3/8) against (3/8, 0, 0);
-  50.9 % of its 935.54 meV QP fundamental gap, direct 3072.76 meV). LORRAX
-  BSE runs on it applied star-representative energies that BerkeleyGW did
-  not; rerun them on a symmetric file.
+  refuse** (`GATE eqp_star_spread`). The gated quantity is the QP shift
+  E_QP − E_DFT averaged over each DFT multiplet (bands within the 1 meV
+  `DEGENERACY_TOL_RY`), which may differ across a symmetry star by at most
+  1 meV; the per-band values are applied as given. Each read prints the
+  multiplet-mean and band-by-band star spreads and the largest spread inside
+  one multiplet (0.396 meV, bands 17–20, on both Si 8³ files below: 0.041 %
+  of eqpA_main's 965.03 meV QP fundamental gap, direct 3072.79 meV). A
+  star-symmetric file gives the old energies to its print precision: Si 8³
+  `sidirect/d8/eqp1.dat` bit for bit, `si8v2` `eqpA_main_si.dat`
+  (htransform at 6446c17d3) within 1.0e-6 meV (1.0e-7 % of its 965.03 meV
+  gap). Wedge files are bit for bit (Si 4³ `eqp1.dat`, `eqp1_a.dat`). The old
+  Si 8³ `sidirect/eqpA_si.dat` (36 bands; QP column of bands 1–16 from the
+  QRCP htransform) refuses at 476.025 meV (bands 15–16, k = (3/8, 3/8, 3/8)
+  against (3/8, 0, 0); 50.9 % of its 935.54 meV QP fundamental gap, direct
+  3072.76 meV). LORRAX BSE runs on it applied star-representative energies
+  that BerkeleyGW did not; rerun them on a symmetric file.
 - **htransform.** `--eqp-file` (`read_eqp_energies`) uses the same reader
   and the same gate, with E_DFT from the file's own column: a full-zone
   coarse eqp file keeps its per-k blocks, a star-asymmetric one refuses, and
   a wedge file reads bit for bit as before.
+- **Bands gated.** The BSE reader gates the bands that both the file and the
+  deck's spectrum carry; htransform gates every band of the file, before its
+  band window is cut. A multiplet that the file's top band cuts (visible on
+  the BSE path, whose spectrum has more bands) is reported, not gated.
 - **Newly accepted:** a full-zone file on a reduced WFN, which used to
   refuse on its block count.
-- **Newly refused:** a file with at least N_k blocks in which some full-BZ k
-  matches no block or two; on a full-zone WFN such a file used to be applied
-  by position.
+- **Newly refused:** a full-zone-sized file in which some full-BZ k matches
+  no block or two; on a full-zone WFN such a file used to be applied by
+  position. A file with more blocks than the full BZ refuses by name
+  (`GATE eqp_full_zone_count`; e.g. Si 8³'s 512-block file on a Si 4³ deck),
+  as it refused before on its block count.
 - **Decks.** No change. The 1 meV tolerance is a constant
   (`EQP_STAR_SPREAD_TOL_EV`), not a key.
-- **Tests.** `tests/test_eqp_fullzone_cpu.py` (wedge file bit for bit,
-  symmetric full-zone file equal to the unfold, per-k blocks with the
-  pre-fix unfold as control variant, asymmetric and off-grid refusals).
+- **Tests.** `tests/test_eqp_fullzone_cpu.py`: wedge file bit for bit;
+  symmetric full-zone file equal to the unfold; per-k blocks, with the
+  pre-fix unfold as control variant, in both readers; asymmetric refusal in
+  both readers; off-grid, duplicate-block and superset refusals; a gauge
+  split inside a multiplet that passes and is applied per band; a
+  multiplet cut by the file's top band, reported and not gated.
 
 ## 2026-10-20 — metal head: thermal near-degenerate pairs leave the static interband head
 

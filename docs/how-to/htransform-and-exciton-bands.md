@@ -227,8 +227,9 @@ Two routes put GW energies on the path. They are mutually exclusive.
   the symmetry service, or by a full-zone eqp file, where every k takes its
   own block (matched by coordinate mod G). Off-diagonal QP mixing is not
   represented. A wedge file's k-block coordinates must be the deck's wedge,
-  in order. QP shifts that differ across a symmetry star by more than 1 meV
-  refuse (`GATE eqp_star_spread`).
+  in order. QP shifts whose DFT-multiplet means differ across a symmetry star
+  by more than 1 meV refuse (`GATE eqp_star_spread`), over every band of the
+  file.
 
 A WFN that is itself a QP wavefunction (`WFN_qp.h5`, via `--wfn-file`) is a
 third description of the same state; combining it with either flag refuses
