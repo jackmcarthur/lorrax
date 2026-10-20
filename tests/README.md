@@ -33,6 +33,9 @@ A new test needs no bootstrap import of its own.
 - `test_general_pencil_batch_cpu.py`: capacity-bounded concurrent reduced
   pencils, canonical raw-bit maps/spaces, collective errors and complex Σ
   equivalence (CPU; no microscopic host matrices).
+- `test_general_pencil_equilibration_cpu.py`: finite/infinity equation units,
+  severe coordinate scalings, original held-space recovery and coherent
+  complex-Sigma equivalence without stable-pole projection (CPU).
 - `test_full_micro_diagnostic_cpu.py`: native q0-only artifact publication,
   collective early refusal and independent microscopic Dyson probes (CPU).
 - `test_native_dielectric_diagnostic_cpu.py`: exact native dielectric/inverse

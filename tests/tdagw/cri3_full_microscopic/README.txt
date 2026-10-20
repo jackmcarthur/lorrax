@@ -102,3 +102,13 @@ and an explicit120s external cap. Example:
    --out <NEW_REPORT.JSON>
 This diagnostic assumes fresh E-SVD spaces. Production also rebalances the
 CURRENT projected E within held spaces; no branch silently reuses old phases.
+
+replay_frequency_equilibration.py performs ONE conditioning-only old-pencil
+experiment with ALL-ONE input unit vectors and the captured full energy span.
+Old captures lack authenticated infinity masks: it is NOT an exact replay of
+the producer's finite/infinity unit policy. Native/held W, column Sigma and
+Laplace admission remain separate requirements. Run from the repository root
+with an explicit120s CPU2 cap and a new output:
+ timeout 120s env OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 PYTHONPATH=src python \
+   tests/tdagw/cri3_full_microscopic/replay_frequency_equilibration.py \
+   <CAPTURE.NPZ> --out <NEW_REPORT.JSON>

@@ -700,11 +700,27 @@ are reported as diagnostics, not independent admission gates. The held-W
 and Laplace-growth gates remain enforced; neither is a proof of self-energy
 convergence or of accurate asymptotic moments in every port direction.
 `shared_pole_constructor.reduce_general_pencil` uses the two-sided SVD of
-the descriptor E for this strictly proper finite-pole bank, with relative
+the frequency-equilibrated descriptor E for this strictly proper finite-pole bank, with relative
 rank tolerance inherited from the source scalar bank tolerance. A-only
 directions unresolved in E are not promoted into nearly infinite modes.
 This is a numerical approximation checked against current response data,
 not a generic singular-descriptor equivalence or stable-pole projection.
+Before fresh-space selection, finite/infinity equation units are matched
+using the current full requested energy span (at least the electronic eta),
+not an adjustable stability scale. Infinity rows/columns have one inverse
+frequency factor; their actual tile-interleaved order supplies the masks.
+Eight deterministic simultaneous infinity-norm Ruiz sweeps equilibrate the
+combined E and A/reference magnitudes. Exact-zero rows/columns retain unit
+scale; no physical population, pole or residue floor enters. For positive
+diagonal left/right factors D_L,D_R the unreduced transfer is unchanged by
+E'=D_L E D_R, A'=D_L A D_R, B'=D_L B, C'=C D_R.
+The selected spaces are immediately mapped back as X=D_R X' and
+Y=D_L^H Y'. All returned/held spaces therefore use ORIGINAL pencil
+coordinates, and both fresh and held eigensolves project current original
+E/A. A changed reference never reinterprets a held space. Equilibration
+changes the numerical truncation metric, not exact untruncated physics;
+native/held W and full complex column-Sigma refinement remain necessary.
+Reference, unit masks and scale hashes are retained in diagnostic receipts.
 For BOTH fresh and held spaces, the current projected descriptor is again
 SVD-balanced into an ordinary non-Hermitian eigenproblem. Its left/right
 inverse-square-root transformations recover the original descriptor maps;
