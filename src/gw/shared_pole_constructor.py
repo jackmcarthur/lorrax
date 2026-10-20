@@ -34,60 +34,142 @@ def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     crosses this handoff. Distributed faces must not mix independent host
     SVD/eigenvector gauges, even on homogeneous hardware.
     """
+    from common.collectives import process_count
+    if int(process_count()) == 1:
+        return reduce_general_pencil(E, A, max_order=max_order, rank_tolerance=rank_tolerance,
+            max_workspace_bytes=max_workspace_bytes, fixed_spaces=fixed_spaces)
+    return collective_general_pencil_batch([(E,A)], max_order=max_order,
+        rank_tolerance=rank_tolerance, max_workspace_bytes=max_workspace_bytes,
+        fixed_spaces=[fixed_spaces])[0]
+
+
+def general_pencil_batch_plan(shapes, *, max_order, max_workspace_bytes=4*1024**3,
+                             processes=None, retained_host_bytes=0):
+    """Price a prefix of at most P SMALL reduced pencils before host gather.
+
+    Two disjoint phases are priced, not summed: one assigned LAPACK solve
+    per process beside the other input pencils; then all returned models,
+    one owner's original result and one bit-transfer buffer. The same
+    numerical order bound applies at every width; capacity never cuts poles.
+    ``retained_host_bytes`` accounts for the caller's existing held spaces.
+    """
+    from common.collectives import process_count
+    world=int(process_count()) if processes is None else int(processes)
+    if world<1 or int(max_order)<1 or int(retained_host_bytes)<0:
+        raise ValueError('GATE shared_general_capacity: invalid batch capacity metadata')
+    shapes=[tuple(map(int,s)) for s in shapes]
+    if not shapes or any(len(s)!=2 or min(s)<1 for s in shapes):
+        raise ValueError('GATE shared_general_capacity: nonempty reduced pencil shapes required')
+    accepted=None
+    for width in range(1,min(world,len(shapes))+1):
+        batch=shapes[:width]
+        inputs=[32*l*r for l,r in batch]
+        reduce=[16*(16*l*r+12*min(l,r)**2) for l,r in batch]
+        orders=[min(int(max_order),l,r) for l,r in batch]
+        models=[16*k*(1+2*l+2*r) for (l,r),k in zip(batch,orders)]
+        words=[16*max(l,r,1)*k for (l,r),k in zip(batch,orders)]
+        control=8192*(world+1+width)
+        reduction=int(retained_host_bytes)+sum(inputs)+max(x-y for x,y in zip(reduce,inputs))+control
+        handoff=int(retained_host_bytes)+sum(inputs)+sum(models)+max(models)+max(words)+control
+        price=max(reduction,handoff)
+        if price<=int(max_workspace_bytes):
+            accepted=dict(batch_size=width,processes=world,reduced_shapes=[list(s) for s in batch],
+                reduction_peak_bytes=reduction,handoff_peak_bytes=handoff,
+                host_workspace_bytes=price,host_workspace_bound_bytes=int(max_workspace_bytes),
+                retained_host_bytes=int(retained_host_bytes),
+                input_bytes=sum(inputs),model_bound_bytes=sum(models),
+                full_microscopic_host_payload=False)
+    if accepted is None:
+        raise ValueError('GATE shared_general_capacity: even one canonical reduced pencil exceeds host bound')
+    return accepted
+
+
+def _share_general_pencil(model, error, *, owner_rank, price, shape):
+    """Ordered canonical metadata/raw-bit handoff; no factorization or port gather."""
     import json
     import numpy as np
-    from common.collectives import all_gather_processes, process_count, process_rank
+    from common.collectives import all_gather_processes, process_rank
     from jax.experimental.multihost_utils import broadcast_one_to_all
-    world, rank = int(process_count()), int(process_rank())
-    options = dict(max_order=max_order, rank_tolerance=rank_tolerance,
-                   max_workspace_bytes=max_workspace_bytes, fixed_spaces=fixed_spaces)
-    if world == 1:
-        return reduce_general_pencil(E, A, **options)
-    model, status = None, None
-    if rank == 0:
-        try:
-            if not jax.config.x64_enabled:
-                raise ValueError("GATE shared_general_precision: canonical complex128 handoff requires JAX x64")
-            nl, nr = E.shape
-            # The existing reduction price covers returned maps/spaces and
-            # the later one-array-at-a-time bit broadcast. Add bounded host
-            # control records explicitly; never truncate order to fit RAM.
-            price = 16*(16*nl*nr+12*min(nl, nr)**2)+8192*(world+2)
-            if price > int(max_workspace_bytes):
-                raise ValueError(f"GATE shared_general_capacity: canonical host workspace {price} "
-                                 f"exceeds {int(max_workspace_bytes)} bytes")
-            model = reduce_general_pencil(E, A, **options)
-            arrays = [model[k] for k in ("poles_ry", "output_map", "input_map")]
-            arrays += [model["spaces"][k] for k in ("right", "left")]
-            status = dict(error=None, shapes=[list(a.shape) for a in arrays],
-                          receipt=dict(model["receipt"], canonical_owner_rank=0,
-                                       canonical_host_workspace_bytes=price))
-        except Exception as error:
-            status = dict(error=f"{type(error).__name__}: {str(error)[:1000]}")
-    payload = b'' if rank else json.dumps(status, separators=(',', ':')).encode('ascii')
+    rank=int(process_rank());started=time.perf_counter()
+    status=None;arrays=None
+    if rank==owner_rank:
+        if error is not None:
+            status=dict(error=f'{type(error).__name__}: {str(error)[:1000]}')
+        else:
+            arrays=[model[k] for k in ('poles_ry','output_map','input_map')]
+            arrays += [model['spaces'][k] for k in ('right','left')]
+            status=dict(error=None,shapes=[list(a.shape) for a in arrays],
+                receipt=dict(model['receipt'],canonical_owner_rank=owner_rank,
+                    canonical_host_workspace_bytes=price['host_workspace_bytes'],
+                    canonical_batch_size=price['batch_size'],reduced_pencil_shape=list(shape)))
+    payload=b'' if rank!=owner_rank else json.dumps(status,separators=(',',':')).encode('ascii')
     lengths = np.asarray(all_gather_processes(np.asarray(len(payload), np.int64))).reshape(-1)
-    count = int(lengths[0])
+    count = int(lengths[owner_rank])
     # Status is bounded metadata, never eigenvector payload in a control RPC.
     if not 0 < count <= 8192:
         raise ValueError("GATE shared_general_owner: invalid canonical status extent")
     record = np.zeros(count, np.uint8)
-    if rank == 0:
+    if rank == owner_rank:
         record[:] = np.frombuffer(payload, np.uint8)
-    status = json.loads(np.asarray(all_gather_processes(record))[0].tobytes())
+    status = json.loads(np.asarray(all_gather_processes(record))[owner_rank].tobytes())
     if status["error"] is not None:
         raise ValueError("GATE shared_general_owner: "+status["error"])
     result = []
     for i, shape in enumerate(status["shapes"]):
-        array = (np.ascontiguousarray(arrays[i], dtype=np.complex128) if rank == 0
+        array = (np.ascontiguousarray(arrays[i], dtype=np.complex128) if rank == owner_rank
                  else np.zeros(shape, np.complex128))
         # uint8 broadcast promotes under x64; uint64 preserves IEEE bits,
         # including tiny signs/complex phases and the zero-length model.
         bits = array.view(np.uint64)
         if bits.size:
-            bits = np.asarray(broadcast_one_to_all(bits, is_source=rank == 0))
+            bits = np.asarray(broadcast_one_to_all(bits, is_source=rank == owner_rank))
         result.append(np.ascontiguousarray(bits).view(np.complex128).reshape(shape))
+    wall=np.asarray(all_gather_processes(np.asarray(time.perf_counter()-started,np.float64))).reshape(-1)
+    status['receipt']['canonical_handoff_seconds']=float(wall[owner_rank])
     return dict(zip(("poles_ry", "output_map", "input_map"), result[:3]),
                 spaces=dict(right=result[3], left=result[4]), receipt=status["receipt"])
+
+
+def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
+                                   max_workspace_bytes=4*1024**3, fixed_spaces=None,
+                                   retained_host_bytes=0):
+    """Reduce at most P gathered frequency pencils concurrently, one owner each.
+
+    The DRIVER gathers this admitted SMALL prefix on ALL ranks before entry.
+    Each rank runs only its assigned pure-host LAPACK solve, BEFORE any
+    ordered per-parent handoff. Every model/space/pole is then canonicalized
+    from that parent's unique owner, with consistent all-rank failures.
+    No JAX gather or full-microscopic matrix enters a rank-only branch.
+    """
+    from common.collectives import process_count, process_rank
+    world,rank=int(process_count()),int(process_rank())
+    pencils=list(pencils)
+    plan=general_pencil_batch_plan([e.shape for e,a in pencils],max_order=max_order,
+        max_workspace_bytes=max_workspace_bytes,processes=world,retained_host_bytes=retained_host_bytes)
+    if len(pencils)>world or plan['batch_size']!=len(pencils):
+        raise ValueError('GATE shared_general_capacity: caller must gather only the metadata-admitted batch prefix')
+    fixed=[None]*len(pencils) if fixed_spaces is None else list(fixed_spaces)
+    if len(fixed)!=len(pencils):
+        raise ValueError('GATE shared_general_basis: one held space per batch parent required')
+    model=None;error=None
+    if rank<len(pencils):
+        try:
+            if world>1 and not jax.config.x64_enabled:
+                raise ValueError('GATE shared_general_precision: canonical complex128 handoff requires JAX x64')
+            e,a=pencils[rank]
+            model=reduce_general_pencil(e,a,max_order=max_order,rank_tolerance=rank_tolerance,
+                max_workspace_bytes=max_workspace_bytes,fixed_spaces=fixed[rank])
+        except Exception as exc:
+            error=exc
+    if world==1:
+        if error is not None:
+            raise error
+        return [model]
+    results=[]
+    for owner in range(len(pencils)):
+        results.append(_share_general_pencil(model if rank==owner else None,
+            error if rank==owner else None,owner_rank=owner,price=plan,shape=pencils[owner][0].shape))
+    return results
 
 
 def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
@@ -109,7 +191,7 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     """
     import numpy as np
     import scipy.linalg as la
-
+    started=time.perf_counter();svd_seconds=0.;eigen_started=None
     E, A = np.asarray(E, complex), np.asarray(A, complex)
     if (E.ndim != 2 or A.shape != E.shape or min(E.shape) < 1
             or not np.isfinite(E).all() or not np.isfinite(A).all()
@@ -128,8 +210,10 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
         return dict(poles_ry=np.empty(0, complex), output_map=np.zeros((nr, 0), complex),
                     input_map=np.zeros((nl, 0), complex),
                     spaces=dict(right=np.zeros((nr, 0), complex), left=np.zeros((nl, 0), complex)),
-                    receipt=dict(order=0, workspace_bytes=price, rank_tolerance=rank_tolerance))
+                    receipt=dict(order=0, workspace_bytes=price, rank_tolerance=rank_tolerance,
+                        svd_seconds=0.,eigen_seconds=0.,host_reduce_seconds=time.perf_counter()-started))
     if fixed_spaces is None:
+        svd_started=time.perf_counter()
         y, sy, _ = la.svd(np.concatenate((E, A), axis=1) / scale,
                          full_matrices=False, check_finite=False)
         _, sx, xh = la.svd(np.concatenate((E, A), axis=0) / scale,
@@ -139,11 +223,14 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
         if not n:
             raise ValueError("GATE shared_general_rank: nonzero response has no resolved frequency span")
         y, x = y[:, :n], xh[:n].conj().T
+        svd_seconds=time.perf_counter()-svd_started
     else:
         x, y = (np.asarray(fixed_spaces[key], complex) for key in ("right", "left"))
         n = x.shape[1]
-        if x.shape != (nr, n) or y.shape != (nl, n) or not n:
+        if (x.shape != (nr, n) or y.shape != (nl, n) or not n
+                or n>min(int(max_order),nl,nr)):
             raise ValueError("GATE shared_general_basis: fixed spaces differ from current pencil")
+    eigen_started=time.perf_counter()
     er, ar = y.conj().T @ E @ x, y.conj().T @ A @ x
     poles, wl, vr = la.eig(ar, er, left=True, right=True, check_finite=False)
     if not np.isfinite(poles).all():
@@ -175,6 +262,8 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                              eigen_residual=float(residual), metric_offdiagonal=float(np.linalg.norm(offdiag)),
                              modal_commutator_error=float(commutator_error),
                              max_growth_ry=float(np.max(poles.imag)),
+                             svd_seconds=svd_seconds,eigen_seconds=time.perf_counter()-eigen_started,
+                             host_reduce_seconds=time.perf_counter()-started,
                              construction="general-two-sided-tangential-loewner"))
 
 
