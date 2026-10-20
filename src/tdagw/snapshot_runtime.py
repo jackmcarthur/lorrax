@@ -644,7 +644,7 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     """Native full-microscopic collision adapter with full-density snapshots.
 
     The keyword bundle ``options`` owns numerical controls in eV:
-    ``spm_support_sites, spm_scratch, fit_tolerance, adiabatic_ev,
+    ``spm_support_sites, spm_chi0_active, spm_scratch, fit_tolerance, adiabatic_ev,
     eta_ev, snapshot_steps, snapshot_tol_ev,
     snapshot_mixing, snapshot_acceleration, screening, statistics, form, hermitian, policy, basis``.
     ``retarded_reference`` fits full-mu full-rho PR/WR with the native

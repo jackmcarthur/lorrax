@@ -33,6 +33,8 @@ A new test needs no bootstrap import of its own.
 - `test_general_pencil_batch_cpu.py`: capacity-bounded concurrent reduced
   pencils, canonical raw-bit maps/spaces, collective errors and complex Σ
   equivalence (CPU; no microscopic host matrices).
+- `test_tdagw_native_partition_options_cpu.py`: production joint/joint_frozen
+  forwarding of the numerical response partition, distinct from the physical window.
 - `test_general_pencil_equilibration_cpu.py`: finite/infinity equation units,
   severe coordinate scalings, original held-space recovery and coherent
   complex-Sigma equivalence without stable-pole projection (CPU).

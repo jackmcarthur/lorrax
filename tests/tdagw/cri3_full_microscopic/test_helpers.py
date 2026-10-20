@@ -60,7 +60,7 @@ def test_native_observer_captures_accepted_tables_and_refuses_bad_density(tmp_pa
 
 def test_prepared_native_decks_have_no_prototype_controls(tmp_path, monkeypatch, capsys):
     import prepare
-    from tdagw.td_config import read_td_deck
+    from tdagw.td_config import read_td_deck, inactive_keys
     source=tmp_path/'source.in'
     source.write_text('[cohsex]\nnumber_bands = 160\nsigma_w_model = shared_pole\n'
                       'sigma_regularization_ev = 0.1\n')
@@ -80,6 +80,8 @@ def test_prepared_native_decks_have_no_prototype_controls(tmp_path, monkeypatch,
         assert deck.values['lorrax.collision_hamiltonian']=='hf'
         assert deck.values['lorrax.collision']=='raw'
         assert deck.values['lorrax.collision_statistics']=='retarded_reference'
+        assert deck.values['lorrax.collision_spm_chi0_active']==[88,144]
+        assert 'lorrax.collision_spm_chi0_active' not in inactive_keys(deck)
 
 
 def test_plot_reader_crops_checkpoint_and_authenticates_native(tmp_path):
