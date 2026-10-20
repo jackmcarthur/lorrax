@@ -431,6 +431,7 @@ def run(args) -> None:
             mesh_xy=mesh_xy,
             use_nohead=args.nohead,
             input_file=args.input,
+            q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
         )
 
     nk = int(data["nkx"] * data["nky"] * data["nkz"])

@@ -115,6 +115,7 @@ def _preview_lanczos(
             eqp_file=eqp_file,
             qp_rotations_file=qp_rotations_file,
             velocity_file=dipole_file,
+            q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
         )
         qp_rotation = data.get("qp_rotation")
         grid_x, grid_y = mesh_xy.devices.shape

@@ -1630,6 +1630,15 @@ def _interpolate_bse_data_to_grid(
     # as before and the delta went through the interpolant — the documented
     # defect, kept only so the A/B has a shipped control.
     q0_head_ry = 0.0
+    if head_channel is None and data.get("q0_head_ry", 0.0):
+        # The loader defers W's head on a densifying run, so a nonzero coarse
+        # diagonal here was normalised on the COARSE N_k and would be dropped
+        # (or mis-scaled) on the fine bundle.
+        raise ValueError(
+            f"GATE densify_q0_head: coarse bundle carries q0_head_ry="
+            f"{data['q0_head_ry']!r} Ry but no head_channel; want 0.  why: "
+            f"the fine bundle would lose or mis-scale the Γ head.  fix: the "
+            f"loader must defer whead on a densifying run.")
     if head_channel is not None:
         from gw.head_densify import attach_head_channel
         from vcoul import CoulombGeometry
@@ -1647,18 +1656,21 @@ def _interpolate_bse_data_to_grid(
             # The model owns the head at every fine q ≠ 0; c1 keeps Γ.
             S_fine = np.where(np.arange(S_fine.size).reshape(S_fine.shape) == 0,
                               S_fine, 0.0)
-        # Γ leaves the tile: at fine q = 0 the pair densities are the exact
-        # overlaps δ_nn', so its head is the transition-diagonal constant
-        # S(0)/(Ω N_k,fine) (bse_head module docstring), not the ISDF rank-1.
+        # On a "diagonal" bundle Γ leaves the tile: at fine q = 0 the pair
+        # densities are the exact overlaps δ_nn', so its head is the
+        # transition-diagonal constant S(0)/(Ω N_k,fine) (bse_head module
+        # docstring).  A "rank1" bundle keeps it on the tile, as before.
         S_fine = np.array(S_fine, dtype=np.float64)
-        q0_head_ry = q0_head_diagonal(
-            S_fine.flat[0], head_channel["cell_volume"],
-            int(np.prod(fine_grid)))
-        S_fine.flat[0] = 0.0
+        if head_channel.get("q0_head", "rank1") == "diagonal":
+            q0_head_ry = q0_head_diagonal(
+                S_fine.flat[0], head_channel["cell_volume"],
+                int(np.prod(fine_grid)))
+            S_fine.flat[0] = 0.0
         W_q_fine = attach_head_channel(
             W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
             head_channel["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
-        log_fn(f"[bse_k_grid] fine Γ head as the exact-overlap diagonal "
+        log_fn(f"[bse_k_grid] fine Γ head: q0_head="
+               f"{head_channel.get('q0_head', 'rank1')}, diagonal "
                f"{q0_head_ry:.8e} Ry (fine q ≠ 0 heads on the W tile)")
         log_fn("[bse_k_grid] W Γ head re-attached AFTER densification (C1): "
                "the interpolant saw the body only, and the head is analytic "

@@ -165,6 +165,7 @@ def run_haydock(
         restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
         input_file=input_file, n_occ=n_occ, eqp_file=eqp_file,
         velocity_file=dipole_file,
+        q0_head="diagonal",           # operands via bse_head.head_shifted_eps_c
     )
     # Resolve n_occ for the downstream dipole slice — same source as the
     # loader used (WFN.h5 ifmax → largest-gap fallback).

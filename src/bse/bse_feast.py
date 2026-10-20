@@ -1601,6 +1601,7 @@ def run(args) -> None:
             n_cond=args.n_cond,
             mesh_xy=mesh_xy,
             input_file=args.input,
+            q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
         )
 
     use_tda = args.tda

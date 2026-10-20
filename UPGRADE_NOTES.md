@@ -5,31 +5,36 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
-## 2026-10-20 — BSE q=0 screened head uses the exact band overlaps
+## 2026-10-20 — BSE q=0 screened head uses the exact band overlaps (opt-in loader mode)
 
 At q = 0, G = 0 the direct-kernel pair densities are band overlaps,
 `<nk|n'k> = delta_nn'`, so the screened head is the transition-diagonal
-constant `whead/(Omega N_k)`. The loader used to put it on the W tile as the
-ISDF rank-1 `conj(g0) g0`, which evaluates the overlaps through the centroid
-fit and is not orthonormal. `bse_head._inject_q0_head` now keeps `whead` off
-W and returns `q0_head_ry`; every BSE operator takes it off its conduction
-diagonal (`bse_head.head_shifted_eps_c`): the TDA and non-TDA A block,
-Haydock, FEAST/KPM, the preconditioner diagonal and `exciton_bands` at every
-Q. The coupling block gets no head (`<ck|v'k> = 0`). The `bse_k_grid`
-densifier and `exciton_bands --w-coarse-grid` keep their per-fine-q heads at
-q ≠ 0 and move fine Γ to the same diagonal. `vhead` on the exchange tile is
-unchanged.
+constant `whead/(Omega N_k)`. The ISDF rank-1 `conj(g0) g0` on the W tile
+evaluates the overlaps through the centroid fit and is not orthonormal. The
+loader now has a mode, `q0_head`: `"rank1"` (default, unchanged: head on
+W_q) or `"diagonal"` (whead off W, `data["q0_head_ry"]` set). The BSE drivers
+(`bse_jax`, `absorption_haydock`, `exciton_bands`, `bse_feast`, `bse_kpm`)
+request `"diagonal"` and every operator takes the scalar off its conduction
+diagonal (`bse_head.head_shifted_eps_c`): TDA and non-TDA A block, Haydock,
+FEAST/KPM, the preconditioner diagonal, `exciton_bands` at every Q. The
+coupling block gets no head (`<ck|v'k> = 0`). On a diagonal bundle the
+`bse_k_grid` densifier and `exciton_bands --w-coarse-grid` keep their q ≠ 0
+heads and move fine Γ to the diagonal. `vhead` on the exchange tile is
+unchanged. TD-aGW, `bse_w_exact`, `w_ladder` and `w_omega_chain` load
+`"rank1"` and are bitwise unchanged.
 
-- **Results move.** Each exciton moves by `(whead/(Omega N_k)) (c_S - 1)`,
-  with `c_S` the ISDF head content of the state. MoS2 12x12, N_mu 1198: A/B
-  move up by about +4.3/+4.5 meV (c = 1.0076/1.0081; 0.14 % of the 3.108 eV
-  QP gap), which removes the BerkeleyGW–LORRAX rigid residual; the window
-  admits -8.1 to +14.0 meV. Si 8^3, N_mu 1100: -0.04 to +0.09 meV.
+- **Results move (BSE only).** Each exciton moves by
+  `(whead/(Omega N_k)) (c_S - 1)`, `c_S` the ISDF head content of the state.
+  MoS2 12x12, N_mu 1198: A/B up by about +4.3/+4.5 meV (c = 1.0076/1.0081;
+  0.14 % of the 3.108 eV QP gap), which removes the BerkeleyGW–LORRAX rigid
+  residual; the window admits -8.1 to +14.0 meV. Si 8^3, N_mu 1100: -0.04 to
+  +0.09 meV.
 - **Decks.** No change. `vhead`/`whead_0freq` overrides act as before.
-- **Code.** `_inject_q0_head` returns `(V_q0, W_q, q0_head_ry, log)` and takes
-  `nk=`. Bundles carry `data["q0_head_ry"]` (Ry); operator operands must go
-  through `head_shifted_eps_c`. `W_q[:,:,0,0,0]` no longer holds the
-  screened head.
+- **Code.** `_inject_q0_head(..., nk=, q0_head=)` returns
+  `(V_q0, W_q, q0_head_ry, log)`; bundles carry `q0_head` and `q0_head_ry`.
+  `head_shifted_eps_c` refuses a rank-1 bundle with a nonzero scalar and a
+  diagonal bundle without one. A new driver that requests `"diagonal"` must
+  build its operands through the helper and be added to the test's list.
 - **Test.** `tests/test_bse_q0_head_exact_overlap.py`.
 
 ## 2026-10-20 — BSE `--eqp`: a full-zone file is read per k; star-asymmetric QP shifts refuse

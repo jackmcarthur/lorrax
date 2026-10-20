@@ -1358,6 +1358,29 @@ def _gamma_only_grid(kgrid, value):
     return S
 
 
+def _gamma_head_to_diagonal(S_fine, data, head_ch, *, rtol=1e-10):
+    """Zero fine Γ in ``S_fine`` after checking it is the loader's diagonal.
+
+    ``--w-coarse-grid`` runs on a natively fine restart, so C1's Γ entry must
+    reproduce the whead the loader turned into ``data["q0_head_ry"]``
+    (``bse_head.q0_head_diagonal`` on the same fine N_k).  A mismatch means two
+    different Γ heads, one on the diagonal and one implied by ``S_fine``.
+    Returns a float64 copy with ``S[0, 0, 0] = 0``; q ≠ 0 entries untouched.
+    """
+    from .bse_head import q0_head_diagonal
+    S = np.array(S_fine, dtype=np.float64)
+    got = q0_head_diagonal(S.flat[0], head_ch["cell_volume"], S.size)
+    want = float(data["q0_head_ry"])
+    if not abs(got - want) <= rtol * max(abs(want), 1e-300):
+        raise ValueError(
+            f"GATE coarse_w_gamma_head: S_fine(Γ) gives {got:.12e} Ry on the "
+            f"diagonal, the loader {want:.12e} Ry; want equal (rtol {rtol}).  "
+            f"why: the fine Γ head would enter as two different values.  fix: "
+            f"--w-head-gamma-cell fine, and the same deck whead_0freq for both.")
+    S.flat[0] = 0.0
+    return S
+
+
 def _w_tile_gauge(wfn, centroids_path, keep_idx, n_rmu, restart_file, log):
     """``(r_mu, geometry)`` of the W tile, built once per ``--w-coarse-grid`` run.
 
@@ -1373,16 +1396,24 @@ def _w_tile_gauge(wfn, centroids_path, keep_idx, n_rmu, restart_file, log):
             CoulombGeometry.from_wfn(wfn))
 
 
-def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print):
+def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print,
+                           q0_head="diagonal"):
     """The ``whead`` the loader resolved for this NATIVE-grid restart.
 
     ``--w-coarse-grid`` decimates a natively fine W.  The loader keeps the
     screened Γ head off ``data["W_q"]`` (it is the exact diagonal
     ``data["q0_head_ry"]``), and this FINE-cell value scales C1's per-fine-q
-    heads at q ≠ 0 after densifying.  Returns
+    heads at q ≠ 0 after densifying.  Refuses a ``q0_head="rank1"`` bundle,
+    whose Γ head would be on the tile the decimation interpolates.  Returns
     ``None`` (with a reason logged) when there is no head to move, in which
     case the caller runs the plain densifier and nothing is lost.
     """
+    if q0_head != "diagonal":
+        raise ValueError(
+            f"GATE coarse_w_q0_head: --w-coarse-grid got a q0_head="
+            f"{q0_head!r} bundle; want 'diagonal'.  why: a rank-1 Γ head on "
+            f"W_q would go through the trig interpolant.  fix: load with "
+            f"q0_head='diagonal' (exciton_bands.main does).")
     try:
         from file_io.restart_bundle import read_metadata
         header = read_metadata(restart_file)
@@ -1570,6 +1601,7 @@ def main(argv=None):
         data = load_bse_data_from_restart_sharded(
             restart_file, n_val=args.n_val, n_cond=args.n_cond,
             mesh_xy=mesh_xy, input_file=args.input, inject_head=True,
+            q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
             # ``refit`` NEEDS the stored exchange tensor as much as ``ongrid``
             # does, and for a stricter reason: ongrid CONSUMES it, refit is
             # CERTIFIED AGAINST it — the tile null under --refit-window=zeta, the
@@ -2195,7 +2227,8 @@ def main(argv=None):
                     wfn, centroids_path, keep_idx, n_rmu, restart_file, log)
                 if w_head_mode == "c1":
                     head_ch = _resolve_native_w_head(
-                        restart_file, args.input, wfn, log=log)
+                        restart_file, args.input, wfn, log=log,
+                        q0_head=data["q0_head"])
                 # The loader no longer puts the screened Γ head on W_q (it is
                 # the exact diagonal ``data["q0_head_ry"]``), so the operand is
                 # already the head-free body and nothing is subtracted here.
@@ -2220,10 +2253,9 @@ def main(argv=None):
                         input_file=args.input, restart_file=restart_file,
                         geometry=geom, mesh=mesh_xy,
                         gamma_cell=args.w_head_gamma_cell, log_fn=log)
-                    # Γ stays the exact diagonal the loader resolved (this
-                    # S_fine's Γ entry reproduces that whead); q ≠ 0 go on W.
-                    S_fine = np.where(np.arange(np.size(S_fine)).reshape(
-                        np.shape(S_fine)) == 0, 0.0, S_fine)
+                    # Γ stays the exact diagonal the loader resolved (checked
+                    # against S_fine's Γ entry); q ≠ 0 go on W.
+                    S_fine = _gamma_head_to_diagonal(S_fine, data, head_ch)
                     W_dense = attach_head_channel(
                         W_dense, data["g0_X"], data["g0_Y"], S_fine,
                         head_ch["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)

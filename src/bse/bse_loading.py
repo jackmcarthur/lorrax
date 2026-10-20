@@ -127,6 +127,7 @@ def load_bse_data_from_restart_sharded(
     velocity_full_window: bool = False,
     velocity_pair_rule: str = "mask",
     velocity_pair_gap_ev: float = 0.05,
+    q0_head: str = "rank1",
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
 
@@ -299,7 +300,7 @@ def load_bse_data_from_restart_sharded(
             # as the single-device loader.
             V_q0, W_q, q0_head_ry, head_str = _inject_q0_head(
                 V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
-                w0_ready=w0_ready, nk=nkx * nky * nkz,
+                w0_ready=w0_ready, nk=nkx * nky * nkz, q0_head=q0_head,
                 defer_whead=defer_whead)
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
                   f"V_cell={cell_volume:.2f}): {head_str} "
@@ -310,6 +311,7 @@ def load_bse_data_from_restart_sharded(
                     "cell_volume": float(cell_volume),
                     "gamma_cell": w_head_gamma_cell,
                     "static_sample": built_head,
+                    "q0_head": q0_head,
                 }
         else:
             # G0_mu_nu is present and inject_head is True, but the head cannot
@@ -367,9 +369,11 @@ def load_bse_data_from_restart_sharded(
         "n_cond_pad": n_cond_pad,
         "fermi_energy": fermi_energy,
         "qp_rotation": qp_rotation,
-        # Exact q=0 screened head, Ry, on the transition diagonal
-        # (bse_head.q0_head_diagonal); operators read it through
-        # bse_head.head_shifted_eps_c.  The densifier replaces it.
+        # Where W's screened q=0 head lives (bse_head module docstring):
+        # "rank1" on the W tile (default), or "diagonal" as q0_head_ry (Ry),
+        # which operators read through bse_head.head_shifted_eps_c.  The
+        # densifier replaces q0_head_ry on a "diagonal" bundle.
+        "q0_head": q0_head,
         "q0_head_ry": q0_head_ry,
     }
 

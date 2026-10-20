@@ -28,11 +28,21 @@ a constant on the transition diagonal of the A block, and nothing in the
 coupling block (there the overlaps are <ck|v'k> = 0).  The ISDF fit
 ``sum_mu zeta_mu(G=0) psi*_n(r_mu) psi_n'(r_mu)`` is not exactly orthonormal
 (MoS2 12x12, N_mu 1198: content 1.008, a 4.3 meV rigid over-binding), so
-``whead`` no longer goes on the W tile as the rank-1 ``conj(g0) g0``.
-``_inject_q0_head`` returns the scalar ``q0_head_ry`` instead, the bundle
-carries it under that key, and every operator subtracts it from its
-conduction diagonal through :func:`head_shifted_eps_c`.  ``vhead`` on the
-exchange tile is unchanged.
+the exact form is a loader MODE, ``q0_head``:
+
+* ``"rank1"`` (the default): ``whead`` goes on the W tile as the ISDF
+  rank-1 ``conj(g0) g0``, exactly as before.  Every consumer that never
+  reads ``q0_head_ry`` (TD-aGW, the screening and ladder operators) gets
+  this and is unchanged.
+* ``"diagonal"``: ``whead`` stays off W, ``_inject_q0_head`` returns the
+  scalar ``q0_head_ry``, and the operator subtracts it from its conduction
+  diagonal through :func:`head_shifted_eps_c`.  Requested only by the BSE
+  operator drivers, every one of which builds its operands through that
+  helper.
+
+The bundle records the mode under ``data["q0_head"]``; the helper refuses a
+bundle whose mode and scalar disagree.  ``vhead`` on the exchange tile is
+the rank-1 in both modes.
 
 The provenance of the scalars is the module's other job.  ``vhead`` and
 ``whead_0freq`` are cross-code validation knobs — they pin the head to an
@@ -157,6 +167,16 @@ def _resolve_head_params(
     return vhead, whead, cell_volume, source
 
 
+Q0_HEAD_MODES = ("rank1", "diagonal")
+
+
+def _check_q0_head_mode(q0_head: str) -> str:
+    """Refuse an unknown ``q0_head`` mode by name."""
+    if q0_head not in Q0_HEAD_MODES:
+        raise ValueError(f"q0_head must be one of {Q0_HEAD_MODES}; got {q0_head!r}")
+    return q0_head
+
+
 def q0_head_diagonal(whead, cell_volume: float, nk: int) -> float:
     """The exact q=0 screened head as a transition-diagonal constant, in Ry.
 
@@ -187,13 +207,25 @@ def head_shifted_eps_c(eps_c, data):
     of the A block (and of the finite-Q pair ``eps_c(k+Q) - eps_v(k)``, whose
     q=0 direct term pairs ``<c k+Q|c' k+Q>`` with ``<v k|v' k>``).  The
     bundle's ``eps_c`` stays the QP/DFT energy; only operator operands are
-    shifted.  A bundle without ``q0_head_ry`` (head-less loads, synthetic
-    fixtures) returns ``eps_c`` itself.
+    shifted.
+
+    A ``"diagonal"`` bundle must carry ``q0_head_ry`` (KeyError otherwise).
+    A ``"rank1"`` bundle — the loader default, and any dict without
+    ``q0_head`` (synthetic fixtures) — returns ``eps_c`` itself, and refuses a
+    nonzero ``q0_head_ry``: its head is already on the W tile, and taking it
+    off the diagonal as well would count it twice.
 
     ``eps_c`` : (nk, n_c_pad) Ry, any sharding.  Returns the same shape.
     """
-    shift = float(data.get("q0_head_ry", 0.0) or 0.0)
-    return eps_c - shift if shift else eps_c
+    mode = _check_q0_head_mode(data.get("q0_head", "rank1"))
+    if mode == "diagonal":
+        return eps_c - float(data["q0_head_ry"])
+    if data.get("q0_head_ry", 0.0):
+        raise ValueError(
+            f"GATE q0_head_mode: bundle has q0_head='rank1' (head on the W "
+            f"tile) and q0_head_ry={data['q0_head_ry']!r}; want 0.  why: the "
+            f"head would enter twice.  fix: load with q0_head='diagonal'.")
+    return eps_c
 
 
 def _inject_q0_head(
@@ -207,9 +239,10 @@ def _inject_q0_head(
     *,
     w0_ready: bool,
     nk: int,
+    q0_head: str = "rank1",
     defer_whead: bool = False,
 ):
-    """Inject the rank-1 q=0 ``vhead``; resolve ``whead`` to its exact diagonal.
+    """Inject the rank-1 q=0 ``vhead`` and the screened head in mode ``q0_head``.
 
     One authoritative spelling of the head injection for both restart
     loaders: the sharded one (:func:`load_bse_data_from_restart_sharded`)
@@ -228,8 +261,10 @@ def _inject_q0_head(
         ``(n_μ, n_ν)`` q=0 exchange tile.  Sharded ``P("x", "y")`` on the
         sharded path, unsharded on the single-device one.
     W_q : jax.Array
-        ``(n_μ, n_ν, nkx, nky, nkz)`` screened tensor; returned unchanged.
-        The screened head no longer goes on it (module docstring).
+        ``(n_μ, n_ν, nkx, nky, nkz)`` screened tensor.  Under ``"rank1"``
+        the ``(0, 0, 0)`` k-slice takes the rank-1 ``whead`` (when
+        ``w0_ready`` and not deferred); under ``"diagonal"`` it is returned
+        unchanged.
     g0_mu, g0_nu : jax.Array
         ``ζ(0, μ, G=0)`` on the μ- and ν-axis respectively (the same vector
         twice; two copies so the rank-1 update is process-local when the
@@ -241,6 +276,8 @@ def _inject_q0_head(
         False gives ``q0_head_ry = 0`` and logs ``whead=skipped``.
     nk : int
         Number of k points of the loaded grid (:func:`q0_head_diagonal`).
+    q0_head : {"rank1", "diagonal"}
+        Where the screened head goes (module docstring).
     defer_whead : bool
         A coarse→fine densification is pending and will re-attach W's head
         itself, per fine q (C1, :mod:`gw.head_densify`).  The W tile must then
@@ -258,17 +295,23 @@ def _inject_q0_head(
     -------
     tuple
         ``(V_q0, W_q, q0_head_ry, log_fragment)``: ``q0_head_ry`` is
-        :func:`q0_head_diagonal` when ``w0_ready`` and not deferred, else 0;
+        :func:`q0_head_diagonal` under ``"diagonal"`` when ``w0_ready`` and
+        not deferred, else 0;
         the fragment is the ``"vhead=…, whead=…"`` half of each loader's own
         log line.
     """
     from gw.head_correction import apply_q0_head_rank1_sharded
 
+    diagonal = _check_q0_head_mode(q0_head) == "diagonal"
     apply_w = w0_ready and not defer_whead and whead is not None
-    V_q0, _ = apply_q0_head_rank1_sharded(
-        V_q0, None, g0_mu, g0_nu, vhead, None, cell_volume, omega_index=0)
+    V_q0, W_head = apply_q0_head_rank1_sharded(
+        V_q0, W_q if apply_w and not diagonal else None, g0_mu, g0_nu,
+        vhead, whead, cell_volume, omega_index=0)
+    if apply_w and not diagonal:
+        W_q = W_head
     q0_head_ry = (q0_head_diagonal(jnp.asarray(whead).reshape(-1)[0],
-                                   cell_volume, nk) if apply_w else 0.0)
+                                   cell_volume, nk)
+                  if apply_w and diagonal else 0.0)
     v_str = (f"vhead={complex(vhead).real:.6f}"
              if vhead is not None else "vhead=skipped")
     if whead is None or not w0_ready:
@@ -276,7 +319,9 @@ def _inject_q0_head(
     elif defer_whead:
         w_str = (f"whead[0]={complex(whead[0]).real:.6f} DEFERRED to the "
                  f"coarse→fine densifier (C1)")
-    else:
+    elif diagonal:
         w_str = (f"whead[0]={complex(whead[0]).real:.6f} as the exact-overlap "
                  f"diagonal {q0_head_ry * RYD_TO_EV * 1e3:.4f} meV")
+    else:
+        w_str = f"whead[0]={complex(whead[0]).real:.6f} (ISDF rank-1 on W)"
     return V_q0, W_q, q0_head_ry, f"{v_str}, {w_str}"
