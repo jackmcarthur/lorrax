@@ -210,7 +210,8 @@ def constructor_reduction():
     info["reduction"] = dict(reserved_gb=reserved["aggregate_bytes_per_rank"] / 1e9,
                              price_gb=actual / 1e9, room=str(r))
     program = face_parent_program(mesh, True, True, POLE_BUDGET, False, SIDE, None,
-                                  face_eigh(mesh, SIDE, room=r, backend="auto"), int(carrier))
+                                  face_eigh(mesh, SIDE, room=r, backend="auto"), int(carrier),
+                                  spe.plan_room(r))
     face = NamedSharding(mesh, P(None, "x", "y"))
     from gw.shared_pole_local import round_tables
     # The round's tables from the recipe's panel widths (4 fit samples x 2 orientations).

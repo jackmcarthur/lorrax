@@ -939,10 +939,10 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
         # A face round holds ``real`` physical parents in its leading slots;
         # the gate equations are per parent, so each is checked on its own
         # leading row (no data moves) and the replicated rows are stacked.
-        from gw.shared_pole_execution import face_check_bytes, face_eigh, face_round_check_program
+        from gw.shared_pole_execution import face_check_bytes, face_eigh, face_round_check_program, plan_room
         if eigh_plan.n not in (None, int(model[0].shape[-2])):
             raise ValueError('whole-mesh shared-pole checks need the n x n eigh plan')
-        program = lambda plan: face_round_check_program(mesh_xy, bool(ordered), plan)
+        program = lambda plan: face_round_check_program(mesh_xy, bool(ordered), plan, plan_room(plan))
         n, rows = int(model[0].shape[-2]), []
         for slot in range(int(real)):
             pick = partial(_leading_row, slot=slot)
