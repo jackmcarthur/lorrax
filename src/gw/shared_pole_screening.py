@@ -92,7 +92,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .centroid_k_unfold import authenticate_canonical_full_grid
     from .response_bank import (full_density_sample_rules, full_density_bare_moments,
                                  _coulomb_algebra, dense_layout, response_algebra,
-                                 operator_digest, response_blocks)
+                                 operator_digest, response_blocks, dielectric_physical_metrics,
+                                 dielectric_inverse_bounds)
     from .w_isdf import full_density_response_stream
     from .shared_pole_directions import _sample_point
     from .shared_pole_execution import face_matmul
@@ -562,10 +563,22 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                 if bad_growth and len(p):
                     suspect=p[int(np.argmax(p.imag))]
                     offset=max(eta,.001*abs(suspect))
-                    for z in (suspect+1j*offset,suspect+offset+1j*offset):
+                    probe_sites=[suspect+1j*offset,suspect+offset+1j*offset]
+                    if stop_after is not None:
+                        probe_sites.insert(0,suspect)
+                        # All native matrices/identities remain face-sharded
+                        # inside these scalar-returning diagnostic programs.
+                        basic_metrics=jax.jit(lambda e,m: dielectric_physical_metrics(e,m,matmul=mm),
+                            in_shardings=(face,rep),out_shardings=rep)
+                        inverse_metrics=jax.jit(lambda e,m,b: dielectric_physical_metrics(e,m,matmul=mm,inverse=b),
+                            in_shardings=(face,rep,face),out_shardings=rep)
+                    for probe_index,z in enumerate(probe_sites):
+                        probe_start=time.monotonic()
                         raw_probe=None
+                        row=dict(z_ry=[float(z.real),float(z.imag)],at_fitted_pole=z==suspect,
+                                 gamma_ry=gamma,additional_collision_eta_ry=0.)
                         if jax.process_index()==0:
-                            print_fn(f'General shared-pole W [{label}] direct microscopic Dyson probe '
+                            print_fn(f'General shared-pole W [{label}] direct microscopic dielectric/Dyson probe '
                                      f'q={iq} z_Ry={z}; basic artifact committed')
                             sys.stdout.flush()
                         try:
@@ -580,13 +593,56 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                                         pair_band_ranges=block['band_ranges'])
                                     part=stream(jnp.asarray(rule['times']),jnp.asarray(rule['weights']),left,pn,right,energy_d)[:,0]
                                     raw_probe=part if raw_probe is None else raw_probe+part
-                            exact=dyson.value(H[iq:iq+1],raw_probe)
-                            fitted=mm(l/put((z-p)[None,None]),r,transb='C')
-                            probes.append(dict(z_ry=[float(z.real),float(z.imag)],exact_w_norm=float(jnp.linalg.norm(exact)),
-                                fitted_w_norm=float(jnp.linalg.norm(fitted)),relative_w_defect=float(jnp.linalg.norm(fitted-exact)/
-                                    jnp.maximum(jnp.linalg.norm(exact),1e-300))))
+                            if stop_after is not None:
+                                # No inverse or fitted-pole division precedes
+                                # the durable exact dielectric norm witness.
+                                h=H[iq:iq+1]
+                                epsilon=dyson.dielectric_matrix(h,raw_probe)
+                                mask=np.asarray(meta.mu_basis.active_mask,bool)
+                                dimension=int(mask.sum())
+                                basic={k:float(v) for k,v in basic_metrics(epsilon,jnp.asarray(mask)).items()}
+                                basic.update(q=iq,z_ry=row['z_ry'],at_fitted_pole=z==suspect,
+                                    logical_dimension=dimension,packed_dimension=nmu,gamma_ry=gamma,
+                                    physical_mask_sha256=hashlib.sha256(mask.tobytes()).hexdigest(),
+                                    scalar_rule_tolerance=float(recipe['bank_rule_tolerance']),
+                                    prefactor=float(algebra['prefactor']),
+                                    epsilon_definition='I-prefactor*H*P_raw(z)*H',
+                                    additional_collision_eta_ry=0.,admitted=False,sigma_computed=False,
+                                    elapsed_seconds=time.monotonic()-probe_start)
+                                basic_path=root/f'q_{iq:03d}_dielectric_{probe_index:02d}_basic.json'
+                                def save_basic():
+                                    if basic_path.exists():raise FileExistsError(basic_path)
+                                    basic_path.write_text(_json(basic))
+                                rank0_transaction(basic_path,stage='shared_general.dielectric_basic',write=save_basic)
+                                row['dielectric_basic_file']=basic_path.name
+                                try:
+                                    eps,eps_inverse=dyson.dielectric(h,raw_probe)
+                                    metrics={k:float(v) for k,v in inverse_metrics(
+                                        eps,jnp.asarray(mask),eps_inverse).items()}
+                                    bounds=dielectric_inverse_bounds(metrics['epsilon_fro'],metrics['inverse_fro'],
+                                        metrics['inverse_residual_fro'],dimension,
+                                        padding_defect=max(metrics['padding_defect'],metrics['inverse_padding_defect']))
+                                    inverse_record=dict(basic,**metrics,inverse_bounds=bounds,
+                                        elapsed_seconds=time.monotonic()-probe_start)
+                                except Exception as error:
+                                    inverse_record=dict(basic,inverse_error=str(error),
+                                        elapsed_seconds=time.monotonic()-probe_start)
+                                inverse_path=root/f'q_{iq:03d}_dielectric_{probe_index:02d}_inverse.json'
+                                def save_inverse():
+                                    if inverse_path.exists():raise FileExistsError(inverse_path)
+                                    inverse_path.write_text(_json(inverse_record))
+                                rank0_transaction(inverse_path,stage='shared_general.dielectric_inverse',write=save_inverse)
+                                row['dielectric_inverse_file']=inverse_path.name
+                            if z!=suspect:
+                                exact=dyson.value(H[iq:iq+1],raw_probe)
+                                fitted=mm(l/put((z-p)[None,None]),r,transb='C')
+                                row.update(exact_w_norm=float(jnp.linalg.norm(exact)),
+                                    fitted_w_norm=float(jnp.linalg.norm(fitted)),relative_w_defect=float(jnp.linalg.norm(fitted-exact)/
+                                        jnp.maximum(jnp.linalg.norm(exact),1e-300)))
                         except Exception as error:
-                            probes.append(dict(z_ry=[float(z.real),float(z.imag)],error=str(error)))
+                            row['error']=str(error)
+                        row['elapsed_seconds']=time.monotonic()-probe_start
+                        probes.append(row)
                     probe_path=root/f'q_{iq:03d}_direct_probes.json'
                     def save_probes():
                         if probe_path.exists():

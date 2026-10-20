@@ -35,6 +35,9 @@ A new test needs no bootstrap import of its own.
   equivalence (CPU; no microscopic host matrices).
 - `test_full_micro_diagnostic_cpu.py`: native q0-only artifact publication,
   collective early refusal and independent microscopic Dyson probes (CPU).
+- `test_native_dielectric_diagnostic_cpu.py`: exact native dielectric/inverse
+  formula, nonnormal logical-block bounds, padding witnesses and large-W
+  background counterexamples; no fitted-pole admission (CPU).
 - `tdagw/test_collision_boundary_cpu.py`: global versus current-density
   empty/filled-subspace boundary diagnostics, with no state repair (CPU).
 - `tdagw/cri3_full_microscopic/`: archived full-native campaign preparation,

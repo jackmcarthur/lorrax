@@ -37,8 +37,17 @@ def test_native_q0_partial_capture_and_direct_dyson_before_refusal(tmp_path,monk
                                    arrays['left_column_norm']*arrays['right_column_norm'])
     if growth:
         probes=json.loads((path.parent/record['direct_dyson_probes_file']).read_text())['probes']
-        assert len(probes)==2
-        assert all('relative_w_defect' in p for p in probes)
+        assert len(probes)==3 and probes[0]['at_fitted_pole']
+        assert 'relative_w_defect' not in probes[0]
+        assert all('relative_w_defect' in p for p in probes[1:])
+        for p in probes:
+            basic=json.loads((path.parent/p['dielectric_basic_file']).read_text())
+            inverse=json.loads((path.parent/p['dielectric_inverse_file']).read_text())
+            assert basic['logical_dimension']==basic['packed_dimension']==4
+            assert basic['additional_collision_eta_ry']==0.
+            assert basic['epsilon_fro']>0 and not basic['admitted']
+            assert inverse['inverse_bounds']['resolved']
+            assert inverse['inverse_bounds']['sigma_min_lower']>0
         assert record['eta_margin_ry']<0
     else:
         assert max(record['sample_errors'])<.02
