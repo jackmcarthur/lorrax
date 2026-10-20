@@ -117,3 +117,15 @@ with an explicit120s CPU2 cap and a new output:
  timeout 120s env OPENBLAS_NUM_THREADS=2 OMP_NUM_THREADS=2 PYTHONPATH=src python \
    tests/tdagw/cri3_full_microscopic/replay_frequency_equilibration.py \
    <CAPTURE.NPZ> --out <NEW_REPORT.JSON>
+
+analyze_reference_cost.py reads existing production SC stage rows and literal
+Sigma quadrature JSON receipts, with no runtime/JAX/device initialization.
+Use --log <gwjax.out> --deck <sc.in> --output <NEW_REPORT.JSON>, optionally
+--source-code-prefix <REVISION> --source-file <ARTIFACT> --gpu-count 16.
+It reports map0 and every later changed-state map separately; later maps are
+not fixed-input warm-kernel benchmarks. Missing synchronization evidence is
+UNPROVEN, and stage wall is not device-only or an isolated FFT/node time.
+Explicit --active-step-seconds and --reservation-seconds keep assumed costs
+separate from summed map walls; they are not additive. Output publication is
+atomic/exclusive, hashes bind inputs, and reference-state/gauge association
+remains unchecked. Tiny test_analyze_reference_cost.py tests the parser only.
