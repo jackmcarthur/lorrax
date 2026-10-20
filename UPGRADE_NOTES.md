@@ -5,6 +5,47 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — metal head: thermal near-degenerate pairs leave the static interband head
+
+On a smeared metal, a pair split by less than the cell scale but off the
+tetrahedron Fermi surface (`w = 0`) kept its whole interband weight, which grows
+as `f'/Delta^2` at `z = 0`: on Fe 4^3 two pairs 1.9 eV below mu, split by
+0.19 meV, gave the static interband head `8 pi S_xx = -1.5e4` (z: -146).  The
+pair split (`gw.fermi_surface.intraband_pair_fraction`) now also moves pairs
+weighted by the smeared occupation difference; the moved share enters the
+intraband term with its tetrahedron weight, zero there.  S, the wings and the
+four-current head take the one rule; D and the atoms are unchanged.  Metals
+with such pairs move (Fe 4^3 static head isotropic, `-74`); insulators are
+bitwise unchanged.  Test: `tests/test_shared_pole_head_ordered_metal.py::test_d`.
+
+## 2026-10-20 — ordered metals under the full head; `GATE shared_pole_head_ordered` is gone
+
+An ordered (time-reversal-broken) metal with `head_correction = full` now folds its head
+instead of refusing (`GATE shared_pole_head_ordered` is deleted). The wings
+split each pair like S and D (`MetalPairSplit`): the interband wing keeps
+1 − φ and the intraband wing −pref·φ·w̄/z takes the rest, a trace over each
+degenerate multiplet. The former intraband wing used only the diagonal of each
+group, had the opposite sign, and was cancelled only by time reversal, so its
+value depended on the gauge inside the multiplet. The metal's shifted origin
+(z = i·`mpa_metal_origin_shift_ry`) is now the static Thomas–Fermi row: S, the wings and the
+shared-pole Γ body are evaluated at z = 0 there (`metal_static_rows`). The
+metal S kernel clips only the resonance; it no longer drops pairs with
+ΔE < 4.6 × 10⁻⁶ Ry at z = 0.
+
+- **Results.** Insulators are bitwise unchanged. Time-reversal-even SC metals
+  move from the second map on: hsuite `na_sc` map 1 moves occupied states by
+  −27.6 meV and empty states by +28.2 meV (semicore 0). The wing split alone or
+  the static row alone gives this result; reverting both reproduces the former
+  value bit for bit. The `na_sc` reference (`tests/hsuite/reference/na_sc.npz`)
+  is regenerated. Fe 4³, head full, with the thermal-pair rule above: static
+  interband head 8π q̂·S·q̂ = −74.64 / −73.98 / −73.98 (principal axes; −15060 /
+  −15060 / −146 before), W^c + ⟨v⟩ = 8.214 Ry bohr³ at the origin, rigid head
+  shift W^c/(2ΩN_k) = −1.935 eV, spread of states within 1 eV of μ 6.7 meV rms,
+  10.2 meV max.
+- **Decks.** No change. Metal decks that refused with
+  `GATE shared_pole_head_ordered` now run.
+- **Test.** `tests/test_shared_pole_head_ordered_metal.py`.
+
 ## 2026-10-20 — htransform nodal basis (replaces the randomized-QRCP Galerkin basis)
 
 The htransform basis (`isdf.galerkin`) is now nodal: the fitted states'

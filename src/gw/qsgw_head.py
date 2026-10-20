@@ -1591,7 +1591,7 @@ def assemble_delta_head_manifold(
     return _assemble_delta_kernel(mesh, int(nb_storage))(delta, tail)
 
 
-def _interband_weight(dE, f_diff, z, prefactor):
+def _interband_weight(dE, f_diff, z, prefactor, *, metal_split=False):
     r"""Adler-Wiser interband weight ``prefactor f_diff / (dE (z^2 - dE^2))``.
 
     Every pair reaching this weight is split by more than
@@ -1603,9 +1603,15 @@ def _interband_weight(dE, f_diff, z, prefactor):
     rotations inside the multiplet.  Here a 0/1 table that cuts a multiplet
     would give ``1 / (dE z^2)`` at roundoff ``dE``; the mask removes that.
     The clip guards the ``z ~ dE`` resonance of a split pair at real ``z``.
+    With ``metal_split`` the caller multiplies by ``1 - phi ~ dE^2/eps^2``,
+    which keeps the weight bounded as ``dE -> 0``
+    (docs/theory/metal-q0-head.md section 2), so only the resonance factor
+    is clipped: clipping ``dE (z^2 - dE^2)`` dropped, at ``z = 0``, every
+    pair split by less than ``1e-16^(1/3) = 4.6e-6`` Ry.
     """
     denom = dE * (z * z - dE * dE)
-    return jnp.where(jnp.abs(denom) > 1.0e-16, prefactor * f_diff / denom,
+    clip = jnp.abs(z * z - dE * dE) if metal_split else jnp.abs(denom)
+    return jnp.where(clip > 1.0e-16, prefactor * f_diff / denom,
                      jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
 
 
@@ -1624,9 +1630,10 @@ def _head_wing_interband_weight(
     pair, and a magnet keeps the odd-in-z term.  That term is taken only on
     pairs split by :data:`gw.degen_average.TOL_DEGENERACY_RY`, so a
     roundoff-split multiplet cannot amplify by ``1/dE`` what time reversal
-    cancels (the even part needs no such cut).  The finite-frequency
-    intraband surface term is not a ``D -> P`` substitution and remains the
-    separate positive ``pref_surface*surface_weight/z`` contribution.
+    cancels (the even part needs no such cut).  On a metal the kernel keeps
+    ``1 - phi`` of this weight and moves the Fermi-surface share ``phi`` to
+    the intraband wing, which is this weight's own ``dE -> 0`` limit
+    (:func:`_head_wing_kernel_face`).
     """
     denom = z * z - dE * dE
     split = jnp.abs(dE) >= TOL_DEGENERACY_RY
@@ -1667,13 +1674,14 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int,
             from gw.fermi_surface import intraband_pair_fraction
             d_x, d_y, w_x, w_y, moment = split
             keep = 1.0 - intraband_pair_fraction(
-                v_local, dE, d_x, d_y, w_x, w_y, moment, TOL_DEGENERACY_RY)
+                v_local, dE, d_x, d_y, w_x, w_y, moment, TOL_DEGENERACY_RY,
+                f_diff=f_diff)
 
         def _one(omega):
             z = omega + 1j * eta
             weight = jnp.where(
                 transition,
-                _interband_weight(dE, f_diff, z, prefactor),
+                _interband_weight(dE, f_diff, z, prefactor, metal_split=metal_split),
                 jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
             )
             if keep is not None:
@@ -1793,6 +1801,21 @@ def _head_wing_kernel_face(
     over X onto ``mu_X`` and summed over Y, ``Z`` the mirror.  The
     antiunitary term reads the transposed tile, so it also takes the bra
     with bands on Y and the ket with bands on X.
+
+    ``include_surface`` (a metal) adds two replicated operands, the diagonal
+    velocity ``(3, nk, nb_full)`` and the cell moment ``Q`` of the
+    :class:`MetalPairSplit` the S and D kernels use.  Each pair keeps
+    ``1 - phi`` of its Lehmann weight (``fermi_surface.intraband_pair_fraction``)
+    and the intraband wing takes the rest,
+    ``-pref_surface * phi * wbar / z`` on every pair (``phi = 1`` on the
+    diagonal and on exact multiplets, ``wbar = (w_n + w_m)/2``).  That is the
+    pair weight's ``|z| >> dE``, ``dE << k_B T`` limit, ``-(c/2)(f_diff/dE)/z``
+    with ``f_diff/dE -> w``, so for ``|z| >> dE`` a pair's wing does not depend
+    on ``phi``, and on a multiplet it is the trace ``sum_nm conj(v_nm) rho_nm``,
+    invariant under rotations inside it, as ``D`` is.  Time reversal cancels
+    the intraband wing over the zone; a magnet keeps it.  At ``z = 0`` the
+    term is absent: the static row's density wing is
+    :func:`static_head_wings_sharded` (docs/theory/metal-q0-head.md section 3).
     """
     key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface),
            int(mu_block), layout, int(classes), bool(anti))
@@ -1825,9 +1848,10 @@ def _head_wing_kernel_face(
         pref_inter,
         pref_surface,
         eta,
-        class_u=None,
-        class_a=None,
+        *extra,
     ):
+        diag, moment = extra[:2] if include_surface else (None, None)
+        class_u, class_a = extra[2 * include_surface:] if classes else (None, None)
         n_vertex, nk, nbx, nby = (int(n) for n in v_local.shape)
         n_class = max(int(classes), 1)
         x0 = jax.lax.axis_index(ax_x) * nbx
@@ -1865,9 +1889,15 @@ def _head_wing_kernel_face(
         # magnet's odd-in-z wing survives.
         transition = logical2d & (dE != 0.0)
         if include_surface:
+            from gw.fermi_surface import intraband_pair_fraction
             s_x = jax.lax.dynamic_slice_in_dim(surface_weight, x0, nbx, axis=1)
-            diagonal = logical2d & (ix[:, None] == iy[None, :])[None, :, :]
-            surface_pair = jnp.where(diagonal, s_x[:, :, None], 0.0)
+            s_y = jax.lax.dynamic_slice_in_dim(surface_weight, y0, nby, axis=1)
+            share = jnp.where(logical2d, intraband_pair_fraction(
+                v_local, dE, jax.lax.dynamic_slice_in_dim(diag, x0, nbx, axis=2),
+                jax.lax.dynamic_slice_in_dim(diag, y0, nby, axis=2),
+                s_x, s_y, moment, TOL_DEGENERACY_RY, f_diff=f_diff), 0.0)
+            keep = 1.0 - share
+            surface_pair = share * 0.5 * (s_x[:, :, None] + s_y[:, None, :])
         else:
             surface_pair = jnp.zeros_like(dE)
 
@@ -1898,7 +1928,7 @@ def _head_wing_kernel_face(
                     transition[None],
                 )
                 if include_surface:
-                    weight = weight + (
+                    weight = weight * keep[None] - (
                         pref_surface * inv_z_block[:, None, None, None]
                         * surface_pair[None])
                 return _carry, contract(weight)
@@ -2038,7 +2068,10 @@ def _head_wing_kernel_face(
             P(),
             P(),
             P(),
-        ) + ((P(None, None), P(None, None)) if classes else ()),
+        # Metal split: diag velocity (3, nk, nb_full) and Q (3, 3), replicated
+        # like the energies (N_b-class, 24 nk nb_full B; no mu axis).
+        ) + ((P(), P()) if include_surface else ())
+          + ((P(None, None), P(None, None)) if classes else ()),
         out_specs=((P(None, None, "x"), P(None, "y", None)) if not classes
                    else (P(None, None, None, "x"), P(None, None, "y", None))),
         check_vma=False,
@@ -2140,15 +2173,30 @@ def head_wings_sharded(
     surface_weight_kn=None,
     body_bra_wfns=None,
     body_ket_wfns=None,
+    pair_split: "MetalPairSplit | None" = None,
 ):
-    """Contract energy-scaled velocity jets with centroid vertices on canonical faces or parents."""
+    """Contract energy-scaled velocity jets with centroid vertices on canonical faces or parents.
+
+    A metal (``surface_weight_kn``) passes the :class:`MetalPairSplit` its
+    S and D kernels use; the wings split its pairs the same way
+    (:func:`_head_wing_kernel_face`).
+    """
     if getattr(wfns, "layout", None) not in ("face", "axis"):
         raise ValueError("head_wings_sharded requires a canonical face or axis layout")
+    if (surface_weight_kn is None) != (pair_split is None):
+        raise ValueError(
+            "head_wings_sharded: a metallic wing takes both the Fermi-surface "
+            "table and the metal pair split of its S and D kernels "
+            "(metal_intraband_model), an insulating wing neither")
+    split = None if pair_split is None else (
+        np.asarray(pair_split.diag_host, dtype=np.float64),
+        np.asarray(pair_split.moment, dtype=np.float64))
     return _head_wings_sharded_face(
         velocity_cart, wfns, energies_kn_ry, occupations_kn, omegas_ry,
         mesh=mesh, nb_logical=nb_logical, nk_tot=nk_tot, nspin=nspin,
         nspinor=nspinor, eta_ry=eta_ry, surface_weight_kn=surface_weight_kn,
-        body_bra_wfns=body_bra_wfns, body_ket_wfns=body_ket_wfns)
+        body_bra_wfns=body_bra_wfns, body_ket_wfns=body_ket_wfns,
+        metal_split=split)
 
 
 def _head_wings_sharded_face(
@@ -2167,6 +2215,7 @@ def _head_wings_sharded_face(
     surface_weight_kn=None,
     body_bra_wfns=None,
     body_ket_wfns=None,
+    metal_split=None,
     _classes=None,
 ):
     """Contract the face wings, or on parents-only storage the parents' own.
@@ -2207,7 +2256,9 @@ def _head_wings_sharded_face(
             jnp.take(v_all, r, axis=1), parents, take(energies_kn_ry),
             take(occupations_kn), omegas_ry, mesh=mesh, nb_logical=nb_logical,
             nk_tot=nk_tot, nspin=nspin, nspinor=nspinor, eta_ry=eta_ry,
-            surface_weight_kn=take(surface_weight_kn), _classes=classes)
+            surface_weight_kn=take(surface_weight_kn), _classes=classes,
+            metal_split=None if metal_split is None else (
+                metal_split[0][:, np.asarray(classes.parent_rows)], metal_split[1]))
         mix = np.asarray(carrier.plan.sym.cartesian_action(
             classes.ops, axial=False, time_odd=True), dtype=np.float64)
         return _wing_transport(mesh)(
@@ -2294,6 +2345,18 @@ def _head_wings_sharded_face(
             f"surface_weight_kn shape {surface.shape} does not match {e.shape}.")
     v, e, f, surface = _pad_head_band_manifold_to(
         v, e, f, surface, mesh=mesh, width=nb_full)
+    split_args = ()
+    if include_surface:
+        if int(v.shape[0]) != 3:
+            raise ValueError(
+                "the metallic wing splits pairs on the width-3 Cartesian "
+                f"velocity; got a width-{int(v.shape[0])} vertex")
+        diag = np.zeros((3, int(v.shape[1]), nb_full), dtype=np.float64)
+        width = min(nb_full, int(metal_split[0].shape[-1]))
+        diag[:, :, :width] = metal_split[0][:, :, :width]
+        replicated = NamedSharding(mesh, P())
+        split_args = (device_put_process_local(diag, replicated),
+                      device_put_process_local(metal_split[1], replicated))
     spin_denominator = (
         float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
     pref_inter = 4.0 / (float(nk_tot) * spin_denominator)
@@ -2321,6 +2384,7 @@ def _head_wings_sharded_face(
             jnp.asarray(pref_inter, dtype=jnp.complex128),
             jnp.asarray(pref_surface, dtype=jnp.complex128),
             jnp.asarray(float(eta_ry), dtype=jnp.float64),
+            *split_args,
             *class_args,
         )
 
@@ -3415,14 +3479,14 @@ def finalize_iteration_head_rows(response, terms, *, wfn, meta, config):
 
     Row ``i`` equals ``finalize_iteration_head_sample`` of its frequency bit
     for bit; the rows share one mini-BZ draw (``head_samples_from_s``).  The
-    rows of one call share their fold policy; only a zero-frequency row reads
-    its static kappa^2.
+    rows of one call share their fold policy; only the static row
+    (:func:`metal_static_rows`) reads its static kappa^2.
     """
     if not terms:
         return ()
     if len({(t["response_kind"], t["source_prefix"]) for t in terms}) != 1:
         raise ValueError("head rows of one call must share their fold policy")
-    static = [t["static_kappa2"] for t in terms if abs(t["omega"]) <= 1.0e-14]
+    static = [t["static_kappa2"] for t in terms if t["static_row"]]
     return head_samples_from_s(
         np.stack([np.asarray(t["S_effective"], dtype=np.complex128) for t in terms]),
         tuple(t["omega"] for t in terms),
@@ -3493,11 +3557,14 @@ def iteration_head_sample_terms(
         )
     intraband = _metal_intraband(response)
     static_kappa2 = None if intraband is not None else response.static_kappa2_bohr2
-    if use_fold and abs(response.omegas[index]) <= 1.0e-14:
+    static_row = bool(_static_rows(
+        (response.omegas[index],), config, metal=intraband is not None)[0])
+    if use_fold and static_row:
         static_kappa2 = _fold_static_kappa2(
             response, W_body_gamma, float(meta.cell_volume), mesh)
     return dict(
         omega=complex(response.omegas[index]),
+        static_row=static_row,
         S_effective=np.asarray(S_effective, dtype=np.complex128),
         static_kappa2=static_kappa2,
         response_kind=("full_local_fields" if use_fold
@@ -3608,13 +3675,12 @@ def finalize_iteration_head_samples(
         jax.block_until_ready(S_effective)
     intraband = _metal_intraband(response)
     static_kappa2 = response.static_kappa2_bohr2
-    if use_fold and static_kappa2 is not None and any(
-            abs(z) <= 1.0e-14 for z in response.omegas):
-        static_indices = [
-            i for i, z in enumerate(response.omegas) if abs(z) <= 1.0e-14]
-        if len(static_indices) != 1:
+    static_indices = np.flatnonzero(_static_rows(
+        response.omegas, config, metal=intraband is not None))
+    if use_fold and static_kappa2 is not None and static_indices.size:
+        if static_indices.size != 1:
             raise ValueError(
-                "static metallic head requires exactly one z=0 response")
+                "static metallic head requires exactly one static response row")
         static_kappa2 = _fold_static_kappa2(
             response, W_gamma[static_indices[0]], float(meta.cell_volume), mesh)
     elif intraband is not None:
@@ -3683,7 +3749,9 @@ def head_samples_from_s(
     at ``z = 0`` and Drude for ``|z| >> q u``
     (``docs/theory/metal-q0-head.md``).  ``static_kappa2_bohr2`` names the
     one exact-zero row whose Thomas-Fermi term is the full head's folded
-    kappa^2; on a metal that row keeps its interband ``S(0)``.
+    kappa^2; on a metal that row keeps its interband ``S(0)``.  A metal's
+    static row (:func:`metal_static_rows`) was built at ``z = 0``, so its
+    ``S`` carries no ``D / z^2``.
     """
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
@@ -3721,12 +3789,12 @@ def head_samples_from_s(
         if override is not None:
             rows.append(("override", z, override, None, False))
             continue
-        is_static_metal = (
-            static_kappa2_bohr2 is not None and abs(z) <= 1.0e-14)
+        static_row = bool(_static_rows((z,), config, metal=intraband is not None)[0])
+        is_static_metal = static_kappa2_bohr2 is not None and static_row
         extra_chi = None
         if intraband is not None and not is_static_metal:
             drude = np.asarray(intraband_drude, dtype=np.complex128)
-            if abs(z) > 1.0e-15:
+            if not static_row:
                 S = S - drude / (z * z)
             extra_chi = ("lindhard", z)
         elif is_static_metal and intraband is not None:
@@ -3778,26 +3846,69 @@ def head_samples_from_s(
     return tuple(out)
 
 
+def metal_static_rows(omegas, config) -> np.ndarray:
+    """Which plan nodes are a metallic head's static row, ``(n_omega,)`` bool.
+
+    The exact origin, and the metal plan's shifted origin ``z = i*shift``
+    (``gw.mpa.sampling.metal_origin_shift``, deck ``mpa_metal_origin_shift_ry``).
+    There ``|z| ~ 2e-5 Ry << q_cell u_F``: every Lindhard atom of the q = 0
+    cell is static to ``|z|/(q_cell u_F) ~ 4e-4``, so the row is the
+    ``z -> 0`` limit at fixed q (docs/theory/metal-q0-head.md section 3).  The
+    builders evaluate it at ``z = 0`` (:func:`metal_response_nodes`): the
+    interband ``S(0)`` and wings, no ``D/z^2``, no dynamic intraband wing; the
+    sample owners read it as Thomas-Fermi with the static fold.
+    """
+    from gw.mpa.sampling import metal_origin_shift
+    z = np.asarray(omegas, dtype=np.complex128).reshape(-1)
+    origin = 1j * metal_origin_shift(config.mpa.metal_origin_shift_ry, "Ry")
+    return (np.abs(z) <= 1.0e-14) | (np.abs(z - origin) <= 1.0e-14)
+
+
+def _static_rows(omegas, config, *, metal) -> np.ndarray:
+    """A head plan's static rows: ``z = 0``, and on a metal :func:`metal_static_rows`."""
+    if metal:
+        return metal_static_rows(omegas, config)
+    return np.abs(np.asarray(omegas, dtype=np.complex128).reshape(-1)) <= 1.0e-14
+
+
+def metal_response_nodes(omegas, config, *, metal):
+    """The z at which the head operands are evaluated for each plan node.
+
+    An insulator's nodes unchanged; a metal's static rows at ``z = 0``: the
+    head kernels here and the shared-pole Gamma body
+    (``shared_pole_head.build_shared_pole_head``), so the static fold is
+    real on an ordered store too.
+    """
+    if not metal:
+        return omegas
+    z = np.asarray(omegas, dtype=np.complex128).reshape(-1)
+    return np.where(metal_static_rows(z, config), 0.0 + 0.0j, z)
+
+
 def _metal_static_head(wfns, surface, occupation_state, omegas, *, mesh,
                        meta, config, nb_logical, nspin, nspinor):
-    """The exact z = 0 slot of a metallic head: Thomas-Fermi and its fold.
+    """The static row of a metallic head: Thomas-Fermi and its fold.
 
     ``kappa_TF^2 = 8 pi N(E_F) / Omega`` with ``N(E_F)`` from the same
     Fermi-surface table as the Drude term.  When the head carries wings
-    (``wfns`` given) and the plan has an exact static row, the static
-    density wings and the static Gamma body (``compute_chi0_matsubara`` at
-    ``n = 0``, whose tau factors carry ``-df/dE``) complete the fold.  Both
-    metallic head builders take this one owner.
+    (``wfns`` given) and the plan has a static row (:func:`metal_static_rows`),
+    the static density wings complete the fold with the row's own Gamma body.
+    An exact ``z = 0`` row also builds the static Gamma body
+    (``compute_chi0_matsubara`` at ``n = 0``, whose tau factors carry
+    ``-df/dE``), which the static screening role and the MPA producer's
+    static and shifted-origin Gamma rows consume (``gw.screening``,
+    ``gw.mpa.model``).  Both metallic head builders take this one owner.
     """
     capacity = 2.0 / (float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
     kappa2 = (8.0 * np.pi * capacity
               * float(np.sum(np.asarray(surface, dtype=np.float64)))
               / float(meta.nk_tot) / float(meta.cell_volume))
     static_Y_x = static_Z_y = static_chi_body_gamma = None
-    if wfns is not None and any(abs(complex(z)) <= 1.0e-14 for z in omegas):
+    if wfns is not None and metal_static_rows(omegas, config).any():
         static_Y_x, static_Z_y = static_head_wings_sharded(
             wfns, surface, mesh=mesh, nb_logical=int(nb_logical),
             nk_tot=int(meta.nk_tot), nspin=int(nspin), nspinor=int(nspinor))
+    if wfns is not None and any(abs(complex(z)) <= 1.0e-14 for z in omegas):
         from gw.w_isdf import compute_chi0_matsubara
         static_chi_body_gamma = compute_chi0_matsubara(
             wfns, meta, mesh, occupation_state=occupation_state,
@@ -4023,11 +4134,13 @@ def build_iteration_head_response(
         if eta_ry is None else float(eta_ry)
     )
     normalization_nspinor = int(meta.nspinor_wfnfile)
+    nodes = metal_response_nodes(
+        omegas_ry, config, metal=surface_weight_qp_kn is not None)
     S = head_s_tensor_sharded(
         v_qp,
         energies_qp_kn_ry,
         occupations_qp_kn,
-        omegas_ry,
+        nodes,
         mesh=mesh,
         nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume),
@@ -4046,7 +4159,7 @@ def build_iteration_head_response(
             wfns_qp,
             energies_qp_kn_ry,
             occupations_qp_kn,
-            omegas_ry,
+            nodes,
             mesh=mesh,
             nb_logical=nb_logical,
             nk_tot=int(meta.nk_tot),
@@ -4054,6 +4167,7 @@ def build_iteration_head_response(
             nspinor=normalization_nspinor,
             eta_ry=resolved_eta_ry,
             surface_weight_kn=surface_weight_qp_kn,
+            pair_split=pair_split,
         )
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
     static_Y_x = static_Z_y = static_chi_body_gamma = None
@@ -4453,10 +4567,6 @@ def build_dft_head_response(
     the mini-BZ cell stay the GW mesh's (``head_correction.scaled_head_fold``).
     """
     z = np.asarray(omegas_ry, dtype=np.complex128).reshape(-1)
-    parts_key = (bool(wings), any(abs(complex(v)) <= 1.0e-14 for v in z),
-                 None if occupation_state is None else
-                 (float(occupation_state.mu_ry), occupation_state.occ_hash))
-    parts = None if frozen_parts is None else frozen_parts.get(parts_key)
     if source is None:
         source = head_source(config, wfn=wfn, meta=meta, input_dir=input_dir)
     if source.dense and occupation_state is not None:
@@ -4468,6 +4578,12 @@ def build_dft_head_response(
             "  why:  the scaled fold holds S_d^-1 F fixed, but a metal's fold "
             "carries the Fermi-surface wing and its D/z^2 head has no k-fixed "
             "local-field fraction")
+    metal = occupation_state is not None
+    nodes = metal_response_nodes(z, config, metal=metal)
+    parts_key = (bool(wings), bool(_static_rows(z, config, metal=metal).any()),
+                 None if occupation_state is None else
+                 (float(occupation_state.mu_ry), occupation_state.occ_hash))
+    parts = None if frozen_parts is None else frozen_parts.get(parts_key)
     # The cell set's velocity (S_d,cell, the wings) is always the GW mesh's.
     dipole_path = (os.path.join(input_dir, "dipole.h5") if source.dense
                    else source.velocity_path)
@@ -4560,7 +4676,7 @@ def build_dft_head_response(
             sum_set=sum_set)
     surface_c = None if surface is None else on_carrier(surface)
     S = head_s_tensor_sharded(
-        velocity_cart, on_carrier(energies), on_carrier(occupations), z,
+        velocity_cart, on_carrier(energies), on_carrier(occupations), nodes,
         mesh=mesh, nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin), nspinor=normalization_nspinor,
@@ -4569,10 +4685,11 @@ def build_dft_head_response(
     Y_x = Z_y = None
     if wings:
         Y_x, Z_y = head_wings_sharded(
-            velocity_cart, wfns, on_carrier(energies), on_carrier(occupations), z,
+            velocity_cart, wfns, on_carrier(energies), on_carrier(occupations), nodes,
             mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-            eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface_c)
+            eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface_c,
+            pair_split=pair_split)
     fold_scale = None
     if sum_set is not None:
         # The sum set's direct head on the same kernel and nodes, normalized
@@ -4586,7 +4703,7 @@ def build_dft_head_response(
         S_cell = S
         S = head_s_tensor_sharded(
             v_sum, jnp.pad(jnp.asarray(e_sum), ((0, 0), (0, pad))),
-            jnp.pad(jnp.asarray(f_sum), ((0, 0), (0, pad))), z,
+            jnp.pad(jnp.asarray(f_sum), ((0, 0), (0, pad))), nodes,
             mesh=mesh, nb_logical=nb_sum,
             cell_volume=float(meta.cell_volume), nk_tot=int(source.nk_sum),
             nspin=int(wfn.nspin), nspinor=normalization_nspinor,

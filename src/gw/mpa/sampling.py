@@ -60,6 +60,19 @@ _VARPI_FAR = {"Ha": 1.0, "Ry": 2.0}
 # ``mpa_metal_origin_shift_ry`` (always Ry, because deck keys are).
 _METAL_ORIGIN_SHIFT = {"Ha": 1.0e-5, "Ry": 2.0e-5}
 
+
+
+def metal_origin_shift(origin_shift=None, energy_unit="Ha"):
+    """The metal near line's first height ``z_1^1 = i*shift``, in ``energy_unit``.
+
+    The one resolver of the default (:data:`_METAL_ORIGIN_SHIFT`) and the
+    override: :func:`double_parallel_grid` places the sample with it and
+    ``gw.qsgw_head.metal_static_rows`` recognizes it.
+    """
+    return (_METAL_ORIGIN_SHIFT[energy_unit] if origin_shift is None
+            else float(origin_shift))
+
+
 _MATERIAL_CLASSES = ("insulator", "metal")
 _ENERGY_UNITS = ("Ha", "Ry")
 PARTITION_SCHEDULES = ("nested", "leon")
@@ -339,8 +352,7 @@ def double_parallel_grid(
             "FALSE case: 0 < varpi_near < varpi_far -- the near line "
             "resolves structure, the far line carries the envelope.")
 
-    shift = (_METAL_ORIGIN_SHIFT[energy_unit] if origin_shift is None
-             else float(origin_shift))
+    shift = metal_origin_shift(origin_shift, energy_unit)
     if origin_shift is not None and material_class == "insulator":
         raise ValueError(
             f"GATE origin_shift_metal_only: origin_shift={origin_shift!r} "

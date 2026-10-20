@@ -160,7 +160,7 @@ def hall_projection(tensor):
 
 
 @lru_cache(maxsize=16)
-def _interband_program(mesh: Mesh, nb_logical: int):
+def _interband_program(mesh: Mesh, nb_logical: int, metal: bool = False):
     from jax.sharding import PartitionSpec as P
     from gw.degen_average import TOL_DEGENERACY_RY
     from gw.fermi_surface import intraband_pair_fraction
@@ -181,7 +181,8 @@ def _interband_program(mesh: Mesh, nb_logical: int):
         # first-order tensor, and its Fermi-surface share phi keeps only the
         # Hall (antisymmetric) part here; exact multiplets leave entirely.
         share = intraband_pair_fraction(v, delta, d_x, d_y, w_x, w_y, moment,
-                                        TOL_DEGENERACY_RY)
+                                        TOL_DEGENERACY_RY,
+                                        f_diff=occupation if metal else None)
         exact = jnp.abs(delta) < TOL_DEGENERACY_RY
         jet = offdiag & ~exact
         regular = jnp.where(jet, 1.0 - share, 0.0)
@@ -230,7 +231,7 @@ def _interband_program(mesh: Mesh, nb_logical: int):
 
 def direct_photon_interband_tensors(velocity_cart, energies_kn_ry,
                                     occupations_kn, frequencies_ry, *,
-                                    surface_kn, pair_split,
+                                    surface_kn, pair_split, metal: bool,
                                     mesh: Mesh, nb_logical: int,
                                     cell_volume: float, nk_tot: int,
                                     nspin: int, nspinor_wfn: int):
@@ -241,7 +242,10 @@ def direct_photon_interband_tensors(velocity_cart, energies_kn_ry,
     ``gw.qsgw_head.metal_pair_split``; ``surface_kn`` is the tetrahedron
     table): each pair enters with ``1 - phi`` and its Fermi-surface share
     ``phi`` only through :func:`hall_projection`; exact multiplets enter not
-    at all (their content is the Fermi-surface atoms').
+    at all (their content is the Fermi-surface atoms').  ``metal`` also splits
+    pairs weighted only by the smeared occupations, as the scalar metal head
+    does; an insulator's occupation differences are interband, so it passes
+    ``False`` and keeps the degeneracy rule.
     """
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e, f, w = (_host_or_device(a).asarray(a, dtype=np.float64)
@@ -262,7 +266,7 @@ def direct_photon_interband_tensors(velocity_cart, energies_kn_ry,
     d_x, d_y, moment = pair_split.operands(v)
     # Match the incumbent S_ab normalization for its charge-charge block.
     scale = 2.0 / (cell_volume * nk_tot * nspin * nspinor_wfn)
-    return _interband_program(mesh, int(nb_logical))(
+    return _interband_program(mesh, int(nb_logical), bool(metal))(
         v, e, e, f, f, z, jnp.asarray(scale, dtype=jnp.complex128),
         d_x, d_y, w, w, moment)
 
@@ -669,7 +673,7 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     # head's Ward contact needs (moments are frequency independent).
     value, slope, moments = direct_photon_interband_tensors(
         velocity_cart, e, f, np.append(z, 0.0j),
-        surface_kn=surface, pair_split=split,
+        surface_kn=surface, pair_split=split, metal=occupation_state is not None,
         mesh=mesh, nb_logical=nb, cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
         nspinor_wfn=int(meta.nspinor_wfnfile))
