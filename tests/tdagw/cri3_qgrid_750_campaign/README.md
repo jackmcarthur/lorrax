@@ -53,6 +53,17 @@ the original accepted fine Sigma as **NOT_MEASURED**. Band-operator differences
 alone are not a cutoff-convergence certificate. Neither helper weakens a
 scientific gate, clips populations/poles, or substitutes a projected W model.
 
+The actual source68 full64 fine-grid replay in allocation 60055335 refused
+the Gram gate before BSE, Sigma or TD, as did its q4 SC client. A subsequent
+audit found a deterministic file-bank ordering defect: requests used the
+original member order while consumption was dense-first, and sequential
+reads ignored the requested member row. The converged SC reference used the
+unaffected indexed device bank. Fix `d34629c` aligns the orders and witnesses
+row/q-span association; eight focused tests include a real tiny file-bank
+round-trip. Its material replay remains pending. The detailed witness is
+`evidence/STREAMED_BANK_ORDERING_DIAGNOSIS_60055335.json`. In particular, the
+earlier q4 refusal is not evidence that its cutoff alone caused the failure.
+
 `inputs/` preserves the corrected protected-form q8 deck (SHA `534a2c24…`)
 and a prepared q4 deck (SHA `1712d907…`) with a deliberately absent
 `seed_from_accepted_q8` path. The q4 seed can be staged only after the genuine
