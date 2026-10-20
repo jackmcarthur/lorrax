@@ -2375,8 +2375,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         params, override=distrib_la_batched_route)
     (wfn, sym, meta, _, basis, enk_sigma) = initialize_wfns(
         input_file, params, log_fn, mesh_xy=mesh_xy,
-        n_guard_bands=n_guard, centroid_subset_idx=keep_idx,
-        distrib_la_batched_route=_distrib_la_batched_route)
+        n_guard_bands=n_guard, centroid_subset_idx=keep_idx)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nk, nb_wide, rank = (int(ctilde.shape[0]), int(ctilde.shape[1]),
                          int(ctilde.shape[2]))
@@ -2459,9 +2458,9 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             f"forward:\n"
             f"  * set the deck's nval/ncond to the GW run's "
             f"({zx['nb']} bands total); --n-val/--n-cond still choose the BSE "
-            f"window inside it.  The guards also enter the whole-state QRCP "
-            f"fit, whose printed search/projection receipts decide whether "
-            f"that wider state set is represented;\n"
+            f"window inside it.  The guards also enter the nodal fit, whose "
+            f"printed [nodes] metric line says whether that wider state set "
+            f"is represented;\n"
             f"  * or ``--refit-window=bse``, which fits ζ' on the DECK's "
             f"window instead (the BSE window plus its guard bands) and "
             f"certifies on the CONTRACTED object — on-grid BSE eigenvalues, "
@@ -2531,7 +2530,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         # the canonical Pauli spinors even when the QP energies came from a
         # bispinor GW arm.  Its continuation must read the same spinor rows;
         # lifting this second source would change both the spin dimension and
-        # the fitted gauge underneath ``selection_factor``.
+        # the fitted nodal gauge underneath the refit.
         bispinor=False)
     r_chunk_ranges = tuple(
         (r0, min(r0 + int(r_chunk), n_rtot))
@@ -2850,9 +2849,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
             ctilde=rst["ctilde"], B_at_mu=rst["B_at_mu"],
             enk_sigma=rst["enk_sigma"], kgrid_co=rst["kgrid_co"],
             band_window_fi=(0, nb), mesh_xy=mesh_xy, q_list=qm_list,
-            return_coeffs=True,
-            distrib_la_batched_route=rst.get(
-                "distrib_la_batched_route", "batch_reshard"))
+            return_coeffs=True)
         psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
         c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
 

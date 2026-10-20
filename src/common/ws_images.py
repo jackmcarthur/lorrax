@@ -19,9 +19,10 @@ The one implementation for every position-indexed consumer:
 * :func:`pair_ws_embed` — elementwise application: the coarse ``X(R)``
   placed on a finer R lattice, whose FFT is the interpolant on that grid;
 * :func:`pair_ws_fourier` — the same interpolant at an explicit k list;
-* :func:`pair_ws_code_table` / :func:`pair_ws_code_fourier` — the same
-  interpolant from a compact per-element tie code and a per-k phase table,
-  for repeated k batches against one class-major tensor (no weight stack).
+* :func:`pair_ws_code_table` / :func:`pair_ws_code` /
+  :func:`pair_ws_code_fourier` — the same interpolant from a compact tie code
+  (one per class and distinct pair displacement) and a per-k phase table, for
+  repeated k batches against one class-major tensor (no weight stack).
 
 Conventions.  Positions are lattice (crystal) coordinates in the tensor's
 own gauge (the ISDF centroids sit at FFT index / N, in ``[0, 1)``); the
@@ -38,15 +39,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["WS_TIE_TOL_BOHR2", "lattice_bohr", "pair_ws_code_fourier",
-           "pair_ws_code_table", "pair_ws_embed", "pair_ws_fourier",
-           "pair_ws_images", "pair_ws_weights"]
+__all__ = ["WS_TIE_TOL_BOHR2", "lattice_bohr", "pair_ws_code",
+           "pair_ws_code_fourier", "pair_ws_code_table", "pair_ws_embed",
+           "pair_ws_fourier", "pair_ws_images", "pair_ws_weights"]
 
 #: Absolute tie tolerance on squared distances (bohr²), the one tolerance of
 #: every image selection.  Symmetry-related images agree to rounding
 #: (~1e-12 bohr² at |R| ~ 100 bohr); distinct lattice distances of a real
 #: cell differ by far more.
 WS_TIE_TOL_BOHR2 = 1.0e-6
+
+#: Pair displacements (lattice coordinates) that agree to ``2**-DISP_BITS``
+#: are one displacement in :func:`pair_ws_code_table`.  Grid positions (the
+#: ISDF centroids, FFT index / N) repeat a displacement exactly up to
+#: rounding, and distinct ones differ by at least ``1/N``.
+DISP_BITS = 19
 
 
 def lattice_bohr(wfn) -> np.ndarray:
@@ -168,19 +175,21 @@ def pair_ws_images(kgrid, lattice_bohr, pos_frac, sys_dim: int, *,
                 tol=WS_TIE_TOL_BOHR2, kgrid=tuple(int(x) for x in grid))
 
 
-def pair_ws_weights(pos, a_c, b_c, valid_c, tol, *, pin=None,
+def pair_ws_weights(pos, a_c, b_c, valid_c, tol, *, pos_b=None, pin=None,
                     dtype=jnp.float64):
-    """Weights ``(n, n, n_t)`` of ONE class's images for every pair.
+    """Weights ``(n, m, n_t)`` of ONE class's images for every pair.
 
-    ``|v_t + d|² = a_t + 2 d·b_t + |d|²`` with ``d = r_i − r_j``; the
-    ``|d|²`` term is common to every ``t``, so ``a_t + 2(s_i − s_j)``,
-    ``s = pos·b_t``, ranks the images and its differences are squared
-    distances.  The minimal ones within ``tol`` share ``1/N_deg``; the
-    transposed pair sees the negated numbers.  ``pin`` optionally constrains
-    the ``(n, n, n_t)`` layout inside a jit.
+    ``|v_t + d|² = a_t + 2 d·b_t + |d|²`` with ``d = r_i − r_j`` (``r_i``
+    from ``pos``, ``r_j`` from ``pos_b``, default ``pos``); the ``|d|²`` term
+    is common to every ``t``, so ``a_t + 2(s_i − s_j)``, ``s = pos·b_t``,
+    ranks the images and its differences are squared distances.  The minimal
+    ones within ``tol`` share ``1/N_deg``; the transposed pair sees the
+    negated numbers.  ``pin`` optionally constrains the ``(n, m, n_t)``
+    layout inside a jit.
     """
     s = jnp.asarray(pos) @ jnp.asarray(b_c).T                  # (n, n_t)
-    d2 = jnp.asarray(a_c)[None, None, :] + 2.0 * (s[:, None, :] - s[None, :, :])
+    s_b = s if pos_b is None else jnp.asarray(pos_b) @ jnp.asarray(b_c).T
+    d2 = jnp.asarray(a_c)[None, None, :] + 2.0 * (s[:, None, :] - s_b[None, :, :])
     if pin is not None:
         d2 = pin(d2)
     d2 = jnp.where(jnp.asarray(valid_c)[None, None, :], d2, jnp.inf)
@@ -270,15 +279,60 @@ def pair_ws_fourier(X_R, images: dict, k, *, pin=None):
     return acc
 
 
+def _pair_displacements(pos: np.ndarray):
+    """Distinct pair displacements: ``(disp (n_d, 3), pair (n, n) int32)``.
+
+    ``pair[i, j]`` indexes the displacement ``r_i − r_j`` in ``disp`` (the
+    first pair's own value; displacements equal to ``2**-DISP_BITS`` are
+    one).  Work and memory ``O(n²)`` integers, one sort.
+    """
+    n = int(pos.shape[0])
+    d = (pos[:, None, :] - pos[None, :, :]).reshape(n * n, 3)
+    q = np.rint(d * float(1 << DISP_BITS)).astype(np.int64)
+    q -= q.min(axis=0)
+    span = q.max(axis=0) + 1
+    if float(np.prod(span.astype(np.float64))) < 2.0 ** 62:
+        key = (q[:, 0] * span[1] + q[:, 1]) * span[2] + q[:, 2]
+        _, first, pair = np.unique(key, return_index=True, return_inverse=True)
+    else:
+        _, first, pair = np.unique(q, axis=0, return_index=True,
+                                   return_inverse=True)
+    return d[first], pair.reshape(n, n).astype(np.int32)
+
+
+@jax.jit
+def _class_ties(disp, a, b, valid, tol):
+    """Per class and displacement: the tie mask (int64 over the candidate
+    slots), its first slot and whether it is a single image, decided by
+    :func:`pair_ws_weights` against the origin; one class at a time."""
+    bits = jnp.left_shift(jnp.int64(1), jnp.arange(a.shape[1], dtype=jnp.int64))
+    origin = jnp.zeros((1, 3), disp.dtype)
+
+    def one(xs):
+        tie = pair_ws_weights(disp, xs[0], xs[1], xs[2], tol, pos_b=origin)[:, 0] > 0
+        return (jnp.sum(jnp.where(tie, bits, 0), axis=-1),
+                jnp.argmax(tie, axis=-1).astype(jnp.int32),
+                jnp.sum(tie, axis=-1) == 1)
+
+    return jax.lax.map(one, (a, b, valid))
+
+
 def pair_ws_code_table(images: dict) -> dict:
     """Compact form of :func:`pair_ws_weights` for every class and pair.
 
     Element ``(c, i, j)``'s tie set (its minimal images, weight ``1/N_deg``
-    each) is a bitmask over the class's candidate slots, decided by
-    :func:`pair_ws_weights` itself, so there is one rule.  Distinct masks over
-    all classes are interned as patterns.
+    each) depends on the pair only through its displacement
+    ``d = r_i − r_j``, so it is decided once per distinct displacement, by
+    :func:`pair_ws_weights` itself (``pos_b`` = the origin), so there is one
+    rule; it is a bitmask over the class's candidate slots.  Distinct masks
+    over all classes are interned as patterns, ascending.  Work
+    ``n_c·n_d·n_t`` for ``n_d`` distinct displacements (grid positions repeat
+    them: Si 1100 centroid nodes have 1.21e6 pairs), plus one ``O(n²)``
+    integer sort; the full ``(n_c, n, n)`` code is never formed here.
 
-    Returns a dict of host arrays: ``code`` (n_c, n, n) int16 pattern index,
+    Returns a dict of host arrays: ``class_code`` (n_c, n_d) int16 pattern
+    index of each class and displacement, ``pair`` (n, n) int32 the
+    displacement of each pair (:func:`pair_ws_code` expands any block),
     ``weights`` (n_pat, n_t) the ``1/N_deg`` weight of each slot in each
     pattern, ``img``/``valid`` from ``images`` and ``kgrid``.
     """
@@ -286,21 +340,45 @@ def pair_ws_code_table(images: dict) -> dict:
     if n_t > 62:
         raise ValueError(f"pair_ws_code_table: {n_t} candidate images per "
                          "class exceed the 62-bit tie mask")
-    pos = images["pos"]
+    disp, pair = _pair_displacements(np.asarray(images["pos"], np.float64))
     bits = np.left_shift(np.int64(1), np.arange(n_t, dtype=np.int64))
-    masks = np.stack([
-        (np.asarray(pair_ws_weights(pos, a_c, b_c, v_c, float(images["tol"])))
-         > 0).astype(np.int64) @ bits
-        for a_c, b_c, v_c in zip(images["a"], images["b"], images["valid"])])
-    patterns, code = np.unique(masks, return_inverse=True)
+    masks, first, single = (np.asarray(v) for v in _class_ties(
+        jnp.asarray(disp), jnp.asarray(images["a"]), jnp.asarray(images["b"]),
+        jnp.asarray(images["valid"]), float(images["tol"])))
+    # Patterns = the distinct masks, ascending (np.unique's order): the
+    # one-image masks present, by count, and the tie masks, by a sort of the
+    # (few) entries that tie.
+    present = np.bincount(first[single], minlength=n_t)[:n_t] > 0
+    patterns = np.union1d(bits[present], np.unique(masks[~single]))
     if patterns.size >= np.iinfo(np.int16).max:
         raise ValueError(f"pair_ws_code_table: {patterns.size} tie patterns "
                          "exceed the int16 code")
+    class_code = np.searchsorted(patterns, bits).astype(np.int16)[first]
+    class_code[~single] = np.searchsorted(patterns, masks[~single])
     member = (patterns[:, None] & bits[None, :]) != 0
     weights = member / member.sum(axis=1, keepdims=True)
-    return dict(code=code.reshape(masks.shape).astype(np.int16),
-                weights=weights, img=images["img"], valid=images["valid"],
+    return dict(class_code=class_code, pair=pair, weights=weights,
+                img=images["img"], valid=images["valid"],
                 kgrid=images["kgrid"])
+
+
+def pair_ws_code(table: dict, rows=None, cols=None) -> np.ndarray:
+    """Pattern index ``(n_c, m_r, m_c)`` int16 of the pairs ``rows x cols``.
+
+    ``rows``/``cols`` are site indices of :func:`pair_ws_code_table`'s
+    positions (default: every site); ``-1`` marks an exact-null pad row or
+    column, which takes pattern 0 (its tensor entries are zero).
+    """
+    n = int(table["pair"].shape[0])
+    r = np.arange(n) if rows is None else np.asarray(rows, dtype=np.int64)
+    c = np.arange(n) if cols is None else np.asarray(cols, dtype=np.int64)
+    out = np.take(table["class_code"],
+                  table["pair"][np.ix_(np.maximum(r, 0), np.maximum(c, 0))],
+                  axis=1)
+    pad = (r < 0)[:, None] | (c < 0)[None, :]
+    if pad.any():
+        out[:, pad] = 0
+    return out
 
 
 def pair_ws_code_fourier(X_R, table: dict, k, *, code=None, pin=None):
@@ -322,7 +400,7 @@ def pair_ws_code_fourier(X_R, table: dict, k, *, code=None, pin=None):
                    0.0)
     lut = jnp.einsum('qct,pt->cqp', ph,
                      jnp.asarray(table["weights"], dtype=jnp.float64))
-    code = jnp.asarray(table["code"]) if code is None else code
+    code = jnp.asarray(pair_ws_code(table)) if code is None else code
     if tuple(X_R.shape) != tuple(code.shape):
         raise ValueError(f"pair_ws_code_fourier: tensor {tuple(X_R.shape)} "
                          f"and code {tuple(code.shape)} disagree")

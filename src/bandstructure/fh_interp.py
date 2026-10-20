@@ -1,13 +1,13 @@
 """fH interpolation: band energies on an arbitrary k set from coarse-grid ψ.
 
 The coarse-grid nodal basis (``isdf.galerkin``: orthonormal coefficients
-``C̃_k`` on the orbit-closed ISDF centroid nodes) carries the band Hamiltonian
-of the fitted window as a node-pair kernel.  With the f-transform
+``C̃_k`` on an orbit-closed node set, :func:`htransform_nodes`) carries the
+band Hamiltonian of the fitted window as a node-pair kernel.  With the f-transform
 ``f(ε) = shift − a·ε^n``-type map of :func:`f_transform_eigs`, which
 compresses the window's spectrum into a band-limited kernel,
 
-    fH(R)   = Σ_k e^{−ik·R} C̃_k f(E_k) C̃_k†          (build_fH_R)
-    fH(k')  = Σ_R Σ_T w_ij e^{ik'·(R+LT)} fH(R)_ij     (node_fourier, per path k')
+    fH(R)   = N_k^{-1} Σ_k e^{+ik·R} C̃_k f(E_k) C̃_k†   (build_fH_R, ifftn)
+    fH(k')  = Σ_R Σ_T w_ij e^{−ik'·(R+LT)} fH(R)_ij    (node_fourier, per path k')
     E(k')   = f^{-1}(eig fH(k'))                       (newton_inv)
 
 ``w_ij`` are the per-node-pair Wigner–Seitz weights of ``common.ws_images``
@@ -21,6 +21,7 @@ This module reads one environment variable, ``LORRAX_EXTRA_RANK_PAD``, through
 :func:`resolve_extra_rank_pad` (test-only pad invariance, rule 2b).
 """
 import os
+import time
 from functools import partial
 
 import numpy as np
@@ -35,7 +36,6 @@ from common import timing
 from common.band_degeneracy import DEGENERACY_TOL_RY
 from common.units import RYD_TO_EV
 from file_io.restart_bundle import read_eqp_energies
-from gw.gw_config import resolve_distrib_la_batched_route
 from runtime.padding import spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (
@@ -55,7 +55,7 @@ from common.staged_reshard import concatenate_sharded_axis, face_to_batch_reshar
 # Q's free r axis is zero-padded through ``runtime.padding`` and split over
 # the full mesh product.  ``common.staged_reshard`` owns the exact
 # product-band → product-r exchange used to put streamed wavefunctions there.
-from common.ws_images import (pair_ws_code_fourier, pair_ws_code_table,
+from common.ws_images import (pair_ws_code, pair_ws_code_fourier, pair_ws_code_table,
                               pair_ws_images)
 from common.collectives import (
     device_put_process_local,
@@ -126,6 +126,57 @@ def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
         raise ValueError(f"htransform centroid subset: {exc}") from exc
 
 
+def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
+                     basis_path: str | None, log_fn=None):
+    """The node set of the nodal basis, ``(n, 3)`` FFT-grid indices.
+
+    ``N_node = min(N_mu, NODES_PER_FITTED_BAND x fitted bands)`` (owner rule:
+    the fit's cost must not grow with the ISDF bundle).  At ``N_mu`` the
+    nodes are the ISDF centroids; below it an orbit-closed, charge-density-
+    weighted k-means selection of the existing centroid machinery
+    (``centroid.kmeans_cli.orbit_kmeans_points``: ``--orbit``, rho-power 1,
+    fit window = the fitted bands on both legs), cached beside the basis
+    artifact as ``galerkin_nodes_<N>_<window>_<wfn>.txt`` and reused when the
+    WFN fingerprint and window match.  Every rank must enter.
+    """
+    from common.collectives import barrier, process_rank
+    from common.parallel_transport import wfn_fingerprint
+    from isdf.galerkin import NODES_PER_FITTED_BAND
+    log = log_fn if log_fn is not None else (lambda *a, **k: None)
+    centroids = np.asarray(centroid_indices, dtype=np.int64).reshape(-1, 3)
+    b0, b1 = (int(v) for v in band_range)
+    want = NODES_PER_FITTED_BAND * (b1 - b0)
+    if centroids.shape[0] <= want:
+        return centroids
+    tag = f"{want}_b{b0}-{b1}_{wfn_fingerprint(wfn)[:12]}"
+    cache = (os.path.join(os.path.dirname(os.path.abspath(basis_path)),
+                          f"galerkin_nodes_{tag}.txt")
+             if basis_path is not None else None)
+    if cache is not None and os.path.isfile(cache):
+        nodes = np.loadtxt(cache, dtype=np.int64, ndmin=2)
+        log(f"  [nodes] REUSED {cache}: {nodes.shape[0]} k-means nodes for "
+            f"{b1 - b0} fitted bands (N_mu {centroids.shape[0]})")
+        return nodes
+    from centroid.kmeans_cli import orbit_kmeans_points
+    t0 = time.perf_counter()
+    nodes = orbit_kmeans_points(wfn_path, want,
+                                fit_window=((b0, b1), (b0, b1)))
+    log(f"  [nodes] k-means: {nodes.shape[0]} orbit-closed nodes for "
+        f"{b1 - b0} fitted bands ({NODES_PER_FITTED_BAND} per band) instead "
+        f"of the {centroids.shape[0]} ISDF centroids, "
+        f"{time.perf_counter() - t0:.1f} s")
+    if cache is not None:
+        if process_rank() == 0:
+            staging = f"{cache}.partial.{os.getpid()}"
+            np.savetxt(staging, nodes, fmt="%d", header=(
+                f"htransform nodes: orbit-closed k-means (--orbit, rho-power "
+                f"1, fit window {b0}:{b1},{b0}:{b1}), requested {want}; FFT "
+                f"indices; WFN {wfn_fingerprint(wfn)}"))
+            os.replace(staging, cache)
+        barrier("htransform_nodes.cached")
+    return nodes
+
+
 def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              band_range: tuple[int, int],
                              log_fn=None,
@@ -133,30 +184,36 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                              bispinor: bool = False,
                              qr_eps: float = 1.0e-3,
                              basis_path: str | None = None,
-                             progress_fn=None, rank_record_fn=None,
-                             distrib_la_batched_route: str = "batch_reshard"):
-    """Resolve htransform policy around the reusable Galerkin fit service.
+                             rank_record_fn=None, *,
+                             wfn_path: str | None = None):
+    """Resolve htransform policy around the reusable nodal fit service.
 
-    ``basis_path`` is the one immutable basis artifact this deck owns (the
-    CLI passes ``galerkin_dft.h5`` beside the deck; nothing else is
-    searched).  If it exists and ``read_galerkin_basis`` finds the exact
-    provenance (WFN fingerprint, centroids, band window, grids, node
-    version), it is reused.  A file fitted for other inputs is left
-    untouched and the basis is refit in memory.  With no file the fit is
-    published there.  The log names which case applied.  ``None`` fits
-    without any artifact.
+    The nodes are :func:`htransform_nodes` (``wfn_path`` is the WFN file the
+    k-means reads when the bundle has more centroids than the default node
+    count; ``None`` keeps the centroids).  ``basis_path`` is the one
+    immutable basis artifact this deck owns (the CLI passes
+    ``galerkin_dft.h5`` beside the deck; nothing else is searched).  If it
+    exists and ``read_galerkin_basis`` finds the exact provenance (WFN
+    fingerprint, centroids, nodes, band window, grids, selection version), it
+    is reused.  A file fitted for other inputs is left untouched and the
+    basis is refit in memory.  With no file the fit is published there.  The
+    log names which case applied.  ``None`` fits without any artifact.
     """
     if log_fn is None:
         log_fn = lambda *args, **kwargs: None
     extra_rank_pad = resolve_extra_rank_pad()
+    nodes = (np.asarray(centroid_indices, dtype=np.int64).reshape(-1, 3)
+             if wfn_path is None else htransform_nodes(
+                 wfn, centroid_indices, band_range, wfn_path=wfn_path,
+                 basis_path=basis_path, log_fn=log_fn))
     publish = basis_path is not None and not os.path.lexists(basis_path)
     if basis_path is not None and not publish:
         try:
             basis = read_galerkin_basis(
                 os.fspath(basis_path), wfn=wfn, meta=meta,
-                centroid_indices=centroid_indices, band_range=band_range,
-                bispinor=bispinor, qrcp_eps=qr_eps, mesh_xy=mesh_xy,
-                extra_rank_pad=extra_rank_pad)
+                centroid_indices=centroid_indices, node_indices=nodes,
+                band_range=band_range, bispinor=bispinor, refit_rcond=qr_eps,
+                mesh_xy=mesh_xy, extra_rank_pad=extra_rank_pad)
         except GalerkinBasisMismatch as exc:
             log_fn(f"  [galerkin-basis] REFIT: {basis_path} was fitted for "
                    f"other inputs ({exc}); fitting in memory, the file is "
@@ -165,8 +222,8 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
             log_fn(
                 f"  [galerkin-basis] REUSED {basis_path}: physical rank "
                 f"{basis.rank_physical} in carried extent "
-                f"{basis.rank_carrier}, {len(basis.node_indices)} centroid "
-                f"nodes, metric eps {basis.metric_eps:.3e}")
+                f"{basis.rank_carrier}, {len(basis.node_indices)} nodes, "
+                f"metric eps {basis.metric_eps:.3e}")
             if rank_record_fn is not None:
                 rank_record_fn(galerkin_rank_record(basis, meta=meta))
             return basis
@@ -174,20 +231,19 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     # The centroid-face loader plans its own memory (the GW face path).
     basis = fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
+        node_indices=nodes,
         log_fn=log_fn,
         band_chunk_size=band_chunk_size,
         bispinor=bispinor,
-        qr_eps=qr_eps,
+        refit_rcond=qr_eps,
         extra_rank_pad=extra_rank_pad,
-        progress_fn=progress_fn,
         rank_record_fn=rank_record_fn,
-        distrib_la_batched_route=distrib_la_batched_route,
     )
     if publish:
         write_galerkin_basis(
             os.fspath(basis_path), basis, wfn=wfn, meta=meta,
             centroid_indices=centroid_indices, bispinor=bispinor,
-            qrcp_eps=qr_eps, mesh_xy=mesh_xy)
+            refit_rcond=qr_eps, mesh_xy=mesh_xy)
         log_fn(
             f"  [galerkin-basis] FITTED and published physical rank "
             f"{basis.rank_physical} to {basis_path}")
@@ -349,52 +405,158 @@ _NODE_TABLES: dict = {}
 
 
 def node_pair_table(B_at_mu, kgrid, mesh_xy: Mesh) -> dict:
-    """Per-node-pair Wigner–Seitz code table of the carried rank axis.
+    """Per-pair Wigner–Seitz code tables of the node-pair R tensors.
 
-    Built once per (k grid, node geometry) from ``common.ws_images`` on the
-    scalar nodes of ``B_at_mu`` (:class:`isdf.galerkin.NodalInterp`) and
-    tiled over the spin blocks of the ``(s, ν)`` rank axis; exact-null pad
-    rows take pattern 0 (their tensor rows are zero).  ``code`` is placed on
-    the face layout ``P(None, 'x', 'y')`` of every node-pair R tensor.
+    Built once per (k grid, node and target geometry) from
+    ``common.ws_images`` on the scalar nodes of ``B_at_mu``
+    (:class:`isdf.galerkin.NodalInterp`), one image table over the nodes and
+    the back-map targets together, and indexed per spin block of the
+    ``(s, nu)`` axes; exact-null pad rows take pattern 0 (their tensor rows
+    are zero).  ``code`` ``(n_c, rank, rank)`` (node x node: fH_R, operator
+    images) and ``target_code`` ``(n_c, t_carrier, rank)`` (target x node:
+    the back-map L_R; ``code`` itself when the targets are the nodes) are
+    placed on the face layout ``P(None, 'x', 'y')``, each rank building only
+    its own tile.  Admitted by ``lxkit.memory`` (one route: the face).
     """
-    frac = np.asarray(B_at_mu.node_frac, dtype=np.float64)
+    from lxkit import memory
+    from common.gpu_utils import shared_device_room
+    nodes = np.asarray(B_at_mu.node_frac, dtype=np.float64)
+    targets = (None if B_at_mu.targets_are_nodes else
+               np.asarray(B_at_mu.target_frac, dtype=np.float64))
     rank, ns = int(B_at_mu.shape[0]), int(B_at_mu.shape[1])
-    key = (id(mesh_xy), tuple(int(v) for v in kgrid), frac.tobytes(),
+    t_carrier = rank if targets is None else int(B_at_mu.target.shape[2])
+    key = (id(mesh_xy), tuple(int(v) for v in kgrid), nodes.tobytes(),
+           None if targets is None else targets.tobytes(),
            np.asarray(B_at_mu.lattice_bohr).tobytes(), int(B_at_mu.sys_dim),
-           rank, ns)
+           rank, ns, t_carrier)
     table = _NODE_TABLES.get(key)
     if table is not None:
         return table
+    n = nodes.shape[0]
+    n_c = int(np.prod([int(v) for v in kgrid]))
+    ranks = int(mesh_xy.size)
+    stage = f"htransform WS code tables ({n_c} x {t_carrier} x {rank})"
+    tiles = 2.0 * n_c * rank * (rank + (0 if targets is None else t_carrier))
+    room = shared_device_room(stage)
+    memory.admit(stage, (("face", memory.Price(
+        operands=memory.Term(0.0, tiles, "int16 code tiles (exact extents)"),
+        ranks=ranks, label=stage)),),
+        int(room) if isinstance(room, (int, np.integer)) else 0)
     scalar = pair_ws_code_table(pair_ws_images(
-        tuple(int(v) for v in kgrid), B_at_mu.lattice_bohr, frac,
+        tuple(int(v) for v in kgrid), B_at_mu.lattice_bohr,
+        nodes if targets is None else np.concatenate([nodes, targets]),
         int(B_at_mu.sys_dim)))
-    n = frac.shape[0]
-    code = np.zeros((scalar["code"].shape[0], rank, rank), dtype=np.int16)
-    code[:, :ns * n, :ns * n] = np.tile(scalar["code"], (1, ns, ns))
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+
+    def carried(extent, count, offset):
+        rows = np.arange(extent)          # (s, site) row -> site index
+        return np.where(rows < ns * count, offset + rows % count, -1)
+
+    node = carried(rank, n, 0)
+    code = jax.make_array_from_callback(
+        (n_c, rank, rank), face,
+        lambda index: pair_ws_code(scalar, node[index[1]], node[index[2]]))
+    target_code = code
+    if targets is not None:
+        target = carried(t_carrier, targets.shape[0], n)
+        target_code = jax.make_array_from_callback(
+            (n_c, t_carrier, rank), face,
+            lambda index: pair_ws_code(scalar, target[index[1]],
+                                       node[index[2]]))
     # The staged face→q exchange factory issues a collective, so it is built
     # here, synchronously on every rank and outside every jit.
-    table = dict(scalar, code=device_put_process_local(
-        code, NamedSharding(mesh_xy, P(None, 'x', 'y'))),
-        exchange=face_to_batch_reshard(mesh_xy))
+    table = dict(scalar, code=code, target_code=target_code,
+                 exchange=face_to_batch_reshard(mesh_xy))
     _NODE_TABLES[key] = table
     return table
 
 
-def node_fourier(batch_k, operator_R, code, table, mesh_xy: Mesh):
-    """The one node-pair R→k' sum (traceable), Hermitized, q-batch sharded.
+#: The two routes of a node-pair ``(rank, rank)`` stage, fastest first
+#: (memory model, route completeness): ``q-batched`` gives each rank WHOLE
+#: matrices for its own q rows after one face→q exchange; ``face`` takes one
+#: q at a time with every matrix tiled over the mesh, the mesh route beside it.
+NODE_ROUTES = ("q-batched", "face")
+
+
+def node_fourier(batch_k, operator_R, code, table, mesh_xy: Mesh, *,
+                 route: str = "q-batched"):
+    """The one node-pair R→k' sum (traceable), Hermitized.
 
     ``operator_R`` ``(nk, rank, rank)`` on ``P(None,'x','y')`` (class-major
     ``ifftn`` R order) and ``code`` (``table['code']``, passed as a traced
     argument so it is never a compile-time constant); the per-pair weights
     act elementwise through ``pair_ws_code_fourier``, which is local on the
-    matrix face; one staged face→q exchange follows.
+    matrix face.  ``route`` (:data:`NODE_ROUTES`): ``q-batched``, one staged
+    face→q exchange follows (whole matrices of the rank's q rows); ``face``,
+    the batch stays on ``P(None,'x','y')`` and the Hermitian transpose is a
+    face collective.
     """
     face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     pin = lambda x: jax.lax.with_sharding_constraint(x, face)
     mat = 0.5 * pair_ws_code_fourier(operator_R, table, batch_k, code=code,
                                      pin=pin)
+    if route == "face":
+        mat = pin(mat)
+        return pin(mat + jnp.swapaxes(mat, -1, -2).conj())
+    if route != "q-batched":
+        raise ValueError(f"node_fourier: route {route!r} not in {NODE_ROUTES}")
     mat = table["exchange"](pin(mat))
     return mat + jnp.swapaxes(mat, -1, -2).conj()
+
+
+def node_route_map(route: str, fn, *xs):
+    """``fn`` over a q batch (the leading axis of every ``xs``), traceable.
+
+    ``q-batched``: the whole batch at once.  ``face``: one q at a time
+    (``lax.map``), so one face tile per matrix is live; per-batch scalars
+    (top-block steps, residual) come back per q.
+    """
+    if route == "q-batched":
+        return fn(*xs)
+    first = lambda v: v[0] if getattr(v, "ndim", 0) else v
+    return lax.map(lambda x: jax.tree.map(first, fn(*(v[None] for v in x))),
+                   tuple(xs))
+
+
+def admit_node_route(stage: str, program, operands, *, rank: int,
+                     mesh_xy: Mesh, routes=NODE_ROUTES):
+    """THE route of one node-pair stage, admitted by ``lxkit.memory``.
+
+    ``program(route)`` builds the stage's jitted kernel on a route of
+    :data:`NODE_ROUTES`; each route is priced by that kernel compiled (never
+    run) at ``operands`` (``runtime.aot_memory.compiled_new_bytes``, the
+    largest any rank read), in the room beside what is live.  ``q-batched``
+    holds whole ``(rank, rank)`` matrices on a rank (``Price.whole``) and
+    ``face`` is its mesh route (route completeness, GATE nmu2_no_backup).
+    ``routes`` narrows the candidates (``("face",)``: the deck's ``linalg =
+    distributed``, no whole matrix on any rank).  Returns ``(route,
+    executable)``: the admitted route's compiled kernel, which the caller
+    runs, so a price costs no second compile.  Every process must enter.
+    """
+    from lxkit import memory
+    from common.gpu_utils import shared_device_room
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    ranks = int(mesh_xy.size)
+    built = {}
+
+    def priced(route):
+        def price():
+            ex = built[route] = program(route).lower(*operands).compile()
+            got = float(-agreed_chunk(-compiled_new_bytes(ex)))
+            src = f"{stage}, {route} kernel (compiled, never run)"
+            if route == "face":
+                return memory.Price(xla=memory.Term(0.0, got * ranks, src),
+                                    ranks=ranks, label=src)
+            return memory.Price(xla=memory.Term(got, 0.0, src), ranks=ranks,
+                                label=src, whole=int(rank))
+        return price
+
+    room = shared_device_room(stage)
+    room = int(room) if isinstance(room, (int, np.integer)) else 0
+    route = memory.admit(stage, tuple((r, priced(r)) for r in routes), room)
+    if route not in built:
+        built[route] = program(route).lower(*operands).compile()
+    return route, built[route]
 
 
 #: Top-block eigensolver of the interpolated fH(q).  fH(q) is numerically of
@@ -403,34 +565,55 @@ def node_fourier(batch_k, operator_R, code, table, mesh_xy: Mesh):
 #: states plus TOP_BLOCK_PAD columns, refined by subspace iteration on -fH.
 #: Measured, Si 4^3 window (0, 32) of 36 fitted bands, 1100 nodes: pad 16 / 32
 #: / 64 reach the tolerance in 9 / 7 / 7 iterations (312 nodes: 13 / 11 / 9).
+#: The converged window is every band the stage's consumer reads (fine-k: the
+#: returned window; path and moments: their states).  Bands near f -> 0
+#: converge last, at rate ~|lam_{b+1}| / |lam|: the 144-node toy of
+#: tests/test_nodal_htransform_cpu.py needs 11 for all 16 fitted bands, hence
+#: the cap of 16; the topmost guards, at f = 0 beside the null space, need
+#: not converge and are not read.  The loop stops at convergence.
 TOP_BLOCK_PAD = 32
 TOP_BLOCK_TOL = 1.0e-10
 TOP_BLOCK_POWER = 2
-TOP_BLOCK_MAX_ITER = 8
+TOP_BLOCK_MAX_ITER = 16
 _TOP_BLOCK_SEED = 20261020
 
 
-def coarse_start_block(ctilde, kgrid, q, n_pad: int = TOP_BLOCK_PAD):
+#: Window residual above which a top-block solve REFUSES (it logs between
+#: TOP_BLOCK_TOL and this): the eigenvalue error is ~ residual^2 |lam|/gap.
+TOP_BLOCK_REFUSE = 1.0e-6
+#: The relative residual of a Ritz pair is floored at this fraction of the
+#: block's largest |lam|, so the fitted states near the window top (f -> 0)
+#: are held to an absolute bound.
+TOP_BLOCK_FLOOR = 1.0e-2
+
+
+def start_columns(rank: int, nb: int, n_pad: int = TOP_BLOCK_PAD):
+    """The ``(rank, n_pad')`` fixed pseudo-random start columns of
+    :func:`coarse_start_block` (``n_pad' = min(n_pad, rank - nb)``), host;
+    a kernel takes them as an operand, never as a baked constant."""
+    n_pad = max(0, min(int(n_pad), int(rank) - int(nb)))
+    g = np.random.default_rng(_TOP_BLOCK_SEED).standard_normal(
+        (int(rank), n_pad, 2))
+    return (g[..., 0] + 1j * g[..., 1]) / np.sqrt(2.0 * int(rank))
+
+
+def coarse_start_block(ctilde, kgrid, q, columns=None):
     """Start block ``(bs, rank, nb + n_pad)`` of :func:`top_block_eigh`.
 
     The coefficients ``C_k`` (``ctilde`` ``(nk, nb, rank)``, C-order
     Gamma-centred ``kgrid``) of the coarse k nearest each ``q`` (``(bs, 3)``
-    fractional), then ``n_pad`` fixed pseudo-random columns (fewer when
-    ``nb + n_pad`` exceeds the rank).  Traceable.
+    fractional), then the ``(rank, n_pad)`` ``columns``
+    (:func:`start_columns`; built here when ``None``).  Traceable.
     """
     nk, nb, rank = (int(n) for n in ctilde.shape)
-    n_pad = max(0, min(int(n_pad), rank - nb))
     grid = np.asarray(kgrid, dtype=np.float64)
     near = jnp.round(q * grid)
     idx = jnp.mod(near, grid).astype(jnp.int32)
     flat = (idx[:, 0] * int(kgrid[1]) + idx[:, 1]) * int(kgrid[2]) + idx[:, 2]
     x0 = jnp.swapaxes(jnp.take(ctilde, flat, axis=0), 1, 2)
-    g = np.random.default_rng(_TOP_BLOCK_SEED).standard_normal(
-        (rank, int(n_pad), 2))
-    g = (g[..., 0] + 1j * g[..., 1]) / np.sqrt(2.0 * rank)
+    g = jnp.asarray(start_columns(rank, nb) if columns is None else columns)
     return jnp.concatenate(
-        [x0, jnp.broadcast_to(jnp.asarray(g), (q.shape[0], rank, int(n_pad)))],
-        axis=2)
+        [x0, jnp.broadcast_to(g, (q.shape[0],) + tuple(g.shape))], axis=2)
 
 
 def top_block_eigh(K, X0, window, *, tol: float = TOP_BLOCK_TOL,
@@ -440,9 +623,11 @@ def top_block_eigh(K, X0, window, *, tol: float = TOP_BLOCK_TOL,
 
     ``X0`` ``(..., n, b)`` (:func:`coarse_start_block`).  ``power`` steps
     ``X <- qr(-K X)``, then a Rayleigh-Ritz ``eigh`` of ``X^H (-K) X``
-    (``b x b``); while the relative residual ``||K v - lam v|| / |lam|`` of
-    the Ritz pairs in ``window = (lo, hi)`` (ascending order) exceeds ``tol``,
-    one more step, up to ``max_iter`` in all (the batch iterates together).
+    (``b x b``); while the relative residual ``||K v - lam v|| / |lam|``
+    (``|lam|`` floored at ``TOP_BLOCK_FLOOR`` of the block's largest) of the
+    Ritz pairs in ``window = (lo, hi)`` (ascending order; every pair a
+    consumer reads) exceeds ``tol``, one more step, up to ``max_iter`` in
+    all (the batch iterates together).
     Only matmuls on ``K`` and ``b x b`` eighs.  Returns ``(lam (..., b)``
     ascending, ``V (..., n, b)``, steps, max window residual)``.
     """
@@ -460,8 +645,10 @@ def top_block_eigh(K, X0, window, *, tol: float = TOP_BLOCK_TOL,
         mu, U = mu[..., ::-1], U[..., ::-1]
         V = X @ U
         R = Y @ U - V * mu[..., None, :]
+        floor = TOP_BLOCK_FLOOR * jnp.max(jnp.abs(mu), axis=-1, keepdims=True)
         res = (jnp.linalg.norm(R[..., lo:hi], axis=-2)
-               / jnp.maximum(jnp.abs(mu[..., lo:hi]), 1e-300))
+               / jnp.maximum(jnp.maximum(jnp.abs(mu[..., lo:hi]), floor),
+                             1e-300))
         return Y, mu, V, jnp.int32(step), jnp.max(res)
 
     def more(carry):
@@ -475,13 +662,20 @@ def top_block_eigh(K, X0, window, *, tol: float = TOP_BLOCK_TOL,
 
 
 def log_top_block(log_fn, where: str, n_fit: int, steps, residual) -> None:
-    """The one receipt line of the top-block solves of one stage."""
+    """The one receipt line of the top-block solves of one stage; a window
+    residual above ``TOP_BLOCK_REFUSE`` (or not finite) refuses."""
     steps, residual = int(np.max(steps)), float(np.max(residual))
     log_fn(f"  [top-block] {where}: block {n_fit} fitted + {TOP_BLOCK_PAD} "
            f"columns; subspace iterations max {steps}, max window residual "
            f"{residual:.2e} (tol {TOP_BLOCK_TOL:.0e})"
            + ("" if residual <= TOP_BLOCK_TOL else
               f"  NOT CONVERGED in {TOP_BLOCK_MAX_ITER} iterations"))
+    if not np.isfinite(residual) or residual > TOP_BLOCK_REFUSE:
+        raise RuntimeError(
+            f"GATE top_block_not_converged: got: {where} window residual "
+            f"{residual:.3e} after {steps} subspace iterations; want: <= "
+            f"{TOP_BLOCK_REFUSE:.0e} (the node set under-resolves the fitted "
+            "window: raise N_node or check the metric eps warning)")
 
 
 def select_active_eigenpairs(eigenvalues: jax.Array,
@@ -620,7 +814,7 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                kgrid_co: tuple[int, int, int], mesh_xy: Mesh,
                *, a_band_index: int | None = None,
                active_band_range: tuple[int, int] | None = None,
-               log_fn=None, quality_record_fn=None):
+               log_fn=None, quality_record_fn=None, backmap=None):
     """f-transformed Hamiltonian in real-space lattice representation.
 
     Math (htransform paper):
@@ -657,6 +851,14 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
                    row-isometry and real-space-locality receipt.  The
                    reduction preserves the matrix sharding and transfers only
                    scalars to the host.
+        backmap:   optional ``(nk, nb, t_carrier)`` states at the back-map
+                   targets (``NodalInterp.target_values``); the same program
+                   then also returns the back-map image
+                   ``L_R = IFFT[Phi^T (-f) C^H]`` ``(nk, t_carrier, rank)``
+                   on ``P(None, 'x', 'y')`` as a fifth value.
+
+    The program is admitted by ``lxkit.memory`` at its compiled footprint
+    (one route: every image on the face) and that executable runs.
 
     Returns:
         fH_R:    (nk_co, rank, rank), sharded P(None, 'x', 'y') (lattice-R index).
@@ -720,10 +922,12 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         "P(None,None,'x') / P(None,None,'y'); no replicated ctilde in fH")
 
     @partial(jax.jit,
-             in_shardings=(coeff_x, coeff_y, rep_),
-             out_shardings=flat_xy)
-    def _build_fH_R(ctilde_i, ctilde_j, f_eps_in):
-        """Contract fH(k) and consume its internal buffer in the IFFT."""
+             in_shardings=(coeff_x, coeff_y, rep_) + (
+                 (coeff_x,) if backmap is not None else ()),
+             out_shardings=flat_xy if backmap is None else (flat_xy, flat_xy))
+    def _build_fH_R(ctilde_i, ctilde_j, f_eps_in, *target):
+        """Contract fH(k) (and the back-map L(k)) and consume each internal
+        buffer in its IFFT."""
         f_eps_T = f_eps_in.T
         f_eps_ki = jnp.where(f_eps_T > 0, 0.0, f_eps_T)
         bw = jnp.sqrt(jnp.clip(-f_eps_ki, 0.0, None))
@@ -740,7 +944,15 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         # The paired input views already place m on x and n on y, so this is
         # the natural output layout and no full rank-by-rank product exists.
         fH_k = jax.lax.with_sharding_constraint(fH_k, flat_xy)
-        return local_ifftn(fH_k)
+        if not target:
+            return local_ifftn(fH_k)
+        # L_k = Phi^T_k (-f(E_k)) C_k^H maps C_k e_n to -f_n psi_nk at the
+        # targets: rows on x (target states), columns on y (coefficients).
+        L_k = jnp.einsum('kna,kn,knb->kab', target[0],
+                         jnp.clip(-f_eps_T, 0.0, None), jnp.conj(ctilde_j),
+                         optimize=True)
+        L_k = jax.lax.with_sharding_constraint(L_k, flat_xy)
+        return local_ifftn(fH_k), local_ifftn(L_k)
 
     @partial(jax.jit,
              in_shardings=(coeff_x, rep_, rep_),
@@ -866,11 +1078,9 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         active_k = jax.lax.with_sharding_constraint(active_k, flat_xy)
         return local_ifftn(active_k)
 
-    # Projection receipt, not a rank gate.  The published whole-state QRCP
-    # basis is deliberately approximate, so C C^H need not be the identity.
-    # Applying a per-k Löwdin map would change the one shared alpha gauge and
-    # is therefore forbidden.  Accuracy is decided directly from recovered
-    # coarse-grid energies/wavefunctions and the independent fine-QE oracle.
+    # Orthonormality receipt of the coefficients.  The per-k Loewdin step of
+    # the nodal fit makes C_k^H C_k = 1 exactly, so this reads rounding; a
+    # larger value means the coefficients did not come from that fit.
     @partial(jax.jit, in_shardings=coeff_x, out_shardings=rep_)
     def _ortho_all_k(c):
         nb_ = c.shape[1]
@@ -879,9 +1089,9 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
 
     _projection_defect = float(_ortho_all_k(ctilde_x))
     log_fn(
-        f"  [receipt] whole-state projection over all "
+        f"  [receipt] coefficient orthonormality over all "
         f"{int(ctilde.shape[0])} coarse k: max|C Cᴴ − I|="
-        f"{_projection_defect:.3e} (diagnostic only; no per-k gauge repair)")
+        f"{_projection_defect:.3e}")
 
     # Certify the complete coarse spectrum before any dense-grid operator is
     # live.  The incumbent one-shot 5184-way syevBatched needed an 11.29-GiB
@@ -928,7 +1138,28 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
         active_R_spill = None
         active_fft_rel = 0.0
 
-    fH_R = _build_fH_R(ctilde_x, ctilde_y, f_eps)
+    from lxkit import memory
+    from common.gpu_utils import shared_device_room
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    operands = (ctilde_x, ctilde_y, f_eps) + (
+        () if backmap is None else (jax.device_put(backmap, coeff_x),))
+    executable = _build_fH_R.lower(*operands).compile()
+    _rank = int(ctilde.shape[2])
+    _stage = (f"htransform R images ({int(ctilde.shape[0])} x {_rank}^2"
+              + ("" if backmap is None else
+                 f" + {int(backmap.shape[2])} x {_rank} back-map") + ")")
+    _got = float(-agreed_chunk(-compiled_new_bytes(executable)))
+    _room = shared_device_room(_stage)
+    memory.admit(_stage, (("face", memory.Price(
+        xla=memory.Term(0.0, _got * int(mesh_xy.size),
+                        f"{_stage} (compiled, never run)"),
+        ranks=int(mesh_xy.size), label=_stage)),),
+        int(_room) if isinstance(_room, (int, np.integer)) else 0)
+    fH_R = executable(*operands)
+    del operands
+    L_R = None
+    if backmap is not None:
+        fH_R, L_R = fH_R
     fft_rel = _relative_from_abs_scale(
         _fH_fft_abs_scale(fH_R, ctilde_x, ctilde_y, f_eps))
     del ctilde_x, ctilde_y
@@ -981,6 +1212,8 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
             "r_vectors": int(_outer_shell.size),
             "locality_wall_seconds": float(_quality_clock() - _quality_t0),
         })
+    if backmap is not None:
+        return (fH_R, (a_f, n_f, shift), f_eps, active_R_spill, L_R)
     return (fH_R, (a_f, n_f, shift), f_eps, active_R_spill)
 
 
@@ -1230,11 +1463,10 @@ def _shift_indices(n: int) -> jnp.ndarray:
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
                     mesh_xy: Mesh | None = None,
                     n_guard_bands: int = 0, centroid_subset_idx=None,
-                    progress_fn=None, centroid_record_fn=None,
+                    centroid_record_fn=None,
                     rank_record_fn=None, wfn_sym=None, *,
                     require_all_occupied: bool = False,
-                    basis_path: str | None = None,
-                    distrib_la_batched_route: str | None = None):
+                    basis_path: str | None = None):
     """Load ψ, build the Galerkin ``ctilde``/``B_at_mu`` over the deck's window.
 
     ``n_guard_bands`` widens the htransform window ABOVE the deck's
@@ -1388,6 +1620,12 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             "fills the key from _DEFAULTS for every deck), or set it "
             "explicitly.  Do NOT default it here.")
     meta.sys_dim = int(params["sys_dim"])
+    # Route completeness for every htransform / BSE stage after this entry
+    # (htransform, exciton_bands, bse_k_grid, vq_interp): a whole matrix of
+    # side >= N_mu/2 on a rank needs a mesh route (GATE nmu2_no_backup), as
+    # gw.shared_pole_recipe sets it for GW.
+    from lxkit import memory
+    memory.set_nmu(int(meta.n_rmu))
     nsigmarange, enk_sigma = load_wfns_and_enk_for_sigma(wfn, sym, nval, ncond, nband)
 
     # Optionally override energies with EQP values from a file only if explicitly requested via CLI
@@ -1419,17 +1657,14 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             ) from exc
 
     band_range = (int(nsigmarange[0]), int(nsigmarange[1]))
-    distrib_la_batched_route = resolve_distrib_la_batched_route(
-        params, override=distrib_la_batched_route)
     basis_path = _resolve(basis_path) if basis_path else None
     basis = streaming_galerkin_solve(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
         log_fn=log_fn, bispinor=bispinor,
         qr_eps=params.get("htransform_qr_eps", 1.0e-3),
-        progress_fn=progress_fn,
         rank_record_fn=rank_record_fn,
         basis_path=basis_path,
-        distrib_la_batched_route=distrib_la_batched_route,
+        wfn_path=wfn_file,
     )
     log_fn(f"Loaded wavefunctions: nk={sym.nk_tot}, "
            f"nb={band_range[1]-band_range[0]}, rank={basis.rank_carrier}")
@@ -1599,7 +1834,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
 
     ws_table = node_pair_table(B_at_mu, kgrid, mesh_xy)
     ws_code = ws_table["code"]
-    timing.record("ht.S_chol", _perf() - _t0)              # instrument:
+    timing.record("ht.ws_code_table", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
     # fH_R stays SHARDED P(None, 'x', 'y'): the (rank, rank) face is split
@@ -1622,43 +1857,47 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     batch_eig_shard = NamedSharding(mesh_xy, P(('x', 'y'), None))
     batch_scalar_shard = NamedSharding(mesh_xy, P(('x', 'y'),))
 
-    def _fourier_matrix(batch_k, operator_R, code):
-        """The one path-q contraction for both fH and active character."""
-        return node_fourier(batch_k, operator_R, code, ws_table, mesh_xy)
-
-    def _top_block(batch_k, fH_R, code, coeffs):
-        """Fitted-state eigenpairs of fH(q) (:func:`top_block_eigh`)."""
-        mat = _fourier_matrix(batch_k, fH_R, code)
-        x0 = coarse_start_block(coeffs, kgrid, batch_k)
-        values, vectors, steps, res = top_block_eigh(
-            mat, jax.lax.with_sharding_constraint(x0, batch_mat_shard),
-            (0, nb_keep))
-        return values[:, :states], vectors[:, :, :states], steps, res
+    def _top_block(batch_k, fH_R, code, coeffs, columns, route):
+        """Fitted-state eigenpairs of fH(q) (:func:`top_block_eigh`) on one
+        of :data:`NODE_ROUTES` (whole matrices per rank, or one q at a time
+        on the face)."""
+        def one(k):
+            mat = node_fourier(k, fH_R, code, ws_table, mesh_xy, route=route)
+            x0 = coarse_start_block(coeffs, kgrid, k, columns)
+            if route == "q-batched":
+                x0 = jax.lax.with_sharding_constraint(x0, batch_mat_shard)
+            values, vectors, steps, res = top_block_eigh(mat, x0, (0, nb_keep))
+            return values[:, :states], vectors[:, :, :states], steps, res
+        return node_route_map(route, one, batch_k)
 
     batch_vec_shard = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
+    # One kernel per route; ``admit_node_route`` below prices each by its
+    # compiled program and returns the admitted one's executable.
     if not use_active and not return_coeffs:
-        @partial(jax.jit, out_shardings=(batch_eig_shard, rep, rep))
-        def _kpath_batch(batch_k, fH_R, code, coeffs):
-            # batch_k: (bs, 3) replicated; fH_R is face-sharded.  The R-only
-            # contraction is local, then the one face→q reshard gives each
-            # device whole matrices for the top-block solve.
-            values, _, steps, res = _top_block(batch_k, fH_R, code, coeffs)
-            return values, steps, res
-    elif not use_active:
-        @partial(
-            jax.jit,
-            out_shardings=(batch_eig_shard, batch_vec_shard, rep, rep))
-        def _kpath_batch(batch_k, fH_R, code, coeffs):
-            """Return the same ordered eigenvectors used by the path bands."""
-            return _top_block(batch_k, fH_R, code, coeffs)
+        def _kpath_program(route):
+            @partial(jax.jit, out_shardings=(batch_eig_shard, rep, rep))
+            def _kpath_batch(batch_k, fH_R, code, coeffs, columns):
+                # batch_k: (bs, 3) replicated; fH_R is face-sharded.  The
+                # R-only contraction is local; on the q-batched route the one
+                # face→q reshard gives each device whole matrices.
+                values, _, steps, res = _top_block(batch_k, fH_R, code,
+                                                   coeffs, columns, route)
+                return values, steps, res
+            return _kpath_batch
     else:
-        @partial(
-            jax.jit,
-            out_shardings=(batch_eig_shard, batch_vec_shard, rep, rep))
-        def _fH_kpath_batch(batch_k, fH_R, code, coeffs):
-            """Retain only fitted-state eigenspaces before releasing fH_R."""
-            return _top_block(batch_k, fH_R, code, coeffs)
+        def _kpath_program(route):
+            @partial(
+                jax.jit,
+                out_shardings=(batch_eig_shard, batch_vec_shard, rep, rep))
+            def _kpath_batch(batch_k, fH_R, code, coeffs, columns):
+                """The ordered eigenvectors used by the path bands (and,
+                with the active character, retained before fH_R is
+                released)."""
+                return _top_block(batch_k, fH_R, code, coeffs, columns,
+                                  route)
+            return _kpath_batch
 
+    if use_active:
         _active_out_shardings = (
             batch_eig_shard, batch_eig_shard,
             batch_scalar_shard, batch_scalar_shard,
@@ -1667,14 +1906,18 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         if return_coeffs:
             _active_out_shardings += (batch_vec_shard,)
 
-        @partial(jax.jit, out_shardings=_active_out_shardings)
-        def _active_kpath_batch(batch_k, values, vectors, active_R, code):
-            """Score retained fH eigenspaces after restoring only P_A(R)."""
-            active_mat = _fourier_matrix(batch_k, active_R, code)
-            return select_active_eigenpairs(
-                values, vectors, active_mat, n_qp_corrected,
-                n_physical=states, n_return=nb_keep,
-                return_vectors=return_coeffs)
+        def _active_program(route):
+            @partial(jax.jit, out_shardings=_active_out_shardings)
+            def _active_kpath_batch(batch_k, values, vectors, active_R, code):
+                """Score retained fH eigenspaces after restoring only P_A(R)."""
+                def one(k, lam, vec):
+                    return select_active_eigenpairs(
+                        lam, vec, node_fourier(k, active_R, code, ws_table,
+                                               mesh_xy, route=route),
+                        n_qp_corrected, n_physical=states, n_return=nb_keep,
+                        return_vectors=return_coeffs)
+                return node_route_map(route, one, batch_k, values, vectors)
+            return _active_kpath_batch
 
     fermi_energy = float(wfn.efermi)
     # Exact scalar subtracted from every reported path energy below.  Keep it
@@ -1721,8 +1964,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # workspace then requested 13.73 GiB and killed the CrI3 200-band arm
         # after every fH/Gamma gate had passed (JID 57538651).  This is the
         # native path's memory plan: minimize concurrent whole matrices while
-        # retaining ndev-way q parallelism.  A distributed-within-matrix path
-        # belongs to ``distrib_la.plan``, not a second eig implementation here.
+        # retaining ndev-way q parallelism.  Its mesh route is the face route
+        # of ``admit_node_route`` (one q at a time, every matrix tiled).
         #
         # ``padded_axis`` is the canonical placement owner also used by
         # bse_setup.  Starting from one means this policy cannot drift from
@@ -1734,18 +1977,22 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             1, mesh_xy, name="htransform q batch",
             spec=P(("x", "y"), None), axis=0).carrier
         ndev = spec_divisor(mesh_xy, P(('x', 'y'), None), axis=0)
-        matrices_per_device = batch_size // ndev
-        matrix_bytes = rank * rank * np.dtype(np.complex128).itemsize
-        log_fn(
-            f"  kpath native eig ledger: q-batch={batch_size}, ndev={ndev}, "
-            f"whole matrices/device={matrices_per_device}; one "
-            f"({rank}, {rank}) complex128 operand={matrix_bytes / 2**30:.3f} "
-            f"GiB/device (backend eigensolver workspace excluded)")
         nq = int(kpath_frac.shape[0])
         n_pad = padded_axis(
             nq, batch_size, name="htransform path-q carrier").pad
         wrapped_k = _prep_kpath(kpath_frac, int(n_pad))
         nq_padded = wrapped_k.shape[0]
+        columns = jax.device_put(jnp.asarray(start_columns(
+            rank, int(coeffs.shape[1]))), rep)
+        route, _kpath_batch = admit_node_route(
+            f"htransform path fH(q) top block ({rank}^2)", _kpath_program,
+            (wrapped_k[:batch_size], fH_R, ws_code, coeffs, columns),
+            rank=rank, mesh_xy=mesh_xy)
+        log_fn(
+            f"  kpath fH(q) route {route}: q-batch={batch_size}, ndev={ndev}, "
+            + (f"whole ({rank}, {rank}) matrices/device="
+               f"{batch_size // ndev}" if route == "q-batched" else
+               f"one q at a time, ({rank}, {rank}) tiled over the mesh"))
         jax.block_until_ready(wrapped_k)                   # instrument:
         timing.record("ht.kpath_prep", _perf() - _t0)      # instrument:
         _t0 = _perf()                                      # instrument:
@@ -1764,7 +2011,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         for i in range(0, nq_padded, batch_size):
             if not use_active:
                 *batch_result, steps, res = _kpath_batch(
-                    wrapped_k[i:i+batch_size], fH_R, ws_code, coeffs)
+                    wrapped_k[i:i+batch_size], fH_R, ws_code, coeffs, columns)
                 block_stats.append((steps, res))
                 batch_result = (tuple(batch_result) if return_coeffs
                                 else batch_result[0])
@@ -1780,8 +2027,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                     lambda_q_list.append(batch_result)
                 jax.block_until_ready(batch_result)
             else:
-                *batch_eigenpairs, steps, res = _fH_kpath_batch(
-                    wrapped_k[i:i+batch_size], fH_R, ws_code, coeffs)
+                *batch_eigenpairs, steps, res = _kpath_batch(
+                    wrapped_k[i:i+batch_size], fH_R, ws_code, coeffs, columns)
                 block_stats.append((steps, res))
                 batch_eigenpairs = tuple(batch_eigenpairs)
                 physical_eigenpairs.append(batch_eigenpairs)
@@ -1804,6 +2051,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             log_fn(
                 "  [route] released fH_R before active_R restore; scoring "
                 "retained fitted-state eigenspaces in a second path pass")
+            _active_kpath_batch = _active_program(route)
             for i, (values, vectors) in zip(
                     range(0, nq_padded, batch_size), physical_eigenpairs):
                 batch_result = _active_kpath_batch(
@@ -2074,9 +2322,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # service's periodic coordinate owner.  This replaces the old
         # ``enk_sigma[:, 0] == Gamma`` assumption, which was false on a
         # shifted mesh and observed only one point even on an unshifted one.
-        # It is a receipt rather than an accuracy refusal: whole-state QRCP
-        # is an approximate projection and its independent fine-QE oracle
-        # decides the interpolation tolerance.
+        # It is a receipt rather than an accuracy refusal: the nodal basis is
+        # exact on the coarse grid, so a path point on it reads rounding.
         if sym is not None:
             path_rows = []
             coarse_rows = []

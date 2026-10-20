@@ -499,10 +499,10 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
     2026-08-10, PIPELINE_HEALTH.md).  The small bundle's basis is a SUBSET of
     the parent's centroid points (``docs/downfold.md``: ψ at the kept
     centroids is the column slice of the parent's), and the htransform leg must evaluate its fitted
-    whole-state basis at those same child points.  The basis itself is selected
-    from full Bloch states by the one randomized-QRCP implementation in
-    ``isdf.galerkin``; centroid rows are evaluation points, not a second
-    state-space fit or rank authority.  This function resolves the parent table
+    whole-state basis at those same child points.  The basis itself is the
+    nodal (Loewdin) basis of ``isdf.galerkin``, interpolated on an orbit-closed
+    node set and back-mapped to these rows; centroid rows are evaluation
+    points, not a second state-space fit or rank authority.  This function resolves the parent table
     only so ``keep_idx`` can identify the child coordinates without inventing
     another downfold mapping.
 
@@ -697,8 +697,9 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
             f"window's pair densities — widen the deck's nval/ncond and "
             f"re-run;\n"
             f"    * or the fitted whole-state basis may not represent this "
-            f"window — check the QRCP projection receipts from "
-            f"build_fH_R and the full-r residual from refit_prepare;\n"
+            f"window — check the [nodes] metric eps line, the "
+            f"build_fH_R receipts and the full-r residual from "
+            f"refit_prepare;\n"
             f"    * or the BSE window itself cuts a multiplet — check the "
             f"band-window lines above.\n"
             f"  Report the number.  Do not raise REFIT_CERT_TOL_MEV, and do "
@@ -1090,14 +1091,14 @@ def gate_htransform_vs_stored(
     if d_meV > 20.0:
         log(f"  [warn] on-grid conduction ENERGY error {d_meV:.1f} meV ≫ the "
             f"~1-2 meV htransform floor.  Inspect the all-coarse transformed-"
-            f"energy and whole-state QRCP projection receipts; then reduce "
-            f"nband toward the BSE window or raise the registered QRCP search "
-            f"ceiling only if those receipts identify missing state space.")
+            f"energy receipt and the [nodes] metric eps line; then reduce "
+            f"nband toward the BSE window, or raise the node count (N_node "
+            f">= 22 x fitted bands) if the metric eps is large.")
     assert d_eps < 0.05 and smin > 0.5, (
         f"htransform conduction cache grossly inconsistent with the stored grid "
         f"(max|Δε_c|={d_meV:.1f} meV, min-sval={smin:.3f}) — interp basis broken. "
-        f"Check the all-coarse transformed-energy and whole-state QRCP "
-        f"projection receipts (historical window finding: "
+        f"Check the all-coarse transformed-energy receipt and the [nodes] "
+        f"metric eps line (historical window finding: "
         f"runs/MoS2/04_mos2_12x12_bands_2026-07-18/"
         f"10_lorrax_exciton_bands_80interp_8v8c).")
     return d_eps, smin
@@ -1204,8 +1205,8 @@ def build_parser():
                          "producer's own zeta-fit window, so the refit "
                          "reproduces the stored V_qmunu tiles and is "
                          "certified BY that tile null. A wide producer window "
-                         "also enlarges the whole-state QRCP fit; inspect its "
-                         "search/projection receipts.  "
+                         "also enlarges the nodal fit (N_node scales with the "
+                         "fitted bands); inspect its [nodes] metric line.  "
                          "'bse': fit zeta' on the DECK's window (the BSE "
                          "window plus its conduction guards).  The exchange "
                          "only ever contracts BSE-window pairs, so that "
@@ -1523,7 +1524,7 @@ def main(argv=None):
         apply_q_per_segment(params, args.q_per_segment, log=log)
 
         # Resolve and print the numerical environment before either htransform
-        # Galerkin setup can emit progress. Whole-state QRCP owns basis selection;
+        # Galerkin setup can emit progress.  The nodal basis has no rank search;
         # the only eigensolver plan here is the fine-k plan executed downstream.
         _wfn_name = str(params["wfn_file"])
         if not os.path.isabs(_wfn_name):
@@ -1538,8 +1539,8 @@ def main(argv=None):
         report.environment(wfn=wfn, lines=(
             f"Restart tensors: {abs_path(restart_file)}",
             "Transition data: distributed band and centroid blocks on X x Y",
-            "Galerkin basis: every orbit-closed centroid as a node; "
-            "quadrature metric + Loewdin; deterministic, no Gram eigensolve",
+            "Galerkin basis: nodal, min(N_mu, 22 x fitted bands) "
+            "orbit-closed nodes; quadrature metric + Loewdin; no rank search",
             f"Fine-k eigensolve: top block (fitted bands + "
             f"{ht.TOP_BLOCK_PAD}) by subspace iteration; operand layout "
             f"{_fine_plan.requested} -> "
@@ -1632,18 +1633,16 @@ def main(argv=None):
 
         # ── htransform setup + Q path ────────────────────────────────────────
         t0 = time.time()
-        # The sole published whole-state fit is born directly at the downfold's
-        # ordered child rows.  ``0`` is only an archived spelling of the default
-        # 20*nb QRCP search ceiling, not an exact parent-fit alternate.  Therefore
-        # no parent-width B or projected-wavefunction cache is ever formed.
+        # The sole published nodal fit evaluates its basis directly at the
+        # downfold's ordered child rows, so no parent-width B or
+        # projected-wavefunction cache is ever formed.
         _fit_subset = keep_idx
         _path_rank_records = []
         (wfn, sym, meta, _mesh, basis,
          enk_sigma) = ht.initialize_wfns(
              args.input, params, log, mesh_xy=mesh_xy,
              centroid_subset_idx=_fit_subset, wfn_sym=(wfn, sym),
-             rank_record_fn=_path_rank_records.append,
-             distrib_la_batched_route=args.distrib_la_batched_route)
+             rank_record_fn=_path_rank_records.append)
         ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
         if enk_qp_full is not None:
             # The interpolated leg.  ``initialize_wfns(eqp_file=...)`` is NOT used:
@@ -1738,9 +1737,7 @@ def main(argv=None):
             kgrid_co=kgrid_co_ct, band_window_fi=(b_min, b_max),
             mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
             batch_size=int(params.get("wfn_fi_q_chunk", 0)),
-            eigh_backend=args.eigh_backend,
             use_low_mem_eigh=_use_low_mem_eigh, log_fn=log,
-            distrib_la_batched_route=args.distrib_la_batched_route,
             htransform_quality_record_fn=_path_quality_records.append)
         if len(_path_quality_records) != 1:
             raise RuntimeError(
