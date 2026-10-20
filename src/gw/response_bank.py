@@ -3194,6 +3194,39 @@ def response_bank_residence(meta, *, segments, n_samples, carry_per_sample, grou
     return "file", dict(receipt, reason="streamed; exceeds half the host budget")
 
 
+def _sample_processing_order(members, line_span):
+    """Dense first, lines last; preserve each member's ORIGINAL carry row."""
+    first, last = map(int, line_span)
+    return sorted(enumerate(members), key=lambda item: first <= item[1] < last)
+
+
+def _stream_member_reader(bank, requests, finish=None):
+    """Read value/slope pairs with an explicit carry-row and q-span witness.
+
+    ``requests`` lists ``(original_member_row, q_span_or_None)`` in the
+    consumer's exact processing order. No frequency, field or q row is
+    inferred from a sequential iterator's position.
+    """
+    requests = tuple((int(row), None if span is None else tuple(map(int, span)))
+                     for row, span in requests)
+    raw = bank.reader([(2*row, 2*row+2, span) for row, span in requests])
+    expected = iter(requests)
+
+    def take(row, span=None):
+        actual = (int(row), None if span is None else tuple(map(int, span)))
+        wanted = next(expected, None)
+        if actual != wanted:
+            raise ValueError(f"GATE response_stream_member: requested {actual}, prefetched {wanted}; "
+                             "value/slope rows must follow the canonical sample processing order")
+        value = next(raw)
+        nq = bank.q if span is None else int(span[1])-int(span[0])
+        if tuple(value.shape[:2]) != (2, nq):
+            raise ValueError("GATE response_stream_member: value/slope or q-span shape mismatch")
+        return value if finish is None else finish(value)
+
+    return raw, take
+
+
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None, direct_head=None, print_fn=print):
     """Stage A: integrate value and derivative together, one frequency at a time.
@@ -3629,6 +3662,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
 
     for group in rules["groups"]:
         members = [int(m) for m in group["members"]]
+        order = _sample_processing_order(members, (p0, p1))
         if all(committed(m) for m in members):
             for _ in members:
                 progress.step()
@@ -3647,7 +3681,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         else:
             # Each pass's rows of every member go to the bank as they finish;
             # each member's value and slope come back one ahead of its solve.
-            fresh = [(row, sample) for row, sample in enumerate(members) if not committed(sample)]
+            fresh = [(row, sample) for row, sample in order if not committed(sample)]
             integrate_response_group(wfns, meta, mesh_xy, rules, group, q_ids=response_rows,
                 execute=execute, receipt=receipt, ordered=ordered, vertex=vertex, bank=stream_bank,
                 outputs=[(2*row+k, 2*row+k) for row, _ in fresh for k in (0, 1)])
@@ -3655,14 +3689,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 stream_bank.commit()
             # A sample larger than its q width reads one q span per solve (the
             # loop's own order); a line sample without line spans reads every parent.
-            raw_group = stream_bank.reader([
-                (2*row, 2*row+2, span) for row, sample in fresh
+            raw_group, take = _stream_member_reader(stream_bank, [
+                (row, span) for row, sample in fresh
                 for span in ([None] if q_width is None or (p0 <= sample < p1 and line_width is None) else
                              line_spans() if p0 <= sample < p1 else
                              [(a, min(q1, a+q_width)) for q0, q1, _, _ in dense_spans(sample)
-                              for a in range(q0, q1, q_width)])])
-            take = ((lambda row: next(raw_group)) if finish is None
-                    else (lambda row: finish(next(raw_group))))
+                              for a in range(q0, q1, q_width)])], finish)
         io_started = time.monotonic()
         # One collective writer transaction per group, not per sample.
         with shared_pole_bank_writer(bank_io["path"], meta=meta,
@@ -3671,7 +3703,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # Dense members first, line members (the selection, the bank's largest phase) last;
             # on the devices the last member's rows leave the group carry, which is freed
             # before that member's solves.
-            order = sorted(enumerate(members), key=lambda m: p0 <= m[1] < p1)
             last = ([row for row, sample in order if not committed(sample)] or [None])[-1]
             for row, sample in order:
                 if committed(sample):
@@ -3703,7 +3734,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     span_panels = []
                     for span in line_spans():
                         sel = line_selections.get(span[1] - span[0], selection)
-                        rows = raw if line_width is None else _RowWindow(take(row), span[0])
+                        rows = raw if line_width is None else _RowWindow(take(row, span), span[0])
                         # The span's W_inf - V serves both orientations' solves.
                         constant = read_constant(span, bank_handle)
                         # The pair goes to the selection as a list it empties: W and dW/ds are
@@ -3752,7 +3783,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         width = q_width or (q1 - q0)
                         for a in range(q0, q1, width):
                             span = (int(a), int(min(q1, a + width)))
-                            rows = raw if q_width is None else _RowWindow(take(row), a)
+                            rows = raw if q_width is None else _RowWindow(take(row, span), a)
                             value, slope = solve(rows, 0, *span, bank_handle, sample,
                                                  need_value=need_value)
                             del rows
