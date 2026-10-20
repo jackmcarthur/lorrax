@@ -228,13 +228,14 @@ class _ShiftedCut:
         return (mu - 1) > self.c * (jnp.max(mu, axis=-1, keepdims=True) - 1)
 
 
-def _shifted_normal_eigh(g, eigh, mesh=None, cut=None):
-    """eigh of the PSD normal matrix G as I + G/||G||_F, eigenvalues mapped back.
+def _shifted_normal(g, mesh=None):
+    """``(I + G/||G||_F, ||G||_F)`` of the PSD normal matrix G: its eigenvectors are G's and
+    lambda_G = (mu - 1) ||G||_F.
 
     cuSOLVERMp STEDC failed (info 4, in58730813.3/.4) on the zero cluster of a
     padded dilation at P16; the shifted positive matrix completed (.5). G has
     the same, denser cluster, so the whole-mesh cuSOLVERMp route solves the
-    shifted matrix. Eigenvectors are those of G. The eigenvalue error becomes
+    shifted matrix. The eigenvalue error becomes
     ~2 eps ||G||_F <= 2 eps sqrt(r) lambda_max, so sigma at the cut
     tau * sigma_max moves by ~eps sqrt(r) / tau**2 relative: 3e-8 at
     r = 2e4, tau = 1e-3, against the 1e-6 multiplet tolerance.
@@ -242,9 +243,7 @@ def _shifted_normal_eigh(g, eigh, mesh=None, cut=None):
     scale = (jnp.linalg.norm(g, axis=(-2, -1)) if mesh is None else
              ordered_norm(g, axis=(-2, -1), mesh=mesh, spec=P(*((None,) * (g.ndim - 2)), "x", "y")))
     scale = jnp.where(scale > 0, scale, 1)
-    eye = jnp.eye(g.shape[-1], dtype=g.dtype)
-    mu, v = eigh(g / scale[..., None, None] + eye, **({} if cut is None else {"cut": cut}))
-    return (mu - 1) * scale[..., None], v
+    return g / scale[..., None, None] + jnp.eye(g.shape[-1], dtype=g.dtype), scale
 
 
 @lru_cache(maxsize=32)
@@ -576,30 +575,44 @@ def _direction_svd_kernel(eigh_plan, ndim, tau=None):
 
     A batch-reshard plan moves whole matrices and forms W.H W and its eigh
     rank-locally; a whole-mesh plan forms W.H W with the service GEMM on the
-    plan's provider and solves it with the planned eigh (on cuSOLVERMp as
-    I + G/||G||_F, ``_shifted_normal_eigh``). The provider eigh reads one
-    triangle, so the face G takes no Hermitian projection (no transpose of a
-    face-tiled matrix). Only the length-m spectrum replicates.
+    plan's provider (on cuSOLVERMp as I + G/||G||_F, ``_shifted_normal``) and
+    solves it eagerly on the plan's route, as :func:`_leading_eigh` does: an
+    eager eigh runs its first attempt alone and compiles the retries only on a
+    set flag (``Plan._program``). Traced inside one program it held every
+    attempt, a room-admitted gathered retry's whole matrices with them
+    (run30k line selection: 30.6 of 41.06 GB/rank). The provider eigh reads
+    one triangle, so the face G takes no Hermitian projection (no transpose of
+    a face-tiled matrix). Only the length-m spectrum replicates.
     """
     from distrib_la.matmul import matmul
-    tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
+    mesh = eigh_plan.mesh
+    rep, tile = NamedSharding(mesh, P()), NamedSharding(mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
     gemm_backend = "distributed" if eigh_plan.requested in ("auto", "off") else eigh_plan.requested
+    shifted = eigh_plan.backend == "cusolvermp"
+    cut = {"cut": _ShiftedCut(0.5 * tau ** 2)} if shifted and tau is not None else {}
+    stack = lambda w: w if w.ndim == 3 else w[None]
+    unstack = lambda s, v: (s, v) if ndim == 3 else (s[0], v[0])
 
-    @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
+    @jax.jit(out_shardings=(rep, tile))
+    def reshard(w):
+        return unstack(*eigh_plan.reshard_stack("normal_eigh", stack(w)))
+
+    @jax.jit(out_shardings=(NamedSharding(mesh, P(None, 'x', 'y')), rep))
+    def normal(w):
+        g = matmul(stack(w), stack(w), mesh=mesh, transa="C", backend=gemm_backend, batched_route="auto")
+        return _shifted_normal(g, mesh) if shifted else (g, jnp.ones(g.shape[0], g.real.dtype))
+
+    @jax.jit(out_shardings=(rep, tile))
+    def spectrum(mu, v, scale):
+        return unstack(_singular_values((mu - 1) * scale[..., None] if shifted else mu), v)
+
     def extract(w):
-        stack = w if w.ndim == 3 else w[None]
-        if eigh_plan.stack_route(stack.shape, w.dtype, "normal_eigh").route == ROUTE_BATCH_RESHARD:
-            s, v = eigh_plan.reshard_stack("normal_eigh", stack)
-        else:
-            g = matmul(stack, stack, mesh=eigh_plan.mesh, transa="C",
-                       backend=gemm_backend, batched_route="auto")
-            if eigh_plan.backend == "cusolvermp":
-                evals, v = _shifted_normal_eigh(g, eigh_plan.batched, eigh_plan.mesh,
-                                                None if tau is None else _ShiftedCut(0.5 * tau ** 2))
-            else:
-                evals, v = eigh_plan.batched(g)
-            s = _singular_values(evals)
-        return (s, v) if w.ndim == 3 else (s[0], v[0])
+        if eigh_plan.stack_route(stack(w).shape, w.dtype, "normal_eigh").route == ROUTE_BATCH_RESHARD:
+            return reshard(w)
+        a, scale = normal(w)
+        mu, v = eigh_plan.batched(a, **cut)
+        del a
+        return spectrum(mu, v, scale)
 
     return extract
 

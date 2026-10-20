@@ -1807,6 +1807,7 @@ def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh, n_rmu_logical: 
     ndev = int(mesh_xy.devices.size)
     if ndev <= 1:
         return "local"
+    import distrib_la
     from lxkit import memory
     from common.gpu_utils import shared_device_room
     from distrib_la.workspace import lu_workspace_bytes
@@ -1816,11 +1817,16 @@ def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh, n_rmu_logical: 
     n_log = int(n_rmu_logical)
     local = lambda: compiled_price(lambda C: _factor_c_q_transverse_lu(C, mesh_xy, n_log), c,
                                    ranks=ndev, face=False, source="per-q LU on whole tiles")
-    mesh_price = lambda: compiled_price(
-        lambda C: _factor_c_q_transverse_inverse(C, mesh_xy, n_log), c, ranks=ndev, face=True,
-        source="mesh LU inverse on the face") + memory.Price(vendor=memory.Term(
-            float(lu_workspace_bytes(mesh_xy, int(n_rmu), jnp.complex128)),
-            source="cuSOLVERMp solve_lu workspace (measured row)"), ranks=ndev)
+    # The provider's workspace outside XLA, for the plan the mesh route resolves (its room):
+    # cuSOLVERMp's measured row; the other providers' solves allocate inside the program.
+    def mesh_price():
+        lu = distrib_la.plan("solve_lu", mesh_xy, backend="distributed", n=int(n_rmu), batched_route="auto",
+                             budget_bytes=shared_device_room("transverse zeta inverse"))
+        vendor = lu_workspace_bytes(mesh_xy, int(n_rmu), jnp.complex128) if lu.backend == "cusolvermp" else 0
+        return compiled_price(lambda C: _factor_c_q_transverse_inverse(C, mesh_xy, n_log), c, ranks=ndev,
+                              face=True, source="mesh LU inverse on the face") + memory.Price(
+            vendor=memory.Term(float(vendor), source=f"{lu.backend} solve_lu workspace (measured row)"),
+            ranks=ndev)
     return memory.admit(f"transverse zeta factor {int(nq)} x {int(n_rmu)}^2", (
         ("local", local), ("mesh", mesh_price)),
         int(shared_device_room("transverse zeta factor")))
