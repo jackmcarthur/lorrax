@@ -2260,8 +2260,12 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
         brackets, band_counts, matrix_counts, tail_first = _ordered_tail_brackets(
             tail, b_lo=b_lo, hi=hi, n_insert=n_insert, nb=nb)
     cfg = plan["sigma_cfg"]
+    meta_sigma = fresh_shared_pole_capacity(meta_t, mesh_xy)
+    # All ranks read live room with current full-band faces/model resident;
+    # a fresh ledger alone has no inherited baseline or agreed phase room.
+    meta_sigma.shared_pole_capacity.at_phase()
     res, receipt = ordered_shared_pole_sigma(wfns_t, source["model"],
-        fresh_shared_pole_capacity(meta_t, mesh_xy), mesh_xy, request=request,
+        meta_sigma, mesh_xy, request=request,
         sigma_branches=branches, regularization_width_ry=float(cfg.regularization_ev)/RYD_TO_EV,
         quadrature_eps=float(cfg.quadrature_eps), projection_bands=(b_lo, hi),
         band_brackets=tuple(brackets), band_counts=band_counts,

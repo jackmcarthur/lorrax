@@ -1,0 +1,42 @@
+# PREPARED EXPERIMENTAL ONLY: not executed or a converged q4 reference.
+# Sharp baseline SHA256: 1712d907f1468a518afe8c8a4fdd17b7d7909392fbd97e22c6e7d11996b9c299
+# The ONLY input-key change from that baseline is qgrid_response_window=fejer.
+# Run in a NEW PRIVATE directory, never any sharp/q8 output directory.
+# Accepted q8 INPUT seed SHA256: 92a595db4e75eb906e0888c561652e33c4e73f3cd9936c624d7003c00f9d759c
+# Fejer changes chi smoothing; ordinary coarse-q Sigma is unchanged/non-Phi.
+[cohsex]
+sys_dim = 2
+wfn_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/CrI3/470_monolayer_pbeU_htransform_20260922/qe/nscf08/WFN.h5
+number_bands = 750
+zeta_nband = 750
+qgrid = 4 4 1
+qgrid_response_window = fejer
+compute_mode = mpa
+sigma_w_model = shared_pole
+sigma_w_accuracy = production
+screening_diagrams = w_rpa
+head_correction = full
+sc_head_update = dft_velocity
+vnl_velocity_sign = +1
+linalg = local
+bispinor = false
+number_bands_protected = 160
+qp_solver = self_consistent
+density_self_consistent = true
+sc_semicore = dft
+sc_max_iter = 30
+sc_initial_qp_rotations_file = seed_from_accepted_q8/qp_wfn_rotations.h5
+sc_tol_ev = 0.001
+sc_accelerator = anderson
+sc_history_depth = 20
+sigma_out_of_grid = cover
+sigma_regularization_ev = 0.25
+sigma_quadrature_eps = 1e-4
+restart = false
+write_restart_tensors = false
+write_wfn_h5 = false
+qp_rotations_k_storage = full
+centroids_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/CrI3/471_monolayer_gnppm_sc_16x16_20260922/12_bseprod_prep/centroids_frac_3000_fit898.txt
+kin_ion_file = /pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/CrI3/471_monolayer_gnppm_sc_16x16_20260922/12_bseprod_prep/kin_ion.h5
+use_band_extrapolation = true
+band_extrapolation_estimator = spectral_shell
