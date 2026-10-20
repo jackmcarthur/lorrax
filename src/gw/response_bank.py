@@ -721,7 +721,8 @@ def _check_bare_hermitian(mesh_xy, q0, receipt, **moments):
     24x24, n = 3328); the replicated ratios make every rank refuse alike.
     """
     from distrib_la import roundoff_tol
-    ratios = np.asarray(_anti_hermitian_ratios(mesh_xy)(*moments.values()), dtype=np.float64)
+    ratios = np.asarray(_run_priced(_anti_hermitian_ratios(mesh_xy), *moments.values(),
+                                    label="bare moment Hermiticity check"), dtype=np.float64)
     receipt["bare_anti_hermitian_max"] = max(float(np.nanmax(ratios, initial=0.0)),
                                              receipt.get("bare_anti_hermitian_max", 0.0))
     tol = roundoff_tol(next(iter(moments.values())).shape[-1])
@@ -1434,12 +1435,32 @@ def _moment_batch_major(mesh_xy, n_out, width, n_batch):
     return jax.jit(order, out_shardings=spec)
 
 
+def _run_priced(program, *args, label):
+    """Run ``program`` as the executable it books in the open section: its own temp and outputs
+    (``runtime.aot_memory.compiled_new_bytes``) beside the bytes in use, compiled once per signature."""
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+    from gw.shared_pole_execution import compiled_for
+    executable = compiled_for(program, args)
+    memory.book(memory.priced(compiled_new_bytes(executable), f"{label} (compiled)", increment=True))
+    return executable(*args)
+
+
 @lru_cache(maxsize=8)
 def _moment_batch_split(mesh_xy, n_out, rows):
     """One q batch's bank run ``[n_out, width, m, n]`` → its ``n_out`` totals ``[rows, m, n]``."""
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     return jax.jit(lambda run: tuple(run[o, :rows] for o in range(n_out)),
                    out_shardings=(face,) * n_out)
+
+
+def _batch_totals(run, finish, split):
+    """A q batch's totals from its read run. The photon path's canonical copy (``finish``) is
+    live beside the run and the totals: a part of its own. The split shares the read-back's
+    part (they run in turn beside the same residents).
+    """
+    canonical = run if finish is None else _run_priced(finish, run, label="moment canonical order")
+    return _run_priced(split, canonical, label="moment correlations")
 
 
 def ordered_moments(steps, execute, h, a0, a1, o0, o1):
@@ -1589,19 +1610,18 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
         qwidth = moment_width(per_q)
     receipt["q_width"] = int(qwidth)
     receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
+    # A batch's read-back and split run in turn beside the same residents: one part, the larger.
     runs = None if streamed is None else streamed.reader(
-        [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))])
-    # The q batches in their own section: the price judged against their peak is the
-    # ledger's live set plus one batch's tile (the stream's peak is the stream's).
-    from lxkit import memory
+        [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))],
+        run=partial(_run_priced, label="moment correlations"))
+    # The q batches in their own section. Each program a batch runs is priced by its own
+    # executable in its dispatch section (bank.dispatch.coulomb_sqrt, .moment_dyson); the
+    # batch's ledger row admits its outputs and is no price of this section.
     with timing.section("bank.moment_batches"):
-        memory.book(ledger.price(ledger.preview(
-            resident_bytes_per_rank=(per_q * qwidth + 16) * face_bytes, workspace_bytes_per_rank=0,
-            concurrent_with=ambient)))
         for q0 in range(0,len(qids),qwidth):
             q1 = min(q0+qwidth,len(qids))
             ledger.live_stages = ambient
-            name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
+            name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes, book=False)
             ledger.live_stages = ambient+(name,)
             if not np.asarray(header["moment_written"])[q0:q1].all():
                 # The roots first: their factorization runs beside no total.
@@ -1611,8 +1631,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                 with _moment_phase(receipt, "correlations"):
                     if runs is not None:
                         run = next(runs)
-                        totals = _moment_batch_split(mesh_xy, n_total, q1 - q0)(
-                            run if finish is None else finish(run))
+                        totals = _batch_totals(run, finish, _moment_batch_split(mesh_xy, n_total, q1 - q0))
                         del run
                         a0, a1, o0, o1 = totals if ordered else (*totals, None, None)
                         del totals

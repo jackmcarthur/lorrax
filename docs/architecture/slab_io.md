@@ -580,7 +580,8 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
   syncs the files.
 - **Read.** `reader(spans)` yields whole outputs or q spans of them, each
   verified and agreed, with the next span's reads already in flight. A q-span
-  read goes through one aligned scratch buffer per I/O thread.
+  read goes through one aligned scratch buffer per I/O thread. `run=` runs each
+  span's unpack program, so the caller prices it (the moment batches do).
 - **Files.** O_DIRECT where the filesystem accepts it; a rejected direct
   call moves that file to buffered I/O at the same offsets. A 4 × 4 MiB stripe
   layout where `lfs` exists (a failed `lfs setstripe` is logged; the default

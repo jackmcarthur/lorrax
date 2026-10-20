@@ -507,15 +507,16 @@ class StreamedBank:
             error = error or exc
         agree_io_error(error, path=self.dir, stage="streamed_bank.commit")
 
-    def reader(self, spans):
+    def reader(self, spans, run=None):
         """Each ``(o0, o1)`` or ``(o0, o1, (qa, qb))`` of ``spans`` in turn as one device array
         ``[o1-o0, q, ...]`` (``q = qb - qa`` for a q span), verified and agreed on every rank
-        (one control-store round per span), the next span's preads started behind it."""
+        (one control-store round per span), the next span's preads started behind it.
+        ``run(program, *args)``, if given, runs each span's unpack program (the caller prices it)."""
         spans = [(((int(s[0]), int(s[1])),), None if len(s) < 3 or s[2] is None
                   else (int(s[2][0]), int(s[2][1]))) for s in spans]
         for i, (runs, q_span) in enumerate(spans):
             started = time.monotonic()
-            value = self.read_runs(runs, q_span, then=spans[i + 1] if i + 1 < len(spans) else None)
+            value = self.read_runs(runs, q_span, then=spans[i + 1] if i + 1 < len(spans) else None, run=run)
             try:
                 agree_io_error(self.check_reads(), path=self.dir, stage="streamed_bank.read")
             except RuntimeError:
@@ -523,7 +524,7 @@ class StreamedBank:
                 # transient read recovers; bytes that never landed refuse again.
                 self.rereads += 1
                 self._drop_ahead()
-                value = self.read_runs(runs, q_span)
+                value = self.read_runs(runs, q_span, run=run)
                 agree_io_error(self.check_reads(), path=self.dir, stage="streamed_bank.reread")
             self.seconds["read"] += time.monotonic() - started
             # Handed over, not kept: a suspended frame holding ``value`` kept each span
@@ -532,7 +533,7 @@ class StreamedBank:
             del value
             yield held.pop()
 
-    def read_runs(self, runs, q_span=None, then=None):
+    def read_runs(self, runs, q_span=None, then=None, run=None):
         """Outputs of every run ``[(o0, o1), ...]`` as one device array ``[Σ(o1-o0), q, ...]``,
         or only rows ``q_span = (qa, qb)`` of each record (``q = qb - qa``). Every run's preads
         are in flight together on the I/O threads, then one placement and one unpack.
@@ -568,8 +569,9 @@ class StreamedBank:
                                               np.complex128, count))[None, None])
         flat.block_until_ready()        # the staging buffer is reused after this
         self._settle((local, ()))
-        value, digest = _unpack(self.mesh, n_out, qb - qa, self.shapes, self.rects, self.tile,
-                                records16 if q_span is not None else tuple(r // 16 for r in self.records))(flat)
+        unpack = _unpack(self.mesh, n_out, qb - qa, self.shapes, self.rects, self.tile,
+                         records16 if q_span is not None else tuple(r // 16 for r in self.records))
+        value, digest = unpack(flat) if run is None else run(unpack, flat)
         self._checks.append((runs, (qa, qb), digest))
         return value
 

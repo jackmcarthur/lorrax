@@ -605,6 +605,12 @@ def construction_receipt(measurements=None, *, capacity=None, capacity_entry_sta
     return result
 
 
+def native_query_rows(native_queries):
+    """The receipt rows of a constructor's native size queries, each keyed ``(op, shapes)``
+    (``ConstructorCapacity.native_queries``)."""
+    return [dict(op=op, shapes=shapes, bytes_per_rank=value) for (op, shapes), value in native_queries.items()]
+
+
 def build_construction_row(model, counts, diagnostics, *, span, roles, price,
                            coulomb, native_queries, identity, gates, nspinor,
                            logical_n, ordered, odd_moments, detail=False):
@@ -663,8 +669,7 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
            "damping_fraction": 0.0, "capacity": price, "coulomb": coulomb,
            "condition": np.asarray(reduction["gram_condition"]).tolist(),
            "normalized_gram_spectrum": spectrum.tolist() if detail else spectrum,
-           "native_workspace_queries": [dict(op=op, shapes=shapes, bytes_per_rank=value)
-                                         for (op, shapes), value in native_queries.items()],
+           "native_workspace_queries": native_query_rows(native_queries),
            "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},
            "moment_defects": {k: {a: np.asarray(value).tolist() for a, value in v.items()}
                               for k, v in moment_defects.items()},

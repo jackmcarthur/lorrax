@@ -77,7 +77,18 @@ cuSOLVERMp LU chunks `getrs` to the posted room.
   `distrib_la.checked_program`, so each carries a host callback. `spole.gram_reduction`
   and `spole.bank` price above the 1.3 band (the face round's row holds its program's eigh
   twice); `spole.direction_selection` prices 1.9x its peak (run30k 46.86 vs 24.44 GB:
-  the conservative side and the selection eigh), and it binds the minimum-P line. The
+  the conservative side and the selection eigh). A kernel-priced selection was tried and
+  dropped (its key broke the receipt rows and it compiled in the width search). The run30k
+  minimum-P binder is `zeta_fit.mubatch.write_zeta`, 53.44 GB against 51.46 measured.
+  After the landing gate (run30k, REPORT6) `spole.bank` 2.0x, `spole.moment_read` 2.2x and
+  `spole.sample_batch_read` 1.6x are over too. (`bank.moment_batches` was 54.73 GB, a
+  closed-form batch tile booked beside its compiled dispatches; it books none now and prices
+  24.67 GB against an 11.23 GB trace peak. Its store write rows still price each field as
+  output + temporary + the live input, 4 x 4.5 GB for M0..M3 at run30k against about 2.7 GB
+  of measured staging. The batch's read-back, split and photon canonical copy run as priced:
+  `bank.moment_correlations` 10.36 GB priced and measured.) The
+  selection's `phase_dense_temporaries` (24 n^2/P per parent, 21.6 GB at run30k) duplicates
+  the direction-SVD program, which should price it at the stack it runs. The
   native ncclMin agreement in the LU workspace query (B3) and the eigh memory change
   (ABI 11) are not in this landing.
 

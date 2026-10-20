@@ -171,6 +171,9 @@ def _admit(ledger, stage, resident, workspace=0, *, host_payload=0,
     # hold the caller's arrays whether or not a live row names them.
     from dataclasses import replace
     from lxkit import memory
+    # One part per kind: kinds admitted together (a multi-field read or write) sum; a kind admitted
+    # again in turn keeps its largest (run30k spole.bank: 5 x 2 bank writes of 4.5 GB, freed in
+    # turn; a part per admission summed them, 36 GB over).
     memory.book(replace(ledger.price(row), operands=memory.Term(), increment=True, label=f"store.{stage}"))
     if jax.process_index() == 0:
         print("[shared_pole_store capacity] " + _json(dict(device=row, host=host)), flush=True)

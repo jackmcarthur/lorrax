@@ -251,3 +251,36 @@ def test_chi0_active_group_extends_to_isolated_groups():
     if all(flat[:, b].min() - flat[:, b - 1].max() <= 0 for b in range(1, FX.NBF)):
         with pytest.raises(Exception, match="dynsig_spm_chi0_active"):
             chi0_active_group(flat, slice(3, 5), "auto")
+
+
+
+def test_photon_batch_books_the_canonical_copy_beside_the_split():
+    """The photon path's canonical copy of a read run is live beside the run and the split's
+    totals, so the batch books its own executable and the split's, summed."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    from common import timing
+    from gw.response_bank import _batch_totals, _moment_batch_split, _photon_canonical
+    from gw.shared_pole_execution import compiled_for
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+    jax.config.update("jax_enable_x64", True)
+    mesh, n = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y")), 16
+
+    class Reversal:                                    # families that reverse each photon axis
+        layout = SimpleNamespace(mesh_side=1)
+
+        def order_map(self):
+            return np.arange(n)[::-1].astype(np.int32), n, n
+    families = Reversal()
+    finish, split = _photon_canonical(families, mesh), _moment_batch_split(mesh, 2, 2)
+    run = jax.device_put(jnp.arange(2 * 3 * n * n, dtype=jnp.complex128).reshape(2, 3, n, n),
+                         NamedSharding(mesh, P(None, None, "x", "y")))
+    with timing.section("demo.photon_batch"):
+        totals = _batch_totals(run, finish, split)
+    canonical = np.asarray(run)[:, :, ::-1, ::-1]
+    assert all(np.array_equal(np.asarray(t), canonical[o, :2]) for o, t in enumerate(totals))
+    price = next(r["price"] for r in memory.receipts() if r["stage"] == "demo.photon_batch")
+    copy = compiled_new_bytes(compiled_for(finish, (run,)))
+    assert copy >= run.nbytes and price.xla.at(1) == copy + compiled_new_bytes(compiled_for(split, (run,)))
