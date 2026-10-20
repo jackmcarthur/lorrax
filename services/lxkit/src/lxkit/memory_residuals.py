@@ -37,15 +37,20 @@ def load(path) -> dict:
 
 
 def rows(trace: dict) -> list:
-    """One row per section name: the call with the largest |residual|."""
+    """One row per section name: the call with the largest |residual|.  Its compiled figure is
+    the largest executable any call of that name ran first (``runs``; ``compiles`` in traces
+    before C8h), so a program compiled in a check section is the running section's."""
     limit = float(trace.get("run", {}).get("limit") or 0.0)
     tol = max(0.02 * limit, 0.25 * GB)
-    best = {}
+    best, ran = {}, {}
+    for s in trace["sections"]:
+        for c in s.get("runs", s["compiles"]):
+            ran[s["name"]] = max(ran.get(s["name"], 0), c["temp"] + c["output"] - c["alias"])
     for s in trace["sections"]:
         live = float(s["open"]["live"])
         allocator = s.get("source") in ("pool", "bfc")
         measured = float(s["measured"]) if allocator and s["measured"] >= 0 else float(s["peak"]["live"])
-        compiled = max((c["temp"] + c["output"] - c["alias"] for c in s["compiles"]), default=0)
+        compiled = ran.get(s["name"], 0)
         vendor = float((s.get("priced") or {}).get("vendor", 0.0))
         residual = measured - (live + compiled + vendor)
         opened = {(tuple(a["shape"]), a["dtype"], a["spec"], a["born"]) for a in s["open"]["arrays"]}
