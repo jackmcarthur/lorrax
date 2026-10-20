@@ -835,6 +835,21 @@ def _json(value):
     return json.dumps(value, default=encode, sort_keys=True, allow_nan=False)
 
 
+def _require_persistent_state_identity(identity):
+    """Refuse reuse of SC scratch labels that do not authenticate current U/H.
+
+    Match the restart owner's NON-AUTHENTICATING contract. Energy, occupation
+    and original-WFN hashes alone do not identify the current QP rotation.
+    This guard does not prevent fresh construction or upgrade old labels.
+    """
+    if (str(identity.get("iteration_id", "")).startswith("sc_")
+            or identity.get("wavefunctions") == "qp_rotation_unreceipted"
+            or identity.get("authentication") == "NON-AUTHENTICATING"
+            or str(identity.get("hamiltonian", "")).startswith("sc_map_")):
+        raise ValueError("GATE shared_pole_sc_reuse: NON-AUTHENTICATING SC scratch "
+                         "does not bind current U/H; preserve it and use a fresh run directory")
+
+
 def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, coulomb_sha256=None):
     """Authenticate a complete producer bank before preserving it.
 
@@ -854,6 +869,7 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False, c
     required = (*receipt_paths, bank_path)
     if not all(path.is_file() for path in required):
         return False
+    _require_persistent_state_identity(identity)
     try:
         bank_receipt = json.loads(receipt_paths[0].read_text())
         moments_receipt = None if photon else json.loads(receipt_paths[1].read_text())
@@ -896,6 +912,8 @@ def _published_sector_handle(root, identity):
     manifest of another identity refuses: it is not this map's private state.
     """
     manifest = root / 'sectors.json'
+    if manifest.exists():
+        _require_persistent_state_identity(identity)
     try:
         header = json.loads(manifest.read_text())
     except (OSError, ValueError):
@@ -1346,6 +1364,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # An interrupted run's directory keeps what authenticates for this
             # map and loses the rest: a published sector handle is reused, a
             # complete bank resumes the constructor, anything else is rebuilt.
+            # Unreceipted SC labels cannot authenticate ANY preserved scratch
+            # against a different current rotation, even at identical E/f.
+            if root.exists() and any(root.iterdir()):
+                _require_persistent_state_identity(identity)
             import h5py
             from file_io.slab_io import remove_stale_streamed_banks
             # A per-rank streamed store is unlinked as soon as it is opened, so its bytes
