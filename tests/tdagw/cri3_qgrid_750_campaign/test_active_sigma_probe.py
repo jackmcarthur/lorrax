@@ -71,3 +71,18 @@ def test_dispatch_has_compact_destinations_and_no_hidden_fullprefix_or_optical_s
     assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                    and n.func.attr in ("run_bse_probe", "gw_iteration_map", "run_propagation")
                    for n in ast.walk(run))
+
+
+def test_settings_use_the_real_native_config_before_W_not_a_flat_fake():
+    from gw.gw_config import LorraxConfig
+    path = Path(probe.__file__).with_name("inputs")/"corrected_protected160_750_q4_from_accepted_q8.in"
+    config = LorraxConfig.from_input_file(str(path), resolve_hardware=False, print_fn=lambda *a: None)
+    settings = probe.validate_config(config)
+    assert settings["linalg"] == config.backend.linalg == "local"
+    assert settings["projection_bands"] == (100, 144)
+    assert settings["quadrature_eps"] == 1.e-4
+    assert settings["sigma_w_model"] == "shared_pole"
+    assert settings["keep_branches"] is True
+    energy, occupations = tables()
+    request, _, _ = probe.active_request(energy, occupations, config)
+    assert request.table_ev("pair").shape == (64, 44)

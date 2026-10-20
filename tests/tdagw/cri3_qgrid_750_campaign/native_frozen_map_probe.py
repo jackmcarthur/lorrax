@@ -471,6 +471,8 @@ def main(argv=None):
             spec = importlib.util.spec_from_file_location("native_pre_sigma_probe", args.pre_sigma_helper)
             pre = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(pre)
+            if hasattr(pre, "validate_config"):
+                pre.validate_config(inputs.config)
             callback = lambda current: run_pre_sigma_only(pre.run_pre_sigma_probe, current,
                 out=out/"fine_pre_sigma", publish=publish, finished=finished)
         if args.bse_helper:

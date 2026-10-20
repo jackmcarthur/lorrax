@@ -13,6 +13,21 @@ import time
 from types import SimpleNamespace
 
 
+def validate_config(config):
+    """Resolve real native typed fields BEFORE an expensive W construction."""
+    from common.units import RYD_TO_EV
+    settings = dict(regularization_width_ry=float(config.sigma.regularization_ev)/RYD_TO_EV,
+        edge_factor=float(config.sigma.window_edge_factor), quadrature_eps=float(config.sigma.quadrature_eps),
+        omega_grid_step_ry=float(config.sigma.omega_step_ev)/RYD_TO_EV,
+        pole_batch_size=int(config.mpa.pole_batch_size),
+        expected_screening_diagrams=config.screening.diagrams,
+        sigma_w_model="shared_pole", material_class="insulator",
+        linalg=config.backend.linalg, keep_branches=True, projection_bands=(100, 144))
+    if settings["linalg"] not in ("local", "distributed") or not config.sigma.w_model == "shared_pole":
+        raise ValueError("native shared-pole backend layout required")
+    return settings
+
+
 def active_request(energy, occupations, config):
     """Request ONLY [100,144) external energies, without changing virtuals."""
     import numpy as np
@@ -39,13 +54,16 @@ def active_request(energy, occupations, config):
 
 
 def run_pre_sigma_probe(source, *, out):
-    """One cold and one warm SAME-W sweep; native memory/gates are unchanged."""
+    """Cold and held-session SAME-W sweeps; native gates are unchanged.
+
+    The held session may serve a different certified, padded rule. These
+    are identical physical inputs, not necessarily identical executables.
+    """
     import numpy as np
     import jax
     from common.collectives import gather_to_host, rank0_transaction
     from common.units import RYD_TO_EV
     from gw import quadrature_log
-    from gw.gw_config import linalg_resolution
     from gw.ppm_sigma import fresh_shared_pole_capacity
     from gw.mpa.sigma import compute_sigma_c_mpa_omega_grid
     meta, config, mesh = source["meta"], source["config"], source["mesh"]
@@ -67,16 +85,8 @@ def run_pre_sigma_probe(source, *, out):
         rank0_transaction(out/name, stage="active_sigma/"+name,
             write=lambda: io.exclusive_write(out/name, record=record, arrays=arrays))
 
-    common = dict(request=request, efermi_ry=efermi,
-        regularization_width_ry=float(config.sigma.regularization_ev)/RYD_TO_EV,
-        edge_factor=float(config.sigma.window_edge_factor), quadrature_eps=float(config.sigma.quadrature_eps),
-        omega_grid_step_ry=float(config.sigma.omega_step_ev)/RYD_TO_EV,
-        pole_batch_size=int(config.mpa.pole_batch_size),
-        fit_identity=model["identity"], fit_digest=model["digest"],
-        expected_screening_diagrams=config.screening.diagrams,
-        sigma_w_model="shared_pole", material_class="insulator",
-        linalg=linalg_resolution({"linalg": config.linalg}).layout,
-        keep_branches=True, projection_bands=(100, 144))
+    common = dict(validate_config(config), request=request, efermi_ry=efermi,
+        fit_identity=model["identity"], fit_digest=model["digest"])
     session = {}
     save("started.json", record=dict(status="STARTED_NOT_COMPLETED", frame=source["frame"],
         execution_revision=os.environ.get("LEG_HEAD"),
@@ -86,7 +96,7 @@ def run_pre_sigma_probe(source, *, out):
         external_energy_range_ev=[float(energy[:, 100:144].min()*RYD_TO_EV),
                                   float(energy[:, 100:144].max()*RYD_TO_EV)],
         scope="raw750 equilibrium correlation BODY, no head/tail extrapolation, no driven full-coherent W refresh"))
-    records, first = [], None
+    records, first, difference = [], None, None
     for repeat in range(2):
         started = time.perf_counter()
         current_meta = fresh_shared_pole_capacity(meta, mesh)
@@ -121,10 +131,16 @@ def run_pre_sigma_probe(source, *, out):
         if first is None:
             first = pair.copy()
         else:
-            if not np.allclose(first, pair, rtol=1.e-10, atol=1.e-11):
-                raise ValueError("cold/warm identical-input Sigma disagreement")
+            # Different certified rules need not agree at machine precision.
+            # Report the observed difference; this timing test does not derive
+            # a full matrix error bound from the scalar quadrature tolerance.
+            difference = dict(max_abs_ry=float(np.max(abs(pair-first))),
+                relative_frobenius=None if not np.linalg.norm(first) else
+                    float(np.linalg.norm(pair-first)/np.linalg.norm(first)),
+                scope="same physical W/endpoints, different certified rules possible; NOT a convergence verdict")
     save("complete.json", record=dict(status="ACTIVE44_RAW750_BODY_TIMING_COMPLETE", sweeps=records,
         active_destination_zero_based=[100, 144], virtual_bands=750, model_digest=model["digest"],
         frame=source["frame"]["frame"], no_SC_update=True, no_TD_propagation=True,
         head_evaluated=False, band_extrapolation_evaluated=False,
+        cold_held_difference=difference,
         scope="native equilibrium W and diagonal internal occupations; not the full coherent refreshed-W TD cost"))

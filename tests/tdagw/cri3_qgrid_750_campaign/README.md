@@ -192,8 +192,11 @@ output. The host tests use explicitly synthetic small fixtures only.
 two identical-input compact native Sigma sweeps after fine W, then stops
 cleanly before the protected160 Sigma map, BSE, coarse leg or TD. Only
 external [100,144) energies and 44x44 matrices are requested; all750 physical
-internal bands remain. The two sweeps expose cold and same-session warm
-costs, actual window/tau counts and full complex branch pairs. Wall time per
+internal bands remain. The two sweeps expose cold and held-session
+costs, actual window/tau counts and full complex branch pairs. The first can
+serve one-shot rules while building padded held rules for the second; these
+need not be the same executable or agree at machine precision. Their observed
+matrix difference is reported, not promoted to a convergence verdict. Wall time per
 window/tau pair is an amortized whole-sweep cost, not isolated GPU latency.
 This first benchmark measures the raw750 equilibrium correlation BODY only;
 it does not include head evaluation, tail extrapolation or construction of

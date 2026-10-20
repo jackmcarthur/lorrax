@@ -1,6 +1,8 @@
 """Host lifecycle only: no native map, screening, Sigma or convergence claim."""
 import importlib.util
+import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +41,48 @@ def test_pre_sigma_failure_never_enters_collective_completion_publish(tmp_path):
         owner.run_pre_sigma_only(run, {}, out=tmp_path,
             publish=lambda *a, **kw: calls.append(a), finished=finished)
     assert actual.value is error and not finished and not calls
+
+
+def test_pre_sigma_module_config_preflight_runs_before_callback_or_maps(tmp_path):
+    tree = ast.parse(Path(owner.__file__).read_text())
+    block = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "args.pre_sigma_helper"
+        and any(isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id == "pre" for n in node.body))
+    events, config = [], object()
+    def validate(value):
+        assert value is config
+        events.append("actual-config-validated")
+    pre = SimpleNamespace(validate_config=validate)
+    spec = SimpleNamespace(loader=SimpleNamespace(
+        exec_module=lambda value: events.append("module-loaded")))
+    util = SimpleNamespace(spec_from_file_location=lambda *a: spec,
+                           module_from_spec=lambda value: pre)
+    scope = dict(importlib=SimpleNamespace(util=util),
+        args=SimpleNamespace(pre_sigma_helper="reviewed.py"),
+        inputs=SimpleNamespace(config=config), out=tmp_path, publish=object(), finished=[])
+    exec(compile(ast.Module(body=[block], type_ignores=[]), "<native-pre-sigma-preflight>", "exec"), scope)
+    assert events == ["module-loaded", "actual-config-validated"]
+    assert callable(scope["callback"])  # No W or callback body was executed.
+
+
+def test_pre_sigma_module_preflight_refusal_never_assigns_or_runs_callback(tmp_path):
+    tree = ast.parse(Path(owner.__file__).read_text())
+    block = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "args.pre_sigma_helper"
+        and any(isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id == "pre" for n in node.body))
+    error = AttributeError("actual typed configuration contract")
+    def validate(config):
+        raise error
+    pre = SimpleNamespace(validate_config=validate)
+    spec = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda value: None))
+    util = SimpleNamespace(spec_from_file_location=lambda *a: spec, module_from_spec=lambda value: pre)
+    scope = dict(importlib=SimpleNamespace(util=util), args=SimpleNamespace(pre_sigma_helper="reviewed.py"),
+        inputs=SimpleNamespace(config=object()), out=tmp_path)
+    with pytest.raises(AttributeError) as actual:
+        exec(compile(ast.Module(body=[block], type_ignores=[]), "<native-pre-sigma-preflight>", "exec"), scope)
+    assert actual.value is error and "callback" not in scope
 
 
 @pytest.mark.parametrize("extra", [["--bse-helper", "bse.py", "--pre-sigma-helper", "pre.py"],
