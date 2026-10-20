@@ -3,8 +3,36 @@
 import numpy as np
 import pytest
 import scipy.integrate as sint
+import scipy.linalg as sla
 
 from tdagw import keldysh_rational as kr
+
+
+@pytest.mark.parametrize("gamma", [1e-3, 1e-5])
+def test_finite_lag_screening_known_equilibrium_fdt_counterexample(gamma):
+    """Exact rational algebra, not a fit: bare residue FDT is insufficient.
+
+    The finite-lag model leaves positive-frequency lesser collective weight
+    as gamma -> 0. T=0 equilibrium FDT instead requires zero such weight.
+    This known statistical failure must not be presented as a numeric error.
+    """
+    delta, g = 1.0, 0.5
+    omega = np.sqrt(delta ** 2 + 2 * g * delta)
+    pl = kr.pole_residue_realization([-delta - 1j * gamma], np.array([[[g]]]))
+    pg = kr.pole_residue_realization([delta - 1j * gamma], np.array([[[g]]]))
+    wr = kr.screen_retarded(kr.add(pg, kr.scale(pl, -1)), np.ones((1, 1)))
+    wl = kr.screened_lesser(wr, pl)
+    poles, eigenvectors = sla.eig(wl[0])
+    residues = ((wl[2] @ eigenvectors).ravel()
+                * sla.solve(eigenvectors, wl[1]).ravel())
+    positive = residues[np.argmin(abs(poles - (omega - 1j * gamma)))]
+    exact = g * (omega - delta) * (omega - delta - 2j * gamma) / (
+        4 * omega * (omega - 1j * gamma))
+    limiting_weight = g * (omega - delta) ** 2 / (4 * omega ** 2)
+    np.testing.assert_allclose(positive, exact, atol=2e-10, rtol=1e-9)
+    assert limiting_weight == pytest.approx(0.010723304703363122)
+    assert positive.real == pytest.approx(limiting_weight, abs=4e-8)
+    assert positive.real > 0.01  # not the zero required by T=0 screened FDT
 
 
 def _direct_cauchy(system, z):

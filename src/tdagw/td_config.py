@@ -88,6 +88,7 @@ TD_DEFAULTS = {
     "lorrax.collision_refresh_df": 0.0,
     "lorrax.collision_refresh_sweep": "active",
     "lorrax.collision_screening": "frozen",
+    "lorrax.collision_statistics": "unspecified",
     "lorrax.collision_hamiltonian": "hf",
     "lorrax.collision_frozen_bands": None,
     "lorrax.collision_screening_gamma_ev": 0.001,
@@ -107,6 +108,7 @@ TD_DEFAULTS = {
     "lorrax.collision_projection_order": 400,
     "lorrax.collision_pencil_mb": 128,
     "lorrax.collision_fit_samples": 192,
+    "lorrax.collision_fit_real_axis": False,
     "lorrax.collision_fit_tolerance": 0.02,
     "lorrax.collision_adiabatic_ev": 0.05,
     "lorrax.collision_fit_height_ev": 0.15,
@@ -216,6 +218,16 @@ def _check_collision(vals: dict) -> None:
     if vals["lorrax.collision_hamiltonian"] not in ("hf", "reference"):
         raise _gate("td_collision_snapshot", "unknown collision Hamiltonian",
                     "hf | reference", "set collision_hamiltonian")
+    statistics = vals["lorrax.collision_statistics"]
+    if statistics not in ("unspecified", "finite_lag"):
+        raise _gate("td_collision_statistics", f"collision_statistics = {statistics!r}",
+                    "unspecified | finite_lag", "set [lorrax] collision_statistics")
+    if (form != "off" and vals["lorrax.collision_screening"] in ("joint", "joint_frozen")
+            and statistics != "finite_lag"):
+        raise _gate("td_collision_statistics", "joint screening statistics not explicitly selected",
+                    "collision_statistics = 'finite_lag' for the implemented statistical model",
+                    "explicitly acknowledge finite-lag statistics; screened equilibrium FDT is "
+                    "not generally satisfied and physical lossless statistics are not implemented")
     if (form != "off" and vals["lorrax.collision_screening"] in ("joint", "joint_frozen")
             and isinstance(vals["lorrax.stiff_modes"], int) and vals["lorrax.stiff_modes"] > 0):
         raise _gate("td_collision_snapshot", "stiff split with a joint snapshot",
@@ -244,6 +256,9 @@ def _check_collision(vals: dict) -> None:
     if vals["lorrax.collision_fit_samples"] < 4:
         raise _gate("td_collision_snapshot", "collision_fit_samples < 4",
                     "at least four distinct supports", "increase collision_fit_samples")
+    if not isinstance(vals["lorrax.collision_fit_real_axis"], bool):
+        raise _gate("td_collision_snapshot", "collision_fit_real_axis must be boolean",
+                    "true | false", "set [lorrax] collision_fit_real_axis")
     for key in ("collision_snapshot_tol_ev", "collision_fit_tolerance", "collision_adiabatic_ev",
                 "collision_fit_height_ev", "collision_snapshot_mixing"):
         try:
@@ -671,7 +686,7 @@ def inactive_keys(deck) -> dict:
          "model none on a TDGW header (occupations come from the header)"),
         (("lorrax.collision_source", "lorrax.collision_hermitian",
           "lorrax.collision_refresh_fs", "lorrax.collision_refresh_df",
-          "lorrax.collision_refresh_sweep", "lorrax.collision_screening",
+          "lorrax.collision_refresh_sweep", "lorrax.collision_screening", "lorrax.collision_statistics",
           "lorrax.collision_frozen_bands", "lorrax.collision_screening_gamma_ev",
           "lorrax.collision_rebase", "lorrax.collision_spm_support_sites_ev",
           "lorrax.collision_spm_chi0_active", "lorrax.collision_in_scattering",
@@ -1054,7 +1069,9 @@ TD_KEY_DOCS = {
         "screening at every converged snapshot; and `joint_frozen`, the identical "
         "reduced equilibrium screening held fixed as a control. Joint modes require "
         "`collision_basis = instantaneous`. Density rank, rational supports/order, "
-        "held-out errors and the adiabatic regulator have explicit controls below. "
+        "held-out errors and finite lag decay have explicit controls below. Joint modes "
+        "also require explicit `collision_statistics = finite_lag`; screened equilibrium "
+        "FDT is not generally satisfied by that statistical model. "
         "`refreshed` and `shared_pole` are refused by "
         "`td_collision_keldysh_screening`: those experimental paths reconstruct retarded W from "
         "instantaneous populations but do not construct the independent nonequilibrium W< or a "
@@ -1082,6 +1099,15 @@ TD_KEY_DOCS = {
         "(bank, moments, constructor), the pole count, whether the support sites moved, "
         "and the pole weight below 0.3 and 1 eV.",
         ("td_collision",)),
+    "lorrax.collision_statistics": (
+        "= not selected", "Statistical closure for joint and joint_frozen screening. "
+        "Active joint propagation refuses the default `unspecified` before GW setup. "
+        "The only implemented selection, `finite_lag`, explicitly accepts a lag-decay "
+        "statistical model whose screened equilibrium FDT is known not to hold in "
+        "general, even as the decay tends to zero. Physical lossless collective "
+        "statistics/adiabatic switch-on are not implemented. This is not a fit or "
+        "convergence tolerance. Legacy frozen screening and collision-off defaults "
+        "are unchanged.", ("td_collision_statistics",)),
     "lorrax.collision_rebase": (
         "= auto", "With refreshed or shared-pole screening and `collision = subtracted`: "
         "`on`, the subtracted C[ρ_eq] is re-evaluated on each refresh's W (one more "
@@ -1183,18 +1209,25 @@ TD_KEY_DOCS = {
         "", "Number of finite complex frequency supports for joint rational fitting. "
         "Independent held-out response and dressed-noise checks must pass before use.",
         ("td_collision",)),
+    "lorrax.collision_fit_real_axis": (
+        "", "Also train the joint rational fit on exact real parts of its complex "
+        "fit supports. The declared positive finite lag decay makes these boundary "
+        "samples finite. Real training supports are disjoint from the independent "
+        "real dressed-noise checks. This adds sampling and pencil cost, not frequency "
+        "integration, a regulator change or relaxed acceptance.", ("td_collision",)),
     "lorrax.collision_fit_tolerance": (
         "", "Relative held-out tolerance for both fluctuation bubbles, retarded "
         "screening and dressed fluctuation noise in the reduced Coulomb coordinates.",
         ("td_collision",)),
     "lorrax.collision_adiabatic_ev": (
-        "eV", "Declared exponential adiabatic regulator of frozen polarization lag "
-        "kernels in joint screening. This fixes the finite-regulator statistical model; "
-        "its convergence must be assessed separately from collision eta and fit offsets. "
+        "eV", "Declared positive exponential decay of frozen polarization lag kernels "
+        "in the finite_lag statistical model. The historical key name does not imply "
+        "a validated physical adiabatic limit: screened equilibrium FDT can fail even "
+        "as this decay tends to zero. Separate from collision eta and fit offsets. "
         "Undeclared real-axis collective poles refuse.", ("td_collision",)),
     "lorrax.collision_fit_height_ev": (
         "eV", "Imaginary offset of the rational fit supports. It is numerical sampling "
-        "geometry and is separate from the adiabatic regulator and collision broadening.",
+        "geometry and is separate from finite lag decay and collision broadening.",
         ("td_collision",)),
     "lorrax.collision_internal_pairing": (
         "= vertex", "With `collision_in_scattering = full`: the energy pairing of the "

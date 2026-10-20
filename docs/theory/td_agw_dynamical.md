@@ -786,8 +786,9 @@ differences vanish, whereas $P^<$ has transition noise proportional to
 $f(1-f)$. Thus $W^R=v$, $W_c^R=0$, but $\widehat W^<=v\widehat P^<v\ne0$.
 A bank inferred only from retarded poles loses this noise. The CPU gates
 include this counterexample, direct-frequency causal-projection agreement,
-repeated poles, full-matrix endpoint ordering, and equilibrium Bose residue
-weights. Regulator, rank and dynamical convergence remain run-level tests.
+repeated poles, full-matrix endpoint ordering, and bare-bubble equilibrium
+Bose residue weights. The last test is not a validation of screened FDT;
+the finite-lag screened model has the known failure described below.
 
 `tdagw.keldysh_rational` is the dense host reference for the algebra after
 $P^<$ and $W^R$ have been supplied: it composes plain state-space arrays,
@@ -795,7 +796,7 @@ forms the sharp transfer, and performs the causal split by ordered complex
 Schur decomposition plus a Sylvester solve. Its CPU gates compare the result
 with the direct real-frequency Cauchy integral, exercise a repeated pole, and
 retain the $\rho=fI$ noise pole when $W_c^R=0$. It refuses a pole on the real
-axis until the caller declares an adiabatic regulator.
+axis until the caller declares a positive finite lag decay.
 
 The production snapshot modules use a fixed Coulomb factor
 $v_q\simeq F_qF_q^\dagger$ of declared `collision_density_rank`. In its
@@ -834,9 +835,43 @@ leave an unintended density-dependent term.
 
 The separate controls are density rank, rational order/support count,
 fit-support height, collision regularization, and the declared exponential
-adiabatic regulator of the lag kernels. A finite regulator defines a finite
-statistical model; it is not a substitute for demonstrating its limiting
-behavior. `snapshot_collision.q_sigma_operators` evaluates the same ISDF
+finite lag decay of the lag kernels (historical key `collision_adiabatic_ev`).
+Active `joint` and `joint_frozen` propagation requires explicit
+`collision_statistics = "finite_lag"`; the default `unspecified` refuses
+before GW setup. This selection acknowledges a statistical model, not a
+validated physical adiabatic limit. Screened equilibrium FDT is known not
+to hold in general, even when this decay tends to zero. Lossless collective
+initial statistics/physical adiabatic switch-on are not implemented.
+
+An exact scalar counterexample needs no rational fit. Take zero-temperature
+bare transition functions
+$P^<(z)=g/(z+\Delta+i\gamma)$ and
+$P^>(z)=g/(z-\Delta+i\gamma)$, with $v=1$ and positive $g,\Delta$.
+Then $P^R=P^>-P^<$ and
+$W^R=[(z+i\gamma)^2-\Delta^2]/[(z+i\gamma)^2-\Omega^2]$,
+where $\Omega^2=\Delta^2+2g\Delta$. The implemented statistical construction
+$W^<=\mathcal C_-[W^R(P^<-P^{<\sharp})W^{R\sharp}]$ has a
+positive-frequency lower-pole residue
+
+$$
+r_+(\gamma)=\frac{g(\Omega-\Delta)(\Omega-\Delta-2i\gamma)}
+ {4\Omega(\Omega-i\gamma)}
+\ \longrightarrow\ \frac{g(\Omega-\Delta)^2}{4\Omega^2}>0.
+$$
+
+Equilibrium $T=0$ FDT requires zero positive-frequency lesser weight.
+For $\Delta=1,g=1/2$ the nonzero limit is $0.0107233047034$;
+the exact state-space regression checks both $\gamma=10^{-3}$ and $10^{-5}$.
+Off-resonant lag-broadened bare noise is amplified at the collective poles,
+so sending $\gamma$ to zero is a nonuniform statistical limit. This is a
+known model failure, not fit error or insufficient numerical convergence.
+At finite decay the supplied noise defines the stationary model; in a
+lossless physical treatment collective occupations additionally require
+initial correlations/switch-on information. No equilibrium or nonequilibrium
+statistical shortcut inferred solely from retarded $W$ is implemented.
+Subtracting the equilibrium collision term does not restore screened FDT.
+
+`snapshot_collision.q_sigma_operators` evaluates the same ISDF
 product in projected vertices, with column energy $E_b$ and internal phase
 $e_n$, and admits a general biorthogonal pole expansion only after checking
 its transfer reconstruction. Frozen states enter the coherent self-energy;

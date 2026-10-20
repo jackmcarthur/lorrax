@@ -115,15 +115,16 @@ def polarization_samples(psi, energy, rho, factor, kmq, sites, *,
     Inputs have shapes ``psi[k,b,s,mu]``, ``energy[k,b]`` (Ry),
     ``rho[k,b,b]``, ``factor[mu,r]``, ``kmq[k]`` and ``sites[support]``
     (Ry).  Output ``[2,support,r,r]`` is lesser then greater.  The declared
-    positive adiabatic regulator shifts transition poles by ``-i gamma``;
-    it is independent of support heights and the collision evaluation eta.
+    positive finite lag decay shifts transition poles by ``-i gamma``;
+    this is not a validated physical adiabatic statistical closure.
+    It is independent of support heights and the collision evaluation eta.
     Normalization is ``spin_weight / nk``; no cell-volume factor is added.
     """
     psi, energy, rho, factor = map(np.asarray, (psi, energy, rho, factor))
     sites = np.asarray(sites, dtype=complex)
     nk, nb = energy.shape
     if adiabatic_ry <= 0 or band_block < 1:
-        raise ValueError("GATE snapshot_regulator: declare positive adiabatic_ry and band_block")
+        raise ValueError("GATE snapshot_regulator: declare positive finite lag decay adiabatic_ry and band_block")
     if psi.shape[:2] != (nk, nb) or rho.shape != (nk, nb, nb):
         raise ValueError("GATE snapshot_band_support: inconsistent full-band arrays")
     kmq = np.asarray(kmq, dtype=int)
@@ -264,7 +265,7 @@ def make_projected_sampler(mesh_xy, *, band_block=32):
     its k carrier may be zero-padded to the mesh size.  Small band tables
     ``energy[k,b]`` (Ry), ``rho[k,b,b]``, exact ``kmq[k]`` and supports
     ``sites[s]`` (Ry) are replicated.  The returned ``[2,s,r,r]`` is
-    replicated.  ``gamma>0`` is the declared physical adiabatic regulator,
+    replicated.  ``gamma>0`` is the declared finite lag decay,
     independent of both support height and collision eta.
 
     Local k and band-pair loops are scans inside shard_map.  The full-rho
@@ -337,7 +338,9 @@ def joint_loewner(sites, samples, *, max_order=96, rank_tolerance=1e-11,
     """Fit a common strictly proper realization to stacked ``[P<;P>]``.
 
     ``samples[2,support,r,r]`` and complex ``sites[support]`` are small
-    replicated host arrays; energies use Ry.  All matrix entries enter the
+    replicated host arrays; energies use Ry.  Real boundary supports are
+    allowed when the declared finite lag decay makes their exact samples
+    finite.  All matrix entries enter the
     full-block Loewner pencil.  Its SVD selects at most ``max_order`` modal
     candidates; the strictly lower-half-plane candidate subset defines a
     stable approximation basis.  Joint output amplitudes are then fitted
@@ -471,12 +474,13 @@ def compact_causal_realization(system, sites, *, tolerance=1e-9):
 def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
                     fit_tolerance=1e-3, rank_tolerance=1e-11,
                     pole_tolerance=1e-12, max_projection_order=400,
-                    self_negative=False, max_pencil_bytes=128 * 1024 ** 2):
+                    self_negative=False, max_pencil_bytes=128 * 1024 ** 2,
+                    real_fit_sites=None):
     """Build and certify a reduced joint screened snapshot from a callback.
 
     ``sampler(sites)`` returns exact ``[2,support,r,r]`` bubble values in
     Coulomb coordinates.  Its declared electronic support, density rank,
-    and physical adiabatic regulator belong to the refresh receipt.  Fit
+    and finite lag decay belong to the refresh receipt. Fit
     and check supports (Ry) must be disjoint and strictly above the axis.
     A plain dict returns ``retarded`` (total W), ``correlation`` (WcR),
     ``lesser`` (one-sided W<), and sample/error/pole receipts.  Causal
@@ -489,6 +493,12 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
     ``max_projection_order`` bounds causal-projection states and
     ``max_pencil_bytes`` bounds each block Loewner pencil before allocation;
     increasing these capacity limits does not change fit acceptance.
+    Optional ``real_fit_sites`` are exact, finite boundary training supports
+    for the same joint fit, not frequency integration nodes.  The sampler's
+    positive finite lag decay makes these samples finite. It is not a
+    validated physical adiabatic statistical closure. They
+    must be disjoint from ``check_sites.real``, which remains an independent
+    dressed-noise oracle; no check values enter training.
     """
     fit_sites, check_sites = (np.asarray(x, dtype=complex) for x in (fit_sites, check_sites))
     if (check_sites.size == 0 or not np.isfinite(fit_sites).all()
@@ -496,8 +506,20 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
             or np.any(check_sites.imag <= 0) or np.intersect1d(fit_sites, check_sites).size
             or not np.isfinite(fit_tolerance) or fit_tolerance <= 0):
         raise ValueError("GATE snapshot_check_support: positive disjoint fit/check supports required")
+    real_fit_sites = (np.empty(0, complex) if real_fit_sites is None
+                      else np.asarray(real_fit_sites, dtype=complex))
+    if (real_fit_sites.ndim != 1 or not np.isfinite(real_fit_sites).all()
+            or np.any(real_fit_sites.imag != 0)
+            or np.unique(real_fit_sites).size != real_fit_sites.size
+            or np.intersect1d(real_fit_sites, check_sites.real).size):
+        raise ValueError("GATE snapshot_check_support: finite unique real training supports "
+                         "must be disjoint from real noise checks")
     data = np.asarray(sampler(fit_sites), dtype=complex)
-    fit = joint_loewner(fit_sites, data, max_order=max_order, rank_tolerance=rank_tolerance,
+    joint_sites = fit_sites
+    if real_fit_sites.size:
+        joint_sites = np.concatenate((fit_sites, real_fit_sites))
+        data = np.concatenate((data, np.asarray(sampler(real_fit_sites), dtype=complex)), axis=1)
+    fit = joint_loewner(joint_sites, data, max_order=max_order, rank_tolerance=rank_tolerance,
                         max_pencil_bytes=max_pencil_bytes)
     pl, pg = fit["lesser"], fit["greater"]
     if self_negative:
@@ -549,8 +571,8 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
     wl = compact_causal_realization(wl, check_sites)
     wc = (wr[0], wr[1], wr[2], np.zeros_like(wr[3]))
     # This independent check sees the dressed noise, rather than inferring
-    # its accuracy from separate P and retarded W residuals.  The physical
-    # adiabatic regulator in the sampler makes real support evaluation finite.
+    # its accuracy from separate P and retarded W residuals. The declared
+    # finite lag decay in the sampler makes real support evaluation finite.
     real_sites = check_sites.real.astype(complex)
     noise_data = np.asarray(sampler(real_sites), dtype=complex)
     noise_exact, noise_fit = [], []
@@ -579,6 +601,7 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
                         "fit_pencil_bytes": int(fit["pencil_bytes"]),
                         "self_negative_crossing": bool(self_negative),
                         "fit_sites_ry": fit_sites.copy(), "check_sites_ry": check_sites.copy(),
+                        "real_fit_sites_ry": real_fit_sites.copy(),
                         "retarded_poles_ry": np.linalg.eigvals(wr[0]),
                         "lesser_order": wl[0].shape[0],
                         "noise_only_poles_allowed": True,

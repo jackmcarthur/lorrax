@@ -3201,7 +3201,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         selection, selection_resident, selection_workspace = line_route(line_width, 3*2*line_width*face_bytes)
         line_selections = {line_width: selection}
         if len(qids) % line_width:
-            line_selections[len(qids) % line_width] = line_selector(selection.execution, len(qids) % line_width)
+            # The remainder span runs under the full span's admitted route: its execution and room.
+            rest = len(qids) % line_width
+            line_selections[rest] = line_selector(selection.execution, rest, selection.room)
         receipt["line_selection"].update(execution=selection.execution, q_width=line_width,
             resident_bytes_per_rank=selection_resident, workspace_bytes_per_rank=selection_workspace)
         line_layout = ("batch" if selection.execution == "local" and dyson.pair("batch") is not None
