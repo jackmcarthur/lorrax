@@ -454,11 +454,9 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
     without it.  That is why the feature is opt-in and why the off arm is
     gated bit-identical.
 
-    The dipoles also carry the velocity-sign convention of the FILE they came
-    from.  Since the head is quadratic in ``d`` it inherits that convention
-    at full strength.  As of 2026-08-09 the tree's default arm is ``+1`` and
-    the tracked fixtures were re-cut on it, so the provenance stamp is read
-    and logged rather than assumed.
+    The dipoles are the one velocity ``i[H, r]`` (``dipole.h5`` format 2,
+    ``GATE dipole_format_version`` refuses older files); the head is
+    quadratic in ``d``, so an older operator would enter at full strength.
     """
     from .absorption_common import (build_dipole_vector_bse, slice_dipole_to_bse_window)
     from file_io.restart_bundle import (load_dipole_h5)

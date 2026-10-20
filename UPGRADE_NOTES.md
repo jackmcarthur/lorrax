@@ -30,16 +30,20 @@ deck key `vnl_velocity_sign`, the dipole step's `--vnl-velocity-sign`, the
 `common.mtxel_sweep.dipole_operator` / `uniform_gauge_operator` and
 `psp.get_dipole_mtxels.compute_finite_q_mtxels` (whose keyword default was
 the subtraction).  A deck that still names the key reports it as unrecognized.
-`--skip-vnl` (bare $p$) stays: it is another operator, not a sign.
 
-Files: `dipole.h5` now carries `format_version = 2`, and every reader refuses a
-file without it (`GATE dipole_format_version`); parallel-transport artifacts
-move to schema 5 and Hall artifacts to schema 3, and their readers refuse older
-schemas (the velocity reader of `sc_head_update = dft_velocity` used to accept
-schemas 2–4 without checking the operator).  Regenerate all three with
-`python -m psp.get_dipole_mtxels -i <deck>`.  Values built at the former
-default (+1) are unchanged; the Hall operator fingerprint of a +1 artifact is
-byte-identical.
+- **Regenerate every `dipole.h5`.** Every `dipole.h5` written before this
+  commit must be regenerated with `python3 -m psp.get_dipole_mtxels -i <deck>`.
+  Readers refuse a file without `format_version = 2`
+  (`GATE dipole_format_version`); there is no migration reader. The same
+  command rewrites the parallel-transport artifact (now schema 5) and the Hall
+  artifact (now schema 3), whose readers refuse older schemas (the velocity
+  reader of `sc_head_update = dft_velocity` used to accept schemas 2–4 without
+  checking the operator).
+- **`--skip-vnl` is unchanged.** The bare momentum $p$ (BerkeleyGW
+  `use_momentum`) stays a separate operator, not a sign; its files are
+  regenerated the same way.
+- **Results.** Values built at the former default (+1) are unchanged; the Hall
+  operator fingerprint of a +1 artifact is byte-identical.
 
 ## 2026-10-20 — c1 head channel: the q ≠ 0 projector carries the gauge phase
 

@@ -104,8 +104,8 @@ The correction is Hermitian and positive semidefinite because
 when the \(\Gamma\) sample stands for its cell. It is not a more accurate
 pointwise evaluation along a finite-q band path.
 
-The dipole includes the nonlocal-pseudopotential commutator and carries its
-velocity-sign provenance in `dipole.h5`. The tensor follows the Cartesian
+The dipole is the one velocity `i[H, r]`, nonlocal-pseudopotential commutator
+included; readers refuse a `dipole.h5` older than format 2. The tensor follows the Cartesian
 convention in [The S-tensor convention](s-tensor-convention.md).
 
 The deck key `head_minibz_average` selects the cell average in the

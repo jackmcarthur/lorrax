@@ -161,9 +161,9 @@ jax.config.update("jax_enable_x64", True)
 #: 2. The converse hazard, which is the one that produces WRONG NUMBERS rather
 #:    than slow ones: two operators that hash the same share a compiled program,
 #:    so the second arm of an A/B silently re-runs the first.
-#:    ``mtxel_sweep.dipole_operator`` had to put its velocity SIGN into
-#:    ``_operator_key`` for exactly this reason ("the defect class this project
-#:    has already paid for twice").  :func:`assert_distinct_operators` is the
+#:    ``mtxel_sweep.dipole_operator`` once had to put its (since deleted)
+#:    velocity sign into ``_operator_key`` for exactly this reason ("the defect
+#:    class this project has already paid for twice").  :func:`assert_distinct_operators` is the
 #:    caller-facing assertion; the registry below is the automatic half.
 #:
 #: ONLY THE MATVEC IS CACHED, and that is the whole point of the split.  The

@@ -511,7 +511,7 @@ def dipole_provenance(*, wfn, wfn_path, nval, ncond, nband,
     }
     if hubbard is not None:
         attrs["prov_hubbard"] = str(hubbard)
-    # ``analytic`` and the VNL sign do not identify the implementation.  In
+    # ``analytic`` does not identify the implementation.  In
     # particular, 5036f21b replaced the old sqrt(q^2+1e-8) projector
     # regularizer and approximate l>0 origin row by exact reduced-radial
     # moments.  That reaches ordinary Gamma-point dZ and therefore the stored
