@@ -1366,8 +1366,15 @@ def _coulomb_pack(basis,mesh_xy):
 _COULOMB_ROOTS: dict = {}
 
 
-def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
-    """Read one authenticated canonical V batch; convert through its owner."""
+def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute, *, cache_config=None,
+                   cache_receipt=None):
+    """Read one authenticated canonical V batch; convert through its owner.
+
+    ``cache_config`` may name the bank's solve dial when a face constructor
+    requires a different fresh-solve layout. Only already checked roots are
+    borrowed through that dial; a miss still uses ``config`` and its normal
+    workspace admission. Both layouts return the same packed face resources.
+    """
     if "photon_v" in bank_io:
         value = bank_io["photon_v"][q_span[0]:q_span[1]]
         return value, None, [value.shape[-1]] * (q_span[1]-q_span[0])
@@ -1377,19 +1384,36 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     token = resource.get("operator")
     key = None if token is None else (token, (int(q_span[0]), int(q_span[1])),
                                       basis.n_packed, basis.n_logical, layout, mesh_xy)
-    held = _COULOMB_ROOTS.get(key)
-    if held is not None and not any(x.is_deleted() for x in held[:2]):
-        return held
-    if key is not None:
+    lookup_keys = []
+    if key is not None and cache_config is not None:
+        cached_layout = dense_layout(meta, cache_config, mesh_xy, basis.n_packed)
+        lookup_keys.append((*key[:4], cached_layout, key[5]))
+    if key is not None and key not in lookup_keys:
+        lookup_keys.append(key)
+    for lookup in lookup_keys:
+        held = _COULOMB_ROOTS.get(lookup)
+        if held is not None and not any(x.is_deleted() for x in held[:2]):
+            if cache_receipt is not None:
+                cache_receipt['root_cache'] = dict(hit=True, solve_layout=layout,
+                    source_layout=lookup[4], requested_span=list(q_span),
+                    covering_span=list(lookup[1]), fresh_solve=False)
+            return held
         # A constructor round asks for a sub-span of the parents the producer
         # already rooted (the held all-q entry): slice those rows instead of a
         # second read and eigensolve of the same V.
         for (k_token, (k_lo, k_hi), *k_rest), cover in _COULOMB_ROOTS.items():
-            if (k_token == token and tuple(k_rest) == key[2:] and k_lo <= key[1][0]
-                    and key[1][1] <= k_hi and not any(x.is_deleted() for x in cover[:2])):
-                a, b = key[1][0] - k_lo, key[1][1] - k_lo
+            if (k_token == token and tuple(k_rest) == lookup[2:] and k_lo <= lookup[1][0]
+                    and lookup[1][1] <= k_hi and not any(x.is_deleted() for x in cover[:2])):
+                a, b = lookup[1][0] - k_lo, lookup[1][1] - k_lo
                 rows, start = _span_rows(mesh_xy, b - a), _span_cursor(mesh_xy, (k_token, k_lo), a, b)
+                if cache_receipt is not None:
+                    cache_receipt['root_cache'] = dict(hit=True, solve_layout=layout,
+                        source_layout=lookup[4], requested_span=list(q_span),
+                        covering_span=[k_lo, k_hi], fresh_solve=False)
                 return rows(cover[0], start), rows(cover[1], start), list(cover[2][a:b])
+    if cache_receipt is not None:
+        cache_receipt['root_cache'] = dict(hit=False, solve_layout=layout,
+            requested_span=list(q_span), fresh_solve=True)
     h, hi, ranks = _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute)
     if key is not None:
         for stale in [k for k in _COULOMB_ROOTS if k[0] != token]:

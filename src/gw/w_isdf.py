@@ -2191,20 +2191,23 @@ def compute_response_moments(wfns, meta, config, *, mesh_xy, sym, bank_io):
                                bank_io=bank_io)
 
 
-def response_coulomb_powers(meta, config, *, mesh_xy, bank_io, q_span):
+def response_coulomb_powers(meta, config, *, mesh_xy, bank_io, q_span, cache_config=None):
     """Read one authenticated parent batch and return H, H_pinv, receipt.
 
     H=V^1/2 and H_pinv=V^-1/2 on the numerical PSD support (zero outside).
     Both outputs are packed complex128 ``[b,mu_p,mu_p]`` face arrays at
-    ``P(None,'x','y')``. They are temporary caller-owned resources, never
-    a retained full-q copy. The receipt binds the Coulomb hash and ranks.
+    ``P(None,'x','y')``. A checked covering bank cache may own their backing
+    arrays; callers retain only the requested span, not another full-q copy.
+    ``cache_config`` selects that bank's cache dial, never a fresh fallback.
+    The receipt binds the Coulomb hash and ranks.
     """
     from .response_bank import (_bank_execution, _coulomb_batch, _receipt,
                                 authenticate_coulomb)
     authenticate_coulomb(bank_io, bank_io["coulomb"]["q_irr_full_idx"])
     receipt = _receipt("coulomb", {}, bank_io)
     execute = _bank_execution(meta, mesh_xy, receipt, config)
-    h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute)
+    h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute,
+                                 cache_config=cache_config, cache_receipt=receipt)
     receipt.update(support_ranks=ranks, completion=True)
     return h, hi, receipt
 

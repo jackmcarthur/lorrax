@@ -744,13 +744,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 for lo, hi in runs:
                     coulomb_sqrt, part, receipt = response_coulomb_powers(
                         meta, coulomb_config, mesh_xy=mesh_xy, bank_io=bank,
-                        q_span=(lo, hi))
+                        q_span=(lo, hi), cache_config=config)
                     del coulomb_sqrt
                     parts.append(part)
                     # One parent's support rank and the resource hash; the resource
                     # itself (path, q order) is the bank's, stated once.
                     coulomb.update({q: dict(sha256=receipt["coulomb_identity"].get("sha256"),
-                                            support_ranks=receipt["support_ranks"][q - lo:q - lo + 1])
+                                            support_ranks=receipt["support_ranks"][q - lo:q - lo + 1],
+                                            root_cache=receipt.get("root_cache"))
                                     for q in range(lo, hi)})
                 inverse_sqrt = face_rows(mesh_xy, tuple(sorted(ids[:real]).index(q) for q in ids))(*parts)
                 if execution == 'local':
