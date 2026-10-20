@@ -98,8 +98,13 @@ def main():
         source_tree=os.environ.get('LEG_SOURCE_TREE'),
         archive_sha256=os.environ.get('LEG_SOURCE_ARCHIVE_SHA256'), walls_s={})
     def save():
+        error = None
         if rank0:
-            (root/'receipt.json').write_text(json.dumps(report, indent=2, default=str)+'\n')
+            try:
+                (root/'receipt.json').write_text(json.dumps(report, indent=2, default=str)+'\n')
+            except OSError as exc:
+                error = exc
+        agree_io_refusal(error, path=root/'receipt.json', stage='source_frozen/receipt')
     def timed(name, fn):
         report['phase'] = name; save()
         start = time.perf_counter()
@@ -150,8 +155,13 @@ def main():
             min_blocking_mev=float(np.linalg.eigvalsh(gamma-injection).min())*RYD_TO_EV*1e3,
             min_gamma_mev=float(np.linalg.eigvalsh(gamma).min())*RYD_TO_EV*1e3,
             positivity_claim=False)
+        error = None
         if rank0:
-            np.savez(root/'operators.npz', **arrays)
+            try:
+                np.savez(root/'operators.npz', **arrays)
+            except OSError as exc:
+                error = exc
+        agree_io_refusal(error, path=root/'operators.npz', stage='source_frozen/operators')
     except Exception:
         report.update(status='refused', error=traceback.format_exc()); rc=1
         say(report['error'], flush=True)
