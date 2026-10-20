@@ -24,11 +24,16 @@ through the symmetry service as before.
   `si8v2` `eqpA_main_si.dat` (htransform at 6446c17d3) within 1.0e-6 meV
   (1.0e-7 % of its 965.03 meV QP fundamental gap, direct 3072.79 meV).
   Wedge files are bit for bit (Si 4³ `eqp1.dat`, `eqp1_a.dat`). The old
-  Si 8³ `sidirect/eqpA_si.dat` (bands 1–16 from the QRCP htransform)
+  Si 8³ `sidirect/eqpA_si.dat` (36 bands; QP column of bands 1–16 from
+  the QRCP htransform)
   refuses at 476.03 meV (band 15, k = (3/8, 3/8, 3/8) against (3/8, 0, 0);
   50.9 % of its 935.54 meV QP fundamental gap, direct 3072.76 meV). LORRAX
   BSE runs on it applied star-representative energies that BerkeleyGW did
   not; rerun them on a symmetric file.
+- **htransform.** `--eqp-file` (`read_eqp_energies`) uses the same reader
+  and the same gate, with E_DFT from the file's own column: a full-zone
+  coarse eqp file keeps its per-k blocks, a star-asymmetric one refuses, and
+  a wedge file reads bit for bit as before.
 - **Newly accepted:** a full-zone file on a reduced WFN, which used to
   refuse on its block count.
 - **Newly refused:** a file with at least N_k blocks in which some full-BZ k

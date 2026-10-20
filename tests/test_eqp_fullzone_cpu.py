@@ -5,6 +5,7 @@ either as the WFN's file wedge (unfolded through the symmetry service, as
 before) or, when the file has a block for every full-BZ k, block by block,
 which is how BerkeleyGW reads it.  Both refuse QP shifts E_QP - E_DFT that
 differ across a symmetry star by more than 1 meV (``GATE eqp_star_spread``).
+htransform's ``read_eqp_energies`` places its file through the same helper.
 
 Host-side file reader, no device code: a CPU unit cell, exempt from the
 four-GPU rule under its unit-and-CPU-cell clause.  The stars are the bcc Na
@@ -88,7 +89,8 @@ def _full_zone_wfn(sym):
         irr_idx_k=kf[np.asarray(sym.irr_idx_k)],
         sym_idx_k=np.asarray(sym.sym_idx_k),
         sym_mats_k=np.asarray(sym.sym_mats_k),
-        nk_tot=int(sym.nk_tot), nk_red=int(sym.nk_tot))
+        nk_tot=int(sym.nk_tot), nk_red=int(sym.nk_tot),
+        kirr_fullids=np.arange(int(sym.nk_tot), dtype=np.int32))
 
 
 def test_wedge_file_is_unchanged_bit_for_bit(case, tmp_path):
@@ -140,6 +142,40 @@ def test_star_asymmetric_full_zone_file_refuses(case, tmp_path):
                        r"5\.00\d meV") as err:
         apply_eqp_corrections(case.e_full / RY, f, _deck(tmp_path))
     assert f"full-BZ k {k_star} " in str(err.value)
+
+
+def test_htransform_reader_keeps_full_zone_blocks(case, tmp_path):
+    """``read_eqp_energies``: a full-zone file keeps its per-k blocks; a wedge file reads as before.
+
+    The first assertion fails under the pre-fix reader, which unfolded the
+    file from star parents on a full-zone WFN.
+    """
+    import jax.numpy as jnp
+    from common.units import RYD_TO_EV
+    from file_io.restart_bundle import read_eqp_energies
+
+    window = (1, 5)                                     # absolute bands, offset 0
+    fz = _full_zone_wfn(case.sym)
+    k_star = _k_off_its_parent(case.sym)
+    q = case.q_full.copy()
+    q[k_star, 2] += 0.4 * EQP_STAR_SPREAD_TOL_EV       # under the gate
+    f = _write(tmp_path / "eqp_full.dat", case.k_full, case.e_full, q)
+    _k, _d, q_file, _off = read_bgw_eqp(f)
+
+    def ry(a_ev):
+        return np.asarray(jnp.asarray(a_ev.T / RYD_TO_EV, dtype=jnp.float64))
+
+    got = np.asarray(read_eqp_energies(f, fz, window))  # (nb, nk) Ry
+    assert np.array_equal(got, ry(q_file[:, 1:5]))
+    # Control variant: the pre-fix unfold reads k_star's star parent.
+    old = np.asarray(case.unfold(fz, q_file[:, 1:5]))
+    assert abs(old[k_star, 1] - q_file[k_star, 2]) > 0.3 * EQP_STAR_SPREAD_TOL_EV
+
+    fw = _write(tmp_path / "eqp_wedge.dat", case.k_wedge, case.e_wedge,
+                case.q_wedge)
+    _k, _d, q_w, _off = read_bgw_eqp(fw)
+    assert np.array_equal(np.asarray(read_eqp_energies(fw, case.sym, window)),
+                          ry(np.asarray(case.unfold(case.sym, q_w[:, 1:5]))))
 
 
 def test_full_zone_sized_file_off_the_grid_refuses(case, tmp_path):

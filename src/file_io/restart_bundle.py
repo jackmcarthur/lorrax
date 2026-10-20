@@ -4281,33 +4281,33 @@ def read_bgw_eqp(eqp_file: str):
 
 
 def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.Array:
-    """Full-BZ QP energies from the IRREDUCIBLE-WEDGE ``eqp{0,1}.dat``.
+    """Full-BZ QP energies from a BerkeleyGW ``eqp{0,1}.dat``.
 
-    Reads the BerkeleyGW-columnar eqp file LORRAX's GW writes — one block
-    per ``wfn.kpoints`` entry, the crystal coordinate in the block header,
-    energies in eV — and returns ``(nb, nk_full)`` in RYDBERG over
-    ``band_window``, which is what this module's DFT path returns.
+    Reads the BerkeleyGW-columnar eqp file — the crystal coordinate in each
+    block header, energies in eV — and returns ``(nb, nk_full)`` in RYDBERG
+    over ``band_window``, which is what this module's DFT path returns.
 
-    THE UNFOLD IS THE SERVICE'S, NOT THIS MODULE'S.  Every IBZ→full-BZ
-    map in the tree goes through ``symmetry_maps.star_broadcast``, reached
-    here by :func:`symmetry_maps.unfold_file_wedge_to_full_bz` — the FILE
-    wedge, ``wfn.kpoints``, which is what ``eqp1.dat`` is indexed by and
-    what BerkeleyGW means by the IBZ.  It shares its backend with the
-    kin_ion read path; no index table crosses into this module.
+    TWO FILE FORMS, ONE PLACEMENT.  The wedge LORRAX's GW writes (one block
+    per ``wfn.kpoints`` entry: the FILE wedge, which is what BerkeleyGW means
+    by the IBZ) is unfolded through ``symmetry_maps``; a full-zone file (a
+    block for every full-BZ k) gives every k its own block.  Both go through
+    :func:`_eqp_on_full_bz`, the BSE reader's helper, which also refuses
+    star-asymmetric QP shifts (``GATE eqp_star_spread``, measured against
+    the file's own E_DFT column).  This reader used to unfold every file
+    from star representatives, so on a full-zone WFN it kept one block per
+    star and discarded the rest.
 
     WHAT THIS REPLACED, AND WHY.  It used to require a PRE-UNFOLDED
     full-BZ text file (``nk == sym.nk_tot``, refused otherwise) whose
     ``k-point N:`` blocks it paired to full-BZ k BY POSITION, with no
     coordinate ever read.  Nothing in the tree wrote that file: it came
     from an out-of-tree ``make_eqp_htformat.py`` that joined
-    ``eqp_g0w0.dat`` against ``eqp1.dat`` to do the unfold by hand.  That
-    is bespoke unfolding one hop upstream, plus a positional pairing that
-    a re-ordered file passes silently.  Now the wedge file is read
-    directly and the service does the unfold, so the converter has no job
-    left and the position never enters.
+    ``eqp_g0w0.dat`` against ``eqp1.dat`` to do the unfold by hand.  The
+    wedge file is now read directly and the service does the unfold; a
+    full-zone file is matched by coordinate, never by position.
 
-    The block coordinates are CHECKED against the deck's own wedge
-    (``sym.unfolded_kpts[sym.kirr_fullids]``) rather than trusted — a
+    A wedge file's block coordinates are CHECKED against the deck's own
+    wedge (``sym.unfolded_kpts[sym.kirr_fullids]``) rather than trusted — a
     file from another deck, or in another order, is refused here instead
     of producing a quasiparticle bandstructure with the energies on the
     wrong k.
@@ -4317,35 +4317,36 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
     if nb == 0:
         raise ValueError("Empty band window requested for EQP override")
 
-    from symmetry_maps import unfold_file_wedge_to_full_bz
-
     kpts_file, _e_dft_ev, e_qp_ev, band_offset = read_bgw_eqp(eqp_file)
     nk_file, nb_file = e_qp_ev.shape
 
-    # ---- the file must be THIS deck's wedge, in the wedge's order -------
-    kirr = np.asarray(sym.unfolded_kpts, dtype=np.float64)[
-        np.asarray(sym.kirr_fullids, dtype=np.int64)]
-    if nk_file != kirr.shape[0]:
-        raise ValueError(
-            f"{os.path.basename(eqp_file)} holds {nk_file} k-blocks but this "
-            f"deck's irreducible wedge has {kirr.shape[0]} (full BZ "
-            f"{int(sym.nk_tot)}).  This reader takes the wedge file LORRAX's "
-            f"GW writes; the pre-unfolded full-BZ form is no longer read.")
-    # Written by ``%13.9f``, so equality is to that many places; the
-    # comparison is modulo a lattice vector because either side may carry
-    # a k in a different periodic image.
-    dk = np.asarray(kpts_file, dtype=np.float64) - kirr
-    dk -= np.rint(dk)
-    worst = float(np.max(np.abs(dk))) if dk.size else 0.0
-    if worst > 1e-6:
-        bad = int(np.argmax(np.max(np.abs(dk), axis=1)))
-        raise ValueError(
-            f"{os.path.basename(eqp_file)} block {bad} is at "
-            f"{np.asarray(kpts_file)[bad].tolist()} but this deck's wedge "
-            f"point {bad} is {kirr[bad].tolist()} (worst |Δk| = {worst:.2e} "
-            f"over {nk_file} blocks).  The eqp file does not belong to this "
-            f"wavefunction, or its k-order differs — either way its energies "
-            f"would land on the wrong k.")
+    # ---- a wedge file must be THIS deck's wedge, in the wedge's order ---
+    # (a full-zone file is matched by coordinate in ``_eqp_on_full_bz``)
+    if nk_file < int(sym.nk_tot):
+        kirr = np.asarray(sym.unfolded_kpts, dtype=np.float64)[
+            np.asarray(sym.kirr_fullids, dtype=np.int64)]
+        if nk_file != kirr.shape[0]:
+            raise ValueError(
+                f"{os.path.basename(eqp_file)} holds {nk_file} k-blocks but "
+                f"this deck's irreducible wedge has {kirr.shape[0]} (full BZ "
+                f"{int(sym.nk_tot)}).  This reader takes the wedge file "
+                f"LORRAX's GW writes, or a full-zone file with a block for "
+                f"every full-BZ k.")
+        # Written by ``%13.9f``, so equality is to that many places; the
+        # comparison is modulo a lattice vector because either side may carry
+        # a k in a different periodic image.
+        dk = np.asarray(kpts_file, dtype=np.float64) - kirr
+        dk -= np.rint(dk)
+        worst = float(np.max(np.abs(dk))) if dk.size else 0.0
+        if worst > 1e-6:
+            bad = int(np.argmax(np.max(np.abs(dk), axis=1)))
+            raise ValueError(
+                f"{os.path.basename(eqp_file)} block {bad} is at "
+                f"{np.asarray(kpts_file)[bad].tolist()} but this deck's wedge "
+                f"point {bad} is {kirr[bad].tolist()} (worst |Δk| = {worst:.2e} "
+                f"over {nk_file} blocks).  The eqp file does not belong to this "
+                f"wavefunction, or its k-order differs — either way its energies "
+                f"would land on the wrong k.")
 
     # ---- absolute band window -> the file's columns ---------------------
     lo, hi = start - band_offset, end - band_offset
@@ -4363,12 +4364,8 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
             f"{window_ev.size} (k, band) entries inside the requested window "
             f"[{start}, {end}) — a short block cannot be silently padded.")
 
-    # ---- THE unfold: wedge -> full BZ, through the service --------------
-    # The FILE wedge: ``eqp1.dat`` is indexed by ``wfn.kpoints``, which is a
-    # different (and on two of three committed decks a different-LENGTH)
-    # k-set from the star wedge — see the register.  The call site says
-    # which without the reader needing to know what ``trs_reference`` is.
-    full_ev = np.asarray(unfold_file_wedge_to_full_bz(sym, window_ev))
+    # ---- THE placement on the full BZ, star-gated -----------------------
+    full_ev = np.asarray(_eqp_on_full_bz(sym, eqp_file, None))[:, lo:hi]
     if full_ev.shape[0] != int(sym.nk_tot):
         raise ValueError(
             f"star_broadcast returned {full_ev.shape[0]} k-points, expected "
@@ -4385,7 +4382,7 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
 EQP_STAR_SPREAD_TOL_EV = 1.0e-3
 
 
-def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray) -> np.ndarray:
+def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray | None) -> np.ndarray:
     """A BerkeleyGW eqp file's QP energies on the full BZ, ``(nk_tot, nb)`` eV.
 
     The file is read in one of two forms, decided by its block coordinates:
@@ -4408,7 +4405,10 @@ def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray) -> np.ndarray
     ``GATE eqp_star_spread`` refuses otherwise, naming the file, the band
     (the file's 1-based label) and the two k that bound the worst star.  On
     a wedge file the unfolded QP energies are star-constant, so the gate
-    reads the star spread of ``e_dft_full_ev`` itself.
+    reads the star spread of ``e_dft_full_ev`` itself.  ``e_dft_full_ev =
+    None`` measures the shifts against the file's own E_DFT column, placed on
+    the full BZ the same way (:func:`read_eqp_energies`, which holds no DFT
+    table).  An entry missing on either side is a zero shift.
     """
     from symmetry_maps import unfold_file_wedge_to_full_bz
 
@@ -4435,9 +4435,14 @@ def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray) -> np.ndarray
                     f"grid.")
             own[ik] = hits[0]
         e_qp_full = np.asarray(e_qp_file)[own]
+        if e_dft_full_ev is None:
+            e_dft_full_ev = np.asarray(_e_dft_file)[own]
     elif nk_file == int(sym.nk_red):
         # FILE WEDGE: the service's unfold.
         e_qp_full = np.asarray(unfold_file_wedge_to_full_bz(sym, e_qp_file))
+        if e_dft_full_ev is None:
+            e_dft_full_ev = np.asarray(
+                unfold_file_wedge_to_full_bz(sym, _e_dft_file))
     else:
         raise ValueError(
             f"{name} holds {nk_file} k-blocks, but this deck's file wedge has "
@@ -4449,8 +4454,8 @@ def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray) -> np.ndarray
     n = min(int(e_qp_full.shape[1]), int(np.shape(e_dft_full_ev)[1]))
     if n:
         qp = e_qp_full[:, :n]
-        shift = np.where(np.isnan(qp), 0.0,
-                         qp - np.asarray(e_dft_full_ev, dtype=np.float64)[:, :n])
+        dft = np.asarray(e_dft_full_ev, dtype=np.float64)[:, :n]
+        shift = np.where(np.isnan(qp) | np.isnan(dft), 0.0, qp - dft)
         labels = np.asarray(sym.irr_idx_k)
         order = np.argsort(labels, kind="stable")
         first = np.flatnonzero(np.r_[True, np.diff(labels[order]) != 0])

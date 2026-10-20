@@ -1687,13 +1687,14 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
         except Exception as exc:
             raise SystemExit(
                 f"FATAL: --eqp-file {os.path.basename(eqp_path)} could not be "
-                f"consumed: {exc}\nExpected LORRAX's GW ``eqp1.dat`` as "
-                f"written: BerkeleyGW columns on the IRREDUCIBLE WEDGE — "
-                f"{getattr(sym, 'nk_red', '?')} k-blocks for this deck, each "
-                f"a '(3f13.9,i8)' crystal-coordinate header followed by that "
-                f"many '(2i8,2f15.9)' band rows in eV.  Pass it directly; the "
-                f"unfold to this deck's {getattr(sym, 'nk_tot', '?')} full-BZ "
-                f"k-points happens here, through the symmetry service.  No "
+                f"consumed: {exc}\nExpected a BerkeleyGW-format eqp file: "
+                f"LORRAX's GW ``eqp1.dat`` on the IRREDUCIBLE WEDGE "
+                f"({getattr(sym, 'nk_red', '?')} k-blocks for this deck, in "
+                f"WFN order) or a full-zone file with a block for each of the "
+                f"deck's {getattr(sym, 'nk_tot', '?')} full-BZ k-points, each "
+                f"block a '(3f13.9,i8)' crystal-coordinate header followed by "
+                f"that many '(2i8,2f15.9)' band rows in eV, with QP shifts "
+                f"equal across every symmetry star.  Pass it directly; no "
                 f"pre-conversion step is needed or accepted."
             ) from exc
 
