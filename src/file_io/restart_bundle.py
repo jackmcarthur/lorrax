@@ -787,11 +787,14 @@ def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
     return v, c, V[0], qgrid(W), qgrid(V) if full_exchange else None
 
 
-def read_coarse_interactions(filename, input_file, mesh_xy):
+def read_coarse_interactions(filename, input_file, mesh_xy, *, pad_mu=False):
     """Return canonical coarse ψ host cache and sharded full-q V/W arrays.
 
     Only one k row is replicated for each host transfer. Interaction arrays
     stay XY sharded and are never restored on a one-device shadow mesh.
+    ``pad_mu``: ψ on the mesh's centroid carrier (``padded_mu_extent``, exact
+    zero pad columns), the extent the V/W arrays already have, so every
+    (μ, ν) face its consumers build tiles the mesh; else the logical count.
     """
     from common.collectives import resolve_mesh
     if mesh_xy is None:
@@ -799,10 +802,11 @@ def read_coarse_interactions(filename, input_file, mesh_xy):
     m = read_metadata(filename)
     full = read_wavefunctions(filename, input_file, mesh_xy)
     width = m["centroid_count"]
-    host = np.empty(full.shape[:-1]+(width,), dtype=full.dtype)
+    carrier = int(padded_mu_extent(width, mesh_xy)) if pad_mu else int(width)
+    host = np.zeros(full.shape[:-1]+(carrier,), dtype=full.dtype)
     replicate = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
     for k in range(full.shape[0]):
-        host[k] = np.asarray(replicate(full[k, ..., :width]))
+        host[k, ..., :width] = np.asarray(replicate(full[k, ..., :width]))
     return {"psi": host, "kgrid": m["grid"], "enk": m["energies"],
             "band_window": m["band_window"],
             "Vqmunu": read_interaction(filename, "bare", mesh_xy),
@@ -2256,9 +2260,14 @@ class _ZetaGTiles:
     is a diagnostics rewrite, not a transport change.
     """
 
-    def __init__(self, loader: ZetaLoader, *, path: str, distributed: bool):
+    def __init__(self, loader: ZetaLoader, *, path: str, distributed: bool, mu_carrier=None):
         self._loader = loader
         self._distributed = bool(distributed)
+        self._mu_disk = int(loader.n_rmu_disk)
+        # ``mu_carrier``: the μ axis zero-padded to the payload's centroid carrier.
+        self._mu = self._mu_disk if mu_carrier is None else int(mu_carrier)
+        if self._mu < self._mu_disk:
+            raise ValueError(f"zeta_q_G: centroid carrier {self._mu} below the stored {self._mu_disk}")
         if loader.zeta_layout != 'G_flat':
             raise ValueError(
                 f"vq_interp needs a G-flat ζ ('zeta_q_G'); {path} has "
@@ -2267,7 +2276,7 @@ class _ZetaGTiles:
                 f"read path for r-space ζ at all: ZetaLoader's disk→G FFT "
                 f"+ sphere gather was deleted on 2026-08-07 because no "
                 f"writer in the tree emits that layout.")
-        self.shape = (int(loader.n_q_on_disk), int(loader.n_rmu_disk),
+        self.shape = (int(loader.n_q_on_disk), self._mu,
                       int(loader.n_G_sph_disk))
         self.dtype = np.complex128
         # The header-vs-dataset ngkmax agreement check is GONE from here, not
@@ -2287,7 +2296,12 @@ class _ZetaGTiles:
         makes "closed" one fact about one owner instead of two objects
         each with a private opinion.
         """
-        return self._loader.read_zeta_G_local(key)
+        out = self._loader.read_zeta_G_local(key)
+        if self._mu == self._mu_disk:
+            return out
+        axis = out.ndim - 2                                  # (.., μ, G)
+        return np.pad(out, [(0, self._mu - self._mu_disk) if i == axis else (0, 0)
+                            for i in range(out.ndim)])
 
     # -- distributed plan (per-rank hyperslab straight into `sharding`) -
     def read_q_slab(self, q_offset: int, q_count: int, *, sharding):
@@ -2299,12 +2313,19 @@ class _ZetaGTiles:
         return the same on-disk elements and neither reduces.
         """
         q_offset, q_count = int(q_offset), int(q_count)
-        if self._distributed:
+        if not self._distributed:
+            return device_put_process_local(
+                self[q_offset:q_offset + q_count], sharding)
+        if self._mu == self._mu_disk:
             return self._loader.load(
                 q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
                 sharding=sharding.spec)
-        return device_put_process_local(
-            self[q_offset:q_offset + q_count], sharding)
+        # The stored extent with μ unsharded, then zero rows to the carrier on ``sharding``.
+        spec = tuple(sharding.spec) + (None,) * (3 - len(tuple(sharding.spec)))
+        disk = self._loader.load(q=np.arange(q_offset, q_offset + q_count, dtype=np.int32),
+                                 sharding=P(spec[0], None, spec[2]))
+        return jax.jit(lambda z: jnp.pad(z, ((0, 0), (0, self._mu - self._mu_disk), (0, 0))),
+                       out_shardings=sharding)(disk)
 
     # -- ownership -----------------------------------------------------
     def close(self) -> None:
@@ -3833,12 +3854,16 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
         assert_slab_scope,
     )
     zx = {"restart_file": restart_file, "zeta_file": zeta_file}
-    zx.update(read_coarse_interactions(restart_file, input_file, mesh))
+    # ψ, ζ and the centroid coordinates on the mesh's centroid carrier: a logical count
+    # that does not tile the mesh left every (μ, ν) face of vq_interp replicated. The
+    # pad centroids are inert (zero ψ and ζ rows).
+    zx.update(read_coarse_interactions(restart_file, input_file, mesh, pad_mu=True))
     _mesh_for_loader, _distributed = _zeta_mesh_for_loader(mesh, log_fn=log_fn)
     zl = open_zeta(zeta_file, mesh=_mesh_for_loader)
     zx["_zeta_loader"] = zl
     zx["zeta_distributed"] = _distributed
-    zx["ZG"] = _ZetaGTiles(zl, path=zeta_file, distributed=_distributed)
+    zx["ZG"] = _ZetaGTiles(zl, path=zeta_file, distributed=_distributed,
+                           mu_carrier=int(zx["psi"].shape[-1]))
     # ``ngk_per_q`` is ``isdf_header/ngk`` (the per-q ζ SPHERE size).
     # ``zl.ngk`` is a DIFFERENT array — ``mf_header/kpoints/ngk``, the
     # WFN's per-k G count, bound by ``bind_mf_attrs``.  Reading the wrong
@@ -3855,6 +3880,8 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     zx["bvec"] = np.asarray(zl.bvec) * blat
     zx["celvol"] = float(np.real(zl.cell_volume))
     rmu_idx = np.asarray(zl.r_mu_fft_idx).astype(int)
+    zx["n_mu_logical"] = int(rmu_idx.shape[0])
+    rmu_idx = np.pad(rmu_idx, ((0, int(zx["psi"].shape[-1]) - rmu_idx.shape[0]), (0, 0)))
     zx["zeta_cutoff"] = float(zl.zeta_cutoff_ry)
     ifmax = np.asarray(zl.ifmax)
     zx["nk"], zx["nb"], zx["ns"], zx["n_mu"] = zx["psi"].shape
