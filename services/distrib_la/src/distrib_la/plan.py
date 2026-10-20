@@ -307,7 +307,23 @@ def _stack_bytes(op, mesh, nb, n, dtype, rounds, phase="all", gathered=False) ->
     n = -(-int(n) // tile) * tile
     program = _reshard_stack_program(op, mesh, (int(nb), int(n), int(n)), np.dtype(dtype).name,
                                      int(rounds), phase, None, bool(gathered))
-    return compiled_bytes(program, mesh, (nb, n, n), dtype)
+    operand = jax.ShapeDtypeStruct((int(nb), n, n), np.dtype(dtype), sharding=NamedSharding(mesh, P(None, "x", "y")))
+    return int(_analysis_bytes(_executable(program, (operand,))) or 0)
+
+
+#: Route (c)'s executables, one per program and operand signature: the compile a price reads is
+#: the one an eager call runs (:meth:`Plan._checked_reshard`).
+_EXECUTABLES: dict = {}
+
+
+def _executable(program, args):
+    """``program`` (one of :func:`_reshard_stack_program`'s) compiled at ``args``, once per
+    operand shape, dtype, mesh and spec."""
+    key = (program, tuple((tuple(a.shape), str(a.dtype), getattr(a.sharding, "mesh", None),
+                           getattr(a.sharding, "spec", a.sharding)) for a in jax.tree.leaves(args)))
+    if key not in _EXECUTABLES:
+        _EXECUTABLES[key] = program.lower(*args).compile()
+    return _EXECUTABLES[key]
 
 
 #: Measured eigh walls by platform, complex128: CUDA = A100-SXM4-80GB, ``dla_sweep`` P4 2x2 (the
@@ -603,7 +619,12 @@ def _program_bytes(fn, abstract) -> int | None:
     """Per-device bytes a compiled program allocates beside its arguments: XLA's
     ``memory_analysis`` temp + output, less the outputs aliased to arguments.  None where the
     backend reports no analysis."""
-    stats = jax.jit(fn).lower(*abstract).compile().memory_analysis()
+    return _analysis_bytes(jax.jit(fn).lower(*abstract).compile())
+
+
+def _analysis_bytes(executable) -> int | None:
+    """An executable's ``memory_analysis`` temp + output less aliased outputs, or None."""
+    stats = executable.memory_analysis()
     if stats is None:
         return None
     return (int(stats.temp_size_in_bytes) + int(stats.output_size_in_bytes)
@@ -1414,7 +1435,7 @@ class Plan:
         if compiled is None:
             return None
         # The query reads the stack's own n: a plan prices every stack place() routes, whatever
-        # n it was built at (run30k 2026-10-20: h_vv beside a pencil-sized plan).
+        # n it was built at (a pencil-sized plan also prices h_vv).
         sized = self if self.n in (None, int(n)) else replace(self, n=int(n))
         vendor = (distrib_la.workspace_bytes_per_rank(sized, "eigh", ((int(nb), int(n), int(n)),), dtype)
                   if self.backend == "cusolvermp" else 0)
@@ -1793,11 +1814,11 @@ class Plan:
             values_vectors, failed = program(traced_phase())(A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
             return values_vectors
-        values_vectors, failed = program("first")(A)
+        values_vectors, failed = _executable(program("first"), (A,))(A)
         if _flag(failed, shape[-1], A.dtype):
             _notices(failed, "eigh", shape[-1], A.dtype, site, final=False)
             del values_vectors
-            values_vectors, failed = program("retry")(A)
+            values_vectors, failed = _executable(program("retry"), (A,))(A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
         return values_vectors
 

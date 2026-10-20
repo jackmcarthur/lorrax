@@ -285,18 +285,20 @@ def lu_workspace_query(mesh, n, nrhs, dtype, cap) -> int:
     return _vendor_query(get_or_init_context(mesh, col_major=False), 'solve_lu', sizes + (int(cap),), dtype)[0]
 
 
-def eigh_stack_bytes(plan, shape, dtype) -> int:
+def eigh_stack_bytes(plan, shape, dtype, phase="all") -> int:
     """Per-rank device bytes a batched eigh of the face stack ``shape`` (nb, n, n) adds beside
     its operand: the program that runs it, compiled at the abstract operand and never run
     (route (c): ``distrib_la.plan._stack_bytes``, plus the ROCm leg's rocSOLVER batched
     workspace, which XLA does not see; otherwise ``Plan.mesh_bytes``, the plan's own program
-    plus its provider's workspace query).  Every rank computes the same figure."""
+    plus its provider's workspace query).  ``phase`` is the one the plan runs (``Plan`` line
+    ``phase = ...``): "first" for an eager call, whose retries price their own program, "all"
+    for a stack traced in a caller's program.  Every rank computes the same figure."""
     from distrib_la.plan import ROUTE_BATCH_RESHARD, _gathered_admitted, _stack_bytes
     nb, n = int(shape[0]), int(shape[-1])
     ranks = int(plan.mesh.shape['x']) * int(plan.mesh.shape['y'])
     if plan.batched_route == ROUTE_BATCH_RESHARD:
         from distrib_la.local_eigh import batched_workspace_bytes
-        return (_stack_bytes('eigh', plan.mesh, nb, n, dtype, 1, 'all',
+        return (_stack_bytes('eigh', plan.mesh, nb, n, dtype, 1, phase,
                              _gathered_admitted(plan.mesh, (n, n), dtype, plan.budget_bytes))
                 + batched_workspace_bytes((-(-nb // ranks), n, n), dtype, mesh_platform(plan.mesh)))
-    return plan.mesh_bytes('eigh', nb, n, dtype)
+    return plan.mesh_bytes('eigh', nb, n, dtype, phase)

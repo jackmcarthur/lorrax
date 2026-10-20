@@ -91,18 +91,16 @@ def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     plan = constructor_price_plan(mesh, largest, execution, backend=eigh_backend)
     if execution == 'local':
         resident = 16 * 2 * math.ceil(int(nq) / ranks) * (blocks + largest ** 2)
-        # The batched local chain, compiled with every attempt (the retry is the fallback).
-        workspace = distrib_la.eigh_stack_bytes(plan, (int(nq), largest, largest), np.complex128)
+        # The batched local stack's first attempt; a failed check books its retry when it runs.
+        workspace = distrib_la.eigh_stack_bytes(plan, (int(nq), largest, largest), np.complex128, phase="first")
     else:
         # The whole-mesh kernel forms G = W^H W and its vectors for every
         # parent of the stack at once: 2 nq largest^2 tiles.
         resident = math.ceil(16 * (2 * int(nq) * blocks + 2 * int(nq) * largest ** 2) / ranks)
-        # One parent's eigh as it runs eagerly: its first attempt, or the retry program a failed
-        # check compiles (its gathered attempt joins only within the selection plan's own room,
-        # what this admission leaves), each compiled (Plan.mesh_bytes: + the provider's query).
-        workspace = max([distrib_la.workspace_bytes_per_rank(plan, "eigh", ((1, largest, largest),), np.complex128)]
-                        + [plan.mesh_bytes("eigh", 1, largest, np.complex128, phase) or 0
-                           for phase in ("first", "retry")])
+        # One parent's eigh as it runs eagerly: its first attempt compiled (Plan.mesh_bytes: +
+        # the provider's query); a failed check books its retry program when it runs.
+        workspace = max(distrib_la.workspace_bytes_per_rank(plan, "eigh", ((1, largest, largest),), np.complex128),
+                        plan.mesh_bytes("eigh", 1, largest, np.complex128, "first") or 0)
     return int(resident), int(workspace)
 
 
@@ -676,7 +674,7 @@ def face_check_bytes(mesh, rows, side):
 
 
 def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, compiled,
-                     selection=None, extra=lambda width: 0, eigen_side=None):
+                     selection=None, extra=lambda width: 0, eigen_side=None, held=0):
     """Largest whole-mesh parent batch whose selection and reduction fit.
 
     The scalar face route runs a batch of physical parents per round, every
@@ -685,8 +683,9 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
     any bank read, at the conservative recipe side, the ``selection`` price
     (its ``quote`` arguments) may reject a width; ``compiled(width, room)``, the
     reduction program compiled at that width's abstract operands with its eighs
-    decided in the room beside the operands alone (the largest), admits it beside
-    ``extra(width)`` resident bytes. Every rank compiles the same shapes. Widths start
+    decided in the room beside the operands and ``held`` alone (the largest), admits it beside
+    ``extra(width)`` resident bytes; the receipt's ``eigh_room`` is that room, the one the
+    rounds run in, so their stacks decide as they were priced. Every rank compiles the same shapes. Widths start
     at every parent, so a deck that fits runs one round and compiles each program once
     per shape, and step down in proportion to the whole price. The constructor still
     admits every phase at its actual side.
@@ -708,11 +707,12 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
             width -= 1
             continue
         budget.program_bytes = 0
-        room = face_eigh_room(row('reduction', extra(width), eigen_side=eigen_side),
+        room = face_eigh_room(row('reduction', extra(width), eigen_side=eigen_side), held,
                               stage="shared-pole constructor batch admission")
         price = budget.program_bytes = max(1, int(compiled(width, room)))
         reduction = row('reduction', extra(width), eigen_side=eigen_side)
-        receipt = dict(parent_batch=width, program_bytes_per_rank=price, selection=picked, reduction=reduction)
+        receipt = dict(parent_batch=width, program_bytes_per_rank=price, selection=picked, reduction=reduction,
+                       eigh_room=room)
         if reduction['device_budget_status'] == 'PASS' or width == 1:
             return width, receipt
         # Every term of the row grows about linearly in the width, so step by the whole

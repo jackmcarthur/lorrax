@@ -1550,7 +1550,7 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
         eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=room)
         @partial(checked_program, mesh=mesh_xy, out_shardings=(face, rep), in_shardings=(face,))
         def _fn(C):
-            # A traced iota mask: the host (n, n) mask was a whole n^2 constant per rank.
+            # A traced iota mask, not a host (n, n) constant per rank.
             live = jnp.arange(int(n)) < n_log
             C = jnp.where(live[:, None] & live[None, :], C, 0)
             B, figures = cplus.factor(C, rcond=rcond, rank_log=True, n_log=n_log,

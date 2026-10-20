@@ -170,8 +170,8 @@ def test_sector_route_replay():
     assert 68 < actual['TT']['eighs'][2][1] < 72, actual['TT']
     assert actual['TT']['stage'] >= 2 and actual['CC']['stage'] >= actual['TT']['stage'], actual
     # At the recipe's conservative sides TT's H'_vv leaves route (c); the CT stacks fit no route
-    # (the mesh with its solve, 73.8 GB + 3.6 GB of contexts, is over 72 GB): never refused
-    # (owner 2026-10-19), the smaller route runs under lxkit.memory.admit's warning.
+    # (the mesh with its solve, 73.8 GB + 3.6 GB of contexts, is over 72 GB): never refused:
+    # the smaller route runs under lxkit.memory.admit's warning.
     conservative = cri3['conservative']
     assert conservative['TT']['eighs'][0][0] == 'mesh' and conservative['CT']['eighs'] == ['mesh', 'mesh']
     assert got['fe/40']['mode'] == 'local' and got['fe/40']['route'] == dict(width=4, rounds=4)

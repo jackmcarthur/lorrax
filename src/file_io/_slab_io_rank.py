@@ -527,7 +527,7 @@ class StreamedBank:
                 agree_io_error(self.check_reads(), path=self.dir, stage="streamed_bank.reread")
             self.seconds["read"] += time.monotonic() - started
             # Handed over, not kept: a suspended frame holding ``value`` kept each span
-            # alive beside the caller's next phase (run30k moments: 3.6 GB/rank).
+            # alive beside the caller's next phase (3.6 GB/rank of moments at N_mu 30k).
             held = [value]
             del value
             yield held.pop()
