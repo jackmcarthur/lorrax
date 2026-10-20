@@ -74,3 +74,34 @@ def test_cuda_workspace_query_reads_the_stacks_own_n(monkeypatch):
     monkeypatch.setattr(workspace, "mesh_platform", lambda mesh: "CUDA")
     got = cuda.mesh_bytes("eigh", 1, 32, np.complex128)
     assert asked and asked[-1][0] == mp.solve_layout(32, 2)[0] and got > 7, (asked, got)
+
+
+def test_mesh_price_compiles_once_per_room_class(monkeypatch):
+    """A stack's mesh price is compiled once per class of rooms deciding it alike (production
+    hsuite: one compile per constructor round, each round's room new): two rooms that both
+    admit the gathered retry share one compile; a room that refuses it compiles its own."""
+    import distrib_la
+    import distrib_la._cusolvermp as mp
+    plan = importlib.import_module("distrib_la.plan")
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    face = NamedSharding(mesh, P("x", "y"))
+
+    def stub(A, *, mesh, compute_evecs=True, block=None, side=None):
+        return (jnp.zeros(A.shape[-1], jnp.float64), jax.lax.with_sharding_constraint(A * (1 + 0j), face))
+    monkeypatch.setattr(mp, "distributed_eigh", stub)
+    monkeypatch.setattr(distrib_la, "workspace_bytes_per_rank", lambda *a, **k: 0)
+    n = 2048
+    need = plan.compiled_bytes(plan._gathered_program(mesh), mesh, (n, n), np.complex128)
+    monkeypatch.setattr(plan, "_MESH_PROGRAMS", {})
+    compiles, real = [], plan._program_bytes
+    monkeypatch.setattr(plan, "_program_bytes", lambda *a, **k: compiles.append(1) or real(*a, **k))
+    got = []
+    for room in (4 * need, 8 * need, need // 2, 4 * need + 1):
+        p = distrib_la.plan("eigh", mesh, n=n, backend="off", batched_route="auto",
+                            budget_bytes=int(room), price_only=True)
+        p = dataclasses.replace(p, backend="cusolvermp", in_sharding=face,
+                                batch_in_sharding=NamedSharding(mesh, P(None, "x", "y")))
+        before = len(compiles)
+        got.append((p.mesh_bytes("eigh", 1, n, np.complex128, "all"), len(compiles) - before))
+    assert got[1] == (got[0][0], 0) and got[3] == (got[0][0], 0), got     # same decisions: no compile
+    assert got[2][1] > 0 and got[2][0] < got[0][0], got                   # gathered refused: its own

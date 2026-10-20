@@ -292,8 +292,10 @@ def staged_fits(mesh, a_shape, b_shape, dtype, transa, transb, budget_bytes) -> 
     from distrib_la.plan import GATHERED_EIGH_BYTES
     ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
     cap = int(budget_bytes) if int(a_shape[0]) >= ranks else min(int(budget_bytes), GATHERED_EIGH_BYTES)
-    return route_bytes(mesh, tuple(a_shape), tuple(b_shape), str(dtype), str(transa).upper(),
-                       str(transb).upper()) <= cap
+    from distrib_la.plan import room_test
+    price = route_bytes(mesh, tuple(a_shape), tuple(b_shape), str(dtype), str(transa).upper(), str(transb).upper())
+    return room_test(lambda r: price <= (int(r) if int(a_shape[0]) >= ranks else min(int(r), GATHERED_EIGH_BYTES)),
+                     budget_bytes)
 
 
 @lru_cache(maxsize=None)

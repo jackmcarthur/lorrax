@@ -118,7 +118,7 @@ from distrib_la.matmul import (
 )
 from distrib_la.matmul_plan import GemmPlan, gemm_plan, local_gemm_plan
 from distrib_la._panel_matmul import batch_gram, panel_matmul
-from distrib_la.plan import RoomExhausted, room_or_exhausted  # noqa: E402
+from distrib_la.plan import RoomExhausted, room_class, room_or_exhausted  # noqa: E402
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
     BATCHED_ROUTE_DEFAULT,
@@ -170,7 +170,7 @@ __all__ = [
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
     # plan
-    "Plan", "plan", "StackRoute", "RoomExhausted", "room_or_exhausted", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
+    "Plan", "plan", "StackRoute", "RoomExhausted", "room_class", "room_or_exhausted", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
     # native dense workspace queries (no allocation)
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "eigh_stack_bytes", "lu_workspace_bytes", "lu_workspace_query",
     # polar / SVD
