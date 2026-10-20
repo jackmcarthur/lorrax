@@ -1,0 +1,27 @@
+set pagination off
+set confirm off
+set print thread-events off
+set debuginfod enabled off
+set startup-with-shell off
+handle SIGSEGV stop print nopass
+handle SIGABRT stop print nopass
+run
+python
+import gdb
+inferior = gdb.selected_inferior()
+if inferior.threads():
+    gdb.write("MATERIAL_GDB_STOPPED_WITH_LIVE_THREADS\n")
+    for command in ("bt 60", "info registers", "info sharedlibrary", "thread apply all bt 20"):
+        try:
+            gdb.execute(command)
+        except gdb.error as error:
+            gdb.write("MATERIAL_GDB_CAPTURE_ERROR=%s\n" % error)
+    gdb.execute("quit 139")
+else:
+    try:
+        code = int(gdb.parse_and_eval("$_exitcode"))
+    except Exception:
+        code = 140
+    gdb.write("MATERIAL_GDB_INFERIOR_EXIT_CODE=%s\n" % code)
+    gdb.execute("quit %d" % code)
+end

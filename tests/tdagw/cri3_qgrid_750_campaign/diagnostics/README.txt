@@ -95,3 +95,47 @@ timeout stack, NOT a crash-time native backtrace. The constructor sample
 shows first h_vv eigensolve route/price compilation (_stack_bytes), not
 proof of gathered fallback execution. A follow-up stack-route reproducer
 needs its exact batch/round metadata; do not guess those from parent count.
+
+Separate actual-material replay: RUNNING 60052556, no result claimed
+-----------------------------------------------------------------
+debug_sc_first_map_native.py and p16_material_gdb_v2.commands preserve the
+reviewed external payload for the actual N750, electronic 8 x 8 / q8
+proper-SC replay. This is NOT another synthetic gathered-eigh test and
+does not inherit that test's PASS. Ops owns job 60052556; its pending
+first-map/SC outcome must be read from that job's own evidence.
+
+This replay pins original source 1134957c6e63d3d5c8ac141799e0eb17e9423233
+and the exact original q8-v2 physical input deck, not a modified solver:
+  deck SHA256
+    8e6df25ebfce57a3dbbc7055cdd4f8c37def5a5e76a1c8b15d42f457bb1c00bf
+  original run_sc_reference_frames.py SHA256
+    31f545b6d5a58d7c8c5d053249f8967dc607191cc8d2684a8ff094117b4a3e3b
+  debug wrapper SHA256
+    d734585e3bca8e68ae01cea8a811f1f63a9aebc82e00cfd47ea2f3e54535f0e5
+  enhanced GDB commands SHA256
+    c7cc6c95c73218242d904a94c00c626c733a7f228b7339a9898b1e79670a58b3
+The wrapper also recognizes reviewed source a0 for a separately pinned
+replay; that does not change which source this job actually launched.
+
+Every rank durably appends its own JSONL before/after the original host
+pricing/compilation functions. Static metadata includes the exact op,
+batch count B, matrix side n, dtype, rounds, phase and gathered flag when
+those are known at that call. Hooked functions retain their original
+arguments, return objects and internal caches. No new array read, device
+operation, collective, solver policy, tolerance or physics is introduced
+inside a trace. --log-prefix must stay OUTSIDE the original runner's fresh
+--out directory. Log-file fsync and stdout are deliberate instrumentation:
+these host walls are NOT a clean production performance benchmark.
+
+The original native runner continues successful maps with unchanged
+max_iter=30 and 1 meV protected-band convergence criterion. A first-map
+success or saved input frame is not SC convergence. Only the original
+native convergence verdict plus accepted-input and completed-driver joins
+can establish a usable reference. Native crashes may bypass Python files;
+use the exact last durable BEGIN and GDB fault backtrace. Enhanced GDB
+captures the stopped fault thread's bt 60, registers and shared libraries
+before all-thread bt 20. Repeated faulthandler timeout stacks remain
+sampled timeout stacks, not fault-time native backtraces.
+
+No allocation launcher or hardcoded remote submission script is preserved
+here. This directory requests no additional allocation or GPU stage.
