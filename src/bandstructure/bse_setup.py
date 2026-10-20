@@ -9,7 +9,7 @@ standard htransform pipeline:
     fH_R       = build_fH_R(ctilde, enk_sigma, kgrid_co)     # node-pair kernel
     L_R        = ifft_k Φ_k (−f(E_k)) C̃_k†                    # back-map kernel
     X_q        = Σ_R Σ_T w_ij e^{-2πi q·(R+LT)} X_R           # per-pair WS sum
-    (lam, c)   = eigh(fH_q)                                  # eigvals f(ε), eigvecs in C̃'s frame
+    (lam, c)   = top_block_eigh(fH_q, C̃ of nearest coarse k)  # fitted f(ε), eigvecs in C̃'s frame
     ψ_n,q(r_μ) = [L_q c_n,q]_μ / (−lam_n)                    # nodal values (exact on-grid)
 
 The resulting wfns are returned as the canonical X/Y-sharded bundle
@@ -18,7 +18,7 @@ ready to drop in as a BSE interpolation input.
 
 This module deliberately stays narrow: it calls the core htransform
 routines (``build_fH_R``, ``node_pair_table``, ``newton_inv``) and
-adds only the fine-grid k-list construction, the per-q eigh path, and
+adds only the fine-grid k-list construction, the per-q top-block path, and
 the X/Y reshard.
 """
 
@@ -58,13 +58,16 @@ from common.staged_reshard import (
 )
 
 from .fh_interp import (
+    TOP_BLOCK_PAD,
     build_fH_R,
+    coarse_start_block,
+    log_top_block,
     newton_inv,
     node_pair_table,
     require_newton_converged,
+    top_block_eigh,
 )
 from common.ws_images import pair_ws_code_fourier
-from distrib_la import eigh_local
 
 
 #: ``compute_wfns_fi``'s jits, keyed per SIGNATURE and held for the process.
@@ -459,11 +462,10 @@ def compute_wfns_fi(
                                                   via ``newton_inv`` of fH_q eigvals
             .lam_fi:     (nk_fi, nb_fi)           raw fH_q eigenvalues (= f(ε_n,q))
                                                   kept for diagnostics
-            .lam_all_fi: (nk_fi, rank)            the FULL fH_q spectrum, all
-                                                  ``rank`` bands, accumulated
-                                                  chunk by chunk (see the
-                                                  ``lam_all`` note at the
-                                                  emit loop)
+            .lam_all_fi: (nk_fi, nb_co)           the fitted fH_q spectrum
+                                                  (top block, every fitted
+                                                  band) accumulated chunk by
+                                                  chunk
             .coeffs_fi:  (nk_fi, rank, nb_fi)     only when ``return_coeffs``
             .q_frac:     (nk_fi, 3) host float64  fractional q of each row,
                                                   wrapped to (−0.5, 0.5], in
@@ -708,7 +710,7 @@ def compute_wfns_fi(
         + bytes([int(B_at_mu.sys_dim)])).hexdigest()
     _sig = (_mesh_id, tuple(int(v) for v in kgrid_co), int(rank),
             int(nb_fi), int(nspinor), int(n_mu),
-            _stage_q is not None, bool(native), _geom)
+            _stage_q is not None, bool(native), _geom, int(nb_co))
 
     # The two stages either side of the eigh are plain traceable functions,
     # shared verbatim by both backends; only the JIT BOUNDARIES differ.  The
@@ -840,18 +842,9 @@ def compute_wfns_fi(
         nodal = (L @ c) / (-lam[..., None, b_min:b_max])       # (..., rank, nb_fi)
         psi = jnp.moveaxis(nodal[..., :nspinor * n_mu, :].reshape(
             nodal.shape[:-2] + (nspinor, n_mu, nodal.shape[-1])), -1, -3)
-        # ``lam`` (ALL ``rank`` bands) comes out LAST, appended to the tuple
-        # the three existing consumers already unpack, so nothing above moves.
-        # It is the owner's "store eigenvalues up to the full N_band before
-        # doing other chunks": the eigensolver produced the whole spectrum
-        # either way, and at (bs, rank) f64 q-sharded it is
-        # bs·rank·8/ndev B/rank — 122 KB/rank on the 4x4/91-Q deck, 4 orders
-        # below the (bs, rank, rank) c128 batch it rides along with — so
-        # keeping it costs nothing while discarding it means the chunk has to
-        # be RE-SOLVED to answer any question about a band outside
-        # [b_min, b_max).  psi/coeffs stay windowed: THOSE are the arrays
-        # whose full-band form does not fit.
-        return lam[..., b_min:b_max], psi, c, lam
+        # ``lam`` of every fitted band comes out LAST (the owner's "store
+        # eigenvalues up to the full N_band"); psi/coeffs stay windowed.
+        return lam[..., b_min:b_max], psi, c, lam[..., :nb_co]
 
     def _qbatch_out_shardings(bs):
         """EXPLICIT out_shardings for the fused native batch.
@@ -870,25 +863,37 @@ def compute_wfns_fi(
                      (bs, nb_fi, nspinor, n_mu), "bse_setup.psi"),
                 _fit(mesh_xy, P(('x', 'y'), None, None), (bs, rank, nb_fi),
                      "bse_setup.coeffs"),
-                _fit(mesh_xy, P(('x', 'y'), None), (bs, rank),
-                     "bse_setup.lam_all"))
+                _fit(mesh_xy, P(('x', 'y'), None), (bs, nb_co),
+                     "bse_setup.lam_all"),
+                NamedSharding(mesh_xy, P()), NamedSharding(mesh_xy, P()))
+
+    def _start_block(q, ctilde, bs_):
+        """Top-block start columns, laid out like the q-batch operand."""
+        x0 = coarse_start_block(ctilde, kgrid_co, q)
+        return jax.lax.with_sharding_constraint(x0, _fit(
+            mesh_xy, P(('x', 'y'), None, None),
+            (bs_, rank, min(nb_co + TOP_BLOCK_PAD, rank)),
+            "bse_setup.start_block"))
 
     def _q_batch_kernel(bs_):
         def _build():
             @partial(jax.jit, static_argnames=('b_min', 'b_max'),
                      out_shardings=_qbatch_out_shardings(bs_))
-            def _q_batch(q_batch, fH_R, L_R, code, b_min, b_max):
-                """Native: Fourier sum → batched eigh → projection, ONE fused
-                jit."""
-                lam, U = eigh_local(_fourier(q_batch, fH_R, True, code))
+            def _q_batch(q_batch, fH_R, L_R, code, ctilde, b_min, b_max):
+                """Native: Fourier sum → top-block solve → projection, ONE
+                fused jit."""
+                lam, U, steps, res = top_block_eigh(
+                    _fourier(q_batch, fH_R, True, code),
+                    _start_block(q_batch, ctilde, bs_), (b_min, b_max))
                 L = _fourier(q_batch, L_R, True, code, hermitian=False)
-                return _project(lam, U, L, b_min, b_max)
+                return _project(lam, U, L, b_min, b_max) + (steps, res)
             return _q_batch
         return _cached_kernel(("q_batch", _sig, int(bs_)), _build)
 
     lam_chunks, psi_chunks, c_chunks, lam_all_chunks = [], [], [], []
+    block_stats = []
 
-    def _emit(lam_s, psi_s, c_s, lam_all_s):
+    def _emit(lam_s, psi_s, c_s, lam_all_s, steps, res):
         """Stash one CHUNK's four outputs.  Both arms emit a leading chunk
         axis now — the native q-batch, and the FFI arm's ``lax.map``'d chunk
         — so the per-item ``[None]`` rank-expansions this used to carry
@@ -897,6 +902,7 @@ def compute_wfns_fi(
         That sync fired once per q on the FFI arm (1456 host round trips on
         the reference deck).  Each loop now owns its own sync POLICY, at its
         own cadence, where the reason for it can be written down."""
+        block_stats.append((steps, res))
         lam_chunks.append(lam_s)
         psi_chunks.append(psi_s)
         lam_all_chunks.append(lam_all_s)
@@ -913,8 +919,8 @@ def compute_wfns_fi(
     if native:
         _q_batch = _q_batch_kernel(bs)
         for i in range(0, q_pad.shape[0], bs):
-            _emit(*_q_batch(q_pad[i:i + bs], fH_R, L_R, ws_code, b_min,
-                            b_max))
+            _emit(*_q_batch(q_pad[i:i + bs], fH_R, L_R, ws_code, ctilde,
+                            b_min, b_max))
             # RETAINED, per chunk, and it is not an oversight.  ``_q_batch``
             # materialises a (bs, rank, rank) fH_q batch INSIDE its own
             # executable, and this file records two separate OOMs caused by
@@ -987,7 +993,8 @@ def compute_wfns_fi(
                 f"Unset the key for the bit-identical path. ***")
         n_chunks = -(-nq // bs_ffi)
         # Mesh/geometry guards already passed when the plan was built.
-        log(f"  fH_q eigh: {eigh_plan.describe()}, {nq} q in {n_chunks} "
+        log(f"  fH_q top-block on the face layout of {eigh_plan.describe()}, "
+            f"{nq} q in {n_chunks} "
             f"chunk(s) of {bs_ffi} "
             f"[{'wfn_fi_q_chunk' if _bs_explicit else 'default ndev//2'}], "
             f"Plan.batched route={eigh_plan.batched_route}"
@@ -1043,20 +1050,32 @@ def compute_wfns_fi(
                     (lam, U, L))
             return _project_chunk
 
+        def _build_solve_chunk():
+            @partial(jax.jit, static_argnames=('b_min', 'b_max'))
+            def _solve_chunk(K_c, q_chunk, ctilde, b_min, b_max):
+                x0 = coarse_start_block(ctilde, kgrid_co, q_chunk)
+                lam, U, steps, res = jax.lax.map(
+                    lambda kx: top_block_eigh(kx[0], kx[1], (b_min, b_max)),
+                    (K_c, x0))
+                return lam, U, jnp.max(steps), jnp.max(res)
+            return _solve_chunk
+
         _fH_q_chunk = _cached_kernel(
             ("fH_q_chunk", _sig, eigh_plan.backend), _build_fH_q_chunk)
+        _solve_chunk = _cached_kernel(("solve_chunk", _sig), _build_solve_chunk)
         _project_chunk = _cached_kernel(
             ("project_chunk", _sig), _build_project_chunk)
 
         t_eigh = time.time()
         _logged = 0
         for i in range(0, nq, bs_ffi):
-            lam_c, U_c = eigh_plan.batched(
-                _fH_q_chunk(q_all[i:i + bs_ffi], fH_R, ws_code, True))
+            lam_c, U_c, steps, res = _solve_chunk(
+                _fH_q_chunk(q_all[i:i + bs_ffi], fH_R, ws_code, True),
+                q_all[i:i + bs_ffi], ctilde, b_min, b_max)
             _emit(*_project_chunk(
                 lam_c, U_c,
                 _fH_q_chunk(q_all[i:i + bs_ffi], L_R, ws_code, False),
-                b_min, b_max))
+                b_min, b_max), steps, res)
             # nq SERIAL distributed solves is a long, silent stretch — log the
             # rate so a stall is distinguishable from slow progress.  THE ONE
             # SYNC LEFT ON THIS ARM lives here, at the LOG cadence and not per
@@ -1071,8 +1090,11 @@ def compute_wfns_fi(
                 jax.block_until_ready(psi_chunks[-1])
                 _logged = done
                 dt = time.time() - t_eigh
-                log(f"    fH_q eigh {done}/{nq} q  {dt:.0f}s  "
+                log(f"    fH_q top-block {done}/{nq} q  {dt:.0f}s  "
                     f"{1e3 * dt / done:.0f} ms/q")
+    log_top_block(log, "fine-grid fH_q", nb_co,
+                  [np.asarray(s) for s, _ in block_stats],
+                  [np.asarray(r) for _, r in block_stats])
     lam_fi = jnp.concatenate(lam_chunks, axis=0)[:nq]
     psi_fi = jnp.concatenate(psi_chunks, axis=0)[:nq]
     lam_all_fi = jnp.concatenate(lam_all_chunks, axis=0)[:nq]

@@ -170,9 +170,8 @@ means the basis is over-complete and `rtol` must not be loosened.
 
 ## Scope
 
-* htransform model order is not governed here: `isdf.galerkin`'s randomized
-  QRCP uses `htransform_qr_eps` (default 1e-3) as its criterion and
-  `htransform_rank_multiplier` (default 20) as its search ceiling, and reports
-  its own receipts.
+* htransform model order is not governed here: `isdf.galerkin`'s nodal
+  basis is the orbit-closed centroid set (no rank search) and reports its own
+  receipts.
 * The thresholds are read from the measurements above; no production deck has
   been re-run under the gate itself.

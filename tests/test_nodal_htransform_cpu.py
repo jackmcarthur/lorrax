@@ -7,7 +7,8 @@ model.  The node-pair kernel ``fH`` of the lowest bands, continued off the
 star-invariant energies to rounding; a lattice-box R set (the former
 htransform R grid) does not.  On the coarse grid it reproduces f(eps)
 exactly.  The orbit-tied quadrature metric and the Loewdin step make
-sampled nodal values exactly orthonormal.
+sampled nodal values exactly orthonormal.  The top-block subspace solve
+returns the full eigensolver's window off the grid.
 
 Covariance is exact only when the window top lies in a gap at every coarse k
 (the precondition ``common.band_degeneracy.check_band_window`` reports): a
@@ -21,7 +22,8 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from bandstructure.fh_interp import f_transform_eigs, newton_inv  # noqa: E402
+from bandstructure.fh_interp import (coarse_start_block, f_transform_eigs,  # noqa: E402
+                                     newton_inv, top_block_eigh)
 from common.ws_images import (pair_ws_code_fourier, pair_ws_code_table,  # noqa: E402
                               pair_ws_fourier, pair_ws_images)
 from isdf.galerkin import _loewdin, _quadrature_metric  # noqa: E402
@@ -173,3 +175,24 @@ def test_quadrature_metric_and_loewdin_orthonormalize_sampled_values():
     np.testing.assert_allclose(np.einsum('kna,kma->knm', np.conj(C), C),
                                np.broadcast_to(np.eye(nb), (nk, nb, nb)),
                                atol=1e-12)
+
+
+def test_top_block_matches_full_eigh_off_the_grid():
+    """Top block (15 fitted + 32 columns of 48) from the nearest coarse C:
+    window eigenpairs equal ``eigh`` to 1e-10 at random off-grid q."""
+    fH_R, _, _, nb = _kernel()
+    _, table = _ws_tables()
+    E, C = np.linalg.eigh(_hamiltonian(_coarse_k()))
+    ctilde = np.swapaxes(C[:, :, :nb], 1, 2)         # (nk, nb, rank)
+    q = np.random.default_rng(5).random((6, 3)) - 0.5
+    K = np.asarray(pair_ws_code_fourier(fH_R, table, q))
+    K = 0.5 * (K + np.conj(np.swapaxes(K, -1, -2)))
+    x0 = coarse_start_block(ctilde, KGRID, q)
+    lam, V, steps, res = top_block_eigh(K, x0, (0, N_WINDOW))
+    ref, U = np.linalg.eigh(K)
+    lam, V = np.asarray(lam)[:, :N_WINDOW], np.asarray(V)[:, :, :N_WINDOW]
+    scale = np.abs(ref[:, :N_WINDOW])
+    assert float(res) <= 1e-10 and int(steps) <= 8, (float(res), int(steps))
+    assert np.max(np.abs(lam - ref[:, :N_WINDOW]) / scale) < 1e-10
+    proj = lambda X: np.einsum('qan,qbn->qab', X, np.conj(X))
+    assert np.max(np.abs(proj(V) - proj(U[:, :, :N_WINDOW]))) < 1e-8

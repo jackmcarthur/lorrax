@@ -44,12 +44,13 @@ def _run(mesh, c, e, v, *, full_window):
     kc = toy._grid(toy.KC)
     with xla_reference():
         fine = compute_wfns_fi(
-            ctilde=jnp.asarray(c), B_at_mu=jnp.ones((c.shape[2], 1, 4), complex),
+            ctilde=jnp.asarray(c), B_at_mu=toy._nodes(c),
             enk_sigma=jnp.asarray(e.T), kgrid_co=toy.KC, kgrid_fi=toy.KF,
             band_window_fi=(LO, HI), mesh_xy=mesh, return_coeffs=True)
         dip = densified_dipoles(
             (v, e, "toy dH/dk", "toy.h5"), sym=toy._sym(kc), fh_energies=e,
-            basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, toy.NB)),
+            basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, toy.NB),
+                                  basis_at_nodes=toy._nodes(c)),
             fine=fine, coarse_grid=toy.KC, n_val=NV, window_start=LO,
             a_band_index=None, mesh_xy=mesh, log_fn=lambda *a: None,
             full_window=full_window)

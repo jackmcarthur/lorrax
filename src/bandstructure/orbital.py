@@ -355,20 +355,23 @@ def interpolate_band_operator(operator_cart, source_coefficients,
 
 
 def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
-                 n_states, mesh, *, B_at_mu):
+                 n_states, mesh, *, B_at_mu, ctilde, log_fn=None):
     """Energies and band diagonals of the fitted states on a uniform q grid.
 
     Returns ``(E (Nq, n_states) Ry, D (n_op, Nq, n_states), newton
     residual)`` with q in C order over ``grid``.  One pass is one q_z plane:
     the per-node-pair Wigner–Seitz sum over the geometry of ``B_at_mu``
     (local on the ``(rank, rank)`` face; no dense-grid FFT carrier) and one
-    face->q exchange.  The first ``lax.scan`` solves fH on every plane and keeps the
+    face->q exchange.  The first ``lax.scan`` solves fH on every plane (top
+    block, started from ``ctilde`` of the nearest coarse k) and keeps the
     fitted-state eigenvectors; ``fH_R`` is then deleted (consumed) and each
     operator's lattice image, built by its ``operator_R_builders`` entry
     only when needed, is read by a second scan.  At most one dense
     ``(nk, rank, rank)`` image is resident.
     """
-    from bandstructure.fh_interp import newton_inv, node_fourier, node_pair_table
+    from bandstructure.fh_interp import (
+        coarse_start_block, log_top_block, newton_inv, node_fourier,
+        node_pair_table, top_block_eigh)
     a_f, n_f, shift = f_params
     Nx, Ny, Nz = (int(v) for v in grid)
     n_plane = Nx * Ny
@@ -389,17 +392,22 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
     def plane(qz, X, code):
         return node_fourier(qz, X, code, table, mesh)
 
-    @partial(jax.jit, out_shardings=(plane_q, plane_v,
-                                     NamedSharding(mesh, P())))
-    def _solve(fH_R, code):
+    rep = NamedSharding(mesh, P())
+
+    @partial(jax.jit, out_shardings=(plane_q, plane_v, rep, rep, rep))
+    def _solve(fH_R, code, ctilde):
         def one_pass(_, qz):
-            values, vectors = jax.vmap(eigh_local)(plane(qz, fH_R, code))
+            x0 = coarse_start_block(ctilde, kgrid, qz)
+            values, vectors, steps, block_res = top_block_eigh(
+                plane(qz, fH_R, code), x0, (0, n_states))
             energies, residual = newton_inv(
                 a_f, n_f, shift, values[:, :n_states].real)
-            return None, (energies, vectors[:, :, :n_states], residual)
+            return None, (energies, vectors[:, :, :n_states], residual,
+                          steps, block_res)
 
-        _, (E, V, res) = jax.lax.scan(one_pass, None, Qz, unroll=1)
-        return E, V, jnp.max(res)
+        _, (E, V, res, steps, block_res) = jax.lax.scan(
+            one_pass, None, Qz, unroll=1)
+        return E, V, jnp.max(res), jnp.max(steps), jnp.max(block_res)
 
     @partial(jax.jit, out_shardings=plane_q)
     def _expect(O_R, V, code):
@@ -412,7 +420,10 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
         _, D = jax.lax.scan(one_pass, None, (Qz, V), unroll=1)
         return D
 
-    E, V, residual = _solve(fH_R, code)
+    E, V, residual, steps, block_res = _solve(fH_R, code, ctilde)
+    if log_fn is not None:
+        log_top_block(log_fn, "moments grid", int(ctilde.shape[1]),
+                      np.asarray(steps), np.asarray(block_res))
     jax.block_until_ready(E)
     fH_R.delete()
     D = []
