@@ -250,9 +250,12 @@ def split_bundle(dyn: dict):
 def instantaneous_basis(h, rho):
     """Eigenpairs of the window's G Hamiltonian and the populations in that basis.
 
-    h, rho : (nk, nA, nA) Hermitian, Ry / dimensionless.  Returns U (nk, nA, nA)
-    (columns = instantaneous orbitals in the fixed basis), e (nk, nA) Ry, and
-    f = Re diag(U^H rho U) (nk, nA): the populations the screening sees.
+    h, rho : (..., nk, nA, nA) Hermitian, energy / dimensionless. Returns U
+    (columns = instantaneous orbitals in the fixed basis), e in h's units
+    (Ry in Green helpers, Ha in slow_basis_step), and diagnostic populations
+    f = Re diag(U^H rho U). The native full-density snapshot caller retains
+    the COMPLETE U^H rho U for screening and Sigma; returning f does not
+    project its density onto populations.
     """
     h = 0.5 * (h + jnp.conj(jnp.swapaxes(h, -1, -2)))
     e, U = eigh_local(h)

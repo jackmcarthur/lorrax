@@ -221,8 +221,8 @@ an intermediate sc_seed/map output as that accepted reference.
 No allocation launcher or hardcoded remote submission script is preserved
 here. This directory requests no additional allocation or GPU stage.
 
-Common coherent chi owner: PREPARED, NOT GPU-QUALIFIED
---------------------------------------------------
+Common coherent chi owner: NATIVE P4 SOFTWARE PROOF PASS
+-----------------------------------------------------
 verify_common_coherent_chi_p4.py requires an explicitly pinned source
 revision (also LEG_HEAD), source-root module origins, native CUDA mathdx,
 four processes/one device each and mesh2x2. Maximum runtime180s (0.2GPUh).
@@ -240,4 +240,17 @@ including the actual typed execution config parsed by its native factory.
 The first5049 P4 attempt stopped before chi/JIT at an invalid empty config
 constructor; it provides no chi correctness verdict. The corrected helper
 uses LorraxConfig.from_input_file(resolve_hardware=False), not a fabricated
-full config. It still requires a separate successful native execution.
+full config.
+
+The corrected source dbf45a48a577d5b0c4b649e4ea76af24462c2e9f passed
+native P4 step 60056663.13: 39 s step, 29.654809 s receipt. All 20 paired calls,
+full+FF/FA/AF/AA, two E/rho inputs, fine/coarse grids, exact moments,
+overflow and compiled-execution cases passed. Maximum literal error was
+5.551792708129603e-16; moment error 1.2212801772525548e-15.
+Actual receipt:
+/home/jackm/mgkba_campaign_20261019/qgrid_20261020/p4_commonchiDBF_60056663/receipt.json
+The durable summary is ../evidence/COMMON_CHI_P4_PASS_60056663.json.
+This qualifies the tiny native software case, not material/general-W,
+hsuite, speedup, positivity, equilibrium stationarity or a TD trajectory.
+Earlier CPU evidence and failed 5049 startup records retain their original
+per-run identities; the successful run does not relabel either of them.

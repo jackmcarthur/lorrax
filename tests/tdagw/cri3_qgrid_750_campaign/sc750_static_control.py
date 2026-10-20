@@ -3,7 +3,9 @@
 The accepted SC anchor is retained once. Only its density increment is
 Hartree[Vbar] minus screened exchange[W(0)]. No zeta-file export, new kernel,
 GW collision, equilibrium subtraction or spatial rank approximation is added.
-This campaign adapter has not been admitted on the material/GPU trajectory.
+Static-A material calibration trajectories completed in steps 60056663.10/.11;
+the midpoint record is evidence/STATIC_A_MIDPOINT_60056663.json. This is not
+MGKBA, updated-W, positivity or three-arm driven-comparison admission.
 """
 
 

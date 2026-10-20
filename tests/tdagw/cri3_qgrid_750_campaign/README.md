@@ -227,9 +227,12 @@ receives the actual W(0) body and its head once. `HeadSample.wcoul0` is FULL
 screened W, not Wc: the adapter injects that value alone, then sets the
 separate scalar exchange-head term to zero. Its CPU literal-k-sum oracle
 checks full coherences, bare-Hartree preservation and this head convention.
-No material/GPU trajectory or active44/pulse calibration is claimed. Turning
-collisions off on the SC builder's bare-HF model is NOT this static TD-aGW arm.
-The next-version BSE callback also publishes bounded k-summed root/c/v
+Static-A active44 calibration completed for 10 fs on the accepted q4 input;
+the measured midpoint populations are 0.00813454 and 0.15942947 e/cell.
+See [the preserved calibration record](evidence/STATIC_A_MIDPOINT_60056663.json).
+This is not collision, updated-W or damping evidence. Turning collisions
+off on the SC builder's bare-HF model is NOT this static TD-aGW arm.
+The BSE callback also publishes bounded k-summed root/c/v
 weights and central-2v2c containment. This measures the existing finite BSE
 solution, not convergence in a larger window. It does not alter the pinned
 source68 callback used by the already prepared material probe.

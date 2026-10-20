@@ -92,9 +92,16 @@ contraction, row passes and carry. Independent density left endpoints and
 node-specific references remain distinct runtime arguments; this is not a
 stationary-ρ shortcut. The old separate full-density contraction was removed.
 CPU literal/orientation/moment checks pass, and the scalar default matches
-the actual parent21fcc77 owner bit-for-bit on a tiny CPU fixture. The bounded
-native P4 helper is prepared; no material timing or speedup for this
-consolidation is claimed here. Earlier measured timings above are unchanged.
+the actual parent21fcc77 owner bit-for-bit on a tiny CPU fixture. The native
+P4 proof passed on source `dbf45a4`, step `60056663.13`: 20 paired calls,
+full+FF/FA/AF/AA, two current E/rho inputs, fine/coarse grids and exact
+moments through actual mode11 and compiled execution admission. Maximum
+literal error was `5.55179e-16`, moment error `1.22128e-15`; the fixture
+receipt took 29.6548 s (39 s Slurm step). See
+[the software-proof summary](evidence/COMMON_CHI_P4_PASS_60056663.json) and
+the local `qgrid_20261020/p4_commonchiDBF_60056663/receipt.json` under the
+campaign artifact root. This is not a material/general-W timing, hsuite,
+speedup or positivity result. Earlier measured timings above are unchanged.
 
 `active_sigma_probe.py:31–52` constructs external energies only for
 `[100,144)` and requests `projection_bands=(100,144)`. In
