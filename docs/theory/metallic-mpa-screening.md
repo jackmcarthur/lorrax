@@ -28,8 +28,7 @@ any occupation family but Fermi–Dirac (`GATE metal_occupations_fermi_dirac`);
 (`GATE w_bse_insulators_only`); elementwise MPA with time reversal measured
 broken (`GATE mpa_ordered_metal`: that route fits one residue with no odd
 channel); `parallel_transport` on `bare_transverse` and a folded bispinor
-velocity head (`GATE metal_sc_head_update_disabled`, §4); and a folded head on an ordered
-store (`GATE shared_pole_head_ordered`).
+velocity head (`GATE metal_sc_head_update_disabled`, §4).
 
 ## 1. The finite-occupation response and its cancellation structure
 

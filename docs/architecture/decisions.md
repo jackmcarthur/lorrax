@@ -458,7 +458,8 @@ by its own convergence. The Gram gate is unchanged; a headless run may still
 refuse at `GATE shared_pole_gram_valid`. An ordered (time-reversal-broken)
 store refused `head_correction = full` (`GATE shared_pole_head_ordered`) and
 carried the direct head (`no_local_fields`) instead; since 2026-10-19 it folds
-the signed body and Lehmann wings, and only an ordered metal refuses.
+the signed body and Lehmann wings, and since 2026-10-20 an ordered metal does
+too ([metal head §5](../theory/metal-q0-head.md#5-limits-of-the-model)).
 
 ## 2026-09-06 — The GW carrier is the raw parent
 

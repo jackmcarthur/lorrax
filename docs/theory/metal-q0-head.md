@@ -209,7 +209,12 @@ W_{\rm head}(0)=\Big\langle\frac{8\pi}{\mathbf q\cdot\epsilon_\infty\cdot\mathbf
 $$
 
 A folded (`full`) head uses the folded $S(0)$ and the static fold's $\kappa^2$
-(`qsgw_head._metal_static_head`). On Fe $4^3$ map 0 the origin
+(`qsgw_head._metal_static_head`). The metal plan's shifted origin
+$z=i\cdot2\times10^{-5}$ Ry (`mpa.sampling.metal_origin_shift`) is this static
+row (`qsgw_head.metal_static_rows`): there $|z|/(q_{\rm cell}u_F)\approx4\times10^{-4}$,
+every atom is static, and the builders evaluate $S$ and the wings at $z=0$
+(no $D/z^2$, no dynamic intraband wing). Left dynamic, that row folded a
+$(Y_DWZ_D/\Omega)/z^2$ remainder that drove $W^c_{\rm head}$ to $-\langle v\rangle$. On Fe $4^3$ map 0 the origin
 $8\pi\,\hat q\cdot S(0)\cdot\hat q$ is $-151/-91$ with this split, against
 $-2242/-1551$ without it, so $q^2\epsilon_\infty$ at the cell's
 $\operatorname{tr}Q=0.017$ bohr$^{-2}$ is comparable with $\kappa^2=2.33$ rather than
@@ -259,11 +264,20 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
   bispinor map-0 eqp0/eqp1 tails (64 and 119 meV) come entirely from the CC
   head block, on states whose $|E-E_F|$ lies 3.6–4.8 eV from the Fermi
   level (claim 2862).
-- **Wings.** The `full` scalar route folds head/body wings
-  (`qsgw_head.head_wings_sharded`); the wing kernels keep every pair with
-  $\Delta>0$ and a diagonal-only surface term, so they apply neither the
-  degeneracy rule nor $\phi$. Weighting their pairs by $1-\phi$ is the next
-  seam.
+- **Wings (closed 2026-10-20).** The `full` scalar route folds head/body
+  wings (`qsgw_head.head_wings_sharded`) split like $S$ and $D$: each pair
+  keeps $1-\phi$ of its Lehmann weight and the intraband wing
+  $-\tfrac{C}{2}\,\phi\,\bar w_{nm}\,v^*_{nm}\rho_{nm}/z$ takes the rest, the
+  pair weight's own $|z|\gg\Delta$, $\Delta\ll k_BT$ limit. A pair's wing is then
+  independent of $\phi$ for $|z|\gg\Delta$, and a multiplet's is the
+  rotation-invariant trace. The previous diagonal-only surface term had the
+  opposite sign to that limit; time reversal cancels the intraband wing over
+  the zone, so only an ordered metal saw it, and that store refused `full`
+  until both seams closed. The intraband wing stays the Drude limit at
+  $z\ne0$ (q-independent in the cell, error confined to near-line samples
+  $|z|\lesssim q_{\rm cell}u_F$, i.e. to $Z$). The static row's fold takes the
+  row's own Γ body; only an exact $z=0$ row also builds the static Matsubara
+  body. Certified by `tests/test_shared_pole_head_ordered_metal.py`.
 - **Estimators.** The intraband term uses tetrahedron weights and the
   interband term FD occupations; at coarse grids the two describe slightly
   different Fermi surfaces.
