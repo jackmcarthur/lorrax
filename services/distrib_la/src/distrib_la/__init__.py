@@ -108,7 +108,7 @@ from distrib_la.blocks import (diagonal_like, face_sharding, hermitian_block,
                                hermitian_part, join_columns, on_face)
 from distrib_la.subspace import plan_orthogonalization, plan_subspace, subspace_route, SUBSPACE_ROUTE
 from distrib_la.active_subspace import LocalSubspacePlan, plan_local_subspace
-from distrib_la.workspace import eigh_stack_bytes, lu_workspace_bytes, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
+from distrib_la.workspace import eigh_stack_bytes, lu_workspace_bytes, lu_workspace_query, workspace_bytes_per_rank, matmul_workspace_bytes_per_rank
 from distrib_la.loader import dial_key, has_target, probe_target
 from distrib_la.matmul import (
     MATMUL_BACKEND_CHOICES,
@@ -172,7 +172,7 @@ __all__ = [
     # plan
     "Plan", "plan", "StackRoute", "RoomExhausted", "room_or_exhausted", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
     # native dense workspace queries (no allocation)
-    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "eigh_stack_bytes", "lu_workspace_bytes",
+    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "eigh_stack_bytes", "lu_workspace_bytes", "lu_workspace_query",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
     "right_singular_vectors", "leading_eigenvectors", "leading_eigenvectors_above",
