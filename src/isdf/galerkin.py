@@ -61,7 +61,6 @@ __all__ = [
     "iter_galerkin_rchunks",
     "plan_galerkin_stream",
     "read_galerkin_basis",
-    "validate_rank_multiplier",
     "write_galerkin_basis",
 ]
 
@@ -76,7 +75,7 @@ NODE_METRIC_EPS_WARN = 1.0e-2
 #: Node count per fitted band that reached eps <= 1e-2 on Si 4^3 (780/36);
 #: MoS2 9x9 at 22.2 nodes per band (1198/54) reads eps 1.7e-2.
 NODES_PER_FITTED_BAND = 22
-_BASIS_FORMAT = 4
+_BASIS_FORMAT = 5
 _BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_nodal", "galerkin_loewdin")
 _BASIS_META = "galerkin_"
 
@@ -184,31 +183,7 @@ class GalerkinBasis:
         return int(self.ctilde.shape[2])
 
 
-def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
-    """Validate ``htransform_rank_multiplier`` (parsed for archived decks).
-
-    The nodal basis has no rank search, so the value bounds nothing; ``0``
-    is retained as an input-compatibility spelling of ``20``.
-    """
-    try:
-        multiplier = float(value)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"{name}={value!r} is not a finite number; use 20 for the "
-            "published ceiling or another value >= 1.") from None
-    if not np.isfinite(multiplier) or multiplier < 0.0:
-        raise ValueError(f"{name}={value!r} must be finite and >= 0.")
-    if multiplier == 0.0:
-        return 20.0
-    if multiplier < 1.0:
-        raise ValueError(
-            f"{name}={multiplier:g} would retain fewer directions than bands "
-            "at one k. Use the published default 20 or another value >= 1.")
-    return multiplier
-
-
-def galerkin_rank_record(basis: GalerkinBasis, *, meta,
-                         rank_multiplier: float) -> dict:
+def galerkin_rank_record(basis: GalerkinBasis, *, meta) -> dict:
     """The node receipt of a fitted or restored basis (host only)."""
     nk, nb, carrier = (int(n) for n in basis.ctilde.shape)
     physical = int(basis.rank_physical)
@@ -222,8 +197,6 @@ def galerkin_rank_record(basis: GalerkinBasis, *, meta,
         "retained_rank": physical,
         "carried_rank": carrier,
         "null_padding": carrier - physical,
-        "rank_multiplier": validate_rank_multiplier(
-            rank_multiplier, name="htransform_rank_multiplier"),
         "fit_seconds": float(basis.fit_seconds),
         "metric_eps": float(basis.metric_eps),
         "zero_weight_nodes": int(np.count_nonzero(
@@ -252,7 +225,7 @@ def _basis_digest(indices) -> tuple[tuple[int, ...], str]:
 
 
 def _basis_provenance(*, wfn, meta, centroid_indices, band_range,
-                      bispinor, rank_multiplier, qrcp_eps) -> dict:
+                      bispinor, qrcp_eps) -> dict:
     from common.parallel_transport import (
         WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
 
@@ -272,8 +245,6 @@ def _basis_provenance(*, wfn, meta, centroid_indices, band_range,
         "centroid_hash": centroid_hash, "wfn_hash": wfn_fingerprint(wfn),
         "wfn_scheme": WFN_FINGERPRINT_SCHEME,
         "transform_scheme": FULL_BLOCH_TRANSFORM_SCHEME,
-        "rank_multiplier": validate_rank_multiplier(
-            rank_multiplier, name="htransform_rank_multiplier"),
         "qrcp_eps": qrcp_eps, "selection": NODE_SELECTION_VERSION,
     }
 
@@ -304,8 +275,7 @@ def _basis_write_meta(io, basis: GalerkinBasis, provenance: dict) -> None:
     for name, value in integer.items():
         io.write_attr(_BASIS_META + name, np.asarray(value, dtype=np.int32))
     io.write_attr(_BASIS_META + "controls", np.asarray([
-        provenance["rank_multiplier"], provenance["qrcp_eps"],
-        basis.fit_seconds, basis.metric_eps], dtype=np.float64))
+        provenance["qrcp_eps"], basis.fit_seconds, basis.metric_eps], dtype=np.float64))
     io.write_attr(_BASIS_META + "node_weights",
                   np.asarray(basis.node_weights, dtype=np.float64))
     for name, value in (
@@ -321,19 +291,16 @@ def _basis_write_meta(io, basis: GalerkinBasis, provenance: dict) -> None:
 
 
 def write_galerkin_basis(path, basis: GalerkinBasis, *, wfn, meta,
-                         centroid_indices, bispinor, rank_multiplier,
-                         qrcp_eps, mesh_xy: Mesh, qrcp_seed: int = 0) -> None:
-    """Collectively publish one immutable mesh-neutral basis artifact.
-
-    ``qrcp_seed`` is accepted for archived callers and is not recorded."""
+                         centroid_indices, bispinor, qrcp_eps,
+                         mesh_xy: Mesh) -> None:
+    """Collectively publish one immutable mesh-neutral basis artifact."""
     import os
     from common.collectives import barrier, process_count, process_rank
     from file_io.slab_io import SlabIO
 
     provenance = _basis_provenance(
         wfn=wfn, meta=meta, centroid_indices=centroid_indices,
-        band_range=basis.band_range, bispinor=bispinor,
-        rank_multiplier=rank_multiplier, qrcp_eps=qrcp_eps)
+        band_range=basis.band_range, bispinor=bispinor, qrcp_eps=qrcp_eps)
     _basis_check(basis, provenance)
     destination = os.path.abspath(os.fspath(path))
     job, step = os.environ.get("SLURM_JOB_ID", "local"), os.environ.get(
@@ -395,8 +362,8 @@ def _basis_read_meta(io) -> dict:
         "centroid_hash": text("centroid_hash"), "wfn_hash": text("wfn_hash"),
         "wfn_scheme": text("wfn_scheme"),
         "transform_scheme": text("transform_scheme"),
-        "rank_multiplier": float(controls[0]), "qrcp_eps": float(controls[1]),
-        "fit_seconds": float(controls[2]), "metric_eps": float(controls[3]),
+        "qrcp_eps": float(controls[0]), "fit_seconds": float(controls[1]),
+        "metric_eps": float(controls[2]),
         "node_weights": tuple(float(v) for v in small(
             "node_weights", np.float64)),
         "selection": text("selection"),
@@ -405,17 +372,15 @@ def _basis_read_meta(io) -> dict:
 
 
 def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
-                        bispinor, rank_multiplier, qrcp_eps,
-                        mesh_xy: Mesh, extra_rank_pad: int = 0,
-                        qrcp_seed: int = 0) -> GalerkinBasis:
+                        bispinor, qrcp_eps, mesh_xy: Mesh,
+                        extra_rank_pad: int = 0) -> GalerkinBasis:
     """Collectively validate and read a basis on the caller's target mesh."""
     import os
     from file_io.slab_io import SlabIO
 
     expected = _basis_provenance(
         wfn=wfn, meta=meta, centroid_indices=centroid_indices,
-        band_range=band_range, bispinor=bispinor,
-        rank_multiplier=rank_multiplier, qrcp_eps=qrcp_eps)
+        band_range=band_range, bispinor=bispinor, qrcp_eps=qrcp_eps)
     with SlabIO(os.path.abspath(os.fspath(path)), mode="r", mesh=mesh_xy) as io:
         stored = _basis_read_meta(io)
         mismatches = [key for key in expected if stored.get(key) != expected[key]]
@@ -520,24 +485,21 @@ def fit_galerkin_basis(
         log_fn=None,
         band_chunk_size: int = 64,
         bispinor: bool = False,
-        rank_multiplier: float = 20.0,
         qr_eps: float = 1.0e-3,
         device_pool_limit: float | None = None,
         extra_rank_pad: int = 0,
         progress_fn=None,
         rank_record_fn=None,
-        qrcp_seed: int = 0,
         distrib_la_batched_route=None,
 ) -> GalerkinBasis:
     """Sample the fitted window at the centroid nodes (module docstring).
 
     The centroid set must be orbit-closed (refused otherwise, naming the
-    remedy).  ``rank_multiplier``, ``device_pool_limit``, ``qrcp_seed`` and
-    ``distrib_la_batched_route`` are accepted for the caller's signature and
-    bound nothing (the centroid-face loader plans its own memory); ``qr_eps``
+    remedy).  ``device_pool_limit`` and ``distrib_la_batched_route`` are
+    accepted for the caller's signature and bound nothing (the centroid-face loader plans its own memory); ``qr_eps``
     is recorded for :func:`iter_galerkin_rchunks`.
     """
-    del progress_fn, device_pool_limit, qrcp_seed, distrib_la_batched_route
+    del progress_fn, device_pool_limit, distrib_la_batched_route
     from symmetry_maps import (centroid_source_map_and_wrap,
                                permutation_orbit_labels)
     if log_fn is None:
@@ -554,8 +516,6 @@ def fit_galerkin_basis(
     if not (0.0 < float(qr_eps) < 1.0):
         raise ValueError(
             f"fit_galerkin_basis: qr_eps={qr_eps!r} must lie in (0,1)")
-    multiplier = validate_rank_multiplier(
-        rank_multiplier, name="htransform_rank_multiplier")
     if getattr(meta, "mu_basis", None) is not None:
         raise ValueError(
             "fit_galerkin_basis: meta carries a packed centroid basis "
@@ -633,8 +593,7 @@ def fit_galerkin_basis(
         fit_seconds=float(seconds),
     )
     if rank_record_fn is not None:
-        rank_record_fn(galerkin_rank_record(
-            basis, meta=meta, rank_multiplier=multiplier))
+        rank_record_fn(galerkin_rank_record(basis, meta=meta))
     return basis
 
 
@@ -692,24 +651,27 @@ def _make_zeta_kernel(*, mesh: Mesh, phi_shape, n_nodes: int, rank: int,
 
 def iter_galerkin_rchunks(
         source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
-        r_chunk_ranges, retained_band_range: tuple[int, int]):
+        r_chunk_ranges, retained_band_range: tuple[int, int],
+        receipt: dict | None = None):
     """Yield bounded basis rows and requested WFN rows together.
 
     The least-squares rows of the coefficient space on the grid,
 
-    ``zeta_nu(r) = sum_nu' G^+[nu, nu'] sum_{k,n,s} conj(C_{k,n,(s,nu')}) psit_{nk,s}(r)``,
+    ``zeta_nu(r) = sum_nu' G^+[nu, nu'] sum_{k,n,s} conj(C_{k,n,(s,nu')}) psi_{nk,s}(r)``,
 
-    with ``G`` the node Gram of ``C`` and ``psit = psi G_k^{-1/2}`` the states
-    ``C`` represents,
-
-    is accumulated from the caller-owned canonical :class:`PsiGStore` during
+    with ``G`` the node Gram of ``C``: the frame vector ``C_k e_n`` (the fH_k
+    eigenvector of band n) maps to the WFN state ``psi_nk``, as the back-map
+    does at the nodes.  This is accumulated from the caller-owned canonical :class:`PsiGStore` during
     the same WFN/FFT pass that retains ``retained_band_range`` for the
     consumer.  Yields ``(r0, r1, B_chunk, psi_parts)`` with ``B_chunk``
     ``(rank, nspinor, r_carrier)`` the spin-block rows
     ``B[(s, nu), s', r] = delta_{s s'} zeta_nu(r)``, so
     ``psi(r) = sum_rho c_rho B[rho, :, r]`` for nodal values ``c``, and
     ``psi_parts`` the ordered ``((band_lo, band_hi), psi_chunk)`` pairs of the
-    retained range.
+    retained range.  A ``receipt`` dict receives, once the generator is
+    exhausted, the full-r relative residuals ``||psi - C B|| / ||psi||`` of
+    the fit over the basis window (``"fh"``, from the normal equations) and
+    over the retained window (``"zeta"``, direct).
     """
     b_start, b_end = (int(v) for v in basis.band_range)
     keep_start, keep_end = (int(v) for v in retained_band_range)
@@ -733,26 +695,35 @@ def iter_galerkin_rchunks(
     psi_layout = NamedSharding(mesh_xy, P(None, None, None, ('y', 'x')))
     r_divisor = spec_divisor(mesh_xy, row_layout.spec, axis=2)
 
-    @partial(jax.jit, static_argnames=("lo", "hi"), out_shardings=rep)
-    def _phi(ctilde, loewdin, lo, hi):
-        # Y_k[m, rho] = sum_n T_k[n, m] C_k[n, rho]: the WFN states psi_m
-        # enter through the Loewdin-mixed states C represents.
-        y = jnp.einsum('knm,knr->kmr', loewdin, ctilde[..., :nspinor * n_nodes])
-        rows = y[:, lo:hi].reshape(ctilde.shape[0], hi - lo, nspinor, n_nodes)
-        return jnp.pad(rows, ((0, 0), (0, bc - (hi - lo)), (0, 0), (0, 0)))
+    @partial(jax.jit, static_argnames=("lo", "hi", "pad"), out_shardings=rep)
+    def _phi(ctilde, lo, hi, pad):
+        rows = ctilde[:, lo:hi, :nspinor * n_nodes].reshape(
+            ctilde.shape[0], hi - lo, nspinor, n_nodes)
+        return jnp.pad(rows, ((0, 0), (0, pad), (0, 0), (0, 0)))
 
-    phis = [_phi(basis.ctilde, basis.loewdin, int(lo) - b_start,
-                 int(hi) - b_start)
+    phis = [_phi(basis.ctilde, int(lo) - b_start, int(hi) - b_start,
+                 bc - (int(hi) - int(lo)))
             for lo, hi in source.band_chunk_ranges]
     pinv = _node_gram_pinv(basis, nspinor=nspinor, mesh_xy=mesh_xy)
 
-    @partial(jax.jit, out_shardings=row_layout)
+    @partial(jax.jit, out_shardings=(row_layout, rep))
     def _rows(pinv, acc):
         zeta = pinv @ acc
         out = jnp.zeros((rank, nspinor, zeta.shape[-1]), dtype=zeta.dtype)
         for s in range(nspinor):
             out = out.at[s * n_nodes:(s + 1) * n_nodes, s, :].set(zeta)
-        return out
+        return out, jnp.sum(jnp.real(jnp.conj(acc) * zeta))
+
+    @partial(jax.jit, out_shardings=(rep, rep))
+    def _part_residual(rows, psi, basis_chunk):
+        zeta = basis_chunk[:n_nodes, 0, :]
+        diff = psi - jnp.einsum('knsv,vr->knsr', rows, zeta, optimize=True)
+        return jnp.sum(jnp.abs(diff) ** 2), jnp.sum(jnp.abs(psi) ** 2)
+
+    scalar = lambda x: float(np.asarray(x.addressable_data(0)))
+    # |psi|^2 and fitted part over the basis window; residual and |psi|^2
+    # over the retained window.
+    totals = np.zeros(4)
 
     for r0, r1 in r_chunk_ranges:
         r0, r1 = int(r0), int(r1)
@@ -774,6 +745,9 @@ def iter_galerkin_rchunks(
                 mesh=mesh_xy, phi_shape=phis[bc_idx].shape, n_nodes=n_nodes,
                 rank=rank, nspinor=nspinor, r_carrier=r_carrier)(
                     psi_bc, phis[bc_idx], acc)
+            if receipt is not None:
+                n_valid = int(bc_range[1]) - int(bc_range[0])
+                totals[0] += scalar(jnp.sum(jnp.abs(psi_bc[:, :n_valid]) ** 2))
             lo = max(int(bc_range[0]), keep_start)
             hi = min(int(bc_range[1]), keep_end)
             if lo < hi:
@@ -782,13 +756,24 @@ def iter_galerkin_rchunks(
                     ((lo, hi), psi_bc[:, offset:offset + (hi - lo)]))
             else:
                 del psi_bc
-        basis_chunk = _rows(pinv, acc)
+        basis_chunk, fitted = _rows(pinv, acc)
         del acc
+        if receipt is not None:
+            totals[1] += scalar(fitted)
+            for (lo, hi), psi in retained:
+                rows = _phi(basis.ctilde, lo - b_start, hi - b_start, 0)
+                res2, nrm2 = _part_residual(rows, psi, basis_chunk)
+                totals[2] += scalar(res2)
+                totals[3] += scalar(nrm2)
         if sum(hi - lo for (lo, hi), _ in retained) != keep_end - keep_start:
             raise RuntimeError(
                 "iter_galerkin_rchunks: retained WFN pieces do not cover "
                 f"[{keep_start},{keep_end})")
         yield r0, r1, basis_chunk, tuple(retained)
+    if receipt is not None:
+        receipt["fh"] = float(np.sqrt(max(totals[0] - totals[1], 0.0)
+                                      / max(totals[0], 1e-300)))
+        receipt["zeta"] = float(np.sqrt(totals[2] / max(totals[3], 1e-300)))
 
 
 @dataclass(frozen=True)

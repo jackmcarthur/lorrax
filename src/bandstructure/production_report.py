@@ -113,8 +113,10 @@ class HTransformProductionReport:
                  "scalapack"))
             if str(fine_plan.requested) != str(fine_plan.backend):
                 fine_text += f" -> {fine_plan.backend}"
-            self.emit("Fine-k eigensolve: " + fine_text
-                      + "; matrix extent follows retained Galerkin rank")
+            from bandstructure.fh_interp import TOP_BLOCK_PAD
+            self.emit(f"Fine-k eigensolve: top block (fitted bands + "
+                      f"{TOP_BLOCK_PAD}) by subspace iteration; operand "
+                      f"layout " + fine_text)
             batch_text = policy(
                 fine_plan.requested_batched_route,
                 ("auto", "batch_reshard"))
@@ -194,10 +196,8 @@ class HTransformProductionReport:
                 f"of {int(centroids.source_n_rmu)} source rows")
         self.emit(f"Galerkin basis : nodal rank {int(ctilde.shape[2])} shared "
                   f"across {int(result['nk_total'])} coarse-grid k points")
-        multiplier = float(params.get("htransform_rank_multiplier", 0.0))
-        self.emit("Rank policy    : " + (
-            "full numerical span" if multiplier == 0.0 else
-            f"reduced target {multiplier:.5f} x bands"))
+        self.emit("Rank policy    : every orbit-closed centroid is a node "
+                  "(rank = spin components x centroids)")
         transform = result.get("f_transform")
         if transform is not None:
             scale_band = start + int(transform["scale_band_local"]) + 1

@@ -1823,12 +1823,9 @@ _DEFAULTS = {
     # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
     # ``bandstructure.bse_setup.compute_wfns_fi``).
     # The nodal htransform basis is the centroid set itself (rank spin x
-    # centroids): htransform_rank_multiplier and htransform_qrcp_seed bound
-    # nothing and are accepted for archived decks (0 spells 20);
-    # htransform_qr_eps only cuts the Gram pseudo-inverse of the refit's grid rows.
-    "htransform_rank_multiplier": 20.0,
+    # centroids); htransform_qr_eps only cuts the Gram pseudo-inverse of the
+    # refit's grid rows.
     "htransform_qr_eps": 1.0e-3,
-    "htransform_qrcp_seed": 0,
     "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
     "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
     "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.
