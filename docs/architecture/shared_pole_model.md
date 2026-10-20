@@ -8,6 +8,9 @@ are [the shared-pole theory page](../theory/shared-pole-w-model.md); deck keys
 are in the [input reference](../input_reference.md); rebuilding the model inside
 a QSGW loop and retaining its quadrature are
 [self-consistency](../self_consistency.md#shared-pole-w-with-retained-quadrature).
+The full-density TD snapshot extension uses a general two-sided pole bank,
+not the passive real-pole constructor; its additional contract is
+[§11](#general-snapshot).
 
 Notation: `q` is a raw parent (one irreducible $q$; `−q` is its own parent when
 time reversal is broken); `n` is the packed centroid count
@@ -583,3 +586,106 @@ family's rows (`line_selection_price`). On the local route that is
 $16\cdot 2\lceil N_q/P\rceil (d^2 + n^2)$ B per rank, the rank's parents in one
 batched eigh; on the face route $16\,(2N_q d^2 + 2N_q n^2)/P$, every parent
 of the stack at once. The eigh service's workspace comes on top.
+
+## 11 Full-density snapshot extension {#general-snapshot}
+
+`gw.shared_pole_screening.screen_general_shared_poles` is the native TD
+snapshot producer. This is a general first-order frequency realization,
+not a relaxation of the passive constructor's Gram/pole gates. The
+[TD theory owner](../theory/td_agw_dynamical.md#retarded-reference) specifies
+the upper-endpoint density ordering and reference branch approximation.
+This direct-FFT entry currently requires the complete unshifted k/q grid
+in canonical C order. The centroid-plan owner authenticates coordinates,
+not just identity index tables; permuted or shifted inputs refuse without
+implicitly reordering orbitals or the Coulomb operator.
+
+`greens_function_kernel.density_left_endpoint` forms the full-band
+$\Psi\rho$ face; `w_isdf.full_density_response_stream` keeps its phase on
+the right band index. It evaluates the two independent density insertions
+of $P^>-P^<$ using the native spin-traced momentum FFT product. Quadratic
+density terms cancel algebraically, but neither remaining insertion can be
+replaced by the stationary conjugation shortcut. Frozen-active virtual
+transitions remain. `response_bank.full_density_sample_rules` supplies
+sampled-error-checked shared complex-time nodes over the signed transition interval;
+`full_density_bare_moments` supplies the leading moments, including a
+possible nonzero $1/z$ coefficient. No sampled dense-frequency integral
+or fixed spatial Coulomb basis is introduced.
+
+The full-density scalar planner collectively gathers `ResponseGroupTree`
+attempts through the response-bank owner: all ranks receive identical node
+counts and bytes before entering collective FFTs. Before any Hankel pencil
+allocation or preparation it applies a conservative 4 GiB host workspace
+bound. Oversized groups first try the minimax owner's existing composite
+imaginary-time Gauss panels, shared across every sample in the group. The
+explicit capacity is 32 panels of at most 384 nodes; rejection splits the
+group, and no single-sample fallback can escape the bound. The ordinary
+value/derivative sampled-error and coefficient-mass tests are unchanged.
+This is a larger frequency quadrature, not a smaller physical band or
+centroid space; its Green-pair count is printed before streaming.
+
+Only scalar rules whose signed interval contains the current complete-band
+gap interval, with identical shifted support sites and tolerance, are held
+inside one Hamiltonian solve. A new interval uses the response owner's
+4 eV hold pad. Current phases, density insertions and W are recomputed.
+The compiled response factory is keyed on topology, FFT dialect, shapes
+and moment powers; energies and the scalar reference are dynamic operands.
+Flushed phase starts and synchronized wall times distinguish planning,
+streaming, Dyson, directions, pencil assembly, host reduction, checks and
+persistence. No physics gate is inferred from these resource receipts.
+
+The source GW recipe sets finite support sites and tangential direction
+widths. Its pole budget counts positive-frequency modes; the general
+realization's signed-frequency budget is twice that count, not an extra
+factor-of-two truncation. Full microscopic Dyson actions enter
+`shared_pole_pencil.general_tangential_pencil`. Independent left/right
+actions produce $E,A,B,C$ with $W_c(z)=C(zE-A)^{-1}B$.
+`shared_pole_constructor.reduce_general_pencil` uses two-sided SVD spaces
+and a general, biorthogonal eigensolve, without Hermitian/PSD projection.
+The resulting full-port factors obey
+
+$$
+W_c^R(z)=L\,\operatorname{diag}[(z-p)^{-1}]R^\dagger.
+$$
+
+Only reduced per-parent frequency pencils cross the bounded host LAPACK
+seam. Its workspace is priced explicitly and refuses above its declared
+capacity; microscopic samples and endpoint factors stay distributed. The
+reduced constructor has one canonical process-zero owner: all ranks first
+gather the same reduced E/A, then exchange an owner success/error record
+before broadcasting exact uint64 bit patterns of complex128 poles, both
+coefficient maps and both held frequency spaces. JAX x64 is required for
+this handoff. Only these reduced arrays cross ranks; independent host
+eigenvector gauges must never be mixed across distributed microscopic
+factor faces. Current E/A are reduced anew every iteration; only numerical
+frequency spaces may be held. The initial general solver is therefore
+capacity-bounded, not a claim of an
+arbitrarily large distributed non-Hermitian eigensolver. At 1761 frequency
+states a complex pencil is about 50 MB; the conservative reduction workspace
+is about 1.39 GB. Two 978-by-1761 endpoint factors at each of 36 q total
+about 1.98 GB globally before padding and reciprocal self-q columns. These
+are shape prices, not measured GPU walls or peak memory.
+
+The store `lorrax.shared-general-pole.v1` has independent
+`left,right[q,mu,1,Kmax]` complex128 factors and `poles_ry[q,Kmax]`
+complex128. Every q is explicit; current Hamiltonian, orbitals, full density,
+centroids and recipe are authenticated. Inactive factor columns are zero.
+The final digest reads bounded canonical file rows, not a full microscopic
+device gather. Opposite q banks are paired algebraically, and self-inverse
+q banks include the half-weight crossing partner. The final bank must pass
+the actual microscopic response checks after this pairing.
+
+`gw.mpa.sigma.ordered_shared_pole_sigma` synthesizes
+$L\exp[-i(p-E_{\rm ref})\tau]R^\dagger$ on the existing faces and feeds the
+same native node loop, momentum FFT and matrix projection as equilibrium
+GW. Both reference electronic branches use the literal retarded denominator
+$E_b-e_n-p+i\eta$. Signed/complex pole extrema enter certified product
+windows; $\eta$ must exceed their growth bound. No pole is shifted and no
+anti-Hermitian completion or extra on-shell average is performed.
+
+`ppm_sigma.window_sigma_c` selects only the active destination block without
+truncating virtual bands. Cumulative band brackets retain the active-only
+and all-virtual intermediate results in one sweep: the first supplies
+$\Gamma,D$, the last supplies $M_H$. The identity-minus-density particle
+line keeps its cancellation at fully occupied states. Only small active
+matrix outputs reach host diagnostics. Native joint propagation never
+calls the archived projected-vertex evaluator.

@@ -83,7 +83,8 @@ derivatives are with respect to s = z². No rule sees band masks, occupations
 or response arrays, and none certifies W or Σ accuracy.
 
 * **`response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-  decay_rate=0)`** (the shared-pole bank). A stacked Hankel shift pencil
+  decay_rate=0, pencil=None, panels=False, max_pencil_bytes=None,
+  max_panel_count=16)`** (the shared-pole bank). A stacked Hankel shift pencil
   proposes complex Laplace times shared by every forward (z) and reverse
   (−z̄) pole of a sample group; linear projection fits 1/(d − p) and
   1/(d − p)² on those nodes. Each node is one Green-pair evaluation A(t):
@@ -108,9 +109,23 @@ or response arrays, and none certifies W or Σ accuracy.
   OpenBLAS (numpy's and scipy's) at min(16, CPUs of the affinity mask) threads
   (the pin of `analytic_box_rule`): the pencil's QR,
   SVD and least squares pick different times at different thread counts, and
-  the shared-pole W poles inherit them.
+  the shared-pole W poles inherit them. `panels=True` permits additive
+  imaginary Gauss panels of at most 384 nodes, checked with the same sampled
+  value/derivative errors and coefficient-mass criterion. The optional
+  `max_pencil_bytes` bounds conservative live HOST Hankel workspace before
+  allocation or pencil-source preparation. An oversized group first tries
+  these shared panels for all its members, then splits if they do not accept;
+  no single-member fallback can bypass the bound. `max_panel_count` limits
+  their number; increasing it adds frequency-quadrature work, not a looser
+  tolerance. Defaults `None`/16 preserve the original unbounded pencil walk.
+  The full-density consumer explicitly uses 4 GiB/32 panels. Its bounded
+  panel checks reuse the identical-height common probe basis, retaining
+  every per-pole near-resonance probe and both derivative/value tests.
+  New consumers must collectively gather rule tables (the response-bank
+  owner does so), since hardware/BLAS can change rule bytes and node counts.
 * **`ResponseGroupTree(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-  decay_rate=0)`** (the same build, one node at a time). Nodes are tuples of
+  decay_rate=0, pencil=None, panels=False, max_pencil_bytes=None,
+  max_panel_count=16)`** (the same build, one node at a time). Nodes are tuples of
   sample indices; `children(node)` gives the two halves, `tried(node)` is False
   for a node halved without a try, `size(node)` is its pencil sample count,
   and `attempt(node)` is the node's whole-group construction: `[rule]` or None

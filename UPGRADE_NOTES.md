@@ -63,6 +63,35 @@ cuSOLVERMp LU chunks `getrs` to the posted room.
   native ncclMin agreement in the LU workspace query (B3) and the eigh memory change
   (ABI 11) are not in this landing.
 
+## 2026-10-20 — native full-microscopic instantaneous GW snapshots
+
+`collision_screening = joint/joint_frozen` with explicit
+`collision_statistics = retarded_reference` now uses the full microscopic
+ISDF response and momentum-FFT self-energy owners. All supplied virtual
+bands, instantaneous energy columns and active density coherences are
+retained. A general two-sided shared-frequency pole bank carries signed or
+complex residues with independent full-ISDF endpoint factors. It does not
+disable the passive constructor's positivity checks or shift growing poles.
+The collision Laplace height must exceed their growth bound.
+
+The previous joint adapter was a spatially projected prototype; its rank-one
+trajectories are not a full microscopic screening comparison. Native joint
+decks setting `collision_density_rank` now refuse: remove the key. Frequency
+supports/directions/pole capacity come from the collision source's GW
+shared-pole recipe, optionally overriding its sites with
+`collision_spm_support_sites_ev`. The old projected-model order, pencil,
+support-count and fit-height keys are marked unused rather than controlling
+the new calculation. `finite_lag` and `lossless_bath` remain CPU research
+helpers, but refuse as native propagation choices.
+
+Full virtual screening and the all-band Hermitian self-energy are separate
+from real collision intermediates/destinations, which remain active-only.
+The one-sided column-shell complex self-energy and principal values enter
+once; no arithmetic on-shell average, trace repair, clipping or Pauli-bound
+guarantee is introduced. Existing collision-off and legacy frozen native
+GW paths retain their previous numerical contracts. New full-microscopic
+results require complex-self-energy refinement before physical interpretation.
+
 ## 2026-10-20 — W densifier: per-centroid-pair Wigner–Seitz embedding
 
 `bse_k_grid` and `exciton_bands --w-coarse-grid` now embed each coarse R class

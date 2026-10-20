@@ -1,10 +1,8 @@
-"""Distributed preparation and runtime adapter for joint MGKBA snapshots.
+"""Full microscopic native shared-pole MGKBA snapshot runtime.
 
-Centroid faces and the bare Coulomb matrices stay on all ranks.  Only one
-q's reduced pair vertices are gathered at a time.  The approximation is a
-declared deterministic Coulomb Nystrom rank; electronic bands and active
-coherences are retained.  All energies below use Ry until the propagation
-boundary, where operators are converted to Ha exactly once.
+The primary joint modes retain every centroid, q and virtual band. Archived
+projected helpers below remain explicit prototype diagnostics, not a fallback
+for propagation. Energies use Ry until the Ha propagation boundary.
 """
 from __future__ import annotations
 
@@ -23,6 +21,146 @@ from tdagw import snapshot_screening as SS
 from tdagw.dynsig import (collision_basis_state, collision_snapshot_state,
                          slow_basis_step, _track_bands)
 from tdagw.self_energy import held_term, with_held_term
+
+
+def prepare_native_source(source, mesh):
+    """Authenticate a full-grid native orbital/Coulomb source without projection.
+
+    The returned ``psi`` is the source's existing centroid face, not a
+    density-channel vertex tensor. Large orbital and bare-Coulomb arrays
+    remain distributed on all ranks. Only scalar metadata and the small
+    full-band energy/occupation tables are gathered.
+    """
+    from common.collectives import gather_to_host
+    from symmetry_maps import QirrOperator
+    wfns, meta = source["wfns"], source["meta"]
+    carrier = wfns.green_parent
+    if carrier is None:
+        raise ValueError("GATE td_native_parent_carrier: explicit full-grid parent faces required")
+    kgrid = tuple(int(x) for x in meta.kgrid)
+    nk = int(np.prod(kgrid))
+    rows = carrier.plan
+    frac = np.asarray(rows.k_parent_frac, float)
+    from gw.centroid_k_unfold import authenticate_canonical_full_grid
+    qsym = source.get("screening_inputs", {}).get("kwargs", {}).get("sym", getattr(rows, "sym", None))
+    flat_grid = authenticate_canonical_full_grid(rows, kgrid, sym=qsym)
+    if (frac.shape != (nk, 3) or not np.array_equal(np.asarray(rows.irr_idx), np.arange(nk))
+            or (rows.parent_full_rows is not None and
+                not np.array_equal(np.asarray(rows.parent_full_rows), np.arange(nk)))):
+        raise ValueError("GATE td_native_full_grid: full identity parent k order required")
+    if int(wfns.slices.b0) != 0:
+        raise ValueError("GATE td_native_full_bands: electronic support must start at zero")
+    logical = int(wfns.slices.b4_logical)
+    nb_chi = min(int(wfns.slices.b4_chi), logical)
+    nb_sigma = min(int(wfns.slices.b4_sigma or nb_chi), logical)
+    nb = max(nb_chi, nb_sigma)
+    V = source.get("V_q", source.get("screening_inputs", {}).get("V_q"))
+    if V is None:
+        raise ValueError("GATE td_native_bare_coulomb: source must retain its full bare V")
+    interaction = QirrOperator.of(V)
+    if (not interaction.is_whole_zone() or interaction.n_full != nk or
+            not np.array_equal(np.asarray(interaction.full_rows), np.arange(nk))):
+        raise ValueError("GATE td_native_coulomb_grid: full identity q carrier required")
+    psi = carrier.projection_faces()[0]
+    V = interaction.values
+    if not isinstance(V, jax.Array) or V.ndim != 3 or V.shape[-1] != psi.shape[-1]:
+        raise ValueError("GATE td_native_centroids: distributed full-mu Coulomb/orbital faces required")
+    nspin = int(getattr(meta, "nspin", 1))
+    nspinor = int(getattr(meta, "nspinor_wfnfile", psi.shape[2]))
+    if min(nspin, nspinor) < 1:
+        raise ValueError("GATE td_native_spin_weight: positive file spin multiplicities required")
+    return dict(energy=np.asarray(gather_to_host(wfns.enk))[:, :nb],
+        occupations=np.asarray(gather_to_host(wfns.occ))[:, :nb], k_frac=frac,
+        kgrid=kgrid, nk=nk, nb=nb, nb_chi=nb_chi, nb_sigma=nb_sigma,
+        mesh=mesh, nmu_logical=int(meta.n_rmu), spin_weight=2.0/(nspin*nspinor),
+        psi=psi, V_q=V, head=source.get("head"),
+        efermi_ry=float(source.get("efermi_ry") or 0.0), native_full_microscopic=True,
+        flat_grid=flat_grid)
+
+
+def make_native_snapshot_evaluator(source, prepared, options):
+    """Bind full-mu current screening to the production native Sigma window.
+
+    Every iterate receives the same explicit block-embedded instantaneous
+    state in response and Sigma. ``joint_frozen`` reuses the equilibrium W
+    handle exactly; electronic lines and the full virtual energies still
+    update. Only active-band matrix outputs leave the devices.
+    """
+    from gw.shared_pole_screening import screen_general_shared_poles
+    from gw.ppm_sigma import shared_pole_window_source, window_sigma_c, window_sigma_plan
+    from gw.shared_pole_recipe import parse_support_sites
+    from common.units import RYD_TO_EV
+    from dataclasses import replace
+    import os
+    start, na = int(options["b_lo"]), int(options["n_active"])
+    active = slice(start, start+na)
+    inp = source.get("screening_inputs")
+    if inp is None:
+        raise ValueError("GATE td_native_screening_source: source must retain native shared-pole W inputs")
+    mode = options.get("screening", "joint")
+    if mode not in ("joint", "frozen"):
+        raise ValueError("GATE td_native_screening: expected joint or frozen")
+    scratch = options.get("spm_scratch")
+    if not scratch:
+        raise ValueError("GATE td_native_screening_scratch: unique model output directory required")
+    cache = dict(n=0)
+    plan = window_sigma_plan(source["config"], head=source.get("head"), window_only=True)
+    screening_config = inp["config"]
+    supports = parse_support_sites(options.get("spm_support_sites", ""))
+    if supports is not None:
+        screening_config = replace(screening_config,
+            sigma=replace(screening_config.sigma, w_support_sites_ev=supports["text"]))
+
+    def evaluate(basis, *, equilibrium=False, fit_bases=None):
+        wall = time.perf_counter()
+        U, e, rho = (np.asarray(basis[k]) for k in ("U", "e", "rho"))
+        energy = prepared["energy"].copy()
+        energy[:, :start] += (e[:, 0]-energy[:, start])[:, None]
+        energy[:, start+na:] += (e[:, -1]-energy[:, start+na-1])[:, None]
+        energy[:, active] = e
+        cache["n"] += 1
+        if mode == "joint" or equilibrium:
+            snapshot = dict(U_active=U, E_active_ry=e, rho_active=rho,
+                active_slice=active, energy_ry=energy,
+                gamma_ry=float(options.get("adiabatic_ry",
+                    float(options.get("adiabatic_ev", 0.05))/RYD_TO_EV)),
+                eta_ry=float(source["config"].sigma.regularization_ev)/RYD_TO_EV,
+                spm_support_sites_ev=options.get("spm_support_sites", ""),
+                support_reads_ev=source.get("recipe_inputs", {}).get("support_reads_ev"),
+                fit_tolerance=float(options.get("fit_tolerance", 0.02)))
+            # The native builder owns support/direction/K admission. No
+            # projected rank, prototype pole order or sample count enters.
+            built = screen_general_shared_poles(inp["wfns"], inp["V_q"], inp["meta"], screening_config,
+                mesh_xy=prepared["mesh"], sym=inp["kwargs"]["sym"], snapshot=snapshot,
+                run_dir=os.path.abspath(scratch), label=f"snapshot_{cache['n']:06d}",
+                fit_basis=fit_bases, print_fn=options.get("say", print))
+            handle = shared_pole_window_source(built["shared_pole"], built["meta"],
+                efermi_ry=prepared["efermi_ry"], linalg=source.get("linalg"))
+            screening_receipt = built["receipt"]
+            if equilibrium:
+                cache.update(equilibrium=handle, equilibrium_receipt=screening_receipt)
+        else:
+            if "equilibrium" not in cache:
+                raise ValueError("GATE td_native_equilibrium: initialize equilibrium W before frozen control")
+            handle, screening_receipt = cache["equilibrium"], cache["equilibrium_receipt"]
+        window = dict(b_lo=start, U=U, e=e, rho=rho,
+                      f=np.diagonal(rho, axis1=-2, axis2=-1).real, e_frozen=energy)
+        out = window_sigma_c(source["wfns"], handle, window, plan, meta=source["meta"],
+            mesh_xy=prepared["mesh"], branches=True, pairing="vertex", static_limit=False,
+            print_fn=options.get("say", print))
+        active_pair, full_pair = out["active_branch_pair"], out["branch_pair"]
+        gamma, injection, _ = C.branch_operators(active_pair["cond"], active_pair["val"])
+        _, _, mh = C.branch_operators(full_pair["cond"], full_pair["val"])
+        Uh = U.conj().swapaxes(-1, -2)
+        totals = {key: U @ np.asarray(value) @ Uh for key, value in
+                  (("gamma", gamma), ("injection", injection), ("m_h", mh))}
+        totals["static"] = np.zeros_like(totals["m_h"])
+        totals.update(screening_receipts=screening_receipt,
+            native_receipt=out["native_receipt"], raw=out,
+            wall_s=time.perf_counter()-wall)
+        return totals
+
+    return evaluate, cache
 
 
 def prepare_projected_source(source, mesh, *, rank=8):
@@ -497,19 +635,18 @@ def make_snapshot_evaluator(prepared, options):
 
 def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
                        options=None, say=print, record=None):
-    """Production collision adapter with converged full-density snapshots.
+    """Native full-microscopic collision adapter with full-density snapshots.
 
     The keyword bundle ``options`` owns numerical controls in eV:
-    ``density_rank, max_order, fit_samples, fit_tolerance, adiabatic_ev,
-    fit_height_ev, eta_ev, snapshot_steps, snapshot_tol_ev,
+    ``spm_support_sites, spm_scratch, fit_tolerance, adiabatic_ev,
+    eta_ev, snapshot_steps, snapshot_tol_ev,
     snapshot_mixing, snapshot_acceleration, screening, statistics, form, hermitian, policy, basis``.
-    Statistical preparation must be selected explicitly. ``finite_lag``
-    does not generally satisfy screened equilibrium FDT. ``lossless_bath``
-    declares spectral pinching in the screening bath, a same-subspace
-    weak-colored-bath prescription, and real poles with collision eta only.
-    ``retarded_reference`` fits only full-rho PR/WR and uses equilibrium-style
-    T=0 reference branches in Sigma, without independent fluctuation noise.
-    All retain the original full density in the electronic self-energy.
+    ``retarded_reference`` fits full-mu full-rho PR/WR with the native
+    shared-frequency constructor, and uses equilibrium-style T=0 reference
+    branches without an independent fluctuation-noise model. All centroid
+    ports, q points and virtual bands are retained. Electronic lines keep
+    the complete active density. The source GW recipe, not a projected
+    rank or prototype pole-order setting, owns frequency approximation.
     ``hamiltonian='hf'`` (default) uses the authenticated absolute
     ``hHF[rho]+MH[rho,H]`` and solves its coherent correction already at
     t0. The supplied DFT density is then explicitly a prepared quench.
@@ -519,7 +656,7 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     static Wc term from a different full screened reference kernel.
 
     ``screening`` is ``joint`` or ``joint_frozen``; both use the same
-    reduced equilibrium screening, then only ``joint`` rebuilds it inside
+    full microscopic equilibrium screening, then only ``joint`` rebuilds it inside
     each snapshot iterate.  Return keys match ``dynsig.window_collision``:
     diss, held, refresh, state, t0, eq. All ranks call this adapter.
     """
@@ -530,17 +667,14 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
 
     options = dict(options or {})
     statistics = options.get("statistics", "unspecified")
-    if statistics not in ("finite_lag", "lossless_bath", "retarded_reference"):
-        raise ValueError("GATE td_collision_statistics: explicitly select finite_lag, lossless_bath or retarded_reference")
-    statistical_status = (dict(statistics="finite_lag",
-        screened_equilibrium_fdt="known_not_generally_satisfied",
-        physical_lossless_statistics="not_implemented") if statistics == "finite_lag" else
-        dict(statistics="retarded_reference", screened_equilibrium_fdt="not_a_nonequilibrium_statistics_claim",
+    if statistics != "retarded_reference":
+        raise ValueError("GATE td_collision_statistics: native full-microscopic joint modes require "
+                         "retarded_reference; finite_lag/lossless_bath helpers are prototype diagnostics only")
+    if options.get("density_rank") is not None:
+        raise ValueError("GATE td_native_density_rank: spatial rank projection is not a native joint control")
+    statistical_status = dict(statistics="retarded_reference", screened_equilibrium_fdt="not_a_nonequilibrium_statistics_claim",
              physical_lossless_statistics="not_requested_retarded_vacuum_reference",
-             screening_density_approximation="full_matrix_ordered_snapshot") if statistics == "retarded_reference" else
-        dict(statistics="lossless_bath", screened_equilibrium_fdt="same_subspace_residue_KMS",
-             physical_lossless_statistics="secular_weak_colored_bath_approximation",
-             screening_density_approximation="spectral_pinching_in_instantaneous_H"))
+             screening_density_approximation="full_matrix_ordered_full_microscopic_snapshot")
     form, hermitian = options.get("form", "subtracted"), options.get("hermitian", "dynamic")
     mode = options.get("screening", "joint")
     convention = options.get("hamiltonian", "hf")
@@ -553,7 +687,7 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     if model is None:
         raise ValueError("GATE td_snapshot_model: propagator reference mean-field model required")
     t_setup = time.perf_counter()
-    prepared = prepare_projected_source(source, mesh, rank=int(options.get("density_rank", 8)))
+    prepared = prepare_native_source(source, mesh)
     nk, na, nk_pad = prepared["nk"], int(ops.e_qp.shape[-1]), int(ops.e_qp.shape[0])
     start, active = int(b_lo), slice(int(b_lo), int(b_lo) + na)
     if start < 0 or start + na > prepared["nb"]:
@@ -583,14 +717,9 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     frozen_energy = prepared["energy"].copy()
     frozen_energy[:, :start] += (e_ref[:, 0] - frozen_energy[:, start])[:, None]
     frozen_energy[:, start + na:] += (e_ref[:, -1] - frozen_energy[:, start + na - 1])[:, None]
-    evaluator_opts = dict(options, b_lo=start, n_active=na,
-        frozen_energy=frozen_energy, screening="frozen" if mode == "joint_frozen" else "joint",
-        support_count=int(options.get("fit_samples", 192)),
-        support_height_ry=float(options.get("fit_height_ev", 0.15)) / RYD_TO_EV,
-        adiabatic_ry=float(options.get("adiabatic_ev", 0.05)) / RYD_TO_EV,
-        eta_ry=float(options.get("eta_ev", 0.1)) / RYD_TO_EV,
-        fit_tolerance=float(options.get("fit_tolerance", 0.02)))
-    evaluate, screening_cache = make_snapshot_evaluator(prepared, evaluator_opts)
+    evaluator_opts = dict(options, b_lo=start, n_active=na, say=say,
+        frozen_energy=frozen_energy, screening="frozen" if mode == "joint_frozen" else "joint")
+    evaluate, screening_cache = make_native_snapshot_evaluator(source, prepared, evaluator_opts)
     held0 = None if hermitian == "none" else put(np.zeros((ntr, nk, na, na), complex))
     rho0 = put(np.broadcast_to(rho_eq_h, (ntr, nk, na, na)))
     slow_apply = model.apply if hermitian == "none" else with_held_term(model, None).apply
@@ -657,7 +786,7 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
 
     t0 = dict(n=0, t_fs=0.0, why="t0", screening=mode, form=form, hermitian=hermitian,
               **statistical_status,
-              density_rank=prepared["rank"], electronic_bands=prepared["nb"],
+              spatial_projection=False, nmu=prepared["nmu_logical"], electronic_bands=prepared["nb"],
               q_receipts=eq["screening_receipts"], setup_s=time.perf_counter() - t_setup,
               orbital_gauge=gauge,
               hamiltonian_convention=("hHF[rho]+MH[rho,H]" if convention == "hf" else
@@ -675,7 +804,7 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     req_b = to_bundle(rho_eq_h)
     t0["prepared_density_commutator_ha"] = float(np.max(np.linalg.norm(
         H0 @ req_b - req_b @ H0, axis=(-2, -1)))) * ry_ha
-    say(f"  joint snapshot t0: rank {prepared['rank']}, {prepared['nb']} bands, {nk} q; "
+    say(f"  native joint snapshot t0: {prepared['nmu_logical']} mu, {prepared['nb']} bands, {nk} q; "
         f"{mode}; setup {t0['setup_s']:.2f} s")
     if record is not None:
         record(t0)
@@ -695,12 +824,9 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
             bases = bases_at(rho, candidate_params, t)
             rows = ([evaluate(basis, fit_bases=fit_bases[trial]) for trial, basis in enumerate(bases)]
                     if fit_bases is not None else [evaluate(basis) for basis in bases])
-            screens = [row["screening_receipts"] for row in rows]
             screening_iterations.append(dict(
-                fit_orders=[[q["fit_order"] for q in trial] for trial in screens],
-                bubble_check_error=max(q["bubble_check_error"] for tr in screens for q in tr),
-                screening_check_error=max(q["screening_check_error"] for tr in screens for q in tr),
-                noise_check_error=max(q["noise_check_error"] for tr in screens for q in tr)))
+                screening=[row["screening_receipts"] for row in rows],
+                native_sigma=[row["native_receipt"] for row in rows]))
             target = candidate
             if hermitian != "none":
                 mh = np.stack([row["m_h"][bundle_of] for row in rows])

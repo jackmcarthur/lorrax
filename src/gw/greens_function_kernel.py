@@ -1,6 +1,6 @@
 """Build parent Green operators and transport them with typed local symmetry actions."""
 import dataclasses
-from functools import partial
+from functools import partial, lru_cache
 
 import jax
 
@@ -8,6 +8,34 @@ import numpy as np
 import jax.numpy as jnp
 
 from common.contract_bands import merge_spin_centroid
+
+
+@lru_cache(maxsize=None)
+def density_left_endpoint(mesh, shape, *, layout="face"):
+    """Native GEMM ``psi_mun @ density`` for a full one-sided Green.
+
+    The returned compiled function takes ``psi[k,s,mu,b]`` and the full
+    instantaneous band matrix ``density[k,b,b]``. It returns the same
+    wavefunction layout with *only its left endpoint* weighted. Subsequent
+    :func:`build_G_tau` applies phases on the original right-column band,
+    retaining off-diagonal coherences without a dense Green band matrix.
+    No eigenvalue or occupation pinching is performed. Both spatial and
+    band axes retain their native distributed GEMM layouts.
+    """
+    from distrib_la import gemm_plan
+    from common.contract_bands import split_spin_centroid
+    nk, ns, nmu, nb = (int(i) for i in shape)
+    plan = gemm_plan(mesh, m=ns*nmu, k=nb, n=nb, nq=nk,
+                     dtype=jnp.complex128, layout=layout, warmup=False)
+
+    @jax.jit
+    def apply(psi, density):
+        if psi.shape != (nk, ns, nmu, nb) or density.shape != (nk, nb, nb):
+            raise ValueError("GATE response_density_endpoint: incompatible full band density")
+        a = jax.lax.with_sharding_constraint(merge_spin_centroid(psi, 1, 2), plan.in_sharding_a)
+        b = jax.lax.with_sharding_constraint(density, plan.in_sharding_b)
+        return split_spin_centroid(plan(a, b), 1, ns, nmu)
+    return apply
 
 
 def face_green_product(A, B, mesh, phases, band_range, n_full=None, partner=False):

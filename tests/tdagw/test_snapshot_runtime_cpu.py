@@ -1,4 +1,8 @@
-"""Four-CPU distributed Nystrom/vertex and full-rho adapter smoke gates."""
+"""Archived projected helpers and native adapter bookkeeping CPU gates.
+
+The coefficient test doubles below exercise Hamiltonian/refresh bookkeeping,
+not microscopic-screening accuracy; the literal full-port gates own that.
+"""
 from types import SimpleNamespace as NS
 from typing import NamedTuple
 
@@ -26,7 +30,9 @@ def _source():
     k = np.stack((np.arange(nk) / nk, np.zeros(nk), np.zeros(nk)), axis=1)
     carrier = NS(psi_nmu=jax.device_put(psi, NamedSharding(mesh, P(None, None, None, "y"))),
                  plan=NS(k_parent_frac=k, irr_idx=np.arange(nk), parent_full_rows=np.arange(nk)))
-    wfns = NS(green_parent=carrier, slices=NS(b0=0, b4_chi=nb, b4_logical=nb),
+    carrier.projection_faces = lambda: (carrier.psi_nmu,
+        jax.device_put(psi.transpose(0, 2, 3, 1), NamedSharding(mesh, P(None, None, "x", None))))
+    wfns = NS(green_parent=carrier, slices=NS(b0=0, b4_chi=nb, b4_sigma=nb, b4_logical=nb),
               enk=jnp.tile(jnp.array([-0.4, -0.2, 0.3, 0.7]), (nk, 1)),
               occ=jnp.tile(jnp.array([1.0, 1.0, 0.0, 0.0]), (nk, 1)))
     source = dict(wfns=wfns, meta=NS(kgrid=(nk, 1, 1), n_rmu=nmu),
@@ -217,18 +223,31 @@ def test_hf_source_capture_reuses_existing_authenticated_outputs():
     assert hf["basis"] == "source_wfn"
 
 
-@pytest.mark.parametrize("statistics", [None, "unspecified", "physical_adiabatic"])
+@pytest.mark.parametrize("statistics", [None, "unspecified", "physical_adiabatic", "finite_lag", "lossless_bath"])
 def test_snapshot_statistics_guard_precedes_source_setup(monkeypatch, statistics):
     from tdagw import snapshot_runtime as runtime
 
     def unexpected_setup(*args, **kwargs):
         pytest.fail("statistical guard must precede any source preparation")
 
-    monkeypatch.setattr(runtime, "prepare_projected_source", unexpected_setup)
+    monkeypatch.setattr(runtime, "prepare_native_source", unexpected_setup)
     options = {} if statistics is None else dict(statistics=statistics)
     with pytest.raises(ValueError, match="GATE td_collision_statistics"):
         runtime.snapshot_collision(None, None, mesh=None, k_frac=None,
                                    b_lo=0, ntr=1, model=None, options=options)
+
+
+def test_native_preparation_keeps_original_faces_without_spatial_sketch(monkeypatch):
+    from tdagw import snapshot_runtime as sr
+    source, mesh, psi, _ = _source()
+    def unexpected_projection(*args, **kwargs):
+        pytest.fail("native preparation must not construct projected pair vertices")
+    monkeypatch.setattr(sr, "prepare_projected_source", unexpected_projection)
+    prepared = sr.prepare_native_source(source, mesh)
+    assert prepared["native_full_microscopic"]
+    assert prepared["nmu_logical"] == psi.shape[-1]
+    assert prepared["psi"] is source["wfns"].green_parent.projection_faces()[0]
+    assert not ({"vertices", "omega", "rank"} & prepared.keys())
 
 
 def test_joint_fit_refusal_does_not_install_a_snapshot(monkeypatch):
@@ -239,16 +258,16 @@ def test_joint_fit_refusal_does_not_install_a_snapshot(monkeypatch):
     from tdagw.tdgw_io import HA_IN_EV
     source, mesh, _, _ = _source()
 
-    def factory(prepared, options):
-        def evaluate(basis, equilibrium=False):
+    def factory(source, prepared, options):
+        def evaluate(basis, equilibrium=False, fit_bases=None):
             if not equilibrium:
                 raise ValueError("GATE snapshot_fit_error: independently checked response refused")
             zero = np.zeros((4, 2, 2), complex)
             return dict(gamma=zero, injection=zero, m_h=zero, static=zero,
-                        screening_receipts=[])
+                        screening_receipts=[], native_receipt={})
         return evaluate, {}
 
-    monkeypatch.setattr(runtime, "make_snapshot_evaluator", factory)
+    monkeypatch.setattr(runtime, "make_native_snapshot_evaluator", factory)
     req = np.broadcast_to(np.diag([1.0, 0.0]), (4, 2, 2)).astype(complex)
     put = lambda value, spec: jax.device_put(value, NamedSharding(mesh, spec))
     ops = NS(e_qp=put(np.asarray(source["wfns"].enk)[:, 1:3] * RYD_TO_EV / HA_IN_EV,
@@ -258,7 +277,7 @@ def test_joint_fit_refusal_does_not_install_a_snapshot(monkeypatch):
     model = zero_model()
     built = runtime.snapshot_collision(source, ops, mesh=mesh,
         k_frac=source["wfns"].green_parent.plan.k_parent_frac, b_lo=1, ntr=1, model=model,
-        options=dict(statistics="finite_lag", hamiltonian="reference", hf_model=model, screening="joint",
+        options=dict(statistics="retarded_reference", hamiltonian="reference", hf_model=model, screening="joint",
                      policy=C.RefreshPolicy(every=1.0)), say=lambda _: None)
     held = np.asarray(built["held"]).copy()
     with pytest.raises(ValueError, match="GATE snapshot_fit_error"):
@@ -302,7 +321,7 @@ def test_bare_hf_kernel_replaces_full_screened_W_and_keeps_bare_head():
 
 
 @pytest.mark.parametrize("convention", ["hf", "reference"])
-@pytest.mark.parametrize("statistics", ["finite_lag", "retarded_reference"])
+@pytest.mark.parametrize("statistics", ["retarded_reference"])
 def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkeypatch, convention, statistics):
     from common.units import RYD_TO_EV
     from tdagw import collision as C
@@ -324,7 +343,7 @@ def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkey
     M = np.broadcast_to(np.array([[0.04, 0.006j], [-0.006j, -0.01]]), (nk, na, na)).copy()
     basis_calls = []
 
-    def factory(prepared, options):
+    def factory(source, prepared, options):
         def evaluate(basis, equilibrium=False, fit_bases=None):
             basis_calls.append((equilibrium, fit_bases))
             U = basis["U"]
@@ -336,10 +355,10 @@ def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkey
             # The grossly different static table must never be subtracted
             # from the bare-HF-plus-MH Hamiltonian, in either convention.
             return dict(gamma=z, injection=z, m_h=M + 0.1 * delta,
-                        static=1000.0 * delta, screening_receipts=receipts)
+                        static=1000.0 * delta, screening_receipts=receipts, native_receipt={})
         return evaluate, {}
 
-    monkeypatch.setattr(runtime, "make_snapshot_evaluator", factory)
+    monkeypatch.setattr(runtime, "make_native_snapshot_evaluator", factory)
     sh3, sh2, sh1 = (NamedSharding(mesh, P(("x", "y"), None, None)),
                      NamedSharding(mesh, P(("x", "y"), None)), NamedSharding(mesh, P(("x", "y"))))
     energies = np.asarray(source["wfns"].enk)[:, 1:3]
@@ -409,13 +428,13 @@ def test_snapshot_refusal_preserves_scalar_residual_history(acceleration):
 
 
 @pytest.mark.parametrize("with_head", [False, True])
-@pytest.mark.parametrize("statistics", ["finite_lag", "lossless_bath", "retarded_reference"])
-def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head, statistics):
+def test_snapshot_adapter_with_projected_coefficient_test_double(monkeypatch, with_head):
     from common.units import RYD_TO_EV
     from tdagw import collision as C
     from tdagw import propagate as tp
     from tdagw.self_energy import zero_model
     from tdagw.snapshot_runtime import snapshot_collision
+    from tdagw import snapshot_runtime as sr
     from tdagw.tdgw_io import HA_IN_EV
 
     class Ops(NamedTuple):
@@ -440,13 +459,27 @@ def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head, statistics):
     ops = Ops(jax.device_put(np.asarray(source["wfns"].enk)[:, 1:3] * RYD_TO_EV / HA_IN_EV, spec2),
               jax.device_put(rhoeq, spec3), jax.device_put(np.full(4, 0.25), spec1))
     model = zero_model()
-    options = dict(statistics=statistics, density_rank=1, max_order=48, fit_samples=192, fit_tolerance=2e-3,
+    statistics = "retarded_reference"
+    options = dict(statistics=statistics, max_order=48, fit_samples=192, fit_tolerance=2e-3,
                    adiabatic_ev=0.15, fit_height_ev=0.3, policy=C.RefreshPolicy(every=1.0),
                    # Isolate the coupled HF/Sigma runtime from adaptive
                    # rational fit order changes: both consume the identical
                    # admitted equilibrium W, with full-rho electronic lines.
                    screening="joint_frozen", hamiltonian="reference",
                    hf_model=model)
+    # Explicitly substitute an archived projected coefficient oracle for this
+    # bookkeeping-only test. Production must never call this helper implicitly.
+    def coefficient_double(source, prepared, controls):
+        projected = prepare_projected_source(source, mesh, rank=1)
+        evaluate, cache = sr.make_snapshot_evaluator(projected, dict(controls,
+            support_count=192, support_height_ry=.3/RYD_TO_EV,
+            adiabatic_ry=.15/RYD_TO_EV, eta_ry=.1/RYD_TO_EV))
+        def wrapped(*args, **kwargs):
+            result = evaluate(*args, **kwargs)
+            result["native_receipt"] = {"test_double": "explicit_projected_coefficients"}
+            return result
+        return wrapped, cache
+    monkeypatch.setattr(sr, "make_native_snapshot_evaluator", coefficient_double)
     built = snapshot_collision(source, ops, mesh=mesh,
         k_frac=source["wfns"].green_parent.plan.k_parent_frac,
         b_lo=1, ntr=1, model=model, options=options, say=lambda _: None)
@@ -457,18 +490,9 @@ def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head, statistics):
     assert len(built["state"]["basis_last"]) == 1
     assert all(row["screening_s"] >= 0.0 for row in built["t0"]["q_receipts"])
     assert built["t0"]["statistics"] == statistics
-    if statistics == "finite_lag":
-        assert built["t0"]["screened_equilibrium_fdt"] == "known_not_generally_satisfied"
-        assert built["state"]["history"][-1]["physical_lossless_statistics"] == "not_implemented"
-    elif statistics == "lossless_bath":
-        assert built["t0"]["screened_equilibrium_fdt"] == "same_subspace_residue_KMS"
-        assert built["state"]["history"][-1]["screening_density_approximation"] == (
-            "spectral_pinching_in_instantaneous_H")
-        assert all(not row["lag_decay_used"] for row in built["t0"]["q_receipts"])
-    else:
-        assert built["t0"]["screened_equilibrium_fdt"] == "not_a_nonequilibrium_statistics_claim"
-        assert built["state"]["history"][-1]["screening_density_approximation"] == (
-            "full_matrix_ordered_snapshot")
+    assert built["t0"]["screened_equilibrium_fdt"] == "not_a_nonequilibrium_statistics_claim"
+    assert built["state"]["history"][-1]["screening_density_approximation"] == (
+        "full_matrix_ordered_full_microscopic_snapshot")
     if not with_head:
         excited = rhoeq[None].copy()
         excited[..., 0, 0], excited[..., 1, 1] = 0.9, 0.1

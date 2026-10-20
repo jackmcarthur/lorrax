@@ -2073,6 +2073,7 @@ def shared_pole_window_source(model: dict, meta, *, efermi_ry: float, linalg) ->
     which places the W(τ) synthesis.
     """
     return dict(member="shared_pole", model=dict(model), meta=meta, efermi_ry=float(efermi_ry),
+                representation=model.get("representation", "scalar"),
                 linalg=linalg)
 
 
@@ -2138,6 +2139,106 @@ def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal
         fixed_quadrature_session=plan.get("session"), linalg=source.get("linalg"),
         keep_branches=keep_branches, print_fn=print_fn)
     return replace(res, efermi_ry=efermi)
+
+
+def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
+                          enk, occ, pop, line_carrier, print_fn):
+    """Full microscopic retarded branches, active rates and all-band virtual MH.
+
+    One native band-bracket sweep retains both the active intermediate
+    contribution and the full virtual sum, at the same compact real
+    destination bands. The left electronic panel is psi rho, so every
+    phase belongs to the right internal index. An inserted identity active
+    panel represents I-rho without diagonalizing the density.
+    """
+    from common.collectives import gather_to_host
+    from .mpa.sigma import ordered_shared_pole_sigma
+    from .ppm_windows import _SigmaBranch
+
+    nk, nb = pop.shape
+    hi = int(b_lo) + int(n_a)
+    # Both faces remain the actual instantaneous orbitals; only the Green
+    # left panel receives rho. Frozen spectators have diagonal 0/1 lines.
+    hole = _rotate_faces(*faces, rho, b_lo, np.ones(faces[0].shape[1]))
+    enlarged_n, enlarged_m, n_pad = _insert_columns(faces, [faces], b_lo, n_a, mesh_xy)
+    _, left_m, _ = _insert_columns(hole, [faces], b_lo, n_a, mesh_xy)
+    n_insert = int(n_a) + n_pad
+    insert = lambda a, x, pad: np.concatenate((a[:, :hi], x, pad, a[:, hi:]), axis=1)
+    energy = insert(enk, enk[:, b_lo:hi], np.repeat(enk[:, b_lo:b_lo+1], n_pad, axis=1))
+    occ_l = insert(occ, occ[:, b_lo:hi], np.zeros((nk, n_pad)))
+    wfns_t, meta_t, slices_t, _ = line_carrier((enlarged_n, enlarged_m),
+        (left_m, None), n_insert, energy, occ_l)
+    efermi = float(source["efermi_ry"])
+    external = enk[:, b_lo:hi] - efermi
+    request = on_shell_request(e_eval_rel_ev=external * RYD_TO_EV,
+        e_dft_rel_ev=external * RYD_TO_EV, omega_range_ev=plan["omega_range_ev"],
+        out_of_grid=plan["out_of_grid"], irr_idx=np.arange(nk), n_parent=nk)
+    hole_weight = insert(pop, np.zeros((nk, n_a)), np.zeros((nk, n_pad)))
+    part_weight = insert(1.0-pop, np.ones((nk, n_a)), np.zeros((nk, n_pad)))
+    # Preserve every nonzero coherence. The negative particle panel is
+    # -rho, NOT I-rho: even a fully occupied column must cancel its
+    # inserted identity column exactly.
+    live_h = np.any(np.abs(rho) != 0.0, axis=-1)
+    hole_weight[:, b_lo:hi] = live_h
+    part_weight[:, b_lo:hi] = -live_h.astype(np.float64)
+    # All spectator and active phases use the SAME explicit full energy
+    # table. The sign is a line coefficient, never a pole/sign projection.
+    branches = tuple(_SigmaBranch(tag=f"ordered:{space}", E_A=energy-efermi,
+        base_mask_A=weight != 0.0, space=space, neg_omega_half=False,
+        omega_abs=np.abs(request.frequencies_ry), omega_idx=np.arange(request.frequencies_ry.size),
+        band_weight=weight) for space, weight in (("cond", part_weight), ("val", hole_weight)))
+    brackets = [(b_lo, hi+n_a)]
+    if b_lo:
+        brackets.append((0, b_lo))
+    if hi+n_insert < nb+n_insert:
+        brackets.append((hi+n_insert, nb+n_insert))
+    cfg = plan["sigma_cfg"]
+    res, receipt = ordered_shared_pole_sigma(wfns_t, source["model"],
+        fresh_shared_pole_capacity(meta_t, mesh_xy), mesh_xy, request=request,
+        sigma_branches=branches, regularization_width_ry=float(cfg.regularization_ev)/RYD_TO_EV,
+        quadrature_eps=float(cfg.quadrature_eps), projection_bands=(b_lo, hi),
+        band_brackets=tuple(brackets), print_fn=print_fn)
+    block = _window_block_fn(mesh_xy, 0, n_a, 4)
+    both = {}
+    for name, count in (("active", 0), ("full", len(brackets)-1)):
+        both[name] = {space: np.asarray(gather_to_host(block(res.branches[space].point(count).pair)))
+                      for space in ("cond", "val")}
+    head = plan.get("head")
+    if head is not None:
+        head = replace(head, enk_ry=enk[:, b_lo:hi], occupations=np.ones((nk, n_a)),
+                       efermi_ry=efermi)
+        head_pair = {space: np.zeros((2, nk, n_a, n_a), complex) for space in ("cond", "val")}
+        for slot in range(2):
+            for i in range(n_a):
+                energies = (np.repeat(external[:, i:i+1], n_a, axis=1) if slot == 0 else external)
+                h = np.conj(head.on_shell(energies)[0])
+                p = replace(head, occupations=np.zeros((nk, n_a))).on_shell(energies)[0]
+                head_pair["val"][slot, :, i] = rho[:, i] * h
+                head_pair["cond"][slot, :, i] = (np.eye(n_a)[None]-rho)[:, i] * p
+        for count in both.values():
+            for space in head_pair:
+                count[space] = count[space] + head_pair[space]
+    # Existing downstream column algebra expects an ADVANCED hole pair.
+    # This exact small-table conversion recovers Rh_column once, with no
+    # arithmetic shell average and no additional principal-value term.
+    compatibility = lambda t: dict(cond=t["cond"],
+        val=np.conj(t["val"][::-1].swapaxes(-1, -2)), static=np.zeros((nk, n_a, n_a), complex))
+    active, full = (compatibility(both[key]) for key in ("active", "full"))
+    total = both["full"]["cond"] + both["full"]["val"]
+    receipt.update(internal_bands=int(nb), real_destinations=int(n_a),
+        rate_intermediates="active_only", virtual_intermediates="all",
+        ordered_internal_phase="right_index", head="frozen_reference_current_electronic_lines",
+        full_density=True, spatial_projection=False,
+        bracket_intervals=[list(x) for x in brackets])
+    return dict(pair=total, diag=np.einsum("kii->ki", total[1]),
+        onshell=None, branch_pair=full, active_branch_pair=active,
+        static=np.zeros((nk, n_a, n_a), complex), retarded_pair=both["full"],
+        request=request, efermi_ry=efermi, native_receipt=receipt,
+        carrier=dict(slices=slices_t, nb_sigma=int(n_a)),
+        sweep=dict(n_windows=receipt["n_windows"], window_tau_pairs=receipt["window_tau_pairs"],
+            distinct_tau=receipt["window_tau_pairs"], held=False, rebuilds=0,
+            windows=[(x["name"], x["node_count"]) for x in receipt["windows"]]),
+        full_rho=dict(pairing="vertex", n_insert=n_insert), basis=U)
 
 
 def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omega_ry=None,
@@ -2306,7 +2407,9 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
                                  "sum needs internal='frozen'")
             mask = mask & np.broadcast_to(np.asarray(keep_frozen, bool), pop.shape)
         internal_bands = InternalBands(mask=mask, coulomb_hole=(internal == "frozen"))
-    rho_w = _window_rho(window, U, f, internal, omit_frozen)
+    general = (isinstance(poles, dict) and
+               poles.get("representation", poles.get("model", {}).get("representation")) == "ordered_complex")
+    rho_w = _window_rho(window, U, f, "active" if general else internal, omit_frozen)
     if rho_w is not None and (pairing not in LINE_PAIRINGS or omega_ry is not None
                               or not branches):
         raise ValueError(
@@ -2370,6 +2473,14 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
                     setattr(meta_t, name, getattr(meta_src, name))
             meta_t = fresh_shared_pole_capacity(meta_t, mesh_xy)
         return wfns_t, meta_t, slices_t, enk_l
+
+    if general:
+        if rho_w is None or pairing != "vertex" or omit_frozen or static_limit or keep_frozen is not None:
+            raise ValueError("GATE ordered_window_sigma: full rho, vertex ordering and full virtual "
+                             "sum required; static-W subtraction and frozen-band truncation are not this member")
+        return _ordered_window_lines(poles, plan, mesh_xy=mesh_xy, faces=(psi_nmu, psi_mun),
+            rho=rho_w, U=U, b_lo=b_lo, n_a=n_a, enk=enk_t, occ=occ, pop=pop,
+            line_carrier=line_carrier, print_fn=quiet)
 
     def line_sweep(line, pop_l, part_l, ib_l, plan_l, omega_grid=None, keep_branches=False):
         """One Σ sweep on a line carrier: on shell (``omega_grid`` None) or on that grid
