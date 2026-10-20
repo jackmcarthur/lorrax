@@ -1804,8 +1804,8 @@ class Plan:
         A = ensure_sharding(A, face)
         shape, dtype, site = tuple(int(v) for v in A.shape), str(A.dtype), call_site()
 
-        def program(phase):
-            return _reshard_stack_program(op, self.mesh, shape, dtype, int(rounds), phase,
+        def program(phase, r=rounds):
+            return _reshard_stack_program(op, self.mesh, shape, dtype, int(r), phase,
                                           cut if cut is None or callable(cut) else float(cut),
                                           _gathered_admitted(self.mesh, shape[-2:], dtype, self.budget_bytes))
         if op == "normal_eigh":
@@ -1814,13 +1814,42 @@ class Plan:
             values_vectors, failed = program(traced_phase())(A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
             return values_vectors
-        values_vectors, failed = _executable(program("first"), (A,))(A)
+        rounds, first = self._admitted_first(program, A, int(rounds))
+        values_vectors, failed = first(A)
         if _flag(failed, shape[-1], A.dtype):
             _notices(failed, "eigh", shape[-1], A.dtype, site, final=False)
             del values_vectors
-            values_vectors, failed = _executable(program("retry"), (A,))(A)
+            values_vectors, failed = _executable(program("retry", rounds), (A,))(A)
             raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
         return values_vectors
+
+    def _admitted_first(self, program, A, rounds):
+        """``(rounds, executable)`` of an eager route-(c) first attempt, admitted at the executable
+        that runs: its ``memory_analysis`` plus the ROCm leg's batched workspace against the agreed
+        room (``lxkit.memory.room``, every rank enters).  Over the room, twice the rounds (slices
+        of half as many matrices), each compiled only when the one before is over; none fits, the
+        smallest runs under ``lxkit.memory.admit``'s warning.  Without a run budget (a bare
+        library call) the decided rounds run."""
+        from lxkit import memory
+        first = lambda r: _executable(program("first", r), (A,))
+        if "budget" not in memory.run():
+            return rounds, first(rounds)
+        from distrib_la.local_eigh import batched_workspace_bytes
+        nb, n, ranks = int(A.shape[0]), int(A.shape[-1]), int(self.mesh.size)
+        tries = [rounds]
+        while tries[-1] < nb:
+            tries.append(min(nb, 2 * tries[-1]))
+
+        def price(r):
+            share = -(-(-(-nb // r)) // ranks)
+            return memory.priced((_analysis_bytes(first(r)) or 0) + batched_workspace_bytes(
+                (share, n, n), A.dtype, mesh_platform(self.mesh)),
+                f"distrib_la route (c) first program, {r} round(s) (compiled)")
+        chosen = memory.admit(f"distrib_la route (c) stack {nb} x {n}^2",
+                              tuple((f"{r} round(s)", lambda r=r: price(r)) for r in tries),
+                              memory.room(bucketed=False), device=False)
+        r = next(t for t in tries if f"{t} round(s)" == chosen)
+        return r, first(r)
 
     def _reshard_options(self, kwargs: dict):
         """Refuse keywords route (c) cannot honour.
