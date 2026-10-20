@@ -128,7 +128,7 @@ from common.contract_bands import reduce_scatter_to_band_block
 from common.fft_helpers import (klead_outer_decode_refusal, klead_outer_refusal,
                                 make_local_kconv_klead, make_local_kconv_klead_outer,
                                 make_local_kconv_klead_outer_decode)
-from common.gpu_utils import device_budget_bytes, record_stage_price, warn_over_budget
+from common.gpu_utils import device_budget_bytes
 from runtime import tiles
 from .bse_preconditioner import exchange_spin_weight
 from .bse_ring_comm import make_bse_shardings
@@ -587,8 +587,8 @@ def _w_plan(name, rank, W_R, mu, nu):
     The price is the W term's per-rank live set: the resident ``W_R`` tile and ψ legs, and per
     trial the route's block transients (the stored U, the laid-out ``W_R`` block, A and its
     accumulator, the outer load's legs, the fused handler's scratch at most U/16).  It is
-    recorded (``record_stage_price``) and, over ``device_budget_bytes()``, warned
-    (``warn_over_budget``); it never sizes the blocks.
+    booked to the open section (``lxkit.memory.book``) and admitted against
+    ``device_budget_bytes()`` (``lxkit.memory.admit``: over it, one warning); it never sizes the blocks.
     """
     from ffi.gate import announce_once
     mu_loc, nu_loc = int(W_R.shape[0]), int(W_R.shape[1])
@@ -613,10 +613,10 @@ def _w_plan(name, rank, W_R, mu, nu):
                                              f"{nu_loc} (mu_loc x nu_loc) tile")
                   + (f", U block {gb(stored)} (tile {gb(tiles.TILE_BYTES)})" if stored else "")
                   + f"; W term {gb(price)}/rank")
-    record_stage_price("bse.w_term", price)
-    budget = device_budget_bytes()
-    if price > budget:
-        warn_over_budget("bse.w_term", price, budget)
+    from lxkit import memory
+    priced = memory.priced(price, "bse W term blocks (closed form)")
+    memory.book(priced)
+    memory.admit("bse.w_term", priced, device_budget_bytes())
     return plan
 
 

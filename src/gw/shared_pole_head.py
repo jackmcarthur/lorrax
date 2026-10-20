@@ -75,7 +75,7 @@ def _gamma_gemm_route(mesh, b_shape, budget_bytes):
     is ``panel_matmul``, an XLA program that opens no vendor context."""
     import distrib_la
     from lxkit import memory
-    from distrib_la.matmul import route_bytes, staged_fits
+    from distrib_la import route_bytes, staged_fits
     q, n, k = (int(v) for v in b_shape)
     ranks, shape = int(mesh.size), (q, n, k)
     fits = staged_fits(mesh, shape, shape, "complex128", "N", "C", int(budget_bytes))

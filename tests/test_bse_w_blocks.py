@@ -215,17 +215,20 @@ def run_cases(mesh, *, xla_reference=False):
         with ctx(), _patched(B, _take_block=fake, **_route_patches("xla")), _patched(tiles, **tile_attrs):
             red[name] = _rel(_apply(mesh, ops), ref)
     # Over budget: the price exceeds a budget lowered below it; the stage warns and runs.
-    from common import gpu_utils
-    keep = gpu_utils._RUN_DEVICE_BUDGET_GB
+    from lxkit import memory
+    keep = memory.run()
     with warnings.catch_warnings(record=True) as seen:
         warnings.simplefilter("always")
-        gpu_utils.set_device_budget_gb(1e-9)
+        memory.set_budget(1.0)
         try:
             tile_attrs, _ = _plan_patches("xla", "cap_a", 2)
             with ctx(), _patched(B, **_route_patches("xla")), _patched(tiles, **tile_attrs):
                 out["over budget: still exact vs numpy"] = _rel(_apply(mesh, ops), ref)
         finally:
-            gpu_utils._RUN_DEVICE_BUDGET_GB = keep
+            memory.reset(run=True)
+            if keep:
+                memory.set_budget(keep["budget"], limit_bytes=keep["limit"], per_node=keep["per_node"],
+                                  platform=keep["platform"], linalg=keep["linalg"])
     warned = any("memory over budget at bse.w_term" in str(w.message) for w in seen)
     return out, red, warned
 

@@ -114,8 +114,7 @@ from distrib_la.matmul import (
     MATMUL_BACKEND_CHOICES,
     contract_faces,
     matmul,
-    resolve_matmul_backend,
-)
+    resolve_matmul_backend, route_bytes, staged_fits)
 from distrib_la.matmul_plan import GemmPlan, gemm_plan, local_gemm_plan
 from distrib_la._panel_matmul import batch_gram, panel_matmul
 from distrib_la.plan import RoomExhausted, room_class, room_or_exhausted  # noqa: E402
@@ -172,7 +171,7 @@ __all__ = [
     # plan
     "Plan", "plan", "StackRoute", "RoomExhausted", "room_class", "room_or_exhausted", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes", "native_eigh_jacobi",
     # native dense workspace queries (no allocation)
-    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "eigh_stack_bytes", "lu_workspace_bytes", "lu_workspace_query",
+    "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "eigh_stack_bytes", "lu_workspace_bytes", "lu_workspace_query", "route_bytes", "staged_fits",
     # polar / SVD
     "PolarPlan", "plan_polar_factor", "polar_factor",
     "right_singular_vectors", "leading_eigenvectors", "leading_eigenvectors_above",
