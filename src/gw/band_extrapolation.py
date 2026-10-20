@@ -1835,6 +1835,43 @@ def _pooled_shell_grid(ladder: BandLadder, a1: int, a2: int, a3: int,
             float(np.sqrt(res[jo] / max(e_fit.size, 1))))
 
 
+def spectral_tail_ratio(ladder, counts, e_state_ev, *, beta, omega_ev):
+    """Evaluate the denominator-shell ratio with specified shape parameters.
+
+    Computes G(N3,NT;E)/G(N1,N3;E), using the SAME compressed shell
+    measures as the equilibrium estimator. ``e_state_ev`` is a host array
+    on the ladder's absolute eV reference. No band-label-dependent ratio is
+    reused: a snapshot calls this at its current eigenvalues. A uniform
+    virtual-ladder shift is represented by subtracting that shift from E.
+    Invalid denominators refuse; no zero-tail or pole clipping is applied.
+    """
+    N = np.asarray(counts, dtype=np.int64)
+    e = np.asarray(e_state_ev, dtype=np.float64)
+    if (N.shape != (3,) or not (0 <= N[0] < N[1] < N[2])
+            or e.size == 0 or not np.isfinite(e).all()
+            or not np.isfinite(beta) or beta <= 0 or not np.isfinite(omega_ev)):
+        raise ValueError("spectral_tail_ratio: finite states, shape and three ascending counts required")
+    a1, _, a3 = (ladder.absolute(int(c)) for c in N)
+    if a3 >= ladder.n_target:
+        raise BandExtrapolationRefused("spectral_tail_ratio: no uncomputed finite-basis tail")
+    if float(np.max(e)-omega_ev) >= ladder.floor_ev(a1):
+        raise BandExtrapolationRefused("spectral_tail_ratio: live energy crosses the frozen shell domain")
+    shape = e.shape
+    e = e.reshape(-1)
+    e_ref = float(np.max(e - omega_ev))
+    c = e_ref - e + omega_ev
+    sums = []
+    for lo, hi in ((a1, a3), (a3, ladder.n_target)):
+        de, w = ladder.shell_rule(lo, hi, e_ref)
+        x = (de[None, :] + c[:, None]) / ladder.estar_ev
+        sums.append(np.exp(np.log(w)[None, :]
+                           - beta * np.log(x)).sum(axis=1))
+    ratio = sums[1]/sums[0]
+    if not np.isfinite(ratio).all() or np.any(ratio < 0):
+        raise BandExtrapolationRefused("spectral_tail_ratio: nonfinite or negative shell ratio")
+    return ratio.reshape(shape)
+
+
 def fit_band_extrapolation_spectral(
     counts, s_at_counts: np.ndarray, ladder: BandLadder, *,
     e_state_ev, fit_mask=None,
@@ -1920,15 +1957,7 @@ def fit_band_extrapolation_spectral(
     code = np.full(e.size, SHELL_FAIL_NO_FIT, dtype=np.int64)
     if np.isfinite(beta):
         code[:] = SHELL_OK
-        e_ref = float(np.max(e - omega))
-        c = e_ref - e + omega
-        sums = []
-        for lo, hi in ((a1, a3), (a3, ladder.n_target)):
-            de, w = ladder.shell_rule(lo, hi, e_ref)
-            x = (de[None, :] + c[:, None]) / ladder.estar_ev
-            sums.append(np.exp(np.log(w)[None, :]
-                               - beta * np.log(x)).sum(axis=1))
-        r = sums[1] / sums[0]
+        r = spectral_tail_ratio(ladder, N, e, beta=beta, omega_ev=omega)
     r = r.reshape(shape)
     code = code.reshape(shape)
 
@@ -2495,6 +2524,7 @@ __all__ = [
     "assert_brackets_match_ols_abscissae",
     "build_band_ladder",
     "fit_band_extrapolation_spectral",
+    "spectral_tail_ratio",
     "format_spectral_report",
     "plan_band_brackets",
     "plan_band_checkpoints",

@@ -2141,6 +2141,65 @@ def _shared_pole_window_run(wfns_t, source, meta_t, mesh_xy, plan, pop, internal
     return replace(res, efermi_ry=efermi)
 
 
+def ordered_window_spectral_tail(pair_first, pair_last, e_state_ev, reference):
+    """One-sided complex tail: S3_ab(E_b)+(S3-S1)_ab(E_b) r(E_b).
+
+    ``pair_first/last[2,nk,nA,nA]`` are small host Ry tables from the SAME
+    current sweep, at the reference fit's N1 and N3. Slot0 samples row E_a,
+    slot1 column E_b. ``e_state_ev[nk,nA]`` uses the reference DFT/Weyl
+    ladder's absolute eV zero. ``reference`` holds the native equilibrium
+    SpectralShellFit, its authenticated input-frame identifier, and an
+    explicit uniform ladder_shift_ev. Only the shape/ladder is frozen;
+    amplitudes and denominator energies update. No shell arithmetic average,
+    Hermitian projection or rate correction is made here.
+    """
+    from .band_extrapolation import SpectralShellFit, spectral_tail_ratio
+    fit = reference.get("fit")
+    if not isinstance(fit, SpectralShellFit) or not reference.get("input_frame"):
+        raise ValueError("GATE ordered_sigma_tail: native fit and authenticated input frame required")
+    if fit.n_failed:
+        raise ValueError("GATE ordered_sigma_tail: reference fit has states without a tail")
+    shift = float(reference["ladder_shift_ev"])
+    first, last = np.asarray(pair_first), np.asarray(pair_last)
+    e = np.asarray(e_state_ev, np.float64)
+    if (e.ndim != 2 or first.shape != (2, e.shape[0], e.shape[1], e.shape[1])
+            or last.shape != first.shape or not np.isfinite(shift)
+            or not np.isfinite(first).all() or not np.isfinite(last).all()):
+        raise ValueError("GATE ordered_sigma_tail: finite matched row/column tables required")
+    ratio = spectral_tail_ratio(fit.ladder, fit.counts, e-shift,
+        beta=fit.beta, omega_ev=fit.omega_ev)
+    weight = np.stack((np.broadcast_to(ratio[:, :, None], e.shape+(e.shape[1],)),
+                       np.broadcast_to(ratio[:, None, :], e.shape+(e.shape[1],))))
+    out = last+(last-first)*weight
+    return out, dict(input_frame=reference["input_frame"],
+        counts=np.asarray(fit.counts).tolist(), beta=float(fit.beta), omega_ev=float(fit.omega_ev),
+        ladder_shift_ev=shift, ratio=ratio.tolist(), max_delta_ry=float(np.max(abs(out-last))),
+        approximation="frozen_equilibrium_shell_shape_live_complex_amplitude",
+        shell_ordering="slot0_row_slot1_column_no_arithmetic_average",
+        destination="full_virtual_hermitian_material_self_energy_only")
+
+
+def _ordered_tail_brackets(reference, *, b_lo, hi, n_insert, nb):
+    """Partition the live ordered line while retaining active, N1 and N3 matrices."""
+    counts = np.asarray(reference["fit"].counts)
+    if (counts.shape != (3,) or not (hi < counts[0] < counts[1] < counts[2] <= nb)
+            or b_lo < 0 or n_insert < hi-b_lo):
+        raise ValueError("GATE ordered_sigma_tail: three empty-tail cuts must lie above active window")
+    brackets = [(b_lo, hi+hi-b_lo)]  # active rho and inserted I panels; pad omitted
+    labels = [hi-b_lo]
+    if b_lo:
+        brackets.append((0, b_lo))
+        labels.append(hi)
+    lo = hi
+    for cut in counts:
+        end = nb if cut == counts[-1] else int(cut)
+        brackets.append((lo+n_insert, end+n_insert))
+        labels.append(int(cut))
+        lo = int(cut)
+    first = len(brackets)-3
+    return tuple(brackets), tuple(labels), (0, first, len(brackets)-1), first
+
+
 def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
                           enk, occ, pop, line_carrier, print_fn):
     """Full microscopic retarded branches, active rates and all-band virtual MH.
@@ -2192,17 +2251,33 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
         brackets.append((0, b_lo))
     if hi+n_insert < nb+n_insert:
         brackets.append((hi+n_insert, nb+n_insert))
+    tail = plan.get("spectral_tail")
+    matrix_counts = band_counts = tail_first = None
+    if tail is not None:
+        logical = int(source["meta"].b_id_4_sigma_user)-int(source["meta"].b_id_0)
+        if int(tail["fit"].counts[-1]) != logical:
+            raise ValueError("GATE ordered_sigma_tail: reference N3 differs from current Sigma band support")
+        brackets, band_counts, matrix_counts, tail_first = _ordered_tail_brackets(
+            tail, b_lo=b_lo, hi=hi, n_insert=n_insert, nb=nb)
     cfg = plan["sigma_cfg"]
     res, receipt = ordered_shared_pole_sigma(wfns_t, source["model"],
         fresh_shared_pole_capacity(meta_t, mesh_xy), mesh_xy, request=request,
         sigma_branches=branches, regularization_width_ry=float(cfg.regularization_ev)/RYD_TO_EV,
         quadrature_eps=float(cfg.quadrature_eps), projection_bands=(b_lo, hi),
-        band_brackets=tuple(brackets), print_fn=print_fn)
+        band_brackets=tuple(brackets), band_counts=band_counts,
+        band_matrix_counts=matrix_counts, print_fn=print_fn)
     block = _window_block_fn(mesh_xy, 0, n_a, 4)
     both = {}
     for name, count in (("active", 0), ("full", len(brackets)-1)):
         both[name] = {space: np.asarray(gather_to_host(block(res.branches[space].point(count).pair)))
                       for space in ("cond", "val")}
+    tail_receipt = None
+    if tail is not None:
+        tail_receipt = {}
+        for space in ("cond", "val"):
+            first_pair = np.asarray(gather_to_host(block(res.branches[space].point(tail_first).pair)))
+            both["full"][space], tail_receipt[space] = ordered_window_spectral_tail(
+                first_pair, both["full"][space], enk[:, b_lo:hi]*RYD_TO_EV, tail)
     head = plan.get("head")
     if head is not None:
         head = replace(head, enk_ry=enk[:, b_lo:hi], occupations=np.ones((nk, n_a)),
@@ -2233,7 +2308,7 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
             np.asarray(head.poles_ry, np.complex128).imag.tolist()),
         head_width_convention="frozen_source_poles_no_added_bulk_eta",
         full_density=True, spatial_projection=False,
-        bracket_intervals=[list(x) for x in brackets])
+        bracket_intervals=[list(x) for x in brackets], spectral_tail=tail_receipt)
     return dict(pair=total, diag=np.einsum("kii->ki", total[1]),
         onshell=None, branch_pair=full, active_branch_pair=active,
         static=np.zeros((nk, n_a, n_a), complex), retarded_pair=both["full"],

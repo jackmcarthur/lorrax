@@ -2134,7 +2134,7 @@ def _ordered_shared_pole_synthesis(io, meta, header, *, mesh_xy):
 
 def ordered_shared_pole_sigma(wfns, model, meta, mesh_xy, *, request, sigma_branches,
                              regularization_width_ry, quadrature_eps, projection_bands,
-                             band_brackets=None,
+                             band_brackets=None, band_counts=None, band_matrix_counts=None,
                              print_fn=print):
     """Full microscopic, both-retarded Σ from a general shared-frequency bank.
 
@@ -2165,7 +2165,7 @@ def ordered_shared_pole_sigma(wfns, model, meta, mesh_xy, *, request, sigma_bran
             result = _integrate_sigma_batches(wfns, ((0, None, None, None),),
                 int(header["n_q_irr"]), plan, request, meta, mesh_xy,
                 pole_batch_size=1, w_synthesis=synthesis, keep_branches=True,
-                brackets=band_brackets,
+                brackets=band_brackets, band_counts=band_counts, matrix_counts=band_matrix_counts,
                 projection_bands=projection_bands, print_fn=print_fn)
             synthesis.close(result.sigma_c_kij)
             return result, receipt

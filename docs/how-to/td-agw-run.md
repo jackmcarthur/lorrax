@@ -256,6 +256,25 @@ Hartree/Fock plus M_H material Hamiltonian; a DFT-prepared density need not be
 stationary there. Both use bare HF increments, with no static reduced-W
 subtraction. See the [theory owner](../theory/td_agw_dynamical.md#damping).
 
+For a native self-consistent reference, the internal
+`snapshot_runtime.build_sc_td_reference` adapter requires the **evaluated input**
+of the accepted GW map, joined to a normally completed converged driver by
+Hamiltonian/array digests. Final output EQP energies alone are not that state.
+It checks the full protected rotation against the actual source orbitals and
+rotates the entire protected DFT velocity before selecting the TD window.
+This is the explicitly chosen `U† v_DFT U` optical approximation, not the
+k derivative of the QSGW Hamiltonian. The native full-centroid bare-HF delta
+uses the fine electronic-grid Coulomb interaction; Hartree excludes G=0 and
+the Fock head enters once. Its reference Hamiltonian is the SC anchor plus
+HF(rho-rho_eq) plus MH(rho)-MH(rho_eq). The **raw collision is not subtracted**,
+so SC convergence does not assert finite-width collision stationarity.
+If the source used band extrapolation, its authenticated native shell fit is
+required ([tail approximation](../theory/band-extrapolation.md#instantaneous-full-density-window-route)).
+This source adapter has small CPU algebra/gauge checks; material propagation,
+compiled/provider memory admission and a zero-field drift check remain
+required. It is an internal source handoff, not a new automatic deck/restart
+conversion or permission to reuse unrelated W/dipole artifacts.
+
 The snapshot Hamiltonian must meet its physical residual tolerance; a last
 unconverged iterate is never installed. Frozen electronic bands retain their
 reference occupations and identity rotation, with the documented edge

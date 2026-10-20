@@ -23,6 +23,295 @@ from tdagw.dynsig import (collision_basis_state, collision_snapshot_state,
 from tdagw.self_energy import held_term, with_held_term
 
 
+def sc_reference_velocity(U, velocity_dft_ry, active):
+    """Rotate the WHOLE protected SC velocity before selecting a TD window.
+
+    ``U[k,M,M]`` is DFT-to-SC, ``velocity_dft_ry[3,k,M,M]`` is the
+    authenticated original-DFT velocity in Ry bohr. The result is
+    ``[3,k,nA,nA]`` in the accepted SC gauge. This is the explicitly chosen
+    QP-rotated DFT-velocity approximation, not a derivative of the QSGW
+    Hamiltonian. Mixing outside the propagated window must not be dropped.
+    """
+    U, velocity = np.asarray(U, complex), np.asarray(velocity_dft_ry, complex)
+    if (U.ndim != 3 or U.shape[-1] != U.shape[-2]
+            or velocity.shape != (3, *U.shape) or not np.isfinite(U).all()
+            or not np.isfinite(velocity).all()):
+        raise ValueError("GATE td_sc_velocity: finite full protected U/velocity required")
+    if (active.start is None or active.stop is None or active.start < 0
+            or active.stop > U.shape[-1] or active.start >= active.stop):
+        raise ValueError("GATE td_sc_velocity: TD window must lie inside the SC protected block")
+    if np.max(abs(U.conj().swapaxes(-1, -2) @ U - np.eye(U.shape[-1]))) > 1e-10:
+        raise ValueError("GATE td_sc_velocity: nonunitary accepted SC frame")
+    cols = U[:, :, active]
+    return np.einsum("kmi,akmn,knj->akij", cols.conj(), velocity, cols, optimize=True)
+
+
+@functools.lru_cache(maxsize=16)
+def _native_hf_program(mesh, kgrid, spin_weight, fft_backend):
+    """Bare Fock plus G=0-excluded Hartree, using all centroid directions."""
+    del fft_backend  # Routed FFT backend is part of the factory-cache key.
+    from jax import lax, shard_map
+    from bse.bse_ring_comm import make_bse_shardings
+    from bse.bse_stack_matvec import make_w_term
+    nk = int(np.prod(kgrid))
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    sh = make_bse_shardings(mesh)
+    state_spec = P(None, None, "x", "y")
+    exchange = make_w_term(mesh, *kgrid)
+
+    def hartree_local(density, psi_x, psi_y, v0):
+        # Only the small active density is gathered. No centroid axis or
+        # centroid-square Coulomb block crosses its native endpoint shard.
+        density = lax.all_gather(density, "x", axis=2, tiled=True)
+        density = lax.all_gather(density, "y", axis=3, tiled=True)
+        charge = jnp.einsum("kasu,tkab,kbsu->tu", psi_y, density, psi_y.conj())
+        potential = lax.psum(jnp.einsum("uv,tv->tu", v0, charge), "y")
+        result = lax.psum(jnp.einsum("kasu,tu,kbsu->tkab",
+            psi_x.conj(), potential, psi_x), "x") * (float(spin_weight) / nk)
+        na = result.shape[-1]
+        zero = jnp.asarray(0, jnp.int32)
+        return lax.dynamic_slice(result, (zero, zero, lax.axis_index("x")*(na//px),
+            lax.axis_index("y")*(na//py)),
+            (result.shape[0], result.shape[1], na//px, na//py))
+
+    hartree = shard_map(hartree_local, mesh=mesh,
+        in_specs=(state_spec, sh.psi_x.spec, sh.psi_y.spec, P("x", "y")),
+        out_specs=state_spec, check_vma=False)
+
+    def apply(density, psi_x, psi_y, vr, v0):
+        fock = exchange(jnp.moveaxis(density, 1, -1), psi_x, psi_y, vr)
+        return hartree(density, psi_x, psi_y, v0) - jnp.moveaxis(fock, -1, 1)
+    return jax.jit(apply, in_shardings=(NamedSharding(mesh, state_spec),
+        sh.psi_x, sh.psi_y, sh.W, NamedSharding(mesh, P("x", "y"))),
+        out_shardings=NamedSharding(mesh, state_spec))
+
+
+def _native_hf_apply(static, params, rho, t):
+    """Reference-anchored bare-HF increment in the propagator's Ha units."""
+    del t
+    from common.staged_reshard import batch_to_face_reshard, face_to_batch_reshard
+    from common.units import RYD_TO_EV
+    from tdagw.tdgw_io import HA_IN_EV
+    from ffi.fft import kconv_backend
+    mesh, grid, na, npad, nk, spin = static
+    psi_x, psi_y, vr, v0, rho_eq, bare_head = params
+    nk_pad = rho.shape[1]
+    delta = rho-rho_eq[None]
+    face = batch_to_face_reshard(mesh, lead=1)(jnp.pad(delta,
+        ((0, 0), (0, 0), (0, npad-na), (0, npad-na))))[:, :nk]
+    result = _native_hf_program(mesh, grid, spin, kconv_backend(mesh))(
+        face, psi_x, psi_y, vr, v0)
+    result = jnp.pad(result, ((0, 0), (0, nk_pad-nk), (0, 0), (0, 0)))
+    result = face_to_batch_reshard(mesh, lead=1)(result)[..., :na, :na]
+    return result*(RYD_TO_EV/HA_IN_EV)-bare_head*delta
+
+
+def native_hf_delta_model(prepared, active, rho_eq, *, bare_head_ha=0.0,
+                          hartree_q0=None):
+    """Full-centroid bare HF delta model; no zeta surrogate or spatial rank cut.
+
+    ``hartree_q0`` is the source's G=0-excluded physical centroid matrix,
+    ``[mu_X,mu_Y]`` Ry. Its producer policy must be authenticated by the
+    caller. Fock always uses the unchanged full electronic-grid bare V.
+    ``rho_eq[nk_pad,nA,nA]`` is in the same canonical k/SC gauge.
+    This delta is zero at the reference; the SC anchor belongs to H0 once.
+    """
+    from bse.bse_ring_comm import make_bse_shardings
+    from runtime.padding import pad_axis
+    from tdagw.dynsig import make_dynsig_kernels, _w_R, WR_SPEC
+    from tdagw.self_energy import SelfEnergyModel
+    mesh, grid = prepared["mesh"], tuple(prepared["kgrid"])
+    na = int(active.stop)-int(active.start)
+    if hartree_q0 is None:
+        raise ValueError("GATE td_native_hartree: authenticated G=0-excluded q0 matrix required")
+    if (active.start < 0 or na <= 0 or active.stop > prepared["nb"]
+            or rho_eq.shape[-2:] != (na, na) or rho_eq.shape[0] < prepared["nk"]):
+        raise ValueError("GATE td_native_hf_window: inconsistent active source/reference support")
+    sh = make_bse_shardings(mesh)
+    side = int(np.lcm(int(mesh.shape["x"]), int(mesh.shape["y"])))
+    psi_x = jax.jit(lambda p: pad_axis(p[:, active], side, axis=1).array,
+                    out_shardings=sh.psi_x)(prepared["psi"])
+    psi_y = jax.jit(lambda p: p, out_shardings=sh.psi_y)(psi_x)
+    if tuple(hartree_q0.shape) != tuple(prepared["V_q"].shape[-2:]):
+        raise ValueError("GATE td_native_hartree: q0 matrix differs from full centroid support")
+    v0 = jax.jit(lambda v: v, out_shardings=NamedSharding(mesh, P("x", "y")))(hartree_q0)
+    kern = make_dynsig_kernels(mesh, grid)
+    vr = jax.jit(lambda v: _w_R(v, kern),
+                 out_shardings=NamedSharding(mesh, WR_SPEC))(prepared["V_q"])
+    static = (mesh, grid, na, int(psi_x.shape[1]), int(prepared["nk"]),
+              float(prepared["spin_weight"]))
+    return SelfEnergyModel(apply=functools.partial(_native_hf_apply, static),
+        params=(psi_x, psi_y, vr, v0, rho_eq, float(bare_head_ha)), linear=True,
+        name="native full-centroid bare HF delta about accepted SC reference")
+
+
+def _sc_array_digest(array):
+    """Metadata-only SC-frame digest (dtype, shape, then contiguous bytes)."""
+    import hashlib
+    array = np.ascontiguousarray(array)
+    digest = hashlib.sha256()
+    digest.update(str(array.dtype).encode())
+    digest.update(str(array.shape).encode())
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _source_spectral_tail(source, *, input_frame=None, input_h_sha256=None,
+                          wfn_fingerprint=None):
+    """Require the producer's actual native tail fit when its SC used one."""
+    from gw.band_extrapolation import SpectralShellFit
+    reference = source.get("spectral_tail_reference")
+    enabled = bool(getattr(getattr(source["config"], "sigma", None), "band_extrapolation", False))
+    if reference is None:
+        if enabled:
+            raise ValueError("GATE td_native_spectral_tail: source used band extrapolation; authenticated native fit required")
+        return None
+    if (not isinstance(reference.get("fit"), SpectralShellFit)
+            or not reference.get("input_frame") or "ladder_shift_ev" not in reference
+            or not np.isfinite(float(reference["ladder_shift_ev"]))):
+        raise ValueError("GATE td_native_spectral_tail: native fit, input frame and explicit ladder energy shift required")
+    fit = reference["fit"]
+    if fit.n_failed or not np.isfinite([fit.beta, fit.omega_ev]).all():
+        raise ValueError("GATE td_native_spectral_tail: incomplete/nonfinite reference shell fit")
+    current = source.get("frame")
+    if isinstance(current, dict):
+        input_frame = input_frame or current.get("frame")
+        input_h_sha256 = input_h_sha256 or current.get("input_h_sha256")
+        wfn_fingerprint = wfn_fingerprint or current.get("wfn_fingerprint")
+    if input_frame is not None and reference["input_frame"] != input_frame:
+        raise ValueError("GATE td_native_spectral_tail: fit belongs to a different evaluated SC input frame")
+    if input_h_sha256 is not None and reference.get("input_h_sha256") != input_h_sha256:
+        raise ValueError("GATE td_native_spectral_tail: accepted input-H digest differs from fit context")
+    if (wfn_fingerprint is not None and reference.get("wfn_fingerprint") is not None
+            and reference["wfn_fingerprint"] != wfn_fingerprint):
+        raise ValueError("GATE td_native_spectral_tail: fit original WFN fingerprint differs")
+    return reference
+
+
+def build_sc_td_reference(source, frame, inputs, *, mesh, active):
+    """Build an explicitly anchored TD system from an accepted native SC INPUT.
+
+    ``source`` is the native full-grid source rotated with this exact frame,
+    not a DFT source with replaced eigenvalues. ``frame`` is the small array
+    bundle from ``native_sc_input_frame_v1``. ``inputs`` contains its
+    ``frame_receipt`` and ``driver_complete`` records, ``original_psi``
+    (distributed original-DFT centroid face), ``velocity_dft_ry[3,k,M,M]``,
+    ``structure`` and ``wfn_fingerprint``. The caller supplies the native
+    electronic-grid ``bare_head_coefficient_ry`` explicitly. No SC run or
+    large host orbital copy is performed here.
+
+    Returns a plain bundle ``header, ops, model, prepared, receipts``.
+    H0 is the accepted SC dispersion ONCE. The model adds bare HF(rho-rho0);
+    snapshot_collision with ``hamiltonian='reference'`` adds MH-MH0, while
+    leaving the RAW collision operator untouched. This anchor is an explicit
+    approximation, not an assertion that the reference is stationary under
+    the finite-width collision closure. A zero-field drift test and native
+    executable/provider memory admission remain required before propagation.
+    """
+    from common.collectives import device_put_process_local
+    from common.units import RYD_TO_EV
+    from tdagw.tdgw_io import HA_IN_EV, header_operators
+    from tdagw.td_system import bundle_header, position_from_velocity
+
+    record = inputs["frame_receipt"]
+    completed = inputs["driver_complete"]
+    solver = completed.get("solver", {})
+    if (record.get("schema") != "native_sc_input_frame_v1"
+            or completed.get("reference_ready") is not True
+            or solver.get("status") != "CONVERGED_ACCEPTED_INPUT"
+            or not all(solver.get(key) is True for key in
+                ("accepted_input_join", "proper_sc_requested", "native_converged"))
+            or solver.get("frame") != record.get("frame")):
+        raise ValueError("GATE td_sc_reference: converged evaluated INPUT plus normal driver completion required")
+    if (record.get("wfn_fingerprint") != inputs["wfn_fingerprint"]
+            or inputs.get("velocity_wfn_fingerprint") != record.get("wfn_fingerprint")):
+        raise ValueError("GATE td_sc_reference: original WFN fingerprint differs")
+    _source_spectral_tail(source, input_frame=record["frame"],
+        input_h_sha256=record["input_h_sha256"], wfn_fingerprint=record["wfn_fingerprint"])
+    U = np.asarray(frame["U_active"])
+    energy = np.asarray(frame["energy_ry"])
+    occupation = np.asarray(frame["occupations"])
+    H = np.asarray(frame["input_H_loop_ry"])
+    for key, array in (("U_sha256", U), ("energy_sha256", energy),
+                       ("occupation_sha256", occupation), ("input_h_sha256", H)):
+        if record.get(key) != _sc_array_digest(array):
+            raise ValueError(f"GATE td_sc_reference: frame array digest differs: {key}")
+    if (U.ndim != 3 or U.shape[-1] != U.shape[-2]
+            or record.get("active_slice") != [0, U.shape[-1]]
+            or active.start < 0 or active.stop > U.shape[-1]
+            or active.start >= active.stop or energy.shape != occupation.shape
+            or energy.shape[0] != U.shape[0] or energy.shape[1] < U.shape[-1]
+            or not np.isfinite(energy).all() or not np.isfinite(occupation).all()):
+        raise ValueError("GATE td_sc_reference: inconsistent full protected/current electronic support")
+    loop_rows = np.asarray(frame["input_loop_full_rows"], int)
+    if (loop_rows.ndim != 1 or len(np.unique(loop_rows)) != len(loop_rows)
+            or np.any(loop_rows < 0) or np.any(loop_rows >= len(U))
+            or H.shape != (len(loop_rows), U.shape[-1], U.shape[-1])):
+        raise ValueError("GATE td_sc_reference: invalid typed full-to-loop input-H join")
+    protected = (U*energy[:, None, :U.shape[-1]]) @ U.conj().swapaxes(-1, -2)
+    mismatch = float(np.max(abs(protected[loop_rows]-H)))
+    if mismatch > 1e-9*max(1., float(np.max(abs(H)))):
+        raise ValueError("GATE td_sc_reference: current U/E do not reconstruct accepted input H")
+    prepared = prepare_native_source(source, mesh)
+    if (energy.shape != prepared["energy"].shape
+            or not np.array_equal(energy, prepared["energy"])
+            or not np.array_equal(occupation, prepared["occupations"])):
+        raise ValueError("GATE td_sc_reference: source must retain exact current SC energies/occupations including tail")
+    original = inputs["original_psi"]
+    if (not isinstance(original, jax.Array) or original.ndim != 4
+            or original.shape[0] != len(U) or original.shape[1] < U.shape[-1]
+            or original.shape[2:] != prepared["psi"].shape[2:]):
+        raise ValueError("GATE td_sc_reference: distributed original-DFT full protected orbital face required")
+    Udev = device_put_process_local(U, NamedSharding(mesh, P()))
+
+    def orbital_error(base, current, rotation):
+        expected = jnp.einsum("kmsu,kma->kasu", base[:, :U.shape[-1]], rotation[:, :, active])
+        return jnp.linalg.norm(expected-current[:, active])/jnp.maximum(jnp.linalg.norm(expected), 1e-300)
+    orbital_error_value = float(jax.jit(orbital_error)(original, prepared["psi"], Udev))
+    if not np.isfinite(orbital_error_value) or orbital_error_value > 1e-10:
+        raise ValueError("GATE td_sc_reference: current orbitals differ from full protected SC rotation")
+    f = occupation[:, active]
+    nval = int(np.sum(f[0] == 1.))
+    expected_f = np.broadcast_to(np.r_[np.ones(nval), np.zeros(f.shape[-1]-nval)], f.shape)
+    if not 0 < nval < f.shape[-1] or not np.array_equal(f, expected_f):
+        raise ValueError("GATE td_sc_reference: TD header requires a binary insulating active window")
+    velocity = sc_reference_velocity(U, inputs["velocity_dft_ry"], active)
+    r, pair_receipt = position_from_velocity(velocity, energy[:, active], nval,
+        rule=inputs.get("pair_rule", "mask"), gap_ry=float(inputs.get("pair_gap_ry", 1e-5)))
+    header = bundle_header(structure=inputs["structure"], k_frac=prepared["k_frac"],
+        kgrid=prepared["kgrid"], bands=(active.start, active.stop),
+        nspinor=int(prepared["psi"].shape[2]), e_qp_ry=energy[:, active], n_val=nval, r=r)
+    host = header_operators(header, geometry=inputs.get("geometry", "slab"),
+                            esmear_ha=0.0, intraband=False)
+    host["gamma"] = np.zeros((f.shape[-1], f.shape[-1]))
+    ops, nk_pad = tp.place_operators(host, mesh)
+    if "hartree_q0" in inputs:
+        hartree_q0, hartree_policy = inputs["hartree_q0"], "explicit_G0_excluded"
+    else:
+        config = source["config"]
+        if (int(config.sys_dim) != 2 or bool(config.head.use_bgw_vcoul)):
+            raise ValueError("GATE td_native_hartree: only authenticated slab point-body q0 is inferred")
+        hartree_q0, hartree_policy = prepared["V_q"][0], "slab_2d_point_body_exact_G0_zero"
+    coefficient = float(inputs["bare_head_coefficient_ry"])
+    if not np.isfinite(coefficient):
+        raise ValueError("GATE td_native_hf_head: finite native fine-electronic-cell coefficient required")
+    model = native_hf_delta_model(prepared, active, ops.rho_eq,
+        bare_head_ha=coefficient*(RYD_TO_EV/HA_IN_EV), hartree_q0=hartree_q0)
+    receipts = dict(reference_convention="SC_anchor_plus_bare_HF_delta_plus_MH_minus_MH_eq",
+        collision_equilibrium_subtraction=False, reference_is_collision_stationary="not_asserted",
+        frame=record["frame"], input_h_sha256=record["input_h_sha256"],
+        wfn_fingerprint=record["wfn_fingerprint"], protected_bands=[0, U.shape[-1]],
+        active_bands=[active.start, active.stop], input_h_error_ry=mismatch,
+        orbital_gauge_relative_error=orbital_error_value, velocity="full_protected_U_dagger_vDFT_U",
+        position="rotated_DFT_velocity_over_current_SC_energy_difference",
+        hartree_policy=hartree_policy, bare_head_coefficient_ry=coefficient,
+        pair_receipt=pair_receipt, zero_field_drift_gate="required_not_run",
+        executable_memory_admission="required_not_run", nk_pad=nk_pad)
+    return dict(header=header, ops=ops, model=model, prepared=prepared, receipts=receipts,
+                snapshot_options=dict(hamiltonian="reference", form="raw", hermitian="full",
+                                      statistics="retarded_reference", basis="instantaneous"))
+
+
 def prepare_native_source(source, mesh):
     """Authenticate a full-grid native orbital/Coulomb source without projection.
 
@@ -117,6 +406,9 @@ def make_native_snapshot_evaluator(source, prepared, options):
         raise ValueError("GATE td_native_screening_scratch: unique model output directory required")
     cache = dict(n=0)
     plan = window_sigma_plan(source["config"], head=source.get("head"), window_only=True)
+    tail = _source_spectral_tail(source)
+    if tail is not None:
+        plan["spectral_tail"] = tail
     screening_config = inp["config"]
     supports = parse_support_sites(options.get("spm_support_sites", ""))
     if supports is not None:
@@ -358,6 +650,19 @@ def authenticate_orbital_gauge(prepared, model, active):
     """
     from tdagw.model import flat_k_rows
     from tdagw.self_energy import _isdf_apply
+    if getattr(model.apply, "func", None) is _native_hf_apply:
+        model_psi = model.params[0]
+        na = int(active.stop)-int(active.start)
+        if (model_psi.shape[0] != prepared["nk"] or model_psi.shape[1] < na
+                or model_psi.shape[2:] != prepared["psi"].shape[2:]):
+            raise ValueError("GATE td_snapshot_orbital_gauge: native HF/source support differs")
+        def error(a, b):
+            return jnp.linalg.norm(a[:, active]-b[:, :na])/jnp.maximum(jnp.linalg.norm(b[:, :na]), 1e-300)
+        relative = float(jax.jit(error)(prepared["psi"], model_psi))
+        if not np.isfinite(relative) or relative > 1e-10:
+            raise ValueError("GATE td_snapshot_orbital_gauge: native HF/source SC orbitals differ")
+        return dict(checked=True, relative_error=relative, tolerance=1e-10,
+                    centroid_support="all_packed_rows_including_interleaved_padding")
     if getattr(model.apply, "func", None) is not _isdf_apply:
         return dict(checked=False, reason="model has no ISDF orbital operands")
     model_psi = model.params[0][0]
@@ -402,6 +707,11 @@ def bare_hf_coherent_model(model, prepared, rho_eq, baseline, *, bare_head_ha=0.
     from tdagw.dynsig import make_dynsig_kernels, _w_R, WR_SPEC
     if explicit_hf_model is not None:
         bare = explicit_hf_model
+    elif getattr(model.apply, "func", None) is _native_hf_apply:
+        # The native delta already contains its authenticated fine-cell head.
+        if float(bare_head_ha) != 0.0:
+            raise ValueError("GATE td_native_hf_head: native delta head must not be added twice")
+        bare = model
     else:
         if getattr(model.apply, "func", None) is not _isdf_apply:
             raise ValueError("GATE td_snapshot_bare_hf_model: full ISDF model or explicit bare-HF model required")
@@ -728,7 +1038,14 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
         raise ValueError("GATE td_snapshot_reference: source and propagator occupations differ")
     ry_ha = RYD_TO_EV / HA_IN_EV
     e_ref = to_bundle(np.asarray(gather_to_host(ops.e_qp))[:nk]) / ry_ha
-    hf_eq, bare_head = hf_reference_window(source, prepared, active)
+    native_reference = (convention == "reference" and
+                        getattr(model.apply, "func", None) is _native_hf_apply)
+    if native_reference:
+        # This chosen constant-counterterm convention needs no absolute
+        # HF reference publication; its bare delta and head are already bound.
+        hf_eq, bare_head = np.zeros((nk, na, na), complex), 0.0
+    else:
+        hf_eq, bare_head = hf_reference_window(source, prepared, active)
     put = lambda blocks: tp.place_window_blocks(blocks, mesh, nk_pad)
     h_ref = np.einsum("ki,ij->kij", e_ref, np.eye(na)).astype(complex)
     offset = np.zeros_like(hf_eq) if convention == "reference" else hf_eq - h_ref
@@ -818,9 +1135,15 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     t0["wall_s"] = t0["setup_s"]
     state = dict(n=0, t_last=0.0, f_last=np.asarray(gather_to_host(pops(rho0)))[:, :nk],
                  trace_last=np.asarray(initial["trace"]), history=[t0],
-                 basis_last=bases0, snapshot_held=held0, hf_reference_ry=hf_eq)
+                 basis_last=bases0, snapshot_held=held0,
+                 hf_reference_ry=None if native_reference else hf_eq)
     mh0 = eq["m_h"] if hermitian != "none" else np.zeros_like(hf_eq)
     state["one_body_counterterm_ry"] = h_ref - hf_eq - mh0 if convention == "reference" else np.zeros_like(hf_eq)
+    if native_reference:
+        # No fabricated zero absolute HF matrix/counterterm: only the
+        # reference-anchored DELTA model is available from these operands.
+        state["one_body_counterterm_ry"] = None
+        state["one_body_counterterm_scope"] = "implicit_SC_anchor_absolute_HF_not_published"
     H0 = (bases0[0]["U"] * bases0[0]["e"][..., None, :]) @ bases0[0]["U"].conj().swapaxes(-1, -2)
     req_b = to_bundle(rho_eq_h)
     t0["prepared_density_commutator_ha"] = float(np.max(np.linalg.norm(

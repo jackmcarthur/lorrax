@@ -18,22 +18,27 @@ converged by raising `number_bands`; its measured size is in
 
 ### Instantaneous full-density window route
 
-The general complex-pole TD window route does **not** currently consume the
-equilibrium extrapolation fit. Its active-intermediate and full-virtual
-brackets in `gw.ppm_sigma._ordered_window_lines` are not the three tail-fit
-counts; `use_band_extrapolation` is disabled in the current 160-band CrI3
-source. The existing `require_extrapolation_band_floor` requires at least as
+The general complex-pole TD window route can consume an authenticated native
+equilibrium `SpectralShellFit` through its internal `spectral_tail` plan
+entry. The context names the accepted input frame and an explicit uniform
+virtual-ladder shift (eV). The production source adapter must supply it;
+merely enabling the equilibrium deck key is not sufficient. The existing
+`require_extrapolation_band_floor` requires at least as
 many empty as occupied bands in the **Sigma sum**. With 130 occupied bands,
 that means at least 260 total, not 160. Enlarging only the propagated window
 to 30v14c does not satisfy the rule. A sufficiently large authenticated WFN,
 pair representation and three clean unoccupied-tail cuts are prerequisites;
 availability of a different WFN must not be assumed.
 
-A future reuse option could hold the equilibrium pooled offset and DFT/Weyl
-ladder parameters, while evaluating denominators with the current external
-energies and the consistently shifted virtual ladder. Holding these shape
-parameters does not require freezing the amplitude: the live finite-bracket
-self-energy difference could still update it with the current density and W,
+This reuse option holds the equilibrium pooled exponent/offset and DFT/Weyl
+ladder, while evaluating denominators at the current external energies. A
+uniform shift of the virtual ladder subtracts that shift from the external
+energy when evaluating the ratio. Zero shift explicitly retains the native
+equilibrium estimator's DFT/Weyl ladder; it does not claim the virtual QP
+spectrum remains unchanged. Crossing the frozen shell's domain refuses.
+Holding these shape parameters does not freeze the amplitude: the same live
+Sigma sweep retains active, N1 and N3 matrices, plus N2 diagonals. Its current
+complex difference S3-S1 updates the amplitude with the density and W,
 without repeating the pooled shape search. Alternatively, caching the whole
 equilibrium matrix tail amplitude would be an explicitly frozen-response
 approximation, not the refreshed-W tail. Both choices require domain and
@@ -48,7 +53,14 @@ amplitude needs an explicit fixed-orbital gauge and rotation into the current
 basis, with current-energy functions and degeneracies treated consistently.
 Any additional frozen high-band tail would enter the full-virtual Hermitian
 material self-energy, not the deliberately active-only collision rates.
-No such TD tail adapter or supporting convergence validation is implemented.
+`ordered_window_spectral_tail` applies S3+(S3-S1)r(E_b) to the column slot,
+and the corresponding r(E_a) to the separate row slot. The added high-band
+tail enters only the full-virtual material self-energy; active-only collision
+intermediates are unchanged. Compact dense CPU oracles check complex
+off-diagonals, diagonal recovery of the native estimator, uniform energy-shift
+invariance, degenerate-subspace covariance and bracket/padding coverage.
+These algebra tests do **not** establish material/GPU convergence of the TD
+tail approximation; that validation remains outstanding.
 
 ## Where it runs
 
