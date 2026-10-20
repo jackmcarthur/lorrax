@@ -2,106 +2,35 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Iterable
-
 import numpy as np
 
+from common.production_report import ProductionReport
+from common.report_blocks import kv_lines
 from common.scientific_output import (
     FLOAT_DIGITS,
     abs_path,
-    architecture_lines,
     band_range,
-    centroid_orbit_line,
     clean_rounded,
-    file_table_lines,
-    htransform_quality_lines,
-    numerical_environment_lines,
     policy,
-    spectral_compression_lines,
-    symmetry_sampling_lines,
 )
 from common.units import RYD_TO_EV
 
 
-_WARNING_WORDS = (
-    "WARNING", "[WARN]", "FATAL", "FAILURE", "FAILED", "UNPHYSICAL",
-    "NOT TRUSTWORTHY", "DEPRECATED",
-)
-
-
-class HTransformProductionReport:
+class HTransformProductionReport(ProductionReport):
     """One human-readable htransform stream, written only by process zero."""
 
-    def __init__(self, path: str, *, runtime, debug: bool, stdout) -> None:
-        self.path = abs_path(path)
-        self.runtime = runtime
-        self.debug = bool(debug)
-        self.stdout = stdout
-        self.rank = int(getattr(runtime, "process_index", 0))
-        self._warnings: list[str] = []
-        self._warnings_emitted = False
-        self._stream = None
-        if self.rank == 0:
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-            self._stream = open(self.path, "w", encoding="utf-8", buffering=1)
-
-    def close(self) -> None:
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
-
-    def emit(self, line: str = "") -> None:
-        if self.rank != 0:
-            return
-        text = str(line)
-        self.stdout(text)
-        if self._stream is not None:
-            self._stream.write(text + "\n")
-
-    def progress(self, line: str) -> None:
-        self.emit(line)
-
-    def legacy_print(self, *args, sep: str = " ", **kwargs) -> None:
-        text = sep.join(str(v) for v in args)
-        if (text.startswith("Started ") or text.startswith("Finished ")
-                or (text.startswith("[ ") and " | " in text
-                    and " / " in text)):
-            self.progress(text)
-            return
-        if self.debug:
-            self.stdout(text, **kwargs)
-            return
-        upper = text.upper()
-        if any(word in upper for word in _WARNING_WORDS):
-            cleaned = " ".join(text.split())
-            if cleaned and cleaned not in self._warnings:
-                self._warnings.append(cleaned)
-
-    def heading(self, title: str) -> None:
-        self.emit()
-        self.emit(title.upper())
-        self.emit("-" * len(title))
+    driver = "htransform"
+    purpose = "Hamiltonian interpolation"
 
     def begin(self, *, input_file: str, output_file: str,
               energy_source: str) -> None:
-        self.emit("=" * 78)
-        self.emit("LORRAX HAMILTONIAN INTERPOLATION")
-        self.emit("=" * 78)
-        self.emit(f"Input          : {abs_path(input_file)}")
-        self.emit(f"Band output    : {abs_path(output_file)}")
-        self.emit(f"Energy source  : {energy_source}")
-
-    def architecture(self) -> None:
-        self.heading("Processor architecture")
-        for line in architecture_lines(self.runtime):
-            self.emit(line)
+        """The shared header plus the energy source (the band file is an output row)."""
+        super().begin(input_file=input_file)
+        self.emit_lines(kv_lines([("Energy source", energy_source)], indent=0))
 
     def environment(self, *, params, wfn, fine_plan,
                     fine_enabled: bool) -> None:
         self.heading("Numerical environment")
-        for line in numerical_environment_lines(self.runtime):
-            self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
         self.emit(
             "Galerkin basis : nodal, orbit-closed nodes (the ISDF centroids up "
@@ -129,16 +58,6 @@ class HTransformProductionReport:
             self.emit("Batched LA     : not used by this calculation")
         self.emit("LA alternatives : native JAX; cuSOLVERMp on GPU; SLATE or "
                   "ScaLAPACK on CPU. Batched LA is a schedule, not a backend")
-        self.emit("Debug stream   : " + (
-            "ON via LORRAX_DEBUG_PRINT" if self.debug else
-            "OFF (set LORRAX_DEBUG_PRINT=1 for kernel diagnostics)"))
-
-    def sampling(self, *, wfn, sym, centroids=None) -> None:
-        self.heading("Crystal symmetry and Brillouin-zone sampling")
-        for line in symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS):
-            self.emit(line)
-        if centroids is not None:
-            self.emit(centroid_orbit_line(centroids))
 
     def interpolation_space(self, *, params, wfn, meta, result,
                             enk_sigma_ry, ctilde, centroid_file: str,
@@ -214,16 +133,6 @@ class HTransformProductionReport:
                 "the full top-band "
                 "dispersion lies at or below the cutoff")
 
-    def spectral_compression(self, receipt) -> None:
-        self.heading("Spectral compression and validation")
-        for line in spectral_compression_lines(receipt):
-            self.emit(line)
-
-    def htransform_quality(self, receipt) -> None:
-        self.heading("Real-space locality and interpolation risk")
-        for line in htransform_quality_lines(receipt):
-            self.emit(line)
-
     def path_summary(self, *, result) -> None:
         kpath, _, node_indices, node_labels, _ = result["kpath_data"]
         self.heading("Interpolation path")
@@ -275,34 +184,7 @@ class HTransformProductionReport:
         ]
         accounted = sum(seconds for _, seconds in stages)
         stages.append(("other driver work", max(float(wall) - accounted, 0.0)))
-        self.heading("Major-stage timing")
-        self.emit("  stage                    wall (s)     fraction")
-        for name, seconds in stages:
-            self.emit(f"  {name:<22} {seconds:14.2f}  "
-                      f"{100.0 * seconds / wall if wall else 0.0:9.2f}%")
-        self.emit(f"  {'total run':<22} {float(wall):14.2f}  "
-                  f"{100.0:9.2f}%")
-
-    def warnings(self) -> None:
-        if self._warnings_emitted:
-            return
-        self._warnings_emitted = True
-        if self._warnings:
-            self.heading("Warnings")
-            for warning in self._warnings:
-                self.emit(f"  {warning}")
-
-    def files(self, rows: Iterable[tuple[str, str, str]]) -> None:
-        self.heading("Output files and inputs")
-        for line in file_table_lines(rows, omit_paths=(self.path,)):
-            self.emit(line)
-
-    def finish(self, *, status: str = "completed") -> None:
-        self.warnings()
-        self.emit()
-        self.emit(f"LORRAX Hamiltonian interpolation {status}.")
-        self.emit(f"Report written to {self.path}")
-        self.close()
+        super().timings(stages, wall=wall)
 
 
 def resolve_text(value) -> str:

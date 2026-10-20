@@ -15,14 +15,16 @@ that sequence, written once::
 A launcher whose P tasks would each form a one-process world refuses at
 startup (``runtime.init_jax_distributed``).  A refusal raised inside the
 ``with`` block still closes the report: the stage table printed so far, the
-retained warnings and the line ``LORRAX ... REFUSED (<ExceptionType>: GATE
-<id>)``.  The exception then propagates to
-``runtime.run_main_and_finalize`` unchanged.
+retained warnings, a line naming the exception type and its ``[<id>]``, and
+the closing line ``LORRAX <driver> ERROR ...``.  The exception, with its
+``GATE <id>`` text, then propagates to ``runtime.run_main_and_finalize``
+unchanged.
 
 The report class is the driver's; this module imports none (it is L3 and a
 report knows about bands).  It needs a constructor ``(path, *, runtime,
 debug, stdout, **labels)``, a settable ``stdout``, and the methods
-``legacy_print``, ``timings``, ``warnings``, ``files`` and ``finish``.  A
+``legacy_print``, ``timings``, ``warnings``, ``files`` and ``finish(*, status,
+wall, error)`` (``common.production_report.ProductionReport`` has them).  A
 driver whose report is a single text written at the end (``kmeans_cli``)
 passes ``report_cls=None``; the session then keeps the retained warnings in
 :attr:`RunSession.warnings` and emits through :meth:`RunSession.emit`.
@@ -30,14 +32,13 @@ passes ``report_cls=None``; the session then keeps the retained warnings in
 ``stages`` names the major-stage table once, for completion and refusal
 alike.  ``None`` hands :meth:`timings` the raw timing records, for a report
 that partitions them itself (GW, htransform).  A tuple of ``(label, name,
-...)`` rows sums those timing sections, after one ``runtime + imports`` row
-this module owns.  A zero-argument callable returns finished ``(label,
+...)`` rows sums those timing sections, and carries this rank's device peak
+over them, after one ``runtime + imports`` row this module owns.  A zero-argument callable returns finished ``(label,
 seconds)`` rows (``exciton_bands`` keeps its own two-column timers).
 """
 from __future__ import annotations
 
 import os
-import re
 import time
 
 import common.timing as timing
@@ -170,8 +171,15 @@ class RunSession:
             float(row["inclusive"]) for row in records
             if str(row["name"]).startswith(f"{self.prefix}.runtime_stack."))
         runtime_s += timing.total(records, f"{self.prefix}.imports")
+
+        def peak(names):
+            """This rank's device pool high-water over the named sections (bytes)."""
+            marks = [float(row["peak"]) for row in records
+                     if str(row["name"]) in names and row.get("peak") is not None]
+            return max(marks) if marks else None
+
         return ((RUNTIME_ROW, runtime_s),) + tuple(
-            (label, timing.total(records, *names))
+            (label, timing.total(records, *names), peak(set(names)))
             for label, *names in self._stages)
 
     # ── output ───────────────────────────────────────────────────────────
@@ -202,7 +210,7 @@ class RunSession:
         early-exit mode runs other stages.  ``published`` rows ``(label, path, required)`` are checked by
         :func:`published_artifacts` before the completion line; an
         unpublished artifact refuses (``GATE artifacts_unpublished``) and the
-        report closes as REFUSED.  All ranks then leave together.
+        report closes as ERROR.  All ranks then leave together.
         """
         if stages is not None:
             self._stages = stages
@@ -223,7 +231,7 @@ class RunSession:
                 "prints the completion line while a published artifact is "
                 "missing or inside its write transaction is not a usable run")
         if self.report is not None:
-            self.report.finish()
+            self.report.finish(wall=wall)
         self._closed = True
         from common.collectives import barrier
         barrier(f"{self.prefix}.report_written")
@@ -237,10 +245,7 @@ class RunSession:
         if not self._timed:
             self.report.timings(self.stage_rows(), wall=wall)
         self.report.warnings()
-        gate = re.search(r"GATE (\w+)", str(exc))
-        self.report.finish(
-            status=f"REFUSED ({type(exc).__name__}"
-            + (f": GATE {gate.group(1)}" if gate else "") + ")")
+        self.report.finish(status="ERROR", wall=wall, error=exc)
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         try:

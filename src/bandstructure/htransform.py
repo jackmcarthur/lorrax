@@ -451,7 +451,7 @@ def main(argv=None):
             _energy_source = "the WFN's eigenvalues (QP for a WFN_qp.h5)"
         report.begin(input_file=args.input, output_file=output_path,
                      energy_source=_energy_source)
-        report.architecture()
+        report.devices(mesh_role="basis axes X x Y")
 
         params = read_cohsex_input(args.input)
         # The deck's linalg dial selects the eigensolver and the batch route.
@@ -595,13 +595,16 @@ def main(argv=None):
             enk_sigma_ry=enk_sigma, ctilde=ctilde,
             centroid_file=_centroid_path, energy_source=_energy_source,
             centroids=_centroid_records[0])
-        report.spectral_compression(_rank_records[0])
+        report.spectral_compression(
+            _rank_records[0], title="Spectral compression and validation")
         if len(_quality_records) != 1:
             raise RuntimeError(
                 "htransform returned "
                 f"{len(_quality_records)} interpolation-quality receipts; "
                 "expected one")
-        report.htransform_quality(_quality_records[0])
+        report.htransform_quality(
+            _quality_records[0],
+            title="Real-space locality and interpolation risk")
         report.path_summary(result=result)
 
         # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.

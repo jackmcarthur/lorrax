@@ -2,8 +2,8 @@
 
 This module formats facts owned elsewhere.  It does not inspect input files,
 resolve runtime policies, construct symmetry maps, or derive a second set of
-band edges.  Drivers hand it their canonical ``RuntimeFacts``, ``WfnLoader``
-and ``SymMaps`` objects and receive stable, human-readable lines.
+band edges.  The symmetry, time-reversal and k-point blocks are
+:mod:`common.report_blocks`'.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import numpy as np
 
 
 FLOAT_DIGITS = 5
-TAU_DIGITS = 3
 
 
 def clean_rounded(values, *, digits: int = FLOAT_DIGITS) -> np.ndarray:
@@ -45,24 +44,6 @@ def policy(value, choices: Iterable[str]) -> str:
                     if str(item).strip().lower() != "auto"]
     return (f"auto (other choices: {', '.join(alternatives)})"
             if alternatives else "auto")
-
-
-def centroid_orbit_line(loaded_centroids) -> str:
-    """Compact presentation of a canonical centroid-closure verdict."""
-    verdict = loaded_centroids.closure
-    n_sym = int(verdict.n_sym)
-    n_bad = int(verdict.n_violating)
-    n_sites = int(verdict.n_centroids)
-    tol = float(verdict.tol)
-    if bool(verdict.closed):
-        return (
-            f"Centroid orbit: CLOSED : {n_sym - n_bad}/{n_sym} spatial "
-            f"operations preserve {n_sites} sites (tol={tol:.5e})")
-    return (
-        f"Centroid orbit: NOT CLOSED : {n_bad}/{n_sym} spatial operations "
-        f"fail to preserve the {n_sites}-site set; worst residual "
-        f"{float(verdict.worst_residual):.5e} at S{int(verdict.worst_op) + 1:02d} "
-        f"(tol={tol:.5e})")
 
 
 def spectral_compression_lines(receipt, *,
@@ -202,252 +183,6 @@ def htransform_quality_lines(receipt) -> list[str]:
     ]
 
 
-def architecture_lines(runtime, *, mesh_role: str | None = None) -> list[str]:
-    """Compact rank/device/thread geometry from the canonical runtime facts."""
-    facts = runtime.facts
-    p = int(facts.get("process_count", 1))
-    ndev = int(facts.get("n_devices", 0))
-    nlocal = int(facts.get("n_local_devices", 0))
-    mesh = tuple(int(v) for v in facts.get("mesh_shape", (1, 1)))
-    threads = facts.get("threads") or {}
-    affinity = threads.get("affinity")
-    thread_fields = []
-    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS",
-                "OPENBLAS_NUM_THREADS", "LORRAX_MKLBLAS_THREADS"):
-        value = threads.get(key)
-        if value not in (None, ""):
-            thread_fields.append(f"{key}={value}")
-    role = f"  ({mesh_role})" if mesh_role else ""
-    local_note = f", {nlocal} per rank" if nlocal else ""
-    from runtime import device_memory_summary
-    memory, memory_warning = device_memory_summary(facts.get("device_memory"))
-    return [
-        f"MPI ranks      : {p}",
-        f"Accelerators   : {ndev} {str(facts.get('backend', 'unknown')).upper()} "
-        f"devices ({facts.get('device_kind', 'unknown')}{local_note})",
-        f"Processor mesh : {mesh[0]} x {mesh[1]}{role}",
-        f"CPU allocation : {affinity if affinity is not None else '?'} "
-        "cores per rank",
-        "Host threads   : " + (", ".join(thread_fields)
-                                 if thread_fields else "runtime defaults"),
-    ] + ([f"Device memory  : {memory}"] if memory else []) + (
-        [f"Memory WARNING : {memory_warning}"] if memory_warning else [])
-
-
-def numerical_environment_lines(runtime) -> list[str]:
-    facts = runtime.facts
-    precision = ("FP64 / complex128" if facts.get("x64")
-                 else "FP32 / complex64")
-    backend = str(facts.get("backend", "unknown")).lower()
-    collectives = ("NCCL" if backend in ("gpu", "cuda", "rocm") else
-                   str((facts.get("collectives") or {}).get(
-                       "impl", "local")).upper())
-    return [
-        f"JAX/JAXLIB     : {facts.get('jax_version', 'unknown')} / "
-        f"{facts.get('jaxlib_version', 'unknown')} | {precision} | "
-        f"{collectives} collectives",
-    ]
-
-
-def _matrix_text(matrix) -> str:
-    rows = np.asarray(matrix, dtype=np.int64).reshape(3, 3)
-    return "[" + "; ".join(" ".join(f"{int(v):2d}" for v in row)
-                            for row in rows) + "]"
-
-
-def _fractional_translation(translation) -> np.ndarray:
-    return np.asarray(translation, dtype=np.float64) / (2.0 * np.pi)
-
-
-def _operation_usage(active_rows: set[int], spatial_row: int,
-                     n_spatial: int) -> str:
-    kinds = []
-    if spatial_row in active_rows:
-        kinds.append("unitary")
-    if spatial_row + n_spatial in active_rows:
-        kinds.append("TR")
-    return "+".join(kinds) if kinds else "inactive"
-
-
-def symmetry_sampling_lines(wfn, sym, *, digits: int = FLOAT_DIGITS,
-                            enumerate_ibz: bool = True) -> list[str]:
-    """Render the canonical spatial operations and BZ/IBZ sampling.
-
-    The TRS statement below only quotes ``WfnLoader.trs_reference`` and
-    ``SymMaps.trs_allowed``.  No symmetry is rechecked here.
-    """
-    rotations = np.asarray(sym.Rinv_grid)
-    n_sym = int(rotations.shape[0])
-    translations = np.asarray(sym.translations, dtype=np.float64)[:n_sym]
-    tau = translations / (2.0 * np.pi)
-    fractional_tau = np.any(
-        np.abs(tau - np.rint(tau)) > 10.0 ** (-(digits + 2)), axis=1)
-    n_fractional = int(np.count_nonzero(fractional_tau))
-    lines = [
-        "Real-space action: r' = R^-1 r + tau",
-        f"Spatial group   : {n_sym} operations; {n_fractional} with fractional "
-        "translations",
-    ]
-    qe_binding = getattr(sym, "qe_symmetry_binding", None)
-    active = np.asarray(sym.active_symmetry_rows, dtype=np.int32).reshape(-1)
-    active_set = {int(row) for row in active}
-    n_active_unitary = sum(row < n_sym for row in active_set)
-    n_active_anti = sum(row >= n_sym for row in active_set)
-    if qe_binding is None:
-        qe_tr = None
-        diagnostic = str(getattr(
-            sym, "qe_symmetry_diagnostic",
-            "no authenticated QE data-file-schema.xml"))
-        lines.append(
-            f"QE schema      : NOT FOUND ({diagnostic})")
-        lines.append(
-            f"Stored QE type : unknown for all {n_sym} operations; WFN.h5 "
-            "omits each time_reversal bit")
-    else:
-        qe_tr = np.asarray(getattr(
-            sym, "qe_operation_antiunitary", qe_binding.antiunitary),
-            dtype=bool).reshape(-1)
-        if qe_tr.shape != (n_sym,):
-            raise ValueError(
-                "symmetry_sampling_lines: QE operation typing has shape "
-                f"{qe_tr.shape}, expected ({n_sym},)")
-        schema_path = abs_path(qe_binding.schema_path)
-        schema_name = os.path.basename(schema_path)
-        n_qe_anti = int(np.count_nonzero(qe_tr))
-        lines.append(
-            f"QE schema      : FOUND {schema_name} at {schema_path}")
-        lines.append(
-            f"QE schema hash : SHA256 {qe_binding.schema_sha256[:12]}")
-        lines.append(
-            f"Stored QE type : {n_sym - n_qe_anti} unitary; {n_qe_anti} "
-            "composed with time reversal")
-    lines.append(
-        f"Active op rows : {n_active_unitary} unitary; {n_active_anti} "
-        "TR-composed")
-
-    inversion = np.all(
-        rotations == -np.eye(3, dtype=rotations.dtype), axis=(1, 2))
-    inversion_rows = np.flatnonzero(inversion)
-    if inversion_rows.size == 0:
-        lines.append("Inversion      : absent")
-    else:
-        descriptions = []
-        for row in inversion_rows:
-            qe_status = ("unknown" if qe_tr is None else
-                         "yes" if bool(qe_tr[row]) else "no")
-            descriptions.append(
-                f"S{int(row) + 1:02d} (QE-TR={qe_status}; "
-                f"used={_operation_usage(active_set, int(row), n_sym)})")
-        lines.append("Inversion      : present at " + ", ".join(descriptions))
-
-    receipt = getattr(wfn, "trs_reference", None)
-    if receipt is None:
-        receipt = getattr(wfn, "density_symmetry", None)
-    if receipt is None:
-        lines.append(
-            "Density check   : unavailable; symmetry metadata accepted "
-            "without a retained receipt")
-        lines.append(
-            f"Global TRS     : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
-            "for BZ unfolding")
-    elif getattr(receipt, "method", "real-space-density") == \
-            "occupied-density-subspace":
-        if receipt.trs_basis == "not-2c":
-            lines.append(
-                f"DFT 2c TRS     : NOT APPLICABLE "
-                f"(nspin={int(receipt.nspin)}, "
-                f"nspinor={int(receipt.nspinor)})")
-            lines.append(
-                f"Global TRS     : "
-                f"{'enabled' if bool(sym.trs_allowed) else 'disabled'} "
-                "for BZ unfolding")
-        else:
-            residual = ("n/a" if receipt.subspace_residual is None else
-                        f"{float(receipt.subspace_residual):.{digits}e}")
-            evidence = ", ".join(
-                f"{kind}={int(count)}"
-                for kind, count in receipt.evidence_counts)
-            state = "BROKEN" if not receipt.trs_holds else (
-                "CONSISTENT" if receipt.conclusive else "INCONCLUSIVE")
-            lines.append(
-                f"DFT 2c TRS     : {state} ({receipt.trs_basis}; "
-                f"occupied-density residual={residual}; "
-                f"coverage={100.0 * float(receipt.trs_coverage):.2f}%; "
-                f"{evidence or 'no independent evidence'})")
-            lines.append(
-                f"Global TRS     : "
-                f"{'enabled' if bool(sym.trs_allowed) else 'disabled'} "
-                "from the two-component reference check")
-    else:
-        m_rel = ("n/a" if receipt.m_rel is None else
-                 f"{float(receipt.m_rel):.{digits}e}")
-        tested = int(np.count_nonzero(np.isfinite(receipt.spatial_residual)))
-        finite = np.asarray(receipt.spatial_residual, dtype=np.float64)
-        finite = finite[np.isfinite(finite)]
-        max_res = ("untested" if finite.size == 0 else
-                   f"{float(np.max(finite)):.{digits}e}")
-        lines.append(
-            f"Density check   : {tested}/{len(receipt.spatial_residual)} "
-            f"spatial operations tested; max residual {max_res}")
-        mesh_implies = ("unknown" if receipt.trs_implied_by_mesh is None else
-                        "yes" if receipt.trs_implied_by_mesh else "no")
-        lines.append(
-            f"Time reversal  : {'HOLDS' if receipt.trs_holds else 'BROKEN'} "
-            f"({receipt.trs_basis}; |m|/|rho|={m_rel}; "
-            f"coverage={100.0 * float(receipt.trs_coverage):.2f}%; "
-            f"mesh requires it={mesh_implies})")
-        lines.append(
-            f"Global TRS     : {'enabled' if bool(sym.trs_allowed) else 'disabled'} "
-            "from the retained legacy verdict")
-
-    display_tau = clean_rounded(tau, digits=TAU_DIGITS)
-    lines.append("  op   QE time-reversal status       R^-1 and fractional translation")
-    for i, (rotation, shift) in enumerate(
-            zip(rotations, display_tau), start=1):
-        qe_status = ("unknown" if qe_tr is None else
-                     "yes" if bool(qe_tr[i - 1]) else "no")
-        usage = _operation_usage(active_set, i - 1, n_sym)
-        lines.append(
-            f"  S{i:02d}  QE-TR={qe_status:<7} active={usage:<10} "
-            f"R^-1={_matrix_text(rotation)}  "
-            f"tau=({shift[0]: .{TAU_DIGITS}f} "
-            f"{shift[1]: .{TAU_DIGITS}f} "
-            f"{shift[2]: .{TAU_DIGITS}f})")
-
-    kgrid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
-    shift = tuple(float(v) for v in clean_rounded(
-        np.asarray(wfn.shift).reshape(-1)[:3], digits=digits))
-    lines.append(
-        f"Full BZ grid   : {int(sym.nk_tot)} k points | mesh "
-        f"{kgrid[0]} x {kgrid[1]} x {kgrid[2]} | shift "
-        f"({shift[0]:.{digits}f}, {shift[1]:.{digits}f}, "
-        f"{shift[2]:.{digits}f})")
-    lines.append(f"Stored IBZ     : {int(sym.nk_red)} k points")
-    if enumerate_ibz:
-        weights = np.asarray(wfn.kweights, dtype=np.float64)
-        weight_sum = float(np.sum(weights))
-        if weight_sum != 0.0:
-            weights = weights / weight_sum
-        lines.append("  ik        kx        ky        kz     weight")
-        points = clean_rounded(wfn.kpoints, digits=digits)
-        weights = clean_rounded(weights, digits=digits)
-        for ik, (point, weight) in enumerate(zip(points, weights), start=1):
-            lines.append(
-                f"  {ik:3d}  {point[0]: .{digits}f}  {point[1]: .{digits}f}  "
-                f"{point[2]: .{digits}f}  {weight: .{digits}f}")
-    return lines
-
-
-def file_table_lines(rows: Iterable[tuple[str, str, str]], *,
-                     omit_paths: Iterable[str] = ()) -> list[str]:
-    omitted = {abs_path(path) for path in omit_paths}
-    lines = ["  role                     state       path"]
-    lines.extend(
-        f"  {role:<24} {state:<11} {abs_path(path)}"
-        for role, state, path in rows if abs_path(path) not in omitted)
-    return lines
-
-
 def pseudopotential_file_rows(
         pseudos, *, fallback: str = "") -> list[tuple[str, str, str]]:
     """Return one clean input-file row per loaded pseudopotential."""
@@ -462,17 +197,11 @@ def pseudopotential_file_rows(
 
 __all__ = [
     "FLOAT_DIGITS",
-    "TAU_DIGITS",
     "abs_path",
-    "architecture_lines",
     "band_range",
-    "centroid_orbit_line",
     "clean_rounded",
-    "file_table_lines",
     "htransform_quality_lines",
-    "numerical_environment_lines",
     "policy",
     "pseudopotential_file_rows",
-    "symmetry_sampling_lines",
     "spectral_compression_lines",
 ]

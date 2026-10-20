@@ -236,7 +236,7 @@ def _open_production_report(args):
                      else production_stdout.emit)
     print0 = report.legacy_print
     timing.set_trace_sink(report.progress)
-    report.begin(input_file=args.input, config=config)
+    report.begin(input_file=args.input)
     refuse_unimplemented_compute_mode(mode, context="the LORRAX GW driver")
     validate_band_extrapolation(config, mode)
     do_screened = mode.needs_screening
@@ -311,8 +311,8 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
     """Produce wavefunctions, symmetry, centroid basis and output paths."""
     wfn = WfnLoader(config.paths.wfn_file, mesh=mesh_xy)
     material_class = infer_material_class(wfn.occs)
-    config = resolve_mpa_sampling_alpha(
-        config, material_class, print_fn=report.progress)
+    config = resolve_mpa_sampling_alpha(          # its SETTINGS row states it
+        config, material_class, print_fn=print0)
     validate_material_inputs(config, material_class)
     print0(f"  Material class: {material_class} (inferred from WFN occupations)")
     sym = wfn.symmetry()
@@ -357,15 +357,11 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
         n_rmu=n_rmu, fft_grid=wfn.fft_grid,
         cell_volume=wfn.cell_volume, print_fn=print0,
     )
-    report.layout_dials(
+    report.devices(config=config)
+    # The deck's resolved keys, with the deck-resolution notes the parse printed.
+    report.settings_block(
         config=config, n_mu=n_rmu, n_q_irr=int(sym.nk_red),
-        processes=RUNTIME.process_count)
-    if _config_provenance:
-        report.heading("Configuration provenance")
-        for line in _config_provenance:
-            report.emit(line.strip())
-    report.architecture()
-    report.method(config=config)
+        processes=RUNTIME.process_count, resolved=_config_provenance)
     # The QP request (number_bands_protected) resolves against the WFN here.
     config = config.with_band_request(wfn, print0)
     return (config, wfn, material_class, sym, centroid_basis, centroid_indices, n_rmu, tmp_dir, tensors_filename)
@@ -395,9 +391,10 @@ def _report_sampling_and_bands(
         nspinor=meta.nspinor)
     _zeta_ranges = zeta_fit_band_ranges(
         band_slices, zeta_fit_edge, log=lambda *args, **kwargs: None)
-    report.environment(config=config, wfn=wfn)
-    report.sampling(wfn=wfn, sym=sym, centroids=centroid_basis)
-    report.trs_pathways(config=config, sym=sym, material_class=material_class)
+    report.environment(wfn=wfn)
+    report.sampling(wfn=wfn, sym=sym, centroids=centroid_basis,
+                    consequence=report.trs_consequence(
+                        config=config, sym=sym, material_class=material_class))
     report.bands(
         config=config, wfn=wfn, band_slices=band_slices,
         zeta_ranges=_zeta_ranges)
@@ -1540,9 +1537,9 @@ def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tens
          config.paths.parallel_transport_file),
         ("ISDF restart tensors", "present" if os.path.exists(tensors_filename)
          else "absent", tensors_filename),
-        ("self-energy table" + (
-            " (+ raw sigC_raw, eqp0_raw, eqp1_raw: no band tail)"
-            if raw_columns else ""), "written" if os.path.exists(
+        # Its raw (no band tail) columns are named under Dynamic Sigma.
+        ("self-energy table" + (" (+ raw columns)" if raw_columns else ""),
+         "written" if os.path.exists(
             config.paths.sigma_diag_file) else "absent",
          config.paths.sigma_diag_file),
         (EQP0_FILE_ROLE,
@@ -1595,11 +1592,7 @@ def _report_refused_run(report, _pre_main, _t_main, exc):
 			timing.report(print_fn=report.legacy_print, title="--- Timing ---",
 			              wall=_wall)
 		report.timings(timing.records(), wall=_wall)
-		report.warnings()
-		import re
-		gate = re.search(r"GATE (\w+)", str(exc))
-		report.finish(status=f"REFUSED ({type(exc).__name__}"
-		              + (f": GATE {gate.group(1)}" if gate else "") + ")")
+		report.finish(status="ERROR", wall=_wall, error=exc)
 	except Exception:  # noqa: BLE001 - a report failure must not mask the refusal
 		pass
 
@@ -1746,7 +1739,7 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	        "the completion line while a published artifact is missing or "
 	        "still inside its write transaction is not a usable run")
 	timing.set_trace_sink()
-	report.finish()
+	report.finish(wall=_wall)
 	production_stdout.close()
 	return 0
 

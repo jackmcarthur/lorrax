@@ -5,10 +5,7 @@ from __future__ import annotations
 import math
 import os
 
-from common.scientific_output import (
-    architecture_lines,
-    numerical_environment_lines,
-)
+from common.report_blocks import devices_lines
 from common.timing import total as timing_total
 
 
@@ -237,13 +234,12 @@ def format_kmeans_report(*, header: str, source_wfn: str,
         "LORRAX ISDF CENTROID SELECTION",
         "=" * 78,
         "",
-        "PROCESSOR ARCHITECTURE",
-        "----------------------",
-        *architecture_lines(runtime, mesh_role="centroid selection"),
+        "DEVICES",
+        "-------",
+        *devices_lines(runtime.facts, mesh_role="centroid selection"),
         "",
         "NUMERICAL ENVIRONMENT",
         "---------------------",
-        *numerical_environment_lines(runtime),
         f"Wavefunctions  : {wfn_backend} reader",
         "Selection      : feature-weighted k-means on the real-space FFT grid",
         "",

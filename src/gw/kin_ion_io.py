@@ -65,7 +65,8 @@ from common import Meta
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
 from common.collectives import process_rank_world
 import common.timing as timing
-from common.preprocessing_output import PreprocessingProductionReport
+from common.preprocessing_output import PreprocessingProductionReport, soc_setting
+from common.report_blocks import Setting
 from common.progress import LoopProgress
 from common.scientific_output import (
     band_range, pseudopotential_file_rows,
@@ -291,13 +292,12 @@ def main(argv=None):
                                 "kin_ion.out"))
     with RunSession(RUNTIME, "kin_ion", PreprocessingProductionReport,
                     report_path, stages=_STAGES,
-                    driver_name="gw.kin_ion_io",
-                    calculation_name=(
-                        "kinetic, ionic, and Hartree preprocessing")) as run:
+                    driver="kin-ion",
+                    purpose="kinetic, ionic, and Hartree preprocessing") as run:
         report = run.report
         print0 = report.legacy_print
         report.begin(input_file=args.input)
-        report.architecture(mesh_role="band-matrix axes X x Y")
+        report.devices(mesh_role="band-matrix axes X x Y")
 
         # ---- parse input: the deck is the single source of truth ----
         # Everything physical (Coulomb truncation, band window, spinor
@@ -481,14 +481,17 @@ def main(argv=None):
         k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
         resolved_soc = (vnl_setup.soc_provenance if vnl_setup is not None
                         else "none (no projector setup)")
-        report.pathways((
-            "Mean-field H0  : pristine T + V_loc + V_NL",
-            "Hartree V_H    : live G-space build in gw_jax",
-            "Coulomb system : " + ("2D slab truncation" if ctx.truncation_2d
-                                    else "3D bulk periodic"),
-            f"SOC projectors : {resolved_soc}",
-            f"k-space compute/storage: {nk_irr} star-wedge points; "
-            f"{int(sym.nk_tot)} full-BZ points reconstructed on read",
+        report.settings((
+            Setting("operator", "T+V_loc+V_NL", "default",
+                    "pristine mean field; V_H is built live in G-space by gw_jax"),
+            Setting("sys_dim", str(int(sys_dim)),
+                    "deck" if sys_dim_file is not None else
+                    "cli" if args.sys_dim is not None else "default",
+                    "2D slab: Coulomb truncated along z" if ctx.truncation_2d
+                    else "3D bulk: no Coulomb truncation"),
+            soc_setting(resolved_soc),
+            Setting("k storage", f"{nk_irr} k", "derived",
+                    f"the star wedge; the {int(sym.nk_tot)} full-BZ k are rebuilt on read"),
         ))
         report.system(
             natoms=int(np.asarray(wfn.atom_crys).shape[0]),

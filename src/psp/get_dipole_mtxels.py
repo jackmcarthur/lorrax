@@ -37,8 +37,9 @@ from wfn_loader import WfnLoader                                    # noqa: E402
 from symmetry_maps import unfold_file_wedge_polar_matrix            # noqa: E402
 from common import timing
 from common.collectives import gather_k_blocks
-from common.preprocessing_output import PreprocessingProductionReport
+from common.preprocessing_output import PreprocessingProductionReport, soc_setting
 from common.progress import LoopProgress
+from common.report_blocks import Setting
 from common.scientific_output import band_range, pseudopotential_file_rows
 from common.mtxel_sweep import (SweepGeometry,
                                 dipole_operator,
@@ -911,12 +912,12 @@ def main(argv=None):
 				   Path(args.out).resolve().with_name("dipole.out"))
 	with RunSession(RUNTIME, "dipole", PreprocessingProductionReport,
 					str(report_path), stages=_STAGES,
-					driver_name="psp.get_dipole_mtxels",
-					calculation_name="dipole and velocity preprocessing") as run:
+					driver="dipole",
+					purpose="dipole and velocity preprocessing") as run:
 		report = run.report
 		debug = run.debug
 		report.begin(input_file=str(input_path))
-		report.architecture(mesh_role="band-matrix axes X x Y")
+		report.devices(mesh_role="band-matrix axes X x Y")
 		params = read_cohsex_input(str(input_path))
 		w_av_first_neighbors = bool(params.get("w_av_first_neighbors", False))
 		w_av_second_neighbors = bool(params.get("w_av_second_neighbors", False))
@@ -1006,11 +1007,12 @@ def main(argv=None):
 				"Matrix storage : distributed band blocks on the X x Y mesh",
 				"Output backend : SlabIO collective artifact transaction",
 			))
-			report.pathways((
-				"Operator       : finite-q wavefunction-overlap stencil only",
-				f"Neighbour shell: first={'on' if w_av_first_neighbors else 'off'}; "
-				f"second={'on' if w_av_second_neighbors else 'off'}",
-				"Dipole matrix  : skipped by --w-av-only",
+			report.settings((
+				Setting("--w-av-only", "on", "cli",
+						"finite-q wavefunction-overlap stencil only; no dipole matrix"),
+				Setting("W-av shells", ("on" if w_av_first_neighbors else "off") + " / "
+						+ ("on" if w_av_second_neighbors else "off"),
+						"derived", "first / second shells of the overlap stencil"),
 			))
 			report.sampling(wfn=wfn, sym=sym)
 			report.bands((
@@ -1167,28 +1169,40 @@ def main(argv=None):
 		))
 		_operator = ("p (nonlocal commutator intentionally omitted)"
 					 if args.skip_vnl else _arm)
-		report.pathways((
-			f"Velocity       : {_operator}",
-			f"V_NL evaluator : {args.vnl_mode} "
-			+ ("derivative" if args.vnl_mode == "analytic" else
-			   f"finite difference ({args.vnl_num_scheme})"),
-			f"SOC projectors : {vnl_setup.soc_provenance}",
-			"DFT+U velocity : " + (
-				"none (no Hubbard input; no authenticated QE schema declares DFT+U)"
-				if hubbard_stamp == hubbard_ops.NO_HUBBARD
-				else "omitted with every nonlocal term (--skip-vnl)" if hubbard_setup is None
-				else "i[r,V_U] included; " + hubbard_in.card.formulation + ", "
-				+ hubbard_in.card.projector + "; " + ", ".join(
-					f"{sh.element}-{sh.label.lower()} U={sh.U_eV:g} J={sh.J_eV:g} B={sh.B_eV:.4g} eV"
-					for sh in hubbard_in.shells)
-				+ f"; occupations sha256 {hubbard_in.occupations_sha256[:12]}"),
-			"q = 0 matrix   : enabled; full band-to-band Cartesian velocity",
-			"finite-q SOS   : " + ("enabled" if args.with_finite_q else "off"),
-			"parallel gauge : " + (
-				"enabled; covariant velocity validated before commit"
-				if args.parallel_transport_out is not None else "off"),
-			f"W-av shells   : first={'on' if w_av_first_neighbors else 'off'}; "
-			f"second={'on' if w_av_second_neighbors else 'off'}",
+		report.settings((
+			Setting("velocity", "p" if args.skip_vnl else _operator.split("  (")[0],
+					report.flag_source("--skip-vnl"),
+					"the nonlocal commutator is omitted (--skip-vnl)" if args.skip_vnl
+					else "the q = 0 band-to-band Cartesian velocity stored in dipole.h5"
+					+ ("; " + _operator.split("  (")[1].rstrip(")") if "  (" in _operator
+					   else "")),
+			Setting("--vnl-mode", str(args.vnl_mode), report.flag_source("--vnl-mode"),
+					"analytic derivative of V_NL" if args.vnl_mode == "analytic"
+					else f"finite-difference V_NL ({args.vnl_num_scheme})"),
+			soc_setting(vnl_setup.soc_provenance),
+			Setting("DFT+U velocity",
+					"none" if hubbard_stamp == hubbard_ops.NO_HUBBARD
+					else "omitted" if hubbard_setup is None else "i[r, V_U]",
+					"QE" if hubbard_stamp != hubbard_ops.NO_HUBBARD else "default",
+					"no Hubbard input; no QE schema declares DFT+U"
+					if hubbard_stamp == hubbard_ops.NO_HUBBARD
+					else "omitted with every nonlocal term (--skip-vnl)" if hubbard_setup is None
+					else hubbard_in.card.formulation + ", " + hubbard_in.card.projector
+					+ "; " + ", ".join(
+						f"{sh.element}-{sh.label.lower()} U={sh.U_eV:g} J={sh.J_eV:g} "
+						f"B={sh.B_eV:.4g} eV" for sh in hubbard_in.shells)),
+			Setting("--with-finite-q", "on" if args.with_finite_q else "off",
+					report.flag_source("--with-finite-q"),
+					"finite-q sum over states as well" if args.with_finite_q
+					else "q = 0 matrix only"),
+			Setting("--parallel-transport-out",
+					"on" if args.parallel_transport_out is not None else "off",
+					report.flag_source("--parallel-transport-out"),
+					"parallel-transport gauge; covariant velocity validated before commit"
+					if args.parallel_transport_out is not None else "no parallel-transport gauge"),
+			Setting("W-av shells", ("on" if w_av_first_neighbors else "off") + " / "
+					+ ("on" if w_av_second_neighbors else "off"),
+					"derived", "first / second shells of the finite-q overlap stencil"),
 		))
 		report.system(
 			natoms=int(np.asarray(wfn.atom_crys).shape[0]),

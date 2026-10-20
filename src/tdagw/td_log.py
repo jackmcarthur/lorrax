@@ -40,7 +40,7 @@ import textwrap
 import numpy as np
 
 from common.preprocessing_output import ScientificProductionReport
-from common.scientific_output import architecture_lines, numerical_environment_lines
+from common.report_blocks import devices_lines
 from tdagw import propagate as tp
 from tdagw import stages, td_config, tdgw_io
 
@@ -182,7 +182,7 @@ class TdReport(ScientificProductionReport):
 
     def __init__(self, path, *, runtime, debug, stdout, deck) -> None:
         super().__init__(path, runtime=runtime, debug=debug, stdout=stdout,
-                         driver_name="tdagw.tdgw_jax", calculation_name="TD-aGW propagation")
+                         driver="tdagw", purpose="TD-aGW propagation")
         self.deck = deck
         self._held = None
         self._rows = {}
@@ -248,9 +248,7 @@ class TdReport(ScientificProductionReport):
         self.emit(f"FFI bundle     : {lib.get('platform', '?')} leg: "
                   + (lib.get("provenance") or lib.get("path")
                      or f"not loaded ({lib.get('reason', 'unknown')})"))
-        for line in numerical_environment_lines(self.runtime):
-            self.emit(line)
-        for line in architecture_lines(self.runtime, mesh_role="k axis over every device"):
+        for line in devices_lines(f, mesh_role="k axis over every device"):
             self.emit(line)
         elapsed = (f.get("elapsed") or {}).get("total")
         if elapsed is not None:
@@ -604,10 +602,10 @@ class TdReport(ScientificProductionReport):
         self._flush_pending()
         super().timings(stages_rows, wall=wall)
 
-    def finish(self, *, status: str = "completed") -> None:
+    def finish(self, **closing) -> None:
         self._flush_pending()
         self._refresh_section()
-        super().finish(status=status)
+        super().finish(**closing)
 
     def _flush_pending(self) -> None:
         """Before the closing blocks: what a refused run had not written yet.

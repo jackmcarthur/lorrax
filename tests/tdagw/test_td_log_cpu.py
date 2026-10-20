@@ -17,7 +17,7 @@ L5 the invariant drifts are rounding-sized on the Hamiltonian flow (cfm4 < 1e-12
 L6 the gate block: the measured wall of one dSigma call, the probes, the chosen dt
    (auto); the split's basis
 L7 dp54: no gate, the dSigma wall bounded and not timed
-L8 a refused run's log still closes: the gate's line, the refusal message, REFUSED
+L8 a refused run's log still closes: the gate's line, the refusal message, ERROR
 L9 the summary's steady s/fs and its bound on one dSigma call leave out the chunks that
    compiled a program (a new step or sample count, re-derived from the table and dt) and
    are the other chunks' wall over their time and over their dSigma calls
@@ -127,8 +127,8 @@ def problems(log, stdout, *, completed=True):
             pos.append(hit[0])
     if pos != sorted(pos):
         out.append(f"sections out of order: {pos}")
-    status = "completed." if completed else "REFUSED"
-    if not any(l.startswith("LORRAX TD-aGW propagation " + status) for l in lines):
+    status = "COMPLETED" if completed else "ERROR"
+    if not any(l.startswith("LORRAX tdagw " + status + " ") for l in lines):
         out.append(f"no '{status}' line")
     try:
         rows = table_rows(log)
@@ -184,7 +184,7 @@ def test_log_sections_superset_and_table(runs, tag):
     assert all(b["dsigma"] >= a["dsigma"] and b["t_fs"] > a["t_fs"] for a, b in zip(rows, rows[1:]))
     prov = r["log"][r["log"].index("PROVENANCE"):r["log"].index("RESOLVED DECK")]
     for field in ("Started        :", "Source         :", "Source closure :", "FFI bundle     :",
-                  "JAX/JAXLIB     :", "Processor mesh :"):
+                  "\n  JAX ", "\n  mesh "):
         assert field in prov, field
 
 
@@ -285,7 +285,9 @@ def test_refused_run_log_closes(runs):
     log = r["log"]
     assert "INTEGRATOR AND STABILITY GATE (THE RUN STOPPED HERE)" in log
     assert "\nREFUSAL\n-------\n  ValueError: GATE td_magnus_stability" in log
-    assert "LORRAX TD-aGW propagation REFUSED (ValueError: GATE td_magnus_stability)." in log
+    assert re.search(r"\nERROR    .* \[td_magnus_stability\]\n(?:         .*\n)*"
+                     r"         ValueError; the full message is on stderr\n", log)
+    assert re.search(r"\nLORRAX tdagw ERROR [^\n]* · [^\n]*\n", log)
     stability = [l for l in r["stdout"].splitlines() if l.startswith("  stability       : ")]
     assert stability and stability[0] in log
 

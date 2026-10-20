@@ -142,6 +142,7 @@ from common.fft_helpers import make_kfft_kminor
 from common.preprocessing_output import ScientificProductionReport
 from common.progress import LoopProgress
 from common.provenance import lorrax_version, provenance_header
+from common.report_blocks import Setting
 from common.scientific_output import abs_path, band_range, policy
 from runtime.run_session import RunSession
 from .bse_head import head_shifted_eps_c
@@ -1108,6 +1109,34 @@ def gate_htransform_vs_stored(
 _PROBE_TICK = None      # instrument: set by an out-of-tree profiling probe
 
 
+def settings_rows(args, *, source) -> tuple:
+    """The exciton-band SETTINGS rows from the parsed command line; ``source(*flags)``
+    says whether a flag was given (``ProductionReport.flag_source``)."""
+    rerun = rerun_check_enabled(args)
+    return (
+        Setting("--vq-mode", str(args.vq_mode), source("--vq-mode"),
+                "exchange V_Q of the finite-Q TDA BSE (D_Q + V_Q - W); other "
+                "choices interp, refit, both, ongrid"),
+        Setting("--w-coarse-grid", str(args.w_coarse_grid) if args.w_coarse_grid
+                else "none", source("--w-coarse-grid"),
+                "W on a coarse grid, trigonometric densification" if args.w_coarse_grid
+                else "W on the native BSE k grid"),
+        Setting("--max-iter", str(int(args.max_iter)), source("--max-iter"),
+                f"block Lanczos, block size {int(args.block_size)}"),
+        Setting("--eqp", os.path.basename(str(args.eqp)) if args.eqp else "none",
+                source("--eqp"),
+                "quasiparticle corrections from this file" if args.eqp
+                else "DFT eigenvalues from the WFN"),
+        Setting("--cert-grade", str(args.cert_grade), source("--cert-grade"),
+                f"refit certificate gate {CERT_TOL_BY_GRADE[args.cert_grade]:g} meV"
+                if args.cert_grade in CERT_TOL_BY_GRADE else
+                "refit certificate: " + policy(args.cert_grade, tuple(CERT_TOL_BY_GRADE))),
+        Setting("--rerun-check", "on" if rerun else "off", source("--rerun-check"),
+                "the Q scan is solved twice, a reproducibility check" if rerun
+                else "the Q scan is solved once"),
+    )
+
+
 def rerun_check_enabled(args) -> bool:
     """Is the diagnostic warm re-run of the solve scan switched on?
 
@@ -1454,31 +1483,12 @@ def main(argv=None):
     timers: dict[str, float] = {}
     with RunSession(RUNTIME, "exciton_bands", ScientificProductionReport,
                     report_path, stages=lambda: tuple(timers.items()),
-                    driver_name="bse.exciton_bands",
-                    calculation_name="exciton bandstructure") as run:
+                    driver="exb", purpose="exciton bandstructure") as run:
         report = run.report
         log = report.legacy_print
         report.begin(input_file=args.input)
-        report.architecture(mesh_role="BSE transition axes X x Y")
-        report.pathways((
-            "Hamiltonian    : finite-Q Tamm-Dancoff BSE, D_Q + V_Q - W",
-            f"Exchange V_Q   : {args.vq_mode} "
-            "(other choices: interp, refit, both, ongrid)",
-            "Screened W    : " + (
-                f"coarse {args.w_coarse_grid} grid, trigonometric densification"
-                if args.w_coarse_grid else "native BSE k grid"),
-            f"Eigensolver    : block Lanczos; block={int(args.block_size)}; "
-            f"maximum iterations={int(args.max_iter)}",
-            "Energy source : " + (
-                f"quasiparticle corrections from {abs_path(args.eqp)}"
-                if args.eqp else "DFT eigenvalues from the WFN"),
-            "Refit cert     : " + policy(
-                args.cert_grade, tuple(CERT_TOL_BY_GRADE)),
-            "Warm rerun     : " + (
-                "enabled as a reproducibility diagnostic"
-                if rerun_check_enabled(args) else
-                "off (pass --rerun-check to enable)"),
-        ))
+        report.devices(mesh_role="BSE transition axes c x v")
+        report.settings(settings_rows(args, source=report.flag_source))
         # ---- Stage timing -----------------------------------------------------
         # DELIBERATELY a driver-local two-column table (``name  seconds``) and NOT
         # ``common.timing.report``: eight live campaign harnesses parse this table
