@@ -19,7 +19,15 @@ generated: `python3 tools/gen_input_reference.py` rewrites each default cell fro
 `tests/test_env_registry.py` fails when a key has no row, a row names a key the
 parser no longer accepts, or a default cell differs from the code.
 
-The last section documents a different input file, the `[downfold]` deck.
+The last two sections document other input files: the `[downfold]` and
+`[epsmat]` decks.
+`bse.bsemat_cli` adds no deck keys: it reads the producer GW deck named by `-i`
+and takes its own flags ([drivers](drivers.md#bsemat-bsebsemat_cli)). Its
+`--mu-small` is the centroid count of the downfold it runs first: an integer, `kx` =
+k·N_b with N_b = `--n-val` + `--n-cond` (the file's band window, the same set for
+TDA and `--extended`), `auto` (the window Gram's eigenvalue rank at
+`--downfold-rcond`, the largest accepted count) or `off` (the default). It is the
+`[downfold]` deck's `mu_small` with the window fixed to the file's bands.
 
 ## System
 
@@ -271,3 +279,28 @@ choose each value.
 | `plan` | `auto` | `auto`/`local`: the local plan, independent of the process grid. `distributed` refuses. |
 | `report_residual` | `true` | Prints the per-q Pythagorean error bar ε_W (two GEMMs at μ_L per q). |
 | `residual_refuse_above` | unset | Refuses to write the bundle when the worst-q ε_W exceeds this value. It is a tripwire, not a meV guarantee. |
+
+## Epsmat — the `[epsmat]` input file
+
+This is not a GW deck. `gw.epsmat_cli` converts between a finished GW
+bundle's static screened interaction and BerkeleyGW 4.0 `eps0mat.h5` /
+`epsmat.h5`, one q at a time ([theory](theory/bgw_epsmat_export.md)). The
+section header must be `[epsmat]`; any other section, an unknown key or a
+missing required key refuses. The keys are `epsmat_config.EPSMAT_DEFAULTS`,
+and `--print-schema` prints them.
+
+| key | default | meaning |
+|---|---|---|
+| `mode` | `export` | `export`: write ε⁻¹ files from the bundle. `project`: read BerkeleyGW's files and write a copy of the bundle under `output_dir/tmp` whose `W0_qmunu` is their screening projected on the bundle's ζ. |
+| `source_restart` | unset (required) | The GW run directory (its `tmp/isdf_tensors_<mu>.h5`) or the bundle file. It needs a ready `W0_qmunu`. |
+| `zeta_file` | `""` | The bundle's ζ; empty selects `zeta_q.h5` beside the bundle. V rebuilt from it and v must equal the bundle's V to 1e-9 (`GATE epsmat_v_reconstruction`). |
+| `parent_input_file` | unset (required) | The producer GW deck: WFN, `sys_dim` and the Coulomb keys of V_q. `use_bgw_vcoul` and a non-`off` `mc_average_placement` refuse. |
+| `output_dir` | unset (required) | `export`: the directory receiving the files. `project`: the variant run directory; it may not be the source's. |
+| `bgw_reference` | `""` | A directory with BerkeleyGW's `eps0mat.h5` / `epsmat.h5` on the same WFN. `export`: the q list, q0, `ecuts` and G order are taken from it, and the recomputed G order must agree (`GATE epsmat_bgw_gorder`). `project`: required, the files projected. |
+| `epsilon_cutoff` | `0.0` | `export` without `bgw_reference`: BerkeleyGW's `epsilon_cutoff` (Ry). It may not exceed `bare_coulomb_cutoff`. |
+| `q0_vector` | `0.001 0 0` | `export` without `bgw_reference`: the q → 0 vector of `eps0mat.h5`, crystal coordinates. |
+| `files` | `eps0mat epsmat` | `export`: the files to write. |
+| `rcond` | `1e-8` | Coulomb-whitening cut: eigenvalues of V_q above `rcond`·λ_max are kept (amplification ≤ 1/`rcond`), the cut closed over degenerate multiplets. |
+| `q0_head` | `s_tensor` | ε⁻¹₀₀(q0): `s_tensor`, the direct head 1/(1 − v(q0) q0ᵀSq0) from the bundle's `S_cart_head`; `unscreened` writes 1 (debug). |
+| `q0_body_3d` | `refuse` | Only with `q0_wings = zero`: a `sys_dim = 3` `eps0mat` body then lacks the O(1) head–wing term ε_b0 ε_00⁻¹ ε_0b ([theory](theory/bgw_epsmat_export.md#5-q-0)). `refuse` stops before writing (`GATE epsmat_q0_body_3d`); `omit_head_wing` writes that body and records it in the receipt. Slab decks ignore it. |
+| `q0_wings` | `dipole` | The q → 0 wings of `eps0mat` ([theory](theory/bgw_epsmat_export.md#5-q-0), E9–E13). `dipole`: from the bundle's stored ω = 0 head wings `head_wing_L`/`head_wing_R` and `S_cart_head_direct` (written by `gw_jax` since 2026-10-18): local-field head 1/ε_M, both wings, and in 3D the body's head–wing term, so no `q0_body_3d` choice is needed; refuses a bundle without them (`GATE epsmat_q0_wings_source`) and one whose stored head is not their fold through the file's W(Γ) (`GATE epsmat_q0_wing_fold`). `zero`: wings 0 and the head from `S_cart_head` (the file before the wings). |

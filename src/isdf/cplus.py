@@ -6,10 +6,12 @@ multiplets and certified against the Gram ceiling), with the cut's per-q
 figures, which ``report`` prints on the host after the program; ``apply`` is
 ``ζ = C⁺Z = B(BᴴZ)``.  Every charge producer calls these -- the μ-batch
 fit (``isdf.zeta_mubatch``), the dense refit (``solve_zeta_charge_dense``) and
-the per-q factor stacks of ``isdf.core`` -- so a different conditioning
-procedure replaces this file and nothing else.  Callers own the logical
-extent (``runtime.padding.solve_at_logical``), or zero the pads so the
-face's checked eigh deflates them below the cut (``isdf.core._factor_c_q_face``).
+the per-q factor stacks of ``isdf.core`` -- and the Coulomb-metric whitener
+``V⁺ = B Bᴴ`` of the BerkeleyGW ε⁻¹ export (``gw.epsmat_export``), so a
+different conditioning procedure replaces this file and nothing else.
+Callers own the logical extent (``runtime.padding.solve_at_logical``), or
+zero the pads so the face's checked eigh deflates them below the cut
+(``isdf.core._factor_c_q_face``).
 """
 from __future__ import annotations
 
@@ -26,13 +28,14 @@ def apply(B, Z):
     return B @ (jnp.conj(jnp.swapaxes(B, -1, -2)) @ Z)
 
 
-def factor(C_log, *, rcond: float, rank_log: bool, n_log: int, eigh=eigh_local):
+def factor(C_log, *, rcond: float, rank_log: bool, n_log: int, eigh=eigh_local,
+           where: str = "zeta rank_truncate"):
     """``(B, figures)``: B with B Bᴴ = C⁺ for a logical C_q stack, and the
     cut's per-q figures, which the caller hands to :func:`report` on the host
     after the program; see the module docstring.  ``eigh`` is the whole-tile
     local eigh, or the face's checked distributed eigh (``isdf.core._factor_c_q_face``,
-    whose zeroed pads deflate below the cut)."""
-    from isdf.core import _certify_the_cut, _close_the_cut
+    whose zeroed pads deflate below the cut).  ``where`` names the caller's
+    matrix in every notice."""
     # WHY THIS FEATURE EXISTS: the charge CCT near-singularizes when
     # n_μ over-completes the pair-density rank (κ~1e13); plain
     # Cholesky then amplifies ULP/mesh/nband roundoff into O(1) V_q
@@ -40,6 +43,21 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int, eigh=eigh_local):
     # DROPS eigenvalues < zeta_rcond·λ_max (the near-null
     # directions) → a conditioned, mesh-invariant ζ = C⁺Z.
     lam, V = eigh(C_log)             # Hermitian-PSD (the face's deflated pads come first)
+    return factor_from_eigh(lam, V, rcond=rcond, rank_log=rank_log, where=where)
+
+
+def factor_from_eigh(lam, V, *, rcond: float, rank_log: bool,
+                     where: str = "zeta rank_truncate"):
+    """The cut of :func:`factor` on eigenpairs already solved: ``(B, figures)``.
+
+    ``lam`` ``(nq, n)`` and ``V`` ``(nq, n, n)`` (eigenvectors as
+    columns), e.g. from ``distrib_la``'s face eigensolve, where ``V`` sits at
+    ``P(None,'x','y')``: ``B = V·diag(λ^(−1/2))`` over the kept modes is a
+    column scaling, so ``B`` keeps ``V``'s layout and no rank holds an
+    ``n × n`` whole.  Exact-zero eigenvalues (zero pad rows) fall below any
+    cut.
+    """
+    from isdf.core import _certify_the_cut, _close_the_cut
     lam_max = jnp.max(lam, axis=-1, keepdims=True)   # (nqb,1) largest λ per q
     keep = lam > (rcond * lam_max)       # near-null cut
     # …and the near-null cut is not allowed to stop mid-multiplet.  THIS
@@ -55,7 +73,7 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int, eigh=eigh_local):
     # That deck turned out to be covariant by luck — 0 of 16 q-stars
     # carried a non-constant n_keep, MEASURED after the fact, enforced by
     # nothing.  This is the enforcement.
-    keep, figures = _close_the_cut(lam, keep, where="zeta rank_truncate")
+    keep, figures = _close_the_cut(lam, keep, where=where)
     # …and a cut that lands in a gap can still be a cut nobody has
     # certified.  THE GATE: when the criterion BINDS, the achieved
     # amplification must not exceed the ceiling any measurement supports
@@ -109,7 +127,8 @@ def factor(C_log, *, rcond: float, rank_log: bool, n_log: int, eigh=eigh_local):
     return V * inv_sqrt[..., None, :].astype(V.dtype), figures
 
 
-def report(figures, *, rcond: float, n_log: int) -> None:
+def report(figures, *, rcond: float, n_log: int,
+           where: str = "zeta rank_truncate") -> None:
     """Print a :func:`factor` program's notices and conditioning receipt on the host, and record its findings."""
     from isdf.core import _report_the_cut
     from common.host_read import host_tree
@@ -117,11 +136,11 @@ def report(figures, *, rcond: float, n_log: int) -> None:
     replicated = all(getattr(a, "is_fully_replicated", False) for a in jax.tree.leaves(figures)
                      if isinstance(a, jax.Array))
     figures = host_tree(figures) if replicated else jax.tree.map(_host, figures)
-    _report_the_cut(figures, where="zeta rank_truncate",
+    _report_the_cut(figures, where=where,
                     kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM, rcond=rcond)
     if "rank" in figures:
         k, mx, mn, kp, dh, lo, mg = figures["rank"]
-        print(f"[zeta rank_truncate] n_log={n_log} rcond={rcond:.1e} "
+        print(f"[{where}] n_log={n_log} rcond={rcond:.1e} "
               f"n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
               f"kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
               f"margin/q={mg}", flush=True)

@@ -136,6 +136,7 @@ that site; `—` means uncertified, and the site warns instead of refusing.
 | `isdf/core._charge_factor_math` `rank_truncate` | charge Gram `C_q`, PSD | `zeta_rcond` | `n_log` | 1e8 | refuse |
 | `isdf/core._transverse_lu_math` (ridge) | transverse CCT | no truncation | — | κ ≥ 1e12 refuses | refuse |
 | `common/zeta_projection.least_squares_transfer` | small-basis Gram `G_S` | caller `rcond` | `μ_S` | 1e8 | refuse (κ arm only: the route reduces over q before host, so it has no per-q trace for the weight arm) |
+| `gw/epsmat_export.coulomb_whitener` `epsmat V+` | Coulomb Gram `V_q`, PSD | `rcond` (`[epsmat]`) | `N_μ` | 1e8 (κ(V) 6.2e7 unbound at 1e-8, CrI3 6×6) | refuse ([export](../theory/bgw_epsmat_export.md#2-whitening-passivity-and-what-is-represented)) |
 | `centroid/pivoted_cholesky` select | candidate Gram, PSD | `√ε` relative | candidate count | — | reports; see below |
 | `bse/bse_w_exact` TRIM probes | probe independence | relative | block size | — | refuse on deficiency, naming k, block and norm |
 
