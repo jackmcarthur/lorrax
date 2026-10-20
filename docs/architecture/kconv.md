@@ -496,6 +496,20 @@ the fine electronic Green transforms and R-space product; its saving is
 the smaller χ/W storage, Dyson solves and shared-pole construction, not a
 reduction of the electronic band sum or ζ fit.
 
+This is fixed-centroid-convention, R-windowed RPA plus ordinary coarse-q
+GW, not a matched conserving ring-Φ approximation. Differentiating a ring
+functional of the windowed bubble would put the window's weighted adjoint
+in Σ (central-image injection with boundary weights), rather than the
+periodic tiling specified here. Do not infer energy conservation from a
+Φ argument. Reciprocal coarse q pairs still shift fine k by exact grid
+permutations, so fresh particle balance can follow the collision event
+algebra independently; measure its trace residual and held-rate drift.
+The window has signed Fourier weights and can create nonpassivity even
+from a passive bubble. Such failures must not be relabelled as physical
+gain. Dropping spatial reductions prevents false symmetry reconstruction
+but does not restore centroid-home-cell gauge covariance: authenticate the
+fixed convention and converge the cutoff.
+
 ## 6. Row passes and the `live` operand {#live-rows}
 
 The Σ τ kernel and the χ₀ direct stream do not convolve a rank's whole
