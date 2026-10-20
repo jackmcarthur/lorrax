@@ -298,10 +298,17 @@ request, `LinalgResolution.eigh_backend` (`resolve_linalg`, the one owner):
 exists and a refusal by name (`GATE eigh_capacity_route`) at the stack that
 needs it where none does (ROCm today); `linalg = distributed` asks
 `distributed`, refused at plan time where the leg has none. The shared-pole sectors decide each stack so
-(`staged_eigh`, `src/gw/shared_pole_execution.py:682`); a caller that passes a
+(`gw.shared_pole_execution.staged_eigh`); a caller that passes a
 room instead lets `distrib_la` decide each stack by the same price
 ([API § eigh-stack](../services/distrib_la/api.md#eigh-stack)). Each figure is
 the largest any rank read and no size is exchanged, so every rank decides alike.
+
+**At run time.** An eager route-(c) call admits the executable it runs before it
+executes: the first attempt's `memory_analysis` plus the ROCm batched workspace
+against the agreed room (`lxkit.memory.room`). Over it, the call runs in twice the
+rounds, each candidate compiled only when the one before is over; when none fits,
+the smallest runs with one warning. A caller admitted on a closed-form proposal
+(`distrib_la.eigh_stack_proposal`) is held to the measured figure here.
 
 **Checks.** No distributed eigh result is returned unchecked: eight
 fixed-seed probe columns test $\|(AZ - Z\Lambda)X\|$ and $\|(Z^\dagger Z - I)X\|$

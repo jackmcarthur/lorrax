@@ -99,7 +99,8 @@ the task, flag it; do not silently violate it.
 
 ### Memory
 - **A stage is priced by the program that runs it**, compiled at its operands, and by the
-  provider's size query; a closed form only proposes. Admission is `lxkit.memory.admit`
+  provider's size query; a closed form only proposes, and the run then admits its own
+  executable before it executes (route (c): twice the rounds when over). Admission is `lxkit.memory.admit`
   (no refusal on a price; a banner with the minimum P when over the limit), and no whole
   N_μ-scale matrix is held on a rank without a mesh route
   ([memory model](docs/architecture/memory-model.md#measured)).

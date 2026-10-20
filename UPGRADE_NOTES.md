@@ -39,6 +39,14 @@ cuSOLVERMp LU chunks `getrs` to the posted room.
 - **Environment.** New diagnostics: `LORRAX_MEMORY_RECEIPTS=calibrate`,
   `LORRAX_MEMORY_STRICT=1`, `LORRAX_MEMORY_TRACE=<path>`, `LORRAX_NMU2_BACKUP=report`
   ([env vars](docs/reference/env_vars.md)). No deck change.
+- **Open.** Sixteen route-chooser compiles still price a program that does not run
+  (CPU hsuite: `matmul.route_bytes` 10, the head Γ and ζ staged GEMMs; `place()`'s
+  `mesh_bytes` 4 and `_gathered_admitted` 2): the chooser should compile the caller's
+  program once at the proposed route and run it. Frontier reported 6 programs the
+  persistent cache does not keep, unidentified. `spole.gram_reduction` and `spole.bank`
+  price above the 1.3 band (the face round's row holds its program's eigh twice). The
+  native ncclMin agreement in the LU workspace query (B3) and the eigh memory change
+  (ABI 11) are not in this landing.
 
 ## 2026-10-20 — W densifier: per-centroid-pair Wigner–Seitz embedding
 

@@ -318,7 +318,9 @@ route (c), and refuses by name at the first stack that needs the whole mesh
   sizing compile and no exchange.  `eigh_stack_proposal(mesh, shape, dtype)` is the
   route-(c) first attempt in closed form (five matrices per rank's share of the batch, plus
   the ROCm batched workspace), for a caller whose run program is not known yet (the line
-  selection: its cut and room are the call's); the run's program remains the price.
+  selection: its cut and room are the call's); the run's program remains the price: an
+  eager route-(c) call admits its first attempt's executable against `lxkit.memory.room`
+  before it runs, and over it runs in twice the rounds (compiled only then).
 - **`checked_program(fn, mesh, out_shardings)`** jits a caller's program
   over checked solves in two phases: the first holds every solve's first
   attempt and returns their mesh-reduced failure flag; a failed first attempt

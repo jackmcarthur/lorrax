@@ -124,6 +124,18 @@ a provider context under `linalg = local` carries it as its `outside` term
   executed (the response bank, the ζ tile passes, the shared-pole rounds), so a
   price costs no extra compile. `check_chunk` corrects a chunk once from that
   figure ([§ The compiled check](#the-compiled-check)).
+- **Proposals, then the run's check.** Where the program that will run is not
+  known when the stage is admitted (its cut and room are the call's), a closed form
+  proposes: a local constructor's and the line selection's eigh stacks take
+  `distrib_la.eigh_stack_proposal` (five matrices per rank's share of the batch, plus
+  the ROCm batched workspace). The run then admits its own executable before it
+  executes: an eager route-(c) first attempt (`Plan._checked_reshard`) checks its
+  `memory_analysis` plus the ROCm batched workspace against the agreed room
+  (`memory.room`, the minimum over ranks); over it, twice the rounds (slices of half
+  as many matrices), each compiled only when the one before is over, and when none
+  fits the smallest runs under `admit`'s warning. A local reduction round is admitted
+  at its compiled round program (`shared_pole_execution.price_round`). The receipt
+  shows the proposal; the run's check prints when it is over.
 - **Room classes.** A room enters a program or a price only through tests of
   compiled figures against it (`distrib_la.room_test`: `place()`'s fit and
   step, the gathered retry's admission, `staged_fits`, the size route).
@@ -673,7 +685,8 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
 3. **Read the receipts** in `gwjax.out`: `ISDF μ-batch plan` for each ζ
    fit (the charge channel, and the current channels with `channels = 3`),
    which names its binder, and `Resident ψ` for the GW carriers.
-4. **On a `memory over budget` warning or a `WILL NOT FIT` banner**, run at
+4. **On a `memory over budget` warning or a `!! MEMORY: <stage> is PRICED OVER the
+   allocator limit` banner**, run at
    the banner's `minimum to complete` or with more memory per device. For the ζ fit the smallest batch keeps ψ(G)
    resident; for V_q, more ranks, fewer centroids, or a smaller ζ sphere;
    `vq_g_chunk_size` shrinks only the panel workspace.
@@ -704,7 +717,9 @@ and reads every section; `LORRAX_MEMORY_STRICT=1` adds the census;
 arrays, allocator, the executables that ran) in either mode, without waits
 (`lxkit.memory_residuals`). An increment price
 (`priced(..., increment=True)`) adds the allocator's bytes in use at entry as its
-`operands`. The reader is the leg's `peak_reader`: CUDA's pool
+`operands`; one increment part per stage takes them, since a stage's parts are
+summed. The shared-pole store's admissions are booked so, beside what the caller
+holds whether or not a live ledger row names it. The reader is the leg's `peak_reader`: CUDA's pool
 `CU_MEMPOOL_ATTR_USED_MEM_HIGH`, reset at each boundary (exact); BFC's
 `peak_bytes_in_use`, which never resets, exact where the stage raised the mark
 (first raise) and otherwise a sampler thread's polled `bytes_in_use` maximum,
