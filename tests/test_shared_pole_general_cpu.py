@@ -227,6 +227,87 @@ def test_descriptor_selector_refuses_algebraic_A_only_pencil():
         reduce_general_pencil(np.zeros((2,2),complex),np.eye(2),max_order=2,rank_tolerance=1e-8)
 
 
+@pytest.mark.parametrize('held',[False,True])
+def test_balanced_modal_maps_match_dense_complex_sigma_for_nondiagonal_conditioned_descriptor(held):
+    import scipy.linalg as la
+    from tests._full_microscopic_oracle import retarded_reference_pairs,branch_coefficients
+    rng=np.random.default_rng(1123)
+    unitary=lambda: np.linalg.qr(rng.normal(size=(4,4))+1j*rng.normal(size=(4,4)))[0]
+    u,v=unitary(),unitary();s=np.array([1.,.02,3e-5,2e-7])
+    # Include a genuine observable growing mode AND a degenerate complex
+    # eigenspace; full metric normalization must preserve the resolvent.
+    poles=np.array([-.8-.12j,.4+.025j,.4+.025j,1.2-.04j])
+    z=unitary()@np.array([[1.,.15j,0.,0.],[0.,1.,.1,0.],[0.,0.,1.,-.1j],[0.,0.,0.,1.]])
+    h=z@np.diag(poles)@np.linalg.inv(z)
+    E=(u*s)@v.conj().T
+    A=(u*np.sqrt(s))@h@(np.sqrt(s)[:,None]*v.conj().T)
+    fixed=dict(right=np.eye(4,dtype=complex),left=np.eye(4,dtype=complex)) if held else None
+    out=reduce_general_pencil(E,A,max_order=4,rank_tolerance=1e-8,fixed_spaces=fixed)
+    assert len(out['poles_ry'])==4
+    np.testing.assert_allclose(np.sort_complex(out['poles_ry']),np.sort_complex(poles),atol=3e-9,rtol=3e-9)
+    np.testing.assert_allclose(np.sort_complex(out['poles_ry']),np.sort_complex(la.eigvals(A,E)),atol=3e-9,rtol=3e-9)
+    assert out['poles_ry'].imag.max()==pytest.approx(.025,abs=3e-9)
+    C=.01*(rng.normal(size=(5,4))+1j*rng.normal(size=(5,4)))
+    B=.01*(rng.normal(size=(4,5))+1j*rng.normal(size=(4,5)))
+    left=C@out['output_map'];right=B.conj().T@out['input_map']
+    expected_left=C@(v/np.sqrt(s))@z
+    expected_right=(np.linalg.inv(z)@(u.conj().T/np.sqrt(s)[:,None])@B).conj().T
+    for point in (-.3+.4j,.25+.15j,.9+.17j):
+        actual=(left/(point-out['poles_ry']))@right.conj().T
+        literal=C@np.linalg.solve(point*E-A,B)
+        independent=(expected_left/(point-poles))@expected_right.conj().T
+        np.testing.assert_allclose(actual,literal,rtol=3e-8,atol=3e-10)
+        np.testing.assert_allclose(actual,independent,rtol=3e-8,atol=3e-10)
+    residue=lambda l,r: np.stack([np.outer(l[:,j],r[:,j].conjugate()) for j in range(l.shape[1])])
+    vertices=.1*(rng.normal(size=(2,2,2,5))+1j*rng.normal(size=(2,2,2,5)))
+    energy=np.array([[-.2,.3],[-.1,.4]])
+    rho=np.broadcast_to(np.array([[.6,.13+.07j],[.13-.07j,.3]]),(2,2,2))
+    got=retarded_reference_pairs(vertices,energy,rho,energy,out['poles_ry'],residue(left,right),.15)
+    exact=retarded_reference_pairs(vertices,energy,rho,energy,poles,residue(expected_left,expected_right),.15)
+    for a,b in zip(got,exact):np.testing.assert_allclose(a,b,rtol=3e-8,atol=3e-10)
+    for key,a in branch_coefficients(*got).items():
+        np.testing.assert_allclose(a,branch_coefficients(*exact)[key],rtol=3e-8,atol=3e-10)
+    assert out['receipt']['eigen_residual']<1e-9 and out['receipt']['modal_commutator_error']<1e-9
+    assert out['receipt']['eigensolver']=='current-descriptor-balanced-ordinary-geev'
+
+
+def test_current_held_descriptor_singularity_refuses_without_rank_drop():
+    initial=reduce_general_pencil(np.eye(3),np.diag([-.3-.1j,.2+.02j,.8-.1j]),max_order=3)
+    E=np.diag([1.,.4,1e-12]);A=np.diag([-.3-.1j,.08+.008j,1e-12*(.8-.1j)])
+    with pytest.raises(ValueError,match='shared_general'):
+        reduce_general_pencil(E,A,max_order=3,rank_tolerance=1e-8,fixed_spaces=initial['spaces'])
+
+
+def test_balanced_workspace_is_priced_identically_by_batch_and_single_before_factorization(monkeypatch):
+    import scipy.linalg as la
+    from gw.shared_pole_constructor import general_pencil_batch_plan
+    n=9;E=np.eye(n,dtype=complex);A=np.diag(np.linspace(-.8,.8,n)-.1j)
+    model=reduce_general_pencil(E,A,max_order=n)
+    price=model['receipt']['workspace_bytes']
+    plan=general_pencil_batch_plan([E.shape],max_order=n,processes=1,max_workspace_bytes=10**9)
+    assert plan['reduction_peak_bytes']>=price
+    def forbidden(*args,**kwargs):raise AssertionError('factorization entered before workspace admission')
+    monkeypatch.setattr(la,'svd',forbidden);monkeypatch.setattr(la,'eig',forbidden)
+    with pytest.raises(ValueError,match='shared_general_capacity'):
+        reduce_general_pencil(E,A,max_order=n,max_workspace_bytes=price-1)
+
+
+def test_balanced_eigensolver_is_uniform_for_fresh_and_current_held_descriptor(monkeypatch):
+    import scipy.linalg as la
+    original=la.eig;calls=[]
+    def ordinary_only(*args,**kwargs):
+        assert len(args)==1 and kwargs.get('b') is None # no hidden QZ/held fallback
+        calls.append(np.asarray(args[0]).copy())
+        return original(*args,**kwargs)
+    monkeypatch.setattr(la,'eig',ordinary_only)
+    E=np.array([[1.,.07j],[.04,.3]],complex)
+    A=np.array([[-.4-.1j,.1],[.03j,.21+.006j]],complex)
+    first=reduce_general_pencil(E,A,max_order=2)
+    second=reduce_general_pencil(E+.01*A,A,max_order=2,fixed_spaces=first['spaces'])
+    assert len(calls)==2 and all(a.shape==(2,2) for a in calls)
+    assert first['receipt']['eigensolver']==second['receipt']['eigensolver']
+
+
 def test_general_store_roundtrip_signed_complex_full_port(tmp_path, monkeypatch):
     import jax
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P

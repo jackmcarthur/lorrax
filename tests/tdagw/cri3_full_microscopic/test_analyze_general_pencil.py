@@ -16,10 +16,14 @@ def test_weak_descriptor_direction_can_give_unobservable_large_growth_without_pr
     sites=np.array([-.2+.3j,.4+.2j]);target=(1/(sites+.1j))[:,None,None]
     capture=tmp_path/'tiny.npz'
     np.savez(capture,E=e,A=a,B=b,C=c,sites_ry=sites,target=target,C1=np.ones((1,1)),C2=np.array([[-.1j]]))
-    report=helper.analyze(capture,max_order=2,tolerances=(1e-9,1e-10))
-    stable,growing=report['studies']
-    assert stable['selected_order']==1 and growing['selected_order']==2
+    report=helper.analyze(capture,max_order=2,tolerances=(1e-9,1e-10,1e-12))
+    stable,unresolved,growing=report['studies']
+    assert stable['selected_order']==1 and unresolved['selected_order']==growing['selected_order']==2
     assert stable['transfer']['maximum_growth_ry']==pytest.approx(-.1)
+    # Union selection can expose a descriptor direction that the CURRENT
+    # balance correctly refuses. Only a resolving diagnostic tolerance may
+    # recover the dark growing pole; production gates are never bypassed.
+    assert unresolved['status']=='refused' and 'shared_general_balance' in unresolved['error']
     assert growing['transfer']['maximum_growth_ry']==pytest.approx(12.)
     assert growing['transfer']['largest_growth'][0]['residue_frobenius']==0.
     assert max(p['absolute_target_defect'] for p in growing['transfer']['probes'])<1e-14
