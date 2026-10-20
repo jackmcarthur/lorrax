@@ -294,7 +294,8 @@ seconds of every stage, and rank 0 prints the `common.timing` stage table at the
 (BerkeleyGW `exciton_Q_shift` = −Q): on the restart grid from the restart's own
 states (`qflag` 2); off it, `--wfn-co` is the restart grid shifted by +Q, the
 electron leg comes from the deck's htransform and `--wfnq-co` is the restart
-grid's WFN (`qflag` 0). BerkeleyGW 4.0's absorption needs a compensating
+grid's WFN (`qflag` 0; not yet validated, so it refuses unless the restart's ζ
+covers the full zone). BerkeleyGW 4.0's absorption needs a compensating
 `eqp.dat` at `qflag` 2 ([theory](theory/bgw-bsemat-export.md#finite-q)).
 [The theory page](theory/bgw-bsemat-export.md) owns the equations, the conventions and the
 refusals.

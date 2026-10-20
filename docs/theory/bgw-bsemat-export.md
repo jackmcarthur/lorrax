@@ -310,7 +310,8 @@ takes the wrap(−Q) tile; at this Q it differs from BerkeleyGW's kernel by up t
 The off-grid route (`qflag` 0) is implemented but not yet validated: its
 exchange needs the per-Q refit of an IBZ-stored ζ, whose reader currently
 fails on the full-grid WFN header (`file_io.restart_bundle.read_vq_payload` labels the IBZ q
-by the first WFN k-points; open).
+by the first WFN k-points; open). Until it is validated the writer refuses it unless the
+restart's `zeta_q.h5` stores the full zone (`GATE bsemat_finite_q_offgrid`).
 
 ## Gates {#gates}
 
@@ -330,4 +331,5 @@ by the first WFN k-points; open).
 | `bsemat_finite_q_grid` | a WFN_co point minus Q is off the restart grid, or WFN_co − Q does not cover it once |
 | `bsemat_finite_q_wfnq` | `--wfnq-co` missing off the grid, or given on it (where `WFNq_co` is not read) |
 | `bsemat_finite_q_form` | `extended` or `--mu-small` at Q ≠ 0 |
+| `bsemat_finite_q_offgrid` | Q off the restart grid (`qflag` 0) without a full-zone ζ in the restart: the route is not yet validated |
 | `bsemat_finite_q_window`, `bsemat_finite_q_basis` | off the grid: the deck's htransform window lacks the BSE valence bands, or fits ψ at a centroid count other than the restart's μ |

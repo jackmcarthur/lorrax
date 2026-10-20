@@ -193,25 +193,45 @@ def test_block_equals_dense_rpa_inverse_and_red_twins():
     assert np.linalg.norm(naive - ref) / np.linalg.norm(ref - np.eye(n)) > 1.0
 
 
-def test_epsmat_ecut_is_the_leading_sub_block_not_a_reinversion():
-    """``epsmat_ecut`` keeps the leading gcutoff G of the full order: the written block is the
-    sub-block of the converged ε⁻¹ (docs/theory/bgw_epsmat_export.md#ecut).  Control
-    variant: the inverse of the dielectric matrix restricted to the cut G set, which is what a
-    fresh epsilon run at the smaller cutoff would write."""
+def test_epsmat_ecut_is_the_leading_sub_block_not_a_reinversion(tmp_path):
+    """``epsmat_ecut`` keeps the leading gcutoff G of the full order at every q of both files
+    (``plan_export``): the written block is the sub-block of the converged ε⁻¹
+    (docs/theory/bgw_epsmat_export.md#ecut).  Control variant: the inverse of the dielectric
+    matrix restricted to the cut G set, which is what a fresh epsilon run at the smaller cutoff
+    would write."""
+    from types import SimpleNamespace
     from gw import epsmat_export as ee
-    from file_io import bgw_epsmat as be
     mesh = _mesh()
     q = (1 / 6, 1 / 3, 0.0)
     assert ee.resolve_ecut(0.0, 5.0, source="t")[0] == 5.0          # 0 = the full sphere
     e, _ = ee.resolve_ecut(2.5, 5.0, source="t")
     with pytest.raises(ValueError, match="GATE epsmat_ecut_beyond_sphere"):
         ee.resolve_ecut(5.5, 5.0, source="t")
+    # The planner on a WFN header that holds the toy's G list (ecutwfc 5 Ry = the full sphere):
+    # at every q of both files the cut keeps the leading G of the full order, which is
+    # BerkeleyGW's own list at the smaller cutoff.
+    rho, _ = bgw_list(np.zeros(3), 5.0)
+    wfn = tmp_path / "WFN.h5"
+    with h5py.File(wfn, "w") as w:
+        w["mf_header/gspace/components"] = rho
+        w["mf_header/crystal/bdot"] = BDOT
+        w["mf_header/kpoints/ecutwfc"] = 5.0
+    src = SimpleNamespace(wfn_file=str(wfn), q_stored=np.array([[0.0, 0.0, 0.0], [*q], [1 / 3, 0.0, 0.0]]),
+                          config=SimpleNamespace(head=SimpleNamespace(bare_coulomb_cutoff=None)))
+    plan = lambda ecut: ee.plan_export(
+        SimpleNamespace(files=("eps0mat", "epsmat"), bgw_reference="", q0_vector=(1e-3, 0.0, 0.0),
+                        epsmat_ecut=ecut), src, print_fn=lambda *a: None)[0]
+    p_full, p_cut = plan(0.0), plan(e)
+    for name in ("eps0mat", "epsmat"):
+        (_, e_full, rows_full), (_, e_cut, rows_cut) = p_full[name], p_cut[name]
+        assert (e_full, e_cut) == (5.0, e) and len(rows_full) == len(rows_cut) > 0
+        for rf, rc in zip(rows_full, rows_cut):
+            _, direct = bgw_list(np.asarray(rc.q_file), e, is_q0=(name == "eps0mat"))
+            n = rc.gspace.nmtx
+            assert 0 < n == direct.nmtx < rf.gspace.nmtx, (name, rc.q_file, n, direct.nmtx)
+            assert np.array_equal(rc.gspace.order[:n], rf.gspace.order[:n])
+            assert np.array_equal(rc.gspace.order[:n], direct.order[:n])
     full = export(mesh, q, ecuts=5.0)
-    # The prefix of the full order is BerkeleyGW's own list at the smaller cutoff.
-    qg = full["qg"]
-    pre = qg._replace(nmtx=be.gcutoff(qg.ekin[qg.order], e))
-    _, direct = bgw_list(np.asarray(q), e)
-    assert pre.nmtx == direct.nmtx and np.array_equal(pre.order[:pre.nmtx], direct.order[:direct.nmtx])
     cut = export(mesh, q, ecuts=e)
     n, N = cut["n"], full["n"]
     assert 0 < n < N

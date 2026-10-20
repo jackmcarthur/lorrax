@@ -337,3 +337,29 @@ def test_row_kernels_compile_once_per_shape(synthetic, monkeypatch):
              X.output_spec(str(d / "j_dip.h5"), q0_body="dipole", q0_vector=[1.0e-3, 0.0, 0.0])])
     n1 = (X._direct_row._cache_size(), X._exchange_row._cache_size())
     assert n1[0] - n0[0] <= 1 and n1[1] - n0[1] <= 1, (n0, n1)
+
+
+
+@pytest.mark.parametrize("Q, qflag", [((0.0, 0.0, 0.0), 1), ((0.5, 0.0, 0.0), 2)])
+def test_header_carries_qflag_and_minus_q_through_the_writer(synthetic, monkeypatch, Q, qflag):
+    """kernel.x's ``exciton_Q_shift Qflag`` in the written header (docs/theory/bgw-bsemat-export.md
+    #finite-q, E10): qflag 1 and a zero shift at Q = 0; qflag 2 and the shift -Q for Q on the restart
+    grid. Through the writer: ``run_bsemat_exports`` -> ``_write_output`` -> ``create_bsemat_file``."""
+    from file_io import bgw_bsemat as F
+    mesh = _mesh()
+    Q = np.asarray(Q, dtype=np.float64)
+
+    def context(**kw):
+        ctx = _context(synthetic, mesh, use_gauge_map=kw["use_gauge_map"])
+        ctx.update(exciton_Q=np.asarray(kw["exciton_Q"], dtype=np.float64), qflag=qflag)
+        return ctx
+    monkeypatch.setattr(X, "_export_context", context)
+    out = str(synthetic["dir"] / f"header_qflag{qflag}.h5")
+    summ, = X.run_bsemat_exports(input_file="unused.in", wfn_co=synthetic["wfn_co"], n_val=N_VAL,
+                                 n_cond=N_COND, outputs=[X.output_spec(out)], exciton_Q=Q, mesh_xy=mesh)
+    h = F.read_bsemat_header(out)
+    shift = np.asarray(h["kpoints/exciton_Q_shift"], dtype=np.float64)
+    assert int(h["kpoints/qflag"]) == qflag == summ["qflag"]
+    assert np.array_equal(shift, -Q) and np.array_equal(np.asarray(summ["exciton_Q_shift"]), -Q)
+    if qflag == 2:
+        assert shift[0] == -0.5            # BerkeleyGW's valence leg at k + Q_s = k - Q

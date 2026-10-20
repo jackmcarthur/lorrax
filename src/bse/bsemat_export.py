@@ -179,6 +179,35 @@ def finite_q_legs(kpts, grid, exciton_Q):
     return qflag, (None if qflag == 0 else grid_index(kpts, grid)), v_rows
 
 
+def require_offgrid_zeta(restart, nk, exciton_Q):
+    """``GATE bsemat_finite_q_offgrid``: the off-grid route (qflag 0) runs only on a full-zone ζ.
+
+    That route is implemented but not validated against ``kernel.x``
+    (docs/theory/bgw-bsemat-export.md#finite-q). Its exchange is the per-Q ζ refit,
+    whose reader labels an IBZ-stored ζ by the first WFN k-points, and gw_init stores
+    the IBZ by default (``write_ibz_only_charge``). Until the route is certified it
+    refuses unless the restart's ``zeta_q.h5`` holds every q of the grid
+    (``zeta_loader.ZetaLoader.q_layout == 'full_bz'``). Returns the stored q count.
+    """
+    from zeta_loader import ZetaLoader
+    path = os.path.join(os.path.dirname(os.path.abspath(restart)), "zeta_q.h5")
+    Q = np.asarray(exciton_Q, dtype=np.float64).reshape(3).tolist()
+    why = (f"exciton_Q {Q} is off the restart grid (qflag 0), a route not yet validated against "
+           "kernel.x; it runs only on a full-zone zeta")
+    fix = ("fix: put Q on the restart grid (every N_i Q_i an integer: qflag 2), or rerun GW with "
+           "full-zone zeta storage")
+    if not os.path.exists(path):
+        raise ValueError(f"GATE bsemat_finite_q_offgrid: {why}, and {path} is absent. {fix}")
+    with ZetaLoader(path) as zl:
+        layout, nq = str(zl.q_layout), int(zl.n_q_on_disk)
+    if layout != "full_bz" or nq != int(nk):
+        raise ValueError(f"GATE bsemat_finite_q_offgrid: {why}, and {path} stores {nq} of the grid's "
+                         f"{int(nk)} q (q_layout {layout!r}; gw_init writes the IBZ by default). {fix}")
+    _log(f"[bsemat] qflag 0 route on a full-zone zeta ({nq} q): implemented, NOT validated against "
+         "kernel.x (docs/theory/bgw-bsemat-export.md#finite-q)")
+    return nq
+
+
 def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy):
     """ψ and ε of the BSE window at explicit points, from the deck's htransform.
 
@@ -1020,6 +1049,8 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
                             "restart grid's explicit WFN (BerkeleyGW reads the hole leg from it)"
                             if qflag == 0 else "on the restart grid, where WFNq_co is not read; "
                             "fix: drop --wfnq-co"))
+    if qflag == 0:
+        require_offgrid_zeta(restart, nk, exciton_Q)     # GATE bsemat_finite_q_offgrid
     if c_rows is not None and len(set(c_rows.tolist())) != nk:
         raise ValueError("GATE bsemat_k_bijection: WFN_co k points do not cover the grid once")
     wfn_v = wfnq_co if qflag == 0 else wfn_co            # the file whose gauge the hole leg takes
@@ -1149,7 +1180,7 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
 
     nocc_abs = int(bands_abs[n_val])
     efermi = 0.5 * (el_all[:, :nocc_abs].max() + el_all[:, nocc_abs:].min()) * 13.605693122994
-    # The exchange tile: head-less Γ at Q = 0, V at wrap(−Q) with every G otherwise.
+    # The exchange tile: head-less Γ at Q = 0, V at wrap(+Q) with every G otherwise (E12).
     V_ex, ex_rec = exchange_tile(exciton_Q, qflag, data=data, input_file=input_file, restart=restart,
                                  grid=grid, n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy)
     _log(f"[bsemat] exchange: {ex_rec}; exciton_Q {exciton_Q.tolist()} (qflag {qflag}, "

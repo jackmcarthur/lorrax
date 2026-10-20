@@ -28,8 +28,13 @@ G ([theory](docs/theory/bgw-bsemat-export.md#finite-q)).
 - **Decks.** Rename `epsilon_cutoff` to `epsmat_ecut` in `[epsmat]` files. An export
   without `bgw_reference` no longer needs a cutoff: 0 writes the producer's
   `bare_coulomb_cutoff` sphere (`ecutwfc` when unset).
-- **Open.** Off-grid Q (`qflag` 0) is implemented but not validated: the per-Q ζ refit
-  fails on an IBZ-stored ζ. `bse.exciton_bands` still contracts its finite-Q exchange
+- **Receipts.** The `gauge` value of a `bsemat` file's `<file>.json` for the identity gauge
+  now reads `identity (control variant)`.
+- **Fixed.** `--mu-small` exports, which refused on main since the downfold API change
+  (6ec872560), run again.
+- **Open.** Off-grid Q (`qflag` 0) is implemented but not validated, and it refuses
+  unless the restart's ζ stores the full zone (`GATE bsemat_finite_q_offgrid`; gw_init
+  stores the IBZ by default). `bse.exciton_bands` still contracts its finite-Q exchange
   at wrap(−Q): bright states at that MoS₂ Q are off by up to 6.6 meV (0.38 %); Q = 0 is
   unaffected. BerkeleyGW 4.0's `qflag` 2 route has two defects of its own; the theory
   page gives the workarounds.

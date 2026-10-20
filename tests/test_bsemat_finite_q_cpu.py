@@ -1,8 +1,9 @@
-"""Finite-Q bsemat bookkeeping (``bse.bsemat_export.finite_q_legs``, the exchange tile momentum, the header), host only.
+"""Finite-Q bsemat bookkeeping (``bse.bsemat_export.finite_q_legs``, the exchange tile momentum and
+the writer's tile, the off-grid refusal, the header).
 
-CPU clause of the four-GPU rule: index arithmetic and file layout, no mesh. The
-finite-Q kernel itself is verified end to end by BerkeleyGW absorption on the file
-against ``bse.exciton_bands`` at the same Q (docs/theory/bgw-bsemat-export.md#finite-q).
+CPU clause of the four-GPU rule: index arithmetic and file layout; the writer's exchange tile on a
+2 x 2 host mesh. The finite-Q kernel itself is verified end to end by BerkeleyGW absorption on the
+file against BerkeleyGW's own kernel at the same Q (docs/theory/bgw-bsemat-export.md#finite-q).
 """
 import os
 
@@ -77,6 +78,77 @@ def test_exchange_tile_momentum_is_plus_q_against_plane_waves():
     assert np.linalg.norm(X_plus - X_pw) / np.linalg.norm(X_pw) < 1e-12
     assert np.linalg.norm(X_minus - X_pw) / np.linalg.norm(X_pw) > 1e-2, "the -Q tile must not reproduce it"
     assert np.allclose(exchange_tile_momentum([0, 0, 0]), 0.0) and np.allclose(exchange_tile_momentum([1.25, 0, 0]), [0.25, 0, 0])
+
+
+def _cpu_mesh():
+    import jax
+    from bse.bse_ring_comm import create_mesh_2d
+    cpu = jax.devices("cpu")
+    if len(cpu) < 4:
+        pytest.skip("needs 4 host CPU devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    return create_mesh_2d(devices=cpu[:4])
+
+
+def test_writer_exchange_tile_is_the_stored_tile_at_wrap_plus_q():
+    """E12 through the writer: ``exchange_tile`` (route ``ongrid``) returns the stored V at wrap(+Q).
+
+    The call goes through ``bse.exchange_path.exchange_tiles``, which labels its argument's tile
+    wrap(-arg); the test fails if the writer's -Q argument flips or if that shared routine is
+    relabelled. Control variant: the stored tile at wrap(-Q) differs at every Q. Q = 0 returns
+    the head-less Gamma tile itself. A synthetic Hermitian tile stack, distinct at every q of a
+    3 x 3 grid, on a 2 x 2 host mesh.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from bse import bsemat_export as X
+    mesh = _cpu_mesh()
+    pad = 8
+    up = np.triu(np.ones((pad, pad)), 1)
+    V = np.zeros((pad, pad, 3, 3, 1), complex)
+    for ix in range(3):
+        for iy in range(3):
+            V[:, :, ix, iy, 0] = (ix * 3 + iy + 1) * np.eye(pad) + 1j * (ix - 2 * iy + 0.5) * (up - up.T)
+    data = {"V_q0": jax.device_put(jnp.eye(pad, dtype=jnp.complex128), NamedSharding(mesh, P("x", "y"))),
+            "V_q_full": jax.device_put(V, NamedSharding(mesh, P("x", "y", None, None, None)))}
+    rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh, P()))
+    at = lambda q: V[(slice(None), slice(None)) + tuple(int(i) for i in np.round(q * GRID).astype(int) % GRID)]
+    for Q in ([1 / 3, 0, 0], [2 / 3, 0, 0], [0, 1 / 3, 0], [-1 / 3, 2 / 3, 0], [4 / 3, -1 / 3, 0]):
+        Q = np.asarray(Q, dtype=np.float64)
+        Vt, rec = X.exchange_tile(Q, 2, data=data, input_file=None, restart=None, grid=GRID,
+                                  n_rmu=pad, n_rmu_pad=pad, mesh_xy=mesh)
+        Vt = np.asarray(rep(Vt))
+        assert np.abs(Vt - at(Q)).max() < 1e-14, (Q.tolist(), "the writer's tile is not V[wrap(+Q)]")
+        assert np.abs(Vt - at(-Q)).max() > 1e-3, (Q.tolist(), "the control variant must differ")
+        assert "wrap(+Q)" in rec
+    V0, rec0 = X.exchange_tile(np.zeros(3), 1, data=data, input_file=None, restart=None, grid=GRID,
+                               n_rmu=pad, n_rmu_pad=pad, mesh_xy=mesh)
+    assert V0 is data["V_q0"] and "head-less" in rec0
+
+
+def test_off_grid_route_refuses_without_a_full_zone_zeta(tmp_path, monkeypatch):
+    """``GATE bsemat_finite_q_offgrid``: qflag 0 runs only when the restart's zeta_q.h5 stores every q."""
+    import zeta_loader
+    from bse.bsemat_export import require_offgrid_zeta
+    restart = str(tmp_path / "isdf_tensors_8.h5")
+    with pytest.raises(ValueError, match="GATE bsemat_finite_q_offgrid.*absent"):
+        require_offgrid_zeta(restart, 9, (1 / 6, 0, 0))
+    (tmp_path / "zeta_q.h5").write_bytes(b"")
+
+    def header(layout, nq):
+        class Header:
+            def __init__(self, path, **kw):
+                self.q_layout, self.n_q_on_disk = layout, nq
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+        return Header
+    monkeypatch.setattr(zeta_loader, "ZetaLoader", header("ibz", 5))
+    with pytest.raises(ValueError, match="GATE bsemat_finite_q_offgrid.*stores 5 of the grid's 9"):
+        require_offgrid_zeta(restart, 9, (1 / 6, 0, 0))
+    monkeypatch.setattr(zeta_loader, "ZetaLoader", header("full_bz", 9))
+    assert require_offgrid_zeta(restart, 9, (1 / 6, 0, 0)) == 9
 
 
 def test_off_grid_q_needs_the_shifted_wfn_co():

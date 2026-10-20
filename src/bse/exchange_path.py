@@ -7,7 +7,9 @@ conj(ψ_c,k+Q) ψ_v,k with the exchange tile at tile momentum q = wrap(−Q)
 
 * Γ (Q on an integer point): the production q = 0 tile with its rank-one
   head, ``data["V_q0"]``;
-* ``ongrid``: the stored tile ``V_qmunu[wrap(−Q)]``, exact;
+* ``ongrid``: the stored tile ``V_qmunu[wrap(−Q)]``, exact (the BerkeleyGW finite-Q
+  writer, ``bse.bsemat_export.exchange_tile``, passes −Q to get wrap(+Q): relabelling the
+  tile here flips that writer too; ``tests/test_bsemat_finite_q_cpu.py`` pins it);
 * ``refit``: a per-Q ζ refit contracted with the producer's Coulomb entry point
   (``bse.vq_interp.refit_vq``);
 * ``interp``: the arbitrary-Q evaluator (``vq_interp.build_vq_evaluator``),
