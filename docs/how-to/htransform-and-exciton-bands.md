@@ -63,6 +63,17 @@ zero-weight nodes (they drop out of $c$), the orbit count and the fit wall
 is not orbit-closed (`symmetry_maps.centroid_source_map_and_wrap`) refuses,
 naming the remedy.
 
+**Node count.** The off-grid error follows $\varepsilon$, not the rank. On Si
+4³ (36 fitted spinor bands, orbit-closed k-means with `--fit-window 0:36,0:36`)
+$\varepsilon$ = 0.37 / 0.12 / 1.6×10⁻² / 1.9×10⁻³ / 1.0×10⁻³ at 312 / 432 /
+588 / 780 / 1100 nodes, and the 4³→8³ off-grid DFT MAE is 8.03 meV (max 62.7)
+at 312 nodes against 6.76 meV (max 27.4) at 780. The fit warns when
+$\varepsilon > 10^{-2}$ and names the count $N_\mathrm{node} \ge 22\,(b_1-b_0)$
+that reached it on Si; MoS₂ 9×9 at 22.2 nodes per band (1198/54) reads
+$\varepsilon = 1.7\times10^{-2}$. The fine-grid cost is one eigh of rank
+$N_s N_\mathrm{node}$ per fine k, so this count prices the fine stage at
+2–3× the former QRCP basis (rank ≈ 17.7 per fitted band on Si).
+
 The fit writes $c$, $\Phi$ and $G^{-1/2}$ to `galerkin_dft.h5` beside the deck. A later run reuses
 the file only when its provenance matches exactly (WFN fingerprint, centroid
 SHA-256, band window, grids, spinor mode, node version); otherwise it refits
