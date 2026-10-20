@@ -675,7 +675,7 @@ def face_check_bytes(mesh, rows, side):
 
 def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, compiled,
                      selection=None, extra=lambda width: 0, eigen_side=None, held=0):
-    """Largest whole-mesh parent batch whose selection and reduction fit.
+    """Balanced whole-mesh parent batch whose selection and reduction fit.
 
     The scalar face route runs a batch of physical parents per round, every
     matrix tiled over all ranks (``face_reduce_round``); the bispinor sectors
@@ -685,10 +685,15 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
     reduction program compiled at that width's abstract operands with its eighs
     decided in the room beside the operands and ``held`` alone (the largest), admits it beside
     ``extra(width)`` resident bytes; the receipt's ``eigh_room`` is that room, the one the
-    rounds run in, so their stacks decide as they were priced. Every rank compiles the same shapes. Widths start
-    at every parent, so a deck that fits runs one round and compiles each program once
-    per shape, and step down in proportion to the whole price. The constructor still
-    admits every phase at its actual side.
+    rounds run in, so their stacks decide as they were priced. ``nq`` is the
+    actual raw-parent count, not the full response-grid size. Every candidate
+    capacity is balanced over the same number of rounds before its selection
+    quote and actual compiled reduction admission; no smaller-width memory
+    estimate substitutes for that candidate's compiled program. Every rank
+    compiles the same shapes. Widths start at every parent, then step down in
+    proportion to the whole price. The constructor still admits every phase
+    at its actual side. Local P-wide rounds and bispinor sectors do not use
+    this scalar face chooser.
     """
     from gw.shared_pole_capacity import ConstructorCapacity, face_eigh_room
 
@@ -701,6 +706,8 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, comp
         return ledger.preview(resident_bytes_per_rank=price['resident_bytes_per_rank'] + extra,
                               workspace_bytes_per_rank=sum(native.values()), concurrent_with=upstream)
     while True:
+        rounds = -(-int(nq) // width)
+        width = -(-int(nq) // rounds)
         budget.batch_width, budget.program_bytes = width, None
         picked = None if selection is None else row('selection', **selection)
         if picked is not None and picked['device_budget_status'] != 'PASS' and width > 1:

@@ -168,6 +168,9 @@ A new test needs no bootstrap import of its own.
   relaxed tier's sector face batch has no Ritz carrier, a bank of another
   bare-V digest is rebuilt, the pole-budget cut never splits a multiplet, a
   local CT round over budget is handed back for the face rerun.
+- `test_shared_pole_balanced_face_cpu.py`: scalar face parent-count and
+  balanced-width admission, including nonmonotonic compiled prices and
+  CPU4 actual reducer pole/transfer/gate equivalence across padded schedules.
 - `test_centroid_fixed_tile.py`: the kmeans candidate Gram's k batches and
   tiles and the feature metric's chunks do not read the budget (CPU, toy
   faces).

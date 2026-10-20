@@ -336,6 +336,16 @@ reruns that round's whole-chain program on the whole mesh
 **Sectors.** The bispinor sectors take their own route, decided once per map
 from the recipe shapes ([bispinor sectors §4–5](bispinor_shared_pole_w.md#sector-route)).
 
+**Scalar face batches.** Admission uses the actual raw-parent count, not the
+full response-grid size. A candidate capacity $c$ for $N$ parents becomes
+$b=\lceil N/\lceil N/c\rceil\rceil$ before selection pricing and the compiled
+reduction admission: the same number of fixed-shape rounds, with fewer
+synthetic slots in a short last round (10 parents at capacity 9 use two
+width-5 rounds). Each balanced candidate is compiled and admitted at its own
+width and room; no monotonic workspace assumption bypasses that check.
+The local P-wide schedule and bispinor sector routes are unchanged. This is
+a scheduling/resource change, not a measured wall-time speedup.
+
 **Face products.** Every face GEMM of the constructor is `distrib_la.panel_matmul`
 on the square mesh, every parent of
 a program in one exchange per panel, transposed operands by one
@@ -559,7 +569,15 @@ with $c_b=\lceil b/P\rceil$ on local rounds ($b/P$ on the face route) and, by
 phase: selection $D=24n^2$, $s_f=2a$ over the $a$ dense fitted samples plus the
 moment faces and the line panels in face units,
 $N_{\rm line}(1+2S)\,n\,r_{\rm cap}/n^2$ (`selection_face_count`);
-reduction $D=14R^2+12nR$, $s_f=0$ (on the face route $16\,c_b D$ at the conservative side, an ordered round's kept span on `face_ritz_carrier`, admits a batch, priced from these terms and never compiled to be measured: `face_batch_width` starts at every parent and steps down in proportion to the room; the staged sector route bounds its stage programs by the same price, `stage_width`; a local paired, ordered round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
+reduction $D=14R^2+12nR$, $s_f=0$ (on the scalar face route the conservative
+shape terms reserve the room, then `face_round_compiled_bytes` prices the
+actual balanced candidate at that room; `face_batch_width` starts at every
+raw parent and steps down in proportion to the admitted whole price,
+balancing before each new quote/compile as in §6. The staged sector route
+bounds its stage programs by the shape price, `stage_width`; a local paired,
+ordered round: $D=5R^2+3(2c)^2+12nR$ with
+$2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold
+3.8-9.7 $R^2$ against 7.5-12 here); model
 checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction (local) $D=CT+8R^2+4nR+\max(C,T)R$,
 on the face the program price alone (no dense term beside it). A local round has $b=P$. The native cuSOLVERMp `eigh`
 adds a private $n^2/P$ operand tile beside its workspace, which

@@ -537,7 +537,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                           carrier=face_ritz_carrier(mesh_xy, keep_budget) if ordered else None)
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
-                side=conservative_side, nq=nq,
+                side=conservative_side, nq=int(header['n_q_irr']),
                 held=execution_receipt['retained_output_upper_bound_bytes_per_rank'],
                 selection=dict(sample_batch=len(dense_fit), selection_faces=selection_faces),
                 compiled=lambda width, room: face_round_compiled_bytes(
