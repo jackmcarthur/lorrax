@@ -1163,6 +1163,60 @@ Consequently, neither positivity of $\rho$ nor a fitted growing pole is
 evidence that the current microscopic Dyson response is stable or unstable.
 Suspect poles need independent current-response checks and refinement.
 
+**Alternative numerical realization: transition Galerkin (NOT IMPLEMENTED).**
+The preceding identity suggests preserving the known bare generator instead
+of continuing sampled $W$ into a global unconstrained rational bank. Write
+$A=T K_\rho$, $B=T$ and $D=\Delta-i\gamma I$, with exactly the same spin,
+k-weight and packed-ISDF metric factors as above. For an orthonormal
+transition-space basis $Q$ (not a spatial projector), define
+
+$$
+A_r=AQ,\quad B_r=BQ,\quad
+D_r=Q^\dagger\Delta Q-i\gamma I,\qquad
+P_r(z)=A_r(z-D_r)^{-1}B_r^\dagger.
+$$
+
+Its bare poles retain imaginary part $-\gamma$ because
+$Q^\dagger\Delta Q$ is Hermitian. No square root or positivity assumption
+on $K_\rho$ is needed. The corresponding reduced Dyson feedback is
+
+$$
+M_r=D_r+B_r^\dagger vA_r,\qquad
+W_{c,r}(z)=vA_r(z-M_r)^{-1}B_r^\dagger v.
+$$
+
+All microscopic output ports remain in $A_r,B_r$; density stays on the
+output side of the right-index energy phase. For $Q=I$ these are exact
+finite-band identities, including the complex column-shell self-energy.
+For smaller $Q$, they are an additional numerical approximation. Exact
+full moments are not automatic: for example, containing the full ranges
+of $B^\dagger$ and $\Delta B^\dagger$ suffices for the first two bare
+moments, whereas a narrow tangential seed need not contain those ranges.
+
+This is **not** a passivity or collective-stability guarantee. An arbitrary
+orthogonal $Q$ can produce spurious collective gain by failing to preserve
+the relation between $K_\rho$ and $\Delta$. Even a stationary binary-density
+control should project its positive/negative occupation-gap sectors
+separately; general coherent $K_\rho$ does not commute with $\Delta$.
+The subspaces must also transform covariantly under the exact transition
+exchange/conjugation relating $q$ and $-q$, including closure at self-negative
+q. Independent microscopic $P$, $W$, dielectric and complex-$\Sigma$ checks
+remain required. Genuine inverted-state gain is retained, not projected
+away; no realization can cure a true microscopic pole above the specified
+collision evaluation height.
+
+A streamed block-Krylov/Galerkin implementation could reuse native endpoint
+actions and shared-pole factor storage without forming the dense transition
+interaction. It is not a cheap substitution: at 36 k points and 160 bands
+there are $36\times160^2=921\,600$ transition coordinates **per q**. A single
+complex128 basis with $K=1000$ costs 14.75 GB globally per parent (before
+orthogonalization workspace and other fields). Exactly zero spectator
+pairs may be omitted, but coherent pairs cannot be dropped from their
+diagonal occupations. Parent sharding, basis/workspace admission, crossing
+closure and actual time-to-accuracy would need implementation and measurement.
+`tests/test_full_density_transition_galerkin_cpu.py` is only a tiny algebra
+oracle, not a production path or a performance/stability certification.
+
 Full microscopic Dyson samples/actions feed a two-sided tangential Loewner
 realization, using the source GW shared-pole support/direction recipe. Its
 frequency pole bank has the form
