@@ -340,6 +340,8 @@ class CapacityLedger:
     def __init__(self, meta, *, mesh_xy, device_budget_bytes=None, baseline_bytes=0):
         geometry = dict(nq=meta.nk_tot, nspinor=meta.nspinor, nmu=meta.n_rmu,
                         px=mesh_xy.shape['x'], py=mesh_xy.shape['y'])
+        from lxkit import memory
+        memory.set_nmu(int(meta.n_rmu))           # route completeness (memory.require_backup)
         self.geometry = {}
         for key, value in geometry.items():
             if isinstance(value, bool):

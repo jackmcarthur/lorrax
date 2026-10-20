@@ -1282,6 +1282,10 @@ class Plan:
         decided = _STACK_ROUTES.get(key)
         if decided is None:
             decided = self._decide_stack(op, nb, key[3], key[4], key[6], traced)
+            if decided.route == ROUTE_BATCH_RESHARD and self.capacity_refusal is not None:
+                from lxkit import memory                  # route (c) with no mesh beside it
+                memory.require_backup(f"distrib_la {op} stack {shape} (no distributed eigh on "
+                                      f"this mesh: {self.capacity_refusal})", [key[3]], False)
             if decided.route != ROUTE_BATCH_RESHARD:
                 self.require_capacity(
                     f"the eigh stack {shape} ({_describe_stack(decided)})")
