@@ -643,6 +643,39 @@ def fold_small_head_wings_sharded(
     return folded
 
 
+def head_fold_scale(S_sum, S_cell) -> jax.Array:
+    """``M(z) = S_d,sum(z) S_d,cell(z)^-1``, ``(..., 3, 3)``: the scaled fold's ratio.
+
+    ``S_sum`` is the direct head of the dense sum set and ``S_cell`` that of
+    the GW mesh, at the same response nodes (leading axes), both replicated
+    3x3 Cartesian tensors in the S convention
+    (docs/theory/s-tensor-convention.md#sum-set-and-cell-set).
+    """
+    S_sum = jnp.asarray(S_sum, dtype=jnp.complex128)
+    S_cell = jnp.asarray(S_cell, dtype=jnp.complex128)
+    # M S_cell = S_sum  <=>  S_cell^T M^T = S_sum^T
+    return jnp.swapaxes(jnp.linalg.solve(
+        jnp.swapaxes(S_cell, -1, -2), jnp.swapaxes(S_sum, -1, -2)), -1, -2)
+
+
+def scaled_head_fold(S_direct, fold, fold_scale) -> jax.Array:
+    """``S_eff = S_d,sum + (M F + F M^T)/2``: the GW mesh's fold scaled to the sum set.
+
+    ``F = Y W(Gamma) Z / Omega`` is the local-field fold of the GW mesh
+    (``S_eff,cell - S_d,cell``), ``M = head_fold_scale(S_d,sum, S_d,cell)``
+    and ``S_direct = S_d,sum``; all ``(..., 3, 3)``.  The model holds the
+    local-field fraction ``S_d^-1 F`` fixed while the direct head converges in
+    k: exact when ``S_d,sum = r S_d,cell`` (then ``r F``), covariant under the
+    point group, linear in ``F``.  The symmetrized product is what
+    ``q.S_eff.q`` sees.  It is an approximation (+1.2 % in eps_M on Si 4^3
+    against native 8^3, docs/theory/s-tensor-convention.md#scaled-fold) and
+    undefined for a metal, whose fold carries the Fermi-surface wing
+    (``GATE head_dense_metal``).
+    """
+    M = jnp.asarray(fold_scale, dtype=jnp.complex128)
+    return S_direct + 0.5 * (M @ fold + fold @ jnp.swapaxes(M, -1, -2))
+
+
 def fold_cartesian_head_wings_sharded(
     S_direct: jax.Array,
     Y_x: jax.Array,
@@ -651,10 +684,21 @@ def fold_cartesian_head_wings_sharded(
     cell_volume: float,
     *,
     mesh_xy: Mesh,
+    fold_scale=None,
 ) -> jax.Array:
-    """Charge-head adapter to :func:`fold_small_head_wings_sharded`; see docs/theory/bispinor-gw.md#head."""
-    return fold_small_head_wings_sharded(
-        S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
+    """Charge-head adapter to :func:`fold_small_head_wings_sharded`; see docs/theory/bispinor-gw.md#head.
+
+    ``fold_scale`` (``IterationHeadResponse.fold_scale``) is ``None`` for the
+    GW mesh's own head (today's fold, bit for bit) or ``M`` of a dense sum
+    set, which folds by :func:`scaled_head_fold`.
+    """
+    if fold_scale is None:
+        return fold_small_head_wings_sharded(
+            S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
+    fold = fold_small_head_wings_sharded(
+        jnp.zeros_like(S_direct), Y_x, W_body_xy, Z_y, cell_volume,
+        mesh_xy=mesh_xy)
+    return scaled_head_fold(S_direct, fold, fold_scale)
 
 
 @functools.partial(jax.jit, static_argnames=("mesh_xy",))

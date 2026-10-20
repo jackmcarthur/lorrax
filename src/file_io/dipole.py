@@ -65,6 +65,7 @@ __all__ = [
     "wfn_psi_basis",
     "delta_e",
     "delta_e_cv",
+    "read_band_energies",
     "energy_extent",
     "finite_q_payload",
     "write_dipole",
@@ -320,6 +321,23 @@ def _whole_float64(h5, name) -> np.ndarray | None:
 
 def _band_energies(h5) -> np.ndarray | None:
     return _whole_float64(h5, BAND_ENERGIES_DATASET)
+
+
+def read_band_energies(path) -> np.ndarray:
+    """``(nk, nb)`` float64 ``band_energies`` of a current-format ``dipole.h5`` (Ry).
+
+    The full-BZ eigenvalues the producer wrote beside ``dipole_cart``; a
+    file without the table (written before 2026-09-25) or of an older format
+    refuses.
+    """
+    import h5py
+    with h5py.File(str(path), "r") as h5:
+        require_dipole_format(h5.attrs, dipole_path=path)
+        energies = _band_energies(h5)
+    if energies is None:
+        raise KeyError(f"{path!s} has no {BAND_ENERGIES_DATASET!r} table; "
+                       "regenerate it with python -m psp.get_dipole_mtxels")
+    return energies
 
 
 def delta_e(h5) -> np.ndarray:
