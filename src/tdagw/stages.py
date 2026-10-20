@@ -386,7 +386,7 @@ def magnus_frame(v) -> str:
 
 
 def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mesh, *,
-                       auto: bool, say):
+                       auto: bool, say, tracking_reference: bool = False, n_trials: int = 1):
     """The corrected Magnus step limit on this model: refuse, or pick dt for 'auto'.
 
     Two tests on the model itself.  (1) σ = :func:`tdagw.propagate.coupling_radius`
@@ -410,7 +410,7 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
     T = tdgw_io.T_IN_ATTOSEC
     t_gate = time.perf_counter()
     sigma, est, power = tp.coupling_radius(None, system.ops, model, drive, mesh, t0=cfg.t0,
-                                           timed=True)
+                                           timed=True, n_trials=n_trials)
     if not np.isfinite(sigma):
         raise ValueError(
             f"GATE td_magnus_stability: got: coupling radius sigma = {sigma} (power iteration on "
@@ -435,9 +435,11 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
         t_probe = time.perf_counter()
         if cfg.method == "cfm4" and cfg.stiff:
             g, _, fc = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0,
-                                      counters=True)
+                                      counters=True, tracking_reference=tracking_reference,
+                                      n_trials=n_trials)
         else:
-            g, fc = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0)[0], None
+            g, fc = tp.step_growth(cfg._replace(dt=h), system.ops, model, mesh, h=h, t0=cfg.t0,
+                                  tracking_reference=tracking_reference, n_trials=n_trials)[0], None
         row = dict(dt_as=dt * T, probe_dt_as=h * T, growth=g,
                    wall_s=time.perf_counter() - t_probe)
         if fc is not None:              # the split: a probe whose closing solve failed did not pass
@@ -470,6 +472,7 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
         stable = (cfg.frame == "whole_rho" or cfg.dt <= dt_sig) and probe(cfg.dt)
     n_hist = len(tp._magnus_parts(cfg)[3])
     per_probe = n_hist + tp.PROBE_STEPS * tp.dsigma_per_step(cfg.method, cfg.n_corr)
+    per_probe *= 2 if tracking_reference else 1
     receipt = dict(sigma_ev=sigma * tdgw_io.HA_IN_EV, y=cfg.dt * sigma, y_lim=y_lim,
                    dt_max_as=dt_sig * T,
                    change=float(abs(est[-1] - est[-2]) / est[-1]) if sigma > 0.0 else 0.0,
@@ -478,6 +481,7 @@ def _magnus_step_check(cfg, system: TdSystem, model: SelfEnergyModel, drive, mes
                    stiff=int(cfg.stiff), margin=tp.STABILITY_MARGIN,
                    probe_factor=tp.PROBE_STEP_FACTOR, probe_steps=tp.PROBE_STEPS,
                    probe_tolerance=tp.PROBE_TOLERANCE, power_iterations=len(est),
+                   probe_tracking_reference=bool(tracking_reference), probe_trials=int(n_trials),
                    power=power, dsigma_wall_s=(power["exec_s"] / power["dsigma"]
                                                if power["dsigma"] else float("nan")),
                    dsigma=int(power["dsigma"]) + len(probes) * per_probe,
@@ -762,7 +766,8 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
             gate_system = (system._replace(ops=system.ops._replace(collision=None))
                            if joint_collision else system)
             cfg, check = _magnus_step_check(cfg, gate_system, model, drive, mesh,
-                                           auto=auto, say=say)
+                                           auto=auto, say=say, tracking_reference=joint_collision,
+                                           n_trials=ntr if joint_collision else 1)
     if collision is not None and coll is None:
         with timing.section("tdagw.collision"):
             coll, system, model, cfg = _attach_collision(deck, system, model, cfg, collision,

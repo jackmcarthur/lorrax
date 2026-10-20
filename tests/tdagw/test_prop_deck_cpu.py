@@ -180,6 +180,8 @@ def test_joint_snapshot_controls_parse_and_refuse_invalid_closures():
     assert reference.values["lorrax.collision_hamiltonian"] == "reference"
     assert _refuses(_bundle(collision="raw", collision_screening="joint",
         collision_basis="instantaneous", collision_hermitian="none"), "td_collision_snapshot")
+    assert _refuses(_bundle(collision="raw", collision_screening="joint",
+        collision_basis="instantaneous", stiff_modes=1), "td_collision_snapshot")
     assert _refuses(_bundle(collision="raw", collision_screening="joint"),
                     "td_collision_snapshot")
     for key, value in (("collision_snapshot_steps", 0), ("collision_density_rank", 0),

@@ -229,6 +229,11 @@ Hartree/Fock plus M_H material Hamiltonian; a DFT-prepared density need not be
 stationary there. Both use bare HF increments, with no static reduced-W
 subtraction. See the [theory owner](../theory/td_agw_dynamical.md#damping).
 
+The joint snapshot's stability gate probes its installed coherent Hamiltonian.
+It follows paired field-free trajectories, so a physical HF quench is not
+mistaken for numerical perturbation growth. The stiff-split/joint-snapshot
+combination is currently refused rather than using an unvalidated basis.
+
 This exploratory executor projects the microscopic Coulomb interaction before
 fitting both polarization components. It retains separate exact response and
 noise realizations on their union pole bank; the small projected self-energy

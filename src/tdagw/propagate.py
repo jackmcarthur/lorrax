@@ -760,7 +760,7 @@ def initial_carry(cfg: PropagatorConfig, rho0, ops, mparams, model, drive, mesh)
 
 def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float,
                     n_iter: int = COUPLING_POWER_ITERATIONS, seed: int = 0,
-                    timed: bool = False):
+                    timed: bool = False, n_trials: int = 1):
     """Power-iteration estimate of the spectral radius σ (Ha) of the coupling map.
 
         L(x) = -i [dSigma[rho^eq + x] - dSigma[rho^eq], rho^eq]
@@ -795,10 +795,11 @@ def coupling_radius(rho0, ops, model: SelfEnergyModel, drive, mesh, *, t0: float
     lowered and compiled ahead of time and its one execution timed, so
     exec_s / dsigma (2 n_iter + 1 calls; the rest of an iteration is
     elementwise) is the measured wall of one ΔΣ call at no extra cost.
+    ``n_trials`` must match trial-dependent constant model operands.
     """
     nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
     rng = np.random.default_rng(seed)
-    x = rng.standard_normal((1, nk_pad, nb, nb)) + 1j * rng.standard_normal((1, nk_pad, nb, nb))
+    x = rng.standard_normal((int(n_trials), nk_pad, nb, nb)) + 1j * rng.standard_normal((int(n_trials), nk_pad, nb, nb))
     f = np.real(np.diagonal(np.asarray(gather_to_host(ops.rho_eq)), axis1=-2, axis2=-1))
     gap = (f[:, None, :] - f[:, :, None])[None]                      # f_m - f_n
     w = np.asarray(gather_to_host(ops.w_k)) > 0.0                     # logical k
@@ -858,7 +859,8 @@ def magnus_dt_limit(cfg: PropagatorConfig, sigma: float) -> tuple:
 
 def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: float,
                 t0: float, n_steps: int = PROBE_STEPS, eps: float = None, seed: int = 1,
-                counters: bool = False):
+                counters: bool = False, tracking_reference: bool = False,
+                n_trials: int = 1):
     """Growth per step of a small coherence under the scheme's own step at h, field off.
 
     The scheme-exact counterpart of :func:`coupling_radius`: from a random
@@ -878,14 +880,21 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
     and coefficients of the independent seeds), and ``counters = True``
     returns the closing-solve counters as a third value (a probe whose
     closing solve failed measured another scheme: the gate refuses it).
+    ``tracking_reference=True`` measures the distance from a second trajectory
+    starting at rho_eq with zero deviation/history. This removes physical
+    field-free motion when a constant Hamiltonian correction does not commute
+    with rho_eq. Its default perturbation is 1e-7 to resolve that difference
+    above cancellation roundoff. ``n_trials`` matches trial-dependent model
+    operands; both trajectories use all those operands. The default stationary
+    probe retains its original arithmetic and perturbation size.
     Returns (g, the norms after each step).
     """
     whole = cfg.method == "magnus2" and cfg.frame == "whole_rho"
     if eps is None:              # the whole rho rounds at 1e-16 of its O(1) occupations
-        eps = 1e-8 if whole else 1e-14
+        eps = 1e-7 if tracking_reference else (1e-8 if whole else 1e-14)
     nk_pad, nb = int(ops.e_qp.shape[0]), int(ops.e_qp.shape[1])
     rng = np.random.default_rng(seed)
-    x = rng.standard_normal((1, nk_pad, nb, nb)) + 1j * rng.standard_normal((1, nk_pad, nb, nb))
+    x = rng.standard_normal((int(n_trials), nk_pad, nb, nb)) + 1j * rng.standard_normal((int(n_trials), nk_pad, nb, nb))
     f = np.real(np.diagonal(np.asarray(gather_to_host(ops.rho_eq)), axis1=-2, axis2=-1))
     gap = (f[:, None, :] - f[:, :, None])[None]
     w = np.asarray(gather_to_host(ops.w_k)) > 0.0
@@ -901,18 +910,40 @@ def step_growth(cfg: PropagatorConfig, ops, model: SelfEnergyModel, mesh, *, h: 
         y = 0.5 * (y + np.conj(np.swapaxes(y, -1, -2)))
         xs.append(y * (eps / np.max(np.abs(y))))
     x0 = place_state(xs[0], mesh)
-    xh = place_state(np.concatenate(xs[1:], axis=0), mesh)
-    off = lambda t: jnp.zeros((1, 3))                                  # the field is off
+    xh = _place(np.stack(xs[1:]), mesh, 2)
+    off = lambda t: jnp.zeros((int(n_trials), 3))                       # the field is off
 
     def run(x0, xh, ops, mparams, h):
         ph = _physics(ops, mparams, model, off, mesh)
         step, _, _ = _fixed_parts(cfg, ph, h)
         base = ph["rho_eq"] if whole else 0.0
-        if _split(cfg, ph):            # past the bootstrap: the predictor acts at once
-            carry = _split_carry(ph, x0, [xh[j:j + 1] for j in range(n_hist)], n_boot, t0)
-        else:
-            hist = jnp.stack([ph["dsig_dev"](t0, xh[j:j + 1]) for j in range(n_hist)])
-            carry = (base + x0, hist, jnp.int32(n_boot))
+
+        def start(initial, seeds):
+            if _split(cfg, ph):       # past bootstrap: the predictor acts at once
+                return _split_carry(ph, initial, seeds, n_boot, t0)
+            hist = jnp.stack([ph["dsig_dev"](t0, y) for y in seeds])
+            return (base + initial, hist, jnp.int32(n_boot))
+
+        carry = start(x0, [xh[j] for j in range(n_hist)])
+        if tracking_reference:
+            zero = jnp.zeros_like(x0)
+            reference = start(zero, [zero] * n_hist)
+
+            def paired_body(pair, i):
+                t = t0 + i * h
+                current, reference = pair
+                current, _ = step(t, current, h, t + h)
+                reference, _ = step(t, reference, h, t + h)
+                return (current, reference), jnp.linalg.norm(current[0] - reference[0])
+
+            (c, reference), norms = jax.lax.scan(
+                paired_body, (carry, reference), jnp.arange(int(n_steps)), unroll=1)
+            stats = ()
+            if len(c) == 5:
+                a, b = c[4], reference[4]
+                stats = (a[0] + b[0], jnp.maximum(a[1], b[1]),
+                         a[2] + b[2], jnp.maximum(a[3], b[3]))
+            return norms, stats
 
         def body(c, i):
             t = t0 + i * h

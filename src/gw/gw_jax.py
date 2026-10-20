@@ -907,7 +907,8 @@ def _run_oneshot_sigma(
     return (sigma_result, W_by_role, photon_response)
 
 
-def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn):
+def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn, *,
+                                   sigma_result=None, static_head=None):
     """Produce the authenticated kinetic and ionic band matrix."""
     from file_io import validate_kin_ion_against_run
     _t_kin = time.perf_counter()
@@ -925,6 +926,8 @@ def _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, 
         mesh=mesh_xy,
     )
     timing.record("gw_jax.kin_ion_load", time.perf_counter() - _t_kin)
+    from .ppm_pipeline import publish_window_hf_reference
+    publish_window_hf_reference(kin_ion, sigma_result, static_head, meta, band_slices)
     return (kin_ion)
 
 
@@ -1662,9 +1665,9 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    input_dir, isdf, material_class, mesh_xy, meta, mode, oneshot_occupation_state,
 	    photon_response, print0, qp_solver, quad, static_head_terms, sym, wfn, wfns_sigma,
 	    wfns_transverse)
-	(kin_ion) = _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn)
-	from .ppm_pipeline import publish_window_hf_reference
-	publish_window_hf_reference(kin_ion, sigma_result, static_head_terms, meta, band_slices)
+	(kin_ion) = _load_kinetic_ionic_hamiltonian(
+	    band_slices, config, mesh_xy, meta, print0, wfn,
+	    sigma_result=sigma_result, static_head=static_head_terms)
 	(
 	    enk_dft, final_static_head_terms, kin_ion, rotations_written, sc_result,
 	    sigma_result, sigma_total) = _solve_qp_stage(

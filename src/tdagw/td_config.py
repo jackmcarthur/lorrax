@@ -215,6 +215,11 @@ def _check_collision(vals: dict) -> None:
         raise _gate("td_collision_snapshot", "unknown collision Hamiltonian",
                     "hf | reference", "set collision_hamiltonian")
     if (form != "off" and vals["lorrax.collision_screening"] in ("joint", "joint_frozen")
+            and isinstance(vals["lorrax.stiff_modes"], int) and vals["lorrax.stiff_modes"] > 0):
+        raise _gate("td_collision_snapshot", "stiff split with a joint snapshot",
+                    "stiff_modes = 0",
+                    "disable the unvalidated stiff-snapshot combination")
+    if (form != "off" and vals["lorrax.collision_screening"] in ("joint", "joint_frozen")
             and vals["lorrax.collision_hermitian"] != "dynamic"):
         raise _gate("td_collision_snapshot", "joint screening without the full coherent correction",
                     "collision_hermitian = 'dynamic'",
@@ -1136,7 +1141,8 @@ TD_KEY_DOCS = {
         "diag(e_ref) + Δh_HF + (M_H − M_H_eq), an explicitly reference-anchored model "
         "for comparison to the original TD-aGW. Both use bare HF increments and count "
         "dispersion once; no static reduced-W subtraction is made. A DFT-prepared "
-        "density is not assumed stationary for the absolute `hf` Hamiltonian.", ("td_collision",)),
+        "density is not assumed stationary for the absolute `hf` Hamiltonian. Joint "
+        "snapshots require `stiff_modes = 0`; the coupled stiff basis is not validated.", ("td_collision",)),
     "lorrax.collision_snapshot_steps": (
         "", "Maximum coherent self-energy sweeps per instantaneous snapshot. "
         "An unconverged snapshot refuses; no last iterate is installed.", ("td_collision",)),
