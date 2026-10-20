@@ -1,0 +1,80 @@
+{
+  "status": "PASS_RECORDED_SHAPE_SYNTHETIC_VALUES_ONLY",
+  "SC_run": false,
+  "physical_result": false,
+  "revision": "a0c1882d1cc579b1670694615bb00f4b53b15b0d",
+  "archive_sha256": "332ceb8551e4a2e25e1ce87aa505df567df3fdbddb7bcb4dd819a58bd7c297ef",
+  "harness_sha256": "1bd9b788d940e27e208c223808f845f40e7e1eca533e4de418356e250f9b286b",
+  "recorded_cache_sha256": "9860455fa2b871b29194db0ae785ff91841544b2244d47043f3a7b5359a91a8e",
+  "input_shape": [5504, 5504],
+  "dtype": "complex128",
+  "input_sharding": "P('x','y')",
+  "output_shardings": ["P()", "P('x','y')"],
+  "mesh": [4, 4],
+  "exact_scope": "recorded shape/layout/owner; deterministic synthetic values, NOT lost bank",
+  "matrix": "nontrivial Hermitian positive diagonal+complex rank-one; last8 exactzero rows",
+  "custom_call_targets": ["cusolver_syevd_ffi"],
+  "compiled_hlo_sha256": "6bd463f2cd744a10806318d9057c5c3c8e08d837fa1f8f16be73cfd5668bd08f",
+  "compile_cache": {
+    "forced_cold": false,
+    "columns": ["probes", "hits", "backend_compiles"],
+    "rank_deltas": [
+      [1, 0, 1], [1, 0, 1], [1, 0, 1], [1, 0, 1],
+      [1, 0, 1], [1, 0, 1], [1, 0, 1], [1, 0, 1],
+      [1, 0, 1], [1, 0, 1], [1, 0, 1], [1, 0, 1],
+      [1, 0, 1], [1, 0, 1], [1, 0, 1], [1, 0, 1]
+    ],
+    "backend_compilation_observed": true,
+    "persistent_hit_observed": false
+  },
+  "phases": {
+    "compile_or_load_exact_gathered_eigh": {
+      "min_seconds": 1.6475280419981573,
+      "max_seconds": 1.7059719529934227
+    },
+    "execute_exact_gathered_eigh": {
+      "min_seconds": 1.0638412879925454,
+      "max_seconds": 1.198434387013549
+    }
+  },
+  "memory": {
+    "compiled_bytes_per_rank": 1030043688,
+    "vendor_workspace_bytes_per_rank": 1950529200,
+    "aggregate_bound_bytes_per_rank": 2980572888
+  },
+  "runtime_budget_bytes": 31583140988,
+  "device_ceiling_bytes": 8589934592,
+  "max_seconds": 360.0,
+  "errors": {
+    "residual": 3.344770294761322e-17,
+    "orthogonality": 1.0725674037460392e-14,
+    "unchanged_service_tolerance": 7.821654435247183e-11
+  },
+  "elapsed_s": 25.048770798995974,
+  "unknown_stages_not_run": [
+    "normal_eigh batch shape",
+    "constructor face-pencil shape"
+  ],
+  "provenance": {
+    "external_campaign_root": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020",
+    "receipt": "repro_gathered5504_a0_nodewide_v2_60051836/receipt.json",
+    "receipt_sha256": "69d3cea8df45a33189db74180130f221b2f4ab84eec8e3ff32e85521f1c92b02",
+    "launcher_and_accounting_summary": "GATHERED5504_DIAGNOSTIC_RESULT.json",
+    "launcher_and_accounting_summary_sha256": "40500619ab7ed67713f1e06cd960c0255f4fbe36601000f123c847682641e8d4",
+    "job": "60051836",
+    "step": "60051836.0",
+    "all_rank_gdb_inferior_exit_codes": "16 of 16 zero",
+    "evidence_archive": "gathered5504_v2_60051836_evidence.tar.gz",
+    "evidence_archive_sha256": "d8133fa42947312ea5e6b1953384a0a9397a9381da742bda1bbd55fddfa0ee0c"
+  },
+  "both_diagnostic_attempts_accounting": {
+    "jobs": ["60051557", "60051836"],
+    "reserved_seconds": [93, 41],
+    "reserved_gpu_hours": 0.5955555555555555,
+    "active_step_seconds": [84, 33],
+    "active_step_gpu_hours": 0.52,
+    "accounting_views_are_not_additive": true,
+    "allocations_released": true
+  },
+  "limitations": "No material bank, constructor face-pencil, SC map, physical Sigma or trajectory was run. This synthetic gathered-eigh pass neither reproduces nor diagnoses the original material constructor SIGSEGV. No further GPU job is authorized by this result."
+}
