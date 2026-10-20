@@ -651,8 +651,8 @@ def apply_eqp_to_bse_window(data, restart_file: str, eqp_file: str,
     (:func:`apply_eqp_and_reslice_bands`, which re-resolves ``n_occ`` so a
     QP gap change cannot mis-slice), and returns the full-band
     ``(nk, nb)`` QP table for the caller's interpolated leg.  ``eqp_file``
-    is the irreducible wedge; ``apply_eqp_corrections`` unfolds it through
-    the symmetry service.
+    is the irreducible wedge or a full-zone file; ``apply_eqp_corrections``
+    places it on the full BZ and refuses star-asymmetric QP shifts.
 
     Refuses (before touching ``data``) an eqp ladder on a QP WFN, whose ψ
     and E are already a matched pair (:func:`refuse_eqp_on_a_qp_wfn`), and
