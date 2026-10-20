@@ -352,15 +352,16 @@ class ConstructorCapacity:
                                      backend=self._resolution.eigh_backend)
 
     def eigh_bytes(self, extent):
-        """The eigh stack's compiled figure at ``extent`` (``distrib_la.eigh_stack_bytes``),
-        cached and recorded in the receipt's ``native_queries``."""
+        """The eigh stack's compiled figure at ``extent`` (``distrib_la.eigh_stack_bytes``), its
+        first attempt: the selection's stacks run eagerly and a face round's inside its
+        checked first program; cached and recorded in the receipt's ``native_queries``."""
         import distrib_la
         shapes = ((self.batch_width, int(extent), int(extent)),)
         if ("eigh", shapes) not in self.native_queries:
             self.native_queries[("eigh", shapes)] = distrib_la.eigh_stack_bytes(
                 constructor_price_plan(self._mesh_xy, int(extent), self.execution,
                                        backend=self._resolution.eigh_backend),
-                shapes[0], np.complex128)
+                shapes[0], np.complex128, phase="first")
         return self.native_queries[("eigh", shapes)]
 
     @property
@@ -381,7 +382,10 @@ class ConstructorCapacity:
         if side is None:
             side = self._side
         self._side = side
-        price, native = self.quote(side, phase=self._phase,
+        # A local reduction round admits its own executable, eigh stacks included, beside
+        # this row (shared_pole_execution.price_round); the row holds its operands only.
+        price, native = self.quote(side, phase=self._phase, eigh=not (
+                                       self.execution == "local" and self._phase == "reduction"),
                                    sample_batch=sample_batch,
                                    selection_faces=selection_faces, eigen_side=eigen_side,
                                    cross_original_sides=cross_original_sides,
@@ -391,7 +395,7 @@ class ConstructorCapacity:
         row['execution'] = self.execution
         return dict(row, price=price, native_workspace=dict(native))
 
-    def quote(self, side, *, phase, sample_batch=1, selection_faces=None, eigen_side=None,
+    def quote(self, side, *, phase, eigh=True, sample_batch=1, selection_faces=None, eigen_side=None,
               cross_original_sides=None, padding_output_bytes_per_rank=0):
         """Return an unrecorded phase price for route selection/preflight."""
         side = int(side)
@@ -408,7 +412,7 @@ class ConstructorCapacity:
         # stack's program compiled at its shape on the whole-mesh plan (never run), plus its
         # provider's workspace query: the room distrib_la reads to run a stack one whole
         # matrix per rank is what this admission leaves over.
-        self._native_maxima["eigh"] = max(self.eigh_bytes(e) for e in sorted(extents))
+        self._native_maxima["eigh"] = max(self.eigh_bytes(e) for e in sorted(extents)) if eigh else 0
         self._workspace = sum(self._native_maxima.values())
 
         return price, dict(self._native_maxima)

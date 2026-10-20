@@ -571,7 +571,7 @@ def bucket(value) -> int:
     return (value >> 30) << 30 if value >= 1 << 30 else max(value, 0)
 
 
-# --- admission: the one policy point (owner 2026-10-19), route completeness, sizing ----------------
+# --- admission: the one policy point, route completeness, sizing ----------------
 def record_route(site, route, reason, *, warning=None) -> None:
     """Record one route decision; rank 0 prints it the first time."""
     key = (str(site), str(route), str(reason))

@@ -1061,7 +1061,7 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
     def _make_clean_split(qb3):
         return jax.jit(_clean_split_body, out_shardings=(qb3, qb3, qb3))
 
-    # The face route (owner rule 2026-10-19: a mesh backup at every whole-matrix site): a
+    # The face route (a mesh backup at every whole-matrix site): a
     # chunk whose q count does not divide the mesh (the q-batched layout degrades to
     # replicated) or whose whole matrices per q owner do not fit beside what is live runs
     # with every n_μ x n_μ operand tiled: the eigh in the room through distrib_la's

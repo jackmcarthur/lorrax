@@ -221,6 +221,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, nq=nq,
+                held=execution_receipt['retained_output_upper_bound_bytes_per_rank'],
                 selection=dict(sample_batch=len(dense_fit), selection_faces=selection_faces),
                 compiled=lambda width, room: face_round_compiled_bytes(
                     mesh_xy, width, rows=n, finite=conservative_side - infinity_block, infinity_width=infinity_cap,
@@ -229,6 +230,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     eigh_backend=resolution.eigh_backend, room=room))
             # Every face round's reduction is priced at this size.
             budget.program_bytes = execution_receipt['face_batch']['program_bytes_per_rank']
+            reduction_room = execution_receipt['face_batch'].pop('eigh_room')
             # distrib_la decides each eigh stack against the room beside the
             # admitted batch and the retained factors: whole matrices per rank
             # where they fit, else the whole mesh.
@@ -254,7 +256,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 budget.retained_panels = tuple(factors)
                 budget.plan(
                     conservative_side, phase="selection",
-                    sample_batch=len(dense_fit), selection_faces=selection_faces)
+                    sample_batch=len(dense_fit), selection_faces=selection_faces,
+                    runs_in="spole.direction_selection")
                 budget.live(())
             with phase("scratch_read"):
                 with moment_rounds.phase() as moment_io:
@@ -330,10 +333,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     # The kept span on the budget's carrier, as the local round
                     # solves it on its Ritz carrier: the Schur and final eigh run
                     # at about 2 x budget instead of the pencil side.
-                    # The eigh room beside this round's own program: the batch row, which
-                    # admitted the program compiled at the conservative side.
-                    row = execution_receipt['face_batch']['reduction']
-                    room = face_eigh_room(row, retained_bound, stage="shared-pole constructor reduction round")
+                    # The room the batch width compiled this program in: a room beside the
+                    # admitted row would hold the program's own stacks twice (room 0).
+                    room = reduction_room
                     round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                         round_states, infinity, tables, mesh=mesh_xy,
                         budget=budget, ordered=ordered, odd_moments=odd_moments,

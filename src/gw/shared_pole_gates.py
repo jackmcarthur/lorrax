@@ -228,7 +228,7 @@ def _passivity_response_checks(response, *, eigh, gates):
     norm = jnp.linalg.norm(herm, axis=(-2, -1))
     # ||A - A^H|| / (2 ||Herm A||) read as ||A - Herm A|| / ||Herm A||: elementwise on the
     # face. ``response - _adjoint(response)`` lowered to two whole-matrix all-gathers per
-    # rank under GSPMD (2.4 n^2 c128 per rank whatever P: run30k passivity_held).
+    # rank under GSPMD (2.4 n^2 c128 per rank whatever P, measured at the passivity check).
     anti = jnp.linalg.norm(response - herm, axis=(-2, -1))
     anti = anti / jnp.where(norm > 0, norm, 1)
     values, _ = eigh(herm, cut=PASSIVITY_CHECK_CUT)
