@@ -888,7 +888,7 @@ def _compute_V_q_g_flat_tiles(
                     jnp.int32(0)).compile() for s in specs), key=compiled_new_bytes)
         resident = priced['priced'] - priced['work'] - q_tile * priced['per_q']   # the accumulators
         room = (budget - resident if budget is not None
-                else memory.room("V(q) q tile") if memory.run() else float("inf"))
+                else memory.room() if memory.run() else float("inf"))
         check = check_chunk(q_tile, build=build, stage="V(q) q tile", fixed=priced['work'],
                             per_unit=per_q, room=room, extra=lambda c, _: c * per_q)
         q_tile = check.chunk

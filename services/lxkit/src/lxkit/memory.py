@@ -1,7 +1,13 @@
-"""Device memory: :class:`Price` (sourced terms, ``fixed + spread / P``) -> :func:`book` (a
-stage's parts; receipt ``memory <stage>: priced P | measured M | γ``) -> :func:`resolve` /
-:func:`room` -> :func:`admit` (the one policy) -> :func:`sizing` (minimum P).  Platform data
-is in ``lxkit.LEGS``; stdlib-only at import; an instrument never raises."""
+"""Device memory, one model: a stage's :class:`Price` is booked to the timing section that runs
+it (:func:`book`), routed by the one policy (:func:`admit`) against :func:`room`, and receipted
+against the allocator's high-water over that section (``memory <stage>: priced P | measured M |
+γ``); :func:`sizing` gives the minimum P.  Platform differences are ``lxkit.LEGS`` data.
+Production reads the allocator at section boundaries only; ``LORRAX_MEMORY_RECEIPTS=calibrate``
+(implied by STRICT and TRACE) waits on priced stages, reads every section, and on a BFC arena
+takes the first raise of its mark (exact) or a polled reading (``>=``).  ``LORRAX_MEMORY_TRACE=
+<path>``: JSON Lines per closed section (``lxkit.memory_residuals``).  ``LORRAX_MEMORY_STRICT=1``:
+the census (GATE memory_unpriced, :func:`findings`).  ``LORRAX_NMU2_BACKUP=report``: GATE
+nmu2_no_backup is a finding."""
 
 from __future__ import annotations
 
@@ -14,16 +20,11 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 TERMS = ("operands", "xla", "vendor", "outside")
-#: The census: an unpriced figure raises GATE memory_unpriced; :func:`findings` lists terms
-#: without provenance.
 STRICT = os.environ.get("LORRAX_MEMORY_STRICT", "") == "1"
-#: Calibrate (and STRICT): priced stages wait on their work and a BFC leg polls (exact
-#: receipts); production receipts are ``~``.  ``LORRAX_MEMORY_TRACE=<path>`` (implies
-#: calibrate): each section's live arrays at open, peak and close, the allocator's bytes and
-#: every executable compiled in it, as JSON Lines appended as sections close
-#: (``lxkit.memory_residuals``).
 TRACE = os.environ.get("LORRAX_MEMORY_TRACE", "")
 CALIBRATE = STRICT or bool(TRACE) or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
+NMU2_REPORT = os.environ.get("LORRAX_NMU2_BACKUP", "") == "report"
+POLL_SECONDS = 0.01                     # the BFC bytes_in_use poll (calibrate only)
 
 
 @dataclass(frozen=True)
@@ -38,11 +39,16 @@ class Term:
         p = max(1, int(ranks))
         return self.fixed + self.spread / p + (float(self.grid(p)) if self.grid else 0.0)
 
+    def __add__(self, b: "Term") -> "Term":
+        grids = [g for g in (self.grid, b.grid) if g]
+        return Term(self.fixed + b.fixed, self.spread + b.spread, _join(self.source, b.source),
+                    (lambda p: sum(g(p) for g in grids)) if grids else None)
+
 
 @dataclass(frozen=True)
 class Price:
-    """One stage's per-rank price at ``ranks`` processes.  ``increment``: the stage's
-    resident set is the allocator's bytes in use when it is metered (:meth:`settled`)."""
+    """A stage's per-rank price at ``ranks``.  ``increment``: the allocator's bytes in use when it
+    is metered join its operands; ``whole``: the largest matrix side a rank holds whole (0: none)."""
     operands: Term = Term()
     xla: Term = Term()
     vendor: Term = Term()
@@ -50,15 +56,7 @@ class Price:
     ranks: int = 1
     label: str = ""
     increment: bool = False
-    #: The largest matrix side a rank holds whole on this route (0: distributed, no whole matrix).
     whole: int = 0
-
-    def settled(self) -> "Price":
-        if not self.increment:
-            return self
-        return replace(self, increment=False, operands=Term(
-            self.operands.at(self.ranks) + in_use(), source=" + ".join(s for s in (
-                self.operands.source, "resident at stage entry (allocator bytes in use)") if s)))
 
     def terms(self, ranks: Optional[int] = None) -> dict:
         return {n: getattr(self, n).at(self.ranks if ranks is None else ranks) for n in TERMS}
@@ -67,21 +65,15 @@ class Price:
         return float(sum(self.terms(ranks).values()))
 
     def unsourced(self) -> list:
-        return [n for n in TERMS if getattr(self, n).at(self.ranks) and not getattr(self, n).source]
+        return [n for n, v in self.terms().items() if v and not getattr(self, n).source]
 
     def describe(self, ranks: Optional[int] = None) -> str:
         return ", ".join(f"{n} {_gb(v)}" for n, v in self.terms(ranks).items())
 
-    def __add__(self, other: "Price") -> "Price":
-        def join(a, b):
-            grids = [g for g in (a.grid, b.grid) if g]
-            return Term(a.fixed + b.fixed, a.spread + b.spread,
-                        " + ".join(s for s in (a.source, b.source) if s),
-                        (lambda p: sum(g(p) for g in grids)) if grids else None)
-        return Price(*(join(getattr(self, n), getattr(other, n)) for n in TERMS),
-                     ranks=max(self.ranks, other.ranks), increment=self.increment or other.increment,
-                     label=" + ".join(s for s in (self.label, other.label) if s),
-                     whole=max(self.whole, other.whole))
+    def __add__(self, o: "Price") -> "Price":
+        return Price(*(getattr(self, n) + getattr(o, n) for n in TERMS), ranks=max(self.ranks, o.ranks),
+                     label=_join(self.label, o.label), increment=self.increment or o.increment,
+                     whole=max(self.whole, o.whole))
 
 
 def priced(nbytes: float, source: str, *, term: str = "xla", spread: float = 0.0,
@@ -91,8 +83,28 @@ def priced(nbytes: float, source: str, *, term: str = "xla", spread: float = 0.0
                    **{term: Term(float(nbytes), float(spread), source)})
 
 
+# Process state, plain tables; reset() clears the run's records, never the instrument (_I, _T).
+_RUN: dict = {}          # limit, budget, reserve, linalg, per_node, platform, nmu
+_OPEN: list = []         # the main thread's open sections (dicts), outermost first
+_PENDING: dict = {}      # stage -> {label: Price} booked before it opens
+_RECEIPTS: dict = {}     # stage -> receipt row (max over calls)
+_PLANNED: dict = {}      # stage -> {"routes": ((name, Price), ...), "limit": bytes, "parts": {..}}
+_ROUTES: dict = {}       # (site, route, reason) -> row
+_DOOMED: dict = {}       # stage -> its over-the-limit banner, repeated when it opens
+_WARNED: dict = {}       # stage kind -> the largest need warned
+_FINDINGS: list = []
+_HOOK: dict = {"sink": None, "agree": None}
+_I = dict(source=None, lib=None, handle=None, device=None, mark=-1, poll=-1, live=-1, reads=0, s=0.0)
+_T: dict = {"on": False, "wrote": False, "exe": {}, "last": None, "born": {}}
+_LOCK = threading.Lock()
+
+
 def _gb(value: float) -> str:
     return f"{float(value) / 1e9:.2f} GB"
+
+
+def _join(*parts) -> str:
+    return " + ".join(s for s in parts if s)
 
 
 def _rank0() -> bool:
@@ -107,280 +119,27 @@ def _leg():
     return leg_for_vendor(device_vendor(jax.local_devices()[0]))
 
 
-# ---------------------------------------------------------------------------
-# Instrument: the allocator high-water per interval between boundaries
-# ---------------------------------------------------------------------------
-POLL_SECONDS = 0.01              # the BFC bytes_in_use poll (calibrate only)
-_I = {"source": None, "lib": None, "handle": None, "device": None, "mark": -1, "poll": -1, "live": -1}
-_LOCK = threading.Lock()
-_COST = [0, 0.0]
+def _main() -> bool:
+    return threading.current_thread() is threading.main_thread()
 
 
 def _backend_up() -> bool:
     import sys
-    bridge = sys.modules.get("jax._src.xla_bridge")
-    return bool(bridge and getattr(bridge, "_backends", None))
+    return bool(getattr(sys.modules.get("jax._src.xla_bridge"), "_backends", None))
 
 
 def _held(a) -> tuple:
-    """(bytes on each device holding ``a``, those devices), from its sharding: reading
-    ``addressable_shards[i].data`` would create the single-device arrays it counts."""
-    shard = math.prod(a.sharding.shard_shape(a.shape)) * a.dtype.itemsize
-    return int(shard), a.sharding.addressable_devices
+    """(bytes on each device holding ``a``, those devices), from its sharding alone."""
+    return int(math.prod(a.sharding.shard_shape(a.shape)) * a.dtype.itemsize), a.sharding.addressable_devices
 
 
-def _live_bytes() -> int:
+def _in_use(per_device: bool = True) -> float:
+    """Allocator bytes in use, max over devices; CPU: live array bytes (``per_device``: / devices)."""
     import jax
-    return sum(n * len(d) for n, d in map(_held, jax.live_arrays()))
-
-
-def _setup() -> Optional[str]:
-    """The leg's reader: "pool" (CUDA mempool, resettable), "bfc" (never resets), "live" (CPU)."""
-    if not _backend_up():
-        return None
-    import ctypes
-    import jax
-    device = _I["device"] = jax.local_devices()[0]
-    leg = _leg()
-    reader = getattr(leg, "peak_reader", "live") if leg is not None else "live"
-    if reader == "pool":
-        arrays = [a for a in jax.live_arrays() if a.nbytes and not a.is_deleted()
-                  and getattr(a.sharding, "memory_kind", None) in (None, "device")]
-        if not arrays:
-            return None                      # no live buffer yet: ask again next time
-        lib, handle = ctypes.CDLL("libcuda.so.1"), ctypes.c_void_p()
-        pointer = arrays[0].addressable_shards[0].data.unsafe_buffer_pointer()
-        if not lib.cuPointerGetAttribute(ctypes.byref(handle), 17, ctypes.c_uint64(pointer)) \
-                and handle.value:
-            _I.update(lib=lib, handle=handle, source="pool")
-            return "pool"
-        reader = "bfc"                        # no CUDA pool behind this allocator
-    if reader == "bfc" and "peak_bytes_in_use" in (device.memory_stats() or {}):
-        stats = device.memory_stats()
-        _I.update(source="bfc", mark=int(stats["peak_bytes_in_use"]),
-                  poll=int(stats.get("bytes_in_use", 0)))
-        if CALIBRATE:
-            threading.Thread(target=_sample, name="lorrax-memory-sampler", daemon=True).start()
-        return "bfc"
-    _I["source"] = "live" if device.platform == "cpu" else "none"
-    return _I["source"]
-
-
-def _sample() -> None:
-    """Poll ``bytes_in_use`` into the interval maximum (a BFC arena's lower bound)."""
-    while True:
-        time.sleep(POLL_SECONDS)
-        try:
-            use = int((_I["device"].memory_stats() or {}).get("bytes_in_use", 0))
-        except Exception:                                      # noqa: BLE001
-            return
-        with _LOCK:
-            _I["poll"] = max(_I["poll"], use)
-
-
-def _interval() -> tuple:
-    """(high-water since the last boundary, exact)."""
-    src = _I["source"] or _setup()
-    if src == "pool":
-        import ctypes
-        value = ctypes.c_uint64(0)    # CU_MEMPOOL_ATTR_USED_MEM_HIGH, read and reset
-        if _I["lib"].cuMemPoolGetAttribute(_I["handle"], 8, ctypes.byref(value)):
-            return None, False
-        high, value.value = int(value.value), 0
-        _I["lib"].cuMemPoolSetAttribute(_I["handle"], 8, ctypes.byref(value))
-        return high, True
-    if src == "bfc":
-        stats = _I["device"].memory_stats() or {}
-        peak, use = int(stats.get("peak_bytes_in_use", 0)), int(stats.get("bytes_in_use", 0))
-        with _LOCK:
-            polled, _I["poll"] = max(_I["poll"], use), use
-        raised, _I["mark"] = peak > _I["mark"], max(peak, _I["mark"])
-        return (peak, True) if raised else (polled, False)
-    if src == "live":
-        live = _live_bytes()
-        high, _I["live"] = max(_I["live"], live), live
-        return high, False
-    return None, False
-
-
-def source() -> Optional[str]:
-    return _I["source"]
-
-
-def instrument_cost() -> tuple:
-    """(boundary reads, seconds) the instrument has cost this process."""
-    return int(_COST[0]), float(_COST[1])
-
-
-class Tracker:
-    """An open section's high-waters: ``whole``, ``own`` (outside children), ``metered``
-    (since its first part was booked: the receipt's figure)."""
-    __slots__ = ("name", "parts", "whole", "own", "metered", "exact", "mark0", "rec")
-
-    def __init__(self, name, parts):
-        self.name, self.parts = str(name), dict(parts or {})
-        self.whole = self.own = self.metered = -1
-        self.exact, self.mark0, self.rec = True, None, None
-
-    @property
-    def price(self) -> Optional[Price]:
-        return sum(self.parts.values(), Price()) if self.parts else None
-
-    def meter(self) -> None:
-        if self.mark0 is None and _backend_up():
-            _sync()
-            boundary()
-            self.metered, self.exact, self.mark0 = -1, CALIBRATE, _I["mark"]
-        if _backend_up():
-            self.parts = {k: p.settled() for k, p in self.parts.items()}
-
-
-_OPEN: list = []                 # the main thread's open trackers, outermost first
-_PENDING: dict = {}              # stage -> {label: Price} booked before it opens
-_RECEIPTS: dict = {}             # stage -> receipt row (max over calls)
-_FINDINGS: list = []             # the census's findings (STRICT)
-_SINK = [None]
-
-
-# ---------------------------------------------------------------------------
-# Trace (LORRAX_MEMORY_TRACE): what is live, what the allocator holds, what compiled
-# ---------------------------------------------------------------------------
-_T: dict = {"sections": [], "born": {}, "hooked": False, "exe": {}}
-
-
-def _snapshot() -> dict:
-    """The live arrays grouped by (shape, dtype, sharding, creating stage), bytes per device."""
-    import jax
-    devices, groups, per_device = jax.local_devices(), {}, {}
-    stage = _OPEN[-1].name if _OPEN else "(top level)"
-    born, alive = _T["born"], set()
-    for a in jax.live_arrays():
-        alive.add(id(a))
-        if id(a) not in born:
-            born[id(a)] = stage
-        nbytes, held = _held(a)
-        for device in held:
-            per_device[device.id] = per_device.get(device.id, 0) + nbytes
-        key = (tuple(a.shape), str(a.dtype), str(getattr(a.sharding, "spec", type(a.sharding).__name__)),
-               born[id(a)])
-        groups.setdefault(key, [0, nbytes])[0] += 1
-    for gone in set(born) - alive:
-        del born[gone]
-    stats = [d.memory_stats() or {} for d in devices]
-    return dict(live=max(per_device.values(), default=0),
-                in_use=max(int(st.get("bytes_in_use", 0)) for st in stats),
-                peak=max(int(st.get("peak_bytes_in_use", 0)) for st in stats),
-                arrays=[dict(shape=list(k[0]), dtype=k[1], spec=k[2], born=k[3], count=v[0],
-                             bytes_per_device=v[1]) for k, v in
-                        sorted(groups.items(), key=lambda kv: -kv[1][0] * kv[1][1])])
-
-
-def _hook_compiles() -> None:
-    """Record every executable XLA compiles (cache hits included) under the open section, and
-    under the sections open at its first run (``runs``: where its temporaries are allocated)."""
-    from jax._src import compiler
-    from jax._src.interpreters import pxla
-    original, execute = compiler.compile_or_get_cached, pxla.ExecuteReplicated.__call__
-
-    def run(self, *args):
-        hit = _T["exe"].pop(id(self.xla_executable), None)
-        for t in (_OPEN if hit is not None else ()):
-            if t.rec is not None:
-                t.rec["runs"].append(hit[1])
-        return execute(self, *args)
-
-    def traced(backend, computation, *args, **kwargs):
-        executable = original(backend, computation, *args, **kwargs)
-        try:
-            m = executable.get_compiled_memory_stats()
-            row = dict(program=str(computation.operation.attributes["sym_name"]).strip('"'),
-                       temp=int(m.temp_size_in_bytes), argument=int(m.argument_size_in_bytes),
-                       output=int(m.output_size_in_bytes), alias=int(m.alias_size_in_bytes),
-                       code=int(m.generated_code_size_in_bytes))
-            for t in _OPEN:
-                if t.rec is not None:
-                    t.rec["compiles"].append(row)
-            _T["exe"][id(executable)] = (executable, row)
-        except Exception:                                      # noqa: BLE001
-            pass
-        return executable
-    compiler.compile_or_get_cached, _T["hooked"] = traced, True
-    pxla.ExecuteReplicated.__call__ = run
-    open(_trace_path(), "w").close()                  # this run's trace starts empty
-    import atexit
-    atexit.register(trace_dump)
-
-
-def _trace_path(path: str = "") -> str:
-    """``path`` (else LORRAX_MEMORY_TRACE), ``.p<i>`` on process i > 0."""
-    try:
-        import jax
-        index = jax.process_index()
-    except Exception:                                          # noqa: BLE001
-        index = 0
-    path = path or TRACE
-    return path if index == 0 else f"{path}.p{index}"
-
-
-def _append(record: dict, path: str = "") -> None:
-    import json
-    with open(_trace_path(path), "a") as out:
-        out.write(json.dumps(record, default=str) + "\n")
-
-
-def _trace(tracker: Tracker, event: str) -> None:
-    try:
-        if not _T["hooked"]:
-            _hook_compiles()
-        last = _T.get("last")
-        snap = last[1] if last and last[0] == _COST[0] else _snapshot()
-        _T["last"] = (_COST[0], snap)
-        if event == "open":
-            tracker.rec = dict(name=tracker.name, depth=len(_OPEN) - 1, open=snap, peak=snap,
-                               compiles=[], runs=[], t_open=time.time())
-        for t in ([tracker] if event == "close" else _OPEN):
-            if t.rec is not None and snap["live"] > t.rec["peak"]["live"]:
-                t.rec["peak"] = snap
-        if event == "close" and tracker.rec is not None:
-            price = tracker.price
-            tracker.rec.update(close=snap, t_close=time.time(), measured=tracker.whole,
-                               exact=tracker.exact, source=_I["source"],
-                               priced=None if price is None else price.terms(), run=dict(_RUN))
-            _T["sections"].append(tracker.rec)
-            _append(tracker.rec)
-    except Exception:                                          # noqa: BLE001
-        pass
-
-
-def trace_dump(path: str = "") -> Optional[str]:
-    """Append the run's figures and receipts to the trace (at exit; the sections are already
-    there).  ``path``: write the whole trace there instead."""
-    if not (path or TRACE) or not _T["sections"]:
-        return None
-    if path:
-        open(_trace_path(path), "w").close()
-        for rec in _T["sections"]:
-            _append(rec, path)
-    _append(dict(run=dict(_RUN), receipts=[{k: v for k, v in r.items() if k != "price"}
-                                           for r in receipts()]), path)
-    return _trace_path(path)
-
-
-def set_sink(sink=None) -> None:
-    """Route receipt, route and banner lines through the driver's report."""
-    _SINK[0] = sink
-
-
-def _say(text: str, *, local: bool = False) -> None:
-    if local or _rank0():
-        try:
-            (_SINK[0] or (lambda line: print(line, flush=True)))(text)
-        except Exception:                                      # noqa: BLE001
-            pass
-
-
-def _main() -> bool:
-    return threading.current_thread() is threading.main_thread()
+    devices = jax.local_devices()
+    if devices[0].platform == "cpu":
+        return sum(n * len(d) for n, d in map(_held, jax.live_arrays())) / (len(devices) if per_device else 1)
+    return float(max(int((d.memory_stats() or {}).get("bytes_in_use", 0)) for d in devices))
 
 
 def _sync() -> None:
@@ -392,133 +151,193 @@ def _sync() -> None:
             pass
 
 
+# --- the instrument: the allocator high-water per interval between section boundaries ------------
+def _setup() -> Optional[str]:
+    """The leg's ``peak_reader``: "pool" (CUDA mempool, read and reset), "bfc" (a mark that never
+    resets; polled in calibrate), else "live" (CPU live arrays)."""
+    if not _backend_up():
+        return None
+    import ctypes
+    import jax
+    device, leg = jax.local_devices()[0], _leg()
+    reader, _I["device"] = getattr(leg, "peak_reader", "live") if leg is not None else "live", device
+    if reader == "pool":
+        arrays = [a for a in jax.live_arrays() if a.nbytes and not a.is_deleted()
+                  and getattr(a.sharding, "memory_kind", None) in (None, "device")]
+        if not arrays:
+            return None                      # no live buffer yet: ask again next time
+        lib, handle = ctypes.CDLL("libcuda.so.1"), ctypes.c_void_p()
+        pointer = arrays[0].addressable_shards[0].data.unsafe_buffer_pointer()
+        if not lib.cuPointerGetAttribute(ctypes.byref(handle), 17, ctypes.c_uint64(pointer)) and handle.value:
+            _I.update(lib=lib, handle=handle, source="pool")
+            return "pool"
+        reader = "bfc"                        # no CUDA pool behind this allocator
+    stats = device.memory_stats() or {}
+    if reader != "bfc" or "peak_bytes_in_use" not in stats:
+        _I["source"] = "live" if device.platform == "cpu" else "none"
+        return _I["source"]
+    _I.update(source="bfc", mark=int(stats["peak_bytes_in_use"]), poll=int(stats.get("bytes_in_use", 0)))
+
+    def sample():
+        while True:
+            time.sleep(POLL_SECONDS)
+            try:
+                use = int((device.memory_stats() or {}).get("bytes_in_use", 0))
+            except Exception:                                  # noqa: BLE001
+                return
+            with _LOCK:
+                _I["poll"] = max(_I["poll"], use)
+    if CALIBRATE:
+        threading.Thread(target=sample, name="lorrax-memory-sampler", daemon=True).start()
+    return "bfc"
+
+
+def instrument() -> dict:
+    """The reader (``source``), and the boundary ``reads`` and ``seconds`` it has cost."""
+    return dict(source=_I["source"], reads=int(_I["reads"]), seconds=float(_I["s"]))
+
+
 def _reads_every_section() -> bool:
     return CALIBRATE or (_I["source"] or _setup()) in ("pool", "bfc")
 
 
 def boundary() -> Optional[int]:
-    """Close the current interval; its high-water goes to every open tracker."""
+    """Read the high-water since the last boundary: it goes to every open section (``whole``),
+    the innermost (``own``) and the innermost priced one (``metered``: it owns its interval)."""
     if not _main():
         return None
-    t0 = time.perf_counter()
+    t0, high, exact = time.perf_counter(), None, False
     try:
-        high, exact = _interval()
+        src = _I["source"] or _setup()
+        if src == "pool":
+            import ctypes
+            value = ctypes.c_uint64(0)        # CU_MEMPOOL_ATTR_USED_MEM_HIGH, read and reset
+            if not _I["lib"].cuMemPoolGetAttribute(_I["handle"], 8, ctypes.byref(value)):
+                high, exact, value.value = int(value.value), True, 0
+                _I["lib"].cuMemPoolSetAttribute(_I["handle"], 8, ctypes.byref(value))
+        elif src == "bfc":
+            stats = _I["device"].memory_stats() or {}
+            peak, use = int(stats.get("peak_bytes_in_use", 0)), int(stats.get("bytes_in_use", 0))
+            with _LOCK:
+                polled, _I["poll"] = max(_I["poll"], use), use
+            exact, _I["mark"] = peak > _I["mark"], max(peak, _I["mark"])
+            high = peak if exact else polled
+        elif src == "live":
+            live = int(_in_use(per_device=False))
+            high, _I["live"] = max(_I["live"], live), live
     except Exception:                                          # noqa: BLE001
         high, exact = None, False
-    _COST[0] += 1
-    _COST[1] += time.perf_counter() - t0
-    if high is not None:
+    _I["reads"], _I["s"] = _I["reads"] + 1, _I["s"] + time.perf_counter() - t0
+    if high is not None and _OPEN:
         for t in _OPEN:
-            t.whole = max(t.whole, high)
-        # An interval is metered by the innermost priced stage: a priced child owns its own.
-        owner = next((t for t in reversed(_OPEN) if t.mark0 is not None), None)
+            t["whole"] = max(t["whole"], high)
+        owner = next((t for t in reversed(_OPEN) if t["mark0"] is not None), None)
         if owner is not None:
-            owner.metered, owner.exact = max(owner.metered, high), owner.exact and exact
-        if _OPEN:
-            _OPEN[-1].own = max(_OPEN[-1].own, high)
+            owner["metered"], owner["exact"] = max(owner["metered"], high), owner["exact"] and exact
+        _OPEN[-1]["own"] = max(_OPEN[-1]["own"], high)
     if TRACE and _OPEN:
         _trace(_OPEN[-1], "boundary")
     return high
 
 
-def open_tracker(name: str, price: Optional[Price] = None) -> Optional[Tracker]:
-    """Open a tracker with the parts booked to ``name``; repeat its banner if it has one."""
+# --- sections and receipts (common.timing opens one per timing section) --------------------------
+def _meter(t: dict) -> None:
+    """Meter ``t`` from its first part on (after a wait in calibrate); settle its increments."""
+    if not _backend_up():
+        return
+    if t["mark0"] is None:
+        _sync()
+        boundary()
+        t.update(metered=-1, exact=CALIBRATE, mark0=_I["mark"])
+    resident = "resident at stage entry (allocator bytes in use)"
+    t["parts"] = {k: replace(p, increment=False, operands=Term(p.operands.at(p.ranks) + _in_use(), source=_join(
+        p.operands.source, resident))) if p.increment else p for k, p in t["parts"].items()}
+
+
+def open_tracker(name: str) -> Optional[dict]:
+    """Open section ``name`` with the parts booked to it; repeat its banner if it has one."""
     if not _main():
         return None
-    parts = _PENDING.pop(str(name), {})
-    if price is not None:
-        parts[price.label] = price
-    tracker = Tracker(name, parts)
-    if str(name) in _DOOMED:
-        _say(_DOOMED[str(name)])
-    if tracker.parts:
-        tracker.meter()
+    t = dict(name=str(name), parts=_PENDING.pop(str(name), {}), whole=-1, own=-1, metered=-1,
+             exact=True, mark0=None, rec=None)
+    if t["name"] in _DOOMED:
+        _say(_DOOMED[t["name"]])
+    if t["parts"]:
+        _meter(t)
     elif _backend_up() and _reads_every_section():
         boundary()
-    _OPEN.append(tracker)
+    _OPEN.append(t)
     if TRACE and _backend_up():
-        _trace(tracker, "open")
-    return tracker
+        _trace(t, "open")
+    return t
 
 
-def close_tracker(tracker: Optional[Tracker]) -> tuple:
-    """Close ``tracker``: (whole, own, exact); a priced one records its receipt."""
-    if tracker is None:
+def close_tracker(t: Optional[dict]) -> tuple:
+    """Close a section: (whole, own, exact); a priced one records and prints its receipt."""
+    if t is None:
         return -1, -1, False
-    if tracker.mark0 is not None:
+    metered = t["mark0"] is not None
+    if metered:
         _sync()
-    if tracker.mark0 is not None or _reads_every_section():
+    if metered or _reads_every_section():
         boundary()
-    if tracker in _OPEN:
-        _OPEN.remove(tracker)
-    if tracker.mark0 is not None and _I["source"] == "bfc" and CALIBRATE:
-        # First raise: a stage that lifted the never-resetting mark peaked at it exactly.
-        tracker.exact = _I["mark"] > tracker.mark0
-        tracker.metered = _I["mark"] if tracker.exact else tracker.metered
-    if tracker.mark0 is not None:          # the priced parent's first raise is past this child's
-        parent = next((t for t in reversed(_OPEN) if t.mark0 is not None), None)
-        if parent is not None:
-            parent.mark0 = max(parent.mark0, _I["mark"])
-    if TRACE and tracker.rec is not None:
-        _trace(tracker, "close")
-    if tracker.parts:
-        _receipt(tracker)
-    return tracker.whole, tracker.own, tracker.exact
+    _OPEN[:] = [o for o in _OPEN if o is not t]
+    if metered:
+        if _I["source"] == "bfc" and CALIBRATE:      # it lifted the mark: its peak, exactly
+            t["exact"] = _I["mark"] > t["mark0"]
+            t["metered"] = _I["mark"] if t["exact"] else t["metered"]
+        parent = next((o for o in reversed(_OPEN) if o["mark0"] is not None), None)
+        if parent is not None:                       # the parent's first raise is past this one's
+            parent["mark0"] = max(parent["mark0"], _I["mark"])
+    if TRACE and t["rec"] is not None:
+        _trace(t, "close")
+    if t["parts"]:
+        price, src = sum(t["parts"].values(), Price()), _I["source"] or "none"
+        row = _RECEIPTS.setdefault(t["name"], dict(stage=t["name"], count=0, priced=0.0,
+                                                   measured=-1.0, exact=True, price=price, source=src))
+        row["count"] += 1
+        say = row["count"] == 1 or t["metered"] > row["measured"] or price.bytes() > row["priced"]
+        if price.bytes() >= row["priced"]:
+            row["priced"], row["price"] = price.bytes(), price
+        if t["metered"] > row["measured"]:
+            row["measured"], row["exact"] = float(t["metered"]), t["exact"]
+        if say:
+            _say(receipt_line(t["name"], price, t["metered"], t["exact"], src))
+    return t["whole"], t["own"], t["exact"]
 
 
 def book(price: Price, stage: Optional[str] = None) -> None:
-    """Book ``price`` as one part of ``stage`` (its open tracker, innermost; else the next to
-    open; ``None``: the innermost open tracker).  A stage's price is the sum of its parts;
-    a part booked again under the same label keeps the larger."""
+    """Book ``price`` as a part of ``stage``: its innermost open section, else the next to open
+    under that name (``None``: the innermost open section).  A stage's price is the sum of its
+    parts; a part booked again under its label keeps the larger."""
     if not isinstance(price, Price):
         raise TypeError(f"memory.book takes a memory.Price, got {type(price).__name__}")
     if STRICT and price.unsourced():
         _FINDINGS.append(f"no provenance: {stage or price.label}: {', '.join(price.unsourced())}")
-    target = None
-    if _main():
-        target = (_OPEN[-1] if _OPEN else None) if stage is None else next(
-            (t for t in reversed(_OPEN) if t.name == stage), None)
-    parts = target.parts if target is not None else _PENDING.setdefault(
-        str(stage if stage is not None else price.label), {})
-    old = parts.get(price.label)
-    if old is None or price.bytes() > old.bytes():
+    target = None if not _main() else (_OPEN[-1] if _OPEN else None) if stage is None else next(
+        (t for t in reversed(_OPEN) if t["name"] == stage), None)
+    key = target["name"] if target is not None else str(stage if stage is not None else price.label)
+    parts = target["parts"] if target is not None else _PENDING.setdefault(key, {})
+    if price.label not in parts or price.bytes() > parts[price.label].bytes():
         parts[price.label] = price
-    key = target.name if target is not None else str(stage or price.label)
     _PLANNED.setdefault(key, {})["parts"] = dict(parts)
     if target is not None:
-        target.meter()
+        _meter(target)
     elif stage is None:
-        _PENDING.pop(price.label, None)      # no section open (a planning replay): sizing only
+        _PENDING.pop(key, None)              # no section open (a planning replay): sizing only
 
 
 def receipt_line(name: str, price: Price, measured: float, exact: bool, src: str) -> str:
     """``memory <stage>: priced P (terms) | measured M | γ g``."""
-    total = price.bytes()
+    total, head = price.bytes(), f"memory {name}: priced {_gb(price.bytes())} ({price.describe()})"
     if measured is None or measured < 0:
-        meas, gamma = "not measured", "–"
-    else:
-        mark = "" if exact else ({"bfc": ">=", "live": "live "}.get(src, "~") if CALIBRATE
-                                 else "~")
-        meas, gamma = f"{mark}{_gb(measured)}", (f"{measured / total:.2f}" if total else "–")
-    return f"memory {name}: priced {_gb(total)} ({price.describe()}) | measured {meas} | γ {gamma}"
-
-
-def _receipt(t: Tracker) -> None:
-    src, price = _I["source"] or "none", t.price
-    row = _RECEIPTS.setdefault(t.name, dict(stage=t.name, count=0, priced=0.0, measured=-1.0,
-                                            exact=True, price=price, source=src))
-    first, row["count"] = row["count"] == 0, row["count"] + 1
-    rise = t.metered > row["measured"] or price.bytes() > row["priced"]
-    if price.bytes() >= row["priced"]:
-        row["priced"], row["price"] = price.bytes(), price
-    if t.metered > row["measured"]:
-        row["measured"], row["exact"] = float(t.metered), t.exact
-    if first or rise:
-        _say(receipt_line(t.name, price, t.metered, t.exact, src))
+        return head + " | measured not measured | γ –"
+    mark = "" if exact else ({"bfc": ">=", "live": "live "}.get(src, "~") if CALIBRATE else "~")
+    return head + f" | measured {mark}{_gb(measured)} | γ " + (f"{measured / total:.2f}" if total else "–")
 
 
 def receipts() -> list:
-    """The receipt rows (max over calls; the report's gather adds ``measured_ranks``)."""
+    """The receipt rows (max over calls; ``common.timing``'s gather adds ``measured_ranks``)."""
     return list(_RECEIPTS.values())
 
 
@@ -527,70 +346,164 @@ def findings() -> list:
     return list(_FINDINGS) + [f"never opened: {name}" for name in _PENDING]
 
 
-# ---------------------------------------------------------------------------
-# Vendor workspace: the leg's MEASURED row in its range (no query at trace time)
-# ---------------------------------------------------------------------------
-def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int,
-           unit: Optional[float] = None) -> Term:
-    """The vendor workspace per rank: ``leg``'s measured row (GATE outside it under STRICT)."""
+# --- the trace (LORRAX_MEMORY_TRACE): what is live, what the allocator holds, what runs ----------
+def _snapshot() -> dict:
+    """Live arrays grouped by (shape, dtype, sharding, creating section), bytes per device."""
+    import jax
+    groups, per_device, born, alive = {}, {}, _T["born"], set()
+    for a in jax.live_arrays():
+        alive.add(id(a))
+        born.setdefault(id(a), _OPEN[-1]["name"] if _OPEN else "(top level)")
+        nbytes, held = _held(a)
+        for device in held:
+            per_device[device.id] = per_device.get(device.id, 0) + nbytes
+        spec = str(getattr(a.sharding, "spec", type(a.sharding).__name__))
+        groups.setdefault((tuple(a.shape), str(a.dtype), spec, born[id(a)]), [0, nbytes])[0] += 1
+    for gone in set(born) - alive:
+        del born[gone]
+    stats = [d.memory_stats() or {} for d in jax.local_devices()]
+    return dict(live=max(per_device.values(), default=0),
+                in_use=max(int(st.get("bytes_in_use", 0)) for st in stats),
+                peak=max(int(st.get("peak_bytes_in_use", 0)) for st in stats),
+                arrays=[dict(shape=list(k[0]), dtype=k[1], spec=k[2], born=k[3], count=v[0], bytes_per_device=v[1])
+                        for k, v in sorted(groups.items(), key=lambda kv: -kv[1][0] * kv[1][1])])
+
+
+def _append(record: Optional[dict]) -> None:
+    """Append ``record`` to this process's trace (``.p<i>`` on process i > 0); None: truncate."""
+    import json
+
+    import jax
+    path = TRACE if jax.process_index() == 0 else f"{TRACE}.p{jax.process_index()}"
+    with open(path, "a" if record else "w") as out:
+        out.write(json.dumps(record, default=str) + "\n" if record else "")
+
+
+def _start_trace() -> None:
+    """Credit each executable's compiled figures to the sections open when it runs; at exit,
+    append the run's figures and receipts (sections are appended as they close)."""
+    import atexit
+    from jax._src.interpreters import pxla
+    execute, names = pxla.ExecuteReplicated.__call__, ("temp", "argument", "output", "alias", "generated_code")
+
+    def run(self, *args):
+        try:
+            exe = self.xla_executable
+            if id(exe) not in _T["exe"]:
+                m = exe.get_compiled_memory_stats()
+                _T["exe"][id(exe)] = (exe, dict(program=str(self.name), **{
+                    n.replace("generated_", ""): int(getattr(m, f"{n}_size_in_bytes")) for n in names}))
+            row = _T["exe"][id(exe)][1]
+            for t in _OPEN:
+                if t["rec"] is not None and not any(r is row for r in t["rec"]["runs"]):
+                    t["rec"]["runs"].append(row)
+        except Exception:                                      # noqa: BLE001
+            pass
+        return execute(self, *args)
+    pxla.ExecuteReplicated.__call__ = run
+    _append(None)
+    atexit.register(lambda: _T["wrote"] and _append(dict(run=dict(_RUN), receipts=[
+        {k: v for k, v in r.items() if k != "price"} for r in receipts()])))
+    _T["on"] = True
+
+
+def _trace(t: dict, event: str) -> None:
+    try:
+        if not _T["on"]:
+            _start_trace()
+        last = _T["last"]
+        snap = last[1] if last and last[0] == _I["reads"] else _snapshot()
+        _T["last"] = (_I["reads"], snap)
+        if event == "open":
+            t["rec"] = dict(name=t["name"], depth=len(_OPEN) - 1, open=snap, peak=snap, runs=[], t_open=time.time())
+        for o in ([t] if event == "close" else _OPEN):
+            if o["rec"] is not None and snap["live"] > o["rec"]["peak"]["live"]:
+                o["rec"]["peak"] = snap
+        if event == "close" and t["rec"] is not None:
+            price = sum(t["parts"].values(), Price()) if t["parts"] else None
+            t["rec"].update(close=snap, t_close=time.time(), measured=t["whole"], exact=t["exact"],
+                            source=_I["source"], priced=price and price.terms(), run=dict(_RUN))
+            _append(t["rec"])
+            _T["wrote"] = True
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+# --- lines and warnings ----------------------------------------------------------------------------
+def set_sink(sink=None) -> None:
+    """Route receipt, route and banner lines through the driver's report."""
+    _HOOK["sink"] = sink
+
+
+def _say(text: str, *, local: bool = False) -> None:
+    try:
+        (local or _rank0()) and (_HOOK["sink"] or (lambda line: print(line, flush=True)))(text)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def _warn(stage: str, need: float, message: str, *, local: bool) -> None:
+    """A RuntimeWarning once per stage kind (``.N``/``:N`` dropped), again only if it grows."""
+    import sys
+    import warnings
+    kind = re.sub(r"([.:]\d+)+$", "", str(stage))
+    if need > _WARNED.get(kind, -1.0):
+        _WARNED[kind] = need
+        if _rank0():
+            warnings.warn(message, RuntimeWarning, stacklevel=3)
+        elif local:
+            print("WARNING: " + message, file=sys.stderr, flush=True)
+
+
+def vendor(leg, lib: str, op: str, n: int, ranks: int, itemsize: int, unit: Optional[float] = None) -> Term:
+    """A vendor workspace with no size query: ``leg``'s MEASURED row within its stated n and P
+    range; outside it, or with no row, :func:`unpriced` (extrapolated, or priced 0)."""
     row = dict(leg.vendor_rows).get((lib, op))
-    where = (f"no measured row for {leg.key}/{lib}/{op}" if row is None else
+    where = (f"no measured row for {leg.key}/{lib}/{op}" if row is None else None
+             if row.n[0] <= n <= row.n[1] and row.p[0] <= ranks <= row.p[1] else
              f"{leg.key}/{lib}/{op} at n {int(n)}, P {int(ranks)} outside the measured "
              f"n {row.n[0]}-{row.n[1]}, P {row.p[0]}-{row.p[1]}")
-    if row is not None and row.n[0] <= n <= row.n[1] and row.p[0] <= ranks <= row.p[1]:
-        where = None
     if where:
         unpriced(where, "priced 0" if row is None else "extrapolated")
     if row is None:
         return Term(0.0, source=f"UNPRICED {leg.key}/{lib}/{op}")
     nbytes = row.ratio * (row.unit(int(n), int(ranks), int(itemsize)) if unit is None else unit)
-    return Term(nbytes, source=("EXTRAPOLATED " if where else "")
-                + f"{row.ratio:g} x {row.unit_name} ({row.source})")
+    return Term(nbytes, source=("EXTRAPOLATED " if where else "") + f"{row.ratio:g} x {row.unit_name} ({row.source})")
 
 
 def unpriced(what: str, then: str = "priced 0") -> None:
-    """A figure no compile, query or measurement gives here: GATE memory_unpriced under STRICT,
-    else one warning per kind."""
+    """A figure no compile, query or measurement gives: GATE memory_unpriced under STRICT, else
+    one warning per kind."""
     if STRICT:
         raise RuntimeError(f"GATE memory_unpriced: got: {what}; want: a compiled figure, a "
                            "library query or a measurement there")
     _warn(f"unpriced {what.split(' ')[0]}", 0.0, f"memory: {what}; {then}", local=False)
 
 
-# ---------------------------------------------------------------------------
-# Limit, budget, room
-# ---------------------------------------------------------------------------
-_RUN: dict = {}
-_AGREE: list = [None]
-
-
-def outside_allowance(leg, linalg: str = "local") -> float:
+# --- limit, budget, room ---------------------------------------------------------------------------
+def _outside(leg, linalg: str = "local") -> float:
     """Bytes outside the allocator: the leg's row, plus its providers' contexts if distributed."""
-    return float(leg.outside_allowance) + (float(leg.distributed_context[0])
-                                           if linalg == "distributed" else 0.0)
+    return float(leg.outside_allowance) + (float(leg.distributed_context[0]) if linalg == "distributed" else 0.0)
 
 
 def pool_reservation(total: float, leg) -> float:
     """The pool reserved before the deck: the card less the distributed allowance, >= half."""
-    return max(float(total) - outside_allowance(leg, "distributed"), 0.5 * float(total))
+    return max(float(total) - _outside(leg, "distributed"), 0.5 * float(total))
 
 
 def contexts() -> Term:
-    """The providers' contexts a route opens, where the budget did not withhold them (local)."""
-    leg = _leg()
-    size, src = getattr(leg, "distributed_context", (0.0, ""))
+    """The providers' contexts a route opens where the budget did not withhold them (local)."""
+    size, src = getattr(_leg(), "distributed_context", (0.0, ""))
     return Term(size if _RUN.get("linalg", "local") == "local" else 0.0, source=src)
 
 
 def _agree(value: float) -> float:
     """The minimum over processes, through :func:`resolve`'s ``agree`` collective."""
-    if _AGREE[0] is not None:
-        return float(_AGREE[0](float(value)))
     import jax
-    if jax.process_count() > 1:
+    if _HOOK["agree"] is None and jax.process_count() > 1:
         raise RuntimeError("memory: several processes and no agreement collective; resolve the "
                            "budget through common.gpu_utils.resolve_device_budget_gb")
-    return float(value)
+    return float(_HOOK["agree"](float(value)) if _HOOK["agree"] else value)
 
 
 def enforced(stats) -> bool:
@@ -602,33 +515,30 @@ def enforced(stats) -> bool:
 def resolve(deck_bytes: float = 0.0, linalg: str = "local", *, total: Optional[float] = None,
             outside: Optional[float] = None, agree: Optional[Callable] = None) -> float:
     """THE run budget per device (every process enters): limit = an enforced ``bytes_limit``,
-    else ``total`` less what is ``outside`` (>= the leg's allowance), CPU the host share;
-    budget = (limit - pending contexts) x (1 - reserve) - T_ord, minimum over processes
-    (``agree``), never above a positive deck value."""
+    else ``total`` less what is ``outside`` (>= the leg's allowance), CPU the host share; budget
+    = (limit - pending contexts) x (1 - reserve) - T_ord, the minimum over processes (``agree``),
+    never above a positive deck value."""
     import jax
     from lxkit import ordered_transient_bytes
-    _AGREE[0] = agree
-    leg = _leg()
-    stats = jax.local_devices()[0].memory_stats() or {}
+    _HOOK["agree"] = agree
+    leg, device = _leg(), jax.local_devices()[0]
+    stats = device.memory_stats() or {}
     if leg is None or not leg.accelerator:
-        lim, pending_out = float(total or 0.0) / max(1, jax.local_device_count()), 0.0
+        lim, pending = float(total or 0.0) / max(1, jax.local_device_count()), 0.0
     elif enforced(stats) or not total:
-        lim, pending_out = float(stats.get("bytes_limit", 0)), 0.0
+        lim, pending = float(stats.get("bytes_limit", 0)), 0.0
     else:
-        lim = float(total) - max(float(outside or 0.0), outside_allowance(leg))
-        pending_out = outside_allowance(leg, linalg) - outside_allowance(leg)
-    rule = (lim - pending_out) * (1.0 - float(getattr(leg, "memory_reserve", 0.0)))
-    lim, rule = _agree(lim), _agree(max(0.0, rule - float(ordered_transient_bytes())))
-    deck = float(deck_bytes or 0.0)
+        lim = float(total) - max(float(outside or 0.0), _outside(leg))
+        pending = _outside(leg, linalg) - _outside(leg)
+    rule = (lim - pending) * (1.0 - float(getattr(leg, "memory_reserve", 0.0)))
+    lim, rule, deck = _agree(lim), _agree(max(0.0, rule - float(ordered_transient_bytes()))), float(deck_bytes or 0)
     if deck > rule and _rank0():
         import warnings
-        warnings.warn(f"memory_per_device_gb = {deck / 1e9:g} exceeds the memory model's "
-                      f"{rule / 1e9:.2f} GB on this card (linalg = {linalg}); running at "
-                      f"{rule / 1e9:.2f} GB", RuntimeWarning, stacklevel=2)
+        warnings.warn(f"memory_per_device_gb = {deck / 1e9:g} exceeds the memory model's {rule / 1e9:.2f} GB on "
+                      f"this card (linalg = {linalg}); running at {rule / 1e9:.2f} GB", RuntimeWarning, stacklevel=2)
     reset()
     set_budget(min(deck, rule) if deck > 0 else rule, limit_bytes=lim, linalg=linalg,
-               per_node=int(getattr(leg, "node_devices", 1)),
-               platform=str(getattr(jax.local_devices()[0], "device_kind", "") or "cpu"))
+               per_node=int(getattr(leg, "node_devices", 1)), platform=str(getattr(device, "device_kind", "") or "cpu"))
     return float(_RUN["budget"])
 
 
@@ -641,28 +551,15 @@ def set_budget(budget: float, *, limit_bytes: Optional[float] = None, per_node: 
                 linalg=str(linalg), per_node=int(per_node), platform=str(platform))
 
 
-def budget() -> float:
-    """The run's per-device planning budget in bytes (``common.gpu_utils`` resolves it)."""
-    return float(_RUN["budget"])
-
-
 def run() -> dict:
-    """The run's figures (empty before :func:`resolve`)."""
+    """The run's figures (empty before :func:`resolve`): limit, budget (the planning budget per
+    device), reserve, linalg, per_node, platform, nmu."""
     return dict(_RUN)
 
 
-def in_use() -> float:
-    """Allocator bytes in use, max over this process's devices (CPU: live arrays per device)."""
-    import jax
-    devices = jax.local_devices()
-    if devices[0].platform == "cpu":
-        return _live_bytes() / len(devices)
-    return float(max(int((d.memory_stats() or {}).get("bytes_in_use", 0)) for d in devices))
-
-
-def room(stage: str = "", *, bucketed: bool = True) -> int:
-    """budget - bytes in use, the minimum over processes, bucketed (every process enters)."""
-    left = int(_agree(max(0.0, budget() - in_use())))
+def room(*, bucketed: bool = True) -> int:
+    """limit - reserve - bytes in use, the minimum over processes (all enter), :func:`bucket`-ed."""
+    left = int(_agree(max(0.0, float(_RUN["budget"]) - _in_use())))
     return bucket(left) if bucketed else left
 
 
@@ -672,15 +569,7 @@ def bucket(value) -> int:
     return (value >> 30) << 30 if value >= 1 << 30 else max(value, 0)
 
 
-# ---------------------------------------------------------------------------
-# Admission: the one policy point (owner 2026-10-19), and the sizing estimate
-# ---------------------------------------------------------------------------
-_ROUTES: dict = {}
-_PLANNED: dict = {}      # stage -> {"routes": ((name, Price), ...), "limit": bytes, "parts": {...}}
-_DOOMED: dict = {}       # stage -> banner, repeated when it opens
-_WARNED: dict = {}
-
-
+# --- admission: the one policy point (owner 2026-10-19), route completeness, sizing ----------------
 def record_route(site, route, reason, *, warning=None) -> None:
     """Record one route decision; rank 0 prints it the first time."""
     key = (str(site), str(route), str(reason))
@@ -688,8 +577,7 @@ def record_route(site, route, reason, *, warning=None) -> None:
         _ROUTES[key]["count"] += 1
         return
     line = f"route {site}: {route} ({reason})" + (f"; WARNING {warning}" if warning else "")
-    _ROUTES[key] = dict(site=str(site), route=str(route), reason=str(reason),
-                        warning=warning, line=line, count=1)
+    _ROUTES[key] = dict(site=key[0], route=key[1], reason=key[2], warning=warning, line=line, count=1)
     _say(("  WARNING: " if warning else "  ") + line)
 
 
@@ -697,159 +585,119 @@ def routes() -> list:
     return [dict(row) for row in _ROUTES.values()]
 
 
-def admit(stage: str, routes, room_bytes: float, *, probe=None, forced=None, quiet: bool = False,
-          runs_in: Optional[str] = None, local: bool = False, device: bool = True,
-          detail: bool = False):
-    """THE admission policy (owner 2026-10-19).  ``routes``: ``(name, Price | callable[, room])``
-    fastest first, each against its room (default the rank-invariant ``room_bytes``).
-    1. The fastest route that fits.  2. None fits and the cheapest is over the physical limit
-    (room + reserve): a banner now and when its stage (``runs_in``, else the open one) opens,
-    with the minimum process count; it runs, never raises.  3. Otherwise one warning; it runs.
-    ``device=False`` (a host share, a tile cap): never a banner, not in :func:`sizing`.
-    ``probe()`` raising drops the later routes; ``forced``: a deck-named route; ``quiet``: the
-    caller records it; ``local``: warned on its rank.  Returns the name (``detail``: a dict)."""
+def admit(stage: str, routes, room_bytes: float, *, probe=None, runs_in: Optional[str] = None,
+          local: bool = False, device: bool = True, detail: bool = False):
+    """THE admission policy.  ``routes``: ``(name, Price | callable[, room])`` fastest first, each
+    against its room (default ``room_bytes``, the same on every rank).  1. The fastest route that
+    fits runs.  2. None fits and the cheapest is over the physical limit (room + reserve): a
+    banner with the shortfall and the minimum P, now and when its stage (``runs_in``, else the
+    open one) opens; it runs.  3. Otherwise one warning; it runs.  ``device=False`` (a host
+    share, a tile cap): no banner, not in :func:`sizing`.  ``probe()`` raising drops the later
+    routes; ``local``: warned on its rank.  Returns the route, or with ``detail`` an unrecorded
+    dict(route, reason, warning) the caller records."""
     routes = (("chosen", routes),) if isinstance(routes, Price) else tuple(routes)
-    key = str(runs_in or (_OPEN[-1].name if _OPEN and _main() else stage))
-
-    def record(route, reason, warning=None):
-        if not quiet and len(routes) > 1:
-            record_route(stage, route, reason, warning=warning)
-        return dict(route=route, reason=reason, warning=warning) if detail else route
-    if forced is not None:
-        return record(forced, "named")
-    if device:
-        priced_routes = [p for _, p, *rest in routes if isinstance(p, Price)]
-        if any(p.whole for p in priced_routes):
-            require_backup(stage, [p.whole for p in priced_routes],
-                           any(not p.whole for p in priced_routes) or len(priced_routes) < len(routes))
-    done = []                    # (name, price, room)
+    key, reserve = str(runs_in or (_OPEN[-1]["name"] if _OPEN and _main() else stage)), _RUN.get("reserve", 0.0)
+    known = [p for _, p, *_ in routes if isinstance(p, Price)]
+    if device and any(p.whole for p in known):
+        require_backup(stage, [p.whole for p in known], any(not p.whole for p in known) or len(known) < len(routes))
+    done, warning = [], None                     # (name, price, room) tried, in order
     for i, (name, price, *own) in enumerate(routes):
-        room = float(own[0] if own else room_bytes)
         if i == 1 and probe is not None:
             try:
                 probe()
             except Exception as exc:                           # noqa: BLE001
-                return record(routes[0][0], f"{_gb(done[0][1].bytes())}/rank over room "
-                              f"{_gb(done[0][2])}", warning=f"the {name} route is unavailable "
-                              f"here ({type(exc).__name__}: {exc})")
-        done.append((name, price() if callable(price) else price, room))
+                warning = f"the {name} route is unavailable here ({type(exc).__name__}: {exc})"
+                break
+        done.append((name, price() if callable(price) else price, float(own[0] if own else room_bytes)))
         if STRICT and done[-1][1].unsourced():
             _FINDINGS.append(f"no provenance: {stage} ({name}): {', '.join(done[-1][1].unsourced())}")
         if device:
-            _PLANNED.setdefault(key, {}).update(routes=tuple(d[:2] for d in done),
-                                                limit=room + _RUN.get("reserve", 0.0))
-        if done[-1][1].bytes() <= room:
-            return record(name, "".join(f"{n} {_gb(p.bytes())}/rank over room {_gb(r)}; "
-                                        for n, p, r in done[:-1])
-                          + f"{_gb(done[-1][1].bytes())}/rank of room {_gb(room)}")
-    name, price, room = min(done, key=lambda item: item[1].bytes() - item[2])
-    physical = room + _RUN.get("reserve", 0.0) if device else float("inf")
-    reason = "; ".join(f"{n} {_gb(p.bytes())}/rank over room {_gb(r)}" for n, p, r in done)
-    if price.bytes() <= physical:
-        _warn(stage, price.bytes(), f"memory over budget at {stage}: {name} needs "
-              f"{_gb(price.bytes())}/rank, room {_gb(room)}/rank"
-              + (f", within the allocator limit {_gb(physical)}" if device else "")
-              + "; continuing (an OOM is possible)", local=local)
-        return record(name, reason, warning="no route fits the planning room")
-    line, rule = sizing()["line"], "!" * 78
-    _DOOMED[key] = "\n".join([
-        rule, f"!! MEMORY: {stage} is PRICED OVER the allocator limit. It runs anyway.",
-        f"!!   {name}: priced {_gb(price.bytes())}/rank ({price.describe()})",
-        f"!!   allocator limit beside what is live {_gb(physical)}; short by "
-        f"{_gb(price.bytes() - physical)}", "!!   " + line, rule])
-    _say(_DOOMED[key], local=local)
-    _warn(stage, price.bytes(), f"memory: {stage} priced over the limit ({name} "
-          f"{_gb(price.bytes())}/rank over {_gb(physical)}); {line}", local=local)
-    return record(name, reason, warning="priced over the allocator limit")
-
-
-#: ``LORRAX_NMU2_BACKUP=report``: a stage with no distributed backup is listed (``findings``),
-#: not refused (the census and the traced calibration runs).
-NMU2_REPORT = os.environ.get("LORRAX_NMU2_BACKUP", "") == "report"
+            _PLANNED.setdefault(key, {}).update(routes=tuple(d[:2] for d in done), limit=done[-1][2] + reserve)
+        if done[-1][1].bytes() <= done[-1][2]:
+            break
+    fits = done[-1][1].bytes() <= done[-1][2]
+    name, price, have = done[-1] if fits or warning else min(done, key=lambda d: d[1].bytes() - d[2])
+    need, limit = price.bytes(), have + reserve if device else float("inf")
+    reason = "; ".join(f"{_gb(p.bytes())}/rank of room {_gb(r)}" if p.bytes() <= r else
+                       f"{n} {_gb(p.bytes())}/rank over room {_gb(r)}" for n, p, r in done)
+    if not (fits or warning) and need <= limit:
+        warning = "no route fits the planning room"
+        _warn(stage, need, f"memory over budget at {stage}: {name} needs {_gb(need)}/rank, room {_gb(have)}/rank"
+              + (f", within the allocator limit {_gb(limit)}" if device else "") + "; continuing (an OOM is "
+              "possible)", local=local)
+    elif not (fits or warning):
+        warning, line, bar = "priced over the allocator limit", sizing()["line"], "!" * 78
+        _DOOMED[key] = "\n".join([bar, f"!! MEMORY: {stage} is PRICED OVER the allocator limit. It runs anyway.",
+                                  f"!!   {name}: priced {_gb(need)}/rank ({price.describe()})", "!!   allocator "
+                                  f"limit beside what is live {_gb(limit)}; short by {_gb(need - limit)}",
+                                  "!!   " + line, bar])
+        _say(_DOOMED[key], local=local)
+        _warn(stage, need, f"memory: {stage} priced over the limit ({name} {_gb(need)}/rank over {_gb(limit)}); "
+              f"{line}", local=local)
+    if detail:
+        return dict(route=name, reason=reason, warning=warning)
+    if len(routes) > 1:
+        record_route(stage, name, reason, warning=warning)
+    return name
 
 
 def set_nmu(n: int) -> None:
-    """The run's N_mu: a whole matrix with a side >= N_mu / 2 (N_mu^2 and the pencil and
-    gathered sides derived from it) needs a distributed backup (:func:`require_backup`)."""
+    """The run's N_mu: a whole matrix with a side >= N_mu / 2 needs a distributed backup."""
     _RUN["nmu"] = int(n)
 
 
 def require_backup(stage: str, wholes, distributed: bool) -> None:
     """Route completeness (owner): a stage whose candidates hold an N_mu-scale matrix whole on a
-    rank (``wholes``: each candidate's largest whole side) must have a distributed candidate;
-    the router picks between them.  None: GATE nmu2_no_backup (``NMU2_REPORT``: a finding)."""
+    rank (``wholes``: each one's largest whole side) needs a distributed candidate; with none,
+    GATE nmu2_no_backup (``NMU2_REPORT``: a finding)."""
     import jax
     nmu = int(_RUN.get("nmu", 0))
-    big = [int(w) for w in wholes if nmu and int(w) * 2 >= nmu]
+    big = max([int(w) for w in wholes if nmu and int(w) * 2 >= nmu], default=0)
     if not big or distributed or jax.device_count() < 2:
         return
-    what = (f"GATE nmu2_no_backup: got: {stage} holds a whole {max(big)} x {max(big)} matrix on a "
-            f"rank (N_mu {nmu}) with no distributed candidate; want: a mesh route beside it")
+    what = (f"GATE nmu2_no_backup: got: {stage} holds a whole {big} x {big} matrix on a rank (N_mu {nmu}) "
+            "with no distributed candidate; want: a mesh route beside it")
     if not NMU2_REPORT:
         raise RuntimeError(what)
-    if what not in _FINDINGS:
-        _FINDINGS.append(what)
-
-
-def _warn(stage: str, need: float, message: str, *, local: bool) -> None:
-    """A RuntimeWarning once per stage kind (``.N``/``:N`` dropped), again only if it grows."""
-    import sys
-    import warnings
-    kind = re.sub(r"([.:]\d+)+$", "", str(stage))
-    if need <= _WARNED.get(kind, -1.0):
-        return
-    _WARNED[kind] = need
-    if _rank0():
-        warnings.warn(message, RuntimeWarning, stacklevel=3)
-    elif local:
-        print("WARNING: " + message, file=sys.stderr, flush=True)
-
-
-def legal_ranks(largest: int = 4096) -> list:
-    """Every count the mesh builder takes: p x p (``collectives.resolve_mesh``), any nodes."""
-    return [p * p for p in range(1, math.isqrt(largest) + 1)]
+    _FINDINGS.extend([what] if what not in _FINDINGS else [])
 
 
 def sizing(stages: Optional[dict] = None, *, limit_bytes: Optional[float] = None,
            per_node: Optional[int] = None, platform: Optional[str] = None) -> dict:
-    """The smallest legal P at which every device stage fits: its price the larger of its best
-    admitted route and its booked parts, its limit the admission's (else the run's);
-    ``binding`` the least headroom there.  ``stages``: ``{stage: ((route, Price), ...)}``."""
-    run_lim = float(_RUN.get("limit", 0.0) if limit_bytes is None else limit_bytes)
+    """The smallest square P (``collectives.resolve_mesh``) at which every device stage fits (its
+    best admitted route, at least its booked parts, against its admission's limit, else the
+    run's); ``binding``: the least headroom there; nodes = ceil(P / devices per node).
+    ``stages``: ``{stage: ((route, Price), ...)}`` instead of this run's plans."""
     plans = _PLANNED if stages is None else {k: dict(routes=v) for k, v in stages.items()}
-    per = max(1, int(_RUN.get("per_node", 1) if per_node is None else per_node))
-    plat = _RUN.get("platform", "this platform") if platform is None else platform
+    run_lim = float(_RUN.get("limit", 0.0) if limit_bytes is None else limit_bytes)
     limit = {k: float(v.get("limit", run_lim)) for k, v in plans.items()}
 
-    def need(k, p):
-        plan = plans[k]
-        best = min((pr.bytes(p) for _, pr in plan.get("routes", ())), default=0.0)
-        return max(best, sum(pr.bytes(p) for pr in plan.get("parts", {}).values()))
-    grid = legal_ranks()
-    if not plans:
-        return dict(p=None, nodes=None, binding=None, line="minimum to complete: no priced stage")
-    for k in (k for k in plans if need(k, grid[-1]) > limit[k]):
-        price = sum(plans[k].get("parts", {}).values(), Price()) + min(
-            (pr for _, pr in plans[k].get("routes", ())), default=Price(),
-            key=lambda pr: pr.bytes(grid[-1]))
-        term = getattr(price, max(TERMS, key=lambda n: getattr(price, n).fixed))
-        return dict(p=None, nodes=None, binding=k, line=(
-            f"minimum to complete: no P suffices: {k} holds {_gb(term.fixed)}/rank of "
-            f"{max(TERMS, key=lambda n: getattr(price, n).fixed)} that no mesh divides "
-            f"({term.source}) against the {_gb(limit[k])} limit"))
-    for p in grid:
-        if all(need(k, p) <= limit[k] for k in plans):
-            nodes = -(-p // per)
-            binding = max(plans, key=lambda k: need(k, p) / limit[k], default=None)
-            return dict(p=p, nodes=nodes, binding=binding, line=(
-                f"minimum to complete: P = {p} ({nodes} node{'s' * (nodes != 1)} of {plat})"
-                + (f"; binding stage {binding}" if binding else "")))
+    def price(k, p):             # the booked parts beside the cheapest admitted route at P
+        v = plans[k]
+        return sum(v.get("parts", {}).values(), Price()) + min(
+            (x for _, x in v.get("routes", ())), default=Price(), key=lambda x: x.bytes(p))
+
+    def need(k, p):              # the larger of the cheapest route and the parts (parts often hold it)
+        v = plans[k]
+        return max(min((x.bytes(p) for _, x in v.get("routes", ())), default=0.0),
+                   sum(x.bytes(p) for x in v.get("parts", {}).values()))
+    short = lambda p: [k for k in plans if need(k, p) > limit[k]] or None
+    p = next((p * p for p in range(1, 65) if not short(p * p)), None)
+    if not plans or p is None:
+        k = (short(4096) or [None])[0]
+        n = k and max(TERMS, key=lambda n: getattr(price(k, 4096), n).fixed)
+        return dict(p=None, nodes=None, binding=k, line="minimum to complete: no priced stage" if not plans else
+                    f"minimum to complete: no P suffices: {k} holds {_gb(getattr(price(k, 4096), n).fixed)}/rank "
+                    f"of {n} that no mesh divides ({getattr(price(k, 4096), n).source}) against the "
+                    f"{_gb(limit[k])} limit")
+    nodes = -(-p // max(1, int(_RUN.get("per_node", 1) if per_node is None else per_node)))
+    binding = max(plans, key=lambda k: need(k, p) / limit[k])
+    return dict(p=p, nodes=nodes, binding=binding, line=f"minimum to complete: P = {p} ({nodes} node"
+                f"{'s' * (nodes != 1)} of {_RUN.get('platform', 'this platform') if platform is None else platform})"
+                f"; binding stage {binding}")
 
 
 def reset(*, run: bool = False) -> None:
-    """Forget receipts, bookings, routes and plans (a new run in the same process); ``run``:
-    the run's figures too."""
-    _T["sections"].clear()
-    for table in (_RECEIPTS, _PENDING, _ROUTES, _PLANNED, _DOOMED, _WARNED, _FINDINGS) + (
-            (_RUN,) if run else ()):
+    """Forget the run's records (a new run in this process); ``run``: its figures too."""
+    for table in (_RECEIPTS, _PENDING, _ROUTES, _PLANNED, _DOOMED, _WARNED, _FINDINGS) + ((_RUN,) if run else ()):
         table.clear()
