@@ -1591,17 +1591,14 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
     runs = None if streamed is None else streamed.reader(
         [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))])
-    # The q batches in their own section: the price judged against their peak is the
-    # ledger's live set plus one batch's tile (the stream's peak is the stream's).
-    from lxkit import memory
+    # The q batches in their own section. Each program a batch runs is priced by its own
+    # executable in its dispatch section (bank.dispatch.coulomb_sqrt, .moment_dyson); the
+    # batch's ledger row admits its outputs and is no price of this section.
     with timing.section("bank.moment_batches"):
-        memory.book(ledger.price(ledger.preview(
-            resident_bytes_per_rank=(per_q * qwidth + 16) * face_bytes, workspace_bytes_per_rank=0,
-            concurrent_with=ambient)))
         for q0 in range(0,len(qids),qwidth):
             q1 = min(q0+qwidth,len(qids))
             ledger.live_stages = ambient
-            name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
+            name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes, book=False)
             ledger.live_stages = ambient+(name,)
             if not np.asarray(header["moment_written"])[q0:q1].all():
                 # The roots first: their factorization runs beside no total.
