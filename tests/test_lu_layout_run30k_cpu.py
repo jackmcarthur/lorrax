@@ -1,7 +1,7 @@
 """The run30k Dyson LU (n 30000, complex128, 16 A100s on a 4x4 mesh) at the layout that ran it in
 22 s per dispatch (try 8, e57a2071a, 2026-10-18): cuSOLVERMp past the one_device bound, block-cyclic
 at block 250 (relabeled), the right-hand sides (nrhs = n) in 250-wide blocks, 30 per rank, which
-getrs chunks under its 2 GiB workspace cap. One tile per rank (7500) ran getrf/getrs in four
+getrs chunks as widely as the room posted for the dispatch allows (2 GiB without one). One tile per rank (7500) ran getrf/getrs in four
 serialized panel steps across nodes (try 5). Pure functions: no GPU and no context."""
 import types
 
