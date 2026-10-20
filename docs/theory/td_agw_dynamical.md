@@ -2018,6 +2018,33 @@ the twelve largest-growth modes. This is a reduced-pencil benchmark,
 not a material-screening admission. No full native material self-energy
 or matched 10 fs trajectory is established by these follow-ups.
 
+The next P4 diagnostic at commit `a91b532` (tree
+`e4a2719fe7d2221a36609473593ceca4318e4f1c`) evaluated the **native dielectric
+at the suspect fitted pole itself**, without an additional collision eta.
+For the same strong snapshot, its physical 978-port block had
+$\|\epsilon\|_F=31.4239$, $\|\epsilon^{-1}\|_F=31.1933$, and measured
+inverse residual $4.32\times10^{-14}$. The inverse-residual bound, including
+its FP64 allowance, gave $\sigma_{\min}(\epsilon)\ge0.0320581$; both identity
+padding defects were zero (980 packed ports). This fitted pole is therefore
+not a pole of the **computed** microscopic response. It does not establish
+the absence of other physical poles or certify the response quadrature.
+
+A stationary DFT-reference projector control used the same source energies,
+$U=I$ and active occupations $(1,1,0,0)$, with no frozen-edge shift. Its
+1218-mode fit also refused (growth 0.410557 Ry, maximum sample defect 12.70%).
+At that fitted pole the computed dielectric again had a verified positive
+smallest-singular-value lower bound, 0.0319715, with inverse residual
+$3.77\times10^{-14}$ and zero padding defects. Thus the specific spurious
+growth is not contingent on the strongly driven coherent state. This is a
+screening-implementation control, **not** a self-consistent GW ground-state,
+equilibrium-FDT, or raw-collision-stationarity test; no material self-energy
+was reached in either diagnostic.
+
+Both steps together used 0.43778 active GPUh; the owned reservation used
+0.56889 GPUh and was released immediately after capture. Their complete
+small receipts and the capacity-bounded frequency pencils are preserved in
+`/home/jackm/mgkba_campaign_20261019/full_microscopic_v6_20261020/`.
+
 ### 8.2 Acceptance checks and earlier-member evidence
 
 The corrected column-sampled MGKBA collision requires an independent dense
