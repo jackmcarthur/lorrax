@@ -883,7 +883,14 @@ $H \leftarrow |G_k|^{-1}\sum_L A_L(H)$ with the band representations of the
 operations from the WFN, so a seed from another run or code version cannot
 break this run's symmetry. The `SC initial Hamiltonian` line prints the
 largest change, and a seed whose Σ window cuts a multiplet refuses
-(`GATE little_group_band_representation`). A seed file that records a
+(`GATE little_group_band_representation`). A run with a
+computational identity-only group needs no projection: the typed unitary
+identity with zero translation returns the imported H unchanged, without
+reloading source-file little groups. Full computational k rows are not raw
+WFN parent indices, and the source file's larger point group must not be
+reimposed after the run explicitly discarded it (for example, separate
+bosonic q-grid mode). The loader retains its original file-parent mapping
+for authenticating input unfolding. A seed file that records a
 partial band partition or an active-window scissor refuses, because the loop
 keeps every QP-matrix state's full Σ and has nothing to apply such a law to.
 Without a checkpoint beside it, occupations, the tail fit, the quadrature

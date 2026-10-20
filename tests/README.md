@@ -171,6 +171,9 @@ A new test needs no bootstrap import of its own.
 - `test_shared_pole_balanced_face_cpu.py`: scalar face parent-count and
   balanced-width admission, including nonmonotonic compiled prices and
   CPU4 actual reducer pole/transfer/gate equivalence across padded schedules.
+- `test_sc_initial_little_group_cpu.py`: identity-only computational SC
+  seed import preserves all independent k rows without raw-file parent
+  reloads; nontrivial/antiunitary/translated groups retain their projection.
 - `test_centroid_fixed_tile.py`: the kmeans candidate Gram's k batches and
   tiles and the feature metric's chunks do not read the budget (CPU, toy
   faces).
