@@ -650,14 +650,26 @@ $$
 Only reduced per-parent frequency pencils cross the bounded host LAPACK
 seam. Its workspace is priced explicitly and refuses above its declared
 capacity; microscopic samples and endpoint factors stay distributed. The
-reduced constructor has one canonical process-zero owner: all ranks first
-gather the same reduced E/A, then exchange an owner success/error record
+serial reduced constructor has one canonical process-zero owner. The exact
+batched route (`general_pencil_batch_plan`, `collective_general_pencil_batch`)
+admits a prefix of at most P small pencils from shapes **before** their host
+gather. Every rank reduces at most its one assigned parent, concurrently;
+each parent still has exactly one canonical owner. All ranks first
+gather the same admitted reduced E/A, then exchange an ordered owner success/error record
 before broadcasting exact uint64 bit patterns of complex128 poles, both
 coefficient maps and both held frequency spaces. JAX x64 is required for
 this handoff. Only these reduced arrays cross ranks; independent host
 eigenvector gauges must never be mixed across distributed microscopic
 factor faces. Current E/A are reduced anew every iteration; only numerical
-frequency spaces may be held. The initial general solver is therefore
+frequency spaces may be held. Its 4 GiB default bound prices the maximum of
+two disjoint phases: one LAPACK solve beside all other batch inputs, then
+retained canonical models beside one owner result and one transfer buffer.
+Existing held-space bytes are an explicit caller input. Capacity reduces
+the numerical batch width (down to one), never the physical pole order,
+spatial ports or q count. Per-parent receipts record reduced shapes/order,
+SVD/eigen/reduction and canonical-handoff walls and the owner/batch capacity.
+These are concurrent host solves of independent parents, not a batched
+distributed general eigensolver. The general solver is therefore
 capacity-bounded, not a claim of an
 arbitrarily large distributed non-Hermitian eigensolver. At 1761 frequency
 states a complex pencil is about 50 MB; the conservative reduction workspace

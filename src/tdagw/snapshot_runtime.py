@@ -120,8 +120,12 @@ def make_native_snapshot_evaluator(source, prepared, options):
         energy[:, active] = e
         cache["n"] += 1
         if mode == "joint" or equilibrium:
+            # Response A is a NUMERICAL band partition, not the propagated
+            # density window. Extra bands retain their original exact 0/1 rho.
+            from tdagw.dynsig import chi0_active_group
+            a0, a1, _ = chi0_active_group(energy, active, options.get("spm_chi0_active") or "auto")
             snapshot = dict(U_active=U, E_active_ry=e, rho_active=rho,
-                active_slice=active, energy_ry=energy,
+                active_slice=active, response_active_slice=slice(a0, a1), energy_ry=energy,
                 gamma_ry=float(options.get("adiabatic_ry",
                     float(options.get("adiabatic_ev", 0.05))/RYD_TO_EV)),
                 eta_ry=float(source["config"].sigma.regularization_ev)/RYD_TO_EV,

@@ -52,12 +52,12 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .centroid_k_unfold import authenticate_canonical_full_grid
     from .response_bank import (full_density_sample_rules, full_density_bare_moments,
                                  _coulomb_algebra, dense_layout, response_algebra,
-                                 operator_digest)
+                                 operator_digest, response_blocks)
     from .w_isdf import full_density_response_stream
     from .shared_pole_directions import _sample_point
     from .shared_pole_execution import face_matmul
     from .shared_pole_pencil import general_tangential_pencil, tile_join, tile_block, join_vectors
-    from .shared_pole_constructor import collective_general_pencil
+    from .shared_pole_constructor import general_pencil_batch_plan, collective_general_pencil_batch
     from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
     from types import SimpleNamespace
     from file_io.shared_pole_store import write_general_shared_pole_model
@@ -186,8 +186,45 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         raise ValueError("GATE shared_general_supports: at least four native fitted supports required")
     end("setup", (ph, H))
     begin("planning")
-    rules = full_density_sample_rules(energy[:, :stop], sites, gamma_ry=gamma,
-        tolerance=float(recipe["bank_rule_tolerance"]), held=fit_basis.setdefault("scalar_rules", {}))
+    response_active = snapshot.get('response_active_slice', active)
+    if not isinstance(response_active,slice):
+        response_active = slice(*response_active)
+    if not 0 <= response_active.start <= active.start < active.stop <= response_active.stop <= stop:
+        raise ValueError('GATE response_blocks_active: numerical response group must contain the coherent window')
+    band = np.arange(nb)[None]
+    amask = (band >= response_active.start)&(band < response_active.stop)
+    live = band < stop
+    f_support = np.where(amask,1.,occupations)*live
+    u_support = np.where(amask,1.,1.-occupations)*live
+    blocks = response_blocks(energy,f_support,u_support,(response_active.start,response_active.stop),
+                             allow_crossing=True)
+    rules, scalar_cache = [], fit_basis.setdefault('scalar_rules',{})
+    # Do not force native high-height supports to use the narrow eta-height
+    # continuation grid. Partition by actual height and by noncrossing status;
+    # every original site remains an independently checked physical target.
+    heights = np.floor(np.log2((sites.imag+gamma)/np.min(sites.imag+gamma))/2).astype(int)
+    for bi, block in enumerate(blocks):
+        lm, rm = block['u'] != 0, block['f'] != 0
+        block['bounds'] = [float(energy[lm].min()),float(energy[lm].max()),
+                           float(energy[rm].min()),float(energy[rm].max())]
+        remote = (np.abs(sites.real) < block['lo']) if block['lo'] > 0 else np.zeros(len(sites),bool)
+        groups = sorted(set(zip(remote.tolist(),heights.tolist())))
+        for is_remote,height in groups:
+            ids = np.flatnonzero((remote == is_remote)&(heights == height))
+            # Noncrossing must also survive outward hold padding; if near
+            # the boundary, the general bounded primitive handles it exactly.
+            key = (block['name'],tuple(ids))
+            if jax.process_index()==0:
+                print_fn(f"General shared-pole W [{label}] plan block={block['name']} "
+                         f"interval_Ry={[block['lo'],block['hi']]} sites={len(ids)} "
+                         f"height_bin={height} noncrossing={is_remote}")
+                sys.stdout.flush()
+            planned = full_density_sample_rules(energy[:,:stop],sites[ids],gamma_ry=gamma,
+                tolerance=float(recipe['bank_rule_tolerance']), interval_ry=(block['lo'],block['hi']),
+                paired=True,held=scalar_cache.setdefault(key,{}))
+            for rule in planned:
+                rules.append(dict(rule,block_index=bi,block=block['name'],
+                                  members=[int(ids[j]) for j in rule['members']]))
     end("planning")
     if jax.process_index() == 0:
         print_fn(f"General shared-pole W [{label}] scalar plan: {len(rules)} panels, "
@@ -200,17 +237,23 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     polarizations = [None]*len(sites)
     for panel_index, rule in enumerate(rules):
         panel_start = time.monotonic()
+        block = blocks[rule['block_index']]
+        if block['name'][1] == 'A':
+            left = (pm-ph)*jnp.asarray(block['u'])[:,None,None]
+        else:
+            left = pm*jnp.asarray(block['u'])[:,None,None]
+        right = (ph if block['name'][0] == 'A' else pm)*jnp.asarray(block['f'])[:,None,None]
         stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
             q_ids=np.arange(nk), n_outputs=len(rule["members"]), layout=layout,
-            rule_reference_ry=rule["reference_ry"])
-        raw = stream(jnp.asarray(rule["times"]), jnp.asarray(rule["weights"]), pm, pn, ph, energy_d)
+            rule_reference_ry=rule["reference_ry"],pair_bounds_ry=block['bounds'])
+        raw = stream(jnp.asarray(rule["times"]), jnp.asarray(rule["weights"]), left, pn, right, energy_d)
         for j, sid in enumerate(rule["members"]):
             value = raw[:, j]
             polarizations[sid] = value if polarizations[sid] is None else polarizations[sid]+value
         # Bound asynchronous live panels to the accumulator plus CURRENT
         # raw result, rather than queueing every full-microscopic bank.
         jax.block_until_ready(polarizations)
-        del raw, value
+        del raw, value,left,right
         if jax.process_index() == 0 and (panel_index == 0 or (panel_index+1) % 4 == 0
                                         or panel_index+1 == len(rules)):
             print_fn(f"General shared-pole W [{label}] stream panel {panel_index+1}/{len(rules)} "
@@ -321,29 +364,50 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     begin("hostreduce")
     spaces = fit_basis.setdefault("spaces", {})
     banks, receipts = {}, []
-    for iq in range(nk):
-        if iq in banks:
-            continue
-        model = collective_general_pencil(np.asarray(gather_to_host(E[iq])), np.asarray(gather_to_host(A[iq])),
-            max_order=cap, max_workspace_bytes=workspace, fixed_spaces=spaces.get(iq))
-        spaces.setdefault(iq, model["spaces"])
-        order = len(model["poles_ry"])
-        carrier_order = extent(order)
-        padding = carrier_order-order
-        omap = np.pad(model["output_map"], ((0, 0), (0, padding)))
-        imap = np.pad(model["input_map"], ((0, 0), (0, padding)))
-        l = mm(C[iq:iq+1], put(omap[None], face))
-        r = mm(B[iq:iq+1], put(imap[None], face), transa="C")
-        p = np.pad(model["poles_ry"], (0, padding))
-        partner = int(minus[iq])
-        if partner == iq:
-            l = tile_join((.5*l, -.5*jnp.conj(l)), -1, face)
-            r = tile_join((r, jnp.conj(r)), -1, face)
-            p = join_vectors((p, -p.conj()), panel_side)
-        banks[iq] = (l, r, p)
-        if partner != iq:
-            banks[partner] = (-jnp.conj(l), jnp.conj(r), -p.conj())
-        receipts.append(dict(q=iq, partner=partner, **model["receipt"]))
+    parents=[iq for iq in range(nk) if iq <= int(minus[iq])]
+    position=0
+    while position<len(parents):
+        retained=sum(a.nbytes for space in spaces.values() for a in space.values())
+        plan=general_pencil_batch_plan([(nl,nr)]*min(jax.process_count(),len(parents)-position),
+            max_order=cap,max_workspace_bytes=workspace,retained_host_bytes=retained)
+        ids=parents[position:position+plan['batch_size']]
+        batch_start=time.monotonic()
+        if jax.process_index()==0:
+            print_fn(f"General shared-pole W [{label}] host batch parents={ids} "
+                     f"shape={nl}x{nr} cap={cap} peak_bytes={plan['host_workspace_bytes']}")
+            sys.stdout.flush()
+        # All ranks execute EVERY slice/gather before the pure host owners
+        # reduce their assigned parents concurrently. Never gather in a
+        # rank-conditional lambda or mix independent host modal gauges.
+        pencils=[(np.asarray(gather_to_host(E[iq])),np.asarray(gather_to_host(A[iq]))) for iq in ids]
+        models=collective_general_pencil_batch(pencils,max_order=cap,max_workspace_bytes=workspace,
+            fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained)
+        for iq,model in zip(ids,models):
+            spaces.setdefault(iq, model["spaces"])
+            order = len(model["poles_ry"])
+            carrier_order = extent(order)
+            padding = carrier_order-order
+            omap = np.pad(model["output_map"], ((0, 0), (0, padding)))
+            imap = np.pad(model["input_map"], ((0, 0), (0, padding)))
+            l = mm(C[iq:iq+1], put(omap[None], face))
+            r = mm(B[iq:iq+1], put(imap[None], face), transa="C")
+            p = np.pad(model["poles_ry"], (0, padding))
+            partner = int(minus[iq])
+            if partner == iq:
+                l = tile_join((.5*l, -.5*jnp.conj(l)), -1, face)
+                r = tile_join((r, jnp.conj(r)), -1, face)
+                p = join_vectors((p, -p.conj()), panel_side)
+            banks[iq] = (l, r, p)
+            if partner != iq:
+                banks[partner] = (-jnp.conj(l), jnp.conj(r), -p.conj())
+            receipts.append(dict(q=iq, partner=partner, **model["receipt"]))
+        jax.block_until_ready([banks[iq][:2] for iq in ids])
+        if jax.process_index()==0:
+            print_fn(f"General shared-pole W [{label}] host batch complete parents={ids} "
+                     f"orders={[len(m['poles_ry']) for m in models]} wall={time.monotonic()-batch_start:.3f}s")
+            sys.stdout.flush()
+        del pencils,models,model,omap,imap
+        position+=len(ids)
     end("hostreduce", [b[:2] for b in banks.values()])
     # Every current full-matrix sample checks the FINAL bank, including the
     # mirrored partner and self-negative convex crossing mixture.
@@ -394,6 +458,13 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         algebra=algebra, spatial_projection=False, screening_density="full_matrix",
         reference_statistics="retarded_reference", general_gates=general_gates)
     receipt["capacity"] = price
+    receipt['response_active_bands'] = [response_active.start,response_active.stop]
+    receipt['response_blocks'] = [dict(name=b['name'],interval_ry=[b['lo'],b['hi']],
+                                      endpoint_bounds_ry=b['bounds']) for b in blocks]
+    receipt['quadrature_work'] = dict(ordered_green_pairs=sum(len(r['times']) for r in rules),
+        product_greens_per_node=2,output_node_updates=sum(len(r['times'])*len(r['members']) for r in rules),
+        largest_output_count=max(len(r['members']) for r in rules),
+        rule_groups=len(rules),scalar_provider='exact_endpoint_blocks_public_minimax_owners')
     receipt["phase_seconds"] = phases
     receipt["physical_grid_order"] = grid_receipt
     receipt["native_positive_pole_budget"] = positive_cap

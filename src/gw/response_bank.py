@@ -26,8 +26,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from .efermi import OCCUPATION_WEIGHT_FLOOR, band_in_occupation_window
 
 
-def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=None):
-    """Native shared-node scalar quadrature for the FULL signed gap interval.
+def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=None,
+                              interval_ry=None, paired=False):
+    """Native scalar quadrature for full bands or one EXACT endpoint block.
 
     Energies/sites use Ry; all screening bands participate, including frozen
     to active virtual transitions. The interval and rule use no population
@@ -36,6 +37,11 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
     The returned small plain dictionaries contain ``times`` in 1/Ry and
     ``weights[member,node]`` for ``1/(z-d+i gamma)``. Native minimax panels
     handle a rule exceeding one node carrier; no dense frequency grid enters.
+    ``interval_ry`` optionally supplies the actual ordered-block gap range.
+    ``paired=True`` returns weights ``[2,member,node]`` for the two independent
+    retarded primitives: -1/(d-z) and -1/(d+z), with the second evaluated at
+    conjugate time. Strictly noncrossing groups use the public continuum-
+    checked Laplace owner (Ke+Ko, Ke-Ko); others retain shared complex rules.
     """
     import minimax
     energy, sites = np.asarray(energy, float), np.asarray(sites, complex)
@@ -44,22 +50,55 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
             or np.any(sites.imag+gamma_ry <= 0)):
         raise ValueError("GATE response_full_density: finite full bands and upper Laplace supports required")
     extent = float(energy.max()-energy.min())
+    lo, hi = (-extent, extent) if interval_ry is None else tuple(map(float, interval_ry))
+    if not np.isfinite([lo, hi]).all() or lo > hi:
+        raise ValueError("GATE response_full_density: invalid exact endpoint gap interval")
+    if lo == hi:
+        lo, hi = float(np.nextafter(lo, -np.inf)), float(np.nextafter(hi, np.inf))
     shifted = sites+1j*gamma_ry
     # Hold ONLY accepted scalar quadrature on a containing interval, never
     # current density, W, physical poles, or wavefunctions. The refresh owner
     # supplies a fresh dictionary at each physical Hamiltonian solve.
-    key = (shifted.tobytes(), float(tolerance))
+    key = (shifted.tobytes(), float(tolerance), bool(paired))
     if (held is not None and held.get("key") == key
-            and float(held["extent_ry"]) >= extent):
+            and held["interval_ry"][0] <= lo and held["interval_ry"][1] >= hi):
         return held["rules"]
     if held is not None:
-        extent += RESPONSE_HOLD_PAD_EV/RYD_TO_EV
+        pad = RESPONSE_HOLD_PAD_EV/RYD_TO_EV
+        if interval_ry is not None:
+            pad = min(pad, .1*(hi-lo))
+            reach = float(np.max(abs(shifted.real)))
+            if paired and lo > reach:
+                pad = min(pad, .5*(lo-reach))
+        lo, hi = (max(lo-pad, lo/2) if lo > 0 else lo-pad), hi+pad
     # Different hardware/BLAS must not choose different node counts and hence
     # different FFT collectives. Gather attempts through the response owner.
     bound = 4*1024**3
-    tree = lambda members: minimax.ResponseGroupTree(-extent, extent, shifted[list(members)],
-        rel_tol=tolerance, panels=True, max_pencil_bytes=bound, max_panel_count=32)
-    groups = _gather_group_rules([tuple(range(len(sites)))], tree)[0]
+    request = tuple(range(len(sites)))
+    if paired and lo > float(np.max(abs(shifted.real))):
+        def remote(members):
+            z = shifted[list(members)]
+            rule = minimax.response_laplace_rule(lo, hi, z, rel_tol=tolerance,
+                                                  ordered=True, reference_ry=lo)
+            ke, ko = rule['projection_value'], rule['odd_projection_value']
+            value = np.stack((ke+ko, ke-ko), axis=1)
+            de, do = rule['projection_derivative'], rule['odd_projection_derivative']
+            derivative = np.stack((de+do, de-do), axis=1)
+            mass = np.stack((z.imag[:,None]*np.sum(abs(value),axis=-1),
+                             z.imag[:,None]**3*np.sum(abs(derivative),axis=-1)),axis=-1)
+            # Match the shared-response primitive's finite-noise admission;
+            # this scalar coefficient bound is not a physical positivity cut.
+            if not np.isfinite(mass).all() or np.max(mass[...,0]) > 5000.:
+                raise ValueError('GATE response_full_density: noncrossing primitive coefficient mass')
+            return [dict(t=rule['t'],count=len(rule['t']),value=value,
+                         members=list(members),reference_ry=rule['reference_ry'],
+                         sampled_error=rule['certificate']['maximum_bound'],coefficient_mass=mass,
+                         construction='continuum_noncrossing_laplace')]
+        groups = _gather_group_rules([request], build=remote)[0]
+    else:
+        tree = lambda members: minimax.ResponseGroupTree(lo, hi, shifted[list(members)],
+            rel_tol=tolerance, panels=True, max_pencil_bytes=bound, max_panel_count=32)
+        groups = _gather_group_rules([request], tree)[0]
     result = []
     for group in groups:
         count = int(group["count"])
@@ -67,16 +106,18 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
         reference = float(group["reference_ry"])
         # The stream carries the reference in its bounded Green phases; do
         # not separately form a tiny coefficient times an overflowing Green.
-        weights = -np.asarray(group["value"][:, 0, :count])
+        weights = -np.asarray(group["value"][:, :, :count] if paired else group["value"][:, 0, :count])
+        if paired:
+            weights = weights.swapaxes(0, 1)
         result.append(dict(members=list(map(int, group["members"])), times=times,
                            weights=weights, reference_ry=reference,
                            sampled_error=float(np.max(group["sampled_error"])),
                            coefficient_mass=float(np.max(group["coefficient_mass"])),
                            construction=group.get("construction", "shared_hankel"),
-                           interval_ry=[-extent, extent], max_pencil_bytes=bound,
+                           interval_ry=[lo, hi], max_pencil_bytes=bound,
                            max_panel_count=32))
     if held is not None:
-        held.update(key=key, extent_ry=extent, rules=result)
+        held.update(key=key, extent_ry=max(abs(lo),abs(hi)), interval_ry=[lo, hi], rules=result)
     return result
 
 
@@ -1926,7 +1967,23 @@ def _rule_round(trees, known, world):
     return plan
 
 
-def _gather_group_rules(requests, tree):
+def _gather_rule_attempts(local):
+    """Canonical small numerical records from all response-rule owners."""
+    import pickle
+    from common.collectives import all_gather_processes, process_count
+    world = int(process_count())
+    if world == 1:
+        return [local]
+    payload = np.frombuffer(pickle.dumps(local, protocol=pickle.HIGHEST_PROTOCOL), np.uint8)
+    lengths = np.asarray(all_gather_processes(np.asarray(payload.size, np.int32)), np.int64).reshape(-1)
+    padded = np.zeros(int(lengths.max()), np.uint8)
+    padded[:payload.size] = payload
+    gathered = np.asarray(all_gather_processes(padded), np.uint8)
+    return [pickle.loads(np.ascontiguousarray(gathered[r, :int(n)]).tobytes())
+            for r, n in enumerate(lengths)]
+
+
+def _gather_group_rules(requests, tree=None, *, build=None):
     """Build every request's rule tree across hosts; replicate the small rules.
 
     ``tree(members)`` is the request's ``minimax.ResponseGroupTree``. Its
@@ -1938,9 +1995,25 @@ def _gather_group_rules(requests, tree):
     to the serial walk's rules, byte for byte (one list per request). Refusals
     cross as data and are raised only where the serial walk would raise them.
     """
-    import pickle
-    from common.collectives import all_gather_processes, process_count, process_rank
+    from common.collectives import process_count, process_rank
     rank, world = int(process_rank()), int(process_count())
+    if build is not None:
+        # Public closed-form/noncrossing owners have no adaptive halving
+        # tree. Distribute their whole requests, but share the SAME canonical
+        # small-record/error handoff as the shared-pencil planner below.
+        local = []
+        for i, members in enumerate(requests):
+            if i % world != rank:
+                continue
+            try:
+                local.append((i, (), build(members), None))
+            except Exception as error:
+                local.append((i, (), None, f"{type(error).__name__}: {error}"))
+        records = sorted((item for shard in _gather_rule_attempts(local) for item in shard), key=lambda v:v[0])
+        for _, _, _, error in records:
+            if error is not None:
+                raise ValueError(error)
+        return [record[2] for record in records]
     trees = [tree(members) for members in requests]
     known = [dict() for _ in trees]
     errors = [dict() for _ in trees]
@@ -1962,16 +2035,7 @@ def _gather_group_rules(requests, tree):
                 local.append((i, node, trees[i].attempt(node), None))
             except Exception as error:  # refusals cross hosts as data, then raise
                 local.append((i, node, None, f"{type(error).__name__}: {error}"))
-        if world == 1:
-            shards = [local]
-        else:
-            payload = np.frombuffer(pickle.dumps(local, protocol=pickle.HIGHEST_PROTOCOL), np.uint8)
-            lengths = np.asarray(all_gather_processes(np.asarray(payload.size, np.int32)), np.int64).reshape(-1)
-            padded = np.zeros(int(lengths.max()), np.uint8)
-            padded[:payload.size] = payload
-            gathered = np.asarray(all_gather_processes(padded), np.uint8)
-            shards = [pickle.loads(np.ascontiguousarray(gathered[r, :int(n)]).tobytes())
-                      for r, n in enumerate(lengths)]
+        shards = _gather_rule_attempts(local)
         for shard in shards:
             for i, node, rules, error in shard:
                 known[i][node] = _REFUSED if error is not None else rules
@@ -2041,7 +2105,7 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
 RESPONSE_BLOCKS = ("FF", "FA", "AF", "AA")
 
 
-def response_blocks(energy, f, u, active):
+def response_blocks(energy, f, u, active, *, allow_crossing=False):
     """chi0 as four (hole x electron) blocks, each with its own transition interval.
 
     ``active`` = (a0, a1): the active bands A (0-based, half-open, on the band
@@ -2055,6 +2119,10 @@ def response_blocks(energy, f, u, active):
     (:func:`response_quadrature`).  FF, FA and AF must be strictly positive;
     AA, on [-span_A, +span_A], is the one crossing block (no occupation
     envelope: decay rate 0).  A block without hole or electron bands is dropped.
+    ``allow_crossing=True`` retains the measured signed intervals of the
+    other blocks too. For a coherent-density caller f/u on A describe ONLY
+    endpoint support (both one), not the actual density; independently formed
+    Psi rho and Psi(I-rho) faces must supply the matrix weights.
     """
     a0, a1 = (int(x) for x in active)
     band = np.arange(energy.shape[1])[None, :]
@@ -2079,7 +2147,7 @@ def response_blocks(energy, f, u, active):
             continue
         refs = np.array([energy[h].max(), energy[e].min()])
         lo, hi = float(refs[1] - refs[0]), float(energy[e].max() - energy[h].min())
-        if name != "AA" and not lo > 0:
+        if name != "AA" and not lo > 0 and not allow_crossing:
             raise ValueError(f"GATE response_blocks_interval: got the {name} block's interval "
                              f"[{lo*RYD_TO_EV:.6g}, {hi*RYD_TO_EV:.6g}] eV with active bands "
                              f"[{a0}, {a1}); want lo > 0 (a band gap between A and F on that "
