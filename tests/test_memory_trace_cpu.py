@@ -40,6 +40,7 @@ def test_trace_records_live_arrays_compiles_and_residuals(tmp_path):
     assert {((1024, 1024), "demo.outer"), ((1024, 1024), "demo.inner")} <= born
     matmul = [c for c in inner["compiles"] if c["output"] == face]
     assert matmul and all(k in matmul[0] for k in ("temp", "argument", "alias", "code"))
+    assert any(c["output"] == face for c in inner["runs"])  # run where compiled: attributed there
     assert inner["priced"]["vendor"] == 1e6
     rows = {r["section"]: r for r in memory_residuals.rows(memory_residuals.load(trace))}
     r = rows["demo.inner"]

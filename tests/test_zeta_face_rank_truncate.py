@@ -100,12 +100,15 @@ def test_a_stack_smaller_than_the_ranks_is_no_batch_layout_fit():
     """The head Gamma GEMM (run30k: 1 x 30000 x 15000 on one GPU for 4+ min): one matrix on 16
     ranks fits the batch layout only within GATHERED_EIGH_BYTES; the same live set without the
     stack count fits a large budget."""
-    from types import SimpleNamespace
-    import distrib_la
-    p16 = SimpleNamespace(mesh=SimpleNamespace(devices=np.empty((4, 4))))
-    shapes = ((1, 2048, 1024), (1, 1024, 2048), (1, 2048, 2048))               # 0.13 GB live
-    assert not distrib_la.fits_local(p16, "gemm", shapes, np.complex128, 10 ** 10, batch=1)
-    assert distrib_la.fits_local(p16, "gemm", shapes, np.complex128, 10 ** 10)
+    import jax
+    from jax.sharding import Mesh
+    from distrib_la.matmul import staged_fits
+    if jax.device_count() < 4:
+        pytest.skip("needs 4 devices")
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    a, b = (1, 2048, 1024), (1, 1024, 2048)                   # whole D 67 MB > the gathered cap
+    assert not staged_fits(mesh, a, b, "complex128", "N", "N", 10 ** 10)
+    assert staged_fits(mesh, (4, *a[1:]), (4, *b[1:]), "complex128", "N", "N", 10 ** 10)
 
 
 def test_the_passivity_eigh_room_hands_back_its_own_reservation():

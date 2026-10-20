@@ -406,7 +406,7 @@ class CapacityLedger:
         return result
 
     def reserve(self, stage, *, resident_bytes_per_rank,
-                workspace_bytes_per_rank, concurrent_with=(), runs_in=None, whole=False):
+                workspace_bytes_per_rank, concurrent_with=(), runs_in=None, whole=False, book=True):
         """Admit actual-batch bytes before allocation (``lxkit.memory.admit``).
 
         The price is booked to ``runs_in``, the timing section that allocates it (default:
@@ -432,7 +432,8 @@ class CapacityLedger:
             memory.admit(f"shared-pole ledger {stage}", self.price(row),
                          row['available_device_bytes_per_rank'], runs_in=runs_in)
         self._accepted[stage] = row
-        memory.book(self.price(row), stage=runs_in)
+        if book:
+            memory.book(self.price(row), stage=runs_in)
         return copy.deepcopy(row)
 
     def at_phase(self):

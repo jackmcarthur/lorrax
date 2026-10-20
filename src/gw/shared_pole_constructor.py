@@ -210,8 +210,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         face_batch = 1
         if execution == 'face':
             from gw.shared_pole_capacity import check_eigh_room, face_eigh_room
-            from gw.shared_pole_execution import (face_batch_width, face_reduction_bytes, face_ritz_carrier,
-                                                  face_round_compiled_bytes)
+            from gw.shared_pole_execution import face_batch_width, face_ritz_carrier, face_round_compiled_bytes
             keep_budget = recipe.get("pole_budget")
             # The conservative round's infinity carrier and its block in the pencil side
             # (constructor_side_upper_bound), for the width's compiled admission.
@@ -223,7 +222,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, nq=nq,
                 selection=dict(sample_batch=len(dense_fit), selection_faces=selection_faces),
-                program_bytes=lambda width: face_reduction_bytes(mesh_xy, width, **sizing),
                 compiled=lambda width, room: face_round_compiled_bytes(
                     mesh_xy, width, rows=n, finite=conservative_side - infinity_block, infinity_width=infinity_cap,
                     infinities=1 + len(moment_fields), ordered=ordered, odd_moments=odd_moments,
@@ -332,12 +330,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     # The kept span on the budget's carrier, as the local round
                     # solves it on its Ritz carrier: the Schur and final eigh run
                     # at about 2 x budget instead of the pencil side.
-                    # The eigh room beside this round's own program: the batch row
-                    # with the round's price at its actual side for the batch's.
+                    # The eigh room beside this round's own program: the batch row, which
+                    # admitted the program compiled at the conservative side.
                     row = execution_receipt['face_batch']['reduction']
-                    room = lambda price: face_eigh_room(dict(row, aggregate_bytes_per_rank=(
-                        row['aggregate_bytes_per_rank'] - budget.program_bytes + price)), retained_bound,
-                        stage="shared-pole constructor reduction round")
+                    room = face_eigh_room(row, retained_bound, stage="shared-pole constructor reduction round")
                     round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                         round_states, infinity, tables, mesh=mesh_xy,
                         budget=budget, ordered=ordered, odd_moments=odd_moments,
