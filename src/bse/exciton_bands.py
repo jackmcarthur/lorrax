@@ -2195,9 +2195,9 @@ def main(argv=None):
                     mesh_xy, sh.W.spec, (nkx, nky, nkz),
                     output="k" if head_ch else "R",
                     embedding=w_pair_embedding(
-                        cg, wfn, centroids_path, keep_idx,
+                        cg, wfn, centroids_path, keep_idx, int(n_rmu),
                         int(W_q_coarse.shape[0]), meta.sys_dim,
-                        restart_file=restart_file))
+                        restart_file=restart_file, log_fn=log))
                 W_dense = densify_W(W_q_coarse)
                 if head_ch is not None:
                     S_fine = build_w_head_channel(

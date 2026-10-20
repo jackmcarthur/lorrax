@@ -105,8 +105,9 @@ def pad_W_R_to_grid(W_R_coarse: jax.Array, fine_grid: tuple[int, int, int],
     return out if pin is None else pin(out)
 
 
-def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx,
-                     n_mu_carrier: int, sys_dim: int, *, restart_file) -> dict:
+def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx, n_mu: int,
+                     n_mu_carrier: int, sys_dim: int, *, restart_file,
+                     log_fn=print) -> dict:
     """The per-pair Wigner–Seitz table of a W tile's μ axis.
 
     The positions are the centroid table's FFT points ``idx / N`` (the
@@ -116,8 +117,10 @@ def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx,
     digest must match the ``centroids_charge_md5`` receipt ``restart_file``
     carries (GW and the downfold stamp it over the tile's own rows), so the
     embedding cannot sit on another run's centroids; a restart without a
-    receipt is not checked.  Carrier pad rows beyond the tile take the first
-    centroid's position (their tiles are zero).
+    receipt is not checked, and ``log_fn`` says so in one line.  The table
+    must have exactly the tile's logical ``n_mu`` rows; carrier pad rows up
+    to ``n_mu_carrier`` take the first centroid's position (their tiles are
+    zero).
     """
     import h5py
     from file_io.centroids import load_centroids
@@ -125,13 +128,13 @@ def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx,
     grid = np.asarray(tuple(int(x) for x in wfn.fft_grid), dtype=np.int64)
     idx = np.asarray(load_centroids(centroids_file, tuple(grid))[1],
                      dtype=np.int64)
-    if idx.ndim != 2 or idx.shape[1] != 3 or np.any(idx < 0) \
-            or np.any(idx >= grid[None, :]):
-        raise ValueError(
-            f"w_pair_embedding: {centroids_file} does not give FFT points "
-            f"inside the {tuple(grid)} grid")
     if keep_idx is not None:
         idx = idx[np.asarray(keep_idx, dtype=np.int64)]
+    if idx.shape[0] != int(n_mu):
+        raise ValueError(
+            f"GATE w_pair_centroids: {centroids_file} gives {idx.shape[0]} "
+            f"centroid rows for a W tile of {int(n_mu)} rows; the W "
+            f"densifier would embed the tile on the wrong positions.")
     with h5py.File(restart_file, "r") as f:
         receipt = f.attrs.get("centroids_charge_md5")
     if receipt is not None:
@@ -143,10 +146,10 @@ def w_pair_embedding(coarse_grid, wfn, centroids_file, keep_idx,
                 f"built on (index digest {centroid_table_md5(idx)} vs "
                 f"receipt {receipt}); the W densifier would embed the tile "
                 f"on the wrong positions.")
-    if idx.shape[0] > int(n_mu_carrier):
-        raise ValueError(
-            f"w_pair_embedding: {idx.shape[0]} centroids for a W carrier of "
-            f"{int(n_mu_carrier)} rows")
+    else:
+        log_fn(f"  w_pair_embedding: {restart_file} carries no "
+               f"centroids_charge_md5 receipt; the centroid rows of "
+               f"{centroids_file} are not checked against the W tile.")
     return pair_ws_images(coarse_grid, lattice_bohr(wfn), idx / grid[None, :],
                           int(sys_dim), n_carrier=int(n_mu_carrier))
 
@@ -1578,8 +1581,9 @@ def _interpolate_bse_data_to_grid(
     densify_W = make_w_densifier(
         mesh_xy, P("x", "y", None, None, None), fine_grid, output="k",
         embedding=w_pair_embedding(coarse_grid, wfn, centroids_path, keep,
-                                   int(W_coarse.shape[0]), meta.sys_dim,
-                                   restart_file=restart_file))
+                                   n_rmu, int(W_coarse.shape[0]),
+                                   meta.sys_dim, restart_file=restart_file,
+                                   log_fn=log_fn))
     W_q_fine = densify_W(W_coarse)
     del W_coarse
     if srlr:

@@ -133,9 +133,21 @@ A new test needs no bootstrap import of its own.
   refuses a cut edge and a window outside the block; the QP route of
   `window_dipoles` equals the DFT slice at U = I and refuses a `dipole.h5` on
   another k grid, with another WFN's stamp or none, or with `skip_vnl`.
-- `test_w_pad_nyquist_cpu.py`: the W densifier's R zero-pad (CPU): an even
-  coarse axis splits its Nyquist coefficient, so coarse tiles stay exact and
-  every fine tile is Hermitian; the single-sided red twin is not.
+- `test_pair_ws_cpu.py`: the per-pair Wigner–Seitz image table of
+  `common.ws_images` (CPU): the images and their 1/N_deg weights equal a
+  brute-force search (fcc, a hexagonal slab, a skewed cell whose minima lie
+  several supercells out), coincident positions share one set, the transposed
+  pair takes the negated images, and the embedding keeps every coarse sample.
+- `test_w_pair_ws_cpu.py`: the W densifier's per-centroid-pair embedding (CPU):
+  coarse tiles are exact, fine tiles Hermitian, and relabelling centroids by
+  lattice vectors commutes with the interpolation, which the fftfreq box and a
+  shared Wigner–Seitz set (control variants) break; `w_pair_embedding` on a
+  temporary restart refuses a centroid table that misses the
+  `centroids_charge_md5` receipt or the tile's row count, takes the ordered
+  `keep_idx` rows and puts carrier pad rows at the first centroid.
+- `test_ws_covariance_cpu.py`: O_h covariance of the densified W on an fcc toy
+  whose sites fold into the home cell non-uniformly (CPU): the per-pair
+  embedding is covariant to round-off; the box and the shared set are not.
 - Benchmarks and backend checks for a standalone service live in that service's
   `services/<svc>/bench/`.
 
