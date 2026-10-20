@@ -47,7 +47,7 @@ from .fh_interp import (
 # The library half is bandstructure.fh_interp.  These names stay importable
 # from the CLI module for open lanes until the wave after ARCH wave 0.
 from .fh_interp import (                                             # noqa: F401
-    build_R_grid_np, f_transform_eigs, outer_r_shell_mask,
+    f_transform_eigs,
     resolve_extra_rank_pad, resolve_galerkin_rank_multiplier,
     resolve_local_vbm_index, select_active_eigenpairs,
     validate_centroid_subset_idx,
@@ -161,14 +161,15 @@ def add_band_character_arguments(parser):
 
 
 def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
-                               wfn_path, params, ctilde, wfn_ctilde,
+                               wfn_path, params, ctilde, wfn_ctilde, B_at_mu,
                                enk_sigma, meta, result, mesh, input_dir,
                                n_return_bands, a_band, energy_source, report):
     """Spin / orbital path coloring, coarse orbital totals, grid moments.
 
     ``ctilde`` builds H (QP-rotated under ``--qp-rotations``); the operator
-    images take ``wfn_ctilde``, the unrotated rows of the WFN band basis
-    the operators are computed in.
+    kernels take ``wfn_ctilde``, the unrotated nodal values of the WFN band
+    basis the operators are computed in, weighted by
+    ``orbital.operator_weight`` so the pencil duals read them on H's states.
 
     1. ``<psi_kn|O|psi_km>`` on the coarse full BZ: sigma_a, the requested
        orbital-character projectors and, with ``velocity``, the stored
@@ -192,8 +193,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
     from .fh_interp import build_fH_R, require_newton_converged
     from .orbital import (band_operators, grid_moments, occupied_sums,
                           interpolate_band_operator, magnetization_axis,
-                          orbital_totals, path_orbital_moments,
-                          stored_velocity, _operator_R)
+                          operator_weight, orbital_totals,
+                          path_orbital_moments, stored_velocity, _operator_R)
 
     report.heading("Band character and moments")
     log = report.emit
@@ -231,6 +232,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
     ops, names = band_operators(
         wfn, (band_start, band_start + nb_fit), mesh, sym,
         pseudos=pseudos, channels=channels)
+    weight = operator_weight(
+        ctilde, wfn_ctilde, f_transform_eigs(enk_sigma, a_band_index=a_band)[0])
     axis, axis_source = magnetization_axis(wfn)
     log(f"  [band operators] {len(names)} on {nk} coarse k x {nb_fit} "
         f"bands: {', '.join(names)}")
@@ -283,7 +286,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         nq = int(kpath_frac.shape[0])
         path_ops = gather_to_host(interpolate_band_operator(
             ops, wfn_ctilde, result["coeffs_on_path"],
-            np.asarray(kpath_frac), kgrid, mesh))[:nq]
+            np.asarray(kpath_frac), kgrid, mesh, B_at_mu=B_at_mu,
+            weight=weight))[:nq]
         expect = np.einsum('qaii->qai', path_ops).real
         extra = {}
         if "orbital" in colors:
@@ -292,7 +296,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
             m_path = path_orbital_moments(
                 parents, sym, slice(band_start, band_start + nb_fit),
                 wfn_ctilde, result["coeffs_on_path"], kpath_frac, kgrid,
-                mesh, E_path, deps_tol)
+                mesh, E_path, deps_tol, B_at_mu=B_at_mu, weight=weight)
             m_n = average_within_degenerate_sets(
                 np.einsum('a,qai->qi', axis, m_path), E_path, deps_tol)
             clip = float(np.percentile(np.abs(m_n), 95))
@@ -331,12 +335,13 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
 
     if moments_grid:
         grid = tuple(int(v) for v in moments_grid)
-        fH_R, f_params, _, _ = build_fH_R(
+        fH_R, F_R, f_params, _, _ = build_fH_R(
             ctilde, enk_sigma, kgrid, mesh, a_band_index=a_band)
-        builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde,
+        builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde, weight,
                             kgrid, mesh) for i in range(3)]
         E, D, residual = grid_moments(
-            fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
+            fH_R, F_R, f_params, builders, kgrid, grid, n_return_bands, mesh,
+            B_at_mu=B_at_mu, n_fit=nb_fit)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
             np.asarray(gather_to_host(E)), np.asarray(gather_to_host(D)),
@@ -481,7 +486,7 @@ def main(argv=None):
             qp_rotations_file=_qp_rotations_path)
 
         # Resolve the concrete fine-k plan before the first setup/progress line.
-        # Whole-state QRCP owns basis selection and has no Gram eigensolve.
+        # The nodal basis is pivoted on the host; no distributed Gram eigensolve.
         mesh_xy = _build_mesh_xy()
         wfn, sym = setup_wfn_and_sym(_wfn_path, mesh_xy=mesh_xy)
         from distrib_la import plan as _linalg_plan
@@ -575,6 +580,7 @@ def main(argv=None):
         _quality_records = []
         with timing.section("h_transform"):
             result = h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
+                                 B_at_mu,
                                  a_band_index=args.a_band,
                                  band_start=int(wfn.nelec) - int(params["nval"]),
                                  n_return_bands=n_return_bands,
@@ -650,7 +656,7 @@ def main(argv=None):
                 colors=args.color, moments_grid=args.moments_grid,
                 velocity=args.velocity and _output_path(args.velocity),
                 wfn=wfn, sym=sym, wfn_path=_wfn_path, params=params,
-                ctilde=ctilde, wfn_ctilde=wfn_ctilde,
+                ctilde=ctilde, wfn_ctilde=wfn_ctilde, B_at_mu=B_at_mu,
                 enk_sigma=enk_sigma, meta=meta,
                 result=result, mesh=mesh_xy, input_dir=input_dir,
                 n_return_bands=n_return_bands, a_band=args.a_band,

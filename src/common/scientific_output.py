@@ -75,38 +75,27 @@ def spectral_compression_lines(receipt, *,
     htransform, BSE and exciton-band drivers cannot drift onto different
     explanations of the same retained subspace.
     """
-    if receipt.get("method") == "whole_state_randomized_qrcp":
+    if receipt.get("method") == "orbit_pivoted_centroid_gram":
         retained = int(receipt["retained_rank"])
         carried = int(receipt["carried_rank"])
         n_pad = int(receipt["null_padding"])
         return [
-            f"{label:<15}: {int(receipt['stacked_states'])} stacked states x "
-            f"{int(receipt['state_dimension'])} full-Bloch components",
-            f"QRCP search    : {int(receipt['candidate_count'])} candidates; "
-            f"ceiling {int(receipt['search_rank'])} "
-            f"({float(receipt['rank_multiplier']):.5f} x fitted bands)",
-            f"QRCP rank      : qr_eps={float(receipt['qr_eps']):.5e}; raw "
-            f"rank {int(receipt['raw_rank'])}; retained rank {retained}",
-            f"Reproducibility: seed={int(receipt['qrcp_seed'])}; "
-            f"rng={receipt['qrcp_rng_version']}; candidate SHA256="
-            f"{receipt['candidate_hash']}; pivot SHA256={receipt['pivot_hash']}",
-            f"Selected basis : min diag(L)="
-            f"{float(receipt['min_cholesky_diagonal']):.5e}; "
-            f"max |C[selected]-L|="
-            f"{float(receipt['selected_orientation_error']):.5e} "
-            f"(cap {float(receipt['selected_orientation_tolerance']):.5e})",
-            f"Projection     : max |C C^H-I|="
-            f"{float(receipt['coefficient_orthogonality_error']):.5e}; "
-            f"max missing norm^2="
-            f"{float(receipt['max_missing_state_norm_squared']):.5e}; "
-            f"relative Frobenius residual="
-            f"{float(receipt['relative_frobenius_residual']):.5e}",
-            "Error meaning     : projection residuals diagnose the fitted "
-            "whole-state representation; they are not a fine-k band-energy "
-            "error bound",
-            f"Distributed carry: rank {carried} = {retained} physical + "
-            f"{n_pad} exact-null mesh pad; no rank was dropped for device "
-            "alignment",
+            f"{label:<15}: {int(receipt['stacked_states'])} stacked states "
+            f"sampled at {int(receipt['centroids'])} centroids",
+            f"Node pivot     : {int(receipt['nodes'])} nodes in "
+            f"{int(receipt['orbits'])} whole orbits; tol qr_eps^2 with "
+            f"qr_eps={float(receipt['qr_eps']):.5e}; max relative residual "
+            f"{float(receipt['max_relative_residual']):.5e}",
+            f"Node Gram      : G_nn^+ rank {int(receipt['gram_rank'])} of "
+            f"{int(receipt['nodes'])}; ceiling "
+            f"{float(receipt['rank_multiplier']):.5f} x fitted bands; "
+            f"pivot SHA256={receipt['pivot_hash']}",
+            "Error meaning     : the pivot residual bounds the centroid "
+            "interpolation of the fitted states; it is not a fine-k "
+            "band-energy error bound",
+            f"Distributed carry: rank {carried} = {retained} physical "
+            f"(spin x node) + {n_pad} exact-null mesh pad; no rank was "
+            "dropped for device alignment",
         ]
 
     report = receipt["numerical_report"]
@@ -180,34 +169,24 @@ def spectral_compression_lines(receipt, *,
 
 
 def htransform_quality_lines(receipt) -> list[str]:
-    """Render the shared htransform representation/locality receipt.
+    """Render the shared htransform nodal-pencil receipt.
 
-    The row-isometry number screens recovery on the fitted coarse grid.  The
-    real-space number measures how much of ``f(H)_R`` reaches the outer shell
-    of the available Born--von Karman supercell.  Neither is silently promoted
-    into an off-grid band-energy error: that requires an independent fine-k
-    reference, as the report states explicitly.
+    ``nodal_injectivity_min`` is ``min_k λmin/λmax(Φ_k†Φ_k)`` of the coarse
+    nodal values: the ``(F, −fH)`` pencil reproduces ``f(ε)`` on the coarse
+    grid exactly iff it is positive.  The energy-recovery number is the f
+    inverse on the coarse energies.  Neither is promoted into an off-grid
+    band-energy error: that requires an independent fine-k reference.
     """
-    isometry = float(receipt["row_isometry_max"])
-    cap = receipt.get("row_isometry_cap")
-    shell = 100.0 * float(receipt["outer_shell_l2_fraction"])
-    shell_max = 100.0 * float(receipt["outer_shell_max_over_r0"])
-    wall = float(receipt["locality_wall_seconds"])
-    isometry_line = f"Row isometry   : max |C C^H - I|={isometry:.5e}"
-    if cap is None:
-        isometry_line += " (diagnostic only; no per-k gauge repair)"
-    else:
-        isometry_line += f" (acceptance cap {float(cap):.5e})"
+    injectivity = float(receipt["nodal_injectivity_min"])
+    recovery = float(receipt["energy_recovery_error_ry"])
     return [
-        isometry_line,
-        f"f(H)_R locality: outer-shell ||f(H)_R||_F / total = {shell:.2f}%; "
-        f"largest shell ||f(H)_R||_F / R=0 = {shell_max:.2f}%",
-        "Error meaning  : the locality receipt diagnoses finite-supercell "
-        "aliasing risk; it is not an off-grid energy-error bound",
+        f"Nodal values   : min_k lmin/lmax(Phi^H Phi)={injectivity:.5e} "
+        "(coarse-grid pencil exact iff > 0)",
+        f"f inverse      : max |f^-1(f(e)) - e| = {recovery:.5e} Ry",
+        "Error meaning  : both are coarse-grid receipts; they are not an "
+        "off-grid energy-error bound",
         "Fine-k error   : unavailable without an independent fine-k "
         "wavefunction reference",
-        f"Receipt cost   : {wall:.2f} s; one sharded reduction, no matrix "
-        "gather",
     ]
 
 

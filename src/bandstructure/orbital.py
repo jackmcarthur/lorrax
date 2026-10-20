@@ -7,10 +7,11 @@ Three steps, one owner each:
     grid_moments               sum_n f(e_qn) <qn|O|qn> on a uniform q grid
 
 Each operator is projected on the fitted band space at every coarse k and
-carried into htransform's Galerkin basis as ``C^T O C^*``; that matrix is
-Fourier-interpolated exactly as fH is.  A QP rotation ``U`` is unitary on
-the fitted window, so ``C_QP^T O_QP C_QP^* = C^T O C^*``: the operators come
-from the WFN states, the QP enters only through the fH eigenvectors.
+carried into htransform's node space as the kernel ``C^T (M O M) C^*``
+(``C`` the WFN nodal values, ``M = U √(−f(E)) U^H`` with ``U`` the QP rotation
+of the fitted window, identity for DFT); that kernel is Fourier-interpolated
+exactly as fH is, and the pencil's dual vectors read
+``dual_n^† K dual_m = <n|O|m>`` of the htransform states.
 
 The orbital moment is the modern-theory one (``psp.orbital_response``): a
 stored velocity of the WFN's own states (:func:`stored_velocity`) is
@@ -25,7 +26,6 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import make_flat_k_ifftn
-from common.staged_reshard import face_to_batch_reshard
 from gw.qsgw_head import rotate_velocity_to_qp
 from runtime.padding import pad_axis, padded_axis
 from distrib_la import eigh_local
@@ -244,7 +244,7 @@ def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry):
 
 def path_orbital_moments(parents, sym, window, source_coefficients,
                          path_coefficients, kpath, kgrid, mesh, energies,
-                         deps_tol_ry):
+                         deps_tol_ry, *, B_at_mu, weight):
     """Wavepacket moments ``(q, 3, band)`` mu_B of the path states.
 
     The ``window`` of the parent velocity, unfolded by the polar time-odd
@@ -259,22 +259,45 @@ def path_orbital_moments(parents, sym, window, source_coefficients,
         1, 0), NamedSharding(mesh, P()))
     v_path = gather_to_host(interpolate_band_operator(
         velocity, source_coefficients, path_coefficients, np.asarray(kpath),
-        kgrid, mesh))[:len(energies)]
+        kgrid, mesh, B_at_mu=B_at_mu, weight=weight))[:len(energies)]
     return np.asarray(orbital_moments(v_path, energies,
                                       deps_tol_ry=deps_tol_ry)[0])
 
 
-def _operator_R(operator_cart, source_coefficients, kgrid, mesh):
+def operator_weight(ctilde, wfn_ctilde, f_eps):
+    """``M_k = U √(−f(E)) U^H`` (nk, nb, nb) in the WFN band basis.
+
+    ``ctilde`` are the nodal values of the states that define H (QP-rotated
+    or the WFN's own), ``wfn_ctilde`` the WFN's; their per-k relation
+    ``ctilde = U^T wfn_ctilde`` gives ``U``.  ``f_eps`` (nb, nk) are the
+    f-transformed H energies.  With ``M`` on both sides of a band operator,
+    the pencil's duals return its matrix elements on the H states.
+    """
+    @jax.jit
+    def _weight(c, c0, f):
+        ut = jnp.einsum('kna,kma->knm', c, jnp.conj(c0), optimize=True) @ \
+            jnp.linalg.pinv(jnp.einsum('kna,kma->knm', c0, jnp.conj(c0),
+                                       optimize=True), hermitian=True)
+        u = jnp.swapaxes(ut, -1, -2)
+        g = jnp.sqrt(jnp.clip(-f.T, 0.0, None))
+        return jnp.einsum('kmn,kn,kln->kml', u, g, jnp.conj(u), optimize=True)
+    return _weight(ctilde, wfn_ctilde, f_eps)
+
+
+def _operator_R(operator_cart, source_coefficients, weight, kgrid, mesh):
     """Lattice image ``(nk, rank, rank)`` of ONE band operator ``(1,k,n,n)``.
 
-    The shared two-sided contraction is ``U^H O U``; here ``U = conj(C)``,
-    giving ``C^T O C^*`` since ``C[k,n,a] = <B_a|psi_kn>``.  Sharded
-    ``P(None,'x','y')`` like ``fH_R``.
+    The shared two-sided contraction is ``U^H (M O M) U`` with ``U =
+    conj(C)``, giving ``C^T M O M C^*`` since ``C[k,n,ν] = ψ_kn(r_ν)``.
+    Sharded ``P(None,'x','y')`` like ``fH_R``.
     """
+    nb = int(weight.shape[-1])
+    weighted = jnp.einsum('kab,ckbd,kde->ckae', weight,
+                          operator_cart[..., :nb, :nb], weight, optimize=True)
     coefficients = pad_axis(
-        source_coefficients, operator_cart.shape[-1], axis=1).array
+        source_coefficients, weighted.shape[-1], axis=1).array
     operator_basis = rotate_velocity_to_qp(
-        operator_cart, jnp.conj(coefficients), mesh=mesh)
+        weighted, jnp.conj(coefficients), mesh=mesh)
     inverse = make_flat_k_ifftn(
         mesh, tuple(kgrid), P(None, None, None, None, 'x', 'y'),
         norm='backward')
@@ -293,17 +316,19 @@ def _check_shapes(operator_cart, source_coefficients, kgrid):
 
 
 def interpolate_band_operator(operator_cart, source_coefficients,
-                              path_coefficients, kpath, kgrid, mesh):
+                              path_coefficients, kpath, kgrid, mesh, *,
+                              B_at_mu, weight):
     """Return (q_carrier,component,band,band) matrices in the path basis.
 
-    ``operator_cart`` is (component,k,n,n), ``source_coefficients`` is
-    (k,n,rank), and ``path_coefficients`` is (q_carrier,rank,band), exactly
-    as returned by htransform.  Matrix elements use bra n, ket m.  The q
-    carrier is cut into passes of one q per device; one ``lax.scan`` runs
-    every pass of a component (the phase sum is local on the matrix face,
-    one face->q exchange per pass, then the local band rotation).
+    ``operator_cart`` is (component,k,n,n), ``source_coefficients`` the WFN
+    nodal values (k,n,rank), ``weight`` the :func:`operator_weight` and
+    ``path_coefficients`` the pencil duals (q_carrier,rank,band), exactly as
+    returned by htransform.  Matrix elements use bra n, ket m.  The q carrier
+    is cut into passes of one q per device; one ``lax.scan`` runs every pass
+    of a component (the per-pair Wigner–Seitz sum is local on the matrix
+    face, one face->q exchange per pass, then the local band rotation).
     """
-    from bandstructure.fh_interp import build_R_grid_np
+    from bandstructure.fh_interp import node_fourier, node_pair_table
     _check_shapes(operator_cart, source_coefficients, kgrid)
     rank = int(source_coefficients.shape[2])
     nq_carrier = int(path_coefficients.shape[0])
@@ -317,23 +342,18 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     # Device d holds carrier rows [d*n_pass, (d+1)*n_pass); pass p takes
     # row d*n_pass + p on every device, so no coefficient moves.
     q_tab = np.swapaxes(q_tab.reshape(step, n_pass, 3), 0, 1)
-    R = jnp.asarray(build_R_grid_np(kgrid))
-    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    table = node_pair_table(B_at_mu, kgrid, mesh)
     batch = NamedSharding(mesh, P(('x', 'y'), None, None))
-    exchange = face_to_batch_reshard(mesh)
 
     @partial(jax.jit, out_shardings=NamedSharding(
         mesh, P(('x', 'y'), None, None)))
-    def _scan(q_tab, coefficients, operator_R):
+    def _scan(q_tab, coefficients, operator_R, code):
         c_tab = jnp.swapaxes(coefficients.reshape(
             (step, n_pass) + coefficients.shape[1:]), 0, 1)
 
         def one_pass(_, xs):
             q, c = xs
-            phase = jnp.exp(-2j * jnp.pi * (q @ R.T))
-            value = 0.5 * jnp.einsum('qk,kmn->qmn', phase, operator_R)
-            value = exchange(jax.lax.with_sharding_constraint(value, face))
-            value = value + jnp.conj(jnp.swapaxes(value, -1, -2))
+            value = node_fourier(q, operator_R, code, table, mesh)
             c = jax.lax.with_sharding_constraint(c, batch)
             return None, jnp.einsum('qmi,qmn,qnj->qij', jnp.conj(c), value, c,
                                     optimize=True)
@@ -345,87 +365,79 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     parts = []
     for a in range(operator_cart.shape[0]):
         operator_R = _operator_R(operator_cart[a:a + 1], source_coefficients,
-                                 kgrid, mesh)
+                                 weight, kgrid, mesh)
         parts.append(jax.block_until_ready(
-            _scan(q_tab, path_coefficients, operator_R)))
+            _scan(q_tab, path_coefficients, operator_R, table["code"])))
         del operator_R
     return jnp.stack(parts, axis=1)
 
 
-def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
-                 n_states, mesh):
+def grid_moments(fH_R, F_R, f_params, operator_R_builders, kgrid, grid,
+                 n_states, mesh, *, B_at_mu, n_fit):
     """Energies and band diagonals of the fitted states on a uniform q grid.
 
     Returns ``(E (Nq, n_states) Ry, D (n_op, Nq, n_states), newton
-    residual)`` with q in C order over ``grid``.  One pass is one q_z plane:
-    a separable phase sum ``z -> y -> x`` over the coarse lattice R (local on
-    the ``(rank, rank)`` face; no dense-grid FFT carrier) and one face->q
-    exchange.  The first ``lax.scan`` solves fH on every plane and keeps the
-    fitted-state eigenvectors; ``fH_R`` is then deleted (consumed) and each
-    operator's lattice image, built by its ``operator_R_builders`` entry
-    only when needed, is read by a second scan.  At most one dense
-    ``(nk, rank, rank)`` image is resident.
+    residual)`` with q in C order over ``grid``; ``n_fit`` is the number of
+    fitted states (the pencil's extent).  One pass is one q_z plane:
+    the per-node-pair Wigner–Seitz sum over the plane's q (local on the
+    ``(rank, rank)`` face) and one face->q exchange.  The first ``lax.scan``
+    solves the pencil on every plane and keeps the fitted-state duals; the
+    kernels are then deleted (consumed) and each operator's lattice image,
+    built by its ``operator_R_builders`` entry only when needed, is read by a
+    second scan.  At most two dense ``(nk, rank, rank)`` images are resident.
     """
-    from bandstructure.fh_interp import build_R_grid_np, newton_inv
+    from bandstructure.fh_interp import (newton_inv, node_fourier,
+                                         node_pair_table, pencil_eigh)
     a_f, n_f, shift = f_params
-    nx, ny, nz = (int(v) for v in kgrid)
     Nx, Ny, Nz = (int(v) for v in grid)
-    rank = int(fH_R.shape[-1])
-    R = build_R_grid_np(kgrid).reshape(nx, ny, nz, 3)
-
-    def phases(N, Rvals):
-        return np.exp(-2j * np.pi * np.outer(np.arange(N) / N, Rvals))
-
-    Px = jnp.asarray(phases(Nx, R[:, 0, 0, 0]))
-    Py = jnp.asarray(phases(Ny, R[0, :, 0, 1]))
-    Pz = jnp.asarray(phases(Nz, R[0, 0, :, 2]))
     n_plane = Nx * Ny
     carrier = padded_axis(n_plane, mesh, name="moment grid plane",
                           spec=P(('x', 'y'), None, None), axis=0).carrier
-    face = NamedSharding(mesh, P(None, 'x', 'y'))
-    exchange = face_to_batch_reshard(mesh)
+    table = node_pair_table(B_at_mu, kgrid, mesh)
     plane_q = NamedSharding(mesh, P(None, ('x', 'y'), None))
     plane_v = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
+    ix, iy = np.meshgrid(np.arange(Nx) / Nx, np.arange(Ny) / Ny,
+                         indexing='ij')
+    q_xy = np.zeros((carrier, 2))
+    q_xy[:n_plane] = np.stack([ix.ravel(), iy.ravel()], axis=1)
+    q_xy = jnp.asarray(q_xy)
+    qz = jnp.asarray(np.arange(Nz) / Nz)
 
-    def plane(pz, X):
-        X = X.reshape(nx, ny, nz, rank, rank)
-        A = jnp.einsum('z,xyzab->xyab', pz, X)
-        A = jnp.einsum('jy,xyab->xjab', Py, A)
-        A = 0.5 * jnp.einsum('ix,xjab->ijab', Px, A).reshape(
-            n_plane, rank, rank)
-        A = pad_axis(A, carrier, axis=0).array
-        A = exchange(jax.lax.with_sharding_constraint(A, face))
-        return A + jnp.conj(jnp.swapaxes(A, -1, -2))
+    def plane(z, X, code):
+        q = jnp.concatenate([q_xy, jnp.full((carrier, 1), z)], axis=1)
+        return node_fourier(q, X, code, table, mesh)
 
     @partial(jax.jit, out_shardings=(plane_q, plane_v,
                                      NamedSharding(mesh, P())))
-    def _solve(fH_R):
-        def one_pass(_, pz):
-            values, vectors = jax.vmap(eigh_local)(plane(pz, fH_R))
+    def _solve(fH_R, F_R, code):
+        def one_pass(_, z):
+            values, _nodal, dual = pencil_eigh(
+                -plane(z, fH_R, code), plane(z, F_R, code), int(n_fit))
             energies, residual = newton_inv(
                 a_f, n_f, shift, values[:, :n_states].real)
-            return None, (energies, vectors[:, :, :n_states], residual)
+            return None, (energies, dual[:, :, :n_states], residual)
 
-        _, (E, V, res) = jax.lax.scan(one_pass, None, Pz, unroll=1)
+        _, (E, V, res) = jax.lax.scan(one_pass, None, qz, unroll=1)
         return E, V, jnp.max(res)
 
     @partial(jax.jit, out_shardings=plane_q)
-    def _expect(O_R, V):
+    def _expect(O_R, V, code):
         def one_pass(_, xs):
-            pz, v = xs
+            z, v = xs
             return None, jnp.einsum('qan,qab,qbn->qn', jnp.conj(v),
-                                    plane(pz, O_R), v, optimize=True).real
+                                    plane(z, O_R, code), v, optimize=True).real
 
-        _, D = jax.lax.scan(one_pass, None, (Pz, V), unroll=1)
+        _, D = jax.lax.scan(one_pass, None, (qz, V), unroll=1)
         return D
 
-    E, V, residual = _solve(fH_R)
+    E, V, residual = _solve(fH_R, F_R, table["code"])
     jax.block_until_ready(E)
     fH_R.delete()
+    F_R.delete()
     D = []
     for build in operator_R_builders:
         O_R = build()
-        D.append(jax.block_until_ready(_expect(O_R, V)))
+        D.append(jax.block_until_ready(_expect(O_R, V, table["code"])))
         O_R.delete()
     del V
     D = jnp.stack(D)
