@@ -277,8 +277,9 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def bind(room):
         lu = plan("solve_lu", mesh_xy, backend=backend, n=n, batched_route=route, budget_bytes=room)
         # The provider beside the room: one factor face and its getrf/getrs workspace and pivots
-        # (cuSOLVERMp: distrib_la.lu_workspace_bytes, measured panels, nrhs = n: the Dyson bodies
-        # solve against I or V; no vendor query at bind), else the getrs workspace cap
+        # (cuSOLVERMp: distrib_la.lu_workspace_bytes, measured panels, nrhs = n, getrs at the
+        # default cap -- no cap is posted at bind; a dispatch books the cap it posts beside this
+        # (_bank_execution); the Dyson bodies solve against I or V; no vendor query), else the getrs workspace cap
         # (batched_solve_lu_ffi: 2 GB, at most a face); over it, no route fits.
         if room is not None and lu.backend != "one_device":
             faces = 16 * int(n) * int(n) // int(mesh_xy.size)
@@ -1005,6 +1006,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
             stream = stage in ("real_time", "laplace", "windowed", "direct", "moment_correlation", "static_reference")
+            lu = None
             if stream:
                 # The caller reserves the sole carry; admit the actual
                 # Green/FFT workspace, without compiling a legacy comparator.
@@ -1012,26 +1014,35 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                                   memory.temp_size_in_bytes + int(runtime_bytes),
                                   runs_in="bank.dispatch." + stage)
                 receipt["memory"].append(row)
-            elif not stream:
+            else:
+                from lxkit import memory as allocator
+                from runtime.aot_memory import compiled_new_bytes
                 layout = dense_layout(meta, config, mesh_xy, args[0].shape[-1])
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
-                _, row = _reserve(meta, stage, memory.argument_size_in_bytes,
-                    memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"],
-                    runs_in="bank.dispatch." + stage)
+                # Beside the operands: temporaries + outputs - donated aliases, the dense workspace,
+                # and on cuSOLVERMp the Dyson LU's measured workspace (getrf, getrs at the default
+                # cap, pivots) plus the getrs cap posted for this dispatch: the room the ledger
+                # leaves (the native takes the widest chunk under it, else one block column, which
+                # the measured row covers).  The price is these bytes over what is live at entry.
+                new = compiled_new_bytes(executable) + native["total"]
+                lu = getattr(kernel, "lu", None)
+                lu = lu if lu is not None and lu.backend == "cusolvermp" else None
+                if lu is not None:
+                    from distrib_la import lu_workspace_bytes
+                    ledger, n_lu = meta.shared_pole_capacity, int(args[0].shape[-1])
+                    new += lu_workspace_bytes(mesh_xy, n_lu, np.complex128)
+                    cap = max(0, ledger.room_bytes_per_rank(ledger.live_stages)
+                              - memory.argument_size_in_bytes - new)
+                    new += cap
+                _, row = _reserve(meta, stage, memory.argument_size_in_bytes, new,
+                                  runs_in="bank.dispatch." + stage, book=False)
                 receipt["memory"].append(row)
-            # The Dyson LU's getrs chunks get what this dispatch leaves: the allocator's room
-            # (lxkit.memory.room, every rank's smallest) less this program's outputs and
-            # temporaries, the dense workspace and the LU's own priced workspace at one chunk.
-            lu = getattr(kernel, "lu", None) if not stream else None
-            if lu is not None:
-                from lxkit import memory as allocator
-                from distrib_la import lu_workspace_bytes
-                n_lu = int(args[0].shape[-1])
-                lu.chunk_room(n_lu, n_lu, allocator.room(stage) - memory.output_size_in_bytes
-                              - memory.temp_size_in_bytes - native["total"]
-                              - lu_workspace_bytes(mesh_xy, n_lu, np.complex128))
+                allocator.book(allocator.priced(new, f"bank {stage} program (temporaries + outputs - "
+                    "aliases, dense and LU workspace)", increment=True), stage="bank.dispatch." + stage)
+                if lu is not None:
+                    lu.chunk_room(n_lu, n_lu, cap)
             receipt["compiled"].append(dict(stage=stage,
                 arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
                 temporaries=memory.temp_size_in_bytes,
@@ -2547,12 +2558,14 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
     resident, the outputs, temporaries and native solver workspace on top.
     One ``sample_dyson`` pair ``(H held, chi, dchi) -> (Wc, dWc/ds)``; the
     photon pair also takes ``extra`` (the contact) and W_inf - V on the face.
-    A deck without a pair: ``sample_dyson`` takes ``(H, chi)``; ``sample_slope``
-    takes ``(H, Wc, dchi)`` while the value's chi rows are still held (one more
-    face stack).  Both at the full parent span ``nq``, the largest a sample solves.  ``mirrored``:
+    A deck without a pair (every face deck): ``sample_dyson`` takes ``(H, chi)``, donating
+    chi, while the slope's dchi rows are already held (one more face stack); ``sample_slope``
+    then takes ``(H, Wc, dchi)``.  Beside the operands: temporaries + outputs - donated
+    aliases, the dense workspace and the Dyson LU's measured workspace on cuSOLVERMp.  Both at the full parent span ``nq``, the largest a sample solves.  ``mirrored``:
     a partner's χ and dχ/ds rows are collected from unfolded tiles before they
     are concatenated (two more stacks, plus one tile's unfold).
     """
+    from runtime.aot_memory import compiled_new_bytes
     sharding = getattr(roots, "sharding", None)
     if sharding is None or not hasattr(roots, "shape"):
         return 0, 0
@@ -2570,14 +2583,19 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
     stages = (((pair, (jax.ShapeDtypeStruct(held_roots.shape, held_roots.dtype, sharding=held_roots.sharding),
                        face, face) + tuple(extra) + ((face,) if extra else ()), extra_bytes),)
               if pair is not None else
-              ((dyson.value, (h, face) + tuple(extra), extra_bytes),
-               (solve_slope, (h, face, face), held + extra_bytes)))
+              ((dyson.value, (h, face) + tuple(extra), held + extra_bytes),
+               (solve_slope, (h, face, face), extra_bytes)))
+    lu = getattr(dyson.value, "lu", None)
+    if lu is not None and lu.backend == "cusolvermp":
+        from distrib_la import lu_workspace_bytes
+        native += lu_workspace_bytes(mesh_xy, int(n), np.complex128)
     for kernel, args, kept in stages:
-        memory = _compiled(kernel, args).memory_analysis()
+        executable = _compiled(kernel, args)
+        memory = executable.memory_analysis()
         if memory is None:
             raise ValueError("GATE response_capacity: compiled memory unavailable")
         phases.append((int(memory.argument_size_in_bytes) + kept,
-                       int(memory.output_size_in_bytes + memory.temp_size_in_bytes) + int(native)))
+                       compiled_new_bytes(executable) + int(native)))
     return tuple(max(p[i] for p in phases) for i in (0, 1))
 
 
