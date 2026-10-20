@@ -509,7 +509,8 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     packed=pack_panels(tuple([s[k] for s in states] for k in (1,2,3)),tables['order'],
                        [int(s[1].shape[-1]) for s in states],mesh_xy=mesh,layout='face')
     args=(tables['points'],tables['active'],*packed,tuple(infinity))
-    executable,run=program(room).checked(*args).compiled(*args)
+    executable,run=face_compiled(('parent',mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
+                                  str(eigh_backend),carrier),room,program,args)
     if beside is not None:
         price_round(executable,mesh,beside)
     result=run(*args)
@@ -545,6 +546,23 @@ def price_round(executable, mesh, beside, whole=False):
                         ranks=ranks, label="reduction round executable")
     memory.admit("shared-pole reduction round", beside + part, memory.run()["budget"])
     memory.book(part)
+
+
+_FACE_COMPILED: dict = {}
+
+
+def face_compiled(key, room, build, args):
+    """``build(room).checked(*args).compiled(*args)`` (executable, run), compiled once per class
+    of rooms that decide its eigh stacks alike (``distrib_la.room_class``), so a round that
+    repeats a shape in another room runs, or is priced by, the executable already compiled.  An
+    exhausted room (or any non-int) compiles per room, as before."""
+    import jax
+    import distrib_la
+    compile_ = lambda: build(room).checked(*args).compiled(*args)
+    if not (type(room) is int or isinstance(room, np.integer)):
+        return compile_()
+    sig = tuple((tuple(a.shape), str(a.dtype), str(getattr(a, "sharding", None))) for a in jax.tree.leaves(args))
+    return distrib_la.room_class(_FACE_COMPILED, (key, sig), int(room), compile_)
 
 
 def plan_room(room):
@@ -623,10 +641,13 @@ def face_round_compiled_bytes(mesh, width, *, rows, finite, infinity_width, infi
     args = (jax.ShapeDtypeStruct((b, int(finite)), np.complex128),
             jax.ShapeDtypeStruct((b, side), np.bool_), *(panel(finite) for _ in range(3)),
             tuple(panel(infinity_width) for _ in range(int(infinities))))
-    plan = face_eigh(mesh, side, room=room, backend=eigh_backend)
-    program = face_parent_program(mesh, bool(ordered), bool(odd_moments), keep_budget, False, side,
-                                  None, plan, None if carrier is None else int(carrier), plan_room(plan))
-    return -agreed_chunk(-compiled_new_bytes(program.checked(*args).compiled(*args)[0]))
+    carrier = None if carrier is None else int(carrier)
+    program = lambda r: face_parent_program(mesh, bool(ordered), bool(odd_moments), keep_budget, False, side,
+                                            None, face_eigh(mesh, side, room=r, backend=eigh_backend), carrier,
+                                            plan_room(r))
+    executable = face_compiled(("parent", mesh, bool(ordered), bool(odd_moments), keep_budget, False, side, None,
+                                str(eigh_backend), carrier), room, program, args)[0]
+    return -agreed_chunk(-compiled_new_bytes(executable))
 
 
 def face_reduction_bytes(mesh, width, *, rows, side, carrier, retain_span=False):
