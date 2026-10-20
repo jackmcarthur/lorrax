@@ -1635,13 +1635,37 @@ def _transverse_lu_ridge(trace, n_log):
 _TRANSVERSE_LU_BACKWARD_MAX = 1e-8
 
 
+#: Iterations of the transverse factor's kappa estimator (Hager-Higham, LAPACK xLACN2).
+_KAPPA_STEPS = 5
+
+
+def _kappa_1_lower(C, solve, n_log):
+    """A lower bound on kappa_1 = ||C||_1 ||C^-1||_1 of the Hermitian ridged Gram ``C`` on its
+    logical block, from ``solve(b) = C^-1 b`` alone (Hager-Higham, LAPACK xLACN2; C^H = C, so
+    the transposed solve is the same call): every iterate ||C^-1 x||_1 with ||x||_1 = 1 is
+    <= ||C^-1||_1. The same arithmetic on either route, each with its own solve (the local
+    LU, or the mesh route's C^-1), so the gate does not depend on the route."""
+    n = C.shape[-1]
+    live = jnp.arange(n) < n_log
+    norm1 = jnp.max(jnp.sum(jnp.where(live[:, None] & live[None, :], jnp.abs(C), 0), axis=0))
+    x = jnp.where(live, 1.0 / n_log, 0).astype(C.dtype)
+    best = jnp.zeros((), jnp.float64)
+    for _ in range(_KAPPA_STEPS):
+        y = jnp.where(live, solve(x), 0)
+        best = jnp.maximum(best, jnp.sum(jnp.abs(y)))
+        sign = jnp.where(jnp.abs(y) > 0, y / jnp.where(jnp.abs(y) > 0, jnp.abs(y), 1), 1)
+        z = jnp.where(live, solve(jnp.where(live, sign, 0).astype(C.dtype)), 0)
+        x = jax.nn.one_hot(jnp.argmax(jnp.abs(z)), n, dtype=C.dtype)
+    return (norm1 * best).astype(jnp.float64)
+
+
 def _transverse_lu_math(C_log: jax.Array, n_log: int):
     """Factor the logical signed Gram with its sign-aware ridge before the unchanged RHS solve.
 
-    Also returns the solve's normwise backward error on one fixed probe,
-    eta = ||C x - b|| / (||C||_F ||x|| + ||b||) with b = C x0 and x0 unit
-    phases: O(n^2) next to the O(n^3) factor, on the whole tile the factor
-    already holds.  LU and pivots are unchanged by it.
+    Also returns ``[eta, kappa]``: the solve's normwise backward error on one fixed probe,
+    eta = ||C x - b|| / (||C||_F ||x|| + ||b||) with b = C x0 and x0 unit phases, and
+    :func:`_kappa_1_lower`: O(n^2) next to the O(n^3) factor, on the whole tile the factor
+    already holds.  LU and pivots are unchanged by them.
     """
     ridge = _transverse_lu_ridge(jnp.trace(C_log), n_log)
     C_reg = C_log + ridge * jnp.eye(n_log, dtype=C_log.dtype)
@@ -1654,16 +1678,21 @@ def _transverse_lu_math(C_log: jax.Array, n_log: int):
     x = lu_solve_local(lu, piv, b)
     eta = (jnp.linalg.norm(C_reg @ x - b)
            / (jnp.linalg.norm(C_reg) * jnp.linalg.norm(x) + jnp.linalg.norm(b)))
-    return lu, piv, eta.astype(jnp.float64)
+    kappa = _kappa_1_lower(C_reg, lambda v: lu_solve_local(lu, piv, v), n_log)
+    return lu, piv, jnp.stack([eta.astype(jnp.float64), kappa])
 
 
-def _certify_transverse_lu_residual(eta_q, *, where: str) -> None:
-    """Refuse a transverse ζ LU whose probe backward error exceeds the bound."""
+def _certify_transverse_factor(figures_q, *, where: str) -> None:
+    """The transverse ζ factor's two gates on its per-q ``[eta, kappa]`` figures, either route:
+    the kappa ceiling (:func:`_kappa_1_lower`), then the probe backward error."""
     mode = rank_criterion.resolve_policy_mode(
         os.environ.get(rank_criterion.POLICY_MODE_ENV))
     if mode == "off":
         return
-    eta = np.asarray(jax.device_get(eta_q), dtype=float).reshape(-1)
+    figures = np.asarray(jax.device_get(figures_q), dtype=float).reshape(-1, 2)
+    _refuse_kappa(figures[:, 1], where=where, estimator="||C||_1 ||C^-1||_1 (Hager-Higham)",
+                  mode=mode)
+    eta = figures[:, 0]
     worst = float(np.max(eta)) if eta.size else 0.0
     q_at = int(np.argmax(eta)) if eta.size else -1
     if jax.process_index() == 0:
@@ -1680,28 +1709,6 @@ def _certify_transverse_lu_residual(eta_q, *, where: str) -> None:
     if mode == "refuse":
         raise rank_criterion.RankPolicyError(msg)
     print("*** " + msg, flush=True)
-
-
-def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
-                              where: str) -> None:
-    """CONDITIONING INSTRUMENT for the default (ridge) transverse path; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    mode = rank_criterion.resolve_policy_mode(
-        os.environ.get(rank_criterion.POLICY_MODE_ENV))
-    if mode == "off":
-        return
-    n = int(n_log)
-
-    @jax.jit
-    def _kappa_lb(LU):
-        u = jnp.abs(jnp.diagonal(LU[:, :n, :n], axis1=-2, axis2=-1))
-        return jnp.max(u, axis=-1), jnp.min(u, axis=-1)
-
-    hi, lo = jax.device_get(_kappa_lb(LU_q))
-    hi = np.asarray(hi, dtype=float)
-    lo = np.asarray(lo, dtype=float)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        kap = np.where(lo > 0.0, hi / np.where(lo > 0.0, lo, 1.0), np.inf)
-    _refuse_kappa(kap, where=where, estimator="max|u_ii|/min|u_ii| of the pivoted LU", mode=mode)
 
 
 def _refuse_kappa(kap, *, where: str, estimator: str, mode: str) -> None:
@@ -1762,9 +1769,8 @@ def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh) -> str:
 def _factor_c_q_transverse_inverse(C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int):
     """The mesh route of the transverse factor: C_reg⁻¹ [nq, n, n] on the face, with the same
     sign-aware ridge on the logical block as the LU route and a zero pad block (ζ pad rows
-    zero), by distrib_la's mesh LU solve against I. Returns ``(C⁻¹, eta, kappa_lb)``: the
-    probe backward error of :func:`_transverse_lu_math` and max|C_ij|·max|(C⁻¹)_ij|, a lower
-    bound on kappa_2 (|a_ij| <= ||A||_2), both on the logical block."""
+    zero), by distrib_la's mesh LU solve against I. Returns ``(C⁻¹, figures)``, the per-q
+    ``[eta, kappa]`` of :func:`_transverse_lu_math` on the logical block."""
     import distrib_la
     from common.gpu_utils import shared_device_room
     nq, n, _ = C_q.shape
@@ -1788,7 +1794,7 @@ def _factor_c_q_transverse_inverse(C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical:
     # which the probe below reads.
     inverse = lu.batched(jax.jit(jnp.copy, out_shardings=face)(C_reg), eye)
 
-    @partial(jax.jit, out_shardings=(face, NamedSharding(mesh_xy, P()), NamedSharding(mesh_xy, P())))
+    @partial(jax.jit, out_shardings=(face, NamedSharding(mesh_xy, P())))
     def figures(C, X):
         live, block = masks()
         X = jnp.where(block[None], X, 0)
@@ -1800,8 +1806,8 @@ def _factor_c_q_transverse_inverse(C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical:
         r = jnp.einsum('qmn,qn->qm', Cl, x) - b
         norm = lambda v: jnp.sqrt(jnp.sum(jnp.abs(v) ** 2, axis=tuple(range(1, v.ndim))))
         eta = norm(r) / (norm(Cl) * norm(x) + norm(b))
-        kappa = jnp.max(jnp.abs(Cl), axis=(1, 2)) * jnp.max(jnp.abs(X), axis=(1, 2))
-        return X, eta.astype(jnp.float64), kappa.astype(jnp.float64)
+        kappa = jax.vmap(lambda c, inv: _kappa_1_lower(c, lambda v: inv @ v, n_log))(Cl, X)
+        return X, jnp.stack([eta.astype(jnp.float64), kappa], axis=-1)
     return figures(C_reg, inverse)
 
 
@@ -1837,7 +1843,7 @@ def _factor_c_q_transverse_lu(
         if key not in _transverse_lu_cache:
             @partial(jax.jit,
                      out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None)),
-                                    NamedSharding(mesh_xy, P(None))))
+                                    NamedSharding(mesh_xy, P(None, None))))
             def _fn(C):
                 def _fact_log(C_log):
                     C_log = jax.lax.with_sharding_constraint(
@@ -1860,8 +1866,8 @@ def _factor_c_q_transverse_lu(
         perm_q = jax.device_put(
             jnp.concatenate([p[1] for p in parts], axis=0),
             NamedSharding(mesh_xy, P(None, None)))
-        eta_q = jnp.concatenate([p[2] for p in parts], axis=0)
-        return LU_q, perm_q, eta_q
+        figures_q = jnp.concatenate([p[2] for p in parts], axis=0)
+        return LU_q, perm_q, figures_q
     key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, 'qpar')
     if key not in _transverse_lu_cache:
         _qparallel_announce_transverse(nq, n_rmu, n_log, mesh_xy)
@@ -1887,7 +1893,7 @@ def _factor_c_q_transverse_lu(
             def _skip(C1):
                 return (jnp.zeros_like(C1),
                         jnp.zeros((1, n_log), dtype=jnp.int32),
-                        jnp.zeros((1,), dtype=jnp.float64))
+                        jnp.zeros((1, 2), dtype=jnp.float64))
 
             def _one(i, accs):
                 LU_acc, perm_acc, eta_acc = accs
@@ -1899,24 +1905,24 @@ def _factor_c_q_transverse_lu(
                         jax.lax.dynamic_update_slice(
                             perm_acc, perm1, (i, 0)),
                         jax.lax.dynamic_update_slice(
-                            eta_acc, eta1, (i,)))
+                            eta_acc, eta1, (i, 0)))
 
             return jax.lax.fori_loop(
                 0, blk, _one,
                 (jnp.zeros_like(C_loc),
                  jnp.zeros((blk, n_log), dtype=jnp.int32),
-                 jnp.zeros((blk,), dtype=jnp.float64)))
+                 jnp.zeros((blk, 2), dtype=jnp.float64)))
 
         _sm = shard_map(_local_factor, mesh=mesh_xy,
                         in_specs=P(('x', 'y'), None, None),
                         out_specs=(P(('x', 'y'), None, None),
                                    P(('x', 'y'), None),
-                                   P(('x', 'y'))),
+                                   P(('x', 'y'), None)),
                         check_vma=False)
 
         @partial(jax.jit,
                  out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None)),
-                                NamedSharding(mesh_xy, P(None))))
+                                NamedSharding(mesh_xy, P(None, None))))
         def _fn(C):
             C = C[:, :n_log, :n_log]
             if nq_pad > nq:
@@ -2126,28 +2132,13 @@ def factor_c_q(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
         if transverse_factor_layout(int(nq), int(n_rmu), mesh_xy) == "mesh":
             # (C⁻¹, None): the caller's factor kind is 'inverse' (ζ = C⁻¹Z on the face).
-            inverse, eta_q, kappa_q = _factor_c_q_transverse_inverse(
-                C_q, mesh_xy, n_rmu_logical)
-            mode = rank_criterion.resolve_policy_mode(
-                os.environ.get(rank_criterion.POLICY_MODE_ENV))
-            if mode != "off":
-                _refuse_kappa(np.asarray(jax.device_get(kappa_q), dtype=float),
-                              where="zeta transverse ridge (mesh inverse)",
-                              estimator="max|C_ij| max|(C^-1)_ij|", mode=mode)
-            _certify_transverse_lu_residual(eta_q, where="zeta transverse ridge (mesh inverse)")
+            inverse, figures_q = _factor_c_q_transverse_inverse(C_q, mesh_xy, n_rmu_logical)
+            _certify_transverse_factor(figures_q, where="zeta transverse ridge (mesh inverse)")
             return inverse, None
-        LU_q, perm_q, eta_q = _factor_c_q_transverse_lu(
+        LU_q, perm_q, figures_q = _factor_c_q_transverse_lu(
             C_q, mesh_xy, n_rmu_logical)
-        # THE DEFAULT TRANSVERSE PATH'S ONLY CONDITIONING NUMBER.  See
-        # _certify_transverse_ridge for what it measures, what it costs and
-        # why a LOWER bound is the right instrument for this gate.
-        _certify_transverse_ridge(
-            LU_q,
-            n_log=int(n_rmu_logical if n_rmu_logical is not None
-                      else C_q.shape[-1]),
-            where="zeta transverse ridge (LU)")
-        _certify_transverse_lu_residual(
-            eta_q, where="zeta transverse ridge (LU)")
+        # The transverse path's conditioning number and residual, the same on either route.
+        _certify_transverse_factor(figures_q, where="zeta transverse ridge (LU)")
         return LU_q, perm_q
 
     solver_kind = _resolve_solver_kind(0, solver_kind)
