@@ -100,7 +100,7 @@ def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     return int(resident), int(workspace)
 
 
-def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole parents"):
+def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole parents", whole=0):
     """'local' when whole parents per rank fit the ledger beside its live stages, else 'face'.
 
     ``price(execution)`` returns the route's ``(resident, workspace)`` bytes per
@@ -108,8 +108,10 @@ def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole pa
     mesh, one parent after another, priced only when the local route does not
     fit (its plan opens the provider). Decided and recorded by
     ``lxkit.memory.admit``. Returns ``(execution, resident,
-    workspace)``, the prices of the chosen route.
+    workspace)``, the prices of the chosen route. ``whole``: the side of the parents a rank holds
+    whole on the local route (the face is its distributed backup, ``memory.require_backup``).
     """
+    import dataclasses
     from lxkit import memory
     prices = {}
 
@@ -120,7 +122,7 @@ def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole pa
                               concurrent_with=ledger.live_stages)
     row = aggregate('local')
     execution = memory.admit(site, (
-        ('local', ledger.price(row)),
+        ('local', dataclasses.replace(ledger.price(row), whole=int(whole))),
         ('face', lambda: ledger.price(aggregate('face'))
          + memory.Price(outside=memory.contexts()))),
         row['available_device_bytes_per_rank'])
@@ -135,7 +137,8 @@ def line_selection_execution(rows, *, mesh, ledger, nq, eigh_backend, carry=0):
     return whole_parent_execution(
         lambda execution: line_selection_price(rows, mesh=mesh, nq=nq, execution=execution,
                                                eigh_backend=eigh_backend),
-        ledger=ledger, carry=carry, site=f"shared-pole line selection {int(nq)} parents")
+        ledger=ledger, carry=carry, site=f"shared-pole line selection {int(nq)} parents",
+        whole=max(map(int, rows)))
 
 
 def line_selection_room(ledger, resident, *, carry=0):
@@ -232,6 +235,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     reduction_phase = 'cross_reduction' if cross_original_sides is not None else 'reduction'
     reduction_args = (dict(cross_original_sides=cross_original_sides)
                       if cross_original_sides is not None else {})
+    import dataclasses
     from lxkit import memory
     decision = {}
 
@@ -240,7 +244,8 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
         # price here is the provider's contexts alone; the caller records the
         # map's final route.
         decision.update(memory.admit('shared-pole constructor', (
-            ('local', ledger.price(max(rows, key=lambda r: r['aggregate_bytes_per_rank']))),
+            ('local', dataclasses.replace(ledger.price(max(rows, key=lambda r: r['aggregate_bytes_per_rank'])),
+                                          whole=int(side))),
             ('face', memory.Price(outside=memory.contexts()))),
             rows[0]['available_device_bytes_per_rank'], quiet=True, detail=True))
         return decision['route'] == 'local'
