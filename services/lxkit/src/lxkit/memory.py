@@ -245,7 +245,7 @@ _SINK = [None]
 # ---------------------------------------------------------------------------
 # Trace (LORRAX_MEMORY_TRACE): what is live, what the allocator holds, what compiled
 # ---------------------------------------------------------------------------
-_T: dict = {"sections": [], "born": {}, "hooked": False}
+_T: dict = {"sections": [], "born": {}, "hooked": False, "exe": {}}
 
 
 def _snapshot() -> dict:
@@ -276,9 +276,18 @@ def _snapshot() -> dict:
 
 
 def _hook_compiles() -> None:
-    """Record every executable XLA compiles (cache hits included) under the open section."""
+    """Record every executable XLA compiles (cache hits included) under the open section, and
+    under the sections open at its first run (``runs``: where its temporaries are allocated)."""
     from jax._src import compiler
-    original = compiler.compile_or_get_cached
+    from jax._src.interpreters import pxla
+    original, execute = compiler.compile_or_get_cached, pxla.ExecuteReplicated.__call__
+
+    def run(self, *args):
+        hit = _T["exe"].pop(id(self.xla_executable), None)
+        for t in (_OPEN if hit is not None else ()):
+            if t.rec is not None:
+                t.rec["runs"].append(hit[1])
+        return execute(self, *args)
 
     def traced(backend, computation, *args, **kwargs):
         executable = original(backend, computation, *args, **kwargs)
@@ -291,10 +300,12 @@ def _hook_compiles() -> None:
             for t in _OPEN:
                 if t.rec is not None:
                     t.rec["compiles"].append(row)
+            _T["exe"][id(executable)] = (executable, row)
         except Exception:                                      # noqa: BLE001
             pass
         return executable
     compiler.compile_or_get_cached, _T["hooked"] = traced, True
+    pxla.ExecuteReplicated.__call__ = run
     open(_trace_path(), "w").close()                  # this run's trace starts empty
     import atexit
     atexit.register(trace_dump)
@@ -326,7 +337,7 @@ def _trace(tracker: Tracker, event: str) -> None:
         _T["last"] = (_COST[0], snap)
         if event == "open":
             tracker.rec = dict(name=tracker.name, depth=len(_OPEN) - 1, open=snap, peak=snap,
-                               compiles=[], t_open=time.time())
+                               compiles=[], runs=[], t_open=time.time())
         for t in ([tracker] if event == "close" else _OPEN):
             if t.rec is not None and snap["live"] > t.rec["peak"]["live"]:
                 t.rec["peak"] = snap
@@ -399,8 +410,10 @@ def boundary() -> Optional[int]:
     if high is not None:
         for t in _OPEN:
             t.whole = max(t.whole, high)
-            if t.mark0 is not None:
-                t.metered, t.exact = max(t.metered, high), t.exact and exact
+        # An interval is metered by the innermost priced stage: a priced child owns its own.
+        owner = next((t for t in reversed(_OPEN) if t.mark0 is not None), None)
+        if owner is not None:
+            owner.metered, owner.exact = max(owner.metered, high), owner.exact and exact
         if _OPEN:
             _OPEN[-1].own = max(_OPEN[-1].own, high)
     if TRACE and _OPEN:
@@ -442,6 +455,10 @@ def close_tracker(tracker: Optional[Tracker]) -> tuple:
         # First raise: a stage that lifted the never-resetting mark peaked at it exactly.
         tracker.exact = _I["mark"] > tracker.mark0
         tracker.metered = _I["mark"] if tracker.exact else tracker.metered
+    if tracker.mark0 is not None:          # the priced parent's first raise is past this child's
+        parent = next((t for t in reversed(_OPEN) if t.mark0 is not None), None)
+        if parent is not None:
+            parent.mark0 = max(parent.mark0, _I["mark"])
     if TRACE and tracker.rec is not None:
         _trace(tracker, "close")
     if tracker.parts:
