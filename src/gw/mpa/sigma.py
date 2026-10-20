@@ -1062,7 +1062,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                                                 factors=factors) if e == "local"
                        else (_shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy,
                                                          layout=layout, extents=extents), 0)),
-            ledger=capacity)
+            ledger=capacity, whole=int(meta.n_rmu))
         if execution == "local":
             receipt = capacity.reserve(
                 f"{stage}.synthesis", resident_bytes_per_rank=whole_resident,

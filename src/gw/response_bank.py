@@ -922,7 +922,7 @@ def dense_layout(meta, config, mesh_xy, n):
     whole = _WHOLE_PARENT_MATRICES * 16 * int(n) * int(n)
     execution, _, _ = whole_parent_execution(
         lambda e: (0, whole if e == "local" else -(-whole // int(mesh_xy.size))),
-        ledger=meta.shared_pole_capacity)
+        ledger=meta.shared_pole_capacity, whole=int(n))
     return "local" if execution == "local" else "distributed"
 
 

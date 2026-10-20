@@ -56,6 +56,8 @@ import sys
 
 import jax
 import jax.numpy as jnp
+import dataclasses
+
 import numpy as np
 from common import timing
 
@@ -80,8 +82,8 @@ def _gamma_gemm_route(mesh, b_shape, budget_bytes):
     fits = distrib_la.fits_local(SimpleNamespace(mesh=mesh), "gemm", shapes, np.complex128,
                                  int(budget_bytes), batch=q)
     # The staged route runs where distrib_la.fits_local says (its workspace and gathered cap).
-    staged = memory.priced(16 * sum(int(np.prod(s)) for s in shapes), "whole matrices per rank",
-                           term="operands")
+    staged = dataclasses.replace(memory.priced(16 * sum(int(np.prod(s)) for s in shapes),
+                                               "whole matrices per rank", term="operands"), whole=min(n, k))
     faces = memory.priced(0, "A, B and D faces", term="operands",
                           spread=16 * q * (2 * n * k + n * n), ranks=ranks)
     if memory.admit(f"shared-pole head Gamma GEMM {q} x {n} x {k}",

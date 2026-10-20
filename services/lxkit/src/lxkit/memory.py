@@ -55,6 +55,8 @@ class Price:
     ranks: int = 1
     label: str = ""
     increment: bool = False
+    #: The largest matrix side a rank holds whole on this route (0: distributed, no whole matrix).
+    whole: int = 0
 
     def settled(self) -> "Price":
         if not self.increment:
@@ -83,7 +85,8 @@ class Price:
                         (lambda p: sum(g(p) for g in grids)) if grids else None)
         return Price(*(join(getattr(self, n), getattr(other, n)) for n in TERMS),
                      ranks=max(self.ranks, other.ranks), increment=self.increment or other.increment,
-                     label=" + ".join(s for s in (self.label, other.label) if s))
+                     label=" + ".join(s for s in (self.label, other.label) if s),
+                     whole=max(self.whole, other.whole))
 
 
 def priced(nbytes: float, source: str, *, term: str = "xla", spread: float = 0.0,
@@ -710,6 +713,11 @@ def admit(stage: str, routes, room_bytes: float, *, probe=None, forced=None, qui
         return dict(route=route, reason=reason, warning=warning) if detail else route
     if forced is not None:
         return record(forced, "named")
+    if device:
+        priced_routes = [p for _, p, *rest in routes if isinstance(p, Price)]
+        if any(p.whole for p in priced_routes):
+            require_backup(stage, [p.whole for p in priced_routes],
+                           any(not p.whole for p in priced_routes) or len(priced_routes) < len(routes))
     done = []                    # (name, price, room)
     for i, (name, price, *own) in enumerate(routes):
         room = float(own[0] if own else room_bytes)
@@ -749,6 +757,34 @@ def admit(stage: str, routes, room_bytes: float, *, probe=None, forced=None, qui
     _warn(stage, price.bytes(), f"memory: {stage} priced over the limit ({name} "
           f"{_gb(price.bytes())}/rank over {_gb(physical)}); {line}", local=local)
     return record(name, reason, warning="priced over the allocator limit")
+
+
+#: ``LORRAX_NMU2_BACKUP=report``: a stage with no distributed backup is listed (``findings``),
+#: not refused (the census and the traced calibration runs).
+NMU2_REPORT = os.environ.get("LORRAX_NMU2_BACKUP", "") == "report"
+
+
+def set_nmu(n: int) -> None:
+    """The run's N_mu: a whole matrix with a side >= N_mu / 2 (N_mu^2 and the pencil and
+    gathered sides derived from it) needs a distributed backup (:func:`require_backup`)."""
+    _RUN["nmu"] = int(n)
+
+
+def require_backup(stage: str, wholes, distributed: bool) -> None:
+    """Route completeness (owner): a stage whose candidates hold an N_mu-scale matrix whole on a
+    rank (``wholes``: each candidate's largest whole side) must have a distributed candidate;
+    the router picks between them.  None: GATE nmu2_no_backup (``NMU2_REPORT``: a finding)."""
+    import jax
+    nmu = int(_RUN.get("nmu", 0))
+    big = [int(w) for w in wholes if nmu and int(w) * 2 >= nmu]
+    if not big or distributed or jax.device_count() < 2:
+        return
+    what = (f"GATE nmu2_no_backup: got: {stage} holds a whole {max(big)} x {max(big)} matrix on a "
+            f"rank (N_mu {nmu}) with no distributed candidate; want: a mesh route beside it")
+    if not NMU2_REPORT:
+        raise RuntimeError(what)
+    if what not in _FINDINGS:
+        _FINDINGS.append(what)
 
 
 def _warn(stage: str, need: float, message: str, *, local: bool) -> None:
