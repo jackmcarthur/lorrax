@@ -132,6 +132,8 @@ def make_native_snapshot_evaluator(source, prepared, options):
                 spm_support_sites_ev=options.get("spm_support_sites", ""),
                 support_reads_ev=source.get("recipe_inputs", {}).get("support_reads_ev"),
                 fit_tolerance=float(options.get("fit_tolerance", 0.02)))
+            if options.get('stop_after_model_q') is not None:
+                snapshot['stop_after_model_q']=int(options['stop_after_model_q'])
             # The native builder owns support/direction/K admission. No
             # projected rank, prototype pole order or sample count enters.
             built = screen_general_shared_poles(inp["wfns"], inp["V_q"], inp["meta"], screening_config,
