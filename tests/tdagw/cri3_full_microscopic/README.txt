@@ -47,8 +47,8 @@ spans6.70403eV in[100,144), versus8.39510eV in[88,144) and1.85550eV
 in[128,132). Its minimum direct lower-edge separation E100-E99 is only
 20.1002meV; this is not the isolated lower edge of the old56-band group.
 These are read-only source-table measurements, not a leakage/convergence
-test or an instantaneous interacting gap. At201 time samples/36k, complex128
-rho alone occupies about224MB/trial for44 bands, versus1.85MB for4.
+test or an instantaneous interacting gap. At200 end-exclusive time samples/36k,
+complex128 rho alone occupies about223MB/trial for44 bands, versus1.84MB for4.
 Existing band-extrapolation constraints and missing TD adapter are described
 in docs/theory/band-extrapolation.md; do not enable it on this160-band case.
 
