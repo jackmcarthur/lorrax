@@ -1,7 +1,7 @@
 """ISDF core primitives: ψ + centroids -> ζ interpolation vectors; see docs/architecture/zeta_fit_face_psi_cct.md."""
 import math
 import os
-from functools import partial
+from functools import lru_cache, partial
 
 import numpy as np
 import jax
@@ -1334,13 +1334,17 @@ def _identity_pad_block_diagonal(
     sharding = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     if n_rmu_logical == n_rmu:
         return jax.lax.with_sharding_constraint(M, sharding)
-    # Build a (n_rmu, n_rmu) diagonal matrix whose only non-zeros sit
-    # on positions ``[n_rmu_logical, n_rmu)`` of the diagonal.
-    idx = jnp.arange(n_rmu)
-    pad_diag_mask = (idx >= n_rmu_logical).astype(M.dtype)
-    eye_pad = jnp.diag(pad_diag_mask)
-    M_id_pad = M + eye_pad[None, :, :]
-    return jax.lax.with_sharding_constraint(M_id_pad, sharding)
+    # The pad-block identity [n_rmu_logical, n_rmu) is traced inside one program on M's face:
+    # an eager jnp.diag built the whole (n_rmu, n_rmu) on every process's default device.
+    return _identity_pad_program(sharding, int(n_rmu), int(n_rmu_logical))(M)
+
+
+@lru_cache(maxsize=None)
+def _identity_pad_program(sharding, n_rmu, n_rmu_logical):
+    def add(M):
+        pad = (jnp.arange(n_rmu) >= n_rmu_logical).astype(M.dtype)
+        return M + jnp.diag(pad)[None, :, :]
+    return jax.jit(add, out_shardings=sharding)
 
 
 def _resolve_solver_kind(vertex_mu_L: int, solver_kind: str, **_) -> str:
@@ -1544,10 +1548,10 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     key = (_mesh_key(mesh_xy), int(nq), int(n), n_log, float(rcond), room)
     if key not in _charge_face_cache:
         eig = plan("eigh", mesh_xy, n=int(n), budget_bytes=room)
-        live = np.arange(int(n)) < n_log
-
         @partial(checked_program, mesh=mesh_xy, out_shardings=(face, rep), in_shardings=(face,))
         def _fn(C):
+            # A traced iota mask: the host (n, n) mask was a whole n^2 constant per rank.
+            live = jnp.arange(int(n)) < n_log
             C = jnp.where(live[:, None] & live[None, :], C, 0)
             B, figures = cplus.factor(C, rcond=rcond, rank_log=True, n_log=n_log,
                                       eigh=lambda c: eig.batched(c, cut=rcond))
@@ -1751,12 +1755,17 @@ def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
     lo = np.asarray(lo, dtype=float)
     with np.errstate(divide='ignore', invalid='ignore'):
         kap = np.where(lo > 0.0, hi / np.where(lo > 0.0, lo, 1.0), np.inf)
+    _refuse_kappa(kap, where=where, estimator="max|u_ii|/min|u_ii| of the pivoted LU", mode=mode)
+
+
+def _refuse_kappa(kap, *, where: str, estimator: str, mode: str) -> None:
+    """The transverse ridge's kappa ceiling on a per-q LOWER bound ``kap``."""
     k_max = float(np.max(kap)) if kap.size else 0.0
     q_at = int(np.argmax(kap)) if kap.size else -1
     ceiling = rank_criterion.KAPPA_INDEFINITE_MAX
     if jax.process_index() == 0:
-        print(f"  [{where}] conditioning: kappa_lb = max|u_ii|/min|u_ii| of "
-              f"the pivoted LU, worst over q = {k_max:.3e} at q={q_at} "
+        print(f"  [{where}] conditioning: kappa_lb = {estimator}, "
+              f"worst over q = {k_max:.3e} at q={q_at} "
               f"(ridge sign(tr C)*{_TRANSVERSE_LU_RIDGE:.1e}*|tr C|/n; ceiling "
               f"{ceiling:.1e}).  This is a LOWER BOUND on kappa — above the "
               f"ceiling it refuses, below it certifies NOTHING.", flush=True)
@@ -1779,6 +1788,75 @@ def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
         raise rank_criterion.RankPolicyError(msg)
     for line in msg.splitlines():
         print("*** " + line, flush=True)
+
+
+def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh) -> str:
+    """``"local"``: the hoisted per-q LU on whole tiles (replicated or q-parallel) and the
+    q-owner back-solve and V; ``"mesh"``: C⁻¹ on the face from one mesh LU solve per q
+    and ζ = C⁻¹Z, V on the face (``ZetaG``, kind ``'inverse'``). The faster route that fits
+    beside what is live (owner rule 2026-10-19: a mesh backup at every whole-matrix site)."""
+    ndev = int(mesh_xy.devices.size)
+    if ndev <= 1:
+        return "local"
+    from lxkit import memory
+    from common.gpu_utils import shared_device_room
+    whole, owned = 16.0 * int(n_rmu) ** 2, -(-int(nq) // ndev)
+    batch = owned if _qparallel_factor_ok(nq, n_rmu, mesh_xy) else min(
+        int(nq), _replicated_factor_q_chunk(nq, n_rmu))
+    local = memory.Price(operands=memory.Term(
+        whole * (2 * batch + 3 * owned),
+        source="factor batch (C, LU) + owned LU, V, Z tiles (closed form, chooser)"), ranks=ndev)
+    mesh_price = memory.Price(operands=memory.Term(
+        spread=4 * whole * int(nq), source="C, C^-1, I, V faces (closed form, chooser)"), ranks=ndev)
+    return memory.admit(f"transverse zeta factor {int(nq)} x {int(n_rmu)}^2", (
+        ("local", local), ("mesh", mesh_price)),
+        int(shared_device_room("transverse zeta factor")))
+
+
+def _factor_c_q_transverse_inverse(C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int):
+    """The mesh route of the transverse factor: C_reg⁻¹ [nq, n, n] on the face, with the same
+    sign-aware ridge on the logical block as the LU route and a zero pad block (ζ pad rows
+    zero), by distrib_la's mesh LU solve against I. Returns ``(C⁻¹, eta, kappa_lb)``: the
+    probe backward error of :func:`_transverse_lu_math` and max|C_ij|·max|(C⁻¹)_ij|, a lower
+    bound on kappa_2 (|a_ij| <= ||A||_2), both on the logical block."""
+    import distrib_la
+    from common.gpu_utils import shared_device_room
+    nq, n, _ = C_q.shape
+    n_log = int(n_rmu_logical)
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    # Masks are traced iotas, never host constants: an (n, n) constant is a whole n^2 per rank.
+    masks = lambda: (lambda live: (live, live[:, None] & live[None, :]))(jnp.arange(n) < n_log)
+
+    @partial(jax.jit, out_shardings=(face, face))
+    def ridged(C):
+        live, _ = masks()
+        trace = jnp.sum(jnp.where(live, jnp.diagonal(C, axis1=-2, axis2=-1), 0), axis=-1)
+        ridge = _transverse_lu_ridge(trace, n_log)
+        C = C + ridge[:, None, None] * jnp.diag(live.astype(C.dtype))[None]
+        return C, jnp.broadcast_to(jnp.eye(n, dtype=C.dtype), C.shape)
+    C_reg, eye = ridged(C_q)
+    lu = distrib_la.plan("solve_lu", mesh_xy, backend="distributed", n=int(n),
+                         batched_route="auto",
+                         budget_bytes=shared_device_room("transverse zeta inverse"))
+    # The solve consumes its operands (LU in place of A, X of B): it gets a copy of C_reg,
+    # which the probe below reads.
+    inverse = lu.batched(jax.jit(jnp.copy, out_shardings=face)(C_reg), eye)
+
+    @partial(jax.jit, out_shardings=(face, NamedSharding(mesh_xy, P()), NamedSharding(mesh_xy, P())))
+    def figures(C, X):
+        live, block = masks()
+        X = jnp.where(block[None], X, 0)
+        phase = jnp.arange(n, dtype=jnp.float64) * 0.6180339887498949
+        x0 = jnp.where(live, jnp.exp(2j * jnp.pi * phase), 0).astype(C.dtype)
+        Cl = jnp.where(block[None], C, 0)
+        b = jnp.einsum('qmn,n->qm', Cl, x0)
+        x = jnp.einsum('qmn,qn->qm', X, b)
+        r = jnp.einsum('qmn,qn->qm', Cl, x) - b
+        norm = lambda v: jnp.sqrt(jnp.sum(jnp.abs(v) ** 2, axis=tuple(range(1, v.ndim))))
+        eta = norm(r) / (norm(Cl) * norm(x) + norm(b))
+        kappa = jnp.max(jnp.abs(Cl), axis=(1, 2)) * jnp.max(jnp.abs(X), axis=(1, 2))
+        return X, eta.astype(jnp.float64), kappa.astype(jnp.float64)
+    return figures(C_reg, inverse)
 
 
 def _embed_lu_padded(LU_log: jax.Array, n_rmu: int, n_log: int,
@@ -2100,6 +2178,18 @@ def factor_c_q(
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
+        if transverse_factor_layout(int(nq), int(n_rmu), mesh_xy) == "mesh":
+            # (C⁻¹, None): the caller's factor kind is 'inverse' (ζ = C⁻¹Z on the face).
+            inverse, eta_q, kappa_q = _factor_c_q_transverse_inverse(
+                C_q, mesh_xy, n_rmu_logical)
+            mode = rank_criterion.resolve_policy_mode(
+                os.environ.get(rank_criterion.POLICY_MODE_ENV))
+            if mode != "off":
+                _refuse_kappa(np.asarray(jax.device_get(kappa_q), dtype=float),
+                              where="zeta transverse ridge (mesh inverse)",
+                              estimator="max|C_ij| max|(C^-1)_ij|", mode=mode)
+            _certify_transverse_lu_residual(eta_q, where="zeta transverse ridge (mesh inverse)")
+            return inverse, None
         LU_q, perm_q, eta_q = _factor_c_q_transverse_lu(
             C_q, mesh_xy, n_rmu_logical)
         # THE DEFAULT TRANSVERSE PATH'S ONLY CONDITIONING NUMBER.  See
