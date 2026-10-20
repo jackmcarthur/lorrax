@@ -2325,9 +2325,11 @@ def _sc_head_frequency_plan(
         if getattr(config, "head", None) is not None and config.head.correction is not HeadCorrection.OFF:
             from .shared_pole_head import shared_pole_head_plan
             from .mpa.sample_plan import plan_z
+            from .qsgw_head import head_quadrature_omegas
             plan = shared_pole_head_plan(config, shared_pole_recipe,
                                           material_class=material_class)
-            points = list(map(complex, plan_z(plan)))
+            # The fit nodes, then the head's imaginary-axis moment rule.
+            points = list(map(complex, plan_z(plan))) + list(head_quadrature_omegas(config))
             if bool(config.do_G0) and 0j not in points:
                 points.append(0j)
             return requests, plan, points
@@ -2362,8 +2364,10 @@ def _sc_head_frequency_plan(
             from .mpa.model import make_mpa_plan
             mpa_plan = make_mpa_plan(
                 config, quad, material_class=material_class)
+        from .qsgw_head import head_quadrature_omegas
         mpa_z = np.asarray(sample_plan.plan_z(mpa_plan), dtype=np.complex128)
-        head_omegas = [complex(value) for value in mpa_z]
+        # The fit nodes, then the head's imaginary-axis moment rule.
+        head_omegas = [complex(value) for value in mpa_z] + list(head_quadrature_omegas(config))
         # The metallic MPA grid starts just above the origin.  Preserve a
         # separate exact-static sample for do_G0; it is nonanalytic and must
         # never enter the Loewner sample vector.

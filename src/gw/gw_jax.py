@@ -525,7 +525,7 @@ def _prepare_oneshot_response(
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
             and not packed_photon_replaces_charge_sigma(config)
             and qp_solver is not QPSolver.SELF_CONSISTENT):
-        from .qsgw_head import build_dft_head_response
+        from .qsgw_head import build_dft_head_response, head_quadrature_omegas
         if mode.value == "mpa":
             from .mpa import sample_plan
             if config.sigma.w_model == "shared_pole":
@@ -536,8 +536,10 @@ def _prepare_oneshot_response(
                 from .mpa.model import make_mpa_plan
                 oneshot_mpa_plan = make_mpa_plan(
                     config, quad, material_class=material_class)
+            # The fit nodes, then the head's imaginary-axis moment rule.
             oneshot_omegas = np.asarray(
-                sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
+                tuple(sample_plan.plan_z(oneshot_mpa_plan))
+                + head_quadrature_omegas(config), dtype=np.complex128)
         else:
             oneshot_head_requests = screening_requests_for(mode, config)
             oneshot_omegas = np.asarray(

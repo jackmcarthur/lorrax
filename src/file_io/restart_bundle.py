@@ -3250,8 +3250,8 @@ def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
 
     RETURNS HOST NUMPY, not sharded arrays, despite taking ``mesh_xy``:
     the four vectors come back ``np.complex128`` via ``as_numpy=True``,
-    alongside ``units``, ``diagnostics``, ``provenance``, ``model``,
-    ``occupation_stamps`` and ``ready``.
+    alongside ``units``, ``diagnostics``, ``provenance``, ``moment_m1``,
+    ``model``, ``occupation_stamps`` and ``ready``.
 
     "CERTIFY" MEANS: :func:`validate_fit_store` on the body, head
     ``format_version == 2``, ``ready``, head-vs-body ``mpa_grid_hash``,
@@ -3356,6 +3356,11 @@ def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
         },
         "diagnostics": diagnostics,
         "provenance": provenance,
+        # The pinned imaginary-axis moment sum B/Omega^2 (Ry^-1 * a.u.); None
+        # on a head with no rule (off, BGW finite-q0, ladder) or a store
+        # written before the rule.
+        "moment_m1": (None if "moment_m1" not in provenance
+                      else complex(provenance["moment_m1"])),
         "model": model,
         "occupation_stamps": occupation_stamps,
         "ready": True,

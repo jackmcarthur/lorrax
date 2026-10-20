@@ -207,10 +207,11 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     """
     from file_io.shared_pole_store import open_shared_pole_model, read_shared_pole_matrix
     from .gw_config import HeadCorrection
-    from .mpa.model import fit_head_samples
+    from .mpa.model import fit_head_samples, head_moment_report
     from .mpa.sample_plan import plan_z
     from .qsgw_head import (IterationHeadSamples, finalize_iteration_head_rows,
-                            iteration_head_sample_terms, metal_response_nodes)
+                            head_moment_m1, iteration_head_sample_terms,
+                            metal_response_nodes)
     from .response_bank import _reserve
     from .qgrid_symmetry import shared_pole_operator_realizer
     import distrib_la
@@ -327,9 +328,14 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
                   file=sys.stderr, flush=True)
     with timing.section("head.mpa_fit", announce=True,
                         label="shared-pole head pole fit"):
+        # The rows past the fit nodes include the imaginary-axis moment rule,
+        # folded through this same exact Gamma body (qsgw_head.head_moment_m1).
         head = fit_head_samples(samples[:len(z)], z, int(config.mpa.n_poles),
             model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
-            solve=config.mpa.pole_solver, occupation_state=occupation_state)
+            solve=config.mpa.pole_solver, occupation_state=occupation_state,
+            moment_m1=head_moment_m1(samples, points, metal=material_class == "metal"))
+    if jax.process_index() == 0:
+        print(head_moment_report(head), file=sys.stderr, flush=True)
     head.update(identity=handle["identity"], body_digest=handle["digest"], completion=True)
     iteration = IterationHeadSamples(omegas=points, samples=tuple(samples),
         sigma_energies_ry=np.asarray(wfns.enk[:, wfns.slices.sigma]),

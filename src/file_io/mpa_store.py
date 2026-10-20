@@ -1961,6 +1961,13 @@ def write_head_fit_collective(
     authenticated and preserved so a crash immediately before COMPLETE is
     idempotently resumable; a differing ready head is immutable and refuses.
 
+    MOMENT.  ``fit_provenance["moment_m1"]`` (with ``moment_rule``), when
+    present, is the imaginary-axis ``M_1 = sum_p B_p/Omega_p^2`` the
+    residues were pinned to (``gw.mpa.model._pin_static_head_sample``); it
+    lands as the attr ``fit_moment_m1`` like every provenance key, and
+    :func:`read_head_fit_collective` returns it as ``moment_m1``.  Format 2
+    readers ignore an absent one, so the version is unchanged.
+
     FORMAT VERSION 2.  This writer stamps 2 and
     :func:`read_head_fit_collective` refuses anything else; a version-1
     head (the retired serial writer's) is not readable.  A fresh publish

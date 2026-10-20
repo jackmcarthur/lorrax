@@ -320,21 +320,26 @@ def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z, *, name=_CHI):
     del value
 
 
-def _pin_static_head_sample(wc, z, fitted, *, rcond=1.0e-13):
-    r"""Refit the scalar head's residues with its static sample exact.
+def _pin_static_head_sample(wc, z, fitted, *, moment_m1=None, rcond=1.0e-13):
+    r"""Refit the scalar head's residues with its static sample and ``M_1`` exact.
 
     On shell the band-diagonal head is exactly
-    ``Sigma_nk(E_nk) = (1/2 - f_nk) W^c(0) / (Omega N_k)`` for any pole
-    model (``compute_complex_pole_head_sigma_diag`` at ``delta = 0``), so
-    ``W^c(0)`` alone carries the head's on-shell self-energy.  The guarded
-    fit's residue refit is an unweighted least squares over every sample and
-    can miss the static one: on Fe 4^3 with the metallic Drude head it missed
-    by 5.8 Ry bohr^3, a +/-7.7 meV on-shell error.  This keeps the fitted
-    poles and re-solves the residues as least squares subject to
-    ``W^c_fit(z_s) = W^c(z_s)`` at the sample nearest the origin (``z = 0``
-    on an insulator plan, the metal origin ``i varpi_0`` on a metal plan):
-    ``B = B_0 + N y`` with ``B_0`` the minimum-norm solution of the
-    constraint and ``N`` its null space.
+    ``Sigma_nk(E_nk) = (1/2 - f_nk) W^c(0) / (Omega N_k)`` and its slope
+    ``d Sigma_nk/d omega = -M_1 / (Omega N_k)``, ``M_1 = sum_p B_p/Omega_p^2``,
+    for any pole model (``compute_complex_pole_head_sigma_diag`` at
+    ``delta = 0``), so ``W^c(0)`` and ``M_1`` alone carry the head's on-shell
+    self-energy and Z.  The guarded fit's residue refit is an unweighted
+    least squares over every sample and can miss the static one: on Fe 4^3
+    with the metallic Drude head it missed by 5.8 Ry bohr^3, a +/-7.7 meV
+    on-shell error.  This keeps the fitted poles and re-solves the residues
+    as least squares subject to ``W^c_fit(z_s) = W^c(z_s)`` at the sample
+    nearest the origin (``z = 0`` on an insulator plan, the metal origin
+    ``i varpi_0`` on a metal plan) and, given ``moment_m1`` (the
+    imaginary-axis quadrature, ``gw.qsgw_head.head_moment_m1``),
+    ``sum_p B_p/Omega_p^2 = M_1``: ``B = B_0 + N y`` with ``B_0`` the
+    minimum-norm solution of the constraints and ``N`` their null space.  A
+    fit left with one pole and two constraints re-places that pole on both
+    moments (the plasmon-pole limit).
     """
     wc = np.asarray(wc, dtype=np.complex128)
     z = np.asarray(z, dtype=np.complex128)
@@ -343,14 +348,35 @@ def _pin_static_head_sample(wc, z, fitted, *, rcond=1.0e-13):
     matrix = 2.0 * omega[None, :] / (z[:, None] ** 2 - omega[None, :] ** 2)
     s = int(np.argmin(np.abs(z)))
     before = float(np.abs(matrix[s] @ residues - wc[s]))
+    out = dict(fitted)
+    out["moment_m1_unpinned"] = complex(np.sum(residues / omega ** 2))
     row = matrix[s]
     norm2 = float(np.real(np.vdot(row, row)))
     if omega.size == 0 or norm2 == 0.0:
         raise ValueError("scalar-head static pin: no fitted pole reaches the "
                          "static sample")
-    base = np.conj(row) * wc[s] / norm2
-    _, _, vh = np.linalg.svd(row[None, :])
-    null = np.conj(vh[1:].T)
+    if moment_m1 is not None and omega.size == 1:
+        # B = M_1 Omega^2 and 2 B Omega/(z_s^2 - Omega^2) = W^c(z_s):
+        # 2 M_1 Omega^3 + W^c(z_s) Omega^2 - W^c(z_s) z_s^2 = 0.
+        roots = np.roots([2.0 * moment_m1, wc[s], 0.0, -wc[s] * z[s] ** 2])
+        roots = roots[roots.real > 0.0]
+        if roots.size == 0:
+            raise ValueError(
+                "scalar-head moment pin: no positive pole carries "
+                f"W^c(z_s)={complex(wc[s])!r} with M_1={complex(moment_m1)!r}")
+        omega = roots[[int(np.argmin(np.abs(roots - omega[0])))]]
+        matrix = 2.0 * omega[None, :] / (z[:, None] ** 2 - omega[None, :] ** 2)
+        base, null = moment_m1 * omega ** 2, np.zeros((1, 0), np.complex128)
+    elif moment_m1 is not None:
+        constraints = np.stack([row, 1.0 / omega ** 2])
+        target = np.asarray([wc[s], moment_m1], dtype=np.complex128)
+        base = np.linalg.lstsq(constraints, target, rcond=None)[0]
+        _, _, vh = np.linalg.svd(constraints)
+        null = np.conj(vh[2:].T)
+    else:
+        base = np.conj(row) * wc[s] / norm2
+        _, _, vh = np.linalg.svd(row[None, :])
+        null = np.conj(vh[1:].T)
     rest = np.delete(np.arange(z.size), s)
     if null.shape[1]:
         y, *_ = np.linalg.lstsq(matrix[rest] @ null,
@@ -358,7 +384,7 @@ def _pin_static_head_sample(wc, z, fitted, *, rcond=1.0e-13):
         residues = base + null @ y
     else:
         residues = base
-    out = dict(fitted)
+    out["Omega_p"] = omega
     out["B_p"] = residues
     out["max_abs_residual"] = float(np.max(np.abs(matrix @ residues - wc)))
     out["static_pin_z"] = complex(z[s])
@@ -367,8 +393,12 @@ def _pin_static_head_sample(wc, z, fitted, *, rcond=1.0e-13):
 
 
 def fit_head_samples(head_samples, z, n_p, *, model, solve,
-                     occupation_state=None):
+                     occupation_state=None, moment_m1=None):
     """Fit scalar Wc_head in Ry through the canonical MPA scalar fitter.
+
+    ``moment_m1`` (``gw.qsgw_head.head_moment_m1``; ``None`` on a head with
+    no imaginary-axis rule) is pinned beside ``W^c(0)``
+    (:func:`_pin_static_head_sample`) and stamped in the provenance.
 
     ``head_correction=off`` is the exact zero model, not an ill-conditioned
     pole-fitting problem.  It still gets a complete scalar-head record because
@@ -395,7 +425,7 @@ def fit_head_samples(head_samples, z, n_p, *, model, solve,
         provenance = {"solve_mode": "exact_zero", "n_valid": int(n_p)}
     else:
         fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
-        fitted = _pin_static_head_sample(wc, z, fitted)
+        fitted = _pin_static_head_sample(wc, z, fitted, moment_m1=moment_m1)
         provenance = {
             "solve_mode": fitted["solve"],
             "solve_affine": fitted["affine"],
@@ -408,7 +438,14 @@ def fit_head_samples(head_samples, z, n_p, *, model, solve,
             "static_pin_z": complex(fitted["static_pin_z"]),
             "static_pin_residual_before": float(
                 fitted["static_pin_residual_before"]),
+            "moment_m1_unpinned": complex(fitted["moment_m1_unpinned"]),
         }
+        if moment_m1 is not None:
+            from gw.qsgw_head import HEAD_QUADRATURE_ORDER, HEAD_QUADRATURE_SCALE_RY
+            provenance.update(
+                moment_m1=complex(moment_m1),
+                moment_rule=(f"gauss_legendre_t order={HEAD_QUADRATURE_ORDER} "
+                             f"xi0={HEAD_QUADRATURE_SCALE_RY!r} Ry"))
     if (not all(np.all(np.isfinite(value)) for value in
                 (wc, z, fitted["Omega_p"], fitted["B_p"], fitted["condition"],
                  fitted["backward_error"], fitted["max_abs_residual"]))):
@@ -426,11 +463,27 @@ def fit_head_samples(head_samples, z, n_p, *, model, solve,
             dict(occ_hash=occupation_state.occ_hash, mu_ry=occupation_state.mu_ry)))
 
 
+def head_moment_report(head) -> str:
+    """One line: the fit's own ``M_1`` and the pinned quadrature ``M_1`` (Ry^-1 bohr^3)."""
+    prov = head["provenance"]
+    if "moment_m1" not in prov:
+        return ("  scalar head M_1: not pinned (no imaginary-axis rule on this head); "
+                f"fit M_1 = {complex(prov.get('moment_m1_unpinned', 0.0)).real:.9g}")
+    m1, fit = complex(prov["moment_m1"]), complex(prov["moment_m1_unpinned"])
+    return (f"  scalar head M_1 = sum B/Omega^2: quadrature {m1.real:.9g}, unpinned fit "
+            f"{fit.real:.9g} (rel {abs(fit - m1) / max(abs(m1), 1.0e-300):.3e}); "
+            f"{prov['moment_rule']}")
+
+
 def _fit_head_samples(fit_path, head_samples, z, n_p, grid_hash, mesh_xy, *,
-                      model, solve, occupation_state=None):
+                      model, solve, occupation_state=None, moment_m1=None,
+                      print_fn=print):
     """Publish the canonical scalar fit beside the completed MPA body."""
     head = fit_head_samples(head_samples, z, n_p, model=model, solve=solve,
-                            occupation_state=occupation_state)
+                            occupation_state=occupation_state,
+                            moment_m1=moment_m1)
+    if model != "head_off_zero":
+        print_fn(head_moment_report(head))
     mpa_store.write_head_fit_collective(
         fit_path, head["sample_z"], head["sample_Wc"], head["Omega_p"], head["B_p"],
         mesh_xy=mesh_xy, energy_unit="Ry", **head["diagnostics"],
@@ -642,8 +695,13 @@ def _solve_wc(
 
     if head_response is None:
         return tuple(head_samples) if bgw_q0 is not None else None
+    # The moment rule's rows need W_body(Gamma, i xi), which exists only once
+    # the body is fitted: build_mpa_fit folds them (_fold_quadrature_rows).
+    deferred = set(_quadrature_rows(head_response.omegas, config))
     for index in range(int(n_z), len(head_response.omegas)):
-        if bgw_q0 is not None:
+        if index in deferred:
+            head_samples.append(None)
+        elif bgw_q0 is not None:
             # Metallic MPA appends only the exact-static do_G0 sample after
             # the fit grid.  The Gamma row of the near-line origin sample was
             # replaced by the same static order-of-limits response above, so
@@ -669,6 +727,76 @@ def _solve_wc(
         sigma_occupations=head_response.sigma_occupations,
         efermi_ry=head_response.efermi_ry,
     )
+
+
+def _quadrature_rows(omegas, config):
+    """Indices of the head moment rule's nodes (``qsgw_head.head_quadrature_omegas``) in ``omegas``."""
+    if config is None:
+        return ()
+    from gw.qsgw_head import head_quadrature_omegas
+    nodes = np.asarray(head_quadrature_omegas(config), dtype=np.complex128)
+    z = np.asarray(omegas, dtype=np.complex128).reshape(-1)
+    return tuple(int(i) for i in range(z.size)
+                 if nodes.size and np.min(np.abs(nodes - z[i])) <= 1.0e-14)
+
+
+def _fitted_gamma_body(fit_path, gamma_row, V_gamma, meta, mesh_xy):
+    """``z -> W_body(Gamma, z) = V + W^c_fit(Gamma, z)``, run order, from the fitted body.
+
+    The elementwise store's Gamma row only: ``(n_p, 1, n_mu, n_mu)`` of
+    ``Omega_p``, ``B_p`` (and ``B_odd_p`` on an ordered store) through one
+    read-only ``SlabIO``, packed and evaluated as the Sigma reader does
+    (``gw.mpa.sigma``, ``pade_fit.eval_mpa_model``).  This is the body model
+    Sigma integrates; an exact ``W(Gamma, i xi)`` would need a chi0 sample
+    at every node, and ``compute_chi0`` is all-q (N_xi more body samples).
+    """
+    import jax
+    from file_io.mpa_store import _pole_read_shape, _unit_scale, fit_completion_ledger
+    from file_io.slab_io import SlabIO
+    from gw.mpa.pade_fit import eval_mpa_model
+
+    ledger = fit_completion_ledger(fit_path)
+    n_p = int(ledger["n_p"])
+    n_q, n_pad, _ = _pole_read_shape(ledger, mesh_xy)
+    if not 0 <= int(gamma_row) < int(n_q):
+        raise ValueError(f"fitted Gamma body: row {gamma_row} outside the store's {n_q} q rows")
+    shape, offset = (n_p, 1, n_pad, n_pad), (0, int(gamma_row), 0, 0)
+    spec = P(None, None, "x", "y")
+    with SlabIO(fit_path, mode="r", mesh=mesh_xy) as io:
+        fields = [io.read_slab(name, shape=shape, offset=offset, partition_spec=spec)[:, 0]
+                  for name in ("Omega_p", "B_p")
+                  + (("B_odd_p",) if ledger["ordered_residues"] else ())]
+    scale = _unit_scale(ledger["energy_unit"], "Ry", "fitted Gamma body")
+    basis = getattr(meta, "mu_basis", None)
+    if basis is not None:
+        n_can = int(basis.n_canonical)
+        fields = [f if (i == 0 and tuple(f.shape[-2:]) != (n_can, n_can))
+                  else basis.pack_operator(f) for i, f in enumerate(fields)]
+    n = int(V_gamma.shape[-1])
+    fields = [jnp.moveaxis(f[:, :n, :n] * scale, 0, -1) for f in fields]
+
+    @jax.jit
+    def body(z, V, Omega, B, *odd):
+        return V + eval_mpa_model(Omega, B, z, B_odd=odd[0] if odd else None)
+
+    return lambda z: body(jnp.asarray(complex(z), jnp.complex128), V_gamma, *fields)
+
+
+def _fold_quadrature_rows(head, response, rows, body_at, *, wfn, meta, config, mesh_xy):
+    """Fill the moment rule's rows of ``head`` (``IterationHeadSamples``), folded through ``body_at``."""
+    import dataclasses
+    from gw.qsgw_head import finalize_iteration_head_rows, iteration_head_sample_terms
+    terms = []
+    for index in rows:
+        W = body_at(response.omegas[index])
+        terms.append(iteration_head_sample_terms(
+            response, index, W, meta=meta, config=config, mesh=mesh_xy))
+        del W
+    samples = list(head.samples)
+    for index, sample in zip(rows, finalize_iteration_head_rows(
+            response, terms, wfn=wfn, meta=meta, config=config)):
+        samples[index] = sample
+    return dataclasses.replace(head, samples=tuple(samples))
 
 
 def _fit_body(sample_path, fit_path, z, n_p, tile_bytes, mesh_xy,
@@ -1214,6 +1342,9 @@ def build_mpa_fit(
     # superblock write-consistency flag set and refusing the ledger open.
     from common.collectives import barrier
     barrier("mpa_body_fit_closed_before_head")
+    from gw.qsgw_head import head_moment_m1, head_quadrature_omegas
+    metal = material_class == "metal"
+    moment_m1 = None
     if isinstance(iteration_head, tuple):
         head_fit_samples = iteration_head
         iteration_head = None
@@ -1226,7 +1357,26 @@ def build_mpa_fit(
         head_model = (
             "head_off_zero" if correction == "off"
             else f"dft_direct_{config.mpa.pole_solver}")
+        nodes = head_quadrature_omegas(config)
+        moment_m1 = head_moment_m1(
+            head_fit_samples + tuple(head_resolver.at(z) for z in nodes),
+            tuple(z_all) + nodes, metal=metal)
     else:
+        rows = (_quadrature_rows(iteration_head.omegas, config)
+                if iteration_head_response is not None else ())
+        if rows:
+            if gamma_row is None:
+                raise ValueError(
+                    "GATE mpa_quadrature_head_gamma: the head's imaginary-axis rows "
+                    "fold through W_body(Gamma), but the q wedge has no single Gamma row")
+            body_at = _fitted_gamma_body(fit_path, gamma_row, V[gamma_row], meta, mesh_xy)
+            iteration_head = _fold_quadrature_rows(
+                iteration_head, iteration_head_response, rows, body_at,
+                wfn=wfn, meta=meta, config=config, mesh_xy=mesh_xy)
+            del body_at
+            barrier("mpa_quadrature_head_body_read")
+        moment_m1 = head_moment_m1(iteration_head.samples, iteration_head.omegas,
+                                   metal=metal)
         head_fit_samples = iteration_head.samples[:z_all.size]
         if bool(getattr(
                 config.head, "uses_bgw_metal_q0shift", False)):
@@ -1254,6 +1404,8 @@ def build_mpa_fit(
         model=head_model,
         solve=config.mpa.pole_solver,
         occupation_state=occupation_state,
+        moment_m1=moment_m1,
+        print_fn=print_fn,
     )
     # COMPLETE is the last mutation of the two-part transaction.  A crash
     # after body checkpointing or during head publication leaves the store
