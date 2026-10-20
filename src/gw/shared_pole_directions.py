@@ -569,16 +569,33 @@ class LineSelection:
                     line = lines[family["name"]]
                     line["cross"] += self._cross(family, rectangles, line["mirrors"], mirror=True)
 
-    def panels(self, sid, lines):
-        """The bank write of one line sample: every family's face panels and counts."""
-        out = dict(sample=int(sid), panels={}, counts={}, cross={})
+    def eigh_bytes(self):
+        """The selection's eigh stack as its own plan prices it (``distrib_la.eigh_stack_bytes``:
+        the program place() routes, compiled at the abstract stack, plus the provider's query):
+        the largest family's, every parent at once on the local route, one on the face."""
+        import distrib_la
+        if not hasattr(self, "_eigh_bytes"):
+            depth = self.nq if self.execution == "local" else 1
+            self._eigh_bytes = max(distrib_la.eigh_stack_bytes(self.plans[f["name"]], (depth, f["rows"], f["rows"]),
+                                                               np.complex128) for f in self.families)
+        return self._eigh_bytes
+
+    def panel_fields(self, lines):
+        """``(family, cross, fields)`` of every :attr:`to_face` call of one sample's panels."""
         for family in self.families:
             line = lines[family["name"]]
             states = line["states"] + list(line.get("mirrors", ()))
-            out["panels"][family["name"]] = self.to_face(states[0][1], *[a for st in states for a in st[2:]])
-            out["counts"][family["name"]] = np.asarray(line["counts"][:self.nq], np.int64)
+            yield family["name"], False, (states[0][1], *[a for st in states for a in st[2:]])
             if family["cross"]:
-                out["cross"][family["name"]] = self.to_face(*line["cross"])
+                yield family["name"], True, tuple(line["cross"])
+
+    def panels(self, sid, lines):
+        """The bank write of one line sample: every family's face panels and counts."""
+        out = dict(sample=int(sid), panels={}, counts={}, cross={})
+        for name, cross, fields in self.panel_fields(lines):
+            out["cross" if cross else "panels"][name] = self.to_face(*fields)
+        for family in self.families:
+            out["counts"][family["name"]] = np.asarray(lines[family["name"]]["counts"][:self.nq], np.int64)
         if not out["cross"]:
             out.pop("cross")
         return out

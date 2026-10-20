@@ -997,47 +997,47 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
             receipt["seconds"]["compilation"] = (receipt["seconds"].get("compilation", 0.)
                 + time.monotonic() - started)
         with timing.section('bank.admission.' + stage, announce=True):
+            from lxkit import memory as allocator
+            from runtime.aot_memory import compiled_new_bytes
             memory = executable.memory_analysis()
             if memory is None:
                 raise ValueError("GATE response_capacity: compiled memory unavailable")
             stream = stage in ("real_time", "laplace", "windowed", "direct", "moment_correlation", "static_reference")
+            # The price over what is live at the dispatch's entry: the program's temporaries +
+            # outputs - donated aliases (+ cuFFT plans), what it draws outside its buffers
+            # (``runtime_bytes``), a dense stage's provider workspace, and the cuSOLVERMp Dyson
+            # LU's native size query at the getrs cap posted for this dispatch (the room the
+            # ledger leaves; the query sizes the chunk the solve then takes).
+            new = compiled_new_bytes(executable) + int(runtime_bytes)
             lu = None
             if stream:
-                # The caller reserves the sole carry; admit the actual
-                # Green/FFT workspace, without compiling a legacy comparator.
+                # The caller reserves the sole carry; the ledger admits the Green/FFT workspace.
                 _, row = _reserve(meta, stage + "_temporaries", 0,
                                   memory.temp_size_in_bytes + int(runtime_bytes),
-                                  runs_in="bank.dispatch." + stage)
-                receipt["memory"].append(row)
+                                  runs_in="bank.dispatch." + stage, book=False)
             else:
-                from lxkit import memory as allocator
-                from runtime.aot_memory import compiled_new_bytes
                 layout = dense_layout(meta, config, mesh_xy, args[0].shape[-1])
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
-                # Beside the operands: temporaries + outputs - donated aliases, the dense workspace,
-                # and on cuSOLVERMp the Dyson LU's measured workspace (getrf, getrs at the default
-                # cap, pivots) plus the getrs cap posted for this dispatch: the room the ledger
-                # leaves (the native takes the widest chunk under it, else one block column, which
-                # the measured row covers).  The price is these bytes over what is live at entry.
-                new = compiled_new_bytes(executable) + native["total"]
+                new += native["total"]
                 lu = getattr(kernel, "lu", None)
                 lu = lu if lu is not None and lu.backend == "cusolvermp" else None
                 if lu is not None:
-                    from distrib_la import lu_workspace_bytes
+                    from distrib_la import lu_workspace_query
                     ledger, n_lu = meta.shared_pole_capacity, int(args[0].shape[-1])
-                    new += lu_workspace_bytes(mesh_xy, n_lu, np.complex128)
-                    cap = max(0, ledger.room_bytes_per_rank(ledger.live_stages)
-                              - memory.argument_size_in_bytes - new)
-                    new += cap
+                    lu.chunk_room(n_lu, n_lu, max(0, ledger.room_bytes_per_rank(ledger.live_stages)
+                                                  - memory.argument_size_in_bytes - new))
+                    try:
+                        new += lu_workspace_query(mesh_xy, n_lu, n_lu, np.complex128)
+                    except BaseException:
+                        lu.chunk_room(n_lu, n_lu, None)
+                        raise
                 _, row = _reserve(meta, stage, memory.argument_size_in_bytes, new,
                                   runs_in="bank.dispatch." + stage, book=False)
-                receipt["memory"].append(row)
-                allocator.book(allocator.priced(new, f"bank {stage} program (temporaries + outputs - "
-                    "aliases, dense and LU workspace)", increment=True), stage="bank.dispatch." + stage)
-                if lu is not None:
-                    lu.chunk_room(n_lu, n_lu, cap)
+            receipt["memory"].append(row)
+            allocator.book(allocator.priced(new, f"bank {stage} program (temporaries + outputs - aliases, "
+                "run-time, dense and LU workspace)", increment=True), stage="bank.dispatch." + stage)
             receipt["compiled"].append(dict(stage=stage,
                 arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
                 temporaries=memory.temp_size_in_bytes,
@@ -1511,9 +1511,14 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     # The passes being drained stay live beside every correlation's admission.
     ledger = meta.shared_pole_capacity
     live = ledger.live_stages
-    carries, _ = _reserve(meta, "moment_pass_carry", 0, bank.in_flight * 2 * n_batch * int(width) * n_out
-                          * 16 * max(r * c for r, c, _ in segments[0]))
+    in_flight = bank.in_flight * 2 * n_batch * int(width) * n_out * 16 * max(r * c for r, c, _ in segments[0])
+    carries, _ = _reserve(meta, "moment_pass_carry", 0, in_flight, book=False)
     ledger.live_stages = live + (carries,)
+    # The stream's own price: what it holds now (bank, weights, scratch: measured) and the
+    # passes in flight; each pass's dispatch is priced by its program (bank.dispatch).
+    from lxkit import memory
+    memory.book(memory.priced(in_flight, "moment passes in flight (carry and its batch-major copy)",
+                              increment=True))
     passes = _passes_ahead(bank.shapes, (n_out, nq), mesh_xy, common, tail, lambda p: response_stream(
         wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids), n_outputs=n_out, pair_mode="direct",
         bank_carry=True, ordered=ordered, vertex=vertex, stream_pass=p))
@@ -2895,9 +2900,6 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     break
                 disk_group = -(-disk_group // 2)
         if residence == "device":
-            memory.book(memory.priced(check.price, f"compiled direct stream, group {group_size}/"
-                                      f"{len(z)} (temp + outputs + carry + scratch)", increment=True),
-                        stage="bank.dispatch.direct")
             receipt["group_check"] = dict(chunk=check.chunk, agreed=group_size, analytic=check.analytic,
                 compiled=check.compiled_bytes, price=check.price, live=live, room=room,
                 recompiled=check.recompiled, seconds=check.seconds)
@@ -2979,6 +2981,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 return add_direct_gamma_field(packed, coefficient,
                     gamma_vectors=direct_head["gamma_vectors"],
                     layout=bank_io["photon_layout"], mesh=mesh_xy)
+        # The rows this sample gathers from the carry (and a partner's conjugate beside them)
+        # are live until its Dyson programs consume them: a named reservation every room sees.
+        fields = 2 if need_value else 1
+        live_rows = ledger.live_stages
+        rows_stage, _ = _reserve(meta, "sample_rows", 0, (fields + bool(partner)) * len(rows) * face_bytes)
+        ledger.live_stages = live_rows + (rows_stage,)
         chi, *chi_value = chi_rows((1, 0) if need_value else (1,))
         if partner:
             chi = jnp.conj(chi)
@@ -3013,6 +3021,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             slope = execute(solve_slope, (h, w, chi), "sample_slope")
             del w
         del chi
+        ledger.live_stages = live_rows
         if head_update is not None:
             coefficient = (direct_head["dWc_minus_q_ds"][sample]
                            if partner else direct_head["dWc_ds"][sample])
@@ -3138,8 +3147,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     if np.asarray(header["line_written"], bool)[:, sample-p0].any():
                         raise ValueError(f"GATE response_line_panel: sample {sample} is partly committed; "
                                          "a line sample commits every parent at once; fix: rebuild the bank")
-                    stage, selection_row = _reserve(meta, "line_selection", selection_resident,
-                                                    selection_workspace)
+                    # The selection's phases are priced by their own programs (below).
+                    stage, _ = _reserve(meta, "line_selection", selection_resident,
+                                                    selection_workspace, book=False)
                     live = ledger.live_stages
                     ledger.live_stages = live + (stage,)
                     # line_selection times the selection alone: this sample's Dyson
@@ -3161,7 +3171,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                           constant=constant))
                         if not ordered and line_width is None:
                             rows = raw = None          # every row of this member is read
-                        memory.book(ledger.price(selection_row), stage='bank.line_select')
+                        # Each phase over what is live at its entry: the cut blocks and normal
+                        # matrices (the admitted resident) and the eigh stack's own program
+                        # (place()); the mirror cuts the partner's blocks; the panels are to_face
+                        # compiled at their fields.
+                        memory.book(memory.priced(selection_resident + sel.eigh_bytes(), "line selection: "
+                            "cut blocks (admitted) + the eigh stack's program", increment=True), stage='bank.line_select')
                         with timing.section('bank.line_select'):
                             lines = sel.select(sample, pair)
                         if ordered:
@@ -3169,12 +3184,16 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                               constant=constant))
                             if line_width is None:
                                 rows = raw = None      # every row of this member is read
-                            memory.book(ledger.price(selection_row), stage='bank.line_mirror')
+                            memory.book(memory.priced(selection_resident, "line mirror: the partner's cut "
+                                "blocks (admitted)", increment=True), stage='bank.line_mirror')
                             with timing.section('bank.line_mirror'):
                                 sel.mirror(sample, lines, pair)
                         del pair
                         del constant
-                        memory.book(ledger.price(selection_row), stage='bank.line_panels')
+                        from runtime.aot_memory import compiled_new_bytes
+                        memory.book(memory.priced(sum(compiled_new_bytes(_compiled(sel.to_face, fields))
+                                                      for _, _, fields in sel.panel_fields(lines)),
+                            "line panels: to_face compiled at its fields", increment=True), stage='bank.line_panels')
                         with timing.section('bank.line_panels'):
                             span_panels.append((span, sel.panels(sample, lines)))
                         del lines, rows
