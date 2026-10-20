@@ -187,6 +187,14 @@ gate refuses still closes its log: the gate's lines, the refusal's message and a
 
 ## The collision term {#collision}
 
+This is an experimental implementation, not an admitted CrI3 production
+prescription. The full-microscopic refreshed-W fit currently fails independent
+material checks; a separate source-frozen control has evaluated the new
+complex self-energy but has not established refreshed-screening dynamics.
+Read the [current validation evidence](../theory/td_agw_dynamical.md#full-microscopic-evidence)
+before launching. The transition-Galerkin alternative is an internal
+numerical proof, not a selectable production route.
+
 For an updated-screening comparison, use `collision_basis = "instantaneous"`
 and `collision_screening = "joint"`. The material Hamiltonian and coherent
 self-energy converge together at each refresh, using one set of energies for
@@ -207,7 +215,7 @@ nonequilibrium lesser interaction is determined exactly by retarded W.
 collision_basis = "instantaneous"
 collision_screening = "joint"
 collision_statistics = "retarded_reference"
-collision_hamiltonian = "reference"
+collision_hamiltonian = "hf"
 collision_source = ".../04_gw_oneshot_mpa_eqp/oneshot.in"
 collision = "raw"
 collision_refresh_sweep = "active"

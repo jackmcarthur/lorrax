@@ -885,3 +885,36 @@ additional. No all-parent retained-space, fixed-point, material-capacity,
 full-q model, or trajectory admission follows from this proof. Current
 microscopic W/column-Σ refinement and electronic boundary tests are still
 required before a production integration.
+
+The same internal module supplies a direct one-parent verification sample,
+`transition_polarization`: slice the full-port columns of $T^\dagger I$
+exactly, apply the current free resolvent, then K and T, and accumulate
+bounded port panels on the native XY face. It keeps all ports and full
+coherent density. Bridge programs are reused between sites; the column
+start is dynamic, so only the regular/final panel widths create variants.
+Each panel completes before the next is submitted. The returned Pi is
+already PHYSICALLY normalized by T; `transition_dyson_value` supplies
+`Pi / response_algebra_receipt['prefactor']` to the existing checked-LU
+Dyson owner with its unchanged raw-response convention and authenticated
+Coulomb root. Neither helper adds an electronic eta or changes gamma.
+`transition_panel_capacity` can be called before T allocation and prices
+T, retained Q, K/state scratch, narrow panels and overlapping Pi buffers.
+Source residency must be supplied separately; the checked-LU owner's
+workspace/ledger obligation is explicitly additional. This capability
+does not itself admit a material bank, seed a production route, or certify
+interpolation/column-Sigma convergence from a few direct sites.
+
+The internal `transport_transition_basis` helper moves a held numerical Q
+between instantaneous active-band gauges without holding physical energies
+or screening fixed. For $S_k=U_{\rm ref,k}^\dagger U_{\rm current,k}$, frozen
+identity outside the active window, each transition matrix transforms as
+$X_{\rm new,k}=S_k^\dagger X_{\rm ref,k}S_{k-q}$. The catalogue must explicitly
+reserve every active row/column coordinate; missing or inexact indices and
+nonunitary rotations refuse. Whole-k sharded kernels process at most 32 Q
+rows at a time, with no transition- or port-sized host gather. Input/output
+Q, unpack/rotation workspaces and caller-supplied source residency are
+priced before allocation, against an explicit device budget. Host metadata
+placement uses the process-local collective owner for a remote-rank mesh.
+Current T, density, energy and K/D actions must still be rebuilt/supplied;
+this helper is not wired into production, and its covariance tests admit
+neither a full-q model nor a physical trajectory.
