@@ -2059,7 +2059,6 @@ def _dyson_route(dyson, n, stack, mesh_xy):
     faces = 16.0 * n * n * 3 * int(stack) / ranks
     room = max(0, int(device_budget_bytes() - faces)) if ranks > 1 else None
     if dyson == "distributed":
-        memory.admit(site, (), 0, forced="distributed")
         return "distributed", room
     if ranks <= 1:
         return "local", None
