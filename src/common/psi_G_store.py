@@ -50,18 +50,13 @@ _EXECUTABLES: dict = {}
 
 
 def _priced_executable(kernel, args, stage):
-    """``kernel`` compiled for ``args`` (once per signature) with its compiled figure booked
-    to ``stage`` as an increment beside the resident set (``lxkit.memory``)."""
-    from lxkit import memory
-    from runtime.aot_memory import compiled_new_bytes
+    """``kernel`` compiled for ``args``, once per signature (a stage that cannot bind: no price
+    of its own; the trace measures it)."""
     key = (kernel, tuple((tuple(a.shape), str(a.dtype), getattr(a, "sharding", None))
                          for a in jax.tree.leaves(args)))
     if key not in _EXECUTABLES:
         _EXECUTABLES[key] = kernel.lower(*args).compile()
     executable = _EXECUTABLES[key]
-    memory.book(memory.priced(compiled_new_bytes(executable), f"{stage} executable "
-                              "(memory_analysis temp + outputs - alias, FFT plans)",
-                              increment=True), stage=stage)
     return executable
 
 def _zero_user_band_pad_in_shard(

@@ -132,21 +132,12 @@ def test_production_instrument_reads_priced_stages_only_on_cpu(monkeypatch):
     assert memory.instrument_cost()[0] == reads + 2
 
 
-def test_census_flags_unpriced_allocations_and_missing_provenance(calibrate, monkeypatch):
-    jnp.zeros(4).block_until_ready()
+def test_census_flags_missing_provenance(calibrate, monkeypatch):
+    """An unpriced allocation is the trace's residual (lxkit.memory_residuals); the census lists
+    terms without provenance."""
     monkeypatch.setattr(memory, "STRICT", True)
-    keep = []
-    with timing.section("t.unpriced"):
-        keep.append(jnp.ones((160 * MB,), jnp.uint8).block_until_ready())
-    memory.book(memory.priced(100 * MB, "test"), stage="t.priced")
-    with timing.section("t.priced"):
-        with timing.section("t.child"):                # inside a priced stage: fine
-            keep.append(jnp.ones((80 * MB,), jnp.uint8).block_until_ready())
     memory.admit("t.route", (("a", memory.Price(xla=memory.Term(1.0))),), 2.0)
-    got = memory.findings()
-    assert len(got) == 2 and got[0].startswith("unpriced: t.unpriced allocated ")
-    assert got[1] == "no provenance: t.route (a): xla"
-    del keep
+    assert memory.findings() == ["no provenance: t.route (a): xla"]
 
 
 @pytest.fixture(scope="module")
