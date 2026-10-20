@@ -926,14 +926,15 @@ def dense_layout(meta, config, mesh_xy, n):
     return "local" if execution == "local" else "distributed"
 
 
-def _reserve(meta, stage, resident, workspace=0, runs_in=None):
+def _reserve(meta, stage, resident, workspace=0, runs_in=None, book=True):
     """Reserve a uniquely named actual-batch footprint in the shared ledger, priced in the
-    section that allocates it (``runs_in``)."""
+    section that allocates it (``runs_in``; ``book`` False: a live set later phases' rooms
+    hold, no stage's own price)."""
     ledger = meta.shared_pole_capacity
     name = f"{stage}:{len(ledger.entries)}"
     row = ledger.reserve(name, resident_bytes_per_rank=int(resident),
                         workspace_bytes_per_rank=int(workspace),
-                        concurrent_with=ledger.live_stages, runs_in=runs_in)
+                        concurrent_with=ledger.live_stages, runs_in=runs_in, book=book)
     return name, row
 
 
@@ -2746,7 +2747,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             nonlocal ambient
             if vertex is None and not tables_reserved:
                 from .w_isdf import charge_kconv_table_bytes
-                tables, _ = _reserve(meta, "kconv_tables", charge_kconv_table_bytes())
+                tables, _ = _reserve(meta, "kconv_tables", charge_kconv_table_bytes(), book=False)
                 tables_reserved.append(tables)
                 ambient += (tables,)
                 ledger.live_stages = ambient
@@ -2824,12 +2825,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     break
                 disk_group = -(-disk_group // 2)
         if residence == "device":
-            memory.book(memory.Price(
-                operands=memory.Term(float(live), source="live ledger stages + bind baseline "
-                                     "(response_group_size)"),
-                xla=memory.Term(float(check.price), source=f"compiled direct stream, group "
-                                f"{group_size}/{len(z)} (temp + outputs + carry + scratch)"),
-                label="response direct stream"), stage="bank.dispatch.direct")
+            memory.book(memory.priced(check.price, f"compiled direct stream, group {group_size}/"
+                                      f"{len(z)} (temp + outputs + carry + scratch)", increment=True),
+                        stage="bank.dispatch.direct")
             receipt["group_check"] = dict(chunk=check.chunk, agreed=group_size, analytic=check.analytic,
                 compiled=check.compiled_bytes, price=check.price, live=live, room=room,
                 recompiled=check.recompiled, seconds=check.seconds)
