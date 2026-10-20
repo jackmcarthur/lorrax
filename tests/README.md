@@ -61,6 +61,10 @@ A new test needs no bootstrap import of its own.
 - `tdagw/test_collision_cpu.py`: the one-sided collision branch operator,
   equilibrium subtraction, Hermitian update and held affine flow against
   independent NumPy/SciPy references.
+- `tdagw/test_native_general_head_cpu.py`: authentic general pole store,
+  native synthesis/FFT/projection and an independent body-plus-head pole
+  sum with coherent density, current energies and distinct frozen head
+  widths; checks both retarded tables and single-counted active/full output.
 - `tdagw/test_prop_collision_cpu.py` and its `_collision_case.py` child:
   collision attachment through the production propagator on a 2x2 CPU mesh;
   fixed point, integrator order, refreshes, carry/history rebasing, compile

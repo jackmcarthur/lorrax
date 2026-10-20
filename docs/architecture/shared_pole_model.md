@@ -754,3 +754,13 @@ $\Gamma,D$, the last supplies $M_H$. The identity-minus-density particle
 line keeps its cancellation at fully occupied states. Only small active
 matrix outputs reach host diagnostics. Native joint propagation never
 calls the archived projected-vertex evaluator.
+
+The existing frozen reference head is evaluated on current electronic
+energies and full density, once in each independent active/full result.
+Its source pole widths are retained; bulk collision $\eta$ is not added
+to those head denominators. Native receipts distinguish
+`bulk_evaluation_eta_ry`, signed `head_pole_imaginary_parts_ry`, and
+`head_width_convention`. The authentic head-included CPU oracle uses
+different bulk/head widths and checks both retarded slots against literal
+pole sums. This is coverage of the declared frozen-head approximation,
+not a refreshed-head or width-convergence result.
