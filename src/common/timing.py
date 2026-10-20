@@ -161,7 +161,8 @@ _MEM_COST = [0, 0.0]          # host boundary reads' seconds (device: lxkit.memo
 def instrument_cost() -> tuple[int, float]:
 	"""(boundary reads, seconds) the per-section device and host peaks have cost this process."""
 	from lxkit import memory
-	reads, seconds = memory.instrument_cost()
+	used = memory.instrument()
+	reads, seconds = used["reads"], used["seconds"]
 	return reads, seconds + float(_MEM_COST[1])
 
 

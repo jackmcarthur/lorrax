@@ -122,15 +122,15 @@ def test_production_instrument_reads_priced_stages_only_on_cpu(monkeypatch):
     """Default receipts on the CPU leg: an unpriced section reads nothing; a priced one twice."""
     monkeypatch.setattr(memory, "CALIBRATE", False)
     x = jnp.ones((256, 256)).block_until_ready()
-    reads = memory.instrument_cost()[0]
+    reads = memory.instrument()["reads"]
     for _ in range(20):
         with timing.section("hot.loop"):
             x = x + 1
-    assert memory.instrument_cost()[0] == reads
+    assert memory.instrument()["reads"] == reads
     memory.book(memory.priced(1e6, "test"), stage="priced")
     with timing.section("priced"):
         x = x + 1
-    assert memory.instrument_cost()[0] == reads + 2
+    assert memory.instrument()["reads"] == reads + 2
 
 
 def test_census_flags_missing_provenance(calibrate, monkeypatch):
@@ -164,7 +164,7 @@ def test_fastest_that_fits_prints_once(capsys):
         assert memory.admit("W Dyson 8 x 64^2", (("local", P(1 * GB, "t")),
                                                  ("distributed", P(0, "t"))), 30 * GB) == "local"
     assert memory.admit("s", (("local", P(40 * GB, "t")), ("mesh", P(4 * GB, "t"))), 30 * GB,
-                        quiet=True, detail=True)["route"] == "mesh"
+                        detail=True)["route"] == "mesh"
     out = [line for line in capsys.readouterr().out.splitlines() if "route " in line]
     assert out == ["  route W Dyson 8 x 64^2: local (1.00 GB/rank of room 30.00 GB)"]
     (row,) = memory.routes()
@@ -193,10 +193,9 @@ def test_lazy_price_probe_forced_quiet():
     assert memory.admit("probe", (("local", P(5 * GB, "t")), ("distributed", P(0, "t"))),
                         1 * GB, probe=refused) == "local"
     assert "1-D mesh" in memory.routes()[-1]["warning"]
-    assert memory.admit("SC eigh", (), 0, forced="distributed") == "distributed"
     n = len(memory.routes())
     assert memory.admit("constructor", (("local", P(5 * GB, "t")), ("face", P(0, "t"))),
-                        4 * GB, quiet=True, detail=True)["route"] == "face"
+                        4 * GB, detail=True)["route"] == "face"
     assert len(memory.routes()) == n
 
 

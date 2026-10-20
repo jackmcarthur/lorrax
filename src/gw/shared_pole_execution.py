@@ -247,7 +247,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             ('local', dataclasses.replace(ledger.price(max(rows, key=lambda r: r['aggregate_bytes_per_rank'])),
                                           whole=int(side))),
             ('face', memory.Price(outside=memory.contexts()))),
-            rows[0]['available_device_bytes_per_rank'], quiet=True, detail=True))
+            rows[0]['available_device_bytes_per_rank'], detail=True))
         return decision['route'] == 'local'
     receipt = dict(requested_layout=resolution.layout, conservative_pencil_side=side,
                    selection_face_count=selection_faces,
@@ -537,7 +537,7 @@ def price_round(executable, mesh, beside, whole=False):
                                         source=f"{'local' if whole else 'face'} round program "
                                                "(memory_analysis temp + outputs - alias)"),
                         ranks=ranks, label="reduction round executable")
-    memory.admit("shared-pole reduction round", beside + part, memory.budget())
+    memory.admit("shared-pole reduction round", beside + part, memory.run()["budget"])
     memory.book(part)
 
 

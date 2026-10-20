@@ -53,7 +53,7 @@ def device_budget_bytes() -> float:
     from lxkit import memory
     if "budget" not in memory.run():
         resolve_device_budget_gb()
-    return memory.budget()
+    return memory.run()["budget"]
 
 
 def shared_device_room(stage: str):
@@ -62,7 +62,7 @@ def shared_device_room(stage: str):
     (its eigh stacks then take the whole mesh with a warning).  Every process must enter."""
     from distrib_la import room_or_exhausted
     from lxkit import memory
-    budget, room = int(device_budget_bytes()), memory.room(stage)
+    budget, room = int(device_budget_bytes()), memory.room()
     return room_or_exhausted(room, stage=stage, priced_bytes=budget - room, available_bytes=budget)
 
 

@@ -1410,7 +1410,7 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn, nk: int = 1) -
     requested = str(getattr(getattr(config, "sc", None), "eigh", "auto"))
     site = f"SC eigh {int(nk)} x {int(nb)}^2"
     if requested in ("native", "distributed"):
-        return memory.admit(site, (), 0, forced=requested)
+        return requested
 
     from common.wfn_layout import band_sphere_spec
     from runtime.padding import padded_axis
