@@ -823,6 +823,15 @@ class ZetaG:
                                          int(sl.shape[1]), debug_m=dbg, with_v=with_v)
         L_arg = self.factor
         nxt = st.read_tile(0)
+        # The pass's price: its tile step compiled (never run) beside the prefetched tile, the
+        # largest any rank read; the tile width is the store's (runtime.aot_memory.check_chunk).
+        from lxkit import memory
+        from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+        tile = math.prod(nxt.sharding.shard_shape(nxt.shape)) * nxt.dtype.itemsize
+        got = -agreed_chunk(-compiled_new_bytes(step.lower(
+            L_arg, nxt, v_dev, ngk_dev, sl_dev, jnp.int32(0), V, M, shell).compile(), extra=tile))
+        memory.book(memory.priced(got, f"ζ G-tile step {st.g_tile} (compiled) + the prefetched "
+                                  "tile", increment=True))
         for t in range(st.n_Gt):
             # Tile t+1 is read while tile t is contracted.
             Zt = nxt
