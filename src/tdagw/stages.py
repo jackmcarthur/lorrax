@@ -607,6 +607,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
             basis=v["lorrax.collision_basis"],
             hamiltonian=v["lorrax.collision_hamiltonian"],
             spm_support_sites=v["lorrax.collision_spm_support_sites_ev"],
+            spm_chi0_active=v["lorrax.collision_spm_chi0_active"],
             spm_scratch=os.path.join(os.path.abspath(str(
                 v["control.files.outdir"])), "collision_models"),
             fit_tolerance=v["lorrax.collision_fit_tolerance"],

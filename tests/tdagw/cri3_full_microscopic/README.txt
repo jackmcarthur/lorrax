@@ -21,6 +21,7 @@ repair is performed. A failed or cropped leg is not a completed 10 fs run.
 
 Default controls are 2v2c, all 978 centroid ports/36 q/160 virtual bands,
 raw retarded-reference collision and hHF+MH, dt25 as, samples50 as,
+numerical response partition[88,144) with all160 virtual bands still present,
 refresh0.5 fs, pulse center3 fs/width1 fs/energy0.07 Ha, fields0/7e9/1e10
 V/m. These are exploratory numerical settings, not convergence results.
 The prepared DFT density is a declared quench. B/C share the same t0
