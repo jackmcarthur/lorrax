@@ -571,6 +571,21 @@ def compiled_new_bytes(compiled, *, extra: int = 0, platform: str | None = None)
     return int(aot_kernel_peak_bytes(compiled, platform=platform).resident_increment) + int(extra)
 
 
+def compiled_price(fn, *abstract, ranks: int, face: bool, source: str, arguments: bool = False):
+    """A route's ``lxkit.memory.Price`` from its own code ``fn`` compiled (never run) at
+    ``abstract`` operands, as :func:`check_chunk` reads a chunk: :func:`compiled_new_bytes`
+    (``arguments``: + the operands, which the route creates in its own layout), the largest any
+    rank read (INVARIANTS 21); ``face``: divided over the mesh, else whole on every rank."""
+    import jax
+    from lxkit import memory
+    ex = jax.jit(fn).lower(*abstract).compile()
+    got = float(-agreed_chunk(-compiled_new_bytes(
+        ex, extra=int(ex.memory_analysis().argument_size_in_bytes) if arguments else 0)))
+    return memory.Price(xla=memory.Term(0.0 if face else got, got * int(ranks) if face else 0.0,
+                                        f"{source} (compiled, never run)"),
+                        ranks=int(ranks), label=source)
+
+
 def agreed_chunk(chunk: int) -> int:
     """The smallest of every rank's value (one small all-gather).
 
