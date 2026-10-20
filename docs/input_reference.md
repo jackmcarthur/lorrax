@@ -232,9 +232,9 @@ with `head_correction`, and a deck that names the key refuses at parse.
 |---|---|---|---|
 | `bse_k_grid` | str | `""` | `"NX NY NZ"`: densifies the BSE bundle (ψ/ε, W) from the coarse restart grid before any solve. Each extent must be at least the coarse one; integer nesting is not required. Empty keeps the coarse grid. |
 | `w_head_densify` | str | `c1` | Coarse-to-fine W treatment under `bse_k_grid`. `c1` splits off the singular Γ head and reattaches it analytically per fine q. `srlr` interpolates W minus a fitted dressed long-range model (head and slab G_z channels) and adds the model back at every fine q ([SR/LR densification](theory/w-srlr-densification.md)); it needs a restart whose W0 came from the static Dyson solve (`W0_lr` group, e.g. `compute_mode = cohsex`) stored on its q wedge, and runs on the `bse_k_grid` bundle path only (`exciton_bands --w-coarse-grid` refuses it). `legacy` is retired and refuses by name. |
-| `htransform_rank_multiplier` | float | `20.0` | Search ceiling ⌈multiplier·N_band⌉ of the whole-state randomized QRCP basis. `htransform_qr_eps` sets the delivered rank. |
-| `htransform_qr_eps` | float | `1e-3` | Relative QR-diagonal rank threshold of the whole-state sketch (the pivoted-Cholesky form uses qr_eps²). |
-| `htransform_qrcp_seed` | int | `0` | Seed of the candidate shuffle and the Gaussian sketch; the candidate and pivot hashes are printed. |
+| `htransform_rank_multiplier` | float | `20.0` | Unused: the nodal htransform basis is the centroid set (rank N_spin·N_centroid). Accepted for archived decks. |
+| `htransform_qr_eps` | float | `1e-3` | Relative cutoff (qr_eps²) of the Gram pseudo-inverse in the refit's grid rows; the nodal fit itself has no tolerance. |
+| `htransform_qrcp_seed` | int | `0` | Unused: the nodal basis is deterministic. Accepted for archived decks. |
 | `get_centroids_fi` | bool | `false` | htransform → BSE handoff: also computes fine-grid ψ at the coarse centroids. |
 | `wfn_fi_min` | int | `0` | Lower edge of the htransform band sub-window (0-based). |
 | `wfn_fi_max` | int | `0` | Exclusive upper edge; `0` selects the full window. |
@@ -243,7 +243,7 @@ with `head_correction`, and a deck that names the key refuses at parse.
 
 htransform keeps its Galerkin basis in `galerkin_dft.h5` beside the deck. A file
 whose provenance matches (WFN fingerprint, centroid SHA-256, band window, grids,
-spinor mode, QRCP controls) is reused. A file with other provenance is left
+spinor mode, node version) is reused. A file with other provenance is left
 unchanged and the basis is refit in memory. With no file, the basis is fitted
 and published there. The log prints `REUSED`, `REFIT` or `FITTED and published`.
 

@@ -1,8 +1,9 @@
 """``bse_k_grid`` dipoles: the htransform-interpolated velocity (CPU, 2x2 host mesh).
 
 ``bse.bse_densify.densified_dipoles`` on a toy tight-binding slab whose
-orbitals are the Galerkin basis, so the coarse states ARE ``ctilde`` and the
-exact fine-grid dipoles are one ``eigh`` away.  Run with
+orbitals are the htransform nodes (all at the cell origin, unit metric), so the
+coarse states ARE ``ctilde`` and the exact fine-grid dipoles are one ``eigh``
+away.  Run with
 ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4``.
 
 1. Every fine q that is a coarse k reproduces the coarse velocity in the
@@ -34,6 +35,7 @@ from bandstructure.bse_setup import compute_wfns_fi  # noqa: E402
 from bse.absorption_common import window_dipoles  # noqa: E402
 from bse.bse_densify import densified_dipoles  # noqa: E402
 from ffi.fft import xla_reference  # noqa: E402
+from isdf.galerkin import NodalInterp  # noqa: E402
 
 KC, KF = (6, 6, 1), (9, 9, 1)          # non-nested: 3x3 shared points
 ONSITE = np.r_[np.linspace(-1.6, -0.7, 4), np.linspace(0.6, 1.5, 4), 5.0, 5.3]
@@ -89,14 +91,22 @@ def _sym(kpts):
             np.eye(3), (len(np.asarray(rows)), 3, 3)))
 
 
+def _nodes(c):
+    """The toy's orbitals as co-located nodes; their nodal values are ``c``."""
+    m = int(c.shape[2])
+    return NodalInterp(jnp.asarray(c), np.zeros((m, 3)),
+                       np.diag([1.0, 1.0, 10.0]), 2, 1)
+
+
 def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
              gate_energies=None):
     """``compute_wfns_fi`` + ``densified_dipoles`` on the toy, XLA backend."""
     kc = _grid(KC)
     e_fh = e if fh_energies is None else fh_energies
+    nodes = _nodes(c)
     with xla_reference():
         fine = compute_wfns_fi(
-            ctilde=jnp.asarray(c), B_at_mu=jnp.ones((c.shape[2], 1, 4), complex),
+            ctilde=jnp.asarray(c), B_at_mu=nodes,
             enk_sigma=jnp.asarray(e_fh.T),
             kgrid_co=KC, kgrid_fi=KF, band_window_fi=(B_MIN, B_MAX),
             mesh_xy=mesh, return_coeffs=True)
@@ -105,8 +115,8 @@ def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
         dip = densified_dipoles(
             (v, e if e_file is None else e_file, "toy dH/dk", "toy.h5"),
             sym=_sym(kc), fh_energies=e_fh if gate_energies is None else gate_energies,
-            basis=SimpleNamespace(ctilde=jnp.asarray(c),
-                                                band_range=(0, NB)),
+            basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, NB),
+                                  basis_at_nodes=nodes),
             fine=fine, coarse_grid=KC, n_val=N_VAL, window_start=B_MIN,
             a_band_index=None,
             mesh_xy=mesh, log_fn=lambda *a: None)

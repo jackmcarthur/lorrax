@@ -1537,10 +1537,9 @@ def main(argv=None):
         report.environment(wfn=wfn, lines=(
             f"Restart tensors: {abs_path(restart_file)}",
             "Transition data: distributed band and centroid blocks on X x Y",
-            "Galerkin basis: whole-state randomized QRCP; search ceiling "
-            f"{_basis_multiplier:g} x fitted bands; qr_eps="
-            f"{float(params.get('htransform_qr_eps', 1.0e-3)):.3e}; seed="
-            f"{int(params.get('htransform_qrcp_seed', 0))}; no Gram eigensolve",
+            "Galerkin basis: every orbit-closed centroid as a node "
+            f"(multiplier {_basis_multiplier:g} unused); quadrature metric + "
+            "Loewdin; deterministic, no Gram eigensolve",
             f"Fine-k eigensolve: {_fine_plan.requested} -> "
             f"{_fine_plan.backend}; matrix extent follows retained Galerkin rank",
             f"Batched LA schedule: {_fine_plan.requested_batched_route} -> "

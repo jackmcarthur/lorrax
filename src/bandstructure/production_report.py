@@ -103,14 +103,9 @@ class HTransformProductionReport:
         for line in numerical_environment_lines(self.runtime):
             self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
-        multiplier = float(params.get("htransform_rank_multiplier", 20.0))
-        if multiplier == 0.0:
-            multiplier = 20.0
         self.emit(
-            "Galerkin basis : whole-state randomized QRCP; search ceiling "
-            f"{multiplier:.5f} x fitted bands; qr_eps="
-            f"{float(params.get('htransform_qr_eps', 1.0e-3)):.5e}; seed="
-            f"{int(params.get('htransform_qrcp_seed', 0))}; no Gram eigensolve")
+            "Galerkin basis : every orbit-closed centroid as a node; "
+            "quadrature metric + Loewdin; no selection, no tolerance")
         if fine_enabled:
             fine_text = policy(
                 fine_plan.requested,
@@ -197,8 +192,8 @@ class HTransformProductionReport:
             self.emit(
                 f"Centroid sites : requested subset {int(centroids.n_rmu)} "
                 f"of {int(centroids.source_n_rmu)} source rows")
-        self.emit(f"Galerkin basis : rank {int(ctilde.shape[2])} shared across "
-                  f"{int(result['nk_total'])} coarse-grid k points")
+        self.emit(f"Galerkin basis : nodal rank {int(ctilde.shape[2])} shared "
+                  f"across {int(result['nk_total'])} coarse-grid k points")
         multiplier = float(params.get("htransform_rank_multiplier", 0.0))
         self.emit("Rank policy    : " + (
             "full numerical span" if multiplier == 0.0 else
