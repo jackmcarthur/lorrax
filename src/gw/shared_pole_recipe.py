@@ -340,6 +340,8 @@ class CapacityLedger:
     def __init__(self, meta, *, mesh_xy, device_budget_bytes=None, baseline_bytes=0):
         geometry = dict(nq=meta.nk_tot, nspinor=meta.nspinor, nmu=meta.n_rmu,
                         px=mesh_xy.shape['x'], py=mesh_xy.shape['y'])
+        from lxkit import memory
+        memory.set_nmu(int(meta.n_rmu))           # route completeness (memory.require_backup)
         self.geometry = {}
         for key, value in geometry.items():
             if isinstance(value, bool):
@@ -361,6 +363,7 @@ class CapacityLedger:
         if self.device_budget_bytes_per_rank <= 0:
             raise ValueError("capacity device budget must be positive")
         self.baseline_bytes_per_rank = self._bytes(baseline_bytes)
+        self.room_bytes = None           # the device room at the last agreed phase point
         self.entries = []
         self._accepted = {}
         self._live_stages = None
@@ -403,32 +406,57 @@ class CapacityLedger:
         return result
 
     def reserve(self, stage, *, resident_bytes_per_rank,
-                workspace_bytes_per_rank, concurrent_with=()):
-        """Admit actual-batch bytes before allocation; over the budget, warn and admit.
+                workspace_bytes_per_rank, concurrent_with=(), runs_in=None, whole=False):
+        """Admit actual-batch bytes before allocation (``lxkit.memory.admit``).
+
+        The price is booked to ``runs_in``, the timing section that allocates it (default:
+        the section open now), so its receipt measures the allocation, not the admission.
 
         Returns a detached JSON row. ``concurrent_with`` is an iterable of
         accepted stage names, not their byte totals. Caller-live allocations
         must be charged here OR in a named concurrent reservation, never both.
         No runtime peak is inferred from a successful analytical admission.
         A row over the available budget keeps ``device_budget_status`` FAIL
-        and prints one line (``common.gpu_utils.warn_over_budget``).
+        and prints one line (``lxkit.memory.admit``).
         """
         if not isinstance(stage, str) or not stage.strip() or stage in self._accepted:
             raise ValueError(f"capacity stage must be a new nonempty name; got {stage!r}")
         row = self.preview(resident_bytes_per_rank=resident_bytes_per_rank,
                            workspace_bytes_per_rank=workspace_bytes_per_rank,
                            concurrent_with=concurrent_with)
-        row['stage'] = stage
+        row['stage'], row['whole'] = stage, bool(whole)
         row['live_stages'] = sorted(set(row['concurrent_with']) | {stage})
         self.entries.append(row)
-        from common.gpu_utils import record_stage_price, warn_over_budget
+        from lxkit import memory
         if row['device_budget_status'] != 'PASS':
-            warn_over_budget(f"shared-pole ledger {stage}", row['aggregate_bytes_per_rank'],
-                             row['available_device_bytes_per_rank'])
+            memory.admit(f"shared-pole ledger {stage}", self.price(row),
+                         row['available_device_bytes_per_rank'], runs_in=runs_in)
         self._accepted[stage] = row
-        # Priced as the pool measures it: the ledger's bytes and what was live beside it at bind.
-        record_stage_price(self.price_label(), row['aggregate_bytes_per_rank'] + self.baseline_bytes_per_rank)
+        memory.book(self.price(row), stage=runs_in)
         return copy.deepcopy(row)
+
+    def at_phase(self):
+        """Read the device room (``lxkit.memory.room``) at an agreed phase point: the ledger
+        bind, a constructor phase's entry, a bank kernel's admission (every process enters)."""
+        from lxkit import memory
+        if "budget" in memory.run():
+            self.room_bytes = int(memory.room(bucketed=False))
+
+    def price(self, row):
+        """A ledger row as THE Price admission, receipt and sizing use: its own bytes and its
+        live concurrent rows (face-tiled: spread over the mesh) beside the driver's arrays live
+        at bind (the baseline, held at this P).  A row of whole matrices per rank (``whole``:
+        the local constructor) holds its own bytes at any P (fixed)."""
+        from lxkit import memory
+        ranks = self.geometry['px'] * self.geometry['py']
+        own = float(row['resident_bytes_per_rank'] + row['workspace_bytes_per_rank'])
+        beside = float(row['aggregate_bytes_per_rank']) - own
+        return memory.Price(
+            operands=memory.Term(float(self.baseline_bytes_per_rank), beside * ranks,
+                                 source="live outside the ledger at bind + live ledger rows"),
+            xla=memory.Term(own if row.get('whole') else 0.0, 0.0 if row.get('whole') else own * ranks,
+                            source=f"{row.get('stage', 'ledger')} (shared-pole ledger)"),
+            ranks=ranks, label=self.price_label())
 
     def preview(self, *, resident_bytes_per_rank,
                 workspace_bytes_per_rank, concurrent_with=()):
@@ -451,12 +479,10 @@ class CapacityLedger:
             self._accepted[name]['resident_bytes_per_rank']
             + self._accepted[name]['workspace_bytes_per_rank'] for name in live)
         scaling_passed = total <= self.limit_bytes_per_rank
-        # Stream and Sigma are sequential inherited phases, not simultaneous
-        # allocations. Retain the larger recorded peak conservatively.
-        inherited = max((row.get('value', {}).get('shared_bytes_per_rank') or 0
-                         for row in (self.stream_peak, self.sigma_peak)
-                         if isinstance(row.get('value'), dict)), default=0)
-        available = max(0, self.device_budget_bytes_per_rank - inherited - self.baseline_bytes_per_rank)
+        # The room read at the last agreed phase point (at_phase) with the live rows it already
+        # holds handed back; a standalone ledger (no room read) prices against its budget.
+        available = (max(0, self.device_budget_bytes_per_rank - self.baseline_bytes_per_rank)
+                     if self.room_bytes is None else self.room_bytes + total - resident - workspace)
         passed = total <= available
         g = self.geometry
         max_ranks = math.floor(self.limit_bytes_per_rank * g['px'] * g['py'] / total) if total else None
@@ -477,7 +503,6 @@ class CapacityLedger:
                    aggregate_bytes_per_rank=total,
                    limit_bytes_per_rank=self.limit_bytes_per_rank,
                    device_budget_bytes_per_rank=self.device_budget_bytes_per_rank,
-                   inherited_peak_bytes_per_rank=inherited,
                    baseline_bytes_per_rank=self.baseline_bytes_per_rank,
                    available_device_bytes_per_rank=available,
                    device_budget_status='PASS' if passed else 'FAIL',
@@ -486,7 +511,7 @@ class CapacityLedger:
         return copy.deepcopy(row)
 
     def price_label(self):
-        """The stage name a reservation's price is recorded under (``record_stage_price``)."""
+        """The stage name a reservation's price is recorded under (``lxkit.memory.book``)."""
         if not self.baseline_bytes_per_rank:
             return "shared-pole ledger"
         return f"shared-pole ledger + {self.baseline_bytes_per_rank / 1e9:.2f} GB baseline"
@@ -499,17 +524,6 @@ class CapacityLedger:
                            concurrent_with=concurrent_with)
         return max(0, int(row['available_device_bytes_per_rank'])
                    - int(row['aggregate_bytes_per_rank']))
-
-    def record_measured_peak(self, bytes_per_rank, *, reason):
-        """Record the new-object maximum over ranks, excluding inherited stream."""
-        peak = self._bytes(bytes_per_rank)
-        if peak < self.measured_peak.get('bytes_per_rank', 0):
-            return self.receipt()['measured_peak']
-        self.measured_peak = gate_receipt(
-            'capacity', peak / self.U_bytes_per_rank,
-            passed=peak <= self.limit_bytes_per_rank, reason=reason)
-        self.measured_peak['bytes_per_rank'] = peak
-        return self.receipt()['measured_peak']
 
     def receipt(self, *, entry_start=None):
         """Snapshot stage rows and peaks, optionally as an indexed ledger segment.
@@ -1246,14 +1260,15 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
         raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
     # The run's budget in decimal GB (was per_device_gb * 2**30: GiB, 7.4% over the deck).
-    from common.gpu_utils import device_budget_bytes, shared_device_room_bytes
+    from common.gpu_utils import device_budget_bytes
+    from lxkit import memory
     budget = int(device_budget_bytes())
-    # What is live outside the ledger now (the driver's arrays), the largest over processes:
-    # shared_device_room_bytes gathers every process's room and takes the minimum, so every
-    # rank enters the same call here and gets the same baseline (no rank-divergent flow).
-    baseline = max(0, budget - int(shared_device_room_bytes()))
+    # What the allocator holds outside the ledger now (the driver's arrays), the largest over
+    # processes: memory.room takes the minimum room, so every rank gets the same baseline.
+    baseline = max(0, budget - memory.room(bucketed=False))
     meta.shared_pole_capacity = CapacityLedger(
         meta, mesh_xy=mesh_xy, device_budget_bytes=budget, baseline_bytes=baseline)
+    meta.shared_pole_capacity.room_bytes = budget - baseline
     print_fn(f"shared-pole ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "
              f"live outside the ledger at bind (the driver's arrays); admissions see "
              f"{(budget - baseline) / 1e9:.2f} GB/rank")

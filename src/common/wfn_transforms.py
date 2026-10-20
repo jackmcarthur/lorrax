@@ -2126,9 +2126,10 @@ def _centroid_fft_scan_chunk(
     if int(gpu_mem_bytes) - persistent_bytes < min_scan_bytes:
         # G-flat tile or input + X/Y centroid outputs + one FFT scan row: a
         # smaller scan chunk cannot reduce this floor.
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("centroid load (one FFT scan row)",
-                         persistent_bytes + min_scan_bytes, gpu_mem_bytes)
+        from lxkit import memory
+        memory.admit("centroid load (one FFT scan row)",
+                     memory.priced(persistent_bytes + min_scan_bytes, "closed form"),
+                     gpu_mem_bytes, device=False)
 
     # Translate legacy hints (band_chunk_size, k_chunk_size) into the new
     # flat-row count.  In either arm the tile bound applies last.

@@ -372,11 +372,12 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     scratch = sigma_kconv_scratch(kgrid=kgrid, ns=ns, rows=R, n_right=nu, mesh=mesh_xy)
     price = dict(d=ns, ns=ns, passes=len(windows), tile=float(TILE_BYTES), scratch=int(scratch),
                  new=float(R * row_bytes + psi_bytes + scratch))
-    from common.gpu_utils import record_stage_price
+    from lxkit import memory
     # A static node is priced in its caller's section (Σ exchange, static COHSEX).
     label = "Sigma static" if static else "Sigma tau"
-    record_stage_price(f"{label}, {len(windows)} row pass(es)", price["new"],
-                       section=None if static else "sigma.tau_sweep")
+    memory.book(memory.priced(price["new"],
+                              f"{label}, {len(windows)} row pass(es)", increment=True),
+                stage=None if static else "sigma.tau_sweep")
     if jax.process_index() == 0:
         print(f"{label} stream: {len(windows)} row pass(es) of {R} local rows "
               f"({local_rows} per rank)", flush=True)

@@ -435,7 +435,7 @@ def density_active_band_count(occ, kweights, spin_degeneracy: float) -> int:
 # docs/architecture/memory-model.md#routes): robustness at 1e4+ bands over
 # speed at 1e3, where the native batch solves ndev matrices at once and wins
 # by roughly ndev.  Both consumers decide through
-# ``common.gpu_utils.admit_local``, which prints and records the route.
+# ``lxkit.memory.admit``, which prints and records the route.
 BAND_TILE_BUDGET_FRACTION = 0.01
 
 
@@ -492,11 +492,12 @@ def plan_density_scan(*, mesh: Mesh, n_k: int, nb_carrier: int,
     if not have_U:
         return DensityScanPlan("local", nb_carrier, 1, int(ngkmax))
     c128 = 16.0
-    from common.gpu_utils import admit_local
+    from lxkit import memory
     budget = float(budget_bytes or 0.0)
-    if not admit_local(f"SC density scan U tile {nb_carrier}^2", float(nb_carrier) ** 2 * c128,
-                       BAND_TILE_BUDGET_FRACTION * budget if budget > 0 else float("inf"),
-                       provider=False, names=("g_split", "band_2d")):
+    if memory.admit(f"SC density scan U tile {nb_carrier}^2", (
+            ("g_split", memory.priced(float(nb_carrier) ** 2 * c128, "U tile", term="operands"),
+             BAND_TILE_BUDGET_FRACTION * budget if budget > 0 else float("inf")),
+            ("band_2d", memory.Price())), budget) == "band_2d":
         return DensityScanPlan("band_2d", nb_carrier, 1, int(ngkmax))
     n_rot = padded_axis(
         max(int(n_active), 1), mesh, name="density occupied rotated bands",

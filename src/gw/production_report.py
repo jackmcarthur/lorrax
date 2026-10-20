@@ -870,9 +870,9 @@ class GWProductionReport:
         self._routes()
 
     def _routes(self) -> None:
-        """Every memory-driven route the run took and why (``common.gpu_utils.routes``)."""
-        from common.gpu_utils import routes
-        taken = routes()
+        """Every memory-driven route the run took and why (``lxkit.memory.routes``)."""
+        from lxkit import memory
+        taken = memory.routes()
         if not taken:
             return
         self.heading("Routes")
@@ -883,18 +883,16 @@ class GWProductionReport:
         """The device peak of every major stage against its planner's price, and its host peak.
 
         A row's peak is the pool high-water mark over the timing nodes it owns
-        (``common.timing``; max and min over ranks).  A planner's price
-        (``common.gpu_utils.record_stage_price``) is judged against the own peak
-        of the section it names: an enclosing one, else the one sharing the
-        longest path with the call, else the section open at the call.
+        (``common.timing``; max and min over ranks).  A priced stage's receipt
+        (``lxkit.memory``) holds its own measured figure: the high-water from the
+        price's booking to the stage's exit, after waits on the work around it.
 
         The host columns are the process resident high-water mark (``ru_maxrss``,
         which never falls) at the row's last exit and the rise the row's own
         intervals caused, each the max over ranks.  No planner prices the host.
         """
-        from common import timing
-        from common.gpu_utils import stage_prices
-        from runtime.xla_memory import pool_high_water_source
+        from common import gpu_utils, timing
+        from lxkit import memory
         paths = [tuple(r.get("path", (r["name"],))) for r in rows]
         selfs = [_rank_peaks(r, "peak_self") for r in rows]
         hosts = [_rank_peaks(r, "host") for r in rows]
@@ -925,28 +923,13 @@ class GWProductionReport:
             rise = np.nanmax(np.nansum([pad(rises[i]) for i in mine], axis=0))
             return f"{mark / 1e9:7.2f}  {rise / 1e9:+6.2f}"
 
-        priced = {}      # (stage, section path) -> the largest price, and the peak
-        for price in stage_prices():
-            call = tuple(price["path"])
-            # The named section: an enclosing one first, else the one sharing the
-            # longest path with the call, else the section open at the call.
-            candidates = [(call[:len(p)] == p, len(os.path.commonprefix([p, call])), -i, i)
-                          for i, p in enumerate(paths) if p and p[-1] == price["section"]]
-            candidates = candidates or [(True, len(p), -i, i)
-                                        for i, p in enumerate(paths) if p == call]
-            if not candidates:
-                continue
-            node = max(candidates)[3]
-            key = (price["stage"], paths[node])
-            if key not in priced or price["bytes"] > priced[key][0]["bytes"]:
-                priced[key] = (price, paths[node], _rank_peaks(rows[node], "peak"))
-        priced = list(priced.values())
+        priced = [(row, np.where(m >= 0, m, np.nan)) for row in memory.receipts()
+                  for m in (_rank_peaks(row, "measured"),)]
         self.heading("Major-stage device and host memory")
-        from common import gpu_utils
-        budget = gpu_utils._RUN_DEVICE_BUDGET_GB
+        budget = memory.run().get("budget", 0.0) / 1e9
         run_peak = max((np.nanmax(v) for v in selfs if np.any(np.isfinite(v))), default=0.0)
         self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
-                  f"rank(s); γ = peak / planner price")
+                  f"rank(s); prices and γ: the priced stages below")
         host_run = [pad(v) for v in hosts if np.any(np.isfinite(v))]
         if host_run:
             host_run = np.nanmax(np.asarray(host_run), axis=0)
@@ -960,36 +943,32 @@ class GWProductionReport:
         if budget:
             self.emit(f"  budget memory_per_device_gb = {budget:.2f} GB; run peak "
                       f"{run_peak / 1e9:.2f} GB ({'within' if run_peak <= budget * 1e9 else 'OVER'})")
-        self.emit(f"  {'stage':<{width}}  peak GB max / min   price GB           γ  "
+        self.emit(f"  {'stage':<{width}}  peak GB max / min  "
                   f"host GB    rise  set by")
         for name, band in stages:
             peak, setter = row_peak(band)
             host = row_host(band)
             if peak is None and "–" in host:
                 continue
-            mine = [pr for pr, node, _ in priced if band.owns(node)]
-            if mine:
-                price = max(pr["bytes"] for pr in mine)
-                gamma = (f"{np.nanmax(peak) / price:10.2f}" if price > 0 and peak is not None
-                         else f"{'–':>10}")
-                tail = f"{price / 1e9:9.2f}  {gamma}"
-            else:
-                tail = f"{'–':>9}  no planner"
-            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}  {host}  "
+            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {host}  "
                       f"{' > '.join(setter[-2:])}")
         # Constructor sub-stages with their own pool high-water (TimingNode.peak), so a leg
         # measures what the reduction, passivity and head prices are calibrated against.
         for line in _substage_peak_lines(paths, rows):
             self.emit(line)
         if priced:
-            self.emit("  planner prices, each against the own peak of the section it names:")
-            for price, node, peak in priced:
-                gamma = (f"{np.nanmax(peak) / price['bytes']:.2f}"
-                         if price["bytes"] > 0 and np.any(np.isfinite(peak)) else "–")
-                self.emit(f"    {price['stage']}: {price['bytes'] / 1e9:.2f} GB; "
-                          f"{' > '.join(node)} peak {_gb_pair(peak, 0)} GB; γ {gamma}")
+            self.emit("  priced stages (receipts; measured max over ranks):")
+            for row, peak in priced:
+                worst = float(np.nanmax(peak)) if np.any(np.isfinite(peak)) else -1.0
+                self.emit("    " + memory.receipt_line(row["stage"], row["price"], worst,
+                                                       row["exact"], row["source"])
+                          + f" [x{row['count']}]")
+        self.emit("  " + memory.sizing()["line"])
+        for finding in memory.findings() if memory.STRICT else ():
+            self.emit("  memory census: " + finding)
         reads, seconds = timing.instrument_cost()
-        self.emit(f"  instrument: {pool_high_water_source() or 'none'}; {reads} boundary "
+        self.emit(f"  instrument: {memory.source() or 'none'} "
+                  f"({'calibrate' if memory.CALIBRATE else 'production'}); {reads} boundary "
                   f"reads on rank 0 took {seconds * 1e3:.1f} ms "
                   f"({100.0 * seconds / wall if wall else 0.0:.4f}% of the wall)")
 

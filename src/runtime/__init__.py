@@ -869,81 +869,25 @@ def apply_site_scratch(*, say=print) -> None:
         say(f"[runtime] WARNING: {why}; per-user caches stay under HOME.")
 
 
-#: The one device-memory rule (owner 2026-10-08), the same for every vendor and
-#: card size, fitted with a 1.2 margin to the largest P4 and P64 sampler
-#: readings (sandbox claim 3978).  With ``M`` the card total and ``O`` the bytes
-#: outside the XLA pool:
-#:
-#:     planner budget    B = (M - 1.2 O) / (1 + 1.2 phi) - T_ord   (planner_budget_bytes)
-#:     pool reservation  R = M - 1.2 O_max                  (pool_fraction)
-#:
-#: ``O`` is 3 GB (the CUDA context and modules, XLA's NCCL communicators, cuFFT
-#: plans), plus :data:`DISTRIBUTED_LINALG_OUTSIDE_BYTES` under ``linalg =
-#: distributed``.  ``phi`` = 0.19 is how far the pool's in-use bytes may run
-#: above the budget: peaks the planners under-price, and free space trapped
-#: between live buffers.  The pool's reserved bytes can also rise past ``R``
-#: for an instant, when a request meets only frees still pending on the
-#: stream; that borrows the card's free memory until XLA's next stream
-#: synchronize and is not in ``phi`` (docs/architecture/memory-model.md
-#: #pool-growth).  The pool is reserved before the deck is read, so
-#: ``R`` leaves room for the larger ``O``; the reservation is not a cap.  Both
-#: read only ``M`` and the deck's resolved ``linalg``: the same on every rank
-#: and every run.  ``T_ord`` (16 MiB, :func:`ordered_reduction_transient_bytes`)
-#: is the rank-order reductions' fixed transient inside the pool.
-OUTSIDE_POOL_BYTES = 3e9
-#: The cuSOLVERMp/cuBLASMp contexts, their NCCL communicators and workspace
-#: under ``linalg = distributed`` (5.9 GB outside at P4 against 2.9).  Owner:
-#: ``distrib_la``; the constant lives here because the pool is reserved before
-#: any service is imported.
-DISTRIBUTED_LINALG_OUTSIDE_BYTES = 3e9
-POOL_OVERSHOOT = 0.19
-MEMORY_MARGIN = 1.2
-
-
-def outside_pool_allowance_bytes(linalg: str = "local") -> float:
-    """``O`` for the deck's resolved ``linalg`` (``local`` or ``distributed``).
-
-    The ``local`` term is the device leg's ``outside_pool_bytes`` (:data:`lxkit.LEGS`)
-    where it declares one, else :data:`OUTSIDE_POOL_BYTES`; read before any backend
-    exists, the same on every rank."""
-    base = OUTSIDE_POOL_BYTES
-    leg = None
-    if os.environ.get("JAX_PLATFORMS", "").split(",")[0] != "cpu":   # a forced-CPU process: default O
+def _reservation_leg():
+    """The device leg whose outside allowance the pool reservation leaves free (the
+    installed plugin's, read before any backend exists; the CUDA leg when none answers)."""
+    from lxkit import LEGS
+    if os.environ.get("JAX_PLATFORMS", "").split(",")[0] != "cpu":
         try:
             leg = _gpu_leg()
+            if leg is not None:
+                return leg
         except Exception:                                     # noqa: BLE001
-            leg = None      # no GPU plugin installed: a CPU process, the default O
-    if leg is not None and getattr(leg, "outside_pool_bytes", None) is not None:
-        base = float(leg.outside_pool_bytes)
-    return base + (DISTRIBUTED_LINALG_OUTSIDE_BYTES
-                                 if linalg == "distributed" else 0.0)
-
-
-def ordered_reduction_transient_bytes() -> float:
-    """``T_ord``: the named cap of the rank-order reductions' transient.
-
-    ``lxkit.ordered_transient_bytes()``, ``ORDERED_TRANSIENT_SLABS`` (2) slabs of
-    ``LORRAX_ORDERED_SLAB_MB`` (8 MiB): 16 MiB.  Fixed: an ordered all-reduce or
-    reduce-scatter of any size holds at most this much beyond the library
-    collective (docs/environment/transports.md#rank-order-reductions), so the
-    rule reserves it once, out of ``B``, for every planner and route."""
-    from lxkit import ordered_transient_bytes
-    return float(ordered_transient_bytes())
-
-
-def planner_budget_bytes(total_bytes: float, linalg: str = "local") -> float:
-    """``B = (M - 1.2 O) / (1 + 1.2 phi) - T_ord``, at most the reservation and at least ``M / 4``."""
-    total = float(total_bytes)
-    budget = ((total - MEMORY_MARGIN * outside_pool_allowance_bytes(linalg))
-              / (1.0 + MEMORY_MARGIN * POOL_OVERSHOOT)) - ordered_reduction_transient_bytes()
-    return max(min(budget, pool_reservation_bytes(total)), 0.25 * total)
+            pass
+    return LEGS["CUDA"]
 
 
 def pool_reservation_bytes(total_bytes: float) -> float:
-    """``R = M - 1.2 O`` at the larger ``O`` (distributed linalg), at least ``M / 2``."""
-    total = float(total_bytes)
-    return max(total - MEMORY_MARGIN * outside_pool_allowance_bytes("distributed"),
-               0.5 * total)
+    """``R``: the card less the leg's larger outside allowance
+    (``lxkit.memory.pool_reservation``)."""
+    from lxkit import memory
+    return memory.pool_reservation(total_bytes, _reservation_leg())
 
 
 def pool_fraction(total_bytes: float | None) -> str:
@@ -992,7 +936,7 @@ def set_default_gpu_pool() -> None:
     an allocation outside the pool afterwards (NCCL communicators, the
     cuSOLVERMp/cuBLASMp contexts) gets ``M - R``.  The policy needs one
     process per GPU.  The planners budget from the card total
-    (:func:`planner_budget_bytes`), not from the client's ``bytes_limit``.
+    (``lxkit.memory.resolve``), not from the client's ``bytes_limit``.
     """
     plats = [p.strip().lower()
              for p in os.environ.get("JAX_PLATFORMS", "").split(",") if p.strip()]
@@ -3136,8 +3080,9 @@ def _device_memory_facts(device, total) -> dict:
     worst = int(np.max(np.asarray(all_gather_processes(
         np.asarray(-1 if outside is None else outside, dtype=np.int64)))))
     reservation = pool_reservation_bytes(total) if total else None
+    from common.gpu_utils import device_budget_bytes
     return {"total": total, "headroom": None if not total else total - reservation,
-            "budget": None if not total else planner_budget_bytes(total),
+            "budget": None if not total else device_budget_bytes(),
             "reservation": reservation,
             "outside_max": None if worst < 0 else worst}
 
@@ -3152,7 +3097,7 @@ def device_memory_summary(d: dict | None) -> tuple[str | None, str | None]:
     seen = "unread" if out is None else f"{out / 1e9:.2f} GB (max over ranks)"
     line = (f"card {d['total'] / 1e9:.2f} GB | pool {d['reservation'] / 1e9:.2f} GB "
             f"({d['headroom'] / 1e9:.2f} GB outside it) | budget "
-            f"{d['budget'] / 1e9:.2f} GB at linalg local | outside the pool after warm-up {seen}")
+            f"{d['budget'] / 1e9:.2f} GB | outside the pool after warm-up {seen}")
     warn = (f"{out / 1e9:.2f} GB is already outside the pool after warm-up, above "
             f"0.75 of the {d['headroom'] / 1e9:.2f} GB outside the reservation "
             "(runtime.pool_reservation_bytes)"

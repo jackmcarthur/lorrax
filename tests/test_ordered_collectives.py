@@ -233,14 +233,14 @@ def test_ordered_sum_is_placement_independent():
 
 
 def test_planner_budget_reserves_the_ordered_transient():
-    import runtime
-    from lxkit import collectives as C
+    import jax
+    import pytest
+    from lxkit import LEGS, collectives as C, memory
     assert C.ordered_transient_bytes() == C.ORDERED_TRANSIENT_SLABS * C.slab_bytes() == 2 * (8 << 20)
     total = 64e9
-    plain = ((total - runtime.MEMORY_MARGIN * runtime.outside_pool_allowance_bytes("local"))
-             / (1.0 + runtime.MEMORY_MARGIN * runtime.POOL_OVERSHOOT))
-    want = max(min(plain - C.ordered_transient_bytes(), runtime.pool_reservation_bytes(total)), 0.25 * total)
-    assert runtime.planner_budget_bytes(total, "local") == want
+    share = total / jax.local_device_count()
+    want = share * (1.0 - LEGS["cpu"].memory_reserve) - C.ordered_transient_bytes()
+    assert memory.resolve(0.0, "local", total=total) == pytest.approx(want)
 
 
 def test_ordered_psum_replicated_out_specs_under_check_vma():

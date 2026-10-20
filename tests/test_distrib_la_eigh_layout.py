@@ -193,25 +193,24 @@ def test_lu_relabels_from_4x4_and_keeps_the_2x2_bound():
     assert rhs_block(9152, 9152, 2, 2, 4576) == 4576
 
 
-def test_the_gathered_retry_is_priced_against_the_plans_room(monkeypatch):
+def test_the_gathered_retry_joins_by_its_compiled_figure(monkeypatch):
     """run30k: cuSOLVERMp 0.9.1 left the n 30000 direction eigh with no correct attempt. The
-    gathered retry joins the chain where 2 n^2 and the local eigh workspace fit the plan's room
-    (no room: the 64 MiB rule). The workspace is LAPACK's heevd x CUDA_HEEVD_FACTOR on CUDA, from
-    the shape: planning issues no vendor query (one at trace time could create a handle mid-run)."""
+    gathered retry joins the chain where its compiled program (the whole matrix, its vectors
+    and the local solve on every rank: lower().compile(), never run) fits the plan's room, or
+    GATHERED_EIGH_BYTES with no room. No vendor query is issued while planning."""
     import sys
-    import lxkit
     import distrib_la  # noqa: F401
     from distrib_la import loader
+    from jax.sharding import Mesh
     pl = sys.modules["distrib_la.plan"]                  # the module (distrib_la.plan is also a function)
 
     def refuse(platform):
         raise AssertionError("a vendor query while planning")
     monkeypatch.setattr(loader, "get_lib", refuse)
-    monkeypatch.setattr(lxkit, "device_vendor", lambda device: "cuda")
-    lapack = 16 * (2 * 30000 + 30000 ** 2) + 8 * (1 + 5 * 30000 + 2 * 30000 ** 2) + 4 * (3 + 5 * 30000)
-    assert pl._gathered_bytes((30000, 30000), np.complex128) == 2 * 16 * 30000 ** 2 + 2 * lapack   # 86.4 GB
-    assert pl._gathered_admitted((1448, 1448), np.complex128)                    # the fixed rule
-    assert not pl._gathered_admitted((9152, 9152), np.complex128)               # no room
-    assert pl._gathered_admitted((9152, 9152), np.complex128, 63.41e9)           # 8.0 GB
-    assert not pl._gathered_admitted((30000, 30000), np.complex128, 63.41e9)
-    assert pl._gathered_admitted((30000, 30000), np.complex128, 90e9)
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    need = pl.compiled_bytes(pl._gathered_program(mesh), mesh, (4096, 4096), np.complex128)
+    assert need >= 16 * 4096 ** 2                         # the whole matrix on every rank
+    assert pl._gathered_admitted(mesh, (64, 64), np.complex128)                  # under the cap
+    assert not pl._gathered_admitted(mesh, (4096, 4096), np.complex128)          # no room
+    assert pl._gathered_admitted(mesh, (4096, 4096), np.complex128, need)
+    assert not pl._gathered_admitted(mesh, (4096, 4096), np.complex128, need - 1)
