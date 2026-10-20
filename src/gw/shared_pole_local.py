@@ -726,14 +726,15 @@ def host_tree(tree):
 
 
 def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget,
-                 retain_span=False, gram_keep=None):
+                 retain_span=False, gram_keep=None, beside=None):
     """Run ``round_program`` on one round: host tables in, round-order results out.
 
     An ordered round solves its kept span on the carrier of its pole budget
     (the keep cut retains at most ``keep_budget`` directions), as the face
     round does on ``face_ritz_carrier``: the carrier is known before the
     first round, so one program serves every round and SC map, and only
-    exact-zero columns ever leave the solve.
+    exact-zero columns ever leave the solve.  ``beside`` (the ledger Price of the round's
+    operands): the program is admitted and booked at its compiled executable, which then runs.
     """
     import os
     import numpy as np
@@ -753,8 +754,14 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
                              "differ from the host's (live, points, active)")
     args = (live, points, active, q, o, d, tuple(infinity))
     budget = None if keep_budget is None else int(keep_budget)
-    return round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
-                         bool(retain_span), gram_keep, budget)(*args)
+    program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
+                            bool(retain_span), gram_keep, budget)
+    if beside is None:
+        return program(*args)
+    from gw.shared_pole_execution import compiled_for, price_round
+    executable = compiled_for(program, args)
+    price_round(executable, mesh_xy, beside, whole=True)
+    return executable(*args)
 
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
