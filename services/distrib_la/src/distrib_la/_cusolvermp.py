@@ -16,6 +16,7 @@ Section docstrings from the merged modules follow inline.
 from __future__ import annotations
 
 import atexit
+import ctypes
 import threading
 from dataclasses import dataclass
 from functools import partial
@@ -272,7 +273,7 @@ def rhs_block(n: int, nrhs: int, Px: int, Py: int, mb: int) -> int:
     return local if mb == n // Px else largest_divisor(local, _BLOCK_MAX)
 
 
-def _announce_lu(kind, mesh, nq, n, nrhs, mb_a, nb_a, mb_b=None, nb_b=None):
+def _announce_lu(kind, mesh, nq, n, nrhs, mb_a, nb_a, mb_b=None, nb_b=None, identity=False):
     """One rank-0 line per distributed LU program built: its descriptors, so a run's log shows
     the layout it solved at (run30k 2026-10-19: a stalled Dyson LU printed none)."""
     if int(jax.process_index()) != 0:
@@ -280,10 +281,25 @@ def _announce_lu(kind, mesh, nq, n, nrhs, mb_a, nb_a, mb_b=None, nb_b=None):
     Px, Py = (int(v) for v in _validate_mesh(mesh))
     rhs = ("" if nb_b is None else
            f"; B {n}x{nrhs} mb_b {mb_b} nb_b {nb_b}, {(nrhs // Py) // max(1, nb_b)} RHS block(s) per rank "
-           "(getrs chunks them under its 2 GiB workspace cap)")
+           "(getrs chunks them within the room posted for the solve, else 2 GiB)")
     relabel = "relabeled block-cyclic" if (mb_a, nb_a) != (n // Px, n // Py) else "one tile per rank"
+    grid = "; B = I: A^T factored on the column-major grid" if identity else ""
     print(f"  [distrib_la.cusolvermp] {kind} {nq} x {n}^2 on the {Px}x{Py} mesh: A mb {mb_a} nb {nb_a} "
-          f"({relabel}){rhs}.", flush=True)
+          f"({relabel}){rhs}{grid}.", flush=True)
+
+
+def post_getrs_room(n: int, nrhs: int, nbytes) -> bool:
+    """Post ``nbytes`` per rank (``None`` withdraws it) as the room the getrs chunks of a fused
+    ``n x nrhs`` solve may take beside everything else its program holds: the handler solves in
+    the widest chunks whose workspace fits the ranks' smallest figure, 2 GiB without one
+    (cpp/cusolvermp/batched_solve_lu_ffi.cc, getrs_chunk).  Run-time state read by the next solve
+    of that shape, never an attribute, so the compiled program does not carry the room.  False
+    where the loaded library predates the entry (it keeps 2 GiB)."""
+    fn = getattr(loader.get_lib("CUDA"), "lrx_lu_getrs_room", None)
+    if fn is None:
+        return False
+    fn.argtypes, fn.restype = (ctypes.c_int64,) * 3, ctypes.c_int
+    return fn(int(n), int(nrhs), -1 if nbytes is None else max(0, int(nbytes))) == 0
 
 
 def lu_blocks(n: int, Px: int, Py: int) -> tuple[int, int]:
@@ -935,6 +951,7 @@ def batched_distributed_solve_lu(
     B: jax.Array,
     *,
     mesh: Mesh,
+    identity: bool = False,
 ) -> jax.Array:
     """Solve ``A[q] X[q] = B[q]`` via per-q cuSOLVERMp ``getrf`` + ``getrs``.
 
@@ -960,6 +977,14 @@ def batched_distributed_solve_lu(
     N % Py == 0, NRHS % Py == 0 — square N on both sides because
     cuSOLVERMp's descB must have the same row-block as descA (mb_b = N/Px).
     Dtypes F64 / C128.
+
+    ``identity``: B is the identity (the caller's word; the checked solve's sketch tests
+    A X = B).  On a square mesh A^T is factored on the column-major grid instead, as eigh reads
+    its operand: there rank (x, y) is process (y, x), so its untransposed tile IS A^T's, each
+    process column is one node (4 consecutive ranks), and getrf's pivot search, the row
+    interchanges and getrs's laswp stay inside it.  The solve returns (A^-1)^T, whose tiles read
+    untransposed are A^-1 in JAX's layout: no transposes in or out.  Only for B = I: an
+    untransposed B reads as B^T, which would return B A^-1.
     """
     if A.ndim != 3 or A.shape[1] != A.shape[2]:
         raise ValueError(
@@ -984,16 +1009,17 @@ def batched_distributed_solve_lu(
         raise ValueError(f"NRHS={nrhs} must be divisible by Py={Py}.")
 
     loader.get_lib("CUDA")
-    ctx_key = context_key(mesh, col_major=False)
+    on_node = bool(identity) and Px == Py and nrhs == n
+    ctx_key = context_key(mesh, col_major=on_node)
 
     mb_a, nb_a = lu_blocks(n, Px, Py)
     mb_b, nb_b = mb_a, rhs_block(n, nrhs, Px, Py, mb_a)
 
     key = ("solve_lu", _mesh_key(mesh), A.dtype,
-           nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_key))
+           nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, int(ctx_key), on_node)
     jit_solve = _JIT_CACHE.get(key)
     if jit_solve is None:
-        _announce_lu("solve_lu", mesh, nq, n, nrhs, mb_a, nb_a, mb_b, nb_b)
+        _announce_lu("solve_lu", mesh, nq, n, nrhs, mb_a, nb_a, mb_b, nb_b, on_node)
         X_local_T = jax.ShapeDtypeStruct((nq, nrhs // Py, n // Px), B.dtype)
         LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
         attrs = dict(nq=nq, n=n, nrhs=nrhs,
@@ -1005,6 +1031,12 @@ def batched_distributed_solve_lu(
                  out_specs=P(None, "x", "y"),
                  check_vma=False)
         def _solve(local_A, local_B):
+            if on_node:
+                X, _ = jax.ffi.ffi_call(
+                    _SOLVE_LU_TARGET, (X_local_T, LU_local_T),
+                    input_output_aliases={0: 1, 1: 0},
+                )(local_A, local_B, **attrs)
+                return X
             local_A_T = jnp.transpose(local_A, (0, 2, 1))
             local_B_T = jnp.transpose(local_B, (0, 2, 1))
             # getrf and getrs work in place: the factors overwrite A and X
