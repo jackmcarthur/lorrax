@@ -184,10 +184,12 @@ else.
 | `parallel_transport.py` | Constructs band-subspace parallel-transport links. |
 | `pivoted_cholesky.py` | Implements shared pivoted-Cholesky selection helpers. |
 | `preprocessing_output.py` | Writes preprocessing reports and provenance. |
+| `production_report.py` | The rank-zero main log every driver report subclasses: stream, header, Devices, files table, closing line. |
 | `progress.py` | Renders rank-aware progress output. |
 | `provenance.py` | Defines provenance stamps and validation helpers. |
 | `psi_G_store.py` | Maintains the host-resident reciprocal-wavefunction cache. |
 | `rank_criterion.py` | Applies the shared numerical-rank criterion. |
+| `report_blocks.py` | Pure text blocks of the main log (header, Devices, outputs table, closing line) and their primitives. |
 | `sanity.py` | Runs scientific sanity checks and diagnostics. |
 | `scientific_output.py` | Formats shared scientific output records. |
 | `sharding_fit.py` | A `PartitionSpec` that divides the extents in hand. |

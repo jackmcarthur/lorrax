@@ -2029,7 +2029,7 @@ class RuntimeStack:
         # mesh-derived facts entry (collect_startup_facts reads the mesh in
         # exactly these three), then rebuild the report — both formatters
         # are pure functions of facts, so this keeps report == f(facts).
-        # common.scientific_output.architecture_lines reads the facts
+        # common.report_blocks.devices_lines reads the facts
         # (facts["mesh_shape"]), not the report.
         self.facts["mesh_shape"] = self.mesh_shape
         self.facts["mesh_axes"] = tuple(self.mesh.axis_names)

@@ -20,6 +20,7 @@ import common.timing as timing
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
 from common.preprocessing_output import ScientificProductionReport
 from common.progress import LoopProgress
+from common.report_blocks import Setting
 from common.scientific_output import policy
 from common.units import RYD_TO_EV
 from runtime.run_session import RunSession
@@ -585,6 +586,38 @@ def parse_args(argv=None):
     return route, args
 
 
+def settings_rows(args, *, source) -> tuple:
+    """The BSE SETTINGS rows from the parsed command line; ``source(*flags)``
+    says whether a flag was given (``ProductionReport.flag_source``)."""
+    use_tda = args.tda
+    include_w = not (args.rpa or not args.bse)
+    basis_file = args.qp_rotations or args.eqp
+    return (
+        Setting("--tda", "on" if use_tda else "off", source("--tda"),
+                "Tamm-Dancoff Hermitian BSE" if use_tda else
+                "full resonant-antiresonant BSE"),
+        Setting("--bse" if include_w else "--rpa", "on", source("--bse", "--rpa"),
+                "kernel D + V - W: screened direct term (stored W0 or a static RPA "
+                "rebuild)" if include_w else
+                "kernel D + V: RPA, no screened direct term"),
+        Setting("--solver", str(args.solver), source("--solver"),
+                f"block size {int(args.block_size)}, {int(args.n_eig)} roots; "
+                "trial-stack matvec"),
+        Setting("--lanczos-rtol", f"{float(args.lanczos_rtol):g}", source("--lanczos-rtol"),
+                f"stop at this relative change, checked every "
+                f"{int(args.lanczos_check_every)} iterations"
+                if args.lanczos_rtol > 0.0 else "fixed Krylov dimension: no convergence test"),
+        Setting("--qp-rotations" if args.qp_rotations else "--eqp",
+                os.path.basename(str(basis_file)) if basis_file else "none",
+                source("--qp-rotations", "--eqp"),
+                "QP-rotated bands, eigenstates of the GW H_QP" if args.qp_rotations
+                else "DFT bands, diagonal QP energies" if args.eqp
+                else "DFT bands and energies"),
+        Setting("--band-degeneracy", str(args.band_degeneracy), source("--band-degeneracy"),
+                f"tolerance {float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.3f} meV"),
+    )
+
+
 def main(argv=None) -> int:
     route, args = parse_args(argv)
 
@@ -631,35 +664,12 @@ def main(argv=None) -> int:
     # preserving definite-pencil / product solve).  TDA stays the default.
     report_path = os.path.abspath(args.report_file or "bse.out")
     with RunSession(RUNTIME, "bse", ScientificProductionReport, report_path,
-                    stages=_STAGES, driver_name="bse.bse_jax",
-                    calculation_name="Bethe-Salpeter eigensolve") as run:
+                    stages=_STAGES, driver="bse",
+                    purpose="Bethe-Salpeter eigensolve") as run:
         report = run.report
         report.begin(input_file=args.input)
-        report.architecture(mesh_role="BSE transition axes X x Y")
-        include_w = not (args.rpa or not args.bse)
-        report.pathways((
-            "Hamiltonian    : " + (
-                "Tamm-Dancoff Hermitian BSE" if use_tda else
-                "full resonant-antiresonant BSE"),
-            "Interaction    : " + (
-                "D + V - W (screened direct term; authenticated stored W0 "
-                "or a direct static RPA rebuild)" if include_w else
-                "D + V (RPA kernel; screened direct term omitted)"),
-            f"Eigensolver    : {args.solver}; block size={int(args.block_size)}; "
-            f"requested roots={int(args.n_eig)}",
-            "Iteration mode : " + (
-                f"relative convergence {float(args.lanczos_rtol):.5e}, "
-                f"checked every {int(args.lanczos_check_every)} iterations"
-                if args.lanczos_rtol > 0.0 else "fixed Krylov dimension"),
-            "Matvec route   : trial-stack (bse_stack_matvec)",
-            "Band basis     : " + (
-                "QP-rotated, eigenstates of the GW H_QP (--qp-rotations)"
-                if args.qp_rotations else
-                "DFT bands, diagonal QP energies (--eqp)" if args.eqp else
-                "DFT bands and energies"),
-            f"Band boundary  : {args.band_degeneracy}; "
-            f"tolerance={float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.5f} meV",
-        ))
+        report.devices(mesh_role="BSE transition axes c x v")
+        report.settings(settings_rows(args, source=report.flag_source))
 
         from .bse_window import _parse_wfn_path
         from wfn_loader import WfnLoader
