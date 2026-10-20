@@ -201,7 +201,7 @@ def validate_general_shared_pole_model(path, *, expected_identity, mesh_xy, capa
             if ("final_commit" not in f or f["final_commit"][()].decode() != header["digest"]
                     or not np.array_equal(f["K"][:], header["K"])):
                 _refuse("general count/commit metadata mismatch")
-        if not _finalized_digest_current(path, header["digest"]):
+        if not _finalized_digest_local(path, header["digest"]):
             if _general_digest(path, header) != header["digest"]:
                 _refuse("general model payload digest mismatch")
             _record_finalized_digest(path, header["digest"])
@@ -1067,6 +1067,19 @@ def _record_finalized_digest(path, digest):
         pass
 
 
+def _finalized_digest_local(path, digest):
+    """Pure host cache lookup for a file generation; no rank collective.
+
+    Root-only file validators must use this local operation, not the
+    all-rank verdict helper below: their peers are waiting in rank0_read.
+    A miss still requires authenticating the complete bounded file digest.
+    """
+    try:
+        return _FINALIZED_DIGESTS.get(_file_generation(path)) == digest
+    except OSError:
+        return False
+
+
 def _finalized_digest_current(path, digest):
     """Whether ``path`` is still the generation finalized here with ``digest``.
 
@@ -1076,10 +1089,7 @@ def _finalized_digest_current(path, digest):
     from jax.experimental import multihost_utils
     verdict = np.zeros(1, dtype=np.int32)
     if process_rank() == 0:
-        try:
-            verdict[0] = int(_FINALIZED_DIGESTS.get(_file_generation(path)) == digest)
-        except OSError:
-            verdict[0] = 0
+        verdict[0] = int(_finalized_digest_local(path, digest))
     return bool(np.asarray(multihost_utils.broadcast_one_to_all(verdict))[0])
 
 

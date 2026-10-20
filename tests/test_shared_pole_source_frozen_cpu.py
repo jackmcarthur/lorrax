@@ -56,6 +56,7 @@ def test_positive_store_adapter_native_full_rho_sigma_matches_literal(tmp_path, 
     from jax.sharding import NamedSharding, PartitionSpec as P
     from dataclasses import replace
     from file_io.shared_pole_store import write_shared_pole_model
+    from file_io import shared_pole_store as store
     from gw.shared_pole_reference import source_frozen_ordered_model
     from gw.shared_pole_recipe import shared_real_pole_v1_r3b
     from gw.head_correction import HeadSigmaDiag
@@ -105,7 +106,10 @@ def test_positive_store_adapter_native_full_rho_sigma_matches_literal(tmp_path, 
             residues_ry=np.array([.012]),cell_volume=8.,nk_tot=nk)
     source = dict(wfns=c['wfns'], meta=meta, config=config, head=head, linalg='distributed')
     prepared = dict(nb=3, nk=nk, mesh=mesh, efermi_ry=0.)
-    with F.xla_reference():
+    def forbidden_collective(*args, **kwargs):
+        raise AssertionError('root-only general validation entered an all-rank device collective')
+    with F.xla_reference(), monkeypatch.context() as local_cache_only:
+        local_cache_only.setattr(store, '_finalized_digest_current', forbidden_collective)
         result = evaluate_source_frozen_snapshot(source, prepared,
             dict(U=rotation,e=energy[:,1:],rho=rho_a), b_lo=1, model=ordered,
             print_fn=lambda *a,**k:None)
@@ -148,3 +152,16 @@ def test_positive_store_adapter_native_full_rho_sigma_matches_literal(tmp_path, 
                                    rtol=2e-5,atol=4e-8)
     with pytest.raises(RuntimeError, match='FileExistsError'):
         source_frozen_ordered_model(positive,meta,mesh_xy=mesh,tables=c['tables'],path=str(tmp_path/'ordered.h5'))
+    # A cached general model requires no all-rank device verdict inside its
+    # rank0_read callback. A generation change must STILL rehash and refuse
+    # corruption, rather than treating the local cache as an auth bypass.
+    import h5py
+    with monkeypatch.context() as local_cache_only:
+        local_cache_only.setattr(store, '_finalized_digest_current', forbidden_collective)
+        store.validate_general_shared_pole_model(ordered['path'],expected_identity=ordered['identity'],
+                                                mesh_xy=mesh,capacity=meta.shared_pole_capacity)
+        with h5py.File(ordered['path'],'r+') as modified:
+            modified['left'][0,0,0,0] += .001j
+        with pytest.raises((ValueError, RuntimeError),match='payload digest mismatch'):
+            store.validate_general_shared_pole_model(ordered['path'],expected_identity=ordered['identity'],
+                                                    mesh_xy=mesh,capacity=meta.shared_pole_capacity)
