@@ -643,12 +643,17 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     infinity_width=recipe_infinity_width(infinity,recipe,column_extent=extent,logical_n=n)
     tables=_sector_tables(meta,geometry,n,counts,widths,states,values,infinity_width,extent)
     side=int(tables['active'].shape[-1])
-    budget.plan(side,phase='reduction',padding_output_bytes_per_rank=round_padding_output_bytes(
-        states,infinity,widths,infinity_width))
+    admitted,budget.program_bytes=budget.program_bytes,0     # the round program: compiled
+    try:
+        row=budget.plan(side,phase='reduction',padding_output_bytes_per_rank=round_padding_output_bytes(
+            states,infinity,widths,infinity_width))
+    finally:
+        budget.program_bytes=admitted
     states,infinity=pad_states(states,widths,infinity,infinity_width)
     reduced=reduce_round(states,infinity,tables,real=geometry['real'],mesh_xy=mesh_xy,
         native_eigh=budget.eigenplan(side).native_fn,ordered=True,odd_moments=True,
-        keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=_SECTOR_GRAM_KEEP())
+        keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=_SECTOR_GRAM_KEEP(),
+        beside=budget.ledger.price(row))
     model,signed,vectors,diagnostics,y=reduced
     _sector_gates(diagnostics,geometry['sector'],geometry['ids'],geometry['real'])
     # The returned planner must not retain the just-consumed full sample and

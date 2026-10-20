@@ -515,16 +515,30 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     return (*output,result[3]) if retain_span else output
 
 
-def price_round(executable, mesh, beside):
-    """Admit and book a face round at the executable that runs (``memory_analysis``; the
-    conservative ``face_reduction_bytes`` only chose the width and the eigh room) beside the
-    reservation that holds its operands (``beside``, a ledger Price), in the open stage."""
+_COMPILED_ROUNDS: dict = {}
+
+
+def compiled_for(program, args):
+    """``program`` lowered and compiled at ``args`` (never run here), once per signature."""
+    import jax
+    key = (program, tuple((tuple(a.shape), str(a.dtype), str(getattr(a, "sharding", None)))
+                          for a in jax.tree.leaves(args)))
+    if key not in _COMPILED_ROUNDS:
+        _COMPILED_ROUNDS[key] = program.lower(*args).compile()
+    return _COMPILED_ROUNDS[key]
+
+
+def price_round(executable, mesh, beside, whole=False):
+    """Admit and book a reduction round at the executable that runs (``memory_analysis``)
+    beside the reservation that holds its operands (``beside``, a ledger Price), in the open
+    stage.  A face round's figure is face-sharded; a local round's (``whole``: whole parents per
+    rank) holds at any P."""
     from lxkit import memory
     from runtime.aot_memory import compiled_new_bytes
-    ranks = int(mesh.size)
-    part = memory.Price(xla=memory.Term(spread=float(compiled_new_bytes(executable)) * ranks,
-                                        source="face parent program (memory_analysis temp + "
-                                               "outputs - alias)"),
+    ranks, got = int(mesh.size), float(compiled_new_bytes(executable))
+    part = memory.Price(xla=memory.Term(got if whole else 0.0, 0.0 if whole else got * ranks,
+                                        source=f"{'local' if whole else 'face'} round program "
+                                               "(memory_analysis temp + outputs - alias)"),
                         ranks=ranks, label="reduction round executable")
     memory.admit("shared-pole reduction round", beside + part, memory.budget())
     memory.book(part)

@@ -310,8 +310,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # subtract the admitted (conservative) program.
                 admitted = budget.program_bytes
                 try:
-                    if execution == 'face':
-                        budget.program_bytes = 0
+                    budget.program_bytes = 0          # the round program: its compiled figure
                     reduction_row = budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
                         round_states, infinity, widths, infinity_width), runs_in="spole.gram_reduction")
                 finally:
@@ -339,7 +338,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                     round_model, round_signed, vectors, round_diagnostics = reduce_round(
                         round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
                         native_eigh=local_eigh.native_fn, ordered=ordered,
-                        odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
+                        odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"),
+                        beside=budget.ledger.price(reduction_row))
                 qi = infinity[0]
                 # One device-to-host read of the round's replicated diagnostics and vectors.
                 from gw.shared_pole_local import host_tree
