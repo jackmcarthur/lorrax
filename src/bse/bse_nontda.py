@@ -87,6 +87,7 @@ import jax.numpy as jnp
 from common.fft_helpers import make_kfft_kminor
 from common.gpu_utils import device_budget_bytes
 from .bse_ring_comm import build_bse_ring_matvec_full, make_bse_shardings
+from .bse_head import head_shifted_eps_c
 
 jax.config.update("jax_enable_x64", True)
 
@@ -283,9 +284,11 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W, with_halves=False):
         data["W_q"] = None      # release the caller-side reference
     else:
         W_R = data["W_q"]
+    # A block takes the exact q=0 head on its diagonal; the coupling block has
+    # none (<c k|v' k> = 0), which is what a head-free W_q gives it.
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-            data["eps_c"], data["eps_v"], W_R, data["V_q0"],
-            data["M"])
+            head_shifted_eps_c(data["eps_c"], data), data["eps_v"], W_R,
+            data["V_q0"], data["M"])
     return (matvec, args, halves) if with_halves else (matvec, args)
 
 

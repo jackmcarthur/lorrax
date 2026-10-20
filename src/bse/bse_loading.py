@@ -288,6 +288,7 @@ def load_bse_data_from_restart_sharded(
         w_head_densify, _read_lorrax_input_quietly(input_file))
     defer_whead = densify_pending
     head_channel = None
+    q0_head_ry = 0.0
 
     if g0_X is not None and inject_head:
         vhead, whead, cell_volume, head_src = _resolve_head_params(
@@ -296,9 +297,10 @@ def load_bse_data_from_restart_sharded(
         if cell_volume is not None and (vhead is not None or whead is not None):
             # whead goes on a SCREENED W or nowhere — same gate, same helper,
             # as the single-device loader.
-            V_q0, W_q, head_str = _inject_q0_head(
+            V_q0, W_q, q0_head_ry, head_str = _inject_q0_head(
                 V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
-                w0_ready=w0_ready, defer_whead=defer_whead)
+                w0_ready=w0_ready, nk=nkx * nky * nkz,
+                defer_whead=defer_whead)
             print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
                   f"V_cell={cell_volume:.2f}): {head_str} "
                   f"[source: {head_src}]")
@@ -365,6 +367,10 @@ def load_bse_data_from_restart_sharded(
         "n_cond_pad": n_cond_pad,
         "fermi_energy": fermi_energy,
         "qp_rotation": qp_rotation,
+        # Exact q=0 screened head, Ry, on the transition diagonal
+        # (bse_head.q0_head_diagonal); operators read it through
+        # bse_head.head_shifted_eps_c.  The densifier replaces it.
+        "q0_head_ry": q0_head_ry,
     }
 
     # ── bse_k_grid coarse→fine densification ─────────────────────────────

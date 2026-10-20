@@ -31,6 +31,7 @@ from .bse_ring_comm import (build_bse_ring_matvec_full,
                             create_mesh_xy_from_flags, make_bse_shardings)
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_preconditioner import energy_diff_cv_k
+from .bse_head import head_shifted_eps_c
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_davidson_helpers import build_bse_exact_diagonal
 import common.timing as timing
@@ -119,7 +120,8 @@ def matvec_operands(data: dict) -> tuple:
     (see ``bse_w_exact`` compare-wq)."""
     return (
         data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-        data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
+        head_shifted_eps_c(data["eps_c"], data), data["eps_v"], data["W_R"],
+        data["V_q0"],
         data["M"],  # hoisted V-term pair amplitude (audit P3), transition layout
     )
 
@@ -211,7 +213,8 @@ def build_preconditioner_diagonal_sharded(
 
     tda_sharding = NamedSharding(mesh_xy, P("x", "y", None))
     diag_h = build_bse_exact_diagonal(
-        data["eps_c"], data["eps_v"], data["psi_c_X"], data["psi_v_Y"],
+        head_shifted_eps_c(data["eps_c"], data), data["eps_v"],
+        data["psi_c_X"], data["psi_v_Y"],
         W_q0, M, data["V_q0"], nk,
         sharding=tda_sharding, complex_out=True, memo=False,
     )
@@ -686,6 +689,7 @@ def _build_gmres_data_fp32(data: dict) -> dict:
         "M": _cast_with_sharding(data["M"], jnp.complex64),  # hoisted V-term pair amplitude (P3)
         "eps_c": _cast_with_sharding(data["eps_c"], jnp.float32),
         "eps_v": _cast_with_sharding(data["eps_v"], jnp.float32),
+        "q0_head_ry": data.get("q0_head_ry", 0.0),
         "V_q0": _cast_with_sharding(data["V_q0"], jnp.complex64),
         "W_q": _cast_with_sharding(data["W_q"], jnp.complex64),
     }
@@ -731,7 +735,8 @@ def _rayleigh_ritz(
         )
 
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-            data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
+            head_shifted_eps_c(data["eps_c"], data), data["eps_v"],
+            data["W_R"], data["V_q0"],
             data["M"])  # hoisted V-term pair amplitude (audit P3)
     if use_tda:
         # TDA subspace application through the trial-stack matvec: the filtered
@@ -1097,7 +1102,7 @@ def estimate_spectral_bounds_sharded(
     """
     data_fp32 = ensure_W_R(_build_gmres_data_fp32(data), include_W, mesh_xy)
 
-    eps_c = data_fp32["eps_c"]
+    eps_c = head_shifted_eps_c(data_fp32["eps_c"], data_fp32)
     eps_v = data_fp32["eps_v"]
     n_cond = int(data["n_cond"])
     n_val = int(data["n_val"])

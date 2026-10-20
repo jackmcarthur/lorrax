@@ -1629,9 +1629,11 @@ def _interpolate_bse_data_to_grid(
     # ``head_channel`` is None on the ``legacy`` arm, where the loader injected
     # as before and the delta went through the interpolant — the documented
     # defect, kept only so the A/B has a shipped control.
+    q0_head_ry = 0.0
     if head_channel is not None:
         from gw.head_densify import attach_head_channel
         from vcoul import CoulombGeometry
+        from .bse_head import q0_head_diagonal
         geom = CoulombGeometry.from_wfn(wfn)
         S_fine = build_w_head_channel(
             wfn, sym, meta, params,
@@ -1645,9 +1647,19 @@ def _interpolate_bse_data_to_grid(
             # The model owns the head at every fine q ≠ 0; c1 keeps Γ.
             S_fine = np.where(np.arange(S_fine.size).reshape(S_fine.shape) == 0,
                               S_fine, 0.0)
+        # Γ leaves the tile: at fine q = 0 the pair densities are the exact
+        # overlaps δ_nn', so its head is the transition-diagonal constant
+        # S(0)/(Ω N_k,fine) (bse_head module docstring), not the ISDF rank-1.
+        S_fine = np.array(S_fine, dtype=np.float64)
+        q0_head_ry = q0_head_diagonal(
+            S_fine.flat[0], head_channel["cell_volume"],
+            int(np.prod(fine_grid)))
+        S_fine.flat[0] = 0.0
         W_q_fine = attach_head_channel(
             W_q_fine, data["g0_X"], data["g0_Y"], S_fine,
             head_channel["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
+        log_fn(f"[bse_k_grid] fine Γ head as the exact-overlap diagonal "
+               f"{q0_head_ry:.8e} Ry (fine q ≠ 0 heads on the W tile)")
         log_fn("[bse_k_grid] W Γ head re-attached AFTER densification (C1): "
                "the interpolant saw the body only, and the head is analytic "
                "at every fine q inside the coarse Γ cell.  This also changes "
@@ -1661,7 +1673,7 @@ def _interpolate_bse_data_to_grid(
         "psi_v_X": psi_v_X, "psi_v_Y": psi_v_Y,
         "M": M,
         "eps_c": eps_c, "eps_v": eps_v,
-        "W_q": W_q_fine, "V_q0": V_q0,
+        "W_q": W_q_fine, "V_q0": V_q0, "q0_head_ry": q0_head_ry,
         "V_q_full": None,                       # finite-q resolvent not a fine use
         # The finite-q EXCHANGE tiles survive the densification, on the COARSE
         # q-grid they were stored on, and they are exact there.  V_{μν}(q) is

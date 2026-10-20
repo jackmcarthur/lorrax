@@ -144,6 +144,7 @@ from common.progress import LoopProgress
 from common.provenance import lorrax_version, provenance_header
 from common.scientific_output import abs_path, band_range, policy
 from runtime.run_session import RunSession
+from .bse_head import head_shifted_eps_c
 from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, w_pair_embedding, build_w_head_channel, resolve_w_head_densify, _resolve_head_params, PAD_EPS_GUARD_RY)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
@@ -1343,9 +1344,10 @@ def build_parser():
 def _gamma_only_grid(kgrid, value):
     """A head-scalar grid that is ``value`` at Γ and zero everywhere else.
 
-    The array shape :func:`gw.head_densify.attach_head_channel` consumes, used
-    here to SUBTRACT the head the loader already injected (pass a negative
-    value) so the densifier's operand is the body alone.  Spelled through the
+    The array shape :func:`gw.head_densify.attach_head_channel` consumes; a
+    negative value detaches a rank-one Γ head.  No driver path uses it since the
+    loader stopped putting the screened Γ head on W (``bse_head``); kept for
+    ``tests/test_c1_head_phase_cpu.py``.  Spelled through the
     same attach helper rather than as a bespoke ``.at[...,0,0,0].add()`` so the
     detach and the re-attach cannot disagree about which slice, which
     projector, or which 1/Ω the head lives on — a mismatched pair here would
@@ -1372,11 +1374,12 @@ def _w_tile_gauge(wfn, centroids_path, keep_idx, n_rmu, restart_file, log):
 
 
 def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print):
-    """The ``whead`` the loader injected into this NATIVE-grid restart's W.
+    """The ``whead`` the loader resolved for this NATIVE-grid restart.
 
-    ``--w-coarse-grid`` decimates a natively fine W, so the head sitting in
-    ``data["W_q"][:,:,0,0,0]`` is the FINE cell's average — the number C1 has
-    to remove before sub-sampling and put back after densifying.  Returns
+    ``--w-coarse-grid`` decimates a natively fine W.  The loader keeps the
+    screened Γ head off ``data["W_q"]`` (it is the exact diagonal
+    ``data["q0_head_ry"]``), and this FINE-cell value scales C1's per-fine-q
+    heads at q ≠ 0 after densifying.  Returns
     ``None`` (with a reason logged) when there is no head to move, in which
     case the caller runs the plain densifier and nothing is lost.
     """
@@ -2193,11 +2196,9 @@ def main(argv=None):
                 if w_head_mode == "c1":
                     head_ch = _resolve_native_w_head(
                         restart_file, args.input, wfn, log=log)
-                if head_ch is not None:
-                    W_q_fine_in = attach_head_channel(
-                        W_q_fine_in, data["g0_X"], data["g0_Y"],
-                        _gamma_only_grid((nkx, nky, nkz), -head_ch["whead"]),
-                        head_ch["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
+                # The loader no longer puts the screened Γ head on W_q (it is
+                # the exact diagonal ``data["q0_head_ry"]``), so the operand is
+                # already the head-free body and nothing is subtracted here.
                 W_q_coarse = decimate_W_q_to_subgrid(W_q_fine_in, cg)
                 densify_W = make_w_densifier(
                     mesh_xy, sh.W.spec, (nkx, nky, nkz),
@@ -2219,6 +2220,10 @@ def main(argv=None):
                         input_file=args.input, restart_file=restart_file,
                         geometry=geom, mesh=mesh_xy,
                         gamma_cell=args.w_head_gamma_cell, log_fn=log)
+                    # Γ stays the exact diagonal the loader resolved (this
+                    # S_fine's Γ entry reproduces that whead); q ≠ 0 go on W.
+                    S_fine = np.where(np.arange(np.size(S_fine)).reshape(
+                        np.shape(S_fine)) == 0, 0.0, S_fine)
                     W_dense = attach_head_channel(
                         W_dense, data["g0_X"], data["g0_Y"], S_fine,
                         head_ch["cell_volume"], centroid_frac=r_mu, bvec=geom.bvec)
@@ -2248,6 +2253,9 @@ def main(argv=None):
         tick("w_r_and_build", t0)
         stage_progress.step()
         t_c0 = time.time()
+        # Exact q=0 direct head: <c k+Q|c' k+Q><v k|v' k> = δδ, so it is the
+        # transition-diagonal constant on every Q (bse_head.head_shifted_eps_c).
+        eps_cQ = head_shifted_eps_c(eps_cQ, data)
         evs_dev, alpha_dev = solver(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
                                     data["psi_v_X"], data["psi_v_Y"],
                                     data["eps_v"], W_R, *head_args)

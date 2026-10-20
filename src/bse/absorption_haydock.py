@@ -55,6 +55,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import make_kfft_kminor
 
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, window_dipoles, write_absorption_dat, write_absorption_h5)
+from .bse_head import head_shifted_eps_c
 from .bse_window import _parse_wfn_path
 from .bse_io import (load_bse_data_from_restart_sharded)
 from file_io.restart_bundle import (_find_restart_file)
@@ -243,8 +244,8 @@ def run_haydock(
     alphas, betas, norms = _full_run(
         d_block,
         data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
-        data["eps_c"], data["eps_v"], data["W_q"], data["V_q0"],
-        data["M"],
+        head_shifted_eps_c(data["eps_c"], data), data["eps_v"], data["W_q"],
+        data["V_q0"], data["M"],
     )
     alphas = np.asarray(alphas)
     betas = np.asarray(betas)

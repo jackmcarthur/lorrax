@@ -59,6 +59,7 @@ def iters_reported(n_iter_done, budget: int) -> int:
 
 
 from .bse_ring_comm import make_bse_shardings
+from .bse_head import head_shifted_eps_c
 import common.timing as timing
 
 
@@ -232,7 +233,8 @@ def solve_bse_sharded(
 
         psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
         psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
-        eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
+        eps_c   = head_shifted_eps_c(data["eps_c"], data)
+        eps_v   = data["eps_v"]
         V_q0    = data["V_q0"]
         M       = data["M"]  # hoisted V-term pair amplitude (P3)
         # W_R already built above (donated top-level ifft).
@@ -399,7 +401,8 @@ def solve_bse_sharded(
 
         psi_c_X = data["psi_c_X"]; psi_c_Y = data["psi_c_Y"]
         psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
-        eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
+        eps_c   = head_shifted_eps_c(data["eps_c"], data)
+        eps_v   = data["eps_v"]
         V_q0    = data["V_q0"]
         M       = data["M"]
 
@@ -583,7 +586,7 @@ def solve_bse_sharded(
     _args = (
         data["psi_c_X"], data["psi_c_Y"],
         data["psi_v_X"], data["psi_v_Y"],
-        data["eps_c"], data["eps_v"],
+        head_shifted_eps_c(data["eps_c"], data), data["eps_v"],
         W_R, data["V_q0"],
         data["M"],
     )

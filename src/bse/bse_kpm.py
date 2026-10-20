@@ -35,6 +35,7 @@ from .bse_ring_comm import (build_bse_ring_matvec_full,
 from .bse_stack_matvec import build_bse_stack_matvec
 from .bse_feast import (estimate_spectral_bounds_sharded,
                         _build_gmres_data_fp32, ensure_W_R)
+from .bse_head import head_shifted_eps_c
 from .bse_io import (load_bse_data_from_restart_sharded, pad_zone_mask_np)
 from file_io.restart_bundle import (_find_restart_file)
 import common.timing as timing
@@ -56,7 +57,7 @@ def make_bse_h_tilde(matvec, data, e_center, half_width):
     psi_c_Y = data["psi_c_Y"]
     psi_v_X = data["psi_v_X"]
     psi_v_Y = data["psi_v_Y"]
-    eps_c = data["eps_c"]
+    eps_c = head_shifted_eps_c(data["eps_c"], data)
     eps_v = data["eps_v"]
     W_R = data["W_R"]
     V_q0 = data["V_q0"]
