@@ -139,6 +139,14 @@ Enabling B/C still requires the original rawzero preflight and both mandatory
 matching-window gates. An A-only completion is not an A/B/C comparison or
 evidence that raw MGKBA is safe.
 
+`compare_sc750_driven.py --calibration-only` validates and plots only completed
+native10fs static-A legs, even when a finite carrier-target search ends without
+a selected bracket. Optional `--calibration-tags A_calibration_00 ...` names an
+explicit verified subset for bounded data transfers; omitted committed tags
+are reported. Raw P/E/electron/hole traces and amplitude-normalized P are not
+a B/C comparison or a damping measurement. Default plotting still requires a
+complete three-arm campaign.
+
 `sc750_td_callback.py` is a prepared, not material-verified adapter from the
 authenticated accepted input to the existing native snapshot and TD owners.
 The accepted q8 input of run 60053348 is recorded separately in

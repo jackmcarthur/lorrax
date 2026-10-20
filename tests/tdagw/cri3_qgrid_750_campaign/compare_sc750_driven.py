@@ -101,12 +101,188 @@ def read_run(directory, arm, amplitude, window, duration_fs, measure_as):
     return result
 
 
+def calibration_inputs(root, tags=None):
+    """Validate completed 10fs A legs, even while other amplitudes still run.
+
+    Every committed calibration row must match its completion receipt, native
+    checkpoint and plot NPZ. No missing campaign completion or selected target
+    is manufactured. Different amplitudes share exact time/k/weight axes;
+    proportional drives are checked with an explicit FP64 roundoff tolerance.
+    """
+    root = Path(root)
+    manifest = json.loads((root/"manifest.json").read_text())
+    plan = manifest["plan"]
+    if plan["duration_fs"] != 10.:
+        raise ValueError("calibration-only requires completed full10fs A legs")
+    terminal = root/"complete.json"
+    status = "CAMPAIGN_NOT_COMPLETED_COMPLETED_A_LEGS_ONLY"
+    if terminal.exists():
+        status = json.loads(terminal.read_text()).get("status")
+        if status not in ("THREE_ARM_EXPLORATORY_COMPLETE",
+                          "A_CALIBRATION_ONLY_COMPLETE_BC_NOT_ATTEMPTED"):
+            raise ValueError("unrecognized campaign completion; no completion inferred")
+    records = sorted(root.glob("calibration_[0-9][0-9].json"))
+    if not records:
+        raise ValueError("no committed completed calibration amplitudes")
+    committed_tags = ["A_"+path.stem for path in records]
+    if tags is not None:
+        if (not tags or len(tags) != len(set(tags))
+                or any(tag not in committed_tags for tag in tags)):
+            raise ValueError("explicit calibration tags must be distinct committed actual legs")
+        records = [path for path in records if "A_"+path.stem in tags]
+    rows, items = [], []
+    for path in records:
+        row = json.loads(path.read_text())
+        tag = "A_"+path.stem
+        directory = root/tag
+        complete = json.loads((directory/"complete.json").read_text())
+        if (row != complete or row.get("tag") != tag or row.get("zero_gate") is not False
+                or row.get("actual_active") != manifest["actual_active"]
+                or row.get("response_policy") != manifest["response_policy"]
+                or row.get("duration_fs") != 10.):
+            raise ValueError("calibration receipt/window/response-policy join mismatch")
+        amplitude = float(row["amplitude_v_m"])
+        if not np.isfinite(amplitude) or amplitude <= 0:
+            raise ValueError("actual positive calibration amplitude required")
+        item = read_run(directory, ARMS[0], amplitude, manifest["actual_active"],
+                        plan["duration_fs"], plan["measure_as"])
+        with np.load(directory/"plot_data.npz", allow_pickle=False) as payload:
+            mapping = dict(time_fs=item["time_fs"], polarization_au=item["polarization"],
+                field_au=item["field"], conduction_electrons_per_cell=item["carrier"][:, 0],
+                valence_holes_per_cell=item["carrier"][:, 1])
+            for key, expected in mapping.items():
+                value = np.asarray(payload[key])
+                if (not np.isfinite(value).all() or np.max(abs(value.imag), initial=0.) > 1.e-9
+                        or not np.array_equal(value.real, expected)):
+                    raise ValueError("native H5/plot NPZ mismatch: "+key)
+        if (row.get("completed_samples") != len(item["time_fs"])
+                or not np.isclose(row.get("checkpoint_fs", np.nan), 10., rtol=0., atol=1.e-8)
+                or row.get("carrier_peak") != float(item["carrier"][:, 0].max())
+                or row.get("hole_peak") != float(item["carrier"][:, 1].max())):
+            raise ValueError("calibration completion/native measurements mismatch")
+        rows.append(row)
+        items.append(item)
+    amplitudes = [row["amplitude_v_m"] for row in rows]
+    if amplitudes != sorted(set(amplitudes)):
+        raise ValueError("distinct increasing calibration amplitudes required")
+    comparisons = []
+    reference = items[0]
+    reference_amplitude = rows[0]["amplitude_v_m"]
+    field_peak = float(abs(reference["field"]).max())
+    if field_peak <= 0:
+        raise ValueError("finite-amplitude calibration has zero applied field")
+    for row, item in zip(rows, items):
+        for key in ("time_fs", "weights", "kpts"):
+            if not np.array_equal(reference[key], item[key]):
+                raise ValueError("cross-amplitude exact "+key+" mismatch; no interpolation")
+        scaled_field = item["field"]*(reference_amplitude/row["amplitude_v_m"])
+        roundoff = 64*np.finfo(np.float64).eps
+        if not np.allclose(reference["field"], scaled_field,
+                           rtol=roundoff, atol=roundoff*field_peak):
+            raise ValueError("cross-amplitude normalized applied field mismatch")
+        comparison = dict(amplitude_v_m=row["amplitude_v_m"],
+            normalized_drive_relative_max=float(abs(scaled_field-reference["field"]).max()/field_peak),
+            normalized_drive_fp64_tolerance=roundoff,
+            reference_amplitude_v_m=reference_amplitude)
+        if np.linalg.norm(reference["polarization"]) > 0:
+            comparison["P_per_amplitude_versus_reference"] = waveform_difference(
+                reference["polarization"]/reference_amplitude,
+                item["polarization"]/row["amplitude_v_m"])
+        else:
+            comparison["P_per_amplitude_versus_reference"] = "UNDEFINED_ZERO_REFERENCE_POLARIZATION"
+        comparisons.append(comparison)
+    selected_path = root/"calibration_selected.json"
+    selected = None
+    selection_status = "NOT_AVAILABLE_NOT_INFERRED"
+    if selected_path.exists():
+        selection = json.loads(selected_path.read_text())
+        selected = selection["selected"]
+        if selection.get("arm") != ARMS[0] or not isinstance(selected, list) or len(selected) != 2:
+            raise ValueError("invalid actual calibration selection")
+        by_tag = {row["tag"]: row for row in rows}
+        if tags is not None and any(pick["calibration_tag"] not in by_tag for pick in selected):
+            selected = None
+            selection_status = "NOT_EVALUATED_EXPLICIT_SUBSET_EXCLUDES_SELECTED_LEGS"
+        else:
+            for pick in selected:
+                row = by_tag.get(pick["calibration_tag"])
+                if (row is None or pick["amplitude_v_m"] != row["amplitude_v_m"]
+                        or pick["actual_A_carrier_peak"] != row["carrier_peak"]
+                        or pick["target_carriers"] not in plan["carrier_targets"]):
+                    raise ValueError("selected target does not join actual completed A leg")
+            selection_status = "JOINED_ACTUAL_COMPLETED_LEGS"
+    return manifest, rows, items, dict(
+        scope="STATIC_A_CALIBRATION_ONLY_NO_BC_NO_DAMPING_INFERENCE",
+        campaign_status=status, completed_calibration_amplitudes=len(rows),
+        requested_calibration_tags=tags,
+        unplotted_committed_tags=[tag for tag in committed_tags if tag not in {row["tag"] for row in rows}],
+        selected=selected, selection_status=selection_status, amplitude_normalized_nonlinearity=comparisons,
+        interpolation=False, zero_field_subtraction=False,
+        qualification="Only complete native10fs static-A legs. No B/C result or damping conclusion.")
+
+
+def plot_calibration(root, out, tags=None):
+    """Plot actual static-A calibration observables without an MGKBA claim."""
+    manifest, rows, items, report = calibration_inputs(root, tags=tags)
+    plan = manifest["plan"]
+    projection = np.asarray(plan["pulse"]["polarization"], float)
+    if projection.shape != (3,) or not np.isfinite(projection).all() or not np.isclose(projection@projection, 1.):
+        raise ValueError("actual literal unit pulse polarization required")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    reference = items[0]["polarization"]/rows[0]["amplitude_v_m"]
+    report["amplitudes"] = []
+    for row, item in zip(rows, items):
+        t, amplitude = item["time_fs"], row["amplitude_v_m"]
+        label = f"{amplitude:g} V/m; peak {row['carrier_peak']:.5g} e/cell"
+        p, e = item["polarization"]@projection, item["field"]@projection
+        axes[0, 0].plot(t, p, label=label)
+        axes[0, 1].plot(t, item["carrier"][:, 0], label=label)
+        axes[0, 1].plot(t, item["carrier"][:, 1], linestyle="--", alpha=.6)
+        axes[0, 2].plot(t, e, label=label)
+        axes[1, 0].plot(t, p/amplitude, label=label)
+        axes[1, 1].plot(t, e/amplitude, label=label)
+        axes[1, 2].plot(t, (item["polarization"]/amplitude-reference)@projection, label=label)
+        report["amplitudes"].append(dict(amplitude_v_m=amplitude,
+            actual_carrier_peak=row["carrier_peak"], actual_hole_peak=row["hole_peak"],
+            actual_coverage_fs=[float(t[0]), float(t[-1])], checkpoint_fs=10.,
+            path=item["path"]))
+    labels = ("raw P along pulse (native au)", "electrons/cell; holes dashed",
+              "applied E along pulse (native au)", "P / amplitude (au / (V/m))",
+              "E / amplitude (au / (V/m))", "P/amplitude minus lowest plotted amplitude")
+    for axis, label in zip(axes.flat, labels):
+        axis.set(xlabel="time (fs)", ylabel=label)
+        axis.axvline(plan["pulse"]["end_fs"], color=".7", linestyle=":")
+        axis.legend(fontsize=7)
+    fig.suptitle("Static-A calibration only — no B/C comparison or damping inference")
+    fig.tight_layout()
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=False)
+    fig.savefig(out/"calibration_only.png", dpi=150)
+    plt.close(fig)
+    report.update(execution_revision=manifest["execution_revision"],
+                  actual_active=manifest["actual_active"], response_policy=manifest["response_policy"])
+    (out/"calibration_only.json").write_text(json.dumps(report, indent=2)+"\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("campaign", help="completed sc750_driven_callback output")
     parser.add_argument("--out", required=True, help="new plot/report directory")
+    parser.add_argument("--calibration-only", action="store_true",
+                        help="only complete10fs static-A calibration legs; no B/C claim")
+    parser.add_argument("--calibration-tags", nargs="+",
+                        help="explicit subset of committed A_calibration_NN legs (calibration-only)")
     args = parser.parse_args(argv)
     root, out = Path(args.campaign).resolve(), Path(args.out).resolve()
+    if out.exists():
+        raise FileExistsError("choose a NEW plot output directory")
+    if args.calibration_only:
+        return plot_calibration(root, out, tags=args.calibration_tags)
+    if args.calibration_tags is not None:
+        raise ValueError("calibration-tags requires explicit calibration-only mode")
     manifest = json.loads((root/"manifest.json").read_text())
     done = json.loads((root/"complete.json").read_text())
     plan = manifest["plan"]
