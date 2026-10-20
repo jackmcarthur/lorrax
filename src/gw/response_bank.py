@@ -203,18 +203,13 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def bodies(solve):
         """The solve-bearing bodies over ``solve``: name -> (body, inputs, outputs,
         resident, layout)."""
-        # Against I: the distributed plan may factor (I - x)^T in place (distrib_la's solve_lu
-        # identity, B = I only); the local solve takes no such word.
-        inverse = solve if solve in (None, jnp.linalg.solve) else partial(solve, identity=True)
-
         def wc(h, chi_raw):
-            # Wc = H X (I-X)^-1 H = H ((I-X)^-1 - I) H: the LU solves against I (distrib_la's
-            # B = I path factors (I-X)^T without transposes) and overwrites it with E; X is not
-            # held across the LU and no product follows it.
+            # Wc = H X (I-X)^-1 H = H (I-X)^-1 X H: X is the right-hand side the LU
+            # overwrites, so no identity right-hand side is held and no product follows it
+            # (not H ((I-X)^-1 - I) H: that cancels to eps/||X|| as X -> 0).
             x = pref * congruence(h, chi_raw)
             identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
-            e = inverse(identity - x, identity.copy())
-            return congruence(h, e - identity)
+            return congruence(h, solve(identity - x, x))
 
         def pair(h, chi_raw, dchi_raw):
             value = wc(h, chi_raw)

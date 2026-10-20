@@ -303,16 +303,3 @@ def test_the_decision_runs_one_devices_own_round_rule(mesh, rocm, monkeypatch):
     want = od.rounds_for(nb, n, 4, round_n, n)
     assert rounds == want and want != od.rounds_for(nb, n, 4, bound, n), (rounds, want)
 
-
-def test_an_identity_rhs_solves_off_cusolvermp_too(mesh, rocm):
-    """``identity=True`` is a word only cuSOLVERMp's stacked entry acts on (A^T on the
-    column-major grid); on every other route (here ROCM's one_device) the plan drops it and
-    solves against the operand given, and posting a getrs room is a no-op."""
-    n = 64
-    a = _hermitian(2, n, seed=3) + 4 * n * np.eye(n)
-    p = distrib_la.plan("solve_lu", mesh, backend="distributed", n=n, budget_bytes=GCD_ROOM)
-    assert p.backend == "one_device"
-    p.chunk_room(n, n, 1 << 30)
-    x = p.batched(_face(mesh, jnp.asarray(a)), _face(mesh, jnp.broadcast_to(jnp.eye(n, dtype=a.dtype), a.shape)),
-                  identity=True)
-    assert np.allclose(np.asarray(x), np.linalg.inv(a), atol=1e-12)
