@@ -408,7 +408,10 @@ def place(op, mesh, nb, n, dtype, room, provider, mesh_bytes, phase="all") -> St
     refuses by name a fallback over ``room`` (no route fits).
     """
     x, y = int(mesh.shape["x"]), int(mesh.shape["y"])
-    ranks, gathered = x * y, _gathered_admitted(mesh, (n, n), dtype, room)
+    ranks = x * y
+    # normal_eigh has no retry chain (_reshard_stack_program returns its
+    # plain solve). Do not compile a gathered retry that it cannot execute.
+    gathered = op != "normal_eigh" and _gathered_admitted(mesh, (n, n), dtype, room)
     platform = mesh_platform(mesh)
     if n % x == 0 and n % y == 0:
         per_rank = -(-nb // ranks)
@@ -1807,7 +1810,8 @@ class Plan:
         def program(phase, r=rounds):
             return _reshard_stack_program(op, self.mesh, shape, dtype, int(r), phase,
                                           cut if cut is None or callable(cut) else float(cut),
-                                          _gathered_admitted(self.mesh, shape[-2:], dtype, self.budget_bytes))
+                                          op != "normal_eigh" and _gathered_admitted(
+                                              self.mesh, shape[-2:], dtype, self.budget_bytes))
         if op == "normal_eigh":
             return program("all")(A)
         if isinstance(A, jax.core.Tracer):

@@ -158,7 +158,10 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   then gathered when admitted. Measured cost at P4: 0.3–4.1 ms per eigh at
   n = 3328–18304 (at most 0.2 % of the solve). polar's direction SVD
   (`normal_eigh`, the eigh of WᴴW) is not probe-checked on route (c); its
-  spectrum is refused when non-finite. A non-Hermitian operand of
+  spectrum is refused when non-finite. It has no shifted/gathered retry chain,
+  so its placement and execution do not compile or price a gathered retry;
+  the actual normal-matrix solve is still compiled for placement pricing.
+  A non-Hermitian operand of
   `leading_eigenvectors` is refused before either route ("requires finite
   Hermitian W"), never retried as a solver failure.
 - Every distributed LU solve (`plan('solve_lu').batched`) and every
