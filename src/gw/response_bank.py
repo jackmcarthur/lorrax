@@ -1454,6 +1454,15 @@ def _moment_batch_split(mesh_xy, n_out, rows):
                    out_shardings=(face,) * n_out)
 
 
+def _batch_totals(run, finish, split):
+    """A q batch's totals from its read run. The photon path's canonical copy (``finish``) is
+    live beside the run and the totals: a part of its own. The split shares the read-back's
+    part (they run in turn beside the same residents).
+    """
+    canonical = run if finish is None else _run_priced(finish, run, label="moment canonical order")
+    return _run_priced(split, canonical, label="moment correlations")
+
+
 def ordered_moments(steps, execute, h, a0, a1, o0, o1):
     """M0..M3 of an ordered charge bank from its scaled totals, one step per dispatch
     (``_response_programs``' ordered ``moments``). Every total is consumed: X_k is formed in
@@ -1622,8 +1631,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                 with _moment_phase(receipt, "correlations"):
                     if runs is not None:
                         run = next(runs)
-                        totals = _run_priced(_moment_batch_split(mesh_xy, n_total, q1 - q0),
-                                             run if finish is None else finish(run), label="moment correlations")
+                        totals = _batch_totals(run, finish, _moment_batch_split(mesh_xy, n_total, q1 - q0))
                         del run
                         a0, a1, o0, o1 = totals if ordered else (*totals, None, None)
                         del totals
