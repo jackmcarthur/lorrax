@@ -902,7 +902,8 @@ def _get_chi_fractional_contour_kernel(
 
 
 def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs,
-                                 layout="face", rule_reference_ry=0.0, moment_powers=(0, 0)):
+                                 layout="face", rule_reference_ry=0.0, moment_powers=(0, 0),
+                                 pair_bounds_ry=None):
     """Full microscopic one-sided MGKBA commutator on shared time nodes.
 
     Returned ``fn(times,weights,psi_mun,psi_nmu,psi_rho_mun,energy)`` takes
@@ -919,17 +920,30 @@ def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs
     the existing spin/Nk prefactor. No transition or spatial projection is
     formed. Explicit full-k input is required: current rho need not possess
     ANY ground-state point symmetry.
+
+    With ``pair_bounds_ry=(Lmin,Lmax,Rmin,Rmax)``, the two left faces are
+    independent ordered endpoints L and R. Weights then have shape
+    ``[2,output,node]`` and one product B(L,R;t) supplies forward -q and
+    conjugate reverse +q. The exact identity is
+    B(R,L;-conj(t))=conj(B(L,R;t)), not B(R,L;t)=conj(B(L,R;t)).
+    Endpoint-specific bounded references and current right-index phases
+    remain independent; no rho/E commutation or stationary shortcut enters.
     """
     from ffi import ffi_dial_key
     program = _full_density_response_program(mesh_xy, tuple(map(int, kgrid)), tuple(map(int, face_shape)),
-        tuple(map(int, q_ids)), int(n_outputs), layout, tuple(map(int, moment_powers)), ffi_dial_key())
+        tuple(map(int, q_ids)), int(n_outputs), layout, tuple(map(int, moment_powers)),
+        pair_bounds_ry is not None, ffi_dial_key())
     # Reference is a small DYNAMIC operand, not a fresh jit closure per E.
     # Only topology, shape and moment powers identify the compiled factory.
-    return lambda *args: program(*args, jnp.asarray(rule_reference_ry, dtype=jnp.float64))
+    bounds = np.zeros(4) if pair_bounds_ry is None else np.asarray(pair_bounds_ry, float)
+    if bounds.shape != (4,) or not np.isfinite(bounds).all():
+        raise ValueError("GATE response_full_density: finite ordered endpoint bounds required")
+    return lambda *args: program(*args, jnp.asarray(rule_reference_ry, dtype=jnp.float64), jnp.asarray(bounds))
 
 
 @lru_cache(maxsize=32)
-def _full_density_response_program(mesh_xy, kgrid, face_shape, q_ids, n_outputs, layout, moment_powers, dial_key):
+def _full_density_response_program(mesh_xy, kgrid, face_shape, q_ids, n_outputs, layout, moment_powers,
+                                   ordered_pair, dial_key):
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
     from .greens_function_kernel import build_G_tau
@@ -954,17 +968,17 @@ def _full_density_response_program(mesh_xy, kgrid, face_shape, q_ids, n_outputs,
     scalar = NamedSharding(mesh_xy, CHI_R_SPEC)
 
     @partial(jax.jit, in_shardings=(rep, rep, NamedSharding(mesh_xy, mun_spec),
-             NamedSharding(mesh_xy, nmu_spec), NamedSharding(mesh_xy, mun_spec), rep, rep),
+             NamedSharding(mesh_xy, nmu_spec), NamedSharding(mesh_xy, mun_spec), rep, rep, rep),
              out_shardings=out)
-    def integrate(times, weights, psi_mun, psi_nmu, psi_rho_mun, energy, rule_reference_ry):
-        if weights.shape != (n_outputs, times.size):
+    def integrate(times, weights, psi_mun, psi_nmu, psi_rho_mun, energy, rule_reference_ry, endpoint_bounds):
+        if weights.shape != ((2, n_outputs, times.size) if ordered_pair else (n_outputs, times.size)):
             raise ValueError("GATE response_full_density: inconsistent shared quadrature weights")
         emin, emax = jnp.min(energy), jnp.max(energy)
 
-        def green(left, t, reference, power):
+        def green(left, t, reference, power, mask=None):
             return gfft(build_G_tau(left, psi_nmu, energy, t, e_ref=reference,
                                     band_weight=(energy-.5*(emin+emax))**int(power),
-                                    layout=layout, gemm=plan))
+                                    mask=mask, layout=layout, gemm=plan))
 
         def correlation(left, right, t):
             lower_ref = jnp.where(t.real >= 0, emin, emax)
@@ -979,6 +993,26 @@ def _full_density_response_program(mesh_xy, kgrid, face_shape, q_ids, n_outputs,
             jnp.zeros((n_outputs, q_ids.size, nmu, nmu), jnp.complex128), out)
 
         def node(carry, i):
+            if ordered_pair:
+                t = times[i]
+                lmin, lmax, rmin, rmax = endpoint_bounds
+                lref = jnp.where(t.real >= 0, lmin, lmax)
+                rref = jnp.where(t.real >= 0, rmax, rmin)
+                # The endpoint is structurally zero outside these exact
+                # support bounds. Use the Green owner's phase selector so
+                # an unused deep-band exp cannot form 0*inf under a compact
+                # real-time rule. No supported energy/phase is modified.
+                a = green(psi_mun, t, lref, moment_powers[0],(energy>=lmin)&(energy<=lmax))
+                a, t = jax.lax.optimization_barrier((a, t))
+                b = green(psi_rho_mun, -jnp.conj(t), rref, moment_powers[1],(energy>=rmin)&(energy<=rmax))
+                product = jax.lax.with_sharding_constraint(jnp.einsum("kmanb,kmanb->kmn",a,b.conj()),scalar)
+                value = cfft(product)
+                forward = jnp.take(value, jnp.asarray(minus_q), axis=0)
+                reverse = jnp.conj(jnp.take(value, jnp.asarray(q_ids), axis=0))
+                delta = rule_reference_ry-(lref-rref)
+                w0 = weights[0,:,i]*jnp.exp(delta*t)
+                w1 = weights[1,:,i]*jnp.exp(delta*jnp.conj(t))
+                return carry+w0[:,None,None,None]*forward[None]+w1[:,None,None,None]*reverse[None],None
             t, w = jax.lax.optimization_barrier((times[i], weights[:, i]))
             forward = correlation(psi_mun, psi_rho_mun, t)
             forward, t = jax.lax.optimization_barrier((forward, t))
