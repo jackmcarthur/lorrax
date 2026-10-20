@@ -166,8 +166,10 @@ def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
     return multiplier
 
 
-def _galerkin_rank_metrics_kernel(mesh, shape, *, selected_rows, physical):
-    """Scalar receipts from all-P state slabs, with no full coefficient gather."""
+def _galerkin_rank_metrics_kernel(mesh, shape, *, selected_rows, physical, columns=False):
+    """Scalar receipts from all-P state slabs, with no full coefficient gather.
+    ``columns``: the factor arrives column-sharded like the coefficients' rank axis
+    (``P(None, ('x','y'))``, the mesh route) instead of replicated."""
     nk, nb, rank = (int(v) for v in shape)
     p = int(mesh.size)
     if rank % p:
@@ -177,14 +179,16 @@ def _galerkin_rank_metrics_kernel(mesh, shape, *, selected_rows, physical):
     spec = P(None, None, axes)
     from jax.experimental.layout import Layout, with_layout_constraint
 
-    @partial(shard_map, mesh=mesh, in_specs=(spec, P()),
+    fspec = P(None, axes) if columns else P()
+
+    @partial(shard_map, mesh=mesh, in_specs=(spec, fspec),
              out_specs=(P(),) * 6, check_vma=False)
     def _metrics(local, factor):
         owner = jax.lax.axis_index("x") * int(mesh.shape["y"]) + jax.lax.axis_index("y")
         selected = jnp.asarray(selected_rows, dtype=jnp.int32)
         picked = local.reshape(nk * nb, rank // p)[selected]
-        reference = jax.lax.dynamic_slice_in_dim(
-            factor[:physical], owner * (rank // p), rank // p, axis=1)
+        reference = (factor[:physical] if columns else jax.lax.dynamic_slice_in_dim(
+            factor[:physical], owner * (rank // p), rank // p, axis=1))
         selected_error = jax.lax.pmax(jnp.max(jnp.abs(picked - reference)), axes)
         rows = jnp.pad(local, ((0, nk_carrier - nk), (0, 0), (0, 0)))
         rows = with_layout_constraint(rows, Layout(major_to_minor=(0, 1, 2)))
@@ -197,20 +201,31 @@ def _galerkin_rank_metrics_kernel(mesh, shape, *, selected_rows, physical):
         missing_norm = jax.lax.pmax(jnp.max(jnp.where(
             valid[:, None], jnp.abs(row_norm-1.0), 0.0)), axes)
         norm_sum = ordered_psum(jnp.sum(jnp.where(valid[:, None], row_norm, 0.0)), axes)
-        return (jnp.min(jnp.real(jnp.diag(factor))[:physical]),
-                orthogonality, missing_norm,
+        if columns:
+            cols = owner * (rank // p) + jnp.arange(rank // p)
+            diag = jnp.real(factor[cols, jnp.arange(rank // p)])
+            diag_min = jax.lax.pmin(jnp.min(jnp.where(cols < physical, diag, jnp.inf)), axes)
+            scale = jax.lax.pmax(jnp.max(jnp.abs(factor[:physical])), axes)
+        else:
+            diag_min = jnp.min(jnp.real(jnp.diag(factor))[:physical])
+            scale = jnp.max(jnp.abs(factor[:physical]))
+        return (diag_min, orthogonality, missing_norm,
                 jnp.sqrt(jnp.maximum(0.0, 1.0-norm_sum/(nk*nb))),
-                selected_error, jnp.maximum(1.0, jnp.max(jnp.abs(factor[:physical]))))
+                selected_error, jnp.maximum(1.0, scale))
 
     return jax.jit(_metrics,
-                   in_shardings=(NamedSharding(mesh, spec), NamedSharding(mesh, P())),
+                   in_shardings=(NamedSharding(mesh, spec), NamedSharding(mesh, fspec)),
                    out_shardings=(NamedSharding(mesh, P()),) * 6)
 
 
 def _galerkin_rank_metrics(ctilde, selection_factor, *, selected_rows, physical):
+    columns = not _is_replicated(selection_factor)
+    if columns:      # the face L's columns with the coefficients' rank shards
+        selection_factor = jax.jit(lambda f: f, out_shardings=NamedSharding(
+            ctilde.sharding.mesh, P(None, ("x", "y"))))(selection_factor)
     return _galerkin_rank_metrics_kernel(
         ctilde.sharding.mesh, ctilde.shape, selected_rows=selected_rows,
-        physical=physical)(ctilde, selection_factor)
+        physical=physical, columns=columns)(ctilde, selection_factor)
 
 
 def galerkin_rank_record(basis: GalerkinBasis, *, meta,
@@ -523,15 +538,15 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
                          "galerkin.restart.basis_at_nodes").spec
         # SlabIO's registered shape>dataset contract zero-extends the physical
         # logical datasets directly into these mesh-legal carrier shapes.
+        factor_spec = P("x", "y") if selection_factor_layout(mesh_xy, carrier) == "mesh" else P()
         arrays = [io.read_slab(name, shape=shape, partition_spec=spec)
                   for name, shape, spec in zip(
                       _BASIS_ARRAYS, shapes,
-                      (P(None, None, ("x", "y")), node_spec, P()))]
-    rep = NamedSharding(mesh_xy, P())
+                      (P(None, None, ("x", "y")), node_spec, factor_spec))]
     arrays[2] = jax.jit(
         lambda factor: factor + jnp.diag(
             (jnp.arange(carrier) >= physical).astype(factor.dtype)),
-        out_shardings=rep)(arrays[2])
+        out_shardings=NamedSharding(mesh_xy, factor_spec))(arrays[2])
     basis = GalerkinBasis(
         ctilde=arrays[0], basis_at_nodes=arrays[1], rank_physical=physical,
         band_range=stored["band_range"], selected_state_indices=stored["selected"],
@@ -1055,15 +1070,17 @@ def fit_galerkin_basis(
 
         gram_stack = _prepare_selected(selected_gram)
         del selected_gram
+        on_mesh = selection_factor_layout(mesh_xy, rank) == "mesh"
         chol_plan = linalg_plan(
             "cholesky", mesh_xy, backend="native2d", n=rank,
-            batched_route=distrib_la_batched_route)
-        log_fn(f"  [route] selected-state factor: {chol_plan.describe()}")
+            batched_route="auto" if on_mesh else distrib_la_batched_route)
+        log_fn(f"  [route] selected-state factor: {chol_plan.describe()}"
+               f"{'; L stays on the face, solves by the mesh LU' if on_mesh else ''}")
         L_stack = chol_plan.batched(gram_stack)
         del gram_stack
 
         @partial(jax.jit, in_shardings=batch_face,
-                 out_shardings=(rep, rep))
+                 out_shardings=(NamedSharding(mesh_xy, P('x', 'y')) if on_mesh else rep, rep))
         def _replicate_lower(factors):
             L_ = jnp.tril(factors[0])
             return L_, jnp.min(jnp.real(jnp.diag(L_))[:rank_phys])
@@ -1476,6 +1493,52 @@ def _selected_gram_from_projection(projection, *, selected_states,
     return _pick(projection)
 
 
+def selection_factor_layout(mesh: Mesh, carrier: int) -> str:
+    """``"local"``: the selected-state factor L [carrier, carrier] replicated (every solve
+    rank-local, the route (c) Cholesky holding the Gram, L and its workspace on one rank);
+    ``"mesh"``: L on the face and every L^-1 X by distrib_la's mesh LU. The faster route
+    that fits beside what is live (owner rule 2026-10-19: a mesh backup at every whole
+    matrix site); P = 1 is local."""
+    if int(mesh.size) <= 1:
+        return "local"
+    from lxkit import memory
+    from common.gpu_utils import shared_device_room
+    whole = 16.0 * int(carrier) ** 2
+    local = memory.Price(operands=memory.Term(
+        4 * whole, source="replicated L + route (c) Gram, L, workspace on one rank (closed form)"),
+        ranks=int(mesh.size))
+    mesh_price = memory.Price(operands=memory.Term(
+        spread=4 * whole, source="Gram, L, LU factor and pivots on the face (closed form)"),
+        ranks=int(mesh.size))
+    return memory.admit(f"Galerkin selected-state factor {int(carrier)}^2", (
+        ("local", local), ("mesh", mesh_price)),
+        int(shared_device_room("Galerkin selected-state factor")))
+
+
+def _is_replicated(array) -> bool:
+    return all(axis is None for axis in tuple(array.sharding.spec))
+
+
+def _mesh_lower_solve(factor, rows, out_sharding):
+    """``L^-1 X`` for a face L [c, c] (``P('x','y')``) and rows whose leading axis is c: X as
+    the face [1, c, M] (M padded to the mesh), distrib_la's mesh LU solve, back to
+    ``out_sharding``. LU with partial pivoting of the triangular L solves it to the
+    solver's tolerance; no rank holds a whole c x c."""
+    import distrib_la
+    from common.gpu_utils import shared_device_room
+    mesh = factor.sharding.mesh
+    c, shape = int(rows.shape[0]), tuple(rows.shape)
+    m = int(np.prod(shape[1:]))
+    m_pad = -(-m // int(mesh.shape["y"])) * int(mesh.shape["y"])
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    lu = distrib_la.plan("solve_lu", mesh, backend="distributed", n=c, batched_route="auto",
+                         budget_bytes=shared_device_room("Galerkin selected-state solve"))
+    x = jax.jit(lambda r: jnp.pad(r.reshape(c, m), ((0, 0), (0, m_pad - m)))[None],
+                out_shardings=face)(rows)
+    y = lu.batched(jax.jit(lambda a: a[None], out_shardings=face)(factor), x)
+    return jax.jit(lambda v: v[0, :, :m].reshape(shape), out_shardings=out_sharding)(y)
+
+
 def _solve_selected_basis_rows(factor, selected_rows):
     """Evaluate ``B = L^-1 X`` with spin kept outside the solve axis."""
     rhs = jnp.moveaxis(selected_rows, 1, 0)
@@ -1609,10 +1672,13 @@ def iter_galerkin_rchunks(
                     ((lo, hi), psi_bc[:, offset:offset + (hi - lo)]))
             else:
                 del psi_bc
-        solve = _make_basis_solve_kernel(
-            mesh=mesh_xy, rank=rank, nspinor=nspinor,
-            r_carrier=r_carrier, row_layout=row_layout)
-        basis_chunk = solve(basis.selection_factor, selected_rows)
+        if _is_replicated(basis.selection_factor):
+            solve = _make_basis_solve_kernel(
+                mesh=mesh_xy, rank=rank, nspinor=nspinor,
+                r_carrier=r_carrier, row_layout=row_layout)
+            basis_chunk = solve(basis.selection_factor, selected_rows)
+        else:
+            basis_chunk = _mesh_lower_solve(basis.selection_factor, selected_rows, row_layout)
         del selected_rows
         if sum(hi - lo for (lo, hi), _ in retained) != keep_end - keep_start:
             raise RuntimeError(
@@ -1690,6 +1756,12 @@ def _solve_coefficient_projection(projection, factor, mesh: Mesh):
     p = int(mesh.size)
     if rank % p:
         raise ValueError("Galerkin coefficient rank carrier must divide all P")
+    if not _is_replicated(factor):
+        # C^H = L^-1 (Psi X^H)^H on the mesh: the rows are the projection's conjugate transpose.
+        rows = jax.jit(lambda a: jnp.conj(a.reshape(nk * nb, rank)).T)(projection)
+        c_h = _mesh_lower_solve(factor, rows, NamedSharding(mesh, P(None, ("x", "y"))))
+        return jax.jit(lambda v: jnp.conj(v).T.reshape(nk, nb, rank),
+                       out_shardings=NamedSharding(mesh, P(None, None, ("x", "y"))))(c_h)
     states = nk * nb
     state_carrier = -(-states // p) * p
     spec = P(None, None, ("x", "y"))
@@ -1830,6 +1902,8 @@ def _basis_at_nodes_from_selected_chunks(
                             device_put_process_local(valid, rep))
             destination = np.minimum(start + np.arange(panel), n_nodes - 1)
             rows = _place(rows, values, device_put_process_local(destination, rep))
+    if not _is_replicated(factor):
+        return _mesh_lower_solve(factor, rows, rows_layout)
     solve = _make_basis_solve_kernel(
         mesh=mesh_xy, rank=rank_carrier, nspinor=nspinor,
         r_carrier=n_nodes, row_layout=rows_layout)
