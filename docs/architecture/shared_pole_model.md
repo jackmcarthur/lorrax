@@ -505,10 +505,9 @@ through total $W$ and fits the scalar head with the MPA head owner; its
 vertices trace the spinor index and its capacity is $2/(n_{\rm spin}n_{\rm spinor})$
 states per band. On an ordered store the body is the signed
 $b D_+ b^\dagger - [b D_- b^\dagger]^T$, $D_\pm = 1/(2W(z\mp W))$, at $z$, and the
-wings sum every ordered pair. It refuses on an ordered metal
-(`GATE shared_pole_head_ordered`: the static Matsubara slot is not certified
-without time reversal) and on the four-component charge store
-(`GATE shared_pole_head_nspinor`). `head_correction = no_local_fields` carries
+wings sum every ordered pair, split on a metal as $S$ is
+([metal head §5](../theory/metal-q0-head.md#5-limits-of-the-model)). It refuses
+on the four-component charge store (`GATE shared_pole_head_nspinor`). `head_correction = no_local_fields` carries
 the direct tensor $S(\omega)$, finalized with no Γ body ([four-current heads](../theory/four-current-head-corrections.md)). Metal head routes are
 [self-consistency](../self_consistency.md#metals-direct-drude-head).
 

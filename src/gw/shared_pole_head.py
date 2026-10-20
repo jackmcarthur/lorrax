@@ -41,13 +41,13 @@ full zone unfolded by the measured magnetic group.  The scalar head stays
 even in ``z``: the Lehmann form gives ``chi_ab(-z) = chi_ba(z)`` for the
 tensor, the wings (``Y(-z) = Z(z)^T``) and the body (``W(-z) = W(z)^T``), so
 ``S_eff(-z) = S_eff(z)^T`` and ``q.S_eff.q`` with real ``q`` is even; the
-``s = z^2`` MPA head fit applies unchanged.  ``head_correction = full``
-still refuses an ordered METAL by name (``GATE shared_pole_head_ordered``):
-its exact ``z = 0`` slot folds the static Matsubara wings and body
-(``qsgw_head._metal_static_head``), not certified without time reversal.
-Such a deck takes ``no_local_fields`` (the direct head; the SC route may
-select ``dft_velocity`` for the Drude/Thomas-Fermi piece) or ``off``.  The
-signed fold is checked in ``tests/test_shared_pole_head_ordered_fold.py``.
+``s = z^2`` MPA head fit applies unchanged.  An ordered METAL folds the same
+way: its wing pairs split by the S kernel's Fermi-surface share, with the
+intraband wing taking it (``qsgw_head._head_wing_kernel_face``), and the
+plan's shifted origin is the static Thomas-Fermi row
+(``qsgw_head.metal_static_rows``).  The signed fold is checked in
+``tests/test_shared_pole_head_ordered_fold.py``, the ordered metal in
+``tests/test_shared_pole_head_ordered_metal.py``.
 """
 from types import SimpleNamespace
 from functools import lru_cache
@@ -139,7 +139,7 @@ def _realized_gamma_body(mesh, realize, route, ordered=False):
     return evaluate
 
 
-def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor, material_class):
+def refuse_unsupported_shared_pole_head(config, *, nspinor):
     """Refuse, at input resolution, a full shared-pole head the Gamma body cannot evaluate.
 
     Called once from ``gw_jax._load_system_inputs`` right after the WFN
@@ -147,9 +147,7 @@ def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor, materia
     same refusal used to fire inside :func:`build_shared_pole_head`, after
     the bank, moments and constructor had run and ``model.h5`` was committed,
     so a rerun in that directory then refused on the committed model (Q0HEAD
-    2026-09-16).  ``trs_allowed`` is the final ``SymMaps.trs_allowed`` the
-    store's representation follows; ``nspinor`` is the source WFN's;
-    ``material_class`` is the WFN-occupation verdict. The
+    2026-09-16).  ``nspinor`` is the source WFN's. The
     bare-transverse shared-pole route stores its charge operator on the
     four-component carrier, so its preflight must use that store extent.
     """
@@ -159,11 +157,10 @@ def refuse_unsupported_shared_pole_head(config, *, trs_allowed, nspinor, materia
         return
     store_nspinor = (4 if (bool(getattr(config, "bispinor", False))
                           and uses_bare_transverse_shared_pole(config)) else nspinor)
-    _refuse_head_representation(trs_allowed=trs_allowed, nspinor=store_nspinor,
-                                metal=material_class == "metal")
+    _refuse_head_representation(nspinor=store_nspinor)
 
 
-def _refuse_head_representation(*, trs_allowed, nspinor, metal):
+def _refuse_head_representation(*, nspinor):
     """The one owner of what the full Gamma head evaluates: the scalar charge body.
 
     ``nspinor`` 1 or 2 is the charge representation (module docstring): the
@@ -171,19 +168,8 @@ def _refuse_head_representation(*, trs_allowed, nspinor, metal):
     head vertices trace the spinor index, so both evaluate identically. The
     four-component charge carrier has no certified scalar wing/body fold.
     The full photon layout has a separate Gamma completion.  Either store
-    representation folds (module docstring); an ordered metal refuses.
+    representation folds, insulator or metal (module docstring).
     """
-    if not bool(trs_allowed) and bool(metal):
-        raise ValueError(
-            "GATE shared_pole_head_ordered: got time-reversal-broken symmetry (an ordered "
-            "store, representation scalar-ordered-ph) on a metal with head_correction = "
-            "full; want an insulator, or time reversal, for full; why: the metal's exact "
-            "z = 0 slot folds the static Matsubara wings and body "
-            "(qsgw_head._metal_static_head), which are not certified without time "
-            "reversal. head_correction = no_local_fields delivers the direct "
-            "frequency-dependent head (exact without time reversal; the SC route may "
-            "select dft_velocity for the Drude/Thomas-Fermi piece); head_correction = off "
-            "is the headless brute-grid development mode (owner policy 2026-09-18).")
     if int(nspinor) not in (1, 2):
         raise ValueError(
             f"GATE shared_pole_head_nspinor: got N_spinor = {int(nspinor)}; want 1 or 2 (the "
@@ -224,7 +210,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     from .mpa.model import fit_head_samples
     from .mpa.sample_plan import plan_z
     from .qsgw_head import (IterationHeadSamples, finalize_iteration_head_rows,
-                            iteration_head_sample_terms)
+                            iteration_head_sample_terms, metal_response_nodes)
     from .response_bank import _reserve
     from .qgrid_symmetry import shared_pole_operator_realizer
     import distrib_la
@@ -238,6 +224,8 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     points = tuple(map(complex, z)) if response is None else tuple(response.omegas)
     if response is not None and not np.array_equal(np.asarray(points[:len(z)]), z):
         raise ValueError("GATE shared_pole_head: response and MPA scalar sample grids differ")
+    # A metal's static row takes the body at z = 0, as its head operands do.
+    nodes = metal_response_nodes(points, config, metal=material_class == "metal")
     full = config.head.correction is HeadCorrection.FULL
     if full and response is None:
         raise ValueError("GATE shared_pole_head: full head requires the direct response and wings")
@@ -252,8 +240,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         # Decks are refused at input resolution (refuse_unsupported_shared_pole_head);
         # this re-reads the same owner on the store actually opened.
         ordered = str(header.get("representation", "")) != "scalar-trs-even-s"
-        _refuse_head_representation(trs_allowed=not ordered, nspinor=int(header["nspinor"]),
-                                    metal=material_class == "metal")
+        _refuse_head_representation(nspinor=int(header["nspinor"]))
         parents = np.flatnonzero(np.asarray(header["q_irr_full_idx"]) == 0)
         if len(parents) != 1:
             raise ValueError("GATE shared_pole_head: expected one Gamma parent")
@@ -307,7 +294,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         for index, point in enumerate(points):
             total = None
             if full:
-                value = evaluate(jnp.asarray(point, jnp.complex128), *args)
+                value = evaluate(jnp.asarray(nodes[index], jnp.complex128), *args)
                 total = value[0]
             if response is None:
                 samples.append(head_resolver.at(point))

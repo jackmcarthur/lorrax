@@ -10,7 +10,9 @@ body and the Lehmann wings of every ordered pair.  Checked here on CPU:
 * body: the ordered Gamma body equals the store normalization
   ``sum_p b b^H/(2W(z-W)) - conj(b) b^T/(2W(z+W))``, reduces to the TRS
   ``b (z^2 - Lambda)^-1 b^H`` for real ``b``, and obeys ``W(-z) = W(z)^T``;
-* gate: full is admitted on an ordered insulator and refused on an ordered metal.
+* gate: full is admitted on every one- and two-component store, ordered metals
+  included (``tests/test_shared_pole_head_ordered_metal.py``), and refused on
+  the four-component charge store.
 """
 from types import SimpleNamespace
 
@@ -153,16 +155,12 @@ def test_ordered_body_is_store_normalization(mesh):
         assert _rel(_body(mesh, True, z, br, poles, counts), trs) < 1e-12
 
 
-def test_gate_admits_ordered_insulator_refuses_ordered_metal():
+def test_gate_admits_two_component_refuses_four_component():
     from gw.gw_config import HeadCorrection
     from gw.shared_pole_head import refuse_unsupported_shared_pole_head
     config = SimpleNamespace(sigma=SimpleNamespace(w_model="shared_pole"),
                              head=SimpleNamespace(correction=HeadCorrection.FULL),
                              bispinor=False)
-    refuse_unsupported_shared_pole_head(config, trs_allowed=False, nspinor=2,
-                                        material_class="insulator")
-    refuse_unsupported_shared_pole_head(config, trs_allowed=True, nspinor=2,
-                                        material_class="metal")
-    with pytest.raises(ValueError, match="GATE shared_pole_head_ordered"):
-        refuse_unsupported_shared_pole_head(config, trs_allowed=False, nspinor=2,
-                                            material_class="metal")
+    refuse_unsupported_shared_pole_head(config, nspinor=2)
+    with pytest.raises(ValueError, match="GATE shared_pole_head_nspinor"):
+        refuse_unsupported_shared_pole_head(config, nspinor=4)
