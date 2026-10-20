@@ -120,9 +120,12 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
     basis = meta.mu_basis
     if canonical.ndim != 1 or canonical.size != int(meta.n_rmu):
         raise ValueError("BSE needs the exact source-fit G0 vector")
-    canonical = np.pad(canonical, (0, basis.n_canonical-canonical.size))
-    gx = basis.pack_axis(device_put_process_local(canonical, NamedSharding(mesh, P('x'))), -1)
-    gy = basis.pack_axis(device_put_process_local(canonical, NamedSharding(mesh, P('y'))), -1)
+    # G0 is ALREADY small replicated host metadata from its native producer.
+    # Use its host packing owner: the large-array staged conversion requires
+    # a second slab axis and is not the vector-metadata path.
+    packed_g0 = basis.pack_host(canonical)
+    gx = device_put_process_local(packed_g0, NamedSharding(mesh, P('x')))
+    gy = device_put_process_local(packed_g0, NamedSharding(mesh, P('y')))
     v0, W, head_log = _inject_q0_head(v0, W, gx, gy, hs.vc0,
         jnp.asarray([hs.wcoul0]), float(meta.cell_volume), w0_ready=True)
     ev = pad_axis(energy[:, nocc-nval:nocc], int(mesh.shape['y']), axis=1, fill=-1.e6).array
