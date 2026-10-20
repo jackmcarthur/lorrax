@@ -70,6 +70,26 @@ original fresh-solve route and all checks).
 
 ## What the compact44 benchmark really requests
 
+The band limits have different meanings; the screening space is **not**
+reduced to the propagated density window:
+
+| Object | Electronic band support |
+| --- | --- |
+| Propagated density | Active44 block; spectators retain their reference occupations |
+| χ and W construction | All750 physical screening bands, including FF, FA, AF and AA |
+| External on-shell Σ matrix | Active44 rows/columns and their requested energies |
+| Virtual internal Σ line | All750 bands; real collision destinations are separately active-only |
+
+In particular, FA and AF retain active-to-outside virtual transitions even
+though the propagated active–spectator density coherences are zero. A narrow
+external on-shell sampling range is not a transition cutoff in χ. The current
+full-density builder embeds the active matrix into the full-band density,
+uses current right-column energy phases, and sums all four response blocks
+before Dyson. The separate bosonic q grid changes spatial sampling, not this
+band support. The coherent wrapper and equilibrium wrapper currently share
+Green/GEMM/FFT owners but are not the identical compiled χ integration
+program; consolidation onto the profiled equilibrium stream is under review.
+
 `active_sigma_probe.py:31–52` constructs external energies only for
 `[100,144)` and requests `projection_bands=(100,144)`. In
 `src/gw/mpa/sigma.py:2693–2694`, the planner uses the request's actual
