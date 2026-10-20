@@ -235,10 +235,9 @@ def transition_basis(bridge, seed_blocks, catalogue, rho, *, capacity,
                      self_crossing=None):
     """One-parent CGS2 + TSQR basis with canonical small-R rank admission.
 
-    Binary stationary populations use separate exact K-sign sectors and
-    currently require a catalogue without reserved K=0 rows. A coherent
-    reservation at a stationary projector refuses; it is never silently
-    removed. Zero-sector triangular/dark-mode initialization is deferred.
+    Binary stationary populations use separate exact K=-1,0,+1 sectors.
+    The zero sector remains in the held basis, even when its current transfer
+    is dark. Each normalized block is restored to its exact structural support.
     For a self-inverse q, self_crossing is the authenticated row permutation and
     seeds are completed by their antiunitary partners BEFORE QR. No state is
     truncated to meet capacity: a retained block that does not fit refuses.
@@ -271,14 +270,13 @@ def transition_basis(bridge, seed_blocks, catalogue, rho, *, capacity,
     sectors=np.ones((nk,width),int)
     if stationary:
         sectors=(np.take_along_axis(diag[kmq],d,1)-np.take_along_axis(diag,b,1)).real.astype(int)
-        if np.any(valid&(sectors==0)):
-            raise ValueError('GATE transition_sectors: stationary proof requires exact live catalogue')
-    sector_masks=[valid&(sectors==s) for s in (-1,1)] if stationary else [valid]
+    sector_values=(-1,0,1) if stationary else (None,)
+    sector_masks=[valid&(sectors==s) for s in sector_values] if stationary else [valid]
     for block in seed_blocks:
         partners=[block]
         if self_crossing is not None:
             partners.append(bridge['cross'](block,jnp.asarray(self_crossing),jnp.asarray(valid)))
-        for sector in sector_masks:
+        for sector_value,sector in zip(sector_values,sector_masks):
             for candidate in partners:
                 for lo in range(0,candidate.shape[0],max_block_size):
                     work=candidate[lo:lo+max_block_size]*jnp.asarray(sector)[None]
@@ -290,11 +288,15 @@ def transition_basis(bridge, seed_blocks, catalogue, rho, *, capacity,
                     if active+keep>capacity:raise ValueError('GATE transition_capacity: retained QR block exceeds capacity')
                     if keep:
                         coeff=device_put_process_local(rotate,rep)
-                        normalized=jnp.einsum('ar,akp->rkp',coeff,q)
+                        # QR may place roundoff outside an exactly known
+                        # coordinate sector; restoring these structural zeros
+                        # is not a population or small-amplitude cutoff.
+                        normalized=jnp.einsum('ar,akp->rkp',coeff,q)*jnp.asarray(sector)[None]
                         basis=basis.at[active:active+keep].set(normalized);active+=keep
                         jax.block_until_ready(basis)
                     records.append(dict(input_rows=int(work.shape[0]),retained=keep,active=active,
                         original_seed_norm=reference_norm,
+                        exact_K_sector=sector_value,
                         independence_policy='common.rank_criterion.probe_is_independent',
                         independence_rtol=float(rank_tolerance),
                         spectral_closure='strict whole residual singular blocks; not an overlap inverse'))
@@ -331,7 +333,10 @@ def transition_parent_model(bridge, t, catalogue, energy, rho, V, basis, gamma, 
     frequency matrices leave the device. V[mu,nu] stays on native XY faces.
     Returned left/right[1,mu,Kcarrier] remain distributed; exact zero padding
     is distinguished by count. This internal proof neither stores nor admits
-    a production bank and does not switch any TD route.
+    a production bank and does not switch any TD route. At binary stationary
+    rho only, exactly coordinate-separated K=0 basis rows may be omitted from
+    modal materialization after exact D-crossblock/A0 checks; the full held
+    basis and projected generator remain available for the next current rho.
     """
     from common.collectives import gather_to_host,device_put_process_local
     from .shared_pole_execution import face_matmul
@@ -370,18 +375,47 @@ def transition_parent_model(bridge, t, catalogue, energy, rho, V, basis, gamma, 
     va=mm(V[None],aq);vb=mm(V[None],bq)
     feedback=mm(bq,va,transa='C')
     # EVERY rank gathers before the canonical pure-host modal owner.
-    m=np.asarray(gather_to_host(dq))+np.asarray(gather_to_host(feedback[0,:n,:n]))
-    eye=np.eye(n,dtype=complex)
-    modal=collective_general_pencil(eye,m,max_order=n,max_workspace_bytes=host_workspace_bytes,
-        fixed_spaces=dict(right=eye,left=eye))
-    om=np.pad(modal['output_map'],((0,carrier-n),(0,carrier-n)))
-    im=np.pad(modal['input_map'],((0,carrier-n),(0,carrier-n)))
-    left=mm(va,device_put_process_local(om[None],face))
-    right=mm(vb,device_put_process_local(im[None],face))
-    poles=np.pad(modal['poles_ry'],(0,carrier-n))
-    return dict(left=left,right=right,poles_ry=poles,count=n,
+    d_host=np.asarray(gather_to_host(dq))
+    m=d_host+np.asarray(gather_to_host(feedback[0,:n,:n]))
+    indices=np.arange(n);dark_indices=np.array([],int)
+    dark_certificate=False
+    if stationary:
+        sector=(np.take_along_axis(diagonal[np.asarray(catalogue['kmq'])],catalogue['d'],1)
+                -np.take_along_axis(diagonal,catalogue['b'],1)).real
+        dark_mask=np.asarray(catalogue['valid'])&(sector==0)
+        # Only n booleans leave the state/port devices, never Q or full ports.
+        inside=np.asarray(gather_to_host(jnp.any((basis!=0)&jnp.asarray(dark_mask)[None],axis=(1,2))))
+        outside=np.asarray(gather_to_host(jnp.any((basis!=0)&jnp.asarray(~dark_mask)[None],axis=(1,2))))
+        weighted_live=np.asarray(gather_to_host(jnp.any(aq[0,:,:n]!=0,axis=0)))
+        dark_indices=np.flatnonzero(inside&~outside)
+        indices=np.flatnonzero(~inside&outside)
+        separated=len(dark_indices)+len(indices)==n
+        dark_certificate=(separated and not np.any(weighted_live[dark_indices])
+            and not np.any(d_host[np.ix_(indices,dark_indices)]!=0)
+            and not np.any(d_host[np.ix_(dark_indices,indices)]!=0))
+        if not dark_certificate:
+            indices=np.arange(n);dark_indices=np.array([],int)
+    order=len(indices)
+    model_carrier=max(int(mesh.shape['y']),((order+int(mesh.shape['y'])-1)//int(mesh.shape['y']))*int(mesh.shape['y']))
+    if order:
+        eye=np.eye(order,dtype=complex)
+        modal=collective_general_pencil(eye,m[np.ix_(indices,indices)],max_order=order,
+            max_workspace_bytes=host_workspace_bytes,fixed_spaces=dict(right=eye,left=eye))
+        om=np.zeros((carrier,model_carrier),complex);im=om.copy()
+        om[indices,:order]=modal['output_map'];im[indices,:order]=modal['input_map']
+        left=mm(va,device_put_process_local(om[None],face))
+        right=mm(vb,device_put_process_local(im[None],face))
+        poles=np.pad(modal['poles_ry'],(0,model_carrier-order))
+        modal_receipt=modal['receipt']
+    else:
+        left=jax.jit(lambda:jnp.zeros((1,nmu,model_carrier),complex),out_shardings=face)()
+        right=left;poles=np.zeros(model_carrier,complex)
+        modal_receipt=dict(construction='exact structurally dark zero transfer; no eigensolve')
+    return dict(left=left,right=right,poles_ry=poles,count=order,
         projected_generator=m,receipt=dict(construction='full-port-transition-Galerkin-one-parent-proof',
             full_ports=nmu,transition_rows=int(catalogue['valid'].size),live_transitions=int(catalogue['valid'].sum()),
-            free_lag_decay_ry=float(gamma),modal=modal['receipt'],production_default=False,
+            free_lag_decay_ry=float(gamma),modal=modal_receipt,production_default=False,
             orthogonality_defect=orthogonality,stationary_binary=bool(stationary),K_sector_defect=sector_defect,
+            held_order=n,materialized_order=order,materialized_indices=indices.tolist(),
+            exact_dark_Kzero_indices=dark_indices.tolist(),exact_dark_certificate=bool(dark_certificate),
             retained_parent_count=1,all_parent_retention_admitted=False))
