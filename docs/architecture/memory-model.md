@@ -5,14 +5,16 @@ per-rank live set fits the device budget. Every large object is tiled over
 the whole `x × y` mesh, so its per-rank bytes fall as `1/P`; nothing large is
 materialised on fewer than all `P` ranks. This page states, stage by stage,
 what is resident per rank, how it scales, and which planner prices it.
-No planner refuses on a price (owner 2026-10-01): a stage over its budget
-raises one `RuntimeWarning: memory over budget at <stage>` (needed, budget, by
-how much; `common.gpu_utils.warn_over_budget`; gwjax.out lists it under
-WARNINGS), runs at its smallest size, and OOMs if the device truly lacks the
-room. What still refuses is not a price: a workspace that cannot be measured (`GATE shared_pole_capacity: … FFT
-workspace unavailable`), a compiled module larger than the device
-([`GATE xla_rematerialization`](#module-does-not-fit)), and the correctness
-gates.
+One implementation prices, admits and measures every stage: `lxkit.memory`
+(`services/lxkit/src/lxkit/memory.py`). No planner refuses on a price (owner
+2026-10-19, `memory.admit`): the fastest route that fits runs; when none fits,
+the cheapest runs with one `RuntimeWarning`, or, when it is over the allocator's
+physical limit, with a loud banner naming the shortfall and the minimum process
+count that completes. What still refuses is not a price: a workspace that cannot
+be measured, a compiled module larger than the device
+([`GATE xla_rematerialization`](#module-does-not-fit)), a measured vendor row used
+outside its range under `memory.STRICT` (`GATE memory_unpriced`), and the
+correctness gates.
 
 | symbol | meaning |
 |---|---|
@@ -30,15 +32,9 @@ All arrays are complex128 (16 B) unless stated.
 ## Budget
 
 Every planner prices its stage against one number per device, the budget `B`
-(`common.gpu_utils.device_budget_bytes`, `src/common/gpu_utils.py:71`). One
-rule sets `B` from two quantities known before the deck is read: `M`, the
-card total (`runtime.xla_memory.device_total_bytes`, through the device leg's
-declared reader, `PlatformLeg.device_memory_api` in `lxkit.LEGS`:
-`cuDeviceTotalMem` on CUDA, `hipDeviceTotalMem` from the ROCm plugin's own
-HIP runtime on ROCm), and `O`, the bytes the process holds
-outside XLA's memory pool. This section defines the pool, states the rule,
-explains why the pool's reserved bytes can run past its reservation, and
-says which part of that the rule has to price.
+(`common.gpu_utils.device_budget_bytes`, held by `lxkit.memory`). `B` comes from
+the allocator's limit `L`, the bytes outside it, and the leg's reserve; every
+platform difference is a row of `lxkit.LEGS`, not code.
 
 ### The pool {#pool}
 
@@ -67,90 +63,53 @@ The card's free bytes are `F(t) = M − O(t) − V(t)`.
 ### The rule {#rule}
 
 ```text
-B = (M − 1.2·O) / (1 + 1.2·φ) − T_ord   the planner budget   (runtime.planner_budget_bytes, src/runtime/__init__.py:812)
-R = M − 1.2·O_max                 the pool's reservation (runtime.pool_reservation_bytes, :797; runtime.pool_fraction = R/M)
+L = bytes_limit                    where the allocator enforces it (BFC: ROCm)
+L = M − max(O_now, O_leg)          otherwise (cuda_async), M the card total
+B = (L − O_pend)·(1 − r) − T_ord   lxkit.memory.resolve, the minimum over processes
+R = M − O_leg − O_dist             the pool's reservation (memory.pool_reservation; runtime.pool_fraction = R/M)
 ```
 
-`O` is 3 GB (`OUTSIDE_POOL_BYTES`; a device leg may declare its own, `PlatformLeg.outside_pool_bytes`: 4.1 GB on ROCm, where ROCr keeps reclaimed-off scratch outside the arena, see the ROCm arena paragraph below), plus 3 GB under `linalg = distributed`
-for the cuSOLVERMp/cuBLASMp contexts, their communicators and workspace
-(`DISTRIBUTED_LINALG_OUTSIDE_BYTES`; `O_max` = 6 GB). `φ` = 0.19
-(`POOL_OVERSHOOT`, `:802`) is the fraction by which the pool's in-use bytes
-`U` may run above the budget the planners priced: peaks they under-price,
-and free space trapped between live buffers ([§ what φ covers](#what-phi-covers)).
-1.2 is the margin (`MEMORY_MARGIN`). `T_ord` is the one named cap of the
-rank-order reductions' transient inside the pool, `lxkit.ORDERED_TRANSIENT_SLABS` (2)
-slabs of `LORRAX_ORDERED_SLAB_MB` (8 MiB) = 16 MiB
-(`runtime.ordered_reduction_transient_bytes`). It is fixed: an ordered all-reduce
-or reduce-scatter of any operand size holds at most two slabs beyond the library
-collective ([rank-order reductions](../environment/transports.md#rank-order-reductions)),
-so it comes off `B` once and every planner and route (`admit_local`'s room is `B`
-less the live stages) sees it. `B` is at most `R` and at least `M/4`.
+`O_leg` is the leg's `outside_allowance` (CUDA 3.6 GB, ROCm 4.92 GB: the measured
+outside bytes, 3.0 and 4.1 GB, with the 1.2 margin), `O_dist` the distributed
+providers' contexts (`lxkit.legs.DISTRIBUTED_CONTEXT_BYTES`, 3.6 GB), `O_pend` =
+`O_dist` under `linalg = distributed` where the allocator does not enforce its
+limit (the contexts open later, outside it), `r` the leg's `memory_reserve`, and
+`T_ord` the rank-order reductions' fixed transient, `lxkit.ORDERED_TRANSIENT_SLABS`
+(2) slabs of `LORRAX_ORDERED_SLAB_MB` (8 MiB) = 16 MiB
+([rank-order reductions](../environment/transports.md#rank-order-reductions)).
+**`r` = 0.18567 is provisional**: the 2026-10-08 rule's overshoot φ = 0.19 with its
+1.2 margin, `1.2φ/(1 + 1.2φ)`, so `B` equals that rule's budget (A100-80GB: 66.4 GB
+at linalg local, 63.4 GB distributed; MI250X GCD: 48.99 GB of a 60.18 GB arena)
+until the gate legs measure `r` as the largest `(allocator peak − priced)` over
+passing stages ([§ what φ covers](#what-phi-covers) is its present evidence).
 
-| card | M | R | B, linalg local | B, linalg distributed |
-|---|---|---|---|---|
-| A100-40GB | 42.4 GB | 35.2 GB (0.830) | 31.6 GB | 28.7 GB |
-| A100-80GB | 85.1 GB | 77.9 GB (0.915) | 66.4 GB | 63.4 GB |
+A positive `memory_per_device_gb` can only lower `B` (above it, one warning and
+the run keeps `B`). On CPU `L` is the node's `MemTotal` over the processes on the
+node and the process's devices. The room beside what is allocated now is
+`memory.room() = B − bytes_in_use` (the allocator's own figure; CPU: live arrays),
+the minimum over processes, floored to a whole GiB.
 
-The pool is reserved before the deck is read, so `R` leaves room for
-`O_max` whatever the deck's `linalg`. The reservation is not a cap: the pool
-may map more than `R` ([§ growth](#pool-growth)). The rule reads only `M`
-and the deck's resolved `linalg`, so it is the same on every rank and every
-run. A positive `memory_per_device_gb` can only lower `B`: below `B` it is
-used silently; above `B` it warns once at start-up with both numbers and the
-run keeps `B` (a deck written for an 80 GB card runs at the rule on a 40 GB
-one instead of running out of memory mid-run). When the caller owns the
-allocator and it is a BFC arena, whose `bytes_limit` is a hard cap, `B` is at
-most `bytes_limit/(1 + 1.2·φ)`; under the runtime's `cuda_async` pool the
-reservation is not a cap and `B` reads only `M`. The rule
-is the minimum over processes (`common.gpu_utils.resolve_device_budget_gb`,
-`src/common/gpu_utils.py:50`), because static tile shapes must agree on every
-process. On CPU the same rule takes `M` as the node's `MemTotal` over the
-processes on the node, and a process's devices share its budget.
+### Routes and admission {#routes}
 
-Every driver's architecture section prints the rule and the bytes already
-outside the pool after the communicator warm-up, the maximum over ranks
-(`runtime.xla_memory.outside_pool_bytes`, `src/runtime/xla_memory.py:99`),
-with a warning when they exceed 0.75 of `M − R`. Nothing is sized from that
-reading.
+`lxkit.memory.admit(stage, routes, room)` is the one admission point. `routes`
+are `(name, Price)` pairs, fastest first; a `Price` has four per-rank terms,
+`operands`, `xla`, `vendor` and `outside`, each `fixed + spread/P (+ grid(P))` with
+its provenance. The fastest route that fits its room runs. When none fits, the
+cheapest runs: within the physical limit (room + reserve) with one warning; over
+it with a banner at plan time and again when the stage opens, giving the terms,
+the shortfall and `memory.sizing()`'s `minimum to complete: P = N (X nodes of …)`,
+the smallest square mesh in whole nodes at which every admitted stage's best route
+fits (or `no P suffices`, naming the term no mesh divides). A route that opens
+a provider context under `linalg = local` carries it as its `outside` term
+(`memory.contexts()`). Every decision prints once on rank 0 (`route <site>: <route>
+(<prices>)`) and the run report's Routes table lists each with its count.
 
-Every planner reads the one number `common.gpu_utils.device_budget_bytes()`,
-which the config sets when the deck resolves. kmeans, htransform, bse and
-exciton_bands have no deck key; their planners read the same owner, which
-resolves the rule on its first call. No planner reads `bytes_limit` (beyond
-the BFC cap above), free memory or a fragmentation factor.
-
-### Routes {#routes}
-
-Where a stage has a local plan (whole matrices per rank) and a distributed one
-(each matrix over the whole mesh), one predicate chooses,
-`common.gpu_utils.admit_local`: local when the local plan's full per-rank shape
-price fits the room, else distributed. The room is `B`, less the live stages
-the capacity ledger names where a stage has one. No site adds a margin of its
-own: `φ` covers what a shape price misses (XLA temporaries, fragmentation).
-Under `linalg = local` the rule withheld no room for cuSOLVERMp's contexts
-outside the pool, so a distributed fallback is charged
-`DISTRIBUTED_LINALG_OUTSIDE_BYTES` (3 GB) against the same room; when neither
-route fits, the run takes the one less over and warns, naming both prices and
-`linalg = distributed`, which reserves that room at start-up. A distributed
-plan that cannot run here (platform, mesh, build) keeps the local one, warned.
-Every decision prints once on rank 0 (`route <site>: <route> (<prices>)`) and
-the run report's Routes table lists each with its count; nothing else prints a
-route.
-
-| site | local plan admitted when | distributed plan |
-|---|---|---|
-| W Dyson, charge and photon (`gw.w_isdf._dyson_route`) | $16\mu^2(3\lceil Q/P\rceil + 2) + 48Q\mu^2/P \le B$ | `solve_lu` on the mesh |
-| SC eigh (`gw.sc_iteration._resolve_sc_eigh`) and density scan (`gw.qsgw_density.plan_density_scan`) | one $(n_b, n_b)$ tile $\le$ 1 % of `B`: $n_b \le 4.4\cdot10^3$ on A100-40GB, $6.4\cdot10^3$ on A100-80GB | cuSOLVERMp eigh, priced beside the replicated H and U; `band_2d` |
-| shared-pole line selection, whole-parent stages (`whole_parent_execution`) | the ledger row of whole parents per rank passes | the face |
-| shared-pole constructor (`constructor_execution`, `sector_route`) | the conservative recipe pencil's selection and reduction rows pass | face rounds |
-| staged eigh stacks (`staged_eigh`) and face eigh rooms (`distrib_la` `Plan.stack_route`) | route (c)'s stack price fits the room | the whole mesh |
-| head Γ GEMM (`gw.shared_pole_head._gamma_gemm_route`) | `distrib_la.fits_local` | `panel_matmul` (an XLA program; no context charged) |
-
-`linalg = distributed` forces the distributed plan at the W Dyson solve and the
-SC eigh; the shared-pole sites decide by capacity under both values. The two
-plans agree to round-off; the shared-pole Ritz and pole cuts are thresholded,
-so there they can differ by more (the pole-budget tie entry in the sandbox's
-known-issue list). claim TBD: route-equivalence gate.
+| site | routes |
+|---|---|
+| W Dyson (`gw.w_isdf._dyson_route`) | local: faces + $16\mu^2(3\lceil Q/P\rceil + 2)$; distributed: faces + one LU pair + contexts |
+| SC eigh, density scan (`gw.sc_iteration`, `gw.qsgw_density`) | one $(n_b, n_b)$ tile within 1 % of `B`; cuSOLVERMp eigh / `band_2d` |
+| shared-pole whole parents, constructor, staged eigh stacks (`gw.shared_pole_execution`) | the ledger row of the local route; the face / whole mesh + contexts |
+| head Γ GEMM (`gw.shared_pole_head._gamma_gemm_route`) | staged where `distrib_la.fits_local`; `panel_matmul` faces |
 
 ### Why the pool's reserved bytes run past R {#pool-growth}
 
@@ -678,15 +637,15 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
 
 ## Planning a run
 
-1. **Budget.** Leave `memory_per_device_gb = 0` for the memory rule, or
-   set it lower to cap the budget (a value above the rule warns).
+1. **Budget.** Leave `memory_per_device_gb = 0` for the model's budget, or
+   set it lower to cap it (a value above it warns).
 2. **Mesh.** Use a square mesh. Every chunked term and the default
    face-layout centroid copies fall as `1/P`.
 3. **Read the receipts** in `gwjax.out`: `ISDF μ-batch plan` for each ζ
    fit (the charge channel, and the current channels with `channels = 3`),
    which names its binder, and `Resident ψ` for the GW carriers.
-4. **On a `memory over budget` warning** (or an OOM after one), add ranks
-   or memory per device. For the ζ fit the smallest batch keeps ψ(G)
+4. **On a `memory over budget` warning or a `WILL NOT FIT` banner**, run at
+   the banner's `minimum to complete` or with more memory per device. For the ζ fit the smallest batch keeps ψ(G)
    resident; for V_q, more ranks, fewer centroids, or a smaller ζ sphere;
    `vq_g_chunk_size` shrinks only the panel workspace.
 5. **Compare with the run.** `gwjax.out` prints MAJOR-STAGE DEVICE AND HOST
@@ -698,20 +657,25 @@ which latency is 20 % of the call, and the all-to-all floor at `β`.
 
 ## The per-stage receipt
 
-`peak_bytes_in_use` never resets, so a stage below an earlier high-water mark
-is invisible in it. The CUDA pool behind XLA's `cuda_async` allocator keeps
-`CU_MEMPOOL_ATTR_USED_MEM_HIGH`, which a reset sets back to the bytes in use.
-`runtime.xla_memory.pool_high_water` reads and resets it at every
-`common.timing` section boundary on the main thread (two driver calls), so
-every section has its own peak on every rank. A leg without a CUDA pool (ROCm,
-jaxlib's BFC arena) reads the arena's `peak_bytes_in_use` instead, which never
-resets: a warning says so once, and a stage below an earlier mark reads as
-that mark. A planner records its price
-with `common.gpu_utils.record_stage_price(stage, bytes, section=...)`: the
-live bytes plus what it plans. What the pool cannot see: NCCL and library
-workspaces outside it (2–3 GB per rank on A100; the start-up line prints the
-maximum over ranks after warm-up), and work dispatched but not
-yet allocated at a boundary, which counts in the next section.
+Every `common.timing` section is a tracker of `lxkit.memory`. A planner books its
+price to the section that allocates it, `memory.book(price, stage=...)` (the
+shared-pole ledger's `reserve(..., runs_in=...)`); that section waits on the work
+dispatched before it, meters the allocator's high-water from the booking, waits on
+its own work, and prints one rank-0 line:
+
+```text
+memory <stage>: priced P (operands a, xla b, vendor c, outside d) | measured M | γ g
+```
+
+with `γ = measured / priced` (gate: `1/1.3 ≤ γ ≤ 1`). An increment price
+(`priced(..., increment=True)`) adds the allocator's bytes in use at entry as its
+`operands`. The reader is the leg's `peak_reader`: CUDA's pool
+`CU_MEMPOOL_ATTR_USED_MEM_HIGH`, reset at each boundary (exact); BFC's
+`peak_bytes_in_use`, which never resets, exact where the stage raised the mark
+(first raise) and otherwise a sampler thread's polled `bytes_in_use` maximum,
+printed `>=M` (a lower bound); CPU's live arrays, `live M`. Outside every reader:
+NCCL and library workspaces outside the allocator, which the `vendor` and
+`outside` terms price.
 
 Host memory is read at the same boundaries from
 `resource.getrusage(RUSAGE_SELF).ru_maxrss`, the process's resident

@@ -1735,10 +1735,6 @@ def _plan_route_g_for_channel(
 			_n_a, math.ceil(2.4 * _r) + 1))),
 		n_vertex=int(n_vertex), n_parent=n_parent,
 		orbit_width=widest_unfold_orbit(k_unfold_plan))
-	from common.gpu_utils import record_stage_price
-	record_stage_price("zeta fit, plan_zeta_route_g HWM", mubatch_plan.hwm_bytes,
-	                   section=("gw_jax.zeta_fit_chunked" if int(n_vertex) == 1
-	                            else "gw_jax.zeta_fit_transverse"))
 	if jax.process_index() == 0:
 		print_fn(mubatch_plan.format())
 	return {
@@ -2787,8 +2783,6 @@ def _prepare_fresh_coulomb(
         basis_T, bgw_v_grid_fn, centroid_indices, cfg, mem_est, mesh_xy, meta, print0, sym,
         wfn, zeta_path):
     """Produce Coulomb tensors and their canonical Gamma vectors."""
-    from gw.isdf_fitting import mem_probe as _mem_probe
-    _mem_probe("pre_v_q")
     V_qmunu, G0, head_channel, photon_g0_vectors = compute_V_q(
     	zeta_path, wfn, meta, mesh_xy, cfg,
     	mem_est=mem_est, print_fn=print0,
@@ -2800,7 +2794,6 @@ def _prepare_fresh_coulomb(
     		for channel, vector in enumerate(photon_g0_vectors))
     if debug_print_enabled():
     	jax.block_until_ready(V_qmunu)
-    _mem_probe("post_v_q")
     return (V_qmunu, G0, head_channel, photon_g0_vectors)
 
 def _write_fresh_restart(

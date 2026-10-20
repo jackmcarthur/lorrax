@@ -630,10 +630,11 @@ def _plan_rows_pass(geom: dict, *, rows: int, omega_rows: int,
             # Not even one state per device fits: run one state at the
             # narrowest r slab and warn.
             cols = 1 if fixed_local_cols is None else int(fixed_local_cols)
-            from common.gpu_utils import warn_over_budget
-            warn_over_budget(f"Galerkin fit {name} (one state)", _rows_pass_bytes(
-                geom, rows=1, fft_rows=1, local_cols=cols, omega_rows=omega_rows,
-                resident=resident), capacity)
+            from lxkit import memory
+            need = _rows_pass_bytes(geom, rows=1, fft_rows=1, local_cols=cols,
+                                    omega_rows=omega_rows, resident=resident)
+            memory.admit(f"Galerkin fit {name} (one state)",
+                         memory.priced(need, "closed form"), capacity, device=False)
             break
         groups *= 2
     fft = _largest_fit(per, lambda f: _rows_pass_bytes(
@@ -663,10 +664,11 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
         k_tile=1) <= capacity)
     if cols < 1:
         cols = 1
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"Galerkin all-states projection (band carrier {band_carrier})",
-                         _projection_bytes(geom, band_carrier=band_carrier, rank=rank,
-                                           local_cols=1, k_tile=1), capacity)
+        from lxkit import memory
+        memory.admit(f"Galerkin all-states projection (band carrier {band_carrier})",
+                     memory.priced(_projection_bytes(geom, band_carrier=band_carrier, rank=rank,
+                                                     local_cols=1, k_tile=1), "closed form"),
+                     capacity, device=False)
     groups = 1
     while True:
         per = -(-int(rows) // groups)
@@ -678,10 +680,10 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
         groups *= 2
     if x_cols < 1:
         x_cols = 1
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("Galerkin selected-row pass", _rows_pass_bytes(
-            geom, rows=per, fft_rows=1, local_cols=1, omega_rows=0,
-            resident=x_resident), capacity)
+        from lxkit import memory
+        need = _rows_pass_bytes(geom, rows=per, fft_rows=1, local_cols=1, omega_rows=0,
+                                resident=x_resident)
+        memory.admit("Galerkin selected-row pass", memory.priced(need, "closed form"), capacity, device=False)
     cols = x_cols
     k_tile = max(d for d in range(1, nk + 1) if nk % d == 0 and (
         d == 1 or _projection_bytes(
@@ -738,7 +740,7 @@ def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
     (gather, ``ifftn(norm='ortho')``, Bloch phase, output) including its
     cuFFT workspace, so every FFT batch below is priced by measurement.  The
     target is ``device_pool_limit`` itself; the run budget's headroom
-    (``runtime.planner_budget_bytes``) is the only margin.
+    (``lxkit.memory.resolve``, its reserve) is the only margin.
     """
     n_rtot = int(meta.n_rtot)
     memory = gflat_to_rchunk_aot_memory(

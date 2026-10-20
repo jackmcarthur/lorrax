@@ -30,6 +30,8 @@ plan_mod = importlib.import_module("distrib_la.plan")
 LIBRARY = {"ROCM": "slate", "CUDA": "cusolvermp"}
 
 
+
+
 @pytest.fixture
 def mesh():
     if len(jax.devices()) < 4:
@@ -48,7 +50,7 @@ def leg(request, monkeypatch):
 
 
 def _room(leg):
-    return None if leg == "ROCM" else 1 << 40          # CUDA: the room is its size bound
+    return 1 << 40          # both legs' LU are room legs: the room is the size bound
 
 
 def _lu(nb=16, n=8, seed=0):
@@ -328,11 +330,11 @@ def _fake_costs(monkeypatch, table, tmp_path, lib=None):
     return calls
 
 
-def _row(monkeypatch, bound):
+def _row(monkeypatch, bound, leg="ROCM"):
     """The ROCM solve_lu size row stood in at ``bound`` (n=8, 16 matrices, 2x2: bound 11 -> the
     round rule runs 4 rounds, 12 -> 2, the real row -> 1)."""
     rows = dict(resolve_mod.ONE_DEVICE_MAX_N)
-    rows[("solve_lu", "ROCM")] = bound
+    rows[("solve_lu", leg)] = bound
     monkeypatch.setattr(resolve_mod, "ONE_DEVICE_MAX_N", rows)
 
 
@@ -351,21 +353,18 @@ def _ledger():
 def test_the_incumbent_is_mains_route(mesh, leg, monkeypatch):
     p = _lu_plan(mesh, leg)
     lu = ((16, 8, 8), (16, 8, 8))
-    if leg == "CUDA":
-        assert plan_mod._incumbent(p, lu, False) == 0                # the library
-        return
-    assert plan_mod._incumbent(p, lu, False) == 1                    # the real row
-    assert plan_mod._incumbent(p, lu, True) == 1                     # one matrix
-    _row(monkeypatch, 11)
+    assert plan_mod._incumbent(p, lu, False) == 0                    # a room leg: the library
+    _row(monkeypatch, 11, leg)                                       # a size row stood in
     assert plan_mod._incumbent(p, lu, False) == 4
-    _row(monkeypatch, 12)
+    _row(monkeypatch, 12, leg)
     assert plan_mod._incumbent(p, lu, False) == 2
 
 
 @ROCM
 def test_a_one_round_one_device_incumbent_is_never_measured(mesh, leg, monkeypatch, tmp_path):
-    """ROCM's main route is one_device in 1 round: nothing can have fewer rounds, so nothing is
-    compiled, no library is priced and no rank exchanges anything; main's program runs."""
+    """A size-row leg whose main route is one_device in 1 round: nothing can have fewer rounds, so
+    nothing is compiled, no library is priced and no rank exchanges anything; main's program runs."""
+    _row(monkeypatch, 1 << 20)
     calls = _fake_costs(monkeypatch, {1: 100, 2: 10, 4: 1}, tmp_path, lib=1)
     asked = []
     monkeypatch.setattr(plan_mod, "_library_bytes", lambda p, a, s: asked.append(1) or 1)

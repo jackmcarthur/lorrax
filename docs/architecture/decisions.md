@@ -17,7 +17,7 @@ The GW driver's phase invariants and the per-function contracts of
 **Rule (owner).** From the card total `M` and the bytes outside the pool
 `O` (3 GB, plus 3 GB under `linalg = distributed`), the planner budget is
 `B = (M − 1.2·O)/(1 + 1.2·φ)` with `φ = 0.19`, and the XLA pool reserves
-`M − 1.2·O_max` (`runtime.planner_budget_bytes`, `runtime.pool_fraction`).
+`M − 1.2·O_max` (`lxkit.memory.resolve`, `runtime.pool_fraction`).
 There is no node term: outside bytes measured 2.8 GB at P4 and 2.2 GB at
 P64. A positive `memory_per_device_gb` can only lower the budget; above the rule
 it warns and the run keeps the rule (owner 2026-10-13).
@@ -172,7 +172,7 @@ parent stack whose whole matrices do not fit beside the live stages takes
 the distributed plan instead (`gw.shared_pole_execution.whole_parent_execution`
 for the bank's line selection, `constructor_execution` for the constructor),
 and so does a W Dyson solve whose whole matrices per rank do not fit the
-budget (owner 2026-10-13; `common.gpu_utils.admit_local`,
+budget (owner 2026-10-13; `lxkit.memory.admit`,
 [memory model § routes](memory-model.md#routes)).
 The fit is judged by the capacity ledger against `memory_per_device_gb`, so
 this choice reads the budget, unlike the [one-memory-path](#one-memory-path)
@@ -220,7 +220,7 @@ operations include a time-reversal-composed one.
 
 **Rule (owner).** No planner stops a run because a priced or compiled memory
 figure exceeds `memory_per_device_gb` or its tile. It prints one
-`RuntimeWarning` per stage kind (`common.gpu_utils.warn_over_budget`:
+`RuntimeWarning` per stage kind (`lxkit.memory.admit`:
 `memory over budget at <stage>: needs X GB/rank, budget Y GB/rank, over by
 Z GB; continuing (an OOM is possible)`), takes its smallest size and runs. The
 shared-pole capacity ledger records an over-budget row as `FAIL` and admits it

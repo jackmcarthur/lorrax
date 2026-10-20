@@ -672,8 +672,9 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
     else:
         # The smallest schedule runs: H_k(p, r') for one r' chunk and
         # T_q(G, r') stay resident on all P ranks.
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("mixed-basis pair convolution", hwm(nc, 1, 1, 1), target)
+        from lxkit import memory
+        memory.admit("mixed-basis pair convolution",
+                     memory.priced(hwm(nc, 1, 1, 1), "closed form"), target)
     cols_chunk = padded_axis(ncol, Pn * nc, name="mixed-basis r' columns").carrier // Pn // nc
     if J is None:
         J = 1

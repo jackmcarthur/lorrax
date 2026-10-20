@@ -96,6 +96,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
     def phase(name):
         """One named constructor stage; its wall adds to ``walls[name]`` (the per-map summary)."""
         started = time.monotonic()
+        if getattr(meta, "shared_pole_capacity", None) is not None:
+            meta.shared_pole_capacity.at_phase()
         with timing.section("spole." + name):
             yield
         walls[name] = walls.get(name, 0.0) + time.monotonic() - started
@@ -208,15 +210,25 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         face_batch = 1
         if execution == 'face':
             from gw.shared_pole_capacity import check_eigh_room, face_eigh_room
-            from gw.shared_pole_execution import face_batch_width, face_reduction_bytes, face_ritz_carrier
+            from gw.shared_pole_execution import (face_batch_width, face_reduction_bytes, face_ritz_carrier,
+                                                  face_round_compiled_bytes)
             keep_budget = recipe.get("pole_budget")
+            # The conservative round's infinity carrier and its block in the pencil side
+            # (constructor_side_upper_bound), for the width's compiled admission.
+            infinity_cap = column_extent(max(1, int(recipe["infinity_width"])))
+            infinity_block = (2 * infinity_cap if odd_moments else 0) if ordered else infinity_cap
             sizing = dict(rows=n, side=conservative_side,
                           carrier=face_ritz_carrier(mesh_xy, keep_budget) if ordered else None)
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, nq=nq,
                 selection=dict(sample_batch=len(dense_fit), selection_faces=selection_faces),
-                program_bytes=lambda width: face_reduction_bytes(mesh_xy, width, **sizing))
+                program_bytes=lambda width: face_reduction_bytes(mesh_xy, width, **sizing),
+                compiled=lambda width, room: face_round_compiled_bytes(
+                    mesh_xy, width, rows=n, finite=conservative_side - infinity_block, infinity_width=infinity_cap,
+                    infinities=1 + len(moment_fields), ordered=ordered, odd_moments=odd_moments,
+                    keep_budget=keep_budget, carrier=sizing['carrier'],
+                    eigh_backend=resolution.eigh_backend, room=room))
             # Every face round's reduction is priced at this size.
             budget.program_bytes = execution_receipt['face_batch']['program_bytes_per_rank']
             # distrib_la decides each eigh stack against the room beside the
@@ -303,16 +315,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 # Resolve before either reduction program is traced; the ledger
                 # warns when the route price is over the budget.
                 local_eigh = budget.eigenplan(side)
-                # The reservation prices this round's program at its actual side, not the batch's
-                # conservative one (run30k: 48640 vs 84480, 137.9 -> 64 GB/rank); the eigh rooms
-                # below still subtract the admitted (conservative) program.
+                # The reservation holds the round's operands; a face round's program is priced by
+                # its compiled figure where it runs (face_reduce_round). The eigh rooms below still
+                # subtract the admitted (conservative) program.
                 admitted = budget.program_bytes
                 try:
-                    if execution == 'face':
-                        from gw.shared_pole_execution import face_reduction_bytes
-                        budget.program_bytes = face_reduction_bytes(mesh_xy, len(ids), **dict(sizing, side=side))
-                    budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
-                        round_states, infinity, widths, infinity_width))
+                    budget.program_bytes = 0          # the round program: its compiled figure
+                    reduction_row = budget.plan(side, phase="reduction", padding_output_bytes_per_rank=round_padding_output_bytes(
+                        round_states, infinity, widths, infinity_width), runs_in="spole.gram_reduction")
                 finally:
                     budget.program_bytes = admitted
                 round_states, infinity = pad_states(round_states, widths, infinity, infinity_width)
@@ -332,12 +342,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                         round_states, infinity, tables, mesh=mesh_xy,
                         budget=budget, ordered=ordered, odd_moments=odd_moments,
                         keep_budget=keep_budget, eigh_backend=resolution.eigh_backend,
-                        admit=False, room=room, carrier=sizing['carrier'])
+                        admit=False, room=room, carrier=sizing['carrier'],
+                        beside=budget.ledger.price(reduction_row))
                 else:
                     round_model, round_signed, vectors, round_diagnostics = reduce_round(
                         round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
                         native_eigh=local_eigh.native_fn, ordered=ordered,
-                        odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
+                        odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"),
+                        beside=budget.ledger.price(reduction_row))
                 qi = infinity[0]
                 # One device-to-host read of the round's replicated diagnostics and vectors.
                 from gw.shared_pole_local import host_tree

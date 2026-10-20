@@ -238,10 +238,12 @@ def _metric_chunk_plan(
     if per_k > budget // 2:
         # One k runs: this route band-shards psi but does not spatially
         # shard the replicated D_k(r).
-        from common.gpu_utils import device_budget_bytes, warn_over_budget
+        from common.gpu_utils import device_budget_bytes
+        from lxkit import memory
         if per_k + budget // 2 > device_budget_bytes():
-            warn_over_budget("centroid feature metric (one k)",
-                             per_k + budget // 2, device_budget_bytes())
+            memory.admit("centroid feature metric (one k)",
+                         memory.priced(per_k + budget // 2, "closed form"),
+                         device_budget_bytes())
     k_chunk = bounded_partition_tile(
         int(n_parents), max(1, (budget // 2) // per_k), 1)
     return max(1, k_chunk), band_chunk, budget

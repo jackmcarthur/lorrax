@@ -452,12 +452,16 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
     if q_fit < 1:
         # One q runs: the output accumulator beside one q's ζ face (device),
         # or one q's read staging (host), is over its budget.
-        from common.gpu_utils import warn_over_budget
+        from lxkit import memory
         if host_per_q > host_budget_bytes:
-            warn_over_budget("V_q host read staging (one q)", host_per_q, host_budget_bytes)
+            memory.admit("V_q host read staging (one q)",
+                         memory.priced(host_per_q, "closed form"), host_budget_bytes,
+                         device=False)
         else:
-            warn_over_budget("V_q tile (one q)", resident + work + per_q,
-                             TILE_BYTES if budget_bytes is None else budget_bytes)
+            memory.admit("V_q tile (one q)",
+                         memory.priced(resident + work + per_q, "closed form"),
+                         TILE_BYTES if budget_bytes is None else budget_bytes,
+                         device=budget_bytes is not None)
         q_fit = 1
     q_max = min(int(n_q), q_fit)
     n_tiles = -(-int(n_q) // q_max)
@@ -767,7 +771,7 @@ def _compute_V_q_g_flat_tiles(
         s['v'] = v
 
     # ---- G panel and q-tile from the V_q budget ------------------------
-    from common.gpu_utils import record_stage_price
+    from lxkit import memory
     budget = _vq_budget_bytes(budget_bytes)
     # A ζ q-tile read stages each rank's slab in its phdf5 file context's host
     # buffer (``ctx->read_buf``); the context retires a buffer above 32 MiB
@@ -779,7 +783,8 @@ def _compute_V_q_g_flat_tiles(
               n_sub=n_sub if s['one_leg'] else 0) for s in specs],
         rows=mu_pad, n_q=n_q_ibz, ngkmax=ngkmax, mesh_xy=mesh_xy,
         g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
-    record_stage_price(f"V_q, vq_tile_bytes q_tile={q_tile}", priced['priced'])
+    memory.book(memory.priced(priced['priced'], f"V_q, vq_tile_bytes q_tile={q_tile}",
+                              increment=True))
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:

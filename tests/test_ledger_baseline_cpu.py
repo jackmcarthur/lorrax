@@ -16,8 +16,9 @@ BUDGET, BASELINE = 63_414_637_611, 3_130_000_000
 
 def test_the_baseline_is_taken_from_every_admission_and_room(monkeypatch):
     prices = []
-    from common import gpu_utils
-    monkeypatch.setattr(gpu_utils, "record_stage_price", lambda stage, b: prices.append((stage, b)))
+    from lxkit import memory
+    monkeypatch.setattr(memory, "book", lambda price, stage=None: prices.append(
+        (price.label, price.bytes())))
     bare = CapacityLedger(META, mesh_xy=MESH, device_budget_bytes=BUDGET)
     held = CapacityLedger(META, mesh_xy=MESH, device_budget_bytes=BUDGET, baseline_bytes=BASELINE)
     a = bare.preview(resident_bytes_per_rank=10**9, workspace_bytes_per_rank=0)
@@ -29,7 +30,7 @@ def test_the_baseline_is_taken_from_every_admission_and_room(monkeypatch):
     # Over budget only beside the baseline: warned and admitted, status FAIL.
     over = held.preview(resident_bytes_per_rank=BUDGET - BASELINE + 1, workspace_bytes_per_rank=0)
     assert over["device_budget_status"] == "FAIL"
-    # Prices are recorded as the pool measures them, the label naming the baseline.
+    # One price per row: its own bytes and live rows (spread) beside the baseline (fixed).
     held.reserve("head:0", resident_bytes_per_rank=6_600_000_000, workspace_bytes_per_rank=0)
     bare.reserve("head:0", resident_bytes_per_rank=6_600_000_000, workspace_bytes_per_rank=0)
     assert prices == [("shared-pole ledger + 3.13 GB baseline", 6_600_000_000 + BASELINE),

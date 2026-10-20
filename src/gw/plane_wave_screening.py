@@ -363,8 +363,9 @@ class SphereScreening:
             if need <= budget_bytes:
                 return n_c
         # One wedge row per chunk runs (the response sphere carrier M at P).
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("plane-wave screening (one wedge row)", need, budget_bytes)
+        from lxkit import memory
+        memory.admit("plane-wave screening (one wedge row)",
+                     memory.priced(need, "closed form"), budget_bytes)
         return n_q
 
     # ------------------------------------------------------------------ receipt

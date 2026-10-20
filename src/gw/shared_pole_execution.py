@@ -100,17 +100,19 @@ def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     return int(resident), int(workspace)
 
 
-def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole parents"):
+def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole parents", whole=0):
     """'local' when whole parents per rank fit the ledger beside its live stages, else 'face'.
 
     ``price(execution)`` returns the route's ``(resident, workspace)`` bytes per
     rank; ``carry`` is a resident the work runs beside. The face is the full
     mesh, one parent after another, priced only when the local route does not
     fit (its plan opens the provider). Decided and recorded by
-    ``common.gpu_utils.admit_local``. Returns ``(execution, resident,
-    workspace)``, the prices of the chosen route.
+    ``lxkit.memory.admit``. Returns ``(execution, resident,
+    workspace)``, the prices of the chosen route. ``whole``: the side of the parents a rank holds
+    whole on the local route (the face is its distributed backup, ``memory.require_backup``).
     """
-    from common.gpu_utils import admit_local
+    import dataclasses
+    from lxkit import memory
     prices = {}
 
     def aggregate(execution):
@@ -119,10 +121,11 @@ def whole_parent_execution(price, *, ledger, carry=0, site="shared-pole whole pa
                               workspace_bytes_per_rank=workspace,
                               concurrent_with=ledger.live_stages)
     row = aggregate('local')
-    local = admit_local(site, row['aggregate_bytes_per_rank'], row['available_device_bytes_per_rank'],
-                        distributed_bytes=lambda: aggregate('face')['aggregate_bytes_per_rank'],
-                        names=('local', 'face'))
-    execution = 'local' if local else 'face'
+    execution = memory.admit(site, (
+        ('local', dataclasses.replace(ledger.price(row), whole=int(whole))),
+        ('face', lambda: ledger.price(aggregate('face'))
+         + memory.Price(outside=memory.contexts()))),
+        row['available_device_bytes_per_rank'])
     if execution not in prices:
         aggregate(execution)
     return (execution, *prices[execution])
@@ -134,7 +137,8 @@ def line_selection_execution(rows, *, mesh, ledger, nq, eigh_backend, carry=0):
     return whole_parent_execution(
         lambda execution: line_selection_price(rows, mesh=mesh, nq=nq, execution=execution,
                                                eigh_backend=eigh_backend),
-        ledger=ledger, carry=carry, site=f"shared-pole line selection {int(nq)} parents")
+        ledger=ledger, carry=carry, site=f"shared-pole line selection {int(nq)} parents",
+        whole=max(map(int, rows)))
 
 
 def line_selection_room(ledger, resident, *, carry=0):
@@ -231,29 +235,32 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     reduction_phase = 'cross_reduction' if cross_original_sides is not None else 'reduction'
     reduction_args = (dict(cross_original_sides=cross_original_sides)
                       if cross_original_sides is not None else {})
-    from common.gpu_utils import admit_local, last_decision
+    import dataclasses
+    from lxkit import memory
+    decision = {}
 
     def admitted(rows):
         # The face's own batch fills the room later (face_batch_width), so its
         # price here is the provider's contexts alone; the caller records the
         # map's final route.
-        need = max(row['aggregate_bytes_per_rank'] for row in rows)
-        return admit_local('shared-pole constructor', need, rows[0]['available_device_bytes_per_rank'],
-                           names=('local', 'face'), quiet=True)
+        decision.update(memory.admit('shared-pole constructor', (
+            ('local', dataclasses.replace(ledger.price(max(rows, key=lambda r: r['aggregate_bytes_per_rank'])),
+                                          whole=int(side))),
+            ('face', memory.Price(outside=memory.contexts()))),
+            rows[0]['available_device_bytes_per_rank'], quiet=True, detail=True))
+        return decision['route'] == 'local'
     receipt = dict(requested_layout=resolution.layout, conservative_pencil_side=side,
                    selection_face_count=selection_faces,
                    retained_output_upper_bound_bytes_per_rank=retained_outputs)
     resident_rows = (resident_preview('selection', **selection_args),
                      resident_preview(reduction_phase, **reduction_args))
     if not admitted(resident_rows):
-        decision = last_decision()
         return decision['route'], dict(
             receipt, reason='local resident lower bound: ' + decision['reason'],
             warning=decision['warning'],
             local_selection=resident_rows[0], local_reduction=resident_rows[1])
     rows = (preview('selection', **selection_args), preview(reduction_phase, **reduction_args))
     local = admitted(rows)
-    decision = last_decision()
     return ('local' if local else 'face'), dict(
         receipt, reason=('capacity-admitted local parent: ' if local else
                          'local parent: ') + decision['reason'],
@@ -350,7 +357,9 @@ def face_program(fn, mesh, *, outputs='matrices'):
                 raise ValueError('unknown explicit constructor output contract '+outputs)
             compiled[signature]=distrib_la.checked_program(fn,mesh,out,compiler_options=FACE_COMPILER_OPTIONS)
         return compiled[signature]
-    return lambda *args: program(*args)(*args)
+    run = lambda *args: program(*args)(*args)
+    run.checked = program
+    return run
 
 
 @lru_cache(maxsize=None)
@@ -439,11 +448,12 @@ def face_ritz_carrier(mesh, keep_budget):
 
 @lru_cache(maxsize=None)
 def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None,eigh_plan=None,
-                        carrier=None):
+                        carrier=None,room=None):
     """Retained static-layout executable builder; all state values are operands.
 
     ``eigh_plan`` (``face_eigh`` at the reduction's room) decides the pencil's
-    eigh stacks, and the program is keyed on it. ``carrier``
+    eigh stacks; ``room`` (:func:`plan_room`) keys the program with it, since plan
+    equality ignores the room the stacks were decided in. ``carrier``
     (``face_ritz_carrier``) solves an ordered pencil's kept span on that many
     columns, None keeping the whole H'_vv side. The state columns arrive packed
     (``shared_pole_local.pack_panels``), so the program's shape is the round's
@@ -470,7 +480,8 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
 
 
 def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
-                      keep_budget,eigh_backend,room,retain_span=False,admit=True,gram_keep=None,carrier=None):
+                      keep_budget,eigh_backend,room,retain_span=False,admit=True,gram_keep=None,carrier=None,
+                      beside=None):
     """A fixed-width batch of parents with every matrix tiled over all ranks.
 
     ``room`` is the room the pencil's eigh stacks are decided against
@@ -488,7 +499,7 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
         budget.plan(side,phase='reduction')
     program=lambda room: face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
                                              face_eigh(mesh,side,room=room,backend=eigh_backend),
-                                             None if carrier is None else int(carrier))
+                                             None if carrier is None else int(carrier),plan_room(room))
     from gw.shared_pole_local import pack_panels
     packed=pack_panels(tuple([s[k] for s in states] for k in (1,2,3)),tables['order'],
                        [int(s[1].shape[-1]) for s in states],mesh_xy=mesh,layout='face')
@@ -496,18 +507,58 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     if callable(room):
         room=room(face_reduction_bytes(mesh,int(tables['active'].shape[0]),rows=int(states[0][1].shape[-2]),
                                        side=side,carrier=carrier,retain_span=retain_span))
-    result=program(room)(*args)
+    executable,run=program(room).checked(*args).compiled(*args)
+    if beside is not None:
+        price_round(executable,mesh,beside)
+    result=run(*args)
     model,signed,diagnostics=result[:3]
     output=model,signed,model[1:],diagnostics
     return (*output,result[3]) if retain_span else output
 
 
+_COMPILED_ROUNDS: dict = {}
+
+
+def compiled_for(program, args):
+    """``program`` lowered and compiled at ``args`` (never run here), once per signature."""
+    import jax
+    key = (program, tuple((tuple(a.shape), str(a.dtype), str(getattr(a, "sharding", None)))
+                          for a in jax.tree.leaves(args)))
+    if key not in _COMPILED_ROUNDS:
+        _COMPILED_ROUNDS[key] = program.lower(*args).compile()
+    return _COMPILED_ROUNDS[key]
+
+
+def price_round(executable, mesh, beside, whole=False):
+    """Admit and book a reduction round at the executable that runs (``memory_analysis``)
+    beside the reservation that holds its operands (``beside``, a ledger Price), in the open
+    stage.  A face round's figure is face-sharded; a local round's (``whole``: whole parents per
+    rank) holds at any P."""
+    from lxkit import memory
+    from runtime.aot_memory import compiled_new_bytes
+    ranks, got = int(mesh.size), float(compiled_new_bytes(executable))
+    part = memory.Price(xla=memory.Term(got if whole else 0.0, 0.0 if whole else got * ranks,
+                                        source=f"{'local' if whole else 'face'} round program "
+                                               "(memory_analysis temp + outputs - alias)"),
+                        ranks=ranks, label="reduction round executable")
+    memory.admit("shared-pole reduction round", beside + part, memory.budget())
+    memory.book(part)
+
+
+def plan_room(room):
+    """A face program's cache key for the room its eigh plan decides stacks in (a room, a
+    ``RoomExhausted`` or a plan): plans that differ only by room compare equal."""
+    room = getattr(room, "budget_bytes", room)
+    return (int(room or 0), type(room).__name__)
+
+
 @lru_cache(maxsize=None)
-def face_round_check_program(mesh, ordered, eigh_plan):
+def face_round_check_program(mesh, ordered, eigh_plan, room=None):
     """Whole-mesh adapter for the scalar model's existing gate equations.
 
     ``eigh_plan`` is the n x n plan (``face_eigh``); distrib_la decides from
-    its room whether the passivity eighs run on the mesh or one per rank.
+    its room whether the passivity eighs run on the mesh or one per rank;
+    ``room`` (:func:`plan_room`) keys the program with it.
     """
     from gw.shared_pole_local import _round_check_equations
     from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1,
@@ -555,6 +606,27 @@ def _face_price(mesh, rows, width, side, phase, **terms):
     return FACE_PROGRAM_COPIES * int(price['terms_bytes_per_rank']['phase_dense_temporaries'])
 
 
+def face_round_compiled_bytes(mesh, width, *, rows, finite, infinity_width, infinities, ordered,
+                              odd_moments, keep_budget, carrier, eigh_backend, room):
+    """Per-rank bytes of ``face_parent_program`` for ``width`` parents, compiled (temp + outputs
+    - alias; never run) at abstract operands of the round's layout: ``finite`` packed columns of
+    ``rows`` rows (Q, WQ, dWQ on the face), ``infinities`` infinity panels of ``infinity_width``,
+    the pencil side ``finite`` plus the infinity block, its eighs decided in ``room``."""
+    import jax
+    from runtime.aot_memory import compiled_new_bytes
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    block = (2 * int(infinity_width) if odd_moments else 0) if ordered else int(infinity_width)
+    side, b, n = int(finite) + block, int(width), int(rows)
+    panel = lambda f: jax.ShapeDtypeStruct((b, n, int(f)), np.complex128, sharding=face)
+    args = (jax.ShapeDtypeStruct((b, int(finite)), np.complex128),
+            jax.ShapeDtypeStruct((b, side), np.bool_), *(panel(finite) for _ in range(3)),
+            tuple(panel(infinity_width) for _ in range(int(infinities))))
+    plan = face_eigh(mesh, side, room=room, backend=eigh_backend)
+    program = face_parent_program(mesh, bool(ordered), bool(odd_moments), keep_budget, False, side,
+                                  None, plan, None if carrier is None else int(carrier), plan_room(plan))
+    return int(compiled_new_bytes(program.checked(*args).compiled(*args)[0]))
+
+
 def face_reduction_bytes(mesh, width, *, rows, side, carrier, retain_span=False):
     """Price of ``face_parent_program`` for ``width`` parents of ``rows`` at a pencil
     ``side``: an ordered pencil's kept span on ``carrier`` columns
@@ -577,7 +649,7 @@ def face_check_bytes(mesh, rows, side):
 
 
 def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, program_bytes,
-                     selection=None, extra=lambda width: 0, eigen_side=None):
+                     selection=None, extra=lambda width: 0, eigen_side=None, compiled=None):
     """Largest whole-mesh parent batch whose selection and reduction fit.
 
     The scalar face route runs a batch of physical parents per round, every
@@ -586,9 +658,10 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
     any bank read, at the conservative recipe side, the ``selection`` price
     (its ``quote`` arguments) may reject a width; the reduction program's
     price at that width (``program_bytes(width)``: ``shared_pole_byte_terms``
-    tiled over the mesh, the same on every rank), beside ``extra(width)``
-    resident bytes, admits it. Nothing is compiled to be measured, so every
-    rank prices the same shapes. Widths start at every parent, so a deck that
+    tiled over the mesh) proposes it and the eigh room beside it; ``compiled(width,
+    room)``, the program compiled at that width's abstract operands, admits it,
+    beside ``extra(width)`` resident bytes (the formula alone where this host has
+    no whole-mesh eigh for an exhausted room). Every rank compiles the same shapes. Widths start at every parent, so a deck that
     fits runs one round and compiles each program once per shape, and step
     down in proportion to the whole price. The constructor still admits every
     phase at its actual side.
@@ -611,6 +684,17 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
             continue
         price = budget.program_bytes = max(1, int(program_bytes(width)))
         reduction = row('reduction', extra(width), eigen_side=eigen_side)
+        if compiled is not None:
+            from gw.shared_pole_capacity import face_eigh_room
+            try:     # no room beside the proposal: its eighs on the whole mesh (minimum footprint)
+                got = compiled(width, face_eigh_room(reduction, stage="shared-pole constructor batch admission"))
+            except RuntimeError as exc:                        # no whole-mesh eigh on this host
+                if "eigh_capacity_route" not in str(exc):
+                    raise
+                got = None
+            if got is not None:
+                price = budget.program_bytes = max(1, int(got))
+                reduction = row('reduction', extra(width), eigen_side=eigen_side)
         receipt = dict(parent_batch=width, program_bytes_per_rank=price, selection=picked, reduction=reduction)
         if reduction['device_budget_status'] == 'PASS' or width == 1:
             return width, receipt
@@ -755,11 +839,11 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
     """The plan of one staged eigh stack ``stack`` (nb, n, n): route (c), whole matrices per rank,
     when its shape price (``distrib_la.eigh_stack_bytes``) beside ``beside`` bytes per rank and
     the ``live`` ledger stages fits the budget; otherwise the whole mesh
-    (``common.gpu_utils.admit_local``, which records the route). Shapes and the
+    (``lxkit.memory.admit``, which records the route). Shapes and the
     deck budget only, so every rank decides alike. ``backend`` is the deck's
     eigh request (``LinalgResolution.eigh_backend``) for the whole mesh."""
     import distrib_la
-    from common.gpu_utils import admit_local
+    from lxkit import memory
     from gw.shared_pole_capacity import _local_eigenplan
     n = int(stack[-1])
     local = _local_eigenplan(mesh, n)
@@ -773,9 +857,13 @@ def staged_eigh(mesh, stack, beside, *, ledger, live, label, backend):
                      + distrib_la.eigh_stack_bytes(mesh_plan, stack, np.complex128))
     except RuntimeError as refusal:      # no whole-mesh library here: route (c) or that refusal
         mesh_plan, no_mesh, mesh_need = None, refusal, 0
-    if admit_local(f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2",
-                   row['aggregate_bytes_per_rank'], row['available_device_bytes_per_rank'],
-                   distributed_bytes=mesh_need, names=('route (c)', 'whole mesh')):
+    site = f"shared-pole {label} eigh stack {int(stack[0])} x {n}^2"
+    mesh_row = dict(row, aggregate_bytes_per_rank=mesh_need, workspace_bytes_per_rank=0,
+                    resident_bytes_per_rank=mesh_need - row['aggregate_bytes_per_rank'] + need)
+    if memory.admit(site, (
+            ('route (c)', ledger.price(row)),
+            ('whole mesh', ledger.price(mesh_row) + memory.Price(outside=memory.contexts()))),
+            row['available_device_bytes_per_rank']) == 'route (c)':
         return local
     if no_mesh is not None:
         raise no_mesh

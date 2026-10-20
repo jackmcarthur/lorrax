@@ -277,3 +277,35 @@ def test_scalar_face_round_matches_local(monkeypatch):
     assert np.allclose(np.where(la, lp, 0), np.where(fa, fp, 0), rtol=1e-8, atol=1e-10)
     for p in range(q):
         assert np.allclose(lb[p] @ np.conj(lb[p].T), fb[p] @ np.conj(fb[p].T), rtol=1e-7, atol=1e-9), p
+
+
+def test_face_width_compile_matches_the_round(monkeypatch):
+    """The width admission's program (``face_round_compiled_bytes``, abstract operands at the
+    round's layout) compiles to the figure of the face round that runs (``price_round``)."""
+    mesh = _mesh()
+    import gw.shared_pole_execution as ex
+    from gw.shared_pole_capacity import _local_eigenplan
+    from gw.shared_pole_directions import port_extent
+    from lxkit import memory
+    monkeypatch.setattr(ex, "face_eigh", lambda mesh_, n, room=None, backend=None: _local_eigenplan(mesh_, int(n)))
+    from runtime.aot_memory import compiled_new_bytes
+    got = []
+    monkeypatch.setattr(ex, "price_round", lambda executable, mesh_, beside, whole=False:
+                        got.append(int(compiled_new_bytes(executable))))
+    memory.set_budget(1e12)
+    extent = port_extent(mesh)
+    states, infinity, tables, _ = _pencil(mesh, seed=2)
+    width, iw = extent(4), extent(2)
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    put = lambda a: jax.device_put(np.asarray(a), face)
+    fs = [(s[0], put(_pad(s[1], width)), put(_pad(s[2], width)), put(_pad(s[3], width))) for s in states]
+    fi = tuple(put(_pad(a, iw)) for a in infinity)
+    carrier = ex.face_ritz_carrier(mesh, 8)
+    ex.face_reduce_round(fs, fi, tables, mesh=mesh, budget=None, ordered=True, odd_moments=True, keep_budget=8,
+                         eigh_backend="auto", room=1 << 30, admit=False, carrier=carrier,
+                         beside=memory.Price())
+    abstract = ex.face_round_compiled_bytes(
+        mesh, len(tables["points"]), rows=int(fs[0][1].shape[-2]), finite=int(tables["points"].shape[-1]),
+        infinity_width=iw, infinities=len(fi), ordered=True, odd_moments=True, keep_budget=8,
+        carrier=carrier, eigh_backend="auto", room=1 << 30)
+    assert got and got[0] == abstract > 0

@@ -116,6 +116,8 @@ def set_trace_sink(sink=None) -> None:
     """Route stage cadence through the active driver's scientific report."""
     global _TRACE_SINK
     _TRACE_SINK = sink
+    from lxkit import memory
+    memory.set_sink(sink)
 
 
 def _trace(msg: str) -> None:
@@ -146,34 +148,21 @@ def _exc_text(error: BaseException | None) -> str:
 	return f"{type(error).__name__}: {first[:200]}" if first else type(error).__name__
 
 # ---------------------------------------------------------------------------
-# DEVICE PEAK PER SECTION.  At every section boundary on the main thread the
-# pool high-water mark since the previous boundary is read and reset
-# (``runtime.xla_memory.pool_high_water``: two driver calls).  That interval
-# belongs to the section on top of the stack; a section's own peak is the max
-# over its intervals and its children's, so every section, not only the one
-# that raised the run's high-water mark, has its own peak on every rank.
-# Work dispatched but not yet allocated at a boundary counts in the next one.
+# DEVICE PEAK PER SECTION.  Every section is a tracker of ``lxkit.memory``: at
+# each section boundary on the main thread the allocator high-water mark since
+# the previous boundary is read (CUDA: reset), and that interval belongs to
+# every open section and, as its own peak, to the innermost.  A section with a
+# price booked to its name is a priced stage: it blocks on the work before and
+# inside it, and prints its receipt (``lxkit.memory``).
 # ---------------------------------------------------------------------------
-_MEM_COST = [0, 0.0]          # boundary reads, seconds spent in them
-
-
-def _device_high_water(section: "TimingSection") -> int | None:
-	if threading.current_thread() is not threading.main_thread():
-		return None
-	t0 = time.perf_counter()
-	try:
-		from runtime.xla_memory import pool_high_water
-		return pool_high_water(reset=True)
-	except Exception:          # noqa: BLE001 — never take down the run
-		return None
-	finally:
-		_MEM_COST[0] += 1
-		_MEM_COST[1] += time.perf_counter() - t0
+_MEM_COST = [0, 0.0]          # host boundary reads' seconds (device: lxkit.memory)
 
 
 def instrument_cost() -> tuple[int, float]:
 	"""(boundary reads, seconds) the per-section device and host peaks have cost this process."""
-	return int(_MEM_COST[0]), float(_MEM_COST[1])
+	from lxkit import memory
+	reads, seconds = memory.instrument_cost()
+	return reads, seconds + float(_MEM_COST[1])
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +233,7 @@ class TimingNode:
 
 class TimingSection:
 	__slots__ = ("collector", "node", "stack", "start", "child_elapsed",
-	             "_watchers", "announce", "label", "mem_own", "mem_self",
-	             "host_rise")
+	             "_watchers", "announce", "label", "tracker", "host_rise")
 
 	def __init__(self, collector: "TimingCollector", node: TimingNode,
 	             stack: list["TimingSection"], *, announce: bool = False,
@@ -262,8 +250,7 @@ class TimingSection:
 		# (the tree/report always keeps the node name).
 		self.announce = announce
 		self.label = label
-		self.mem_own = -1
-		self.mem_self = -1
+		self.tracker = None
 		self.host_rise = 0
 
 	def _display_name(self) -> str:
@@ -274,7 +261,14 @@ class TimingSection:
 		        or (self.announce and _rank0()))
 
 	def __enter__(self) -> "TimingSection":
-		return self.collector._enter(self)
+		# Outside the collector lock: a priced stage's entry wait must not stall heartbeats.
+		from lxkit import memory
+		self.tracker = memory.open_tracker(self.node.name)
+		try:
+			return self.collector._enter(self)
+		except BaseException:
+			memory.close_tracker(self.tracker)
+			raise
 
 	def __exit__(self, exc_type, exc, tb) -> None:
 		# Keep cadence alive while a watcher synchronizes asynchronous JAX work.
@@ -290,6 +284,12 @@ class TimingSection:
 			watcher_failed = True
 			raise
 		finally:
+			from lxkit import memory
+			whole, own, _ = memory.close_tracker(self.tracker)
+			if whole >= 0:
+				self.node.peak = max(self.node.peak, whole)
+			if own >= 0:
+				self.node.peak_self = max(self.node.peak_self, own)
 			end = time.perf_counter()
 			self.collector._leave(
 				self, end=end,
@@ -394,12 +394,6 @@ class TimingCollector:
 				if section._cadence_on():
 					_safe_trace("  " * (len(section.stack) - 1)
 					            + f"-> {section._display_name()}")
-				high = _device_high_water(section)
-				if high is not None and len(section.stack) > 1:
-					parent = section.stack[-2]
-					parent.mem_own = max(parent.mem_own, high)
-					parent.mem_self = max(parent.mem_self, high)
-				section.mem_own = section.mem_self = -1
 				host = _host_high_water()
 				if host is not None and len(section.stack) > 1:
 					section.stack[-2].host_rise += host[1]
@@ -433,13 +427,6 @@ class TimingCollector:
 			self._heartbeat_sections.pop(section, None)
 			self._active_sections.discard(section)
 			section.node.record(inclusive, max(0.0, exclusive))
-			high = _device_high_water(section)
-			if high is not None:
-				section.mem_own = max(section.mem_own, high)
-				section.mem_self = max(section.mem_self, high)
-				node = section.node
-				node.peak = max(node.peak, section.mem_own)
-				node.peak_self = max(node.peak_self, section.mem_self)
 			host = _host_high_water()
 			if host is not None:
 				section.node.host = max(section.node.host, host[0])
@@ -447,8 +434,6 @@ class TimingCollector:
 			section.stack.pop()
 			if section.stack:
 				section.stack[-1].child_elapsed += inclusive
-				section.stack[-1].mem_own = max(section.stack[-1].mem_own,
-				                                section.mem_own)
 			self._heartbeat_condition.notify_all()
 			# State is already clean if the ordinary foreground print sink fails.
 			# Holding the same lock as the scheduler preserves exit ordering.
@@ -645,6 +630,18 @@ class TimingCollector:
 				node.peak_self_ranks = [nan(row[1]) for row in hit]
 				node.host_ranks = [nan(row[2]) for row in hit]
 				node.host_rise_ranks = [nan(row[3]) for row in hit]
+		# Every rank's receipt figure per priced stage (lxkit.memory), the same way.
+		from lxkit import memory
+		rows = memory.receipts()
+		local = np.array([(key((r["stage"],)), int(r["measured"])) for r in rows],
+		                 dtype=np.int64).reshape(-1, 2)
+		counts = np.asarray(all_gather_processes(np.asarray(len(local), dtype=np.int64))).reshape(-1)
+		padded = np.full((max(1, int(counts.max(initial=0))), 2), -1, dtype=np.int64)
+		padded[:len(local)] = local
+		table = np.asarray(all_gather_processes(padded))
+		ranks = [dict(table[r, :int(counts[r])].tolist()) for r in range(len(counts))]
+		for row in rows:
+			row["measured_ranks"] = [nan(rank.get(key((row["stage"],)), -1)) for rank in ranks]
 
 	def format(self, **kwargs) -> list[str]:
 		_, rows = self._rows(kwargs.get("min_percent"), kwargs.get("max_depth"))
