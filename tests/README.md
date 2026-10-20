@@ -70,6 +70,10 @@ A new test needs no bootstrap import of its own.
 - `tdagw/cri3_full_microscopic/`: archived full-native campaign preparation,
   observation/plotting and bounded reduced-pencil timing helpers; prepared,
   not a completed trajectory or model admission.
+- `tdagw/cri3_full_microscopic/test_analyze_reference_cost.py`: tiny read-only
+  production-SC log parser checks. Reports individual map walls and literal
+  quadrature counts without inferring synchronized device-kernel timings,
+  fixed-state warm timings, reference-state authentication or model admission.
 - `tdagw/full_microscopic_saved_state.py`: P4 compute-node saved-state native
   proof. `--chi0-active LO:HI` selects a numerical response partition only;
   `--stop-after-model-q 0` retains a frequency-only diagnostic and never
