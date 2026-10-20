@@ -348,9 +348,11 @@ $A_{\rm in}(1-\rho)+(1-\rho)A_{\rm in}^\dagger
 -A_{\rm out}\rho-\rho A_{\rm out}^\dagger$, since
 $A_{\rm in}+A_{\rm out}=i(R_p+R_h)$. Moving
 $\operatorname{Herm}M$ into the coherent Hamiltonian removes its commutator
-from the collision. The static screened-exchange response already present in
-$K\delta\rho$ must also be removed from the added coherent correction, using
-the same full density matrix and equilibrium $W_0$. A time-ordered total or
+from the collision. In the legacy frozen-screening path, the static
+screened-exchange response already present in $K\delta\rho$ must also be
+removed from the added coherent correction, using the same full density matrix
+and equilibrium $W_0$. Joint screening instead uses bare HF increments and
+requires no such static subtraction. A time-ordered total or
 the Hermitian part of an arithmetic on-shell average is not this $M$.
 
 **Optional counterterm.** `raw` uses $C_{\rm diss}[\rho]=
@@ -390,6 +392,20 @@ derivation of a full nonequilibrium collision operator.
   but it is a different closure, not a repair of Eq. (8). Negative dissipative
   substeps in the cfm4 triple jump would still prevent a guarantee for the
   composed numerical flow; a guaranteed mode needs forward dissipative steps.
+  This is not only a warning about arbitrary held matrices: an exact rational
+  three-state GW/RPA snapshot with Hermitian reciprocal density vertices,
+  positive bare interaction, positive lesser/greater spectra and zero trace
+  collision can still point outward on the actual current-density boundary.
+  For example, in units with an electronic splitting of one, take
+  $H=\mathrm{diag}(0,1,0.37)$,
+  $\rho=|+\rangle\langle+|\oplus\tfrac12$ and
+  $V=0.1\,[\begin{smallmatrix}a&1\\1&-a\end{smallmatrix}]
+  \oplus0.2\sqrt{0.3-a^2}$, $a=0.4\gamma^2$.
+  At $\gamma=0.05$, $\eta_{\rm coll}=0.01$, the empty/filled eigenvalue
+  derivatives are $-6.65\times10^{-10}$ and $+6.65\times10^{-10}$ respectively
+  (no rational fit or equilibrium subtraction). Thus a universal nonlinear
+  invariance theorem would also be false. The small size of this example's
+  excursion does not bound excursions in a material calculation.
 * **Linear response.** Off-diagonal rates and the variation of $D$ couple
   coherences and populations; a scalar sum of two quasiparticle widths is
   valid only after further diagonal restrictions. The static-$W$ limit has
@@ -625,8 +641,9 @@ definition in Eq. (8).
 The Markov step behind Eq. (8) must rotate the lines with the Hamiltonian that propagates ρ.
 The GKBA hole line is $G^<(t,t-\tau)=i\,e^{-iH\tau}\rho(t-\tau)$ (particle: $1-\rho$), and the
 interaction-picture step $\rho(t-\tau)=e^{iH\tau}\rho(t)e^{-iH\tau}$ turns it into
-$i\,\rho(t)\,e^{-iH\tau}$: populations do not rotate, coherences do. `collision_basis =
-instantaneous` takes the basis from the full-density material Hamiltonian,
+$i\,\rho(t)\,e^{-iH\tau}$: populations do not rotate, coherences do. In the legacy
+frozen-screening path, `collision_basis = instantaneous` takes the basis from
+the full-density reference material Hamiltonian,
 $$
 H^s=\mathrm{diag}(e_{\rm ref})+K_{W_0}[\rho-\rho^{\rm eq}]+V_{\rm dyn}
 =U\,\mathrm{diag}(E)\,U^\dagger,\qquad
@@ -644,10 +661,10 @@ so its $U,E$, electronic phases and collision tables agree exactly while the
 coherent map residual is bounded by the declared tolerance. The explicit
 drive is excluded from $H^s$. The current mean-field coherences remain included.
 
-This is a reference-counterterm convention with Hartree plus statically
-screened exchange. An absolute $h_{\rm HF}+M_H$ calculation would additionally
-require the one-body/DFT $V_{xc}$ counterterm; the reference mode does not
-reconstruct that missing operator. On the 516 decks, $e_{\rm ref}=\epsilon^G$
+This legacy convention has Hartree plus statically screened exchange. The
+joint snapshot path instead reconstructs bare HF from authenticated kinetic/
+ionic, Hartree and Fock source matrices; no $V_{xc}$ operator is required.
+On the 516 decks, $e_{\rm ref}=\epsilon^G$
 because no eqp file is set. At equilibrium the coherent correction is zero.
 The full $\rho'=U^\dagger\rho U$ enters the internal line, and the final
 coefficients rotate back to the fixed working basis. With joint screening,
@@ -785,8 +802,12 @@ $v_q\simeq F_qF_q^\dagger$ of declared `collision_density_rank`. In its
 coordinates, $\widetilde P=F_q^\dagger P F_q$ and the bare interaction is the
 identity. Centroid wavefunctions and $v_q$ remain distributed; a projected
 band-pair block is streamed per q. Frozen bands and all active coherences
-remain in both bubbles. A bounded tangential Loewner realization is selected
-jointly from $P^<$ and $P^>$ finite complex supports. Retarded feedback and the
+remain in both bubbles. A bounded full-block Loewner pencil uses both $P^<$
+and $P^>$ at finite complex supports. Its stable modal candidates define a
+causal basis; all matrix entries of both targets are refitted on that basis.
+This is a new constrained fit, not a post-hoc shift of unstable poles. The
+declared pencil-memory guard and final order bound are checked explicitly.
+Retarded feedback and the
 exact rational causal projection then produce $W_c^R,W^<$, retaining general
 signed/complex residues, noise-only directions and the lesser $1/z$ tail.
 The self-energy factors one exact common union realization for response and
@@ -795,6 +816,21 @@ Independent held-out checks certify both bubbles, the screened response and
 the dressed full-frequency noise. Unstable or unresolved poles refuse.
 This reduces the joint polarization before the screening algebra rather than
 fitting the screened retarded function alone.
+
+Joint screening uses the bare Hartree/Fock increment $\Delta h_{\rm HF}$,
+not the reference screened-exchange kernel. With `collision_hamiltonian = hf`
+the coherent fixed point is exactly the specified projected-model closure,
+$H^s=h_{\rm HF}^{\rm eq}+\Delta h_{\rm HF}+M_H[\rho,H^s]$.
+The authenticated kinetic/ionic plus equilibrium Hartree and Fock matrices
+provide $h_{\rm HF}^{\rm eq}$. A DFT-prepared density need not commute with
+this Hamiltonian or be a stationary collision state.
+The explicit `reference` alternative uses
+$H^s=\mathrm{diag}(e_{\rm ref})+\Delta h_{\rm HF}+
+M_H[\rho,H^s]-M_H^{\rm eq}$ for comparisons anchored to the old reference.
+It is a different effective-one-body model, not a claim of absolute HF/GW
+self-consistency of DFT. Neither joint convention subtracts a static reduced-W
+increment; doing so against a different full screened-exchange kernel would
+leave an unintended density-dependent term.
 
 The separate controls are density rank, rational order/support count,
 fit-support height, collision regularization, and the declared exponential

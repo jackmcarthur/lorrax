@@ -197,6 +197,7 @@ is:
 ```toml
 collision_basis = "instantaneous"
 collision_screening = "joint"
+collision_hamiltonian = "reference"
 collision_source = ".../04_gw_oneshot_mpa_eqp/oneshot.in"
 collision = "raw"
 collision_refresh_sweep = "active"
@@ -222,8 +223,11 @@ fit height and collision regularization separately. Compare a zero-field
 trajectory before interpreting pulse decay, and inspect the density spectrum,
 number balance, snapshot residual and response/noise fit errors. `subtracted`
 is available as a separate imposed equilibrium-counterterm model. The
-Hamiltonian uses the reference screened-exchange convention described by the
-[theory owner](../theory/td_agw_dynamical.md#damping).
+`reference` setting is an explicit DFT/QP-reference-anchored model for
+comparison to the original TD-aGW. The default `hf` instead solves the absolute
+Hartree/Fock plus M_H material Hamiltonian; a DFT-prepared density need not be
+stationary there. Both use bare HF increments, with no static reduced-W
+subtraction. See the [theory owner](../theory/td_agw_dynamical.md#damping).
 
 This exploratory executor projects the microscopic Coulomb interaction before
 fitting both polarization components. It retains separate exact response and

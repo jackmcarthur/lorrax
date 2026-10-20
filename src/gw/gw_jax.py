@@ -1663,6 +1663,8 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    photon_response, print0, qp_solver, quad, static_head_terms, sym, wfn, wfns_sigma,
 	    wfns_transverse)
 	(kin_ion) = _load_kinetic_ionic_hamiltonian(band_slices, config, mesh_xy, meta, print0, wfn)
+	from .ppm_pipeline import publish_window_hf_reference
+	publish_window_hf_reference(kin_ion, sigma_result, static_head_terms, meta, band_slices)
 	(
 	    enk_dft, final_static_head_terms, kin_ion, rotations_written, sc_result,
 	    sigma_result, sigma_total) = _solve_qp_stage(

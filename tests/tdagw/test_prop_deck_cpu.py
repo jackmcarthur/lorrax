@@ -174,11 +174,18 @@ def test_joint_snapshot_controls_parse_and_refuse_invalid_closures():
                                  collision_snapshot_steps=32, collision_adiabatic_ev=0.05))
     assert deck.values["lorrax.collision_screening"] == "joint"
     assert deck.values["lorrax.collision_snapshot_steps"] == 32
+    assert deck.values["lorrax.collision_hamiltonian"] == "hf"
+    reference = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+        collision_basis="instantaneous", collision_hamiltonian="reference"))
+    assert reference.values["lorrax.collision_hamiltonian"] == "reference"
+    assert _refuses(_bundle(collision="raw", collision_screening="joint",
+        collision_basis="instantaneous", collision_hermitian="none"), "td_collision_snapshot")
     assert _refuses(_bundle(collision="raw", collision_screening="joint"),
                     "td_collision_snapshot")
     for key, value in (("collision_snapshot_steps", 0), ("collision_density_rank", 0),
                        ("collision_fit_samples", 3), ("collision_snapshot_mixing", 1.1),
-                       ("collision_adiabatic_ev", 0), ("collision_fit_height_ev", float("inf"))):
+                       ("collision_adiabatic_ev", 0), ("collision_fit_height_ev", float("inf")),
+                       ("collision_hamiltonian", "screened")):
         assert _refuses(_bundle(collision="raw", **{key: value}), "td_collision_snapshot")
 
 

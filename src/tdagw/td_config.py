@@ -88,6 +88,7 @@ TD_DEFAULTS = {
     "lorrax.collision_refresh_df": 0.0,
     "lorrax.collision_refresh_sweep": "active",
     "lorrax.collision_screening": "frozen",
+    "lorrax.collision_hamiltonian": "hf",
     "lorrax.collision_frozen_bands": None,
     "lorrax.collision_screening_gamma_ev": 0.001,
     "lorrax.collision_rebase": "auto",
@@ -210,6 +211,14 @@ def _check_collision(vals: dict) -> None:
         raise _gate("td_collision", f"collision_screening = "
                     f"{vals['lorrax.collision_screening']!r}", " | ".join(COLLISION_SCREENINGS),
                     "set [lorrax] collision_screening")
+    if vals["lorrax.collision_hamiltonian"] not in ("hf", "reference"):
+        raise _gate("td_collision_snapshot", "unknown collision Hamiltonian",
+                    "hf | reference", "set collision_hamiltonian")
+    if (form != "off" and vals["lorrax.collision_screening"] in ("joint", "joint_frozen")
+            and vals["lorrax.collision_hermitian"] != "dynamic"):
+        raise _gate("td_collision_snapshot", "joint screening without the full coherent correction",
+                    "collision_hermitian = 'dynamic'",
+                    "include M_H once in the material snapshot")
     if form != "off" and vals["lorrax.collision_screening"] in ("refreshed", "shared_pole"):
         raise _gate(
             "td_collision_keldysh_screening",
@@ -1110,15 +1119,24 @@ TD_KEY_DOCS = {
         "= band", "With `collision_in_scattering = full`: the basis and "
         "energies of the rates' lines. `band`: the band basis at the collision source's "
         "bundle energies (the GW run's ε^G). `instantaneous`: solve the material "
-        "Hamiltonian H_s = diag(e_ref) + K_W0[ρ−ρ_eq] + held using the full current ρ. "
+        "Hamiltonian using the full current ρ. Joint screening uses bare Hartree/Fock "
+        "increments and the convention selected by `collision_hamiltonian`; the frozen "
+        "legacy path uses the reference screened-exchange kernel. "
         "The coherent held correction and its eigenpairs converge together, controlled "
         "by `collision_snapshot_*`; the same final U,E enter the electronic lines and "
         "column shells, and joint screening when selected. Explicit driving is excluded "
         "from the internal snapshot. Frozen bands keep their step occupations and edge "
-        "scissors. This is the reference-counterterm screened-exchange convention; it "
-        "does not reconstruct bare HF from DFT without an explicit V_xc counterterm "
+        "scissors. The source contains authenticated kinetic/ionic, Hartree and Fock "
+        "matrices for absolute HF reconstruction without needing V_xc "
         "([td_agw_dynamical.md §1.5, Eq. 8b](theory/td_agw_dynamical.md)).",
         ("td_collision",)),
+    "lorrax.collision_hamiltonian": (
+        "", "With joint screening: `hf` solves H_s = h_HF[ρ] + M_H using the source's "
+        "authenticated kinetic/ionic, Hartree and bare Fock baseline. `reference` uses "
+        "diag(e_ref) + Δh_HF + (M_H − M_H_eq), an explicitly reference-anchored model "
+        "for comparison to the original TD-aGW. Both use bare HF increments and count "
+        "dispersion once; no static reduced-W subtraction is made. A DFT-prepared "
+        "density is not assumed stationary for the absolute `hf` Hamiltonian.", ("td_collision",)),
     "lorrax.collision_snapshot_steps": (
         "", "Maximum coherent self-energy sweeps per instantaneous snapshot. "
         "An unconverged snapshot refuses; no last iterate is installed.", ("td_collision",)),

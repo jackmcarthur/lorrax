@@ -324,7 +324,7 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             if v.get(key, default) != default:                       # absent at the default
                 fp["collision"][key] = v[key]
         for key in ("collision_snapshot_steps", "collision_snapshot_tol_ev",
-                    "collision_snapshot_mixing", "collision_snapshot_acceleration", "collision_density_rank",
+                    "collision_snapshot_mixing", "collision_snapshot_acceleration", "collision_hamiltonian", "collision_density_rank",
                     "collision_pole_order", "collision_fit_samples", "collision_fit_tolerance",
                     "collision_adiabatic_ev", "collision_fit_height_ev"):
             fp["collision"][f"lorrax.{key}"] = v[f"lorrax.{key}"]
@@ -599,6 +599,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
             screening=v["lorrax.collision_screening"], form=v["lorrax.collision"],
             hermitian=v["lorrax.collision_hermitian"], policy=policy,
             basis=v["lorrax.collision_basis"],
+            hamiltonian=v["lorrax.collision_hamiltonian"],
             density_rank=v["lorrax.collision_density_rank"],
             max_order=v["lorrax.collision_pole_order"],
             fit_samples=v["lorrax.collision_fit_samples"],
@@ -662,6 +663,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
         + ("; the exact held flow in the remainder" if cfg.method in ("magnus2", "cfm4")
            else "; its generator in the right-hand side"))
     system = system._replace(ops=system.ops._replace(collision=built["diss"]))
+    model = built.get("model", model)
     if built["held"] is not None:
         model = with_held_term(model, built["held"])
     return built, system, model, cfg._replace(remainder=True)
@@ -723,6 +725,16 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
     basis_wall = 0.0
     if log is not None:
         log.hold()                 # the split and gate lines: stdout now, the log after the gate
+    coll = None
+    joint_collision = (collision is not None
+                       and v["lorrax.collision_screening"] in ("joint", "joint_frozen"))
+    if joint_collision:
+        # This adapter replaces screened exchange by bare HF and can install
+        # an absolute material Hamiltonian. Probe that actual coherent model,
+        # not the original TD-aGW kernel; exclude dissipative gain from the probe.
+        with timing.section("tdagw.collision"):
+            coll, system, model, cfg = _attach_collision(
+                deck, system, model, cfg, collision, mesh, say=say, log=log)
     if cfg.stiff:
         if not model.linear:
             raise ValueError(f"GATE td_stiff_model: got: stiff_modes = {cfg.stiff} with the "
@@ -747,9 +759,11 @@ def propagate(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, drive,
     check = None
     if cfg.method in ("magnus2", "cfm4"):
         with timing.section("tdagw.stability_gate"):
-            cfg, check = _magnus_step_check(cfg, system, model, drive, mesh, auto=auto, say=say)
-    coll = None
-    if collision is not None:
+            gate_system = (system._replace(ops=system.ops._replace(collision=None))
+                           if joint_collision else system)
+            cfg, check = _magnus_step_check(cfg, gate_system, model, drive, mesh,
+                                           auto=auto, say=say)
+    if collision is not None and coll is None:
         with timing.section("tdagw.collision"):
             coll, system, model, cfg = _attach_collision(deck, system, model, cfg, collision,
                                                          mesh, say=say, log=log)

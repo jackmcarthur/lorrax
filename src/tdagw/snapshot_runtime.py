@@ -9,6 +9,7 @@ boundary, where operators are converted to Ha exactly once.
 from __future__ import annotations
 
 import time
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -221,6 +222,82 @@ def authenticate_orbital_gauge(prepared, model, active):
     return dict(checked=True, relative_error=error, tolerance=1e-10)
 
 
+def _hf_coherent_apply(inner, params, rho, t):
+    """Bare HF increment plus the chosen constant one-body baseline, Ha."""
+    inner_params, baseline, rho_eq, bare_head = params
+    return inner(inner_params, rho, t) + baseline - bare_head * (rho - rho_eq[None])
+
+
+def bare_hf_coherent_model(model, prepared, rho_eq, baseline, *, bare_head_ha=0.0,
+                           explicit_hf_model=None):
+    """Replace screened exchange by bare V using the existing TD kernel.
+
+    ``model`` is the authenticated full ISDF TD model. ``baseline`` is
+    ``(ntr,nk_pad,na,na)`` Ha in propagator k sharding. Bare Fock uses
+    source V on the same centroid gauge and the existing routed inverse
+    k FFT. The supplied reference W0 is never subtracted from reduced Wc0.
+    An explicitly supplied ``explicit_hf_model`` is for independent plain
+    array models whose bare-HF contract is owned by their caller.
+    """
+    from tdagw.self_energy import SelfEnergyModel, _isdf_apply
+    from tdagw.dynsig import make_dynsig_kernels, _w_R, WR_SPEC
+    if explicit_hf_model is not None:
+        bare = explicit_hf_model
+    else:
+        if getattr(model.apply, "func", None) is not _isdf_apply:
+            raise ValueError("GATE td_snapshot_bare_hf_model: full ISDF model or explicit bare-HF model required")
+        static = model.apply.args[0]
+        if static[-1] is not None:
+            raise ValueError("GATE td_snapshot_bare_hf_model: TDA projection cannot carry full-density HF")
+        if int(prepared["psi"].shape[2]) > 2:
+            raise ValueError("GATE td_snapshot_bare_hf_model: transverse four-current HF increment not implemented")
+        from bse.bse_preconditioner import exchange_spin_weight
+        if prepared["spin_weight"] != exchange_spin_weight(int(static[2])):
+            raise ValueError("GATE td_snapshot_bare_hf_model: TD Hartree spin multiplicity differs from GW source")
+        operands, reference = model.params
+        extent = int(operands[3].shape[0])
+        V = prepared["V_q"]
+        if extent > V.shape[-1]:
+            extra = extent - int(V.shape[-1])
+            V = jax.jit(lambda v: jnp.pad(v, ((0, 0), (0, extra), (0, extra))))(V)
+        V = V[:, :extent, :extent]
+        kern = make_dynsig_kernels(prepared["mesh"], prepared["kgrid"])
+        bare_R = jax.jit(lambda v: _w_R(v, kern),
+            out_shardings=NamedSharding(prepared["mesh"], WR_SPEC))(V)
+        bare_operands = list(operands)
+        bare_operands[3] = bare_R
+        bare_static = (*static[:7], True, True, None)
+        bare = SelfEnergyModel(apply=functools.partial(_isdf_apply, bare_static),
+            params=(tuple(bare_operands), reference), linear=True, name="ISDF bare Hartree-Fock increment")
+    return SelfEnergyModel(apply=functools.partial(_hf_coherent_apply, bare.apply),
+        params=(bare.params, baseline, rho_eq, float(bare_head_ha)), linear=bare.linear,
+        name=f"{bare.name} + constant one-body baseline")
+
+
+def hf_reference_window(source, prepared, active):
+    """Authenticated hHF[rho_eq] in source/bundle k order, Ry."""
+    from common.collectives import gather_to_host
+    reference = source.get("hf_reference")
+    if reference is None or reference.get("basis") != "source_wfn":
+        raise ValueError("GATE td_snapshot_hf_reference: rerun GW source with HF capture seam")
+    from gw.sigma_dispatch import SIGMA_KSET_FULL_BZ
+    if reference.get("kset") != SIGMA_KSET_FULL_BZ:
+        raise ValueError("GATE td_snapshot_hf_reference: HF matrices must cover the full BZ")
+    lo, hi = int(reference["band_start"]), int(reference["band_stop"])
+    if active.start < lo or active.stop > hi:
+        raise ValueError("GATE td_snapshot_hf_reference: authenticated HF matrices do not cover active window")
+    win = slice(active.start - lo, active.stop - lo)
+    parts = [np.asarray(gather_to_host(reference[key]))[:, win, win]
+             for key in ("kin_ion_ry", "hartree_ry", "exchange_ry")]
+    shape = (prepared["nk"], active.stop - active.start, active.stop - active.start)
+    if any(part.shape != shape or not np.isfinite(part).all() for part in parts):
+        raise ValueError("GATE td_snapshot_hf_reference: inconsistent/nonfinite one-body/Hartree/Fock blocks")
+    H = sum(parts)
+    if np.max(abs(H - H.conj().swapaxes(-1, -2))) > 1e-9:
+        raise ValueError("GATE td_snapshot_hf_reference: non-Hermitian HF baseline")
+    return H, float(reference.get("bare_head_coefficient_ry", 0.0))
+
+
 def snapshot_supports(energy, options):
     """Resolve explicit disjoint upper-half-plane fit/check supports, Ry."""
     if "fit_sites" in options and "check_sites" in options:
@@ -273,6 +350,10 @@ def make_snapshot_evaluator(prepared, options):
     def evaluate(basis, *, equilibrium=False):
         U, external, rho_a = (np.asarray(basis[k]) for k in ("U", "e", "rho"))
         energy = frozen_energy.copy()
+        if options.get("frozen_edge_updates", True):
+            energy = energy0.copy()
+            energy[:, :start] += (external[:, 0] - energy0[:, start])[:, None]
+            energy[:, start + na:] += (external[:, -1] - energy0[:, start + na - 1])[:, None]
         energy[:, active] = external
         density = SS.embed_active_density(occupations, rho_a, start)
         energy_dev, density_dev = (replicated(x) for x in
@@ -330,6 +411,10 @@ def make_snapshot_evaluator(prepared, options):
                 crossing_noise_error=(float(receipt["noise_check_error"])
                                       if receipt.get("derived_by_crossing", False) else 0.0),
                 self_negative_crossing=bool(receipt.get("self_negative_crossing", False)),
+                fit_method=receipt.get("fit_method"),
+                training_refit_error=receipt.get("training_refit_error"),
+                fit_pencil_shape=receipt.get("fit_pencil_shape"),
+                fit_pencil_bytes=receipt.get("fit_pencil_bytes"),
                 project_s=t_project - tq, screening_s=t_screen - t_project,
                 sigma_s=time.perf_counter() - t_screen))
         Uh = U.conj().swapaxes(-1, -2)
@@ -359,6 +444,14 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     ``density_rank, max_order, fit_samples, fit_tolerance, adiabatic_ev,
     fit_height_ev, eta_ev, snapshot_steps, snapshot_tol_ev,
     snapshot_mixing, snapshot_acceleration, screening, form, hermitian, policy, basis``.
+    ``hamiltonian='hf'`` (default) uses the authenticated absolute
+    ``hHF[rho]+MH[rho,H]`` and solves its coherent correction already at
+    t0. The supplied DFT density is then explicitly a prepared quench.
+    ``hamiltonian='reference'`` uses ``diag(e_ref)+delta_HF+MH-MH_eq``:
+    its constant one-body counterterm anchors the supplied reference.
+    Both use bare Hartree/Fock increments; neither subtracts a reduced
+    static Wc term from a different full screened reference kernel.
+
     ``screening`` is ``joint`` or ``joint_frozen``; both use the same
     reduced equilibrium screening, then only ``joint`` rebuilds it inside
     each snapshot iterate.  Return keys match ``dynsig.window_collision``:
@@ -372,6 +465,9 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     options = dict(options or {})
     form, hermitian = options.get("form", "subtracted"), options.get("hermitian", "dynamic")
     mode = options.get("screening", "joint")
+    convention = options.get("hamiltonian", "hf")
+    if convention not in ("hf", "reference"):
+        raise ValueError("GATE td_snapshot_hamiltonian: expected hf or reference")
     if mode not in ("joint", "joint_frozen") or form not in C.FORMS or hermitian not in C.HERMITIAN_MODES:
         raise ValueError("GATE td_snapshot_options: invalid screening, collision form or Hermitian mode")
     if options.get("basis", "instantaneous") != "instantaneous":
@@ -399,6 +495,13 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
         raise ValueError("GATE td_snapshot_reference: source and propagator occupations differ")
     ry_ha = RYD_TO_EV / HA_IN_EV
     e_ref = to_bundle(np.asarray(gather_to_host(ops.e_qp))[:nk]) / ry_ha
+    hf_eq, bare_head = hf_reference_window(source, prepared, active)
+    put = lambda blocks: tp.place_window_blocks(blocks, mesh, nk_pad)
+    h_ref = np.einsum("ki,ij->kij", e_ref, np.eye(na)).astype(complex)
+    offset = np.zeros_like(hf_eq) if convention == "reference" else hf_eq - h_ref
+    baseline = put(np.stack([offset[bundle_of]] * ntr) * ry_ha)
+    model = bare_hf_coherent_model(model, prepared, ops.rho_eq, baseline,
+        bare_head_ha=bare_head * ry_ha, explicit_hf_model=options.get("hf_model"))
     frozen_energy = prepared["energy"].copy()
     frozen_energy[:, :start] += (e_ref[:, 0] - frozen_energy[:, start])[:, None]
     frozen_energy[:, start + na:] += (e_ref[:, -1] - frozen_energy[:, start + na - 1])[:, None]
@@ -410,7 +513,6 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
         eta_ry=float(options.get("eta_ev", 0.1)) / RYD_TO_EV,
         fit_tolerance=float(options.get("fit_tolerance", 0.02)))
     evaluate, screening_cache = make_snapshot_evaluator(prepared, evaluator_opts)
-    put = lambda blocks: tp.place_window_blocks(blocks, mesh, nk_pad)
     held0 = None if hermitian == "none" else put(np.zeros((ntr, nk, na, na), complex))
     rho0 = put(np.broadcast_to(rho_eq_h, (ntr, nk, na, na)))
     slow_apply = model.apply if hermitian == "none" else with_held_term(model, None).apply
@@ -434,7 +536,21 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
 
     params0 = model.params if hermitian == "none" else (model.params, held0)
     bases0 = bases_at(rho0, params0, 0.0)
-    eq = evaluate(bases0[0], equilibrium=True)
+    cold_snapshot = dict(iterations=1, residual=0.0, converged=True)
+    if convention == "hf" and hermitian != "none":
+        def cold(candidate):
+            bases = bases_at(rho0, (model.params, candidate), 0.0)
+            row = evaluate(bases[0], equilibrium=True)
+            target = put(np.stack([row["m_h"][bundle_of]] * ntr) * ry_ha)
+            return target, (row, bases)
+
+        held0, (eq, bases0), cold_snapshot = collision_snapshot_state(cold, held0,
+            steps=int(options.get("snapshot_steps", 32)),
+            tol_ha=float(options.get("snapshot_tol_ev", 1e-4)) / HA_IN_EV,
+            mixing=float(options.get("snapshot_mixing", 0.7)),
+            acceleration=options.get("snapshot_acceleration", "anderson"))
+    else:
+        eq = evaluate(bases0[0], equilibrium=True)
     keys = ("gamma", "injection", "m_h", "static")
     eq_rows = {key: np.stack([eq[key][bundle_of]] * ntr) for key in keys}
     gamma_eq, injection_eq = (put(eq_rows[key] * ry_ha) for key in ("gamma", "injection"))
@@ -463,12 +579,21 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
               density_rank=prepared["rank"], electronic_bands=prepared["nb"],
               q_receipts=eq["screening_receipts"], setup_s=time.perf_counter() - t_setup,
               orbital_gauge=gauge,
-              hamiltonian_convention="reference screened-exchange increment plus DeltaMH-DeltaStatic",
+              hamiltonian_convention=("hHF[rho]+MH[rho,H]" if convention == "hf" else
+                  "diag(e_ref)+delta_HF[rho]+MH[rho,H]-MH_eq"),
+              hamiltonian=convention, snapshot=cold_snapshot,
+              initial_state="DFT-prepared density quench" if convention == "hf" else "anchored reference density",
               **diagnostics(initial))
     t0["wall_s"] = t0["setup_s"]
     state = dict(n=0, t_last=0.0, f_last=np.asarray(gather_to_host(pops(rho0)))[:, :nk],
                  trace_last=np.asarray(initial["trace"]), history=[t0],
-                 basis_last=bases0, snapshot_held=held0)
+                 basis_last=bases0, snapshot_held=held0, hf_reference_ry=hf_eq)
+    mh0 = eq["m_h"] if hermitian != "none" else np.zeros_like(hf_eq)
+    state["one_body_counterterm_ry"] = h_ref - hf_eq - mh0 if convention == "reference" else np.zeros_like(hf_eq)
+    H0 = (bases0[0]["U"] * bases0[0]["e"][..., None, :]) @ bases0[0]["U"].conj().swapaxes(-1, -2)
+    req_b = to_bundle(rho_eq_h)
+    t0["prepared_density_commutator_ha"] = float(np.max(np.linalg.norm(
+        H0 @ req_b - req_b @ H0, axis=(-2, -1)))) * ry_ha
     say(f"  joint snapshot t0: rank {prepared['rank']}, {prepared['nb']} bands, {nk} q; "
         f"{mode}; setup {t0['setup_s']:.2f} s")
     if record is not None:
@@ -495,10 +620,8 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
             target = candidate
             if hermitian != "none":
                 mh = np.stack([row["m_h"][bundle_of] for row in rows])
-                static = np.stack([row["static"][bundle_of] for row in rows])
-                target = put(np.asarray(C.hermitian_update(mh, eq_rows["m_h"],
-                    static if hermitian == "dynamic" else None,
-                    eq_rows["static"] if hermitian == "dynamic" else None)) * ry_ha)
+                reference = eq_rows["m_h"] if convention == "reference" else np.zeros_like(mh)
+                target = put(np.asarray(C.hermitian_update(mh, reference)) * ry_ha)
             return target, (rows, bases)
 
         predictor = jnp.zeros_like(rho) if hermitian == "none" else held_term(params)[0]
@@ -544,7 +667,7 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
             record(rec)
         return dict(ops=ops_now._replace(collision=out["diss"]), params=new_params, delta=delta)
 
-    return dict(diss=initial["diss"], held=held0, refresh=refresh, state=state, t0=t0, eq=eq,
+    return dict(diss=initial["diss"], held=held0, refresh=refresh, state=state, t0=t0, eq=eq, model=model,
                 c_eq=initial["c_eq"], operators_eq=(gamma_eq, injection_eq),
                 prepared=prepared, screening=screening_cache, evaluate=evaluate,
                 basis_of=bases_at, bundle_of=bundle_of)

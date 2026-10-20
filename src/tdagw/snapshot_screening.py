@@ -7,7 +7,7 @@ operators are ``F WcR F.H`` and ``F Wless F.H``.  Electronic bands are
 never truncated by this projection.  Frozen bands enter through their
 diagonal occupations in the same full density matrix as the active block.
 
-Finite complex supports are used, with a common tangential Loewner
+Finite complex supports are used, with a common full-block Loewner
 realization of the stacked one-sided ``[P<; P>]``.  No frequency integral,
 passive residue constraint, or dense all-transition state space is used.
 The fit is admitted only after independent full-matrix sample checks.
@@ -332,15 +332,24 @@ def make_projected_sampler(mesh_xy, *, band_block=32):
         out_specs=P(), check_vma=False))
 
 
-def joint_loewner(sites, samples, *, max_order=96, rank_tolerance=1e-11):
+def joint_loewner(sites, samples, *, max_order=96, rank_tolerance=1e-11,
+                  max_pencil_bytes=128 * 1024 ** 2):
     """Fit a common strictly proper realization to stacked ``[P<;P>]``.
 
     ``samples[2,support,r,r]`` and complex ``sites[support]`` are small
-    replicated host arrays; energies use Ry.  Tangential interpolation
-    limits dense state size to ``min(nsupport//2,max_order)`` regardless of
-    the number of electronic transitions.  General complex, signed and
-    noise-only poles are retained.  Admission is the caller's independent
-    matrix check, never the interpolation residual alone.
+    replicated host arrays; energies use Ry.  All matrix entries enter the
+    full-block Loewner pencil.  Its SVD selects at most ``max_order`` modal
+    candidates; the strictly lower-half-plane candidate subset defines a
+    stable approximation basis.  Joint output amplitudes are then fitted
+    against ALL support entries by linear least squares with common right
+    directions. No pole is shifted, no residue sign is constrained, and
+    noise-only modes remain eligible.  This is a new stable basis fit, not
+    causal projection of an already accepted transfer.  Independent exact
+    response and dressed-noise checks remain mandatory in screen_snapshot.
+
+    ``max_pencil_bytes`` bounds each complex block pencil before allocation;
+    factorization workspace and copies require approximately eight such
+    arrays.  State count is independent of the electronic transition count.
     """
     sites = np.asarray(sites, dtype=complex)
     samples = np.asarray(samples, dtype=complex)
@@ -352,55 +361,56 @@ def joint_loewner(sites, samples, *, max_order=96, rank_tolerance=1e-11):
         raise ValueError("GATE snapshot_fit_input: finite unique supports and joint square samples required")
     rank = samples.shape[2]
     values = samples.transpose(1, 0, 2, 3).reshape(sites.size, 2 * rank, rank)
-    # Fixed directions make the refresh deterministic without selecting poles
-    # from the retarded function (which would lose half-filled noise).
-    rng = np.random.default_rng(1729)
     nl, nr = (sites.size + 1) // 2, sites.size // 2
-    left = rng.normal(size=(nl, 2 * rank)) + 1j * rng.normal(size=(nl, 2 * rank))
-    right = rng.normal(size=(nr, rank)) + 1j * rng.normal(size=(nr, rank))
-    left /= np.linalg.norm(left, axis=1)[:, None]
-    right /= np.linalg.norm(right, axis=1)[:, None]
+    shape = (nl * 2 * rank, nr * rank)
+    pencil_bytes = 16 * shape[0] * shape[1]
+    if pencil_bytes > int(max_pencil_bytes):
+        raise ValueError(f"GATE snapshot_pencil_budget: {pencil_bytes} bytes per block pencil "
+                         f"exceeds explicit {max_pencil_bytes} byte limit; reduce supports/density rank")
     scale = max(float(np.max(abs(sites))), 1e-12)
     mu, lam = sites[::2] / scale, sites[1::2] / scale
-    V = np.einsum("im,imn->in", left.conj(), values[::2])
-    W = np.einsum("imn,in->im", values[1::2], right).T
-    lv = V @ right.T
-    rw = left.conj() @ W
-    denominator = mu[:, None] - lam[None, :]
-    L = (lv - rw) / denominator
-    Ls = (mu[:, None] * lv - lam[None, :] * rw) / denominator
-    U, singular, _ = sla.svd(np.concatenate((L, Ls), axis=1), full_matrices=False)
-    _, singular_right, Vh = sla.svd(np.concatenate((L, Ls), axis=0), full_matrices=False)
-    if singular[0] == 0 or singular_right[0] == 0:
+    hl, hr = values[::2], values[1::2]
+    denominator = (mu[:, None] - lam[None, :])[:, :, None, None]
+    L = ((hl[:, None] - hr[None]) / denominator).transpose(0, 2, 1, 3).reshape(shape)
+    Ls = ((mu[:, None, None, None] * hl[:, None]
+           - lam[None, :, None, None] * hr[None]) / denominator)
+    Ls = Ls.transpose(0, 2, 1, 3).reshape(shape)
+    U, singular, Vh = sla.svd(L, full_matrices=False)
+    if singular[0] == 0:
         empty = kr.pole_residue_realization([], np.zeros((0, rank, rank)))
-        return {"lesser": empty, "greater": empty, "order": 0, "singular_values": singular}
-    order = min(int(max_order), int(np.count_nonzero(singular > singular[0] * rank_tolerance)),
-                int(np.count_nonzero(singular_right > singular_right[0] * rank_tolerance)))
+        return {"lesser": empty, "greater": empty, "order": 0, "singular_values": singular,
+                "pencil_shape": shape, "pencil_bytes": pencil_bytes, "refit_error": 0.0}
+    order = min(int(max_order), int(np.count_nonzero(singular > singular[0] * rank_tolerance)))
     requested_order = order
-    # Exact ordered bubble inputs have damped electronic poles, irrespective
-    # of population inversion. An upper input pole is therefore a Loewner
-    # approximation artifact. Try nested lower-rank pencils; no pole is moved
-    # or residue sign changed. Full independent response/noise admission is
-    # still required by screen_snapshot after selecting this stable pencil.
-    for order in range(requested_order, 0, -1):
-        Y, X = U[:, :order], Vh[:order].conj().T
-        E = -Y.conj().T @ L @ X
-        pencil_A = -Y.conj().T @ Ls @ X
-        pencil_B, C = Y.conj().T @ V, W @ X
-        try:
-            A = scale * sla.solve(E, pencil_A)
-            B = scale * sla.solve(E, pencil_B)
-        except (ValueError, np.linalg.LinAlgError) as exc:
-            if order == 1:
-                raise ValueError("GATE snapshot_fit_pencil: singular reduced Loewner pencil") from exc
-            continue
-        if np.all(np.linalg.eigvals(A).imag < -1e-12):
-            break
+    Y, X = U[:, :order], Vh[:order].conj().T
+    A = scale * ((Y.conj().T @ Ls @ X) / singular[:order, None])
+    B = -scale * (Y.conj().T @ hl.reshape(nl * 2 * rank, rank)) / singular[:order, None]
+    poles, vectors = sla.eig(A)
+    if np.linalg.cond(vectors) > 1e12:
+        raise ValueError("GATE snapshot_fit_pencil: defective Loewner modal candidate basis")
+    modal_right = sla.solve(vectors, B)
+    stable = poles.imag < -1e-12
+    poles, modal_right = poles[stable], modal_right[stable]
+    if poles.size == 0:
+        raise ValueError("GATE snapshot_causal_poles: no causal input modal candidates")
+    design = ((1.0 / (sites[:, None] - poles[None]))[:, :, None]
+              * modal_right[None]).transpose(0, 2, 1).reshape(sites.size * rank, -1)
+    norms = np.linalg.norm(design, axis=0)
+    live = norms > 0.0
+    design, poles, modal_right, norms = design[:, live], poles[live], modal_right[live], norms[live]
+    design /= norms[None]
+    rhs = values.transpose(0, 2, 1).reshape(sites.size * rank, 2 * rank)
+    coefficients = sla.lstsq(design, rhs, cond=rank_tolerance, lapack_driver="gelsd")[0]
+    A, B, C = np.diag(poles), modal_right / norms[:, None], coefficients.T
+    order = poles.size
+    reconstructed = (design @ coefficients).reshape(sites.size, rank, 2 * rank).transpose(0, 2, 1)
+    refit_error = _relative_error(reconstructed, values)
     zero = np.zeros((rank, rank), dtype=complex)
     return {"lesser": (A, B, C[:rank], zero),
             "greater": (A, B, C[rank:], zero.copy()),
             "order": order, "requested_order": requested_order,
-            "stable_rank_reduction": requested_order - order, "singular_values": singular}
+            "stable_rank_reduction": requested_order - order, "singular_values": singular,
+            "refit_error": refit_error, "pencil_shape": shape, "pencil_bytes": pencil_bytes}
 
 
 def _relative_error(actual, reference):
@@ -518,9 +528,11 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
                                         np.eye(rank)) for i in range(check_sites.size)])
     approx_w = np.stack([kr.evaluate(wr, z) for z in check_sites])
     screening_error = _relative_error(approx_w - np.eye(rank), exact_w - np.eye(rank))
-    if max(bubble_error, screening_error) > fit_tolerance:
+    refit_error = float(fit.get("refit_error", 0.0))
+    if max(refit_error, bubble_error, screening_error) > fit_tolerance:
         raise ValueError(f"GATE snapshot_fit_error: bubble={bubble_error:.3e}, "
-                         f"screening={screening_error:.3e}; tolerance={fit_tolerance:.3e}; "
+                         f"screening={screening_error:.3e}, train={refit_error:.3e}; "
+                         f"tolerance={fit_tolerance:.3e}; "
                          "increase supports/order or revise density-space rank")
     projection_order = 4 * fit["order"]
     if projection_order > max_projection_order:
@@ -557,6 +569,10 @@ def screen_snapshot(sampler, fit_sites, check_sites, *, max_order=96,
                         "noise_check_error": noise_error,
                         "fit_tolerance": float(fit_tolerance),
                         "stable_rank_reduction": int(fit.get("stable_rank_reduction", 0)),
+                        "fit_method": "full_block_loewner_causal_basis_refit",
+                        "training_refit_error": refit_error,
+                        "fit_pencil_shape": tuple(fit["pencil_shape"]),
+                        "fit_pencil_bytes": int(fit["pencil_bytes"]),
                         "self_negative_crossing": bool(self_negative),
                         "fit_sites_ry": fit_sites.copy(), "check_sites_ry": check_sites.copy(),
                         "retarded_poles_ry": np.linalg.eigvals(wr[0]),

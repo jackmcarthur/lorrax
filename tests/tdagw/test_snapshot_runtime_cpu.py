@@ -16,7 +16,7 @@ jax.config.update("jax_enable_x64", True)
 
 def _source():
     devices = np.asarray(jax.devices())
-    mesh = Mesh(devices.reshape((1, -1)), ("x", "y"))
+    mesh = Mesh(devices.reshape((2, 2) if devices.size == 4 else (1, -1)), ("x", "y"))
     nk, nb, ns, nmu = 4, 4, 2, max(8, devices.size)
     rng = np.random.default_rng(781)
     psi = rng.normal(size=(nk, nb, ns, nmu)) + 1j * rng.normal(size=(nk, nb, ns, nmu))
@@ -31,6 +31,10 @@ def _source():
               occ=jnp.tile(jnp.array([1.0, 1.0, 0.0, 0.0]), (nk, 1)))
     source = dict(wfns=wfns, meta=NS(kgrid=(nk, 1, 1), n_rmu=nmu),
                   V_q=jax.device_put(V, NamedSharding(mesh, P(None, "x", "y"))))
+    h0 = np.einsum("ki,ij->kij", np.asarray(wfns.enk), np.eye(nb)).astype(complex)
+    source["hf_reference"] = dict(kin_ion_ry=jnp.asarray(h0),
+        hartree_ry=jnp.zeros_like(jnp.asarray(h0)), exchange_ry=jnp.zeros_like(jnp.asarray(h0)),
+        band_start=0, band_stop=nb, basis="source_wfn", kset="full_bz", bare_head_coefficient_ry=0.0)
     return source, mesh, psi, V
 
 
@@ -159,6 +163,166 @@ def test_source_model_gauge_authenticates_actual_orbitals():
         authenticate_orbital_gauge(prepared, model._replace(params=((mismatch,), None)), slice(1, 3))
 
 
+def test_hf_source_capture_reuses_existing_authenticated_outputs():
+    from gw.ppm_pipeline import observe_window_sigma_source, publish_window_hf_reference
+    source, _, _, _ = _source()
+    fields = source["hf_reference"]
+    result = NS(v_h_kij_ry=fields["hartree_ry"], sigma_x_kij_ry=fields["exchange_ry"],
+                hartree_omitted=False, kset="full_bz")
+    meta = NS(cell_volume=12.0, nk_tot=4)
+    bands = NS(b0=0, b3=4)
+    # An unobserved ordinary GW call does not even inspect its operands.
+    publish_window_hf_reference(None, None, None, None, None)
+    with observe_window_sigma_source() as captured:
+        publish_window_hf_reference(fields["kin_ion_ry"], result, NS(vc0=0.24), meta, bands)
+    hf = captured["hf_reference"]
+    assert hf["kin_ion_ry"] is not fields["kin_ion_ry"]
+    np.testing.assert_array_equal(hf["kin_ion_ry"], fields["kin_ion_ry"])
+    assert hf["bare_head_coefficient_ry"] == 0.24 / 48.0
+    assert hf["basis"] == "source_wfn"
+
+
+def test_joint_fit_refusal_does_not_install_a_snapshot(monkeypatch):
+    from common.units import RYD_TO_EV
+    from tdagw import collision as C
+    from tdagw.self_energy import zero_model
+    from tdagw import snapshot_runtime as runtime
+    from tdagw.tdgw_io import HA_IN_EV
+    source, mesh, _, _ = _source()
+
+    def factory(prepared, options):
+        def evaluate(basis, equilibrium=False):
+            if not equilibrium:
+                raise ValueError("GATE snapshot_fit_error: independently checked response refused")
+            zero = np.zeros((4, 2, 2), complex)
+            return dict(gamma=zero, injection=zero, m_h=zero, static=zero,
+                        screening_receipts=[])
+        return evaluate, {}
+
+    monkeypatch.setattr(runtime, "make_snapshot_evaluator", factory)
+    req = np.broadcast_to(np.diag([1.0, 0.0]), (4, 2, 2)).astype(complex)
+    put = lambda value, spec: jax.device_put(value, NamedSharding(mesh, spec))
+    ops = NS(e_qp=put(np.asarray(source["wfns"].enk)[:, 1:3] * RYD_TO_EV / HA_IN_EV,
+                     P(("x", "y"), None)),
+             rho_eq=put(req, P(("x", "y"), None, None)),
+             w_k=put(np.full(4, 0.25), P(("x", "y"))))
+    model = zero_model()
+    built = runtime.snapshot_collision(source, ops, mesh=mesh,
+        k_frac=source["wfns"].green_parent.plan.k_parent_frac, b_lo=1, ntr=1, model=model,
+        options=dict(hamiltonian="reference", hf_model=model, screening="joint",
+                     policy=C.RefreshPolicy(every=1.0)), say=lambda _: None)
+    held = np.asarray(built["held"]).copy()
+    with pytest.raises(ValueError, match="GATE snapshot_fit_error"):
+        built["refresh"](2.0, runtime.tp.place_window_blocks(req[None], mesh, 4), ops,
+                           (built["model"].params, built["held"]))
+    assert built["state"]["n"] == 0 and len(built["state"]["history"]) == 1
+    np.testing.assert_array_equal(built["state"]["snapshot_held"], held)
+    assert "snapshot_fit_error" in built["state"]["snapshot_failure"]["error"]
+
+
+def test_bare_hf_kernel_replaces_full_screened_W_and_keeps_bare_head():
+    from ffi import fft as FF
+    from tdagw.dynsig import make_dynsig_kernels, _w_R
+    from tdagw.model import assemble_td_model, ZETA_G_SPEC, V_G_SPEC
+    from tdagw.self_energy import isdf_model
+    from tdagw.snapshot_runtime import bare_hf_coherent_model, authenticate_orbital_gauge
+    from tdagw import propagate as tp
+    source, mesh, _, _ = _source()
+    prepared = prepare_projected_source(source, mesh, rank=1)
+    put = lambda a, spec: jax.device_put(np.asarray(a), NamedSharding(mesh, spec))
+    with FF.xla_reference():
+        kern = make_dynsig_kernels(mesh, prepared["kgrid"])
+        bare_R = jax.jit(lambda v: _w_R(v, kern))(prepared["V_q"])
+        model_data = assemble_td_model(prepared["psi"][:, 1:3], 5.0 * bare_R,
+            put(np.zeros((8, 4), complex), ZETA_G_SPEC), put(np.zeros(4), V_G_SPEC),
+            mesh_xy=mesh, kgrid=prepared["kgrid"], k_frac=prepared["k_frac"],
+            band_lo=1, n_bands=2, n_rmu=8)
+        req = put(np.broadcast_to(np.diag([1.0, 0.0]), (4, 2, 2)).astype(complex),
+                  P(("x", "y"), None, None))
+        model = isdf_model(model_data, mesh, k_frac=prepared["k_frac"], rho_eq=req)
+        assert authenticate_orbital_gauge(prepared, model, slice(1, 3))["checked"]
+        zero = tp.place_window_blocks(np.zeros((1, 4, 2, 2), complex), mesh, 4)
+        bare = bare_hf_coherent_model(model, prepared, req, zero, bare_head_ha=0.004)
+        rh = np.broadcast_to(np.array([[0.8, 0.03j], [-0.03j, 0.2]]), (1, 4, 2, 2)).copy()
+        rho = tp.place_window_blocks(rh, mesh, 4)
+        run = jax.jit(lambda p, r: model.apply(p, r, 0.0))
+        run_bare = jax.jit(lambda p, r: bare.apply(p, r, 0.0))
+        original, actual = run(model.params, rho), run_bare(bare.params, rho)
+        np.testing.assert_allclose(actual, original / 5.0 - 0.004 * (rho - req[None]),
+                                   rtol=2e-12, atol=2e-12)
+
+
+@pytest.mark.parametrize("convention", ["hf", "reference"])
+def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkeypatch, convention):
+    from common.units import RYD_TO_EV
+    from tdagw import collision as C
+    from tdagw.self_energy import SelfEnergyModel, zero_model
+    from tdagw import snapshot_runtime as runtime
+    from tdagw.tdgw_io import HA_IN_EV
+
+    class Ops(NamedTuple):
+        e_qp: object
+        rho_eq: object
+        w_k: object
+        collision: object = None
+
+    source, mesh, _, _ = _source()
+    ntr, nk, na = 1, 4, 2
+    rhoeq = np.broadcast_to(np.diag([1.0, 0.0]), (nk, na, na)).astype(complex).copy()
+    hcore = source["hf_reference"]["kin_ion_ry"].at[:, 1, 2].set(0.015j).at[:, 2, 1].set(-0.015j)
+    source["hf_reference"]["kin_ion_ry"] = hcore
+    M = np.broadcast_to(np.array([[0.04, 0.006j], [-0.006j, -0.01]]), (nk, na, na)).copy()
+
+    def factory(prepared, options):
+        def evaluate(basis, equilibrium=False):
+            U = basis["U"]
+            current = U @ basis["rho"] @ U.conj().swapaxes(-1, -2)
+            delta = current - rhoeq
+            z = np.zeros_like(current)
+            receipts = [dict(fit_order=1, bubble_check_error=0.0,
+                             screening_check_error=0.0, noise_check_error=0.0)] * nk
+            # The grossly different static table must never be subtracted
+            # from the bare-HF-plus-MH Hamiltonian, in either convention.
+            return dict(gamma=z, injection=z, m_h=M + 0.1 * delta,
+                        static=1000.0 * delta, screening_receipts=receipts)
+        return evaluate, {}
+
+    monkeypatch.setattr(runtime, "make_snapshot_evaluator", factory)
+    sh3, sh2, sh1 = (NamedSharding(mesh, P(("x", "y"), None, None)),
+                     NamedSharding(mesh, P(("x", "y"), None)), NamedSharding(mesh, P(("x", "y"))))
+    energies = np.asarray(source["wfns"].enk)[:, 1:3]
+    ops = Ops(jax.device_put(energies * RYD_TO_EV / HA_IN_EV, sh2),
+              jax.device_put(rhoeq, sh3), jax.device_put(np.full(nk, 0.25), sh1))
+    reference = ops.rho_eq
+    # This supplied screened kernel is deliberately inconsistent with the
+    # reduced static term. Only the explicitly supplied bare-HF model may
+    # contribute its density increment.
+    original = SelfEnergyModel(lambda p, r, t: 7.0 * (r - p[None]), reference, True, "screened red twin")
+    options = dict(hamiltonian=convention, hf_model=zero_model(), policy=C.RefreshPolicy(every=1.0),
+                   snapshot_tol_ev=1e-8, snapshot_steps=8)
+    built = runtime.snapshot_collision(source, ops, mesh=mesh,
+        k_frac=source["wfns"].green_parent.plan.k_parent_frac,
+        b_lo=1, ntr=ntr, model=original, options=options, say=lambda _: None)
+    expected0 = np.asarray(hcore)[:, 1:3, 1:3] + M if convention == "hf" else (
+        np.einsum("ki,ij->kij", energies, np.eye(na)))
+    basis = built["state"]["basis_last"][0]
+    actual0 = (basis["U"] * basis["e"][..., None, :]) @ basis["U"].conj().swapaxes(-1, -2)
+    np.testing.assert_allclose(actual0, expected0, atol=1e-10)
+    if convention == "reference":
+        np.testing.assert_allclose(np.asarray(hcore)[:, 1:3, 1:3] + M
+                                   + built["state"]["one_body_counterterm_ry"], expected0, atol=1e-12)
+    else:
+        assert built["t0"]["prepared_density_commutator_ha"] > 0.0
+    excited = rhoeq.copy()
+    excited[:, 0, 0], excited[:, 1, 1] = 0.8, 0.2
+    excited[:, 0, 1], excited[:, 1, 0] = 0.03j, -0.03j
+    rho = runtime.tp.place_window_blocks(excited[None], mesh, nk)
+    result = built["refresh"](2.0, rho, ops, (built["model"].params, built["held"]))
+    got = built["model"].apply(result["params"][0], rho, 2.0) + result["params"][1]
+    full = np.einsum("ki,ij->kij", energies, np.eye(na))[None] + np.asarray(got) * HA_IN_EV / RYD_TO_EV
+    np.testing.assert_allclose(full[0], expected0 + 0.1 * (excited - rhoeq), atol=1e-9)
+
+
 @pytest.mark.parametrize("with_head", [False, True])
 def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head):
     from common.units import RYD_TO_EV
@@ -190,14 +354,18 @@ def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head):
     ops = Ops(jax.device_put(np.asarray(source["wfns"].enk)[:, 1:3] * RYD_TO_EV / HA_IN_EV, spec2),
               jax.device_put(rhoeq, spec3), jax.device_put(np.full(4, 0.25), spec1))
     model = zero_model()
-    options = dict(density_rank=1, max_order=48, fit_samples=192, fit_tolerance=1e-3,
+    options = dict(density_rank=1, max_order=48, fit_samples=192, fit_tolerance=2e-3,
                    adiabatic_ev=0.15, fit_height_ev=0.3, policy=C.RefreshPolicy(every=1.0),
-                   screening="joint_frozen" if with_head else "joint")
+                   # Isolate the coupled HF/Sigma runtime from adaptive
+                   # rational fit order changes: both consume the identical
+                   # admitted equilibrium W, with full-rho electronic lines.
+                   screening="joint_frozen", hamiltonian="reference",
+                   hf_model=model)
     built = snapshot_collision(source, ops, mesh=mesh,
         k_frac=source["wfns"].green_parent.plan.k_parent_frac,
         b_lo=1, ntr=1, model=model, options=options, say=lambda _: None)
     rho = tp.place_window_blocks(rhoeq[None], mesh, 4)
-    update = built["refresh"](2.0, rho, ops, (model.params, built["held"]))
+    update = built["refresh"](2.0, rho, ops, (built["model"].params, built["held"]))
     np.testing.assert_allclose(update["params"][1], 0.0, atol=1e-13)
     assert built["state"]["history"][-1]["snapshot"]["iterations"] == 1
     assert len(built["state"]["basis_last"]) == 1

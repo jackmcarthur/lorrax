@@ -31,13 +31,17 @@ density matrix and converges the material Hamiltonian and coherent M_H
 correction together. `collision_snapshot_steps`, `collision_snapshot_tol_ev`
 and `collision_snapshot_mixing` bound the solve; an unconverged snapshot
 refuses. Accepted eigenpairs and collision tables come from the same final
-sweep. The material kernel uses the reference-counterterm Hartree plus
-screened-exchange convention; an absolute bare-HF closure additionally needs
-an explicit DFT exchange-correlation counterterm.
+sweep. Joint screening replaces the screened-exchange increment by bare HF.
+`collision_hamiltonian = "hf"` reconstructs its absolute baseline from the
+source's authenticated kinetic/ionic, Hartree and Fock matrices, then includes
+M_H once. `reference` instead anchors the bare-HF/dynamical increments to the
+existing reference energies; this is a distinct effective reference model,
+not a claim that DFT energies solve the absolute QSGW-like closure.
 
-The equilibrium collision counterterm and the static-W subtraction from the
-Hermitian update have separate roles: the former defines `subtracted`, while
-the latter avoids counting the static interaction already in K δρ twice.
+The equilibrium collision counterterm defines `subtracted`. The legacy frozen
+screened-exchange kernel additionally needs its static-W subtraction. Joint
+modes use a bare-HF kernel and no static reduced-W subtraction, avoiding a
+full-kernel/reduced-screening mismatch.
 `collision_screening = "refreshed"` and `"shared_pole"` now refuse at
 `td_collision_keldysh_screening`. Their retained machinery is a
 retarded/population snapshot; it does not implement the joint response/noise

@@ -119,6 +119,12 @@ class observe_window_sigma_source:
       ``recipe_inputs`` (``gw.gw_jax``'s census inputs and requested reads),
       with which the refit re-resolves the recipe at its own census.
 
+    A one-shot driver's post-Sigma seam also supplies ``hf_reference``:
+    authenticated kinetic+ionic, equilibrium Hartree and bare exchange
+    matrices in Ry, their band interval and bare-head coefficient. These
+    already computed matrices define the absolute HF baseline; no DFT Vxc
+    input or additional self-energy sweep is required.
+
     The device fields of the poles and the carriers are copied at the seam (a
     later stage may donate the originals); the last stage of the block wins.
     """
@@ -143,6 +149,29 @@ _SCREENING_FIELDS = ("fit_plan", "W_supports", "screening_inputs", "recipe_input
 def observing_window_source() -> bool:
     """Whether an :class:`observe_window_sigma_source` block is open (the seams' one test)."""
     return bool(_WINDOW_SOURCE_OBSERVERS)
+
+
+def publish_window_hf_reference(kin_ion, sigma_result, static_head, meta, band_slices):
+    """Capture the already computed one-shot HF matrices for TD snapshots.
+
+    Arrays are ``(nk,nb,nb)`` Ry in the authenticated source WFN gauge.
+    The observer owns copies; no Hartree/Fock stage or frequency sweep is
+    repeated. This seam is a no-op when no TD source observer is open.
+    ``kin_ion`` is pristine T+Vloc+VNL, so reconstructing absolute HF
+    needs no separately supplied DFT Vxc matrix.
+    """
+    if not _WINDOW_SOURCE_OBSERVERS or sigma_result is None:
+        return
+    if sigma_result.hartree_omitted:
+        raise ValueError("GATE td_snapshot_hf_reference: source omitted its Hartree matrix")
+    reference = dict(
+        kin_ion_ry=jnp.copy(kin_ion), hartree_ry=jnp.copy(sigma_result.v_h_kij_ry),
+        exchange_ry=jnp.copy(sigma_result.sigma_x_kij_ry),
+        band_start=int(band_slices.b0), band_stop=int(band_slices.b3),
+        bare_head_coefficient_ry=(0.0 if static_head is None else
+            float(np.real(static_head.vc0)) / (float(meta.cell_volume) * int(meta.nk_tot))),
+        basis="source_wfn", kset=sigma_result.kset)
+    publish_window_source(hf_reference=reference)
 
 
 def _copy_device(tree):
