@@ -918,3 +918,17 @@ placement uses the process-local collective owner for a remote-rank mesh.
 Current T, density, energy and K/D actions must still be rebuilt/supplied;
 this helper is not wired into production, and its covariance tests admit
 neither a full-q model nor a physical trajectory.
+
+A possible future capacity alternative, **not implemented**, is to retain
+the ordered reference seed descriptors and their full canonical coefficient
+map $Q_{\rm ref}=S_{\rm ref}C$, then regenerate one parent per staged round.
+The current stored left singular rotation alone is insufficient: C must
+also compose every CGS2 overlap update and the small QR/SVD factors, without
+normal-equation inversion. Reference E/rho/gamma, full-W right/adjoint actions,
+sector projections and q/crossing maps define the original space and may
+not be silently replaced by current values during regeneration. Reconstructed
+projector/orthogonality checks and gauge transport would precede projection
+of the **current** T/K/D/V. This caches a numerical space, not a physical
+fluctuation history. Its extra GEMMs, reconstruction conditioning and staged
+memory must be measured against retaining or streaming full Q through the
+existing owners; no memory reduction or speedup is admitted by this design.
