@@ -39,6 +39,31 @@ def bright_subgap_summary(energies_ev, residual_ev, dipoles, *, gap_ev, nk):
         optical_approximation="full-protected U^H v_DFT U divided by current SC gap")
 
 
+def band_pair_summary(pair_power, *, nocc):
+    """Small physical-band weights after summing native eigenvector power over k.
+
+    Input is [root, conduction, valence], with padding already excluded.
+    Weights diagnose containment within THIS finite-window BSE solution;
+    they are not a larger-window convergence or optical-oscillator certificate.
+    """
+    import numpy as np
+    power = np.asarray(pair_power, float)
+    if (power.ndim != 3 or power.size > 65536 or not np.isfinite(power).all()
+            or np.any(power < 0) or power.shape[-1] > int(nocc)):
+        raise ValueError("BSE band weights require bounded finite nonnegative physical pair power")
+    norm = power.sum(axis=(1, 2))
+    if np.any(norm <= 0):
+        raise ValueError("BSE band weights require nonzero physical eigenvectors")
+    nc, nv = power.shape[1:]
+    c, v = np.arange(nocc, nocc+nc), np.arange(nocc-nv, nocc)
+    weights = power/norm[:, None, None]
+    core = ((c < nocc+2)[:, None] & (v >= nocc-2)[None, :])
+    return dict(conduction_bands_zero_based=c.tolist(), valence_bands_zero_based=v.tolist(),
+        physical_norm=norm.tolist(), normalized_pair_weights=weights.tolist(),
+        central_2v2c_weight=(weights*core[None]).sum(axis=(1, 2)).tolist(),
+        scope="k-summed eigenvector power in this finite BSE window; not a larger-window convergence test")
+
+
 def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
     """Solve and check the native TDA BSE on the same full-q accepted SC state.
 
@@ -179,6 +204,10 @@ def run_bse_probe(source, *, out, nval=4, ncond=4, nroots=24, maxiter=200):
     gap = (energy[:, nocc:].min()-energy[:, :nocc].max())*RYD_TO_EV
     report = bright_subgap_summary(np.asarray(gather_to_host(values))*RYD_TO_EV,
         residual_ev, dipoles, gap_ev=gap, nk=nk)
+    pair_power = jax.jit(lambda x: jnp.sum(
+        jnp.abs(x[:, 0, :ncond, :nval])**2, axis=-1))(vectors)
+    report["band_pair_weights"] = band_pair_summary(
+        np.asarray(gather_to_host(pair_power)), nocc=nocc)
     report.update(nval=int(nval), ncond=int(ncond), nk=nk,
         iterations=int(iterations), maxiter=maxiter, head=head_log,
         screening_model=dict(source['W_by_role']['shared_pole']),

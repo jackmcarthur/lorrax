@@ -125,3 +125,18 @@ and nonlinear pulse need separate bright-target/window and resource gates.
 Focused local parser/gauge/provenance tests are
 `test_sc750_td_callback.py` and `test_native_frozen_map_probe.py`; they do not
 replace a real multihost material callback execution.
+
+`sc750_static_control.py` prepares the distinct coherent arm
+`A_STATIC_SEX_HARTREE_NO_COLLISION` from the live fine-grid static-W owner.
+It reuses the native full-centroid exchange and Hartree kernels without
+exporting zeta. Hartree keeps the original G=0-excluded bare V0; exchange
+receives the actual W(0) body and its head once. `HeadSample.wcoul0` is FULL
+screened W, not Wc: the adapter injects that value alone, then sets the
+separate scalar exchange-head term to zero. Its CPU literal-k-sum oracle
+checks full coherences, bare-Hartree preservation and this head convention.
+No material/GPU trajectory or active44/pulse calibration is claimed. Turning
+collisions off on the SC builder's bare-HF model is NOT this static TD-aGW arm.
+The next-version BSE callback also publishes bounded k-summed root/c/v
+weights and central-2v2c containment. This measures the existing finite BSE
+solution, not convergence in a larger window. It does not alter the pinned
+source68 callback used by the already prepared material probe.

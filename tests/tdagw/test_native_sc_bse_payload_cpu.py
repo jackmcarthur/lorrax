@@ -88,3 +88,6 @@ def test_native_bse_callback_toy_static_payload_actual_solver(tmp_path, monkeypa
     saved = json.loads((target/'bright_subgap.json').read_text())
     assert saved['frame']['frame'] == 'DECLARED_SYNTHETIC_ACCEPTED_INPUT'
     assert saved['energies_ev'] == result['energies_ev']
+    weights = saved['band_pair_weights']
+    assert weights['central_2v2c_weight'] == [1.]
+    np.testing.assert_allclose(weights['normalized_pair_weights'], [[[1.]]])
