@@ -354,14 +354,19 @@ class ConstructorCapacity:
     def eigh_bytes(self, extent):
         """The eigh stack's compiled figure at ``extent`` (``distrib_la.eigh_stack_bytes``), its
         first attempt: the selection's stacks run eagerly and a face round's inside its
-        checked first program; cached and recorded in the receipt's ``native_queries``."""
+        checked first program; cached and recorded in the receipt's ``native_queries``.
+        A local constructor's stacks run on route (c) under the run's own room and cut (a
+        selection) or inside its round program (a reduction): proposed, not compiled
+        (``distrib_la.eigh_stack_proposal``)."""
         import distrib_la
         shapes = ((self.batch_width, int(extent), int(extent)),)
         if ("eigh", shapes) not in self.native_queries:
-            self.native_queries[("eigh", shapes)] = distrib_la.eigh_stack_bytes(
-                constructor_price_plan(self._mesh_xy, int(extent), self.execution,
-                                       backend=self._resolution.eigh_backend),
-                shapes[0], np.complex128, phase="first")
+            self.native_queries[("eigh", shapes)] = (
+                distrib_la.eigh_stack_proposal(self._mesh_xy, shapes[0], np.complex128)
+                if self.execution == "local" else distrib_la.eigh_stack_bytes(
+                    constructor_price_plan(self._mesh_xy, int(extent), self.execution,
+                                           backend=self._resolution.eigh_backend),
+                    shapes[0], np.complex128, phase="first"))
         return self.native_queries[("eigh", shapes)]
 
     @property
