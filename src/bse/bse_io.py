@@ -40,10 +40,10 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
 
 from .bse_densify import (W_HEAD_DENSIFY_MODES, _interpolate_bse_data_to_grid,
                           _parse_grid_spec, _read_lorrax_input_quietly,
-                          _resolve_bse_k_grid, _zeropad_R_axis,
-                          build_w_head_channel, decimate_W_q_to_subgrid,
-                          make_w_densifier, pad_W_R_to_grid,
-                          resolve_w_head_densify)
+                          _resolve_bse_k_grid, build_w_head_channel,
+                          decimate_W_q_to_subgrid, make_w_densifier,
+                          pad_W_R_to_grid, resolve_w_head_densify,
+                          w_pair_embedding)
 from .bse_head import (_inject_q0_head, _parse_head_overrides,
                        _resolve_head_params)
 from .bse_loading import (_load_ring_subset, _pad_first_two_axes, _pad_last_axis, _pad_last_two_axes, load_bse_data_from_restart_sharded)
@@ -67,5 +67,6 @@ __all__ = [
     "resolve_band_window",
     "resolve_n_occ",
     "resolve_w_head_densify",
+    "w_pair_embedding",
     "write_eigenvectors_stream",
 ]

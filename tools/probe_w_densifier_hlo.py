@@ -46,7 +46,8 @@ _GATHER_OPS = ("all-gather", "all-to-all")
 
 
 def main() -> int:
-    from bse.bse_io import pad_W_R_to_grid, make_w_densifier
+    from bse.bse_io import make_w_densifier, pad_W_R_to_grid
+    from common.ws_images import pair_ws_images
 
     devs = jax.devices()
     if len(devs) < 4:
@@ -66,12 +67,15 @@ def main() -> int:
     # Eager single-process reference (legal here: one process, replicated
     # semantics) — the sharded densifier must reproduce it.
     W_R_ref = jnp.fft.ifftn(jnp.asarray(W_np), axes=(2, 3, 4), norm="ortho")
-    W_R_ref = pad_W_R_to_grid(W_R_ref, fine)
+    lat = 6.0 * np.array([[1, 0, 0], [-.5, np.sqrt(3) / 2, 0], [0, 0, 4.0]])
+    emb = pair_ws_images(coarse, lat, rng.random((n_mu, 3)), 2)
+    W_R_ref = pad_W_R_to_grid(W_R_ref, fine, embedding=emb)
     W_k_ref = jnp.fft.fftn(W_R_ref, axes=(2, 3, 4), norm="ortho")
 
     failed = False
     for output, ref in (("k", W_k_ref), ("R", W_R_ref)):
-        fn = make_w_densifier(mesh, w_spec, fine, output=output)
+        fn = make_w_densifier(mesh, w_spec, fine, output=output,
+                              embedding=emb)
         hlo = fn.lower(W_q).compile().as_text()
         bad = [ln.strip() for ln in hlo.splitlines()
                if any(op in ln for op in _GATHER_OPS)]

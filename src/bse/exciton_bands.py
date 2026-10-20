@@ -144,7 +144,7 @@ from common.progress import LoopProgress
 from common.provenance import lorrax_version, provenance_header
 from common.scientific_output import abs_path, band_range, policy
 from runtime.run_session import RunSession
-from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, build_w_head_channel, resolve_w_head_densify, _resolve_head_params, PAD_EPS_GUARD_RY)
+from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, w_pair_embedding, build_w_head_channel, resolve_w_head_densify, _resolve_head_params, PAD_EPS_GUARD_RY)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_preconditioner import compute_pair_amplitude
@@ -1324,8 +1324,8 @@ def build_parser():
     ap.add_argument("--w-coarse-grid", type=str, default=None,
                     help="NX,NY,NZ — sample the screened W on this COARSE BZ "
                          "sub-grid (a divisor of the WFN/BSE grid), then "
-                         "zero-pad W_R back to the fine grid (exact trig "
-                         "interpolation) for the direct term.  Enables cheap "
+                         "embed W_R per centroid pair (Wigner-Seitz) on the "
+                         "fine grid (trig interpolation) for the direct term.  Enables cheap "
                          "coarse-W + fine exciton sampling.  Default (unset) "
                          "keeps the native fine W byte-identical.")
     ap.add_argument("--w-head-densify", type=str, default=None,
@@ -2153,7 +2153,7 @@ def main(argv=None):
                 # Coarse-W → fine direct term.  Sub-sample the fine W_q onto the
                 # coarse BZ sub-grid (same ISDF μ-basis; q=0 head-tile preserved),
                 # then the ONE sharded densifier (bse_io.make_w_densifier: shard_map
-                # ifft to the coarse R-lattice + jitted R zero-pad = exact trig
+                # ifft to the coarse R-lattice + jitted per-pair WS embedding = trig
                 # interpolation, (μ,ν) sharding preserved throughout — no eager pad
                 # + device_put re-shard).  The convolution then runs on the fine
                 # grid with the fine (nkx,nky,nkz) solver — cheap coarse W, fine
@@ -2195,8 +2195,13 @@ def main(argv=None):
                         _gamma_only_grid((nkx, nky, nkz), -head_ch["whead"]),
                         head_ch["cell_volume"])
                 W_q_coarse = decimate_W_q_to_subgrid(W_q_fine_in, cg)
-                densify_W = make_w_densifier(mesh_xy, sh.W.spec, (nkx, nky, nkz),
-                                             output="k" if head_ch else "R")
+                densify_W = make_w_densifier(
+                    mesh_xy, sh.W.spec, (nkx, nky, nkz),
+                    output="k" if head_ch else "R",
+                    embedding=w_pair_embedding(
+                        cg, wfn, centroids_path, keep_idx,
+                        int(W_q_coarse.shape[0]), meta.sys_dim,
+                        restart_file=restart_file))
                 W_dense = densify_W(W_q_coarse)
                 if head_ch is not None:
                     S_fine = build_w_head_channel(
@@ -2219,7 +2224,7 @@ def main(argv=None):
                 else:
                     W_R = W_dense
                 log(f"[coarse-W] W sampled on {cg[0]}x{cg[1]}x{cg[2]} sub-grid of "
-                    f"{nkx}x{nky}x{nkz}, zero-padded in R (trig-interp to fine "
+                    f"{nkx}x{nky}x{nkz}, embedded per centroid pair in R (trig-interp to fine "
                     f"grid) [w_head_densify={w_head_mode}"
                     + (f", gamma_cell={args.w_head_gamma_cell}]"
                        if head_ch else "]"))
