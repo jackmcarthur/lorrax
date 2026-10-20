@@ -36,6 +36,14 @@ Chi already includes all160 bands, but larger external-energy transforms,
 full44x44 collision matrices, wider active phases and snapshot storage
 still need pricing. Adapt the window authentication/plotting before using
 these helpers on44 bands; do not relabel 2v2c data as the larger window.
+The saved canonical DFT energy table (current160_energy.npz, SHA256
+e87acf02e2286cf6fb5423eed73476e064b8b982499e49883a86f3dc85254b09)
+spans6.70403eV in[100,144), versus8.39510eV in[88,144) and1.85550eV
+in[128,132). Its minimum direct lower-edge separation E100-E99 is only
+20.1002meV; this is not the isolated lower edge of the old56-band group.
+These are read-only source-table measurements, not a leakage/convergence
+test or an instantaneous interacting gap. At201 time samples/36k, complex128
+rho alone occupies about224MB/trial for44 bands, versus1.85MB for4.
 Existing band-extrapolation constraints and missing TD adapter are described
 in docs/theory/band-extrapolation.md; do not enable it on this160-band case.
 
