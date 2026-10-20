@@ -203,7 +203,9 @@ def build_sc_td_reference(source, frame, inputs, *, mesh, active):
     Returns a plain bundle ``header, ops, model, prepared, receipts``.
     H0 is the accepted SC dispersion ONCE. The model adds bare HF(rho-rho0);
     snapshot_collision with ``hamiltonian='reference'`` adds MH-MH0, while
-    leaving the RAW collision operator untouched. This anchor is an explicit
+    leaving the RAW collision operator untouched. The joint-deck Hermitian
+    mode is named ``dynamic``; it retains the complete complex-matrix MH.
+    This anchor is an explicit
     approximation, not an assertion that the reference is stationary under
     the finite-width collision closure. A zero-field drift test and native
     executable/provider memory admission remain required before propagation.
@@ -308,7 +310,7 @@ def build_sc_td_reference(source, frame, inputs, *, mesh, active):
         pair_receipt=pair_receipt, zero_field_drift_gate="required_not_run",
         executable_memory_admission="required_not_run", nk_pad=nk_pad)
     return dict(header=header, ops=ops, model=model, prepared=prepared, receipts=receipts,
-                snapshot_options=dict(hamiltonian="reference", form="raw", hermitian="full",
+                snapshot_options=dict(hamiltonian="reference", form="raw", hermitian="dynamic",
                                       statistics="retarded_reference", basis="instantaneous"))
 
 

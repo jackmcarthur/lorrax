@@ -145,6 +145,8 @@ def test_accepted_sc_builder_keeps_tail_mixing_gauge_and_anchor_once(monkeypatch
         frame["energy_ry"][:, 1:3]*RYD_TO_EV/HA_IN_EV, rtol=1e-14)
     assert built["receipts"]["protected_bands"] == [0, 4]
     assert built["receipts"]["collision_equilibrium_subtraction"] is False
+    # Joint decks call this mode 'dynamic'; the complete M_H is retained.
+    assert built["snapshot_options"]["hermitian"] == "dynamic"
     assert built["receipts"]["zero_field_drift_gate"] == "required_not_run"
     with pytest.raises(ValueError, match="twice"):
         S.bare_hf_coherent_model(built["model"], prepared, req, z, bare_head_ha=.013)

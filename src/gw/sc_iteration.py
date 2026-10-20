@@ -848,6 +848,15 @@ def _project_on_little_groups(inputs, H_loop, ks):
     """
     from file_io.qp_wfn import little_group_band_representations
     sym = inputs.sym
+    active = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
+    if active.size == 1:
+        rotation, translation, antiunitary = sym.operation_rows(active)
+        if (not bool(antiunitary[0]) and np.array_equal(rotation[0], np.eye(3))
+                and np.all(translation[0] == 0)):
+            # Full computational parents are not raw file IBZ indices.
+            # Their identity-only group needs no projection or file reload;
+            # source-file operations must not reimpose a discarded symmetry.
+            return H_loop.copy(), 0.0
     n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
     if ks is not None and not ks.is_identity:
         rows, parents = np.asarray(ks.rows), np.asarray(ks.labels)
