@@ -127,3 +127,80 @@ def test_live_pair_Galerkin_preserves_genuine_inverted_collective_gain_without_P
     np.testing.assert_allclose(pr,[[-2/((z+1j*gamma)**2-1)]],atol=4e-16)
     w=v@ar@np.linalg.solve(z*np.eye(2)-feedback,br.conj().T@v)
     np.testing.assert_allclose(w,np.linalg.solve(np.eye(1)-v@pr,v)-v,atol=4e-16)
+
+
+def test_exact_Dyson_right_and_dual_states_interpolate_actions_and_tangential_derivative():
+    """A possible future basis builder, not a production constructor test."""
+    rng=np.random.default_rng(716);nk,nb,ns,nmu=2,3,1,4
+    psi=.35*(rng.normal(size=(nk,nb,ns,nmu))+1j*rng.normal(size=(nk,nb,ns,nmu)))
+    energy=np.array([[-.8,-.1,.7],[-.6,.2,.9]])
+    rho=[]
+    for _ in range(nk):
+        u=np.linalg.qr(rng.normal(size=(nb,nb))+1j*rng.normal(size=(nb,nb)))[0]
+        rho.append(u@np.diag([.08,.43,.91])@u.conj().T)
+    rho=np.asarray(rho);partner=np.array([1,0]);gamma=.04
+    a,t,delta,kmat=_transition_maps(psi,energy,rho,partner)
+    d=np.diag(delta-1j*gamma);eye=np.eye(len(delta));z=.24+.37j
+    r=np.linalg.solve(z*eye-d,eye)
+    v0=rng.normal(size=(nmu,nmu))+1j*rng.normal(size=(nmu,nmu))
+    v=.035*(v0@v0.conj().T)
+    pr=a@r@t.conj().T
+    w=np.linalg.solve(np.eye(nmu)-v@pr,v)  # direct microscopic Dyson sample
+    direction=rng.normal(size=nmu)+1j*rng.normal(size=nmu)
+    test=rng.normal(size=nmu)+1j*rng.normal(size=nmu)
+    x=r@t.conj().T@w@direction
+    # RIGHT TO LEFT: apply K to T.H W.H test FIRST, then the diagonal
+    # adjoint resolvent. K and that resolvent must not be interchanged.
+    y=r.conj().T@kmat@t.conj().T@w.conj().T@test
+    wrong_y=kmat@r.conj().T@t.conj().T@w.conj().T@test
+    assert np.linalg.norm(kmat@d-d@kmat)>.1
+    assert np.linalg.norm(y-wrong_y)/np.linalg.norm(y)>.1
+    m=d+t.conj().T@v@a
+    left=v@a;right=t.conj().T@v
+    np.testing.assert_allclose((z*eye-m)@x,right@direction,rtol=2e-13,atol=2e-14)
+    np.testing.assert_allclose((z*eye-m).conj().T@y,left.conj().T@test,rtol=2e-13,atol=2e-14)
+    q=np.linalg.qr(np.column_stack([x,y]))[0]
+    mr=q.conj().T@m@q
+    rr=np.linalg.solve(z*np.eye(q.shape[1])-mr,np.eye(q.shape[1]))
+    wr=v+left@q@rr@q.conj().T@right
+    np.testing.assert_allclose(wr@direction,w@direction,rtol=3e-12,atol=3e-14)
+    np.testing.assert_allclose(test.conj()@wr,test.conj()@w,rtol=3e-12,atol=3e-14)
+    # dW/dz from the independent microscopic Dyson derivative, not a
+    # fitted pole derivative or a finite difference.
+    dw=w@(-a@r@r@t.conj().T)@w
+    dwr=-left@q@rr@rr@q.conj().T@right
+    np.testing.assert_allclose(test.conj()@dwr@direction,
+                               test.conj()@dw@direction,rtol=4e-12,atol=3e-14)
+    np.testing.assert_allclose(test.conj()@dw@direction,-np.vdot(y,x),rtol=4e-12,atol=3e-14)
+    qw=np.linalg.qr(np.column_stack([x,wrong_y]))[0]
+    rw=np.linalg.solve(z*np.eye(2)-qw.conj().T@m@qw,np.eye(2))
+    wwrong=v+left@qw@rw@qw.conj().T@right
+    # Wrong dual ordering still contains x, so right interpolation alone
+    # would MISS this bug. The left action and Hermite datum expose it.
+    np.testing.assert_allclose(wwrong@direction,w@direction,rtol=3e-12,atol=3e-14)
+    assert np.linalg.norm(test.conj()@(wwrong-w))>1e-5
+    dwrong=-left@qw@rw@rw@qw.conj().T@right
+    assert abs(test.conj()@(dwrong-dw)@direction)>1e-5
+
+
+def test_stationary_binary_K_sector_projection_preserves_passive_collective_structure():
+    rng=np.random.default_rng(717);nt,ports=12,4;gamma=.035
+    delta=np.r_[-np.linspace(.2,1.4,6),np.linspace(.3,1.7,6)]
+    kdiag=np.sign(delta);kmat=np.diag(kdiag)
+    t=.4*(rng.normal(size=(ports,nt))+1j*rng.normal(size=(ports,nt)))
+    q=np.zeros((nt,4),complex)
+    q[:6,:2]=np.linalg.qr(rng.normal(size=(6,2))+1j*rng.normal(size=(6,2)))[0]
+    q[6:,2:]=np.linalg.qr(rng.normal(size=(6,2))+1j*rng.normal(size=(6,2)))[0]
+    ar,br,dr=_project(t@kmat,t,delta,q,gamma)
+    j=np.diag([-1.,-1.,1.,1.])
+    np.testing.assert_allclose(ar,br@j,atol=3e-16)
+    v0=rng.normal(size=(ports,ports))+1j*rng.normal(size=(ports,ports))
+    v=v0@v0.conj().T
+    mreal=dr+1j*gamma*np.eye(4)+br.conj().T@v@ar
+    # J Mreal is positive Hermitian: this is the specific stationary
+    # sign-sector theorem, NOT a guarantee for arbitrary coherent Q.
+    positive=j@mreal
+    np.testing.assert_allclose(positive,positive.conj().T,atol=2e-14)
+    assert np.linalg.eigvalsh(positive).min()>.2
+    np.testing.assert_allclose(np.linalg.eigvals(mreal-1j*gamma*np.eye(4)).imag,
+                               -gamma,atol=3e-14)
