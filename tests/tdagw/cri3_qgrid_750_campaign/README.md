@@ -151,3 +151,37 @@ The next-version BSE callback also publishes bounded k-summed root/c/v
 weights and central-2v2c containment. This measures the existing finite BSE
 solution, not convergence in a larger window. It does not alter the pinned
 source68 callback used by the already prepared material probe.
+
+## Prepared larger-window driven comparison
+
+`sc750_driven_callback.py` is a separate, prepared post-Sigma callback; it
+does not weaken or replace the short zero-field gate above. Its explicit JSON
+plan comes from `example_plan()` and must name the actual matched BSE and
+completed zero-field artifacts. The requested 30v14c window is resolved by
+the existing multiplet owner, not silently split across a degeneracy.
+
+The three labels distinguish `A_STATIC_TDAGW_NO_COLLISION` (bare Hartree plus
+fixed-W screened exchange), `B_FROZEN_W_MGKBA` and `C_UPDATED_W_MGKBA`.
+Actual complete A trajectories calibrate two finite amplitudes near 0.01
+and 0.1 carriers/cell; B/C use those exact pulses and share the same initial
+equilibrium W. A differs in its coherent functional, while C minus B includes
+both real/coherent and collision changes. Neither difference alone measures
+irreversible damping. The internal `execute_mgkba` flag selects B/C execution;
+it is not a request for more user approval.
+
+Full density samples are in each native H5 file. Small refresh snapshots
+preserve material H/U/E, full complex shell pairs and fresh collision/boundary
+diagnostics; separate checkpoint health records measure held-rate drift.
+Gap records describe the propagated window, not a complete750-band gap.
+The actual frozen/reference basis and source producer are recorded separately.
+No 10fs material completion, usable BSE target or nonlinear response has yet
+been established by these adapter tests.
+
+`compare_sc750_driven.py CAMPAIGN --out NEW_DIRECTORY` reads only a completed
+three-arm campaign, requiring actual checkpoint coverage, matched fields,
+times, k points and weights. It plots raw polarization, carriers, C-minus-B
+and scale-separated waveform differences, plus available material-gap
+snapshots. Its report also compares polarization divided by the actual
+pulse amplitude across the two intensities. It performs no interpolation,
+equilibrium subtraction or damping-rate fit, and refuses calibration-only
+output. The host tests use explicitly synthetic small fixtures only.
