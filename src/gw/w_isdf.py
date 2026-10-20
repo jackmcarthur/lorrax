@@ -4,7 +4,7 @@ _services.ensure_on_path()
 from distrib_la import mesh_key as _mesh_key
 import time
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -899,6 +899,98 @@ def _get_chi_fractional_contour_kernel(
         layout=layout, ordered=ordered)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
+
+
+def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs,
+                                 layout="face", rule_reference_ry=0.0, moment_powers=(0, 0)):
+    """Full microscopic one-sided MGKBA commutator on shared time nodes.
+
+    Returned ``fn(times,weights,psi_mun,psi_nmu,psi_rho_mun,energy)`` takes
+    complex times ``t[node]`` in 1/Ry, weights ``[output,node]`` and native
+    full-k wavefunction faces. ``psi_rho_mun=psi_mun@rho`` retains ALL band
+    coherences; phases multiply its RIGHT energy-column index. Each node
+    computes ``GU(t)*conj(Gh(-conj(t)))-Gh(t)*conj(GU(-conj(t)))`` and its
+    flat-k FFT through the existing router. This is exactly greater-minus-
+    lesser after their quadratic-rho terms cancel, not a population pinch.
+
+    Output ``[q,output,mu,nu]`` is sharded on both centroid axes, in the
+    pair-vertex convention ``psi[k,b,mu] conj(psi[k-q,d,mu])``. It carries
+    the native raw ``1/sqrt(Nk)`` FFT normalization; response_algebra applies
+    the existing spin/Nk prefactor. No transition or spatial projection is
+    formed. Explicit full-k input is required: current rho need not possess
+    ANY ground-state point symmetry.
+    """
+    from ffi import ffi_dial_key
+    program = _full_density_response_program(mesh_xy, tuple(map(int, kgrid)), tuple(map(int, face_shape)),
+        tuple(map(int, q_ids)), int(n_outputs), layout, tuple(map(int, moment_powers)), ffi_dial_key())
+    # Reference is a small DYNAMIC operand, not a fresh jit closure per E.
+    # Only topology, shape and moment powers identify the compiled factory.
+    return lambda *args: program(*args, jnp.asarray(rule_reference_ry, dtype=jnp.float64))
+
+
+@lru_cache(maxsize=32)
+def _full_density_response_program(mesh_xy, kgrid, face_shape, q_ids, n_outputs, layout, moment_powers, dial_key):
+    from common.fft_helpers import make_flat_k_fftn
+    from distrib_la import gemm_plan
+    from .greens_function_kernel import build_G_tau
+    from .wavefunction_bundle import G_FFT7D_SPEC, CHI_Q_SPEC, CHI_R_SPEC
+    from common.wfn_layout import psi_specs
+    nk, nb, nmu, ns = map(int, face_shape)
+    grid = tuple(map(int, kgrid))
+    if nk != int(np.prod(grid)):
+        raise ValueError("GATE response_full_density: current full-k carrier required")
+    q_ids = np.asarray(q_ids, np.int32)
+    if not q_ids.size or np.any(q_ids < 0) or np.any(q_ids >= nk):
+        raise ValueError("GATE response_full_density: invalid exact q rows")
+    coords = np.unravel_index(q_ids, grid)
+    minus_q = np.ravel_multi_index(tuple((-c) % n for c, n in zip(coords, grid)), grid)
+    gfft = make_flat_k_fftn(mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
+    cfft = make_flat_k_fftn(mesh_xy, grid, CHI_Q_SPEC, norm="ortho")
+    plan = gemm_plan(mesh_xy, m=nmu*ns, k=nb, n=nmu*ns, nq=nk,
+                     dtype=jnp.complex128, layout=layout, warmup=False)
+    nmu_spec, mun_spec = psi_specs(layout)
+    rep = NamedSharding(mesh_xy, P())
+    out = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+    scalar = NamedSharding(mesh_xy, CHI_R_SPEC)
+
+    @partial(jax.jit, in_shardings=(rep, rep, NamedSharding(mesh_xy, mun_spec),
+             NamedSharding(mesh_xy, nmu_spec), NamedSharding(mesh_xy, mun_spec), rep, rep),
+             out_shardings=out)
+    def integrate(times, weights, psi_mun, psi_nmu, psi_rho_mun, energy, rule_reference_ry):
+        if weights.shape != (n_outputs, times.size):
+            raise ValueError("GATE response_full_density: inconsistent shared quadrature weights")
+        emin, emax = jnp.min(energy), jnp.max(energy)
+
+        def green(left, t, reference, power):
+            return gfft(build_G_tau(left, psi_nmu, energy, t, e_ref=reference,
+                                    band_weight=(energy-.5*(emin+emax))**int(power),
+                                    layout=layout, gemm=plan))
+
+        def correlation(left, right, t):
+            lower_ref = jnp.where(t.real >= 0, emin, emax)
+            upper_ref = jnp.where(t.real >= 0, emax, emin)
+            a = green(left, t, lower_ref, moment_powers[0])
+            a, right = jax.lax.optimization_barrier((a, right))
+            b = green(right, -jnp.conj(t), upper_ref, moment_powers[1])
+            return jax.lax.with_sharding_constraint(
+                jnp.einsum("kmanb,kmanb->kmn", a, b.conj()), scalar)
+
+        zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((n_outputs, q_ids.size, nmu, nmu), jnp.complex128), out)
+
+        def node(carry, i):
+            t, w = jax.lax.optimization_barrier((times[i], weights[:, i]))
+            forward = correlation(psi_mun, psi_rho_mun, t)
+            forward, t = jax.lax.optimization_barrier((forward, t))
+            value = cfft(forward-correlation(psi_rho_mun, psi_mun, t))
+            value = jnp.take(value, jnp.asarray(minus_q), axis=0)
+            delta_ref = jnp.where(t.real >= 0, emin-emax, emax-emin)
+            w = w*jnp.exp((rule_reference_ry-delta_ref)*t)
+            return carry+w[:, None, None, None]*value[None], None
+
+        result = jax.lax.scan(node, zero, jnp.arange(times.size))[0]
+        return jnp.swapaxes(result, 0, 1)
+    return integrate
 
 
 def _get_chi_fractional_contour_kernel_face(

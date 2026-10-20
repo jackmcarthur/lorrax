@@ -43,6 +43,51 @@ def _readonly(value, dtype) -> np.ndarray:
     return out
 
 
+def authenticate_canonical_full_grid(plan, kgrid, *, sym=None, tolerance=1e-6):
+    """Authenticate physical parent k/q row order for direct flat-grid FFTs.
+
+    An identity parent INDEX table does not authenticate coordinate order:
+    the no-symmetry service may preserve an arbitrarily ordered WFN table.
+    This boundary therefore verifies that ``plan.k_parent_frac[nk,3]`` is
+    the complete unshifted ``kgrid`` in canonical C order, modulo reciprocal
+    lattice translations. With ``sym`` supplied its full parent q integer
+    table and full-q row IDs must independently have that same order.
+
+    No nearest-grid mapping, sorting or independent orbital/Coulomb reorder
+    is performed. A shifted, incomplete or permuted physical grid refuses.
+    All operands are small host metadata; no wavefunction array is read.
+    """
+    grid = np.asarray(kgrid, dtype=np.int64)
+    if grid.shape != (3,) or np.any(grid < 1):
+        raise ValueError("GATE full_microscopic_fft_order: positive three-dimensional grid required")
+    nk = int(np.prod(grid))
+    k = np.asarray(plan.k_parent_frac, dtype=float)
+    if k.shape != (nk, 3) or not np.isfinite(k).all():
+        raise ValueError("GATE full_microscopic_fft_order: complete finite parent k coordinates required")
+    scaled = k*grid[None]
+    rounded = np.rint(scaled)
+    if np.max(abs(scaled-rounded), initial=0) > float(tolerance):
+        raise ValueError("GATE full_microscopic_fft_order: shifted/off-grid k coordinates; "
+                         "the direct FFT requires an unshifted canonical C-order grid")
+    integer = rounded.astype(np.int64) % grid[None]
+    rows = np.ravel_multi_index(integer.T, tuple(grid))
+    if not np.array_equal(rows, np.arange(nk)):
+        raise ValueError("GATE full_microscopic_fft_order: parent k coordinates are not in canonical C order; "
+                         "no implicit orbital reorder is authorized")
+    if sym is not None:
+        q = np.asarray(sym.q_irr_kgrid_int)
+        if q.shape != (nk, 3) or q.dtype.kind not in "iu":
+            raise ValueError("GATE full_microscopic_fft_order: complete integer parent q coordinates required")
+        qrows = np.ravel_multi_index((q % grid[None]).T, tuple(grid))
+        if (not np.array_equal(qrows, np.arange(nk))
+                or not np.array_equal(np.asarray(sym.q_irr_full_idx), np.arange(nk))):
+            raise ValueError("GATE full_microscopic_fft_order: Coulomb q coordinates are not in canonical C order; "
+                             "no independent Coulomb reorder is authorized")
+    return dict(grid=grid.tolist(), n_k=nk, k_order="canonical-C",
+                q_order="canonical-C" if sym is not None else "NOT_MEASURED",
+                unshifted=True, coordinate_tolerance=float(tolerance))
+
+
 #: ``id(plan) -> (plan, dirac_halves())``; the plan is held so its id stays unique.
 _DIRAC_HALVES: dict = {}
 
