@@ -180,8 +180,11 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
 
     Only ``E,A[l,r]`` (complex128) cross this seam, never full microscopic
     response samples, q stacks, or port factors. A two-sided SVD of the
-    horizontal/vertical pencil unions chooses numerical frequency spaces;
-    generalized LAPACK eigenvectors produce unchanged complex poles and
+    descriptor E chooses numerical frequency spaces for this strictly proper
+    finite-pole Loewner bank. A-visible directions unresolved in E are not
+    promoted into nearly infinite modal states. This is numerical rank
+    resolution, not a stable-pole projection: resolved growing poles remain.
+    Generalized LAPACK eigenvectors produce unchanged complex poles and
     independent input/output coefficient maps. No pole or residue is clipped.
     ``max_order`` bounds realization states, not the full spatial port count.
 
@@ -200,8 +203,8 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
             or int(max_order) < 1 or not 0 < rank_tolerance < 1):
         raise ValueError("GATE shared_general_pencil: finite compatible pencils required")
     nl, nr = E.shape
-    # Both concatenated SVD operands, their factors/workspace, the projected
-    # descriptor and both eigenspaces. This is an admission bound, not a
+    # Conservative inherited bound for descriptor factors/workspace, the
+    # projected descriptor and both eigenspaces. This is admission, not a
     # claim that LAPACK's hidden workspace is zero.
     price = 16 * (16 * nl * nr + 12 * min(nl, nr) ** 2)
     if price > int(max_workspace_bytes):
@@ -216,12 +219,8 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                         svd_seconds=0.,eigen_seconds=0.,host_reduce_seconds=time.perf_counter()-started))
     if fixed_spaces is None:
         svd_started=time.perf_counter()
-        y, sy, _ = la.svd(np.concatenate((E, A), axis=1) / scale,
-                         full_matrices=False, check_finite=False)
-        _, sx, xh = la.svd(np.concatenate((E, A), axis=0) / scale,
-                          full_matrices=False, check_finite=False)
-        n = min(int(max_order), int(np.count_nonzero(sy > rank_tolerance * sy[0])),
-                int(np.count_nonzero(sx > rank_tolerance * sx[0])))
+        y, singular, xh = la.svd(E / scale, full_matrices=False, check_finite=False)
+        n = min(int(max_order), int(np.count_nonzero(singular > rank_tolerance * singular[0])))
         if not n:
             raise ValueError("GATE shared_general_rank: nonzero response has no resolved frequency span")
         y, x = y[:, :n], xh[:n].conj().T
@@ -266,6 +265,7 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                              max_growth_ry=float(np.max(poles.imag)),
                              svd_seconds=svd_seconds,eigen_seconds=time.perf_counter()-eigen_started,
                              host_reduce_seconds=time.perf_counter()-started,
+                             numerical_spaces="two-sided-descriptor-svd",
                              construction="general-two-sided-tangential-loewner"))
 
 

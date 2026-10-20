@@ -1132,6 +1132,37 @@ are independent; one cannot replace the reverse product by the stationary
 conjugation shortcut. All supplied virtual bands remain, including frozen-active
 transitions. Frozen states have identity rotation and a per-side edge scissor.
 
+An exact finite-band identity clarifies causality without introducing
+propagated auxiliary states. With transition index $t=(k,b,d)$, vertex map
+$T_{\mu t}$ carrying the spin/k/metric factors, define
+
+$$
+\Delta_t=E_{kb}-E_{k-q,d},\qquad
+K_\rho=\bigoplus_k\left(I\otimes\rho_{k-q}^{T}-\rho_k\otimes I\right).
+$$
+
+The prescribed upper-endpoint bubble is
+$P^R(z)=T K_\rho(z-\Delta+i\gamma)^{-1}T^\dagger$.
+Density therefore belongs to the output map in this realization; moving
+$K_\rho$ across the resolvent would change the coherent ordering unless
+$[K_\rho,\Delta]=0$. Bare transition poles stay at $\Delta_t-i\gamma$.
+Woodbury gives
+
+$$
+W_c^R(z)=vT K_\rho(z-A_D)^{-1}T^\dagger v,\qquad
+A_D=\Delta-i\gamma+T^\dagger vT K_\rho.
+$$
+
+This identity is not a proposal to form the large transition matrix in
+production. Physical $0\preceq\rho\preceq I$ makes $K_\rho$ Hermitian with
+norm at most one, but does not make the feedback $A_D$ Hermitian, passive
+or stable. For example, a valid inverted two-level projector has
+$P^R(z)=-2\Delta/[(z+i\gamma)^2-\Delta^2]$; positive scalar $v$ gives
+$(z+i\gamma)^2=\Delta^2-2v\Delta$, which can have an upper-half-plane pole.
+Consequently, neither positivity of $\rho$ nor a fitted growing pole is
+evidence that the current microscopic Dyson response is stable or unstable.
+Suspect poles need independent current-response checks and refinement.
+
 Full microscopic Dyson samples/actions feed a two-sided tangential Loewner
 realization, using the source GW shared-pole support/direction recipe. Its
 frequency pole bank has the form
@@ -1878,6 +1909,29 @@ branch algebra and tiny native builder; neither substitutes for admission
 of the full material model, self-energy convergence, or matched frozen-W
 and updated-W trajectories. No full-microscopic 10 fs damping result is
 established by this evidence.
+
+A follow-up q=0 diagnostic at tree
+`5cfab98ede3d8a78888e91f908720f272607872a` (commit `ee2ec85`) retained the
+1226-by-1316 frequency pencil before refusal. The saved density was physical
+($\lambda(\rho)\in[0.002574,0.996949]$). Its 1224-pole model again had growth
+12.080938 Ry. All 24 native fitted/held sites had relative errors below
+1.28%, but the additional collision-height sites failed by up to 46.1%.
+Independent current microscopic Dyson evaluations near the suspect pole
+disagreed with the fit by relative errors 41.16 and 29.08, not percentages.
+This demonstrates an unsupported rational continuation, not a physical-gain
+diagnosis. Full-port $C_1,C_2$ relative defects were 0.8743 and 0.0438;
+these are diagnostics, not independently enforced moment gates.
+
+That bounded diagnostic stopped after one q model: host reduction took
+33.94 s (31.42 s eigensolve), not a measured 20-fold speedup of a complete
+map. Its response stream took 313.55 s with the new block quadrature but
+the old extensive added-verification geometry. Step cost was 0.53222 GPUh;
+no self-energy or physical-time propagation was performed. The pencil,
+exact-probe receipts and accounting are preserved in
+`/home/jackm/mgkba_campaign_20261019/full_microscopic_v4_20261020/`.
+Subsequent exact zero-product skipping and scoping of only the added
+verification sites reduces the scalar work to 3038 nodes; GPU savings and
+complex-self-energy accuracy remain separate, unmeasured questions.
 
 ### 8.2 Acceptance checks and earlier-member evidence
 

@@ -92,3 +92,25 @@ def test_frequency_only_grams_and_mixed_actions_equal_literal_complex_full_port_
 
 def la_solve(a,b):
     return np.linalg.solve(a,b)
+
+
+def test_descriptor_svd_is_distinct_accuracy_resolved_basis_without_owner_mutation(tmp_path):
+    import hashlib
+    from gw.shared_pole_constructor import reduce_general_pencil
+    owner_path=Path(reduce_general_pencil.__code__.co_filename)
+    before=hashlib.sha256(owner_path.read_bytes()).hexdigest()
+    e=np.diag([1.,1e-11]).astype(complex);a=np.diag([-.1j,.5j])
+    b=np.array([[1.],[0.]],complex);c=b.T.copy()
+    capture=tmp_path/'basis.npz';np.savez(capture,E=e,A=a,B=b,C=c)
+    union=helper.analyze(capture,max_order=2,tolerances=(1e-8,),basis='union')
+    records=[]
+    descriptor=helper.analyze(capture,max_order=2,tolerances=(1e-8,),basis='descriptor',record=records.append)
+    assert union['studies'][0]['selected_order']==2
+    row=descriptor['studies'][0]
+    assert row['selected_order']==1 and row['transfer']['maximum_growth_ry']==pytest.approx(-.1)
+    assert row['projected_E_singular_values']['condition']<=1e8
+    assert descriptor['basis_method']=='two-sided SVD(E)'
+    assert descriptor['left_union_singular_values'] is None
+    assert descriptor['production_reducer_sha256']==before==hashlib.sha256(owner_path.read_bytes()).hexdigest()
+    assert records[0]['status']=='RUNNING_DIAGNOSTIC_NOT_ADMITTED'
+    assert records[-1]['status']=='COMPLETE_DIAGNOSTIC_NOT_ADMITTED'

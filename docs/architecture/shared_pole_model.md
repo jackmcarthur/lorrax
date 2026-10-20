@@ -642,10 +642,13 @@ fallback when a block rule refuses. Node counts and output-node updates
 are reported separately; fewer carried outputs do not imply fewer Greens.
 
 All original native fit and held supports retain their exact IDs, order and
-values. Only the **additional** low-height verification supports are confined
-to the current propagated active energy-difference span (including zero,
-midpoint and edge), through `active_eta_verification_sites`. This is a
-verification geometry choice, not a self-energy error certificate. Full
+values. `active_eta_verification_sites` adds low-height training at zero,
+half and the edge of the current propagated active energy-difference span,
+with independent held points at one-quarter and three-quarters. Explicit
+position tables distinguish training from holds even though native IDs stay
+unchanged. Exact duplicate/collapsed-span collisions are recorded, never
+used as fictitious independent holds or to promote native held data into
+training. These are numerical geometry choices, not a self-energy error certificate. Full
 complex self-energy refinement, including real/offdiagonal components and
 collision operators, remains necessary before claiming numerical convergence.
 
@@ -676,8 +679,21 @@ realization's signed-frequency budget is twice that count, not an extra
 factor-of-two truncation. Full microscopic Dyson actions enter
 `shared_pole_pencil.general_tangential_pencil`. Independent left/right
 actions produce $E,A,B,C$ with $W_c(z)=C(zE-A)^{-1}B$.
-`shared_pole_constructor.reduce_general_pencil` uses two-sided SVD spaces
-and a general, biorthogonal eigensolve, without Hermitian/PSD projection.
+Infinity rows use exact bare/Dyson coefficients projected onto the selected
+infinity directions. They do not guarantee exact full-port moments after
+finite direction selection and numerical reduction. Full $C_1,C_2$ defects
+are reported as diagnostics, not independent admission gates. The held-W
+and Laplace-growth gates remain enforced; neither is a proof of self-energy
+convergence or of accurate asymptotic moments in every port direction.
+`shared_pole_constructor.reduce_general_pencil` uses the two-sided SVD of
+the descriptor E for this strictly proper finite-pole bank, with relative
+rank tolerance inherited from the source scalar bank tolerance. A-only
+directions unresolved in E are not promoted into nearly infinite modes.
+This is a numerical approximation checked against current response data,
+not a generic singular-descriptor equivalence or stable-pole projection.
+The general biorthogonal eigensolve retains resolved growing poles unchanged,
+without Hermitian/PSD projection. Held spaces remain canonical within the
+inner solve; current pencils and all response/growth checks are recomputed.
 The resulting full-port factors obey
 
 $$
