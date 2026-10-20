@@ -181,7 +181,7 @@ def _interband_program(mesh: Mesh, nb_logical: int):
         # first-order tensor, and its Fermi-surface share phi keeps only the
         # Hall (antisymmetric) part here; exact multiplets leave entirely.
         share = intraband_pair_fraction(v, delta, d_x, d_y, w_x, w_y, moment,
-                                        TOL_DEGENERACY_RY)
+                                        TOL_DEGENERACY_RY, f_diff=occupation)
         exact = jnp.abs(delta) < TOL_DEGENERACY_RY
         jet = offdiag & ~exact
         regular = jnp.where(jet, 1.0 - share, 0.0)

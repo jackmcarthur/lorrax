@@ -17,6 +17,9 @@ on the metal MPA plan and folded with a shared-pole Gamma body
   route at every node to 1e-12.
 * (c) ``W^c_h`` at the shifted origin is the folded Thomas-Fermi cell value
   ``<8 pi/(q.eps_inf.q + kappa_eff^2)> - <v>``, built here in numpy, to 1e-10.
+* (d) A thermal pair off the T = 0 surface (``w = 0``, smeared ``f_diff != 0``)
+  leaves the static interband head: ``S(0)`` does not depend on ``Delta``,
+  where the pair kept whole would grow as ``f'/Delta^2``.
 """
 from types import SimpleNamespace
 
@@ -251,3 +254,35 @@ def test_c_shifted_origin_is_the_folded_thomas_fermi_row(mesh):
     # not the Drude-remainder limit W_h -> 0 (W^c_h -> -<v>).
     w_h = (Wc[origin] + complex(vc0)).real
     assert 0.3 < w_h * kappa2_np / (8.0 * np.pi) <= 1.0, (w_h, kappa2_np)
+
+
+def _thermal_model(delta):
+    """The split pair 0.05 Ry below mu, off the T = 0 surface: w = 0, f_diff != 0."""
+    e, f, s, psi, v = _model(delta, trs=False, couple_outer=False)
+    e = e.copy()
+    e[:, 1:3] -= 0.05
+    f = 1.0 / (1.0 + np.exp(e / KT))
+    s = s.copy()
+    s[:, 1:3] = 0.0
+    return e, f, s, psi, v
+
+
+@pytest.mark.parametrize("mesh", _meshes(), ids=lambda m: f"P{m.size}")
+def test_d_thermal_pair_off_the_surface_leaves_the_static_interband_head(mesh):
+    from gw.qsgw_head import head_s_tensor_sharded, metal_pair_split
+    bvec = 2.0 * np.pi / A * np.eye(3)
+    S0 = {}
+    for d in DELTAS:
+        e, f, s, psi, v = _thermal_model(d)
+        split = metal_pair_split(jnp.asarray(v), mesh=mesh, bvec_cart=bvec, kgrid=KGRID)
+        S0[d] = np.asarray(head_s_tensor_sharded(
+            jnp.asarray(v), e, f, [0.0], mesh=mesh, nb_logical=NB, cell_volume=OMEGA,
+            nk_tot=NK, nspin=1, nspinor=NS, surface_weight_kn=s, pair_split=split))[0]
+    ref = S0[DELTAS[-1]]
+    assert max(_rel(S0[d], ref) for d in DELTAS[:-1]) < 1.0e-3, S0
+    # Control variant: the pair kept whole (the tetrahedron gate alone).
+    e, f, _, _, v = _thermal_model(DELTAS[-1])
+    dE, fd = e[:, 2] - e[:, 1], f[:, 1] - f[:, 2]
+    whole = -4.0 / (OMEGA * NK * NS) * np.einsum(
+        "k,ak,bk->ab", fd / dE ** 3, np.conj(v[:, :, 2, 1]), v[:, :, 2, 1])
+    assert np.max(np.abs(whole)) > 1.0e3 * np.max(np.abs(ref)), (whole, ref)

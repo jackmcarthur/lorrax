@@ -328,7 +328,7 @@ _ATOM_BLOCK = 64
 
 
 def intraband_pair_fraction(v_local, delta_e, diag_bra, diag_ket, w_bra, w_ket,
-                            cell_moment, tol_ry):
+                            cell_moment, tol_ry, f_diff=None):
     r"""Fermi-surface share ``phi`` of each band pair of a metallic head tile.
 
     A pair's first-order long-wavelength vertex is the small-q end of the
@@ -341,14 +341,26 @@ def intraband_pair_fraction(v_local, delta_e, diag_bra, diag_ket, w_bra, w_ket,
               \epsilon^2=\mathrm{tr}\,Q\,[\delta v\,\delta v^{\sf T}+4\,\mathrm{Re}\,v_{nm}^*v_{nm}^{\sf T}],
 
     the interband tensor keeps ``1 - phi`` of the pair and the Fermi-surface
-    term takes ``phi``.  Only pairs with Fermi-surface weight
-    (``w_bra + w_ket > 0``) move; an exact degeneracy (``|Delta| < tol_ry``)
-    has ``phi = 1``.  On an insulator every weight vanishes and ``phi`` is the
+    term takes ``phi``.  A pair moves when either occupation measure gives it
+    Fermi-surface weight: the tetrahedron table of the intraband term
+    (``w_bra + w_ket > 0``) or the smeared occupation difference that weights
+    it in the interband sum (``f_diff != 0``, whose ``f_diff/Delta -> -f'``).
+    The moved share enters the intraband term once, with the tetrahedron
+    weight ``(w_bra + w_ket)/2``.  A pair seen only by ``f_diff`` (both states
+    off the T = 0 surface, ``w = 0``) therefore leaves the interband sum and
+    adds nothing: its thermal weight is the smearing's copy of surface content
+    the table already counts, and kept as interband it grows as
+    ``f'/Delta^2`` at ``z = 0`` (Fe 4^3: two pairs 1.9 eV below mu, split by
+    0.19 meV, gave 8 pi S_xx = -1.5e4).  ``D`` and the atoms weigh a pair by
+    ``(w_bra + w_ket)/2`` and pass no ``f_diff``: where ``w = 0`` the share
+    carries no weight there.  An exact degeneracy (``|Delta| < tol_ry``) has
+    ``phi = 1``.  On an insulator every weight vanishes and ``phi`` is the
     degeneracy rule.  ``docs/theory/metal-q0-head.md`` section 2.
 
     Shapes (one shard_map tile): ``v_local (3,nk,nx,ny)`` complex,
     ``delta_e (nk,nx,ny)``, ``diag_bra (3,nk,nx)``, ``diag_ket (3,nk,ny)``,
-    ``w_bra (nk,nx)``, ``w_ket (nk,ny)``, ``cell_moment (3,3)``.
+    ``w_bra (nk,nx)``, ``w_ket (nk,ny)``, ``cell_moment (3,3)``, ``f_diff``
+    ``(nk,nx,ny)`` (either sign convention) or ``None``.
     """
     import jax.numpy as jnp
 
@@ -361,6 +373,8 @@ def intraband_pair_fraction(v_local, delta_e, diag_bra, diag_ket, w_bra, w_ket,
     delta2 = delta_e * delta_e
     exact = jnp.abs(delta_e) < tol_ry
     on_surface = (w_bra[:, :, None] + w_ket[:, None, :]) > 0.0
+    if f_diff is not None:
+        on_surface = on_surface | (f_diff != 0.0)
     share = extent / jnp.where(exact, 1.0, delta2 + extent)
     return jnp.where(exact, 1.0, jnp.where(on_surface, share, 0.0))
 

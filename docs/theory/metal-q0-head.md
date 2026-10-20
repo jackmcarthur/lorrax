@@ -134,8 +134,14 @@ $$
 The interband tensor keeps $1-\phi$ of the pair and the Fermi-surface term
 takes $\phi$: $D$ gains $\phi\,\bar w_{nm}v^*_{nm}v_{nm}^{\sf T}$ and the state's
 atoms spread by $\sum_m\phi_{nm}\operatorname{Re}v^*_{nm}v^{\sf T}_{nm}$
-(`gw.fermi_surface.intraband_pair_fraction`). Only pairs with Fermi-surface
-weight ($\bar w_{nm}>0$) move. Exact degeneracies ($|\Delta|<10^{-6}$ Ry, BGW's
+(`gw.fermi_surface.intraband_pair_fraction`). A pair moves when either
+occupation measure gives it Fermi-surface weight: the tetrahedron table
+($\bar w_{nm}>0$) or the smeared occupation difference that weights it in the
+interband sum ($f_m-f_n\neq0$, with $(f_m-f_n)/\Delta\to-f'$). It enters the
+Fermi-surface term once, with $\bar w_{nm}$, so a pair seen only by the
+smearing (both states off the $T=0$ surface) leaves the interband sum and adds
+nothing: its thermal weight copies surface content the table already counts,
+and kept whole it grows as $f'/\Delta^2$ at $z=0$. Exact degeneracies ($|\Delta|<10^{-6}$ Ry, BGW's
 TOL_Degeneracy, a rounding tolerance) have $\phi=1$. On an insulator every
 $w$ vanishes, $\phi$ reduces to the degeneracy rule, and nothing changes.
 The scale is the cell's own ($\epsilon\sim|v|\,q_{\rm cell}$, falling as
