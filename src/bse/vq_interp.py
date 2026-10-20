@@ -2385,7 +2385,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
     # the guards, and conflating them is the defect this contract fixes.
     nb = nb_wide - n_guard
     ns = int(B_at_mu.shape[1])
-    # On a downfolded bundle ``initialize_wfns`` evaluates the one whole-state
+    # On a downfolded bundle ``initialize_wfns`` evaluates the one nodal
     # basis directly at ``keep_idx``.  B_at_mu is therefore born in the child
     # mu basis; no parent-width intermediate or after-the-fact slice exists.
     assert nk == zx["nk"] and ns == zx["ns"], \

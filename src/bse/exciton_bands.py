@@ -496,7 +496,7 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
     2026-08-10, PIPELINE_HEALTH.md).  The small bundle's basis is a SUBSET of
     the parent's centroid points (``docs/downfold.md``: ψ at the kept
     centroids is the column slice of the parent's), and the htransform leg must evaluate its fitted
-    whole-state basis at those same child points.  The basis itself is the
+    nodal basis at those same child points.  The basis itself is the
     nodal (Loewdin) basis of ``isdf.galerkin``, interpolated on an orbit-closed
     node set and back-mapped to these rows; centroid rows are evaluation
     points, not a second state-space fit or rank authority.  This function resolves the parent table
@@ -571,7 +571,7 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
             f"{prov.get('parent_file', '?')} (mu {mu_parent} -> "
             f"{n_rmu_bundle}).  Resolved parent table {path} ({whence}) and "
             f"its ordered {keep_idx.shape[0]}-row child subset.  The published "
-            f"whole-state htransform basis is evaluated directly on these "
+            f"nodal htransform basis is evaluated directly on these "
             f"child rows.")
         return path, keep_idx
 
@@ -581,7 +581,7 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
         f"run's centroid table to refit psi(k+Q); none of "
         f"{[c[0] for c in cands]} is a readable {mu_parent}-row table.\n"
         f"  Why the parent table: keep_idx names rows of that table; it is "
-        f"the coordinate authority needed to evaluate the whole-state basis "
+        f"the coordinate authority needed to evaluate the nodal basis "
         f"directly at the child points.  It is not a parent-width fit.\n"
         f"  Fix: re-run gw.downfold_cli with parent_centroids_file set to "
         f"the parent deck's centroids_file (the driver then records its path "
@@ -693,7 +693,7 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
             f"    * the refit window may be too narrow to carry the BSE "
             f"window's pair densities — widen the deck's nval/ncond and "
             f"re-run;\n"
-            f"    * or the fitted whole-state basis may not represent this "
+            f"    * or the fitted nodal basis may not represent this "
             f"window — check the [nodes] metric eps line, the "
             f"build_fH_R receipts and the full-r residual from "
             f"refit_prepare;\n"
@@ -823,7 +823,7 @@ def build_conduction_stacks(bundle, nQ, nk, n_cond, n_cond_pad, n_rmu,
     device; at 40 path points the old device_get→np.pad→2×device_put moved
     ~1.7 GB through the host).
 
-    Downfold selections are applied when the whole-state basis is evaluated;
+    Downfold selections are applied when the nodal basis is evaluated;
     the incoming bundle is already child-width.  There is no legacy
     parent-width slice in this consumer.
 
@@ -1536,7 +1536,7 @@ def main(argv=None):
         report.environment(wfn=wfn, lines=(
             f"Restart tensors: {abs_path(restart_file)}",
             "Transition data: distributed band and centroid blocks on X x Y",
-            "Galerkin basis: nodal, min(N_mu, 22 x fitted bands) "
+            "Galerkin basis: nodal (centroids up to 1.25 x 22 x fitted bands) "
             "orbit-closed nodes; quadrature metric + Loewdin; no rank search",
             f"Fine-k eigensolve: top block (fitted bands + "
             f"{ht.TOP_BLOCK_PAD}) by subspace iteration; operand layout "

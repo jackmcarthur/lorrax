@@ -2,9 +2,10 @@
 
 The nodes are an orbit-closed, charge-density-weighted k-means set (the
 centroid machinery of ``centroid.kmeans_cli``): the run's own ISDF centroids
-when there are at most ``NODES_PER_FITTED_BAND`` per fitted band, else a
-smaller selection at that count (``bandstructure.fh_interp.htransform_nodes``,
-cached beside the basis artifact).  Every coarse state of the fitted window
+when there are at most ``KMEANS_ABOVE x NODES_PER_FITTED_BAND`` per fitted
+band, else a smaller selection at ``NODES_PER_FITTED_BAND`` per band
+(``bandstructure.fh_interp.htransform_nodes``, cached beside the basis
+artifact).  Every coarse state of the fitted window
 is sampled there once, through the GW centroid-face path
 (``common.wfn_transforms.load_centroids_band_chunked``):
 
@@ -23,8 +24,10 @@ and ``ctilde[k, n, (s, nu)] = C_k[(s, nu), n]`` is used exactly like an
 orthonormal coefficient array (``C f C^H``).  ``C f C^H`` is unchanged by
 window unitaries that commute with ``f`` and ``G_k`` is gauge-covariant, so a
 node-pair kernel with per-pair Wigner-Seitz images (``common.ws_images``) is
-exactly covariant.  The fit logs ``eps = max_k ||G_k - 1||_2`` and the number
-of zero-weight nodes (they drop out of ``C``).
+exactly covariant.  The fit logs ``eps = max_k ||G_k - 1||_2``.  A
+zero-weight node's row of ``C`` is exactly zero, so it is dropped from the
+rank axis (whole orbits, since ``W`` is orbit-tied); the ISDF centroids stay
+the back-map targets.
 
 :class:`NodalInterp` carries the nodal values ``Phi``, the node geometry and,
 when the nodes are not the ISDF centroids, the same states sampled at the
@@ -69,16 +72,21 @@ __all__ = [
 ]
 
 
-NODE_SELECTION_VERSION = "kmeans-nodes-orbit-nnls-loewdin-v2"
+NODE_SELECTION_VERSION = "kmeans-nodes-orbit-nnls-loewdin-v3"
 
 #: Metric quality above which the fit warns.  Si 4^3 (36 fitted spinor
 #: bands, orbit-closed k-means, fit window 0:36): eps 0.37 / 0.12 / 1.6e-2 /
-#: 1.9e-3 / 1.0e-3 at 312 / 432 / 588 / 780 / 1100 nodes; off-grid DFT MAE
-#: 8.03 meV (max 62.7) at 312 nodes against 6.76 (max 27.4) at 780.
-NODE_METRIC_EPS_WARN = 1.0e-2
-#: Node count per fitted band that reached eps <= 1e-2 on Si 4^3 (780/36);
-#: MoS2 9x9 at 22.2 nodes per band (1198/54) reads eps 1.7e-2.
+#: 1.9e-3 / 1.0e-3 at 312 / 432 / 588 / 780 / 1100 nodes; off-grid DFT max
+#: error 62.7 meV at 312 nodes against 27.4 at 780 (MAE 8.03 / 6.76): the
+#: max doubles between eps 0.1 and 0.4.  MoS2 9x9 at 1198 centroids reads
+#: eps 1.7e-2 with the same error as the 1183-node k-means set (4.6e-2).
+NODE_METRIC_EPS_WARN = 1.0e-1
+#: Node count per fitted band that reached eps <= 1e-2 on Si 4^3 (780/36).
 NODES_PER_FITTED_BAND = 22
+#: The ISDF centroids are kept as the nodes up to this factor above
+#: NODES_PER_FITTED_BAND x fitted bands (a k-means set that drops only a few
+#: percent of the nodes saves nothing and worsens eps: MoS2 1198 -> 1183).
+KMEANS_ABOVE = 1.25
 _BASIS_FORMAT = 6
 _BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_nodal", "galerkin_loewdin",
                  "galerkin_target")
@@ -173,7 +181,9 @@ class GalerkinBasis:
     geometry); ``loewdin`` ``(nk, nb, nb)`` is ``G_k^{-1/2}``.  ``node_weights``
     are the metric weights ``w_nu``, ``metric_eps = max_k ||G_k - 1||_2``.
     ``rank_physical = ns * n_nodes`` excludes the exact-null mesh pad.
-    ``node_indices`` are the nodes' FFT-grid indices.  ``refit_rcond`` (deck
+    ``node_indices`` are the nodes' FFT-grid indices (zero-weight nodes
+    dropped); ``requested_nodes`` the node set the fit was asked for, when
+    it differs (the artifact's provenance).  ``refit_rcond`` (deck
     key ``htransform_qr_eps``) is used only by :func:`iter_galerkin_rchunks`,
     the relative cutoff of its node-Gram pseudo-inverse.  ``fit_seconds`` is
     the fit wall.
@@ -190,6 +200,7 @@ class GalerkinBasis:
     refit_rcond: float = 1.0e-3
     n_orbits: int = 0
     fit_seconds: float = 0.0
+    requested_nodes: tuple = ()
 
     def __post_init__(self) -> None:
         if self.ctilde.ndim != 3:
@@ -239,8 +250,8 @@ def galerkin_rank_record(basis: GalerkinBasis, *, meta) -> dict:
         "null_padding": carrier - physical,
         "fit_seconds": float(basis.fit_seconds),
         "metric_eps": float(basis.metric_eps),
-        "zero_weight_nodes": int(np.count_nonzero(
-            np.asarray(basis.node_weights) == 0.0)),
+        "zero_weight_nodes": (len(basis.requested_nodes) - len(basis.node_indices)
+                              if basis.requested_nodes else 0),
     }
 
 
@@ -300,7 +311,8 @@ def _basis_check(basis: GalerkinBasis, provenance: dict) -> None:
         raise ValueError("Galerkin basis payload disagrees with provenance")
     if basis.refit_rcond != provenance["refit_rcond"]:
         raise ValueError("Galerkin basis qr_eps disagrees with provenance")
-    if len(basis.node_indices) != provenance["node_shape"][0]:
+    if len(basis.requested_nodes or basis.node_indices) != \
+            provenance["node_shape"][0]:
         raise ValueError("Galerkin basis node count disagrees with provenance")
 
 
@@ -322,6 +334,10 @@ def _basis_write_meta(io, basis: GalerkinBasis, provenance: dict) -> None:
         provenance["refit_rcond"], basis.fit_seconds, basis.metric_eps], dtype=np.float64))
     io.write_attr(_BASIS_META + "node_weights",
                   np.asarray(basis.node_weights, dtype=np.float64))
+    kept = set(basis.node_indices)
+    io.write_attr(_BASIS_META + "node_keep", np.asarray(
+        [int(row in kept) for row in (basis.requested_nodes or basis.node_indices)],
+        dtype=np.int32))
     for name, value in (
             ("centroid_hash", provenance["centroid_hash"]),
             ("node_hash", provenance["node_hash"]),
@@ -345,8 +361,9 @@ def write_galerkin_basis(path, basis: GalerkinBasis, *, wfn, meta,
 
     provenance = _basis_provenance(
         wfn=wfn, meta=meta, centroid_indices=centroid_indices,
-        node_indices=basis.node_indices, band_range=basis.band_range,
-        bispinor=bispinor, refit_rcond=refit_rcond)
+        node_indices=basis.requested_nodes or basis.node_indices,
+        band_range=basis.band_range, bispinor=bispinor,
+        refit_rcond=refit_rcond)
     _basis_check(basis, provenance)
     destination = os.path.abspath(os.fspath(path))
     job, step = os.environ.get("SLURM_JOB_ID", "local"), os.environ.get(
@@ -399,6 +416,10 @@ def _basis_read_meta(io) -> dict:
     controls = small("controls", np.float64)
     counts = small("orbits", np.int32)
     text = lambda name: _basis_decode(small(name, np.int32))
+    if text("selection") != NODE_SELECTION_VERSION:
+        raise GalerkinBasisMismatch(
+            f"Galerkin basis node version {text('selection')} is not "
+            f"{NODE_SELECTION_VERSION}; it is refit")
     return {
         "rank": int(small("rank", np.int32)[0]),
         "band_range": tuple(int(n) for n in band),
@@ -421,6 +442,7 @@ def _basis_read_meta(io) -> dict:
             "node_weights", np.float64)),
         "selection": text("selection"),
         "n_orbits": int(counts[0]),
+        "node_keep": small("node_keep", np.int32).astype(bool),
     }
 
 
@@ -457,18 +479,22 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, node_indices,
                 stored["nspinor"] * stored["centroid_shape"][0], mesh_xy, 0)
             target = io.read_slab(_BASIS_ARRAYS[3], shape=(nk, nb, t_carrier),
                                   partition_spec=rows)
+    requested = np.asarray(node_indices, dtype=np.int64).reshape(-1, 3)
+    kept = requested[stored["node_keep"]]
     basis = GalerkinBasis(
         ctilde=ctilde,
         basis_at_nodes=_node_interp(
-            node_indices, nodal, meta=meta, wfn=wfn,
+            kept, nodal, meta=meta, wfn=wfn,
             nspinor=stored["nspinor"], target=target,
             centroid_indices=centroid_indices),
         rank_physical=stored["rank"], band_range=stored["band_range"],
-        node_indices=_index_rows(node_indices), loewdin=loewdin,
+        node_indices=_index_rows(kept), loewdin=loewdin,
         node_weights=stored["node_weights"],
         metric_eps=stored["metric_eps"],
         refit_rcond=stored["refit_rcond"], n_orbits=stored["n_orbits"],
-        fit_seconds=stored["fit_seconds"])
+        fit_seconds=stored["fit_seconds"],
+        requested_nodes=(_index_rows(requested)
+                         if len(kept) != len(requested) else ()))
     _basis_check(basis, expected)
     return basis
 
@@ -661,6 +687,18 @@ def fit_galerkin_basis(
     t_sample = time.perf_counter() - t0
     w, gram = _quadrature_metric(phi, labels)
     inv_half, eps = _loewdin(gram)
+    # A zero-weight node's row of C = W^{1/2} Phi G^{-1/2} is exactly zero:
+    # drop it from the rank axis (exact).  The ISDF centroids stay the
+    # back-map targets, so a dropped centroid node keeps its sampled values.
+    requested, keep = nodes, w > 0.0
+    n_zero = int(np.count_nonzero(~keep))
+    target_values = None
+    if n_zero:
+        if same:
+            target_values = phi                  # every centroid, pre-drop
+        nodes, phi, w, labels = nodes[keep], phi[..., keep], w[keep], labels[keep]
+        n_mu, same = int(nodes.shape[0]), False
+        n_orbits = int(np.unique(labels).size)
     coeff = np.einsum('kmn,kmsv,v->knsv', inv_half, phi, np.sqrt(w),
                       optimize=True)
     rank_phys = nspinor * n_mu
@@ -677,30 +715,36 @@ def fit_galerkin_basis(
     target = None
     if not same:
         t_carrier = _rank_carrier(nspinor * centroids.shape[0], mesh_xy, 0)
-        target = device_put_process_local(pad(_sample(
-            wfn, sym, meta, centroids, bispinor, mesh_xy, (b_start, b_end),
-            band_chunk_size), t_carrier), rows)
+        target = device_put_process_local(pad(
+            target_values if target_values is not None else _sample(
+                wfn, sym, meta, centroids, bispinor, mesh_xy,
+                (b_start, b_end), band_chunk_size), t_carrier), rows)
+    del target_values
     loewdin = device_put_process_local(inv_half, NamedSharding(mesh_xy, P()))
     seconds = time.perf_counter() - t0
-    n_zero = int(np.count_nonzero(w == 0.0))
+    from_centroids = (requested.shape == centroids.shape
+                      and np.array_equal(requested, centroids))
     log_fn(
         f"  [nodes] {n_mu} nodes"
         + (" (the ISDF centroids)" if same else
-           f" (k-means; back-map targets: the {centroids.shape[0]} ISDF "
-           "centroids)")
+           (f" (the ISDF centroids less {n_zero} zero-weight" if from_centroids
+            else " (k-means") + f"; back-map targets: the "
+           f"{centroids.shape[0]} ISDF centroids)")
         + f", {n_orbits} orbit(s) under {n_ops} ops; {int(meta.nk_tot)} k x "
         f"{nb} bands x {nspinor} spinor; metric eps=max_k||Phi^H W Phi - "
-        f"1||_2={eps:.3e}, {n_zero} zero-weight node(s); rank {rank_phys} (+"
+        f"1||_2={eps:.3e}, {n_zero} zero-weight node(s) dropped of "
+        f"{requested.shape[0]}; rank {rank_phys} (+"
         f"{carrier - rank_phys} pad); fit {seconds:.2f} s (sampling "
         f"{t_sample:.2f} s)")
     if eps > NODE_METRIC_EPS_WARN:
         log_fn(
             f"  [warn] nodal metric eps {eps:.3e} > {NODE_METRIC_EPS_WARN:.0e}: "
             "the Loewdin frame mixes window-edge states and the off-grid "
-            "error grows.  Use an orbit-closed k-means set with N_node >= "
+            "error grows.  Use at least "
             f"{NODES_PER_FITTED_BAND} x {nb} fitted bands = "
-            f"{NODES_PER_FITTED_BAND * nb} (centroid.kmeans_cli --orbit "
-            f"--fit-window 0:{nb},0:{nb}); this set has {n_mu}.")
+            f"{NODES_PER_FITTED_BAND * nb} orbit-closed nodes (more ISDF "
+            f"centroids, centroid.kmeans_cli --orbit); this set has "
+            f"{requested.shape[0]}.")
     basis = GalerkinBasis(
         ctilde=ctilde,
         basis_at_nodes=_node_interp(
@@ -709,6 +753,7 @@ def fit_galerkin_basis(
         rank_physical=rank_phys,
         band_range=(b_start, b_end),
         node_indices=_index_rows(nodes),
+        requested_nodes=_index_rows(requested) if n_zero else (),
         loewdin=loewdin,
         node_weights=tuple(float(v) for v in w),
         metric_eps=eps,

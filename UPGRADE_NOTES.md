@@ -21,8 +21,8 @@ solve whose route (`q-batched` or `face`) the memory model admits
   star-covariant: Si 4³→8³ (default 780 nodes) star spread 239.3 meV under
   the QRCP basis, 2.1e-7 meV now; off-grid DFT MAE 41.6 → 6.78 meV (max 204
   → 28.0; 0.63 % / 2.6 % of the 1080.4 meV QP fundamental gap of the deck's
-  eqp1_a.dat, direct 3072.8 meV). MoS₂ 9×9→12×12 (1183 nodes): star spread
-  9.3 → 6.6e-6 meV, MAE 2.30 → 2.37 meV (0.07 % of 3230.8 meV, direct
+  eqp1_a.dat, direct 3072.8 meV). MoS₂ 9×9→12×12 (the 1198 centroids): star spread
+  9.3 → 6.5e-6 meV, MAE 2.30 → 2.31 meV (0.07 % of 3230.8 meV, direct
   3552.9). On the grid they reproduce the fitted energies.
 - **hsuite.** `reference/htransform.npz` and `reference/exciton_bands.npz` are
   rebaselined (other references unchanged). Every hsuite path k and exciton Q
@@ -37,23 +37,25 @@ solve whose route (`q-batched` or `face`) the memory model admits
   refit's node Gram; the fit has no tolerance.
 - **Centroids and nodes.** Orbit-closed sets are mandatory: a centroid or
   node set that is not closed under the WFN's operations refuses (regenerate
-  it with `centroid.kmeans_cli --orbit`). The node count is
-  min(N_μ, 22 × fitted bands): with more ISDF centroids than that, an
-  orbit-closed k-means selection on the fitted bands is made once and cached
-  beside `galerkin_dft.h5` as `galerkin_nodes_<N>_b<b0>-<b1>_<wfn>.txt`, and
-  the states at the centroids, which the BSE consumers read, become back-map
-  targets. The fit warns when the metric eps exceeds 1e-2 (too few nodes).
-- **Files.** `galerkin_dft.h5` is format 6 (node indices and target states
-  added). An older file is left untouched and the basis is refitted in memory
+  it with `centroid.kmeans_cli --orbit`). The nodes are the ISDF centroids
+  up to 1.25 × 22 × fitted bands; above that, an orbit-closed k-means
+  selection of 22 × fitted bands is made once (rank 0's, broadcast) and
+  cached beside `galerkin_dft.h5` as
+  `galerkin_nodes_<N>_b<b0>-<b1>_<wfn>_<params>.txt`. Zero-weight nodes
+  (W = 0) are dropped from the rank axis, which is exact. The states at the
+  centroids, which the BSE consumers read, are back-map targets whenever the
+  nodes differ from them. The fit warns when the metric eps exceeds 0.1
+  (too few nodes).
+- **Files.** `galerkin_dft.h5` is format 6 (node indices, the kept-node
+  mask and target states added). An older file is left untouched and the basis is refitted in memory
   on every run; delete it to publish the format-6 basis once.
 - **Memory.** The fine-k stage holds f(H)_R and the back-map L_R,
   `16·N_k·N_B·(N_B + N_T)/P` bytes per rank (`N_B` = spin × nodes, `N_T` =
   spin × centroids, 0 when the nodes are the centroids), plus int16 WS code
   tiles `2·N_k·N_B·(N_B + N_T)/P`; the lattice-box R tensor it replaces was
   `16·N_k·rank²/P` without the back-map. Both are admitted (`lxkit.memory`).
-  Si 4³ at P = 4: 1.69 GB per device (780 nodes, 1100 targets) against 0.10
-  GB for the QRCP box (rank 636); device peak of the fine stage 4.19 against
-  1.01 GiB. MoS₂ 9×9: 4.11 GB per device, peak 9.55 GiB.
+  Si 4³ at P = 4 (768 nodes after dropping 12 zero-weight ones, 1100
+  targets): 1.65 GB per device against 0.10 GB for the QRCP box (rank 636).
 - **Tests.** `tests/test_nodal_htransform_cpu.py`: star covariance, on-grid
   exactness, off-grid accuracy against the control variants (sign-flipped
   pair displacement, one image set per class, the box), the orbit-tied

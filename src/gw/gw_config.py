@@ -1823,7 +1823,8 @@ _DEFAULTS = {
     # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
     # ``bandstructure.bse_setup.compute_wfns_fi``).
     # The htransform basis is nodal: Loewdin-orthonormalised interpolation on
-    # an orbit-closed node set (default k-means, min(N_mu, 22 x fitted bands)
+    # an orbit-closed node set (the ISDF centroids up to 1.25 x 22 x fitted
+    # bands, else 22 x fitted bands by k-means; zero-weight nodes dropped)
     # nodes, cached beside galerkin_dft.h5; rank = spin x nodes).  It has no
     # rank criterion.  htransform_qr_eps keeps its name for old decks but is
     # now only the relative pseudo-inverse cutoff of the refit's node Gram
@@ -3172,7 +3173,8 @@ def _report_early_retired_keys(
             "Loewdin frame); its rank is spin x nodes and there is no rank "
             "search or random sketch to seed.\n"
             "  fix:  delete the line(s).  The node count is "
-            "min(N_mu, 22 x fitted bands) by default.\n"
+            "the ISDF centroids, or 22 x fitted bands by k-means above 1.25 x "
+            "that.\n"
             "  doc:  UPGRADE_NOTES.md, \"htransform nodal basis\"; "
             "docs/how-to/htransform-and-exciton-bands.md.")
     if section.get("use_shipped_minimax_tables", fallback=None) is not None:

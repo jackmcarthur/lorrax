@@ -171,8 +171,8 @@ means the basis is over-complete and `rtol` must not be loosened.
 ## Scope
 
 * htransform model order is not governed here: `isdf.galerkin`'s nodal
-  basis is an orbit-closed node set of min(N_μ, 22 × fitted bands) points
-  (the ISDF centroids or a k-means selection; no rank search) and reports
+  basis is an orbit-closed node set (the ISDF centroids up to 1.25 × 22 ×
+  fitted bands, else 22 × fitted bands by k-means; no rank search) and reports
   its own receipts.
 * The thresholds are read from the measurements above; no production deck has
   been re-run under the gate itself.

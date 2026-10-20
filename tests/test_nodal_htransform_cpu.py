@@ -454,3 +454,84 @@ def test_back_map_recovers_states_at_targets_through_a_nonuniform_metric():
     on_c, off_c = errors(np.zeros_like(targets))
     assert on_c < 1e-9, on_c                         # on-grid: geometry-free
     assert off < 0.05 and off_c > 3.0 * off, (off, off_c)
+
+
+def _back_map_toy():
+    """The back-map toy of the test above: two orbits (96 nodes) with a
+    smeared, per-orbit-scaled sampling, 16 targets, 16 fitted / 9 returned
+    bands, 4 coarse and 6 off-grid q."""
+    sites, labels = _sites(2)
+    onsite, nb = 0.05 * labels, 16
+    targets = np.random.default_rng(23).random((16, 3))
+    k = _coarse_k()
+    E = np.linalg.eigvalsh(_hamiltonian(k, sites, onsite))[:, :nb]
+    phi, at_t = _back_map_states(k, sites, labels, targets, onsite, nb,
+                                 np.array([1.0, 2.5]))
+    q = np.concatenate([k[[0, 7, 22, 41]],
+                        np.random.default_rng(31).random((6, 3)) - 0.5])
+    return sites, labels, targets, E, phi, at_t, q
+
+
+def _fine(ctilde, interp, E, q, n_win, **kw):
+    import jax.numpy as jnp
+    from jax.sharding import Mesh
+    from bandstructure.bse_setup import compute_wfns_fi
+    from ffi.fft import xla_reference
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    with xla_reference():
+        fine = compute_wfns_fi(
+            ctilde=jnp.asarray(ctilde), B_at_mu=interp,
+            enk_sigma=jnp.asarray(E.T), kgrid_co=KGRID, q_list=q,
+            band_window_fi=(0, n_win), mesh_xy=mesh, **kw)
+    psi = np.asarray(fine.psi_rmu_Y)[:, :, 0, :]
+    return (np.asarray(fine.enk_full),
+            np.einsum('qnt,qns->qts', psi, np.conj(psi)))
+
+
+def test_dropping_zero_weight_nodes_is_exact():
+    """A node orbit with w = 0 has exactly zero rows of C = W^{1/2} Phi
+    G^{-1/2}; dropping it from the rank axis, with every node kept as a
+    back-map target, leaves the energies (<= 1e-10 meV) and the window
+    projector at the targets unchanged."""
+    import jax.numpy as jnp
+    import pytest
+    from isdf.galerkin import NodalInterp
+    if jax.device_count() < 4:
+        pytest.skip("needs 4 host devices")
+    sites, labels, _, E, phi, _, q = _back_map_toy()
+    w, _ = _quadrature_metric(phi[:, :, None, :], labels)
+    w = np.where(labels == 1, 0.0, w)                # orbit 2: zero weight
+    inv_half, _ = _loewdin(np.einsum('kmv,v,knv->kmn', np.conj(phi), w, phi))
+    ctilde = np.einsum('kmn,kmv,v->knv', inv_half, phi, np.sqrt(w))
+    keep = w > 0.0
+    assert keep.sum() == 48 and not np.any(ctilde[:, :, ~keep])
+    e_all, p_all = _fine(ctilde, NodalInterp(jnp.asarray(phi), sites, A, 3, 1),
+                         E, q, 9)
+    e_kept, p_kept = _fine(
+        ctilde[:, :, keep],
+        NodalInterp(jnp.asarray(phi[:, :, keep]), sites[keep], A, 3, 1,
+                    target=jnp.asarray(phi), target_frac=sites), E, q, 9)
+    assert RY_TO_MEV * np.abs(e_kept - e_all).max() <= 1e-10
+    assert np.abs(p_kept - p_all).max() <= 1e-12 * np.abs(p_all).max()
+
+
+def test_face_route_matches_the_q_batched_route():
+    """``compute_wfns_fi`` on the face route (``use_low_mem_eigh``, the
+    nmu2 mesh backup) and on the q-batched route agree to 1e-12 on the
+    back-map toy (2x2 host mesh): energies and window projectors."""
+    import jax.numpy as jnp
+    import pytest
+    from isdf.galerkin import NodalInterp
+    if jax.device_count() < 4:
+        pytest.skip("needs 4 host devices")
+    sites, labels, targets, E, phi, at_t, q = _back_map_toy()
+    w, gram = _quadrature_metric(phi[:, :, None, :], labels)
+    inv_half, _ = _loewdin(gram)
+    ctilde = np.einsum('kmn,kmv,v->knv', inv_half, phi, np.sqrt(w))
+    interp = lambda: NodalInterp(jnp.asarray(phi), sites, A, 3, 1,
+                                 target=jnp.asarray(at_t), target_frac=targets)
+    e_q, p_q = _fine(ctilde, interp(), E, q, 9)
+    e_f, p_f = _fine(ctilde, interp(), E, q, 9, use_low_mem_eigh=True)
+    assert np.abs(e_f - e_q).max() <= 1e-12 * np.abs(e_q).max()
+    assert np.abs(p_f - p_q).max() <= 1e-12 * np.abs(p_q).max()
+

@@ -86,7 +86,7 @@ def spectral_compression_lines(receipt, *,
             f"Nodes          : {n_nodes} orbit-closed nodes, "
             f"{int(receipt['orbits'])} orbit(s): "
             + ("the ISDF centroids" if n_nodes == n_cent else
-               f"k-means (min(N_mu, 22 x fitted bands)); the {n_cent} ISDF "
+               f"k-means or zero-weight drop; the {n_cent} ISDF "
                "centroids are back-map targets")
             + f"; no rank search; fit {float(receipt['fit_seconds']):.2f} s",
             f"Metric         : orbit-NNLS quadrature weights, eps=max_k"

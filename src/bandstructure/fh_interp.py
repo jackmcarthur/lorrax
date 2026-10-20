@@ -20,6 +20,7 @@ same fH on a fine grid for the BSE.  The CLI is ``bandstructure.htransform``.
 This module reads one environment variable, ``LORRAX_EXTRA_RANK_PAD``, through
 :func:`resolve_extra_rank_pad` (test-only pad invariance, rule 2b).
 """
+import itertools
 import os
 import time
 from functools import partial
@@ -126,29 +127,62 @@ def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
         raise ValueError(f"htransform centroid subset: {exc}") from exc
 
 
+_NODE_BROADCASTS = itertools.count()
+
+
+def _rank0_nodes(nodes, key: str):
+    """Rank 0's node set on every rank, byte-exact (the k-means need not be
+    bitwise identical across ranks; every rank must use one set).  Every rank
+    calls it in the same order (the KV keys carry a call counter)."""
+    from ffi.common.broadcast import broadcast_bytes
+    call = next(_NODE_BROADCASTS)
+    rows = np.ascontiguousarray(np.asarray(nodes, dtype="<i8").reshape(-1, 3))
+    count = broadcast_bytes(np.frombuffer(np.asarray(
+        [rows.shape[0]], dtype="<i8").tobytes(), dtype=np.uint8).copy(),
+        key=f"lorrax/htransform/nodes/{call}/{key}/count")
+    n = int(np.frombuffer(count.tobytes(), dtype="<i8")[0])
+    if rows.shape[0] != n:
+        rows = np.zeros((n, 3), dtype="<i8")
+    payload = broadcast_bytes(rows.reshape(-1).view(np.uint8).copy(),
+                              key=f"lorrax/htransform/nodes/{call}/{key}/rows")
+    return np.frombuffer(payload.tobytes(), dtype="<i8").reshape(n, 3).astype(
+        np.int64)
+
+
 def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
                      basis_path: str | None, log_fn=None):
     """The node set of the nodal basis, ``(n, 3)`` FFT-grid indices.
 
-    ``N_node = min(N_mu, NODES_PER_FITTED_BAND x fitted bands)`` (owner rule:
-    the fit's cost must not grow with the ISDF bundle).  At ``N_mu`` the
-    nodes are the ISDF centroids; below it an orbit-closed, charge-density-
-    weighted k-means selection of the existing centroid machinery
-    (``centroid.kmeans_cli.orbit_kmeans_points``: ``--orbit``, rho-power 1,
-    fit window = the fitted bands on both legs), cached beside the basis
-    artifact as ``galerkin_nodes_<N>_<window>_<wfn>.txt`` and reused when the
-    WFN fingerprint and window match.  Every rank must enter.
+    ``want = NODES_PER_FITTED_BAND x fitted bands`` (owner rule: the fit's
+    cost must not grow with the ISDF bundle).  Up to ``KMEANS_ABOVE x want``
+    centroids the nodes are the ISDF centroids (a selection that drops a few
+    percent saves nothing and worsens the metric); above it an orbit-closed,
+    charge-density-weighted k-means selection of ``want`` points with the
+    existing centroid machinery (``centroid.kmeans_cli.orbit_kmeans_points``:
+    ``--orbit``, rho-power 1, fit window = the fitted bands on both legs),
+    cached beside the basis artifact as
+    ``galerkin_nodes_<N>_b<b0>-<b1>_<wfn>_<params>.txt`` (``params``: a hash
+    of the selector, its version and its arguments) and reused when all of
+    them match.  Every rank must enter.
     """
+    import hashlib
+    import json
     from common.collectives import barrier, process_rank
     from common.parallel_transport import wfn_fingerprint
-    from isdf.galerkin import NODES_PER_FITTED_BAND
+    from isdf.galerkin import (KMEANS_ABOVE, NODE_SELECTION_VERSION,
+                               NODES_PER_FITTED_BAND)
     log = log_fn if log_fn is not None else (lambda *a, **k: None)
     centroids = np.asarray(centroid_indices, dtype=np.int64).reshape(-1, 3)
     b0, b1 = (int(v) for v in band_range)
     want = NODES_PER_FITTED_BAND * (b1 - b0)
-    if centroids.shape[0] <= want:
+    if centroids.shape[0] <= KMEANS_ABOVE * want:
         return centroids
-    tag = f"{want}_b{b0}-{b1}_{wfn_fingerprint(wfn)[:12]}"
+    params = dict(selector="centroid.kmeans_cli.orbit_kmeans_points",
+                  version=NODE_SELECTION_VERSION, n_points=want, orbit=True,
+                  rho_power=1, seed=0, fit_window=[[b0, b1], [b0, b1]])
+    key = hashlib.sha256(json.dumps(params, sort_keys=True).encode()
+                         ).hexdigest()[:10]
+    tag = f"{want}_b{b0}-{b1}_{wfn_fingerprint(wfn)[:12]}_{key}"
     cache = (os.path.join(os.path.dirname(os.path.abspath(basis_path)),
                           f"galerkin_nodes_{tag}.txt")
              if basis_path is not None else None)
@@ -159,8 +193,8 @@ def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
         return nodes
     from centroid.kmeans_cli import orbit_kmeans_points
     t0 = time.perf_counter()
-    nodes = orbit_kmeans_points(wfn_path, want,
-                                fit_window=((b0, b1), (b0, b1)))
+    nodes = _rank0_nodes(orbit_kmeans_points(
+        wfn_path, want, fit_window=((b0, b1), (b0, b1))), key)
     log(f"  [nodes] k-means: {nodes.shape[0]} orbit-closed nodes for "
         f"{b1 - b0} fitted bands ({NODES_PER_FITTED_BAND} per band) instead "
         f"of the {centroids.shape[0]} ISDF centroids, "
@@ -171,7 +205,7 @@ def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
             np.savetxt(staging, nodes, fmt="%d", header=(
                 f"htransform nodes: orbit-closed k-means (--orbit, rho-power "
                 f"1, fit window {b0}:{b1},{b0}:{b1}), requested {want}; FFT "
-                f"indices; WFN {wfn_fingerprint(wfn)}"))
+                f"indices; WFN {wfn_fingerprint(wfn)}; selector {params}"))
             os.replace(staging, cache)
         barrier("htransform_nodes.cached")
     return nodes

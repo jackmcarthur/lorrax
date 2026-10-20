@@ -1483,7 +1483,7 @@ def _interpolate_bse_data_to_grid(
     @partial(jax.jit, out_shardings=(x4, y4, x4, y4, rep, rep))
     def _split_pad(psi, enk):
         # psi (nk_f, n_val+n_cond, ns, n_mu); enk (nk_f, n_val+n_cond).
-        # ``initialize_wfns`` evaluated the sole whole-state basis directly
+        # ``initialize_wfns`` evaluated the sole nodal basis directly
         # on the resolved child centroid rows, so ``compute_wfns_fi`` and this
         # split both receive the restart's final μ width.  There is no
         # parent-width projected-wavefunction route here.

@@ -44,15 +44,19 @@ through the GW centroid-face path
 
 $$\Phi_k[(s,\nu), n] = \psi_{nk}(s, r_\nu).$$
 
-**Nodes.** $N_\mathrm{node} = \min(N_\mu, 22\,(b_1-b_0))$
-(`fh_interp.htransform_nodes`, `isdf.galerkin.NODES_PER_FITTED_BAND`), so the
-fit's cost follows the fitted window, not the ISDF bundle. At $N_\mu$ the nodes
-are the run's ISDF centroids. Below it they are an orbit-closed,
-charge-density-weighted k-means selection on the fitted bands
+**Nodes.** With $N_\mathrm{want} = 22\,(b_1-b_0)$
+(`fh_interp.htransform_nodes`, `isdf.galerkin.NODES_PER_FITTED_BAND`), the
+nodes are the run's ISDF centroids when $N_\mu \le 1.25\,N_\mathrm{want}$
+(`KMEANS_ABOVE`: a selection that drops only a few percent saves nothing and
+worsens $\varepsilon$, MoS₂ 1198 → 1183 nodes: $1.7\times10^{-2}$ →
+$4.6\times10^{-2}$). Above it they are an orbit-closed, charge-density-weighted
+k-means selection of $N_\mathrm{want}$ points on the fitted bands
 (`centroid.kmeans_cli.orbit_kmeans_points`: `--orbit`, rho-power 1, fit window
-$b_0{:}b_1$ on both legs), written beside the basis artifact as
-`galerkin_nodes_<N>_b<b0>-<b1>_<wfn>.txt` and reused while the WFN fingerprint
-and window match. The states at the ISDF centroids, which the BSE consumers
+$b_0{:}b_1$ on both legs), so the fit's cost follows the fitted window, not the
+ISDF bundle. Rank 0's selection is broadcast to every rank, written beside the
+basis artifact as `galerkin_nodes_<N>_b<b0>-<b1>_<wfn>_<params>.txt`
+(`params`: a hash of the selector, its version and its arguments) and reused
+while all of them match. The states at the ISDF centroids, which the BSE consumers
 need, are then back-map targets (§3) rather than nodes. Orbit closure is
 mandatory for both sets.
 
@@ -71,7 +75,9 @@ $$G_k = \Phi_k^\dagger W \Phi_k, \qquad c_{k} = W^{1/2}\Phi_k G_k^{-1/2},
 shape $(N_k, b_1-b_0, N_B)$ with $N_B = N_s N_\mathrm{node}$. The log
 prints $\varepsilon = \max_k \|G_k - 1\|_2$ (Si 4³ at 1100 nodes:
 $1.0\times10^{-3}$; MoS₂ 9×9 at 1198: $1.7\times10^{-2}$), the number of
-zero-weight nodes (they drop out of $c$), the orbit count and the fit wall
+zero-weight nodes (their rows of $c$ are exactly zero, so they are dropped from
+the rank axis; the centroids stay the back-map targets), the orbit count and
+the fit wall
 (seconds). The fit itself has no pivot or tolerance. A node or centroid set
 that is not orbit-closed (`symmetry_maps.centroid_source_map_and_wrap`) refuses,
 naming the remedy.
@@ -80,10 +86,11 @@ naming the remedy.
 4³ (36 fitted spinor bands, orbit-closed k-means with `--fit-window 0:36,0:36`)
 $\varepsilon$ = 0.37 / 0.12 / 1.6×10⁻² / 1.9×10⁻³ / 1.0×10⁻³ at 312 / 432 /
 588 / 780 / 1100 nodes, and the 4³→8³ off-grid DFT MAE is 8.03 meV (max 62.7)
-at 312 nodes against 6.76 meV (max 27.4) at 780. The fit warns when
-$\varepsilon > 10^{-2}$ and names the count $N_\mathrm{node} \ge 22\,(b_1-b_0)$
-that reached it on Si; MoS₂ 9×9 at 22.2 nodes per band (1198/54) reads
-$\varepsilon = 1.7\times10^{-2}$.
+at 312 nodes against 6.76 meV (max 27.4) at 780: the max error doubles
+between $\varepsilon = 0.1$ and $0.4$. The fit warns when $\varepsilon > 0.1$
+and names the count $22\,(b_1-b_0)$, which reached $\varepsilon \le 10^{-2}$ on
+Si; MoS₂ 9×9 at 1198 centroids (22.2 per band) reads $\varepsilon =
+1.7\times10^{-2}$.
 
 **Fine-k solve.** $f(H)_q$ is numerically of rank $b_1-b_0$ ($f \le 0$ on the
 fitted states, $\approx 0$ on the rest of the $N_B$ directions), so every
@@ -464,7 +471,7 @@ qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--color orbital:d]
 | refusal | cause | fix |
 |---|---|---|
 | the nodal fit refuses: centroids not orbit-closed | the centroid file was not made in orbit-aware mode | regenerate it with `centroid.kmeans_cli` (orbit mode) |
-| `[warn] nodal metric eps` | $\varepsilon > 10^{-2}$: too few nodes for the fitted window | $N_\mathrm{node} \ge 22\,(b_1-b_0)$; with fewer ISDF centroids than that the nodes are the centroids |
+| `[warn] nodal metric eps` | $\varepsilon > 0.1$: too few nodes for the fitted window | at least $22\,(b_1-b_0)$ orbit-closed ISDF centroids |
 | `top_block_not_converged` | a top-block window residual above $10^{-6}$ after 16 steps | raise $N_\mathrm{node}$ or check the metric warning |
 | `quadrature_metric_nnls` | the orbit-tied NNLS did not converge | check orbit closure and the node count |
 | `htransform_qrcp_retired` | `htransform_rank_multiplier` or `htransform_qrcp_seed` in the deck | delete the line |

@@ -104,8 +104,9 @@ class HTransformProductionReport:
             self.emit(line)
         self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
         self.emit(
-            "Galerkin basis : nodal, min(N_mu, 22 x fitted bands) "
-            "orbit-closed nodes; quadrature metric + Loewdin; no rank search")
+            "Galerkin basis : nodal, orbit-closed nodes (the ISDF centroids up "
+            "to 1.25 x 22 x fitted bands, else 22 x fitted bands by k-means); "
+            "quadrature metric + Loewdin; zero-weight nodes dropped")
         if fine_enabled:
             fine_text = policy(
                 fine_plan.requested,
@@ -197,7 +198,8 @@ class HTransformProductionReport:
         self.emit(f"Galerkin basis : nodal rank {int(ctilde.shape[2])} shared "
                   f"across {int(result['nk_total'])} coarse-grid k points")
         self.emit("Rank policy    : rank = spin components x nodes; nodes "
-                  "= the ISDF centroids, or k-means above 22 x fitted bands")
+                  "= the ISDF centroids, or k-means above 1.25 x 22 x fitted "
+                  "bands; zero-weight nodes dropped")
         transform = result.get("f_transform")
         if transform is not None:
             scale_band = start + int(transform["scale_band_local"]) + 1
