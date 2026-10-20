@@ -2114,6 +2114,35 @@ Hamiltonian fixed point or trajectory. Its saved-state harness is
 `tests/tdagw/source_frozen_saved_state.py`; material results, if obtained,
 must be reported separately from these small algebra checks.
 
+That source-frozen material control subsequently completed at commit
+`62d9804` (tree `a9a10a3952d3a9b58f7926dcc1266539035b2998`), with
+the same saved 9.5 fs strong-drive input, all 978 ports/36 q/160 virtual
+bands and four real destination bands. Source preparation took 79.24 s,
+exact positive-to-signed conversion 7.07 s, and the **new ordered
+full-density self-energy** 10.77 s. It used 12 windows/96 tau pairs at
+relative rule target 1e-4, collision eta 0.1 eV, and the unchanged source
+head. The raw fresh trace was -2.373e-9 Ry against flux 0.00491225 Ry,
+or 4.830e-7 relative. This does not meet the campaign's stricter 1e-8
+fresh-number guard; no guard was relaxed and rule refinement remains needed.
+
+The rate operators were indefinite: minimum eigenvalues of D, Gamma-D
+and Gamma were -24.86, -54.23 and -2.53 meV. The input density was physical
+and strictly interior, with eigenvalues [0.002574,0.996948]. These operator
+signs preclude a general held-affine positivity guarantee; they are not a
+measured density excursion or a trajectory. This calculation updated
+neither W nor the material Hamiltonian fixed point, and establishes no
+screening-induced damping, new band gap or 10 fs evolution.
+
+An earlier attempt at `05fc7cb` stopped before the new self-energy because
+a root-only general-store validator entered an all-rank broadcast. The
+fix separates the host cache lookup from its collective wrapper; regression
+checks retain file-generation rehash and corruption refusal. The failed
+and successful P4 steps used 0.26778 and 0.13222 active GPUh (0.40000 total),
+and both allocations were released. Authenticated raw complex branch
+tables, operators, source/snapshot hashes and accounting are preserved in
+`/home/jackm/mgkba_campaign_20261019/source_frozen_v2_20261020/` and the
+combined status in `source_frozen_20261020/COMBINED_STATUS.json`.
+
 ### 8.2 Acceptance checks and earlier-member evidence
 
 The corrected column-sampled MGKBA collision requires an independent dense

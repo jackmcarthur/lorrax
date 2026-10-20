@@ -16,9 +16,11 @@ import traceback
 import runtime
 
 
-def evaluate_source_frozen_snapshot(source, prepared, basis, *, b_lo, model, print_fn=print):
+def evaluate_source_frozen_snapshot(source, prepared, basis, *, b_lo, model,
+                                    quadrature_eps=None, print_fn=print):
     """Use current full-rho lines and one frozen source bank in the native executor."""
     import numpy as np
+    from dataclasses import replace
     from common.collectives import gather_to_host
     from gw.ppm_sigma import shared_pole_window_source, window_sigma_c, window_sigma_plan
     from tdagw.collision import branch_operators
@@ -41,6 +43,10 @@ def evaluate_source_frozen_snapshot(source, prepared, basis, *, b_lo, model, pri
     window = dict(b_lo=start, U=U, e=e, rho=rho,
         f=np.diagonal(rho, axis1=-2, axis2=-1).real, e_frozen=energy)
     plan = window_sigma_plan(source["config"], head=source.get("head"), window_only=True)
+    if quadrature_eps is not None:
+        if not np.isfinite(quadrature_eps) or not 0 < quadrature_eps < 1:
+            raise ValueError('GATE source_frozen_quadrature: finite relative target in (0,1) required')
+        plan['sigma_cfg'] = replace(plan['sigma_cfg'], quadrature_eps=float(quadrature_eps))
     raw = window_sigma_c(source["wfns"], handle, window, plan, meta=source["meta"],
         mesh_xy=prepared["mesh"], branches=True, pairing="vertex", print_fn=print_fn)
     active, full = raw["active_branch_pair"], raw["branch_pair"]
@@ -58,7 +64,12 @@ def main():
     parser.add_argument('--out', required=True)
     parser.add_argument('--b-lo', type=int, default=128)
     parser.add_argument('--trial', type=int, default=0)
+    parser.add_argument('--sigma-quadrature-eps', type=float, default=None,
+                        help='verification-only Sigma rule refinement; source W/eta/head unchanged')
     args = parser.parse_args()
+    if (args.sigma_quadrature_eps is not None
+            and not 0 < args.sigma_quadrature_eps < 1):
+        parser.error('--sigma-quadrature-eps must lie in (0,1)')
     stack = runtime.initialize_communicator_stack()
     import jax
     import numpy as np
@@ -97,6 +108,7 @@ def main():
         saved_time_fs=saved_time, commit=os.environ.get('LEG_HEAD'),
         source_tree=os.environ.get('LEG_SOURCE_TREE'),
         archive_sha256=os.environ.get('LEG_SOURCE_ARCHIVE_SHA256'), walls_s={})
+    report['sigma_quadrature_override'] = args.sigma_quadrature_eps
     def save():
         error = None
         if rank0:
@@ -128,7 +140,8 @@ def main():
             path=str(root/'source_frozen_ordered'/'model.h5')))
         report['adapter'] = model['source_frozen_receipt']; save()
         result = timed('native_ordered_sigma', lambda: evaluate_source_frozen_snapshot(
-            source, prepared, basis, b_lo=args.b_lo, model=model, print_fn=say))
+            source, prepared, basis, b_lo=args.b_lo, model=model,
+            quadrature_eps=args.sigma_quadrature_eps, print_fn=say))
         U, rho = basis['U'], basis['rho']
         rho_fixed = U@rho@U.conj().swapaxes(-1,-2)
         gamma, injection = result['gamma'], result['injection']
