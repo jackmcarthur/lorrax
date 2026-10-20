@@ -2668,58 +2668,46 @@ _REFIT_CHUNK_KERNELS: dict = {}
 _REFIT_MU_PAD_KERNELS: dict = {}
 
 
-def _refit_kernels(nk, nb, ns, n_mu, zeta_solve):
-    """Jitted refit chunk kernels, cached on the (shape) signature so every
-    refit Q after the first is dispatch-only (per-q-recompile lesson).
-
-    ``zeta_solve`` is the producer's ``(charge_zeta_solve, zeta_rcond)``
-    pair for the bundle being refitted (:func:`_zeta_solve_of`).
-    It is part of the CACHE KEY, not just of the closure: the ζ solve is a
-    different program per (kind, rcond), and a key that omitted it would hand
-    the second bundle of a process the first bundle's compiled solve.
+def _refit_kernels(nk, nb, ns, n_mu, mesh_xy: Mesh):
+    """The refit's face programs, cached on the shapes, the mesh and the GEMM room: X (the
+    pair density at the centroids, its pair axis zero-padded to tile the mesh) at
+    ``P(None,'x','y')``; the Hermitised C = XᴴX; and ζ = B(BᴴZ) for the producer's
+    charge factor B (:func:`isdf.core._factor_c_q_face`).  The GEMMs keep whole matrices
+    per rank only where they fit the room (distrib_la.matmul ``'auto'``), else the face
+    SUMMA; the plain-jit C and dense solve held a whole n_μ x n_μ on one device.
     """
-    key = (nk, nb, ns, n_mu, tuple(zeta_solve))
+    from common.gpu_utils import shared_device_room
+    from distrib_la import matmul
+    room = int(shared_device_room("BSE refit GEMM"))
+    key = (nk, nb, ns, n_mu, id(mesh_xy), room)
     hit = _REFIT_KERNELS.get(key)
     if hit is not None:
         return hit
-    _solve_kind, _rcond = zeta_solve
-    # LAZY, and for the same reason every other import in this module is:
-    # ``isdf.core``'s module body reaches ``distrib_la`` and the FFI plan
-    # resolver, and this module is imported by host-only diagnostics that
-    # never refit.  L1 → L1, so the layer map has nothing to say about it.
-    from isdf.core import solve_zeta_charge_dense
+    from runtime.padding import padded_mu_extent
+    ndev, n = int(mesh_xy.devices.size), int(padded_mu_extent(n_mu, mesh_xy))
+    m = nk * nb * nb
+    m_pad = -(-m // ndev) * ndev            # zero pair rows and pad centroids: C's logical block unchanged
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    mm = partial(matmul, mesh=mesh_xy, batched_route="auto", budget_bytes=room)
 
-    @jax.jit
-    def _cq_and_x(psi_m_mu, psi_mu):
+    @partial(jax.jit, out_shardings=face)
+    def _x(psi_m_mu, psi_mu):
         # X[k,m,n,μ] = Σ_s conj(u^{ht}_{m,k−q,s}(μ)) u_{n,k,s}(μ)  (spin-traced)
         X = jnp.einsum("kmsu,knsu->kmnu", jnp.conj(psi_m_mu), psi_mu)
-        Xf = X.reshape(nk * nb * nb, n_mu)
-        C = jnp.conj(Xf).T @ Xf
-        return Xf, 0.5 * (C + jnp.conj(C).T)
+        return jnp.pad(X.reshape(m, n_mu), ((0, m_pad - m), (0, n - n_mu)))[None]
 
-    @jax.jit
-    def _solve_zeta(C, Z):
-        # THE PRODUCER'S SOLVE, not a second implementation of it.  This
-        # used to be a plain Cholesky with a fixed 1e-14·|tr C| ridge, under
-        # a comment citing a private ridged-Cholesky helper of ``isdf.core``
-        # — a symbol that has never existed in this tree.  The production
-        # charge path is
-        # ``rank_truncate``: an eigh pseudo-inverse that DROPS
-        # every direction with λ < zeta_rcond·λ_max.  A ridged Cholesky
-        # KEEPS those directions and amplifies them by up to four orders
-        # more than the producer's κ cap allows, so ζ' differed from ζ in
-        # precisely the near-null subspace — and V_Q is quadratic in ζ.
-        # The tile identity ``refit_ongrid_null`` measured the consequence
-        # on five parents: worst-tile error monotone in the DISCARDED
-        # fraction (4.7 % → 3.289, 7.9 % → 16.0, 39.4 % → 50.9, 58.6 % →
-        # 139.9) against a 5.0e-02 bracket, while the htransform Galerkin
-        # residual moved eight orders and the tile null did not follow it
-        # (tests/known_failures/2026-08-11-narrowed-zeta-window-clears-fh-\
-        # and-the-tile-null-still-refuses.md §4).
-        return solve_zeta_charge_dense(
-            C, Z, charge_zeta_solve=_solve_kind, zeta_rcond=_rcond)
+    @partial(jax.jit, out_shardings=face)
+    def _gram(Xf):
+        C = mm(Xf, Xf, transa="C")
+        return 0.5 * (C + jnp.conj(jnp.swapaxes(C, -2, -1)))
 
-    kernels = (_cq_and_x, _solve_zeta)
+    @partial(jax.jit, out_shardings=face)
+    def _apply(B, Z):                       # ζ (1, n, r) on the face, r padded to tile; pad rows zero
+        r = int(Z.shape[-1])
+        Zf = jnp.pad(Z, ((0, n - n_mu), (0, -(-r // ndev) * ndev - r)))[None]
+        return mm(B, mm(B, jax.lax.with_sharding_constraint(Zf, face), transa="C"))
+
+    kernels = (_x, _gram, _apply)
     _REFIT_KERNELS[key] = kernels
     return kernels
 
@@ -2817,9 +2805,10 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
             "and V_Q is quadratic in that difference.  Build the state with "
             "vq_interp.refit_prepare, which reads the pair from the ζ "
             "file's isdf_header/fit_provenance.")
-    cq_and_x, solve_zeta = _refit_kernels(
-        nk, nb, ns, n_mu, rst["zeta_solve"])
-    from isdf.cplus import report as report_zeta_cut
+    kind, rcond = rst["zeta_solve"]
+    if kind != "rank_truncate":            # _zeta_solve_of admits only the producer's charge solve
+        raise ValueError(f"refit_vq: charge_zeta_solve={kind!r}; expected 'rank_truncate'")
+    x_face, gram, apply_zeta = _refit_kernels(nk, nb, ns, n_mu, mesh_xy)
     if m_leg not in ("htransform", "stored"):
         raise ValueError(
             f"refit_vq: m_leg={m_leg!r}; expected 'htransform' or 'stored'")
@@ -2854,8 +2843,16 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
         psi_m_mu = jnp.asarray(bundle.psi_rmu_Y)      # (nk, nb, ns, n_μ)
         c_m = jnp.asarray(bundle.coeffs_fi)           # (nk, rank, nb)
 
-    Xf, C = cq_and_x(psi_m_mu, jnp.asarray(zx["psi"]))
-    X4 = Xf.reshape(nk, nb, nb, n_mu)
+    Xf = x_face(psi_m_mu, jnp.asarray(zx["psi"]))
+    X4 = Xf[0, :nk * nb * nb, :n_mu].reshape(nk, nb, nb, n_mu)
+    # THE PRODUCER'S FACTOR, once per Q: the rank-truncated pseudo-inverse of the charge fit
+    # (isdf.core._factor_c_q_face, which reports its cut), its eigh placed by distrib_la's
+    # place(): whole matrices per rank where they fit and are faster, else the whole mesh.
+    # The pad centroids of the carrier (zx["n_mu_logical"]) are masked out of the cut.
+    from isdf.core import _factor_c_q_face
+    B = _factor_c_q_face(gram(Xf), mesh_xy, int(zx.get("n_mu_logical", n_mu)),
+                         zeta_rcond=float(rcond))
+    del Xf
 
     # ζ(r_chunk) is solved and consumed immediately by the SAME G-flat FFT
     # accumulator as the producer.  The accumulator is the sole all-r object,
@@ -2893,9 +2890,7 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
         if Z is None:
             raise RuntimeError("refit_vq: empty ζ-window WFN slab")
         logical_r = int(r1) - int(r0)
-        zeta_chunk, figures = solve_zeta(C, Z)
-        report_zeta_cut(figures, rcond=float(rst["zeta_solve"][1]), n_log=int(C.shape[-1]))
-        zeta_chunk = zeta_chunk[:, :logical_r]
+        zeta_chunk = apply_zeta(B, Z)[0, :, :logical_r]
         zeta_chunk = _pad_refit_zeta_for_gflat(
             zeta_chunk, n_mu_padded=n_mu_padded, mesh_xy=mesh_xy)
         gflat_acc = accumulate_rchunk_to_gflat(
