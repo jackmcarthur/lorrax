@@ -55,6 +55,81 @@ def test_native_parsed_B_C_decks_identical_except_W_update_and_A_is_truly_off():
     assert a.measurements[-1][2]["brange1"] == [101, 145]
 
 
+def test_matching_zero_decks_are_short_same_window_and_not_disabled_by_control_flag():
+    plan = dict(driver.example_plan(), run_zero_controls=False)
+    source = dict(input_deck="actual.in", input_dir="private_source")
+    for arm in driver.ARMS[1:]:
+        deck = driver.make_deck(plan, source, "matching_zero", slice(100, 144), 2.7, 0., arm, zero_gate=True)
+        duration = (deck.values["control.timesteps.tf"]-deck.values["control.timesteps.t0"])*driver.FS_PER_AU
+        assert duration == pytest.approx(.6)
+        assert (deck.values["system.ibndmin"], deck.values["system.ibndmax"]) == (101, 144)
+        assert all(deck.trials[0]["E_"+axis] == 0. for axis in "xyz")
+        assert deck.values["lorrax.collision"] == "raw"
+    with pytest.raises(ValueError, match="exactly zero"):
+        driver.make_deck(plan, source, "bad", slice(100, 144), 2.7, 1., driver.ARMS[1], zero_gate=True)
+
+
+def test_matching_zero_refresh_must_be_strictly_inside_gate_before_native_work():
+    plan = dict(driver.example_plan(), execute_mgkba=True, refresh_fs=.5)
+    assert driver.validate_plan(plan) is plan
+    for cadence in (.6, 1.):
+        with pytest.raises(ValueError, match="zero gate needs"):
+            driver.validate_plan(dict(plan, refresh_fs=cadence))
+    assert driver.validate_plan(dict(plan, execute_mgkba=False, refresh_fs=1.))["refresh_fs"] == 1.
+
+
+def test_calibration_stops_on_first_actual_valid_distinct_target_pair():
+    # .075 already satisfies the explicitly allowed factor-two .1 target;
+    # do not run a stronger candidate merely to cross .1 literally.
+    observations = [.008, .075, .15, .3]
+    rows, tried = [], []
+    for index, actual in enumerate(observations):
+        tried.append(index)
+        rows.append(dict(completed=True, carrier_peak=actual, amplitude_v_m=10.**(index+1), tag=str(index)))
+        try:
+            driver.choose_calibrations(rows, (.01, .1), 2.)
+            break
+        except ValueError:
+            pass
+    assert tried == [0, 1]
+    assert [row["actual_A_carrier_peak"] for row in driver.choose_calibrations(rows)] == [.008, .075]
+    tree = ast.parse(Path(driver.__file__).read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_td_probe")
+    loop = next(n for n in run.body if isinstance(n, ast.For) and isinstance(n.iter, ast.Call)
+                and isinstance(n.iter.func, ast.Name) and n.iter.func.id == "enumerate")
+    assert isinstance(loop.body[-1], ast.Try)
+    assert any(isinstance(n, ast.Break) for n in loop.body[-1].body)
+
+
+def test_four_band_or_wrong_policy_zero_never_admits_matching_44_gate():
+    policy = dict(response_qgrid=[4, 4, 1], response_window="fejer")
+    good = dict(completed=True, zero_gate=True, amplitude_v_m=0., duration_fs=.6,
+        actual_active=[100, 144], response_policy=policy, accepted_refreshes=1,
+        fresh_snapshot_times_fs=[0., .5])
+    assert driver.require_matching_zero_result(good, slice(100, 144), policy) is good
+    for field, value in (("actual_active", [128, 132]), ("zero_gate", False),
+                         ("duration_fs", 10.), ("accepted_refreshes", 0),
+                         ("fresh_snapshot_times_fs", [0.]),
+                         ("response_policy", dict(policy, response_window="sharp"))):
+        with pytest.raises(ValueError, match="matching-active"):
+            driver.require_matching_zero_result(dict(good, **{field: value}), slice(100, 144), policy)
+
+
+def test_both_mandatory_zero_results_precede_any_driven_MGKBA_loop():
+    tree = ast.parse(Path(driver.__file__).read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_td_probe")
+    execution = next(n for n in run.body if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Subscript) and ast.literal_eval(n.test.slice) == "execute_mgkba")
+    loops = [n for n in execution.body if isinstance(n, ast.For)]
+    assert len(loops) == 2
+    calls = [n for n in ast.walk(loops[0]) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "run_arm"]
+    assert len(calls) == 1 and any(k.arg == "zero_gate" and ast.literal_eval(k.value) is True
+                                  for k in calls[0].keywords)
+    assert not any(isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
+                   and n.slice.value == "run_zero_controls" for n in ast.walk(execution))
+
+
 def _prerequisites(tmp_path):
     frame = dict(frame="actual_accepted_input", input_h_sha256="H", wfn_fingerprint="WFN")
     plan = driver.example_plan()

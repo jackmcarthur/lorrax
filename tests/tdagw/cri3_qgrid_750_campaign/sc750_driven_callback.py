@@ -18,6 +18,7 @@ import os
 import time
 
 ARMS = ("A_STATIC_TDAGW_NO_COLLISION", "B_FROZEN_W_MGKBA", "C_UPDATED_W_MGKBA")
+MATCHING_ZERO_FS = .6
 FS_PER_AU = .024188843265857
 
 
@@ -76,6 +77,8 @@ def validate_plan(plan):
         raise ValueError("GATE driven_pulse: first campaign needs one signed Cartesian axis, not an unverified projection")
     if not isinstance(plan["execute_mgkba"], bool) or not isinstance(plan["run_zero_controls"], bool):
         raise ValueError("GATE driven_plan: internal execution flags must be boolean")
+    if plan["execute_mgkba"] and plan["refresh_fs"] > .5:
+        raise ValueError("GATE driven_plan: matching .6fs zero gate needs refresh_fs <= .5fs")
     if not isinstance(plan["snapshot_steps"], int) or not 1 <= plan["snapshot_steps"] <= 32:
         raise ValueError("GATE driven_plan: bounded native fixed-point steps required")
     for key, val in plan["gates"].items():
@@ -114,14 +117,17 @@ def pulse_trials(plan, energy_ev, amplitude):
             for a, c in zip("xyz", p["polarization"])}
 
 
-def make_deck(plan, source, out, active, energy_ev, amplitude, arm):
+def make_deck(plan, source, out, active, energy_ev, amplitude, arm, *, zero_gate=False):
     """Resolve native parser afresh; B/C differ ONLY by screening flag."""
     import tomllib
     from tdagw.td_config import parse_td_deck
     if arm not in ARMS:
         raise ValueError("GATE driven_arm: unknown arm")
     raw = tomllib.loads((Path(__file__).with_name("inputs")/"sc750_zero_joint_0p6fs.toml").read_text())
-    raw["control"]["timesteps"].update(tf=1000*plan["duration_fs"], dt_measure=plan["measure_as"])
+    if zero_gate and amplitude != 0.:
+        raise ValueError("GATE driven_zero: matching-window gate must have exactly zero field")
+    duration = MATCHING_ZERO_FS if zero_gate else plan["duration_fs"]
+    raw["control"]["timesteps"].update(tf=1000*duration, dt_measure=plan["measure_as"])
     raw["control"]["files"]["outdir"] = str(out)
     raw["system"].update(ibndmin=active.start+1, ibndmax=active.stop, ivbm=130)
     raw["system"]["Efunc"] = pulse_trials(plan, energy_ev, amplitude)
@@ -137,6 +143,20 @@ def make_deck(plan, source, out, active, energy_ev, amplitude, arm):
         collision_snapshot_steps=plan["snapshot_steps"],
         collision_snapshot_tol_ev=plan["snapshot_tol_ev"], collision_fit_tolerance=plan["fit_tolerance"])
     return parse_td_deck(raw, source="explicit SC750 driven campaign JSON plan")
+
+
+def require_matching_zero_result(result, active, response_policy):
+    """No four-band or wrong-policy result can admit a larger driven window."""
+    if (not result.get("completed") or result.get("zero_gate") is not True
+            or result.get("amplitude_v_m") != 0.
+            or result.get("duration_fs") != MATCHING_ZERO_FS
+            or result.get("actual_active") != [active.start, active.stop]
+            or result.get("response_policy") != response_policy
+            or result.get("accepted_refreshes", 0) < 1
+            or len(result.get("fresh_snapshot_times_fs", ())) < 2
+            or not any(t > 0 for t in result["fresh_snapshot_times_fs"])):
+        raise ValueError("GATE driven_zero: completed matching-active .6fs/one-refresh raw gate required")
+    return result
 
 
 def validate_material_prerequisites(plan, frame, *, response_policy=None):
@@ -195,7 +215,9 @@ def validate_material_prerequisites(plan, frame, *, response_policy=None):
         target_axis_strength_bohr2_cell=strength, bse=bse,
         bse_sha256=hashlib.sha256(bpath.read_bytes()).hexdigest(),
         zero_complete_sha256=hashlib.sha256((zero/"complete.json").read_bytes()).hexdigest(),
-        zero_carrier_max=float(abs(carriers).max()), zero_boundary_records=len(boundary_paths))
+        zero_carrier_max=float(abs(carriers).max()), zero_boundary_records=len(boundary_paths),
+        zero_active_bands=ref.get("active_bands"),
+        zero_evidence_scope="PREFLIGHT_ONLY_NOT_DRIVEN_WINDOW_ADMISSION")
 
 
 def completed_observables(path, *, duration_fs=None, measure_interval_fs=None):
@@ -381,10 +403,13 @@ def run_td_probe(source, *, out, deck_path):
     completed_runs = []
     shared_equilibrium = {}
 
-    def run_arm(tag, arm, amplitude, model):
+    def run_arm(tag, arm, amplitude, model, *, zero_gate=False):
         budget("before_"+tag)
-        deck = make_deck(plan, source, out/tag, active, prereq["target_energy_ev"], amplitude, arm)
+        deck = make_deck(plan, source, out/tag, active, prereq["target_energy_ev"], amplitude, arm,
+                         zero_gate=zero_gate)
+        duration = MATCHING_ZERO_FS if zero_gate else plan["duration_fs"]
         health, evaluated, handles = [], [], []
+        fresh_snapshot_times = []
         held_rates = {}
         A_diagnostic = dict(n=0, next_fs=0.)
         if arm == ARMS[0]:
@@ -408,6 +433,8 @@ def run_td_probe(source, *, out, deck_path):
             A_diagnostic.update(n=n+1, next_fs=float(time_au)*FS_PER_AU+plan["refresh_fs"])
         oldwrite, oldfactory, oldsnapshot = stages._write_chunk, sr.make_native_snapshot_evaluator, sr.snapshot_collision
         save(tag+"/started.json", record=dict(arm=arm, amplitude_v_m=amplitude,
+            zero_gate=zero_gate, duration_fs=duration, actual_active=[active.start, active.stop],
+            response_policy=response_policy,
             nominal_vacuum_cycle_averaged_peak_intensity_w_cm2=.5*8.8541878128e-12*299792458*amplitude**2/1.e4,
             target_energy_ev=prereq["target_energy_ev"], resolved_values=deck.values,
             anchor="SC+deltaH-SEX(W0)" if arm == ARMS[0] else "SC+bareHFdelta+MH-MHeq",
@@ -440,6 +467,8 @@ def run_td_probe(source, *, out, deck_path):
                     or abs(tr-trace0) > plan["gates"]["trace_drift"] or record["hermiticity"] > 1.e-9):
                 save(tag+"/refused_density.npz", arrays=dict(rho=rho, time_au=np.array(t_state)))
                 raise ValueError("GATE driven_density: unmodified Pauli/trace/Hermiticity guard")
+            if zero_gate and max(abs(nc_now), abs(nh_now)) > plan["gates"]["zero_carrier_drift"]:
+                raise ValueError("GATE driven_zero: actual matching-window carrier drift exceeds explicit limit")
             oldwrite(outs, current, i0, i1, samples, lambda: state, t_state, fingerprint)
             if arm == ARMS[0] and record["time_fs"] >= A_diagnostic["next_fs"]-1.e-10:
                 capture_A(tp.place_window_blocks(np.asarray(state[0]), mesh, system.nk_pad), t_state)
@@ -510,6 +539,7 @@ def run_td_probe(source, *, out, deck_path):
                     vals = np.asarray(bd[name])[np.asarray(bd[counts]) > 0]
                     if vals.size and (not np.isfinite(vals).all() or vals.min() < -plan["gates"]["tangent_tolerance_ry"]):
                         raise ValueError("GATE driven_boundary: actual tangent outward; no PSD clipping")
+                fresh_snapshot_times.append(float(state["history"][-1]["t_fs"]))
             capture()
             refresh = collision["refresh"]
             def observe_refresh(*a, **kw):
@@ -531,9 +561,11 @@ def run_td_probe(source, *, out, deck_path):
             if arm != ARMS[0] and refreshes < 1:
                 raise ValueError("GATE driven_refresh: no current-electronic refresh reached")
             payload, measured = completed_observables(outputs.paths[0],
-                duration_fs=plan["duration_fs"], measure_interval_fs=plan["measure_as"]/1000.)
+                duration_fs=duration, measure_interval_fs=plan["measure_as"]/1000.)
             save(tag+"/plot_data.npz", arrays=payload)
             result = dict(tag=tag, arm=arm, amplitude_v_m=amplitude, completed=True,
+                zero_gate=zero_gate, duration_fs=duration, actual_active=[active.start, active.stop],
+                response_policy=response_policy, fresh_snapshot_times_fs=fresh_snapshot_times,
                 **measured, carrier_peak_scope="actual completed native measurement grid",
                 checkpoint_carrier_peak=max(r["carrier"] for r in health),
                 native_h5=outputs.paths[0], plot_data=str(out/tag/"plot_data.npz"),
@@ -551,24 +583,32 @@ def run_td_probe(source, *, out, deck_path):
     static = static_owner.build_static_control(source, reference)
     save("static_control.json", record=static["receipt"])
     if plan["run_zero_controls"]:
-        run_arm("A_zero", ARMS[0], 0., static["model"])
+        run_arm("A_zero", ARMS[0], 0., static["model"], zero_gate=True)
     for index, amp in enumerate(plan["amplitude_candidates_v_m"]):
         row = run_arm(f"A_calibration_{index:02d}", ARMS[0], amp, static["model"])
         rows.append(row)
         save(f"calibration_{index:02d}.json", record=row)
-        if row["carrier_peak"] >= max(plan["carrier_targets"]):
-            try:
-                choose_calibrations(rows, plan["carrier_targets"], plan["target_factor"])
-                break
-            except ValueError:
-                pass
+        try:
+            choose_calibrations(rows, plan["carrier_targets"], plan["target_factor"])
+            break
+        except ValueError:
+            pass
     selected = choose_calibrations(rows, plan["carrier_targets"], plan["target_factor"])
     save("calibration_selected.json", record=dict(selected=selected, arm=ARMS[0], raw_observables=True))
     del static
     if plan["execute_mgkba"]:
+        matching_gates = []
+        # Mandatory even when the optional A-zero control is disabled. The
+        # smaller supplied zero artifact remains a source/closure preflight.
+        # Both arms must pass BEFORE any driven MGKBA arm starts.
         for arm in ARMS[1:]:
-            if plan["run_zero_controls"]:
-                run_arm(arm[0]+"_zero", arm, 0., reference["model"])
+            result = run_arm(arm[0]+"_zero", arm, 0., reference["model"], zero_gate=True)
+            matching_gates.append(require_matching_zero_result(result, active, response_policy))
+        save("matching_active_zero_gates.json", record=dict(status="MATCHING_ACTIVE_BC_ZERO_GATES_COMPLETE",
+            actual_active=[active.start, active.stop], response_policy=response_policy,
+            duration_fs=MATCHING_ZERO_FS, supplied_zero_scope="PREFLIGHT_ONLY",
+            gates=matching_gates, shared_equilibrium_W_and_Sigma=True))
+        for arm in ARMS[1:]:
             for level, pick in enumerate(selected):
                 run_arm(f"{arm[0]}_level_{level}", arm, pick["amplitude_v_m"], reference["model"])
     save("complete.json", record=dict(

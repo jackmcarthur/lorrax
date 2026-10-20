@@ -15,6 +15,10 @@ maps take about 45.2 s for W and 17.3 s for the protected160-output Sigma
 sweep; these are not compact44 or coherent TD-refresh timings. Fejér is an
 explicit response-smoothing policy, not a successful sharp-cutoff replay or
 a conserving-closure claim. Matching q4 BSE/TD remain unverified on material.
+See [PERFORMANCE.md](PERFORMANCE.md) for the measured cold/warm phase costs,
+compact-destination contract, actual backend limits and remaining unmeasured
+TD costs. The native tiny BSE mapping proof is recorded separately in
+`evidence/P4_COARSE_BSE_60056663.json`; it is not a material eigensolve.
 
 The prepared BSE and static-TD control share the native `make_bosonic_q_comb`
 owner: inject the coarse screened head once, embed nested q rows with Nk/Nq,
@@ -112,6 +116,18 @@ kernel keeps the actual q4 or q8 screened head and quadrature. Zero/driven
 receipts expose the response grid/window, and coarse driven prerequisites
 must use BSE and zero-field results from that same accepted response policy.
 These are prepared adapter contracts, not a material TD or cutoff verdict.
+
+The supplied four-band zero artifact is **preflight only**, not Pauli or
+stationarity evidence for the resolved30v14c driven window. Before either
+MGKBA driven arm, the driven callback unconditionally runs both B and C at
+zero field for0.6fs on the actual resolved window and requires a completed
+fresh refresh, raw number/boundary checks, trace/Pauli health and the explicit
+zero-carrier-drift bound. `run_zero_controls=false` can disable the optional
+A-zero control, never these B/C safety gates. Their actual artifacts and
+response policy are listed in `matching_active_zero_gates.json`; a failure
+prevents both MGKBA driven arms. A amplitude calibration remains permitted
+before this larger-window gate. Identical equilibrium U/E/rho reuse the
+same checked equilibrium W and Sigma row; the actual C refresh is not skipped.
 
 `sc750_td_callback.py` is a prepared, not material-verified adapter from the
 authenticated accepted input to the existing native snapshot and TD owners.
