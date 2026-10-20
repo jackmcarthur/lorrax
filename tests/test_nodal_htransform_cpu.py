@@ -491,8 +491,11 @@ def _fine(ctilde, interp, E, q, n_win, **kw):
 def test_dropping_zero_weight_nodes_is_exact():
     """A node orbit with w = 0 has exactly zero rows of C = W^{1/2} Phi
     G^{-1/2}; dropping it from the rank axis, with every node kept as a
-    back-map target, leaves the energies (<= 1e-10 meV) and the window
-    projector at the targets unchanged."""
+    back-map target, leaves the energies and the window projector at the
+    targets unchanged up to roundoff: 4 ulp of max |E| per node on the
+    rank axis (96 nodes, max |E| 14.9 Ry: 1.3e-12 Ry).  The shift is
+    1.6-2.7 ulp of max |E| (5.3e-15-8.9e-15 Ry, run to run), so a fixed
+    1e-10 meV (7.3e-15 Ry, 2.2 ulp) failed intermittently."""
     import jax.numpy as jnp
     import pytest
     from isdf.galerkin import NodalInterp
@@ -511,7 +514,9 @@ def test_dropping_zero_weight_nodes_is_exact():
         ctilde[:, :, keep],
         NodalInterp(jnp.asarray(phi[:, :, keep]), sites[keep], A, 3, 1,
                     target=jnp.asarray(phi), target_frac=sites), E, q, 9)
-    assert RY_TO_MEV * np.abs(e_kept - e_all).max() <= 1e-10
+    d_e = float(np.abs(e_kept - e_all).max())
+    tol_e = 4 * phi.shape[-1] * np.finfo(np.float64).eps * float(np.abs(E).max())
+    assert d_e <= tol_e, (RY_TO_MEV * d_e, RY_TO_MEV * tol_e)   # meV
     assert np.abs(p_kept - p_all).max() <= 1e-12 * np.abs(p_all).max()
 
 

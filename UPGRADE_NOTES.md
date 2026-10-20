@@ -210,8 +210,6 @@ G ([theory](docs/theory/bgw-bsemat-export.md#finite-q)).
   unaffected. BerkeleyGW 4.0's `qflag` 2 route has two defects of its own; the theory
   page gives the workarounds.
 
-||||||| parent of 9bc2cad61 (c1 head channel: the q != 0 projector carries the full-Bloch gauge phase)
-
 ## 2026-10-20 — `band_extrapolation_checkpoints`: several Σ band counts from one sweep
 
 New deck key, off by default (`""`): a run without it is unchanged (same plan,
@@ -1030,7 +1028,6 @@ P=4, one node (`/lustre/orion/mat280/scratch/jackmc/int8/<run>/run.r0.log`):
 | syn/w12-i8 (dfce55663) | active GEMM reads B conjugated on load; identity little-group projector; per-branch W orientation | Σ τ other 5.84 → 3.70 s | eqp bitwise, Σ ≤ 2.2e-14 relative |
 | rcgpu (6b8629482) | the rule tree abandons a geometry on its error forecast's prediction bound | rule construction 32.42 → 27.40 s | Fe bitwise |
 
-||||||| parent of 491fd4afc (docs: the build records, and the runtime enforces, every leg's dependency closure)
 ## 2026-10-16 — rocm/integration7: the ROCm leg's host syncs, transfers and kernels
 
 Integration 7 lands the lane branches listed below on `rocm/integration6` 4e6b28dfc. The rules
