@@ -43,6 +43,15 @@ A new test needs no bootstrap import of its own.
 - `test_native_dielectric_diagnostic_cpu.py`: exact native dielectric/inverse
   formula, nonnormal logical-block bounds, padding witnesses and large-W
   background counterexamples; no fitted-pole admission (CPU).
+- `test_native_transition_galerkin_bridge_cpu.py`: internal one-parent native
+  transition actions against full-coherent FFT/literal response with scalar
+  and spinor normalization; CGS2/TSQR, exact Dyson/dual interpolation,
+  full-port factors through complex column Sigma, stationary sign sectors,
+  genuine gain, q-crossing and capacity guards (four-device CPU). No all-q
+  bank, production switch, material admission or trajectory is certified.
+- `test_transition_probe_rank_cpu.py`: internal transition-seed independence
+  and strict residual singular-block rank policy (CPU); numerical basis
+  admission, not a physical pole or stability projection.
 - `tdagw/test_collision_boundary_cpu.py`: global versus current-density
   empty/filled-subspace boundary diagnostics, with no state repair (CPU).
 - `tdagw/cri3_full_microscopic/`: archived full-native campaign preparation,
