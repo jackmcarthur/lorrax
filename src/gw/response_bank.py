@@ -3221,7 +3221,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         partnered = ordered and p1 > p0
         if partnered:
             from symmetry_maps import q_negation_index
-            negative = np.asarray(q_negation_index((int(meta.nkx), int(meta.nky), int(meta.nkz))), dtype=np.int64)
+            qgrid = getattr(meta, "qgrid", None)
+            qgrid = ((int(meta.nkx), int(meta.nky), int(meta.nkz))
+                     if qgrid is None else tuple(map(int, qgrid)))
+            negative = np.asarray(q_negation_index(qgrid), dtype=np.int64)
             partner_qids = negative[qids]
             partner_provenance = bank_io.get("minus_q_operator_provenance")
             if partner_provenance is None:

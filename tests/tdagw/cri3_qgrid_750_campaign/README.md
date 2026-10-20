@@ -62,3 +62,66 @@ and the pending q4 handoff plan. These are input/provenance checks, not
 converged SC results. `diagnostics/README.txt` records the actual fault-time
 CPython stack, selector-policy correction, and explicitly partial progress
 of corrected run 60053348; no current intermediate map is a reference.
+
+## Accepted-SC750 short zero-field callback
+
+`sc750_td_callback.py` is a prepared, not material-verified adapter from the
+authenticated accepted input to the existing native snapshot and TD owners.
+The accepted q8 input of run 60053348 is recorded separately in
+`evidence/Q8_ACCEPTED_REFERENCE_60053348.json`; historical prepared/ongoing
+records above are not its convergence receipt. The SC producer revision and
+actual TD execution revision are recorded separately.
+
+After a frozen native fine-q map, the probe commits its raw750/extrapolated
+complex shell pairs, spectral fit and receipt BEFORE the optional TD callback.
+Separate STARTED and CALLBACK_RETURNED records distinguish request from return;
+a TD refusal leaves the completed GW evidence intact and aborts the probe.
+To obtain the matched q8/q4 GW comparison independently of a possible TD
+refusal, run first without either TD option. No full microscopic W comparison
+or cutoff-accuracy verdict is implied by those small-band results.
+
+The callback explicitly rerotates the original DFT carrier with the full
+accepted 160-band unitary before selecting active [128,132), preserves the
+logical750/padded752 ladder and actual native spectral fit, and uses the SC
+anchor once plus bare-HF delta and MH minus its equilibrium value. Rates remain
+raw, full-coherent, active-only, with no equilibrium collision subtraction,
+PSD/population clipping or trace repair. Fullvirtual MH includes the tail.
+`dynamic` is the legal parser value retaining complete MH in joint mode.
+
+Launch collectively in a separately authenticated native environment; the
+following is a command template, NOT a submitted job:
+
+```sh
+python CAMPAIGN/native_frozen_map_probe.py \
+  --source IMMUTABLE_EXEC_SOURCE --source-revision EXEC_REVISION \
+  --setup-deck PRIVATE_CORRECTED_Q4_SETUP.in \
+  --frames ACCEPTED_Q8_FRAME_DIRECTORY --out FRESH_PROBE_DIRECTORY \
+  --td-helper CAMPAIGN/sc750_td_callback.py \
+  --td-deck CAMPAIGN/inputs/sc750_zero_joint_0p6fs.toml \
+  --wall-cap 900 --stack-after 0
+```
+
+`LEG_HEAD` must equal EXEC_REVISION. The execution source needs the native
+logical750/padded752 fix, authenticated SC-reference builder, legal dynamic-MH
+default, spectral-tail adapter and full-grid seed join. The setup deck must
+use fresh private outputs and the actual accepted q8 artifact, never a failed
+map's output. This template does not select an allocation or waive native
+memory admission. Optional `--bse-helper` uses the separate reviewed native
+BSE callback; its finite-window target is not automatically a 2v2c TD target.
+
+The zero-field deck is callback-only: its LIVE_AUTHENTICATED_SC750_CALLBACK
+markers are not a loadable old160 manifest. The callback emits resolved runtime
+paths and execution/module hashes; source paths describe the live prepared
+callback, not a standalone reloadable bundle. It requests 0.6 fs with a 0.5 fs
+updated-W refresh, source collision eta (currently 0.25 eV), and separate
+response-lag gamma 0.05 eV. Completion requires an actual refreshed snapshot,
+and reports fresh same-gauge boundary compressions, raw/coherent collision,
+trace and Pauli excursions. Static SC convergence does not certify finite-eta
+Markov stationarity or driven admission. Any refusal is evidence, not repaired.
+Fine full-coherent TD has 64 q rows rather than the SC run's 10 symmetry
+parents; no SC wall time is claimed as its refresh cost. A later 30v14c window
+and nonlinear pulse need separate bright-target/window and resource gates.
+
+Focused local parser/gauge/provenance tests are
+`test_sc750_td_callback.py` and `test_native_frozen_map_probe.py`; they do not
+replace a real multihost material callback execution.

@@ -1,0 +1,57 @@
+# Callback-only deck. NEVER load as a standalone bundle/old 160-band source.
+# The adapter replaces source/output paths with the authenticated live SC750 context.
+[control]
+calc_type = "COHSEX"
+[control.timesteps]
+t0 = 0.0
+tf = 600.0
+dt_measure = 50.0
+ntcheck = 5
+[control.files]
+outdir = "SET_BY_AUTHENTICATED_SC750_CALLBACK"
+[system]
+ibndmin = 129
+ibndmax = 132
+ivbm = 130
+geometry = "slab"
+esmear = 0.05
+depopulation = 0.0
+dephasing = 0.0
+[system.Efunc]
+E_x = 0.0
+E_y = 0.0
+E_z = 0.0
+[measurements]
+types = ["Efield", "polarization", "carrier_density", "density_matrix"]
+[measurements.3]
+dataset_name = "rho_full"
+brange1 = [129, 133]
+brange2 = [129, 133]
+[lorrax]
+method = "cfm4"
+dt = 25.0
+n_corr = 2
+chunk = 5
+stiff_modes = 0
+system = "bundle"
+bundle_input = "LIVE_AUTHENTICATED_SC750_CALLBACK"
+dipole_file = "LIVE_AUTHENTICATED_SC750_CALLBACK"
+model = "isdf"
+intraband = false
+collision = "raw"
+collision_screening = "joint"
+collision_statistics = "retarded_reference"
+collision_hamiltonian = "reference"
+collision_basis = "instantaneous"
+collision_hermitian = "dynamic"
+collision_internal_pairing = "vertex"
+collision_rate_intermediates = "active"
+collision_in_scattering = "full"
+collision_refresh_fs = 0.5
+collision_refresh_df = 0.0
+collision_adiabatic_ev = 0.05
+collision_fit_tolerance = 0.02
+collision_snapshot_steps = 32
+collision_snapshot_tol_ev = 0.0001
+collision_snapshot_mixing = 0.7
+collision_snapshot_acceleration = "anderson"

@@ -4,7 +4,8 @@ PREPARED capability, not hardware verified. Initialize through a native q4 SC
 deck (which authenticates full electronic parents), intercept its solver entry,
 and replay the EXISTING native map twice on one accepted saved input frame.
 Both calls hold the exact input E/f/U and full750 tail; each computes its own
-native W, head, Hartree, Sigma and spectral-shell tail. No TD/HF adapter is used.
+native W, head, Hartree, Sigma and spectral-shell tail. Optional post-Sigma
+TD uses an explicitly reconstructed current source and the actual tail fit.
 """
 import argparse
 import copy
@@ -13,10 +14,12 @@ import faulthandler
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
 import threading
+import time
 import zipfile
 
 
@@ -76,6 +79,7 @@ def load_accepted_frame(directory):
             and np.array_equal(arrays["occupations"], arrays["occupation_padded"][:, :750])):
         raise ValueError("logical frame and padded carrier disagree")
     record = dict(record, accepted_solver=solver, reference_ready=True,
+                  accepted_driver_complete=complete,
                   frame_npz_sha256=hashlib.sha256(
                       (directory / (stem + ".npz")).read_bytes()).hexdigest())
     return arrays, record
@@ -106,7 +110,7 @@ def band_pair_comparison(fine, coarse):
 
 def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
                         directory, publish, gather, G0_canonical=None,
-                        source_callback=None, post_sigma_callback=None):
+                        source_callback=None, post_sigma_callback=None, input_deck=None):
     """Evaluate one existing native map; source callback is synchronous only."""
     import numpy as np
     import jax
@@ -117,6 +121,7 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
     from gw.head_correction import HeadResolver
     from gw import sigma_dispatch, ppm_pipeline
     h = helpers()
+    leg_started = time.perf_counter()
     carrier = inputs.wfns_dft.green_parent
     if (carrier is None or carrier.plan.n_parent != 64 or carrier.plan.n_full != 64
             or tuple(inputs.meta.kgrid) != (8, 8, 1)):
@@ -198,7 +203,16 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
                 G0_canonical=G0_canonical,
                 spectral_tail_reference=captured.get("spectral_tail_reference"),
                 velocity_dft_cart=(None if inputs.parallel_transport is None else
-                                   inputs.parallel_transport.velocity_dft_cart))
+                                   inputs.parallel_transport.velocity_dft_cart),
+                original_psi=inputs.wfns_dft.green_parent.projection_faces()[0],
+                frame_arrays=arrays, input_deck=input_deck,
+                driver_complete=frame.get("accepted_driver_complete"),
+                head=captured.get("sigma_head"), member="shared_pole",
+                efermi_ry=captured.get("efermi_ry"), wall_s=time.perf_counter()-leg_started,
+                source_cost_scope="this frozen map/callback setup; outer native source initialization excluded",
+                screening_inputs=dict(wfns=current, V_q=Vscreen, meta=meta,
+                    config=config, kwargs=dict(sym=inputs.sym)),
+                source_lifetime="explicit post-Sigma rerotation; original DFT carrier retained")
 
     def screen(mode, current, V_screen, **kwargs):
         result = original_screen(mode, current, V_screen, **kwargs)
@@ -222,6 +236,8 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
 
     def finalize(body, head, **kwargs):
         from gw.dynamic_sigma import add_head_sigma_diag
+        captured["sigma_head"] = head
+        captured["efermi_ry"] = kwargs.get("efermi_ry")
         raw = kwargs.get("sigma_c_body_omega_unextrap")
         if raw is None or getattr(raw, "pair", None) is None:
             raise ValueError("native raw750 complex pair was not retained by debug twin policy")
@@ -279,16 +295,6 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
             wfn_fingerprint=reference["wfn_fingerprint"], ladder_shift_ev=0.0,
             native_fields=fit_scalars,
             scope="ACTUAL native producer fit at this accepted frozen input; amplitude not frozen"))
-        if post_sigma_callback is not None:
-            # Never assume references keep donated faces alive. Explicitly
-            # rebuild current faces from immutable DFT operands after Sigma.
-            h.mark("post_sigma_explicit_rerotation_begin", qgrid=list(qgrid))
-            current = original_rotate(inputs.wfns_dft, U, enk_active_new=E[:, :160],
-                enk_base=E, efermi=None, occupations=f, active_slice=slice(0, 160),
-                mesh_xy=inputs.mesh_xy)
-            post_sigma_callback(source_record(current, captured["roles"]))
-            del current
-            h.mark("post_sigma_explicit_rerotation_end", qgrid=list(qgrid))
         fields = {key: captured[key] for key in
                   ("raw750_pair_ry", "extrapolated_pair_ry", "sigma_x_ry", "e_eval_ev")}
         publish(directory.name + "_band_operators.npz", arrays=fields)
@@ -306,8 +312,23 @@ def evaluate_frozen_leg(owner, initial_state, inputs, arrays, frame, *, qgrid,
             q0_certificate_records="owned by native report/head callback; not reserialized here",
             full_W_comparison="NOT_MEASURED",
             source_callback_executed=source_callback is not None,
-            post_sigma_explicit_rerotation=post_sigma_callback is not None,
+            post_sigma_callback_requested=post_sigma_callback is not None,
             newly_converged=False, metadata_only_host_arrays=True))
+        if post_sigma_callback is not None:
+            # Commit the completed native GW result BEFORE optional TD can
+            # refuse its distinct finite-width/raw-collision gate.
+            publish(directory.name+"_post_sigma_callback_started.json", record=dict(
+                status="STARTED_NOT_COMPLETED", input_frame=frame["frame"], qgrid=list(qgrid)))
+            h.mark("post_sigma_explicit_rerotation_begin", qgrid=list(qgrid))
+            current = original_rotate(inputs.wfns_dft, U, enk_active_new=E[:, :160],
+                enk_base=E, efermi=None, occupations=f, active_slice=slice(0, 160),
+                mesh_xy=inputs.mesh_xy)
+            post_sigma_callback(source_record(current, captured["roles"]))
+            del current
+            publish(directory.name+"_post_sigma_callback_complete.json", record=dict(
+                status="CALLBACK_RETURNED", input_frame=frame["frame"], qgrid=list(qgrid),
+                scope="callback return, not an automatic driven/material acceptance"))
+            h.mark("post_sigma_explicit_rerotation_end", qgrid=list(qgrid))
         del mapped
         return fields
     finally:
@@ -325,21 +346,28 @@ def main(argv=None):
     parser.add_argument("--frames", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--bse-helper")
+    parser.add_argument("--td-helper", help="reviewed post-Sigma SC750 TD callback module")
+    parser.add_argument("--td-deck", help="explicit short zero-field TD deck for that callback")
     parser.add_argument("--wall-cap", type=float, default=900.)
-    parser.add_argument("--stack-after", type=float, default=120.)
+    parser.add_argument("--stack-after", type=float, default=0.)
     args = parser.parse_args(argv)
     h = helpers()
     source, out = Path(args.source).resolve(), Path(args.out).resolve()
-    if out.exists() or args.wall_cap <= 0 or args.stack_after <= 0:
-        parser.error("fresh --out and positive deadlines required")
+    if (out.exists() or not math.isfinite(args.wall_cap) or args.wall_cap <= 0
+            or not math.isfinite(args.stack_after) or args.stack_after < 0):
+        parser.error("fresh --out, positive finite wall cap and nonnegative stack interval required")
+    if bool(args.td_helper) != bool(args.td_deck):
+        parser.error("--td-helper and --td-deck are required together")
+    if os.environ.get("LEG_HEAD") != args.source_revision:
+        parser.error("--source-revision must match launcher's immutable LEG_HEAD")
     sys.path[:0] = [str(source), str(source / "src")]
     faulthandler.enable(all_threads=True)
-    faulthandler.dump_traceback_later(args.stack_after, repeat=True)
+    if args.stack_after > 0:
+        faulthandler.dump_traceback_later(args.stack_after, repeat=True)
     done = threading.Event()
     def watchdog():
         if not done.wait(args.wall_cap):
             h.mark("frozen_probe_wall_stop", seconds=args.wall_cap)
-            faulthandler.dump_traceback(all_threads=True)
             os._exit(124)
     threading.Thread(target=watchdog, daemon=True).start()
     import runtime
@@ -398,18 +426,27 @@ def main(argv=None):
             host_band_metadata_price_bytes=small_preflight,
             no_material_capacity_admission_claim=True))
         callback = None
+        td_callback = None
         if args.bse_helper:
             spec = importlib.util.spec_from_file_location("native_bse_probe", args.bse_helper)
             bse = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(bse)
             callback = lambda current: bse.run_bse_probe(current, out=out / "fine_bse",
                 nval=4, ncond=4, nroots=24, maxiter=200)
+        if args.td_helper:
+            spec = importlib.util.spec_from_file_location("sc750_td_callback", args.td_helper)
+            td = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(td)
+            td_callback = lambda current: td.run_td_probe(current,
+                out=out / "fine_td", deck_path=args.td_deck)
         results = []
         for grid, directory in zip(((8, 8, 1), (4, 4, 1)), directories):
             results.append(evaluate_frozen_leg(sc_iteration, initial, inputs, arrays,
                 frame, qgrid=grid, directory=directory, publish=publish,
                 gather=gather_to_host, G0_canonical=None if not G0 else G0[0],
-                source_callback=callback if grid == (8, 8, 1) else None))
+                source_callback=callback if grid == (8, 8, 1) else None,
+                post_sigma_callback=td_callback if grid == (8, 8, 1) else None,
+                input_deck=str(Path(args.setup_deck).resolve())))
         # Conservative four copies of the two band-only payloads and accepted
         # frame cover retained arrays, NPZ staging, norms/differences and BLAS
         # scratch. This does NOT price native source/device/model workspaces.
@@ -439,7 +476,8 @@ def main(argv=None):
     finally:
         sc_iteration.run_self_consistency, gw_init._finalize_vq_views = original_solver, original_vq
         done.set()
-        faulthandler.cancel_dump_traceback_later()
+        if args.stack_after > 0:
+            faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":
