@@ -970,14 +970,20 @@ def _face_kernels(mesh, Q, g_tile, with_v):
     """The charge channel's per-tile programs on the face: Z (q-owner) -> its first Q rows at
     ``P(None,'x','y')``; ζ = B(BᴴZ) by two face GEMMs; then ζ masked by ngk, ``V += conj(ζ) v ζᵀ``
     at ``P(None,'x','y')`` and the shell gather at ``P(None,('x','y'),None)``."""
-    key = ('face', _mesh_id(mesh), int(Q), int(g_tile), bool(with_v))
+    # The GEMMs take whole matrices per rank only where they fit the room beside what is live
+    # (distrib_la.fits_local: Q < P only within its small-matrix cap), else the face SUMMA.
+    # The default staged route put a whole B (mu x mu) and Z tile on one rank at Q = 1.
+    from common.gpu_utils import shared_device_room
+    room = int(shared_device_room("isdf zeta face apply"))
+    key = ('face', _mesh_id(mesh), int(Q), int(g_tile), bool(with_v), room)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
     face, mush = NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P(None, _XY, None))
     to_face = jax.jit(lambda Z: Z[:Q], out_shardings=face)
     from distrib_la import matmul
-    apply = jax.jit(lambda B, Z: matmul(B, matmul(B, Z, transa="C", mesh=mesh), mesh=mesh), out_shardings=face)
+    gemm = partial(matmul, mesh=mesh, batched_route="auto", budget_bytes=room)
+    apply = jax.jit(lambda B, Z: gemm(B, gemm(B, Z, transa="C")), out_shardings=face)
 
     def acc(zeta, v, ngk, sl, t, V, S):
         g_idx = t * g_tile + jnp.arange(zeta.shape[-1], dtype=jnp.int32)
