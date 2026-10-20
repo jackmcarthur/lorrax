@@ -91,12 +91,18 @@ def line_selection_price(rows, *, mesh, nq, execution, eigh_backend):
     plan = constructor_price_plan(mesh, largest, execution, backend=eigh_backend)
     if execution == 'local':
         resident = 16 * 2 * math.ceil(int(nq) / ranks) * (blocks + largest ** 2)
-        workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((int(nq), largest, largest),), np.complex128)
+        # The batched local chain, compiled with every attempt (the retry is the fallback).
+        workspace = distrib_la.eigh_stack_bytes(plan, (int(nq), largest, largest), np.complex128)
     else:
         # The whole-mesh kernel forms G = W^H W and its vectors for every
         # parent of the stack at once: 2 nq largest^2 tiles.
         resident = math.ceil(16 * (2 * int(nq) * blocks + 2 * int(nq) * largest ** 2) / ranks)
-        workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((1, largest, largest),), np.complex128)
+        # One parent's eigh as it runs eagerly: its first attempt, or the retry program a failed
+        # check compiles (its gathered attempt joins only within the selection plan's own room,
+        # what this admission leaves), each compiled (Plan.mesh_bytes: + the provider's query).
+        workspace = max([distrib_la.workspace_bytes_per_rank(plan, "eigh", ((1, largest, largest),), np.complex128)]
+                        + [plan.mesh_bytes("eigh", 1, largest, np.complex128, phase) or 0
+                           for phase in ("first", "retry")])
     return int(resident), int(workspace)
 
 

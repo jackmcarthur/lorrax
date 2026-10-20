@@ -76,7 +76,7 @@ REPLICATED.  Eigenvectors are COLUMNS.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache, partial
 from typing import Any, Callable, NamedTuple
 
@@ -1366,7 +1366,10 @@ class Plan:
                             f"lower on this host ({type(exc).__name__}: {str(exc)[:120]})",
                             "the route is decided without its price")
             return None
-        vendor = (distrib_la.workspace_bytes_per_rank(self, "eigh", ((int(nb), int(n), int(n)),), dtype)
+        # The query reads the stack's own n: a plan prices every stack place() routes, whatever
+        # n it was built at (run30k 2026-10-20: h_vv beside a pencil-sized plan).
+        sized = self if self.n in (None, int(n)) else replace(self, n=int(n))
+        vendor = (distrib_la.workspace_bytes_per_rank(sized, "eigh", ((int(nb), int(n), int(n)),), dtype)
                   if self.backend == "cusolvermp" else 0)
         return compiled + int(vendor)
 
@@ -1508,7 +1511,13 @@ class Plan:
             return out
         _notices(out[-1], self.op, int(ops[0].shape[-1]), ops[0].dtype, site, final=False)
         del out
-        return program("retry", ())(*ops)
+        retry = program("retry", ())
+        # The fallback runs: its program, compiled at the operands, is a part of the open stage.
+        from lxkit import memory
+        m = retry.lower(*ops).compile().memory_analysis()
+        memory.book(memory.priced(m.temp_size_in_bytes + m.output_size_in_bytes - m.alias_size_in_bytes,
+                                  f"distrib_la {self.op} retry program (compiled)", increment=True))
+        return retry(*ops)
 
     def _checked_eigh(self, call, post):
         from distrib_la._result_check import checked_eigh, eigh_layout, shifted
@@ -1634,12 +1643,7 @@ class Plan:
         module exists to make once — the same reason there is no
         ``backend=`` on a call and only on :func:`plan`.
 
-        ``identity=True`` (``solve_lu``): ``args[0]`` is the identity, the caller's word.  Only
-        cuSOLVERMp's stacked entry acts on it (A^T factored on the column-major grid,
-        :func:`distrib_la._cusolvermp.batched_distributed_solve_lu`); every other route solves
-        against the operand it was given.
         """
-        identity = bool(kwargs.pop("identity", False))
         if (self.op == "eigh" and _route is None and not isinstance(A, jax.core.Tracer)
                 and _is_batch_layout(A, self.mesh)):
             # Whole matrices already live on their ranks: only the local kernel can
@@ -1676,12 +1680,10 @@ class Plan:
 
         rounds = _rounds if _rounds is not None else self._decide(A, args, traced, route)[2]
         if rounds == 0:
-            return self._library_plan().batched(A, *args, identity=identity, **kwargs)
+            return self._library_plan().batched(A, *args, **kwargs)
         ops = tuple(ensure_sharding(x, self.batch_in_sharding)
                     for x in (A, *args))
         if route == ROUTE_BACKEND_BATCHED:
-            if identity and self.op == "solve_lu" and self.backend == "cusolvermp":
-                kwargs = dict(kwargs, identity=True)
             many, post = self._entry("many", rounds=rounds)
             if many is None:
                 raise NotImplementedError(

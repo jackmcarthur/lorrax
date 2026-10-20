@@ -22,7 +22,7 @@ def _shapes(shapes):
 def _vendor_query(ctx, op, sizes, dtype):
     from distrib_la.loader import get_lib
     lib = get_lib('CUDA')
-    name = 'lrx_eigh_workspace_bytes'
+    name = 'lrx_lu_workspace_bytes' if op == 'solve_lu' else 'lrx_eigh_workspace_bytes'
     if op == 'eigh' and len(sizes) == 2:
         # (side, block): the descriptor the distributed solve runs at. A
         # library without the block query prices one tile per rank at that side.
@@ -95,6 +95,29 @@ def _workspace_details(plan, op, shapes, dtype):
     dtype = np.dtype(dtype)
     if dtype not in (np.dtype('float64'), np.dtype('complex128')):
         raise TypeError('workspace query supports float64 and complex128')
+    # Every platform checks the request against its plan first: the CUDA branch below is
+    # the one CPU never runs, so its shape contract must not live only there.
+    if op == 'eigh':
+        if not isinstance(plan, Plan) or plan.op != 'eigh':
+            raise ValueError('eigh query requires an eigh Plan')
+        if (len(shapes) != 1 or len(shapes[0]) not in (2, 3)
+                or shapes[0][-2] != shapes[0][-1]):
+            raise ValueError('eigh shapes must be ((n,n),) or ((batch,n,n),)')
+        if plan.n is not None and plan.n != shapes[0][-1]:
+            raise ValueError('eigh shape differs from the planned n')
+    elif op in ('gemm', 'matmul'):
+        if (len(shapes) != 2 or len(shapes[0]) not in (2, 3)
+                or len(shapes[1]) != len(shapes[0])
+                or shapes[0][:-2] != shapes[1][:-2]
+                or shapes[0][-1] != shapes[1][-2]):
+            raise ValueError('GEMM shapes must be matching N,N matrix or batched operand shapes')
+        batch = shapes[0][0] if len(shapes[0]) == 3 else 1
+        if isinstance(plan, GemmPlan) and ((shapes[0][-2], shapes[0][-1], shapes[1][-1], batch)
+                                           != (plan.m, plan.k, plan.n, plan.nq)
+                                           or dtype != np.dtype(plan.dtype)):
+            raise ValueError('GEMM shape/dtype differs from its plan')
+    else:
+        raise ValueError('workspace op must be eigh or gemm')
     if mesh_platform(plan.mesh) != 'CUDA':
         return _off_cuda(plan, op, shapes, dtype)
     px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
@@ -105,14 +128,7 @@ def _workspace_details(plan, op, shapes, dtype):
         (op != 'eigh' or len(shapes[0]) == 3)
         and plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD))
     if op == 'eigh':
-        if not isinstance(plan, Plan) or plan.op != 'eigh':
-            raise ValueError('eigh query requires an eigh Plan')
-        if (len(shapes) != 1 or len(shapes[0]) not in (2, 3)
-                or shapes[0][-2] != shapes[0][-1]):
-            raise ValueError('eigh shapes must be ((n,n),) or ((batch,n,n),)')
         n = shapes[0][-1]
-        if plan.n is not None and plan.n != n:
-            raise ValueError('eigh shape differs from the planned n')
         if not local and (n % px or n % py):
             raise ValueError('eigh shape must tile the plan mesh')
         if not local and plan.backend != 'cusolvermp':
@@ -143,19 +159,9 @@ def _workspace_details(plan, op, shapes, dtype):
                     checked_device_bytes=0, copies=copies,
                     provider=('cusolverDn (one_device)' if one_device else 'cusolverDn')
                     if local else 'cusolverMp')
-    if op not in ('gemm', 'matmul'):
-        raise ValueError('workspace op must be eigh or gemm')
-    if (len(shapes) != 2 or len(shapes[0]) not in (2, 3)
-            or len(shapes[1]) != len(shapes[0])
-            or shapes[0][:-2] != shapes[1][:-2]
-            or shapes[0][-1] != shapes[1][-2]):
-        raise ValueError('GEMM shapes must be matching N,N matrix or batched operand shapes')
     m, k, n = shapes[0][-2], shapes[0][-1], shapes[1][-1]
-    batch = shapes[0][0] if len(shapes[0]) == 3 else 1
-    if isinstance(plan, GemmPlan) and ((m,k,n,batch) != (plan.m,plan.k,plan.n,plan.nq)
-                                        or dtype != np.dtype(plan.dtype)):
-        raise ValueError('GEMM shape/dtype differs from its plan')
-    if any(v % axis for v, axis in ((m,px),(k,px),(k,py),(n,py))):
+    # A local GEMM holds whole operands per device: only the distributed one tiles the mesh.
+    if not local and any(v % axis for v, axis in ((m,px),(k,px),(k,py),(n,py))):
         raise ValueError('GEMM shapes must tile the plan mesh')
     return _gemm_workspace_details(plan.mesh, shapes, dtype, local=local,
         backend=plan.backend,
@@ -262,6 +268,18 @@ def lu_workspace_bytes(mesh, n, dtype) -> int:
     item = np.dtype(dtype).itemsize
     return int(memory.vendor(leg_for_platform("CUDA"), "cusolvermp", "solve_lu", int(n), px * py, item,
                              unit=(int(n) // px + mb) * nb * item).fixed)
+
+
+def lu_workspace_query(mesh, n, nrhs, dtype) -> int:
+    """Device bytes per rank the next cuSOLVERMp ``n x nrhs`` solve_lu allocates beside its
+    operands: the native size query (``lrx_lu_workspace_bytes``: getrf, the getrs chunk the cap
+    posted for this shape admits, pivots) on the solve's own context and descriptors, which sizes
+    and caches the plan the solve then runs.  Collective: every rank asks at the same point."""
+    from distrib_la._cusolvermp import get_or_init_context, lu_blocks, rhs_block
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    mb, nb = lu_blocks(int(n), px, py)
+    sizes = (int(n), int(nrhs), mb, nb, mb, rhs_block(int(n), int(nrhs), px, py, mb))
+    return _vendor_query(get_or_init_context(mesh, col_major=False), 'solve_lu', sizes, dtype)[0]
 
 
 def eigh_stack_bytes(plan, shape, dtype) -> int:
