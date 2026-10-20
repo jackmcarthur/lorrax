@@ -1,0 +1,63 @@
+{
+  "status": "PASS_SOFTWARE_ONLY_NOT_MATERIAL_OR_SPEEDUP",
+  "revision": "57b30151fba085f6478ea3c1939f7066eb7e57bf",
+  "material_admitted": false,
+  "source_root": "/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/qgrid_20261020/source/57b3015",
+  "archive_sha256": "c30d1f02adb0f82f9731e858c2ec32597efad218c614bdcaf8be872f63d82713",
+  "harness_sha256": "9dda4ccb802ea57454d7031e6fd7a76b2f93ef36193965f7568fd2276e5b8479",
+  "max_wall_seconds": 120.0,
+  "max_active_GPUh": 0.13333333333333333,
+  "result": {
+    "parents": 10,
+    "widths": [
+      9,
+      5
+    ],
+    "rounds_each": 2,
+    "slots": [
+      18,
+      10
+    ],
+    "max_pole_absolute_difference": 0.0,
+    "max_complex_transfer_absolute_difference": 0.0,
+    "passing_gate_rows": [
+      "gram_valid",
+      "retained_metric_positive",
+      "orientation_paired",
+      "retained_rank"
+    ],
+    "phases": [
+      {
+        "width": 9,
+        "round": 0,
+        "real_parents": 9,
+        "seconds": 17.299610726000537,
+        "compiled_admission": true
+      },
+      {
+        "width": 9,
+        "round": 1,
+        "real_parents": 1,
+        "seconds": 0.017661514997598715,
+        "compiled_admission": true
+      },
+      {
+        "width": 5,
+        "round": 0,
+        "real_parents": 5,
+        "seconds": 14.583742194001388,
+        "compiled_admission": true
+      },
+      {
+        "width": 5,
+        "round": 1,
+        "real_parents": 5,
+        "seconds": 0.018216889999166597,
+        "compiled_admission": true
+      }
+    ],
+    "scope": "native_CUDA_MPI_face_round_equivalence_NOT_material_or_speedup",
+    "admission_scope": "actual_eigh_provider_and_compiled_round_NOT_full_constructor_chooser"
+  },
+  "elapsed_s": 32.39988636899943
+}

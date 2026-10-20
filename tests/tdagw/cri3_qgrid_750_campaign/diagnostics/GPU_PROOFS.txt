@@ -1,0 +1,35 @@
+20 October 2026: bounded software proofs in allocation 60053348
+
+The two versioned Python helpers are byte-identical backups of the executed
+external harnesses. They require their exact archived source revision,
+runtime-first collective bootstrap, authenticated native library pair,
+node-wide four-GPU visibility, one selected GPU per MPI rank, and an external
+step deadline. They do not submit jobs. Run collectively, never on rank 0
+alone. Source-root/revision variables are authenticated by the external
+launcher, not by trusting an unverified environment variable alone.
+
+verify_sc_td_adapters_p4_d469c49.py
+  source: d469c49e0e7197a384990a4fe2817f9ce1e3bafe
+  helper SHA256: cd2f837cc48dc68e9f8de8ac5b1e2e866f89985b7725ece734c8961f8b361281
+  step: 60053348.3; actual elapsed 81 s on four GPUs (0.090 GPU-hours)
+  receipt: ../evidence/P4_D469_ADAPTERS_60053348.json
+  Scope: native padding scalar gate, bare-HF increment, ordered Sigma tail,
+  and explicitly toy-static BSE payload. No material SC, material screening,
+  material BSE or TD trajectory was performed by this proof. The later BSE
+  live-memory-room fix is not in this pinned source.
+
+verify_balanced_face_p4_57b3015.py
+  source: 57b30151fba085f6478ea3c1939f7066eb7e57bf
+  helper SHA256: 9dda4ccb802ea57454d7031e6fd7a76b2f93ef36193965f7568fd2276e5b8479
+  step: actual elapsed 42 s on four GPUs (0.046667 GPU-hours)
+  receipt: ../evidence/P4_BALANCED_57B3015_60053348.json
+  Scope: actual CUDA/MPI scalar face reducer with native auto-eigh and
+  compiled-round admission. Ten tiny paired-frequency parents use two
+  width-nine rounds (18 slots) or two width-five rounds (10 slots). Poles
+  and full complex transfers agreed exactly in this fixture, and the four
+  recorded gate rows passed in both. This does not exercise the complete
+  constructor chooser or measure a material speedup.
+
+Both receipts explicitly disclaim material admission and positivity or
+conservation guarantees. Their active step costs are portions of an already
+owned allocation, not additional reservation costs to add to that allocation.
