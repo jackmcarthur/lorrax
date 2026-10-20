@@ -521,7 +521,7 @@ def checked_shapes(fn, *args):
     return jax.eval_shape(_in_phase(fn, "first"), *args)[0]
 
 
-def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options=None):
+def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options=None, donate_argnums=()):
     """A caller's jitted program over checked solves, run as an eager eigh is.
 
     The first program holds each checked solve's first attempt and check and
@@ -535,6 +535,9 @@ def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options
     that size fits. A caller that runs ``call.lower(*args).compile()`` itself
     hands that executable's ``(out, status)`` to ``call.finish(args, result)``,
     which prints the notices, refuses by name and returns ``out``.
+    ``donate_argnums`` donates to the whole-chain program only: it is the last program
+    that reads the arguments (``call.lower`` and every retry), while the first attempt
+    never donates, so its retry reads them intact.
     """
     rep = NamedSharding(mesh, P())
     phases = {phase: _in_phase(fn, phase) for phase in ("first", "all")}
@@ -542,7 +545,8 @@ def checked_program(fn, mesh, out_shardings, in_shardings=None, compiler_options
     if compiler_options is not None:
         # Top-level jit only (the XLA option set, e.g. the latency-hiding scheduler).
         shardings["compiler_options"] = dict(compiler_options)
-    first, again = (jax.jit(phases[phase], out_shardings=(out_shardings, rep), **shardings)
+    first, again = (jax.jit(phases[phase], out_shardings=(out_shardings, rep),
+                            donate_argnums=tuple(donate_argnums) if phase == "all" else (), **shardings)
                     for phase in ("first", "all"))
 
     def report(phase, args, status, final):
