@@ -56,8 +56,12 @@ def _native_auth(out):
     return dict(native_receipts_checked=len(found),microscopic=found[0])
 
 
-def read_run(out,tag,mode,tf_fs,allow_partial=False,source_tree=None):
+def read_run(out,tag,mode,tf_fs,allow_partial=False,source_tree=None,active_window=(128,132)):
     out=Path(out)
+    lo,hi=map(int,active_window)
+    nb=hi-lo
+    if not 0<=lo<130<hi<=160:
+        raise ValueError('Expected active window containing occupied and empty source bands')
     path=out/'tdgw.h5'
     if not path.exists():
         raise FileNotFoundError('Missing actual native dataset: '+str(path))
@@ -92,10 +96,10 @@ def read_run(out,tag,mode,tf_fs,allow_partial=False,source_tree=None):
         weights=np.asarray(f['tdgw_header/wfn_header/w_k'])
         kpts=np.asarray(f['tdgw_header/wfn_header/kpts'])
         bands=f['tdgw_header/wfn_header/bands']
-        if tuple(int(bands[k][()]) for k in ('start','stop','step'))!=(129,133,1):
-            raise ValueError('Native header is not the matched129:132 active window: '+str(path))
-        if rho.shape!=(n,len(weights),4,4) or weights.shape!=(36,) or not np.isclose(weights.sum(),1.):
-            raise ValueError('Expected complete36k active2v2c density and normalized weights: '+str(path))
+        if tuple(int(bands[k][()]) for k in ('start','stop','step'))!=(lo+1,hi+1,1):
+            raise ValueError('Native header does not match manifest active window: '+str(path))
+        if rho.shape!=(n,len(weights),nb,nb) or weights.shape!=(36,) or not np.isclose(weights.sum(),1.):
+            raise ValueError('Expected complete36k manifest-window density and normalized weights: '+str(path))
     if end>tf_fs+1e-6:
         raise ValueError('Checkpoint extends beyond requested manifest final time: '+str(path))
     complete=bool(completed and abs(end-tf_fs)<1e-6 and len(t)==round(tf_fs/.05)
@@ -116,7 +120,8 @@ def read_run(out,tag,mode,tf_fs,allow_partial=False,source_tree=None):
         requested_tf_fs=tf_fs,completion_receipts=[str(p) for p,_,_ in records],authentication=auth,
         trace_initial=float(trace[0]),trace_final=float(trace[-1]),trace_max_drift=float(abs(trace-trace[0]).max()),
         purity_initial=float(purity[0]),purity_final=float(purity[-1]),
-        purity_definition='sum_k w_k Tr(rho_k^2), active4, no clipping',
+        active_zero_based=[lo,hi],
+        purity_definition=f'sum_k w_k Tr(rho_k^2), active{nb}, no clipping',
         rho_min=float(eigen.min()),rho_max=float(eigen.max()),hermiticity_max=float(abs(rho-adj).max()),
         polarization_units='native atomic units',field_units='native atomic units',carrier_units='native e/cell')
     return report,data
@@ -138,8 +143,12 @@ def exact_common(items,allow_partial=False,check_field=True):
     return n
 
 
-def gap_mixing(out,tf_limit):
+def gap_mixing(out,tf_limit,active_window=(128,132)):
     """Optional instantaneous Hermitian MATERIAL H, excluding the drive; not an occupation gap."""
+    lo,hi=map(int,active_window)
+    nb,nv=hi-lo,130-lo
+    if not 0<nv<nb:
+        raise ValueError('Material-gap diagnostic requires valence and conduction states')
     rows=[]
     for path in sorted((Path(out)/'campaign_diagnostics').glob('snapshot_*.npz')):
         with np.load(path) as z:
@@ -149,19 +158,19 @@ def gap_mixing(out,tf_limit):
             if t>tf_limit+1e-7:
                 continue
             u,e=np.asarray(z['U']),np.asarray(z['E_ry'])
-            if u.shape!=(1,36,4,4) or e.shape!=(1,36,4):
+            if u.shape!=(1,36,nb,nb) or e.shape!=(1,36,nb):
                 raise ValueError('Unsupported snapshot basis shape: '+str(path))
             h=(u[0]*e[0,:,None,:])@u[0].conj().swapaxes(-1,-2)
             energies,vectors=np.linalg.eigh(h)
-            # Tr(Pc_reference Pv_instantaneous)/2, gauge-invariant within v/c pairs.
-            mixing=np.sum(abs(vectors[:,2:,:2])**2,axis=(1,2))/2
+            # Tr(Pc_reference Pv_instantaneous)/n_valence, subspace gauge-invariant.
+            mixing=np.sum(abs(vectors[:,nv:,:nv])**2,axis=(1,2))/nv
             from common.units import RYD_TO_EV
             rows.append(dict(time_fs=t,
-                indirect_gap_ev=float(energies[:,2].min()-energies[:,1].max())*RYD_TO_EV,
-                minimum_direct_gap_ev=float(np.min(energies[:,2]-energies[:,1]))*RYD_TO_EV,
+                indirect_gap_ev=float(energies[:,nv].min()-energies[:,nv-1].max())*RYD_TO_EV,
+                minimum_direct_gap_ev=float(np.min(energies[:,nv]-energies[:,nv-1]))*RYD_TO_EV,
                 valence_reference_conduction_leakage_kmean=float(mixing.mean()),
                 valence_reference_conduction_leakage_kmax=float(mixing.max()),
-                vc_material_H_max_mev=float(abs(h[:,:2,2:]).max())*RYD_TO_EV*1e3))
+                vc_material_H_max_mev=float(abs(h[:,:nv,nv:]).max())*RYD_TO_EV*1e3))
     return rows
 
 
@@ -177,12 +186,16 @@ def main():
     a=p.parse_args()
     manifest=Path(a.manifest).resolve();root=manifest.parent
     plan=json.loads(manifest.read_text());fields=list(map(float,a.fields.split(',')))
+    active_window=tuple(plan['microscopic_space']['active_zero_based'])
     if len(fields)!=2 or any(x<=0 for x in fields):
         p.error('Exactly two positive fields are required for nonlinear overlays')
     out=Path(a.out).resolve()
     if out.exists():
         raise FileExistsError('Choose a NEW plot output directory: '+str(out))
-    aroot=Path(a.a_root or plan['static_A']['root'])
+    static_root=a.a_root or plan['static_A']['root']
+    if not static_root:
+        raise ValueError('No matched static A is available for this window; supply actual --a-root')
+    aroot=Path(static_root)
     results={};arrays={};run_out={}
     for amp in fields:
         for mode,arm in (('A','off'),('B','joint_frozen'),('C','joint')):
@@ -191,7 +204,7 @@ def main():
                 raise ValueError('Missing required native manifest leg: '+tag)
             directory=(aroot if mode=='A' else root)/tag
             results[amp,mode],arrays[amp,mode]=read_run(directory,tag,mode,plan['tf_fs'],
-                a.allow_partial,plan['source_tree'] if mode!='A' else None)
+                a.allow_partial,plan['source_tree'] if mode!='A' else None,active_window)
             run_out[amp,mode]=directory
     zero={}
     if a.subtract_zero:
@@ -200,7 +213,7 @@ def main():
         for mode,arm in (('A','off'),('B','joint_frozen'),('C','joint')):
             directory=Path(a.a_zero) if mode=='A' else root/f'E0_{arm}'
             rr,zero[mode]=read_run(directory,f'E0_{arm}',mode,plan['tf_fs'],a.allow_partial,
-                plan['source_tree'] if mode!='A' else None)
+                plan['source_tree'] if mode!='A' else None,active_window)
             if np.max(abs(zero[mode]['field']))!=0:
                 raise ValueError('Control is not exactly zero field: '+str(directory))
             results[0.,mode]=rr
@@ -277,7 +290,7 @@ def main():
         for ax in na[:,j]:ax.grid(alpha=.2);ax.legend(fontsize=8)
     nonlinear.suptitle('Nonlinear field-normalized overlays; not damping fits'+subtitle,fontsize=11)
     nonlinear.tight_layout(rect=(0,0,1,.95))
-    gaps={f'{amp:g}_{mode}':gap_mixing(run_out[amp,mode],results[amp,mode]['last_actual_sample_fs'])
+    gaps={f'{amp:g}_{mode}':gap_mixing(run_out[amp,mode],results[amp,mode]['last_actual_sample_fs'],active_window)
           for amp in fields for mode in ('B','C')}
     gapfig=None
     if any(gaps.values()):
@@ -288,7 +301,7 @@ def main():
             ga[1].plot([r['time_fs'] for r in rows],
                 [r['valence_reference_conduction_leakage_kmean'] for r in rows],label=key)
         ga[0].set(ylabel='instantaneous material indirect gap(eV)',xlabel='time(fs)')
-        ga[1].set(ylabel='mean Tr(Pc_ref Pv_inst)/2',xlabel='time(fs)')
+        ga[1].set(ylabel='mean Tr(Pc_ref Pv_inst)/n_valence',xlabel='time(fs)')
         for ax in ga:ax.grid(alpha=.2);ax.legend(fontsize=7)
         gapfig.suptitle('Material H=U diag(E) U†; excludes drive; NOT occupation/optical gap')
         gapfig.tight_layout()
