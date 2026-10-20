@@ -26,7 +26,8 @@ from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 
 def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
-                             max_workspace_bytes=4*1024**3, fixed_spaces=None):
+                             max_workspace_bytes=4*1024**3, fixed_spaces=None,
+                             frequency_scale_ry=1., coordinate_units=None):
     """One canonical owner of a reduced host pencil's modal gauges.
 
     Every rank supplies the same gathered ``E,A[l,r]``; ONLY rank zero runs
@@ -39,21 +40,22 @@ def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     from common.collectives import process_count
     if int(process_count()) == 1:
         return reduce_general_pencil(E, A, max_order=max_order, rank_tolerance=rank_tolerance,
-            max_workspace_bytes=max_workspace_bytes, fixed_spaces=fixed_spaces)
+            max_workspace_bytes=max_workspace_bytes, fixed_spaces=fixed_spaces,
+            frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units)
     return collective_general_pencil_batch([(E,A)], max_order=max_order,
         rank_tolerance=rank_tolerance, max_workspace_bytes=max_workspace_bytes,
-        fixed_spaces=[fixed_spaces])[0]
+        fixed_spaces=[fixed_spaces],frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units)[0]
 
 
 def general_pencil_workspace_bytes(shape):
     """Conservative host bytes for current descriptor SVD/balance/modal maps.
 
-    Covers reduced E/A and frequency spaces, both SVDs and their work,
+    Covers reduced E/A, unit/equilibration copies and frequency spaces, both SVDs and their work,
     balanced ordinary-eigenvector/metric buffers and reconstruction products.
     It never prices or gathers microscopic port matrices.
     """
     l,r=map(int,shape)
-    return 16*(16*l*r+24*min(l,r)**2)
+    return 16*(20*l*r+24*min(l,r)**2)
 
 
 def general_pencil_batch_plan(shapes, *, max_order, max_workspace_bytes=4*1024**3,
@@ -145,7 +147,7 @@ def _share_general_pencil(model, error, *, owner_rank, price, shape):
 
 def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
                                    max_workspace_bytes=4*1024**3, fixed_spaces=None,
-                                   retained_host_bytes=0):
+                                   retained_host_bytes=0,frequency_scale_ry=1.,coordinate_units=None):
     """Reduce at most P gathered frequency pencils concurrently, one owner each.
 
     The DRIVER gathers this admitted SMALL prefix on ALL ranks before entry.
@@ -171,7 +173,8 @@ def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
                 raise ValueError('GATE shared_general_precision: canonical complex128 handoff requires JAX x64')
             e,a=pencils[rank]
             model=reduce_general_pencil(e,a,max_order=max_order,rank_tolerance=rank_tolerance,
-                max_workspace_bytes=max_workspace_bytes,fixed_spaces=fixed[rank])
+                max_workspace_bytes=max_workspace_bytes,fixed_spaces=fixed[rank],
+                frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units)
         except Exception as exc:
             error=exc
     if world==1:
@@ -186,7 +189,8 @@ def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
 
 
 def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
-                          max_workspace_bytes=4 * 1024 ** 3, fixed_spaces=None):
+                          max_workspace_bytes=4 * 1024 ** 3, fixed_spaces=None,
+                          frequency_scale_ry=1.,coordinate_units=None):
     """Bounded host reduction of ONE general tangential frequency pencil.
 
     Only ``E,A[l,r]`` (complex128) cross this seam, never full microscopic
@@ -195,6 +199,12 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     finite-pole Loewner bank. A-visible directions unresolved in E are not
     promoted into nearly infinite modal states. This is numerical rank
     resolution, not a stable-pole projection: resolved growing poles remain.
+    Before rank selection, finite/infinity row units and eight deterministic
+    Ruiz sweeps equilibrate the combined E,A/frequency_scale_ry magnitudes.
+    ``coordinate_units=(left[l],right[r])`` contains positive equation-unit
+    factors, never microscopic port weights. Returned/held spaces are ALWAYS
+    recovered to original E/A coordinates. Current original pencils supply
+    the eigensolve, so physical poles never need frequency rescaling.
     Every CURRENT projected descriptor, including held spaces, is SVD-balanced
     to an ordinary eigenproblem. The recovered maps retain unchanged complex
     poles and independent input/output coefficients. No pole or residue is clipped.
@@ -208,6 +218,7 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     """
     import numpy as np
     import scipy.linalg as la
+    import hashlib
     started=time.perf_counter();svd_seconds=0.;eigen_started=None
     E, A = np.asarray(E, complex), np.asarray(A, complex)
     if (E.ndim != 2 or A.shape != E.shape or min(E.shape) < 1
@@ -231,13 +242,40 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                         svd_seconds=0.,eigen_seconds=0.,host_reduce_seconds=time.perf_counter()-started))
     if fixed_spaces is None:
         svd_started=time.perf_counter()
-        y, singular, xh = la.svd(E / scale, full_matrices=False, check_finite=False)
+        omega=float(frequency_scale_ry)
+        if not np.isfinite(omega) or omega<=0:
+            raise ValueError('GATE shared_general_equilibration: positive physical frequency reference required')
+        dl,dr=(np.ones(nl),np.ones(nr)) if coordinate_units is None else (
+            np.asarray(coordinate_units[0],float).copy(),np.asarray(coordinate_units[1],float).copy())
+        if (dl.shape!=(nl,) or dr.shape!=(nr,) or not np.isfinite(dl).all()
+                or not np.isfinite(dr).all() or np.any(dl<=0) or np.any(dr<=0)):
+            raise ValueError('GATE shared_general_equilibration: positive finite equation-unit factors required')
+        es=dl[:,None]*E*dr[None,:]
+        aa=dl[:,None]*(A/omega)*dr[None,:]
+        for _ in range(8):
+            magnitude=np.hypot(np.abs(es),np.abs(aa))
+            rows=magnitude.max(axis=1);cols=magnitude.max(axis=0)
+            rl=1/np.sqrt(np.where(rows>0,rows,1.))
+            rr=1/np.sqrt(np.where(cols>0,cols,1.))
+            dl*=rl;dr*=rr
+            es*=rl[:,None];es*=rr[None,:]
+            aa*=rl[:,None];aa*=rr[None,:]
+        if not all(np.isfinite(a).all() for a in (es,aa,dl,dr)):
+            raise ValueError('GATE shared_general_equilibration: unrepresentable frequency coordinates')
+        y, singular, xh = la.svd(es, full_matrices=False, check_finite=False)
         n = min(int(max_order), int(np.count_nonzero(singular > rank_tolerance * singular[0])))
         if not n:
             raise ValueError("GATE shared_general_rank: nonzero response has no resolved frequency span")
-        y, x = y[:, :n], xh[:n].conj().T
+        y, x = dl[:,None]*y[:, :n], dr[:,None]*xh[:n].conj().T
+        equilibration=dict(method='unit-aware-combined-pencil-Ruiz-infinity-8',frequency_scale_ry=omega,
+            left_scale_range=[float(dl.min()),float(dl.max())],right_scale_range=[float(dr.min()),float(dr.max())],
+            left_scale_sha256=hashlib.sha256(dl.tobytes()).hexdigest(),
+            right_scale_sha256=hashlib.sha256(dr.tobytes()).hexdigest(),
+            held_space_coordinates='original-pencil')
+        del es,aa,magnitude
         svd_seconds=time.perf_counter()-svd_started
     else:
+        equilibration=dict(method='held-original-pencil-spaces',held_space_coordinates='original-pencil')
         x, y = (np.asarray(fixed_spaces[key], complex) for key in ("right", "left"))
         n = x.shape[1]
         if (x.shape != (nr, n) or y.shape != (nl, n) or not n
@@ -297,6 +335,7 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                              svd_seconds=svd_seconds,eigen_seconds=time.perf_counter()-eigen_started,
                              host_reduce_seconds=time.perf_counter()-started,
                              numerical_spaces="two-sided-descriptor-svd",
+                             frequency_equilibration=equilibration,
                              eigensolver="current-descriptor-balanced-ordinary-geev",
                              construction="general-two-sided-tangential-loewner"))
 

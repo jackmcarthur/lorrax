@@ -152,12 +152,14 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # Geometry and selection are numerical spaces held only within this
     # physical refresh. Current census and scientific identity stay current.
     recipe = dict(fit_basis.setdefault("recipe", resolved), census=current_meta.shared_pole_census)
-    general_gates = dict(version="full-density-general-shared-pole-gates-v5",
+    general_gates = dict(version="full-density-general-shared-pole-gates-v6",
         source_policy_version=recipe.get("recipe_version", recipe.get("version")),
         scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
         eta_training_verification='active_span_3train_2interlaced_held_v1',
         numerical_spaces='two-sided-descriptor-svd',
         eigensolver='current-descriptor-balanced-ordinary-geev',
+        frequency_equilibration='unit-aware-combined-pencil-Ruiz-infinity-8',
+        frequency_scale='max_current_full_requested_energy_span_eta',
         descriptor_rank_tolerance=float(recipe['bank_rule_tolerance']),
         full_microscopic_support=True, finite_density_and_residues=True,
         scalar_rule_tolerance=float(recipe["bank_rule_tolerance"]),
@@ -396,8 +398,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     pref = float(algebra["prefactor"])
     c1 = mm(V, mm(pref*x1, V))
     c2 = mm(V, mm(pref*(x2-1j*gamma*x1), V))+mm(V, mm(pref*x1, mm(V, mm(pref*x1, V))))
+    moment_scale = max(float(np.ptp(energy[:, :stop])), eta)
     if "infinity" not in directions:
-        moment_scale = max(float(np.ptp(energy[:, :stop])), eta)
         c2_scaled = c2/moment_scale
         # Union of both moment input AND output ranges. This is a numerical
         # direction Gram, not Hermitization/positivity repair of W or rho.
@@ -423,6 +425,17 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                 tile_block(((A, af), (ai, aii)), face),
                 tile_join((B, bi), -2, face), tile_join((C, ci), -1, face))
     E, A, B, C = jax.jit(add_infinity, out_shardings=(face,)*4)(mu, lam, E, A, B, C, ql, il, qr, wr, qi, c1, c2)
+    # Infinity conditions have one extra energy unit per endpoint relative
+    # to finite divided differences. Match those units BEFORE numerical
+    # rank selection, respecting the actual tiled join order on each axis.
+    coordinate_units=(join_vectors((np.ones(mu.shape[0]),np.full(qi.shape[-1],1/moment_scale)),panel_side),
+                      join_vectors((np.ones(lam.shape[0]),np.full(qi.shape[-1],1/moment_scale)),panel_side))
+    frequency_coordinates=dict(frequency_scale_ry=moment_scale,
+        infinity_width=int(qi.shape[-1]),tile_extent=panel_side,
+        left_units_sha256=hashlib.sha256(coordinate_units[0].tobytes()).hexdigest(),
+        right_units_sha256=hashlib.sha256(coordinate_units[1].tobytes()).hexdigest())
+    recipe['frequency_coordinates']=frequency_coordinates
+    recipe['recipe_hash']=hashlib.sha256(_json({k:v for k,v in recipe.items() if k!='recipe_hash'}).encode()).hexdigest()
     positive_cap = recipe.get("pole_budget")
     cap = 2*int(positive_cap) if positive_cap is not None else min(E.shape[-2:])
     # Source recipe is the native accuracy policy. Host workspace is an
@@ -458,6 +471,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         pencils=[(np.asarray(gather_to_host(E[iq])),np.asarray(gather_to_host(A[iq]))) for iq in ids]
         models=collective_general_pencil_batch(pencils,max_order=cap,max_workspace_bytes=workspace,
             rank_tolerance=float(recipe['bank_rule_tolerance']),
+            frequency_scale_ry=moment_scale,coordinate_units=coordinate_units,
             fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained)
         for batch_index,(iq,model) in enumerate(zip(ids,models)):
             spaces.setdefault(iq, model["spaces"])
@@ -516,6 +530,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                     full_microscopic_host_payload=False,n_mu=int(meta.n_rmu),n_q=nk,screening_bands=stop,
                     response_active_bands=[response_active.start,response_active.stop])
                 report['verification_geometry']=verification_geometry
+                report['frequency_coordinates']=frequency_coordinates
                 arrays=dict(E=pencils[batch_index][0],A=pencils[batch_index][1],
                     poles_ry=model['poles_ry'],output_map=model['output_map'],input_map=model['input_map'],
                     space_right=model['spaces']['right'],space_left=model['spaces']['left'],
@@ -523,6 +538,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                     energy_ry=energy,U_active=np.asarray(snapshot['U_active']),rho_active=np.asarray(snapshot['rho_active']),
                     sites_ry=sites,fit_positions=np.asarray(fit_positions,np.int32),
                     held_positions=np.asarray(held_positions,np.int32),
+                    frequency_scale_ry=np.array(moment_scale),
+                    left_coordinate_units=coordinate_units[0],right_coordinate_units=coordinate_units[1],
                     gamma_ry=np.array(gamma),eta_ry=np.array(eta))
                 # Full-port actions contract ON DEVICE into frequency-only
                 # Grams. Their host bound includes existing batch inputs,
@@ -712,6 +729,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         reference_statistics="retarded_reference", general_gates=general_gates)
     receipt["capacity"] = price
     receipt['verification_geometry']=verification_geometry
+    receipt['frequency_coordinates']=frequency_coordinates
     receipt['response_active_bands'] = [response_active.start,response_active.stop]
     receipt['response_blocks'] = [dict(name=b['name'],interval_ry=[b['lo'],b['hi']],
                                       endpoint_bounds_ry=b['bounds'],
