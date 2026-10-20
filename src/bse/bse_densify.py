@@ -1394,8 +1394,8 @@ def _interpolate_bse_data_to_grid(
     #
     # On a DOWNFOLDED bundle the two questions come apart, and the densifier
     # has to answer them through ``exciton_bands.resolve_isdf_basis``, the ONE
-    # owner of this contract.  The sole whole-state QRCP fit applies the
-    # ordered ``keep`` before evaluating its basis and is born at μ_S.
+    # owner of this contract.  The nodal fit evaluates its basis at the
+    # ordered ``keep`` rows, so it is born at μ_S.
     # Without that route, the pad below is asked for
     # (μ_S_pad − μ_L) columns — NEGATIVE — and the run dies in ``jnp.pad``
     # with an index error that names neither the downfold nor the basis.
@@ -1429,7 +1429,6 @@ def _interpolate_bse_data_to_grid(
          input_file, params, log_fn, mesh_xy=mesh_xy, eqp_file=eqp_file,
          centroid_subset_idx=_fit_subset,
          rank_record_fn=htransform_rank_record_fn,
-         distrib_la_batched_route=_distrib_la_batched_route,
          wfn_sym=wfn_sym)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nb_window = int(ctilde.shape[1])
@@ -1463,7 +1462,6 @@ def _interpolate_bse_data_to_grid(
         band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
-        distrib_la_batched_route=_distrib_la_batched_route,
         htransform_quality_record_fn=htransform_quality_record_fn,
         return_coeffs=velocity is not None)
     dipoles = None

@@ -1,32 +1,36 @@
-"""Orbit-closed nodal htransform basis on the ISDF centroids.
+"""Orbit-closed nodal htransform basis.
 
-The nodes are the run's own ISDF centroids (charge-density-weighted k-means,
-orbit-closed under the crystal operations).  Every coarse state of the fitted
-window is sampled there once, through the GW centroid-face path
+The nodes are an orbit-closed, charge-density-weighted k-means set (the
+centroid machinery of ``centroid.kmeans_cli``): the run's own ISDF centroids
+when there are at most ``NODES_PER_FITTED_BAND`` per fitted band, else a
+smaller selection at that count (``bandstructure.fh_interp.htransform_nodes``,
+cached beside the basis artifact).  Every coarse state of the fitted window
+is sampled there once, through the GW centroid-face path
 (``common.wfn_transforms.load_centroids_band_chunked``):
 
     Phi_k[(s, nu), n] = psi_{nk,s}(r_nu)                       nodal values.
 
 Nodal values carry no metric, so the basis adds the diagonal quadrature
-metric ``W = diag(w_nu)`` of the centroids: one non-negative weight per
-centroid orbit, the least-squares solution of ``Phi_k^H W Phi_k = 1`` over
-all coarse k (NNLS).  ``W`` is invariant under the node permutation of every
-crystal operation.  A per-k Loewdin step makes the coefficients exactly
-orthonormal,
+metric ``W = diag(w_nu)`` of the nodes: one non-negative weight per node
+orbit, the least-squares solution of ``Phi_k^H W Phi_k = 1`` over all coarse
+k (NNLS on the orbit-folded normal equations).  ``W`` is invariant under the
+node permutation of every crystal operation.  A per-k Loewdin step makes the
+coefficients exactly orthonormal,
 
     G_k = Phi_k^H W Phi_k,   C_k = W^{1/2} Phi_k G_k^{-1/2},   C_k^H C_k = 1,
 
 and ``ctilde[k, n, (s, nu)] = C_k[(s, nu), n]`` is used exactly like an
-orthonormal Galerkin coefficient array (``C f C^H``, direct eigh).  ``C f C^H``
-is unchanged by window unitaries that commute with ``f`` and ``G_k`` is
-gauge-covariant, so a node-pair kernel with per-pair Wigner-Seitz images
-(``common.ws_images``) is exactly covariant.  The fit logs ``eps = max_k
-||G_k - 1||_2`` and the number of zero-weight nodes (they drop out of ``C``).
+orthonormal coefficient array (``C f C^H``).  ``C f C^H`` is unchanged by
+window unitaries that commute with ``f`` and ``G_k`` is gauge-covariant, so a
+node-pair kernel with per-pair Wigner-Seitz images (``common.ws_images``) is
+exactly covariant.  The fit logs ``eps = max_k ||G_k - 1||_2`` and the number
+of zero-weight nodes (they drop out of ``C``).
 
-:class:`NodalInterp` carries the nodal values ``Phi`` and the node geometry;
-the BSE recovers ``psi(r_nu)`` at a fine q from the back-map kernel
-``Phi f C^H`` (``bandstructure.bse_setup``).  There is no node selection, no
-pivot and no tolerance.  :func:`iter_galerkin_rchunks` continues the
+:class:`NodalInterp` carries the nodal values ``Phi``, the node geometry and,
+when the nodes are not the ISDF centroids, the same states sampled at the
+centroids (the back-map TARGETS, ``Phi^T``).  The BSE recovers ``psi(r_mu)``
+at the centroids at a fine q from the back-map kernel ``Phi^T (-f) C^H``
+(``bandstructure.bse_setup``).  :func:`iter_galerkin_rchunks` continues the
 coefficient space to the full grid (least-squares rows) for the refit
 consumers only.
 """
@@ -65,7 +69,7 @@ __all__ = [
 ]
 
 
-NODE_SELECTION_VERSION = "centroid-nodes-orbit-nnls-loewdin-v1"
+NODE_SELECTION_VERSION = "kmeans-nodes-orbit-nnls-loewdin-v2"
 
 #: Metric quality above which the fit warns.  Si 4^3 (36 fitted spinor
 #: bands, orbit-closed k-means, fit window 0:36): eps 0.37 / 0.12 / 1.6e-2 /
@@ -75,8 +79,9 @@ NODE_METRIC_EPS_WARN = 1.0e-2
 #: Node count per fitted band that reached eps <= 1e-2 on Si 4^3 (780/36);
 #: MoS2 9x9 at 22.2 nodes per band (1198/54) reads eps 1.7e-2.
 NODES_PER_FITTED_BAND = 22
-_BASIS_FORMAT = 5
-_BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_nodal", "galerkin_loewdin")
+_BASIS_FORMAT = 6
+_BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_nodal", "galerkin_loewdin",
+                 "galerkin_target")
 _BASIS_META = "galerkin_"
 
 
@@ -90,39 +95,72 @@ class GalerkinBasisMismatch(ValueError):
 
 @jax.tree_util.register_pytree_node_class
 class NodalInterp:
-    """Nodal values of the fitted states and the node geometry.
+    """Nodal values of the fitted states, the node geometry and the targets.
 
     ``nodal`` ``(nk, nb, rank)`` holds ``Phi_k[(s, nu), n] = psi_{nk,s}(r_nu)``
     on the carried ``(s, nu)`` rank axis (rows past ``ns*n_nodes`` are
     exact-null pad).  The geometry every node-pair Fourier sum needs is
     static pytree data: ``node_frac`` ``(n_nodes, 3)`` lattice coordinates
     (carried row ``s*n_nodes + nu`` sits at node ``nu``), the lattice
-    ``(3, 3)`` rows ``a_i`` in bohr, ``sys_dim`` and ``nspinor``.  ``shape``
-    is ``(rank, nspinor, n_nodes)``, the extents the BSE consumers read.
+    ``(3, 3)`` rows ``a_i`` in bohr, ``sys_dim`` and ``nspinor``.
+
+    The back-map TARGETS are the ISDF centroids, where the BSE reads
+    ``psi``: ``target`` ``(nk, nb, t_carrier)`` holds the same states there
+    on the ``(s, mu)`` axis and ``target_frac`` ``(n_mu, 3)`` their
+    positions; both ``None`` when the nodes are the centroids (then the
+    targets are the nodes).  ``shape`` is ``(rank, nspinor, n_mu)``, the
+    extents the BSE consumers read.
     """
 
-    def __init__(self, nodal, node_frac, lattice_bohr, sys_dim, nspinor):
+    def __init__(self, nodal, node_frac, lattice_bohr, sys_dim, nspinor,
+                 target=None, target_frac=None):
         self.nodal = nodal
         self.node_frac = np.asarray(node_frac, dtype=np.float64)
         self.lattice_bohr = np.asarray(lattice_bohr, dtype=np.float64)
         self.sys_dim = int(sys_dim)
         self.nspinor = int(nspinor)
+        if (target is None) != (target_frac is None):
+            raise ValueError("NodalInterp: target and target_frac go together")
+        self.target = target
+        self.target_frac = (None if target_frac is None else
+                            np.asarray(target_frac, dtype=np.float64))
+
+    @property
+    def n_nodes(self) -> int:
+        return int(self.node_frac.shape[0])
+
+    @property
+    def targets_are_nodes(self) -> bool:
+        return self.target is None
+
+    @property
+    def target_values(self):
+        """``(nk, nb, t_carrier)`` states at the targets (the nodes' own
+        nodal values when the targets are the nodes)."""
+        return self.nodal if self.target is None else self.target
+
+    @property
+    def target_positions(self) -> np.ndarray:
+        return self.node_frac if self.target is None else self.target_frac
 
     @property
     def shape(self):
         return (int(self.nodal.shape[2]), self.nspinor,
-                int(self.node_frac.shape[0]))
+                int(self.target_positions.shape[0]))
 
     def tree_flatten(self):
+        tf = (None if self.target_frac is None else
+              tuple(map(tuple, self.target_frac.tolist())))
         aux = (tuple(map(tuple, self.node_frac.tolist())),
                tuple(map(tuple, self.lattice_bohr.tolist())), self.sys_dim,
-               self.nspinor)
-        return (self.nodal,), aux
+               self.nspinor, tf)
+        return (self.nodal, self.target), aux
 
     @classmethod
     def tree_unflatten(cls, aux, children):
         return cls(children[0], np.asarray(aux[0]), np.asarray(aux[1]),
-                   aux[2], aux[3])
+                   aux[2], aux[3], target=children[1],
+                   target_frac=None if aux[4] is None else np.asarray(aux[4]))
 
 
 @dataclass(frozen=True)
@@ -135,19 +173,21 @@ class GalerkinBasis:
     geometry); ``loewdin`` ``(nk, nb, nb)`` is ``G_k^{-1/2}``.  ``node_weights``
     are the metric weights ``w_nu``, ``metric_eps = max_k ||G_k - 1||_2``.
     ``rank_physical = ns * n_nodes`` excludes the exact-null mesh pad.
-    ``qrcp_eps`` is used only by :func:`iter_galerkin_rchunks` (the relative
-    cutoff of its Gram pseudo-inverse).  ``fit_seconds`` is the fit wall.
+    ``node_indices`` are the nodes' FFT-grid indices.  ``refit_rcond`` (deck
+    key ``htransform_qr_eps``) is used only by :func:`iter_galerkin_rchunks`,
+    the relative cutoff of its node-Gram pseudo-inverse.  ``fit_seconds`` is
+    the fit wall.
     """
 
     ctilde: jax.Array
     basis_at_nodes: NodalInterp
     rank_physical: int
     band_range: tuple[int, int]
-    node_indices: tuple[int, ...]
+    node_indices: tuple
     loewdin: jax.Array = None
     node_weights: tuple = ()
     metric_eps: float = 0.0
-    qrcp_eps: float = 1.0e-3
+    refit_rcond: float = 1.0e-3
     n_orbits: int = 0
     fit_seconds: float = 0.0
 
@@ -188,7 +228,7 @@ def galerkin_rank_record(basis: GalerkinBasis, *, meta) -> dict:
     nk, nb, carrier = (int(n) for n in basis.ctilde.shape)
     physical = int(basis.rank_physical)
     return {
-        "method": "centroid_nodes",
+        "method": "kmeans_nodes",
         "selection_version": NODE_SELECTION_VERSION,
         "stacked_states": nk * nb,
         "centroids": int(basis.basis_at_nodes.shape[2]),
@@ -224,17 +264,18 @@ def _basis_digest(indices) -> tuple[tuple[int, ...], str]:
     return shape, digest.hexdigest()
 
 
-def _basis_provenance(*, wfn, meta, centroid_indices, band_range,
-                      bispinor, qrcp_eps) -> dict:
+def _basis_provenance(*, wfn, meta, centroid_indices, node_indices,
+                      band_range, bispinor, refit_rcond) -> dict:
     from common.parallel_transport import (
         WFN_FINGERPRINT_SCHEME, wfn_fingerprint)
 
     b0, b1 = (int(n) for n in band_range)
     shape, centroid_hash = _basis_digest(centroid_indices)
-    qrcp_eps = float(qrcp_eps)
+    node_shape, node_hash = _basis_digest(node_indices)
+    refit_rcond = float(refit_rcond)
     if b1 <= b0:
         raise ValueError("Galerkin basis band window is empty")
-    if not 0.0 < qrcp_eps < 1.0:
+    if not 0.0 < refit_rcond < 1.0:
         raise ValueError("htransform_qr_eps must lie in (0,1)")
     return {
         "band_range": (b0, b1), "nk": int(meta.nk_tot), "nb": b1 - b0,
@@ -242,10 +283,11 @@ def _basis_provenance(*, wfn, meta, centroid_indices, band_range,
         "fft_grid": tuple(int(n) for n in meta.fft_grid),
         "kgrid": tuple(int(n) for n in meta.kgrid),
         "bispinor": bool(bispinor), "centroid_shape": shape,
-        "centroid_hash": centroid_hash, "wfn_hash": wfn_fingerprint(wfn),
+        "centroid_hash": centroid_hash, "node_shape": node_shape,
+        "node_hash": node_hash, "wfn_hash": wfn_fingerprint(wfn),
         "wfn_scheme": WFN_FINGERPRINT_SCHEME,
         "transform_scheme": FULL_BLOCH_TRANSFORM_SCHEME,
-        "qrcp_eps": qrcp_eps, "selection": NODE_SELECTION_VERSION,
+        "refit_rcond": refit_rcond, "selection": NODE_SELECTION_VERSION,
     }
 
 
@@ -256,10 +298,10 @@ def _basis_check(basis: GalerkinBasis, provenance: dict) -> None:
             or tuple(basis.basis_at_nodes.shape[1:]) != (
                 provenance["nspinor"], provenance["centroid_shape"][0]):
         raise ValueError("Galerkin basis payload disagrees with provenance")
-    if basis.qrcp_eps != provenance["qrcp_eps"]:
+    if basis.refit_rcond != provenance["refit_rcond"]:
         raise ValueError("Galerkin basis qr_eps disagrees with provenance")
-    if len(basis.node_indices) != provenance["centroid_shape"][0]:
-        raise ValueError("Galerkin nodes are not the centroid set")
+    if len(basis.node_indices) != provenance["node_shape"][0]:
+        raise ValueError("Galerkin basis node count disagrees with provenance")
 
 
 def _basis_write_meta(io, basis: GalerkinBasis, provenance: dict) -> None:
@@ -270,16 +312,19 @@ def _basis_write_meta(io, basis: GalerkinBasis, provenance: dict) -> None:
         "fft_grid": provenance["fft_grid"], "kgrid": provenance["kgrid"],
         "bispinor": [provenance["bispinor"]],
         "centroid_shape": provenance["centroid_shape"],
+        "node_shape": provenance["node_shape"],
+        "targets": [int(not basis.basis_at_nodes.targets_are_nodes)],
         "orbits": [basis.n_orbits],
     }
     for name, value in integer.items():
         io.write_attr(_BASIS_META + name, np.asarray(value, dtype=np.int32))
     io.write_attr(_BASIS_META + "controls", np.asarray([
-        provenance["qrcp_eps"], basis.fit_seconds, basis.metric_eps], dtype=np.float64))
+        provenance["refit_rcond"], basis.fit_seconds, basis.metric_eps], dtype=np.float64))
     io.write_attr(_BASIS_META + "node_weights",
                   np.asarray(basis.node_weights, dtype=np.float64))
     for name, value in (
             ("centroid_hash", provenance["centroid_hash"]),
+            ("node_hash", provenance["node_hash"]),
             ("wfn_hash", provenance["wfn_hash"]),
             ("wfn_scheme", provenance["wfn_scheme"]),
             ("transform_scheme", provenance["transform_scheme"]),
@@ -291,7 +336,7 @@ def _basis_write_meta(io, basis: GalerkinBasis, provenance: dict) -> None:
 
 
 def write_galerkin_basis(path, basis: GalerkinBasis, *, wfn, meta,
-                         centroid_indices, bispinor, qrcp_eps,
+                         centroid_indices, bispinor, refit_rcond,
                          mesh_xy: Mesh) -> None:
     """Collectively publish one immutable mesh-neutral basis artifact."""
     import os
@@ -300,7 +345,8 @@ def write_galerkin_basis(path, basis: GalerkinBasis, *, wfn, meta,
 
     provenance = _basis_provenance(
         wfn=wfn, meta=meta, centroid_indices=centroid_indices,
-        band_range=basis.band_range, bispinor=bispinor, qrcp_eps=qrcp_eps)
+        node_indices=basis.node_indices, band_range=basis.band_range,
+        bispinor=bispinor, refit_rcond=refit_rcond)
     _basis_check(basis, provenance)
     destination = os.path.abspath(os.fspath(path))
     job, step = os.environ.get("SLURM_JOB_ID", "local"), os.environ.get(
@@ -316,8 +362,12 @@ def write_galerkin_basis(path, basis: GalerkinBasis, *, wfn, meta,
     barrier("galerkin_basis.staging")
     physical = int(basis.rank_physical)
     nk, nb = (int(n) for n in basis.ctilde.shape[:2])
-    values = (basis.ctilde, basis.basis_at_nodes.nodal, basis.loewdin)
-    shapes = ((nk, nb, physical), (nk, nb, physical), (nk, nb, nb))
+    nodes = basis.basis_at_nodes
+    values = (basis.ctilde, nodes.nodal, basis.loewdin, nodes.target)
+    shapes = ((nk, nb, physical), (nk, nb, physical), (nk, nb, nb),
+              (nk, nb, int(nodes.nspinor) * int(nodes.shape[2])))
+    values, shapes = (values, shapes) if nodes.target is not None else (
+        values[:3], shapes[:3])
     with SlabIO(staging, mode="w", mesh=mesh_xy) as io:
         for name, value, shape in zip(_BASIS_ARRAYS, values, shapes):
             io.create_dataset(name, shape=shape, dtype=value.dtype)
@@ -343,7 +393,7 @@ def _basis_read_meta(io) -> dict:
     if version != _BASIS_FORMAT:
         raise GalerkinBasisMismatch(
             f"Galerkin basis format {version} is unsupported (this build "
-            f"reads the nodal format {_BASIS_FORMAT})")
+            f"reads the nodal format {_BASIS_FORMAT}); it is refit")
     band = small("band_range", np.int32)
     extents = small("nk_nb_nspinor", np.int32)
     controls = small("controls", np.float64)
@@ -359,10 +409,13 @@ def _basis_read_meta(io) -> dict:
         "bispinor": bool(small("bispinor", np.int32)[0]),
         "centroid_shape": tuple(int(n) for n in small(
             "centroid_shape", np.int32)),
-        "centroid_hash": text("centroid_hash"), "wfn_hash": text("wfn_hash"),
+        "node_shape": tuple(int(n) for n in small("node_shape", np.int32)),
+        "targets": bool(small("targets", np.int32)[0]),
+        "centroid_hash": text("centroid_hash"),
+        "node_hash": text("node_hash"), "wfn_hash": text("wfn_hash"),
         "wfn_scheme": text("wfn_scheme"),
         "transform_scheme": text("transform_scheme"),
-        "qrcp_eps": float(controls[0]), "fit_seconds": float(controls[1]),
+        "refit_rcond": float(controls[0]), "fit_seconds": float(controls[1]),
         "metric_eps": float(controls[2]),
         "node_weights": tuple(float(v) for v in small(
             "node_weights", np.float64)),
@@ -371,8 +424,8 @@ def _basis_read_meta(io) -> dict:
     }
 
 
-def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
-                        bispinor, qrcp_eps, mesh_xy: Mesh,
+def read_galerkin_basis(path, *, wfn, meta, centroid_indices, node_indices,
+                        band_range, bispinor, refit_rcond, mesh_xy: Mesh,
                         extra_rank_pad: int = 0) -> GalerkinBasis:
     """Collectively validate and read a basis on the caller's target mesh."""
     import os
@@ -380,7 +433,8 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
 
     expected = _basis_provenance(
         wfn=wfn, meta=meta, centroid_indices=centroid_indices,
-        band_range=band_range, bispinor=bispinor, qrcp_eps=qrcp_eps)
+        node_indices=node_indices, band_range=band_range, bispinor=bispinor,
+        refit_rcond=refit_rcond)
     with SlabIO(os.path.abspath(os.fspath(path)), mode="r", mesh=mesh_xy) as io:
         stored = _basis_read_meta(io)
         mismatches = [key for key in expected if stored.get(key) != expected[key]]
@@ -388,26 +442,32 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
             raise GalerkinBasisMismatch(
                 "Galerkin basis provenance mismatch: " + ", ".join(mismatches))
         carrier = _rank_carrier(stored["rank"], mesh_xy, extra_rank_pad)
-        n_mu = stored["centroid_shape"][0]
+        rows = P(None, None, ("x", "y"))
+        nk, nb = stored["nk"], stored["nb"]
         # SlabIO's registered shape>dataset contract zero-extends the physical
         # logical dataset directly into the mesh-legal carrier shape.
         ctilde, nodal, loewdin = (
             io.read_slab(name, shape=shape, partition_spec=spec)
             for name, shape, spec in zip(
-                _BASIS_ARRAYS,
-                ((stored["nk"], stored["nb"], carrier),) * 2
-                + ((stored["nk"], stored["nb"], stored["nb"]),),
-                (P(None, None, ("x", "y")),) * 2 + (P(),)))
+                _BASIS_ARRAYS[:3], ((nk, nb, carrier),) * 2 + ((nk, nb, nb),),
+                (rows,) * 2 + (P(),)))
+        target = None
+        if stored["targets"]:
+            t_carrier = _rank_carrier(
+                stored["nspinor"] * stored["centroid_shape"][0], mesh_xy, 0)
+            target = io.read_slab(_BASIS_ARRAYS[3], shape=(nk, nb, t_carrier),
+                                  partition_spec=rows)
     basis = GalerkinBasis(
         ctilde=ctilde,
-        basis_at_nodes=_centroid_nodes(
-            centroid_indices, nodal, meta=meta, wfn=wfn,
-            nspinor=stored["nspinor"]),
+        basis_at_nodes=_node_interp(
+            node_indices, nodal, meta=meta, wfn=wfn,
+            nspinor=stored["nspinor"], target=target,
+            centroid_indices=centroid_indices),
         rank_physical=stored["rank"], band_range=stored["band_range"],
-        node_indices=tuple(range(n_mu)), loewdin=loewdin,
+        node_indices=_index_rows(node_indices), loewdin=loewdin,
         node_weights=stored["node_weights"],
         metric_eps=stored["metric_eps"],
-        qrcp_eps=stored["qrcp_eps"], n_orbits=stored["n_orbits"],
+        refit_rcond=stored["refit_rcond"], n_orbits=stored["n_orbits"],
         fit_seconds=stored["fit_seconds"])
     _basis_check(basis, expected)
     return basis
@@ -424,44 +484,75 @@ def _rank_carrier(physical: int, mesh_xy: Mesh, extra_rank_pad: int) -> int:
         extra=int(extra_rank_pad)).carrier
 
 
-def _centroid_nodes(centroid_indices, nodal, *, meta, wfn,
-                    nspinor: int) -> NodalInterp:
-    """The :class:`NodalInterp` of the centroid nodes around ``nodal``."""
+def _index_rows(indices) -> tuple:
+    """FFT-grid index rows ``(n, 3)`` as a hashable tuple of int triples."""
+    return tuple(tuple(int(v) for v in row)
+                 for row in np.asarray(indices, dtype=np.int64).reshape(-1, 3))
+
+
+def _node_interp(node_indices, nodal, *, meta, wfn, nspinor: int,
+                 target=None, centroid_indices=None) -> NodalInterp:
+    """The :class:`NodalInterp` of the nodes around ``nodal``; with
+    ``target`` the states at the ISDF centroids ``centroid_indices``."""
     from common.ws_images import lattice_bohr
-    idx = np.asarray(centroid_indices, dtype=np.int64)
-    frac = idx.astype(np.float64) / np.asarray(
-        meta.fft_grid, dtype=np.float64)[None, :]
-    return NodalInterp(nodal, frac, lattice_bohr(wfn), int(meta.sys_dim),
-                       nspinor)
+    grid = np.asarray(meta.fft_grid, dtype=np.float64)[None, :]
+    frac = lambda idx: np.asarray(idx, dtype=np.int64).reshape(-1, 3) / grid
+    return NodalInterp(nodal, frac(node_indices), lattice_bohr(wfn),
+                       int(meta.sys_dim), nspinor, target=target,
+                       target_frac=None if target is None else
+                       frac(centroid_indices))
 
 
-def _quadrature_metric(phi, labels):
+#: Host bytes of one node block of :func:`_quadrature_metric`'s normal rows.
+QUADRATURE_BLOCK_BYTES = 1 << 26
+
+
+def _quadrature_metric(phi, labels, *, block_bytes: int = QUADRATURE_BLOCK_BYTES):
     """Orbit-tied non-negative weights ``w`` with ``Phi_k^H W Phi_k ~ 1``.
 
-    ``phi`` ``(nk, nb, ns, n_mu)`` host nodal values, ``labels`` the centroid
+    ``phi`` ``(nk, nb, ns, n_mu)`` host nodal values, ``labels`` the node
     orbit of each node.  The normal equations of ``sum_nu w_nu sum_s
     conj(phi_kms nu) phi_kns nu = delta_mn`` over every (k, m, n) are folded
-    onto the orbits and solved by NNLS (``W^{1/2}`` needs ``w >= 0``).
-    Returns ``(w (n_mu,), G (nk, nb, nb))``.
+    onto the orbits, a block of nodes at a time (one ``(ns B, ns n_mu)``
+    block of ``x^T conj(x)`` is live, at most ``block_bytes``), and solved by
+    NNLS (``W^{1/2}`` needs ``w >= 0``); a solve that does not converge
+    refuses.  Returns ``(w (n_mu,), G (nk, nb, nb))``.
     """
     from scipy.optimize import nnls
     nk, nb, ns, n_mu = phi.shape
     labels = np.asarray(labels, dtype=np.int64)
     n_orb = int(labels.max()) + 1
-    ata = np.zeros((n_mu, n_mu))
-    atb = np.zeros(n_mu)
+    order = np.argsort(labels, kind="stable")
+    starts = np.flatnonzero(np.r_[True, np.diff(labels[order]) != 0])
+    rows = max(1, int(block_bytes) // (16 * ns * ns * n_mu))
+    a_o, b_o = np.zeros((n_orb, n_orb)), np.zeros(n_orb)
     for k in range(nk):
         x = phi[k].reshape(nb, ns * n_mu)
-        q = x.T @ np.conj(x)
-        ata += (np.abs(q) ** 2).reshape(ns, n_mu, ns, n_mu).sum(axis=(0, 2))
-        atb += np.real(np.einsum('msn,msn->n', np.conj(phi[k]), phi[k]))
-    fold = np.zeros((n_mu, n_orb))
-    fold[np.arange(n_mu), labels] = 1.0
-    a_o, b_o = fold.T @ ata @ fold, fold.T @ atb
+        b_o += np.bincount(labels, weights=np.real(np.einsum(
+            'msn,msn->n', np.conj(phi[k]), phi[k])), minlength=n_orb)
+        for r0 in range(0, n_mu, rows):
+            r1 = min(n_mu, r0 + rows)
+            part = phi[k][:, :, r0:r1].reshape(nb, ns * (r1 - r0))
+            q = np.abs(part.T @ np.conj(x)) ** 2
+            block = q.reshape(ns, r1 - r0, ns, n_mu).sum(axis=(0, 2))
+            np.add.at(a_o, labels[r0:r1],
+                      np.add.reduceat(block[:, order], starts, axis=1))
     chol = np.linalg.cholesky(
         a_o + 1e-14 * np.trace(a_o) / n_orb * np.eye(n_orb))
-    w_o = nnls(chol.T, np.linalg.solve(chol, b_o), maxiter=20 * n_orb)[0]
-    w = fold @ w_o
+    try:
+        w_o, rnorm = nnls(chol.T, np.linalg.solve(chol, b_o),
+                          maxiter=20 * n_orb)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"GATE quadrature_metric_nnls: got: the orbit-tied NNLS over "
+            f"{n_orb} node orbits did not converge in {20 * n_orb} "
+            f"iterations ({exc}); want: a converged metric (check the node "
+            "set: orbit closure and N_node >= "
+            f"{NODES_PER_FITTED_BAND} x fitted bands)") from None
+    if not (np.isfinite(rnorm) and np.all(np.isfinite(w_o))):
+        raise RuntimeError("GATE quadrature_metric_nnls: got: a non-finite "
+                           "NNLS solution; want: finite node weights")
+    w = w_o[labels]
     gram = np.einsum('kmsn,n,klsn->kml', np.conj(phi), w, phi, optimize=True)
     return w, gram
 
@@ -479,75 +570,94 @@ def _loewdin(gram):
     return inv_half, float(np.max(np.abs(vals - 1.0)))
 
 
+def _orbit_labels(indices, sym, meta, what: str):
+    """Orbit label of every point of an orbit-closed FFT-index set (refused
+    otherwise, naming the remedy)."""
+    from symmetry_maps import (centroid_source_map_and_wrap,
+                               permutation_orbit_labels)
+    sym_matrices = np.asarray(sym.sym_matrices)
+    try:
+        perm, _wrap = centroid_source_map_and_wrap(
+            np.asarray(indices, dtype=np.int64), sym_matrices,
+            np.asarray(sym.translations)[:sym_matrices.shape[0]],
+            tuple(int(n) for n in meta.fft_grid))
+    except RuntimeError as exc:
+        raise ValueError(
+            f"fit_galerkin_basis: the {what} are not orbit-closed under the "
+            f"WFN's {sym_matrices.shape[0]} spatial operations, and the nodal "
+            "htransform basis requires closure.  Regenerate them with "
+            f"centroid.kmeans_cli in orbit-aware mode (--orbit).  ({exc})"
+        ) from None
+    return permutation_orbit_labels(perm), int(sym_matrices.shape[0])
+
+
+def _sample(wfn, sym, meta, indices, bispinor, mesh_xy, band_range,
+            band_chunk_size):
+    """Host ``(nk, nb, ns, n)`` values of the fitted window at ``indices``
+    (the GW centroid-face path)."""
+    nb = int(band_range[1]) - int(band_range[0])
+    psi_y, psi_x = load_centroids_band_chunked(
+        wfn, sym, meta, np.asarray(indices, dtype=np.int64), bool(bispinor),
+        mesh_xy, band_range=tuple(int(v) for v in band_range),
+        band_chunk_size=int(band_chunk_size))
+    del psi_x
+    n = int(np.asarray(indices).reshape(-1, 3).shape[0])
+    if int(psi_y.shape[2]) != int(meta.nspinor) or int(psi_y.shape[1]) != nb:
+        raise ValueError(
+            f"fit_galerkin_basis: centroid faces {tuple(psi_y.shape)} do "
+            f"not carry ({nb} bands, {int(meta.nspinor)} spinor components)")
+    return np.asarray(gather_to_host(psi_y))[..., :n]
+
+
 def fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
         band_range: tuple[int, int], *,
+        node_indices=None,
         log_fn=None,
         band_chunk_size: int = 64,
         bispinor: bool = False,
-        qr_eps: float = 1.0e-3,
-        device_pool_limit: float | None = None,
+        refit_rcond: float = 1.0e-3,
         extra_rank_pad: int = 0,
-        progress_fn=None,
         rank_record_fn=None,
-        distrib_la_batched_route=None,
 ) -> GalerkinBasis:
-    """Sample the fitted window at the centroid nodes (module docstring).
+    """Sample the fitted window at the nodes (module docstring).
 
-    The centroid set must be orbit-closed (refused otherwise, naming the
-    remedy).  ``device_pool_limit`` and ``distrib_la_batched_route`` are
-    accepted for the caller's signature and bound nothing (the centroid-face loader plans its own memory); ``qr_eps``
-    is recorded for :func:`iter_galerkin_rchunks`.
+    ``node_indices`` (FFT-grid indices, default: the ISDF centroids
+    ``centroid_indices``) and the centroids must both be orbit-closed
+    (refused otherwise, naming the remedy).  When the nodes are not the
+    centroids the window is also sampled at the centroids, the back-map
+    targets.  ``refit_rcond`` is recorded for :func:`iter_galerkin_rchunks`.
     """
-    del progress_fn, device_pool_limit, distrib_la_batched_route
-    from symmetry_maps import (centroid_source_map_and_wrap,
-                               permutation_orbit_labels)
     if log_fn is None:
         log_fn = lambda *a, **kw: None
     t0 = time.perf_counter()
     b_start, b_end = (int(v) for v in band_range)
     nb = b_end - b_start
     nspinor = int(meta.nspinor)
-    idx = np.asarray(centroid_indices, dtype=np.int64)
-    n_mu = int(idx.shape[0])
+    centroids = np.asarray(centroid_indices, dtype=np.int64).reshape(-1, 3)
+    nodes = (centroids if node_indices is None else
+             np.asarray(node_indices, dtype=np.int64).reshape(-1, 3))
+    same = nodes.shape == centroids.shape and np.array_equal(nodes, centroids)
+    n_mu = int(nodes.shape[0])
     if nb <= 0:
         raise ValueError(
             f"fit_galerkin_basis: empty band range [{b_start},{b_end})")
-    if not (0.0 < float(qr_eps) < 1.0):
+    if not (0.0 < float(refit_rcond) < 1.0):
         raise ValueError(
-            f"fit_galerkin_basis: qr_eps={qr_eps!r} must lie in (0,1)")
+            f"fit_galerkin_basis: htransform_qr_eps={refit_rcond!r} must lie "
+            "in (0,1)")
     if getattr(meta, "mu_basis", None) is not None:
         raise ValueError(
             "fit_galerkin_basis: meta carries a packed centroid basis "
             "(meta.mu_basis); the nodal htransform samples the canonical "
             "centroid table and needs meta.mu_basis = None")
 
-    sym_matrices = np.asarray(sym.sym_matrices)
-    try:
-        perm, _wrap = centroid_source_map_and_wrap(
-            idx, sym_matrices,
-            np.asarray(sym.translations)[:sym_matrices.shape[0]],
-            tuple(int(n) for n in meta.fft_grid))
-    except RuntimeError as exc:
-        raise ValueError(
-            "fit_galerkin_basis: the centroid set is not orbit-closed under "
-            f"the WFN's {sym_matrices.shape[0]} spatial operations, and the "
-            "nodal htransform basis requires closure.  Regenerate the "
-            "centroids with centroid.kmeans_cli in orbit-aware mode.  "
-            f"({exc})") from None
-    labels = permutation_orbit_labels(perm)
+    labels, n_ops = _orbit_labels(nodes, sym, meta, "nodes")
+    if not same:
+        _orbit_labels(centroids, sym, meta, "ISDF centroids (targets)")
     n_orbits = int(labels.max()) + 1
-
-    psi_y, psi_x = load_centroids_band_chunked(
-        wfn, sym, meta, idx, bool(bispinor), mesh_xy,
-        band_range=(b_start, b_end), band_chunk_size=int(band_chunk_size))
-    del psi_x
-    if int(psi_y.shape[2]) != nspinor or int(psi_y.shape[1]) != nb:
-        raise ValueError(
-            f"fit_galerkin_basis: centroid faces {tuple(psi_y.shape)} do "
-            f"not carry ({nb} bands, {nspinor} spinor components)")
-    phi = np.asarray(gather_to_host(psi_y))[..., :n_mu]       # (nk, nb, ns, n_mu)
-    del psi_y
+    phi = _sample(wfn, sym, meta, nodes, bispinor, mesh_xy, (b_start, b_end),
+                  band_chunk_size)                       # (nk, nb, ns, n_mu)
     t_sample = time.perf_counter() - t0
     w, gram = _quadrature_metric(phi, labels)
     inv_half, eps = _loewdin(gram)
@@ -556,18 +666,31 @@ def fit_galerkin_basis(
     rank_phys = nspinor * n_mu
     carrier = _rank_carrier(rank_phys, mesh_xy, extra_rank_pad)
     rows = NamedSharding(mesh_xy, P(None, None, ("x", "y")))
-    pad = lambda a: np.pad(a.reshape(a.shape[0], nb, rank_phys),
-                           ((0, 0), (0, 0), (0, carrier - rank_phys)))
-    ctilde = device_put_process_local(pad(coeff), rows)
-    nodal = device_put_process_local(pad(phi), rows)
+
+    def pad(a, to):
+        flat = a.reshape(a.shape[0], nb, -1)
+        return np.pad(flat, ((0, 0), (0, 0), (0, to - flat.shape[2])))
+
+    ctilde = device_put_process_local(pad(coeff, carrier), rows)
+    nodal = device_put_process_local(pad(phi, carrier), rows)
+    del phi
+    target = None
+    if not same:
+        t_carrier = _rank_carrier(nspinor * centroids.shape[0], mesh_xy, 0)
+        target = device_put_process_local(pad(_sample(
+            wfn, sym, meta, centroids, bispinor, mesh_xy, (b_start, b_end),
+            band_chunk_size), t_carrier), rows)
     loewdin = device_put_process_local(inv_half, NamedSharding(mesh_xy, P()))
     seconds = time.perf_counter() - t0
     n_zero = int(np.count_nonzero(w == 0.0))
     log_fn(
-        f"  [nodes] {n_mu} centroid nodes, {n_orbits} orbit(s) under "
-        f"{sym_matrices.shape[0]} ops; {int(meta.nk_tot)} k x {nb} bands x "
-        f"{nspinor} spinor; metric eps=max_k||Phi^H W Phi - 1||_2="
-        f"{eps:.3e}, {n_zero} zero-weight node(s); rank {rank_phys} (+"
+        f"  [nodes] {n_mu} nodes"
+        + (" (the ISDF centroids)" if same else
+           f" (k-means; back-map targets: the {centroids.shape[0]} ISDF "
+           "centroids)")
+        + f", {n_orbits} orbit(s) under {n_ops} ops; {int(meta.nk_tot)} k x "
+        f"{nb} bands x {nspinor} spinor; metric eps=max_k||Phi^H W Phi - "
+        f"1||_2={eps:.3e}, {n_zero} zero-weight node(s); rank {rank_phys} (+"
         f"{carrier - rank_phys} pad); fit {seconds:.2f} s (sampling "
         f"{t_sample:.2f} s)")
     if eps > NODE_METRIC_EPS_WARN:
@@ -580,15 +703,16 @@ def fit_galerkin_basis(
             f"--fit-window 0:{nb},0:{nb}); this set has {n_mu}.")
     basis = GalerkinBasis(
         ctilde=ctilde,
-        basis_at_nodes=_centroid_nodes(idx, nodal, meta=meta, wfn=wfn,
-                                       nspinor=nspinor),
+        basis_at_nodes=_node_interp(
+            nodes, nodal, meta=meta, wfn=wfn, nspinor=nspinor,
+            target=target, centroid_indices=None if same else centroids),
         rank_physical=rank_phys,
         band_range=(b_start, b_end),
-        node_indices=tuple(range(n_mu)),
+        node_indices=_index_rows(nodes),
         loewdin=loewdin,
         node_weights=tuple(float(v) for v in w),
         metric_eps=eps,
-        qrcp_eps=float(qr_eps),
+        refit_rcond=float(refit_rcond),
         n_orbits=n_orbits,
         fit_seconds=float(seconds),
     )
@@ -600,27 +724,52 @@ def fit_galerkin_basis(
 _ZETA_KERNELS: dict = {}
 
 
-def _node_gram_pinv(basis: GalerkinBasis, *, nspinor: int, mesh_xy: Mesh):
-    """``G^+`` of the coefficient rows (relative cutoff ``qrcp_eps**2`` on
-    the unit-diagonal Gram), replicated: the factor of the least-squares
-    rows ``zeta_nu(r)`` (:func:`iter_galerkin_rchunks` only)."""
-    n_nodes = len(basis.node_indices)
+def _node_gram_factor(basis: GalerkinBasis, *, nspinor: int, mesh_xy: Mesh):
+    """``B`` ``(1, n, n)`` on the face ``P(None, 'x', 'y')`` with ``B B^H =
+    G^+``, the pseudo-inverse of the node Gram of the coefficient rows
+    (relative cutoff ``refit_rcond**2`` on the unit-diagonal Gram): the factor
+    of the least-squares rows ``zeta_nu(r)`` (:func:`iter_galerkin_rchunks`
+    only).  ``n`` is the node count padded to tile the mesh; pad rows of B
+    are zero.  The Gram is built on the face and its eigh is placed by
+    ``distrib_la`` in the room beside what is live (whole matrices per rank
+    where they fit, else the whole mesh), so no rank holds the
+    ``n_nodes^2`` Gram by construction."""
+    from common.gpu_utils import shared_device_room
+    from distrib_la import plan as linalg_plan
+    from runtime.padding import padded_axis
+    n_nodes = int(basis.basis_at_nodes.n_nodes)
+    n = padded_axis(n_nodes, mesh_xy, name="Galerkin node Gram",
+                    specs=((P("x", None), 0), (P(None, "y"), 1))).carrier
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     rep = NamedSharding(mesh_xy, P())
+    cut = float(basis.refit_rcond) ** 2
 
-    @partial(jax.jit, out_shardings=rep)
+    @partial(jax.jit, out_shardings=(face, rep))
     def _gram(c):
         rows = c[:, :, :nspinor * n_nodes].reshape(
             c.shape[0], c.shape[1], nspinor, n_nodes)
-        return jnp.einsum('kbsn,kbsm->nm', jnp.conj(rows), rows,
-                          optimize=True)
+        rows = jnp.pad(rows, ((0, 0), (0, 0), (0, 0), (0, n - n_nodes)))
+        g = jax.lax.with_sharding_constraint(jnp.einsum(
+            'kbsn,kbsm->nm', jnp.conj(rows), rows, optimize=True)[None], face)
+        scale = jnp.sqrt(jnp.maximum(jnp.real(jnp.diagonal(g[0])), 1e-300))
+        live = jnp.arange(n) < n_nodes
+        unit = g / scale[None, :, None] / scale[None, None, :]
+        unit = jnp.where(live[:, None] & live[None, :], unit, 0)
+        return jax.lax.with_sharding_constraint(unit, face), scale
 
-    g = np.asarray(_gram(basis.ctilde).addressable_data(0))
-    scale = np.sqrt(np.maximum(np.real(np.diag(g)), 1e-300))
-    w, v = np.linalg.eigh(g / scale[:, None] / scale[None, :])
-    keep = w > float(basis.qrcp_eps) ** 2 * float(w.max())
-    pinv = (v[:, keep] / w[keep]) @ np.conj(v[:, keep]).T
-    pinv = pinv / scale[:, None] / scale[None, :]
-    return device_put_process_local(pinv, rep)
+    unit, scale = _gram(basis.ctilde)
+    room = shared_device_room("Galerkin node Gram eigh")
+    lam, vec = linalg_plan("eigh", mesh_xy, n=n, budget_bytes=room).batched(
+        unit)
+
+    @partial(jax.jit, out_shardings=face)
+    def _factor(lam, vec, scale):
+        keep = lam[0] > cut * jnp.max(lam[0])
+        col = jnp.where(keep, 1.0 / jnp.sqrt(jnp.where(keep, lam[0], 1.0)), 0.0)
+        row = jnp.where(jnp.arange(n) < n_nodes, 1.0 / scale, 0.0)
+        return vec * row[None, :, None] * col[None, None, :]
+
+    return _factor(lam, vec, scale)
 
 
 def _make_zeta_kernel(*, mesh: Mesh, phi_shape, n_nodes: int, rank: int,
@@ -688,7 +837,7 @@ def iter_galerkin_rchunks(
             f"range [{b_start},{b_end}); got {source.band_chunk_ranges}")
     rank = int(basis.rank_carrier)
     nspinor = int(meta.nspinor)
-    n_nodes = len(basis.node_indices)
+    n_nodes = int(basis.basis_at_nodes.n_nodes)
     bc = int(source.band_chunk_carrier)
     rep = NamedSharding(mesh_xy, P())
     row_layout = NamedSharding(mesh_xy, P(None, None, ('y', 'x')))
@@ -704,11 +853,22 @@ def iter_galerkin_rchunks(
     phis = [_phi(basis.ctilde, int(lo) - b_start, int(hi) - b_start,
                  bc - (int(hi) - int(lo)))
             for lo, hi in source.band_chunk_ranges]
-    pinv = _node_gram_pinv(basis, nspinor=nspinor, mesh_xy=mesh_xy)
+    factor = _node_gram_factor(basis, nspinor=nspinor, mesh_xy=mesh_xy)
+    from common.gpu_utils import shared_device_room
+    from distrib_la import matmul as face_matmul
+    room = shared_device_room("Galerkin refit rows GEMM")
+    mm = partial(face_matmul, mesh=mesh_xy, batched_route="auto",
+                 budget_bytes=room)
+    n_face = int(factor.shape[1])
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
 
     @partial(jax.jit, out_shardings=(row_layout, rep))
-    def _rows(pinv, acc):
-        zeta = pinv @ acc
+    def _rows(factor, acc):
+        # zeta = G^+ acc = B (B^H acc) by the face GEMM (distrib_la.matmul:
+        # whole matrices per rank only where they fit the room).
+        a = jax.lax.with_sharding_constraint(
+            jnp.pad(acc, ((0, n_face - n_nodes), (0, 0)))[None], face)
+        zeta = mm(factor, mm(factor, a, transa="C"))[0, :n_nodes]
         out = jnp.zeros((rank, nspinor, zeta.shape[-1]), dtype=zeta.dtype)
         for s in range(nspinor):
             out = out.at[s * n_nodes:(s + 1) * n_nodes, s, :].set(zeta)
@@ -756,7 +916,7 @@ def iter_galerkin_rchunks(
                     ((lo, hi), psi_bc[:, offset:offset + (hi - lo)]))
             else:
                 del psi_bc
-        basis_chunk, fitted = _rows(pinv, acc)
+        basis_chunk, fitted = _rows(factor, acc)
         del acc
         if receipt is not None:
             totals[1] += scalar(fitted)

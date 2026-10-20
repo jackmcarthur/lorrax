@@ -482,7 +482,8 @@ def main(argv=None):
             qp_rotations_file=_qp_rotations_path)
 
         # Resolve the concrete fine-k plan before the first setup/progress line.
-        # Whole-state QRCP owns basis selection and has no Gram eigensolve.
+        # The nodal basis is fixed by the node set; the fine-k eigensolves are
+        # admitted per stage (q-batched or face) inside the library.
         mesh_xy = _build_mesh_xy()
         wfn, sym = setup_wfn_and_sym(_wfn_path, mesh_xy=mesh_xy)
         from distrib_la import plan as _linalg_plan
@@ -507,12 +508,11 @@ def main(argv=None):
             wfn, sym, meta, mesh_xy, basis, enk_sigma = initialize_wfns(
                 args.input, params, log, args.eqp_file,
                 mesh_xy=mesh_xy, wfn_sym=(wfn, sym),
-                n_guard_bands=args.guard_bands, progress_fn=report.progress,
+                n_guard_bands=args.guard_bands,
                 centroid_record_fn=_centroid_records.append,
                 rank_record_fn=_rank_records.append,
                 require_all_occupied=True,
-                basis_path=GALERKIN_BASIS_FILE,
-                distrib_la_batched_route=distrib_la_batched_route)
+                basis_path=GALERKIN_BASIS_FILE)
         _setup_progress.step()
         _setup_progress.finish()
         ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
@@ -638,9 +638,7 @@ def main(argv=None):
                     kgrid_fi=params["kgrid_fi"],
                     band_window_fi=(b_min, b_max),
                     mesh_xy=mesh_xy, a_band_index=args.a_band,
-                    eigh_backend=eigh_backend,
                     use_low_mem_eigh=use_low_mem_eigh, log_fn=log,
-                    distrib_la_batched_route=distrib_la_batched_route,
                 )
             log(f"BSE setup: psi_rmu_Y={wfns_fi.psi_rmu_Y.shape} "
                 f"P{wfns_fi.psi_rmu_Y.sharding.spec}, "

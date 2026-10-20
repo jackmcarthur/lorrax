@@ -1822,9 +1822,12 @@ _DEFAULTS = {
     "write_wfn_h5": True,
     # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
     # ``bandstructure.bse_setup.compute_wfns_fi``).
-    # The nodal htransform basis is the centroid set itself (rank spin x
-    # centroids); htransform_qr_eps only cuts the Gram pseudo-inverse of the
-    # refit's grid rows.
+    # The htransform basis is nodal: Loewdin-orthonormalised interpolation on
+    # an orbit-closed node set (default k-means, min(N_mu, 22 x fitted bands)
+    # nodes, cached beside galerkin_dft.h5; rank = spin x nodes).  It has no
+    # rank criterion.  htransform_qr_eps keeps its name for old decks but is
+    # now only the relative pseudo-inverse cutoff of the refit's node Gram
+    # (isdf.galerkin, refit_rcond).
     "htransform_qr_eps": 1.0e-3,
     "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
     "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
@@ -1854,6 +1857,11 @@ _EQP2_RETIRED_KEYS = (
     "write_eqp2", "eqp2_tol_ev", "eqp2_max_iter",
     "eqp2_accelerator", "eqp2_history_depth", "eqp2_file")
 
+#: 2026-10-20: the randomized-QRCP htransform basis was replaced by the nodal
+#: basis, which has no rank search; its two controls refuse by name.
+_HTRANSFORM_QRCP_RETIRED_KEYS = (
+    "htransform_rank_multiplier", "htransform_qrcp_seed")
+
 
 # Deck keys REMOVED from _DEFAULTS but still handled by an explicit
 # legacy/deprecation branch in ``read_lorrax_input`` (raise or dedicated
@@ -1863,6 +1871,8 @@ _EQP2_RETIRED_KEYS = (
 _LEGACY_DECK_KEYS = frozenset({
     # 2026-10: the fixed-Sigma eqp2 ladder is retired (refused by name).
     *_EQP2_RETIRED_KEYS,
+    # 2026-10-20: QRCP htransform basis controls (refused by name).
+    *_HTRANSFORM_QRCP_RETIRED_KEYS,
     "use_shipped_minimax_tables",   # refused with replacement named
     "chunk_size",                   # warn-and-ignore (planner-owned)
     "output_file",                  # warn-and-ignore (sigma_diag_file)
@@ -3152,6 +3162,19 @@ def _report_early_retired_keys(
             "  fix:  delete the line(s); nothing replaces them.\n"
             "  doc:  UPGRADE_NOTES.md, \"Sigma_c on shell only\" and "
             "\"Sigma(omega) grid debug restored\"; docs/theory/sigma-on-shell.md.")
+    named = [key for key in _HTRANSFORM_QRCP_RETIRED_KEYS
+             if section.get(key, fallback=None) is not None]
+    if named:
+        raise ValueError(
+            f"GATE htransform_qrcp_retired: input key(s) {', '.join(named)} "
+            "have been REMOVED with the randomized-QRCP htransform basis.\n"
+            "  why:  the htransform basis is nodal (orbit-closed nodes, "
+            "Loewdin frame); its rank is spin x nodes and there is no rank "
+            "search or random sketch to seed.\n"
+            "  fix:  delete the line(s).  The node count is "
+            "min(N_mu, 22 x fitted bands) by default.\n"
+            "  doc:  UPGRADE_NOTES.md, \"htransform nodal basis\"; "
+            "docs/how-to/htransform-and-exciton-bands.md.")
     if section.get("use_shipped_minimax_tables", fallback=None) is not None:
         raise ValueError(
             "Input key 'use_shipped_minimax_tables' is no longer supported, "

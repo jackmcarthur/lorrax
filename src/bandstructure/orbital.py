@@ -308,7 +308,8 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     caller can take a receipt of it (``fh_interp.image_locality``) without a
     second image ever being resident.
     """
-    from bandstructure.fh_interp import node_fourier, node_pair_table
+    from bandstructure.fh_interp import (admit_node_route, node_fourier,
+                                         node_pair_table, node_route_map)
     _check_shapes(operator_cart, source_coefficients, kgrid)
     rank = int(source_coefficients.shape[2])
     nq_carrier = int(path_coefficients.shape[0])
@@ -325,31 +326,43 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     table = node_pair_table(B_at_mu, kgrid, mesh)
     batch = NamedSharding(mesh, P(('x', 'y'), None, None))
 
-    @partial(jax.jit, out_shardings=NamedSharding(
-        mesh, P(('x', 'y'), None, None)))
-    def _scan(q_tab, coefficients, operator_R, code):
-        c_tab = jnp.swapaxes(coefficients.reshape(
-            (step, n_pass) + coefficients.shape[1:]), 0, 1)
+    def _program(route):
+        @partial(jax.jit, out_shardings=NamedSharding(
+            mesh, P(('x', 'y'), None, None)))
+        def _scan(q_tab, coefficients, operator_R, code):
+            c_tab = jnp.swapaxes(coefficients.reshape(
+                (step, n_pass) + coefficients.shape[1:]), 0, 1)
 
-        def one_pass(_, xs):
-            q, c = xs
-            value = node_fourier(q, operator_R, code, table, mesh)
-            c = jax.lax.with_sharding_constraint(c, batch)
-            return None, jnp.einsum('qmi,qmn,qnj->qij', jnp.conj(c), value, c,
-                                    optimize=True)
+            def one(q, c):
+                value = node_fourier(q, operator_R, code, table, mesh,
+                                     route=route)
+                if route == "q-batched":
+                    c = jax.lax.with_sharding_constraint(c, batch)
+                return jnp.einsum('qmi,qmn,qnj->qij', jnp.conj(c), value, c,
+                                  optimize=True)
 
-        _, out = jax.lax.scan(one_pass, None, (q_tab, c_tab), unroll=1)
-        return jnp.swapaxes(out, 0, 1).reshape((nq_carrier,) + out.shape[2:])
+            def one_pass(_, xs):
+                return None, node_route_map(route, one, *xs)
+
+            _, out = jax.lax.scan(one_pass, None, (q_tab, c_tab), unroll=1)
+            return jnp.swapaxes(out, 0, 1).reshape(
+                (nq_carrier,) + out.shape[2:])
+        return _scan
 
     q_tab = jnp.asarray(q_tab)
-    parts = []
+    parts, scan = [], None
     for a in range(operator_cart.shape[0]):
         operator_R = _operator_R(operator_cart[a:a + 1], source_coefficients,
                                  kgrid, mesh)
         if image_record_fn is not None:
             image_record_fn(a, operator_R)
+        if scan is None:
+            _, scan = admit_node_route(
+                f"band operator on the path ({rank}^2)", _program,
+                (q_tab, path_coefficients, operator_R, table["code"]),
+                rank=rank, mesh_xy=mesh)
         parts.append(jax.block_until_ready(
-            _scan(q_tab, path_coefficients, operator_R, table["code"])))
+            scan(q_tab, path_coefficients, operator_R, table["code"])))
         del operator_R
     return jnp.stack(parts, axis=1)
 
@@ -370,8 +383,9 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
     ``(nk, rank, rank)`` image is resident.
     """
     from bandstructure.fh_interp import (
-        coarse_start_block, log_top_block, newton_inv, node_fourier,
-        node_pair_table, top_block_eigh)
+        admit_node_route, coarse_start_block, log_top_block, newton_inv,
+        node_fourier, node_pair_table, node_route_map, start_columns,
+        top_block_eigh)
     a_f, n_f, shift = f_params
     Nx, Ny, Nz = (int(v) for v in grid)
     n_plane = Nx * Ny
@@ -389,38 +403,51 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
     Qz[:, :n_plane, 2] = (np.arange(Nz) / Nz)[:, None]
     Qz = jnp.asarray(Qz)
 
-    def plane(qz, X, code):
-        return node_fourier(qz, X, code, table, mesh)
-
     rep = NamedSharding(mesh, P())
+    rank = int(fH_R.shape[-1])
 
-    @partial(jax.jit, out_shardings=(plane_q, plane_v, rep, rep, rep))
-    def _solve(fH_R, code, ctilde):
-        def one_pass(_, qz):
-            x0 = coarse_start_block(ctilde, kgrid, qz)
-            values, vectors, steps, block_res = top_block_eigh(
-                plane(qz, fH_R, code), x0, (0, n_states))
-            energies, residual = newton_inv(
-                a_f, n_f, shift, values[:, :n_states].real)
-            return None, (energies, vectors[:, :, :n_states], residual,
-                          steps, block_res)
+    def _solve_program(route):
+        @partial(jax.jit, out_shardings=(plane_q, plane_v, rep, rep, rep))
+        def _solve(fH_R, code, ctilde, columns):
+            def one(qz):
+                x0 = coarse_start_block(ctilde, kgrid, qz, columns)
+                values, vectors, steps, block_res = top_block_eigh(
+                    node_fourier(qz, fH_R, code, table, mesh, route=route),
+                    x0, (0, n_states))
+                energies, residual = newton_inv(
+                    a_f, n_f, shift, values[:, :n_states].real)
+                return (energies, vectors[:, :, :n_states], residual, steps,
+                        block_res)
 
-        _, (E, V, res, steps, block_res) = jax.lax.scan(
-            one_pass, None, Qz, unroll=1)
-        return E, V, jnp.max(res), jnp.max(steps), jnp.max(block_res)
+            def one_pass(_, qz):
+                return None, node_route_map(route, one, qz)
+
+            _, (E, V, res, steps, block_res) = jax.lax.scan(
+                one_pass, None, Qz, unroll=1)
+            return E, V, jnp.max(res), jnp.max(steps), jnp.max(block_res)
+        return _solve
+
+    columns = jax.device_put(jnp.asarray(start_columns(
+        rank, int(ctilde.shape[1]))), rep)
+    route, _solve = admit_node_route(
+        f"moment grid fH(q) top block ({rank}^2)", _solve_program,
+        (fH_R, code, ctilde, columns), rank=rank, mesh_xy=mesh)
 
     @partial(jax.jit, out_shardings=plane_q)
     def _expect(O_R, V, code):
+        def one(qz, v):
+            return jnp.einsum('qan,qab,qbn->qn', jnp.conj(v),
+                              node_fourier(qz, O_R, code, table, mesh,
+                                           route=route), v,
+                              optimize=True).real
+
         def one_pass(_, xs):
-            qz, v = xs
-            return None, jnp.einsum('qan,qab,qbn->qn', jnp.conj(v),
-                                    plane(qz, O_R, code), v,
-                                    optimize=True).real
+            return None, node_route_map(route, one, *xs)
 
         _, D = jax.lax.scan(one_pass, None, (Qz, V), unroll=1)
         return D
 
-    E, V, residual, steps, block_res = _solve(fH_R, code, ctilde)
+    E, V, residual, steps, block_res = _solve(fH_R, code, ctilde, columns)
     if log_fn is not None:
         log_top_block(log_fn, "moments grid", int(ctilde.shape[1]),
                       np.asarray(steps), np.asarray(block_res))

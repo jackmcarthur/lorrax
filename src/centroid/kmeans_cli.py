@@ -493,22 +493,16 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 # Main
 # ─────────────────────────────────────────────────────────────────────────
 
-def main():
-    args = build_parser().parse_args()
-    validate_mode_policy(args)
-    production_warnings = []
-    production_stdout = ProductionStdout(
-        debug=debug_print_enabled(), rank=RUNTIME.process_index,
-        warning_fn=production_warnings.append)
-    production_stdout.install()
-
-    # (the compile cache was armed at import, by step 7 of
-    # initialize_communicator_stack)
-    print0(f"✓ JAX initialized: {dist.device_summary()}")
-
-    timing.reset()
-    selection_start = time.perf_counter()
-    args.sigma_ncond, wfn_path = _resolve_deck(args)
+def select_points(args, wfn_path, *, keep_weight=None):
+    """THE selection, as :func:`main` runs it: weight, weighted k-means in
+    orbits, snap and unfold, then the pivoted-Cholesky prune of the
+    over-sampled pool.  ``args`` is this module's parsed namespace (with
+    ``sigma_ncond``); every rank must enter.  Returns a namespace with the
+    FFT-grid ``indices`` (``(n, 3)``), their fractional ``snapped`` positions
+    and the selection's receipts.  ``keep_weight`` (default ``args.plot``)
+    keeps the weight array for the caller."""
+    from types import SimpleNamespace
+    keep_weight = bool(args.plot) if keep_weight is None else bool(keep_weight)
 
     N_c = int(args.N_c)
     oversample = float(args.oversample)
@@ -619,13 +613,13 @@ def main():
             # ``weight`` is also the plot payload.  Retain that one reference
             # when plotting, but release every device alias before the prune
             # reloads the WFN windows.
-            if not args.plot or array is not weight:
+            if not keep_weight or array is not weight:
                 release_arrays.append(array)
         with timing.section("release_before_prune"):
             _release_lloyd_before_prune(*release_arrays)
         del release_arrays, labels, centroids, kmeans_weight
-        if not args.plot:
-            del weight
+        if not keep_weight:
+            weight = None
         centroid_indices, rank, unpicked = _prune(
             args, wfn, sym, mesh, centroid_indices, orbit_id_arr,
             n_unique, N_c)
@@ -637,6 +631,56 @@ def main():
         print0(f"  [point rank] {rank}/{n_unique} delivered centroid "
                "directions certified; rank deficiency is reported, while "
                "LORRAX_CENTROID_SELECT=strict makes it a refusal")
+
+
+    return SimpleNamespace(
+        wfn=wfn, indices=np.asarray(centroid_indices, dtype=np.int64),
+        snapped=centroids_snapped, n_unique=int(n_unique), pool=int(n_pool),
+        pruned=pruned, prune_rank=prune_rank, unpicked=unpicked,
+        weight=weight, weight_label=weight_label,
+        weight_band_ranges=weight_band_ranges, M_cand=M_cand,
+        orbit_aware=orbit_aware, n_sym=n_sym, fft_grid=fft_grid, N_c=N_c)
+
+
+def orbit_kmeans_points(wfn_path, n_points: int, *, fit_window, seed: int = 0):
+    """FFT-grid indices ``(n, 3)`` of an orbit-closed, charge-density-weighted
+    k-means selection of about ``n_points`` points over ``fit_window``
+    (``((l0, l1), (r0, r1))`` bands), with the ISDF bundle's settings
+    (``--orbit``, rho-power 1, the default over-sampling and prune).  Every
+    rank must enter; the result is the same on every rank."""
+    (l0, l1), (r0, r1) = fit_window
+    args = build_parser().parse_args([
+        str(int(n_points)), "--orbit", "--rho-power", "1", "--seed",
+        str(int(seed)), "--fit-window", f"{l0}:{l1},{r0}:{r1}"])
+    validate_mode_policy(args)
+    args.sigma_ncond = None
+    return select_points(args, str(wfn_path), keep_weight=False).indices
+
+
+def main():
+    args = build_parser().parse_args()
+    validate_mode_policy(args)
+    production_warnings = []
+    production_stdout = ProductionStdout(
+        debug=debug_print_enabled(), rank=RUNTIME.process_index,
+        warning_fn=production_warnings.append)
+    production_stdout.install()
+
+    # (the compile cache was armed at import, by step 7 of
+    # initialize_communicator_stack)
+    print0(f"✓ JAX initialized: {dist.device_summary()}")
+
+    timing.reset()
+    selection_start = time.perf_counter()
+    args.sigma_ncond, wfn_path = _resolve_deck(args)
+    sel = select_points(args, wfn_path)
+    (wfn, _indices, centroids_snapped, n_unique, n_pool, pruned,
+     prune_rank, unpicked, weight, weight_label, weight_band_ranges, M_cand,
+     orbit_aware, n_sym, fft_grid, N_c) = (
+        sel.wfn, sel.indices, sel.snapped, sel.n_unique, sel.pool, sel.pruned,
+        sel.prune_rank, sel.unpicked, sel.weight, sel.weight_label,
+        sel.weight_band_ranges, sel.M_cand, sel.orbit_aware, sel.n_sym,
+        sel.fft_grid, sel.N_c)
 
     # Default suffix follows --density-mode unless the user overrode it.
     out_suffix = (args.out_suffix

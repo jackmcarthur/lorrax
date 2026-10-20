@@ -75,16 +75,20 @@ def spectral_compression_lines(receipt, *,
     htransform, BSE and exciton-band drivers cannot drift onto different
     explanations of the same retained subspace.
     """
-    if receipt.get("method") == "centroid_nodes":
+    if receipt.get("method") == "kmeans_nodes":
         retained = int(receipt["retained_rank"])
         carried = int(receipt["carried_rank"])
         n_pad = int(receipt["null_padding"])
+        n_nodes, n_cent = int(receipt["nodes"]), int(receipt["centroids"])
         return [
             f"{label:<15}: {int(receipt['stacked_states'])} stacked states "
-            f"sampled at {int(receipt['centroids'])} centroids",
-            f"Nodes          : all {int(receipt['nodes'])} centroids, "
-            f"{int(receipt['orbits'])} orbit(s); no selection, no "
-            f"tolerance; fit {float(receipt['fit_seconds']):.2f} s",
+            f"sampled at {n_nodes} nodes",
+            f"Nodes          : {n_nodes} orbit-closed nodes, "
+            f"{int(receipt['orbits'])} orbit(s): "
+            + ("the ISDF centroids" if n_nodes == n_cent else
+               f"k-means (min(N_mu, 22 x fitted bands)); the {n_cent} ISDF "
+               "centroids are back-map targets")
+            + f"; no rank search; fit {float(receipt['fit_seconds']):.2f} s",
             f"Metric         : orbit-NNLS quadrature weights, eps=max_k"
             f"||Phi^H W Phi - 1||_2={float(receipt['metric_eps']):.3e}, "
             f"{int(receipt['zero_weight_nodes'])} zero-weight node(s); "
