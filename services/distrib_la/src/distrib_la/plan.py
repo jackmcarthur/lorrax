@@ -1554,6 +1554,15 @@ class Plan:
             return values, vectors, failed
         return safe
 
+    def chunk_room(self, n: int, nrhs: int, nbytes) -> None:
+        """Post ``nbytes`` per rank (``None`` withdraws it) as the room this plan's next fused
+        ``n x nrhs`` LU solves may give getrs chunks beside everything else their program holds
+        (:func:`distrib_la._cusolvermp.post_getrs_room`); a no-op off cuSOLVERMp.  Run-time
+        state, never in the program: the caller posts before the dispatch and withdraws after."""
+        if self.op == "solve_lu" and self.backend == "cusolvermp":
+            from distrib_la._cusolvermp import post_getrs_room
+            post_getrs_room(n, nrhs, nbytes)
+
     def _checked_solve(self, call):
         from distrib_la._result_check import checked, matrix_sketch, rhs_sketch, solve_errors
 
@@ -1624,7 +1633,13 @@ class Plan:
         caller that picks a route has taken back the decision this whole
         module exists to make once — the same reason there is no
         ``backend=`` on a call and only on :func:`plan`.
+
+        ``identity=True`` (``solve_lu``): ``args[0]`` is the identity, the caller's word.  Only
+        cuSOLVERMp's stacked entry acts on it (A^T factored on the column-major grid,
+        :func:`distrib_la._cusolvermp.batched_distributed_solve_lu`); every other route solves
+        against the operand it was given.
         """
+        identity = bool(kwargs.pop("identity", False))
         if (self.op == "eigh" and _route is None and not isinstance(A, jax.core.Tracer)
                 and _is_batch_layout(A, self.mesh)):
             # Whole matrices already live on their ranks: only the local kernel can
@@ -1661,10 +1676,12 @@ class Plan:
 
         rounds = _rounds if _rounds is not None else self._decide(A, args, traced, route)[2]
         if rounds == 0:
-            return self._library_plan().batched(A, *args, **kwargs)
+            return self._library_plan().batched(A, *args, identity=identity, **kwargs)
         ops = tuple(ensure_sharding(x, self.batch_in_sharding)
                     for x in (A, *args))
         if route == ROUTE_BACKEND_BATCHED:
+            if identity and self.op == "solve_lu" and self.backend == "cusolvermp":
+                kwargs = dict(kwargs, identity=True)
             many, post = self._entry("many", rounds=rounds)
             if many is None:
                 raise NotImplementedError(

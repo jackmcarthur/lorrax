@@ -200,10 +200,14 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def bodies(solve):
         """The solve-bearing bodies over ``solve``: name -> (body, inputs, outputs,
         resident, layout)."""
+        # Against I: the distributed plan may factor (I - x)^T in place (distrib_la's solve_lu
+        # identity, B = I only); the local solve takes no such word.
+        inverse = solve if solve in (None, jnp.linalg.solve) else partial(solve, identity=True)
+
         def wc(h, chi_raw):
             x = pref * congruence(h, chi_raw)
             identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
-            e = solve(identity - x, identity.copy())
+            e = inverse(identity - x, identity.copy())
             return congruence(h, mm(x, e))
 
         def pair(h, chi_raw, dchi_raw):
@@ -1011,6 +1015,17 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                     memory.output_size_in_bytes + memory.temp_size_in_bytes + native["total"],
                     runs_in="bank.dispatch." + stage)
                 receipt["memory"].append(row)
+            # The Dyson LU's getrs chunks get what this dispatch leaves: the allocator's room
+            # (lxkit.memory.room, every rank's smallest) less this program's outputs and
+            # temporaries, the dense workspace and the LU's own priced workspace at one chunk.
+            lu = getattr(kernel, "lu", None) if not stream else None
+            if lu is not None:
+                from lxkit import memory as allocator
+                from distrib_la import lu_workspace_bytes
+                n_lu = int(args[0].shape[-1])
+                lu.chunk_room(n_lu, n_lu, allocator.room(stage) - memory.output_size_in_bytes
+                              - memory.temp_size_in_bytes - native["total"]
+                              - lu_workspace_bytes(mesh_xy, n_lu, np.complex128))
             receipt["compiled"].append(dict(stage=stage,
                 arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
                 temporaries=memory.temp_size_in_bytes,
@@ -1021,10 +1036,14 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
         with timing.section('bank.dispatch.' + stage, announce=stream,
                             label=f"shared-pole bank {stage} dispatch"):
             started = time.monotonic()
-            result = executable(*args)
-            # A checked program's executable returns its status too (checked_program).
-            if hasattr(kernel, "finish"):
-                result = kernel.finish(args, result)
+            try:
+                result = executable(*args)
+                # A checked program's executable returns its status too (checked_program).
+                if hasattr(kernel, "finish"):
+                    result = kernel.finish(args, result)
+            finally:
+                if lu is not None:
+                    lu.chunk_room(n_lu, n_lu, None)
             receipt["seconds"][stage+"_dispatch"] = receipt["seconds"].get(stage+"_dispatch", 0.) + time.monotonic()-started
         return result
     return execute

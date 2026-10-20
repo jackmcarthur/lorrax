@@ -5,7 +5,8 @@
 // minor that is not positive in potrf, an exactly zero U(i,i) in getrf) and an
 // illegal argument (info < 0) reach the caller only through the device int
 // d_info. Each call zeroes it on the context stream first and copies it to
-// the host after (one int and one stream sync per call); a nonzero value
+// the host after (one int and one stream sync per call; the fused LU gives each
+// of its calls a slot and reads them all once, batched_solve_lu_ffi.cc); a nonzero value
 // returns as an error naming the routine, info, its meaning and the shape,
 // never as a result.
 #pragma once
@@ -27,16 +28,11 @@ inline ::xla::ffi::Error reset_info(LorraxCusolverMpCtx* ctx) {
     return ::xla::ffi::Error::Success();
 }
 
-// ``positive`` names what info = i > 0 means for this routine; ``q`` is the
-// batch member (-1 for an unbatched call).
-inline ::xla::ffi::Error read_info(LorraxCusolverMpCtx* ctx, const char* routine,
-                                   const char* positive, int64_t n, int64_t mb,
-                                   int64_t q = -1) {
-    int info = 0;
-    LORRAX_GPU_CHECK(cudaMemcpyAsync(&info, ctx->d_info, sizeof(int),
-                                      cudaMemcpyDeviceToHost, ctx->stream));
-    LORRAX_GPU_CHECK(cudaStreamSynchronize(ctx->stream));
-    if (info == 0) return ::xla::ffi::Error::Success();
+// The error a nonzero ``info`` returns.  ``positive`` names what info = i > 0 means for this
+// routine; ``q`` is the batch member (-1 for an unbatched call).
+inline ::xla::ffi::Error info_error(LorraxCusolverMpCtx* ctx, const char* routine,
+                                    const char* positive, int info, int64_t n, int64_t mb,
+                                    int64_t q = -1) {
     std::ostringstream os;
     os << routine << " returned info=" << info << " (n=" << n << ", block=" << mb;
     if (q >= 0) os << ", q=" << q;
@@ -45,6 +41,17 @@ inline ::xla::ffi::Error read_info(LorraxCusolverMpCtx* ctx, const char* routine
     else os << "argument " << -info << " is invalid";
     os << "; the result is not returned";
     return ::xla::ffi::Error(::xla::ffi::ErrorCode::kInternal, os.str());
+}
+
+inline ::xla::ffi::Error read_info(LorraxCusolverMpCtx* ctx, const char* routine,
+                                   const char* positive, int64_t n, int64_t mb,
+                                   int64_t q = -1) {
+    int info = 0;
+    LORRAX_GPU_CHECK(cudaMemcpyAsync(&info, ctx->d_info, sizeof(int),
+                                      cudaMemcpyDeviceToHost, ctx->stream));
+    LORRAX_GPU_CHECK(cudaStreamSynchronize(ctx->stream));
+    if (info == 0) return ::xla::ffi::Error::Success();
+    return info_error(ctx, routine, positive, info, n, mb, q);
 }
 
 }  // namespace lorrax_ffi::cusolvermp
