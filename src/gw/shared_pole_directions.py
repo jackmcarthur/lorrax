@@ -134,7 +134,8 @@ def _round_kernels(mesh, layout="batch"):
         return jax.jit(shard_map(fn, mesh=mesh, in_specs=specs, out_specs=out, check_vma=False))
 
     def sample(stack, j):
-        return jax.lax.dynamic_index_in_dim(stack, j, axis=1, keepdims=False)
+        # A 3-D stack is one sample with its axis dropped (a line sample): taken as is, no copy.
+        return stack if stack.ndim == 3 else jax.lax.dynamic_index_in_dim(stack, j, axis=1, keepdims=False)
 
     @lru_cache(maxsize=None)
     def take(indices):
@@ -295,7 +296,8 @@ def _select(k, W, entries, kind, index, recipe, *, real, eigh_plan, column_exten
     """
     spectral_rows = None if is_face_stack(W) else real
     tol = recipe["multiplet_relative_tolerance"]
-    stack = k.take(tuple(index[sid] for sid, _ in entries))(W)
+    # A one-sample stack [.., n, n] is its own selection stack (no copy); Q is then [.., n, r].
+    stack = W if W.ndim == 3 and len(entries) == 1 else k.take(tuple(index[sid] for sid, _ in entries))(W)
     if kind == "line":
         return distrib_la.right_singular_vectors(
             stack, recipe["direction_cutoff"], eigh_plan=eigh_plan, column_extent=column_extent,
@@ -415,8 +417,12 @@ def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan,
     put = replicated(mesh_xy)
     q_all, values = _select(k, W, entries[:1], "line", {sid: 0}, recipe, real=real, eigh_plan=eigh_plan,
                             column_extent=column_extent, logical_n=logical_n)
-    direction = k.column(q_all, device_index(mesh_xy, 0))
-    widths = tuple(int(row[0].size) for row in values)
+    if W.ndim == 3:
+        direction, widths = q_all, tuple(int(row.size) for row in values)
+    else:
+        direction = k.column(q_all, device_index(mesh_xy, 0))
+        widths = tuple(int(row[0].size) for row in values)
+    del q_all
     if any(w < 1 or w > logical_n for w in widths[:real]):
         raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
     states, flags, counts = _sample_states(k, W, dW, device_index(mesh_xy, 0), z, "line", direction, widths,
@@ -517,44 +523,51 @@ class LineSelection:
             out.extend(program(panels, state[1], jnp.asarray(state[0]), sample))
         return out
 
-    def select(self, sid, value, slope):
-        """Directions and the states at z and conj z of every family, from W(z) and dW/ds."""
+    def _cut(self, operands):
+        """Every block the selection reads of the pair ``operands`` = [W(z), dW/ds], which it
+        empties: the caller's pair is freed once its blocks are cut, before any eigh.
+        Returns ``(diagonal blocks by family, rectangles or None)``."""
+        value, slope = operands
+        operands.clear()
+        blocks = {f["name"]: (self.block(value, (f["index"],) * 2), self.block(slope, (f["index"],) * 2))
+                  for f in self.families}
+        rectangles = (self._rectangles(value, slope)
+                      if any(family["cross"] for family in self.families) else None)
+        return blocks, rectangles
+
+    def select(self, sid, operands):
+        """Directions and the states at z and conj z of every family, from ``operands`` =
+        [W(z), dW/ds] (emptied, :meth:`_cut`)."""
+        blocks, rectangles = self._cut(operands)
         lines = {}
         for family in self.families:
-            eig = self.plans[family["name"]]
-            f = family["index"]
-            W, dW = self.block(value, (f, f)), self.block(slope, (f, f))
+            W, dW = blocks.pop(family["name"])
             lines[family["name"]] = line_sample_states(
                 W, dW, family["recipe"], sid=sid, ordered=self.ordered,
-                real=self.nq, mesh_xy=self.mesh, eigh_plan=eig,
+                real=self.nq, mesh_xy=self.mesh, eigh_plan=self.plans[family["name"]],
                 column_extent=self.extent, logical_n=family["logical_n"])
             del W, dW
-        # The cross actions follow every diagonal selection, so the shared
-        # rectangles are live only while they act.
-        if any(family["cross"] for family in self.families):
-            rectangles = self._rectangles(value, slope)
+        if rectangles is not None:
             for family in self.families:
                 if family["cross"]:
                     line = lines[family["name"]]
                     line["cross"] = self._cross(family, rectangles, line["states"], mirror=False)
-            del rectangles
         return lines
 
-    def mirror(self, sid, lines, value, slope):
-        """The states at -z and -conj z from the minus-q partner W_q(-conj z) and its dW/ds."""
+    def mirror(self, sid, lines, operands):
+        """The states at -z and -conj z from ``operands`` = [the minus-q partner W_q(-conj z),
+        its dW/ds] (emptied, :meth:`_cut`)."""
+        blocks, rectangles = self._cut(operands)
         for family in self.families:
             line = lines[family["name"]]
-            f = family["index"]
-            partner = (self.block(value, (f, f)), self.block(slope, (f, f)))
+            partner = blocks.pop(family["name"])
             line["mirrors"] = line_sample_mirrors(line, partner, family["recipe"], sid=sid, mesh_xy=self.mesh)
             del partner
-        if any(family["cross"] for family in self.families):
-            rectangles = self._rectangles(value, slope)
+        if rectangles is not None:
             for family in self.families:
                 if family["cross"]:
                     line = lines[family["name"]]
                     line["cross"] += self._cross(family, rectangles, line["mirrors"], mirror=True)
-            del rectangles
 
     def panels(self, sid, lines):
         """The bank write of one line sample: every family's face panels and counts."""
@@ -579,10 +592,11 @@ def charge_line_selection(meta, *, mesh_xy, ordered, execution, nq, eigh_backend
     """
     basis = meta.mu_basis
     mask = _padding_mask(mesh_xy, tuple(bool(v) for v in np.asarray(basis.active_mask)))
-    move, axis, _ = selection_layout(mesh_xy, execution, int(nq))
+    move, _, _ = selection_layout(mesh_xy, execution, int(nq))
+    # The one-sample stack [B, n, n] itself (no sample axis, so no copy of it; ``_select``).
     return LineSelection([dict(name="charge", index=0, recipe=meta.shared_pole_recipe,
                                logical_n=int(meta.n_rmu), rows=int(basis.n_packed), cross=False)],
-                         lambda value, _: axis(move(mask(value))),
+                         lambda value, _: move(mask(value)),
                          mesh_xy=mesh_xy, ordered=ordered, execution=execution, nq=nq,
                          eigh_backend=eigh_backend, room=room)
 

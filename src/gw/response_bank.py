@@ -175,13 +175,16 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
     key = (mesh_xy, n, backend, route, pref, ordered, volume)
 
-    def program(inputs, outputs=1, resident=(), layout="face"):
+    def program(inputs, outputs=1, resident=(), layout="face", donate=()):
+        # ``donate``: operands the bank hands over (fresh χ rows and moment totals, read by no
+        # one after the call), so their faces hold the temporaries and outputs. The bank runs
+        # the whole-chain program (``_compiled``: ``call.lower``), the arguments' last reader.
         def wrap(fn):
             if backend == "off":
                 return local_batch(fn, mesh_xy, resident=resident, out_layout=layout)
             # The checked LU solves return their status: no host callback.
             return checked_program(fn, mesh_xy, face if outputs == 1 else (face,) * outputs,
-                                   in_shardings=(face,) * inputs)
+                                   in_shardings=(face,) * inputs, donate_argnums=donate)
         return wrap
 
     def mm(a, b):
@@ -205,23 +208,28 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
         inverse = solve if solve in (None, jnp.linalg.solve) else partial(solve, identity=True)
 
         def wc(h, chi_raw):
+            # Wc = H X (I-X)^-1 H = H ((I-X)^-1 - I) H: the LU solves against I (distrib_la's
+            # B = I path factors (I-X)^T without transposes) and overwrites it with E; X is not
+            # held across the LU and no product follows it.
             x = pref * congruence(h, chi_raw)
             identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
             e = inverse(identity - x, identity.copy())
-            return congruence(h, mm(x, e))
+            return congruence(h, e - identity)
 
         def pair(h, chi_raw, dchi_raw):
             value = wc(h, chi_raw)
             return value, derivative(value + mm(h, h), dchi_raw)
 
         if volume is None:
-            # One sample's value and slope in one program: the roots H stay laid out
-            # for every sample (no exchange), only the two chi stacks move in, and a
-            # 'batch' consumer takes both outputs without the exchange back.
+            # Local: one sample's value and slope in one program, the roots H laid out
+            # once for every sample (no exchange), and a 'batch' consumer takes both outputs
+            # without the exchange back. On the face, value then slope (two programs, the
+            # same products): dχ/ds is not live beside the value's LU and first GEMMs.
+            # The χ rows are donated (fresh rows of the carry).
             resident = (0,) if backend == "off" else ()
-            out = {"value": (wc, 2, 1, (), "face")}
-            for layout in (("face", "batch") if backend == "off" else ("face",)):
-                out["pair:" + layout] = (pair, 3, 2, resident, layout)
+            out = {"value": (wc, 2, 1, (), "face", (1,))}
+            for layout in (("face", "batch") if backend == "off" else ()):
+                out["pair:" + layout] = (pair, 3, 2, resident, layout, (1, 2))
             return out
 
         def infinity(v, contact):
@@ -254,13 +262,13 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                 result.append(mm(winf, rhs))
             return (winf - v, *(0.5 * c for c in result))
 
-        return {"value": (w_minus_v, 3, 1, (), "face"),
-                "pair:face": (photon_pair, 5, 2, (), "face"),
-                "moments": (photon_moments, 6, 5, (), "face")}
+        return {"value": (w_minus_v, 3, 1, (), "face", ()),
+                "pair:face": (photon_pair, 5, 2, (), "face", ()),
+                "moments": (photon_moments, 6, 5, (), "face", ())}
 
     def program_for(name, solve):
-        body, inputs, outputs, resident, layout = bodies(solve)[name]
-        return program(inputs, outputs, resident, layout)(body)
+        body, inputs, outputs, resident, layout, donate = bodies(solve)[name]
+        return program(inputs, outputs, resident, layout, donate)(body)
 
     local = ({name: program_for(name, jnp.linalg.solve) for name in bodies(jnp.linalg.solve)}
              if backend == "off" else None)
@@ -288,11 +296,11 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
         return dyson, progs.get("moments", moments), lu
 
     if volume is None:
-        @program(3)
+        @program(3, donate=(2,))
         def slope(h, wc, dchi_raw):
             return derivative(wc + mm(h, h), dchi_raw)
 
-        @program(3, 2)
+        @program(3, 2, donate=(1, 2))
         def moments(h, a0, a1):
             # chi_scaled=A0/s+A1/s²; whitened Dyson coefficients are
             # B0=H A0 H, B1=H A1 H, S0=B0, S1=B1+B0².
@@ -301,23 +309,20 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             return (0.5 * congruence(h, b0),
                     0.5 * congruence(h, b1 + mm(b0, b0)))
         if ordered:
-            @program(5, 4)
-            def moments(h, a0, a1, o0, o1):
-                # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-
-                # reversal or reality assumption; X_k = H chi_k H and
-                # Wc = H X (I-X)^-1 H. Coefficients C1..C4 of 1/z..1/z^4 keep
-                # every X1 cross term (o0 vanishes only in a complete basis).
-                # Returns M0=C1/2, M1=C2/2, M2=C3/2, M3=C4/2 (M_k = C_(k+1)/2, the
-                # constructor's convention); with o0=o1=0 the even pair reduces
-                # to the incumbent M1/M3 exactly.
-                x1, x2, x3, x4 = (congruence(h, v) for v in (o0, a0, o1, a1))
-                x11 = mm(x1, x1)
-                c2 = x2 + x11
-                c3 = x3 + mm(x1, x2) + mm(x2, x1) + mm(x11, x1)
-                c4 = (x4 + mm(x1, x3) + mm(x3, x1) + mm(x2, x2) + mm(x11, x2)
-                      + mm(mm(x1, x2), x1) + mm(x2, x11) + mm(x11, x11))
-                return (0.5 * congruence(h, x1), 0.5 * congruence(h, c2),
-                        0.5 * congruence(h, c3), 0.5 * congruence(h, c4))
+            # chi_scaled = o0/z + a0/z^2 + o1/z^3 + a1/z^4 with no time-reversal or reality
+            # assumption; X_k = H chi_k H and Wc = H X (I-X)^-1 H. Coefficients C1..C4 of
+            # 1/z..1/z^4 keep every X1 cross term (o0 vanishes only in a complete basis), by
+            # the Dyson recurrence C_k = X_k + sum_(i<k) X_i C_(k-i) (the photon moments'
+            # form): 6 products, not 12 of the expanded series. M_k = C_(k+1)/2 (the
+            # constructor's convention); with o0=o1=0 the even pair reduces to the incumbent
+            # M1/M3 exactly. One program per step (:func:`ordered_moments`), each result in a
+            # consumed operand's face: in one program XLA held the independent products side
+            # by side (17 faces of temporaries at n 30000, P16, compiled on XLA:CPU).
+            moments = SimpleNamespace(
+                term=program(2, donate=(1,))(lambda h, chi: congruence(h, chi)),
+                add_product=program(3)(lambda c, x, y: c + mm(x, y)),
+                accumulate=program(3, donate=(0,))(lambda c, x, y: c + mm(x, y)),
+                half_term=program(2, donate=(1,))(lambda h, c: 0.5 * congruence(h, c)))
 
     else:
         @program(3)
@@ -1427,6 +1432,24 @@ def _moment_batch_split(mesh_xy, n_out, rows):
                    out_shardings=(face,) * n_out)
 
 
+def ordered_moments(steps, execute, h, a0, a1, o0, o1):
+    """M0..M3 of an ordered charge bank from its scaled totals, one step per dispatch
+    (``_response_programs``' ordered ``moments``). Every total is consumed: X_k is formed in
+    its total's face, C_k accumulates in a face of its own (X2 and X3 are read again; C4 in
+    X4's), and M_k in C_k's. At most X1..X3, C2, C3, the running C4 and one product's work
+    are live."""
+    xs = [execute(steps.term, (h, v), "moment_dyson") for v in (o0, a0, o1, a1)]
+    cs = [xs[0]]
+    for k in range(1, 4):
+        c = xs[k]
+        for i in range(k):
+            step = steps.add_product if i == 0 and k < 3 else steps.accumulate
+            c = execute(step, (c, xs[i], cs[k - i - 1]), "moment_dyson")
+        cs.append(c)
+    del xs, c
+    return tuple(execute(steps.half_term, (h, cs.pop(0)), "moment_dyson") for _ in range(4))
+
+
 def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered, receipt, root,
                            vertex=None):
     """Every parent's exact-moment totals from one pass of the row-pass engine, or ``None``.
@@ -1566,6 +1589,10 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
             name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
             ledger.live_stages = ambient+(name,)
             if not np.asarray(header["moment_written"])[q0:q1].all():
+                # The roots first: their factorization runs beside no total.
+                with _moment_phase(receipt, "coulomb"):
+                    h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
+                    del hi
                 with _moment_phase(receipt, "correlations"):
                     if runs is not None:
                         run = next(runs)
@@ -1584,13 +1611,11 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                     timing.stage_wait((a0, a1) + ((o0, o1) if ordered else ()))
                 with _moment_phase(receipt, "diagnostics"):
                     _check_bare_hermitian(mesh_xy, q0, receipt, A0=a0, A1=a1)
-                with _moment_phase(receipt, "coulomb"):
-                    h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
-                    del hi
                 operands = (h,a0,a1,o0,o1) if ordered else (h,a0,a1)
                 with _moment_phase(receipt, "dyson"):
-                    result = execute(moments, operands + (() if vertex is None else (contact,)),
-                                     "moment_dyson")
+                    result = (ordered_moments(moments, execute, *operands) if ordered and vertex is None
+                              else execute(moments, operands + (() if vertex is None else (contact,)),
+                                           "moment_dyson"))
                     timing.stage_wait(result)
                 names = (("constant", "M0", "M1", "M2", "M3") if vertex is not None else
                          (("M0", "M1", "M2", "M3") if ordered else ("M1", "M3")))
@@ -2723,6 +2748,19 @@ def _member_rows(carry, i, rows):
     return carry[i, rows]
 
 
+def _member_block(carry, first, mesh_xy):
+    """``carry[first:first+2]``, one member's value and slope rows out of the group carry, so
+    the carry can be freed while that member is solved (the start a placed constant)."""
+    from common.collectives import device_put_process_local_cached
+    return _member_block_program(carry, device_put_process_local_cached(
+        np.int32(first), NamedSharding(mesh_xy, P())))
+
+
+@jax.jit
+def _member_block_program(carry, first):
+    return jax.lax.dynamic_slice_in_dim(carry, first, 2, axis=0)
+
+
 #: Face-sized arrays one parent's partner unfold holds at once per field (the
 #: tile's gathered rows, their packed copy, the unfolded block, the mixed block
 #: and the output on the four-current route), the bound the partner tile is
@@ -3143,7 +3181,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             return parts[0] if len(parts) == 1 else tuple(
                 jnp.concatenate(column, axis=0) for column in zip(*parts))
         span = (int(q0), int(q1))
-        h = roots[q0:q1]
+        # The whole span solves on the held roots; a slice would be one more face per parent.
+        h = roots if span == (0, len(qids)) else roots[q0:q1]
         if constant is None:
             constant = read_constant(span, bank_handle)
         head_update = None
@@ -3163,6 +3202,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             chi_value, = chi_value
             if partner:
                 chi_value = jnp.conj(chi_value)
+        # The Dyson programs consume their χ rows (donated); the debug census reads them after.
+        census_chi = chi_value + 0 if need_value and ordered and tr_odd_census and not partner else None
         if need_value and dyson.pair(layout) is not None:
             # Wc and dWc/ds in one program: on the held roots (charge), or
             # with the contact and W_inf - V (photon).
@@ -3172,7 +3213,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         else:
             if need_value:
                 value = execute(dyson.value, (h,chi_value)+(() if vertex is None else (contact,)),
-                                "sample_dyson") - constant
+                                "sample_dyson")
+                if vertex is not None:          # charge: constant 0 (no copy of Wc)
+                    value = value - constant
             else:
                 io_started = time.monotonic()
                 saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
@@ -3207,7 +3250,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     # imaginary sample at every TRIM parent, so it runs under the
                     # debug-output dial, never in the production prefactor.
                     if ordered and tr_odd_census:
-                        _tr_odd_census(receipt,dyson.value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
+                        _tr_odd_census(receipt,dyson.value,h[part],census_chi[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
     def dense_spans(sample):
@@ -3293,11 +3336,20 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         with shared_pole_bank_writer(bank_io["path"], meta=meta,
                 expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-            for row, sample in enumerate(members):
+            # Dense members first, line members (the selection, the bank's largest phase) last;
+            # on the devices the last member's rows leave the group carry, which is freed
+            # before that member's solves.
+            order = sorted(enumerate(members), key=lambda m: p0 <= m[1] < p1)
+            last = ([row for row, sample in order if not committed(sample)] or [None])[-1]
+            for row, sample in order:
                 if committed(sample):
                     progress.step()
                     continue
-                raw = take(row) if q_width is None or (p0 <= sample < p1 and line_width is None) else None
+                if stream_bank is None and row == last:
+                    raw = _MemberRows(_member_block(raw_group, 2 * row, mesh_xy), 0)
+                    raw_group = take = None
+                else:
+                    raw = take(row) if q_width is None or (p0 <= sample < p1 and line_width is None) else None
                 if p0 <= sample < p1:
                     # Select from W(z) itself, then act with the minus-q partner on
                     # the same directions; only the panels reach the bank.
@@ -3321,19 +3373,24 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         rows = raw if line_width is None else _RowWindow(take(row), span[0])
                         # The span's W_inf - V serves both orientations' solves.
                         constant = read_constant(span, bank_handle)
-                        value, slope = solve(rows, 0, *span, bank_handle, sample, layout=line_layout,
-                                             constant=constant)
+                        # The pair goes to the selection as a list it empties: W and dW/ds are
+                        # freed once their selection blocks are cut.
+                        pair = list(solve(rows, 0, *span, bank_handle, sample, layout=line_layout,
+                                          constant=constant))
+                        if not ordered and line_width is None:
+                            rows = raw = None          # every row of this member is read
                         memory.book(ledger.price(selection_row), stage='bank.line_select')
                         with timing.section('bank.line_select'):
-                            lines = sel.select(sample, value, slope)
-                        del value, slope
+                            lines = sel.select(sample, pair)
                         if ordered:
-                            value, slope = solve(rows, 1, *span, bank_handle, sample, layout=line_layout,
-                                                 constant=constant)
+                            pair = list(solve(rows, 1, *span, bank_handle, sample, layout=line_layout,
+                                              constant=constant))
+                            if line_width is None:
+                                rows = raw = None      # every row of this member is read
                             memory.book(ledger.price(selection_row), stage='bank.line_mirror')
                             with timing.section('bank.line_mirror'):
-                                sel.mirror(sample, lines, value, slope)
-                            del value, slope
+                                sel.mirror(sample, lines, pair)
+                        del pair
                         del constant
                         memory.book(ledger.price(selection_row), stage='bank.line_panels')
                         with timing.section('bank.line_panels'):
