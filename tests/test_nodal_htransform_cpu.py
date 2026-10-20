@@ -535,3 +535,108 @@ def test_face_route_matches_the_q_batched_route():
     assert np.abs(e_f - e_q).max() <= 1e-12 * np.abs(e_q).max()
     assert np.abs(p_f - p_q).max() <= 1e-12 * np.abs(p_q).max()
 
+
+def test_fit_drops_zero_weight_nodes_and_the_mask_round_trips(tmp_path,
+                                                              monkeypatch):
+    """``fit_galerkin_basis`` on sampled values Phi = U / sqrt(v) (three
+    orbits of 4 nodes, the nodes are the 12 centroids) with orbit 3 at
+    w = 0: its 4 nodes leave the rank axis, C is the kept columns of the
+    full fit, every centroid stays a back-map target with its pre-drop
+    values, and ``galerkin_dft.h5`` returns the kept-node mask, the
+    requested nodes and every array unchanged."""
+    import types
+    import pytest
+    from jax.sharding import Mesh
+    from common import parallel_transport
+    from isdf import galerkin
+    if jax.device_count() < 4:
+        pytest.skip("needs 4 host devices")
+    rng = np.random.default_rng(13)
+    nk, nb, grid = 8, 5, (12, 12, 12)
+    labels = np.repeat(np.arange(3), 4)
+    U = np.linalg.qr(rng.standard_normal((nk, labels.size, nb))
+                     + 1j * rng.standard_normal((nk, labels.size, nb)))[0]
+    phi = np.moveaxis(U, -1, 1) / np.sqrt(np.array([0.5, 2.0, 1.3])[labels])
+    flat = rng.permutation(np.prod(grid))[:labels.size]
+    idx = np.stack(np.unravel_index(flat, grid), axis=1)
+    metric = galerkin._quadrature_metric
+
+    def zero_orbit_3(values, orbit, **kw):
+        w = np.where(orbit == 2, 0.0, metric(values, orbit, **kw)[0])
+        return w, np.einsum('kmsv,v,knsv->kmn', np.conj(values), w, values)
+
+    monkeypatch.setattr(galerkin, "_quadrature_metric", zero_orbit_3)
+    monkeypatch.setattr(galerkin, "_orbit_labels", lambda *a: (labels, 4))
+    monkeypatch.setattr(galerkin, "_sample", lambda *a: phi[:, :, None, :])
+    monkeypatch.setattr(parallel_transport, "wfn_fingerprint", lambda w: "toy")
+    wfn = types.SimpleNamespace(avec=A / 10.0, alat=10.0)
+    meta = types.SimpleNamespace(nspinor=1, nk_tot=nk, fft_grid=grid,
+                                 kgrid=(2, 2, 2), sys_dim=3, mu_basis=None)
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
+    logs = []
+    fit = galerkin.fit_galerkin_basis(wfn, None, meta, idx, mesh, (0, nb),
+                                      log_fn=logs.append)
+    keep = labels < 2
+    assert fit.node_indices == galerkin._index_rows(idx[keep])
+    assert fit.requested_nodes == galerkin._index_rows(idx)
+    assert fit.rank_physical == 8 and "4 zero-weight node(s) dropped of 12" \
+        in logs[0]
+    w, gram = zero_orbit_3(phi[:, :, None, :], labels)
+    ctilde = np.einsum('kmn,kmsv,v->knsv', _loewdin(gram)[0],
+                       phi[:, :, None, :], np.sqrt(w), optimize=True)
+    np.testing.assert_allclose(np.asarray(fit.ctilde)[:, :, :8],
+                               ctilde[:, :, 0, keep], rtol=0, atol=1e-13)
+    np.testing.assert_array_equal(
+        np.asarray(fit.basis_at_nodes.target)[:, :, :12], phi)
+    path = tmp_path / "galerkin_dft.h5"
+    galerkin.write_galerkin_basis(path, fit, wfn=wfn, meta=meta,
+                                  centroid_indices=idx, bispinor=False,
+                                  refit_rcond=1e-3, mesh_xy=mesh)
+    back = galerkin.read_galerkin_basis(
+        path, wfn=wfn, meta=meta, centroid_indices=idx, node_indices=idx,
+        band_range=(0, nb), bispinor=False, refit_rcond=1e-3, mesh_xy=mesh)
+    assert back.node_indices == fit.node_indices
+    assert back.requested_nodes == fit.requested_nodes
+    assert back.node_weights == fit.node_weights
+    for name in ("ctilde", "loewdin"):
+        np.testing.assert_array_equal(np.asarray(getattr(back, name)),
+                                      np.asarray(getattr(fit, name)))
+    for name in ("nodal", "target", "node_frac", "target_frac"):
+        np.testing.assert_array_equal(
+            np.asarray(getattr(back.basis_at_nodes, name)),
+            np.asarray(getattr(fit.basis_at_nodes, name)))
+
+
+def test_node_cache_is_published_once_and_keyed_on_the_kmeans_version(
+        tmp_path, monkeypatch):
+    """``htransform_nodes`` above ``KMEANS_ABOVE x want``: a miss runs the
+    k-means once and publishes ``galerkin_nodes_*.txt``; the next call
+    reuses it (rank 0's read) without the k-means; a new ``KMEANS_VERSION``
+    misses and publishes a second cache."""
+    import sys
+    import types
+    from bandstructure import fh_interp
+    from centroid import kmeans_isdf
+    from common import parallel_transport
+    calls = []
+
+    def kmeans(wfn_path, n_points, *, fit_window, seed=0):
+        calls.append(n_points)
+        return np.arange(3 * n_points).reshape(-1, 3) % 7
+
+    fake = types.ModuleType("centroid.kmeans_cli")
+    fake.orbit_kmeans_points = kmeans
+    monkeypatch.setitem(sys.modules, "centroid.kmeans_cli", fake)
+    monkeypatch.setattr(parallel_transport, "wfn_fingerprint",
+                        lambda w: "f" * 64)
+    run = lambda: fh_interp.htransform_nodes(
+        None, np.zeros((200, 3), dtype=np.int64), (0, 2), wfn_path="WFN.h5",
+        basis_path=str(tmp_path / "galerkin_dft.h5"))
+    first, again = run(), run()
+    assert calls == [44] and first.shape == (44, 3)
+    np.testing.assert_array_equal(again, first)
+    assert len(list(tmp_path.glob("galerkin_nodes_*.txt"))) == 1
+    monkeypatch.setattr(kmeans_isdf, "KMEANS_VERSION", "kmeans-isdf-bumped")
+    run()
+    assert calls == [44, 44]
+    assert len(list(tmp_path.glob("galerkin_nodes_*.txt"))) == 2

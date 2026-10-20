@@ -36,6 +36,13 @@ import symmetry_maps as _sym                     # noqa: E402
 
 BOHR_TO_ANG = 0.529177210544
 
+#: Version of the k-means point selection (this module's seeding, Lloyd loop
+#: and grid snap, and ``kmeans_cli.select_points``' over-sampling and prune).
+#: Bump it with any change that moves the selected points for fixed inputs:
+#: caches keyed on it (the htransform node cache,
+#: ``bandstructure.fh_interp.htransform_nodes``) are then recomputed.
+KMEANS_VERSION = "kmeans-isdf-v1"
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # PBC distance: lattice-aware min-image offset table

@@ -20,7 +20,6 @@ same fH on a fine grid for the BSE.  The CLI is ``bandstructure.htransform``.
 This module reads one environment variable, ``LORRAX_EXTRA_RANK_PAD``, through
 :func:`resolve_extra_rank_pad` (test-only pad invariance, rule 2b).
 """
-import itertools
 import os
 import time
 from functools import partial
@@ -127,26 +126,12 @@ def validate_centroid_subset_idx(selection, n_parent: int) -> np.ndarray:
         raise ValueError(f"htransform centroid subset: {exc}") from exc
 
 
-_NODE_BROADCASTS = itertools.count()
-
-
-def _rank0_nodes(nodes, key: str):
-    """Rank 0's node set on every rank, byte-exact (the k-means need not be
-    bitwise identical across ranks; every rank must use one set).  Every rank
-    calls it in the same order (the KV keys carry a call counter)."""
-    from ffi.common.broadcast import broadcast_bytes
-    call = next(_NODE_BROADCASTS)
-    rows = np.ascontiguousarray(np.asarray(nodes, dtype="<i8").reshape(-1, 3))
-    count = broadcast_bytes(np.frombuffer(np.asarray(
-        [rows.shape[0]], dtype="<i8").tobytes(), dtype=np.uint8).copy(),
-        key=f"lorrax/htransform/nodes/{call}/{key}/count")
-    n = int(np.frombuffer(count.tobytes(), dtype="<i8")[0])
-    if rows.shape[0] != n:
-        rows = np.zeros((n, 3), dtype="<i8")
-    payload = broadcast_bytes(rows.reshape(-1).view(np.uint8).copy(),
-                              key=f"lorrax/htransform/nodes/{call}/{key}/rows")
-    return np.frombuffer(payload.tobytes(), dtype="<i8").reshape(n, 3).astype(
-        np.int64)
+def _node_rows(path):
+    """Rank 0's reader of a node cache: its ``(n, 3)`` rows (JSON), or None
+    when there is none yet."""
+    if not os.path.isfile(path):
+        return None
+    return np.loadtxt(path, dtype=np.int64, ndmin=2).tolist()
 
 
 def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
@@ -162,12 +147,17 @@ def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
     ``--orbit``, rho-power 1, fit window = the fitted bands on both legs),
     cached beside the basis artifact as
     ``galerkin_nodes_<N>_b<b0>-<b1>_<wfn>_<params>.txt`` (``params``: a hash
-    of the selector, its version and its arguments) and reused when all of
-    them match.  Every rank must enter.
+    of the selector, its version, the k-means version
+    ``centroid.kmeans_isdf.KMEANS_VERSION`` and the arguments) and reused
+    when all of them match.  Rank 0 decides the cache hit, and rank 0's node
+    set reaches every rank through ``common.collectives.rank0_read``, on a
+    hit and after a fresh selection alike (the k-means need not be bitwise
+    identical across ranks).  Every rank must enter.
     """
     import hashlib
     import json
-    from common.collectives import barrier, process_rank
+    from centroid.kmeans_isdf import KMEANS_VERSION
+    from common.collectives import rank0_atomic_file_transaction, rank0_read
     from common.parallel_transport import wfn_fingerprint
     from isdf.galerkin import (KMEANS_ABOVE, NODE_SELECTION_VERSION,
                                NODES_PER_FITTED_BAND)
@@ -178,36 +168,53 @@ def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
     if centroids.shape[0] <= KMEANS_ABOVE * want:
         return centroids
     params = dict(selector="centroid.kmeans_cli.orbit_kmeans_points",
-                  version=NODE_SELECTION_VERSION, n_points=want, orbit=True,
-                  rho_power=1, seed=0, fit_window=[[b0, b1], [b0, b1]])
+                  version=NODE_SELECTION_VERSION, kmeans=KMEANS_VERSION,
+                  n_points=want, orbit=True, rho_power=1, seed=0,
+                  fit_window=[[b0, b1], [b0, b1]])
     key = hashlib.sha256(json.dumps(params, sort_keys=True).encode()
                          ).hexdigest()[:10]
     tag = f"{want}_b{b0}-{b1}_{wfn_fingerprint(wfn)[:12]}_{key}"
     cache = (os.path.join(os.path.dirname(os.path.abspath(basis_path)),
                           f"galerkin_nodes_{tag}.txt")
              if basis_path is not None else None)
-    if cache is not None and os.path.isfile(cache):
-        nodes = np.loadtxt(cache, dtype=np.int64, ndmin=2)
-        log(f"  [nodes] REUSED {cache}: {nodes.shape[0]} k-means nodes for "
-            f"{b1 - b0} fitted bands (N_mu {centroids.shape[0]})")
-        return nodes
+    as_nodes = lambda rows: np.asarray(rows, dtype=np.int64).reshape(-1, 3)
+    if cache is not None:
+        rows = rank0_read(cache, stage="htransform_nodes/reuse",
+                          read=lambda: _node_rows(cache))
+        if rows is not None:
+            nodes = as_nodes(rows)
+            log(f"  [nodes] REUSED {cache}: {nodes.shape[0]} k-means nodes "
+                f"for {b1 - b0} fitted bands (N_mu {centroids.shape[0]})")
+            return nodes
     from centroid.kmeans_cli import orbit_kmeans_points
     t0 = time.perf_counter()
-    nodes = _rank0_nodes(orbit_kmeans_points(
-        wfn_path, want, fit_window=((b0, b1), (b0, b1))), key)
+    local = as_nodes(orbit_kmeans_points(
+        wfn_path, want, fit_window=((b0, b1), (b0, b1))))
+    if cache is None:
+        nodes = as_nodes(rank0_read(f"{wfn_path}:htransform_nodes",
+                                    stage="htransform_nodes/broadcast",
+                                    read=local.tolist))
+    else:
+        header = (f"htransform nodes: orbit-closed k-means (--orbit, rho-power "
+                  f"1, fit window {b0}:{b1},{b0}:{b1}), requested {want}; FFT "
+                  f"indices; WFN {wfn_fingerprint(wfn)}; selector {params}")
+
+        def check(path):
+            if not np.array_equal(np.loadtxt(path, dtype=np.int64, ndmin=2),
+                                  local):
+                raise ValueError(f"htransform node cache {path} does not "
+                                 "read back as written")
+
+        rank0_atomic_file_transaction(
+            cache, stage="htransform_nodes/publish",
+            write=lambda path: np.savetxt(path, local, fmt="%d", header=header),
+            validate_file=check)
+        nodes = as_nodes(rank0_read(cache, stage="htransform_nodes/read",
+                                    read=lambda: _node_rows(cache)))
     log(f"  [nodes] k-means: {nodes.shape[0]} orbit-closed nodes for "
         f"{b1 - b0} fitted bands ({NODES_PER_FITTED_BAND} per band) instead "
         f"of the {centroids.shape[0]} ISDF centroids, "
         f"{time.perf_counter() - t0:.1f} s")
-    if cache is not None:
-        if process_rank() == 0:
-            staging = f"{cache}.partial.{os.getpid()}"
-            np.savetxt(staging, nodes, fmt="%d", header=(
-                f"htransform nodes: orbit-closed k-means (--orbit, rho-power "
-                f"1, fit window {b0}:{b1},{b0}:{b1}), requested {want}; FFT "
-                f"indices; WFN {wfn_fingerprint(wfn)}; selector {params}"))
-            os.replace(staging, cache)
-        barrier("htransform_nodes.cached")
     return nodes
 
 

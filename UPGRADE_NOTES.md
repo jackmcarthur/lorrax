@@ -39,9 +39,13 @@ solve whose route (`q-batched` or `face`) the memory model admits
   node set that is not closed under the WFN's operations refuses (regenerate
   it with `centroid.kmeans_cli --orbit`). The nodes are the ISDF centroids
   up to 1.25 × 22 × fitted bands; above that, an orbit-closed k-means
-  selection of 22 × fitted bands is made once (rank 0's, broadcast) and
-  cached beside `galerkin_dft.h5` as
-  `galerkin_nodes_<N>_b<b0>-<b1>_<wfn>_<params>.txt`. Zero-weight nodes
+  selection of 22 × fitted bands is made once and cached beside
+  `galerkin_dft.h5` as `galerkin_nodes_<N>_b<b0>-<b1>_<wfn>_<params>.txt`
+  (`params`: a hash of the selector, its version, the k-means version
+  `centroid.kmeans_isdf.KMEANS_VERSION` and the arguments). Rank 0 decides
+  the cache hit and its node set reaches every rank
+  (`common.collectives.rank0_read`), on a hit and after a fresh selection
+  alike. Zero-weight nodes
   (W = 0) are dropped from the rank axis, which is exact. The states at the
   centroids, which the BSE consumers read, are back-map targets whenever the
   nodes differ from them. The fit warns when the metric eps exceeds 0.1
@@ -55,7 +59,9 @@ solve whose route (`q-batched` or `face`) the memory model admits
   tiles `2·N_k·N_B·(N_B + N_T)/P`; the lattice-box R tensor it replaces was
   `16·N_k·rank²/P` without the back-map. Both are admitted (`lxkit.memory`).
   Si 4³ at P = 4 (768 nodes after dropping 12 zero-weight ones, 1100
-  targets): 1.65 GB per device against 0.10 GB for the QRCP box (rank 636).
+  targets): 1.65 GB per device against 0.10 GB for the QRCP box (rank 636);
+  device peak of the fine stage 4.11 against 1.01 GiB. MoS₂ 9×9 (878 of the
+  1198 centroids kept, 1198 targets): 2.66 GB per device, peak 6.79 GiB.
 - **Tests.** `tests/test_nodal_htransform_cpu.py`: star covariance, on-grid
   exactness, off-grid accuracy against the control variants (sign-flipped
   pair displacement, one image set per class, the box), the orbit-tied
