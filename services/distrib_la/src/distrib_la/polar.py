@@ -23,7 +23,7 @@ from lxkit import ordered_norm
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD
+from distrib_la.plan import Plan, plan, ROUTE_BATCH_RESHARD, _analysis_bytes, _executable
 from distrib_la.resolve import mesh_key
 from distrib_la._collectives import device_put_process_local_cached
 
@@ -569,6 +569,39 @@ def retain_leading_eigenvectors(
         layout=layout, descending=True)
 
 
+@lru_cache(maxsize=None)
+def _normal_program(mesh, ndim, gemm_backend, shifted):
+    """The face W.H W program of :func:`_direction_svd_kernel` (on cuSOLVERMp I + G/||G||_F), one
+    per mesh and layout: no plan's room is in it, so a price and the run execute one program."""
+    from distrib_la.matmul import matmul
+    stack = lambda w: w if w.ndim == 3 else w[None]
+
+    @jax.jit(out_shardings=(NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P())))
+    def normal(w):
+        g = matmul(stack(w), stack(w), mesh=mesh, transa="C", backend=gemm_backend, batched_route="auto")
+        return _shifted_normal(g, mesh) if shifted else (g, jnp.ones(g.shape[0], g.real.dtype))
+    return normal
+
+
+def _gemm_backend(eigh_plan):
+    return "distributed" if eigh_plan.requested in ("auto", "off") else eigh_plan.requested
+
+
+def direction_svd_bytes(eigh_plan, shape, dtype) -> int:
+    """Per-rank bytes the face direction solve (:func:`right_singular_vectors`) of the stack
+    ``shape`` [e, m, m] adds beside W, from the programs it runs: on route (c) its stack's price;
+    otherwise the normal-matrix executable the solve executes, or its output beside the eigh stack
+    as the plan prices it (``eigh_stack_bytes``: first attempt + the provider's query)."""
+    from distrib_la.workspace import eigh_stack_bytes
+    mesh, shape = eigh_plan.mesh, tuple(int(v) for v in shape)
+    if eigh_plan.known_route(shape, dtype) == ROUTE_BATCH_RESHARD:      # a pure query: price plans have no room
+        return eigh_stack_bytes(eigh_plan, shape, dtype, phase="first")
+    W = jax.ShapeDtypeStruct(shape, np.dtype(dtype), sharding=NamedSharding(mesh, P(None, 'x', 'y')))
+    ex = _executable(_normal_program(mesh, 3, _gemm_backend(eigh_plan), eigh_plan.backend == "cusolvermp"), (W,))
+    return max(int(_analysis_bytes(ex) or 0), int(ex.memory_analysis().output_size_in_bytes)
+               + eigh_stack_bytes(eigh_plan, shape, dtype, phase="first"))
+
+
 @lru_cache(maxsize=16)
 def _direction_svd_kernel(eigh_plan, ndim, tau=None):
     """Right singular vectors of the current face-tiled responses from the m x m normal matrix.
@@ -584,10 +617,8 @@ def _direction_svd_kernel(eigh_plan, ndim, tau=None):
     one triangle, so the face G takes no Hermitian projection (no transpose of
     a face-tiled matrix). Only the length-m spectrum replicates.
     """
-    from distrib_la.matmul import matmul
     mesh = eigh_plan.mesh
     rep, tile = NamedSharding(mesh, P()), NamedSharding(mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
-    gemm_backend = "distributed" if eigh_plan.requested in ("auto", "off") else eigh_plan.requested
     shifted = eigh_plan.backend == "cusolvermp"
     cut = {"cut": _ShiftedCut(0.5 * tau ** 2)} if shifted and tau is not None else {}
     stack = lambda w: w if w.ndim == 3 else w[None]
@@ -597,10 +628,7 @@ def _direction_svd_kernel(eigh_plan, ndim, tau=None):
     def reshard(w):
         return unstack(*eigh_plan.reshard_stack("normal_eigh", stack(w)))
 
-    @jax.jit(out_shardings=(NamedSharding(mesh, P(None, 'x', 'y')), rep))
-    def normal(w):
-        g = matmul(stack(w), stack(w), mesh=mesh, transa="C", backend=gemm_backend, batched_route="auto")
-        return _shifted_normal(g, mesh) if shifted else (g, jnp.ones(g.shape[0], g.real.dtype))
+    normal = _normal_program(mesh, ndim, _gemm_backend(eigh_plan), shifted)
 
     @jax.jit(out_shardings=(rep, tile))
     def spectrum(mu, v, scale):
@@ -609,7 +637,7 @@ def _direction_svd_kernel(eigh_plan, ndim, tau=None):
     def extract(w):
         if eigh_plan.stack_route(stack(w).shape, w.dtype, "normal_eigh").route == ROUTE_BATCH_RESHARD:
             return reshard(w)
-        a, scale = normal(w)
+        a, scale = _executable(normal, (w,))(w)     # the executable direction_svd_bytes prices
         mu, v = eigh_plan.batched(a, **cut)
         del a
         return spectrum(mu, v, scale)

@@ -369,6 +369,18 @@ class ConstructorCapacity:
                     shapes[0], np.complex128, phase="first"))
         return self.native_queries[("eigh", shapes)]
 
+    def direction_bytes(self, depth):
+        """A face selection's direction solve of a ``depth``-row stack (parents x samples, the
+        stack ``polar`` flattens): ``distrib_la.direction_svd_bytes``, cached in ``native_queries``."""
+        import distrib_la
+        key = ("direction", int(depth), int(self._n))
+        if key not in self.native_queries:
+            self.native_queries[key] = distrib_la.direction_svd_bytes(
+                constructor_price_plan(self._mesh_xy, int(self._n), self.execution,
+                                       backend=self._resolution.eigh_backend),
+                (int(depth), int(self._n), int(self._n)), np.complex128)
+        return self.native_queries[key]
+
     @property
     def ledger(self):
         """The shared ledger this construction reserves in (``CapacityLedger``)."""
@@ -417,7 +429,15 @@ class ConstructorCapacity:
         # stack's program compiled at its shape on the whole-mesh plan (never run), plus its
         # provider's workspace query: the room distrib_la reads to run a stack one whole
         # matrix per rank is what this admission leaves over.
-        self._native_maxima["eigh"] = max(self.eigh_bytes(e) for e in sorted(extents)) if eigh else 0
+        face_selection = phase == "selection" and self.execution == "face"
+        if face_selection:
+            # The face direction solve is priced by the programs it runs (direction_bytes), not by
+            # the 24 n^2 dense closed form.
+            price = dict(price, resident_bytes_per_rank=price["resident_bytes_per_rank"]
+                         - price["terms_bytes_per_rank"]["phase_dense_temporaries"])
+        self._native_maxima["eigh"] = 0 if not eigh else (
+            self.direction_bytes(self.batch_width * int(sample_batch)) if face_selection
+            else max(self.eigh_bytes(e) for e in sorted(extents)))
         self._workspace = sum(self._native_maxima.values())
 
         return price, dict(self._native_maxima)
