@@ -52,6 +52,19 @@ A new test needs no bootstrap import of its own.
 - `test_transition_probe_rank_cpu.py`: internal transition-seed independence
   and strict residual singular-block rank policy (CPU); numerical basis
   admission, not a physical pole or stability projection.
+- `test_transition_panel_capacity_cpu.py`: direct physical-Pi panel shape
+  prices, explicit source residency, native XY updates across a column-tile
+  boundary, full-coherent literal Pi and checked-LU Pi/pref normalization
+  (CPU); no material admission.
+- `test_transition_saved_state_cli_cpu.py`: argument/budget preflight,
+  verification-only scope guards, and the tiny four-device pipeline with a
+  local dense backend; no real MPI communicator or material run.
+- `tdagw/transition_galerkin_saved_state.py`: unlaunched verification-only P4
+  q0 CLI for a saved36k/160band/978logical-port coherent state. Fixed training
+  and independent held sites, mandatory tiny real-P4 protocol preflight,
+  explicit source/LU/provider/device bounds and a
+  <=600s cap; frequency-only diagnostics, never Sigma, a production bank or a
+  trajectory. Review/push/explicit launch approval remain required.
 - `tdagw/test_collision_boundary_cpu.py`: global versus current-density
   empty/filled-subspace boundary diagnostics, with no state repair (CPU).
 - `tdagw/cri3_full_microscopic/`: archived full-native campaign preparation,
@@ -64,6 +77,9 @@ A new test needs no bootstrap import of its own.
 - `test_shared_pole_source_frozen_cpu.py`: exact positive-source to signed
   ordered-W conversion, independent-factor transpose, unequal logical/padded
   counts, and full-rho native FFT Σ against literal sums, including the head once.
+- `test_transition_basis_transport_cpu.py`: reserved transition-space gauge
+  transport with process-local full-mesh placement, full-port action/K/Gram
+  covariance and q/−q crossing; omitted coordinates and capacity refuse.
 - `tdagw/source_frozen_saved_state.py`: verification-only P4 ordered full-matrix
   Σ using SOURCE-FROZEN equilibrium W and saved instantaneous electronic lines.
   No refreshed screening, Hamiltonian fixed point, or trajectory is claimed;
