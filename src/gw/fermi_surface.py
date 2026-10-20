@@ -344,7 +344,8 @@ def intraband_pair_fraction(v_local, delta_e, diag_bra, diag_ket, w_bra, w_ket,
     term takes ``phi``.  A pair moves when either occupation measure gives it
     Fermi-surface weight: the tetrahedron table of the intraband term
     (``w_bra + w_ket > 0``) or the smeared occupation difference that weights
-    it in the interband sum (``f_diff != 0``, whose ``f_diff/Delta -> -f'``).
+    it in the interband sum (``f_diff != 0``, whose ``f_diff/Delta -> -f'``;
+    metals only: an insulator's ``f_diff`` is interband, so it passes ``None``).
     The moved share enters the intraband term once, with the tetrahedron
     weight ``(w_bra + w_ket)/2``.  A pair seen only by ``f_diff`` (both states
     off the T = 0 surface, ``w = 0``) therefore leaves the interband sum and
