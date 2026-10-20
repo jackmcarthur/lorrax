@@ -217,6 +217,20 @@ def test_hf_source_capture_reuses_existing_authenticated_outputs():
     assert hf["basis"] == "source_wfn"
 
 
+@pytest.mark.parametrize("statistics", [None, "unspecified", "physical_adiabatic"])
+def test_snapshot_statistics_guard_precedes_source_setup(monkeypatch, statistics):
+    from tdagw import snapshot_runtime as runtime
+
+    def unexpected_setup(*args, **kwargs):
+        pytest.fail("statistical guard must precede any source preparation")
+
+    monkeypatch.setattr(runtime, "prepare_projected_source", unexpected_setup)
+    options = {} if statistics is None else dict(statistics=statistics)
+    with pytest.raises(ValueError, match="GATE td_collision_statistics"):
+        runtime.snapshot_collision(None, None, mesh=None, k_frac=None,
+                                   b_lo=0, ntr=1, model=None, options=options)
+
+
 def test_joint_fit_refusal_does_not_install_a_snapshot(monkeypatch):
     from common.units import RYD_TO_EV
     from tdagw import collision as C
@@ -244,7 +258,7 @@ def test_joint_fit_refusal_does_not_install_a_snapshot(monkeypatch):
     model = zero_model()
     built = runtime.snapshot_collision(source, ops, mesh=mesh,
         k_frac=source["wfns"].green_parent.plan.k_parent_frac, b_lo=1, ntr=1, model=model,
-        options=dict(hamiltonian="reference", hf_model=model, screening="joint",
+        options=dict(statistics="finite_lag", hamiltonian="reference", hf_model=model, screening="joint",
                      policy=C.RefreshPolicy(every=1.0)), say=lambda _: None)
     held = np.asarray(built["held"]).copy()
     with pytest.raises(ValueError, match="GATE snapshot_fit_error"):
@@ -333,7 +347,7 @@ def test_hf_baseline_and_reference_anchor_ignore_screened_static_mismatch(monkey
     # reduced static term. Only the explicitly supplied bare-HF model may
     # contribute its density increment.
     original = SelfEnergyModel(lambda p, r, t: 7.0 * (r - p[None]), reference, True, "screened red twin")
-    options = dict(hamiltonian=convention, hf_model=zero_model(), policy=C.RefreshPolicy(every=1.0),
+    options = dict(statistics="finite_lag", hamiltonian=convention, hf_model=zero_model(), policy=C.RefreshPolicy(every=1.0),
                    snapshot_tol_ev=1e-8, snapshot_steps=8)
     built = runtime.snapshot_collision(source, ops, mesh=mesh,
         k_frac=source["wfns"].green_parent.plan.k_parent_frac,
@@ -389,7 +403,7 @@ def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head):
     ops = Ops(jax.device_put(np.asarray(source["wfns"].enk)[:, 1:3] * RYD_TO_EV / HA_IN_EV, spec2),
               jax.device_put(rhoeq, spec3), jax.device_put(np.full(4, 0.25), spec1))
     model = zero_model()
-    options = dict(density_rank=1, max_order=48, fit_samples=192, fit_tolerance=2e-3,
+    options = dict(statistics="finite_lag", density_rank=1, max_order=48, fit_samples=192, fit_tolerance=2e-3,
                    adiabatic_ev=0.15, fit_height_ev=0.3, policy=C.RefreshPolicy(every=1.0),
                    # Isolate the coupled HF/Sigma runtime from adaptive
                    # rational fit order changes: both consume the identical
@@ -405,6 +419,9 @@ def test_snapshot_adapter_equilibrium_refresh_and_timing(with_head):
     assert built["state"]["history"][-1]["snapshot"]["iterations"] == 1
     assert len(built["state"]["basis_last"]) == 1
     assert all(row["screening_s"] >= 0.0 for row in built["t0"]["q_receipts"])
+    assert built["t0"]["statistics"] == "finite_lag"
+    assert built["t0"]["screened_equilibrium_fdt"] == "known_not_generally_satisfied"
+    assert built["state"]["history"][-1]["physical_lossless_statistics"] == "not_implemented"
     if not with_head:
         excited = rhoeq[None].copy()
         excited[..., 0, 0], excited[..., 1, 1] = 0.9, 0.1

@@ -324,7 +324,7 @@ def restart_fingerprint(deck: TdDeck, system: TdSystem, model: SelfEnergyModel,
             if v.get(key, default) != default:                       # absent at the default
                 fp["collision"][key] = v[key]
         for key in ("collision_snapshot_steps", "collision_snapshot_tol_ev",
-                    "collision_snapshot_mixing", "collision_snapshot_acceleration", "collision_hamiltonian", "collision_density_rank",
+                    "collision_snapshot_mixing", "collision_snapshot_acceleration", "collision_hamiltonian", "collision_statistics", "collision_density_rank",
                     "collision_pole_order", "collision_projection_order", "collision_pencil_mb",
                     "collision_fit_samples", "collision_fit_real_axis", "collision_fit_tolerance",
                     "collision_adiabatic_ev", "collision_fit_height_ev"):
@@ -602,6 +602,7 @@ def _attach_collision(deck: TdDeck, system: TdSystem, model: SelfEnergyModel, cf
         from tdagw.snapshot_runtime import snapshot_collision
         options = dict(
             screening=v["lorrax.collision_screening"], form=v["lorrax.collision"],
+            statistics=v["lorrax.collision_statistics"],
             hermitian=v["lorrax.collision_hermitian"], policy=policy,
             basis=v["lorrax.collision_basis"],
             hamiltonian=v["lorrax.collision_hamiltonian"],

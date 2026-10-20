@@ -70,6 +70,9 @@ def test_projected_vertex_sampler_matches_full_centroid_bubble_including_frozen_
 
 
 def test_thermal_bubble_residues_obey_bose_fdt():
+    # Bare undamped transition residues only: this is not a screened-W FDT
+    # validation. test_finite_lag_screening_known_equilibrium_fdt_counterexample
+    # in test_keldysh_rational_cpu records the known screened statistical failure.
     energy = np.array([[-0.3, 0.4]])
     beta = 4.0
     f = 1.0 / (np.exp(beta * energy[0]) + 1.0)

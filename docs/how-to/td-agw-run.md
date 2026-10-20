@@ -194,9 +194,17 @@ the polarization, internal lines and column shells. `joint_frozen` provides
 the matched reduced equilibrium-screening control. A small exploratory setup
 is:
 
+Warning: this example explicitly selects a finite-lag statistical **model**,
+not physical equilibrium/lossless GW statistics. Its screened equilibrium FDT
+is known to fail in general, including as the lag decay tends to zero.
+Physical collective initial statistics/adiabatic switch-on are not implemented.
+Without this explicit acknowledgement, active joint modes refuse before GW
+setup. Do not interpret a trajectory as validated physical thermal relaxation.
+
 ```toml
 collision_basis = "instantaneous"
 collision_screening = "joint"
+collision_statistics = "finite_lag"
 collision_hamiltonian = "reference"
 collision_source = ".../04_gw_oneshot_mpa_eqp/oneshot.in"
 collision = "raw"
@@ -221,8 +229,10 @@ collision_adiabatic_ev = 0.05
 collision_fit_height_ev = 0.15
 ```
 
-These are explicit underconverged controls. Converge the adiabatic regulator,
-fit height and collision regularization separately. Compare a zero-field
+These are explicit underconverged controls within that statistical model.
+Vary finite lag decay, fit height and collision regularization separately;
+numerical convergence does not cure the known statistical/FDT failure.
+Compare a zero-field
 trajectory before interpreting pulse decay, and inspect the density spectrum,
 number balance, snapshot residual and response/noise fit errors. `subtracted`
 is available as a separate imposed equilibrium-counterterm model. The
@@ -245,7 +255,7 @@ response and noise checks keep the same tolerances.
 If upper-half-plane fits poorly resolve boundary noise, optionally set
 `collision_fit_real_axis = true`. This also samples the exact bubble at the
 real parts of the complex training supports and includes those values in
-the same joint fit. The declared positive `collision_adiabatic_ev` makes
+the same joint fit. The declared positive finite lag decay `collision_adiabatic_ev` makes
 these boundary samples finite; it is not replaced by a tiny fit offset.
 The real training grid must be disjoint from the real dressed-noise check
 grid, so those check values remain independent and all acceptance gates

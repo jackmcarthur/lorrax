@@ -445,7 +445,10 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     The keyword bundle ``options`` owns numerical controls in eV:
     ``density_rank, max_order, fit_samples, fit_tolerance, adiabatic_ev,
     fit_height_ev, eta_ev, snapshot_steps, snapshot_tol_ev,
-    snapshot_mixing, snapshot_acceleration, screening, form, hermitian, policy, basis``.
+    snapshot_mixing, snapshot_acceleration, screening, statistics, form, hermitian, policy, basis``.
+    ``statistics='finite_lag'`` must be selected explicitly: this statistical
+    model does not generally satisfy screened equilibrium FDT, and is not a
+    validated physical lossless/adiabatic statistical closure.
     ``hamiltonian='hf'`` (default) uses the authenticated absolute
     ``hHF[rho]+MH[rho,H]`` and solves its coherent correction already at
     t0. The supplied DFT density is then explicitly a prepared quench.
@@ -465,6 +468,13 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     from tdagw.tdgw_io import HA_IN_EV
 
     options = dict(options or {})
+    if options.get("statistics", "unspecified") != "finite_lag":
+        raise ValueError("GATE td_collision_statistics: explicitly select statistics='finite_lag'; "
+                         "screened equilibrium FDT is not generally satisfied; "
+                         "physical lossless statistics are not implemented")
+    statistical_status = dict(statistics="finite_lag",
+        screened_equilibrium_fdt="known_not_generally_satisfied",
+        physical_lossless_statistics="not_implemented")
     form, hermitian = options.get("form", "subtracted"), options.get("hermitian", "dynamic")
     mode = options.get("screening", "joint")
     convention = options.get("hamiltonian", "hf")
@@ -578,6 +588,7 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
             c_eq_diag=float(out["c_eq_diag"]), c_eq_offdiag=float(out["c_eq_offdiag"]))
 
     t0 = dict(n=0, t_fs=0.0, why="t0", screening=mode, form=form, hermitian=hermitian,
+              **statistical_status,
               density_rank=prepared["rank"], electronic_bands=prepared["nb"],
               q_receipts=eq["screening_receipts"], setup_s=time.perf_counter() - t_setup,
               orbital_gauge=gauge,
@@ -652,6 +663,7 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
         trace = np.asarray(out["trace"])
         elapsed = (float(t) - state["t_last"]) / fs
         rec = dict(n=state["n"] + 1, t_fs=float(t) / fs, df=float(df), why=why,
+                   **statistical_status,
                    screening=mode, wall_s=time.perf_counter() - wall, snapshot=snapshot,
                    sweep_s=t_swept - wall, build_s=t_built - t_swept,
                    hermitian_s=t_hermitian - t_built,

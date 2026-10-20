@@ -170,6 +170,7 @@ def test_collision_on_a_bundle_parses():
 
 def test_joint_snapshot_controls_parse_and_refuse_invalid_closures():
     deck = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+                                 collision_statistics="finite_lag",
                                  collision_basis="instantaneous", collision_density_rank=8,
                                  collision_snapshot_steps=32, collision_adiabatic_ev=0.05))
     assert deck.values["lorrax.collision_screening"] == "joint"
@@ -179,19 +180,24 @@ def test_joint_snapshot_controls_parse_and_refuse_invalid_closures():
     assert deck.values["lorrax.collision_pencil_mb"] == 128
     assert deck.values["lorrax.collision_fit_real_axis"] is False
     capacity = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+        collision_statistics="finite_lag",
         collision_basis="instantaneous", collision_projection_order=800, collision_pencil_mb=256,
         collision_fit_real_axis=True))
     assert capacity.values["lorrax.collision_projection_order"] == 800
     assert capacity.values["lorrax.collision_pencil_mb"] == 256
     assert capacity.values["lorrax.collision_fit_real_axis"] is True
     reference = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+        collision_statistics="finite_lag",
         collision_basis="instantaneous", collision_hamiltonian="reference"))
     assert reference.values["lorrax.collision_hamiltonian"] == "reference"
     assert _refuses(_bundle(collision="raw", collision_screening="joint",
+        collision_statistics="finite_lag",
         collision_basis="instantaneous", collision_hermitian="none"), "td_collision_snapshot")
     assert _refuses(_bundle(collision="raw", collision_screening="joint",
+        collision_statistics="finite_lag",
         collision_basis="instantaneous", stiff_modes=1), "td_collision_snapshot")
-    assert _refuses(_bundle(collision="raw", collision_screening="joint"),
+    assert _refuses(_bundle(collision="raw", collision_screening="joint",
+                    collision_statistics="finite_lag"),
                     "td_collision_snapshot")
     for key, value in (("collision_snapshot_steps", 0), ("collision_density_rank", 0),
                        ("collision_fit_samples", 3), ("collision_snapshot_mixing", 1.1),
@@ -201,6 +207,20 @@ def test_joint_snapshot_controls_parse_and_refuse_invalid_closures():
                        ("collision_adiabatic_ev", 0), ("collision_fit_height_ev", float("inf")),
                        ("collision_hamiltonian", "screened")):
         assert _refuses(_bundle(collision="raw", **{key: value}), "td_collision_snapshot")
+
+
+@pytest.mark.parametrize("screening", ["joint", "joint_frozen"])
+def test_joint_statistics_requires_explicit_finite_lag_before_setup(screening):
+    raw = _bundle(collision="raw", collision_screening=screening,
+                  collision_basis="instantaneous")
+    assert _refuses(raw, "td_collision_statistics")
+    raw["lorrax"]["collision_statistics"] = "physical_adiabatic"
+    assert _refuses(raw, "td_collision_statistics")
+    raw["lorrax"]["collision_statistics"] = "finite_lag"
+    assert parse_td_deck(raw).values["lorrax.collision_statistics"] == "finite_lag"
+    off = _bundle(collision_screening=screening)
+    assert parse_td_deck(off).values["lorrax.collision_statistics"] == "unspecified"
+    assert parse_td_deck(_bundle(collision="raw")).values["lorrax.collision_statistics"] == "unspecified"
 
 
 def test_population_and_symmetric_comparisons_are_not_propagation_modes():
@@ -254,6 +274,11 @@ def test_collision_keys_inactive_when_off_and_fingerprint():
     assert fp_on["collision"]["lorrax.collision_projection_order"] == 400
     assert fp_on["collision"]["lorrax.collision_pencil_mb"] == 128
     assert fp_on["collision"]["lorrax.collision_fit_real_axis"] is False
+    assert fp_on["collision"]["lorrax.collision_statistics"] == "unspecified"
+    finite_lag = parse_td_deck(_bundle(collision="subtracted", collision_statistics="finite_lag"))
+    fp_lag = json.loads(restart_fingerprint(finite_lag, sysm, model, 0.1))
+    assert fp_lag["collision"]["lorrax.collision_statistics"] == "finite_lag"
+    assert fp_lag != fp_on
     real_fit = parse_td_deck(_bundle(collision="subtracted", collision_fit_real_axis=True))
     fp_real = json.loads(restart_fingerprint(real_fit, sysm, model, 0.1))
     assert fp_real["collision"]["lorrax.collision_fit_real_axis"] is True
@@ -265,6 +290,7 @@ def test_joint_capacity_controls_forward_from_deck_to_runtime(monkeypatch):
     from tdagw import stages, snapshot_runtime
 
     deck = parse_td_deck(_bundle(collision="raw", collision_screening="joint",
+        collision_statistics="finite_lag",
         collision_basis="instantaneous", collision_projection_order=800, collision_pencil_mb=256,
         collision_fit_real_axis=True))
     captured = {}
@@ -282,3 +308,4 @@ def test_joint_capacity_controls_forward_from_deck_to_runtime(monkeypatch):
     assert captured["max_projection_order"] == 800
     assert captured["max_pencil_bytes"] == 256 * 1024 ** 2
     assert captured["real_axis_fit"] is True
+    assert captured["statistics"] == "finite_lag"

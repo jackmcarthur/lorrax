@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-19 — joint collision statistics now require explicit acknowledgement
+
+Active `collision_screening = "joint"` or `"joint_frozen"` decks now refuse
+at `td_collision_statistics` before GW setup unless they explicitly set
+`collision_statistics = "finite_lag"`. The default is `"unspecified"`.
+Collision-off and legacy frozen defaults are unchanged. Restart fingerprints
+include the selection, and joint refresh receipts record the known limitation.
+
+This is a breaking safety guard, not a statistical repair. The implemented
+finite-lag model does not generally satisfy screened equilibrium FDT; an
+exact scalar counterexample retains positive-frequency lesser collective
+weight even as `collision_adiabatic_ev` tends to zero. That historical key
+specifies finite lag decay, not a validated physical adiabatic limit.
+Physical lossless collective statistics/adiabatic switch-on remain
+unimplemented. Select `finite_lag` only for explicitly labelled model
+experiments; do not infer physical thermal GW relaxation from convergence.
+See the [analytic counterexample](docs/theory/td_agw_dynamical.md#damping).
+
 ## 2026-10-19 — TD-aGW collision: column-sampled one-sided MGKBA operator
 
 Collision-enabled propagation replaces the arithmetic average of the row- and
