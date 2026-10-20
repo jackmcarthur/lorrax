@@ -404,6 +404,33 @@ def prepare_native_source(source, mesh):
         flat_grid=flat_grid)
 
 
+def _native_window_support_reads(energy_ry, efermi_ry, plan):
+    """Absolute-eV reads of the CURRENT compact ordered Sigma request.
+
+    Use the same request owner as ``ppm_sigma._ordered_window_lines``.
+    Include its auxiliary zero/clipped tables as well as the actual active
+    shell energies. Internal750-band sums and tail cutoffs add no external
+    evaluation energies; the head provider uses those same active shells.
+    No old protected-window or full-virtual frequency envelope is inferred.
+    """
+    from gw.ppm_sigma import on_shell_request
+    from common.units import RYD_TO_EV
+    energy = np.asarray(energy_ry, dtype=np.float64)
+    efermi = float(efermi_ry)
+    if (energy.ndim != 2 or not energy.size or not np.isfinite(energy).all()
+            or not np.isfinite(efermi)):
+        raise ValueError("GATE td_native_support_reads: finite current active shell energies required")
+    external = (energy-efermi)*RYD_TO_EV
+    request = on_shell_request(e_eval_rel_ev=external, e_dft_rel_ev=external,
+        omega_range_ev=plan["omega_range_ev"], out_of_grid=plan["out_of_grid"],
+        irr_idx=np.arange(energy.shape[0]), n_parent=energy.shape[0])
+    reads = np.unique(np.concatenate((energy.ravel()*RYD_TO_EV,
+                                      (request.frequencies_ry+efermi)*RYD_TO_EV)))
+    if not reads.size or not np.isfinite(reads).all():
+        raise ValueError("GATE td_native_support_reads: current native request has no finite reads")
+    return reads
+
+
 def make_native_snapshot_evaluator(source, prepared, options):
     """Bind full-mu current screening to the production native Sigma window.
 
@@ -443,6 +470,9 @@ def make_native_snapshot_evaluator(source, prepared, options):
     def evaluate(basis, *, equilibrium=False, fit_bases=None):
         wall = time.perf_counter()
         U, e, rho = (np.asarray(basis[k]) for k in ("U", "e", "rho"))
+        # Validate the REAL ordered request before any screening work. Its
+        # supports follow current active shells, not stale SC160 metadata.
+        support_reads = _native_window_support_reads(e, prepared["efermi_ry"], plan)
         # Screening/line owners consume the full native padded carrier.
         # Logical metadata/tail cuts remain capped at nb; inert padding keeps
         # its exact source energy sentinel and zero density/orbitals.
@@ -464,7 +494,7 @@ def make_native_snapshot_evaluator(source, prepared, options):
                     float(options.get("adiabatic_ev", 0.05))/RYD_TO_EV)),
                 eta_ry=float(source["config"].sigma.regularization_ev)/RYD_TO_EV,
                 spm_support_sites_ev=options.get("spm_support_sites", ""),
-                support_reads_ev=source.get("recipe_inputs", {}).get("support_reads_ev"),
+                support_reads_ev=support_reads,
                 fit_tolerance=float(options.get("fit_tolerance", 0.02)))
             if options.get('stop_after_model_q') is not None:
                 snapshot['stop_after_model_q']=int(options['stop_after_model_q'])
