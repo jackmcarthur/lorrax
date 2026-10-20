@@ -1,10 +1,7 @@
-"""Device memory: one price per stage, one room, one admission policy, one receipt
-(MEMORY_MODEL_AUDIT §3).  Platform differences are data in ``lxkit.LEGS``.
-
-:class:`Price` (four sourced terms, ``fixed + spread / P``) -> :func:`book` (a stage's price
-is the sum of its parts; its receipt ``memory <stage>: priced P | measured M | γ``) ->
-:func:`resolve` / :func:`room` -> :func:`admit` (the one policy) -> :func:`sizing` (minimum P).
-Stdlib-only at import; jax is imported lazily.  An instrument never raises."""
+"""Device memory: :class:`Price` (sourced terms, ``fixed + spread / P``) -> :func:`book` (a
+stage's parts; receipt ``memory <stage>: priced P | measured M | γ``) -> :func:`resolve` /
+:func:`room` -> :func:`admit` (the one policy) -> :func:`sizing` (minimum P).  Platform data
+is in ``lxkit.LEGS``; stdlib-only at import; an instrument never raises."""
 
 from __future__ import annotations
 
@@ -17,16 +14,13 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 TERMS = ("operands", "xla", "vendor", "outside")
-#: The census: a figure no compile, query or measurement gives raises GATE memory_unpriced;
-#: :func:`findings` lists terms without provenance (an unpriced allocation is the trace's residual).
+#: The census: an unpriced figure raises GATE memory_unpriced; :func:`findings` lists terms
+#: without provenance.
 STRICT = os.environ.get("LORRAX_MEMORY_STRICT", "") == "1"
-#: Calibrate (and STRICT): priced stages wait on their work and a BFC leg polls, so receipts
-#: are exact.  Production: no wait, no poll, receipts ``~``; the CPU leg reads priced stages only.
-#: ``LORRAX_MEMORY_TRACE=<path>`` (implies calibrate): at every section's open and close and at
-#: its in-section peak, the live arrays (shape, dtype, sharding, bytes per device, the stage
-#: that created them), the allocator's bytes in use and peak, and every executable compiled in
-#: it (``memory_analysis``); JSON Lines per process, one record per closed section as it closes
-#: and the run's receipts at exit, so a late crash keeps every closed section
+#: Calibrate (and STRICT): priced stages wait on their work and a BFC leg polls (exact
+#: receipts); production receipts are ``~``.  ``LORRAX_MEMORY_TRACE=<path>`` (implies
+#: calibrate): each section's live arrays at open, peak and close, the allocator's bytes and
+#: every executable compiled in it, as JSON Lines appended as sections close
 #: (``lxkit.memory_residuals``).
 TRACE = os.environ.get("LORRAX_MEMORY_TRACE", "")
 CALIBRATE = STRICT or bool(TRACE) or os.environ.get("LORRAX_MEMORY_RECEIPTS", "") == "calibrate"
@@ -817,16 +811,15 @@ def sizing(stages: Optional[dict] = None, *, limit_bytes: Optional[float] = None
     grid = legal_ranks()
     if not plans:
         return dict(p=None, nodes=None, binding=None, line="minimum to complete: no priced stage")
-    for k in plans:
-        if need(k, grid[-1]) > limit[k]:
-            price = sum(plans[k].get("parts", {}).values(), Price()) + min(
-                (pr for _, pr in plans[k].get("routes", ())), default=Price(),
-                key=lambda pr: pr.bytes(grid[-1]))
-            term = max(TERMS, key=lambda n: getattr(price, n).fixed)
-            return dict(p=None, nodes=None, binding=k, line=(
-                f"minimum to complete: no P suffices: {k} holds {_gb(getattr(price, term).fixed)}"
-                f"/rank of {term} that no mesh divides ({getattr(price, term).source}) against "
-                f"the {_gb(limit[k])} limit"))
+    for k in (k for k in plans if need(k, grid[-1]) > limit[k]):
+        price = sum(plans[k].get("parts", {}).values(), Price()) + min(
+            (pr for _, pr in plans[k].get("routes", ())), default=Price(),
+            key=lambda pr: pr.bytes(grid[-1]))
+        term = getattr(price, max(TERMS, key=lambda n: getattr(price, n).fixed))
+        return dict(p=None, nodes=None, binding=k, line=(
+            f"minimum to complete: no P suffices: {k} holds {_gb(term.fixed)}/rank of "
+            f"{max(TERMS, key=lambda n: getattr(price, n).fixed)} that no mesh divides "
+            f"({term.source}) against the {_gb(limit[k])} limit"))
     for p in grid:
         if all(need(k, p) <= limit[k] for k in plans):
             nodes = -(-p // per)
