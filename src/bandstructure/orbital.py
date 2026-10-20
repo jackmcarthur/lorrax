@@ -243,7 +243,7 @@ def orbital_totals(parents, energies, sym, *, nelec, width_ry, deps_tol_ry):
 
 
 def path_orbital_moments(parents, sym, window, source_coefficients,
-                         path_coefficients, kpath, kgrid, lattice, mesh,
+                         path_coefficients, kpath, kgrid, geometry, mesh,
                          energies, deps_tol_ry):
     """Wavepacket moments ``(q, 3, band)`` mu_B of the path states.
 
@@ -259,7 +259,7 @@ def path_orbital_moments(parents, sym, window, source_coefficients,
         1, 0), NamedSharding(mesh, P()))
     v_path = gather_to_host(interpolate_band_operator(
         velocity, source_coefficients, path_coefficients, np.asarray(kpath),
-        kgrid, lattice, mesh))[:len(energies)]
+        kgrid, geometry, mesh))[:len(energies)]
     return np.asarray(orbital_moments(v_path, energies,
                                       deps_tol_ry=deps_tol_ry)[0])
 
@@ -293,19 +293,21 @@ def _check_shapes(operator_cart, source_coefficients, kgrid):
 
 
 def interpolate_band_operator(operator_cart, source_coefficients,
-                              path_coefficients, kpath, kgrid, lattice, mesh):
+                              path_coefficients, kpath, kgrid, geometry, mesh):
     """Return (q_carrier,component,band,band) matrices in the path basis.
 
     ``operator_cart`` is (component,k,n,n), ``source_coefficients`` is
     (k,n,rank), and ``path_coefficients`` is (q_carrier,rank,band), exactly
-    as returned by htransform; ``lattice`` (3, 3) bohr rows a_i sets the
-    Wigner–Seitz R images of the off-grid phase sum
-    (``fh_interp.build_ws_R_images_np``).  Matrix elements use bra n, ket m.  The q
+    as returned by htransform; ``geometry`` = ``(lattice_bohr, centroid_frac,
+    basis_at_nodes)`` sets the per-node-pair Wigner–Seitz images of the
+    off-grid sum (``fh_interp.pair_ws_lattice_images``).  Matrix elements use
+    bra n, ket m.  The q
     carrier is cut into passes of one q per device; one ``lax.scan`` runs
     every pass of a component (the phase sum is local on the matrix face,
     one face->q exchange per pass, then the local band rotation).
     """
-    from bandstructure.fh_interp import build_ws_R_images_np, ws_fourier_phase
+    from bandstructure.fh_interp import (lattice_fourier_phase,
+                                         pair_ws_lattice_images)
     _check_shapes(operator_cart, source_coefficients, kgrid)
     rank = int(source_coefficients.shape[2])
     nq_carrier = int(path_coefficients.shape[0])
@@ -319,20 +321,19 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     # Device d holds carrier rows [d*n_pass, (d+1)*n_pass); pass p takes
     # row d*n_pass + p on every device, so no coefficient moves.
     q_tab = np.swapaxes(q_tab.reshape(step, n_pass, 3), 0, 1)
-    R_tab, w_tab = build_ws_R_images_np(kgrid, lattice)
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     batch = NamedSharding(mesh, P(('x', 'y'), None, None))
     exchange = face_to_batch_reshard(mesh)
 
     @partial(jax.jit, out_shardings=NamedSharding(
         mesh, P(('x', 'y'), None, None)))
-    def _scan(q_tab, coefficients, operator_R):
+    def _scan(q_tab, coefficients, operator_R, R_img):
         c_tab = jnp.swapaxes(coefficients.reshape(
             (step, n_pass) + coefficients.shape[1:]), 0, 1)
 
         def one_pass(_, xs):
             q, c = xs
-            phase = ws_fourier_phase(q, R_tab, w_tab)
+            phase = lattice_fourier_phase(q, R_img)
             value = 0.5 * jnp.einsum('qk,kmn->qmn', phase, operator_R)
             value = exchange(jax.lax.with_sharding_constraint(value, face))
             value = value + jnp.conj(jnp.swapaxes(value, -1, -2))
@@ -348,21 +349,26 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     for a in range(operator_cart.shape[0]):
         operator_R = _operator_R(operator_cart[a:a + 1], source_coefficients,
                                  kgrid, mesh)
+        R_img, (operator_img,) = pair_ws_lattice_images(
+            [operator_R], kgrid, *geometry, mesh)
+        del operator_R
+        operator_R = operator_img
         parts.append(jax.block_until_ready(
-            _scan(q_tab, path_coefficients, operator_R)))
+            _scan(q_tab, path_coefficients, operator_R, jnp.asarray(R_img))))
         del operator_R
     return jnp.stack(parts, axis=1)
 
 
-def grid_moments(fH_R, f_params, operator_R_builders, kgrid, lattice, grid,
+def grid_moments(fH_R, f_params, operator_R_builders, kgrid, geometry, grid,
                  n_states, mesh):
     """Energies and band diagonals of the fitted states on a uniform q grid.
 
     Returns ``(E (Nq, n_states) Ry, D (n_op, Nq, n_states), newton
     residual)`` with q in C order over ``grid``.  One pass is one q_z plane:
-    one dense ``(plane, nk)`` phase over the Wigner–Seitz images of the
-    coarse supercell (``lattice`` (3, 3) bohr rows a_i;
-    ``fh_interp.build_ws_R_images_np``), contracted locally on the
+    one dense ``(plane, n_img)`` phase over the per-node-pair Wigner–Seitz
+    images of the coarse supercell (``geometry`` = ``(lattice_bohr,
+    centroid_frac, basis_at_nodes)``; ``fh_interp.pair_ws_lattice_images``),
+    contracted locally on the
     ``(rank, rank)`` face (no dense-grid FFT carrier), and one face->q
     exchange.  The first ``lax.scan`` solves fH on every plane and keeps the
     fitted-state eigenvectors; ``fH_R`` is then deleted (consumed) and each
@@ -370,12 +376,14 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, lattice, grid,
     only when needed, is read by a second scan.  At most one dense
     ``(nk, rank, rank)`` image is resident.
     """
-    from bandstructure.fh_interp import (build_ws_R_images_np, newton_inv,
-                                         ws_fourier_phase)
+    from bandstructure.fh_interp import (lattice_fourier_phase, newton_inv,
+                                         pair_ws_lattice_images)
     a_f, n_f, shift = f_params
     Nx, Ny, Nz = (int(v) for v in grid)
     rank = int(fH_R.shape[-1])
-    R_tab, w_tab = build_ws_R_images_np(kgrid, lattice)
+    R_img, (fH_img,) = pair_ws_lattice_images([fH_R], kgrid, *geometry, mesh)
+    fH_R.delete()
+    fH_R = fH_img
     q_xy = np.stack(np.meshgrid(np.arange(Nx) / Nx, np.arange(Ny) / Ny,
                                 indexing='ij'), axis=-1).reshape(-1, 2)
     Pz = jnp.asarray(np.arange(Nz) / Nz)
@@ -390,7 +398,7 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, lattice, grid,
     def plane(qz, X):
         q = jnp.concatenate([jnp.asarray(q_xy),
                              jnp.full((n_plane, 1), qz)], axis=1)
-        A = 0.5 * jnp.einsum('qk,kab->qab', ws_fourier_phase(q, R_tab, w_tab),
+        A = 0.5 * jnp.einsum('qk,kab->qab', lattice_fourier_phase(q, R_img),
                              X)
         A = pad_axis(A, carrier, axis=0).array
         A = exchange(jax.lax.with_sharding_constraint(A, face))
@@ -424,8 +432,12 @@ def grid_moments(fH_R, f_params, operator_R_builders, kgrid, lattice, grid,
     D = []
     for build in operator_R_builders:
         O_R = build()
-        D.append(jax.block_until_ready(_expect(O_R, V)))
+        R_o, (O_img,) = pair_ws_lattice_images([O_R], kgrid, *geometry, mesh)
         O_R.delete()
+        if not np.array_equal(R_o, R_img):
+            raise RuntimeError('grid_moments: operator and fH image sets differ')
+        D.append(jax.block_until_ready(_expect(O_img, V)))
+        O_img.delete()
     del V
     D = jnp.stack(D)
     # C order over (x, y, z): pass index is z, plane row i*Ny + j.

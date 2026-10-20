@@ -7,7 +7,7 @@ already-selected coarse-grid centroids on the fine grid via the
 standard htransform pipeline:
 
     fH_R       = build_fH_R(ctilde, enk_sigma, kgrid_co)
-    fH_q       = Σ_R w_R(q) fH_R,  w_R = Σ_WS N_R⁻¹ e^{-2πi q·R'}  # one Fourier sum
+    fH_q       = Σ_j e^{-2πi q·R_j} fH_j    (per-pair WS images)  # one Fourier sum
     (lam, c)   = eigh(fH_q)                                  # eigvals f(ε), eigvecs in α-basis
     ψ_n,q(r_μ) = Σ_α c_n,q[α] · B_at_μ[α, s, μ]              # reconstruction
 
@@ -16,13 +16,14 @@ used elsewhere in LORRAX (matching ``load_centroids_band_chunked``),
 ready to drop in as a BSE interpolation input.
 
 This module deliberately stays narrow: it calls the core htransform
-routines (``build_fH_R``, ``build_ws_R_images_np``, ``newton_inv``) and
+routines (``build_fH_R``, ``pair_ws_lattice_images``, ``newton_inv``) and
 adds only the fine-grid k-list construction, the per-q eigh path, and
 the X/Y reshard.
 """
 
 from __future__ import annotations
 
+import hashlib
 import time
 from types import SimpleNamespace
 from functools import partial
@@ -57,9 +58,9 @@ from common.staged_reshard import (
 
 from .fh_interp import (
     build_fH_R,
-    build_ws_R_images_np,
+    lattice_fourier_phase,
     newton_inv,
-    ws_fourier_phase,
+    pair_ws_lattice_images,
     require_newton_converged,
 )
 from distrib_la import eigh_local
@@ -85,8 +86,7 @@ from distrib_la import eigh_local
 #: THE KEY MUST COVER EVERY CLOSED-OVER VALUE, not just the arguments.  The
 #: arguments take care of themselves (jit keys its own cache on avals and
 #: static args); what a stale entry would silently reuse is the CONSTANTS
-#: baked into the trace — ``R_tab``/``w_tab`` (a pure function of ``kgrid_co``
-#: and ``lattice_bohr``), the
+#: baked into the trace — ``R_img`` (the per-pair image lattice vectors), the
 #: mesh, ``rank``, the batch width, the band window's derived extents, the
 #: staged-reshard route, and ``newton_inv``'s (a, n, shift).  Every one of
 #: them is in a key below.  ``distrib_la.mesh_key`` rather than ``id(mesh)``
@@ -327,6 +327,7 @@ def compute_wfns_fi(
     enk_sigma: jax.Array,
     kgrid_co: tuple[int, int, int],
     lattice_bohr: np.ndarray,
+    centroid_frac: np.ndarray,
     kgrid_fi=None,
     band_window_fi: tuple[int, int],
     mesh_xy: Mesh,
@@ -352,8 +353,12 @@ def compute_wfns_fi(
         enk_sigma: (nb, nk_co) DFT band energies in Ry.
         kgrid_co:  (nkx, nky, nkz) coarse uniform k-grid.
         lattice_bohr: (3, 3) real-space lattice, rows a_i in bohr
-                   (``fh_interp.lattice_bohr(wfn)``).  Defines the
-                   Wigner–Seitz R images every off-grid q is evaluated on.
+                   (``fh_interp.lattice_bohr(wfn)``).
+        centroid_frac: (n_μ, 3) fractional coordinates of ``B_at_mu``'s
+                   nodes (``meta.centroid_frac`` from ``initialize_wfns``).
+                   With the lattice, defines the per-node-pair Wigner–Seitz
+                   images every off-grid q is evaluated on
+                   (``fh_interp.pair_ws_lattice_images``).
         kgrid_fi:  (nkx_fi, nky_fi, nkz_fi) fine k-grid; tuple/list/string.
                    Mutually exclusive with ``q_list``.
         band_window_fi: (b_min, b_max) — sub-window of the htransform band
@@ -578,10 +583,13 @@ def compute_wfns_fi(
     # device count (gw_converged_12x12_80ry_2026-07-21 §5, next-step #2).
     rep = NamedSharding(mesh_xy, P())
     B_rep = jax.device_put(B_at_mu, rep)
-    # Wigner–Seitz images of the coarse supercell (host constants, 1/N_deg
-    # weights): the off-grid model is point-group invariant; on the coarse
-    # grid it is the plain sum.  ``fh_interp.build_ws_R_images_np``.
-    R_tab, w_tab = build_ws_R_images_np(kgrid_co, lattice_bohr)
+    # Per-node-pair Wigner–Seitz images of the coarse supercell (host R_img,
+    # face-sharded image stack that REPLACES fH_R): the off-grid model is
+    # point-group covariant; on the coarse grid it is the plain sum.
+    # ``fh_interp.pair_ws_lattice_images``.
+    R_img, (fH_R,) = pair_ws_lattice_images(
+        [fH_R], kgrid_co, lattice_bohr, centroid_frac, B_at_mu, mesh_xy,
+        log_fn=log)
 
     # ── q-points (uniform fine grid or explicit list), padded to batch ───
     if q_list is None:
@@ -668,7 +676,7 @@ def compute_wfns_fi(
     # ── The per-signature key for the jit cache ──────────────────────────
     # Every value the kernels below CLOSE OVER, in one tuple: the mesh (by
     # ``distrib_la.mesh_key``, which carries device identity and not just
-    # extents), ``kgrid_co`` and the lattice (all ``R_tab``/``w_tab`` are), the
+    # extents), ``kgrid_co`` and the image lattice vectors ``R_img``, the
     # matrix extent,
     # the three output extents that ``_qbatch_out_shardings`` and the bundle
     # shardings are built from, and whether the staged reshard primitive
@@ -677,8 +685,8 @@ def compute_wfns_fi(
     # would only split entries that are already correctly split.
     _mesh_id = _mesh_key(mesh_xy)
     _sig = (_mesh_id, tuple(int(v) for v in kgrid_co),
-            tuple(np.round(np.asarray(lattice_bohr, dtype=np.float64), 10)
-                  .ravel().tolist()), int(rank),
+            hashlib.sha1(np.ascontiguousarray(R_img).tobytes()).hexdigest(),
+            int(rank),
             int(nb_fi), int(nspinor), int(n_mu),
             _stage_q is not None, bool(native))
 
@@ -689,7 +697,7 @@ def compute_wfns_fi(
     # instead of being fused away down to the nb_fi columns actually kept
     # (10.1 GiB/device at bs=32 / rank 4452; it killed a 16 × A100-80GB run).
     def _fourier(q, fH_R, batched):
-        """fH_q = Σ_R w_R(q) fH_R over the Wigner–Seitz R images.
+        """fH_q = Σ_j e^{-2πi q·R_j} fH_j over the per-pair WS images.
 
         ``batched``: q is (bs, 3) and the output ends q-SHARDED — the
         ``_kpath_batch`` idiom (htransform.h_transform), one all-to-all after
@@ -706,7 +714,7 @@ def compute_wfns_fi(
         devices), the price of not materialising the matrix.
         """
         if not batched:
-            fH_q = jnp.einsum('k,kij->ij', ws_fourier_phase(q, R_tab, w_tab),
+            fH_q = jnp.einsum('k,kij->ij', lattice_fourier_phase(q, R_img),
                               fH_R)
             grid = _fit(mesh_xy, P('x', 'y'), (rank, rank),
                         "bse_setup.fH_q(one)")
@@ -716,7 +724,7 @@ def compute_wfns_fi(
         bs = int(q.shape[0])
         q = jax.lax.with_sharding_constraint(
             q, _fit(mesh_xy, P(('x', 'y'), None), (bs, 3), "bse_setup.q_batch"))
-        phase = ws_fourier_phase(q, R_tab, w_tab)                      # (bs, nk_co)
+        phase = lattice_fourier_phase(q, R_img)                        # (bs, n_img)
         # fH_R is (i, j)-sharded and the sum runs over R only → local.  Pin the
         # contraction OUTPUT to that same (i, j) layout: left free, XLA
         # materialises the whole (bs, rank, rank) batch on every device before

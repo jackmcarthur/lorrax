@@ -1727,6 +1727,7 @@ def main(argv=None):
         bundle = compute_wfns_fi(
             ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
             kgrid_co=kgrid_co_ct, lattice_bohr=ht.lattice_bohr(wfn),
+            centroid_frac=meta.centroid_frac,
             band_window_fi=(b_min, b_max),
             mesh_xy=mesh_xy, q_list=q_list, a_band_index=args.a_band,
             batch_size=int(params.get("wfn_fi_q_chunk", 0)),

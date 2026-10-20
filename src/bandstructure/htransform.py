@@ -162,6 +162,7 @@ def add_band_character_arguments(parser):
 
 def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
                                wfn_path, params, ctilde, wfn_ctilde,
+                               basis_at_nodes,
                                enk_sigma, meta, result, mesh, input_dir,
                                n_return_bands, a_band, energy_source, report):
     """Spin / orbital path coloring, coarse orbital totals, grid moments.
@@ -198,7 +199,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
     report.heading("Band character and moments")
     log = report.emit
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    lattice = lattice_bohr(wfn)
+    geometry = (lattice_bohr(wfn), meta.centroid_frac, basis_at_nodes)
     nk, nb_fit = int(ctilde.shape[0]), int(ctilde.shape[1])
     band_start = int(result["band_start"])
     # Electrons in the window: the count, less one per (spinor) band below.
@@ -284,7 +285,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         nq = int(kpath_frac.shape[0])
         path_ops = gather_to_host(interpolate_band_operator(
             ops, wfn_ctilde, result["coeffs_on_path"],
-            np.asarray(kpath_frac), kgrid, lattice, mesh))[:nq]
+            np.asarray(kpath_frac), kgrid, geometry, mesh))[:nq]
         expect = np.einsum('qaii->qai', path_ops).real
         extra = {}
         if "orbital" in colors:
@@ -293,7 +294,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
             m_path = path_orbital_moments(
                 parents, sym, slice(band_start, band_start + nb_fit),
                 wfn_ctilde, result["coeffs_on_path"], kpath_frac, kgrid,
-                lattice, mesh, E_path, deps_tol)
+                geometry, mesh, E_path, deps_tol)
             m_n = average_within_degenerate_sets(
                 np.einsum('a,qai->qi', axis, m_path), E_path, deps_tol)
             clip = float(np.percentile(np.abs(m_n), 95))
@@ -337,7 +338,7 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
         builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde,
                             kgrid, mesh) for i in range(3)]
         E, D, residual = grid_moments(
-            fH_R, f_params, builders, kgrid, lattice, grid, n_return_bands,
+            fH_R, f_params, builders, kgrid, geometry, grid, n_return_bands,
             mesh)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
@@ -583,7 +584,9 @@ def main(argv=None):
                                  qp_corrected_band_range=qp_corrected_band_range,
                                  progress_fn=report.progress,
                                  quality_record_fn=_quality_records.append,
-                                 sym=sym, return_coeffs=bool(args.color))
+                                 sym=sym, return_coeffs=bool(args.color),
+                                 basis_at_nodes=B_at_mu,
+                                 centroid_frac=meta.centroid_frac)
         _transform_progress.step()
         _transform_progress.finish()
 
@@ -636,6 +639,7 @@ def main(argv=None):
                     ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
                     kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
                     lattice_bohr=lattice_bohr(wfn),
+                    centroid_frac=meta.centroid_frac,
                     kgrid_fi=params["kgrid_fi"],
                     band_window_fi=(b_min, b_max),
                     mesh_xy=mesh_xy, a_band_index=args.a_band,
@@ -654,6 +658,7 @@ def main(argv=None):
                 velocity=args.velocity and _output_path(args.velocity),
                 wfn=wfn, sym=sym, wfn_path=_wfn_path, params=params,
                 ctilde=ctilde, wfn_ctilde=wfn_ctilde,
+                basis_at_nodes=B_at_mu,
                 enk_sigma=enk_sigma, meta=meta,
                 result=result, mesh=mesh_xy, input_dir=input_dir,
                 n_return_bands=n_return_bands, a_band=args.a_band,

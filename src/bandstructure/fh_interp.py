@@ -6,14 +6,17 @@ f-transform ``f(ε) = shift − a·ε^n``-type map of :func:`f_transform_eigs`,
 which compresses the window's spectrum into a band-limited kernel,
 
     fH(R)   = Σ_k e^{−ik·R} C̃_k f(E_k) C̃_k†          (build_fH_R)
-    fH(k')  = Σ_R Σ_{T∈WS(R)} N_R⁻¹ e^{ik'·(R+LT)} fH(R)   (h_transform, per path k')
+    fH(k')  = Σ_j e^{ik'·R_j} fH(R_j)                  (h_transform, per path k')
     E(k')   = f^{-1}(eig fH(k'))                       (newton_inv)
 
-Off the coarse grid each R class is represented by its Wigner–Seitz images in
-the supercell ``L = diag(kgrid)`` with ``1/N_deg`` weights
-(:func:`build_ws_R_images_np`, :func:`ws_fourier_phase`); every off-grid
-consumer (``h_transform``, ``bse_setup.compute_wfns_fi``, ``orbital``) uses
-that one set.  On the coarse grid it equals the plain sum.
+Off the coarse grid the R classes are represented by per-node-pair
+Wigner–Seitz images ``R_j`` of the supercell ``L = diag(kgrid)``: each
+centroid pair (mu, nu) keeps the images of minimal ``|R + L T + r_mu − r_nu|``
+with ``1/N_deg`` (Wannier90's ``use_ws_distance``), mapped back to the α basis
+(:func:`pair_ws_lattice_images`, :func:`lattice_fourier_phase`).  Every
+off-grid consumer (``h_transform``, ``bse_setup.compute_wfns_fi``,
+``orbital``) uses that one construction; on the coarse grid it equals the
+plain sum.
 
 ``h_transform`` runs that on a k path; ``bandstructure.bse_setup`` runs the
 same fH on a fine grid for the BSE.  The CLI is ``bandstructure.htransform``.
@@ -331,108 +334,230 @@ def build_R_grid_np(kgrid: tuple[int, int, int]) -> np.ndarray:
 
 
 #: Relative tie tolerance on the squared Cartesian length of supercell images
-#: (``build_ws_R_images_np``).  Distinct lattice-vector lengths of a real cell
-#: differ by far more; images related by a point operation agree to rounding.
+#: (``pair_ws_lattice_images``).  Distinct lattice-vector lengths of a real
+#: cell differ by far more; images related by a point operation agree to
+#: rounding.
 WS_TIE_RTOL = 1.0e-6
 
 
 def lattice_bohr(wfn) -> np.ndarray:
     """Real-space lattice ``(3, 3)`` in bohr, ROWS ``a_i`` (``wfn.avec·alat``).
 
-    The one conversion every off-grid Fourier consumer uses to build its
-    Wigner–Seitz images (:func:`build_ws_R_images_np`).
+    With the centroid coordinates, the geometry every off-grid Fourier
+    consumer needs for its per-pair Wigner–Seitz images
+    (:func:`pair_ws_lattice_images`).
     """
     return np.asarray(wfn.avec, dtype=np.float64) * float(wfn.alat)
 
 
-def build_ws_R_images_np(kgrid: tuple[int, int, int], lattice: np.ndarray,
-                         *, tie_rtol: float = WS_TIE_RTOL,
-                         search: int = 2) -> tuple[np.ndarray, np.ndarray]:
-    """Wigner–Seitz images of the coarse-grid lattice vectors, with weights.
+def ws_candidate_images(kgrid: tuple[int, int, int], lattice: np.ndarray,
+                        d_lo, d_hi, *, search: int = 2, max_search: int = 5):
+    """Supercell images that can be minimal for some pair, per R class (host).
 
-    A Γ-centred ``kgrid`` determines ``f(R) = N⁻¹ Σ_k e^{2πik·R} f(k)`` only on
-    the classes ``R + L·T`` of the supercell ``L = diag(kgrid)``.  Off the grid
-    the interpolant must choose representatives, and that choice is the whole
-    off-grid model.  The lattice-coordinate box of :func:`build_R_grid_np`
-    chooses ``R_i ∈ [−n/2, n/2)``: its ``−n/2`` faces have no ``+n/2`` partner
-    and, for a non-cubic metric (FCC, hexagonal), the box is not invariant
-    under the point group, so star members ``Sk`` of an off-grid ``k`` see
-    different R sets (Si 4³→8³: 239 meV star spread of band energies).
+    For class ``R`` (rows of :func:`build_R_grid_np`) the candidates are
+    ``v_T = R + L·T``, ``L = diag(kgrid)``, ``T_i ∈ [−search, search]`` on
+    periodic axes and 0 on singleton ones.  A pair displacement ``d`` (lattice
+    coordinates, componentwise in ``[d_lo, d_hi]``) can select ``v_T`` over the
+    ``d = 0`` minimum ``v_0`` only if ``|v_T|² − |v_0|² ≤ 2 max_d d·G(v_0 − v_T)``
+    (the box maximum of a linear form), so only those are kept.  The search
+    widens until no kept candidate lies on its boundary.
 
-    Here each class keeps EVERY image of minimal Cartesian length
-    ``|(R + L·T)·A|`` (the Wigner–Seitz cell of the supercell) with weight
-    ``1/N_deg`` (Wannier90's ``ndegen``).  The image set is invariant under
-    every lattice point operation and under ``R → −R``, and on the coarse
-    grid ``e^{−2πik·L·T} = 1`` with ``Σ w = 1`` reproduces the box sum
-    exactly.  Axes with a single k point carry no images (slab z, wires):
-    their ``T_i`` is 0, so no phase along them is ever created.
-
-    Parameters
-    ----------
-    kgrid : (3,) int
-        Coarse Γ-centred mesh ``(n1, n2, n3)``.
-    lattice : (3, 3) float
-        Real-space lattice, ROWS ``a_i`` in bohr (:func:`lattice_bohr`).
-    tie_rtol : float
-        Images whose squared length is within ``tie_rtol`` (relative) of the
-        class minimum are degenerate.
-    search : int
-        Supercell translations ``T_i ∈ [−search, search]`` searched per
-        periodic axis; an image found on the search boundary refuses.
-
-    Returns
-    -------
-    R_tab : (nk, n_deg_max, 3) float64
-        Lattice coordinates of the images, class rows in
-        :func:`build_R_grid_np` order (the ``make_flat_k_ifftn`` R index).
-    w_tab : (nk, n_deg_max) float64
-        ``1/N_deg`` on images, 0 on pad slots; every row sums to 1.
+    Returns ``(img (nk, n_t, 3) float64 lattice coords, valid (nk, n_t)
+    bool)``; pad slots are invalid.
     """
     grid = np.asarray(tuple(int(v) for v in kgrid), dtype=np.int64)
     lat = np.asarray(lattice, dtype=np.float64)
     if grid.shape != (3,) or np.any(grid <= 0) or lat.shape != (3, 3):
         raise ValueError(
-            f"build_ws_R_images_np: invalid k grid {tuple(grid)} or lattice "
+            f"ws_candidate_images: invalid k grid {tuple(grid)} or lattice "
             f"shape {lat.shape}")
-    base = build_R_grid_np(tuple(grid))                         # (nk, 3)
-    rng = [np.arange(-search, search + 1) if n > 1 else np.zeros(1)
-           for n in grid]
-    T = np.stack(np.meshgrid(*rng, indexing='ij'), axis=-1).reshape(-1, 3)
-    img = base[:, None, :] + (T * grid)[None, :, :]             # (nk, nT, 3)
-    d2 = np.einsum('kti,ij,ktj->kt', img, lat @ lat.T, img)
-    dmin = d2.min(axis=1, keepdims=True)
-    keep = d2 <= dmin * (1.0 + float(tie_rtol)) + 1e-12 * float(np.trace(
-        lat @ lat.T))
-    on_edge = np.any(np.abs(T) == search, axis=1) & np.any(grid > 1)
-    if np.any(keep & on_edge[None, :] & (search > 0)):
-        raise ValueError(
-            f"build_ws_R_images_np: a minimal image of the {tuple(grid)} "
-            f"supercell lies on the T = ±{search} search boundary; the cell "
-            f"is too skewed for this search radius.  Raise ``search``.")
-    n_deg = keep.sum(axis=1)
-    n_max = int(n_deg.max())
-    R_tab = np.zeros((base.shape[0], n_max, 3), dtype=np.float64)
-    w_tab = np.zeros((base.shape[0], n_max), dtype=np.float64)
+    G = lat @ lat.T
+    lo = np.asarray(d_lo, dtype=np.float64).reshape(3)
+    hi = np.asarray(d_hi, dtype=np.float64).reshape(3)
+    base = build_R_grid_np(tuple(grid))
+    while True:
+        rng = [np.arange(-search, search + 1) if n > 1 else np.zeros(1)
+               for n in grid]
+        T = np.stack(np.meshgrid(*rng, indexing='ij'), axis=-1).reshape(-1, 3)
+        img = base[:, None, :] + (T * grid)[None, :, :]           # (nk, nT, 3)
+        a = np.einsum('kti,ij,ktj->kt', img, G, img)
+        v0 = img[np.arange(img.shape[0]), np.argmin(a, axis=1)]   # (nk, 3)
+        cvec = np.einsum('ij,ktj->kti', G, v0[:, None, :] - img)
+        gain = 2.0 * np.maximum(cvec * lo, cvec * hi).sum(axis=-1)
+        keep = a - a.min(axis=1, keepdims=True) <= gain + 1e-9 * np.trace(G)
+        edge = np.any((np.abs(T) == search) & (grid > 1)[None, :], axis=1)
+        if not np.any(keep & edge[None, :]):
+            break
+        if search >= max_search:
+            raise ValueError(
+                f"ws_candidate_images: candidate images of the {tuple(grid)} "
+                f"supercell reach T = ±{max_search}; the cell or the node "
+                f"spread is too skewed.")
+        search += 1
+    n_t = int(keep.sum(axis=1).max())
+    out = np.zeros((base.shape[0], n_t, 3), dtype=np.float64)
+    valid = np.zeros((base.shape[0], n_t), dtype=bool)
     for r in range(base.shape[0]):
         sel = img[r, keep[r]]
-        R_tab[r, :sel.shape[0]] = sel
-        w_tab[r, :sel.shape[0]] = 1.0 / sel.shape[0]
-    return R_tab, w_tab
+        out[r, :sel.shape[0]] = sel
+        valid[r, :sel.shape[0]] = True
+    return out, valid
 
 
-def ws_fourier_phase(k: jax.Array, R_tab, w_tab) -> jax.Array:
-    """Off-grid Fourier weights ``(..., nk)`` of the Wigner–Seitz R classes.
+def pair_displacement_box(centroid_frac: np.ndarray):
+    """Componentwise range ``(d_lo, d_hi)`` of ``r_mu − r_nu`` (lattice coords)."""
+    r = np.asarray(centroid_frac, dtype=np.float64)
+    span = r.max(axis=0) - r.min(axis=0)
+    return -span, span
 
-    ``Σ_d w_tab[R, d] · exp(−2πi k·R_tab[R, d])`` — the phase row that
-    contracts against an ``(nk, ...)`` lattice image in
-    :func:`build_R_grid_np` order (``fH_R``, operator images).  ``k`` is
-    ``(..., 3)`` fractional; the result is periodic in ``k``, so no wrap of
-    ``k`` is needed or assumed.  Tables come from
-    :func:`build_ws_R_images_np` (host constants).
+
+@partial(jax.jit, static_argnames=('out_sharding',))
+def _pair_ws_weights(s_mu, a_c, valid_c, out_sharding):
+    """Per-pair image weights ``(n_mu, n_mu, n_t)`` for ONE R class.
+
+    ``|R + L T + r_mu − r_nu|² = a_T + 2 (s_mu,T − s_nu,T) + |d|²`` with
+    ``a_T = |R + L T|²`` and ``s_mu,T = r_mu · G (R + L T)``; the ``|d|²`` term
+    is common to every T and drops out of the selection.  Ties within
+    ``WS_TIE_RTOL`` share ``1/N_deg``.  ``(nu, mu)`` sees exactly the negated
+    numbers of ``(mu, nu)``, so the weights of the transposed pair are the
+    images' negatives (Hermiticity is kept bit for bit).
     """
-    arg = jnp.einsum('...x,rdx->...rd', k, jnp.asarray(R_tab))
-    return jnp.einsum('...rd,rd->...r', jnp.exp(-2j * jnp.pi * arg),
-                      jnp.asarray(w_tab, dtype=jnp.float64))
+    d2 = a_c[None, None, :] + 2.0 * (s_mu[:, None, :] - s_mu[None, :, :])
+    d2 = jax.lax.with_sharding_constraint(d2, out_sharding)
+    d2 = jnp.where(valid_c[None, None, :], d2, jnp.inf)
+    dmin = jnp.min(d2, axis=-1, keepdims=True)
+    tol = WS_TIE_RTOL * jnp.max(jnp.where(valid_c, a_c, 0.0))
+    w = (d2 <= dmin + tol).astype(jnp.float64)
+    return w / jnp.sum(w, axis=-1, keepdims=True)
+
+
+def pair_ws_lattice_images(images_R, kgrid, lattice, centroid_frac, B_at_mu,
+                           mesh_xy: Mesh, *, log_fn=None, search: int = 2):
+    """Per-orbital-pair Wigner–Seitz images of α-space lattice tensors.
+
+    The off-grid Fourier sum ``X(k) = Σ_R e^{−2πik·R} X(R)`` of a coarse-grid
+    lattice image is fixed only on the classes ``R + L·T`` (``L =
+    diag(kgrid)``).  ``X(R)`` lives in the delocalized α basis, but its
+    kernel on the centroid nodes,
+
+        K_R = Q X(R) Qᴴ,   Q[(s,mu), α] = B_at_mu[α, s, mu],
+
+    is the operator between ``r_mu + R`` and ``r_nu`` (full-Bloch gauge, the
+    ``make_flat_k_ifftn`` sign), so each node PAIR keeps the images of minimal
+    ``|(R + L T + r_mu − r_nu)·A|`` with weight ``1/N_deg`` (Wannier90's
+    ``use_ws_distance``).  A lattice-coordinate box, or one image set shared
+    by every pair, is not covariant under operations that fold the home cell
+    non-uniformly (Si: 36 of 48 operations, 89 meV off-grid star spread with a
+    shared Wigner–Seitz set); per-pair images are, because the centroid set is
+    orbit closed.  Back in the α basis,
+
+        X(R, T) = S⁻¹ Qᴴ (W_{R,T} ∘ K_R) Q S⁻¹,   S = Qᴴ Q,
+
+    and ``Σ_T X(R, T) = X(R)`` exactly, so every coarse k is unchanged.  A
+    class whose pairs all select one image keeps ``X(R)`` unprojected.
+
+    Parameters
+    ----------
+    images_R : sequence of (nk, rank, rank) arrays, sharded ``P(None,'x','y')``
+        Lattice images in :func:`build_R_grid_np` order (``fH_R``, ``P_A(R)``,
+        band-operator images); all share the masks.
+    kgrid : (3,) int; lattice : (3, 3) bohr rows a_i
+    centroid_frac : (n_mu, 3) fractional node coordinates of ``B_at_mu``.
+    B_at_mu : (rank, ns, n_mu) the α basis at the nodes (replicated).
+
+    Returns
+    -------
+    R_img : (n_j, 3) float64 host — lattice vectors of the kept images.
+    images : list of (n_j, rank, rank), sharded ``P(None,'x','y')``; the
+        off-grid sum is ``Σ_j e^{−2πik·R_img[j]} images[j]``.
+    """
+    lat = np.asarray(lattice, dtype=np.float64)
+    r = np.asarray(centroid_frac, dtype=np.float64)
+    rank, ns, n_mu = (int(v) for v in B_at_mu.shape)
+    if r.shape != (n_mu, 3):
+        raise ValueError(
+            f"pair_ws_lattice_images: centroid_frac {r.shape} does not match "
+            f"B_at_mu's {n_mu} nodes")
+    if ns * n_mu < rank:
+        raise ValueError(
+            f"pair_ws_lattice_images: the α basis (rank {rank}) cannot be "
+            f"recovered from {ns}×{n_mu} node values; per-pair images need "
+            f"rank ≤ ns·n_mu.")
+    G = lat @ lat.T
+    img, valid = ws_candidate_images(
+        kgrid, lat, *pair_displacement_box(r), search=search)
+    a = np.einsum('kti,ij,ktj->kt', img, G, img)
+    face = NamedSharding(mesh_xy, P('x', 'y'))
+    w_sh = NamedSharding(mesh_xy, P('x', 'y', None))
+    rep = NamedSharding(mesh_xy, P())
+    Q = jax.device_put(
+        jnp.reshape(jnp.transpose(jnp.asarray(B_at_mu), (1, 2, 0)),
+                    (ns * n_mu, rank)), rep)
+    # S⁺ on the physical α span: the rank carrier's exact-null mesh pad rows
+    # (zero in B and in every X(R)) are left out, so Σ_T X(R,T) = X(R) holds.
+    S = jnp.einsum('pa,pb->ab', jnp.conj(Q), Q)
+    lam, U = jnp.linalg.eigh(S)
+    s_eig = np.asarray(gather_to_host(lam))
+    cut = 1e-12 * float(s_eig.max())
+    Sinv = jax.device_put(
+        (U * jnp.where(lam > cut, 1.0 / jnp.where(lam > cut, lam, 1.0), 0.0))
+        @ jnp.conj(U).T, rep)
+    s_phys = s_eig[s_eig > cut]
+
+    @partial(jax.jit, out_shardings=face)
+    def _kernel(X):
+        return jax.lax.with_sharding_constraint(
+            jnp.einsum('pa,ab,qb->pq', Q, X, jnp.conj(Q)), face)
+
+    @partial(jax.jit, out_shardings=face)
+    def _project(K, w):
+        Wsp = jnp.tile(w, (ns, ns))
+        Y = jnp.einsum('pa,pq,qb->ab', jnp.conj(Q), Wsp * K, Q)
+        return jax.lax.with_sharding_constraint(Sinv @ Y @ Sinv, face)
+
+    R_out, outs = [], [[] for _ in images_R]
+    n_mixed = 0
+    for c in range(img.shape[0]):
+        s_mu = jnp.asarray(r @ (img[c] @ G).T)                       # (n_mu, n_t)
+        w = _pair_ws_weights(s_mu, jnp.asarray(a[c]), jnp.asarray(valid[c]),
+                             out_sharding=w_sh)
+        used = np.asarray(gather_to_host(jnp.max(w, axis=(0, 1)))) > 0.0
+        full = np.asarray(gather_to_host(jnp.min(w, axis=(0, 1)))) >= 1.0
+        if used.sum() == 1 and full[used].all():
+            t = int(np.flatnonzero(used)[0])
+            R_out.append(img[c, t])
+            for o, X in zip(outs, images_R):
+                o.append(X[c])
+            continue
+        n_mixed += 1
+        Ks = [_kernel(X[c]) for X in images_R]
+        for t in np.flatnonzero(used):
+            R_out.append(img[c, t])
+            wt = w[:, :, t]
+            for o, K in zip(outs, Ks):
+                o.append(_project(K, wt))
+        del Ks
+    stack_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    images = [jax.device_put(jnp.stack(o), stack_sh) for o in outs]
+    R_img = np.asarray(R_out, dtype=np.float64)
+    if log_fn is not None:
+        log_fn(f"  [pair-WS] {img.shape[0]} R classes -> {R_img.shape[0]} "
+               f"per-pair Wigner-Seitz images ({n_mixed} classes split "
+               f"across node pairs; up to {img.shape[1]} candidates/class); "
+               f"node Gram cond {s_phys.max() / s_phys.min():.3e} over "
+               f"{s_phys.size} physical directions ({rank - s_phys.size} "
+               f"null pad; {ns}x{n_mu} node values)")
+    return R_img, images
+
+
+def lattice_fourier_phase(k: jax.Array, R_img) -> jax.Array:
+    """``exp(−2πi k·R_img)`` ``(..., n_j)``: the one off-grid phase row.
+
+    Contracts against the image stacks of :func:`pair_ws_lattice_images`;
+    periodic in ``k``, so no wrap of ``k`` is needed or assumed.
+    """
+    return jnp.exp(-2j * jnp.pi * jnp.einsum('...x,jx->...j', k,
+                                              jnp.asarray(R_img)))
 
 
 def outer_r_shell_mask(kgrid: tuple[int, int, int]) -> np.ndarray:
@@ -1371,6 +1496,11 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
             "fills the key from _DEFAULTS for every deck), or set it "
             "explicitly.  Do NOT default it here.")
     meta.sys_dim = int(params["sys_dim"])
+    # The node coordinates of ``basis.basis_at_nodes`` (the consumed FFT-grid
+    # points, fractional): with ``lattice_bohr(wfn)`` they are the geometry of
+    # every off-grid sum's per-pair Wigner–Seitz images.
+    meta.centroid_frac = (np.asarray(centroid_indices, dtype=np.float64)
+                          / np.asarray(wfn.fft_grid, dtype=np.float64)[None, :])
     nsigmarange, enk_sigma = load_wfns_and_enk_for_sigma(wfn, sym, nval, ncond, nband)
 
     # Optionally override energies with EQP values from a file only if explicitly requested via CLI
@@ -1480,7 +1610,11 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 band_start: int = 0, n_return_bands: int | None = None,
                 qp_corrected_band_range: tuple[int, int] | None = None,
                 progress_fn=None, quality_record_fn=None, sym=None,
-                return_coeffs: bool = False):
+                return_coeffs: bool = False, *, basis_at_nodes,
+                centroid_frac):
+    """``basis_at_nodes`` (rank, ns, n_mu) and ``centroid_frac`` (n_mu, 3)
+    define the per-pair Wigner–Seitz images of every off-grid sum
+    (:func:`pair_ws_lattice_images`)."""
     from time import perf_counter as _perf   # instrument:
     nk = int(meta.nkx * meta.nky * meta.nkz)
     states = ctilde.shape[1]
@@ -1578,10 +1712,14 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
     log_fn(f"  [route] fH_q metric: identity (selected-state Galerkin basis; "
            f"no dense {rank}x{rank} identity object)")
 
-    # Off-grid R set: Wigner–Seitz images of the coarse supercell with 1/N_deg
-    # weights (host constants), so star members of an off-grid k see the same
-    # model.  On the coarse grid this is the box sum exactly.
-    R_tab, w_tab = build_ws_R_images_np(kgrid, lattice_bohr(wfn))
+    # Off-grid images: per node-pair Wigner–Seitz images of the coarse
+    # supercell (pair_ws_lattice_images).  fH_R is consumed; on the coarse
+    # grid the image sum equals the plain R sum exactly.
+    _geometry = (kgrid, lattice_bohr(wfn), centroid_frac, basis_at_nodes)
+    R_img, (fH_img,) = pair_ws_lattice_images(
+        [fH_R], *_geometry, mesh_xy, log_fn=log_fn)
+    fH_R.delete()
+    del fH_R
     timing.record("ht.S_chol", _perf() - _t0)              # instrument:
 
     # ── Kpath-batch processing ───────────────────────────────────────────
@@ -1610,7 +1748,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
 
     def _fourier_matrix(batch_k, operator_R):
         """The one path-q contraction for both fH and active character."""
-        phase = ws_fourier_phase(batch_k, R_tab, w_tab)
+        phase = lattice_fourier_phase(batch_k, R_img)
         mat = 0.5 * jnp.einsum(
             'bk,kij->bij', phase, operator_R, optimize=True)
         mat = jax.lax.with_sharding_constraint(mat, face_ij_shard)
@@ -1754,7 +1892,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         for i in range(0, nq_padded, batch_size):
             if not use_active:
                 batch_result = _kpath_batch(
-                    wrapped_k[i:i+batch_size], fH_R)
+                    wrapped_k[i:i+batch_size], fH_img)
                 if return_coeffs:
                     lambda_q_list.append(batch_result[0])
                     # Retain every physical candidate until the transformed
@@ -1768,7 +1906,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 jax.block_until_ready(batch_result)
             else:
                 batch_eigenpairs = _fH_kpath_batch(
-                    wrapped_k[i:i+batch_size], fH_R)
+                    wrapped_k[i:i+batch_size], fH_img)
                 physical_eigenpairs.append(batch_eigenpairs)
                 jax.block_until_ready(batch_eigenpairs)
             _path_progress.step()
@@ -1778,11 +1916,15 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             # release timing to refcounts and could overlap the 13.18-GiB
             # fH_R and P_A(R) shards at MoS2-72.  The retained fitted-state
             # eigenpairs are O(nq*rank*states), not O(nk*rank^2).
-            fH_R.delete()
-            del fH_R
+            fH_img.delete()
+            del fH_img
             active_R = restore_from_host(active_R_spill)
             jax.block_until_ready(active_R)
             del active_R_spill
+            _, (active_img,) = pair_ws_lattice_images(
+                [active_R], *_geometry, mesh_xy)
+            active_R.delete()
+            active_R = active_img
             log_fn(
                 "  [route] released fH_R before active_R restore; scoring "
                 "retained fitted-state eigenspaces in a second path pass")
