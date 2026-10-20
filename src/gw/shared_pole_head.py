@@ -3,17 +3,20 @@
 Only Gamma is evaluated, one frequency at a time. The common head owner
 folds its wings and the common MPA owner fits the resulting scalar samples.
 
-The head is the charge head on scalar (N_spinor = 1) and two-component
-(N_spinor = 2) stores alike: the Coulomb kernel couples the charge density
-only, so every vertex is the spin-traced pair density
+The head is the charge head on scalar (N_spinor = 1), two-component
+(N_spinor = 2) and four-component (N_spinor = 4, the bare-transverse route's
+restricted-kinetic-balance carrier) stores alike: the Coulomb kernel couples
+the charge density only, so every vertex is the spin-traced pair density
 ``rho_ij(mu) = sum_s conj(psi_is(mu)) psi_js(mu)`` (traced inside
 ``gw.qsgw_head.head_wings_sharded``), the velocity is the spinor-traced matrix
-element, the capacity is ``2/(n_spin n_spinor)`` states per band, and the body
-is the spin-traced charge operator on ``n_mu x n_mu`` (factor spin axis 1).
-Nothing crosses the body, so the fold ``S + Y W Z / Omega`` is one contraction
-on both stores. Certified by ``tests/test_shared_pole_head_two_component.py``
-(a spin-doubled two-component store reproduces the scalar head; a global SU(2)
-rotation leaves it invariant).
+element on the same carrier (``scalar_head_bispinor``), the capacity is
+``2/(n_spin n_spinor)`` states per band with ``n_spinor`` the source WFN's,
+and the body is the spin-traced charge operator on ``n_mu x n_mu``
+(``file_io.shared_pole_store.charge_representation``).  Nothing crosses the
+body, so the fold ``S + Y W Z / Omega`` is one contraction on every store.
+Certified by ``tests/test_shared_pole_head_ordered_fold.py`` (the wings of a
+four-component carrier equal the spin-traced Lehmann sum and are invariant
+under a global U(4) rotation of its components).
 
 An ordered store (measured broken time reversal, ``scalar-ordered-ph``)
 takes the same fold with its signed forms.  Its Gamma body is the store's
@@ -139,46 +142,6 @@ def _realized_gamma_body(mesh, realize, route, ordered=False):
     return evaluate
 
 
-def refuse_unsupported_shared_pole_head(config, *, nspinor):
-    """Refuse, at input resolution, a full shared-pole head the Gamma body cannot evaluate.
-
-    Called once from ``gw_jax._load_system_inputs`` right after the WFN
-    symmetry is final and before any basis, bank or constructor exists.  The
-    same refusal used to fire inside :func:`build_shared_pole_head`, after
-    the bank, moments and constructor had run and ``model.h5`` was committed,
-    so a rerun in that directory then refused on the committed model (Q0HEAD
-    2026-09-16).  ``nspinor`` is the source WFN's. The
-    bare-transverse shared-pole route stores its charge operator on the
-    four-component carrier, so its preflight must use that store extent.
-    """
-    from .gw_config import HeadCorrection, uses_bare_transverse_shared_pole
-    if (config.sigma.w_model != "shared_pole"
-            or config.head.correction is not HeadCorrection.FULL):
-        return
-    store_nspinor = (4 if (bool(getattr(config, "bispinor", False))
-                          and uses_bare_transverse_shared_pole(config)) else nspinor)
-    _refuse_head_representation(nspinor=store_nspinor)
-
-
-def _refuse_head_representation(*, nspinor):
-    """The one owner of what the full Gamma head evaluates: the scalar charge body.
-
-    ``nspinor`` 1 or 2 is the charge representation (module docstring): the
-    two-component store holds the same spin-traced charge operator and its
-    head vertices trace the spinor index, so both evaluate identically. The
-    four-component charge carrier has no certified scalar wing/body fold.
-    The full photon layout has a separate Gamma completion.  Either store
-    representation folds, insulator or metal (module docstring).
-    """
-    if int(nspinor) not in (1, 2):
-        raise ValueError(
-            f"GATE shared_pole_head_nspinor: got N_spinor = {int(nspinor)}; want 1 or 2 (the "
-            "certified full-head representations); why: the four-component charge "
-            "carrier has no certified scalar wing/body fold. Use head_correction = "
-            "no_local_fields for its direct Gamma head, or head_correction = off "
-            "for a headless development deck.")
-
-
 def shared_pole_head_plan(config, recipe, *, material_class):
     """Use the MPA sample-plan owner on the current logical energy span.
 
@@ -207,10 +170,11 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     """
     from file_io.shared_pole_store import open_shared_pole_model, read_shared_pole_matrix
     from .gw_config import HeadCorrection
-    from .mpa.model import fit_head_samples
+    from .mpa.model import fit_head_samples, head_moment_report
     from .mpa.sample_plan import plan_z
     from .qsgw_head import (IterationHeadSamples, finalize_iteration_head_rows,
-                            iteration_head_sample_terms, metal_response_nodes)
+                            head_moment_m1, iteration_head_sample_terms,
+                            metal_response_nodes)
     from .response_bank import _reserve
     from .qgrid_symmetry import shared_pole_operator_realizer
     import distrib_la
@@ -237,10 +201,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
             from file_io.shared_pole_store import validate_shared_pole_model
             header = validate_shared_pole_model(handle["path"], expected_identity=handle["identity"],
                 mesh_xy=mesh_xy, capacity=ledger)
-        # Decks are refused at input resolution (refuse_unsupported_shared_pole_head);
-        # this re-reads the same owner on the store actually opened.
         ordered = str(header.get("representation", "")) != "scalar-trs-even-s"
-        _refuse_head_representation(nspinor=int(header["nspinor"]))
         parents = np.flatnonzero(np.asarray(header["q_irr_full_idx"]) == 0)
         if len(parents) != 1:
             raise ValueError("GATE shared_pole_head: expected one Gamma parent")
@@ -327,9 +288,14 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
                   file=sys.stderr, flush=True)
     with timing.section("head.mpa_fit", announce=True,
                         label="shared-pole head pole fit"):
+        # The rows past the fit nodes include the imaginary-axis moment rule,
+        # folded through this same exact Gamma body (qsgw_head.head_moment_m1).
         head = fit_head_samples(samples[:len(z)], z, int(config.mpa.n_poles),
             model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
-            solve=config.mpa.pole_solver, occupation_state=occupation_state)
+            solve=config.mpa.pole_solver, occupation_state=occupation_state,
+            moment_m1=head_moment_m1(samples, points, metal=material_class == "metal"))
+    if jax.process_index() == 0:
+        print(head_moment_report(head), file=sys.stderr, flush=True)
     head.update(identity=handle["identity"], body_digest=handle["digest"], completion=True)
     iteration = IterationHeadSamples(omegas=points, samples=tuple(samples),
         sigma_energies_ry=np.asarray(wfns.enk[:, wfns.slices.sigma]),

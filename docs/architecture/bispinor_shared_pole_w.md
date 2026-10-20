@@ -134,7 +134,7 @@ endpoint block is cut exactly as a sector read cuts it, so the producer selects
 on the bits the constructor reads.
 
 Every map builds its own static contact $\Pi_{\rm FD}(0,0)$. Under
-`head_correction = no_local_fields` the bank adds the direct Γ head field
+`head_correction = full` the bank adds the direct Γ head field
 $W_h - V_h$ to every sample through the packed $\zeta(G=0)$ vectors, so the fitted
 CC, CT, TC and TT poles carry the head
 ([four-current heads §5](../theory/four-current-head-corrections.md#direct-bulk-head)).
@@ -455,9 +455,8 @@ exchange Σ_x is its own owner's ([four-current wiring](four_current_wiring.md))
 
 | `head_correction` | what Σ receives |
 |---|---|
-| `no_local_fields` (the default) | the direct Γ head, already inside the sector poles (§3); the consumer adds no head term. A store without it refuses (`GATE shared_pole_sector_head`, `src/gw/sigma_dispatch.py:885`). |
+| `full` (the default) | the direct Γ head, already inside the sector poles (§3); the consumer adds no head term. No local-field fold exists for the four-current bank, and the run record says so. A store without the head refuses (`GATE shared_pole_sector_head`, `src/gw/sigma_dispatch.py`). |
 | `off` | no head; a debug setting |
-| `full` | refused at configuration (`GATE full_shared_pole_head`): no wing/body local-field fold exists for this route |
 
 **Factor placement.** One class is live at a time. Its factors are placed by the
 scalar schedule with the class's extents $(n_A, n_B)$

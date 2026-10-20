@@ -22,10 +22,10 @@ the incumbent and shared-pole hybrid take the scalar charge head (§3) and
 the bare TT overlay (§2.1); `full_shared_pole` takes the direct head (§5).
 
 **Heads are always on** ([decisions, 2026-09-01](../architecture/decisions.md)).
-`head_correction = off` is a DEBUG skip with a loud banner on every route.
-`no_local_fields` refuses on every bispinor route except the two shared-pole
-ones, where it selects the direct head. No other key moves the head or the
-route.
+`head_correction = off` is a DEBUG skip with a loud banner on every route;
+`full` is the only other value. On `full_shared_pole` it is the direct sector
+head (§5), with no local-field fold on the four-current bank. No other key
+moves the head or the route.
 
 Every bispinor deck also carries the transverse direct field
 $\langle m|\alpha\cdot A|n\rangle$ ([Direct Hartree field](hartree.md)).
@@ -150,9 +150,12 @@ S^{\rm eff}_{ab}(\omega)=S_{ab}(\omega)+\frac1\Omega\,Y^a(\omega)\,W_{\rm body}(
 $$
 
 On a two-component store the centroid leg is the spin-traced pair density
-and $n_{\rm spinor}=2$, so the fold is one contraction on both stores.
-`head_correction = full` applies it once, `no_local_fields` skips it (the
-direct head), and `off` removes the Γ contribution.
+and $n_{\rm spinor}=2$, so the fold is one contraction on both stores. The
+`bare_transverse` four-component RKB carrier is the same: the body, the
+centroid leg $\sum_{s=1}^{4}\overline{\psi_{is}}\psi_{js}$ and the velocity
+are spin-traced on that one carrier, and $n_{\rm spinor}$ in the capacity is
+the source WFN's ($=2$). `head_correction = full` applies the fold once and
+`off` removes the Γ contribution.
 
 The head samples are cell averages of the bare and screened kernels
 (`vcoul.<kernel>.q0_average`):
@@ -358,7 +361,7 @@ form, so they stay in the $(\mu,\nu)$ representation on every route.
 
 ## 5. The direct first-order head (`full_shared_pole`) {#direct-bulk-head}
 
-`full_shared_pole` with `head_correction = no_local_fields` completes the
+`full_shared_pole` with `head_correction = full` completes the
 ordered sector bank with a direct Γ head
 (`gw.photon_direct_head.build_direct_photon_head`) for `sys_dim = 3` or
 `2` (§5.1). A metal needs the current map's Fermi–Dirac occupations; an

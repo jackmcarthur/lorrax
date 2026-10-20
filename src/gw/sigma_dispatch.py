@@ -937,13 +937,12 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
         fit_path = handle["path"]
         fit_identity, fit_digest = handle["identity"], handle["digest"]
         if handle.get("representation") == "sector-ordered-ph":
+            # head_correction = full is the bank's direct sector head (no
+            # local-field fold exists for the four-current bank).
             policy = getattr(head_correction, "value", head_correction)
-            if policy == "no_local_fields":
-                if handle.get("direct_photon_head") != "first_order_cc_ct_tc_tt":
-                    raise ValueError("GATE shared_pole_sector_head: direct four-current Γ is absent from the sector bank")
-            elif policy != "off":
-                raise NotImplementedError(
-                    "GATE shared_pole_sector_head: full photon Γ with local fields is unavailable")
+            if (policy != "off"
+                    and handle.get("direct_photon_head") != "first_order_cc_ct_tc_tt"):
+                raise ValueError("GATE shared_pole_sector_head: direct four-current Γ is absent from the sector bank")
             return fit_path, None, fit_identity, fit_digest
         if getattr(head_correction, "value", head_correction) != "off":
             head_fit_path = W_by_role.get("mpa_head")

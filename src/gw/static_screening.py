@@ -49,7 +49,6 @@ def build_static_screened_w(wfns, V_q, *, config, meta, mesh_xy, sym=None,
         response = build_dft_head_response(
             wfns, np.asarray([0.0j]), input_dir=config.input_dir,
             mesh=mesh_xy, wfn=head_resolver.wfn, meta=meta, config=config,
-            wings=config.head.correction is HeadCorrection.FULL,
             occupation_state=occupation_state)
     roles = compute_screening(
         wfns, V_q, [request], quad=quad, e_ref=e_ref,

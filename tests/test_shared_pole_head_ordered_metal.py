@@ -247,7 +247,7 @@ def test_c_shifted_origin_is_the_folded_thomas_fermi_row(mesh):
     assert _rel(S[origin], S_np) < 1.0e-12, _rel(S[origin], S_np)
     vc0, (wc0,) = compute_q0_averages_screened(
         wfn, meta, [S_np], extra_chi_rows=_extra_chi_rows(
-            [("constant", -kappa2_np / (8.0 * np.pi))], None))
+            [("constant", -kappa2_np / (8.0 * np.pi))]))
     want = complex(wc0) - complex(vc0)
     assert abs(Wc[origin] - want) <= 1.0e-10 * max(1.0, abs(want)), (Wc[origin], want)
     # The row is Thomas-Fermi, W_h = <8 pi/(q.eps.q + kappa^2)> <= 8 pi/kappa^2,

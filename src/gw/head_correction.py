@@ -1404,7 +1404,7 @@ class HeadResolver:
 
     __slots__ = ("_params", "_input_dir", "_wfn", "_sym", "_meta",
                  "_print_fn", "_cache", "_direct_cache", "_policy",
-                 "_screened")
+                 "_folded")
 
     def __init__(self, config, input_dir, wfn, sym, meta, print_fn,
                  q0_certificate_fn=None, mesh=None):
@@ -1433,10 +1433,14 @@ class HeadResolver:
             "_q0_certificate_fn": q0_certificate_fn,
             "_mesh": mesh,
         }
-        from gw.gw_config import coerce_head_correction
+        from gw.gw_config import coerce_head_correction, uses_full_bispinor_shared_pole
         self._policy = coerce_head_correction(
             getattr(head, "correction", "full"))
-        self._screened = bool(getattr(config, "do_screened", True))
+        # ``at`` serves the once-folded head on a screened run; the
+        # four-current sector bank's head is its direct sector head, so
+        # there the scalar slot (the bare exchange) reads the direct sample.
+        self._folded = (bool(getattr(config, "do_screened", True))
+                        and not uses_full_bispinor_shared_pole(config))
         self._input_dir = input_dir
         self._wfn = wfn
         self._sym = sym
@@ -1455,7 +1459,7 @@ class HeadResolver:
         return self._wfn
 
     def direct_at(self, omega) -> HeadSample:
-        """Return the configured no-local-field/direct diagnostic sample."""
+        """Return the direct (unfolded) head sample at ``omega``."""
         key = self._cache_key(omega)
         cached = self._direct_cache.get(key)
         if cached is not None:
@@ -1509,8 +1513,7 @@ class HeadResolver:
         if direct.response_kind is HeadResponseKind.OVERRIDE:
             self._cache[key] = direct
             return direct
-        if (self._policy is HeadCorrection.NO_LOCAL_FIELDS
-                or not self._screened):
+        if not self._folded:
             self._cache[key] = direct
             return direct
         raise RuntimeError(

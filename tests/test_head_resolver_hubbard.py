@@ -33,7 +33,7 @@ def _config(hubbard_input, hubbard_occupations):
     head = SimpleNamespace(
         wcoul0_source="s_tensor", wcoul0_eta=0.0, vhead=None,
         whead_0freq=None, whead_imfreq=None, head_minibz_average=False,
-        bgw_metal_q0_treatment=None, correction="no_local_fields")
+        bgw_metal_q0_treatment=None, correction="full")
     return SimpleNamespace(
         head=head, bispinor=False, bispinor_gw="bare_transverse",
         nval=4, ncond=4, nband=8, do_screened=True,

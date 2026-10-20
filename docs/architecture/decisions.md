@@ -12,6 +12,27 @@ The GW driver's phase invariants and the per-function contracts of
 `gw.gw_config` are developer reference, not rulings:
 [GW driver and configuration contracts](../dev/gw_config_contracts.md).
 
+## 2026-10-20 — One q→0 head prescription; `no_local_fields` is deleted {#one-head}
+
+**Rule (owner).** The head is the folded head, `head_correction = full`: the
+direct head (on the dense k set when `head_dense_file` is given) plus the GW
+mesh's wing fold through W(Γ), on metals and insulators. `off` stays as the one
+documented debug value (the CD route, the TD-aGW SPM member and head-off
+convergence arms need it). On `bispinor_gw = full_shared_pole`, `full` is the
+existing direct sector head, and the run record states "no local-field fold on
+the four-current bank". The shared-pole `bare_transverse` four-spinor charge
+carrier folds like the scalar store: its charge operator, wing vertices and
+velocity are spin-traced on the same carrier (`gw.shared_pole_head` docstring).
+
+**Why.** Local fields move the head's gap part `v/ε_M` by `v·Δ(1/ε_M)`: on Si
+4³ the dense head goes from ε_M 13.5 (unfolded) to 12.3 (folded), about 21 meV
+of the gap. A deck dial that drops them is not a prescription.
+
+**Licenses deleting.** `HeadCorrection.NO_LOCAL_FIELDS`, its default under
+`full_shared_pole`, `GATE full_shared_pole_head`, `GATE
+bispinor_head_correction_no_local_fields_unavailable`, `GATE
+shared_pole_head_nspinor`, and the `wings=False` direct-only head builds.
+
 ## 2026-10-08 — One memory rule sets the device budget and the pool {#headroom}
 
 **Rule (owner).** From the card total `M` and the bytes outside the pool
@@ -457,7 +478,7 @@ limit: the missing head is a finite-grid term, so the headless map is judged
 by its own convergence. The Gram gate is unchanged; a headless run may still
 refuse at `GATE shared_pole_gram_valid`. An ordered (time-reversal-broken)
 store refused `head_correction = full` (`GATE shared_pole_head_ordered`) and
-carried the direct head (`no_local_fields`) instead; since 2026-10-19 it folds
+carried the direct head (the since-deleted `no_local_fields`) instead; since 2026-10-19 it folds
 the signed body and Lehmann wings, and since 2026-10-20 an ordered metal does
 too ([metal head §5](../theory/metal-q0-head.md#5-limits-of-the-model)).
 
@@ -595,10 +616,8 @@ with a disposition and rejects new local pad arithmetic.
 A static COHSEX calculation with `bispinor = true` always includes the Γ-cell
 head corrections; no mode may require them off or drop them silently.
 `head_correction = off` exists for brute-force k-grid convergence studies and
-prints `WARNING -- DEBUG` into the run record. `no_local_fields` is refused on
-every bispinor deck except the shared-pole direct-head routes, because the
-coupled solve has no scalar diagnostic head
-(`GATE bispinor_head_correction_no_local_fields_unavailable`).
+prints `WARNING -- DEBUG` into the run record. `full` and `off` are the only
+values ([2026-10-20](#one-head): `no_local_fields` deleted).
 
 **Why.** The charge head is a leading finite-grid term that decays only as
 `N_k^{-1/2}` in 2D. A screened bispinor mode that omits it is less complete

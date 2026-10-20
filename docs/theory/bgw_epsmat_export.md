@@ -285,8 +285,7 @@ $$
 $$
   from the stored `S_cart_head` ($v(q_0)$ the truncated $8\pi/|q_0|^2$ in Ry bohr³,
   without 1/Ω). With a `head_schur` bundle $S=S_{\rm eff}$ and (E8) already IS the
-  local-field head (E11); with `head_correction = no_local_fields` it is the direct
-  head. The body is $(\varepsilon_{bb})^{-1}$: in 2D the q → 0 limit, in 3D missing
+  local-field head (E11). The body is $(\varepsilon_{bb})^{-1}$: in 2D the q → 0 limit, in 3D missing
   the O(1) term of (E13), so a `sys_dim = 3` export refuses (`GATE epsmat_q0_body_3d`)
   unless `q0_body_3d = omit_head_wing`. `q0_head = unscreened` writes 1.
 

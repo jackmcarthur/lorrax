@@ -404,38 +404,6 @@ def _atom_kernel(q, z, u):
     return g, dg
 
 
-def _density_response(q, zs, w_blocks, u_blocks):
-    """``sum_s W_s x_s / (z - x_s)`` at every ``z`` of ``zs`` [Z], ``x_s = q.u_s``: [Z, nq].
-
-    One atom block per scan step, every frequency in the same step (a metal
-    head averages ~20 rows on one mini-BZ draw). ``x`` is real, so each term
-    is ``x (d - i b) / (d^2 + b^2)`` with ``d = Re z - x``, ``b = Im z``: one
-    real division instead of a complex128 division, which cost 2.9x as much
-    on an A100 (2^18 q x 1920 atoms x 17 rows x 10 draws: 2.22 s -> 0.77 s;
-    round-off, 7e-16 relative). ``x`` is formed by broadcasting rather than a
-    K = 3 GEMM and the weighted atom sum is one complex reduction, so each
-    block is one fused elementwise-reduce kernel that never writes its
-    ``(Z, nq, block)`` table to device memory. A resting atom (``x = 0``)
-    contributes zero, as in :func:`_atom_kernel`.
-    """
-    import jax
-    import jax.numpy as jnp
-
-    a, b = jnp.real(zs)[:, None, None], jnp.imag(zs)[:, None, None]
-
-    def one(total, block):
-        w, u = block
-        x = (q[:, 0, None] * u[None, :, 0] + q[:, 1, None] * u[None, :, 1]
-             + q[:, 2, None] * u[None, :, 2])[None]
-        d = a - x
-        scale = jnp.where(x != 0, w[None, None, :] * x / (d * d + b * b), 0.0)
-        return total + jnp.sum(jax.lax.complex(scale * d, -scale * b), axis=-1), None
-
-    total, _ = jax.lax.scan(one, jnp.zeros((zs.shape[0], q.shape[0]), jnp.complex128),
-                            (w_blocks, u_blocks), unroll=1)
-    return total
-
-
 def _four_current_response(q, z, w_blocks, u_blocks, halfalpha):
     import jax
     import jax.numpy as jnp
@@ -461,17 +429,6 @@ def _four_current_response(q, z, w_blocks, u_blocks, halfalpha):
     return total
 
 
-_DENSITY_PROGRAM = []
-
-
-def _density_program():
-    """The one jitted scalar intraband program (traced once per shape)."""
-    if not _DENSITY_PROGRAM:
-        import jax
-        _DENSITY_PROGRAM.append(jax.jit(_density_response))
-    return _DENSITY_PROGRAM[0]
-
-
 class FermiSurfaceIntraband:
     r"""Velocity atoms of a metal's intraband (Fermi-surface) response.
 
@@ -486,9 +443,11 @@ class FermiSurfaceIntraband:
     velocity spread.  That keeps the zeroth, first and second moments
     exact state by state, so ``sum W u u^T`` is the Drude tensor of
     ``gw.qsgw_head.head_drude_tensor_sharded`` and both limits hold:
-    ``-N0`` static, ``q.D.q/z^2`` for ``|z| >> q u``.  Both metallic heads
-    (``gw.qsgw_head``, ``gw.photon_direct_head``) take their intraband
-    response here.  Atoms are replicated: bytes ``O(4 N_FS)``.
+    ``-N0`` static, ``q.D.q/z^2`` for ``|z| >> q u``.  The four-current
+    sector head (``gw.photon_direct_head``) takes its intraband response
+    here; the scalar head (``gw.qsgw_head``) reads only ``drude_tensor``
+    (generalized Drude, ``qsgw_head.drude_memory_damping``) and ``N0`` (its
+    Thomas-Fermi row).  Atoms are replicated: bytes ``O(4 N_FS)``.
     """
 
     def __init__(self, surface_kn, velocity_diag, spread_kn, drude_tensor, *,
@@ -543,18 +502,6 @@ class FermiSurfaceIntraband:
         return (f"{self.n_states} Fermi-surface states, {self.n_split} split by their "
                 f"intraband partners, {self.weights.size} velocity atoms; "
                 f"|sum W u u - D| = {self.moment_error:.2e}")
-
-    def density_response(self, q_cart, z):
-        """Scalar ``chi_intra(q,z)`` at every row of ``q_cart (nq,3)``."""
-        return self.density_response_rows(q_cart, (z,))[0]
-
-    def density_response_rows(self, q_cart, zs):
-        """Scalar ``chi_intra(q,z)`` [Z, nq] at every ``z`` of ``zs`` and row of ``q_cart (nq,3)``."""
-        import jax.numpy as jnp
-        return _density_program()(
-            jnp.asarray(q_cart, jnp.float64),
-            jnp.asarray(np.asarray([complex(z) for z in zs], np.complex128)),
-            jnp.asarray(self._blocks[0]), jnp.asarray(self._blocks[1]))
 
     def device_operands(self):
         """Replicated ``(w_blocks, u_blocks)`` for jitted callers."""

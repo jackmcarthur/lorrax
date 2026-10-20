@@ -508,8 +508,7 @@ class SCMapScreeningArtifacts:
     These three values belong to the same map evaluation, and the static
     terms are the exact ones passed to that map's Sigma build.  Under FULL,
     the head and terms are folded through this map's exact static/probe W
-    role table.  Under NLF they deliberately remain independent of the W
-    body.  Keeping the artifacts together prevents a restart writer from
+    role table.  Keeping the artifacts together prevents a restart writer from
     pairing a final head with a seed/previous W.  Only the static W is
     retained; probe-frequency W is not restart-owned and must not survive
     the map.
@@ -2325,9 +2324,11 @@ def _sc_head_frequency_plan(
         if getattr(config, "head", None) is not None and config.head.correction is not HeadCorrection.OFF:
             from .shared_pole_head import shared_pole_head_plan
             from .mpa.sample_plan import plan_z
+            from .qsgw_head import head_quadrature_omegas
             plan = shared_pole_head_plan(config, shared_pole_recipe,
                                           material_class=material_class)
-            points = list(map(complex, plan_z(plan)))
+            # The fit nodes, then the head's imaginary-axis moment rule.
+            points = list(map(complex, plan_z(plan))) + list(head_quadrature_omegas(config))
             if bool(config.do_G0) and 0j not in points:
                 points.append(0j)
             return requests, plan, points
@@ -2362,8 +2363,10 @@ def _sc_head_frequency_plan(
             from .mpa.model import make_mpa_plan
             mpa_plan = make_mpa_plan(
                 config, quad, material_class=material_class)
+        from .qsgw_head import head_quadrature_omegas
         mpa_z = np.asarray(sample_plan.plan_z(mpa_plan), dtype=np.complex128)
-        head_omegas = [complex(value) for value in mpa_z]
+        # The fit nodes, then the head's imaginary-axis moment rule.
+        head_omegas = [complex(value) for value in mpa_z] + list(head_quadrature_omegas(config))
         # The metallic MPA grid starts just above the origin.  Preserve a
         # separate exact-static sample for do_G0; it is nonanalytic and must
         # never enter the Loewner sample vector.
@@ -3330,7 +3333,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             inputs.meta._shared_pole_carrier_history = (
                 inputs.fixed_quadrature_session.setdefault("shared_pole_carriers", {}))
 
-    from .gw_config import (uses_bare_transverse_shared_pole,
+    from .gw_config import (folds_scalar_head,
                             uses_direct_bispinor_shared_pole_head)
     if uses_direct_bispinor_shared_pole_head(inputs.config):
         sigma = inputs.band_slices.sigma
@@ -3414,18 +3417,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # this map's qp_velocity; None reads the dipole velocity (dft_velocity).
     photon_velocity = None
     pt = getattr(inputs, "parallel_transport", None)
-    # The shared-pole route also carries the direct-only head
-    # (no_local_fields) through this frozen DFT response, with the wings
-    # skipped and the fold never evaluated (``gw.shared_pole_head``).
-    direct_only_shared_pole = (
-        inputs.config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
-        and inputs.config.sigma.w_model == "shared_pole"
-        and (int(inputs.meta.nspinor) != 4
-             or uses_bare_transverse_shared_pole(inputs.config)))
     fixed_dft_full_head = (inputs.fixed_dft_head_response is not None or
         (pt is None and inputs.config.sigma.w_model == "shared_pole"
-         and (inputs.config.head.correction is HeadCorrection.FULL
-              or direct_only_shared_pole)))
+         and folds_scalar_head(inputs.config)))
     if pt is not None or fixed_dft_full_head:
         from .head_correction import compute_static_head_terms_from_sample
         from .qsgw_head import finalize_iteration_head_samples
@@ -3536,7 +3530,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # Y and Z are built directly from the two centroid-sharded
             # wavefunction copies.  Their band-pair tiles are distributed
             # over the full Px*Py mesh and frequency-blocked in each ring.
-            wfns_qp=(None if direct_only_shared_pole else wfns_qp),
+            wfns_qp=wfns_qp,
             eta_ry=(0.0 if mpa_mode else None),
             occupation_state=entry_occ_state,
             velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None),
@@ -3559,12 +3553,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 f"ISDF wings on the exact MPA z grid ({velocity_kind}, "
                 f"nb={pt.nb_logical}, "
                 f"fit samples={len(_sample_plan.plan_z(mpa_plan))})")
-        elif direct_only_shared_pole:
-            _record_sc(
-                inputs,
-                f"    SC head: {velocity_kind} + live Fermi-surface Drude "
-                f"and static Thomas-Fermi direct head "
-                f"(nb={pt.nb_logical}, samples={len(head_omegas)}; no wings)")
         else:
             _record_sc(
                 inputs,
@@ -3581,13 +3569,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                            np.asarray(jax.device_get(wfns_qp.enk[:, :nb_storage])))
 
     elif fixed_dft_full_head:
-        # ``sc_head_update=off`` freezes the DFT direct response; it does not
-        # turn a requested macroscopic W head back into the no-local-field
-        # epsilon head.  Reuse the immutable DFT S/Y/Z on this iteration's
-        # exact frequency plan, then fold it once through this iteration's W.
-        # This branch keeps the public full/no-LF decision independent of the
-        # QSGW velocity-update choice.  Only the small 3x3/vector response is
-        # retained; body W remains 2-D sharded as before.
+        # ``sc_head_update=off`` freezes the DFT direct response, not the
+        # fold.  Reuse the immutable DFT S/Y/Z on this iteration's exact
+        # frequency plan, then fold it once through this iteration's W.
+        # Only the small 3x3/vector response is retained; body W remains 2-D
+        # sharded as before.
         iteration_head_response = inputs.fixed_dft_head_response
         if (iteration_head_response is None or
                 (inputs.config.sigma.w_model == "shared_pole"
@@ -3603,7 +3589,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
                 input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
                 meta=inputs.meta, config=inputs.config,
-                wings=not direct_only_shared_pole,
                 occupation_state=dft_head_state,
                 frozen_parts=(None if seed_cache is None else
                               seed_cache.setdefault("dft_head_frozen_parts", {})))
@@ -3640,10 +3625,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 "fixed DFT head response does not match the current "
                 "screening frequency plan")
         inputs.print_fn(
-            "    SC head: fixed DFT direct response on the current screening "
-            "frequency plan; direct head only, no wings, no fold "
-            "(head_correction=no_local_fields, sc_head_update=off)"
-            if direct_only_shared_pole else
             "    SC head: fixed DFT direct response plus matching wings "
             "on the current screening frequency plan; local fields fold "
             "once through this iteration's W (sc_head_update=off)")

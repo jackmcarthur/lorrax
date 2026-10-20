@@ -171,10 +171,11 @@ rulings override anything here.
 
 - **`HeadCorrection`**: `full` (the default: an irreducible direct response is
   completed with its microscopic head and wings exactly once, and a
-  micro-reducible response is used as is), `no_local_fields` (the diagnostic ε
-  head, or the first-order direct four-current Γ head on the bispinor
-  shared-pole routes), `off` (no special Γ-cell term, for brute-force k
-  convergence).
+  micro-reducible response is used as is; on `bispinor_gw = full_shared_pole`
+  it is the first-order direct four-current Γ head, with no local-field fold
+  on that bank, `uses_direct_bispinor_shared_pole_head`; `folds_scalar_head`
+  names the folded scalar case), `off` (no special Γ-cell term, for
+  brute-force k convergence; the one debug value).
 - **`ScreeningConfig`**: `method` exists only to refuse anything but `minimax`
   ([decisions](../architecture/decisions.md), 2026-08-06). `diagrams`
   (`ScreeningDiagrams`) chooses which series W sums: `w_rpa` (the default,

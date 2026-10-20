@@ -97,7 +97,7 @@ from .gw_config import (
 	packed_bare_transverse_route,
 	packed_photon_replaces_charge_sigma, packed_photon_screens_current,
 	refuse_unimplemented_compute_mode, uses_dynamic_packed_photon_route,
-	uses_direct_bispinor_shared_pole_head,
+	folds_scalar_head, uses_direct_bispinor_shared_pole_head,
 	uses_full_bispinor_shared_pole, uses_bare_transverse_shared_pole,
 	uses_four_spinor_finite_q_charge, uses_static_photon_response,
 	infer_material_class, resolve_mpa_sampling_alpha,
@@ -253,10 +253,9 @@ def _report_head_and_photon_policy(config, print0, report):
         + ({
             HeadCorrection.FULL: (
                 "bare Coulomb head" if config.compute_mode is ComputeMode.X_ONLY
+                else "first-order direct four-current Gamma head; no "
+                "local-field fold on the four-current bank" if direct_photon
                 else "macroscopic W, local fields exactly once"),
-            HeadCorrection.NO_LOCAL_FIELDS: (
-                "first-order direct four-current Gamma head" if direct_photon
-                else "diagnostic epsilon head"),
             HeadCorrection.OFF: "no special Gamma-cell contribution",
         }[config.head.correction]))
     if config.bispinor:
@@ -338,13 +337,11 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
                 f"orbit-closed centroid set; fix: regenerate the centroids with "
                 f"kmeans (orbit-closed), or use screening_diagrams = w_rpa; doc: "
                 f"docs/architecture/symmetry_register.md §7.")
-    # Before any basis, bank or constructor: the full shared-pole head, the
-    # w_bse ladder and HL-PPM refuse an ordered store, and full_shared_pole a
-    # store with time reversal, here, on the final symmetry verdict.
-    from .shared_pole_head import refuse_unsupported_shared_pole_head
+    # Before any basis, bank or constructor: the w_bse ladder and HL-PPM
+    # refuse an ordered store, and full_shared_pole a store with time
+    # reversal, here, on the final symmetry verdict.
     from .screening import refuse_full_shared_pole_with_trs, refuse_w_bse_without_trs
     from .ppm_pipeline import refuse_hl_ppm_without_trs
-    refuse_unsupported_shared_pole_head(config, nspinor=wfn.nspinor)
     refuse_w_bse_without_trs(config, sym)
     refuse_full_shared_pole_with_trs(config, sym)
     refuse_hl_ppm_without_trs(config, sym)
@@ -507,22 +504,15 @@ def _prepare_oneshot_response(
     oneshot_head_response = None
     oneshot_head_requests = None
     oneshot_mpa_plan = None
-    # The shared-pole route takes its direct head from the same sharded
-    # response as the full one, with the wings skipped and the fold never
-    # evaluated (``gw.shared_pole_head`` docstring): the head an ordered
-    # store carries.  The four-current sector bank builds its own direct
-    # CC/CT/TC/TT head (``gw.photon_direct_head``) and consumes no scalar
-    # head response, as on the SC route (``sc_iteration``).
-    direct_only_shared_pole = (
-        config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
-        and config.sigma.w_model == "shared_pole"
-        and not uses_direct_bispinor_shared_pole_head(config))
+    # The four-current sector bank builds its own direct CC/CT/TC/TT head
+    # (``gw.photon_direct_head``) and consumes no scalar head response, as on
+    # the SC route (``sc_iteration``).
     if (do_screened
-            and (config.head.correction is HeadCorrection.FULL or direct_only_shared_pole)
+            and folds_scalar_head(config)
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
             and not packed_photon_replaces_charge_sigma(config)
             and qp_solver is not QPSolver.SELF_CONSISTENT):
-        from .qsgw_head import build_dft_head_response
+        from .qsgw_head import build_dft_head_response, head_quadrature_omegas
         if mode.value == "mpa":
             from .mpa import sample_plan
             if config.sigma.w_model == "shared_pole":
@@ -533,8 +523,10 @@ def _prepare_oneshot_response(
                 from .mpa.model import make_mpa_plan
                 oneshot_mpa_plan = make_mpa_plan(
                     config, quad, material_class=material_class)
+            # The fit nodes, then the head's imaginary-axis moment rule.
             oneshot_omegas = np.asarray(
-                sample_plan.plan_z(oneshot_mpa_plan), dtype=np.complex128)
+                tuple(sample_plan.plan_z(oneshot_mpa_plan))
+                + head_quadrature_omegas(config), dtype=np.complex128)
         else:
             oneshot_head_requests = screening_requests_for(mode, config)
             oneshot_omegas = np.asarray(
@@ -548,7 +540,6 @@ def _prepare_oneshot_response(
                 wfns_sigma, oneshot_omegas,
                 input_dir=input_dir, mesh=mesh_xy,
                 wfn=wfn, meta=meta, config=config,
-                wings=not direct_only_shared_pole,
                 occupation_state=(occupation_state
                                   if material_class == "metal" else None))
             if material_class == "metal":
@@ -556,9 +547,6 @@ def _prepare_oneshot_response(
                 print0("  " + metal_head_summary(
                     oneshot_head_response, occupation_state))
             print0(
-                "  head_correction=no_local_fields: built the direct DFT "
-                "response on the chi0 transition manifold; no wings, no "
-                "fold (direct head only)." if direct_only_shared_pole else
                 "  head_correction=full: built direct DFT response and "
                 "head/body wings on the chi0 transition manifold; finalizing "
                 "once against the resident W(Gamma).")
@@ -780,7 +768,7 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
             and not packed_photon_replaces_charge_sigma(config)):
         _sc_full = (qp_solver is QPSolver.SELF_CONSISTENT
                     and do_screened
-                    and config.head.correction is HeadCorrection.FULL)
+                    and folds_scalar_head(config))
         if not _sc_full:
             with timing.section("gw_jax.static_head"):
                 static_head_terms = _compute_static_head(

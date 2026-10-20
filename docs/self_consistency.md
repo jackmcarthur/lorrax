@@ -775,8 +775,8 @@ from `qsgw_head.qp_velocity` (§3); the one-shot and the fixed DFT head
 | `sc_head_update` on a metal | head on each map | admitted on |
 |---|---|---|
 | `off` | the fixed DFT response on the DFT fixed-N Fermi–Dirac state, with its Drude term and Thomas–Fermi slot (`sc_iteration._fixed_dft_head_occupation_state`) | every metal deck |
-| `dft_velocity` | the `dipole.h5` velocity rotated into each map's QP basis, the current μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | shared-pole decks with `head_correction = no_local_fields` (scalar, `bare_transverse`, `full_shared_pole`), or `full` on a scalar deck |
-| `parallel_transport` | the same head on $U^\dagger(v^{\rm DFT} + D_k\Delta H)U$, so the Drude term sees the QP Fermi velocity | shared-pole scalar decks with `no_local_fields` or `full`, and `full_shared_pole` |
+| `dft_velocity` | the `dipole.h5` velocity rotated into each map's QP basis, the current μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | shared-pole decks with `head_correction = full` (scalar, `bare_transverse`, `full_shared_pole`) |
+| `parallel_transport` | the same head on $U^\dagger(v^{\rm DFT} + D_k\Delta H)U$, so the Drude term sees the QP Fermi velocity | shared-pole scalar decks and `full_shared_pole`, `head_correction = full` |
 | `interband_commutator` | refused (`GATE sc_head_interband_commutator_insulator_only`) | — |
 
 Any other metal combination refuses (`GATE metal_sc_head_update_disabled`,

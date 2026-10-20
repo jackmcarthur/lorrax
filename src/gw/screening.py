@@ -970,12 +970,12 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
     """
     if mode is not ComputeMode.MPA:
         return W_by_role.get("static", V_q)
-    from .gw_config import HeadCorrection
+    from .gw_config import folds_scalar_head
     why = None
     if material_class == "metal":
         why = ("material_class = metal; this writer does not retain the "
                "static metallic head")
-    elif getattr(config.head, "correction", None) is HeadCorrection.FULL and not any(
+    elif folds_scalar_head(config) and not any(
             abs(complex(z)) <= 1.0e-12
             for z in getattr(W_by_role.get("iteration_head"), "omegas", ())):
         why = ("head_correction = full produced no finalized head sample at "

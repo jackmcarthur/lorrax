@@ -55,8 +55,7 @@ That tensor is already micro-reducible because the finite-G Hartree/ring term
 is in the operator.  ``head_correction=full`` restores only the omitted
 macroscopic bare-v channel through the mini-BZ reduction; applying the RPA
 ``Y W Z`` fold to it again is explicitly forbidden as double counting.
-``no_local_fields`` retains the direct diagnostic and ``off`` removes the
-special Gamma cell.  The separate finite-q ``mc_average_placement`` policy
+``off`` removes the special Gamma cell.  The separate finite-q ``mc_average_placement`` policy
 remains refused under w_bse; a non-None ``head_channel`` reaching here is a
 parse-gate bug, not a case to serve.
 

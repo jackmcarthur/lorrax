@@ -194,20 +194,40 @@ pair is therefore unchanged by the split.
 ## 3. The cell average
 
 The head is the average over the mini-BZ Voronoi cell $\mathcal C$, sample by
-sample, with no spherical reduction. For the scalar head at each plan
-frequency $z$,
+sample, with no spherical reduction. For the scalar head at each dynamic
+plan frequency $z$,
 
 $$
-W^c_{\rm head}(z)=\Big\langle\frac{v(q)}{1-v(q)\,[\mathbf q\cdot S(z)\cdot\mathbf q+\chi_{\rm intra}(\mathbf q,z)]}\Big\rangle_{\mathcal C}-\langle v\rangle_{\mathcal C},
-\qquad v(q)=\frac{8\pi}{q^2},
+W^c_{\rm head}(z)=\Big\langle\frac{v(q)}{1-v(q)\,\mathbf q\cdot S(z)\cdot\mathbf q}\Big\rangle_{\mathcal C}-\langle v\rangle_{\mathcal C},
+\qquad v(q)=\frac{8\pi}{q^2},\qquad
+S(z)=S_{\rm inter}(z)+\frac{D\,r(z)}{z^2},
 $$
 
 on the scrambled-Sobol Voronoi draws of `vcoul` (with the analytic sphere
-where the deck asks for it; `gw.vcoul.compute_q0_averages`, argument
-`extra_chi`). $\chi_{\rm intra}$ is evaluated at every sample from the atoms,
-so both its direction and its magnitude dependence are resolved. The exact
-static slot $z=0$ is the $z\to0^+$ limit of the same function,
-$\chi_{\rm intra}\to-N_0$ at every sample, with the interband $S(0)$ kept:
+where the deck asks for it; `gw.vcoul.compute_q0_averages_screened`). The
+intraband term is the generalized Drude term with a Fermi-liquid memory
+function (`qsgw_head.drude_memory_damping`):
+
+$$
+\epsilon_{\rm intra}(z)=-\frac{\omega_p^2}{z\,(z+iM(z))},\qquad
+M(z)=\gamma_0\,\frac{-iz}{\Gamma-iz},\qquad
+r(z)=\frac{z}{z+iM}=1-\frac{\gamma_0}{\Gamma+\gamma_0-iz}.
+$$
+
+$M$ is analytic in the upper half plane (pole at $z=-i\Gamma$); on the real
+axis $\operatorname{Re}M(\omega)=\gamma_0\omega^2/(\omega^2+\Gamma^2)\ge0$, a rate
+that vanishes as $\omega^2$ at the Fermi surface and saturates at
+$\gamma_0$; on the imaginary axis $M(i\xi)=\gamma_0\xi/(\xi+\Gamma)$ is real.
+Deck `head_drude_gamma0_ev` ($\gamma_0$, default 0: the undamped Drude term
+$D/z^2$) and `head_drude_gamma_width_ev` ($\Gamma$). The per-sample
+anisotropic Lindhard function of the atoms (the Landau continuum at
+$|z|\lesssim q\cdot u$) is not part of the dynamic head: its moment $M_1$
+(section 4) grows as $\log$ of the cell's smallest $|q\cdot u|$, so it would
+set $Z$ by the Sobol draw. A constant rate ($\Gamma\to0$) is rejected for the
+same reason: $\epsilon(i\xi)\sim\omega_p^2/(\gamma_0\xi)$ and $M_1$ diverges.
+
+The static slot is the $z\to0$ limit at fixed $q$, Thomas-Fermi at every
+sample, with the interband $S(0)$ kept:
 
 $$
 W_{\rm head}(0)=\Big\langle\frac{8\pi}{\mathbf q\cdot\epsilon_\infty\cdot\mathbf q+\kappa^2}\Big\rangle_{\mathcal C},
@@ -241,7 +261,24 @@ velocities are replicated; their bytes are $O(N_kN_b)$, never $O(N_b^2)$.
 ## 4. How the head enters Σ
 
 The scalar samples $W^c_{\rm head}(z)$ are fitted by the head pole model
-with the origin sample pinned (`gw.mpa.model._pin_static_head_sample`), and
+with two moments pinned (`gw.mpa.model._pin_static_head_sample`): the origin
+sample, and
+
+$$
+M_1=\sum_p\frac{R_p}{\Omega_p^2}=\frac1\pi\int_0^\infty d\xi\,
+\frac{W^c_{\rm head}(i\xi)-W^c_{\rm head}(0^+)}{\xi^2},
+$$
+
+by Gauss-Legendre quadrature in $t$, $\xi=\xi_0t/(1-t)$, on dedicated
+imaginary-axis head samples (`qsgw_head.head_quadrature_rule`, $N_\xi=24$,
+$\xi_0=0.5$ Ry; each node is one head build with the fold through
+$W_{\rm body}(\Gamma,i\xi)$). $W^c_{\rm head}(0^+)$ is the limit of the
+dynamic model the rule samples: $-\langle v\rangle$, because
+$\epsilon_M(i\xi)\to\omega_p^2\Gamma/((\Gamma+\gamma_0)\xi^2)$; the
+Thomas-Fermi row $-\langle v\rangle+t$ is the static limit at fixed $q$, and
+subtracting it would add $-t/\xi^2$ (`qsgw_head.head_moment_m1`). The integrand
+$[W^c+\langle v\rangle]/\xi^2$ is then finite at $\xi=0$. M₁ is stamped in the
+head store (`fit_moment_m1`).
 
 $$
 \Sigma^{\rm head}_{nk}(\omega)=\frac{1}{\Omega N_k}\sum_pR_p
@@ -250,9 +287,10 @@ $$
 $$
 
 which is $(1/2-f_{nk})W^c_{\rm head}(0)/(\Omega N_k)$ on shell
-([metallic screening §5.3](metallic-mpa-screening.md)). On-shell energies
-therefore see the static cell average, and the intraband shape moves $Z$
-and off-shell values. The four-current head's cell averages
+([metallic screening §5.3](metallic-mpa-screening.md)), with slope
+$\partial_\omega\Sigma^{\rm head}_{nk}=-M_1/(\Omega N_k)$. On-shell energies
+therefore see the static cell average, $Z$ sees the quadrature $M_1$ of the
+generalized Drude model, and only off-shell values are shaped by the fit. The four-current head's cell averages
 ($W_h-W_\infty$, its $z^2$ derivative, the ordered $-\mathbf q$ mirror,
 $\langle W_\infty-\mathcal D\rangle$ and the large-$z$ coefficients) enter the
 ordered sector bank as rank-4 updates on the literal-Γ vectors, and Σ is the
@@ -284,6 +322,9 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
   $|z|\lesssim q_{\rm cell}u_F$, i.e. to $Z$). The static row's fold takes the
   row's own Γ body; only an exact $z=0$ row also builds the static Matsubara
   body. Certified by `tests/test_shared_pole_head_ordered_metal.py`.
+- **Damping and the wings.** $r(z)$ multiplies the $D/z^2$ term of $S$. The
+  ordered metal's intraband wing ($\propto1/z$) keeps the undamped Drude
+  form at $\gamma_0>0$; time reversal cancels it on a non-magnetic metal.
 - **Estimators.** The intraband term uses tetrahedron weights and the
   interband term FD occupations; at coarse grids the two describe slightly
   different Fermi surfaces.
@@ -297,7 +338,8 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
 |---|---|
 | tetrahedron Fermi-surface table, multiplet weights | `gw.fermi_surface.metal_head_surface_weights` |
 | two-band pair split $\phi$ | `gw.fermi_surface.intraband_pair_fraction` |
-| velocity atoms, $\Pi_{\rm intra}$ (scalar and $4\times4$) | `gw.fermi_surface.FermiSurfaceIntraband` |
-| $D$, $S(z)$, static slot | `gw.qsgw_head` |
+| velocity atoms, $\Pi_{\rm intra}$ ($4\times4$) | `gw.fermi_surface.FermiSurfaceIntraband` |
+| $D$, $S(z)$, static slot, $r(z)$, the $M_1$ rule | `gw.qsgw_head` |
+| two-moment pin | `gw.mpa.model._pin_static_head_sample` |
 | cell moment $Q$ and cell draws | `vcoul.minibz` (`minibz_coulomb_moment`) |
 | four-current interband tensor, Hall part, Γ-cell Dyson | `gw.photon_direct_head` |
