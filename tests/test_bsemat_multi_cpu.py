@@ -132,14 +132,17 @@ def _context(s, mesh, *, use_gauge_map=True):
         wfn_co=s["wfn_co"], mesh_xy=mesh, rep=jax.jit(lambda a: a, out_shardings=NamedSharding(mesh, P())),
         n_val=N_VAL, n_cond=N_COND, nk=s["nk"], grid=np.asarray(GRID), n_rmu=N_MU, n_rmu_pad=N_MU_PAD,
         nspinor=NS, omega=OMEGA, bvec=np.eye(3) * 2 * np.pi / 10.26, kpts=s["kpts"],
-        kgrid_w=np.asarray(GRID), b2l=s["b2l"], ecutwfc=25.0, efermi=6.1,
+        kgrid_w=np.asarray(GRID), ecutwfc=25.0, efermi=6.1,
+        exciton_Q=np.zeros(3), qflag=1, exchange="synthetic head-less Gamma tile",
+        eps_c=np.zeros((s["nk"], N_COND)),
+        src_c=s["psi_win"][s["b2l"]], src_v=s["psi_win"][s["b2l"]], Uc=Ug, Uv=Ug,
         keys=list(s["keys"]), n_ties=1, iq_pair=s["iq_pair"].copy(), key_pair=s["key_pair"].copy(),
         lam_pair=s["lam"].copy(), z_keys=s["z_keys"].copy(), y_keys=s["y_keys"].copy(),
         W11=s["W11"].copy(), figs=[{"iq": 0, "q0": True}], split_stats=None,
         v_head_q=np.full(s["nk"], 3.0),
         W_flat=W_flat, V_flat=put(s["V"], "x", "y", None), Vbar=put(s["Vbar"], "x", "y"),
-        psi_win=s["psi_win"].copy(), use_gauge_map=use_gauge_map, Ug=Ug,
-        gfig={"gauge_map": "synthetic"} if use_gauge_map else {"gauge_map": "identity (red twin)"},
+        psi_win=s["psi_win"].copy(), use_gauge_map=use_gauge_map,
+        gfig={"gauge_map": "synthetic"} if use_gauge_map else {"gauge_map": "identity (control variant)"},
         q0_dipole={}, q0_update=jax.jit(lambda w, a, d: w.at[:, :, 0].set(
             A.add_q0_body_update(w[:, :, 0], a, d, xp=jnp)), out_shardings=W_flat.sharding))
 

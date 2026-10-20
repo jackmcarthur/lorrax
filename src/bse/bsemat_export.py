@@ -146,6 +146,151 @@ def grid_index(frac, grid):
     return (ni[:, 0] * grid[1] + ni[:, 1]) * grid[2] + ni[:, 2]
 
 
+def finite_q_legs(kpts, grid, exciton_Q):
+    """``(qflag, c_rows, v_rows)``: where the two legs of each file row live at exciton momentum Q.
+
+    File row j is BerkeleyGW's ik, the WFN_co point k_j. Its conduction leg is
+    at k_j and its valence leg at k_j − Q: BerkeleyGW's ``exciton_Q_shift`` is
+    −Q (``BSE/input_kernel.f90``: valence at ``kg%f + finiteq``). The pair set
+    is LORRAX's |v k, c k+Q⟩ (``bse.exciton_bands``), labelled by the electron.
+    The hole is always on the restart grid: ``v_rows`` is its flat index.
+    Q = 0 gives ``qflag`` 1, and Q on the grid gives 2 (``c_rows`` the flat
+    index of k_j). Q off the grid gives 0: WFN_co is the restart grid shifted
+    by Q, and ``c_rows`` is None (the conduction leg comes from the htransform at k_j).
+    docs/theory/bgw-bsemat-export.md#finite-q.
+    """
+    Q = np.asarray(exciton_Q, dtype=np.float64).reshape(3)
+    g = np.asarray(grid, dtype=np.float64)
+    try:
+        v_rows = grid_index(np.asarray(kpts, dtype=np.float64) - Q[None, :], grid)
+    except ValueError:
+        raise ValueError(f"GATE bsemat_finite_q_grid: a WFN_co point minus exciton_Q {Q.tolist()} is "
+                         "off the restart grid; the hole leg must be on it. fix: for Q off the grid, "
+                         "WFN_co is the restart grid shifted by +Q (the electron leg) and the "
+                         "restart grid's own WFN is --wfnq-co.") from None
+    if len(set(v_rows.tolist())) != len(v_rows):
+        raise ValueError("GATE bsemat_finite_q_grid: WFN_co minus Q does not cover the restart grid once")
+    if np.allclose(Q - np.rint(Q), 0.0, atol=1e-9):
+        qflag = 1
+    elif np.allclose(Q * g, np.rint(Q * g), atol=1e-6):
+        qflag = 2
+    else:
+        qflag = 0
+    return qflag, (None if qflag == 0 else grid_index(kpts, grid)), v_rows
+
+
+def htransform_window(input_file, kpts, *, n_val, n_cond, n_rmu, mesh_xy):
+    """ψ and ε of the BSE window at explicit points, from the deck's htransform.
+
+    Built exactly as ``bse.exciton_bands`` builds its conduction caches. The
+    fit is ``fh_interp.initialize_wfns`` on the deck's band window, the BSE
+    bands are returned from inside it (``bse_setup.resolve_conduction_window``),
+    and ``bse_setup.compute_wfns_fi`` runs with ``q_list = kpts`` (crystal). One
+    f(H) covers every band the deck loads. Returns host ``psi`` with shape
+    (nk, n_val + n_cond, ns, n_rmu), bands ascending, ``enk`` with shape
+    (nk, n_val + n_cond) in Ry, and the receipts. Only the conduction block is
+    consumed; the valence block enters the gauge fit
+    (docs/how-to/htransform-and-exciton-bands.md §7).
+    """
+    from gw.gw_config import (linalg_resolution, read_lorrax_input, resolve_distrib_la_batched_route,
+                              resolve_eigh_backend)
+    from bandstructure import fh_interp as ht
+    from bandstructure.bse_setup import compute_wfns_fi, resolve_conduction_window
+    from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY
+    params = read_lorrax_input(input_file)
+    base = os.path.dirname(os.path.abspath(input_file))
+    absp = lambda p: p if os.path.isabs(p) else os.path.join(base, p)
+    params["centroids_file"] = absp(str(params["centroids_file"]))
+    route = resolve_distrib_la_batched_route(params)
+    wfn, sym = ht.setup_wfn_and_sym(absp(str(params["wfn_file"])), mesh_xy=mesh_xy)
+    receipts = []
+    wfn, sym, meta, _, basis, enk_sigma = ht.initialize_wfns(
+        input_file, params, _log, mesh_xy=mesh_xy, centroid_subset_idx=None, wfn_sym=(wfn, sym),
+        rank_record_fn=receipts.append, distrib_la_batched_route=route)
+    nval_in = int(params["nval"])
+    if nval_in < int(n_val):
+        raise ValueError(f"GATE bsemat_finite_q_window: the deck's nval {nval_in} < n_val {n_val}; the "
+                         "htransform window must hold the BSE valence bands")
+    _, b_max, _ = resolve_conduction_window(
+        enk_sigma, nb_window=int(basis.ctilde.shape[1]), nval_in=nval_in, n_cond=int(n_cond),
+        tol_ry=DEGENERACY_TOL_RY, mode=DEFAULT_MODE, input_file=input_file, log_fn=_log)
+    bundle = compute_wfns_fi(
+        ctilde=basis.ctilde, B_at_mu=basis.basis_at_nodes, enk_sigma=enk_sigma,
+        kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+        band_window_fi=(nval_in - int(n_val), b_max), mesh_xy=mesh_xy,
+        q_list=np.asarray(kpts, dtype=np.float64),
+        batch_size=int(params.get("wfn_fi_q_chunk", 0)), eigh_backend=resolve_eigh_backend(params),
+        use_low_mem_eigh=linalg_resolution(params).layout == "distributed", log_fn=_log,
+        distrib_la_batched_route=route, htransform_quality_record_fn=receipts.append)
+    rep = jax.jit(lambda a: a, out_shardings=NamedSharding(mesh_xy, P()))
+    psi, enk = np.asarray(rep(bundle.psi_rmu_Y)), np.asarray(rep(bundle.enk_full))
+    if psi.shape[-1] != int(n_rmu):
+        raise ValueError(f"GATE bsemat_finite_q_basis: the htransform fitted ψ at {psi.shape[-1]} "
+                         f"centroids, the restart stores μ = {n_rmu} (a downfolded bundle needs its "
+                         "parent's table)")
+    wfn.close()
+    return psi, enk, receipts
+
+
+def exchange_tile_momentum(Q):
+    """The tile momentum of the finite-Q exchange: wrap(+Q), crystal.
+
+    Row k's exchange contracts conj(ρ_vc) on the left and ρ_v'c' on the right,
+    ρ_vc = ψ*_{v,k−Q} ψ_{c,k}, a density of momentum +Q. LORRAX's tile V_q
+    contracts a left density of momentum −q against a right one of momentum
+    +q (the direct term takes W(k − k') with C_cc', momentum k' − k, on the
+    left), so the exchange takes q = +Q (docs/theory/bgw-bsemat-export.md#finite-q,
+    E12). At Q = 0 both labels are one tile; at finite Q they are different
+    tiles (conjugate under time reversal) and only +Q reproduces the plane-wave
+    exchange (``tests/test_bsemat_finite_q_cpu.py``).
+    """
+    q = np.asarray(Q, dtype=np.float64).reshape(3)
+    return q - np.round(q)
+
+
+def exchange_tile(Q, qflag, *, data, input_file, restart, grid, n_rmu, n_rmu_pad, mesh_xy):
+    """The exchange tile the file contracts (μ, ν) at ``P('x','y')``, and its receipt.
+
+    At Q = 0 this is the head-less Γ tile: kernel.x drops G = 0 (E1d). At
+    finite Q it is V at tile momentum :func:`exchange_tile_momentum` (Q) =
+    wrap(+Q) with every G kept: BerkeleyGW's ``energy_loss`` exchange, whose
+    plane wave e^{i(Q_s+G)·r} (``kernel_main.f90``: ``vcoularray(:, nf+1)`` at
+    ``finiteq`` = Q_s = −Q) picks the density component of momentum Q − G
+    (E12). The tile comes from ``bse.exchange_path.exchange_tiles``, the
+    evaluator ``bse.exciton_bands`` solves with; that evaluator labels the
+    tile of its argument Q' as wrap(−Q'), so it is called with −Q. On the
+    grid it is the stored tile (``ongrid``, exact); off the grid it is the
+    per-Q ζ refit on the BSE window (``refit``, the arbitrary-Q route).
+    """
+    from .exchange_path import exchange_tiles
+    if qflag == 1:
+        return data["V_q0"], "head-less Gamma tile (G = 0 dropped, E1d)"
+    rst = None
+    if qflag == 2:
+        route, refit = "ongrid", None
+    else:
+        from . import vq_interp
+        zx = vq_interp.read_vq_payload(restart, os.path.join(os.path.dirname(restart), "zeta_q.h5"),
+                                       mesh=mesh_xy, log_fn=_log, input_file=input_file,
+                                       require_slab=False, require_full_bz_zeta=False)
+        rst = vq_interp.refit_prepare(input_file, mesh_xy, zx, log_fn=_log, policy=zx.get("policy"),
+                                      keep_idx=None, window_mode="bse")
+        route, refit = "refit", (rst["zx_fit"], rst)
+    q_tile = exchange_tile_momentum(Q)
+    V_stack, _, _, _ = exchange_tiles(
+        -q_tile.reshape(1, 3), route=route, mesh_xy=mesh_xy,          # its tile is wrap(-arg) = q_tile
+        V_q0=data["V_q0"], V_ongrid=data.get("V_q_full"), kgrid_vq=np.asarray(grid),
+        n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, refit=refit, log_fn=_log)
+    V = jax.jit(lambda s: s[0], out_shardings=NamedSharding(mesh_xy, P("x", "y")))(V_stack)
+    if rst is not None:
+        from . import vq_interp
+        vq_interp.close_refit_state(rst)
+    return V, (f"stored tile V[wrap(+Q) = {np.round(q_tile, 9).tolist()}], every G (energy_loss)"
+               if qflag == 2 else
+               f"per-Q zeta refit on the BSE window at wrap(+Q) = {np.round(q_tile, 9).tolist()}, "
+               "every G (energy_loss)")
+
+
 # ---------------------------------------------------------------------------
 # 2b. ζ columns at the head momenta, unfolded from the wedge
 # ---------------------------------------------------------------------------
@@ -719,7 +864,7 @@ def output_spec(out_path, *, extended=False, use_gauge_map=True, q0_body="head_l
 def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=False,
                       use_gauge_map=True, rcond=A.RCOND, bgw_eps=None, q0_body="head_less",
                       q0_vector=None, q0_body_update=None, mu_small=None,
-                      downfold_rcond=None, mesh_xy):
+                      downfold_rcond=None, exciton_Q=(0.0, 0.0, 0.0), wfnq_co=None, mesh_xy):
     """Write ``out_path`` (BerkeleyGW bsemat.h5) from the deck's restart. Returns a summary dict.
 
     ``bgw_eps`` (an ``epsmat.h5``) supplies BerkeleyGW's own q wedge, so the
@@ -736,11 +881,15 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
     ``mu_small`` (int or ``"auto"``) runs the downfold on the file's band window
     before the rows (``_downfold_stage``), at ``downfold_rcond`` (default the
     downfold driver's); ``None`` builds the rows on the parent's μ.
+    ``exciton_Q`` (crystal) writes the finite-momentum kernel of the pairs
+    |v k−Q, c k⟩ on WFN_co's k list (``finite_q_legs``); off the restart grid,
+    WFN_co is the grid shifted by Q and ``wfnq_co`` the restart grid's own WFN
+    (BerkeleyGW's WFNq_co).
     One file of ``run_bsemat_exports``, which shares the load across files.
     """
     return run_bsemat_exports(
         input_file=input_file, wfn_co=wfn_co, n_val=n_val, n_cond=n_cond, rcond=rcond,
-        bgw_eps=bgw_eps, mesh_xy=mesh_xy,
+        bgw_eps=bgw_eps, exciton_Q=exciton_Q, wfnq_co=wfnq_co, mesh_xy=mesh_xy,
         outputs=[output_spec(out_path, extended=extended, use_gauge_map=use_gauge_map,
                              q0_body=q0_body, q0_vector=q0_vector,
                              q0_body_update=q0_body_update, mu_small=mu_small,
@@ -748,7 +897,7 @@ def run_bsemat_export(*, input_file, wfn_co, out_path, n_val, n_cond, extended=F
 
 
 def run_bsemat_exports(*, input_file, wfn_co, n_val, n_cond, outputs, rcond=A.RCOND,
-                       bgw_eps=None, mesh_xy):
+                       bgw_eps=None, exciton_Q=(0.0, 0.0, 0.0), wfnq_co=None, mesh_xy):
     """Write several bsemat files from one load of the deck's restart; one summary per file.
 
     ``outputs`` are ``output_spec`` dicts with distinct ``out_path``; they may differ
@@ -766,10 +915,17 @@ def run_bsemat_exports(*, input_file, wfn_co, n_val, n_cond, outputs, rcond=A.RC
     paths = [os.path.abspath(o["out_path"]) for o in outputs]
     if not paths or len(set(paths)) != len(paths):
         raise ValueError(f"run_bsemat_exports: want one or more distinct output paths, got {paths}")
+    Q = np.asarray(exciton_Q, dtype=np.float64).reshape(3)
+    if np.any(np.abs(Q - np.rint(Q)) > 1e-9):
+        bad = [o["out_path"] for o in outputs if o["extended"] or o["mu_small"] is not None]
+        if bad:
+            raise ValueError(f"GATE bsemat_finite_q_form: {bad} ask for extended_kernel or the downfold "
+                             "at exciton_Q != 0; the finite-Q file is the TDA kernel on the parent's "
+                             "centroids (kernel.x's finite-Q route). fix: --kernel tda --mu-small off")
     t0, w0 = time.time(), _stage_walls()
     try:
         ctx = _export_context(input_file=input_file, wfn_co=wfn_co, n_val=n_val, n_cond=n_cond,
-                              rcond=rcond, bgw_eps=bgw_eps,
+                              rcond=rcond, bgw_eps=bgw_eps, exciton_Q=Q, wfnq_co=wfnq_co,
                               use_gauge_map=any(o["use_gauge_map"] for o in outputs),
                               mesh_xy=mesh_xy)
     except BaseException as exc:
@@ -795,7 +951,7 @@ def run_bsemat_exports(*, input_file, wfn_co, n_val, n_cond, outputs, rcond=A.RC
 
 
 def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_gauge_map,
-                    mesh_xy):
+                    mesh_xy, exciton_Q=(0.0, 0.0, 0.0), wfnq_co=None):
     """The shared stages of an export, once per restart; returns the plain dict ``_write_output`` reads.
 
     The bundle at full q (1), BerkeleyGW's head momenta and ζ columns (2), the
@@ -852,9 +1008,24 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
     if len(kpts) != nk:
         raise ValueError(f"GATE bsemat_full_grid: {wfn_co} has {len(kpts)} k, the bundle {nk}; "
                          "want an explicit full-grid WFN_co (no_symmetries_coarse_grid).")
-    b2l = grid_index(kpts, grid)
-    if len(set(b2l.tolist())) != nk:
+    # Finite Q: row j holds the electron at k_j (WFN_co) and the hole at k_j − Q (the grid).
+    exciton_Q = np.asarray(exciton_Q, dtype=np.float64).reshape(3)
+    qflag, c_rows, v_rows = finite_q_legs(kpts, grid, exciton_Q)
+    if (qflag == 0) != bool(wfnq_co):
+        raise ValueError(f"GATE bsemat_finite_q_wfnq: exciton_Q {exciton_Q.tolist()} is "
+                         + ("off the restart grid and no WFNq_co was given; fix: --wfnq-co, the "
+                            "restart grid's explicit WFN (BerkeleyGW reads the hole leg from it)"
+                            if qflag == 0 else "on the restart grid, where WFNq_co is not read; "
+                            "fix: drop --wfnq-co"))
+    if c_rows is not None and len(set(c_rows.tolist())) != nk:
         raise ValueError("GATE bsemat_k_bijection: WFN_co k points do not cover the grid once")
+    wfn_v = wfnq_co if qflag == 0 else wfn_co            # the file whose gauge the hole leg takes
+    kv = F.read_wfn_k_list(wfn_v)[0] if qflag == 0 else kpts
+    kv_rows = grid_index(kv, grid)
+    if len(kv) != nk or len(set(kv_rows.tolist())) != nk:
+        raise ValueError(f"GATE bsemat_k_bijection: {wfn_v} k points do not cover the grid once")
+    row_of = np.empty(nk, np.int64)
+    row_of[kv_rows] = np.arange(nk)                      # flat grid index -> row of wfn_v
     with h5py.File(wfn_co, "r") as w:
         el_all = np.asarray(w["mf_header/kpoints/el"][()]).reshape(-1, nk, int(w["mf_header/kpoints/mnband"][()]))[0]
         ecutwfc = float(w["mf_header/kpoints/ecutwfc"][()])
@@ -938,14 +1109,33 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
                                else os.path.join(os.path.dirname(os.path.abspath(input_file)),
                                                  params["centroids_file"]),
                                tuple(int(x) for x in wfn.fft_grid))[0]
+    nb = n_val + n_cond
+    eye = lambda: np.broadcast_to(np.eye(nb), (nk, nb, nb)).copy()
+    gmap = lambda psi, wfile, rows, e: gauge_map(
+        psi, wfn_co=wfile, k_rows=rows, bands_abs=bands_abs, centroid_frac=cent_frac,
+        fft_grid=wfn.fft_grid, nv=n_val, enk_win=e, mesh_xy=mesh_xy)
     if use_gauge_map:
-        Ug, gfig = gauge_map(psi_win, wfn_co=wfn_co, k_rows=b2l, bands_abs=bands_abs,
-                             centroid_frac=cent_frac, fft_grid=wfn.fft_grid, nv=n_val,
-                             enk_win=enk_win, mesh_xy=mesh_xy)
+        U_file, gfig = gmap(psi_win, wfn_v, kv_rows, enk_win)
     else:
-        Ug = np.broadcast_to(np.eye(n_val + n_cond), (nk, n_val + n_cond, n_val + n_cond)).copy()
-        gfig = {"gauge_map": "identity (red twin)"}
-    _log(f"[bsemat] gauge map: {gfig}")
+        U_file, gfig = eye(), {"gauge_map": "identity (control variant)"}
+    _log(f"[bsemat] gauge map ({os.path.basename(wfn_v)}): {gfig}")
+    # The two legs of every file row, in its own k order: source ψ and window unitary.
+    src_v, Uv = psi_win[v_rows], U_file[row_of[v_rows]]
+    if qflag == 0:
+        psi_h, enk_h, ht_rec = htransform_window(input_file, kpts, n_val=n_val, n_cond=n_cond,
+                                                 n_rmu=n_rmu, mesh_xy=mesh_xy)
+        src_c = np.zeros_like(psi_win)
+        src_c[..., :n_rmu] = psi_h
+        eps_c = enk_h[:, n_val:]
+        if use_gauge_map:
+            Uc, gfig_c = gmap(src_c, wfn_co, np.arange(nk), enk_h)
+        else:
+            Uc, gfig_c = eye(), {"gauge_map": "identity (control variant)"}
+        _log(f"[bsemat] gauge map ({os.path.basename(wfn_co)}, htransform electron leg): {gfig_c}")
+        gfig = {"hole_leg": gfig, "electron_leg": gfig_c,
+                "htransform": [str(r)[:400] for r in ht_rec]}
+    else:
+        src_c, Uc, eps_c = psi_win[c_rows], U_file[row_of[c_rows]], enk_win[c_rows, n_val:]
 
     # q = 0 head column check against the bundle's G = 0 vector.
     q0 = [kk for kk, (iq, G) in enumerate(keys) if iq == 0 and G == (0, 0, 0)][0]
@@ -956,18 +1146,25 @@ def _export_context(*, input_file, wfn_co, n_val, n_cond, rcond, bgw_eps, use_ga
 
     nocc_abs = int(bands_abs[n_val])
     efermi = 0.5 * (el_all[:, :nocc_abs].max() + el_all[:, nocc_abs:].min()) * 13.605693122994
+    # The exchange tile: head-less Γ at Q = 0, V at wrap(−Q) with every G otherwise.
+    V_ex, ex_rec = exchange_tile(exciton_Q, qflag, data=data, input_file=input_file, restart=restart,
+                                 grid=grid, n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, mesh_xy=mesh_xy)
+    _log(f"[bsemat] exchange: {ex_rec}; exciton_Q {exciton_Q.tolist()} (qflag {qflag}, "
+         f"exciton_Q_shift {(-exciton_Q).tolist()})")
     _stage(None)
     data["W_q"] = data["V_q_full"] = None            # the flattened copies above stay resident
     return dict(restart=restart, sys_dim=sys_dim, bgw_eps=bgw_eps, wfn=wfn, wfn_co=wfn_co,
                 mesh_xy=mesh_xy, rep=rep, n_val=n_val, n_cond=n_cond, nk=nk, grid=grid,
                 n_rmu=n_rmu, n_rmu_pad=n_rmu_pad, nspinor=int(psi_v.shape[2]), omega=omega,
-                bvec=bvec, kpts=kpts, kgrid_w=kgrid_w, b2l=b2l, ecutwfc=ecutwfc, efermi=efermi,
+                bvec=bvec, kpts=kpts, kgrid_w=kgrid_w, ecutwfc=ecutwfc, efermi=efermi,
+                exciton_Q=exciton_Q, qflag=qflag, exchange=ex_rec, eps_c=eps_c,
+                src_c=src_c, src_v=src_v, Uc=Uc, Uv=Uv,
                 keys=keys, n_ties=n_ties, iq_pair=iq_pair, key_pair=key_pair,
                 lam_pair=qlen if sys_dim == 3 else np.ones_like(qlen),
                 z_keys=z_keys, y_keys=y_keys, W11=W11, figs=figs, split_stats=split_stats,
                 v_head_q=v_head_q,
-                W_flat=W_flat, V_flat=V_flat, Vbar=data["V_q0"], psi_win=psi_win,
-                use_gauge_map=use_gauge_map, Ug=Ug, gfig=gfig, q0_dipole={},
+                W_flat=W_flat, V_flat=V_flat, Vbar=V_ex, psi_win=psi_win,
+                use_gauge_map=use_gauge_map, gfig=gfig, q0_dipole={},
                 q0_update=jax.jit(lambda w, a, d: w.at[:, :, 0].set(
                     A.add_q0_body_update(w[:, :, 0], a, d, xp=jnp)), out_shardings=W_flat.sharding))
 
@@ -1066,16 +1263,17 @@ def _write_output(ctx, out, *, release):
 
         # ── ψ in the file's gauge, k order and band order ─────────────────
         with timing.section("psi_map"):
-            Ug, gfig = ctx["Ug"], ctx["gfig"]
-            if ctx["use_gauge_map"] and not out["use_gauge_map"]:     # red twin beside mapped files
+            Uc, Uv, gfig = ctx["Uc"], ctx["Uv"], ctx["gfig"]
+            if ctx["use_gauge_map"] and not out["use_gauge_map"]:     # control variant beside mapped files
                 nb = n_val + n_cond
-                Ug = np.broadcast_to(np.eye(nb), (nk, nb, nb)).copy()
-                gfig = {"gauge_map": "identity (red twin)"}
+                Uc = Uv = np.broadcast_to(np.eye(nb), (nk, nb, nb)).copy()
+                gfig = {"gauge_map": "identity (control variant)"}
                 _log(f"[bsemat] gauge map: {gfig}")
-            # ψ_file,n = Σ_m ψ_LX,m conj(U[n, m]); rows of the file in WFN_co order.
-            psi_map = np.einsum("knsr,kmn->kmsr", ctx["psi_win"][ctx["b2l"]], np.conj(Ug))
-            psi_v_b = psi_map[:, :n_val][:, ::-1]                     # BerkeleyGW: iv = 1 highest
-            psi_c_b = psi_map[:, n_val:]
+            # ψ_file,n = Σ_m ψ_LX,m conj(U[n, m]); rows of the file in WFN_co order, the hole leg
+            # at k − Q and the electron leg at k (the same rows at Q = 0).
+            to_file = lambda src, U: np.einsum("knsr,kmn->kmsr", src, np.conj(U))
+            psi_v_b = to_file(ctx["src_v"], Uv)[:, :n_val][:, ::-1]   # BerkeleyGW: iv = 1 highest
+            psi_c_b = to_file(ctx["src_c"], Uc)[:, n_val:]
             psi_1 = np.concatenate([psi_v_b, psi_c_b], axis=1) if extended else psi_v_b
             psi_2 = psi_1 if extended else psi_c_b
             sx = NamedSharding(mesh_xy, P(None, None, None, "x"))
@@ -1114,7 +1312,8 @@ def _write_output(ctx, out, *, release):
                     out_path, wfn_file=ctx["wfn_co"], kpts=ctx["kpts"], kgrid=ctx["kgrid_w"],
                     nvb=n_val, ncb=n_cond, extended=extended,
                     icutv=F.ICUTV_OF_SYS_DIM[ctx["sys_dim"]], ecuts=ctx["ecutwfc"],
-                    ecutg=ctx["ecutwfc"], efermi=ctx["efermi"], nspinor=ctx["nspinor"])
+                    ecutg=ctx["ecutwfc"], efermi=ctx["efermi"], nspinor=ctx["nspinor"],
+                    qflag=ctx["qflag"], exciton_Q_shift=-ctx["exciton_Q"])
             shape = F.matrix_shape(nk, n1b, n2b)
             _barrier()
         fro = np.zeros(4)
@@ -1156,6 +1355,10 @@ def _write_output(ctx, out, *, release):
             "ties": ctx["n_ties"], "q0_body": q0_body, "q0_dipole": q0_fig, "downfold": df_fig,
             "frobenius": dict(zip(("head", "wing", "body", "exchange"), np.sqrt(fro).tolist())),
             "split": ctx["figs"], "head_split": ctx["split_stats"], "gauge": gfig, "vbar_imag_rel": vim,
+            "exciton_Q": ctx["exciton_Q"].tolist(), "qflag": int(ctx["qflag"]),
+            "exciton_Q_shift": (-ctx["exciton_Q"]).tolist(), "exchange": ctx["exchange"],
+            "kpts": np.asarray(ctx["kpts"]).tolist(),
+            "eps_c_ry": np.asarray(ctx["eps_c"]).tolist(),
             "wall_rows_s": t_end - t_rows, "peak_device_bytes": _peak_device_bytes()}
 
 

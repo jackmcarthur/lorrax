@@ -3,7 +3,7 @@
     python3 -u -m bse.bsemat_cli -i cohsex.in --wfn-co WFN_co.h5 --n-val 8 --n-cond 8 \\
         [--kernel tda extended] [--bgw-eps epsmat.h5] [--gauge map identity] \\
         [--q0-body head-less dipole] [--mu-small off|N|Nx|auto ...] [--downfold-rcond R] \\
-        [-o bsemat.h5]
+        [--exciton-Q Q1 Q2 Q3 [--wfnq-co WFNq_co.h5]] [-o bsemat.h5]
 
 ``-i`` is the producer GW deck. Its run directory holds the restart
 (``tmp/isdf_tensors_*.h5``: a static-Dyson ``W0_qmunu``, ``V_qmunu`` and, beside
@@ -19,6 +19,14 @@ BerkeleyGW's 3-D q0 body term from the bundle's stored q → 0 wings
 (default ``off``) first downfolds the restart onto μ_S of its centroids against
 the file's own band window (the ``gw.downfold`` driver's selection and transfer,
 docs/downfold.md) and builds the rows by GEMMs over the small W.
+
+``--exciton-Q`` (crystal, default 0) writes kernel.x's finite-momentum kernel on
+the same coarse k count: file row k holds the electron at k (WFN_co) and the hole
+at k − Q, the pair |v k−Q, c k⟩ of ``bse.exciton_bands``' |v k, c k+Q⟩. On the
+restart grid both legs are the restart's (``exciton_Q_shift 2 -Q``). Off it, WFN_co
+is the restart grid shifted by +Q, its states come from the htransform, the hole
+gauge from ``--wfnq-co`` and the exchange tile from the per-Q ζ refit
+(``exciton_Q_shift 0 -Q``). docs/theory/bgw-bsemat-export.md#finite-q.
 
 Several files from one load: ``--kernel`` (``--extended`` = ``--kernel extended``),
 ``--gauge``, ``--q0-body`` and ``--mu-small`` each take one or more values, and the
@@ -72,6 +80,15 @@ def build_parser():
                          "docs/theory/bgw-bsemat-export.md#downfold has the measured accuracy)")
     ap.add_argument("--downfold-rcond", type=float, default=None,
                     help="downfold transfer cut, relative eigenvalue (default: gw.downfold's 1.1e-6)")
+    ap.add_argument("--exciton-Q", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                    metavar=("Q1", "Q2", "Q3"), dest="exciton_Q",
+                    help="exciton momentum Q (crystal; default 0): the kernel of the pairs |v k-Q, c k> on "
+                         "WFN_co's k list, written with BerkeleyGW's exciton_Q_shift = -Q (qflag 2 on the "
+                         "restart grid, 0 off it). Off the grid WFN_co is the grid shifted by Q and the "
+                         "electron leg comes from the htransform, as in bse.exciton_bands")
+    ap.add_argument("--wfnq-co", default=None,
+                    help="off-grid --exciton-Q only: the restart grid's explicit WFN, BerkeleyGW's WFNq_co "
+                         "(the hole leg's coefficient gauge)")
     ap.add_argument("-o", "--output", default="bsemat.h5",
                     help="output file; with several combinations, the <stem><ext> of <stem>_<tag><ext>")
     ap.add_argument("--summary", default=None,
@@ -164,7 +181,8 @@ def main(argv=None) -> int:
                            downfold_rcond=a.downfold_rcond)
                for f in files]
     ss = run_bsemat_exports(input_file=a.input, wfn_co=a.wfn_co, n_val=a.n_val, n_cond=a.n_cond,
-                            bgw_eps=a.bgw_eps, outputs=outputs, mesh_xy=create_mesh_2d())
+                            bgw_eps=a.bgw_eps, outputs=outputs, exciton_Q=a.exciton_Q,
+                            wfnq_co=a.wfnq_co, mesh_xy=create_mesh_2d())
     wall = time.perf_counter() - _t_main + (_pre_main or 0.0)
     startup = {r["name"][len("bsemat."):]: float(r["inclusive"]) for r in timing.records()
                if r["depth"] == 0 and (r["name"] == "bsemat.imports"
