@@ -1772,9 +1772,10 @@ _DEFAULTS = {
     "write_wfn_h5": True,
     # BSE interpolation setup (htransform-driven fine-k wfn recovery; see
     # ``bandstructure.bse_setup.compute_wfns_fi``).
-    # Search ceiling for the published whole-state randomized QRCP basis.
-    # The qr_eps rank criterion selects the physical rank; this multiplier
-    # only bounds the search.  0 is accepted as an archived spelling of 20.
+    # The nodal htransform basis is the centroid set itself (rank spin x
+    # centroids): htransform_rank_multiplier and htransform_qrcp_seed bound
+    # nothing and are accepted for archived decks (0 spells 20);
+    # htransform_qr_eps only cuts the Gram pseudo-inverse of the refit's grid rows.
     "htransform_rank_multiplier": 20.0,
     "htransform_qr_eps": 1.0e-3,
     "htransform_qrcp_seed": 0,

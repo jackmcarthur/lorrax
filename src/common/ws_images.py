@@ -18,7 +18,10 @@ The one implementation for every position-indexed consumer:
 * :func:`pair_ws_weights` — the per-pair weights of one class (traceable);
 * :func:`pair_ws_embed` — elementwise application: the coarse ``X(R)``
   placed on a finer R lattice, whose FFT is the interpolant on that grid;
-* :func:`pair_ws_fourier` — the same interpolant at an explicit k list.
+* :func:`pair_ws_fourier` — the same interpolant at an explicit k list;
+* :func:`pair_ws_code_table` / :func:`pair_ws_code_fourier` — the same
+  interpolant from a compact per-element tie code and a per-k phase table,
+  for repeated k batches against one class-major tensor (no weight stack).
 
 Conventions.  Positions are lattice (crystal) coordinates in the tensor's
 own gauge (the ISDF centroids sit at FFT index / N, in ``[0, 1)``); the
@@ -35,8 +38,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-__all__ = ["WS_TIE_TOL_BOHR2", "lattice_bohr", "pair_ws_embed",
-           "pair_ws_fourier", "pair_ws_images", "pair_ws_weights"]
+__all__ = ["WS_TIE_TOL_BOHR2", "lattice_bohr", "pair_ws_code_fourier",
+           "pair_ws_code_table", "pair_ws_embed", "pair_ws_fourier",
+           "pair_ws_images", "pair_ws_weights"]
 
 #: Absolute tie tolerance on squared distances (bohr²), the one tolerance of
 #: every image selection.  Symmetry-related images agree to rounding
@@ -263,4 +267,71 @@ def pair_ws_fourier(X_R, images: dict, k, *, pin=None):
         _class, acc0,
         (Xc, jnp.asarray(images["a"]), jnp.asarray(images["b"]),
          jnp.asarray(images["valid"]), vec))
+    return acc
+
+
+def pair_ws_code_table(images: dict) -> dict:
+    """Compact form of :func:`pair_ws_weights` for every class and pair.
+
+    Element ``(c, i, j)``'s tie set (its minimal images, weight ``1/N_deg``
+    each) is a bitmask over the class's candidate slots, decided by
+    :func:`pair_ws_weights` itself, so there is one rule.  Distinct masks over
+    all classes are interned as patterns.
+
+    Returns a dict of host arrays: ``code`` (n_c, n, n) int16 pattern index,
+    ``weights`` (n_pat, n_t) the ``1/N_deg`` weight of each slot in each
+    pattern, ``img``/``valid`` from ``images`` and ``kgrid``.
+    """
+    n_t = int(images["img"].shape[1])
+    if n_t > 62:
+        raise ValueError(f"pair_ws_code_table: {n_t} candidate images per "
+                         "class exceed the 62-bit tie mask")
+    pos = images["pos"]
+    bits = np.left_shift(np.int64(1), np.arange(n_t, dtype=np.int64))
+    masks = np.stack([
+        (np.asarray(pair_ws_weights(pos, a_c, b_c, v_c, float(images["tol"])))
+         > 0).astype(np.int64) @ bits
+        for a_c, b_c, v_c in zip(images["a"], images["b"], images["valid"])])
+    patterns, code = np.unique(masks, return_inverse=True)
+    if patterns.size >= np.iinfo(np.int16).max:
+        raise ValueError(f"pair_ws_code_table: {patterns.size} tie patterns "
+                         "exceed the int16 code")
+    member = (patterns[:, None] & bits[None, :]) != 0
+    weights = member / member.sum(axis=1, keepdims=True)
+    return dict(code=code.reshape(masks.shape).astype(np.int16),
+                weights=weights, img=images["img"], valid=images["valid"],
+                kgrid=images["kgrid"])
+
+
+def pair_ws_code_fourier(X_R, table: dict, k, *, code=None, pin=None):
+    """:func:`pair_ws_fourier` from the code table, ``(nk, n, n)``.
+
+    ``X_R`` is CLASS-MAJOR ``(n_c, n, n)`` (``ifftn`` R order).  Per k the
+    phases of every class's candidate images are folded into one
+    ``(n_c, nk, n_pat)`` table, then each element gathers its pattern's
+    phase: work ``nk * n_c * n**2``, the box sum's, and no per-pair weight
+    stack.  ``code`` optionally supplies the ``(n_c, n, n)`` int code already
+    placed on device (e.g. on the tensor's own sharding); ``pin`` constrains
+    the ``(nk, n, n)`` carry inside a jit.
+    """
+    keep = pin if pin is not None else (lambda x: x)
+    k = jnp.atleast_2d(jnp.asarray(k, dtype=jnp.float64))
+    img = jnp.asarray(table["img"], dtype=jnp.float64)          # (n_c, n_t, 3)
+    ph = jnp.where(jnp.asarray(table["valid"])[None],
+                   jnp.exp(-2j * jnp.pi * jnp.einsum('qi,cti->qct', k, img)),
+                   0.0)
+    lut = jnp.einsum('qct,pt->cqp', ph,
+                     jnp.asarray(table["weights"], dtype=jnp.float64))
+    code = jnp.asarray(table["code"]) if code is None else code
+    if tuple(X_R.shape) != tuple(code.shape):
+        raise ValueError(f"pair_ws_code_fourier: tensor {tuple(X_R.shape)} "
+                         f"and code {tuple(code.shape)} disagree")
+
+    def _class(acc, xs):
+        x_c, code_c, lut_c = xs
+        return keep(acc + jnp.take(lut_c, code_c.astype(jnp.int32), axis=1)
+                    * x_c[None]), None
+
+    acc0 = keep(jnp.zeros((k.shape[0],) + tuple(X_R.shape[1:]), X_R.dtype))
+    acc, _ = jax.lax.scan(_class, acc0, (X_R, code, lut))
     return acc
