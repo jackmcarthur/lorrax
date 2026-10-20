@@ -360,7 +360,7 @@ def test_extra_eta_verification_keeps_all_original_ids_and_only_active_span_exte
     extra=got[len(native):];span=np.ptp(energy[:,active])
     assert receipt['native_count']==len(native) and receipt['native_ids_unchanged']
     assert receipt['extra_count']==len(extra) and receipt['active_transition_span_ry']==span
-    assert set(extra)=={complex(x,eta) for x in (0.,.2,.4,.5*span,span)}
+    assert set(extra)=={complex(x,eta) for x in (0.,.25*span,.5*span,.75*span,span)}
     assert np.all((extra.real>=0)&(extra.real<=span)) and np.all(extra.imag==eta)
     assert 4.+.3j in got and 4.+1j*eta not in got # native far-frequency held point survives
     assert 'not a Sigma error certificate' in receipt['scope']
@@ -376,19 +376,54 @@ def test_extra_eta_verification_keeps_all_original_ids_and_only_active_span_exte
 
 def test_extra_eta_verification_uses_current_energies_and_exact_native_deduplication():
     from gw.shared_pole_screening import active_eta_verification_sites
-    eta=.125;native=np.array([0.+1j*eta,.5+1j*eta,20.+.4j,.5+1j*eta])
+    eta=.125;native=np.array([0.+1j*eta,.5+1j*eta,20.+.4j])
     original=native.copy()
     energy=np.array([[-10.,0.,1.,8.]])
-    first,_=active_eta_verification_sites(native,energy,slice(1,3),eta)
-    assert len(first)==len(native)+1 and first[-1]==1.+1j*eta
+    first,_=active_eta_verification_sites(native,energy,slice(1,3),eta,native_fit_count=2)
+    assert set(first[len(native):])=={.25+1j*eta,.75+1j*eta,1.+1j*eta}
     energy[:,2]=2.
-    second,receipt=active_eta_verification_sites(native,energy,slice(1,3),eta)
+    second,receipt=active_eta_verification_sites(native,energy,slice(1,3),eta,native_fit_count=2)
     assert receipt['active_transition_span_ry']==2.
-    assert set(second[len(native):])=={1.+1j*eta,2.+1j*eta}
+    assert set(second[len(native):])=={1.+1j*eta,1.5+1j*eta,2.+1j*eta}
     np.testing.assert_array_equal(native,original)
     for bad_eta in (0.,-1.,np.nan):
         with pytest.raises(ValueError,match='shared_general_verification'):
             active_eta_verification_sites(native,energy,slice(1,3),bad_eta)
+
+
+def test_eta_training_and_independent_holds_keep_native_roles_and_pencil_nodes_disjoint():
+    from gw.shared_pole_screening import active_eta_verification_sites
+    energy=np.array([[-10.,0.,1.,8.]])
+    eta=.1
+    # Native held midpoint CANNOT be silently promoted to training. Existing
+    # fit zero is reused; existing held quarter stays held; all IDs survive.
+    native=np.array([0.+.1j,.8+.3j,.5+.1j,.25+.1j,1.+.3j])
+    sites,receipt=active_eta_verification_sites(native,energy,slice(1,3),eta,native_fit_count=2)
+    np.testing.assert_array_equal(sites[:len(native)],native)
+    fit=receipt['fit_positions'];held=receipt['held_positions']
+    assert fit==[0,1,5] and held==[2,3,4,6]
+    assert sites[5]==1.+.1j and sites[6]==.75+.1j
+    assert any(c['role']=='fit' and c['fraction']==.5 for c in receipt['collisions'])
+    assert not set(fit)&set(held) and not set(sites[fit])&set(sites[held])
+    # Independently mirror exactly the builder's alternating two-sided
+    # conditions: mirrors go to the opposite side, and a purely imaginary
+    # support must not be duplicated into BOTH sides.
+    left=[];right=[]
+    for i,z in enumerate(sites[fit]):
+        own,other=(right,left) if i%2 else (left,right)
+        own.append(z)
+        if z.real!=0:other.append(-z.conjugate())
+    assert min(abs(a-b) for a in left for b in right)>0
+
+
+def test_collapsed_active_span_does_not_invent_independent_eta_hold():
+    from gw.shared_pole_screening import active_eta_verification_sites
+    native=np.array([0.+.1j]);energy=np.array([[-1.,.3,.3,2.]])
+    sites,receipt=active_eta_verification_sites(native,energy,slice(1,3),.1,native_fit_count=1)
+    np.testing.assert_array_equal(sites,native)
+    assert receipt['collapsed_span'] and receipt['fit_positions']==[0]
+    assert receipt['held_positions']==[]
+    assert len([c for c in receipt['collisions'] if c['role']=='held'])==2
 
 
 def test_structural_endpoint_band_ranges_match_literal_nonstationary_all_q():

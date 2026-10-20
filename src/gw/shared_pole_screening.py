@@ -18,10 +18,10 @@ import numpy as np
 from common import timing
 
 
-def active_eta_verification_sites(native_sites, energy, active, eta_ry):
-    """Keep native IDs, append verification sites inside the active gap span.
+def active_eta_verification_sites(native_sites, energy, active, eta_ry, *, native_fit_count=0):
+    """Keep native IDs, append active-height training and independent holds.
 
-    Energies/sites are Ry. These are verification geometry, NOT a bound on
+    Energies/sites are Ry. This is numerical geometry, NOT a bound on
     full complex Sigma error. Every native fit/held site stays byte-identical
     in the original order; full-Sigma refinement remains independently needed.
     """
@@ -29,17 +29,33 @@ def active_eta_verification_sites(native_sites, energy, active, eta_ry):
     energy=np.asarray(energy,float)
     if (native.ndim!=1 or energy.ndim!=2 or not np.isfinite(native).all()
             or not np.isfinite(energy).all() or not np.isfinite(eta_ry) or eta_ry<=0
-            or not 0<=active.start<active.stop<=energy.shape[1]):
+            or not 0<=active.start<active.stop<=energy.shape[1]
+            or not 0<=native_fit_count<=native.size):
         raise ValueError('GATE shared_general_verification: finite native sites and active energies required')
     span=float(np.ptp(energy[:,active]))
-    real=np.unique(np.r_[native.real[(native.real>0)&(native.real<=span)],0.,.5*span,span])
-    extra=np.array([complex(x,eta_ry) for x in real if complex(x,eta_ry) not in native],complex)
+    sites=list(native)
+    fit=list(range(int(native_fit_count))); held=list(range(int(native_fit_count),len(native)))
+    collisions=[]
+    for role,fractions in (('fit',(0.,.5,1.)),('held',(.25,.75))):
+        own,other=(fit,held) if role=='fit' else (held,fit)
+        for fraction in fractions:
+            z=complex(fraction*span,eta_ry)
+            matches=[i for i,value in enumerate(sites) if value==z]
+            if any(i in other for i in matches):
+                collisions.append(dict(role=role,fraction=fraction,reason='opposite-role existing site'))
+            elif matches:
+                if matches[0] not in own:
+                    own.append(matches[0])
+            else:
+                own.append(len(sites));sites.append(z)
+    extra=np.asarray(sites[len(native):],complex)
     receipt=dict(native_count=len(native),extra_count=len(extra),eta_ry=float(eta_ry),
         active_bands=[active.start,active.stop],active_transition_span_ry=span,
         extra_real_sites_ry=extra.real.tolist(),native_ids_unchanged=True,
-        scope='verification geometry only; not a Sigma error certificate',
+        fit_positions=fit,held_positions=held,collisions=collisions,collapsed_span=span==0.,
+        scope='training/verification geometry only; not a Sigma error certificate',
         required_refinement='full complex Sigma including real/offdiagonal and collision operators')
-    return np.concatenate((native,extra)),receipt
+    return np.asarray(sites,complex),receipt
 
 
 def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapshot,
@@ -134,10 +150,12 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # Geometry and selection are numerical spaces held only within this
     # physical refresh. Current census and scientific identity stay current.
     recipe = dict(fit_basis.setdefault("recipe", resolved), census=current_meta.shared_pole_census)
-    general_gates = dict(version="full-density-general-shared-pole-gates-v3",
+    general_gates = dict(version="full-density-general-shared-pole-gates-v4",
         source_policy_version=recipe.get("recipe_version", recipe.get("version")),
         scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
-        eta_verification='propagated_active_span_v1',
+        eta_training_verification='active_span_3train_2interlaced_held_v1',
+        numerical_spaces='two-sided-descriptor-svd',
+        descriptor_rank_tolerance=float(recipe['bank_rule_tolerance']),
         full_microscopic_support=True, finite_density_and_residues=True,
         scalar_rule_tolerance=float(recipe["bank_rule_tolerance"]),
         full_matrix_fit_held_tolerance=float(snapshot.get("fit_tolerance", .02)),
@@ -180,13 +198,23 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     mm = face_matmul(mesh_xy)
     fit_ids, held_ids = list(map(int, recipe["fit_ids"])), list(map(int, recipe["held_ids"]))
     sites = np.asarray([_sample_point(recipe, i) for i in fit_ids+held_ids], complex)
-    # Extra held supports at the actual electronic smoothing height measure
-    # the continuation relevant to Sigma, not only the high native fit line.
+    # Fit the observed continuation scale, while keeping independent
+    # interlaced holds and EVERY original native fit/held position intact.
     eta = float(snapshot["eta_ry"])
-    sites,verification_geometry=active_eta_verification_sites(sites,energy,active,eta)
+    sites,verification_geometry=active_eta_verification_sites(sites,energy,active,eta,
+        native_fit_count=len(fit_ids))
+    fit_positions=verification_geometry['fit_positions']
+    held_positions=verification_geometry['held_positions']
+    recipe['general_support_geometry']=dict(sites_ry=[[float(z.real),float(z.imag)] for z in sites],
+        fit_positions=fit_positions,held_positions=held_positions,
+        training_width_policy='native imaginary_width / line_direction_cap by support type')
     widths = [int(recipe["imaginary_width"]) if z.real == 0 else
-              int(recipe.get("line_direction_cap") or nmu) for z in sites[:len(fit_ids)]]
-    side_bound = sum(extent for z, extent in zip(sites[:len(fit_ids)], widths) if z.real != 0)
+              int(recipe.get("line_direction_cap") or nmu) for z in sites[fit_positions]]
+    recipe['general_support_geometry']['training_widths']=widths
+    general_gates['support_geometry_hash']=hashlib.sha256(_json(recipe['general_support_geometry']).encode()).hexdigest()
+    recipe['gate_hash']=hashlib.sha256(_json(general_gates).encode()).hexdigest()
+    recipe['recipe_hash']=hashlib.sha256(_json({k:v for k,v in recipe.items() if k!='recipe_hash'}).encode()).hexdigest()
+    side_bound = sum(extent for z, extent in zip(sites[fit_positions], widths) if z.real != 0)
     side_bound += sum(widths)+2*int(recipe["infinity_width"])
     ranks = int(mesh_xy.size)
     bank_bytes = 16*nk*len(sites)*nmu*nmu//ranks
@@ -316,21 +344,21 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     coords = np.unravel_index(np.arange(nk), grid)
     minus = np.ravel_multi_index(tuple((-c) % n for c, n in zip(coords, grid)), grid)
     left_states, right_states = [], []
-    for i in range(len(fit_ids)):
+    for training_index,i in enumerate(fit_positions):
         W = values[i]
         width = (int(recipe["imaginary_width"]) if sites[i].real == 0
                  else int(recipe.get("line_direction_cap") or nmu))
         if i not in directions:
             # Both sides use singular directions: -Herm(W) is not PSD for
             # a general coherent/gain input and must not be used as a Gram.
-            source = W if i % 2 else jax.jit(lambda w: jnp.conj(jnp.swapaxes(w, -1, -2)),
+            source = W if training_index % 2 else jax.jit(lambda w: jnp.conj(jnp.swapaxes(w, -1, -2)),
                                              out_shardings=face)(W)
             q, _ = distrib_la.right_singular_vectors(source, float(recipe["direction_cutoff"]),
                 eigh_plan=eig, column_extent=extent, max_rank=width,
                 multiplet_tol=float(recipe["multiplet_relative_tolerance"]))
             directions[i] = q
         q = directions[i]
-        if i % 2:
+        if training_index % 2:
             right_states.append((sites[i], q, mm(W, q)))
         else:
             left_states.append((sites[i], q, mm(q, W, transa="C")))
@@ -340,7 +368,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             # sample, equilibrium transpose relation or PSD premise enters.
             qm = jnp.conj(q[minus])
             wm = jnp.conj(W[minus])
-            if i % 2:
+            if training_index % 2:
                 left_states.append((-sites[i].conjugate(), qm, mm(qm, wm, transa="C")))
             else:
                 right_states.append((-sites[i].conjugate(), qm, mm(wm, qm)))
@@ -354,7 +382,10 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     begin("pencil")
     E, A, B, C = jax.jit(lambda mu, lam, ql, il, qr, wr: general_tangential_pencil(
         (mu, ql, il), (lam, qr, wr), matmul=mm), out_shardings=(face, face, face, face))(mu, lam, ql, il, qr, wr)
-    # General infinity rows preserve the exact 1/z and 1/z² coefficients.
+    # General infinity rows constrain the exact 1/z and 1/z² coefficients
+    # on the retained infinity directions. Full-port moment defects are
+    # measured below; finite direction/reduction accuracy does not make
+    # those full-matrix coefficients exact.
     # They are not forced to be Hermitian/even for a coherent finite-band
     # projected density algebra. Gamma shifts X2 by -i gamma X1 once.
     x1, x2 = full_density_bare_moments((pm, pn, ph, energy_d), meta,
@@ -423,6 +454,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         # rank-conditional lambda or mix independent host modal gauges.
         pencils=[(np.asarray(gather_to_host(E[iq])),np.asarray(gather_to_host(A[iq]))) for iq in ids]
         models=collective_general_pencil_batch(pencils,max_order=cap,max_workspace_bytes=workspace,
+            rank_tolerance=float(recipe['bank_rule_tolerance']),
             fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained)
         for batch_index,(iq,model) in enumerate(zip(ids,models)):
             spaces.setdefault(iq, model["spaces"])
@@ -486,13 +518,15 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                     space_right=model['spaces']['right'],space_left=model['spaces']['left'],
                     bank_poles_ry=p,left_column_norm=ln,right_column_norm=rn,residue_norm_bound=ln*rn,
                     energy_ry=energy,U_active=np.asarray(snapshot['U_active']),rho_active=np.asarray(snapshot['rho_active']),
-                    sites_ry=sites,gamma_ry=np.array(gamma),eta_ry=np.array(eta))
+                    sites_ry=sites,fit_positions=np.asarray(fit_positions,np.int32),
+                    held_positions=np.asarray(held_positions,np.int32),
+                    gamma_ry=np.array(gamma),eta_ry=np.array(eta))
                 # Full-port actions contract ON DEVICE into frequency-only
                 # Grams. Their host bound includes existing batch inputs,
                 # canonical maps/spaces and the two optional held actions.
-                selected=list(range(len(fit_ids)+len(held_ids),min(len(sites),len(fit_ids)+len(held_ids)+2)))
+                selected=[j for j in held_positions if j>=len(fit_ids)+len(held_ids)][:2]
                 if not selected:
-                    selected=list(range(len(fit_ids),min(len(sites),len(fit_ids)+2)))
+                    selected=held_positions[:2]
                 action_bytes=16*(nl*nl+nr*nr+len(selected)*nl*nr)
                 base_bytes=retained+sum(e.nbytes+a.nbytes for e,a in pencils)
                 base_bytes+=sum(sum(m[k].nbytes for k in ('poles_ry','output_map','input_map'))+
@@ -587,7 +621,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             got = mm(l/put((z-p)[None, None]), r, transb="C")
             target = values[j][iq:iq+1]
             error = float(jnp.linalg.norm(got-target)/jnp.maximum(jnp.linalg.norm(target), 1e-300))
-            checks.append(dict(q=iq, support=j, held=j >= len(fit_ids), error=error))
+            checks.append(dict(q=iq, support=j, held=j in held_positions, error=error))
             if not np.isfinite(error) or error > tolerance:
                 raise ValueError(f"GATE shared_general_held_w: q={iq} support={j} relative error {error:.6g}>{tolerance}")
     end("checks")

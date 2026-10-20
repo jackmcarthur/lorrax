@@ -204,6 +204,29 @@ def test_general_pencil_signed_residue_not_psd_constrained():
                                C @ np.linalg.solve(z*E-A, B), atol=1e-13)
 
 
+def test_descriptor_selector_discards_unresolved_E_direction_not_observable_growth():
+    # A-only directions are not made physical by a large shifted pencil.
+    # Conversely the resolved genuine UHP mode MUST survive unchanged.
+    E=np.diag([1.,.7,1e-12]).astype(complex)
+    poles=np.array([-.4-.03j,.2+.04j])
+    A=np.diag([poles[0],.7*poles[1],.8j])
+    out=reduce_general_pencil(E,A,max_order=3,rank_tolerance=1e-8)
+    assert len(out['poles_ry'])==2
+    np.testing.assert_allclose(np.sort_complex(out['poles_ry']),np.sort_complex(poles),atol=1e-14)
+    rng=np.random.default_rng(216)
+    B=rng.normal(size=(3,5))+1j*rng.normal(size=(3,5));B[-1]=0
+    C=rng.normal(size=(5,3))+1j*rng.normal(size=(5,3));C[:,-1]=0
+    for z in (-.1+.2j,.31+.11j):
+        actual=((C@out['output_map'])/(z-out['poles_ry']))@(B.conj().T@out['input_map']).conj().T
+        np.testing.assert_allclose(actual,C@np.linalg.solve(z*E-A,B),rtol=2e-13,atol=2e-13)
+    assert out['poles_ry'].imag.max()==pytest.approx(.04) # no stabilizing projection
+
+
+def test_descriptor_selector_refuses_algebraic_A_only_pencil():
+    with pytest.raises(ValueError,match='shared_general_rank'):
+        reduce_general_pencil(np.zeros((2,2),complex),np.eye(2),max_order=2,rank_tolerance=1e-8)
+
+
 def test_general_store_roundtrip_signed_complex_full_port(tmp_path, monkeypatch):
     import jax
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
