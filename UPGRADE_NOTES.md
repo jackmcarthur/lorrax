@@ -5,6 +5,22 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — `head_dense_file`: a dense-k direct head for insulators
+
+New deck key, off by default (`""`): a deck without it, or naming the GW mesh's
+own `dipole.h5`, builds today's head bit for bit.  It names a `dipole.h5` of a
+denser NSCF of the same crystal and Hamiltonian; its full-zone S_d(z) replaces
+the GW mesh's at every response node, while the wings, W(Γ) and the mini-BZ
+cell stay the GW mesh's.  The fold is the GW mesh's local-field fold scaled by
+M = S_d,dense S_d,mesh⁻¹ (`gw.head_correction.scaled_head_fold`; +1.2 % in
+ε_M on Si 4³ with an 8³ set, docs/theory/s-tensor-convention.md#scaled-fold).
+The persisted `S_cart_head`, and so the BSE, inherit it.  Metals refuse
+(`GATE head_dense_metal`), as do another operator, crystal or band window
+(`GATE head_dense_operator` / `head_dense_lattice` / `head_dense_window`).
+Recipe: QE NSCF on the dense mesh from the GW deck's SCF (nbnd ≥ occupied + 28),
+pw2bgw, then `python -m psp.get_dipole_mtxels -i <dense deck>`.
+Test: `tests/test_head_dense_source.py`.
+
 ## 2026-10-20 — one velocity operator: the V_NL sign is gone; regenerate old velocity files
 
 The velocity is $\partial_k H = i[H, r] = p + i[V_\mathrm{NL}, r]$, a unique
