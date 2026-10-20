@@ -143,6 +143,7 @@ else.
 | `shared_pole_reduction.py` | Ritz reduction of the shared-pole pencils. |
 | `shared_pole_screening.py` | Deck-driven shared real-pole screening stage. |
 | `shared_pole_sectors.py` | Charge/current cross pencils on parent-local stacks. |
+| `transition_galerkin.py` | Internal full-port transition actions, canonical CGS2/TSQR seed basis and one-parent reduced Dyson proof; not a production screening route. |
 | `sigma_box_plan.py` | Denominator-box quadrature plan for dynamic Σ(ω). |
 | `sigma_dispatch.py` | Dispatches one self-energy call per resolved compute mode. |
 | `sigma_x_bispinor.py` | Implements bare-current exchange routes for spinor inputs. |

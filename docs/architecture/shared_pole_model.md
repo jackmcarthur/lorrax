@@ -801,3 +801,76 @@ to those head denominators. Native receipts distinguish
 different bulk/head widths and checks both retarded slots against literal
 pole sums. This is coverage of the declared frozen-head approximation,
 not a refreshed-head or width-convergence result.
+
+## 12 Internal transition-Galerkin proof (not a production route)
+
+`gw.transition_galerkin` is an internal one-parent numerical proof. It is
+not selected by a deck, does not replace §11, and does not admit or write a
+full-q model. Every microscopic port and band remains in the response. Its
+ordered equation is
+
+$$
+P(z)=T K_\rho(z-D)^{-1}T^\dagger,\qquad
+(K_\rho X)_k=X_k\rho_{k-q}-\rho_kX_k,
+$$
+
+where $D_{kbd}=E_{kb}-E_{k-q,d}-i\gamma$ and
+$T_{\mu,kbd}=\sqrt{2/(N_k n_{\rm spin}n_{\rm spinor})}
+\sum_s\psi_{kbs\mu}\psi^*_{k-q,ds\mu}$. In particular, $K_\rho$
+does not commute through the resolvent for a coherent density. The catalogue
+omits only exactly null K columns; it uses no occupation threshold. A held
+catalogue can reserve every physical active column, and must refuse if a
+new density activates any omitted row. Current energies, density, partner
+indices and native wavefunctions are action operands, not compiled constants.
+
+Transition rows are whole-k sharded over both mesh axes. The vertex is
+formed in pair tiles by `lax.scan` inside `shard_map`; port actions and
+inner products use the ordered collective owner. Only narrow full-port
+panels are replicated. Source ψ face-to-k redistribution can require a
+transient source-ψ replica; it must be included in any future material
+residency admission. Neither microscopic W nor tall transition vectors are
+gathered to host.
+
+Exact current Dyson right and dual states seed one common Q. The dual
+applies K **before** the adjoint free resolvent. Existing distributed CGS2
+removes the accepted basis, then the subspace owner's TSQR orthonormalizes
+the residual block. Only its small R reaches a canonical root SVD; exact
+complex128 bit patterns distribute its rotation. Rank admission uses
+`common.rank_criterion.probe_is_independent` relative to the ORIGINAL seed
+block norm. The spectral-closure owner strictly refuses a cut through a
+near-degenerate residual singular block. This is probe independence, not
+an overlap inverse or a pole-stability selection. Capacity refuses an
+admitted block that does not fit rather than trimming it. Binary stationary
+controls use separate exact K-sign sectors. This proof currently refuses a
+coherent-reserved catalogue containing K=0 rows at a stationary projector;
+it does not silently discard the reservation. Initialization of that held
+catalogue would require a separate zero-sector triangular/dark-mode proof
+and is deferred. Opposite-q bases are related by
+conjugation and the exact $(k,b,d)\mapsto(k-q,d,b)$ permutation; self-inverse
+q seeds are completed and the resulting subspace closure is checked.
+
+With $A_Q=TK_\rho Q$, $B_Q=TQ$ and $D_Q=Q^\dagger DQ$, the full-port
+proof is
+
+$$
+W_{c,Q}(z)=VA_Q[z-D_Q-B_Q^\dagger VA_Q]^{-1}B_Q^\dagger V.
+$$
+
+The existing canonical complex-pole executor diagonalizes this small
+projected generator with all retained states; it does not fit a W Loewner
+pencil or remove growing modes. Only projected frequency matrices reach
+the host. Returned native left/right factors distinguish logical count
+from zero padding and are tested against literal complex column/row Σ.
+
+At 36 k and 160 bands, a four-coherent-band catalogue has 303552 exact
+live rows (280800 for the binary equilibrium population). At order 1000,
+Q alone is about 4.52 GiB globally, and explicit full 978-port T is another
+4.42 GiB, before padding. Twenty retained parent bases alone would be
+about 90 GiB globally. These are shape prices, not measured GPU walls.
+The one-parent receipt counts overlapping immutable basis buffers,
+streaming K scratch, and the providers' workspace. Source ψ/W/V,
+retained seed arrays, source redistribution and other parents are explicitly
+additional. No all-parent retained-space, fixed-point, material-capacity,
+full-q model, or trajectory admission follows from this proof. Current
+microscopic W/column-Σ refinement and electronic boundary tests are still
+required before a production integration.
