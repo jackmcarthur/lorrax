@@ -10,9 +10,11 @@ body and the Lehmann wings of every ordered pair.  Checked here on CPU:
 * body: the ordered Gamma body equals the store normalization
   ``sum_p b b^H/(2W(z-W)) - conj(b) b^T/(2W(z+W))``, reduces to the TRS
   ``b (z^2 - Lambda)^-1 b^H`` for real ``b``, and obeys ``W(-z) = W(z)^T``;
-* gate: full is admitted on every one- and two-component store, ordered metals
-  included (``tests/test_shared_pole_head_ordered_metal.py``), and refused on
-  the four-component charge store.
+* four-component carrier (the ``bare_transverse`` restricted-kinetic-balance
+  store, capacity counted on the two-component source WFN): the wings are the
+  spin-traced Lehmann sum over all four components, are invariant under a
+  global U(4) rotation of the components, and with zero small components
+  equal the two-component carrier's, so the fold needs no refusal there.
 """
 from types import SimpleNamespace
 
@@ -155,12 +157,22 @@ def test_ordered_body_is_store_normalization(mesh):
         assert _rel(_body(mesh, True, z, br, poles, counts), trs) < 1e-12
 
 
-def test_gate_admits_two_component_refuses_four_component():
-    from gw.gw_config import HeadCorrection
-    from gw.shared_pole_head import refuse_unsupported_shared_pole_head
-    config = SimpleNamespace(sigma=SimpleNamespace(w_model="shared_pole"),
-                             head=SimpleNamespace(correction=HeadCorrection.FULL),
-                             bispinor=False)
-    refuse_unsupported_shared_pole_head(config, nspinor=2)
-    with pytest.raises(ValueError, match="GATE shared_pole_head_nspinor"):
-        refuse_unsupported_shared_pole_head(config, nspinor=4)
+@pytest.mark.parametrize("mesh", _meshes(), ids=lambda m: f"P{m.size}")
+def test_four_component_carrier_wings_are_spin_traced(mesh):
+    e, f, psi2, D, v = _system(4, trs=False)
+    rng = np.random.default_rng(5)
+    psi4 = (rng.normal(size=(NK, 4, MU, NB))
+            + 1j * rng.normal(size=(NK, 4, MU, NB))).astype(np.complex128)
+    Y, Z = _kernel_wings(mesh, e, f, psi4, v)
+    Y_ref, Z_ref = _lehmann_wings(e, f, psi4, D)
+    assert _rel(Y, Y_ref) < 1e-12, _rel(Y, Y_ref)
+    assert _rel(Z, Z_ref) < 1e-12, _rel(Z, Z_ref)
+    # psi^dagger psi is invariant under one U(4) acting on every state.
+    u, _ = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))
+    Y_u, Z_u = _kernel_wings(mesh, e, f, np.einsum("st,ktmn->ksmn", u, psi4), v)
+    assert _rel(Y_u, Y) < 1e-12 and _rel(Z_u, Z) < 1e-12
+    # Zero small components: the two-component carrier's wings.
+    lifted = np.concatenate([psi2, np.zeros_like(psi2)], axis=1)
+    Y_l, Z_l = _kernel_wings(mesh, e, f, lifted, v)
+    Y_2, Z_2 = _kernel_wings(mesh, e, f, psi2, v)
+    assert _rel(Y_l, Y_2) < 1e-12 and _rel(Z_l, Z_2) < 1e-12

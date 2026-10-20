@@ -201,11 +201,10 @@ RESTART_DECKS = {
     "cohsex.in": _restart_deck("cohsex", """compute_mode = cohsex
 qp_solver = one_shot_dft
 """),
-    # The shared-pole file-model path: one-shot with the W bank and the
-    # pole model exported.
+    # The shared-pole file-model path: one-shot with the W bank, the folded
+    # head and the pole model exported.
     "sp_export.in": _restart_deck("spx", """compute_mode = mpa
 sigma_w_model = shared_pole
-head_correction = no_local_fields
 mpa_n_poles = 2
 qp_solver = one_shot_dft
 sigma_regularization_ev = 0.25
@@ -229,7 +228,6 @@ centroids_file_current = {centroids}
 bispinor_gw = full_shared_pole
 compute_mode = mpa
 sigma_w_model = shared_pole
-head_correction = no_local_fields
 mpa_n_poles = 2
 sigma_regularization_ev = 0.25
 linalg = local

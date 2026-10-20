@@ -382,7 +382,7 @@ a branch, else it refuses by name. `wfns_transverse` and
 | material | route |
 |---|---|
 | time-reversal invariant | `bare_transverse` |
-| magnet, half-metal, Hall or Chern state | `full_shared_pole` (`mpa`, `shared_pole`, `head_correction = no_local_fields`) |
+| magnet, half-metal, Hall or Chern state | `full_shared_pole` (`mpa`, `shared_pole`; its head is the direct sector head) |
 | static slab cross-check of current screening | `full_static_cohsex` |
 | exchange-only check | `bare_transverse`, `x_only` |
 | two-component reference | `bispinor = false` |

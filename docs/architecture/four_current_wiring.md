@@ -76,7 +76,8 @@ Further predicates:
 |---|---|
 | `uses_coupled_photon_head` | packed and `head_correction = full`: run the Γ completion and keep the four literal-Γ vectors |
 | `uses_bare_tt_gamma_head` | insert the bare TT overlay into $V$: SP-hybrid unless `off`; B with GN/HL or `x_only` under `full`, `sys_dim ∈ {2,3}` |
-| `uses_direct_bispinor_shared_pole_head` | SP-full with `head_correction = no_local_fields` |
+| `uses_direct_bispinor_shared_pole_head` | SP-full with `head_correction = full` (its direct sector head) |
+| `folds_scalar_head` | `head_correction = full` on every route but SP-full: the scalar charge head folded once through W(Γ) |
 
 ## The map
 
@@ -316,7 +317,7 @@ and the completion owns the charge head.
 
 SP-hybrid builds the full-frequency CC bank on the four-spinor charge
 carrier. SP-full builds the ordered CC/CT/TC/TT sector bank, and under
-`no_local_fields` it adds the direct first-order bulk Γ head
+`head_correction = full` it adds the direct first-order bulk Γ head
 (`gw.photon_direct_head.build_direct_photon_head`; physics in
 [theory §5](../theory/four-current-head-corrections.md#direct-bulk-head)).
 Bank construction, sector reduction, storage and byte models are owned by
@@ -420,11 +421,10 @@ driver entry.
 | `bispinor_gw_*_retired` (three) | `coerce_bispinor_gw_mode` | a retired mode spelling; names the replacement |
 | (deck key) `bispinor_tt_head_correction` | `read_lorrax_input` | the removed key appears at any value |
 | `full_shared_pole_trs` | `screening.refuse_full_shared_pole_with_trs` (driver entry, on the measured symmetry) | `full_shared_pole` on a WFN with time reversal; use `bare_transverse` |
-| `bispinor_head_correction_no_local_fields_unavailable` | `refuse_unsupported_bispinor_gw` | `no_local_fields` on any bispinor route except SP-hybrid and SP-full |
-| `bispinor_self_consistency_requires_live_four_current` | same | bispinor QSGW with `density_self_consistent = false` |
+| `bispinor_self_consistency_requires_live_four_current` | `refuse_unsupported_bispinor_gw` | bispinor QSGW with `density_self_consistent = false` |
 | `bare_tt_gamma_restart_unstamped` | same | `restart = true` where the bare TT overlay is on (`x_only`, B with GN/HL): restart $V$ does not stamp it |
 | `restart_bispinor_charge_carrier` | `gw_init._restart_charge_basis` | `restart = true` on a bundle whose `charge_representation` stamp is not `normalized_rkb_four_current_v1` (every bispinor bundle written before this name, including the 2026-10-05 `isometric_kinetic_balance_four_current_v1` bundles) |
-| `full_shared_pole_envelope` / `full_shared_pole_head` | same | `full_shared_pole` without bispinor, MPA, `sigma_w_model = shared_pole` and `w_rpa`; or with an explicit `head_correction = full` (unset resolves to `no_local_fields`, logged) |
+| `full_shared_pole_envelope` | same | `full_shared_pole` without bispinor, MPA, `sigma_w_model = shared_pole` and `w_rpa` |
 | `bispinor_gw_requires_bispinor` | same | `full_static_cohsex` with `bispinor = false` |
 | `static_bispinor_photon_head_slab_only` | same | P-screened with `head_correction = full` and `sys_dim ≠ 2` |
 | `static_bispinor_photon_envelope` | same, over `packed_static_envelope` | any envelope row fails for `full_static_cohsex` |

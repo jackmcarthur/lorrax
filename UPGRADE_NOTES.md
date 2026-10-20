@@ -5,6 +5,28 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — `head_correction = no_local_fields` is deleted; `full` is the one head
+
+The deck value `no_local_fields` is gone and refuses as an unknown policy; use
+`full` (the default) or `off` (debug). Ruling:
+[decisions, 2026-10-20](docs/architecture/decisions.md#one-head).
+
+- Scalar decks that set `no_local_fields` (shared-pole one-shot and SC) now fold
+  the head's local fields once through W(Γ). Every state moves by the same
+  `ΔΣ_h = (1/2 − f) ΔW^c_h(0)/(Ω N_k)` on shell, so the gap moves by
+  `ΔW^c_h(0)/(Ω N_k) = v·Δ(1/ε_M)/(Ω N_k)`; eqp1 also moves through the head's
+  frequency slope. The hsuite `sp_export` reference is regenerated.
+- `bispinor_gw = full_shared_pole`: `full` (now the default and the only head
+  value) is the existing direct sector head; numbers are unchanged
+  (`bisp_sc`, `bisp_sc3`, `bse_bisp`). The run record states "no local-field
+  fold on the four-current bank". `GATE full_shared_pole_head` and
+  `GATE bispinor_head_correction_no_local_fields_unavailable` are deleted.
+- Shared-pole `bare_transverse` (four-spinor charge carrier): `full` now folds
+  the head like the scalar store instead of refusing
+  (`GATE shared_pole_head_nspinor` is deleted); its charge operator, wing
+  vertices and velocity are spin-traced on the one carrier. Test:
+  `tests/test_shared_pole_head_ordered_fold.py::test_four_component_carrier_wings_are_spin_traced`.
+
 ## 2026-10-20 — BSE `--eqp`: a full-zone file is read per k; star-asymmetric QP shifts refuse
 
 `file_io.restart_bundle.apply_eqp_corrections`, the eqp reader of every BSE

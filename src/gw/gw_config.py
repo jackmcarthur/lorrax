@@ -383,7 +383,6 @@ class HeadCorrection(str, enum.Enum):
     """Finite-grid treatment of the singular macroscopic ``q -> 0`` head; see docs/dev/gw_config_contracts.md."""
 
     FULL = "full"
-    NO_LOCAL_FIELDS = "no_local_fields"
     OFF = "off"
 
 
@@ -656,7 +655,7 @@ def refuse_unsupported_head_dense(config) -> None:
             "GATE head_dense_operator: head_dense_file names a dense DFT "
             "charge head this deck cannot use.\n"
             f"  got:  head_dense_file = {config.head.dense_file!r}; {why}\n"
-            "  want: a scalar head (head_correction = full | no_local_fields) "
+            "  want: a scalar head (head_correction = full) "
             "built from the DFT response: one-shot, BSE screening, or SC with "
             "sc_head_update = off\n"
             "  fix:  drop head_dense_file, or change the head settings\n"
@@ -2638,8 +2637,7 @@ def _input_head(
             raise ValueError(
                 "contradictory deck settings: legacy do_G0 and "
                 "head_correction request opposite Gamma-head policies. "
-                "Remove do_G0 and use head_correction = full | "
-                "no_local_fields | off.")
+                "Remove do_G0 and use head_correction = full | off.")
         if "head_correction" not in _named_keys:
             _head_correction = legacy_policy
             print_fn(
@@ -2647,19 +2645,6 @@ def _input_head(
                 f"mapping it to head_correction = "
                 f"{_head_correction.value}. Prefer the named policy in "
                 "new decks.")
-    elif ("head_correction" not in _named_keys
-            and bool(params["bispinor"])
-            and coerce_bispinor_gw_mode(params["bispinor_gw"])
-            is BispinorGWMode.FULL_SHARED_POLE):
-        # The ordered four-current sector bank has only the direct Gamma
-        # head (no local-field fold), so its default is that head.  An
-        # explicit ``full`` still refuses (GATE full_shared_pole_head).
-        _head_correction = HeadCorrection.NO_LOCAL_FIELDS
-        print_fn(
-            "  [config provenance] bispinor_gw = full_shared_pole with "
-            "head_correction unset: head_correction = no_local_fields "
-            "(the sector bank's direct Gamma head; full has no local-field "
-            "fold on this route).")
     _resolved_do_g0 = _head_correction is not HeadCorrection.OFF
     head = HeadConfig(
         correction=_head_correction,
@@ -3044,8 +3029,7 @@ def _apply_input_envelope(
                  or uses_full_bispinor_shared_pole(resolved))
             and bool(resolved.do_G0)
             and resolved.sigma.w_model == "shared_pole"
-            and resolved.head.correction in (
-                HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL)):
+            and resolved.head.correction is HeadCorrection.FULL):
         links = resolved.paths.parallel_transport_file
         dipole = os.path.join(resolved.input_dir or ".", "dipole.h5")
         if links and os.path.isfile(links):
@@ -3711,13 +3695,6 @@ def packed_static_envelope(config, *, screened: bool):
            "screening_diagrams = w_rpa", _ENV_IMPL,
            "the ladder/resolvent facade has no packed four-current operand",
            None)
-    yield (config.head.correction in (HeadCorrection.FULL, HeadCorrection.OFF),
-           f"head_correction = {config.head.correction.value}",
-           "head_correction = full (the default), or off for a DEBUG "
-           "headless body", _ENV_PHYSICS,
-           "heads are always on with bispinors and 'off' is the announced "
-           "DEBUG skip (owner ruling 2026-09-01, "
-           "docs/architecture/decisions.md; TASTE.md row 20)", None)
     if not screened:
         # The bare route builds no packed Dyson solve (chi_TT = chi_CT = 0),
         # so no backend dial may choose it: under either `linalg` value an
@@ -3835,9 +3812,26 @@ def uses_bare_tt_gamma_head(config) -> bool:
 
 
 def uses_direct_bispinor_shared_pole_head(config) -> bool:
-    """First-order direct Γ completion of the ordered four-current bank."""
+    """First-order direct Γ completion of the ordered four-current bank.
+
+    On ``bispinor_gw = full_shared_pole`` the head (``head_correction =
+    full``) is this direct sector head: no local-field fold exists for the
+    four-current bank, and the run record says so
+    (:func:`incumbent_bispinor_head_record`).
+    """
     return (uses_full_bispinor_shared_pole(config)
-            and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS)
+            and config.head.correction is HeadCorrection.FULL)
+
+
+def folds_scalar_head(config) -> bool:
+    """The head is the scalar charge head folded once through W(Γ).
+
+    ``head_correction = full`` on every route but the four-current sector
+    bank, whose head is its direct sector head
+    (:func:`uses_direct_bispinor_shared_pole_head`).
+    """
+    return (config.head.correction is HeadCorrection.FULL
+            and not uses_full_bispinor_shared_pole(config))
 
 
 def incumbent_bispinor_head_record(config) -> tuple[str, str]:
@@ -3854,18 +3848,16 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
             "  ==========================================================\n",
             "DEBUG: no Gamma-cell head at all (head_correction=off on the "
             "incumbent route); NOT a production calculation")
-    if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
-        if uses_direct_bispinor_shared_pole_head(config):
-            return "", ("first-order direct CC/CT/TC/TT Gamma-cell head "
-                        "in ordered shared-pole sectors (bulk: screened "
-                        "sphere; slab: exact Wigner-Seitz polygon); FD metal "
-                        "Drude; no wing/body fold; spatial current "
-                        "uses the dipole-velocity approximation")
-        if uses_bare_transverse_shared_pole(config):
-            return "", ("direct frequency-dependent scalar CC Gamma head "
-                        "on the four-spinor charge carrier; no wing/body fold; "
-                        "bare transverse Gamma exchange")
-        return "", "no-local-fields head outside the direct four-current route"
+    if uses_direct_bispinor_shared_pole_head(config):
+        return "", ("first-order direct CC/CT/TC/TT Gamma-cell head "
+                    "in ordered shared-pole sectors (bulk: screened "
+                    "sphere; slab: exact Wigner-Seitz polygon); FD metal "
+                    "Drude; no local-field fold on the four-current bank; "
+                    "spatial current uses the dipole-velocity approximation")
+    if uses_bare_transverse_shared_pole(config):
+        return "", ("frequency-dependent scalar CC Gamma head on the "
+                    "four-spinor charge carrier, local fields folded once "
+                    "through W(Gamma); bare transverse Gamma exchange")
     if (config.compute_mode is ComputeMode.X_ONLY
             and uses_bare_tt_gamma_head(config)):
         return "", ("bare charge and TT Gamma-cell averages in V; "
@@ -3940,27 +3932,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "GATE bare_tt_gamma_restart_unstamped: GN/HL-PPM bare "
             "transverse exchange needs a fresh V with its TT Gamma-cell "
             "average; restart V does not stamp that choice. Set restart=false.")
-    shared_pole_direct = (uses_direct_bispinor_shared_pole_head(config)
-                          or (uses_bare_transverse_shared_pole(config)
-                              and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS))
-    if (bool(config.bispinor)
-            and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
-            and not shared_pole_direct):
-        raise ValueError(
-            "GATE bispinor_head_correction_no_local_fields_unavailable: "
-            "head_correction = no_local_fields is refused with "
-            "bispinor = true.\n"
-            "  got:  bispinor = true, head_correction = no_local_fields\n"
-            "  want: head_correction = full (the default), or off for a "
-            "DEBUG headless body\n"
-            "  why:  PHYSICS/POLICY.  no_local_fields names a SCALAR "
-            "diagnostic -- the direct epsilon head with the microscopic "
-            "local fields left unfolded.  The coupled 4x4 photon solve does "
-            "not produce it, and on the bare-transverse route the value "
-            "silently moved the deck off the packed path: a head dial must "
-            "never choose a route (lane J section 2/3.d).  Bispinor heads "
-            "are on by default and 'off' is the announced DEBUG skip.\n"
-            "  doc:  docs/input_reference.md, head_correction.")
     if (bool(config.bispinor)
             and config.qp_solver is QPSolver.SELF_CONSISTENT
             and not bool(config.density_self_consistent)):
@@ -3983,12 +3954,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "GATE full_shared_pole_envelope: bispinor_gw=full_shared_pole "
                 "requires bispinor=true, compute_mode=mpa, "
                 "sigma_w_model=shared_pole, and screening_diagrams=w_rpa")
-        if config.head.correction is HeadCorrection.FULL:
-            raise ValueError(
-                "GATE full_shared_pole_head: the ordered four-current sector "
-                "bank has a direct Gamma head under "
-                "head_correction=no_local_fields; full wing/body folding is "
-                "unavailable")
         if (config.qp_solver is QPSolver.SELF_CONSISTENT
                 and config.sc.head_update not in PHOTON_DIRECT_HEAD_UPDATES):
             raise ValueError(
@@ -4016,9 +3981,7 @@ def refuse_unsupported_bispinor_gw(config) -> None:
             "  doc:  docs/input_reference.md, bispinor_gw.")
     # The one packed static mode.  The Gamma-cell completion is part of the
     # calculation (owner ruling 2026-09-01, docs/architecture/decisions.md):
-    # ``full`` runs it, ``off`` is the announced DEBUG skip, and there is no
-    # third value because ``no_local_fields`` names a scalar diagnostic that
-    # the coupled 4x4 solve does not produce.
+    # ``full`` runs it and ``off`` is the announced DEBUG skip.
     if config.head.correction is HeadCorrection.FULL and int(config.sys_dim) != 2:
         raise ValueError(
             "GATE static_bispinor_photon_head_slab_only: the packed static "
@@ -4094,7 +4057,7 @@ def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
 @dataclass(frozen=True)
 class HeadConfig:
     """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs; see docs/dev/gw_config_contracts.md."""
-    correction: HeadCorrection    # full | no_local_fields | off
+    correction: HeadCorrection    # full | off
     dense_file: str               # dense-k sum set dipole.h5; "" = the GW mesh
     wcoul0_source: str            # "s_tensor" | "epshead"
     wcoul0_eta: float
@@ -4560,14 +4523,16 @@ PHOTON_DIRECT_HEAD_UPDATES = ("off", "dft_velocity", "parallel_transport")
 def uses_metal_direct_drude_head(config) -> bool:
     """Admit the per-map velocity head (Drude + Thomas-Fermi) on a shared-pole metal.
 
-    The direct head (``no_local_fields``) is admitted on scalar,
-    bare-transverse and four-current (``full_shared_pole``) decks; the
-    four-current bank builds its own head from the same QP-rotated dipole
-    velocity (``response_bank.compute_photon_bank``).  The folded head (``full``, intraband
-    wings and the static fold) is admitted on scalar decks (owner ruling
-    2026-09-25: full on time-reversal-even metals on the frozen and the
-    per-map routes; since 2026-10-20 on ordered metals too,
-    docs/theory/metal-q0-head.md section 5).
+    ``dft_velocity`` is admitted under ``head_correction = full`` on scalar,
+    bare-transverse and four-current (``full_shared_pole``) decks.  Scalar
+    and bare-transverse decks fold the head (intraband wings and the static
+    fold) on the charge carrier: the four-spinor carrier's charge operator
+    is spin-traced like the scalar one (``gw.shared_pole_head`` docstring).
+    Owner ruling 2026-09-25: full on time-reversal-even metals on the frozen
+    and the per-map routes; since 2026-10-20 on ordered metals too,
+    docs/theory/metal-q0-head.md section 5.  The four-current bank builds
+    its own direct sector head from the same QP-rotated dipole velocity
+    (``response_bank.compute_photon_bank``).
 
     ``parallel_transport`` is admitted on scalar and four-current decks:
     the same head on the QSGW velocity ``U^dagger (v_DFT + D_k DeltaH) U``,
@@ -4579,14 +4544,12 @@ def uses_metal_direct_drude_head(config) -> bool:
             and config.sc.head_update in METAL_HEAD_UPDATES
             and config.sigma.w_model == "shared_pole"):
         return False
+    if config.head.correction is not HeadCorrection.FULL:
+        return False
     if config.sc.head_update == "parallel_transport":
-        return ((not config.bispinor or uses_direct_bispinor_shared_pole_head(config))
-                and config.head.correction in (
-                    HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL))
-    if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
-        return (not config.bispinor or uses_bare_transverse_shared_pole(config)
-                or uses_full_bispinor_shared_pole(config))
-    return config.head.correction is HeadCorrection.FULL and not config.bispinor
+        return not config.bispinor or uses_full_bispinor_shared_pole(config)
+    return (not config.bispinor or uses_bare_transverse_shared_pole(config)
+            or uses_full_bispinor_shared_pole(config))
 
 
 @dataclass(frozen=True)
@@ -4805,12 +4768,10 @@ def validate_material_inputs(config, material_class):
                 "tetrahedron Fermi-surface weights, Drude term, Thomas-Fermi "
                 "static head)\n"
                 "  want: sc_head_update = off, or dft_velocity with "
-                "shared_pole and no_local_fields (direct Drude head) or full "
-                "(scalar decks), or parallel_transport on a scalar or "
+                "shared_pole and head_correction = full, or "
+                "parallel_transport on a scalar or "
                 "bispinor_gw = full_shared_pole deck\n"
-                "  why:  a folded bispinor metal head has no derived "
-                "completion, and the bare-transverse head has no link "
-                "consumer\n"
+                "  why:  the bare-transverse head has no link consumer\n"
                 "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
         if width_ry is None:
             raise ValueError(
@@ -5028,7 +4989,7 @@ class LorraxConfig:
                 "sc_head_update requests a QSGW velocity/head rebuild, but "
                 "head_correction=off removes that channel. The update flag "
                 "does not override the head policy; set sc_head_update=off "
-                "or choose head_correction=full/no_local_fields.")
+                "or choose head_correction=full.")
         if self.screening.occ_broadening_ev == 0.0:
             return
         if self.qp_solver is not QPSolver.SELF_CONSISTENT:

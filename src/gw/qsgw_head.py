@@ -4520,7 +4520,6 @@ def build_dft_head_response(
     meta,
     config,
     wfn_fingerprint_binding=None,
-    wings: bool = True,
     occupation_state=None,
     frozen_parts: dict | None = None,
     source: HeadSource | None = None,
@@ -4533,11 +4532,8 @@ def build_dft_head_response(
     dipole file while the body uses ``number_bands_chi`` is refused by shape
     and slicing here rather than silently mixing transition manifolds.
 
-    ``wings=False`` builds the direct head alone (``Y_x = Z_y = None``): the
-    ``head_correction = no_local_fields`` response, whose consumer
-    (:func:`finalize_iteration_head_sample`) never folds.  ``S_direct``
-    needs no time-reversal assumption (``gw.shared_pole_head`` docstring), so
-    this is the head an ordered store carries.
+    ``S_direct`` needs no time-reversal assumption (``gw.shared_pole_head``
+    docstring), so this is also the head an ordered store folds.
 
     ``occupation_state`` is the metal's fixed-N Fermi-Dirac state on this
     spectrum (the one-shot state, or the DFT state of a map whose head stays
@@ -4553,9 +4549,8 @@ def build_dft_head_response(
     ``frozen_parts`` is a caller-owned dict that holds the frequency-free
     part of this response between calls on the same ``wfns``: the
     authenticated velocity and, on a metal, the Fermi-surface table, the
-    Drude atoms, the pair split and the static head.  Its key is ``wings``,
-    whether the plan has an exact static row, and the state's ``(mu,
-    occ_hash)``.  A frozen SC head (``sc_head_update = off``) keeps that key
+    Drude atoms, the pair split and the static head.  Its key is whether
+    the plan has an exact static row and the state's ``(mu, occ_hash)``.  A frozen SC head (``sc_head_update = off``) keeps that key
     while its frequency plan follows the QP energy span, so each map then
     builds only S(z) and the wings.
 
@@ -4580,7 +4575,7 @@ def build_dft_head_response(
             "local-field fraction")
     metal = occupation_state is not None
     nodes = metal_response_nodes(z, config, metal=metal)
-    parts_key = (bool(wings), bool(_static_rows(z, config, metal=metal).any()),
+    parts_key = (bool(_static_rows(z, config, metal=metal).any()),
                  None if occupation_state is None else
                  (float(occupation_state.mu_ry), occupation_state.occ_hash))
     parts = None if frozen_parts is None else frozen_parts.get(parts_key)
@@ -4656,7 +4651,7 @@ def build_dft_head_response(
                 kgrid=wfn.kgrid)
             (static_kappa2, static_Y_x, static_Z_y,
              static_chi_body_gamma) = _metal_static_head(
-                wfns if wings else None, surface, occupation_state, z,
+                wfns, surface, occupation_state, z,
                 mesh=mesh, meta=meta, config=config, nb_logical=nb_logical,
                 nspin=int(wfn.nspin), nspinor=normalization_nspinor)
         else:
@@ -4682,14 +4677,12 @@ def build_dft_head_response(
         nspin=int(wfn.nspin), nspinor=normalization_nspinor,
         eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface_c,
         pair_split=pair_split)
-    Y_x = Z_y = None
-    if wings:
-        Y_x, Z_y = head_wings_sharded(
-            velocity_cart, wfns, on_carrier(energies), on_carrier(occupations), nodes,
-            mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
-            nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-            eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface_c,
-            pair_split=pair_split)
+    Y_x, Z_y = head_wings_sharded(
+        velocity_cart, wfns, on_carrier(energies), on_carrier(occupations), nodes,
+        mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
+        nspin=int(wfn.nspin), nspinor=normalization_nspinor,
+        eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface_c,
+        pair_split=pair_split)
     fold_scale = None
     if sum_set is not None:
         # The sum set's direct head on the same kernel and nodes, normalized

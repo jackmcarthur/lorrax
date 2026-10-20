@@ -266,7 +266,7 @@ switch to another head mid-run.
 | `sc_head_update` | velocity each map | reads | admitted on |
 |---|---|---|---|
 | `off` | none: the fixed DFT response | `dipole.h5` | every deck |
-| `dft_velocity` | $U^\dagger v_\mathrm{DFT}\,U$ | `dipole.h5`, or the artifact's velocity stage | insulators; metals with the shared-pole W and `head_correction = no_local_fields` (or `full` on a scalar deck) |
+| `dft_velocity` | $U^\dagger v_\mathrm{DFT}\,U$ | `dipole.h5`, or the artifact's velocity stage | insulators; metals with the shared-pole W and `head_correction = full` |
 | `parallel_transport` | $U^\dagger(v_\mathrm{DFT} + D_k\Delta H)\,U$ | the full link artifact | insulators; metals with the shared-pole W on a scalar or `full_shared_pole` deck |
 | `interband_commutator` | $U^\dagger(v_\mathrm{DFT} + [\Delta H, \mathcal W])\,U$ | the artifact's velocity stage (`vnl_included = 1`) | insulators only |
 
