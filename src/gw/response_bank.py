@@ -2904,7 +2904,8 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
     given runs as one stack of rows.
     """
     from symmetry_maps import bgw_integer_q_to_fractional, unfold_isdf_operator
-    if tuple(getattr(meta, "qgrid", None) or meta.kgrid) != tuple(meta.kgrid):
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    if tuple(getattr(meta, "qgrid", None) or kgrid) != kgrid:
         return None
     from .photon_layout import _empty, _insert, photon_block_view
     plans, layout = tuple(families.plans), families.packed_layout
