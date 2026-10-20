@@ -897,10 +897,11 @@ def _mm(a, b, *, transa='N', transb='N'):
     return jnp.matmul(op(a, transa), op(b, transb))
 
 
-def book_check_eighs(eigh_plan, n):
-    """Book the passivity checks' eigh stacks (one and two matrices per parent) as their own
-    part of ``spole.passivity_held``: the plan's stack price (distrib_la; provider workspace
-    included) for the route it takes in the room it was given."""
+def book_check_eighs(eigh_plan, n, executable=None):
+    """Book the passivity check program as its own part of ``spole.passivity_held``: its
+    compiled ``executable`` (the eigh stacks inlined; ``memory_analysis``), never below the
+    plan's own stack price (one and two matrices per parent, compiled) that is all a plan-time
+    caller has, plus the provider's workspace query off route (c)."""
     import numpy as np
     import distrib_la
     from lxkit import memory
@@ -910,10 +911,14 @@ def book_check_eighs(eigh_plan, n):
     # figure holds the provider's workspace query, booked as the vendor term.
     vendor = (0 if route.route == "batch_reshard" else
               distrib_la.workspace_bytes_per_rank(eigh_plan, "eigh", ((n, n),), np.complex128))
-    ranks = int(eigh_plan.mesh.size)
+    ranks, xla = int(eigh_plan.mesh.size), int(route.program_bytes or 0) - vendor
+    if executable is not None:
+        from runtime.aot_memory import compiled_new_bytes
+        xla = max(xla, int(compiled_new_bytes(executable)))
     memory.book(memory.Price(
-        xla=memory.Term(spread=float(int(route.program_bytes or 0) - vendor) * ranks,
-                        source=f"passivity eigh stack, {route.route} (compiled, never run)"),
+        xla=memory.Term(spread=float(xla) * ranks, source=(
+            "passivity check program" if executable is not None else "passivity eigh stack")
+            + f", eighs {route.route} (compiled, never run)"),
         vendor=memory.Term(float(vendor), source="provider eigh workspace (distrib_la query)"),
         ranks=ranks,         label="passivity eigh stacks"), stage="spole.passivity_held")
 
@@ -922,9 +927,9 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
                 mesh_xy, eigh_plan, ordered, room=None):
     """Run ``round_checks`` through the plan matching the arrays' layout.
 
-    A face round given ``room`` decides its eighs against ``room(price)``,
-    the room beside the check program's price for one parent
-    (``face_check_bytes``)."""
+    A face round given ``room`` decides its eighs against ``room(price)``, the room beside
+    ``face_check_bytes`` (a proposal); the program compiled for the parent is what is booked
+    (:func:`book_check_eighs`) and runs."""
     import jax
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -949,8 +954,9 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
                 # The same deck eigh request as the round's own face plan.
                 eigh_plan, room = face_eigh(mesh_xy, n, room=room(face_check_bytes(mesh_xy, n, int(model[0].shape[-1]))),
                                             backend=eigh_plan.requested), None
-                book_check_eighs(eigh_plan, n)
-            rows.append(jax.tree.map(np.asarray, program(eigh_plan)(*args)))
+            executable, run = program(eigh_plan).checked(*args).compiled(*args)
+            book_check_eighs(eigh_plan, n, executable)
+            rows.append(jax.tree.map(np.asarray, run(*args)))
         return jax.tree.map(lambda *v: np.concatenate(v, axis=0), *rows)
 
     replicated = NamedSharding(mesh_xy, P())
