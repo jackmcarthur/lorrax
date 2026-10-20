@@ -643,12 +643,17 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     infinity_width=recipe_infinity_width(infinity,recipe,column_extent=extent,logical_n=n)
     tables=_sector_tables(meta,geometry,n,counts,widths,states,values,infinity_width,extent)
     side=int(tables['active'].shape[-1])
-    budget.plan(side,phase='reduction',padding_output_bytes_per_rank=round_padding_output_bytes(
-        states,infinity,widths,infinity_width))
+    admitted,budget.program_bytes=budget.program_bytes,0     # the round program: compiled
+    try:
+        row=budget.plan(side,phase='reduction',padding_output_bytes_per_rank=round_padding_output_bytes(
+            states,infinity,widths,infinity_width))
+    finally:
+        budget.program_bytes=admitted
     states,infinity=pad_states(states,widths,infinity,infinity_width)
     reduced=reduce_round(states,infinity,tables,real=geometry['real'],mesh_xy=mesh_xy,
         native_eigh=budget.eigenplan(side).native_fn,ordered=True,odd_moments=True,
-        keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=_SECTOR_GRAM_KEEP())
+        keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=_SECTOR_GRAM_KEEP(),
+        beside=budget.ledger.price(row))
     model,signed,vectors,diagnostics,y=reduced
     _sector_gates(diagnostics,geometry['sector'],geometry['ids'],geometry['real'])
     # The returned planner must not retain the just-consumed full sample and
@@ -1631,7 +1636,7 @@ def staged_round(read_diagonal, read_cross, ids, real, meta, config, geometry, *
 
 def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=print):
     """The map's sector route from the recipe shapes, decided once and recorded on one line
-    (``common.gpu_utils.record_route``, site ``shared-pole sector constructor``).
+    (``lxkit.memory.record_route``, site ``shared-pole sector constructor``).
 
     q-local, rounds of P parents with one whole parent per rank, when every sector's local
     round fits (``sector_execution``); otherwise rounds of R = min(nq, P) parents (balanced)
@@ -1672,9 +1677,9 @@ def sector_route(meta, config, mu_bases, nq, *, mesh_xy, upstream, print_fn=prin
               f"q-local needs GB/rank {local} of {budget/1e9:.1f}")
     else:
         text=f"q-local, {-(-nq//width)} round(s) of {width} parents (local GB/rank {local} of {budget/1e9:.1f})"
-    from common.gpu_utils import record_route
-    record_route("shared-pole sector constructor", execution, text,
-                 warning="; ".join(w for w in (row.get('warning') for row in (*rows, joint)) if w) or None)
+    from lxkit import memory
+    memory.record_route("shared-pole sector constructor", execution, text,
+                        warning="; ".join(w for w in (row.get('warning') for row in (*rows, joint)) if w) or None)
     return execution,rows,dict(width=width,rounds=-(-nq//width))
 
 

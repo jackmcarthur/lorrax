@@ -1383,7 +1383,7 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn, nk: int = 1) -
       the same tile with an FFI call around it;
     * one tile exceeds ``qsgw_density.BAND_TILE_BUDGET_FRACTION`` of the
       per-device budget, with the distributed eigh priced beside the
-      replicated H and U (``common.gpu_utils.admit_local``, which prints
+      replicated H and U (``lxkit.memory.admit``, which prints
       the route);
 
     and then only if the distributed backend actually resolves on this
@@ -1405,13 +1405,12 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn, nk: int = 1) -
     indivisible window to native, i.e. reinstate the lifted refusal by
     accident.
     """
-    from common.gpu_utils import admit_local
+    from lxkit import memory
 
     requested = str(getattr(getattr(config, "sc", None), "eigh", "auto"))
     site = f"SC eigh {int(nk)} x {int(nb)}^2"
     if requested in ("native", "distributed"):
-        admit_local(site, 0, 0, forced=requested, names=("native", "distributed"))
-        return requested
+        return memory.admit(site, (), 0, forced=requested)
 
     from common.wfn_layout import band_sphere_spec
     from runtime.padding import padded_axis
@@ -1441,13 +1440,14 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn, nk: int = 1) -
     # The native batch is admitted while one tile stays under the band-tile
     # fraction of the budget; the distributed eigh (input, vectors and
     # workspace faces) is priced beside the replicated H and U it runs with.
-    local = admit_local(
-        site, float(nb) * float(nb) * c128,
-        BAND_TILE_BUDGET_FRACTION * budget_b if budget_b > 0 else float("inf"),
-        distributed_bytes=3.0 * c128 * nb_solve * nb_solve / ndev,
-        distributed_room=budget_b - 2.0 * c128 * int(nk) * nb * nb,
-        probe=probe, names=("native", "distributed"))
-    return "native" if local else "distributed"
+    return memory.admit(site, (
+        ("native", memory.priced(float(nb) * float(nb) * c128, "native eigh tile", term="operands"),
+         BAND_TILE_BUDGET_FRACTION * budget_b if budget_b > 0 else float("inf")),
+        ("distributed", memory.Price(
+            operands=memory.Term(spread=3.0 * c128 * nb_solve * nb_solve,
+                                 source="eigh input, vectors and workspace faces"),
+            outside=memory.contexts(), ranks=ndev), budget_b - 2.0 * c128 * int(nk) * nb * nb)),
+        0, probe=probe)
 
 
 def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):

@@ -572,9 +572,10 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
                      + (1.0 + float(partner_tiles)) * panels + scratch(d))
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
     d = next((d for d in divisors if rows(d) / mx * tile <= TILE_BYTES), 1)
-    from common.gpu_utils import record_stage_price
-    record_stage_price(f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", new(d),
-                       section="sigma.tau_sweep")
+    from lxkit import memory
+    memory.book(memory.priced(new(d),
+                              f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", increment=True),
+                stage="sigma.tau_sweep")
     if plan is not None:
         plan.update(d=int(d), ns=int(ns), new=float(new(d)), scratch=int(scratch(d)),
                     tile=float(TILE_BYTES))
@@ -617,7 +618,7 @@ def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner
                                 mesh=mesh)
     acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / (
         int(mesh.shape['x']) * int(mesh.shape['y']))
-    from common.gpu_utils import record_stage_price
+    from lxkit import memory
     new = (2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
            + chi0_kconv_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
-    record_stage_price("chi0 node, price_chi0_node", new, section="chi.exec")
+    memory.book(memory.priced(new, "chi0 node, price_chi0_node", increment=True), stage="chi.exec")

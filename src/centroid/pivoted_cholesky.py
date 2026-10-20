@@ -332,11 +332,11 @@ def auto_gram_col_block_width(
         x_shards=x_shards, y_shards=y_shards)
     width = math.isqrt(budget_i // coefficient) * divisor_i
     if width < min_aligned:
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget(f"kmeans Gram tile (block {min_aligned})",
-                         gram_col_block_device_bytes(nk, nspinor, min_aligned, min_aligned,
-                                                     x_shards=x_shards, y_shards=y_shards),
-                         budget_i)
+        from lxkit import memory
+        need = gram_col_block_device_bytes(nk, nspinor, min_aligned, min_aligned,
+                                           x_shards=x_shards, y_shards=y_shards)
+        memory.admit(f"kmeans Gram tile (block {min_aligned})",
+                     memory.priced(need, "closed form"), budget_i)
         return min_aligned
     return width
 
@@ -1711,9 +1711,9 @@ def _build_gram_q0_kbatch(
     target_bytes = int(float(meta.memory_per_device_gb) * 1e9)
     price = resident_bytes + 3 * gram_local_bytes + tile_bytes
     if price > target_bytes:
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("kmeans candidate Gram (faces, fold, tile)",
-                         price, target_bytes)
+        from lxkit import memory
+        memory.admit("kmeans candidate Gram (faces, fold, tile)",
+                     memory.priced(price, "closed form"), target_bytes)
     if verbose:
         ntiles, executed_extent, work_inflation = gram_tile_schedule(
             M_cols, col_block)

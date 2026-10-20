@@ -32,6 +32,11 @@ def mesh():
     return Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
 
 
+#: The room a ROCM caller hands its LU plan: one GCD's budget (48.99 of 60.18 GB).
+GCD_ROOM = 48_990_000_000
+
+
+
 @pytest.fixture
 def rocm(monkeypatch):
     """The ROCM leg's resolution on a CPU mesh (its library has no handler here)."""
@@ -58,8 +63,9 @@ def _eigh_ok(a, w, v):
 
 
 def test_size_route_rows_and_room_legs():
-    assert set(resolve_mod.ONE_DEVICE_MAX_N) == {("eigh", "ROCM"), ("solve_lu", "ROCM")}
-    assert resolve_mod.ONE_DEVICE_BY_ROOM == {("eigh", "CUDA"), ("solve_lu", "CUDA")}
+    assert set(resolve_mod.ONE_DEVICE_MAX_N) == {("eigh", "ROCM")}
+    assert resolve_mod.ONE_DEVICE_BY_ROOM == {("eigh", "CUDA"), ("solve_lu", "CUDA"),
+                                              ("solve_lu", "ROCM")}
     assert resolve_mod.one_device_max_n("eigh", "CUDA") is None          # no room, no bound
     assert resolve_mod.one_device_max_n("eigh", "CUDA", 0) is None
     for op in ("eigh", "solve_lu"):
@@ -67,11 +73,11 @@ def test_size_route_rows_and_room_legs():
         assert resolve_mod.one_device_max_n(op, "CUDA", need) == 312
         assert resolve_mod.one_device_max_n(op, "CUDA", need - 1) == 311
     assert resolve_mod.one_device_max_n("eigh", "cpu", 1 << 40) is None
-    # ROCM solve_lu is one GCD's capacity: the priced one-device program within the allocator.
-    lim = resolve_mod._ROCM_GCD_BYTES_LIMIT
-    assert resolve_mod._ROCM_LU_BYTES_PER_N2 == od.one_device_bytes("solve_lu", 1)
-    n = resolve_mod.ONE_DEVICE_MAX_N[("solve_lu", "ROCM")]
-    assert n == 27427 and od.one_device_bytes("solve_lu", n) <= lim < od.one_device_bytes("solve_lu", n + 1)
+    # ROCM solve_lu is a room leg: one GCD's budget room holds n 24746; no room, no bound.
+    n = resolve_mod.one_device_max_n("solve_lu", "ROCM", GCD_ROOM)
+    assert n == 24746 and od.one_device_bytes("solve_lu", n) <= GCD_ROOM < od.one_device_bytes(
+        "solve_lu", n + 1)
+    assert resolve_mod.one_device_max_n("solve_lu", "ROCM") is None
     assert "one_device" in resolve_mod.EIGH_BACKENDS and "one_device" in resolve_mod.LU_BACKENDS
 
 
@@ -85,13 +91,13 @@ _MAIN_ROWS = {("eigh", "ROCM"): 16384, ("solve_lu", "ROCM"): 8192}
     ("eigh", (64, 312, 312)), ("eigh", (16, 312, 312)), ("eigh", (4, 96, 96)),
     ("eigh", (256, 4096, 4096))])
 @pytest.mark.parametrize("ranks", [4, 16])
-def test_room_less_round_counts_are_mains(op, shape, ranks):
-    """Fe / hsuite stacks and the stacks where the round budget binds: the rounds a room-less
-    caller runs are main's exactly, though the solve_lu selection bound rose to one GCD."""
+def test_gcd_room_round_counts_are_mains(op, shape, ranks):
+    """Fe / hsuite stacks and the stacks where the round budget binds: the rounds a caller runs
+    in one GCD's room are main's exactly, though the solve_lu selection bound rose to the room."""
     nb, n = shape[0], shape[-1]
     width = n if op == "solve_lu" else None
     main = od.rounds_for(nb, n, ranks, _MAIN_ROWS[(op, "ROCM")], width)
-    bound = resolve_mod.one_device_max_n(op, "ROCM")
+    bound = resolve_mod.one_device_max_n(op, "ROCM", GCD_ROOM)
     assert od.rounds_for(nb, n, ranks, resolve_mod.one_device_round_n(op, "ROCM", bound), width) == main
     # the incumbent of the measured route is the same count (plan._incumbent)
     from types import SimpleNamespace
@@ -100,8 +106,8 @@ def test_room_less_round_counts_are_mains(op, shape, ranks):
     shapes = (shape, shape) if op == "solve_lu" else (shape,)
     old = resolve_mod.mesh_platform
     resolve_mod.mesh_platform = lambda m: "ROCM"
-    try:
-        assert plan_mod._incumbent(p, shapes, False) == main
+    try:      # the measured route's incumbent: main's count on a size-row leg, the library else
+        assert plan_mod._incumbent(p, shapes, False) == (main if op == "eigh" else 0)
     finally:
         resolve_mod.mesh_platform = old
     if (op, shape, ranks) == ("solve_lu", (256, 2048, 2048), 4):
@@ -110,16 +116,20 @@ def test_room_less_round_counts_are_mains(op, shape, ranks):
 
 def test_a_single_matrix_above_mains_row_is_one_device_one_per_round(mesh, rocm):
     n = 12288
-    assert resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=n) == "one_device"
+    assert resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=n,
+                                       room=GCD_ROOM) == "one_device"
     assert od.held_per_rank(4, n, 4, resolve_mod.one_device_round_n(
-        "solve_lu", "ROCM", resolve_mod.one_device_max_n("solve_lu", "ROCM")), n) == 1
+        "solve_lu", "ROCM", resolve_mod.one_device_max_n("solve_lu", "ROCM", GCD_ROOM)), n) == 1
 
 
 def test_distributed_takes_the_size_route_on_rocm(mesh, rocm, capsys):
     bound = resolve_mod.ONE_DEVICE_MAX_N[("eigh", "ROCM")]
     assert resolve_mod.resolve_backend("eigh", "distributed", mesh, n=64) == "one_device"
-    lu_bound = resolve_mod.ONE_DEVICE_MAX_N[("solve_lu", "ROCM")] // 2 * 2   # n divisible by the 2x2 mesh
-    assert resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=lu_bound) == "one_device"
+    lu_bound = resolve_mod.one_device_max_n("solve_lu", "ROCM", GCD_ROOM) // 2 * 2   # 2x2 tiles
+    assert resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=lu_bound,
+                                       room=GCD_ROOM) == "one_device"
+    with pytest.raises(ValueError, match="GATE distrib_la_room"):     # never SLATE silently
+        resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=lu_bound)
     # Beyond the bound and with n unknown: the leg library, refused on this host by name --
     # ELPA for eigh (the ROCM distributed eigh since 0018), SLATE still for solve_lu.
     for n in (bound + 4, None):
@@ -129,7 +139,7 @@ def test_distributed_takes_the_size_route_on_rocm(mesh, rocm, capsys):
             resolve_mod.resolve_backend("eigh", "distributed", mesh, n=n)
     for n in (lu_bound + 2, None):
         with pytest.raises((RuntimeError, ValueError), match="solve_lu backend 'slate'"):
-            resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=n)
+            resolve_mod.resolve_backend("solve_lu", "distributed", mesh, n=n, room=GCD_ROOM)
     # The capacity provider is the library (ELPA), never the size route.
     backend, why = resolve_mod.resolve_eigh_capacity(mesh, n=64)
     assert backend == "native" and "eigh backend 'elpa'" in why and "slate" not in why.split("Build with")[0]
@@ -243,7 +253,8 @@ def test_facade_records_and_runs_the_size_route(mesh, rocm):
     _eigh_ok(a[1], w1, v1)
     rng = np.random.default_rng(7)
     A = rng.normal(size=(3, 8, 8)); B = rng.normal(size=(3, 8, 8))
-    lu = distrib_la.plan("solve_lu", mesh, backend="distributed", n=8, batched_route="auto")
+    lu = distrib_la.plan("solve_lu", mesh, backend="distributed", n=8, batched_route="auto",
+                         budget_bytes=GCD_ROOM)
     assert lu.backend == "one_device"
     X = lu.batched(_face(mesh, A), _face(mesh, B))
     assert np.allclose(np.asarray(X), np.linalg.solve(A, B), atol=1e-11)
@@ -281,10 +292,11 @@ def test_the_decision_runs_one_devices_own_round_rule(mesh, rocm, monkeypatch):
     plan_mod = importlib.import_module("distrib_la.plan")
     monkeypatch.setattr(plan_mod, "_measured_rounds", lambda p, A, args, single=False: None)
     n, nb = 6144, 16
-    bound = resolve_mod.one_device_max_n("solve_lu", "ROCM")
+    bound = resolve_mod.one_device_max_n("solve_lu", "ROCM", GCD_ROOM)
     round_n = resolve_mod.one_device_round_n("solve_lu", "ROCM", bound)
     assert round_n < bound          # the case this guards: a round row below the selection bound
-    p = distrib_la.plan("solve_lu", mesh, backend="distributed", n=n, batched_route="auto")
+    p = distrib_la.plan("solve_lu", mesh, backend="distributed", n=n, batched_route="auto",
+                        budget_bytes=GCD_ROOM)
     assert p.backend == "one_device"
     a = jax.ShapeDtypeStruct((nb, n, n), np.complex128)
     backend, route, rounds = p.decision(a, a)

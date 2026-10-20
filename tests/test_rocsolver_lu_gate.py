@@ -26,6 +26,8 @@ TOL = 1e-12
 TOL32 = 1e-5          #: float32 / complex64 (normwise backward error ~ 10-30 eps at n ~ 2e4)
 
 
+
+
 def _tol(dt):
     return TOL32 if np.dtype(dt) in (np.float32, np.complex64) else TOL
 #: (n, dtype, nrhs, batch): handler forced (small) -- odd sizes, narrow and wide RHS, a stack.

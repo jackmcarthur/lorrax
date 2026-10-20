@@ -2,7 +2,7 @@
 
 ``one_device`` holds whole matrices on a rank.  A caller that hands
 ``distributed`` a room (``plan(budget_bytes=)``) has found that whole matrices
-per rank do not fit it (``common.gpu_utils.admit_local``, memory-model.md#routes),
+per rank do not fit it (``lxkit.memory.admit``, memory-model.md#routes),
 so the size route takes ``one_device`` only where ONE whole matrix's priced
 program (``distrib_la._one_device.one_device_bytes``) fits that room; otherwise
 the leg's library runs.  Without a room the route is unchanged; on CUDA (no size
@@ -21,6 +21,8 @@ import distrib_la
 resolve_mod = importlib.import_module("distrib_la.resolve")
 od = importlib.import_module("distrib_la._one_device")
 plan_mod = importlib.import_module("distrib_la.plan")
+
+
 
 
 @pytest.fixture
@@ -47,8 +49,13 @@ def test_one_device_price_is_the_route_c_stack_price():
 @pytest.mark.parametrize("op,n", [("eigh", 64), ("solve_lu", 64)])
 def test_room_caps_the_size_route(mesh, rocm, op, n):
     need = od.one_device_bytes(op, n)
-    # No room: unchanged.  Room for one whole matrix: one_device.
-    assert resolve_mod.resolve_backend(op, "distributed", mesh, n=n) == "one_device"
+    # No room: eigh keeps its size row; solve_lu (a room leg) refuses by name.  Room for one
+    # whole matrix: one_device.
+    if op == "eigh":
+        assert resolve_mod.resolve_backend(op, "distributed", mesh, n=n) == "one_device"
+    else:
+        with pytest.raises(ValueError, match="GATE distrib_la_room"):
+            resolve_mod.resolve_backend(op, "distributed", mesh, n=n)
     assert resolve_mod.resolve_backend(op, "distributed", mesh, n=n, room=need) == "one_device"
     # One byte short (and the no-room 0 of a whole-mesh caller): the library
     # (no SLATE handler on this host, so the ladder names it).

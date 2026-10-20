@@ -1536,7 +1536,7 @@ def _factor_c_q_face(C_q, mesh_xy, n_rmu_logical, zeta_rcond=ZETA_RCOND_DEFAULT)
     rcond = _deprecated_env_float("LORRAX_ZETA_RCOND", "zeta_rcond", zeta_rcond)
     face, rep = NamedSharding(mesh_xy, P(None, 'x', 'y')), NamedSharding(mesh_xy, P())
     # distrib_la.plan.place decides the stack in the room beside what the zeta stage holds now
-    # (C, the stores; common.gpu_utils.shared_device_room_bytes, the same on every rank): whole
+    # (C, the stores; lxkit.memory.room, the same on every rank): whole
     # matrices per rank where they fit (Fe: 64 q, n 312), else the whole mesh (a Gamma deck:
     # nq 1, n 29998). The room's bucket keys the program, so a later call decides in its own room.
     from common.gpu_utils import shared_device_room

@@ -207,11 +207,6 @@ def validate_tile_layout(n: int, nb: int, p: int, q: int, *, what: str,
 #     LU's measured arena bytes are the same either way.
 # The rules live in the handlers (eigh_ffi.cc a_seed_tiles, batched_solve_lu_ffi.cc
 # seed_want, potrf_ffi.cc); eigh_workspace_bytes below is eigh's rule, max over ranks.
-#: The outside-pool allowance the memory model grants distributed linalg (the value of
-#: ``runtime.DISTRIBUTED_LINALG_OUTSIDE_BYTES``; distrib_la cannot import ``runtime`` --
-#: layering -- so tests/test_slate_pool_rules.py pins the two equal).  A rank's potrf
-#: reservation is seeded only past it: within it unseeded SLATE fits outside the arena.
-_SLATE_OUTSIDE_ALLOWANCE_BYTES = 3e9
 
 
 def _device_leg(mesh: Mesh) -> bool:
@@ -459,7 +454,10 @@ def distributed_cholesky(
     if _device_leg(mesh):
         # The device handler seeds a rank's SLATE pool (from XLA's scratch, that rank
         # only) only when its reservation exceeds this allowance (cpp/slate/potrf_ffi.cc).
-        attrs["seed_min_bytes"] = int(_SLATE_OUTSIDE_ALLOWANCE_BYTES)
+        # Seeded only past the distributed providers' outside allowance (lxkit.legs): within
+        # it unseeded SLATE fits outside the arena.
+        from lxkit import LEGS
+        attrs["seed_min_bytes"] = int(LEGS["ROCM"].distributed_context[0])
 
     @partial(shard_map, mesh=mesh,
              in_specs=P("x", "y"), out_specs=P("y", "x"),

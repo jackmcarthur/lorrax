@@ -726,14 +726,15 @@ def host_tree(tree):
 
 
 def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget,
-                 retain_span=False, gram_keep=None):
+                 retain_span=False, gram_keep=None, beside=None):
     """Run ``round_program`` on one round: host tables in, round-order results out.
 
     An ordered round solves its kept span on the carrier of its pole budget
     (the keep cut retains at most ``keep_budget`` directions), as the face
     round does on ``face_ritz_carrier``: the carrier is known before the
     first round, so one program serves every round and SC map, and only
-    exact-zero columns ever leave the solve.
+    exact-zero columns ever leave the solve.  ``beside`` (the ledger Price of the round's
+    operands): the program is admitted and booked at its compiled executable, which then runs.
     """
     import os
     import numpy as np
@@ -753,8 +754,14 @@ def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordere
                              "differ from the host's (live, points, active)")
     args = (live, points, active, q, o, d, tuple(infinity))
     budget = None if keep_budget is None else int(keep_budget)
-    return round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
-                         bool(retain_span), gram_keep, budget)(*args)
+    program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
+                            bool(retain_span), gram_keep, budget)
+    if beside is None:
+        return program(*args)
+    from gw.shared_pole_execution import compiled_for, price_round
+    executable = compiled_for(program, args)
+    price_round(executable, mesh_xy, beside, whole=True)
+    return executable(*args)
 
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
@@ -890,13 +897,39 @@ def _mm(a, b, *, transa='N', transb='N'):
     return jnp.matmul(op(a, transa), op(b, transb))
 
 
+def book_check_eighs(eigh_plan, n, executable=None):
+    """Book the passivity check program as its own part of ``spole.passivity_held``: its
+    compiled ``executable`` (the eigh stacks inlined; ``memory_analysis``), never below the
+    plan's own stack price (one and two matrices per parent, compiled) that is all a plan-time
+    caller has, plus the provider's workspace query off route (c)."""
+    import numpy as np
+    import distrib_la
+    from lxkit import memory
+    route = max((eigh_plan.stack_route((b, n, n), np.complex128) for b in (1, 2)),
+                key=lambda r: int(r.program_bytes or 0))
+    # The stack's program compiled (face-sharded: spread over the mesh); off route (c) its
+    # figure holds the provider's workspace query, booked as the vendor term.
+    vendor = (0 if route.route == "batch_reshard" else
+              distrib_la.workspace_bytes_per_rank(eigh_plan, "eigh", ((n, n),), np.complex128))
+    ranks, xla = int(eigh_plan.mesh.size), int(route.program_bytes or 0) - vendor
+    if executable is not None:
+        from runtime.aot_memory import compiled_new_bytes
+        xla = max(xla, int(compiled_new_bytes(executable)))
+    memory.book(memory.Price(
+        xla=memory.Term(spread=float(xla) * ranks, source=(
+            "passivity check program" if executable is not None else "passivity eigh stack")
+            + f", eighs {route.route} (compiled, never run)"),
+        vendor=memory.Term(float(vendor), source="provider eigh workspace (distrib_la query)"),
+        ranks=ranks,         label="passivity eigh stacks"), stage="spole.passivity_held")
+
+
 def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_directions, *, real, nodes, eta_ry,
                 mesh_xy, eigh_plan, ordered, room=None):
     """Run ``round_checks`` through the plan matching the arrays' layout.
 
-    A face round given ``room`` decides its eighs against ``room(price)``,
-    the room beside the check program's price for one parent
-    (``face_check_bytes``)."""
+    A face round given ``room`` decides its eighs against ``room(price)``, the room beside
+    ``face_check_bytes`` (a proposal); the program compiled for the parent is what is booked
+    (:func:`book_check_eighs`) and runs."""
     import jax
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -906,10 +939,10 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
         # A face round holds ``real`` physical parents in its leading slots;
         # the gate equations are per parent, so each is checked on its own
         # leading row (no data moves) and the replicated rows are stacked.
-        from gw.shared_pole_execution import face_check_bytes, face_eigh, face_round_check_program
+        from gw.shared_pole_execution import face_check_bytes, face_eigh, face_round_check_program, plan_room
         if eigh_plan.n not in (None, int(model[0].shape[-2])):
             raise ValueError('whole-mesh shared-pole checks need the n x n eigh plan')
-        program = lambda plan: face_round_check_program(mesh_xy, bool(ordered), plan)
+        program = lambda plan: face_round_check_program(mesh_xy, bool(ordered), plan, plan_room(plan))
         n, rows = int(model[0].shape[-2]), []
         for slot in range(int(real)):
             pick = partial(_leading_row, slot=slot)
@@ -921,7 +954,9 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
                 # The same deck eigh request as the round's own face plan.
                 eigh_plan, room = face_eigh(mesh_xy, n, room=room(face_check_bytes(mesh_xy, n, int(model[0].shape[-1]))),
                                             backend=eigh_plan.requested), None
-            rows.append(jax.tree.map(np.asarray, program(eigh_plan)(*args)))
+            executable, run = program(eigh_plan).checked(*args).compiled(*args)
+            book_check_eighs(eigh_plan, n, executable)
+            rows.append(jax.tree.map(np.asarray, run(*args)))
         return jax.tree.map(lambda *v: np.concatenate(v, axis=0), *rows)
 
     replicated = NamedSharding(mesh_xy, P())

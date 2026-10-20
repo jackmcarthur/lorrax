@@ -40,3 +40,31 @@ def _response(top, bottom=0.0, n=64, rank=16, seed=3):
 def test_passivity_checks_what_its_verdict_uses(top, bottom, full, passed):
     out = jax.jit(lambda r: _passivity_response_checks(r, eigh=_eigh(full), gates=GATES))(_response(top, bottom))
     assert bool(out["passivity"][0]) == passed, {k: np.asarray(v) for k, v in out.items()}
+
+
+def test_passivity_checks_stay_on_the_face():
+    """The face route's checks hold faces only (no whole n x n per rank: run30k passivity_held held
+    2.4 n^2 per rank at any P from ``response - adjoint(response)``) and equal the local values."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+    if len(jax.devices()) < 4:
+        pytest.skip("needs 4 host devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    mesh, n = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y")), 64
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    skew = np.random.default_rng(5).standard_normal((n, n)) * 1e-9
+    a = _response(0.5) + 1j * jnp.asarray(skew)[None]        # anti-Hermitian part 1e-9
+    local_eigh = lambda x, cut=None: (jnp.linalg.eigvalsh(x), None)
+    run = lambda eigh: jax.jit(lambda r: _passivity_response_checks(r, eigh=eigh, gates=GATES))
+    local, onface = run(local_eigh)(a), run(local_eigh)(jax.device_put(a, face))
+    h = 0.5 * (a[0] + a[0].conj().T)
+    direct = np.linalg.norm(a[0] - a[0].conj().T) / (2 * np.linalg.norm(h))
+    np.testing.assert_allclose(np.asarray(onface["passivity_antihermitian_relative"]), [direct], rtol=1e-12)
+    for key in ("passivity_min", "passivity_max", "passivity_antihermitian_relative"):
+        np.testing.assert_allclose(np.asarray(onface[key]), np.asarray(local[key]), rtol=1e-13, atol=1e-15)
+    # Per rank: the response's face and its Hermitian part, nothing whole. The eigh is the
+    # whole-mesh provider's shape (face in, face out), as the run30k census stands it in.
+    keep = lambda x, cut=None: (jnp.zeros(x.shape[:-1]), jax.lax.with_sharding_constraint(x * 1, face))
+    compiled = run(keep).lower(jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=face)).compile()
+    whole = f"c128[1,{n},{n}]"
+    assert not [line for line in compiled.as_text().splitlines()
+                if "all-gather" in line and whole in line.replace(" ", "")]
+    assert compiled.memory_analysis().temp_size_in_bytes <= 4 * 16 * n * n // mesh.size

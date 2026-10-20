@@ -53,18 +53,21 @@ def test_place_decides_whole_matrices_per_rank_or_the_mesh(monkeypatch):
     pl = sys.modules["distrib_la.plan"]
     monkeypatch.setattr(pl, "mesh_platform", lambda mesh: "CUDA")              # the measured row
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
-    fe = pl.place("eigh", mesh, 64, 312, np.complex128, int(80e9), "scan")
+    mesh_figure = lambda: 123456                          # the plan's own program, compiled
+    place = lambda nb, n, room: pl.place("eigh", mesh, nb, n, np.complex128, int(room), "scan", mesh_figure)
+    fe = place(64, 312, 80e9)
     assert (fe.route, fe.per_rank, fe.rounds) == (pl.ROUTE_BATCH_RESHARD, 16, 1)
-    assert pl.place("eigh", mesh, 4, 8192, np.complex128, int(80e9), "scan").route == pl.ROUTE_BATCH_RESHARD
-    one = pl.place("eigh", mesh, 1, 8192, np.complex128, int(80e9), "scan")
-    assert one.route == "scan" and one.program_bytes == (pl.CHECKED_EIGH_TILES + 2) * 8192 ** 2 * 16 // 4
-    assert pl.place("eigh", mesh, 1, 1456, np.complex128, int(80e9), "scan").route == pl.ROUTE_BATCH_RESHARD
-    big = pl.place("eigh", mesh, 1, 30000, np.complex128, int(8e9), "scan")       # 32.4 GB on 2x2
-    assert big.route == "scan" and big.program_bytes > big.room
+    assert fe.program_bytes == pl._stack_bytes("eigh", mesh, 64, 312, np.complex128, 1, "all",
+                                               pl._gathered_admitted(mesh, (312, 312), np.complex128, int(80e9)))
+    assert place(4, 8192, 80e9).route == pl.ROUTE_BATCH_RESHARD
+    one = place(1, 8192, 80e9)
+    assert one.route == "scan" and one.program_bytes == 123456
+    assert place(1, 1456, 80e9).route == pl.ROUTE_BATCH_RESHARD
+    big = place(1, 30000, 8e9)                            # route (c)'s whole matrix: over 8 GB
+    assert big.route == "scan" and big.program_bytes == 123456
     plan = dataclasses.replace(distrib_la.plan("eigh", mesh, n=30000, backend="off", batched_route="auto",
                                                budget_bytes=int(8e9)), backend="scalapack")
-    with pytest.raises(RuntimeError, match="GATE distrib_la_capacity"):
-        plan.stack_route((1, 30000, 30000), np.complex128)
+    assert plan.stack_route((1, 30000, 30000), np.complex128).program_bytes is None   # no lowering here
 
 
 def test_place_times_the_mesh_by_p_and_platform_without_a_vendor_query(monkeypatch):
@@ -82,11 +85,15 @@ def test_place_times_the_mesh_by_p_and_platform_without_a_vendor_query(monkeypat
         raise AssertionError("a vendor query while planning")
     monkeypatch.setattr(loader, "get_lib", refuse)
     p16 = SimpleNamespace(shape={"x": 4, "y": 4})
+    # The time model alone: every candidate fits (the compiled figures need a real 16-device mesh).
+    monkeypatch.setattr(pl, "_stack_bytes", lambda *a, **k: 0)
+    monkeypatch.setattr(pl, "_gathered_admitted", lambda *a, **k: False)
+    place = lambda nb, n: pl.place("eigh", p16, nb, n, np.complex128, int(100e9), "scan", lambda: 0)
     monkeypatch.setattr(pl, "mesh_platform", lambda mesh: "CUDA")
-    assert pl.place("eigh", p16, 2, 20480, np.complex128, int(100e9), "scan").route == "scan"
-    assert pl.place("eigh", p16, 2, 8192, np.complex128, int(100e9), "scan").route == pl.ROUTE_BATCH_RESHARD
+    assert place(2, 20480).route == "scan"
+    assert place(2, 8192).route == pl.ROUTE_BATCH_RESHARD
     monkeypatch.setattr(pl, "mesh_platform", lambda mesh: "ROCM")
-    assert pl.place("eigh", p16, 2, 20480, np.complex128, int(100e9), "scan").route == pl.ROUTE_BATCH_RESHARD
+    assert place(2, 20480).route == pl.ROUTE_BATCH_RESHARD
 
 
 def test_a_stack_smaller_than_the_ranks_is_no_batch_layout_fit():
@@ -113,14 +120,15 @@ def test_the_passivity_eigh_room_hands_back_its_own_reservation():
 
 def test_constructor_refuses_a_whole_41250_parent_per_rank(monkeypatch):
     """The plausibility deck's largest constructor eigh (one 41250 x 41250 parent, nq 1): route (c)
-    would hold the whole matrix per rank; its shape price is over an 80 GB room, so admit_local
+    would hold the whole matrix per rank; its shape price is over an 80 GB room, so lxkit.memory.admit
     sends it to the whole mesh (staged_eigh)."""
     import distrib_la
-    from common import gpu_utils
+    from lxkit import memory
     from gw.shared_pole_capacity import _local_eigenplan
-    monkeypatch.setattr(gpu_utils, "_RUN_DEVICE_BUDGET_GB", 80.0)
+    memory.set_budget(80e9)
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
     price = distrib_la.eigh_stack_bytes(_local_eigenplan(mesh, 41250), (1, 41250, 41250), np.complex128)
     assert price > 80e9
-    assert not gpu_utils.admit_local("test constructor eigh 1 x 41250^2", price, 80e9,
-                                     distributed_bytes=2 * 16 * 41250 ** 2 // 16, names=("route (c)", "whole mesh"))
+    assert memory.admit("test constructor eigh 1 x 41250^2", (
+        ("route (c)", memory.priced(price, "eigh_stack_bytes")),
+        ("whole mesh", memory.priced(2 * 16 * 41250 ** 2 // 16, "faces"))), 80e9) == "whole mesh"
