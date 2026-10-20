@@ -9,11 +9,13 @@ sample takes which kernel, is owned by
 finite-occupation χ₀ is `compute_chi0_matsubara` at ν = 0, not either kernel
 here.
 
-The full-density TD snapshot uses the separate nonstationary ordered-lag
-contract in [shared-pole implementation §11](shared_pole_model.md#general-snapshot).
-Its native `full_density_response_stream` evaluates two independent density
-insertions; it must not use the diagonal-occupation reverse-product shortcut
-below for a density that does not commute with the Hamiltonian.
+The full-density TD snapshot uses the nonstationary ordered-lag contract in
+[shared-pole implementation §11](shared_pole_model.md#general-snapshot).
+`full_density_response_stream` is an operand adapter onto this same direct
+contour kernel: independent left faces ΨL and ΨR, and the original common
+right Ψ†, enter the existing Green builds, row passes, mode-11 contraction
+and selected-row carry. It does not use a diagonal-occupation reverse-product
+shortcut for a density that does not commute with the Hamiltonian.
 
 ## Carrier
 
@@ -126,6 +128,24 @@ vertices (`ffi.fft.make_kconv_chi_vertex`): per family pair, each Dirac-half
 quadrant's two parent Greens are built on the raw parents and mode 11 forms
 every channel pair's plane, so no full-k Green quadrant exists; a CUDA grid
 mode 11 cannot hold takes the XLA backend ([router](kconv.md#router)).
+
+**Coherent endpoint operands.**
+
+The coherent endpoint option uses a named runtime operand dictionary for
+the two left faces, exact per-parent band ranges, energy bounds and reference
+origin; the ordinary equilibrium call is unchanged. Right-column phases
+remain on the original band index. Node-specific references follow the actual
+two build times, and exact unsupported columns are masked before taking an
+exponential. Full-density moments with unequal energy powers use two
+independent insertions through the same kernel, not a swapped-power reverse
+shortcut. A full-current identity parent plan supplies the native mode-11
+route; the owner also retains its existing no-parent transform arm for tiny
+explicit-full-grid callers. Both use the same response-lattice restriction.
+The row-pass planner prices two left row sets and one common right operand;
+the general builder admits the actual compiled program and native scratch
+through the response bank's existing execution owner. Its receipt records
+these prices under `response_execution`. This is an implementation
+consolidation, not an additional stationarity or passivity guarantee.
 
 **Cost per node** (P ranks, N_μ centroids, n_s spinor components):
 

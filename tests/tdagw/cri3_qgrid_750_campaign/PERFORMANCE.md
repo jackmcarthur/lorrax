@@ -86,9 +86,15 @@ external on-shell sampling range is not a transition cutoff in χ. The current
 full-density builder embeds the active matrix into the full-band density,
 uses current right-column energy phases, and sums all four response blocks
 before Dyson. The separate bosonic q grid changes spatial sampling, not this
-band support. The coherent wrapper and equilibrium wrapper currently share
-Green/GEMM/FFT owners but are not the identical compiled χ integration
-program; consolidation onto the profiled equilibrium stream is under review.
+band support. The coherent wrapper is now a thin operand adapter onto the
+existing equilibrium direct stream, including its typed-parent mode-11
+contraction, row passes and carry. Independent density left endpoints and
+node-specific references remain distinct runtime arguments; this is not a
+stationary-ρ shortcut. The old separate full-density contraction was removed.
+CPU literal/orientation/moment checks pass, and the scalar default matches
+the actual parent21fcc77 owner bit-for-bit on a tiny CPU fixture. The bounded
+native P4 helper is prepared; no material timing or speedup for this
+consolidation is claimed here. Earlier measured timings above are unchanged.
 
 `active_sigma_probe.py:31–52` constructs external energies only for
 `[100,144)` and requests `projection_bands=(100,144)`. In

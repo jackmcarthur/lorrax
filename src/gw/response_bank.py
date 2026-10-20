@@ -156,7 +156,8 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
     return result
 
 
-def full_density_bare_moments(operands, meta, *, mesh_xy, q_ids):
+def full_density_bare_moments(operands, meta, *, mesh_xy, q_ids,
+                              k_unfold_plan=None, execute=None):
     """Exact full-rho coefficients X1/X2 of the native raw polarization.
 
     ``operands=(psi_mun,psi_nmu,psi_rho_mun,energy)`` are the same native
@@ -174,6 +175,7 @@ def full_density_bare_moments(operands, meta, *, mesh_xy, q_ids):
                                                moment_powers=(a, b),
                                                qgrid=getattr(meta, 'qgrid', None),
                                                response_window=getattr(meta, 'qgrid_response_window', 'sharp'),
+                                               k_unfold_plan=k_unfold_plan, execute=execute,
                                                **common)
         return stream(jnp.zeros(1, complex), jnp.ones((1, 1), complex), pm, pn, ph, energy)[:, 0]
     return term(0, 0), term(1, 0)-term(0, 1)

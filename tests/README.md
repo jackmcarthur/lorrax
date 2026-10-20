@@ -37,6 +37,10 @@ A new test needs no bootstrap import of its own.
   products, independent reverse phases, enlarged numerical response groups,
   moments and native paired FFT/quadrature, exact structural endpoint band
   ranges and native-preserving active-span verification geometry (CPU).
+- `test_common_coherent_response_cpu.py`: coherent endpoint adapter through
+  the incumbent direct/mode-11 owner, literal all-block fine/coarse response,
+  two current densities, independent asymmetric moments, runtime load-table
+  operands and unchanged default-versus-explicit-false equilibrium bits (CPU).
 - `test_full_density_block_planning_cpu.py`: public noncrossing and crossing
   primitive signs, measured endpoint intervals and scalar accuracy (CPU).
 - `test_general_pencil_batch_cpu.py`: capacity-bounded concurrent reduced

@@ -133,7 +133,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .response_bank import (full_density_sample_rules, full_density_bare_moments,
                                  _coulomb_algebra, dense_layout, response_algebra,
                                  operator_digest, response_blocks, dielectric_physical_metrics,
-                                 dielectric_inverse_bounds)
+                                 dielectric_inverse_bounds, _bank_execution)
     from .w_isdf import full_density_response_stream
     from .shared_pole_directions import _sample_point
     from .shared_pole_execution import face_matmul
@@ -283,6 +283,11 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         resident_bytes_per_rank=bank_bytes+action_bytes+pencil_bytes,
         workspace_bytes_per_rank=green_bytes+bank_bytes)
     current_meta.shared_pole_capacity.live_stages = (price["stage"],)
+    # Same executable/native-scratch admission as the equilibrium bank. The
+    # full-map reservation above owns the retained response and panel carry;
+    # each dispatch measures its actual TWO-left/common-right operands.
+    response_execution = dict(seconds={}, memory=[], compiled=[])
+    execute_response = _bank_execution(current_meta, mesh_xy, response_execution, config)
     ph = density_left_endpoint(mesh_xy, pm.shape, layout=layout)(pm, jnp.asarray(rho))
     energy_d = jnp.asarray(energy)
     H, inverse, negative, support = _coulomb_algebra(mesh_xy, nmu, int(meta.n_rmu),
@@ -373,7 +378,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             q_ids=np.arange(nq), n_outputs=len(rule["members"]), layout=layout, qgrid=qgrid,
             response_window=response_window,
             rule_reference_ry=rule["reference_ry"],pair_bounds_ry=block['bounds'],
-            pair_band_ranges=block['band_ranges'])
+            pair_band_ranges=block['band_ranges'], k_unfold_plan=plan,
+            execute=execute_response)
         raw = stream(jnp.asarray(rule["times"]), jnp.asarray(rule["weights"]), left, pn, right, energy_d)
         for j, sid in enumerate(rule["members"]):
             value = raw[:, j]
@@ -448,7 +454,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # They are not forced to be Hermitian/even for a coherent finite-band
     # projected density algebra. Gamma shifts X2 by -i gamma X1 once.
     x1, x2 = full_density_bare_moments((pm, pn, ph, energy_d), meta,
-                                      mesh_xy=mesh_xy, q_ids=np.arange(nq))
+                                      mesh_xy=mesh_xy, q_ids=np.arange(nq),
+                                      k_unfold_plan=plan, execute=execute_response)
     pref = float(algebra["prefactor"])
     c1 = mm(V, mm(pref*x1, V))
     c2 = mm(V, mm(pref*(x2-1j*gamma*x1), V))+mm(V, mm(pref*x1, mm(V, mm(pref*x1, V))))
@@ -649,7 +656,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                                     stream=full_density_response_stream(mesh_xy,grid,(nk,nb,nmu,ns),q_ids=[iq],
                                         n_outputs=1,layout=layout,qgrid=qgrid,response_window=response_window,
                                         rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'],
-                                        pair_band_ranges=block['band_ranges'])
+                                        pair_band_ranges=block['band_ranges'],
+                                        k_unfold_plan=carrier.plan,execute=execute_response)
                                     part=stream(jnp.asarray(rule['times']),jnp.asarray(rule['weights']),left,pn,right,energy_d)[:,0]
                                     raw_probe=part if raw_probe is None else raw_probe+part
                             if stop_after is not None:
@@ -787,6 +795,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         largest_output_count=max(len(r['members']) for r in rules),
         rule_groups=len(rules),scalar_provider='exact_endpoint_blocks_public_minimax_owners')
     receipt["phase_seconds"] = phases
+    receipt["response_execution"] = response_execution
     receipt["physical_grid_order"] = grid_receipt
     receipt["native_positive_pole_budget"] = positive_cap
     receipt["general_signed_pole_budget"] = int(cap)

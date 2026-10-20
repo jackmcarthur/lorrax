@@ -1,0 +1,32 @@
+{
+  "status": "CPU_CHECKED_NATIVE_P4_PENDING",
+  "scope": "Tiny algebra and preparation checks only; no material/SC/TD admission or speed claim",
+  "environment": "PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=1 PYTHONPATH=src",
+  "python": "/tmp/lorrax_mgkba_cpu_venv/bin/python",
+  "checks": [
+    {
+      "command": "python -m pytest -q tests/test_common_coherent_response_cpu.py tests/test_full_density_blocks_oracle_cpu.py",
+      "result": "25 passed in 19.13s",
+      "qualification": "Before explicit outer-tail correction; full literal suite"
+    },
+    {
+      "command": "python -m pytest -q tests/test_common_coherent_response_cpu.py tests/tdagw/cri3_qgrid_750_campaign/diagnostics/test_verify_common_chi_p4_prepared.py",
+      "result": "7 passed in 20.35s",
+      "qualification": "AFTER outer-tail correction; includes outer-jaxpr runtime-table witness"
+    },
+    {
+      "command": "python -c 'from tests.test_common_coherent_response_cpu import compare_parent_equilibrium_bits; print(compare_parent_equilibrium_bits())'",
+      "result": "PASS exact uint64 equality, shape [8,1,4,4], actual parent git object 21fcc77",
+      "qualification": "Actual legacy scalar direct function in isolated module namespace, not default-vs-explicit-false alone"
+    },
+    {
+      "command": "python -m pytest -q tests/tdagw/cri3_qgrid_750_campaign/diagnostics/test_verify_common_chi_p4_prepared.py",
+      "result": "2 passed in 0.29s",
+      "qualification": "Final changing-E/rho helper syntax/contract and independent literal transition/moment oracle; no GPU imports"
+    }
+  ],
+  "gpu_helper": "verify_common_coherent_chi_p4.py",
+  "gpu_helper_sha256": "f8130b9ef5bdf67a0ccb9519bff70bee24d51c42bffb5d6cc9663d3551cb2fda",
+  "gpu_launch": "python verify_common_coherent_chi_p4.py --source-root IMMUTABLE_ROOT --source-revision EXACT_SHA --out FRESH_DIRECTORY --max-wall-seconds 180",
+  "gpu_contract": "Native CUDA/mathdx, four MPI processes/one GPU each, mesh2x2; explicit typed current identity plan and real compiled/native execution admission; no reference override or native rebuild"
+}

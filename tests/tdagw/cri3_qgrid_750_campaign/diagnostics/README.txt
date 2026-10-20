@@ -220,3 +220,19 @@ an intermediate sc_seed/map output as that accepted reference.
 
 No allocation launcher or hardcoded remote submission script is preserved
 here. This directory requests no additional allocation or GPU stage.
+
+Common coherent chi owner: PREPARED, NOT GPU-QUALIFIED
+--------------------------------------------------
+verify_common_coherent_chi_p4.py requires an explicitly pinned source
+revision (also LEG_HEAD), source-root module origins, native CUDA mathdx,
+four processes/one device each and mesh2x2. Maximum runtime180s (0.2GPUh).
+It forces the full current typed identity parent plan and the existing
+compiled/native admission owner: full+FF/FA/AF/AA, fine8/coarse4 Fejer,
+two E/rho inputs, both complex-time orientations, exact transition moments,
+inactive deep-band overflow and default-vs-explicit-false bits. No reference
+backend override, material/SC admission, new native build or TD trajectory.
+Run with --source-root ROOT --source-revision SHA --out FRESH_DIRECTORY.
+Both this file and the fixture owner verify_fejer_p4_38dbea1.py must remain
+in the immutable source archive. Only agreed normal completion writes PASS;
+rank-local exceptions print/rethrow without a new failure-path collective.
+Host preparation tests are test_verify_common_chi_p4_prepared.py (2PASS).

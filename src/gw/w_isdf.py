@@ -243,7 +243,8 @@ def charge_kconv_table_bytes():
 _PASS_PLANS: dict = {}
 
 
-def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nodes):
+def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nodes,
+                      left_endpoints=1):
     """The direct stream's row passes and node chunk (``gw.subtile_stream.plan_passes``).
 
     Per local row: the two parent Greens and their antiunitary partners
@@ -251,11 +252,13 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
     transform ``2·16·nk·ν``, the pass's ψ rows ``16·n_parent·ns·n_band``, and
     the chunk's kept rows ``2·16·chunk·q·ν``; per node on the whole tile,
     ``2·16·q·μ·ν``.  ``ν = n_rmu/p_y``, ``μ = n_rmu/p_x``.
+    ``left_endpoints=2`` prices independent density-weighted left rows;
+    their right band-complete operand remains common.
     """
     from .greens_function_kernel import has_antiunitary_rows
     from .subtile_stream import plan_passes
     key = (mesh_xy, tuple(int(v) for v in kgrid), plan, int(n_rmu), int(ns), int(n_band),
-           int(q_count), int(n_nodes))
+           int(q_count), int(n_nodes), int(left_endpoints))
     if key in _PASS_PLANS:
         return _PASS_PLANS[key]
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
@@ -265,7 +268,8 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
 
     def row_bytes(chunk):
         return 16 * (greens * n_parent * ns * nu * ns + 2 * nk * nu
-                     + n_parent * ns * int(n_band) + 2 * chunk * int(q_count) * nu)
+                     + int(left_endpoints) * n_parent * ns * int(n_band)
+                     + 2 * chunk * int(q_count) * nu)
     while len(_PASS_PLANS) >= 4:
         _PASS_PLANS.pop(next(iter(_PASS_PLANS)))
     _PASS_PLANS[key] = plan_passes(plan.unfold_load_tables(), mesh_xy, ns=ns, row_bytes=row_bytes,
@@ -914,7 +918,7 @@ def _get_chi_fractional_contour_kernel(
 def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs,
                                  layout="face", rule_reference_ry=0.0, moment_powers=(0, 0),
                                  pair_bounds_ry=None, pair_band_ranges=None, qgrid=None,
-                                 response_window="sharp"):
+                                 response_window="sharp", k_unfold_plan=None, execute=None):
     """Full microscopic one-sided MGKBA commutator on shared time nodes.
 
     Returned ``fn(times,weights,psi_mun,psi_nmu,psi_rho_mun,energy)`` takes
@@ -951,14 +955,14 @@ def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs
     program = _full_density_response_program(mesh_xy, tuple(map(int, kgrid)), tuple(map(int, face_shape)),
         tuple(map(int, q_ids)), int(n_outputs), layout, tuple(map(int, moment_powers)),
         pair_bounds_ry is not None, pair_band_ranges is not None, ffi_dial_key(),
-        None if qgrid is None else tuple(qgrid), response_window)
+        None if qgrid is None else tuple(qgrid), response_window, k_unfold_plan)
     # Reference is a small DYNAMIC operand, not a fresh jit closure per E.
     # Only topology, shape and moment powers identify the compiled factory.
     bounds = np.zeros(4) if pair_bounds_ry is None else np.asarray(pair_bounds_ry, float)
     if bounds.shape != (4,) or not np.isfinite(bounds).all():
         raise ValueError("GATE response_full_density: finite ordered endpoint bounds required")
     nk, nb = map(int, face_shape[:2])
-    ranges = np.zeros((2,2,nk),np.int32)
+    ranges = np.broadcast_to(np.array([0,nb],np.int32)[None,:,None],(2,2,nk)).copy()
     if pair_band_ranges is not None:
         raw = np.asarray(pair_band_ranges)
         if raw.shape == (2,2):
@@ -969,110 +973,75 @@ def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs
                 or np.any(raw[:,0] > raw[:,1])):
             raise ValueError("GATE response_full_density: exact ordered endpoint band ranges required")
         ranges = raw.astype(np.int32)
-    return lambda *args: program(*args, jnp.asarray(rule_reference_ry, dtype=jnp.float64),
-                                jnp.asarray(bounds), jnp.asarray(ranges))
+    def run(*args):
+        operands = (*args, jnp.asarray(rule_reference_ry, dtype=jnp.float64),
+                    jnp.asarray(bounds), jnp.asarray(ranges))
+        if execute is None:
+            return program(*operands)
+        from .greens_function_kernel import chi0_kconv_scratch
+        scratch = (0 if k_unfold_plan is None else chi0_kconv_scratch(
+            kgrid=kgrid, n_parent=nk, n_rmu=face_shape[2], ns=face_shape[3], mesh=mesh_xy))
+        stage = "moment_correlation" if any(moment_powers) else "direct"
+        return execute(program, operands, stage, runtime_bytes=scratch)
+    return run
 
 
 @lru_cache(maxsize=32)
 def _full_density_response_program(mesh_xy, kgrid, face_shape, q_ids, n_outputs, layout, moment_powers,
                                    ordered_pair, bounded_bands, dial_key, qgrid=None,
-                                   response_window="sharp"):
-    from common.fft_helpers import make_flat_k_fftn, make_response_lattice_fftn
-    from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau
-    from .wavefunction_bundle import G_FFT7D_SPEC, CHI_Q_SPEC, CHI_R_SPEC
+                                   response_window="sharp", k_unfold_plan=None):
+    """Thin operand adapter; all Green/convolution/carry work has ONE owner."""
     from common.wfn_layout import psi_specs
     nk, nb, nmu, ns = map(int, face_shape)
     grid = tuple(map(int, kgrid))
     if nk != int(np.prod(grid)):
         raise ValueError("GATE response_full_density: current full-k carrier required")
-    cfft = make_response_lattice_fftn(mesh_xy, grid, qgrid, CHI_Q_SPEC,
-                                      window=response_window)
-    response_grid = grid if qgrid is None else tuple(int(n) for n in qgrid)
-    nq = int(np.prod(response_grid))
-    if response_grid != grid and ns not in (1, 2):
-        raise ValueError("GATE response_qgrid: lattice restriction serves the standard scalar response only")
-    q_ids = np.asarray(q_ids, np.int32)
-    if not q_ids.size or np.any(q_ids < 0) or np.any(q_ids >= nq):
-        raise ValueError("GATE response_full_density: invalid exact q rows")
-    coords = np.unravel_index(q_ids, response_grid)
-    minus_q = np.ravel_multi_index(tuple((-c) % n for c, n in zip(coords, response_grid)), response_grid)
-    gfft = make_flat_k_fftn(mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
-    plan = gemm_plan(mesh_xy, m=nmu*ns, k=nb, n=nmu*ns, nq=nk,
-                     dtype=jnp.complex128, layout=layout, warmup=False)
+    common = _get_chi_fractional_contour_kernel_face(
+        mesh_xy, grid, n_outputs, face_shape, k_unfold_plan=k_unfold_plan,
+        layout=layout, selected_q=q_ids, pair_mode="direct", ordered=True,
+        qgrid=qgrid, response_window=response_window, endpoint_pair=True)
+    # Bind placed load tables at the OUTERMOST jit boundary too. Calling a
+    # _BoundTail from inside this jit would close over multi-process device
+    # arrays instead of passing its native mode-11 tables as operands.
+    common_tail = common.tail if isinstance(common, _BoundTail) else ()
+    common_program = common.program if isinstance(common, _BoundTail) else common
+    tail_shardings = jax.tree.map(lambda value: value.sharding, common_tail)
     nmu_spec, mun_spec = psi_specs(layout)
     rep = NamedSharding(mesh_xy, P())
     out = NamedSharding(mesh_xy, P(None, None, "x", "y"))
-    scalar = NamedSharding(mesh_xy, CHI_R_SPEC)
 
     @partial(jax.jit, in_shardings=(rep, rep, NamedSharding(mesh_xy, mun_spec),
-             NamedSharding(mesh_xy, nmu_spec), NamedSharding(mesh_xy, mun_spec), rep, rep, rep, rep),
+             NamedSharding(mesh_xy, nmu_spec), NamedSharding(mesh_xy, mun_spec), rep, rep, rep, rep)
+             + tail_shardings,
              out_shardings=out)
     def integrate(times, weights, psi_mun, psi_nmu, psi_rho_mun, energy, rule_reference_ry, endpoint_bounds,
-                  endpoint_ranges):
+                  endpoint_ranges, *load_tables):
         if weights.shape != ((2, n_outputs, times.size) if ordered_pair else (n_outputs, times.size)):
             raise ValueError("GATE response_full_density: inconsistent shared quadrature weights")
         emin, emax = jnp.min(energy), jnp.max(energy)
-
-        def green(left, t, reference, power, mask=None, band_range=None):
-            return gfft(build_G_tau(left, psi_nmu, energy, t, e_ref=reference,
-                                    band_weight=(energy-.5*(emin+emax))**int(power),
-                                    mask=mask, band_range=band_range, layout=layout, gemm=plan))
-
-        def correlation(left, right, t):
-            lower_ref = jnp.where(t.real >= 0, emin, emax)
-            upper_ref = jnp.where(t.real >= 0, emax, emin)
-            a = green(left, t, lower_ref, moment_powers[0])
-            a, right = jax.lax.optimization_barrier((a, right))
-            b = green(right, -jnp.conj(t), upper_ref, moment_powers[1])
-            return jax.lax.with_sharding_constraint(
-                jnp.einsum("kmanb,kmanb->kmn", a, b.conj()), scalar)
-
-        zero = jax.lax.with_sharding_constraint(
-            jnp.zeros((n_outputs, q_ids.size, nmu, nmu), jnp.complex128), out)
-
-        def node(carry, i):
-            if ordered_pair:
-                t = times[i]
-                lmin, lmax, rmin, rmax = endpoint_bounds
-                lref = jnp.where(t.real >= 0, lmin, lmax)
-                rref = jnp.where(t.real >= 0, rmax, rmin)
-                # The endpoint is structurally zero outside these exact
-                # support bounds. Use the Green owner's phase selector so
-                # an unused deep-band exp cannot form 0*inf under a compact
-                # real-time rule. No supported energy/phase is modified.
-                lr = tuple(endpoint_ranges[0]) if bounded_bands else None
-                rr = tuple(endpoint_ranges[1]) if bounded_bands else None
-                a = green(psi_mun, t, lref, moment_powers[0],(energy>=lmin)&(energy<=lmax),lr)
-                a, t = jax.lax.optimization_barrier((a, t))
-                b = green(psi_rho_mun, -jnp.conj(t), rref, moment_powers[1],(energy>=rmin)&(energy<=rmax),rr)
-                product = jax.lax.with_sharding_constraint(jnp.einsum("kmanb,kmanb->kmn",a,b.conj()),scalar)
-                value = cfft(product)
-                forward = jnp.take(value, jnp.asarray(minus_q), axis=0)
-                reverse = jnp.conj(jnp.take(value, jnp.asarray(q_ids), axis=0))
-                delta = rule_reference_ry-(lref-rref)
-                w0 = weights[0,:,i]*jnp.exp(delta*t)
-                w1 = weights[1,:,i]*jnp.exp(delta*jnp.conj(t))
-                return carry+w0[:,None,None,None]*forward[None]+w1[:,None,None,None]*reverse[None],None
-            t, w = jax.lax.optimization_barrier((times[i], weights[:, i]))
-            forward = correlation(psi_mun, psi_rho_mun, t)
-            forward, t = jax.lax.optimization_barrier((forward, t))
-            value = cfft(forward-correlation(psi_rho_mun, psi_mun, t))
-            value = jnp.take(value, jnp.asarray(minus_q), axis=0)
-            delta_ref = jnp.where(t.real >= 0, emin-emax, emax-emin)
-            w = w*jnp.exp((rule_reference_ry-delta_ref)*t)
-            return carry+w[:, None, None, None]*value[None], None
-
-        result = jax.lax.scan(node, zero, jnp.arange(times.size))[0]
-        return jnp.swapaxes(result, 0, 1)
-    return integrate
+        powers = tuple((energy-.5*(emin+emax))**int(p) for p in moment_powers)
+        bounds = endpoint_bounds if ordered_pair else jnp.stack([emin,emax,emin,emax])
+        def product(left, right, projections):
+            operands = dict(lower_mun=right, upper_mun=left, bounds_ry=bounds,
+                            band_ranges=endpoint_ranges, origin_ry=rule_reference_ry)
+            return common_program(times, projections, operands, psi_nmu, energy,
+                                  powers[1], powers[0], jnp.zeros(2), *load_tables)
+        if ordered_pair:
+            return product(psi_mun, psi_rho_mun, weights)
+        projections = jnp.stack([weights, jnp.zeros_like(weights)])
+        # Independent insertions are essential for unequal moment powers:
+        # reverse of B(L E^a,R E^b) swaps a/b, not just L/R.
+        first = product(psi_mun, psi_rho_mun, projections)
+        first, second_left = jax.lax.optimization_barrier((first, psi_rho_mun))
+        return first-product(second_left, psi_mun, projections)
+    return _BoundTail(integrate, common_tail) if common_tail else integrate
 
 
 def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
     *, k_unfold_plan=None, layout="face", selected_q=None, pair_mode="retarded",
     bank_carry=False, ordered=False, vertex=False, band_ranges=None, stream_pass=None,
-    qgrid=None, response_window="sharp",
+    qgrid=None, response_window="sharp", endpoint_pair=False,
 ):
     """Integrate the retarded response using final occupied and unoccupied band weights.
 
@@ -1125,6 +1094,15 @@ def _get_chi_fractional_contour_kernel_face(
     Greens and their phases retain ``kgrid``. The FFT owner applies the
     symmetric even-boundary lattice window and ``sqrt(Nq/Nk)`` scaling, so
     the physical prefactor still uses electronic Nk. Same-grid is unchanged.
+
+    ``endpoint_pair=True`` is the coherent direct stream. Its ``psi_mun``
+    operand is a plain dictionary with ``lower_mun`` (Psi R), ``upper_mun``
+    (Psi L), ``bounds_ry`` [Lmin,Lmax,Rmin,Rmax], ``band_ranges``
+    [L/R,lo/hi,parent] and scalar ``origin_ry``. The right face remains the
+    ORIGINAL Psi dagger. Bounds/ranges are exact structural supports, not
+    occupation thresholds; all are runtime operands. Both independently
+    oriented Greens use the same contraction, row passes and carry as the
+    equilibrium stream. Only an explicitly full current parent plan is valid.
     """
     from common.fft_helpers import make_flat_k_fftn, make_response_lattice_fftn
     from distrib_la import gemm_plan
@@ -1166,6 +1144,10 @@ def _get_chi_fractional_contour_kernel_face(
                 "bosonic full-grid indices; why: bank parent rows must be explicit")
     physical = bool(ordered) or pair_mode == "laplace_ordered"
     photon = vertex if vertex else None
+    if endpoint_pair and (pair_mode != "direct" or not physical or photon is not None):
+        raise ValueError("GATE response_endpoints: ordered scalar direct stream required")
+    if endpoint_pair and band_ranges is not None:
+        raise ValueError("GATE response_endpoints: use runtime endpoint band_ranges only")
     if cropped_lattice and (photon is not None or int(face_shape[-1]) not in (1, 2)):
         raise ValueError("GATE response_qgrid: lattice restriction serves the standard scalar response only")
     if photon is not None and (not physical or k_unfold_plan is not None
@@ -1215,6 +1197,15 @@ def _get_chi_fractional_contour_kernel_face(
         raise ValueError(
             "_get_chi_fractional_contour_kernel_face: plan n_full "
             f"{k_unfold_plan.n_full} != prod(kgrid)={nk}.")
+    if endpoint_pair and nk_shape != nk:
+        raise ValueError("GATE response_endpoints: full current electronic parents required")
+    if endpoint_pair and k_unfold_plan is not None:
+        from .centroid_k_unfold import authenticate_canonical_full_grid
+        plan = k_unfold_plan
+        authenticate_canonical_full_grid(plan, grid)
+        if (not np.array_equal(np.asarray(plan.irr_idx), np.arange(nk))
+                or np.any(np.asarray(plan.sym_idx) != 0)):
+            raise ValueError("GATE response_endpoints: current full-k identity transport required")
 
     G_fftn = make_flat_k_fftn(
         mesh_xy, grid, G_FFT7D_SPEC, norm="ortho")
@@ -1226,6 +1217,9 @@ def _get_chi_fractional_contour_kernel_face(
     psi_mun_shard = NamedSharding(mesh_xy, PSI_MUN_SPEC)
     psi_nmu_shard = NamedSharding(mesh_xy, PSI_NMU_SPEC)
     mun_input = (psi_mun_shard, psi_mun_shard) if photon else psi_mun_shard
+    if endpoint_pair:
+        mun_input = dict(lower_mun=psi_mun_shard, upper_mun=psi_mun_shard,
+                         bounds_ry=rep0, band_ranges=rep0, origin_ry=rep0)
     nmu_input = (psi_nmu_shard, psi_nmu_shard) if photon else psi_nmu_shard
 
     # One fixed contraction route is shared by every Gf and Gu build.
@@ -1259,7 +1253,7 @@ def _get_chi_fractional_contour_kernel_face(
     else:
         g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
                            nq=nk_shape, dtype=jnp.complex128, layout=layout,
-                           enable_active_range=band_ranges is not None and layout == "axis",
+                           enable_active_range=(band_ranges is not None or endpoint_pair) and layout == "axis",
                            warmup=False)
     # Four-current stream on raw-parent plans: each quadrant's parent Green pair
     # goes straight into mathdx mode 11 with the channel vertices (unfold on the
@@ -1324,12 +1318,13 @@ def _get_chi_fractional_contour_kernel_face(
         px = int(mesh_xy.shape["x"])
         subtile = _direct_pass_plan(mesh_xy, grid, k_unfold_plan, n_rmu=n_rmu, ns=ns,
                                     n_band=nb_full, q_count=len(selected_q),
-                                    n_nodes=minimax.RESPONSE_NODE_CAPACITY)
+                                    n_nodes=minimax.RESPONSE_NODE_CAPACITY,
+                                    left_endpoints=2 if endpoint_pair else 1)
         # Every pass is one window of subtile.rows rows: one kconv call, one GEMM plan.
         pass_kconv, pass_arrays = _charge_window_kconv(mesh_xy, grid, k_unfold_plan, subtile.rows)
         pass_gemm = gemm_plan(mesh_xy, m=px * subtile.rows * ns, k=nb_full, n=n_rmu * ns,
                               nq=nk_shape, dtype=jnp.complex128, layout="axis",
-                              enable_active_range=band_ranges is not None, warmup=False)
+                              enable_active_range=band_ranges is not None or endpoint_pair, warmup=False)
         pass_active = (tuple(pass_gemm.prepare_active_range(*bounds) for bounds in band_ranges)
                        if band_ranges is not None else (None, None))
         chi_tables = pass_arrays
@@ -1384,6 +1379,15 @@ def _get_chi_fractional_contour_kernel_face(
         *carry,
     ):
         # The caller supplies occ and 1-occ after support masking; do not invert again.
+        endpoints = psi_mun if endpoint_pair else None
+        if endpoint_pair:
+            psi_mun = endpoints["upper_mun"]
+            lmin, lmax, rmin, rmax = endpoints["bounds_ry"]
+            lrefs = jnp.where(time_nodes.real >= 0, lmin, lmax)
+            rrefs = jnp.where(time_nodes.real >= 0, rmax, rmin)
+            delta = endpoints["origin_ry"] - (lrefs-rrefs)
+            projection_rows = projection_rows * jnp.stack([
+                jnp.exp(delta*time_nodes), jnp.exp(delta*jnp.conj(time_nodes))])[:,None,:]
         n_mu = (psi_mun.shape[2] if photon is None
                 else photon.packed_layout.packed_extent)
         q_count = nk if selected_q is None else len(selected_q)
@@ -1422,12 +1426,34 @@ def _get_chi_fractional_contour_kernel_face(
             """The (weight, time) the Green is built at: conjugated for the physical orientation."""
             return (jnp.conj(weight), jnp.conj(t)) if physical else (weight, t)
 
+        def endpoint_operands(weight, ref, current):
+            """Mask exact zero columns BEFORE exp, without moving a live phase."""
+            i = 0 if current else 1
+            lo, hi = endpoints["band_ranges"][i]
+            emin, emax = endpoints["bounds_ry"][2*i:2*i+2]
+            bands = jnp.arange(nb_full)[None,:]
+            support = ((enk_full >= emin) & (enk_full <= emax)
+                       & (bands >= lo[:,None]) & (bands < hi[:,None]))
+            return (endpoints["upper_mun" if current else "lower_mun"],
+                    jnp.where(support, enk_full, ref), jnp.where(support, weight, 0),
+                    (lo, hi))
+
+        def direct_refs(time):
+            if endpoint_pair:
+                return (jnp.where(time.real >= 0, rmax, rmin),
+                        jnp.where(time.real >= 0, lmin, lmax))
+            return energy_reference
+
         def green_k(weight, t, ref, *, current=False):
             # Incumbent: conj(G(w, t)) = G(conj w, conj t)^T. Physical: G(conj w, conj t).
             weight, t = oriented(weight, t)
-            g = build_G_tau(psi_mun, psi_nmu, enk_full, t, e_ref=ref,
+            left, energies, bounds = psi_mun, enk_full, None
+            if endpoint_pair:
+                left, energies, weight, bounds = endpoint_operands(weight, ref, current)
+            g = build_G_tau(left, psi_nmu, energies, t, e_ref=ref,
                             band_weight=weight, layout=layout,
                             gemm=g_plan, k_unfold_plan=k_unfold_plan,
+                            band_range=bounds,
                             prepared_active_gemm=active_gemms[int(current)],
                             real_weights=False if direct else None)
             g = g if physical else jnp.conj(g)
@@ -1714,8 +1740,12 @@ def _get_chi_fractional_contour_kernel_face(
             """
             def parent(weight, t, ref, current):
                 weight, t = oriented(weight, t)
-                return build_G_tau(psi_mun, psi_nmu, enk_full, t, e_ref=ref,
+                left, energies, bounds = psi_mun, enk_full, None
+                if endpoint_pair:
+                    left, energies, weight, bounds = endpoint_operands(weight, ref, current)
+                return build_G_tau(left, psi_nmu, energies, t, e_ref=ref,
                                    band_weight=weight, layout=layout, gemm=g_plan,
+                                   band_range=bounds,
                                    k_unfold_plan=k_unfold_plan, unfold=False,
                                    prepared_active_gemm=active_gemms[int(current)],
                                    real_weights=False)
@@ -1744,8 +1774,9 @@ def _get_chi_fractional_contour_kernel_face(
                 jax.lax.dynamic_index_in_dim(projection_rows[0], index, axis=1, keepdims=False),
                 jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False),
                 *node_band_weights(index)))
-            value = chi_fftn(spin_correlation(lower_w, -time, energy_reference[0],
-                upper_w, jnp.conj(time), energy_reference[1]))
+            lower_ref, upper_ref = direct_refs(time)
+            value = chi_fftn(spin_correlation(lower_w, -time, lower_ref,
+                upper_w, jnp.conj(time), upper_ref))
             ahead, behind = rows(value, gather_q), jnp.conj(rows(value, reverse_q))
             accumulators = accumulate_selected(accumulators, ahead, forward)
             return accumulate_selected(accumulators, behind, reverse)
@@ -1773,6 +1804,9 @@ def _get_chi_fractional_contour_kernel_face(
             from .greens_function_kernel import green_right_operand
             from .subtile_stream import band_complete, stream_passes, window_load, window_rows
             rows_all, cols_all = band_complete(psi_mun, psi_nmu, mesh_xy)
+            if endpoint_pair:
+                lower_rows, _ = band_complete(endpoints["lower_mun"], psi_nmu, mesh_xy)
+                rows_all = (lower_rows, rows_all)
             # The right operand of every Green build, formed once per dispatch.
             right = green_right_operand(cols_all)
             px, R = int(mesh_xy.shape["x"]), int(subtile.rows)
@@ -1782,7 +1816,9 @@ def _get_chi_fractional_contour_kernel_face(
                 if window is None:
                     return rows_all, DeviceLoadTables(*chi_load), {}
                 s, lo, hi = window
-                return (window_rows(rows_all, mesh_xy, s, R, axis=2, spec=P(None, None, "x", None)),
+                cut = lambda value: window_rows(value, mesh_xy, s, R, axis=2,
+                                                spec=P(None, None, "x", None))
+                return (tuple(cut(value) for value in rows_all) if endpoint_pair else cut(rows_all),
                         window_load(DeviceLoadTables(*chi_load), mesh_xy, s, lo, hi, R, ns),
                         dict(live=jnp.stack([lo, hi]).astype(jnp.int32)))
 
@@ -1793,13 +1829,19 @@ def _get_chi_fractional_contour_kernel_face(
 
                 def parent(weight, t, ref, current):
                     weight, t = oriented(weight, t)
-                    return build_G_tau(psi_p, None, enk_full, t, e_ref=ref,
+                    energies, bounds, left = enk_full, None, psi_p
+                    if endpoint_pair:
+                        _, energies, weight, bounds = endpoint_operands(weight, ref, current)
+                        left = psi_p[int(current)]
+                    return build_G_tau(left, None, energies, t, e_ref=ref,
                                        band_weight=weight, layout="axis", gemm=pass_gemm,
+                                       band_range=bounds,
                                        k_unfold_plan=k_unfold_plan, unfold=False,
                                        prepared_active_gemm=pass_active[int(current)],
                                        real_weights=False, right=right)
-                lower = parent(lower_w, -time, energy_reference[0], False)
-                upper = parent(upper_w, jnp.conj(time), energy_reference[1], True)
+                lower_ref, upper_ref = direct_refs(time)
+                lower = parent(lower_w, -time, lower_ref, False)
+                upper = parent(upper_w, jnp.conj(time), upper_ref, True)
                 partners = (() if lower.conj_partner and upper.conj_partner
                             else (lower.partner(), upper.partner()))
                 # A window's rows outside its live rows add nothing (mode 11's live).

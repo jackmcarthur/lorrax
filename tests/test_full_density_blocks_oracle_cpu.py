@@ -39,6 +39,101 @@ def test_literal_four_blocks_sum_full_coherent_time_and_frequency_all_q():
         np.testing.assert_allclose(got_z,ordered_pr(psi,energy,rho,partner,sites,gamma,spin),rtol=2e-13,atol=2e-15)
 
 
+@pytest.mark.parametrize('nspin',[1,2])
+def test_common_mode11_endpoint_mapping_literal_complex_time_all_q(nspin):
+    """Algebra oracle only: incumbent IFFT contraction with independent LEFTs.
+
+    This does not execute the production native kernel. It fixes its exact
+    endpoint, q-sign and reference contracts before the implementation is
+    consolidated. The separate transition-index oracle supplies the answers.
+    """
+    psi,energy,rho,partners=case(704)
+    psi=psi[:,:,:nspin]
+    nk=psi.shape[0]
+    times=np.array([0.,.13+.21j,-.11+.29j,.03-.17j,-.09-.07j])
+    identity=np.broadcast_to(np.eye(energy.shape[1]),rho.shape)
+
+    def green_from_left(matrix,time,reference):
+        # M precedes the RIGHT-band phase, including [M,E] != 0.
+        left=np.einsum('kab,kasm->kbsm',matrix,psi)
+        phase=np.exp(-(energy-reference)*time)
+        return np.einsum('kbsm,kb,kbtn->ksmtn',left,phase,psi.conjugate())
+
+    # Include the unsplit pair and every exact frozen/active block.
+    panels=dict(full=(identity-rho,rho),
+                **four_block_panels(rho,slice(1,3)))
+    for name,(left,right) in panels.items():
+        forward=[pair_spectrum(psi,energy,left,right,p) for p in partners]
+        reverse=[pair_spectrum(psi,energy,right,left,p) for p in partners]
+        for i,time in enumerate(times):
+            # References deliberately differ at each node and between the
+            # endpoints. They are REAL, chosen for the ACTUAL build times.
+            lref=energy.min() if time.real>=0 else energy.max()
+            rref=energy.max() if time.real>=0 else energy.min()
+            origin=-.37+.023*i
+            # Physical direct owner: lower=-s -> -conj(s),
+            # upper=conj(s) -> s. Only the left faces differ.
+            lower=green_from_left(right,-time.conjugate(),rref)
+            upper=green_from_left(left,time,lref)
+            lower_r=np.fft.ifft(lower,axis=0,norm='ortho')
+            upper_r=np.fft.ifft(upper,axis=0,norm='ortho')
+            # Native mode11 v(R)=conj(upper_ifft)*lower_ifft.
+            v=np.einsum('Rsmtn,Rsmtn->Rmn',upper_r.conjugate(),lower_r)
+            fv=np.fft.fft(v,axis=0,norm='ortho')
+            delta=lref-rref
+            for q in range(nk):
+                ahead=fv[(-q)%nk].conjugate()/np.sqrt(nk)
+                behind=fv[q]/np.sqrt(nk)
+                expected_f=pair_time(forward[q],[time])[0]
+                expected_r=pair_time(reverse[q],[-time.conjugate()])[0]
+                np.testing.assert_allclose(
+                    ahead*np.exp((origin-delta)*time),
+                    expected_f*np.exp(origin*time),rtol=3e-13,atol=3e-15)
+                np.testing.assert_allclose(
+                    behind*np.exp((origin-delta)*time.conjugate()),
+                    expected_r*np.exp(origin*time.conjugate()),rtol=3e-13,atol=3e-15)
+                if name=='AA' and i==1 and q==1:
+                    # These mistakes are not masked by a spin trace or a
+                    # stationary/passive density fixture.
+                    assert np.linalg.norm(expected_f-expected_f.T)>1e-5
+                    wrong=pair_time(reverse[q],[time.conjugate()])[0]
+                    assert np.linalg.norm(wrong-expected_r)>1e-5
+
+    # Independent bilinear reduction of the full upper-endpoint commutator:
+    # B(I,rho)-B(rho,I) = B(I-rho,rho)-B(rho,I-rho).
+    for partner in partners:
+        first=pair_time(pair_spectrum(psi,energy,identity-rho,rho,partner),times)
+        second=pair_time(pair_spectrum(psi,energy,rho,identity-rho,partner),times)
+        np.testing.assert_allclose(first-second,
+            ordered_pr_time(psi,energy,rho,partner,times),rtol=3e-13,atol=3e-15)
+
+
+def test_common_paired_moments_require_swapping_endpoint_energy_powers():
+    """A single product reverses its endpoint powers as well as its endpoints."""
+    psi,energy,rho,partners=case(705)
+    identity=np.broadcast_to(np.eye(energy.shape[1]),rho.shape)
+    upper=identity-rho
+    centered=energy-.5*(energy.min()+energy.max())
+    upper_e=upper*centered[:,None,:]
+    rho_e=rho*centered[:,None,:]
+    gamma=.041
+    for partner in partners:
+        def at_zero(left,right):
+            return pair_time(pair_spectrum(psi,energy,left,right,partner),[0.])[0]
+        forward=pair_spectrum(psi,energy,upper,rho,partner)
+        reverse=pair_spectrum(psi,energy,rho,upper,partner)
+        first,second=commutator_moments(forward,reverse,gamma)
+        # C2 uses the SUM of the two paired orientations, not the C1
+        # antisymmetric combination. The common energy origin cancels.
+        first_power=(at_zero(upper_e,rho)+at_zero(rho,upper_e)
+                     -at_zero(upper,rho_e)-at_zero(rho_e,upper))
+        np.testing.assert_allclose(first_power-1j*gamma*first,second,
+                                   rtol=3e-13,atol=3e-15)
+        wrong=(at_zero(upper_e,rho)-at_zero(rho,upper_e)
+               -at_zero(upper,rho_e)+at_zero(rho_e,upper))
+        assert np.linalg.norm(wrong-first_power)>1e-4
+
+
 def test_independent_reverse_is_minus_conjugate_time_and_q_not_stationary_shortcut():
     psi,energy,rho,partners=case()
     times=np.array([.17+.23j,-.09+.31j,.04-.19j])
