@@ -720,9 +720,11 @@ def fit_zeta_to_h5(
                 zeta_rcond=zeta_rcond)
             # The charge factor is one array; a current factor is (factor, piv).
             L_q, lu_piv = _factor if v != 0 else (_factor, None)
+            if v != 0 and lu_piv is None:
+                _kind = 'inverse'      # the mesh route: C⁻¹ on the face (core.transverse_factor_layout)
             timing.stage_wait(L_q)
             print_fn(f"  μ_L={v} factor: {_kind} -> "
-                     f"{'hoisted pivoted LU' if lu_piv is not None else 'B on the face'} "
+                     f"{'hoisted pivoted LU' if lu_piv is not None else 'C^-1 on the face' if _kind == 'inverse' else 'B on the face'} "
                      f"{tuple(L_q.shape)}, back-solve {'on the q owners' if lu_piv is not None else 'on the face'}")
         with timing.section("zeta_fit.factor_residency"):
             L_q, lu_piv = zeta_factor_resident(
