@@ -79,7 +79,7 @@ __all__ = ["DynsigKernels", "assemble_dynsig_bundle", "check_state", "chi0_split
            "dynamic_correction", "dynsig_model", "equilibrium_sigma", "exchange_sigma",
            "instantaneous_basis", "literal_sx", "make_dynsig_kernels", "probe_rule",
            "screened_update", "static_rule", "gw_window_source", "window_collision",
-           "window_branch_rates", "collision_screening", "screen_populations",
+           "window_branch_operators", "collision_screening", "screen_populations",
            "spm_screening", "spm_refit", "pole_census", "census_summary",
            "COLLISION_SCREENINGS"]
 
@@ -1501,14 +1501,11 @@ def spm_t0_line(screen_eq: dict) -> str:
             + ("" if not c else f", Omega_min {c['omega_min_ev']:.3f} eV"))
 
 
-def window_branch_rates(tabs: dict):
-    """(G~>, G~<, S~) host (nk, n, n) Ry from ``window_sigma_c``'s ``branch_pair`` (Eq. 8)."""
+def window_branch_operators(tabs: dict):
+    """(gamma, injection, m_h), host (nk, n, n) Ry, from complex branch samples."""
     from tdagw import collision as C
-    g_out, g_in = (np.asarray(g) for g in C.rates(jnp.asarray(tabs["cond"]),
-                                                   jnp.asarray(tabs["val"])))
-    s = 0.5 * (tabs["cond"][0] + tabs["cond"][1] + tabs["val"][0] + tabs["val"][1]
-               ) + tabs["static"]
-    return g_out, g_in, s
+    return tuple(np.asarray(g) for g in C.branch_operators(
+        jnp.asarray(tabs["cond"]), jnp.asarray(tabs["val"]), jnp.asarray(tabs["static"])))
 
 
 def _shift_window_part(base: dict, new: dict, old: dict) -> dict:
@@ -1531,11 +1528,11 @@ def _shift_window_part(base: dict, new: dict, old: dict) -> dict:
 
 #: ``window_collision``'s refresh sweeps (``[lorrax] collision_refresh_sweep``).
 REFRESH_SWEEPS = ("full", "active")
-#: The internal line of the active part's rates (``[lorrax] collision_in_scattering``):
+#: The internal line of the active collision coefficients (``[lorrax] collision_in_scattering``):
 #: the populations (diag rho) or the full window rho (td_agw_dynamical.md §1.5, Eq. 8a).
 IN_SCATTERINGS = ("populations", "full")
-#: The intermediate states of the rates (``[lorrax] collision_rate_intermediates``): every
-#: band, or the window's own (the frozen part then enters the Hermitian part only).
+#: The intermediate states of Gamma and D (``[lorrax] collision_rate_intermediates``):
+#: every band, or the window's own (the frozen part then enters M_H only).
 RATE_INTERMEDIATES = ("all", "active")
 #: The basis and energies of the lines (``[lorrax] collision_basis``): the band basis at the
 #: bundle's energies (the incumbent), or the eigenbasis of the propagator's slow Hamiltonian
@@ -1715,9 +1712,9 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         ``pairing`` (``window_sigma_c``'s ``rho``; td_agw_dynamical.md §1.5, Eqs. 8a, 8c);
         each line sweep has its own held session, planned at f = 1/2, at t0 on rho_eq.
     rate_intermediates : :data:`RATE_INTERMEDIATES`, ``sweep = "active"`` for
-        ``"active"``: the rates G~> and G~< (both branches' widths) of every
-        intermediate band (the incumbent) or of the window's own; the frozen part then
-        enters S~ (the Hermitian part, Delta Sigma^h) only, so frozen populations, which
+        ``"active"``: the dissipative Gamma and D coefficients use every intermediate
+        band (the incumbent) or the window's own; the frozen part then enters the coherent
+        M_H correction (Delta Sigma^h) only, so frozen populations, which
         never update, are no particle source or sink of the window.
     basis : :data:`COLLISION_BASES`, ``in_scattering = "full"`` for ``"instantaneous"``:
         the lines' basis and energies.  ``"band"`` (the incumbent): U = 1, e = eps^G of
@@ -1744,7 +1741,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     t0 :class:`tdagw.collision.Dissipator` (k-sharded), ``held`` the t0 held
     Delta Sigma^h (zeros; None when ``hermitian == "none"``), ``refresh`` the hook of
     ``tdagw.propagate.run_propagation``, ``t0`` the equilibrium receipt and
-    ``state`` (the hook's history), ``eq`` the t0 sweep (:func:`window_branch_rates`
+    ``state`` (the hook's history), ``eq`` the t0 sweep (:func:`window_branch_operators`
     and ``window_sigma_c``'s raw output) and ``bundle_of`` (TD k row -> GW row).
     With ``basis = "band"`` the window outputs' instantaneous basis and the
     propagator's coincide (U = 1).
@@ -1789,6 +1786,16 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         _refuse("dynsig_collision_basis", f"basis = {basis!r}, pairing = {pairing!r} with "
                 f"in_scattering = {in_scattering!r}", "in_scattering = 'full'",
                 "the basis and the pairing are the full-ρ internal line's")
+    if not (sweep == "active" and full_rho and active_rates and pairing == "vertex"):
+        _refuse(
+            "dynsig_collision_mgkba_closure",
+            f"sweep = {sweep!r}, in_scattering = {in_scattering!r}, "
+            f"rate_intermediates = {rate_intermediates!r}, pairing = {pairing!r}",
+            "sweep = 'active', in_scattering = 'full', rate_intermediates = 'active', "
+            "pairing = 'vertex'",
+            "the column-sampled full-matrix MGKBA operator conserves the closed active "
+            "window only with the full-rho vertex line; the other kernels are diagnostics",
+        )
     if instant and (screening != "frozen" or model is None):
         _refuse("dynsig_collision_basis", f"basis = 'instantaneous' with screening = "
                 f"{screening!r}" + ("" if model is not None else ", no model"),
@@ -1801,6 +1808,11 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         _refuse("dynsig_collision_frozen_plan", repr(frozen_plan), "'window' | 'gw_list'",
                 "pick one")
     refreshed = screening in ("refreshed", "shared_pole")
+    if refreshed:
+        _refuse("dynsig_collision_keldysh_screening", f"screening = {screening!r}",
+                "screening = 'frozen' until a joint retarded/lesser W realization exists",
+                "the refreshed paths rebuild retarded W from populations but do not supply "
+                "the nonequilibrium W< required by the column-sampled MGKBA operator")
     if frozen_bands is not None and (not refreshed or sweep != "active"):
         _refuse("dynsig_collision_frozen_bands", f"frozen_bands with screening = {screening!r}, "
                 f"sweep = {sweep!r}", "screening = 'refreshed' or 'shared_pole', sweep = 'active'",
@@ -2050,14 +2062,14 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     t_split = time.perf_counter() - t_split
 
     def tables(out, rates_of=None, U=None):
-        """The rates, S~ and the static-W limit of one window output, on the TD k rows.
+        """Gamma, injection D, M_H and the static-W limit, on the TD k rows.
 
-        ``rates_of``: the output whose branches give the rates (the active part, with
-        ``rate_intermediates = "active"``); S~ and the static limit stay ``out``'s.
+        ``rates_of``: the output whose branches give Gamma and D (the active part, with
+        ``rate_intermediates = "active"``); M_H and the static limit stay ``out``'s.
         ``U`` (bundle rows): the outputs' basis, rotated back to the band basis."""
-        g_out, g_in, s = window_branch_rates(out["branch_pair"])
+        gamma, injection, s = window_branch_operators(out["branch_pair"])
         if rates_of is not None:
-            g_out, g_in, _ = window_branch_rates(rates_of["branch_pair"])
+            gamma, injection, _ = window_branch_operators(rates_of["branch_pair"])
         static = None
         if dynamic:
             idx = np.arange(nb)
@@ -2065,9 +2077,9 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
             static[:, idx, idx] += out["static_limit"]["head"]
         if U is not None:
             Uh = np.conj(np.swapaxes(U, -1, -2))
-            g_out, g_in, s = U @ g_out @ Uh, U @ g_in @ Uh, U @ s @ Uh
+            gamma, injection, s = U @ gamma @ Uh, U @ injection @ Uh, U @ s @ Uh
             static = None if static is None else U @ static @ Uh
-        return dict(g_out=to_td(g_out), g_in=to_td(g_in), s=to_td(s),
+        return dict(gamma=to_td(gamma), injection=to_td(injection), m_h=to_td(s),
                     static=None if static is None else to_td(static), raw=out,
                     wall_s=out["wall_s"])
 
@@ -2124,6 +2136,26 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     stack = lambda key, parts: np.stack([p[key] for p in parts]) * half
     program = tp.collision_program(mesh, raw=(form == "raw"))
     pops = jax.jit(lambda r: jnp.real(jnp.diagonal(r, axis1=-2, axis2=-1)))
+    fs = 1000.0 / 24.188843265857                       # a.u. of time per fs
+
+    def number_balance(result):
+        """Per-trial instantaneous number flux and residual, in electrons/fs.
+
+        This is the freshly rebuilt generator evaluated on the refresh state.
+        It is distinct from the accumulated trace drift while the coefficients
+        are held until the next refresh.
+        """
+        out = np.asarray(result["out"], np.float64) * fs
+        inn = np.asarray(result["inn"], np.float64) * fs
+        residual = out + inn
+        flux = 0.5 * (np.abs(out) + np.abs(inn))
+        rel = np.full_like(flux, np.inf)
+        np.divide(np.abs(residual), flux, out=rel, where=flux > 0.0)
+        rel[(flux == 0.0) & (residual == 0.0)] = 0.0
+        return dict(out_per_fs=out.tolist(), in_per_fs=inn.tolist(),
+                    number_flux_per_fs=flux.tolist(),
+                    number_residual_per_fs=residual.tolist(),
+                    number_residual_rel=rel.tolist())
 
     def populations(rho):
         return np.asarray(gather_to_host(pops(rho)))[:, :nk]               # (ntr, nk, nb)
@@ -2131,24 +2163,24 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     ry_mev = RYD_TO_EV * 1e3
 
     def edge_rates(parts_):
-        """min/max over k and trials of diag G~> (out) and G~< (in) at the VBM and CBM
+        """min/max over k and trials of diag Gamma and injection D at the VBM and CBM
         bands (band basis), meV."""
         nv = int(np.sum(f_td[0] > 0.5))
         out = {}
         for name, j in (("vbm", nv - 1), ("cbm", nv)):
-            for g, tag in (("g_out", "out"), ("g_in", "in")):
+            for g, tag in (("gamma", "out"), ("injection", "in")):
                 d = np.concatenate([np.real(np.einsum("kii->ki", p_[g]))[:, j] for p_ in parts_])
                 out[f"{name}_{tag}"] = [float(d.min() * ry_mev), float(d.max() * ry_mev)]
         return out
 
     def compare(a, b, h_a=None, h_b=None):
-        """Split vs full tables at one state: rates (G~>, G~<), S~ and Delta Sigma^h, meV."""
+        """Split vs full Gamma, injection D, M_H and coherent correction, meV."""
         mx = lambda x: float(np.max(np.abs(x)))
-        scale = max(mx(b["g_out"]), mx(b["g_in"]), 1e-300)
-        d = dict(rate_out_mev=mx(a["g_out"] - b["g_out"]) * ry_mev,
-                 rate_in_mev=mx(a["g_in"] - b["g_in"]) * ry_mev,
-                 rate_rel=max(mx(a["g_out"] - b["g_out"]), mx(a["g_in"] - b["g_in"])) / scale,
-                 s_mev=mx(a["s"] - b["s"]) * ry_mev, full_tau=b["nodes"]["distinct_tau"],
+        scale = max(mx(b["gamma"]), mx(b["injection"]), 1e-300)
+        d = dict(rate_out_mev=mx(a["gamma"] - b["gamma"]) * ry_mev,
+                 rate_in_mev=mx(a["injection"] - b["injection"]) * ry_mev,
+                 rate_rel=max(mx(a["gamma"] - b["gamma"]), mx(a["injection"] - b["injection"])) / scale,
+                 s_mev=mx(a["m_h"] - b["m_h"]) * ry_mev, full_tau=b["nodes"]["distinct_tau"],
                  full_s=b["wall_s"])
         if h_a is not None:
             d["herm_mev"] = mx(np.asarray(h_a) - np.asarray(h_b)) * 2.0 * ry_mev   # Ha -> meV
@@ -2160,23 +2192,27 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
           sweep_tables(b0[0]["f"], rho=b0[0]["rho"], basis_now=b0[0]))
     t_b = time.perf_counter()
     eq_full = full_sweep(f_b) if check_full else None
-    g_out_eq, g_in_eq = put(stack("g_out", [eq] * ntr)), put(stack("g_in", [eq] * ntr))
+    gamma_eq, injection_eq = put(stack("gamma", [eq] * ntr)), put(stack("injection", [eq] * ntr))
     rho0 = put(np.broadcast_to(np.asarray(gather_to_host(ops.rho_eq))[:nk], (ntr, nk, nb, nb)))
-    res = program(g_out_eq, g_in_eq, rho0, ops.rho_eq, g_out_eq, g_in_eq, ops.w_k)
+    res = program(gamma_eq, injection_eq, rho0, ops.rho_eq, gamma_eq, injection_eq, ops.w_k)
     c_eq = res["c_eq"]
     jax.block_until_ready(res["diss"])
     t_c = time.perf_counter()
-    geq_h = np.stack([eq["g_out"], eq["g_in"]])                            # Ry
+    balance0 = number_balance(res)
+    geq_h = np.stack([eq["gamma"], eq["injection"]])                            # Ry
     d_out, d_in = (np.real(np.einsum("kii->ki", g)) for g in geq_h)
     receipt = dict(
         t_fs=0.0, why="t0", wall_s=t_c - t_a, sweep_s=t_b - t_a, build_s=t_c - t_b,
         min_rate_mev=float(res["min_rate"]) * 2.0 * ry_mev,
+        min_injection_mev=float(res["min_injection"]) * 2.0 * ry_mev,
+        min_blocking_mev=float(res["min_blocking"]) * 2.0 * ry_mev,
+        rho_min=float(res["rho_min"]), rho_max=float(res["rho_max"]),
         rate_out_diag_mev=[float(d_out.min() * ry_mev), float(d_out.max() * ry_mev)],
         rate_in_diag_mev=[float(d_in.min() * ry_mev), float(d_in.max() * ry_mev)],
-        min_eig_out_mev=float(np.linalg.eigvalsh(0.5 * (eq["g_out"] + np.conj(
-            np.swapaxes(eq["g_out"], -1, -2)))).min() * ry_mev),
-        min_eig_in_mev=float(np.linalg.eigvalsh(0.5 * (eq["g_in"] + np.conj(
-            np.swapaxes(eq["g_in"], -1, -2)))).min() * ry_mev),
+        min_eig_out_mev=float(np.linalg.eigvalsh(0.5 * (eq["gamma"] + np.conj(
+            np.swapaxes(eq["gamma"], -1, -2)))).min() * ry_mev),
+        min_eig_in_mev=float(np.linalg.eigvalsh(0.5 * (eq["injection"] + np.conj(
+            np.swapaxes(eq["injection"], -1, -2)))).min() * ry_mev),
         c_eq_diag=float(res["c_eq_diag"]), c_eq_offdiag=float(res["c_eq_offdiag"]),
         trace=[float(v) for v in np.asarray(res["trace"])], form=form, hermitian=hermitian,
         sweep=sweep, nodes=eq["nodes"], in_scattering=in_scattering,
@@ -2184,6 +2220,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         frozen=(None if not held_parts else dict(
             nodes=_sweep_nodes(held_parts["frozen"]), wall_s=held_parts["frozen"]["wall_s"],
             setup_s=t_split)), screening=screening, screen_eq=screen_eq)
+    receipt.update(balance0)
     if instant:
         receipt.update(basis=basis, pairing=pairing, basis_t0=basis_t0,
                        frozen_energies=frozen_rule, edges=edge_rates([eq]),
@@ -2192,22 +2229,28 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         receipt.update(pairing=pairing)
     if eq_full is not None:
         receipt["full_vs_split"] = compare(eq, eq_full)
-    s_eq = np.stack([eq["s"]] * ntr)
+    s_eq = np.stack([eq["m_h"]] * ntr)
     static_eq = None if not dynamic else np.stack([eq["static"]] * ntr)
     if eq_full is not None:
-        s_eq_full = np.stack([eq_full["s"]] * ntr)
+        s_eq_full = np.stack([eq_full["m_h"]] * ntr)
         static_eq_full = None if not dynamic else np.stack([eq_full["static"]] * ntr)
     held0 = None if hermitian == "none" else put(np.zeros((ntr, nk, nb, nb), complex))
     state = dict(t_last=0.0, f_last=np.broadcast_to(f_td, (ntr, nk, nb)).copy(), n=0,
                  trace_last=np.asarray(res["trace"]).copy(), history=[receipt],
                  held_max_mev=0.0, valid_prev=[None] * ntr)
     line = (f"  collision t0     : {form}, hermitian {hermitian}, in-scattering {in_scattering}, "
-            f"rate intermediates {rate_intermediates}; rates at rho_eq: diag "
-            f"out [{receipt['rate_out_diag_mev'][0]:.3g}, {receipt['rate_out_diag_mev'][1]:.3g}] meV, "
-            f"in [{receipt['rate_in_diag_mev'][0]:.3g}, {receipt['rate_in_diag_mev'][1]:.3g}] meV, "
-            f"min eig G~ {receipt['min_rate_mev']:.3g} meV (G~> {receipt['min_eig_out_mev']:.3g}, "
-            f"G~< {receipt['min_eig_in_mev']:.3g}); ||C[rho_eq]|| diag {receipt['c_eq_diag']:.3e} "
-            f"off-diag {receipt['c_eq_offdiag']:.3e} Ha/hbar; wall {receipt['wall_s']:.2f} s "
+            f"rate intermediates {rate_intermediates}; operators at rho_eq: diag "
+            f"Gamma [{receipt['rate_out_diag_mev'][0]:.3g}, {receipt['rate_out_diag_mev'][1]:.3g}] meV, "
+            f"D [{receipt['rate_in_diag_mev'][0]:.3g}, {receipt['rate_in_diag_mev'][1]:.3g}] meV, "
+            f"min eig Gamma {receipt['min_rate_mev']:.3g} meV, D_eff "
+            f"{receipt['min_injection_mev']:.3g} meV, Gamma-D_eff "
+            f"{receipt['min_blocking_mev']:.3g} meV; rho bounds "
+            f"[{receipt['rho_min']:.3e}, {receipt['rho_max']:.3e}]; ||C[rho_eq]|| diag "
+            f"{receipt['c_eq_diag']:.3e} "
+            f"off-diag {receipt['c_eq_offdiag']:.3e} Ha/hbar; number residual "
+            f"{max(receipt['number_residual_per_fs'], key=abs):+.3e} e/fs "
+            f"({max(receipt['number_residual_rel']):.3e} of flux); wall "
+            f"{receipt['wall_s']:.2f} s "
             f"(sweep {receipt['sweep_s']:.2f}, build {receipt['build_s']:.2f}); sweep {sweep}: "
             f"{eq['nodes']['distinct_tau']} tau in {eq['nodes']['n_windows']} windows"
             + ("" if not held_parts else
@@ -2226,10 +2269,10 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                f"{frozen_rule['gap_e_mev']:.1f} meV, eps^G {frozen_rule['gap_eps_g_mev']:.1f} "
                f"(direct {frozen_rule['gap_eps_g_direct_mev']:.1f}) meV; "
                + _slow_line(basis_t0["slow"])
-               + "; edge rates VBM out "
-               f"[{receipt['edges']['vbm_out'][0]:.3g}, {receipt['edges']['vbm_out'][1]:.3g}] in "
-               f"[{receipt['edges']['vbm_in'][0]:.3g}, {receipt['edges']['vbm_in'][1]:.3g}], CBM out "
-               f"[{receipt['edges']['cbm_out'][0]:.3g}, {receipt['edges']['cbm_out'][1]:.3g}] in "
+               + "; edge diagonals VBM Gamma "
+               f"[{receipt['edges']['vbm_out'][0]:.3g}, {receipt['edges']['vbm_out'][1]:.3g}] D "
+               f"[{receipt['edges']['vbm_in'][0]:.3g}, {receipt['edges']['vbm_in'][1]:.3g}], CBM Gamma "
+               f"[{receipt['edges']['cbm_out'][0]:.3g}, {receipt['edges']['cbm_out'][1]:.3g}] D "
                f"[{receipt['edges']['cbm_in'][0]:.3g}, {receipt['edges']['cbm_in'][1]:.3g}] meV")
             + ("" if screen_eq is None or screening != "shared_pole" else spm_t0_line(screen_eq))
             + ("" if screen_eq is None or screening == "shared_pole" else
@@ -2244,7 +2287,6 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
     say(line)
     if record is not None:
         record(dict(receipt, line=line))
-    fs = 1000.0 / 24.188843265857                       # a.u. of time per fs
 
     def refresh(t, rho, ops_now, params):
         f = populations(rho)
@@ -2289,21 +2331,21 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                            nodes=_sweep_nodes(fz), wall_s=fz["wall_s"])
                 parts[-1]["_truncation"] = alt
         t2 = time.perf_counter()
-        g_out, g_in = put(stack("g_out", parts)), put(stack("g_in", parts))
-        g_eq_now, rebase_s = (g_out_eq, g_in_eq), 0.0
+        gamma, injection = put(stack("gamma", parts)), put(stack("injection", parts))
+        g_eq_now, rebase_s = (gamma_eq, injection_eq), 0.0
         if rebase:
             tr0 = time.perf_counter()
             eqs = [sweep_tables(f_b, at=p_) for p_ in poles_now]
-            g_eq_now = (put(stack("g_out", eqs)), put(stack("g_in", eqs)))
+            g_eq_now = (put(stack("gamma", eqs)), put(stack("injection", eqs)))
             rebase_s = time.perf_counter() - tr0
         t3 = time.perf_counter()
-        out = program(g_out, g_in, rho, ops_now.rho_eq, *g_eq_now, ops_now.w_k)
+        out = program(gamma, injection, rho, ops_now.rho_eq, *g_eq_now, ops_now.w_k)
         new_ops = ops_now._replace(collision=out["diss"])
         jax.block_until_ready(out["diss"])
         t4 = time.perf_counter()
         new_params, delta, held_max, h = params, None, 0.0, None
         if hermitian != "none":
-            s_t = np.stack([p["s"] for p in parts])
+            s_t = np.stack([p["m_h"] for p in parts])
             st_t = None if not dynamic else np.stack([p["static"] for p in parts])
             h = np.asarray(C.hermitian_update(s_t, s_eq, st_t, static_eq)) * half   # Ha
             held_max = float(np.max(np.abs(h))) * 2.0 * ry_mev
@@ -2313,17 +2355,25 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
             new_params = set_term(new)
         t5 = time.perf_counter()
         trace = np.asarray(out["trace"])
+        balance = number_balance(out)
+        elapsed_fs = (float(t) - state["t_last"]) / fs
+        trace_drift_per_fs = ((trace - state["trace_last"]) / elapsed_fs).tolist()
         state["n"] += 1
         rec = dict(n=state["n"], t_fs=float(t) / fs, why=why, df=df,
                    wall_s=t5 - t1, sweep_s=t2 - t1, rates_s=t3 - t2, build_s=t4 - t3,
-                   hermitian_s=t5 - t4, out_per_fs=[float(v) * fs for v in np.asarray(out["out"])],
-                   in_per_fs=[float(v) * fs for v in np.asarray(out["inn"])],
+                   hermitian_s=t5 - t4,
                    d_trace=[float(v) for v in (trace - state["trace_last"])],
-                   min_rate_mev=float(out["min_rate"]) * 2.0 * ry_mev, held_max_mev=held_max,
+                   trace_drift_per_fs=trace_drift_per_fs,
+                   min_rate_mev=float(out["min_rate"]) * 2.0 * ry_mev,
+                   min_injection_mev=float(out["min_injection"]) * 2.0 * ry_mev,
+                   min_blocking_mev=float(out["min_blocking"]) * 2.0 * ry_mev,
+                   rho_min=float(out["rho_min"]), rho_max=float(out["rho_max"]),
+                   held_max_mev=held_max,
                    c_eq_diag=receipt["c_eq_diag"], c_eq_offdiag=receipt["c_eq_offdiag"],
                    sweep=sweep, nodes=parts[0]["nodes"], screening=screening,
                    rebase_s=rebase_s, c_eq_now=(None if not rebase else
                                                 [float(out["c_eq_diag"]), float(out["c_eq_offdiag"])]))
+        rec.update(balance)
         if screening == "shared_pole":
             rec.update(screen=spm_record(screens, screen_eq))
         elif refreshed:
@@ -2342,11 +2392,12 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         if instant and state["n"] == 1:          # once, at the first refresh after t0
             # C[rho_eq] at the t0 rates (the subtracted constant) and at this refresh's
             # rates, Ha/hbar (Frobenius over k and the window)
-            coll = lambda go, gi: 0.5 * (gi - 0.5 * ((go + gi) @ rho_eq_td + rho_eq_td @ (go + gi)))
+            coll = lambda gamma, injection: 0.5 * (
+                injection - 0.5 * (gamma @ rho_eq_td + rho_eq_td @ gamma))
             offd = lambda X: X - np.einsum("...ii->...i", X)[..., None] * np.eye(nb)
             fro = lambda X: float(np.linalg.norm(X))
-            c0 = coll(eq["g_out"], eq["g_in"])
-            shift = max(fro(offd(coll(p_["g_out"], p_["g_in"]) - c0)) for p_ in parts)
+            c0 = coll(eq["gamma"], eq["injection"])
+            shift = max(fro(offd(coll(p_["gamma"], p_["injection"]) - c0)) for p_ in parts)
             rec["c_eq_split"] = dict(
                 c_eq_fro=fro(c0), c_eq_offdiag_frac=fro(offd(c0)) / max(fro(c0), 1e-300),
                 shift_offdiag_fro=shift, shift_offdiag_rel=shift / max(fro(c0), 1e-300))
@@ -2358,7 +2409,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
             h_alt = None
             if hermitian != "none":
                 h_alt = np.asarray(C.hermitian_update(
-                    np.stack([p_["_truncation"]["s"] for p_ in parts]), s_eq,
+                    np.stack([p_["_truncation"]["m_h"] for p_ in parts]), s_eq,
                     None if not dynamic else np.stack([p_["_truncation"]["static"] for p_ in parts]),
                     static_eq)) * half
             cmp = [compare(p_, p_["_truncation"], None if h is None else h[i],
@@ -2370,7 +2421,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
             h_full = None
             if hermitian != "none":
                 h_full = np.asarray(C.hermitian_update(
-                    np.stack([p["s"] for p in fulls]), s_eq_full,
+                    np.stack([p["m_h"] for p in fulls]), s_eq_full,
                     None if not dynamic else np.stack([p["static"] for p in fulls]),
                     static_eq_full)) * half
             cmp = [compare(p, q, None if h is None else h[i], None if h_full is None else h_full[i])
@@ -2382,8 +2433,15 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                 f"{rec['wall_s']:.2f} s (sweep {rec['sweep_s']:.2f}, rates {rec['rates_s']:.3f}, "
                 f"dissipator {rec['build_s']:.3f}, hermitian {rec['hermitian_s']:.3f}), max|df| "
                 f"{df:.3e}, dTr rho {max(rec['d_trace'], key=abs):+.3e} since last; d(Tr rho)/dt "
-                f"out {min(rec['out_per_fs']):+.3e} in {max(rec['in_per_fs']):+.3e} per fs; min "
-                f"eig G~ {rec['min_rate_mev']:.3g} meV; max|dSigma^h| {held_max:.3g} meV; "
+                f"out {min(rec['out_per_fs']):+.3e} in {max(rec['in_per_fs']):+.3e} per fs; "
+                f"instantaneous number residual {max(rec['number_residual_per_fs'], key=abs):+.3e} "
+                f"e/fs ({max(rec['number_residual_rel']):.3e} of flux), held trace drift "
+                f"{max(rec['trace_drift_per_fs'], key=abs):+.3e} e/fs; min "
+                f"eig Gamma {rec['min_rate_mev']:.3g} meV, D_eff "
+                f"{rec['min_injection_mev']:.3g} meV, Gamma-D_eff "
+                f"{rec['min_blocking_mev']:.3g} meV; rho bounds "
+                f"[{rec['rho_min']:.3e}, {rec['rho_max']:.3e}]; max|dSigma^h| "
+                f"{held_max:.3g} meV; "
                 f"||C[rho_eq]|| diag {rec['c_eq_diag']:.2e} off {rec['c_eq_offdiag']:.2e}; "
                 f"{sweep} sweep {rec['nodes']['distinct_tau']} tau"
                 + (f" ({rec['nodes']['rebuilds']} rules rebuilt)" if rec["nodes"]["rebuilds"] else "")
@@ -2408,10 +2466,10 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                    f"{rec['basis']['residual']:.1e}, max|U - 1| {rec['basis']['max_u_minus_1']:.2e}, "
                    f"max|E - e| {rec['basis']['max_de_mev']:.3g} meV, {basis_s:.2f} s; "
                    + _slow_line(rec["basis"]["slow"]) + "), frozen "
-                   f"sweep {rec['frozen_s']:.2f} s, active {rec['active_s']:.2f} s; edge rates VBM "
-                   f"out [{rec['edges']['vbm_out'][0]:.3g}, {rec['edges']['vbm_out'][1]:.3g}] in "
-                   f"[{rec['edges']['vbm_in'][0]:.3g}, {rec['edges']['vbm_in'][1]:.3g}], CBM out "
-                   f"[{rec['edges']['cbm_out'][0]:.3g}, {rec['edges']['cbm_out'][1]:.3g}] in "
+                   f"sweep {rec['frozen_s']:.2f} s, active {rec['active_s']:.2f} s; edge diagonals VBM "
+                   f"Gamma [{rec['edges']['vbm_out'][0]:.3g}, {rec['edges']['vbm_out'][1]:.3g}] D "
+                   f"[{rec['edges']['vbm_in'][0]:.3g}, {rec['edges']['vbm_in'][1]:.3g}], CBM Gamma "
+                   f"[{rec['edges']['cbm_out'][0]:.3g}, {rec['edges']['cbm_out'][1]:.3g}] D "
                    f"[{rec['edges']['cbm_in'][0]:.3g}, {rec['edges']['cbm_in'][1]:.3g}] meV"
                    + ("" if "c_eq_split" not in rec else
                       f"; C[rho_eq]: offdiag share {rec['c_eq_split']['c_eq_offdiag_frac']:.3e} of "
@@ -2430,7 +2488,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
         return dict(ops=new_ops, params=new_params, delta=delta)
 
     return dict(diss=res["diss"], held=held0, refresh=refresh, t0=receipt, state=state,
-                c_eq=c_eq, rates_eq=(g_out_eq, g_in_eq), sweep=sweep_tables, program=program,
+                c_eq=c_eq, operators_eq=(gamma_eq, injection_eq), sweep=sweep_tables, program=program,
                 eq=eq, bundle_of=bundle_of, parts=held_parts, plans=plans, screening=scr,
                 window=window, tables=tables, keep=keep, rebase=rebase, W0c=W0c, poles=poles,
                 in_scattering=in_scattering, rate_intermediates=rate_intermediates,

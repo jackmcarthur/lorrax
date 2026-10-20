@@ -45,9 +45,9 @@ G7  branches=True at the same state, one sweep: cond + val + static == pair
     (rel <= 1e-12) and pair unchanged by keeping the branches (rel <= 1e-12);
     each branch == the dense branch (particle R_+ retarded, hole R_- time
     ordered, invalid-pole static term)                                      rel <= 1e-5
-    tdagw.collision.rates: G~> == i(S~_p - S~_p^H) of the dense particle branch
-    and G~< == i(S~^R_h - S~^R_h^H) of the dense RETARDED hole branch (+i eta):
-    HOLE_BRANCH_SIGN maps the sweep's time-ordered hole branch to it        rel <= 1e-5
+    tdagw.collision.branch_operators: gamma, injection and m_h from the dense
+    particle column and adjoint time-ordered hole row; the complex PV terms
+    survive the one-sided sampling                                       rel <= 1e-5
 G8  static_limit=True: sx == the dense -sum_s f_s <s| W^c(0) |s> exchange on
     every mode (window block, instantaneous basis)                          rel <= 1e-8
     and the head part is zero (no head on this bundle)
@@ -276,10 +276,13 @@ def _dense_sx(psi_g, f_g, proj, Wc0):
     return S
 
 
-def _width(pair):
-    """i (S~ - S~^H) of a pair table, S~ = 1/2 (pair_0 + pair_1)."""
-    st = 0.5 * (pair[0] + pair[1])
-    return 1j * (st - np.conj(np.swapaxes(st, -1, -2)))
+def _branch_reference(pair_cond, pair_val, static):
+    """Independent NumPy column-shell retarded operators, including the PV part."""
+    dagger = lambda a: np.conj(np.swapaxes(a, -1, -2))
+    rp, rh = pair_cond[1], dagger(pair_val[0])
+    total = rp + rh
+    return (1j * (total - dagger(total)), 1j * rh + dagger(1j * rh),
+            0.5 * (total + static + dagger(total + static)))
 
 
 def _excited(rng, nk):
@@ -551,13 +554,15 @@ def run_checks(mesh):
         ref_s = _dense_pair(*args, part="static")[0]
         rows["G7_cond"], rows["G7_val"] = _rel(tabs["cond"], ref_c), _rel(tabs["val"], ref_v)
         rows["G7_static"] = _rel(tabs["static"], ref_s)
-        g_out, g_in = (np.asarray(g) for g in C.rates(tabs["cond"], tabs["val"]))
-        width_hr = _width(_dense_pair(*args, part="val", hole_retarded=True))
-        rows["G7_gout"] = _rel(g_out, _width(ref_c))
-        rows["G7_gin"] = _rel(g_in, width_hr)
+        gamma, injection, m_h = map(np.asarray, C.branch_operators(
+            tabs["cond"], tabs["val"], tabs["static"]))
+        gamma_ref, injection_ref, m_h_ref = _branch_reference(ref_c, ref_v, ref_s)
+        rows["G7_gamma"] = _rel(gamma, gamma_ref)
+        rows["G7_injection"] = _rel(injection, injection_ref)
+        rows["G7_m_h"] = _rel(m_h, m_h_ref)
         rows["G7_min_diag_rate_ev"] = float(min(np.real(np.einsum("kii->ki", g)).min()
-                                                for g in (g_out, g_in))) * RYD_TO_EV
-        rows["R5"] = _rel(-g_in, width_hr)
+                                                for g in (gamma, injection))) * RYD_TO_EV
+        rows["R5"] = _rel(-injection, injection_ref)
         rows["G8_sx"] = _rel(outb["static_limit"]["sx"],
                              _dense_sx(psi_r, f_r, psi_r[:, B_LO:B_LO + NA], gather(poles.Wc0_q)))
         rows["G8_head"] = float(np.max(np.abs(outb["static_limit"]["head"])))
@@ -674,15 +679,15 @@ def run_checks(mesh):
 GATES = dict(G0_W0=1e-8, G0_Wp=1e-8, G1_static=1e-8, G1_probe=1e-8, G2_W0=1e-8, G2_Wp=1e-8,
              G2_poles_vs_driver=1e-8, G2_poles_vs_dense=1e-8, G3_W=1e-8, G3_poles_vs_dense=1e-8,
              G4=1e-5, G5=1e-5, G6_onshell=1e-5, G6_omega=1e-5, G7_split=1e-12,
-             G7_pair_same=1e-12, G7_cond=1e-5, G7_val=1e-5, G7_static=1e-5, G7_gout=1e-5,
-             G7_gin=1e-5, G8_sx=1e-8, G8_head=0.0, G9_pair=1e-5, G9_branches=1e-5,
+             G7_pair_same=1e-12, G7_cond=1e-5, G7_val=1e-5, G7_static=1e-5, G7_gamma=1e-5,
+             G7_injection=1e-5, G7_m_h=1e-5, G8_sx=1e-8, G8_head=0.0, G9_pair=1e-5, G9_branches=1e-5,
              G9_static_limit=1e-5, G9_window_only=1e-5, G9_affine=1e-12, G10_static=1e-8,
              G10_probe=1e-8, G10_eq=0.0, G10_pv=1e-8, G11_rules=0.0, G11_eq_dchi=0.0, G11_eq_W=1e-14,
              G11_eq_poles=1e-14, G11_W=1e-8, G11_sigma=1e-5, G11_static_limit_W0=1e-8,
              G11_split=1e-5, G11_static_W_limit=1e-8)
 COUNTS = ("G2_valid_vs_driver", "G2_valid_vs_dense", "G3_valid_vs_dense", "G9_affine_rebuilds",
           "G11_eq_valid")
-TWINS = dict(R0="G0_Wp", R1="G2_W0", R2="G5", R3="G5", R4="G5", R5="G7_gin", R6="G9_pair",
+TWINS = dict(R0="G0_Wp", R1="G2_W0", R2="G5", R3="G5", R4="G5", R5="G7_injection", R6="G9_pair",
              R7="G10_probe", R8="G11_static_W_limit")
 
 

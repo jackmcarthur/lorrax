@@ -117,14 +117,13 @@ def _raw(**lorrax):
 
 
 def test_deck_keys_shared_pole():
-    v = parse_td_deck(_raw(collision_screening="shared_pole", collision_source="/a/04/oneshot.in",
+    with pytest.raises(ValueError, match="GATE td_collision_keldysh_screening"):
+        parse_td_deck(_raw(collision_screening="shared_pole",
+                           collision_source="/a/04/oneshot.in",
                            collision_refresh_sweep="active",
                            collision_spm_support_sites_ev="2.6, 3.5 | 1.0,2.0, 4.0 | 1.0"),
-                      source="cpu").values
-    assert v["lorrax.collision_source"] == "/a/04/oneshot.in"
-    assert v["lorrax.collision_rebase"] == "auto"
-    assert v["lorrax.collision_spm_support_sites_ev"] == "2.6,3.5|1.0,2.0,4.0|1.0"
-    # defaults: the incumbent's source and no override
+                      source="cpu")
+    # The frozen equilibrium W remains admitted.
     v0 = parse_td_deck(_raw(), source="cpu").values
     assert v0["lorrax.collision_source"] == "/a/07/oneshot.in"
     assert v0["lorrax.collision_spm_support_sites_ev"] == ""
@@ -134,7 +133,8 @@ def test_deck_keys_shared_pole():
     (dict(collision_source="/a/04/oneshot.in"), "td_collision_source"),
     (dict(collision_screening="frozen", collision_rebase="on"), "td_collision"),
     (dict(collision_rebase="maybe"), "td_collision"),
-    (dict(collision_screening="shared_pole", collision_spm_support_sites_ev="1|2"), "td_collision"),
+    (dict(collision_screening="shared_pole", collision_spm_support_sites_ev="1|2"),
+     "td_collision_keldysh_screening"),
 ])
 def test_deck_keys_refused(kw, gate):
     with pytest.raises(Exception, match=f"GATE {gate}"):
@@ -142,7 +142,8 @@ def test_deck_keys_refused(kw, gate):
 
 
 def test_deck_inactive_sites():
-    d = parse_td_deck(_raw(collision_screening="refreshed", collision_refresh_sweep="active",
+    d = parse_td_deck(_raw(collision="off", collision_screening="refreshed",
+                           collision_refresh_sweep="active",
                            collision_spm_support_sites_ev="2.6,3.5|1,2"), source="cpu")
     assert "lorrax.collision_spm_support_sites_ev" in inactive_keys(d)
 

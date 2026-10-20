@@ -14,17 +14,19 @@ ID  vertex pairing at a random Hermitian rho' (spectrum in [0, 1]): both branche
     and the static term == the dense reference, Sigma_ij(e_i) with the internal energy
     of the index on i's vertex and Sigma_ij(e_j) with that on j's       rel <= 1e-5
 IE  covariance at a unitary mixing degenerate window states (e_v1 = e_v2, e_c1 = e_c2
-    per k), both pairings: U^H G~[rho] U == G~'[U^H rho U]               rel <= 1e-10
-IF  sum_k Tr C[rho] / sum_k |Tr G~> rho| on the fixture's poles made reciprocal, active
-    intermediates, both pairings: code <= 1e-6; dense vertex reference   <= 1e-12
-IG  G~> and G~< Hermitian, both pairings                                 abs == 0
+    per k), both pairings: U^H X[rho] U == X'[U^H rho U], X = gamma, injection
+                                                                         rel <= 1e-10
+IF  sum_k Tr C[rho] / flux on reciprocal poles, active intermediates:
+    vertex code <= 1e-6; dense vertex reference <= 1e-12; the symmetric
+    comparison is a red twin and exceeds the vertex tolerance by > 100x
+IG  gamma and injection Hermitian, both pairings                        abs == 0
 IS  the slow-H basis map (Eq. 8b) on a synthetic linear dSigma: at rho_eq U = 1,
     E = e_QP, f = f_eq (residual 0, one evaluation); at an excited rho the fixed point
     converges (run to residual <= 1e-12; the production stop is DRESS_TOL, reported) and
     is one: H_slow U = U diag(E) and f = diag(U^H rho U)                 <= 1e-9
 IC  ``tdagw.dynsig.window_collision`` end to end on hand-built propagator operators (2
-    trials, TD k order permuted against the bundle's, a synthetic linear dSigma), both
-    pairings: with dSigma = 0 and e_QP = eps^G the instantaneous basis is the band basis
+    trials, TD k order permuted against the bundle's, a synthetic linear dSigma), vertex
+    pairing: with dSigma = 0 and e_QP = eps^G the instantaneous basis is the band basis
     (U = 1; held Delta Sigma^h and dissipator of a refresh at an excited rho) rel <= 1e-12;
     with dSigma != 0 and e_QP != eps^G a refresh at rho_eq reproduces t0 (dissipator)
     rel <= 1e-12 and holds Delta Sigma^h = 0 (<= 1e-9 meV), and a refresh at an excited
@@ -52,7 +54,7 @@ import numpy as np
 import test_tdagw_collision_fullrho as FR
 import test_tdagw_dynsig_sigma as F
 
-GATES = dict(IB=1e-12, ID=1e-5, IE=1e-10, IF_code=1e-6, IF_dense=1e-12, IG=0.0, IS=1e-9,
+GATES = dict(IB=1e-12, ID=1e-5, IE=1e-10, IF_code_vertex=1e-6, IF_dense=1e-12, IG=0.0, IS=1e-9,
              IC_band=1e-12, IC_eq=1e-12, IC_eq_held_mev=1e-9, IC_basis=0.0, IH=1e-14)
 _rel = FR._rel
 
@@ -241,15 +243,15 @@ def _collision_rows(mesh, wfns, meta, poles, cfg, splan, kplan, e, f, rng):
                       for _ in range(ntr)])
     rel_list = lambda a, b: max(_rel(x, y) for x, y in zip(a, b))
     built_ops = [None]
-    for pr in ("symmetric", "vertex"):
-        ops, model = setup(0.0, 0.0)
-        built_ops[0] = ops
-        ra = refresh(build("band", pr, ops, model), model, rho_x, 2.0)
-        bi = build("instantaneous", pr, ops, model)
-        rb = refresh(bi, model, rho_x, 2.0)
-        rows[f"IC_band_{pr}"] = max(_rel(rb["held"], ra["held"]), rel_list(rb["diss"], ra["diss"]))
-        rows[f"IC_t0_basis_{pr}"] = bi["basis_t0"]
-    rows["IC_band"] = max(rows["IC_band_symmetric"], rows["IC_band_vertex"])
+    ops, model = setup(0.0, 0.0)
+    built_ops[0] = ops
+    ra = refresh(build("band", "vertex", ops, model), model, rho_x, 2.0)
+    bi = build("instantaneous", "vertex", ops, model)
+    rb = refresh(bi, model, rho_x, 2.0)
+    rows["IC_band_vertex"] = max(_rel(rb["held"], ra["held"]),
+                                 rel_list(rb["diss"], ra["diss"]))
+    rows["IC_t0_basis_vertex"] = bi["basis_t0"]
+    rows["IC_band"] = rows["IC_band_vertex"]
     shift = np.where(f_w > 0.5, -0.02, 0.05)                      # Ry, a QP-like scissor
     ops, model = setup(1.0, shift)
     built_ops[0] = ops
@@ -326,9 +328,9 @@ def run_checks(mesh):
             out["wall_s"] = time.perf_counter() - t
             return out
 
-        def rates(out):
-            return tuple(np.asarray(g) for g in C.rates(out["branch_pair"]["cond"],
-                                                        out["branch_pair"]["val"]))
+        def operators(out):
+            return tuple(np.asarray(g) for g in C.branch_operators(
+                out["branch_pair"]["cond"], out["branch_pair"]["val"])[:2])
 
         def tables_rel(a, b):
             parts = [_rel(a["pair"], b["pair"])]
@@ -378,7 +380,7 @@ def run_checks(mesh):
         rows["ID"] = max(rows["ID_parts"])
         sym = sweep(win_r, pairing="symmetric")
         rows["IG"] = max(float(np.max(np.abs(g - np.conj(np.swapaxes(g, -1, -2)))))
-                         for o in (vx, sym) for g in rates(o))
+                         for o in (vx, sym) for g in operators(o))
         rows["ID_vertex_vs_symmetric"] = _rel(vx["pair"], sym["pair"])
 
         # ---- IE: covariance at a unitary mixing degenerate window states
@@ -394,8 +396,8 @@ def run_checks(mesh):
         rho_u = Uh @ rho @ Ud
         ie = {}
         for pr in ("vertex", "symmetric"):
-            ga = rates(sweep(dict(b_lo=B_LO, U=eye, e=e_d, f=f_r, rho=rho), pairing=pr))
-            gb = rates(sweep(dict(b_lo=B_LO, U=Ud, e=e_d, f=np.real(np.einsum("kii->ki", rho_u)),
+            ga = operators(sweep(dict(b_lo=B_LO, U=eye, e=e_d, f=f_r, rho=rho), pairing=pr))
+            gb = operators(sweep(dict(b_lo=B_LO, U=Ud, e=e_d, f=np.real(np.einsum("kii->ki", rho_u)),
                                   rho=rho_u), pairing=pr))
             ie[pr] = max(_rel(Uh @ ga[i] @ Ud, gb[i]) for i in range(2))
         rows["IE_parts"] = ie
@@ -420,19 +422,21 @@ def run_checks(mesh):
                np.where(g_s, D_s, 0.0), g_s, dpo[4])
         for pr in ("vertex", "symmetric"):
             out = sweep(win_r, pairing=pr)
-            rc, flux = FR._trace_ratio(*rates(out), rho)
+            rc, flux = FR._trace_ratio(*operators(out), rho)
             rows[f"IF_code_{pr}"] = rc
         rows["IF_flux_mev"] = flux * RYD_TO_EV * 1e3
         refv = dict(val=_dense_vertex(psi, e_g, M_h, proj, e_w, dpo, eta, "val"),
                     cond=_dense_vertex(psi, e_g, M_p, proj, e_w, dpo, eta, "cond"))
-        rows["IF_dense"] = FR._trace_ratio(FR._width(refv["cond"]),
-                                           C.HOLE_BRANCH_SIGN * FR._width(refv["val"]), rho)[0]
-        rows["IF_code"] = max(rows["IF_code_vertex"], rows["IF_code_symmetric"])
+        rows["IF_dense"] = FR._trace_ratio(
+            *FR._dense_operators(refv["cond"], refv["val"])[:2], rho)[0]
+        rows["RI_symmetric_nonconserving"] = rows["IF_code_symmetric"]
     return rows
 
 
 def verdict(rows):
-    return {g: rows[g] <= tol for g, tol in GATES.items()}
+    out = {g: rows[g] <= tol for g, tol in GATES.items()}
+    out["RI"] = rows["RI_symmetric_nonconserving"] > 100.0 * GATES["IF_code_vertex"]
+    return out
 
 
 def main() -> int:

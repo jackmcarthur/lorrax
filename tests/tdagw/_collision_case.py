@@ -115,7 +115,7 @@ def _synthetic_attach(case, records):
         put = lambda a: tp.place_window_blocks(tile(a), mesh, nk_pad)
         prog = tp.collision_program(mesh, raw=case.get("form") == "raw")
         rho_eq = np.asarray(gather_to_host(system.ops.rho_eq))[:nk]
-        geq = (put(g_out), put(g_in))
+        geq = (put(g_out + g_in), put(g_in))
         res = prog(geq[0], geq[1], put(rho_eq), system.ops.rho_eq, geq[0], geq[1],
                    system.ops.w_k)
         held0 = put(np.zeros((nk, nb, nb), complex))
@@ -131,7 +131,8 @@ def _synthetic_attach(case, records):
                 return None
             state["n"] += 1
             s = 1.0 + float(case.get("rate_step", 0.2)) * state["n"]
-            out = prog(put(g_out * s), put(g_in * s), rho, ops.rho_eq, geq[0], geq[1], ops.w_k)
+            out = prog(put((g_out + g_in) * s), put(g_in * s), rho, ops.rho_eq,
+                       geq[0], geq[1], ops.w_k)
             term, set_term = held_term(params)
             new = put(state["n"] * held_ha * c)
             records.setdefault("refresh_t", []).append(float(t))

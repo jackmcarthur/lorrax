@@ -341,27 +341,34 @@ def place_window_blocks(blocks, mesh, nk_pad: int):
 def collision_program(mesh, *, raw: bool):
     """The device half of a collision refresh, one jitted ``shard_map`` (k-local).
 
-    ``run(g_out, g_in, rho, rho_eq, g_out_eq, g_in_eq, w_k)``: the held rates
-    G~>, G~< (ntr, nk, nb, nb) Ha at the refresh state, the state ρ, the
-    equilibrium density diag(f) (nk, nb, nb), the rates at ρ_eq, the k weights.
+    ``run(gamma, injection, rho, rho_eq, gamma_eq, injection_eq, w_k)``: the held
+    total width Gamma and injection D (ntr, nk, nb, nb) Ha, the state rho,
+    equilibrium density diag(f) (nk, nb, nb), equilibrium operators, k weights.
     Returns dict: ``diss`` the :class:`tdagw.collision.Dissipator` of
-    G~ = G~> + G~< and S (Eq. 3, less C[ρ_eq] at the equilibrium rates unless
-    ``raw``); ``c_eq`` that C[ρ_eq]; per trial ``out``/``in`` the out- and
-    in-scattering parts of d(sum_k w_k Tr ρ_k)/dt (subtracted: minus the same at
-    equilibrium), ``trace`` sum_k w_k Tr ρ_k, ``min_rate`` the smallest eigenvalue
-    of G~ (pads excluded), ``c_eq_diag``/``c_eq_offdiag`` max |C[ρ_eq]| on and off
+    Gamma and S (less the imposed equilibrium counterterm unless ``raw``);
+    ``c_eq`` that counterterm; per trial ``out``/``in`` the loss and injection
+    parts of d(sum_k w_k Tr rho_k)/dt (subtracted: minus the same at
+    equilibrium), ``trace`` sum_k w_k Tr ρ_k; ``min_rate``, ``min_injection``
+    and ``min_blocking`` the smallest eigenvalues of Gamma, effective D, and
+    Gamma-D.  The latter two are the held-generator Pauli-boundary tests.
+    ``rho_min``/``rho_max`` are density bounds (pads excluded);
+    ``c_eq_diag``/``c_eq_offdiag`` max |C[ρ_eq]| on and off
     the diagonal.  One all-reduce of a few (ntr,) scalars.
     """
     spec4, spec3, spec2 = _spec(4, 1), _spec(3, 0), _spec(1, 0)
     dspec = _dissipator_spec()
 
-    def local(g_out, g_in, rho, rho_eq, g_out_eq, g_in_eq, w):
+    def local(gamma, injection, rho, rho_eq, gamma_eq, injection_eq, w):
         req = rho_eq[None].astype(rho.dtype)
-        c0 = coll.collision(g_out_eq, g_in_eq, req)
-        src = coll.source(g_out, g_in, req, None if raw else c0)
-        d = coll.dissipator(g_out + g_in, src, eigh=eigh_local)
-        out, inn = (coll.trace_rates(g_out, g_in, rho) if raw else
-                    coll.trace_rates(g_out, g_in, rho, g_out_eq, g_in_eq, req))
+        c0 = coll.collision(gamma_eq, injection_eq, req)
+        src = coll.source(gamma, injection, req, None if raw else c0)
+        d = coll.dissipator(gamma, src, eigh=eigh_local)
+        injection_eff = injection if raw else injection - c0
+        dvals = eigh_local(coll.hermitian_part(injection_eff))[0]
+        bvals = eigh_local(coll.hermitian_part(gamma - injection_eff))[0]
+        rvals = eigh_local(coll.hermitian_part(rho))[0]
+        out, inn = (coll.trace_rates(gamma, injection, rho) if raw else
+                    coll.trace_rates(gamma, injection, rho, gamma_eq, injection_eq, req))
         wk = w.astype(jnp.float64)[None, :]
         tsum = lambda a: jax.lax.psum(jnp.sum(wk * a, axis=1), K_AXES)
         live = (w > 0.0)[None, :, None]
@@ -373,10 +380,19 @@ def collision_program(mesh, *, raw: bool):
         return dict(diss=d, c_eq=c0, out=tsum(out), inn=tsum(inn),
                     trace=tsum(jnp.real(jnp.trace(rho, axis1=-2, axis2=-1))),
                     min_rate=jax.lax.pmin(jnp.min(jnp.where(live, jnp.real(d.vals), big)), K_AXES),
+                    min_injection=jax.lax.pmin(
+                        jnp.min(jnp.where(live, jnp.real(dvals), big)), K_AXES),
+                    min_blocking=jax.lax.pmin(
+                        jnp.min(jnp.where(live, jnp.real(bvals), big)), K_AXES),
+                    rho_min=jax.lax.pmin(
+                        jnp.min(jnp.where(live, jnp.real(rvals), big)), K_AXES),
+                    rho_max=jax.lax.pmax(
+                        jnp.max(jnp.where(live, jnp.real(rvals), -big)), K_AXES),
                     c_eq_diag=dmax(eye), c_eq_offdiag=dmax(~eye))
 
     out_specs = dict(diss=dspec, c_eq=spec4, out=P(), inn=P(), trace=P(), min_rate=P(),
-                     c_eq_diag=P(), c_eq_offdiag=P())
+                     min_injection=P(), min_blocking=P(), rho_min=P(), rho_max=P(), c_eq_diag=P(),
+                     c_eq_offdiag=P())
     return jax.jit(shard_map(local, mesh=mesh,
                              in_specs=(spec4, spec4, spec4, spec3, spec4, spec4, spec2),
                              out_specs=out_specs, check_vma=False))

@@ -1,44 +1,26 @@
-"""tdagw/collision.py — the on-shell GW collision term of TD-aGW, on plain arrays.
+"""tdagw/collision.py — one-sided full-matrix Markov GW operators.
 
-docs/theory/td_agw_dynamical.md §1.5, Eq. (8).  The causal branches of the Σ τ
-sweep split Σ^c into a particle part (weight 1 - f, the ``cond`` branch) and a
-hole part (weight f, the ``val`` branch).  Their on-shell averages
+The complex branch tables retain row-shell Sigma_ij(E_i) and column-shell
+Sigma_ij(E_j) samples. The particle branch is retarded, the hole advanced.
+Their retarded columns are R_p = cond[1] and R_h = val[0]^H. With
+M = R_p + R_h + static, Gamma = i(M - M^H), D = i R_h + (i R_h)^H,
+and M_H = Herm(M), the full one-sided expression separates into
 
-    S~_ij = 1/2 [T1_ij + T2_ij],   T1_ij = Σ_ij(e_i),   T2_ij = Σ_ij(e_j)
+    -i[M_H, rho] - 1/2 {Gamma, rho} + D.
 
-(the pair tables of ``gw.ppm_sigma.window_sigma_c(branches=True)``) give the
-out- and in-scattering rates
+The Hermitian static term contributes only to M_H. The model carries the
+chosen coherent correction separately, exactly once. The optional
+subtracted form imposes the equilibrium remainder as a counterterm;
+it is not an identity of the raw Markov integral.
 
-    G~> = i (S~_p - S~_p^H),      G~< = s_h i (S~_h - S~_h^H),                 (1)
+Between refreshes the remainder on x = rho - rho_eq is affine:
+x\' = -1/2 {Gamma, x} + S, S = C[rho_eq] [- C_eq[rho_eq]]. The existing
+Hermitian Gamma eigenbasis gives its exact flow for either sign of tau.
+Negative rates are reported, never clipped.
 
-positive semidefinite on the diagonal; ``s_h`` = :data:`HOLE_BRANCH_SIGN`
-because the sweep's hole branch is time ordered (E - e + Ω - iη), the adjoint
-of the retarded one, whose width has the opposite sign.  The dissipative part
-of Eq. (8) is
-
-    C[ρ] = -1/2 {G~, ρ} + G~<  =  -1/2 {G~>, ρ} + 1/2 {G~<, 1 - ρ},   G~ = G~> + G~<.   (2)
-
-The propagator carries C[ρ] - C[ρ_eq] (``subtracted``: ρ_eq is a fixed point
-exactly and x = ρ - ρ_eq is damped by the full G~) or C[ρ] (``raw``), with G~
-and the source
-
-    S = -1/2 {G~, ρ_eq} + G~<  [- C[ρ_eq]]                                     (3)
-
-held between refreshes (§7.1).  The flow x' = -1/2 {G~, x} + S is then affine
-and exact in the eigenbasis of G~ = V diag(g) V^H,
-
-    x'_ab(τ) = e^{-z_ab} x'_ab(0) + τ φ1(z_ab) S'_ab,   z_ab = (g_a + g_b) τ / 2,   (4)
-
-x' = V^H x V, S' = V^H S V, φ1(z) = (1 - e^{-z})/z.  :class:`Dissipator` holds
-(V, g, S'); :func:`flow` is (4) and :func:`rate` its generator (the right-hand
-side term of the explicit methods).  The held Hermitian part of the on-shell
-operator, :func:`hermitian_update`, joins the K δρ model as a held term.
-
-Every function acts on the trailing (n, n) band axes and broadcasts over any
-leading axes (the propagator's (trial, k)): nothing here reduces over k except
-:func:`trace_rates`, a diagnostic.  Units are those of the tables (the
-propagator: Hartree).  jit-able; the propagator runs them k-locally inside its
-``shard_map`` (``tdagw.propagate``).
+Arrays broadcast over leading trial and k axes, act on trailing band axes,
+and use supplied energy units (Hartree in propagation). The propagator
+invokes these array functions k-locally inside shard_map.
 """
 from __future__ import annotations
 
@@ -47,20 +29,16 @@ from typing import NamedTuple
 import numpy as np
 import jax.numpy as jnp
 
-__all__ = ["HOLE_BRANCH_SIGN", "FORMS", "HERMITIAN_MODES", "Dissipator", "RefreshPolicy",
-           "dagger", "on_shell_average", "width", "hermitian_part", "rates", "collision",
+__all__ = ["FORMS", "HERMITIAN_MODES", "Dissipator", "RefreshPolicy",
+           "dagger", "width", "hermitian_part", "branch_operators", "collision",
            "source", "dissipator", "phi1", "flow", "rate", "hermitian_update", "trace_rates",
            "refresh_due"]
 
-#: The Σ sweep's hole (``val``) branch is time ordered, E - e + Ω - iη
-#: (``tests/test_tdagw_dynsig_sigma.py``'s dense reference, gate G7 pins the
-#: sign on the sweep): G~< = -i (S~_h - S~_h^H) = i (S~_h^R - S~_h^R^H).
-HOLE_BRANCH_SIGN = -1.0
-#: ``subtracted``: C[ρ] - C[ρ_eq] (Eq. 8's equilibrium subtraction); ``raw``: C[ρ].
+#: ``subtracted`` imposes the equilibrium counterterm; ``raw`` does not.
 FORMS = ("subtracted", "raw")
 #: The held Hermitian part (:func:`hermitian_update`): ``dynamic`` (default) the
 #: on-shell change minus its static-W limit, which K δρ carries already;
-#: ``full`` the whole change Herm(S~[ρ]) - Herm(S~[ρ_eq]); ``none``.
+#: ``full`` the whole change M_H[ρ] - M_H[ρ_eq]; ``none``.
 HERMITIAN_MODES = ("dynamic", "full", "none")
 #: |z| below which φ1 is its Taylor series (relative error < 1e-16 there).
 _PHI1_SERIES = 1e-5
@@ -69,11 +47,6 @@ _PHI1_SERIES = 1e-5
 def dagger(a):
     """a^H over the trailing two axes."""
     return jnp.conj(jnp.swapaxes(a, -1, -2))
-
-
-def on_shell_average(pair):
-    """S~ = 1/2 (T1 + T2) of a pair table (2, ..., n, n)."""
-    return 0.5 * (pair[0] + pair[1])
 
 
 def width(s):
@@ -85,33 +58,60 @@ def hermitian_part(s):
     return 0.5 * (s + dagger(s))
 
 
-def rates(pair_cond, pair_val):
-    """(G~>, G~<) of Eq. (1) from each branch's pair tables (2, ..., n, n)."""
-    return (width(on_shell_average(pair_cond)),
-            HOLE_BRANCH_SIGN * width(on_shell_average(pair_val)))
+def branch_operators(pair_cond, pair_val, static=0.0):
+    """One-sided Markov operators ``(gamma, injection, m_h)`` from branch tables.
+
+    Parameters
+    ----------
+    pair_cond, pair_val : (2, ..., n, n) complex arrays
+        Row-shell and column-shell samples in one instantaneous basis, in energy
+        units. The particle branch is retarded; the hole branch is time ordered.
+    static : (..., n, n) complex array or scalar
+        Frequency-independent Hermitian self-energy; enters ``m_h`` only.
+
+    Returns
+    -------
+    gamma, injection, m_h : (..., n, n) complex arrays
+        Hermitian total width, injection D = A_in + A_in^H, and Hermitian
+        retarded self-energy. No arithmetic shell averaging is performed.
+
+    The retarded hole column is the adjoint of the advanced *row* table:
+    R_p = cond[1], R_h = val[0]^H, A_in = i R_h. Thus gamma =
+    i(R_p + R_h - R_p^H - R_h^H), and m_h = Herm(R_p + R_h + static).
+    """
+    rp, rh = pair_cond[1], dagger(pair_val[0])
+    ain = 1j * rh
+    return width(rp + rh), ain + dagger(ain), hermitian_part(rp + rh + static)
 
 
 def _anti(a, b):
     return a @ b + b @ a
 
 
-def collision(gamma_out, gamma_in, rho):
-    """C[ρ] of Eq. (2): -1/2 {G~> + G~<, ρ} + G~<."""
-    return -0.5 * _anti(gamma_out + gamma_in, rho) + gamma_in
+def collision(gamma, injection, rho):
+    """Split Markov remainder: -1/2 {gamma, rho} + injection.
+
+    The coherent term -i[m_h, rho] is propagated separately, exactly once.
+    """
+    return -0.5 * _anti(gamma, rho) + injection
 
 
-def source(gamma_out, gamma_in, rho_eq, c_eq=None):
-    """S of Eq. (3); ``c_eq`` = C[ρ_eq] at the equilibrium rates (None: the raw form)."""
-    s = collision(gamma_out, gamma_in, rho_eq)
+def source(gamma, injection, rho_eq, c_eq=None):
+    """Affine source on delta rho; optional ``c_eq`` is an equilibrium counterterm.
+
+    Subtracting this counterterm imposes a stationary reference. It is a model
+    choice, not an identity of the unsubtracted Markov collision integral.
+    """
+    s = collision(gamma, injection, rho_eq)
     return s if c_eq is None else s - c_eq
 
 
 class Dissipator(NamedTuple):
-    """The held affine flow x' = -1/2 {G~, x} + S of Eq. (4), per leading index.
+    """The held affine flow x' = -1/2 {Gamma, x} + S, per leading index.
 
-    vecs : (..., n, n) complex, eigenvectors V of the Hermitized G~ (columns).
-    vals : (..., n) float, its eigenvalues g (rates; >= 0 up to the sweep's
-        regularization and the PPM's residue asymmetry, which a refresh reports).
+    vecs : (..., n, n) complex, eigenvectors V of Hermitian Gamma (columns).
+    vals : (..., n) float, its eigenvalues g (rates). The full-matrix Markov
+        approximation can give negative values, which a refresh reports.
     source : (..., n, n) complex, S' = V^H S V.
     The propagator holds it k-sharded like ρ (``ops.collision``); a pad k is
     zero rates and zero source, the identity flow.
@@ -140,7 +140,7 @@ def _pair_rate(vals):
 
 
 def flow(d: Dissipator, x, tau):
-    """x(τ) of Eq. (4) from x(0) = ``x``: exact for the held G~ and S, any real τ."""
+    """x(τ) from x(0) = ``x``: exact for held Hermitian Gamma and D."""
     xe = dagger(d.vecs) @ x @ d.vecs
     z = tau * _pair_rate(jnp.real(d.vals))                    # real: the rates are eigenvalues
     ye = jnp.exp(-z).astype(xe.dtype) * xe + (tau * phi1(z)).astype(xe.dtype) * d.source
@@ -148,7 +148,7 @@ def flow(d: Dissipator, x, tau):
 
 
 def rate(d: Dissipator, x):
-    """The generator of :func:`flow`: -1/2 {G~, x} + S."""
+    """The generator of :func:`flow`: -1/2 {Gamma, x} + D."""
     xe = dagger(d.vecs) @ x @ d.vecs
     return d.vecs @ (-_pair_rate(d.vals).astype(xe.dtype) * xe + d.source) @ dagger(d.vecs)
 
@@ -156,10 +156,10 @@ def rate(d: Dissipator, x):
 def hermitian_update(s_t, s_eq, static_t=None, static_eq=None):
     """The held Hermitian term ΔΣ^h added to K δρ (§1.5, §7.1).
 
-    ``s_t``, ``s_eq``: the on-shell operator S~ (``window_sigma_c``'s ``onshell``) at the
-    refresh state and at ρ_eq.  ``static_t``, ``static_eq``: its static-W limit's
+    ``s_t``, ``s_eq``: M_H = Herm(R_p + R_h + static) at the refresh state
+    and at rho_eq. ``static_t``, ``static_eq``: its static-W limit's
     population-dependent part at the same states (``window_sigma_c(static_limit=True)``:
-    sx + diag(head)), or None.  Returns Herm(S~[ρ] - S~[ρ_eq]) minus the change of the
+    sx + diag(head)), or None. Returns the change in M_H minus the change of the
     static limit when given: K δρ already carries the static screened exchange of the
     populations, -W^c(0) δf, which is the static limit of the GN-PPM change, so the
     difference is the dynamical correction and vanishes as the pole energies go to
@@ -171,19 +171,19 @@ def hermitian_update(s_t, s_eq, static_t=None, static_eq=None):
     return d - hermitian_part(static_t - static_eq)
 
 
-def trace_rates(gamma_out, gamma_in, rho, gamma_out_eq=None, gamma_in_eq=None, rho_eq=None):
-    """(out, in): the out- and in-scattering parts of d Tr ρ/dt per leading index.
+def trace_rates(gamma, injection, rho, gamma_eq=None, injection_eq=None, rho_eq=None):
+    """(loss, injection): trace of the two split remainder terms, per leading index.
 
-    Tr(-1/2 {G~>, ρ}) = -Tr(G~> ρ) and Tr(1/2 {G~<, 1 - ρ}) = Tr(G~<) - Tr(G~< ρ); with the
-    equilibrium triple given, the same at equilibrium is subtracted (the subtracted form).
-    Real parts; the caller weights the leading k axis.
+    With the equilibrium triple, subtract the imposed equilibrium counterterm.
+    Real parts; the caller weights the leading k axis. Neither term is assumed
+    positive for a general matrix Markov approximation.
     """
     tr = lambda a, b: jnp.real(jnp.einsum("...ab,...ba->...", a, b))
-    out = -tr(gamma_out, rho)
-    inn = jnp.real(jnp.trace(gamma_in, axis1=-2, axis2=-1)) - tr(gamma_in, rho)
-    if gamma_out_eq is not None:
-        out = out + tr(gamma_out_eq, rho_eq)
-        inn = inn - (jnp.real(jnp.trace(gamma_in_eq, axis1=-2, axis2=-1)) - tr(gamma_in_eq, rho_eq))
+    out = -tr(gamma, rho)
+    inn = jnp.real(jnp.trace(injection, axis1=-2, axis2=-1))
+    if gamma_eq is not None:
+        out = out + tr(gamma_eq, rho_eq)
+        inn = inn - jnp.real(jnp.trace(injection_eq, axis1=-2, axis2=-1))
     return out, inn
 
 

@@ -44,9 +44,20 @@ $\langle u_{kn}|u_{k+b,m}\rangle\,e^{-(\varepsilon_{kn}-\varepsilon_{k+b,m})^2/2
 ($\sigma$ = `system.esmear`) and the second term only along a vacuum
 direction. `lorrax.intraband = false` drops Eq. (3).
 
+**Held collision term.** With `lorrax.collision` enabled, Eq. (1) also
+carries the held collision remainder; its column-sampled one-sided MGKBA
+coefficients, coherent principal-value contribution and equilibrium
+counterterm are defined by [TD-aGW dynamical §1.5](td_agw_dynamical.md#damping).
+The coherent contribution joins ΔΣ once. The remainder enters the right-hand
+side for explicit methods and the split remainder flow for Magnus methods;
+its coefficients refresh at chunk boundaries under
+[the refresh contract](td_agw_dynamical.md#refresh). The static-W subtraction
+in ΔΣ and the collision equilibrium counterterm are distinct operations.
+
 **ΔΣ is injected.** The integrators see the self-energy update only as a
 callable of the instantaneous state, `apply(params, rho, t) -> dSigma` (Ha,
-Hermitian, linear in $\rho - \rho^\mathrm{eq}$), `tdagw.self_energy.SelfEnergyModel`:
+Hermitian; the models below are linear in $\rho - \rho^\mathrm{eq}$ before
+attaching a held term), `tdagw.self_energy.SelfEnergyModel`:
 
 | `lorrax.model` | ΔΣ[ρ] | parameters |
 |---|---|---|
@@ -207,7 +218,8 @@ with $V, w$ from the `eigh` of the generator, so every term has the size of
 $x$ or of $h\bar B$: rounding is relative to the response, not to the O(1)
 occupations, and the weak-field floor of conjugating the whole ρ is gone
 ([accuracy limits](#accuracy-limits)). The spectrum of $\rho^\mathrm{eq} + x$
-is conserved exactly when Γ = 0 and the intraband term is off. ΔΣ is frozen
+is conserved exactly when Γ = 0, the collision is off and the intraband term
+is off. ΔΣ is frozen
 over a step as the polynomial through its node values (linear through the two
 Gauss nodes for `cfm4`), so everything else on the step — the corrections'
 node flows, the composition below, dense output — costs exponentials, not ΔΣ
@@ -454,6 +466,11 @@ the odd part, linear up to $O(E_0^3)$: a window without inversion and with
 intra-manifold dipoles has a physical second-order response
 ($P^{(2)}/P^{(1)} \sim |\rho_{cv}|$) that would otherwise set the floor.
 
+These rungs have the GW collision term off. With it enabled, Hermiticity
+remains a check, but purity and the spectrum of ρ are not invariants;
+particle conservation has the closure conditions of
+[the collision operator](td_agw_dynamical.md#damping).
+
 **Linear response is the full BSE.** Linearized about $\rho^\mathrm{eq}$,
 Eqs. (1)–(2) for $z = (\delta\rho_{cv}, \delta\rho_{vc})$ over the pairs
 $t = (k, c, v)$ read
@@ -647,7 +664,8 @@ measurement and `tdgw_data/checkpoint/{it_next,tchkp,lessG_knn}`, plus a
 that trial in `[system.Efunc]`). `tdgw-pp linear` reads the directory
 unchanged.
 
-**Restart.** Every checkpoint also stores the integrator's whole carry in the
+**Restart, collision off.** Every checkpoint also stores the integrator's whole
+carry in the
 first trial's file, `tdgw_data/checkpoint/lorrax` (`leaf_<i>` datasets at
 logical k; attributes `step`, `n_leaves` and `fingerprint`, the settings the
 carry is valid for): ρ with the Magnus node history, the FSAL slope or DP54's
@@ -661,6 +679,10 @@ as TDGW restarts, differ at 1e-12 and 6e-10 in ρ_cv. Only `outdir`,
 (`td_restart_settings`); a TDGW checkpoint holds the state but no carry and
 refuses (`td_restart_carry`). TDGW and `tdgw-pp` read the checkpoint's three
 datasets and ignore the group.
+
+A collision-enabled run refuses checkpoint restart (`td_collision_restart`):
+the checkpoint does not persist its held collision coefficients and refresh
+state. The restart guarantees above apply with `lorrax.collision = off`.
 
 ## What refuses {#refusals}
 

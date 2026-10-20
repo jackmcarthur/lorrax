@@ -86,17 +86,17 @@ TD_DEFAULTS = {
     "lorrax.collision_hermitian": "dynamic",
     "lorrax.collision_refresh_fs": 0.0,
     "lorrax.collision_refresh_df": 0.0,
-    "lorrax.collision_refresh_sweep": "full",
+    "lorrax.collision_refresh_sweep": "active",
     "lorrax.collision_screening": "frozen",
     "lorrax.collision_frozen_bands": None,
     "lorrax.collision_screening_gamma_ev": 0.001,
     "lorrax.collision_rebase": "auto",
     "lorrax.collision_spm_support_sites_ev": "",
     "lorrax.collision_spm_chi0_active": None,
-    "lorrax.collision_in_scattering": "populations",
-    "lorrax.collision_rate_intermediates": "all",
+    "lorrax.collision_in_scattering": "full",
+    "lorrax.collision_rate_intermediates": "active",
     "lorrax.collision_basis": "band",
-    "lorrax.collision_internal_pairing": "symmetric",
+    "lorrax.collision_internal_pairing": "vertex",
 }
 #: Keys without a usable default.
 TD_REQUIRED = ("control.calc_type", "control.timesteps.t0",
@@ -200,6 +200,15 @@ def _check_collision(vals: dict) -> None:
         raise _gate("td_collision", f"collision_screening = "
                     f"{vals['lorrax.collision_screening']!r}", " | ".join(COLLISION_SCREENINGS),
                     "set [lorrax] collision_screening")
+    if form != "off" and vals["lorrax.collision_screening"] != "frozen":
+        raise _gate(
+            "td_collision_keldysh_screening",
+            f"collision_screening = {vals['lorrax.collision_screening']!r}",
+            "collision_screening = 'frozen' until a joint retarded/lesser W realization exists",
+            "use the equilibrium W branches; the refreshed and shared-pole paths rebuild only "
+            "retarded W from populations and do not supply the nonequilibrium W< required by "
+            "the column-sampled MGKBA collision operator",
+        )
     fb = vals["lorrax.collision_frozen_bands"]
     if fb is not None:
         ok = (isinstance(fb, (list, tuple)) and len(fb) == 2
@@ -266,14 +275,24 @@ def _check_collision(vals: dict) -> None:
                         f"collision_refresh_sweep = {vals['lorrax.collision_refresh_sweep']!r}",
                         "collision_refresh_sweep = 'active'",
                         "it acts on the active part of the split sweep")
-    for key in ("lorrax.collision_basis", "lorrax.collision_internal_pairing"):
-        if (vals[key] != TD_DEFAULTS[key]
-                and vals["lorrax.collision_in_scattering"] != "full"):
-            raise _gate("td_collision", f"{key.split('.')[1]} = {vals[key]!r} with "
-                        f"collision_in_scattering = {vals['lorrax.collision_in_scattering']!r}",
-                        "collision_in_scattering = 'full'",
-                        "it acts on the full-rho internal line")
-    if (vals["lorrax.collision_basis"] == "instantaneous"
+    if form != "off":
+        required = {
+            "lorrax.collision_refresh_sweep": "active",
+            "lorrax.collision_in_scattering": "full",
+            "lorrax.collision_rate_intermediates": "active",
+            "lorrax.collision_internal_pairing": "vertex",
+        }
+        wrong = [f"{key.split('.')[1]} = {vals[key]!r}" for key, want in required.items()
+                 if vals[key] != want]
+        if wrong:
+            raise _gate(
+                "td_collision_mgkba_closure", ", ".join(wrong),
+                ", ".join(f"{key.split('.')[1]} = {want!r}" for key, want in required.items()),
+                "the column-sampled full-matrix MGKBA operator conserves the closed active "
+                "window only with the full-rho vertex line; the populations, all-band-rate, "
+                "and symmetric-pairing paths are comparison kernels, not propagation modes",
+            )
+    if (form != "off" and vals["lorrax.collision_basis"] == "instantaneous"
             and vals["lorrax.collision_screening"] != "frozen"):
         raise _gate("td_collision", "collision_basis = 'instantaneous' with collision_screening "
                     f"= {vals['lorrax.collision_screening']!r}", "collision_screening = 'frozen'",
@@ -919,13 +938,17 @@ TD_KEY_DOCS = {
         "", "Node-map evaluations (each: the exponentials to the two nodes, no ΔΣ call) of "
         "the closing solve per step, at least 1.", ("td_stiff_solve",)),
     "lorrax.collision": (
-        "", "The on-shell GW collision term of the GN-PPM run, W frozen at its own poles "
+        "", "The column-sampled, one-sided Markov GW collision term, with W frozen at the "
+        "source run's equilibrium poles "
         "([td_agw_dynamical.md §1.5](theory/td_agw_dynamical.md)): `off`; `subtracted`, "
-        "C[ρ] − C[ρ_eq] at full rates, so ρ_eq is an exact fixed point; `raw`, C[ρ] (ρ_eq "
-        "drifts by C[ρ_eq], the regularization tails). The dissipative flow "
-        "x' = −½{G̃, x} + S is solved exactly in the eigenbasis of G̃ = G̃> + G̃< "
+        "C[ρ] − C[ρ_eq], an explicit reference counterterm; `raw`, the literal C[ρ]. "
+        "The complex particle column `cond[1]` and the adjoint hole row `val[0]^†` "
+        "define the total Hermitian width Γ, injection D and coherent M_H without an "
+        "arithmetic average of external energies. The dissipative flow "
+        "x' = −½{Γ, x} + S is solved exactly in the eigenbasis of Γ "
         "in the remainder slot (Magnus) or added to the right-hand side (dp54, rk4, "
-        "etdrk4). Needs `system = bundle` on a GN-PPM bundle; the GW driver reruns on a "
+        "etdrk4); M_H enters the held Hamiltonian once. Needs `system = bundle` on a "
+        "GN-PPM bundle; the GW driver reruns on a "
         "copy of `collision_source` (default `bundle_input`) in `outdir/collision_source` "
         "at the start (no restart written) to recover the poles or, with "
         "`collision_screening = shared_pole`, the shared-pole model and its W stage's "
@@ -942,8 +965,9 @@ TD_KEY_DOCS = {
         "(`dynsig_collision_occupations` refuses another window).", ("td_collision_source",)),
     "lorrax.collision_hermitian": (
         "", "The held Hermitian part ΔΣ^h added to K δρ at each refresh: `dynamic`, "
-        "Herm S̃[ρ] − Herm S̃[ρ_eq] less its static-W limit (the population response of "
-        "W^c(0), which K already holds); `full`, Herm S̃[ρ] − Herm S̃[ρ_eq]; `none`.",
+        "M_H[ρ] − M_H[ρ_eq] less its static-W limit (the response of W^c(0), which "
+        "K already holds); `full`, the whole M_H[ρ] − M_H[ρ_eq]; `none`. This term is "
+        "not repeated in the dissipative remainder.",
         ("td_collision",)),
     "lorrax.collision_refresh_fs": (
         "= never", "Refresh the rates, the dissipator and ΔΣ^h every this many fs (at "
@@ -954,7 +978,7 @@ TD_KEY_DOCS = {
         "window's populations exceeds this; 0 = no population trigger.",
         ("td_collision_refresh",)),
     "lorrax.collision_refresh_sweep": (
-        "", "What a refresh sweeps: `full`, the window Σ over every intermediate band, "
+        "= active", "What a refresh sweeps: `full`, the window Σ over every intermediate band, "
         "planned on the GW run's on-shell list; `active`, the window's own intermediate "
         "bands only, added to the frozen bands' part evaluated once at t0 (exact with W "
         "frozen: each Σ branch is linear in the intermediate populations and the frozen "
@@ -963,7 +987,13 @@ TD_KEY_DOCS = {
         "(theory/td_agw_dynamical.md)). The refresh lines name the sweep's τ nodes.",
         ("td_collision",)),
     "lorrax.collision_screening": (
-        "", "The W of the rates and of ΔΣ^h: `frozen`, the GW run's W0 and poles throughout; "
+        "", "The W of the collision coefficients and of ΔΣ^h. The column-sampled MGKBA "
+        "operator currently admits only `frozen`, the GW run's equilibrium W0 and its explicit "
+        "lesser/greater branches. `refreshed` and `shared_pole` are refused by "
+        "`td_collision_keldysh_screening`: those experimental paths reconstruct retarded W from "
+        "instantaneous populations but do not construct the independent nonequilibrium W< or a "
+        "joint response/noise pole bank required by this operator. Their earlier implementation "
+        "was: "
         "`refreshed`, at every refresh W is re-screened at both GN-PPM supports (0 and "
         "iω_p) from the window populations — δχ0 of the RPA bubble (cross-gap pairs on the "
         "run's own Laplace rules, Pauli blocking, same-side pairs exact), the Dyson solve "
@@ -1003,27 +1033,31 @@ TD_KEY_DOCS = {
         "difference from the source's model is in the t0 line).",
         ("td_collision",)),
     "lorrax.collision_in_scattering": (
-        "= populations", "With `collision_refresh_sweep = active` for `full`: the internal "
-        "line of the active part's rates. `populations`: the band populations f = diag ρ "
+        "= full", "With `collision_refresh_sweep = active`: the internal "
+        "line of the active part's rates. `populations` is a diagnostic kernel using the "
+        "band populations f = diag ρ "
         "(hole f_m, particle 1 − f_m), the coherences of ρ are not in the rates. `full`: the "
         "window's whole ρ, hole ρ_mn and particle (1 − ρ)_mn, contracted in the Σ sweep as "
         "G = L diag(w) R^H on the orbital panels ψ and ψC with the energy pairing of "
         "`collision_internal_pairing` ([td_agw_dynamical.md §1.5, Eqs. 8a and "
         "8c](theory/td_agw_dynamical.md)); at a diagonal ρ it is `populations` to rounding. "
-        "The frozen part is unchanged (its populations never change).",
+        "The frozen part is unchanged (its populations never change). Collision-enabled "
+        "propagation requires `full`; `populations` is refused because it does not close the "
+        "full-matrix number balance.",
         ("td_collision",)),
     "lorrax.collision_rate_intermediates": (
-        "= all", "With `collision_refresh_sweep = active` for `active`: the intermediate "
-        "bands of the dissipative rates G~> and G~< (both branches' widths). `all`: every "
+        "= active", "With `collision_refresh_sweep = active`: the intermediate "
+        "bands used to build the dissipative coefficients Gamma and D. `all` is a diagnostic "
+        "using every "
         "band of the Σ sum. `active`: the window's own; the frozen bands' part then enters "
-        "S~, the Hermitian part (ΔΣ^h, and under refreshed W its change), only. Frozen "
+        "the coherent M_H correction (ΔΣ^h, and under refreshed W its change), only. Frozen "
         "populations never update, so their transitions into the window (energy-forbidden "
         "at T = 0, alive only in the η tails) are a particle source or sink; with "
-        "`active` and a closed window Σ_k Tr C[ρ] = 0 holds to rounding for "
-        "`in_scattering = full`.",
+        "`active` and a closed window, instantaneous trace conservation is checked from the "
+        "reported loss/injection balance. Collision-enabled propagation requires `active`.",
         ("td_collision",)),
     "lorrax.collision_basis": (
-        "= band", "With `collision_in_scattering = full` for `instantaneous`: the basis and "
+        "= band", "With `collision_in_scattering = full`: the basis and "
         "energies of the rates' lines. `band`: the band basis at the collision source's "
         "bundle energies (the GW run's ε^G). `instantaneous`: at every refresh the "
         "eigenbasis U of the propagator's slow Hamiltonian, H_slow = diag(e) + ΔΣ^h + "
@@ -1034,16 +1068,20 @@ TD_KEY_DOCS = {
         "back to the band basis. The frozen bands keep ψ and their step occupation and sit "
         "at ε^G + Δ_edge(k), Δ_edge = e − ε^G of the window's edge band on their "
         "side (lowest window band below, highest above); their part is swept at every "
-        "refresh (its external states rotate). Needs `collision_screening = frozen` "
+        "refresh (its external states rotate). This is currently an experimental, "
+        "carriers-only one-refresh-lag predictor, not a converged full-rho "
+        "H^s <-> M_H snapshot fixed point. Needs `collision_screening = frozen` "
         "([td_agw_dynamical.md §1.5, Eq. 8b](theory/td_agw_dynamical.md)).",
         ("td_collision",)),
     "lorrax.collision_internal_pairing": (
-        "= symmetric", "With `collision_in_scattering = full`: the energy pairing of the "
-        "internal line in the two on-shell tables Σ_ij(ε_i), Σ_ij(ε_j). `symmetric`: "
-        "½ {g(ε'), C} in both (one sweep per branch on 2 n_A internal columns). `vertex`: "
+        "= vertex", "With `collision_in_scattering = full`: the energy pairing of the "
+        "internal line in the two on-shell tables Σ_ij(ε_i), Σ_ij(ε_j). `symmetric` is "
+        "the earlier diagnostic ½ {g(ε'), C} in both (one sweep per branch on 2 n_A internal "
+        "columns); it is refused for propagation because it is not number conserving after "
+        "column sampling. `vertex`: "
         "each external index with the internal index on its own vertex, Σ_ij(ε_i) from "
         "G_L = ψ' e^{−iε'τ} C ψ'^† and Σ_ij(ε_j) from G_R = ψ' C e^{−iε'τ} ψ'^† (four "
-        "sweeps); both conserve Σ_k Tr C[ρ] on reciprocal poles "
+        "sweeps); it conserves Σ_k Tr C[ρ] on reciprocal poles "
         "([td_agw_dynamical.md §1.5, Eq. 8c](theory/td_agw_dynamical.md)).",
         ("td_collision",)),
     "lorrax.collision_spm_chi0_active": (

@@ -39,6 +39,22 @@ A new test needs no bootstrap import of its own.
   adapter's dSigma equals 1/2 K (rho - rho_eq) for a synthetic TDMODEL model
   with a permuted k order and padded k; red twins drop the Ry -> Ha halving
   and pass rho for Delta rho.
+- `tdagw/test_collision_cpu.py`: the one-sided collision branch operator,
+  equilibrium subtraction, Hermitian update and held affine flow against
+  independent NumPy/SciPy references.
+- `tdagw/test_prop_collision_cpu.py` and its `_collision_case.py` child:
+  collision attachment through the production propagator on a 2x2 CPU mesh;
+  fixed point, integrator order, refreshes, carry/history rebasing, compile
+  reuse and k-locality against exact piecewise affine solutions.
+- `test_tdagw_collision_fullrho.py` and `test_tdagw_collision_instbasis.py`:
+  focused script gates on a 2x2 mesh for the full density-matrix internal
+  line, dense branch-table references, vertex pairing, basis covariance,
+  closed-window trace checks, instantaneous-basis fixed point and head.
+  Their pytest entries skip; run the scripts explicitly with four host
+  devices for the CPU leg.
+- `tdagw/_collision_516_case.py`: the real CrI3 GN-PPM collision diagnostic,
+  including branch tables, equilibrium drift, driven refreshes, frozen/active
+  splits and screening snapshots; run explicitly at P4 on compute nodes.
 - `tdagw/test_validation_*_cpu.py`: the TD-aGW validation ladder
   ([theory](../docs/theory/td_agw_propagation.md#validation)), CPU on a 2x2
   host mesh through the driver's deck -> stages -> `tdgw.h5` route; each rung

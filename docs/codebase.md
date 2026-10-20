@@ -370,8 +370,13 @@ modules meet at one contract, ΔΣ = `apply(params, rho, t)`.
 | `tdgw_jax.py` | Driver: TDGW deck in, `tdgw.h5` + `tdgw.toml` out. |
 | `td_config.py` | Parses and validates the TD-aGW deck (TDGW's `tdgw.toml` plus `[lorrax]`). |
 | `stages.py` | The driver's stages: header and operators, ΔΣ model, outputs, propagation, report. |
+| `td_system.py` | Builds the TD system, energies and position operators from a GW restart bundle. |
+| `td_log.py` | The resolved run report, progress rows and collision refresh receipts. |
 | `eom.py` | The equation of motion, the intraband commutator and TDGW's measurements. |
 | `propagate.py` | The jitted, k-sharded chunk program around the integrators of `solvers.time_integrators`. |
+| `collision.py` | The column-sampled one-sided MGKBA branch operator, equilibrium counterterm and held affine collision flow. |
+| `dynsig.py` | The instantaneous self-energy stages and collision refresh: frozen/active sweeps, basis dressing and screening snapshots ([theory](theory/td_agw_dynamical.md)). |
+| `keldysh_rational.py` | Host-side small-matrix reference for sharp, transfer-function products and causal Schur/Sylvester projection of a future joint retarded/lesser screening realization; it is not a production screening path. |
 | `self_energy.py` | The ΔΣ[ρ] contract and its models: none, dense TDGW kernel, low-rank, the ISDF adapter. |
 | `tdgw_io.py` | TDGW's formats: header reader, operator rebuild, `kernel.h5`, `tdgw.h5` writer, the field expressions. |
 | `model.py` | The ISDF COHSEX interaction ΔΣ[Δρ] of a GW restart bundle. |

@@ -177,9 +177,11 @@ says nothing either way.
 The table's columns are fixed (`tdagw.td_log.PROGRESS_COLUMNS`), so
 `tdagw.td_log.parse_progress_row` reads any row back. Tr ρ and Tr ρ² are computed
 on the device at every sample with no ΔΣ call; both are invariants of the exact
-flow without Γ (the intraband term moves charge between k but keeps the sums), so
-a drift far above rounding in a Γ = 0 run is a defect. With Γ ≠ 0, Tr ρ² decays by
-design. The energy is not logged: it needs ΔΣ[ρ] at every sample. A run that a
+flow with Γ = 0 and the collision off (the intraband term moves charge between
+k but keeps the sums), so a drift far above rounding there is a defect.
+With relaxation or collisions, purity can change; particle conservation has
+the closure conditions of the [collision theory](../theory/td_agw_dynamical.md#damping).
+The energy is not logged: it needs ΔΣ[ρ] at every sample. A run that a
 gate refuses still closes its log: the gate's lines, the refusal's message and a
 `REFUSED (… GATE <id>)` line.
 
@@ -187,8 +189,10 @@ gate refuses still closes its log: the gate's lines, the refusal's message and a
 
 `[lorrax] collision = "subtracted"` adds the on-shell GW collision term of a
 GN-PPM bundle ([TD-aGW dynamical §1.5](../theory/td_agw_dynamical.md#damping)):
-out- and in-scattering rates from the two branches of the bundle's own Σ
-sweep, held between refreshes, and the dissipative flow solved exactly. It
+column-sampled one-sided MGKBA coefficients from the two branches of the
+bundle's own Σ sweep, held between refreshes. The coherent principal-value
+contribution enters ΔΣ once; the remaining affine collision flow occupies
+the Magnus remainder slot or the explicit methods' right-hand side. It
 needs `system = "bundle"` on a `compute_mode = gn_ppm` run; the keys are in the
 [input reference](../input_reference.md#td-agw).
 
@@ -205,16 +209,21 @@ collision_refresh_fs = 0.5                # refresh the rates every 0.5 fs ...
 collision_refresh_df = 1e-3               # ... or when a population moves by 1e-3
 ```
 
+`subtracted` removes the equilibrium collision counterterm defined on the
+owner page. This is separate from `collision_hermitian = "dynamic"`, which
+subtracts the static-W change already carried by K δρ. `full` retains that
+static change too, and `none` drops the held Hermitian update. Neither the
+counterterm nor a diagnostic width should be confused with the complex
+one-sided branch coefficient.
+
 At the start the driver reruns the GW deck in its own process
 (`outdir/collision_source`, no restart written; 34.7 s on the 516 6×6 bundle,
 warm cache) to recover the pole model. The log's `Collision refreshes` section
-(after the progress table) has the t0 receipt and one line per refresh; from the
-516 drive (5e8 V/m, 8 fs, 4 A100):
-
-```text
-  collision t0     : subtracted, hermitian dynamic; rates at rho_eq: diag out [-3.33, 132] meV, in [24.6, 196] meV, min eig G~ 122 meV (G~> -3.64, G~< 24); ||C[rho_eq]|| diag 1.047e-03 off-diag 4.785e-04 Ha/hbar; wall 4.20 s (sweep 4.13, build 0.07)
-  collision refresh   5 at    2.5000 fs (cadence): wall 4.40 s (sweep 4.40, rates 0.000, dissipator 0.001, hermitian 0.002), max|df| 1.274e-04, dTr rho +6.011e-07 since last; ...
-```
+(after the progress table) has the t0 receipt and one line per refresh.
+Check the coefficient and counterterm diagnostics there, together with the
+refresh trigger, sweep wall and trace change. The numerical collision
+measurements quoted below were made with the previous arithmetic-average
+operator; new trajectories require validation with the one-sided operator.
 
 Read the t0 line first. Rates of the size of the GW run's regularization width
 (`sigma_regularization_ev`, 0.25 eV by default) at band edges are its tails, not
@@ -225,16 +234,18 @@ moves Tr ρ by 0.14 per k in 2.5 fs. A refresh costs one window Σ sweep (3.2 s 
 millisecond), so the refresh cadence, not the step, sets the wall: two
 refreshes per fs made the 516 drive 8.1 s per fs (steady chunks) against 0.31 s per
 fs without the term.
-`collision_hermitian = "dynamic"` (default) holds the dynamical part of the
-on-shell Hermitian change; `full` also re-adds its static-W limit, which K
-already holds (0.08 % of P(t) on the 516 drive). A collision run does not
-restart from a checkpoint.
+A collision run does not restart from a checkpoint.
 
 ### Cheaper refreshes and refreshed screening {#collision-refresh}
 
+Only the `active` split below is currently runnable. The `refreshed` example
+is retained as a record of the earlier arithmetic-operator prototype and now
+refuses at `td_collision_keldysh_screening`: it lacks the independent
+nonequilibrium W< required by the column-sampled operator.
+
 ```toml
 collision_refresh_sweep = "active"        # sweep the window's own intermediate bands per refresh
-collision_screening = "refreshed"         # re-screen W at both GN-PPM supports per refresh
+collision_screening = "refreshed"         # historical example: currently refused
 collision_screening_gamma_ev = 0.001      # principal-value width of degenerate same-side pairs
 ```
 
@@ -268,8 +279,12 @@ before trusting a run.
 
 ### Shared-pole screening {#collision-shared-pole}
 
+This section records the earlier arithmetic-operator prototype. The deck below
+now refuses at `td_collision_keldysh_screening`; the passive retarded pole bank
+cannot stand in for a joint retarded/lesser response-and-noise realization.
+
 ```toml
-collision_screening = "shared_pole"       # full refit of the source's shared-pole W per refresh
+collision_screening = "shared_pole"       # historical example: currently refused
 collision_source = "../04_gw_oneshot_mpa_eqp/oneshot.in"   # the SPM GW deck (default: bundle_input)
 collision_refresh_sweep = "active"
 collision_refresh_fs = 0.25
@@ -280,7 +295,10 @@ collision_refresh_fs = 0.25
 Every refresh reruns the source deck's W stage (response bank, moments,
 constructor) at the instantaneous populations and re-resolves the recipe there
 ([TD-aGW dynamical §1.4](../theory/td_agw_dynamical.md#w)); at ρ_eq the refit is
-bitwise the run's model. On 516 2v2c it costs 34 s per refresh (refit 25 s,
+bitwise the run's model. This remains a retarded/population snapshot of
+screening. It does not supply a general nonequilibrium W< or implement the
+proposed joint response/noise realization described on the theory owner page.
+On 516 2v2c it costs 34 s per refresh (refit 25 s,
 window Σ 5 s, rebase 4 s; [§7](../theory/td_agw_dynamical.md#cost)) and the
 run stays one program. Each refresh line adds the refit walls, K, the census
 (Ω_min and the residue and static weight below 0.3 and 1 eV) and the gates

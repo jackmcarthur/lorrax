@@ -392,41 +392,41 @@ def main():
             for ik, k in enumerate(ks):
                 dv, dc = dense[ik, 0], dense[ik, 1]
                 sv, sc = body["val"][:, k], body["cond"][:, k]
-                g_out_d, g_in_d = (np.asarray(g) for g in C.rates(dc, dv))
-                g_out_s, g_in_s = (np.asarray(g) for g in C.rates(sc, sv))
+                gamma_d, injection_d, m_h_d = map(np.asarray, C.branch_operators(dc, dv))
+                gamma_s, injection_s, m_h_s = map(np.asarray, C.branch_operators(sc, sv))
                 mxa = lambda x: float(np.max(np.abs(x)))
                 rows_b.append(dict(
                     k=k, val_rel=mxa(sv - dv) / mxa(dv), cond_rel=mxa(sc - dc) / mxa(dc),
-                    g_out_rel=mxa(g_out_s - g_out_d) / max(mxa(g_out_d), 1e-300),
-                    g_in_rel=mxa(g_in_s - g_in_d) / max(mxa(g_in_d), 1e-300),
-                    g_out_diag_mev=list(np.real(np.diag(g_out_s)) * mev),
-                    g_in_diag_mev=list(np.real(np.diag(g_in_s)) * mev),
-                    g_out_diag_dense_mev=list(np.real(np.diag(g_out_d)) * mev),
-                    g_in_diag_dense_mev=list(np.real(np.diag(g_in_d)) * mev)))
+                    gamma_rel=mxa(gamma_s - gamma_d) / max(mxa(gamma_d), 1e-300),
+                    injection_rel=mxa(injection_s - injection_d) / max(mxa(injection_d), 1e-300),
+                    m_h_rel=mxa(m_h_s - m_h_d) / max(mxa(m_h_d), 1e-300),
+                    gamma_diag_mev=list(np.real(np.diag(gamma_s)) * mev),
+                    injection_diag_mev=list(np.real(np.diag(injection_s)) * mev),
+                    gamma_diag_dense_mev=list(np.real(np.diag(gamma_d)) * mev),
+                    injection_diag_dense_mev=list(np.real(np.diag(injection_d)) * mev)))
             out["B"] = dict(eta_ev=eta * ev, sum_bands=nsum, rows=rows_b,
                             n_invalid=int(np.sum(~good)), note="body only (head None), U = 1")
             del psi, Om, Bq, Dq, good, Rp, Rm
 
-    def rates_at(plan, f_win, band_lo=b_lo, n=nA):
+    def operators_at(plan, f_win, band_lo=b_lo, n=nA):
         eye = np.broadcast_to(np.eye(n, dtype=complex), (nk, n, n)).copy()
         w = dict(b_lo=band_lo, U=eye, e=e_full[:, band_lo:band_lo + n], f=f_win)
         o = PS.window_sigma_c(wfns, poles, w, plan, meta=meta, mesh_xy=mesh, branches=True)
-        g_out, g_in, _ = D.window_branch_rates(o["branch_pair"])
-        return g_out, g_in, o
+        gamma, injection, _ = D.window_branch_operators(o["branch_pair"])
+        return gamma, injection, o
 
-    def rate_summary(g_out, g_in):
+    def operator_summary(gamma, injection):
         herm = lambda g: 0.5 * (g + np.conj(np.swapaxes(g, -1, -2)))
-        d_o, d_i = (np.real(np.einsum("kii->ki", g)) for g in (g_out, g_in))
-        return dict(min_eig_out_mev=float(np.linalg.eigvalsh(herm(g_out)).min() * mev),
-                    min_eig_in_mev=float(np.linalg.eigvalsh(herm(g_in)).min() * mev),
-                    min_eig_total_mev=float(np.linalg.eigvalsh(herm(g_out + g_in)).min() * mev),
-                    out_diag_per_band_mev=[[float(d_o[:, b].min() * mev), float(d_o[:, b].max() * mev)]
+        d_o, d_i = (np.real(np.einsum("kii->ki", g)) for g in (gamma, injection))
+        return dict(min_eig_gamma_mev=float(np.linalg.eigvalsh(herm(gamma)).min() * mev),
+                    min_eig_injection_mev=float(np.linalg.eigvalsh(herm(injection)).min() * mev),
+                    gamma_diag_per_band_mev=[[float(d_o[:, b].min() * mev), float(d_o[:, b].max() * mev)]
                                            for b in range(d_o.shape[1])],
-                    in_diag_per_band_mev=[[float(d_i[:, b].min() * mev), float(d_i[:, b].max() * mev)]
+                    injection_diag_per_band_mev=[[float(d_i[:, b].min() * mev), float(d_i[:, b].max() * mev)]
                                           for b in range(d_i.shape[1])],
                     offdiag_max_mev=float(max(np.max(np.abs(g - np.einsum("kii->ki", g)[..., None]
                                                             * np.eye(g.shape[-1]))) for g in
-                                              (g_out, g_in)) * mev))
+                                              (gamma, injection)) * mev))
 
     def eta_plan(eta_ev):
         import dataclasses
@@ -517,14 +517,14 @@ def main():
 
     if "C" in sections and eq is not None:
         with section("C"):
-            c = dict(eta_ev=out["source"]["eta_ev"], at_eta=rate_summary(eq["g_out"], eq["g_in"]),
+            c = dict(eta_ev=out["source"]["eta_ev"], at_eta=operator_summary(eq["gamma"], eq["injection"]),
                      c_eq_diag=coll["t0"]["c_eq_diag"], c_eq_offdiag=coll["t0"]["c_eq_offdiag"],
                      c_eq_diag_mev=coll["t0"]["c_eq_diag"] * 2 * mev,
                      c_eq_offdiag_mev=coll["t0"]["c_eq_offdiag"] * 2 * mev)
             fw = f_full[:, b_lo:b_hi]
-            g2o, g2i, _ = rates_at(eta_plan(a.eta2), fw)
+            g2o, g2i, _ = operators_at(eta_plan(a.eta2), fw)
             c["eta2_ev"] = a.eta2
-            c["at_eta2"] = rate_summary(g2o[bundle_of], g2i[bundle_of])
+            c["at_eta2"] = operator_summary(g2o[bundle_of], g2i[bundle_of])
             out["C"] = c
             _save()
             runs = {}
@@ -631,13 +631,13 @@ def main():
                             rebuilds=s.get("rebuilds", 0), wall_s=o["wall_s"])
 
             def diffs(a, b):
-                ga, gb = D.window_branch_rates(a["branch_pair"]), D.window_branch_rates(b["branch_pair"])
+                ga, gb = D.window_branch_operators(a["branch_pair"]), D.window_branch_operators(b["branch_pair"])
                 sl = lambda o: o["static_limit"]["sx"] + np.einsum(
                     "ki,ij->kij", o["static_limit"]["head"], np.eye(o["static_limit"]["head"].shape[1]))
                 scale = max(mxa(gb[0]), mxa(gb[1]))
-                return dict(rate_out_mev=mxa(ga[0] - gb[0]) * mev, rate_in_mev=mxa(ga[1] - gb[1]) * mev,
+                return dict(gamma_mev=mxa(ga[0] - gb[0]) * mev, injection_mev=mxa(ga[1] - gb[1]) * mev,
                             rate_rel=max(mxa(ga[0] - gb[0]), mxa(ga[1] - gb[1])) / scale,
-                            s_mev=mxa(ga[2] - gb[2]) * mev, pair_rel=mxa(a["pair"] - b["pair"]) / mxa(b["pair"]),
+                            m_h_mev=mxa(ga[2] - gb[2]) * mev, pair_rel=mxa(a["pair"] - b["pair"]) / mxa(b["pair"]),
                             static_limit_mev=mxa(sl(a) - sl(b)) * mev, max_rate_mev=scale * mev)
 
             ss = {}
@@ -740,22 +740,22 @@ def main():
                             rebuilds=s_.get("rebuilds", 0), wall_s=o["wall_s"])
 
             def diffs(x, y):
-                gx, gy = D.window_branch_rates(x["branch_pair"]), D.window_branch_rates(y["branch_pair"])
+                gx, gy = D.window_branch_operators(x["branch_pair"]), D.window_branch_operators(y["branch_pair"])
                 scale = max(mxa(gy[0]), mxa(gy[1]))
-                return dict(rate_out_mev=mxa(gx[0] - gy[0]) * mev, rate_in_mev=mxa(gx[1] - gy[1]) * mev,
+                return dict(gamma_mev=mxa(gx[0] - gy[0]) * mev, injection_mev=mxa(gx[1] - gy[1]) * mev,
                             rate_rel=max(mxa(gx[0] - gy[0]), mxa(gx[1] - gy[1])) / scale,
-                            s_mev=mxa(gx[2] - gy[2]) * mev,
+                            m_h_mev=mxa(gx[2] - gy[2]) * mev,
                             herm_mev=mxa(herm(gx[2]) - herm(gy[2])) * mev,
                             pair_rel=mxa(x["pair"] - y["pair"]) / mxa(y["pair"]), max_rate_mev=scale * mev)
 
             def dw_effect(x, y):
                 """W(t) (x) vs W0 (y) at the same populations: band-edge rates vs Re Sigma, meV."""
-                gx, gy = D.window_branch_rates(x["branch_pair"]), D.window_branch_rates(y["branch_pair"])
+                gx, gy = D.window_branch_operators(x["branch_pair"]), D.window_branch_operators(y["branch_pair"])
                 return dict(
-                    d_rate_out_diag_mev=mxa(dg(gx[0]) - dg(gy[0])) * mev,
-                    d_rate_in_diag_mev=mxa(dg(gx[1]) - dg(gy[1])) * mev,
-                    rate_out_diag_max_mev=mxa(dg(gy[0])) * mev, rate_in_diag_max_mev=mxa(dg(gy[1])) * mev,
-                    d_rate_out_mev=mxa(gx[0] - gy[0]) * mev, d_rate_in_mev=mxa(gx[1] - gy[1]) * mev,
+                    d_gamma_diag_mev=mxa(dg(gx[0]) - dg(gy[0])) * mev,
+                    d_injection_diag_mev=mxa(dg(gx[1]) - dg(gy[1])) * mev,
+                    gamma_diag_max_mev=mxa(dg(gy[0])) * mev, injection_diag_max_mev=mxa(dg(gy[1])) * mev,
+                    d_gamma_mev=mxa(gx[0] - gy[0]) * mev, d_injection_mev=mxa(gx[1] - gy[1]) * mev,
                     d_re_sigma_mev=mxa(herm(gx[2]) - herm(gy[2])) * mev,
                     d_re_sigma_diag_mev=mxa(dg(herm(gx[2])) - dg(herm(gy[2]))) * mev,
                     re_sigma_diag_max_mev=mxa(dg(herm(gy[2]))) * mev)
@@ -929,15 +929,15 @@ def main():
             fw = f_full[:, w_lo:w_hi]
             ww = dict(bands=[w_lo, w_hi])
             for tag, plan in (("eta", splan), ("eta2", eta_plan(a.eta2))):
-                go, gi, _ = rates_at(plan, fw, band_lo=w_lo, n=nW)
-                ww[tag] = rate_summary(go, gi)
+                go, gi, _ = operators_at(plan, fw, band_lo=w_lo, n=nW)
+                ww[tag] = operator_summary(go, gi)
             # the hot-carrier state: hot_amount moved from hot_from to hot_to at every k
             fh = fw.copy()
             i_from, i_to = a.hot_from - w_lo, a.hot_to - w_lo
             fh[:, i_from] -= a.hot_amount
             fh[:, i_to] += a.hot_amount
-            go, gi, _ = rates_at(splan, fh, band_lo=w_lo, n=nW)
-            ww["hot_rates"] = rate_summary(go, gi)
+            go, gi, _ = operators_at(splan, fh, band_lo=w_lo, n=nW)
+            ww["hot_operators"] = operator_summary(go, gi)
             ww["hot"] = dict(from_band=a.hot_from, to_band=a.hot_to, amount=a.hot_amount)
             _save()
             raw = _td_deck(ref, (w_lo, w_hi), os.path.join(a.out, "td", "wide_probe"), tf_fs=0.1,

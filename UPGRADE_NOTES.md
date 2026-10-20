@@ -5,6 +5,42 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-19 — TD-aGW collision: column-sampled one-sided MGKBA operator
+
+Collision-enabled propagation replaces the arithmetic average of the row- and
+column-shell self-energy tables with the one-sided Markov operator of
+[TD-aGW dynamical §1.5](docs/theory/td_agw_dynamical.md#damping). The particle
+retarded table is sampled at the column energy; the retarded hole table is
+the adjoint of the advanced row table. Their complex principal-value terms
+enter the coherent update once, alongside the held collision coefficients.
+This changes collision results, including off-diagonal dynamics. The defaults
+of `collision_refresh_sweep`, `collision_in_scattering`,
+`collision_rate_intermediates`, `collision_basis` and
+`collision_internal_pairing` are now respectively `active`, `full`, `active`,
+`band` and `vertex`; decks that need an earlier comparison must set
+all of its choices explicitly while the collision is off. Collision-enabled
+propagation hard-refuses populations-only lines, all-band rate intermediates,
+and symmetric internal pairing: after column sampling only the closed active,
+full-ρ vertex construction passes the reciprocal-pole number gate (the synthetic
+residual/flux is 1.39×10⁻⁸, versus 4.74×10⁻² for symmetric). Earlier collision
+measurements below describe the previous arithmetic-average operator and do not
+certify the replacement.
+
+The opt-in `collision_basis = "instantaneous"` path remains the inherited
+carriers-only, one-refresh-lag predictor. It is not the requested converged
+full-density snapshot fixed point between the material Hamiltonian and M_H,
+and is therefore not the new default. The present material kernel is also a
+reference-counterterm Hartree plus screened-exchange model, not literal bare
+HF with a DFT exchange-correlation counterterm.
+
+The equilibrium collision counterterm and the static-W subtraction from the
+Hermitian update have separate roles: the former defines `subtracted`, while
+the latter avoids counting the static interaction already in K δρ twice.
+`collision_screening = "refreshed"` and `"shared_pole"` now refuse at
+`td_collision_keldysh_screening`. Their retained machinery is a
+retarded/population snapshot; it does not implement the joint response/noise
+realization or general nonequilibrium W< required by the new operator.
+
 ## 2026-10-19 — TD-aGW collision: instantaneous basis, vertex pairing, G = L diag(w) R^H (opt-in)
 
 Two `[lorrax]` keys of the full-ρ internal line (`collision_in_scattering = "full"`);

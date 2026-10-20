@@ -11,22 +11,19 @@ driver's own W0, W(i w_p) and pole fit:
 FA  diagonal rho' (an excited population state): window_sigma_c(rho = diag f) ==
     the populations' sweep for the pair, both branches, the static term and the
     static limit                                                        rel <= 1e-12
-FB  G~> and G~< of the full-ρ sweep are Hermitian                         abs == 0
+FB  gamma and injection of the full-ρ sweep are Hermitian               abs == 0
 FD  random Hermitian rho' (spectrum in [0, 1], coherences O(0.3)): both branches
     and the static term == the dense full-ρ reference (hole rho_mn, particle
     (1 - rho)_mn, 1/2 g(e_m) + 1/2 g(e_n); the static term -sum rho_mn <i m| W_s
     |n j>)                                                              rel <= 1e-5
-FC  closed window (active intermediates): sum_k Tr C[rho] / sum_k |Tr G~> rho| for
-    random Hermitian rho, in_scattering full + rate_intermediates active, on the
-    fixture's poles made reciprocal (R_-(q) = R_+(-q)^T, Omega(q) = Omega(-q)^T: the
-    bosonic W^<(q) = W^>(-q)^T that particle conservation needs; the GN fit of this
-    magnet violates it at O(1), which the fitted-pole rows report)
-    (code, quadrature eps 1e-7)                                           <= 1e-6;
-    the dense reference with the symmetric prescription                   <= 1e-12;
-    reported: the dense left-index prescription g(e_m), the code with each key alone
-    (populations + active, full + all) and neither (populations + all)
+RC  the earlier symmetric internal ordering is retained as a red twin.  With
+    the corrected column-sampled external operator it is not conserving even
+    on reciprocal poles (code and dense residual/flux both > 1e-2).  The
+    conserving full-rho vertex gate is IF in test_tdagw_collision_instbasis.py.
+    The fitted-pole and comparison rows remain diagnostic.
 FU  covariance at a unitary U mixing degenerate window states (e_v1 = e_v2,
-    e_c1 = e_c2 per k): U^H G~[rho] U == G~'[U^H rho U] (both rates)     rel <= 1e-10;
+    e_c1 = e_c2 per k): U^H X[rho] U == X'[U^H rho U], X = gamma, injection
+                                                                         rel <= 1e-10;
     the populations' internal line fails it (control variant, > 100 x)
 FW  the wall of an active full-ρ sweep over the populations' one (reported)
 """
@@ -42,7 +39,7 @@ import numpy as np
 
 import test_tdagw_dynsig_sigma as F
 
-GATES = dict(FA=1e-12, FB=0.0, FD=1e-5, FC_code=1e-6, FC_dense=1e-12, FU=1e-10)
+GATES = dict(FA=1e-12, FB=0.0, FD=1e-5, FU=1e-10)
 
 
 def _rel(a, b):
@@ -108,15 +105,19 @@ def _dense_full(psi_g, e_g, M_int, proj, e_proj, poles, eta, branch, rule="sym")
     return S
 
 
-def _width(pair):
-    st = 0.5 * (pair[0] + pair[1])
-    return 1j * (st - np.conj(np.swapaxes(st, -1, -2)))
+def _dense_operators(pair_cond, pair_val, static=0.0):
+    """Independent NumPy one-sided operators from dense branch tables."""
+    dagger = lambda a: np.conj(np.swapaxes(a, -1, -2))
+    rp, rh = pair_cond[1], dagger(pair_val[0])
+    total = rp + rh
+    injection = 1j * rh + dagger(1j * rh)
+    return 1j * (total - dagger(total)), injection, _herm(total + static)
 
 
-def _trace_ratio(g_out, g_in, rho):
-    """sum_k Tr C[rho] / sum_k |Tr G~> rho|, C = -1/2 {G~> + G~<, rho} + G~<."""
-    tr = sum(np.trace(g_in[k]) - np.trace((g_out[k] + g_in[k]) @ rho[k]) for k in range(len(rho)))
-    flux = sum(abs(np.trace(g_out[k] @ rho[k])) for k in range(len(rho)))
+def _trace_ratio(gamma, injection, rho):
+    """Trace residual relative to the particle flux, C = -1/2 {gamma, rho} + injection."""
+    tr = sum(np.trace(injection[k]) - np.trace(gamma[k] @ rho[k]) for k in range(len(rho)))
+    flux = sum(abs(np.trace((gamma[k] - injection[k]) @ rho[k])) for k in range(len(rho)))
     return float(abs(tr) / flux), float(flux)
 
 
@@ -185,10 +186,10 @@ def run_checks(mesh):
             out["wall_s"] = time.perf_counter() - t
             return out
 
-        def rates(out):
-            g_out, g_in = (np.asarray(g) for g in C.rates(out["branch_pair"]["cond"],
-                                                         out["branch_pair"]["val"]))
-            return g_out, g_in
+        def operators(out):
+            gamma, injection, _ = C.branch_operators(out["branch_pair"]["cond"],
+                                                     out["branch_pair"]["val"])
+            return np.asarray(gamma), np.asarray(injection)
 
         # ---- FA: diagonal rho' == populations (an excited population state)
         f_x = np.clip(f[:, B_LO:B_LO + NA] + np.array([-0.06, -0.035, 0.05, 0.045])
@@ -227,16 +228,15 @@ def run_checks(mesh):
                    static=_dense_full(psi, e_g, M_h, proj, e_w, dpo, eta, "static")[0])
         rows["FD_parts"] = [_rel(full["branch_pair"][n], ref[n]) for n in ("cond", "val", "static")]
         rows["FD"] = max(rows["FD_parts"])
-        g_out, g_in = rates(full)
+        gamma, injection = operators(full)
         rows["FB"] = max(float(np.max(np.abs(g - np.conj(np.swapaxes(g, -1, -2)))))
-                         for g in (g_out, g_in))
+                         for g in (gamma, injection))
 
         # ---- FC on the fitted (non-reciprocal) poles: code == dense residual
-        rows["FC_fit_code"] = _trace_ratio(g_out, g_in, rho)[0]
-        rows["FC_fit_dense"] = _trace_ratio(_width(ref["cond"]),
-                                            C.HOLE_BRANCH_SIGN * _width(ref["val"]), rho)[0]
-        gp_out, gp_in = rates(sweep(dict(b_lo=B_LO, U=eye, e=e_w, f=f_r)))
-        rows["FC_fit_populations_active"] = _trace_ratio(gp_out, gp_in, rho)[0]
+        rows["FC_fit_code"] = _trace_ratio(gamma, injection, rho)[0]
+        rows["FC_fit_dense"] = _trace_ratio(*_dense_operators(ref["cond"], ref["val"])[:2], rho)[0]
+        gamma_p, injection_p = operators(sweep(dict(b_lo=B_LO, U=eye, e=e_w, f=f_r)))
+        rows["FC_fit_populations_active"] = _trace_ratio(gamma_p, injection_p, rho)[0]
 
         # ---- the fixture's poles made reciprocal
         neg = lambda a: np.swapaxes(a[q_neg], -1, -2)
@@ -259,31 +259,30 @@ def run_checks(mesh):
         rows["reciprocity_sym_Rm_vs_RpT"] = _rel(Rm_s, neg(Rp_s))
         rows["n_invalid_modes_sym"] = int(np.sum(~g_s))
         full = sweep(win_r)
-        g_out, g_in = rates(full)
+        gamma, injection = operators(full)
         ref = dict(val=_dense_full(psi, e_g, M_h, proj, e_w, dpo, eta, "val"),
                    cond=_dense_full(psi, e_g, M_p, proj, e_w, dpo, eta, "cond"))
         rows["FD_sym_parts"] = [_rel(full["branch_pair"][n], ref[n]) for n in ("cond", "val")]
 
         # ---- FC: the closed-window trace identity (reciprocal poles)
-        rc, flux = _trace_ratio(g_out, g_in, rho)
+        rc, flux = _trace_ratio(gamma, injection, rho)
         rows["FC_code"] = rc
         rows["FC_flux_mev"] = flux * RYD_TO_EV * 1e3
-        gd_out = _width(ref["cond"])
-        gd_in = C.HOLE_BRANCH_SIGN * _width(ref["val"])
-        rows["FC_dense"] = _trace_ratio(gd_out, gd_in, rho)[0]
+        gamma_d, injection_d, _ = _dense_operators(ref["cond"], ref["val"])
+        rows["FC_dense"] = _trace_ratio(gamma_d, injection_d, rho)[0]
         left = dict(val=_dense_full(psi, e_g, M_h, proj, e_w, dpo, eta, "val", rule="left"),
                     cond=_dense_full(psi, e_g, M_p, proj, e_w, dpo, eta, "cond", rule="left"))
-        gl_out, gl_in = _width(left["cond"]), C.HOLE_BRANCH_SIGN * _width(left["val"])
-        rows["FC_dense_left_index"] = _trace_ratio(gl_out, gl_in, rho)[0]
+        gamma_l, injection_l, _ = _dense_operators(left["cond"], left["val"])
+        rows["FC_dense_left_index"] = _trace_ratio(gamma_l, injection_l, rho)[0]
         popr = sweep(dict(b_lo=B_LO, U=eye, e=e_w, f=f_r))
-        gp_out, gp_in = rates(popr)
+        gamma_p, injection_p = operators(popr)
         fro = sweep(dict(b_lo=B_LO, U=eye, e=e_w, f=f_r), internal="frozen")
-        gf_out, gf_in = rates(fro)
-        rows["FC_populations_active"] = _trace_ratio(gp_out, gp_in, rho)[0]
-        rows["FC_full_all"] = _trace_ratio(g_out + gf_out, g_in + gf_in, rho)[0]
-        rows["FC_populations_all"] = _trace_ratio(gp_out + gf_out, gp_in + gf_in, rho)[0]
+        gamma_f, injection_f = operators(fro)
+        rows["FC_populations_active"] = _trace_ratio(gamma_p, injection_p, rho)[0]
+        rows["FC_full_all"] = _trace_ratio(gamma + gamma_f, injection + injection_f, rho)[0]
+        rows["FC_populations_all"] = _trace_ratio(gamma_p + gamma_f, injection_p + injection_f, rho)[0]
         rows["FC_frozen_flux_share"] = float(
-            sum(abs(np.trace(gf_out[k] @ rho[k])) for k in range(nk)) / flux)
+            sum(abs(np.trace((gamma_f[k] - injection_f[k]) @ rho[k])) for k in range(nk)) / flux)
         # the same identity at a near-equilibrium state (coherences 0.05)
         rho_s = np.einsum("ki,ij->kij", f[:, B_LO:B_LO + NA], np.eye(NA)) * 0.9 + 0.05 * _random_rho(
             rng2, nk, NA, coh=1.0)
@@ -292,9 +291,9 @@ def run_checks(mesh):
         rows["FC_small_spectrum"] = [float(lam.min()), float(lam.max())]
         out_s = sweep(dict(b_lo=B_LO, U=eye, e=e_w, f=np.real(np.einsum("kii->ki", rho_s)),
                            rho=rho_s))
-        rows["FC_code_small"] = _trace_ratio(*rates(out_s), rho_s)[0]
+        rows["FC_code_small"] = _trace_ratio(*operators(out_s), rho_s)[0]
         pop_s = sweep(dict(b_lo=B_LO, U=eye, e=e_w, f=np.real(np.einsum("kii->ki", rho_s))))
-        rows["FC_populations_active_small"] = _trace_ratio(*rates(pop_s), rho_s)[0]
+        rows["FC_populations_active_small"] = _trace_ratio(*operators(pop_s), rho_s)[0]
 
         # ---- FU: covariance at a unitary mixing degenerate window states
         e_d = e_w.copy()
@@ -309,11 +308,11 @@ def run_checks(mesh):
         rho_u = Uh @ rho @ Ud
         A = sweep(dict(b_lo=B_LO, U=eye, e=e_d, f=f_r, rho=rho))
         Bq = sweep(dict(b_lo=B_LO, U=Ud, e=e_d, f=np.real(np.einsum("kii->ki", rho_u)), rho=rho_u))
-        ga, gb = rates(A), rates(Bq)
+        ga, gb = operators(A), operators(Bq)
         rows["FU"] = max(_rel(Uh @ ga[i] @ Ud, gb[i]) for i in range(2))
         Ap = sweep(dict(b_lo=B_LO, U=eye, e=e_d, f=f_r))
         Bp = sweep(dict(b_lo=B_LO, U=Ud, e=e_d, f=np.real(np.einsum("kii->ki", rho_u))))
-        gap, gbp = rates(Ap), rates(Bp)
+        gap, gbp = operators(Ap), operators(Bp)
         rows["RU_populations"] = max(_rel(Uh @ gap[i] @ Ud, gbp[i]) for i in range(2))
     return rows
 
@@ -321,6 +320,10 @@ def run_checks(mesh):
 def verdict(rows):
     ok = {g: rows[g] <= tol for g, tol in GATES.items()}
     ok["RU"] = rows["RU_populations"] > 100.0 * GATES["FU"]
+    # Column sampling requires the vertex internal ordering.  This file keeps
+    # the earlier symmetric builder as a lower-level red twin; the vertex
+    # conservation gate is IF in test_tdagw_collision_instbasis.py.
+    ok["RC"] = rows["FC_code"] > 1e-2 and rows["FC_dense"] > 1e-2
     return ok
 
 

@@ -161,6 +161,22 @@ def test_collision_on_a_bundle_parses():
     assert v["lorrax.collision_refresh_fs"] == pytest.approx(500.0 / T_IN_ATTOSEC)
     assert v["lorrax.collision_refresh_df"] == 1e-3
     assert v["lorrax.collision_hermitian"] == "dynamic"
+    assert v["lorrax.collision_refresh_sweep"] == "active"
+    assert v["lorrax.collision_in_scattering"] == "full"
+    assert v["lorrax.collision_rate_intermediates"] == "active"
+    assert v["lorrax.collision_basis"] == "band"
+    assert v["lorrax.collision_internal_pairing"] == "vertex"
+
+
+def test_population_and_symmetric_comparisons_are_not_propagation_modes():
+    assert _refuses(_bundle(collision="raw", collision_in_scattering="populations"),
+                    "td_collision_mgkba_closure")
+    assert _refuses(_bundle(collision="raw", collision_in_scattering="populations",
+                            collision_basis="band", collision_internal_pairing="symmetric"),
+                    "td_collision_mgkba_closure")
+    assert _refuses(_bundle(collision="raw", collision_basis="band",
+                            collision_internal_pairing="symmetric"),
+                    "td_collision_mgkba_closure")
 
 
 def test_collision_refuses_another_source_and_a_restart():
@@ -175,21 +191,16 @@ def test_collision_refuses_another_source_and_a_restart():
 def test_collision_screening_and_frozen_bands():
     on = dict(collision="subtracted", collision_screening="refreshed",
               collision_refresh_sweep="active")
-    v = parse_td_deck(_bundle(**on, collision_frozen_bands=[4, 8])).values
-    assert v["lorrax.collision_screening"] == "refreshed"
-    assert v["lorrax.collision_frozen_bands"] == [4, 8]
+    assert _refuses(_bundle(**on, collision_frozen_bands=[4, 8]),
+                    "td_collision_keldysh_screening")
     assert parse_td_deck(_bundle(collision="subtracted")).values["lorrax.collision_screening"] == "frozen"
-    # the truncation is of the frozen part's change under W(t): refreshed screening, split sweep
+    # The column-sampled operator admits only the equilibrium W branches until the
+    # independent nonequilibrium W< and joint response/noise bank exist.
+    assert _refuses(_bundle(**on), "td_collision_keldysh_screening")
     assert _refuses(_bundle(collision="subtracted", collision_frozen_bands=[4, 8]), "td_collision")
-    assert _refuses(_bundle(collision="subtracted", collision_screening="refreshed",
-                            collision_frozen_bands=[4, 8]), "td_collision")
-    assert _refuses(_bundle(**on, collision_frozen_bands=[4, -1]), "td_collision")
     from tdagw.td_config import inactive_keys
-    assert parse_td_deck(_bundle(**on)).values["lorrax.collision_screening_gamma_ev"] == 0.001
     frozen = parse_td_deck(_bundle(collision="subtracted", collision_screening_gamma_ev=0.01))
     assert "lorrax.collision_screening_gamma_ev" in inactive_keys(frozen)
-    assert "lorrax.collision_screening_gamma_ev" not in inactive_keys(
-        parse_td_deck(_bundle(**on, collision_screening_gamma_ev=0.01)))
 
 
 def test_collision_keys_inactive_when_off_and_fingerprint():

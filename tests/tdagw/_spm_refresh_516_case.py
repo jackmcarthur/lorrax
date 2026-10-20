@@ -267,14 +267,14 @@ def main():
                     K=[[int(Ka.min()), int(Ka.max())], [int(Kb.min()), int(Kb.max())]],
                     paths=[path_a, path_b], seconds=time.perf_counter() - t1)
 
-    def band_rates(g_out, g_in):
-        """Per band: k-mean, k-min, k-max of the diagonal rates (meV), TD rows."""
-        d_o, d_i = (np.real(np.einsum("kii->ki", g)) * mev for g in (g_out, g_in))
+    def band_operators(gamma, injection):
+        """Per band: k-mean, k-min, k-max of gamma and injection (meV), TD rows."""
+        d_o, d_i = (np.real(np.einsum("kii->ki", g)) * mev for g in (gamma, injection))
         herm = lambda g: 0.5 * (g + np.conj(np.swapaxes(g, -1, -2)))
-        return dict(out_mean=d_o.mean(0).tolist(), out_min=d_o.min(0).tolist(),
-                    out_max=d_o.max(0).tolist(), in_mean=d_i.mean(0).tolist(),
-                    in_min=d_i.min(0).tolist(), in_max=d_i.max(0).tolist(),
-                    min_eig_total_mev=float(np.linalg.eigvalsh(herm(g_out + g_in)).min() * mev))
+        return dict(gamma_mean=d_o.mean(0).tolist(), gamma_min=d_o.min(0).tolist(),
+                    gamma_max=d_o.max(0).tolist(), injection_mean=d_i.mean(0).tolist(),
+                    injection_min=d_i.min(0).tolist(), injection_max=d_i.max(0).tolist(),
+                    min_eig_gamma_mev=float(np.linalg.eigvalsh(herm(gamma)).min() * mev))
 
     def eta_plan(plan, eta_ev):
         import dataclasses
@@ -288,8 +288,8 @@ def main():
         t1 = time.perf_counter()
         o = PS.window_sigma_c(source["wfns"], at, w, eta_plan(source["plan"], eta_ev),
                               meta=source["meta"], mesh_xy=mesh, branches=True)
-        go, gi, _ = D.window_branch_rates(o["branch_pair"])
-        return dict(band_rates(go[bundle_of], gi[bundle_of]), eta_ev=float(eta_ev),
+        gamma, injection, _ = D.window_branch_operators(o["branch_pair"])
+        return dict(band_operators(gamma[bundle_of], injection[bundle_of]), eta_ev=float(eta_ev),
                     wall_s=time.perf_counter() - t1, tau=int(o["sweep"]["distinct_tau"]))
 
     def census_out(c, per_q=False):
@@ -314,7 +314,7 @@ def main():
         """Gamma(eta) = a + b eta per band (least squares over the eta list): a = electronic."""
         etas = np.asarray([r["eta_ev"] for r in rs])
         res = {}
-        for key in ("out_mean", "in_mean"):
+        for key in ("gamma_mean", "injection_mean"):
             G = np.asarray([r[key] for r in rs])            # (n_eta, nA)
             A = np.stack([np.ones_like(etas), etas], 1)
             coef, *_ = np.linalg.lstsq(A, G, rcond=None)
@@ -349,7 +349,7 @@ def main():
                     wall_s=time.perf_counter() - t1, line=t0r.get("line", ""),
                     receipt={k: v for k, v in t0r.items() if k not in ("line", "screen_eq")},
                     refit_eq=refit_out(sc, per_q=True) if sc else None,
-                    rates_eq=band_rates(colls[V]["eq"]["g_out"], colls[V]["eq"]["g_in"]),
+                    operators_eq=band_operators(colls[V]["eq"]["gamma"], colls[V]["eq"]["injection"]),
                     memory=mem())
                 if V.endswith("B"):
                     out["SP0"][V]["w_sites_vs_run"] = w_sites_cmp(
@@ -380,11 +380,11 @@ def main():
         r = dict(refit=refit_out(rec, per_q=per_q))
         t1 = time.perf_counter()
         tabs = cv["sweep"](f_b, at=at)
-        r["rates_W_state"] = band_rates(tabs["g_out"], tabs["g_in"])
+        r["operators_W_state"] = band_operators(tabs["gamma"], tabs["injection"])
         r["sweep_W_state_s"] = time.perf_counter() - t1
         if at_eq_too:
             tabs0 = cv["sweep"](f_b, at=None)
-            r["rates_W_eq"] = band_rates(tabs0["g_out"], tabs0["g_in"])
+            r["operators_W_eq"] = band_operators(tabs0["gamma"], tabs0["injection"])
         r["eta"] = [eta_rates(src, at, f_b, e_, bo) for e_ in etas]
         if len(etas) > 1:
             r["eta_split"] = eta_split(r["eta"])

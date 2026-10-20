@@ -8,8 +8,10 @@ GW components it reuses, the cost per refresh measured from the GW stage
 walls, and the refactors it needs. The static-screening member is implemented
 (`tdagw.dynsig`). The GN-PPM member's two GW stages are callable per refresh
 from arrays (`gw.ppm_sigma.screening_update`, `window_sigma_c`; §9 items 4–5)
-and reproduce a GN-PPM run at t = 0 (§6.1); its propagation wiring is not
-built. The shared-pole member is designed here. The
+and reproduce a GN-PPM run at t = 0 (§6.1). The collision wiring and earlier
+population-based shared-pole refreshes are described below; the corrected
+column-sampled MGKBA split is specified in §1.5. Full-matrix nonequilibrium
+$W^<$ and its joint pole bank remain unimplemented. The
 equation of motion, integrators and layout are owned by
 [TD-aGW propagation](td_agw_propagation.md); the frozen-W kernel by
 [TD-aGW interaction](td_agw.md). Equations in Ry unless stated.
@@ -116,9 +118,10 @@ instantaneous basis. The scheme uses it in two ways:
   $G^<(t,t-s)=ie^{-iHs}\rho$ or $i\rho e^{-iHs}$, gives
   $G(0^-)=\rho$ exactly, so the static screened exchange
   $\Sigma^{SX}=-\rho\,W$ keeps every coherence. For a dynamical $W$ the
-  correlation part uses the symmetrized GKBA,
+  earlier correlation construction used the symmetrized GKBA,
   $g_{ij}(\tau)=\tfrac12(e^{-e_i\tau}+e^{-e_j\tau})\,\tilde\rho_{ij}$, a
-  coherence entering at both of its energies (designed, §3.2).
+  coherence entering at both of its energies. The corrected collision uses
+  the ordered MGKBA line and column-energy sampling of §1.5 instead.
 
 ### 1.2 Frozen and active Green functions {#split}
 
@@ -185,6 +188,15 @@ kernel limit).
 
 ### 1.4 W and the self-energy {#w}
 
+**Current collision admission.** The column-sampled MGKBA entry in
+`tdagw.dynsig.window_collision` accepts `collision_screening = frozen` only.
+Both `refreshed` and `shared_pole` refuse with
+`GATE dynsig_collision_keldysh_screening`: their population-based retarded
+refits do not supply the required nonequilibrium lesser interaction.
+The refit machinery below is retained for development and its earlier
+arithmetic-operator benchmarks; it is not runnable through the collision
+entry until the [joint response/noise gates](#keldysh-screening) are met.
+
 $\chi_0^{ff}$ is folded once into the run's own $W_0$ at each support $z_s$:
 
 $$
@@ -210,8 +222,9 @@ $$
 $\mathcal W$ being the BSE W-term (`bse_stack_matvec.make_w_term`) on the
 full band set; $K\delta\rho$ is the TD model unchanged.
 
-**GN-PPM member** (stages built, §9 items 4–5; not wired into the
-propagator). Two supports $0$ and $i\omega_p$, Eq. (6) at
+**GN-PPM refreshed-screening machinery** (stages built, §9 items 4–5;
+`collision_screening = refreshed` currently refused). Two supports $0$ and
+$i\omega_p$, Eq. (6) at
 each; the per-element pole fit of `ppm_sigma.fit_ppm` (ordered, since the
 magnet and a helicity drive break time reversal: conduction branches take
 $R_+=B+D$, valence branches $R_-=B-D$; modes the fit marks invalid enter as
@@ -221,8 +234,10 @@ coherences, §1.1); the operator at the instantaneous energies, Eq. (8) of §1.5
 (no Hermitian projection; [on-shell Σ](sigma-on-shell.md) for the
 evaluation), rotated back with $U$.
 
-**Shared-pole member** (`collision_screening = shared_pole`, implemented for the
-collision term, §1.5). $W^c(q,z)=\sum_j b_j(q)b_j(q)^\dagger/(z^2-\Omega_j^2)$
+**Shared-pole refit machinery** (`collision_screening = shared_pole`, currently
+refused by the collision entry). The retained population-based implementation
+and earlier arithmetic-operator results use
+$W^c(q,z)=\sum_j b_j(q)b_j(q)^\dagger/(z^2-\Omega_j^2)$
 with poles shared per $q$ (the even store; the ordered store pairs $q$ with
 $-q$). A refresh is a **full refit**: the GW run's own W stage
 (`gw.shared_pole_screening.screen_shared_poles`: response bank, moments,
@@ -289,82 +304,119 @@ once carriers exist (§4).
 
 ### 1.5 The on-shell collision term {#damping}
 
-The dynamical members keep the anti-Hermitian part of the on-shell average and
-add its in-scattering partner. The branches of the Σ sweep split
-$\Sigma^R(\omega)$ into a particle part $\Sigma^R_p$ (weight $1-f_n$; the cond
-branch of `_population_branches`) and a hole part $\Sigma^R_h$ (weight $f_n$;
-the val branch). A time-ordered hole branch is the adjoint of the retarded
-one. The anti-Hermitian parts are the out- and in-scattering rates,
+The corrected frozen-Hamiltonian Markov GKBA (MGKBA) prescription samples a
+retarded self-energy on the **column energy**. It replaces the arithmetic
+average of two on-shell tables as the collision definition. At each refresh,
+$H_s=U E U^\dagger$, $\rho'=U^\dagger\rho U$ and, for $\tau>0$,
 
 $$
-\Gamma^>(\omega)=i\big[\Sigma^R_p-\Sigma^{R\dagger}_p\big](\omega)=i\Sigma^>(\omega),\qquad
-\Gamma^<(\omega)=i\big[\Sigma^R_h-\Sigma^{R\dagger}_h\big](\omega)=-i\Sigma^<(\omega),
+g^<(\tau)=i\Psi'\rho'e^{-iE\tau}\Psi'^\dagger,\qquad
+g^>(\tau)=-i\Psi'(1-\rho')e^{-iE\tau}\Psi'^\dagger.
 $$
 
-both positive semidefinite, with $\Gamma=\Gamma^>+\Gamma^<=i(\Sigma^R-\Sigma^A)$.
-The on-shell average of any of them is $\tilde X_{ij}=\tfrac12[X_{ij}(e_i)+X_{ij}(e_j)]$.
-The Markov limit of the collision integral with quasiparticle propagators
-(GKBA; Langreth form $\Sigma^RG^<+\Sigma^<G^A$ and its adjoint), with the
-energies of both indices entering (owner's prescription, 2026-10-17), is
+The ordering follows by putting the free evolution of $\rho(t-\tau)$ into
+GKBA; it retains the full matrix $\rho'$. With
+$\bar\Sigma^\gtrless(z)=\int_0^\infty d\tau\,e^{iz\tau}\Sigma^\gtrless(\tau)$,
+define $A_{{\rm in},ab}=-i\bar\Sigma^<_{ab}(E_b+i\eta)$ and
+$A_{{\rm out},ab}=i\bar\Sigma^>_{ab}(E_b+i\eta)$. For the frozen equilibrium
+$W$ branch executor, its time-ordered hole table must first become retarded:
 
 $$
-\dot\rho=-i\big(\tilde H\rho-\rho\tilde H^\dagger\big)+\tilde\Gamma^<
-=-i[\tilde H^{\rm h},\rho]-\tfrac12\{\tilde\Gamma^>,\rho\}+\tfrac12\{\tilde\Gamma^<,1-\rho\}, \tag{8}
+R_p=\mathrm{cond}[1],\qquad R_h=\mathrm{val}[0]^\dagger,\qquad
+M=R_p+R_h+S_{\rm static},\qquad A_{\rm in}=iR_h,
 $$
 
-where $\tilde H=H+\tilde\Sigma$ and $\tilde\Sigma=\tfrac12[\Sigma^R(e_i)+\Sigma^R(e_j)]$.
-The anti-Hermitian part of $\tilde\Sigma$ is the total width
-$-\tfrac i2\tilde\Gamma$, and the $\Sigma^<G^A$ piece is the source
-$+\tilde\Gamma^<$. Occupied weight scatters out at $\Gamma^>$ and empty
-weight is filled at $\Gamma^<$, Pauli-blocked. The principal-value parts of
-the half-range transforms add up to the Hermitian part of $\Sigma^R$ and
-nothing else. In the code's terms,
-$\tilde\Gamma^{\gtrless}=i(\tilde\Sigma_{p/h}-\tilde\Sigma_{p/h}^\dagger)$ with
-$\tilde\Sigma_{p/h}=\tfrac12(T_1+T_2)$, $T_1=\Sigma_{ij}(e_i)$ and
-$T_2=\Sigma_{ij}(e_j)$ being `window_sigma_c`'s two on-shell tables of the
-branch.
+where $S_{\rm static}$ is the separately Hermitian static coherent term, when
+present. Slot 1 is the column-energy particle table; adjointing slot 0 of the
+hole table reverses its time ordering and supplies its column-energy table.
+Do not adjoint slot 1 or average slots before this conversion. The resulting
+split, rotated back with $U$, is
 
-**Equilibrium subtraction.** The propagator carries $C[\rho]-C[\rho^{\rm eq}]$,
-where $C[\rho]=-\tfrac12\{\tilde\Gamma[\rho],\rho\}+\tilde\Gamma^<[\rho]$ is the
-dissipative part of Eq. (8) at the full rates. Then $\rho^{\rm eq}$ is a fixed
-point exactly, and the deviation $x=\rho-\rho^{\rm eq}$ is damped by the full
-$\tilde\Gamma[\rho]\ge0$: no negative width, unlike a difference of rates.
-For a gapped $T=0$ state the diagonal of $C[\rho^{\rm eq}]$ vanishes up to
-the regularization tails. Its off-diagonal (occupied–empty) part comes from
-the widths of the correlated ground state, and the subtraction removes both.
+$$
+\Gamma=i\big[(R_p+R_h)-(R_p+R_h)^\dagger\big],\qquad
+D=A_{\rm in}+A_{\rm in}^\dagger,\qquad
+C_{\rm raw}=-i[\operatorname{Herm}M,\rho]
+-\tfrac12\{\Gamma,\rho\}+D. \tag{8}
+$$
 
-* **Particle number.** $\mathrm{Tr}\,\rho$ changes only through scattering
-  partners outside the window and through the asymmetry of the ordered PPM
-  residues ($R_+$ on particle branches, $R_-$ on hole branches). This is
-  measured, not assumed.
-* **Linear response.** The $O(E)$ coherences decay at
-  $\tfrac12(\tilde\Gamma_{ii}+\tilde\Gamma_{jj})$ of equilibrium: the BSE
-  with quasiparticle widths. At the band edges these widths are the
-  regularization tails. The static-$W$ limit is unchanged, $\Sigma$ being
-  static and Hermitian there.
+Without the separately coherent static term this equals
+$A_{\rm in}(1-\rho)+(1-\rho)A_{\rm in}^\dagger
+-A_{\rm out}\rho-\rho A_{\rm out}^\dagger$, since
+$A_{\rm in}+A_{\rm out}=i(R_p+R_h)$. Moving
+$\operatorname{Herm}M$ into the coherent Hamiltonian removes its commutator
+from the collision. The static screened-exchange response already present in
+$K\delta\rho$ must also be removed from the added coherent correction, using
+the same full density matrix and equilibrium $W_0$. A time-ordered total or
+the Hermitian part of an arithmetic on-shell average is not this $M$.
+
+**Optional counterterm.** `raw` uses $C_{\rm diss}[\rho]=
+-\tfrac12\{\Gamma[\rho],\rho\}+D[\rho]$ without subtraction.
+`subtracted` adds the counterterm $-C_{\rm diss}[\rho^{\rm eq}]$ to make the
+reference state stationary for the chosen frozen coefficients. This is an
+additional approximation, not a Keldysh identity or a positivity argument.
+With finite $\eta$, sharp occupations need not obey exact detailed balance;
+raw equilibrium residuals and their $\eta$ convergence must be measured.
+Recomputing the counterterm on a nonequilibrium $W(t)$ can remove physical
+excitation by its lesser component, so the existing `rebase` option is not a
+derivation of a full nonequilibrium collision operator.
+
+* **Particle number.** Matching active internal and external state spaces,
+  reciprocal vertices, bosonic endpoint relations and common quadrature are
+  required for the self-consistent trace cancellation. Window leakage and
+  nonreciprocal PPM fits must be measured. Even if the freshly evaluated
+  $\sum_k\operatorname{Tr}C[\rho_*]$ vanishes, holding $D[\rho_*]$ and
+  $\Gamma[\rho_*]$ gives
+  $\sum_k\operatorname{Tr}C_{\rm held}[\rho]=
+  \sum_k\operatorname{Tr}(D[\rho_*]-\Gamma[\rho_*]\rho)$, which generally
+  changes as $\rho$ evolves. Refresh residual and trajectory number drift are
+  separate diagnostics; cadence convergence is required.
+* **Positivity.** For fixed held coefficients write the absolute-state flow as
+  $\dot\rho=-\tfrac12\{\Gamma,\rho\}+D_{\rm eff}$, where
+  $D_{\rm eff}=D$ for `raw` and includes the explicit equilibrium counterterm
+  for `subtracted`. The full Pauli interval is invariant for every initial
+  state iff $D_{\rm eff}\succeq0$ and
+  $\Gamma-D_{\rm eff}\succeq0$. At a state-dependent boundary only their
+  restrictions to $\ker\rho$ and $\ker(1-\rho)$, respectively, are required.
+  Nonsecular column sampling guarantees neither inequality, even for positive
+  spectral residues. Refreshes therefore report the minimum eigenvalues of
+  both boundary matrices and of $\rho$; no coefficient or density is clipped.
+  A future guaranteed closure must construct positive channel Gramians and
+  paired destination-blocked gain/loss terms before summing channels. That can
+  retain off-diagonal channels and exact instantaneous number cancellation,
+  but it is a different closure, not a repair of Eq. (8). Negative dissipative
+  substeps in the cfm4 triple jump would still prevent a guarantee for the
+  composed numerical flow; a guaranteed mode needs forward dissipative steps.
+* **Linear response.** Off-diagonal rates and the variation of $D$ couple
+  coherences and populations; a scalar sum of two quasiparticle widths is
+  valid only after further diagonal restrictions. The static-$W$ limit has
+  no dynamical width; its coherent contribution must obey the double-counting
+  subtraction above.
 * **GN-PPM.** With real pole energies the rates are sums of broadened
   $\delta$ functions at $e_n\pm\Omega$; on a 30×30 mesh they depend on the
   regularization width. The shared-pole member gives smoother rates.
-* **Integrator.** $\tilde\Gamma$ and the source
-  $S=-\tfrac12\{\tilde\Gamma,\rho^{\rm eq}\}+\tilde\Gamma^<-C[\rho^{\rm eq}]$
+* **Integrator.** $\Gamma$ and the source
+  $S=-\tfrac12\{\Gamma,\rho^{\rm eq}\}+D-C_{\rm diss}[\rho^{\rm eq}]$
   are held between refreshes (§7.1), like $\Delta\Sigma^{\rm dyn}$. The
-  dissipative flow $\dot x=-\tfrac12\{\tilde\Gamma,x\}+S$ is then affine and is
-  solved exactly in the eigenbasis of $\tilde\Gamma$,
+  last term is omitted for `raw`. The dissipative flow
+  $\dot x=-\tfrac12\{\Gamma,x\}+S$ is then affine and is
+  solved exactly in the eigenbasis of $\Gamma$,
   $x'_{ab}(\tau)=e^{-(\gamma_a+\gamma_b)\tau/2}x'_{ab}(0)+\tau\,\varphi_1\big((\gamma_a+\gamma_b)\tau/2\big)S'_{ab}$
   with $\varphi_1(z)=(1-e^{-z})/z$. It is composed with the commutator flow
   by the triple jump, as the $\Gamma$ remainder is now, and is $k$-local: two
   $n_A\times n_A$ products per $k$ and application.
-* **Code.** `window_sigma_c` returns both branches' pair tables from one τ
-  sweep and the complex $U\tilde\Sigma U^\dagger$, not its Hermitian part.
+* **Code seam.** `window_sigma_c` supplies the branch pair tables. The collision
+  consumer must construct Eq. (8) from the specified slots; its total
+  time-ordered `onshell` table is not the retarded coherent operator.
 
-**As implemented (GN-PPM member, W frozen at the run's poles).** The path is
+**Branch executor and earlier benchmarks.** The wiring path is
 `window_sigma_c(branches=True)` → `tdagw.collision` (rates, $C[\rho]$, the
 held flow, the Hermitian update) → `tdagw.propagate.collision_program` (one
 jitted `shard_map`: the dissipator, $C[\rho^{\rm eq}]$, the trace split) →
 `ops.collision`, refreshed by `run_propagation`'s chunk-end hook
 (`tdagw.dynsig.window_collision`); deck keys `[lorrax] collision*`
-([input reference](../input_reference.md#td-agw)). Where it differs from the
-text above:
+([input reference](../input_reference.md#td-agw)). The historical measurements
+below used arithmetic pair averaging. They establish executor and cost
+baselines, not validation of the corrected column-sampled Eq. (8):
 
 * **One sweep, branches kept.** `gw.mpa.sigma._integrate_sigma_batches(keep_branches=True)`
   folds each window into its branch's accumulator (cond, val) instead of one;
@@ -375,29 +427,29 @@ text above:
   is a third, Hermitian table. `window_sigma_c` now returns `onshell`
   ($U\tilde\Sigma U^\dagger$, complex) in place of the Hermitian `static`, and
   slices the window blocks on the device.
-* **Hole sign.** The sweep's hole branch is time ordered ($E-\epsilon+\Omega-i\eta$),
-  so the code takes $\tilde\Gamma^<=-i(\tilde\Sigma_h-\tilde\Sigma_h^\dagger)$
-  (`tdagw.collision.HOLE_BRANCH_SIGN`), equal to the retarded form above because
-  both GN-PPM residues are Hermitian ([GN-PPM §3](gn-ppm-nonhermitian.md)); the
-  synthetic dense reference pins it (`tests/test_tdagw_dynsig_sigma.py` G7, twin R5).
-* **Positivity is measured, not assumed.** The on-shell average of the
-  off-diagonal pairs and residues that are Hermitian but not positive make
-  $\tilde\Gamma^>$, $\tilde\Gamma^<$ indefinite in general; each refresh logs the
-  smallest eigenvalue of $\tilde\Gamma$, and the flow is exact for either sign.
+* **Hole conversion.** The sweep's hole branch is time ordered
+  ($E-\epsilon+\Omega-i\eta$). Its sign convention is pinned by
+  `tests/test_tdagw_dynsig_sigma.py` G7, twin R5. For the column-sampled
+  collision the required conversion is the adjoint of slot 0, as above;
+  changing the sign of an averaged hole width alone is insufficient.
+* **Positivity is measured, not assumed.** Each refresh must report the
+  smallest eigenvalues of $\Gamma$, $D$, and the propagated density bounds.
+  Exact solution of a held affine flow does not make it positive.
 * **The held Hermitian part.** $K\delta\rho$ already carries the static screened
   exchange of the populations, $-W^c(0)\,\delta f$, which is the static-$W$
   limit of the GN-PPM population response. The default
   (`collision_hermitian = dynamic`) therefore holds
-  $\mathrm{Herm}\,\tilde\Sigma[\rho]-\mathrm{Herm}\,\tilde\Sigma[\rho^{\rm eq}]$
+  $\operatorname{Herm}M[\rho]-\operatorname{Herm}M[\rho^{\rm eq}]$
   minus the same change of that static limit (`window_sigma_c(static_limit=True)`:
   the window block of $-\langle G_{\rm occ}W^c(0)\rangle$ on every mode plus the
   head's static limit), the correction that vanishes as the pole energies go to
   infinity (§2). `full` is the literal difference (it counts the static part
   twice); `none` drops it.
 * **Explicit methods.** dp54, rk4 and etdrk4 carry the generator
-  $-\tfrac12\{\tilde\Gamma,x\}+S$ in the right-hand side; magnus2 and cfm4 apply
+  $-\tfrac12\{\Gamma,x\}+S$ in the right-hand side; magnus2 and cfm4 apply
   the exact flow in the remainder slot (Strang, triple jump for cfm4), on the
-  Schrödinger-picture $\Delta\rho$, so cfm4 stays fourth order.
+  Schrödinger-picture $\Delta\rho$. Fourth order between refreshes does not
+  establish fourth-order convergence of the refreshed nonlinear problem.
 * **Refresh.** At a chunk end, by cadence (`collision_refresh_fs`) and/or
   $\max|f-f_{\rm last}|$ (`collision_refresh_df`): one window sweep per trial at
   $f=\mathrm{diag}\,\rho$ (dress none: $U=1$, $e=\epsilon^G$, the coherences not in
@@ -470,7 +522,8 @@ middle bracket. Measured (516, P4): 2v2c active 44 τ, 0.95 s per refresh (88 τ
 tolerance (rates 2.1×10⁻³ of their maximum, pair 5×10⁻⁵ relative); along the
 5×10⁸ V/m drive every refresh was checked against a full sweep at the same ρ.
 
-**Refreshed screening (`collision_screening = refreshed`, §7.1).** Each refresh
+**Earlier refreshed-screening baseline (`collision_screening = refreshed`,
+currently refused; §7.1).** In the retained machinery, each refresh
 re-screens $W$ at both GN-PPM supports from the window populations,
 $W(z_s,t)=[1-W_0(z_s)\delta\chi_0(z_s,t)]^{-1}W_0(z_s)$, $z_s\in\{0,i\omega_p\}$
 (`gw.ppm_sigma.screening_update` on the run's own two W samples and fit plan,
@@ -501,12 +554,13 @@ run's $\chi_0$ rebuilt from the split at both supports gives its $W$ to
 
 Measured on the 516 2v2c drives (8 fs, cfm4 25 as, refresh by cadence and
 $\max|\delta f|\ge10^{-3}$; $E_g$ = 3.37 eV, the 07 arm's QP gap):
-* **The equilibrium subtraction must follow $W$.** With $C[\rho^{\rm eq}]$ at the
+* **Counterterm sensitivity in the earlier population model.** With $C[\rho^{\rm eq}]$ at the
   t0 rates the final carrier density rises by 43 % at 5×10⁸ V/m and 58 % at
   3×10⁹ V/m against frozen $W$; with $C[\rho^{\rm eq}]$ at the rates of
   $\rho^{\rm eq}$ on $W(t)$ (`rebase=True`, +2.1 s per refresh) by 0.2 % and 19 %.
-  The difference is the regularization tails of $C[\rho^{\rm eq}]$ changing with
-  $W$, not scattering.
+  These runs attributed the difference to regularization tails changing with
+  $W$. This does not justify rebasing a future physical nonequilibrium $W^<$;
+  the excitation it induces at $\rho^{\rm eq}$ need not be a tail.
 * **$\delta W$ moves Re Σ more than the band-edge rates.** At a 5 % carrier
   transfer (all $k$) Re Σ of the window moves by 594 meV (17.7 % of $E_g$) and the
   band-edge rates by 37–39 meV; along the 3×10⁹ V/m drive the held
@@ -526,7 +580,9 @@ $\max|\delta f|\ge10^{-3}$; $E_g$ = 3.37 eV, the 07 arm's QP gap):
 
 **Full-ρ in-scattering and active rate intermediates (2026-10-19, opt-in).**
 Two deck keys change the rates of the split refresh (`collision_refresh_sweep =
-active`); both default to the incumbent.
+active`). The arithmetic-pair construction and measurements in this paragraph
+are an earlier comparison prescription, not the column-sampled MGKBA
+definition in Eq. (8).
 
 * `collision_in_scattering = full`. The internal line of the active part is the
   window's whole density matrix in the instantaneous basis, $\rho'=U^\dagger\rho U$
@@ -536,25 +592,21 @@ active`); both default to the incumbent.
   G_{\rm int}=\Psi'\,\tfrac12\{g(\epsilon),M\}\,\Psi'^\dagger,\qquad
   M=\rho'\ \text{(hole)},\ 1-\rho'\ \text{(particle)}, \tag{8a}
   $$
-  i.e. $\tfrac12[g(\epsilon_m)+g(\epsilon_n)]$ for $M_{mn}$ (owner's ruling). It is
+  i.e. $\tfrac12[g(\epsilon_m)+g(\epsilon_n)]$ for $M_{mn}$. It is
   contracted in the Σ sweep as $G=L\,\mathrm{diag}(w)\,R^\dagger$ on the panels $\Psi'$ and
   $\Psi'\rho'$ (Eq. 8c below; the $2n_A$ pseudo-bands $\Psi'(1\pm R)$ of the first version
   gave the same tables to 9×10⁻¹⁶), and the occupied projector of the static terms (the
   static limit subtracted from ΔΣ^h) is $\Psi'\rho'\Psi'^\dagger$. At a diagonal $\rho'$ it is
   the populations' sweep to rounding. The natural-orbital route (rotating the carrier to
   the eigenvectors of $\rho'$) is not used: it has no energy for the internal line.
-* `collision_rate_intermediates = active`. $\tilde\Gamma^>$ and $\tilde\Gamma^<$
-  take the window's own intermediate states only; the frozen part enters
-  $\tilde\Sigma$, the Hermitian part (ΔΣ^h, and under refreshed $W$ its change),
-  only. Frozen populations never update, so their η-tail transitions into the
-  window are a particle source or sink.
-* **Particle number.** With both keys the window is closed and
-  $\sum_k\mathrm{Tr}\,C[\rho]=0$ for any Hermitian $\rho$ when $W^<(q)=W^>(-q)^{\rm T}$
-  (pole form: $R_-(q)=R_+(-q)^{\rm T}$, $\Omega(q)=\Omega(-q)^{\rm T}$): the
-  in-scattering of $k$ from $k-q$ and the out-scattering of $k-q$ into $k$ carry
-  the same symmetric energy factor $\tfrac14\sum_{x\in\{i,j\},y\in\{m,n\}}
-  L(e_x-\epsilon_y+\Omega)$. A left-index prescription $g(\epsilon_m)$ breaks it.
-  CPU gates (`tests/test_tdagw_collision_fullrho.py`, GN-PPM synthetic magnet, 2v2c
+* `collision_rate_intermediates = active` takes the window's own intermediate
+  states in $\Gamma$ and $D$; frozen intermediate bands enter the coherent
+  part only. Frozen populations never update, so including their dissipative
+  transitions can make the window a particle source or sink.
+* **Earlier trace benchmark.** The symmetric arithmetic-pair reference
+  cancels its in/out traces on reciprocal synthetic poles. This is not proof
+  of the corrected column split or its held propagation. CPU measurements
+  (`tests/test_tdagw_collision_fullrho.py`, GN-PPM synthetic magnet, 2v2c
   window, random Hermitian ρ with spectrum in [0, 1]): diagonal ρ == populations
   to 2.8×10⁻¹⁶; both branches == the dense full-ρ reference to 1.1×10⁻⁸;
   covariance $U^\dagger\tilde\Gamma[\rho]U=\tilde\Gamma'[U^\dagger\rho U]$ at a unitary
@@ -583,6 +635,16 @@ slow mean-field part, $K[P]$ plus the held ΔΣ^h. The drive $E(t)\cdot r$ and t
 they oscillate near 2 eV, faster than the memory time $\hbar/\eta$. $E$ serves the external
 (on-shell) energies and the internal propagation, $\rho'=U^\dagger\rho U$ is the internal line,
 and the rates are rotated back, $U\tilde\Gamma' U^\dagger$. At $\rho^{\rm eq}$, $U=1$ and $E=e$.
+This existing option is a carriers-only inner fixed point with the previously
+held $\Delta\Sigma^h$; it is a lagged predictor, not the full outer
+$H^s\leftrightarrow M_H$ snapshot fixed point. It projects the mean-field input
+onto $U\,\mathrm{diag}(f-f^{\rm eq})U^\dagger$ and installs the new $M_H$ only
+after the sweep. It remains an explicit experimental option, while `band` is
+the default. A QSGW-like mode must retain the full current density matrix,
+iterate the coherent self-energy and eigenpairs to a declared residual, and
+use one common converged $(U,E)$ for polarization, internal phases and
+external column sampling. The current reference kernel is Hartree plus
+screened exchange, not literal bare HF.
 Frozen bands keep ψ and their 0/1 occupation and sit at $\epsilon^G(k)+\Delta_{\rm edge}(k)$,
 $\Delta_{\rm edge}=e-\epsilon^G$ of the window's edge band on their side (lowest window band
 below the window, highest above; 0 when the propagator runs on $\epsilon^G$); deep-state QP
@@ -607,34 +669,110 @@ $\Psi'$ or $\Psi'\rho'$, and the occupied projector of the static terms is $\Psi
 $\Psi'\rho'$ is one $k$-local product per refresh on the μ-sharded faces. $L$ and $R$ are
 separate panels, so they may later sit at different $k$ (the phonon line $d_{q\nu}G_{k+q,k}$).
 
-*Vertex pairing.* In $\Sigma^<_{ij}(t,t-\tau)\,G^A_{jj}$ the external line closes on $j$ with
+*Column sampling and vertex pairing.* In $\Sigma^<_{ij}(t,t-\tau)\,G^A_{jj}$ the external line closes on $j$ with
 $e^{iE_j\tau}$ and the internal line $\rho'_{mn}e^{-iE_n\tau}$ puts $n$ on the $j$ vertex
 ($M^*_{jn}$): the phase is $e^{i(E_j-E_n-\Omega)\tau}$. Each external index pairs with the
-internal index on its own vertex, so $T_1=\Sigma_{ij}(E_i)$ takes $G_L$ and $T_2=\Sigma_{ij}(E_j)$
-takes $G_R$, $\tilde\Sigma=\tfrac12(T_1+T_2)$ as before (`collision_internal_pairing = vertex`:
-two sweeps, each window block with an $n_A$ identity block). `symmetric` keeps
+internal index on its own vertex: $T_1=\Sigma_{ij}(E_i)$ takes $G_L$ and
+$T_2=\Sigma_{ij}(E_j)$ takes $G_R$ (`collision_internal_pairing = vertex`:
+two sweeps, each window block with an $n_A$ identity block). Eq. (8) uses
+$R_p=\mathrm{cond}[1]$ and $R_h=\mathrm{val}[0]^\dagger$, without averaging
+these tables. The earlier `symmetric` comparison keeps
 $\tfrac12\{g(E),\rho'\}$, i.e. $\tfrac12(G_L+G_R)$, in both tables (Eq. 8a; one sweep on
 $3n_A$ internal columns), which adds the two cross-vertex combinations. The q → 0 head pairs
 each index with its own ($m=i$, $n=j$): $C_{ij}h_i$ and $C_{ij}h_j$ in either pairing.
 
-*Particle number.* With $W^<(q)=W^>(-q)^{\rm T}$ the in-scattering of $k$ from $k-q$ and the
-out-scattering of $k-q$ into $k$ carry the same product $M_{im}C_{mn}M^*_{jn}$; they cancel in
-$\sum_k\mathrm{Tr}\,C[\rho]$ when the energy factor is even in Ω and symmetric under swapping the
-vertex pairs $\{(i,m),(j,n)\}$. Vertex pairing gives $\tfrac12[L(E_i-E_m+\Omega)+L(E_j-E_n+\Omega)]$,
-symmetric pairing $\tfrac14\sum_{x\in\{i,j\},y\in\{m,n\}}L(E_x-E_y+\Omega)$: both conserve; a
-left-index factor $g(E_m)$ in both tables does not.
+*Particle number.* For the corrected column split, cancellation must be
+checked on $C_{\rm raw}$ itself with reversed bosonic endpoints and a common
+active state space. The earlier symmetric factors of arithmetic pair
+averaging are not its proof. In fact, after column sampling the synthetic
+reciprocal-pole gate gives a $1.39\times10^{-8}$ residual/flux for the vertex
+code ($1.38\times10^{-15}$ for its dense reference), while the symmetric
+comparison leaves $4.74\times10^{-2}$; a second full-$\rho$ state gives 0.381.
+Collision-enabled propagation therefore refuses `symmetric`, populations-only
+internal lines, and all-band rate intermediates: it requires the closed active
+space, full $\rho$, and vertex ordering. The fresh-state and held-flow checks are
+distinct, as specified above. Each refresh receipt therefore reports the
+fresh generator's weighted number residual, its ratio to the mean in/out
+flux, and separately the accumulated trace drift per unit time over the
+preceding held interval. The first checks the snapshot collision algebra;
+the second measures the finite-refresh-cadence approximation.
 
-CPU gates (`tests/test_tdagw_collision_instbasis.py`, the same fixture; random Hermitian
-ρ with spectrum in [0, 1]): diagonal ρ' == populations for both pairings to 5.9×10⁻¹⁶;
-vertex pairing == the dense vertex reference to 9.5×10⁻⁹; covariance at a unitary mixing
-degenerate states to 7.7×10⁻¹⁵ (both pairings); trace residual on reciprocal poles
-2.9×10⁻⁹ (vertex) and 6.8×10⁻¹⁰ (symmetric), dense vertex 4.5×10⁻¹⁶; G~> and G~<
-Hermitian exactly; the basis map's fixed point to 4×10⁻¹⁴, U = 1 and E = e at ρ_eq.
+Current column-sampled CPU gates (`tests/test_tdagw_collision_instbasis.py`, the same fixture;
+random Hermitian ρ with spectrum in [0, 1]): diagonal ρ' == populations for both line
+builders to 4.0×10⁻¹⁶; vertex branch tables equal the dense vertex reference to
+9.5×10⁻⁹; covariance at a unitary mixing degenerate states to 1.6×10⁻¹⁵; the
+number residuals are as stated above; Gamma and D are Hermitian exactly; the basis map's
+fixed point is 4.1×10⁻¹⁴, with U = 1 and E = e at ρ_eq.
 End to end (`window_collision` on hand-built propagator operators, two trials): at ΔΣ = 0
 and e = ε^G the instantaneous basis is the band basis to 1.4×10⁻¹³, and a refresh at
 ρ_eq reproduces t0 exactly. The equilibrium path (no ρ) is bitwise the previous tree's,
 the GW run's Σ(ω) cube included. Fixture walls: populations 1.04 s, symmetric 1.14 s,
 vertex 2.24 s per sweep.
+
+#### Full-matrix nonequilibrium screening: future gate {#keldysh-screening}
+
+The corrected collision can first be checked with frozen equilibrium
+$W^{</>}$ and the full MGKBA electronic line. Refitting the existing passive
+shared-pole $W^R$ at diagonal populations is not a full-matrix nonequilibrium
+$W^<$ implementation. The proposed joint retarded/lesser bank is not
+implemented by `construct_shared_poles`; its present passivity and storage
+contracts belong to [shared-pole theory](shared-pole-w-model.md) and the
+[shared-pole implementation](../architecture/shared_pole_model.md).
+
+For a future local stationary closure, declare the one-sided transform
+$\bar X(z)=\int_0^\infty d\tau\,e^{iz\tau}X(\tau)$ and its inverse/full
+Fourier normalization first. Under the anti-adjoint negative-lag extension,
+$\widehat X_\eta(\omega)=\bar X(\omega+i\eta)
+-\bar X(\omega+i\eta)^\dagger$. The required identities are
+
+$$
+P^R=\bar P^>-\bar P^<,\qquad
+P^R-P^A=\widehat P^>-\widehat P^<,\qquad
+W^R=(1-vP^R)^{-1}v,\qquad
+\widehat W^<=W^R\widehat P^<W^A,
+$$
+
+$$
+\widehat W^>-\widehat W^<=W^R-W^A
+=W^R(P^R-P^A)W^A.
+$$
+
+Here the products use full spectra at the same real frequency, with
+$W^A=W^{R\dagger}$. Recover the positive-time $\bar W^<$ by a causal
+Cauchy/Hilbert projection of $\widehat W^<$; replacing the full spectrum in
+the product by $\bar P^<$ is incorrect. For the convention
+$X(\tau)=\int d\omega\,e^{-i\omega\tau}\widehat X(\omega)/(2\pi)$,
+the projection is
+$\bar X(z)=i\int d\omega\,\widehat X(\omega)/[2\pi(z-\omega)]$,
+with $\operatorname{Im}z>0$. Apply each declared regulator once: damping a
+spectrum and adding the same $i\eta$ again changes the linewidth.
+
+When $[H_s,\rho]\ne0$, the exact anti-adjoint identity exchanges both
+time endpoints and therefore the endpoint density. Extending the frozen
+positive-lag MGKBA line into a stationary spectrum is an additional closure;
+it is not exact two-time RPA and does not imply passive response or positive
+noise. Arbitrary coherences and population inversion need not satisfy the
+current passive constructor's assumptions.
+
+The joint representation must retain noise poles absent from $W_c^R$.
+For example, $\rho=fI$, $0<f<1$, gives $P^R=0$ because all occupation
+differences vanish, whereas $P^<$ has transition noise proportional to
+$f(1-f)$. Thus $W^R=v$, $W_c^R=0$, but $\widehat W^<=v\widehat P^<v\ne0$.
+A bank inferred only from retarded poles loses this noise. Admission of a
+future joint bank requires this counterexample, endpoint and Keldysh
+identities, direct-frequency versus causal-projection agreement, regulator
+convergence, and independent validation of its response/noise pole union.
+Until those gates and a suitable general realization exist, full-matrix
+nonequilibrium screening must remain deferred or explicitly refused.
+
+`tdagw.keldysh_rational` is the dense host reference for the algebra after
+$P^<$ and $W^R$ have been supplied: it composes plain state-space arrays,
+forms the sharp transfer, and performs the causal split by ordered complex
+Schur decomposition plus a Sylvester solve. Its CPU gates compare the result
+with the direct real-frequency Cauchy integral, exercise a repeated pole, and
+retain the $\rho=fI$ noise pole when $W_c^R=0$. It refuses a pole on the real
+axis until the caller declares an adiabatic regulator. It does not build the
+polarization, reduce a joint bank, or run in the distributed screening path.
 
 ### 1.6 The active space: band window or disentangled subspace (proposed) {#active-space}
 
@@ -757,13 +895,17 @@ is the term their split drops.
 * for the static and frozen members: $\mathrm{Tr}\,\rho_k$ per $k$, Hermiticity
   of $\Delta\Sigma$ (measured $\le1.2\times10^{-17}$), unitarity of the
   commutator flow (the spectrum of $\rho$ at $\Gamma=0$). The dynamical members
-  keep the Hermiticity of $\rho$; their $\mathrm{Tr}\,\rho$ is conserved up to
-  the terms named in §1.5, which are measured;
-* $\rho=\rho^{\rm eq}$ is a fixed point, $\Delta\Sigma=0$ exactly;
+  keep the Hermiticity of $\rho$. The collision requires separate fresh-state
+  trace and held-flow drift checks (§1.5); neither Pauli bounds nor exact
+  trajectory particle conservation follows from the Hermitian split;
+* $\Delta\Sigma[\rho^{\rm eq}]=0$ by reference subtraction. The raw collision
+  must be tested for stationarity independently; a subtracted counterterm can
+  impose it for the selected frozen coefficients;
 * covariance under a rotation of the window basis: the populations are those
   of the instantaneous basis, not of the band gauge (the red twin that reads
   them in the fixed basis misses the reference by 5%);
-* linear response = TD-aGW = BSE (§2), dressed or not.
+* the coherent static member has linear response = TD-aGW = BSE (§2), dressed
+  or not. The dynamical collision adds the full linearized kernel of Eq. (8).
 
 ### 3.2 Lost
 
@@ -772,12 +914,14 @@ is the term their split drops.
 * **Φ-derivability.** With $W$ updated, $\Delta\Sigma$ is not $\delta E/\delta\rho$
   of any functional of $\rho$ (the GW Φ functional is a functional of the
   two-time $G$, and Eq. (2) is not its stationarity condition), so the energy
-  is not conserved exactly. The frozen-W member is Φ-derivable from
+  is not conserved exactly. The coherent frozen-W member is Φ-derivable from
   $\tfrac12\mathrm{Tr}\,\delta\rho K\delta\rho$ and conserves its energy.
-* **Memory in the rates.** The collision term (§1.5) is the on-shell Markov
-  limit, built from the populations of the instantaneous basis and held
-  between refreshes; there is no non-Markovian dephasing and no
-  coherence-driven scattering.
+  This statement does not extend to the Markov collision with frozen
+  screening, finite broadening, projected active spaces and held rates.
+* **Memory in the rates.** The collision term (§1.5) uses a frozen Hamiltonian
+  and is held between refreshes; there is no non-Markovian dephasing. The
+  corrected full-matrix electronic line does retain coherence-driven
+  scattering, unlike the population approximation.
 * **Coherence-driven screening** ($\delta W/\delta G$ at the drive frequency),
   by construction (§1.1).
 
@@ -917,7 +1061,7 @@ at 12×12) to the full zone. The frozen
 `apply` walls are TDPROP's (516 2v2c) and TDMODEL's (30×30, 12×12) at b = 1;
 at 30v × 14c on 6×6 k it is 9.0 ms.
 
-**Measured per refresh, the collision term on origin/main** (516 6×6, 160
+**Earlier arithmetic-operator baseline, the collision term on origin/main** (516 6×6, 160
 bands, $N_\mu$ 978, 4 × A100, warm; τ = distinct Σ τ nodes of the sweep):
 
 | refresh (2v2c window [128, 132)) | τ | wall per refresh |
@@ -937,7 +1081,7 @@ energies (48 or 76 τ against 181–207 τ on the GW list); the active part's by
 live branches. δχ0 on the window is the bubble's change only ($\chi_0^{ff}$ is in
 $W_0$): its same-side sum grows with $n_A$ (2v2c 1.85 s, 10v14c 5.16 s).
 
-**Measured per refresh, the shared-pole collision term** (branch
+**Earlier arithmetic-operator baseline, the shared-pole collision term** (branch
 `feat/td-agw-dynsig-spm-2026-10-18`; 516 6×6, 160 bands, $N_\mu$ 978, K = 1761
 poles at every q, 4 × A100, warm; medians over the refreshes of the driven runs):
 
@@ -971,6 +1115,14 @@ M ∥ z keeps C3: one third).
 
 ### 7.1 Refresh policy {#refresh}
 
+The current column-sampled collision can refresh its electronic-line
+coefficients with **frozen screening**. `collision_screening = refreshed` and
+`shared_pole` are refused at entry by
+`GATE dynsig_collision_keldysh_screening` (§1.4). The $W$-refresh policies,
+costs and trajectories described below are prior arithmetic-operator
+baselines from retained development machinery, not currently runnable
+collision configurations.
+
 $\delta W$ follows the populations, which follow the pulse envelope and the
 carrier relaxation, not the optical period. The production design refreshes
 Eq. (6) and the pole model when $\max_k|\delta f|$ has moved by a set
@@ -987,8 +1139,9 @@ A refresh can happen only at a chunk end, and `chunk` counts samples: at
 0.125 fs cadence then refreshes every chunk, as 0.25 fs does); 0.125 fs needs
 25 as samples.
 
-**Refreshed screening** (`collision_screening = refreshed`, §1.5) refreshes
-Eq. (6) and the pole model with the rates. Each refresh line adds the walls (δχ0
+**Prior refreshed-screening baseline** (`collision_screening = refreshed`,
+currently refused; §1.5). The retained machinery refreshes
+Eq. (6) and the pole model with the rates. Its refresh line adds the walls (δχ0
 at both supports, Dyson + fit, frozen and active sweeps), the invalid-mode count
 and its flips (since the last refresh and against $\rho^{\rm eq}$), the largest
 $|\Delta\Omega|$ over the modes valid in both, $\max|\delta W|/|W_0|$ at both
@@ -998,12 +1151,15 @@ the regularization tails of $C[\rho^{\rm eq}]$ (28 meV on the diagonal at
 516) change with $W$ and are no longer cancelled. `window_collision(rebase=True)`
 takes $C[\rho^{\rm eq}]$ at the rates of $\rho^{\rm eq}$ on $W(t)$ (one more split
 sweep at $f^{\rm eq}$, 2.1 s on 516 2v2c); on the 516 drives it removes the
-spurious carriers (§1.5) and should be the refreshed screening's default.
+population model's measured tail-induced carriers (§1.5). Rebasing is an
+optional counterterm approximation, not a formal default for a future
+nonequilibrium lesser interaction.
 
-**Shared-pole screening** (`collision_screening = shared_pole`, §1.4) refits
-the whole W stage at each refresh and rebases $C[\rho^{\rm eq}]$ on $W(t)$ by
-default (`collision_rebase = auto`: on for shared_pole; `on` with frozen
-screening is refused). Its source is the GW driver on `collision_source`
+**Prior shared-pole screening baseline** (`collision_screening = shared_pole`,
+currently refused; §1.4). The retained machinery refits
+the whole W stage at each refresh and used rebased $C[\rho^{\rm eq}]$ on
+$W(t)$ by default (`collision_rebase = auto`). `on` with the admitted frozen
+screening remains refused. Its source is the GW driver on `collision_source`
 (the SPM deck; it may differ from `bundle_input` only for shared_pole). On 516
 the refreshed run is one program per run (no recompiles over 15–63 refreshes);
 at $\rho^{\rm eq}$ the collision stays zero through the refreshes (max
@@ -1016,6 +1172,27 @@ jumps by at most 13.8 meV at a refresh (3×10⁹ V/m; GN-PPM refreshed screening
 77 meV), the pole count stays K = 1761 and no gate refuses (V1).
 
 ## 8. Validation {#validation}
+
+The corrected column-sampled MGKBA collision requires an independent dense
+positive-time or direct-resolvent reference with noncommuting $H_s$ and
+$\rho$. Acceptance must separately establish the slot conversion
+$R_p=\mathrm{cond}[1]$, $R_h=\mathrm{val}[0]^\dagger$; $D$ and $\Gamma$;
+the identity between Eq. (8) and the raw in/out expression; Hermiticity;
+diagonal-state reduction; and covariance under unitary rotations within
+degenerate energy blocks. Deliberately wrong hole slots and arithmetic
+averaging must fail the noncommuting reference. Static-limit and coherent
+double-counting checks must use the same full $\rho$ and $W_0$.
+
+For reciprocal synthetic poles with matching active spaces, the fresh-state
+weighted trace residual must agree with dense cancellation to the declared
+quadrature tolerance. Also measure density eigenvalue bounds, raw equilibrium
+residual versus $\eta$, and trajectory number drift versus refresh cadence;
+none of these follows from a fresh-state trace test. CPU checks do not
+establish end-to-end GPU correctness. Full-matrix screening additionally
+requires the separate future gates in §1.5's
+[screening contract](#keldysh-screening). The measurements below predate the
+corrected column split and do not by themselves satisfy these acceptance
+criteria.
 
 `tests/test_tdagw_dynsig.py` (synthetic 3×2×1 k, 9 bands = 3 frozen occupied +
 2v2c + 2 frozen empty, two spinor components, a NumPy reference sharing no code
@@ -1119,17 +1296,19 @@ file I/O and no re-planning (lines at `feat/td-agw-propagator-2026-10-16`
    branch weights (new `populations=` argument; `None` is the incumbent
    call). `window_sigma_plan` (:1560) holds the plan: the session, the run's
    head and the on-shell frequency list. It returns $\Sigma_{ij}(e_i)$,
-   $\Sigma_{ij}(e_j)$, the static operator
+   $\Sigma_{ij}(e_j)$, an arithmetic-pair static operator
    $U[\tfrac12(\cdot+\cdot)]^{\rm h}U^\dagger$ and, on request,
    $\Sigma(\omega)$. Under §1.5 it returns both branches' pair tables from one
-   sweep (`branches=True`), $U\tilde\Sigma U^\dagger$ without the Hermitian
-   projection (`onshell`) and the static-$W$ limit of the populations'
+   sweep (`branches=True`), the time-ordered arithmetic total (`onshell`)
+   and the static-$W$ limit of the populations'
    exchange (`static_limit=True`), done on branch
    `feat/td-agw-dynsig-collision-2026-10-17`. Limits: the projection is the band prefix $[0,b_{\rm hi})$,
    not the window alone, because the invalid-mode static term sums the
    occupied bands (window decode is item 6); the head is the run's
    `HeadSigmaDiag` at the instantaneous $e$, $f$ (frozen $W_h$, §1.4); only
-   full-zone parents are accepted (`GATE window_sigma_full_zone`).
+   full-zone parents are accepted (`GATE window_sigma_full_zone`). The
+   corrected collision consumes the branch slots defined in Eq. (8), not
+   the arithmetic total as a retarded coherent operator.
 6. **Full-band encode, window decode.** `bse_stack_matvec.make_w_term` (:470)
    decodes onto the encode's band set (the prototype decodes 160×160 to keep
    4×4). Change: separate encode (all bands) and decode (window) faces.

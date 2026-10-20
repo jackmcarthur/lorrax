@@ -416,7 +416,7 @@ class TdReport(ScientificProductionReport):
                   "sample, max over drives; dSigma = calls so far (steps and samples);")
         self.emit("  dTr/Tr, dPur/Pur = largest |X - X(t0)| / X(t0) of Tr rho and Tr rho^2 over "
                   "the chunk's samples (" + (
-                      "collision on: Tr rho moves by the out/in balance of the held rates, "
+                      "collision on: Tr rho moves by the held loss/injection balance, "
                       "Tr rho^2 is not conserved)" if coll else
                       "Gamma = 0: both are invariants of the exact flow)" if ham else
                       "Gamma != 0: Tr rho^2 decays by design, Tr rho is conserved)"))
@@ -534,7 +534,7 @@ class TdReport(ScientificProductionReport):
         if dtr:
             ham = (deck.values["system.depopulation"] == 0.0
                    and deck.values["system.dephasing"] == 0.0)
-            why = ("collision on: Tr rho moves by the out/in balance of the held rates, "
+            why = ("collision on: Tr rho moves by the held loss/injection balance, "
                    "Tr rho^2 is not conserved)" if coll else
                    "Gamma = 0: both conserved by the exact flow)" if ham else
                    "Gamma != 0: only Tr rho is conserved)")

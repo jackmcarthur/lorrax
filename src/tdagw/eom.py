@@ -82,8 +82,10 @@ class TdOperators(NamedTuple):
         integrator treats implicitly.
     collision : ``tdagw.collision.Dissipator`` or None, the held on-shell GW
         collision term (docs/theory/td_agw_dynamical.md §1.5, Eq. 8): Eq. (1)
-        gains -1/2 {G~, rho - rho^eq} + S per trial, (ntr, nk, nb, nb) arrays
-        k-sharded like ρ (rates in Ha), refreshed between chunks
+        gains the affine column-sampled MGKBA remainder
+        -1/2 {Gamma, rho} + D (and, for the explicit subtracted form, its
+        reference counterterm) per trial.  The held coefficient arrays are
+        (ntr, nk, nb, nb), k-sharded like ρ and in Ha, and are refreshed between chunks
         (``tdagw.propagate.run_propagation``'s ``refresh``).  None: no term.
     """
     e_qp: jax.Array
