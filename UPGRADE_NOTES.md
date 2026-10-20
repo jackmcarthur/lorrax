@@ -5,6 +5,35 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — BerkeleyGW exports: `epsmat_ecut` and the finite-Q `bsemat`
+
+`[epsmat]` export: `epsmat_ecut` (Ry, default 0 = the full sphere) replaces
+`epsilon_cutoff`, which now refuses by name (`GATE epsmat_retired_key`). It sets the
+written G cutoff with or without `bgw_reference`; a positive value writes the leading
+sub-block of the converged ε⁻¹ in BerkeleyGW's G order, not a re-inversion
+([theory §3](docs/theory/bgw_epsmat_export.md#ecut)). `bse.bsemat_cli --exciton-Q Q1 Q2 Q3`
+(crystal, default 0) writes `kernel.x`'s finite-momentum TDA kernel: row k holds the
+electron at k and the hole at k − Q, `exciton_Q_shift` = −Q, `qflag` 2 on the restart
+grid, and `qflag` 0 off it with `--wfnq-co`. The exchange tile is V at wrap(+Q) with every
+G ([theory](docs/theory/bgw-bsemat-export.md#finite-q)).
+
+- **Results.** Unchanged at the same cutoff and at Q = 0: a cut file equals the full
+  file's leading block (1.0 × 10⁻¹⁵ on Si 4³), and the Q = 0 `bsemat.h5` equals the
+  previous writer's, all four matrices. New outputs: on Si 4³ the 12 Ry file moves the
+  lowest 40 absorption energies by at most 0.078 meV (0.007 % of the 1.080 eV QP gap;
+  direct gap 3.072 eV) against the 25 Ry file. On MoS₂ 9×9 at Q = (1/9, 0, 0) the file
+  agrees with BerkeleyGW's own kernel to 0.42 meV MAE, 0.88 meV max (0.024 % and
+  0.051 % of the 1.732 eV gap of the DFT energies used; the fundamental gap is the
+  direct gap at K).
+- **Decks.** Rename `epsilon_cutoff` to `epsmat_ecut` in `[epsmat]` files. An export
+  without `bgw_reference` no longer needs a cutoff: 0 writes the producer's
+  `bare_coulomb_cutoff` sphere (`ecutwfc` when unset).
+- **Open.** Off-grid Q (`qflag` 0) is implemented but not validated: the per-Q ζ refit
+  fails on an IBZ-stored ζ. `bse.exciton_bands` still contracts its finite-Q exchange
+  at wrap(−Q): bright states at that MoS₂ Q are off by up to 6.6 meV (0.38 %); Q = 0 is
+  unaffected. BerkeleyGW 4.0's `qflag` 2 route has two defects of its own; the theory
+  page gives the workarounds.
+
 ## 2026-10-20 — `band_extrapolation_checkpoints`: several Σ band counts from one sweep
 
 New deck key, off by default (`""`): a run without it is unchanged (same plan,

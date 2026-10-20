@@ -429,7 +429,7 @@ and `--print-schema` prints them.
 | `parent_input_file` | unset (required) | The producer GW deck: WFN, `sys_dim` and the Coulomb keys of V_q. `use_bgw_vcoul` and a non-`off` `mc_average_placement` refuse. |
 | `output_dir` | unset (required) | `export`: the directory receiving the files. `project`: the variant run directory; it may not be the source's. |
 | `bgw_reference` | `""` | A directory with BerkeleyGW's `eps0mat.h5` / `epsmat.h5` on the same WFN. `export`: the q list, q0, `ecuts` and G order are taken from it, and the recomputed G order must agree (`GATE epsmat_bgw_gorder`). `project`: required, the files projected. |
-| `epsilon_cutoff` | `0.0` | `export` without `bgw_reference`: BerkeleyGW's `epsilon_cutoff` (Ry). It may not exceed `bare_coulomb_cutoff`. |
+| `epsmat_ecut` | `0.0` | `export`: the G cutoff of the written files (Ry), $\|q+G\|^2\le$ `epsmat_ecut`; 0 writes the full sphere, the `ecuts` of `bgw_reference` or else the producer's `bare_coulomb_cutoff` (`ecutwfc` when unset). A positive value keeps the leading G of the same BerkeleyGW order at every q, so the file is the sub-block of the converged ε⁻¹, not a re-inversion ([theory](theory/bgw_epsmat_export.md#ecut)). Above the full sphere it refuses (`GATE epsmat_ecut_beyond_sphere`), below 0 too (`GATE epsmat_ecut_value`). The retired key `epsilon_cutoff` refuses by name (`GATE epsmat_retired_key`). |
 | `q0_vector` | `0.001 0 0` | `export` without `bgw_reference`: the q → 0 vector of `eps0mat.h5`, crystal coordinates. |
 | `files` | `eps0mat epsmat` | `export`: the files to write. |
 | `rcond` | `1e-8` | Coulomb-whitening cut: eigenvalues of V_q above `rcond`·λ_max are kept (amplification ≤ 1/`rcond`), the cut closed over degenerate multiplets. |

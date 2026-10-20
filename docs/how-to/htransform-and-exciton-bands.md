@@ -302,7 +302,11 @@ with the exchange $V_Q$ weighted as in `bse.bse_jax`
   momentum difference $k-k'$ stays on the coarse grid, so $W$ needs no
   interpolation.
 - **The exchange $V_Q$** needs the bare interaction at the off-grid
-  momentum. The tile is taken at $\mathrm{wrap}(-Q)$, and at finite $Q$ the
+  momentum. The tile is taken at $\mathrm{wrap}(-Q)$. That is an open defect: the
+  pair density $\psi^*_{vk}\psi_{c,k+Q}$ has momentum $+Q$ and needs the tile at
+  $\mathrm{wrap}(+Q)$ ([bsemat E12](../theory/bgw-bsemat-export.md#finite-q)). On
+  MoS₂ 9×9 at $Q=(1/9,0,0)$ bright states move by up to 6.6 meV (0.38 % of the
+  1.732 eV gap); $Q=0$ is unaffected. At finite $Q$ the
   $G = 0$ term of $v(Q+G)$ is kept (BerkeleyGW's `energy_loss` convention):
   this is the nonanalytic long-range exchange, so $E_S(Q\to0)$ need not equal
   $E_S(\Gamma)$ for longitudinal excitons. At exactly $\Gamma$ the production

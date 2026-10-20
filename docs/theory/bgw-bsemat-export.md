@@ -34,7 +34,8 @@ zero (`calc_wings`). `absorption` restores the screening
 $v(q)\varepsilon^{-1}_{00}(q)/8\pi$ from its own `epsdiag` (q = 0:
 $w_{\rm coul0}/8\pi$). The 3D wing is multiplied by
 `oneoverq`/8π = 1/|q| (`vcoul_generator.f90`: $|q|v(q)$). Body and slab wing
-are taken as stored, and the exchange is scaled by $-$(the factor). The head's
+are taken as stored, and the exchange is scaled by $-$(the factor), twice that for the singlet
+with `nspin` 1 and no spinors (`intkernel.f90`, `bsemat_fac`). The head's
 screening is therefore not a kernel quantity: it lives in BerkeleyGW's eps
 files and the q → 0 average.
 
@@ -204,6 +205,113 @@ runs it as a diagnostic: it gates the residual (`bsemat_downfold_head_solve`,
 $\rho_S^\dagger W_{\rm PW}\rho_S$. `--mu-small off` builds the rows on the
 parent's centroids.
 
+## Finite exciton momentum {#finite-q}
+
+`--exciton-Q Q1 Q2 Q3` (crystal, default 0) writes `kernel.x`'s
+finite-momentum kernel on the same coarse k count. BerkeleyGW's
+`exciton_Q_shift` $Q_s$ is the negative of the exciton momentum: `kernel.x`
+puts the conduction leg of row k at $k$ (WFN_co) and the valence leg at
+$k+Q_s$ (`BSE/input_kernel.f90`, `kgq%f = kg%f + finiteq`). The writer
+therefore stores
+
+$$
+\text{row }k:\quad |v,\,k-Q\rangle\otimes|c,\,k\rangle ,\qquad Q_s=-Q ,
+\tag{E10}
+$$
+
+which is `bse.exciton_bands`' pair $|v\,k,\,c\,k+Q\rangle$ labelled by the
+electron, and writes `exciton_Q_shift` $=-Q$ and BerkeleyGW's `qflag` into
+`bse_header`. Both legs of a direct block move by the same Q, so the momentum
+of W is unchanged and W stays on the restart grid:
+
+$$
+q=k-k' \quad\text{for}\quad C_{cc'}(\mu)=\textstyle\sum_s\psi^*_{ck s}\psi_{c'k' s}
+\ \text{and}\ C_{vv'}(\mu)=\textstyle\sum_s\psi^*_{v,k-Q,s}\psi_{v',k'-Q,s},
+\tag{E11}
+$$
+
+and head, wing and body are E7 with these amplitudes and the split of E3–E6
+at $q$. A tile $V_q$ contracts a left density of momentum $-q$ against a right
+one of momentum $+q$; that is how the direct term takes $W(k-k')$ with
+$C_{cc'}$ (momentum $k'-k$) on the left. The exchange contracts $\rho^*_{vc}$
+against $\rho_{v'c'}$, with $\rho_{vc}=\psi^*_{v,k-Q}\psi_{c,k}$ of momentum
+$+Q$, so its tile is the one at $+Q$:
+
+$$
+\text{exchange}=\tfrac{\Omega}{8\pi}\,C^*_{vc}(k)\,\bar V_{Q}\,C_{v'c'}(k'),\qquad
+\bar V_{Q}=V\big(\mathrm{wrap}(+Q)\big)\ \text{with every } G .
+\tag{E12}
+$$
+
+With $Q_s\neq0$, `kernel.x` sets `energy_loss` and contracts $v(Q_s+G)$ at every
+G, G = 0 included (`kernel_main.f90`, `vcoularray(:, nf+1)`), so the G = 0 term of
+E1d is kept. Its label $Q_s+G=-Q+G$ is the plane wave
+$e^{i(Q_s+G)\cdot r}$ of $M_{vc}(G)$, which selects the density component of
+momentum $Q-G$; the tile momentum is $+Q$ all the same. At Q = 0 the two
+labels are one tile; at Q ≠ 0, $V(-Q)$ is the time-reversed tile, and E12 with
+it misses the plane-wave exchange (`bsemat_export.exchange_tile_momentum`;
+`tests/test_bsemat_finite_q_cpu.py` checks E12 against a plane-wave sum and
+fails the $-Q$ tile). The tile comes from `bse.exchange_path.exchange_tiles`, the
+evaluator `bse.exciton_bands` solves with. That evaluator labels the tile of its
+argument $Q'$ as wrap$(-Q')$, so the writer calls it with $-Q$. The three cases
+(`bsemat_export.finite_q_legs`):
+
+| Q | `qflag` | electron leg (WFN_co) | hole leg | exchange tile |
+|---|---|---|---|---|
+| 0 | 1 | restart grid | restart grid | head-less Γ tile (E1d) |
+| on the restart grid ($N_iQ_i\in\mathbb Z$) | 2 | restart ψ at k | restart ψ at k − Q | stored V at wrap(+Q) (`ongrid`, exact) |
+| off the grid | 0 | the restart grid shifted by +Q: ψ from the deck's htransform, gauge-mapped onto that WFN_co | restart ψ at k − Q; `--wfnq-co` = the restart grid's WFN | per-Q ζ refit on the BSE window (`refit`) |
+
+Off the grid the electron states are built as `bse.exciton_bands` builds its
+conduction caches (`bsemat_export.htransform_window`: one f(H) fit on the
+deck's band window, `compute_wfns_fi` at the shifted points), and the gauge
+map of §q0 runs separately on each leg. The finite-Q file is the TDA kernel on
+the parent's centroids (`GATE bsemat_finite_q_form` refuses `extended` and
+`--mu-small`).
+
+Reading these files with BerkeleyGW 4.0 meets two defects of its own finite-Q
+route, both measured on MoS₂ 9×9:
+
+1. `kernel.x` at `qflag` 2 aborts where $k+Q_s$ needs an umklapp:
+   `genwf_kernel.f90` sorts the valence sphere around the wrapped point
+   `kg%f(indexq(ik))` but maps it with `kgq%kg0`, and `checknorm('wfnv%cg')`
+   stops at $|\lVert\psi\rVert-1|=6.4\times10^{-4}$. BerkeleyGW's own on-grid
+   kernel runs at `qflag` 0 with `WFNq_co` = `WFN_co` (that path sorts around
+   the unwrapped point).
+2. `absorption` at `qflag` 2 builds the valence diagonal at $k+2Q_s$:
+   `input_fi_q.f90` already stores `eqp%evqp(iv, ik)` $=E_v(k+Q_s)$ and
+   `diag.f90` indexes it through `indexq_fi(ik)` a second time (at Q =
+   (1/9, 0, 0) the lowest non-interacting pair comes out 2.1075 eV for 2.0341
+   eV). The kernel rows are unaffected. An `eqp.dat` whose valence quasiparticle
+   column at $p$ holds $E_v(p-Q_s)$, the mean-field column unchanged, restores
+   $E_c(k)-E_v(k+Q_s)$ (`eqp_corrections`, momentum operator).
+
+`absorption` does not compare `exciton_Q_shift` or `qflag` of the file with its
+own input, so `absorption.inp` must carry the file's `exciton_Q_shift`.
+
+Measured (MoS₂ 9×9 slab, SOC, 8v × 8c, DFT energies, the BGW head; % of the DFT gap of
+the WFN, 1.732 eV, fundamental = direct at K):
+
+| check | result |
+|---|---|
+| Q = 0 file vs the previous writer's | identical (all four matrices, elementwise) |
+| BerkeleyGW absorption, Q = 0 file, vs `bse.bse_jax` | lowest 10: MAE 0.090 meV (0.005 %), max 0.195 meV (0.011 %) |
+| Q = 0 file vs BerkeleyGW's own kernel (absorption, lowest 40) | MAE 0.37 meV (0.021 %), max 0.56 meV (0.032 %); degenerate-subspace overlap ≥ 0.99998 |
+| Q = (1/9, 0, 0) file vs BerkeleyGW's own kernel at that Q: matrices | head, wing, body, exchange elementwise 0.9, 0.6, 0.9, 1.3 × 10⁻³ |
+| the same, absorption, lowest 40 | MAE 0.42 meV (0.024 %), max 0.88 meV (0.051 %); subspace overlap ≥ 0.9966 |
+| the same with the tile at wrap(−Q) | exchange 44 % elementwise; max 6.67 meV (0.38 %), on the bright states |
+
+A plane-wave evaluation of the Γ exchange block from the WFN coefficients with
+BerkeleyGW's slab Coulomb matches BerkeleyGW's file to 3 × 10⁻⁵, the writer's
+to 1.1 × 10⁻³, and the wrap(−Q) tile to 0.39. `bse.exciton_bands` still
+takes the wrap(−Q) tile; at this Q it differs from BerkeleyGW's kernel by up to
+6.6 meV; correcting `bse.exciton_bands` is open.
+
+The off-grid route (`qflag` 0) is implemented but not yet validated: its
+exchange needs the per-Q refit of an IBZ-stored ζ, whose reader currently
+fails on the full-grid WFN header (`file_io.restart_bundle.read_vq_payload` labels the IBZ q
+by the first WFN k-points; open).
+
 ## Gates {#gates}
 
 | rule | refuses when |
@@ -219,3 +327,7 @@ parent's centroids.
 | `bsemat_q0_wings_source`, `bsemat_q0_vector`, `bsemat_q0_body_dim` | `--q0-body dipole` without the bundle's stored wings, without a q₀ direction, or in a slab |
 | `bsemat_downfold_head_solve` | the child's $\lVert V_Sa-z_S^*\rVert/\lVert z_S^*\rVert>10^{-6}$; the downfold driver's own refusals (μ_S above the window Gram's eigenvalue rank, a budget below the first orbit) apply unchanged |
 | `bsemat_q0_wing_fold` | the stored fold $S_{\rm eff}-S_{\rm d}$ disagrees with $LW(\Gamma)R/\Omega$ on this W by more than 10⁻³ |
+| `bsemat_finite_q_grid` | a WFN_co point minus Q is off the restart grid, or WFN_co − Q does not cover it once |
+| `bsemat_finite_q_wfnq` | `--wfnq-co` missing off the grid, or given on it (where `WFNq_co` is not read) |
+| `bsemat_finite_q_form` | `extended` or `--mu-small` at Q ≠ 0 |
+| `bsemat_finite_q_window`, `bsemat_finite_q_basis` | off the grid: the deck's htransform window lacks the BSE valence bands, or fits ψ at a centroid count other than the restart's μ |

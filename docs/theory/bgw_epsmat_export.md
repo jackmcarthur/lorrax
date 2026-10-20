@@ -97,24 +97,65 @@ directions per q: V's remaining eigenvalues sit at $|\lambda|\le4\times10^{-6}$
 against $\lambda_{\max}\approx3\times10^{9}$, the null space of the
 rank-truncated ζ, eight decades below the kept $\lambda_{\min}\approx500$.
 
-## 3. Restriction to BerkeleyGW's G list
+## 3. Restriction to BerkeleyGW's G list {#ecut}
 
-The file holds $|q+G|^2<E_\varepsilon$ (`epsilon_cutoff`, BerkeleyGW's
-`ecuts`) with $E_\varepsilon\le E_c$ (`GATE epsmat_ecuts_beyond_coulomb`: beyond
-$E_c$ LORRAX's $v$ and ζ̃ are zero). The written block is (E5) on those rows
-and columns:
+The file holds the G with $|q+G|^2\le E_\varepsilon$ (BerkeleyGW's `ecuts`,
+`gcutoff`). The full sphere $E_{\rm full}$ is the `ecuts` of `bgw_reference`
+when it is set, otherwise the producer's `bare_coulomb_cutoff` (`ecutwfc`
+when that is unset, gw_init's own resolution of the V sphere). With
+`bare_coulomb_cutoff` set, a reference `ecuts` above it refuses
+(`GATE epsmat_ecuts_beyond_coulomb`: beyond $E_c$ LORRAX's $v$ and ζ̃ are
+zero). `epsmat_ecut` (Ry) selects
+
+$$
+E_\varepsilon=\begin{cases}E_{\rm full}, & \texttt{epsmat\_ecut}=0,\\
+\texttt{epsmat\_ecut}, & 0<\texttt{epsmat\_ecut}\le E_{\rm full},\end{cases}
+\tag{E6a}
+$$
+
+and refuses above $E_{\rm full}$ (`GATE epsmat_ecut_beyond_sphere`) or below 0
+(`GATE epsmat_ecut_value`). Each q's G list is first built on the full sphere
+in BerkeleyGW's order and, with a reference, checked against the reference's
+own (`GATE epsmat_bgw_gorder`, §7). A smaller $E_\varepsilon$ then keeps its
+leading $n_\varepsilon(q)=$ `gcutoff`$(E_\varepsilon)$ entries, so `gind_eps2rho`
+of the cut file is the first $n_\varepsilon$ entries of the full file's. The
+written block is (E5) on those rows and columns:
 
 $$
 \varepsilon^{-1}_{GG'}-\delta_{GG'} = v(q+G)\,\big[Y_\varepsilon KY_\varepsilon^\dagger\big]_{GG'},
-\qquad Y_\varepsilon=Z_\varepsilon B,\qquad |q+G|^2,|q+G'|^2<E_\varepsilon .
+\qquad Y_\varepsilon=Z_\varepsilon B,\qquad |q+G|^2,|q+G'|^2\le E_\varepsilon .
 \tag{E6}
 $$
 
-This is the block of the full-sphere inverse, $(\varepsilon^{-1})_{\varepsilon\varepsilon}$.
-BerkeleyGW's epsilon inverts the block of ε, $(\varepsilon_{\varepsilon\varepsilon})^{-1}$,
-with χ₀ evaluated on the eps sphere alone. The two differ by local fields beyond
-$E_\varepsilon$: a screening difference between the codes, not a
-representation error, and §6 keeps the two apart.
+$K$ and $B$ are the full-sphere ones (§2); nothing is re-inverted. The file is
+therefore the leading sub-block of the full-sphere inverse,
+$(\varepsilon^{-1})_{\varepsilon\varepsilon}$, entry for entry: on Si 4³
+(full sphere 25 Ry, nmtx 560–588; cut 12 Ry, nmtx 178–200 and 181 at q₀) the
+cut file equals the full file's leading block to 1.0 × 10⁻¹⁵.
+`tests/test_bgw_epsmat_cpu.py::test_epsmat_ecut_is_the_leading_sub_block_not_a_reinversion`
+holds the writer to that and fails the re-inversion on the cut G set,
+$(\varepsilon_{\varepsilon\varepsilon})^{-1}$.
+
+BerkeleyGW's epsilon at a smaller `epsilon_cutoff` inverts the block of ε,
+$(\varepsilon_{\varepsilon\varepsilon})^{-1}$, with χ₀ evaluated on the eps
+sphere alone. The two differ by local fields beyond $E_\varepsilon$: a
+screening difference between the codes, not a representation error, and §6
+keeps the two apart.
+
+What a smaller file does downstream depends on the BerkeleyGW code that reads
+it. `kernel.x` (BerkeleyGW 4.0) takes every G of the file
+(`BSE/mtxel_kernel.f90`: `neps = xct%nmtxa(irq)`, `epscol(1:neps)`) and
+contracts the G beyond it with the bare $v$
+(`calc_direct_unscreened_contrib`). Its `screened_coulomb_cutoff` sets
+`xct%neps`, which enters only `nepsmin = max(xct%neps, neps)` and never
+shortens the file's list. A cut file is therefore the way to truncate the
+screening seen by `kernel.x`; a full file with `screened_coulomb_cutoff` is
+not. On Si 4³ (8v × 8c, 64 k) the full file with and without
+`screened_coulomb_cutoff 12` gives bitwise identical kernels, and the 12 Ry cut
+file moves the wing and body by 9.4 × 10⁻⁴ and 6.2 × 10⁻⁴ (relative
+Frobenius) and the lowest 40 absorption eigenvalues by 0.009 meV on average,
+0.078 meV at most (0.007 % of the QP gap, 1.080 eV). Sigma, unlike
+`kernel.x`, truncates at its own `screened_coulomb_cutoff`.
 
 ## 4. The reverse: BerkeleyGW ε⁻¹ onto ζ
 
@@ -136,7 +177,7 @@ and the export checks this identity per q against the μ-space product
 (`GATE epsmat_block_projection`, 1e-8). On the full sphere $V_\varepsilon=V$ and
 the round trip returns W − V on the kept span: 1.0e-13 and 1.2e-14 on CrI3 6×6.
 On a smaller sphere $\|V_\varepsilon BKB^\dagger V_\varepsilon-(W-V)\|/\|W-V\|$
-is the part of W that `epsilon_cutoff` leaves out; it is printed per q.
+is the part of W that the cut leaves out (`epsmat_ecut`, §3); it is printed per q.
 
 `mode = project` copies the bundle to `output_dir/tmp`, replaces `W0_qmunu` by
 (E7) at every stored q and stamps `W0_source = bgw_epsmat` with the reference

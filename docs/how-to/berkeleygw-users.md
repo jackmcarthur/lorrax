@@ -49,7 +49,7 @@ load (`wfn_loader.WfnLoader`); use a noncollinear calculation for magnetism.
 | `number_bands` (epsilon) | `number_bands_chi` | bands in $\chi_0$ |
 | `number_bands` (sigma) | `number_bands_sigma` | bands in the $\Sigma$ sum; `number_bands` sets both |
 | `band_index_min/max`, `diag` | `ncond`, or `number_bands_protected` (the total band count of the request: every occupied band plus conduction bands up to that total) | $\Sigma$ bands are always $[1, n_\mathrm{occ} + $`ncond`$]$; `nval` does not change them ([its roles](../input_reference.md#system)) |
-| `epsilon_cutoff`, `screened_coulomb_cutoff` | none | W is built in the ISDF basis from the same $V_q$ as $\Sigma_x$ (§4.1) |
+| `epsilon_cutoff`, `screened_coulomb_cutoff` | none in the GW run; `epsmat_ecut` of the ε⁻¹ export | W is built in the ISDF basis from the same $V_q$ as $\Sigma_x$ (§4.1); the exported `epsmat.h5` holds the leading sub-block of that ε⁻¹ at `epsmat_ecut` ([export §3](../theory/bgw_epsmat_export.md#ecut)) |
 | `bare_coulomb_cutoff` (sigma) | `bare_coulomb_cutoff` | default the WFN's `ecutwfc` in both codes |
 | `cell_average_cutoff` (sigma) | `mc_average_vcoul_body` | §4.1 |
 | `write_vcoul` (sigma) | `use_bgw_vcoul`, `bgw_vcoul_file` | LORRAX reads that table (§4.1) |
@@ -67,6 +67,7 @@ load (`wfn_loader.WfnLoader`); use a noncollinear calculation for magnetism.
 | k-point list (sigma) | none | every k of the WFN wedge |
 | `degeneracy_check_override` | none | a band count that cuts a degenerate multiplet refuses |
 | `eqp_corrections` (kernel, absorption) | `--eqp` of `bse.bse_jax` | §7 |
+| `exciton_Q_shift` (kernel, absorption) | `--exciton-Q` of `bse.bsemat_cli`; the shift is −Q | §7 |
 | `use_momentum` (absorption) | `psp.get_dipole_mtxels --skip-vnl` | §7 |
 | `number_val_bands`, `number_cond_bands` | `--n-val`, `--n-cond` | counted in bands, spinor bands included |
 | `energy_resolution`, `number_iterations` | `--eta-eV`, `--n-iter` of `bse.absorption_haydock` | |
@@ -544,6 +545,12 @@ conventions (§4.1–4.2) carry into the kernel. To compare with BerkeleyGW's
   prefactor and must describe the WFN. The outputs
   `absorption_haydock_b1_eh.dat` (b2, b3) are the three Cartesian
   polarizations. Compare $\varepsilon_2(\omega)$, not raw sums of $|d|^2$.
+- **Kernel files.** `python -m bse.bsemat_cli` writes `bsemat.h5` from the GW
+  restart for BerkeleyGW's `absorption` ([theory](../theory/bgw-bsemat-export.md)).
+  `--exciton-Q Q1 Q2 Q3` writes the finite-momentum kernel. `absorption.inp` must carry
+  the file's `exciton_Q_shift` (= −Q), which `absorption` does not check, and at `qflag`
+  2 BerkeleyGW 4.0's `absorption` needs an `eqp.dat` whose valence column at $p$ holds
+  $E_v(p-Q_s)$ ([BerkeleyGW 4.0 defects](../theory/bgw-bsemat-export.md#finite-q)).
 - **Eigenvectors.** `bse.bse_jax --lanczos --tda --bse --write-eigs N
   --dipole FILE` writes `eigenvectors.h5` in BerkeleyGW's layout (eV, valence
   axis reversed; [BSE outputs](../architecture/bse.md#outputs)). An
