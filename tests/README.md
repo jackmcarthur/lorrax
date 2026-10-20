@@ -8,6 +8,12 @@ interpreter's install (the sealed release under `lx test`), and a later
 `file_io` import in the same pytest worker refuses with `SourceClosureError`.
 A new test needs no bootstrap import of its own.
 
+- `test_chi_fejer_window_cpu.py`: explicitly selected real-lattice Fejer
+  smoothing, positive normalized Fourier weights, complex scalar/full-density
+  response and moments, legacy identity bits, recipe/store authentication,
+  and fresh number balance on a reciprocal coarse-q subgroup. No material
+  model admission, matched-Phi or electronic Pauli claim.
+
 - `hsuite/`: the test suite, the production drivers run end to end on a tiny
   magnetic H2⁻ fixture at P4 ([README](hsuite/README.md)).
 - `test_layering.py`, `test_crossfile_requests.py`, `test_env_registry.py`,

@@ -78,6 +78,11 @@ R-space product is retained, then restricted and transformed. Thus Green
 construction and its electronic transforms do not become cheaper merely
 because fewer response rows are stored; the smaller bank and downstream
 Dyson/shared-pole work are the intended saving.
+The explicit `qgrid_response_window` choice is forwarded to the same
+transform for scalar streams, full-density streams and moments; its default
+is `sharp`. Experimental `fejer` changes that response restriction, not
+the electronic Green grid or Σ embedding. Its precise weights, scope and
+non-Φ qualification live in the linked bosonic response-grid contract.
 
 **Band weights.** `_occupation_support_slices` returns the smallest
 contiguous band ranges on which |f|, respectively |1 − f|, is at least

@@ -935,6 +935,7 @@ _DEFAULTS = {
     # Optional compact real-lattice χ cutoff, giving the full-BZ χ/W grid.
     # Empty follows the electronic WFN kgrid, without a change of arithmetic.
     "qgrid": "",
+    "qgrid_response_window": "sharp",
     # The QP request as one band count (owner 2026-09-29, the documented
     # form): every occupied band plus conduction bands up to this total.
     # Exclusive with nval/ncond (GATE band_request_forms); resolved against
@@ -2959,6 +2960,7 @@ def _assemble_input_config(
         nval=int(params["nval"]),
         ncond=int(params["ncond"]),
         qgrid=parse_qgrid(params["qgrid"]),
+        qgrid_response_window=str(params["qgrid_response_window"]).strip().lower(),
         number_bands_protected=_band_request_form(params, _effective_named_keys),
         nband=int(_bands.isdf),
         bands=_bands,
@@ -4992,9 +4994,13 @@ class LorraxConfig:
     #: Full-BZ bosonic χ/W grid from a compact real-lattice χ cutoff.
     #: None follows the electronic WFN grid. Resolved on Meta, never nk_tot.
     qgrid: tuple[int, int, int] | None = None
+    #: Explicit real-lattice response approximation; equal grids are identity.
+    qgrid_response_window: str = "sharp"
 
     def __post_init__(self):
         """Refuse head settings outside their landed scope."""
+        if self.qgrid_response_window not in ("sharp", "fejer"):
+            raise ValueError("qgrid_response_window must be sharp or fejer")
         if (self.sc.initial_qp_rotations_file is not None
                 and self.qp_solver is not QPSolver.SELF_CONSISTENT):
             raise ValueError(

@@ -510,6 +510,29 @@ gain. Dropping spatial reductions prevents false symmetry reconstruction
 but does not restore centroid-home-cell gauge covariance: authenticate the
 fixed convention and converge the cutoff.
 
+`qgrid_response_window = fejer` is an explicitly selected experimental
+alternative; the default remains `sharp`. On each reduced even response
+axis m, set L=m/2 and multiply the real-space product by
+`max(1-abs(R)/L,0)`. The old boundary images at ±L are now zero; nonreduced
+axes retain weight one, reduced odd axes refuse, and equal grids use the
+unchanged legacy FFT. The tensor-product Fourier kernel is nonnegative:
+κ(θ)=|Σ(j=0..L−1) exp(ijθ)|²/L per reduced axis. Consequently the coarse
+polarization is a normalized positive average of the fine-q polarization
+in the fixed centroid convention. No eigenvalue is inspected or floored.
+All native Gram, moment, held-response and model gates still apply; neither
+this spectral property nor a tiny CPU oracle admits a material model or
+guarantees positivity of the nonsecular electronic collision.
+
+This option changes χ (including its moments and full-density response)
+consistently, and binds its name into recipe/model identities. It does
+**not** change Σ's ordinary coarse-q periodic tiling above. It therefore
+remains a non-Φ response-smoothing approximation, not the matched weighted
+adjoint of that response restriction. A future ring-functional derivative
+would instead use `sqrt(Nk/Nq)*w(R)*W_R[R mod qgrid]` in Σ; it is not silently
+enabled here. Compare full complex Σ and the intended dynamics against the
+fine-grid reference, and keep fresh number balance separate from held-rate
+drift and energy/Pauli claims.
+
 ## 6. Row passes and the `live` operand {#live-rows}
 
 The Σ τ kernel and the χ₀ direct stream do not convolve a rank's whole

@@ -470,6 +470,8 @@ def _check_basis(meta, header, basis=None):
         if (tuple(header["grid"]) != response
                 or tuple(header.get("electronic_grid", header["grid"])) != electronic):
             _refuse("reader/writer electronic or bosonic response grid changed")
+    if header.get("qgrid_response_window", "sharp") != getattr(meta, "qgrid_response_window", "sharp"):
+        _refuse("reader/writer qgrid_response_window changed")
     return basis
 
 
@@ -561,6 +563,9 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
                        "typing_source": str(sym.operation_typing_source)},
         "finalized": False,
     }
+    response_window = getattr(meta, "qgrid_response_window", "sharp")
+    if response_window != "sharp":
+        header["qgrid_response_window"] = response_window
     if sector is not None:
         header.update(sector=sector, factor_components=3 if sector in ("TT", "CT_T") else 1,
                       capacity_geometry=dict(_capacity(meta).geometry))

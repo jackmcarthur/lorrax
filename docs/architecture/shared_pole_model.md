@@ -390,6 +390,7 @@ $10^{-12}$. The bare moments are checked where they are produced
 | `representation` | model: `scalar-trs-even-s` (W 14) or `scalar-ordered-ph` (W 16); ordered bank: `charge-ordered-z` |
 | `n_q_irr`, `q_irr_full_idx`, `qirr`, `operations` | raw parents and the authorized symmetry rows |
 | `grid`, `electronic_grid` | bosonic response grid and electronic Green grid, respectively; an old header without `electronic_grid` means it equals `grid`. Both domains are authenticated on read. |
+| `qgrid_response_window` | Optional explicit response-window identity; absent means `sharp`. `fejer` is a distinct recipe/model and a mismatched reader refuses. The approximation and unchanged ordinary coarse-q Σ contract are owned by [k-convolution](kconv.md#bosonic-response-grid). |
 | `n_mu_logical`, `nspinor`, `centroid_digest` | basis identity; the operator is the spin-traced $\mu\times\mu$ charge response for `nspinor` 1, 2 and the four-component kinetic-balance carrier |
 | model: `factor [q, μ, components, Kmax]` complex128, `poles2_ry2 [q, Kmax]` float64, `K [q]` int64 | (W 14) per parent, units Ry$^{3/2}$ and Ry²; inactive columns have $b=0$, $\Lambda=1$ Ry² |
 | bank: `Wc`, `dWc_ds [q, a, μ, μ]` at the dense samples (every id outside the line span $[p_0,p_1)$, rows $a$ skipping it); `M1`, `M3` (+ `M0`, `M2` when ordered); `constant` for photon | dense samples and moments of §2 |

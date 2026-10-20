@@ -172,7 +172,9 @@ def full_density_bare_moments(operands, meta, *, mesh_xy, q_ids):
     def term(a, b):
         stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
                                                moment_powers=(a, b),
-                                               qgrid=getattr(meta, 'qgrid', None), **common)
+                                               qgrid=getattr(meta, 'qgrid', None),
+                                               response_window=getattr(meta, 'qgrid_response_window', 'sharp'),
+                                               **common)
         return stream(jnp.zeros(1, complex), jnp.ones((1, 1), complex), pm, pn, ph, energy)[:, 0]
     return term(0, 0), term(1, 0)-term(0, 1)
 
@@ -845,7 +847,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
         pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges,
-        qgrid=qgrid,
+        qgrid=qgrid, response_window=getattr(meta, "qgrid_response_window", "sharp"),
         # One segment program for every pass; the segment index is a runtime argument.
         **({} if stream_pass is None else dict(stream_pass=0)))
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)

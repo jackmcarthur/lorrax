@@ -65,7 +65,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             k_unfold_plan=None,
                             occupations: str = "step",
                             ordered: bool = False,
-                            real_times: bool = False, qgrid=None):
+                            real_times: bool = False, qgrid=None, response_window="sharp"):
     """Build the face or parent imaginary-time response with vertices applied after unfold.
 
     ``real_times``: every node time is real (the parent kernel then reads a
@@ -124,7 +124,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)),
-                 fused, bool(real_times) and fused, qgrid)
+                 fused, bool(real_times) and fused, qgrid, response_window)
     if fermi_dirac:
         cache_key = cache_key + ("fermi_dirac", bool(ordered))
     if cache_key in _chi_minimax_kernel_cache:
@@ -137,14 +137,16 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     if fused:
         kernel = _get_chi_minimax_kernel_fused(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
-            k_unfold_plan=k_unfold_plan, layout=layout, real_times=bool(real_times), qgrid=qgrid)
+            k_unfold_plan=k_unfold_plan, layout=layout, real_times=bool(real_times), qgrid=qgrid,
+            response_window=response_window)
     else:
         kernel = _get_chi_minimax_kernel_face(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
             right_face_shape=right_face_shape,
             vertex_pairs=vertex_pairs,
             k_unfold_plan=k_unfold_plan, layout=layout,
-            fermi_dirac=fermi_dirac, ordered=bool(ordered), qgrid=qgrid)
+            fermi_dirac=fermi_dirac, ordered=bool(ordered), qgrid=qgrid,
+            response_window=response_window)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
@@ -529,7 +531,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
                                  face_shape, *, right_face_shape=None,
                                  vertex_pairs=None,
                                  k_unfold_plan=None, layout="face",
-                                 fermi_dirac=False, ordered=False, qgrid=None):
+                                 fermi_dirac=False, ordered=False, qgrid=None, response_window="sharp"):
     """Build the node Green pair (step masks or Fermi-Dirac KMS weights) and integrate both response orientations."""
     from common.fft_helpers import make_flat_k_fftn, make_response_lattice_fftn
     from distrib_la import gemm_plan
@@ -567,7 +569,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
     _Gv_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
     _Gc_fftn        = make_flat_k_fftn(mesh_xy, kgrid, _G_spec,   norm='ortho')
-    _chi_fftn_local = make_response_lattice_fftn(mesh_xy, kgrid, qgrid, _chi_spec)
+    _chi_fftn_local = make_response_lattice_fftn(mesh_xy, kgrid, qgrid, _chi_spec,
+                                               window=response_window)
 
     _rep0 = P()
     _rep1 = P(None)
@@ -795,7 +798,7 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
 def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
                                   face_shape, *, k_unfold_plan, layout="face",
-                                  real_times=False, qgrid=None):
+                                  real_times=False, qgrid=None, response_window="sharp"):
     """The step-occupation, identity-vertex response read from the raw-parent Green pair.
 
         chi_R(mu, nu) = sum_tau alpha_tau sum_ab conj(Gc'_ab) Gv'_ab   (+ c.c., real contour)
@@ -828,7 +831,8 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
     kconv = make_kconv_chi_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
                                  n_out=n_out, complete=not complex_contour, norm="ortho")
-    chi_fftn = make_response_lattice_fftn(mesh_xy, kgrid, qgrid, _chi_spec)
+    chi_fftn = make_response_lattice_fftn(mesh_xy, kgrid, qgrid, _chi_spec,
+                                         window=response_window)
     chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
     acc_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     rep0, rep1, rep2 = (NamedSharding(mesh_xy, s) for s in (P(), P(None), P(None, None)))
@@ -872,7 +876,7 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
 def _get_chi_fractional_contour_kernel(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int,
     *, layout: str = "face", face_shape=None, k_unfold_plan=None,
-    ordered=False, qgrid=None,
+    ordered=False, qgrid=None, response_window="sharp",
 ):
     """Build the face or parent retarded response on one positive-time sweep.
 
@@ -892,7 +896,7 @@ def _get_chi_fractional_contour_kernel(
     ordered = bool(ordered)
     cache_key = ("fractional_contour", _mesh_key(mesh_xy), grid, ffi_dial_key(),
                  n_out, layout, face_shape, id(k_unfold_plan), ordered,
-                 None if qgrid is None else tuple(qgrid))
+                 None if qgrid is None else tuple(qgrid), response_window)
     if cache_key in _chi_minimax_kernel_cache:
         return _chi_minimax_kernel_cache[cache_key]
 
@@ -902,14 +906,15 @@ def _get_chi_fractional_contour_kernel(
             "face_shape=(nk, nb_full, n_rmu, nspinor)")
     kernel = _get_chi_fractional_contour_kernel_face(
         mesh_xy, grid, n_out, face_shape, k_unfold_plan=k_unfold_plan,
-        layout=layout, ordered=ordered, qgrid=qgrid)
+        layout=layout, ordered=ordered, qgrid=qgrid, response_window=response_window)
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
 
 
 def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs,
                                  layout="face", rule_reference_ry=0.0, moment_powers=(0, 0),
-                                 pair_bounds_ry=None, pair_band_ranges=None, qgrid=None):
+                                 pair_bounds_ry=None, pair_band_ranges=None, qgrid=None,
+                                 response_window="sharp"):
     """Full microscopic one-sided MGKBA commutator on shared time nodes.
 
     Returned ``fn(times,weights,psi_mun,psi_nmu,psi_rho_mun,energy)`` takes
@@ -946,7 +951,7 @@ def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs
     program = _full_density_response_program(mesh_xy, tuple(map(int, kgrid)), tuple(map(int, face_shape)),
         tuple(map(int, q_ids)), int(n_outputs), layout, tuple(map(int, moment_powers)),
         pair_bounds_ry is not None, pair_band_ranges is not None, ffi_dial_key(),
-        None if qgrid is None else tuple(qgrid))
+        None if qgrid is None else tuple(qgrid), response_window)
     # Reference is a small DYNAMIC operand, not a fresh jit closure per E.
     # Only topology, shape and moment powers identify the compiled factory.
     bounds = np.zeros(4) if pair_bounds_ry is None else np.asarray(pair_bounds_ry, float)
@@ -970,7 +975,8 @@ def full_density_response_stream(mesh_xy, kgrid, face_shape, *, q_ids, n_outputs
 
 @lru_cache(maxsize=32)
 def _full_density_response_program(mesh_xy, kgrid, face_shape, q_ids, n_outputs, layout, moment_powers,
-                                   ordered_pair, bounded_bands, dial_key, qgrid=None):
+                                   ordered_pair, bounded_bands, dial_key, qgrid=None,
+                                   response_window="sharp"):
     from common.fft_helpers import make_flat_k_fftn, make_response_lattice_fftn
     from distrib_la import gemm_plan
     from .greens_function_kernel import build_G_tau
@@ -980,7 +986,8 @@ def _full_density_response_program(mesh_xy, kgrid, face_shape, q_ids, n_outputs,
     grid = tuple(map(int, kgrid))
     if nk != int(np.prod(grid)):
         raise ValueError("GATE response_full_density: current full-k carrier required")
-    cfft = make_response_lattice_fftn(mesh_xy, grid, qgrid, CHI_Q_SPEC)
+    cfft = make_response_lattice_fftn(mesh_xy, grid, qgrid, CHI_Q_SPEC,
+                                      window=response_window)
     response_grid = grid if qgrid is None else tuple(int(n) for n in qgrid)
     nq = int(np.prod(response_grid))
     if response_grid != grid and ns not in (1, 2):
@@ -1065,7 +1072,7 @@ def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
     *, k_unfold_plan=None, layout="face", selected_q=None, pair_mode="retarded",
     bank_carry=False, ordered=False, vertex=False, band_ranges=None, stream_pass=None,
-    qgrid=None,
+    qgrid=None, response_window="sharp",
 ):
     """Integrate the retarded response using final occupied and unoccupied band weights.
 
@@ -1144,7 +1151,8 @@ def _get_chi_fractional_contour_kernel_face(
         accumulate_selected = contour_accumulator(mesh_xy)
     grid = tuple(int(n) for n in kgrid)
     nk = int(np.prod(grid))
-    chi_fftn = make_response_lattice_fftn(mesh_xy, grid, qgrid, CHI_Q_SPEC)
+    chi_fftn = make_response_lattice_fftn(mesh_xy, grid, qgrid, CHI_Q_SPEC,
+                                         window=response_window)
     response_grid = grid if qgrid is None else tuple(int(n) for n in qgrid)
     nq = int(np.prod(response_grid))
     cropped_lattice = response_grid != grid
@@ -2433,6 +2441,7 @@ def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
         real_times=real_times, qgrid=getattr(meta, "qgrid", None),
+        response_window=getattr(meta, "qgrid_response_window", "sharp"),
         **_chi_parent_face_kwargs(wfns))
     if compile_only:
         kernel.lower(*args).compile()
@@ -2744,6 +2753,7 @@ def compute_chi0_matsubara(wfns, meta, mesh_xy, *, occupation_state, nu_indices,
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, occupations="fermi_dirac", ordered=ordered,
         qgrid=getattr(meta, "qgrid", None),
+        response_window=getattr(meta, "qgrid_response_window", "sharp"),
         **_chi_parent_face_kwargs(wfns))
     values = kernel(
         nodes, carrier.psi_mun, carrier.psi_nmu, carrier.enk,
@@ -3596,6 +3606,7 @@ def compute_chi0_contour_fractional(
     )
     kernel = _get_chi_fractional_contour_kernel(
         mesh_xy, kgrid, n_out, ordered=ordered, qgrid=getattr(meta, "qgrid", None),
+        response_window=getattr(meta, "qgrid_response_window", "sharp"),
         **_chi_parent_face_kwargs(wfns))
     values = kernel(*args)
     return values[0] if n_out == 1 else values

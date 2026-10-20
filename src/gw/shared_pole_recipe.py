@@ -1394,6 +1394,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if charge4:
         version += '+charge4'
         table = hashlib.sha256((table + '|four-component-spin-traced-v1').encode()).hexdigest()
+    response_window = getattr(meta, 'qgrid_response_window', 'sharp')
+    if response_window != 'sharp':
+        version += '+response_window_' + response_window
+        table = hashlib.sha256((table + '|qgrid_response_window=' + response_window).encode()).hexdigest()
     gate_table = (charge4_gates(not census['trs_allowed']) if charge4 else
                   shared_real_pole_gates_v1_r3b if census['trs_allowed'] else
                   shared_real_pole_gates_ordered_v1)
@@ -1441,6 +1445,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     }
     if charge4:
         result['charge_operator'] = 'four-component-spin-traced-v1'
+    if response_window != 'sharp':
+        result['qgrid_response_window'] = response_window
     if support_receipt is not None:
         result['support_envelope'] = support_receipt
     if sector_treatment is not None:

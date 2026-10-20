@@ -256,11 +256,27 @@ def make_flat_k_fftn(
                            norm=norm, out_spec=out_spec)
 
 
+def validate_response_lattice_window(kgrid, qgrid, window="sharp"):
+    """Authenticate the explicit real-lattice response window, without arrays.
+
+    Fejer uses integer order L=m/2 on each reduced even response axis m.
+    Nonreduced axes are untouched. Reduced odd axes are not yet supported;
+    equal grids always take the legacy identity restriction.
+    """
+    if window not in ("sharp", "fejer"):
+        raise ValueError("GATE response_qgrid_window: want sharp or fejer")
+    target = kgrid if qgrid is None else qgrid
+    if window == "fejer" and any(n != m and m % 2 for n, m in zip(kgrid, target)):
+        raise ValueError("GATE response_qgrid_window: fejer requires every reduced qgrid axis to be even")
+    return window
+
+
 def make_response_lattice_fftn(
     mesh: Mesh,
     kgrid: tuple[int, int, int],
     qgrid: tuple[int, int, int] | None,
     spec: P,
+    *, window="sharp",
 ) -> Callable:
     """Restrict a response lattice product, then transform to the full q BZ.
 
@@ -278,6 +294,10 @@ def make_response_lattice_fftn(
     and does not assert point-group or centroid-home-cell covariance.
     A missing/equal q grid returns the legacy FFT callable, with no crop,
     multiplication or changed arithmetic.
+    Explicit ``window='fejer'`` instead tapers each reduced even axis by
+    max(1-|R|/(m/2),0), zero at the sharp window's boundary. This is a
+    distinct approximation with a nonnegative Fourier averaging kernel;
+    it does not change any subsequent Sigma real-space embedding.
     """
     from itertools import product
     import numpy as np
@@ -294,6 +314,7 @@ def make_response_lattice_fftn(
     target = source if qgrid is None else grid(qgrid, "qgrid")
     if any(n % m for n, m in zip(source, target)):
         raise ValueError("GATE response_qgrid: qgrid must divide the electronic kgrid")
+    window = validate_response_lattice_window(source, target, window)
     fft = make_flat_k_fftn(mesh, target, spec, norm="ortho")
     if source == target:
         return fft
@@ -302,11 +323,14 @@ def make_response_lattice_fftn(
     nk, nq = int(np.prod(source)), int(np.prod(target))
     coordinates = np.indices(target).reshape(3, -1)
     base, alternatives, boundary_axes = [], [], []
+    taper = np.ones(nq)
     for axis, (n, m) in enumerate(zip(source, target)):
         r = np.where(coordinates[axis] <= (m-1)//2,
                      coordinates[axis], coordinates[axis]-m)
         base.append(r % n)
         alternatives.append(np.where(r == -(m//2), m//2, r) % n)
+        if window == "fejer" and m != n:
+            taper *= np.maximum(1.0 - np.abs(r)/(m/2), 0.0)
         if m != n and m % 2 == 0:
             boundary_axes.append(axis)
     images, weights = [], []
@@ -319,7 +343,7 @@ def make_response_lattice_fftn(
             if alternate:
                 rows[axis] = alternatives[axis]
         images.append(np.ravel_multi_index(tuple(rows), source).astype(np.int32))
-        weights.append(weight)
+        weights.append(weight if window == "sharp" else weight*taper)
     # Small static geometry, not closed-over process-local device arrays.
     images, weights = np.stack(images), np.stack(weights)
 

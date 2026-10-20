@@ -126,6 +126,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     nk = int(meta.nk_tot)
     grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     qgrid = tuple(int(n) for n in (getattr(meta, "qgrid", None) or grid))
+    response_window = getattr(meta, "qgrid_response_window", "sharp")
     nq = int(np.prod(qgrid))
     sym = getattr(meta, "q_sym", sym)
     if not np.array_equal(np.asarray(sym.q_irr_full_idx), np.arange(nq)):
@@ -326,6 +327,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         right = (ph if block['name'][0] == 'A' else pm)*jnp.asarray(block['f'])[:,None,None]
         stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
             q_ids=np.arange(nq), n_outputs=len(rule["members"]), layout=layout, qgrid=qgrid,
+            response_window=response_window,
             rule_reference_ry=rule["reference_ry"],pair_bounds_ry=block['bounds'],
             pair_band_ranges=block['band_ranges'])
         raw = stream(jnp.asarray(rule["times"]), jnp.asarray(rule["weights"]), left, pn, right, energy_d)
@@ -616,7 +618,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                                     tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),paired=True)
                                 for rule in prules:
                                     stream=full_density_response_stream(mesh_xy,grid,(nk,nb,nmu,ns),q_ids=[iq],
-                                        n_outputs=1,layout=layout,qgrid=qgrid,rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'],
+                                        n_outputs=1,layout=layout,qgrid=qgrid,response_window=response_window,
+                                        rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'],
                                         pair_band_ranges=block['band_ranges'])
                                     part=stream(jnp.asarray(rule['times']),jnp.asarray(rule['weights']),left,pn,right,energy_d)[:,0]
                                     raw_probe=part if raw_probe is None else raw_probe+part
@@ -718,6 +721,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         centroids=hashlib.sha256(np.asarray(meta.mu_basis.canonical_indices).tobytes()).hexdigest())
     if qgrid != grid:
         identity.update(electronic_grid=list(grid), response_grid=list(qgrid))
+    if response_window != "sharp":
+        identity["qgrid_response_window"] = response_window
     tables = _shared_pole_tables(meta, sym, meta.mu_basis.canonical_indices)
     root = Path(run_dir)/f"{label}_general_shared_pole"
     if jax.process_index() == 0:
@@ -734,6 +739,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     end("persist")
     receipt = dict(construction="full-microscopic-general-shared-pole", n_mu=int(meta.n_rmu),
         n_q=nq, n_k=nk, electronic_grid=list(grid), response_grid=list(qgrid),
+        qgrid_response_window=response_window,
         screening_bands=stop, poles=receipts, checks=checks, moment_checks=moment_checks, sample_seconds=sample_wall,
         seconds=time.monotonic()-started, response_rules=[{k:v for k,v in r.items() if k not in ("times", "weights")}
                                                        for r in rules],

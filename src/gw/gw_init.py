@@ -3438,6 +3438,9 @@ def validate_qgrid_route(config, kgrid):
     from .gw_config import (ComputeMode, QPSolver, ScreeningDiagrams,
                             coerce_screening_diagrams)
     requested = getattr(config, "qgrid", None)
+    from common.fft_helpers import validate_response_lattice_window
+    validate_response_lattice_window(kgrid, requested,
+        getattr(config, "qgrid_response_window", "sharp"))
     if requested is None or tuple(requested) == tuple(kgrid):
         return
     supported = (
@@ -3525,7 +3528,8 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
                             nband_chi=config.bands.chi,
                             nband_sigma=config.bands.sigma,
                             mesh_xy=mesh_xy, mu_basis=mu_basis,
-                            qgrid=getattr(config, "qgrid", None))
+                            qgrid=getattr(config, "qgrid", None),
+                            qgrid_response_window=getattr(config, "qgrid_response_window", "sharp"))
     meta.rank = jax.process_index()
     meta.n_proc = jax.process_count()
     meta.sys_dim = config.sys_dim

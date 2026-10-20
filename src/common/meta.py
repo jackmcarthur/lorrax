@@ -68,6 +68,7 @@ class Meta:
     # Bosonic χ/W grid. None preserves the electronic-grid calculation.
     # The electronic kgrid/nk_tot and all wavefunction layouts stay unchanged.
     qgrid: tuple | None = None
+    qgrid_response_window: str = "sharp"
 
     @property
     def mu_solve_extent(self) -> int:
@@ -130,6 +131,8 @@ class Meta:
                 f"of the electronic kgrid={self.kgrid}; finer or "
                 "incommensurate bosonic grids are not supported")
         self.nq_tot = int(np.prod(self.qgrid))
+        from .fft_helpers import validate_response_lattice_window
+        validate_response_lattice_window(self.kgrid, self.qgrid, self.qgrid_response_window)
         self.qgrid_np = np.asarray(self.qgrid, dtype=np.int32)
         self.qgrid_jax = jnp.asarray(self.qgrid_np)
         self.fft_grid_np = np.asarray(self.fft_grid, dtype=np.int32)
@@ -168,6 +171,7 @@ class Meta:
         mesh_xy=None,
         mu_basis=None,
         qgrid=None,
+        qgrid_response_window="sharp",
     ):
         rank = jax.process_index()
         rank_topo = np.where(np.asarray(jax.devices()) == rank)
@@ -282,4 +286,5 @@ class Meta:
             b_id_4_sigma=b_id_4_sigma,
             mu_basis=mu_basis,
             qgrid=qgrid,
+            qgrid_response_window=qgrid_response_window,
         )
