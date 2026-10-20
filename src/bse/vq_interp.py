@@ -506,7 +506,6 @@ def build_cq_q_chunk(*, nq, nb, ns, n_mu, n_r, mesh_xy):
     from runtime.tiles import tile_units
     n_dev = int(mesh_xy.devices.size)
     face = 16.0 * int(ns) ** 2 * int(n_mu) ** 2 / n_dev
-    fixed = 2.0 * int(n_r) * face
     per_q = 2.0 * 16.0 * int(nb) * int(ns) * int(n_mu) + face
     chunk = tile_units(per_q, int(nq))
     return chunk
@@ -1080,12 +1079,30 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             if nb % ndev:
                 _routes[nb] = True
             else:
-                per = 16.0 * n_mu * (6 * n_mu + 3 * ngkmax)          # C, R, S, Sc, V_delta, V_SRc; ζ̃ and A
-                whole = memory.Price(operands=memory.Term(
-                    per * (nb // ndev), source="whole q tiles per owner (closed form, chooser)"), ranks=ndev)
-                tiled = memory.Price(operands=memory.Term(
-                    spread=nb * per,
-                    source="face tiles (closed form, chooser)"), ranks=ndev)
+                # Each route's chunk program (eigh and split) compiled at its own layout's
+                # abstract operands (C, its ζ slab and the q tables), never run.
+                from runtime.aot_memory import compiled_price
+                tables = lambda sh: tuple(jax.ShapeDtypeStruct((nb, *a.shape[1:]), a.dtype, sharding=sh)
+                                          for a in (v_ref_all, v_lr_all, idx_all, zx["qfr"]))
+                c_abs = jax.ShapeDtypeStruct((nb, n_mu, n_mu), np.complex128, sharding=face3)
+                zeta = lambda spec: jax.ShapeDtypeStruct((nb, n_mu, ngkmax), np.complex128,
+                                                          sharding=NamedSharding(mesh_xy, spec))
+
+                def owners(c, zg, *t):
+                    eigh, split = _kernels(nb)
+                    native = eigh_plan.is_native and distrib_la_batched_route == "auto"
+                    herm = 0.5 * (c + jnp.conj(jnp.swapaxes(c, -2, -1)))
+                    return split(*(eigh(herm) if native else eigh_plan.batched(herm)), zg, *t)
+
+                def tiles(c, zg, *t):
+                    plan, herm, split = _face_parts(nb)
+                    return split(*plan.batched(herm(c)), zg, *t)
+                whole = lambda: compiled_price(owners, c_abs, zeta(P(("x", "y"), None, None)),
+                                               *tables(_qb(nb)[0]), ranks=ndev, face=False,
+                                               arguments=True, source="q-owner chunk program")
+                tiled = lambda: compiled_price(tiles, c_abs, zeta(P(None, None, ("x", "y"))),
+                                               *tables(rep), ranks=ndev, face=True,
+                                               arguments=True, source="face chunk program")
                 _routes[nb] = memory.admit(f"BSE V(q) coarse chunk {nb} x {n_mu}^2", (
                     ("q-batched", whole), ("face", tiled)),
                     int(shared_device_room("BSE V(q) coarse chunk"))) == "face"
@@ -1093,12 +1110,13 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
 
     _face_programs: dict = {}
 
-    def _face_chunk(sl, nb):
-        if nb not in _face_programs:
-            fplan = linalg_plan("eigh", mesh_xy, backend=eigh_backend, n=n_mu,
-                                budget_bytes=shared_device_room("BSE V(q) coarse eigh"))
-            mm = partial(_face_mm, mesh=mesh_xy, batched_route="auto",
-                         budget_bytes=int(shared_device_room("BSE V(q) coarse GEMM")))
+    def _face_parts(nb):
+        # Keyed by the rooms too: the eigh plan and the GEMMs decide their routes in them.
+        rooms = (shared_device_room("BSE V(q) coarse eigh"), int(shared_device_room("BSE V(q) coarse GEMM")))
+        key = (nb, *map(memory.bucket, rooms))
+        if key not in _face_programs:
+            fplan = linalg_plan("eigh", mesh_xy, backend=eigh_backend, n=n_mu, budget_bytes=rooms[0])
+            mm = partial(_face_mm, mesh=mesh_xy, batched_route="auto", budget_bytes=rooms[1])
 
             @partial(jax.jit, out_shardings=face3)
             def herm(c):
@@ -1111,8 +1129,11 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             def split(lam, R, ZGq, v_ref, v_lr, idx, qfr_b):
                 ZG = jax.lax.with_sharding_constraint(ZGq, face3)
                 return _clean_split_body(lam, R, ZG, v_ref, v_lr, idx, qfr_b, mm=mm)
-            _face_programs[nb] = (fplan, herm, split)
-        fplan, herm, split = _face_programs[nb]
+            _face_programs[key] = (fplan, herm, split)
+        return _face_programs[key]
+
+    def _face_chunk(sl, nb):
+        fplan, herm, split = _face_parts(nb)
         lam, R = fplan.batched(herm(C_q[sl]))
         zg = _ns(mesh_xy, P(None, None, ("x", "y")), (nb, n_mu, ngkmax), "prepare_coarse.face_zeta")
         return split(lam, R, zx["ZG"].read_q_slab(sl.start, nb, sharding=zg),

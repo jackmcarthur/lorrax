@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 import hashlib
 import math
 import os
@@ -1501,18 +1501,32 @@ def selection_factor_layout(mesh: Mesh, carrier: int) -> str:
     matrix site); P = 1 is local."""
     if int(mesh.size) <= 1:
         return "local"
+    return _selection_factor_layout(mesh, int(carrier))
+
+
+def _selection_factor_layout(mesh, carrier):
     from lxkit import memory
     from common.gpu_utils import shared_device_room
-    whole = 16.0 * int(carrier) ** 2
-    local = memory.Price(operands=memory.Term(
-        4 * whole, source="replicated L + route (c) Gram, L, workspace on one rank (closed form)"),
-        ranks=int(mesh.size))
-    mesh_price = memory.Price(operands=memory.Term(
-        spread=4 * whole, source="Gram, L, LU factor and pivots on the face (closed form)"),
-        ranks=int(mesh.size))
-    return memory.admit(f"Galerkin selected-state factor {int(carrier)}^2", (
-        ("local", local), ("mesh", mesh_price)),
+    return memory.admit(f"Galerkin selected-state factor {carrier}^2", (
+        ("local", lambda: _factor_price(mesh, carrier, "batch_reshard")),
+        ("mesh", lambda: _factor_price(mesh, carrier, "auto"))),
         int(shared_device_room("Galerkin selected-state factor")))
+
+
+@lru_cache(maxsize=None)
+def _factor_price(mesh, carrier, route):
+    """The selected-state factor's route: its Cholesky and L (replicated on route (c), on the
+    face on the mesh), compiled at the Gram stack's abstract operand."""
+    from distrib_la import plan as linalg_plan
+    from runtime.aot_memory import compiled_price
+    chol = linalg_plan("cholesky", mesh, backend="native2d", n=carrier, batched_route=route)
+    spec = P("x", "y") if route == "auto" else P()
+    gram = jax.ShapeDtypeStruct((1, carrier, carrier), np.complex128,
+                                sharding=NamedSharding(mesh, P(None, "x", "y")))
+    return compiled_price(jax.jit(lambda g: jnp.tril(chol.batched(g)[0]),
+                                  out_shardings=NamedSharding(mesh, spec)), gram,
+                          ranks=int(mesh.size), face=route == "auto",
+                          source=f"selected-state Cholesky ({route}) and L")
 
 
 def _is_replicated(array) -> bool:
