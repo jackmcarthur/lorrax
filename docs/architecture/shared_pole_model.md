@@ -379,6 +379,7 @@ $10^{-12}$. The bare moments are checked where they are produced
 | `recipe`, `recipe_hash` | the resolved recipe (support override and sector treatment fold into the hash); restart and SC maps refuse a stale one |
 | `representation` | model: `scalar-trs-even-s` (W 14) or `scalar-ordered-ph` (W 16); ordered bank: `charge-ordered-z` |
 | `n_q_irr`, `q_irr_full_idx`, `qirr`, `operations` | raw parents and the authorized symmetry rows |
+| `grid`, `electronic_grid` | bosonic response grid and electronic Green grid, respectively; an old header without `electronic_grid` means it equals `grid`. Both domains are authenticated on read. |
 | `n_mu_logical`, `nspinor`, `centroid_digest` | basis identity; the operator is the spin-traced $\mu\times\mu$ charge response for `nspinor` 1, 2 and the four-component kinetic-balance carrier |
 | model: `factor [q, μ, components, Kmax]` complex128, `poles2_ry2 [q, Kmax]` float64, `K [q]` int64 | (W 14) per parent, units Ry$^{3/2}$ and Ry²; inactive columns have $b=0$, $\Lambda=1$ Ry² |
 | bank: `Wc`, `dWc_ds [q, a, μ, μ]` at the dense samples (every id outside the line span $[p_0,p_1)$, rows $a$ skipping it); `M1`, `M3` (+ `M0`, `M2` when ordered); `constant` for photon | dense samples and moments of §2 |
@@ -594,10 +595,24 @@ snapshot producer. This is a general first-order frequency realization,
 not a relaxation of the passive constructor's Gram/pole gates. The
 [TD theory owner](../theory/td_agw_dynamical.md#retarded-reference) specifies
 the upper-endpoint density ordering and reference branch approximation.
-This direct-FFT entry currently requires the complete unshifted k/q grid
-in canonical C order. The centroid-plan owner authenticates coordinates,
-not just identity index tables; permuted or shifted inputs refuse without
-implicitly reordering orbitals or the Coulomb operator.
+This direct-FFT entry requires complete unshifted electronic and response
+grids in canonical C order. They may coincide (the unchanged default), or
+the optional scalar `qgrid` may divide the electronic `kgrid` axis by axis.
+The centroid-plan owner authenticates electronic coordinates, not just
+identity index tables; the separate coarse response domain is checked
+against its own complete canonical q coordinates. Permuted or shifted
+inputs refuse without implicitly reordering orbitals or the Coulomb operator.
+The real-space restriction, normalization, Σ transport and approximation
+limits are owned by [the bosonic response-grid contract](kconv.md#bosonic-response-grid).
+
+`snapshot_runtime.prepare_native_source` retains the complete fine electronic
+orbital and bare-Coulomb carriers. Screening selects the coarse bare-Coulomb
+rows through the symmetry owner's bounded row evaluation; it does not replace
+the fine V used by the electronic source. Response banks, q/−q pairing and
+stored W factors use the bosonic domain, while Green phases and their
+normalization retain the electronic grid. Store `grid` is bosonic and
+`electronic_grid` records the fine domain; missing `electronic_grid` in a
+legacy header means equal grids, not permission to infer a different one.
 
 `greens_function_kernel.density_left_endpoint` forms the full-band
 $\Psi\rho$ face; `w_isdf.full_density_response_stream` keeps its phase on

@@ -20,6 +20,7 @@ This page is the service contract.
 | name | contract |
 |---|---|
 | `SymMaps(wfn)` | The canonical operation source. Requires `wfn.trs_holds`, which becomes `trs_allowed`; a missing verdict refuses, and `allow_trs=` refuses by name. `operation_rows` returns reciprocal rotation, Seitz translation and the antiunitary bit; `cartesian_action(rows, *, axial, time_odd)`, `lorentz_action`, `fft_grid_pullback`, `spinor_action`, `reciprocal_phase` and `unfold_wavefunction` act through the same typed rows. `validate_kgrid_unfolding` checks the tables. |
+| `SymMaps.qgrid_view(qgrid, *, kgrid=None)` | Separate full bosonic q domain whose three positive integer extents divide the electronic grid. Preserves the electronic k/parent and basis-operation arrays; installs canonical coarse q coordinates, identity-only response parents and `q_to_fine_full`, the exact coarse-to-fine physical row map. Equal grids return the original object. |
 | `read_qe_symmetry_receipt`, `bind_qe_symmetry_receipt`, `resolve_qe_symmetry_binding`, `discover_qe_schema_paths`, `qe_xml_seitz_to_bgw` | Bounded `data-file-schema.xml` reader and WFN authentication: matrix orientation, Seitz translation, k rows/grid, spinor count, per-operation antiunitary bits, and QE's pure-TR k-reduction permission. |
 | `build_spatial_operator_tables(wfn)` | `mtrx.T`, translation, Cartesian and spinor tables without a k-map, so the 2c check can measure a reduced WFN that `SymMaps` would refuse. |
 | `KStarMap(irr_idx, sym_idx, n_sym_spatial)`, `.from_sym(sym, nss)`, `.identity(nk)` | The three star arrays bundled so no caller supplies two of three. `select`, `broadcast`, `spread`, `spread_rel`; `rows` (first full-grid row of each star) and `take` (`irr_idx` renumbered onto `rows`) are the one star-row rule every wedge writer uses. |
@@ -30,6 +31,7 @@ This page is the service contract.
 | `unfold_file_wedge_to_full_bz`, `unfold_star_wedge_to_full_bz`, `unfold_file_wedge_polar_matrix`, `unfold_file_wedge_band_operator(sym, data, *, trs_rule)`, `reduce_full_bz_to_file_wedge`, `star_tables_of` | The named unfolds, taking a `SymMaps` so a driver never holds index tables. The FILE wedge (`wfn.kpoints`, `nk_red`, what BerkeleyGW files use) and the STAR wedge (one row per orbit) differ in size on most decks. `unfold_file_wedge_band_operator` takes `trs_rule='conj'` for an observable or `'transpose'` for an operator that transforms like G (Σ_{Θk,mn} = Σ_{k,nm}). |
 | `directed_edge_orbit_table`, `q_stencil_orbit_table`, `apply_band_matrix_symmetry` | Pure-array edge and q-stencil orbit tables and the one band-matrix symmetry action, § [Directed band-matrix edges](#directed-band-matrix-edges). |
 | `unfold_isdf_operator(V_q_ibz, *, irr_idx, sym_idx, sym_perm, L_table, q_irr_frac, mesh_xy, n_sym_spatial, trs_rule='conj', ...)` | Centroid-indexed operator IBZ → full BZ: double centroid gather, umklapp L-phase, antiunitary conjugation. `shard_map` with paired `all_to_all`; one single-tile peak per rank. |
+| `QirrOperator.at_rows(q_full_rows, *, mesh_xy=None)` | Values at valid integer full-zone row IDs, in requested order. The exact stored representative-row sequence returns the existing values; whole-zone operators gather their rows. Other requests on a reduced operator require `mesh_xy` and unfold only the requested rows through the same symmetry owner, without a full-q tensor or host centroid gather. |
 | `unfold_operator_local(...)` | The manual-mode body of the same unfold for a caller already inside an `('x','y')` `shard_map`: one local parent tile in, the rank's full-k tile out. Endpoint tables are runtime operands, so changed tables reuse one executable. Both endpoints must be orbit-packed (the caller's plan certifies it); `left_mesh_axis`/`right_mesh_axis` name the axis whose table shard this rank holds, `None` meaning already local. |
 | `unfold_isdf_one_leg`, `isdf_one_leg_source_slots`, `unfold_spin_centroid_operator`, `open_spin_block_coefficient(U, a, b)` | One-leg (parent-G relabelling, scalar/polar transport) and spin-operator unfolds; `open_spin_block_coefficient` gives one block `coef[k,c,d] = U_k[a,c]·conj(U_k[b,d])` of `U O U†`. |
 | `mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None)` | Mixes charge/current sectors by Λ⊗Λ from `SymMaps.lorentz_action`; callers supply no rotation convention. `sym_idx` is host metadata. |
@@ -47,6 +49,17 @@ This page is the service contract.
 | `QgridTrsPolicy.measure_covariance`, `little_group_covariance_residual` | The little-group covariance the unfold assumes, measured with the same authorized row, centroid permutation, umklapp phase and conjugation; `nan` when no non-identity little-group operation exists. |
 | `project_little_group_operator(operator, *, transposed_partner, ...)` | Average over all authorized unitary and antiunitary stabilizers of each q. Returns the average and its transpose at `P(None,'x','y')`, one operation per loop step, with volume-preserving `all_to_all` for nonlocal permutations; each matrix stays ≤ `b·M·M/P` entries per rank. |
 | `self_negative_q_mask(q_full_idx, *, kgrid)`, `minus_q_parent_partners`, `trs_pair_coherent_unfold_sym_idx`, `trs_project_self_negative_q_rows` | The one-element orbits of q → −q (every TRIM of an even mesh, Γ alone on an odd one), where the fixed-q Θ projector acts, and the pair-coherent row map. |
+
+An independent response grid is a full-BZ domain, not a subset near Γ.
+`qgrid_view` requires a complete electronic grid and one authenticated identity
+operation. It does not grant the original spatial reduction to the restricted
+response: every coarse q is its own parent. Keep this response view separate
+from the electronic carrier's maps. `q_to_fine_full` accounts for the original
+fine row order; it is not an assumption that the fine grid was stored in C order.
+To read the corresponding bare operator, pass those fine row IDs to
+`QirrOperator.at_rows(..., mesh_xy=mesh_xy)`, not coarse IDs into the fine operator.
+The restriction and its approximation limits are owned by
+[the bosonic response-grid contract](../architecture/kconv.md#bosonic-response-grid).
 
 `unfold_v_q`, `trs_augment_U`, `compute_centroid_sym_perm`,
 `compute_rgrid_sym_perm` and `build_real_space_syms` are call-through

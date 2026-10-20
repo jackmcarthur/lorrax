@@ -66,6 +66,19 @@ $$
 with positive times t_l and weights h_l from a damped-line rule, followed by
 one FFT R → q.
 
+The optional scalar `qgrid` changes only the bosonic output lattice. Greens
+still use the complete electronic `kgrid`; the real-space spin product is
+restricted before its smaller forward FFT by the shared response-transform
+owner. `selected_q` and full-density `q_ids` then name canonical rows of that
+coarse full BZ, not a near-Γ subset of the fine grid. Equal grids take the
+legacy transform directly. The crop, normalization and approximation limits
+are specified in [the bosonic response-grid contract](kconv.md#bosonic-response-grid).
+With different grids the old fused fine-grid q-store is disabled: the native
+R-space product is retained, then restricted and transformed. Thus Green
+construction and its electronic transforms do not become cheaper merely
+because fewer response rows are stored; the smaller bank and downstream
+Dyson/shared-pole work are the intended saving.
+
 **Band weights.** `_occupation_support_slices` returns the smallest
 contiguous band ranges on which |f|, respectively |1 − f|, is at least
 10⁻⁵ (`gw.efermi.band_in_occupation_window`). MP overshoot is kept by magnitude, and a
