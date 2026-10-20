@@ -58,19 +58,6 @@ def _local_gemm_temp(shapes, dtype, device):
     return int(memory.temp_size_in_bytes)
 
 
-@lru_cache(maxsize=128)
-def _local_eigh_temp(shape, dtype, device):
-    """Compile the local batched eigh at ``shape`` on one device, without running it: its
-    temp + outputs (the solver's workspace is an XLA buffer on CUDA)."""
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import SingleDeviceSharding
-    sh = SingleDeviceSharding(device)
-    fn = jax.jit(jnp.linalg.eigh, in_shardings=sh)
-    memory = fn.lower(jax.ShapeDtypeStruct(shape, np.dtype(dtype), sharding=sh)).compile().memory_analysis()
-    return int(memory.temp_size_in_bytes) + int(memory.output_size_in_bytes)
-
-
 def _off_cuda(plan, op, shapes, dtype):
     """Off CUDA: a host mesh and the XLA dot count their scratch in the compiled program
     (zero vendor bytes); a ROCm eigh's vendor bytes are the leg's measured rows
@@ -226,73 +213,6 @@ def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
     provider = resolve_matmul_backend(backend, mesh, batched_route=route)
     return int(_gemm_workspace_details(mesh, shapes, dtype,
         local=route == ROUTE_BATCH_RESHARD, backend=provider)['device_bytes'])
-
-
-def _local_kernel_workspace(mesh, op, shapes, dtype):
-    """Workspace of the device-local kernel that route (c) runs, per rank.
-
-    eigh: the local vendor query (cuSolverDn syevd) on CUDA; on host meshes the
-    LAPACK ``?heevd``/``?syevd`` optimal workspace, which is a closed formula
-    (complex: lwork = 2n + n^2, lrwork = 1 + 5n + 2n^2, liwork = 3 + 5n; real:
-    lwork = 1 + 6n + 2n^2, liwork = 3 + 5n). gemm: the compiled local batched
-    matmul temporary. Route (c) solves a rank's local rows (the leading
-    extent of the first shape) in one batched eigh, so eigh reserves one
-    workspace per local row.
-    """
-    import jax
-    if op == 'eigh':
-        n = max(s[-1] for s in shapes)
-        rows = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
-        return _local_eigh_temp((rows, n, n), dtype.str, jax.local_devices()[0])
-    if op in ('gemm', 'matmul'):
-        return _local_gemm_temp(tuple(shapes[:2]), dtype.str, jax.local_devices()[0])
-    raise ValueError('fits_local op must be eigh or gemm')
-
-
-def fits_local(plan, op, shapes, dtype, budget_bytes, batch=None) -> bool:
-    """Whether one rank holds the caller's live set and the local kernel's workspace.
-
-    Parameters
-    ----------
-    plan : Plan or GemmPlan
-        Supplies the mesh (platform decides which workspace model applies).
-    op : {'eigh', 'gemm'}
-        The local kernel route (c) or a batch-layout operand runs.
-    shapes : tuple of tuples
-        The caller's whole per-rank live set of dense operands, e.g.
-        ``((local_batch, n, n),) * 2`` for an eigh input and its vectors, or
-        eight ``(1, R, R)`` blocks for a pencil reduction. Complete matrices,
-        not face tiles: this is the fit-on-one-device question.
-    dtype : numpy dtype
-        float64 or complex128.
-    budget_bytes : int
-        Device bytes per rank the caller admits for this stage. Pass a value
-        every rank agrees on (a deck budget), never a per-rank measurement:
-        the answer selects collectives.
-    batch : int, optional
-        The caller's whole stack count. Below the rank count the batch layout
-        pads every rank to a whole matrix with ``P - batch`` of them idle, so it
-        fits only within ``GATHERED_EIGH_BYTES`` (``distrib_la.plan.place``).
-
-    Returns
-    -------
-    bool
-        ``sum(prod(shape)) * itemsize + workspace <= budget_bytes``.
-    """
-    shapes = _shapes(shapes)
-    dtype = np.dtype(dtype)
-    if dtype not in (np.dtype('float64'), np.dtype('complex128')):
-        raise TypeError('fits_local supports float64 and complex128')
-    budget = operator.index(budget_bytes)
-    live = sum(int(np.prod(s)) for s in shapes) * dtype.itemsize
-    if batch is not None and int(batch) < plan.mesh.devices.size:
-        from distrib_la.plan import GATHERED_EIGH_BYTES
-        budget = min(budget, GATHERED_EIGH_BYTES)
-    try:
-        workspace = int(_local_kernel_workspace(plan.mesh, op, shapes, dtype))
-    except RuntimeError:            # a shape the vendor cannot size is no local candidate
-        return False
-    return live + workspace <= budget
 
 
 def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:

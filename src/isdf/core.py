@@ -1790,24 +1790,30 @@ def _refuse_kappa(kap, *, where: str, estimator: str, mode: str) -> None:
         print("*** " + line, flush=True)
 
 
-def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh) -> str:
+def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh, n_rmu_logical: int) -> str:
     """``"local"``: the hoisted per-q LU on whole tiles (replicated or q-parallel) and the
     q-owner back-solve and V; ``"mesh"``: C⁻¹ on the face from one mesh LU solve per q
     and ζ = C⁻¹Z, V on the face (``ZetaG``, kind ``'inverse'``). The faster route that fits
-    beside what is live (owner rule 2026-10-19: a mesh backup at every whole-matrix site)."""
+    beside what is live (owner rule 2026-10-19: a mesh backup at every whole-matrix site),
+    each priced by its own factor compiled at the face C_q (never run); the apply's whole
+    tiles are admitted where it runs (route G, ``check_chunk``)."""
     ndev = int(mesh_xy.devices.size)
     if ndev <= 1:
         return "local"
     from lxkit import memory
     from common.gpu_utils import shared_device_room
-    whole, owned = 16.0 * int(n_rmu) ** 2, -(-int(nq) // ndev)
-    batch = owned if _qparallel_factor_ok(nq, n_rmu, mesh_xy) else min(
-        int(nq), _replicated_factor_q_chunk(nq, n_rmu))
-    local = memory.Price(operands=memory.Term(
-        whole * (2 * batch + 3 * owned),
-        source="factor batch (C, LU) + owned LU, V, Z tiles (closed form, chooser)"), ranks=ndev)
-    mesh_price = memory.Price(operands=memory.Term(
-        spread=4 * whole * int(nq), source="C, C^-1, I, V faces (closed form, chooser)"), ranks=ndev)
+    from distrib_la.workspace import lu_workspace_bytes
+    from runtime.aot_memory import compiled_price
+    c = jax.ShapeDtypeStruct((int(nq), int(n_rmu), int(n_rmu)), jnp.complex128,
+                             sharding=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+    n_log = int(n_rmu_logical)
+    local = lambda: compiled_price(lambda C: _factor_c_q_transverse_lu(C, mesh_xy, n_log), c,
+                                   ranks=ndev, face=False, source="per-q LU on whole tiles")
+    mesh_price = lambda: compiled_price(
+        lambda C: _factor_c_q_transverse_inverse(C, mesh_xy, n_log), c, ranks=ndev, face=True,
+        source="mesh LU inverse on the face") + memory.Price(vendor=memory.Term(
+            float(lu_workspace_bytes(mesh_xy, int(n_rmu), jnp.complex128)),
+            source="cuSOLVERMp solve_lu workspace (measured row)"), ranks=ndev)
     return memory.admit(f"transverse zeta factor {int(nq)} x {int(n_rmu)}^2", (
         ("local", local), ("mesh", mesh_price)),
         int(shared_device_room("transverse zeta factor")))
@@ -2178,7 +2184,7 @@ def factor_c_q(
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
-        if transverse_factor_layout(int(nq), int(n_rmu), mesh_xy) == "mesh":
+        if transverse_factor_layout(int(nq), int(n_rmu), mesh_xy, n_rmu_logical) == "mesh":
             # (C⁻¹, None): the caller's factor kind is 'inverse' (ζ = C⁻¹Z on the face).
             inverse, eta_q, kappa_q = _factor_c_q_transverse_inverse(
                 C_q, mesh_xy, n_rmu_logical)

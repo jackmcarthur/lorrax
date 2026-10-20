@@ -485,8 +485,7 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     """A fixed-width batch of parents with every matrix tiled over all ranks.
 
     ``room`` is the room the pencil's eigh stacks are decided against
-    (``face_eigh``), or a function of this round's program price at its
-    actual side (``face_reduction_bytes``). ``carrier`` is the kept-span width of an
+    (``face_eigh``; the batch admission's row beside its compiled program). ``carrier`` is the kept-span width of an
     ordered reduction (``face_ritz_carrier``), None solving the whole H'_vv
     side. ``eigh_backend`` is the deck's eigh request (``face_eigh``). A short last round's synthetic slots repeat its last parent
     (``parent_rounds``); callers read only the leading real slots. An ordered round's
@@ -504,9 +503,6 @@ def face_reduce_round(states,infinity,tables,*,mesh,budget,ordered,odd_moments,
     packed=pack_panels(tuple([s[k] for s in states] for k in (1,2,3)),tables['order'],
                        [int(s[1].shape[-1]) for s in states],mesh_xy=mesh,layout='face')
     args=(tables['points'],tables['active'],*packed,tuple(infinity))
-    if callable(room):
-        room=room(face_reduction_bytes(mesh,int(tables['active'].shape[0]),rows=int(states[0][1].shape[-2]),
-                                       side=side,carrier=carrier,retain_span=retain_span))
     executable,run=program(room).checked(*args).compiled(*args)
     if beside is not None:
         price_round(executable,mesh,beside)
@@ -608,12 +604,12 @@ def _face_price(mesh, rows, width, side, phase, **terms):
 
 def face_round_compiled_bytes(mesh, width, *, rows, finite, infinity_width, infinities, ordered,
                               odd_moments, keep_budget, carrier, eigh_backend, room):
-    """Per-rank bytes of ``face_parent_program`` for ``width`` parents, compiled (temp + outputs
-    - alias; never run) at abstract operands of the round's layout: ``finite`` packed columns of
+    """Per-rank bytes of ``face_parent_program`` for ``width`` parents, compiled
+    (``compiled_new_bytes``, the largest any rank read; never run) at abstract operands of the round's layout: ``finite`` packed columns of
     ``rows`` rows (Q, WQ, dWQ on the face), ``infinities`` infinity panels of ``infinity_width``,
     the pencil side ``finite`` plus the infinity block, its eighs decided in ``room``."""
     import jax
-    from runtime.aot_memory import compiled_new_bytes
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     block = (2 * int(infinity_width) if odd_moments else 0) if ordered else int(infinity_width)
     side, b, n = int(finite) + block, int(width), int(rows)
@@ -624,7 +620,7 @@ def face_round_compiled_bytes(mesh, width, *, rows, finite, infinity_width, infi
     plan = face_eigh(mesh, side, room=room, backend=eigh_backend)
     program = face_parent_program(mesh, bool(ordered), bool(odd_moments), keep_budget, False, side,
                                   None, plan, None if carrier is None else int(carrier), plan_room(plan))
-    return int(compiled_new_bytes(program.checked(*args).compiled(*args)[0]))
+    return -agreed_chunk(-compiled_new_bytes(program.checked(*args).compiled(*args)[0]))
 
 
 def face_reduction_bytes(mesh, width, *, rows, side, carrier, retain_span=False):
@@ -648,25 +644,23 @@ def face_check_bytes(mesh, rows, side):
     return _face_price(mesh, rows, 1, side, 'model')
 
 
-def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, program_bytes,
-                     selection=None, extra=lambda width: 0, eigen_side=None, compiled=None):
+def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, compiled,
+                     selection=None, extra=lambda width: 0, eigen_side=None):
     """Largest whole-mesh parent batch whose selection and reduction fit.
 
     The scalar face route runs a batch of physical parents per round, every
     matrix tiled over all ranks (``face_reduce_round``); the bispinor sectors
     size their rounds by P instead (``shared_pole_sectors.sector_route``). Before
     any bank read, at the conservative recipe side, the ``selection`` price
-    (its ``quote`` arguments) may reject a width; the reduction program's
-    price at that width (``program_bytes(width)``: ``shared_pole_byte_terms``
-    tiled over the mesh) proposes it and the eigh room beside it; ``compiled(width,
-    room)``, the program compiled at that width's abstract operands, admits it,
-    beside ``extra(width)`` resident bytes (the formula alone where this host has
-    no whole-mesh eigh for an exhausted room). Every rank compiles the same shapes. Widths start at every parent, so a deck that
-    fits runs one round and compiles each program once per shape, and step
-    down in proportion to the whole price. The constructor still admits every
-    phase at its actual side.
+    (its ``quote`` arguments) may reject a width; ``compiled(width, room)``, the
+    reduction program compiled at that width's abstract operands with its eighs
+    decided in the room beside the operands alone (the largest), admits it beside
+    ``extra(width)`` resident bytes. Every rank compiles the same shapes. Widths start
+    at every parent, so a deck that fits runs one round and compiles each program once
+    per shape, and step down in proportion to the whole price. The constructor still
+    admits every phase at its actual side.
     """
-    from gw.shared_pole_capacity import ConstructorCapacity
+    from gw.shared_pole_capacity import ConstructorCapacity, face_eigh_room
 
     budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
                                  upstream=upstream, execution='face')
@@ -682,19 +676,11 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
         if picked is not None and picked['device_budget_status'] != 'PASS' and width > 1:
             width -= 1
             continue
-        price = budget.program_bytes = max(1, int(program_bytes(width)))
+        budget.program_bytes = 0
+        room = face_eigh_room(row('reduction', extra(width), eigen_side=eigen_side),
+                              stage="shared-pole constructor batch admission")
+        price = budget.program_bytes = max(1, int(compiled(width, room)))
         reduction = row('reduction', extra(width), eigen_side=eigen_side)
-        if compiled is not None:
-            from gw.shared_pole_capacity import face_eigh_room
-            try:     # no room beside the proposal: its eighs on the whole mesh (minimum footprint)
-                got = compiled(width, face_eigh_room(reduction, stage="shared-pole constructor batch admission"))
-            except RuntimeError as exc:                        # no whole-mesh eigh on this host
-                if "eigh_capacity_route" not in str(exc):
-                    raise
-                got = None
-            if got is not None:
-                price = budget.program_bytes = max(1, int(got))
-                reduction = row('reduction', extra(width), eigen_side=eigen_side)
         receipt = dict(parent_batch=width, program_bytes_per_rank=price, selection=picked, reduction=reduction)
         if reduction['device_budget_status'] == 'PASS' or width == 1:
             return width, receipt
