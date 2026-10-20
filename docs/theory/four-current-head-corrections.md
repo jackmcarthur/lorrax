@@ -250,8 +250,8 @@ The derivation and branch assignment are owned by
   by the measured magnetic group. HL's real probe cannot resolve an odd
   residue and keeps the single-residue fit.
 * On a time-reversal-broken scalar shared-pole store `full` folds the signed
-  body and Lehmann wings (`gw.shared_pole_head`); an ordered metal refuses it
-  (`GATE shared_pole_head_ordered`).
+  body and Lehmann wings (`gw.shared_pole_head`), on an ordered metal with
+  the pair-split wings of [metal head §5](metal-q0-head.md#5-limits-of-the-model).
 
 ## 4. The packed static photon head
 
