@@ -226,7 +226,7 @@ new measurements, not flag speculation or accuracy-gate relaxation.
 
 ## Specific remaining opportunities, not measured gains
 
-### Implemented value-only contour path; native timing still required
+### Value-only contour path: native proof and measured FAST17 stream
 
 Source `7aa8f92` switches only the full-density general-W caller to the
 existing public `minimax.analytic_box_rule` value primitives. The old path
@@ -243,7 +243,7 @@ are formed with non-growing endpoint references to avoid zero-times-infinity
 arithmetic. Tiny full-complex CPU oracles cover all four blocks, current
 coherences, and both fine and Fejer-restricted response grids.
 
-This node reduction is **not a measured GPU speedup or a sub60s cycle**.
+This host node reduction alone is **not a measured GPU speedup or a sub60s cycle**.
 Full750 Green GEMMs, momentum transforms, Dyson, direction selection and
 frequency reduction still need native timing and admission. See
 [the bounded host certificate record](evidence/COMPLEX_BOX_HOST_CERTIFICATES.json).
@@ -252,6 +252,55 @@ maximum literal complex error `2.14446e-9`, maximum scalar certificate
 `9.76432e-9 < 1e-8`, full response plus all four blocks, two current E/rho
 inputs, and both fine and Fejer grids. Its22.8645s tiny-fixture time is not
 a material refresh time. See [native proof evidence](evidence/COMPLEX_BOX_NATIVE_P4_60065589.json).
+
+The subsequent material trial used exact source `17dd65a`, step
+`60065876.0`, the same accepted q4 Fejer input frame7/750-band tail, active44
+`[100,144)`, full750 screening/virtual space and3000 centroids. It used the
+ordinary **updated-W** callback, not the source-frozen diagnostic. The only
+private TD-deck change was25as to20as, below the previous24.47as stability
+limit; all native fit, held, Laplace, Sigma, number and Pauli gates stayed
+active. This does not pre-admit the new trajectory.
+
+| Synchronized general-W phase | Seconds |
+| --- | ---: |
+| Setup | 1.406719 |
+| Scalar planning | .907207 |
+| Stream:856 physical pairs,34 panels | **86.659068** |
+| Dyson | 2.817703 |
+| Directions | 6.966241 |
+| Pencil assembly | 4.425004 |
+
+The scalar value certificate was `7.607e-9 < 1e-8`, with coefficient mass
+62.59. Within the stream,34 `bank.compile.direct` calls summed to **29.9s**
+in the one-decimal stage log (28 printed nonzero);34 actual native dispatches
+summed to **55.7s**. Admission printed0.0s. These rounded child-stage sums
+are not independent exact timers; their85.6s sum is close to, but does not
+replace, the86.659s synchronized inclusive stream. It is not a warm-run
+measurement, and55.7s dispatch alone is not a sub60s full W cycle.
+
+The q0 realization again produced an **inadmissible fitted UHP pole**:
+order424, growth `1.00669735135 Ry`, eta margin `-.988322696935 Ry`, moment
+errors `[3.838029616, .003838402]`. Native `shared_general_laplace` refused
+it; no physical-gain interpretation, pole clipping, fallback source W or
+gate relaxation was used. No admitted full W, ordered Sigma44, t0 collision
+or TD followed. The enclosing125.3s collision timer includes the early q0
+refusal and two offset diagnostic probes; it is not a successful refresh.
+The separate initial equilibrium source W took75.4s and protected160 Sigma
+tau17.2s; those are preparation, not the requested updated-W result.
+
+The old405.294s and new86.659s streams are real measurements, but their
+ratio is not an isolated matched optimization experiment: request/origin
+fixes also changed the source between revisions. In particular, this run
+does **not** achieve the below60s total-W target. A proper next comparison
+must hold one resident accepted source, transfer-frequency sites, accuracy,
+current E/U/rho and constructor policy fixed while changing only the named
+response partition or node-carrier scheduling.
+
+The job was released at terminal failure:402s×16 = **1.78667 reserved GPUh**,
+391s×16 = **1.73778 active GPUh**. They are nonadditive views, not two charges.
+All16 raw logs, small receipts and the frequency-only q0 capture are local
+under `material_ownq4_zero44_FAST17_60065876/` at the campaign artifact root.
+See [the source-pinned phase/accounting receipt](evidence/GENERAL_W_FAST17_TIMING_60065876.json).
 
 ### Correction: the707 t0 request was not on its instantaneous shells
 
