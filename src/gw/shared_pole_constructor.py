@@ -27,7 +27,8 @@ from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                              max_workspace_bytes=4*1024**3, fixed_spaces=None,
-                             frequency_scale_ry=1., coordinate_units=None):
+                             frequency_scale_ry=1., coordinate_units=None,
+                             structure=None, output_gram=None):
     """One canonical owner of a reduced host pencil's modal gauges.
 
     Every rank supplies the same gathered ``E,A[l,r]``; ONLY rank zero runs
@@ -41,10 +42,12 @@ def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     if int(process_count()) == 1:
         return reduce_general_pencil(E, A, max_order=max_order, rank_tolerance=rank_tolerance,
             max_workspace_bytes=max_workspace_bytes, fixed_spaces=fixed_spaces,
-            frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units)
+            frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units,
+            structure=structure,output_gram=output_gram)
     return collective_general_pencil_batch([(E,A)], max_order=max_order,
         rank_tolerance=rank_tolerance, max_workspace_bytes=max_workspace_bytes,
-        fixed_spaces=[fixed_spaces],frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units)[0]
+        fixed_spaces=[fixed_spaces],frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units,
+        structure=structure,output_grams=None if output_gram is None else [output_gram])[0]
 
 
 def general_pencil_workspace_bytes(shape):
@@ -59,7 +62,7 @@ def general_pencil_workspace_bytes(shape):
 
 
 def general_pencil_batch_plan(shapes, *, max_order, max_workspace_bytes=4*1024**3,
-                             processes=None, retained_host_bytes=0):
+                             processes=None, retained_host_bytes=0, input_matrix_count=2):
     """Price a prefix of at most P SMALL reduced pencils before host gather.
 
     Two disjoint phases are priced, not summed: one assigned LAPACK solve
@@ -70,7 +73,7 @@ def general_pencil_batch_plan(shapes, *, max_order, max_workspace_bytes=4*1024**
     """
     from common.collectives import process_count
     world=int(process_count()) if processes is None else int(processes)
-    if world<1 or int(max_order)<1 or int(retained_host_bytes)<0:
+    if world<1 or int(max_order)<1 or int(retained_host_bytes)<0 or input_matrix_count not in (2,3):
         raise ValueError('GATE shared_general_capacity: invalid batch capacity metadata')
     shapes=[tuple(map(int,s)) for s in shapes]
     if not shapes or any(len(s)!=2 or min(s)<1 for s in shapes):
@@ -78,7 +81,7 @@ def general_pencil_batch_plan(shapes, *, max_order, max_workspace_bytes=4*1024**
     accepted=None
     for width in range(1,min(world,len(shapes))+1):
         batch=shapes[:width]
-        inputs=[32*l*r for l,r in batch]
+        inputs=[16*input_matrix_count*l*r for l,r in batch]
         reduce=[general_pencil_workspace_bytes((l,r)) for l,r in batch]
         orders=[min(int(max_order),l,r) for l,r in batch]
         models=[16*k*(1+2*l+2*r) for (l,r),k in zip(batch,orders)]
@@ -147,7 +150,8 @@ def _share_general_pencil(model, error, *, owner_rank, price, shape):
 
 def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
                                    max_workspace_bytes=4*1024**3, fixed_spaces=None,
-                                   retained_host_bytes=0,frequency_scale_ry=1.,coordinate_units=None):
+                                   retained_host_bytes=0,frequency_scale_ry=1.,coordinate_units=None,
+                                   structure=None,output_grams=None):
     """Reduce at most P gathered frequency pencils concurrently, one owner each.
 
     The DRIVER gathers this admitted SMALL prefix on ALL ranks before entry.
@@ -159,8 +163,15 @@ def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
     from common.collectives import process_count, process_rank
     world,rank=int(process_count()),int(process_rank())
     pencils=list(pencils)
+    if structure is not None and (not isinstance(structure,dict)
+                                 or structure.get('kind')!='equilibrium_definite'):
+        raise ValueError('GATE shared_equilibrium_structure: explicit equilibrium_definite kind required')
+    grams=[None]*len(pencils) if output_grams is None else list(output_grams)
+    if len(grams)!=len(pencils) or (structure is not None and any(g is None for g in grams)):
+        raise ValueError('GATE shared_equilibrium_output: one output Gram per pencil required')
     plan=general_pencil_batch_plan([e.shape for e,a in pencils],max_order=max_order,
-        max_workspace_bytes=max_workspace_bytes,processes=world,retained_host_bytes=retained_host_bytes)
+        max_workspace_bytes=max_workspace_bytes,processes=world,retained_host_bytes=retained_host_bytes,
+        input_matrix_count=3 if structure is not None else 2)
     if len(pencils)>world or plan['batch_size']!=len(pencils):
         raise ValueError('GATE shared_general_capacity: caller must gather only the metadata-admitted batch prefix')
     fixed=[None]*len(pencils) if fixed_spaces is None else list(fixed_spaces)
@@ -174,7 +185,8 @@ def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
             e,a=pencils[rank]
             model=reduce_general_pencil(e,a,max_order=max_order,rank_tolerance=rank_tolerance,
                 max_workspace_bytes=max_workspace_bytes,fixed_spaces=fixed[rank],
-                frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units)
+                frequency_scale_ry=frequency_scale_ry,coordinate_units=coordinate_units,
+                structure=structure,output_gram=grams[rank])
         except Exception as exc:
             error=exc
     if world==1:
@@ -190,7 +202,8 @@ def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
 
 def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                           max_workspace_bytes=4 * 1024 ** 3, fixed_spaces=None,
-                          frequency_scale_ry=1.,coordinate_units=None):
+                          frequency_scale_ry=1.,coordinate_units=None,
+                          structure=None,output_gram=None):
     """Bounded host reduction of ONE general tangential frequency pencil.
 
     Only ``E,A[l,r]`` (complex128) cross this seam, never full microscopic
@@ -216,6 +229,11 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
     ``Wc(z)=left@diag(1/(z-poles_ry))@right.H``. Workspace is conservatively
     priced before any factorization. Infinite/defective poles refuse.
     """
+    if structure is not None:
+        if coordinate_units is not None:
+            raise ValueError('GATE shared_equilibrium_coordinates: independent row/column units are not a congruence')
+        return _reduce_equilibrium_pencil(E,A,output_gram,structure=structure,max_order=max_order,
+            rank_tolerance=rank_tolerance,max_workspace_bytes=max_workspace_bytes,fixed_spaces=fixed_spaces)
     import numpy as np
     import scipy.linalg as la
     import hashlib
@@ -338,6 +356,103 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                              frequency_equilibration=equilibration,
                              eigensolver="current-descriptor-balanced-ordinary-geev",
                              construction="general-two-sided-tangential-loewner"))
+
+
+def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
+                               rank_tolerance, max_workspace_bytes, fixed_spaces):
+    """Opt-in same-state ``O[(z+i gamma)G-H]^-1 O.H`` host reduction.
+
+    G/H and O.H O are small square frequency matrices, never microscopic
+    ports. The caller must authenticate the equilibrium definite-member
+    premise; this function does not classify a physical density. It is not
+    selected by the production builder. Null directions require current
+    metric/output loss witnesses, not a pole or positive-eigenvalue repair.
+    """
+    import numpy as np
+    import scipy.linalg as la
+    started=time.perf_counter()
+    shape=np.shape(G)
+    if (not isinstance(structure,dict) or structure.get('kind')!='equilibrium_definite'
+            or len(shape)!=2 or shape[0]!=shape[1] or shape[0]<1 or np.shape(H)!=shape
+            or output_gram is None or np.shape(output_gram)!=shape
+            or int(max_order)<1 or not 0<float(rank_tolerance)<1):
+        raise ValueError('GATE shared_equilibrium_pencil: square G/H and explicit output Gram required')
+    price=general_pencil_workspace_bytes(shape)
+    if price>int(max_workspace_bytes):
+        raise ValueError('GATE shared_equilibrium_capacity: host workspace exceeds bound before copies/eigh')
+    gamma=float(structure.get('gamma_ry',np.nan))
+    if not np.isfinite(gamma) or gamma<0:
+        raise ValueError('GATE shared_equilibrium_gamma: finite nonnegative uniform lag required')
+    g,h,n=(np.asarray(a,np.complex128) for a in (G,H,output_gram))
+    if any(not np.isfinite(a).all() for a in (g,h,n)):
+        raise ValueError('GATE shared_equilibrium_pencil: nonfinite frequency matrices')
+    eps=np.finfo(float).eps;size=shape[0];rounding=128*size*eps
+    for a in (g,h,n):
+        if la.norm(a-a.conj().T)>rounding*max(la.norm(a),np.finfo(float).tiny):
+            raise ValueError('GATE shared_equilibrium_hermiticity: non-Hermitian frequency matrix')
+    # Only roundoff antisymmetry is normalized; no spectrum is floored.
+    g,h,n=((a+a.conj().T)*.5 for a in (g,h,n))
+    hn=la.norm(h);gn=la.norm(g);on=la.norm(n)
+    nev=la.eigvalsh(n,check_finite=False)
+    if nev[0]<-rounding*max(on,np.finfo(float).tiny):
+        raise ValueError('GATE shared_equilibrium_output: output Gram has resolved negative eigenvalue')
+    held=fixed_spaces is not None
+    if held:
+        base=np.asarray(fixed_spaces['right'],complex)
+        if (base.ndim!=2 or base.shape[0]!=size or not 0<base.shape[1]<=int(max_order)
+                or not np.array_equal(base,np.asarray(fixed_spaces['left'])) or not np.isfinite(base).all()):
+            raise ValueError('GATE shared_equilibrium_basis: held left/right spaces must be the SAME congruence')
+        hp=base.conj().T@h@base
+    else:
+        base=np.eye(size,dtype=complex);hp=h
+    eigen,u=la.eigh(hp,check_finite=False)
+    hs=max(float(np.max(abs(eigen))),np.finfo(float).tiny)
+    if eigen[0]<-rounding*hs:
+        raise ValueError('GATE shared_equilibrium_metric: resolved negative H; no PSD repair')
+    cut=rounding*hs if held else max(rounding,float(rank_tolerance))*hs
+    keep=eigen>cut
+    null=base@u[:,~keep]
+    def output_loss(v):
+        return float(la.norm(v.conj().T@n@v)) if v.shape[1] else 0.
+    if held and not np.all(keep):
+        raise ValueError('GATE shared_equilibrium_basis: current held H is unresolved; no held rank drop')
+    if null.shape[1] and (la.norm(g@null)>(rank_tolerance+rounding)*max(gn,np.finfo(float).tiny)
+            or output_loss(null)>(rank_tolerance**2+rounding)*max(on,np.finfo(float).tiny)):
+        raise ValueError('GATE shared_equilibrium_null: live H-null/unresolved state')
+    rank=int(np.count_nonzero(keep))
+    if rank>int(max_order):
+        raise ValueError('GATE shared_equilibrium_order: resolved state space exceeds budget; no truncation to cap')
+    z=base@(u[:,keep]/np.sqrt(eigen[keep])[None])
+    spaces=base if held else z
+    if not rank:
+        return dict(poles_ry=np.empty(0,complex),output_map=z,input_map=z,
+            spaces=dict(right=spaces,left=spaces),receipt=dict(order=0,construction='equilibrium-definite-value',
+            workspace_bytes=price,host_reduce_seconds=time.perf_counter()-started))
+    metric=z.conj().T@g@z
+    mu,rotation=la.eigh((metric+metric.conj().T)*.5,check_finite=False)
+    vectors=z@rotation
+    bound=rounding*max(float(np.max(abs(mu))),np.finfo(float).tiny)
+    finite=abs(mu)>bound
+    if np.any(~finite):
+        v=vectors[:,~finite]
+        if output_loss(v)>(rank_tolerance**2+rounding)*max(on*la.norm(v)**2,np.finfo(float).tiny):
+            raise ValueError('GATE shared_equilibrium_infinite: live zero/unresolved mu gives constant feedthrough')
+    gp=z.conj().T@g@z;hp=z.conj().T@h@z
+    residual=la.norm(gp@rotation-(hp@rotation)*mu[None])/max(la.norm(gp@rotation),np.finfo(float).tiny)
+    whitening=la.norm(hp-np.eye(rank))
+    if residual>1e-9 or whitening>1e-9:
+        raise ValueError('GATE shared_equilibrium_eigenvectors: unresolved metric reconstruction')
+    mu,vectors=mu[finite],vectors[:,finite]
+    poles=1/mu-1j*gamma
+    t=vectors/np.sqrt(abs(mu))[None]
+    order=np.argsort(poles.real,kind='stable')
+    return dict(poles_ry=poles[order],output_map=t[:,order],input_map=(t*np.sign(mu)[None])[:,order],
+        spaces=dict(right=spaces,left=spaces),receipt=dict(order=len(poles),held_state_rank=rank,
+        construction='equilibrium-definite-value',spectral_variable='z+i_gamma',gamma_ry=gamma,
+        rank_tolerance=float(rank_tolerance),H_min_eigenvalue=float(eigen[0]),H_null_output_squared=output_loss(null),
+        H_null_roundoff_allowance=rounding*on,zero_mu_output_checked=True,
+        numerical_spaces='same-state-H-congruence',eigen_residual=float(residual),whitening_error=float(whitening),
+        workspace_bytes=price,host_reduce_seconds=time.perf_counter()-started))
 
 
 def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordered,
