@@ -2278,7 +2278,8 @@ def _resolve_cd_inputs(params):
     by name outside the CD route, and the pole-model keys refuse inside it.
     IMPLEMENTATION LIMITS of the first landing (cd_production_design.md
     section 0): ``head_correction = off``, ``linalg = local``, one eta,
-    ``use_band_extrapolation = false``.
+    ``use_band_extrapolation = false``.  CD is one-shot only: ``qp_solver``
+    must not resolve to self_consistent (GATE cd_self_consistent_unimplemented).
     """
     named = params[_DECK_NAMED_KEYS]
     value = str(params["sigma_frequency_integration"]).strip().lower()
@@ -2311,6 +2312,15 @@ def _resolve_cd_inputs(params):
                 f"GATE cd_applicability: {key} got: {params[key]!r} with "
                 "sigma_frequency_integration=contour_deformation; want: the key absent; "
                 "why: CD has no pole model, no W sample bank and no fit to reuse")
+    # The GWConfig.qp_solver rule: auto is self_consistent iff the deprecated self_consistent key is true.
+    solver = str(params.get("qp_solver") or "auto").strip().lower()
+    if solver == "self_consistent" or (solver == "auto" and bool(params.get("self_consistent", False))):
+        raise NotImplementedError(
+            f"GATE cd_self_consistent_unimplemented: qp_solver got: {solver!r}"
+            + (" (resolved from self_consistent = true)" if solver == "auto" else "")
+            + " with contour_deformation; want: qp_solver = one_shot_dft, or auto without self_consistent; "
+            "why: CD is the one-shot reference route (comparisons with BerkeleyGW) and is not validated "
+            "inside the QSGW map (IMPLEMENTATION LIMIT, owner 2026-10-20)")
     diagrams = str(params.get("screening_diagrams", "w_rpa")).strip().lower()
     if diagrams != "w_rpa":
         raise ValueError(
