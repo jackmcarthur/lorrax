@@ -42,7 +42,7 @@ $\zeta$ is the least-squares solution of Eq. (1.1) over every $\bk$ and every pa
 
 <figure class="flowchart" markdown>
 [![ζ fit and bare Coulomb (route G)](../assets/figures/g1.png)](../assets/figures/g1.png)
-<figcaption><strong>Fig. G1.</strong> The ζ fit and the bare Coulomb matrix. Stage 1 evaluates $\psi$ at the centroids from its plane-wave coefficients and forms the band projector $P_\bk(\br_\mu,\bG)$; stage 2 builds the Gram $C_\bq$ and the right-hand side $Z_\bq(\br_\mu,\bG)$ by k-convolution and solves for $\zeta_{\bq\mu}(\bG)$ one G tile at a time; stage 3 contracts $\zeta(\bG)$ with $v(\bq+\bG)$. The Objects block gives the implicit definition of each output.</figcaption>
+<figcaption><strong>Fig. G1.</strong> The ζ fit and the bare Coulomb matrix. Stage 1 evaluates $\psi$ at the centroids from its plane-wave coefficients and forms the band projectors $P^X_\bk(\br_\mu,\bG)$ of the two windows $X=L,R$; stage 2 builds the Gram $C_\bq$ and the right-hand side $Z_\bq(\br_\mu,\bG)$ by k-convolution and solves for $\zeta_{\bq\mu}(\bG)$ one G tile at a time; stage 3 contracts $\zeta(\bG)$ with $v(\bq+\bG)$. The Objects block gives the implicit definition of each output.</figcaption>
 </figure>
 
 ### <span class="n">2.1</span> Normal equations {: #isdf-normal }

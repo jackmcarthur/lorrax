@@ -37,7 +37,7 @@ Solver
 <div class="stages" markdown>
 
 1. **Optional interpolation of bands and interactions to the BSE k-grid**
-   Read $\psi_{n\bk}(\br_\mu)$, $E^{\mathrm{QP}}_{n\bk}$, $V_\bq(\mu,\nu)$ and $W_\bq(\mu,\nu;0)$ from the bundle and add the $\bq \to 0$ head. Under `bse_k_grid` the bands are carried to the fine grid $\bk_{\mathrm{fi}}$ by H-transform interpolation, and $W$ is split into a short-range part, smooth in $\bq$ and Fourier-interpolated, and a long-range part carried by the plane-wave channels $\bq+\bG_a\to0$: their dressed form factors and polarizability are fitted in $\bq$, screened, switched off smoothly inside the zone, and evaluated at every fine $\bq$ (`w_head_densify = srlr`; [Theory](theory.md)).
+   Read $\psi_{n\bk}(\br_\mu)$, $E^{\mathrm{QP}}_{n\bk}$, $V_\bq(\mu,\nu)$ and $W_\bq(\mu,\nu;0)$ from the bundle and add the $\bq \to 0$ head. Under `bse_k_grid` the bands are carried to the fine grid $\bk_{\mathrm{fi}}$ by H-transform interpolation, and $W$ is split into a short-range part, smooth in $\bq$ and Fourier-interpolated, and a long-range part on the long-range plane waves $\bG_L$, the vectors at which $\bq+\bG\to0$. Their dressed coefficients $\tilde\zeta_{\bq\mu}(\bG_L)$ and polarizability $P_\bq$ are fitted in $\bq$, screened, switched off smoothly inside the zone, and evaluated at every fine $\bq$ (`w_head_densify = srlr`; [Theory](theory.md)).
 2. **Matrix-free product $HX$**
    The Hamiltonian, Tamm–Dancoff or full ([below](#kernel)), is never stored. Each trial vector gets the diagonal $E^{\mathrm{QP}}_{c\bk} - E^{\mathrm{QP}}_{v\bk}$, the exchange term through $V_{\bq=0}$ and the direct term as a k-convolution with $W$.
 3. **Eigensolve**
@@ -49,7 +49,7 @@ Solver
 
 <figure class="flowchart" markdown>
 [![BSE driver overview](../../assets/figures/b1.png)](../../assets/figures/b1.png)
-<figcaption><strong>Fig. B1.</strong> The production route (<code>--tda --bse</code>) in four stages: the bands optionally carried to the BSE k-grid by the H-transform; $W$ optionally carried there in two branches, the short-range part Fourier-interpolated through $\bR$ and the long-range part built on G-space plane-wave channels ($\bq+\bG_a\to0$) fitted in $\bq$, screened and windowed, then added and assembled into the Tamm–Dancoff Hamiltonian; the matrix-free product $HX$, with the exchange (top) and direct (bottom) branches; the eigensolve and the spectrum. The Objects cards name the file each quantity comes from or goes to.</figcaption>
+<figcaption><strong>Fig. B1.</strong> The production route (<code>--tda --bse</code>) in four stages: the bands optionally carried to the BSE k-grid by the H-transform; $W$ optionally carried there in two branches, the short-range part Fourier-interpolated through $\bR$ and the long-range part built on the long-range plane waves $\bG_L$, fitted in $\bq$, screened and windowed, then added and assembled into the Tamm–Dancoff Hamiltonian; the matrix-free product $HX$, with the exchange (top) and direct (bottom) branches; the eigensolve and the spectrum. The Objects cards name the file each quantity comes from or goes to.</figcaption>
 </figure>
 
 !!! note

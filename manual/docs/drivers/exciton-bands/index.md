@@ -33,7 +33,7 @@ Exchange at $\bQ$
 
 <figure class="flowchart" markdown>
 [![Exciton bands at finite momentum](../../assets/figures/x1.png)](../../assets/figures/x1.png)
-<figcaption><strong>Fig. X1.</strong> One run in four stages: conduction states at $\bk+\bQ$ by H-transform interpolation; the exchange $V_\bQ$; the static $W$, optionally interpolated in two branches as in Fig. B1, the short-range part Fourier-interpolated through $\bR$ and the long-range part built on G-space plane-wave channels fitted in $\bq$, screened and windowed; then the matrix-free product $H_\bQ X$ (exchange row above, direct row below), diagonalized once per path point.</figcaption>
+<figcaption><strong>Fig. X1.</strong> One run in four stages: conduction states at $\bk+\bQ$ by H-transform interpolation; the exchange $V_\bQ$; the static $W$, optionally interpolated in two branches as in Fig. B1, the short-range part Fourier-interpolated through $\bR$ and the long-range part built on the long-range plane waves $\bG_L$, fitted in $\bq$, screened and windowed; then the matrix-free product $H_\bQ X$ (exchange row above, direct row below), diagonalized once per path point.</figcaption>
 </figure>
 
 <div class="stages" markdown>

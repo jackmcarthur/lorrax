@@ -256,7 +256,7 @@ with the upper sign for $G^>$ windows and the lower for $G^<$. The synthesis cos
 
 <figure class="flowchart" markdown>
 [![Shared-pole W in the self-energy](../assets/figures/g9b.png)](../assets/figures/g9b.png)
-<figcaption><strong>Fig. G9b.</strong> Σ from the shared-pole model. For each product window and time node $t_\ell$, $W^c_\bq(t_\ell)$ is synthesized from the window's poles, multiplied by $G^{\gtrless}$ in $\bR$ and folded into frequency.</figcaption>
+<figcaption><strong>Fig. G9b.</strong> Σ from the shared-pole model. For each product window and time node $t_\ell$, $W^c_\bq(\pm t_\ell)$ is synthesized from the window's poles and multiplied by $G^{\gtrless}$ in $\bR$, and Fig. G4 folds the result into frequency; stage 3 evaluates the static $W_\bq(0)$ the BSE reads.</figcaption>
 </figure>
 
 ### <span class="n">6.2</span> χ⁰ at the supports {: #bank-times }
@@ -299,7 +299,7 @@ The construction runs once per irreducible $\bq$ after the ISDF fit and $V_\bq$,
 
 <figure class="flowchart" markdown>
 [![Shared-pole screened interaction](../assets/figures/g9.png)](../assets/figures/g9.png)
-<figcaption><strong>Fig. G9.</strong> Stage 1 samples $W^c$ and its derivative at the support frequencies: a line above the real axis at equal quantiles of the square root of the crossing density, and a log-spaced imaginary ladder, the same $z_a$ for every $\bq$. Stage 2 keeps the action of $W^c$ on a few probe directions per support, and of the exact moments on the leading directions of $M_1$, and assembles the Loewner pencil $(\mathbb H,\mathbb G)$ in $z^2$. Stage 3 diagonalizes the pencil, whose Ritz pairs are the poles $\Omega_{j\bq}$ and factor vectors $b_{j\bq}(\mu)$ that go to `model.h5`.</figcaption>
+<figcaption><strong>Fig. G9.</strong> Stage 1 samples $W^c$ and its derivative at the support frequencies: a line above the real axis at equal quantiles of the square root of the crossing density, and a log-spaced imaginary ladder, the same $z_a$ for every $\bq$. Stage 2 keeps the action of $W^c$ on a few probe directions per support, and of the exact moments on the leading directions of $M_1$, and assembles the Loewner pencil $(\mathbb H,\mathbb G)$ in $s=z^2$. Stage 3 diagonalizes the pencil, whose Ritz pairs are the poles $\Omega_{j\bq}$ and factor vectors $b_{j\bq}(\mu)$ that go to `model.h5`.</figcaption>
 </figure>
 
 ### <span class="n">7.1</span> Line supports {: #sup-line }
