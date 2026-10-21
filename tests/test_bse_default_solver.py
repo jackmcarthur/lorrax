@@ -19,13 +19,18 @@ space (so H is Hermitian) and the exchange V positive:
   three-term recurrence of the dense operator to 1e-9.
 * The solver-flag guard refuses a Lanczos-only flag under the default solver, and
   ``--haydock-iter`` refuses the RPA kernel (the recursion is D + V - W).
+* The driver (``bse_jax._preview_lanczos`` on the synthetic payload, loader stubbed):
+  ``--lanczos --dipole-position-fix`` parses and reaches the loader as
+  ``velocity_position_fix=True``; a Davidson run capped at 2 iterations refuses with
+  ``GATE davidson_converged`` and writes no file.  ``GATE cpu_davidson_threads`` refuses
+  four emulated devices on 4 host threads and passes them on 16.
 
 CPU, one process, on a 1x1 mesh (login node, <= 4 threads) or a 2x2 mesh of four host
 devices: ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4
-python3 tests/test_bse_default_solver.py``.  The 2x2 case needs at least 8 host threads:
-the planned Davidson's host callbacks and the four devices' collective rendezvous share
-the CPU client's pool, and at 4 threads an all-to-all waits forever (rendezvous
-termination timeout, measured).  The host-only checks (``test_*``) run under pytest
+python3 tests/test_bse_default_solver.py``.  The 2x2 case needs at least 16 host threads
+(4 per device): the planned Davidson's host callbacks and the four devices' collective
+rendezvous share the CPU client's pool, and at 4 threads an all-to-all waits until XLA's
+rendezvous termination timeout (measured); ``GATE cpu_davidson_threads`` refuses that.  The host-only checks (``test_*``) run under pytest
 anywhere; the mesh cases skip there.
 """
 KGRID = (2, 2, 2)
@@ -189,7 +194,67 @@ def run_cases(mesh):
         out["haydock_refused_without_bse"] = False
     except SystemExit:
         out["haydock_refused_without_bse"] = "it needs --bse" in err.getvalue()
+    out.update(_driver_cases(mesh, ops))
     return out
+
+
+def _driver_cases(mesh, ops):
+    """The driver path on the synthetic payload (loader and restart lookup stubbed): the
+    parsed ``--lanczos --dipole-position-fix`` reaches the loader, and a Davidson capped
+    at 2 iterations refuses before anything is written; then the CPU threads gate."""
+    import os
+    import tempfile
+    from types import SimpleNamespace
+    import jax
+    import numpy as np
+    from bse import bse_io, bse_jax, bse_lanczos
+    _, args = bse_jax.parse_args(["-i", "toy.in", "--lanczos", "--tda", "--bse", "--write-eigs",
+                                  "--dipole", "toy_dipole.h5", "--dipole-position-fix"])
+    seen = {}
+
+    def load(restart_file, **kw):
+        seen.update(kw)
+        return _payload(mesh, ops)
+
+    stubs = [(bse_io, "load_bse_data_from_restart_sharded", load),
+             (bse_jax, "_find_restart_file", lambda path: path), (bse_jax, "create_mesh_2d", lambda: mesh)]
+    stubs = [(mod, name, getattr(mod, name), new) for mod, name, new in stubs]
+    cwd, gate = os.getcwd(), ""
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            for mod, name, _, new in stubs:
+                setattr(mod, name, new)
+            os.chdir(tmp)
+            bse_jax._preview_lanczos(args.input, NV, NC, n_eig=N_EIG, write_eigs=args.write_eigs,
+                                     dipole_file=args.dipole,
+                                     dipole_position_fix=args.dipole_position_fix, max_lanczos_iter=2)
+        except RuntimeError as exc:
+            gate = str(exc)
+        finally:
+            os.chdir(cwd)
+            for mod, name, old, _ in stubs:
+                setattr(mod, name, old)
+        written = sorted(os.listdir(tmp))
+    print(f"[driver] {gate}", flush=True)
+    fake = SimpleNamespace(devices=np.empty((2, 2), dtype=object))
+    for i in range(4):
+        fake.devices.flat[i] = SimpleNamespace(platform="cpu", process_index=jax.process_index())
+    real = os.sched_getaffinity
+
+    def threads_gate(n):
+        os.sched_getaffinity = lambda pid: set(range(n))
+        try:
+            bse_lanczos._refuse_cpu_davidson_threads(fake)
+            return ""
+        except RuntimeError as exc:
+            return str(exc)
+        finally:
+            os.sched_getaffinity = real
+    return {"dipole_position_fix_reaches_loader": seen.get("velocity_file") == "toy_dipole.h5"
+            and seen.get("velocity_position_fix") is True,
+            "capped_davidson_refuses": "GATE davidson_converged" in gate and "/2 iterations" in gate,
+            "refusal_writes_nothing": written == [],
+            "cpu_threads_gate": "GATE cpu_davidson_threads" in threads_gate(4) and threads_gate(16) == ""}
 
 
 def main() -> int:
@@ -218,6 +283,11 @@ def main() -> int:
         "Lanczos-only flag refused under default solver": out["lanczos_flag_refused_under_davidson"],
         "Haydock polarizations parse and refuse": out["haydock_polarizations_parse_and_refuse"],
         "--haydock-iter refused on the RPA kernel": out["haydock_refused_without_bse"],
+        "--lanczos --dipole-position-fix parsed and reaches the loader":
+            out["dipole_position_fix_reaches_loader"],
+        "GATE davidson_converged refuses a run capped at 2 iterations": out["capped_davidson_refuses"],
+        "the refusal writes no file": out["refusal_writes_nothing"],
+        "GATE cpu_davidson_threads: 4 devices refuse on 4 threads, run on 16": out["cpu_threads_gate"],
     }
     ok = all(checks.values())
     if jax.process_index() == 0:

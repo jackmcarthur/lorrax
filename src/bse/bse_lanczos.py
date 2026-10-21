@@ -69,6 +69,40 @@ from .bse_head import head_shifted_eps_c
 import common.timing as timing
 
 
+#: Host threads per emulated CPU device the planned Davidson needs: the CPU
+#: subspace provider's host callbacks share the CPU client's pool with the
+#: devices' collective rendezvous.  Measured on 4 host devices (2x2): 4 threads
+#: hang in an all-to-all until XLA's rendezvous timeout (rc 134); 16 run.
+CPU_DAVIDSON_THREADS_PER_DEVICE = 4
+
+
+def _refuse_cpu_davidson_threads(mesh_xy) -> None:
+    """``GATE cpu_davidson_threads``: refuse up front where the CPU provider hangs."""
+    local = [d for d in mesh_xy.devices.flat if d.process_index == jax.process_index()]
+    if local[0].platform != "cpu" or len(local) < 2:
+        return
+    threads, need = len(os.sched_getaffinity(0)), CPU_DAVIDSON_THREADS_PER_DEVICE * len(local)
+    if threads < need:
+        raise RuntimeError(
+            f"GATE cpu_davidson_threads: {len(local)} emulated CPU devices in one process "
+            f"on {threads} host threads; the planned Davidson needs >= {need} "
+            f"({CPU_DAVIDSON_THREADS_PER_DEVICE} per device), or its host callbacks starve "
+            "the devices' collective rendezvous and XLA aborts on a timeout.  Fix: give "
+            f"the process {need} cores, or run one device per process")
+
+
+def _price_davidson_basis(capacity, X0, mesh_xy) -> None:
+    """Book and admit the Davidson basis and its images: 2 x capacity complex128
+    vectors of the transition dimension, sharded over the mesh."""
+    from lxkit import memory
+    from common.gpu_utils import device_budget_bytes
+    n = int(np.prod(X0.shape[1:]))
+    basis = memory.priced(0.0, "bse Davidson basis + images (2 capacity x N x 16 B / P)",
+                          spread=2.0 * capacity * n * 16, ranks=int(mesh_xy.devices.size))
+    memory.book(basis)
+    memory.admit("bse.davidson_basis", basis, device_budget_bytes())
+
+
 def solve_bse_sharded(
     data: dict,
     mesh_xy: Mesh,
@@ -270,6 +304,7 @@ def solve_bse_sharded(
             return matvec_ring(V, *solver_data[0])
 
         bse_sharding = NamedSharding(mesh_xy, P(None, "x", "y", None))
+        _refuse_cpu_davidson_threads(mesh_xy)
         # ── preconditioner route ──────────────────────────────────────
         # "bare"  : 1/(dE - lam + eps)          -- what LORRAX has always done
         # "exact" : 1/(diag(H) - lam + eps)     -- what BerkeleyGW hands PRIMME
@@ -350,6 +385,7 @@ def solve_bse_sharded(
                       else DEFAULT_M_MAX_FACTOR * n_eig)
         print(f"Davidson: m_max={m_max_warm} ({m_max_warm // n_eig}x n_eig), "
               f"storing 2*m_max = {2 * m_max_warm} trial vectors", flush=True)
+        _price_davidson_basis(max(m_max_warm, 2 * n_eig), X0, mesh_xy)
         eigenvalues, eigenvectors = davidson(
             apply_H, n_eig=n_eig, precond_fn=apply_precond, X0=X0,
             data=solver_data,

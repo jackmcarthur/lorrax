@@ -216,7 +216,7 @@ def _preview_lanczos(
               f"(Krylov dim = {n_done * block_size})")
     if solver_kind == "davidson" and tda:
         _davidson_report(report, n_eig=n_eig, tol_mev=float(davidson_tol_mev),
-                         budget=block_max_iter)
+                         budget=block_max_iter, dim=bse_dim)
     if stage_progress is not None:
         stage_progress.step()
     ryd2ev = 13.6056980659
@@ -359,11 +359,11 @@ def _preview_lanczos(
     }
 
 
-def _davidson_report(report, *, n_eig, tol_mev, budget):
+def _davidson_report(report, *, n_eig, tol_mev, budget, dim):
     """Print and report the Davidson stop: roots converged, iterations,
-    matvecs, the largest residual in meV.  An unconverged stop is a WARNING."""
+    matvecs, the largest residual in meV.  Any stop but CONVERGED refuses
+    (``GATE davidson_converged``) before the driver writes anything."""
     import numpy as np
-    from common.report_blocks import Message
     from solvers.davidson import LAST_RUN as run
     from solvers.davidson_fixed import CONVERGED, STALLED
     res_mev = np.asarray(run["res"][0]) * RYD_TO_EV * 1.0e3
@@ -376,18 +376,18 @@ def _davidson_report(report, *, n_eig, tol_mev, budget):
             f"{int(run['mv'][0])} matvecs, {int(run['restarts'])} restarts; "
             f"max residual {float(np.max(res_mev)):.3e} meV")
     print(line, flush=True)
-    if report is None:
-        return
-    report.heading("Eigensolver convergence")
-    report.emit("  " + line)
+    if report is not None:
+        report.heading("Eigensolver convergence")
+        report.emit("  " + line)
     if status != CONVERGED:
-        report.warn(Message(
-            "WARNING", "davidson_not_converged",
-            f"Davidson stopped {word}: {n_eig - n_conv} of {n_eig} roots above "
-            f"the {tol_mev:g} meV residual",
-            found=("max residual", f"{float(np.max(res_mev)):.3e} meV"),
-            fix="raise --max-lanczos-iter (the iteration cap) or "
-                "--davidson-m-max, or loosen --davidson-tol-mev"))
+        raise RuntimeError(
+            f"GATE davidson_converged: Davidson stopped {word} with {n_conv}/{n_eig} "
+            f"roots below the {tol_mev:g} meV residual after {int(run['iter'][0])}/"
+            f"{int(budget)} iterations (the cap is --max-lanczos-iter, default "
+            f"max(30, min(200, dim // 2)) = {max(30, min(200, int(dim) // 2))} at dim "
+            f"{int(dim)}); max residual {float(np.max(res_mev)):.3e} meV.  No "
+            "eigenvector, spectrum or Haydock output was written.  Fix: raise "
+            "--max-lanczos-iter or --davidson-m-max, or loosen --davidson-tol-mev")
 
 
 
@@ -674,7 +674,7 @@ _ROUTE_DESTS = {
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
         "davidson_m_max", "davidson_tol_mev", "trlan_m_max", "trlan_n_keep",
         "eqp", "n_occ", "band_degeneracy", "degeneracy_tol_ry", "dipole",
-        "helicity_table", "qp_rotations", *(
+        "dipole_position_fix", "helicity_table", "qp_rotations", *(
             "haydock_" + k for k in ("iter", "pol", "eta_ev", "omega_min_ev",
                                      "omega_max_ev", "n_omega", "n_spin",
                                      "no_eps1", "out_prefix"))},

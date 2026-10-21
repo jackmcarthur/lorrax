@@ -49,8 +49,25 @@ reference. Without locking the same solve takes 640-800.
   bounded blocks (`absorption_common.LORENTZ_BLOCK_ELEMENTS`): Si 8^3, 4001
   omegas, 6.35 s -> 2.09 s on four cores, and no `n_omega x n_transitions`
   host array.
+- **Explicit `--solver davidson` tolerance.** It was `atol` or 1e-8 Ry; it is
+  now `--davidson-tol-mev` (0.01 meV = 7.35e-7 Ry), 73x looser in the residual
+  and still a 0.01 meV bound per root (`--davidson-tol-mev 1.36e-4` is the old
+  1e-8 Ry stop).
+- **An unconverged Davidson refuses.** Any stop but CONVERGED (the cap is
+  `--max-lanczos-iter`, default `max(30, min(200, dim // 2))`; a stall)
+  raises `GATE davidson_converged` with n_conv/n_eig, the iterations against
+  the cap and the largest residual in meV, before eigenvectors, spectrum or
+  Haydock output are written. It used to warn and exit 0.
+- **`--dipole-position-fix` on `--lanczos`.** It was missing from the
+  eigensolve route's flags (since 7999900e3), so `bse_jax --lanczos
+  --dipole-position-fix` was refused at parse time; it now reaches the loader.
+- **Memory and CPU.** The Davidson basis and its images (2 m_max x N x 16 B / P,
+  m_max = 10 n_eig: 128 GB / P at N = 1e7, n_eig 40) are priced and admitted as
+  `bse.davidson_basis`. `GATE cpu_davidson_threads` refuses more than one
+  emulated CPU device per process below 4 host threads per device, where the
+  CPU subspace provider's callbacks used to hang until XLA's rendezvous timeout.
 - **Test.** `tests/test_bse_default_solver.py` (script; 1x1 on a login node,
-  2x2 with at least 8 host threads).
+  2x2 with at least 16 host threads).
 
 ## 2026-10-21 — `bse_k_grid` `--eqp` dipoles: Rayleigh-quotient default, exact position opt-in (`--dipole-position-fix`)
 
