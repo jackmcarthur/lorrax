@@ -482,6 +482,20 @@ an investigation hypothesis, not an established sole cause. The
 [partial-run/accounting record](evidence/HSUITE_PARTIAL_60069199.json) pins
 raw all-rank stage logs, source tree, launcher and software-proof receipt.
 
+The next material run, `60070270.0` on committed `becf1a4`, passed **all ten
+canonical equilibrium reducers** (orders 658–692), but was then refused by
+the full-port held-W check: q0/support25 relative error **0.0245786** exceeded
+the configured **0.02**. No ordered Sigma44, t0 collision, or propagation was
+computed. Stream time was **58.066 s**, Dyson **2.826 s**, directions
+**6.189 s**, pencil **5.185 s**, and all-parent host reduction **174.924 s**.
+These are partial phases, not a sub60s full screening cycle. The host work is
+numerical work, not compilation. See the [actual failure/accounting record](evidence/EQ_ALL_PARENTS_HELD_REFUSAL_60070270.json).
+
+The subsequent explicit driven pilot requests **0.05** fit tolerance as a
+separate underconverged numerical setting. It does not turn this 0.02 failure
+into a pass or change conservation, density-boundary, Pauli, trace or finite
+checks. A pilot is not a converged screening or damping result.
+
 ### Correction: the707 t0 request was not on its instantaneous shells
 
 The preserved707 measurements above remain raw historical evidence, but
@@ -600,3 +614,21 @@ the sparse q-comb error was exactly zero. Receipt:
 `p4_bse4b_60056663/receipt.json` under the evidence directory above.
 This qualifies the tiny software mapping only, not material exciton roots,
 optical convergence, a TD trajectory, or general positivity.
+
+## Accurate equilibrium reducer: actual material held-fit refusal (60070270)
+
+On source `becf1a4`, all ten equilibrium parent reductions passed the new
+original-column metric checks. The 856 physical Green-pair stream took
+58.066 s (34 padded panels; rounded printed compile/dispatch sums 1.7/55.3 s).
+Setup/planning/Dyson/directions/pencil took 1.624/0.843/2.826/6.189/5.185 s;
+host reduction took 174.924 s. The original 2% held-fit gate then refused
+q0/support25 at 2.45786%. Thus there was no complete admitted general W,
+ordered collision Sigma44, t0 operator snapshot, or trajectory. This is not
+a metric-null, UHP, or physical conservation verdict. The pre-reduction q0
+frequency capture and all-rank logs are preserved; no additional run was
+needed for this record.
+
+The released four-node allocation used 548 s (2.435555556 reserved GPUh),
+with 541 s of numerical-step lifetime (2.404444444 active GPUh). These are
+nonadditive views. Exact hashes, phase times, and scope are in
+[the material receipt](evidence/EQ_BECF_HELD_REFUSAL_60070270.json).

@@ -137,7 +137,7 @@ artifacts. A missing or scientifically refused zero4 therefore need not
 block independent staticA carrier-target measurements. Its manifest records
 `raw_zero_status=NOT_REQUIRED_STATIC_A_ONLY`, no zero evidence and B/C not
 attempted; ordinary coherent trace/Pauli/Hermiticity checks remain active.
-Enabling B/C still requires the original rawzero preflight and both mandatory
+Enabling qualified B/C still requires the original rawzero preflight and both mandatory
 matching-window gates. An A-only completion is not an A/B/C comparison or
 evidence that raw MGKBA is safe.
 

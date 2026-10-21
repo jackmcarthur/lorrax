@@ -1,0 +1,68 @@
+{
+  "status": "ALL_EQ_REDUCERS_PASSED_FULL_W_HELD_ACCURACY_REFUSED",
+  "job": "60070270",
+  "numeric_step": "60070270.0",
+  "source_revision": "becf1a40fadf05216cbe47459736748baef179b6",
+  "source_archive_sha256": "36969b179b28f7606d1da904d1fd00d4ed6e21fa6b652f643a6040fed0a31987",
+  "electronic_grid": [8, 8, 1],
+  "response_grid": [4, 4, 1],
+  "response_window": "fejer",
+  "virtual_bands": 750,
+  "active_window": [100, 144],
+  "centroids": 3000,
+  "packed_centroids": 3008,
+  "physical_chi_nodes": 856,
+  "panels": 34,
+  "phase_seconds": {
+    "setup": 1.624,
+    "planning": 0.843,
+    "stream": 58.066,
+    "dyson": 2.826,
+    "directions": 6.189,
+    "pencil": 5.185,
+    "hostreduce": 174.924
+  },
+  "canonical_parent_orders": {
+    "0": 661,
+    "1": 672,
+    "2": 658,
+    "4": 686,
+    "5": 688,
+    "6": 692,
+    "7": 668,
+    "8": 667,
+    "9": 685,
+    "10": 678
+  },
+  "host_batches_seconds": [94.065, 80.844],
+  "refusal": {
+    "gate": "shared_general_held_w",
+    "q": 0,
+    "support": 25,
+    "relative_error_as_printed": 0.0245786,
+    "configured_tolerance": 0.02,
+    "all_remaining_full_W_errors_measured": false
+  },
+  "sigma44_computed": false,
+  "t0_collision_computed": false,
+  "physical_time_advanced": false,
+  "W_admitted": false,
+  "conservation_or_positivity_verdict": "NOT_MEASURED",
+  "artifact_directory": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/material_ownq4_t0only44_EQBECF_60070270",
+  "artifact_sha256": {
+    "material_ownq4_t0only44_EQBECF_60070270.all_rank_logs.tar.gz": "ea606d1f6e26880432009e0c89bdec3828e32440251c0d103dad8fa8a64de1f2",
+    "material_ownq4_t0only44_EQBECF_60070270.rank0.log": "21b93a104149edebbc30013c154fa73769e3a21b496ce1b929ab8feb82cc904f",
+    "material_ownq4_t0only44_EQBECF_60070270.sacct.txt": "ed20620cdd8a361a8c884e0df9f61e1f679202839ec7f7949c5e1143ceccf4c8",
+    "q_000_equilibrium_pencil.npz": "3072e386cf8f49e1db6cd0f69b9aec30fb3b3809ddff8c70e319103827947184"
+  },
+  "accounting": {
+    "gpus": 16,
+    "allocation_seconds": 548,
+    "numeric_step_seconds": 541,
+    "reserved_gpu_hours": 2.4355555555555557,
+    "active_gpu_hours": 2.4044444444444446,
+    "views_are_nonadditive": true,
+    "allocation_released_utc": "2026-10-21T03:27:14Z"
+  },
+  "followup_policy": "A separately labeled underconverged diagnostic pilot explicitly requests fit_tolerance=0.05. This result remains a failed 0.02 check; no physical or density-matrix guard is changed."
+}
