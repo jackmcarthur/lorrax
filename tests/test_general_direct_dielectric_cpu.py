@@ -72,7 +72,7 @@ def test_scalar_witness_owner_preserves_current_complex_epsilon_padding_and_basi
 
 
 def test_diagnostic_selection_and_stop_precede_all_dyson_values_directions_and_fitting():
-    from gw.shared_pole_screening import screen_general_shared_poles
+    from gw.shared_pole_screening import screen_general_shared_poles, _general_current_site_samples
     source = inspect.getsource(screen_general_shared_poles)
     tree = ast.parse(source)
     stops = [n for n in ast.walk(tree) if isinstance(n, ast.Raise)
@@ -81,14 +81,18 @@ def test_diagnostic_selection_and_stop_precede_all_dyson_values_directions_and_f
     stop = stops[0]
     # The ACTUAL owner stream receives the one-row query table and keeps the
     # same physical runtime operands/executor; no separate contraction path.
-    streams = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+    stage_tree = ast.parse(inspect.getsource(_general_current_site_samples))
+    streams = [n for n in ast.walk(stage_tree) if isinstance(n, ast.Call)
                and isinstance(n.func, ast.Name) and n.func.id == 'full_density_response_stream']
     primary = min(streams, key=lambda n: n.lineno)
     keywords = {k.arg: ast.unparse(k.value) for k in primary.keywords}
     assert keywords['q_ids'] == 'query_q_ids'
     assert keywords['k_unfold_plan'] == 'plan' and keywords['execute'] == 'execute_response'
     assert 'np.arange(nq) if direct_request is None else np.asarray([0])' in source
-    assert primary.lineno < stop.lineno
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name) and n.func.id == '_general_current_site_samples')
+    assert next(ast.unparse(k.value) for k in call.keywords if k.arg == 'evaluate_dyson') == 'direct_request is None'
+    assert call.lineno < stop.lineno
     assert stop.lineno < next(n.lineno for n in ast.walk(tree) if isinstance(n, ast.Assign)
         and any(isinstance(t, ast.Name) and t.id == 'values' for t in n.targets))
     assert source.index('shared_general_dielectric_diagnostic_stop') < source.index('begin("directions")')

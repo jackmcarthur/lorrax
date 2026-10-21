@@ -2,7 +2,9 @@
 
 These plain helpers do NOT fit, repair or admit a model. The native builder
 must evaluate the proposed new microscopic targets, retain its old samples,
-and rerun every original fit/held/moment/growth check. A verified inverse at
+and rerun every original fit/held/growth gate and moment measurement. Here W
+means the correlation Wc returned by the native Dyson/general-store owner,
+not bare V plus Wc. A verified inverse at
 one fitted pole proves COMPUTED-matrix nonsingularity ONLY at that point,
 not physical-kernel invertibility without a propagated operator error bound,
 nor global causal stability. No equilibrium/positive-residue premise is used.
@@ -15,7 +17,8 @@ diagnostic entrypoint is q0-only); call that SAME stage for ONLY the new
 evaluate=True targets; add the independent L/R residue panels to the existing
 direction tables; rebuild the current general pencil with invalidated held
 frequency spaces when its dimensions grow; and rerun EVERY original/new
-fit/held/moment/capacity/growth gate. Failure remains a normal refusal. The
+fit/held/capacity/growth gate and the existing moment measurements (which
+are NOT a full-port moment admission certificate). Failure remains a normal refusal. The
 functions below do not silently activate this unfinished native lifecycle.
 ``state_digest`` must bind the current E/U/rho, bare V, gamma, response
 grid/window and source recipe, not just an iteration label or density hash.
@@ -161,7 +164,8 @@ def general_refinement_targets(candidates, witnesses, existing_sites, *, state_d
     return dict(targets=targets,proofs=proofs,new_microscopic_target_count=sum(t['evaluate'] for t in targets),
         max_rounds=MAX_REFINEMENT_ROUNDS,max_poles_per_round=MAX_REFINEMENT_POLES,
         state_digest=state_digest,status='PLANNED_NOT_EXECUTED_NOT_ADMITTED',
-        required_checks='all original and new full-W fit/held, moments, growth, and capacity')
+        required_checks='all original and new full-Wc fit/held, growth, and capacity gates',
+        required_measurements='existing full-port moment defects; not a full-moment admission certificate')
 
 
 def append_general_refinement_samples(state, plan, evaluated_values, *, crossing):

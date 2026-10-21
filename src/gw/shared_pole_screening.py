@@ -274,6 +274,132 @@ def _save_general_dielectric_probe(raw, operators, record, *, root, index):
     return dict(dielectric_basic_file=basic_path.name, dielectric_inverse_file=inverse_path.name)
 
 
+def _general_current_site_samples(current, sites, *, scalar_cache, begin, end,
+                                  phase_start, print_fn=print, evaluate_dyson=True):
+    """Evaluate ONLY the supplied current sites with the native chi/Dyson owners.
+
+    ``current`` is a plain bundle of this refresh's physical operands and
+    authenticated providers. It owns no old samples or fitted model. A later
+    refinement supplies ONLY its new sites and a separate geometry-keyed
+    scalar cache; the caller retains the old distributed W operands verbatim.
+    The caller must reserve the NEW retained bank/workspace before invoking
+    this stage; the existing execute_response still admits each dispatch.
+    Phase callbacks own initial versus incremental timing labels. Setting
+    evaluate_dyson=False returns raw polarizations for native epsilon probes,
+    without attempting a W inversion before that diagnostic is committed.
+    """
+    import sys
+    import jax
+    import jax.numpy as jnp
+    from .response_bank import full_density_sample_rules
+    from .w_isdf import full_density_response_stream
+    energy,rho,occupations=(current[k] for k in ('energy','rho','occupations'))
+    active,stop,nb=(current[k] for k in ('active','stop','nb'))
+    gamma,recipe,label=(current[k] for k in ('gamma','recipe','label'))
+    pm,ph,pn,energy_d=(current[k] for k in ('pm','ph','pn','energy_d'))
+    mesh_xy,grid,qgrid=(current[k] for k in ('mesh_xy','grid','qgrid'))
+    nk,nmu,ns=(current[k] for k in ('nk','nmu','ns'))
+    layout,response_window=(current[k] for k in ('layout','response_window'))
+    query_q_ids,plan,execute_response=(current[k] for k in ('query_q_ids','plan','execute_response'))
+    sites=np.asarray(sites,complex)
+    if sites.ndim!=1 or not len(sites) or not np.isfinite(sites).all() or np.any(sites.imag<=0):
+        raise ValueError('GATE shared_general_current_sites: finite nonempty upper-half-plane sites required')
+    if evaluate_dyson and current['H'].shape[0]!=len(query_q_ids):
+        raise ValueError('GATE shared_general_current_sites: Coulomb rows must match the explicit response q query')
+    begin('planning')
+    response_active=current['response_active']
+    if not isinstance(response_active,slice):
+        response_active=slice(*response_active)
+    if not 0 <= response_active.start <= active.start < active.stop <= response_active.stop <= stop:
+        raise ValueError('GATE response_blocks_active: numerical response group must contain the coherent window')
+    band=np.arange(nb)[None]
+    f_support,u_support=_density_endpoint_column_support(rho,stop,
+        occupations=occupations,active=response_active)
+    blocks=_general_response_blocks(energy,f_support,u_support,
+        (response_active.start,response_active.stop),current['response_partition'])
+    rules=[]
+    heights=np.floor(np.log2((sites.imag+gamma)/np.min(sites.imag+gamma))/2).astype(int)
+    for bi,block in enumerate(blocks):
+        left_density,right_density=block['density_sides']
+        lm,rm=block['u']!=0,block['f']!=0
+        block['bounds']=[float(energy[lm].min()),float(energy[lm].max()),
+                         float(energy[rm].min()),float(energy[rm].max())]
+        coherent=(band>=active.start)&(band<active.stop)
+        left_support=lm&((coherent|(occupations!=1)) if left_density else True)
+        right_support=rm&((coherent|(occupations!=0)) if right_density else True)
+        ranges=[]
+        for support in (left_support,right_support):
+            nonempty=support.any(axis=1)
+            lower=np.where(nonempty,np.argmax(support,axis=1),0)
+            upper=np.where(nonempty,nb-np.argmax(support[:,::-1],axis=1),0)
+            ranges.append(np.stack([lower,upper]))
+        block['band_ranges']=np.asarray(ranges,np.int32)
+        remote=(np.abs(sites.real)<block['lo']) if block['lo']>0 else np.zeros(len(sites),bool)
+        groups=sorted(set(zip(remote.tolist(),heights.tolist())))
+        for is_remote,height in groups:
+            ids=np.flatnonzero((remote==is_remote)&(heights==height))
+            key=(block['name'],tuple(ids))
+            if jax.process_index()==0:
+                print_fn(f"General shared-pole W [{label}] plan block={block['name']} "
+                         f"interval_Ry={[block['lo'],block['hi']]} sites={len(ids)} "
+                         f"height_bin={height} noncrossing={is_remote}")
+                sys.stdout.flush()
+            planned=full_density_sample_rules(energy[:,:stop],sites[ids],gamma_ry=gamma,
+                tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),
+                paired=True,values_only=True,held=scalar_cache.setdefault(key,{}))
+            for rule in planned:
+                rules.append(dict(rule,block_index=bi,block=block['name'],
+                                  members=[int(ids[j]) for j in rule['members']]))
+    end('planning')
+    if jax.process_index()==0:
+        print_fn(f"General shared-pole W [{label}] scalar plan: {len(rules)} panels, "
+                 f"{sum(r.get('active_count',len(r['times'])) for r in rules)} Green pairs; "
+                 f"node carrier capacity={max(len(r['times']) for r in rules)}; "
+                 f"max error={max(r['sampled_error'] for r in rules):.3e}, "
+                 f"mass={max(r['coefficient_mass'] for r in rules):.3e}; "
+                 "Hankel workspace bound=4GiB, panel count bound=32")
+        sys.stdout.flush()
+    begin('stream')
+    polarizations=[None]*len(sites)
+    for panel_index,rule in enumerate(rules):
+        panel_start=time.monotonic()
+        block=blocks[rule['block_index']]
+        left_density,right_density=block['density_sides']
+        if left_density:
+            left=(pm-ph)*jnp.asarray(block['u'])[:,None,None]
+        else:
+            left=pm*jnp.asarray(block['u'])[:,None,None]
+        right=(ph if right_density else pm)*jnp.asarray(block['f'])[:,None,None]
+        stream=full_density_response_stream(mesh_xy,grid,(nk,nb,nmu,ns),
+            q_ids=query_q_ids,n_outputs=len(rule['members']),layout=layout,qgrid=qgrid,
+            response_window=response_window,rule_reference_ry=rule['reference_ry'],
+            pair_bounds_ry=block['bounds'],pair_band_ranges=block['band_ranges'],
+            k_unfold_plan=plan,execute=execute_response)
+        raw=stream(jnp.asarray(rule['times']),jnp.asarray(rule['weights']),left,pn,right,energy_d)
+        for j,sid in enumerate(rule['members']):
+            value=raw[:,j]
+            polarizations[sid]=value if polarizations[sid] is None else polarizations[sid]+value
+        jax.block_until_ready(polarizations)
+        del raw,value,left,right
+        if jax.process_index()==0 and (panel_index==0 or (panel_index+1)%4==0
+                                       or panel_index+1==len(rules)):
+            print_fn(f"General shared-pole W [{label}] stream panel {panel_index+1}/{len(rules)} "
+                     f"nodes={rule.get('active_count',len(rule['times']))} "
+                     f"carrier={len(rule['times'])} wall={time.monotonic()-panel_start:.3f}s "
+                     f"elapsed={time.monotonic()-phase_start['stream']:.3f}s")
+            sys.stdout.flush()
+    end('stream',polarizations)
+    if evaluate_dyson:
+        # Sum ALL polarization panels BEFORE the one nonlinear Dyson solve.
+        begin('dyson')
+        values=[current['dyson'].value(current['H'],value) for value in polarizations]
+        del polarizations
+        end('dyson',values)
+    else:
+        values=polarizations
+    return dict(values=values,rules=rules,blocks=blocks,response_active=response_active)
+
+
 def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapshot,
                                  run_dir, label, fit_basis=None, print_fn=print):
     """Full microscopic instantaneous-rho W, with general shared frequency poles.
@@ -519,100 +645,16 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     if len(fit_ids) < 4:
         raise ValueError("GATE shared_general_supports: at least four native fitted supports required")
     end("setup", (ph, H))
-    begin("planning")
-    response_active = snapshot.get('response_active_slice', active)
-    if not isinstance(response_active,slice):
-        response_active = slice(*response_active)
-    if not 0 <= response_active.start <= active.start < active.stop <= response_active.stop <= stop:
-        raise ValueError('GATE response_blocks_active: numerical response group must contain the coherent window')
-    band = np.arange(nb)[None]
-    f_support, u_support = _density_endpoint_column_support(rho, stop,
-        occupations=occupations, active=response_active)
-    blocks = _general_response_blocks(energy,f_support,u_support,
-        (response_active.start,response_active.stop),response_partition)
-    rules, scalar_cache = [], fit_basis.setdefault('scalar_rules',{})
-    # Do not force native high-height supports to use the narrow eta-height
-    # continuation grid. Partition by actual height and by noncrossing status;
-    # every original site remains an independently checked physical target.
-    heights = np.floor(np.log2((sites.imag+gamma)/np.min(sites.imag+gamma))/2).astype(int)
-    for bi, block in enumerate(blocks):
-        left_density, right_density = block['density_sides']
-        lm, rm = block['u'] != 0, block['f'] != 0
-        block['bounds'] = [float(energy[lm].min()),float(energy[lm].max()),
-                           float(energy[rm].min()),float(energy[rm].max())]
-        # Only spectator columns with EXACT 0/1 density may be skipped.
-        # Every propagated coherent column stays live regardless of its
-        # diagonal occupation; rho need not commute with current energies.
-        coherent = (band >= active.start)&(band < active.stop)
-        left_support = lm & ((coherent | (occupations != 1)) if left_density else True)
-        right_support = rm & ((coherent | (occupations != 0)) if right_density else True)
-        ranges = []
-        for support in (left_support,right_support):
-            nonempty = support.any(axis=1)
-            lower = np.where(nonempty,np.argmax(support,axis=1),0)
-            upper = np.where(nonempty,nb-np.argmax(support[:,::-1],axis=1),0)
-            ranges.append(np.stack([lower,upper]))
-        block['band_ranges'] = np.asarray(ranges,np.int32)
-        remote = (np.abs(sites.real) < block['lo']) if block['lo'] > 0 else np.zeros(len(sites),bool)
-        groups = sorted(set(zip(remote.tolist(),heights.tolist())))
-        for is_remote,height in groups:
-            ids = np.flatnonzero((remote == is_remote)&(heights == height))
-            # Noncrossing must also survive outward hold padding; if near
-            # the boundary, the general bounded primitive handles it exactly.
-            key = (block['name'],tuple(ids))
-            if jax.process_index()==0:
-                print_fn(f"General shared-pole W [{label}] plan block={block['name']} "
-                         f"interval_Ry={[block['lo'],block['hi']]} sites={len(ids)} "
-                         f"height_bin={height} noncrossing={is_remote}")
-                sys.stdout.flush()
-            planned = full_density_sample_rules(energy[:,:stop],sites[ids],gamma_ry=gamma,
-                tolerance=float(recipe['bank_rule_tolerance']), interval_ry=(block['lo'],block['hi']),
-                paired=True,values_only=True,held=scalar_cache.setdefault(key,{}))
-            for rule in planned:
-                rules.append(dict(rule,block_index=bi,block=block['name'],
-                                  members=[int(ids[j]) for j in rule['members']]))
-    end("planning")
-    if jax.process_index() == 0:
-        print_fn(f"General shared-pole W [{label}] scalar plan: {len(rules)} panels, "
-                 f"{sum(r.get('active_count',len(r['times'])) for r in rules)} Green pairs; "
-                 f"node carrier capacity={max(len(r['times']) for r in rules)}; "
-                 f"max error={max(r['sampled_error'] for r in rules):.3e}, "
-                 f"mass={max(r['coefficient_mass'] for r in rules):.3e}; "
-                 "Hankel workspace bound=4GiB, panel count bound=32")
-        sys.stdout.flush()
-    begin("stream")
-    polarizations = [None]*len(sites)
-    for panel_index, rule in enumerate(rules):
-        panel_start = time.monotonic()
-        block = blocks[rule['block_index']]
-        left_density, right_density = block['density_sides']
-        if left_density:
-            left = (pm-ph)*jnp.asarray(block['u'])[:,None,None]
-        else:
-            left = pm*jnp.asarray(block['u'])[:,None,None]
-        right = (ph if right_density else pm)*jnp.asarray(block['f'])[:,None,None]
-        stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
-            q_ids=query_q_ids, n_outputs=len(rule["members"]), layout=layout, qgrid=qgrid,
-            response_window=response_window,
-            rule_reference_ry=rule["reference_ry"],pair_bounds_ry=block['bounds'],
-            pair_band_ranges=block['band_ranges'], k_unfold_plan=plan,
-            execute=execute_response)
-        raw = stream(jnp.asarray(rule["times"]), jnp.asarray(rule["weights"]), left, pn, right, energy_d)
-        for j, sid in enumerate(rule["members"]):
-            value = raw[:, j]
-            polarizations[sid] = value if polarizations[sid] is None else polarizations[sid]+value
-        # Bound asynchronous live panels to the accumulator plus CURRENT
-        # raw result, rather than queueing every full-microscopic bank.
-        jax.block_until_ready(polarizations)
-        del raw, value,left,right
-        if jax.process_index() == 0 and (panel_index == 0 or (panel_index+1) % 4 == 0
-                                        or panel_index+1 == len(rules)):
-            print_fn(f"General shared-pole W [{label}] stream panel {panel_index+1}/{len(rules)} "
-                     f"nodes={rule.get('active_count',len(rule['times']))} "
-                     f"carrier={len(rule['times'])} wall={time.monotonic()-panel_start:.3f}s "
-                     f"elapsed={time.monotonic()-phase_start['stream']:.3f}s")
-            sys.stdout.flush()
-    end("stream", polarizations)
+    sample_current=dict(energy=energy,rho=rho,occupations=occupations,active=active,
+        response_active=snapshot.get('response_active_slice',active),stop=stop,nb=nb,
+        response_partition=response_partition,gamma=gamma,recipe=recipe,label=label,
+        pm=pm,ph=ph,pn=pn,energy_d=energy_d,mesh_xy=mesh_xy,grid=grid,qgrid=qgrid,
+        nk=nk,nmu=nmu,ns=ns,layout=layout,response_window=response_window,
+        query_q_ids=query_q_ids,plan=plan,execute_response=execute_response,dyson=dyson,H=H)
+    sampled=_general_current_site_samples(sample_current,sites,
+        scalar_cache=fit_basis.setdefault('scalar_rules',{}),begin=begin,end=end,
+        phase_start=phase_start,print_fn=print_fn,evaluate_dyson=direct_request is None)
+    rules,blocks,response_active=(sampled[k] for k in ('rules','blocks','response_active'))
     if direct_request is not None:
         z = direct_request['z_ry']
         root = Path(run_dir)/f'{label}_general_shared_pole'
@@ -621,17 +663,13 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             prefactor=float(algebra['prefactor']), status='UNADMITTED_DIRECT_DIELECTRIC',
             phase_seconds=dict(phases), grid=grid_receipt,
             response_active_bands=[response_active.start, response_active.stop], screening_bands=stop)
-        _save_general_dielectric_probe(polarizations[0],
+        _save_general_dielectric_probe(sampled['values'][0],
             dict(dyson=dyson, H=H[:1], matmul=mm, face=face, rep=rep,
                  mask=meta.mu_basis.active_mask), record, root=root, index=0)
         raise RuntimeError('GATE shared_general_dielectric_diagnostic_stop: UNADMITTED q=0 one-site '
                            f'microscopic dielectric witnesses retained at {root}; no fitted W or Sigma')
-    # Minimax panels add POLARIZATIONS, not screened W. Never add independent
-    # Dyson solutions when more than one panel contributes to the same site.
-    begin("dyson")
-    values = [dyson.value(H, value) for value in polarizations]
-    del polarizations
-    end("dyson", values)
+    values=sampled['values']
+    del sampled
     sample_wall = time.monotonic()-started
     put = lambda a, sh=rep: device_put_process_local(np.asarray(a), sh)
     panel_side = int(mesh_xy.shape["y"])
