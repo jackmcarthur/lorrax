@@ -1,0 +1,81 @@
+{
+  "status": "INDEPENDENT_LITERAL_TIME_CPU_AUDIT_PASS_NO_RUNTIME_CHANGE",
+  "audited_integration_revision": "371efadca2df70234d406e2a8d674eefbd6fe2e0",
+  "test": "tests/tdagw/test_upper_endpoint_literal_time_cpu.py",
+  "test_sha256": "e12f211751db62edfbd049c7d7841e6e0c1ff1d637f23b45e51a95a708faf5bc",
+  "command": "XLA_FLAGS=--xla_force_host_platform_device_count=4 PYTHONPATH=src /tmp/lorrax_mgkba_cpu_venv/bin/python -m pytest tests/tdagw/test_upper_endpoint_literal_time_cpu.py tests/tdagw/test_same_w_rates_only_cpu.py -q -p no:cacheprovider -o junit_family=legacy --junitxml=/tmp/lorrax_literal_endpoint_20261021.Wk8vau/complete.xml",
+  "tests_passed": 10,
+  "seconds": 18.59,
+  "execution": "Four emulated CPU devices, existing native owner and XLA-reference FFT route; no GPU job",
+  "oracle": "Explicit real-positive-time orbital Green matrices, statistical W branch matrices, pointwise spatial/spin products, external orbital projection, and Ain/Aout integrals. No production contraction, resolvent, branch-coefficient or collision helper is used by the oracle.",
+  "time_quadrature": {"interval": [0.0, 300.0], "rule": "Gauss-Legendre", "orders_compared": [512, 768]},
+  "coherent": {
+    "ain_max_abs": 1.3772075917512246e-9,
+    "aout_max_abs": 1.5475790283128855e-9,
+    "raw_C_max_abs": 8.767479797722189e-10,
+    "device_program_raw_C_max_abs": 8.76747972833325e-10,
+    "time_512_vs_768_max_abs": 1.0714189382297384e-13,
+    "negative_control_max_frobenius_errors": {
+      "phase_left_of_density": 0.05823092416130952,
+      "extra_q_reversal": 0.10810961249820956,
+      "W_port_transpose": 0.11416664509719458,
+      "external_row_instead_of_column_energy": 0.08197993568302128
+    }
+  },
+  "binary_projector": {
+    "ain_max_abs": 2.0372917223069963e-12,
+    "aout_max_abs": 2.8754094461250933e-12,
+    "raw_C_max_abs": 7.104332933350098e-14,
+    "device_program_raw_C_max_abs": 7.104505717643775e-14,
+    "time_512_vs_768_max_abs": 1.5577990926991728e-13
+  },
+  "coarse_q_identity": {
+    "electronic_grid": [6, 3, 1],
+    "response_grid": [3, 3, 1],
+    "literal_formula": "sum_q G[k-q] W[q] / Nq",
+    "max_abs_error": 1.6165091241761062e-15,
+    "scope": "Actual sigma_lattice_tile plus independent NumPy unitary-FFT identity; not a full unequal-grid GPU router test"
+  },
+  "passive_native_outward_control": {
+    "coupled_E": [-1.0, -0.5, 1.0],
+    "coupled_rho_diagonal": [1.0, 1.0, 0.0],
+    "Hermitian_channel": [[0, 0, 1], [0, 0, 1], [1, 1, 0]],
+    "poles": [1.0, -1.0],
+    "eta": 0.2,
+    "ISDF_realization": "M=V diag(g) Vdagger; Psi[a,mu]=conj(V[a,mu]); positive W residue=g*g^T. One exactly dark empty band pads the active mesh. Three identical k/q copies retain the exact 1/Nq normalization.",
+    "native_raw_C_vs_literal_time_max_abs": 1.2110951130850367e-11,
+    "native_filled_blocking_min": -0.03154333523251579,
+    "native_fresh_trace_max_abs": 9.298117831235686e-16,
+    "scope": "Actual stored passive frozen W through native synthesis, FFT and projection, not an asserted self-consistent RPA construction. Energy units are the synthetic input units; this does not estimate the material leak."
+  },
+  "implementation_evidence": {
+    "PsiU_then_PsiRho_and_complement": "src/gw/ppm_sigma.py:1793 and 2274",
+    "right_column_liveness_and_energy": "src/gw/ppm_sigma.py:2302 and 2315",
+    "literal_signed_poles_no_extra_q_or_transpose": "src/gw/mpa/sigma.py:2090",
+    "direct_q_crossing_pair_without_transpose": "src/gw/shared_pole_screening.py:1201",
+    "negative_Green_lag": "No negative-lag Green is independently substituted in the ordered positive-time Sigma path; hole compatibility below is the explicit advanced/retarded conversion",
+    "advanced_hole_conversion_and_undo": "src/gw/ppm_sigma.py:2402 then src/tdagw/collision.py:82",
+    "Gamma_D_MH_and_raw_collision": "src/tdagw/collision.py:82 and 91",
+    "U_back_rotation": "src/tdagw/snapshot_runtime.py:566",
+    "actual_raw_device_program_no_counterterm": "src/tdagw/propagate.py:361",
+    "raw_option_binding": "src/tdagw/snapshot_runtime.py:1206"
+  },
+  "audited_runtime_sha256": {
+    "src/gw/ppm_sigma.py": "7a15447fdc5bbfb1670148f5b9a3df11a9944d207d15f67bfcfb3058e416039d",
+    "src/gw/mpa/sigma.py": "51a07e76c868009e5206b5ea1ac201b83b1fb709a4a9701e818432008d61b87a",
+    "src/gw/ppm_tau_kernel.py": "59d7ef27810639873bcd992cee792d55d818fbc921e5217a9b2b168be43c58e3",
+    "src/gw/greens_function_kernel.py": "360b307a3f69daf083f31ed7a48fdc82289a2fccc26ca954a7d9bf148a9c11b9",
+    "src/tdagw/collision.py": "c59a52e09eb84cb7b164fba723ce5f4f3af9710d68a6c5f38cc143c02ebf3576",
+    "src/tdagw/propagate.py": "d7f294b162b5776dac57c9a2423381eb347d1e684355e7f39e332d87e0c212bb",
+    "src/tdagw/snapshot_runtime.py": "cd0dc36ec36c4fb449263f0f8bbaae519a76acb587955ed39300e2a8f63b3c7b"
+  },
+  "verdict": "No implementation discrepancy found against the supplied literal full-matrix upper-endpoint kernel. The passive frozen-W native control already has an actual outward filled-boundary direction with zero fresh trace, so a sign, q, shell-slot or density-order repair is not supported by this audit.",
+  "remaining_scope": [
+    "Not a GPU/CUDA-native qualification or an independent material W/response accuracy proof.",
+    "The coherent reference uses arbitrary signed complex reciprocal poles; zero-real-frequency half-weight and growing-pole edge cases are not independently covered here.",
+    "Fejer response construction and the complete unequal-grid GPU FFT router were read but not rerun against a separate full coarse-grid time oracle. The scalar coarse-q convolution identity is checked.",
+    "The existing finite-width HeadSigmaDiag binary-projector cancellation test passes in the same run. Arbitrary coherent-head statistical reconstruction is not independently audited. A Hermitian coherent counterterm cannot change actual projector boundary compressions.",
+    "A three-band active destination on the CPU2x2 mesh hits existing projection divisibility before padding. The outward control uses one exactly dark empty coordinate; this unrelated odd-dimension interface issue cannot explain the material44-band leak.",
+    "No principal-value term, pole, eigenvalue, collision law, counterterm or guard was altered. Choosing another renormalization or closure requires a separate scientific derivation."
+  ]
+}
