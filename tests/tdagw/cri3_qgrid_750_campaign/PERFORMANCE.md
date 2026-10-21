@@ -402,6 +402,27 @@ wheel path, not a shared-venv modification. See the
 [unaltered small result](evidence/EQFF_Q0_CPU_DIAGNOSTIC_v2.json) and
 [execution/hash receipt](evidence/EQFF_Q0_CPU_EXECUTION_RECEIPT.json).
 
+Two subsequent cached-q0 CPU prototypes retained all 661 selected states,
+without the bank-tolerance H cut. Both obtained a positive lower bound for
+the **computed scaled H** from explicit factor/inverse residual envelopes,
+but neither passed the unchanged `1e-9` whitening requirement:
+
+| Prototype | CPU wall / peak RSS | Computed-H lower bound | Reported whitening error | Verdict |
+| --- | --- | ---: | ---: | --- |
+| Binary64 factor/inverse, extended residuals | 29.545 s / 1.207 GB | 1.52275e-10 | 2.04197e-6, original-H binary64 check | Fail |
+| Extended factor/inverse, delivered maps checked in extended arithmetic | 56.682 s / .801 GB | 1.51973e-10 | 1.32733e-9, final rotated rounded maps | Fail |
+
+The check arithmetic differs between these diagnostics; this table is not
+a matched production speed or accuracy comparison. The second prototype's
+pre-rotation rounded-map error was also `1.30378e-9`, above the same limit.
+Numerical SPD of the recorded scaled matrix is not physical sample accuracy
+or W admission. No H floor, state dropping, tolerance change, GPU run or
+model admission followed. Raw small results and execution/hash receipts are
+preserved byte-for-byte: [binary64 prototype](evidence/EQFF_Q0_CHOLESKY_PROTOTYPE_v1.json),
+[its execution receipt](evidence/EQFF_Q0_CHOLESKY_PROTOTYPE_v1_EXECUTION.json),
+[extended prototype](evidence/EQFF_Q0_EXTENDED_CHOLESKY_9929_v1.json), and
+[its execution receipt](evidence/EQFF_Q0_EXTENDED_CHOLESKY_9929_v1_EXECUTION.json).
+
 ### Correction: the707 t0 request was not on its instantaneous shells
 
 The preserved707 measurements above remain raw historical evidence, but
