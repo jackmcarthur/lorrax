@@ -147,6 +147,8 @@ def make_deck(plan, source, out, active, energy_ev, amplitude, arm, *, zero_gate
 
 def require_matching_zero_result(result, active, response_policy):
     """No four-band or wrong-policy result can admit a larger driven window."""
+    if result.get("diagnostic_role") is not None:
+        raise ValueError("GATE driven_zero: diagnostic source-frozen W cannot admit matched B/C")
     if (not result.get("completed") or result.get("zero_gate") is not True
             or result.get("amplitude_v_m") != 0.
             or result.get("duration_fs") != MATCHING_ZERO_FS
@@ -193,6 +195,8 @@ def validate_raw_zero_prerequisite(plan, frame, *, response_policy=None):
     zero = Path(plan["zero_directory"])
     complete = json.loads((zero/"complete.json").read_text())
     ref = json.loads((zero/"reference.json").read_text())
+    if complete.get("diagnostic_role") is not None or ref.get("diagnostic_role") is not None:
+        raise ValueError("GATE driven_zero: diagnostic source-frozen W cannot admit matched B/C")
     if any(ref.get(k) != frame.get(k) for k in ("frame", "input_h_sha256", "wfn_fingerprint")):
         raise ValueError("GATE driven_reference: zero and live accepted input identities differ")
     if response_policy is not None and response_policy["response_qgrid"] != [8, 8, 1]:

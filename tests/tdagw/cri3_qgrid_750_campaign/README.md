@@ -14,7 +14,9 @@ are in `evidence/Q4_FEJER_ACCEPTED_REFERENCE_60056663.json`. Warm P16 material
 maps take about 45.2 s for W and 17.3 s for the protected160-output Sigma
 sweep; these are not compact44 or coherent TD-refresh timings. Fejér is an
 explicit response-smoothing policy, not a successful sharp-cutoff replay or
-a conserving-closure claim. Matching q4 BSE/TD remain unverified on material.
+a conserving-closure claim. A matching finite-window q4 BSE and coherent
+static-A calibration subsequently completed; raw-collision and updated-W
+material dynamics remain unadmitted, as distinguished below.
 See [PERFORMANCE.md](PERFORMANCE.md) for the measured cold/warm phase costs,
 compact-destination contract, actual backend limits and remaining unmeasured
 TD costs. The native tiny BSE mapping proof is recorded separately in
@@ -259,8 +261,9 @@ preserve material H/U/E, full complex shell pairs and fresh collision/boundary
 diagnostics; separate checkpoint health records measure held-rate drift.
 Gap records describe the propagated window, not a complete750-band gap.
 The actual frozen/reference basis and source producer are recorded separately.
-No 10fs material completion, usable BSE target or nonlinear response has yet
-been established by these adapter tests.
+These adapter tests alone establish neither a material target nor dynamics.
+The separate material BSE and static-A receipts above establish their limited
+results; no 10fs B/C completion or screening-induced damping is established.
 
 `compare_sc750_driven.py CAMPAIGN --out NEW_DIRECTORY` reads only a completed
 three-arm campaign, requiring actual checkpoint coverage, matched fields,
@@ -294,3 +297,33 @@ The captured producer/basis/value receipt and small vector are preserved
 before maps; only the existing basis owner performs orbit packing. BSE
 validates this before allocating static W. No G0 fit or large zeta export is
 substituted.
+
+## Verification-only dielectric and source-frozen collision diagnostic
+
+The first full750 coherent response stream completed in 405.294 s, but the
+general reduced W was refused for a growing q0 pole before any ordered Sigma
+or t0 collision. See [PERFORMANCE.md](PERFORMANCE.md). The saved electronic
+input is an exact equilibrium projector; no population inversion explains
+that fitted pole. A retarded-fit defect or genuine dielectric zero must be
+distinguished with a native dielectric witness, not by clipping poles.
+
+`screen_general_shared_poles` accepts an explicit snapshot-only
+`direct_dielectric_probe={"q": 0, "z_ry": [real, imag]}` diagnostic. It uses
+the same current full750/four-block Green/chi owners at one upper-half-plane
+site, saves scalar physical-space epsilon and checked-inverse witnesses,
+then raises `GATE shared_general_dielectric_diagnostic_stop` before fitting
+or Sigma. Only resolved inverse bounds establish nonsingularity; the named
+stop or an `inverse_error` record alone does not. No microscopic face is
+gathered to host and no default production route changes.
+
+`sc750_source_frozen_callback.py` separately binds the production current
+U/E/full-rho Sigma and authenticated tail/head to the exact signed conversion
+of the native equilibrium source W. Its optional first dielectric witness
+uses a fresh capacity ledger and catches only the explicit diagnostic stop.
+The callback requires the private source artifact policy `write_poles=true`
+and `inputs/sc750_source_frozen_zero44_0p6fs.toml`. Source W is **unshifted**:
+its applied response-lag gamma is zero, not the configured general-W .05 eV.
+All results carry `SOURCE_FROZEN_DIAGNOSTIC`, `zero_gate=false` and
+`matched_BC_admission=false`; both driven prerequisite validators reject
+them. This is a bounded raw-collision investigation, not a matching B/C zero
+gate, an updated-W calculation or a successful material trajectory.

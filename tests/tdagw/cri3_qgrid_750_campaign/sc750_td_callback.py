@@ -13,6 +13,28 @@ import os
 import time
 
 
+SOURCE_FROZEN_DIAGNOSTIC = "SOURCE_FROZEN_DIAGNOSTIC"
+
+
+def diagnostic_record(record, role=None):
+    """Label a verification control without admitting matched B/C evidence."""
+    if role is None:
+        return record
+    if role != SOURCE_FROZEN_DIAGNOSTIC:
+        raise ValueError("GATE sc750_td_diagnostic: unknown diagnostic role")
+    result = dict(record, diagnostic_role=role, screening_control=role,
+                  refreshed_screening=False, matched_BC_admission=False,
+                  source_W_unshifted=True, response_lag_gamma_applied_to_W_ev=0.0)
+    if "response_gamma_ev" in result:
+        result["configured_response_gamma_ev"] = result["response_gamma_ev"]
+        result["response_gamma_ev"] = 0.0
+    if "zero_gate" in result:
+        result["zero_gate"] = False
+    if result.get("status") == "SHORT_ZERO_FIELD_PROBE_COMPLETE_NOT_DRIVEN_ADMISSION":
+        result["status"] = "SOURCE_FROZEN_DIAGNOSTIC_COMPLETE_NOT_BC_ADMISSION"
+    return result
+
+
 def snapshot_boundary_report(gamma, injection, U, rho_in_basis):
     """Fresh boundary test in ONE gauge; all inputs are small host arrays, Ry."""
     import numpy as np
@@ -111,7 +133,7 @@ def validate_probe_deck(deck, *, tf_fs_limit=1.0):
     return span
 
 
-def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
+def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64., diagnostic_role=None):
     """Collective native execution on source['mesh']; no allocation or source rerun."""
     import importlib.util
     import jax
@@ -126,6 +148,7 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
     from tdagw.tdgw_io import efield_function, HA_IN_EV
     from common.units import RYD_TO_EV
     started, out = time.perf_counter(), Path(out).resolve()
+    diagnostic_record({}, diagnostic_role)
     if (not math.isfinite(budget_s) or not math.isfinite(storage_gib)
             or budget_s <= 0 or storage_gib <= 0):
         raise ValueError("positive finite explicit probe budgets required")
@@ -190,7 +213,7 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
 
     def save(name, *, record=None, arrays=None):
         path = out/name
-        record = None if record is None else plain(record)
+        record = None if record is None else plain(diagnostic_record(record, diagnostic_role))
         rank0_transaction(path, stage="sc750_td/"+name,
             write=lambda: io.exclusive_write(path, record=record, arrays=arrays))
 
@@ -272,6 +295,8 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
         def capture():
             nonlocal n
             state = collision["state"]
+            if diagnostic_role is not None:
+                state["history"][-1].update(diagnostic_record(state["history"][-1], diagnostic_role))
             basis = state["basis_last"][0]
             row = latest_snapshot_row(evaluated,basis)
             data = dict(U=basis["U"], E_ry=basis["e"], rho_in_basis=basis["rho"],
@@ -338,6 +363,8 @@ def run_td_probe(source, *, out, deck_path, budget_s=900., storage_gib=64.):
         refreshes = 0 if not handles else int(handles[0]["state"]["n"])
         if values["lorrax.collision_screening"] == "joint" and refreshes < 1:
             raise ValueError("GATE sc750_td_refresh: no actual updated-W refresh was reached")
+        if diagnostic_role is not None and refreshes < 1:
+            raise ValueError("GATE sc750_td_refresh: source-frozen control needs an actual electronic refresh")
         save("complete.json", record=dict(status="SHORT_ZERO_FIELD_PROBE_COMPLETE_NOT_DRIVEN_ADMISSION",
             frame=frame["frame"], stats=stats, accepted_refreshes=refreshes,
             completed=True, zero_gate=True, amplitude_v_m=0., duration_fs=duration,
