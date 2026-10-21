@@ -254,3 +254,21 @@ This qualifies the tiny native software case, not material/general-W,
 hsuite, speedup, positivity, equilibrium stationarity or a TD trajectory.
 Earlier CPU evidence and failed 5049 startup records retain their original
 per-run identities; the successful run does not relabel either of them.
+
+Proposed equilibrium Hermitian value pencil: HOST ONLY
+-----------------------------------------------------
+verify_equilibrium_hermitian_pencil_host.py exercises the ACTUAL small
+finite_pencil_column owner, then a proof-only NumPy/SciPy positive-H
+congruence. Complex gyrotropic q/-q channels have nonzero C1; shifted gamma,
+all complex held values, both residue signs and non-dark zero-mu refusal are
+checked. It is not a production reducer, native GPU proof, material fit or
+speedup. The proposal and material sample-error/null-space caveats are in
+docs/theory/shared-pole-w-model.md section6.4.
+
+Use CPU only, with OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 JAX_PLATFORMS=cpu:
+  python verify_equilibrium_hermitian_pencil_host.py --source ROOT --out FRESH.json
+The output is exclusive. The focused host test is
+../test_equilibrium_hermitian_pencil_host.py. The actual V2 receipt is
+/home/jackm/mgkba_campaign_20261019/qgrid_20261020/PROPOSED_EQ_HERMITIAN_PENCIL_HOST_V2.json
+(held complex error2.42e-14, q/-q error5.97e-15; .589s).
+No production route or material source was changed by this proof.

@@ -607,6 +607,12 @@ left/right Ruiz factors and E-SVD cut are not that reduction.
 Admission must refuse resolved negative $\mathcal H$, not floor it. Exact
 $\mathcal H$-null directions are state dependencies and also null in
 $\mathcal G,O$; numerical removal still needs the existing loss checks.
+For material data, propagate sample errors as well as roundoff before
+calling negativity resolved: an action perturbation obeys
+$|\delta\mathcal G_{ij}|\le
+(\|\delta O_i\|\|Q_j\|+\|Q_i\|\|\delta O_j\|)/
+(\operatorname{Im}\zeta_i+\operatorname{Im}\zeta_j)$ and
+$\delta\mathcal H_{ij}=\zeta_j\delta\mathcal G_{ij}-\delta O_i^\dagger Q_j$.
 Separately, $\mu=0$ can produce a nonzero constant $-cc^\dagger$, not a dark
 mode. A strictly proper bank must resolve/refuse that output or establish an
 explicit admissible null-output policy; it must not silently drop it.

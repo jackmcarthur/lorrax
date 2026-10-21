@@ -1,0 +1,28 @@
+{
+  "status": "HOST_ONLY_PROPOSED_EQ_PENCIL_PASS",
+  "production_route": false,
+  "material_qualified": false,
+  "native_GPU_test": false,
+  "source_revision_before_proof_commit": "6518d36",
+  "proof_sha256": "9cc26179098364259099bf0ef7aa0a26de0a19fe55b5aca0f4491c46704e3353",
+  "finite_owner": "gw.shared_pole_pencil.finite_pencil_column",
+  "finite_owner_sha256": "c204c2ab31dabaaa8bb0094954a590e63b0b8156c319c74531ed2b8f77668ece",
+  "receipt_path": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/PROPOSED_EQ_HERMITIAN_PENCIL_HOST_V2.json",
+  "elapsed_seconds": 0.5885144999992917,
+  "full_complex_held_relative_error": 2.4196373024746194e-14,
+  "latent_gram_relative_error": 3.838927573930046e-16,
+  "q_minus_q_relative_error": 5.971998695112494e-15,
+  "undamped_not_even_frequency_relative_difference": 0.9620388612051985,
+  "gamma_ry": 0.037,
+  "state_ranks": [4, 4],
+  "node_count": 8,
+  "nonzero_C1_norms": [15.492786496756322, 15.49278649675632],
+  "zero_C1_assumed": false,
+  "real_zeta_poles": true,
+  "exact_dark_mu_removed": 1,
+  "required_refusals": [
+    "GATE host_eq_pencil: non-dark zero/unresolved mu gives feedthrough",
+    "GATE host_eq_pencil: resolved negative H; no PSD repair"
+  ],
+  "scope": "Exact tiny complex gyrotropic signed-channel proof; not material reduction, approximate rank selection, GPU performance or a nonequilibrium stability theorem."
+}
