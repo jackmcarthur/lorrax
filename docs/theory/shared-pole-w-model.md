@@ -620,6 +620,12 @@ Separately, $\mu=0$ can produce a nonzero constant $-cc^\dagger$, not a dark
 mode. A strictly proper bank must resolve/refuse that output or establish an
 explicit admissible null-output policy; it must not silently drop it.
 Native/held full-W, moment and full-complex column-Σ checks remain necessary.
+The current builder **measures and receipts** full-port $C_1,C_2$ defects;
+it does not apply an independent full-moment admission threshold. Infinity
+states enforce projected equations on their retained directions, not exact
+full-port moments. In particular, a relative defect of cancellation-small
+$C_1$ must not be mistaken for a consumer-weighted Σ error bound. Full-W
+fit/held, growth and capacity gates are separately enforced.
 
 `tests/test_equilibrium_definite_constructor_cpu.py` and
 `tests/test_equilibrium_definite_builder_cpu.py` cover complex q/−q pairs,
