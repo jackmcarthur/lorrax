@@ -3,7 +3,7 @@
 #
 # Login-node checks (always run; python3 3.7 is enough — the suites are the
 # AST gates, which run via their __main__ runners without jax):
-#   1-5. the five login AST suites: test_layering, test_crossfile_requests,
+#   1-5. the five login AST lint suites (tools/lint): test_layering, test_crossfile_requests,
 #        test_env_registry, test_env_grammar, test_fft_shardmap_context
 #   6.   tools/gen_input_reference.py drift check (the tool refuses on key
 #        drift vs gw_config._DEFAULTS; a content diff vs the committed
@@ -52,10 +52,10 @@ record() {  # record <name> <rc> [detail]
   else VERDICTS+=("FAIL${3:+ — $3}"); FAILED=1; fi
 }
 
-# --- 1-5. the five login AST suites ---------------------------------------
+# --- 1-5. the five login AST lint suites (tools/lint) ---------------------------------------
 for t in test_layering test_crossfile_requests test_env_registry \
          test_env_grammar test_fft_shardmap_context; do
-  out=$(python3 "tests/$t.py" 2>&1); rc=$?
+  out=$(python3 "tools/lint/$t.py" 2>&1); rc=$?
   tail_line=$(printf '%s\n' "$out" | tail -1)
   record "$t" "$rc" "$tail_line"
   [ "$rc" -ne 0 ] && printf '%s\n' "$out" | tail -20

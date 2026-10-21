@@ -204,7 +204,7 @@ def make_w_densifier(
     No step materializes a replicated N_μ²-class array — the eager
     ``local_ifftn3``/``local_fftn3`` + ``device_put`` form this replaces
     all-gathered the full tensor per rank (audit P0-4/P2-7) and is what the
-    ``tests/test_fft_shardmap_context.py`` gate now bans.
+    ``tools/lint/test_fft_shardmap_context.py`` gate now bans.
     """
     if output not in ("k", "R"):
         raise ValueError(f"make_w_densifier: output must be 'k' or 'R', got {output!r}")

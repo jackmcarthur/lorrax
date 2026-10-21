@@ -3,7 +3,7 @@
 This page owns four facts about every environment variable LORRAX reads: its
 **spelling**, its **default**, its **class**, and its **parse grammar**. Each
 row adds one sentence on what the variable controls and what it refuses; the
-explanation belongs to the page the row links to. `tests/test_env_registry.py`
+explanation belongs to the page the row links to. `tools/lint/test_env_registry.py`
 fails when a variable read under `src/` or `services/*/src` (Python or C++)
 has no row here.
 

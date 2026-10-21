@@ -88,25 +88,6 @@ _services.ensure_on_path()
 # dual spelling of it would be two module objects waiting to happen.
 
 
-def report_devices(print_fn=None) -> None:
-    """Lightweight device banner — call it, do not trigger it on import.
-
-    This used to run at module IMPORT time.  ``jax.devices()`` brings up
-    the XLA backend, and ``jax.distributed.initialize()`` refuses to run
-    after that ("must be called before any JAX calls that might
-    initialise the XLA backend"), so merely importing this module made
-    every downstream CLI single-process **whatever its own header did**.
-    That is what pinned ``gw.kin_ion_io`` to one rank; a diagnostic
-    print is not worth a backend init, so it moved into a function.
-    """
-    try:
-        devs = jax.devices()
-        plat = devs[0].platform if devs else 'none'
-        (print_fn if print_fn is not None else log.info)(
-            f"JAX: {len(devs)} {plat} devices")
-    except Exception:
-        pass
-
 # Import ISDF modules
  
 

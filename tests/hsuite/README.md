@@ -50,7 +50,7 @@ bands. The Na stages run in `run/na/`.
 | dipole | `psp.get_dipole_mtxels` | dipole with analytic V_NL velocity |
 | gnppm | `gw.gw_jax` | fresh ζ fit, GN-PPM one-shot, `head_correction = full`, spectral_shell band extrapolation, local linalg |
 | bse | `bse.bse_jax` | TDA Davidson on the GN-PPM restart bundle, screened direct term (D + V − W) |
-| htransform | `bandstructure.htransform` | Galerkin band interpolation on a G–X–M path |
+| htransform | `bandstructure.htransform` | Galerkin band interpolation on a G–X–M path with two interior points per segment (`htransform.in`): the 5 × 5 × 1 grid has spacing 0.2, so the interior points at multiples of 2/15 are off the grid; the corners are on it |
 | exciton_bands | `bse.exciton_bands` | fH interpolation, then finite-Q TDA (1v × 1c) on the same path |
 | cohsex | `gw.gw_jax` | static COHSEX one-shot, restarted |
 | sp_export | `gw.gw_jax` | shared-pole one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |

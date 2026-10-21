@@ -1,7 +1,7 @@
 """HLO probe: prove ``bse_io.make_w_densifier`` compiles with NO all-gather.
 
 WHAT THIS PROVES (that the AST gate cannot).  The gate
-``tests/test_fft_shardmap_context.py`` bans the eager
+``tools/lint/test_fft_shardmap_context.py`` bans the eager
 ``local_ifftn3``/``local_fftn3`` call form syntactically; the SEMANTIC claim
 of audit P0-4 — the densifier never materializes a replicated N_μ²-class W
 tile per rank — is a property of the compiled program.  This probe lowers

@@ -231,7 +231,7 @@ def least_squares_transfer(
     # refuses on host below rather than snapping, so the flag means the same
     # thing here as at every other seam.
     # The caller reads the dial and passes it — ``spectral_closure`` is L2 and
-    # must be a function of its arguments (tests/test_layering.py).
+    # must be a function of its arguments (tools/lint/test_layering.py).
     _sc_mode = spectral_closure.resolve_mode(
         os.environ.get(spectral_closure.MODE_ENV))
     _keep_closed, _n_pre, _n_post = spectral_closure.close_keep_mask(

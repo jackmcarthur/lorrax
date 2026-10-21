@@ -227,12 +227,6 @@ def sampling_plan(points, *, label):
     }
 
 
-def plan_points(plan):
-    """The plan's ordered points."""
-
-    return plan["points"]
-
-
 def plan_z(plan):
     """The plan's sample grid as ``(n_points,)`` complex128.
 
@@ -306,18 +300,6 @@ def refuse_unsupported(plan, *, delta_max=None):
                 "positive; at or below it the target has a real pole. "
                 "FALSE case: every varpi == 0, omega != 0 sample sits "
                 "above every transition energy.")
-
-
-def describe_plan(plan):
-    """A one-line-per-cell census of the plan.  For cost reports."""
-
-    counts = {}
-    for p in plan["points"]:
-        counts[p["family"]] = counts.get(p["family"], 0) + 1
-    cells = ", ".join(
-        f"{name}={counts.get(name, 0)}" for name in FAMILIES)
-    return (f"plan {plan['label']!r}: {len(plan['points'])} points "
-            f"[{cells}]")
 
 
 # ---------------------------------------------------------------------------

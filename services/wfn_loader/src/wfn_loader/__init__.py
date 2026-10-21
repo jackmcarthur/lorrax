@@ -13,7 +13,7 @@ P2 contract and the only reason ``LORRAX_WFN_BACKEND`` is safe to expose.
 
 THE PACKAGE IS THE PUBLIC API.  Everything a consumer needs is a top-level name
 here; importing ``wfn_loader.loader`` from outside is a layering violation
-the monorepo's ``tests/test_layering.py`` fails on.
+the monorepo's ``tools/lint/test_layering.py`` fails on.
 
 The surface
 -----------

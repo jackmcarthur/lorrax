@@ -76,11 +76,6 @@ def dress(F, Fchi, chiFh, FchiW, v):
     return Ft, 0.5 * (P + np.conj(np.swapaxes(P, -1, -2)))
 
 
-def lr_term(Ft, P, v):
-    """F̃ᴴ D F̃, D = :func:`screened_lr` — (n, n_L, N), (n, n_L, n_L), (n, n_L) → (n, N, N)."""
-    return np.conj(np.swapaxes(Ft, -1, -2)) @ screened_lr(P, v) @ Ft
-
-
 def read_channel_rows(zeta_path, q_frac, *, sys_dim, kgrid, mc_average_vcoul_body):
     """Bare channel rows F (n_q, n_L, n_rmu) in canonical order, and the channel table.
 

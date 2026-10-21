@@ -101,16 +101,6 @@ def _sample_point(recipe, sample_id):
     return complex(values[0])
 
 
-def _fit_roles(recipe):
-    """Ephemeral constructor record view; only flat arrays are serialized."""
-    from gw.shared_pole_recipe import ROLE_CODES
-    names = {code: name for name, code in ROLE_CODES.items()}
-    return [{"sample_id": int(sample), "role": f"{names[int(role)]}:{i}",
-             "held": bool(held)}
-            for i, (sample, role, held) in enumerate(zip(
-                recipe["distinct_id"], recipe["role"], recipe["held"]))]
-
-
 @lru_cache(maxsize=None)
 def _round_kernels(mesh, layout="batch"):
     """Selection programs for batch or whole-mesh face stacks of parents.

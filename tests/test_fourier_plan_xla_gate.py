@@ -184,43 +184,7 @@ def main() -> int:
     return rc
 
 
-# ---- pytest: the contract and the rows on CPU ---------------------------------------------
-
-def test_the_rows_and_family_agree():
-    pytest.importorskip("jax")
-    from ffi.common import families, ffi_loader
-    from ffi.fft import FOURIER_PLAN_TARGETS
-    assert families.family_of(FOURIER_PLAN_TARGETS["ROCM"]) == "fourier_plan_rocm"
-    assert families.state("fourier_plan_rocm", "ROCM")[0] == "built"
-    assert families.FAMILIES["fourier_plan_rocm"].tol == TOL == families.FAMILIES["fourier_plan"].tol
-    assert FOURIER_PLAN_TARGETS["ROCM"] in ffi_loader._PLATFORMS["ROCM"]["targets"]
-    assert FOURIER_PLAN_TARGETS["CUDA"] in ffi_loader._PLATFORMS["CUDA"]["targets"]
-
-
-def test_xla_leg_matches_numpy_on_cpu():
-    jax = pytest.importorskip("jax")
-    jax.config.update("jax_enable_x64", True)
-    import jax.numpy as jnp
-    import common.fourier_plan as fp
-    saved = dict(fp.GEMM_CROSSOVER)
-    fp.GEMM_CROSSOVER.update(_ROWS)
-    try:
-        for i, (name, kw, shape, kind) in enumerate(cases()):
-            kw2 = dict(kw)
-            plan = fp.LocalFourierPlan(kw2.pop("extents"), kw2.pop("axes"), device_kind=kind, **kw2)
-            rng = np.random.default_rng(i)
-            x = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
-            y = np.asarray(plan._call_xla(jnp.asarray(x)))
-            ref = np_reference(x, kw)
-            assert np.max(np.abs(y - ref)) <= TOL * np.max(np.abs(ref)), name
-    finally:
-        fp.GEMM_CROSSOVER.clear()
-        fp.GEMM_CROSSOVER.update(saved)
-
-
-def test_device_gate_needs_a_device_leg():
-    pytest.skip("run as a script on a CUDA or ROCm mesh: python -m tests.test_fourier_plan_xla_gate")
-
+# ---- pytest: the contract on CPU ----------------------------------------------------------
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -96,12 +96,6 @@ log = get_logger(__name__)
 #  Jitted real-space kernels (single-GPU; no sharding)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _batched_real_norm_host(a: jax.Array) -> jax.Array:
-    """``(batch,)`` real L2 norm over the trailing two axes — for the b≈0 fast path."""
-    return jnp.sqrt(jnp.real(
-        jnp.einsum('vsG,vsG->v', jnp.conj(a), a, optimize=True)))
-
-
 def _gather_box_at_G(box: jax.Array, G_int: jax.Array) -> jax.Array:
     """Gather values at the signed integer G-indices (wrapped mod FFT-grid).
 
@@ -236,38 +230,6 @@ def make_density_perturbation(fft_grid) -> jax.Array:
     return jnp.ones((nx, ny, nz), dtype=jnp.complex128)
 
 
-def make_umklapp_phase(G_wrap: np.ndarray, fft_grid, sign: int = +1) -> jax.Array:
-    """Return e^{i·sign·G_wrap·r} on the FFT grid, with r in crystal coords.
-
-    Build exp(sign · 2π i · G_wrap · r_frac) at FFT grid points r_frac =
-    (j_x/nx, j_y/ny, j_z/nz).  This is cell-periodic when G_wrap is an
-    integer reciprocal vector; it converts a cell-periodic function from the
-    naive-(k-q) gauge to the wrapped-(k-q) gauge (sign=+1) or back (sign=-1):
-
-        u_{wrap}(r) = e^{-i G_wrap · r} · u_{naive}(r)      [user derivation §1]
-        δu_{naive}(r) = e^{-i G_wrap · r} · δu_{wrap}(r)   [user derivation §2]
-
-    So the source builder multiplies by phase_wrap  = exp(+2πi G_wrap · r_frac)
-    to push u_{v,k_s}(r) into the wrapped gauge before projecting on Q_{k-q}_wrap,
-    and the accumulator multiplies δu_wrap by phase_unwrap = conj(phase_wrap)
-    to recover δu_naive before contracting with u_{v,k_s}(r).
-
-    If ``G_wrap == 0``, returns constant 1 (no-op).
-    """
-    nx, ny, nz = fft_grid
-    if int(G_wrap[0]) == 0 and int(G_wrap[1]) == 0 and int(G_wrap[2]) == 0:
-        return jnp.ones((nx, ny, nz), dtype=jnp.complex128)
-    fx = jnp.arange(nx, dtype=jnp.float64) / nx
-    fy = jnp.arange(ny, dtype=jnp.float64) / ny
-    fz = jnp.arange(nz, dtype=jnp.float64) / nz
-    phase_arg = (2.0 * jnp.pi * sign) * (
-        float(G_wrap[0]) * fx[:, None, None]
-        + float(G_wrap[1]) * fy[None, :, None]
-        + float(G_wrap[2]) * fz[None, None, :]
-    )
-    return jnp.exp(1j * phase_arg).astype(jnp.complex128)
-
-
 # ═══════════════════════════════════════════════════════════════════════
 #  k·p response  ∂u_{v, kvec_p}/∂kvec_p  — "unfreeze the projector"
 # ═══════════════════════════════════════════════════════════════════════
@@ -379,121 +341,9 @@ def compute_kp_tangent_at_kvec(
     return du_flat.reshape(3, nv, *du_flat.shape[1:])  # (3, nv, ns, nG)
 
 
-def compute_kp2_tangent_at_kvec(
-    kvec_p_base_np: np.ndarray,        # (3,)
-    Gkminq_int_np: np.ndarray,         # (nG_p, 3)
-    vnl_setup,
-    V_scf: jax.Array, mask: jax.Array,
-    Gx: jax.Array, Gy: jax.Array, Gz: jax.Array,
-    fft_grid,
-    bdot: jax.Array,
-    vnl_E_super: jax.Array,
-    U_val_G: jax.Array,                 # (nv, ns, nG_p)
-    U_val_grad_kp: jax.Array,           # (3, nv, ns, nG_p) from compute_kp_tangent_at_kvec
-    eps_v_at_kvec_p: jax.Array,
-    alpha_pv_sc: jax.Array,
-    precond_diag: jax.Array,
-    *,
-    tol: float = 1e-10,
-    max_iter: int = 300,
-    use_schur: bool = False,
-    U_extra_G: jax.Array | None = None,
-    eps_extra_v_at_kvec_p: jax.Array | None = None,
-) -> jax.Array:
-    """Return ∂²u_v/∂kvec_p_i ∂kvec_p_j as a (3, 3, nv, nspinor, nG) array,
-    symmetric over (i, j).
-
-    Second-order k·p response.  The standard insulator derivation gives
-
-        Q (H − ε) Q · ∂²u/∂k_i∂k_j  =  − Q · [ (∂²H/∂k_i∂k_j) u
-                                              + (∂H/∂k_i) ∂u/∂k_j
-                                              + (∂H/∂k_j) ∂u/∂k_i ]
-
-    (the ε-derivatives don't survive the Q-projection since ∂u/∂k are already
-    in range(Q)).  Implementation uses nested ``jax.jvp`` on ``A(k) · x``
-    with ``x`` in turn equal to ``U_val_G`` or ``U_val_grad_kp[i]``; the
-    operator tangent ``∂A/∂k_i`` reduces to ``∂H/∂k_i`` because the α·P_val
-    and −ε_v terms are kvec_p-independent.
-
-    This is the missing ingredient for the exact S-tensor at q=0: the
-    linear U_val_eff ansatz in ``chi_col_contrib_at_kvec_traced`` captures
-    only first-order projector drift; picking up the second-order projector
-    correction requires this Hess of U_val to appear in the quadratic
-    U_val_eff term.
-
-    Cost: 6 batched CG solves per call (symmetric 3×3 matrix; only i≤j pairs
-    are solved; diagonal entries reuse the single cross term).  Each solve
-    is the same jitted ``sternheimer_solve`` kernel as the main χ column.
-    """
-    from solvers.sternheimer_solve import (
-        SternheimerOp, sternheimer_solve, _apply_A_inline)
-
-    def _op_at(kvec_p_t):
-        return build_sternheimer_op_at_kvec_traced(
-            kvec_p_t, Gkminq_int_np, vnl_setup,
-            V_scf=V_scf, mask=mask, Gx=Gx, Gy=Gy, Gz=Gz, fft_grid=fft_grid,
-            bdot=bdot, vnl_E_super=vnl_E_super,
-            U_val_kminq_G=U_val_G, eps_v=eps_v_at_kvec_p,
-            alpha_pv_sc=alpha_pv_sc, precond_diag=precond_diag,
-            U_extra_G=U_extra_G, eps_extra=eps_extra_v_at_kvec_p,
-        )
-
-    kvec_p_base = jnp.asarray(kvec_p_base_np, dtype=jnp.float64)
-    op_base = _op_at(kvec_p_base)
-
-    def Q_of(x):
-        coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
-        return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
-
-    def e_vec(k):
-        return jnp.zeros(3, dtype=jnp.float64).at[k].set(1.0)
-
-    hess = [[None] * 3 for _ in range(3)]
-    for i in range(3):
-        for j in range(i + 1):
-            ei = e_vec(i)
-            ej = e_vec(j)
-
-            # (∂²A/∂k_i∂k_j) · U_val  via nested jax.jvp on k ↦ A(k)·U_val.
-            def _A_u(k):
-                return _apply_A_inline(_op_at(k), U_val_G)
-            def _grad_j_A_u(k):
-                _, out = jax.jvp(_A_u, (k,), (ej,))
-                return out
-            _, A_ij_u = jax.jvp(_grad_j_A_u, (kvec_p_base,), (ei,))
-
-            # (∂A/∂k_i) · (∂u/∂k_j)
-            _, A_i_duj = jax.jvp(
-                lambda k: _apply_A_inline(_op_at(k), U_val_grad_kp[j]),
-                (kvec_p_base,), (ei,))
-            # (∂A/∂k_j) · (∂u/∂k_i)  — equals A_i_duj when i == j
-            if i == j:
-                A_j_dui = A_i_duj
-            else:
-                _, A_j_dui = jax.jvp(
-                    lambda k: _apply_A_inline(_op_at(k), U_val_grad_kp[i]),
-                    (kvec_p_base,), (ej,))
-
-            rhs_ij = A_ij_u + A_i_duj + A_j_dui
-            b_ij = Q_of(rhs_ij)
-            d2u_ij = sternheimer_solve(op_base, b_ij,
-                                        tol=tol, max_iter=max_iter,
-                                        use_schur=use_schur)
-            hess[i][j] = d2u_ij
-            hess[j][i] = d2u_ij
-
-    return jnp.stack([jnp.stack(row, axis=0) for row in hess], axis=0)
-
-
 # ═══════════════════════════════════════════════════════════════════════
 #  Explicit S-tensor at q = 0 — bypasses nested jvp entirely
 # ═══════════════════════════════════════════════════════════════════════
-
-def _q_project(U_val_G: jax.Array, x: jax.Array) -> jax.Array:
-    """Q_{k-q}(x) = x - Σ_m U_val[m]·<U_val[m]|x>."""
-    coefs = jnp.einsum('msG,vsG->vm', jnp.conj(U_val_G), x, optimize=True)
-    return x - jnp.einsum('vm,msG->vsG', coefs, U_val_G, optimize=True)
-
 
 def compute_s_tensor_contrib_at_q0(
     kvec_p_base_np: np.ndarray,        # (3,) = kvec_k at q=0 (non-wrapping k's)

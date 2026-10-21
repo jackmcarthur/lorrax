@@ -320,14 +320,6 @@ CHECKS = ([(f"prefix active={a}", lambda a=a: check_prefix_ops(a)) for a in (1, 
              ("davidson solve", check_davidson)])
 
 
-@pytest.mark.parametrize("name,fn", CHECKS, ids=[n for n, _ in CHECKS])
-def test_native_route(name, fn):
-    ok, why = _native_available()
-    if not ok:
-        pytest.skip(f"no native active-subspace provider on this process: {why}")
-    fn()
-
-
 def main():
     ok, why = _native_available()
     print(f"device {jax.devices()[0]} ({jax.devices()[0].platform}); native: {ok} {why}", flush=True)

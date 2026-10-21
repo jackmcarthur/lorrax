@@ -385,7 +385,7 @@ def _qs():
     always: this module was written while the q_irr checkpoint was still
     landing, when the format's plumbing was private to
     ``symmetry_maps.qirr_store``, and it reached into that submodule for
-    thirty-four of them.  ``tests/test_layering.py``'s public-API rule counted
+    thirty-four of them.  ``tools/lint/test_layering.py``'s public-API rule counted
     that reach, correctly — a consumer that imports a service's submodule
     is a consumer that stops the service being replaceable — and the
     checkpoint answered it by PUBLISHING the plumbing rather than by

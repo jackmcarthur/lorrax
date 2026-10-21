@@ -230,34 +230,6 @@ def _gauss_from_moments(moments: np.ndarray, k: int) -> tuple[np.ndarray, np.nda
     return nodes[order], weights[order]
 
 
-def _compute_window_moments(
-    E_grid: np.ndarray,
-    rho: np.ndarray,
-    w_j: np.ndarray,
-    n_moments: int,
-    E_shift: float = 0.0,
-    E_scale: float = 1.0,
-) -> np.ndarray:
-    """Compute power moments m_n = ∫ x^n w_j(E) ρ(E) dE where x = (E - shift)/scale.
-
-    Clips to the window support (|w_j| > 1e-6) to avoid pollution from
-    high-order monomials far outside the window.
-    """
-    # Restrict to window support
-    support = np.abs(w_j) > 1e-6
-    if not np.any(support):
-        return np.zeros(n_moments)
-    E_s = E_grid[support]
-    w_s = w_j[support]
-    rho_s = np.maximum(rho[support], 0.0)
-    x = (E_s - E_shift) / E_scale
-    integrand_base = w_s * rho_s
-    moments = np.zeros(n_moments)
-    for n in range(n_moments):
-        moments[n] = float(np.trapezoid(integrand_base * x**n, E_s))
-    return moments
-
-
 def _compute_window_moments_discrete(
     E_eig: np.ndarray,
     n_moments: int,

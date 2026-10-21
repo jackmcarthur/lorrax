@@ -11,7 +11,7 @@ A module's level is decided by its vocabulary, not by its directory:
 | **L2** | **numerical routines** | matrices, quadrature nodes, residuals, convergence | anything physical |
 | **L3** | **substrate** | devices, meshes, processes, native libraries, files | anything mathematical |
 
-**Imports run downhill only: L1 → L2 → L3.** `tests/test_layering.py` holds
+**Imports run downhill only: L1 → L2 → L3.** `tools/lint/test_layering.py` holds
 the map and fails when a rule breaks ([§6](#6-the-gate)). Everything under
 `src/` that the map does not name is L1: physics is the bulk, so a new module
 has to argue its way down.
@@ -51,7 +51,7 @@ that concrete: a driver imports none of `jax.sharding`,
 `jax.experimental.shard_map`, `multihost_utils`, `mesh_utils` or `jax._src`,
 nor `shard_map` / `Mesh` / `NamedSharding` / `PartitionSpec` / `make_mesh`
 off `jax`, at module scope or lazily. Seventeen drivers carry none. Four carry
-one import each, and `tests/test_layering.py::_DRIVER_PLUMBING_BUDGET` pins
+one import each, and `tools/lint/test_layering.py::_DRIVER_PLUMBING_BUDGET` pins
 that count:
 
 - `bse/exciton_bands.py` is a driver and a library: it owns the
@@ -196,7 +196,7 @@ readers above it (`epsreader`, `mf_header`, `sigma_output`, `tagged_arrays`,
 
 ## 5. The sanctioned exceptions
 
-Each exception is listed in `tests/test_layering.py` with its reason and is
+Each exception is listed in `tools/lint/test_layering.py` with its reason and is
 asserted to be still needed: an exception that outlives its violation fails
 the suite. An import of a service's top-level package is not an exception:
 `upward_edges()` does not rank it, and rule 6 governs it.
@@ -260,9 +260,9 @@ the gate.
 
 ## 6. The gate
 
-`tests/test_layering.py` is pure AST: it imports neither jax nor anything
+`tools/lint/test_layering.py` is pure AST: it imports neither jax nor anything
 under `src/`, so it runs on a login node, in a container and in CI
-(`python3 tests/test_layering.py` also runs it without pytest).
+(`python3 tools/lint/test_layering.py` also runs it without pytest).
 
 | rule | what fails it |
 |---|---|

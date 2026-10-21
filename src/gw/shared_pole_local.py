@@ -673,17 +673,6 @@ def own_extent_receipts(reduction, own):
 _BATCH_CONSTANTS = {}
 
 
-def _batch_constant(mesh_xy, a):
-    """:func:`_batch_put` of a small table that repeats between rounds, placed once per value."""
-    import numpy as np
-    a = np.asarray(a)
-    key = (mesh_xy, a.dtype.str, a.shape, a.tobytes())
-    hit = _BATCH_CONSTANTS.get(key)
-    if hit is None or hit.is_deleted():
-        hit = _BATCH_CONSTANTS[key] = _batch_put(mesh_xy, a)
-    return hit
-
-
 def _batch_put(mesh_xy, a):
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P

@@ -267,35 +267,3 @@ def assemble_W_sharded(
 # ---------------------------------------------------------------------------
 # End-to-end driver (convenience)
 # ---------------------------------------------------------------------------
-
-def reconstruct_W_via_schur_sharded(
-    V_q: jax.Array,
-    chi_body_q: jax.Array,
-    g0_x: jax.Array,
-    g0_y: jax.Array,
-    chi_wing_x: jax.Array,
-    chi_wing_y: jax.Array,
-    chi_wingp_x: jax.Array,
-    chi_wingp_y: jax.Array,
-    chi_head_q: jax.Array,
-    v_head_q: jax.Array,
-    *,
-    mesh_xy: Mesh,
-    pref: complex = 1.0+0j,
-) -> jax.Array:
-    """End-to-end Schur reconstruction of W from rank-1 head + body solve.
-
-    Equivalent to ``solve_w(V_q, χ_q)`` modulo the user's ability to
-    *override* the wing convention before W is rebuilt.  Pass the
-    centroid-derived χ_wing for the literal centroid result; pass
-    ``chi_wing_y = 0`` (and similarly chi_wingp_x = 0) to mirror BGW's
-    fixwings q=0 behavior — that's the planned use case.
-    """
-    V_body = extract_V_body_sharded(V_q, g0_x, g0_y, v_head_q, mesh_xy=mesh_xy)
-    W_body0 = solve_W_body0_sharded(V_body, chi_body_q, mesh_xy=mesh_xy, pref=pref)
-    chi_head_eff_q, A_wing_x, A_wingp_y = schur_reductions_sharded(
-        W_body0, chi_wing_x, chi_wing_y, chi_wingp_x, chi_wingp_y,
-        chi_head_q, mesh_xy=mesh_xy)
-    W_head_q = W_head_scalar_per_q(v_head_q, chi_head_eff_q)
-    return assemble_W_sharded(
-        W_body0, g0_x, g0_y, A_wing_x, A_wingp_y, W_head_q, mesh_xy=mesh_xy)

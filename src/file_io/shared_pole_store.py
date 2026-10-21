@@ -486,25 +486,6 @@ def _refuse_invalid(oks):
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
 
-def preview_model_write(meta, shape, *, basis=None):
-    """Whether :func:`write_shared_pole_model` would admit a factor batch of ``shape``.
-
-    ``shape`` is the (parent, mu_p, component, Kp) handoff. The price is the
-    writer's own admission (its conversion kernel's argument, output and
-    temporary bytes plus the pole scratch) against the map ledger's live
-    stages, without a ledger row. A caller choosing an optional wider carrier
-    asks here before allocating it and keeps its live width on False.
-    """
-    basis = meta.mu_basis if basis is None else basis
-    ledger = _capacity(meta)
-    shape = tuple(int(v) for v in shape)
-    arg, output, temporary = _conversion_bytes(basis, shape, P(None, "x", None, "y"), unpack=True)
-    row = ledger.preview(resident_bytes_per_rank=output,
-                         workspace_bytes_per_rank=temporary + arg + 3 * shape[0] * shape[-1] * 8,
-                         concurrent_with=ledger.live_stages)
-    return row["device_budget_status"] == "PASS"
-
-
 @timing.timed("shared_pole_store.write_model")
 def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
                             recipe, receipts, ordered=False, basis=None, sector=None,
@@ -1376,41 +1357,6 @@ def _live_face(b, counts, mask):
 def _live_poles(poles, counts):
     """Pole columns past each parent's count hold the sentinel 1."""
     return jnp.where(jnp.arange(poles.shape[-1])[None, :] < counts[:, None], poles, 1.0)
-
-
-def read_shared_pole_cross_faces(readers, q_span, *, meta, headers, bases,
-                                 column_span=None):
-    """Read both CT endpoint factors with one authenticated pole census.
-
-    ``readers``, ``headers`` and ``bases`` are charge/current pairs. The
-    returned (b_C_X,b_T_Y,poles2,K) has the ordinary public face layouts.
-    TC is obtained by exchanging endpoint roles, never stored separately.
-    The two files carry the same iteration, parent order and exact poles.
-    All factors remain XY sharded and only pole metadata is compared.
-    """
-    left, right = headers
-    if left.get("sector") != "CT_C" or right.get("sector") != "CT_T":
-        _refuse("CT requires CT_C and CT_T endpoint stores")
-    for key in ("identity", "K", "Kmax", "q_irr_full_idx", "ordered"):
-        if _json(left.get(key)) != _json(right.get(key)):
-            _refuse(f"CT endpoint stores disagree on {key}")
-    c = read_shared_pole_faces(readers[0], q_span, meta=meta, header=left,
-                               column_span=column_span, basis=bases[0])
-    ledger = _capacity(meta)
-    previous = ledger.live_stages
-    amount = (sum(_local_bytes(a.shape, a.dtype, readers[0].mesh, a.sharding.spec)
-                  for a in c[:2]) + sum(a.size*a.dtype.itemsize for a in c[2:]))
-    row = _admit(ledger, "cross_charge_faces", amount)
-    ledger.live_stages = (*previous, row["stage"])
-    try:
-        t = read_shared_pole_faces(readers[1], q_span, meta=meta, header=right,
-                                   column_span=column_span, basis=bases[1])
-    finally:
-        ledger.live_stages = previous
-    if not bool(jnp.all(jax.lax.bitcast_convert_type(c[2], jnp.uint64) ==
-                        jax.lax.bitcast_convert_type(t[2], jnp.uint64))):
-        _refuse("CT endpoint stores disagree on exact pole bits")
-    return c[0], t[1], c[2], c[3]
 
 
 # Scratch bank uses the same identity and metadata transactions.

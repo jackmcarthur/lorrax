@@ -502,7 +502,7 @@ def resolve_n_reorth(n_reorth: int | None, depth: int) -> int:
 # the loop body data-dependent inside a jit.
 #
 # The route reads no environment: ``solvers`` is L2 and must be a function of
-# its arguments (``tests/test_layering.py::test_no_l2_module_reads_the_
+# its arguments (``tools/lint/test_layering.py::test_no_l2_module_reads_the_
 # environment``).  ``LORRAX_LANCZOS_REORTH`` is retired and refuses by name in
 # ``bse.bse_lanczos``.
 

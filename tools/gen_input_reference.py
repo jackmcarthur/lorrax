@@ -18,7 +18,7 @@ one ``TABLES`` row plus its section on the page.  Both modes refuse, writing not
 when a key has no row, when a key has two rows, or when a row names a key
 the parser no longer accepts; a row whose default cell is ``retired`` is
 allowed only if ``gw_config.py`` still refuses that key by name.
-``tests/test_env_registry.py`` runs the check, so gate0 fails on drift.
+``tools/lint/test_env_registry.py`` runs the check, so gate0 fails on drift.
 
 A ``DOC_TABLES`` section's table is replaced by the rendering of the parser's
 docs dict (``tdagw.td_config.TD_KEY_DOCS``: key -> (default note, meaning,

@@ -21,7 +21,7 @@ policy live on the owner pages of the [documentation register](index.md#register
 ## Packages at a glance
 
 Each package has a level (L1 physics, L2 numerical routines, L3 substrate;
-`tests/test_layering.py`). Imports run downhill only, so an L3 package may be
+`tools/lint/test_layering.py`). Imports run downhill only, so an L3 package may be
 imported by anything, an L2 package by L1 and L2 code, and an L1 package only
 by L1 code. A service is reached through its top-level package and nowhere
 else.
@@ -44,7 +44,7 @@ else.
 | `ffi` | L3 | the bridge to native libraries: loading and attestation, capability gates, FFT and k-convolution router, GEMM, parallel HDF5, the contour accumulator; the C++ sources | library; `ffi/cpp/stage/seal_bundle.py` seals a native bundle | `gw`, `bse`, `common`, `file_io`, `psp`, `bandstructure` |
 
 `runtime.cli_seam` and `runtime.tiles` are not named in the layer map
-(`tests/test_layering.py`), so they take the L1 default; the rest of
+(`tools/lint/test_layering.py`), so they take the L1 default; the rest of
 `runtime` is L3.
 
 ## `src/gw`

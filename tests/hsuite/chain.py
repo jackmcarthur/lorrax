@@ -174,6 +174,21 @@ K_POINTS {{crystal_b}}
   0.400000  0.400000  0.000000  1  # M
 """
 
+# The same corners with two interior points per segment (the counts on X and
+# M are the steps of the segment that ends there).  The 5 x 5 x 1 coarse grid
+# has spacing 0.2, so the points at multiples of 2/15 are OFF the grid: the
+# htransform stage then evaluates the interpolant, not just f(eps) at a grid
+# point (star covariance, the WS images, the top-block solve, the back-map).
+# exciton_bands keeps the corner-only path above: its `--vq-mode ongrid`
+# needs every Q on the grid.
+_PATH_OFFGRID = """
+K_POINTS {{crystal_b}}
+3
+  0.000000  0.000000  0.000000  1  # G
+  0.400000  0.000000  0.000000  3  # X
+  0.400000  0.400000  0.000000  3  # M
+"""
+
 # Five k-points per side leave the Galerkin basis no room below the full
 # state count at the default QRCP tolerance (1e-3 saturates at 80 of 80).
 EXCITED_DECK = _DECK_COMMON + """restart = true
@@ -182,6 +197,8 @@ qp_solver = one_shot_dft
 linalg = local
 htransform_qr_eps = 1e-2
 """ + _PATH
+
+HTRANSFORM_DECK = EXCITED_DECK.replace(_PATH, _PATH_OFFGRID)
 
 _SIDE = "2" if rank_session._resolve_proc_count() == 4 else "1"
 
@@ -432,7 +449,7 @@ STAGES = (
       "--n-eig", "2", "--block-size", "1", *_P,
       "--report-file", "bse.out"]),
     ("htransform", "bandstructure.htransform",
-     ["-i", "excited.in", "--guard-bands", "1", "-o", "htransform.dat",
+     ["-i", "htransform.in", "--guard-bands", "1", "-o", "htransform.dat",
       "--report-file", "htransform.out"]),
     # One conduction band: the window's top band must lie below the fitted
     # window's top, or fH cannot see it (compute_wfns_fi refuses).
@@ -575,6 +592,7 @@ def write_decks(run):
     centroids = _centroid_file(run)
     (run / "gnppm.in").write_text(GNPPM_DECK.format(centroids=centroids))
     (run / "excited.in").write_text(EXCITED_DECK.format(centroids=centroids))
+    (run / "htransform.in").write_text(HTRANSFORM_DECK.format(centroids=centroids))
     for fname, deck in RESTART_DECKS.items():
         (run / fname).write_text(deck.format(centroids=centroids))
     return centroids

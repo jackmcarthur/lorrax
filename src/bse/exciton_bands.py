@@ -1383,23 +1383,6 @@ def build_parser():
     return ap
 
 
-def _gamma_only_grid(kgrid, value):
-    """A head-scalar grid that is ``value`` at Γ and zero everywhere else.
-
-    The array shape :func:`gw.head_densify.attach_head_channel` consumes; a
-    negative value detaches a rank-one Γ head.  No driver path uses it since the
-    loader stopped putting the screened Γ head on W (``bse_head``); kept for
-    ``tests/test_c1_head_phase_cpu.py``.  Spelled through the
-    same attach helper rather than as a bespoke ``.at[...,0,0,0].add()`` so the
-    detach and the re-attach cannot disagree about which slice, which
-    projector, or which 1/Ω the head lives on — a mismatched pair here would
-    leave a residual rank-one term with no shape error to catch it.
-    """
-    S = np.zeros(tuple(int(s) for s in kgrid), dtype=np.float64)
-    S[0, 0, 0] = float(value)
-    return S
-
-
 def _gamma_head_to_diagonal(S_fine, data, head_ch, *, rtol=1e-10):
     """Zero fine Γ in ``S_fine`` after checking it is the loader's diagonal.
 

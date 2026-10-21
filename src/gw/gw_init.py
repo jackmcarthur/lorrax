@@ -54,7 +54,7 @@ from .gw_config import (
 # ``zeta_loader`` service package under ``services/``.  This module reaches
 # it through the TOP-LEVEL package only: ``zeta_loader.format`` /
 # ``zeta_loader.loader`` are past-the-API edges and
-# ``tests/test_layering.py`` fails on them.
+# ``tools/lint/test_layering.py`` fails on them.
 #
 # ``ffi._services.ensure_on_path()`` is why the import below resolves in a
 # bare launch — nothing in the launch chain knows ``services/`` exists

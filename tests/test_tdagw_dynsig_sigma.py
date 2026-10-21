@@ -727,11 +727,5 @@ def main() -> int:
     return rc
 
 
-def test_tdagw_dynsig_sigma_needs_2x2_mesh():
-    import pytest
-    pytest.skip("script on a 2x2 mesh: JAX_PLATFORMS=cpu XLA_FLAGS="
-                "--xla_force_host_platform_device_count=4 python3 tests/test_tdagw_dynsig_sigma.py")
-
-
 if __name__ == "__main__":
     sys.exit(main())

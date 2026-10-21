@@ -1435,40 +1435,6 @@ def ordered_cross_pencil(charge, transverse, cross_actions, cross_moments, *, ma
                   join((ct, mt[0], mt[1]), axis=-1)))
 
 
-def cross_pencil_block(left, right, samples, *, matmul):
-    """Compute one rectangular Hermite block, report equation A.1.
-
-    Parameters
-    ----------
-    left, right : tuple
-        Node and direction panel, ``(s, Q[b,n,r])``. Nodes are z² for
-        the even pencil and z for the signed pencil, in Ry² and Ry.
-    samples : tuple
-        CT at conjugate(left node), CT at right node, and its derivative
-        at right node. Arrays are complex ``[b,n_C,n_T]``. The derivative
-        is with respect to the pencil coordinate. CT at the conjugate
-        node must come from TC's adjoint, never from CT's own adjoint.
-    matmul : callable
-        Constructor's local/service GEMM with transa/transb support.
-
-    Returns
-    -------
-    tuple
-        Cross G and H, complex ``[b,r_C,r_T]``. Units follow the input
-        state normalization. Parent sharding is inherited from the caller.
-    """
-    a, qc = left
-    b, qt = right
-    wa, wb, derivative = samples
-    project = lambda w: matmul(qc, matmul(w, qt), transa="C")
-    at_left = project(wa)
-    delta = b - jnp.conj(a)
-    confluent = delta == 0
-    g = jnp.where(confluent, -project(derivative),
-                  (at_left - project(wb)) / jnp.where(confluent, 1, delta))
-    return g, b * g - at_left
-
-
 def joint_sector_pencil(charge, transverse, cross, *, matmul, matrix_sharding=None):
     """Project CT on the two metric-corrected sector spans (plan 12.2).
 

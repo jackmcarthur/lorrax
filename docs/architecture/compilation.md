@@ -97,8 +97,8 @@ A jit built inside a function is a new object on every call, so it lowers on
 every call; `jnp.zeros(..., device=sharding)` lowers once per (shard shape,
 dtype) instead (claim 4153). A `with mesh:` block would put its mesh into the
 trace context and re-trace held programs, so the runtime sets
-`jax_disallow_mesh_context_manager` (`src/runtime/__init__.py:262`) and
-`tests/test_glue3_program_counts.py` fails on one in `src/` (claim 4194).
+`jax_disallow_mesh_context_manager` (`src/runtime/__init__.py:262`), so a
+`with mesh:` block raises (claim 4194).
 
 **Every process lowers.** In production each driver is its own process, and
 the in-process cache dies with it. A warm persistent cache saves the XLA

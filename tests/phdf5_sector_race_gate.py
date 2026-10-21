@@ -7,7 +7,7 @@ them at once on the device (reshape + concat, as the sector reader does) and on 
 values differ from numpy, and all-zero results (the bisp_sc CT symptom). Control: the same rectangles by
 synchronous read_slab. Prints SECTOR <case> wrong=<n>/<N> allzero=<n>/<N>.
 """
-import os, sys, time
+import os, sys
 import runtime
 runtime.bootstrap(platform="gpu")
 import jax, jax.numpy as jnp, numpy as np

@@ -9,7 +9,7 @@ stay in ``gw``; this package is what they compute WITH.
 
 THE PACKAGE IS THE PUBLIC API.  Everything a consumer needs is a top-level name
 here; importing ``vcoul.<submodule>`` from lorrax is a layering violation
-the monorepo's ``tests/test_layering.py`` fails on.
+the monorepo's ``tools/lint/test_layering.py`` fails on.
 
 Dependencies: numpy and jax, plus **optional** scipy (the scrambled-Sobol
 generator, quarantined in :mod:`vcoul.minibz` behind an announce-or-refuse

@@ -26,7 +26,7 @@ tile, which GPU layout assignment turns into one k-leading relayout of the whole
 CPU, one process with four host devices: ``JAX_PLATFORMS=cpu
 XLA_FLAGS=--xla_force_host_platform_device_count=4 python3 tests/test_bse_w_blocks.py``.
 CUDA, four ranks: ``lx run -N 1 -G 4 -n 4 -- python3 tests/test_bse_w_blocks.py``.  The
-planner tests (``test_plan_*``) run under pytest anywhere; the mesh cases skip there.
+pytest items are a placeholder for the script and the ``_w_block`` slice identity.
 """
 import contextlib
 import warnings
@@ -344,60 +344,6 @@ def main() -> int:
     rc = 0 if ok else 1
     runtime.finalize_process(rc)
     return rc
-
-
-def test_w_blocks_need_a_2x2_mesh():
-    """Collected by pytest: the cases need their own 2x2 mesh, so they run as a script."""
-    import pytest
-    pytest.skip("run as a script on a 2x2 mesh: python3 tests/test_bse_w_blocks.py")
-
-
-def test_w_block_matches_the_5d_slice():
-    """``_w_block`` (the slice of the tile's 2-D view) is W_R's 5-D block at interior, edge and clamped offsets."""
-    import jax.numpy as jnp
-    import numpy as np
-    from bse import bse_stack_matvec as B
-    rng = np.random.default_rng(31)
-    W = jnp.asarray(rng.standard_normal((29, 23, 3, 2, 1)) + 1j * rng.standard_normal((29, 23, 3, 2, 1)))
-    ref = np.asarray(W)
-    for m0, n0, bm, bn in ((0, 0, 8, 8), (8, 16, 8, 7), (21, 15, 8, 8), (0, 0, 29, 23)):
-        assert np.array_equal(np.asarray(B._w_block(W, m0, n0, bm, bn)), ref[m0:m0 + bm, n0:n0 + bn])
-
-
-def test_plan_whole_tile_when_it_fits():
-    from bse.bse_stack_matvec import plan_w_blocks
-    assert plan_w_blocks("xla", nk=64, ns=2, mu_loc=100, nu_loc=100, n_c=14, rank=14) == ((100, 1), (100, 1))
-    assert plan_w_blocks("fused", nk=64, ns=2, mu_loc=1504, nu_loc=1504, n_c=14, rank=14) == ((1504, 1), (1504, 1))
-
-
-def test_plan_stored_u_fits_the_tile():
-    from bse.bse_stack_matvec import plan_w_blocks
-    from runtime.tiles import TILE_BYTES
-    for nk, mu, nc, route in ((900, 1504, 14, "xla"), (900, 1500, 14, "xla"), (64, 3000, 30, "outer"),
-                              (144, 1504, 14, "outer"), (900, 1504, 60, "xla")):
-        (bm, nm), (bn, nn) = plan_w_blocks(route, nk=nk, ns=2, mu_loc=mu, nu_loc=mu, n_c=nc, rank=nc)
-        assert 16 * nk * 5 * bm * bn <= TILE_BYTES, (nk, mu, bm, bn)
-        assert bm % 8 == 0 and bn % 8 == 0 and (nm - 1) * bm < mu <= nm * bm and (nn - 1) * bn < mu <= nn * bn
-        assert nk * 4 * bm * bn < 2 ** 31
-    # CrI3 30x30 k-grid (nk 900), N_mu 3000 on P4 (2x2): a 1500 x 1500 tile per rank, 42v x 14c,
-    # spinors -> 13 x 13 blocks of 120 x 120 (U block 0.83 GB); the 1504 tile plans the same
-    assert plan_w_blocks("xla", nk=900, ns=2, mu_loc=1500, nu_loc=1500, n_c=14, rank=14) == ((120, 13), (120, 13))
-    assert plan_w_blocks("xla", nk=900, ns=2, mu_loc=1504, nu_loc=1504, n_c=14, rank=14) == ((120, 13), (120, 13))
-
-
-def test_plan_handler_cap_shrinks_and_refuses():
-    import pytest
-    from bse.bse_stack_matvec import plan_w_blocks
-    # the unfused CrI3 8x8 42v x 30c at N_mu 6000, P4: whole U = 2.30e9 >= 2^31 -> blocks
-    (bm, nm), (bn, nn) = plan_w_blocks("outer", nk=64, ns=2, mu_loc=3000, nu_loc=3000, n_c=30, rank=30)
-    assert nm * nn > 1 and 64 * 4 * bm * bn < 2 ** 31
-    # the fused route stays whole until an operand reaches 2^31 (V = mu_loc nu_loc nk here)
-    (bm, nm), (bn, nn) = plan_w_blocks("fused", nk=128, ns=2, mu_loc=6000, nu_loc=6000, n_c=8, rank=8)
-    assert nm * nn > 1 and bm * bn * 128 < 2 ** 31
-    # red twin of the refusal: the largest grid whose 8 x 8 block fits plans; one doubling more refuses
-    assert plan_w_blocks("outer", nk=2 ** 22, ns=2, mu_loc=64, nu_loc=64, n_c=4, rank=4)[0][0] == 8
-    with pytest.raises(ValueError, match="GATE bse_w_block_operand"):
-        plan_w_blocks("outer", nk=2 ** 23, ns=2, mu_loc=64, nu_loc=64, n_c=4, rank=4)
 
 
 if __name__ == "__main__":

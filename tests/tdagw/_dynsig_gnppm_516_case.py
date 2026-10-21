@@ -38,7 +38,6 @@ import dataclasses
 import json
 import os
 import re
-import shutil
 import time
 
 import runtime  # noqa: F401  (before numpy: the runtime tunes BLAS spin at import)

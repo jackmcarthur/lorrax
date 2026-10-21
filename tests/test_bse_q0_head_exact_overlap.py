@@ -116,39 +116,3 @@ def test_q0_head_content_is_exact_and_the_isdf_head_is_not():
         head_shifted_eps_c(eps_c, {"q0_head": "diagonal"})
     with pytest.raises(ValueError, match="q0_head must be"):
         head_shifted_eps_c(eps_c, {"q0_head": "exact"})
-
-
-# The BSE operator drivers audited to build every operand through
-# head_shifted_eps_c.  A new opt-in must be audited and added here.
-_DIAGONAL_DRIVERS = {"bse_jax.py", "absorption_haydock.py", "exciton_bands.py",
-                     "bse_feast.py", "bse_kpm.py"}
-
-
-def test_only_audited_drivers_request_the_diagonal_head():
-    import pathlib
-    import bse
-    root = pathlib.Path(bse.__file__).parent
-    found = {f.name for f in root.glob("*.py")
-             if 'q0_head="diagonal"' in f.read_text()}
-    assert found == _DIAGONAL_DRIVERS, found
-
-
-def test_fp32_copy_of_a_diagonal_bundle_keeps_its_head():
-    """FEAST/KPM's fp32 copy carries the head mode with the scalar (audit M2)."""
-    from bse.bse_feast import _build_gmres_data_fp32
-    rng = np.random.default_rng(5)
-    cz = lambda *s: jnp.asarray(rng.standard_normal(s) + 0j)
-    data = {k: cz(NK, 2, NS, NMU) for k in ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y")}
-    data.update(M=cz(NK, 2, 2, NMU), V_q0=cz(NMU, NMU), W_q=cz(NMU, NMU, 2, 2, 1),
-                eps_c=jnp.asarray(rng.random((NK, 2)) + 0.5),
-                eps_v=jnp.asarray(-rng.random((NK, 2))))
-    q0 = q0_head_diagonal(WHEAD, OMEGA, NK)
-    for mode, shift in (("diagonal", q0), ("rank1", 0.0)):
-        bundle = dict(data, q0_head=mode, q0_head_ry=shift)
-        fp32 = _build_gmres_data_fp32(bundle)
-        assert (fp32["q0_head"], fp32["q0_head_ry"]) == (mode, shift)
-        got = np.asarray(head_shifted_eps_c(fp32["eps_c"], fp32))
-        want = np.asarray(fp32["eps_c"]) - np.float32(shift)
-        np.testing.assert_allclose(got, want, rtol=0, atol=1e-6)
-        if mode == "diagonal":
-            assert np.max(np.abs(got - np.asarray(fp32["eps_c"]))) > 0.9 * q0

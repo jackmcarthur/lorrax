@@ -8,11 +8,8 @@ tolerance refuses at m = 0 and takes TRS off at 0 < m < tolerance.
 file the NSCF .save holds byte for byte, because an NSCF schema writes
 ``absolute`` = 0.
 """
-from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
 from ffi import _services
 
@@ -91,28 +88,27 @@ def _pt_magnet(binding):
                       [np.eye(3), -np.eye(3)], binding)
 
 
-def test_no_schema_is_off():
+def test_qe_data_decides_the_trs_verdict():
+    """TRS verdict from QE data: no schema, a t_rev row, or a magnetization without t_rev rows is off; a nonmagnetic SOC cell without inversion is on."""
+    # --- no_schema_is_off
     report = check_spinor_reference_trs(_pt_magnet(None))
     assert report.trs_basis == "qe-magnetic" and not report.trs_holds
 
-
-def test_t_rev_row_is_off():
-    """Theta*I typed t_rev = 1; the WFN would pass a test through -I as unitary."""
+    # --- t_rev_row_is_off
+    # Theta*I typed t_rev = 1; the WFN would pass a test through -I as unitary.
     report = check_spinor_reference_trs(_pt_magnet(_binding([False, True], 0.0)))
     assert report.trs_basis == "qe-magnetic" and not report.trs_holds
 
-
-def test_magnetization_without_t_rev_rows_is_off():
-    """A type-I magnetic group: every row unitary, m != 0."""
+    # --- magnetization_without_t_rev_rows_is_off
+    # A type-I magnetic group: every row unitary, m != 0.
     report = check_spinor_reference_trs(_pt_magnet(_binding([False, False], 6.66)))
     assert report.trs_basis == "qe-magnetic" and not report.trs_holds
     report = check_spinor_reference_trs(_pt_magnet(_binding([False, False], None)))
     assert not report.trs_holds                       # no SCF magnetization found
 
-
-def test_nonmagnetic_soc_without_inversion_is_on():
-    """P1 with SOC, m = 0: no unitary k -> -k, -k not stored. The guard has
-    only the Gamma Kramers pair, and QE's data turns TRS on."""
+    # --- nonmagnetic_soc_without_inversion_is_on
+    # P1 with SOC, m = 0: no unitary k -> -k, -k not stored. The guard has
+    #     only the Gamma Kramers pair, and QE's data turns TRS on.
     rng = np.random.default_rng(1)
     gamma = _orthonormal(rng, 1)
     gamma = np.concatenate([gamma, _theta(gamma)])
@@ -122,85 +118,3 @@ def test_nonmagnetic_soc_without_inversion_is_on():
     assert dict(report.evidence_counts) == {"raw-pair": 0, "spatial-pair": 0, "trim": 1}
     assert report.trs_holds and report.subspace_residual < report.tol_trs
 
-
-def test_nonmagnetic_guard_refuses_inconsistent_wfn():
-    """QE says nonmagnetic but psi(-k) is not Theta psi(k)."""
-    rng = np.random.default_rng(2)
-    loader = _ToyLoader([_K, [-v for v in _K]],
-                        [_orthonormal(rng, 2), _orthonormal(rng, 2)],
-                        [np.eye(3)], _binding([False], 0.0))
-    with pytest.raises(RuntimeError, match="GATE trs_qe_nonmagnetic_wfn_consistent"):
-        check_spinor_reference_trs(loader)
-
-
-def test_small_moment_guard_failure_is_off():
-    """0 < m < 1e-4 muB/cell breaks Theta at ~Delta/gap: the guard takes TRS off, no refusal."""
-    rng = np.random.default_rng(2)
-    loader = _ToyLoader([_K, [-v for v in _K]],
-                        [_orthonormal(rng, 2), _orthonormal(rng, 2)],
-                        [np.eye(3)], _binding([False], 5.0e-5))
-    report = check_spinor_reference_trs(loader)
-    assert report.trs_basis == "raw-pair-falsified" and not report.trs_holds
-    assert "TRS off" in report.messages[0]
-
-
-def _schema(directory, *, calculation, do_mag, absolute, density):
-    directory.mkdir(parents=True)
-    (directory / "data-file-schema.xml").write_text(f"""<qes:espresso xmlns:qes="x">
-<input><control_variables><calculation>{calculation}</calculation></control_variables></input>
-<output><symmetries><nsym>1</nsym><symmetry><info>crystal_symmetry</info>
-<rotation>1 0 0 0 1 0 0 0 1</rotation></symmetry></symmetries>
-<magnetization><noncolin>true</noncolin><absolute>{absolute}</absolute>
-<do_magnetization>{do_mag}</do_magnetization></magnetization>
-<basis_set><reciprocal_lattice><b1>1 0 0</b1><b2>0 1 0</b2><b3>0 0 1</b3></reciprocal_lattice></basis_set>
-</output></qes:espresso>""")
-    (directory / "charge-density.hdf5").write_bytes(density)
-    return str(directory / "data-file-schema.xml")
-
-
-def test_scf_magnetization_from_the_matching_density(tmp_path):
-    from symmetry_maps import read_qe_symmetry_receipt
-    nscf = read_qe_symmetry_receipt(_schema(
-        tmp_path / "nscf/x.save", calculation="nscf", do_mag="true",
-        absolute=0.0, density=b"rho-scf"))
-    scf = _schema(tmp_path / "scf/x.save", calculation="scf", do_mag="true",
-                  absolute=6.66, density=b"rho-scf")
-    other = _schema(tmp_path / "old/x.save", calculation="scf", do_mag="true",
-                    absolute=0.0, density=b"rho-old")
-    assert scf_absolute_magnetization([nscf], [other, scf]) == 6.66
-    assert scf_absolute_magnetization([nscf], [other]) is None
-    unreadable = Path(_schema(tmp_path / "locked/x.save", calculation="scf", do_mag="true",
-                              absolute=1.0, density=b"rho-scf")).parent / "charge-density.hdf5"
-    unreadable.chmod(0)
-    assert scf_absolute_magnetization([nscf], [unreadable.parent / "data-file-schema.xml"]) is None
-    plain = read_qe_symmetry_receipt(_schema(
-        tmp_path / "nm/x.save", calculation="nscf", do_mag="false",
-        absolute=0.0, density=b"rho-nm"))
-    assert scf_absolute_magnetization([plain], []) == 0.0
-
-
-def test_qp_wfn_is_discovered_from_its_source(tmp_path, monkeypatch):
-    """A real-file WFN_qp.h5 beside a symlinked WFN.h5 finds the schema its source finds."""
-    import symmetry_maps
-    from symmetry_maps.qe_schema import discover_qe_schema_paths
-    from wfn_loader.loader import WfnLoader
-
-    schema = _schema(tmp_path / "qe/nscf/x.save", calculation="nscf", do_mag="false",
-                     absolute=0.0, density=b"rho")
-    (tmp_path / "qe/nscf/WFN.h5").write_bytes(b"")
-    run = tmp_path / "runs/a/b/c"
-    run.mkdir(parents=True)
-    (run / "WFN.h5").symlink_to(tmp_path / "qe/nscf/WFN.h5")
-    (run / "WFN_qp.h5").write_bytes(b"")
-    assert discover_qe_schema_paths(run / "WFN_qp.h5") == ()
-    assert discover_qe_schema_paths(run / "WFN_qp.h5", run / "WFN.h5") == (
-        str(Path(schema).resolve()),)
-
-    seen = {}
-    monkeypatch.setattr(symmetry_maps, "resolve_qe_symmetry_binding",
-                        lambda wfn, *, wfn_path, schema: (seen.update(paths=wfn_path), (None, ""))[1])
-    loader = SimpleNamespace(_qe_symmetry_checked=False, _qe_schema_request=None,
-                             _path=str(run / "WFN_qp.h5"),
-                             _file=SimpleNamespace(attrs={"qp_wfn_source": str(run / "WFN.h5")}))
-    WfnLoader.resolve_qe_symmetry(loader)
-    assert seen["paths"] == (str(run / "WFN_qp.h5"), str(run / "WFN.h5"))

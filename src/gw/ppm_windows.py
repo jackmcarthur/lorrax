@@ -141,53 +141,6 @@ class _SigmaBranch(NamedTuple):
     band_weight: jax.Array | None = None
 
 
-def _omega_clusters(
-    omega_abs,
-    gap_ry: float,
-    *,
-    max_span_ry: float | None = None,
-):
-    """Split ``|omega|`` at real gaps, optionally capping cluster span."""
-    gap = float(gap_ry)
-    if not np.isfinite(gap) or gap <= 0.0:
-        raise ValueError("omega cluster gap must be finite and positive")
-    span = None if max_span_ry is None else float(max_span_ry)
-    if span is not None and (not np.isfinite(span) or span <= 0.0):
-        raise ValueError("omega cluster maximum span must be finite and positive")
-
-    omega = np.asarray(omega_abs, dtype=np.float64)
-    if omega.ndim != 1:
-        raise ValueError("omega_abs must be one-dimensional")
-    if not np.all(np.isfinite(omega)):
-        raise ValueError("omega_abs contains a non-finite value")
-    if not omega.size:
-        return []
-
-    order = np.argsort(omega, kind="stable")
-    breaks = np.nonzero(np.diff(omega[order]) > gap)[0]
-    gap_pieces = np.split(order, breaks + 1)
-    pieces = []
-    for piece in gap_pieces:
-        if span is None:
-            pieces.append(piece)
-            continue
-        start = 0
-        while start < piece.size:
-            omega_start = float(omega[piece[start]])
-            stop = start + 1
-            while (stop < piece.size
-                   and float(omega[piece[stop]]) - omega_start <= span):
-                stop += 1
-            pieces.append(piece[start:stop])
-            start = stop
-    return [
-        (np.sort(piece),
-         float(np.min(omega[piece])),
-         float(np.max(omega[piece])))
-        for piece in pieces
-    ]
-
-
 def _iter_branches(
     *,
     omega_pos: np.ndarray,

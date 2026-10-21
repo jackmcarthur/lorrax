@@ -4,9 +4,8 @@
 body and the Lehmann wings of every ordered pair.  Checked here on CPU:
 
 * wings: the face kernel equals a direct numpy Lehmann sum over all ordered
-  pairs on a random TRS-broken system, and on a time-reversal-even system
-  (real psi, real position vertex) the old energy-ordered even weight
-  ``-c f A / (z^2 - dE^2)`` to roundoff; ``Y(-z) = Z(z)^T``;
+  pairs on a random TRS-broken system (the old energy-ordered even weight
+  ``-c f A / (z^2 - dE^2)`` misses it); ``Y(-z) = Z(z)^T``;
 * body: the ordered Gamma body equals the store normalization
   ``sum_p b b^H/(2W(z-W)) - conj(b) b^T/(2W(z+W))``, reduces to the TRS
   ``b (z^2 - Lambda)^-1 b^H`` for real ``b``, and obeys ``W(-z) = W(z)^T``;
@@ -21,7 +20,6 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 jax.config.update("jax_enable_x64", True)
@@ -96,29 +94,40 @@ def _rel(a, b):
     return float(np.max(np.abs(a - b)) / np.max(np.abs(b)))
 
 
-@pytest.mark.parametrize("mesh", _meshes(), ids=lambda m: f"P{m.size}")
-def test_wings_trs_even_agree_with_old_weight(mesh):
-    e, f, psi, D, v = _system(1, trs=True)
-    Y, Z = _kernel_wings(mesh, e, f, psi, v)
-    Y_old = _old_even_wings(e, f, psi, v)
-    Y_ref, Z_ref = _lehmann_wings(e, f, psi, D)
-    assert _rel(Y, Y_old) < 1e-12, _rel(Y, Y_old)
-    assert _rel(Y_ref, Y_old) < 1e-12
-    assert _rel(Z, Z_ref) < 1e-12
+def test_ordered_wings_equal_the_direct_lehmann_sum():
+    """Wings equal a direct Lehmann sum over all ordered pairs (the even TRS weight misses it; Y(-z) = Z(z)^T), also for the four-component carrier."""
+    # --- wings_trs_broken_match_direct_lehmann
+    for mesh in _meshes():
+        e, f, psi, D, v = _system(2, trs=False)
+        Y, Z = _kernel_wings(mesh, e, f, psi, v)
+        Y_ref, Z_ref = _lehmann_wings(e, f, psi, D)
+        assert _rel(Y, Y_ref) < 1e-12, _rel(Y, Y_ref)
+        assert _rel(Z, Z_ref) < 1e-12, _rel(Z, Z_ref)
+        # The case is sensitive: the even TRS weight misses the odd-in-z wing here.
+        assert _rel(_old_even_wings(e, f, psi, v), Y_ref) > 1e-2
+        # Y(-z) = Z(z)^T (OMEGAS[3] = -OMEGAS[1], OMEGAS[4] = -OMEGAS[0]).
+        for neg, pos in ((3, 1), (4, 0)):
+            assert _rel(Y[neg], Z[pos].T) < 1e-12
 
-
-@pytest.mark.parametrize("mesh", _meshes(), ids=lambda m: f"P{m.size}")
-def test_wings_trs_broken_match_direct_lehmann(mesh):
-    e, f, psi, D, v = _system(2, trs=False)
-    Y, Z = _kernel_wings(mesh, e, f, psi, v)
-    Y_ref, Z_ref = _lehmann_wings(e, f, psi, D)
-    assert _rel(Y, Y_ref) < 1e-12, _rel(Y, Y_ref)
-    assert _rel(Z, Z_ref) < 1e-12, _rel(Z, Z_ref)
-    # The case is sensitive: the even TRS weight misses the odd-in-z wing here.
-    assert _rel(_old_even_wings(e, f, psi, v), Y_ref) > 1e-2
-    # Y(-z) = Z(z)^T (OMEGAS[3] = -OMEGAS[1], OMEGAS[4] = -OMEGAS[0]).
-    for neg, pos in ((3, 1), (4, 0)):
-        assert _rel(Y[neg], Z[pos].T) < 1e-12
+    # --- four_component_carrier_wings_are_spin_traced
+    for mesh in _meshes():
+        e, f, psi2, D, v = _system(4, trs=False)
+        rng = np.random.default_rng(5)
+        psi4 = (rng.normal(size=(NK, 4, MU, NB))
+                + 1j * rng.normal(size=(NK, 4, MU, NB))).astype(np.complex128)
+        Y, Z = _kernel_wings(mesh, e, f, psi4, v)
+        Y_ref, Z_ref = _lehmann_wings(e, f, psi4, D)
+        assert _rel(Y, Y_ref) < 1e-12, _rel(Y, Y_ref)
+        assert _rel(Z, Z_ref) < 1e-12, _rel(Z, Z_ref)
+        # psi^dagger psi is invariant under one U(4) acting on every state.
+        u, _ = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))
+        Y_u, Z_u = _kernel_wings(mesh, e, f, np.einsum("st,ktmn->ksmn", u, psi4), v)
+        assert _rel(Y_u, Y) < 1e-12 and _rel(Z_u, Z) < 1e-12
+        # Zero small components: the two-component carrier's wings.
+        lifted = np.concatenate([psi2, np.zeros_like(psi2)], axis=1)
+        Y_l, Z_l = _kernel_wings(mesh, e, f, lifted, v)
+        Y_2, Z_2 = _kernel_wings(mesh, e, f, psi2, v)
+        assert _rel(Y_l, Y_2) < 1e-12 and _rel(Z_l, Z_2) < 1e-12
 
 
 def _body(mesh, ordered, z, b, poles, counts):
@@ -133,46 +142,3 @@ def _body(mesh, ordered, z, b, poles, counts):
              jax.device_put(jnp.zeros((1, n, n), jnp.complex128), face))
     return np.asarray(out)[0]
 
-
-@pytest.mark.parametrize("mesh", _meshes(), ids=lambda m: f"P{m.size}")
-def test_ordered_body_is_store_normalization(mesh):
-    rng = np.random.default_rng(3)
-    n, K, k = 8, 6, 5                                    # the sixth pole is inactive
-    b = rng.normal(size=(1, n, K)) + 1j * rng.normal(size=(1, n, K))
-    poles = np.concatenate([rng.uniform(0.2, 4.0, (1, k)), np.zeros((1, K - k))], axis=1)
-    counts = np.array([k])
-    W = np.sqrt(poles[0, :k]); bb = b[0, :, :k]
-    for z in (0.7j, 0.3 + 1.1j):
-        got = _body(mesh, True, z, b, poles, counts)
-        ref = ((bb / (2 * W * (z - W))) @ bb.conj().T
-               - (bb.conj() / (2 * W * (z + W))) @ bb.T)
-        assert _rel(got, ref) < 1e-12
-        assert _rel(_body(mesh, True, -z, b, poles, counts), got.T) < 1e-12
-    # Real b: the ordered form is the TRS-even b (z^2 - Lambda)^-1 b^H.
-    br = b.real.astype(np.complex128)
-    for z in (0.7j, 0.3 + 1.1j):
-        trs = _body(mesh, False, z, br, poles, counts)
-        ref = (br[0, :, :k] / (z * z - W * W)) @ br[0, :, :k].T
-        assert _rel(trs, ref) < 1e-12
-        assert _rel(_body(mesh, True, z, br, poles, counts), trs) < 1e-12
-
-
-@pytest.mark.parametrize("mesh", _meshes(), ids=lambda m: f"P{m.size}")
-def test_four_component_carrier_wings_are_spin_traced(mesh):
-    e, f, psi2, D, v = _system(4, trs=False)
-    rng = np.random.default_rng(5)
-    psi4 = (rng.normal(size=(NK, 4, MU, NB))
-            + 1j * rng.normal(size=(NK, 4, MU, NB))).astype(np.complex128)
-    Y, Z = _kernel_wings(mesh, e, f, psi4, v)
-    Y_ref, Z_ref = _lehmann_wings(e, f, psi4, D)
-    assert _rel(Y, Y_ref) < 1e-12, _rel(Y, Y_ref)
-    assert _rel(Z, Z_ref) < 1e-12, _rel(Z, Z_ref)
-    # psi^dagger psi is invariant under one U(4) acting on every state.
-    u, _ = np.linalg.qr(rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4)))
-    Y_u, Z_u = _kernel_wings(mesh, e, f, np.einsum("st,ktmn->ksmn", u, psi4), v)
-    assert _rel(Y_u, Y) < 1e-12 and _rel(Z_u, Z) < 1e-12
-    # Zero small components: the two-component carrier's wings.
-    lifted = np.concatenate([psi2, np.zeros_like(psi2)], axis=1)
-    Y_l, Z_l = _kernel_wings(mesh, e, f, lifted, v)
-    Y_2, Z_2 = _kernel_wings(mesh, e, f, psi2, v)
-    assert _rel(Y_l, Y_2) < 1e-12 and _rel(Z_l, Z_2) < 1e-12

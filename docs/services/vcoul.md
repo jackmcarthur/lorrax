@@ -6,7 +6,7 @@ Wigner–Seitz cubature, the 3D body head) and the BerkeleyGW `vcoul` table
 reader. It is standalone: numpy and jax, optionally scipy, nothing from
 LORRAX. Deck keys, loaders and `Meta` stay on the LORRAX side; the service
 speaks `CoulombGeometry`, an explicit `kgrid` and an explicit `sys_dim`.
-Import top-level names only (`tests/test_layering.py` fails a submodule
+Import top-level names only (`tools/lint/test_layering.py` fails a submodule
 import from outside).
 
 Physics owner for the head and cell averages:

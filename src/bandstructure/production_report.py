@@ -267,11 +267,6 @@ class HTransformProductionReport(ProductionReport):
         super().timings(stages, wall=wall)
 
 
-def resolve_text(value) -> str:
-    """Enum-or-string display without importing a driver resolver."""
-    return str(getattr(value, "value", value))
-
-
 __all__ = [
     "HTransformProductionReport",
     "band_table_lines",

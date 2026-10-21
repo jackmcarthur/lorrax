@@ -1155,33 +1155,3 @@ def fit_mpa_poles_batched(
 
     return jax.vmap(_one_ordered)(tile, negative)
 
-
-def synthesize_w_samples(Omega, B, z_samples, B_odd=None):
-    """Host-side ``W_c(z_j)`` from a known pole set.  Test/validation aid.
-
-    Uses the same model as ``eval_mpa_model`` but in numpy, so a test can
-    build its reference without going through the code under test.
-    """
-
-    om = np.asarray(Omega, dtype=np.complex128)
-    b = np.asarray(B, dtype=np.complex128)
-    z = np.asarray(z_samples, dtype=np.complex128)
-    if om.shape != b.shape:
-        raise ValueError(
-            f"GATE pole_residue_shapes: Omega has shape {om.shape} and B "
-            f"has shape {b.shape}. FALSE case: Omega.shape == B.shape.")
-    denom = z[:, None] ** 2 - om[None, :] ** 2
-    if np.any(np.abs(denom) == 0.0):
-        raise ValueError(
-            "GATE synthesis_off_pole: a sample point sits exactly on a "
-            "synthesized pole, so W_c is infinite there. FALSE case: no "
-            "z_j**2 equals any Omega_p**2 -- give the poles a nonzero "
-            "width, which the physical model has anyway.")
-    numerator = 2.0 * om[None, :] * b[None, :]
-    if B_odd is not None:
-        d = np.asarray(B_odd, dtype=np.complex128)
-        if d.shape != om.shape:
-            raise ValueError(
-                "GATE odd_residue_shapes: B_odd must match Omega and B")
-        numerator = numerator + 2.0 * z[:, None] * d[None, :]
-    return np.sum(numerator / denom, axis=1)

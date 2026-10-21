@@ -681,7 +681,7 @@ POLICY_MODES = ("refuse", "warn", "off")
 DEFAULT_POLICY_MODE: str = "refuse"
 
 #: NAME of the environment dial the DRIVERS read.  This module never reads it
-#: — ``tests/test_layering.py``: an L2 module is a function of its arguments.
+#: — ``tools/lint/test_layering.py``: an L2 module is a function of its arguments.
 #: The name lives here once; each call site does its own ``os.environ`` lookup
 #: and hands the answer to :func:`resolve_policy_mode`.
 POLICY_MODE_ENV = "LORRAX_RANK_POLICY"

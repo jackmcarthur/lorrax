@@ -1494,13 +1494,6 @@ def generate_kpath_from_qe_segments(params: dict, wfn) -> tuple[jnp.ndarray, np.
     return jnp.asarray(kpoints, dtype=jnp.float64), np.asarray(node_indices, dtype=int), labels
 
 
-def _shift_indices(n: int) -> jnp.ndarray:
-    arr = jnp.arange(n, dtype=jnp.float64)
-    return jnp.where(arr >= (n + 1) // 2, arr - n, arr)
-
-
-
-
 def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None = None,
                     mesh_xy: Mesh | None = None,
                     n_guard_bands: int = 0, centroid_subset_idx=None,

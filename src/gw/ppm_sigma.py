@@ -1128,28 +1128,6 @@ def screening_update(W0_at_supports, dchi_at_supports, plan: dict, *, print_fn=N
 # Sigma band-window mesh padding
 # ---------------------------------------------------------------------------
 
-def pad_sigma_window(psi_proj_xr, psi_proj_yn, mesh_xy):
-    """Zero-pad both projected-band operands to one square Sigma carrier.
-
-    The returned third value is the :class:`runtime.padding.PaddedAxis`
-    receipt.  Production calls the same owner directly in ``gw.mpa.sigma``;
-    this small adapter remains the projection primitive's focused test seam.
-    """
-    from runtime.padding import pad_to_axis, padded_axis
-
-    tag = padded_axis(
-        int(psi_proj_xr.shape[1]), mesh_xy, name="Sigma band window",
-        specs=(
-            (P(None, "x"), 1),
-            (P(None, None, None, "y"), 3),
-        ))
-    return (
-        pad_to_axis(psi_proj_xr, tag, axis=1),
-        pad_to_axis(psi_proj_yn, tag, axis=3),
-        tag,
-    )
-
-
 def sigma_band_axis(nb_proj: int, mesh_xy, *, ansatz: str):
     """Return the square mesh carrier receipt for a Sigma band window.
 

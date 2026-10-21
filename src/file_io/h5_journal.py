@@ -120,7 +120,7 @@ MODE_ENV = "LORRAX_H5_JOURNAL"
 #: Where the per-rank files land.  Default: the working directory.
 DIR_ENV = "LORRAX_H5_JOURNAL_DIR"
 # THE READS BELOW SPELL THESE NAMES AS LITERALS, and that duplication is
-# deliberate.  ``tools/env_audit.py`` and ``tests/test_env_registry.py``
+# deliberate.  ``tools/env_audit.py`` and ``tools/lint/test_env_registry.py``
 # both resolve only literal arguments, so a read through a module
 # constant is INVISIBLE to the gate that requires a docs/reference/env_vars.md
 # row — which is exactly how the sibling ``LORRAX_HDF5_ONE_OWNER`` came

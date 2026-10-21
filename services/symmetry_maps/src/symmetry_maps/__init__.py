@@ -17,7 +17,7 @@ whether the flags in the file may be believed at all.
 THE PACKAGE IS THE PUBLIC API.  There is no separate facade module: everything a
 consumer needs is a top-level name here, and importing
 ``symmetry_maps.<submodule>`` from outside is a layering violation the
-monorepo's ``tests/test_layering.py`` fails on.  The private names
+monorepo's ``tools/lint/test_layering.py`` fails on.  The private names
 (``_I_SIGMA_Y``, the ``_star_*`` helpers) are deliberately NOT re-exported:
 they are the service's own tests' business.
 
@@ -394,7 +394,7 @@ __all__ = [
     # second answer to "do these tables describe this tensor".  Same
     # reason ``vcoul`` puts ``_minibz_kernel_bare`` on its public API: a
     # consumer reaching the submodule for one of these is a
-    # past-the-API edge and ``tests/test_layering.py`` rule 6 counts it.
+    # past-the-API edge and ``tools/lint/test_layering.py`` rule 6 counts it.
     "QIRR_VERSION_ATTR", "QIRR_TABLE_SUFFIX", "QirrDest", "qirr_attr_str",
     "qirr_generator_commit", "validate_qirr_tables",
     # the 2c TRS reference check

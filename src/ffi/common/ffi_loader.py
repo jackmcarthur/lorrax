@@ -930,18 +930,6 @@ def loaded_platforms_in_order() -> list:
     return list(_LIBS)
 
 
-def _assert_one_mapped_mpi_runtime() -> None:
-    """Refuse a process in which more than one MPI runtime is already mapped.
-
-    The link-time ``gate_one_mpi.sh`` proves one artifact's dependency
-    closure.  It cannot see a foreign MPI loaded earlier by an inherited
-    Python overlay or preload.  Check the live address space immediately
-    after the FFI ``dlopen`` and before any native collective starts.
-    Filename aliases onto one real object are deduplicated by ``realpath``.
-    """
-    _native.assert_one_mapped_mpi_runtime(unusable_cls=FfiLibraryUnusable)
-
-
 def get_lib(platform: Optional[str] = None) -> ctypes.CDLL:
     """Return the loaded FFI library for ``platform``; idempotent.
 

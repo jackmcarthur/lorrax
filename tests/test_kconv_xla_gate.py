@@ -593,11 +593,5 @@ def _main_kdft(mesh, runtime) -> int:
     return rc
 
 
-def test_kconv_xla_gate_needs_p4_cuda():
-    """Collected by pytest: the gate needs its own 2x2 mesh, so it runs as a script."""
-    import pytest
-    pytest.skip("run as a script on a 2x2 mesh: python3 tests/test_kconv_xla_gate.py")
-
-
 if __name__ == "__main__":
     sys.exit(main())

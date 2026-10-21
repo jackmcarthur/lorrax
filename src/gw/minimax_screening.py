@@ -1220,47 +1220,6 @@ def solve_laplace_minimax_imag_interval(
     )
 
 
-def solve_phase_minimax_bandwidth(
-    A_dim: float,
-    *,
-    target_error: float = 1.0e-6,
-    max_nodes: int = 500,
-    eps_q: float = 1.0e-3,
-    target_kind: str = "hgl",
-) -> CrossingMinimaxQuadrature:
-    """Fit crossing regularization target on ``[0, A_dim]`` as ``sum alpha_l sin(tau_l u)``.
-
-    Error convention:
-      ``target_error`` is the L-infinity absolute error on the target function itself,
-      e.g. ``max_{u in [0, A_dim]} |G(u) - approx(u)|`` for the chosen regularization
-      target. This is the same absolute convention used by the current solver and the
-      shipped tables below.
-    """
-
-    A_dim = max(float(A_dim), 1.0e-12)
-    target_error = max(float(target_error), 1.0e-14)
-    eps_q = max(float(eps_q), 1.0e-12)
-    max_nodes = max(8, int(max_nodes))
-    kind = str(target_kind).strip().lower()
-
-    served = _mm.serve(
-        family="crossing", target=kind,
-        range_value=A_dim, error_bound=target_error, n_max=max_nodes,
-        eps_q=eps_q,
-    )
-    tau_hat, w_hat, err = served.nodes, served.weights, served.max_error
-    return CrossingMinimaxQuadrature(
-        A_dim=A_dim,
-        tau=np.asarray(tau_hat, dtype=np.float64),
-        alpha=np.asarray(w_hat, dtype=np.float64),
-        max_error=float(err),
-        target_kind=kind,
-        provenance=served.provenance.one_line(),
-    )
-
-
-
-
 # ---------------------------------------------------------------------------
 #  Quadrature builders — the χ₀/Σ frequency axes, solved on G's spectrum
 #  (moved from gw/w_isdf.py 2026-07-09: B1 frequency code belongs with the

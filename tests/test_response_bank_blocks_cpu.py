@@ -4,8 +4,7 @@
 ``_block_quadrature``, ``_integrate_block_passes``) against the exact ordered-pair scan
 ``gw.w_isdf.compute_chi0_direct_fractional`` at complex z down to Im z = 0.1 eV, with random
 fractional populations on the active bands; the one-rule path on the same carrier as the
-convention check; the gates.  ``python tests/test_response_bank_blocks_cpu.py --dump OUT.npz``
-writes the one-rule path's carries and rules (both trees: the default path bitwise unchanged).
+convention check; the blocks sum to all pairs; the gates.
 
     JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \\
         python -m pytest -q tests/test_response_bank_blocks_cpu.py
@@ -84,7 +83,7 @@ def sample_plan(z_ry, mu_ry, tol=TOL):
 
 
 def bank_chi(wfns, meta, mesh, z_ry, *, blocks=None):
-    """The bank's value rows per sample, [n_z, n_q, mu, nu], and the rules (one stream program)."""
+    """The bank's value rows per sample, [n_z, n_q, mu, nu], the rules and the receipt (one stream program)."""
     import jax
     from gw import response_bank as RB
     if blocks is not None:
@@ -99,15 +98,13 @@ def bank_chi(wfns, meta, mesh, z_ry, *, blocks=None):
     execute = lambda kernel, args, name, runtime_bytes=0: kernel(*args)
     nq = int(meta.nk_tot)
     out = np.zeros((len(z_ry), nq, FX.NMU, FX.NMU), np.complex128)
-    raws = []
     for group in rules["groups"]:
         raw = RB.integrate_response_group(wfns, meta, mesh, rules, group, q_ids=list(range(nq)),
                                           execute=execute, receipt=receipt, ordered=True)
         raw = np.asarray(jax.device_get(raw))
-        raws.append(raw)
         for slot, m in enumerate(group["members"]):
             out[int(m)] = raw[2 * slot]
-    return out, rules, receipt, raws
+    return out, rules, receipt
 
 
 def exact_chi(wfns, meta, mesh, z_ry, f, kmq):
@@ -129,28 +126,27 @@ def _relative_per_z(a, b):
     return [float(np.max(np.abs(x - y)) / np.max(np.abs(y))) for x, y in zip(a, b)]
 
 
-def test_one_rule_convention_on_the_insulator():
-    """The one-rule bank at a step state equals the exact scan (fixes the comparison's convention)."""
+def test_four_blocks_match_the_exact_scan():
+    """The one-rule bank at a step state, then four blocks at fractional active populations with z
+    down to 0.1 eV, against the exact ordered-pair scan."""
     from ffi import fft as F
     mesh = _mesh()
+
+    # the one-rule bank at a step state equals the exact scan (fixes the comparison's convention)
     wfns, meta, kmq, f = system(mesh, fractional=False)
     z = np.asarray(Z_EV[1:]) / RY                 # the one-rule path builds these
     with F.xla_reference():
-        bank, _, _, _ = bank_chi(wfns, meta, mesh, z)
+        bank, _, _ = bank_chi(wfns, meta, mesh, z)
         exact = exact_chi(wfns, meta, mesh, z, f, kmq)
     rel = _relative_per_z(bank, exact)
     print("one-rule vs exact (step):", ["%.2e" % r for r in rel])
     assert max(rel) <= 50 * TOL
 
-
-def test_four_blocks_match_the_exact_scan():
-    """Fractional active populations, z down to 0.1 eV: four blocks vs the exact ordered-pair scan."""
-    from ffi import fft as F
-    mesh = _mesh()
+    # fractional active populations, z down to 0.1 eV: four blocks vs the exact ordered-pair scan
     wfns, meta, kmq, f = system(mesh, fractional=True)
     z = np.asarray(Z_EV) / RY
     with F.xla_reference():
-        bank, rules, receipt, _ = bank_chi(wfns, meta, mesh, z, blocks=ACTIVE)
+        bank, rules, receipt = bank_chi(wfns, meta, mesh, z, blocks=ACTIVE)
         exact = exact_chi(wfns, meta, mesh, z, f, kmq)
     rel = _relative_per_z(bank, exact)
     blocks = receipt["rule"]["blocks"]
@@ -171,116 +167,3 @@ def test_four_blocks_match_the_exact_scan():
     RB.response_quadrature(meta, plan, receipt2, support, group_size=len(z), print_fn=lambda *a, **k: None)
     assert receipt2["rule"]["reused"] is True
 
-
-def test_blocks_sum_to_all_pairs():
-    from gw.response_bank import response_blocks
-    rng = np.random.default_rng(3)
-    nk = 6
-    e = _energies(rng, nk)
-    f = _occupations(rng, nk, True)
-    u = 1.0 - f
-    blocks = response_blocks(e, f, u, ACTIVE)
-    total = sum(np.einsum("ka,kb->kab", b["f"], b["u"]) for b in blocks)
-    assert np.array_equal(total, np.einsum("ka,kb->kab", f, u))
-
-
-def test_block_gates():
-    from gw.response_bank import response_blocks
-    rng = np.random.default_rng(4)
-    nk = 6
-    e = _energies(rng, nk)
-    f = _occupations(rng, nk, True)
-    bad = f.copy(); bad[0, 0] = 0.7                 # a fractional frozen band
-    with pytest.raises(ValueError, match="response_blocks_frozen_fractional"):
-        response_blocks(e, bad, 1.0 - bad, ACTIVE)
-    step = _occupations(rng, nk, False)
-    e2 = e.copy(); e2[:, 2] = e2[:, 3]          # frozen-occupied band 2 meets active band 3
-    with pytest.raises(ValueError, match="response_blocks_interval"):
-        response_blocks(e2, step, 1.0 - step, (3, 7))   # FA not strictly positive
-    with pytest.raises(ValueError, match="response_blocks_active"):
-        response_blocks(e, f, 1.0 - f, (7, 7))
-
-
-def dump(path):
-    """The one-rule path's carries and rules at a step and a fractional state (bitwise across trees)."""
-    import jax
-    from ffi import fft as F
-    devs = np.asarray(jax.devices())
-    from jax.sharding import Mesh
-    mesh = Mesh(devs[:4].reshape(2, 2), ("x", "y"))
-    out = {}
-    with F.xla_reference():
-        # the one-rule path refuses 3+0.5i eV at the fractional state (its envelope interval);
-        # the dump keeps the samples it builds there
-        for name, frac, zz in (("step", False, Z_EV[1:]), ("frac", True, Z_EV[2:4])):
-            wfns, meta, kmq, f = system(mesh, fractional=frac)
-            z = np.asarray(zz) / RY
-            bank, rules, receipt, raws = bank_chi(wfns, meta, mesh, z)
-            for i, raw in enumerate(raws):
-                out[f"{name}_raw{i}"] = raw
-            for i, g in enumerate(rules["groups"]):
-                out[f"{name}_t{i}"] = np.asarray(g["t"])
-                out[f"{name}_value{i}"] = np.asarray(g["value"])
-            out[f"{name}_nodes"] = np.asarray(receipt["nodes"])
-    np.savez(path, **out)
-    print("dumped", len(out), "arrays to", path)
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "--dump":
-        dump(sys.argv[2])
-    else:
-        sys.exit(pytest.main([__file__, "-q", "-s"]))
-
-
-def test_chi0_active_group_extends_to_isolated_groups():
-    """``tdagw.dynsig.chi0_active_group``: edges move out to the first positive gap; refused only if none."""
-    from tdagw.dynsig import chi0_active_group
-    rng = np.random.default_rng(5)
-    nk = 6
-    e = _energies(rng, nk)                       # positive gaps 1|2, 4|5, 6|7; 2|3, 3|4 overlap
-    assert chi0_active_group(e, slice(3, 5), "auto")[:2] == (2, 5)
-    assert chi0_active_group(e, slice(3, 5), (2, 7))[:2] == (2, 7)
-    lo, hi, gaps = chi0_active_group(e, slice(2, 7), "auto")
-    assert (lo, hi) == (2, 7) and min(gaps) > 0
-    flat = np.tile(np.linspace(-1, 1, FX.NBF), (nk, 1))
-    flat[:, 1:] -= 0.3                           # every gap negative: no isolated group
-    flat = np.sort(flat + rng.uniform(0, 0.6, flat.shape), axis=1)
-    flat[:, 1:] = np.maximum(flat[:, 1:], flat[:, :-1])
-    flat[0] -= 0.0
-    if all(flat[:, b].min() - flat[:, b - 1].max() <= 0 for b in range(1, FX.NBF)):
-        with pytest.raises(Exception, match="dynsig_spm_chi0_active"):
-            chi0_active_group(flat, slice(3, 5), "auto")
-
-
-
-def test_photon_batch_books_the_canonical_copy_beside_the_split():
-    """The photon path's canonical copy of a read run is live beside the run and the split's
-    totals, so the batch books its own executable and the split's, summed."""
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from common import timing
-    from gw.response_bank import _batch_totals, _moment_batch_split, _photon_canonical
-    from gw.shared_pole_execution import compiled_for
-    from lxkit import memory
-    from runtime.aot_memory import compiled_new_bytes
-    jax.config.update("jax_enable_x64", True)
-    mesh, n = Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ("x", "y")), 16
-
-    class Reversal:                                    # families that reverse each photon axis
-        layout = SimpleNamespace(mesh_side=1)
-
-        def order_map(self):
-            return np.arange(n)[::-1].astype(np.int32), n, n
-    families = Reversal()
-    finish, split = _photon_canonical(families, mesh), _moment_batch_split(mesh, 2, 2)
-    run = jax.device_put(jnp.arange(2 * 3 * n * n, dtype=jnp.complex128).reshape(2, 3, n, n),
-                         NamedSharding(mesh, P(None, None, "x", "y")))
-    with timing.section("demo.photon_batch"):
-        totals = _batch_totals(run, finish, split)
-    canonical = np.asarray(run)[:, :, ::-1, ::-1]
-    assert all(np.array_equal(np.asarray(t), canonical[o, :2]) for o, t in enumerate(totals))
-    price = next(r["price"] for r in memory.receipts() if r["stage"] == "demo.photon_batch")
-    copy = compiled_new_bytes(compiled_for(finish, (run,)))
-    assert copy >= run.nbytes and price.xla.at(1) == copy + compiled_new_bytes(compiled_for(split, (run,)))

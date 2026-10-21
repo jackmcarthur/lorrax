@@ -37,16 +37,23 @@ machine pages: [Perlmutter](docs/environment/machines/perlmutter.md),
 ## How to test
 
 [`docs/contributing.md`](docs/contributing.md#the-test-suite) owns the test
-suite and the pre-push checklist. In short, there are two kinds of tests:
+suite and the pre-push checklist. In short, the checks are the hsuite, lint
+and a small unit layer:
 
 - `tests/hsuite`: the production drivers run end to end on two small fixtures
   (a magnetic H2⁻ cell and bcc Na 3³) at P4 on one node, each stage compared
   with stored references and every rank's log scanned for failure signatures.
   It is the verdict for a driver or physics change, and only a compute-node run
   counts.
-- The five static AST suites in `tests/` (`test_layering.py`,
+- Lint, `tools/lint/`: the five static AST suites (`test_layering.py`,
   `test_crossfile_requests.py`, `test_env_registry.py`, `test_env_grammar.py`,
-  `test_fft_shardmap_context.py`), which run on a login node.
+  `test_fft_shardmap_context.py`), which run on a login node and are not part
+  of the pytest set.
+- A small unit layer, `tests/test_*.py`: only important checks the hsuite
+  cannot reach (an exact identity against an independent reference, a refusal
+  that must fire, two routes that must agree, an output format). Several
+  related checks share one test; do not add one that re-checks an hsuite stage
+  or pins incidental implementation behaviour.
 
 `tools/release_check.sh` runs the login-node pre-push set. Service benchmarks
 live in `services/<svc>/bench/` and are not collected by pytest.

@@ -25,7 +25,7 @@ from runtime import debug_print_enabled
 # Canonical boolean env grammar for this layer (same recognised token set
 # as file_io._slab_io_ffi._env_flag and the one isdf.core imports, plus an
 # announcement for anything outside it).
-# See gw/gw_config.py's module comment and tests/test_env_grammar.py for
+# See gw/gw_config.py's module comment and tools/lint/test_env_grammar.py for
 # the drift gate.
 from .gw_config import (ZETA_RCOND_DEFAULT,
                         active_zeta_truncating_knobs)

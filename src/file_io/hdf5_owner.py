@@ -117,7 +117,7 @@ _TOKEN = [0]
 # HDF5_USE_FILE_LOCKING IS NOT SET HERE.  It is a variable LORRAX ships,
 # and ``runtime.set_default_env`` is the one place that decides those —
 # a module that sets one just by being imported is what
-# ``tests/test_layering.py::test_only_entry_points_write_the_environment_at_import``
+# ``tools/lint/test_layering.py::test_only_entry_points_write_the_environment_at_import``
 # refuses, and it is right to: an env default applied at import time
 # depends on import ORDER, which is exactly the property an HDF5 knob
 # read at file-open time must not depend on.  This module only REPORTS
@@ -129,7 +129,7 @@ def policy() -> str:
 
     The name is spelled as a LITERAL here as well as in
     :data:`POLICY_ENV`: ``tools/env_audit.py`` and
-    ``tests/test_env_registry.py`` resolve only literal arguments, so
+    ``tools/lint/test_env_registry.py`` resolve only literal arguments, so
     this read was invisible to the gate that requires a
     ``docs/reference/env_vars.md`` row — and the variable duly shipped without
     one.  The constant stays for the messages and the tests.

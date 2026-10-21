@@ -1,4 +1,4 @@
-"""``bse_k_grid`` dipoles: the htransform-interpolated velocity (CPU, 2x2 host mesh).
+"""``bse_k_grid`` dipoles: ``densified_dipoles`` against the exact fine-grid answer (CPU, 2x2 host mesh).
 
 ``bse.bse_densify.densified_dipoles`` on a toy tight-binding slab whose
 orbitals are the htransform nodes (all at the cell origin, unit metric), so the
@@ -7,26 +7,36 @@ away.  Run with
 ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4``.
 
 1. Every fine q that is a coarse k reproduces the coarse velocity in the
-   fine states (the gate's identity), and off the coarse grid the dipoles
-   match the exact ones phase-coherently, in the densified states' own gauge.
+   fine states (the gate's identity), also when the fH band order moves a
+   band across the window edge (the gate reads the fH's order; handing it the
+   DFT order fires), and a permuted fine q list fires
+   ``GATE densified_dipole_on_grid``; off the coarse grid the dipoles match
+   the exact ones phase-coherently, in the densified states' own gauge.
 2. A gauge planted on the coarse states AND their velocity changes nothing;
    planted on the velocity alone (the dipfix failure) it is seen, and the
-   velocity image loses its locality.
-3. Under a scissor the fine states come from the QP f(H) while ``r = v/ΔE``
-   keeps the velocity file's energies: the dipoles do not move with the QP
-   energies, and dividing by the QP ΔE (the red twin) would.
-4. A fit window whose top band meets an unfitted band carries the velocity
-   weighted (exact on-grid, closer off-grid than unweighted).
-5. A permuted fine q list fires ``GATE densified_dipole_on_grid``;
-   ``window_dipoles`` refuses a densified bundle without its own dipoles, an
-   undensified bundle whose dipole has another k list, and one whose dipole
-   is stamped for another WFN (or not stamped), or whose bands do not
-   cover the window (``GATE dipole_band_window``).
+   velocity image loses its locality.  Under a scissor the fine states come
+   from the QP f(H) while ``r = v/ΔE`` keeps the velocity file's energies:
+   the dipoles do not move with the QP energies, and dividing by the QP ΔE
+   (the red twin) would.
+3. ``qp_states=True`` gives ⟨c̃|r̂|ṽ⟩ of the fine states (CrI3 8→12: Σ|d|²
+   0.986 with the Rayleigh-quotient ``v/ΔE``) to the htransform's
+   interpolation floor, and the Rayleigh-quotient twin is more than 5x
+   further off; ``r_window`` is the window position (Hermitian, matches the
+   exact one off the diagonal, ``i`` times its c←v block IS ``d_alpha``).
+4. ``full_window=True``: the window is Hermitian and matches the exact
+   velocity in the densified states' gauge; the bra/ket-swapped window (the
+   red twin) does not.
+5. Refusals that must fire: ``window_dipoles`` on a densified bundle without
+   its own dipoles, an undensified bundle with another k list, a dipole
+   stamped for another WFN (or not stamped) or in an older format; the
+   rotation's record (small valence↔conduction mixing, window sum kept) and
+   the ``GATE densified_pair_rule`` refusal.
+
+The pair rule is also pinned to ``tdagw.td_system.position_from_velocity``'s
+(a copy of it lives in ``bse_densify``).
 """
-import sys
 from types import SimpleNamespace
 
-import h5py
 import numpy as np
 import pytest
 
@@ -37,13 +47,16 @@ from jax.sharding import Mesh  # noqa: E402
 
 from bandstructure.bse_setup import compute_wfns_fi  # noqa: E402
 from bse.absorption_common import window_dipoles  # noqa: E402
-from bse.bse_densify import densified_dipoles  # noqa: E402
+from bse.bse_densify import (DENSIFIED_POSITION_FORM,  # noqa: E402
+                             _position_from_velocity_rule, densified_dipoles)
 from ffi.fft import xla_reference  # noqa: E402
 from isdf.galerkin import NodalInterp  # noqa: E402
 
 KC, KF = (6, 6, 1), (9, 9, 1)          # non-nested: 3x3 shared points
 ONSITE = np.r_[np.linspace(-1.6, -0.7, 4), np.linspace(0.6, 1.5, 4), 5.0, 5.3]
 NB, B_MIN, B_MAX, N_VAL = 8, 2, 6, 2   # fitted window, BSE window, valence rows
+NV, LO, HI = N_VAL, B_MIN, B_MAX
+HOP, SHIFT = 0.02, 0.1                 # smooth model and QP shifts of test 3
 
 
 def _mesh():
@@ -103,7 +116,7 @@ def _nodes(c):
 
 
 def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
-             gate_energies=None):
+             gate_energies=None, **kw):
     """``compute_wfns_fi`` + ``densified_dipoles`` on the toy, XLA backend."""
     kc = _grid(KC)
     e_fh = e if fh_energies is None else fh_energies
@@ -123,7 +136,7 @@ def _densify(mesh, c, e, v, *, fh_energies=None, e_file=None, q_perm=None,
                                   basis_at_nodes=nodes),
             fine=fine, coarse_grid=KC, n_val=N_VAL, window_start=B_MIN,
             a_band_index=None,
-            mesh_xy=mesh, log_fn=lambda *a: None)
+            mesh_xy=mesh, log_fn=lambda *a: None, **kw)
     return dip, fine
 
 
@@ -144,7 +157,8 @@ def _rel(a, b):
 
 def test_on_grid_identity_and_off_grid_dipoles():
     mesh, h = _mesh(), _model()
-    c, e, v = _states(h, _grid(KC), phases=np.exp(2j * np.pi * np.random.default_rng(
+    kc = _grid(KC)
+    c, e, v = _states(h, kc, phases=np.exp(2j * np.pi * np.random.default_rng(
         11).random((np.prod(KC), NB))))
     dip, fine = _densify(mesh, c, e, v)
     assert dip["n_on_grid"] == 9 and dip["on_grid_rel"] < 1e-12
@@ -154,189 +168,17 @@ def test_on_grid_identity_and_off_grid_dipoles():
     assert _rel(dip["d_alpha"], ref) < 0.02
     assert np.all(dip["de_cv"] > 0)
 
-
-def test_coarse_gauge_is_invisible_and_a_velocity_only_gauge_is_seen():
-    mesh, h = _mesh(), _model()
-    kc = _grid(KC)
-    rng = np.random.default_rng(5)
-    c0, e, v0 = _states(h, kc)
-    ph = np.exp(2j * np.pi * rng.random((len(kc), NB)))
-    c1, _, v1 = _states(h, kc, phases=ph)
-    a, fine_a = _densify(mesh, c0, e, v0)
-    b, fine_b = _densify(mesh, c1, e, v1)
-    ra, _ = _exact_rotated(h, fine_a)
-    rb, _ = _exact_rotated(h, fine_b)
-    assert _rel(a["d_alpha"], ra) < 0.02 and _rel(b["d_alpha"], rb) < 0.02
-    np.testing.assert_allclose(np.abs(a["d_alpha"]), np.abs(b["d_alpha"]),
-                               atol=1e-9 * np.abs(a["d_alpha"]).max())
-    # Red twin: the velocity in another gauge than the states (dipfix).
-    bad, fine_bad = _densify(mesh, c0, e, v1)
-    rbad, _ = _exact_rotated(h, fine_bad)
-    assert _rel(bad["d_alpha"], rbad) > 0.2
-    assert bad["image_locality"]["v_x"][0] > 10 * a["image_locality"]["v_x"][0]
-
-
-def test_scissor_keeps_the_velocity_energies():
-    mesh, h = _mesh(), _model()
-    c, e, v = _states(h, _grid(KC))
-    qp = e + 0.3 * (np.arange(NB) >= 4)[None]            # conduction scissor
-    dft, _ = _densify(mesh, c, e, v)
-    sc, fine = _densify(mesh, c, e, v, fh_energies=qp)
-    _, ee, _ = _states(h, fine.q_frac)
-    de_x = ee[:, B_MIN + N_VAL:B_MAX, None] - ee[:, None, B_MIN:B_MIN + N_VAL]
-    err = lambda de: float(np.abs(de - de_x).max())
-    # The fine states come from the QP f(H); the denominators stay the
-    # velocity's DFT energies (Rayleigh quotients, second order).
-    assert err(sc["de_cv"]) < 1.5 * err(dft["de_cv"]) + 1e-3
-    e_qp = np.asarray(fine.enk_full)
-    de_qp = e_qp[:, N_VAL:, None] - e_qp[:, None, :N_VAL]
-    assert err(de_qp) > 0.25                             # the bundle's ΔE is QP
-    assert _rel(np.abs(sc["d_alpha"]), np.abs(dft["d_alpha"])) < 0.06
-    # Red twin: the QP ΔE in the denominator is off by ΔE_DFT/ΔE_QP.
-    wrong = sc["d_alpha"] * sc["de_cv"][None] / de_qp[None]
-    assert _rel(np.abs(wrong), np.abs(dft["d_alpha"])) > 0.2
-
-
-def _densify_entangled(mesh, top_onsite, hop_top):
-    """A 16-orbital toy, 14 fitted bands, BSE window [2, 6): six guard bands.
-
-    The velocity file holds all 16 bands, as ``psp.get_dipole_mtxels`` does,
-    so ``densified_dipoles`` can see where the fit window's top band meets
-    the first unfitted one.  Returns ``(dip, fine, rel)``, ``rel`` against
-    the exact dipoles in the densified states' gauge.
-    """
-    onsite = np.r_[np.linspace(-1.6, -0.7, 4), np.linspace(0.6, 1.5, 4),
-                   np.linspace(1.8, 3.3, 6), top_onsite]
-    m, nb = len(onsite), 14
-    rng = np.random.default_rng(3)
-    a = rng.standard_normal((m, m)) + 1j * rng.standard_normal((m, m))
-    h = {(0, 0): np.diag(onsite) + 0.02 * (a + a.conj().T)}
-    for r in ((1, 0), (0, 1), (1, 1), (1, -1)):
-        b = 0.05 * (rng.standard_normal((m, m)) + 1j * rng.standard_normal((m, m)))
-        b[12:, 12:] *= hop_top / 0.05          # the top orbitals disperse strongly
-        h[r], h[(-r[0], -r[1])] = b, b.conj().T
-    kc = _grid(KC)
-    ph = np.exp(2j * np.pi * np.random.default_rng(11).random((len(kc), m)))
-    mod = sys.modules[__name__]
-    saved = mod.NB
-    try:
-        mod.NB = m
-        c_all, e_all, v_all = _states(h, kc, phases=ph)
-        mod.NB = nb
-        c, e = c_all[:, :nb], e_all[:, :nb]
-        nodes = _nodes(c)
-        with xla_reference():
-            fine = compute_wfns_fi(
-                ctilde=jnp.asarray(c), B_at_mu=nodes, enk_sigma=jnp.asarray(e.T),
-                kgrid_co=KC, kgrid_fi=KF, band_window_fi=(B_MIN, B_MAX),
-                mesh_xy=mesh, return_coeffs=True)
-            dip = densified_dipoles(
-                (v_all, e_all, "toy dH/dk", "toy.h5"), sym=_sym(kc), fh_energies=e,
-                basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, nb),
-                                      basis_at_nodes=nodes),
-                fine=fine, coarse_grid=KC, n_val=N_VAL, window_start=B_MIN,
-                a_band_index=None, mesh_xy=mesh, log_fn=lambda *a: None)
-        ref, _ = _exact_rotated(h, fine)
-    finally:
-        mod.NB = saved
-    return dip, fine, _rel(dip["d_alpha"], ref)
-
-
-def test_entangled_window_top_weights_the_velocity(monkeypatch):
-    """The fit window's top band meets an unfitted band (Si: 36 of 100).
-
-    The projected velocity is then not smooth in k, so it is carried as
-    g v g (``bse_densify.velocity_weight``, zero above the first unfitted
-    band's lowest energy) and g is divided back in the fine window: the
-    on-grid identity stays exact and the off-grid dipoles are closer to the
-    exact ones than the unweighted route (g = 1, the control).  An isolated
-    window top keeps the unweighted route (no weight recorded).
-    """
-    import bse.bse_densify as bse_densify
-    mesh = _mesh()
-    iso, _, rel_iso = _densify_entangled(mesh, (6.0, 6.3), 0.05)
-    assert iso["velocity_weight"] is None and rel_iso < 0.02
-    dip, _, rel = _densify_entangled(mesh, (3.4, 3.6), 0.25)
-    w = dip["velocity_weight"]
-    assert w is not None and w["floor"] > 0.9
-    assert dip["on_grid_rel"] < 1e-12 and dip["on_grid_state_dev"] < 1e-8
-    monkeypatch.setattr(bse_densify, "velocity_weight",
-                        lambda e, *a: np.ones_like(np.asarray(e, dtype=np.float64)))
-    flat, _, rel_flat = _densify_entangled(mesh, (3.4, 3.6), 0.25)
-    assert flat["on_grid_rel"] < 1e-12
-    assert rel < 0.6 * rel_flat                 # measured 0.118 vs 0.242
-
-
-def test_permuted_q_list_fires_the_on_grid_gate():
-    mesh, h = _mesh(), _model()
-    c, e, v = _states(h, _grid(KC))
+    # A permuted fine q list fires the on-grid gate.
     perm = np.roll(np.arange(np.prod(KF)), 1)
     with pytest.raises(ValueError, match="GATE densified_dipole_on_grid"):
         _densify(mesh, c, e, v, q_perm=perm)
 
-
-def test_window_dipoles_refusals(tmp_path, monkeypatch):
-    import bse.absorption_common as absorption_common
-    import file_io.dipole as dipole
-    monkeypatch.setattr(dipole, "wfn_psi_basis", lambda path: "dft")
-    monkeypatch.setattr(absorption_common, "_deck_wfn_fingerprint",
-                        lambda path: "sha-of-the-deck-wfn")
-    dense = {"densified": True, "dipoles": None, "nkx": 3, "nky": 3, "nkz": 1,
-             "n_val": 1, "n_cond": 1}
-    with pytest.raises(ValueError, match="GATE densified_dipoles"):
-        window_dipoles(dense, tmp_path / "dipole.h5", n_occ=1, wfn_path="WFN.h5")
-    path = tmp_path / "dipole.h5"
-    with h5py.File(path, "w") as f:
-        f["dipole_cart"] = np.zeros((3, 4, 2, 2), complex)
-        f["band_energies"] = np.tile([-1.0, 1.0], (4, 1))
-        f.attrs.update({"nk": 4, "nbands": 2, "basis": "dft",
-                        "prov_wfn_sha256": "sha-of-the-deck-wfn",
-                        dipole.DIPOLE_FORMAT_ATTR: dipole.DIPOLE_FORMAT_VERSION})
-    coarse = dict(dense, densified=False)
-    with pytest.raises(ValueError, match="GATE dipole_k_grid"):
-        window_dipoles(coarse, path, n_occ=1, wfn_path="WFN.h5")
-    ok = dict(coarse, nkx=2, nky=2)
-    d, de = window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
-    assert d.shape == (3, 4, 1, 1) and de.shape == (4, 1, 1)
-    # A window past the stored bands used to slice to fewer conduction bands.
-    with pytest.raises(ValueError, match="GATE dipole_band_window"):
-        window_dipoles(dict(ok, n_cond=2), path, n_occ=1, wfn_path="WFN.h5")
-    # The band stamp must cover the window from band 0 and match the axis.
-    for lo, hi in ((1, 3), (0, 3)):
-        with h5py.File(path, "a") as f:
-            f.attrs.update({dipole.DIPOLE_BAND_MIN_ATTR: lo, dipole.DIPOLE_BAND_MAX_ATTR: hi})
-        with pytest.raises(ValueError, match="GATE dipole_band_window"):
-            window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
-    with h5py.File(path, "a") as f:
-        f.attrs.update({dipole.DIPOLE_BAND_MIN_ATTR: 0, dipole.DIPOLE_BAND_MAX_ATTR: 2})
-    window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
-    # Another WFN's file on the same k list, and an unstamped one (AUDIT B12).
-    for stamp in ("sha-of-another-wfn", None):
-        with h5py.File(path, "a") as f:
-            if stamp is None:
-                del f.attrs["prov_wfn_sha256"]
-            else:
-                f.attrs["prov_wfn_sha256"] = stamp
-        with pytest.raises(ValueError, match="GATE velocity_wfn_fingerprint"):
-            window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
-    # A file older than the one-operator format (no stamp) refuses by name.
-    with h5py.File(path, "a") as f:
-        del f.attrs[dipole.DIPOLE_FORMAT_ATTR]
-    with pytest.raises(ValueError, match="GATE dipole_format_version"):
-        window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
-
-
-def test_on_grid_identity_follows_the_fh_band_order():
-    """A QP ladder that moves a band across the window edge at a shared k.
-
-    The fH's own order picks the window there (MoS2 9x9 eqp1 at Gamma swaps
-    DFT bands 18-19 out of [18, 34) for 16-17), so the on-grid state identity
-    reads the window rows from ``fh_energies``; the red twin hands the gate
-    the DFT order and must fire.
-    """
-    mesh, h = _mesh(), _model()
-    c, e, v = _states(h, _grid(KC))
-    i0 = int(np.flatnonzero(np.all(np.abs(_grid(KC)) < 1e-12, axis=1))[0])
+    # A QP ladder that moves a band across the window edge at a shared k.
+    # The fH's own order picks the window there (MoS2 9x9 eqp1 at Gamma swaps
+    # DFT bands 18-19 out of [18, 34) for 16-17), so the on-grid state
+    # identity reads the window rows from ``fh_energies``; the red twin hands
+    # the gate the DFT order and must fire.
+    i0 = int(np.flatnonzero(np.all(np.abs(kc) < 1e-12, axis=1))[0])
     e_qp = e.copy()
     e_qp[i0, B_MIN - 1], e_qp[i0, B_MIN] = e[i0, B_MIN] + 0.02, e[i0, B_MIN - 1]
     assert list(np.argsort(e_qp[i0])[B_MIN:B_MAX]) != list(range(B_MIN, B_MAX))
@@ -345,3 +187,4 @@ def test_on_grid_identity_follows_the_fh_band_order():
     assert dip["on_grid_state_dev"] < 1e-8 and dip["on_grid_rel"] < 1e-12
     with pytest.raises(ValueError, match="GATE densified_dipole_on_grid"):
         _densify(mesh, c, e, v, fh_energies=e_qp, gate_energies=e)
+

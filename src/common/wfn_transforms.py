@@ -221,20 +221,6 @@ def _box_kernel(psi: jax.Array, sphere_index: jax.Array, *,
                        fft_grid=fft_grid)
 
 
-def _sphere_gather(box: jax.Array, sphere_index: jax.Array) -> jax.Array:
-    """Box ``(n_k, nb, ns, nx, ny, nz)`` → sphere ``(n_k, nb, ns, ngk)``.
-
-    The inverse of :func:`_box_kernel` on its image: pad slots read zero.
-    """
-    n_k, nb, ns = (int(v) for v in box.shape[:3])
-    flat = box.reshape(n_k, nb, ns, -1)
-
-    def one_k(b, idx):
-        return jnp.take(b, idx, axis=-1, mode='fill', fill_value=0)
-
-    return jax.vmap(one_k)(flat, sphere_index)
-
-
 # ---------------------------------------------------------------------------
 # Sharding helpers — every public transform requires a ``mesh`` argument.
 # A 1×1 trivial mesh is the right thing to pass for single-device runs;
@@ -1536,7 +1522,7 @@ def apply_bloch_phase_on_slice(
 # (``to_box`` and friends) key on the output ``NamedSharding``, which embeds
 # the mesh OBJECT.  Two equal-but-distinct 1×1 ``Mesh``es double every one of
 # them.  So this MUST stay an alias — re-implementing it here, however
-# faithfully, is the bug.  ``tests/test_layering.py`` pins the direction and
+# faithfully, is the bug.  ``tools/lint/test_layering.py`` pins the direction and
 # ``tests/test_collectives_distribution.py`` pins the identity.
 #
 # It is the mesh half of the ``WfnLoader.load_process_local`` contract; see

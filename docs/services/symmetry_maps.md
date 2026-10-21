@@ -7,7 +7,7 @@ real-space orbit machinery, the q_irr restart store, and the time-reversal
 measurement. It is independently installable (src-layout); it depends on
 `lxkit`, jax and numpy (h5py lazily, inside the two q_irr file functions) and
 on nothing in LORRAX. Import top-level names only: `from symmetry_maps.maps
-import …` from outside fails `tests/test_layering.py`.
+import …` from outside fails `tools/lint/test_layering.py`.
 
 The conventions (BGW `mtrx`/τ, the ψ-unfold algebra, the (α, L)
 decomposition) are derived in [`theory/symmetry.md`](../theory/symmetry.md);
