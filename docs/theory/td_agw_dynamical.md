@@ -1465,6 +1465,73 @@ Both summed boundary compressions must be measured at the actual state.
 The derivation neither deletes principal values nor introduces a secular
 projection, equilibrium subtraction or other change of the reference model.
 
+###### Research alternative: paired covariance-root jumps
+
+This is an unimplemented alternative collision prescription, not a repair or
+validation of literal one-sided MGKBA. Suppose a stationary lesser covariance
+$J_q^<(\omega)\succeq0$ is admitted in a fixed physical port basis, with the
+reciprocal greater covariance supplied by the same statistical model. Define
+$B_q(\omega)=\sqrt{J_q^<(\omega)}$ using its unique Hermitian PSD root and
+directed channels from $s=k-q$ to $d=k$ by
+
+$$
+(L_{ds}^{q\mu})_{am}=\sqrt{2\pi w_q}\sum_r
+M^{kq}_{am,r}\,B_q(E_{ka}-E_{k-q,m})_{r\mu}.
+$$
+
+The vertex and spectral normalization must reproduce the chosen diagonal
+transition rates; using the current finite-width spectrum must be declared.
+Coherences between different transition energies remain within each matrix
+$L$. Root the **full covariance sum** before constructing these channels:
+for scalar $J=\sum_p j_p$, their cross-frequency factor is
+$\sqrt{J(\omega)J(\omega')}$, whereas independent pole channels give
+$\sum_p\sqrt{j_p(\omega)j_p(\omega')}\le\sqrt{J(\omega)J(\omega')}$.
+They are different nonsecular approximations. A fixed unitary mixing of
+channel columns changes nothing; a frequency-dependent mixing generally does.
+
+For positive electronic weights $w_k$, define a CP gain map and its adjoint
+in the weighted trace inner product, over all directed channels $\alpha$:
+
+$$
+\Phi[\rho]_d=\sum_{s,\alpha}L_{ds}^\alpha\rho_sL_{ds}^{\alpha\dagger},\qquad
+\Phi_w^*[Q]_s=\sum_{d,\alpha}\frac{w_d}{w_s}
+L_{ds}^{\alpha\dagger}Q_dL_{ds}^\alpha,
+\qquad C_k=\tfrac12\{I-\rho_k,\Phi[\rho]_k\}
+-\tfrac12\{\rho_k,\Phi_w^*[I-\rho]_k\}.
+$$
+
+Each directed jump cancels in $\sum_k w_k\operatorname{Tr}C_k$ by cyclicity.
+At an empty eigenvector the gain is nonnegative and the loss vanishes;
+at a filled eigenvector the gain vanishes and the loss is nonpositive.
+These are continuous Pauli boundary statements for physical full matrices
+$0\preceq\rho\preceq I$, not complete positivity of a nonlinear map or a
+finite-step guarantee. Uniform full-zone weights give $w_d/w_s=1$.
+Include q/$-q$ statistical partners once: the adjoint loss is the same
+transfer, not an additional independently fitted greater-loss channel.
+Held $L$ still gives exact nonlinear trace cancellation if both maps are
+recontracted with the **current** density at every RHS evaluation.
+
+The PSD premise is substantive. Retarded W alone does not determine a PSD
+noise covariance; signed gain response does not mean negative physical
+noise. General coherent endpoint spectra and independent full-port pole
+residues need not be PSD. Material negative covariance eigenvalues refuse;
+neither clipping nor a pole-sign projection supplies the missing statistics.
+Off-diagonal dissipative/PV interference changes. Keeping the original full
+$M_H$ separately is an explicit coherent convention,
+not the ULE Lamb-shift derivation or its error theorem; q=0 centering and
+coherent double counting still need a decision. Number and Pauli properties
+do not establish thermal stationarity or energy conservation.
+
+For $n$ active bands and $r$ channel columns, stored jumps cost
+$16N_kN_qrn^2$ bytes and their RHS products scale as $N_kN_qrn^3$.
+Full-port root construction, compression and material overhead are unmeasured.
+A useful next comparison adds full-covariance roots to the same exact toy
+used for per-pole roots, retaining the same $M_H$, then tests diagonal rates,
+coherences, boundary signs, particle trace and equilibrium residuals together.
+Relevant precedents are [nonlinear fermionic mean-field channels](https://arxiv.org/html/1408.1898)
+and [matrix covariance roots in ULE](https://arxiv.org/html/2004.01469v2);
+neither validates this self-generated screened bath or the proposed convention.
+
 ##### Lossless transition-bath prescription {#lossless-transition-bath}
 
 `collision_statistics = "lossless_bath"` declares a stationary, lossless
