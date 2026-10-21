@@ -791,8 +791,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                 frequency_scale_ry=moment_scale,capacity=plan,
                 storage_array_bytes=capture_bytes,storage_bound_bytes=storage_bound,
                 capture_workspace_bytes=capture_workspace,full_microscopic_host_payload=False,
-                energy_sha256=hashlib.sha256(energy.tobytes()).hexdigest(),
-                density_sha256=hashlib.sha256(rho.tobytes()).hexdigest(),
+                energy_sha256=hashlib.sha256(memoryview(energy)).hexdigest(),
+                density_sha256=hashlib.sha256(memoryview(rho)).hexdigest(),
                 scope='pre-reduction frequency-only diagnostic, NOT an admitted W or trajectory')
             def save_frequency_capture():
                 capture_path.parent.mkdir(parents=True,exist_ok=True)
@@ -1008,7 +1008,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     end("checks")
     begin("persist")
     identity = dict(iteration_id=str(label), energies=hashlib.sha256(energy.tobytes()).hexdigest(),
-        occupations=hashlib.sha256(rho.tobytes()).hexdigest(),
+        occupations=hashlib.sha256(memoryview(rho)).hexdigest(),
         hamiltonian=hashlib.sha256((energy.tobytes()+np.asarray(snapshot["U_active"]).tobytes())).hexdigest(),
         wavefunctions=operator_digest(merge_spin_centroid(pm, 1, 2), mesh_xy, cache=False),
         centroids=hashlib.sha256(np.asarray(meta.mu_basis.canonical_indices).tobytes()).hexdigest())
