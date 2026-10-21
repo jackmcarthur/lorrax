@@ -1,6 +1,6 @@
 # LORRAX
 
-`LORRAX` The Low-scaling Real-space Real-Axis eXcited-state package, written in JAX.
+`LORRAX` The Low-scaling Real-space Real-Axis eXcited-state module in BerkeleyGW.
 {: .page-summary }
 
 <div class="chain-map" data-driver="gw" data-page="deps"></div>
