@@ -790,7 +790,8 @@ def _general_current_fit(current, samples, *, defer_admission=False):
     from .shared_pole_pencil import tile_join, join_vectors
     from .shared_pole_constructor import (general_pencil_batch_plan,
         collective_general_pencil_batch, general_pencil_workspace_bytes,
-        EQUILIBRIUM_METRIC_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
+        reduce_equilibrium_pencil_device,
+        EQUILIBRIUM_DEVICE_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
     H=current['H']
     V=current['V']
     adjoint_program=current['adjoint_program']
@@ -960,7 +961,7 @@ def _general_current_fit(current, samples, *, defer_admission=False):
         right_units_sha256=hashlib.sha256(coordinate_units[1].tobytes()).hexdigest())
     if definite:
         frequency_coordinates.update(metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
-            held_space_representation='original-column-selector-P_I-v1')
+            held_space_representation='original-coordinate-native-common-span-v1')
     recipe['frequency_coordinates']=frequency_coordinates
     recipe['recipe_hash']=hashlib.sha256(_json({k:v for k,v in recipe.items() if k!='recipe_hash'}).encode()).hexdigest()
     positive_cap = recipe.get("pole_budget")
@@ -969,13 +970,14 @@ def _general_current_fit(current, samples, *, defer_admission=False):
     # explicit numerical admission bound, not a pole budget chosen to fit RAM.
     workspace = int(snapshot.get("host_workspace_bytes", 4*1024**3))
     nl, nr = map(int, E.shape[-2:])
-    host_price = general_pencil_workspace_bytes((nl,nr))
+    host_price = 0 if definite else general_pencil_workspace_bytes((nl,nr))
     if host_price > workspace:
         raise ValueError(f"GATE shared_general_capacity: reduced host pencil {nl}x{nr} "
                          f"needs {host_price}>{workspace} bytes before any host gather")
     end("pencil", (E, A, B, C, output_gram))
-    begin("hostreduce")
-    spaces = fit_basis.setdefault("equilibrium_column_spaces_v1" if definite else "spaces", {})
+    reduction_phase = 'devicereduce' if definite else 'hostreduce'
+    begin(reduction_phase)
+    spaces = fit_basis.setdefault("equilibrium_device_spaces_v1" if definite else "spaces", {})
     if not definite and samples.get('supports') is not None:
         # A previous physical refresh may have ended on expanded support
         # axes. Reuse only compatible general numerical coordinates; never
@@ -991,6 +993,53 @@ def _general_current_fit(current, samples, *, defer_admission=False):
     capture_workspace = 16*1024**2 if definite else 0
     frequency_saved_bytes=0
     position=0
+    if definite:
+        from .gw_config import linalg_resolution
+        eigh_backend=linalg_resolution({'linalg':current['config'].backend.linalg}).eigh_backend
+        for iq in parents:
+            model=reduce_equilibrium_pencil_device(E[iq:iq+1],A[iq:iq+1],output_gram[iq:iq+1],
+                mesh_xy=mesh_xy,max_order=cap,rank_tolerance=float(recipe['bank_rule_tolerance']),
+                gamma_ry=gamma,fixed_spaces=spaces.get(iq),
+                multiplet_tolerance=float(recipe['multiplet_relative_tolerance']),
+                capacity=current['capacity'],eigh_backend=eigh_backend)
+            spaces.setdefault(iq,model['spaces'])
+            l=mm(C[iq:iq+1],model['output_map'])
+            r=mm(B[iq:iq+1],model['input_map'],transa='C')
+            p=np.pad(model['poles_ry'],(0,l.shape[-1]-len(model['poles_ry'])))
+            partner=int(minus[iq])
+            if partner==iq:
+                l=tile_join((.5*l,-.5*jnp.conj(l)),-1,face)
+                r=tile_join((r,jnp.conj(r)),-1,face)
+                p=join_vectors((p,-p.conj()),panel_side)
+            banks[iq]=(l,r,p)
+            if partner!=iq:
+                banks[partner]=(-jnp.conj(l),jnp.conj(r),-p.conj())
+            receipts.append(dict(q=iq,partner=partner,**model['receipt']))
+            if stop_after is not None:
+                # An explicit diagnostic may capture bounded frequency data;
+                # ordinary refreshes never gather these matrices or maps.
+                root=Path(run_dir)/f'{label}_general_shared_pole'
+                path=root/f'q_{iq:03d}_diagnostic.npz'
+                diagnostic_arrays=dict(
+                    E=E[iq],A=A[iq],output_gram=output_gram[iq],
+                    output_map=model['output_map'],input_map=model['input_map'],
+                    space_right=model['spaces']['right'])
+                payload_bytes=sum(a.size*a.dtype.itemsize for a in diagnostic_arrays.values())
+                bound=int(snapshot.get('frequency_diagnostic_storage_bytes',workspace))
+                if payload_bytes+65536>bound:
+                    raise ValueError('GATE shared_equilibrium_capture: explicit diagnostic storage bound exceeded')
+                arrays={k:np.asarray(gather_to_host(a)) for k,a in diagnostic_arrays.items()}
+                report=dict(admitted=False,sigma_computed=False,q=iq,model_receipt=model['receipt'],
+                    scope='explicit partial frequency diagnostic; no physical accuracy certificate')
+                def save_device_diagnostic():
+                    root.mkdir(parents=True,exist_ok=True)
+                    if path.exists():raise FileExistsError(path)
+                    np.savez(path,**arrays,poles_ry=model['poles_ry'],bank_poles_ry=p,
+                        metadata_json=np.asarray(_json(report)))
+                rank0_transaction(path,stage='shared_equilibrium.frequency_diagnostic',write=save_device_diagnostic)
+                raise RuntimeError(f'GATE shared_general_diagnostic_stop: unadmitted q={iq} partial model; '
+                                   f'no Sigma computed; diagnostic retained at {path}')
+        position=len(parents)
     while position<len(parents):
         retained=sum(a.nbytes for key in ('spaces', 'equilibrium_spaces', 'equilibrium_column_spaces_v1')
             for space in fit_basis.get(key, {}).values() for a in space.values())
@@ -1249,7 +1298,7 @@ def _general_current_fit(current, samples, *, defer_admission=False):
             sys.stdout.flush()
         del pencils,models,model,omap,imap,grams
         position+=len(ids)
-    end("hostreduce", [b[:2] for b in banks.values()])
+    end(reduction_phase, [b[:2] for b in banks.values()])
     # Every current full-matrix sample checks the FINAL bank, including the
     # mirrored partner and self-negative convex crossing mixture.
     begin("checks")
@@ -1328,7 +1377,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .shared_pole_pencil import tile_join, join_vectors
     from .shared_pole_constructor import (general_pencil_batch_plan, collective_general_pencil_batch,
                                           general_pencil_workspace_bytes,
-                                          EQUILIBRIUM_METRIC_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
+                                          EQUILIBRIUM_DEVICE_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
     from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
     from types import SimpleNamespace
     from file_io.shared_pole_store import write_general_shared_pole_model
@@ -1419,10 +1468,10 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         modal_reconstruction_tolerance=1e-9, laplace_margin_ry=1e-12,
         capacity="explicit-full-map-and-host-pencil-bound", store="sha256-complete-full-q")
     if definite:
-        general_gates.update(numerical_spaces='original-column-selector-P_I-v1',
-            eigensolver='current-positive-H-extended-Cholesky-Hermitian-eigh',
+        general_gates.update(numerical_spaces='original-coordinate-native-common-span-v1',
+            eigensolver='native-positive-H-quotient-Hermitian-eigh',
             metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
-            common_state_selection='original-state-joint-RRQR-v1',
+            common_state_selection='source-tolerance-common-metric-quotient-v1',
             frequency_equilibration='positive-diagonal-common-H-congruence',
             equilibrium_definite=equilibrium)
     if refinement_selected:
@@ -1560,6 +1609,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     fit_current=dict(
         H=H,
         V=V,
+        config=config,
+        capacity=current_meta.shared_pole_capacity,
         adjoint_program=adjoint_program,
         algebra=algebra,
         begin=begin,
@@ -1711,8 +1762,14 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     receipt["held_reduced_host_basis_bytes_per_rank"] = sum(
         a.nbytes for key in ('spaces', 'equilibrium_spaces', 'equilibrium_column_spaces_v1')
         for space in fit_basis.get(key, {}).values() for a in space.values())
+    receipt['held_reduced_device_basis_bytes_per_rank']=sum(
+        a.size*a.dtype.itemsize for space in fit_basis.get('equilibrium_device_spaces_v1',{}).values()
+        for a in {id(v):v for v in space.values()}.values())//ranks
     retained = sum(a.size*a.dtype.itemsize for key in ('directions', 'equilibrium_directions')
                    for a in fit_basis.get(key, {}).values())
+    retained += sum(a.size*a.dtype.itemsize
+        for space in fit_basis.get('equilibrium_device_spaces_v1',{}).values()
+        for a in {id(v):v for v in space.values()}.values())
     kept = current_meta.shared_pole_capacity.reserve("general_held_numeric_basis",
         resident_bytes_per_rank=max(0, retained-previous_direction_bytes)//ranks,
         workspace_bytes_per_rank=0)

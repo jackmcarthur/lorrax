@@ -292,6 +292,74 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
 ORIENTATION_PAIR_REFUSAL = ("GATE shared_pole_orientation_pair: got: finite columns not in mirrored halves; want: [X(z); X(-z)] on one direction set and paired k0/k1 columns; why: the ordered cut acts in the paired basis")
 
 
+def equilibrium_metric_stage(g, h, output_gram, *, matmul, space=None):
+    """Same-state metric of (W 25), without a host frequency-matrix copy.
+
+    G/H are complex128 [1,R,R] native faces. A held ``space`` is an
+    original-coordinate face [1,R,K], including exact-zero carrier columns.
+    Only a common congruence is permitted. Diagonal equilibration changes
+    coordinates, never inertia; invalid diagonals remain a refusal flag.
+    """
+    if space is None:
+        diagonal = jnp.real(jnp.diagonal(h, axis1=-2, axis2=-1))
+        scale = 1 / jnp.sqrt(jnp.where(diagonal > 0, diagonal, 1))
+        metric = scale[:, :, None] * h * scale[:, None, :]
+    else:
+        scale = jnp.ones(h.shape[:2], h.real.dtype)
+        metric = matmul(space, matmul(h, space), transa='C')
+    diagnostics = dict(
+        input_finite=jnp.all(jnp.isfinite(g)) & jnp.all(jnp.isfinite(h)) &
+            jnp.all(jnp.isfinite(output_gram)),
+        output_norm=jnp.linalg.norm(output_gram),
+        output_hermiticity=jnp.linalg.norm(output_gram-jnp.conj(jnp.swapaxes(output_gram,-1,-2))) /
+            jnp.maximum(jnp.linalg.norm(output_gram),jnp.finfo(h.real.dtype).tiny),
+        H_hermiticity=jnp.linalg.norm(h-jnp.conj(jnp.swapaxes(h, -1, -2))) /
+            jnp.maximum(jnp.linalg.norm(h), jnp.finfo(h.real.dtype).tiny),
+        G_hermiticity=jnp.linalg.norm(g-jnp.conj(jnp.swapaxes(g, -1, -2))) /
+            jnp.maximum(jnp.linalg.norm(g), jnp.finfo(g.real.dtype).tiny))
+    return hermitian_part(metric), scale, diagnostics
+
+
+def equilibrium_ritz_stage(g, h, output_gram, space, active, *, matmul, eigh):
+    """Correct the retained current H metric, then solve its Hermitian G.
+
+    Arrays remain face tiled. ``space[1,R,K]`` maps the retained common
+    span to ORIGINAL coordinates; ``active[1,K]`` excludes carrier padding.
+    A rank cut is an approximation whose full-W/complex-Sigma checks belong
+    to the caller, not an exact-null or physical accuracy certificate.
+    """
+    hp = hermitian_part(matmul(space, matmul(h, space), transa='C'))
+    inert = diagonal_like(~active, hp)
+    correction, metric_ok, diagnostics = _metric_inverse_root(
+        hp+inert, matmul=matmul, tolerance=1e-10)
+    z = matmul(space, correction)
+    projected = hermitian_part(matmul(z, matmul(g, z), transa='C'))
+    # Distinct inert sentinels keep padding out of the physical eigenspace.
+    side = projected.shape[-1]
+    sentinel = -(jnp.linalg.norm(projected, axis=(-2, -1))+1)
+    spread = 1+jnp.arange(side, dtype=sentinel.dtype)/side
+    mu, rotation = eigh(projected+inert*(sentinel[:, None]*spread[None])[:, None])
+    physical = jnp.arange(side)[None] >= side-jnp.sum(active, axis=-1)[:, None]
+    vectors = matmul(z, rotation)*physical[:, None, :]
+    final_metric = matmul(z, matmul(h, z), transa='C')
+    # A retained-space backward check, independent of the original ill-
+    # conditioned coordinate metric residual.
+    live_rotation = rotation*physical[:, None, :]
+    residual = matmul(projected, live_rotation)
+    rhs = live_rotation*mu[:, None, :]
+    backward = jnp.linalg.norm(residual-rhs)/jnp.maximum(
+        jnp.linalg.norm(residual)+jnp.linalg.norm(rhs), jnp.finfo(h.real.dtype).tiny)
+    diagnostics.update(metric_ok=metric_ok,
+        retained_metric_error=jnp.linalg.norm(final_metric-diagonal_like(active, hp)),
+        eigen_residual=backward,
+        eigen_finite=jnp.all(jnp.isfinite(mu)) & jnp.all(jnp.isfinite(vectors)))
+    # Output evidence is used only for unresolved mu (constant feedthrough),
+    # never to infer a self-energy error from a rank/eigenvalue threshold.
+    output_weight = jnp.real(jnp.diagonal(
+        matmul(vectors, matmul(output_gram, vectors), transa='C'), axis1=-2, axis2=-1))
+    return mu, vectors, physical, output_weight, diagnostics
+
+
 def _paired_member(a, row_inverse, column_inverse, *, half, finite, n_inf):
     """One pencil member [b,R,R] in the paired basis: its (ww, wv, vv) blocks.
 

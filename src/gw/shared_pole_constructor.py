@@ -15,6 +15,7 @@ reduction; microscopic port factors remain distributed.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 import time
 
 import jax
@@ -25,6 +26,178 @@ from gw.shared_pole_directions import (_round_kernels, _sample_point, line_panel
 from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
 EQUILIBRIUM_METRIC_SOLVER='original-columns-extended-newton-v1'
+EQUILIBRIUM_DEVICE_SOLVER='same-state-device-metric-quotient-v1'
+
+
+@lru_cache(maxsize=32)
+def _equilibrium_device_programs(mesh_xy, width, dial_key, room=None, eigh_backend='auto'):
+    """Cache shape-specialized native metric/Ritz programs, never current data."""
+    import jax.numpy as jnp
+    import distrib_la
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from .shared_pole_execution import face_matmul
+    from .shared_pole_reduction import equilibrium_metric_stage, equilibrium_ritz_stage
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    rep = NamedSharding(mesh_xy, P())
+    mm = face_matmul(mesh_xy)
+    metric = jax.jit(lambda g,h,n,b: equilibrium_metric_stage(g,h,n,matmul=mm,space=b),
+        out_shardings=(face,rep,rep))
+    eig = distrib_la.plan('eigh',mesh_xy,n=width,backend=eigh_backend,budget_bytes=room)
+    ritz = distrib_la.checked_program(lambda g,h,n,z,a: equilibrium_ritz_stage(g,h,n,z,a,
+        matmul=mm,eigh=eig.batched),mesh_xy,out_shardings=(rep,face,rep,rep,rep))
+    scale_columns = jax.jit(lambda a,w:a*w, out_shardings=face)
+    return metric,ritz,scale_columns
+
+
+def reduce_equilibrium_pencil_device(G, H, output_gram, *, mesh_xy, max_order,
+                                    rank_tolerance, gamma_ry, fixed_spaces=None,
+                                    multiplet_tolerance=1e-6, capacity=None,eigh_backend='auto'):
+    """Native face reduction of the equilibrium same-state value pencil.
+
+    G/H/output_gram are complex128 [1,R,R] faces, in original coordinates.
+    A positive diagonal congruence and Hermitian metric cut cap amplification
+    using the source rank tolerance. Removing weak positive metric modes is
+    an explicit approximation, admitted only by the caller's original full-W
+    train/held checks; full complex Sigma refinement is separately required.
+    Only spectra/scalar diagnostics reach host. Maps and held spaces remain
+    native [1,R,Kcarrier] faces, with exact-zero carrier columns.
+    """
+    import math
+    import numpy as np
+    import jax.numpy as jnp
+    import distrib_la
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import gather_to_host, device_put_process_local
+    from common.rank_criterion import select_rank
+    from common.spectral_closure import resolve_spectral_cut
+    from common.staged_reshard import permute_sharded_axis
+    from .shared_pole_execution import face_matmul
+    started = time.monotonic()
+    if (G.ndim != 3 or G.shape[0] != 1 or G.shape[-2] != G.shape[-1]
+            or H.shape != G.shape or output_gram.shape != G.shape
+            or not 0 < float(rank_tolerance) < 1 or not np.isfinite(gamma_ry)
+            or gamma_ry < 0 or int(max_order) < 1):
+        raise ValueError('GATE shared_equilibrium_pencil: one square native G/H/output Gram required')
+    face = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+    rep = NamedSharding(mesh_xy, P())
+    mm = face_matmul(mesh_xy)
+    side = G.shape[-1]
+    rounding = 128*side*np.finfo(float).eps
+    room=None
+    if capacity is not None:
+        from lxkit import memory
+        ambient=capacity.preview(resident_bytes_per_rank=0,workspace_bytes_per_rank=0,
+            concurrent_with=tuple(capacity.live_stages))
+        room=memory.bucket(max(0,ambient['available_device_bytes_per_rank']-
+                              ambient['aggregate_bytes_per_rank']))
+    base = None if fixed_spaces is None else fixed_spaces['right']
+    if base is not None and (base.ndim != 3 or base.shape[:2] != (1, side)
+                             or fixed_spaces['left'] is not base):
+        raise ValueError('GATE shared_equilibrium_basis: one current native common space required')
+    def admit(program, operands, phase, vendor=0):
+        if capacity is None:
+            return
+        executable=program.lower(*operands).compile()
+        analysis=executable.memory_analysis()
+        workspace=max(0,int(analysis.temp_size_in_bytes)+int(analysis.output_size_in_bytes)
+                      -int(analysis.alias_size_in_bytes))
+        capacity.reserve(f'equilibrium_device_{phase}.{len(capacity.entries)}',
+            resident_bytes_per_rank=0,workspace_bytes_per_rank=workspace+int(vendor),
+            concurrent_with=tuple(capacity.live_stages))
+    metric_stage,_,scale_columns = _equilibrium_device_programs(
+        mesh_xy,side,distrib_la.dial_key(),room,eigh_backend)
+    admit(metric_stage,(G,H,output_gram,base),'metric')
+    metric, scale, initial = metric_stage(G,H,output_gram,base)
+    initial = {k:np.asarray(gather_to_host(v)).item() for k,v in initial.items()}
+    if not initial['input_finite'] or max(initial['G_hermiticity'],initial['H_hermiticity']) > rounding:
+        raise ValueError('GATE shared_equilibrium_hermiticity: finite current Hermitian G/H required')
+    if not np.isfinite(initial['output_norm']) or initial['output_hermiticity']>rounding:
+        raise ValueError('GATE shared_equilibrium_output: finite Hermitian output Gram required')
+    eig = distrib_la.plan('eigh', mesh_xy, n=metric.shape[-1],backend=eigh_backend,budget_bytes=room)
+    spectrum, vectors = eig.batched(metric, cut=float(rank_tolerance) if base is None else rounding)
+    spectrum = np.asarray(gather_to_host(spectrum))[0]
+    largest = float(np.max(abs(spectrum), initial=0.))
+    if not np.isfinite(spectrum).all() or largest == 0 or spectrum[0] < -rounding*largest:
+        raise ValueError('GATE shared_equilibrium_metric: unresolved or negative H; no PSD repair')
+    closure = None
+    if base is None:
+        cut = max(float(rank_tolerance), rounding)
+        rank = select_rank(spectrum, cut, ceiling=side)
+        rank, closure = resolve_spectral_cut(np.maximum(spectrum,0), rank,
+            rtol=float(multiplet_tolerance), where='shared equilibrium device metric', rcond=cut)
+    else:
+        # A held numerical span is fixed within the inner solve. Refactor
+        # its CURRENT H; never reuse old whitening or silently cut it again.
+        norms = np.asarray(gather_to_host(jnp.sum(abs(base)**2, axis=-2)))[0]
+        rank = int(np.count_nonzero(norms))
+        if np.count_nonzero(spectrum > rounding*largest) != rank:
+            raise ValueError('GATE shared_equilibrium_basis: current held H unresolved; no held rank drop')
+        cut = rounding
+    if not 0 < rank <= int(max_order):
+        raise ValueError('GATE shared_equilibrium_order: resolved rank empty or exceeds physical pole budget')
+    width = math.ceil(rank/int(mesh_xy.shape['y']))*int(mesh_xy.shape['y'])
+    indices = np.r_[np.arange(len(spectrum)-rank,len(spectrum)),
+                    np.repeat(len(spectrum)-1,width-rank)].astype(np.int32)
+    selected = permute_sharded_axis(vectors, 2, indices, mesh_xy, face.spec)
+    weights = np.r_[1/np.sqrt(spectrum[-rank:]), np.zeros(width-rank)]
+    weights = device_put_process_local(weights[None,None], rep)
+    selected = scale_columns(selected,weights)
+    space = scale_columns(selected,scale[:,:,None]) if base is None else mm(base,selected)
+    active = device_put_process_local((np.arange(width)<rank)[None],rep)
+    _,ritz,_ = _equilibrium_device_programs(mesh_xy,width,distrib_la.dial_key(),room,eigh_backend)
+    vendor=0
+    if capacity is not None:
+        ritz_plan=distrib_la.plan('eigh',mesh_xy,n=width,backend=eigh_backend,budget_bytes=room)
+        vendor=distrib_la.workspace_bytes_per_rank(ritz_plan,'eigh',((1,width,width),),np.complex128)
+    admit(ritz,(G,H,output_gram,space,active),'ritz',vendor)
+    mu, maps, physical, output_weight, diagnostics = ritz(G,H,output_gram,space,active)
+    diagnostics = {k:np.asarray(gather_to_host(v)).reshape(-1)[0].item()
+                   for k,v in diagnostics.items()}
+    if (not diagnostics['eigen_finite'] or not diagnostics['metric_ok']
+            or not np.isfinite(diagnostics['eigen_residual'])
+            or diagnostics['eigen_residual'] > 64*width*np.finfo(float).eps):
+        raise ValueError('GATE shared_equilibrium_eigenvectors: retained-space metric/backward check failed')
+    mu = np.asarray(gather_to_host(mu))[0]
+    physical = np.asarray(gather_to_host(physical))[0]
+    bound = rounding*float(np.max(abs(mu[physical]), initial=0.))
+    finite = physical & (abs(mu)>bound)
+    output_weight = np.asarray(gather_to_host(output_weight))[0]
+    output_scale=float(np.sum(abs(output_weight[physical])))
+    if not np.isfinite(output_weight).all() or np.any(output_weight < -rounding*output_scale):
+        raise ValueError('GATE shared_equilibrium_output: nonfinite or negative output weight')
+    constant_weight=float(np.sum(abs(output_weight[physical & ~finite])))
+    if constant_weight > (rank_tolerance**2+rounding)*output_scale:
+        raise ValueError('GATE shared_equilibrium_infinite: live unresolved mu gives constant feedthrough')
+    positions = np.flatnonzero(finite)
+    positions = positions[np.argsort(1/mu[positions], kind='stable')]
+    poles = 1/mu[positions]-1j*float(gamma_ry)
+    count = len(poles)
+    if count == 0:
+        raise ValueError('GATE shared_equilibrium_infinite: no finite pole remains')
+    out_width = math.ceil(count/int(mesh_xy.shape['y']))*int(mesh_xy.shape['y'])
+    selection = np.r_[positions, np.repeat(positions[0],out_width-count)].astype(np.int32)
+    modal = permute_sharded_axis(maps, 2, selection, mesh_xy, face.spec)
+    normalization = np.r_[1/np.sqrt(abs(mu[positions])),np.zeros(out_width-count)]
+    output_map = scale_columns(modal,device_put_process_local(normalization[None,None],rep))
+    signs = np.r_[np.sign(mu[positions]),np.zeros(out_width-count)]
+    input_map = scale_columns(output_map,device_put_process_local(signs[None,None],rep))
+    receipt = dict(order=count,held_state_rank=rank,construction='equilibrium-definite-value',
+        metric_solver=EQUILIBRIUM_DEVICE_SOLVER,numerical_spaces='original-coordinate-native-common-span',
+        rank_tolerance=float(rank_tolerance),relative_metric_cut=cut,
+        H_min_eigenvalue=float(spectrum[0]),H_max_eigenvalue=largest,
+        H_condition=largest/float(spectrum[-rank]),original_order=side,
+        zero_mu_output_weight=constant_weight,projected_output_weight=output_scale,
+        discarded_metric_directions=side-rank if base is None else 0,
+        approximation='positive metric quotient; all original full-W targets remain mandatory',
+        physical_accuracy_certified=False,sigma_accuracy_certified=False,
+        approximation_requires_full_W_validation=True,
+        required_validation='original full-W train/held and full complex column-Sigma/collision refinement',
+        spectral_closure=closure,spectral_variable='z+i_gamma',gamma_ry=float(gamma_ry),
+        host_frequency_matrix_bytes=0,host_reduce_seconds=0.,
+        device_reduce_seconds=time.monotonic()-started,**initial,**diagnostics)
+    held_space=space if base is None else base
+    return dict(poles_ry=poles,output_map=output_map,input_map=input_map,
+        spaces=dict(right=held_space,left=held_space),receipt=receipt)
 
 
 def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
