@@ -64,6 +64,7 @@ def lifecycle(monkeypatch, *, bad_rounds=1, final_error=0., admission='PASS',
         return norms,panels
     def sample(physical,sites,*,evaluate_dyson=True,**kwargs):
         assert physical is current['sample_current']
+        assert physical['dyson'] is current['dyson']
         events.append(('sample',))
         sites=np.asarray(sites,complex);sampled.append((sites.copy(),evaluate_dyson))
         assert not np.any(sites==initial)
