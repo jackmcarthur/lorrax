@@ -626,9 +626,38 @@ frequency-only NPZ. No successful total-W runtime or speedup is claimed.
   synthesis first prices replicated pole columns, then may use whole-parent
   local execution, otherwise face panels (`mpa/sigma.py:956–1085`). Read the
   actual schedule receipt. Ordered general synthesis explicitly uses face
-  GEMM/distributed workspace (`2053–2081`), and the bounded general-pencil
-  reduction uses host SciPy (`shared_pole_constructor.py:191–330`). A local
-  flag does not change those paths. No unpriced route change is proposed.
+  GEMM/distributed workspace (`2053–2081`). The former bounded host-SciPy
+  general-pencil reduction has now been replaced by the native routes
+  measured below; a local flag did not itself change that path.
+
+### Native pencil reduction: bounded CUDA verification
+
+Source `d4be4cb`, job `60077288`, passed the native P4 equilibrium and general
+complex-transfer checks, including current held spaces, a nonnormal matrix,
+carrier padding and preservation of a genuinely growing pole. Maximum
+relative transfer defects were `2.18055e-15` (equilibrium) and `1.92237e-15`
+(general). The explicit right-only cuSOLVER provider and its actual
+device/host workspace query executed successfully. Its vendor eigensolver
+is internally hybrid CPU/GPU; there is no Python/SciPy host-LAPACK fallback.
+
+The saved **2084×2084 equilibrium q0 frequency pencil** reduced in **2.5486 s
+cold / 0.31051 s warm**, retaining 627 directions at the source `1e-8` relative
+metric tolerance. These are **one-parent reduction times**, not a full W
+construction or all-parent speedup against the old 178 s phase. The replay
+loaded its declared frequency-only input from disk; the production reducer
+itself gathered zero frequency matrices to host. Its retained-space solve
+passed, but the replay contains no original full-port W or Sigma targets:
+**material accuracy, including the requested 1 meV full-complex Sigma check,
+remains unqualified**. Original current full-W checks stay mandatory.
+
+The complete software body took 19.614 s; the allocation lasted 46 s and was
+released. Including the preceding receipt-publication failure `60077059`
+(an infinite spectral-gap reporting marker, not a failed numerical
+assertion), the two short allocations cost **0.12667 reserved GPU-h**.
+All 45 focused CPU checks passed with x64 enabled (one skipped), and all nine
+release checks passed. This is not a full hsuite pass, a conservation or
+Pauli verdict, or a 10 fs damping comparison. See the
+[native proof and exact evidence hashes](evidence/DEVICE_PENCIL_P4_60077288.json).
 
 ## Software validation is not material BSE validation
 

@@ -1,0 +1,65 @@
+{
+  "schema": "native_device_pencil_p4_v1",
+  "status": "PASS_SOFTWARE_ONLY_NOT_MATERIAL",
+  "source_revision": "d4be4cb",
+  "source_archive_sha256": "5b4faf33a3691c2e206558dd44914efa7f11e44c9eaf2e6546534fd6adb1a0e2",
+  "job": 60077288,
+  "job_state": "COMPLETED",
+  "gpu_count": 4,
+  "mesh": [2, 2],
+  "software_body_seconds": 19.613749993004603,
+  "tiny_equilibrium_complex_transfer_relative_error": 2.1805505800872064e-15,
+  "tiny_general_complex_transfer_relative_error": 1.9223670105199046e-15,
+  "current_held_spaces_verified": true,
+  "genuine_growing_pole_preserved": true,
+  "general_eig_backend": "explicit_cusolver_right_only",
+  "provider_workspace_query": {
+    "order": 4,
+    "provider": "cusolverDnXgeev",
+    "device_bytes": 529920,
+    "host_bytes": 2048,
+    "vendor_algorithm": "hybrid CPU-GPU; no Python/SciPy host-LAPACK fallback"
+  },
+  "frequency_only_material_replay": {
+    "input_sha256": "3072e386cf8f49e1db6cd0f69b9aec30fb3b3809ddff8c70e319103827947184",
+    "original_order": 2084,
+    "retained_order": 627,
+    "rank_tolerance": 1e-8,
+    "gamma_ry": 0.0036749308824745378,
+    "cold_seconds": 2.548604344992782,
+    "warm_seconds": 0.3105134770012228,
+    "equilibrated_retained_H_condition": 99039522.90796116,
+    "retained_space_eigen_backward_error": 1.798955816047006e-15,
+    "production_host_frequency_matrix_gather_bytes": 0,
+    "scope": "One saved equilibrium q0 pencil, loaded explicitly for replay. No original full-port W/Sigma targets; not all-parent or full-screening timing."
+  },
+  "qualification": {
+    "material_full_W_accuracy_certified": false,
+    "material_full_complex_Sigma_meV_accuracy_certified": false,
+    "driven_trajectory_or_damping_certified": false,
+    "number_or_Pauli_closure_certified": false,
+    "hsuite_full_pass": false
+  },
+  "local_checks": {
+    "focused_tests_passed": 45,
+    "focused_tests_skipped": 1,
+    "x64_enabled": true,
+    "release_checks": "all nine passed on d4be4cb"
+  },
+  "accounting": {
+    "allocation_seconds": 46,
+    "numeric_step_seconds": 34,
+    "reserved_GPUh": 0.051111111111111114,
+    "active_numeric_step_GPUh": 0.03777777777777778,
+    "prior_reporting_failure_job": 60077059,
+    "prior_reporting_failure_reserved_GPUh": 0.07555555555555556,
+    "combined_reserved_GPUh": 0.12666666666666668,
+    "views": "Nonadditive: active numeric lifetime is contained in reserved allocation time.",
+    "allocation_released": true
+  },
+  "evidence": {
+    "raw_receipt": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/device_pencil_general_60077288.receipt.json",
+    "raw_receipt_sha256": "ef09d1dad83449762b1e7715e176c61c7eeae25b3d11abb387d158b54dbb3edd",
+    "remote_root": "/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/qgrid_20261020/device_pencil_general_60077288"
+  }
+}
