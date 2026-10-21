@@ -297,7 +297,9 @@ def _preview_lanczos(
             dipoles = None
             dipole_attrs = None
             if dipole_file is not None:
-                # ⟨0|r̂_α|S⟩ per written state: the window dipoles Haydock seeds
+                # ⟨0|r̂_α|S⟩ per root (every root, for eigenvalues_b*.dat and
+                # the brightest in RESULTS; eigenvectors.h5 keeps the written
+                # states'): the window dipoles Haydock seeds
                 # from (``absorption_common.window_dipoles``: the dipole.h5 slice
                 # at the n_occ the loader and ``--eqp`` settled on, a bse_k_grid
                 # bundle's own, or a --qp-rotations bundle's QP-basis dipoles),
@@ -315,16 +317,16 @@ def _preview_lanczos(
                     dipoles = exciton_dipoles_distributed(
                         eigenvectors, build_dipole_vector_bse(
                             d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
-                        n_write)
-                stage_row("dipoles", f"<0|r|S> for {int(n_write)} states from "
-                                     f"{os.path.basename(str(dipole_file))}")
+                        int(n_eig))
+                stage_row("dipoles", f"<0|r|S> for {int(dipoles.shape[0])} states "
+                                     f"from {os.path.basename(str(dipole_file))}")
                 if helicity_table and report is not None:
                     # Report-only: the per-state σ± strengths of the dipoles just
                     # stored, under the one convention ``inplane_helicity`` owns.
                     # Printed in RESULTS.
                     from .absorption_common import helicity_table_lines
                     helicity_lines = tuple(helicity_table_lines(
-                        eigenvalues_host[:n_write] * ryd2ev, dipoles, nk))
+                        eigenvalues_host[:dipoles.shape[0]] * ryd2ev, dipoles, nk))
             with timing.section("bse.write_eigenvectors", announce=True):
                 write_eigenvectors_stream(
                     "eigenvectors.h5",
@@ -337,7 +339,7 @@ def _preview_lanczos(
                     nkz,
                     n_write,
                     use_tda=tda,
-                    dipoles=dipoles,
+                    dipoles=None if dipoles is None else dipoles[:n_write],
                     qp_rotations_file=(None if qp_rotation is None
                                        else qp_rotation["path"]),
                     dipole_attrs=dipole_attrs,
@@ -345,6 +347,9 @@ def _preview_lanczos(
             _out.result(f"eigenvectors.h5: {int(n_write)} states"
                         + (" with <0|r|S>" if dipoles is not None else ""))
 
+    # Every root, in BerkeleyGW's own files (with its dipoles when computed).
+    energies_ev = eigenvalues_host[:n_eig] * ryd2ev
+    roots_files = _write_all_roots(input_file, energies_ev, dipoles, nk)
     if haydock is not None:
         # ε₂(ω) by the Haydock recursion on THIS payload: the loaded bundle,
         # the eigensolve's W_R (keep_W_R) and the same matvec, so the second
@@ -382,19 +387,24 @@ def _preview_lanczos(
                         f"{haydock['eta_ev']:.4f} eV")
 
     if report is not None:
-        # RESULTS: the exciton table (the harness reads its S rows on the
-        # rank-0 stdout), the window's lowest direct transition and the
-        # binding of S1 against it, the oscillator strengths when computed.
+        # RESULTS: the exciton table, the window's lowest direct transition
+        # and the binding of S1 against it, the oscillator strengths when
+        # computed.  The harness reads every S row on the rank-0 stdout, so
+        # stdout keeps the untrimmed table; the main log lists at most 20.
         gap = _window_gap(data, n_val_eff, n_cond_eff)
         kind = "QP" if (eqp_file is not None or qp_rotation is not None) else "DFT"
-        report.emit_lines(bse_results_lines(
-            eigenvalues_host[:n_eig] * ryd2ev,
-            gap=None if gap is None else (gap[0] * ryd2ev, gap[1], kind),
-            dipoles=dipoles, n_k=nk, helicity=helicity_lines,
-            eigenvectors=(None if write_eigs is None else
-                          f"eigenvectors.h5, {int(n_write)} states"
-                          + (" with <0|r|S>" if dipoles is not None else "")),
-            extra_rows=(() if stopped is None else (("eigensolve", stopped),))))
+
+        def results(trim):
+            return bse_results_lines(
+                energies_ev,
+                gap=None if gap is None else (gap[0] * ryd2ev, gap[1], kind),
+                dipoles=dipoles, n_k=nk, helicity=helicity_lines,
+                eigenvectors=(None if write_eigs is None else
+                              f"eigenvectors.h5, {int(n_write)} states"
+                              + (" with <0|r|S>" if dipoles is not None else "")),
+                roots_file=_files_text(roots_files), trim=trim,
+                extra_rows=(() if stopped is None else (("eigensolve", stopped),)))
+        _emit_results(report, results(True), results(False))
 
     return {
         "n_val": int(n_val_eff),
@@ -405,6 +415,7 @@ def _preview_lanczos(
         "eigenvector_file": "eigenvectors.h5" if write_eigs is not None else None,
         "haydock_file": (None if haydock is None
                          else f"{haydock['out_prefix']}.h5"),
+        "roots_files": tuple(roots_files),
     }
 
 
@@ -436,6 +447,50 @@ def _davidson_report(*, n_eig, tol_mev, budget, dim):
             "eigenvector, spectrum or Haydock output was written.  Fix: raise "
             "--max-lanczos-iter or --davidson-m-max, or loosen --davidson-tol-mev")
     return line
+
+
+def _files_text(paths) -> str:
+    """``eigenvalues.dat`` or ``eigenvalues_b1.dat .. _b3.dat``."""
+    names = [os.path.basename(str(p)) for p in paths]
+    return names[0] if len(names) == 1 else f"{names[0]} .. {names[-1]}"
+
+
+def _write_all_roots(input_file, energies_ev, dipoles, nk: int) -> list[str]:
+    """Every root to BerkeleyGW's ``eigenvalues.dat`` (energies) or, with
+    dipoles, its three-polarization ``eigenvalues_b1.dat`` .. ``_b3.dat``
+    (``absorption_common.write_bgw_eigenvalues``), rank 0 writing.  The
+    header's ``vol`` is ``N_k`` times the deck WFN's cell volume and its
+    ``nspin, nspinor`` that WFN's.  Returns the paths (on every rank)."""
+    if jax.process_index() == 0:
+        import h5py
+        from .absorption_common import write_bgw_eigenvalues
+        from .bse_window import _parse_wfn_path
+        with h5py.File(_parse_wfn_path(input_file), "r") as f:
+            celvol = float(f["mf_header/crystal/celvol"][()])
+            n_spin = int(f["mf_header/kpoints/nspin"][()])
+            n_spinor = int(f["mf_header/kpoints/nspinor"][()])
+        return write_bgw_eigenvalues(".", energies_ev, dipoles, n_spin=n_spin,
+                                     n_spinor=n_spinor,
+                                     vol_supercell=float(nk) * celvol)
+    return (["eigenvalues.dat"] if dipoles is None else
+            [f"eigenvalues_{s}.dat" for s in ("b1", "b2", "b3")])
+
+
+def _emit_results(report, log_lines, stdout_lines) -> None:
+    """RESULTS: ``log_lines`` to the main log, ``stdout_lines`` to the live
+    stdout (one block when they agree, as they do up to 20 roots)."""
+    if list(log_lines) == list(stdout_lines):
+        report.emit_lines(log_lines)
+        return
+    stdout = report.stdout
+    report.stdout = lambda _line: None
+    try:
+        report.emit_lines(log_lines)
+    finally:
+        report.stdout = stdout
+    if report.rank == 0:
+        for line in stdout_lines:
+            stdout(line)
 
 
 
@@ -874,6 +929,21 @@ def _haydock_settings(args) -> dict | None:
             "out_prefix": str(args.haydock_out_prefix)}
 
 
+def _file_rows(result, wfn_path, args):
+    """The OUTPUT FILES rows: what the run read and wrote."""
+    rows = [("GW/BSE restart", "read", result["restart_file"]),
+            ("wavefunctions", "read", wfn_path)]
+    rows += [(label, "written", path) for label, path in (
+        ("exciton eigenvectors", result["eigenvector_file"]),
+        ("Haydock absorption", result["haydock_file"])) if path]
+    rows += [("exciton energies, all roots", "written", path)
+             for path in result["roots_files"]]
+    rows += [(label, "read", path) for label, path in (
+        ("QP corrections", args.eqp), ("QP rotations", args.qp_rotations)) if path]
+    rows.append(("input deck", "read", args.input))
+    return rows
+
+
 def main(argv=None) -> int:
     route, args = parse_args(argv)
 
@@ -980,18 +1050,7 @@ def main(argv=None) -> int:
         )
 
         wfn.close()
-        file_rows = [
-            ("GW/BSE restart", "read", result["restart_file"]),
-            ("wavefunctions", "read", wfn_path),
-        ]
-        file_rows += [(label, "written", path) for label, path in (
-            ("exciton eigenvectors", result["eigenvector_file"]),
-            ("Haydock absorption", result["haydock_file"])) if path]
-        file_rows += [(label, "read", path) for label, path in (
-            ("QP corrections", args.eqp), ("QP rotations", args.qp_rotations))
-            if path]
-        file_rows.append(("input deck", "read", args.input))
-        run.complete(files=file_rows)
+        run.complete(files=_file_rows(result, wfn_path, args))
     return 0
 
 

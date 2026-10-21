@@ -424,7 +424,8 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
     # The deck's resolved keys, with the deck-resolution notes the parse printed.
     report.settings_block(
         config=config, n_mu=n_rmu, n_q_irr=int(sym.nk_red),
-        processes=RUNTIME.process_count, resolved=_config_provenance)
+        processes=RUNTIME.process_count, resolved=_config_provenance,
+        tensors_file=tensors_filename)
     # The QP request (number_bands_protected) resolves against the WFN here.
     config = config.with_band_request(wfn, print0)
     return (config, wfn, material_class, sym, centroid_basis, centroid_indices, n_rmu, tmp_dir, tensors_filename)
@@ -454,7 +455,9 @@ def _report_sampling_and_bands(
         nspinor=meta.nspinor)
     _zeta_ranges = zeta_fit_band_ranges(
         band_slices, zeta_fit_edge, log=lambda *args, **kwargs: None)
-    report.input_files(config=config, wfn=wfn, sym=sym, centroids=centroid_basis)
+    report.input_files(config=config, wfn=wfn, sym=sym, centroids=centroid_basis,
+                       zeta_ranges=_zeta_ranges, band_slices=band_slices,
+                       material_class=material_class)
     report.sampling(wfn=wfn, sym=sym, centroids=centroid_basis,
                     consequence=report.trs_consequence(
                         config=config, sym=sym, material_class=material_class))
@@ -466,12 +469,19 @@ def _report_sampling_and_bands(
 
 def _prepare_isdf_carriers(
         band_slices, bgw_v_grid_fn, centroid_indices, config, material_class, mesh_xy, meta,
-        mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn, enk_dft):
+        mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn, enk_dft, *,
+        centroid_basis=None):
     """Produce the fitted ISDF operators and wavefunction views."""
     from .shared_pole_screening import compile_w_model_ahead
     compile_w_model_ahead(config, meta, sym, mesh_xy)
     with _manual_stage(1, _stage_count(qp_solver), "ISDF basis and Coulomb metric",
                        name="gw_jax.isdf") as _stage:
+        _n_sites = int(np.asarray(centroid_indices).shape[0])
+        _n_ops = int(np.asarray(sym.Rinv_grid).shape[0])
+        _closed = bool(getattr(centroid_basis, "orbit_closed", True))
+        log_stage_row("centroids", f"{_n_sites}, " + (
+            f"orbit-closed under the {_n_ops} operations" if _closed else
+            "not orbit-closed: the run uses the unreduced parents"), stage="isdf")
         isdf = prepare_isdf_and_wavefunctions(
             cfg=config,
             wfn=wfn,
@@ -490,9 +500,12 @@ def _prepare_isdf_carriers(
         _n_q, _n_mu = (int(v) for v in _v_shape[:2])
         log_stage_row("V(q)", v_q_detail(
             n_q=_n_q, n_mu=_n_mu,
-            seconds=sum(float(r["inclusive"]) for r in timing.records()
-                        if str(r["name"]).startswith("gw_jax.V_q_compute")) or None,
             restart_file=tensors_filename if config.restart else None), stage="isdf")
+        if not config.restart and bool(getattr(config, "write_restart_tensors", False)):
+            # The one file this stage's results go to (written after W).
+            log_stage_row("file written", os.path.join(
+                "tmp", os.path.basename(tensors_filename)) + " (after W, for bse)",
+                stage="isdf")
         _stage.result(f"zeta and V(q) {'read for' if config.restart else 'on'} "
                       f"{_n_mu} centroids, {_n_q} q")
     V_qmunu = isdf.V_qmunu
@@ -817,11 +830,14 @@ def _log_screening_rows(W_by_role, V_q, config, mode, sym):
 
 def _screening_result(W_by_role, V_q, config, mode):
 	"""The Screening stage's ``=>`` line."""
-	roles = [role for role, _ in _screening_roles(W_by_role, config, mode)]
+	roles = _screening_roles(W_by_role, config, mode)
 	if not roles:
 		return ("no screened W (bare exchange)" if not mode.needs_screening
 		        else "screened response built")
-	return f"W on {_n_q_of(V_q)} q: " + " and ".join(roles)
+	names = ["W(0)" if str(role) == "static" else
+	         ("W(i omega_p)" if omega is None or complex(omega).real == 0.0 else "W(omega_p)")
+	         if str(role) == "probe" else str(role) for role, omega in roles]
+	return f"W on {_n_q_of(V_q)} q: " + " and ".join(names)
 
 
 def _install_oneshot_head(
@@ -1790,8 +1806,9 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    V_qmunu, bispinor_v_q_path, green_parent_carrier, isdf, oneshot_occupation_state, wfns,
 	    wfns_screening, wfns_sigma, wfns_transverse) = _prepare_isdf_carriers(
 	    band_slices, bgw_v_grid_fn, centroid_indices, config, material_class, mesh_xy, meta,
-	    mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn, enk_dft)
-	V_q = V_qmunu               # flat-q (nq, μ, μ) — compute and restart alike
+	    mode, print0, qp_solver, sym, tensors_filename, tmp_dir, wfn, enk_dft,
+	    centroid_basis=centroid_basis)
+	V_q = V_qmunu              # flat-q (nq, μ, μ) — compute and restart alike
 	# Stages 2-4 of the main log (one-shot: Screening, Self-energy, QP bands;
 	# QSGW: its driver, QP bands), each opened by the helper that starts it.
 	with _GWStages(qp_solver) as stages:

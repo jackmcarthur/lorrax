@@ -14,11 +14,14 @@ MANUAL STAGES (the ``[i/N]`` banners of a driver's main log)::
 
 prints, in the main log and on the rank stream::
 
+    ==========================================================================
     [1/4] ISDF basis and Coulomb metric                                    14:44:29
+    ==========================================================================
           zeta plan      route G, 1 batch of 6 centroids
           => zeta and V(q) on 6 centroids, 9 q                        2.4 s · 0.13 GB
 
-(the clock and the ``wall · peak`` end at column 100).  The manual stage IS a
+(a blank line above the first rule; the rules are 100 columns, and the clock
+and the ``wall · peak`` end at column 100).  The manual stage IS a
 :func:`section`: ``name`` (default ``title``) is its TIMING-tree node, so pass
 the name of the top-level section it replaces and the TIMING table keeps its
 rows.  ``announce=True`` (default) gives it the 60 s heartbeat, a row under
@@ -849,6 +852,8 @@ class ManualStage:
 #: stage's rows (``report_blocks.DETAIL_INDENT``).
 STAGE_WIDTH = 100
 STAGE_INDENT = 6
+#: The rule above and below a manual stage's banner.
+STAGE_RULE = "=" * STAGE_WIDTH
 
 
 def fmt_wall(seconds: float) -> str:
@@ -937,8 +942,13 @@ def manual_stage(index: int, total: int, title: str, *, name: str | None = None,
 		banner = stage_banner(index, total, title, time.strftime("%H:%M:%S"))
 	except Exception:          # noqa: BLE001 - output never fails a run
 		banner = f"[{index}/{total}] {title}"
+	# The banner between two ``=`` rules, a blank line above (the main log's
+	# layout grid, ``report_blocks``).
+	_say_stage("")
+	_say_stage(STAGE_RULE)
 	_say_stage(banner, stage_index=stage.index, stage_total=stage.total,
 	           stage_title=stage.title)
+	_say_stage(STAGE_RULE)
 	sec = _GLOBAL_COLLECTOR.section(name or str(title), announce=announce,
 	                                label=str(title), manual=True)
 	_OPEN_MANUAL.append(stage)

@@ -45,6 +45,7 @@ from common.collectives import all_gather_processes, barrier
 from common.log import get_logger, message
 from file_io import CrystalData, WFNReader, WFNWriter
 from psp.pseudos import load_pseudopotentials
+from psp.operator_checks import validate_nscf_inputs
 from psp.h_dft import setup_H_k_from_kvec, make_apply_H
 from psp.dft_precond import make_dft_preconditioner, make_pw_init
 from psp.gvec_utils import (
@@ -619,6 +620,12 @@ def main():
 
     crystal = CrystalData.from_qe_save(save_dir)
     pseudos = load_pseudopotentials(args.pseudo_dir or save_dir)
+    # Every QE run the psp operators cannot rebuild refuses here, before any
+    # work: non-PBE, hybrid/vdW/+U, USPP/PAW, a missing UPF, magnetism,
+    # metals, nspin 2 (GATE nscf_<rule>, each with its fix).
+    validate_nscf_inputs(crystal, pseudos,
+                         pseudo_dir=args.pseudo_dir or save_dir,
+                         charge_density_fields=crystal.charge_density_fields())
 
     kpoints_override = weights_override = None
     if args.ref_wfn:

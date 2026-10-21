@@ -186,7 +186,7 @@ with `head_correction`, and a deck that names the key refuses at parse.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `qp_solver` | str | `auto` | `one_shot_dft` (the `auto` default): one full-matrix effective Hamiltonian with Σ evaluated at E_DFT under QSGW Hermitian symmetrization. `self_consistent`: the QSGW loop, which reads Σ at each map's own energies, diagonalizes H and writes one energy table and one Z table per map ([self-consistency](self_consistency.md)). No QP equation E = h₀ + ReΣ(E) is solved on either route. `fixed_point` is retired (2026-09-29) and refuses by name. |
+| `qp_solver` | str | `auto` | `one_shot_dft` (the `auto` default): one full-matrix effective Hamiltonian with Σ evaluated at E_DFT under QSGW Hermitian symmetrization. `self_consistent`: the QSGW loop, which reads Σ at each map's own energies, diagonalizes H and writes one energy table and one Z table per map ([self-consistency](self_consistency.md)). No QP equation E = h₀ + ReΣ(E) is solved on either route. `fixed_point` is retired (2026-09-29) and refuses by name. `self_consistent` is never a default: `auto` resolves to it only when the deck names the deprecated `self_consistent = true`. |
 | `sc_max_iter` | int | `30` | SC map cap, ≥ 1. Reaching it without meeting `sc_tol_ev` refuses (`GATE sc_fixed_point_not_converged`) and keeps the per-map tables. `1` runs a labelled one-map diagnostic. |
 | `sc_tol_ev` | float | `1e-4` | SC convergence tolerance (eV), > 0. |
 | `sc_accelerator` | str | `anderson` | `anderson` is the only value: one-evaluation Anderson type II with history `sc_history_depth`. Any other value refuses (`GATE sc_accelerator_anderson_only`); the fix is to delete the key. |
@@ -249,6 +249,20 @@ whose provenance matches (WFN fingerprint, centroid SHA-256, band window, grids,
 spinor mode, node version) is reused. A file with other provenance is left
 unchanged and the basis is refit in memory. With no file, the basis is fitted
 and published there. The log prints `REUSED`, `REFIT` or `FITTED and published`.
+
+htransform writes its path energies relative to the VBM. On a metal (fractional
+WFN occupations) the zero is the DFT E_F, QE's `fermi_energy` from the schema
+that authenticates the WFN; E_F is never refilled or re-found on the path, and
+the log says "relative to E_F (DFT)". A metal whose schema is not found refuses
+(`GATE htransform_metal_fermi_level`).
+
+`bse_jax` writes every root in BerkeleyGW's layout (`BSE/absp_io.f90`
+`write_eigenvalues`): `eigenvalues.dat` with the energies, or, with `--dipole`,
+`eigenvalues_b1.dat` to `_b3.dat`, one per Cartesian direction, each with the
+energy (eV), |D|², Re D and Im D of D = ⟨0|r|S⟩. With more than 20 roots the main
+log lists the first 16 and the 5 brightest; the rank-0 stdout lists every root.
+A `dipole.h5` that stops below the BSE window's top band refuses
+(`GATE dipole_bands_short`).
 
 ## Deprecated aliases
 

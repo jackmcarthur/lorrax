@@ -8,7 +8,7 @@ closing blocks are :class:`common.production_report.ProductionReport`'s.
 
 Every block here is ``key   value`` rows at the two-space indent
 (:func:`common.report_blocks.kv_lines`); implementation facts a user does not
-act on (reader backend, matrix layout, writer) go to the JSON sidecar under
+act on (reader backend, matrix layout, writer) are DEBUG receipts under
 ``environment``.  The RESULTS block is :func:`results_lines`, a pure function
 of its rows.  :class:`StageSequence` opens the ``[i/N]`` manual stages of a
 long driver body one after another (``common.timing.manual_stage``).
@@ -146,7 +146,7 @@ def parallel_transport_text(*, requested: bool, written: bool,
     """The dipole driver's parallel-transport outcome in one row value.
 
     ``lines`` are the validation block ``file_io.parallel_transport`` writes
-    (kept whole in the JSON sidecar); its verdict and the head's relative L2
+    (kept whole as a DEBUG receipt); its verdict and the head's relative L2
     are read back from the ``Covariant DFT velocity:`` line.  ``None`` when
     the run asked for no parallel-transport artifact.
     """
@@ -250,7 +250,7 @@ def stage_row(label: str | None, value) -> None:
 
 class CapturedBlock:
     """A ``report`` stand-in that keeps a component's ``heading``/``emit``
-    lines for the JSON sidecar instead of the main log."""
+    DEBUG receipts instead of main-log lines."""
 
     def __init__(self) -> None:
         self.lines: list[str] = []
@@ -270,7 +270,7 @@ class ScientificProductionReport(ProductionReport):
     """One rank-zero scientific stream for a LORRAX core driver."""
 
     def environment(self, *, wfn, lines: Iterable[str] = ()) -> None:
-        """Implementation facts (reader, layouts, writer): JSON sidecar only."""
+        """Implementation facts (reader, layouts, writer): DEBUG receipts only."""
         log.debug("numerical environment", extra=record(
             "environment",
             wavefunction_reader=str(getattr(wfn, "backend", "unknown")),

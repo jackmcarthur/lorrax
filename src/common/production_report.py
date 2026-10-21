@@ -13,8 +13,9 @@ and, when verbose (``--verbose``, the deck's ``verbose = true`` or
 ``LORRAX_DEBUG_PRINT=1``), DEBUG records as rows under the current stage
 (:meth:`ProductionReport.log_debug`).  Component text still handed to
 :meth:`ProductionReport.legacy_print` is a DEBUG record; only a line naming a
-warning becomes a message.  The JSON sidecar ``<report stem>.json`` is named
-in the header and, once a record has written it, in the files table.
+warning becomes a message.  No JSON sidecar is written: a receipt is a DEBUG
+record and prints, with its fields, when verbose.  ``memory`` block rows are
+held and printed once, as the MEMORY MODEL block after TIMING.
 """
 
 from __future__ import annotations
@@ -22,14 +23,13 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
-import socket
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
 from common import report_blocks as blocks
-from common.log import get_logger, record, session_sidecar, written_sidecar
+from common.log import get_logger, record, record_text
 from common.report_blocks import Message
 from common.scientific_output import (
     abs_path,
@@ -42,24 +42,6 @@ from common.scientific_output import (
 _LEGACY = get_logger("legacy")
 #: The report's own DEBUG lines and records (the density check, repeated messages).
 _LOG = get_logger("report")
-#: The files-table role of the JSON sidecar.
-SIDECAR_ROLE = "machine-readable record"
-
-
-def _command(argv: list[str]) -> tuple[str, ...]:
-    """The command as typed: ``python -m <module> <args>``.
-
-    A harness that runs ``main`` in process sets ``sys.argv[0]`` to the module
-    name; ``python -m`` sets it to the module's file, and ``sys.orig_argv``
-    keeps the interpreter flags and the module name.
-    """
-    head = argv[0] if argv else ""
-    if head and os.sep not in head and not head.endswith(".py"):
-        return ("python", "-m", *argv)
-    orig = list(getattr(sys, "orig_argv", ()) or ())
-    if "-m" in orig:
-        return ("python", *orig[1:])
-    return ("python", *argv)
 
 
 def _job() -> str | None:
@@ -226,15 +208,13 @@ class ProductionReport:
         self._printed: dict[tuple, list] = {}
         self._stage = "setup"
         self._warnings_emitted = False
+        # ``memory`` block rows, in order, for the MEMORY MODEL block.
+        self._memory_rows: list[tuple[str | None, str]] = []
+        self._memory_emitted = False
         self._stream = None
         if self.rank == 0:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
             self._stream = open(self.path, "w", encoding="utf-8", buffering=1)
-
-    @property
-    def sidecar_path(self) -> str:
-        """The JSON sidecar beside this log: ``<report stem>.json``."""
-        return os.path.splitext(self.path)[0] + ".json"
 
     # ── stream ───────────────────────────────────────────────────────────
     def close(self) -> None:
@@ -333,11 +313,14 @@ class ProductionReport:
         """The main-log handler's entry for a block-tagged INFO line.
 
         The ``progress`` and ``stage`` blocks are the log's cadence and print
-        verbatim (:meth:`progress`); any other block is a detail row under the
-        current stage (``report_blocks.stage_detail``).
+        verbatim (:meth:`progress`); a ``memory`` block row is held for the
+        MEMORY MODEL block (:meth:`memory_model`); any other block is a detail
+        row under the current stage (``report_blocks.stage_detail``).
         """
         if fields.get("block") in ("progress", "stage"):
             self.progress(text)
+        elif fields.get("block") == "memory":
+            self._memory_rows.append((fields.get("label"), str(text)))
         else:
             self.emit_lines(blocks.stage_detail(fields.get("label"), text))
 
@@ -345,11 +328,40 @@ class ProductionReport:
         """The main-log handler's entry for a DEBUG record, when verbose.
 
         A row at indent 6 under the current stage, one per line of the
-        message; a record's payload is in the JSON sidecar and is not
-        printed.  The stage the summary names does not change.
+        message, then a receipt's fields as one ``<key>: {...}`` row.  The
+        stage the summary names does not change.
         """
         if str(text).strip():
             self.emit_lines(blocks.stage_detail(None, text))
+        extra = record_text(fields)
+        if extra:
+            self.emit_lines(blocks.stage_detail(None, extra))
+
+    def memory_model(self) -> None:
+        """MEMORY MODEL, once: every ``memory`` row the run logged (plan
+        estimates, batch counts, resident arrays), in order; nothing when
+        none was logged."""
+        if self._memory_emitted or not self._memory_rows:
+            return
+        self._memory_emitted = True
+        self.heading("Memory model")
+        for label, value in self._memory_rows:
+            if label is None:
+                self.emit_lines("  " + line for line in str(value).splitlines())
+                continue
+            wrapped = blocks.wrap_value(value, first_col=blocks.LABEL + 2)
+            self.emit_lines(blocks.kv_lines([(label, wrapped[0])]) + wrapped[1:])
+
+    def memory_budget_check(self, peak_gb: float | None, where: str) -> None:
+        """WARNING at 90 % of the per-device memory budget (TIMING's device
+        peak against ``runtime.facts`` ``device_memory.budget``)."""
+        facts = getattr(self.runtime, "facts", None) or {}
+        budget = float((facts.get("device_memory") or {}).get("budget") or 0.0) / 1e9
+        if peak_gb is None or not budget:
+            return
+        warning = blocks.memory_budget_message(float(peak_gb), budget, where=where)
+        if warning is not None:
+            self.warn(warning, indent=2)
 
     def render_message(self, text: str, fields, levelno: int) -> list[str]:
         """The lines :meth:`log_message` prints, for another rank's own log."""
@@ -416,27 +428,24 @@ class ProductionReport:
             kept.append(message)
         return kept
 
-    def heading(self, title: str) -> None:
-        self.emit_lines(blocks.heading(title))
+    def heading(self, title: str, suffix: str = "") -> None:
+        self.emit_lines(blocks.heading(title, suffix))
 
     # ── shared blocks ────────────────────────────────────────────────────
     def begin(self, *, input_file: str | None = None) -> None:
-        """The title and the run's facts (``input_file`` is in the command).
+        """The title, ``Started`` and the run's facts (``input_file`` is
+        accepted and unused: the files table names the input).
 
         ``Version`` is the checkout's commit, when startup read it
         (``runtime.source_closure.checkout_version``); ``Logs`` names the
-        JSON sidecar when this run's session writes one; ``Verbose`` says
-        what turned verbose on, when it is on.
+        main log; ``Verbose`` says what turned verbose on, when it is on.
         """
         from runtime import verbose_source
         from runtime.source_closure import checkout_version
         logs = [blocks.display_path(self.path, self.directory)]
-        if session_sidecar() == self.sidecar_path:
-            logs.append(blocks.display_path(self.sidecar_path, self.directory))
         self.emit_lines(blocks.header_lines(blocks.RunFacts(
             driver=self.driver, purpose=self.purpose,
-            argv=_command(list(sys.argv)), directory=self.directory,
-            started=datetime.now().astimezone(), host=socket.gethostname(),
+            started=datetime.now().astimezone(),
             job=_job(), logs=tuple(logs), version=checkout_version())))
         source = verbose_source()
         if source is not None:
@@ -445,8 +454,10 @@ class ProductionReport:
                 indent=0))
 
     def devices(self, *, mesh_role: str | None = None,
-                extras: Iterable[tuple[str, str]] = ()) -> None:
-        """GPUs, mesh, memory, CPU and threads from the runtime facts."""
+                extras: Iterable[tuple[str, str]] = (),
+                kernels: Iterable[tuple[str, str]] = ()) -> None:
+        """DEVICES (GPUs, mesh, CPU and threads, the memory budget, JAX) from
+        the runtime facts, then MATH KERNELS when ``kernels`` names any."""
         facts = dict(self.runtime.facts)
         facts.setdefault("n_nodes", _node_count())
         self.heading("Devices")
@@ -456,11 +467,22 @@ class ProductionReport:
         warning = blocks.device_memory_message(memory) if memory.get("total") else None
         if warning is not None:                     # printed by devices_lines
             self.count(warning)
+        kernels = list(kernels)
+        if kernels:
+            self.heading("Math kernels")
+            self.emit_lines(blocks.math_kernel_lines(kernels))
 
     def settings(self, rows: Iterable[blocks.Setting]) -> None:
         """SETTINGS: key, value, source and a one-line effect per row."""
         self.heading("Settings")
         self.emit_lines(blocks.settings_lines(list(rows)))
+
+    def flags(self, rows: Iterable[tuple[str, str]]) -> None:
+        """INPUT FLAGS: a plain ``key value`` echo of what the input set."""
+        rows = list(rows)
+        if rows:
+            self.heading("Input flags")
+            self.emit_lines(blocks.flag_lines(rows))
 
     @staticmethod
     def flag_source(*flags: str, argv=None) -> str:
@@ -528,6 +550,9 @@ class ProductionReport:
             rows, wall=float(wall), budget_gb=budget or None,
             device_peak=(top.device_gb, top.label) if top is not None else None,
             host_peak=(max(hosts) / 1e9, max(hosts) / 1e9) if hosts else None))
+        if top is not None:
+            self.memory_budget_check(top.device_gb, top.label)
+        self.memory_model()
 
     def warnings(self) -> None:
         """The WARNINGS summary, once: one line per id."""
@@ -537,16 +562,10 @@ class ProductionReport:
         self.emit_lines(blocks.warnings_summary_lines(self.messages()))
 
     def files(self, rows: Iterable[tuple[str, str, str]]) -> None:
-        """Inputs read and outputs written, relative to the run directory.
-
-        The JSON sidecar is the last row once a record of this run wrote it.
-        """
+        """Inputs read and outputs written, relative to the run directory
+        (the table's first line names it)."""
         own = abs_path(self.path)
         rows = [row for row in rows if abs_path(row[2]) != own]
-        sidecar = written_sidecar()
-        if sidecar is not None and not any(abs_path(row[2]) == abs_path(sidecar)
-                                           for row in rows):
-            rows.append((SIDECAR_ROLE, "written", sidecar))
         self.heading("Output files and inputs")
         self.emit_lines(blocks.output_file_lines(rows, directory=self.directory))
 

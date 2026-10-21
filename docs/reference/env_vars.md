@@ -193,7 +193,6 @@ refusals stay on by default; per-file and per-operation instruments are opt-in.
 | `LORRAX_H5_JOURNAL_DIR` | unset (working directory) | debug | Where the journal and crash-ring files land. A directory that cannot be created disables the journal with one warning; the run continues. |
 | `LORRAX_SANITY` | unset (`warn`) | guard | `0`/`off` skips the stage-boundary invariant checks (`common/sanity.py`); unset checks and warns without stopping; `strict` raises `SanityError` (CI and regression gates). Does not govern `sanity.refuse_nonfinite`. |
 | `LORRAX_ALLOW_NONFINITE_RESULT` | unset (refuse) | debug | `1 true yes on` downgrades `common/sanity.py::refuse_nonfinite` (the refusal of a non-finite `kin_ion`, `Σ_total`, `E_qp` or `eqp` column about to be written) to a loud warning so the NaN artifact lands for forensics; anything else refuses. |
-| `LORRAX_ALLOW_X64_OFF` | unset (refuse) | debug | *bool*. With 64-bit values resolved off the run refuses, at `set_default_env` (an explicit `JAX_ENABLE_X64=0`) and again on the live jax during startup; `1` continues as an announced uncertified run in which every result is f32/c64. |
 | `LORRAX_ALLOW_TRS_VELOCITY_PARITY_BREAK` | `0` | debug | *bool*. Overrides the QSGW head-velocity time-reversal parity refusal (`gw/qsgw_head.py`). The gate is inactive when the two-component DFT-reference check finds broken TRS or gives no verdict. |
 | `LORRAX_UNIFORM_RULE_TRACE` | unset | debug | Presence test: any non-empty value, `0` included, turns it on. Prints each MPA box plan's raw real support and final padded denominator box (`gw/sigma_box_plan.py`); changes no support, rule, cache key or value. |
 | `LORRAX_DAV_MVSCAN` | unset | debug | Comma list of block widths (e.g. `1,2,4,8`). Times `apply_H` at each width inside the Davidson route (`bse/bse_lanczos.py`); changes no result. |
@@ -330,7 +329,7 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 
 | var | LORRAX's handling |
 |---|---|
-| `JAX_ENABLE_X64` | `runtime.set_default_env` `setdefault`s `1`, and `runtime.set_x64_on_imported_jax` pushes the resolved value onto a jax imported earlier. A resolved `False` refuses unless `LORRAX_ALLOW_X64_OFF` (§3a). |
+| `JAX_ENABLE_X64` | `runtime.set_default_env` `setdefault`s `1`, and `runtime.set_x64_on_imported_jax` pushes the resolved value onto a jax imported earlier. A resolved `False` refuses; there is no override (FP64 cannot be switched off). |
 | `JAX_PLATFORMS` | `setdefault` `<gpu>,cpu` with `<gpu>` the installed jaxlib GPU plugin's platform (`cuda` or `rocm`, `runtime._gpu_plugin_platform`), or hard-set to `cpu` by `set_default_env(platform="cpu")`; `lxkit.platform_from_env` reads it to pick the FFI library without initialising a backend. |
 | `JAX_PLATFORM_NAME` | jax's deprecated spelling; `runtime` pops it at both CPU-downgrade sites, and `psp/get_DFT_mtxels.py` counts either spelling as the caller choosing a platform. |
 | `JAX_PROCESS_COUNT` → `JAX_NUM_PROCESSES` → `OMPI_COMM_WORLD_SIZE` → `MV2_COMM_WORLD_SIZE` → `PMI_SIZE` → `SLURM_NTASKS` → `1` | Process-count chain (`runtime._WORLD_SIZE_ENVS`), first set wins. When it resolves 1 while any of them says more, startup refuses (`GATE split_launch`). |

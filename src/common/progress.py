@@ -8,22 +8,20 @@ It emits BGW-style output:
     [ 17:50:21 | ██████░░░░ |  60% ] tau node  6 / 10 · ETA 2 s
     Finished frequency integration at 17:50:23.  Elapsed: 3 s.
 
-Each line is an INFO record of the ``lorrax.progress`` logger.  ``Started``,
-``Finished`` and at most :data:`MAIN_LOG_BARS` bar lines per loop carry the
-``progress`` block, so a driver session shows them in the main log
-(``common.log``): the first milestone, then one about every 10 %, and the last
-(:func:`main_log_mask`).  Within one manual stage (``common.timing``), a later
-loop with the title of an earlier one is a repeat: the main log shows only its
-``Started``, its final bar and its ``Finished``.  The other milestones are
-untagged INFO, which only the rank stream prints, so the live stream keeps
-every milestone.  Milestone
-steps are precomputed as static boolean masks, and ``enabled=False``
-(non-rank-0 processes) logs nothing.
+Each line is an INFO record of the ``lorrax.progress`` logger carrying the
+``progress`` block, so a driver session shows it in the main log
+(``common.log``): ``Started``, one bar line per milestone (``max_updates`` of
+them, first and last included) and ``Finished``.  Every bar line gives the
+ETA from step 1.  Within one manual stage (``common.timing``), a later loop
+with the title of an earlier one is a repeat: the main log shows only its
+``Started``, its final bar and its ``Finished``; its other milestones are
+untagged INFO, which only the rank stream prints.  Milestone steps are
+precomputed as a static boolean mask, and ``enabled=False`` (non-rank-0
+processes) logs nothing.
 
-A loop that only dispatches asynchronous work (the Sigma tau sweep) passes
-``note="dispatched"``: its bar lines say ``· dispatched`` instead of an ETA,
-because the clock measures dispatch, not execution.  A milestone that did wait
-on its ``wait`` value (``LORRAX_STAGE_SYNC=1``) reports its ETA as usual.
+A loop that only dispatches asynchronous work (the Sigma tau sweep) measures
+dispatch unless a milestone waits on its ``wait`` value
+(``LORRAX_STAGE_SYNC=1``); its ETA is the dispatch clock's.
 """
 
 from __future__ import annotations
@@ -42,8 +40,6 @@ PrintFn = Callable[[str], None]
 #: The progress logger; its lines carry the ``progress`` block.
 _LOG = get_logger("progress")
 _BLOCK = block("progress")
-#: Bar lines per loop that the main log shows, first and last included.
-MAIN_LOG_BARS = 10
 
 
 def _say(text: str) -> None:
@@ -63,29 +59,6 @@ def _milestone_mask(num_steps: int, max_updates: int) -> np.ndarray:
     return mask
 
 
-def main_log_mask(milestones: np.ndarray, max_lines: int = MAIN_LOG_BARS) -> np.ndarray:
-    """The milestones the main log shows: at most ``max_lines``, the first, the last,
-    and in between the first milestone of each new 10 % bucket while room is left.
-
-    ``milestones`` is a :func:`_milestone_mask` (index = step, 1-indexed).  A pure
-    function of the loop's size, so it is precomputed like the milestones.
-    """
-    keep = np.zeros_like(milestones)
-    steps = np.flatnonzero(milestones)
-    if steps.size == 0:
-        return keep
-    num_steps = max(len(milestones) - 1, 1)
-    shown, last_bucket = 0, -1
-    for step in steps[:-1]:
-        bucket = (10 * int(step)) // num_steps
-        if shown == 0 or (bucket > last_bucket and shown < max_lines - 1):
-            keep[step] = True
-            shown += 1
-            last_bucket = bucket
-    keep[steps[-1]] = True
-    return keep
-
-
 def _repeated_loop(title: str) -> bool:
     """Whether the open manual stage already ran a loop titled ``title``
     (``timing.ManualStage.first_loop``); never outside a manual stage."""
@@ -99,19 +72,16 @@ def _repeated_loop(title: str) -> bool:
 
 def _format_progress(
     step: int, num_steps: int, elapsed: float,
-    title: str, item_name: str, bar_width: int, note: str | None = None,
+    title: str, item_name: str, bar_width: int,
 ) -> str:
     pct = int(round(100.0 * step / num_steps))
     filled = min(max(int(round(bar_width * step / num_steps)), 0), bar_width)
     bar = "█" * filled + "░" * (bar_width - filled)
-    if note is not None:
-        tail = str(note)
+    if step >= num_steps:
+        eta = 0
     else:
-        if step >= num_steps:
-            eta = 0
-        else:
-            eta = max(0, int(round(elapsed / max(step, 1) * (num_steps - step))))
-        tail = f"ETA {eta} s"
+        eta = max(0, int(round(elapsed / max(step, 1) * (num_steps - step))))
+    tail = f"ETA {eta} s"
     digits = len(str(num_steps))
     return (
         f"[ {_fmt_time(time.time())} | {bar} | {pct:3d}% ] "
@@ -143,26 +113,23 @@ class LoopProgress:
                 do_work(i)
                 p.step()
 
-    ``max_updates`` is the number of milestones (rank stream); the main log shows
-    at most :data:`MAIN_LOG_BARS` of them.  ``note`` replaces the ETA (``"dispatched"``
-    for a loop that times dispatch).  ``print_fn`` is accepted and unused: the
-    lines go to ``lorrax.progress``.
+    ``max_updates`` is the number of milestones, each a bar line in the main
+    log.  ``print_fn`` is accepted and unused: the lines go to
+    ``lorrax.progress``.
     """
 
     def __init__(
         self, num_steps: int, print_fn: PrintFn | None = None, *,
         title: str = "loop", item_name: str = "step",
         max_updates: int = 10, bar_width: int = 10,
-        enabled: bool | None = None, note: str | None = None,
+        enabled: bool | None = None,
     ):
         self.num_steps = num_steps
         self.title = title
         self.item_name = item_name
         self.bar_width = bar_width
-        self.note = note
         self.enabled = (jax.process_index() == 0) if enabled is None else enabled
         self._mask = _milestone_mask(num_steps, max_updates)
-        self._main = main_log_mask(self._mask)
         self._current = 0
         self._start: float | None = None
         self._repeat = False
@@ -215,21 +182,17 @@ class LoopProgress:
         # pass a globally sharded value even though today's Sigma caller uses
         # a local shard.  Only formatting and printing are rank-conditional
         # (INVARIANTS row 21).
-        waited = False
         if milestone and wait is not None:
             # A timing-only wait: under LORRAX_STAGE_SYNC=1 alone (common.timing.stage_sync).
             # Without it the line reports how far the loop has dispatched.
-            from common.timing import stage_sync, stage_wait
+            from common.timing import stage_wait
             stage_wait(wait)
-            waited = stage_sync()
         if self.enabled and milestone:
             elapsed = time.time() - self._start
             line = _format_progress(
                 self._current, self.num_steps, elapsed,
-                self.title, self.item_name, self.bar_width,
-                note=None if waited else self.note)
-            if self._main[self._current] and (
-                    not self._repeat or self._current == self.num_steps):
+                self.title, self.item_name, self.bar_width)
+            if not self._repeat or self._current == self.num_steps:
                 _say(line)
             else:
                 _LOG.info(line)          # untagged: the rank stream only

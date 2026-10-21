@@ -8,6 +8,7 @@ The full htransform receipts behind :func:`galerkin_rows` and
 
 from __future__ import annotations
 
+import re
 from typing import Sequence
 
 import numpy as np
@@ -23,18 +24,31 @@ PATH_LEVELS_SHOWN = 4
 
 
 # ── BSE ──────────────────────────────────────────────────────────────────────
-def exciton_energy_lines(energies_ev) -> list[str]:
+#: The main log lists every root up to this many.  Past it, the first
+#: ``BSE_ROOTS_FIRST`` and the ``BSE_ROOTS_BRIGHT`` brightest; every root is
+#: in BerkeleyGW's ``eigenvalues*.dat`` and on the rank-0 stdout.
+BSE_ROOTS_LISTED = 20
+BSE_ROOTS_FIRST = 16
+BSE_ROOTS_BRIGHT = 5
+
+_STATE_ROW = re.compile(r"^  S(\d{3,})  ")
+
+
+def exciton_energy_lines(energies_ev, states=None) -> list[str]:
     """The exciton table: ``  state       energy (eV)`` and one ``  S001  <E>``
-    row per root.  The row text is a harness contract
-    (``tests/hsuite/chain.py``: ``^\\s*S\\d+\\s+([0-9.+-]+)\\s*$``)."""
+    row per root (``states``: the 0-based roots to list, default all).  The
+    row text is a harness contract (``tests/hsuite/chain.py``:
+    ``^\\s*S\\d+\\s+([0-9.+-]+)\\s*$`` on the rank-0 stdout)."""
+    energies = np.asarray(energies_ev, dtype=np.float64)
     lines = ["  state       energy (eV)"]
-    for index, value in enumerate(np.asarray(energies_ev, dtype=np.float64), start=1):
-        lines.append(f"  S{index:03d}  {float(value):15.5f}")
+    for index in (range(energies.size) if states is None else states):
+        lines.append(f"  S{int(index) + 1:03d}  {float(energies[int(index)]):15.5f}")
     return lines
 
 
-def oscillator_lines(dipoles, n_k: int) -> list[str]:
-    """Per-state ``|D_a|^2 / N_k`` (bohr^2 per cell) for ``D = <0|r_a|S>``.
+def oscillator_lines(dipoles, n_k: int, states=None) -> list[str]:
+    """Per-state ``|D_a|^2 / N_k`` (bohr^2 per cell) for ``D = <0|r_a|S>``
+    (``states``: the 0-based roots to list, default all).
 
     Every row carries three numbers in e-format, so no row reads as an
     exciton-energy row."""
@@ -42,28 +56,73 @@ def oscillator_lines(dipoles, n_k: int) -> list[str]:
     strength = np.abs(d) ** 2 / max(int(n_k), 1)
     lines = [f"  {'state':<7}{'|D_x|^2/N_k':>14}{'|D_y|^2/N_k':>14}"
              f"{'|D_z|^2/N_k':>14}   (bohr^2 per cell)"]
-    for index, row in enumerate(strength, start=1):
-        lines.append(f"  S{index:03d}  " + "".join(f"{float(v):14.4e}" for v in row[:3]))
+    for index in (range(strength.shape[0]) if states is None else states):
+        lines.append(f"  S{int(index) + 1:03d}  "
+                     + "".join(f"{float(v):14.4e}" for v in strength[int(index), :3]))
+    return lines
+
+
+def brightest_states(dipoles, count: int = BSE_ROOTS_BRIGHT) -> list[int]:
+    """The 0-based roots of the ``count`` largest ``sum_a |D_a|^2``, brightest
+    first (ties in root order)."""
+    strength = np.sum(np.abs(np.asarray(dipoles, dtype=np.complex128)) ** 2, axis=1)
+    order = sorted(range(strength.size), key=lambda i: (-float(strength[i]), i))
+    return order[:int(count)]
+
+
+def brightest_lines(energies_ev, dipoles, n_k: int, states) -> list[str]:
+    """The brightest roots: the energy and ``|D_a|^2 / N_k`` of each."""
+    energies = np.asarray(energies_ev, dtype=np.float64)
+    strength = np.abs(np.asarray(dipoles, dtype=np.complex128)) ** 2 / max(int(n_k), 1)
+    lines = [f"  {'state':<7}{'energy (eV)':>15}{'|D_x|^2/N_k':>14}{'|D_y|^2/N_k':>14}"
+             f"{'|D_z|^2/N_k':>14}   (bohr^2 per cell)"]
+    for i in states:
+        lines.append(f"  S{int(i) + 1:03d}  {float(energies[int(i)]):15.5f}"
+                     + "".join(f"{float(v):14.4e}" for v in strength[int(i), :3]))
     return lines
 
 
 def bse_results_lines(energies_ev, *, gap=None, dipoles=None, n_k: int = 1,
                       helicity: Sequence[str] = (), eigenvectors: str | None = None,
+                      roots_file: str | None = None, trim: bool = True,
                       extra_rows: Sequence[tuple[str, str]] = ()) -> list[str]:
     """The BSE RESULTS block.
 
     ``gap`` is ``(E_gap eV, k index 1-based, "QP" | "DFT")``, the lowest direct
     transition of the solved window; the binding row is ``E_gap - E(S1)``.
-    ``dipoles`` (``(n_written, 3)``) adds the oscillator table, ``helicity``
-    the ``--helicity-table`` lines; ``eigenvectors`` says what was written;
-    ``extra_rows`` follow it.
+    ``dipoles`` (``(n_roots, 3)``) adds the oscillator table, ``helicity``
+    the ``--helicity-table`` lines; ``eigenvectors`` says what was written,
+    ``roots_file`` which file holds every root; ``extra_rows`` follow.
+
+    With ``trim`` and more than :data:`BSE_ROOTS_LISTED` roots the tables list
+    the first :data:`BSE_ROOTS_FIRST`, then the :data:`BSE_ROOTS_BRIGHT`
+    brightest by ``sum_a |D_a|^2`` (when the dipoles are known).  The rank-0
+    stdout carries the untrimmed block (``trim=False``).
     """
     energies_ev = np.asarray(energies_ev, dtype=np.float64)
-    table = exciton_energy_lines(energies_ev)
+    n_roots = int(energies_ev.size)
+    states = bright = None
+    if trim and n_roots > BSE_ROOTS_LISTED:
+        states = range(BSE_ROOTS_FIRST)
+        if dipoles is not None:
+            bright = brightest_states(dipoles)
+    table = exciton_energy_lines(energies_ev, states)
+    if states is not None:
+        table.append(f"  [the first {BSE_ROOTS_FIRST} of {n_roots} roots; all are in "
+                     f"{roots_file or 'the rank-0 stdout'}"
+                     + ("" if dipoles is not None else
+                        "; the brightest need --dipole") + "]")
     if dipoles is not None:
-        table += [""] + oscillator_lines(dipoles, n_k)
+        table += [""] + oscillator_lines(dipoles, n_k, states)
     if helicity:
-        table += [""] + [str(line) for line in helicity]
+        shown = None if states is None else set(states) | set(bright or ())
+        table += [""] + [str(line) for line in helicity if shown is None
+                         or not _STATE_ROW.match(str(line))
+                         or int(_STATE_ROW.match(str(line)).group(1)) - 1 in shown]
+    if bright is not None:
+        table += ["", f"  brightest {len(bright)} of {n_roots} by "
+                      "|D_x|^2 + |D_y|^2 + |D_z|^2"]
+        table += brightest_lines(energies_ev, dipoles, n_k, bright)
     rows = []
     if gap is not None:
         gap_ev, ik, kind = gap
@@ -73,6 +132,8 @@ def bse_results_lines(energies_ev, *, gap=None, dipoles=None, n_k: int = 1,
             rows.append(("binding (S1)", f"{float(gap_ev) - float(energies_ev[0]):.5f} eV "
                                          f"below the {kind} gap"))
     rows.append(("eigenvectors", eigenvectors or "not written (--write-eigs)"))
+    if roots_file:
+        rows.append(("all roots", f"{n_roots} in {roots_file}, BerkeleyGW's layout"))
     rows += [(str(label), str(value)) for label, value in extra_rows]
     return results_lines(rows, table=table)
 
@@ -155,8 +216,13 @@ def exciton_band_results_lines(path_ev, Qpath, node_idx, node_labels, *,
 
 
 __all__ = [
+    "BSE_ROOTS_BRIGHT",
+    "BSE_ROOTS_FIRST",
+    "BSE_ROOTS_LISTED",
     "PATH_LEVELS_SHOWN",
     "PATH_ROWS_MAX",
+    "brightest_lines",
+    "brightest_states",
     "bse_results_lines",
     "exciton_band_results_lines",
     "exciton_band_table",

@@ -10,6 +10,8 @@ Common needs:
   - Lorentzian broaden
   - Kramers-Kronig
   - write BGW-style 4-column ``absorption_b{1,2,3}.dat``
+  - write BerkeleyGW's ``eigenvalues.dat`` / ``eigenvalues_b{1,2,3}.dat``
+    (``bse_jax`` writes every root there)
 """
 from __future__ import annotations
 
@@ -382,6 +384,29 @@ def helicity_table_lines(energies_ev, dipoles, n_k):
     return lines
 
 
+def require_dipole_not_short(attrs, nb_stored: int, band_hi: int, *,
+                             dipole_path) -> None:
+    """Refuse a ``dipole.h5`` that stops below the BSE window's top band.
+
+    ``band_hi`` is the window's top (absolute, 0-based, exclusive); the file
+    holds bands up to its ``band_max`` stamp, else ``nb_stored``.  A short
+    file would leave the transitions above its top with no dipole: zero
+    oscillator strength, and no message.
+    """
+    from file_io.dipole import DIPOLE_BAND_MAX_ATTR, DIPOLE_BAND_MIN_ATTR
+    lo = int(np.asarray(attrs.get(DIPOLE_BAND_MIN_ATTR, 0)).reshape(-1)[0])
+    hi = int(np.asarray(attrs.get(DIPOLE_BAND_MAX_ATTR,
+                                  lo + int(nb_stored))).reshape(-1)[0])
+    if int(band_hi) > hi:
+        raise ValueError(
+            f"GATE dipole_bands_short: {dipole_path!s} holds bands up to "
+            f"{hi}; want at least {int(band_hi)}, the top of the BSE window; "
+            f"why: the transitions to bands {hi + 1}-{int(band_hi)} would get "
+            f"no dipole and zero oscillator strength; fix: regenerate it with "
+            f"python -m psp.get_dipole_mtxels and nval/ncond/number_bands "
+            f"reaching band {int(band_hi)}.")
+
+
 def slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ, n_val, n_cond):
     """Slice (nb, nb) dipole tables → BSE (nc, nv) sub-block.
 
@@ -396,6 +421,8 @@ def slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ, n_val, n_cond):
     from file_io.dipole import require_dipole_bands
     val_lo = n_occ - n_val
     cond_hi = n_occ + n_cond
+    require_dipole_not_short({}, int(dipole_cart.shape[-1]), cond_hi,
+                             dipole_path="dipole_cart")
     require_dipole_bands({}, int(dipole_cart.shape[-1]), val_lo, cond_hi,
                          dipole_path="dipole_cart", where="BSE window")
     v_cv = dipole_cart[:, :, n_occ:cond_hi, val_lo:n_occ]   # (3, nk, nc, nv)
@@ -452,6 +479,8 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
                                 require_dipole_wfn_fingerprint)
     from file_io.restart_bundle import load_dipole_h5
     dipole_cart, deltaE, attrs = load_dipole_h5(dipole_file, wfn_path=wfn_path)
+    require_dipole_not_short(attrs, int(dipole_cart.shape[-1]),
+                             n_occ + int(data["n_cond"]), dipole_path=dipole_file)
     require_dipole_bands(
         attrs, int(dipole_cart.shape[-1]), n_occ - int(data["n_val"]),
         n_occ + int(data["n_cond"]), dipole_path=dipole_file, where="BSE window")
@@ -582,31 +611,99 @@ def write_absorption_dat(path, omegas_eV, eps2, eps1, jdos, header_lines=None):
             f.write(f" {o:15.9f}  {e2:14.9f}  {e1:14.9f}  {jd:14.9f}\n")
 
 
-def write_eigenvalues_dat(
-    path, eigvals_eV, dipoles_pol, *, n_spin, n_spinor, vol_supercell,
-):
-    """BGW-format ``eigenvalues_b{1,2,3}.dat`` (matches ``BSE/absp_io.f90:122``).
+def fortran_e(value, width: int, digits: int) -> str:
+    """``value`` as Fortran ``Ew.d`` writes it (gfortran): ``-`` only when
+    negative, ``0.``, ``digits`` digits, ``E`` and a signed two-digit exponent
+    (``+ddd`` without the ``E`` past 99), right-justified in ``width``."""
+    x = float(value)
+    if not np.isfinite(x):
+        return ("NaN" if np.isnan(x) else "-Infinity" if x < 0 else
+                "Infinity").rjust(width)
+    if x == 0.0:
+        mantissa, exponent = "0" * int(digits), 0
+    else:
+        head, tail = f"{abs(x):.{int(digits) - 1}e}".split("e")
+        mantissa, exponent = head.replace(".", ""), int(tail) + 1
+    sign = "-" if np.signbit(x) else ""
+    power = f"E{exponent:+03d}" if abs(exponent) <= 99 else f"{exponent:+04d}"
+    return f"{sign}0.{mantissa}{power}".rjust(int(width))
 
-    Columns (TDA, 4 per row, ``4e16.8``):
-      ``E_S (eV)   |⟨0|r̂|S⟩|²   Re⟨0|r̂|S⟩   Im⟨0|r̂|S⟩``
 
-    Header lines:
-      ``# neig  =       N``
-      ``# vol   =  <V_supercell in bohr³>``
-      ``# nspin, nspinor =  ns  nspinor``
+#: BerkeleyGW's file per polarization (``BSE/absp_io.f90``, ``suffix``): one
+#: polarization writes ``eigenvalues.dat``, three write ``eigenvalues_b1.dat``
+#: to ``_b3.dat``, the Cartesian x, y and z (``BSE/vmtxel.f90``).
+BGW_POLARIZATION_SUFFIXES = ("b1", "b2", "b3")
 
-    ``vol_supercell = V_unit_cell · N_k`` (BGW convention — what BGW prints
-    in the header line).
+
+def bgw_eigenvalue_lines(eigvals_eV, dipoles_pol=None, *, n_spin: int,
+                         n_spinor: int, vol_supercell: float) -> list[str]:
+    """The lines of one BerkeleyGW ``eigenvalues*.dat`` (TDA, complex flavor).
+
+    BerkeleyGW ``BSE/absp_io.f90`` ``write_eigenvalues``, singlet kernel::
+
+        write(14,'(a,i8)') '# neig  = ', neig
+        write(14,'(a,e16.9)') '# vol   = ', vol
+        write(14,'(a,2i8)') '# nspin, nspinor = ', xct%nspin, xct%nspinor
+        '#       eig (eV)   abs(dipole)^2' // '    ' // '  Re(dipole)    Im(dipole)'
+        write(14,'(4e16.8)') evals(ii), cs(ii,ipol), dipoles_r(ii,ipol)
+
+    ``dipoles_pol`` (``(N,)`` complex) is ``D = <0|r|S>`` along this file's
+    polarization; ``vol_supercell`` is ``N_k V_cell`` (bohr^3, BerkeleyGW's
+    ``xct%nktotal * crys%celvol``).  Without dipoles the rows carry the
+    energy column alone, under ``#       eig (eV)``.
     """
-    n = eigvals_eV.size
+    energies = np.asarray(eigvals_eV, dtype=np.float64).reshape(-1)
+    lines = [f"# neig  = {energies.size:8d}",
+             f"# vol   = {fortran_e(vol_supercell, 16, 9)}",
+             f"# nspin, nspinor = {int(n_spin):8d}{int(n_spinor):8d}"]
+    if dipoles_pol is None:
+        lines.append("#       eig (eV)")
+        lines += [fortran_e(e, 16, 8) for e in energies]
+        return lines
+    d = np.asarray(dipoles_pol, dtype=np.complex128).reshape(-1)
+    if d.size != energies.size:
+        raise ValueError(f"bgw_eigenvalue_lines: {energies.size} energies for "
+                         f"{d.size} dipoles")
+    lines.append("#       eig (eV)   abs(dipole)^2      Re(dipole)    Im(dipole)")
+    lines += ["".join(fortran_e(v, 16, 8) for v in
+                      (e, float(np.abs(di) ** 2), di.real, di.imag))
+              for e, di in zip(energies, d)]
+    return lines
+
+
+def write_eigenvalues_dat(
+    path, eigvals_eV, dipoles_pol=None, *, n_spin, n_spinor, vol_supercell,
+):
+    """One BerkeleyGW ``eigenvalues*.dat`` at ``path``
+    (:func:`bgw_eigenvalue_lines`)."""
     with open(str(path), "w") as f:
-        f.write(f"# neig  = {n:9d}\n")
-        f.write(f"# vol   = {vol_supercell:15.9E}\n")
-        f.write(f"# nspin, nspinor = {n_spin:8d}{n_spinor:8d}\n")
-        f.write("#       eig (eV)   abs(dipole)^2      Re(dipole)    Im(dipole)\n")
-        for E_S, d_S in zip(eigvals_eV, dipoles_pol):
-            mag2 = float((d_S.conjugate() * d_S).real)
-            f.write(f"  {E_S:14.8E}  {mag2:14.8E}  {d_S.real:14.8E}  {d_S.imag:14.8E}\n")
+        f.write("\n".join(bgw_eigenvalue_lines(
+            eigvals_eV, dipoles_pol, n_spin=n_spin, n_spinor=n_spinor,
+            vol_supercell=vol_supercell)) + "\n")
+
+
+def write_bgw_eigenvalues(directory, eigvals_eV, dipoles=None, *, n_spin,
+                          n_spinor, vol_supercell) -> list[str]:
+    """Every root in BerkeleyGW's own files; returns the paths written.
+
+    ``dipoles`` ``(N, 3)`` (``<0|r_a|S>``, Cartesian) gives BerkeleyGW's
+    three-polarization set ``eigenvalues_b1.dat`` .. ``_b3.dat``; without
+    dipoles one ``eigenvalues.dat`` lists the energies.
+    """
+    directory = Path(directory)
+    if dipoles is None:
+        jobs = [("eigenvalues.dat", None)]
+    else:
+        d = np.asarray(dipoles, dtype=np.complex128)
+        jobs = [(f"eigenvalues_{suffix}.dat", d[:, a])
+                for a, suffix in enumerate(BGW_POLARIZATION_SUFFIXES)]
+    paths = []
+    for name, d_pol in jobs:
+        write_eigenvalues_dat(directory / name, eigvals_eV, d_pol,
+                              n_spin=n_spin, n_spinor=n_spinor,
+                              vol_supercell=vol_supercell)
+        paths.append(str(directory / name))
+    return paths
 
 
 def write_absorption_h5(
@@ -659,5 +756,10 @@ __all__ = [
     "kramers_kronig_eps1",
     "write_absorption_dat",
     "write_absorption_h5",
+    "BGW_POLARIZATION_SUFFIXES",
+    "bgw_eigenvalue_lines",
+    "fortran_e",
+    "require_dipole_not_short",
+    "write_bgw_eigenvalues",
     "write_eigenvalues_dat",
 ]

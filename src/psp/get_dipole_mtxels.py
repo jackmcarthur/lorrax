@@ -527,9 +527,12 @@ def dipole_provenance(*, wfn, wfn_path, nval, ncond, nband,
 
 
 def _note_parallel_transport_dropped(args, reason) -> None:
-    """The NOTE a dropped default parallel-transport artifact leaves where it
-    happens; every rank's log keeps the full text (``GATE <id>``) at INFO.
+    """The message a dropped default parallel-transport artifact leaves where
+    it happens; every rank's log keeps the full text (``GATE <id>``) at INFO.
 
+    A WARNING when a collapsed-axis gate (``GATE pt_collapsed_axis_*``) drops
+    it on a grid with more than one k; a NOTE on a Gamma-only grid
+    (``args.parallel_transport_gamma_only``) and for any other reason.
     ``reason`` is the stage's refusal (its ``GATE <id>: ...`` text) or plain
     words; the id is kept on ``args`` for the RESULTS row.
     """
@@ -538,9 +541,13 @@ def _note_parallel_transport_dropped(args, reason) -> None:
     ident, body = ((gate.group(1), gate.group(2)) if gate
                    else ("parallel_transport_not_written", text))
     body, _, fix = body.partition("Fix: ")
-    args.parallel_transport_dropped = ident
+    warn = (ident.startswith("pt_collapsed_axis")
+            and not getattr(args, "parallel_transport_gamma_only", False))
+    args.parallel_transport_dropped = (f"[{ident}]; see the WARNING above"
+                                       if warn else ident)
     log.warning("parallel_transport.h5 not written; dipole.h5 is unaffected",
-                extra=message(ident, kind="NOTE", lines=(body.strip(),),
+                extra=message(ident, kind=None if warn else "NOTE",
+                              lines=(body.strip(),),
                               fix=fix.strip().rstrip(".") or None))
 
 
@@ -618,6 +625,8 @@ def _parallel_transport_outer_bands(args, wfn, head_nbands, parser):
     Without links the extent is the head's.
     """
     from common.parallel_transport import undersampled_link_axes
+    args.parallel_transport_gamma_only = all(
+        int(n) == 1 for n in np.asarray(wfn.kgrid).reshape(-1)[:3])
     if getattr(args, "parallel_transport_defaulted", False) and \
             undersampled_link_axes(wfn.kgrid):
         log.info("  parallel-transport artifact: not written (the k grid "

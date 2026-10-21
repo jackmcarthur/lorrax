@@ -19,10 +19,11 @@ the closing line ``LORRAX <driver> ERROR ...``.  The exception, with its
 ``GATE <id>`` text, then propagates to ``runtime.run_main_and_finalize``
 unchanged.
 
-The output streams are :class:`RunStreams`: the stdout swap and the three
-``lorrax`` logging handlers (``common.log``), main log on rank 0, rank stream
-on every rank, JSON sidecar ``<report stem>.json`` on rank 0, with Python
-warnings captured as records.  The handlers read the verbose switch
+The output streams are :class:`RunStreams`: the stdout swap and the two
+``lorrax`` logging handlers (``common.log``), main log on rank 0 and rank
+stream on every rank (silent above rank 0 but for its warnings and errors,
+on its stderr), with Python warnings captured as records.  No JSON sidecar
+is written.  The handlers read the verbose switch
 (``runtime.debug_print_enabled``: ``--verbose``, the deck's
 ``verbose = true``, ``LORRAX_DEBUG_PRINT=1``) on every record; verbose puts
 DEBUG records in the rank log and, under the current stage, in the main log.  A driver that opens its report itself (GW,
@@ -34,7 +35,7 @@ report knows about bands).  It needs a constructor ``(path, *, runtime,
 debug, stdout, **labels)``, a settable ``stdout``, and the methods
 ``legacy_print``, ``log_detail``, ``log_message``, ``render_message``,
 ``timings``, ``warnings``, ``files`` and ``finish(*, status, wall, error)``,
-and optionally ``log_debug`` (verbose DEBUG rows) and ``sidecar_path``
+and optionally ``log_debug`` (verbose DEBUG rows)
 (``common.production_report.ProductionReport`` has them).  A driver whose
 report is a single text written at the end (``kmeans_cli``) passes
 ``report_cls=None``; the session then keeps the retained warnings' texts
@@ -123,8 +124,8 @@ class RunStreams:
     :meth:`open` takes the stdout the process holds (the stream the harness
     captures as this rank's log), installs :class:`ProductionStdout` and then
     the handlers of ``common.log``: rank 0's main log into ``report``, the
-    rank stream on that stdout, the JSON sidecar beside the report, and
-    Python warnings captured as records.  Without a report, a warning's text
+    rank stream (rank 0's stdout; a rank above 0 prints only its warnings
+    and errors, on its stderr), and Python warnings captured as records.  Without a report, a warning's text
     goes to ``warning_fn``.  :meth:`close` removes them in reverse order.
     """
 
@@ -153,10 +154,7 @@ class RunStreams:
             report.stdout = rank0_print if self.debug else self._stdout.emit
             sink = dict(on_message=report.log_message, on_detail=report.log_detail,
                         on_debug=getattr(report, "log_debug", None),
-                        render=report.render_message,
-                        sidecar=getattr(report, "sidecar_path", None)
-                        or os.path.splitext(report.path)[0] + ".json",
-                        report_name=os.path.basename(report.path))
+                        render=report.render_message)
         else:
             warning_fn = self._warning_fn
 

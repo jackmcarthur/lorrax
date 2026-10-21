@@ -80,10 +80,16 @@ def guard_rows(energies_ry, *, start: int, keep: int, fit: int) -> list[tuple[st
                 f"; the ranges overlap by {-overlap_ev:.5f} eV"))]
 
 
+def _zero_text(zero: str) -> str:
+    """``the VBM`` or ``E_F (DFT)``: the zero of the path energies."""
+    return "the VBM" if zero == "VBM" else str(zero)
+
+
 def band_table_lines(energies_ev, *, band_start: int, n_val: int,
                      max_rows: int = BAND_ROWS_MAX,
-                     edge: int = BAND_ROWS_EDGE) -> list[str]:
-    """Each returned band's range on the path, eV relative to the VBM."""
+                     edge: int = BAND_ROWS_EDGE, zero: str = "VBM") -> list[str]:
+    """Each returned band's range on the path, eV relative to ``zero``: the
+    VBM (its band and the CBM's tagged), or a metal's ``"E_F (DFT)"``."""
     energies = np.atleast_2d(np.asarray(energies_ev, dtype=np.float64))
     nb = energies.shape[1]
     rows = list(range(nb))
@@ -91,10 +97,11 @@ def band_table_lines(energies_ev, *, band_start: int, n_val: int,
         vbm = int(n_val) - 1
         rows = [b for b in rows if vbm - edge < b <= vbm + edge]
     lines = [f"  {'band':>6}{'min (eV)':>12}{'max (eV)':>12}{'width (eV)':>12}"
-             "   (on the path, relative to the VBM)"]
+             f"   (on the path, relative to {_zero_text(zero)})"]
     for b in rows:
         lo, hi = float(np.min(energies[:, b])), float(np.max(energies[:, b]))
-        tag = "  VBM" if b == int(n_val) - 1 else "  CBM" if b == int(n_val) else ""
+        tag = ("" if zero != "VBM" else "  VBM" if b == int(n_val) - 1
+               else "  CBM" if b == int(n_val) else "")
         lines.append(f"  {band_start + b + 1:>6}{lo:>+12.5f}{hi:>+12.5f}{hi - lo:>12.5f}{tag}")
     if len(rows) < nb:
         lines.append(f"  [{edge} bands on each side of the VBM; all {nb} are in the "
@@ -105,11 +112,12 @@ def band_table_lines(energies_ev, *, band_start: int, n_val: int,
 def htransform_results_lines(*, energies_ev, band_start: int, n_val: int,
                              n_keep: int, n_fit: int, on_grid=None,
                              guard: list[tuple[str, str]] = (),
-                             energy_source: str, written: str) -> list[str]:
+                             energy_source: str, written: str,
+                             zero: str = "VBM") -> list[str]:
     """The htransform RESULTS block.
 
     ``energies_ev`` are the returned bands on the path ``(nk_path, n_keep)``,
-    relative to the VBM; ``on_grid`` is ``(n_points, max |dE| eV, RMS eV)``
+    relative to ``zero`` (the VBM, or a metal's ``"E_F (DFT)"``); ``on_grid`` is ``(n_points, max |dE| eV, RMS eV)``
     over the path points that lie on the coarse grid (``None``: the path has
     none, so the interpolation has no on-grid check).
     """
@@ -129,10 +137,12 @@ def htransform_results_lines(*, energies_ev, band_start: int, n_val: int,
     energies = np.asarray(energies_ev, dtype=np.float64)
     if energies.size:
         rows.append(("energy range", f"{float(energies.min()):+.5f} .. "
-                                     f"{float(energies.max()):+.5f} eV relative to the VBM"))
+                                     f"{float(energies.max()):+.5f} eV relative to "
+                                     f"{_zero_text(zero)}"))
     rows.append(("energy source", energy_source))
     rows.append(("written", written))
-    table = (band_table_lines(energies, band_start=band_start, n_val=n_val)
+    table = (band_table_lines(energies, band_start=band_start, n_val=n_val,
+                              zero=zero)
              if energies.size else [])
     return results_lines(rows, table=table)
 
@@ -243,7 +253,8 @@ class HTransformProductionReport(ProductionReport):
             energies_ev=energies_ev, band_start=start, n_val=int(n_val),
             n_keep=keep, n_fit=fit, on_grid=on_grid,
             guard=guard_rows(enk_sigma_ry, start=start, keep=keep, fit=fit),
-            energy_source=energy_source, written=written))
+            energy_source=energy_source, written=written,
+            zero=str(result.get("energy_zero", "VBM"))))
 
     def timings(self, records, *, wall: float) -> None:
         def total(name: str) -> float:

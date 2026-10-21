@@ -1765,11 +1765,17 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
                 band_start: int = 0, n_return_bands: int | None = None,
                 qp_corrected_band_range: tuple[int, int] | None = None,
                 progress_fn=None, quality_record_fn=None, sym=None,
-                return_coeffs: bool = False, B_at_mu=None):
+                return_coeffs: bool = False, B_at_mu=None,
+                fermi_reference_ry: float | None = None):
     """Band energies on ``kpath_data`` from the nodal fH (module docstring).
 
     ``B_at_mu`` (:class:`isdf.galerkin.NodalInterp`) supplies the node
     geometry of the per-pair Wigner–Seitz sums; it is required.
+
+    The returned path energies are relative to a zero: the path maximum of
+    the top occupied band (the VBM) by default, or ``fermi_reference_ry``
+    (Ry, a metal's DFT E_F) as given, never re-derived on the path.
+    ``result["energy_zero"]`` names which.
     """
     from time import perf_counter as _perf   # instrument:
     if B_at_mu is None:
@@ -2338,7 +2344,9 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # The VBM index is LOCAL to the fitted band window.  Using the
         # absolute electron count here silently selected a conduction level
         # whenever the window started above band zero.
-        fermi_energy = float(np.max(energies_sorted[:, fermi_band_idx]))
+        fermi_energy = (float(np.max(energies_sorted[:, fermi_band_idx]))
+                        if fermi_reference_ry is None
+                        else float(fermi_reference_ry))
         energy_reference_ry = fermi_energy
         _k_np = np.asarray(jax.device_get(wrapped_k))[:nq]
         if not np.all(np.isfinite(_k_np)):
@@ -2422,7 +2430,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
             log_fn(
                 "  [receipt] path/coarse coincidences: none; no nearest-point "
                 "value is labelled exact")
-        # Shift all reported energies so VBM is at 0
+        # Shift all reported energies so the zero (VBM, or a metal's DFT
+        # E_F) is at 0
         if energies_on_path is not None:
             energies_on_path = energies_on_path - fermi_energy
         if energies_sorted is not None:
@@ -2435,7 +2444,8 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         path_range = (float(energies_sorted.min()), float(energies_sorted.max()))
         log_fn(
             f"Path energy range: {path_range[0] * RYD_TO_EV:.5f} to "
-            f"{path_range[1] * RYD_TO_EV:.5f} eV (VBM@0)")
+            f"{path_range[1] * RYD_TO_EV:.5f} eV "
+            + ("(VBM@0)" if fermi_reference_ry is None else "(E_F (DFT)@0)"))
         # Gamma deltas (in meV) remain unchanged by uniform shift.  Unlike
         # the old receipt this is emitted only for an authenticated
         # path/coarse Gamma coincidence.
@@ -2463,6 +2473,7 @@ def h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log_fn, mesh_xy: Mesh,
         # Ry.  The exact pre-shift path VBM subtracted from every returned
         # path-energy carrier, or None when no path was requested.
         "energy_reference_ry": energy_reference_ry,
+        "energy_zero": "VBM" if fermi_reference_ry is None else "E_F (DFT)",
         "fermi_energy": fermi_energy,
         "energies_on_path": energies_on_path,
         "energies_sorted": energies_sorted,

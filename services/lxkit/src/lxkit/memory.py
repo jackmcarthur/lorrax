@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
-#: Receipts and route decisions are diagnostics: DEBUG lines plus JSON-sidecar records
+#: Receipts and route decisions are diagnostics: DEBUG lines with their receipt fields
 #: (``memory.receipts``, ``routes``).  ``lxkit`` is a service and imports no ``common.log``, so it
 #: logs on the ``lorrax.`` namespace directly, with the ``common.log.record`` extras by hand.
 _LOG = logging.getLogger("lorrax.memory")
@@ -353,7 +353,7 @@ def receipt_line(name: str, price: Price, measured: float, exact: bool, src: str
 
 
 def _receipt_fields(name: str, price: Price, measured: float, exact: bool, src: str) -> dict:
-    """The numbers of a receipt line, in bytes: the JSON-sidecar record of ``memory.receipts``."""
+    """The numbers of a receipt line, in bytes: the DEBUG receipt of ``memory.receipts``."""
     total, known = price.bytes(), measured is not None and measured >= 0
     return dict(stage=str(name), priced_bytes=total, **{f"{n}_bytes": v for n, v in price.terms().items()},
                 measured_bytes=float(measured) if known else None, measured_exact=bool(exact),
@@ -456,7 +456,7 @@ def _trace(t: dict, event: str) -> None:
 # --- lines and warnings ----------------------------------------------------------------------------
 def set_sink(sink=None) -> None:
     """Route the banner and warned-route lines through the driver's report (receipts and routes are
-    DEBUG logs and sidecar records, not sink lines)."""
+    DEBUG logs and receipts, not sink lines)."""
     _HOOK["sink"] = sink
 
 
@@ -468,7 +468,7 @@ def _say(text: str, *, local: bool = False) -> None:
 
 
 def _debug(text: str, key: str, fields: Callable[[], dict], *, local: bool = False) -> None:
-    """A diagnostic line: DEBUG, plus the record ``fields()`` under ``key`` in the JSON sidecar."""
+    """A diagnostic line: DEBUG, plus the record ``fields()`` under ``key`` (printed with verbose)."""
     try:
         (local or _rank0()) and _LOG.debug(text, extra={"lorrax": {"record_key": key, "record": fields()}})
     except Exception:                                          # noqa: BLE001

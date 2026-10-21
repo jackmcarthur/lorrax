@@ -769,6 +769,9 @@ def _select_and_report(args, run, stages):
     rank_warning = pool_rank_warning(
         pool=n_pool, written=n_unique, unpicked=unpicked, rank_law=rank_law)
     if rank_warning is not None:
+        # Graded: a WARNING only when the budget stop leaves the set below the
+        # rank-law estimate (written/estimate < 1); at or above it, or with no
+        # estimate (current mode), a NOTE.
         log.warning(
             f"pair-space rank not established: {n_unique} centroids are not a "
             "complete ISDF basis",
@@ -777,7 +780,9 @@ def _select_and_report(args, run, stages):
                 found=("pivoted Cholesky", f"stopped by the point budget at "
                        f"{n_unique} points of a {n_pool}-point pool"),
                 lines=(rank_warning,),
-                fix="raise N_c or --oversample until the rank reads 'pool spent'"))
+                fix="raise N_c or --oversample until the rank reads 'pool spent'",
+                kind=(None if rank_law is not None
+                      and n_unique / float(rank_law[0]) < 1.0 else "NOTE")))
     header = format_centroid_header(
         feature_fit=feature_fit, source_wfn=wfn_path,
         weight_label=weight_label,

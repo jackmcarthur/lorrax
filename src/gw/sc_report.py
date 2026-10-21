@@ -29,7 +29,7 @@ after these rows.  At the loop's end :func:`convergence_lines` gives::
           1  Anderson          1.914016        6, 4    0.750533    0.818789     51.3
       verdict        CONVERGED after 2 maps (max|dE| 1.914016 eV < 3.000000 eV)
 
-Every map's facts also go to the JSON sidecar under ``sc.maps``, the loop's
+Every map's facts are also DEBUG receipts under ``sc.maps``, the loop's
 settings under ``sc.loop`` and the verdict under ``sc.verdict``.
 
 For the report (slice A's RESULTS): :func:`last_run` returns the latest
@@ -69,7 +69,7 @@ _INPUT = {"dft_seed": "DFT states", "external_qp_seed": "QP seed",
 
 @dataclass
 class MapFacts:
-    """What one SC map did, as the main log and the sidecar report it."""
+    """What one SC map did, as the main log and its DEBUG receipt report it."""
 
     call: int
     input: str = ""
@@ -168,7 +168,7 @@ def _joined(words) -> str:
 def loop_value(*, mode: str, max_iter: int, tol_ev: float, accelerator: str,
                depth: int) -> str:
     """The ``SC loop`` row: how maps are mixed and when the loop stops
-    (``mode`` is the SETTINGS block's ``compute_mode``; the sidecar keeps it)."""
+    (``mode`` is the SETTINGS block's ``compute_mode``; its DEBUG receipt keeps it)."""
     if int(max_iter) <= 1:
         return f"one map, no mixing; max|dE| reported against {float(tol_ev):g} eV"
     return (f"{accelerator} mixing (history {int(depth)}), at most {int(max_iter)} maps, "
@@ -310,5 +310,5 @@ def emit_rows(rows) -> None:
 
 
 def record_map(facts: MapFacts) -> None:
-    """The map's facts into the JSON sidecar, under ``sc.maps``."""
+    """The map's facts as a DEBUG receipt, under ``sc.maps``."""
     log.debug(f"SC map {facts.call} facts", extra=record("sc.maps", **asdict(facts)))

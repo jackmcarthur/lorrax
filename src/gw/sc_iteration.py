@@ -4139,7 +4139,7 @@ def _record_shared_pole_replans(inputs, iteration, recipe):
 
 def _report_sc_convergence(verdict, *, n_maps: int, one_map: bool) -> None:
     """The loop's closing table in the main log (:func:`gw.sc_report.convergence_lines`)
-    and its verdict in the JSON sidecar (``sc.verdict``); printed before the
+    and its verdict as a DEBUG receipt (``sc.verdict``); printed before the
     driver raises on a budget without convergence, so that run shows it too."""
     run = _sc_run()
     run.converged = bool(verdict.converged)

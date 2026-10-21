@@ -1657,7 +1657,7 @@ def _integrate_sigma_batches(
                         total_tau += len(np.asarray(_row.window.nodes.t))
         progress = LoopProgress(
             max(1, total_tau), title="Sigma tau sweep",
-            item_name="tau node", max_updates=20, note="dispatched")
+            item_name="tau node", max_updates=20)
         progress.start()
     for lo, Omega, B, B_odd in batches:
         if not synthesis and getattr(meta, 'mu_basis', None) is not None:
@@ -2314,7 +2314,7 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
 
 def _note_sc_fixed_quadrature(geometry, reasons) -> None:
     """An SC map's held Sigma rules: the ``sc.quadrature`` record (JSON
-    sidecar) and, when some window was rebuilt, the map's ``changes`` row
+    receipt) and, when some window was rebuilt, the map's ``changes`` row
     (``gw.sc_report``).  Values only; nothing here is computed."""
     from common.log import record
     from gw import sc_report
@@ -2567,7 +2567,7 @@ def compute_sigma_c_mpa_omega_grid(
                 support_window_ry=support_window_ry, support_top_ev=support_top_ev)
         quadrature_log.record_sigma_plan(geometry)
         from gw.production_report import log_sigma_rules
-        log_sigma_rules(geometry)
+        log_sigma_rules(geometry, omega_grid_ry=omega_grid_ry)
         log.debug(
             f"  MPA windows [box]: "
             f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "

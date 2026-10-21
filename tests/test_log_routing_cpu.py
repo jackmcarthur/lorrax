@@ -8,8 +8,7 @@ The three handlers a driver session installs, fed fixed records:
 * the rank stream handler writes ``%(message)s`` to the stream the process
   held when the session opened, leaves out on rank 0 what the main log
   mirrors there, and renders messages as the main log does on other ranks;
-* the JSON sidecar keeps each ``record`` extra under its ``record_key``, and
-  writes no file without one.
+* no JSON sidecar is written: a ``record`` extra is a DEBUG record's fields.
 
 Python warnings, ``LoopProgress`` and the stage cadence of ``common.timing``
 reach them with byte-identical text (nested stage traces at DEBUG), and a
@@ -20,7 +19,6 @@ main log.
 from __future__ import annotations
 
 import io
-import json
 import logging
 import re
 import sys
@@ -36,7 +34,6 @@ _BAR = re.compile(r"^\[ \d\d:\d\d:\d\d \| [\u2588\u2591]{10} \| +\d+% \] ")
 # ── extras ───────────────────────────────────────────────────────────────────
 # ── main-log handler ─────────────────────────────────────────────────────────
 # ── rank stream handler ──────────────────────────────────────────────────────
-# ── JSON sidecar ─────────────────────────────────────────────────────────────
 # ── a session: warnings, progress, stage cadence ─────────────────────────────
 def test_session_routes_warnings_progress_and_stage_lines(tmp_path):
     from common import timing
@@ -47,8 +44,7 @@ def test_session_routes_warnings_progress_and_stage_lines(tmp_path):
     uninstall = log.install_session(
         rank=0, debug=False, stream=console,
         on_message=lambda text, fields, level: got.append(("msg", text, level)),
-        on_detail=lambda text, fields: got.append(("detail", text)),
-        sidecar=str(tmp_path / "t.json"))
+        on_detail=lambda text, fields: got.append(("detail", text)))
     try:
         sys.stdout = io.StringIO()          # the swap: the rank stream keeps its stream
         with warnings.catch_warnings():
@@ -83,7 +79,6 @@ def test_session_routes_warnings_progress_and_stage_lines(tmp_path):
     assert not any("inner substep" in text or "outer" in text for text in details)
     assert len(got) == 6                    # the donation hint never reaches the log
     assert console.getvalue() == "rank-log line\n"
-    assert not (tmp_path / "t.json").exists()
     assert warnings.formatwarning is saved_format
     assert log._FALLBACK in logging.getLogger("lorrax").handlers
     assert logging.getLogger("lorrax").propagate
@@ -91,7 +86,7 @@ def test_session_routes_warnings_progress_and_stage_lines(tmp_path):
 
 def test_a_run_session_shows_progress_and_banners_in_its_main_log(tmp_path, capsys):
     """A non-GW driver's session: the bar and the stage banners are in the main
-    log, a warning is printed and summarized, a receipt is in the sidecar."""
+    log, a warning is printed and summarized, and no JSON sidecar is written."""
     from common import timing
     from common.progress import LoopProgress
     from runtime.run_session import RunSession
@@ -121,8 +116,7 @@ def test_a_run_session_shows_progress_and_banners_in_its_main_log(tmp_path, caps
     stdout = capsys.readouterr().out
     assert stdout.splitlines() == text      # the main log, mirrored once
     assert "incidental chatter" not in stdout
-    sidecar = json.loads((tmp_path / "probe.json").read_text())
-    assert sidecar["report"] == "probe.out" and sidecar["probe"] == {"receipt": {"n": 1}}
+    assert not (tmp_path / "probe.json").exists()
     assert blocks.warning_count(run.report.messages()) == 1
 
 

@@ -9,7 +9,13 @@ environment and decides no physics.  The rank-zero stream that prints them is
 Layout grid (all blocks):
 
 * titles, block headings and the closing line start at column 0;
+* two blank lines above each block heading, a ``=`` rule above and below each
+  ``[i/N]`` stage banner (``common.timing``);
 * a block row is ``label value`` at indent 2, the label padded to 17;
+* a table's header row is underlined, one dash run per column
+  (:func:`underline`);
+* a number in a table column has one fixed format, right-aligned
+  (:func:`fixed`: a sign column, two digits, two decimals);
 * a right-aligned item (an ``[id]``, a wall) ends at column 100;
 * a line holds at most 100 columns; only a command or a path may run over.
 """
@@ -47,10 +53,26 @@ _THREAD_NAMES = (
 
 
 # ── primitives ───────────────────────────────────────────────────────────────
-def heading(title: str) -> list[str]:
-    """A block heading: a blank line, the title in upper case, a dash rule."""
-    text = str(title).upper()
-    return ["", text, "-" * len(text)]
+def heading(title: str, suffix: str = "") -> list[str]:
+    """A block heading: two blank lines, the title in upper case (``suffix``,
+    a file name, as written), a dash rule."""
+    text = str(title).upper() + (f" {suffix}" if suffix else "")
+    return ["", "", text, "-" * len(text)]
+
+
+def underline(header: str) -> str:
+    """The rule under a table's header row: a dash run under each column title
+    (a title of words one space apart is one column), blanks between."""
+    return re.sub(r"\S+(?: \S+)*", lambda m: "-" * len(m.group()), str(header)).rstrip()
+
+
+def fixed(value: float, *, digits: int = 2, decimals: int = 2) -> str:
+    """One fixed-width number for a table column: a sign column, ``digits``
+    places before the point (a blank for a leading zero), ``decimals`` after:
+    ``+14.80``, ``- 7.40``, ``+ 0.25``.  A value too large runs wider."""
+    value = float(value)
+    sign = "-" if value < 0 else "+"
+    return sign + f"{abs(value):{digits + 1 + decimals}.{decimals}f}"
 
 
 def kv_lines(rows: Sequence[tuple[str, str]], *, indent: int = 2,
@@ -64,7 +86,8 @@ def kv_lines(rows: Sequence[tuple[str, str]], *, indent: int = 2,
 def table_lines(header: Sequence[str], rows: Sequence[Sequence[str]], *,
                 widths: Sequence[int], align: str, indent: int = 2,
                 legend: Sequence[tuple[str, str]] = ()) -> list[str]:
-    """A fixed-column table: one space between columns, the last column unpadded.
+    """A fixed-column table: one space between columns, the last column unpadded,
+    the header row underlined (one dash run per column width).
 
     ``align`` holds one ``l`` or ``r`` per column.  A ``legend`` prints below the
     table as ``label value`` rows at indent ``indent + 2``.
@@ -83,7 +106,11 @@ def table_lines(header: Sequence[str], rows: Sequence[Sequence[str]], *,
                 parts.append(f"{cell:>{width}}" if side == "r" else f"{cell:<{width}}")
         return (" " * indent + " ".join(parts)).rstrip()
 
-    return ([line(header)] + [line(row) for row in rows]
+    cells = [str(cell) for cell in header]
+    rule_widths = [max(width, len(cell)) if i < last else len(cell)
+                   for i, (cell, width) in enumerate(zip(cells, widths))]
+    rule = (" " * indent + " ".join("-" * w for w in rule_widths)).rstrip()
+    return ([line(header), rule] + [line(row) for row in rows]
             + kv_lines(legend, indent=indent + 2))
 
 
@@ -144,14 +171,10 @@ class RunFacts:
 
     driver: str                       # "gw", "bse", ...: the title and the closing line
     purpose: str                      # "GW quasiparticles"
-    argv: tuple[str, ...]             # the command, interpreter first
-    directory: str                    # the run directory; outputs print relative to it
     started: datetime                 # tz-aware
-    host: str
     job: str | None = None            # "Slurm job 60021274" or "Slurm job 59988848, step 6"
-    logs: tuple[str, ...] = ()        # the main log, relative to ``directory``
+    logs: tuple[str, ...] = ()        # the main log, relative to the run directory
     version: str | None = None        # printed only when given
-    native_bundle: str | None = None  # printed only when given
 
 
 def title_lines(driver: str, purpose: str) -> list[str]:
@@ -161,25 +184,18 @@ def title_lines(driver: str, purpose: str) -> list[str]:
 
 
 def header_lines(run: RunFacts) -> list[str]:
-    """The title and the run's facts, one per line, labels flush left."""
-    command = wrap_value(" ".join(run.argv), first_col=LABEL)
-    rows = []
+    """The title, then ``Started`` right under it (as BerkeleyGW does), the
+    version, the job and the logs, one per line, labels flush left.  No
+    command, directory or host row: the directory is stated once, at the
+    files table."""
+    rows = [("Started", fmt_clock(run.started))]
     if run.version:
         rows.append(("Version", run.version))
-    if run.native_bundle:
-        rows.append(("Native bundle", run.native_bundle))
-    rows.append(("Command", command[0]))
-    rows.append(("Directory", run.directory))
-    rows.append(("Started", fmt_clock(run.started)))
-    rows.append(("Host", run.host + (f", {run.job}" if run.job else "")))
+    if run.job:
+        rows.append(("Job", run.job))
     if run.logs:
         rows.append(("Logs", " · ".join(run.logs)))
-    lines = title_lines(run.driver, run.purpose)
-    for label, value in rows:
-        lines += kv_lines([(label, value)], indent=0)
-        if label == "Command":
-            lines += command[1:]
-    return lines
+    return title_lines(run.driver, run.purpose) + kv_lines(rows, indent=0)
 
 
 # ── devices ──────────────────────────────────────────────────────────────────
@@ -189,7 +205,12 @@ def devices_lines(facts: Mapping, *, mesh_role: str | None,
 
     ``facts`` may carry ``n_nodes``; without it the rank row gives the count
     alone.  ``mesh_role`` names what the two mesh axes hold; ``None`` omits the
-    mesh row.  ``extras`` are a driver's own ``(label, value)`` rows, printed last.
+    mesh row, which says how many GPUs the mesh leaves unused when it does not
+    fill them.  The card's memory is in the GPUs row; ``memory budget`` is the
+    one memory row.  FP64 is always on (``runtime.enforce_x64``), so the JAX
+    row does not state it.  ``extras`` are a driver's own ``(label, value)``
+    rows, printed last; math kernels are their own block
+    (:func:`math_kernel_lines`).
     """
     p = int(facts.get("process_count", 1))
     nodes = facts.get("n_nodes")
@@ -199,47 +220,71 @@ def devices_lines(facts: Mapping, *, mesh_role: str | None,
     nlocal = int(facts.get("n_local_devices", 0))
     kind = str(facts.get("device_kind", "unknown"))
     backend = str(facts.get("backend", "unknown")).lower()
+    gpu = backend in ("gpu", "cuda", "rocm")
     per_rank = f", {nlocal} per rank" if nlocal else ""
-    if backend in ("gpu", "cuda", "rocm"):
-        devices = ("GPUs", f"{ndev} x {kind}{per_rank}")
+    memory = facts.get("device_memory") or {}
+    card = f" ({memory['total'] / 1e9:.2f} GB)" if memory.get("total") else ""
+    if gpu:
+        devices = ("GPUs", f"{ndev} x {kind}{card}{per_rank}")
     else:
         devices = ("GPUs", f"none; {ndev} {backend.upper()} devices{per_rank}")
     rows = [("MPI ranks", ranks), devices]
     if mesh_role is not None:
         mesh = tuple(int(v) for v in facts.get("mesh_shape", (1, 1)))
-        rows.append(("mesh", f"{mesh[0]} x {mesh[1]} ({mesh_role})"))
+        unused = ndev - mesh[0] * mesh[1]
+        noun = "GPU" if gpu else "device"
+        rows.append(("mesh", f"{mesh[0]} x {mesh[1]} ({mesh_role})" + (
+            f"; {unused} {noun}{'' if unused == 1 else 's'} unused" if unused > 0 else "")))
     threads = facts.get("threads") or {}
     affinity = threads.get("affinity")
-    rows.append(("CPU", f"{affinity} cores per rank" if affinity is not None
-                 else "unknown cores per rank"))
-    # A runtime note names the library it applied the count to; the row keeps
-    # the count and why (``6 (auto: physical cores of the affinity mask)``).
-    named = [f"{short} " + re.sub(r";\s*applied to [^)]*", "", str(threads[key]))
-             for key, short in _THREAD_NAMES if threads.get(key) not in (None, "")]
-    rows.append(("host threads", ", ".join(named) if named else "runtime defaults"))
+    # A runtime note names the library it applied the count to and why; the
+    # row keeps the count (``OpenBLAS 6 threads``).
+    named = []
+    for key, short in _THREAD_NAMES:
+        value = threads.get(key)
+        if value in (None, ""):
+            continue
+        count = re.match(r"\s*(\d+)", str(value))
+        plain = re.sub(r";\s*applied to [^)]*", "", str(value))
+        named.append(f"{short} {count.group(1)} threads" if count else f"{short} {plain}")
+    cpu = (f"{affinity} cores per rank" if affinity is not None
+           else "unknown cores per rank")
+    rows.append(("CPU", cpu + (", " + ", ".join(named) if named else "")))
     lines = kv_lines(rows)
-    memory = facts.get("device_memory") or {}
     if memory.get("total"):
-        outside = memory.get("outside_max")
-        lines += kv_lines((
-            ("device memory", f"card {memory['total'] / 1e9:.2f} GB, XLA pool "
-                              f"{memory['reservation'] / 1e9:.2f} GB, "
-                              f"{memory['headroom'] / 1e9:.2f} GB outside the pool"),
-            ("memory budget", f"{memory['budget'] / 1e9:.2f} GB per device"),
-            ("after warm-up", "unread" if outside is None else
-                              f"{outside / 1e9:.2f} GB outside the pool (max over ranks)"),
-        ))
+        lines += kv_lines((("memory budget", f"{memory['budget'] / 1e9:.2f} GB per device"),))
         warning = device_memory_message(memory)
         if warning is not None:
             lines += message_lines(warning, indent=2)
-    precision = "FP64 / complex128" if facts.get("x64") else "FP32 / complex64"
-    collectives = ("NCCL" if backend in ("gpu", "cuda", "rocm") else
+    collectives = ("NCCL" if gpu else
                    str((facts.get("collectives") or {}).get("impl", "local")).upper())
+    on = (f" on {ndev} GPU{'' if ndev == 1 else 's'}" if gpu else
+          f" on {ndev} {backend.upper()} device{'' if ndev == 1 else 's'}")
     lines += kv_lines((("JAX", f"{facts.get('jax_version', 'unknown')} / jaxlib "
-                               f"{facts.get('jaxlib_version', 'unknown')}, {precision}, "
+                               f"{facts.get('jaxlib_version', 'unknown')}{on}, "
                                f"{collectives} collectives"),
                        *extras))
     return lines
+
+
+def math_kernel_lines(rows: Sequence[tuple[str, str]]) -> list[str]:
+    """The MATH KERNELS block's rows: which engine runs each kind of kernel
+    (dense linear algebra, k-convolutions, GEMMs), as ``(label, value)``."""
+    return kv_lines(rows)
+
+
+def memory_budget_message(peak_gb: float, budget_gb: float, *, where: str
+                          ) -> "Message | None":
+    """``WARNING [device_memory_near_budget]`` when a device peak reaches 90 %
+    of the per-device memory budget, else ``None``."""
+    if not budget_gb or peak_gb < 0.9 * float(budget_gb):
+        return None
+    return Message(
+        "WARNING", "device_memory_near_budget",
+        f"device memory reached {100.0 * peak_gb / budget_gb:.0f} % of the budget",
+        found=("device peak", f"{peak_gb:.2f} GB in {where}"),
+        needs=f"below 90 % of {budget_gb:.2f} GB per device",
+        fix="raise memory_per_device_gb toward the card, or run on more GPUs")
 
 
 def device_memory_message(memory: Mapping) -> "Message | None":
@@ -535,7 +580,9 @@ def time_reversal_check(receipt) -> tuple[str, dict] | None:
 
 
 def symmetry_lines(sym, *, centroids=None, tr_lines: Sequence[str] = ()) -> list[str]:
-    """The SYMMETRY block's rows and the operation table (always in full).
+    """The SYMMETRY block's rows and the table of every operation the run
+    uses (an operation the file lists and the run does not use is counted in
+    the ``QE types`` row, not tabulated).
 
     ``centroids`` is a loaded centroid set with a ``closure`` verdict (only for
     drivers that read centroids); ``tr_lines`` are :func:`time_reversal_lines`'
@@ -574,11 +621,14 @@ def symmetry_lines(sym, *, centroids=None, tr_lines: Sequence[str] = ()) -> list
                      f"NOT closed: {n_bad}/{n_ops} operations move the {sites}-site set; "
                      f"worst residual {float(verdict.worst_residual):.1e} at "
                      f"S{int(verdict.worst_op) + 1:02d}"))
-    lines = kv_lines(rows) + list(tr_lines)
-    lines.append(f"  {'op':<5} {'QE-TR':<6} {'used as':<9} {'R^-1':<32} "
-                 f"{'tau':<8} (r' = R^-1 r + tau)")
+    lines = kv_lines(rows) + list(tr_lines) + [""]
+    header = (f"  {'op':<5} {'QE-TR':<6} {'used as':<9} {'R^-1':<32} "
+              f"{'tau':<8} (r' = R^-1 r + tau)")
+    lines += [header, underline(header)]
     shown = _clean(tau, TAU_DIGITS)
     for i, (rotation, shift) in enumerate(zip(rotations, shown)):
+        if used[i] == "unused":         # the table lists the operations the run uses
+            continue
         flag = "-" if qe_tr is None else ("yes" if bool(qe_tr[i]) else "no")
         lines.append(f"  S{i + 1:02d}   {flag:<6} {used[i]:<9} {_matrix_text(rotation):<32} "
                      f"({shift[0]: .{TAU_DIGITS}f} {shift[1]: .{TAU_DIGITS}f} "
@@ -586,23 +636,18 @@ def symmetry_lines(sym, *, centroids=None, tr_lines: Sequence[str] = ()) -> list
     return lines
 
 
-def kpoint_lines(wfn, sym, *, extra: Mapping[str, Sequence] = {},
-                 max_rows: int = 100) -> list[str]:
-    """The K POINTS block: the grid, then the stored list in crystal coordinates.
-
-    A stored set that is the whole grid is one line and no list.  ``extra``
-    adds columns (``{"ngk": [...]}``).  A list longer than ``max_rows`` prints
-    20 rows and the count of the rest.
-    """
+def kpoint_lines(wfn, sym, *, extra: Mapping[str, Sequence] = {}) -> list[str]:
+    """The K POINTS block: the grid, then every stored k point in crystal
+    coordinates (no cap).  ``extra`` adds columns (``{"ngk": [...]}``)."""
     grid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
     shift = _clean(np.asarray(wfn.shift, dtype=np.float64).reshape(-1)[:3], K_DIGITS)
     shift_text = ("unshifted" if not np.any(shift) else
                   "shift (" + ", ".join(f"{v:.3f}" for v in shift) + ")")
     n_full, n_red = int(sym.nk_tot), int(sym.nk_red)
     head = f"{grid[0]} x {grid[1]} x {grid[2]}, {shift_text}: "
-    if n_red == n_full:
-        return kv_lines([("k grid", head + f"{n_full} k, all stored (no IBZ reduction)")])
-    lines = kv_lines([("k grid", head + f"{n_full} k in the BZ, {n_red} in the IBZ")])
+    lines = kv_lines([("k grid", head + (
+        f"{n_full} k, all stored (no IBZ reduction)" if n_red == n_full
+        else f"{n_full} k in the BZ, {n_red} in the IBZ"))]) + [""]
     weights = np.asarray(wfn.kweights, dtype=np.float64)
     if float(np.sum(weights)) != 0.0:
         weights = weights / float(np.sum(weights))
@@ -611,17 +656,14 @@ def kpoint_lines(wfn, sym, *, extra: Mapping[str, Sequence] = {},
     columns = {name: [str(v) for v in values] for name, values in extra.items()}
     widths = {name: max([len(name)] + [len(v) for v in values]) + 3
               for name, values in columns.items()}
-    lines.append(f"{'ik':>7}{'kx':>11}{'ky':>11}{'kz':>11}{'weight':>11}"
-                 + "".join(f"{name:>{widths[name]}}" for name in columns))
-    count = len(points)
-    shown = range(count) if count <= max_rows else range(20)
-    for i in shown:
+    header = (f"{'ik':>7}{'kx':>11}{'ky':>11}{'kz':>11}{'weight':>11}"
+              + "".join(f"{name:>{widths[name]}}" for name in columns))
+    lines += [header, underline(header)]
+    for i in range(len(points)):
         p = points[i]
         lines.append(f"{i + 1:>7}{p[0]:>11.{K_DIGITS}f}{p[1]:>11.{K_DIGITS}f}"
                      f"{p[2]:>11.{K_DIGITS}f}{weights[i]:>11.{K_DIGITS}f}"
                      + "".join(f"{columns[name][i]:>{widths[name]}}" for name in columns))
-    if count > max_rows:
-        lines.append(f"{'':7}[... {count - 20} more k points]")
     return lines
 
 
@@ -684,8 +726,9 @@ def timing_lines(rows: Sequence[TimingRow], *, wall: float, compile: str | None 
                 f"{float(seconds):>11.2f}{fraction:>10.2f}%")
         return text + (f"{gb:>12.2f}" if gb is not None else "")
 
-    lines = [f"  {'stage':<{width}}{'wall (s)':>11}{'fraction':>11}"
-             + (f"{'device GB':>12}" if peaks else "")]
+    header = (f"  {'stage':<{width}}{'wall (s)':>11}{'fraction':>11}"
+              + (f"{'device GB':>12}" if peaks else ""))
+    lines = [header, underline(header)]
     lines += [line(row.label, row.depth, row.seconds, row.device_gb) for row in rows]
     lines.append(f"  {'total run':<{width}}{float(wall):>11.2f}{100.0:>10.2f}%"
                  + (f"{max(peaks):>12.2f}" if peaks else ""))
@@ -743,7 +786,8 @@ def settings_lines(rows: Sequence[Setting]) -> list[str]:
     # column with it, so every effect starts in one column.
     value_width = min(max([15] + [len(row.value) for row in rows]), 20)
     effect_col = EFFECT_COL + value_width - 15
-    lines = [f"  {'key':<24} {'value':<{value_width}} {'source':<8} effect"]
+    header = f"  {'key':<24} {'value':<{value_width}} {'source':<8} effect"
+    lines = [header, underline(header)]
     for row in rows:
         left = f"  {row.key:<24} {row.value:<{value_width}} {row.source:<8} "
         column = max(len(left), effect_col)
@@ -758,10 +802,20 @@ def settings_lines(rows: Sequence[Setting]) -> list[str]:
     return lines
 
 
+def flag_lines(rows: Sequence[tuple[str, str]]) -> list[str]:
+    """The INPUT FLAGS block: a plain ``key value`` echo of what the input
+    set, in its order; no source, no effect (the METHOD block says what the
+    run does)."""
+    width = max([24] + [len(str(key)) + 1 for key, _ in rows])
+    return kv_lines([(str(key), str(value)) for key, value in rows], width=width + 1)
+
+
 # ── outputs ──────────────────────────────────────────────────────────────────
 def output_file_lines(rows: Sequence[tuple[str, str, str]], *, directory: str,
                       next_step: str | None = None) -> list[str]:
-    """The files table: ``role / state / path``, inputs first, paths relative.
+    """The files table: ``role / state / path``, inputs first, paths relative
+    to ``directory``, which the line above the table names (the one place the
+    log states the run directory).
 
     ``rows`` are ``(role, state, path)``.  A row whose state is in
     :data:`INPUT_STATES` is an input and prints before the outputs; the order is
@@ -770,7 +824,8 @@ def output_file_lines(rows: Sequence[tuple[str, str, str]], *, directory: str,
     ordered = sorted(rows, key=lambda row: row[1] not in INPUT_STATES)
     width = min(max([ROLE_MIN] + [len(str(role)) for role, _, _ in ordered]), ROLE_MAX)
     state_width = max([11] + [len(str(state)) + 1 for _, state, _ in ordered])
-    lines = table_lines(
+    lines = [f"  paths relative to {os.path.abspath(os.fspath(directory))}", ""]
+    lines += table_lines(
         ("role", "state", "path"),
         [(role, state, display_path(path, directory)) for role, state, path in ordered],
         widths=(width, state_width, 0), align="lll")
@@ -807,6 +862,11 @@ __all__ = [
     "device_memory_message",
     "devices_lines",
     "display_path",
+    "fixed",
+    "flag_lines",
+    "math_kernel_lines",
+    "memory_budget_message",
+    "underline",
     "message_detail",
     "message_from_exception",
     "message_lines",

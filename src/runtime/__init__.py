@@ -188,7 +188,6 @@ __all__ = [
     "read_matmul_precision",
     "enforce_x64",
     "set_x64_on_imported_jax",
-    "X64_OVERRIDE_ENV",
 ]
 
 
@@ -491,11 +490,9 @@ def install_failfast_excepthook() -> None:
     sys._lorrax_failfast_installed = True
 
 
-#: jax's own 64-bit variable, and the named override that lets a run proceed
-#: without it.  x64 off refuses; a deliberate 32-bit debug run has exactly one
-#: spelling for the opt-out, and it is printed on every startup.
+#: jax's own 64-bit variable.  x64 off refuses, always: FP64 is not a switch
+#: (owner ruling 2026-10-20; the former ``LORRAX_ALLOW_X64_OFF`` opt-out is gone).
 _X64_ENV = "JAX_ENABLE_X64"
-X64_OVERRIDE_ENV = "LORRAX_ALLOW_X64_OFF"
 
 #: XLA's GPU autotuner level is a compile-time environment choice.  Keep its
 #: name and default beside the other environment defaults rather than in a
@@ -714,7 +711,7 @@ def set_x64_on_imported_jax():
 
 
 def enforce_x64(resolved, *, where: str, say=None) -> None:
-    """REFUSE a run whose 64-bit values are off.  Announce a named opt-out.
+    """REFUSE a run whose 64-bit values are off.  There is no opt-out.
 
     ``resolved`` is a bool, or ``None`` for "not determinable here" (an
     unset variable before jax exists, or a spelling jax itself will refuse),
@@ -741,13 +738,6 @@ def enforce_x64(resolved, *, where: str, say=None) -> None:
     """
     if resolved is None or resolved:
         return
-    emit = say if say is not None else _print_rank0
-    from .env_flags import env_bool
-    if env_bool(X64_OVERRIDE_ENV, False, print_fn=emit):
-        emit(f"  [runtime] {X64_OVERRIDE_ENV}=1: 64-bit values are OFF "
-             f"({where}).  This run is UNCERTIFIED -- LORRAX physics is "
-             f"complex128 throughout and every result below is f32/c64.")
-        return
     raise RuntimeError(
         f"64-bit values are OFF and this run refuses to continue.\n"
         f"  got   x64 = False ({where})\n"
@@ -757,8 +747,7 @@ def enforce_x64(resolved, *, where: str, say=None) -> None:
         f"  fix   unset {_X64_ENV} (the runtime sets it to 1 itself), or "
         f"set {_X64_ENV}=1.\n"
         f"  doc   runtime.set_default_env (step 1 of "
-        f"initialize_communicator_stack); {X64_OVERRIDE_ENV}=1 runs anyway "
-        f"and says so on every startup.")
+        f"initialize_communicator_stack); FP64 cannot be switched off.")
 
 
 def set_default_env(*, platform: str = "gpu") -> None:

@@ -15,7 +15,8 @@ import numpy as np
 
 from common.production_report import ProductionReport
 from common.report_blocks import (
-    LABEL, Message, Setting, TimingRow, kv_lines, table_lines, timing_lines, wrap_value)
+    LABEL, Message, TimingRow, fixed, kv_lines, table_lines, timing_lines, underline,
+    wrap_value)
 from common.scientific_output import band_range as _code_band_range
 from common.units import RYD_TO_EV
 from . import quadrature_log
@@ -47,17 +48,13 @@ def _human_bytes(n_bytes: float) -> str:
         return f"{gib:.3g} GiB"
     return f"{float(n_bytes) / 2**20:.3g} MiB"
 
-#: One-line effects of the GW settings (BerkeleyGW style), by resolved value.
-_MODE_EFFECT = {
-    "x_only": "bare exchange only: no screening",
-    "cohsex": "static COHSEX: screened exchange + Coulomb hole at omega = 0",
-    "gn_ppm": "Godby-Needs plasmon pole, one pole per element",
-    "hl_ppm": "Hybertsen-Louie plasmon pole",
-    "mpa": "full-frequency W, shared-pole (multipole) model",
-}
-_SOLVER_EFFECT = {
-    "one_shot_dft": "Sigma at E_DFT; H(QP) diagonalized once",
-    "self_consistent": "QSGW: G, W, Sigma rebuilt from each map's states",
+#: What each self-energy ansatz is: its short name and its METHOD sentence.
+_MODE_METHOD = {
+    "x_only": ("bare exchange", "bare exchange only (Sigma_x): no screening"),
+    "cohsex": ("COHSEX", "static COHSEX: screened exchange plus Coulomb hole at omega = 0"),
+    "gn_ppm": ("GN-PPM", "Godby-Needs plasmon-pole GW, one pole per element"),
+    "hl_ppm": ("HL-PPM", "Hybertsen-Louie plasmon-pole GW"),
+    "mpa": ("MPA", "full-frequency GW, shared-pole (multipole) model of W"),
 }
 _DIM_EFFECT = {
     3: "3D bulk: no Coulomb truncation",
@@ -80,115 +77,118 @@ _SC_HEAD_EFFECT = {
     "dft_velocity": "head on the QP-rotated DFT velocity (dipole.h5)",
     "off": "the q->0 head is not updated between maps",
 }
-#: Deck-resolution notes (``[config provenance]`` lines) a settings row states.
-_RESOLVED_BY_ROW = ("density_self_consistent was not named",
-                    "density_self_consistent = false", "sc_head_update was not named",
-                    "restart was not named", "mpa_sampling_alpha =", "linalg =")
+#: The deck section the GW driver reads (``gw_config._read_input_section``).
+_DECK_SECTION = "cohsex"
+_DECK_KEY = re.compile(r"^\s*([A-Za-z_][\w.\-]*)\s*=\s*(.*?)\s*$")
+_DECK_HEAD = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]")
 
 
-def settings_rows(config, *, n_mu: int, n_q_irr: int, processes: int,
-                  budget_gb: float | None = None, device: str | None = None) -> list:
-    """The GW SETTINGS rows: what the deck set, what was derived, and the defaults
-    that change the result, each with its one-line effect.
-
-    ``n_mu``, ``n_q_irr`` and ``processes`` size the ``linalg`` row (the whole
-    N_mu x N_mu matrices a rank holds under ``local``); ``budget_gb`` and
-    ``device`` state the per-device memory budget.
-    """
-    named = frozenset(getattr(config, "raw_input_keys", ()) or ())
-
-    def source(key, *, derived=False):
-        return "deck" if key in named else ("derived" if derived else "default")
-
-    mode, solver = config.compute_mode.value, config.qp_solver.value
-    rows = [
-        Setting("compute_mode", mode,
-                source("compute_mode", derived=config.compute_mode_raw == "auto"),
-                _MODE_EFFECT.get(mode, mode)),
-        Setting("qp_solver", solver,
-                source("qp_solver", derived=config.qp_solver_raw == "auto"),
-                _SOLVER_EFFECT.get(solver, qp_solver_semantics(solver).description)),
-    ]
-    if config.compute_mode.needs_screening:
-        diagrams = config.screening.diagrams.value
-        rows.append(Setting("screening_diagrams", diagrams, source("screening_diagrams"), {
-            "w_rpa": f"RPA Dyson series, {config.screening.method} chi0 time rules",
-            "w_bse": "electron-hole ladder series in W"}.get(diagrams, diagrams)))
-    dim = int(config.sys_dim)
-    rows.append(Setting("sys_dim", str(dim), source("sys_dim"),
-                        _DIM_EFFECT.get(dim, f"{dim}D")))
-    head = config.head.correction.value
-    head_source = str(config.head.wcoul0_source)
-    rows.append(Setting("head_correction", head, source("head_correction"),
-                        _HEAD_EFFECT.get(head, head)
-                        + (" " + _HEAD_SOURCE.get(head_source, f"({head_source})")
-                           if head != "off" else "")))
-    if config.bispinor:
-        rows.append(Setting("bispinor", "true", source("bispinor"),
-                            "charge + transverse current; bispinor_gw = "
-                            + config.bispinor_gw.value))
-    if solver == "self_consistent":
-        dsc = bool(config.density_self_consistent)
-        rows.append(Setting(
-            "density_self_consistent", str(dsc).lower(),
-            source("density_self_consistent", derived=dsc),
-            "V_H rebuilt from each map's density" if dsc else
-            "V_H fixed at the DFT density: a comparison mode, not production QSGW"))
-        head_update = str(config.sc.head_update)
-        rows.append(Setting("sc_head_update", head_update,
-                            source("sc_head_update", derived=head_update != "off"),
-                            _SC_HEAD_EFFECT.get(head_update, head_update)))
-    elif not bool(config.no_degen_averaging) and "degen_avg_tol_ry" in named:
-        # The default tolerance changes no result a user reads; a deck value is shown.
-        tol = float(config.degen_avg_tol_ry)
-        rows.append(Setting("degen_avg_tol_ry", f"{tol:.3g}", source("degen_avg_tol_ry"),
-                            f"reported diagonals averaged within "
-                            f"{tol * RYD_TO_EV:.2g} eV"))
-    rows.append(Setting("restart", str(bool(config.restart)).lower(), source("restart"),
-                        "reuse the ISDF restart bundle" if config.restart else
-                        "fresh ISDF fit; no restart bundle is read"))
-    layout = str(config.backend.linalg).strip().lower()
-    q_per_rank = (int(n_q_irr) + int(processes) - 1) // int(processes)
-    rows.append(Setting(
-        "linalg", layout, str(config.backend.linalg_provenance),
-        f"{q_per_rank} whole N_mu^2 matrices per rank "
-        f"({_human_bytes(q_per_rank * int(n_mu) ** 2 * 16)})"
-        if layout == "local" else
-        f"N_mu x N_mu matrices 2D-distributed (N_mu = {int(n_mu)})"))
-    if budget_gb:
-        rows.append(Setting(
-            "memory_per_device_gb", f"{float(budget_gb):.2f}",
-            source("memory_per_device_gb", derived=True),
-            "the deck's budget per device" if "memory_per_device_gb" in named else
-            f"card rule{' on ' + device if device else ''}"))
-    if "band_chunk_size" in named:
-        rows.append(Setting("band_chunk_size", str(int(config.memory.band_chunk_size)),
-                            source("band_chunk_size"),
-                            "band panels gathered in chunks of at least this"))
-    if mode == "mpa" or "mpa_sampling_alpha" in named:
-        alpha_source = getattr(config.mpa, "sampling_alpha_provenance", "") or ""
-        rows.append(Setting("mpa_sampling_alpha", f"{config.mpa.sampling_alpha:g}",
-                            "deck" if "mpa_sampling_alpha" in named else "derived",
-                            "MPA frequency sampling exponent"
-                            + (f" ({alpha_source})" if alpha_source != "deck" else "")))
+def deck_flags(path) -> list[tuple[str, str]]:
+    """Every ``key = value`` the deck at ``path`` sets in its GW section, as
+    written and in its order (``#`` starts a comment); empty when the file
+    cannot be read.  The INPUT FLAGS echo: no default is listed."""
+    rows, seen, section = [], set(), None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            lines = stream.read().splitlines()
+    except OSError:
+        return []
+    sections = [m.group(1).lower() for m in map(_DECK_HEAD.match, lines) if m]
+    wanted = _DECK_SECTION if _DECK_SECTION in sections else (sections[0] if sections else None)
+    for line in lines:
+        body = line.split("#", 1)[0]
+        head = _DECK_HEAD.match(body)
+        if head:
+            section = head.group(1).lower()
+            continue
+        if wanted is not None and section != wanted:
+            continue
+        match = _DECK_KEY.match(body)
+        if match and match.group(1) not in seen:
+            seen.add(match.group(1))
+            rows.append((match.group(1), match.group(2)))
     return rows
 
 
-def resolved_notes(lines) -> list[str]:
-    """The deck-resolution notes no settings row states, without their tag."""
-    notes = []
-    for line in lines:
-        text = " ".join(str(line).replace("[config provenance]", "").split())
-        if text and not any(fragment in text for fragment in _RESOLVED_BY_ROW):
-            notes.append(text)
-    return notes
+def method_rows(config) -> list[tuple[str, str]]:
+    """The METHOD block: what this run computes, in plain sentences, from the
+    resolved configuration (no key names, no sources)."""
+    mode, solver = config.compute_mode.value, config.qp_solver.value
+    short, what = _MODE_METHOD.get(mode, (mode, mode))
+    sc = solver == "self_consistent"
+    rows = [("calculation", f"self-consistent QSGW with {short}: G, W and Sigma rebuilt "
+                            "from each map's states" if sc else
+                            f"one-shot {short} (Sigma at E_DFT), not self-consistent"),
+            ("self-energy", what),
+            ("QP Hamiltonian", qp_solver_semantics(solver).description)]
+    if not sc and config.compute_mode.is_dynamic:
+        rows.append(("QP solver", "one-shot DFT with band extrapolation: the Sigma_c band "
+                     "sum is extrapolated past its last band"
+                     if bool(config.sigma.band_extrapolation) else
+                     "one-shot DFT; the Sigma_c band sum stops at its last band"))
+    if config.compute_mode.needs_screening:
+        diagrams = config.screening.diagrams.value
+        screening = {"w_rpa": "RPA screened Coulomb interaction (Dyson series in chi0)",
+                     "w_bse": "BSE-screened Coulomb interaction (electron-hole ladder in W)"
+                     }.get(diagrams, diagrams)
+        omega_p = float(getattr(getattr(config, "ppm", None), "omega_p", 0.0) or 0.0) * RYD_TO_EV
+        screening += {
+            "gn_ppm": f"; W at z = 0 and z = i {omega_p:.2f} eV for GN-PPM",
+            "hl_ppm": f"; W at z = 0 and z = {omega_p:.2f} eV for HL-PPM",
+            "cohsex": "; W at z = 0",
+            "mpa": "; W on the shared-pole frequency samples",
+        }.get(mode, "")
+        rows.append(("screening", screening))
+    head = config.head.correction.value
+    source = str(config.head.wcoul0_source)
+    rows.append(("q->0 head", "off: no q->0 cell term" if head == "off" else
+                 f"{head} ({'local fields' if head == 'full' else 'no local fields'}), "
+                 + {"s_tensor": "S tensor from dipole.h5",
+                    "epshead": "from the epsilon head"}.get(source, f"source {source}")))
+    dim = int(config.sys_dim)
+    rows.append(("Coulomb", _DIM_EFFECT.get(dim, f"{dim}D")))
+    if config.bispinor:
+        rows.append(("bispinor", "charge + transverse current; bispinor_gw = "
+                     + config.bispinor_gw.value))
+    if sc:
+        dsc = bool(config.density_self_consistent)
+        rows.append(("Hartree", "V_H rebuilt from each map's density" if dsc else
+                     "V_H fixed at the DFT density: a comparison mode, not production QSGW"))
+        head_update = str(config.sc.head_update)
+        rows.append(("q->0 head update", _SC_HEAD_EFFECT.get(head_update, head_update)))
+    elif (not bool(config.no_degen_averaging)
+          and "degen_avg_tol_ry" in frozenset(getattr(config, "raw_input_keys", ()) or ())):
+        tol = float(config.degen_avg_tol_ry)
+        rows.append(("degenerate sets", f"reported diagonals averaged within "
+                                        f"{tol * RYD_TO_EV:.2g} eV"))
+    if mode == "mpa":
+        rows.append(("MPA sampling", f"frequency sampling exponent "
+                                     f"{float(config.mpa.sampling_alpha):g}"))
+    return rows
 
 
-_SIGMA_KIND = {
-    "crossing": "crossing",
-    "sign_definite_positive": "d > 0",
-    "sign_definite_negative": "d < 0",
-}
+def restart_line(config, tensors_file) -> str:
+    """The RESTART block's one line: what the run reads, what it fits fresh,
+    and the restart file it writes (``write_restart_tensors``)."""
+    name = os.path.join("tmp", os.path.basename(str(tensors_file))) if tensors_file else "-"
+    if config.restart:
+        return f"restart = true: zeta and V(q) are read from {name}"
+    text = "restart = false: zeta and V(q) are fitted fresh"
+    if bool(getattr(config, "write_restart_tensors", False)):
+        text += f"; {name} is written for bse"
+    return text
+
+
+def linalg_memory_line(config, *, n_mu: int, n_q_irr: int, processes: int) -> str:
+    """The dense-linalg MEMORY MODEL row: the whole N_mu x N_mu matrices a
+    rank holds under ``local``, or the 2D distribution."""
+    layout = str(config.backend.linalg).strip().lower()
+    q_per_rank = (int(n_q_irr) + int(processes) - 1) // int(processes)
+    if layout == "local":
+        return (f"local: {q_per_rank} whole N_mu x N_mu matrices per rank "
+                f"({_human_bytes(q_per_rank * int(n_mu) ** 2 * 16)})")
+    return f"{layout}: N_mu x N_mu matrices 2D-distributed (N_mu = {int(n_mu)})"
+
 
 
 def _ev(value_ry: float) -> str:
@@ -197,19 +197,45 @@ def _ev(value_ry: float) -> str:
     return f"{ev:.3g}" if abs(ev) < 1.0 else f"{ev:.2f}"
 
 
-def chi_rule_detail_row(row: dict) -> str:
-    """One screening rule as a stage-2 ``chi0 rules`` row (energies in eV)."""
+#: Width of the ``rule`` column of the chi0 rules table.
+_RULE_WIDTH = 12
+
+
+def chi_rule_name(kind: str, *, single: bool = True) -> str:
+    """A chi0 time rule named by the W it builds: ``W(0)`` for the static
+    rule, ``W(i omega_p)`` / ``W(omega_p)`` for the plasmon-pole probe (the
+    one imaginary / real rule of the run), ``W(i omega)`` / ``W(omega)`` when
+    there are several; a direct scan or a line rule keeps its kind."""
+    if kind == "static":
+        return "W(0)"
+    if kind == "imag":
+        return "W(i omega_p)" if single else "W(i omega)"
+    if kind == "real":
+        return "W(omega_p)" if single else "W(omega)"
+    return str(kind)
+
+
+def chi_rules_header() -> str:
+    """The header of the chi0 rules table (after its 15-wide label column)."""
+    return (f"{'rule':<{_RULE_WIDTH}} {'where':<35}{'nodes':>5}   "
+            f"{'max err':>7}   source")
+
+
+def chi_rule_detail_row(row: dict, *, single: bool = True) -> str:
+    """One screening rule as a stage-2 ``chi0 rules`` row (energies in eV);
+    ``single`` says whether it is the run's one rule of its kind."""
     kind = row["kind"]
+    name = chi_rule_name(kind, single=single)
     if kind == "direct":
         where = f"z {_ev(row['omega_ry'])} + {_ev(row['varpi_ry'])}i eV"
-        return f"{kind:<7} {where:<35}{'-':>5}   {'exact':>7}   ordered-pair scan"
+        return f"{name:<{_RULE_WIDTH}} {where:<35}{'-':>5}   {'exact':>7}   ordered-pair scan"
     if kind == "line":
         count = row["points"]
         where = (f"varpi {_ev(row['varpi_ry'])} eV, F {_ev(row['freq_max_ry'])} eV, "
                  f"{count} point{'' if count == 1 else 's'}")
         nodes = (f"{row['nodes']}x{row['sweeps']}" if row["sweeps"] > 1
                  else str(row["nodes"]))
-        return (f"{kind:<7} {where:<35}{nodes:>5}   "
+        return (f"{name:<{_RULE_WIDTH}} {where:<35}{nodes:>5}   "
                 f"{'<=' + format(row['target'], '.0e'):>7}   Gauss-Legendre")
     where = (f"x {_ev(row['x_min'])}-{_ev(row['x_max'])} eV, "
              f"R {row['x_max'] / row['x_min']:.3g}")
@@ -219,7 +245,14 @@ def chi_rule_detail_row(row: dict) -> str:
                  f"x {_ev(row['x_min'])}-{_ev(row['x_max'])} eV")
     # The certificate flag is the ``screening.chi0_rules`` record's; the row
     # names where the rule came from.
-    return f"{kind:<7} {where:<35}{row['nodes']:>5}   {row['error']:>7.1e}   {row['source']}"
+    return (f"{name:<{_RULE_WIDTH}} {where:<35}{row['nodes']:>5}   {row['error']:>7.1e}   "
+            f"{row['source']}")
+
+
+def chi_rule_rows(rules) -> list[str]:
+    """Every chi0 rule's row, each named by the W it builds."""
+    kinds = [row["kind"] for row in rules]
+    return [chi_rule_detail_row(row, single=kinds.count(row["kind"]) == 1) for row in rules]
 
 
 def log_chi_rules() -> None:
@@ -232,20 +265,55 @@ def log_chi_rules() -> None:
     log.debug("chi0 rules", extra=record("screening.chi0_rules", rules=rules))
     # Unlabelled detail rows keep their spacing (a labelled value is
     # re-wrapped); the label column is written here, 15 wide.
-    log.info(f"{'chi0 rules':<14} {'rule':<7} {'where':<35}{'nodes':>5}   "
-             f"{'max err':>7}   source", extra=block("screening"))
-    for row in rules:
-        log.info(" " * 15 + chi_rule_detail_row(row), extra=block("screening"))
+    header = f"{'chi0 rules':<14} " + chi_rules_header()
+    log.info(header, extra=block("screening"))
+    log.info(" " * 15 + underline(chi_rules_header()), extra=block("screening"))
+    for line in chi_rule_rows(rules):
+        log.info(" " * 15 + line, extra=block("screening"))
     quadrature_log.mark_shown("chi")
 
 
-def sigma_rule_detail_lines(geometry: dict) -> tuple[str, list[str]]:
-    """The ``Sigma rules`` head and the window table rows (Re d / eta only)."""
+#: A Sigma window's kind as the table names it.
+_SIGMA_KIND_NAME = {"crossing": "crossing", "sign_definite_positive": "sign-definite",
+                    "sign_definite_negative": "sign-definite"}
+#: The sign condition of a sign-definite window: ``(variable, operator, bound)``.
+_SIGMA_KIND_SIGN = {"sign_definite_positive": ("d", ">", "0"),
+                    "sign_definite_negative": ("d", "<", "0")}
+#: A window name's branch: ``ω≥E_F cond:resonant`` is the branch ``omega >= E_F``
+#: and the window ``cond:resonant``.
+_BRANCH = re.compile(r"^(?:ω|omega)\s*(≥|>=|≤|<=|<|>)\s*(\S+)\s+(.+)$")
+_OPERATOR = {"≥": ">=", "≤": "<="}
+
+
+def _window_branch(name: str) -> tuple[str, str, str, str]:
+    """``(variable, operator, bound, window)`` of a Sigma window's name; the
+    first three are blank when the name has no branch."""
+    match = _BRANCH.match(str(name))
+    if not match:
+        return "", "", "", str(name)
+    return "omega", _OPERATOR.get(match.group(1), match.group(1)), match.group(2), match.group(3)
+
+
+def sigma_rule_detail_lines(geometry: dict, *, energies_ev=None) -> tuple[str, list[str]]:
+    """The ``Sigma rules`` head and the window table.
+
+    The head gives eta, eps, the energy range the rules serve
+    (``energies_ev``, ``(lo, hi)`` eV about E_F, when given) and the window
+    and (window, tau) counts.  The table keeps the branch structure: a
+    branch row (``omega >= E_F``, its operator in a column of its own), then
+    its windows, each with its kind (``crossing`` / ``sign-definite`` and the
+    ``d < 0`` condition, operator aligned), the range of Re d / eta as
+    ``lo .. hi``, every number in one fixed format (``report_blocks.fixed``),
+    the nodes, sup/eps, kappa and the rule's origin.
+    """
     eta = float(geometry["eta_ry"])
     count = int(geometry.get("n_windows", 0))
     head = f"eta {eta * RYD_TO_EV:.2f} eV"
     if "eps" in geometry:
-        head += f", eps {float(geometry['eps']):.1e}"
+        head += ", eps " + re.sub(r"e([+-])0*(\d)", r"e\1\2", f"{float(geometry['eps']):.0e}")
+    if energies_ev is not None:
+        lo, hi = (float(v) for v in energies_ev)
+        head += f", energies {lo:+.2f} .. {hi:+.2f} eV about E_F"
     head += f"; {count} window{'' if count == 1 else 's'}"
     if "window_tau_pairs" in geometry:
         head += f", {geometry['window_tau_pairs']} (window, tau) pairs"
@@ -255,15 +323,26 @@ def sigma_rule_detail_lines(geometry: dict) -> tuple[str, list[str]]:
                for window in branch["windows"]]
     if not windows:
         return head, []
-    width = max(22, *(len(w["name"]) for w in windows))
-    rows = [f"{'window':<{width}} {'kind':<8}  {'Re d / eta':>16}{'nodes':>9}"
-            f"{'sup/eps':>9}{'kappa':>10}   rule"]
-    for w in windows:
+    parts = [_window_branch(w["name"]) for w in windows]
+    w_name = max([6] + [len(p[3]) for p in parts]) + 2
+    w_kind = max(len(name) for name in _SIGMA_KIND_NAME.values())
+    header = (f"{'window':<{w_name}}  {'kind':<{w_kind}}  {'sign':<5}  {'Re d / eta':^16}  "
+              f"{'nodes':>5}  {'sup/eps':>7}  {'kappa':>7}  rule")
+    rows = [header, underline(header)]
+    branch = None
+    for (var, op, bound, name), w in zip(parts, windows):
+        if var and (var, op, bound) != branch:
+            branch = (var, op, bound)
+            rows.append(f"{var} {op:<2} {bound}")      # the branch, its operator aligned
         lo, hi = (float(v) / eta for v in w["box_ry"][:2])
+        sign = _SIGMA_KIND_SIGN.get(w["kind"])
+        sign = f"{sign[0]} {sign[1]} {sign[2]}" if sign else ""
+        kind = _SIGMA_KIND_NAME.get(w["kind"], str(w["kind"]))
+        ratio = float(w["sup_error"]) / float(w["eps"])
         rows.append(
-            f"{w['name']:<{width}} {_SIGMA_KIND.get(w['kind'], w['kind']):<8}  "
-            f"{lo:+7.1f}..{hi:+7.1f}{w['node_count']:>9}"
-            f"{w['sup_error'] / w['eps']:>9.3f}{w['kappa_max']:>10.1e}   "
+            f"{'  ' + name if var else name:<{w_name}}  {kind:<{w_kind}}  {sign:<5}  "
+            f"{fixed(lo)} .. {fixed(hi)}  {int(w['node_count']):>5}  "
+            f"{fixed(ratio):>7}  {float(w['kappa_max']):>7.1e}  "
             f"{_rule_source(w['rule_source'])}")
     return head, rows
 
@@ -286,15 +365,21 @@ def _rule_source(source) -> str:
     return source.split(":", 1)[0]
 
 
-def log_sigma_rules(geometry: dict) -> None:
+def log_sigma_rules(geometry: dict, *, omega_grid_ry=None) -> None:
     """The Sigma rule plan under stage 3 of the main log: the ``Sigma rules``
-    row and the window table.  Only the run's first plan is shown there; a
-    later plan (an SC map) is the end-of-run quadrature block's."""
+    row (with the energy range of ``omega_grid_ry``, the Sigma grid about
+    E_F, when given) and the window table.  Only the run's first plan is
+    shown there; a later plan (an SC map) is the end-of-run quadrature
+    block's."""
     from common.log import block, get_logger
     if quadrature_log.sigma_plan()[1] != 1:
         return
     log = get_logger(__name__)
-    head, rows = sigma_rule_detail_lines(geometry)
+    energies = None
+    if omega_grid_ry is not None and np.size(omega_grid_ry):
+        grid = np.asarray(omega_grid_ry, dtype=np.float64) * RYD_TO_EV
+        energies = (float(np.min(grid)), float(np.max(grid)))
+    head, rows = sigma_rule_detail_lines(geometry, energies_ev=energies)
     log.info(head, extra=block("sigma", label="Sigma rules"))
     for row in rows:
         log.info(row, extra=block("sigma"))
@@ -302,13 +387,15 @@ def log_sigma_rules(geometry: dict) -> None:
 
 
 # ── stage rows ───────────────────────────────────────────────────────────────
-def v_q_detail(*, n_q: int, n_mu: int, seconds: float | None, restart_file=None) -> str:
-    """The stage-1 ``V(q)`` row: how many q, the matrix size, and its wall
-    (or the restart file it was read from)."""
+def v_q_detail(*, n_q: int, n_mu: int, seconds: float | None = None,
+               restart_file=None) -> str:
+    """The stage-1 ``V(q)`` row: how many q and the matrix size (or the
+    restart file it was read from).  No wall: the ``=>`` line carries the
+    stage's; ``seconds`` is accepted and unused."""
     text = f"{int(n_q)} q, {int(n_mu)} x {int(n_mu)} per q"
     if restart_file:
         return text + f", read from {os.path.basename(str(restart_file))}"
-    return text + (f", {float(seconds):.2f} s" if seconds is not None else "")
+    return text
 
 
 def w_roles_detail(roles, *, n_q: int, trs_allowed: bool = True) -> str:
@@ -320,14 +407,17 @@ def w_roles_detail(roles, *, n_q: int, trs_allowed: bool = True) -> str:
     parts = []
     for role, omega in roles:
         notes = []
+        name = {"static": "W(0)"}.get(str(role), str(role))
         if omega is not None:
             omega = complex(omega)
+            if str(role) == "probe":
+                name = "W(i omega_p)" if omega.real == 0.0 else "W(omega_p)"
             notes.append("omega 0" if omega == 0 else
                          f"omega {omega.imag * RYD_TO_EV:.1f}i eV" if omega.real == 0.0 else
                          f"omega {omega.real * RYD_TO_EV:.1f} eV")
         if role == "probe" and not trs_allowed:
             notes.append("ordered orientations")
-        parts.append(str(role) + (f" ({', '.join(notes)})" if notes else ""))
+        parts.append(name + (f" ({', '.join(notes)})" if notes else ""))
     return ", ".join(parts) + f"; Dyson on {int(n_q)} q"
 
 
@@ -349,7 +439,8 @@ def log_stage_row(label: str, value: str, *, stage: str = "detail") -> None:
 
 # ── setup blocks: INPUT FILES, BAND WINDOWS ──────────────────────────────────
 def input_file_lines(rows) -> list[str]:
-    """The INPUT FILES table: ``file / bands / k grid / spinor / check``.
+    """The INPUT FILES table: ``file / bands / k grid / spinor / check``
+    (the header underlined).
 
     ``rows`` are ``(file, bands, k grid, spinor, check)``; a cell no cheap
     header read gives is ``-``.  The check column is last and unpadded.
@@ -357,12 +448,36 @@ def input_file_lines(rows) -> list[str]:
     header = ("file", "bands", "k grid", "spinor", "check")
     widths = [max([len(header[i])] + [len(str(row[i])) for row in rows])
               for i in range(4)]
-    widths = [max(w, minimum) for w, minimum in zip(widths, (22, 8, 15, 8))]
-    return table_lines(header, [tuple(str(cell) for cell in row) for row in rows],
-                       widths=(*widths, 0), align="lllll")
+    widths = [max(w, minimum) for w, minimum in zip(widths, (14, 5, 6, 6))]
+    column = 2 + sum(w + 1 for w in widths)
+    lines = table_lines(header, [], widths=(*widths, 0), align="lllll")
+    for row in rows:
+        cells = [str(cell) for cell in row]
+        check = wrap_value(cells[4], first_col=column)
+        lines += table_lines(header, [(*cells[:4], check[0])], widths=(*widths, 0),
+                             align="lllll")[2:] + check[1:]
+    return lines
 
 
 _FEATURE_FIT = re.compile(r"left=\((\d+),\s*(\d+)\),\s*right=\((\d+),\s*(\d+)\)")
+
+
+def centroid_file_window(path):
+    """``((lo, hi), (lo, hi))``: the zero-based left and right band windows a
+    centroid file was selected on, from its ``# feature fit: left=(0, 3),
+    right=(0, 7)`` header line; ``None`` when the header does not say."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if not line.startswith("#"):
+                    break
+                match = _FEATURE_FIT.search(line)
+                if match and "feature fit" in line:
+                    lo_l, hi_l, lo_r, hi_r = (int(v) for v in match.groups())
+                    return (lo_l, hi_l), (lo_r, hi_r)
+    except OSError:
+        pass
+    return None
 
 
 def centroid_file_bands(path) -> str:
@@ -391,12 +506,17 @@ def _same_path(a, b) -> bool:
 
 
 def _k_cell(nk: int, n_stored: int, grid) -> str:
-    """``5x5x1, 9 IBZ`` / ``5x5x1, 25 k``: the k set a file stores, on the
-    run's grid when its full-zone count matches it."""
-    text = f"{n_stored} IBZ" if int(n_stored) != int(nk) else f"{int(nk)} k"
+    """``5x5x1, 9 IBZ`` / ``5x5x1, 25 k (full zone)``: the k set a file
+    stores, on the run's grid when its full-zone count matches it."""
+    text = f"{n_stored} IBZ" if int(n_stored) != int(nk) else f"{int(nk)} k (full zone)"
     if grid is not None and int(np.prod(grid)) == int(nk):
         return f"{grid[0]}x{grid[1]}x{grid[2]}, " + text
     return text
+
+
+def _spinor_cell(nspinor: int) -> str:
+    """The INPUT FILES ``spinor`` cell: ``yes`` for spinor wave functions."""
+    return "yes" if int(nspinor) == 2 else "no"
 
 
 def h5_input_cells(path, kind: str, *, grid=None) -> tuple[str, str, str]:
@@ -415,7 +535,7 @@ def h5_input_cells(path, kind: str, *, grid=None) -> tuple[str, str, str]:
                     cells[1] = _k_cell(int(attrs["nk"]), int(attrs.get("nrk", attrs["nk"])),
                                        grid)
                 if "nspinor" in attrs:
-                    cells[2] = str(int(attrs["nspinor"]))
+                    cells[2] = _spinor_cell(int(attrs["nspinor"]))
             else:
                 attrs = h5.attrs
                 if "band_energies" in h5:
@@ -423,45 +543,72 @@ def h5_input_cells(path, kind: str, *, grid=None) -> tuple[str, str, str]:
                     cells[0] = band_range(0, int(shape[-1]))
                     cells[1] = _k_cell(int(shape[0]), int(shape[0]), grid)
                 if "prov_nspinor" in attrs:
-                    cells[2] = str(int(attrs["prov_nspinor"]))
+                    cells[2] = _spinor_cell(int(attrs["prov_nspinor"]))
     except Exception:                       # noqa: BLE001 - a header the report cannot read
         pass
     return tuple(cells)
 
 
-def wavefunction_lines(name: str, *, wfn, sym, n_bands: int) -> list[str]:
-    """The ``Wavefunctions (WFN.h5)`` detail block under INPUT FILES."""
+def wavefunction_lines(*, wfn, sym, n_bands: int, band_slices=None,
+                       material_class: str | None = None) -> list[str]:
+    """The WAVEFUNCTIONS block: the reader, the k grid, the bands in the file
+    and those loaded, spinor or scalar wave functions, the FFT grid, and the
+    electrons with the occupied bands."""
     grid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
     shift = np.asarray(getattr(wfn, "shift", (0, 0, 0)), dtype=np.float64).reshape(-1)[:3]
     shift_text = ("unshifted" if not np.any(np.abs(shift) > 1e-12) else
                   "shift (" + ", ".join(f"{v:.3f}" for v in shift) + ")")
     n_full, n_red = int(sym.nk_tot), int(sym.nk_red)
-    stored = f"{n_red} k stored (IBZ)" if n_red != n_full else f"{n_full} k stored"
-    electrons = float(getattr(wfn, "num_electrons", np.nan))
+    stored = (f"{n_full} k in the BZ, {n_red} in the IBZ" if n_red != n_full
+              else f"{n_full} k, all stored")
+    bands = f"{int(n_bands)} in the file"
+    if band_slices is not None:
+        b = band_slices
+        top = int(getattr(b, "b4_logical", b.b4))
+        bands += f"; {band_range(b.b0, top)} loaded"
+        if int(b.b4) != top:
+            bands += f", padded to {int(b.b4) - int(b.b0)} rows for the mesh"
     nspinor = int(wfn.nspinor)
-    spinor = "2-component" if nspinor == 2 else "scalar (1-component)"
+    spinor = "spinor wave functions" if nspinor == 2 else "scalar wave functions"
     if not bool(getattr(sym, "trs_allowed", True)):
         spinor += ", time reversal broken"
-    rows = [("k grid", f"{grid[0]} x {grid[1]} x {grid[2]}, {shift_text}, {stored}"),
-            ("bands", f"{int(n_bands)} ({electrons:.5f} electrons)"),
-            ("spinor", spinor)]
+    rows = [("reader", str(getattr(wfn, "backend", "unknown"))),
+            ("k grid", f"{grid[0]} x {grid[1]} x {grid[2]}, {shift_text}: {stored}"),
+            ("bands", bands), ("spinor", spinor)]
     fft = getattr(wfn, "fft_grid", None)
     if fft is not None:
         fft = [int(v) for v in np.asarray(fft).reshape(-1)[:3]]
         rows.append(("FFT grid", " x ".join(str(v) for v in fft)))
-    rows.append(("reader", str(getattr(wfn, "backend", "unknown"))))
-    return [f"  Wavefunctions ({name})"] + kv_lines(rows, indent=4, width=LABEL)
+    electrons = float(getattr(wfn, "num_electrons", np.nan))
+    text = f"{electrons:.3f}"
+    if material_class:
+        text += f": {material_class}"
+    if band_slices is not None:
+        text += (", occupied bands " if material_class != "metal"
+                 else ", fractional occupations up to band ")
+        text += (band_range(band_slices.b0, band_slices.b2) if material_class != "metal"
+                 else str(int(band_slices.b2)))
+    rows.append(("electrons", text))
+    return kv_lines(rows)
 
 
-def band_window_lines(band_slices, zeta_ranges, *, n_electrons: float) -> list[str]:
-    """The BAND WINDOWS rows: which bands each part of the calculation uses."""
+#: The BAND WINDOWS block's one-line reading guide.
+BAND_WINDOWS_NOTE = ("Sigma matrix elements are computed on the QP matrix bands; the chi0 / W "
+                     "and Sigma band sums run over the bands listed.")
+
+
+def band_window_lines(band_slices, zeta_ranges, *, n_electrons: float | None = None
+                      ) -> list[str]:
+    """The BAND WINDOWS rows: which bands each part of the calculation uses,
+    under one line on how to read them.  ``n_electrons`` is accepted and
+    unused (the WAVEFUNCTIONS block states the electrons)."""
     b = band_slices
     # ``b4_logical`` is the physical loaded top (tagged_arrays.py); a
     # band-slices object without it (older producers, test stubs) means
     # no mesh padding, so the padded top is the logical top.
     b4_logical = int(getattr(b, "b4_logical", b.b4))
     rows = [
-        ("occupied", f"{band_range(b.b0, b.b2)} ({n_electrons:.5f} electrons)"),
+        ("occupied", band_range(b.b0, b.b2)),
         ("QP matrix", f"{band_range(b.b0, b.b3)} (valence {band_range(b.b1, b.b2)}, "
                       f"conduction {band_range(b.b2, b.b3)})"),
         ("chi0 / W sum", band_range(b.b0, min(int(b.b4_chi), b4_logical))),
@@ -473,7 +620,8 @@ def band_window_lines(band_slices, zeta_ranges, *, n_electrons: float) -> list[s
     if int(b.b4) != b4_logical:
         rows.append(("band carrier", f"{band_range(b.b0, b.b4)} "
                                      f"({int(b.b4) - b4_logical} zero-pad rows)"))
-    return kv_lines(rows)
+    wrapped = wrap_value(BAND_WINDOWS_NOTE, first_col=2)
+    return ["  " + wrapped[0]] + wrapped[1:] + [""] + kv_lines(rows)
 
 
 # ── RESULTS ──────────────────────────────────────────────────────────────────
@@ -775,18 +923,28 @@ class GWProductionReport(ProductionReport):
         self._quadrature_heading = False
 
     def settings_block(self, *, config, n_mu: int, n_q_irr: int, processes: int,
-                       resolved=()) -> None:
-        """SETTINGS, before any dense data is allocated: the GW rows, then the
-        deck-resolution notes (``resolved``) that no row states."""
-        facts = getattr(self.runtime, "facts", None) or {}
-        budget = float((facts.get("device_memory") or {}).get("budget") or 0.0) / 1e9
-        self.settings(settings_rows(
-            config, n_mu=n_mu, n_q_irr=n_q_irr, processes=processes,
-            budget_gb=budget or float(config.memory.per_device_gb) or None,
-            device=facts.get("device_kind")))
-        for note in resolved_notes(resolved):
-            wrapped = wrap_value(note, first_col=LABEL + 2)
-            self.emit_lines(kv_lines([("resolved", wrapped[0])]) + wrapped[1:])
+                       resolved=(), tensors_file=None) -> None:
+        """INPUT FLAGS (the deck's own ``key value`` lines), METHOD (what the
+        run computes, in sentences) and RESTART (what it reads or fits fresh),
+        before any dense data is allocated.  The dense-linalg size is a
+        MEMORY MODEL row; the deck-resolution notes (``resolved``) are DEBUG
+        lines."""
+        from common.log import block, get_logger
+        log = get_logger(__name__)
+        self.flags(deck_flags(getattr(config, "input_file", "") or ""))
+        self.heading("Method")
+        for label, value in method_rows(config):
+            wrapped = wrap_value(value, first_col=LABEL + 2)
+            self.emit_lines(kv_lines([(label, wrapped[0])]) + wrapped[1:])
+        self.heading("Restart")
+        wrapped = wrap_value(restart_line(config, tensors_file), first_col=LABEL + 2)
+        self.emit_lines(kv_lines([("restart", wrapped[0])]) + wrapped[1:])
+        log.info(linalg_memory_line(config, n_mu=n_mu, n_q_irr=n_q_irr, processes=processes),
+                 extra=block("memory", label="dense linalg"))
+        for line in resolved:
+            text = " ".join(str(line).replace("[config provenance]", "").split())
+            if text:
+                log.debug(f"resolved: {text}")
         if (config.qp_solver.value == "self_consistent"
                 and not bool(config.density_self_consistent)):
             self.warn(Message(
@@ -796,17 +954,18 @@ class GWProductionReport(ProductionReport):
                 fix="remove density_self_consistent = false from the deck"))
 
     def devices(self, *, config) -> None:
-        """The shared Devices rows plus the GW engines this run calls."""
+        """The shared DEVICES rows, then MATH KERNELS: the engines this run's
+        dense linear algebra, k-convolutions and G(tau) GEMM call."""
         f = self.runtime.facts
         platform = f.get("ffi_platform", str(f.get("backend", "unknown")).lower())
-        extras = [("dense linalg", f"{config.backend.linalg} layout")]
+        kernels = [("dense linalg", f"{config.backend.linalg} layout")]
         # The k-convolution router has no dial: it answers by device vendor
         # (nvidia-mathdx on CUDA, the host plan route on cpu, XLA elsewhere),
         # so the report names the engine it picks.
         kconv = {"CUDA": "nvidia-mathdx fused cuFFTDx kernels",
                  "cpu": "FFTW3-ABI host plan route"}.get(
                      platform, "XLA, jnp.fft k-axis transforms")
-        extras.append(("k-convolutions", f"{platform}, {kconv} (zeta fit and Sigma)"))
+        kernels.append(("k-convolutions", f"{platform}, {kconv} (zeta fit and Sigma)"))
         # Report only dials with a caller in this calculation.
         for dial in f.get("ffi_dials", ()):
             name = str(dial.get("env", ""))
@@ -821,31 +980,38 @@ class GWProductionReport(ProductionReport):
             else:
                 state = "OFF"
                 implementation = str(dial.get("off_label") or "default lowering")
-            extras.append(("G(tau) GEMM", f"{implementation} ({name} = {state})"))
-        super().devices(mesh_role="centroid axes X x Y", extras=extras)
+            kernels.append(("G(tau) GEMM", f"{implementation} ({name} = {state})"))
+        super().devices(mesh_role="centroid axes X x Y", kernels=kernels)
 
-    def input_files(self, *, config, wfn, sym, centroids=None) -> None:
+    def input_files(self, *, config, wfn, sym, centroids=None, zeta_ranges=None,
+                    band_slices=None, material_class=None) -> None:
         """INPUT FILES: one row per core input this deck reads, then the
-        wavefunction file's own facts.  Only what is cheap is shown: the WFN
-        header, the centroid set's closure verdict and the bands its header
-        names, the kin_ion / dipole windows from their HDF5 attributes and
-        dataset shapes (rank zero, no dataset read), and whether the other
-        files exist (their windows are checked where they are read)."""
+        WAVEFUNCTIONS block.  The WFN row points to that block, which says
+        everything about the file.  Only what is cheap is shown: the centroid
+        set's closure verdict and the bands its header names (against the
+        zeta fit's left window, ``zeta_ranges``), the kin_ion / dipole
+        windows from their HDF5 attributes and dataset shapes (rank zero, no
+        dataset read), and whether the other files exist (their windows are
+        checked where they are read)."""
         grid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
-        n_full, n_red = int(sym.nk_tot), int(sym.nk_red)
         n_bands = int(np.asarray(wfn.energies).shape[-1])
-        k_short = (f"{grid[0]}x{grid[1]}x{grid[2]}, "
-                   + (f"{n_red} IBZ" if n_red != n_full else f"{n_full} k"))
-        rows = [(os.path.basename(config.paths.wfn_file), band_range(0, n_bands),
-                 k_short, str(int(wfn.nspinor)), "OK  (source of everything below)")]
+        rows = [(os.path.basename(config.paths.wfn_file), "-", "-", "-",
+                 "OK, see WAVEFUNCTIONS")]
         header_reads = self.rank == 0          # only rank zero prints the table
         centroid_file = config.paths.centroids_file
         if centroids is not None:
             closed = bool(getattr(centroids, "orbit_closed", True))
-            rows.append((os.path.basename(centroid_file),
-                         centroid_file_bands(centroid_file) if header_reads else "-", "-", "-",
-                         f"OK  {int(centroids.n_rmu)} sites, orbit closed" if closed else
-                         f"WARNING  {int(centroids.n_rmu)} sites, orbit not closed"))
+            window = centroid_file_window(centroid_file) if header_reads else None
+            check = (f"OK  {int(centroids.n_rmu)} sites, orbit closed" if closed else
+                     f"WARNING  {int(centroids.n_rmu)} sites, orbit not closed")
+            if (closed and window is not None and zeta_ranges is not None
+                    and int(window[0][1]) < int(zeta_ranges[0][1])):
+                # Fitted to the bands in the bands cell; the stage-1 WARNING
+                # says what the zeta fit needs.
+                check = "fitted to these bands: not optimized for this run [centroid_window_short]"
+            rows.append((os.path.basename(centroid_file), "-" if window is None else
+                         f"L {band_range(*window[0])} x R {band_range(*window[1])}",
+                         "-", "-", check))
         current = getattr(config.paths, "centroids_file_current", None)
         if current and not _same_path(current, centroid_file):
             rows.append((os.path.basename(current),
@@ -866,9 +1032,10 @@ class GWProductionReport(ProductionReport):
             rows.append((os.path.basename(transport), "-", "-", "-", "found"))
         self.heading("Input files")
         self.emit_lines(input_file_lines(rows))
-        self.emit()
+        self.heading("Wavefunctions", f"({os.path.basename(config.paths.wfn_file)})")
         self.emit_lines(wavefunction_lines(
-            os.path.basename(config.paths.wfn_file), wfn=wfn, sym=sym, n_bands=n_bands))
+            wfn=wfn, sym=sym, n_bands=n_bands, band_slices=band_slices,
+            material_class=material_class))
 
     @staticmethod
     def trs_consequence(*, config, sym, material_class="insulator") -> str | None:
@@ -891,14 +1058,13 @@ class GWProductionReport(ProductionReport):
     def bands(self, *, config, wfn, band_slices, zeta_ranges) -> None:
         """BAND WINDOWS: which bands each part of the calculation uses."""
         self.heading("Band windows")
-        self.emit_lines(band_window_lines(
-            band_slices, zeta_ranges,
-            n_electrons=float(getattr(wfn, "num_electrons", np.nan))))
+        self.emit_lines(band_window_lines(band_slices, zeta_ranges))
 
     def sigma_coverage(self, *, config, band_slices, enk_dft_ry,
                        sigma_result, final: bool = False) -> None:
         """The dynamic Sigma grid against Sigma's resolved energy origin, as
-        stage-3 rows (``Sigma grid``, ``on shell``, ``coverage``, ``band tail``)
+        stage-3 rows (``coverage`` and the ``band tail`` fit; the grid is the
+        ``Sigma rules`` row's)
         and the ``sigma.coverage`` record.  Shown once: the one-shot shows it
         under its stage (the same result), so the end-of-run call is then a
         no-op.  ``final`` (the end-of-run call) prints the rows in the
@@ -940,13 +1106,10 @@ class GWProductionReport(ProductionReport):
         omega_grid = np.asarray(() if _grid is None else _grid, dtype=np.float64)
         on_shell = sigma_result.sigma_c_on_shell is not None
         step = float(config.sigma.omega_step_ev)
-        rows = [("Sigma grid",
-                 f"{grid_lo:+.2f} .. {grid_hi:+.2f} eV about E_F = {ef_ev:.5f} eV "
-                 f"({provenance}), step {step:.2f} eV, {int(omega_grid.size)} points")]
-        if on_shell:
-            # On shell the grid is only the covered range; Sigma was not
-            # sampled on its points (docs/theory/sigma-on-shell.md).
-            rows.append(("on shell", "covered range only"))
+        # The grid itself is the Sigma rules row's (stage 3); after the sweep
+        # the log keeps the coverage verdict and the band-tail fit (owner
+        # notes 2026-10-20).  The grid's figures stay in the record.
+        rows = []
         fields = dict(efermi_ev=ef_ev, reference=str(provenance),
                       grid_ev=[grid_lo, grid_hi], step_ev=step,
                       points=int(omega_grid.size), on_shell=bool(on_shell),
@@ -1004,11 +1167,9 @@ class GWProductionReport(ProductionReport):
                       tail_counts=[int(v) for v in counts] if counts else None,
                       raw_columns=bool(raw))
         if config.sigma.band_extrapolation:
-            tail = str(estimator)
+            tail = f"{estimator} fit"
             if counts:
                 tail += " on bands " + " / ".join(str(int(v)) for v in counts)
-            if raw:
-                tail += "; raw (untailed) columns kept in the table"
         else:
             tail = "off: Sigma_c is the band sum truncated at the Sigma window"
         rows.append(("band tail", tail))
@@ -1048,10 +1209,10 @@ class GWProductionReport(ProductionReport):
         self._quadrature_heading = True
         self.heading("Quadrature windows")
         if rules:
-            self.emit(f"  {'chi0 rules':<15}{'rule':<7} {'where':<35}{'nodes':>5}   "
-                      f"{'max err':>7}   source")
-            for row in rules:
-                self.emit("  " + " " * 15 + chi_rule_detail_row(row))
+            self.emit(f"  {'chi0 rules':<15}" + chi_rules_header())
+            self.emit("  " + " " * 15 + underline(chi_rules_header()))
+            for line in chi_rule_rows(rules):
+                self.emit("  " + " " * 15 + line)
         if geometry is not None:
             head, rows = sigma_rule_detail_lines(geometry)
             if self_consistent:
@@ -1365,8 +1526,8 @@ class GWProductionReport(ProductionReport):
         from common.log import get_logger, record
         from lxkit import memory
         log = get_logger(__name__)
-        # The clock notes, the Sigma tau split and the table itself are the
-        # sidecar's; the main log keeps the table and one line pointing there.
+        # The clock notes, the Sigma tau split and the table itself are DEBUG
+        # receipts (printed with verbose); the main log keeps the table.
         log.debug("timing notes: " + " | ".join(notes),
                   extra=record("timing.notes", notes=notes))
         if any(r["name"].startswith("tau.") for r in rows):
@@ -1386,9 +1547,12 @@ class GWProductionReport(ProductionReport):
             n_ranks=n_ranks))
         self._stage_memory(rows, stages, wall=wall)
         self._record_routes()
-        sidecar = os.path.splitext(os.path.basename(self.path))[0] + ".json"
-        self.emit(f"  per-stage memory, priced stages and notes on fused clocks: "
-                  f"{sidecar} (timing, memory)")
+        if top is not None and budget:
+            from common.report_blocks import memory_budget_message
+            warning = memory_budget_message(top.device_gb, budget, where=top.label)
+            if warning is not None:
+                self.warn(warning, indent=2)
+        self.memory_model()
 
     @staticmethod
     def _record_routes() -> None:
@@ -1404,9 +1568,9 @@ class GWProductionReport(ProductionReport):
 
     def _stage_memory(self, rows, stages, *, wall) -> None:
         """The device peak of every major stage against its planner's price, and
-        its host peak, as JSON-sidecar records (``memory.stages``,
-        ``memory.priced``, ``memory.sizing``); the main log's TIMING block keeps
-        the budget, the device peak and the host peak.
+        its host peak, as DEBUG receipts (``memory.stages``, ``memory.priced``,
+        ``memory.sizing``; printed with verbose); the main log's TIMING block
+        keeps the budget, the device peak and the host peak.
 
         A row's peak is the pool high-water mark over the timing nodes it owns
         (``common.timing``; max and min over ranks).  A priced stage's receipt

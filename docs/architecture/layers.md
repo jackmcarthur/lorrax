@@ -205,7 +205,7 @@ the suite. An import of a service's top-level package is not an exception:
 |---|---|---|---|
 | **R2** | `solvers.sternheimer_solve` → `psp.dft_operators` | 3 | Is this an L2 CG solve or an L1 Sternheimer kernel? Split `SternheimerOp`'s operator out, or move the file to `psp/`. Physics decision. |
 | **R4** | `mixing.acceleration` sets `JAX_ENABLE_X64` at module scope | 2, 5 | Its consumer (`gw.sc_iteration`) imports it lazily after bootstrap, but a bare `import mixing.acceleration` in a fresh process would otherwise run the accelerator in f32 silently. Physics decision. |
-| — | `gw/__init__.py` sets `JAX_ENABLE_X64` | 5 | Inert for both GW drivers, whose startup call owns x64 (`runtime.set_x64_on_imported_jax`; a resolved `False` refuses, override `LORRAX_ALLOW_X64_OFF=1`). Kept for import paths with no bootstrap. |
+| — | `gw/__init__.py` sets `JAX_ENABLE_X64` | 5 | Inert for both GW drivers, whose startup call owns x64 (`runtime.set_x64_on_imported_jax`; a resolved `False` refuses, with no override). Kept for import paths with no bootstrap. |
 | — | `centroid/kmeans_plot.py` sets `MPLBACKEND=Agg` | 5 | Not a compute knob; a plotting helper choosing a headless renderer is the right owner. |
 
 **Mesh construction (rule 4).** Only these modules may call `Mesh(`:

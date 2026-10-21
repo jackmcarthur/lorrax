@@ -68,8 +68,12 @@ python3 -u -m psp.run_dense_h --save QE.save \
 
 ## Refusals
 
-`psp.operator_checks.validate_dense_h_inputs` runs before any heavy work. Each
-refusal is a `DenseHRefusal` printed as `[dense_h:<rule>]`.
+`psp.operator_checks.validate_dense_h_inputs` runs before any heavy work. It
+collects every failing check into one `DenseHRefusal`, one
+`GATE dense_h_<rule>: got ...; want ...; why: ...; fix: ...` line per rule.
+`psp.run_nscf` runs the same checks (`validate_nscf_inputs`, `GATE nscf_<rule>`)
+and also refuses a magnetic run (`magnetism`) and a metal (`metal`, fractional
+QE occupations); dense-H rebuilds both.
 
 | rule | condition |
 |---|---|
@@ -77,7 +81,7 @@ refusal is a `DenseHRefusal` printed as `[dense_h:<rule>]`.
 | `xc_extension` | the QE run has a hybrid, vdW or +U term |
 | `functional` | the QE functional is not PBE (LDA included), or a UPF was generated with another functional |
 | `pseudo_type` | a UPF is not norm-conserving (USPP, PAW) |
-| `magnetism` | collinear `nspin = 2`: H_k and the writer carry one spin channel |
+| `nspin2` | collinear `nspin = 2`: H_k and the writer carry one spin channel |
 | `nc_gga_branch` | a noncollinear magnetic run without `--nc-gga-branch general`. The `.save` does not record QE's branch. The fixed-axis branch needs QE's `ux`, which the `.save` does not keep |
 | `charge_density` | no `rhotot_g` in `charge-density.hdf5`; on a magnetic run, a missing `m_x`, `m_y` or `m_z` |
 | `truncation_2d` | `--sys-dim 2` without QE `assume_isolated = '2D'`, or the reverse |

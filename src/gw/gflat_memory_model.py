@@ -176,19 +176,24 @@ def log_mubatch_plan(plan: "MuBatchPlan", *, summary: bool = False,
                      fit: str | None = None) -> None:
     """Log a route-G μ-batch plan: its table at DEBUG with its fields as the
     ``isdf.mubatch_plan`` receipt, or with ``summary`` (the fit that runs the
-    plan already logged) one ``zeta plan`` row under the current stage of the
-    main log; ``fit`` names the fit when a run has two (``zeta plan (charge)``,
-    ``zeta plan (transverse)``)."""
+    plan already logged) its MEMORY MODEL rows (``zeta fit``: the mu batches
+    and the estimate; ``resident psi``); ``fit`` names the fit when a run has
+    two (``zeta fit (charge)``, ``zeta fit (transverse)``)."""
     if not summary:
         fields = {f.name: getattr(plan, f.name)
                   for f in dataclasses.fields(plan) if f.repr}
         log.debug(plan.format(), extra=record("isdf.mubatch_plan", **fields))
     else:
         n_batch = int(plan.n_batch)
-        log.info(f"route G, {n_batch} batch{'es' if n_batch != 1 else ''} of "
-                 f"{int(plan.b)} centroids, Z store on the {plan.placement}, "
-                 f"est. {plan.hwm_bytes / 1e9:.2f} GB/dev",
-                 extra=block("isdf", label="zeta plan" + (f" ({fit})" if fit else "")))
+        suffix = f" ({fit})" if fit else ""
+        log.info(f"{n_batch} mu batch{'es' if n_batch != 1 else ''} of {int(plan.b)} "
+                 f"centroids, Z store on the {plan.placement}; estimate "
+                 f"{plan.hwm_bytes / 1e9:.2f} GB per device",
+                 extra=block("memory", label="zeta fit" + suffix))
+        psi = next((v for k, v in plan.breakdown.items() if "resident" in k), None)
+        if psi:
+            log.info(f"{psi / 1e9:.2f} GB per device (conj psi(G) slice)",
+                     extra=block("memory", label="resident psi" + suffix))
 
 
 def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,

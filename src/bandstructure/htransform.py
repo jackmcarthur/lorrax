@@ -32,6 +32,7 @@ from common.collectives import gather_to_host
 # This driver reads a raw params dict rather than ``LorraxConfig``; use the
 # parser-cached linalg profile rather than interpreting its public dial here.
 from gw.gw_config import (
+    infer_material_class,
     linalg_resolution,
     read_cohsex_input,
     resolve_distrib_la_batched_route,
@@ -56,6 +57,36 @@ from .fh_interp import (                                             # noqa: F40
 
 # ``logger``, not ``log``: the functions below name their report sink ``log``.
 logger = get_logger(__name__)
+
+
+def metal_fermi_reference_ry(wfn):
+    """A metal's DFT E_F (Ry), the zero of its path energies; ``None`` for an
+    insulator, whose zero stays the VBM.
+
+    A metal is a WFN with fractional occupations (``gw.gw_config.
+    infer_material_class``, the GW driver's own test).  Its E_F is QE's
+    ``output/band_structure/fermi_energy`` (Ha) in the schema that
+    authenticates the WFN.  E_F never moves: nothing is refilled or re-found
+    on the path.
+    """
+    import xml.etree.ElementTree as ET
+    if infer_material_class(wfn.occs) != "metal":
+        return None
+    binding = wfn.resolve_qe_symmetry()
+    path = None if binding is None else binding.schema_path
+    text = None if path is None else ET.parse(path).getroot().findtext(
+        "output/band_structure/fermi_energy")
+    if text is None:
+        raise ValueError(
+            f"GATE htransform_metal_fermi_level: got a metal WFN (fractional "
+            f"occupations) with "
+            + ("no QE schema that authenticates it" if path is None else
+               f"no output/band_structure/fermi_energy in {path}")
+            + "; want QE's DFT E_F; why: a metal's bands are written relative "
+              "to the DFT E_F, which is never re-derived on the path; fix: put "
+              "the QE run's data-file-schema.xml beside the WFN (the SCF or "
+              "NSCF .save that pw2bgw read).")
+    return 2.0 * float(text)
 
 
 def plot_bands(result):
@@ -606,7 +637,8 @@ def main(argv=None):
                                  progress_fn=report.progress,
                                  quality_record_fn=_quality_records.append,
                                  sym=sym, return_coeffs=bool(args.color),
-                                 B_at_mu=B_at_mu)
+                                 B_at_mu=B_at_mu,
+                                 fermi_reference_ry=metal_fermi_reference_ry(wfn))
         if len(_quality_records) != 1:
             raise RuntimeError(
                 "htransform returned "
