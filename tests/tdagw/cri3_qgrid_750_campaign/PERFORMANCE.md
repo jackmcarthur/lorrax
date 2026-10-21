@@ -145,9 +145,84 @@ not automatically an identical-executable warm-kernel measurement.
 
 Full-coherent TD uses the compact ordered path
 (`src/gw/ppm_sigma.py:2203–2272`), retaining active rates and full virtual MH
-from bracketed contributions in one sweep. Its **material cost is not yet
-measured** here. Reducing output bands does not remove the full750 Green
+from bracketed contributions in one sweep. A verification-only material
+source-frozen measurement is recorded below; a successful updated-W TD
+refresh remains unmeasured. Reducing output bands does not remove the full750 Green
 sum, μ-space work, electronic FFT, or current-W refresh.
+
+## Source-frozen ordered44 and one-site dielectric: measured, not admitted
+
+Source `707874d`, owned P16 step `60063961.0`, completed the one-site
+microscopic q0 dielectric diagnostic at the previously fitted suspect pole,
+then the full native ordered Sigma44 t0 snapshot. This control uses the
+**unshifted positive equilibrium source W** converted exactly to signed
+ordered factors: applied W-lag gamma is **zero**, unlike the direct dielectric
+response's configured `.05 eV`. It is explicitly `SOURCE_FROZEN_DIAGNOSTIC`,
+not refreshed W, production `joint_frozen` initialization, or matched B/C
+admission. The current full-rho lines, 750 virtual bands, active-only real
+destinations `[100,144)`, native head/tail and HF/MH reference anchor remain.
+
+| Actual phase | Seconds | Scope |
+| --- | ---: | --- |
+| Fresh equilibrium source W | 87.23 | Cold host-bank/file-artifact path, not warm SC's 45.2 s |
+| Direct one-site response stream | 17.9564 | Four panels, 215 Green pairs, full750 response |
+| Positive-to-ordered source adapter | 27.1816 | Exact native store conversion and authentication |
+| Ordered44 native Sigma tau sweep | 13 | 77 pairs, four sweeps, Kmax4836; compile/probe3.405 s is inside |
+| Full t0 snapshot | 67.4418 | Includes one-site probe, adapter and ordered Sigma; not Sigma alone |
+
+One-site setup/planning took 1.4074/.1751 s; the dielectric inverse stage
+including its basic record took 1.6040 s. These timers are nested and must not
+be summed indiscriminately. No isolated inclusive ordered-Sigma-only timer
+or total updated-W refresh below60s is established by this run.
+
+The computed logical3000 dielectric at
+`z=(-.16154070956060437+1.0066523909325316i) Ry` had inverse residual
+`1.08714e-13`, with spectral residual upper bound `1.32917e-7` including
+roundoff allowance `1.32917e-7`. Its algebraic smallest-singular-value lower
+bound was **.0185205**, strictly positive. This excludes a singularity of
+the computed sampled dielectric within that numerical certificate; it is
+not a proof of exact physical pole absence or a continuation/TD admission.
+
+The source-frozen t0 was **not stationary**: net number rate
+`-.163963 /fs`; gross injection/removal `+2.34439/-2.50835 /fs` gave a
+**6.7575% gross-normalized imbalance**. This normalization is not the
+actual empty-state gain versus filled-state loss normalization. The native
+projector-resolved rates independently reconstructed from the saved full
+operators are gain **.269177 /fs** and loss **.433140 /fs**, so gain/loss is
+.621455: a **37.8545% deficit relative to loss** (46.6920% symmetric
+imbalance). The6.76% gross figure must not be presented as this transition
+imbalance. The native integrator subsequently refused25as: its measured stability certificate
+required at most24.47as. No trajectory, clipping, trace subtraction, gate
+relaxation or matched B/C admission followed. Initial positive rate spectra
+and inward projector diagnostics do not establish nonlinear Pauli invariance.
+
+Reservation was359s×16 = **1.59556 GPUh**; the numeric step was350s×16 =
+**1.55556 active GPUh**. These are alternative views, not additive charges.
+The allocation was released immediately. Exact artifacts, hashes and scope:
+[SOURCE_FROZEN707_RESULT_60063961.json](evidence/SOURCE_FROZEN707_RESULT_60063961.json).
+
+### Actual native flags and why405s is not a missing-GPU-flag measurement
+
+Both93C and707 startup receipts resolve CUDA A100-SXM4-40GB,16 processes with
+one device each, a4×4 NCCL mesh, FP64/complex128 and **native NVIDIA MathDx
+cuFFTDx k-convolution**. The native FFI closure is authenticated. The
+persistent np16 compile cache is armed; XLA GPU autotune level0 and parallel
+LLVM module compilation are the repository defaults. Runtime pool policy is
+cuda_async/preallocate with fraction.8302, measured budget31.58GB/device;
+OPENBLAS uses4 threads under8 allocated CPU cores/rank. The deck requests
+`linalg=local`; the actual constructor nevertheless uses its priced face
+route when the local resident reduction does not fit. No `xla_reference`
+fallback or missing native-GPU-enable flag is evidenced.
+
+The93C405.294s stream evaluated6,137 certified Green pairs/28panels, nine
+passes of84 local rows, three nodes per accumulation, and distinct FF/FA/AF/AA
+blocks. Warm equilibrium W45.2s is a different algorithm/residency/node-count
+case, not a like-for-like performance baseline. A single preserved93C NVML
+sample showed all16 GPUs at100% instantaneous utilization; that neither
+measures sustained efficiency nor proves the tiling optimal. The requested
+below60s **total general-W refresh** remains a target, not an achieved result;
+quadrature/tiling improvements need matched numerical certificates and actual
+new measurements, not flag speculation or accuracy-gate relaxation.
 
 ## Specific remaining opportunities, not measured gains
 
