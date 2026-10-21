@@ -161,7 +161,10 @@ The fine grids differ: `absorption.x` reads the shifted `WFN_fi`, which has no
 direct gap is. On BerkeleyGW's own QP energies LORRAX's S1 lies 68 meV below
 the Γ transition (3.247 eV); BerkeleyGW's lies 10 meV below it, at a k of the
 shifted grid. The BerkeleyGW column is the upstream example's own absorption
-output: this calculation's kernel reproduces its Frobenius norms to 6 digits.
+output: this calculation's kernel reproduces its Frobenius norms to 6 digits,
+but its `absorption.x` did not finish on one node. Full diagonalization needs
+~310 GB (upstream used 20 nodes), and PRIMME (`diagonalization_primme`) did not
+converge on GPU or CPU.
 
 Wall times on the one node: BerkeleyGW epsilon 25 s, sigma 133 s, inteqp 5 s,
 kernel 450 s; LORRAX centroids 26 s, dipole 30 s, kin-ion 10 s, GW 81 s,
