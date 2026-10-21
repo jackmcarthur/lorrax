@@ -2247,7 +2247,7 @@ def _ordered_tail_brackets(reference, *, b_lo, hi, n_insert, nb):
 
 
 def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
-                          enk, occ, pop, line_carrier, print_fn):
+                          enk, occ, pop, line_carrier, print_fn, internal=None):
     """Full microscopic retarded branches, active rates and all-band virtual MH.
 
     One native band-bracket sweep retains both the active intermediate
@@ -2284,6 +2284,12 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     live_h = np.any(np.abs(rho) != 0.0, axis=-1)
     hole_weight[:, b_lo:hi] = live_h
     part_weight[:, b_lo:hi] = -live_h.astype(np.float64)
+    if internal == 'active':
+        # Existing active-intermediate diagnostic: retain every active rho
+        # and inserted identity column, with no deep-band planning interval.
+        for weight in (hole_weight,part_weight):
+            weight[:,:b_lo]=0
+            weight[:,hi+n_a:]=0
     # All spectator and active phases use the SAME explicit full energy
     # table. The sign is a line coefficient, never a pole/sign projection.
     branches = tuple(_SigmaBranch(tag=f"ordered:{space}", E_A=energy-efermi,
@@ -2291,11 +2297,11 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
         omega_abs=np.abs(request.frequencies_ry), omega_idx=np.arange(request.frequencies_ry.size),
         band_weight=weight) for space, weight in (("cond", part_weight), ("val", hole_weight)))
     brackets = [(b_lo, hi+n_a)]
-    if b_lo:
+    if b_lo and internal != 'active':
         brackets.append((0, b_lo))
-    if hi+n_insert < nb+n_insert:
+    if hi+n_insert < nb+n_insert and internal != 'active':
         brackets.append((hi+n_insert, nb+n_insert))
-    tail = plan.get("spectral_tail")
+    tail = None if internal == 'active' else plan.get("spectral_tail")
     matrix_counts = band_counts = tail_first = None
     if tail is not None:
         logical = int(source["meta"].b_id_4_sigma_user)-int(source["meta"].b_id_0)
@@ -2350,7 +2356,7 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     total = both["full"]["cond"] + both["full"]["val"]
     receipt.update(internal_bands=int(nb), real_destinations=int(n_a),
         external_request=request_receipt,
-        rate_intermediates="active_only", virtual_intermediates="all",
+        rate_intermediates="active_only", virtual_intermediates="active" if internal == 'active' else "all",
         ordered_internal_phase="right_index", head="frozen_reference_current_electronic_lines",
         bulk_evaluation_eta_ry=float(cfg.regularization_ev)/RYD_TO_EV,
         head_pole_imaginary_parts_ry=([] if head is None else
@@ -2603,12 +2609,13 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
         return wfns_t, meta_t, slices_t, enk_l
 
     if general:
-        if rho_w is None or pairing != "vertex" or omit_frozen or static_limit or keep_frozen is not None:
+        if (rho_w is None or pairing != "vertex" or omit_frozen or static_limit
+                or keep_frozen is not None or internal == 'frozen'):
             raise ValueError("GATE ordered_window_sigma: full rho, vertex ordering and full virtual "
                              "sum required; static-W subtraction and frozen-band truncation are not this member")
         return _ordered_window_lines(poles, plan, mesh_xy=mesh_xy, faces=(psi_nmu, psi_mun),
             rho=rho_w, U=U, b_lo=b_lo, n_a=n_a, enk=enk_t, occ=occ, pop=pop,
-            line_carrier=line_carrier, print_fn=quiet)
+            line_carrier=line_carrier, print_fn=quiet,internal=internal)
 
     def line_sweep(line, pop_l, part_l, ib_l, plan_l, omega_grid=None, keep_branches=False):
         """One Σ sweep on a line carrier: on shell (``omega_grid`` None) or on that grid
