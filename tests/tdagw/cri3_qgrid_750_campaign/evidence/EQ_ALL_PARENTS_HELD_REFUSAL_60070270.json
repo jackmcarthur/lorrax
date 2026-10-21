@@ -4,6 +4,8 @@
   "numeric_step": "60070270.0",
   "source_revision": "becf1a40fadf05216cbe47459736748baef179b6",
   "source_archive_sha256": "36969b179b28f7606d1da904d1fd00d4ed6e21fa6b652f643a6040fed0a31987",
+  "constructor_sha256": "2de10748ac074e2a7284304c7298b9ab931d80bf4c8d96529e1597dee1c207f8",
+  "screening_sha256": "e444c4ca05fca9b6c496390fc0f757b48a3ab34b8b6b6343035facac74031cee",
   "electronic_grid": [8, 8, 1],
   "response_grid": [4, 4, 1],
   "response_window": "fejer",
@@ -13,6 +15,9 @@
   "packed_centroids": 3008,
   "physical_chi_nodes": 856,
   "panels": 34,
+  "padded_carrier": 384,
+  "printed_stream_compile_sum_rounded_s": 1.7,
+  "printed_stream_dispatch_sum_rounded_s": 55.3,
   "phase_seconds": {
     "setup": 1.624,
     "planning": 0.843,
@@ -41,6 +46,7 @@
     "support": 25,
     "relative_error_as_printed": 0.0245786,
     "configured_tolerance": 0.02,
+    "z_ry": [0.4845052062196684, 0.01837465441237269],
     "all_remaining_full_W_errors_measured": false
   },
   "sigma44_computed": false,

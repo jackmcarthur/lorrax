@@ -615,20 +615,3 @@ the sparse q-comb error was exactly zero. Receipt:
 This qualifies the tiny software mapping only, not material exciton roots,
 optical convergence, a TD trajectory, or general positivity.
 
-## Accurate equilibrium reducer: actual material held-fit refusal (60070270)
-
-On source `becf1a4`, all ten equilibrium parent reductions passed the new
-original-column metric checks. The 856 physical Green-pair stream took
-58.066 s (34 padded panels; rounded printed compile/dispatch sums 1.7/55.3 s).
-Setup/planning/Dyson/directions/pencil took 1.624/0.843/2.826/6.189/5.185 s;
-host reduction took 174.924 s. The original 2% held-fit gate then refused
-q0/support25 at 2.45786%. Thus there was no complete admitted general W,
-ordered collision Sigma44, t0 operator snapshot, or trajectory. This is not
-a metric-null, UHP, or physical conservation verdict. The pre-reduction q0
-frequency capture and all-rank logs are preserved; no additional run was
-needed for this record.
-
-The released four-node allocation used 548 s (2.435555556 reserved GPUh),
-with 541 s of numerical-step lifetime (2.404444444 active GPUh). These are
-nonadditive views. Exact hashes, phase times, and scope are in
-[the material receipt](evidence/EQ_BECF_HELD_REFUSAL_60070270.json).
