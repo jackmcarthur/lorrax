@@ -322,6 +322,56 @@ These cost views are nonadditive. This is not a sub60s material cycle,
 successful W/ordered-Sigma44 result, TD trajectory, or production hsuite
 verdict. See [the exact proof/accounting summary](evidence/EQUILIBRIUM_NATIVE_P4_60066882.json).
 
+### Material same-state EQ trial: 63.201 s stream, strict metric refusal
+
+The ordinary joint material callback then ran on the **same immutable
+`ff4553b`** in step `60066941.0`, with the accepted q4 Fejér frame 7, full 750
+virtual/screening bands, 3000 centroids, actual 44 destinations and private
+dt 20 as deck. No source-frozen substitution or extra partition benchmark ran.
+The exact equilibrium eligibility test selected the same-state definite
+frequency realization and original-state `principal-rrqr-v1` at `1e-8`.
+
+| Synchronized general-W phase | Printed seconds |
+| --- | ---: |
+| Setup | 1.609 |
+| Scalar planning | .806 |
+| Stream: 856 physical pairs, 34 panels, 384-slot carriers | **63.201** |
+| Dyson | 2.878 |
+| Directions | 6.694 |
+| Same-state pencil assembly | 6.750 |
+
+Inside that stream, 34 compile stages summed to **7.0 s** in the one-decimal
+log (eight printed nonzero), while 34 native dispatch stages summed to
+**55.4 s**; admission printed 0.0 s. Compare FAST17's 29.9 s compilation and
+55.7 s dispatch: the recurring numerical work is similar, while the cold
+compile overhead fell. This is not a measured identical-state warm whole
+cycle, and 55.4 s dispatch alone is not a sub-60 s complete W result.
+
+The native reducer **refused** `shared_equilibrium_null: live H-null/unresolved
+state` through the canonical owner protocol. The first six-parent batch was
+`[0,1,2,4,5,6]`, each pencil 2084×2084; the admitted host batch price was
+4,116,810,496 bytes within its 4 GiB bound. That source pin's canonical error
+omitted the failing owner ID, so **the actual failing q is unknown**.
+Do not relabel the saved q0 record as the failing parent without a separate
+replay witness. A later logging-only owner fix does not change this evidence.
+
+The q0 frequency-only G/H/output-Gram/state-unit/site capture was durably
+written **before** reduction and survives the refusal: 208,493,906 bytes,
+SHA256 `fee071ecafbb9c13e91a2f8eaf6abd744a073bbbe93b92a044a4b1a6fd2c3ef0`.
+It is retained both remotely and locally, without full-microscopic port faces.
+Local inspection was limited to the ZIP directory and small metadata; any
+dense diagnostic must use the separately bounded remote CPU path, not the
+shared 8 GB local machine. No PSD repair, cutoff waiver, fallback realization,
+admitted full W, ordered Sigma44, t0 collision, or trajectory followed.
+
+The enclosing collision timer printed 92.6 s before refusal. Initial source
+preparation separately measured equilibrium W 76.1 s and protected160 Sigma
+tau 17.4 s. The job released at terminal: 371 s×16 = **1.648889 reserved GPUh**,
+365 s×16 = **1.622222 active GPUh**, nonadditive views. This trial establishes
+actual partial costs and a strict metric limitation, not a full-cycle or
+physical-gain verdict. The complete source/capture/accounting scope is in
+[EQFF_MATERIAL_REFUSAL_60066941.json](evidence/EQFF_MATERIAL_REFUSAL_60066941.json).
+
 ### Correction: the707 t0 request was not on its instantaneous shells
 
 The preserved707 measurements above remain raw historical evidence, but
