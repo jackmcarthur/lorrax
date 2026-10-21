@@ -298,8 +298,7 @@ deadlock): the ζ μ-batch planner's batch and G tile
 width take the fixed tile),
 the scalar shared-pole W-synthesis panel schedule (`gw.mpa.sigma`, parent and
 pole-column capacities from the ledger), the pair-convolution chunks
-(`gw.mixed_basis_pair_convolution._budget_target`), the W-av stage
-(`file_io.parallel_transport._write_w_av_stage`), the non-TDA BSE column
+(`gw.mixed_basis_pair_convolution._budget_target`), the non-TDA BSE column
 chunk (`bse.bse_nontda.dense_col_chunk`), the head Γ GEMM route
 (`gw.shared_pole_head`) and the plane-wave screening route
 (`gw.plane_wave_screening`). The ruling licenses converting each to

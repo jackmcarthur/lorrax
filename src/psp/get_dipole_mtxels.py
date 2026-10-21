@@ -637,7 +637,7 @@ def _parallel_transport_outer_bands(args, wfn, head_nbands, parser):
             f"stencil on {undersampled_link_axes(wfn.kgrid)}")
         args.parallel_transport_out = None
     if (args.parallel_transport_out is None
-            or args.parallel_transport_velocity_only or args.w_av_only):
+            or args.parallel_transport_velocity_only):
         return int(head_nbands), int(head_nbands)
     outer = int(args.parallel_transport_bands) or min(
         int(wfn.nbands), -(-5 * int(head_nbands) // 4))
@@ -775,8 +775,7 @@ def build_parser() -> argparse.ArgumentParser:
 		"--parallel-transport-out",
 		type=str,
 		default=None,
-		help="SlabIO parallel-transport output, or the standalone W-av output "
-		     "when --w-av-only is selected.  Default: parallel_transport.h5 "
+		help="SlabIO parallel-transport output.  Default: parallel_transport.h5 "
 		     "beside --out whenever the k grid supports links (the SC head "
 		     "then defaults to sc_head_update = parallel_transport); "
 		     "--no-parallel-transport skips it.",
@@ -785,12 +784,6 @@ def build_parser() -> argparse.ArgumentParser:
 		"--no-parallel-transport",
 		action="store_true",
 		help="Do not write the default parallel-transport artifact.",
-	)
-	parser.add_argument(
-		"--w-av-only",
-		action="store_true",
-		help="Write only the finite-q W-av stencil selected by the two "
-		     "W_av_*_neighbors input flags; skip dipole and PT preprocessing.",
 	)
 	parser.add_argument(
 		"--parallel-transport-velocity-only",
@@ -885,7 +878,7 @@ def parse_args(argv=None):
 	# (_parallel_transport_outer_bands).
 	args.parallel_transport_defaulted = bool(
 		args.parallel_transport_out is None and not args.no_parallel_transport
-		and not (args.static_gauge_hall_only or args.w_av_only
+		and not (args.static_gauge_hall_only
 		         or args.with_finite_q or args.skip_vnl)
 		and args.vnl_mode == "analytic")
 	if args.parallel_transport_defaulted:
@@ -903,7 +896,7 @@ def parse_args(argv=None):
 		if args.vnl_mode != "analytic" or args.skip_vnl:
 			parser.error(
 				"--static-gauge-hall-only requires the analytic VNL operator")
-		if (args.parallel_transport_out is not None or args.w_av_only
+		if (args.parallel_transport_out is not None
 				or args.with_finite_q):
 			parser.error(
 				"--static-gauge-hall-only cannot be combined with another "
@@ -1011,32 +1004,11 @@ def main(argv=None):
 		report.begin(input_file=str(input_path))
 		report.devices(mesh_role="band-matrix axes X x Y")
 		params = read_cohsex_input(str(input_path))
-		w_av_first_neighbors = bool(params.get("w_av_first_neighbors", False))
-		w_av_second_neighbors = bool(params.get("w_av_second_neighbors", False))
-		if (w_av_first_neighbors or w_av_second_neighbors) \
-				and args.parallel_transport_out is None:
-			parser.error(
-				"W_av_first_neighbors / W_av_second_neighbors require "
-				"--parallel-transport-out: it names the SlabIO stencil "
-				"artifact")
-		if args.w_av_only and not (
-				w_av_first_neighbors or w_av_second_neighbors):
-			parser.error(
-				"--w-av-only requires an enabled W_av_*_neighbors input flag")
-		if args.parallel_transport_velocity_only and (
-				w_av_first_neighbors or w_av_second_neighbors):
-			parser.error(
-				"--parallel-transport-velocity-only cannot be combined with an "
-				"enabled W_av_*_neighbors input flag: the W-av finite-q stencil "
-				"is written by the SAME link/connection remainder this mode "
-				"skips (write_parallel_transport_artifact), so the combination "
-				"would silently produce a velocity-only artifact and no W-av "
-				"stencil despite the deck asking for one")
 
 		# The one velocity operator, v = i[H, r] = p + i[V_NL, r] (p alone
 		# under --skip-vnl), on both producer routes below.
 		_arm = "p + i[V_NL, r] = i[H, r]"
-		if not args.skip_vnl and not args.w_av_only:
+		if not args.skip_vnl:
 			log.info(f"  velocity assembly: {_arm}")
 		# Resolve WFN relative to input file directory as preferred
 		wfn_path = Path(params.get("wfn_file", "WFN.h5"))
@@ -1093,47 +1065,6 @@ def main(argv=None):
 		nband_eff, head_nbands = _parallel_transport_outer_bands(
 			args, wfn, _resolve_dipole_nb_written(wfn, ncond=ncond, nband=nband),
 			parser)
-
-		if args.w_av_only:
-			report.environment(wfn=wfn, lines=(
-				"Matrix storage : distributed band blocks on the X x Y mesh",
-				"Output backend : SlabIO collective artifact transaction",
-			))
-			report.settings((
-				Setting("--w-av-only", "on", "cli",
-						"finite-q wavefunction-overlap stencil only; no dipole matrix"),
-				Setting("W-av shells", ("on" if w_av_first_neighbors else "off") + " / "
-						+ ("on" if w_av_second_neighbors else "off"),
-						"derived", "first / second shells of the overlap stencil"),
-			))
-			report.sampling(wfn=wfn, sym=sym)
-			report.bands((
-				("occupied", f"{band_range(0, int(wfn.nelec))} "
-				             f"({float(getattr(wfn, 'num_electrons', wfn.nelec)):.5f} electrons)"),
-				("stencil states", band_range(0, nband_eff)),
-			))
-			from file_io.parallel_transport import write_w_av_stencil_artifact
-			progress = LoopProgress(
-				1, title="W-av stencil construction",
-				item_name="stencil artifact")
-			progress.start()
-			with timing.section("w_av_stencil"):
-				write_w_av_stencil_artifact(
-					Path(args.parallel_transport_out).resolve(),
-					wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
-					nbands=nband_eff, bispinor=bispinor,
-					first_neighbors=w_av_first_neighbors,
-					second_neighbors=w_av_second_neighbors,
-					wfn_path=str(wfn_path),
-					wfn_fingerprint=wfn_fingerprint(wfn))
-			progress.step()
-			progress.finish()
-			run.complete(stages=(("W-av stencil", "w_av_stencil"),), files=(
-				("W-av stencil", "written", str(Path(args.parallel_transport_out).resolve())),
-				("wavefunctions", "read", str(wfn_path)),
-				("input deck", "read", str(input_path)),
-			))
-			return 0
 
 		nval = int(params.get("nval", 5))
 		log.debug("\nCreating system metadata...")
@@ -1285,9 +1216,6 @@ def main(argv=None):
 					report.flag_source("--parallel-transport-out"),
 					"parallel-transport gauge; covariant velocity validated before commit"
 					if args.parallel_transport_out is not None else "no parallel-transport gauge"),
-			Setting("W-av shells", ("on" if w_av_first_neighbors else "off") + " / "
-					+ ("on" if w_av_second_neighbors else "off"),
-					"derived", "first / second shells of the finite-q overlap stencil"),
 		))
 		_report_run_facts(report, wfn=wfn, sym=sym, meta=meta, pseudos=pseudos,
 		                  bispinor=bispinor, nval=nval, ncond=ncond, nband=nband,
@@ -1559,8 +1487,6 @@ def main(argv=None):
 					eigh_backend=resolve_eigh_backend(params),
 					rcond=float(args.parallel_transport_rcond),
 					velocity_only=bool(args.parallel_transport_velocity_only),
-					w_av_first_neighbors=w_av_first_neighbors,
-					w_av_second_neighbors=w_av_second_neighbors,
 					atol=float(args.parallel_transport_validation_atol),
 					rtol=float(args.parallel_transport_validation_rtol),
 					report=pt_capture, head_nbands=head_nbands)

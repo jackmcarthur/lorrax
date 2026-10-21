@@ -345,7 +345,7 @@ and checked like `dipole.h5`.
 
 The dipole step writes it beside `dipole.h5` by default
 (`--parallel-transport-out`; `--no-parallel-transport` skips it). It is not
-written with `--skip-vnl`, `--with-finite-q`, `--w-av-only`,
+written with `--skip-vnl`, `--with-finite-q`,
 `--static-gauge-hall-only`, `--vnl-mode numeric`, or on a grid with a
 two-point axis. The file is written as `.partial` and renamed only after its
 links complete. Writer and reader: `file_io.parallel_transport`; schema

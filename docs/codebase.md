@@ -151,7 +151,6 @@ else.
 | `v_q_bispinor.py` | Builds the packed bare-current interaction operator. |
 | `v_q_g_flat.py` | Builds Coulomb matrices from flattened reciprocal-space data. |
 | `vcoul.py` | Compatibility shim: the deck-facing q = 0 mini-BZ averages and Voronoi point wrapping over the `vcoul` service. |
-| `w_av.py` | Builds cell-averaging stencils for screened interactions. |
 | `w_isdf.py` | Orchestrates independent-particle response and screened interaction stages. |
 | `wavefunction_bundle.py` | Bundles wavefunction arrays and band-basis projections. |
 

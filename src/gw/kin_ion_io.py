@@ -9,7 +9,10 @@ The file holds the pristine mean-field operator only.  The Hartree field is
 ``gw.hartree.direct_field_matrices``, built live by the GW driver.
 
 Usage:
-  python -m gw.kin_ion_io -i lorrax.in -o kin_ion.h5 [-n NB]
+  python -m gw.kin_ion_io -i lorrax.in -o kin_ion.h5
+
+The file always covers the protected bands [0, n_occ + ncond), with
+``nval``/``ncond`` or ``number_bands_protected`` resolved as GW resolves them.
 """
 
 import argparse
@@ -28,7 +31,6 @@ def build_argparser() -> argparse.ArgumentParser:
     argp.add_argument("-o", "--output", default=None, help="output HDF5 (default: kin_ion.h5)")
     argp.add_argument("--report-file", default=None,
                       help="human-readable report (default: kin_ion.out beside output)")
-    argp.add_argument("-n", "--nb", type=int, default=None, help="number of bands")
     argp.add_argument("--sys_dim", type=int, default=None,
                       help="system dimensionality: 0, 2, or 3.  Must AGREE with "
                            "the input file when the file specifies it.")
@@ -404,19 +406,13 @@ def main(argv=None):
                 "bispinor=true; the selector does not enable spatial-current "
                 "channels implicitly.")
         # Band window the GW run will actually ask for: ``load_kin_ion_submatrix``
-        # reads [b_id_0, b_id_3) = [0, nelec + ncond).  Sizing the
-        # file below that silently truncates the run's window, so it is a
-        # hard floor, and it is the default: the sweep loads ψ(G) for every
-        # band it writes, and ``nband`` (the polarizability window) is read by
-        # no consumer (CrI3 24x24: 750 bands is 112 GB of ψ(G), 208 are read).
+        # reads [b_id_0, b_id_3) = [0, nelec + ncond).  The file covers
+        # exactly that window (the ``-n``/``--nb`` widening was removed
+        # 2026-10-21): the sweep loads ψ(G) for every band it writes, and
+        # ``nband`` (the polarizability window) is read by no consumer
+        # (CrI3 24x24: 750 bands is 112 GB of ψ(G), 208 are read).
         nb_window = int(wfn.nelec) + ncond
-        nb_req = int(args.nb) if args.nb is not None else nb_window
-        if nb_req < nb_window:
-            raise SystemExit(
-                f"Requested {nb_req} bands but the deck's sigma window needs "
-                f"nelec+ncond = {int(wfn.nelec)}+{nb_window - int(wfn.nelec)} = {nb_window}."
-            )
-        nb_eff = max(1, min(int(wfn.nbands), nb_req))
+        nb_eff = max(1, min(int(wfn.nbands), nb_window))
         if nb_eff < nb_window:
             raise SystemExit(
                 f"{os.path.basename(wfn_path)} only has {int(wfn.nbands)} bands but "

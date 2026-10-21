@@ -24,14 +24,11 @@ KMEANS_STAGES = (
 def validate_mode_policy(args) -> None:
     """Refuse current-mode switches that change its physical metric."""
     if args.density_mode == "current":
-        if args.no_orbit:
+        if args.no_symmetries:
             raise ValueError(
-                "current centroid selection requires atom-derived orbit "
-                "closure; --no-orbit is not a physical current-mode policy")
-        if float(args.rho_power) != 1.0:
-            raise ValueError(
-                "current centroid selection uses the exact feature-row norm; "
-                "--rho-power must remain 1")
+                "current centroid selection requires the crystal's "
+                "symmetries; --no-symmetries is not a physical current-mode "
+                "policy")
         if float(args.oversample) <= 1.0:
             raise ValueError(
                 "current centroid selection requires transverse-Gram pruning; "
@@ -41,21 +38,19 @@ def validate_mode_policy(args) -> None:
 def prune_band_ranges(args, n_val: int, n_cond: int):
     """Resolved pair-density windows, shared by pruning and provenance.
 
-    The default ``v_x_vc`` follows the owner's rule (PAIRS audit,
-    2026-09-26): left = every occupied band plus the deck's Σ conduction
-    window ``[0, n_val + ncond)``, right = every band ``[0, n_val + n_cond)``.
+    The windows follow the owner's rule (PAIRS audit, 2026-09-26): left =
+    every occupied band plus the deck's Σ conduction window
+    ``[0, n_val + ncond)``, right = every band ``[0, n_val + n_cond)``.
     ``args.sigma_ncond`` carries the deck's ``ncond``; when it is ``None``
     (no deck given) the Σ window is unknown and the left leg widens to the
-    right one, the ``vc_x_vc`` square, a safe superset.  A window that drops
-    an occupied band refuses by name.
+    right one, the full square, a safe superset.  ``--fit-window`` is the one
+    override (the ``--prune-window`` choices were removed 2026-10-21; this
+    was their default, ``v_x_vc``).  A window that drops an occupied band
+    refuses by name.
     """
     top = int(n_val) + int(n_cond)
     fit_window = getattr(args, "fit_window", None)
     if fit_window is not None:
-        if args.prune_window != "v_x_vc":
-            raise ValueError(
-                "--fit-window cannot be combined with a non-default "
-                "--prune-window")
         try:
             fields = str(fit_window).split(",")
             if len(fields) != 2:
@@ -77,10 +72,6 @@ def prune_band_ranges(args, n_val: int, n_cond: int):
         assert_windows_keep_occupied(
             left, right, int(n_val), where="kmeans --fit-window")
         return left, right, "explicit feature pair"
-    if args.prune_window == "v_x_c":
-        return (0, int(n_val)), (int(n_val), top), "valence x conduction"
-    if args.prune_window == "vc_x_vc":
-        return (0, top), (0, top), "full protected square"
     sigma_ncond = getattr(args, "sigma_ncond", None)
     if sigma_ncond is None:
         return ((0, top), (0, top),
@@ -141,14 +132,20 @@ def pool_rank_warning(*, pool: int, written: int, unpicked: float | None,
 def format_centroid_header(*, feature_fit: str, source_wfn: str,
                            weight_label: str, num_electrons: float,
                            occupied_boundary: int, fft_grid, kgrid, shift,
-                           seed: int, rho_power: float, requested: int,
+                           seed: int, requested: int,
                            candidates: int, written: int, pruning: str,
                            prune_rank: int | None, prune_left, prune_right,
                            prune_label: str, orbit_aware: bool, n_sym: int,
                            density_mode: str, pool: int,
                            unpicked: float | None = None,
                            rank_law=None) -> str:
-    """Centroid-table provenance, kept pure so the file contract is gated."""
+    """Centroid-table provenance, kept pure so the file contract is gated.
+
+    ``rho_power=1`` stays in the ``selection:`` line although ``--rho-power``
+    was removed (2026-10-21): the k-means mass is always the measured feature
+    norm, and the line keeps its byte layout for existing tables and the
+    hsuite reference.
+    """
     rank_note = ""
     if prune_rank is not None:
         stop = (f"stop: pool spent, largest unpicked residual "
@@ -179,7 +176,7 @@ def format_centroid_header(*, feature_fit: str, source_wfn: str,
         f"FFT grid: {tuple(fft_grid)}; k grid: {tuple(kgrid)}; "
         f"shift: {tuple(shift)}\n"
         f"selection: weighted k-means; seed={int(seed)}; "
-        f"rho_power={float(rho_power):g}; requested={int(requested)}; "
+        f"rho_power=1; requested={int(requested)}; "
         f"candidates={int(candidates)}; written={int(written)}\n"
         f"pruning: {pruning}; pair-density windows "
         f"left={tuple(prune_left)}, right={tuple(prune_right)} "
@@ -201,11 +198,11 @@ def kmeans_settings_rows(args, *, source) -> list:
     """The kmeans SETTINGS rows from the parsed command line; ``source(*flags)``
     says whether a flag was given (``ProductionReport.flag_source``)."""
     oversample = float(args.oversample)
-    n_c = int(args.N_c)
+    n_c = int(args.n_centroids)
     m_cand = int(math.ceil(n_c * oversample)) if oversample > 1.0 else n_c
     current = args.density_mode == "current"
     rows = [
-        Setting("N_c", str(n_c), "cli" if n_c != 400 else "default",
+        Setting("n_centroids", str(n_c), "cli" if n_c != 400 else "default",
                 "point budget: the centroids requested"),
         Setting("oversample", f"{oversample:g}", source("--oversample"),
                 f"{m_cand} k-means candidates, pruned by pivoted Cholesky"
@@ -216,21 +213,21 @@ def kmeans_settings_rows(args, *, source) -> list:
         Setting("seed", str(int(args.seed)), source("--seed"),
                 "k-means start; same seed and ranks, same points"),
     ]
-    if float(args.rho_power) != 1.0:
-        rows.append(Setting("rho_power", f"{float(args.rho_power):g}", "cli",
-                            "centroid density ~ w^(0.6 alpha)"))
     if args.fit_window is not None:
         rows.append(Setting("fit_window", str(args.fit_window), "cli",
                             "left,right band windows, 0-based, half-open"))
     else:
-        rows.append(Setting("prune_window", str(args.prune_window),
-                            source("--prune-window"),
-                            "pair-density windows of the weight and the Gram"))
-    rows.append(Setting("symmetry closure",
-                        "off" if args.no_orbit else "orbits",
-                        "cli" if (args.no_orbit or args.orbit) else "default",
-                        "literal points" if args.no_orbit else
-                        "whole orbits of the decorated-atom space group"))
+        rows.append(Setting("band windows",
+                            "deck ncond" if args.input is not None else "all bands",
+                            "deck" if args.input is not None else "default",
+                            "left: occupied + deck ncond; right: every WFN band"
+                            if args.input is not None else
+                            "no deck: every WFN band on both legs"))
+    rows.append(Setting("symmetries",
+                        "off" if args.no_symmetries else "on",
+                        source("--no-symmetries"),
+                        "literal points" if args.no_symmetries else
+                        "closed under the decorated-atom space group"))
     return rows
 
 
@@ -254,7 +251,7 @@ def kmeans_results_lines(*, requested: int, candidates: int, pool: int,
                          density_mode: str, prune_rank, unpicked,
                          rank_law=None) -> list[str]:
     """The kmeans RESULTS block: what was written, the selection funnel, the
-    orbit closure, the sampling metric and the measured pair-space rank."""
+    symmetries, the sampling metric and the measured pair-space rank."""
     left, right = windows
     metric = ("transverse current" if density_mode == "current" else "charge")
     rows = [
@@ -262,9 +259,10 @@ def kmeans_results_lines(*, requested: int, candidates: int, pool: int,
                       f"({int(requested)} requested)"),
         ("selection", f"{int(requested)} requested -> {int(candidates)} k-means "
                       f"candidates -> {int(pool)}-point pool -> {int(written)} written"),
-        ("orbit closure", f"whole orbits of {int(n_sym)} spatial operations "
-                          "(decorated atoms); snapped to the FFT grid"
-                          if orbit_aware else "literal points; snapped to the FFT grid"),
+        ("symmetries", f"closed under {int(n_sym)} spatial operations "
+                       "(decorated atoms); snapped to the FFT grid"
+                       if orbit_aware else
+                       "none imposed, literal points; snapped to the FFT grid"),
         ("sampling metric", f"sqrt(diag q=0 {metric} Gram) on "
                             f"{_windows_text(left, right)} ({window_label}), "
                             "unit band weights"),

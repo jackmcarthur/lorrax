@@ -182,10 +182,10 @@ Bare Σ_x is unchanged throughout and the ζ fit Gram's retained rank moves by
 1.4 %: which centroids are selected decides, not how many directions the fit
 keeps. The full window costs +13 % wall and +15 GB peak in the selection.
 
-- **Selector.** `centroid/kmeans_cli._resolve_sigma_window` defaults the
-  prune window to every conduction band in the WFN
+- **Selector.** `centroid/kmeans_cli._resolve_sigma_window` sets the
+  prune window's right leg to every conduction band in the WFN
   (`n_cond = nbands − n_val`), a superset of any deck's band counts.
-  `--prune-n-cond` narrows it; keep it at or above
+  Only `--fit-window` narrows it; keep its right leg at or above
   `max(number_bands_chi, number_bands_sigma)` of every deck the centroid file
   serves ([flags](../drivers.md#centroids-centroidkmeans_cli)). `kmeans.out` prints
   the `pool rank=` line. `centroid/pivoted_cholesky.py`

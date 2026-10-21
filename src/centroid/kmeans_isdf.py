@@ -953,7 +953,7 @@ def _decide_init_method(n_c: int, n_rtot: int,
                         ) -> tuple[str, str | None]:
     if n_c > int(n_rtot * threshold):
         return ('random',
-                f"N_c = {n_c} > {int(n_rtot * threshold)} = "
+                f"n_centroids = {n_c} > {int(n_rtot * threshold)} = "
                 f"n_rtot · {threshold:g}; using density-weighted random init.")
     return 'kpp', None
 
@@ -962,7 +962,7 @@ def _warn_dense_grid_regime(m_cand: int, n_c: int, n_rtot: int,
                             threshold: float = _DENSE_WARN_FRACTION,
                             ) -> str | None:
     if n_c > int(n_rtot * threshold):
-        return (f"WARNING: N_c = {n_c} > {int(n_rtot * threshold)} = "
+        return (f"WARNING: n_centroids = {n_c} > {int(n_rtot * threshold)} = "
                 f"n_rtot · {threshold:g}; the requested selection is dense "
                 f"on the FFT grid, so check candidate coverage and Gram "
                 f"conditioning. Proceeding with k-means + prune.")

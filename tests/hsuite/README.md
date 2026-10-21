@@ -45,7 +45,7 @@ bands. The Na stages run in `run/na/`.
 
 | stage | driver | option covered |
 |---|---|---|
-| kmeans | `centroid.kmeans_cli` | orbit-closed charge centroids, forced sharding |
+| kmeans | `centroid.kmeans_cli` | symmetric (orbit-closed) charge centroids |
 | kin_ion | `gw.kin_ion_io` | spinor kinetic + ionic matrix elements |
 | dipole | `psp.get_dipole_mtxels` | dipole with analytic V_NL velocity |
 | gnppm | `gw.gw_jax` | fresh ζ fit, GN-PPM one-shot, `head_correction = full`, spectral_shell band extrapolation, local linalg |

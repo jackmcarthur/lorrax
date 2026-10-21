@@ -1518,11 +1518,6 @@ _DEFAULTS = {
     # (gw.qsgw_head.drude_memory_damping); Gamma must be positive.
     "head_drude_gamma0_ev": 0.0,
     "head_drude_gamma_width_ev": 1.0,
-    # Opt-in finite-q W-av preprocessing.  The flags select the first and
-    # second reciprocal-grid stencil shells written beside the PT data; they
-    # do not activate the not-yet-complete metallic finite-q screening path.
-    "w_av_first_neighbors": False,
-    "w_av_second_neighbors": False,
 
     # BSE fine-grid densification.  When set to "NX NY NZ" (or "NX,NY,NZ") and
     # DIFFERENT from the coarse restart/WFN grid, the GENERAL BSE init
@@ -2680,8 +2675,6 @@ def _input_head(
         mc_average_placement_vcoul=(
             str(params["mc_average_placement_vcoul"] or "") or None),
         head_minibz_average=bool(params["head_minibz_average"]),
-        w_av_first_neighbors=bool(params["w_av_first_neighbors"]),
-        w_av_second_neighbors=bool(params["w_av_second_neighbors"]),
         bare_coulomb_cutoff=params["bare_coulomb_cutoff"],
         zeta_cutoff=params["zeta_cutoff"],
         use_bgw_vcoul=bool(params["use_bgw_vcoul"]),
@@ -4090,8 +4083,6 @@ class HeadConfig:
     mc_average_placement: str      # "off" (default) | "bgw" | "schur_avg"
     mc_average_placement_vcoul: str | None   # BGW vcoul dump for byte-sourced <v>
     head_minibz_average: bool      # per-Q mini-BZ head cell-average (default off)
-    w_av_first_neighbors: bool
-    w_av_second_neighbors: bool
     bare_coulomb_cutoff: float | None
     zeta_cutoff: float | None
     use_bgw_vcoul: bool

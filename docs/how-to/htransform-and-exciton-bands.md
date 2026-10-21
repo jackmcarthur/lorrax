@@ -51,7 +51,7 @@ nodes are the run's ISDF centroids when $N_\mu \le 1.25\,N_\mathrm{want}$
 worsens $\varepsilon$, MoS₂ 1198 → 1183 nodes: $1.7\times10^{-2}$ →
 $4.6\times10^{-2}$). Above it they are an orbit-closed, charge-density-weighted
 k-means selection of $N_\mathrm{want}$ points on the fitted bands
-(`centroid.kmeans_cli.orbit_kmeans_points`: `--orbit`, rho-power 1, fit window
+(`centroid.kmeans_cli.orbit_kmeans_points`: the crystal's symmetries, fit window
 $b_0{:}b_1$ on both legs), so the fit's cost follows the fitted window, not the
 ISDF bundle. The selection is written beside the basis artifact as
 `galerkin_nodes_<N>_b<b0>-<b1>_<wfn>_<params>.txt` (`params`: a hash of the

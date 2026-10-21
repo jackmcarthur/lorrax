@@ -36,8 +36,8 @@ Their eigenvalues are different diagnostics.
 s(r)=K(r,r)/alpha_fs^2 for current on the FFT grid. This global positive
 scale changes neither Lloyd minimizers nor relative pivot/rank criteria;
 absolute Gram magnitudes must retain the distinction.
-`centroid.kmeans_cli` uses w(r)=sqrt(s(r)) as Lloyd's mass (before any
-explicit `rho_power`). Thus the objective is
+`centroid.kmeans_cli` uses w(r)=sqrt(s(r)) as Lloyd's mass.
+Thus the objective is
 
 \[
  J(R)=\sum_r w(r)\min_\mu\min_{n\in\mathbb Z^3}

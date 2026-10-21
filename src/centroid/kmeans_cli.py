@@ -1,10 +1,11 @@
 """CLI driver for the weighted k-means ISDF point selector.
 
-Run as ``python3 -m centroid.kmeans_cli N_C [opts]``.
+Run as ``python3 -m centroid.kmeans_cli n_centroids [opts]``.
 
 The physics, in order: sum unit-weight importance over the requested fit
 bands; run weighted k-means over the real-space FFT grid in decorated-atom
-space-group orbits; snap and unfold; then prune the oversampled pool with the
+space-group orbits (the crystal's symmetries; ``--no-symmetries`` selects
+literal points); snap and unfold; then prune the oversampled pool with the
 charge Gram or the three-channel transverse Gram for the same band windows.
 
 Device meshes, sharding and placement live in :mod:`centroid.distribution`.
@@ -22,77 +23,33 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(allow_abbrev=False,
         description="Weighted k-means for ISDF sampling points.",
     )
-    p.add_argument("N_c", type=int, nargs="?", default=400,
+    p.add_argument("n_centroids", type=int, nargs="?", default=400,
                    help="Number of centroids (default 400).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--plot", action="store_true",
                    help="Emit a 3D matplotlib plot of centroids over ρ "
                         "(default off — most prod runs don't want a popup).")
-    p.add_argument("--plot-zoom", type=float, default=1.0,
-                   help="Bicubic upsampling factor on the plot only.")
-    p.add_argument("--no-shard", action="store_true",
-                   help="Force single-device Lloyd even when multiple GPUs "
-                        "are visible (default: shard across jax.devices()).")
-    p.add_argument("--force-shard", action="store_true",
-                   help="Override the per-shard-P auto-gate (useful for "
-                        "benchmarking).")
-    p.add_argument("--rho-power", type=float, default=1.0,
-                   help="Raise the sampling weight to α (default α=1.0). "
-                        "Per Gersho (3D), centroid number-density "
-                        "asymptotically scales as w^(3α/5), where w is the "
-                        "resolved feature-row norm. Thus α=1 gives w^0.6 "
-                        "and α=5/3 gives w^1.")
     p.add_argument("--oversample", type=float, default=1.5,
-                   help="k-means runs for ⌈N_c·oversample⌉ then prunes via "
-                        "pivoted Cholesky (default 1.5). Set to 1.0 to "
-                        "disable pivoted-Cholesky pruning.")
-    p.add_argument("--prune-n-val", type=int, default=None,
-                   help="Override pivoted-Cholesky n_val (default = wfn.nelec; "
-                        "a value below nelec drops occupied bands and refuses).")
+                   help="k-means runs for ⌈n_centroids·oversample⌉ then "
+                        "prunes via pivoted Cholesky (default 1.5). Set to "
+                        "1.0 to disable pivoted-Cholesky pruning.")
     p.add_argument("-i", "--input", default=None,
                    help="GW deck. Its wfn_file is the WFN read (default "
-                        "./WFN.h5) and its ncond sets the Sigma conduction "
-                        "window on the default v_x_vc left leg; without it "
-                        "the left leg falls back to vc_x_vc (all bands).")
-    p.add_argument("--prune-n-cond", type=int, default=None,
-                   help="Override pivoted-Cholesky n_cond (default = the FULL "
-                        "conduction window in the WFN, nbands - n_val, which "
-                        "is a superset of any deck's ncond and therefore "
-                        "always safe). Narrowing this selects the ISDF basis "
-                        "on fewer pair densities than Sigma_c will consume; "
-                        "the selector reports the resulting numerical rank. "
-                        "Before 2026-07-29 the default was min(n_val, nbands - "
-                        "n_val), which silently clamped the window to n_val.")
-    p.add_argument("--prune-window", choices=("v_x_c", "v_x_vc", "vc_x_vc"),
-                   default="v_x_vc",
-                   help="Pivoted-Cholesky Gram band-window pair. "
-                        "'v_x_c' (legacy) = left (0, n_val), right (n_val, "
-                        "n_val+n_cond) — only val×cond pair densities. "
-                        "'v_x_vc' (default) = left (0, n_val), right (0, "
-                        "n_val+n_cond) — adds val×val (and val×cond), so "
-                        "the centroids also span the |ψ_v|² and ψ_v*ψ_v' "
-                        "diagonals that V_H / G_RI projections need. "
-                        "'vc_x_vc' = left = right = (0, n_val+n_cond) — "
-                        "full σ-window square Gram, also includes c×c "
-                        "pair densities (|ψ_c|² diagonals). n_cond should "
-                        "be the input file's ``ncond`` (σ-protected band "
-                        "count), not the full ``nband`` summed over.")
+                        "./WFN.h5) and its ncond sets the left window, every "
+                        "occupied band plus the Sigma conduction bands; the "
+                        "right window is every band in the WFN. Without a "
+                        "deck the left window widens to every band.")
     p.add_argument("--fit-window", default=None, metavar="L0:L1,R0:R1",
                    help="Explicit 0-based half-open left/right band windows "
                         "shared by candidate construction and Gram pruning "
-                        "(for example 0:16,0:28). Physical occupancy still "
-                        "comes from WFN.nelec. Cannot be combined with a "
-                        "non-default --prune-window.")
-    p.add_argument("--orbit", action="store_true",
-                   help="Symmetry-adapted k-means: store orbit representatives,"
-                        " unfold with the atom-derived spatial Seitz group. "
-                        "Final centroids are closed under the decorated "
-                        "crystal structure, independent of electronic/TR "
-                        "symmetry.")
-    p.add_argument("--no-orbit", action="store_true",
-                   help="Force the literal-point (non-orbit) path even if "
-                        "the decorated atoms have multiple spatial Seitz "
-                        "operations. Overrides --orbit.")
+                        "(for example 0:16,0:28), in place of the deck's. "
+                        "Physical occupancy still comes from WFN.nelec.")
+    p.add_argument("--no-symmetries", action="store_true",
+                   help="Select literal points without imposing the crystal's "
+                        "symmetries. By default the points are closed under "
+                        "every spatial Seitz operation of the decorated atoms "
+                        "whenever there is more than one (electronic and TR "
+                        "symmetry are not consulted).")
     p.add_argument("--density-mode",
                    choices=("scalar", "current"),
                    default="scalar",
@@ -100,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "'scalar' (default) uses the norm of charge "
                         "pair-density rows; 'current' uses the norm of the "
                         "three stacked Dirac-current rows. Both use the "
-                        "resolved --prune-window with unit band weights. "
+                        "resolved band windows with unit band weights. "
                         "Output files are "
                         "written with distinguishing suffixes ('' / "
                         "'_current') and a header comment naming the "
@@ -111,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "is '' for --density-mode scalar and '_current' "
                         "for --density-mode current; pass explicitly to "
                         "override (e.g. multiple current-mode runs at "
-                        "different N_c).")
+                        "different n_centroids).")
     return p
 
 
@@ -126,7 +83,7 @@ if __name__ == "__main__":
 # ('x','y') mesh, compile cache, rank-0 report.  MUST precede any import
 # that pulls in jax, so JAX_ENABLE_X64 etc. take effect.  This driver's
 # mesh POLICY stays in ``centroid.distribution.build_mesh`` (latency
-# floor, --no-shard); when that policy shards, ``resolve_mesh`` hands it
+# floor); when that policy shards, ``resolve_mesh`` hands it
 # back this same startup mesh, not a second one.
 from runtime import (
     debug_print,
@@ -270,22 +227,13 @@ def _resolve_sigma_window(args, wfn) -> tuple[int, int]:
 
     The new default is the FULL conduction window present in the WFN, which is
     a superset of any deck's ncond and therefore always safe.  Narrowing is
-    still available explicitly via ``--prune-n-cond``.  Cost of the fix is
+    available only through ``--fit-window`` (the ``--prune-n-val`` /
+    ``--prune-n-cond`` overrides were removed 2026-10-21).  Cost of the fix is
     small and was measured, not assumed: the (0,1024) build took 349 s against
     308 s for (0,52) at nb=1024 — +13% wall, +15 GB peak (81 GB of 186 GB).
     """
-    n_val = (int(args.prune_n_val) if args.prune_n_val is not None
-             else int(wfn.nelec))
-    if n_val < int(wfn.nelec):
-        from file_io.centroids import CentroidWindowDropsOccupiedError
-        raise CentroidWindowDropsOccupiedError(
-            f"CentroidWindowDropsOccupiedError: --prune-n-val {n_val} is "
-            f"below nelec={int(wfn.nelec)}; the selection would drop "
-            "occupied bands.  Omit it or pass a value >= nelec.")
-    nb_total = int(wfn.nbands)
-    n_cond = (int(args.prune_n_cond) if args.prune_n_cond is not None
-              else max(0, nb_total - n_val))
-    return n_val, n_cond
+    n_val = int(wfn.nelec)
+    return n_val, max(0, int(wfn.nbands) - n_val)
 
 
 def _resolve_deck(args) -> tuple[int | None, str]:
@@ -294,14 +242,14 @@ def _resolve_deck(args) -> tuple[int | None, str]:
     Without a deck: ``(None, "WFN.h5")``.  A relative ``wfn_file`` joins the
     deck's directory, as in ``gw.kin_ion_io``.  Resolved once in
     :func:`main`; ``prune_band_ranges`` reads ``args.sigma_ncond`` for the
-    default ``v_x_vc`` left leg.
+    left window.
     """
     if args.input is None:
-        if args.prune_window == "v_x_vc" and args.fit_window is None:
+        if args.fit_window is None:
             warnings.warn(
                 "kmeans: no deck (-i), so the Sigma window is unknown; the "
-                "prune left leg falls back to vc_x_vc (all bands), a safe "
-                "superset of occupied + Sigma conduction.", RuntimeWarning,
+                "left window widens to every band, a safe superset of "
+                "occupied + Sigma conduction.", RuntimeWarning,
                 stacklevel=2)
         return None, "WFN.h5"
     from file_io.paths import resolve_input_path
@@ -331,7 +279,7 @@ def _resolve_symmetry(args, wfn):
 
     Returns ``(R, Rinv, tau, n_sym, orbit_aware)``.
     """
-    if args.no_orbit:
+    if args.no_symmetries:
         return None, None, None, 1, False
     from symmetry_maps import recover_atomic_space_group
     R, Rinv, tau = recover_atomic_space_group(
@@ -346,7 +294,7 @@ def _resolve_symmetry(args, wfn):
         f"Centroid symmetry: decorated atoms give {n_sym} spatial Seitz "
         f"operations ({n_improper} improper, {n_nonsymmorphic} with "
         "fractional translation); electronic/TR data not consulted")
-    if args.orbit or n_sym > 1:
+    if n_sym > 1:
         return R, Rinv, tau, n_sym, True
     return None, None, None, 1, False
 
@@ -438,7 +386,8 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
 
 
 def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
-    """Pivoted-Cholesky prune of the over-sampled candidate pool to N_c.
+    """Pivoted-Cholesky prune of the over-sampled candidate pool to
+    ``n_centroids`` (``N_c``).
 
     Greedy pivoting on the pair-density Gram keeps the candidates that add
     the most independent interpolation directions over the σ band window;
@@ -467,16 +416,9 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
                     else "charge"),
         k_weights=full_k_quadrature_weights(wfn, sym),
         verbose=(debug_print_enabled() and process_rank() == 0),
+        band_range_left=left_range,
+        band_range_right=right_range,
     )
-    if args.prune_window == "v_x_vc":
-        kwargs["band_range_left"] = left_range
-        kwargs["band_range_right"] = right_range
-    elif args.prune_window == "vc_x_vc":
-        kwargs["band_range_left"] = left_range
-        kwargs["band_range_right"] = right_range
-    else:
-        kwargs["n_val"] = n_val
-        kwargs["n_cond"] = n_cond
     log.info(f"  prune window: left={left_range} right={right_range} "
              f"[{range_label}]; Gram="
              f"{'Σ_i Z_i Z_i† (i=1,2,3)' if args.density_mode == 'current' else 'charge'}")
@@ -525,14 +467,15 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     row = stage_row if stages is not None else _NoStages.row
     stages = stages if stages is not None else _NoStages()
 
-    N_c = int(args.N_c)
+    N_c = int(args.n_centroids)
     oversample = float(args.oversample)
     M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
     if M_cand != N_c:
-        log.debug(f"Over-sampling: k-means M = {M_cand}, prune to N_c = {N_c} "
-                  f"(ratio {oversample:g})")
+        log.debug(f"Over-sampling: k-means M = {M_cand}, prune to "
+                  f"n_centroids = {N_c} (ratio {oversample:g})")
     else:
-        log.debug(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
+        log.debug(f"Using n_centroids = {N_c} clusters (no pivoted-Cholesky "
+                  "pruning)")
 
     stages.begin(1, "Feature weight", name="centroid.feature_weight")
     with timing.section("setup.wfn_io"):
@@ -550,7 +493,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
                 extra=message(
                     id="centroid_dense_grid",
                     found=("requested centroids",
-                           f"N_c = {N_c} of {n_rtot} FFT-grid points"),
+                           f"n_centroids = {N_c} of {n_rtot} FFT-grid points"),
                     needs="candidate coverage and Gram conditioning checked",
                     fix="read the pivoted-Cholesky rank in the centroid header"))
 
@@ -560,9 +503,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     log.debug(f"WFN FFT-grid shape: {fft_grid}")
     log.debug(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
 
-    mesh = dist.build_mesh(int(np.prod(fft_grid)),
-                           shard=not args.no_shard,
-                           force_shard=args.force_shard)
+    mesh = dist.build_mesh(int(np.prod(fft_grid)))
     mesh_axis = dist.MESH_AXES
 
     # The loader was necessarily built mesh-less (the mesh is sized from
@@ -583,18 +524,6 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     stages.result(f"weight on {n_rtot} grid points ({fft_grid[0]} x {fft_grid[1]} "
                   f"x {fft_grid[2]})")
 
-    # w^α re-weighting.  Per Gersho the asymptotic centroid number density
-    # goes as w^(3α/5), so α > 1 pulls points into high-density regions.
-    # Only the k-means sees the power; ``weight`` itself stays as measured,
-    # because it is also what breaks ties when snapped centroids collide.
-    kmeans_weight = weight
-    if args.rho_power != 1.0:
-        # Clip to non-negative first — QE's iFFT can leave tiny < 0 noise.
-        kmeans_weight = np.maximum(
-            np.asarray(weight, dtype=np.float64), 0.0) ** float(args.rho_power)
-        log.debug(f"k-means weight: (weight)^{args.rho_power:g} "
-                  f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
-
     if orbit_aware:
         # In orbit mode the SAMPLED count is M_cand; the OUTPUT after unfold
         # may inflate by up to n_sym. Adjust kmeans target so the final
@@ -603,11 +532,11 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
         M_cand_orbit = int(np.ceil(M_cand / n_sym))
         if M_cand_orbit < 1:
             raise ValueError(
-                f"Orbit mode: requested N_c={N_c} (×oversample={oversample}, "
-                f"M_cand={M_cand}) gives < 1 representative orbit at n_sym="
-                f"{n_sym}. Need N_c × oversample >= n_sym (= {n_sym}) so "
-                f"kmeans can sample at least one orbit; pass --no-orbit or "
-                f"raise N_c."
+                f"Symmetric selection: requested n_centroids={N_c} "
+                f"(×oversample={oversample}, M_cand={M_cand}) gives < 1 "
+                f"representative orbit at n_sym={n_sym}. Need n_centroids × "
+                f"oversample >= n_sym (= {n_sym}) so kmeans can sample at "
+                f"least one orbit; pass --no-symmetries or raise n_centroids."
             )
         log.debug(f"Orbit-aware mode: n_sym = {n_sym}, "
                   f"running kmeans for M_rep = {M_cand_orbit} representatives "
@@ -622,7 +551,7 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
                   f"{M_cand} candidates (literal points)")
     with timing.section("kmeans") as kmeans_section:
         labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
-            avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
+            avec_ang, weight, N_c=kmeans_target, seed=args.seed,
             mesh=mesh, mesh_axis=mesh_axis,
             init_method=init_method,
             R=R, Rinv=Rinv, tau=tau,
@@ -649,15 +578,13 @@ def select_points(args, wfn_path, *, keep_weight=None, stages=None):
         stages.begin(3, "Pivoted-Cholesky selection", name="centroid.select")
     if oversample > 1.0 and n_unique > N_c:
         release_arrays = [labels, centroids]
-        for array in (weight, kmeans_weight):
-            # ``weight`` is also the plot payload.  Retain that one reference
-            # when plotting, but release every device alias before the prune
-            # reloads the WFN windows.
-            if not keep_weight or array is not weight:
-                release_arrays.append(array)
+        # ``weight`` is also the plot payload.  Retain it when plotting, but
+        # otherwise release it before the prune reloads the WFN windows.
+        if not keep_weight:
+            release_arrays.append(weight)
         with timing.section("release_before_prune"):
             _release_lloyd_before_prune(*release_arrays)
-        del release_arrays, labels, centroids, kmeans_weight
+        del release_arrays, labels, centroids
         if not keep_weight:
             weight = None
         centroid_indices, rank, unpicked = _prune(
@@ -689,11 +616,11 @@ def orbit_kmeans_points(wfn_path, n_points: int, *, fit_window, seed: int = 0):
     """FFT-grid indices ``(n, 3)`` of an orbit-closed, charge-density-weighted
     k-means selection of about ``n_points`` points over ``fit_window``
     (``((l0, l1), (r0, r1))`` bands), with the ISDF bundle's settings
-    (``--orbit``, rho-power 1, the default over-sampling and prune).  Every
+    (the crystal's symmetries, the default over-sampling and prune).  Every
     rank must enter; the result is the same on every rank."""
     (l0, l1), (r0, r1) = fit_window
     args = build_parser().parse_args([
-        str(int(n_points)), "--orbit", "--rho-power", "1", "--seed",
+        str(int(n_points)), "--seed",
         str(int(seed)), "--fit-window", f"{l0}:{l1},{r0}:{r1}"])
     validate_mode_policy(args)
     args.sigma_ncond = None
@@ -780,7 +707,8 @@ def _select_and_report(args, run, stages):
                 found=("pivoted Cholesky", f"stopped by the point budget at "
                        f"{n_unique} points of a {n_pool}-point pool"),
                 lines=(rank_warning,),
-                fix="raise N_c or --oversample until the rank reads 'pool spent'",
+                fix="raise n_centroids or --oversample until the rank reads "
+                    "'pool spent'",
                 kind=(None if rank_law is not None
                       and n_unique / float(rank_law[0]) < 1.0 else "NOTE")))
     header = format_centroid_header(
@@ -788,8 +716,7 @@ def _select_and_report(args, run, stages):
         weight_label=weight_label,
         num_electrons=float(getattr(wfn, "num_electrons", np.nan)),
         occupied_boundary=int(wfn.nelec), fft_grid=fft_grid,
-        kgrid=kgrid, shift=shift, seed=args.seed, rho_power=args.rho_power,
-        requested=N_c, candidates=M_cand, written=n_unique,
+        kgrid=kgrid, shift=shift, seed=args.seed, requested=N_c, candidates=M_cand, written=n_unique,
         pruning=prune_state, prune_rank=prune_rank,
         prune_left=prune_left, prune_right=prune_right,
         prune_label=prune_label, orbit_aware=orbit_aware, n_sym=n_sym,
@@ -814,7 +741,8 @@ def _select_and_report(args, run, stages):
         log.debug("centroid table header", extra=record(
             "centroids.header", file=out_file, lines=header.splitlines()))
     stages.result(f"{n_unique} centroids written to {out_file}"
-                  + (" in whole orbits" if orbit_aware else ""))
+                  + (" closed under the crystal's symmetries" if orbit_aware
+                     else ""))
     stages.end()
 
     selection_wall = time.perf_counter() - selection_start
@@ -831,7 +759,7 @@ def _select_and_report(args, run, stages):
 
     if args.plot:
         from .kmeans_plot import plot_density_and_centroids, interpolate_density
-        rho_plot = interpolate_density(weight, (args.plot_zoom,) * 3)
+        rho_plot = interpolate_density(weight, (1.0,) * 3)
         plot_density_and_centroids(wfn, rho_plot, centroids_snapped)
     # The shared footer without ``RunSession.complete``: that closes with a
     # barrier this driver never ran (print-only rule).

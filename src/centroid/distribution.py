@@ -66,36 +66,25 @@ because the allreduce dominated the 1 ms of local compute)."""
 # Mesh policy
 # ─────────────────────────────────────────────────────────────────────────
 
-def build_mesh(n_points: int, *, shard: bool = True,
-               force_shard: bool = False) -> Mesh:
+def build_mesh(n_points: int) -> Mesh:
     """The device mesh for a k-means over ``n_points`` real-space points.
 
     Returns the run's square 2-D ``('x','y')`` mesh, or the 1x1
-    process-local one when ``shard`` is off, when there is a single device,
-    or when the per-device share of the grid is below the latency floor
-    (the only decision this function actually makes — construction and the
-    addressability check are ``common.collectives``').  The single-device
-    case is still 2-D so the downstream pipeline
+    process-local one when there is a single device, or when one process
+    drives several devices and the per-device share of the grid is below
+    the latency floor (the only decision this function actually makes —
+    construction and the addressability check are ``common.collectives``').
+    The single-device case is still 2-D so the downstream pipeline
     (``load_centroids_band_chunked`` and friends) has one code path.
 
-    ``force_shard`` overrides the latency floor (benchmarking).  A
-    multi-process run NEVER falls back to one device: the other ranks
-    would sit on collectives against a mesh they are not in and the
-    distributed shutdown barrier would hang for minutes.
+    A multi-process run ALWAYS shards: on one device per process the other
+    ranks would sit on collectives against a mesh they are not in and the
+    distributed shutdown barrier would hang for minutes.  (The
+    ``--no-shard`` / ``--force-shard`` overrides were removed 2026-10-21:
+    neither touched a one-device run or a multi-process one, and the floor
+    they bypassed applies only to one process driving several devices.)
     """
     multi_host = process_count() > 1
-
-    if not shard:
-        if multi_host:
-            raise ValueError(
-                f"build_mesh: --no-shard on {process_count()} processes. The "
-                f"k-means and the pivoted-Cholesky prune both run collectives "
-                f"over this mesh, so a per-rank 1x1 mesh would have each rank "
-                f"reducing against a communicator the others are not in and "
-                f"the shutdown barrier would hang. Drop --no-shard, or run on "
-                f"one process."
-            )
-        return single_device_mesh()
 
     # prepare_mesh, not resolve_mesh: without the clique warm-up the first
     # Lloyd collective fires from an XLA pool thread and jaxlib refuses
@@ -107,10 +96,9 @@ def build_mesh(n_points: int, *, shard: bool = True,
         return mesh
     per_shard = n_points // n_dev
 
-    if per_shard < _P_PER_SHARD_MIN and not force_shard and not multi_host:
+    if per_shard < _P_PER_SHARD_MIN and not multi_host:
         log.info(f"P/{n_dev} = {per_shard} < {_P_PER_SHARD_MIN} points per "
-                 "shard; falling back to single-device. Pass --force-shard to "
-                 "override.")
+                 "shard; falling back to single-device.")
         return single_device_mesh()
     if multi_host and per_shard < _P_PER_SHARD_MIN:
         log.info(f"P/{n_dev} = {per_shard} < {_P_PER_SHARD_MIN}; sharding "

@@ -93,7 +93,7 @@ on {4..7} split again, and the Hartree split between {0..3} and {4..7} stayed.
 ## 5 Not covered {#open}
 
 - Four-rank reductions off the Fe V2 path are still library-ordered: the BSE
-  `bse_ring_comm` reduce-scatters, `pivoted_cholesky`, `qsgw_head`, `w_av`,
+  `bse_ring_comm` reduce-scatters, `pivoted_cholesky`, `qsgw_head`,
   `photon_direct_head`, `head_correction`, `galerkin`, `centroid.distribution`,
   and `common.collectives.psum_scatter_checked`.
 - Single-axis reductions (`distrib_la` GEMM `psum_scatter`, the `contract_bands`

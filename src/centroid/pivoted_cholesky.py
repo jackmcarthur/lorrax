@@ -603,7 +603,7 @@ def refuse_unless_select_certified(
             f"points scores sigTOT MAE 0.644 meV, the best on record, while "
             f"the rank-clean orbit-mode arm at the same N is 20-56x worse.\n"
             f"  NOT the fix on this deck: widening the prune window "
-            f"(--prune-n-cond / --prune-window vc_x_vc) changes sigTOT by "
+            f"(a wider left leg in --fit-window) changes sigTOT by "
             f"<2x here and never recovers the orbit-mode loss.  If you want "
             f"a rank-clean set, LOWER N to {rank_i}.\n"
             f"  strict : {SELECT_MODE_ENV}=strict restores the 2026-08-07 "

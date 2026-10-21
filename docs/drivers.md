@@ -69,28 +69,28 @@ The GW deck names the table with `centroids_file`, and the current-channel table
 with `centroids_file_current`. The GW run guards reuse by the table's content
 hash, so regenerating centroids invalidates its ζ and restart tensors.
 
-Invoke: `python3 -m centroid.kmeans_cli N [--density-mode current] [--orbit]`.
+Invoke: `python3 -m centroid.kmeans_cli n_centroids -i deck.in [--density-mode current]`.
 The projector sweep partitions IBZ parents across ranks, so useful parallelism
 is capped by the parent count; the full-grid projector carriers are priced and
 refused before loading if they do not fit.
 
 | flag | default | meaning |
 |---|---|---|
-| `N_c` (positional) | 400 | centroids after pruning |
+| `n_centroids` (positional) | 400 | centroids after pruning |
 | `--oversample` | 1.5 | k-means candidate factor; 1.0 disables pruning |
-| `-i` / `--input` | unset | GW deck; its `ncond` sets the Σ conduction window on the `v_x_vc` left leg |
-| `--prune-n-val` / `--prune-n-cond` | `nelec` / `nbands − n_val` | pruning window extents; `--prune-n-val` below `nelec` refuses |
-| `--prune-window` | `v_x_vc` | Gram band pair: `v_x_c`, `v_x_vc` (left = occupied + Σ conduction from `-i`, right = all bands; without `-i` it falls back to `vc_x_vc` and says so), `vc_x_vc` (all bands on both legs) |
-| `--fit-window L0:L1,R0:R1` | unset | explicit left/right windows for candidates and pruning |
-| `--density-mode` | `scalar` | `scalar` charge Gram; `current` transverse three-current Gram (needs orbit closure, `--rho-power 1`; suffix `_current`) |
-| `--orbit` / `--no-orbit` | on if the atom group has more than one operation | orbit-closed selection |
-| `--rho-power` | 1.0 | sampling weight $w^\alpha$; point density $\propto w^{3\alpha/5}$ |
+| `-i` / `--input` | unset | GW deck; left window = occupied + its `ncond`, right window = every WFN band; without `-i` the left window widens to every band and says so |
+| `--fit-window L0:L1,R0:R1` | unset | explicit left/right windows for candidates and pruning, in place of the deck's |
+| `--density-mode` | `scalar` | `scalar` charge Gram; `current` transverse three-current Gram (needs the symmetries; suffix `_current`) |
+| `--no-symmetries` | off | literal points; by default the set is closed under the atom group whenever it has more than one operation |
+| `--seed` | 0 | k-means start |
+| `--out-suffix` | `''` / `_current` | table and report suffix |
 | `LORRAX_CENTROID_SELECT` (env) | `deliver` | `strict` refuses a numerically flat pool |
 
 Both windows must start at band 0 and hold every occupied band; a window that
 drops one refuses (`CentroidWindowDropsOccupiedError`), here and when `gw_jax`
 reads the table's header. A header whose left window stops below the Σ
-conduction window (the old `v_x_vc` default) only warns.
+conduction window (a table selected before the deck's `ncond` set the left
+window) only warns.
 
 ## dipole — `psp.get_dipole_mtxels`
 
@@ -133,17 +133,18 @@ Hartree is not in it: GW builds $V_H$ live ([theory](theory/hartree.md)). The
 operator commutes with the space group and time reversal, so it is computed on
 the orbit parents and unfolded through the symmetry service.
 
-Invoke: `python3 -m gw.kin_ion_io -i deck.in [-o kin_ion.h5] [-n NB]`. The deck
+Invoke: `python3 -m gw.kin_ion_io -i deck.in [-o kin_ion.h5]`. The deck
 owns the system, band window and spinor settings; `WFN.h5` and the
 pseudopotentials are stamped as provenance, and a GW run refuses a file whose
 k storage, spinor representation, system dimension, band extent, WFN, input or
 pseudopotential stamp differs from its own. The sweep shards bands over the
 mesh and `file_io.kin_ion.write_kin_ion` writes the star-wedge slab from those
-shards through SlabIO; no rank gathers it.
+shards through SlabIO; no rank gathers it. The file covers exactly the bands
+GW reads, `[0, nelec + ncond)` (`number_bands_protected` resolved as GW
+resolves it); a `WFN.h5` with fewer bands refuses.
 
 | key / flag | default | meaning |
 |---|---|---|
-| `-n` / `--nb` | b3 = nelec + ncond, the window GW reads (`number_bands_protected` resolved as GW resolves it) | bands written (ψ(G) is loaded for each); refuses below b3 |
 | `--sys_dim` | the deck's | may only confirm the deck; a contradiction refuses |
 | `--pseudo_dir` | deck directory, then `../qe/{scf,nscf}` | `*.upf` location |
 | `kin_ion_file` (deck) | `kin_ion.h5` | the file GW reads |

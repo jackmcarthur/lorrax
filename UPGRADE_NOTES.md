@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — Centroid and kin-ion flag cleanup
+
+`centroid.kmeans_cli`: the positional count is `n_centroids` (was `N_c`;
+same default, 400). `--orbit` is gone and `--no-orbit` is `--no-symmetries`;
+symmetric selection stays the default whenever the decorated atoms have more
+than one operation. `--rho-power`, `--prune-window`, `--prune-n-val`,
+`--prune-n-cond`, `--plot-zoom`, `--no-shard` and `--force-shard` are
+removed. Their defaults are now fixed: unit power, left window = occupied +
+the deck's `ncond` (every band without `-i`), right window = every WFN band,
+and the device mesh's latency floor (which only applies to one process
+driving several devices). `--fit-window` is the one window override.
+`gw.kin_ion_io`: `-n`/`--nb` is removed; the file always covers
+`[0, nelec + ncond)`, its old default.
+
+- **Results do not move** for a command line that used only defaults, and the
+  centroid table's header keeps its layout (`rho_power=1` included).
+- **Command lines** that name a removed flag now refuse: drop it, or replace
+  a window flag with `--fit-window L0:L1,R0:R1`.
+- **W-av stencil removed.** The `w_av_first_neighbors` and `w_av_second_neighbors` deck keys and the dipole driver's `--w-av-only` are gone, with the unused W-av reader and writer; a deck that sets either key now refuses as an unknown key.
+
 ## 2026-10-21 — Davidson for every lowest-N BSE solve: the `bse_jax` default route, exciton bands per Q, margin roots, convergence gates on FEAST and the non-TDA matrix-free route
 
 `bse.exciton_bands` now solves each Q's `--n-eig` lowest with `bse_lanczos`'

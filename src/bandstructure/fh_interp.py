@@ -144,7 +144,7 @@ def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
     percent saves nothing and worsens the metric); above it an orbit-closed,
     charge-density-weighted k-means selection of ``want`` points with the
     existing centroid machinery (``centroid.kmeans_cli.orbit_kmeans_points``:
-    ``--orbit``, rho-power 1, fit window = the fitted bands on both legs),
+    the crystal's symmetries, fit window = the fitted bands on both legs),
     cached beside the basis artifact as
     ``galerkin_nodes_<N>_b<b0>-<b1>_<wfn>_<params>.txt`` (``params``: a hash
     of the selector, its version, the k-means version
@@ -195,7 +195,7 @@ def htransform_nodes(wfn, centroid_indices, band_range, *, wfn_path: str,
                                     stage="htransform_nodes/broadcast",
                                     read=local.tolist))
     else:
-        header = (f"htransform nodes: orbit-closed k-means (--orbit, rho-power "
+        header = (f"htransform nodes: orbit-closed k-means (symmetric, rho-power "
                   f"1, fit window {b0}:{b1},{b0}:{b1}), requested {want}; FFT "
                   f"indices; WFN {wfn_fingerprint(wfn)}; selector {params}")
 

@@ -434,7 +434,7 @@ def steady_compile_problems(run, name):
 # the run directory after kmeans, which names the centroid file.
 STAGES = (
     ("kmeans", "centroid.kmeans_cli",
-     ["6", "--seed", "42", "--force-shard", "--orbit", "--oversample", "1.5",
+     ["6", "--seed", "42", "--oversample", "1.5",
       "--fit-window", "0:3,0:7", "--density-mode", "scalar"]),
     ("kin_ion", "gw.kin_ion_io", ["-i", "gnppm.in"]),
     ("dipole", "psp.get_dipole_mtxels", ["-i", "gnppm.in"]),
@@ -477,7 +477,7 @@ STAGES = (
       "--report-file", "bse_bisp.out"]),
     # bcc Na in run/na/.  Its centroids are stored in fixture_na/ (kmeans
     # is covered above): 56 orbit-closed points from `centroid.kmeans_cli 64
-    # --seed 42 --orbit --oversample 1.5 --fit-window 0:8,0:13` (the zeta legs).
+    # --seed 42 --oversample 1.5 --fit-window 0:8,0:13` (the zeta legs).
     ("na_kin_ion", "gw.kin_ion_io", ["-i", "na.in"]),
     ("na_dipole", "psp.get_dipole_mtxels", ["-i", "na.in"]),
     ("na_sc", "gw.gw_jax", ["-i", "na.in"]),

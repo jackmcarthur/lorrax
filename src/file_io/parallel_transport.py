@@ -8,7 +8,6 @@ and every HDF5 payload or metadata item crosses the SlabIO public API.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
@@ -59,8 +58,6 @@ HUBBARD_PROVENANCE_ATTR = "hubbard_provenance_utf8"
 #: operator whose commutator is the covariant derivative there.
 COLLAPSED_POSITION_DATASET = "collapsed_position_reduced"
 ENERGIES_DATASET = "dft_energies_ry_full"
-W_AV_DENSITY_DATASET = "w_av_density_mtxel"
-W_AV_SCHEMA_VERSION = 3
 OCCUPATIONS_DATASET = "dft_occupations_full"
 
 def wfn_link_stencil(wfn):
@@ -155,9 +152,6 @@ __all__ = [
     "SINGULAR_VALUES_DATASET",
     "VELOCITY_DFT_DATASET",
     "complete_velocity_validation",
-    "W_AV_DENSITY_DATASET",
-    "WAvStencilMetadata",
-    "WAvStencilReader",
     "line_index_table",
     "link_symmetry_reduction_applies",
     "stored_link_steps",
@@ -168,242 +162,8 @@ __all__ = [
     "transported_frame",
     "validate_parallel_transport_artifact",
     "write_parallel_transport_artifact",
-    "write_w_av_stencil_artifact",
     "write_velocity_validation",
 ]
-
-
-@dataclass(frozen=True)
-class WAvStencilMetadata:
-    """Small, replicated contract for a streamed finite-q vertex file."""
-
-    schema_version: int
-    complete: bool
-    band_start: int
-    band_stop: int
-    effective_nspinor: int
-    bispinor: bool
-    kgrid: np.ndarray
-    kgrid_shift: np.ndarray
-    reciprocal_lattice_cart: np.ndarray
-    wfn_path: str
-    wfn_fingerprint: str
-    first_neighbors: bool
-    second_neighbors: bool
-    seed_steps: np.ndarray
-    seed_shell_mask: np.ndarray
-    source_steps: np.ndarray
-    source_full_ids: np.ndarray
-    source_irr_idx: np.ndarray
-    source_shell_mask: np.ndarray
-    source_kplusq_full: np.ndarray
-    source_g_wrap: np.ndarray
-    target_steps: np.ndarray
-    target_full_ids: np.ndarray
-    target_source_row: np.ndarray
-    target_sym_idx: np.ndarray
-    target_antiunitary: np.ndarray
-    target_shell_mask: np.ndarray
-    target_seed_mask: np.ndarray
-
-    @property
-    def nbands(self) -> int:
-        return int(self.band_stop - self.band_start)
-
-    @property
-    def nk_full(self) -> int:
-        return int(np.prod(self.kgrid))
-
-    @property
-    def nq_source(self) -> int:
-        return int(self.source_steps.shape[0])
-
-
-def _decode_i32_text(value) -> str:
-    raw = np.asarray(value, dtype=np.int32)
-    if np.any(raw < 0) or np.any(raw > 255):
-        raise ValueError("W-av text metadata contains a non-byte value")
-    return bytes(raw.astype(np.uint8).tolist()).decode("utf-8")
-
-
-def _read_w_av_metadata(io: SlabIO) -> WAvStencilMetadata:
-    """Read only the small replicated datasets through SlabIO."""
-
-    def _read(name, ndim):
-        return np.asarray(io.read_slab(
-            name, partition_spec=P(*((None,) * int(ndim))), as_numpy=True))
-
-    def _scalar(name):
-        value = _read(name, 1).reshape(-1)
-        if value.size != 1:
-            raise ValueError(f"W-av metadata {name!r} must contain one value")
-        return int(value[0])
-
-    meta = WAvStencilMetadata(
-        schema_version=_scalar("w_av_schema_version"),
-        complete=bool(_scalar("w_av_complete")),
-        band_start=_scalar("band_start"),
-        band_stop=_scalar("band_stop"),
-        effective_nspinor=_scalar("effective_nspinor"),
-        bispinor=bool(_scalar("bispinor")),
-        kgrid=_read("kgrid", 1).astype(np.int32),
-        kgrid_shift=_read("kgrid_shift", 1).astype(np.float64),
-        reciprocal_lattice_cart=(
-            _read("reciprocal_lattice_cart", 2).astype(np.float64)),
-        wfn_path=_decode_i32_text(_read("wfn_path_bytes_i32", 1)),
-        wfn_fingerprint=_decode_i32_text(
-            _read("wfn_fingerprint_bytes_i32", 1)),
-        first_neighbors=bool(_scalar("w_av_first_neighbors")),
-        second_neighbors=bool(_scalar("w_av_second_neighbors")),
-        seed_steps=_read("w_av_seed_steps", 2).astype(np.int32),
-        seed_shell_mask=_read("w_av_seed_shell_mask", 1).astype(np.int32),
-        source_steps=_read("w_av_source_qsteps", 2).astype(np.int32),
-        source_full_ids=_read("w_av_source_q_full_ids", 1).astype(np.int32),
-        source_irr_idx=_read("w_av_source_q_irr_idx", 1).astype(np.int32),
-        source_shell_mask=(
-            _read("w_av_source_shell_mask", 1).astype(np.int32)),
-        source_kplusq_full=(
-            _read("w_av_source_kplusq_full", 2).astype(np.int32)),
-        source_g_wrap=_read("w_av_source_g_wrap", 3).astype(np.int32),
-        target_steps=_read("w_av_target_qsteps", 2).astype(np.int32),
-        target_full_ids=_read("w_av_target_q_full_ids", 1).astype(np.int32),
-        target_source_row=(
-            _read("w_av_target_source_row", 1).astype(np.int32)),
-        target_sym_idx=_read("w_av_target_sym_idx", 1).astype(np.int32),
-        target_antiunitary=(
-            _read("w_av_target_antiunitary", 1).astype(np.int32)),
-        target_shell_mask=(
-            _read("w_av_target_shell_mask", 1).astype(np.int32)),
-        target_seed_mask=(
-            _read("w_av_target_seed_mask", 2).astype(np.int32)),
-    )
-    if meta.schema_version != W_AV_SCHEMA_VERSION:
-        raise ValueError(
-            f"W-av schema {meta.schema_version} != {W_AV_SCHEMA_VERSION}")
-    if not meta.complete:
-        raise ValueError("W-av artifact is incomplete")
-    if meta.band_start != 0 or meta.band_stop <= 0:
-        raise ValueError(
-            f"invalid W-av band interval [{meta.band_start},{meta.band_stop})")
-    if meta.kgrid.shape != (3,) or np.any(meta.kgrid <= 0):
-        raise ValueError(f"invalid W-av kgrid {meta.kgrid}")
-    expected_kq = (meta.nq_source, meta.nk_full)
-    if meta.source_kplusq_full.shape != expected_kq:
-        raise ValueError(
-            f"W-av k+q table shape {meta.source_kplusq_full.shape} != "
-            f"{expected_kq}")
-    if meta.source_g_wrap.shape != expected_kq + (3,):
-        raise ValueError(
-            f"W-av G-wrap shape {meta.source_g_wrap.shape} != "
-            f"{expected_kq + (3,)}")
-    return meta
-
-
-class WAvStencilReader:
-    """Validated, one-source-q-at-a-time SlabIO reader.
-
-    Metadata is read collectively at construction.  The large density
-    dataset is never read whole: :meth:`read_source_row` returns one q row
-    sharded over both band axes.
-    """
-
-    def __init__(self, path, *, mesh) -> None:
-        self.path = str(path)
-        self.mesh = mesh
-        self._io = SlabIO(self.path, mode="r", mesh=mesh)
-        try:
-            self.metadata = _read_w_av_metadata(self._io)
-        except Exception:
-            self._io.close()
-            raise
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-
-    def close(self):
-        if self._io is not None:
-            self._io.close()
-            self._io = None
-
-    def validate_runtime(
-        self, *, nbands, effective_nspinor, bispinor, kgrid, kgrid_shift,
-        reciprocal_lattice_cart, wfn_fingerprint, sym,
-    ) -> None:
-        """Refuse unless file geometry and the canonical SymMaps agree."""
-        m = self.metadata
-        checks = (
-            (m.nbands == int(nbands),
-             f"nbands {m.nbands} != runtime {int(nbands)}"),
-            (m.effective_nspinor == int(effective_nspinor),
-             "effective spinor extent differs"),
-            (m.bispinor == bool(bispinor), "bispinor setting differs"),
-            (np.array_equal(m.kgrid, np.asarray(kgrid, dtype=np.int32)),
-             "kgrid differs"),
-            (np.allclose(m.kgrid_shift, kgrid_shift, atol=1.0e-12),
-             "kgrid shift differs"),
-            (np.allclose(m.reciprocal_lattice_cart,
-                         reciprocal_lattice_cart, atol=1.0e-12),
-             "reciprocal lattice differs"),
-            (m.wfn_fingerprint == str(wfn_fingerprint),
-             "WFN fingerprint differs"),
-        )
-        for passed, message in checks:
-            if not passed:
-                raise ValueError(f"W-av artifact/runtime mismatch: {message}")
-
-        from symmetry_maps import q_stencil_orbit_table
-        table = q_stencil_orbit_table(
-            kgrid=m.kgrid,
-            sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
-            irr_idx_q=np.asarray(sym.irr_idx_q, dtype=np.int32),
-            sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
-            seed_steps=m.seed_steps,
-            n_sym_spatial=int(len(sym.sym_mats_k) // 2),
-            active_symmetry_rows=np.asarray(
-                sym.active_symmetry_rows, dtype=np.int32),
-        )
-        expected = {
-            "source_steps": m.source_steps,
-            "source_full_ids": m.source_full_ids,
-            "source_irr_idx": m.source_irr_idx,
-            "target_steps": m.target_steps,
-            "target_full_ids": m.target_full_ids,
-            "target_source_row": m.target_source_row,
-            "target_sym_idx": m.target_sym_idx,
-            "target_antiunitary": m.target_antiunitary,
-            "target_seed_mask": m.target_seed_mask,
-        }
-        for name, stored in expected.items():
-            if not np.array_equal(np.asarray(table[name]), stored):
-                raise ValueError(
-                    f"W-av artifact/runtime SymMaps mismatch in {name}")
-        neighbors = build_neighbor_table(
-            np.asarray(sym.kvecs_asints, dtype=np.int32),
-            m.kgrid, m.source_steps).T
-        if not np.array_equal(neighbors, m.source_kplusq_full):
-            raise ValueError(
-                "W-av artifact/runtime SymMaps mismatch in k+q endpoints")
-
-    def read_source_row(self, source_row: int):
-        """Read one ``(k,n,m)`` source-q vertex tile as ``P(None,x,y)``."""
-        if self._io is None:
-            raise RuntimeError("WAvStencilReader is closed")
-        iq = int(source_row)
-        m = self.metadata
-        if not 0 <= iq < m.nq_source:
-            raise IndexError(
-                f"source_row={iq} outside [0,{m.nq_source})")
-        nb_storage = band_storage_extent(self.mesh, m.nbands)
-        slab = self._io.read_slab(
-            W_AV_DENSITY_DATASET,
-            shape=(1, m.nk_full, nb_storage, nb_storage),
-            offset=(iq, 0, 0, 0),
-            valid_shape=(1, m.nk_full, m.nbands, m.nbands),
-            partition_spec=P(None, None, "x", "y"))
-        return slab[0]
 
 
 def _require_service_apis():
@@ -419,16 +179,15 @@ def _require_service_apis():
         ) from exc
     try:
         from symmetry_maps import (apply_band_matrix_symmetry,
-                                   directed_edge_orbit_table,
-                                   q_stencil_orbit_table)
+                                   directed_edge_orbit_table)
     except (ImportError, AttributeError) as exc:
         raise RuntimeError(
             "parallel-transport preprocessing requires the public symmetry "
-            "service APIs for directed edges, q stencils and band-matrix "
+            "service APIs for directed edges and band-matrix "
             "actions; merge the symmetry service lane"
         ) from exc
     return (plan_polar_factor, directed_edge_orbit_table,
-            apply_band_matrix_symmetry, q_stencil_orbit_table)
+            apply_band_matrix_symmetry)
 
 
 def _full_band_tables(wfn, sym, nbands: int) -> tuple[np.ndarray, np.ndarray]:
@@ -996,311 +755,6 @@ def _write_connection_stage(
         io.write_attr("connection_complete", np.int32(1))
 
 
-def _w_av_seed_steps(
-    first_neighbors: bool,
-    second_neighbors: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return stencil seeds and per-seed shell bits (first=1, second=2)."""
-    steps = []
-    shells = []
-    axes = np.eye(3, dtype=np.int32)
-    if bool(first_neighbors):
-        for step in np.concatenate([axes, -axes], axis=0):
-            steps.append(step)
-            shells.append(1)
-    if bool(second_neighbors):
-        for step in np.concatenate([2 * axes, -2 * axes], axis=0):
-            steps.append(step)
-            shells.append(2)
-        for iaxis in range(3):
-            for jaxis in range(iaxis + 1, 3):
-                for sign_i in (-1, 1):
-                    for sign_j in (-1, 1):
-                        step = np.zeros(3, dtype=np.int32)
-                        step[iaxis] = sign_i
-                        step[jaxis] = sign_j
-                        steps.append(step)
-                        shells.append(2)
-    if not steps:
-        return (np.empty((0, 3), dtype=np.int32),
-                np.empty((0,), dtype=np.int32))
-    return (np.asarray(steps, dtype=np.int32),
-            np.asarray(shells, dtype=np.int32))
-
-
-def _write_w_av_stage(
-    path: str,
-    *,
-    wfn,
-    sym,
-    mesh,
-    nbands: int,
-    bispinor: bool,
-    first_neighbors: bool,
-    second_neighbors: bool,
-    q_stencil_orbit_table,
-    mode: str = "a",
-    wfn_path: str = "",
-    wfn_fingerprint: str = "",
-) -> None:
-    """Stream symmetry-reduced W-av density vertices into a SlabIO artifact."""
-    seeds, seed_shells = _w_av_seed_steps(
-        first_neighbors, second_neighbors)
-    if seeds.shape[0] == 0:
-        return
-    table = q_stencil_orbit_table(
-        kgrid=np.asarray(wfn.kgrid, dtype=np.int32),
-        sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
-        irr_idx_q=np.asarray(sym.irr_idx_q, dtype=np.int32),
-        sym_idx_q=np.asarray(sym.sym_idx_q, dtype=np.int32),
-        seed_steps=seeds,
-        n_sym_spatial=int(wfn.ntran),
-        active_symmetry_rows=np.asarray(
-            sym.active_symmetry_rows, dtype=np.int32),
-    )
-    source_steps = np.asarray(table["source_steps"], dtype=np.int32)
-    target_seed_mask = np.asarray(table["target_seed_mask"], dtype=np.int32)
-    target_shell_mask = np.bitwise_or.reduce(
-        target_seed_mask * seed_shells[None, :], axis=1).astype(np.int32)
-    source_shell_mask = target_shell_mask[
-        np.asarray(table["source_target_row"], dtype=np.int32)]
-
-    nb = int(nbands)
-    nq = int(source_steps.shape[0])
-    nk = int(sym.nk_tot)
-    kgrid = np.asarray(wfn.kgrid, dtype=np.int32)
-    qpoints_frac = source_steps / kgrid[None, :]
-    target_qpoints_frac = (
-        np.asarray(table["target_steps"], dtype=np.float64)
-        / kgrid[None, :])
-    neighbor_full = build_neighbor_table(
-        np.asarray(sym.kvecs_asints, dtype=np.int32), kgrid, source_steps)
-    wraps = np.empty((nq, nk, 3), dtype=np.int32)
-    center_on_x, overlap = make_cross_k_overlap(mesh)
-    from common.gpu_utils import device_budget_bytes
-    from runtime.xla_memory import resolve_xla_gpu_memory_env
-    xla_memory = resolve_xla_gpu_memory_env()
-    from lxkit import device_vendor
-    if (device_vendor(jax.devices()[0]) == "cuda"
-            and xla_memory.allocator != "platform"):
-        raise RuntimeError(
-            "W_AV-QSTREAM-ALLOCATOR refusal: got "
-            f"XLA_PYTHON_CLIENT_ALLOCATOR={xla_memory.allocator_raw!r}; "
-            "want 'platform' for finite-q W-av preprocessing. The PHDF5 "
-            "q-stream reproducibly segfaults with BFC during the first "
-            "collective write. Fix: export "
-            "XLA_PYTHON_CLIENT_ALLOCATOR=platform before lx run; see "
-            "docs/reference/env_vars.md.")
-    tile_budget_bytes = 0.20 * device_budget_bytes()
-    px = int(mesh.shape["x"])
-    py = int(mesh.shape["y"])
-    nb_storage = band_storage_extent(mesh, nb)
-    nspinor = 4 if bool(bispinor) else int(wfn.nspinor)
-    sphere_bytes = nspinor * int(wfn.ngkmax) * np.dtype(np.complex128).itemsize
-    fixed_bytes = sphere_bytes * (
-        nb_storage // px + nb_storage // (px * py))
-    streamed_q_bytes = (
-        sphere_bytes * (
-            nb_storage // py + nb_storage // (px * py))
-        + (nb_storage // px) * (nb_storage // py)
-        * np.dtype(np.complex128).itemsize)
-    # q is the streaming boundary. The factor of two reserves both the
-    # input and the gathered/aligned neighbor while the overlap is live.
-    working_bytes_per_k = fixed_bytes + 2 * streamed_q_bytes
-    if working_bytes_per_k > tile_budget_bytes:
-        # The smallest k=1, q=1 raw-density tile runs.
-        from lxkit import memory
-        memory.admit("W-av raw-density tile (k=1, q=1)",
-                     memory.priced(working_bytes_per_k, "closed form"), tile_budget_bytes, device=False)
-    k_batch = max(1, min(
-        nk, int(tile_budget_bytes // max(1, working_bytes_per_k))))
-    working_gib = k_batch * working_bytes_per_k / 2**30
-    artifact_gib = (
-        nq * nk * nb * nb * np.dtype(np.complex128).itemsize / 2**30)
-    log.debug(
-        f"  W-av streaming: k={k_batch}/{nk}, q=1/{nq} "
-        f"resident (conservative overlap working set "
-        f"{working_gib:.2f} GiB/device; "
-        f"20% of the {device_budget_bytes() / 1e9:.1f} GB run budget); "
-        f"WFN source=center+neighbor union; "
-        f"raw artifact={artifact_gib:.2f} GiB")
-    g_full = wfn.gvecs(k="full_bz")
-    ngk_full = wfn.ngk_valid(k="full_bz")
-
-    with SlabIO(path, mode=mode, mesh=mesh) as io:
-        io.create_dataset(
-            W_AV_DENSITY_DATASET,
-            shape=(nq, nk, nb, nb),
-            dtype=np.complex128,
-            attrs={
-                "orientation": "rho_nm(k,q)=<u_n,k|u_m,k+q>",
-                "q_storage": "symmetry_reduced_stencil",
-                "k_storage": "full_bz",
-                "band_layout": "P(None,None,x,y)",
-                "spinor_contraction": "sum over every stored component",
-                "unfold_stage": "after full-k response sum",
-            })
-        io.write_attr("w_av_complete", np.asarray([0], dtype=np.int32))
-        if mode == "w":
-            io.write_attr(
-                "artifact_kind_utf8",
-                np.frombuffer(b"w_av_finite_q_stencil", dtype=np.uint8))
-            io.write_attr("band_start", np.asarray([0], dtype=np.int32))
-            io.write_attr("band_stop", np.asarray([nb], dtype=np.int32))
-            io.write_attr("spin_channel", np.asarray([0], dtype=np.int32))
-            io.write_attr(
-                "effective_nspinor",
-                np.asarray(
-                    [4 if bool(bispinor) else int(wfn.nspinor)],
-                    dtype=np.int32))
-            io.write_attr(
-                "bispinor", np.asarray([bool(bispinor)], dtype=np.int32))
-            io.write_attr("kgrid", kgrid)
-            io.write_attr(
-                "kgrid_shift", np.asarray(wfn.shift, dtype=np.float64))
-            io.write_attr(
-                "reduced_spacing", 1.0 / kgrid.astype(np.float64))
-            io.write_attr(
-                "reciprocal_lattice_cart",
-                np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat))
-            io.write_attr(
-                "reciprocal_units_bohr_inverse",
-                np.asarray([1], dtype=np.int32))
-            io.write_attr(
-                "wfn_path_utf8",
-                np.frombuffer(str(wfn_path).encode("utf-8"), dtype=np.uint8))
-            io.write_attr(
-                "wfn_fingerprint_utf8",
-                np.frombuffer(
-                    str(wfn_fingerprint).encode("utf-8"), dtype=np.uint8))
-            # SlabIO's collective reader deliberately supports the numeric
-            # compute dtypes, not uint8.  Keep the historical uint8 spelling
-            # for external HDF5 tools and add an int32 byte view for every
-            # production consumer that must remain behind the SlabIO public API.
-            io.write_attr(
-                "wfn_path_bytes_i32",
-                np.frombuffer(str(wfn_path).encode("utf-8"),
-                              dtype=np.uint8).astype(np.int32))
-            io.write_attr(
-                "wfn_fingerprint_bytes_i32",
-                np.frombuffer(str(wfn_fingerprint).encode("utf-8"),
-                              dtype=np.uint8).astype(np.int32))
-        for k_start in range(0, nk, k_batch):
-            k_stop = min(k_start + k_batch, nk)
-            center_ids = list(range(k_start, k_stop))
-            n_center = k_stop - k_start
-            for iq in range(nq):
-                neighbor_ids = np.asarray(
-                    neighbor_full[k_start:k_stop, iq], dtype=np.int32)
-                # One loader call owns the complete q tile. This avoids
-                # retaining a loader result across a second collective load,
-                # while keeping residency bounded to one center and one
-                # neighbor bank irrespective of the stencil size.
-                windows_xy = wfn.load(
-                    bands=(0, nb),
-                    k=[*center_ids, *neighbor_ids.tolist()],
-                    sharding=band_sphere_spec(), bispinor=bool(bispinor))
-                center_x = center_on_x(windows_xy[:n_center])
-                neighbor_xy = windows_xy[n_center:, None, ...]
-                g_indices = np.empty(
-                    (n_center, 1, int(wfn.ngkmax)), dtype=np.int32)
-                g_masks = np.empty_like(g_indices, dtype=bool)
-                for ik_local, ik in enumerate(center_ids):
-                    g_center = g_full[ik]
-                    ngk_center = int(ngk_full[ik])
-                    ineighbor = int(neighbor_ids[ik_local])
-                    wrap = g_wrap_for_step(
-                        sym.unfolded_kpts, ik, ineighbor,
-                        source_steps[iq], kgrid)
-                    wraps[iq, ik] = wrap
-                    g_index, g_valid = build_g_wrap_lookup(
-                        g_full[ineighbor], g_center, wrap,
-                        ngk_neighbor=int(ngk_full[ineighbor]),
-                        ngk_center=ngk_center)
-                    g_indices[ik_local, 0] = g_index
-                    g_masks[ik_local, 0] = g_valid
-                rho = overlap(
-                    center_x, neighbor_xy, g_indices, g_masks)
-                io.write_slab(
-                    W_AV_DENSITY_DATASET, rho,
-                    offset=(iq, k_start, 0, 0),
-                    global_shape=(nq, nk, nb, nb))
-                io.sync_writes()
-                del windows_xy, center_x, neighbor_xy, rho
-
-        io.write_attr(
-            "w_av_schema_version",
-            np.asarray([W_AV_SCHEMA_VERSION], dtype=np.int32))
-        io.write_attr("w_av_complete", np.asarray([1], dtype=np.int32))
-        io.write_attr("w_av_first_neighbors",
-                      np.asarray([bool(first_neighbors)], dtype=np.int32))
-        io.write_attr("w_av_second_neighbors",
-                      np.asarray([bool(second_neighbors)], dtype=np.int32))
-        io.write_attr("w_av_seed_steps", seeds)
-        io.write_attr("w_av_seed_shell_mask", seed_shells)
-        io.write_attr("w_av_source_qsteps", source_steps)
-        io.write_attr("w_av_source_qpoints_frac", qpoints_frac)
-        io.write_attr("w_av_source_q_full_ids",
-                      np.asarray(table["source_full_ids"], dtype=np.int32))
-        io.write_attr("w_av_source_q_irr_idx",
-                      np.asarray(table["source_irr_idx"], dtype=np.int32))
-        io.write_attr("w_av_source_shell_mask", source_shell_mask)
-        io.write_attr("w_av_source_kplusq_full",
-                      np.asarray(neighbor_full.T, dtype=np.int32))
-        io.write_attr("w_av_source_g_wrap", wraps)
-        io.write_attr("w_av_target_qsteps",
-                      np.asarray(table["target_steps"], dtype=np.int32))
-        io.write_attr("w_av_target_qpoints_frac", target_qpoints_frac)
-        io.write_attr("w_av_target_q_full_ids",
-                      np.asarray(table["target_full_ids"], dtype=np.int32))
-        io.write_attr("w_av_target_source_row",
-                      np.asarray(table["target_source_row"], dtype=np.int32))
-        io.write_attr("w_av_target_sym_idx",
-                      np.asarray(table["target_sym_idx"], dtype=np.int32))
-        io.write_attr("w_av_target_antiunitary",
-                      np.asarray(table["target_antiunitary"], dtype=np.int32))
-        io.write_attr("w_av_target_shell_mask", target_shell_mask)
-        io.write_attr("w_av_target_seed_mask",
-                      np.asarray(target_seed_mask, dtype=np.int32))
-    log.debug(
-        f"  W-av stencil: stored {nq} symmetry-inequivalent q rows "
-        f"for {int(np.shape(table['target_steps'])[0])} target neighbors")
-
-
-def write_w_av_stencil_artifact(
-    path: str | Path,
-    *,
-    wfn,
-    sym,
-    mesh,
-    nbands: int,
-    bispinor: bool,
-    first_neighbors: bool,
-    second_neighbors: bool,
-    wfn_path: str,
-    wfn_fingerprint: str,
-) -> None:
-    """Write the standalone finite-q W-av artifact without PT preprocessing."""
-    if not bool(first_neighbors) and not bool(second_neighbors):
-        raise ValueError(
-            "standalone W-av preprocessing requires at least one enabled "
-            "neighbor shell")
-    try:
-        from symmetry_maps import q_stencil_orbit_table
-    except (ImportError, AttributeError) as exc:
-        raise RuntimeError(
-            "W-av preprocessing requires the public symmetry service "
-            "q_stencil_orbit_table API") from exc
-    _write_w_av_stage(
-        str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
-        bispinor=bool(bispinor),
-        first_neighbors=bool(first_neighbors),
-        second_neighbors=bool(second_neighbors),
-        q_stencil_orbit_table=q_stencil_orbit_table,
-        mode="w", wfn_path=str(wfn_path),
-        wfn_fingerprint=str(wfn_fingerprint))
-
-
 def write_parallel_transport_artifact(
     path: str | Path,
     *,
@@ -1312,8 +766,6 @@ def write_parallel_transport_artifact(
     batched_route: str,
     eigh_backend: str,
     rcond: float = 1.0e-10,
-    w_av_first_neighbors: bool = False,
-    w_av_second_neighbors: bool = False,
 ) -> None:
     """Append streamed links and the full-BZ connection to an initialized file.
 
@@ -1351,8 +803,7 @@ def write_parallel_transport_artifact(
             "operator)\n"
             "  fix:  densify the axis to >= 3 points or collapse it to 1\n"
             "  doc:  common.parallel_transport.link_stencil_orders")
-    plan_polar, edge_table, apply_symmetry, q_stencil_table = (
-        _require_service_apis())
+    plan_polar, edge_table, apply_symmetry = _require_service_apis()
     nb_padded = band_storage_extent(mesh, int(nbands))
     polar_plan = plan_polar(
         mesh, n=nb_padded, backend=str(eigh_backend), rcond=float(rcond),
@@ -1366,14 +817,6 @@ def write_parallel_transport_artifact(
         source_steps=source_steps,
         directed_edge_orbit_table=edge_table,
         apply_band_matrix_symmetry=apply_symmetry)
-
-    if bool(w_av_first_neighbors) or bool(w_av_second_neighbors):
-        _write_w_av_stage(
-            str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
-            bispinor=bool(bispinor),
-            first_neighbors=bool(w_av_first_neighbors),
-            second_neighbors=bool(w_av_second_neighbors),
-            q_stencil_orbit_table=q_stencil_table)
 
 
 def _dagger(matrices):
@@ -2245,8 +1688,7 @@ def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
 
 def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
                                 batched_route, eigh_backend,
-                                rcond, velocity_only, w_av_first_neighbors,
-                                w_av_second_neighbors, atol, rtol,
+                                rcond, velocity_only, atol, rtol,
                                 report, head_nbands=None) -> None:
     """The links, the fourth-order connection and the velocity-identity gate.
 
@@ -2272,9 +1714,7 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
         write_parallel_transport_artifact(
             path, wfn=wfn, sym=sym, mesh=mesh, nbands=nbands,
             bispinor=bispinor, batched_route=batched_route,
-            eigh_backend=eigh_backend, rcond=rcond,
-            w_av_first_neighbors=w_av_first_neighbors,
-            w_av_second_neighbors=w_av_second_neighbors)
+            eigh_backend=eigh_backend, rcond=rcond)
     with timing.section("parallel_transport_validation"):
         metrics = validate_parallel_transport_artifact(
             path, mesh=mesh, kgrid=wfn.kgrid, nbands=nbands,

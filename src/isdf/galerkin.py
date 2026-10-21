@@ -622,7 +622,8 @@ def _orbit_labels(indices, sym, meta, what: str):
             f"fit_galerkin_basis: the {what} are not orbit-closed under the "
             f"WFN's {sym_matrices.shape[0]} spatial operations, and the nodal "
             "htransform basis requires closure.  Regenerate them with "
-            f"centroid.kmeans_cli in orbit-aware mode (--orbit).  ({exc})"
+            "centroid.kmeans_cli with the crystal's symmetries (its default; "
+            f"do not pass --no-symmetries).  ({exc})"
         ) from None
     return permutation_orbit_labels(perm), int(sym_matrices.shape[0])
 
@@ -758,7 +759,7 @@ def fit_galerkin_basis(
                        f"{NODES_PER_FITTED_BAND * nb} orbit-closed nodes; this set "
                        f"has {requested.shape[0]}",),
                 fix="more orbit-closed ISDF centroids: python -m centroid.kmeans_cli "
-                    "--orbit"))
+                    "with a larger n_centroids"))
     basis = GalerkinBasis(
         ctilde=ctilde,
         basis_at_nodes=_node_interp(

@@ -425,7 +425,7 @@ def test_fit_refuses_non_orbit_closed_nodes():
     closed = np.array([[1, 2, 3], [5, 2, 3]])          # x -> -x mod 6
     labels, n_ops = galerkin._orbit_labels(closed, sym, meta, "nodes")
     assert n_ops == 2 and np.unique(labels).size == 1
-    with pytest.raises(ValueError, match=r"not orbit-closed.*--orbit"):
+    with pytest.raises(ValueError, match=r"not orbit-closed.*--no-symmetries"):
         galerkin._orbit_labels(closed[:1], sym, meta, "nodes")
     fit = lambda **kw: galerkin.fit_galerkin_basis(
         None, sym, meta, kw.pop("centroids"), None, (0, 2), **kw)
