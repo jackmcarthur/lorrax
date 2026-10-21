@@ -2254,7 +2254,7 @@ def _ordered_tail_brackets(reference, *, b_lo, hi, n_insert, nb):
 
 
 def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
-                          enk, occ, pop, line_carrier, print_fn, internal=None):
+                          enk, occ, pop, line_carrier, print_fn, internal=None, omega_ry=None):
     """Full microscopic retarded branches, active rates and all-band virtual MH.
 
     One native band-bracket sweep retains both the active intermediate
@@ -2283,7 +2283,17 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
         (left_m, None), n_insert, energy, occ_l)
     efermi = float(source["efermi_ry"])
     external = enk[:, b_lo:hi] - efermi
-    request, request_receipt = ordered_window_request(enk[:, b_lo:hi], efermi)
+    if omega_ry is None:
+        request, request_receipt = ordered_window_request(enk[:, b_lo:hi], efermi)
+        frequencies = request.frequencies_ry
+    else:
+        frequencies = np.asarray(omega_ry, np.float64)
+        if frequencies.ndim != 1 or not frequencies.size or not np.isfinite(frequencies).all():
+            raise ValueError('GATE ordered_window_grid: finite nonempty relative frequency vector required')
+        request = None
+        request_receipt = dict(policy='explicit_relative_frequency_grid_only',
+            frequency_reference_ry=efermi, frequencies_ry=frequencies.tolist(),
+            on_shell_sweep_performed=False)
     hole_weight = insert(pop, np.zeros((nk, n_a)), np.zeros((nk, n_pad)))
     part_weight = insert(1.0-pop, np.ones((nk, n_a)), np.zeros((nk, n_pad)))
     # Preserve every nonzero coherence in each left endpoint. Liveness is
@@ -2304,7 +2314,7 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     # table. The sign is a line coefficient, never a pole/sign projection.
     branches = tuple(_SigmaBranch(tag=f"ordered:{space}", E_A=energy-efermi,
         base_mask_A=weight != 0.0, space=space, neg_omega_half=False,
-        omega_abs=np.abs(request.frequencies_ry), omega_idx=np.arange(request.frequencies_ry.size),
+        omega_abs=np.abs(frequencies), omega_idx=np.arange(frequencies.size),
         band_weight=weight) for space, weight in (("cond", part_weight), ("val", hole_weight)))
     brackets = [(b_lo, hi+n_a)]
     if b_lo and internal != 'active':
@@ -2312,6 +2322,8 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     if hi+n_insert < nb+n_insert and internal != 'active':
         brackets.append((hi+n_insert, nb+n_insert))
     tail = None if internal == 'active' else plan.get("spectral_tail")
+    if omega_ry is not None and tail is not None:
+        raise ValueError('GATE ordered_window_grid: on-shell virtual spectral tail is not a grid extrapolation')
     matrix_counts = band_counts = tail_first = None
     if tail is not None:
         logical = int(source["meta"].b_id_4_sigma_user)-int(source["meta"].b_id_0)
@@ -2325,7 +2337,7 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     # a fresh ledger alone has no inherited baseline or agreed phase room.
     meta_sigma.shared_pole_capacity.at_phase()
     res, receipt = ordered_shared_pole_sigma(wfns_t, source["model"],
-        meta_sigma, mesh_xy, request=request,
+        meta_sigma, mesh_xy, request=request, omega_grid_ry=frequencies if request is None else None,
         sigma_branches=branches, regularization_width_ry=float(cfg.regularization_ev)/RYD_TO_EV,
         quadrature_eps=float(cfg.quadrature_eps), projection_bands=(b_lo, hi),
         band_brackets=tuple(brackets), band_counts=band_counts,
@@ -2333,8 +2345,10 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     block = _window_block_fn(mesh_xy, 0, n_a, 4)
     both = {}
     for name, count in (("active", 0), ("full", len(brackets)-1)):
-        both[name] = {space: np.asarray(gather_to_host(block(res.branches[space].point(count).pair)))
-                      for space in ("cond", "val")}
+        both[name] = {}
+        for space in ('cond', 'val'):
+            value = res.branches[space].point(count)
+            both[name][space] = np.asarray(gather_to_host(block(value if request is None else value.pair)))
     tail_receipt = None
     if tail is not None:
         tail_receipt = {}
@@ -2346,10 +2360,12 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     if head is not None:
         head = replace(head, enk_ry=enk[:, b_lo:hi], occupations=np.ones((nk, n_a)),
                        efermi_ry=efermi)
-        head_pair = {space: np.zeros((2, nk, n_a, n_a), complex) for space in ("cond", "val")}
-        for slot in range(2):
+        head_pair = {space: np.zeros((2 if request is not None else len(frequencies), nk, n_a, n_a), complex)
+                     for space in ("cond", "val")}
+        for slot in range(head_pair['cond'].shape[0]):
             for i in range(n_a):
-                energies = (np.repeat(external[:, i:i+1], n_a, axis=1) if slot == 0 else external)
+                energies = (np.full_like(external, frequencies[slot]) if request is None else
+                    (np.repeat(external[:, i:i+1], n_a, axis=1) if slot == 0 else external))
                 h = np.conj(head.on_shell(energies)[0])
                 p = replace(head, occupations=np.zeros((nk, n_a))).on_shell(energies)[0]
                 head_pair["val"][slot, :, i] = rho[:, i] * h
@@ -2357,6 +2373,29 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
         for count in both.values():
             for space in head_pair:
                 count[space] = count[space] + head_pair[space]
+    if request is None:
+        receipt.update(internal_bands=int(nb), real_destinations=int(n_a),
+            external_request=request_receipt, rate_intermediates='active_only',
+            virtual_intermediates='active' if internal == 'active' else 'all',
+            ordered_internal_phase='right_index', full_density=True, spatial_projection=False,
+            bracket_intervals=[list(x) for x in brackets], spectral_tail=None,
+            head_included=head is not None, bulk_evaluation_eta_ry=float(cfg.regularization_ev)/RYD_TO_EV,
+            head_pole_imaginary_parts_ry=([] if head is None else
+                np.asarray(head.poles_ry, np.complex128).imag.tolist()),
+            head_width_convention='frozen_source_poles_no_added_bulk_eta',
+            output='grid_only_full_matrices', branch_convention='cond_and_val_both_retarded',
+            branch_basis='instantaneous', total_omega_basis='fixed_band',
+            physical_accuracy_certified=False)
+        total = both['full']['cond'] + both['full']['val']
+        return dict(pair=None, diag=None, onshell=None, branch_pair=None, active_branch_pair=None,
+            omega=U[None] @ total @ np.conj(U.swapaxes(-1, -2))[None], omega_ry=frequencies,
+            retarded_omega=both['full'], active_retarded_omega=both['active'],
+            request=None, efermi_ry=efermi, native_receipt=receipt,
+            carrier=dict(slices=slices_t, nb_sigma=int(n_a)), basis=U,
+            sweep=dict(n_windows=receipt['n_windows'], window_tau_pairs=receipt['window_tau_pairs'],
+                distinct_tau=receipt['window_tau_pairs'], held=False, rebuilds=0,
+                windows=[(x['name'], x['node_count']) for x in receipt['windows']]),
+            full_rho=dict(pairing='vertex', n_insert=n_insert, carrier='rho_and_complement'))
     # Existing downstream column algebra expects an ADVANCED hole pair.
     # This exact small-table conversion recovers Rh_column once, with no
     # arithmetic shell average and no additional principal-value term.
@@ -2434,7 +2473,12 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     meta, mesh_xy : the run's.
     omega_ry : optional (n_omega,) frequencies measured from the body's omega
         reference (returned as ``efermi_ry``): the matrix Sigma^c_ij(omega)
-        is also evaluated there (the grid route).
+        is also evaluated there (the grid route). For an ordered general bank
+        this requests a GRID-ONLY diagnostic, with no on-shell sweep. It returns
+        both-retarded ``retarded_omega`` and ``active_retarded_omega`` branches
+        in the instantaneous basis, and total ``omega`` in the fixed band basis.
+        No advanced-hole conversion or on-shell virtual-tail extrapolation is
+        applied to those full matrices.
     omit_frozen : CONTROL VARIANT ONLY — the frozen bands are dropped from G.
     branches : also return each causal branch's pair tables from the SAME sweep
         (``keep_branches``): ``branch_pair`` = dict(cond, val, static), cond the
@@ -2556,7 +2600,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
     general = (isinstance(poles, dict) and
                poles.get("representation", poles.get("model", {}).get("representation")) == "ordered_complex")
     rho_w = _window_rho(window, U, f, "active" if general else internal, omit_frozen)
-    if rho_w is not None and (pairing not in LINE_PAIRINGS or omega_ry is not None
+    if rho_w is not None and (pairing not in LINE_PAIRINGS or (omega_ry is not None and not general)
                               or not branches):
         raise ValueError(
             f"GATE window_sigma_full_rho: got rho with pairing={pairing!r}, omega_ry "
@@ -2627,7 +2671,7 @@ def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omeg
                              "sum required; static-W subtraction and frozen-band truncation are not this member")
         return _ordered_window_lines(poles, plan, mesh_xy=mesh_xy, faces=(psi_nmu, psi_mun),
             rho=rho_w, U=U, b_lo=b_lo, n_a=n_a, enk=enk_t, occ=occ, pop=pop,
-            line_carrier=line_carrier, print_fn=quiet,internal=internal)
+            line_carrier=line_carrier, print_fn=quiet,internal=internal,omega_ry=omega_ry)
 
     def line_sweep(line, pop_l, part_l, ib_l, plan_l, omega_grid=None, keep_branches=False):
         """One Σ sweep on a line carrier: on shell (``omega_grid`` None) or on that grid

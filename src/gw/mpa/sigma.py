@@ -2132,7 +2132,7 @@ def _ordered_shared_pole_synthesis(io, meta, header, *, mesh_xy):
     return synthesis
 
 
-def ordered_shared_pole_sigma(wfns, model, meta, mesh_xy, *, request, sigma_branches,
+def ordered_shared_pole_sigma(wfns, model, meta, mesh_xy, *, request=None, omega_grid_ry=None, sigma_branches,
                              regularization_width_ry, quadrature_eps, projection_bands,
                              band_brackets=None, band_counts=None, band_matrix_counts=None,
                              print_fn=print):
@@ -2140,12 +2140,21 @@ def ordered_shared_pole_sigma(wfns, model, meta, mesh_xy, *, request, sigma_bran
 
     ``model`` is the authenticated full-port screening handle. Returns the
     usual ``SigmaOmegaResult`` with literal retarded ``cond`` and ``val``
-    branch tables, in Ry, plus its certified quadrature receipt. The same
+    branch tables, in Ry, plus its certified quadrature receipt. Supply one
+    on-shell ``request`` or a nonempty relative-frequency ``omega_grid_ry``;
+    the latter retains full matrices on the existing omega-grid accumulator.
+    Both paths perform one sweep. The same
     native face Green, FFT convolution, destination projection, device node
     loop and capacity admission as every production GW Σ are used.
     """
     from file_io.shared_pole_store import (validate_general_shared_pole_model,
                                           open_shared_pole_model)
+    if (request is None) == (omega_grid_ry is None):
+        raise ValueError('GATE ordered_sigma_frequencies: supply one request or omega grid')
+    omega = (np.asarray(omega_grid_ry, np.float64) if request is None
+             else request.frequencies_ry)
+    if omega.ndim != 1 or not omega.size or not np.isfinite(omega).all():
+        raise ValueError('GATE ordered_sigma_frequencies: finite nonempty frequency vector required')
     header = validate_general_shared_pole_model(model["path"], expected_identity=model["identity"],
         mesh_xy=mesh_xy, capacity=meta.shared_pole_capacity)
     if header["digest"] != model["digest"]:
@@ -2155,7 +2164,7 @@ def ordered_shared_pole_sigma(wfns, model, meta, mesh_xy, *, request, sigma_bran
         try:
             poles, counts = (np.asarray(jax.device_get(a)) for a in synthesis.resident_operands()[2:])
             plan, receipt = ordered_shared_pole_plan(poles, counts, sigma_branches,
-                request.frequencies_ry, eta_ry=regularization_width_ry, eps=quadrature_eps,
+                omega, eta_ry=regularization_width_ry, eps=quadrature_eps,
                 scope=(f"ordered:{header['digest']}:{float(regularization_width_ry):.16g}:"
                        f"{float(quadrature_eps):.16g}"))
             print_fn(f"  native full-port Sigma: {header['n_mu_logical']} mu, "
@@ -2166,6 +2175,7 @@ def ordered_shared_pole_sigma(wfns, model, meta, mesh_xy, *, request, sigma_bran
                 int(header["n_q_irr"]), plan, request, meta, mesh_xy,
                 pole_batch_size=1, w_synthesis=synthesis, keep_branches=True,
                 brackets=band_brackets, band_counts=band_counts, matrix_counts=band_matrix_counts,
+                omega_grid_ry=omega if request is None else None,
                 projection_bands=projection_bands, print_fn=print_fn)
             synthesis.close(result.sigma_c_kij)
             return result, receipt
