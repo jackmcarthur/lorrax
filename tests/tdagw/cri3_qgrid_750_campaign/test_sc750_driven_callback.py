@@ -168,6 +168,45 @@ def test_actual_prerequisite_records_checkpoint_crop_and_fresh_number_gate(tmp_p
         driver.validate_material_prerequisites(plan, frame)
 
 
+def test_explicit_pilot_can_start_without_archival_zero_but_cannot_admit_comparison(tmp_path):
+    plan, frame, _ = _prerequisites(tmp_path)
+    plan.update(run_zero_controls=False, fit_tolerance=.05,
+        amplitude_candidates_v_m=[8.e8, 3.2e9],
+        diagnostic_pilot=dict(arms=[driver.ARMS[1]], amplitudes_v_m=[8.e8],
+                              purpose="underconverged live driven pilot"))
+    del plan["zero_directory"]
+    assert driver.validate_plan(plan) is plan
+    result = driver.validate_material_prerequisites(plan, frame)
+    assert result["raw_zero_status"] == "NOT_DONE_DIAGNOSTIC_PILOT_ONLY"
+    assert result["qualified_comparison"] is False
+    with pytest.raises(ValueError, match="cannot admit"):
+        driver.require_matching_zero_result(result, slice(100, 144), {})
+    for changes in (dict(execute_mgkba=False), dict(run_zero_controls=True),
+                    dict(diagnostic_pilot=dict(plan["diagnostic_pilot"], amplitudes_v_m=[1.e9])),
+                    dict(diagnostic_pilot=dict(plan["diagnostic_pilot"], arms=[driver.ARMS[0]]))):
+        with pytest.raises(ValueError, match="driven_pilot"):
+            driver.validate_plan(dict(plan, **changes))
+    with pytest.raises(ValueError, match="identities differ"):
+        driver.validate_material_prerequisites(plan, dict(frame, input_h_sha256="wrong"))
+
+
+def test_pilot_returns_before_static_calibration_and_retains_live_physics_checks():
+    tree = ast.parse(Path(driver.__file__).read_text())
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_td_probe")
+    pilot_index, pilot = next((i, n) for i, n in enumerate(run.body)
+        if isinstance(n, ast.If) and ast.unparse(n.test) == "pilot is not None")
+    assert isinstance(pilot.body[-1], ast.Return)
+    assert "pilot_complete.json" in ast.unparse(pilot)
+    assert any(isinstance(n, ast.Assign) and "build_static_control" in ast.unparse(n)
+               for n in run.body[pilot_index+1:])
+    arm = next(n for n in run.body if isinstance(n, ast.FunctionDef) and n.name == "run_arm")
+    text = ast.unparse(arm)
+    for guard in ("GATE driven_number", "GATE driven_boundary", "GATE driven_density"):
+        assert guard in text
+    assert "pilot" not in ast.unparse(next(n for n in ast.walk(arm)
+        if isinstance(n, ast.If) and "GATE driven_number" in ast.unparse(n)))
+
+
 @pytest.mark.parametrize("zero_case", ["missing", "invalid", "not_named"])
 def test_A_only_valid_BSE_can_calibrate_without_raw_zero_artifacts(tmp_path, zero_case):
     plan, frame, zero = _prerequisites(tmp_path)

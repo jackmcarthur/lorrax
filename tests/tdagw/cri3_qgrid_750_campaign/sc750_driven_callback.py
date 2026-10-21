@@ -84,6 +84,20 @@ def validate_plan(plan):
     for key, val in plan["gates"].items():
         if not math.isfinite(float(val)) or float(val) <= 0:
             raise ValueError("GATE driven_plan: explicit positive diagnostic gate "+key)
+    pilot = plan.get("diagnostic_pilot")
+    if pilot is not None:
+        if (not isinstance(pilot, dict) or set(pilot) != {"arms", "amplitudes_v_m", "purpose"}
+                or not plan["execute_mgkba"] or plan["run_zero_controls"]):
+            raise ValueError("GATE driven_pilot: explicit MGKBA diagnostic, not a qualified comparison")
+        arms = pilot["arms"]
+        if (not isinstance(arms, list) or not 1 <= len(arms) <= 2
+                or len(set(arms)) != len(arms) or any(a not in ARMS[1:] for a in arms)):
+            raise ValueError("GATE driven_pilot: one or two distinct literal B/C arms required")
+        selected = list(map(float, pilot["amplitudes_v_m"]))
+        if (not selected or selected != sorted(set(selected))
+                or any(x not in amp for x in selected)
+                or not isinstance(pilot["purpose"], str) or not pilot["purpose"].strip()):
+            raise ValueError("GATE driven_pilot: finite explicit candidate subset and purpose required")
     return plan
 
 
@@ -235,9 +249,13 @@ def validate_raw_zero_prerequisite(plan, frame, *, response_policy=None):
 
 
 def validate_material_prerequisites(plan, frame, *, response_policy=None):
-    """Static A needs BSE; B/C additionally require all raw-zero gates."""
+    """Qualified B/C require raw zero; explicit pilots retain live guards."""
     result = validate_bse_prerequisite(plan, frame, response_policy=response_policy)
-    if plan["execute_mgkba"]:
+    if plan.get("diagnostic_pilot") is not None:
+        result.update(raw_zero_status="NOT_DONE_DIAGNOSTIC_PILOT_ONLY",
+            zero_evidence_scope="NO_ZERO_OR_MATCHED_COMPARISON_ADMISSION", zero_evidence=None,
+            diagnostic_role="UNQUALIFIED_DRIVEN_PILOT", qualified_comparison=False)
+    elif plan["execute_mgkba"]:
         result.update(validate_raw_zero_prerequisite(plan, frame, response_policy=response_policy))
     else:
         result.update(raw_zero_status="NOT_REQUIRED_STATIC_A_ONLY", zero_evidence_scope="NOT_EVALUATED",
@@ -329,7 +347,9 @@ def run_td_probe(source, *, out, deck_path):
     from common.band_degeneracy import resolve_band_window
     plan_path, out = Path(deck_path).resolve(), Path(out).resolve()
     plan = validate_plan(json.loads(plan_path.read_text()))
-    paths = ("bse_report", "zero_directory") if plan["execute_mgkba"] else ("bse_report",)
+    pilot = plan.get("diagnostic_pilot")
+    paths = (("bse_report", "zero_directory")
+             if plan["execute_mgkba"] and pilot is None else ("bse_report",))
     for key in paths:
         plan[key] = str((plan_path.parent/plan[key]).resolve())
     mesh, meta, arrays = source["mesh"], source["meta"], source["frame_arrays"]
@@ -408,6 +428,8 @@ def run_td_probe(source, *, out, deck_path):
         reference["receipts"]["nk_pad"], active.stop-active.start, float(meta.cell_volume),
         int(reference["header"]["nspinor"]), reference["header"]["bands"], receipts=reference["receipts"])
     save("manifest.json", record=dict(status="STARTED_NOT_COMPLETED", plan=plan,
+        diagnostic_role="UNQUALIFIED_DRIVEN_PILOT" if pilot is not None else None,
+        qualified_comparison=False if pilot is not None else None,
         actual_active=[active.start, active.stop], requested_active=[100, 144], reference=reference["receipts"],
         prerequisites={k: v for k, v in prereq.items() if k != "bse"},
         execution_revision=os.environ.get("LEG_HEAD"), reference_producer_revision=source["frame"]["source_revision"],
@@ -459,6 +481,8 @@ def run_td_probe(source, *, out, deck_path):
             A_diagnostic.update(n=n+1, next_fs=float(time_au)*FS_PER_AU+plan["refresh_fs"])
         oldwrite, oldfactory, oldsnapshot = stages._write_chunk, sr.make_native_snapshot_evaluator, sr.snapshot_collision
         save(tag+"/started.json", record=dict(arm=arm, amplitude_v_m=amplitude,
+            diagnostic_role="UNQUALIFIED_DRIVEN_PILOT" if pilot is not None else None,
+            qualified_comparison=False if pilot is not None else None,
             zero_gate=zero_gate, duration_fs=duration, actual_active=[active.start, active.stop],
             response_policy=response_policy,
             nominal_vacuum_cycle_averaged_peak_intensity_w_cm2=.5*8.8541878128e-12*299792458*amplitude**2/1.e4,
@@ -590,6 +614,9 @@ def run_td_probe(source, *, out, deck_path):
                 duration_fs=duration, measure_interval_fs=plan["measure_as"]/1000.)
             save(tag+"/plot_data.npz", arrays=payload)
             result = dict(tag=tag, arm=arm, amplitude_v_m=amplitude, completed=True,
+                diagnostic_role="UNQUALIFIED_DRIVEN_PILOT" if pilot is not None else None,
+                qualified_comparison=False if pilot is not None else None,
+                raw_zero_status=prereq["raw_zero_status"],
                 zero_gate=zero_gate, duration_fs=duration, actual_active=[active.start, active.stop],
                 response_policy=response_policy, fresh_snapshot_times_fs=fresh_snapshot_times,
                 **measured, carrier_peak_scope="actual completed native measurement grid",
@@ -605,6 +632,22 @@ def run_td_probe(source, *, out, deck_path):
             return result
         finally:
             stages._write_chunk, sr.make_native_snapshot_evaluator, sr.snapshot_collision = oldwrite, oldfactory, oldsnapshot
+
+    if pilot is not None:
+        # Do actual driven work before optional campaign calibration. Every live
+        # source, flux, boundary, Pauli and trace check above is unchanged. This
+        # deliberately cannot produce the qualified campaign complete.json.
+        for arm in pilot["arms"]:
+            for level, amplitude in enumerate(pilot["amplitudes_v_m"]):
+                run_arm(f"{arm[0]}_pilot_{level}", arm, amplitude, reference["model"])
+        save("pilot_complete.json", record=dict(status="UNQUALIFIED_DRIVEN_PILOT_COMPLETE",
+            diagnostic_role="UNQUALIFIED_DRIVEN_PILOT", qualified_comparison=False,
+            raw_zero_status=prereq["raw_zero_status"],
+            no_zero_control_or_calibrated_comparison_claim=True, requested=pilot,
+            numerical_fit_tolerance=plan["fit_tolerance"], runs=completed_runs,
+            wall_s=time.perf_counter()-started,
+            scope="actual exploratory dynamics only; no damping attribution or convergence claim"))
+        return
 
     static = static_owner.build_static_control(source, reference)
     save("static_control.json", record=static["receipt"])

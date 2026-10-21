@@ -121,7 +121,7 @@ These are prepared adapter contracts, not a material TD or cutoff verdict.
 
 The supplied four-band zero artifact is **preflight only**, not Pauli or
 stationarity evidence for the resolved30v14c driven window. Before either
-MGKBA driven arm, the driven callback unconditionally runs both B and C at
+qualified MGKBA driven arm, the driven callback runs both B and C at
 zero field for0.6fs on the actual resolved window and requires a completed
 fresh refresh, raw number/boundary checks, trace/Pauli health and the explicit
 zero-carrier-drift bound. `run_zero_controls=false` can disable the optional
@@ -140,6 +140,19 @@ attempted; ordinary coherent trace/Pauli/Hermiticity checks remain active.
 Enabling B/C still requires the original rawzero preflight and both mandatory
 matching-window gates. An A-only completion is not an A/B/C comparison or
 evidence that raw MGKBA is safe.
+
+An explicit `diagnostic_pilot` plan may instead run B or C immediately,
+without archival zero artifacts, static-A recalibration, or the paired zero
+campaign. It names `arms`, an `amplitudes_v_m` subset of the finite candidate
+list, and a nonempty `purpose`; `execute_mgkba=true` and
+`run_zero_controls=false` are required. BSE/live-source authentication and
+all instantaneous number, boundary, trace, Pauli, finite-value and resource
+checks remain unchanged. Every pilot result is labeled
+`UNQUALIFIED_DRIVEN_PILOT`; the top-level output is `pilot_complete.json`,
+not the campaign's `complete.json`. It cannot admit a matching-zero gate or
+claim damping or a qualified B/C comparison. Numerical fit tolerance is an
+explicit plan value, recorded separately from these physical checks; a 5%
+pilot is not evidence of a passed 2% fit.
 
 `compare_sc750_driven.py --calibration-only` validates and plots only completed
 native10fs static-A legs, even when a finite carrier-target search ends without
