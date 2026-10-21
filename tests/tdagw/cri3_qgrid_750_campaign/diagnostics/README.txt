@@ -272,3 +272,28 @@ The output is exclusive. The focused host test is
 /home/jackm/mgkba_campaign_20261019/qgrid_20261020/PROPOSED_EQ_HERMITIAN_PENCIL_HOST_V2.json
 (held complex error2.42e-14, q/-q error5.97e-15; .589s).
 No production route or material source was changed by this proof.
+
+Complex denominator-box chi quadrature: TINY NATIVE P4 PASS
+---------------------------------------------------------
+verify_complex_box_chi_p4.py tests the explicit value-only public minimax
+rules through the typed common native mode11 stream and its actual compiled
+admission. Two current E/rho inputs, full+FF/FA/AF/AA, fine8 and coarse4
+Fejer outputs are compared with independent full-port transition resolvents.
+The public scalar certificate and mass gates remain enabled. No supports,
+virtual bands, density coherences or physical tolerances are removed.
+
+Run on four MPI ranks / one GPU per rank / native 2x2 mesh with the usual
+nodewide GPU binding and immutable source archive:
+  LEG_HEAD=SHA python verify_complex_box_chi_p4.py --source-root ROOT \
+    --source-revision SHA --out FRESH_DIRECTORY --max-wall-seconds 180
+Native CUDA/MathDx, source origins, exact revision and FP64 are required;
+the helper does not enable a reference backend. Only agreed completion
+writes PASS. Rank-local failures print/rethrow without another collective.
+The host preparation test in tests/test_full_density_complex_box_cpu.py
+checks its independent frequency oracle and REAL typed config construction.
+Actual source7aa8f92 native P4 step60065589.0 passed all20paired cases:
+22.8645s fixture / 54s Slurm step, maximum full-port literal error2.14446e-9,
+maximum public scalar certificate9.76432e-9 < 1e-8. The receipt is
+/home/jackm/mgkba_campaign_20261019/qgrid_20261020/p4_complex7aa_60065589/receipt.json
+(SHA25652427ddbf6f80f89caa74fc37ac0aff045574a6e79660d2306a5e1ca2a4e98fe).
+This tiny CUDA pass is not a material timing, positivity or below60s-cycle claim.

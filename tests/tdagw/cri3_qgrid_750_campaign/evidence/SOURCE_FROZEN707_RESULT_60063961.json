@@ -1,6 +1,14 @@
 {
   "status": "SOURCE_FROZEN_T0_COMPUTED_TRAJECTORY_REFUSED_NOT_BC_ADMISSION",
   "scope": "Verification-only unshifted equilibrium source W, not refreshed general W or production joint_frozen initialization; full microscopic ordered current-full-rho Sigma with native head/tail and reference HF/MH anchor",
+  "subsequent_interpretation_correction": {
+    "fix_revision": "46e3dfb",
+    "defect": "The ordered request inherited initial SC frequency bounds; legacy cover fallback could replace all 2816 current active shells by Sigma(0). The actual pole census with this zero request reproduces the observed 77 nodes and four windows.",
+    "raw_numbers_below_changed": false,
+    "on_shell_MGKBA_conservation_verdict": false,
+    "corrected_material_rerun_required": true,
+    "one_site_dielectric_independent_of_this_defect": true
+  },
   "source_revision": "707874dbad5825c57a662378b8dd6a2b4579b02a",
   "source_archive_sha256": "bcb7ae08389629fa2235c756eca6c382db40ff3c124d48955782cef4029270e0",
   "diagnostic_role": "SOURCE_FROZEN_DIAGNOSTIC",

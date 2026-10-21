@@ -226,6 +226,68 @@ new measurements, not flag speculation or accuracy-gate relaxation.
 
 ## Specific remaining opportunities, not measured gains
 
+### Implemented value-only contour path; native timing still required
+
+Source `7aa8f92` switches only the full-density general-W caller to the
+existing public `minimax.analytic_box_rule` value primitives. The old path
+used real-time crossing rules and also certified derivatives that this
+value-only realization does not consume. Default value-plus-derivative
+callers are unchanged. Exact full-matrix column supports retain even a
+`1e-30` coherence; this is not diagonal-population pruning.
+
+On the actual saved750-band state and all26 original transfer-frequency
+sites, an owner-level scalar replay gives **856 pairs**, versus6,137:
+FF83, FA274, AF242, AA257. The same `1e-8` value certificate, full virtual
+space and coefficient-mass checks remain. Forward/reverse contour phases
+are formed with non-growing endpoint references to avoid zero-times-infinity
+arithmetic. Tiny full-complex CPU oracles cover all four blocks, current
+coherences, and both fine and Fejer-restricted response grids.
+
+This node reduction is **not a measured GPU speedup or a sub60s cycle**.
+Full750 Green GEMMs, momentum transforms, Dyson, direction selection and
+frequency reduction still need native timing and admission. See
+[the bounded host certificate record](evidence/COMPLEX_BOX_HOST_CERTIFICATES.json).
+The separate native P4 proof subsequently passed20 cases on source7aa:
+maximum literal complex error `2.14446e-9`, maximum scalar certificate
+`9.76432e-9 < 1e-8`, full response plus all four blocks, two current E/rho
+inputs, and both fine and Fejer grids. Its22.8645s tiny-fixture time is not
+a material refresh time. See [native proof evidence](evidence/COMPLEX_BOX_NATIVE_P4_60065589.json).
+
+### Correction: the707 t0 request was not on its instantaneous shells
+
+The preserved707 measurements above remain raw historical evidence, but
+must **not** be interpreted as a number-conservation verdict for the
+specified on-shell MGKBA closure. A subsequent code audit found that
+`window_sigma_plan` inherited the producer's initial narrow frequency
+extent, rather than the effective extent grown inside SC. Legacy `cover`
+semantics map remaining uncovered states to Sigma(0). Here all2,816 active
+shells could collapse to zero. A scalar replay with the actual pole census
+and zero external frequency reproduces exactly the observed77 pairs/four
+windows; requesting the true44 shells gives a different192-pair plan.
+Tightening quadrature alone does not cure a wrong evaluation frequency.
+
+Fix `46e3dfb` introduces one shared `ordered_window_request` owner for the
+ordered Sigma and its W support-read validation: actual current row/column
+shells, a scalar extent extending their minimum/maximum by1eV, explicit
+all-covered/no-static-fallback witnesses, and no added boundary evaluation
+shells. All750 virtual lines and the legacy SC request semantics remain
+unchanged. The fourteen focused request/support tests pass; new native
+material verification is still required. The earlier one-site dielectric
+witness is independent of this Sigma-request defect and remains valid in
+its stated numerical scope.
+
+Source `17dd65a` also separates the **numerical common frequency origin**
+from physical chemical-potential metadata. A binary gapped logical reference
+uses its accepted global gap midpoint; absolute H/E, occupations, physical
+census mu, transfer poles and spectral-tail ladder remain unchanged. Both
+external and internal bulk frequencies shift together, and the existing
+head owner shifts covariantly. Twenty-one focused tests check exact shells,
+support reads, scalar denominator and actual head value/derivative invariance.
+This avoids an unnecessary factored-growth refusal in the old skewed
+coordinate frame without relaxing the growth certificate. New material
+verification remains required; choosing a coordinate origin is not a cure
+for a physical collective instability or an inaccurate W realization.
+
 ### First general full-density stream: completed 93C stream, refused fit
 
 Source `93c448f`, step `60062281.0`, passed scalar planning in **5.229 s**:
