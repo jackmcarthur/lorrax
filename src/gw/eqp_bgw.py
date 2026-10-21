@@ -100,6 +100,10 @@ import h5py
 import numpy as np
 
 from common.units import RYD_TO_EV
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 #: How far the WFN's E_DFT - E_F may sit from the live writer's persisted
 #: evaluation energies before make_eqp_bgw calls them different mean fields.
@@ -405,7 +409,7 @@ def on_shell_z_factor(operand, *, print_fn=None, what="eqp1") -> np.ndarray:
 	n_bad = int(z.size - np.count_nonzero(finite))
 	if (n_outside or n_bad) and print_fn is not None:
 		zf = z[finite]
-		print_fn(f"  Z factor ({what}): {n_outside} of {z.size} states outside (0, 1], "
+		log.info(f"  Z factor ({what}): {n_outside} of {z.size} states outside (0, 1], "
 		         f"{n_bad} non-finite"
 		         + (f"; Z in [{float(zf.min()):.4f}, {float(zf.max()):.4f}]" if zf.size else ""))
 	if n_bad:
@@ -736,7 +740,7 @@ def assemble_eqp(
 				np.asarray(e_eval_rel_ev, dtype=np.float64),
 				np.asarray(e_dft_rel_ev, dtype=np.float64)):
 			sigma_c_at_eval = np.asarray(sigma_c_on_shell[ON_SHELL_AT_EVAL], dtype=np.complex128)
-			print_fn(
+			log.info(
 				"  eqp1 linearization: Σ was evaluated away from E_DFT this "
 				f"call (max |E_eval − E_DFT| = "
 				f"{float(np.max(np.abs(np.asarray(e_eval_ev, dtype=np.float64) - np.asarray(e_dft_ev, dtype=np.float64)))):.4f} eV) "
@@ -787,7 +791,7 @@ def assemble_eqp(
 				e_dft_rel_ev=e_eval_rel_ev,
 				dE_ev=dE_ev,
 			)
-			print_fn(
+			log.info(
 				"  eqp1 linearization: Σ was evaluated away from E_DFT this "
 				f"call (max |E_eval − E_DFT| = "
 				f"{float(np.max(np.abs(np.asarray(e_eval_ev, dtype=np.float64) - np.asarray(e_dft_ev, dtype=np.float64)))):.4f} eV) "
@@ -1085,7 +1089,7 @@ def make_eqp_bgw(
 		cbm_ev = float(np.min(e_dft_ev[:, occ_idx_local + 1 :]))
 		efermi_ev = 0.5 * (vbm_ev + cbm_ev)
 		stamped_provenance = "midgap (unstamped file, insulating occupations)"
-	print(f"  omega reference = {efermi_ev:.6f} eV ({stamped_provenance})")
+	log.info(f"  omega reference = {efermi_ev:.6f} eV ({stamped_provenance})")
 	e_dft_rel_ev = e_dft_ev - efermi_ev
 	# THE LIVE WRITER'S OWN E_DFT − E_F, when the receipt stamps its
 	# evaluation energies at E_DFT.  The on-shell operand was evaluated at
@@ -1122,7 +1126,7 @@ def make_eqp_bgw(
 				f"have shape {e_eval_ev.shape}, but the sigma window on the "
 				f"IBZ is {e_dft_ev.shape}")
 		e_eval_rel_ev = e_eval_ev - efermi_ev
-		print(f"  eqp1 linearized at {os.path.basename(eval_energies_path)} "
+		log.info(f"  eqp1 linearized at {os.path.basename(eval_energies_path)} "
 		      f"(max |E_eval − E_DFT| = "
 		      f"{float(np.max(np.abs(e_eval_ev - e_dft_ev))):.4f} eV)")
 
@@ -1161,14 +1165,14 @@ def make_eqp_bgw(
 	# so there is no second row remap here.
 	if e_eval_rel_ev is None:
 		if _eval_rel_window is None:
-			print(f"  eqp1 linearization: {os.path.basename(sigma_mnk_path)} "
+			log.info(f"  eqp1 linearization: {os.path.basename(sigma_mnk_path)} "
 			      f"carries NO evaluation-energy stamp (a file written before "
 			      f"2026-08-22).  Falling back to E_DFT, which is correct for "
 			      f"a one-shot cube and WRONG for a self-consistent one — "
 			      f"pass --eval-energies, or regenerate the cube with a "
 			      f"driver that stamps it.")
 		elif str(_eval_prov) == SIGMA_EVAL_AT_E_DFT:
-			print(f"  eqp1 linearization: stamped {_eval_prov!r} — E_DFT, "
+			log.info(f"  eqp1 linearization: stamped {_eval_prov!r} — E_DFT, "
 			      f"which is what the historical default did.")
 		else:
 			_sub = np.asarray(_eval_rel_window, dtype=np.float64)
@@ -1180,11 +1184,11 @@ def make_eqp_bgw(
 					f"about the k set or the band window.")
 			e_eval_rel_ev = _sub
 			e_eval_ev = _sub + efermi_ev
-			print(f"  eqp1 linearization: stamped {_eval_prov!r} "
+			log.info(f"  eqp1 linearization: stamped {_eval_prov!r} "
 			      f"(max |E_eval − E_DFT| = "
 			      f"{float(np.max(np.abs(e_eval_ev - e_dft_ev))):.4f} eV)")
 		if _eval_cov and int(_eval_cov["n_uncovered"]):
-			print(f"  omega coverage (stamped): "
+			log.info(f"  omega coverage (stamped): "
 			      f"{_eval_cov['n_uncovered']} evaluation energies "
 			      f"({100.0 * _eval_cov['fraction_uncovered']:.1f}%) lie "
 			      f"outside the sampled grid; policy="
@@ -1218,7 +1222,7 @@ def make_eqp_bgw(
 	sigma_x_diag = _receipt["sigma_x_diag_ev"]
 	receipt_c_at_dft = _receipt["sigma_c_at_dft_diag_ev"]
 	sigma_c_omega_diag = _receipt["sigma_c_omega_diag_ev"]
-	print(
+	log.info(
 		f"  EQP assembly receipt: schema v{_receipt['schema_version']}, "
 		"live G-space H plus conditioned X/C (on-shell operand or omega curve); "
 		"raw operators untouched.")
@@ -1302,8 +1306,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 		eqp1_out=args.eqp1,
 		finite_difference_spacing_ev=args.finite_difference_spacing,
 	)
-	print(f"wrote: {eqp0_path}")
-	print(f"wrote: {eqp1_path}")
+	log.info(f"wrote: {eqp0_path}")
+	log.info(f"wrote: {eqp1_path}")
 	return 0
 
 

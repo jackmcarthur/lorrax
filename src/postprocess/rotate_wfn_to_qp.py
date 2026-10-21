@@ -53,12 +53,14 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True,
     COLLECTIVE over ``mesh`` (default: the run's canonical mesh).
     """
     from common.collectives import resolve_mesh
+    from common.log import get_logger
     from file_io.qp_wfn import (authenticate_qp_rotations_source_wfn, write_qp_wfn_h5)
     from file_io.restart_bundle import (read_kirr_to_kfull, read_qp_rotations_artifact)
     from ffi import _services
     _services.ensure_on_path()
     from wfn_loader import WfnLoader
     mesh = resolve_mesh(mesh)
+    log = get_logger(__name__)    # function-local, like every import here: no jax before the runtime
     verbose = verbose and _is_rank0()
 
     artifact = read_qp_rotations_artifact(rot_file)
@@ -89,16 +91,16 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True,
         final_state_kwargs = _stored_final_state_args(
             artifact, kirr_to_kfull)
         if verbose:
-            print(f"Rotation file: {rot_file}")
-            print(f"  Full-BZ U shape: {artifact['U_mnk'].shape}")
-            print(f"  WFN wedge rows: {len(kirr_to_kfull)}")
-            print(f"  Band range: [{band_start}, {band_stop})")
-            print(f"  K-grid: {artifact_kgrid.tolist()}")
+            log.info(f"Rotation file: {rot_file}")
+            log.info(f"  Full-BZ U shape: {artifact['U_mnk'].shape}")
+            log.info(f"  WFN wedge rows: {len(kirr_to_kfull)}")
+            log.info(f"  Band range: [{band_start}, {band_stop})")
+            log.info(f"  K-grid: {artifact_kgrid.tolist()}")
             if artifact["occupation_provenance"] is not None:
-                print("  Occupations: stored final fixed-N table "
-                      f"({artifact['occupation_provenance']['occ_hash']})")
+                log.info("  Occupations: stored final fixed-N table "
+                         f"({artifact['occupation_provenance']['occ_hash']})")
             if "E_full_nk_rydberg" in artifact:
-                print("  Energies: stored complete final ladder")
+                log.info("  Energies: stored complete final ladder")
 
         write_qp_wfn_h5(
             output_file,
@@ -112,7 +114,7 @@ def rotate_wfn_coefficients(wfn_file, rot_file, output_file, verbose=True,
         )
 
     if verbose:
-        print(f"Wrote authenticated QP WFN: {output_file}")
+        log.info(f"Wrote authenticated QP WFN: {output_file}")
     return kirr_to_kfull
 
 
@@ -137,6 +139,8 @@ def main():
     # import; every import below this line is function-local for that reason.
     from runtime import initialize_communicator_stack
     initialize_communicator_stack()
+    from common.log import get_logger
+    log = get_logger(__name__)
     
     # Resolve paths relative to input file directory (per user preference)
     input_dir = os.path.dirname(os.path.abspath(args.wfn_file))
@@ -160,13 +164,13 @@ def main():
     verbose = not args.quiet and _is_rank0()
     
     if verbose:
-        print("=" * 60)
-        print("Rotate WFN to QP basis")
-        print("=" * 60)
-        print(f"Input WFN:       {wfn_file}")
-        print(f"Rotation file:   {rotation_file}")
-        print(f"Output WFN_qp:   {output_file}")
-        print("=" * 60)
+        log.info("=" * 60)
+        log.info("Rotate WFN to QP basis")
+        log.info("=" * 60)
+        log.info(f"Input WFN:       {wfn_file}")
+        log.info(f"Rotation file:   {rotation_file}")
+        log.info(f"Output WFN_qp:   {output_file}")
+        log.info("=" * 60)
     
     # NOTE: there is deliberately no --add-mapping any more.  It recomputed
     # kirr_to_kfull by nearest-coordinate search and OVERWROTE the dataset
@@ -178,7 +182,7 @@ def main():
     )
     
     if verbose:
-        print("\nDone!")
+        log.info("\nDone!")
     
     return 0
 

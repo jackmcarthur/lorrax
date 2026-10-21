@@ -20,7 +20,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from common import rank_criterion
+from common.log import get_logger
 from distrib_la import eigh_local
+
+log = get_logger(__name__)
 
 
 def apply(B, Z):
@@ -140,10 +143,36 @@ def report(figures, *, rcond: float, n_log: int,
                     kappa_certified=rank_criterion.KAPPA_CERTIFIED_GRAM, rcond=rcond)
     if "rank" in figures:
         k, mx, mn, kp, dh, lo, mg = figures["rank"]
-        print(f"[{where}] n_log={n_log} rcond={rcond:.1e} "
-              f"n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
-              f"kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
-              f"margin/q={mg}", flush=True)
+        # The "[zeta rank_truncate] n_log=..." text is read by
+        # tests/test_compile_stability_cpu.py and tests/test_zeta_face_rank_truncate.py.
+        log.info(f"[{where}] n_log={n_log} rcond={rcond:.1e} "
+                 f"n_keep/q={k} lam_max/q={mx} lam_min_kept/q={mn} "
+                 f"kappa/q={kp} ldrop_hi/q={dh} lam_min/q={lo} "
+                 f"margin/q={mg}")
+        # The kept rank for the report's ``zeta rank`` row (:func:`take_rank`):
+        # host numbers already read above, so no new read and no sync.
+        keep = np.asarray(k).reshape(-1)
+        if keep.size:
+            _LAST_RANK[:] = [dict(where=str(where), n_log=int(n_log), rcond=float(rcond),
+                                  kept_min=int(keep.min()), kept_max=int(keep.max()))]
+
+
+#: The last :func:`report`'s kept rank, until :func:`take_rank` reads it.
+_LAST_RANK: list = []
+
+
+def take_rank() -> dict | None:
+    """The kept rank of the last :func:`report` (``where``, ``n_log``, ``rcond``,
+    ``kept_min`` / ``kept_max`` over q), cleared on read; None when no report
+    carried a rank since the last read."""
+    return _LAST_RANK.pop() if _LAST_RANK else None
+
+
+def rank_text(rank: dict) -> str:
+    """The ``zeta rank`` row: ``6 of 6 kept per q (rcond 1e-08)``."""
+    lo, hi = int(rank["kept_min"]), int(rank["kept_max"])
+    kept = str(lo) if lo == hi else f"{lo}-{hi}"
+    return f"{kept} of {int(rank['n_log'])} kept per q (rcond {float(rank['rcond']):.0e})"
 
 
 def _host(a):

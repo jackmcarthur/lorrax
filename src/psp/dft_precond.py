@@ -12,6 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 from distrib_la import eigh_local
 
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Preconditioner: diagonal (QE's g_psi convention)
@@ -79,8 +83,8 @@ def make_pw_init(T_diag: jax.Array, n_channels: int, verbose: bool = True):
         # only the formatting/printing may depend on ``verbose``.
         eigs = np.asarray(eigvals[:n_eig])
         if verbose:
-            print(f"  Initial guess: {n_basis} PWs → {n_eig} vectors, "
-                  f"eig [{eigs[0]:.6f}, {eigs[-1]:.6f}] Ry")
+            log.debug(f"  Initial guess: {n_basis} PWs → {n_eig} vectors, "
+                      f"eig [{eigs[0]:.6f}, {eigs[-1]:.6f}] Ry")
         return X0, HX0
 
     return init_fn

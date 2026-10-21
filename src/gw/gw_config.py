@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import configparser
 import enum
+import logging
 import os
 import re
 from dataclasses import dataclass, field, replace as _dc_replace
@@ -12,6 +13,12 @@ from pathlib import Path
 import numpy as np
 
 from common.units import RYD_TO_EV
+
+#: ``common.log.get_logger(__name__)``, named directly: tests/test_env_grammar.py
+#: loads this file alone under stub packages, and importing ``common.log`` there
+#: would execute a second copy of it (a second fallback handler on ``lorrax``).
+log = logging.getLogger(f"lorrax.{__name__}")
+
 from common.four_current_model import resolve_four_current_representation
 
 # The estimator vocabulary lives with the estimators, not here: a second copy
@@ -1134,6 +1141,7 @@ _DEFAULTS = {
     # application output; launcher placement and rank-binding diagnostics
     # remain in the launcher's own log.
     "report_file": "gwjax.out",
+    "verbose": False,   # read by runtime.read_verbose_switches; declared so it is not refused
     "sigma_omega_h5_file": "sigma_mnk.h5",
     # Core flags.  Fresh physics is the safe default: a tensor bundle is
     # loaded only when the deck explicitly requests ``restart = true``, at
@@ -2244,14 +2252,9 @@ def _deck_key_line(lines, start, end, key) -> str:
 
 
 def _print_deck_report(msg: str) -> None:
-    """Print one deck-hygiene report on rank 0; see docs/dev/gw_config_contracts.md."""
-    try:
-        from common.collectives import process_rank
-        rank = process_rank()
-    except Exception:                                  # noqa: BLE001
-        rank = 0
-    if rank == 0:
-        print(msg)
+    """Log one deck-hygiene report (INFO); see docs/dev/gw_config_contracts.md."""
+    import common.log  # noqa: F401  (its fallback prints the record outside a session)
+    log.info(msg)
 
 
 def _input_key_type(key, default):

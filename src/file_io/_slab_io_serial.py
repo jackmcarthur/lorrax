@@ -92,6 +92,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import mesh_is_emulated, process_count
+from common.log import get_logger
 
 from . import h5_journal as _journal
 from ._slab_io_ffi import (_DatasetGeometry, _apply_dataset_attrs,
@@ -107,6 +108,8 @@ from ._slab_io_ffi import (_DatasetGeometry, _apply_dataset_attrs,
 # to keep in step with the registry's verdict on the same path, so this
 # module imports the one name instead of re-declaring it.
 from .hdf5_owner import STACK_H5PY
+
+log = get_logger(__name__)
 
 #: Announced once per process, not once per file: the tier is a property of
 #: the run's (process, device) geometry, and one line per zeta chunk would
@@ -186,11 +189,11 @@ def announce_tier(mesh) -> None:
     if key in _ANNOUNCED:
         return
     _ANNOUNCED.add(key)
-    print(f"  [SlabIO] transport = serial (auto, {key[1]} process, "
-          f"{key[0]} devices) — an emulated mesh has no per-process MPI "
-          f"world for the phdf5 hyperslab (ffi.io.open_file refuses "
-          f"p*q != process_count); host h5py moves one shard at a time, "
-          f"and every shard is this process's own.", flush=True)
+    log.debug(f"  [SlabIO] transport = serial (auto, {key[1]} process, "
+              f"{key[0]} devices) — an emulated mesh has no per-process MPI "
+              f"world for the phdf5 hyperslab (ffi.io.open_file refuses "
+              f"p*q != process_count); host h5py moves one shard at a time, "
+              f"and every shard is this process's own.")
 
 
 def _index_bounds(index, shape: Sequence[int]) -> tuple[tuple[int, ...],

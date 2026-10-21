@@ -14,6 +14,7 @@ difference validation arm of the V_NL derivative (``psp.vnl_ops``).
 
 import argparse
 import functools
+import re
 from pathlib import Path
 
 # THE startup call (runtime module docstring), before any device is
@@ -37,7 +38,11 @@ from wfn_loader import WfnLoader                                    # noqa: E402
 from symmetry_maps import unfold_file_wedge_polar_matrix            # noqa: E402
 from common import timing
 from common.collectives import gather_k_blocks
-from common.preprocessing_output import PreprocessingProductionReport, soc_setting
+from common.preprocessing_output import (
+    CapturedBlock, PreprocessingProductionReport, StageSequence,
+    dipole_result_rows, parallel_transport_text, soc_setting, soc_text,
+    spin_text, stage_row,
+)
 from common.progress import LoopProgress
 from common.report_blocks import Setting
 from common.scientific_output import band_range, pseudopotential_file_rows
@@ -51,6 +56,7 @@ from common.parallel_transport import (
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
 from common.bispinor_init import ALPHA_FS
+from common.log import get_logger, message, record
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
 from gw.gw_config import (
@@ -69,6 +75,8 @@ from file_io.dipole import (DIPOLE_BASIS_ATTR, band_energies_on_full_bz,
 from file_io.parallel_transport import (complete_parallel_transport,
                                         publish_dft_velocity)
 from runtime.run_session import RunSession
+
+log = get_logger(__name__)
 
 # --------------------------
 # K+G helpers
@@ -317,7 +325,7 @@ def compute_finite_q_mtxels(
     psi_v_per_k  = []     # (nv, ns, ngkmax)
     psi_c_per_k  = []     # (nc, ns, ngkmax)
     prep_progress = LoopProgress(
-        nk_full, progress_fn or (lambda _line: None),
+        nk_full,
         title="finite-q velocity preparation", item_name="full-BZ k point",
         enabled=progress_fn is not None and jax.process_index() == 0)
     prep_progress.start()
@@ -392,7 +400,7 @@ def compute_finite_q_mtxels(
     kminq_idx_kq = np.zeros((nk_full, nq), dtype=np.int32)
 
     pair_progress = LoopProgress(
-        max(1, nq * nk_full), progress_fn or (lambda _line: None),
+        max(1, nq * nk_full),
         title="finite-q matrix elements", item_name="(k, q) pair",
         enabled=progress_fn is not None and jax.process_index() == 0)
     pair_progress.start()
@@ -532,6 +540,31 @@ def stamp_dipole_provenance(h5, **kwargs) -> None:
         h5.attrs[key] = value
 
 
+def _note_parallel_transport_dropped(args, reason) -> None:
+    """The NOTE a dropped default parallel-transport artifact leaves where it
+    happens; every rank's log keeps the full text (``GATE <id>``) at INFO.
+
+    ``reason`` is the stage's refusal (its ``GATE <id>: ...`` text) or plain
+    words; the id is kept on ``args`` for the RESULTS row.
+    """
+    text = " ".join(str(reason).split())
+    gate = re.match(r"GATE (\w+):?\s*(.*)$", text)
+    ident, body = ((gate.group(1), gate.group(2)) if gate
+                   else ("parallel_transport_not_written", text))
+    body, _, fix = body.partition("Fix: ")
+    args.parallel_transport_dropped = ident
+    log.warning("parallel_transport.h5 not written; dipole.h5 is unaffected",
+                extra=message(ident, kind="NOTE", lines=(body.strip(),),
+                              fix=fix.strip().rstrip(".") or None))
+
+
+def _sidecar_line(key: str):
+    """An ``emit`` that keeps a component's receipt line in the JSON sidecar."""
+    def emit(line: str = "") -> None:
+        log.debug(str(line), extra=record(key, text=str(line)))
+    return emit
+
+
 def _publish_dft_velocity(args, H_v, psi_G, **kwargs):
     """The artifact's velocity stage; returns its path, or None when dropped.
 
@@ -549,8 +582,8 @@ def _publish_dft_velocity(args, H_v, psi_G, **kwargs):
     except ValueError as exc:
         if jax.process_index() == 0 and pt_path.exists():
             os.remove(pt_path)
-        kwargs["emit"](f"parallel-transport artifact: not written ({exc})")
-        print(f"  parallel-transport artifact: not written ({exc})", flush=True)
+        _note_parallel_transport_dropped(args, exc)
+        log.info(f"  parallel-transport artifact: not written ({exc})")
         return None
     return pt_path
 
@@ -575,8 +608,8 @@ def _complete_parallel_transport(args, pt_path, **kwargs):
     except ValueError as exc:
         if jax.process_index() == 0 and Path(pt_path).exists():
             os.remove(pt_path)
-        kwargs["report"].emit(f"parallel-transport artifact: not written ({exc})")
-        print(f"  parallel-transport artifact: not written ({exc})", flush=True)
+        _note_parallel_transport_dropped(args, exc)
+        log.info(f"  parallel-transport artifact: not written ({exc})")
         return None
     if jax.process_index() == 0:
         os.replace(pt_path, final)
@@ -601,9 +634,12 @@ def _parallel_transport_outer_bands(args, wfn, head_nbands, parser):
     from common.parallel_transport import undersampled_link_axes
     if getattr(args, "parallel_transport_defaulted", False) and \
             undersampled_link_axes(wfn.kgrid):
-        print("  parallel-transport artifact: not written (the k grid "
-              f"{tuple(int(n) for n in wfn.kgrid)} has no link stencil on "
-              f"{undersampled_link_axes(wfn.kgrid)})", flush=True)
+        log.info("  parallel-transport artifact: not written (the k grid "
+                 f"{tuple(int(n) for n in wfn.kgrid)} has no link stencil on "
+                 f"{undersampled_link_axes(wfn.kgrid)})")
+        args.parallel_transport_dropped = (
+            f"the k grid {tuple(int(n) for n in wfn.kgrid)} has no link "
+            f"stencil on {undersampled_link_axes(wfn.kgrid)}")
         args.parallel_transport_out = None
     if (args.parallel_transport_out is None
             or args.parallel_transport_velocity_only or args.w_av_only):
@@ -905,6 +941,66 @@ def parse_args(argv=None):
 	return parser, args
 
 
+def _report_run_facts(report, *, wfn, sym, meta, pseudos, bispinor, nval,
+                      ncond, nband, nband_eff, head_nbands) -> None:
+    """The numerical environment (JSON), SYSTEM, SYMMETRY, K POINTS and BAND
+    WINDOWS of the q = 0 route (print-only)."""
+    from psp.pseudos import pseudo_summary_rows
+    report.environment(wfn=wfn, lines=(
+        "Matrix storage : distributed band blocks on the X x Y mesh",
+        "Output writer  : SlabIO collective write from the band shards",
+    ))
+    report.system(
+        natoms=int(np.asarray(wfn.atom_crys).shape[0]),
+        species=sorted(str(name) for name in pseudos),
+        fft_grid=meta.fft_grid,
+        pseudopotentials=pseudo_summary_rows(pseudos),
+        rows=(("spin", spin_text(nspin=int(getattr(wfn, "nspin", 1)),
+                                 nspinor=int(wfn.nspinor),
+                                 bispinor=bool(bispinor))),))
+    report.sampling(wfn=wfn, sym=sym)
+    nelec = int(wfn.nelec)
+    report.bands((
+        ("occupied", f"{band_range(0, nelec)} "
+                     f"({float(getattr(wfn, 'num_electrons', nelec)):.5f} electrons)"),
+        ("matrix written", band_range(0, head_nbands)),
+        ("deck window", f"valence {band_range(max(0, nelec - nval), nelec)}, "
+                        f"conduction {band_range(nelec, min(nband_eff, nelec + ncond))}"),
+        ("polarizability", band_range(0, min(nband_eff, nband))),
+    ) + ((("link bands", band_range(0, nband_eff)),)
+         if int(nband_eff) != int(head_nbands) else ()))
+
+
+def _parallel_transport_outcome(args, pt_path, capture):
+    """The parallel-transport row of stage 1 and RESULTS; the validation
+    block itself goes to the JSON sidecar."""
+    if capture.lines:
+        log.debug("parallel-transport validation", extra=record(
+            "dipole.parallel_transport.validation", lines=capture.lines))
+    dropped = getattr(args, "parallel_transport_dropped", None)
+    text = parallel_transport_text(
+        requested=args.parallel_transport_out is not None or dropped is not None,
+        written=pt_path is not None, lines=capture.lines, dropped=dropped,
+        velocity_only=bool(args.parallel_transport_velocity_only))
+    if text is not None:
+        stage_row("gauge", text)
+    return text
+
+
+def _report_results(report, stages, *, args, out_path, bands, nk, operator,
+                    hubbard_setup, vnl_setup, finite_q, parallel_transport) -> None:
+    """Close the write stage, then RESULTS: what dipole.h5 holds and why."""
+    stages.result(f"{out_path.name} written")
+    stages.end()
+    report.results(dipole_result_rows(
+        out_name=out_path.name, bands=bands, nk=nk,
+        velocity=(operator + ("" if hubbard_setup is None else " + i[V_U, r]")
+                  + ("" if args.skip_vnl else f"; {args.vnl_mode} V_NL derivative")),
+        vnl=("omitted (--skip-vnl)" if args.skip_vnl
+             else soc_text(vnl_setup.soc_provenance)),
+        finite_q=finite_q, parallel_transport=parallel_transport))
+
+
 def main(argv=None):
 	parser, args = parse_args(argv)
 	input_path = Path(args.input).resolve()
@@ -913,7 +1009,8 @@ def main(argv=None):
 	with RunSession(RUNTIME, "dipole", PreprocessingProductionReport,
 					str(report_path), stages=_STAGES,
 					driver="dipole",
-					purpose="dipole and velocity preprocessing") as run:
+					purpose="dipole and velocity preprocessing") as run, \
+				StageSequence(2 + bool(args.with_finite_q)) as stages:
 		report = run.report
 		debug = run.debug
 		report.begin(input_file=str(input_path))
@@ -945,7 +1042,7 @@ def main(argv=None):
 		# under --skip-vnl), on both producer routes below.
 		_arm = "p + i[V_NL, r] = i[H, r]"
 		if not args.skip_vnl and not args.w_av_only:
-			print(f"  velocity assembly: {_arm}")
+			log.info(f"  velocity assembly: {_arm}")
 		# Resolve WFN relative to input file directory as preferred
 		wfn_path = Path(params.get("wfn_file", "WFN.h5"))
 		if not wfn_path.is_absolute():
@@ -1016,13 +1113,13 @@ def main(argv=None):
 			))
 			report.sampling(wfn=wfn, sym=sym)
 			report.bands((
-				f"Electrons      : {float(getattr(wfn, 'num_electrons', wfn.nelec)):.5f}; "
-				f"occupied-band boundary = {int(wfn.nelec)}",
-				f"Stencil states : {band_range(0, nband_eff)}",
+				("occupied", f"{band_range(0, int(wfn.nelec))} "
+				             f"({float(getattr(wfn, 'num_electrons', wfn.nelec)):.5f} electrons)"),
+				("stencil states", band_range(0, nband_eff)),
 			))
 			from file_io.parallel_transport import write_w_av_stencil_artifact
 			progress = LoopProgress(
-				1, report.progress, title="W-av stencil construction",
+				1, title="W-av stencil construction",
 				item_name="stencil artifact")
 			progress.start()
 			with timing.section("w_av_stencil"):
@@ -1044,11 +1141,10 @@ def main(argv=None):
 			return 0
 
 		nval = int(params.get("nval", 5))
-		if jax.process_index() == 0:
-			print("\nCreating system metadata...")
+		log.debug("\nCreating system metadata...")
 		meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)
 
-		print("\nScanning for pseudopotential files...")
+		log.debug("\nScanning for pseudopotential files...")
 		searched = [str(args.pseudo_dir)] if args.pseudo_dir else [str(input_path.parent)]
 		pseudos = load_pseudopotentials(searched[0])
 		if not pseudos and not args.pseudo_dir:
@@ -1058,11 +1154,9 @@ def main(argv=None):
 				searched.append(fallback)
 				pseudos = load_pseudopotentials(fallback)
 				if pseudos:
-					print(f"Found pseudopotentials in {fallback}")
+					log.info(f"Found pseudopotentials in {fallback}")
 					break
 
-		from psp.pseudos import pseudo_summary_lines
-		report.pseudopotentials(pseudo_summary_lines(pseudos))
 
 		# ── PRE-FLIGHT.  THE ONE CHECK THIS DRIVER NEVER RAN. ────────────────
 		# ``psp.operator_checks`` was written for exactly three callers and its
@@ -1163,10 +1257,6 @@ def main(argv=None):
 					parser.error(
 						f"GATE dftu_velocity_route: {_flag} has no i[r, V_U] term; "
 						"a DFT+U deck runs the analytic q=0 / finite-q velocity only")
-		report.environment(wfn=wfn, lines=(
-			"Matrix storage : distributed band blocks on the X x Y mesh",
-			"Output writer  : SlabIO collective write from the band shards",
-		))
 		_operator = ("p (nonlocal commutator intentionally omitted)"
 					 if args.skip_vnl else _arm)
 		report.settings((
@@ -1204,22 +1294,9 @@ def main(argv=None):
 					+ ("on" if w_av_second_neighbors else "off"),
 					"derived", "first / second shells of the finite-q overlap stencil"),
 		))
-		report.system(
-			natoms=int(np.asarray(wfn.atom_crys).shape[0]),
-			species=sorted(str(name) for name in pseudos),
-			fft_grid=meta.fft_grid,
-			lines=(f"Spin channels  : nspin={int(getattr(wfn, 'nspin', 1))}; "
-				   f"nspinor={int(wfn.nspinor)}; bispinor={bool(bispinor)}",))
-		report.sampling(wfn=wfn, sym=sym)
-		_nelec = int(wfn.nelec)
-		report.bands((
-			f"Electrons      : {float(getattr(wfn, 'num_electrons', _nelec)):.5f}; "
-			f"occupied-band boundary = {_nelec}",
-			f"Matrix written : {band_range(0, head_nbands)}",
-			f"Deck valence   : {band_range(max(0, _nelec - nval), _nelec)}",
-			f"Deck conduction: {band_range(_nelec, min(nband_eff, _nelec + ncond))}",
-			f"Polarizability : {band_range(0, min(nband_eff, nband))}",
-		))
+		_report_run_facts(report, wfn=wfn, sym=sym, meta=meta, pseudos=pseudos,
+		                  bispinor=bispinor, nval=nval, ncond=ncond, nband=nband,
+		                  nband_eff=nband_eff, head_nbands=head_nbands)
 
 		nk = int(sym.nk_tot)
 		nb = int(nband_eff)
@@ -1258,17 +1335,23 @@ def main(argv=None):
 							skip_vnl=False, vnl_mode="analytic",
 							kinetic_balance_lift=resolve_four_current_representation(
 								True, bispinor_gw_mode).current_lift))
-			if jax.process_index() == 0:
-				print(
-					"STATIC_GAUGE_HALL_TRANSACTION "
-					f"producer_id={hall.producer_id} "
-					f"operator_fingerprint="
-					f"{hall.hamiltonian_config_operator_fingerprint} "
-					f"bands=[{hall.band_start},{hall.band_stop}) "
-					f"nk_tot={hall.nk_tot} "
-					f"sigma_H_raw_bohr^-1="
-					f"[{sigma_H[0]:.17e},{sigma_H[1]:.17e},"
-					f"{sigma_H[2]:.17e}]")
+			log.debug(
+				"STATIC_GAUGE_HALL_TRANSACTION "
+				f"producer_id={hall.producer_id} "
+				f"operator_fingerprint="
+				f"{hall.hamiltonian_config_operator_fingerprint} "
+				f"bands=[{hall.band_start},{hall.band_stop}) "
+				f"nk_tot={hall.nk_tot} "
+				f"sigma_H_raw_bohr^-1="
+				f"[{sigma_H[0]:.17e},{sigma_H[1]:.17e},"
+				f"{sigma_H[2]:.17e}]",
+				extra=record(
+					"dipole.static_gauge_hall",
+					producer_id=hall.producer_id,
+					operator_fingerprint=hall.hamiltonian_config_operator_fingerprint,
+					band_start=hall.band_start, band_stop=hall.band_stop,
+					nk_tot=hall.nk_tot,
+					sigma_H_raw_bohr_inv=[float(v) for v in sigma_H[:3]]))
 			run.complete(stages=(
 				("uniform-current sweep", "static_gauge_uniform_sweep"),
 				("Hall reduction", "static_gauge_hall_reduce"),
@@ -1406,10 +1489,12 @@ def main(argv=None):
 		# uniform-Hall and transport-link paths whose neighbour connectivity truly
 		# needs them.  The three Cartesian components ride ONE sweep; p acts on
 		# each rank's G slab and V_NL is separable, so only ψ crosses the mesh.
+		stages.begin(1, "q = 0 velocity matrix", name="dipole.velocity")
 		pt_path = None
+		pt_capture = CapturedBlock()
 		debug_kindex = min(1, max(0, nk - 1))
 		dipole_progress = LoopProgress(
-			1, report.progress, title="q=0 velocity matrix construction",
+			1, title="q=0 velocity matrix construction",
 			item_name="distributed band-matrix sweep")
 		dipole_progress.start()
 		if args.vnl_mode == "numeric":
@@ -1461,7 +1546,7 @@ def main(argv=None):
 						hubbard_provenance=hubbard_stamp, wfn_path=str(wfn_path),
 						vnl_included=not args.skip_vnl,
 						rcond=float(args.parallel_transport_rcond),
-						emit=report.emit,
+						emit=_sidecar_line("dipole.parallel_transport.collapsed_axis"),
 						velocity_kinetic=H_p[0])
 					del H_p
 				# The velocity stays sharded, 1/P of (nk, 3, nb, nb) per rank,
@@ -1483,14 +1568,17 @@ def main(argv=None):
 					w_av_second_neighbors=w_av_second_neighbors,
 					atol=float(args.parallel_transport_validation_atol),
 					rtol=float(args.parallel_transport_validation_rtol),
-					report=report, head_nbands=head_nbands)
+					report=pt_capture, head_nbands=head_nbands)
 		dipole_progress.step()
 		dipole_progress.finish()
+		pt_text = _parallel_transport_outcome(args, pt_path, pt_capture)
+		stages.result(f"<mk|v|nk> on bands {band_range(0, nb)}, {nk} k")
 
 		# Optional: finite-q matrix elements for the SOS chi head/wing/S/w pipeline.
-		finite_q = None
+		finite_q = finite_q_text = None
 		if args.with_finite_q:
-			print("\nComputing finite-q matrix elements (SOS pipeline)...")
+			stages.begin(2, "Finite-q matrix elements", name="dipole.finite_q")
+			log.info("\nComputing finite-q matrix elements (SOS pipeline)...")
 			iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
 			with timing.section("finite_q"):
 				(rho_cvkq, v_cvkq, alpha_cvkq, ward_residual_cvkq,
@@ -1510,10 +1598,12 @@ def main(argv=None):
 				iq_list=iq_list, n_occ=n_occ_eff, v_lo=v_lo, c_hi=c_hi,
 				alpha_cvkq=alpha_cvkq, ward_residual_cvkq=ward_residual_cvkq)
 			del rho_cvkq, v_cvkq, alpha_cvkq, ward_residual_cvkq, kminq_idx_kq
-			report.heading("Finite-q coverage")
-			report.emit(f"Reduced q points: {len(iq_list)} of {int(sym.nk_red)} stored points")
-			report.emit(f"Valence slice  : {band_range(v_lo, n_occ_eff)}")
-			report.emit(f"Conduction slice: {band_range(n_occ_eff, c_hi)}")
+			finite_q_text = (f"{len(iq_list)} q points (of {int(sym.nk_red)} stored), "
+			                 f"valence {band_range(v_lo, n_occ_eff)}, "
+			                 f"conduction {band_range(n_occ_eff, c_hi)}")
+			stages.result("rho, v and alpha on " + finite_q_text)
+
+		stages.begin(stages.total, "Dipole artifact write", name="dipole.write")
 
 		out_path = Path(args.out).resolve()
 		note = ('dipole_cart[3,x,y] = p_i (V_NL skipped, --skip-vnl); '
@@ -1523,7 +1613,7 @@ def main(argv=None):
 		             + '; ')
 		note += 'band_energies[k,b] = E_b(k); deltaE = E_b - E_b\' derived on read'
 		write_progress = LoopProgress(
-			1, report.progress, title="dipole artifact write",
+			1, title="dipole artifact write",
 			item_name="output artifact")
 		write_progress.start()
 		with timing.section("write_h5"):
@@ -1543,6 +1633,10 @@ def main(argv=None):
 		del velocity, finite_q
 		write_progress.step()
 		write_progress.finish()
+		_report_results(report, stages, args=args, out_path=out_path,
+		                bands=band_range(0, head_nbands), nk=nk, operator=_operator,
+		                hubbard_setup=hubbard_setup, vnl_setup=vnl_setup,
+		                finite_q=finite_q_text, parallel_transport=pt_text)
 		file_rows = [("dipole matrices", "written", str(out_path))]
 		if pt_path is not None:
 			file_rows.append(("parallel-transport", "written", str(pt_path)))

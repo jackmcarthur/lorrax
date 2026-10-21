@@ -25,6 +25,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from common.log import get_logger
 from file_io import CrystalData
 from psp.pseudos import load_pseudopotentials
 from psp.ionic_gspace import build_ionic_and_core
@@ -41,6 +42,8 @@ from solvers.chebyshev import (
     reconstruct_dos,
 )
 import common.timing as timing
+
+log = get_logger(__name__)
 
 RY_TO_EV = 13.6056980659
 
@@ -209,22 +212,22 @@ def run_kpm_dos(
     resolution_eV = 2 * half_width * RY_TO_EV / n_moments
 
     if verbose:
-        print("=" * 60)
-        print("KPM DENSITY OF STATES — H_DFT")
-        print("=" * 60)
-        print(f"  ecutwfc        {ecutwfc:.1f} Ry  ({ecutwfc*RY_TO_EV:.1f} eV)")
-        print(f"  FFT grid       {nx} x {ny} x {nz}")
-        print(f"  k-grid         {'x'.join(str(k) for k in kgrid)}  "
-              f"({nk} {grid_label})")
-        print(f"  nspinor        {nspinor}")
-        print(f"  ngkmax         {ngkmax}  (nG range: {nG_min}–{nG_max})")
-        print(f"  Chebyshev M    {n_moments}")
-        print(f"  Random vectors {n_random} per k-point")
-        print(f"  Total matvecs  {nk * n_random * n_moments}")
-        print(f"  Spectrum       [{e_min_eV:.1f}, {e_max_eV:.1f}] eV  "
-              f"(bandwidth {2*half_width*RY_TO_EV:.1f} eV)")
-        print(f"  Resolution     ~{resolution_eV:.2f} eV/moment")
-        print("-" * 60)
+        log.info("=" * 60)
+        log.info("KPM DENSITY OF STATES — H_DFT")
+        log.info("=" * 60)
+        log.info(f"  ecutwfc        {ecutwfc:.1f} Ry  ({ecutwfc*RY_TO_EV:.1f} eV)")
+        log.info(f"  FFT grid       {nx} x {ny} x {nz}")
+        log.info(f"  k-grid         {'x'.join(str(k) for k in kgrid)}  "
+                 f"({nk} {grid_label})")
+        log.info(f"  nspinor        {nspinor}")
+        log.info(f"  ngkmax         {ngkmax}  (nG range: {nG_min}–{nG_max})")
+        log.info(f"  Chebyshev M    {n_moments}")
+        log.info(f"  Random vectors {n_random} per k-point")
+        log.info(f"  Total matvecs  {nk * n_random * n_moments}")
+        log.info(f"  Spectrum       [{e_min_eV:.1f}, {e_max_eV:.1f}] eV  "
+                 f"(bandwidth {2*half_width*RY_TO_EV:.1f} eV)")
+        log.info(f"  Resolution     ~{resolution_eV:.2f} eV/moment")
+        log.info("-" * 60)
 
     # ── JIT warmup: compile the recurrence at the first k-point ────
     with timing.section("kpm_dos.jit_warmup"):
@@ -256,8 +259,8 @@ def run_kpm_dos(
             mu_total += weights[ik] * mu_k
 
             if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
-                print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.2f}s  "
-                      f"nG={H_k.nG}  mu_0={mu_k[0]:.4f}")
+                log.info(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.2f}s  "
+                         f"nG={H_k.nG}  mu_0={mu_k[0]:.4f}")
 
     # ── Jackson damping + DOS reconstruction ───────────────────────
     with timing.section("kpm_dos.reconstruct"):
@@ -275,9 +278,9 @@ def run_kpm_dos(
     _plot_dos(E_grid, rho, n_moments, n_random, nk, plot_file)
 
     if verbose:
-        print("-" * 60)
-        timing.report(print_fn=print, title="--- KPM DOS Timing ---")
-        print(f"  → {plot_file}")
+        log.info("-" * 60)
+        timing.report(print_fn=log.info, title="--- KPM DOS Timing ---")
+        log.info(f"  → {plot_file}")
 
     return {
         "mu_raw": mu_total,

@@ -37,6 +37,9 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 __all__ = ["exchange_tiles"]
 
@@ -62,7 +65,7 @@ def _host_tile(V_np, n_rmu, n_rmu_pad, grid_xy):
 def exchange_tiles(Qpath, *, route, mesh_xy, V_q0, V_ongrid, kgrid_vq,
                    n_rmu, n_rmu_pad, refit=None, interp=None, head_mbz=False,
                    alpha=None, cert_idx=(), both_refit=None, both_idx=(),
-                   log_fn=print):
+                   log_fn=log.info):
     """``(V_stack, M_stack, head_scalars, n_eval_calls)`` for the path.
 
     ``Qpath`` is ``(nQ, 3)`` fractional.  ``route`` is ``"ongrid"``,

@@ -24,12 +24,17 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import logging
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 
 from ._compat import deprecated_alias
+
+#: A service is independently installable and imports no ``common.log``: it logs on the
+#: ``lorrax.`` namespace directly (the handlers in ``common.log`` sit on that root).
+_LOG = logging.getLogger("lorrax.symmetry_maps")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -545,10 +550,10 @@ def real_space_action_tables(wfn, sym, validate: bool = True, *,
         # ops ⊆ density group AND symmorphic guards against ever *losing* a
         # non-symmorphic op the WFN carries but the τ=0 detector can't see.
         if wfn_symmorphic and wfn_in_rho and Rinv_rho.shape[0] > n_sym:
-            print(f"  [orbit] WFN stores {n_sym} sym op(s); recovered "
-                  f"{Rinv_rho.shape[0]}-op symmorphic point group from the "
-                  f"charge density — closing centroids under the larger group "
-                  f"(fixes V_H k-star symmetry).")
+            _LOG.info(f"  [orbit] WFN stores {n_sym} sym op(s); recovered "
+                      f"{Rinv_rho.shape[0]}-op symmorphic point group from the "
+                      f"charge density — closing centroids under the larger group "
+                      f"(fixes V_H k-star symmetry).")
             Rinv = Rinv_rho
             R = np.rint(np.linalg.inv(Rinv)).astype(np.int32)
             tau = np.zeros((Rinv.shape[0], 3), dtype=np.float64)

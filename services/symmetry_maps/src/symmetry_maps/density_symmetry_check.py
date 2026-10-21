@@ -46,6 +46,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import sys
 import time
@@ -53,6 +54,10 @@ import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
+
+#: A service is independently installable and imports no ``common.log``: it logs on the
+#: ``lorrax.`` namespace directly (the handlers in ``common.log`` sit on that root).
+_LOG = logging.getLogger("lorrax.symmetry_maps")
 
 __all__ = [
     "DensitySymmetryReport",
@@ -899,7 +904,7 @@ def _enforce_policy(
     if not announce:
         return
     if _is_reporting_process():
-        print(report.summary() + note, flush=True)
+        _LOG.info(report.summary() + note)
     if not report.ok:
         detail = "\n  ".join(report.messages)
         text = (f"WFN two-component TRS check FAILED for {report.path}:\n  "

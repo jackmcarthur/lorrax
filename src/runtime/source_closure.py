@@ -560,11 +560,89 @@ def ensure_source_closure(
     return receipt
 
 
+# ── the checkout's version, for the report header ───────────────────────────
+#: The one probe of this process: ``proc`` (the running ``git status``),
+#: ``version`` (the resolved text, or ``None``) and ``started``.
+_VERSION_PROBE: dict = {"started": False, "proc": None, "version": None}
+#: Characters of the commit hash the header prints.
+VERSION_HASH_CHARS = 9
+
+
+def start_version_probe(receipt: SourceClosureReceipt | None = None) -> None:
+    """Start reading this checkout's commit and whether it has local changes.
+
+    Called once, on rank 0, by ``runtime.bootstrap`` right after the closure
+    is sealed and before JAX is imported: the fork is cheap there, and the
+    ``git status`` (0.6 s on Lustre, the measurement in
+    ``gw.kin_ion_io._generator_commit``) runs beside the import storm instead
+    of after it.  ``--no-optional-locks`` keeps it from rewriting the index,
+    so the probe writes no file.  An installed distribution has no checkout;
+    its version is its distribution version.  Any failure leaves no version.
+    """
+    if _VERSION_PROBE["started"]:
+        return
+    _VERSION_PROBE["started"] = True
+    receipt = receipt if receipt is not None else _RECEIPT
+    if receipt is None:
+        return
+    if receipt.mode != "source":
+        try:
+            _VERSION_PROBE["version"] = f"LORRAX {metadata.version('lorrax')}"
+        except Exception:                       # noqa: BLE001 - a stamp never fails a run
+            pass
+        return
+    if not (Path(receipt.root) / ".git").exists():
+        return
+    import subprocess
+    try:
+        _VERSION_PROBE["proc"] = subprocess.Popen(
+            ["git", "--no-optional-locks", "-C", str(receipt.root), "status",
+             "--porcelain=v2", "--branch", "--untracked-files=no"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True)
+    except Exception:                           # noqa: BLE001 - no git, no stamp
+        _VERSION_PROBE["proc"] = None
+
+
+def checkout_version(*, timeout: float = 5.0) -> str | None:
+    """``LORRAX <short hash>[ + local changes]``, or ``None`` when unknown.
+
+    Reads the probe :func:`start_version_probe` started (waiting at most
+    ``timeout`` seconds for it); a process that started none (a test, a tool)
+    has no version.  A tree whose state the probe could not read prints no
+    version rather than a clean-looking one.
+    """
+    proc = _VERSION_PROBE["proc"]
+    if proc is not None:
+        _VERSION_PROBE["proc"] = None
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except Exception:                       # noqa: BLE001 - slow or failed: no stamp
+            try:
+                proc.kill()
+            except Exception:                   # noqa: BLE001
+                pass
+            out = None
+        if out is not None and proc.returncode == 0:
+            lines = out.splitlines()
+            oid = next((line.split()[2] for line in lines
+                        if line.startswith("# branch.oid ") and len(line.split()) > 2),
+                       None)
+            if oid and oid != "(initial)":
+                changed = any(line and not line.startswith("#") for line in lines)
+                _VERSION_PROBE["version"] = (f"LORRAX {oid[:VERSION_HASH_CHARS]}"
+                                             + (" + local changes" if changed else ""))
+    return _VERSION_PROBE["version"]
+
+
 __all__ = [
     "SERVICE_ENTRYPOINT_GROUP",
     "ServiceSpec",
     "SourceClosureError",
     "SourceClosureReceipt",
+    "VERSION_HASH_CHARS",
+    "checkout_version",
     "ensure_source_closure",
     "source_service_specs",
+    "start_version_probe",
 ]

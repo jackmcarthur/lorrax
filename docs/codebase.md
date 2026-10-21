@@ -179,13 +179,14 @@ else.
 | `jax_compile_cache.py` | Configures and audits JAX compilation caches. |
 | `jax_profile.py` | Controls bounded JAX profiling captures. |
 | `kq_mapping.py` | Builds k/q index mappings. |
+| `log.py` | The `lorrax.*` loggers, their structured extras, and the three handlers a driver session installs (main log, rank stream, JSON sidecar). |
 | `meta.py` | Stores system metadata shared by calculation stages. |
 | `mtxel_sweep.py` | Evaluates matrix elements in bounded sweeps. |
 | `parallel_transport.py` | Constructs band-subspace parallel-transport links. |
 | `pivoted_cholesky.py` | Implements shared pivoted-Cholesky selection helpers. |
 | `preprocessing_output.py` | Writes preprocessing reports and provenance. |
 | `production_report.py` | The rank-zero main log every driver report subclasses: stream, header, Devices, files table, closing line. |
-| `progress.py` | Renders rank-aware progress output. |
+| `progress.py` | Renders rank-aware progress lines on the `lorrax.progress` logger. |
 | `provenance.py` | Defines provenance stamps and validation helpers. |
 | `psi_G_store.py` | Maintains the host-resident reciprocal-wavefunction cache. |
 | `rank_criterion.py` | Applies the shared numerical-rank criterion. |

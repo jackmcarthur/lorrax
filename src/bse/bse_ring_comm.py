@@ -20,6 +20,9 @@ from lxkit import mark_varying
 from lxkit import ordered_psum, ordered_psum_scatter
 
 from .bse_preconditioner import exchange_spin_weight
+from common.log import get_logger, message
+
+log = get_logger(__name__)
 
 
 jax.config.update("jax_enable_x64", True)
@@ -224,10 +227,15 @@ def _warm_process_allgather(mesh: Mesh) -> None:
         out = gather_to_host(probe)
         assert out.shape == (n,), out.shape
     except Exception as exc:                      # noqa: BLE001
-        if jax.process_index() == 0:
-            print(f"  [collectives] process_allgather warm-up failed "
-                  f"({type(exc).__name__}: {exc}); a later gather may refuse "
-                  f"under JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi", flush=True)
+        log.warning(f"  [collectives] process_allgather warm-up failed "
+                    f"({type(exc).__name__}: {exc}); a later gather may refuse "
+                    f"under JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi",
+                    extra=message(
+                        id="process_allgather_warmup_failed",
+                        found=("process_allgather warm-up",
+                               f"{type(exc).__name__}: {exc}"),
+                        needs="a working cross-process gather",
+                        fix="check JAX_CPU_COLLECTIVES_IMPLEMENTATION and the launcher"))
 
 
 def create_mesh_2d(devices: Optional[list] = None) -> Mesh:

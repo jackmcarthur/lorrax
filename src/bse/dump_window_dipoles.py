@@ -43,6 +43,9 @@ import numpy as np  # noqa: E402
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES  # noqa: E402
 
 from .bse_densify import DENSIFIED_POSITION_PAIR_RULES  # noqa: E402
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 def _head():
@@ -125,21 +128,21 @@ def main(argv=None):
         f.attrs["lorrax_head"] = _head()
     d = np.asarray(dip["d_alpha"])
     nk = d.shape[1]
-    print(f"[dump_window_dipoles] wrote {args.out}: d_alpha {d.shape}; route {dip['route']}", flush=True)
-    print(f"[dump_window_dipoles] IP sums per cell (bohr^2) x {np.sum(np.abs(d[0])**2)/nk:.6f} "
-          f"y {np.sum(np.abs(d[1])**2)/nk:.6f} z {np.sum(np.abs(d[2])**2)/nk:.6f} "
-          f"sigma+ {np.sum(np.abs(d[0] + 1j*d[1])**2)/(2*nk):.6f} "
-          f"sigma- {np.sum(np.abs(d[0] - 1j*d[1])**2)/(2*nk):.6f}", flush=True)
+    log.info(f"[dump_window_dipoles] wrote {args.out}: d_alpha {d.shape}; route {dip['route']}")
+    log.info(f"[dump_window_dipoles] IP sums per cell (bohr^2) x {np.sum(np.abs(d[0])**2)/nk:.6f} "
+             f"y {np.sum(np.abs(d[1])**2)/nk:.6f} z {np.sum(np.abs(d[2])**2)/nk:.6f} "
+             f"sigma+ {np.sum(np.abs(d[0] + 1j*d[1])**2)/(2*nk):.6f} "
+             f"sigma- {np.sum(np.abs(d[0] - 1j*d[1])**2)/(2*nk):.6f}")
     if dip.get("rfix") is not None:
-        print(f"[dump_window_dipoles] rfix {json.dumps(dip['rfix'])}", flush=True)
+        log.debug(f"[dump_window_dipoles] rfix {json.dumps(dip['rfix'])}")
     if args.check_eigenvectors:
         key = args.check_key
         if dip.get(key) is None:
             raise SystemExit(f"GATE dump_window_dipoles_check_key: {key} is not in this bundle "
                              f"(d_alpha_rq exists only with --eqp --dipole-position-fix)")
         rel, n = check_eigenvectors(args.check_eigenvectors, np.asarray(dip[key]))
-        print(f"[dump_window_dipoles] gauge identity {key} vs {args.check_eigenvectors}: "
-              f"max|P - stored|/max|stored| = {rel:.3e} over {n} states", flush=True)
+        log.info(f"[dump_window_dipoles] gauge identity {key} vs {args.check_eigenvectors}: "
+                 f"max|P - stored|/max|stored| = {rel:.3e} over {n} states")
     return 0
 
 

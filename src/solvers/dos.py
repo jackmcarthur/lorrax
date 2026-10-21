@@ -36,6 +36,9 @@ from solvers.chebyshev import (
     chebyshev_moments,
     reconstruct_dos,
 )
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 @dataclass
@@ -143,7 +146,7 @@ def compute_dos(
     # ── Spectrum bounds ──
     if E_min is None or E_max is None:
         if verbose:
-            print("  Estimating spectrum bounds via Lanczos...")
+            log.info("  Estimating spectrum bounds via Lanczos...")
         E_min_est, E_max_est = estimate_spectrum(apply_H, dim,
                                                   n_lanczos=n_lanczos, seed=seed)
         E_min = E_min if E_min is not None else E_min_est
@@ -152,8 +155,8 @@ def compute_dos(
     center = (E_max + E_min) / 2.0
     half_width = (E_max - E_min) / 2.0
     if verbose:
-        print(f"  Spectrum: [{E_min:.4f}, {E_max:.4f}] "
-              f"(center={center:.4f}, half_width={half_width:.4f})")
+        log.info(f"  Spectrum: [{E_min:.4f}, {E_max:.4f}] "
+                 f"(center={center:.4f}, half_width={half_width:.4f})")
 
     # ── Rescaled matvec ──
     def apply_H_tilde(x):
@@ -161,8 +164,8 @@ def compute_dos(
 
     # ── Chebyshev moments ──
     if verbose:
-        print(f"  Computing {n_moments} Chebyshev moments "
-              f"with {n_random} random vectors...")
+        log.info(f"  Computing {n_moments} Chebyshev moments "
+                 f"with {n_random} random vectors...")
     mu_raw = chebyshev_moments(apply_H_tilde, dim, n_moments, n_random,
                                 seed=seed, verbose=verbose)
 
@@ -176,8 +179,8 @@ def compute_dos(
 
     if verbose:
         total_states = float(np.trapezoid(rho, E_grid))
-        print(f"  DOS integral: {total_states:.1f} states "
-              f"(dim={dim})")
+        log.info(f"  DOS integral: {total_states:.1f} states "
+                 f"(dim={dim})")
 
     return DOSResult(
         E_grid=E_grid, rho=rho,

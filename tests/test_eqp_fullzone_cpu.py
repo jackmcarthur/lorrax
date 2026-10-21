@@ -223,7 +223,7 @@ def _degenerate_pair(case, lo):
 
 
 def test_gauge_split_inside_a_multiplet_passes_and_is_applied(case, tmp_path,
-                                                              capsys):
+                                                              caplog):
     """The gate reads multiplet means; per-band values are applied as given.
 
     Bands 2 and 3 form one DFT multiplet whose two shifts differ by 10 meV
@@ -239,13 +239,13 @@ def test_gauge_split_inside_a_multiplet_passes_and_is_applied(case, tmp_path,
     _k, _d, q_file, _off = read_bgw_eqp(f)
     got = apply_eqp_corrections(e_full / RY, f, _deck(tmp_path))
     assert np.array_equal(got[:, :NB_EQP], q_file / RY)
-    out = capsys.readouterr().out
+    out = caplog.text
     assert "10.0000 meV band by band" in out
     assert "largest spread inside one multiplet 10.0000 meV" in out
 
 
 def test_multiplet_cut_by_the_file_edge_is_reported_not_gated(case, tmp_path,
-                                                              capsys):
+                                                              caplog):
     """The file's top band (6) is degenerate with DFT band 7, outside the file."""
     e_full = _degenerate_pair(case, NB_EQP - 1)
     q = e_full[:, :NB_EQP] + (np.asarray(case.q_full)
@@ -253,8 +253,8 @@ def test_multiplet_cut_by_the_file_edge_is_reported_not_gated(case, tmp_path,
     q[_k_off_its_parent(case.sym), NB_EQP - 1] += 5.0e-3
     f = _write(tmp_path / "eqp_cut.dat", case.k_full, e_full, q)
     apply_eqp_corrections(e_full / RY, f, _deck(tmp_path))
-    out = capsys.readouterr().out
-    assert "WARNING eqp_cut.dat: band 6 ends inside a DFT multiplet at 27 k" in out
+    out = caplog.text
+    assert "[eqp] eqp_cut.dat: band 6 ends inside a DFT multiplet at 27 k" in out
     assert "5.0000 meV, is reported and not gated" in out
 
 

@@ -11,6 +11,7 @@ from jax import shard_map
 
 from common import rank_criterion
 from common import spectral_closure
+from common.log import get_logger, message as log_message, record
 from runtime.padding import (
 	bounded_partition_tile,
 	solve_at_logical,
@@ -31,6 +32,8 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
+
+log = get_logger(__name__)
 
 # The distributed-linalg PUBLIC API: the q-local batch layout, mesh probing
 # and the STABLE mesh cache key.
@@ -1409,13 +1412,16 @@ def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
     val = float(raw)
     if env_name not in _env_override_warned:
         _env_override_warned.add(env_name)
-        if jax.process_index() == 0:
-            print(f"  *** DEPRECATED env override: {env_name}={raw} overrides "
-                  f"input key {key_name}={key_value!r}.  The input file is "
-                  f"the record — put '{key_name} = {raw}' in the deck "
-                  f"instead.  The env form still wins this release, but it "
-                  f"is loud on purpose (env grants capability; it must not "
-                  f"silently select policy).", flush=True)
+        log.warning(
+            f"DEPRECATED env override: {env_name}={raw} overrides "
+            f"input key {key_name}={key_value!r}",
+            extra=log_message(
+                "deprecated_env_override",
+                found=(env_name, str(raw)),
+                lines=("the input file is the record; the env form still wins "
+                       "this release, but it is loud on purpose (env grants "
+                       "capability; it must not silently select policy)",),
+                fix=f"put '{key_name} = {raw}' in the deck instead"))
     return val
 
 
@@ -1455,13 +1461,17 @@ def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> No
         # here would have read every firing as silence after the flip, which is
         # the shape of a guard that reports a clean bill for the wrong reason.
         if np.any(n_post != n_pre):
-            print(f"*** [spectral-closure] {where}: the rank cut falls INSIDE "
-                  "a degenerate block of the ISDF Gram on at least one q of this "
-                  f"batch — retained rank/q {n_pre} closes at {n_post} (the whole straddled "
-                  "block is DROPPED, owner ruling 2026-08-10).  A cut through a "
-                  "degenerate block retains a symmetry-ARBITRARY slice of an "
-                  "eigenspace, so zeta's span differs between q and Sq and the "
-                  f"k-star identity fails for W and Sigma_x alike.  Mode={mode}. ***", flush=True)
+            log.warning(
+                f"[spectral-closure] {where}: the rank cut falls INSIDE "
+                "a degenerate block of the ISDF Gram on at least one q of this "
+                f"batch — retained rank/q {n_pre} closes at {n_post} (the whole straddled "
+                "block is DROPPED, owner ruling 2026-08-10).  A cut through a "
+                "degenerate block retains a symmetry-ARBITRARY slice of an "
+                "eigenspace, so zeta's span differs between q and Sq and the "
+                f"k-star identity fails for W and Sigma_x alike.  Mode={mode}.",
+                extra=log_message(
+                    "spectral_closure_cut",
+                    found=("retained rank/q", f"{n_pre} closes at {n_post}")))
             if mode == "strict":
                 spectral_closure.note_device_snap(where, n_pre.max(), n_post.max())
     if "certify" in figures:
@@ -1469,14 +1479,21 @@ def _report_the_cut(figures, *, where: str, kappa_certified, rcond: float) -> No
         if np.any(over):
             kcert = ("uncertified" if kappa_certified is None
                      else f"{float(kappa_certified):.3e}")
-            print(f"*** [rank-policy] {where}: the rank cut BOUND and left "
-                  f"the certified regime on at least one q.  rcond={float(rcond):.1e} "
-                  f"(cap 1/rcond={1.0 / float(rcond):.3e}), certified kappa ceiling "
-                  f"{kcert}.  n_drop/q={n_drop} kappa/q={kappa} discarded_weight/q={dropped_w} "
-                  f"(ceiling {rank_criterion.DISCARDED_WEIGHT_MAX:.1e}). "
-                  "A cut that binds at kappa >= ~1e10 is measured wrong by "
-                  "electron-volts (R19 rcond ladder; Si 4x4x4 1776 centroids -> "
-                  f"Sigma_c MAE 54.4 eV at exit 0).  Mode={_policy_mode()}. ***", flush=True)
+            log.warning(
+                f"[rank-policy] {where}: the rank cut BOUND and left "
+                f"the certified regime on at least one q.  rcond={float(rcond):.1e} "
+                f"(cap 1/rcond={1.0 / float(rcond):.3e}), certified kappa ceiling "
+                f"{kcert}.  n_drop/q={n_drop} kappa/q={kappa} discarded_weight/q={dropped_w} "
+                f"(ceiling {rank_criterion.DISCARDED_WEIGHT_MAX:.1e}). "
+                "A cut that binds at kappa >= ~1e10 is measured wrong by "
+                "electron-volts (R19 rcond ladder; Si 4x4x4 1776 centroids -> "
+                f"Sigma_c MAE 54.4 eV at exit 0).  Mode={_policy_mode()}.",
+                extra=log_message(
+                    "rank_cut_bound",
+                    found=("n_drop/q", f"{n_drop}"),
+                    needs="a rank cut inside the certified regime",
+                    fix="reduce the centroid budget, or raise zeta_rcond back "
+                        "onto the certified plateau (1e-8 .. 1e-4)"))
             rank_criterion.note_device_finding(
                 where,
                 "the cut bound (max %d directions dropped on one q) at "
@@ -1749,20 +1766,26 @@ def _certify_transverse_factor(figures_q, *, where: str) -> None:
     eta = figures[:, 0]
     worst = float(np.max(eta)) if eta.size else 0.0
     q_at = int(np.argmax(eta)) if eta.size else -1
-    if jax.process_index() == 0:
-        print(f"  [{where}] residual: probe backward error "
+    log.debug(f"  [{where}] residual: probe backward error "
               f"||Cx-b||/(||C||_F||x||+||b||) worst over q = {worst:.3e} at "
-              f"q={q_at} (bound {_TRANSVERSE_LU_BACKWARD_MAX:.0e})", flush=True)
+              f"q={q_at} (bound {_TRANSVERSE_LU_BACKWARD_MAX:.0e})",
+              extra=record("isdf.transverse_lu_residual", where=where, worst=worst,
+                           q=q_at, bound=_TRANSVERSE_LU_BACKWARD_MAX))
     if np.isfinite(worst) and worst <= _TRANSVERSE_LU_BACKWARD_MAX:
         return
-    msg = (f"GATE transverse_zeta_lu_residual: {where}: probe backward error "
-           f"{worst:.3e} at q={q_at} exceeds {_TRANSVERSE_LU_BACKWARD_MAX:.0e}; "
-           f"the pivoted LU of the indefinite current Gram does not solve it.  "
+    head = (f"{where}: probe backward error "
+            f"{worst:.3e} at q={q_at} exceeds {_TRANSVERSE_LU_BACKWARD_MAX:.0e}; "
+            f"the pivoted LU of the indefinite current Gram does not solve it.")
+    msg = (f"GATE transverse_zeta_lu_residual: {head}  "
            f"Fix: reduce the transverse centroid count.  Override: "
            f"{rank_criterion.POLICY_MODE_ENV}=warn.")
     if mode == "refuse":
         raise rank_criterion.RankPolicyError(msg)
-    print("*** " + msg, flush=True)
+    log.warning(head, extra=log_message(
+        "transverse_zeta_lu_residual",
+        found=("probe backward error", f"{worst:.3e} at q={q_at}"),
+        needs=f"at most {_TRANSVERSE_LU_BACKWARD_MAX:.0e}",
+        fix="reduce the transverse centroid count"))
 
 
 def _refuse_kappa(kap, *, where: str, estimator: str, mode: str) -> None:
@@ -1770,12 +1793,14 @@ def _refuse_kappa(kap, *, where: str, estimator: str, mode: str) -> None:
     k_max = float(np.max(kap)) if kap.size else 0.0
     q_at = int(np.argmax(kap)) if kap.size else -1
     ceiling = rank_criterion.KAPPA_INDEFINITE_MAX
-    if jax.process_index() == 0:
-        print(f"  [{where}] conditioning: kappa_lb = {estimator}, "
+    log.debug(f"  [{where}] conditioning: kappa_lb = {estimator}, "
               f"worst over q = {k_max:.3e} at q={q_at} "
               f"(ridge sign(tr C)*{_TRANSVERSE_LU_RIDGE:.1e}*|tr C|/n; ceiling "
               f"{ceiling:.1e}).  This is a LOWER BOUND on kappa — above the "
-              f"ceiling it refuses, below it certifies NOTHING.", flush=True)
+              f"ceiling it refuses, below it certifies NOTHING.",
+              extra=record("isdf.transverse_kappa_lb", where=where, estimator=estimator,
+                           kappa_lb=k_max, q=q_at, ridge=_TRANSVERSE_LU_RIDGE,
+                           ceiling=ceiling))
     if not (k_max > ceiling):
         return
     msg = (
@@ -1793,8 +1818,12 @@ def _refuse_kappa(kap, *, where: str, estimator: str, mode: str) -> None:
         f"leaves a trace; =off disarms the gate.")
     if mode == "refuse":
         raise rank_criterion.RankPolicyError(msg)
-    for line in msg.splitlines():
-        print("*** " + line, flush=True)
+    head, *detail = msg.splitlines()
+    log.warning(head, extra=log_message(
+        "transverse_zeta_kappa",
+        found=("kappa_lb", f"{k_max:.3e} at q={q_at}"),
+        needs=f"at most {ceiling:.1e}",
+        lines=tuple(line.strip() for line in detail)))
 
 
 def transverse_factor_layout(nq: int, n_rmu: int, mesh_xy: Mesh, n_rmu_logical: int) -> str:
@@ -2025,18 +2054,20 @@ def _qparallel_announce_transverse(nq: int, n_rmu: int, n_log: int,
         int(nq), mesh_xy, name="transverse zeta-factor q carrier",
         spec=P(('x', 'y'), None, None), axis=0)
     blk = q_axis.carrier // ndev
-    print(f"  [zeta transverse factor] hoisted per-q LU, q-parallel "
-          f"execution: nq={nq} scattered over {ndev} devices "
-          f"(ceil(nq/P)={blk} whole ({n_log},{n_log}) tile(s)/device); "
-          f"factors are bit-identical to the all-ranks execution "
-          f"(LORRAX_ZETA_QPARALLEL=0 restores it)", flush=True)
+    log.debug(f"  [zeta transverse factor] hoisted per-q LU, q-parallel "
+              f"execution: nq={nq} scattered over {ndev} devices "
+              f"(ceil(nq/P)={blk} whole ({n_log},{n_log}) tile(s)/device); "
+              f"factors are bit-identical to the all-ranks execution "
+              f"(LORRAX_ZETA_QPARALLEL=0 restores it)",
+              extra=record("isdf.transverse_factor_plan", nq=int(nq), devices=ndev,
+                           q_per_device=blk, n_log=int(n_log)))
     if ndev > int(nq):
-        print(f"  [zeta transverse factor] NOTE: the q-parallel fold "
-              f"saturates at P = nq — {ndev - int(nq)} of {ndev} ranks "
-              f"idle for this stage (1 q/rank ceiling).  The distributed "
-              f"transverse plan is the LU family under `linalg = "
-              f"distributed` (needs mu_T divisible by both mesh axes); a "
-              f"different gauge, not bit-identical.", flush=True)
+        log.info(f"  [zeta transverse factor] NOTE: the q-parallel fold "
+                 f"saturates at P = nq — {ndev - int(nq)} of {ndev} ranks "
+                 f"idle for this stage (1 q/rank ceiling).  The distributed "
+                 f"transverse plan is the LU family under `linalg = "
+                 f"distributed` (needs mu_T divisible by both mesh axes); a "
+                 f"different gauge, not bit-identical.")
 
 
 # --------------------------------------------------------------------------
@@ -2130,36 +2161,42 @@ def _chunk_log(where: str, nq: int, qb: int, per_q_bytes: int) -> None:
     # honesty fix, not a wall.  Deliberately announced independently of the
     # routine receipt below, and with its own dedup key.
     _budget = _collective_chunk_bytes()
-    if int(qb) <= 1 and int(per_q_bytes) > _budget and jax.process_index() == 0:
+    if int(qb) <= 1 and int(per_q_bytes) > _budget:
         _wsig = ("__floor__", where, int(per_q_bytes))
         if _wsig not in _chunk_logged:
             _chunk_logged.add(_wsig)
-            print(f"  [collective chunk] WARNING {where}: cannot honour the "
-                  f"payload bound — one q alone emits "
-                  f"{per_q_bytes / 1e6:.1f} MB against a "
-                  f"{_budget / 1e6:.1f} MB budget "
-                  f"({per_q_bytes / max(1.0, _budget):.1f}x). q is the only "
-                  f"split axis, so q_block is already 1 and the bound is "
-                  f"ABANDONED, not enforced. The per-q payload grows with mu "
-                  f"at this site (pinv ~ mu^2/Px; back-solve ~ mu*r_chunk/Py, "
-                  f"so the back-solve bound is already unhonourable at the "
-                  f"smallest production mu). No failure has been attributed to "
-                  f"this; raise LORRAX_COLLECTIVE_CHUNK_MB to silence it "
-                  f"honestly, or accept the larger payload.",
-                  flush=True)
-    if jax.process_index() != 0:
-        return
+            log.warning(
+                f"[collective chunk] {where}: cannot honour the "
+                f"payload bound — one q alone emits "
+                f"{per_q_bytes / 1e6:.1f} MB against a "
+                f"{_budget / 1e6:.1f} MB budget "
+                f"({per_q_bytes / max(1.0, _budget):.1f}x). q is the only "
+                f"split axis, so q_block is already 1 and the bound is "
+                f"ABANDONED, not enforced. The per-q payload grows with mu "
+                f"at this site (pinv ~ mu^2/Px; back-solve ~ mu*r_chunk/Py, "
+                f"so the back-solve bound is already unhonourable at the "
+                f"smallest production mu). No failure has been attributed to "
+                f"this; raise LORRAX_COLLECTIVE_CHUNK_MB to silence it "
+                f"honestly, or accept the larger payload.",
+                extra=log_message(
+                    "collective_chunk_floor",
+                    found=("one q emits",
+                           f"{per_q_bytes / 1e6:.1f} MB against a {_budget / 1e6:.1f} MB budget"),
+                    fix="raise LORRAX_COLLECTIVE_CHUNK_MB, or accept the larger payload"))
     sig = (where, int(nq), int(qb), int(per_q_bytes))
     if sig in _chunk_logged:
         return
     _chunk_logged.add(sig)
     nblk = (int(nq) + int(qb) - 1) // max(1, int(qb))
-    print(f"  [collective chunk] {where}: nq={nq} q_block={qb} "
-          f"({nblk} executions) max collective/exec = "
-          f"{qb * per_q_bytes / 1e6:.1f} MB "
-          f"(cap {_collective_chunk_bytes() / 1e6:.1f} MB, "
-          f"unchunked would be {nq * per_q_bytes / 1e9:.3f} GB)",
-          flush=True)
+    log.debug(f"  [collective chunk] {where}: nq={nq} q_block={qb} "
+              f"({nblk} executions) max collective/exec = "
+              f"{qb * per_q_bytes / 1e6:.1f} MB "
+              f"(cap {_collective_chunk_bytes() / 1e6:.1f} MB, "
+              f"unchunked would be {nq * per_q_bytes / 1e9:.3f} GB)",
+              extra=record("isdf.collective_chunk", where=where, nq=int(nq), q_block=int(qb),
+                           executions=nblk, max_collective_mb=qb * per_q_bytes / 1e6,
+                           cap_mb=_collective_chunk_bytes() / 1e6,
+                           unchunked_gb=nq * per_q_bytes / 1e9))
 
 
 def factor_c_q(

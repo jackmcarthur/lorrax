@@ -29,6 +29,10 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
+from common.log import get_logger, message, record  # noqa: E402
+
+log = get_logger(__name__)
+
 from wfn_loader import WfnLoader                                    # noqa: E402
 
 
@@ -125,7 +129,7 @@ def validate_operator_inputs(
 
 def check_degeneracy_consistency(
     H, energies, *, el_tol_ry: float = 1e-9, split_tol_ry: float = 1e-5,
-    max_report: int = 8, label: str = "kin_ion", print_fn=print,
+    max_report: int = 8, label: str = "kin_ion", print_fn=None,
 ) -> dict:
     """Flag operator blocks that split a manifold the eigenvalues do not.
 
@@ -227,40 +231,63 @@ def check_degeneracy_consistency(
 
     if not clean:
         bar = "=" * 78
-        print_fn(f"\n{bar}")
-        print_fn(f"DEGENERACY MISMATCH: {label} splits manifolds that "
-                 f"'el' does not.")
-        print_fn(bar)
-        print_fn(f"  {len(findings)} of {n_manifolds} degenerate manifolds "
-                 f"(|Δel| ≤ {el_tol_ry:.1e} Ry) are split by more than "
-                 f"{split_tol_ry * RY2MEV:.3f} meV.")
-        print_fn(f"  worst split = {max_split * RY2MEV:.4f} meV")
-        print_fn("")
-        print_fn(f"  {'k':>5} {'band0':>6} {'deg':>4} {'el (Ry)':>14} "
-                 f"{'split (meV)':>13}  pattern")
+        summary = (f"{len(findings)} of {n_manifolds} degenerate manifolds "
+                   f"(|Δel| ≤ {el_tol_ry:.1e} Ry) are split by more than "
+                   f"{split_tol_ry * RY2MEV:.3f} meV.")
+        worst = f"worst split = {max_split * RY2MEV:.4f} meV"
+        table = [f"  {'k':>5} {'band0':>6} {'deg':>4} {'el (Ry)':>14} "
+                 f"{'split (meV)':>13}  pattern"]
         for d in findings[:max_report]:
-            print_fn(f"  {d['ik']:5d} {d['band0']:6d} {d['deg']:4d} "
-                     f"{d['el']:14.9f} {d['spread_ry'] * RY2MEV:13.4f}  "
-                     f"{d['pattern']}")
+            table.append(f"  {d['ik']:5d} {d['band0']:6d} {d['deg']:4d} "
+                         f"{d['el']:14.9f} {d['spread_ry'] * RY2MEV:13.4f}  "
+                         f"{d['pattern']}")
         if len(findings) > max_report:
-            print_fn(f"  ... {len(findings) - max_report} more")
-        print_fn("")
-        print_fn("  This operator distinguishes states the wavefunctions'")
-        print_fn("  Hamiltonian did not.  With a fully-relativistic")
-        print_fn("  pseudopotential the usual cause is a j-RESOLVED V_NL built")
-        print_fn("  against wavefunctions from noncolin=.true.,")
-        print_fn("  lspinorb=.false. (QE ran average_pp; its eigenvalues carry")
-        print_fn("  no spin-orbit).  A 2+4 pattern on a 6-fold at Γ is the")
-        print_fn("  Γ8/Γ7 spin-orbit signature.  The V_NL builder reads")
-        print_fn("  j-resolved vs j-averaged from QE <spinorbit>, so a split")
-        print_fn("  HERE means the operator disagrees with the wavefunctions")
-        print_fn("  anyway — check the WFN / pseudopotential pairing.")
-        print_fn(bar + "\n")
+            table.append(f"  ... {len(findings) - max_report} more")
+        story = ("This operator distinguishes states the wavefunctions'",
+                 "Hamiltonian did not.  With a fully-relativistic",
+                 "pseudopotential the usual cause is a j-RESOLVED V_NL built",
+                 "against wavefunctions from noncolin=.true.,",
+                 "lspinorb=.false. (QE ran average_pp; its eigenvalues carry",
+                 "no spin-orbit).  A 2+4 pattern on a 6-fold at Γ is the",
+                 "Γ8/Γ7 spin-orbit signature.  The V_NL builder reads",
+                 "j-resolved vs j-averaged from QE <spinorbit>, so a split",
+                 "HERE means the operator disagrees with the wavefunctions",
+                 "anyway — check the WFN / pseudopotential pairing.")
+        if print_fn is not None:
+            print_fn(f"\n{bar}")
+            print_fn(f"DEGENERACY MISMATCH: {label} splits manifolds that "
+                     f"'el' does not.")
+            print_fn(bar)
+            print_fn(f"  {summary}")
+            print_fn(f"  {worst}")
+            print_fn("")
+            for line in table:
+                print_fn(line)
+            print_fn("")
+            for line in story:
+                print_fn(f"  {line}")
+            print_fn(bar + "\n")
+        else:
+            log.warning(
+                f"{label} splits degenerate manifolds that the wavefunctions "
+                f"do not",
+                extra=message(
+                    id="degeneracy_mismatch",
+                    found=("split manifolds", f"{summary[:-1]}; {worst}"),
+                    lines=(" ".join(story),),
+                    fix="check the WFN / pseudopotential pairing"))
+            for line in table:
+                log.info(line)
+            log.debug("degeneracy findings", extra=record(
+                "operator_checks.degeneracy", label=label,
+                n_manifolds=n_manifolds, n_split=len(findings),
+                max_split_ry=max_split, worst=findings[:max_report]))
     else:
-        print_fn(f"  {label}: degeneracy-consistent — "
-                 f"{n_manifolds} degenerate manifolds, "
-                 f"max split {max_split * RY2MEV:.4f} meV "
-                 f"(≤ {split_tol_ry * RY2MEV:.3f} meV).")
+        say = print_fn if print_fn is not None else log.info
+        say(f"  {label}: degeneracy-consistent — "
+            f"{n_manifolds} degenerate manifolds, "
+            f"max split {max_split * RY2MEV:.4f} meV "
+            f"(≤ {split_tol_ry * RY2MEV:.3f} meV).")
 
     return dict(n_manifolds=n_manifolds, n_split=len(findings),
                 max_split_ry=max_split, worst=findings[:max_report],

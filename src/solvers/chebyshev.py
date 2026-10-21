@@ -28,6 +28,9 @@ import jax
 import jax.numpy as jnp
 
 from common.collectives import gather_to_host
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 def jackson_coefficients(M: int) -> np.ndarray:
@@ -189,7 +192,7 @@ def chebyshev_moments(
 
     for r in range(n_random):
         if verbose:
-            print(f"  Random vector {r + 1}/{n_random}...")
+            log.info(f"  Random vector {r + 1}/{n_random}...")
         key, subkey = jax.random.split(key)
         x_rand = make_random_vector(subkey)
 

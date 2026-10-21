@@ -42,6 +42,10 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 __all__ = ["PlaneWaveSystem", "open_plane_wave_system", "PlaneWaveGW", "main"]
 
@@ -589,7 +593,8 @@ def main(argv=None):
     import jax
     from common.collectives import prepare_mesh
     mesh = prepare_mesh(print_fn=lambda *a, **k: None)
-    say = (lambda *a: print("[pw-pipeline]", *a, flush=True)) if jax.process_index() == 0 else (lambda *a: None)
+    def say(*a):
+        log.info(" ".join(str(x) for x in ("[pw-pipeline]",) + a))
     t0 = time.perf_counter()
     system = open_plane_wave_system(args.wfn, mesh, nb=args.nb)
     t_read = time.perf_counter() - t0

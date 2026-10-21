@@ -12,6 +12,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from common.units import RYD_TO_EV
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 # The channel-availability table (L1, jax-free) — the writers below ask it
 # which Σ channels a run built instead of hand-checking mode strings.
 from .gw_config import (
@@ -295,12 +299,12 @@ def sigma_table_to_file_wedge(
 # ---------------------------------------------------------------------------
 
 
-def print_section(title: str, print_fn=print):
+def print_section(title: str, print_fn=None):
     """Print a section divider: ---- TITLE ----"""
-    print_fn("")
-    print_fn("-" * 72)
-    print_fn(f"  {title}")
-    print_fn("-" * 72)
+    log.debug("")
+    log.debug("-" * 72)
+    log.debug(f"  {title}")
+    log.debug("-" * 72)
 
 
 def print_system_summary(
@@ -310,12 +314,12 @@ def print_system_summary(
     print_fn=print,
 ):
     """Print ISDF basis and grid metadata before the computation begins."""
-    print_fn(f"  ISDF basis: {n_rmu} centroids")
-    print_fn(
+    log.debug(f"  ISDF basis: {n_rmu} centroids")
+    log.debug(
         f"  FFT grid: {fft_grid[0]}×{fft_grid[1]}×{fft_grid[2]}"
         f"   Cell volume: {cell_volume:.2f} a.u.³"
     )
-    print_fn("")
+    log.debug("")
 
 
 # ---------------------------------------------------------------------------
@@ -671,9 +675,9 @@ def persist_w0_and_head(
         with _tmg.section("persist_w0.write_head_wings"):
             write_head_wings_to_h5(tensors_filename, S_direct=head_wings["S_direct"],
                                    L=L, R=R, n_mu_logical=int(meta.n_rmu))
-        print_fn(f"  Persisted q=0 head wings: head_wing_L/R (3 x {int(meta.n_rmu)}), "
+        log.debug(f"  Persisted q=0 head wings: head_wing_L/R (3 x {int(meta.n_rmu)}), "
                  f"S_cart_head_direct (docs/theory/bgw_epsmat_export.md E9)")
-    print_fn(
+    log.debug(
         f"  Persisted W0_qmunu + q=0 head scalars: "
         f"vhead={head_static.vc0.real:.3f} a.u.,  "
         f"whead[ω=0]={whead_arr[0].real:.3f} a.u."
@@ -706,7 +710,7 @@ def write_qp_wfn_oneshot(
     ValueError on the k-count mismatch).
     """
     if int(U_full.shape[0]) != int(wfn.nkpts):
-        print_fn(
+        log.info(
             f"  QP WFN (one-shot): skipped — Σ on {int(U_full.shape[0])} "
             f"k-points but WFN carries {int(wfn.nkpts)} (IBZ); the one-shot "
             f"dump only supports IBZ-Σ. Set debug.write_wfn_h5=false to silence.")
@@ -725,7 +729,7 @@ def write_qp_wfn_oneshot(
         qp_energy_definition=semantics.energy_definition,
         sigma_eval_provenance=semantics.sigma_evaluation_provenance,
     )
-    print_fn(f"  QP WFN (one-shot): {_qp_wfn_path}")
+    log.debug(f"  QP WFN (one-shot): {_qp_wfn_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -774,7 +778,7 @@ def write_freq_debug(
     if results.use_ppm and not grid and results.sigma_c_on_shell_diag is None:
         # The table's Sigma columns are reads of the on-shell operand, which
         # an SC run drops (its slots carry the QP basis's band labels).
-        print_fn("  sigma_freq_debug.dat: omitted: an SC run's on-shell Sigma_c has "
+        log.debug("  sigma_freq_debug.dat: omitted: an SC run's on-shell Sigma_c has "
                  "no DFT-basis Sigma_c(E_DFT)")
         return
     from file_io import write_sigma_freq_debug_table
@@ -1034,7 +1038,7 @@ def write_freq_debug(
             sym if file_sym is None else file_sym,
             np.asarray(sym.unfolded_kpts, dtype=np.float64))),
         metadata=_photon_head_metadata)
-    print_fn(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
+    log.debug(f"  Sigma freq debug: {config.debug.sigma_freq_debug_file}")
 
 
 def _runnable_modes_building(*channels: SigmaChannel) -> str:
@@ -1116,7 +1120,7 @@ def write_qsgw_qp_ladders(
         return []
     path = results.sigma_omega_h5_path
     if not path:
-        print_fn(
+        log.info(
             "  write_qsgw_datasets = true, but compute_mode "
             f"{config.compute_mode.value} writes no sigma_mnk.h5 — the QP "
             "ladders have no file to go in.  Use one of the modes that "
@@ -1204,7 +1208,7 @@ def write_qsgw_qp_ladders(
             kin_ion + sig_h + sig_x + sigma_c_0)
 
     if omitted:
-        print_fn(
+        log.info(
             "  QP ladders: omitting " + "; ".join(sorted(omitted))
             + " — those operands are not in this run, and putting a "
             "different operator under one of those names would be worse "
@@ -1230,7 +1234,7 @@ def write_qsgw_qp_ladders(
             results.sigma_kset == SIGMA_KSET_STAR_WEDGE),
         print_fn=print_fn)
     if deltas:
-        print_fn(
+        log.debug(
             "  QP ladders vs this run's E_qp (max |Δ|, eV): "
             + ", ".join(f"{n.removeprefix('qp_').removesuffix('_ev')} "
                         f"{d:.3f}" for n, d in sorted(deltas.items())))
@@ -1301,7 +1305,7 @@ def _warn_on_unphysical_h0(
             | (implied_vxc_ev > _VXC_IMPLIED_MAX_EV)
         )
     )
-    print_fn(
+    log.debug(
         "  H0 check: implied Vxc = E_DFT - "
         "(kin_ion + V_H[exact, live G-space]) in "
         f"[{lo:.3f}, {hi:.3f}] eV over {implied_vxc_ev.size} (k,n)"
@@ -1749,7 +1753,7 @@ def write_results(
     # the zero static COH column.
     c_omitted = results.use_ppm and results.sigma_c_diag_at_dft_ry is None
     if c_omitted:
-        print_fn("  sigma_diag.dat: sigC/sigXC omitted: an SC run's on-shell Sigma_c "
+        log.debug("  sigma_diag.dat: sigC/sigXC omitted: an SC run's on-shell Sigma_c "
                  "has no DFT-basis Sigma_c(E_DFT)")
 
     # E_DFT relative to the run's ω reference (matches gw_jax convention).
@@ -1971,7 +1975,7 @@ def write_results(
             _wedge(h0_diag + results.sigma_xc_at_dft_ev),
             kpoints_crys=kpts_irr,
         )
-        print_fn(f"  G0W0 diag (E_DFT):     {g0w0_path}")
+        log.debug(f"  G0W0 diag (E_DFT):     {g0w0_path}")
 
     # ── qp_wfn_rotations.h5 — QP eigenvectors ─────────────────────────────
     if write_qp_rotations:
@@ -2020,14 +2024,14 @@ def write_results(
         )
 
     # ── Status summary ────────────────────────────────────────────────────
-    print_fn(f"\n  Sigma diag:   {sigma_diag_file}")
-    print_fn(f"  BGW eqp0:     {eqp0_file}")
-    print_fn(f"  BGW eqp1:     {eqp1_file}")
+    log.debug(f"\n  Sigma diag:   {sigma_diag_file}")
+    log.debug(f"  BGW eqp0:     {eqp0_file}")
+    log.debug(f"  BGW eqp1:     {eqp1_file}")
     if raw_assembly is not None:
-        print_fn("  raw columns:  sigC_raw, eqp0_raw, eqp1_raw in "
+        log.debug("  raw columns:  sigC_raw, eqp0_raw, eqp1_raw in "
                  f"{sigma_diag_file} (no band tail; BGW-comparable)")
     if results.sigma_omega_h5_path:
-        print_fn(f"  Sigma(ω):     {results.sigma_omega_h5_path}")
+        log.debug(f"  Sigma(ω):     {results.sigma_omega_h5_path}")
     if results.tensors_filename:
-        print_fn(f"  Restart:      {results.tensors_filename}")
-    print_fn("")
+        log.debug(f"  Restart:      {results.tensors_filename}")
+    log.debug("")

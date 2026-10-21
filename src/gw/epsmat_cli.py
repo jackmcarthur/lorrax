@@ -36,6 +36,10 @@ from runtime import initialize_communicator_stack
 RUNTIME = initialize_communicator_stack()
 
 from common import timing                                    # noqa: E402
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common.collectives import barrier, process_rank         # noqa: E402
 from gw.epsmat_config import EPSMAT_DEFAULTS, EpsmatConfig   # noqa: E402
 
@@ -61,40 +65,36 @@ def main(argv=None) -> int:
     timing.reset()
     rank0 = process_rank() == 0
 
-    def print0(*a, **kw):
-        if rank0:
-            print(*a, **kw, flush=True)
-
     if args.print_schema:
         for key, default in EPSMAT_DEFAULTS.items():
-            print0(f"  {key:<18} {'<required>' if default is None else repr(default)}")
+            log.info(f"  {key:<18} {'<required>' if default is None else repr(default)}")
         return 0
     if not args.input:
         build_parser().error("-i/--input is required (an [epsmat] file)")
     cfg = EpsmatConfig.from_input_file(args.input)
     mesh = RUNTIME.mesh
-    print0("=" * 72)
-    print0(f"LORRAX epsmat — {cfg.mode}: "
+    log.info("=" * 72)
+    log.info(f"LORRAX epsmat — {cfg.mode}: "
            + ("W_μν -> BerkeleyGW eps^-1(G,G')" if cfg.mode == "export"
               else "BerkeleyGW eps^-1(G,G') -> W_μν"))
-    print0("=" * 72)
-    print0(cfg.describe())
-    print0(f"  mesh               {dict(mesh.shape)} on {RUNTIME.n_devices} device(s)")
-    print0("-" * 72)
+    log.info("=" * 72)
+    log.info(cfg.describe())
+    log.info(f"  mesh               {dict(mesh.shape)} on {RUNTIME.n_devices} device(s)")
+    log.info("-" * 72)
 
     from gw.epsmat_export import run_epsmat_export, run_epsmat_projection
 
     with timing.section(f"epsmat.{cfg.mode}"):
         if cfg.mode == "export":
-            result = run_epsmat_export(cfg, mesh, print_fn=print0)
+            result = run_epsmat_export(cfg, mesh)
             for name, r in result.items():
                 worst = max(q["projection_err"] for q in r["q"])
-                print0(f"  wrote {r['path']}: {len(r['q'])} q, ecuts {r['ecuts']} Ry, "
+                log.info(f"  wrote {r['path']}: {len(r['q'])} q, ecuts {r['ecuts']} Ry, "
                        f"worst block identity {worst:.2e}")
         else:
-            result = run_epsmat_projection(cfg, mesh, print_fn=print0)
+            result = run_epsmat_projection(cfg, mesh)
             worst = max(q["rel_Wc_bgw_vs_lorrax"] for q in result["q"])
-            print0(f"  wrote {result['path']}: W0_qmunu from BerkeleyGW on "
+            log.info(f"  wrote {result['path']}: W0_qmunu from BerkeleyGW on "
                    f"{len(result['q'])} stored q; max |Wc_BGW − Wc_LX|/|Wc_LX| = {worst:.4e}")
     if rank0:
         import json
@@ -103,7 +103,7 @@ def main(argv=None) -> int:
         with open(receipt, "w") as f:
             json.dump(_json_safe({"mode": cfg.mode, "config": cfg.describe().splitlines(),
                                   "result": result}), f, indent=1)
-        print0(f"  receipt {receipt}")
+        log.info(f"  receipt {receipt}")
         timing.report(print_fn=print, title="--- epsmat timing (s) ---")
     barrier("epsmat.outputs_written")
     return 0

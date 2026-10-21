@@ -16,6 +16,56 @@ import time
 
 import numpy as np
 from common import timing
+from common.log import block, get_logger, message
+from common.log import record as sidecar_record
+
+log = get_logger(__name__)
+
+
+def _pole_counts(result, header, *, photon):
+    """Poles per irreducible q of the model just built: ``{sector: [K_q]}``
+    (one ``"W"`` entry for the scalar model).  Read from the constructor's
+    receipts; empty when they carry none (a reused model)."""
+    if not photon:
+        return {"W": [int(k) for k in (header or {}).get("K", ())]}
+    counts = {}
+    for row in result.get("q_receipts") or ():
+        counts.setdefault(str(row.get("sector")), []).extend(int(k) for k in row.get("K", ()))
+    return counts
+
+
+def _bank_samples(bank):
+    """Frequency samples a bank receipt integrated (the photon bank nests its
+    sample receipt under ``samples``); None when there was no bank."""
+    if not isinstance(bank, dict):
+        return None
+    samples = bank.get("samples") if isinstance(bank.get("samples"), dict) else bank
+    batches = samples.get("batches") or ()
+    return len({int(b["sample"]) for b in batches if "sample" in b}) or None
+
+
+def w_model_row(poles, samples, seconds, *, reused=False) -> str:
+    """The ``W model`` stage row: poles per q, frequency samples, wall.
+
+    >>> w_model_row({"W": [4, 6, 6]}, 22, 7.84)
+    'shared-pole, 4-6 poles per q on 3 q, from 22 frequency samples; 7.8 s'
+    """
+    from common.report_blocks import fmt_wall
+
+    def span(ks):
+        return f"{min(ks)}" if min(ks) == max(ks) else f"{min(ks)}-{max(ks)}"
+    filled = {name: ks for name, ks in poles.items() if ks}
+    if list(filled) == ["W"]:
+        what = f"shared-pole, {span(filled['W'])} poles per q on {len(filled['W'])} q"
+    elif filled:
+        what = ("shared-pole sectors, poles per q " + ", ".join(
+            f"{name} {span(ks)}" for name, ks in filled.items()))
+    else:
+        what = "shared-pole"
+    source = ("reused, no bank built" if reused else
+              f"from {samples} frequency samples" if samples else "")
+    return f"{what}{', ' + source if source else ''}; {fmt_wall(seconds)}"
+
 
 
 def _print_eigh_stack_routes(print_fn):
@@ -402,7 +452,7 @@ def retain_iteration_scratch(run_dir, label, *, print_fn=print):
         root, _MANAGED_SCRATCH, keep=[os.path.join(root, f"{label}_shared_pole")],
         barrier_tag=f"shared_pole.scratch.retain.{label}", print_fn=print_fn)
     if removed:
-        print_fn(f"  shared-pole scratch: retained {label}; discarded: "
+        log.debug(f"  shared-pole scratch: retained {label}; discarded: "
                  + ", ".join(sorted(removed)))
     return tuple(sorted(removed))
 
@@ -475,7 +525,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     # (86307cff). GATE mpa_ordered_metal stays on the MPA route, which fits one
     # residue with no odd channel (gw.mpa.model._require_metal_time_reversal).
     if material_class == "metal" and not bool(getattr(sym, "trs_allowed", True)):
-        print_fn("  shared-pole screening: time-reversal-broken METAL; ordered bank "
+        log.info("  shared-pole screening: time-reversal-broken METAL; ordered bank "
                  "(both orientations, odd channel) with fractional occupations")
     from .ppm_pipeline import observing_window_source, publish_window_source
     if not photon and observing_window_source():
@@ -562,12 +612,15 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 [p / "streamed_bank" for p in Path(run_dir).resolve().glob("*_shared_pole")])
             _SWEPT.append(True)
             if stale:
-                print_fn("WARNING shared-pole output: removed streamed stores left by an earlier "
-                         "process: " + " ".join(stale))
+                log.warning("shared-pole output: removed streamed stores left by an earlier "
+                            "process: " + " ".join(stale),
+                            extra=message("shared_pole_stale_stores_removed",
+                                          lines=("left behind by an earlier process; "
+                                                 "nothing of this run is lost",)))
             model = root / "model.h5"
             if photon and (root / 'sectors.json').exists():
                 if _published_sector_handle(root, identity) is not None:
-                    print_fn(f"shared-pole output: authenticated sector manifest retained at {root}; reusing it")
+                    log.info(f"shared-pole output: authenticated sector manifest retained at {root}; reusing it")
                     return "published"
             complete, bound = False, None
             if model.exists():
@@ -582,29 +635,31 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             if complete and sc_scratch and not photon and bound == identity:
                 # An SC map's committed model of this very map (the file tier
                 # persists it): Sigma reads it; nothing upstream is rebuilt.
-                print_fn(f"shared-pole output: committed model of this map retained at {model}; reusing it")
+                log.info(f"shared-pole output: committed model of this map retained at {model}; reusing it")
                 return "committed"
             if complete:
-                print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
+                log.info(f"shared-pole output: complete model retained at {model}; refusing rebuild")
                 raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
             if _authenticated_constructor_resume(root, identity, recipe, photon=photon,
                                                  coulomb_sha256=None if photon else coulomb['sha256']):
-                print_fn(f"shared-pole output: authenticated complete bank retained at {root}; resuming constructor")
+                log.info(f"shared-pole output: authenticated complete bank retained at {root}; resuming constructor")
                 stale = [name for name in (_SECTOR_OUTPUTS if photon else ())
                          if (root / name).exists()]
                 for name in stale:
                     (root / name).unlink()
                 if stale:
-                    print_fn(f"WARNING shared-pole output: removed {' '.join(stale)} from {root}; "
-                             "rebuilding this map's constructor")
+                    log.warning(f"shared-pole output: removed {' '.join(stale)} from {root}; "
+                                "rebuilding this map's constructor",
+                                extra=message("shared_pole_stale_outputs_removed"))
                 return True
             if root.exists():
                 removed = ' '.join(sorted(path.name for path in root.iterdir()))
-                print_fn(f"WARNING shared-pole output: removed partial directory {root} "
-                         f"({removed}); rebuilding this map")
+                log.warning(f"shared-pole output: removed partial directory {root} "
+                            f"({removed}); rebuilding this map",
+                            extra=message("shared_pole_partial_output_removed"))
                 shutil.rmtree(root)
             else:
-                print_fn(f"shared-pole output: creating new directory {root}")
+                log.debug(f"shared-pole output: creating new directory {root}")
             root.mkdir(parents=True)
             return False
 
@@ -634,7 +689,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                                                   root=root, label=label,
                                                   photon=photon_layout if photon else None,
                                                   mu_bases=mu_bases)
-        print_fn(f"shared-pole bank residence: {residence['residence']}; "
+        log.debug(f"shared-pole bank residence: {residence['residence']}; "
                  f"{residence['payload_bytes_per_rank'] / 2**30:.3f} GiB/rank, "
                  f"{residence['payload_bytes_total'] / 2**30:.2f} GiB total; {residence['reason']}"
                  if 'payload_bytes_per_rank' in residence else
@@ -659,7 +714,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 bank["path"], resident = str(root / "bank.h5"), None
                 residence = dict(residence, residence="file", reason="per-rank files refused "
                                  "by the filesystem (capacity); shared scratch file")
-                print_fn(f"shared-pole bank residence: file; {residence['reason']}")
+                log.debug(f"shared-pole bank residence: file; {residence['reason']}")
                 initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
                     recipe=recipe, identity=identity, mesh_xy=mesh_xy,
                     **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
@@ -685,11 +740,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             rank0_transaction(
                 path, stage=f"shared_pole.receipt.{stage}",
                 write=lambda: path.write_text(_json(receipt) + "\n"))
-            print_fn(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
+            log.debug(f"shared-pole {stage}: completion={receipt.get('completion', receipt.get('status'))}; "
                      f"seconds={receipt.get('seconds', {})}")
     with timing.section("spole.bank"):
         if resume_constructor:
-            print_fn('shared-pole bank: not produced; '
+            log.debug('shared-pole bank: not produced; '
                      + ('committed model reused' if resume_constructor == 'committed'
                         else 'authenticated complete producer artifact reused'))
         elif photon:
@@ -710,7 +765,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             record("moments", compute_response_moments(wfns, meta, config,
                 mesh_xy=mesh_xy, sym=sym, bank_io=bank))
         moments_seconds = receipts["moments"].get("seconds", {})
-        print_fn(f"Response quadrature: moments {receipts['moments'].get('correlation_count', 0)} "
+        log.debug(f"Response quadrature: moments {receipts['moments'].get('correlation_count', 0)} "
                  f"correlations in {len(receipts['moments'].get('q_batches', ()))} q batch(es) "
                  f"of <= {receipts['moments'].get('q_width', 0)} parents; "
                  f"{moments_seconds.get('total', 0.0):.2f} s ("
@@ -765,10 +820,12 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             memory.record_route("shared-pole constructor", route["mode"],
                                 route_summary(route["mode"], route),
                                 warning=route.get("warning"))
-        print_fn("Shared-pole constructor: "
+        log.debug("Shared-pole constructor: "
                  + f"{rounds} round(s); seconds "
                  + " ".join(f"{name}={value:.2f}" for name, value in
-                            sorted(walls.items(), key=lambda item: -item[1])))
+                            sorted(walls.items(), key=lambda item: -item[1])),
+                  extra=sidecar_record("shared_pole.constructor", rounds=rounds,
+                                       seconds=dict(walls)))
         _print_eigh_stack_routes(print_fn)
     if resident is not None:
         # The model is committed; the constructor was the bank's last reader.
@@ -780,7 +837,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         released = _release_bank_file(root / "bank.h5")
         if released is not None:
             residence = dict(residence, released=released)
-            print_fn(f"shared-pole bank: scratch file released after the constructor "
+            log.debug(f"shared-pole bank: scratch file released after the constructor "
                      f"({released['bytes'] / 2**30:.2f} GiB, {released['links']} link(s))")
     receipts["bank_residence"] = residence
     with timing.section("spole.screening_finalize", announce=True,
@@ -788,10 +845,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         record("constructor", result)
         models = result["model_residence"]
         if "payload_bytes_per_rank" in models:
-            print_fn(f"shared-pole {'sector models' if photon else 'model'}: {models['residence']}; "
+            log.debug(f"shared-pole {'sector models' if photon else 'model'}: {models['residence']}; "
                      f"{models['payload_bytes_per_rank'] / 2**30:.3f} GiB/rank"
                      f"{' bound' if photon else ''}; {models['reason']}")
         header = None if photon else result["model_header"]
+        poles = _pole_counts(result, header, photon=photon)
         handle = (result['handle'] if photon else
                   dict(path=result["model"], identity=identity,
                        digest=header["digest"], K=list(header["K"])))
@@ -831,6 +889,9 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 mesh_xy=mesh_xy, capacity=ledger)
         receipts["seconds"] = time.monotonic() - started
         receipts["handle"] = handle
+        log.info(w_model_row(poles, _bank_samples(receipts.get("bank")),
+                             receipts["seconds"], reused=resume_constructor),
+                 extra=block("w_model", label="W model"))
         summary = root / "construction_receipt.json"
         # A recorded stage is already in its own ``<stage>_receipt.json``; the
         # summary names that file instead of encoding the stage a second time.

@@ -21,6 +21,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from common.units import RYD_TO_EV
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common.wfn_transforms import get_enk_bandrange
 
 
@@ -289,7 +293,7 @@ def sigma_on_shell_request(config, *, e_eval_ev, wfn, sym, meta, band_slices,
         out_of_grid=config.sigma.out_of_grid,
         irr_idx=np.asarray(sym.irr_idx_k), n_parent=len(wfn.kvecs(k=sym.parent_k_domain)),
         edge_window_ev=edge_window_ev)
-    print_fn(f"  Sigma_c on shell: {request.n_table} energy table(s) {request.names}, "
+    log.debug(f"  Sigma_c on shell: {request.n_table} energy table(s) {request.names}, "
              f"{request.frequencies_ry.size} distinct frequencies")
     return request
 
@@ -347,7 +351,7 @@ def eval_sigma_c_at_dft_energies(
     else:
         provenance = (OMEGA_REFERENCE_MIDGAP if efermi_ry is None
                       else OMEGA_REFERENCE_FIXED_N_MU)
-    print_fn(
+    log.info(
         f"  omega reference = {efermi_dft_ev:.6f} eV "
         f"({provenance}; VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
@@ -380,7 +384,7 @@ def eval_sigma_c_at_dft_energies(
                              np.where(covered, omega_dft_rel_ev, 0.0),
                              what="Sigma_c at E_DFT")
         if n_uncovered:
-            print_fn(f"  omega coverage [Sigma_c at E_DFT (eqp0/eqp1)]: {n_uncovered} of "
+            log.info(f"  omega coverage [Sigma_c at E_DFT (eqp0/eqp1)]: {n_uncovered} of "
                      f"{omega_dft_rel_ev.size} ({100.0 * frac_uncovered:.1f}%) evaluation "
                      f"energies outside [{float(grid_ev[0]):.3f}, {float(grid_ev[-1]):.3f}] "
                      "use Sigma(omega=0).")

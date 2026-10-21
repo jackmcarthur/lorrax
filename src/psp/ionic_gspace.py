@@ -25,6 +25,9 @@ from common.fft_helpers import local_fftn3, local_ifftn3  # 3-D fields: all thre
 import numpy as np
 
 from psp.radial.radial_jax import interp_uniform_jax
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Primitive 1: species structure factors via lax.scan over atoms
@@ -241,8 +244,8 @@ def build_ionic_and_core(
     )
 
     n_nlcc_atoms = int(np.sum(species_natoms[tables["has_nlcc"]]))
-    print(f"  Core density integral: {float(jnp.sum(rho_core_r)) * vol / N:.4f} e "
-          f"(from NLCC, {n_nlcc_atoms} atoms)")
+    log.info(f"  Core density integral: {float(jnp.sum(rho_core_r)) * vol / N:.4f} e "
+             f"(from NLCC, {n_nlcc_atoms} atoms)")
 
     return V_loc_r, rho_core_r, rho_core_G_scaled
 

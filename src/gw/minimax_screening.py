@@ -41,6 +41,10 @@ import numpy as np
 # Path bootstrap; dies with the owner's workspace fix -- see _services.py.
 from ffi import _services      # noqa: F401
 from common import timing
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common.collectives import transpose_xy, xy_tile_mesh
 
 _services.ensure_on_path()
@@ -1375,7 +1379,7 @@ def build_static_quadrature(wfns, minimax_config, *,
         # R2: this line used to say `nodes=` and `fit_err~` and never say
         # whether that came from a shipped table or four minutes of scipy.
         # It says now.
-        print_fn(
+        log.info(
             "  Minimax static window: "
             f"x=[{quad.x_min:.6e}, {quad.x_max:.6e}] Ry, "
             f"R={R:.2f}, nodes={quad.node_count}, fit_err~{quad.max_error:.3e}"
@@ -1403,12 +1407,12 @@ def build_imag_quadrature(quad, omega_p, minimax_config, *, print_fn=None,
     if print_fn is not None:
         R = quad_imag.x_max / quad_imag.x_min
         n_even = quad_imag.node_count - int(quad_imag.n_odd_extra)
-        print_fn(
+        log.info(
             f"  PPM imag-freq quadrature (ωp={float(omega_p):.4f} Ry): "
             f"R={R:.1f}, nodes={n_even}, err~{quad_imag.max_error:.1e}"
             f"  [{quad_imag.provenance or 'provenance unrecorded'}]")
         if quad_imag.alpha_odd is not None:
-            print_fn(
+            log.info(
                 "  PPM imag-freq ODD kernel ωp/(x²+ωp²) (ordered "
                 f"orientations, TR-odd channel): +{quad_imag.n_odd_extra} "
                 f"nodes -> {quad_imag.node_count} total, "
@@ -1439,12 +1443,12 @@ def build_imag_probe_response_rule(quad, omega_p, minimax_config, *,
         float(quad.x_min), float(quad.x_max), float(omega_p),
         float(minimax_config.target_error), bool(with_odd_kernel))
     if print_fn is not None:
-        print_fn(
+        log.info(
             f"  PPM imag-freq quadrature (ωp={float(omega_p):.4f} Ry): "
             f"R={out.x_max / out.x_min:.1f}, "
             f"nodes={out.node_count}, err~{out.max_error:.1e}  [{out.provenance}]")
         if out.alpha_odd is not None:
-            print_fn(
+            log.info(
                 "  PPM imag-freq ODD kernel ωp/(x²+ωp²) (ordered orientations, TR-odd "
                 f"channel): same {out.node_count} times, err~{out.max_error_odd:.1e}")
     return out
@@ -1575,7 +1579,7 @@ def build_real_quadrature(quad, Omega, minimax_config, *, print_fn=None):
     )
 
     if print_fn is not None:
-        print_fn(
+        log.info(
             f"  PPM real-freq quadrature (Ω={Omega:.4f} Ry, "
             f"decomposed via 1/y minimax): "
             f"+branch nodes={quad_plus.node_count} (R'={Omega/quad.x_min + quad.x_max/quad.x_min:.3f}), "

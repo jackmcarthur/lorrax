@@ -17,6 +17,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import Meta, jax_profile
+from common.log import get_logger, message
+
+log = get_logger(__name__)
+
 from common.bispinor_init import NO_PAIR_DIRAC_CURRENT_MODEL
 from common.collectives import device_put_process_local
 from common.jax_compile_cache import ensure_jax_compile_cache
@@ -439,10 +443,8 @@ def _photon_stream_kconvs(mesh_xy, kgrid, half_plans, parity, rows):
         with timing.section('response.kconv_tables', announce=True):
             kconvs = _photon_chi_kconvs(mesh_xy, kgrid, half_plans, parity, rows)
             placed = _place_photon_kconv_tables(kconvs, mesh_xy)
-        if jax.process_index() == 0:
-            print(f"  [response] four-current mode-11 kconv calls: {len(kconvs)} kconv calls, "
-                  f"{len(placed[1])} table arrays placed once, {placed[3] / 1e9:.3f} GB/rank",
-                  flush=True)
+        log.debug(f"  [response] four-current mode-11 kconv calls: {len(kconvs)} kconv calls, "
+              f"{len(placed[1])} table arrays placed once, {placed[3] / 1e9:.3f} GB/rank")
         while len(_PHOTON_KCONV) >= 2:
             _PHOTON_KCONV.pop(next(iter(_PHOTON_KCONV)))
         hit = _PHOTON_KCONV[key] = (kconvs, placed[:3])
@@ -1121,11 +1123,11 @@ def _get_chi_fractional_contour_kernel_face(
              if band_ranges is not None and g is not None else (None, None))
             for g in photon_gemms)
         if jax.process_index() == 0 and stream_pass is None:
-            print(f"Response four-current {pair_mode} stream: row passes (CC, CT, TC, TT) "
+            log.debug(f"Response four-current {pair_mode} stream: row passes (CC, CT, TC, TT) "
                   f"{tuple(len(plan.passes) for plan in photon_plans)} of "
                   f"{tuple(plan.rows for plan in photon_plans)} "
                   f"local rows, {tuple(plan.chunk for plan in photon_plans)} node(s) "
-                  "per accumulate", flush=True)
+                  "per accumulate")
         photon_kconvs, (kconv_index, kconv_arrays, kconv_specs) = _photon_stream_kconvs(
             mesh_xy, grid, half_plans, half_parity, tuple(plan.rows for plan in photon_plans))
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
@@ -1154,8 +1156,8 @@ def _get_chi_fractional_contour_kernel_face(
                        if band_ranges is not None else (None, None))
         chi_tables = pass_arrays
         if jax.process_index() == 0 and not stream_pass:
-            print(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
-                  f"{subtile.rows} local rows, {subtile.chunk} node(s) per accumulate", flush=True)
+            log.debug(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
+                  f"{subtile.rows} local rows, {subtile.chunk} node(s) per accumulate")
     elif kconv_serves:
         chi_kconv, chi_tables = _charge_stream_kconv(mesh_xy, grid, k_unfold_plan)
     if stream_pass is not None and not bank_carry or stream_pass is not None and photon is None and (
@@ -2858,14 +2860,12 @@ def _load_static_photon_hall(
     """Load/authenticate the optional Hall artifact and gate its model; see docs/architecture/four_current_wiring.md (Stage 3b)."""
     hall_path = str(config.paths.static_gauge_hall_file).strip()
     if not hall_path:
-        if jax.process_index() == 0:
-            print_fn(
-                "  [photon head] Hall term: sigma_H = 0 (no "
-                "static_gauge_hall_file named).  For a Chern-trivial "
-                "insulator the static Hall coefficient is exactly zero; "
-                "supply the artifact from get_dipole_mtxels "
-                "--static-gauge-hall-only to include a measured value.",
-                flush=True)
+        log.info(
+            "  [photon head] Hall term: sigma_H = 0 (no "
+            "static_gauge_hall_file named).  For a Chern-trivial "
+            "insulator the static Hall coefficient is exactly zero; "
+            "supply the artifact from get_dipole_mtxels "
+            "--static-gauge-hall-only to include a measured value.")
         return None
 
     from file_io.static_gauge_head import load_static_gauge_hall_artifact
@@ -2898,11 +2898,10 @@ def _load_static_photon_hall(
         suffix = (
             " (exact zero is compatible with bare_transverse)"
             if not bool(screen_current) else "")
-        print_fn(
+        log.info(
             "  [photon head] Hall term: sigma_H = "
             f"{sigma_h.tolist()} bohr^-1 from authenticated {hall_path}"
-            f"{suffix}",
-            flush=True)
+            f"{suffix}")
     return hall
 
 
@@ -2981,18 +2980,18 @@ def _resolve_static_photon_policy(
         hall = _load_static_photon_hall(
             config, meta, mesh_xy, wfn, wfn_fingerprint_binding,
             screen_current=screen_current, print_fn=print_fn)
-    elif jax.process_index() == 0:
-        print_fn(
-            "\n  ==========================================================\n"
-            "  WARNING -- DEBUG: Gamma-cell head disabled by "
-            "head_correction=off\n"
-            "  The packed static photon V and W keep a ZERO q=Gamma, G=0\n"
-            "  slot: no bare <D> insertion, no charge S00/wing head, no\n"
-            "  Hall term.  This is a brute-force k-grid convergence /\n"
-            "  debugging setting, NOT a production calculation\n"
-            "  (owner ruling 2026-09-01, docs/architecture/decisions.md).\n"
-            "  ==========================================================\n",
-            flush=True)
+    else:
+        log.warning(
+            "Gamma-cell head disabled by head_correction=off on the packed "
+            "static photon route",
+            extra=message(
+                "photon_head_off",
+                lines=("the packed static photon V and W keep a zero q=Gamma, "
+                       "G=0 slot: no bare <D> insertion, no charge S00/wing "
+                       "head, no Hall term",
+                       "a k-grid convergence / debugging setting, NOT a "
+                       "production calculation"),
+                fix="head_correction = full"))
     return coupled_head, screen_current, hall, head_policy
 
 
@@ -3036,7 +3035,7 @@ def _report_static_photon_body(
         n_packed = int(layout.packed_extent)
         n_ranks = max(int(jax.process_count()), 1)
         body_bytes = 16.0 * nq * n_packed * n_packed / n_ranks
-        print_fn(
+        log.info(
             "  [photon response] DECLARED no-pair model "
             "Psi=(Psi_L,(alpha_FS/2)*sigma.p*Psi_L), "
             "j=c*Psi^dagger*alpha*Psi; "
@@ -3045,14 +3044,12 @@ def _report_static_photon_body(
                if screen_current else
                "BARE Breit (chi_TT = chi_CT = 0: no current blocks, no "
                "packed Dyson solve); ")
-            + f"head_correction={head_policy.value}",
-            flush=True)
-        print_fn(
+            + f"head_correction={head_policy.value}")
+        log.debug(
             f"  [photon response] packed body N_packed={n_packed} "
             f"(n_C={layout.carrier_extent(0)} + 3*n_T="
             f"{layout.carrier_extent(1)}), nq={nq}: "
-            f"{body_bytes / 1e9:.4f} GB/rank resident for EACH of V and W",
-            flush=True)
+            f"{body_bytes / 1e9:.4f} GB/rank resident for EACH of V and W")
 
 
 def _screen_static_photon_body(
@@ -3195,15 +3192,13 @@ def _complete_static_photon_head(
             "Gamma-completed static photon V", V_packed)
         sanity.refuse_nonfinite(
             "Gamma-completed static photon W", W_packed)
-        if jax.process_index() == 0:
-            print_fn(
-                "  [photon head] Gamma-cell completion applied: bare <D> "
-                "into V, charge S00/wing head into W; hall_source="
-                f"{response.hall_source}; ward={head_completion.ward_residual:.3e}, "
-                f"hermiticity={head_completion.hermiticity_residual:.3e}, "
-                "dyson_forward_bound="
-                f"{head_completion.max_dyson_forward_error_bound:.3e}",
-                flush=True)
+        log.info(
+            "  [photon head] Gamma-cell completion applied: bare <D> "
+            "into V, charge S00/wing head into W; hall_source="
+            f"{response.hall_source}; ward={head_completion.ward_residual:.3e}, "
+            f"hermiticity={head_completion.hermiticity_residual:.3e}, "
+            "dyson_forward_bound="
+            f"{head_completion.max_dyson_forward_error_bound:.3e}")
     return V_packed, W_packed, head_completion
 
 

@@ -27,6 +27,9 @@ from psp.radial.build_projectors_qe import (
 )
 from psp.radial.solid_harmonics import solid_harmonics_jax as _solid_harmonics_jax
 from runtime.padding import padded_axis
+from common.log import get_logger, message
+
+log = get_logger(__name__)
 
 
 @functools.partial(jax.tree_util.register_dataclass,
@@ -220,7 +223,7 @@ ICL_STRAIGHT_GAUGE_PATH = "icl_straight_segment_v1"
 RY_TO_EV = 13.605693122994
 
 def resolve_soc_mode(pseudos, wfn=None, *, nspinor,
-                     caller: str = "", print_fn=print) -> bool:
+                     caller: str = "", print_fn=None) -> bool:
     """j-RESOLVED vs j-AVERAGED projectors, READ from QE and announced.
 
     There is no caller/deck/CLI ``soc`` input: QE reports the choice and
@@ -262,16 +265,26 @@ def resolve_soc_mode(pseudos, wfn=None, *, nspinor,
         if nspinor == 1:
             # FORCED, not assumed: one-component wavefunctions admit only
             # the j-averaged operator, so the undetermined case has a
-            # unique representable resolution (= QE average_pp).  The
-            # WARNING prefix is load-bearing: production output routes
-            # legacy prints through preprocessing_output.legacy_print,
-            # which retains only _WARNING_WORDS lines — without it this
-            # announcement is silently dropped unless LORRAX_DEBUG_PRINT=1.
-            print_fn(f"{tag}WARNING: V_NL j-AVERAGED (scalar-relativistic, QE "
-                     f"average_pp), forced by nspinor=1.  FR pseudos "
-                     f"{sorted(j_pseudos)}, discarding "
-                     f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV of "
-                     f"spin-orbit.")
+            # unique representable resolution (= QE average_pp).  A
+            # WARNING record: the spin-orbit the FR pseudos carry is
+            # discarded.  A caller that hands its own ``print_fn`` still
+            # gets the old line, with the WARNING prefix its filter keys on.
+            forced = (f"V_NL j-AVERAGED (scalar-relativistic, QE "
+                      f"average_pp), forced by nspinor=1.  FR pseudos "
+                      f"{sorted(j_pseudos)}, discarding "
+                      f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV of "
+                      f"spin-orbit.")
+            if print_fn is not None:
+                print_fn(f"{tag}WARNING: {forced}")
+            else:
+                log.warning(
+                    f"{tag}{forced}",
+                    extra=message(
+                        id="vnl_soc_discarded",
+                        found=("spin-orbit", "not recorded in the WFN, nspinor=1"),
+                        needs="an nspinor=2 WFN to keep the j-resolved V_NL",
+                        fix="use an nspinor=2 WFN, or a scalar-relativistic "
+                            "pseudopotential"))
             return False
         why = getattr(wfn, "qe_symmetry_diagnostic", "no QE schema reader")
         raise ValueError(
@@ -297,16 +310,18 @@ def resolve_soc_mode(pseudos, wfn=None, *, nspinor,
                 f"operator (QE average_pp) with nspinor=1; "
                 f"fix: use an nspinor=2 WFN, or a scalar-relativistic "
                 f"pseudopotential.")
-        print_fn(f"{tag}V_NL: j-RESOLVED (spin-orbit ON), from {source}.  "
-                 f"FR pseudos {sorted(j_pseudos)}, "
-                 f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV.")
+        say = print_fn if print_fn is not None else log.info
+        say(f"{tag}V_NL: j-RESOLVED (spin-orbit ON), from {source}.  "
+            f"FR pseudos {sorted(j_pseudos)}, "
+            f"ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV.")
         return True
 
     # declared False, and the pseudos DO resolve j → the averaged path
-    print_fn(f"{tag}V_NL: j-AVERAGED (scalar-relativistic, QE average_pp), "
-             f"from {source}.  FR pseudos {sorted(j_pseudos)}, "
-             f"discarding ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV of "
-             f"spin-orbit.")
+    say = print_fn if print_fn is not None else log.info
+    say(f"{tag}V_NL: j-AVERAGED (scalar-relativistic, QE average_pp), "
+        f"from {source}.  FR pseudos {sorted(j_pseudos)}, "
+        f"discarding ΔD = {worst_ry:.6f} Ry = {worst_ev:.4f} eV of "
+        f"spin-orbit.")
     return False
 
 
@@ -316,7 +331,7 @@ def build_vnl_setup(
     nspinor: int | None = None,
     q_max: float | None = None,
     compute_contact: bool = False,
-    print_fn=print,
+    print_fn=None,
 ) -> VNLSetup:
     """Build k-independent VNL data: radial tables, channel metadata.
 

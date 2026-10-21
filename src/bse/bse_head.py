@@ -59,6 +59,9 @@ import jax.numpy as jnp
 
 from common.units import RYD_TO_EV
 from .bse_window import _parse_wfn_path
+from common.log import get_logger, message
+
+log = get_logger(__name__)
 
 
 def _parse_head_overrides(input_file: Optional[str]):
@@ -162,7 +165,12 @@ def _resolve_head_params(
             from wfn_loader import WfnLoader
             cell_volume = float(WfnLoader(_parse_wfn_path(input_file)).cell_volume)
         except Exception as exc:
-            print(f"BSE head: cell_volume unresolved ({exc}); skipping head")
+            log.warning(f"BSE head: cell_volume unresolved ({exc}); skipping head",
+                        extra=message(
+                            id="bse_head_cell_volume_unresolved",
+                            found=("cell volume", f"unresolved ({exc})"),
+                            needs="the WFN.h5 cell volume to build the q=0 head",
+                            fix="point wfn_file in the deck at a readable WFN.h5"))
             cell_volume = None
     return vhead, whead, cell_volume, source
 

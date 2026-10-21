@@ -38,6 +38,10 @@ _services.ensure_on_path()
 import numpy as np
 
 from common import timing
+from common.log import get_logger, record
+
+log = get_logger(__name__)
+
 from common.collectives import (all_gather_processes, gather_to_host,
                                 process_count, process_rank)
 from common.units import RYD_TO_EV
@@ -1579,7 +1583,7 @@ def plan_sigma_windows(
             support_reads_past(omega_ry, omega_group, support_window_ry))
     for item in past:
         where = "near grid" if item["group"] < 0 else f"coarse window {item['group']}"
-        print_fn(f"  WARNING Sigma reads past the W line support: {where} samples "
+        log.warning(f"  WARNING Sigma reads past the W line support: {where} samples "
                  f"[{item['samples_ev'][0]:+.3f}, {item['samples_ev'][1]:+.3f}] eV, line sites "
                  f"placed for reads [{support_window_ry[0] * RYD_TO_EV:+.3f}, "
                  f"{support_window_ry[1] * RYD_TO_EV:+.3f}] eV (top site "
@@ -1797,7 +1801,7 @@ def plan_sigma_windows(
                 if frozen else None),
         })
         if _resolve_uniform_rule_trace() and process_rank() == 0:
-            print_fn(
+            log.debug(
                 f"[uniform-box] {spec['name']} "
                 f"support_re={spec['raw_real_support']} box={spec['box']} (Ry)")
 
@@ -1858,7 +1862,9 @@ def plan_sigma_windows(
     # Keep the accepted rule identity in the normal scientific report,
     # including repeated SC planning calls.
     if process_rank() == 0:
-        print_fn("Sigma quadrature receipt: " + _receipt_json(geometry))
+        _receipt = _receipt_json(geometry)
+        log.debug("Sigma quadrature receipt: " + _receipt,
+                  extra=record("sigma.quadrature", **json.loads(_receipt)))
     return output, geometry
 
 

@@ -20,6 +20,7 @@ as noise (+5.72 meV per occupied state on MoS2 3×3, lane J claim 0586).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import warnings
 
 import jax
@@ -54,6 +55,10 @@ _Q0_LADDER_ATOL = 1.0e-12
 
 _Q0_RULE_ANNOUNCED: set[str] = set()
 
+#: A service is independently installable and imports no ``common.log``: it logs on the
+#: ``lorrax.`` namespace directly (the handlers in ``common.log`` sit on that root).
+_LOG = logging.getLogger("lorrax.vcoul")
+
 
 @dataclass(frozen=True)
 class SlabQ0Certificate:
@@ -68,11 +73,9 @@ class SlabQ0Certificate:
 def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
     """Name the q→0 rule that answered, once per process.
 
-    ``print`` reaches a direct caller (a test, a tool, a service consumer).
-    A LORRAX production driver routes incidental component stdout to
-    ``os.devnull`` on purpose (``runtime.production_stream.ProductionStdout``)
-    and keeps only its own reporter, so the production certificate does not
-    reach ``gwjax.out`` today; that seam is registered.  ``warn=True`` also
+    The line is an INFO record on ``lorrax.vcoul``: the rank log of a LORRAX
+    driver run carries it, and a direct caller (a test, a tool) sees it through
+    the ``common.log`` fallback handler.  ``warn=True`` also
     raises a ``RuntimeWarning``, which that boundary DOES route into the
     driver's warning block — reserved for selecting the DEBUG rule, which
     must never run unnoticed inside a production driver.
@@ -80,7 +83,7 @@ def _announce_q0_rule(line: str, *, warn: bool = False) -> None:
     if line in _Q0_RULE_ANNOUNCED:
         return
     _Q0_RULE_ANNOUNCED.add(line)
-    print(line, flush=True)
+    _LOG.info(line)
     if warn:
         warnings.warn(line, RuntimeWarning, stacklevel=3)
 

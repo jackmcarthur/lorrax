@@ -42,6 +42,7 @@ import jax.numpy as jnp
 import distrib_la
 from common.collectives import (process_count, process_rank, psum_replicate,
                                 single_device_mesh)
+from common.log import get_logger
 from common.gpu_utils import device_budget_bytes
 from lxkit import memory
 from file_io import CrystalData
@@ -52,6 +53,8 @@ from psp.operator_checks import validate_dense_h_inputs
 from psp.pseudos import load_pseudopotentials
 from psp.scf_potential import build_dft_potentials
 from wfn_loader import WfnLoader
+
+log = get_logger(__name__)
 
 def solve_k(H_k, gvecs_file, nspinor, eigh, nbands):
     """ε and c for one k: the dense H on its (padded) sphere, one full eigh, source G order."""
@@ -108,10 +111,9 @@ def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
             raise ValueError(
                 f"nbands={nb}: the complete basis of the smallest sphere is "
                 f"{int(n_basis.min())} states (nspinor·min_k ngk).")
-        if verbose:
-            print(f"dense H: nk={nk}, nspinor={crystal.nspinor}, N = "
-                  f"nspinor·ngk in [{int(n_basis.min())}, {int(n_basis.max())}], "
-                  f"writing {nb} bands, {nproc} rank(s)", flush=True)
+        log.info(f"dense H: nk={nk}, nspinor={crystal.nspinor}, N = "
+                 f"nspinor·ngk in [{int(n_basis.min())}, {int(n_basis.max())}], "
+                 f"writing {nb} bands, {nproc} rank(s)")
 
         rho_val = jnp.asarray(crystal.load_charge_density()[0], jnp.float64)
         mag = crystal.load_magnetization() if crystal.domag else None
@@ -142,18 +144,17 @@ def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
                 continue
             energies[ik], coefficients[ik] = e_k, c_k
             stats = jax.local_devices()[0].memory_stats() or {}
-            print(f"  [rank {rank}] k={ik}: N={n} (padded "
-                  f"{int(crystal.nspinor) * ngkmax}), "
-                  f"{time.perf_counter() - t0:.2f} s, peak "
-                  f"{stats.get('peak_bytes_in_use', 0) / 1e9:.3f} GB, "
-                  f"skew {skew:.1e}, e0={energies[ik, 0]:.8f} Ry", flush=True)
+            log.info(f"  [rank {rank}] k={ik}: N={n} (padded "
+                     f"{int(crystal.nspinor) * ngkmax}), "
+                     f"{time.perf_counter() - t0:.2f} s, peak "
+                     f"{stats.get('peak_bytes_in_use', 0) / 1e9:.3f} GB, "
+                     f"skew {skew:.1e}, e0={energies[ik, 0]:.8f} Ry")
         energies = psum_replicate(energies, mesh)
         write_complete_wfn_h5(
             output_path, wfn, energies, coefficients, mesh=mesh,
             stamps={"dense_h_source_wfn": os.path.abspath(wfn_path),
                     "dense_h_qe_save": os.path.abspath(save_dir)})
-    if verbose:
-        print(f"wrote {output_path}: {nk} k x {nb} bands", flush=True)
+    log.info(f"wrote {output_path}: {nk} k x {nb} bands")
     return energies
 
 

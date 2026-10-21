@@ -89,7 +89,7 @@ def test_barrier_uses_the_coordination_service_with_one_id_per_use(monkeypatch):
     assert collectives.barrier("single_process_is_a_no_op") is False
 
 
-def test_large_read_heartbeat_never_waits_on_the_caller(tmp_path, capsys):
+def test_large_read_heartbeat_never_waits_on_the_caller(tmp_path, caplog):
     """A >= 1 GiB file's read is watched on a thread (is_ready polling), not waited for."""
     import time
     from file_io import _slab_io_ffi as ffi
@@ -113,6 +113,6 @@ def test_large_read_heartbeat_never_waits_on_the_caller(tmp_path, capsys):
     deadline, seen = time.monotonic() + 5.0, ""
     while "COMPLETE" not in seen and time.monotonic() < deadline:
         time.sleep(0.05)
-        seen += capsys.readouterr().out
+        seen = caplog.text          # the heartbeat is an INFO record of lorrax.file_io._slab_io_ffi
     assert "START" in seen or "COMPLETE" in seen
     assert "COMPLETE" in seen, seen

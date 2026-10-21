@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from common.collectives import gather_to_host
+from common.log import block, get_logger
 from solvers.davidson_fixed import (
     BAD_INITIAL, BAD_TOLERANCE, NONFINITE, CONVERGED, STALLED, plan_davidson,
 )
@@ -21,6 +22,7 @@ from solvers.davidson_fixed import (
 # The measured Si clustered-band default; a capacity is still explicit in the
 # composable API. See docs/architecture/iterative_eigensolvers.md for memory/conditioning policy.
 DEFAULT_M_MAX_FACTOR = 10
+log = get_logger(__name__)
 TRACE_COUNTS: dict = {}
 MATVEC_APPLICATIONS = [0]
 LAST_RUN: dict = {}
@@ -112,6 +114,7 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
     if verbose:
         count = _count_converged(residuals < tol*np.maximum(1., np.abs(values)), n_eig)
         label = 'Converged' if status == CONVERGED else 'STALLED' if status == STALLED else 'NOT CONVERGED'
-        print(f'Davidson: {label}; {count}/{n_eig} roots, {iterations} iterations, '
-              f'{matvecs} matvecs, {int(restarts)} restarts; max residual={np.max(residuals):.3e}', flush=True)
+        log.info(f'Davidson: {label}; {count}/{n_eig} roots, {iterations} iterations, '
+                 f'{matvecs} matvecs, {int(restarts)} restarts; max residual={np.max(residuals):.3e}',
+                 extra=block("davidson"))
     return values, vectors

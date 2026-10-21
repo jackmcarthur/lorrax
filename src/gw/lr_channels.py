@@ -34,6 +34,10 @@ from __future__ import annotations
 import os
 
 import numpy as np
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 def slab_shells(bvec) -> int:
@@ -232,10 +236,10 @@ def finish(state, W_q):
         Ft=Ft[..., :state["n_rmu"]], P=Pm, gvec=state["ch"].gvec,
         v=state["ch"].v, q_frac=state["q_frac"], n_z=int(state["n_z"]),
         sys_dim=int(state["sys_dim"]), head_kernel=state["head_kernel"]))
-    print(f"  W long-range channels: {Pm.shape[-1]} per q on {Pm.shape[0]} q "
+    log.debug(f"  W long-range channels: {Pm.shape[-1]} per q on {Pm.shape[0]} q "
           f"(sys_dim {state['sys_dim']}, |G_z| <= {state['n_z']}); P definiteness "
           f"max λ_max/|λ_min| {worst:.3e}; dressed form factors F~ and P "
-          f"deposited for the restart", flush=True)
+          f"deposited for the restart")
 
 
 # ---------------------------------------------------------------------------

@@ -88,6 +88,10 @@ from common.fft_helpers import make_kfft_kminor
 from common.gpu_utils import device_budget_bytes
 from .bse_ring_comm import build_bse_ring_matvec_full, make_bse_shardings
 from .bse_head import head_shifted_eps_c
+from common.log import get_logger, message
+
+log = get_logger(__name__)
+_LOGGER = log     # the module logger, where a ``log`` parameter shadows it
 
 jax.config.update("jax_enable_x64", True)
 
@@ -160,11 +164,17 @@ def dense_col_chunk(args, mesh_xy, N, *, log=None):
             f"{peak_per_col / 2 ** 30:.2f} GiB/column -> col_chunk={chunk} "
             f"against a {budget / 2 ** 30:.1f} GiB budget")
         if peak_per_col > budget:
-            log(f"  [nontda] WARNING: even ONE trial column wants ~"
+            _LOGGER.warning(
+                f"  [nontda] WARNING: even ONE trial column wants ~"
                 f"{peak_per_col / 2 ** 30:.1f} GiB, over the "
                 f"{budget / 2 ** 30:.1f} GiB budget. Proceeding at "
                 f"col_chunk=1; if this OOMs, shard wider (raise px*py) or use "
-                f"the matrix-free route (make_ab_appliers).")
+                f"the matrix-free route (make_ab_appliers).",
+                extra=message(
+                    id="nontda_column_over_budget",
+                    found=("one trial column", f"{peak_per_col / 2 ** 30:.1f} GiB"),
+                    needs=f"at most {budget / 2 ** 30:.1f} GiB",
+                    fix="raise px*py, or use the matrix-free route (make_ab_appliers)"))
     return chunk
 
 
@@ -598,7 +608,7 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
             f"solve_bse_nontda_sharded: solver must be 'dense' or "
             f"'matrixfree', got {solver!r}")
     sh = make_bse_shardings(mesh_xy)
-    _log0 = print if jax.process_index() == 0 else (lambda *_a, **_k: None)
+    _log0 = log.info
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     nk = nkx * nky * nkz
     nc = int(data["n_cond_pad"]); nv = int(data["n_val_pad"])

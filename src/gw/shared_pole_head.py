@@ -55,14 +55,18 @@ plan's shifted origin is the static Thomas-Fermi row
 from types import SimpleNamespace
 from functools import lru_cache
 
-import sys
 
 import jax
+import sys
 import jax.numpy as jnp
 import dataclasses
 
 import numpy as np
 from common import timing
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 def _gamma_gemm_route(mesh, b_shape, budget_bytes):
@@ -278,14 +282,13 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     if jax.process_index() == 0 and samples:
         origin = min(range(len(points)), key=lambda i: abs(points[i]))
         s0 = samples[origin]
-        print(f"  shared-pole head: origin sample z={complex(points[origin]):.6g} Ry, "
-              f"W^c={complex(s0.wcoul0) - complex(s0.vc0):.9g} Ry bohr^3 "
-              f"(<v>={complex(s0.vc0).real:.9g})", file=sys.stderr, flush=True)
+        log.info(f"  shared-pole head: origin sample z={complex(points[origin]):.6g} Ry, "
+                 f"W^c={complex(s0.wcoul0) - complex(s0.vc0):.9g} Ry bohr^3 "
+                 f"(<v>={complex(s0.vc0).real:.9g})")
         if getattr(s0, "S_cart", None) is not None:
             _S = np.real(np.asarray(s0.S_cart))
-            print("  shared-pole head: origin interband 8 pi qhat.S.qhat principal = "
-                  + "/".join(f"{x:.6g}" for x in 8.0 * np.pi * np.linalg.eigvalsh(0.5 * (_S + _S.T))),
-                  file=sys.stderr, flush=True)
+            log.info("  shared-pole head: origin interband 8 pi qhat.S.qhat principal = "
+                     + "/".join(f"{x:.6g}" for x in 8.0 * np.pi * np.linalg.eigvalsh(0.5 * (_S + _S.T))))
     with timing.section("head.mpa_fit", announce=True,
                         label="shared-pole head pole fit"):
         # The rows past the fit nodes include the imaginary-axis moment rule,

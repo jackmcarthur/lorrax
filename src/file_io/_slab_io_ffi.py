@@ -46,10 +46,13 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import (barrier as _barrier, device_put_process_local,
                                 device_put_process_local_cached, gather_to_host)
+from common.log import get_logger, message as log_message
 from runtime import debug_print_enabled
 from runtime.padding import authenticate_padded_axis, padded_axis
 
 from . import h5_journal as _journal
+
+log = get_logger(__name__)
 
 #: The two HDF5 library instances, spelled as ``file_io.hdf5_owner`` and
 #: ``file_io.h5_journal`` spell them.  Every HDF5 call this module makes
@@ -188,15 +191,13 @@ def _announce_legacy_introspect(path: str) -> None:
     if path in _LEGACY_INTROSPECT_ANNOUNCED:
         return
     _LEGACY_INTROSPECT_ANNOUNCED.add(path)
-    if not debug_print_enabled() or not _rank0():
-        return
-    print(f"  [SlabIO] {os.path.basename(path)}: dataset geometry read "
-          f"through SERIAL h5py — the loaded FFI library predates "
-          f"lrx_phdf5_dataset_geometry (2026-08-22), so two HDF5 library "
-          f"instances touch this path.  Read-only on both sides, so it is "
-          f"allowed and counted; a handle that could WRITE would refuse "
-          f"here.  Rebuild to retire it: src/ffi/cpp/build.sh (CUDA leg), "
-          f"config/perlmutter/build_ffi_host.sh (host leg).", flush=True)
+    log.debug(f"  [SlabIO] {os.path.basename(path)}: dataset geometry read "
+              f"through SERIAL h5py — the loaded FFI library predates "
+              f"lrx_phdf5_dataset_geometry (2026-08-22), so two HDF5 library "
+              f"instances touch this path.  Read-only on both sides, so it is "
+              f"allowed and counted; a handle that could WRITE would refuse "
+              f"here.  Rebuild to retire it: src/ffi/cpp/build.sh (CUDA leg), "
+              f"config/perlmutter/build_ffi_host.sh (host leg).")
 
 
 def _close_log_level() -> int:
@@ -444,31 +445,31 @@ def _announce_read_layout(path: str) -> None:
     _READ_LAYOUT_ANNOUNCED.add(canonical)
     layout = file_stripe_layout(path)
     if layout is None:
-        print(
+        log.info(
             f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode=r "
             f"bytes={nbytes if nbytes >= 0 else 'UNKNOWN'} "
             "file stripe layout=UNKNOWN (no plain lustre.lov layout: not "
             "Lustre, or a composite layout); "
-            "collective read aggregation cannot be predicted",
-            flush=True)
+            "collective read aggregation cannot be predicted")
         return
     count, unit = layout
     ranks = int(jax.process_count())
     cb_nodes = min(int(count), ranks)
-    warning = ""
-    if count == 1 and ranks > 1:
-        warning = (
-            " WARNING: one-stripe inode forces cb_nodes=1 and a single "
-            "read aggregator at every rank count; create the destination "
-            "directory with the intended layout before producing the file "
-            "or make a separately authenticated migrated copy")
-    print(
+    log.info(
         f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode=r "
         f"bytes={nbytes if nbytes >= 0 else 'UNKNOWN'} "
         f"file stripe_count={count} stripe_size={unit} B "
-        f"cb_nodes={cb_nodes}/{ranks} (the file's inode, not write policy)."
-        f"{warning}",
-        flush=True)
+        f"cb_nodes={cb_nodes}/{ranks} (the file's inode, not write policy).")
+    if count == 1 and ranks > 1:
+        log.warning(
+            f"{os.path.basename(path)}: one-stripe inode forces cb_nodes=1 and a "
+            "single read aggregator at every rank count",
+            extra=log_message(
+                "slabio_one_stripe_read",
+                found=("stripe_count", f"1 on {ranks} ranks"),
+                fix="create the destination directory with the intended layout "
+                    "before producing the file, or make a separately "
+                    "authenticated migrated copy"))
 
 
 @contextmanager
@@ -496,15 +497,13 @@ def _large_read_progress(path: str, name: str, *, global_bytes: int,
 
     started = time.monotonic()
     label = f"{os.path.basename(path)}:{name}"
-    print(
+    log.info(
         f"  [SlabIO.read] START {label} global_bytes={int(global_bytes)} "
-        f"local_bytes={int(local_bytes)}",
-        flush=True)
+        f"local_bytes={int(local_bytes)}")
     try:
         yield pending.append
     except BaseException:
-        print(f"  [SlabIO.read] FAILED {label} elapsed={time.monotonic() - started:.1f} s",
-              flush=True)
+        log.info(f"  [SlabIO.read] FAILED {label} elapsed={time.monotonic() - started:.1f} s")
         raise
 
     def landed() -> None:
@@ -513,17 +512,15 @@ def _large_read_progress(path: str, name: str, *, global_bytes: int,
             now = time.monotonic()
             if now >= beat:
                 beat = now + _READ_HEARTBEAT_SECONDS
-                print(
+                log.info(
                     f"  [SlabIO.read] PROGRESS {label} "
                     f"elapsed={now - started:.1f} s; "
-                    "collective H5Dread has not returned",
-                    flush=True)
+                    "collective H5Dread has not returned")
             time.sleep(delay)
             delay = min(2 * delay, 0.25)
-        print(
+        log.info(
             f"  [SlabIO.read] COMPLETE {label} "
-            f"elapsed={time.monotonic() - started:.1f} s",
-            flush=True)
+            f"elapsed={time.monotonic() - started:.1f} s")
 
     threading.Thread(target=landed, name="lorrax-slabio-read-progress",
                      daemon=True).start()
@@ -557,10 +554,9 @@ def _replace_inode_for_write(path: str) -> None:
                 target = os.readlink(path)
             except OSError:
                 target = "<unreadable>"
-            print(f"  [SlabIO] mode='w': {path} is a symlink -> "
-                  f"{target!r}; removing the LINK — the new file is "
-                  f"created at {path}, not at the old target.",
-                  flush=True)
+            log.info(f"  [SlabIO] mode='w': {path} is a symlink -> "
+                     f"{target!r}; removing the LINK — the new file is "
+                     f"created at {path}, not at the old target.")
         try:
             os.remove(path)
         except OSError as e:
@@ -826,8 +822,9 @@ def _assert_mpi_world(mesh, *, mpi_size=None, probe_detail=None,
             f"[SlabIO ERROR rank={jax.process_index()}] {msg}\n")
         sys.__stderr__.flush()
         raise RuntimeError(msg)
-    if verdict == "unprobed" and _rank0():
-        print(f"  [SlabIO] WARNING: {msg}", flush=True)
+    if verdict == "unprobed":
+        log.warning(f"[SlabIO] {msg}",
+                    extra=log_message("slabio_mpi_world_unprobed"))
 
 
 # ---------------------------------------------------------------------------
@@ -2539,12 +2536,11 @@ class _FfiBackend(_DatasetGeometry):
         # operator's LORRAX_PHDF5_STRIPE_* itself; nothing is exported, since
         # an environment write here raced native getenv (runtime.env_guard).
         _sc, _su = _resolve_striping()
-        if mode == "w" and _rank0() and debug_print_enabled():
-            print(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode={mode} "
-                  f"ranks={jax.process_count()} stripe_count={_sc} "
-                  f"stripe_unit={_su} B (policy; "
-                  f"LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)",
-                  flush=True)
+        if mode == "w":
+            log.debug(f"  [SlabIO.phdf5_ffi] {os.path.basename(path)} mode={mode} "
+                      f"ranks={jax.process_count()} stripe_count={_sc} "
+                      f"stripe_unit={_su} B (policy; "
+                      f"LORRAX_PHDF5_STRIPE_COUNT/_SIZE_FS override)")
         elif mode == "r":
             # Large reads always disclose the actual inode layout.  Small
             # reads retain the historical debug-only line.  The helper
@@ -2583,11 +2579,16 @@ class _FfiBackend(_DatasetGeometry):
                 # visible in the log instead of inferred from its wall time.
                 got = file_stripe_layout(path)
                 if got is not None and got != (_sc, _su):
-                    print(f"  [SlabIO.phdf5_ffi] WARNING {os.path.basename(path)} "
-                          f"was created {got[0]} x {got[1]} B but the policy "
-                          f"requested {_sc} x {_su} B (Lustre clamps a count "
-                          f"above its OST count; 1 x 1 MiB means the MPI-IO "
-                          f"hints were ignored).", flush=True)
+                    log.warning(
+                        f"[SlabIO.phdf5_ffi] {os.path.basename(path)} "
+                        f"was created {got[0]} x {got[1]} B but the policy "
+                        f"requested {_sc} x {_su} B (Lustre clamps a count "
+                        f"above its OST count; 1 x 1 MiB means the MPI-IO "
+                        f"hints were ignored).",
+                        extra=log_message(
+                            "slabio_stripe_mismatch",
+                            found=("created layout", f"{got[0]} x {got[1]} B"),
+                            needs=f"{_sc} x {_su} B"))
         except BaseException:
             # An open that failed holds nothing; leaving it registered
             # would refuse every later legitimate open on this path.
@@ -3096,15 +3097,13 @@ class _FfiBackend(_DatasetGeometry):
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat, mesh_shape=mesh_shape)
         if debug_print_enabled():
-            import sys
             local_shapes = [tuple(s.data.shape) for s in A.addressable_shards]
-            sys.__stdout__.write(
+            log.debug(
                 f"[ffi-debug proc={jax.process_index()}] "
                 f"name={name} shape={tuple(A.shape)} dtype={A.dtype} "
                 f"spec={getattr(A.sharding, 'spec', None)} "
                 f"offset={off} valid_shape={vshape} gshape={gshape} "
-                f"independent={independent} local_shapes={local_shapes}\n")
-            sys.__stdout__.flush()
+                f"independent={independent} local_shapes={local_shapes}")
 
 
         ds_id = self._ds_ids[name]
@@ -3568,8 +3567,8 @@ class _FfiBackend(_DatasetGeometry):
         _verbose = _log_level >= 2
         _pending = self._dispatcher.pending
         if _log_level and _pending:
-            print(f"  [SlabIO.close] draining {_pending} pending writes "
-                  f"for {os.path.basename(self.path)} …", flush=True)
+            log.debug(f"  [SlabIO.close] draining {_pending} pending writes "
+                      f"for {os.path.basename(self.path)} …")
         # ── A rank must not skip a collective because of its OWN error ──
         # decisions.md 2026-08-04.  A writer error is sticky on the
         # dispatcher and nothing raised it earlier: this rank has issued
@@ -3593,9 +3592,8 @@ class _FfiBackend(_DatasetGeometry):
             _moved = (f"{_drained_bytes / 1e9:.2f} GB at "
                       f"{_drained_bytes / 1e6 / max(_t_drain, 1e-9):.0f} MB/s"
                       if _drained_bytes else "no queued data")
-            print(f"  [SlabIO.close] Python dispatch drained in "
-                  f"{_t_drain:.1f} s ({_moved}); joining writer thread",
-                  flush=True)
+            log.debug(f"  [SlabIO.close] Python dispatch drained in "
+                      f"{_t_drain:.1f} s ({_moved}); joining writer thread")
         _t0 = _time.perf_counter()
         try:
             self._dispatcher.close()            # nothing of this handle left queued
@@ -3606,15 +3604,14 @@ class _FfiBackend(_DatasetGeometry):
             _worker_error = self._dispatcher.error
         _t_join = _time.perf_counter() - _t0
         if _worker_error is not None:
-            print(f"  [SlabIO.close rank={jax.process_index()}] write worker "
-                  f"raised {type(_worker_error).__name__}: {_worker_error} — "
-                  f"completing the collective teardown before re-raising.",
-                  flush=True)
+            log.warning(f"[SlabIO.close rank={jax.process_index()}] write worker "
+                        f"raised {type(_worker_error).__name__}: {_worker_error} — "
+                        f"completing the collective teardown before re-raising.",
+                        extra=log_message("slabio_write_worker_error"))
         if self.fh:
             if _verbose:
-                print(f"  [SlabIO.close] writer thread joined in "
-                      f"{_t_join:.1f} s; calling H5Fclose collectively",
-                      flush=True)
+                log.debug(f"  [SlabIO.close] writer thread joined in "
+                          f"{_t_join:.1f} s; calling H5Fclose collectively")
             _t0 = _time.perf_counter()
             # ISSUE-TIME, and this is the one that matters most: S1 is a
             # SIGSEGV that lands in the writer-thread join inside this
@@ -3634,8 +3631,8 @@ class _FfiBackend(_DatasetGeometry):
                 self.fh = 0
             _t_close = _time.perf_counter() - _t0
             if _verbose:
-                print(f"  [SlabIO.close] H5Fclose returned in "
-                      f"{_t_close:.1f} s", flush=True)
+                log.debug(f"  [SlabIO.close] H5Fclose returned in "
+                          f"{_t_close:.1f} s")
         else:
             _t_close = 0.0
         # RELEASE THE FFI CLAIM HERE, between H5Fclose and the rank-0

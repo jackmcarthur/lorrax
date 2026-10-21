@@ -33,7 +33,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax import shard_map
 from common.fft_helpers import local_fftn3
 from common.wfn_transforms import _plane_geometry
+from common.log import get_logger, record
 from runtime.padding import axis_mask, pad_to_axis, padded_axis
+
+log = get_logger(__name__)
 
 _XY = ('x', 'y')
 _kernel_cache: dict = {}
@@ -749,9 +752,9 @@ class ZetaG:
 
     def __init__(self, store, *, mesh, L_q, lu_piv, solver_kind,
                  batched_route, n_rmu_solve, n_rmu, mu_basis,
-                 ngk_per_q, gvec_components, path, print_fn=print):
+                 ngk_per_q, gvec_components, path, print_fn=None):
+        # ``print_fn`` is accepted for callers that still pass it; receipts go to ``log``.
         self.store = store
-        self.print_fn = print_fn        # the fit's report sink (V_q receipt)
         self.mesh = mesh
         self.L_q, self.lu_piv = L_q, lu_piv
         # The hoisted transverse LU travels as (LU, pivots): the 'lu' seam.
@@ -793,9 +796,8 @@ class ZetaG:
         ``with_v=False`` (:meth:`write_file`) forms and writes ζ only.
         """
         if self.solver_kind in _FACE_KINDS:
-            return self._contract_v_face(v_table, keep=keep, zeta_io=zeta_io, print_fn=print_fn, with_v=with_v)
+            return self._contract_v_face(v_table, keep=keep, zeta_io=zeta_io, with_v=with_v)
         t0 = time.perf_counter()
-        print_fn = print_fn or self.print_fn
         st = self.store
         # Pad q rows and G-tile slots carry v = 0, ngk = 0: inert in V.
         qa, ga = st.q_axis, st.g_axis
@@ -869,25 +871,23 @@ class ZetaG:
             if self.mu_basis is not None:
                 V_cmc = self.mu_basis.unpack_operator(V_cmc)
             d = float(jnp.linalg.norm(V_cmc - V) / jnp.linalg.norm(V))
-            if jax.process_index() == 0:
-                print_fn(f"  μ-batch V check: conj(C+) M conj(C+) vs zeta-first "
-                         f"rel {d:.3e} (production keeps zeta-first)")
+            log.debug(f"  μ-batch V check: conj(C+) M conj(C+) vs zeta-first "
+                      f"rel {d:.3e} (production keeps zeta-first)",
+                      extra=record("isdf.mubatch_v_check", rel=d))
         peak = (jax.local_devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0)
         self.receipt = (f"  μ-batch V_q: {st.n_Gt} G tiles, q-local, "
                         f"{time.perf_counter() - t0:.2f}s (store read "
                         f"{st.t_read:.2f}s); zeta file "
                         f"{'written' if zeta_io is not None else 'not written'}; "
                         f"device peak so far {peak / 1e9:.2f} GB")
-        if jax.process_index() == 0:
-            print_fn(self.receipt)
+        log.debug(self.receipt, extra=record("isdf.mubatch_v", text=self.receipt.strip()))
         return V
 
-    def _contract_v_face(self, v_table, *, keep, zeta_io, print_fn, with_v):
+    def _contract_v_face(self, v_table, *, keep, zeta_io, with_v, print_fn=None):
         """:meth:`contract_v` for the charge channel's face factor (:mod:`isdf.cplus`): each Z
         tile moves to the face, ζ = B(BᴴZ) is formed there, and V and the shell accumulate in
         their final layouts (V at ``P(None,'x','y')``), so no rank holds a whole (μ, μ) tile."""
         t0 = time.perf_counter()
-        print_fn = print_fn or self.print_fn
         st, mesh, Q = self.store, self.mesh, self.store.Q
         keep = np.asarray(keep, dtype=np.int32)
         if keep.ndim != 2 or keep.shape[0] != Q:
@@ -946,8 +946,7 @@ class ZetaG:
         peak = (jax.local_devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0)
         self.receipt = (f"  μ-batch V_q: {where}; zeta file {'written' if zeta_io is not None else 'not written'}; "
                         f"device peak so far {peak / 1e9:.2f} GB")
-        if jax.process_index() == 0:
-            print_fn(self.receipt)
+        log.debug(self.receipt, extra=record("isdf.mubatch_v", text=self.receipt.strip()))
         return V
 
     def _write_tile(self, zeta_io, zt, g0):
@@ -1148,7 +1147,6 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     """
     t0 = time.perf_counter()
     z0 = zetas[0]
-    print_fn = print_fn or z0.print_fn
     st0 = z0.store
     for z in zetas[1:]:
         st = z.store
@@ -1170,7 +1168,7 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     from common.collectives import device_put_process_local
     mesh = z0.mesh
     if all(z.solver_kind in _FACE_KINDS for z in zetas):
-        return _contract_v_group_face(zetas, pairs, v_tables, keep, print_fn, t0)
+        return _contract_v_group_face(zetas, pairs, v_tables, keep, t0)
     v_dev = device_put_process_local(v, NamedSharding(mesh, P(None, _XY, None)))
     ngk_dev = device_put_process_local(ngk, NamedSharding(mesh, P(_XY)))
     sl_dev = device_put_process_local(sl, NamedSharding(mesh, P(_XY, None)))
@@ -1213,12 +1211,11 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
                f"{st0.n_Gt} G tiles, q-local, "
                f"{time.perf_counter() - t0:.2f}s (store read "
                f"{sum(z.store.t_read for z in zetas):.2f}s); no ζ file")
-    if jax.process_index() == 0:
-        print_fn(receipt)
+    log.debug(receipt, extra=record("isdf.mubatch_v_group", text=receipt.strip()))
     return out
 
 
-def _contract_v_group_face(zetas, pairs, v_tables, keep, print_fn, t0):
+def _contract_v_group_face(zetas, pairs, v_tables, keep, t0):
     """:func:`contract_v_group` when every ζ is formed on the face: each ζ tile on the face
     (:func:`_face_kernels`), each pair's V and each ζ's shell accumulated there, as
     :meth:`ZetaG._contract_v_face` does for one ζ; no rank holds a whole (μ, μ) V."""
@@ -1244,8 +1241,7 @@ def _contract_v_group_face(zetas, pairs, v_tables, keep, print_fn, t0):
         z.shell_slots = keep
     receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, {st0.n_Gt} G tiles, "
                f"on the face, {time.perf_counter() - t0:.2f}s; no ζ file")
-    if jax.process_index() == 0:
-        (print_fn or z0.print_fn)(receipt)
+    log.debug(receipt, extra=record("isdf.mubatch_v_group", text=receipt.strip()))
     return out
 
 

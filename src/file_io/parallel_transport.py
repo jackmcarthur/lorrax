@@ -34,9 +34,12 @@ from common.parallel_transport import (
     link_stencil_orders,
     undersampled_link_axes,
 )
+from common.log import get_logger, message as log_message
 from common.wfn_layout import band_sphere_spec
 from file_io.slab_io import SlabIO
 from distrib_la import eigh_local
+
+log = get_logger(__name__)
 
 
 #: 5: the velocity is the one operator v = i[H, r]; schemas <= 4 may hold
@@ -742,9 +745,9 @@ def _write_link_stage(
     route = polar_plan.batched_route
     if route != ROUTE_BATCH_RESHARD:
         group_size = 1
-    print(f"  parallel-transport links: {nd*nrk} edges, group={group_size}, "
-          f"polar route={route}, matrix={polar_plan.n}, "
-          "raw overlaps and links at P(None,x,y)", flush=True)
+    log.debug(f"  parallel-transport links: {nd*nrk} edges, group={group_size}, "
+              f"polar route={route}, matrix={polar_plan.n}, "
+              "raw overlaps and links at P(None,x,y)")
     overlaps, edge_ids = [], []
     # Bind the stack's layout in the executable: on a 1 x 1 mesh an eager
     # stack of P('x','y') faces carries no named layout.
@@ -1111,17 +1114,16 @@ def _write_w_av_stage(
                      memory.priced(working_bytes_per_k, "closed form"), tile_budget_bytes, device=False)
     k_batch = max(1, min(
         nk, int(tile_budget_bytes // max(1, working_bytes_per_k))))
-    if jax.process_index() == 0:
-        working_gib = k_batch * working_bytes_per_k / 2**30
-        artifact_gib = (
-            nq * nk * nb * nb * np.dtype(np.complex128).itemsize / 2**30)
-        print(
-            f"  W-av streaming: k={k_batch}/{nk}, q=1/{nq} "
-            f"resident (conservative overlap working set "
-            f"{working_gib:.2f} GiB/device; "
-            f"20% of the {device_budget_bytes() / 1e9:.1f} GB run budget); "
-            f"WFN source=center+neighbor union; "
-            f"raw artifact={artifact_gib:.2f} GiB")
+    working_gib = k_batch * working_bytes_per_k / 2**30
+    artifact_gib = (
+        nq * nk * nb * nb * np.dtype(np.complex128).itemsize / 2**30)
+    log.debug(
+        f"  W-av streaming: k={k_batch}/{nk}, q=1/{nq} "
+        f"resident (conservative overlap working set "
+        f"{working_gib:.2f} GiB/device; "
+        f"20% of the {device_budget_bytes() / 1e9:.1f} GB run budget); "
+        f"WFN source=center+neighbor union; "
+        f"raw artifact={artifact_gib:.2f} GiB")
     g_full = wfn.gvecs(k="full_bz")
     ngk_full = wfn.ngk_valid(k="full_bz")
 
@@ -1260,10 +1262,9 @@ def _write_w_av_stage(
         io.write_attr("w_av_target_shell_mask", target_shell_mask)
         io.write_attr("w_av_target_seed_mask",
                       np.asarray(target_seed_mask, dtype=np.int32))
-    if jax.process_index() == 0:
-        print(
-            f"  W-av stencil: stored {nq} symmetry-inequivalent q rows "
-            f"for {int(np.shape(table['target_steps'])[0])} target neighbors")
+    log.debug(
+        f"  W-av stencil: stored {nq} symmetry-inequivalent q rows "
+        f"for {int(np.shape(table['target_steps'])[0])} target neighbors")
 
 
 def write_w_av_stencil_artifact(
@@ -1729,9 +1730,8 @@ def complete_velocity_validation(
     )
 
     blocks = tuple(int(m) for m in scope_blocks if 0 < int(m) <= nb)
-    if jax.process_index() == 0:
-        rule = {COLLAPSED_AXIS: "position", 2: "order-2", 4: "order-4"}
-        print("  finite-link velocity rule per axis: "
+    rule = {COLLAPSED_AXIS: "position", 2: "order-2", 4: "order-4"}
+    log.debug("  finite-link velocity rule per axis: "
               + ", ".join(
                   f"{a}={rule[o]} (max|dv|={e:.3e} of {x:.3e}, head "
                   f"S_{a}{a} reconstructed/exact {r:.4f})"
@@ -1744,22 +1744,21 @@ def complete_velocity_validation(
         metrics["blocks"] = _block_scoped_metrics(
             outer_reconstructed, jnp.asarray(velocity_exact_cart), blocks,
             atol=float(atol), rtol=float(rtol))
-        if jax.process_index() == 0:
-            print(f"  finite-link velocity diagnostics (nb={nb}, nk={nk})")
-            print("   bands  max_abs      diag         offdiag      rel_l2 gate")
-            for row in metrics["blocks"]:
-                print(f"   1..{row['bands']:<4d} {row['max_abs']:.6e}  "
+        log.debug(f"  finite-link velocity diagnostics (nb={nb}, nk={nk})")
+        log.debug("   bands  max_abs      diag         offdiag      rel_l2 gate")
+        for row in metrics["blocks"]:
+            log.debug(f"   1..{row['bands']:<4d} {row['max_abs']:.6e}  "
                       f"{row['max_abs_diagonal']:.4e}  "
                       f"{row['max_abs_offdiagonal']:.4e}  "
                       f"{str(row['passed']):>5s}")
     write_velocity_validation(path, mesh=mesh, metrics=metrics)
-    if not metrics["passed"] and jax.process_index() == 0:
+    if not metrics["passed"]:
         # A warning, never a refusal or a drop: the link error is a
         # k-convergence measure.  The QSGW head serves D_k DeltaH from these
         # links and logs rel_err x |D_k DeltaH|/|v_DFT| at every map
         # (gw.qsgw_head.link_correction_bound).
-        print(
-            "  WARNING: finite-link DFT velocity reconstruction above rtol "
+        log.warning(
+            "finite-link DFT velocity reconstruction above rtol "
             "(the k grid is underconverged for the links; the artifact is "
             "written and the SC head serves its Sigma term from it): "
             f"head_response_relative_frobenius="
@@ -1780,7 +1779,13 @@ def complete_velocity_validation(
                     metrics["exact_max_abs_by_axis"],
                     metrics["head_response_ratio_by_axis"]))
             + f"; head-set relative L2 "
-            f"{metrics['head_set_relative_l2']:.3e}", flush=True)
+            f"{metrics['head_set_relative_l2']:.3e}",
+            extra=log_message(
+                "finite_link_velocity_above_rtol",
+                found=("head response (relative Frobenius)",
+                       f"{metrics['head_response_relative_frobenius']:.6e}"),
+                needs=f"at most {float(rtol):.6e}",
+                fix="a denser k grid; the artifact is written and used as is"))
     return metrics
 
 
@@ -2258,10 +2263,10 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
     import common.timing as timing
 
     if velocity_only:
-        print("  DFT velocity-only parallel-transport artifact: no "
-              "links, no connection, no validation (--parallel-transport"
-              "-velocity-only).")
-        print(f"\nWrote DFT-velocity-only parallel-transport data to {path}")
+        log.info("  DFT velocity-only parallel-transport artifact: no "
+                 "links, no connection, no validation (--parallel-transport"
+                 "-velocity-only).")
+        log.info(f"\nWrote DFT-velocity-only parallel-transport data to {path}")
         return
     with timing.section("parallel_transport_links"):
         write_parallel_transport_artifact(
@@ -2276,10 +2281,10 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
             bvec_cart=np.asarray(wfn.bvec) * float(wfn.blat),
             atol=atol, rtol=rtol, head_nbands=head_nbands)
     verdict = "within rtol" if metrics["passed"] else "above rtol (diagnostic)"
-    print(f"  DFT covariant-velocity reconstruction: {verdict}; "
-          f"max_abs={metrics['max_abs']:.6e}, "
-          f"max_rel={metrics['max_rel']:.6e}")
-    print(f"\nWrote parallel-transport data to {path}")
+    log.info(f"  DFT covariant-velocity reconstruction: {verdict}; "
+             f"max_abs={metrics['max_abs']:.6e}, "
+             f"max_rel={metrics['max_rel']:.6e}")
+    log.info(f"\nWrote parallel-transport data to {path}")
     report.heading("Parallel-transport validation")
     report.emit(f"Links on bands 1-{int(nbands)} along "
                 f"{int(metrics['link_directions'])} +/- step pairs "

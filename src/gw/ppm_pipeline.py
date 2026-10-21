@@ -25,6 +25,10 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common.units import RYD_TO_EV
+from common.log import get_logger, message
+
+log = get_logger(__name__)
+
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
 
@@ -246,7 +250,7 @@ def _fit_head_correction(
         # W^c(0) head is still LORRAX's — see fit_head_with_fixed_omega.
         head_gn = fit_head_with_fixed_omega_from_sample(
             head_static, omega_h_ry=float(omega_h_override))
-        print_fn(
+        log.info(
             f"  PPM head: Ω_h override = {float(omega_h_override):.6f} Ry "
             f"({float(omega_h_override) * RYD_TO_EV:.4f} eV)"
         )
@@ -258,7 +262,7 @@ def _fit_head_correction(
         omega_p_sq_ry = 16.0 * float(np.pi) * float(num_electrons) / float(meta.cell_volume)
         head_gn = fit_head_hl_analytic_from_sample(
             head_static, omega_p_sq_ry=omega_p_sq_ry)
-        print_fn(
+        log.info(
             f"  HL head: ω_p (analytic, BGW-style) = "
             f"{omega_p_sq_ry**0.5:.6f} Ry "
             f"({(omega_p_sq_ry**0.5) * RYD_TO_EV:.4f} eV)"
@@ -268,7 +272,7 @@ def _fit_head_correction(
         head_gn = fit_head_ppm_from_samples(
             head_static, head_probe, probe_omega=probe_omega)
 
-    print_fn(format_head_diagnostics(head_gn, cell_volume=meta.cell_volume))
+    log.debug(format_head_diagnostics(head_gn, cell_volume=meta.cell_volume))
     return head_gn
 
 
@@ -353,7 +357,7 @@ def _compute_analytic_head_diag(
         cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot),
     ) * RYD_TO_EV
-    print_fn(
+    log.info(
         f"  Σ_c head shift: max|Σ^head_diag| = {head_max_ev:.4f} eV "
         f"(on-shell occ band → {on_shell_occ:+.4f} eV)"
     )
@@ -735,11 +739,11 @@ def write_band_checkpoints(payload, *, directory, print_fn):
                             f"{np.imag(sh['dft0'][kf, j]) * RYD_TO_EV:14.8f} "
                             f"{r['z'][kf, j]:12.8f} {sh['z'][kf, j]:12.8f}\n")
     for m in payload["members"]:
-        print_fn(f"  Σc band checkpoint N = {m['count']}: counts {m['counts']}, "
+        log.debug(f"  Σc band checkpoint N = {m['count']}: counts {m['counts']}, "
                  f"Ω = {m['omega_ev']:.2f} eV, β = {m['beta']:.1f}, "
                  f"{m['n_failed']} state(s) without a tail, fit vs combination "
                  f"{m['fit_vs_combination_ev']:.1e} eV")
-    print_fn(f"  Σc band checkpoints: {h5_path}, {dat_path}")
+    log.debug(f"  Σc band checkpoints: {h5_path}, {dat_path}")
     return h5_path, dat_path
 
 
@@ -819,20 +823,22 @@ def _report_band_extrapolation(
         states.append((f"CBM  k={kc} n={nc + n_occ}  "
                        f"E={unocc[kc, nc]:.4f} eV",
                        (int(kc), int(nc + n_occ))))
-    print_fn(format_spectral_report(plan, fit, states=states))
+    log.info(format_spectral_report(plan, fit, states=states))
 
     # States without a usable exponent keep S(N3) (``band_extrapolation``,
     # "NO USABLE EXPONENT").  The block above names them; this one line is
     # the count the production log keeps.
     if fit.n_failed:
-        print_fn("WARNING: " + fit.failure_report().splitlines()[0])
+        log.warning(fit.failure_report().splitlines()[0],
+                    extra=message("band_extrapolation_no_tail",
+                                  fix="more bands (number_bands_sigma)"))
 
     # ── WHAT THIS RUN DOES WITH THE NUMBER ──────────────────────────────
     # Until 2026-08-16 the fit was reported and then discarded: S(N₃) drove
     # the Hamiltonian and S_inf lived in a log line and four h5 datasets.  It
     # now drives E_nk, and a reader of this block must not have to infer that
     # from the absence of a statement.
-    print_fn(
+    log.debug(
         f"     [driving] E_nk for this iteration is built from the "
         f"EXTRAPOLATED Sigma_c ({estimator}), not S(N3).  Sigma is "
         f"extrapolated FIRST and diagonalized SECOND: the estimator is a REAL "
@@ -852,7 +858,7 @@ def _report_band_extrapolation(
     tol_ev = getattr(getattr(config, "sc", None), "tol_ev", None)
     if tol_ev is not None:
         _, ruling = sc_tolerance_ruling(fit, float(tol_ev))
-        print_fn(ruling)
+        log.info(ruling)
 
     # ── THE PER-MODE CONTAMINANT THE PER-compute_mode GUARD CANNOT SEE ───
     # ``ppm_invalid_mode = "static_limit"`` (the shipping default) puts an
@@ -872,7 +878,7 @@ def _report_band_extrapolation(
         static_diag = np.einsum(
             'bkii->bki', np.asarray(static_coh)) * RYD_TO_EV
         _, static_ruling, _ = static_limit_tail_ruling(fit, static_diag)
-        print_fn(static_ruling)
+        log.info(static_ruling)
 
     # The arrays are already in eV on the band diagonal, which is the unit
     # and the layout ``sigma_mnk.h5`` wants, so no scale is applied here.
@@ -930,14 +936,14 @@ def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where, checkpoints
     assert_brackets_match_ols_abscissae(
         plan, s, meta=meta, where=where)
     if plan.enabled:
-        print_fn(
+        log.info(
             f"  Σc band extrapolation: ON — bracket scheme "
             f"{plan.bracket_scheme}; {plan.n_brackets} disjoint "
             f"band brackets {plan.bounds} against ONE W(τ) per τ; "
             f"band counts {plan.counts} (requested {plan.requested}).")
         if plan.checkpoints is not None:
             ck = plan.checkpoints
-            print_fn(
+            log.debug(
                 f"  Σc band checkpoints: counts {ck.checkpoint_counts} in ONE sweep of "
                 f"{len(ck.union.counts)} disjoint brackets {ck.union.bounds}; each "
                 f"checkpoint's own counts "
@@ -947,7 +953,8 @@ def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where, checkpoints
         # should see before Σ is spent, not after.  ``WARNING:`` is what
         # keeps it in the production log's warning block.
         for note in plan.notes:
-            print_fn(f"WARNING: Σc band extrapolation: {note}")
+            log.warning(f"Σc band extrapolation: {note}",
+                        extra=message("band_extrapolation_fallback"))
     return plan
 
 

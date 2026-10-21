@@ -158,6 +158,10 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 # JAX is optional in this PoC — pure numpy keeps the math readable.  The
 # heavy lifting (FFTs, big einsums) can later be promoted to jax.numpy by
 # swapping `xp` below; ``compute_pair_density_*`` already accept jnp arrays
@@ -726,9 +730,9 @@ def _smoke_test_q0_limit():
     err_V = float(np.max(np.abs(np.array(V_recon) - V_ref)))
     err_W = float(np.max(np.abs(np.array(W_recon) - W_ref)))
     err_Wh = float(abs(complex(Wh) - vh))
-    print(f"[smoke] |W_recon-W_ref|_∞  = {err_W:.3e}")
-    print(f"[smoke] |V_recon-V_ref|_∞  = {err_V:.3e}")
-    print(f"[smoke] |Wh − vh|          = {err_Wh:.3e}")
+    log.info(f"[smoke] |W_recon-W_ref|_∞  = {err_W:.3e}")
+    log.info(f"[smoke] |V_recon-V_ref|_∞  = {err_V:.3e}")
+    log.info(f"[smoke] |Wh − vh|          = {err_Wh:.3e}")
     assert err_V < 1e-12, err_V
     assert err_W < 1e-12, err_W
     assert err_Wh < 1e-14, err_Wh
@@ -752,7 +756,7 @@ def _smoke_test_q0_limit():
     chi_eff_explicit = complex(qp @ S_eff @ qp)
     Wh_ref = vh / (1.0 - vh * chi_eff_explicit)
     err_Wh2 = abs(complex(Wh2) - Wh_ref)
-    print(f"[smoke] |Wh(q') − vh/(1−vh q'S q')| = {err_Wh2:.3e}")
+    log.info(f"[smoke] |Wh(q') − vh/(1−vh q'S q')| = {err_Wh2:.3e}")
     assert err_Wh2 < 1e-12, err_Wh2
 
     # Local-field combinations: feeding nonzero χ_wing/wing' through
@@ -802,10 +806,10 @@ def _smoke_test_q0_limit():
         + W_full[1:, 1:]
     )
     err_full = float(np.max(np.abs(np.array(W_recon) - W_centroid)))
-    print(f"[smoke] |W_recon - W_centroid(bordered Dyson)|_∞ = {err_full:.3e}")
+    log.info(f"[smoke] |W_recon - W_centroid(bordered Dyson)|_∞ = {err_full:.3e}")
     assert err_full < 1e-9, err_full
 
-    print("[smoke] ALL OK")
+    log.info("[smoke] ALL OK")
 
 
 def _smoke_test_q0_dispersion_path():
@@ -862,12 +866,12 @@ def _smoke_test_q0_dispersion_path():
 
     err_W = float(np.max(np.abs(np.array(W_disp) - np.array(W_explicit))))
     err_Wh = abs(complex(Wh_disp) - complex(Wh_explicit))
-    print(f"[smoke-disp] |Wh(q') paths| = {err_Wh:.3e}")
-    print(f"[smoke-disp] |W(q') paths|  = {err_W:.3e}")
+    log.info(f"[smoke-disp] |Wh(q') paths| = {err_Wh:.3e}")
+    log.info(f"[smoke-disp] |W(q') paths|  = {err_W:.3e}")
     # Differences should be at machine precision because χ is linear in q' here.
     assert err_W < 1e-11, err_W
     assert err_Wh < 1e-11, err_Wh
-    print("[smoke-disp] ALL OK")
+    log.info("[smoke-disp] ALL OK")
 
 
 if __name__ == "__main__":

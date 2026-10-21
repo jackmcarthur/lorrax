@@ -161,7 +161,10 @@ import time  # noqa: E402
 import jax   # noqa: E402
 
 import common.timing as timing  # noqa: E402
+from common.log import get_logger  # noqa: E402
 from runtime.run_session import _record_pre_main  # noqa: E402
+
+log = get_logger(__name__)
 
 
 def main(argv=None) -> int:
@@ -188,16 +191,16 @@ def main(argv=None) -> int:
                if r["depth"] == 0 and (r["name"] == "bsemat.imports"
                                        or r["name"].startswith("bsemat.runtime_stack."))}
     if jax.process_index() == 0:
-        timing.report(print_fn=print, title="--- bsemat timing (s) ---", max_depth=1, wall=wall)
+        timing.report(print_fn=log.info, title="--- bsemat timing (s) ---", max_depth=1, wall=wall)
         for s in ss:
             s["stages"]["startup"] = startup
             s["wall_process_s"] = wall
             path = a.summary if a.summary and len(ss) == 1 else os.path.splitext(s["out_path"])[0] + ".json"
             with open(path, "w") as fh:
                 json.dump(s, fh, indent=1, default=str)
-            print(f"[bsemat] wrote {s['out_path']} in {s['wall_total_s']:.1f} s from the load "
-                  f"(own stages {sum(s['stages']['output'].values()):.1f} s, rows "
-                  f"{s['wall_rows_s']:.1f} s, peak device {s['peak_device_bytes'] / 2**30:.2f} GiB)")
+            log.info(f"[bsemat] wrote {s['out_path']} in {s['wall_total_s']:.1f} s from the load "
+                     f"(own stages {sum(s['stages']['output'].values()):.1f} s, rows "
+                     f"{s['wall_rows_s']:.1f} s, peak device {s['peak_device_bytes'] / 2**30:.2f} GiB)")
         if a.summary and len(ss) > 1:
             with open(a.summary, "w") as fh:
                 json.dump(ss, fh, indent=1, default=str)

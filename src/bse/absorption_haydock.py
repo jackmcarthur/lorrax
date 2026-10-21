@@ -61,6 +61,9 @@ from .bse_io import (load_bse_data_from_restart_sharded)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_2d, make_bse_shardings
 from .bse_stack_matvec import build_bse_stack_matvec
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 def haydock_recursion_block(matvec_block, d_block, n_iter):
@@ -161,7 +164,7 @@ def run_haydock(
     sh = make_bse_shardings(mesh_xy)
     grid_x, grid_y = mesh_xy.devices.shape
 
-    print(f"[haydock] loading BSE data from {restart_file}")
+    log.info(f"[haydock] loading BSE data from {restart_file}")
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
         input_file=input_file, n_occ=n_occ, eqp_file=eqp_file,
@@ -200,14 +203,14 @@ def run_haydock(
     # pre-snap assumption ``bse_jax``'s ``--write-eigs`` path made loudly.
     n_val_eff = int(data["n_val"])
     n_cond_eff = int(data["n_cond"])
-    print(f"[haydock] mesh {grid_x}x{grid_y}, problem "
-          f"{nc_pad} cond × {nv_pad} val × {nk} k = {nc_pad * nv_pad * nk}")
+    log.info(f"[haydock] mesh {grid_x}x{grid_y}, problem "
+             f"{nc_pad} cond × {nv_pad} val × {nk} k = {nc_pad * nv_pad * nk}")
 
     # Build the dipole seed vectors |d^α⟩ in BSE basis with proper padding.
     d_alpha, de_cv = window_dipoles(data, dipole_file, n_occ=n_occ,
                                     wfn_path=_parse_wfn_path(input_file))
-    print(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond_eff}, "
-          f"nv={n_val_eff})")
+    log.debug(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond_eff}, "
+              f"nv={n_val_eff})")
     d_block_np = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)
     d_block = jnp.asarray(d_block_np)                                         # (3, nc_pad, nv_pad, nk)
 
@@ -243,7 +246,7 @@ def run_haydock(
 
         return haydock_recursion_block(matvec_block, d_seed, n_iter)
 
-    print(f"[haydock] running 3-block recurrence × {n_iter} iters …")
+    log.info(f"[haydock] running 3-block recurrence × {n_iter} iters …")
     alphas, betas, norms = _full_run(
         d_block,
         data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
@@ -253,9 +256,9 @@ def run_haydock(
     alphas = np.asarray(alphas)
     betas = np.asarray(betas)
     norms = np.asarray(norms)
-    print(f"[haydock] α_1 = {alphas[:, 0]}  (Ry)")
-    print(f"[haydock] β_1 = {betas[:, 0]}  (Ry)")
-    print(f"[haydock] ‖d‖ = {norms}")
+    log.debug(f"[haydock] α_1 = {alphas[:, 0]}  (Ry)")
+    log.debug(f"[haydock] β_1 = {betas[:, 0]}  (Ry)")
+    log.debug(f"[haydock] ‖d‖ = {norms}")
 
     omegas_eV = np.linspace(omega_min_eV, omega_max_eV, n_omega)
     omegas_Ry = omegas_eV / RYD2EV
@@ -292,7 +295,7 @@ def run_haydock(
             f"n_iter = {n_iter},  ‖d‖ = {norms[a]:.6e}",
         ]
         write_absorption_dat(out_dat, omegas_eV, eps2[:, a], eps1[:, a], jdos[:, a], header)
-        print(f"[haydock] wrote {out_dat}")
+        log.info(f"[haydock] wrote {out_dat}")
 
     out_h5 = out_prefix_p.with_name(f"{out_prefix_p.name}.h5")
     write_absorption_h5(
@@ -314,7 +317,7 @@ def run_haydock(
                if data["densified"] else {}),
         },
     )
-    print(f"[haydock] wrote {out_h5}")
+    log.info(f"[haydock] wrote {out_h5}")
 
 
 def main(argv=None):

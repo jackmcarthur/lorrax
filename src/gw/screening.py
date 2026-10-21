@@ -41,6 +41,10 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import collectives, jax_profile
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 import common.timing as timing
 from . import quadrature_log
 from .gw_config import (
@@ -583,7 +587,7 @@ def compute_screening(
     # Bar/ETA cadence over the W roles; long phases inside also announce via
     # ``timing.section(..., announce=True)`` (see the note at module top).
     bar = LoopProgress(
-        len(requests), print_fn,
+        len(requests),
         title="screening (chi0 -> W)", item_name="W role").start()
     n_requests = len(requests)
 
@@ -636,7 +640,7 @@ def compute_screening(
                 config.minimax_config, print_fn=print_fn,
                 with_odd_kernel=_tr_odd)
             if _tr_odd:
-                print_fn(
+                log.info(
                     f"  {_w}: measured time-reversal verdict is BROKEN — "
                     "χ₀(iω_p) is built with ORDERED particle-hole "
                     "orientations (TR-odd anti-Hermitian channel kept; "
@@ -648,7 +652,7 @@ def compute_screening(
                 quad, abs(req.omega_ry.real),
                 config.minimax_config, print_fn=print_fn)
             if _tr_odd:
-                print_fn(
+                log.info(
                     f"  {_w}: measured time-reversal verdict is BROKEN, "
                     "but a REAL-axis probe cannot carry the TR-odd "
                     "residue (W^c(z)^H = W^c(conj z) is Hermitian at real "
@@ -765,7 +769,7 @@ def compute_screening_model(
         if getattr(config.sigma, "frequency_integration", "pole_model") == "contour_deformation":
             # Contour deformation (gw.cd): the ISDF W(z) is streamed by the
             # Sigma consumer from this handle; nothing is fitted or persisted.
-            print_fn("  screening: contour_deformation -- W(z) streamed at the CD nodes by "
+            log.debug("  screening: contour_deformation -- W(z) streamed at the CD nodes by "
                      "gw.cd.sigma (bank response-quadrature chi0, bank Dyson pair); no W bank written")
             return {"cd_stream": dict(
                 V_q=V_q, imaginary_nodes=int(config.sigma.cd_imaginary_nodes),
@@ -981,7 +985,7 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
         why = ("head_correction = full produced no finalized head sample at "
                "omega = 0 on this MPA plan")
     if why is not None:
-        print_fn(f"  W0_qmunu NOT persisted: {why}.  A BSE on this restart "
+        log.info(f"  W0_qmunu NOT persisted: {why}.  A BSE on this restart "
                  "rebuilds the scalar static response.")
         return None
     handle = W_by_role["shared_pole"]

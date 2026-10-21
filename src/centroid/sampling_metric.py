@@ -18,7 +18,9 @@ import numpy as np
 
 from common.bispinor_init import ALPHA_FS, NO_PAIR_DIRAC_CURRENT_MODEL
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
+from common.log import get_logger
 
+log = get_logger(__name__)
 
 _GAMMA_MODES = ("charge", "transverse")
 
@@ -316,7 +318,7 @@ def build_feature_metric_diagonal(
 
     parents_used, star_plan, _ = _quadrature_tables(wfn, sym)
 
-    rank, world = process_rank_world()
+    _, world = process_rank_world()
     if world > 1 and dist_mesh is None:
         raise ValueError(
             "build_feature_metric_diagonal requires dist_mesh at P>1 so the "
@@ -341,15 +343,13 @@ def build_feature_metric_diagonal(
         n_parents=int(parents_used.size), n_bands=union_hi - union_lo,
         n_band_shards=int(mesh.devices.size), ns=ns,
         ngkmax=int(wfn.ngkmax), n_grid=n_grid, n_windows=len(windows))
-    if rank == 0:
-        print(
-            f"  {mode} metric plan: {len(parents_used)} parent(s) in "
-            f"chunks of {k_chunk}, bands [{union_lo},{union_hi}) in chunks "
-            f"of {band_chunk} over {int(mesh.devices.size)} band shard(s); "
-            f"{len(windows)} density matrix window(s), "
-            f"{sym_rows.size} symmetry row(s); budget "
-            f"{budget / 2**30:.2f} GiB/rank",
-            flush=True)
+    log.debug(
+        f"  {mode} metric plan: {len(parents_used)} parent(s) in "
+        f"chunks of {k_chunk}, bands [{union_lo},{union_hi}) in chunks "
+        f"of {band_chunk} over {int(mesh.devices.size)} band shard(s); "
+        f"{len(windows)} density matrix window(s), "
+        f"{sym_rows.size} symmetry row(s); budget "
+        f"{budget / 2**30:.2f} GiB/rank")
 
     t0 = time.perf_counter()
     row_fields = jnp.zeros((sym_rows.size, n_grid), dtype=jnp.float64)
@@ -385,9 +385,9 @@ def build_feature_metric_diagonal(
             jnp.asarray(row_weights[c0:c0 + k_chunk]), mode=mode)
         del density
         if verbose:
-            print(
+            log.debug(
                 f"    [{mode} metric] {c0 + len(chunk)}/{len(parents_used)} "
-                f"parents after {time.perf_counter() - t0:.1f}s", flush=True)
+                f"parents after {time.perf_counter() - t0:.1f}s")
 
     metric_dev = jnp.zeros(n_grid, dtype=jnp.float64)
     for slot, row in enumerate(sym_rows):
@@ -415,12 +415,12 @@ def build_feature_metric_diagonal(
     if verbose:
         model = ("identity charge vertex" if mode == "charge" else
                  NO_PAIR_DIRAC_CURRENT_MODEL)
-        print(
+        log.debug(
             f"  {mode} feature-Gram diagonal ({model}, left={left_range}, "
             f"right={right_range}, unit band weights, {len(parents_used)} "
             f"parents over {int(mesh.devices.size)} band shard(s), "
             f"{sym_rows.size} pullback row(s)) built in "
-            f"{time.perf_counter() - t0:.2f}s", flush=True)
+            f"{time.perf_counter() - t0:.2f}s")
     return metric
 
 

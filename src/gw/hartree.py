@@ -22,6 +22,10 @@ import numpy as np
 import jax.numpy as jnp
 
 import common.timing as timing
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common.collectives import process_rank_world, resolve_mesh
 from file_io.kin_ion import broadcast_star_wedge
 
@@ -138,7 +142,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                           include_transverse: bool = False,
                           charge_nspinor: int | None = None,
                           bispinor_lift: str = "raw",
-                          print_fn=print,
+                          print_fn=None,
                           return_sharded: bool = False):
     """The exact FFT-grid ⟨mk|V_H|nk⟩ for all k — **(nk, nb, nb) Ry**.
 
@@ -213,7 +217,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
     box_index = wfn.box_index(k=k_spec)
     density_label = ("occupied bands" if exact_unit_occupations else
                      "WFN bands with canonical fractional occupations")
-    print_fn(f"\nBuilding valence density from {density_band_stop} "
+    log.info(f"\nBuilding valence density from {density_band_stop} "
              f"{density_label} (P={world}, {nk_irr} star-wedge k of {nk})...")
     f_spin = spin_degeneracy_factor(wfn)
     occ, kweights = wedge_density_occupations(
@@ -232,8 +236,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
             charge_nspinor=(None if charge_nspinor is None else charge_ns),
             sym=sym,
             sym_perm=sym.fft_grid_pullback(sym.active_symmetry_rows, grid),
-            projection_receipt_fn=projections.append,
-            print_fn=print_fn), dtype=np.float64)
+            projection_receipt_fn=projections.append), dtype=np.float64)
 
     if with_transverse:
         fields = np.asarray(rho_np, dtype=np.float64)
@@ -245,7 +248,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         current_l2 = float(np.linalg.norm(current_np))
         current_g0_relative = current_g0_l2 / max(
             current_l2, np.finfo(np.float64).tiny)
-        print_fn(
+        log.debug(
             "    Dirac-current G=0 diagnostic (J=j/c; gauged V_NL current "
             "is absent): "
             f"||J0||={current_g0_l2:.6e}, ||J||={current_l2:.6e}, "
@@ -256,7 +259,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
                 f"current {len(projections)} times; want exactly one "
                 "(gw.qsgw_density.rho_from_wfns with sym)")
         current_projection = projections[0]
-        print_fn(
+        log.debug(
             "    Dirac-current symmetry projection: "
             f"rows={current_projection.n_symmetry_rows} "
             f"(antiunitary={current_projection.n_antiunitary_rows}), "
@@ -301,7 +304,6 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         jnp.asarray(rho_np), wfn,
         truncation_2d=bool(truncation_2d),
         expected_electrons=expected_electrons,
-        print_fn=print_fn,
     )
     # V_H(r) is replicated (step 2), so it is closed over by the operator
     # as a constant; nothing about it is per-k.
@@ -367,7 +369,7 @@ def direct_field_matrices(wfn, sym, meta, *, truncation_2d: bool,
         nk=nk_irr, cell_volume=float(wfn.cell_volume))
     matrix_label = ("⟨mk|V_H|nk⟩ + <m|sum_i alpha_i A_i|n>"
                     if with_transverse else "⟨mk|V_H|nk⟩")
-    print_fn(f"\n{matrix_label}: one k-scan over {nk_irr} STAR-WEDGE "
+    log.debug(f"\n{matrix_label}: one k-scan over {nk_irr} STAR-WEDGE "
              f"k-points (broadcast to {nk} full-BZ k), "
              f"{geom_matrix.nb} bands sharded over P={world}; "
              f"charge nspinor={charge_ns}...")

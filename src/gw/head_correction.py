@@ -14,6 +14,10 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from jax import shard_map
 from common.units import RYD_TO_EV
 
@@ -337,7 +341,7 @@ def _check_dipole_coverage(
         attrs_nb = int(attrs["nbands"]) if "nbands" in attrs else None
         attrs_nk = int(attrs["nk"]) if "nk" in attrs else None
     except (OSError, KeyError, ValueError) as exc:
-        print_fn(f"  [dipole guard] could not read attrs from {dipole_path} "
+        log.info(f"  [dipole guard] could not read attrs from {dipole_path} "
                  f"({type(exc).__name__}: {exc})")
     if attrs_nk is not None and attrs_nk != int(nk_run):
         sanity.warn(
@@ -347,7 +351,7 @@ def _check_dipole_coverage(
             f"safe reading of this file.",
             print_fn=print_fn)
     n_cond_file = max(0, int(nb_file) - int(nelec))
-    print_fn(
+    log.info(
         f"  dipole.h5 coverage: {int(nb_file)} bands on disk "
         f"({int(nelec)} occ + {n_cond_file} cond)"
         + (f", run Σ window = {int(nb_run)} bands" if nb_run else ""))
@@ -453,7 +457,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
             and params.get("vhead") is not None
             and params.get("whead_0freq") is not None
             and params.get("whead_imfreq") is None):
-        print_fn(
+        log.info(
             f"  [head] MIXED HEAD: 'vhead'/'whead_0freq' override W(q→0) at "
             f"omega=0, but 'whead_imfreq' is unset, so W(q→0) at the PPM "
             f"probe omega={complex(omega)} Ry is COMPUTED from "
@@ -480,7 +484,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
                 f"wcoul0_source=epshead requested {eps0_path}, but it does "
                 "not exist; refusing to substitute s_tensor.")
         if abs(omega_val) > 1.0e-14:
-            print_fn(
+            log.info(
                 f"wcoul0_source=epshead is static-only; using epshead(0) for omega={omega_val} Ry"
             )
         from file_io.epsreader import EPSReader
@@ -1379,9 +1383,9 @@ def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
                 S = np.asarray(stored, dtype=np.complex128)
                 if S.shape == (3, 3):
                     return S, f"restart head tensor ({os.path.basename(restart_file)})"
-                print_fn(f"BSE head: restart head tensor has shape {S.shape}, expected (3,3); ignoring it")
+                log.info(f"BSE head: restart head tensor has shape {S.shape}, expected (3,3); ignoring it")
         except Exception as exc:                    # never crash a load on this
-            print_fn(f"BSE head: could not read S_cart_head ({exc})")
+            log.info(f"BSE head: could not read S_cart_head ({exc})")
 
     if wfn is None or sym is None or meta is None or input_file is None:
         return None, ("no S_cart: the restart carries none and the caller "

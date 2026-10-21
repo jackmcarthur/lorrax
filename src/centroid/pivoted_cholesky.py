@@ -73,6 +73,7 @@ if TYPE_CHECKING:                                                   # pragma: no
 from common import timing
 from common.collectives import device_put_process_local, process_rank
 from common.gpu_utils import minimum_process_budget_gb
+from common.log import get_logger
 from common.pivoted_cholesky import (
     make_sharded_group_block_pivoted_cholesky_select as _make_sharded_block_select,
     make_sharded_pivoted_cholesky_select as _make_sharded_select,
@@ -83,6 +84,7 @@ from . import distribution as dist
 
 import symmetry_maps                                            # noqa: E402
 
+log = get_logger(__name__)
 
 _SELECT_HEARTBEAT_S = 60.0
 
@@ -98,22 +100,20 @@ def _logical_gram_diagonal_extrema(G, n_logical: int):
     return jnp.min(diagonal), jnp.max(diagonal)
 
 
-def _report_logical_gram_diagonal(G, n_logical: int, *, verbose: bool,
-                                  print_fn=print):
-    """Collectively measure a distributed Gram diagonal and print on rank 0."""
+def _report_logical_gram_diagonal(G, n_logical: int, *, verbose: bool):
+    """Collectively measure a distributed Gram diagonal and log it (verbose)."""
     diag_min, diag_max = _logical_gram_diagonal_extrema(G, n_logical)
     jax.block_until_ready((diag_min, diag_max))
     diag_min_value = float(diag_min)
     diag_max_value = float(diag_max)
     if verbose:
-        print_fn(
+        log.debug(
             f"[pivoted_cholesky] G built, shape=({n_logical}, {n_logical}), "
             f"diag range [{diag_min_value:.3e}, {diag_max_value:.3e}]")
     return diag_min, diag_max
 
 
 def _make_group_progress_reporter(
-    print_fn,
     *,
     n_candidates: int,
     n_groups: int,
@@ -132,7 +132,7 @@ def _make_group_progress_reporter(
         start_wall = state["start"] if state["start"] is not None else now
         last_wall = state["last"] if state["last"] is not None else start_wall
         state["last"] = now
-        print_fn(
+        log.debug(
             "[centroid-select-progress] "
             f"group={int(group_number)}/{int(n_groups)} "
             f"id={int(group_id)} size={int(group_size)} "
@@ -152,7 +152,6 @@ def _run_select_with_progress(
     n_candidates: int,
     n_groups: int,
     point_budget: int,
-    print_fn,
     start_progress,
 ):
     """Lower, compile, and execute with phase receipts and 60-second heartbeats.
@@ -172,7 +171,7 @@ def _run_select_with_progress(
         with lock:
             state["phase"] = phase
             state["phase_start"] = now
-        print_fn(
+        log.info(
             f"[centroid-select] phase={phase} state=start "
             f"elapsed_s={now - started:.3f}")
         return now
@@ -199,7 +198,7 @@ def _run_select_with_progress(
                 except Exception:
                     pass
 
-    print_fn(
+    log.info(
         "[centroid-select] state=start "
         f"candidates={n_candidates} groups={n_groups} "
         f"point_budget={point_budget} walltime_owner=step-supervisor")
@@ -209,14 +208,14 @@ def _run_select_with_progress(
         phase_start = set_phase("lowering")
         lowered = select_step.lower(*operands)
         now = time.perf_counter()
-        print_fn(
+        log.info(
             f"[centroid-select] phase=lowering state=done "
             f"wall_s={now - phase_start:.3f} elapsed_s={now - started:.3f}")
 
         phase_start = set_phase("compilation")
         compiled = lowered.compile()
         now = time.perf_counter()
-        print_fn(
+        log.info(
             f"[centroid-select] phase=compilation state=done "
             f"wall_s={now - phase_start:.3f} elapsed_s={now - started:.3f}")
 
@@ -225,7 +224,7 @@ def _run_select_with_progress(
         result = compiled(*operands)
         jax.block_until_ready(result)
         now = time.perf_counter()
-        print_fn(
+        log.info(
             f"[centroid-select] phase=execution state=done "
             f"wall_s={now - phase_start:.3f} elapsed_s={now - started:.3f}")
         return result
@@ -613,7 +612,7 @@ def refuse_unless_select_certified(
             raise RuntimeError("pivoted-Cholesky REFUSES ("
                                + SELECT_MODE_ENV + "=strict):\n" + note)
         for line in note.splitlines():
-            print("  [pivoted_cholesky] " + line)
+            log.info("  [pivoted_cholesky] " + line)
 
     # (3) PAD ROWS AND SENTINELS.  HARD GUARD, not a comment: an
     # out-of-range index would silently index past the candidate list (or
@@ -699,15 +698,15 @@ def _report_point_granularity(G, keep_mask, rank_selected, *, unit,
     if not verbose:
         return
     if pt_rank is None:
-        print(f"  [point rank] {rank_selected} {unit} certified, {n_pts} "
+        log.debug(f"  [point rank] {rank_selected} {unit} certified, {n_pts} "
               f"points delivered, independent directions NOT MEASURED — "
               f"{why}.  That is an absence, not a pass.")
         return
-    print(f"  [point rank] {rank_selected} {unit} certified, {n_pts} points "
+    log.debug(f"  [point rank] {rank_selected} {unit} certified, {n_pts} points "
           f"delivered, {pt_rank} independent directions "
           f"({100.0 * pt_rank / max(1, n_pts):.1f}% of the points)")
     if pt_rank < n_pts:
-        print(f"  [point rank] NOTE: {n_pts - pt_rank} of the "
+        log.debug(f"  [point rank] NOTE: {n_pts - pt_rank} of the "
               f"{n_pts} delivered points add no independent "
               f"direction at tol*max(diag G).  The zeta "
               f"back-solve will truncate about that many modes "
@@ -716,7 +715,7 @@ def _report_point_granularity(G, keep_mask, rank_selected, *, unit,
               f"on the Si anchor deck the 960-point set with ~160 dependent "
               f"points is the most accurate one measured.")
     _note = point_rank_closure_note(G, keep_mask, pt_rank, tol_rel=tol_rel)
-    print("  [point rank] closure: " + (
+    log.debug("  [point rank] closure: " + (
         _note if _note else
         "the rank cut falls in a gap — no degenerate block is "
         "sliced at this tolerance."))
@@ -816,7 +815,6 @@ def prune_candidates_by_pivoted_cholesky(
     tol_rel: float | None = None,
     n_point_budget: int | None = None,
     group_block: bool = False,
-    progress_print_fn=print,
 ):
     """End-to-end pruning: gather wfns → Gram → pivoted Cholesky → keep.
 
@@ -857,9 +855,9 @@ def prune_candidates_by_pivoted_cholesky(
     returns the largest greedy whole-orbit set no larger than the point budget;
     there is no partial last block for the host to repair.
 
-    ``progress_print_fn`` receives phase receipts and one receipt per completely
-    deflated group. Each rank reports its active phase every 60 seconds; the
-    step supervisor owns walltime across all ranks.
+    The select logs phase receipts (INFO) and one receipt per completely
+    deflated group (DEBUG). Each rank reports its active phase every 60 seconds
+    to stderr; the step supervisor owns walltime across all ranks.
 
     ``tol_rel`` overrides the select's stopping tolerance (relative to the
     largest initial Gram diagonal).  ``None`` reads
@@ -966,7 +964,7 @@ def prune_candidates_by_pivoted_cholesky(
         window_tag = (f"left={band_range_left}, right={band_range_right}, "
                       f"norms={'on' if band_norms is not None else 'off'}"
                       if asymmetric else f"n_val={n_val}, n_cond={n_cond}")
-        print(f"[pivoted_cholesky] M={M}, n_keep={n_keep}, {window_tag}, "
+        log.debug(f"[pivoted_cholesky] M={M}, n_keep={n_keep}, {window_tag}, "
               f"gamma_mode={gamma_mode} "
               f"(load_wfns 2-D, mesh axes {mesh.axis_names})")
 
@@ -1002,7 +1000,7 @@ def prune_candidates_by_pivoted_cholesky(
     if verbose:
         # The extrema above cover only logical rows; report padding separately.
         if n_pad:
-            print(f"[pivoted_cholesky] zero-pad for the sharded select: "
+            log.debug(f"[pivoted_cholesky] zero-pad for the sharded select: "
                   f"M {M} -> {M_pad} (+{n_pad} inactive rows) so M_pad % "
                   f"{n_dev} == 0; pads carry d=0 and start INACTIVE")
 
@@ -1025,15 +1023,13 @@ def prune_candidates_by_pivoted_cholesky(
         group_id_jax = device_put_process_local(
             dense_pad, NamedSharding(mesh, PartitionSpec(select_axis)))
         group_sizes_host = np.bincount(dense_id, minlength=n_groups)
-        if progress_print_fn is not None:
-            progress_print_fn(
-                "[centroid-select] group-census "
-                f"candidates={M} groups={n_groups} point_budget={budget} "
-                f"size_min={int(group_sizes_host.min())} "
-                f"size_median={float(np.median(group_sizes_host)):.1f} "
-                f"size_max={int(group_sizes_host.max())}")
+        log.debug(
+            "[centroid-select] group-census "
+            f"candidates={M} groups={n_groups} point_budget={budget} "
+            f"size_min={int(group_sizes_host.min())} "
+            f"size_median={float(np.median(group_sizes_host)):.1f} "
+            f"size_max={int(group_sizes_host.max())}")
         progress_fn, start_progress = _make_group_progress_reporter(
-            progress_print_fn or (lambda _message: None),
             n_candidates=M, n_groups=n_groups, point_budget=budget)
         with timing.section("prune.select"):
             select_step = _make_sharded_block_select(
@@ -1044,7 +1040,6 @@ def prune_candidates_by_pivoted_cholesky(
              psd_info) = _run_select_with_progress(
                  select_step, (G, group_id_jax, active_init),
                  n_candidates=M, n_groups=n_groups, point_budget=budget,
-                 print_fn=progress_print_fn or (lambda _message: None),
                  start_progress=start_progress)
         del L
 
@@ -1079,16 +1074,16 @@ def prune_candidates_by_pivoted_cholesky(
             G = G[:M, :M]
         if verbose:
             last = max(n_delivered - 1, 0)
-            print(
+            log.debug(
                 f"[pivoted_cholesky] GROUP-BLOCK: {len(order)} groups -> "
                 f"{n_delivered}/{budget} points, rank={rank_i}; every "
                 f"delivered point updated the residual")
-            print(f"[pivoted_cholesky] picked-pivot residuals: "
-                  f"first={float(d_taken_np[0]):.3e}, "
-                  f"last-delivered={float(d_taken_np[last]):.3e}")
-            print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
-                  f"first={float(trR_over_trG_np[1]):.3e}, "
-                  f"last-delivered={float(trR_over_trG_np[n_delivered]):.3e}")
+            log.debug(f"[pivoted_cholesky] picked-pivot residuals: "
+                      f"first={float(d_taken_np[0]):.3e}, "
+                      f"last-delivered={float(d_taken_np[last]):.3e}")
+            log.debug(f"[pivoted_cholesky] tr(R_k)/tr(G): "
+                      f"first={float(trR_over_trG_np[1]):.3e}, "
+                      f"last-delivered={float(trR_over_trG_np[n_delivered]):.3e}")
         return (keep_idx, rank_i, G, d_final_np, d_taken_np,
                 trR_over_trG_np, psd_host,
                 _unpicked_over_floor(d_final_np, diag_host.max(), tol_rel))
@@ -1141,14 +1136,14 @@ def prune_candidates_by_pivoted_cholesky(
     d_taken_np = np.asarray(d_taken)
     trR_over_trG_np = np.asarray(trR_over_trG)
     if verbose:
-        print(f"[pivoted_cholesky] picked-pivot residuals: "
-              f"first={float(d_taken_np[0]):.3e}, "
-              f"mid={float(d_taken_np[n_keep // 2]):.3e}, "
-              f"last={float(d_taken_np[-1]):.3e}")
-        print(f"[pivoted_cholesky] tr(R_k)/tr(G): "
-              f"first={float(trR_over_trG_np[1]):.3e}, "
-              f"mid={float(trR_over_trG_np[n_keep // 2 + 1]):.3e}, "
-              f"last={float(trR_over_trG_np[n_keep]):.3e}")
+        log.debug(f"[pivoted_cholesky] picked-pivot residuals: "
+                  f"first={float(d_taken_np[0]):.3e}, "
+                  f"mid={float(d_taken_np[n_keep // 2]):.3e}, "
+                  f"last={float(d_taken_np[-1]):.3e}")
+        log.debug(f"[pivoted_cholesky] tr(R_k)/tr(G): "
+                  f"first={float(trR_over_trG_np[1]):.3e}, "
+                  f"mid={float(trR_over_trG_np[n_keep // 2 + 1]):.3e}, "
+                  f"last={float(trR_over_trG_np[n_keep]):.3e}")
 
     piv_np = np.asarray(piv)
     diag_host = np.real(np.asarray(jnp.diag(G)))
@@ -1202,7 +1197,7 @@ def prune_candidates_by_pivoted_cholesky(
                     f"{np.array2string(np.unique(_sizes))}.  Raise N.")
             piv_used = piv_np[:_k]
             if verbose and _k < len(piv_np):
-                print(f"[pivoted_cholesky] ORBIT-FLOORED: "
+                log.debug(f"[pivoted_cholesky] ORBIT-FLOORED: "
                       f"{int(n_point_budget)} points requested -> REALIZED "
                       f"{int(_cum[_k - 1])} ({_k} of {len(piv_np)} picked "
                       f"orbits kept; the next holds "
@@ -1212,7 +1207,7 @@ def prune_candidates_by_pivoted_cholesky(
         in_kept = np.isin(orbit_id_np, picked_orbits)
         keep_idx = np.asarray(cand_idx)[in_kept]
         if verbose:
-            print(f"[pivoted_cholesky] orbit-aware: {len(piv_used)} orbits picked "
+            log.debug(f"[pivoted_cholesky] orbit-aware: {len(piv_used)} orbits picked "
                   f"→ {len(keep_idx)} unfolded centroids (orbit-closed)")
         # R2 — certify at POINT granularity, which is the granularity of the
         # FILE being written.  In ORBIT mode the select's ``rank`` counts
@@ -1364,7 +1359,7 @@ def build_gram_q0_via_loadwfns(
         ]).astype(np.int64)
         weights = w_full[selected_rows]
     if verbose:
-        print(f"[candidate Gram k batches] nk={nk}, batch={k_batch}, "
+        log.debug(f"[candidate Gram k batches] nk={nk}, batch={k_batch}, "
               f"chunks={n_chunks}, WFN faces<= {per_k*k_batch/2**30:.2f} "
               f"GiB/device (fixed tile); same full-zone "
               f"weights and band windows"
@@ -1600,7 +1595,7 @@ def _build_gram_q0_kbatch(
         norms_r_j = None
 
     if verbose:
-        print(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
+        log.debug(f"[pivoted_cholesky] 2-D Gram build via load_wfns: "
               f"nk_tot={sym.nk_tot}, left={left_range} (nb={nb_left}), "
               f"right={right_range} (nb={nb_right}), M={M}, "
               f"gamma_mode={gamma_mode}, "
@@ -1717,7 +1712,7 @@ def _build_gram_q0_kbatch(
     if verbose:
         ntiles, executed_extent, work_inflation = gram_tile_schedule(
             M_cols, col_block)
-        print(
+        log.debug(
             f"[pivoted_cholesky] 2-D blocked Gram: M={M_cols}, "
             f"tile={col_block} ({ntiles}x{ntiles} tiles; "
             f"executed_extent={executed_extent}, "

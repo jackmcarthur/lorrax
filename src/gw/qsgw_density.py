@@ -107,6 +107,10 @@ from jax.experimental.layout import Layout, with_layout_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common.wfn_transforms import _box_kernel, _cached_jit, _sharding_key
 from runtime.padding import pad_axis, spec_divisor
 
@@ -670,8 +674,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         decides one thing, :func:`plan_density_scan`'s route; unknown means
         a band tile is small, the SC eigh's reading.
     print_fn : callable, optional
-        Receives the plan receipt (route, rotated bands, k tile) once per
-        compiled executable.
+        Accepted and unused: the plan receipt (route, rotated bands, k tile)
+        is logged at DEBUG once per compiled executable.
     projection_receipt_fn : callable, optional
         Receives the ``PolarFFTFieldProjection`` of the Dirac current (the
         movement of the raw field and the covariance residual of the
@@ -829,10 +833,9 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     rho_sharding = NamedSharding(mesh, P())
 
     def build():
-        if print_fn is not None:
-            print_fn(f"    density scan: route={plan.route} rotated bands "
-                     f"{plan.n_rot}/{nb_pad} k_tile={plan.k_tile} of {nk} "
-                     f"(G carrier {plan.g_carrier})")
+        log.debug(f"    density scan: route={plan.route} rotated bands "
+                  f"{plan.n_rot}/{nb_pad} k_tile={plan.k_tile} of {nk} "
+                  f"(G carrier {plan.g_carrier})")
         body = _density_scan_body(
             mesh, plan, n_k=nk, nb_carrier=nb_pad, ns=ns, ngkmax=ngkmax,
             grid=grid, scale=scale, f_spin=f_spin,
@@ -1150,7 +1153,7 @@ def distributed_eigh_bands(H, *, mesh: Mesh,
 def hartree_from_orbitals(psi_G, occ, kweights, wfn, *, mesh: Mesh,
                           box_index, fft_grid, truncation_2d: bool,
                           spin_degeneracy: float, sym_perm=None,
-                          expected_electrons=None, print_fn=print):
+                          expected_electrons=None, print_fn=None):
     """ψ → ρ(r) → V_H(r).  ``psi_G`` must ALREADY be the rotated orbitals.
 
     No ``U`` argument: rotate once with :func:`rotate_bands` and pass ψ̃

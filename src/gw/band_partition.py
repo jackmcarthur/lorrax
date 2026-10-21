@@ -45,6 +45,10 @@ import numpy as np
 
 import jax
 import jax.numpy as jnp
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +188,12 @@ class BandPartition:
         splits = (np.diff(mask.astype(np.int8), axis=1) != 0) & (
             gaps <= tolerance_ry)
         for k, n in zip(*np.nonzero(splits)):
-            print_fn(f"  {label} partition: multiplet split at k={k}, "
+            log.info(f"  {label} partition: multiplet split at k={k}, "
                      f"bands {n + band_offset + 1}/{n + band_offset + 2}, "
                      f"gap={gaps[k, n] * RYD_TO_EV * 1000:.6f} meV")
         count = int(splits.sum())
         if not count:
-            print_fn(f"  {label} partition: no boundary splits a multiplet")
+            log.debug(f"  {label} partition: no boundary splits a multiplet")
         return count, (float(gaps[splits].max() * RYD_TO_EV * 1000)
                        if count else 0.0)
 
@@ -228,7 +232,7 @@ class BandPartition:
                     out[k, local] = True
         n_added = int(out.sum() - mask.sum())
         if n_added:
-            print_fn(f"  {label} partition: promoted {n_added} (k,state) members "
+            log.info(f"  {label} partition: promoted {n_added} (k,state) members "
                      "to whole reference multiplets")
         in_range = np.broadcast_to(np.asarray(self.in_range_mask, dtype=bool), out.shape)
         return BandPartition(protected_mask=jnp.asarray(out),

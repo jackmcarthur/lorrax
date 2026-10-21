@@ -14,6 +14,10 @@ import os
 import numpy as np
 
 from .gw_config import HeadCorrection, LorraxConfig, QPSolver, infer_material_class
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 def build_static_screened_w(wfns, V_q, *, config, meta, mesh_xy, sym=None,
@@ -129,7 +133,7 @@ def build_static_w_from_restart(filename, input_file, mesh_xy, *, print_fn=print
         W = meta.mu_basis.unpack_axis(W, -1)
     finally:
         take_pre_unfold("W0_qmunu")
-    print_fn("BSE: built static RPA W(0) and q->0 head from authenticated WFN + centroids")
+    log.info("BSE: built static RPA W(0) and q->0 head from authenticated WFN + centroids")
     return W, head, float(meta.cell_volume)
 
 
@@ -161,7 +165,7 @@ def _shared_pole_static_body(shared_pole, V_q, *, meta, mesh_xy, print_fn):
             sym_idx_q=V_op.sym_idx, sym_perm=V_op.sym_perm,
             L_table=V_op.L_table, n_sym_spatial=V_op.n_sym_spatial,
             mu_basis=getattr(meta, "mu_basis", None))
-    print_fn("  W0 (restart): V + Wc(omega = 0) of the shared-pole "
+    log.info("  W0 (restart): V + Wc(omega = 0) of the shared-pole "
              f"model {str(shared_pole.get('digest', ''))[:12]}, on {V_op.n_wedge} of "
              f"{V_op.n_full} q")
     return W0

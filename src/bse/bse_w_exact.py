@@ -70,6 +70,9 @@ from .bse_preconditioner import compute_pair_amplitude
 from common.collectives import device_put_process_local, gather_to_host
 from common import rank_criterion
 import common.timing as timing
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -1100,7 +1103,7 @@ def _parse_cols(col_str, n_mu, n_cols, seed):
 def run_w_omega_chain_compare(
     data, mesh_xy, cols, *, freqs_ev, chain_len, chain_sweep,
     ry_to_ev, gmres_max_iter, gmres_tol, disk_tile=None, nlog=None,
-    label="", print_fn=print,
+    label="", print_fn=log.info,
 ):
     """Validate the Lanczos-chain W(omega) model against the shifted-solve oracle.
 
@@ -1302,11 +1305,11 @@ def main(argv=None) -> None:
     n_rmu = int(data["V_q0"].shape[0])
     nlog = int(data["n_rmu"])
     z = (args.omega_ev + 1j * args.eta_ev) / args.ry_to_ev
-    print(f"chi0 window: n_val={data['n_val']} n_cond={data['n_cond']} "
-          f"(full occ x cond; matches GW compute_screening), "
-          f"nk={int(data['nkx']*data['nky']*data['nkz'])}, N_mu={nlog} (padded {n_rmu})")
-    print(f"omega={args.omega_ev} eV  eta={args.eta_ev} eV  z={z:.6e} Ry  "
-          f"gmres(max_iter={args.gmres_max_iter}, tol={args.gmres_tol:g}); head-less bodies")
+    log.info(f"chi0 window: n_val={data['n_val']} n_cond={data['n_cond']} "
+             f"(full occ x cond; matches GW compute_screening), "
+             f"nk={int(data['nkx']*data['nky']*data['nkz'])}, N_mu={nlog} (padded {n_rmu})")
+    log.info(f"omega={args.omega_ev} eV  eta={args.eta_ev} eV  z={z:.6e} Ry  "
+             f"gmres(max_iter={args.gmres_max_iter}, tol={args.gmres_tol:g}); head-less bodies")
 
     if args.compare_wq:
         # Finite-q generalization: loop the symmetry-reduced (IBZ) q-grid one at a
@@ -1330,10 +1333,10 @@ def main(argv=None) -> None:
         # single compiled block-GMRES engine.  Result: the engine compiles once
         # (first q) and every later q is dispatch-only (PHASE2_LOG "per-q
         # recompile elimination").
-        print(f"\nFinite-q W_q resolvent cross-check: {len(q_list)} symmetry-reduced "
-              f"q-points (IBZ), one at a time; each vs its own (W0-V)[q_flat] tile")
-        print("shared resolvent engine (matvec/gen/snapshot) built once; per-q "
-              "operands (rolled psi_c/eps_c, V_q tile, diag_h) are runtime args\n")
+        log.info(f"\nFinite-q W_q resolvent cross-check: {len(q_list)} symmetry-reduced "
+                 f"q-points (IBZ), one at a time; each vs its own (W0-V)[q_flat] tile")
+        log.info("shared resolvent engine (matvec/gen/snapshot) built once; per-q "
+                 "operands (rolled psi_c/eps_c, V_q tile, diag_h) are runtime args\n")
         # ``max_resid`` was headed ``max_gmres`` while being filled with
         # ``rr.max()`` — the max relative RESIDUAL, not an iteration count.
         # Anyone reading it as iterations was misled by the header.  The header
@@ -1342,8 +1345,8 @@ def main(argv=None) -> None:
         hdr = (f"{'iq':>3} {'q (kgrid)':>11} {'q_flat':>6} {'max_rel_err':>12} "
                f"{'median':>11} {'max_resid':>11} {'max_it':>7} "
                f"{'build[s]':>9} {'solve[s]':>9}")
-        print(hdr)
-        print("-" * len(hdr))
+        log.info(hdr)
+        log.info("-" * len(hdr))
         rel_by_q = []
         # Per-q state the two callbacks share: the disk tile and the probe
         # columns chosen from it, plus the build/solve wall clocks the table
@@ -1390,9 +1393,9 @@ def main(argv=None) -> None:
                     float(np.linalg.norm(wc[:nlog, i] - T[:nlog, int(nu0)])
                           / np.linalg.norm(T[:nlog, int(nu0)]))
                     for i, nu0 in enumerate(cols)])
-            print(f"{iq:3d} {str((qx, qy, qz)):>11} {q_flat:6d} {rels.max():12.3e} "
-                  f"{np.median(rels):11.3e} {rr.max():11.3e} {int(gi.max()):7d} "
-                  f"{st['t_build']:9.3f} {t_solve:9.3f}")
+            log.info(f"{iq:3d} {str((qx, qy, qz)):>11} {q_flat:6d} {rels.max():12.3e} "
+                     f"{np.median(rels):11.3e} {rr.max():11.3e} {int(gi.max()):7d} "
+                     f"{st['t_build']:9.3f} {t_solve:9.3f}")
             rel_by_q.append(rels.max())
             st["t0"] = time.perf_counter()
 
@@ -1402,15 +1405,15 @@ def main(argv=None) -> None:
                 probe_blocks_for_q=_probe_blocks,
                 gmres_tol=args.gmres_tol, gmres_max_iter=args.gmres_max_iter,
                 on_result=_on_result, build_hook=_build_hook)
-        print("-" * len(hdr))
+        log.info("-" * len(hdr))
         rel_by_q = np.asarray(rel_by_q)
-        print(f"\nmax per-q rel_err = {rel_by_q.max():.3e}   median = "
-              f"{np.median(rel_by_q):.3e}  (q=0 baseline ~2.5e-9). Closure at the GW "
-              f"minimax-quadrature floor confirms W_q = v_q(0-H_RPA^q)^-1 v_q + v_q at "
-              f"every symmetry-reduced q.")
-        print("solve[s] column: first q carries the one-time engine compile; "
-              "later q are warm dispatch (the per-q recompile is gone).")
-        timing.report(print_fn=print, title="--- Timing ---")
+        log.info(f"\nmax per-q rel_err = {rel_by_q.max():.3e}   median = "
+                 f"{np.median(rel_by_q):.3e}  (q=0 baseline ~2.5e-9). Closure at the GW "
+                 f"minimax-quadrature floor confirms W_q = v_q(0-H_RPA^q)^-1 v_q + v_q at "
+                 f"every symmetry-reduced q.")
+        log.info("solve[s] column: first q carries the one-time engine compile; "
+                 "later q are warm dispatch (the per-q recompile is gone).")
+        timing.report(print_fn=log.info, title="--- Timing ---")
         return
 
     if args.w_omega_chain:
@@ -1459,7 +1462,7 @@ def main(argv=None) -> None:
                     chain_sweep=sweep, ry_to_ev=args.ry_to_ev,
                     gmres_max_iter=args.gmres_max_iter, gmres_tol=args.gmres_tol,
                     disk_tile=Tq, nlog=nlog, label=f"q=({qx},{qy},{qz})")
-        timing.report(print_fn=print, title="--- Timing ---")
+        timing.report(print_fn=log.info, title="--- Timing ---")
         return
 
     matvec, diag_h, gen, snapshot, sh = _build_rpa_resolvent(mesh_xy, data)
@@ -1474,8 +1477,8 @@ def main(argv=None) -> None:
             col_norm = np.linalg.norm(T[:nlog, :nlog], axis=0)
         else:
             cols, col_norm = _select_compare_cols(T, nlog, args.n_cols, args.seed)
-        print(f"\nW(0) resolvent cross-check: {len(cols)} columns "
-              f"(largest-|W0-V| + random)\n")
+        log.info(f"\nW(0) resolvent cross-check: {len(cols)} columns "
+                 f"(largest-|W0-V| + random)\n")
 
         with timing.section("w_exact.resolve"):
             W_tile, resids, gm_iters = _resolve_wc_columns(
@@ -1489,8 +1492,8 @@ def main(argv=None) -> None:
 
         hdr = (f"{'nu':>5} {'||(W0-V)_col||':>15} {'rel_err':>11} "
                f"{'max|Delta|':>12} {'gmres_resid':>12} {'gmres_it':>9}")
-        print(hdr)
-        print("-" * len(hdr))
+        log.info(hdr)
+        log.info("-" * len(hdr))
         rel_all = []
         for i, nu0 in enumerate(cols):
             tcol = T[:nlog, int(nu0)]
@@ -1498,27 +1501,27 @@ def main(argv=None) -> None:
             rel = float(np.linalg.norm(dcol) / np.linalg.norm(tcol))
             mx = float(np.max(np.abs(dcol)))
             rel_all.append(rel)
-            print(f"{int(nu0):5d} {col_norm[int(nu0)]:15.4e} {rel:11.3e} "
-                  f"{mx:12.3e} {resids[i]:12.3e} {int(gm_iters[i]):9d}")
+            log.info(f"{int(nu0):5d} {col_norm[int(nu0)]:15.4e} {rel:11.3e} "
+                     f"{mx:12.3e} {resids[i]:12.3e} {int(gm_iters[i]):9d}")
         rel_all = np.asarray(rel_all)
         resids = resids[:len(cols)]
         gm_iters = gm_iters[:len(cols)]
-        print("-" * len(hdr))
-        print(f"max rel_err = {rel_all.max():.3e}   median = {np.median(rel_all):.3e}   "
-              f"max gmres_resid = {resids.max():.3e}")
+        log.info("-" * len(hdr))
+        log.info(f"max rel_err = {rel_all.max():.3e}   median = {np.median(rel_all):.3e}   "
+                 f"max gmres_resid = {resids.max():.3e}")
         # An iteration count EQUAL to the cap means truncation, not convergence.
-        print(f"gmres iters: mean = {gm_iters.mean():.1f}, max = {int(gm_iters.max())} "
-              f"(cap {args.gmres_max_iter}"
-              + (" — TRUNCATED at the cap on at least one column"
+        log.info(f"gmres iters: mean = {gm_iters.mean():.1f}, max = {int(gm_iters.max())} "
+                 f"(cap {args.gmres_max_iter}"
+                 + (" — TRUNCATED at the cap on at least one column"
                  if int(gm_iters.max()) >= args.gmres_max_iter else "") + ")")
-        print("\nInterpretation: W0_qmunu on disk is the RPA static screened "
-              "Coulomb W(0) from chi0 = chi0(iw) minimax-quadratured to w=0; the "
-              "resolvent uses the EXACT 1/(e_c-e_v) static denominator, so rel_err "
-              "is the GW minimax-integration noise (solver residual is orders "
-              "smaller). Closure at this floor confirms W0 = v(0-H_RPA)^-1 v + v.")
+        log.info("\nInterpretation: W0_qmunu on disk is the RPA static screened "
+                 "Coulomb W(0) from chi0 = chi0(iw) minimax-quadratured to w=0; the "
+                 "resolvent uses the EXACT 1/(e_c-e_v) static denominator, so rel_err "
+                 "is the GW minimax-integration noise (solver residual is orders "
+                 "smaller). Closure at this floor confirms W0 = v(0-H_RPA)^-1 v + v.")
     else:
         cols = _parse_cols(args.cols, nlog, args.n_cols, args.seed)
-        print(f"\nComputing {len(cols)} W_c(omega) column(s) of N_mu={nlog}")
+        log.info(f"\nComputing {len(cols)} W_c(omega) column(s) of N_mu={nlog}")
         with timing.section("w_exact.resolve"):
             W_tile, resids, gm_iters = _resolve_wc_columns(
                 cols, z, data, matvec, diag_h, gen, snapshot, sh,
@@ -1539,11 +1542,11 @@ def main(argv=None) -> None:
             h5.create_dataset("gmres_resid", data=resids)
             h5.create_dataset("gmres_iters", data=gm_iters.astype(np.int32))
             h5.create_dataset("Wc", data=wc)
-        print(f"Wrote {len(cols)} Wc columns (max gmres_resid={resids.max():.2e}, "
-              f"max gmres_it={int(gm_iters.max())}/{args.gmres_max_iter}) "
-              f"to {args.out}")
+        log.info(f"Wrote {len(cols)} Wc columns (max gmres_resid={resids.max():.2e}, "
+                 f"max gmres_it={int(gm_iters.max())}/{args.gmres_max_iter}) "
+                 f"to {args.out}")
 
-    timing.report(print_fn=print, title="--- Timing ---")
+    timing.report(print_fn=log.info, title="--- Timing ---")
 
 
 if __name__ == "__main__":

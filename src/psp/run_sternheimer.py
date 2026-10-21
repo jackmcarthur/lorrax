@@ -75,6 +75,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from common import Meta
+from common.log import get_logger, message
 from common.wfn_transforms import load_kpoint_fftbox
 from wfn_loader import WfnLoader                                    # noqa: E402
 from psp.dft_operators import setup_H_k_from_kvec
@@ -88,6 +89,9 @@ from solvers.sternheimer_precond import (
     tpa_preconditioner_diag,
 )
 from solvers.sternheimer_solve import SternheimerOp, sternheimer_solve
+
+log = get_logger(__name__)
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Jitted real-space kernels (single-GPU; no sharding)
 # ═══════════════════════════════════════════════════════════════════════
@@ -835,8 +839,8 @@ def _load_unfolded_wfns(wfn, sym, meta, nb_load: int, verbose: bool):
 
     if verbose:
         dt = time.perf_counter() - t0
-        print(f"  Unfolded WFN buffer: shape {psi_box_full.shape}  "
-              f"({psi_box_full.nbytes / 1e9:.2f} GB)  in {dt:.1f}s")
+        log.debug(f"  Unfolded WFN buffer: shape {psi_box_full.shape}  "
+                  f"({psi_box_full.nbytes / 1e9:.2f} GB)  in {dt:.1f}s")
     return psi_box_full, en_full
 
 
@@ -1092,12 +1096,12 @@ def run_sternheimer(
 
     verbose = verbose and jax.process_index() == 0
     if verbose:
-        print(f"Sternheimer G=0 column driver")
-        print(f"  wfn       = {wfn_path}")
-        print(f"  pseudos   = {pseudo_dir}")
-        print(f"  iq_list   = {iq_list}")
-        print(f"  tol/iter  = {tol:.0e} / {max_iter}")
-        print(f"  trunc_2d  = {truncation_2d}")
+        log.info(f"Sternheimer G=0 column driver")
+        log.info(f"  wfn       = {wfn_path}")
+        log.info(f"  pseudos   = {pseudo_dir}")
+        log.info(f"  iq_list   = {iq_list}")
+        log.info(f"  tol/iter  = {tol:.0e} / {max_iter}")
+        log.info(f"  trunc_2d  = {truncation_2d}")
 
     # ── Load WFN + SymMaps + Meta ──────────────────────────────────────
     t_setup = time.perf_counter()
@@ -1125,17 +1129,17 @@ def run_sternheimer(
     # ── Pseudos + V_scf ────────────────────────────────────────────────
     pseudos = load_pseudopotentials(pseudo_dir)
     if verbose:
-        print(f"\n── ρ_val from full-BZ sum ──")
+        log.info(f"\n── ρ_val from full-BZ sum ──")
     rho_val = build_rho_val_from_wfn(wfn, sym, meta, n_occ, verbose=verbose)
     if verbose:
-        print(f"\n── V_scf ──")
+        log.info(f"\n── V_scf ──")
     V_scf, V_loc, vnl_setup = build_dft_potentials(
         wfn, pseudos, rho_val,
         truncation_2d=truncation_2d, verbose=verbose)
 
     # ── Unfolded WFN buffer (all k, all bands we need) ─────────────────
     if verbose:
-        print(f"\n── Loading unfolded ψ (nk_full={sym.nk_tot}, nb={nb_load}) ──")
+        log.info(f"\n── Loading unfolded ψ (nk_full={sym.nk_tot}, nb={nb_load}) ──")
     psi_box_full, en_full = _load_unfolded_wfns(wfn, sym, meta, nb_load, verbose=verbose)
     # FFT-box layout: (nk_full, nb, ns, nx, ny, nz)
 
@@ -1167,11 +1171,11 @@ def run_sternheimer(
         Gk_int = jnp.stack([H_k.Gx, H_k.Gy, H_k.Gz], axis=-1).astype(jnp.int32)
         H_cache.append((H_k, Gk_int))
     if verbose:
-        print(f"  H_k cache: {len(H_cache)} Hamiltonians, ngkmax={ngkmax}")
+        log.debug(f"  H_k cache: {len(H_cache)} Hamiltonians, ngkmax={ngkmax}")
 
     if verbose:
         dt = time.perf_counter() - t_setup
-        print(f"\n  Setup complete ({dt:.1f}s)")
+        log.info(f"\n  Setup complete ({dt:.1f}s)")
 
     # ── α_pv: level-shift for QE-DFPT-style positive-definite solve ────
     # Following LR_Modules/setup_alpha_pv.f90:  α_pv = 2·(E_max − E_min) of the
@@ -1187,8 +1191,8 @@ def run_sternheimer(
     en_occ = np.asarray(en_full[:, :n_occ], dtype=np.float64)
     alpha_pv = float(2.0 * (en_occ.max() - en_occ.min()))
     if verbose:
-        print(f"\n  α_pv = 2·(E_max − E_min) = {alpha_pv:.3f} Ry "
-              f"(from {n_occ} occupied bands × {int(sym.nk_tot)} k-points)")
+        log.info(f"\n  α_pv = 2·(E_max − E_min) = {alpha_pv:.3f} Ry "
+                 f"(from {n_occ} occupied bands × {int(sym.nk_tot)} k-points)")
 
     # ── HDF5 output ────────────────────────────────────────────────────
     out_h5 = h5py.File(output_path, "w")
@@ -1340,7 +1344,7 @@ def run_sternheimer(
     for q_idx, iq_red in enumerate(iq_list):
         qvec = bgw_signed_q_representative(wfn.kpoints[iq_red])
         if verbose:
-            print(f"\n══ q[{q_idx}] = {qvec}   (signed; reduced idx {iq_red}) ══")
+            log.info(f"\n══ q[{q_idx}] = {qvec}   (signed; reduced idx {iq_red}) ══")
 
         Gprime_int = build_Gprime_list(qvec, wfn, ng_out)
         Gprime_j = jnp.asarray(Gprime_int)
@@ -1364,12 +1368,12 @@ def run_sternheimer(
         # ── Sanity print ──
         if verbose:
             dt = time.perf_counter() - t_q
-            print(f"  ── q[{q_idx}] summary ──")
-            print(f"    χ_{{00}}(q, 0)           = {chi_col_np[0]:+.6e}")
+            log.info(f"  ── q[{q_idx}] summary ──")
+            log.info(f"    χ_{{00}}(q, 0)           = {chi_col_np[0]:+.6e}")
             if np.allclose(qvec, 0.0):
                 max_abs = float(np.max(np.abs(chi_col_np)))
-                print(f"    q=0 check: max|χ(G')|   = {max_abs:.3e}  (expect ~0)")
-            print(f"    time                     = {dt:.2f}s")
+                log.info(f"    q=0 check: max|χ(G')|   = {max_abs:.3e}  (expect ~0)")
+            log.info(f"    time                     = {dt:.2f}s")
 
         # ── Write to HDF5 ──
         grp = out_h5.create_group(f"q_{q_idx}")
@@ -1389,7 +1393,7 @@ def run_sternheimer(
     # ══════════════════════════════════════════════════════════════════
     if with_s_tensor:
         if verbose:
-            print(f"\n══ S-tensor at q=0 ══")
+            log.info(f"\n══ S-tensor at q=0 ══")
         kvec_k_stack    = jnp.asarray(kpts_all, dtype=jnp.float64)
         precond_stack_S = jnp.stack([
             tpa_preconditioner_diag(H_cache[ik][0].T_diag, K_bar_sq_full[ik])
@@ -1453,10 +1457,10 @@ def run_sternheimer(
         S_total = s_tensor_crystal_hessian_to_cartesian_q2(S_hess_crys, B_cart)
         if verbose:
             dt = time.perf_counter() - t_S
-            print(f"  S-tensor (Cartesian q²-coefficient, t={dt:.2f}s):")
+            log.info(f"  S-tensor (Cartesian q²-coefficient, t={dt:.2f}s):")
             for row in S_total.real:
-                print(f"    {row[0]:+.4e}  {row[1]:+.4e}  {row[2]:+.4e}")
-            print(f"  imag max: {float(np.max(np.abs(S_total.imag))):.2e}")
+                log.info(f"    {row[0]:+.4e}  {row[1]:+.4e}  {row[2]:+.4e}")
+            log.info(f"  imag max: {float(np.max(np.abs(S_total.imag))):.2e}")
         out_h5.create_dataset('s_tensor_q0', data=S_total)
         out_h5.attrs['s_tensor_convention'] = "cartesian_q2_coefficient"
         out_h5.attrs['s_tensor_note'] = (
@@ -1471,7 +1475,7 @@ def run_sternheimer(
 
     out_h5.close()
     if verbose:
-        print(f"\nWrote → {output_path}")
+        log.info(f"\nWrote → {output_path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1548,8 +1552,12 @@ def main(argv=None):
         from common.jax_compile_cache import ensure_jax_compile_cache
         ensure_jax_compile_cache()
     except Exception as _e:
-        if jax.process_index() == 0:
-            print(f"  [jax compile cache] skipped: {_e}", flush=True)
+        log.warning(
+            f"JAX compile cache skipped: {_e}",
+            extra=message(id="jax_compile_cache_skipped",
+                          found=("compile cache", str(_e)),
+                          fix="check the compile-cache directory is writable; "
+                              "this run recompiles every kernel"))
 
     run_sternheimer(
         wfn_path=wfn_path,

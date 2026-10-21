@@ -17,6 +17,10 @@ import time
 import jax
 from lxkit import ordered_norm, ordered_sum
 from common import timing
+from common.log import get_logger, message, record
+
+log = get_logger(__name__)
+
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
 import jax.numpy as jnp
@@ -1819,8 +1823,7 @@ def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
         row = dict(q_full=q_full, z_ry=[float(z[s].real), float(z[s].imag)],
                    **{k: float(x) for k, x in zip(names, values)})
         receipt.setdefault("tr_odd_census", []).append(row)
-        if jax.process_index() == 0:
-            print("TRBANK tr_odd_census " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
+        log.debug("TRBANK tr_odd_census " + " ".join(f"{k}={row[k]}" for k in row))
 
 
 def response_groups(z, group_size):
@@ -2027,8 +2030,7 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
                 padded = tuple((min(a, c), max(b, d)) for (a, b), (c, d) in zip(padded, held))
             session["band_ranges"] = padded
         band_ranges = session["band_ranges"]
-    if jax.process_index() == 0:
-        print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
+    log.debug(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
     support = dict(f=f, u=u, refs=refs, lo=lo, hi=hi, mu=mu, decay_rate=decay_rate,
                    amplitude=amplitude, band_ranges=band_ranges)
     spec = getattr(meta, "shared_pole_response_blocks", None)
@@ -2166,15 +2168,14 @@ def _block_quadrature(meta, sample_plan, receipt, support, *, group_size, print_
         groups=[dict(members=[int(m) for m in g["members"]], count=g["count"], passes=len(g["passes"]),
                      sampled_error=g["sampled_error"].tolist()) for g in groups])
     receipt["nodes"] = int(sum(g["count"] for g in groups))
-    if jax.process_index() == 0:
-        for p, r in zip(plans, reused):
-            print_fn(f"Response block {p['name']}: interval (eV) [{p['lo']*RYD_TO_EV:.8g}, "
-                     f"{p['hi']*RYD_TO_EV:.8g}], {len(p['rule_groups'])} rule group(s), "
-                     f"{sum(g['count'] for g in p['rule_groups'])} nodes; "
-                     + ("held" if r else "constructed"), flush=True)
-        print_fn(f"Response quadrature: {len(z)} samples in {len(groups)} evaluation group(s) "
-                 f"(planned size {group_size}), {sum(len(g['passes']) for g in groups)} block passes, "
-                 f"{receipt['nodes']} total Green-pair evaluations", flush=True)
+    for p, r in zip(plans, reused):
+        log.debug(f"Response block {p['name']}: interval (eV) [{p['lo']*RYD_TO_EV:.8g}, "
+                 f"{p['hi']*RYD_TO_EV:.8g}], {len(p['rule_groups'])} rule group(s), "
+                 f"{sum(g['count'] for g in p['rule_groups'])} nodes; "
+                 + ("held" if r else "constructed"))
+    log.debug(f"Response quadrature: {len(z)} samples in {len(groups)} evaluation group(s) "
+             f"(planned size {group_size}), {sum(len(g['passes']) for g in groups)} block passes, "
+             f"{receipt['nodes']} total Green-pair evaluations")
     return dict(plan=None, groups=groups, slots=group_size, f=support["f"], u=support["u"],
                 refs=support["refs"], band_ranges=support["band_ranges"],
                 blocks=[dict(name=blk["name"], f=blk["f"], u=blk["u"], refs=blk["refs"],
@@ -2234,8 +2235,8 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
         plan = old
     else:
         if failed and jax.process_index() == 0:
-            print_fn("Response rule rebuilt at a held map; failed reuse test: "
-                     + "; ".join(failed), flush=True)
+            log.warning("Response rule rebuilt at a held map; failed reuse test: "
+                     + "; ".join(failed))
         pad = RESPONSE_HOLD_PAD_EV/RYD_TO_EV if session is not None else 0.
         plan = dict(lo=snap_outward(support["lo"]-pad, 1., -1),
                     hi=snap_outward(support["hi"]+pad, 1., +1), z=z, metallic=metallic,
@@ -2252,9 +2253,8 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
         pencil = response_pencil_source()
         if options.get("capacity") not in (None, minimax.RESPONSE_RULE_CAPACITY):
             pencil = None                     # the device pencils serve the bank's rank only
-        if jax.process_index() == 0:
-            print_fn("Response rule pencils: " + ("device QR + dilation eigh, decisions on host"
-                     if pencil is not None else "host LAPACK"), flush=True)
+        log.debug("Response rule pencils: " + ("device QR + dilation eigh, decisions on host"
+                 if pencil is not None else "host LAPACK"))
 
         def tree(members):
             local = {m: i for i, m in enumerate(members)}
@@ -2290,16 +2290,21 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
         decay_rate_ry_inv=plan["decay_rate"], occupation_amplitude=plan["amplitude"], reused=reuse)
     receipt["nodes"] = int(sum(g["count"] for g in groups))
     if jax.process_index() == 0:
-        print_fn(f"Response interval (eV): [{plan['lo']*RYD_TO_EV:.8g}, {plan['hi']*RYD_TO_EV:.8g}]", flush=True)
-        print_fn(f"Response quadrature: {len(z)} samples in {len(groups)} shared-node groups "
+        log.debug(f"Response interval (eV): [{plan['lo']*RYD_TO_EV:.8g}, {plan['hi']*RYD_TO_EV:.8g}]")
+        log.debug(f"Response quadrature: {len(z)} samples in {len(groups)} shared-node groups "
                  f"(planned size {group_size}); each node is one Green pair serving value, "
-                 "ds and both orientations; " + ("reused" if reuse else "constructed"), flush=True)
+                 "ds and both orientations; " + ("reused" if reuse else "constructed"))
         for g in groups:
             points = " ".join(f"{complex(z[m])*RYD_TO_EV:.4g}" for m in g["members"])
-            print_fn(f"Response quadrature: nodes {g['count']:4d}  error {g['sampled_error'].max():.2e}  "
-                     f"kappa {g['coefficient_mass'].max():.2e}  z(eV) {points}", flush=True)
-        print_fn(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations "
-                 f"(value + derivative, forward + reverse)", flush=True)
+            log.debug(f"Response quadrature: nodes {g['count']:4d}  error {g['sampled_error'].max():.2e}  "
+                     f"kappa {g['coefficient_mass'].max():.2e}  z(eV) {points}")
+        log.debug(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations "
+                 f"(value + derivative, forward + reverse)",
+                  extra=record("response.quadrature", samples=len(z), nodes=receipt["nodes"],
+                               interval_ev=[plan["lo"] * RYD_TO_EV, plan["hi"] * RYD_TO_EV],
+                               z_ev=[[complex(v).real * RYD_TO_EV, complex(v).imag * RYD_TO_EV]
+                                     for v in z],
+                               reused=bool(reuse), rule=receipt["rule"]))
     return dict(plan=plan, groups=groups, slots=group_size, f=f, u=u, refs=refs,
                 band_ranges=support["band_ranges"])
 
@@ -3181,7 +3186,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 device_bytes_per_rank=max(stream_bank.in_flight*pass_carry, 3*carry_per_sample))
     # The group accumulator is all-P sharded. Dense work and slab I/O batch
     # the irreducible parents of one frequency, with their own admission.
-    progress = LoopProgress(len(z), print_fn, title="response frequency integration",
+    progress = LoopProgress(len(z), title="response frequency integration",
                             item_name="frequency", max_updates=len(z)).start()
 
     def read_constant(span, bank_handle):
@@ -3495,21 +3500,28 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         layout = ("" if passes is None else
                   f", {len(passes.passes)} row pass(es) of <= {max(r for _, r in passes.passes)} "
                   f"local rows, {passes.chunk} node(s) per accumulate")
-        print_fn(f"Response quadrature: chi build {receipt['seconds'].get('direct_dispatch', 0.):.2f} s "
+        log.debug(f"Response quadrature: chi build {receipt['seconds'].get('direct_dispatch', 0.):.2f} s "
                  f"({len(rules['groups'])} group(s), {receipt['correlation_count']} node evaluations"
-                 f"{layout}); bank write {receipt['seconds'].get('io', 0.):.2f} s", flush=True)
+                 f"{layout}); bank write {receipt['seconds'].get('io', 0.):.2f} s")
         residence = receipt["bank_residence"]
-        print_fn(f"Response quadrature: chi bank {residence['residence']}, "
-                 f"{residence['bytes_per_rank'] / 2**30:.2f} GiB/rank; {residence['reason']}"
-                 + ("" if residence["residence"] == "device" else
-                    f"; q spans of {residence.get('q_width')} parents"
-                    f"; write {receipt['seconds']['bank_write']:.2f} s, read "
-                    f"{receipt['seconds']['bank_read']:.2f} s, waited {receipt['seconds']['bank_wait']:.2f} s"
-                    + (f"; {residence['rereads']} span(s) re-read after a failed check"
-                       if residence.get("rereads") else "")),
-                 flush=True)
-        print_fn("Response quadrature: seconds " + " ".join(
-            f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
+        log.debug(f"Response quadrature: chi bank {residence['residence']}, "
+                  f"{residence['bytes_per_rank'] / 2**30:.2f} GiB/rank; {residence['reason']}"
+                  + ("" if residence["residence"] == "device" else
+                     f"; q spans of {residence.get('q_width')} parents"
+                     f"; write {receipt['seconds']['bank_write']:.2f} s, read "
+                     f"{receipt['seconds']['bank_read']:.2f} s, waited {receipt['seconds']['bank_wait']:.2f} s"
+                     + (f"; {residence['rereads']} span(s) re-read after a failed check"
+                        if residence.get("rereads") else "")))
+        if residence["residence"] != "device" and residence.get("rereads"):
+            log.warning(f"Response quadrature: {residence['rereads']} chi bank span(s) "
+                        "re-read after a failed check",
+                        extra=message("response_bank_span_reread"))
+        log.debug("Response quadrature: seconds " + " ".join(
+            f"{key}={value:.3f}" for key, value in receipt["seconds"].items()),
+                  extra=record("response.bank", samples=len(z),
+                               node_evaluations=receipt["correlation_count"],
+                               groups=len(rules["groups"]), seconds=dict(receipt["seconds"]),
+                               residence=dict(residence)))
     del roots, held
     ledger.live_stages = caller_live
     receipt["stream_passes"] = len(rules["groups"])
@@ -3665,8 +3677,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
         retained_bytes_per_rank=0, layout=wfns.layout,
         scope="the stream reads the resident raw-parent carriers of both families")
     before = time.monotonic()
-    if jax.process_index() == 0:
-        print("photon bank: preparing shared vertex endpoints and bare V", flush=True)
+    log.debug("photon bank: preparing shared vertex endpoints and bare V")
     with timing.section("bank.photon_endpoints"):
         vertex = prepare_photon_carriers(wfns, wfns_transverse, mu_bases,
                                          mesh_xy=mesh_xy, layout=layout)
@@ -3690,8 +3701,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 layout=layout, mesh=mesh_xy, wfn=wfn, meta=meta)
     receipt["seconds"]["endpoints_and_V"] = time.monotonic()-before
     before = time.monotonic()
-    if jax.process_index() == 0:
-        print("photon bank: centroid D and static grid reference", flush=True)
+    log.debug("photon bank: centroid D and static grid reference")
     with timing.section("bank.static_contact"):
         from file_io.shared_pole_store import write_bank_contact
         grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
@@ -3744,15 +3754,13 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 dyson_residual=direct_head["dyson_residual"],
                 static_limit="Thomas-Fermi at z=0; dynamic Drude for Im(z)>0")
     before = time.monotonic()
-    if jax.process_index() == 0:
-        print("photon bank: exact moments and W_infinity", flush=True)
+    log.debug("photon bank: exact moments and W_infinity")
     receipt["moments"] = compute_moment_bank(wfns, meta, config, mesh_xy=mesh_xy,
         sym=sym, bank_io=bank, vertex=vertex, contact=contact,
         direct_head=direct_head)
     receipt["seconds"]["moments"] = time.monotonic()-before
     before = time.monotonic()
-    if jax.process_index() == 0:
-        print("photon bank: ordered samples and derivatives", flush=True)
+    log.debug("photon bank: ordered samples and derivatives")
     receipt["samples"] = produce_sample_bank(wfns, meta, config, mesh_xy=mesh_xy,
         sym=sym, sample_plan=sample_plan, bank_io=bank, vertex=vertex,
         contact=contact, direct_head=direct_head, print_fn=print_fn)

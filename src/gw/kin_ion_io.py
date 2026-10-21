@@ -62,10 +62,17 @@ import jax.numpy as jnp
 import h5py
 
 from common import Meta
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common.gvec_fft_box import refuse_padded_gvecs_without_mask
 from common.collectives import process_rank_world
 import common.timing as timing
-from common.preprocessing_output import PreprocessingProductionReport, soc_setting
+from common.preprocessing_output import (
+    PreprocessingProductionReport, StageSequence, kin_ion_result_rows,
+    soc_text, spin_text, stage_row,
+)
 from common.report_blocks import Setting
 from common.progress import LoopProgress
 from common.scientific_output import (
@@ -282,6 +289,55 @@ _STAGES = (
 )
 
 
+def _report_run_facts(report, *, wfn, sym, meta, ctx, bispinor, sys_dim,
+                      sys_dim_source, nb_eff, nval, nb_window, nband) -> None:
+    """SETTINGS, SYSTEM, SYMMETRY, K POINTS and BAND WINDOWS, once the
+    operator inputs are validated (print-only)."""
+    from psp.pseudos import pseudo_summary_rows
+    report.environment(wfn=wfn, lines=(
+        "Matrix storage : distributed band blocks on the X x Y mesh",
+        "Output writer  : SlabIO collective write from the band shards",
+    ))
+    report.settings((
+        Setting("operator", "T+V_loc+V_NL", "default",
+                "pristine mean field; V_H is built live in G-space by gw_jax"),
+        Setting("sys_dim", str(int(sys_dim)), sys_dim_source,
+                "2D slab: Coulomb truncated along z" if ctx.truncation_2d
+                else "3D bulk: no Coulomb truncation"),
+    ))
+    report.system(
+        natoms=int(np.asarray(wfn.atom_crys).shape[0]),
+        species=sorted(str(name) for name in ctx.pseudos),
+        fft_grid=meta.fft_grid,
+        pseudopotentials=pseudo_summary_rows(ctx.pseudos),
+        rows=(("spin", spin_text(nspin=int(getattr(wfn, "nspin", 1)),
+                                 nspinor=int(wfn.nspinor),
+                                 bispinor=bool(bispinor))),))
+    report.sampling(wfn=wfn, sym=sym)
+    nelec = int(wfn.nelec)
+    report.bands((
+        ("occupied", f"{band_range(0, nelec)} "
+                     f"({float(getattr(wfn, 'num_electrons', nelec)):.5f} electrons)"),
+        ("matrix written", band_range(0, nb_eff)),
+        ("protected", f"valence {band_range(max(0, nelec - nval), nelec)}, "
+                      f"conduction {band_range(nelec, nb_window)}"),
+        ("polarizability", band_range(0, min(nb_eff, nband))),
+        ("WFN bands", band_range(0, int(wfn.nbands))),
+    ))
+
+
+def _degeneracy_check(out_path, wfn, sym, nb_eff) -> dict:
+    """Rank 0: does the written operator have the symmetry of these
+    wavefunctions?  (``psp.operator_checks.check_degeneracy_consistency``)"""
+    from psp.operator_checks import check_degeneracy_consistency
+    en = np.asarray(wfn.energies)
+    en = en[0] if en.ndim == 3 else en          # (nk, nb), Ry
+    with h5py.File(out_path, "r") as h5:
+        return check_degeneracy_consistency(
+            h5["kin_ion"], en[star_wedge_rows(sym)[0], :nb_eff],
+            label="kin_ion (T+V_loc+V_NL)")
+
+
 def main(argv=None):
     args = build_argparser().parse_args(argv)
     rank, world = process_rank_world()
@@ -293,9 +349,9 @@ def main(argv=None):
     with RunSession(RUNTIME, "kin_ion", PreprocessingProductionReport,
                     report_path, stages=_STAGES,
                     driver="kin-ion",
-                    purpose="kinetic, ionic, and Hartree preprocessing") as run:
+                    purpose="kinetic, ionic, and Hartree preprocessing") as run, \
+            StageSequence(3) as stages:
         report = run.report
-        print0 = report.legacy_print
         report.begin(input_file=args.input)
         report.devices(mesh_role="band-matrix axes X x Y")
 
@@ -319,7 +375,7 @@ def main(argv=None):
         sys_dim = int(args.sys_dim if args.sys_dim is not None
                       else (sys_dim_file if sys_dim_file is not None else 3))
 
-        print0(f"Loading WFN: {os.path.basename(wfn_path)}")
+        log.debug(f"Loading WFN: {os.path.basename(wfn_path)}")
         # The module-top ``initialize_communicator_stack()`` already built and
         # clique-warmed the run's mesh; handing it to the loader is what lets
         # ``backend=auto`` pick the collective phdf5 read at P>1 instead of
@@ -377,17 +433,12 @@ def main(argv=None):
             raise SystemExit(
                 f"wfn.grid_rho={tuple(wfn.grid_rho)} != FFT box {tuple(meta.fft_grid)}"
             )
-        report.environment(wfn=wfn, lines=(
-            "Matrix storage : distributed band blocks on the X x Y mesh",
-            "Output writer  : SlabIO collective write from the band shards",
-        ))
-        report.sampling(wfn=wfn, sym=sym)
-        print0(f"Bands: {nb_eff} (deck nband={nband}, sigma window needs {nb_window}), "
+        log.info(f"Bands: {nb_eff} (deck nband={nband}, sigma window needs {nb_window}), "
               f"FFT grid: {meta.fft_grid}, k-points: {sym.nk_tot}")
-        print0(f"sys_dim: {sys_dim}   bispinor: {bispinor}   "
+        log.debug(f"sys_dim: {sys_dim}   bispinor: {bispinor}   "
               f"bispinor_gw: {bispinor_gw_mode.value}   "
               f"nspin/nspinor: {int(getattr(wfn, 'nspin', 1))}/{int(wfn.nspinor)}")
-        print0(f"nval={nval} ncond={ncond} nelec(bands)={int(wfn.nelec)}")
+        log.debug(f"nval={nval} ncond={ncond} nelec(bands)={int(wfn.nelec)}")
 
         # ---- load pseudopotentials ----
         pseudo_dir = args.pseudo_dir or input_dir
@@ -400,7 +451,7 @@ def main(argv=None):
                 pseudos = load_pseudopotentials(fallback)
                 if pseudos:
                     pseudo_source = os.path.abspath(fallback)
-                    print0(f"Found pseudopotentials in {fallback}")
+                    log.info(f"Found pseudopotentials in {fallback}")
                     break
 
         # ---- validate (will raise if pseudos missing or sys_dim invalid) ----
@@ -408,9 +459,13 @@ def main(argv=None):
             pseudos=pseudos, wfn=wfn, sys_dim=sys_dim,
             caller="kin_ion_io",
         )
-        from psp.pseudos import pseudo_summary_lines
-        report.pseudopotentials(pseudo_summary_lines(ctx.pseudos))
-        print0(f"Coulomb truncation: {'2D slab' if ctx.truncation_2d else '3D bulk'}")
+        log.debug(f"Coulomb truncation: {'2D slab' if ctx.truncation_2d else '3D bulk'}")
+        _report_run_facts(
+            report, wfn=wfn, sym=sym, meta=meta, ctx=ctx, bispinor=bispinor,
+            sys_dim=sys_dim, sys_dim_source=(
+                "deck" if sys_dim_file is not None else
+                "cli" if args.sys_dim is not None else "default"),
+            nb_eff=nb_eff, nval=nval, nb_window=nb_window, nband=nband)
 
         # ---- build structure data ----
         atom_positions = np.asarray(wfn.atom_crys, dtype=float)
@@ -432,9 +487,10 @@ def main(argv=None):
         ]
 
         # ---- build V_loc on the FFT grid (k-independent) ----
-        print0("Building V_loc...")
+        stages.begin(1, "Ionic potentials", name="kin_ion.potentials")
+        log.debug("Building V_loc...")
         vloc_progress = LoopProgress(
-            1, report.progress, title="local ionic potential construction",
+            1, title="local ionic potential construction",
             item_name="FFT-grid potential")
         vloc_progress.start()
         with timing.section("build_V_loc"):
@@ -457,13 +513,13 @@ def main(argv=None):
 
         vnl_setup = None
         if pseudos:
-            print0("Building unified V_NL setup...")
+            log.debug("Building unified V_NL setup...")
             # Which PROJECTORS get built — j-resolved (spin-orbit) or j-averaged
             # (scalar-relativistic) — is read from QE's <spinorbit> inside
             # ``build_vnl_setup`` (psp.vnl_ops.resolve_soc_mode).  The choice
             # is upstream of the projector contraction and does not touch it.
             vnl_progress = LoopProgress(
-                1, report.progress, title="nonlocal projector construction",
+                1, title="nonlocal projector construction",
                 item_name="projector setup")
             vnl_progress.start()
             with timing.section("build_V_NL"):
@@ -473,44 +529,19 @@ def main(argv=None):
                     meta,
                     pseudos,
                     nspinor=int(wfn.nspinor),
-                    print_fn=print0,
                 )
             vnl_progress.step()
             vnl_progress.finish()
 
-        k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
         resolved_soc = (vnl_setup.soc_provenance if vnl_setup is not None
                         else "none (no projector setup)")
-        report.settings((
-            Setting("operator", "T+V_loc+V_NL", "default",
-                    "pristine mean field; V_H is built live in G-space by gw_jax"),
-            Setting("sys_dim", str(int(sys_dim)),
-                    "deck" if sys_dim_file is not None else
-                    "cli" if args.sys_dim is not None else "default",
-                    "2D slab: Coulomb truncated along z" if ctx.truncation_2d
-                    else "3D bulk: no Coulomb truncation"),
-            soc_setting(resolved_soc),
-            Setting("k storage", f"{nk_irr} k", "derived",
-                    f"the star wedge; the {int(sym.nk_tot)} full-BZ k are rebuilt on read"),
-        ))
-        report.system(
-            natoms=int(np.asarray(wfn.atom_crys).shape[0]),
-            species=sorted(str(name) for name in ctx.pseudos),
-            fft_grid=meta.fft_grid,
-            lines=(
-                f"Spin channels  : nspin={int(getattr(wfn, 'nspin', 1))}; "
-                f"nspinor={int(wfn.nspinor)}; bispinor={bool(bispinor)}",
-                f"System dimension: {int(sys_dim)}",
-            ))
-        report.bands((
-            f"Electrons      : {float(getattr(wfn, 'num_electrons', wfn.nelec)):.5f}; "
-            f"occupied-band boundary = {int(wfn.nelec)}",
-            f"Matrix written : {band_range(0, nb_eff)}",
-            f"Protected valence: {band_range(max(0, int(wfn.nelec) - nval), int(wfn.nelec))}",
-            f"Protected conduction: {band_range(int(wfn.nelec), nb_window)}",
-            f"Polarizability : {band_range(0, min(nb_eff, nband))}",
-            f"WFN available  : {band_range(0, int(wfn.nbands))}",
-        ))
+        stage_row("V_NL", soc_text(resolved_soc))
+        stages.result(
+            f"V_loc on the {nx} x {ny} x {nz} grid; V_NL projectors for "
+            + (", ".join(sorted(str(name) for name in pseudos)) or "no species"))
+
+        stages.begin(2, "T + V_loc + V_NL matrix", name="kin_ion.matrix")
+        k_spec, _, nk_irr = _wedge_sweep_kspec(wfn, sym)
 
         # ---- compute kin+ion: ONE k-scan, bands sharded over every rank -----
         # ``kin_ion`` stays pristine T + V_loc + V_NL.  The k-partitioned
@@ -556,14 +587,14 @@ def main(argv=None):
                  local_potential_operator(geom, V_loc_r)]
         if vnl_setup is not None:
             terms.append(vnl_operator(geom, vnl_setup))
-        print0(f"\n⟨mk|T+V_loc+V_NL|nk⟩: one k-scan over {nk_irr} STAR-WEDGE "
+        log.debug(f"\n⟨mk|T+V_loc+V_NL|nk⟩: one k-scan over {nk_irr} STAR-WEDGE "
                f"k-points (broadcast to {sym.nk_tot} full-BZ k), "
                f"{geom.nb} bands sharded over P={world}...")
         # ONE ``kin_ion`` timing section around the WHOLE sweep, count 1 — not
         # one per k.  A per-k section would time the dispatch and attribute the
         # compute to whoever happened to block next.
         matrix_progress = LoopProgress(
-            1, report.progress, title="kinetic and ionic matrix construction",
+            1, title="kinetic and ionic matrix construction",
             item_name="distributed band-matrix sweep")
         matrix_progress.start()
         with timing.section("kin_ion") as sweep:
@@ -578,13 +609,16 @@ def main(argv=None):
         matrix_progress.step()
         matrix_progress.finish()
         del psi_G
+        stages.result(f"<mk|T+V_loc+V_NL|nk> on bands {band_range(0, nb_eff)}, "
+                      f"{int(nk_irr)} star-wedge k")
 
         # ---- write: SlabIO from the sweep's shards --------------------------
         # The star-wedge slab, not its full-BZ broadcast: the reader unfolds
         # (file_io.kin_ion).  No rank gathers the (n_orbits, nb, nb) table.
-        print0(f"\nWriting to {out_path}...")
+        stages.begin(3, "Artifact write and operator check", name="kin_ion.write")
+        log.debug(f"\nWriting to {out_path}...")
         write_progress = LoopProgress(
-            1, report.progress, title="kinetic and ionic artifact write",
+            1, title="kinetic and ionic artifact write",
             item_name="output artifact")
         write_progress.start()
         with timing.section("write_h5"):
@@ -605,20 +639,19 @@ def main(argv=None):
         # of the WFN eigenvalues, T+V_loc+V_NL must be a multiple of the
         # identity (psp.operator_checks).  It reads the WRITTEN wedge rows'
         # manifold blocks, paired with the same WFN rows the sweep read.
-        if rank == 0:
-            from psp.operator_checks import check_degeneracy_consistency
-            en = np.asarray(wfn.energies)
-            en = en[0] if en.ndim == 3 else en          # (nk, nb), Ry
-            with h5py.File(out_path, "r") as h5:
-                check_degeneracy_consistency(
-                    h5["kin_ion"], en[star_wedge_rows(sym)[0], :nb_eff],
-                    label="kin_ion (T+V_loc+V_NL)", print_fn=print0)
+        degeneracy = (_degeneracy_check(out_path, wfn, sym, nb_eff)
+                      if rank == 0 else None)
+        stages.result(f"{os.path.basename(out_path)} written")
+        stages.end()
 
-        if rank == 0:
-            print0(f"Wrote {os.path.basename(out_path)}: kin_ion "
-                   f"{(int(nk_irr), nb_eff, nb_eff)} on the star wedge "
-                   f"({sym.nk_tot / max(int(nk_irr), 1):.2f}x compression), "
-                   f"sys_dim={sys_dim}; V_H is not stored.")
+        log.info(f"Wrote {os.path.basename(out_path)}: kin_ion "
+                 f"{(int(nk_irr), nb_eff, nb_eff)} on the star wedge "
+                 f"({sym.nk_tot / max(int(nk_irr), 1):.2f}x compression), "
+                 f"sys_dim={sys_dim}; V_H is not stored.")
+        report.results(kin_ion_result_rows(
+            out_name=os.path.basename(out_path), bands=band_range(0, nb_eff),
+            nk_stored=int(nk_irr), nk_full=int(sym.nk_tot),
+            soc=soc_text(resolved_soc), degeneracy=degeneracy))
         run.complete(files=[
             ("mean-field matrices", "written", out_path),
             ("wavefunctions", "read", wfn_path),

@@ -27,6 +27,10 @@ import jax
 import jax.numpy as jnp
 from jax import shard_map
 from jax.sharding import NamedSharding, PartitionSpec as P
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 __all__ = [
     "match_q_umklapp", "zeta_slots", "coulomb_whitener", "q0_body_policy", "q0_dipole_terms",
@@ -478,7 +482,7 @@ def _bundle_file(source_restart):
     return hits[0]
 
 
-def open_export_source(cfg, mesh, *, print_fn=print):
+def open_export_source(cfg, mesh, *, print_fn=None):
     """Open the producer's bundle, ζ and Coulomb geometry; refuse unsupported decks."""
     import h5py
     from ffi import _services
@@ -534,14 +538,14 @@ def open_export_source(cfg, mesh, *, print_fn=print):
     mu_pad = int(padded_mu_axis(n_mu, mesh).carrier)
     eigh = eigh_plan(mesh, mu_pad)
     n_dev = int(mesh.devices.size)
-    print_fn(f"  eigh        {eigh.describe()}")
-    print_fn(f"  μ faces     {16 * mu_pad**2 / n_dev / 2**30:.3f} GiB per device per matrix "
+    log.info(f"  eigh        {eigh.describe()}")
+    log.info(f"  μ faces     {16 * mu_pad**2 / n_dev / 2**30:.3f} GiB per device per matrix "
              f"(16 μ_pad²/P, P = {n_dev})")
     if jax.process_count() == 1 and n_dev > 1:
-        print_fn(f"  NOTE        eigh native in one process: each solve gathers "
+        log.info(f"  NOTE        eigh native in one process: each solve gathers "
                  f"{16 * mu_pad**2 / 2**30:.3f} GiB per device; one process per device "
                  f"takes the distributed solver")
-    print_fn(f"  bundle      {bundle}\n  zeta        {zeta_path}\n"
+    log.info(f"  bundle      {bundle}\n  zeta        {zeta_path}\n"
              f"  stored q    {q_stored.shape[0]} ({storage}) on k-grid {kgrid}, "
              f"μ {n_mu} (carrier {mu_pad})\n  head        {head['head_correction']}"
              + (f"; q0 wings L/R (3 x {n_mu}) and S_direct stored" if head["L"] is not None
@@ -615,7 +619,7 @@ def read_q_rows(src, iq, mesh):
     return V, W, Z
 
 
-def q_algebra(src, iq, mesh, *, rcond, print_fn=print):
+def q_algebra(src, iq, mesh, *, rcond, print_fn=None):
     """Stored q ``iq`` on faces: ``(Z, B, K, chi, V, Wc, diag)``; gates V and W.
 
     ``Z`` is ζ̃ ``(1, μ_pad, ngkmax)`` μ-sharded; ``B``, ``K``, ``chi = B K Bᴴ``,
@@ -651,7 +655,7 @@ def q_algebra(src, iq, mesh, *, rcond, print_fn=print):
     K = whitened_correlation(Wc, B, mesh=mesh)
     chi = response(B, K, mesh=mesh)
     ev = face_spectrum(K, src.eigh)
-    print_fn(f"  q {iq} {np.round(src.q_stored[iq], 6).tolist()}: |V_rec−V|/|V|={err_v:.2e} "
+    log.info(f"  q {iq} {np.round(src.q_stored[iq], 6).tolist()}: |V_rec−V|/|V|={err_v:.2e} "
              f"|W−Wᴴ|/|W|={herm_w:.2e} K∈[{ev[0]:.4f}, {ev[-1]:.2e}]")
     diag = {"err_v": err_v, "herm_w": herm_w, "k_min": float(ev[0]), "k_max": float(ev[-1])}
     return Z, B, K, chi, V, Wc, diag
@@ -702,7 +706,7 @@ def resolve_ecut(epsmat_ecut, full_ecuts, *, source):
     return e, f"{e} Ry (sub-block of the full sphere {full} Ry: {source})"
 
 
-def plan_export(cfg, src, *, print_fn=print):
+def plan_export(cfg, src, *, print_fn=None):
     """The q rows and G lists of each output file, refusing unmatched q.
 
     With ``bgw_reference`` the q list, q0, ecuts and G order are BerkeleyGW's
@@ -770,7 +774,7 @@ def plan_export(cfg, src, *, print_fn=print):
                         "G = 0 first at q → 0", "the head is row 0", "report")
             rows.append(QPlan(i, int(idx[0]), np.asarray(q), g0[0], qg))
         plans[name] = (np.asarray(q_file), ecuts, rows)
-        print_fn(f"  {name}.h5: {len(rows)} q, ecuts {ecut_receipt}, nmtx "
+        log.info(f"  {name}.h5: {len(rows)} q, ecuts {ecut_receipt}, nmtx "
                  f"{min(r.gspace.nmtx for r in rows)}..{max(r.gspace.nmtx for r in rows)}"
                  f"{'  (q list, q0 and G order from ' + ref + ')' if ref else ''}")
     return plans, comps
@@ -881,7 +885,7 @@ def q0_body_policy(files, sys_dim, q0_body_3d, q0_wings="zero"):
     return "omit_head_wing (3D: the O(1) head-wing term is absent)"
 
 
-def run_epsmat_export(cfg, mesh, *, print_fn=print):
+def run_epsmat_export(cfg, mesh, *, print_fn=None):
     """Write ``eps0mat.h5`` / ``epsmat.h5`` from a LORRAX bundle, one q at a time.
 
     Every q passes three gates before its block counts: V from ζ and v equals
@@ -892,10 +896,10 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
     from file_io import bgw_epsmat as be
     from file_io.slab_io import SlabIO
 
-    src = open_export_source(cfg, mesh, print_fn=print_fn)
+    src = open_export_source(cfg, mesh)
     q0_body = q0_body_policy(cfg.files, src.config.sys_dim, cfg.q0_body_3d, cfg.q0_wings)
-    print_fn(f"  q0 body     {q0_body}")
-    plans, comps = plan_export(cfg, src, print_fn=print_fn)
+    log.info(f"  q0 body     {q0_body}")
+    plans, comps = plan_export(cfg, src)
     os.makedirs(cfg.output_dir, exist_ok=True)
     rank0 = process_rank() == 0
     p = _square_side(mesh)
@@ -918,8 +922,7 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
         with SlabIO(path, mode="a", mesh=mesh) as io:
             be.register_matrix(io, len(rows), max(r.gspace.nmtx for r in rows))
             for r in rows:
-                Z, B, K, chi, V, Wc, qd = q_algebra(src, r.iq_store, mesh, rcond=cfg.rcond,
-                                                    print_fn=print_fn)
+                Z, B, K, chi, V, Wc, qd = q_algebra(src, r.iq_store, mesh, rcond=cfg.rcond)
                 n = r.gspace.nmtx
                 miller = comps[r.gspace.order[:n]] + r.g0[None, :]
                 slots = zeta_slots(src.zeta.gvecs(q=[r.iq_store])[0],
@@ -938,7 +941,7 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
                                                            mesh=mesh, v0=v0, chi00=chi00)
                     del W_face
                     qw.update(tf, head_E8=complex(head_e8), head_E10=complex(head))
-                    print_fn(f"    eps0mat q0 wings (dipole): ε_M = {complex(tf['eps_M']).real:.6f} "
+                    log.info(f"    eps0mat q0 wings (dipole): ε_M = {complex(tf['eps_M']).real:.6f} "
                              f"(E8 from S_cart_head: {(1 / complex(head_e8)).real:.6f}); fold gate "
                              f"{qw['fold_gate']:.2e}; |T[a,0]|max = {float(jnp.max(jnp.abs(wings[1]))):.4e}, "
                              f"|T[0,b]|max = {float(jnp.max(jnp.abs(wings[0]))):.4e}")
@@ -960,7 +963,7 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
                              "nmtx": n, "projection_err": err, "roundtrip_vs_W": rt,
                              "head": (None if head is None else complex(head)),
                              **({"q0_wings": qw} if qw else {}), **qd})
-                print_fn(f"    {name}[{r.iq_file}] nmtx {n}: block identity {err:.2e}, "
+                log.info(f"    {name}[{r.iq_file}] nmtx {n}: block identity {err:.2e}, "
                          f"Zᴴ(ε⁻¹−1)vZ vs W−V {rt:.2e}"
                          + ("" if head is None else f", head ε⁻¹_00(q0)={complex(head):.6f}"))
         if rank0:
@@ -976,7 +979,7 @@ def run_epsmat_export(cfg, mesh, *, print_fn=print):
 # Projection: BerkeleyGW eps files -> W_μν on the bundle's stored q
 # ---------------------------------------------------------------------------
 
-def run_epsmat_projection(cfg, mesh, *, print_fn=print):
+def run_epsmat_projection(cfg, mesh, *, print_fn=None):
     """Project BerkeleyGW's ε⁻¹ onto the bundle's ζ and write a variant bundle.
 
     For every stored q the matching BerkeleyGW q (an umklapp image; Γ maps
@@ -992,7 +995,7 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
     from file_io import bgw_epsmat as be
     from file_io.slab_io import SlabIO
 
-    src = open_export_source(cfg, mesh, print_fn=print_fn)
+    src = open_export_source(cfg, mesh)
     files = {name: os.path.join(cfg.bgw_reference, f"{name}.h5") for name in ("eps0mat", "epsmat")}
     heads = {name: be.read_epsmat_header(p) for name, p in files.items() if os.path.isfile(p)}
     if "eps0mat" not in heads:
@@ -1045,7 +1048,7 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
                 iqf, g0 = int(idx[0]), -g0s[0]
             qg, _ = be.read_q_gspace(files[name], iqf)
             n = qg.nmtx
-            Z, B, K, chi, V, Wc, qd = q_algebra(src, iq, mesh, rcond=cfg.rcond, print_fn=print_fn)
+            Z, B, K, chi, V, Wc, qd = q_algebra(src, iq, mesh, rcond=cfg.rcond)
             # q_BGW = q_store + g0, so ζ̃_{q_BGW}(G) = ζ̃_{q_store}(G + g0).
             miller = comps[qg.order[:n]] + g0[None, :]
             slots = zeta_slots(src.zeta.gvecs(q=[iq])[0], src.zeta.ngk_valid(q=[iq])[0],
@@ -1078,7 +1081,7 @@ def run_epsmat_projection(cfg, mesh, *, print_fn=print):
                          "rel_Wc_bgw_vs_lorrax": rel, "herm_bgw": herm_bgw,
                          "rel_K_bgw_vs_lorrax": rel_k, "k_bgw_min": float(evb[0]),
                          "k_bgw_max": float(evb[-1]), "bgw_head": head_bgw, **qd})
-            print_fn(f"    stored q {iq} <- {name}[{iqf}] nmtx {n}: "
+            log.info(f"    stored q {iq} <- {name}[{iqf}] nmtx {n}: "
                      f"|Wc_BGW − Wc_LX|/|Wc_LX| = {rel:.4e}, |Wc_BGW − h.c.|/|Wc_BGW| = {herm_bgw:.1e}, "
                      f"‖K_BGW − K‖₂/‖K‖₂ = {rel_k:.4e}, K_BGW∈[{evb[0]:.4f}, {evb[-1]:.2e}]"
                      + ("" if head_bgw is None else f", BGW ε⁻¹_00(q0) = {head_bgw:.6f}"))

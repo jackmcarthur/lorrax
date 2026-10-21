@@ -49,6 +49,9 @@ from common.ws_images import lattice_bohr, pair_ws_embed, pair_ws_images
 
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_window import PAD_EPS_GUARD_RY
+from common.log import get_logger, message
+
+log = get_logger(__name__)
 
 
 def pad_W_R_to_grid(W_R_coarse: jax.Array, fine_grid: tuple[int, int, int],
@@ -106,7 +109,7 @@ def pad_W_R_to_grid(W_R_coarse: jax.Array, fine_grid: tuple[int, int, int],
 
 
 def w_tile_centroid_frac(wfn, centroids_file, keep_idx, n_mu: int, *,
-                         restart_file, log_fn=print) -> np.ndarray:
+                         restart_file, log_fn=log.debug) -> np.ndarray:
     """``(n_mu, 3)`` positions ``r_μ = idx/N ∈ [0,1)`` of a W tile's μ axis.
 
     The centroid table's FFT points in tile order (the full-Bloch gauge of
@@ -280,7 +283,12 @@ def _read_lorrax_input_quietly(input_file: Optional[str]) -> dict:
         from gw.gw_config import read_lorrax_input
         return read_lorrax_input(input_file) or {}
     except Exception as exc:
-        print(f"BSE: deck read failed ({exc}); using defaults")
+        log.warning(f"BSE: deck read failed ({exc}); using defaults",
+                    extra=message(
+                        id="bse_deck_read_failed",
+                        found=("deck read", f"failed ({exc})"),
+                        needs="a readable deck for the BSE settings",
+                        fix="check the deck syntax; the BSE settings fall back to defaults"))
         return {}
 
 
@@ -296,7 +304,12 @@ def _resolve_bse_k_grid(bse_k_grid, input_file: Optional[str]):
             from gw.gw_config import read_lorrax_input
             return _parse_grid_spec(read_lorrax_input(input_file).get("bse_k_grid"))
         except Exception as exc:               # config parse must never crash load
-            print(f"BSE: bse_k_grid config read failed ({exc}); feature off")
+            log.warning(f"BSE: bse_k_grid config read failed ({exc}); feature off",
+                        extra=message(
+                            id="bse_k_grid_config_read_failed",
+                            found=("bse_k_grid config read", f"failed ({exc})"),
+                            needs="a readable deck with a valid bse_k_grid",
+                            fix="check the deck syntax; bse_k_grid densification is off"))
     return None
 
 
@@ -339,7 +352,7 @@ def resolve_w_head_densify(mode, params=None, *, modes=W_HEAD_DENSIFY_MODES) -> 
 def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
                          whead, ref_grid, input_file, restart_file, geometry,
                          mesh=None,
-                         gamma_cell: str = "fine", log_fn=print, static_sample=None):
+                         gamma_cell: str = "fine", log_fn=log.debug, static_sample=None):
     """The C1 head channel ``S_fine(q)`` for a coarse→fine W, end to end.
 
     ONE composer for BOTH shipping densification paths — the ``bse_k_grid``
@@ -500,13 +513,13 @@ def build_w_head_channel(wfn, sym, meta, params, *, coarse_grid, fine_grid,
                f"or a head_minibz_average / wcoul0_source that differs from "
                f"the GW run's.")
         warnings.warn(msg, RuntimeWarning, stacklevel=2)
-        log_fn(f"[w-head-c1] [WARN] {msg}")
+        log.debug(f"[w-head-c1] [WARN] {msg}")   # the warnings.warn above carries it
     return S_fine
 
 
 def _srlr_terms(restart_file, wfn, sym, meta, params, *, coarse_grid,
                 fine_grid, n_rmu, n_rmu_pad, mesh_xy, input_file, centroid_frac,
-                log_fn=print):
+                log_fn=log.debug):
     """The long-range W terms of ``w_head_densify = srlr``, on the coarse and fine q.
 
     W = J + F̃ᴴ D F̃ exactly at every coarse q (``gw.lr_channels``).  The
@@ -936,7 +949,7 @@ def _velocity_from_weighted(o_win, f_win, g_of_f, *, where):
 
 def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       coarse_grid, n_val, window_start, a_band_index,
-                      mesh_xy, log_fn=print, full_window: bool = False,
+                      mesh_xy, log_fn=log.debug, full_window: bool = False,
                       qp_states: bool = False, pair_rule: str = "mask",
                       pair_gap_ev: float = 0.05,
                       mixing_receipt: bool = False) -> dict:
@@ -1412,7 +1425,7 @@ def _interpolate_bse_data_to_grid(
     velocity_pair_rule: str = "mask",
     velocity_pair_gap_ev: float = 0.05,
     velocity_position_fix: bool = False,
-    log_fn=print,
+    log_fn=log.debug,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
 
@@ -1583,12 +1596,18 @@ def _interpolate_bse_data_to_grid(
     # the deck's own vocabulary.
     _n_guard = nb_window - b_max
     if _n_guard < 4:
-        log_fn(f"  [warn] bse_k_grid: only {_n_guard} conduction guard "
-               f"band(s) above the BSE window [{b_min},{b_max}) inside the "
-               f"{nb_window}-band htransform window.  The f-transform's shift "
-               f"is max_k eps of THAT window's top band, so f == 0 there and "
-               f"the shoulder below it carries ~1% of fH's weight; the top of "
-               f"the returned window may be arbitrary.  Raise nband/ncond.")
+        log.warning(f"bse_k_grid: only {_n_guard} conduction guard "
+                    f"band(s) above the BSE window [{b_min},{b_max}) inside the "
+                    f"{nb_window}-band htransform window.  The f-transform's shift "
+                    f"is max_k eps of THAT window's top band, so f == 0 there and "
+                    f"the shoulder below it carries ~1% of fH's weight; the top of "
+                    f"the returned window may be arbitrary.  Raise nband/ncond.",
+                    extra=message(
+                        id="bse_k_grid_guard_bands_few",
+                        found=("conduction guard bands above the BSE window",
+                               str(_n_guard)),
+                        needs="at least 4",
+                        fix="raise nband/ncond in the deck"))
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
         kgrid_co=coarse_grid, kgrid_fi=fine_grid,

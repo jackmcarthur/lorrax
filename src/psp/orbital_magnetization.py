@@ -64,6 +64,9 @@ from common import Meta
 from psp.orbital_response import orbital_pieces_at_k
 from psp.pseudos import load_pseudopotentials
 import psp.vnl_ops as vnl_ops
+from common.log import get_logger, message
+
+log = get_logger(__name__)
 
 
 RY2EV = 13.605693122994
@@ -274,12 +277,12 @@ def main(argv=None):
     p.add_argument("--out", default=None, help="Optional .npz dump of E and the sums")
     args = p.parse_args(argv)
 
-    from runtime import initialize_communicator_stack, rank0_print
+    from runtime import initialize_communicator_stack
     runtime = initialize_communicator_stack()
 
     wfn_dir = Path(args.wfn).absolute().parent      # the run directory
     wfn_path = Path(args.wfn).resolve()
-    rank0_print(f"\n[orbmag] WFN: {wfn_path}")
+    log.info(f"\n[orbmag] WFN: {wfn_path}")
     wfn = WfnLoader(str(wfn_path), mesh=runtime.mesh)
     sym = wfn.symmetry()
 
@@ -301,8 +304,8 @@ def main(argv=None):
     nocc = int(args.nocc) if args.nocc else int(wfn.nelec)
     deps_tol = args.deps_tol / RY2EV                 # eV -> Ry
 
-    rank0_print(f"[orbmag] nspinor={nspinor}  nbnd={nbnd}  nocc={nocc}  "
-                f"nk_file={int(wfn.nkpts)}  nk_full={int(sym.nk_tot)}")
+    log.info(f"[orbmag] nspinor={nspinor}  nbnd={nbnd}  nocc={nocc}  "
+             f"nk_file={int(wfn.nkpts)}  nk_full={int(sym.nk_tot)}")
 
     # Pseudopotentials for the nonlocal velocity (dV_NL/dk).
     pdirs = [args.pseudo_dir] if args.pseudo_dir else []
@@ -314,14 +317,14 @@ def main(argv=None):
         if d and Path(d).exists():
             pseudos = load_pseudopotentials(d)
             if pseudos:
-                rank0_print(f"[orbmag] pseudopotentials from: {d}  -> "
-                            f"{list(pseudos)}")
+                log.info(f"[orbmag] pseudopotentials from: {d}  -> "
+                         f"{list(pseudos)}")
                 break
 
     V, source = dft_velocity_full_bz(
         wfn, sym, nbnd=nbnd, mesh=runtime.mesh,
         artifact=wfn_dir / VELOCITY_ARTIFACT, pseudos=pseudos)
-    rank0_print(f"[orbmag] velocity: {source}")
+    log.info(f"[orbmag] velocity: {source}")
     nk = int(sym.nk_tot)
     w_k = 1.0 / nk                                   # uniform full-BZ weight
     E = np.asarray(wfn.energies[0], dtype=np.float64)[
@@ -330,7 +333,7 @@ def main(argv=None):
         V, E, np.asarray(wfn.kvecs(k="full_bz"), dtype=np.float64),
         np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat),
         wfn.kgrid)
-    rank0_print(
+    log.info(
         "[orbmag] Hellmann-Feynman check of the loaded velocity: RMS "
         f"|Re diag(v) - d eps/dk| = {hf['rms']:.4f} Ry*Bohr against RMS "
         f"slope {hf['slope_rms']:.4f} ({hf['nsamples']} band/k samples). "
@@ -359,49 +362,53 @@ def main(argv=None):
     CBM = float(E[:, nocc].min()) if nocc < nbnd else VBM
     mu = args.mu / RY2EV if args.mu is not None else 0.5 * (VBM + CBM)
     gap_eV = (CBM - VBM) * RY2EV
-    rank0_print(f"\n[orbmag] VBM={VBM*RY2EV:.4f} eV  CBM={CBM*RY2EV:.4f} eV  "
+    log.info(f"\n[orbmag] VBM={VBM*RY2EV:.4f} eV  CBM={CBM*RY2EV:.4f} eV  "
           f"indirect gap={gap_eV:.4f} eV   mu={mu*RY2EV:.4f} eV ({mu:.5f} Ry)")
     if gap_eV < 0:
-        rank0_print("         NOTE: negative indirect gap at this k-sampling -> the "
-              "moment is mu-dependent (run --mu-scan).")
-    rank0_print(f"\n[orbmag] spin moment -mu_B sum_occ <sigma> = ({m_spin[0]:+.4f}, "
-                f"{m_spin[1]:+.4f}, {m_spin[2]:+.4f}): |m_spin| = "
-                f"{np.linalg.norm(m_spin):.3f} mu_B (g = 2)")
+        log.warning(
+            "negative indirect gap at this k-sampling; the moment depends "
+            "on mu",
+            extra=message(id="orbmag_negative_gap",
+                          found=("indirect gap", f"{gap_eV:.4f} eV"),
+                          fix="run with --mu-scan"))
+    log.info(f"\n[orbmag] spin moment -mu_B sum_occ <sigma> = ({m_spin[0]:+.4f}, "
+             f"{m_spin[1]:+.4f}, {m_spin[2]:+.4f}): |m_spin| = "
+             f"{np.linalg.norm(m_spin):.3f} mu_B (g = 2)")
 
     m_orb = MU_B_PREFACTOR * C_of_mu(mu).imag       # (3,) mu_B, file frame
     m_orb_par = float(m_orb @ n_hat)                 # along spin-moment axis
 
-    rank0_print("\n" + "=" * 64)
-    rank0_print("ORBITAL MAGNETIC MOMENT  (per unit cell, mu_B)")
-    rank0_print("=" * 64)
-    rank0_print(f"  m = ({m_orb[0]:+.5f}, {m_orb[1]:+.5f}, {m_orb[2]:+.5f})  "
-                "(Cartesian file frame)")
-    rank0_print(f"  orbital moment along spin axis: {m_orb_par:+.5f} mu_B  "
+    log.info("\n" + "=" * 64)
+    log.info("ORBITAL MAGNETIC MOMENT  (per unit cell, mu_B)")
+    log.info("=" * 64)
+    log.info(f"  m = ({m_orb[0]:+.5f}, {m_orb[1]:+.5f}, {m_orb[2]:+.5f})  "
+             "(Cartesian file frame)")
+    log.info(f"  orbital moment along spin axis: {m_orb_par:+.5f} mu_B  "
           f"({'PARALLEL' if m_orb_par>0 else 'ANTIPARALLEL'} to spin)")
-    rank0_print(f"  [full-BZ sum over {nk} k; velocity: {source}]")
-    rank0_print("=" * 64)
+    log.info(f"  [full-BZ sum over {nk} k; velocity: {source}]")
+    log.info("=" * 64)
 
     if args.mu_scan and nocc < nbnd:
-        rank0_print("\n[orbmag] mu-scan (m along the spin axis, mu_B):")
+        log.info("\n[orbmag] mu-scan (m along the spin axis, mu_B):")
         for label, m in [("VBM", VBM), ("midgap", 0.5 * (VBM + CBM)), ("CBM", CBM)]:
-            rank0_print(f"   mu={m*RY2EV:8.4f} eV ({label:6s}):  m = "
+            log.info(f"   mu={m*RY2EV:8.4f} eV ({label:6s}):  m = "
                   f"{MU_B_PREFACTOR*float(C_of_mu(m).imag @ n_hat):+.5f}")
 
     if args.convergence:
-        rank0_print("\n[orbmag] convergence vs inner-m band ceiling (m along the "
-                    "spin axis, mu_B):")
+        log.info("\n[orbmag] convergence vs inner-m band ceiling (m along the "
+                 "spin axis, mu_B):")
         col = (PA_band_n - 2.0 * mu * PB_band_n).sum(axis=0)    # sum over occupied n
         cum = np.cumsum(col)                                    # partial sums over m
         for mc in sorted(set([int(0.5*nbnd), int(0.7*nbnd), int(0.85*nbnd), nbnd])):
-            rank0_print(f"   mceil={mc:4d}:  m = {MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
+            log.info(f"   mceil={mc:4d}:  m = {MU_B_PREFACTOR*float(cum[mc-1].imag):+.5f}")
 
     if args.per_band:
         band_n = (PA_band_n - 2.0 * mu * PB_band_n).sum(axis=1)  # per outer-n
         m_par_band = MU_B_PREFACTOR * band_n.imag
-        rank0_print("\n[orbmag] per-occupied-band m (along spin axis, mu_B):")
+        log.info("\n[orbmag] per-occupied-band m (along spin axis, mu_B):")
         order = np.argsort(np.abs(m_par_band[:nocc]))[::-1]
         for n in order[:12]:
-            rank0_print(f"   band {n:3d}: {m_par_band[n]:+.5f}")
+            log.info(f"   band {n:3d}: {m_par_band[n]:+.5f}")
 
     if args.out and jax.process_index() == 0:
         # colA_n/colB_n: band-resolved columns along the spin axis (summed over
@@ -412,7 +419,7 @@ def main(argv=None):
                             colA_n=PA_band_n.sum(axis=0),
                             colB_n=PB_band_n.sum(axis=0), cA=cA, cB=cB,
                             velocity_source=source)
-        rank0_print(f"\n[orbmag] wrote {args.out}")
+        log.info(f"\n[orbmag] wrote {args.out}")
 
 
 if __name__ == "__main__":

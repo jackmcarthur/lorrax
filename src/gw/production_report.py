@@ -9,13 +9,14 @@ driver-wide ``LORRAX_DEBUG_PRINT`` switch and in the launcher's own log.
 from __future__ import annotations
 
 import os
+import re
 
 import numpy as np
 
 from common.production_report import ProductionReport
 from common.report_blocks import (
-    LABEL, Message, Setting, TimingRow, kv_lines, timing_lines, wrap_value)
-from common.scientific_output import band_range
+    LABEL, Message, Setting, TimingRow, kv_lines, table_lines, timing_lines, wrap_value)
+from common.scientific_output import band_range as _code_band_range
 from common.units import RYD_TO_EV
 from . import quadrature_log
 from .gw_config import qp_solver_semantics, sigma_requested_edges_ev
@@ -28,6 +29,14 @@ EQP0_FILE_ROLE = "QP energies, zeroth order (eqp0)"
 EQP1_FILE_ROLE = "QP energies, linearized (eqp1)"
 QP_ROTATIONS_FILE_ROLE = "QP rotations, full matrix"
 QP_WFN_FILE_ROLE = "QP wavefunctions, full matrix"
+
+
+def band_range(lo: int, hi: int) -> str:
+    """A zero-based half-open band interval as band numbers: ``1-3``, or ``3``
+    for one band (``common.scientific_output.band_range`` otherwise)."""
+    if int(hi) - int(lo) == 1:
+        return str(int(hi))
+    return _code_band_range(lo, hi)
 
 
 
@@ -60,6 +69,11 @@ _HEAD_EFFECT = {
     "full": "q->0 head with local fields",
     "no_local_fields": "q->0 head without local fields",
     "off": "no q->0 cell term",
+}
+#: Where the q->0 head's response comes from, by ``wcoul0_source``.
+_HEAD_SOURCE = {
+    "s_tensor": "from dipole.h5",
+    "epshead": "from the epsilon head",
 }
 _SC_HEAD_EFFECT = {
     "parallel_transport": "head velocity with Sigma from the links",
@@ -104,9 +118,11 @@ def settings_rows(config, *, n_mu: int, n_q_irr: int, processes: int,
     rows.append(Setting("sys_dim", str(dim), source("sys_dim"),
                         _DIM_EFFECT.get(dim, f"{dim}D")))
     head = config.head.correction.value
+    head_source = str(config.head.wcoul0_source)
     rows.append(Setting("head_correction", head, source("head_correction"),
                         _HEAD_EFFECT.get(head, head)
-                        + (f" ({config.head.wcoul0_source})" if head != "off" else "")))
+                        + (" " + _HEAD_SOURCE.get(head_source, f"({head_source})")
+                           if head != "off" else "")))
     if config.bispinor:
         rows.append(Setting("bispinor", "true", source("bispinor"),
                             "charge + transverse current; bispinor_gw = "
@@ -122,7 +138,8 @@ def settings_rows(config, *, n_mu: int, n_q_irr: int, processes: int,
         rows.append(Setting("sc_head_update", head_update,
                             source("sc_head_update", derived=head_update != "off"),
                             _SC_HEAD_EFFECT.get(head_update, head_update)))
-    elif not bool(config.no_degen_averaging):
+    elif not bool(config.no_degen_averaging) and "degen_avg_tol_ry" in named:
+        # The default tolerance changes no result a user reads; a deck value is shown.
         tol = float(config.degen_avg_tol_ry)
         rows.append(Setting("degen_avg_tol_ry", f"{tol:.3g}", source("degen_avg_tol_ry"),
                             f"reported diagonals averaged within "
@@ -144,9 +161,10 @@ def settings_rows(config, *, n_mu: int, n_q_irr: int, processes: int,
             source("memory_per_device_gb", derived=True),
             "the deck's budget per device" if "memory_per_device_gb" in named else
             f"card rule{' on ' + device if device else ''}"))
-    rows.append(Setting("band_chunk_size", str(int(config.memory.band_chunk_size)),
-                        source("band_chunk_size"),
-                        "band panels gathered in chunks of at least this"))
+    if "band_chunk_size" in named:
+        rows.append(Setting("band_chunk_size", str(int(config.memory.band_chunk_size)),
+                            source("band_chunk_size"),
+                            "band panels gathered in chunks of at least this"))
     if mode == "mpa" or "mpa_sampling_alpha" in named:
         alpha_source = getattr(config.mpa, "sampling_alpha_provenance", "") or ""
         rows.append(Setting("mpa_sampling_alpha", f"{config.mpa.sampling_alpha:g}",
@@ -173,70 +191,440 @@ _SIGMA_KIND = {
 }
 
 
-def _chi_rule_line(row: dict) -> str:
-    """One screening rule as a fixed-width report row (energies in Ry)."""
+def _ev(value_ry: float) -> str:
+    """An energy in eV: three significant figures below 1 eV, two decimals above."""
+    ev = float(value_ry) * RYD_TO_EV
+    return f"{ev:.3g}" if abs(ev) < 1.0 else f"{ev:.2f}"
+
+
+def chi_rule_detail_row(row: dict) -> str:
+    """One screening rule as a stage-2 ``chi0 rules`` row (energies in eV)."""
     kind = row["kind"]
     if kind == "direct":
-        where = f"z {row['omega_ry']:.4g} + {row['varpi_ry']:.3g}i"
-        return f"{kind:<7} {where:<34} {'-':>7}  {'exact':>9}  ordered-pair scan"
+        where = f"z {_ev(row['omega_ry'])} + {_ev(row['varpi_ry'])}i eV"
+        return f"{kind:<7} {where:<35}{'-':>5}   {'exact':>7}   ordered-pair scan"
     if kind == "line":
         count = row["points"]
-        where = (f"varpi {row['varpi_ry']:.4g}, F {row['freq_max_ry']:.4g}, "
+        where = (f"varpi {_ev(row['varpi_ry'])} eV, F {_ev(row['freq_max_ry'])} eV, "
                  f"{count} point{'' if count == 1 else 's'}")
         nodes = (f"{row['nodes']}x{row['sweeps']}" if row["sweeps"] > 1
                  else str(row["nodes"]))
-        return (f"{kind:<7} {where:<34} {nodes:>7}  "
-                f"{'<=' + format(row['target'], '.0e'):>9}  "
-                f"Gauss-Legendre, {row['panels']} panels, "
-                f"A {row['a_dim']:.0f}, kappa0 {row['kappa0']:.2f}")
-    where = (f"x {row['x_min']:.3g}-{row['x_max']:.3g}, "
+        return (f"{kind:<7} {where:<35}{nodes:>5}   "
+                f"{'<=' + format(row['target'], '.0e'):>7}   Gauss-Legendre")
+    where = (f"x {_ev(row['x_min'])}-{_ev(row['x_max'])} eV, "
              f"R {row['x_max'] / row['x_min']:.3g}")
     if kind != "static":
-        axis = "i" if kind == "imag" else ""
-        where = f"omega {row['omega_ry']:.4g}{axis}, {where}"
-    source = (f"{row['source']}, "
-              f"{'certified' if row['certified'] else 'UNCERTIFIED'}")
-    if row["note"]:
-        source += f"; {row['note']}"
-    return (f"{kind:<7} {where:<34} {row['nodes']:>7}  "
-            f"{row['error']:>9.2e}  {source}")
+        omega = float(row["omega_ry"]) * RYD_TO_EV
+        where = (f"omega {omega:.1f}{'i' if kind == 'imag' else ''} eV, "
+                 f"x {_ev(row['x_min'])}-{_ev(row['x_max'])} eV")
+    # The certificate flag is the ``screening.chi0_rules`` record's; the row
+    # names where the rule came from.
+    return f"{kind:<7} {where:<35}{row['nodes']:>5}   {row['error']:>7.1e}   {row['source']}"
 
 
-def _sigma_rule_lines(geometry: dict, plans: int) -> list[str]:
-    """The Sigma plan header and one row per product window (box in eta)."""
+def log_chi_rules() -> None:
+    """The screening rules under stage 2 of the main log (``chi0 rules``)."""
+    from common.log import block, get_logger, record
+    rules = quadrature_log.chi_rules()
+    if not rules or quadrature_log.shown("chi"):
+        return
+    log = get_logger(__name__)
+    log.debug("chi0 rules", extra=record("screening.chi0_rules", rules=rules))
+    # Unlabelled detail rows keep their spacing (a labelled value is
+    # re-wrapped); the label column is written here, 15 wide.
+    log.info(f"{'chi0 rules':<14} {'rule':<7} {'where':<35}{'nodes':>5}   "
+             f"{'max err':>7}   source", extra=block("screening"))
+    for row in rules:
+        log.info(" " * 15 + chi_rule_detail_row(row), extra=block("screening"))
+    quadrature_log.mark_shown("chi")
+
+
+def sigma_rule_detail_lines(geometry: dict) -> tuple[str, list[str]]:
+    """The ``Sigma rules`` head and the window table rows (Re d / eta only)."""
     eta = float(geometry["eta_ry"])
     count = int(geometry.get("n_windows", 0))
-    head = f"Sigma rules: eta {eta * RYD_TO_EV:.4f} eV"
+    head = f"eta {eta * RYD_TO_EV:.2f} eV"
     if "eps" in geometry:
         head += f", eps {float(geometry['eps']):.1e}"
     head += f"; {count} window{'' if count == 1 else 's'}"
     if "window_tau_pairs" in geometry:
-        head += f", {geometry['window_tau_pairs']} (window,tau) pairs"
+        head += f", {geometry['window_tau_pairs']} (window, tau) pairs"
     if "distinct_tau_count" in geometry:
         head += f", {geometry['distinct_tau_count']} distinct tau"
-    if "plan_seconds" in geometry:
-        head += f"; plan {float(geometry['plan_seconds']):.1f} s"
-    if plans > 1:
-        head += f" (last of {plans} plans)"
-    lines = [head]
     windows = [window for branch in geometry.get("branches", ())
                for window in branch["windows"]]
     if not windows:
-        return lines
-    width = max(len("window"), *(len(w["name"]) for w in windows))
-    lines.append(
-        f"  {'window':<{width}}  {'kind':<8}  {'Re d / eta':>16}  "
-        f"{'Im d / eta':>12}  {'nodes':>5}  {'sup/eps':>7}  {'kappa':>8}  "
-        f"{'fit s':>6}  rule")
+        return head, []
+    width = max(22, *(len(w["name"]) for w in windows))
+    rows = [f"{'window':<{width}} {'kind':<8}  {'Re d / eta':>16}{'nodes':>9}"
+            f"{'sup/eps':>9}{'kappa':>10}   rule"]
     for w in windows:
-        lo, hi, gamma_lo, gamma_hi = (float(v) / eta for v in w["box_ry"])
-        lines.append(
-            f"  {w['name']:<{width}}  {_SIGMA_KIND.get(w['kind'], w['kind']):<8}  "
-            f"{lo:+7.1f}..{hi:+7.1f}  {gamma_lo:5.2f}..{gamma_hi:5.2f}  "
-            f"{w['node_count']:>5}  {w['sup_error'] / w['eps']:>7.3f}  "
-            f"{w['kappa_max']:>8.2e}  {w['fit_seconds']:>6.1f}  "
-            f"{w['rule_source']}")
+        lo, hi = (float(v) / eta for v in w["box_ry"][:2])
+        rows.append(
+            f"{w['name']:<{width}} {_SIGMA_KIND.get(w['kind'], w['kind']):<8}  "
+            f"{lo:+7.1f}..{hi:+7.1f}{w['node_count']:>9}"
+            f"{w['sup_error'] / w['eps']:>9.3f}{w['kappa_max']:>10.1e}   "
+            f"{_rule_source(w['rule_source'])}")
+    return head, rows
+
+
+def _rule_source(source) -> str:
+    """A Sigma window rule's origin in plain words, no digests or rule tags:
+    ``built`` (fitted for this window), ``rebuilt`` (an SC map refitted it:
+    ``rebuild:sc-fixed:...``) or ``reused`` (another window's or an earlier
+    map's rule: ``plan:<digest>``, ``scope:<digest>``, ``hit:sc-fixed``,
+    ``resume:sc-fixed``); ``init:<source>`` reads as its source."""
+    source = str(source)
+    while source.startswith("init:"):
+        source = source[len("init:"):]
+    if source.startswith("rebuild"):
+        return "rebuilt"
+    if source.startswith(("plan:", "scope:", "hit:", "resume:")):
+        return "reused"
+    if source == "analytic-line":
+        return "analytic"
+    return source.split(":", 1)[0]
+
+
+def log_sigma_rules(geometry: dict) -> None:
+    """The Sigma rule plan under stage 3 of the main log: the ``Sigma rules``
+    row and the window table.  Only the run's first plan is shown there; a
+    later plan (an SC map) is the end-of-run quadrature block's."""
+    from common.log import block, get_logger
+    if quadrature_log.sigma_plan()[1] != 1:
+        return
+    log = get_logger(__name__)
+    head, rows = sigma_rule_detail_lines(geometry)
+    log.info(head, extra=block("sigma", label="Sigma rules"))
+    for row in rows:
+        log.info(row, extra=block("sigma"))
+    quadrature_log.mark_shown("sigma")
+
+
+# ── stage rows ───────────────────────────────────────────────────────────────
+def v_q_detail(*, n_q: int, n_mu: int, seconds: float | None, restart_file=None) -> str:
+    """The stage-1 ``V(q)`` row: how many q, the matrix size, and its wall
+    (or the restart file it was read from)."""
+    text = f"{int(n_q)} q, {int(n_mu)} x {int(n_mu)} per q"
+    if restart_file:
+        return text + f", read from {os.path.basename(str(restart_file))}"
+    return text + (f", {float(seconds):.2f} s" if seconds is not None else "")
+
+
+def w_roles_detail(roles, *, n_q: int, trs_allowed: bool = True) -> str:
+    """The stage-2 ``W roles`` row: each screened W the self-energy reads,
+    with its frequency, and the q set the Dyson series ran on.
+
+    ``roles`` are ``(role, omega_ry complex or None)``.
+    """
+    parts = []
+    for role, omega in roles:
+        notes = []
+        if omega is not None:
+            omega = complex(omega)
+            notes.append("omega 0" if omega == 0 else
+                         f"omega {omega.imag * RYD_TO_EV:.1f}i eV" if omega.real == 0.0 else
+                         f"omega {omega.real * RYD_TO_EV:.1f} eV")
+        if role == "probe" and not trs_allowed:
+            notes.append("ordered orientations")
+        parts.append(str(role) + (f" ({', '.join(notes)})" if notes else ""))
+    return ", ".join(parts) + f"; Dyson on {int(n_q)} q"
+
+
+def head_detail(config) -> str:
+    """The stage-2 ``q->0 head`` row: the head correction and its source."""
+    head = config.head.correction.value
+    if head == "off":
+        return "off: " + _HEAD_EFFECT["off"]
+    source = str(config.head.wcoul0_source)
+    return f"{head}, " + ("local fields, " if head == "full" else "no local fields, ") + (
+        _HEAD_SOURCE.get(source, f"source {source}"))
+
+
+def log_stage_row(label: str, value: str, *, stage: str = "detail") -> None:
+    """One ``label value`` row under the current stage of the main log."""
+    from common.log import block, get_logger
+    get_logger(__name__).info(value, extra=block(stage, label=label))
+
+
+# ── setup blocks: INPUT FILES, BAND WINDOWS ──────────────────────────────────
+def input_file_lines(rows) -> list[str]:
+    """The INPUT FILES table: ``file / bands / k grid / spinor / check``.
+
+    ``rows`` are ``(file, bands, k grid, spinor, check)``; a cell no cheap
+    header read gives is ``-``.  The check column is last and unpadded.
+    """
+    header = ("file", "bands", "k grid", "spinor", "check")
+    widths = [max([len(header[i])] + [len(str(row[i])) for row in rows])
+              for i in range(4)]
+    widths = [max(w, minimum) for w, minimum in zip(widths, (22, 8, 15, 8))]
+    return table_lines(header, [tuple(str(cell) for cell in row) for row in rows],
+                       widths=(*widths, 0), align="lllll")
+
+
+_FEATURE_FIT = re.compile(r"left=\((\d+),\s*(\d+)\),\s*right=\((\d+),\s*(\d+)\)")
+
+
+def centroid_file_bands(path) -> str:
+    """The bands a centroid file was selected on, ``1-3 x 1-7`` (left x right),
+    from its ``# feature fit: left=(0, 3), right=(0, 7)`` header line; ``-``
+    when the header does not say.  Only the leading comment lines are read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if not line.startswith("#"):
+                    break
+                match = _FEATURE_FIT.search(line)
+                if match and "feature fit" in line:
+                    lo_l, hi_l, lo_r, hi_r = (int(v) for v in match.groups())
+                    return f"{band_range(lo_l, hi_l)} x {band_range(lo_r, hi_r)}"
+    except OSError:
+        pass
+    return "-"
+
+
+def _same_path(a, b) -> bool:
+    """Whether two paths name the same file (both unset counts as different)."""
+    if not a or not b:
+        return False
+    return os.path.realpath(str(a)) == os.path.realpath(str(b))
+
+
+def _k_cell(nk: int, n_stored: int, grid) -> str:
+    """``5x5x1, 9 IBZ`` / ``5x5x1, 25 k``: the k set a file stores, on the
+    run's grid when its full-zone count matches it."""
+    text = f"{n_stored} IBZ" if int(n_stored) != int(nk) else f"{int(nk)} k"
+    if grid is not None and int(np.prod(grid)) == int(nk):
+        return f"{grid[0]}x{grid[1]}x{grid[2]}, " + text
+    return text
+
+
+def h5_input_cells(path, kind: str, *, grid=None) -> tuple[str, str, str]:
+    """``(bands, k grid, spinor)`` of ``kin_ion.h5`` (``kind`` ``"kin_ion"``) or
+    ``dipole.h5`` (``"dipole"``) from attributes and dataset shapes only (no
+    dataset is read); a cell the header does not give is ``-``."""
+    cells = ["-", "-", "-"]
+    try:
+        import h5py
+        with h5py.File(path, "r") as h5:
+            if kind == "kin_ion":
+                attrs = h5["kin_ion"].attrs
+                if "nb" in attrs:
+                    cells[0] = band_range(0, int(attrs["nb"]))
+                if "nk" in attrs:
+                    cells[1] = _k_cell(int(attrs["nk"]), int(attrs.get("nrk", attrs["nk"])),
+                                       grid)
+                if "nspinor" in attrs:
+                    cells[2] = str(int(attrs["nspinor"]))
+            else:
+                attrs = h5.attrs
+                if "band_energies" in h5:
+                    shape = h5["band_energies"].shape
+                    cells[0] = band_range(0, int(shape[-1]))
+                    cells[1] = _k_cell(int(shape[0]), int(shape[0]), grid)
+                if "prov_nspinor" in attrs:
+                    cells[2] = str(int(attrs["prov_nspinor"]))
+    except Exception:                       # noqa: BLE001 - a header the report cannot read
+        pass
+    return tuple(cells)
+
+
+def wavefunction_lines(name: str, *, wfn, sym, n_bands: int) -> list[str]:
+    """The ``Wavefunctions (WFN.h5)`` detail block under INPUT FILES."""
+    grid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
+    shift = np.asarray(getattr(wfn, "shift", (0, 0, 0)), dtype=np.float64).reshape(-1)[:3]
+    shift_text = ("unshifted" if not np.any(np.abs(shift) > 1e-12) else
+                  "shift (" + ", ".join(f"{v:.3f}" for v in shift) + ")")
+    n_full, n_red = int(sym.nk_tot), int(sym.nk_red)
+    stored = f"{n_red} k stored (IBZ)" if n_red != n_full else f"{n_full} k stored"
+    electrons = float(getattr(wfn, "num_electrons", np.nan))
+    nspinor = int(wfn.nspinor)
+    spinor = "2-component" if nspinor == 2 else "scalar (1-component)"
+    if not bool(getattr(sym, "trs_allowed", True)):
+        spinor += ", time reversal broken"
+    rows = [("k grid", f"{grid[0]} x {grid[1]} x {grid[2]}, {shift_text}, {stored}"),
+            ("bands", f"{int(n_bands)} ({electrons:.5f} electrons)"),
+            ("spinor", spinor)]
+    fft = getattr(wfn, "fft_grid", None)
+    if fft is not None:
+        fft = [int(v) for v in np.asarray(fft).reshape(-1)[:3]]
+        rows.append(("FFT grid", " x ".join(str(v) for v in fft)))
+    rows.append(("reader", str(getattr(wfn, "backend", "unknown"))))
+    return [f"  Wavefunctions ({name})"] + kv_lines(rows, indent=4, width=LABEL)
+
+
+def band_window_lines(band_slices, zeta_ranges, *, n_electrons: float) -> list[str]:
+    """The BAND WINDOWS rows: which bands each part of the calculation uses."""
+    b = band_slices
+    # ``b4_logical`` is the physical loaded top (tagged_arrays.py); a
+    # band-slices object without it (older producers, test stubs) means
+    # no mesh padding, so the padded top is the logical top.
+    b4_logical = int(getattr(b, "b4_logical", b.b4))
+    rows = [
+        ("occupied", f"{band_range(b.b0, b.b2)} ({n_electrons:.5f} electrons)"),
+        ("QP matrix", f"{band_range(b.b0, b.b3)} (valence {band_range(b.b1, b.b2)}, "
+                      f"conduction {band_range(b.b2, b.b3)})"),
+        ("chi0 / W sum", band_range(b.b0, min(int(b.b4_chi), b4_logical))),
+        ("Sigma sum", band_range(b.b0, min(int(b.b4_sigma), b4_logical))),
+        ("zeta fit", f"left {band_range(*zeta_ranges[0])} x "
+                     f"right {band_range(*zeta_ranges[1])}"),
+        ("loaded at r_mu", band_range(b.b0, b4_logical)),
+    ]
+    if int(b.b4) != b4_logical:
+        rows.append(("band carrier", f"{band_range(b.b0, b.b4)} "
+                                     f"({int(b.b4) - b4_logical} zero-pad rows)"))
+    return kv_lines(rows)
+
+
+# ── RESULTS ──────────────────────────────────────────────────────────────────
+def read_eqp_table(path, *, kpoints=None):
+    """A BerkeleyGW ``eqp0.dat`` / ``eqp1.dat`` file read back.
+
+    ``(k_labels, bands, e_dft_ev, e_qp_ev)``: the 1-based index of each k in
+    ``kpoints`` (the run's stored list, matched by coordinates; file order when
+    a k matches none), the band numbers, and the (nk, nb) DFT and QP columns
+    in eV.  ``None`` when the file is missing or not a complete table.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    ks, blocks = [], []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                parts = line.split()
+                if not parts or parts[0].startswith("#"):
+                    continue
+                try:
+                    int(parts[0])
+                except ValueError:                  # a k header: kx ky kz nb
+                    ks.append([float(v) for v in parts[:3]])
+                    blocks.append([])
+                    continue
+                if blocks and len(parts) >= 4:      # spin band E_DFT E_QP
+                    blocks[-1].append((int(parts[1]), float(parts[2]), float(parts[3])))
+    except (OSError, ValueError):
+        return None
+    if not blocks or not blocks[0] or any(len(b) != len(blocks[0]) for b in blocks):
+        return None
+    bands = np.asarray([row[0] for row in blocks[0]], dtype=np.int64)
+    e_dft = np.asarray([[row[1] for row in block] for block in blocks], dtype=np.float64)
+    e_qp = np.asarray([[row[2] for row in block] for block in blocks], dtype=np.float64)
+    labels = np.arange(1, len(ks) + 1)
+    if kpoints is not None and len(kpoints):
+        ref = np.asarray(kpoints, dtype=np.float64).reshape(-1, 3)
+        for i, k in enumerate(np.asarray(ks)):
+            delta = ref - k[None, :]
+            delta -= np.rint(delta)
+            hits = np.flatnonzero(np.max(np.abs(delta), axis=1) < 1e-5)
+            if hits.size:
+                labels[i] = int(hits[0]) + 1
+    return labels, bands, e_dft, e_qp
+
+
+def _k_labels(nk: int, sym):
+    """1-based IBZ labels of an energy array's k rows: the stored list as is,
+    or each full-zone k's star (``sym.irr_idx_k``); ``None`` when neither fits."""
+    if sym is not None and int(nk) == int(getattr(sym, "nk_red", -1)):
+        return np.arange(1, int(nk) + 1)
+    irr = getattr(sym, "irr_idx_k", None)
+    if irr is not None and len(np.asarray(irr)) == int(nk):
+        return np.asarray(irr, dtype=np.int64) + 1
+    return None
+
+
+def _band_edge(energies, column, labels, *, top: bool):
+    values = np.asarray(energies, dtype=np.float64)[:, column]
+    if not np.all(np.isfinite(values)):
+        return None
+    i = int(np.argmax(values) if top else np.argmin(values))
+    return float(values[i]), int(labels[i]) if labels is not None else i + 1
+
+
+def results_lines(rows, *, valence_band: int, ef_ev: float | None,
+                  reference: str | None, correction_label: str | None = None) -> list[str]:
+    """The RESULTS table: each row's VBM and CBM (k, band) and gap, in eV
+    relative to E_F, then the gap correction and the legend.
+
+    ``rows`` are ``(label, energies (nk, nb) eV, first band number, k labels)``;
+    the first row is the reference (DFT) and the last the one the gap
+    correction is quoted for.  ``valence_band`` is the 1-based top valence
+    band; the CBM is the band above it.  ``ef_ev`` ``None`` measures from the
+    midgap of the reference row.  A row whose band window misses an edge, or
+    whose edge energies are not finite, is left out.  ``correction_label``
+    names the last row in the gap-correction line (its row label otherwise).
+    """
+    edges = []
+    for label, energies, first, labels in rows:
+        energies = np.asarray(energies, dtype=np.float64)
+        iv, ic = int(valence_band) - int(first), int(valence_band) + 1 - int(first)
+        if energies.ndim != 2 or iv < 0 or ic >= energies.shape[1]:
+            continue
+        vbm = _band_edge(energies, iv, labels, top=True)
+        cbm = _band_edge(energies, ic, labels, top=False)
+        if vbm is None or cbm is None:
+            continue
+        edges.append((label, vbm, cbm))
+    if not edges:
+        return ["  no complete valence / conduction pair in the QP result"]
+    if ef_ev is None:
+        ef_ev = 0.5 * (edges[0][1][0] + edges[0][2][0])
+        reference = "midgap of the DFT edges"
+    title = f"band edges, eV relative to E_F ({reference or 'reference'})"
+    width = max(44, len(title) + 2, *(len(label) + 2 for label, _, _ in edges))
+    lines = [f"  {title:<{width}}{'VBM (ik, band)':<19}{'CBM (ik, band)':<18}{'gap':>7}"]
+    ref_v, ref_c = edges[0][1][1], edges[0][2][1]
+    vb, cb = int(valence_band), int(valence_band) + 1
+    for label, (ev, kv), (ec, kc) in edges:
+        cell_v = f"{ev - ef_ev:+.3f} ({kv}, {vb})" + ("*" if kv != ref_v else "")
+        cell_c = f"{ec - ef_ev:+.3f} ({kc}, {cb})" + ("*" if kc != ref_c else "")
+        lines.append(f"  {label:<{width}}{cell_v:<19}{cell_c:<18}{ec - ev:>7.3f}")
+    if len(edges) > 1:
+        first_gap = edges[0][2][0] - edges[0][1][0]
+        last_gap = edges[-1][2][0] - edges[-1][1][0]
+        lines += kv_lines([("gap correction", f"{last_gap - first_gap:+.3f} eV "
+                            f"({correction_label or edges[-1][0]} against {edges[0][0]})")])
+    lines.append("  each row gives its own VBM and CBM; an edge whose k differs from "
+                 f"the {edges[0][0]} edge's is marked *")
     return lines
+
+
+def sc_loop_line(run) -> str:
+    """The RESULTS ``SC loop`` value: the final map's max|dE| and the map count."""
+    maps = [m for m in run.maps if m.max_abs_ev is not None]
+    final = maps[-1]
+    n = len(maps)
+    text = f"final max|dE| {float(final.max_abs_ev):.6f} eV after {n} map{'s' if n != 1 else ''}"
+    if final.cutoff_ev is not None:
+        text += f" (cutoff {float(final.cutoff_ev):.6f} eV)"
+    return text
+
+
+def sc_results_lines(dft_row, qsgw_row, run, *, valence_band: int, ef_ev: float | None,
+                     reference: str | None) -> list[str]:
+    """RESULTS of a self-consistent run: the DFT row and the accepted map's
+    ``QSGW (map N, converged|not converged)`` row, then the ``SC loop`` line.
+
+    ``dft_row`` / ``qsgw_row`` are :func:`results_lines` rows; ``run`` is the
+    :class:`gw.sc_report.SCRun` (its final map names the row and says whether
+    the system is a metal).  A metal has no VBM / CBM: its rows carry
+    ``metal`` in the gap column and one line says why no edges are given.
+    """
+    final = run.final
+    verdict = ("one map" if final.role == "one_shot" else
+               "converged" if run.converged else "not converged")
+    label = f"QSGW (map {int(final.call)}, {verdict})"
+    loop = kv_lines([("SC loop", sc_loop_line(run))])
+    if not final.metal:
+        lines = results_lines([dft_row, (label, *qsgw_row[1:])], valence_band=valence_band,
+                              ef_ev=ef_ev, reference=reference, correction_label="QSGW")
+        return lines[:-1] + loop + lines[-1:] if len(lines) > 1 else lines + loop
+    width = 44
+    lines = [f"  {'band gap':<{width}}{'gap':>7}"]
+    lines += [f"  {name:<{width}}{'metal':>7}" for name in ("DFT", label)]
+    where = ("" if ef_ev is None else
+             f" (E_F = {float(ef_ev):.5f} eV" + (f", {reference}" if reference else "") + ")")
+    lines += kv_lines([("band edges", "none: a metal has no VBM or CBM" + where)])
+    return lines + loop
 
 
 class _Band:
@@ -380,29 +768,11 @@ class GWProductionReport(ProductionReport):
         "WARNING", "FATAL", "FAILURE", "FAILED", "UNPHYSICAL",
         "NOT TRUSTWORTHY", "DEPRECATED",
     )
-    _KEEP_PREFIXES = (
-        "  Resident ψ ",
-        # The μ-batch ζ fit's plan and its measured store/timing receipts are
-        # the run's record of where Z lived and what the transfers cost; the
-        # ladder resolvent's per-z receipts (wall, iterations, residual,
-        # high-water, fingerprints) are the same kind of record.
-        "  ISDF μ-batch plan", "  μ-batch ", "  Z store: ", "  [host mem] ",
-        "  Zeta output: ", "  Ladder W(z) ",
-        # Every box plan carries a durable policy and accepted-rule receipt,
-        # including ordinary shared-pole runs with debug disabled.
-        "Sigma quadrature receipt: ", "Response quadrature: ",
-        "Sigma checkpoint: ", "Shared-pole constructor: ",
-        "Shared-pole sector constructor: ", "  route ", "  WARNING: route ",
-        # Fixed-SC quadrature identity is a physics invariant, not backend
-        # chatter: retain its compact receipt so every map's exact node set
-        # and zero-rebuild claim remain auditable after live stdout is gone.
-        "  SC fixed quadrature: ", "    SC fixed quadrature recompute: ",
-        "    SC fixed window: ",
-    )
-
     def __init__(self, path: str, *, runtime, debug: bool, stdout) -> None:
         super().__init__(path, runtime=runtime, debug=debug, stdout=stdout)
         self._timings_emitted = False
+        self._coverage_shown = False
+        self._quadrature_heading = False
 
     def settings_block(self, *, config, n_mu: int, n_q_irr: int, processes: int,
                        resolved=()) -> None:
@@ -454,9 +824,51 @@ class GWProductionReport(ProductionReport):
             extras.append(("G(tau) GEMM", f"{implementation} ({name} = {state})"))
         super().devices(mesh_role="centroid axes X x Y", extras=extras)
 
-    def environment(self, *, wfn) -> None:
-        self.heading("Numerical environment")
-        self.emit(f"Wavefunctions  : {getattr(wfn, 'backend', 'unknown')} reader")
+    def input_files(self, *, config, wfn, sym, centroids=None) -> None:
+        """INPUT FILES: one row per core input this deck reads, then the
+        wavefunction file's own facts.  Only what is cheap is shown: the WFN
+        header, the centroid set's closure verdict and the bands its header
+        names, the kin_ion / dipole windows from their HDF5 attributes and
+        dataset shapes (rank zero, no dataset read), and whether the other
+        files exist (their windows are checked where they are read)."""
+        grid = tuple(int(v) for v in np.asarray(wfn.kgrid).reshape(-1)[:3])
+        n_full, n_red = int(sym.nk_tot), int(sym.nk_red)
+        n_bands = int(np.asarray(wfn.energies).shape[-1])
+        k_short = (f"{grid[0]}x{grid[1]}x{grid[2]}, "
+                   + (f"{n_red} IBZ" if n_red != n_full else f"{n_full} k"))
+        rows = [(os.path.basename(config.paths.wfn_file), band_range(0, n_bands),
+                 k_short, str(int(wfn.nspinor)), "OK  (source of everything below)")]
+        header_reads = self.rank == 0          # only rank zero prints the table
+        centroid_file = config.paths.centroids_file
+        if centroids is not None:
+            closed = bool(getattr(centroids, "orbit_closed", True))
+            rows.append((os.path.basename(centroid_file),
+                         centroid_file_bands(centroid_file) if header_reads else "-", "-", "-",
+                         f"OK  {int(centroids.n_rmu)} sites, orbit closed" if closed else
+                         f"WARNING  {int(centroids.n_rmu)} sites, orbit not closed"))
+        current = getattr(config.paths, "centroids_file_current", None)
+        if current and not _same_path(current, centroid_file):
+            rows.append((os.path.basename(current),
+                         centroid_file_bands(current) if header_reads else "-", "-", "-",
+                         "found" if os.path.exists(current) else "MISSING"))
+        kin_ion = config.paths.kin_ion_file
+        found = os.path.exists(kin_ion)
+        rows.append((os.path.basename(kin_ion),
+                     *(h5_input_cells(kin_ion, "kin_ion", grid=grid)
+                       if found and header_reads else ("-", "-", "-")),
+                     "found" if found else "MISSING"))
+        dipole = os.path.join(config.input_dir, "dipole.h5")
+        if os.path.exists(dipole):
+            rows.append(("dipole.h5", *(h5_input_cells(dipole, "dipole", grid=grid)
+                                        if header_reads else ("-", "-", "-")), "found"))
+        transport = config.paths.parallel_transport_file
+        if transport and os.path.exists(transport):
+            rows.append((os.path.basename(transport), "-", "-", "-", "found"))
+        self.heading("Input files")
+        self.emit_lines(input_file_lines(rows))
+        self.emit()
+        self.emit_lines(wavefunction_lines(
+            os.path.basename(config.paths.wfn_file), wfn=wfn, sym=sym, n_bands=n_bands))
 
     @staticmethod
     def trs_consequence(*, config, sym, material_class="insulator") -> str | None:
@@ -477,41 +889,31 @@ class GWProductionReport(ProductionReport):
         return None
 
     def bands(self, *, config, wfn, band_slices, zeta_ranges) -> None:
-        b = band_slices
-        n_e = float(getattr(wfn, "num_electrons", np.nan))
-        self.heading("Band spaces and energy coverage")
-        self.emit(f"Electrons      : {n_e:.5f}; occupied-band boundary = {b.b2}")
-        self.emit(f"Occupied bands : {band_range(b.b0, b.b2)}")
-        self.emit(f"QP valence     : {band_range(b.b1, b.b2)}")
-        self.emit(f"QP conduction  : {band_range(b.b2, b.b3)}")
-        self.emit(f"QP matrix      : {band_range(b.b0, b.b3)}")
-        # ``b4_logical`` is the physical loaded top (tagged_arrays.py); a
-        # band-slices object without it (older producers, test stubs) means
-        # no mesh padding, so the padded top is the logical top.
-        b4_logical = int(getattr(b, "b4_logical", b.b4))
-        logical_chi = min(int(b.b4_chi), b4_logical)
-        logical_sigma = min(int(b.b4_sigma), b4_logical)
-        self.emit(f"chi0/W sum     : {band_range(b.b0, logical_chi)}")
-        self.emit(f"Sigma sum      : {band_range(b.b0, logical_sigma)}")
-        self.emit(f"Loaded ISDF psi: {band_range(b.b0, b4_logical)}")
-        if int(b.b4) != b4_logical:
-            self.emit(
-                f"Band carrier    : {band_range(b.b0, b.b4)} "
-                f"({int(b.b4) - b4_logical} zero-pad rows)")
-        self.emit(f"zeta fit       : left {band_range(*zeta_ranges[0])}; "
-                  f"right {band_range(*zeta_ranges[1])}")
+        """BAND WINDOWS: which bands each part of the calculation uses."""
+        self.heading("Band windows")
+        self.emit_lines(band_window_lines(
+            band_slices, zeta_ranges,
+            n_electrons=float(getattr(wfn, "num_electrons", np.nan))))
 
     def sigma_coverage(self, *, config, band_slices, enk_dft_ry,
-                       sigma_result) -> None:
-        """Report the dynamic grid against Sigma's resolved energy origin.
+                       sigma_result, final: bool = False) -> None:
+        """The dynamic Sigma grid against Sigma's resolved energy origin, as
+        stage-3 rows (``Sigma grid``, ``on shell``, ``coverage``, ``band tail``)
+        and the ``sigma.coverage`` record.  Shown once: the one-shot shows it
+        under its stage (the same result), so the end-of-run call is then a
+        no-op.  ``final`` (the end-of-run call) prints the rows in the
+        QUADRATURE WINDOWS section (a self-consistent run's final map).
 
         The result owns this origin: for a metal it is the fixed-N chemical
         potential of the accepted map, while for an insulator it is the
         configured VBM or midgap.  Reconstructing it from ``wfn.efermi``
         would silently misreport every non-midgap calculation.
         """
-        if not config.compute_mode.is_dynamic:
+        if not config.compute_mode.is_dynamic or self._coverage_shown:
             return
+        self._coverage_shown = True
+        from common.log import block, get_logger, record
+        log = get_logger(__name__)
         b = band_slices
         # The sampled grid the result was built on (grown past the requested
         # edges, or derived from the bands when they are unset).
@@ -535,42 +937,38 @@ class GWProductionReport(ProductionReport):
         val_span, cond_span = span(lv0, lv1), span(lc0, lc1)
         target = [v for pair in (val_span, cond_span) if pair is not None
                   for v in pair]
-
-        self.heading("Dynamic Sigma energy coverage")
-        self.emit(f"Energy origin   : E_F = {ef_ev:+.5f} eV ({provenance})")
-        omega_grid = np.asarray(
-            () if _grid is None else _grid, dtype=np.float64)
-        grid_note = (f"; step={float(config.sigma.omega_step_ev):.5f} eV; "
-                     f"{int(omega_grid.size)} points")
-        if sigma_result.sigma_c_on_shell is not None:
+        omega_grid = np.asarray(() if _grid is None else _grid, dtype=np.float64)
+        on_shell = sigma_result.sigma_c_on_shell is not None
+        step = float(config.sigma.omega_step_ev)
+        rows = [("Sigma grid",
+                 f"{grid_lo:+.2f} .. {grid_hi:+.2f} eV about E_F = {ef_ev:.5f} eV "
+                 f"({provenance}), step {step:.2f} eV, {int(omega_grid.size)} points")]
+        if on_shell:
             # On shell the grid is only the covered range; Sigma was not
             # sampled on its points (docs/theory/sigma-on-shell.md).
-            grid_note += "; on shell: covered range only"
-        self.emit(f"Sigma omega    : [{grid_lo:+.5f}, {grid_hi:+.5f}] eV "
-                  f"relative to E_F{grid_note}")
-        if val_span is not None:
-            self.emit(f"DFT QP valence : [{val_span[0]:+.5f}, "
-                      f"{val_span[1]:+.5f}] eV relative to E_F")
-        if cond_span is not None:
-            self.emit(f"DFT QP conduct.: [{cond_span[0]:+.5f}, "
-                      f"{cond_span[1]:+.5f}] eV relative to E_F")
+            rows.append(("on shell", "covered range only"))
+        fields = dict(efermi_ev=ef_ev, reference=str(provenance),
+                      grid_ev=[grid_lo, grid_hi], step_ev=step,
+                      points=int(omega_grid.size), on_shell=bool(on_shell),
+                      dft_valence_ev=val_span, dft_conduction_ev=cond_span)
         if target:
             target_lo, target_hi = min(target), max(target)
             lower_margin = target_lo - grid_lo
             upper_margin = grid_hi - target_hi
+            fields.update(margin_below_ev=lower_margin, margin_above_ev=upper_margin)
             if lower_margin >= 0.0 and upper_margin >= 0.0:
-                self.emit("Coverage status : COMPLETE")
-                self.emit(f"Grid margins    : {lower_margin:.5f} eV below; "
-                          f"{upper_margin:.5f} eV above requested DFT output bands")
+                fields["status"] = "COMPLETE"
+                rows.append(("coverage", f"COMPLETE: margins {lower_margin:.2f} eV below "
+                             f"and {upper_margin:.2f} eV above the requested bands"))
             else:
-                self.emit("Coverage status : INCOMPLETE")
+                fields["status"] = "INCOMPLETE"
                 shortfalls = []
                 if lower_margin < 0.0:
                     shortfalls.append(f"{-lower_margin:.5f} eV below")
                 if upper_margin < 0.0:
                     shortfalls.append(f"{-upper_margin:.5f} eV above")
-                self.emit("Grid shortfall  : " + "; ".join(shortfalls)
-                          + " requested DFT output bands")
+                rows.append(("coverage", "INCOMPLETE: short by " + " and ".join(shortfalls)
+                             + " the requested bands"))
                 coverage = getattr(sigma_result, "omega_coverage", None)
                 policy_name = str(getattr(coverage, "policy", "unknown"))
                 affected = ""
@@ -594,66 +992,129 @@ class GWProductionReport(ProductionReport):
                     fix="widen sigma_omega_min_ev / sigma_omega_max_ev, or add a "
                         "sigma_omega_patches_ev window over them"))
 
-        state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(
             sigma_result, "band_extrapolation_estimator", None)
             or config.sigma.band_extrapolation_estimator)
         scheme = (getattr(sigma_result, "band_extrapolation_scheme", None)
                   or config.sigma.band_extrapolation_bracket_scheme)
-        self.emit(f"Band tail      : {state} | estimator={estimator} | "
-                  f"brackets={scheme}")
         counts = getattr(sigma_result, "band_extrapolation_counts", None)
-        if counts:
-            self.emit("Tail calculations: " + " / ".join(
-                f"N{i}={int(value)}" for i, value in enumerate(counts, start=1))
-                + " cumulative bands")
-        if getattr(sigma_result, "sigma_c_at_dft_diag_unextrap_ev",
-                   None) is not None:
-            from file_io.sigma_output import RAW_SIGMA_NOTE
-            self.emit("Raw Sigma_c    : sigC_raw, eqp0_raw, eqp1_raw "
-                      "columns in sigma_diag.dat")
-            self.emit("                 " + RAW_SIGMA_NOTE)
+        raw = getattr(sigma_result, "sigma_c_at_dft_diag_unextrap_ev", None) is not None
+        fields.update(band_tail=bool(config.sigma.band_extrapolation),
+                      tail_estimator=str(estimator), tail_brackets=str(scheme),
+                      tail_counts=[int(v) for v in counts] if counts else None,
+                      raw_columns=bool(raw))
+        if config.sigma.band_extrapolation:
+            tail = str(estimator)
+            if counts:
+                tail += " on bands " + " / ".join(str(int(v)) for v in counts)
+            if raw:
+                tail += "; raw (untailed) columns kept in the table"
+        else:
+            tail = "off: Sigma_c is the band sum truncated at the Sigma window"
+        rows.append(("band tail", tail))
+        log.debug("Sigma coverage", extra=record("sigma.coverage", **fields))
+        if not final:
+            for label, value in rows:
+                log.info(value, extra=block("sigma", label=label))
+            return
+        if not self._quadrature_heading:
+            self._quadrature_heading = True
+            self.heading("Quadrature windows")
+        for label, value in rows:
+            wrapped = wrap_value(value, first_col=LABEL + 2)
+            self.emit_lines(kv_lines([(label, wrapped[0])]) + list(wrapped[1:]))
 
-    def quadrature(self) -> None:
-        """Every quadrature rule the run used: screening chi0, then Sigma."""
+    def quadrature(self, *, self_consistent: bool = False) -> None:
+        """The quadrature rules no stage showed (a self-consistent run's final
+        Sigma plan, or rules recorded outside the one-shot stages), in eV.
+
+        A self-consistent run shows its chi0 rules at the start of its SC
+        stage, so they are not repeated here (the ``screening.chi0_rules``
+        record keeps every rule); its Sigma table is the final map's plan."""
+        from common.log import get_logger, record
         rules = quadrature_log.chi_rules()
         geometry, plans = quadrature_log.sigma_plan()
+        # A table its stage printed (one-shot: chi0 under Screening, the one
+        # Sigma plan under Self-energy) is not repeated here.
+        if quadrature_log.shown("chi") or self_consistent:
+            if rules and self_consistent:
+                get_logger(__name__).debug("chi0 rules (all maps)", extra=record(
+                    "screening.chi0_rules_all_maps", rules=rules))
+            rules = []
+        if quadrature_log.shown("sigma") and plans <= 1:
+            geometry = None
         if not rules and geometry is None:
             return
+        self._quadrature_heading = True
         self.heading("Quadrature windows")
         if rules:
-            self.emit("Screening chi0 rules (energies in Ry)")
-            self.emit(f"  {'rule':<7} {'where':<34} {'nodes':>7}  "
-                      f"{'max err':>9}  source")
+            self.emit(f"  {'chi0 rules':<15}{'rule':<7} {'where':<35}{'nodes':>5}   "
+                      f"{'max err':>7}   source")
             for row in rules:
-                self.emit("  " + _chi_rule_line(row))
+                self.emit("  " + " " * 15 + chi_rule_detail_row(row))
         if geometry is not None:
-            for line in _sigma_rule_lines(geometry, plans):
-                self.emit(line)
+            head, rows = sigma_rule_detail_lines(geometry)
+            if self_consistent:
+                head = "final map: " + head
+            elif plans > 1:
+                head += f" (last of {plans} plans)"
+            wrapped = wrap_value(head, first_col=LABEL + 2)
+            self.emit_lines(kv_lines([("Sigma rules", wrapped[0])]) + list(wrapped[1:]))
+            self.emit_lines("  " + row for row in rows)
 
-    def qp_gap(self, *, band_slices, e_dft_ry, e_qp_ry) -> None:
-        """Summarize the fundamental gap without duplicating EQP tables."""
-        b = band_slices
+    def results(self, *, band_slices, e_dft_ry, e_qp_ry, config, sym, wfn,
+                sigma_result=None, sc_run=None) -> None:
+        """RESULTS: the band edges of DFT, eqp0, eqp1 and the full-matrix H(QP),
+        each relative to E_F, and the gap correction.
+
+        The eqp0 / eqp1 rows are read back from the files this run wrote (rank
+        zero, which wrote them); the DFT row is those files' DFT column, and
+        the full-matrix row is ``e_qp_ry`` (the eigenvalues already in hand).
+        ``sc_run`` (``gw.sc_report.last_run()``, a self-consistent run only)
+        replaces the three QP rows with the accepted map's QSGW row
+        (:func:`sc_results_lines`).
+        """
+        # Every rank reads its arrays to the host, as the gap block did; only
+        # rank zero (which wrote the eqp files) reads them back and prints.
         dft = np.asarray(e_dft_ry, dtype=np.float64) * RYD_TO_EV
         qp = np.asarray(e_qp_ry, dtype=np.float64) * RYD_TO_EV
-        iv = int(b.b2 - b.b0 - 1)
-        ic = int(b.b2 - b.b0)
-        self.heading("Fundamental gap")
-        if (dft.ndim != 2 or qp.ndim != 2 or dft.shape != qp.shape
-                or iv < 0 or ic >= dft.shape[1]):
-            self.emit("Gap            : unavailable (no complete protected "
-                      "valence/conduction pair in the QP result)")
+        if self.rank != 0:
             return
-        dft_gap = float(np.min(dft[:, ic]) - np.max(dft[:, iv]))
-        qp_gap = float(np.min(qp[:, ic]) - np.max(qp[:, iv]))
-        if not np.isfinite(dft_gap) or not np.isfinite(qp_gap):
-            self.emit("Gap            : unavailable (non-finite band edge)")
+        b = band_slices
+        valence = int(b.b2)                      # 1-based top valence band
+        first = int(b.b0) + 1
+        kpoints = np.asarray(wfn.kpoints, dtype=np.float64)
+        rows: list = []
+        dft_row = None
+        for label, path in (("eqp0 (Sigma at E_DFT)", config.paths.eqp0_file),
+                            ("eqp1 (Z-linearized)", config.paths.eqp1_file)):
+            table = read_eqp_table(path, kpoints=kpoints)
+            if table is None:
+                continue
+            labels, bands, e_dft, e_qp = table
+            if dft_row is None:
+                dft_row = ("DFT", e_dft, int(bands[0]), labels)
+            rows.append((label, e_qp, int(bands[0]), labels))
+        if dft_row is None:
+            dft_row = ("DFT", dft, first, _k_labels(dft.shape[0], sym))
+        rows.append(("full-matrix H(QP)", qp, first, _k_labels(qp.shape[0], sym)))
+        rows.insert(0, dft_row)
+        ef = getattr(sigma_result, "efermi_dft_ev", None)
+        reference = (getattr(sigma_result, "omega_reference_provenance", None)
+                     or getattr(getattr(config, "sigma", None), "fermi_reference", None))
+        self.heading("Results")
+        if sc_run is not None and sc_run.final is not None:
+            # SC: eqp0 = eqp1 = the accepted map's spectrum (and e_qp_ry is the
+            # same numbers), so one QSGW row against DFT.
+            self.emit_lines(sc_results_lines(
+                rows[0], rows[1], sc_run, valence_band=valence,
+                ef_ev=None if ef is None else float(ef),
+                reference=str(reference) if reference else None))
             return
-        state = "insulating" if qp_gap > 0.0 else "metallic/overlapping"
-        self.emit(f"DFT gap        : {dft_gap:.5f} eV")
-        self.emit(f"Full-matrix effective-H gap: {qp_gap:.5f} eV ({state})")
-        self.emit(f"Gap correction : {qp_gap - dft_gap:+.5f} eV relative to DFT")
-        self.emit("State energies  : written to the EQP files listed below")
+        self.emit_lines(results_lines(
+            rows, valence_band=valence,
+            ef_ev=None if ef is None else float(ef),
+            reference=str(reference) if reference else None))
 
     def timings(self, records, *, wall: float) -> None:
         """Print accumulated, non-overlapping major scientific stages.
@@ -681,6 +1142,13 @@ class GWProductionReport(ProductionReport):
             return total(lambda r: r["name"] in wanted
                          and tuple(r.get("path", (r["name"],)))
                          == (r["name"],))
+
+        def outer(*names):
+            """The named sections at any depth, less those nested in one of them
+            (a stage section a manual stage now holds is no longer top-level)."""
+            wanted = set(names)
+            return total(lambda r: r["name"] in wanted and not any(
+                str(parent) in wanted for parent in tuple(r.get("path", ()))[:-1]))
 
         def outer_prefixed(prefix, *, within=None, excluding=()):
             def selected(row):
@@ -766,7 +1234,17 @@ class GWProductionReport(ProductionReport):
                 total(lambda r: r in spole_rows and r["name"] == name)))
         screening_details.append(("spole rank synchronization",
             total(lambda r: r in spole_rows and r["name"].startswith("spole.rank_wait."))))
+        # The minimax rule, the head response and the W persist run inside
+        # the Screening stage of a one-shot run; their own rows own them.
+        minimax = outer("gw_jax.minimax_quadrature")
+        w_persist = outer("gw_jax.persist_w0", "gw_jax.static_head")
+        inside = lambda band: _Band(sum(
+            float(r["inclusive"]) for r in rows
+            if tuple(r.get("path", ()))[:1] == ("gw_jax.screening",)
+            and tuple(r.get("path", ())) in band.plus), plus=[
+                p for p in band.plus if p[:1] == ("gw_jax.screening",)])
         screening_support = (screening_total - chi0 - w_screen
+                             - inside(minimax) - inside(w_persist)
                              - sum(value for _, value in screening_details)).floor()
 
         # The dynamic-Sigma executor opens ``sigma.rule_plan`` (box-rule
@@ -806,25 +1284,23 @@ class GWProductionReport(ProductionReport):
             ("V(q)", v_q),
             ("restart load", restart_load),
             ("ISDF setup + I/O", isdf_support),
-            ("minimax quadrature", top_level("gw_jax.minimax_quadrature")),
+            ("minimax quadrature", minimax),
             ("chi0", chi0),
             ("W", w_screen),
             *screening_details,
             ("spole other" if spole_rows else "screening support", screening_support),
-            ("W persist + q0 head", top_level(
-                "gw_jax.persist_w0", "gw_jax.static_head")),
+            ("W persist + q0 head", w_persist),
             ("SC W response", sc_w_response),
             ("Sigma rule plan", sigma_plan),
             ("SC Sigma rule refit", sigma_refit),
-            *(partition("sigma.tau_sweep", ("tau.",), "Sigma tau")
-              if any(r["name"].startswith("tau.") for r in rows)
-              else [("Sigma tau sweep", sigma_sweep)]),
+            # One row for the sweep; its setup / compile / window split is
+            # the timing.sigma_tau record.
+            ("Sigma tau sweep", sigma_sweep),
             *sigma_details,
             ("Sigma other", sigma_other),
-            ("mean-field load", top_level("gw_jax.kin_ion_load")),
-            ("QP solve + diagonalize", top_level(
-                "gw_jax.solve_qp", "gw_jax.qp_eigh")),
-            ("result writes", top_level("gw_jax.output")),
+            ("mean-field load", outer("gw_jax.kin_ion_load")),
+            ("QP solve + diagonalize", outer("gw_jax.solve_qp", "gw_jax.qp_eigh")),
+            ("result writes", outer("gw_jax.output")),
         ]
         # A stage absent in a mode should not occupy a zero-valued report row.
         # Use the table's two-decimal display threshold so a floating-point
@@ -886,31 +1362,51 @@ class GWProductionReport(ProductionReport):
                          "device/effect work, not the named consumer. Rank synchronization is "
                          "separate. Local passivity/held share one compiled call; their fused "
                          "wall is not split into invented timings.")
+        from common.log import get_logger, record
         from lxkit import memory
+        log = get_logger(__name__)
+        # The clock notes, the Sigma tau split and the table itself are the
+        # sidecar's; the main log keeps the table and one line pointing there.
+        log.debug("timing notes: " + " | ".join(notes),
+                  extra=record("timing.notes", notes=notes))
+        if any(r["name"].startswith("tau.") for r in rows):
+            split = partition("sigma.tau_sweep", ("tau.",), "Sigma tau")
+            log.debug("Sigma tau split", extra=record("timing.sigma_tau", rows=[
+                {"label": name, "seconds": float(band)} for name, band in split]))
+        log.debug("timing table", extra=record("timing.stages", wall_s=float(wall), rows=[
+            {"label": row.label, "depth": row.depth, "seconds": row.seconds,
+             "device_gb": row.device_gb} for row in table]))
         budget = memory.run().get("budget", 0.0) / 1e9
-        self.heading("Major-stage timing")
+        self.heading("Timing")
         self.emit_lines(timing_lines(
-            table, wall=float(wall), notes=notes, budget_gb=budget or None,
+            table, wall=float(wall), budget_gb=budget or None,
             device_peak=(top.device_gb, top.label) if top is not None else None,
             host_peak=((float(np.nanmax(host_run)) / 1e9, float(np.nanmin(host_run)) / 1e9)
                        if host_run is not None else None),
             n_ranks=n_ranks))
-        width = max([22] + [len(name) for name, _ in stages])     # the memory table's
-        self._stage_memory(rows, stages, width=width, wall=wall)
-        self._routes()
+        self._stage_memory(rows, stages, wall=wall)
+        self._record_routes()
+        sidecar = os.path.splitext(os.path.basename(self.path))[0] + ".json"
+        self.emit(f"  per-stage memory, priced stages and notes on fused clocks: "
+                  f"{sidecar} (timing, memory)")
 
-    def _routes(self) -> None:
-        """Every memory-driven route the run took and why (``lxkit.memory.routes``)."""
+    @staticmethod
+    def _record_routes() -> None:
+        """Every memory-driven route the run took and how often
+        (``lxkit.memory.routes``), as the ``memory.routes`` record; a route
+        that warned was printed where it happened."""
+        from common.log import get_logger, record
         from lxkit import memory
         taken = memory.routes()
-        if not taken:
-            return
-        self.heading("Routes")
-        for row in taken:
-            self.emit(f"  {row['line']}" + (f" [x{row['count']}]" if row["count"] > 1 else ""))
+        if taken:
+            get_logger(__name__).debug("routes taken", extra=record(
+                "memory.routes", routes=taken))
 
-    def _stage_memory(self, rows, stages, *, width, wall) -> None:
-        """The device peak of every major stage against its planner's price, and its host peak.
+    def _stage_memory(self, rows, stages, *, wall) -> None:
+        """The device peak of every major stage against its planner's price, and
+        its host peak, as JSON-sidecar records (``memory.stages``,
+        ``memory.priced``, ``memory.sizing``); the main log's TIMING block keeps
+        the budget, the device peak and the host peak.
 
         A row's peak is the pool high-water mark over the timing nodes it owns
         (``common.timing``; max and min over ranks).  A priced stage's receipt
@@ -922,7 +1418,9 @@ class GWProductionReport(ProductionReport):
         intervals caused, each the max over ranks.  No planner prices the host.
         """
         from common import gpu_utils, timing
+        from common.log import get_logger, record
         from lxkit import memory
+        log = get_logger(__name__)
         paths = [tuple(r.get("path", (r["name"],))) for r in rows]
         selfs = [_rank_peaks(r, "peak_self") for r in rows]
         hosts = [_rank_peaks(r, "host") for r in rows]
@@ -931,58 +1429,59 @@ class GWProductionReport(ProductionReport):
             return
         row_peak, n_ranks, _host_run = _peak_reader(rows)
         pad = lambda v: v if len(v) == n_ranks else np.full(n_ranks, np.nan)
+        gb = lambda value: (None if value is None or not np.isfinite(value)
+                            else round(float(value) / 1e9, 4))
 
         def row_host(band):
-            """Max over ranks of the row's host mark and of the rise it caused (GB)."""
+            """Max over ranks of the row's host mark and of the rise it caused (bytes)."""
             mine = [i for i, p in enumerate(paths)
                     if band.owns(p) and np.any(np.isfinite(hosts[i]))]
             if not mine:
-                return f"{'–':>7}  {'–':>6}"
+                return None, None
             mark = np.nanmax([np.nanmax(hosts[i]) for i in mine])
             rise = np.nanmax(np.nansum([pad(rises[i]) for i in mine], axis=0))
-            return f"{mark / 1e9:7.2f}  {rise / 1e9:+6.2f}"
+            return mark, rise
 
-        priced = [(row, np.where(m >= 0, m, np.nan)) for row in memory.receipts()
-                  for m in (_rank_peaks(row, "measured"),)]
-        # The budget, the run's device peak and the host peak are the timing
-        # block's memory summary; this table is each stage's detail.
-        self.heading("Major-stage device and host memory")
-        self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
-                  f"rank(s); prices and γ: the priced stages below")
-        if any(np.any(np.isfinite(v)) for v in hosts):
-            self.emit(f"  host = resident high-water (ru_maxrss) per rank at the stage's last "
-                      f"exit, max over ranks; rise = what the stage added to it; unpriced")
-        holds = gpu_utils.host_holds()
-        if holds:
-            self.emit("  held on the host across stages, per rank: " + "; ".join(
-                f"{name} {nbytes / 1e9:.2f} GB" for name, nbytes in holds.items()))
-        self.emit(f"  {'stage':<{width}}  peak GB max / min  "
-                  f"host GB    rise  set by")
+        table = []
         for name, band in stages:
             peak, setter = row_peak(band)
-            host = row_host(band)
-            if peak is None and "–" in host:
+            mark, rise = row_host(band)
+            if peak is None and mark is None:
                 continue
-            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {host}  "
-                      f"{' > '.join(setter[-2:])}")
-        # Constructor sub-stages with their own pool high-water (TimingNode.peak), so a leg
-        # measures what the reduction, passivity and head prices are calibrated against.
-        for line in _substage_peak_lines(paths, rows):
-            self.emit(line)
+            finite = peak is not None and np.any(np.isfinite(peak))
+            table.append({
+                "stage": name,
+                "peak_max_gb": gb(np.nanmax(peak)) if finite else None,
+                "peak_min_gb": gb(np.nanmin(peak)) if finite else None,
+                "host_gb": gb(mark), "host_rise_gb": gb(rise),
+                "set_by": " > ".join(setter[-2:])})
+        log.debug("per-stage memory", extra=record(
+            "memory.stages", ranks=n_ranks, rows=table,
+            held_on_host_gb={name: gb(nbytes)
+                             for name, nbytes in gpu_utils.host_holds().items()},
+            # Constructor sub-stages with their own pool high-water
+            # (TimingNode.peak): what the reduction, passivity and head prices
+            # are calibrated against.
+            substages=[line.strip() for line in _substage_peak_lines(paths, rows)]))
+        priced = []
+        for row in memory.receipts():
+            peak = _rank_peaks(row, "measured")
+            peak = np.where(peak >= 0, peak, np.nan)
+            worst = float(np.nanmax(peak)) if np.any(np.isfinite(peak)) else -1.0
+            priced.append({"line": memory.receipt_line(row["stage"], row["price"], worst,
+                                                       row["exact"], row["source"]),
+                           "count": int(row["count"])})
         if priced:
-            self.emit("  priced stages (receipts; measured max over ranks):")
-            for row, peak in priced:
-                worst = float(np.nanmax(peak)) if np.any(np.isfinite(peak)) else -1.0
-                self.emit("    " + memory.receipt_line(row["stage"], row["price"], worst,
-                                                       row["exact"], row["source"])
-                          + f" [x{row['count']}]")
-        self.emit("  " + memory.sizing()["line"])
-        for finding in memory.findings() if memory.STRICT else ():
-            self.emit("  memory census: " + finding)
+            log.debug("priced stages", extra=record("memory.priced", stages=priced))
         reads, seconds = timing.instrument_cost()
-        self.emit(f"  instrument: {memory.instrument()['source'] or 'none'} "
-                  f"({'calibrate' if memory.CALIBRATE else 'production'}); {reads} boundary "
-                  f"reads on rank 0 took {seconds * 1e3:.1f} ms "
-                  f"({100.0 * seconds / wall if wall else 0.0:.4f}% of the wall)")
+        log.debug("memory sizing", extra=record(
+            "memory.sizing", minimum_to_complete=memory.sizing()["line"],
+            findings=list(memory.findings()) if memory.STRICT else []))
+        log.debug("memory instrument", extra=record(
+            "memory.instrument", source=memory.instrument()["source"] or "none",
+            mode="calibrate" if memory.CALIBRATE else "production",
+            boundary_reads=int(reads), boundary_seconds=float(seconds),
+            wall_fraction=float(seconds / wall) if wall else 0.0))
+
 
 __all__ = ["GWProductionReport"]

@@ -41,6 +41,10 @@ from jax import lax
 import numpy as np
 from distrib_la import eigh_local
 
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 # ===========================================================================
 # The Hermitian-form invariant the recurrence already computes
@@ -280,15 +284,9 @@ def _report_alpha_herm(name: str, form: str, dev, scale, worst) -> bool:
         detail=f"Worst iteration: j={worst}.  {why}{_ALPHA_CAUSE}",
     )
     if ok:
-        try:
-            first = jax.process_index() == 0
-        except Exception:
-            first = True
-        if first:
-            print(f"  lanczos[{name}]: alpha non-Hermitian part / "
+        log.debug(f"  lanczos[{name}]: alpha non-Hermitian part / "
                   f"max|alpha| = {rel:.3e} "
-                  f"(tol {ALPHA_HERM_RTOL:.0e}, worst j={worst})  OK",
-                  flush=True)
+                  f"(tol {ALPHA_HERM_RTOL:.0e}, worst j={worst})  OK")
     return ok
 
 
@@ -520,15 +518,9 @@ def _announce_reorth(name: str, max_iter: int, n_reorth: int) -> None:
     Emitted at trace time (not inside the loop): a jitted solve prints it once
     per compile.
     """
-    try:
-        first = jax.process_index() == 0
-    except Exception:
-        first = True
-    if first:
-        n_coll = reorth_collective_count(max_iter)
-        print(f"  lanczos[{name}]: reorth route=cgs2 n_reorth={n_reorth} "
-              f"max_iter={max_iter} -> {n_coll} reorth all-reduces",
-              flush=True)
+    n_coll = reorth_collective_count(max_iter)
+    log.debug(f"  lanczos[{name}]: reorth route=cgs2 n_reorth={n_reorth} "
+              f"max_iter={max_iter} -> {n_coll} reorth all-reduces")
 
 
 # ---------------------------------------------------------------------------

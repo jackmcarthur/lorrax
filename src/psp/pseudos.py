@@ -12,6 +12,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from common.log import get_logger, message
+
+log = get_logger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Periodic table
@@ -54,7 +58,7 @@ def load_pseudopotentials(work_dir: str = ".") -> dict:
     if not upf_files:
         upf_files = glob.glob(os.path.join(work_dir, "*.UPF"))
     if not upf_files:
-        print(f"No pseudopotentials (*.upf) found in {work_dir}")
+        log.info(f"No pseudopotentials (*.upf) found in {work_dir}")
         return {}
 
     pseudos = {}
@@ -66,7 +70,11 @@ def load_pseudopotentials(work_dir: str = ".") -> dict:
             element = pseudo.pp_header.element.strip()
             pseudos[element] = pseudo
         except Exception as e:
-            print(f"Warning: failed to load {os.path.basename(upf_file)}: {e}")
+            log.warning(
+                f"failed to load {os.path.basename(upf_file)}: {e}",
+                extra=message(id="pseudo_load_failed",
+                              found=(os.path.basename(upf_file), str(e)),
+                              fix="check that the file is a valid UPF v2 pseudopotential"))
     return pseudos
 
 
@@ -109,19 +117,19 @@ def build_atom_pp_assignments(
 
 def print_atomic_structure(wfn, pseudos: dict) -> None:
     """Print compact structure summary and pseudopotential table."""
-    print(f"\nStructure: nat={wfn.nat}, volume={wfn.cell_volume:.4f} bohr³, "
+    log.info(f"\nStructure: nat={wfn.nat}, volume={wfn.cell_volume:.4f} bohr³, "
           f"alat={wfn.alat:.6f} bohr")
     if not pseudos:
-        print("Pseudopotentials: none found\n")
+        log.info("Pseudopotentials: none found\n")
         return
-    print("Pseudopotentials:")
-    print(f"  {'Elem':<6} {'Z_val':>5} {'n_proj':>6}  file")
+    log.info("Pseudopotentials:")
+    log.info(f"  {'Elem':<6} {'Z_val':>5} {'n_proj':>6}  file")
     for element, pseudo in pseudos.items():
         n_proj = pseudo.pp_header.number_of_proj
         z_val = pseudo.pp_header.z_valence
         fname = os.path.basename(getattr(pseudo, "_source_path", ""))
-        print(f"  {element:<6} {z_val:>5} {n_proj:>6}  {fname}")
-    print()
+        log.info(f"  {element:<6} {z_val:>5} {n_proj:>6}  {fname}")
+    log.info("")
 
 
 def _generator_tag(pseudo) -> str:
@@ -151,9 +159,18 @@ def _generator_tag(pseudo) -> str:
 
 
 def pseudo_summary_lines(pseudos: dict) -> list[str]:
-    """ONE log line per species for the Pseudopotentials report block.
+    """:func:`pseudo_summary_rows` as ``element   summary`` lines (two-space
+    indent, the element padded to 15); ``(none loaded)`` without a file."""
+    rows = pseudo_summary_rows(pseudos)
+    if not rows:
+        return ["  (none loaded)"]
+    return [f"  {element:<15} {text}" for element, text in rows]
 
-        Si             : Si.upf — scalar-relativistic, z_val 4, NLCC yes (ONCVPSP-3.3.0)
+
+def pseudo_summary_rows(pseudos: dict) -> list[tuple[str, str]]:
+    """ONE ``(element, summary)`` row per species for the SYSTEM block.
+
+        ("Si", "Si.upf, scalar-relativistic, z_val 4, NLCC yes (ONCVPSP-3.3.0)")
 
     The SR/FR verdict follows the projector policy (radial/
     build_projectors_qe.pseudo_has_j_channels): a beta carrying an
@@ -165,7 +182,7 @@ def pseudo_summary_lines(pseudos: dict) -> list[str]:
     """
     from psp.radial.build_projectors_qe import pseudo_has_j_channels
 
-    lines: list[str] = []
+    rows: list[tuple[str, str]] = []
     for element in sorted(pseudos):
         pseudo = pseudos[element]
         hdr = pseudo.pp_header
@@ -179,10 +196,7 @@ def pseudo_summary_lines(pseudos: dict) -> list[str]:
             kind += f' [header relativistic="{rel_attr}"; beta channels win]'
         nlcc = "yes" if getattr(pseudo, "pp_nlcc", None) is not None else "no"
         tag = _generator_tag(pseudo)
-        lines.append(
-            f"{element:<15}: {fname} — {kind}, "
-            f"z_val {float(hdr.z_valence):g}, NLCC {nlcc}"
-            + (f" ({tag})" if tag else ""))
-    if not lines:
-        lines.append("(none loaded)")
-    return lines
+        rows.append((str(element),
+                     f"{fname}, {kind}, z_val {float(hdr.z_valence):g}, "
+                     f"NLCC {nlcc}" + (f" ({tag})" if tag else "")))
+    return rows

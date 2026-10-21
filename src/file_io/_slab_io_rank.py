@@ -49,6 +49,9 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import agree_io_error, all_gather_processes
+from common.log import get_logger, message as log_message
+
+log = get_logger(__name__)
 
 # PIECE and IO_THREADS were measured on Perlmutter Lustre (4 x 4 MiB stripes):
 # 64 MiB calls from four threads reach 13-14 GB/s per rank; unpacked ~53 MB calls
@@ -244,8 +247,9 @@ class _Store:
             done = subprocess.run(["lfs", "setstripe", "-c", "4", "-S", "4M", str(self.path)],
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False)
             if done.returncode:
-                print(f"[slab_io] lfs setstripe failed for {self.path} (rc {done.returncode}): "
-                      f"{done.stderr.decode(errors='replace').strip()[:200]}; default layout", flush=True)
+                log.warning(f"[slab_io] lfs setstripe failed for {self.path} (rc {done.returncode}): "
+                            f"{done.stderr.decode(errors='replace').strip()[:200]}; default layout",
+                            extra=log_message("slabio_lfs_setstripe_failed"))
         flags = os.O_RDWR | os.O_CREAT
         try:
             self.fd = os.open(self.path, flags | os.O_DIRECT, 0o600)

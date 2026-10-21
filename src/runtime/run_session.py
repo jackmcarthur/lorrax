@@ -1,11 +1,10 @@
-"""One driver invocation's session: report, stdout, timing, refusal, files.
+"""One driver invocation's session: report, stdout, logging, timing, refusal, files.
 
 Every LORRAX driver ran the same bookkeeping around its physics.  It opened a
-rank-zero report, installed :class:`ProductionStdout` with the report as its
-warning sink, reset the timing collector, split the pre-``main`` span into the
-startup call's own phases, and at the end printed the stage table, the file
-table and the completion line and restored stdout.  :class:`RunSession` is
-that sequence, written once::
+rank-zero report, installed :class:`ProductionStdout`, reset the timing
+collector, split the pre-``main`` span into the startup call's own phases, and
+at the end printed the stage table, the file table and the completion line and
+restored stdout.  :class:`RunSession` is that sequence, written once::
 
     with RunSession(RUNTIME, "kin_ion", Report, report_path,
                     stages=STAGES, **labels) as run:
@@ -20,14 +19,27 @@ the closing line ``LORRAX <driver> ERROR ...``.  The exception, with its
 ``GATE <id>`` text, then propagates to ``runtime.run_main_and_finalize``
 unchanged.
 
+The output streams are :class:`RunStreams`: the stdout swap and the three
+``lorrax`` logging handlers (``common.log``), main log on rank 0, rank stream
+on every rank, JSON sidecar ``<report stem>.json`` on rank 0, with Python
+warnings captured as records.  The handlers read the verbose switch
+(``runtime.debug_print_enabled``: ``--verbose``, the deck's
+``verbose = true``, ``LORRAX_DEBUG_PRINT=1``) on every record; verbose puts
+DEBUG records in the rank log and, under the current stage, in the main log.  A driver that opens its report itself (GW,
+whose report path comes from its deck) opens a :class:`RunStreams` beside it;
+every other driver gets one from its session.
+
 The report class is the driver's; this module imports none (it is L3 and a
 report knows about bands).  It needs a constructor ``(path, *, runtime,
 debug, stdout, **labels)``, a settable ``stdout``, and the methods
-``legacy_print``, ``timings``, ``warnings``, ``files`` and ``finish(*, status,
-wall, error)`` (``common.production_report.ProductionReport`` has them).  A
-driver whose report is a single text written at the end (``kmeans_cli``)
-passes ``report_cls=None``; the session then keeps the retained warnings in
-:attr:`RunSession.warnings` and emits through :meth:`RunSession.emit`.
+``legacy_print``, ``log_detail``, ``log_message``, ``render_message``,
+``timings``, ``warnings``, ``files`` and ``finish(*, status, wall, error)``,
+and optionally ``log_debug`` (verbose DEBUG rows) and ``sidecar_path``
+(``common.production_report.ProductionReport`` has them).  A driver whose
+report is a single text written at the end (``kmeans_cli``) passes
+``report_cls=None``; the session then keeps the retained warnings' texts
+(``<Category>: <message>``) in :attr:`RunSession.warnings` and emits through
+:meth:`RunSession.emit`.
 
 ``stages`` names the major-stage table once, for completion and refusal
 alike.  ``None`` hands :meth:`timings` the raw timing records, for a report
@@ -39,12 +51,14 @@ seconds)`` rows (``exciton_bands`` keeps its own two-column timers).
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import common.timing as timing
+from common import log
 from runtime.production_stream import ProductionStdout
 
-__all__ = ["RunSession", "published_artifacts"]
+__all__ = ["RunSession", "RunStreams", "published_artifacts"]
 
 #: The row this module prepends to a declared stage table.
 RUNTIME_ROW = "runtime + imports"
@@ -103,22 +117,90 @@ def published_artifacts(rows, *, print_fn) -> bool:
     return ok
 
 
+class RunStreams:
+    """One driver run's stdout and its ``lorrax`` logging handlers.
+
+    :meth:`open` takes the stdout the process holds (the stream the harness
+    captures as this rank's log), installs :class:`ProductionStdout` and then
+    the handlers of ``common.log``: rank 0's main log into ``report``, the
+    rank stream on that stdout, the JSON sidecar beside the report, and
+    Python warnings captured as records.  Without a report, a warning's text
+    goes to ``warning_fn``.  :meth:`close` removes them in reverse order.
+    """
+
+    def __init__(self, runtime, *, debug: bool, report=None, warning_fn=None,
+                 verbose=None) -> None:
+        self.rank = int(runtime.process_index)
+        self.debug = bool(debug)
+        self.report = report
+        self._warning_fn = warning_fn
+        # The handlers' switch, read per record: a deck parsed after the open
+        # still turns verbose on.  ``debug`` (the stdout swap) is fixed at open.
+        self._verbose = verbose
+        self._stdout = None
+        self._uninstall = None
+
+    def open(self) -> "RunStreams":
+        from runtime import debug_print_enabled, rank0_print
+
+        console = sys.stdout
+        verbose = self._verbose if self._verbose is not None else debug_print_enabled
+        # Warnings are logging records now; the swap keeps only its stdout role.
+        self._stdout = ProductionStdout(debug=self.debug, rank=self.rank)
+        self._stdout.install()
+        report = self.report
+        if report is not None:
+            report.stdout = rank0_print if self.debug else self._stdout.emit
+            sink = dict(on_message=report.log_message, on_detail=report.log_detail,
+                        on_debug=getattr(report, "log_debug", None),
+                        render=report.render_message,
+                        sidecar=getattr(report, "sidecar_path", None)
+                        or os.path.splitext(report.path)[0] + ".json",
+                        report_name=os.path.basename(report.path))
+        else:
+            warning_fn = self._warning_fn
+
+            def on_message(text, fields, levelno):
+                if warning_fn is not None:
+                    warning_fn(text)
+
+            sink = dict(on_message=on_message)
+        self._uninstall = log.install_session(
+            rank=self.rank, debug=verbose, stream=console, **sink)
+        return self
+
+    def emit(self, text: str = "", *, end: str = "\n") -> None:
+        """Rank-zero scientific output on the launcher's stdout."""
+        if self.debug:
+            from runtime import rank0_print
+            rank0_print(text, end=end)
+        else:
+            self._stdout.emit(text, end=end)
+
+    def close(self) -> None:
+        if self._uninstall is not None:
+            self._uninstall()
+            self._uninstall = None
+        if self._stdout is not None:
+            self._stdout.close()
+            self._stdout = None
+
+
 class RunSession:
-    """Report, stdout, timing and refusal handling for one driver run."""
+    """Report, stdout, logging, timing and refusal handling for one driver run."""
 
     def __init__(self, runtime, prefix: str, report_cls, report_path=None, *,
-                 stages=None, warning_fn=None, **report_labels) -> None:
+                 stages=None, **report_labels) -> None:
         self.runtime = runtime
         self.prefix = str(prefix)
         self._report_cls = report_cls
         self._report_path = report_path
         self._report_labels = report_labels
         self._stages = stages
-        self._warning_fn = warning_fn
         self.report = None
         self.warnings: list[str] = []
         self.debug = False
-        self._stdout = None
+        self._streams = None
         self._t_main = None
         self._pre_main = None
         self._closed = False
@@ -137,16 +219,9 @@ class RunSession:
             self.report = self._report_cls(
                 self._report_path, runtime=self.runtime, debug=self.debug,
                 stdout=rank0_print, **self._report_labels)
-        sink = self._warning_fn or (
-            self.report.legacy_print if self.report is not None
-            else self.warnings.append)
-        self._stdout = ProductionStdout(
-            debug=self.debug, rank=int(self.runtime.process_index),
-            warning_fn=sink)
-        self._stdout.install()
-        if self.report is not None:
-            self.report.stdout = (rank0_print if self.debug
-                                  else self._stdout.emit)
+        self._streams = RunStreams(
+            self.runtime, debug=self.debug, report=self.report,
+            warning_fn=self.warnings.append).open()
         return self
 
     # ── clocks ───────────────────────────────────────────────────────────
@@ -185,11 +260,7 @@ class RunSession:
     # ── output ───────────────────────────────────────────────────────────
     def emit(self, text: str = "", *, end: str = "\n") -> None:
         """Rank-zero scientific output on the launcher's stdout."""
-        if self.debug:
-            from runtime import rank0_print
-            rank0_print(text, end=end)
-        else:
-            self._stdout.emit(text, end=end)
+        self._streams.emit(text, end=end)
 
     @staticmethod
     def file_rows(rows):
@@ -258,6 +329,6 @@ class RunSession:
                 except Exception:  # noqa: BLE001 — never mask the refusal
                     pass
         finally:
-            if self._stdout is not None:
-                self._stdout.close()
+            if self._streams is not None:
+                self._streams.close()
         return False

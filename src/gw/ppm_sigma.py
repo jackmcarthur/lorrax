@@ -21,6 +21,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common import timing
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common.units import RYD_TO_EV
 from .gw_config import DynamicSigmaConfig, PPMConfig
 from .minimax_screening import (
@@ -963,7 +967,7 @@ def fit_ppm(
         probe_hermiticity_residual = float(jax.device_get(
             _probe_antihermitian_residual(Wprobe_q)))
         if print_fn is not None:
-            print_fn(
+            log.info(
                 f"  {model_label} ORDERED residues (measured-broken-TR deck): "
                 f"R± = B ± D; max|D|/max|B| = "
                 f"{odd_even_residue_ratio:.3e}; W(iω_p) probe Hermiticity "
@@ -980,17 +984,17 @@ def fit_ppm(
 
     if print_fn is not None:
         kind = "iωp" if abs(z.real) < 1.0e-12 else "Ω"
-        print_fn(
+        log.info(
             f"  {model_label} fit: {t1-t0:.2f}s, {kind}={probe_mag:.4f} Ry, "
             f"unfulfilled={100.0 * fit.unfulfilled_fraction:.2f}%")
-        print_fn(
+        log.debug(
             f"  {model_label} pole census: valid={fit.n_valid}, "
             f"Omega=[{fit.omega_min_raw:.8e}, {fit.omega_max_raw:.8e}] Ry, "
             f"min |Wc(0)-Wc(probe)|/max(|Wc(0)|,|Wc(probe)|)="
             f"{fit.pair_relative_separation_min:.8e}")
         if coarsen_extreme_tails:
             budget = fit.n_valid // GN_PPM_EXTREME_TAIL_DIVISOR
-            print_fn(
+            log.debug(
                 "  GN user-ruled fitted-pole tail policy: "
                 f"low={fit.n_tail_low}/{budget}, "
                 f"high={fit.n_tail_high}/{budget}; "
@@ -1000,7 +1004,7 @@ def fit_ppm(
                 "are atomic before orbit closure; physical partner orbits "
                 "remain unsplit and closure may further undershoot"
             )
-            print_fn(
+            log.debug(
                 "  GN tail semantics: affected Wc(0) is preserved by "
                 "B'=-Wc(0)*Omega'/2; the 1/z^2 moment changes; this is not "
                 "BGW finite-pole parity; exact panes remain downstream."
@@ -1491,7 +1495,7 @@ def compute_sigma_c_ppm_omega_grid(
     ansatz_name = str(getattr(ansatz, "value", ansatz)).strip().lower()
     resolved_xi = resolve_sigma_regularization(
         requested_ry=regularization_width_ry, ansatz=ansatz_name)
-    print_fn(resolved_xi.describe())
+    log.debug(resolved_xi.describe())
     regularization_width_ry = resolved_xi.resolved_ry
 
     n_total_modes, n_invalid = map(
@@ -1508,10 +1512,10 @@ def compute_sigma_c_ppm_omega_grid(
                         dtype=jnp.int64)))
             n_invalid = int(np.dot(n_invalid_q, stars))
             n_total_modes = int(np.dot(n_total_q, stars))
-        print_fn(
+        log.info(
             f"  PPM invalid modes: {n_invalid}/{n_total_modes} "
             f"({100.0 * n_invalid / max(n_total_modes, 1):.2f}%)")
-        print_fn(
+        log.debug(
             f"  PPM invalid modes per {'q' if stars is None else 'wedge q'}: "
             f"min={int(n_invalid_q.min())} max={int(n_invalid_q.max())} "
             f"counts={np.array2string(n_invalid_q, max_line_width=100, threshold=64)}")
@@ -1541,7 +1545,7 @@ def compute_sigma_c_ppm_omega_grid(
             wfns, ppm.Wc0_q, state.invalid_mask, meta, mesh_xy,
             occupation_state=occupation_state, q_wedge=ppm.q_wedge,
             coulomb_hole=internal is None or internal.coulomb_hole)
-        print_fn(
+        log.debug(
             "  PPM invalid modes -> static COHSEX: max|Sigma_static| = "
             f"{float(np.max(np.abs(sigma_static_host))) * RYD_TO_EV:.4f} eV")
         if plan.n_brackets > 1:
@@ -1575,7 +1579,7 @@ def compute_sigma_c_ppm_omega_grid(
             "unfulfilled_fraction": float(ppm.unfulfilled_fraction),
         })
     del Omega_p, B_p, B_odd_p
-    print_fn(
+    log.debug(
         f"  {ansatz_name} fit -> in-memory one-pole source (no store); "
         f"invalid policy={invalid_mode}")
 

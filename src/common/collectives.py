@@ -79,6 +79,7 @@ second chi0/W implementation or a disk round-trip.
 from __future__ import annotations
 
 import itertools
+import logging
 import threading
 from typing import Any, Callable, NamedTuple
 
@@ -200,9 +201,9 @@ def _coordination_barrier(name, _mh):
     if client is None:
         if "notice" not in _BARRIER_SERIAL:
             _BARRIER_SERIAL["notice"] = True
-            print("  GATE barrier_coordination: no distributed runtime client; "
-                  "collectives.barrier uses the device barrier (sync_global_devices)",
-                  flush=True)
+            logging.getLogger("lorrax.collectives").debug(
+                "  GATE barrier_coordination: no distributed runtime client; "
+                "collectives.barrier uses the device barrier (sync_global_devices)")
         _mh.sync_global_devices(name)
         return
     n = _BARRIER_SERIAL[name] = _BARRIER_SERIAL.get(name, 0) + 1
