@@ -97,6 +97,28 @@ def active_eta_verification_sites(native_sites, energy, active, eta_ry, *, nativ
     return np.asarray(sites,complex),receipt
 
 
+def _general_response_blocks(energy, f, u, active, partition='blocks'):
+    """Partition exact endpoints on host ``energy/f/u[k,b]`` (energies Ry).
+
+    Full merging retains every component and its existing admission gates;
+    it changes numerical quadrature work, not the response contraction.
+    """
+    from .response_bank import response_blocks
+    if partition not in ('blocks', 'full'):
+        raise ValueError('GATE shared_general_response_partition: want blocks or full')
+    blocks = response_blocks(energy, f, u, active, allow_crossing=True,
+                             exact_endpoint_support=True)
+    for block in blocks:
+        name = block['name']
+        block.update(density_sides=(name[1] == 'A', name[0] == 'A'), components=[name])
+    if partition == 'full' and blocks:
+        left, right = energy[u != 0], energy[f != 0]
+        blocks = [dict(name='full', u=u, f=f, density_sides=(True, True),
+            lo=float(left.min()-right.max()), hi=float(left.max()-right.min()),
+            components=[b['name'] for b in blocks])]
+    return blocks
+
+
 def _direct_dielectric_request(snapshot):
     """Validate an explicit, unadmitted one-site q0 diagnostic (Ry)."""
     request = snapshot.get("direct_dielectric_probe")
@@ -217,6 +239,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     ``fit_basis`` optionally holds only interpolation directions/reduction
     spaces within one inner Hamiltonian solve. Current response, residues,
     collective poles and all held checks are recomputed on every call.
+    ``response_partition='full'`` opts into an exact merged endpoint product;
+    the default ``'blocks'`` keeps FF/FA/AF/AA numerical quadrature separate.
 
     Explicit ``direct_dielectric_probe={q: 0, z_ry: [real, imag]}`` evaluates
     only that current microscopic response and commits native dielectric
@@ -238,7 +262,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .centroid_k_unfold import authenticate_canonical_full_grid
     from .response_bank import (full_density_sample_rules, full_density_bare_moments,
                                  _coulomb_algebra, dense_layout, response_algebra,
-                                 operator_digest, response_blocks, _bank_execution)
+                                 operator_digest, _bank_execution)
     from .w_isdf import full_density_response_stream
     from .shared_pole_directions import _sample_point
     from .shared_pole_execution import face_matmul
@@ -250,6 +274,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from file_io.shared_pole_store import write_general_shared_pole_model
     started = time.monotonic()
     direct_request = _direct_dielectric_request(snapshot)
+    response_partition = snapshot.get('response_partition', 'blocks')
     phases, phase_start = {}, {}
     def begin(name):
         phase_start[name] = time.monotonic()
@@ -311,6 +336,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         source_policy_version=recipe.get("recipe_version", recipe.get("version")),
         scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
         numerical_response_rule='analytic-denominator-box-values-only-v1',
+        response_partition=response_partition,
         eta_training_verification='active_span_3train_2interlaced_held_v1',
         numerical_spaces='two-sided-descriptor-svd',
         eigensolver='current-descriptor-balanced-ordinary-geev',
@@ -429,14 +455,15 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     band = np.arange(nb)[None]
     f_support, u_support = _density_endpoint_column_support(rho, stop,
         occupations=occupations, active=response_active)
-    blocks = response_blocks(energy,f_support,u_support,(response_active.start,response_active.stop),
-                             allow_crossing=True, exact_endpoint_support=True)
+    blocks = _general_response_blocks(energy,f_support,u_support,
+        (response_active.start,response_active.stop),response_partition)
     rules, scalar_cache = [], fit_basis.setdefault('scalar_rules',{})
     # Do not force native high-height supports to use the narrow eta-height
     # continuation grid. Partition by actual height and by noncrossing status;
     # every original site remains an independently checked physical target.
     heights = np.floor(np.log2((sites.imag+gamma)/np.min(sites.imag+gamma))/2).astype(int)
     for bi, block in enumerate(blocks):
+        left_density, right_density = block['density_sides']
         lm, rm = block['u'] != 0, block['f'] != 0
         block['bounds'] = [float(energy[lm].min()),float(energy[lm].max()),
                            float(energy[rm].min()),float(energy[rm].max())]
@@ -444,8 +471,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         # Every propagated coherent column stays live regardless of its
         # diagonal occupation; rho need not commute with current energies.
         coherent = (band >= active.start)&(band < active.stop)
-        left_support = lm & ((coherent | (occupations != 1)) if block['name'][1]=='A' else True)
-        right_support = rm & ((coherent | (occupations != 0)) if block['name'][0]=='A' else True)
+        left_support = lm & ((coherent | (occupations != 1)) if left_density else True)
+        right_support = rm & ((coherent | (occupations != 0)) if right_density else True)
         ranges = []
         for support in (left_support,right_support):
             nonempty = support.any(axis=1)
@@ -484,11 +511,12 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     for panel_index, rule in enumerate(rules):
         panel_start = time.monotonic()
         block = blocks[rule['block_index']]
-        if block['name'][1] == 'A':
+        left_density, right_density = block['density_sides']
+        if left_density:
             left = (pm-ph)*jnp.asarray(block['u'])[:,None,None]
         else:
             left = pm*jnp.asarray(block['u'])[:,None,None]
-        right = (ph if block['name'][0] == 'A' else pm)*jnp.asarray(block['f'])[:,None,None]
+        right = (ph if right_density else pm)*jnp.asarray(block['f'])[:,None,None]
         stream = full_density_response_stream(mesh_xy, grid, (nk, nb, nmu, ns),
             q_ids=query_q_ids, n_outputs=len(rule["members"]), layout=layout, qgrid=qgrid,
             response_window=response_window,
@@ -770,8 +798,9 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                             sys.stdout.flush()
                         try:
                             for block in blocks:
-                                left=((pm-ph) if block['name'][1]=='A' else pm)*jnp.asarray(block['u'])[:,None,None]
-                                right=(ph if block['name'][0]=='A' else pm)*jnp.asarray(block['f'])[:,None,None]
+                                left_density, right_density = block['density_sides']
+                                left=((pm-ph) if left_density else pm)*jnp.asarray(block['u'])[:,None,None]
+                                right=(ph if right_density else pm)*jnp.asarray(block['f'])[:,None,None]
                                 prules=full_density_sample_rules(energy[:,:stop],np.array([z]),gamma_ry=gamma,
                                     tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),
                                     paired=True,values_only=True)
@@ -880,6 +909,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     receipt['frequency_coordinates']=frequency_coordinates
     receipt['response_active_bands'] = [response_active.start,response_active.stop]
     receipt['response_blocks'] = [dict(name=b['name'],interval_ry=[b['lo'],b['hi']],
+                                      density_sides=list(b['density_sides']),components=b['components'],
                                       endpoint_bounds_ry=b['bounds'],
                                       structural_band_ranges=b['band_ranges'].tolist()) for b in blocks]
     receipt['quadrature_work'] = dict(ordered_green_pairs=sum(len(r['times']) for r in rules),
