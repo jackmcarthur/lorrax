@@ -4,6 +4,9 @@ Run with OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1.
 The 3-level electron/one passive boson model retains complete one-sided
 complex column amplitudes and their full Hermitian self-energy correction.
 This script diagnoses approximations; it implements no material closure.
+The internal phase energies E remain fixed while the coherent Hamiltonian
+contains diag(E)+MH[rho]. There is no instantaneous-H diagonalization or
+self-consistent quasiparticle/GW ground-state solve in this model analogue.
 """
 import json
 
@@ -223,7 +226,7 @@ def main():
         weak_coupling_stationary=[stationary(.01, coupling) for coupling in (.1, .3, 1.)],
         exact_number_conserving_fermion_boson_ground_states=[
             exact_ground_state(coupling, cutoff) for coupling, cutoff in ((1., 12), (1., 18), (.1, 12))],
-        limitations='Toy diagnostic only. Nonlinear Markov stationary density is not assumed a ground state. Exact fermion-boson comparison is a model analogue, not exact self-consistent GW. No spectral/density clipping, fit reduction, material calculation or production prescription change.')
+        limitations='Toy diagnostic only, with FIXED internal phase energies E and coherent H=diag(E)+MH[rho]. No instantaneous-H diagonalization or self-consistent quasiparticle/GW solve. Nonlinear Markov stationary density is not assumed a ground state. Exact fermion-boson comparison is a model analogue and does not rule out a genuine self-consistent correlated-ground-state preparation. No spectral/density clipping, fit reduction, material calculation or production prescription change.')
 
 
 if __name__ == '__main__':

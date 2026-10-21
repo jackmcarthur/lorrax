@@ -281,5 +281,5 @@
             "raw_rhs_at_eta_005_fro": 0.00012597412604185558
         }
     ],
-    "limitations": "Toy diagnostic only. Nonlinear Markov stationary density is not assumed a ground state. Exact fermion-boson comparison is a model analogue, not exact self-consistent GW. No spectral/density clipping, fit reduction, material calculation or production prescription change."
+    "limitations": "Toy diagnostic only, with FIXED internal phase energies E and coherent H=diag(E)+MH[rho]. No instantaneous-H diagonalization or self-consistent quasiparticle/GW solve. Nonlinear Markov stationary density is not assumed a ground state. Exact fermion-boson comparison is a model analogue and does not rule out a genuine self-consistent correlated-ground-state preparation. No spectral/density clipping, fit reduction, material calculation or production prescription change."
 }

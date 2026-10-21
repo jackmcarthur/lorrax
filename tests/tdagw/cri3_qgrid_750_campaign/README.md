@@ -22,6 +22,19 @@ controls without material data or a GPU. These results identify a failure
 of the literal collision closure; they are not a validated replacement,
 equilibrium ground state, or 10 fs damping comparison.
 
+The [native positive-time audit](evidence/UPPER_ENDPOINT_LITERAL_TIME_AUDIT_20261021.json)
+checks the full complex kernel against independently integrated time-domain
+Green functions, including coherences and wrong-order negative controls.
+It reproduces the passive three-level violation through the actual stored-W,
+FFT, projection and collision owners. The
+[endpoint/reference toy](evidence/MGKBA_ENDPOINT_REFERENCE_TOY_v1.json)
+separates a kinetic stationary state from a true correlated ground state and
+shows why deleting dispersive terms can break coherent-state number balance.
+Its internal E are fixed; it is not a self-consistent instantaneous-H solve.
+The combined focused check is 20 passing CPU tests, with no new GPU jobs
+and no runtime collision-law change. The paired full-covariance channel
+alternative remains research-only until its dynamical accuracy is tested.
+
 ## Accepted reference and integration status
 
 Latest actual reference: allocation 60056663 step4 completed eight q4 Fejér
