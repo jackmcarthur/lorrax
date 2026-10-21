@@ -1465,6 +1465,19 @@ Both summed boundary compressions must be measured at the actual state.
 The derivation neither deletes principal values nor introduces a secular
 projection, equilibrium subtraction or other change of the reference model.
 
+The independent 21 October audit localizes the saved material failure to
+these dispersive shell differences at all 64 k points. It also checks a
+closed three-level model with a Hermitian vertex, passive reciprocal boson
+pair, commuting sharp density and exact resolvents: the fresh trace is zero
+but the filled-space collision points outward. In particular,
+$P C P=-P(\Gamma-D)P=-P i(R_p-R_p^\dagger)P$ for a filled projector $P$;
+the hole conversion cannot explain that sign. Deleting only the dispersive
+shell differences makes the saved projector's compressions inward, but
+neither guarantees positivity nor preserves fresh number cancellation at
+general coherent densities. These are diagnostic controls, not an enabled
+alternative. Reproduction and exact scope are recorded in
+[the independent audit](../../tests/tdagw/cri3_qgrid_750_campaign/evidence/INDEPENDENT_PAULI_LOCALIZATION_20261021.json).
+
 ###### Research alternative: paired covariance-root jumps
 
 This is an unimplemented alternative collision prescription, not a repair or

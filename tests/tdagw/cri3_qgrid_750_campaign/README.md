@@ -6,6 +6,24 @@ or automatic job submission is bundled here. Launch collectively through the
 normal authenticated native environment and a separately enforced wall cap.
 The small tests check metadata/owner contracts, not GPU or material accuracy.
 
+## Independent collision audit, 21 October
+
+The occupation-bound failure is separate from the converged fresh-number
+residual. Three independent audits check the derivation, actual native
+execution and saved material matrices; no collision prescription is changed.
+The read-only `independent_pauli_audit.py DATA_ROOT` reproduces the all64-k
+localization and authenticates its saved inputs. The
+[localization receipt](evidence/INDEPENDENT_PAULI_LOCALIZATION_20261021.json)
+includes a closed passive three-level counterexample with zero trace but an
+outward filled-space direction, row/column controls, rotations and the
+limitations of deleting dispersive shell differences. The seven tiny tests
+in `../test_column_shell_boundary_control_cpu.py` reproduce those algebraic
+controls without material data or a GPU. These results identify a failure
+of the literal collision closure; they are not a validated replacement,
+equilibrium ground state, or 10 fs damping comparison.
+
+## Accepted reference and integration status
+
 Latest actual reference: allocation 60056663 step4 completed eight q4 Fejér
 SC maps on source `861d228`, meeting the 1 meV native criterion with a
 0.974317 meV residual. The completed driver authenticates the accepted INPUT
