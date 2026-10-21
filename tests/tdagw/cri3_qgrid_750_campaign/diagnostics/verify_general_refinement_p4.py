@@ -53,7 +53,7 @@ def refinement_stage(c):
     meta.shared_pole_capacity.live_stages=(price['stage'],)
     execution=dict(seconds={},memory=[],compiled=[])
     execute=_bank_execution(meta,mesh,execution,config)
-    H=put(np.broadcast_to(.15*np.eye(mu),(nq,mu,mu)),P(None,'x','y'))
+    H=put(np.broadcast_to(.15*np.eye(mu,dtype=np.complex128),(nq,mu,mu)),P(None,'x','y'))
     dyson,_,_,algebra=response_algebra(meta,config,mesh_xy=mesh,n=mu,ordered=True)
     mm=face_matmul(mesh);endpoint=density_left_endpoint(mesh,c['pm'].shape)
     density=np.broadcast_to(np.diag([1.,.3,.7,0.]),(c['nk'],c['nb'],c['nb'])).astype(complex).copy()
@@ -127,7 +127,7 @@ def refinement_stage(c):
     b=rng.normal(size=(nq,mu,1))+1j*rng.normal(size=(nq,mu,1))
     residue=a@b.conj().swapaxes(-1,-2);pole=.7-.04j
     def exact(z):return residue/(z-pole)-residue[minus].conj()/(z+pole.conjugate())
-    oldq=put(np.broadcast_to(np.eye(mu),(nq,mu,mu)),P(None,'x','y'))
+    oldq=put(np.broadcast_to(np.eye(mu,dtype=np.complex128),(nq,mu,mu)),P(None,'x','y'))
     left=[(.2+.4j,oldq),(p+.025*(1+1j),lp),(-p.conjugate()+.025*(-1+1j),lm)]
     right=[(.35+.3j,oldq),(p,rp),(-p.conjugate(),rm)]
     def join(rows,is_left):

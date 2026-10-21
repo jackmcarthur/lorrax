@@ -1,0 +1,86 @@
+{
+  "status": "ACTUAL_ORDERED_SIGMA44_COMPLETE_T0_NUMBER_REFUSED_BOUNDARY_ALSO_OUTWARD",
+  "job": "60071791",
+  "step": "60071791.0",
+  "source_revision": "3ada0de77b90bdb9ad5ae090c2ec2fb7786781db",
+  "source_archive_sha256": "934792aa36288e456c1ffa1d819542a41350db5f697bc97864bb48e9f478eebe",
+  "arm": "B_FROZEN_W_MGKBA",
+  "amplitude_v_m": 800000000,
+  "diagnostic_role": "UNQUALIFIED_DRIVEN_PILOT",
+  "virtual_bands": 750,
+  "active_window": [100, 144],
+  "electronic_grid": [8, 8, 1],
+  "response_grid": [4, 4, 1],
+  "response_window": "fejer",
+  "centroids": 3000,
+  "fit_tolerance": 0.05,
+  "maximum_full_W_fit_held_error": 0.03332615679,
+  "general_W_seconds": 301.21671983,
+  "ordered_sigma44": {
+    "actual_column_energy_shells": true,
+    "physical_tau_pairs": 326,
+    "sweeps": 12,
+    "undispatched": 0,
+    "wall_seconds_as_printed": 23,
+    "quadrature_eps": 0.0001,
+    "sigma_eta_ev": 0.25,
+    "response_gamma_ev": 0.05
+  },
+  "t0_setup_seconds": 332.2048492390022,
+  "t0": {
+    "rho_min": 0.0,
+    "rho_max": 1.0,
+    "weighted_trace_rate_ry": -3.400550757698023e-6,
+    "fresh_trace_relative": 2.4289061311135264e-5,
+    "fresh_trace_relative_limit": 1e-7,
+    "empty_injection_min_ry": 5.5784820888797916e-5,
+    "filled_blocking_min_ry": -0.001828290475877,
+    "boundary_guard_reached": false,
+    "boundary_note": "The number guard raised first. Saved boundary data independently also show an outward filled tangent."
+  },
+  "independent_small_matrix_audit": {
+    "U_exact_identity": true,
+    "rho_exact_projector": true,
+    "filled_states_per_k": 30,
+    "empty_states_per_k": 14,
+    "Gamma_D_and_MH_reconstruct_exactly": true,
+    "filled_negative_eigenvalues": 494,
+    "filled_eigenvalues_total": 1920,
+    "all_filled_diagonal_blocking_entries_positive": true,
+    "worst_filled_mode_pv_rayleigh_ry": -0.002531916570828,
+    "worst_filled_mode_absorptive_rayleigh_ry": 0.000703626094951,
+    "absorptive_filled_blocks_PSD_at_all_k": true,
+    "spectral_only_is_not_a_driven_fix": "Independent exact passive-pole coherent-state counterexamples violate particle conservation under naive spectral row/column averaging."
+  },
+  "physical_steps": 0,
+  "accepted_refreshes": 0,
+  "B_trajectory_completed": false,
+  "C_launched": false,
+  "damping_or_polarization_comparison": "NOT_MEASURED",
+  "artifact_directory": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/material_Bpilot8e8_3ada_60071791",
+  "artifact_sha256": {
+    "snapshot_0000.json": "469fed7d5eb73cdd5721fa915398e450bee5f02a11782f22133a59ce8fc6c0c6",
+    "snapshot_0000.npz": "a6232345e31b8355d12025fe2402bbcfec4d1f34b49d2993a2fd9ffeca679e58"
+  },
+  "operator_audit": {
+    "path": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/BPILOT_T0_COLLISION_PRESCRIPTION_AUDIT.txt",
+    "sha256": "0cf300b53da44a36f04c6b565f11f7d6a356e77b3e408e540d654d3e4ae3697d"
+  },
+  "persisted_W": {
+    "bytes": 2097556159,
+    "schema": "shared-general-pole.v1",
+    "final_commit": "52fb9de00cf25c1a8b2c6018c4151fe88019fa75e57fa36f0996be7dbda6231d",
+    "all_sixteen_q_written": true,
+    "reuse_scope": "Authenticate the same source, W, rho and E for tighter-Sigma quadrature diagnostics; no automatic dynamics admission."
+  },
+  "accounting": {
+    "allocation_released_utc": "2026-10-21T03:58:45Z",
+    "reserved_gpu_hours": 5.733333333333333,
+    "B_active_gpu_hours": 3.52,
+    "failed_P4_fixture_active_gpu_hours": 0.024444444444444446,
+    "combined_active_gpu_hours": 3.5444444444444443,
+    "views_are_nonadditive": true,
+    "overlapping_one_second_NVML_not_added": true
+  },
+  "separate_P4_fixture": "Native current-chi, epsilon and direction stages ran; the final signed-toy join failed because a fixture identity was real while W was complex. The fixture dtype is corrected, but no native retry or PASS is claimed. Production numerical source is unchanged."
+}

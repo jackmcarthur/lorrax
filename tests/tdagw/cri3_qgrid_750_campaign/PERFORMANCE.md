@@ -496,6 +496,31 @@ separate underconverged numerical setting. It does not turn this 0.02 failure
 into a pass or change conservation, density-boundary, Pauli, trace or finite
 checks. A pilot is not a converged screening or damping result.
 
+### First actual instantaneous-shell Sigma44: 23 s, operator refused at t0
+
+Driven pilot `60071791.0` on source `3ada0de` admitted the initial full W
+at its explicitly requested 5% fit tolerance (maximum measured fit/held
+error 3.3326%). Full general-W construction took **301.217 s**; the genuine
+ordered 44-destination Sigma then completed **326 tau pairs / 12 sweeps in
+23 s**, with zero undispatched pairs and `sigma_quadrature_eps=1e-4`.
+The t0 collision setup took **332.205 s** including W, not per physical step.
+
+No physical step ran. Fresh number residual `-3.40055e-6 Ry`, relative
+`2.42891e-5`, failed the unchanged `1e-7` relative guard. Independently the
+saved filled boundary block had minimum **-0.00182829 Ry (-24.875 meV)**.
+Two small-matrix audits reproduce Gamma/D/MH exactly and isolate the worst
+mode's one-sided PV contribution (-0.00253192 Ry) versus absorptive part
+(+0.000703626 Ry). All filled diagonal rates are positive; this is an
+off-diagonal boundary failure, not a population-rate sign error. A Hermitian
+Hamiltonian counterterm cannot cancel a projector's boundary compression.
+Naively removing PV is not a conserving replacement for coherent rho.
+
+The number defect needs a same-W tighter-quadrature test; its numerical
+origin is plausible but not established. W is persisted (~2.097 GB), so a
+proper replay need not reconstruct screening. None of these measurements
+is a 10fs trajectory, twelve screening updates, damping comparison, or
+universal positivity result. See the [actual operator and accounting record](evidence/B_PILOT_T0_REFUSAL_60071791.json).
+
 ### Correction: the707 t0 request was not on its instantaneous shells
 
 The preserved707 measurements above remain raw historical evidence, but
