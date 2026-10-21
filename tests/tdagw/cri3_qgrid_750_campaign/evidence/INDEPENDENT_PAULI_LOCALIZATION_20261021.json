@@ -1,0 +1,287 @@
+{
+  "source_commit": "371efadca2df70234d406e2a8d674eefbd6fe2e0",
+  "diagnostic_only": true,
+  "limits": "Saved active BODY, exact t0 projector, all64k row/column pairs and k0 common-frequency grid only. No model changes, clipping, roots, propagation, full guard, coherent-density material test, eta refinement, complete microscopic accuracy or positivity theorem. The PV-free comparison is not an enabled or validated replacement.",
+  "boundary_proof": "For exact filled projector P, PCP=-P(Gamma-D)P=-P width(Rp) P; hole conversion cancels identically. For empty Q, QCQ=Q D Q. Any Hermitian commutator has zero P/P and Q/Q compression. All operators in Ry; Hartree conversion multiplies rates by positive 1/2 and cannot alter signs.",
+  "head_scope": "Head omitted in saved replay. At this exact diagonal projector its particle filled compression and hole empty compression vanish by their Q/P factors; omission cannot change either boundary. Not true for arbitrary coherent later snapshots.",
+  "eta_scope": "The three-level reciprocal counterexample also leaks at eta=1e-8. Reducing eta is not a general cure: unequal off-resonant PV column limits remain. Material eta dependence has not been measured; other physical channels can compensate individual negative channel minors.",
+  "inputs": {
+    "spectral_60080234.npz": "31040792f66734965fd90f5e96aff78cc6c452b6d119f6768fb9b5844f0aba9b",
+    "same_w_rate_eps8.npz": "15e3291c6028c66ecb6a801778b83df176f81fd52f9b2ea55c8cae54a399b87a",
+    "material_Bpilot8e8_3ada_60071791/snapshot_0000.npz": "a6232345e31b8355d12025fe2402bbcfec4d1f34b49d2993a2fd9ffeca679e58"
+  },
+  "state": {
+    "U_identity_error": 0.0,
+    "projector_error": 0.0,
+    "rho_rotation_error": 0.0,
+    "H_reconstruction_error_ry": 0.0,
+    "H_rho_commutator_ry": 0.0,
+    "MH_filled_commutator_ry": 0.0,
+    "minimum_energy_gap_ry": 0.0014440928529390051,
+    "filled_count": 30,
+    "empty_count": 14
+  },
+  "saved_reconstruction": {
+    "gamma_error": 1.3904866443919908e-17,
+    "D_error": 0.0,
+    "C_error": 8.673617379884035e-19
+  },
+  "common_grid_reconstruction": {
+    "cond": {
+      "column_error_ry": 8.607825513053225e-11,
+      "row_error_ry": 8.523615603307626e-11,
+      "common_K_min_ry": 3.3865357069873135e-05
+    },
+    "val": {
+      "column_error_ry": 5.884480797059722e-14,
+      "row_error_ry": 5.884480797059722e-14,
+      "common_K_min_ry": 0.00017322254583172712
+    },
+    "exact_energy_match": true
+  },
+  "raw_all_k": {
+    "trace_mean_ry": -9.643635777358429e-12,
+    "filled_min_ry": -0.0018271036950328785,
+    "filled_worst_k": 0,
+    "empty_min_ry": 5.5788187819426375e-05,
+    "filled_bad_k": 64,
+    "empty_bad_k": 0,
+    "C_fro_ry": 0.47483400541753235
+  },
+  "row_all_k": {
+    "trace_mean_ry": -9.643635777358429e-12,
+    "filled_min_ry": -0.0018288510691988487,
+    "filled_worst_k": 0,
+    "empty_min_ry": 5.54406891699703e-05,
+    "filled_bad_k": 64,
+    "empty_bad_k": 0,
+    "C_fro_ry": 0.4748492847368334
+  },
+  "absorption_only_all_k": {
+    "trace_mean_ry": -9.643635777358429e-12,
+    "filled_min_ry": 3.8979779327776135e-05,
+    "filled_worst_k": 0,
+    "empty_min_ry": 0.00018769154781235063,
+    "filled_bad_k": 0,
+    "empty_bad_k": 0,
+    "C_fro_ry": 0.06387035938684286
+  },
+  "PV_scan": {
+    "-1": {
+      "trace_mean_ry": -9.643635777358429e-12,
+      "filled_min_ry": -0.0018288510691988444,
+      "filled_worst_k": 0,
+      "empty_min_ry": 5.544068916997053e-05,
+      "filled_bad_k": 64,
+      "empty_bad_k": 0,
+      "C_fro_ry": 0.4748492847368334
+    },
+    "-0.5": {
+      "trace_mean_ry": -9.643635777358429e-12,
+      "filled_min_ry": -0.000620738995556385,
+      "filled_worst_k": 0,
+      "empty_min_ry": 0.0001585221172025439,
+      "filled_bad_k": 64,
+      "empty_bad_k": 0,
+      "C_fro_ry": 0.24378646747553917
+    },
+    "0": {
+      "trace_mean_ry": -9.643635777358429e-12,
+      "filled_min_ry": 3.8979779327776135e-05,
+      "filled_worst_k": 0,
+      "empty_min_ry": 0.00018769154781235063,
+      "filled_bad_k": 0,
+      "empty_bad_k": 0,
+      "C_fro_ry": 0.06387035938684286
+    },
+    "0.25": {
+      "trace_mean_ry": -9.643635777358429e-12,
+      "filled_min_ry": -0.00013212897197453866,
+      "filled_worst_k": 0,
+      "empty_min_ry": 0.00018399844995921545,
+      "filled_bad_k": 58,
+      "empty_bad_k": 0,
+      "C_fro_ry": 0.1338462058326144
+    },
+    "0.5": {
+      "trace_mean_ry": -9.643635777358429e-12,
+      "filled_min_ry": -0.0006198684848206995,
+      "filled_worst_k": 0,
+      "empty_min_ry": 0.0001586317294166626,
+      "filled_bad_k": 64,
+      "empty_bad_k": 0,
+      "C_fro_ry": 0.24377158666893337
+    },
+    "0.75": {
+      "trace_mean_ry": -9.643635777358429e-12,
+      "filled_min_ry": -0.0012049680311943811,
+      "filled_worst_k": 0,
+      "empty_min_ry": 0.00011420100490152294,
+      "filled_bad_k": 64,
+      "empty_bad_k": 0,
+      "C_fro_ry": 0.35862063766899
+    },
+    "1": {
+      "trace_mean_ry": -9.643635777358429e-12,
+      "filled_min_ry": -0.0018271036950328757,
+      "filled_worst_k": 0,
+      "empty_min_ry": 5.5788187819426375e-05,
+      "filled_bad_k": 64,
+      "empty_bad_k": 0,
+      "C_fro_ry": 0.47483400541753235
+    }
+  },
+  "grid_decomposition": {
+    "cond": {
+      "identity_error_ry": 1.0408340855860843e-17,
+      "absorption_vs_saved_error_ry": 1.4479388521504433e-10,
+      "PV_vs_saved_error_ry": 8.103149156980368e-11
+    },
+    "val": {
+      "identity_error_ry": 8.673617379884035e-18,
+      "absorption_vs_saved_error_ry": 2.9134030257726984e-14,
+      "PV_vs_saved_error_ry": 5.6362935295508785e-14
+    }
+  },
+  "negative_witness": {
+    "eigenvalue_ry": -0.0018271036950328798,
+    "eigenvalue_meV": -24.85901217850578,
+    "absorption_rayleigh_ry": 0.0007032254373075397,
+    "PV_rayleigh_ry": -0.002530329132340419,
+    "PCPrayleigh_ry": 0.0018271036950328787,
+    "significant_support": [
+      0,
+      2,
+      3,
+      4,
+      9,
+      19,
+      23,
+      24,
+      25
+    ],
+    "energy_spread_ry": 0.07188233765070424
+  },
+  "two_state_witness": {
+    "bands": [
+      4,
+      25
+    ],
+    "determinant_ry2": -2.249635453446404e-06,
+    "eigenvalues_ry": [
+      -0.0008610609441542248,
+      0.0026126320891909725
+    ],
+    "gap_ry": 0.14852562155948723
+  },
+  "outer_rho_placement": {
+    "literal_vs_split_error_ry": 1.3985787785349405e-17,
+    "filled_boundary_change_ry": 0.0,
+    "empty_boundary_change_ry": 0.0
+  },
+  "unitary_covariance": {
+    "operator_shell_error_ry": 3.075547341870029e-16,
+    "naive_fixed_indices_error_ry": 0.051643416380121925,
+    "boundary_eigenvalue_error_ry": 9.107298248878237e-18
+  },
+  "diagonal_commuting_control": {
+    "trace_mean_ry": -9.643635777358429e-12,
+    "filled_min_ry": 0.00012901741815233084,
+    "filled_worst_k": 0,
+    "empty_min_ry": 0.0001909755487720555,
+    "filled_bad_k": 0,
+    "empty_bad_k": 0,
+    "C_fro_ry": 0.038540021821122955
+  },
+  "equal_frequency_control": [
+    {
+      "index": 0,
+      "cond_min_ry": 3.400473644940102e-05,
+      "val_min_ry": 0.0005252797176242352
+    },
+    {
+      "index": 15,
+      "cond_min_ry": 3.879427630912046e-05,
+      "val_min_ry": 0.000372604582940762
+    },
+    {
+      "index": 29,
+      "cond_min_ry": 4.6410850397325066e-05,
+      "val_min_ry": 0.0002866628479521354
+    },
+    {
+      "index": 30,
+      "cond_min_ry": 6.961924857982182e-05,
+      "val_min_ry": 0.00020900613721978696
+    },
+    {
+      "index": 43,
+      "cond_min_ry": 0.000127400474692294,
+      "val_min_ry": 0.0001737342981792764
+    }
+  ],
+  "energy_degeneracy": {
+    "minimum_adjacent_gap_all_k_ry": 5.577623056585157e-05,
+    "nearest_pair_k0_meV": 19.64788419819701
+  },
+  "analytic_counterexample": {
+    "retarded_column_real": [
+      [
+        0.0,
+        0.5
+      ],
+      [
+        0.0,
+        0.5
+      ]
+    ],
+    "retarded_column_imag": [
+      [
+        -1.0,
+        -0.5
+      ],
+      [
+        -1.0,
+        -0.5
+      ]
+    ],
+    "filled_width_eigenvalues": [
+      -0.15831239517769968,
+      3.1583123951777
+    ],
+    "filled_width_determinant": -0.5,
+    "common_frequency_width_eigenvalues": [
+      [
+        0.0,
+        4.0
+      ],
+      [
+        0.0,
+        2.0
+      ]
+    ],
+    "PCP_max_eigenvalue": 0.15831239517769968,
+    "meaning": "A single passive channel alone is not a closed reciprocal all-k system, so this demonstrates boundary indefiniteness, not a number-conservation counterexample."
+  },
+  "closed_reciprocal_counterexample": {
+    "energies": [
+      -1.0,
+      -0.5,
+      1.0
+    ],
+    "eta": 0.2,
+    "boson": 1.0,
+    "trace": 0.0,
+    "filled_blocking_eigenvalues": [
+      -0.031543335232515776,
+      0.1393841276126106
+    ],
+    "filled_C_eigenvalues": [
+      -0.1393841276126106,
+      0.031543335232515776
+    ],
+    "empty_injection": 0.10784079238009482,
+    "filled_minor": -0.004396640263376338,
+    "scope": "Literal passive reference branches; reciprocal Hermitian vertex; diagonal sharp rho commuting with H; no head, numerical quadrature, coherent rho, basis ambiguity or fitting. Arbitrary energy units. Not material fitting."
+  }
+}
