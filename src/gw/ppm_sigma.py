@@ -1813,13 +1813,15 @@ LINE_PAIRINGS = ("symmetric", "vertex")
 
 
 @lru_cache(maxsize=8)
-def _line_insert_fn(b_lo, n_a, n_blocks, n_pad, nmu_spec, mun_spec, mesh_xy, full_nmu, full_mun):
+def _line_insert_fn(b_lo, n_a, n_blocks, n_pad, nmu_spec, mun_spec, mesh_xy, full_nmu, full_mun,
+                    subtract_base=False):
     """Both layouts with other panels' window columns inserted after the window (Eq. 8c).
 
     [0, b_hi) of ``base`` | columns [b_lo, b_hi) of each of the ``n_blocks`` extra
     panels | n_pad zero columns | [b_hi, nb) of ``base``, b_hi = b_lo + n_a: the extra
     internal columns of a non-diagonal line (:func:`_window_lines`).  Both layouts hold
-    non-conjugated orbitals.
+    non-conjugated orbitals. ``subtract_base`` inserts each extra's active
+    columns minus the base's active columns, without a full-band temporary.
     """
     lo, hi = int(b_lo), int(b_lo) + int(n_a)
     out = (NamedSharding(mesh_xy, nmu_spec), NamedSharding(mesh_xy, mun_spec))
@@ -1827,15 +1829,20 @@ def _line_insert_fn(b_lo, n_a, n_blocks, n_pad, nmu_spec, mun_spec, mesh_xy, ful
     def build(base_nmu, base_mun, extra_nmu, extra_mun):
         pad_n = jnp.zeros(base_nmu.shape[:1] + (int(n_pad),) + base_nmu.shape[2:], base_nmu.dtype)
         pad_m = jnp.zeros(base_mun.shape[:3] + (int(n_pad),), base_mun.dtype)
-        nmu = jnp.concatenate([base_nmu[:, :hi]] + [x[:, lo:hi] for x in extra_nmu]
+        active_n = [x[:, lo:hi] for x in extra_nmu]
+        active_m = [x[..., lo:hi] for x in extra_mun]
+        if subtract_base:
+            active_n = [x - base_nmu[:, lo:hi] for x in active_n]
+            active_m = [x - base_mun[..., lo:hi] for x in active_m]
+        nmu = jnp.concatenate([base_nmu[:, :hi]] + active_n
                               + [pad_n, base_nmu[:, hi:]], axis=1)
-        mun = jnp.concatenate([base_mun[..., :hi]] + [x[..., lo:hi] for x in extra_mun]
+        mun = jnp.concatenate([base_mun[..., :hi]] + active_m
                               + [pad_m, base_mun[..., hi:]], axis=-1)
         return nmu, mun
     return jax.jit(build, out_shardings=out)
 
 
-def _insert_columns(base, extras, b_lo, n_a, mesh_xy):
+def _insert_columns(base, extras, b_lo, n_a, mesh_xy, *, subtract_base=False):
     """(nmu, mun, n_pad) of :func:`_line_insert_fn` for face pairs ``base`` and ``extras``;
     the ``n_pad`` zero columns keep the band axis a multiple of both mesh axes (the faces
     shard it over x and y)."""
@@ -1844,7 +1851,7 @@ def _insert_columns(base, extras, b_lo, n_a, mesh_xy):
     n_pad = (-(int(base[0].shape[1]) + len(extras) * int(n_a))) % div
     fn = _line_insert_fn(int(b_lo), int(n_a), len(extras), int(n_pad), base[0].sharding.spec,
                          base[1].sharding.spec, mesh_xy, tuple(base[0].shape),
-                         tuple(base[1].shape))
+                         tuple(base[1].shape), bool(subtract_base))
     nmu, mun = fn(base[0], base[1], [x[0] for x in extras], [x[1] for x in extras])
     return nmu, mun, int(n_pad)
 
@@ -2252,9 +2259,9 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
 
     One native band-bracket sweep retains both the active intermediate
     contribution and the full virtual sum, at the same compact real
-    destination bands. The left electronic panel is psi rho, so every
-    phase belongs to the right internal index. An inserted identity active
-    panel represents I-rho without diagonalizing the density.
+    destination bands. The active left panels are psi rho and psi (I-rho),
+    with the same unweighted right orbitals and right-index phases. No
+    density diagonalization or cancellation between particle panels is used.
     """
     from common.collectives import gather_to_host
     from .mpa.sigma import ordered_shared_pole_sigma
@@ -2262,11 +2269,12 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
 
     nk, nb = pop.shape
     hi = int(b_lo) + int(n_a)
-    # Both faces remain the actual instantaneous orbitals; only the Green
-    # left panel receives rho. Frozen spectators have diagonal 0/1 lines.
+    # Right faces remain the actual instantaneous orbitals. Only Green left
+    # panels receive rho or I-rho; frozen spectators keep diagonal 0/1 lines.
     hole = _rotate_faces(*faces, rho, b_lo, np.ones(faces[0].shape[1]))
     enlarged_n, enlarged_m, n_pad = _insert_columns(faces, [faces], b_lo, n_a, mesh_xy)
-    _, left_m, _ = _insert_columns(hole, [faces], b_lo, n_a, mesh_xy)
+    _, left_m, _ = _insert_columns(hole, [faces], b_lo, n_a, mesh_xy,
+                                  subtract_base=True)
     n_insert = int(n_a) + n_pad
     insert = lambda a, x, pad: np.concatenate((a[:, :hi], x, pad, a[:, hi:]), axis=1)
     energy = insert(enk, enk[:, b_lo:hi], np.repeat(enk[:, b_lo:b_lo+1], n_pad, axis=1))
@@ -2278,15 +2286,17 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     request, request_receipt = ordered_window_request(enk[:, b_lo:hi], efermi)
     hole_weight = insert(pop, np.zeros((nk, n_a)), np.zeros((nk, n_pad)))
     part_weight = insert(1.0-pop, np.ones((nk, n_a)), np.zeros((nk, n_pad)))
-    # Preserve every nonzero coherence. The negative particle panel is
-    # -rho, NOT I-rho: even a fully occupied column must cancel its
-    # inserted identity column exactly.
-    live_h = np.any(np.abs(rho) != 0.0, axis=-1)
+    # Preserve every nonzero coherence in each left endpoint. Liveness is
+    # by RIGHT column, whose energy supplies the phase, with no threshold.
+    # Fully occupied/empty active columns have no particle/hole window.
+    live_h = np.any(np.abs(rho) != 0.0, axis=-2)
+    live_p = np.any(np.abs(np.eye(n_a)[None] - rho) != 0.0, axis=-2)
     hole_weight[:, b_lo:hi] = live_h
-    part_weight[:, b_lo:hi] = -live_h.astype(np.float64)
+    part_weight[:, b_lo:hi] = 0.0
+    part_weight[:, hi:hi+n_a] = live_p
     if internal == 'active':
-        # Existing active-intermediate diagnostic: retain every active rho
-        # and inserted identity column, with no deep-band planning interval.
+        # Existing active-intermediate diagnostic: retain both active left
+        # endpoints, with no deep-band planning interval.
         for weight in (hole_weight,part_weight):
             weight[:,:b_lo]=0
             weight[:,hi+n_a:]=0
@@ -2372,7 +2382,9 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
         sweep=dict(n_windows=receipt["n_windows"], window_tau_pairs=receipt["window_tau_pairs"],
             distinct_tau=receipt["window_tau_pairs"], held=False, rebuilds=0,
             windows=[(x["name"], x["node_count"]) for x in receipt["windows"]]),
-        full_rho=dict(pairing="vertex", n_insert=n_insert), basis=U)
+        full_rho=dict(pairing="vertex", n_insert=n_insert,
+            carrier="rho_and_complement",
+            live=dict(val=int(np.sum(live_h)), cond=int(np.sum(live_p)))), basis=U)
 
 
 def window_sigma_c(wfns, poles, window: dict, plan: dict, *, meta, mesh_xy, omega_ry=None,

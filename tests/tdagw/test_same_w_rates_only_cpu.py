@@ -3,13 +3,15 @@ from dataclasses import replace
 
 import jax
 import numpy as np
+import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from tests.test_tdagw_full_microscopic_cpu import _native_port_fixture, _reciprocal_banks
 
 
+@pytest.mark.parametrize('density_case', ['coherent', 'tiny_coherence', 'projector', 'empty', 'filled'])
 def test_native_rates_only_matches_default_active_rates_and_excludes_deep_spectator(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, density_case):
     from common.units import RYD_TO_EV
     from file_io.shared_pole_store import write_general_shared_pole_model
     from ffi import fft
@@ -37,6 +39,16 @@ def test_native_rates_only_matches_default_active_rates_and_excludes_deep_specta
         digest=header['digest'], K=header['K'], representation='ordered_complex'),
         case['meta'], efermi_ry=0., linalg='distributed')
     rho = np.broadcast_to(np.array([[.64, .13+.08j], [.13-.08j, .31]]), (nk, 2, 2)).copy()
+    if density_case == 'tiny_coherence':
+        v = np.array([1., 2e-7j])
+        rho[:] = np.outer(v, v.conj())/np.vdot(v, v).real
+        assert 0. < abs(rho[0, 0, 1]) < 1e-5
+    elif density_case != 'coherent':
+        diagonal = dict(projector=[1., 0.], empty=[0., 0.], filled=[1., 1.])[density_case]
+        rho = np.broadcast_to(np.diag(diagonal), (nk, 2, 2)).astype(complex).copy()
+    else:
+        h = case['energy'][:, 1:, None]*np.eye(2)[None]
+        assert np.linalg.norm(h@rho-rho@h) > .1  # Right phases cannot move through rho.
     energy = np.asarray(case['wfns'].enk).copy()
     energy[:, 0] = -20.  # Deep frozen occupied line must not widen rate-only boxes.
     window = dict(b_lo=1, U=np.broadcast_to(np.eye(2), (nk, 2, 2)).copy(),
@@ -66,7 +78,14 @@ def test_native_rates_only_matches_default_active_rates_and_excludes_deep_specta
         np.testing.assert_array_equal(np.asarray(branch.band_weight)[:, 0], 0.)
         np.testing.assert_array_equal(np.asarray(branch.base_mask_A)[:, 0], False)
         live_energy = np.asarray(branch.E_A)[np.asarray(branch.base_mask_A)]
-        assert live_energy.min() > -1.
+        if live_energy.size:
+            assert live_energy.min() > -1.
+        weight = np.asarray(branch.band_weight)
+        expected_h = np.any(abs(rho) != 0., axis=-2)
+        expected_p = np.any(abs(np.eye(2)[None]-rho) != 0., axis=-2)
+        np.testing.assert_array_equal(weight[:, 1:3], expected_h if branch.space == 'val' else 0.)
+        np.testing.assert_array_equal(weight[:, 3:5], expected_p if branch.space == 'cond' else 0.)
+        np.testing.assert_array_equal(np.asarray(branch.base_mask_A), weight != 0.)
     for space in ('cond', 'val'):
         np.testing.assert_allclose(rates['active_branch_pair'][space],
             default['active_branch_pair'][space], rtol=3e-5, atol=6e-8)
@@ -77,6 +96,15 @@ def test_native_rates_only_matches_default_active_rates_and_excludes_deep_specta
     np.testing.assert_allclose(dr, dd, rtol=3e-5, atol=6e-8)
     assert default['native_receipt']['virtual_intermediates'] == 'all'
     assert rates['native_receipt']['virtual_intermediates'] == 'active'
+    assert rates['full_rho']['carrier'] == 'rho_and_complement'
+    assert rates['full_rho']['live'] == dict(val=int(np.sum(expected_h)), cond=int(np.sum(expected_p)))
+    absent = dict(empty='val', filled='cond').get(density_case)
+    if absent is not None:
+        np.testing.assert_array_equal(rates['active_branch_pair'][absent], 0.)
+        assert not any(w['name'].startswith(f'ordered:{absent}:')
+                       for w in rates['native_receipt']['windows'])
+        present = 'val' if absent == 'cond' else 'cond'
+        assert np.linalg.norm(rates['active_branch_pair'][present]) > 1e-4
 
 
 def test_actual_finite_width_head_has_zero_projector_collision_and_boundary():
