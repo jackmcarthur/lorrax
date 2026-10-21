@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from common.units import RYD_TO_EV
-from gw.ppm_sigma import on_shell_request
+from gw.ppm_sigma import ordered_window_request
 from tdagw.snapshot_runtime import _native_window_support_reads
 
 
@@ -17,18 +17,15 @@ def fp64_request_metadata():
         yield
 
 
-def test_current_shells_and_actual_native_auxiliary_reads_are_absolute_eV():
+def test_current_shells_are_absolute_eV_without_legacy_static_fallback():
     e = np.array([[-.7, -.1, .3, .9], [-.6, -.2, .4, .8]])
     mu = -.25
     plan = dict(omega_range_ev=np.array([-2., 2.]), out_of_grid="cover")
     got = _native_window_support_reads(e, mu, plan)
-    external = (e-mu)*RYD_TO_EV
-    request = on_shell_request(e_eval_rel_ev=external, e_dft_rel_ev=external,
-        omega_range_ev=plan["omega_range_ev"], out_of_grid="cover",
-        irr_idx=np.arange(2), n_parent=2)
+    request, _ = ordered_window_request(e, mu)
     expected = np.unique(np.r_[e.ravel()*RYD_TO_EV, (request.frequencies_ry+mu)*RYD_TO_EV])
     np.testing.assert_array_equal(got, expected)
-    assert np.min(abs(got-mu*RYD_TO_EV)) < 1.e-14  # actual eval0/dft0 fallback
+    assert np.min(abs(got-mu*RYD_TO_EV)) > 1.e-3  # no artificial eval0/dft0 fallback
     assert got.min() >= e.min()*RYD_TO_EV-1.e-14
     assert got.max() <= e.max()*RYD_TO_EV+1.e-14
 

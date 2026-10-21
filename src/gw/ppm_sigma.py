@@ -281,6 +281,52 @@ def on_shell_request(*, e_eval_rel_ev, e_dft_rel_ev, omega_range_ev, out_of_grid
         covered_kn=np.asarray(covered, dtype=bool), omega_range_ev=(lo, hi))
 
 
+def ordered_window_request(energy_ry, efermi_ry):
+    """Exact current-shell request for the ordered instantaneous window.
+
+    Parameters
+    ----------
+    energy_ry : ndarray (nk, n_active)
+        Current absolute electronic shell energies in Ry. Row and column
+        matrix samples use these same shells, never a legacy SC grid fallback.
+    efermi_ry : float
+        Common absolute frequency reference in Ry for both external shells
+        and internal Green energies.
+
+    Returns
+    -------
+    request, receipt : OnShellRequest, dict
+        Native request and its single scalar planning domain: the current
+        active minimum/maximum with a 1 eV margin. Zero is included in the
+        domain if required by the native request contract, but is not added
+        as an evaluation shell. All full-band virtual lines remain unchanged.
+    """
+    energy = np.asarray(energy_ry, np.float64)
+    efermi = float(efermi_ry)
+    if (energy.ndim != 2 or not energy.size or not np.isfinite(energy).all()
+            or not np.isfinite(efermi)):
+        raise ValueError("GATE ordered_window_request: finite current shell energies required")
+    external = (energy-efermi)*RYD_TO_EV
+    margin = 1.0
+    actual = (float(external.min()), float(external.max()))
+    domain = (min(0.0, actual[0]-margin), max(0.0, actual[1]+margin))
+    request = on_shell_request(e_eval_rel_ev=external, e_dft_rel_ev=external,
+        omega_range_ev=np.asarray(domain), out_of_grid="cover",
+        irr_idx=np.arange(len(energy)), n_parent=len(energy))
+    expected = external/RYD_TO_EV
+    if (not np.all(request.covered_kn)
+            or not np.array_equal(request.tables_ry[request.slot("pair")], expected)
+            or any(not np.array_equal(table, expected) for table in request.tables_ry)):
+        raise ValueError("GATE ordered_window_request: current shells changed or fell back to static reads")
+    receipt = dict(policy="exact_current_active_shells", active_shape=list(energy.shape),
+        external_shell_range_ev=list(actual), domain_ev=list(domain), margin_ev=margin,
+        frequency_reference_ry=efermi, all_shells_covered=True,
+        static_fallback_reads=0, legacy_SC_grid_used=False,
+        evaluation_frequency_count=int(request.frequencies_ry.size),
+        domain_boundaries_are_evaluation_frequencies=False)
+    return request, receipt
+
+
 def slots_from_diagonal(diag, n_slot_cols):
     """``(..., nb)`` -> the :func:`band_diagonal_slots` layout ``(..., nb, p_y)``.
 
@@ -2229,9 +2275,7 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
         (left_m, None), n_insert, energy, occ_l)
     efermi = float(source["efermi_ry"])
     external = enk[:, b_lo:hi] - efermi
-    request = on_shell_request(e_eval_rel_ev=external * RYD_TO_EV,
-        e_dft_rel_ev=external * RYD_TO_EV, omega_range_ev=plan["omega_range_ev"],
-        out_of_grid=plan["out_of_grid"], irr_idx=np.arange(nk), n_parent=nk)
+    request, request_receipt = ordered_window_request(enk[:, b_lo:hi], efermi)
     hole_weight = insert(pop, np.zeros((nk, n_a)), np.zeros((nk, n_pad)))
     part_weight = insert(1.0-pop, np.ones((nk, n_a)), np.zeros((nk, n_pad)))
     # Preserve every nonzero coherence. The negative particle panel is
@@ -2305,6 +2349,7 @@ def _ordered_window_lines(source, plan, *, mesh_xy, faces, rho, U, b_lo, n_a,
     active, full = (compatibility(both[key]) for key in ("active", "full"))
     total = both["full"]["cond"] + both["full"]["val"]
     receipt.update(internal_bands=int(nb), real_destinations=int(n_a),
+        external_request=request_receipt,
         rate_intermediates="active_only", virtual_intermediates="all",
         ordered_internal_phase="right_index", head="frozen_reference_current_electronic_lines",
         bulk_evaluation_eta_ry=float(cfg.regularization_ev)/RYD_TO_EV,
