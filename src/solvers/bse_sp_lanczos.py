@@ -64,7 +64,7 @@ is not ``αF(x)``), so the part of the correction that must survive passage
 through ``F`` has to be real — that is ``c`` — and the imaginary part cannot
 ride the same basis, so it is carried on the other one as ``d``.  **Any complex
 coefficient multiplying the U basis is a bug**, and ``single_coeff_set=True``
-below is the red twin that shows what it costs.
+below is the control variant that shows what it costs.
 
 The correction is exact as a projector: with (a) and (b) holding,
 ``Re(V^H ž) = c − c − Im(V^H V)·Im(d) = 0`` and
@@ -102,7 +102,7 @@ rotates BOTH bases through the SAME real ``Q_r``:
 A complex ``Q`` breaks that identity and with it the companion relation
 ``V = F(U)``; ``T_k`` being real symmetric is what guarantees it cannot happen.
 This module builds ``T`` in float64 so the guarantee is STRUCTURAL rather than
-asserted, and ``q_phase`` is the red twin that makes ``Q`` complex on purpose.
+asserted, and ``q_phase`` is the control variant that makes ``Q`` complex on purpose.
 
 WHAT IS NOT HERE
 ----------------
@@ -216,11 +216,11 @@ def sdy_lanczos_eig(
         axes should carry the caller's production sharding; nothing here
         reshapes them and no ``shard_map`` region is opened.
     single_coeff_set : bool
-        **RED TWIN.**  Drop the imaginary coefficient set ``d``, enforcing only
+        **CONTROL VARIANT.**  Drop the imaginary coefficient set ``d``, enforcing only
         invariant (a).  Produces a run that looks healthy step by step and is
         wrong after the first restart.  Never true in production.
     q_phase : float
-        **RED TWIN.**  Multiply the restart rotation ``Q`` by ``exp(i·q_phase)``,
+        **CONTROL VARIANT.**  Multiply the restart rotation ``Q`` by ``exp(i·q_phase)``,
         making it complex and breaking ``F(U Q) = V Q``.  Zero in production,
         and at zero it costs nothing (the branch is resolved in Python).
     announce : callable, optional
@@ -303,11 +303,11 @@ def sdy_lanczos_eig(
             f"[sdy] structure-preserving Lanczos (SDY Alg. 4, shao variant): "
             f"n_eig={n_eig} m_max={m_max} n_keep={n_keep} "
             f"n_restarts={n_restarts} | reorth=cgs2 "
-            f"coeff_sets={'ONE (RED TWIN)' if single_coeff_set else 'two'} "
+            f"coeff_sets={'ONE (CONTROL VARIANT)' if single_coeff_set else 'two'} "
             f"| steps={sdy_steps(m_max, n_keep, n_restarts)} "
             f"pair_applications="
             f"{sdy_pair_applications(m_max, n_keep, n_restarts)}"
-            + ("  [RED TWIN: complex restart Q]" if q_phase else "")
+            + ("  [CONTROL VARIANT: complex restart Q]" if q_phase else "")
             + ("" if tol is None else f" | tol={float(tol):g} (cycles <= {n_restarts})"))
 
     # ── start vector ───────────────────────────────────────────────────
@@ -450,7 +450,7 @@ def sdy_lanczos_eig(
         Y_k = Y[:, :n_keep]                    # (m_max, n_keep), real
         Yc = Y_k.astype(dtype)
         if q_phase:
-            # RED TWIN ONLY.  A complex Q breaks F(U Q) = V Q, because F is
+            # CONTROL VARIANT ONLY.  A complex Q breaks F(U Q) = V Q, because F is
             # real-linear: the companion basis stops being F of the first one
             # and every subsequent α, β is measured against the wrong metric.
             Yc = Yc * jnp.exp(1j * jnp.asarray(q_phase, rdtype)).astype(dtype)

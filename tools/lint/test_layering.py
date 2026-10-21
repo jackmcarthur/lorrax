@@ -46,7 +46,7 @@ in CI, on any Python that can parse the tree — so there is never a reason not
 to run it.  All 241 files under ``src/`` parse under Python 3.7 through 3.13
 (checked).
 
-EVERY SCANNER HAS A RED TWIN.  Each ``test_*_can_fail`` feeds the SAME
+EVERY SCANNER HAS A CONTROL VARIANT.  Each ``test_*_can_fail`` feeds the SAME
 scanner function a synthetic source that does contain the banned construct
 and asserts it is flagged.  Re-implementing the scan inside the twin would
 test the twin, not the instrument, which is standing lesson #1 in
@@ -275,7 +275,7 @@ def layer_of(mod: str) -> str:
 
 
 # ===========================================================================
-# 1.  The scanners.  Each is used by a rule AND by that rule's red twin.
+# 1.  The scanners.  Each is used by a rule AND by that rule's control variant.
 # ===========================================================================
 
 #: What "reaching under jax" means for a driver.  Import spellings, not
@@ -661,7 +661,7 @@ def test_the_plumbing_budget_is_tight(sources, mod):
 
 
 def test_the_plumbing_scan_can_fail():
-    """RED TWIN for rule 1 — the same scanner, on sources that violate it.
+    """CONTROL VARIANT for rule 1 — the same scanner, on sources that violate it.
 
     Five spellings, because the tree contains five.  A scan that catches
     only ``from jax.sharding import Mesh`` would have passed
@@ -743,7 +743,7 @@ def test_driver_main_statement_ratchet(sources, mod):
 
 
 def test_the_main_statement_scan_can_fail():
-    """RED TWIN: the same counter on a source whose count is known."""
+    """CONTROL VARIANT: the same counter on a source whose count is known."""
     src = ("def main(argv=None):\n"
            "    x = 1\n"
            "    if x:\n"
@@ -817,7 +817,7 @@ def test_the_l2_env_exceptions_are_all_still_needed(sources):
 
 
 def test_the_env_scan_can_fail():
-    """RED TWIN for rule 2, over all five spellings the tree actually uses."""
+    """CONTROL VARIANT for rule 2, over all five spellings the tree actually uses."""
     cases = [
         ("x = os.environ.get('A')\n", "read", "A"),
         ("x = os.getenv('B')\n", "read", "B"),
@@ -982,7 +982,7 @@ def test_l1_library_env_reads_live_in_resolvers(sources, mod):
 
 
 def test_the_resolver_scan_can_fail():
-    """RED TWIN for rule 2b — module scope, in-function, and subscript."""
+    """CONTROL VARIANT for rule 2b — module scope, in-function, and subscript."""
     bad_module_scope = "import os\nX = float(os.environ.get('A', '6'))\n"
     assert scan_env_reads_outside_resolvers(bad_module_scope) == [("A", 2)]
     bad_fn = "import os\ndef work():\n    return os.getenv('B')\n"
@@ -1003,7 +1003,7 @@ def test_the_resolver_scan_can_fail():
 
 
 def test_the_l1_env_read_ratchet_rejects_a_new_unregistered_policy(sources):
-    """RED TWIN: a resolver alone does not register a new policy read."""
+    """CONTROL VARIANT: a resolver alone does not register a new policy read."""
     mod = "gw.sigma_box_plan"
     injected = (
         sources[mod]
@@ -1169,7 +1169,7 @@ def test_the_upward_exceptions_are_all_still_needed(sources):
 
 
 def test_the_upward_edge_scan_can_fail(sources):
-    """RED TWIN for rule 3.
+    """CONTROL VARIANT for rule 3.
 
     Seeded with a REAL pair from this tree, so it cannot pass by testing a
     fiction: ``common.collectives`` is L3 and ``gw.gw_config`` is L1, and the
@@ -1188,7 +1188,7 @@ def test_the_upward_edge_scan_can_fail(sources):
 
 
 def test_the_service_api_carve_out_is_narrow(sources):
-    """RED TWIN for the carve-out in :func:`upward_edges`.
+    """CONTROL VARIANT for the carve-out in :func:`upward_edges`.
 
     A skip is a hole until something proves where its edges are.  Three
     facts, on the REAL modules the extraction created:
@@ -1230,7 +1230,7 @@ def test_the_service_api_carve_out_is_narrow(sources):
 
 
 def test_the_upward_edge_scan_sees_package_relative_imports(sources):
-    """RED TWIN for :func:`_absolute_target`'s package case.
+    """CONTROL VARIANT for :func:`_absolute_target`'s package case.
 
     ``from .x import y`` inside a package ``__init__.py`` means ``pkg.x``.  A
     resolver that drops a component instead yields a bare ``x``, which matches
@@ -1347,7 +1347,7 @@ def test_the_mesh_owners_all_still_build_one(sources):
 
 
 def test_the_mesh_scan_can_fail():
-    """RED TWIN for rule 4, including the attribute and asname spellings.
+    """CONTROL VARIANT for rule 4, including the attribute and asname spellings.
 
     The asname snippets scanned CLEAN before their fixes (measured: the
     ``jax.sharding`` pair returned ``[]`` on the pre-fix checker at a6c57166,
@@ -1500,7 +1500,7 @@ def test_no_bse_driver_defaults_its_mesh_shape(sources):
 
 
 def test_the_px_py_default_scan_can_fail():
-    """RED TWIN for both spellings of the defect it exists to catch."""
+    """CONTROL VARIANT for both spellings of the defect it exists to catch."""
     bad = ('p.add_argument("--px", type=int, default=1)\n'
            'p.add_argument("--py", type=int, default=1)\n')
     assert [d for _, _, d in scan_px_py_defaults(bad)] == ["1", "1"], (
@@ -1572,7 +1572,7 @@ def test_the_module_scope_env_write_exceptions_are_still_needed(sources):
 
 
 def test_the_module_scope_env_write_scan_can_fail():
-    """RED TWIN for rule 5 — and it must NOT fire on a write inside a def."""
+    """CONTROL VARIANT for rule 5 — and it must NOT fire on a write inside a def."""
     assert scan_module_scope_env_writes(
         "import os\nos.environ.setdefault('X', '1')\n") == [("X", 2)]
     assert scan_module_scope_env_writes(
@@ -1855,7 +1855,7 @@ def test_the_retired_shim_modules_are_gone(sources):
 
 
 def test_the_service_api_scan_can_fail(sources):
-    """RED TWIN for rule 6, over all three spellings the tree can write —
+    """CONTROL VARIANT for rule 6, over all three spellings the tree can write —
     seeded with REAL names, so it cannot pass by testing a fiction."""
     subs = service_submodules(sources, "distrib_la")
     api = api_names(sources, "distrib_la")
@@ -1891,7 +1891,7 @@ def test_the_service_api_scan_does_not_cry_wolf(sources):
 
 
 def test_the_wfn_loader_api_scan_can_fail(sources):
-    """RED TWIN for rule 6 over the SECOND extracted service.
+    """CONTROL VARIANT for rule 6 over the SECOND extracted service.
 
     A per-service twin, not a second copy of the same one: the rule is
     parameterized by ``_SERVICE_APIS`` and each service supplies its own
@@ -1982,7 +1982,7 @@ def test_the_src_tree_grows_no_new_bench_drivers(sources):
 
 
 def test_the_bench_driver_classifier_can_fail():
-    """RED TWIN: the classifier must actually recognise the shapes it lists."""
+    """CONTROL VARIANT: the classifier must actually recognise the shapes it lists."""
     for name in ("common.slate_eigh_test", "common.eigh_benchmark",
                  "common.slate_chol_trsm_bench", "psp.tests.test_x",
                  "ffi.cusolvermp.profile_batched"):

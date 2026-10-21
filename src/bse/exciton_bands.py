@@ -1379,7 +1379,7 @@ def build_parser():
                          "zeta' is still fitted on the producer's window "
                          "exactly.  Costs Galerkin capacity "
                          "(n_mu*n_s >= nk*(nb_zeta+N)) and needs the WFN to "
-                         "carry the bands.  0 is the RED TWIN and must fail "
+                         "carry the bands.  0 is the CONTROL VARIANT and must fail "
                          "the tile null.")
     ap.add_argument("--cert-grade", choices=tuple(CERT_TOL_BY_GRADE),
                     default="reference",
@@ -1480,7 +1480,7 @@ def build_parser():
                     choices=("fine", "coarse"),
                     help="Which mini-BZ cell the re-attached Γ head is "
                          "averaged over.  'fine' (default) is correct.  "
-                         "'coarse' is the design's RED TWIN — invisible when "
+                         "'coarse' is the design's CONTROL VARIANT — invisible when "
                          "the grids are equal, and it breaks the head sum "
                          "rule everywhere else.  For gate work only.")
     return ap

@@ -55,7 +55,7 @@ convention, stacked ``(n_eig, 2, nc, nv, nk)`` and wired to
 WHAT CHANGED 2026-08-08 (this header used to describe only the dense route)
 ---------------------------------------------------------------------------
 * THE DENSE BUILD IS 3.30x FASTER — 333.4 s -> 101.1 s, driver ~347 s -> ~115 s
-  (~3.0x), both landed with red twins (``FIX_nontda_feature.md`` §0).  The
+  (~3.0x), both landed with control variants (``FIX_nontda_feature.md`` §0).  The
   56 GiB ring-tensor path it used to take is gone.
 * A RESTART PREFLIGHT NOW GUARDS THAT BUILD.  ``check_restart_reciprocity``
   runs BEFORE the O(N^2) assembly and refuses a stale W on
