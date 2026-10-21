@@ -18,7 +18,8 @@ away.  Run with
 4. A permuted fine q list fires ``GATE densified_dipole_on_grid``;
    ``window_dipoles`` refuses a densified bundle without its own dipoles, an
    undensified bundle whose dipole has another k list, and one whose dipole
-   is stamped for another WFN (or not stamped).
+   is stamped for another WFN (or not stamped), or whose bands do not
+   cover the window (``GATE dipole_band_window``).
 """
 from types import SimpleNamespace
 
@@ -224,6 +225,18 @@ def test_window_dipoles_refusals(tmp_path, monkeypatch):
     ok = dict(coarse, nkx=2, nky=2)
     d, de = window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
     assert d.shape == (3, 4, 1, 1) and de.shape == (4, 1, 1)
+    # A window past the stored bands used to slice to fewer conduction bands.
+    with pytest.raises(ValueError, match="GATE dipole_band_window"):
+        window_dipoles(dict(ok, n_cond=2), path, n_occ=1, wfn_path="WFN.h5")
+    # The band stamp must cover the window from band 0 and match the axis.
+    for lo, hi in ((1, 3), (0, 3)):
+        with h5py.File(path, "a") as f:
+            f.attrs.update({dipole.DIPOLE_BAND_MIN_ATTR: lo, dipole.DIPOLE_BAND_MAX_ATTR: hi})
+        with pytest.raises(ValueError, match="GATE dipole_band_window"):
+            window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
+    with h5py.File(path, "a") as f:
+        f.attrs.update({dipole.DIPOLE_BAND_MIN_ATTR: 0, dipole.DIPOLE_BAND_MAX_ATTR: 2})
+    window_dipoles(ok, path, n_occ=1, wfn_path="WFN.h5")
     # Another WFN's file on the same k list, and an unstamped one (AUDIT B12).
     for stamp in ("sha-of-another-wfn", None):
         with h5py.File(path, "a") as f:

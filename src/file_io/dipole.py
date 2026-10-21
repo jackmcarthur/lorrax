@@ -14,8 +14,11 @@ read it):
   ``ward_residual_cvkq``).
 * root attributes — ``nbands``, ``nk``, ``skip_vnl``, ``note``, ``basis``
   (``"dft"`` or ``"qp"``: whose states the band indices label; absent reads
-  ``"dft"``), ``format_version`` (:data:`DIPOLE_FORMAT_VERSION`) and the
-  ``prov_*`` provenance stamp (``psp.get_dipole_mtxels.dipole_provenance``).
+  ``"dft"``), ``format_version`` (:data:`DIPOLE_FORMAT_VERSION`),
+  ``band_min``/``band_max`` (the absolute band range ``[0, nb)`` the band axis
+  holds; ``nbands`` is the WFN's band count, not the stored one; readers gate
+  their window with :func:`require_dipole_bands`) and the ``prov_*``
+  provenance stamp (``psp.get_dipole_mtxels.dipole_provenance``).
 
 FORMAT VERSION.  Version 2 (2026-10-20) is the first format whose velocity
 can only be ``i[H, r]``.  Every reader calls :func:`require_dipole_format`
@@ -48,9 +51,16 @@ DIPOLE_BASIS_ATTR = "basis"
 #: Root attribute and value of the current layout; absent reads 1.
 DIPOLE_FORMAT_ATTR = "format_version"
 DIPOLE_FORMAT_VERSION = 2
+#: Root attributes: the absolute 0-based band range ``[band_min, band_max)``
+#: the stored band axis holds.  Every writer stores from band 0; a file
+#: written before the stamp holds ``[0, nb_stored)``.
+DIPOLE_BAND_MIN_ATTR = "band_min"
+DIPOLE_BAND_MAX_ATTR = "band_max"
 
 __all__ = [
     "BAND_ENERGIES_DATASET",
+    "DIPOLE_BAND_MAX_ATTR",
+    "DIPOLE_BAND_MIN_ATTR",
     "DIPOLE_BASIS_ATTR",
     "DIPOLE_DATASET",
     "DIPOLE_FORMAT_ATTR",
@@ -58,6 +68,7 @@ __all__ = [
     "FINITE_Q_GROUP",
     "LEGACY_DELTA_E_DATASET",
     "band_energies_on_full_bz",
+    "require_dipole_bands",
     "require_dipole_basis",
     "require_dipole_format",
     "require_dipole_k_grid",
@@ -187,6 +198,31 @@ def require_dipole_format(attrs, *, dipole_path) -> None:
             f"dipole.h5 (python -m psp.get_dipole_mtxels -i <deck>).")
 
 
+def require_dipole_bands(attrs, nb_stored: int, band_lo: int, band_hi: int, *,
+                         dipole_path, where: str) -> None:
+    """Refuse a dipole whose stored bands do not cover ``[band_lo, band_hi)``.
+
+    ``attrs`` are the file's root attributes (``{}`` when the caller holds
+    only the array), ``nb_stored`` the stored band axis, and the range is in
+    absolute 0-based band indices.  The stored range is ``[band_min,
+    band_max)`` (:data:`DIPOLE_BAND_MIN_ATTR`), ``[0, nb_stored)`` when
+    unstamped.  Readers index the stored axis as absolute bands, so a file
+    that does not start at band 0, or whose stamp disagrees with its axis,
+    refuses too.  A short file used to slice to a shorter window silently.
+    """
+    lo = int(np.asarray(attrs.get(DIPOLE_BAND_MIN_ATTR, 0)).reshape(-1)[0])
+    hi = int(np.asarray(attrs.get(DIPOLE_BAND_MAX_ATTR, lo + int(nb_stored))).reshape(-1)[0])
+    if lo != 0 or hi - lo != int(nb_stored) or not 0 <= band_lo < band_hi <= hi:
+        raise ValueError(
+            f"GATE dipole_band_window: {dipole_path!s} stores bands "
+            f"[{lo},{hi}) ({int(nb_stored)} on its axis); want [0, n) covering "
+            f"the {where} [{int(band_lo)},{int(band_hi)}); why: the band axis "
+            f"is read as absolute bands from 0, and a file short of the window "
+            f"slices to fewer bands than the window holds; fix: regenerate it "
+            f"with python -m psp.get_dipole_mtxels and nval/ncond/number_bands "
+            f"reaching band {int(band_hi)}.")
+
+
 def require_dipole_k_grid(attrs, nk: int, *, dipole_path) -> None:
     """Refuse a dipole whose full-BZ k list is not the BSE bundle's.
 
@@ -295,7 +331,8 @@ def write_dipole(path, velocity_kmajor, band_energies, *, mesh, attrs,
                                            ds_attrs)
             io.stamp_dataset_attrs(FINITE_Q_GROUP, dict(finite_q["attrs"]))
         io.stamp_dataset_attrs(
-            "/", {**dict(attrs), DIPOLE_FORMAT_ATTR: DIPOLE_FORMAT_VERSION})
+            "/", {**dict(attrs), DIPOLE_FORMAT_ATTR: DIPOLE_FORMAT_VERSION,
+                  DIPOLE_BAND_MIN_ATTR: 0, DIPOLE_BAND_MAX_ATTR: nb})
 
 
 def energy_extent(h5) -> tuple[int, ...] | None:

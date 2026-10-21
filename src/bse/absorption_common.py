@@ -393,8 +393,11 @@ def slice_dipole_to_bse_window(dipole_cart, deltaE, n_occ, n_val, n_cond):
     d_alpha : (3, nk, nc, nv) complex — d^α_{cvk} = ⟨c|v̂|v⟩ / ΔE   (r-form).
     de_cv   : (nk, nc, nv) float      — E_c - E_v (Ry, > 0).
     """
+    from file_io.dipole import require_dipole_bands
     val_lo = n_occ - n_val
     cond_hi = n_occ + n_cond
+    require_dipole_bands({}, int(dipole_cart.shape[-1]), val_lo, cond_hi,
+                         dipole_path="dipole_cart", where="BSE window")
     v_cv = dipole_cart[:, :, n_occ:cond_hi, val_lo:n_occ]   # (3, nk, nc, nv)
     de_cv = deltaE[:, n_occ:cond_hi, val_lo:n_occ]          # (nk, nc, nv)
     d_alpha = v_cv / de_cv[None]
@@ -445,10 +448,13 @@ def window_dipoles(data, dipole_file, *, n_occ, wfn_path):
                 f"velocity_file=dipole_file to "
                 f"load_bse_data_from_restart_sharded.")
         return dip["d_alpha"], dip["de_cv"]
-    from file_io.dipole import (require_dipole_k_grid,
+    from file_io.dipole import (require_dipole_bands, require_dipole_k_grid,
                                 require_dipole_wfn_fingerprint)
     from file_io.restart_bundle import load_dipole_h5
     dipole_cart, deltaE, attrs = load_dipole_h5(dipole_file, wfn_path=wfn_path)
+    require_dipole_bands(
+        attrs, int(dipole_cart.shape[-1]), n_occ - int(data["n_val"]),
+        n_occ + int(data["n_cond"]), dipole_path=dipole_file, where="BSE window")
     require_dipole_k_grid(
         attrs, int(data["nkx"]) * int(data["nky"]) * int(data["nkz"]),
         dipole_path=dipole_file)

@@ -4576,10 +4576,13 @@ def head_source(config, *, wfn, meta, input_dir) -> HeadSource:
             "  why:  the dense head must sum the transitions of one DFT solution")
     if wfn_fingerprint(dense_wfn) == wfn_fingerprint(wfn):
         return dataclasses.replace(mesh_source, velocity_path=path)
+    from file_io.dipole import require_dipole_bands
     nb_file = int(attrs["prov_nb_written"])
     n_occ = int(meta.nelec)
     b4_sum = min(b4, nb_file)
     need = min(b4 - n_occ, HEAD_DENSE_MIN_CONDUCTION)
+    require_dipole_bands(attrs, nb_file, 0, n_occ + max(need, 1),
+                         dipole_path=path, where="head_dense_file sum window")
     if (b0 != 0 or int(dense_wfn.nelec) != n_occ
             or not dense_wfn.occupations_are_exact_integer
             or b4_sum - n_occ < need):
