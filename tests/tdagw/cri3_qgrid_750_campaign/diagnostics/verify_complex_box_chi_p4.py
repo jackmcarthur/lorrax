@@ -116,7 +116,7 @@ def response_stage(c):
         panels=['full', 'FF', 'FA', 'AF', 'AA'], rules=records, execution=executions)
 
 
-def main():
+def main(stage=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root', required=True)
     parser.add_argument('--source-revision', required=True)
@@ -131,12 +131,17 @@ def main():
     import runtime
     import jax
     import gw.w_isdf, gw.response_bank
+    import gw.shared_pole_screening, gw.shared_pole_constructor
+    import sys
     from common.collectives import rank0_transaction
     from ffi.fft import kconv_backend
     import verify_fejer_p4_38dbea1 as fixture_owner
     import verify_common_coherent_chi_p4 as common_owner
     root = Path(args.source_root).resolve()
-    modules = (driver, gw.w_isdf, gw.response_bank, fixture_owner, common_owner)
+    stage = response_stage if stage is None else stage
+    stage_module = sys.modules[stage.__module__]
+    modules = (driver, gw.w_isdf, gw.response_bank, gw.shared_pole_screening,
+               gw.shared_pole_constructor, fixture_owner, common_owner, stage_module)
     origins = {m.__name__: str(Path(m.__file__).resolve()) for m in modules}
     if any(root not in Path(p).parents for p in origins.values()):
         raise ValueError('source module origin mismatch')
@@ -149,12 +154,13 @@ def main():
     rank0_transaction(out, stage='complex_box/new', write=lambda: out.mkdir(parents=True, exist_ok=False))
     started = time.monotonic()
     try:
-        result = response_stage(fixture_owner.fixture(driver.RUNTIME.mesh))
+        result = stage(fixture_owner.fixture(driver.RUNTIME.mesh))
     except BaseException:
         print(f'Complex box rank {jax.process_index()} failed:\n'+traceback.format_exc(), flush=True)
         raise
     report = dict(status='PASS_SOFTWARE_ONLY_NOT_MATERIAL', source_revision=args.source_revision,
         module_origins=origins, harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        stage_sha256=hashlib.sha256(Path(stage_module.__file__).read_bytes()).hexdigest(),
         source_archive_sha256=os.environ.get('LEG_SOURCE_ARCHIVE_SHA256'),
         elapsed_seconds=time.monotonic()-started, max_wall_seconds=args.max_wall_seconds,
         active_GPUh_cap=4*args.max_wall_seconds/3600, result=result)
