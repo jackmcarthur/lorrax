@@ -4,6 +4,7 @@
 
 ## Pages in the sidebar
 
+- [BerkeleyGW export](https://jackmcarthur.github.io/lorrax/drivers/berkeleygw-export/): manual/docs/drivers/berkeleygw-export.md
 - [Files](https://jackmcarthur.github.io/lorrax/drivers/bse/files/): manual/docs/drivers/bse/files.md
 - [BSE driver](https://jackmcarthur.github.io/lorrax/drivers/bse/): manual/docs/drivers/bse/index.md
 - [Input keywords](https://jackmcarthur.github.io/lorrax/drivers/bse/keywords/): manual/docs/drivers/bse/keywords.md
