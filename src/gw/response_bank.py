@@ -75,11 +75,58 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
     # different FFT collectives. Gather attempts through the response owner.
     bound = 4*1024**3
     request = tuple(range(len(sites)))
+    def crossing(members):
+        z=shifted[list(members)]
+        center=.5*(lo+hi)
+        points=np.concatenate((z-center,z+center))
+        # The public derivative is d/d(points²), whereas this owner
+        # reports d/d(z²). Certify the chain factor, never loosen it.
+        chain=abs(points/np.tile(z,2))
+        ratio=np.tile(z.imag,2)/float(np.min(z.imag))
+        requested=float(tolerance)/max(1.,float(np.max(ratio)),float(np.max(ratio**3*chain)))
+        rule=minimax.response_bank_rule(points,.5*(hi-lo),rel_tol=requested)
+        n=len(z);v=rule['projection_value'];dv=rule['projection_derivative']
+        value=np.stack((-1j*v[:n],1j*v[n:]),axis=1)
+        derivative=np.stack((-1j*dv[:n]*(points[:n]/z)[:,None],
+                              1j*dv[n:]*(points[n:]/z)[:,None]),axis=1)
+        mass=np.stack((z.imag[:,None]*np.sum(abs(value),axis=-1),
+                       z.imag[:,None]**3*np.sum(abs(derivative),axis=-1)),axis=-1)
+        error=max(float(np.max(np.array(rule['certificate']['value_bound'])*ratio)),
+                  float(np.max(np.array(rule['certificate']['derivative_bound'])*ratio**3*chain)))
+        if (not np.isfinite(mass).all() or np.max(mass[...,0])>5000.
+                or not np.isfinite(error) or error>tolerance):
+            raise ValueError('GATE response_full_density: crossing primitive certificate/mass')
+        if len(rule['t'])>32*384:
+            raise ValueError('GATE response_full_density: crossing rule exceeds 32 node carriers')
+        out=[]
+        for begin in range(0,len(rule['t']),384):
+            end=min(begin+384,len(rule['t']))
+            # Response-bank t is physical real time. The Green owner
+            # uses Laplace t=i*time and a real interval-centre reference.
+            out.append(dict(t=1j*rule['t'][begin:end],count=end-begin,
+                value=-value[:,:,begin:end],members=list(members),reference_ry=center,
+                sampled_error=error,coefficient_mass=mass,
+                construction='continuum_crossing_real_time'))
+        return out
+
     if paired and lo > float(np.max(abs(shifted.real))):
         def remote(members):
             z = shifted[list(members)]
-            rule = minimax.response_laplace_rule(lo, hi, z, rel_tol=tolerance,
-                                                  ordered=True, reference_ry=lo)
+            try:
+                rule = minimax.response_laplace_rule(lo, hi, z, rel_tol=tolerance,
+                                                    ordered=True, reference_ry=lo)
+            except RuntimeError as error:
+                if not str(error).startswith('remote Ritz certificate failed through 64 nodes:'):
+                    raise
+                # The SAME public time-panel converter is valid on remote
+                # intervals too. It certifies actual rounded primitive rows
+                # at the unchanged per-pole bank norm, rather than accepting
+                # an exhausted Ritz certificate or splitting energy domains.
+                fallback = crossing(members)
+                for row in fallback:
+                    row.update(construction='continuum_real_time_after_ritz_refusal',
+                               ritz_refusal=str(error))
+                return fallback
             ke, ko = rule['projection_value'], rule['odd_projection_value']
             value = np.stack((ke+ko, ke-ko), axis=1)
             de, do = rule['projection_derivative'], rule['odd_projection_derivative']
@@ -96,39 +143,6 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
                          construction='continuum_noncrossing_laplace')]
         groups = _gather_group_rules([request], build=remote)[0]
     elif paired:
-        def crossing(members):
-            z=shifted[list(members)]
-            center=.5*(lo+hi)
-            points=np.concatenate((z-center,z+center))
-            # The public derivative is d/d(points²), whereas this owner
-            # reports d/d(z²). Certify the chain factor, never loosen it.
-            chain=abs(points/np.tile(z,2))
-            ratio=np.tile(z.imag,2)/float(np.min(z.imag))
-            requested=float(tolerance)/max(1.,float(np.max(ratio)),float(np.max(ratio**3*chain)))
-            rule=minimax.response_bank_rule(points,.5*(hi-lo),rel_tol=requested)
-            n=len(z);v=rule['projection_value'];dv=rule['projection_derivative']
-            value=np.stack((-1j*v[:n],1j*v[n:]),axis=1)
-            derivative=np.stack((-1j*dv[:n]*(points[:n]/z)[:,None],
-                                  1j*dv[n:]*(points[n:]/z)[:,None]),axis=1)
-            mass=np.stack((z.imag[:,None]*np.sum(abs(value),axis=-1),
-                           z.imag[:,None]**3*np.sum(abs(derivative),axis=-1)),axis=-1)
-            error=max(float(np.max(np.array(rule['certificate']['value_bound'])*ratio)),
-                      float(np.max(np.array(rule['certificate']['derivative_bound'])*ratio**3*chain)))
-            if (not np.isfinite(mass).all() or np.max(mass[...,0])>5000.
-                    or not np.isfinite(error) or error>tolerance):
-                raise ValueError('GATE response_full_density: crossing primitive certificate/mass')
-            if len(rule['t'])>32*384:
-                raise ValueError('GATE response_full_density: crossing rule exceeds 32 node carriers')
-            out=[]
-            for begin in range(0,len(rule['t']),384):
-                end=min(begin+384,len(rule['t']))
-                # Response-bank t is physical real time. The Green owner
-                # uses Laplace t=i*time and a real interval-centre reference.
-                out.append(dict(t=1j*rule['t'][begin:end],count=end-begin,
-                    value=-value[:,:,begin:end],members=list(members),reference_ry=center,
-                    sampled_error=error,coefficient_mass=mass,
-                    construction='continuum_crossing_real_time'))
-            return out
         groups=_gather_group_rules([request],build=crossing)[0]
     else:
         tree = lambda members: minimax.ResponseGroupTree(lo, hi, shifted[list(members)],
@@ -151,6 +165,8 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
                            construction=group.get("construction", "shared_hankel"),
                            interval_ry=[lo, hi], max_pencil_bytes=bound,
                            max_panel_count=32))
+        if "ritz_refusal" in group:
+            result[-1]["ritz_refusal"] = group["ritz_refusal"]
     if held is not None:
         held.update(key=key, extent_ry=max(abs(lo),abs(hi)), interval_ry=[lo, hi], rules=result)
     return result

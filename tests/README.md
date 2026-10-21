@@ -43,6 +43,9 @@ A new test needs no bootstrap import of its own.
   operands and unchanged default-versus-explicit-false equilibrium bits (CPU).
 - `test_full_density_block_planning_cpu.py`: public noncrossing and crossing
   primitive signs, measured endpoint intervals and scalar accuracy (CPU).
+- `test_full_density_rule_fallback_cpu.py`: actual 44-band FA Ritz-certificate
+  exhaustion and the existing certified real-time fallback, both primitive
+  signs/derivatives, unchanged successful remote rules and narrow error handling.
 - `test_general_pencil_batch_cpu.py`: capacity-bounded concurrent reduced
   pencils, canonical raw-bit maps/spaces, collective errors and complex Σ
   equivalence (CPU; no microscopic host matrices).

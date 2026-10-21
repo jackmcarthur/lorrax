@@ -664,6 +664,13 @@ are unchanged; no band repacking or physical band cutoff is introduced.
 Supports are grouped by actual height and noncrossing geometry. Noncrossing
 groups use the public continuum-checked `minimax.response_laplace_rule`;
 crossing groups use centered `minimax.response_bank_rule` real-time panels.
+Only named exhaustion of the remote Ritz continuum certificate falls back
+to that SAME centered public real-time converter, also valid on noncrossing
+intervals. It must independently pass the unchanged per-support bank norm
+and coefficient-mass/carrier bounds; this is not acceptance of the failed
+Ritz certificate (which has additional relative-kernel constraints).
+Other domain, arithmetic and runtime errors still propagate. The rule's
+`ritz_refusal` and distinct construction label preserve the original reason.
 The adapter certifies physical $d/d(z^2)$ chain factors and each support's
 own height normalization, not merely the minimum height. Both primitive
 signs and the original $10^{-8}$ scalar criterion remain. Every panel's
