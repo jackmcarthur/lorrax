@@ -703,6 +703,58 @@ release checks passed. This is not a full hsuite pass, a conservation or
 Pauli verdict, or a 10 fs damping comparison. See the
 [native proof and exact evidence hashes](evidence/DEVICE_PENCIL_P4_60077288.json).
 
+### Complete device W and spectral-body material diagnostics
+
+Job `60080234`, source `a289c39`, completed both numerical legs on P16:
+two full current W constructions on the same accepted t0 state, then a
+separate spectral-body query using the original saved W. Every response
+includes750 bands, all16 q rows and3000 centroids. No physical step ran.
+
+| Full W phase | First construction (s) | Held-space update (s) |
+| --- | ---: | ---: |
+| Total | 207.220 | 97.236 |
+| χ stream | 58.259 | 55.606 |
+| Device reduction, including setup/admission/compilation | 115.577 | 23.355 |
+| Model persistence | 12.578 | 9.109 |
+
+Both passed the explicit5% pilot full-W fit/held gate with maximum error
+**2.6165%**, Kmax1280 and2084×2084 frequency pencils. This is a completed
+material W result, not full-complex Sigma accuracy at1meV or a sub60s
+cycle. The first-seen padded Ritz widths cost15.7–22.1s; reused widths cost
+0.408–0.423s with similar conditioning. Shape-specialized checked-program
+setup/compilation is strongly implicated, not demonstrated ill-conditioning.
+The phase includes admission of the whole checked retry chain and first-run
+execution; these costs have not been separately timed. The second call is
+the first held-space call, not proof of a compilation-free asymptotic cost.
+
+The independent saved-W query produced full44×44 retarded particle/hole
+matrices at all44 actual shell energies of **k=0**, in **18.273s**,383 τ
+pairs/eight windows. No on-shell second sweep ran. The smallest common-energy
+width eigenvalues were positive: `3.38654e-5 Ry` (particle) and
+`1.73223e-4 Ry` (hole). This tests one k and active-body rates, not a full
+coherent-state positivity guarantee. Post-sweep extraction replicates about
+87.23MB per branch per device before selecting the persisted k; that
+transient is outside the τ-executable admission.
+
+An offline, unclipped principal-root pilot preserves on-shell diagonals and
+the local projector trace to roundoff, and changes the filled-boundary
+minimum from **-24.859meV to +0.532meV**. However, it changes99.1% of the
+instantaneous collision Frobenius norm, primarily by removing one-sided
+dispersive/PV shell-difference coherences. This is **not** a99% trajectory
+error measurement. Original MH is held unchanged by definition, but the
+full complex off-diagonal collision action is not preserved. No root
+closure is enabled, and general coherent-density number cancellation
+remains unproved. See [one-k algebra and its scope](evidence/COVARIANCE_ROOT_K0_60080234.json).
+
+Both Slurm numerical steps completed with rc0; the enclosing allocation
+was marked FAILED because its shell status parser also collected nested
+`WARN` fields. Strict top-level JSON parsing fixes the report without
+rerunning numerical work; the raw FAILED state is preserved. Allocation
+618s×16 GPUs cost **2.74667 reserved GPU-h** and released. Numeric-step
+lifetimes are contained, not added. Exact receipts and reconciliation:
+[combined result](evidence/DEVICE_W_AND_SPECTRAL_60080234.json),
+[report-only fix](evidence/COMBINED_REPORT_PARSER_FIX_60080234.json).
+
 ## Software validation is not material BSE validation
 
 Native P4 source `4b24c0e` tested the actual BSE matvec against the literal

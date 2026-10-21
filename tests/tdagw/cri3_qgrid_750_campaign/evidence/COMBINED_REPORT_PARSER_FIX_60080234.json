@@ -1,0 +1,39 @@
+{
+  "status": "REPORT_PARSER_FIX_CPU_VERIFIED_NO_NUMERICAL_RERUN",
+  "job": "60080234",
+  "original_slurm_state_preserved": "FAILED",
+  "numerical_recomputed": false,
+  "gpu_allocation_requested": false,
+  "cause": "sed substitution replaced each matched status line by its value before the subsequent status-key quit address ran. The key was already gone, so no quit occurred; nested WARN statuses were concatenated with top-level success.",
+  "executed_script": "run_combined_a289c39_v1.executed_dcc52cf.sh",
+  "executed_script_sha256": "dcc52cf7c3db1625bc56832cb6ba8321aa586ee740dd62edcb77b8115b7391d9",
+  "future_fixed_script": "run_combined_a289c39_v1.sh",
+  "future_fixed_script_sha256": "36b54389ad5bf421fc42fe7bf0c77ef66e7bfab17fd80c11641d43141486bf68",
+  "fix": "Isolated system Python stdlib json.load selects exactly the top-level string status and rejects duplicate keys, nonfinite constants, missing/nonstring status, and tab/newline status values.",
+  "bash_syntax_check": "PASS",
+  "strict_fixture_cases_passed": 9,
+  "raw_receipts": [
+    {
+      "file": "device_W_cold_60080234.json",
+      "sha256_unchanged": "129905f01ccc5f398723b4fd3ef6738895a36493ad8f26bea5294433363614bf",
+      "old_status_lines": 39,
+      "old_nested_WARN_lines": 38,
+      "fixed_top_level_status": "CURRENT_FULL_W_COMPLETE_NO_SIGMA_NO_TD"
+    },
+    {
+      "file": "device_W_held_60080234.json",
+      "sha256_unchanged": "cf4a23bf3fe03dac6aa45e8b44e33a39e00317cc48a6382e909a1d609e37db6f",
+      "old_status_lines": 39,
+      "old_nested_WARN_lines": 38,
+      "fixed_top_level_status": "CURRENT_FULL_W_COMPLETE_NO_SIGMA_NO_TD"
+    },
+    {
+      "file": "spectral_60080234.receipt.json",
+      "sha256_unchanged": "242515f86101a655de154d4846a2b6faafd39d4dfdf8a1a8c3ac85701a695c37",
+      "old_status_lines": 1,
+      "old_nested_WARN_lines": 0,
+      "fixed_top_level_status": "SAME_W_ACTIVE_SPECTRAL_BODY_PROBE_COMPLETE_NOT_DYNAMICS"
+    }
+  ],
+  "scope": "CPU reporting-parser proof only. Does not replace raw Slurm state, alter numerical artifacts, qualify dynamics, or account/reclassify allocation cost. Scientific reconciliation and cost receipt belong to the root operator."
+}

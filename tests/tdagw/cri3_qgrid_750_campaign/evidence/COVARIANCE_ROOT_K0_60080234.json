@@ -1,0 +1,76 @@
+{
+  "status": "ONE_K_FROZEN_OLD_W_BODY_COVARIANCE_ROOT_ALGEBRA_PILOT_NOT_IMPLEMENTED",
+  "spectral_input": "spectral_60080234.npz",
+  "spectral_input_sha256": "31040792f66734965fd90f5e96aff78cc6c452b6d119f6768fb9b5844f0aba9b",
+  "tight_body_reference": "same_w_rate_eps8.npz",
+  "tight_body_reference_sha256": "15e3291c6028c66ecb6a801778b83df176f81fd52f9b2ea55c8cae54a399b87a",
+  "snapshot_sha256": "a6232345e31b8355d12025fe2402bbcfec4d1f34b49d2993a2fd9ffeca679e58",
+  "W_digest": "52fb9de00cf25c1a8b2c6018c4151fe88019fa75e57fa36f0996be7dbda6231d",
+  "spectral_k": 0,
+  "band_count": 44,
+  "occupied_count": 30,
+  "quadrature_eps": 1e-8,
+  "head_included": false,
+  "virtual_MH_included": false,
+  "tail_included": false,
+  "screening_rebuilt": false,
+  "method": "K_b(w)=i(R_b(w)-R_b(w)^H); S_b(w)=principal Hermitian square root by eigh, with all eigenvalues strictly positive and no clipping; B_b[a,:]=S_b(E_a)[a,:]; G_b=B_b B_b^H; D_root=G_val; Gamma_root=G_cond+G_val; C=D-.5{Gamma,P} for P=diag(1x30,0x14). Raw retarded columns are R_b(E_column).",
+  "CPU_single_BLAS_thread_seconds": 0.06610032400203636,
+  "branches": {
+    "cond": {
+      "input_K_min_eigenvalue_ry": 3.386535706987376e-5,
+      "root_square_relative_fro_max": 3.928392315517855e-15,
+      "gram_min_eigenvalue_ry": 3.893007897220579e-5,
+      "raw_min_eigenvalue_ry": -0.031442623661384096,
+      "diagonal_preservation_max_ry": 3.2959746837893616e-17,
+      "delta_max_abs_ry": 0.02830376518987817,
+      "delta_fro_ry": 0.1267407794709544,
+      "delta_relative_fro": 0.9459824263116412
+    },
+    "val": {
+      "input_K_min_eigenvalue_ry": 0.00017322254583172523,
+      "root_square_relative_fro_max": 4.464961437888467e-15,
+      "gram_min_eigenvalue_ry": 0.0001871329797881526,
+      "raw_min_eigenvalue_ry": -0.006732134049161883,
+      "diagonal_preservation_max_ry": 4.3368086899452e-17,
+      "delta_max_abs_ry": 0.008473222621162247,
+      "delta_fro_ry": 0.0338967340583497,
+      "delta_relative_fro": 0.6462134671062634
+    }
+  },
+  "collision": {
+    "raw_trace_ry": -0.0006461852081217289,
+    "root_trace_ry": -0.0006461852081217311,
+    "trace_change_ry": -2.032879073410321e-18,
+    "diag_change_max_ry": 4.553649137566247e-18,
+    "raw_filled_blocking_min_ry": -0.0018271037019321873,
+    "root_filled_blocking_min_ry": 3.907625884269896e-5,
+    "raw_empty_injection_min_ry": 9.735744860475321e-5,
+    "root_empty_injection_min_ry": 0.00018767242616677497,
+    "delta_max_abs_ry": 0.014418142113689601,
+    "delta_fro_ry": 0.06120638735909537,
+    "delta_relative_fro": 0.9910519084405784,
+    "offdiag_delta_fro_ry": 0.06120638735909537,
+    "raw_fro_ry": 0.061759012658987464,
+    "root_fro_ry": 0.007923566355665978
+  },
+  "saved_tight_body_comparison": {
+    "gamma_max_abs_ry": 1.4478576150500633e-10,
+    "injection_max_abs_ry": 5.60019889630421e-14,
+    "collision_max_abs_ry": 6.147896254582452e-11,
+    "collision_relative_fro": 4.43110784876421e-9,
+    "tight_body_trace_ry": -0.0006461853286292411
+  },
+  "dispersive_decomposition": {
+    "identity": "raw_width_ab=.5*(K_ab(Ea)+K_ab(Eb))+i*(HermR_ab(Eb)-HermR_ab(Ea)); arithmetic spectral covariance is a diagnostic comparison, not another enabled prescription",
+    "identity_error_max_ry": 1.0408340855860843e-17,
+    "arithmetic_spectral_C_fro_ry": 0.008255825750204933,
+    "dispersive_shell_C_fro_ry": 0.06120551018792,
+    "root_minus_arithmetic_C_fro_ry": 0.0004854402556008694,
+    "arithmetic_filled_min_ry": 3.897977900374255e-5,
+    "arithmetic_empty_min_ry": 0.00018769154781434969,
+    "interpretation": "Most of the large change removes the original one-sided dispersive/PV shell-difference contribution to dissipative coherences; it is not a quadrature correction. Root versus arithmetic spectral covariance is a smaller second change."
+  },
+  "MH_policy": "Original saved full MH_ry is left exactly unchanged by definition. This does not preserve the dispersive shell-difference contribution carried by the original dissipative offdiagonal widths. No full root-modified complex Sigma validation is claimed.",
+  "limits": "One diagnostic k and exact t0 diagonal projector only. Local trace is preserved, not zero, because physical cancellations include other k. No all-k, coherent-density, nonlinear-number, thermal-stationarity, trajectory, finite-step Pauli, or physics-accuracy guarantee. The root pilot contains active BODY only and is not a full-head/tail closure. No source, density, or input spectrum was clipped or changed."
+}
