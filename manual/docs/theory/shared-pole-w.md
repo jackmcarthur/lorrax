@@ -103,10 +103,19 @@ Equation (1.4) has millions of poles, far more than Σ can afford. Replacing a l
 
 ### <span class="n">3.1</span> W as a transfer function {: #red-transfer }
 
-On the ISDF points, with $\phi$ the matrix of all $2N_t$ pair potentials $\phi_{mn\bk\bq}(\mu)$, (1.4) reads
+On the ISDF points, with every band and k label written out, (1.4) is a resolvent of the RPA Hamiltonian $H^{\mathrm{RPA}}_\bq\equiv H_\bq$ of (1.3) between pair densities,
 
 $$
-W^c_\bq(z)=\mathcal C\,(z-\mathcal A)^{-1}\mathcal B,\qquad \mathcal C=\phi,\quad \mathcal A=H_\bq,\quad \mathcal B=\sigma\phi^\dagger \tag{3.1}
+\begin{aligned}
+W^c_\bq(\mu,\nu;z)=\sum_{\mu'\nu'}\sum_{\substack{mn\bk\\m'n'\bk'}}&V_\bq(\mu,\mu')\,\psi^*_{m\bk}(\br_{\mu'})\,\psi_{n\bk+\bq}(\br_{\mu'})\,\Big[\big(z-H^{\mathrm{RPA}}_\bq\big)^{-1}\Big]_{mn\bk,\,m'n'\bk'}\\
+&\times\sigma_{m'n'\bk'}\,\psi_{m'\bk'}(\br_{\nu'})\,\psi^*_{n'\bk'+\bq}(\br_{\nu'})\,V_\bq(\nu',\nu)
+\end{aligned} \tag{3.1}
+$$
+
+with the occupation differences $\sigma_{mn\bk}=f_{m\bk}-f_{n\bk+\bq}$. With $\phi$ the $N_\mu\times2N_t$ matrix of the pair potentials $\phi_{mn\bk\bq}(\mu)=\sum_{\mu'}V_\bq(\mu,\mu')\,\psi^*_{m\bk}(\br_{\mu'})\,\psi_{n\bk+\bq}(\br_{\mu'})$ and $\sigma$ the diagonal matrix of the $\sigma_{mn\bk}$, this is
+
+$$
+W^c_\bq(z)=\mathcal C\,(z-\mathcal A)^{-1}\mathcal B,\qquad \mathcal C=\phi,\quad \mathcal A=H^{\mathrm{RPA}}_\bq,\quad \mathcal B=\sigma\phi^\dagger \tag{3.2}
 $$
 
 This is the transfer function of a linear system whose state matrix $H_\bq$ acts on a space of dimension $2N_t$, the order of the system. A potential applied at the $N_\mu$ points enters the transitions through the input matrix $\sigma\phi^\dagger$, evolves under $H_\bq$, and is read out as an induced potential through the output matrix $\phi$, and the triple $(\mathcal C,\mathcal A,\mathcal B)$ is called a realization of $W^c$. With time reversal, Casida's form (2.2) is the symmetric realization $W^c_\bq(s)=F^\dagger(s-C_\bq)^{-1}F$ in $s=z^2$, with $F=\sqrt2\,\Delta^{1/2}\phi^\dagger$ on the resonant pairs. Model reduction seeks a realization $\phi_r(z-H_r)^{-1}\sigma_r\phi_r^\dagger$ of much lower order whose transfer function is close to $W^c$ where it is used. In our setting $H_\bq$ is never formed, but $W^c$ can be sampled at any complex $z$ for the price of one $\chi^0$ evaluation and one Dyson solve (§[6.2](#bank-times)), so only methods that work from samples apply. §[9.1](#red-methods) compares them, and we use the Loewner framework of §4, which needs no nonlinear fit and keeps the structure of (2.2). A model of order about $N_\mu$ suffices because Σ resolves $W^c$ only on the scale of its broadening $\eta$ (§[9.2](#red-small)).
@@ -118,7 +127,12 @@ A large matrix is usually reduced by projecting it onto a few important directio
 
 ### <span class="n">4.1</span> Samples as resolvent vectors {: #loewner-identities }
 
-A sample of $W$ is an $N_\mu\times N_\mu$ matrix, and we keep only its action on a few directions, which keeps the reduced problem small and well conditioned. This is tangential interpolation [12]. A tangential sample is a small experiment on the screening. A potential pattern $r$ is applied at the ISDF points at the complex frequency $z$, and the induced potential $W(z)\,r$ is read out at every point, much as a network analyzer drives a circuit through a chosen combination of its ports [27]. Matching a whole sample would add $N_\mu$ states to the model at once, one per column, while each direction adds one [10]. In this language $\lambda_j$ and $r_j$ are the right data and $\xi_i$ and $\ell_i$ the left data. At right points $\lambda_j$ with column directions $r_j$, and at left points $\xi_i$ with row directions $\ell_i$, the samples are
+A sample of $W$ is an $N_\mu\times N_\mu$ matrix. We keep only its action on a few directions, which is tangential interpolation [12], so each direction adds one state to the model where a whole sample would add $N_\mu$ [10]. A potential pattern $r$ is applied at the ISDF points at frequency $z$, and the induced potential $W(z)\,r$ is read out at every point, as a network analyzer drives a circuit through a chosen combination of its ports [27].
+
+!!! note "In short"
+    We define trial directions $r_j$ of length $N_\mu$, one entry per ISDF point $\br_\mu$, where $W$ acts. Each corresponds to a resolvent vector $u_j=(\lambda_j-H)^{-1}\sigma\phi^\dagger r_j$ of length $2N_t$, one entry per transition $mn\bk$, where $H_\bq$ acts, and the left pairs $\ell_i$, $\tilde u_i$ are defined the same way. The samples give $\tilde S=\tilde UU$ and $\tilde H=\tilde UHU$ (called $\mathbb G$ and $\mathbb H$ from §4.3 on), and the small resolvent $U(z\tilde S-\tilde H)^{-1}\tilde U\approx(z-H)^{-1}$ is the projection onto the span of the $u_j$, exact at every sample.
+
+At right points $\lambda_j$ with directions $r_j$, and at left points $\xi_i$ with row directions $\ell_i$, the samples are
 
 $$
 \begin{aligned}
@@ -127,7 +141,7 @@ W(\lambda_j)\,r_j&=\phi\,u_j, &\qquad u_j&=(\lambda_j-H)^{-1}\sigma\phi^\dagger 
 \end{aligned} \tag{4.1}
 $$
 
-The resolvent vectors $u_j$ and $\tilde u_i$ live in the space of all $2N_t$ transitions, and we never form them. Their overlaps and the matrix elements of $H$ between them nevertheless follow from the samples alone. The resolvent identities $(\xi-H)^{-1}-(\lambda-H)^{-1}=-(\xi-\lambda)(\xi-H)^{-1}(\lambda-H)^{-1}$ and $z(z-H)^{-1}=1+H(z-H)^{-1}$ give
+We never form the $u_j$, but their overlaps and the matrix elements of $H$ between them follow from the samples alone. The resolvent identities $(\xi-H)^{-1}-(\lambda-H)^{-1}=-(\xi-\lambda)(\xi-H)^{-1}(\lambda-H)^{-1}$ and $z(z-H)^{-1}=1+H(z-H)^{-1}$ give
 
 $$
 \begin{aligned}
@@ -588,7 +602,7 @@ Moment matching fits the Taylor coefficients of the transfer function at a point
 | $V_\bq(\mu,\nu)$, $W^c_\bq(\mu,\nu;z)$ | bare Coulomb and correlation part of $W$ on the ISDF points |
 | $b_{j\bq}(\mu)$, $\Omega_{j\bq}$, $K_\bq$ | stored residue vectors (residue $b_{j\bq}b^\dagger_{j\bq}$, stored as $\sqrt{2\Omega_{j\bq}}\,b_{j\bq}$), poles, pole count |
 | $M_1$, $M_3$, $X_p$ | high-frequency moments of $W^c$; coefficients of $\chi^0$ in $1/z$ |
-| $C$, $B$ | output and input matrices of the transfer function (3.1) |
+| $\mathcal C$, $\mathcal A$, $\mathcal B$, $F$ | output, state and input matrices of the realization (3.2); $\sqrt2\,\Delta^{1/2}\phi^\dagger$ of the form in $s$ |
 | $\xi_i$, $\ell_i$, $\lambda_j$, $r_j$, $\theta$ | left points and row directions; right points and column directions; pencil eigenvalue |
 | $\mathbb L$, $\mathbb L_s$, $u_j$, $\tilde u_i$ | Loewner and shifted Loewner matrices; right and left resolvent vectors |
 | $\mathbb G$, $\mathbb H$, $\mathbb W$ | overlap matrix $-\mathbb L$ and projected Casida matrix $-\mathbb L_s$ of the Hermitian pencil (code `G`, `H`); sampled actions |
