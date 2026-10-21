@@ -444,6 +444,44 @@ See the [raw result](evidence/EQFF_Q0_REFINED_CHOLESKY_c6ebe_v1.json),
 [execution/hash receipt](evidence/EQFF_Q0_REFINED_CHOLESKY_c6ebe_v1_EXECUTION.json)
 and [unaltered progress log](evidence/EQFF_Q0_REFINED_CHOLESKY_c6ebe_v1.log).
 
+The exact production reducer then passed the same cached q0 pencil on
+reviewed **staged tree `51150113`**, not a claimed committed revision. It
+performed full RRQR again (no selected-index override), selected the same
+661 original columns, and used the actual logged cap 10,800. Total remote
+CPU wall was **92.064 s / 1.416 GB**, including **90.266 s** in the reducer:
+factor/inverse 1.459 s, SPD witness 6.448 s, fixed congruences 19.144 s, and
+metric/eigen validation 42.170 s; selection and remaining owner work account
+for the rest. The four extended errors were at most `3.69636e-10`, computed-H
+lower bound `1.51590e-10`, and generalized residual `1.33183e-11`.
+All 661 poles were finite with imaginary part exactly `-gamma`. This is
+**not full-port held-W, other-parent, Sigma or TD admission**. See the
+[raw production receipt](evidence/EQFF_Q0_PRODUCTION_51150113_CFS_v1.json),
+[execution/source-location record](evidence/EQFF_Q0_PRODUCTION_51150113_CFS_v1_EXECUTION.json)
+and [stdout](evidence/EQFF_Q0_PRODUCTION_51150113_CFS_v1.log).
+
+On that same staged tree, the focused native four-process/GPU fixture passed
+in **16.175 s**: 20 padded complex-chi cases, new original-column metric
+policy, exact per-q selector reuse under changed current H, canonical
+all-rank handoff, and strict negative-H refusal. Maximum literal chi error
+was `2.14446e-9`; complex held-response error was `2.85526e-14` and latent
+Gram error `2.79245e-16`. The [unaltered native receipt](evidence/EQ_ORIGINAL_COLUMNS_P4_60069199.json)
+authenticates the tree/archive and actual CUDA owner paths. This focused
+software result is separate from the full hsuite verdict and material W.
+
+The subsequent full P4 hsuite on this tree hit its unchanged **900 s cap**
+during scalar `sp_export` receipt/head finalization. Later bispinor and Na
+stages were not reached, and no final numerical comparison summary exists:
+**PARTIAL, not a full regression PASS**. Completed earlier drivers do not
+stand in for that verdict. The same owned allocation was promptly released:
+956 s × 4 = **1.062222 reserved GPUh**; the focused and suite numeric steps
+used (42 + 903) s × 4 = **1.050000 active GPUh**. These views are nonadditive;
+a 1 s NVML-only overlapping step is not added again. No extension or blind
+retry occurred. GN-PPM recorded 255 real compiles / 23.3 s plus 24 cache hits;
+its ISDF/wavefunction stage took 67.9 s. Slow scratch metadata/cache I/O is
+an investigation hypothesis, not an established sole cause. The
+[partial-run/accounting record](evidence/HSUITE_PARTIAL_60069199.json) pins
+raw all-rank stage logs, source tree, launcher and software-proof receipt.
+
 ### Correction: the707 t0 request was not on its instantaneous shells
 
 The preserved707 measurements above remain raw historical evidence, but

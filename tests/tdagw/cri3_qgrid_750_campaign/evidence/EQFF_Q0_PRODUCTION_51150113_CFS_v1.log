@@ -1,0 +1,7 @@
+/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/tests/tdagw/cri3_qgrid_750_campaign/diagnostics/verify_cached_equilibrium_production_cpu.py: OK
+/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/qgrid_20261020/threadpoolctl-3.6.0-py3-none-any.whl: OK
+CPU_PRODUCTION_Q0_BEGIN utc=2026-10-21T02:51:24Z core=6 helper180s outer180s RSS4GiB noGPU tree=51150113fbea568fe36b77f230e0c215f02f3f25
+[lorrax source closure] {"mode":"source","root":"/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF","runtime":"src/runtime/__init__.py","services":{"distrib-la":"services/distrib_la/src/distrib_la/__init__.py","lxkit":"services/lxkit/src/lxkit/__init__.py","minimax":"services/minimax/src/minimax/__init__.py","symmetry-maps":"services/symmetry_maps/src/symmetry_maps/__init__.py","vcoul":"services/vcoul/src/vcoul/__init__.py","wfn-loader":"services/wfn_loader/src/wfn_loader/__init__.py","zeta-loader":"services/zeta_loader/src/zeta_loader/__init__.py"}}
+CACHED_PRODUCTION ORIGINAL-PRODUCTION-OWNER-BEGIN-full-RRQR 1.569s
+CACHED_PRODUCTION COMPLETE-rc-0 92.164s
+CPU_PRODUCTION_Q0_TERMINAL rc=0 utc=2026-10-21T02:52:56Z

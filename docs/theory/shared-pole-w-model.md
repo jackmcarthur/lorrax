@@ -646,6 +646,54 @@ all training/held W values to $3.11\times10^{-7}$ at $10^{-8}$ relative
 sample perturbation. This is not an operator-W error certificate or material
 qualification. No PSD floor or pole projection is used.
 
+The principal-state metric policy is
+`original-columns-extended-newton-v1`. Rank tolerance selects independent
+original columns **once**; it is not applied again to delete small positive
+eigenvalues of the selected H. All selected states remain. A positive common
+diagonal congruence $H_s=D H_{II}D$ conditions that current metric, without
+changing its inertia or the physical state span. Its Cholesky factor and
+triangular inverse are computed in supported extended host arithmetic;
+unsupported precision fails closed. With residual bounds
+$\delta\ge\|H_s-LL^\dagger\|_2$ and
+$r\ge\|BL-I\|_2<1$, the computed-matrix positivity witness is
+
+$$
+\lambda_{\min}(H_s)\ge
+\left(\frac{1-r}{\|B\|_F}\right)^2-\delta>0.
+$$
+
+This is a floating-operation certificate for the recorded numerical H,
+not a propagated physical χ/W error bound. No negative pivot, unresolved
+metric or failed certificate is replaced by a floor. The original-coordinate
+map is recovered before validation. Exactly two current-H near-identity
+congruence corrections use $S=Z^\dagger HZ$ and
+$R=\tfrac32I-\tfrac12S$, guarded by a finite Hermitian
+$\|S-I\|_F<\tfrac12$. For $S=I+E$,
+$R^\dagger SR=I-\tfrac34E^2+\tfrac14E^3$: the corrections improve the metric,
+not the spectrum or occupations. Final complex128 maps are checked against
+the **original** H, directly and through the equivalent common scaling,
+using extended inner-block compensated products at the unchanged $10^{-9}$
+whitening criterion. The ordinary binary64 product remains diagnostic when
+its cancellation error is larger. Generalized residuals and all native
+full-W checks remain independently necessary.
+
+Held spaces are the exact original-column selector $P_I$, not the previous
+H-whitened Z. Thus a new current metric is obtained from the same original
+principal submatrix and refactored; no old whitening or held rank drop is
+reused. The builder uses a separate versioned selector-space cache and binds
+the metric policy in its recipe/hash. A live null-output witness is measured
+on an orthonormal basis of its span in **original coordinates**, so changing
+units cannot make a live direction appear dark by shrinking its vectors.
+The unselected exact-dependency/null policy is separate from this all-selected
+positive-metric solve.
+
+On the saved 2084-dimensional q0 frequency pencil, the bounded CPU prototype
+retained all 661 independently selected states, certified positive computed
+H, and passed all four rounded-map original-metric checks below $10^{-9}$.
+That is numerical-method evidence only: q0 was not identified as the failed
+material parent, and no native full-W held qualification, Σ, equilibrium
+collision operator or TD trajectory follows from that offline result.
+
 Before reduction, a separately bounded q0 frequency-only capture preserves
 G, H, the output Gram and current selector/provenance metadata. It survives
 a metric refusal without gathering microscopic port faces, allowing the

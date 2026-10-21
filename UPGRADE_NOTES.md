@@ -5,6 +5,25 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-20 — instantaneous equilibrium W: preserve selected positive-metric states
+
+The authenticated equilibrium member of native instantaneous shared-pole W
+uses `original-columns-extended-newton-v1`: joint RRQR selects independent
+original frequency states once, without a second bank-tolerance cut on
+positive H eigenvalues. The current selected H is factored and checked in
+extended host arithmetic; unsupported precision, failed positivity evidence,
+or failed original-matrix reconstruction still refuses. No eigenvalue floor,
+pole clipping or accuracy-threshold change is introduced. The numerical
+contract is in [shared-pole W §6.4](docs/theory/shared-pole-w-model.md).
+
+Held spaces now store exact original-column selectors in the separate
+`equilibrium_column_spaces_v1` cache, with the metric policy bound into the
+recipe hash. Old H-whitened spaces are not reused as selectors. No deck
+change is needed; affected instantaneous W models must be rebuilt. General
+coherent and existing passive equilibrium GW routes keep their contracts.
+Passing the saved-q0 metric diagnostic is not admission of full material W,
+self-energy, or dynamics, and supplies no density-positivity guarantee.
+
 ## 2026-10-20 — BerkeleyGW exports: `epsmat_ecut` and the finite-Q `bsemat`
 
 `[epsmat]` export: `epsmat_ecut` (Ry, default 0 = the full sphere) replaces

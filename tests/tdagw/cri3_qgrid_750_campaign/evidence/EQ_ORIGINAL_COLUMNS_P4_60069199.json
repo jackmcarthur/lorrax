@@ -1,0 +1,4546 @@
+{
+  "status": "PASS_SOFTWARE_ONLY_NOT_MATERIAL",
+  "source_revision": "staged-tree-51150113fbea568fe36b77f230e0c215f02f3f25",
+  "module_origins": {
+    "gw.gw_jax": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/src/gw/gw_jax.py",
+    "gw.w_isdf": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/src/gw/w_isdf.py",
+    "gw.response_bank": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/src/gw/response_bank.py",
+    "gw.shared_pole_screening": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/src/gw/shared_pole_screening.py",
+    "gw.shared_pole_constructor": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/src/gw/shared_pole_constructor.py",
+    "verify_fejer_p4_38dbea1": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/tests/tdagw/cri3_qgrid_750_campaign/diagnostics/verify_fejer_p4_38dbea1.py",
+    "verify_common_coherent_chi_p4": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/tests/tdagw/cri3_qgrid_750_campaign/diagnostics/verify_common_coherent_chi_p4.py",
+    "__main__": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF/tests/tdagw/cri3_qgrid_750_campaign/diagnostics/verify_equilibrium_builder_p4.py"
+  },
+  "harness_sha256": "821836a6d52bfcf1695a9cc71c8139285f85ae9548f9b1a650cb83c01cfcc372",
+  "stage_sha256": "488e3c34bd129bcc73c550c6f2ee4bd5a32018a1e84cda37a55b54c1da716663",
+  "source_archive_sha256": "770fd05b8b77b5975e07502e2da684e5fd120eafaaa91d27bcd8396aa2cd9a40",
+  "elapsed_seconds": 16.174830612999358,
+  "max_wall_seconds": 180.0,
+  "active_GPUh_cap": 0.2,
+  "result": {
+    "padded_complex_chi": {
+      "max_literal_error": 2.144458239785654e-09,
+      "current_inputs": 2,
+      "paired_calls": 20,
+      "total_node_calls": 4036,
+      "typed_identity_parent": true,
+      "native_mode11": true,
+      "panels": [
+        "full",
+        "FF",
+        "FA",
+        "AF",
+        "AA"
+      ],
+      "rules": [
+        {
+          "current": 0,
+          "block": "full",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 210,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.3118356979279945e-09,
+          "max_coefficient_mass": 66.00613952866115
+        },
+        {
+          "current": 0,
+          "block": "FF",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 190,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 6.374755696728833e-09,
+          "max_coefficient_mass": 87.83412404595154
+        },
+        {
+          "current": 0,
+          "block": "FA",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 210,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.524524509385452e-09,
+          "max_coefficient_mass": 66.16079170351684
+        },
+        {
+          "current": 0,
+          "block": "AF",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 191,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 6.774709440052312e-09,
+          "max_coefficient_mass": 87.77091532594437
+        },
+        {
+          "current": 0,
+          "block": "AA",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 210,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.3118356979279945e-09,
+          "max_coefficient_mass": 66.00613952866115
+        },
+        {
+          "current": 1,
+          "block": "full",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 202,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 9.764320567194752e-09,
+          "max_coefficient_mass": 88.2280934431034
+        },
+        {
+          "current": 1,
+          "block": "FF",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 188,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 7.793273503521715e-09,
+          "max_coefficient_mass": 88.57962616266627
+        },
+        {
+          "current": 1,
+          "block": "FA",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 201,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 8.843394425670449e-09,
+          "max_coefficient_mass": 83.55641465334791
+        },
+        {
+          "current": 1,
+          "block": "AF",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 206,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.4960834658718405e-09,
+          "max_coefficient_mass": 66.68857073643618
+        },
+        {
+          "current": 1,
+          "block": "AA",
+          "qgrid": [
+            8,
+            8,
+            1
+          ],
+          "nodes": 210,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.3792161608944083e-09,
+          "max_coefficient_mass": 66.03012857322845
+        },
+        {
+          "current": 0,
+          "block": "full",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 210,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.3118356979279945e-09,
+          "max_coefficient_mass": 66.00613952866115
+        },
+        {
+          "current": 0,
+          "block": "FF",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 190,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 6.374755696728833e-09,
+          "max_coefficient_mass": 87.83412404595154
+        },
+        {
+          "current": 0,
+          "block": "FA",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 210,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.524524509385452e-09,
+          "max_coefficient_mass": 66.16079170351684
+        },
+        {
+          "current": 0,
+          "block": "AF",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 191,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 6.774709440052312e-09,
+          "max_coefficient_mass": 87.77091532594437
+        },
+        {
+          "current": 0,
+          "block": "AA",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 210,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.3118356979279945e-09,
+          "max_coefficient_mass": 66.00613952866115
+        },
+        {
+          "current": 1,
+          "block": "full",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 202,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 9.764320567194752e-09,
+          "max_coefficient_mass": 88.2280934431034
+        },
+        {
+          "current": 1,
+          "block": "FF",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 188,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 7.793273503521715e-09,
+          "max_coefficient_mass": 88.57962616266627
+        },
+        {
+          "current": 1,
+          "block": "FA",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 201,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 8.843394425670449e-09,
+          "max_coefficient_mass": 83.55641465334791
+        },
+        {
+          "current": 1,
+          "block": "AF",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 206,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.4960834658718405e-09,
+          "max_coefficient_mass": 66.68857073643618
+        },
+        {
+          "current": 1,
+          "block": "AA",
+          "qgrid": [
+            4,
+            4,
+            1
+          ],
+          "nodes": 210,
+          "panels": 4,
+          "node_carrier_slots": 1536,
+          "max_bound": 2.3792161608944083e-09,
+          "max_coefficient_mass": 66.03012857322845
+        }
+      ],
+      "execution": [
+        {
+          "seconds": {
+            "compilation": 0.6127430920041661,
+            "direct_dispatch": 0.8392091690002417
+          },
+          "memory": [
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057548,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:1"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:1",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:2"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:2",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:3"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:3",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:4"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:4",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:5"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:5",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:6"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:6",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:7"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:7",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:8"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:8",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:9"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:9",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:10"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:10",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:11"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:11",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:12"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:12",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:13"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:13",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:14"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:14",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:15"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:15",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:16"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:16",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:17"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:17",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:18"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:18",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:19"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:19",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:20"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:20",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:21"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:21",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:22"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:22",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:23"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:23",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:24"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:24",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583041164,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:25"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:25",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:26"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:26",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:27"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:27",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:28"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:28",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:29"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:29",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:30"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:30",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:31"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:31",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:32"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:32",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:33"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:33",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:34"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:34",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:35"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:35",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:36"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:36",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:37"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:37",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:38"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:38",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:39"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:39",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 200.71533203125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 3280328,
+              "aggregate_bytes_per_rank": 3288520,
+              "limit_bytes_per_rank": 49152.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583057556,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:40"
+              ],
+              "geometry": {
+                "nq": 64,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:40",
+              "whole": false
+            }
+          ],
+          "compiled": [
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 8192,
+              "temporaries": 3280328,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            }
+          ]
+        },
+        {
+          "seconds": {
+            "compilation": 0.6036479939994024,
+            "direct_dispatch": 0.9143596579961013
+          },
+          "memory": [
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:1"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:1",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:2"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:2",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:3"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:3",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:4"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:4",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:5"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:5",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:6"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:6",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:7"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:7",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:8"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:8",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:9"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:9",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:10"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:10",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:11"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:11",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:12"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:12",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:13"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:13",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:14"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:14",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:15"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:15",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:16"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:16",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:17"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:17",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:18"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:18",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:19"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:19",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:20"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:20",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:21"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:21",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:22"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:22",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:23"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:23",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:24"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:24",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:25"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:25",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:26"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:26",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:27"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:27",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:28"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:28",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:29"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:29",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:30"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:30",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:31"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:31",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:32"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:32",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:33"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:33",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:34"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:34",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:35"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:35",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:36"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:36",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:37"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:37",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:38"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:38",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:39"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:39",
+              "whole": false
+            },
+            {
+              "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+              "name": "capacity",
+              "version": "shared_real_pole_gates_v1_r3b",
+              "value": 223.923828125,
+              "threshold": 3.0,
+              "status": "WARN",
+              "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+              "resident_bytes_per_rank": 0,
+              "workspace_bytes_per_rank": 915144,
+              "aggregate_bytes_per_rank": 917192,
+              "limit_bytes_per_rank": 12288.0,
+              "device_budget_bytes_per_rank": 31583140988,
+              "baseline_bytes_per_rank": 0,
+              "available_device_bytes_per_rank": 31583051412,
+              "device_budget_status": "PASS",
+              "concurrent_with": [
+                "complex_box_software_carry"
+              ],
+              "live_stages": [
+                "complex_box_software_carry",
+                "direct_temporaries:40"
+              ],
+              "geometry": {
+                "nq": 16,
+                "nspinor": 2,
+                "nmu": 4,
+                "px": 2,
+                "py": 2
+              },
+              "max_mesh_ranks_at_fixed_bytes": 0,
+              "stage": "direct_temporaries:40",
+              "whole": false
+            }
+          ],
+          "compiled": [
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            },
+            {
+              "stage": "direct",
+              "arguments": 77352,
+              "outputs": 2048,
+              "temporaries": 915144,
+              "aliases": 0,
+              "runtime": 0,
+              "inherited_stream": false,
+              "stream_temporaries_admitted": true
+            }
+          ]
+        }
+      ]
+    },
+    "equilibrium_frequency": {
+      "max_full_complex_held_relative_error": 2.8552609158060903e-14,
+      "latent_gram_relative_error": 2.792454340009561e-16,
+      "current_inputs": 2,
+      "nonzero_C1": true,
+      "distinct_q_crossing": true,
+      "real_zeta_poles": true,
+      "canonical_structured_handoff": true,
+      "original_state_RRQR": true,
+      "tiny_host_port_extent": 4,
+      "metric_solver": "original-columns-extended-newton-v1",
+      "exact_original_selector_held_across_current_H": true,
+      "material_microscopic_host_gather": false,
+      "resolved_negative_H_refusal": "GATE shared_general_owner: owner_rank=0, reduced_shape=(2, 2): ValueError: GATE shared_equilibrium_metric: nonpositive/negative H diagonal; no PSD repair",
+      "eigenmodels": [
+        {
+          "current": 0,
+          "q": 0,
+          "receipt": {
+            "order": 4,
+            "held_state_rank": 4,
+            "construction": "equilibrium-definite-value",
+            "spectral_variable": "z+i_gamma",
+            "gamma_ry": 0.037,
+            "rank_tolerance": 1e-08,
+            "H_min_eigenvalue": null,
+            "H_null_output_squared": 0.0,
+            "null_output_basis": "original-coordinate-orthonormal",
+            "H_null_roundoff_allowance": 6.932214808197412e-10,
+            "zero_mu_output_checked": true,
+            "numerical_spaces": "same-state-H-congruence",
+            "state_selection": {
+              "method": "original-state-joint-RRQR-v1",
+              "original_order": 12,
+              "selected_order": 4,
+              "selected_columns_sha256": "02d6d065b23453982a4bc5831d3934435d8b00928c2099f732e6c67180e3e5f6",
+              "rank_tolerance": 1e-08,
+              "relative_cutoff": 1.0000341060513165e-08,
+              "smallest_kept_pivot": 0.24881824727420726,
+              "largest_discarded_pivot": 4.370026620365333e-16,
+              "output_gram_roundoff_rank": 4,
+              "discarded_output_gram_norm": 1.2328540034070195e-13,
+              "output_gram_roundoff_bound": 5.936673081957974e-10,
+              "frequency_scale_ry": 2.0,
+              "scope": "numerical state independence; NOT an operator-W sample-error certificate",
+              "required_validation": "all original full-matrix W fit/held and moment checks"
+            },
+            "eigen_residual": 2.8499850420033625e-15,
+            "whitening_error": 7.894779894025222e-16,
+            "workspace_bytes": 101376,
+            "host_reduce_seconds": 0.0019238540007791016,
+            "metric_solver": "original-columns-extended-newton-v1",
+            "metric_workspace_bytes": 29696,
+            "extended_mantissa_bits": 63,
+            "computed_scaled_H_min_lower": 0.12743342618939354,
+            "computed_H_SPD_residual_upper": 6.179814163442844e-17,
+            "inverse_BL_residual_upper": 8.132953974891365e-17,
+            "fixed_congruence_count": 2,
+            "Newton_metric_errors_before": [
+              2.8094077886836335e-16,
+              2.6414652566706487e-16
+            ],
+            "original_H_extended_whitening_errors": [
+              2.6115049500021854e-16,
+              2.612824432522624e-16,
+              7.894779894025222e-16,
+              7.894748631391368e-16
+            ],
+            "original_H_binary64_whitening_error": 4.533534551299796e-16,
+            "metric_phase_seconds": {
+              "factor_inverse": 0.00018786399959935807,
+              "SPD_witness": 0.000174177999724634,
+              "fixed_two_congruences": 0.00018265499966219068,
+              "metric_eigen_validation": 0.00033886700111906976
+            },
+            "metric_scope": "computed current H, not physical sample-error or full-W admission",
+            "space_representation": "original-column-selector-v1",
+            "original_selector_columns_sha256": "02d6d065b23453982a4bc5831d3934435d8b00928c2099f732e6c67180e3e5f6",
+            "canonical_owner_rank": 0,
+            "canonical_host_workspace_bytes": 150528,
+            "canonical_batch_size": 1,
+            "reduced_pencil_shape": [
+              12,
+              12
+            ],
+            "canonical_handoff_seconds": 0.8879481010008021
+          }
+        },
+        {
+          "current": 0,
+          "q": 1,
+          "receipt": {
+            "order": 4,
+            "held_state_rank": 4,
+            "construction": "equilibrium-definite-value",
+            "spectral_variable": "z+i_gamma",
+            "gamma_ry": 0.037,
+            "rank_tolerance": 1e-08,
+            "H_min_eigenvalue": null,
+            "H_null_output_squared": 0.0,
+            "null_output_basis": "original-coordinate-orthonormal",
+            "H_null_roundoff_allowance": 3.4617950543073146e-09,
+            "zero_mu_output_checked": true,
+            "numerical_spaces": "same-state-H-congruence",
+            "state_selection": {
+              "method": "original-state-joint-RRQR-v1",
+              "original_order": 12,
+              "selected_order": 4,
+              "selected_columns_sha256": "81e22d5108f13139dbb662cc0a434d18d5615952d611df63b724fa138c0d2703",
+              "rank_tolerance": 1e-08,
+              "relative_cutoff": 1.0000341060513165e-08,
+              "smallest_kept_pivot": 0.09617876134377862,
+              "largest_discarded_pivot": 3.5144057143807503e-15,
+              "output_gram_roundoff_rank": 4,
+              "discarded_output_gram_norm": 1.03521342135624e-12,
+              "output_gram_roundoff_bound": 2.4772935026883003e-09,
+              "frequency_scale_ry": 2.0,
+              "scope": "numerical state independence; NOT an operator-W sample-error certificate",
+              "required_validation": "all original full-matrix W fit/held and moment checks"
+            },
+            "eigen_residual": 8.36308765161422e-16,
+            "whitening_error": 5.5026760282926e-16,
+            "workspace_bytes": 101376,
+            "host_reduce_seconds": 0.0016836079994391184,
+            "metric_solver": "original-columns-extended-newton-v1",
+            "metric_workspace_bytes": 29696,
+            "extended_mantissa_bits": 63,
+            "computed_scaled_H_min_lower": 0.0719339688090826,
+            "computed_H_SPD_residual_upper": 6.261489759204822e-17,
+            "inverse_BL_residual_upper": 1.0702401940234092e-16,
+            "fixed_congruence_count": 2,
+            "Newton_metric_errors_before": [
+              2.387800204678395e-16,
+              1.4291588826905886e-16
+            ],
+            "original_H_extended_whitening_errors": [
+              8.315685668491746e-17,
+              8.361170282478388e-17,
+              5.501061381920963e-16,
+              5.5026760282926e-16
+            ],
+            "original_H_binary64_whitening_error": 4.951701177529218e-16,
+            "metric_phase_seconds": {
+              "factor_inverse": 0.00013060299897915684,
+              "SPD_witness": 0.00017060100071830675,
+              "fixed_two_congruences": 0.00019292500110168476,
+              "metric_eigen_validation": 0.00037741200139862485
+            },
+            "metric_scope": "computed current H, not physical sample-error or full-W admission",
+            "space_representation": "original-column-selector-v1",
+            "original_selector_columns_sha256": "81e22d5108f13139dbb662cc0a434d18d5615952d611df63b724fa138c0d2703",
+            "canonical_owner_rank": 0,
+            "canonical_host_workspace_bytes": 150528,
+            "canonical_batch_size": 1,
+            "reduced_pencil_shape": [
+              12,
+              12
+            ],
+            "canonical_handoff_seconds": 0.006904969999595778
+          }
+        },
+        {
+          "current": 0,
+          "q": 3,
+          "receipt": {
+            "order": 4,
+            "held_state_rank": 4,
+            "construction": "equilibrium-definite-value",
+            "spectral_variable": "z+i_gamma",
+            "gamma_ry": 0.037,
+            "rank_tolerance": 1e-08,
+            "H_min_eigenvalue": null,
+            "H_null_output_squared": 0.0,
+            "null_output_basis": "original-coordinate-orthonormal",
+            "H_null_roundoff_allowance": 5.2800759741085555e-09,
+            "zero_mu_output_checked": true,
+            "numerical_spaces": "same-state-H-congruence",
+            "state_selection": {
+              "method": "original-state-joint-RRQR-v1",
+              "original_order": 12,
+              "selected_order": 4,
+              "selected_columns_sha256": "da54908b49a65dde26d992ae8e59fca57b2d5cb0d9c38efd0c892c7378d0d617",
+              "rank_tolerance": 1e-08,
+              "relative_cutoff": 1.0000341060513165e-08,
+              "smallest_kept_pivot": 0.06066274381277775,
+              "largest_discarded_pivot": 2.3793450040344256e-15,
+              "output_gram_roundoff_rank": 4,
+              "discarded_output_gram_norm": 7.595247083608313e-13,
+              "output_gram_roundoff_bound": 3.9644800368605155e-09,
+              "frequency_scale_ry": 2.0,
+              "scope": "numerical state independence; NOT an operator-W sample-error certificate",
+              "required_validation": "all original full-matrix W fit/held and moment checks"
+            },
+            "eigen_residual": 2.9856347405419446e-15,
+            "whitening_error": 1.5621881178570613e-15,
+            "workspace_bytes": 101376,
+            "host_reduce_seconds": 0.001613311000255635,
+            "metric_solver": "original-columns-extended-newton-v1",
+            "metric_workspace_bytes": 29696,
+            "extended_mantissa_bits": 63,
+            "computed_scaled_H_min_lower": 0.0583197083674135,
+            "computed_H_SPD_residual_upper": 6.296616766763684e-17,
+            "inverse_BL_residual_upper": 1.1858769393018238e-16,
+            "fixed_congruence_count": 2,
+            "Newton_metric_errors_before": [
+              3.1211634687408443e-16,
+              2.2947346496195465e-16
+            ],
+            "original_H_extended_whitening_errors": [
+              1.955916050026978e-16,
+              1.9511781825073699e-16,
+              1.5621446276153253e-15,
+              1.5621881178570613e-15
+            ],
+            "original_H_binary64_whitening_error": 6.809954461664064e-16,
+            "metric_phase_seconds": {
+              "factor_inverse": 0.00012666500151681248,
+              "SPD_witness": 0.0001590589999977965,
+              "fixed_two_congruences": 0.00019114000133413356,
+              "metric_eigen_validation": 0.00038654000127280597
+            },
+            "metric_scope": "computed current H, not physical sample-error or full-W admission",
+            "space_representation": "original-column-selector-v1",
+            "original_selector_columns_sha256": "da54908b49a65dde26d992ae8e59fca57b2d5cb0d9c38efd0c892c7378d0d617",
+            "canonical_owner_rank": 0,
+            "canonical_host_workspace_bytes": 150528,
+            "canonical_batch_size": 1,
+            "reduced_pencil_shape": [
+              12,
+              12
+            ],
+            "canonical_handoff_seconds": 0.006628994999118731
+          }
+        },
+        {
+          "current": 1,
+          "q": 0,
+          "receipt": {
+            "order": 4,
+            "held_state_rank": 4,
+            "construction": "equilibrium-definite-value",
+            "spectral_variable": "z+i_gamma",
+            "gamma_ry": 0.037,
+            "rank_tolerance": 1e-08,
+            "H_min_eigenvalue": null,
+            "H_null_output_squared": 0.0,
+            "null_output_basis": "original-coordinate-orthonormal",
+            "H_null_roundoff_allowance": 5.492183052049275e-10,
+            "zero_mu_output_checked": true,
+            "numerical_spaces": "same-state-H-congruence",
+            "state_selection": null,
+            "eigen_residual": 2.427940538253884e-15,
+            "whitening_error": 7.348391157510878e-16,
+            "workspace_bytes": 101376,
+            "host_reduce_seconds": 0.0013207320007495582,
+            "metric_solver": "original-columns-extended-newton-v1",
+            "metric_workspace_bytes": 29696,
+            "extended_mantissa_bits": 63,
+            "computed_scaled_H_min_lower": 0.13027252913135973,
+            "computed_H_SPD_residual_upper": 6.182617702737554e-17,
+            "inverse_BL_residual_upper": 8.047678316141869e-17,
+            "fixed_congruence_count": 2,
+            "Newton_metric_errors_before": [
+              2.549436194512486e-16,
+              2.0410480668158477e-16
+            ],
+            "original_H_extended_whitening_errors": [
+              1.9213147842555182e-16,
+              1.921775148627033e-16,
+              7.348391157510878e-16,
+              7.348140358207892e-16
+            ],
+            "original_H_binary64_whitening_error": 3.5362900141345826e-16,
+            "metric_phase_seconds": {
+              "factor_inverse": 0.00015054100003908388,
+              "SPD_witness": 0.00020391599900904112,
+              "fixed_two_congruences": 0.00017556099919602275,
+              "metric_eigen_validation": 0.0003353409992996603
+            },
+            "metric_scope": "computed current H, not physical sample-error or full-W admission",
+            "space_representation": "original-column-selector-v1",
+            "original_selector_columns_sha256": "02d6d065b23453982a4bc5831d3934435d8b00928c2099f732e6c67180e3e5f6",
+            "canonical_owner_rank": 0,
+            "canonical_host_workspace_bytes": 150528,
+            "canonical_batch_size": 1,
+            "reduced_pencil_shape": [
+              12,
+              12
+            ],
+            "canonical_handoff_seconds": 0.0063536699999531265
+          }
+        },
+        {
+          "current": 1,
+          "q": 1,
+          "receipt": {
+            "order": 4,
+            "held_state_rank": 4,
+            "construction": "equilibrium-definite-value",
+            "spectral_variable": "z+i_gamma",
+            "gamma_ry": 0.037,
+            "rank_tolerance": 1e-08,
+            "H_min_eigenvalue": null,
+            "H_null_output_squared": 0.0,
+            "null_output_basis": "original-coordinate-orthonormal",
+            "H_null_roundoff_allowance": 3.2584273339572347e-09,
+            "zero_mu_output_checked": true,
+            "numerical_spaces": "same-state-H-congruence",
+            "state_selection": null,
+            "eigen_residual": 1.0343436626922686e-15,
+            "whitening_error": 1.0824882164078525e-15,
+            "workspace_bytes": 101376,
+            "host_reduce_seconds": 0.0011653809997369535,
+            "metric_solver": "original-columns-extended-newton-v1",
+            "metric_workspace_bytes": 29696,
+            "extended_mantissa_bits": 63,
+            "computed_scaled_H_min_lower": 0.06608940434854389,
+            "computed_H_SPD_residual_upper": 6.276038118924555e-17,
+            "inverse_BL_residual_upper": 1.1158380016793045e-16,
+            "fixed_congruence_count": 2,
+            "Newton_metric_errors_before": [
+              4.896638104179138e-16,
+              4.1045278750708677e-16
+            ],
+            "original_H_extended_whitening_errors": [
+              3.798621022039046e-16,
+              3.7992720092358785e-16,
+              1.0824882164078525e-15,
+              1.0821458635790653e-15
+            ],
+            "original_H_binary64_whitening_error": 1.406481381093717e-15,
+            "metric_phase_seconds": {
+              "factor_inverse": 0.00011791900033131242,
+              "SPD_witness": 0.00014700499923492316,
+              "fixed_two_congruences": 0.00016870800027390942,
+              "metric_eigen_validation": 0.000330241000483511
+            },
+            "metric_scope": "computed current H, not physical sample-error or full-W admission",
+            "space_representation": "original-column-selector-v1",
+            "original_selector_columns_sha256": "81e22d5108f13139dbb662cc0a434d18d5615952d611df63b724fa138c0d2703",
+            "canonical_owner_rank": 0,
+            "canonical_host_workspace_bytes": 150528,
+            "canonical_batch_size": 1,
+            "reduced_pencil_shape": [
+              12,
+              12
+            ],
+            "canonical_handoff_seconds": 0.00644645899956231
+          }
+        },
+        {
+          "current": 1,
+          "q": 3,
+          "receipt": {
+            "order": 4,
+            "held_state_rank": 4,
+            "construction": "equilibrium-definite-value",
+            "spectral_variable": "z+i_gamma",
+            "gamma_ry": 0.037,
+            "rank_tolerance": 1e-08,
+            "H_min_eigenvalue": null,
+            "H_null_output_squared": 0.0,
+            "null_output_basis": "original-coordinate-orthonormal",
+            "H_null_roundoff_allowance": 4.998918594216428e-09,
+            "zero_mu_output_checked": true,
+            "numerical_spaces": "same-state-H-congruence",
+            "state_selection": null,
+            "eigen_residual": 2.015765832940572e-15,
+            "whitening_error": 3.94207577023543e-15,
+            "workspace_bytes": 101376,
+            "host_reduce_seconds": 0.0012247960003151093,
+            "metric_solver": "original-columns-extended-newton-v1",
+            "metric_workspace_bytes": 29696,
+            "extended_mantissa_bits": 63,
+            "computed_scaled_H_min_lower": 0.05464416382192726,
+            "computed_H_SPD_residual_upper": 6.303555783052368e-17,
+            "inverse_BL_residual_upper": 1.2235279523663578e-16,
+            "fixed_congruence_count": 2,
+            "Newton_metric_errors_before": [
+              2.502318129748814e-16,
+              1.4908219362876753e-16
+            ],
+            "original_H_extended_whitening_errors": [
+              1.269771586330138e-16,
+              1.2682502802709774e-16,
+              3.941925783043707e-15,
+              3.94207577023543e-15
+            ],
+            "original_H_binary64_whitening_error": 1.1094190119095557e-15,
+            "metric_phase_seconds": {
+              "factor_inverse": 0.00011850000009872019,
+              "SPD_witness": 0.0001449210012651747,
+              "fixed_two_congruences": 0.0001692589994490845,
+              "metric_eigen_validation": 0.0003347490001033293
+            },
+            "metric_scope": "computed current H, not physical sample-error or full-W admission",
+            "space_representation": "original-column-selector-v1",
+            "original_selector_columns_sha256": "da54908b49a65dde26d992ae8e59fca57b2d5cb0d9c38efd0c892c7378d0d617",
+            "canonical_owner_rank": 0,
+            "canonical_host_workspace_bytes": 150528,
+            "canonical_batch_size": 1,
+            "reduced_pencil_shape": [
+              12,
+              12
+            ],
+            "canonical_handoff_seconds": 0.006335435000437428
+          }
+        }
+      ],
+      "execution": {
+        "seconds": {
+          "compilation": 1.442334558998482,
+          "direct_dispatch": 0.6335347920030472
+        },
+        "memory": [
+          {
+            "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+            "name": "capacity",
+            "version": "shared_real_pole_gates_v1_r3b",
+            "value": 52.125,
+            "threshold": 3.0,
+            "status": "WARN",
+            "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+            "resident_bytes_per_rank": 0,
+            "workspace_bytes_per_rank": 29184,
+            "aggregate_bytes_per_rank": 213504,
+            "limit_bytes_per_rank": 12288.0,
+            "device_budget_bytes_per_rank": 31583140988,
+            "baseline_bytes_per_rank": 0,
+            "available_device_bytes_per_rank": 31583278620,
+            "device_budget_status": "PASS",
+            "concurrent_with": [
+              "eq_software_matrices"
+            ],
+            "live_stages": [
+              "direct_temporaries:1",
+              "eq_software_matrices"
+            ],
+            "geometry": {
+              "nq": 16,
+              "nspinor": 2,
+              "nmu": 4,
+              "px": 2,
+              "py": 2
+            },
+            "max_mesh_ranks_at_fixed_bytes": 0,
+            "stage": "direct_temporaries:1",
+            "whole": false
+          },
+          {
+            "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+            "name": "capacity",
+            "version": "shared_real_pole_gates_v1_r3b",
+            "value": 52.640625,
+            "threshold": 3.0,
+            "status": "WARN",
+            "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+            "resident_bytes_per_rank": 0,
+            "workspace_bytes_per_rank": 31296,
+            "aggregate_bytes_per_rank": 215616,
+            "limit_bytes_per_rank": 12288.0,
+            "device_budget_bytes_per_rank": 31583140988,
+            "baseline_bytes_per_rank": 0,
+            "available_device_bytes_per_rank": 31583255420,
+            "device_budget_status": "PASS",
+            "concurrent_with": [
+              "eq_software_matrices"
+            ],
+            "live_stages": [
+              "direct_temporaries:2",
+              "eq_software_matrices"
+            ],
+            "geometry": {
+              "nq": 16,
+              "nspinor": 2,
+              "nmu": 4,
+              "px": 2,
+              "py": 2
+            },
+            "max_mesh_ranks_at_fixed_bytes": 0,
+            "stage": "direct_temporaries:2",
+            "whole": false
+          },
+          {
+            "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+            "name": "capacity",
+            "version": "shared_real_pole_gates_v1_r3b",
+            "value": 51.0,
+            "threshold": 3.0,
+            "status": "WARN",
+            "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+            "resident_bytes_per_rank": 0,
+            "workspace_bytes_per_rank": 24576,
+            "aggregate_bytes_per_rank": 208896,
+            "limit_bytes_per_rank": 12288.0,
+            "device_budget_bytes_per_rank": 31583140988,
+            "baseline_bytes_per_rank": 0,
+            "available_device_bytes_per_rank": 31583230844,
+            "device_budget_status": "PASS",
+            "concurrent_with": [
+              "eq_software_matrices"
+            ],
+            "live_stages": [
+              "direct_temporaries:3",
+              "eq_software_matrices"
+            ],
+            "geometry": {
+              "nq": 16,
+              "nspinor": 2,
+              "nmu": 4,
+              "px": 2,
+              "py": 2
+            },
+            "max_mesh_ranks_at_fixed_bytes": 0,
+            "stage": "direct_temporaries:3",
+            "whole": false
+          },
+          {
+            "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+            "name": "capacity",
+            "version": "shared_real_pole_gates_v1_r3b",
+            "value": 52.125,
+            "threshold": 3.0,
+            "status": "WARN",
+            "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+            "resident_bytes_per_rank": 0,
+            "workspace_bytes_per_rank": 29184,
+            "aggregate_bytes_per_rank": 213504,
+            "limit_bytes_per_rank": 12288.0,
+            "device_budget_bytes_per_rank": 31583140988,
+            "baseline_bytes_per_rank": 0,
+            "available_device_bytes_per_rank": 31583216348,
+            "device_budget_status": "PASS",
+            "concurrent_with": [
+              "eq_software_matrices"
+            ],
+            "live_stages": [
+              "direct_temporaries:4",
+              "eq_software_matrices"
+            ],
+            "geometry": {
+              "nq": 16,
+              "nspinor": 2,
+              "nmu": 4,
+              "px": 2,
+              "py": 2
+            },
+            "max_mesh_ranks_at_fixed_bytes": 0,
+            "stage": "direct_temporaries:4",
+            "whole": false
+          },
+          {
+            "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+            "name": "capacity",
+            "version": "shared_real_pole_gates_v1_r3b",
+            "value": 52.640625,
+            "threshold": 3.0,
+            "status": "WARN",
+            "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+            "resident_bytes_per_rank": 0,
+            "workspace_bytes_per_rank": 31296,
+            "aggregate_bytes_per_rank": 215616,
+            "limit_bytes_per_rank": 12288.0,
+            "device_budget_bytes_per_rank": 31583140988,
+            "baseline_bytes_per_rank": 0,
+            "available_device_bytes_per_rank": 31583246204,
+            "device_budget_status": "PASS",
+            "concurrent_with": [
+              "eq_software_matrices"
+            ],
+            "live_stages": [
+              "direct_temporaries:5",
+              "eq_software_matrices"
+            ],
+            "geometry": {
+              "nq": 16,
+              "nspinor": 2,
+              "nmu": 4,
+              "px": 2,
+              "py": 2
+            },
+            "max_mesh_ranks_at_fixed_bytes": 0,
+            "stage": "direct_temporaries:5",
+            "whole": false
+          },
+          {
+            "predicate": "aggregate live device bytes per rank of new shared-pole objects including workspace <= threshold * U",
+            "name": "capacity",
+            "version": "shared_real_pole_gates_v1_r3b",
+            "value": 51.0,
+            "threshold": 3.0,
+            "status": "WARN",
+            "reason": "above 3U scaling target; admitted within device budget (coordinator ruling24); peak not measured",
+            "resident_bytes_per_rank": 0,
+            "workspace_bytes_per_rank": 24576,
+            "aggregate_bytes_per_rank": 208896,
+            "limit_bytes_per_rank": 12288.0,
+            "device_budget_bytes_per_rank": 31583140988,
+            "baseline_bytes_per_rank": 0,
+            "available_device_bytes_per_rank": 31583221628,
+            "device_budget_status": "PASS",
+            "concurrent_with": [
+              "eq_software_matrices"
+            ],
+            "live_stages": [
+              "direct_temporaries:6",
+              "eq_software_matrices"
+            ],
+            "geometry": {
+              "nq": 16,
+              "nspinor": 2,
+              "nmu": 4,
+              "px": 2,
+              "py": 2
+            },
+            "max_mesh_ranks_at_fixed_bytes": 0,
+            "stage": "direct_temporaries:6",
+            "whole": false
+          }
+        ],
+        "compiled": [
+          {
+            "stage": "direct",
+            "arguments": 5280,
+            "outputs": 17952,
+            "temporaries": 29184,
+            "aliases": 0,
+            "runtime": 0,
+            "inherited_stream": false,
+            "stream_temporaries_admitted": true
+          },
+          {
+            "stage": "direct",
+            "arguments": 31040,
+            "outputs": 24608,
+            "temporaries": 31296,
+            "aliases": 0,
+            "runtime": 0,
+            "inherited_stream": false,
+            "stream_temporaries_admitted": true
+          },
+          {
+            "stage": "direct",
+            "arguments": 3072,
+            "outputs": 9216,
+            "temporaries": 24576,
+            "aliases": 0,
+            "runtime": 0,
+            "inherited_stream": false,
+            "stream_temporaries_admitted": true
+          },
+          {
+            "stage": "direct",
+            "arguments": 5280,
+            "outputs": 17952,
+            "temporaries": 29184,
+            "aliases": 0,
+            "runtime": 0,
+            "inherited_stream": false,
+            "stream_temporaries_admitted": true
+          },
+          {
+            "stage": "direct",
+            "arguments": 31040,
+            "outputs": 24608,
+            "temporaries": 31296,
+            "aliases": 0,
+            "runtime": 0,
+            "inherited_stream": false,
+            "stream_temporaries_admitted": true
+          },
+          {
+            "stage": "direct",
+            "arguments": 3072,
+            "outputs": 9216,
+            "temporaries": 24576,
+            "aliases": 0,
+            "runtime": 0,
+            "inherited_stream": false,
+            "stream_temporaries_admitted": true
+          }
+        ],
+        "purpose": "native frequency GEMM programs"
+      }
+    }
+  }
+}

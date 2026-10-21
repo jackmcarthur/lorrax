@@ -24,6 +24,8 @@ from gw.shared_pole_directions import (_round_kernels, _sample_point, line_panel
                                        select_round_states, infinity_directions)
 from gw.shared_pole_reduction import ORIENTATION_PAIR_REFUSAL
 
+EQUILIBRIUM_METRIC_SOLVER='original-columns-extended-newton-v1'
+
 
 def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                              max_workspace_bytes=4*1024**3, fixed_spaces=None,
@@ -392,7 +394,11 @@ def _equilibrium_state_subset(g, h, output_gram, *, units, frequency_scale,
         raise ValueError('GATE shared_equilibrium_selection: positive common state units/energy scale required')
     gs=d[:,None]*g*d[None];hs=d[:,None]*h*d[None]/frequency_scale
     ns=d[:,None]*output_gram*d[None]
+    if any(not np.isfinite(a).all() for a in (gs,hs,ns)):
+        raise ValueError('GATE shared_equilibrium_selection: nonfinite scaled rank evidence')
     eigen,u=la.eigh(ns,check_finite=False)
+    if not np.isfinite(eigen).all() or not np.isfinite(u).all():
+        raise ValueError('GATE shared_equilibrium_output: nonfinite output eigenpairs')
     scale=max(float(np.max(abs(eigen))),np.finfo(float).tiny)
     if eigen[0]<-rounding*scale:
         raise ValueError('GATE shared_equilibrium_output: scaled output Gram has resolved negative eigenvalue')
@@ -420,6 +426,163 @@ def _equilibrium_state_subset(g, h, output_gram, *, units, frequency_scale,
         scope='numerical state independence; NOT an operator-W sample-error certificate',
         required_validation='all original full-matrix W fit/held and moment checks')
     return selected,receipt
+
+
+def equilibrium_metric_workspace_bytes(full_order, selected_order):
+    """Host array envelope before extended selected-metric copies.
+
+    Eight full complex128 squares cover original/normalized pencils and
+    selection storage; 32 selected squares cover sixteen complex256 cores,
+    eigensolver/maps/scratch; four full-by-selected panels cover selectors
+    and returned maps. This fits the existing admitted general envelope.
+    No microscopic port matrix is priced or gathered here.
+    """
+    n,m=int(full_order),int(selected_order)
+    if not 0<m<=n:
+        raise ValueError('GATE shared_equilibrium_capacity: invalid selected metric shape')
+    return 16*(8*n*n+32*m*m+4*n*m)
+
+
+def _equilibrium_extended_product(x,y):
+    """Complex extended product, inner32 Kahan sums; small host pencils only."""
+    import numpy as np
+    out=np.empty((x.shape[0],y.shape[1]),np.clongdouble)
+    for first in range(0,len(x),64):
+        rows=x[first:first+64]
+        total=np.zeros((len(rows),y.shape[1]),np.clongdouble)
+        compensation=np.zeros_like(total)
+        for k in range(0,x.shape[1],32):
+            term=rows[:,k:k+32]@y[k:k+32]
+            corrected=term-compensation;updated=total+corrected
+            compensation=(updated-total)-corrected;total=updated
+        out[first:first+64]=total
+    return out
+
+
+def _equilibrium_original_null_span(v):
+    """Thin QR of an ORIGINAL-coordinate null span, independent of units."""
+    import numpy as np
+    import scipy.linalg as la
+    if not np.isfinite(v).all():
+        raise ValueError('GATE shared_equilibrium_null: nonfinite original null span')
+    q=la.qr(v,mode='economic',check_finite=False)[0] if v.shape[1] else v
+    if not np.isfinite(q).all():
+        raise ValueError('GATE shared_equilibrium_null: nonfinite original null QR')
+    return q
+
+
+def _equilibrium_accurate_metric(g,h, *,full_order,max_workspace_bytes,rounding):
+    """All-selected current-H congruence with unchanged 1e-9 validation.
+
+    Extended initialization, TWO fixed current-H Newton congruences, then
+    rounded original maps. Neither H nor a pole spectrum is truncated.
+    The SPD witness concerns the computed input pencil, not sample error.
+    """
+    import numpy as np
+    import scipy.linalg as la
+    n=len(h);price=equilibrium_metric_workspace_bytes(full_order,n)
+    if price>int(max_workspace_bytes):
+        raise ValueError('GATE shared_equilibrium_capacity: extended metric exceeds admitted host envelope before copies')
+    ext=np.finfo(np.longdouble);fp=np.finfo(float);started=time.perf_counter();phases={}
+    if ext.nmant<=fp.nmant:
+        raise ValueError('GATE shared_equilibrium_precision: extended host precision required')
+    def gamma(k):
+        v=np.longdouble(k)*ext.eps
+        if v>=1:raise ValueError('GATE shared_equilibrium_precision: invalid roundoff envelope')
+        return v/(1-v)
+    def norm(a):
+        a=np.asarray(a,np.clongdouble)
+        return np.sqrt(np.sum(a.real*a.real+a.imag*a.imag,dtype=np.longdouble))/(1-gamma(8*a.size+8))
+    mm=_equilibrium_extended_product
+    diagonal=h.diagonal().real
+    if np.any(diagonal<=0):
+        raise ValueError('GATE shared_equilibrium_metric: nonpositive/negative H diagonal; no PSD repair')
+    d=(1/np.sqrt(diagonal)).astype(np.longdouble)
+    hx=d[:,None]*np.asarray(h,np.clongdouble)*d[None]
+    if not np.isfinite(hx).all():
+        raise ValueError('GATE shared_equilibrium_metric: nonfinite scaled current H')
+    lower=np.zeros_like(hx)
+    for j in range(n):
+        pivot=hx[j,j].real-np.sum(abs(lower[j,:j])**2,dtype=np.longdouble)
+        if not np.isfinite(pivot) or pivot<=0:
+            raise ValueError('GATE shared_equilibrium_metric: nonpositive/negative H pivot; no PSD repair')
+        lower[j,j]=np.sqrt(pivot)
+        if j+1<n:lower[j+1:,j]=(hx[j+1:,j]-lower[j+1:,:j]@lower[j,:j].conj())/lower[j,j]
+    inverse=np.zeros_like(lower)
+    for j in range(n):
+        inverse[j,j]=1/lower[j,j]
+        if j:inverse[j,:j]=-(lower[j,:j]@inverse[:j,:j])/lower[j,j]
+    phases['factor_inverse']=time.perf_counter()-started;stage=time.perf_counter()
+    ll=mm(lower,lower.conj().T);bl=mm(inverse,lower)
+    delta=norm(hx-ll)+gamma(16*n+64)*norm(lower)**2
+    delta+=gamma(8)*(2*norm(hx)+norm(ll))
+    r=norm(bl-np.eye(n))+gamma(16*n+64)*norm(inverse)*norm(lower)
+    r+=gamma(8)*(norm(bl)+np.sqrt(np.longdouble(n)))
+    singular=max(np.longdouble(0),1-r)/norm(inverse)
+    positive=singular**2-delta
+    positive-=gamma(16)*(singular**2+abs(delta))
+    lower_bound=float(np.nextafter(float(positive),-np.inf))
+    if (not all(np.isfinite(a) for a in (delta,r,singular,positive))
+            or not r<1 or not lower_bound>0):
+        raise ValueError('GATE shared_equilibrium_metric: current computed H lacks positive residual witness')
+    del ll,bl
+    phases['SPD_witness']=time.perf_counter()-stage;stage=time.perf_counter()
+    z=np.asarray(d[:,None]*inverse.conj().T,np.complex128)
+    del lower,inverse
+    history=[]
+    for _ in range(2):
+        y=np.asarray(z,np.clongdouble)/d[:,None]
+        s=mm(y.conj().T,mm(hx,y))
+        error=norm(s-np.eye(n));history.append(float(error))
+        if not np.isfinite(error) or error>=np.longdouble(.5):
+            raise ValueError('GATE shared_equilibrium_congruence: current H outside fixed Newton near-I domain')
+        s=(s+s.conj().T)*np.longdouble(.5)
+        correction=np.longdouble(1.5)*np.eye(n,dtype=np.clongdouble)-np.longdouble(.5)*s
+        z=np.asarray(d[:,None]*mm(y,correction),np.complex128)
+    del y,s,correction
+    phases['fixed_two_congruences']=time.perf_counter()-stage;stage=time.perf_counter()
+    zx=np.asarray(z,np.clongdouble);he=np.asarray(h,np.clongdouble);ge=np.asarray(g,np.clongdouble)
+    white=mm(zx.conj().T,mm(he,zx))
+    y=zx/d[:,None];balanced=mm(y.conj().T,mm(hx,y))
+    k=mm(zx.conj().T,mm(ge,zx))
+    del ge
+    kd=np.asarray((k+k.conj().T)*np.longdouble(.5),np.complex128)
+    if not np.isfinite(kd).all():
+        raise ValueError('GATE shared_equilibrium_eigenvectors: nonfinite current G metric')
+    mu,rotation=la.eigh(kd,check_finite=False)
+    if not np.isfinite(mu).all() or not np.isfinite(rotation).all():
+        raise ValueError('GATE shared_equilibrium_eigenvectors: nonfinite metric eigenpairs')
+    del kd
+    vectors=np.asarray(mm(zx,np.asarray(rotation,np.clongdouble)),np.complex128)
+    if not np.isfinite(vectors).all():
+        raise ValueError('GATE shared_equilibrium_eigenvectors: nonfinite original rounded maps')
+    del zx
+    vx=np.asarray(vectors,np.clongdouble)
+    final=mm(vx.conj().T,mm(he,vx))
+    y=vx/d[:,None];final_balanced=mm(y.conj().T,mm(hx,y))
+    errors=[float(norm(a-np.eye(n))) for a in (white,balanced,final,final_balanced)]
+    if not np.isfinite(errors).all() or max(errors)>1e-9:
+        raise ValueError('GATE shared_equilibrium_eigenvectors: original rounded-map metric exceeds 1e-9')
+    del balanced,final,final_balanced,y,vx,hx,he
+    rr=np.asarray(rotation,np.clongdouble)
+    kr=mm(k,rr);hr=mm(white,rr)*mu[None]
+    residual=float(norm(kr-hr)/max(norm(kr),np.finfo(np.longdouble).tiny))
+    if not np.isfinite(residual) or residual>1e-9:
+        raise ValueError('GATE shared_equilibrium_eigenvectors: original generalized residual exceeds 1e-9')
+    phases['metric_eigen_validation']=time.perf_counter()-stage
+    binary64_white=float(la.norm(z.conj().T@h@z-np.eye(n)))
+    if not np.isfinite(binary64_white):
+        raise ValueError('GATE shared_equilibrium_eigenvectors: nonfinite original metric diagnostic')
+    receipt=dict(metric_solver=EQUILIBRIUM_METRIC_SOLVER,
+        metric_workspace_bytes=price,extended_mantissa_bits=int(ext.nmant),
+        computed_scaled_H_min_lower=lower_bound,computed_H_SPD_residual_upper=float(np.nextafter(float(delta),np.inf)),
+        inverse_BL_residual_upper=float(np.nextafter(float(r),np.inf)),
+        fixed_congruence_count=2,Newton_metric_errors_before=history,
+        original_H_extended_whitening_errors=errors,
+        original_H_binary64_whitening_error=binary64_white,
+        eigen_residual=residual,whitening_error=max(errors),metric_phase_seconds=phases,
+        metric_scope='computed current H, not physical sample-error or full-W admission')
+    return z,mu,vectors,receipt
 
 
 def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
@@ -457,17 +620,30 @@ def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
     # Only roundoff antisymmetry is normalized; no spectrum is floored.
     g,h,n=((a+a.conj().T)*.5 for a in (g,h,n))
     hn=la.norm(h);gn=la.norm(g);on=la.norm(n)
+    if not np.isfinite([hn,gn,on]).all():
+        raise ValueError('GATE shared_equilibrium_pencil: nonfinite pencil norms')
     nev=la.eigvalsh(n,check_finite=False)
+    if not np.isfinite(nev).all():
+        raise ValueError('GATE shared_equilibrium_output: nonfinite output spectrum')
     if nev[0]<-rounding*max(on,np.finfo(float).tiny):
         raise ValueError('GATE shared_equilibrium_output: output Gram has resolved negative eigenvalue')
     held=fixed_spaces is not None
     selection=None
+    accurate=structure.get('metric_solver')==EQUILIBRIUM_METRIC_SOLVER
+    if structure.get('metric_solver') is not None and (not accurate
+            or structure.get('state_selection')!='principal-rrqr-v1'):
+        raise ValueError('GATE shared_equilibrium_solver: explicit original-column principal policy required')
     if held:
         base=np.asarray(fixed_spaces['right'],complex)
         if (base.ndim!=2 or base.shape[0]!=size or not 0<base.shape[1]<=int(max_order)
                 or not np.array_equal(base,np.asarray(fixed_spaces['left'])) or not np.isfinite(base).all()):
             raise ValueError('GATE shared_equilibrium_basis: held left/right spaces must be the SAME congruence')
-        hp=base.conj().T@h@base
+        if accurate:
+            columns=np.argmax(abs(base),axis=0)
+            selector=np.zeros_like(base);selector[columns,np.arange(len(columns))]=1
+            if len(np.unique(columns))!=len(columns) or not np.array_equal(base,selector):
+                raise ValueError('GATE shared_equilibrium_basis: original-column P_I selector required; legacy dense spaces cannot be reused')
+        if not accurate:hp=base.conj().T@h@base
     else:
         base=np.eye(size,dtype=complex)
         if structure.get('state_selection') is not None:
@@ -477,56 +653,97 @@ def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
                 frequency_scale=structure.get('frequency_scale_ry'),
                 rank_tolerance=float(rank_tolerance),rounding=rounding)
             base=base[:,columns]
-        hp=base.conj().T@h@base
-    eigen,u=la.eigh(hp,check_finite=False)
-    hs=max(float(np.max(abs(eigen))),np.finfo(float).tiny)
-    if eigen[0]<-rounding*hs:
-        raise ValueError('GATE shared_equilibrium_metric: resolved negative H; no PSD repair')
-    cut=rounding*hs if held else max(rounding,float(rank_tolerance))*hs
-    keep=eigen>cut
-    null=base@u[:,~keep]
+        if not accurate:hp=base.conj().T@h@base
     def output_loss(v):
-        return float(la.norm(v.conj().T@n@v)) if v.shape[1] else 0.
-    if held and not np.all(keep):
-        raise ValueError('GATE shared_equilibrium_basis: current held H is unresolved; no held rank drop')
-    if null.shape[1] and (la.norm(g@null)>(rank_tolerance+rounding)*max(gn,np.finfo(float).tiny)
-            or output_loss(null)>(rank_tolerance**2+rounding)*max(on,np.finfo(float).tiny)):
-        raise ValueError('GATE shared_equilibrium_null: live H-null/unresolved state')
-    rank=int(np.count_nonzero(keep))
+        loss=float(la.norm(v.conj().T@n@v)) if v.shape[1] else 0.
+        if not np.isfinite(loss):
+            raise ValueError('GATE shared_equilibrium_output: nonfinite original output loss')
+        return loss
+    accurate_receipt={}
+    if accurate:
+        rank=base.shape[1]
+        if rank>int(max_order):
+            raise ValueError('GATE shared_equilibrium_order: selected state space exceeds budget; no truncation to cap')
+        # Exact original selectors avoid a poorly conditioned dense unit
+        # reinterpretation and allow the core to validate ORIGINAL entries.
+        gp=g[np.ix_(columns,columns)];hp=h[np.ix_(columns,columns)]
+        metric_price=equilibrium_metric_workspace_bytes(size,rank)
+        if metric_price>price:
+            raise ValueError('GATE shared_equilibrium_capacity: extended cores exceed metadata-admitted batch envelope')
+        small_z,mu,small_vectors,accurate_receipt=_equilibrium_accurate_metric(gp,hp,
+            full_order=size,max_workspace_bytes=min(price,int(max_workspace_bytes)),rounding=rounding)
+        z=np.zeros((size,rank),complex);z[columns]=small_z
+        vectors=np.zeros_like(z);vectors[columns]=small_vectors
+        spaces=base;null=np.empty((size,0),complex);original_null=null;eigen=None
+    else:
+        eigen,u=la.eigh(hp,check_finite=False)
+        if not np.isfinite(eigen).all() or not np.isfinite(u).all():
+            raise ValueError('GATE shared_equilibrium_metric: nonfinite H eigenpairs')
+        hs=max(float(np.max(abs(eigen))),np.finfo(float).tiny)
+        if eigen[0]<-rounding*hs:
+            raise ValueError('GATE shared_equilibrium_metric: resolved negative H; no PSD repair')
+        cut=rounding*hs if held else max(rounding,float(rank_tolerance))*hs
+        keep=eigen>cut
+        null=base@u[:,~keep]
+        if held and not np.all(keep):
+            raise ValueError('GATE shared_equilibrium_basis: current held H is unresolved; no held rank drop')
+        original_null=_equilibrium_original_null_span(null)
+        g_null=float(la.norm(g@original_null))
+        if not np.isfinite(g_null):
+            raise ValueError('GATE shared_equilibrium_null: nonfinite original G null loss')
+        if null.shape[1] and (g_null>(rank_tolerance+rounding)*max(gn,np.finfo(float).tiny)
+                or output_loss(original_null)>(rank_tolerance**2+rounding)*max(on,np.finfo(float).tiny)):
+            raise ValueError('GATE shared_equilibrium_null: live H-null/unresolved state')
+        rank=int(np.count_nonzero(keep))
     if rank>int(max_order):
         raise ValueError('GATE shared_equilibrium_order: resolved state space exceeds budget; no truncation to cap')
-    z=base@(u[:,keep]/np.sqrt(eigen[keep])[None])
-    spaces=base if held else z
+    if not accurate:
+        z=base@(u[:,keep]/np.sqrt(eigen[keep])[None])
+        spaces=base if held else z
     if not rank:
         return dict(poles_ry=np.empty(0,complex),output_map=z,input_map=z,
             spaces=dict(right=spaces,left=spaces),receipt=dict(order=0,construction='equilibrium-definite-value',
             workspace_bytes=price,host_reduce_seconds=time.perf_counter()-started))
-    metric=z.conj().T@g@z
-    mu,rotation=la.eigh((metric+metric.conj().T)*.5,check_finite=False)
-    vectors=z@rotation
+    if not accurate:
+        metric=z.conj().T@g@z
+        mu,rotation=la.eigh((metric+metric.conj().T)*.5,check_finite=False)
+        vectors=z@rotation
+    if not np.isfinite(mu).all() or not np.isfinite(vectors).all():
+        raise ValueError('GATE shared_equilibrium_eigenvectors: nonfinite eigenpairs or maps')
     bound=rounding*max(float(np.max(abs(mu))),np.finfo(float).tiny)
     finite=abs(mu)>bound
     if np.any(~finite):
-        v=vectors[:,~finite]
-        if output_loss(v)>(rank_tolerance**2+rounding)*max(on*la.norm(v)**2,np.finfo(float).tiny):
+        v=_equilibrium_original_null_span(vectors[:,~finite])
+        if output_loss(v)>(rank_tolerance**2+rounding)*max(on,np.finfo(float).tiny):
             raise ValueError('GATE shared_equilibrium_infinite: live zero/unresolved mu gives constant feedthrough')
-    gp=z.conj().T@g@z;hp=z.conj().T@h@z
-    residual=la.norm(gp@rotation-(hp@rotation)*mu[None])/max(la.norm(gp@rotation),np.finfo(float).tiny)
-    whitening=la.norm(hp-np.eye(rank))
-    if residual>1e-9 or whitening>1e-9:
+    if accurate:
+        residual=accurate_receipt['eigen_residual'];whitening=accurate_receipt['whitening_error']
+    else:
+        gp=z.conj().T@g@z;hp=z.conj().T@h@z
+        residual=la.norm(gp@rotation-(hp@rotation)*mu[None])/max(la.norm(gp@rotation),np.finfo(float).tiny)
+        whitening=la.norm(hp-np.eye(rank))
+    if not np.isfinite([residual,whitening]).all() or residual>1e-9 or whitening>1e-9:
         raise ValueError('GATE shared_equilibrium_eigenvectors: unresolved metric reconstruction')
     mu,vectors=mu[finite],vectors[:,finite]
     poles=1/mu-1j*gamma
     t=vectors/np.sqrt(abs(mu))[None]
+    if not np.isfinite(poles).all() or not np.isfinite(t).all():
+        raise ValueError('GATE shared_equilibrium_eigenvectors: nonfinite poles or normalized maps')
     order=np.argsort(poles.real,kind='stable')
-    return dict(poles_ry=poles[order],output_map=t[:,order],input_map=(t*np.sign(mu)[None])[:,order],
-        spaces=dict(right=spaces,left=spaces),receipt=dict(order=len(poles),held_state_rank=rank,
+    receipt=dict(order=len(poles),held_state_rank=rank,
         construction='equilibrium-definite-value',spectral_variable='z+i_gamma',gamma_ry=gamma,
-        rank_tolerance=float(rank_tolerance),H_min_eigenvalue=float(eigen[0]),H_null_output_squared=output_loss(null),
+        rank_tolerance=float(rank_tolerance),H_min_eigenvalue=None if accurate else float(eigen[0]),
+        H_null_output_squared=output_loss(original_null),null_output_basis='original-coordinate-orthonormal',
         H_null_roundoff_allowance=rounding*on,zero_mu_output_checked=True,
         numerical_spaces='same-state-H-congruence',state_selection=selection,
         eigen_residual=float(residual),whitening_error=float(whitening),
-        workspace_bytes=price,host_reduce_seconds=time.perf_counter()-started))
+        workspace_bytes=price,host_reduce_seconds=time.perf_counter()-started)
+    if accurate:
+        import hashlib
+        receipt.update(accurate_receipt,space_representation='original-column-selector-v1',
+            original_selector_columns_sha256=hashlib.sha256(np.asarray(columns,np.int64).tobytes()).hexdigest())
+    return dict(poles_ry=poles[order],output_map=t[:,order],input_map=(t*np.sign(mu)[None])[:,order],
+        spaces=dict(right=spaces,left=spaces),receipt=receipt)
 
 
 def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordered,

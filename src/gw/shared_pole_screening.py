@@ -487,7 +487,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .shared_pole_execution import face_matmul
     from .shared_pole_pencil import tile_join, join_vectors
     from .shared_pole_constructor import (general_pencil_batch_plan, collective_general_pencil_batch,
-                                          general_pencil_workspace_bytes)
+                                          general_pencil_workspace_bytes,
+                                          EQUILIBRIUM_METRIC_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
     from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
     from types import SimpleNamespace
     from file_io.shared_pole_store import write_general_shared_pole_model
@@ -577,10 +578,11 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         modal_reconstruction_tolerance=1e-9, laplace_margin_ry=1e-12,
         capacity="explicit-full-map-and-host-pencil-bound", store="sha256-complete-full-q")
     if definite:
-        general_gates.update(numerical_spaces='same-state-positive-H-congruence',
-            eigensolver='Hermitian-indefinite-G-in-current-positive-H-metric',
+        general_gates.update(numerical_spaces='original-column-selector-P_I-v1',
+            eigensolver='current-positive-H-extended-Cholesky-Hermitian-eigh',
+            metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
             common_state_selection='original-state-joint-RRQR-v1',
-            frequency_equilibration='none; same-state congruence only',
+            frequency_equilibration='positive-diagonal-common-H-congruence',
             equilibrium_definite=equilibrium)
     recipe.update(source_recipe_hash=recipe["recipe_hash"], source_passive_gate_hash=recipe["gate_hash"],
         source_passive_gate_version=recipe["gate_version"], gate_version=general_gates["version"],
@@ -805,6 +807,9 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         infinity_width=int(qi.shape[-1]),tile_extent=panel_side,
         left_units_sha256=hashlib.sha256(coordinate_units[0].tobytes()).hexdigest(),
         right_units_sha256=hashlib.sha256(coordinate_units[1].tobytes()).hexdigest())
+    if definite:
+        frequency_coordinates.update(metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
+            held_space_representation='original-column-selector-P_I-v1')
     recipe['frequency_coordinates']=frequency_coordinates
     recipe['recipe_hash']=hashlib.sha256(_json({k:v for k,v in recipe.items() if k!='recipe_hash'}).encode()).hexdigest()
     positive_cap = recipe.get("pole_budget")
@@ -819,7 +824,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                          f"needs {host_price}>{workspace} bytes before any host gather")
     end("pencil", (E, A, B, C, output_gram))
     begin("hostreduce")
-    spaces = fit_basis.setdefault("equilibrium_spaces" if definite else "spaces", {})
+    spaces = fit_basis.setdefault("equilibrium_column_spaces_v1" if definite else "spaces", {})
     banks, receipts = {}, []
     stop_after=snapshot.get('stop_after_model_q')
     if stop_after is not None and int(stop_after)!=0:
@@ -829,7 +834,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     frequency_saved_bytes=0
     position=0
     while position<len(parents):
-        retained=sum(a.nbytes for key in ('spaces', 'equilibrium_spaces')
+        retained=sum(a.nbytes for key in ('spaces', 'equilibrium_spaces', 'equilibrium_column_spaces_v1')
             for space in fit_basis.get(key, {}).values() for a in space.values())
         plan=general_pencil_batch_plan([(nl,nr)]*min(jax.process_count(),len(parents)-position),
             max_order=cap,max_workspace_bytes=workspace,retained_host_bytes=retained+capture_workspace,
@@ -860,7 +865,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                 source_recipe_hash=recipe['source_recipe_hash'],recipe_hash=recipe['recipe_hash'],
                 source_support_reads_ev=recipe['support_reads_ev'],
                 frequency_coordinates=frequency_coordinates,
-                state_selection='principal-rrqr-v1',rank_tolerance=float(recipe['bank_rule_tolerance']),
+                state_selection='principal-rrqr-v1',metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
+                rank_tolerance=float(recipe['bank_rule_tolerance']),
                 frequency_scale_ry=moment_scale,capacity=plan,
                 storage_array_bytes=capture_bytes,storage_bound_bytes=storage_bound,
                 capture_workspace_bytes=capture_workspace,full_microscopic_host_payload=False,
@@ -887,6 +893,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                 fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained,
                 structure=dict(kind='equilibrium_definite', gamma_ry=gamma,
                     state_selection='principal-rrqr-v1',state_units=common_state_units,
+                    metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
                     frequency_scale_ry=moment_scale) if definite else None,
                 output_grams=grams)
         except ValueError as error:
@@ -904,6 +911,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                     source_recipe_hash=recipe['source_recipe_hash'],recipe_hash=recipe['recipe_hash'],
                     source_support_reads_ev=recipe['support_reads_ev'],
                     frequency_coordinates=frequency_coordinates,state_selection='principal-rrqr-v1',
+                    metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
                     rank_tolerance=float(recipe['bank_rule_tolerance']),frequency_scale_ry=moment_scale,
                     energy_sha256=hashlib.sha256(memoryview(energy)).hexdigest(),
                     density_sha256=hashlib.sha256(memoryview(rho)).hexdigest(),
@@ -1165,7 +1173,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     receipt["reduced_host_pencil_shape"] = [nl, nr]
     receipt["reduced_host_workspace_bytes_per_rank"] = host_price
     receipt["held_reduced_host_basis_bytes_per_rank"] = sum(
-        a.nbytes for key in ('spaces', 'equilibrium_spaces')
+        a.nbytes for key in ('spaces', 'equilibrium_spaces', 'equilibrium_column_spaces_v1')
         for space in fit_basis.get(key, {}).values() for a in space.values())
     retained = sum(a.size*a.dtype.itemsize for key in ('directions', 'equilibrium_directions')
                    for a in fit_basis.get(key, {}).values())

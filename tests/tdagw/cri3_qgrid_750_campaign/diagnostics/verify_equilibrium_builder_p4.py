@@ -16,7 +16,7 @@ def equilibrium_stage(c):
     from gw.shared_pole_pencil import join_vectors
     from gw.shared_pole_screening import (_general_frequency_programs,
         _equilibrium_frequency_programs, _equilibrium_definite_eligibility)
-    from gw.shared_pole_constructor import collective_general_pencil
+    from gw.shared_pole_constructor import collective_general_pencil, EQUILIBRIUM_METRIC_SOLVER
     from verify_common_coherent_chi_p4 import bank_config
 
     mesh = c['mesh']; grid = c['coarse']; nq = int(np.prod(grid)); mu = c['mu']
@@ -45,6 +45,7 @@ def equilibrium_stage(c):
     execution = dict(seconds={}, memory=[], compiled=[], purpose='native frequency GEMM programs')
     execute = _bank_execution(meta, mesh, execution, bank_config())
     maximum = 0.; gram_error = 0.; reports = []; previous = None
+    held_columns = {}
     for current in range(2):
         cp = plus*(1+.05*current*np.sin(np.arange(nq))[:, None, None])
         coupling = np.array([np.concatenate((cp[q], cp[minus[q]].conj()), -1) for q in range(nq)])
@@ -80,14 +81,35 @@ def equilibrium_stage(c):
             gram_error = max(gram_error, float(error)); assert error < 2e-12
         np.testing.assert_allclose(nh, oh.conj().swapaxes(-1, -2)@oh, rtol=2e-12, atol=2e-11)
         structure = dict(kind='equilibrium_definite', gamma_ry=gamma,
-            state_selection='principal-rrqr-v1', state_units=units, frequency_scale_ry=2.)
+            state_selection='principal-rrqr-v1', state_units=units, frequency_scale_ry=2.,
+            metric_solver=EQUILIBRIUM_METRIC_SOLVER)
         # q=0 and a genuinely distinct q/-q pair use the REAL all-rank
         # canonical host-owner handoff, not independent per-rank LAPACK.
         values = {}
         for iq in (0, 1, int(minus[1])):
             model = collective_general_pencil(gh[iq], hh[iq], max_order=len(units),
-                rank_tolerance=1e-8, structure=structure, output_gram=nh[iq])
-            assert model['receipt']['state_selection']['selected_order'] == 4
+                rank_tolerance=1e-8, structure=structure, output_gram=nh[iq],
+                fixed_spaces=held_columns.get(iq))
+            receipt = model['receipt']
+            assert receipt['metric_solver'] == EQUILIBRIUM_METRIC_SOLVER
+            assert receipt['space_representation'] == 'original-column-selector-v1'
+            assert receipt['fixed_congruence_count'] == 2
+            assert max(receipt['original_H_extended_whitening_errors']) <= 1e-9
+            columns = model['spaces']
+            np.testing.assert_array_equal(columns['right'], columns['left'])
+            selector = np.asarray(columns['right'])
+            assert selector.shape == (len(units), 4)
+            indices = np.argmax(abs(selector), axis=0)
+            assert len(np.unique(indices)) == 4
+            expected_selector = np.zeros_like(selector)
+            expected_selector[indices, np.arange(4)] = 1
+            np.testing.assert_array_equal(selector, expected_selector)
+            if current == 0:
+                assert receipt['state_selection']['selected_order'] == 4
+                held_columns[iq] = {name: np.asarray(value).copy() for name, value in columns.items()}
+            else:
+                assert receipt['state_selection'] is None
+                np.testing.assert_array_equal(selector, held_columns[iq]['right'])
             np.testing.assert_array_equal(model['poles_ry'].imag, np.full(4, -gamma))
             l, r = oh[iq]@model['output_map'], oh[iq]@model['input_map']
             values[iq] = []
@@ -109,9 +131,10 @@ def equilibrium_stage(c):
         collective_general_pencil(np.diag([1., -1.]), np.diag([1., -.1]), max_order=2,
             rank_tolerance=1e-8, output_gram=np.eye(2), structure=dict(kind='equilibrium_definite',
                 gamma_ry=gamma, state_selection='principal-rrqr-v1', state_units=np.ones(2),
-                frequency_scale_ry=1.))
+                frequency_scale_ry=1., metric_solver=EQUILIBRIUM_METRIC_SOLVER))
     except ValueError as error:
-        if 'resolved negative H' not in str(error):
+        if ('GATE shared_equilibrium_metric:' not in str(error)
+                or 'negative H' not in str(error) or 'no PSD repair' not in str(error)):
             raise
         refusal = str(error)
     else:
@@ -124,6 +147,7 @@ def equilibrium_stage(c):
     return dict(max_full_complex_held_relative_error=maximum, latent_gram_relative_error=gram_error,
         current_inputs=2, nonzero_C1=True, distinct_q_crossing=True, real_zeta_poles=True,
         canonical_structured_handoff=True, original_state_RRQR=True, tiny_host_port_extent=mu,
+        metric_solver=EQUILIBRIUM_METRIC_SOLVER, exact_original_selector_held_across_current_H=True,
         material_microscopic_host_gather=False, resolved_negative_H_refusal=refusal,
         eigenmodels=reports, execution=execution)
 

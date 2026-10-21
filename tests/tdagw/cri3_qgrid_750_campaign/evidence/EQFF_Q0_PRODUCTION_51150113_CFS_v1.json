@@ -1,0 +1,111 @@
+{
+  "status": "CACHED_Q0_PRODUCTION_REDUCER_PASS_NOT_W_ADMISSION",
+  "source_identity": "staged-tree-51150113fbea568fe36b77f230e0c215f02f3f25",
+  "source_root": "/global/common/software/m4598/jackm/lorrax_tdagw_source_51150113_F2q5vF",
+  "constructor_sha256": "2de10748ac074e2a7284304c7298b9ab931d80bf4c8d96529e1597dee1c207f8",
+  "input_sha256": "fee071ecafbb9c13e91a2f8eaf6abd744a073bbbe93b92a044a4b1a6fd2c3ef0",
+  "input_path": "/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/large_band_reference_20261020/cutoff_validation_750_8x8_20261020/material_ownq4_zero44_EQFF_v1/probe_output/coarse_td/collision_models/snapshot_000001_general_shared_pole/q_000_equilibrium_pencil.npz",
+  "q": 0,
+  "original_shape": [
+    2084,
+    2084
+  ],
+  "max_order": 10800,
+  "max_order_provenance": "actual EQFF rank0 log: pole_budget5400; hostbatch parents0,1,2,4,5,6 shape2084 cap10800",
+  "rank_tolerance": 1e-08,
+  "metric_solver": "original-columns-extended-newton-v1",
+  "host_workspace_bound_bytes": 4294967296,
+  "full_original_RRQR": true,
+  "selected_index_monkeypatch": false,
+  "failed_material_owner_unknown": true,
+  "no_microscopic_port_payload": true,
+  "no_full_W_admission": true,
+  "GPU_hours": 0,
+  "local_dense_analysis": false,
+  "reducer_receipt": {
+    "order": 661,
+    "held_state_rank": 661,
+    "construction": "equilibrium-definite-value",
+    "spectral_variable": "z+i_gamma",
+    "gamma_ry": 0.0036749308824745378,
+    "rank_tolerance": 1e-08,
+    "H_min_eigenvalue": null,
+    "H_null_output_squared": 0.0,
+    "null_output_basis": "original-coordinate-orthonormal",
+    "H_null_roundoff_allowance": 212246418215.71127,
+    "zero_mu_output_checked": true,
+    "numerical_spaces": "same-state-H-congruence",
+    "state_selection": {
+      "method": "original-state-joint-RRQR-v1",
+      "original_order": 2084,
+      "selected_order": 661,
+      "selected_columns_sha256": "2cf7990776a0dc6611b029f2ff8faba4db40e758b1f742ad3cd9e502a79d989d",
+      "rank_tolerance": 1e-08,
+      "relative_cutoff": 1.0059230842452962e-08,
+      "smallest_kept_pivot": 2.4594321838152943e-09,
+      "largest_discarded_pivot": 2.293952442486886e-09,
+      "output_gram_roundoff_rank": 155,
+      "discarded_output_gram_norm": 404520102909.41394,
+      "output_gram_roundoff_bound": 122012640049.53893,
+      "frequency_scale_ry": 7.703632638354097,
+      "scope": "numerical state independence; NOT an operator-W sample-error certificate",
+      "required_validation": "all original full-matrix W fit/held and moment checks"
+    },
+    "eigen_residual": 1.331832430955566e-11,
+    "whitening_error": 3.696359907196797e-10,
+    "workspace_bytes": 3057511424,
+    "host_reduce_seconds": 90.26562392900814,
+    "metric_solver": "original-columns-extended-newton-v1",
+    "metric_workspace_bytes": 867776256,
+    "extended_mantissa_bits": 63,
+    "computed_scaled_H_min_lower": 1.515904864236267e-10,
+    "computed_H_SPD_residual_upper": 7.62728598106657e-13,
+    "inverse_BL_residual_upper": 2.40288900998415e-09,
+    "fixed_congruence_count": 2,
+    "Newton_metric_errors_before": [
+      1.0395761021761673e-09,
+      2.0117852756159022e-10
+    ],
+    "original_H_extended_whitening_errors": [
+      3.696359907196797e-10,
+      2.015847010106033e-10,
+      2.987478505086799e-10,
+      2.7684618569695084e-10
+    ],
+    "original_H_binary64_whitening_error": 7.584126582589244e-07,
+    "metric_phase_seconds": {
+      "factor_inverse": 1.4587274350051302,
+      "SPD_witness": 6.448005504003959,
+      "fixed_two_congruences": 19.143996872997377,
+      "metric_eigen_validation": 42.16973865599721
+    },
+    "metric_scope": "computed current H, not physical sample-error or full-W admission",
+    "space_representation": "original-column-selector-v1",
+    "original_selector_columns_sha256": "2cf7990776a0dc6611b029f2ff8faba4db40e758b1f742ad3cd9e502a79d989d"
+  },
+  "pole_diagnostics": {
+    "count": 661,
+    "finite": true,
+    "max_imaginary_ry": -0.0036749308824745378,
+    "min_real_ry": -180.9115830522149,
+    "max_real_ry": 2621.9834000451706,
+    "max_lag_imaginary_defect_ry": 0.0
+  },
+  "map_shapes": {
+    "input_map": [
+      2084,
+      661
+    ],
+    "output_map": [
+      2084,
+      661
+    ]
+  },
+  "scope": "Exact cached q0 frequency-pencil production reduction only; no full-port held W, other-parent, collision, positivity or trajectory admission",
+  "owner_seconds": 90.49433194499579,
+  "seconds": 92.06351993499266,
+  "peak_rss_bytes": 1415774208,
+  "BLAS_threads": 1,
+  "max_wall_seconds": 180.0,
+  "returncode": 0
+}
