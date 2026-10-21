@@ -358,6 +358,59 @@ def reduce_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
                              construction="general-two-sided-tangential-loewner"))
 
 
+def _equilibrium_state_subset(g, h, output_gram, *, units, frequency_scale,
+                              rank_tolerance, rounding):
+    """RRQR independent ORIGINAL states using joint metric/output evidence.
+
+    This chooses a Galerkin basis, not a positive-H spectrum. No input
+    matrix or sample is repaired; the selected current H must still pass
+    the strict reducer and every original full-port sample remains checked.
+    O†O supplies output evidence without a host microscopic-port gather.
+    Its roundoff-resolved square root is ONLY a rank witness.
+    """
+    import hashlib
+    import numpy as np
+    import scipy.linalg as la
+    d=np.asarray(units,float)
+    try:
+        frequency_scale=float(frequency_scale)
+    except (TypeError,ValueError) as error:
+        raise ValueError('GATE shared_equilibrium_selection: explicit frequency scale required') from error
+    if (d.shape!=(g.shape[0],) or not np.isfinite(d).all() or np.any(d<=0)
+            or not np.isfinite(frequency_scale) or frequency_scale<=0):
+        raise ValueError('GATE shared_equilibrium_selection: positive common state units/energy scale required')
+    gs=d[:,None]*g*d[None];hs=d[:,None]*h*d[None]/frequency_scale
+    ns=d[:,None]*output_gram*d[None]
+    eigen,u=la.eigh(ns,check_finite=False)
+    scale=max(float(np.max(abs(eigen))),np.finfo(float).tiny)
+    if eigen[0]<-rounding*scale:
+        raise ValueError('GATE shared_equilibrium_output: scaled output Gram has resolved negative eigenvalue')
+    resolved=eigen>rounding*scale
+    factor=np.sqrt(eigen[resolved])[:,None]*u[:,resolved].conj().T
+    blocks=[a/max(la.norm(a),np.finfo(float).tiny) for a in (gs,hs,factor)]
+    evidence=np.concatenate(blocks,axis=0)
+    _,r,pivot=la.qr(evidence,mode='economic',pivoting=True,check_finite=False)
+    diagonal=abs(r.diagonal())
+    cutoff=(rank_tolerance+rounding)*float(np.max(diagonal,initial=0.))
+    below=np.flatnonzero(diagonal<=cutoff)
+    rank=int(below[0]) if len(below) else len(diagonal)
+    selected=np.asarray(pivot[:rank],np.int64)
+    if not rank:
+        raise ValueError('GATE shared_equilibrium_selection: no resolved common state')
+    receipt=dict(method='original-state-joint-RRQR-v1',original_order=g.shape[0],selected_order=rank,
+        selected_columns_sha256=hashlib.sha256(selected.tobytes()).hexdigest(),
+        rank_tolerance=float(rank_tolerance),relative_cutoff=float(rank_tolerance+rounding),
+        smallest_kept_pivot=float(diagonal[rank-1]),
+        largest_discarded_pivot=float(np.max(diagonal[rank:],initial=0.)),
+        output_gram_roundoff_rank=int(np.count_nonzero(resolved)),
+        discarded_output_gram_norm=float(la.norm(eigen[~resolved])),
+        output_gram_roundoff_bound=float(rounding*scale),
+        frequency_scale_ry=float(frequency_scale),
+        scope='numerical state independence; NOT an operator-W sample-error certificate',
+        required_validation='all original full-matrix W fit/held and moment checks')
+    return selected,receipt
+
+
 def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
                                rank_tolerance, max_workspace_bytes, fixed_spaces):
     """Opt-in same-state ``O[(z+i gamma)G-H]^-1 O.H`` host reduction.
@@ -397,6 +450,7 @@ def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
     if nev[0]<-rounding*max(on,np.finfo(float).tiny):
         raise ValueError('GATE shared_equilibrium_output: output Gram has resolved negative eigenvalue')
     held=fixed_spaces is not None
+    selection=None
     if held:
         base=np.asarray(fixed_spaces['right'],complex)
         if (base.ndim!=2 or base.shape[0]!=size or not 0<base.shape[1]<=int(max_order)
@@ -404,7 +458,15 @@ def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
             raise ValueError('GATE shared_equilibrium_basis: held left/right spaces must be the SAME congruence')
         hp=base.conj().T@h@base
     else:
-        base=np.eye(size,dtype=complex);hp=h
+        base=np.eye(size,dtype=complex)
+        if structure.get('state_selection') is not None:
+            if structure['state_selection']!='principal-rrqr-v1':
+                raise ValueError('GATE shared_equilibrium_selection: unknown original-state selection policy')
+            columns,selection=_equilibrium_state_subset(g,h,n,units=structure.get('state_units'),
+                frequency_scale=structure.get('frequency_scale_ry'),
+                rank_tolerance=float(rank_tolerance),rounding=rounding)
+            base=base[:,columns]
+        hp=base.conj().T@h@base
     eigen,u=la.eigh(hp,check_finite=False)
     hs=max(float(np.max(abs(eigen))),np.finfo(float).tiny)
     if eigen[0]<-rounding*hs:
@@ -451,7 +513,8 @@ def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
         construction='equilibrium-definite-value',spectral_variable='z+i_gamma',gamma_ry=gamma,
         rank_tolerance=float(rank_tolerance),H_min_eigenvalue=float(eigen[0]),H_null_output_squared=output_loss(null),
         H_null_roundoff_allowance=rounding*on,zero_mu_output_checked=True,
-        numerical_spaces='same-state-H-congruence',eigen_residual=float(residual),whitening_error=float(whitening),
+        numerical_spaces='same-state-H-congruence',state_selection=selection,
+        eigen_residual=float(residual),whitening_error=float(whitening),
         workspace_bytes=price,host_reduce_seconds=time.perf_counter()-started))
 
 

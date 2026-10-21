@@ -101,14 +101,9 @@ def test_exact_member_eligibility_ignores_padding_not_current_physics(mode, expe
     assert receipt['eligible'] is expected
 
 
-@pytest.mark.parametrize('sample_error', [1e-10, 1e-9, 1e-8])
-def test_redundant_passive_sample_noise_is_not_a_psd_repair_license(equilibrium_programs, sample_error):
-    from gw.shared_pole_constructor import reduce_general_pencil
-    factory, _, equilibrium = equilibrium_programs
-    pencil, infinity, adjoint, _ = factory('mesh', (None, 'x', 'y'), ('native',))
-    common, output_gram = equilibrium('mesh', (None, 'x', 'y'), ('native',))
-    a = data(); rng = np.random.default_rng(9931)
-    q, sites, gamma = a['directions'], a['sites'], a['gamma']
+def perturbed_output(a, sample_error):
+    rng = np.random.default_rng(9931)
+    q, sites = a['directions'], a['sites']
     errors = np.zeros((2, len(sites), 4, 4), complex)
     # Perturb the sampled W MATRICES, not G/H, and preserve the same actual
     # q/-q + negative-frequency covariance used by the builder's mirrors.
@@ -123,7 +118,17 @@ def test_redundant_passive_sample_noise_is_not_a_psd_repair_license(equilibrium_
         for i in range(2):
             errors[i, sites == z] = dw[i]
             errors[i, sites == -z.conjugate()] = dw[1-i].conj()
-    output = a['output']+np.einsum('qimn,qni->qmi', errors, q)
+    return a['output']+np.einsum('qimn,qni->qmi', errors, q)
+
+
+@pytest.mark.parametrize('sample_error', [1e-10, 1e-9, 1e-8])
+def test_redundant_passive_sample_noise_is_not_a_psd_repair_license(equilibrium_programs, sample_error):
+    from gw.shared_pole_constructor import reduce_general_pencil
+    factory, _, equilibrium = equilibrium_programs
+    _, infinity, adjoint, _ = factory('mesh', (None, 'x', 'y'), ('native',))
+    common, output_gram = equilibrium('mesh', (None, 'x', 'y'), ('native',))
+    a = data(); q, sites, gamma = a['directions'], a['sites'], a['gamma']
+    output = perturbed_output(a, sample_error)
     zeta = sites+1j*gamma
     g, h, b, c = common(zeta, q, output)
     g, h, b, c = infinity(zeta.conj(), zeta, g, h, b, c, q, adjoint(output), q, output,
@@ -139,6 +144,52 @@ def test_redundant_passive_sample_noise_is_not_a_psd_repair_license(equilibrium_
         record.append(dict(q=iq, H_min=minimum, refusal=str(refused.value)))
     print(dict(relative_sample_perturbation=sample_error, finite_columns=len(sites),
                infinity_columns=a['qi'].shape[-1], results=record))
+
+
+@pytest.mark.parametrize('sample_error', [1e-10, 1e-9, 1e-8])
+def test_joint_original_state_selection_can_remove_only_identifiable_dependencies(equilibrium_programs, sample_error):
+    from gw.shared_pole_constructor import reduce_general_pencil, _equilibrium_state_subset
+    factory, _, equilibrium = equilibrium_programs
+    _, infinity, adjoint, _ = factory('mesh', (None, 'x', 'y'), ('native',))
+    common, output_gram = equilibrium('mesh', (None, 'x', 'y'), ('native',))
+    a = data(); q, gamma = a['directions'], a['gamma']; zeta = a['sites']+1j*gamma
+    output = perturbed_output(a, sample_error)
+    g, h, b, c = common(zeta, q, output)
+    g, h, b, c = infinity(zeta.conj(), zeta, g, h, b, c, q, adjoint(output), q, output,
+        a['qi'], a['c1'], a['c2'])
+    grams = output_gram(c)
+    scale = 2.; units = np.r_[np.ones(len(zeta)), 1/scale]
+    structure = dict(kind='equilibrium_definite', gamma_ry=gamma,
+        state_selection='principal-rrqr-v1', state_units=units, frequency_scale_ry=scale)
+    maximum = 0.; ranks = []
+    for iq in range(2):
+        selected, receipt = _equilibrium_state_subset(g[iq], h[iq], grams[iq], units=units,
+            frequency_scale=scale, rank_tolerance=1e-8, rounding=128*len(units)*np.finfo(float).eps)
+        assert len(selected) == 4 and len(np.unique(selected)) == 4
+        principal = h[iq][np.ix_(selected, selected)]
+        assert np.linalg.eigvalsh((principal+principal.conj().T)*.5)[0] > 0
+        model = reduce_general_pencil(g[iq], h[iq], max_order=len(units), rank_tolerance=1e-8,
+            structure=structure, output_gram=grams[iq])
+        unused = np.setdiff1d(np.arange(len(units)), selected)
+        assert not model['output_map'][unused].any() and not model['input_map'][unused].any()
+        l, r = c[iq]@model['output_map'], c[iq]@model['input_map']
+        for z in np.r_[a['sites'], [-.43+.2j, .31+.04j, 1.5+.08j]]:
+            exact = a['exact'](iq, z)
+            error = np.linalg.norm((l/(z-model['poles_ry']))@r.conj().T-exact)/np.linalg.norm(exact)
+            maximum = max(maximum, error)
+        ranks.append(receipt['selected_order'])
+    assert maximum < 1000*sample_error
+    print(dict(selected_relative_sample_perturbation=sample_error, selected_orders=ranks,
+               full_complex_training_and_held_relative_error=maximum))
+
+
+def test_joint_selection_never_hides_a_resolved_fullrank_negative_metric():
+    from gw.shared_pole_constructor import reduce_general_pencil
+    with pytest.raises(ValueError, match='resolved negative H'):
+        reduce_general_pencil(np.diag([1., -1.]), np.diag([1., -.1]), max_order=2,
+            rank_tolerance=1e-8, output_gram=np.eye(2), structure=dict(kind='equilibrium_definite',
+                gamma_ry=.03, state_selection='principal-rrqr-v1', state_units=np.ones(2),
+                frequency_scale_ry=1.))
 
 
 def test_exact_eligibility_transitions_keep_distinct_held_space_namespaces():

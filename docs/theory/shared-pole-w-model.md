@@ -628,9 +628,22 @@ refusals and the actual cached assembly. The noisy redundant-state stress
 test is deliberately a **refusal**: relative sample perturbations of
 $10^{-10}$–$10^{-8}$ can resolve negative eigenvalues in the exact H-null
 space. A scalar χ certificate alone does not bound that full-W error.
-Independent state selection or a propagated sample-error certificate is
-still needed before claiming robust material admission. No PSD floor or
-pole projection is used.
+The builder therefore selects independent **original** state columns by
+rank-revealing QR of jointly normalized, unit-scaled G/H/output evidence.
+The output Gram is resolved at roundoff before taking its square root;
+that factor supplies only an observability/rank witness. Selection is
+independent of the pole budget and H's eigenvalue signs. The original
+selected principal H must still pass the strict definite-metric check,
+and every original full-W target and moment remains checked. In the noisy
+four-state test this retains four of eleven original columns and reconstructs
+all training/held W values to $3.11\times10^{-7}$ at $10^{-8}$ relative
+sample perturbation. This is not an operator-W error certificate or material
+qualification. No PSD floor or pole projection is used.
+
+Before reduction, a separately bounded q0 frequency-only capture preserves
+G, H, the output Gram and current selector/provenance metadata. It survives
+a metric refusal without gathering microscopic port faces, allowing the
+numerical issue to be studied without rebuilding the full response.
 
 The builder authenticates an exact binary diagonal projector with a strict
 global occupied/empty gap and the existing positive-Coulomb check. A smaller

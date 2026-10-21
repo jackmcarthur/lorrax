@@ -419,6 +419,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     if definite:
         general_gates.update(numerical_spaces='same-state-positive-H-congruence',
             eigensolver='Hermitian-indefinite-G-in-current-positive-H-metric',
+            common_state_selection='original-state-joint-RRQR-v1',
             frequency_equilibration='none; same-state congruence only',
             equilibrium_definite=equilibrium)
     recipe.update(source_recipe_hash=recipe["recipe_hash"], source_passive_gate_hash=recipe["gate_hash"],
@@ -723,6 +724,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # rank selection, respecting the actual tiled join order on each axis.
     coordinate_units=(join_vectors((np.ones(mu.shape[0]),np.full(qi.shape[-1],1/moment_scale)),panel_side),
                       join_vectors((np.ones(lam.shape[0]),np.full(qi.shape[-1],1/moment_scale)),panel_side))
+    common_state_units = coordinate_units[0]
     if definite:
         # Independent row/column equilibration destroys a same-state Gram.
         # The H-congruence owner handles its current metric without it.
@@ -751,12 +753,13 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     if stop_after is not None and int(stop_after)!=0:
         raise ValueError('GATE shared_general_diagnostic: only stop_after_model_q=0 is supported')
     parents=[0] if stop_after is not None else [iq for iq in range(nq) if iq <= int(minus[iq])]
+    capture_workspace = 16*1024**2 if definite else 0
     position=0
     while position<len(parents):
         retained=sum(a.nbytes for key in ('spaces', 'equilibrium_spaces')
             for space in fit_basis.get(key, {}).values() for a in space.values())
         plan=general_pencil_batch_plan([(nl,nr)]*min(jax.process_count(),len(parents)-position),
-            max_order=cap,max_workspace_bytes=workspace,retained_host_bytes=retained,
+            max_order=cap,max_workspace_bytes=workspace,retained_host_bytes=retained+capture_workspace,
             input_matrix_count=3 if definite else 2)
         ids=parents[position:position+plan['batch_size']]
         batch_start=time.monotonic()
@@ -769,11 +772,45 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         # rank-conditional lambda or mix independent host modal gauges.
         pencils=[(np.asarray(gather_to_host(E[iq])),np.asarray(gather_to_host(A[iq]))) for iq in ids]
         grams = [np.asarray(gather_to_host(output_gram[iq])) for iq in ids] if definite else None
+        if definite and 0 in ids:
+            # These frequency-only arrays ALREADY reside on every host.
+            # Commit them before a strict metric refusal can discard the
+            # expensive microscopic samples. No port face is host-read.
+            j=ids.index(0)
+            capture_bytes=sum(a.nbytes for a in (*pencils[j],grams[j]))
+            storage_bound=int(snapshot.get('frequency_diagnostic_storage_bytes',workspace))
+            if capture_bytes+65536>storage_bound:
+                raise ValueError('GATE shared_equilibrium_capture: frequency-only storage bound exceeded')
+            capture_path=Path(run_dir)/f'{label}_general_shared_pole'/'q_000_equilibrium_pencil.npz'
+            capture_metadata=dict(q=0,admitted=False,sigma_computed=False,
+                representation=representation,equilibrium=equilibrium,gamma_ry=gamma,eta_ry=eta,
+                source_recipe_hash=recipe['source_recipe_hash'],recipe_hash=recipe['recipe_hash'],
+                source_support_reads_ev=recipe['support_reads_ev'],
+                frequency_coordinates=frequency_coordinates,
+                state_selection='principal-rrqr-v1',rank_tolerance=float(recipe['bank_rule_tolerance']),
+                frequency_scale_ry=moment_scale,capacity=plan,
+                storage_array_bytes=capture_bytes,storage_bound_bytes=storage_bound,
+                capture_workspace_bytes=capture_workspace,full_microscopic_host_payload=False,
+                energy_sha256=hashlib.sha256(energy.tobytes()).hexdigest(),
+                density_sha256=hashlib.sha256(rho.tobytes()).hexdigest(),
+                scope='pre-reduction frequency-only diagnostic, NOT an admitted W or trajectory')
+            def save_frequency_capture():
+                capture_path.parent.mkdir(parents=True,exist_ok=True)
+                if capture_path.exists():
+                    raise FileExistsError(capture_path)
+                np.savez(capture_path,G=pencils[j][0],H=pencils[j][1],output_gram=grams[j],
+                    state_units=common_state_units,sites_ry=sites,
+                    fit_positions=np.asarray(fit_positions,np.int64),
+                    held_positions=np.asarray(held_positions,np.int64),
+                    metadata_json=np.asarray(_json(capture_metadata)))
+            rank0_transaction(capture_path,stage='shared_equilibrium.frequency_capture',write=save_frequency_capture)
         models=collective_general_pencil_batch(pencils,max_order=cap,max_workspace_bytes=workspace,
             rank_tolerance=float(recipe['bank_rule_tolerance']),
             frequency_scale_ry=moment_scale,coordinate_units=None if definite else coordinate_units,
             fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained,
-            structure=dict(kind='equilibrium_definite', gamma_ry=gamma) if definite else None,
+            structure=dict(kind='equilibrium_definite', gamma_ry=gamma,
+                state_selection='principal-rrqr-v1',state_units=common_state_units,
+                frequency_scale_ry=moment_scale) if definite else None,
             output_grams=grams)
         for batch_index,(iq,model) in enumerate(zip(ids,models)):
             spaces.setdefault(iq, model["spaces"])
