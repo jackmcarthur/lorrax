@@ -1407,6 +1407,54 @@ held Gamma eigenbasis the matrix-element decay coefficient is
 $(\gamma_i+\gamma_j)/2$; fresh nonlinear relaxation also varies $D$ and
 $\Gamma$. None of these identities supplies a general positivity theorem.
 
+###### Column sampling is not a positive-Gram construction
+
+Removing arithmetic shell averaging preserves the declared one-sided
+ordering; it does not make its gain matrix positive. This follows already
+for one passive channel and a diagonal internal density. Take a
+negative-frequency pole $p=-\Omega-i\kappa$, $\Omega>0$, $\kappa\ge0$,
+whose contracted residue is $-xx^\dagger$, and one occupied internal line
+of occupation $f\ge0$ and energy $e_n$. The reference hole weight reverses
+that residue's sign. With $\Delta_b=E_b-e_n+\Omega$ and
+$h=\eta+\kappa>0$, the actual retarded hole column and injection amplitude
+are
+
+$$
+(R_h)_{ab}=\frac{f x_a x_b^*}{\Delta_b+ih},\qquad
+(A_{\rm in})_{ab}=i(R_h)_{ab}=x_a x_b^*F_b,\qquad
+F_b=\frac{f(h+i\Delta_b)}{\Delta_b^2+h^2}.
+$$
+
+Thus $\operatorname{Re}F_b\ge0$, but
+$D_{ab}=x_a x_b^*(F_b+F_a^*)$ has the exact two-state minor
+
+$$
+\det D_{\{a,b\}}
+=|x_a x_b|^2\left[4\operatorname{Re}F_a\operatorname{Re}F_b
+                  -|F_b+F_a^*|^2\right]
+=-|x_a x_b|^2|F_a-F_b|^2.
+$$
+
+Different sampled columns therefore generally give an indefinite
+single-channel matrix despite positive diagonal rates. The analogous
+passive particle channel gives the same result for its contribution to
+$\Gamma-D$. Principal-value parts contribute
+$(\operatorname{Im}F_a-\operatorname{Im}F_b)^2$ to the negative minor;
+they can distinguish columns even when their dissipative diagonal rates
+are equal. Removing those parts would not ensure positivity either,
+because unequal real parts suffice. Away from resonance, unequal
+principal-value limits can persist as $h\to0$.
+
+This local algebra is not a verdict on a material snapshot: the full
+operator sums all channels, internal states and reciprocal q pairs, which
+can compensate negative directions. Nor does global indefiniteness alone
+establish outward motion at the current density. If both states lie in
+$\ker\rho$, this minor belongs to the actual empty-space compression;
+if only one is empty, its one-dimensional compression can remain positive.
+Both summed boundary compressions must be measured at the actual state.
+The derivation neither deletes principal values nor introduces a secular
+projection, equilibrium subtraction or other change of the reference model.
+
 ##### Lossless transition-bath prescription {#lossless-transition-bath}
 
 `collision_statistics = "lossless_bath"` declares a stationary, lossless
