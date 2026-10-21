@@ -19,7 +19,9 @@ def device_stage(c):
     from jax.sharding import PartitionSpec as P
     from common.collectives import gather_to_host
     from gw.ppm_sigma import fresh_shared_pole_capacity
-    from gw.shared_pole_constructor import reduce_equilibrium_pencil_device
+    import distrib_la
+    from gw.shared_pole_constructor import (reduce_equilibrium_pencil_device,
+                                            reduce_general_pencil_device)
     from gw.shared_pole_execution import face_matmul
 
     mesh, put = c['mesh'], c['put']
@@ -67,6 +69,45 @@ def device_stage(c):
     result = dict(tiny_current_inputs=2, max_tiny_complex_transfer_error=maximum,
         exact_held_space=True, native_receipts=reports,
         material_W_accuracy_certified=False, material_Sigma_accuracy_certified=False)
+    # A genuinely nonnormal three-state problem, with one declared null
+    # coordinate so the native P4 modal route must also handle carrier padding.
+    poles = np.asarray([-.8-.03j, .3+.17j, 1.4-.04j])
+    v = np.asarray([[1., .8j, .3], [.2, 1., .4j], [.1j, .3, 1.]])
+    e = np.diag([.5, 2., 1.3]).astype(complex)
+    a = e @ ((v*poles) @ np.linalg.inv(v))
+    b = np.asarray([[1., .2j], [.3j, 1.], [.4, -.3j]])
+    out = np.asarray([[.2j, 1., .3], [1., .4j, -.2]])
+    bd = put(np.pad(b, ((0, 1), (0, 0)))[None], P(None, 'x', 'y'))
+    cd = put(np.pad(out, ((0, 0), (0, 1)))[None], P(None, 'x', 'y'))
+    general_reports, general_maximum, held = [], 0., None
+    for current in range(2):
+        ec, ac = e+.07*current*np.eye(3), a+.11*current*e
+        ed, ad = [put(np.pad(value, ((0, 1), (0, 1)))[None], P(None, 'x', 'y'))
+                  for value in (ec, ac)]
+        model = reduce_general_pencil_device(ed, ad, mesh_xy=mesh, max_order=4,
+            rank_tolerance=1e-8, fixed_spaces=held, capacity=capacity)
+        p = model['poles_ry']
+        left = host(mm(cd, model['output_map']))[0, :, :len(p)]
+        right = host(mm(model['input_map'], bd, transa='C'))[0, :len(p)]
+        for z in (.23+.31j, -.41+.46j, 1.8+.29j):
+            exact = out @ np.linalg.solve(z*ec-ac, b)
+            value = (left/(z-p)) @ right
+            error = np.linalg.norm(value-exact)/np.linalg.norm(exact)
+            general_maximum = max(general_maximum, float(error))
+            assert error < 3e-9
+        if current == 0:
+            assert np.max(p.imag) > .16  # Preserve genuine gain; no pole clipping.
+        else:
+            assert model['spaces']['right'] is held['right']
+            assert model['spaces']['left'] is held['left']
+        held = model['spaces']
+        general_reports.append(model['receipt'])
+    backend = distrib_la.resolve_eig_local_backend()
+    assert backend == 'cusolver'
+    result['native_general'] = dict(max_tiny_complex_transfer_error=general_maximum,
+        genuine_gain_preserved=True, current_held_spaces=True, backend=backend,
+        provider_workspace=distrib_la.eig_local_workspace(4, backend=backend),
+        receipts=general_reports)
     if _PENCIL is not None:
         # This is an explicit replay of an already saved frequency-only
         # forensic cache, not a gather in the production screening path.
@@ -83,8 +124,13 @@ def device_stage(c):
             metadata = json.loads(str(data['metadata_json']))
             cached_tolerance = float(metadata['rank_tolerance'])
             cached_gamma = float(metadata['gamma_ry'])
-            arrays = [put(np.asarray(data[key])[None], P(None, 'x', 'y'))
-                      for key in ('G', 'H', 'output_gram')]
+            host_arrays = [np.asarray(data[key])[None] for key in ('G', 'H', 'output_gram')]
+        row = capacity.reserve('cached_frequency_inputs',
+            resident_bytes_per_rank=sum(value.nbytes for value in host_arrays)//mesh.size,
+            workspace_bytes_per_rank=0)
+        capacity.live_stages = (row['stage'],)
+        arrays = [put(value, P(None, 'x', 'y')) for value in host_arrays]
+        del host_arrays
         for value in arrays:
             value.block_until_ready()
         cached = []
