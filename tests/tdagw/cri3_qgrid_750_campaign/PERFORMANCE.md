@@ -547,6 +547,9 @@ uses `...norm_scale`. Their separate `body_flux_ry` field is a headless
 gain/loss trace scale, also not physical empty-gain/filled-loss flux.
 The1e-8 result is below the original1e-7 relative number criterion, but
 this diagnostic does not execute or admit all original collision guards.
+An independent boundary-flux audit gives empty gain `0.0125563285894 Ry`
+and filled loss `0.0125563285990 Ry`: residual/mean physical flux is
+`7.68030e-10`. This is distinct from both normalization fields above.
 
 The1e-4 replay reproduces saved Tr C within `2.55e-10 Ry` and the boundary
 within `8.42e-12 Ry`. Tightening1e-6→1e-8 changes C by at most

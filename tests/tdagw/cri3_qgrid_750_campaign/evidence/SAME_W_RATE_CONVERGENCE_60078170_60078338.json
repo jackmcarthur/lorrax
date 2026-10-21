@@ -68,6 +68,13 @@
     "MH_body_max_per_k_frobenius": 0.001918856,
     "scope": "Body-only active intermediate column operators, not full750-virtual Sigma/MH or W convergence."
   },
+  "tight_physical_boundary_flux_audit": {
+    "empty_gain_ry": 0.012556328589390426,
+    "filled_loss_ry": 0.01255632859903406,
+    "trace_from_boundary_blocks_ry": -9.643634849010319e-12,
+    "residual_over_mean_physical_flux": 7.680298246937793e-10,
+    "scope": "Mean64 traces of Q D Q and P(Gamma-D)P at exact saved binary projector. Tiny difference from receipt trace is floating-point summation ordering."
+  },
   "conclusions": {
     "same_W_trace_converges": true,
     "fixed_norm_ratio_below_original_number_criterion_at_1e8": true,

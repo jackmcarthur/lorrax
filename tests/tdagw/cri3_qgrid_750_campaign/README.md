@@ -357,3 +357,12 @@ Actual jobs60078170/60078338 reduced the fresh trace residual to
 occupied-boundary eigenvalue. The tight rate body cost30.64s. This is
 number-quadrature convergence, not a positivity fix or damping trajectory;
 see [timings and scope](PERFORMANCE.md#same-w-active-rate-convergence-number-recovered-pauli-boundary-not-recovered).
+
+Optional `--spectral-bands 0 1 ... 43 --spectral-k 0 --quadrature-eps 1e-8`
+selects a **grid-only** diagnostic instead. Each frequency is the selected
+band's saved instantaneous energy minus the common numerical origin; the
+electronic energies/density and W are unchanged. One native sweep retains
+full44×44 both-retarded branch matrices at those common energies, then saves
+only the selected k, raw widths `i(R-R†)` and their unclipped eigenvalues.
+This supplies data missing from row/column on-shell tables. There are no
+matrix roots, new collision closure, extra on-shell sweep or PSD assertion.
