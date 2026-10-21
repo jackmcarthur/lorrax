@@ -302,6 +302,26 @@ All16 raw logs, small receipts and the frequency-only q0 capture are local
 under `material_ownq4_zero44_FAST17_60065876/` at the campaign artifact root.
 See [the source-pinned phase/accounting receipt](evidence/GENERAL_W_FAST17_TIMING_60065876.json).
 
+### Native padded-response and equilibrium-reducer qualification
+
+Source `ff4553b`, P4 step `60066882.0`, subsequently passed the combined
+native software proof. The padded common-chi portion checks 20 paired cases,
+two current E/rho inputs, full+FF/FA/AF/AA and fine+Fejer grids, with maximum
+literal error `2.14445824e-9`; 384-slot node carriers skip their inactive suffix.
+The tiny same-state EQ stage exercises native finite/infinity/output-Gram
+GEMMs, original-state RRQR and the existing canonical reduced-model handoff.
+Its full-complex held relative error was `5.08414861e-14`, latent-Gram error
+`2.79245434e-16`, with nonzero C1 and distinct q-crossing. It also verified
+that resolved negative H refuses without PSD repair. The tiny four-port
+fixture is not a full-microscopic host gather or material admission.
+
+The fixture's measured 21.12155 s excludes runtime startup and teardown.
+The actual Slurm numeric step was 65 s on four GPUs (**.0722222 active GPUh**);
+the allocation was 69 s (**.0766667 reserved GPUh**) and released at terminal.
+These cost views are nonadditive. This is not a sub60s material cycle,
+successful W/ordered-Sigma44 result, TD trajectory, or production hsuite
+verdict. See [the exact proof/accounting summary](evidence/EQUILIBRIUM_NATIVE_P4_60066882.json).
+
 ### Correction: the707 t0 request was not on its instantaneous shells
 
 The preserved707 measurements above remain raw historical evidence, but
