@@ -801,6 +801,19 @@ def settings_rows(args, *, source) -> tuple:
          if getattr(args, "haydock_iter", 0) else ())
 
 
+def _haydock_settings(args) -> dict | None:
+    """The ``--haydock-*`` flags as ``_preview_lanczos``'s ``haydock`` bundle (None: off)."""
+    if args.haydock_iter <= 0:
+        return None
+    return {"n_iter": int(args.haydock_iter), "pols": args.haydock_pols,
+            "eta_ev": float(args.haydock_eta_ev),
+            "omega_min_ev": float(args.haydock_omega_min_ev),
+            "omega_max_ev": float(args.haydock_omega_max_ev),
+            "n_omega": int(args.haydock_n_omega), "n_spin": int(args.haydock_n_spin),
+            "no_eps1": bool(args.haydock_no_eps1),
+            "out_prefix": str(args.haydock_out_prefix)}
+
+
 def main(argv=None) -> int:
     route, args = parse_args(argv)
 
@@ -871,10 +884,9 @@ def main(argv=None) -> int:
                 if args.write_eigs is not None else "not requested"),
         ))
         report.sampling(wfn=wfn, sym=sym)
-        n_stages = 4 if args.haydock_iter > 0 else 3
         stage_progress = LoopProgress(
-            n_stages, report.progress, title="BSE eigensolve",
-            item_name="major stage", max_updates=n_stages)
+            3 + (args.haydock_iter > 0), report.progress, title="BSE eigensolve",
+            item_name="major stage", max_updates=3 + (args.haydock_iter > 0))
         stage_progress.start()
 
         result = _preview_lanczos(
@@ -905,15 +917,7 @@ def main(argv=None) -> int:
             degeneracy_mode=args.band_degeneracy,
             degeneracy_tol_ry=args.degeneracy_tol_ry,
             tda=use_tda,
-            haydock=(None if args.haydock_iter <= 0 else {
-                "n_iter": int(args.haydock_iter), "pols": args.haydock_pols,
-                "eta_ev": float(args.haydock_eta_ev),
-                "omega_min_ev": float(args.haydock_omega_min_ev),
-                "omega_max_ev": float(args.haydock_omega_max_ev),
-                "n_omega": int(args.haydock_n_omega),
-                "n_spin": int(args.haydock_n_spin),
-                "no_eps1": bool(args.haydock_no_eps1),
-                "out_prefix": str(args.haydock_out_prefix)}),
+            haydock=_haydock_settings(args),
             cell_volume=float(wfn.cell_volume),
             report=report,
             stage_progress=stage_progress,
@@ -924,12 +928,9 @@ def main(argv=None) -> int:
             ("GW/BSE restart", "read", result["restart_file"]),
             ("wavefunctions", "read", wfn_path),
         ]
-        if result["eigenvector_file"]:
-            file_rows.append(("exciton eigenvectors", "written",
-                              result["eigenvector_file"]))
-        if result["haydock_file"]:
-            file_rows.append(("Haydock absorption", "written",
-                              result["haydock_file"]))
+        file_rows += [(label, "written", path) for label, path in (
+            ("exciton eigenvectors", result["eigenvector_file"]),
+            ("Haydock absorption", result["haydock_file"])) if path]
         file_rows += [(label, "read", path) for label, path in (
             ("QP corrections", args.eqp), ("QP rotations", args.qp_rotations))
             if path]
