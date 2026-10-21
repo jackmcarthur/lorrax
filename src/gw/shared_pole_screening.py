@@ -1286,9 +1286,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     from .shared_pole_directions import _sample_point
     from .shared_pole_execution import face_matmul
     from .shared_pole_pencil import tile_join, join_vectors
-    from .shared_pole_constructor import (general_pencil_batch_plan, collective_general_pencil_batch,
-                                          general_pencil_workspace_bytes,
-                                          EQUILIBRIUM_DEVICE_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
+    from .shared_pole_constructor import EQUILIBRIUM_DEVICE_SOLVER as _EQUILIBRIUM_METRIC_SOLVER
     from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
     from types import SimpleNamespace
     from file_io.shared_pole_store import write_general_shared_pole_model

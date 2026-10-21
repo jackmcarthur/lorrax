@@ -6,10 +6,11 @@ M1/M3 are physical moments in Ry**3/Ry**5, never bare chi coefficients.
 
 Sample matrices are consumed in bounded batches.  Only narrow direction,
 output and derivative-action panels survive to the pencil assembly.  Dense
-products and eigensolves of the passive constructor use resolved distrib_la
-operations. The explicit general, non-Hermitian route instead gathers only
-its capacity-bounded reduced frequency pencil for canonical host SciPy/LAPACK
-reduction; microscopic port factors remain distributed.
+products and eigensolves use resolved distrib_la operations. Current
+equilibrium and general full-density frequency reductions retain native
+faces; the general eigensolver resolves an explicit device provider. The
+bounded SciPy/extended host routines below are offline numerical oracles,
+not automatic fallbacks from the current snapshot constructor.
 """
 
 from __future__ import annotations
