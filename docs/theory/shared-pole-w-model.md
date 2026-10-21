@@ -535,7 +535,8 @@ model at equal retained span**.
 
 ### 6.4 Equilibrium-definite realization for damped full-density refreshes
 
-**Implemented and host-tested; not material-qualified.** An unstructured
+**Implemented with tiny CPU service-oracle tests; GPU/material qualification
+pending.** An unstructured
 two-sided Loewner truncation can fit finite samples while introducing upper-
 half-plane poles. Accurate interpolation and a small eigenproblem backward
 error do not preserve the positive member in (W 25). The equilibrium branch
@@ -588,10 +589,10 @@ residues in (W 16), including self-negative momenta.
 
 The implementation uses the existing distributed general finite/infinity
 assembly with conjugate left actions in `_equilibrium_frequency_programs`,
-then the explicit `equilibrium_definite` host reducer in
-`shared_pole_constructor`. Only the small frequency matrices and output Gram
-cross that capacity-priced canonical-owner seam; microscopic factors remain
-distributed. It cannot feed the present general E/A directly to
+then `shared_pole_constructor.reduce_equilibrium_pencil_device`. The frequency
+matrices, output Gram and coefficient maps remain native device faces;
+only spectra and scalar diagnostics reach the host. It cannot feed the
+general E/A directly to
 `reduce_ordered_shared_pole_pencil`: that implementation expects the paired
 ±frequency layout and its confluent derivatives. The value-state reducer
 instead uses the same-state H congruence above.
@@ -608,8 +609,10 @@ must be congruences of the same state space; the current independent
 left/right Ruiz factors and E-SVD cut are not that reduction.
 
 Admission must refuse resolved negative $\mathcal H$, not floor it. Exact
-$\mathcal H$-null directions are state dependencies and also null in
-$\mathcal G,O$; numerical removal still needs the existing loss checks.
+$\mathcal H$-null directions of the exact equilibrium realization are state
+dependencies and also null in $\mathcal G,O$. Discarding small positive
+metric directions is a different operation: an approximation whose effect
+must be checked against the original physical response.
 For material data, propagate sample errors as well as roundoff before
 calling negativity resolved: an action perturbation obeys
 $|\delta\mathcal G_{ij}|\le
@@ -627,77 +630,57 @@ full-port moments. In particular, a relative defect of cancellation-small
 $C_1$ must not be mistaken for a consumer-weighted Σ error bound. Full-W
 fit/held, growth and capacity gates are separately enforced.
 
-`tests/test_equilibrium_definite_constructor_cpu.py` and
-`tests/test_equilibrium_definite_builder_cpu.py` cover complex q/−q pairs,
-nonzero $C_1$, finite/infinity identities, current held metrics, null-output
-refusals and the actual cached assembly. The noisy redundant-state stress
-test is deliberately a **refusal**: relative sample perturbations of
-$10^{-10}$–$10^{-8}$ can resolve negative eigenvalues in the exact H-null
-space. A scalar χ certificate alone does not bound that full-W error.
-The builder therefore selects independent **original** state columns by
-rank-revealing QR of jointly normalized, unit-scaled G/H/output evidence.
-The output Gram is resolved at roundoff before taking its square root;
-that factor supplies only an observability/rank witness. Selection is
-independent of the pole budget and H's eigenvalue signs. The original
-selected principal H must still pass the strict definite-metric check,
-and every original full-W target and moment remains checked. In the noisy
-four-state test this retains four of eleven original columns and reconstructs
-all training/held W values to $3.11\times10^{-7}$ at $10^{-8}$ relative
-sample perturbation. This is not an operator-W error certificate or material
-qualification. No PSD floor or pole projection is used.
+The native metric policy is `same-state-device-metric-quotient-v1`. A common
+positive diagonal congruence $H_s=D\mathcal H D$ equilibrates the metric.
+The source rank tolerance caps amplification on its retained positive
+eigenspace; the common spectral-closure owner drops a whole near-degenerate
+block when the boundary straddles it. The pole budget is an admission bound,
+not permission to cut additional states to fit memory. The retained metric
+is corrected with the existing device inverse-root owner before the
+Hermitian Ritz solve. These operations use the existing distributed
+Hermitian eigensolve and GEMM owners, with compiled-program and provider
+workspace admission. They require no extended CPU arithmetic.
 
-The principal-state metric policy is
-`original-columns-extended-newton-v1`. Rank tolerance selects independent
-original columns **once**; it is not applied again to delete small positive
-eigenvalues of the selected H. All selected states remain. A positive common
-diagonal congruence $H_s=D H_{II}D$ conditions that current metric, without
-changing its inertia or the physical state span. Its Cholesky factor and
-triangular inverse are computed in supported extended host arithmetic;
-unsupported precision fails closed. With residual bounds
-$\delta\ge\|H_s-LL^\dagger\|_2$ and
-$r\ge\|BL-I\|_2<1$, the computed-matrix positivity witness is
+Small metric eigenvalues alone do not decide physical importance.
+For $\mathcal H=X^\dagger M X$, nearly dependent columns of $X$ square their
+conditioning in the metric; individual poles and coefficient vectors can
+be poorly identified while $W$ remains accurate. Conversely, a small-metric
+direction may have an order-one contribution after the inverse is applied.
+The quotient therefore makes an explicit approximation and reruns the
+original full-matrix training/held-W checks after reconstruction. It does
+not claim discarded directions are exact nulls. Retained-space backward
+residuals and metric diagnostics check the numerical solve; a stringent
+whitening residual in ill-conditioned original coordinates is not a
+self-energy error criterion.
 
-$$
-\lambda_{\min}(H_s)\ge
-\left(\frac{1-r}{\|B\|_F}\right)^2-\delta>0.
-$$
+Held numerical spaces are common spans in original coordinates. Every call
+projects the **current** $\mathcal H,\mathcal G$ and output into that span
+and recomputes the metric and Ritz problem. The stored held basis remains
+unchanged; an unresolved current held metric refuses without a silent rank
+drop. Zero/unresolved $\mu$ is checked using its H-normalized output weight
+relative to the retained output weight, so a change of state units cannot
+hide a live constant contribution. Resolved negative metrics and live
+unresolved constant outputs refuse; no PSD floor or pole clipping is used.
 
-This is a floating-operation certificate for the recorded numerical H,
-not a propagated physical χ/W error bound. No negative pivot, unresolved
-metric or failed certificate is replaced by a floor. The original-coordinate
-map is recovered before validation. Exactly two current-H near-identity
-congruence corrections use $S=Z^\dagger HZ$ and
-$R=\tfrac32I-\tfrac12S$, guarded by a finite Hermitian
-$\|S-I\|_F<\tfrac12$. For $S=I+E$,
-$R^\dagger SR=I-\tfrac34E^2+\tfrac14E^3$: the corrections improve the metric,
-not the spectrum or occupations. Final complex128 maps are checked against
-the **original** H, directly and through the equivalent common scaling,
-using extended inner-block compensated products at the unchanged $10^{-9}$
-whitening criterion. The ordinary binary64 product remains diagnostic when
-its cancellation error is larger. Generalized residuals and all native
-full-W checks remain independently necessary.
+`tests/test_equilibrium_device_quotient_cpu.py` uses two- and three-state
+latent oracles with CPU stand-ins for the device services. It distinguishes
+nonzero but negligible output from important output at the same metric
+condition number, checks current held spaces, complex coordinate changes,
+whole-block closure and invalid output evidence. Its complex band-column
+contraction is a sensitivity diagnostic, not a contour-deformation Σ
+certificate. The older `test_equilibrium_definite_*_cpu.py` tests and the
+`original-columns-extended-newton-v1` host reducer remain offline numerical
+oracles; the native builder does not use that extended-precision rescue.
 
-Held spaces are the exact original-column selector $P_I$, not the previous
-H-whitened Z. Thus a new current metric is obtained from the same original
-principal submatrix and refactored; no old whitening or held rank drop is
-reused. The builder uses a separate versioned selector-space cache and binds
-the metric policy in its recipe/hash. A live null-output witness is measured
-on an orthonormal basis of its span in **original coordinates**, so changing
-units cannot make a live direction appear dark by shrinking its vectors.
-The unselected exact-dependency/null policy is separate from this all-selected
-positive-metric solve.
-
-On the saved 2084-dimensional q0 frequency pencil, the bounded CPU prototype
-retained all 661 independently selected states, certified positive computed
-H, and passed all four rounded-map original-metric checks below $10^{-9}$.
-That is numerical-method evidence only: q0 was not identified as the failed
-material parent, and no native full-W held qualification, Σ, equilibrium
-collision operator or TD trajectory follows from that offline result.
-
-Before reduction, a separately bounded q0 frequency-only capture preserves
-G, H, the output Gram and current selector/provenance metadata. It survives
-a metric refusal without gathering microscopic port faces, allowing the
-numerical issue to be studied without rebuilding the full response.
+The native receipts explicitly set `physical_accuracy_certified=False` and
+`sigma_accuracy_certified=False`. A sampled relative W tolerance, for
+example 5%, cannot certify a 1 meV self-energy error. That requires an
+independent comparison of the full complex active-band column-Σ against
+the contour-deformation reference on the required energy domain, including
+imaginary and offdiagonal terms and the collision consumer. The GPU material
+and P4 verification of this new reduction, full-W admission, that Σ
+comparison and any TD trajectory qualification remain pending; tiny CPU
+tests establish none of them.
 
 The builder authenticates an exact binary diagonal projector with a strict
 global occupied/empty gap and the existing positive-Coulomb check. A smaller

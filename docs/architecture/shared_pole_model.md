@@ -701,7 +701,7 @@ Current phases, density insertions and W are recomputed.
 The compiled response factory is keyed on topology, FFT dialect, shapes
 and moment powers; energies and the scalar reference are dynamic operands.
 Flushed phase starts and synchronized wall times distinguish planning,
-streaming, Dyson, directions, pencil assembly, host reduction, checks and
+streaming, Dyson, directions, pencil assembly, native reduction, checks and
 persistence. No physics gate is inferred from these resource receipts.
 
 Each fitted parent checks its Laplace-growth margin before fitting the next
@@ -740,7 +740,7 @@ finite direction selection and numerical reduction. Full $C_1,C_2$ defects
 are reported as diagnostics, not independent admission gates. The held-W
 and Laplace-growth gates remain enforced; neither is a proof of self-energy
 convergence or of accurate asymptotic moments in every port direction.
-`shared_pole_constructor.reduce_general_pencil` uses the two-sided SVD of
+`shared_pole_constructor.reduce_general_pencil_device` uses the two-sided SVD of
 the frequency-equilibrated descriptor E for this strictly proper finite-pole bank, with relative
 rank tolerance inherited from the source scalar bank tolerance. A-only
 directions unresolved in E are not promoted into nearly infinite modes.
@@ -761,52 +761,76 @@ coordinates, and both fresh and held eigensolves project current original
 E/A. A changed reference never reinterprets a held space. Equilibration
 changes the numerical truncation metric, not exact untruncated physics;
 native/held W and full complex column-Sigma refinement remain necessary.
-Reference, unit masks and scale hashes are retained in diagnostic receipts.
+The reference energy and equation-unit hashes are bound in the caller's
+`frequency_coordinates` receipt.
+Descriptor singular vectors are obtained through the existing Hermitian
+dilation/eigensolve owner, without forming $E^\dagger E$ and squaring its
+condition number. This Hermitian auxiliary problem does not impose Hermitian
+or passive structure on the physical general response.
 For BOTH fresh and held spaces, the current projected descriptor is again
 SVD-balanced into an ordinary non-Hermitian eigenproblem. Its left/right
 inverse-square-root transformations recover the original descriptor maps;
-the full eigenvector metric handles degenerate blocks. Every retained state
+right eigenvectors $V$ and a current device solve for $V^{-1}$ recover the
+independent dual modal rows, including complete degenerate eigenspaces.
+Every retained state
 must remain resolved: singular/unresolved held descriptors refuse without
-rank dropping. Original-pencil backward and modal-commutator gates remain.
+rank dropping. Current ordinary eigenpair and inverse-solve backward
+residuals remain numerical admission checks.
 Resolved growing poles stay unchanged, without Hermitian/PSD projection.
-Held spaces remain canonical within the inner solve; current pencils and
-all response/growth checks are recomputed. One common conservative host-price
-owner covers the extra SVD/balance buffers before gather or factorization.
+Held spaces remain fixed within the inner solve; current pencils and
+all response/growth checks are recomputed. Numerical eigenpair and inverse
+backward residuals check the modal solve; the eigenvector condition estimate
+is diagnostic, without an arbitrary condition-number rejection threshold.
+None of these numerical diagnostics certifies W or self-energy accuracy.
 The resulting full-port factors obey
 
 $$
 W_c^R(z)=L\,\operatorname{diag}[(z-p)^{-1}]R^\dagger.
 $$
 
-Only reduced per-parent frequency pencils cross the bounded host LAPACK
-seam. Its workspace is priced explicitly and refuses above its declared
-capacity; microscopic samples and endpoint factors stay distributed. The
-serial reduced constructor has one canonical process-zero owner. The exact
-batched route (`general_pencil_batch_plan`, `collective_general_pencil_batch`)
-admits a prefix of at most P small pencils from shapes **before** their host
-gather. Every rank reduces at most its one assigned parent, concurrently;
-each parent still has exactly one canonical owner. All ranks first
-gather the same admitted reduced E/A, then exchange an ordered owner success/error record
-before broadcasting exact uint64 bit patterns of complex128 poles, both
-coefficient maps and both held frequency spaces. JAX x64 is required for
-this handoff. Only these reduced arrays cross ranks; independent host
-eigenvector gauges must never be mixed across distributed microscopic
-factor faces. Current E/A are reduced anew every iteration; only numerical
-frequency spaces may be held. Its 4 GiB default bound prices the maximum of
-two disjoint phases: one LAPACK solve beside all other batch inputs, then
-retained canonical models beside one owner result and one transfer buffer.
-Existing held-space bytes are an explicit caller input. Capacity reduces
-the numerical batch width (down to one), never the physical pole order,
-spatial ports or q count. Per-parent receipts record reduced shapes/order,
-SVD/eigen/reduction and canonical-handoff walls and the owner/batch capacity.
-These are concurrent host solves of independent parents, not a batched
-distributed general eigensolver. The general solver is therefore
-capacity-bounded, not a claim of an
-arbitrarily large distributed non-Hermitian eigensolver. At 1761 frequency
-states a complex pencil is about 50 MB; the conservative reduction workspace
-is about 1.39 GB. Two 978-by-1761 endpoint factors at each of 36 q total
-about 1.98 GB globally before padding and reciprocal self-q columns. These
-are shape prices, not measured GPU walls or peak memory.
+Frequency matrices, endpoint maps and held spaces remain native faces;
+spectra and bounded scalar diagnostics reach the host. The local general
+eigensolve goes through `distrib_la.resolve_eig_local_backend` and
+`eig_local`, composed through the existing face-to-local-batch owner.
+CUDA explicitly requests cuSOLVER right eigenvectors; a capability probe
+compiles the installed lowering before this route runs. It has no Python or
+SciPy host-LAPACK fallback on GPU. CPU LAPACK is an explicit actual-CPU
+oracle route. NVIDIA documents `cusolverDnXgeev` itself as a
+[hybrid CPU/GPU algorithm](https://docs.nvidia.com/cuda/cusolver/index.html#cusolverdnxgeev):
+device operands and JAX orchestration do not mean every vendor eigensolver
+operation runs on the GPU. Provider host and device workspace must therefore
+be counted alongside the compiled program; compiled memory analysis alone
+does not include opaque vendor workspace.
+
+One local nonsymmetric eigensystem must fit its device placement; this is
+not an arbitrarily large distributed nonsymmetric eigensolver. Capacity
+admission cannot lower the physical pole order, ports or q count. The old
+`reduce_general_pencil`, `general_pencil_batch_plan` and
+`collective_general_pencil_batch` host helpers remain explicit offline
+oracles, not automatic GPU rescue paths. Their host-only prices are not
+prices or measured peaks of the native route.
+
+The authenticated equilibrium branch instead uses
+`reduce_equilibrium_pencil_device`, with a common diagonal congruence,
+positive-metric quotient, whole-block spectral closure and current metric
+correction through the Hermitian GPU owners. It does not call the general
+nonsymmetric eigensolver. Its dropped positive metric directions are an
+approximation, requiring the original full-W checks even when algebraically
+nonzero. Held common original-coordinate spaces are projected with current
+G/H/output; current unresolved held metrics refuse without rank dropping.
+The [theory owner](../theory/shared-pole-w-model.md) explains why a metric
+condition number alone cannot determine physical importance.
+
+Both routes require the original full-matrix training/held-W and growth
+checks after final q/−q pairing. Relative sampled W checks do not imply a
+1 meV bound on the full complex self-energy: that independently requires
+column-Σ comparison against contour deformation, including real,
+imaginary and offdiagonal components and the collision consumer. Native
+receipts explicitly report that physical/Σ accuracy is not certified by the
+reducer. Tiny CPU service-oracle tests cover transfer reconstruction,
+coordinate changes, held current pencils, degeneracy and gain preservation;
+they are not GPU execution, material admission or a P4 verification result.
+Those GPU/material checks and the 1 meV complex-Σ qualification remain pending.
 
 The store `lorrax.shared-general-pole.v1` has independent
 `left,right[q,mu,1,Kmax]` complex128 factors and `poles_ry[q,Kmax]`
