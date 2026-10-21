@@ -17,7 +17,8 @@ space (so H is Hermitian) and the exchange V positive:
   ``absorption_haydock.haydock_coefficients`` on the eigensolve's payload equals the
   standalone route (a fresh payload, ``W_q`` transformed there) to 1e-12, and the
   three-term recurrence of the dense operator to 1e-9.
-* The solver-flag guard refuses a Lanczos-only flag under the default solver.
+* The solver-flag guard refuses a Lanczos-only flag under the default solver, and
+  ``--haydock-iter`` refuses the RPA kernel (the recursion is D + V - W).
 
 CPU, one process, on a 1x1 mesh (login node, <= 4 threads) or a 2x2 mesh of four host
 devices: ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4
@@ -180,6 +181,14 @@ def run_cases(mesh):
         out["lanczos_flag_refused_under_davidson"] = False
     except SystemExit:
         out["lanczos_flag_refused_under_davidson"] = "--lanczos-rtol is not read by --solver davidson" in err.getvalue()
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            bse_jax.parse_args(["-i", "x.in", "--lanczos", "--tda", "--write-eigs", "--dipole", "d.h5",
+                                "--haydock-iter", "10"])
+        out["haydock_refused_without_bse"] = False
+    except SystemExit:
+        out["haydock_refused_without_bse"] = "it needs --bse" in err.getvalue()
     return out
 
 
@@ -208,6 +217,7 @@ def main() -> int:
         "Haydock x-only == row 0 of xyz (1e-12)": out["haydock_x_only_equals_row0"] <= 1e-12,
         "Lanczos-only flag refused under default solver": out["lanczos_flag_refused_under_davidson"],
         "Haydock polarizations parse and refuse": out["haydock_polarizations_parse_and_refuse"],
+        "--haydock-iter refused on the RPA kernel": out["haydock_refused_without_bse"],
     }
     ok = all(checks.values())
     if jax.process_index() == 0:

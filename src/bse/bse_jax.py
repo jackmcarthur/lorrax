@@ -738,6 +738,9 @@ def parse_args(argv=None):
         if not args.tda or args.dipole is None:
             parser.error("--haydock-iter runs the TDA Haydock recursion seeded "
                          "by the window dipoles: it needs --tda and --dipole")
+        if args.rpa or not args.bse:
+            parser.error("--haydock-iter runs absorption_haydock's screened "
+                         "recursion (D + V - W): it needs --bse")
         if args.qp_rotations is not None:
             parser.error("--haydock-iter on a --qp-rotations bundle is not "
                          "supported: run bse.absorption_haydock's inputs")
