@@ -1249,7 +1249,8 @@ def snapshot_collision(source, ops, *, mesh, k_frac, b_lo, ntr, model,
     req_b = to_bundle(rho_eq_h)
     t0["prepared_density_commutator_ha"] = float(np.max(np.linalg.norm(
         H0 @ req_b - req_b @ H0, axis=(-2, -1)))) * ry_ha
-    say(f"  native joint snapshot t0: {prepared['nmu_logical']} mu, {prepared['nb']} bands, {nk} q; "
+    say(f"  native joint snapshot t0: {prepared['nmu_logical']} mu, {prepared['nb']} bands, "
+        f"{nk} k / {prepared['nq']} q; "
         f"{mode}; setup {t0['setup_s']:.2f} s")
     if record is not None:
         record(t0)
