@@ -340,3 +340,20 @@ All results carry `SOURCE_FROZEN_DIAGNOSTIC`, `zero_gate=false` and
 `matched_BC_admission=false`; both driven prerequisite validators reject
 them. This is a bounded raw-collision investigation, not a matching B/C zero
 gate, an updated-W calculation or a successful material trajectory.
+
+## Saved-W active-rate quadrature replay
+
+`same_w_rate_replay.py` authenticates the accepted source frame, saved t0
+projector and committed general-W model before invoking the existing native
+ordered Sigma owner with `internal='active'`. Four or sixteen ranks are
+supported; the actual material replay used the original P16 layout. Native
+initialization runs, but no SC map, new W, upstream160-output Sigma or TD
+step runs. Only the exact binary64k/30v14c projector is accepted: headless
+rate-body C and boundary compressions match the full collision there, not
+for an arbitrary coherent state. Head, virtual MH and tail are omitted.
+
+Actual jobs60078170/60078338 reduced the fresh trace residual to
+`-9.64e-12 Ry` at quadrature1e-8, while retaining a **-24.859 meV** outward
+occupied-boundary eigenvalue. The tight rate body cost30.64s. This is
+number-quadrature convergence, not a positivity fix or damping trajectory;
+see [timings and scope](PERFORMANCE.md#same-w-active-rate-convergence-number-recovered-pauli-boundary-not-recovered).

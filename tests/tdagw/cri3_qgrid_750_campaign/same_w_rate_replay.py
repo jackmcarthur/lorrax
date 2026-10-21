@@ -180,8 +180,11 @@ def main(argv=None):
                 collision_difference_from_saved_per_k_frobenius_max_ry=float(np.max(np.linalg.norm(delta,axis=(-2,-1)))),
                 trace_difference_from_saved_ry=result['statistics']['trace_rate_ry']-baseline_stats['trace_rate_ry'],
                 native_receipt=result['raw']['native_receipt'])
-            saved_flux=abs(float(baseline['fresh_trace_rate_ry']))/float(baseline['fresh_trace_relative'])
-            row['residual_over_fixed_saved_full_flux']=abs(row['trace_rate_ry'])/saved_flux
+            # The producer's relative guard uses Frobenius norms of D/loss,
+            # not a physical scattering flux. Keep that fixed denominator
+            # distinct from this replay's headless gain/loss trace scale.
+            saved_norm_scale=abs(float(baseline['fresh_trace_rate_ry']))/float(baseline['fresh_trace_relative'])
+            row['residual_over_fixed_saved_full_norm_scale']=abs(row['trace_rate_ry'])/saved_norm_scale
             if previous is not None:
                 row['collision_change_from_previous_max_ry']=float(np.max(abs(result['collision']-previous)))
             previous=result['collision']
@@ -198,7 +201,8 @@ def main(argv=None):
             head_included=False,virtual_MH_included=False,tail_included=False,screening_rebuilt=False,
             baseline_full_statistics=baseline_stats,rows=rows,seconds=time.monotonic()-started,
             scope='Exact t0 projector only: compare collision/empty injection/filled blocking. '
-                  'Headless Gamma/D/Sigma and body-flux relative statistic are not full physical quantities. '
+                  'Headless Gamma/D/Sigma are not full physical quantities; body_flux_ry is a gain/loss trace scale, '
+                  'not the physical empty-gain/filled-loss scattering flux. '
                   'No full-Sigma/MH, collision guard admission, propagation or physical convergence claim.')
         rank0_transaction(out/'receipt.json',stage='same_W_rate_replay/receipt',
             write=lambda:(out/'receipt.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n'))

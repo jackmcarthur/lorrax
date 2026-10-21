@@ -505,8 +505,9 @@ ordered 44-destination Sigma then completed **326 tau pairs / 12 sweeps in
 23 s**, with zero undispatched pairs and `sigma_quadrature_eps=1e-4`.
 The t0 collision setup took **332.205 s** including W, not per physical step.
 
-No physical step ran. Fresh number residual `-3.40055e-6 Ry`, relative
-`2.42891e-5`, failed the unchanged `1e-7` relative guard. Independently the
+No physical step ran. Fresh number residual `-3.40055e-6 Ry`, relative to
+the saved Frobenius-norm scale `2.42891e-5` (not a scattering-flux ratio),
+failed the unchanged `1e-7` relative guard. Independently the
 saved filled boundary block had minimum **-0.00182829 Ry (-24.875 meV)**.
 Two small-matrix audits reproduce Gamma/D/MH exactly and isolate the worst
 mode's one-sided PV contribution (-0.00253192 Ry) versus absorptive part
@@ -515,11 +516,51 @@ off-diagonal boundary failure, not a population-rate sign error. A Hermitian
 Hamiltonian counterterm cannot cancel a projector's boundary compression.
 Naively removing PV is not a conserving replacement for coherent rho.
 
-The number defect needs a same-W tighter-quadrature test; its numerical
-origin is plausible but not established. W is persisted (~2.097 GB), so a
-proper replay need not reconstruct screening. None of these measurements
+The same-W tighter-quadrature test below subsequently established numerical
+convergence of the fresh number defect, separately from the persistent
+boundary failure. W is persisted (~2.097 GB), so that replay did not
+reconstruct screening. None of these measurements
 is a 10fs trajectory, twelve screening updates, damping comparison, or
 universal positivity result. See the [actual operator and accounting record](evidence/B_PILOT_T0_REFUSAL_60071791.json).
+
+### Same-W active-rate convergence: number recovered, Pauli boundary not recovered
+
+Jobs `60078170` and `60078338`, source `cbdd458`, replayed the authenticated
+saved t0 state and **exactly the same committed W** on P16 (4×4 mesh).
+The source still has750 screening bands and3000 centroids; only44 real
+intermediates/destinations enter this rate-only diagnostic. No W rebuild,
+SC map, head, virtual-band MH, tail extrapolation or physical time step ran.
+At this exact binary projector the omitted head contributes zero raw C
+and zero boundary compression; frozen virtual/tail terms affect MH only.
+The replay therefore tests the saved collision/boundary, not full Sigma.
+
+| Sigma quadrature target | Window/τ pairs | Rate-body wall (s) | Mean Tr C (Ry) | Residual / fixed saved norm scale | Filled boundary minimum (meV) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1e-4 | 294 | 16.20 | -3.40081e-6 | 2.42909e-5 | -24.87516 |
+| 1e-6 | 466 | 20.99 | +1.62371e-8 | 1.15976e-7 | -24.85921 |
+| 1e-8 | 681 | 30.64 | -9.64362e-12 | 6.88813e-11 | -24.85901 |
+
+The fixed denominator is the producer's Frobenius-norm scale
+`0.140003383 Ry`, **not physical scattering flux**. The raw replay receipts
+unfortunately name it `residual_over_fixed_saved_full_flux`; the helper now
+uses `...norm_scale`. Their separate `body_flux_ry` field is a headless
+gain/loss trace scale, also not physical empty-gain/filled-loss flux.
+The1e-8 result is below the original1e-7 relative number criterion, but
+this diagnostic does not execute or admit all original collision guards.
+
+The1e-4 replay reproduces saved Tr C within `2.55e-10 Ry` and the boundary
+within `8.42e-12 Ry`. Tightening1e-6→1e-8 changes C by at most
+**0.00171 meV per-k Frobenius norm**, whereas the outward occupied-block
+direction remains **-24.859 meV**. This separates convergent quadrature
+error from the nonsecular collision closure's boundary defect; neither
+requires screening-mode jitter. It does not certify full750-virtual Sigma,
+W fit accuracy, equilibrium stationarity or driven damping.
+
+Both allocations completed and released. Including the13s pre-numerical
+bootstrap failure `60078048`, total reserved cost was **1.7422 GPU-h**;
+numeric-step time is contained in that allocation cost, not added to it.
+Native source initialization is outside the16–31s rate-body timers and
+is not a per-refresh cost. See [authenticated replay evidence](evidence/SAME_W_RATE_CONVERGENCE_60078170_60078338.json).
 
 ### Correction: the707 t0 request was not on its instantaneous shells
 

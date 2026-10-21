@@ -1,0 +1,103 @@
+{
+  "schema": "same_W_active_rate_convergence_v1",
+  "status": "FRESH_NUMBER_CONVERGES_FILLED_BOUNDARY_REMAINS_OUTWARD_NOT_DYNAMICS",
+  "source_revision": "cbdd45802b7c4831a8d7ee94f54d08f62776d73b",
+  "source_archive_sha256": "aa92e21cde1edc0cbcc59e77ed679b0665331fd09f1c81bbb372f3969dbede90",
+  "source_frame": "frame_0007_call_0007",
+  "snapshot_sha256": "a6232345e31b8355d12025fe2402bbcfec4d1f34b49d2993a2fd9ffeca679e58",
+  "W_digest": "52fb9de00cf25c1a8b2c6018c4151fe88019fa75e57fa36f0996be7dbda6231d",
+  "electronic_grid": [8, 8, 1],
+  "response_grid": [4, 4, 1],
+  "response_window": "fejer",
+  "source_bands": 750,
+  "centroids": 3000,
+  "active_rate_window": [100, 144],
+  "gpu_count": 16,
+  "mesh": [4, 4],
+  "gpu_model": "A100-SXM4-40GB",
+  "same_W_rebuilt": false,
+  "head_included": false,
+  "virtual_MH_included": false,
+  "tail_included": false,
+  "physical_steps": 0,
+  "fixed_saved_norm_scale_ry": 0.140003383,
+  "normalization_note": "Producer guard uses Frobenius norms, not physical scattering flux. Raw receipts misname its ratio residual_over_fixed_saved_full_flux; subsequent helper uses norm_scale. body_flux_ry in raw receipts is a headless gain/loss trace scale, also not physical empty-gain/filled-loss flux.",
+  "rows": [
+    {
+      "job": 60078170,
+      "quadrature_eps": 1e-4,
+      "window_tau_pairs": 294,
+      "windows": 8,
+      "rate_body_seconds": 16.201677746,
+      "trace_rate_ry": -3.400805906994542e-6,
+      "residual_over_fixed_saved_norm_scale": 2.4290883762e-5,
+      "empty_min_injection_ry": 5.578482238019355e-5,
+      "filled_min_blocking_ry": -0.001828290484293034,
+      "max_per_k_collision_frobenius_difference_from_original_ry": 4.92222080325e-8
+    },
+    {
+      "job": 60078170,
+      "quadrature_eps": 1e-6,
+      "window_tau_pairs": 466,
+      "windows": 8,
+      "rate_body_seconds": 20.985524931,
+      "trace_rate_ry": 1.623705286890598e-8,
+      "residual_over_fixed_saved_norm_scale": 1.15976146438e-7,
+      "empty_min_injection_ry": 5.5788302282144704e-5,
+      "filled_min_blocking_ry": -0.0018271179589310284,
+      "max_per_k_collision_frobenius_difference_from_original_ry": 8.19517443647e-6
+    },
+    {
+      "job": 60078338,
+      "quadrature_eps": 1e-8,
+      "window_tau_pairs": 681,
+      "windows": 8,
+      "rate_body_seconds": 30.642777589,
+      "trace_rate_ry": -9.643619236499035e-12,
+      "residual_over_fixed_saved_norm_scale": 6.888132999230152e-11,
+      "empty_min_injection_ry": 5.5788187819426375e-5,
+      "filled_min_blocking_ry": -0.0018271036950328772,
+      "max_per_k_collision_frobenius_difference_from_original_ry": 8.20450698806268e-6
+    }
+  ],
+  "tight_to_tighter_body_differences_meV": {
+    "C_max_element": 0.000378992,
+    "C_max_per_k_frobenius": 0.001706306,
+    "Gamma_max_per_k_frobenius": 0.004043797,
+    "D_max_per_k_frobenius": 0.000167204,
+    "MH_body_max_per_k_frobenius": 0.001918856,
+    "scope": "Body-only active intermediate column operators, not full750-virtual Sigma/MH or W convergence."
+  },
+  "conclusions": {
+    "same_W_trace_converges": true,
+    "fixed_norm_ratio_below_original_number_criterion_at_1e8": true,
+    "all_original_guards_executed_or_admitted": false,
+    "Pauli_boundary_passes": false,
+    "equilibrium_stationarity_demonstrated": false,
+    "full_complex_Sigma_meV_accuracy_certified": false,
+    "driven_damping_demonstrated": false,
+    "scope": "Exact t0 binary projector only. Omitted head has zero raw collision and boundary compression here; frozen virtual/tail terms only affect MH. This does not extend headless comparison to general coherent rho."
+  },
+  "accounting": {
+    "successful_jobs": [
+      {"job": 60078170, "state": "COMPLETED", "allocation_seconds": 197, "numeric_step_seconds": 189},
+      {"job": 60078338, "state": "COMPLETED", "allocation_seconds": 182, "numeric_step_seconds": 174}
+    ],
+    "pre_numerical_failure": {"job": 60078048, "allocation_seconds": 13, "numeric_step_seconds": 5, "reason": "NumPy import preceded native runtime BLAS bootstrap; fixed in cbdd458 before both successful replays."},
+    "combined_reserved_GPUh": 1.7422222222222221,
+    "all_allocations_released": true,
+    "views": "Numeric-step lifetimes and extern/staging steps are contained in reserved allocation cost, not added. Native source preparation is outside rate-body timers."
+  },
+  "evidence": [
+    {
+      "raw_receipt": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/same_w_rate_60078170.receipt.json",
+      "sha256": "49e86bf656408e4636dd4102a80bdc188b82ce0a79d5eca5863fbc7c040aed66",
+      "remote_result": "/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/qgrid_20261020/same_w_rate_cbdd458_v1/result_60078170"
+    },
+    {
+      "raw_receipt": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/same_w_rate_60078338.receipt.json",
+      "sha256": "62a955ff0a501c158e5b8f51f4856003723586d98479c64760e7c862b4903208",
+      "remote_result": "/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/qgrid_20261020/same_w_rate_cbdd458_e8_v1/result_60078338"
+    }
+  ]
+}
