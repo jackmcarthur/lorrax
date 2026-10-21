@@ -99,6 +99,9 @@ _WHY = {
                          "the request would be ignored",
     "td_velocity_full_window_loader": "this loader returns the window's cv dipoles only, so the "
                                       "vv' and cc' pairs would be missing",
+    "td_velocity_position_fix": "the exact-position fix acts on the velocity the loader carries "
+                                "through the htransform (the densified route), so elsewhere the "
+                                "request would be ignored",
     "td_eqp_n_occ": "psi hold the DFT window, and a QP spectrum with another n_occ changes which "
                     "bands are occupied",
     "td_coulomb_policy": "the Hartree term must use the Coulomb kernel that V and W were built "
@@ -463,6 +466,7 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
                   zeta_file: str | None = None, n_occ: int | None = None,
                   degeneracy_mode: str | None = None, eqp_file: str | None = None,
                   velocity_file: str | None = None, velocity_full_window: bool = False,
+                  velocity_position_fix: bool = False,
                   keep_window: bool = False) -> dict:
     """The model bundle from a GW restart: W from the BSE loader, ψ from TDGW's WFN.
 
@@ -492,6 +496,11 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
     velocity_full_window : bool — ask the loader for the velocity over every
         window pair (vv', cc' and cv); refuses when the loader has no such
         option.  Needs ``velocity_file``.
+    velocity_position_fix : bool — with ``eqp_file``, the loader's opt-in
+        exact position of the fine QP states (``bse_jax
+        --dipole-position-fix``; CrI3-type QP ladders) instead of
+        ``v/ΔE_RQ``; forwarded only, refuses (GATE td_velocity_position_fix)
+        without ``velocity_file`` or with a loader that has no such option.
     keep_window : bool — keep the loader's window as ``model["window"]``:
         ``eps_v``/``eps_c`` (Ry, the loader's padded (nk, n_pad) layout,
         window bands ascending, pad slots the loader's sentinel), ``n_occ``,
@@ -541,7 +550,8 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
         n_occ=n_occ, degeneracy_mode=degeneracy_mode or DEFAULT_MODE,
         **_loader_options(load_bse_data_from_restart_sharded, eqp_file=eqp_file,
                           velocity_file=velocity_file,
-                          velocity_full_window=velocity_full_window, densifies=densifies))
+                          velocity_full_window=velocity_full_window,
+                          velocity_position_fix=velocity_position_fix, densifies=densifies))
     if (int(data["n_val"]), int(data["n_cond"])) != (n_val, n_cond):
         _refuse("td_window_resolved", f"loader window {data['n_val']}v x {data['n_cond']}c",
                 f"{n_val}v x {n_cond}c", "close the multiplets at both window edges")
@@ -624,7 +634,8 @@ def _deck_densifies(input_file: str, header: dict) -> bool:
 
 
 def _loader_options(loader, *, eqp_file=None, velocity_file=None,
-                    velocity_full_window: bool = False, densifies=None) -> dict:
+                    velocity_full_window: bool = False,
+                    velocity_position_fix: bool = False, densifies=None) -> dict:
     """The optional keywords :func:`load_td_model` forwards to the BSE loader.
 
     Empty at the defaults, so the default call is the loader's own.  The
@@ -659,6 +670,14 @@ def _loader_options(loader, *, eqp_file=None, velocity_file=None,
                     "a loader that returns the velocity over every window pair "
                     "(vv', cc' and cv)", "add velocity_full_window to the BSE loader")
         out["velocity_full_window"] = True
+    if velocity_position_fix:
+        if velocity_file is None or "velocity_position_fix" not in params:
+            _refuse("td_velocity_position_fix", f"velocity_position_fix=True with velocity_file="
+                    f"{velocity_file!r} on {loader.__module__}.{loader.__name__}",
+                    "a densified bundle whose loader carries the velocity "
+                    "(velocity_position_fix)", "drop lorrax.dipole_position_fix, or use a "
+                    "bse_k_grid deck")
+        out["velocity_position_fix"] = True
     return out
 
 

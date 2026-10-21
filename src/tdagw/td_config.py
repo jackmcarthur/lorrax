@@ -74,6 +74,7 @@ TD_DEFAULTS = {
     "lorrax.dipole_file": "",
     "lorrax.pair_rule": "mask",
     "lorrax.pair_gap_ev": None,
+    "lorrax.dipole_position_fix": False,
     "lorrax.check_eigenvectors": "",
     "lorrax.degeneracy_mode": "",
     "lorrax.tda": False,
@@ -681,7 +682,7 @@ def inactive_keys(deck) -> dict:
         (("lorrax.isdf_zeta", "lorrax.isdf_terms"), model != "isdf",
          f"model isdf only; model is {model}"),
         (("lorrax.isdf_input",), model != "isdf", f"model isdf only; model is {model}"),
-        (("lorrax.pair_rule", "lorrax.pair_gap_ev"), not bundle,
+        (("lorrax.pair_rule", "lorrax.pair_gap_ev", "lorrax.dipole_position_fix"), not bundle,
          "system = 'bundle' only (the r of a TDGW header is TDGW's)"),
         (("control.timesteps.ntcheck",), bool(v["lorrax.chunk"]),
          "lorrax.chunk sets the samples per chunk and checkpoint"),
@@ -980,6 +981,12 @@ TD_KEY_DOCS = {
     "lorrax.pair_gap_ev": (
         "= `system.esmear`", "The energy scale of `pair_rule`, eV; also the smallest "
         "accepted c↔v gap.", ("td_cv_gap", "td_pair_gap_route_b")),
+    "lorrax.dipole_position_fix": (
+        "", "A `bse_k_grid` bundle with `eqp_file`: the window position is the exact "
+        "r of the fine QP states (the DFT f(H) eigenbasis of the window, `bse_jax "
+        "--dipole-position-fix`) instead of v/ΔE of their Rayleigh quotients. Opt in for "
+        "strongly band-dependent QP ladders (CrI3-type); the bundle log's QP/DFT mixing "
+        "receipt says when.", ("td_velocity_position_fix",)),
     "lorrax.check_eigenvectors": (
         "", "A `bse_jax --write-eigs --dipole` file on the same bundle and window: the "
         "builder reproduces its ⟨0|r|S⟩ from the header (the gauge receipt, logged and "

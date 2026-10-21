@@ -12,13 +12,15 @@ Owner decision. Under `--eqp` the densified dipoles are again
 219ee8275). The exact-position fix of 219ee8275 (r from the DFT f(H)
 eigenbasis of the window, rotated back) is now opt-in:
 `bse_jax --dipole-position-fix`, `absorption_haydock --dipole-position-fix`,
-`dump_window_dipoles --dipole-position-fix`, loader `velocity_position_fix`.
+`dump_window_dipoles --dipole-position-fix`, TD-aGW deck key
+`[lorrax] dipole_position_fix = true` (bundle system), loader
+`velocity_position_fix`.
 
 - **Why.** The fix is exact only when the interpolated DFT f(H) is more
   accurate than the QP f(H) that defines ψ. Si 4³→8³ (near-scissor ladder):
   the DFT block mixes valence and conduction by 3.8 % and the fix puts the
-  window-sum |d|² 11.5 % rms off the native 8³ grid (max 39 %) against 2.9 %
-  (max 4.6 %) for the default; IP ε₂ 2.4 % against 0.86 % rms of peak.
+  window-sum |d|² 12.1 % rms off the explicit 8³ dipoles (max 36 %) against
+  2.4 % (max 6.5 %) for the default; IP ε₂ 2.2 % against 0.86 % rms of peak.
 - **CrI3-type runs must opt in** (strongly band-dependent QP shifts). CrI3
   8×8→12×12 against the native 12×12: the default loses 1.4 % of Σ|d|²
   (0.986), 13 % below 1.6 eV (0.87), the lowest transition's quotient 60 meV
@@ -28,13 +30,17 @@ eigenbasis of the window, rotated back) is now opt-in:
   f(H) off-diagonal; `result["qp_mixing"]`). Large values say the run needs
   the fix. There is no automatic switch.
 - **Results move.** `bse_k_grid` runs with `--eqp`: dipoles, oscillator
-  strengths and absorption (not the exciton energies). TD-aGW
-  (`tdagw.td_system`) loads without the fix, so its `r_window` under `--eqp`
-  is now the pair-rule position of `v/ΔE_RQ`; TD-aGW has no opt-in yet.
+  strengths and absorption (not the exciton energies). TD-aGW bundles
+  (`tdagw.td_system`) on a `bse_k_grid` deck with `eqp_file` now take the
+  pair-rule position of `v/ΔE_RQ` unless `dipole_position_fix = true`; the
+  CrI3 TD lane, for which the fix was built, must set it.
 - **Code.** `densified_dipoles(..., qp_states=, mixing_receipt=)`:
   `qp_states` is the fix; `dump_window_dipoles` writes `d_alpha_rq` only with
   it. Bitwise: the opt-in path equals the old r-fix and the default equals the
-  old `d_alpha_rq` (toy of `tests/test_bse_kgrid_dipoles_rfix_cpu.py`).
+  old `d_alpha_rq` (toy of `tests/test_bse_kgrid_dipoles_rfix_cpu.py`) for an
+  isolated fit-window top. With an entangled top the opt-in also receives the
+  weighted velocity (the entry below), so it is not bitwise the old r-fix
+  there.
 
 ## 2026-10-21 — `bse_k_grid` dipoles: weighted velocity at an entangled fit-window top; `dipole.h5` band range
 
@@ -52,9 +58,12 @@ bit for bit, and the on-grid identity stays exact either way.
 - **Results move.** `bse_k_grid` dipoles when the velocity file holds bands
   above the fit window and they are entangled with it (every production
   deck so far). Si 4³→8³ kg_srlr, momentum operator, against the explicit 8³
-  dipoles: window-sum |p|² off-grid rms 6.1 % → 2.4 %; with the default
-  Rayleigh-quotient dipoles |d|² 6.5 % → 2.9 % rms (max 20 % → 4.6 %) and
-  IP ε₂ 1.4 % → 0.86 % rms of peak. Exciton energies do not move.
+  dipoles (448 off-grid k): velocity over exact ΔE, window sum, rms 6.1 % →
+  2.7 %; with the default Rayleigh-quotient dipoles |d|² 6.5 % → 2.4 % rms
+  (max 20 % → 6.5 %, BZ total +3.5 % → −0.3 %) and IP ε₂ at identical QP
+  energies 1.37 % → 0.86 % rms of peak on 2.5–4.5 eV (peak +2.7 % → +0.3 %).
+  kg_srlr as run on main (unweighted, r-fix): 13.7 % rms, IP ε₂ 3.0 %.
+  Exciton energies do not move.
 - **Gate.** `GATE densified_velocity_weight`: an unfitted band at or below the
   BSE window's top, or a weight below 1e-3 in the fine window. Fix: raise
   `ncond`.

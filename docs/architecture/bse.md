@@ -300,7 +300,8 @@ $g \ge 1 - e^{-4}$ on the window, and $G_q = g$ of the window block of the
 file's $f(H)$ in the fine states. When the fit window's top band meets that
 band the window projector jumps where they cross and the unweighted $v$ is
 not smooth in k (Si 4³→8³, 36 of 100 bands: outer-shell image 26 % against
-1.9 % for $f(H)$; window-sum $|p|^2$ off-grid 6.1 % rms, weighted 2.4 %).
+1.9 % for $f(H)$; window-sum velocity over exact $\Delta E$ off-grid 6.1 %
+rms, weighted 2.7 %).
 A fit window whose top stays below every unfitted band takes $g \equiv 1$,
 bit for bit the unweighted route; on-grid both are exact.
 
@@ -323,10 +324,13 @@ None and velocity_position_fix`) then takes the exact position of the fine
 states from the DFT $f(H)$ eigenbasis of the window, which matches CrI3 to
 0.05 %. It is exact only when the DFT interpolant is the more accurate one:
 on Si 4³→8³ (a near-scissor ladder) its window block mixes valence and
-conduction by 3.8 % and the fix moves the window-sum $|d|^2$ 11.6 % rms
-off-grid against 2.6 % for the default. Without the fix the log prints the
+conduction by 3.8 % and the fix puts the window-sum $|d|^2$ 12.1 % rms
+off-grid from the explicit 8³ dipoles against 2.4 % for the default. Without the fix the log prints the
 same mixing receipt (max off-block mixing, $f(H)$ off-diagonal) so a run can
-see when it needs it. The fix, per q: $F = U^\dagger [f(H)]_{\rm file} U = W\,\mathrm{diag}(\varphi)\,W^\dagger$,
+see when it needs it. With an entangled fit-window top the fix receives
+the weighted velocity above, so it equals the pre-weighting fix bit for bit
+only for isolated tops. TD-aGW bundles opt in with `[lorrax]
+dipole_position_fix = true`. The fix, per q: $F = U^\dagger [f(H)]_{\rm file} U = W\,\mathrm{diag}(\varphi)\,W^\dagger$,
 $\varepsilon = f^{-1}(\varphi)$,
 
 $$r' = \frac{(W^\dagger v W)_{mn}}{i(\varepsilon_m - \varepsilon_n)},\qquad
