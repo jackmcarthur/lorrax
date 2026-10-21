@@ -105,6 +105,10 @@ import jax
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 import common.timing as timing
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 from .screening import (
     ScreeningRequest, _gate_w, compute_static_w, screening_requests_for)
@@ -320,7 +324,7 @@ def refuse_fractional_occupations(occs, *, band_lo, band_hi, source,
             f"so this occupation check is the gate.\n"
             f"  doc:  docs/input_reference.md '## Screening', "
             f"screening_diagrams.")
-    print_fn(
+    log.debug(
         f"  {diagram_name}: occupations are integer across bands "
         f"[{lo}, {hi}) of {os.path.basename(str(source))} (worst deviation "
         f"{worst:.2e} <= {_OCC_INTEGER_TOL:g}) -- insulating mean field, "
@@ -676,7 +680,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
             _pc_deck, mesh_xy, name="ladder probe chunk",
             spec=P("y"), axis=0)
         probe_chunk = probe_axis.carrier
-        print_fn(
+        log.debug(
             f"  w_bse: ladder_probe_chunk={_pc_deck}"
             + (f" rounded up to {probe_chunk} "
                f"(mesh divisor={probe_axis.divisor})"
@@ -716,7 +720,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                 worst_z = float(np.max(resid_z)) if resid_z.size else 0.0
                 hot_z = int(np.max(iters_z)) if iters_z.size else 0
                 peak = memory.boundary()
-                print_fn(
+                log.debug(
                     f"  Ladder W(z) {_resolvent_diagram_name(include_w)} "
                     f"z[{iz}] = "
                     f"{complex(zz)!r} Ry: wall {wall:.1f} s, GMRES iters "
@@ -760,7 +764,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
     # and the two are indistinguishable downstream.
     hottest = int(np.max(iters)) if iters is not None and iters.size else -1
     truncated = hottest >= _GMRES_MAX_ITER
-    print_fn(
+    log.info(
         f"  w_bse: ladder GMRES max residual {worst:.2e} "
         f"(tol {tol:.0e}), max iters {hottest}/{_GMRES_MAX_ITER}"
         + ("  TRUNCATED AT THE CAP" if truncated else ""))
@@ -794,7 +798,7 @@ def _finalize_ladder_head(wedge, *, config, meta, head_resolver, print_fn=print)
             f"{worst:.3e}, iterations {hottest}/{_GMRES_MAX_ITER}")
     xi = np.asarray(result.xi, dtype=np.complex128)
     xi_long = 0.5 * (xi + np.swapaxes(xi, -1, -2))
-    print_fn(
+    log.info(
         "  w_bse head: using micro-reducible BSE resolvent exactly once "
         f"(max residual {worst:.2e}, max |Xi-Xi^T|/|Xi| "
         f"{float(np.max(result.asym)):.2e}, dipole/operator Delta mismatch "

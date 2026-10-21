@@ -62,6 +62,10 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import timing
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common.collectives import barrier, process_rank
 from file_io import (
     parse_coulomb_policy,
@@ -546,7 +550,7 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
             f"the child's covariance.  NO CLAIM ABOUT WEDGE STORABILITY MAY "
             f"BE MADE FROM THE NUMBER ABOVE. ***",
         ]
-        print_fn("\n".join(lines))
+        log.info("\n".join(lines))
         return child_perm, child_L, slots, worst_rel, kap_max, tol
     if passed:
         lines.append(
@@ -629,7 +633,7 @@ def _gate_child_wedge_storability(small, keep_idx, tables, mesh_xy, mu_S,
         "over the parent's symmetry operations, and those live on a WFN this "
         "driver does not open.  The permutation-level statement above is a "
         "different object and must not be stamped as if it were that one.")
-    print_fn("\n".join(lines))
+    log.info("\n".join(lines))
     return child_perm, child_L, slots, worst_rel, kap_max, tol
 
 
@@ -661,7 +665,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
     from runtime.padding import padded_mu_extent
 
     src = resolve_restart_file(cfg.source_restart)
-    print_fn(f"  [downfold] parent bundle: {src}")
+    log.info(f"  [downfold] parent bundle: {src}")
 
     with timing.section("downfold.load", announce=True,
                         label="parent restart bundle"):
@@ -674,13 +678,13 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         n_q = int(tensors["V_qmunu"].shape[0])
         mu_L_pad = int(tensors["V_qmunu"].shape[-1])
 
-    print_fn(
+    log.info(
         f"  [downfold] parent: mu_L={mu_L} (in memory {mu_L_pad}), "
         f"n_q={n_q}, nk={geom['nk']}, nb={geom['nb']}, "
         f"nspinor={geom['nspinor']}, kgrid={geom['kgrid']}")
-    print_fn(f"  [downfold] retained window: {window.describe()}")
+    log.info(f"  [downfold] retained window: {window.describe()}")
     if not window.symmetric:
-        print_fn(
+        log.info(
             "  [downfold] NOTE: the window is ASYMMETRIC.  That is the "
             "Sigma-serving shape — Sigma's internal band sum runs over the "
             "full window while its outer projection does not — and the rank "
@@ -690,7 +694,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             "on it: stage 1 was scoped BSE-first.  Treat the result as "
             "unvalidated.")
     if len(geom["present"]) > 2:
-        print_fn(f"  [downfold] parent also carries "
+        log.info(f"  [downfold] parent also carries "
                  f"{[n for n in geom['present'] if n not in ('V_qmunu', 'W0_qmunu')]}"
                  f" — they ride the same congruence.")
 
@@ -726,14 +730,14 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
                       else np.asarray(parent_tables.sym_perm)[:, :mu_L]))
         mu_S = int(sel.mu_small)
         mu_S_pad = int(padded_mu_extent(mu_S, mesh_xy))
-    print_fn(sel.describe())
-    print_fn(describe_price(resident_bytes_per_rank(
+    log.info(sel.describe())
+    log.info(describe_price(resident_bytes_per_rank(
         nk=int(geom["nk"]), nb=int(geom["nb"]), ns=int(geom["nspinor"]),
         n_q=n_q, mu_L_pad=mu_L_pad, mu_S_pad=mu_S_pad,
         n_tensors=len(tensors), mesh_xy=mesh_xy,
         residual=bool(cfg.report_residual))))
     if mu_S_pad != mu_S:
-        print_fn(
+        log.info(
             f"  [downfold] mu_S {mu_S} -> {mu_S_pad} in memory (+"
             f"{mu_S_pad - mu_S} ZERO centroid rows so the extent divides "
             f"both mesh axes).  A zero psi row gives a zero pair density, "
@@ -767,7 +771,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
     small, T_store, g0_S = out["small"], out["T"], out["g0_S"]
     reports = out["reports"]
     del S_cross
-    print_fn(
+    log.info(
         f"  [downfold/stream] q streamed in {out['n_tiles']} tile(s) of "
         f"{out['width']} (runtime.tiles.TILE_BYTES per rank; the shapes "
         f"alone size it).")
@@ -783,9 +787,9 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
         [r.kappa_eff if r.kappa_eff is not None else np.nan for r in reports],
         dtype=np.float64)
     record_kept_rank(sel, reports[0])
-    print_fn(sel.kept_line())
+    log.info(sel.kept_line())
     if sel.eigen_rank_kept < mu_S:
-        print_fn(
+        log.info(
             f"  [downfold/select] NOTE: {mu_S - sel.eigen_rank_kept} of the "
             f"{mu_S} kept centroids add no independent direction at "
             f"rcond={cfg.downfold_rcond:g}.  The transfer solve will "
@@ -793,7 +797,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
             f"smaller than it looks, and mu_small = auto would have reported "
             f"that ceiling up front — a RANK statement, not an accuracy one.")
     if g0_S is not None:
-        print_fn(
+        log.info(
             "  [downfold] g0_mu (zeta(G=0)) transported as g0_S = "
             "conj(T[q=0]) g0_L.  It is a one-index object, so it does not "
             "take the congruence — and the CONJUGATE is load-bearing: the "
@@ -818,7 +822,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
                 f"mu_small (the ceiling at this rcond is "
                 f"{sel.eigen_rank_pool}) or widen the window.")
     else:
-        print_fn(
+        log.info(
             "  [downfold] report_residual = false: the per-q Pythagorean "
             "error bar was NOT computed, and this run therefore has no "
             "answer to 'did the downfold work' that does not require a "
@@ -839,7 +843,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
                 parent_tensor=tensors.get("V_qmunu"),
                 mu_L=mu_L, print_fn=print_fn)
     elif parent_tables is not None:
-        print_fn(
+        log.info(
             "  [downfold/star] the selection is NOT orbit-closed, so the "
             "child has no unfold tables and the wedge-storability gate did "
             "not run.  In orbit mode this cannot happen; reaching it means "
@@ -881,7 +885,7 @@ def run_downfold(cfg, mesh_xy, *, print_fn=print) -> DownfoldResult:
 
 
 def _announce_residual(eps: dict, print_fn) -> None:
-    print_fn(
+    log.info(
         "  [downfold/residual] eps_W(q) = sqrt(1 - ||W_S||^2/||W||^2), the "
         "relative error of the DOWNFOLDED OBSERVABLE on the retained "
         "window.  It is exact, not an estimate: the fit is an orthogonal "
@@ -890,15 +894,15 @@ def _announce_residual(eps: dict, print_fn) -> None:
     for name, e in eps.items():
         finite = e[np.isfinite(e)]
         if finite.size == 0:
-            print_fn(f"  [downfold/residual] {name}: no finite value "
+            log.info(f"  [downfold/residual] {name}: no finite value "
                      f"(||W||^2 was zero at every q)")
             continue
-        print_fn(
+        log.info(
             f"  [downfold/residual] {name}: eps_W min/median/max = "
             f"{finite.min():.3e} / {np.median(finite):.3e} / "
             f"{finite.max():.3e} over {finite.size} q  "
             f"(worst at q={int(np.nanargmax(e))})")
-    print_fn(
+    log.info(
         "  [downfold/residual] q=0's absolute norms are head-dominated and "
         "should not be compared across q; the RATIO is still meaningful "
         "there because the head contaminates both norms identically.")
@@ -962,7 +966,7 @@ def _write_small_bundle(cfg, geom, small, g0_S, enk_full, psi_S, keep_idx,
                                kappa_per_q=kappa_per_q, eps=eps,
                                child_tables=child_tables)
     barrier("downfold.bundle_written")
-    print_fn(f"  [downfold] wrote {out_file}  "
+    log.info(f"  [downfold] wrote {out_file}  "
              f"(mu {sel.mu_large} -> {mu_S}, "
              f"{(sel.mu_large / max(mu_S, 1)) ** 2:.0f}x smaller per "
              f"(mu,mu) tensor)")
@@ -1110,7 +1114,7 @@ def _stamp_isdf_basis(filename, parent_table, kept_table, zeta_file, *,
     miss = [n for n, v in (("parent centroid table", parent_table),
                            ("kept centroid table", kept_table),
                            ("transported zeta_q.h5", zeta_file)) if not v]
-    print_fn(f"  [downfold] ISDF-basis provenance stamped: "
+    log.info(f"  [downfold] ISDF-basis provenance stamped: "
              f"{', '.join(have) if have else 'nothing'}"
              + (f"; MISSING {', '.join(miss)}" if miss else ""))
     barrier("downfold.isdf_basis")
@@ -1195,7 +1199,7 @@ def write_downfolded_zeta(src_restart, out_file, T, keep_idx, mu_S, n_q,
     src_zeta = os.path.join(os.path.dirname(os.path.abspath(src_restart)),
                             "zeta_q.h5")
     if not os.path.isfile(src_zeta):
-        print_fn(
+        log.info(
             f"  [downfold/zeta] the parent run has no {src_zeta} — nothing "
             f"to transport, and the small bundle carries no zeta_q.h5.  "
             f"bse.bse_jax does not read one; bse.exciton_bands --vq-mode "
@@ -1204,14 +1208,14 @@ def write_downfolded_zeta(src_restart, out_file, T, keep_idx, mu_S, n_q,
 
     hdr = read_isdf_header(src_zeta)
     if hdr.zeta_layout != "G_flat":
-        print_fn(
+        log.info(
             f"  [downfold/zeta] parent zeta_q.h5 has zeta_layout="
             f"{hdr.zeta_layout!r}, not 'G_flat'.  No reader in this tree "
             f"consumes an r-space ζ, so there is nothing a transported copy "
             f"would serve; skipped.")
         return ""
     if not bool(hdr.zeta_is_done):
-        print_fn(
+        log.info(
             "  [downfold/zeta] parent zeta_q.h5 has zeta_is_done = False — "
             "the fit did not finish, so its contents are not ζ.  Skipped; "
             "re-run the parent's ζ fit to completion.")
@@ -1238,14 +1242,14 @@ def write_downfolded_zeta(src_restart, out_file, T, keep_idx, mu_S, n_q,
             # match, but two of them would have to share one transfer row.
             # Refused here rather than as a duplicate-permutation message
             # three lines later, because the diagnosis is different.
-            print_fn(
+            log.info(
                 f"  [downfold/zeta] parent zeta_q.h5 stores {nq_disk} q "
                 f"against the bundle's {n_q} — MORE ζ than there are q in "
                 f"the restart.  The two files do not describe the same "
                 f"q set, so no ζ is transported.")
             return ""
         if nq_disk < int(n_q):
-            print_fn(
+            log.info(
                 f"  [downfold/zeta] parent zeta_q.h5 stores {nq_disk} q "
                 f"against the bundle's {n_q} — the q-IBZ WEDGE, and it "
                 f"transports.  The downfold is q-diagonal: T[q] is built "
@@ -1326,7 +1330,7 @@ def write_downfolded_zeta(src_restart, out_file, T, keep_idx, mu_S, n_q,
                         g0_chk = z_S[:, 0].copy()
             mark_zeta_done(out_zeta)
             _gate_g0_against_zeta(g0_chk, g0_host, print_fn)
-            print_fn(
+            log.info(
                 f"  [downfold/zeta] wrote {out_zeta}  (zeta_S = conj(T[q]) "
                 f"zeta_L over {nq_disk} q, mu {mu_L_file} -> {mu_S}, "
                 f"ngkmax {ngkmax}).  V rebuilt from it is T V_L T-dagger by "
@@ -1387,7 +1391,7 @@ def _zeta_q_to_restart_q(zl, kgrid, nq_disk, *, n_q=None, print_fn=print):
                 f"attach grid point i's transfer to wedge slot i and write a "
                 f"ζ of plausible, wrong numbers.  Re-fit the parent's ζ from "
                 f"a WFN whose rk labels every stored q.")
-        print_fn(
+        log.info(
             f"  [downfold/zeta] mf_header/kpoints/rk labels only "
             f"{qraw.shape[0]} of the {nq_disk} stored q (the WFN is "
             f"symmetry-reduced).  Taking the writer's full-BZ order as the "
@@ -1482,7 +1486,7 @@ def _gate_g0_against_zeta(g0_from_zeta, g0_S_host, print_fn) -> None:
     denom = max(float(np.max(np.abs(g0))), 1e-300)
     rel = float(np.max(np.abs(g0_from_zeta - g0))) / denom
     verdict = "AGREE" if rel < 1e-10 else "DISAGREE"
-    print_fn(f"  [downfold/zeta] g0 cross-check: zeta_S(q=0, G=0) vs the "
+    log.info(f"  [downfold/zeta] g0 cross-check: zeta_S(q=0, G=0) vs the "
              f"transported g0_S -> {verdict} (max rel {rel:.3e}).  Both are "
              f"conj(T[0]) applied to the same parent column.")
 
@@ -1566,7 +1570,7 @@ def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
                 f"It names the PARENT run's centroid coordinate table (the "
                 f"one its cohsex.in points centroids_file at), not the small "
                 f"basis this run is about to produce.")
-        print_fn(f"  [downfold] parent centroid table: {named} "
+        log.info(f"  [downfold] parent centroid table: {named} "
                  f"(named by parent_centroids_file).")
         return named, _isdf_fft_grid(src_restart)
 
@@ -1579,13 +1583,13 @@ def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
             hdr = read_isdf_header(src_zeta)
         except (OSError, KeyError, ValueError) as exc:      # noqa: BLE001
             hdr = None
-            print_fn(f"  [downfold] parent zeta_q.h5 has no readable "
+            log.info(f"  [downfold] parent zeta_q.h5 has no readable "
                      f"isdf_header ({type(exc).__name__}: {exc}); falling "
                      f"back to a search beside the parent bundle.")
         if hdr is not None:
             idx = np.asarray(hdr.r_mu_fft_idx, dtype=np.int64)
             if idx.shape[0] != int(mu_large):
-                print_fn(
+                log.info(
                     f"  [downfold] parent zeta_q.h5 describes "
                     f"{idx.shape[0]} centroids but the bundle holds "
                     f"{mu_large}; the two are not the same ISDF basis, so "
@@ -1593,7 +1597,7 @@ def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
             else:
                 ok, how = _verdict(idx)
                 if not ok:
-                    print_fn(
+                    log.info(
                         f"  [downfold] parent zeta_q.h5's centroid table "
                         f"{how} — the zeta beside the parent bundle was "
                         f"fitted on different points than its tensors.  Not "
@@ -1607,7 +1611,7 @@ def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
                                                    dtype=np.float64),
                                    fmt="%.12f")
                     barrier("downfold.parent_centroids")
-                    print_fn(
+                    log.info(
                         f"  [downfold] wrote {out} — the PARENT basis's "
                         f"{mu_large} centroid coordinates, taken from its own "
                         f"zeta_q.h5 isdf_header ({how}).  bse.exciton_bands "
@@ -1635,7 +1639,7 @@ def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
             continue
         if int(rows.shape[0]) != int(mu_large):
             continue
-        print_fn(
+        log.info(
             f"  [downfold] parent centroid table found beside the parent "
             f"bundle: {c}.  CHECKED ON ROW COUNT ONLY — the parent has no "
             f"zeta_q.h5, so there is no FFT grid here to turn these "
@@ -1644,7 +1648,7 @@ def resolve_parent_centroids(cfg, src_restart, mu_large, geom, out_dir, *,
             f"points would pass this check.")
         return c, None
 
-    print_fn(
+    log.info(
         f"  [downfold] no parent centroid table: parent_centroids_file is "
         f"unset, the parent has no readable zeta_q.h5 isdf_header, and no "
         f"matching centroids_frac_{mu_large}*.txt was found in "
@@ -1710,7 +1714,7 @@ def _write_centroid_subset(cfg, keep_idx, out_file, parent_table, fft_grid, *,
     if process_rank() == 0:
         np.savetxt(out, kept, fmt="%.12f")
         if fft_grid is None:
-            print_fn(
+            log.info(
                 f"  [downfold] wrote {out} ({len(keep_idx)} kept centroids) "
                 f"but stamped NO centroids_charge_md5: that hash is over the "
                 f"FFT-grid INDEX table and no FFT grid was available here "
@@ -1721,7 +1725,7 @@ def _write_centroid_subset(cfg, keep_idx, out_file, parent_table, fft_grid, *,
             md5 = _centroid_table_md5(_frac_to_fft_idx(kept, fft_grid))
             with h5py.File(out_file, "a") as f:
                 f.attrs["centroids_charge_md5"] = md5
-            print_fn(f"  [downfold] wrote {out} ({len(keep_idx)} kept "
+            log.info(f"  [downfold] wrote {out} ({len(keep_idx)} kept "
                      f"centroids, centroids_charge_md5 {md5[:12]}...) and "
                      f"stamped it on the bundle")
     barrier("downfold.centroids")

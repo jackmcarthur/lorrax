@@ -51,11 +51,14 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from jax import shard_map
 from common.collectives import device_put_process_local, gather_to_host
+from common.log import get_logger, message
 from common.wfn_transforms import (
     FULL_BLOCH_TRANSFORM_SCHEME,
     load_centroids_band_chunked,
 )
 from runtime.padding import spec_divisor
+
+log = get_logger(__name__)
 
 
 __all__ = [
@@ -737,14 +740,18 @@ def fit_galerkin_basis(
         f"{carrier - rank_phys} pad); fit {seconds:.2f} s (sampling "
         f"{t_sample:.2f} s)")
     if eps > NODE_METRIC_EPS_WARN:
-        log_fn(
-            f"  [warn] nodal metric eps {eps:.3e} > {NODE_METRIC_EPS_WARN:.0e}: "
-            "the Loewdin frame mixes window-edge states and the off-grid "
-            "error grows.  Use at least "
-            f"{NODES_PER_FITTED_BAND} x {nb} fitted bands = "
-            f"{NODES_PER_FITTED_BAND * nb} orbit-closed nodes (more ISDF "
-            f"centroids, centroid.kmeans_cli --orbit); this set has "
-            f"{requested.shape[0]}.")
+        log.warning(
+            "the nodal Loewdin frame mixes window-edge states",
+            extra=message(
+                "galerkin_nodal_metric_large",
+                found=("nodal metric eps", f"{eps:.3e}"),
+                needs=f"eps <= {NODE_METRIC_EPS_WARN:g}",
+                lines=("the off-grid interpolation error grows",
+                       f"use at least {NODES_PER_FITTED_BAND} x {nb} fitted bands = "
+                       f"{NODES_PER_FITTED_BAND * nb} orbit-closed nodes; this set "
+                       f"has {requested.shape[0]}",),
+                fix="more orbit-closed ISDF centroids: python -m centroid.kmeans_cli "
+                    "--orbit"))
     basis = GalerkinBasis(
         ctilde=ctilde,
         basis_at_nodes=_node_interp(

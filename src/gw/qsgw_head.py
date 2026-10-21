@@ -14,6 +14,10 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from jax import shard_map
 from gw.degen_average import TOL_DEGENERACY_RY
 
@@ -700,7 +704,7 @@ def load_parallel_transport_head(
         # Broken time reversal: eq. (2) is no identity and the verdict would
         # be nan, so the O(nk nb^2) mirror of v is not built for a diagnostic
         # (18.2 GiB per rank at CrI3 24x24, 750 bands, P16).
-        print(f"  sanity[{path}: v^DFT]: the measured spin density says TIME "
+        log.info(f"  sanity[{path}: v^DFT]: the measured spin density says TIME "
               f"REVERSAL IS BROKEN, so v(-k) = -conj(v(k)) is not an identity "
               f"here; the parity diagnostic is not computed.")
     return ParallelTransportHeadData(
@@ -1429,7 +1433,7 @@ def write_qsgw_dipole(path, velocity: QPVelocity, U_active, energies_qp_kn_ry,
         "note": ("QSGW velocity U^H v U between the SC final map's input QP "
                  "states (gw.qsgw_head.qp_velocity); band_energies are "
                  "their QP energies")})
-    print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} "
+    log.info(f"  QSGW dipoles: {os.path.basename(str(path))} "
              f"({int(energies.shape[0])} k x {nb} bands, QP basis, "
              f"{velocity.label})")
 
@@ -1452,7 +1456,7 @@ def stamp_qsgw_dipole_provenance(path, *, wfn_qp_path, config, wfn, meta,
     from psp.get_dipole_mtxels import dipole_provenance
 
     if int(meta.b_id_0) != 0:
-        print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} not bound "
+        log.info(f"  QSGW dipoles: {os.path.basename(str(path))} not bound "
                  f"to WFN_qp (head bands start at {int(meta.b_id_0)}, the "
                  "dipole reader indexes bands from 0)")
         return
@@ -1473,7 +1477,7 @@ def stamp_qsgw_dipole_provenance(path, *, wfn_qp_path, config, wfn, meta,
                 h5.attrs[key] = value
 
     rank0_transaction(path, stage="qsgw_dipole_provenance", write=_stamp)
-    print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} bound to "
+    log.info(f"  QSGW dipoles: {os.path.basename(str(path))} bound to "
              f"{os.path.basename(str(wfn_qp_path))} (dipole.h5 provenance "
              "stamps; a GW run on WFN_qp reads it as its dipole.h5)")
 
@@ -5043,12 +5047,12 @@ def report_trs_velocity_parity(
     detail = (f"tr-parity max|tr v(-k) + conj(tr v(k))|/max|tr v| = "
               f"{rel:.3e} (elementwise diagnostic {el:.3e})")
     if trs_measured is None:
-        print_fn(f"  sanity[{name}]: {detail} — time reversal was NOT "
+        log.debug(f"  sanity[{name}]: {detail} — time reversal was NOT "
                  f"MEASURED for this WFN, so no verdict is taken (an "
                  f"unmeasured system is not a TRS system).")
         return True
     if not bool(trs_measured):
-        print_fn(f"  sanity[{name}]: {detail} — the measured spin density "
+        log.info(f"  sanity[{name}]: {detail} — the measured spin density "
                  f"says TIME REVERSAL IS BROKEN, so v(-k) = -conj(v(k)) is "
                  f"NOT an identity here and this number is a diagnostic "
                  f"only.")
@@ -5083,5 +5087,5 @@ def report_trs_velocity_parity(
             f"benign explanation; check the window before the physics.",
             print_fn=print_fn)
         return False
-    print_fn(f"  sanity[{name}]: {detail} — parity holds.")
+    log.debug(f"  sanity[{name}]: {detail} — parity holds.")
     return True

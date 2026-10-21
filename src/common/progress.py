@@ -8,8 +8,22 @@ It emits BGW-style output:
     [ 17:50:21 | ██████░░░░ |  60% ] tau node  6 / 10 · ETA 2 s
     Finished frequency integration at 17:50:23.  Elapsed: 3 s.
 
-Milestone steps are precomputed as a static boolean mask, and
-``enabled=False`` (non-rank-0 processes) prints nothing.
+Each line is an INFO record of the ``lorrax.progress`` logger.  ``Started``,
+``Finished`` and at most :data:`MAIN_LOG_BARS` bar lines per loop carry the
+``progress`` block, so a driver session shows them in the main log
+(``common.log``): the first milestone, then one about every 10 %, and the last
+(:func:`main_log_mask`).  Within one manual stage (``common.timing``), a later
+loop with the title of an earlier one is a repeat: the main log shows only its
+``Started``, its final bar and its ``Finished``.  The other milestones are
+untagged INFO, which only the rank stream prints, so the live stream keeps
+every milestone.  Milestone
+steps are precomputed as static boolean masks, and ``enabled=False``
+(non-rank-0 processes) logs nothing.
+
+A loop that only dispatches asynchronous work (the Sigma tau sweep) passes
+``note="dispatched"``: its bar lines say ``· dispatched`` instead of an ETA,
+because the clock measures dispatch, not execution.  A milestone that did wait
+on its ``wait`` value (``LORRAX_STAGE_SYNC=1``) reports its ETA as usual.
 """
 
 from __future__ import annotations
@@ -20,8 +34,20 @@ from typing import Callable
 import jax
 import numpy as np
 
+from common.log import block, get_logger
+
 
 PrintFn = Callable[[str], None]
+
+#: The progress logger; its lines carry the ``progress`` block.
+_LOG = get_logger("progress")
+_BLOCK = block("progress")
+#: Bar lines per loop that the main log shows, first and last included.
+MAIN_LOG_BARS = 10
+
+
+def _say(text: str) -> None:
+    _LOG.info(text, extra=_BLOCK)
 
 
 def _fmt_time(t: float) -> str:
@@ -37,21 +63,59 @@ def _milestone_mask(num_steps: int, max_updates: int) -> np.ndarray:
     return mask
 
 
+def main_log_mask(milestones: np.ndarray, max_lines: int = MAIN_LOG_BARS) -> np.ndarray:
+    """The milestones the main log shows: at most ``max_lines``, the first, the last,
+    and in between the first milestone of each new 10 % bucket while room is left.
+
+    ``milestones`` is a :func:`_milestone_mask` (index = step, 1-indexed).  A pure
+    function of the loop's size, so it is precomputed like the milestones.
+    """
+    keep = np.zeros_like(milestones)
+    steps = np.flatnonzero(milestones)
+    if steps.size == 0:
+        return keep
+    num_steps = max(len(milestones) - 1, 1)
+    shown, last_bucket = 0, -1
+    for step in steps[:-1]:
+        bucket = (10 * int(step)) // num_steps
+        if shown == 0 or (bucket > last_bucket and shown < max_lines - 1):
+            keep[step] = True
+            shown += 1
+            last_bucket = bucket
+    keep[steps[-1]] = True
+    return keep
+
+
+def _repeated_loop(title: str) -> bool:
+    """Whether the open manual stage already ran a loop titled ``title``
+    (``timing.ManualStage.first_loop``); never outside a manual stage."""
+    try:
+        from common.timing import current_manual_stage
+        stage = current_manual_stage()
+        return stage is not None and not stage.first_loop(title)
+    except Exception:          # noqa: BLE001 - output never fails a run
+        return False
+
+
 def _format_progress(
     step: int, num_steps: int, elapsed: float,
-    title: str, item_name: str, bar_width: int,
+    title: str, item_name: str, bar_width: int, note: str | None = None,
 ) -> str:
     pct = int(round(100.0 * step / num_steps))
     filled = min(max(int(round(bar_width * step / num_steps)), 0), bar_width)
-    bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
-    if step >= num_steps:
-        eta = 0
+    bar = "█" * filled + "░" * (bar_width - filled)
+    if note is not None:
+        tail = str(note)
     else:
-        eta = max(0, int(round(elapsed / max(step, 1) * (num_steps - step))))
+        if step >= num_steps:
+            eta = 0
+        else:
+            eta = max(0, int(round(elapsed / max(step, 1) * (num_steps - step))))
+        tail = f"ETA {eta} s"
     digits = len(str(num_steps))
     return (
         f"[ {_fmt_time(time.time())} | {bar} | {pct:3d}% ] "
-        f"{item_name} {step:{digits}d} / {num_steps} \u00b7 ETA {eta} s"
+        f"{item_name} {step:{digits}d} / {num_steps} · {tail}"
     )
 
 
@@ -65,7 +129,7 @@ class LoopProgress:
     Usage::
 
         total_nodes = sum(w.n_tau for w in windows)
-        progress = LoopProgress(total_nodes, print_fn, title="sigma convolution")
+        progress = LoopProgress(total_nodes, title="sigma convolution")
         for win in windows:
             for t_node in win.nodes.t:
                 do_work(t_node)
@@ -74,27 +138,34 @@ class LoopProgress:
 
     Or as a context manager (calls finish() automatically)::
 
-        with LoopProgress(n, print_fn) as p:
+        with LoopProgress(n) as p:
             for i in range(n):
                 do_work(i)
                 p.step()
+
+    ``max_updates`` is the number of milestones (rank stream); the main log shows
+    at most :data:`MAIN_LOG_BARS` of them.  ``note`` replaces the ETA (``"dispatched"``
+    for a loop that times dispatch).  ``print_fn`` is accepted and unused: the
+    lines go to ``lorrax.progress``.
     """
 
     def __init__(
-        self, num_steps: int, print_fn: PrintFn, *,
+        self, num_steps: int, print_fn: PrintFn | None = None, *,
         title: str = "loop", item_name: str = "step",
         max_updates: int = 10, bar_width: int = 10,
-        enabled: bool | None = None,
+        enabled: bool | None = None, note: str | None = None,
     ):
         self.num_steps = num_steps
-        self.print_fn = print_fn
         self.title = title
         self.item_name = item_name
         self.bar_width = bar_width
+        self.note = note
         self.enabled = (jax.process_index() == 0) if enabled is None else enabled
         self._mask = _milestone_mask(num_steps, max_updates)
+        self._main = main_log_mask(self._mask)
         self._current = 0
         self._start: float | None = None
+        self._repeat = False
 
     def __enter__(self):
         return self
@@ -118,8 +189,9 @@ class LoopProgress:
         """
         if self._start is None:
             self._start = time.time()
+            self._repeat = _repeated_loop(self.title)
             if self.enabled:
-                self.print_fn(f"Started {self.title} at {_fmt_time(self._start)}.")
+                _say(f"Started {self.title} at {_fmt_time(self._start)}.")
         return self
 
     def step(self, wait=None):
@@ -143,21 +215,29 @@ class LoopProgress:
         # pass a globally sharded value even though today's Sigma caller uses
         # a local shard.  Only formatting and printing are rank-conditional
         # (INVARIANTS row 21).
+        waited = False
         if milestone and wait is not None:
             # A timing-only wait: under LORRAX_STAGE_SYNC=1 alone (common.timing.stage_sync).
             # Without it the line reports how far the loop has dispatched.
-            from common.timing import stage_wait
+            from common.timing import stage_sync, stage_wait
             stage_wait(wait)
+            waited = stage_sync()
         if self.enabled and milestone:
             elapsed = time.time() - self._start
-            self.print_fn(_format_progress(
+            line = _format_progress(
                 self._current, self.num_steps, elapsed,
-                self.title, self.item_name, self.bar_width))
+                self.title, self.item_name, self.bar_width,
+                note=None if waited else self.note)
+            if self._main[self._current] and (
+                    not self._repeat or self._current == self.num_steps):
+                _say(line)
+            else:
+                _LOG.info(line)          # untagged: the rank stream only
 
     def finish(self):
         """Print the final summary line."""
         if self._start is not None and self.enabled:
             now = time.time()
             elapsed = int(round(now - self._start))
-            self.print_fn(f"Finished {self.title} at {_fmt_time(now)}.  Elapsed: {elapsed} s.")
+            _say(f"Finished {self.title} at {_fmt_time(now)}.  Elapsed: {elapsed} s.")
         self._start = None

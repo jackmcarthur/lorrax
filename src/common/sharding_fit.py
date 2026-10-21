@@ -89,8 +89,11 @@ other assertion in that file and mean nothing).
 """
 from __future__ import annotations
 
+import logging
 from itertools import combinations
 from runtime.padding import spec_divisor
+
+_LOG = logging.getLogger("lorrax.sharding_fit")
 
 __all__ = ["legal_spec", "fit_sharding", "shard_factor"]
 
@@ -222,6 +225,7 @@ def fit_sharding(mesh, spec, shape, what: str = "", print_fn=None,
 
 
 def _rank0_print(msg):
+    """The default sink of a dropped-axis notice: a rank-0 DEBUG diagnostic."""
     try:
         import jax
 
@@ -229,4 +233,4 @@ def _rank0_print(msg):
             return
     except Exception:
         pass
-    print(msg, flush=True)
+    _LOG.debug(msg)

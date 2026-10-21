@@ -1,11 +1,11 @@
 """One production stdout stream for a driver invocation.
 
 LORRAX still contains low-level components that call :func:`print` directly
-instead of accepting the driver's ``print_fn``.  Refactoring every physics
-service merely to control presentation would create dozens of new logging
-seams.  This small runtime boundary gives a production driver one authoritative
-stdout instead: ordinary component chatter is discarded, while the driver's
-scientific reporter writes through :meth:`emit` to the original stream.
+instead of logging (``common.log``).  Until they convert, a production driver
+keeps one authoritative stdout: ordinary component chatter is discarded, while
+the driver's scientific reporter writes through :meth:`emit` to the original
+stream.  Python warnings are logging records (``runtime.run_session``), not
+this stream's concern.
 
 Exceptions, tracebacks, rank-local refusals, and C/C++ diagnostics use stderr
 and are deliberately untouched.  The distributed fail-fast hook also retains
@@ -20,14 +20,6 @@ from __future__ import annotations
 
 import os
 import sys
-import warnings
-
-
-_PRODUCTION_ONLY_WARNING_NOISE = (
-    # JAX buffer donation is an optimization hint, not a numerical or physical
-    # warning.  It remains visible in the driver's forensic debug stream.
-    "Some donated buffers were not usable",
-)
 
 
 _failure_stdout = None
@@ -55,14 +47,11 @@ def failure_output_streams():
 class ProductionStdout:
     """Route incidental stdout away from one driver's scientific output."""
 
-    def __init__(self, *, debug: bool, rank: int, warning_fn=None) -> None:
+    def __init__(self, *, debug: bool, rank: int) -> None:
         self.debug = bool(debug)
         self.rank = int(rank)
-        self.warning_fn = warning_fn
         self._console = sys.stdout
         self._sink = None
-        self._showwarning = None
-        self._warning_handler = None
         self._previous_failure_stdout = None
 
     def install(self) -> None:
@@ -74,23 +63,6 @@ class ProductionStdout:
         self._previous_failure_stdout = _failure_stdout
         _failure_stdout = self._console
         sys.stdout = self._sink
-        # Python warnings otherwise bypass stdout and repeat once per process.
-        # A driver reporter can retain them once in its final warning block;
-        # workers without a reporter stay silent.  Exceptions and native
-        # diagnostics still use stderr and are never intercepted here.
-        if self.warning_fn is not None or self.rank != 0:
-            self._showwarning = warnings.showwarning
-
-            def _route_warning(message, category, filename, lineno,
-                               file=None, line=None):
-                if any(fragment in str(message)
-                       for fragment in _PRODUCTION_ONLY_WARNING_NOISE):
-                    return
-                if self.rank == 0 and self.warning_fn is not None:
-                    self.warning_fn(f"{category.__name__}: {message}")
-
-            self._warning_handler = _route_warning
-            warnings.showwarning = self._warning_handler
 
     def emit(self, text: str = "", *, end: str = "\n") -> None:
         """Write scientific output once, from process zero."""
@@ -106,11 +78,6 @@ class ProductionStdout:
             sys.stdout = self._console
         self._sink.close()
         self._sink = None
-        if (self._warning_handler is not None
-                and warnings.showwarning is self._warning_handler):
-            warnings.showwarning = self._showwarning
-        self._showwarning = None
-        self._warning_handler = None
         if _failure_stdout is self._console:
             _failure_stdout = self._previous_failure_stdout
         self._previous_failure_stdout = None

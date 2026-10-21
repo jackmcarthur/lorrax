@@ -65,6 +65,10 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from lxkit import ordered_psum
 
 from common.units import RYD_TO_EV
+from common.log import get_logger, message
+
+log = get_logger(__name__)
+
 from gw.cd import chi0_rules as cd_rules
 from gw.cd import laws
 from gw.cd.rule import tan_mapped_gauss_rule
@@ -90,7 +94,8 @@ CD_RECIPE = dict(version="cd_production_v3", laws="ordered_cd TRREF / Run211 jet
 
 
 def _say(print_fn, started, msg):
-    print_fn(f"  CD +{time.monotonic() - started:7.1f}s {msg}")
+    """One CD progress line (INFO); ``print_fn`` is accepted and unused."""
+    log.info(f"  CD +{time.monotonic() - started:7.1f}s {msg}")
 
 
 #: Sigma_x identity tolerance (``GATE cd_sigma_x_identity``), meV.  The CD pair densities and V_q reproduce
@@ -1145,8 +1150,10 @@ class CdCheckpoint:
                                       schema=CD_SCHEMA, discard=False, cubes=False)
         if found[0] is None:
             if found[1] != "absent":
-                self.print_fn(f"  WARNING CD resume: {self.path} does not continue this run ({found[1]}); "
-                              "starting at chunk 0 (this run's first checkpoint replaces the file)")
+                log.warning(f"CD resume: {self.path} does not continue this run; "
+                            "starting at chunk 0 (this run's first checkpoint replaces the file)",
+                            extra=message("cd_resume_mismatch",
+                                          found=("checkpoint", str(found[1]))))
             return None
         _, host, state, commit = found
         accs = {k: replicate_to_mesh(np.asarray(v), self.mesh) for k, v in state["accs"].items()}
@@ -1835,7 +1842,7 @@ def cd_on_shell_body(body, request, mesh_xy, *, dE_ev=None, print_fn=print):
         return jnp.stack([at_m, at_n])
     pair = jax.jit(cd_on_shell_pair, out_shardings=spec)(
         cube, replicate_to_mesh(idx[request.slot("pair")].astype(np.int32), mesh_xy))
-    print_fn(f"  CD on shell: {n_table} table(s) {tuple(request.names)} read at {n_e} CD frequencies (max lookup "
+    log.info(f"  CD on shell: {n_table} table(s) {tuple(request.names)} read at {n_e} CD frequencies (max lookup "
              f"{dev:.1e} Ry); dSigma/domega by +-{dE * float(RYD_TO_EV):g} eV central difference on them "
              f"({int(clamped.sum())} of {clamped.size} states clamped at the sampled range)")
     return dataclasses.replace(body, sigma_c_kij=OnShellSigma(pair=pair, slots=slots, request=request,

@@ -1,5 +1,49 @@
+"""Stage clocks, the TIMING tree, and the main log's stage banners.
+
+MANUAL STAGES (the ``[i/N]`` banners of a driver's main log)::
+
+    from common import timing
+    from common.log import block, get_logger
+    log = get_logger(__name__)
+
+    with timing.manual_stage(1, 4, "ISDF basis and Coulomb metric",
+                             name="ISDF basis + wavefunctions") as st:
+        ...                                  # the stage's work, unchanged
+        log.info("route G, 1 batch of 6 centroids", extra=block("detail", label="zeta plan"))
+        st.result("zeta and V(q) on 6 centroids, 9 q")
+
+prints, in the main log and on the rank stream::
+
+    [1/4] ISDF basis and Coulomb metric                                    14:44:29
+          zeta plan      route G, 1 batch of 6 centroids
+          => zeta and V(q) on 6 centroids, 9 q                        2.4 s · 0.13 GB
+
+(the clock and the ``wall · peak`` end at column 100).  The manual stage IS a
+:func:`section`: ``name`` (default ``title``) is its TIMING-tree node, so pass
+the name of the top-level section it replaces and the TIMING table keeps its
+rows.  ``announce=True`` (default) gives it the 60 s heartbeat, a row under
+the stage: ``      .. still running, 60 s`` (a nested announced section that
+speaks names itself: ``      .. SC W response still running, 2 min 00 s``).
+Every section opened inside it is nested, so its ``->``/``<-`` traces are
+DEBUG.  Within one manual stage, a second and later ``LoopProgress`` loop with
+the same title prints only ``Started``, its final bar and ``Finished`` in the
+main log (:meth:`ManualStage.first_loop`; the rank stream keeps every bar).  The ``=>`` line's device peak is the high-water the
+section's ``lxkit.memory`` tracker read at the stage's own boundaries (no extra
+read, no sync); it is left out when nothing was read.  A stage that raises
+prints its ``[EXC]`` exit line instead of the ``=>`` line.  Stage rows are
+``log.info(value, extra=block(<name>, label=<key>))``
+(``report_blocks.stage_detail``: indent 6, key padded to 15).
+
+Top-level sections that are not manual stages print their ``->``/``<-`` lines
+at INFO while :data:`PLAIN_STAGE_TRACES_IN_MAIN_LOG` is true, DEBUG otherwise
+(the default: every production driver opens manual stages); that constant is
+the one switch.  The TIMING table reads the section records, not these lines.
+``report(...)`` timing tables are DEBUG.
+"""
+
 from __future__ import annotations
 
+import logging
 import os
 import resource
 import sys
@@ -9,6 +53,8 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Callable
+
+from common.log import block, get_logger
 
 # ---------------------------------------------------------------------------
 # STAGE CADENCE (scorecard AI; the observability gap AC.2 / AC.3c / AF.4c
@@ -38,7 +84,12 @@ from typing import Any, Callable
 # every 60 seconds until the section and its registered async watchers finish.
 # It proves that the Python scope is alive, not that a GPU counter advanced.
 # Same formatting path, same rank-0 gate, no depth cap — ONE cadence mechanism,
-# not two.  Driver-owned announced sections begin after runtime/bootstrap; raw
+# not two.  The lines are ``lorrax.stage`` log records (``common.log``) at the
+# level :func:`_trace_level` gives: an outermost plain section's at INFO (the
+# main log) under ``PLAIN_STAGE_TRACES_IN_MAIN_LOG``, a nested one's, a worker
+# thread's and a manual stage's own at DEBUG; heartbeats and ``[EXC]`` exits
+# stay INFO at any depth.
+# Driver-owned announced sections begin after runtime/bootstrap; raw
 # process forks after runtime startup are unsupported throughout LORRAX.
 # ---------------------------------------------------------------------------
 # The knob is read at USE time, not import time: common.timing is
@@ -47,6 +98,13 @@ from typing import Any, Callable
 _TRACE_RANK0: bool | None = None
 _TRACE_DEPTH = 3
 _ANNOUNCED_HEARTBEAT_SECONDS = 60.0
+
+#: Whether a top-level section that is not a manual stage prints its ``->`` /
+#: ``<-`` lines in the main log (INFO) rather than at DEBUG.  False: every
+#: production driver opens its stages with :func:`manual_stage`, so a plain
+#: top-level trace is a substep between banners.  The one switch:
+#: :func:`_trace_level` is its only reader.
+PLAIN_STAGE_TRACES_IN_MAIN_LOG = False
 
 
 def _trace_flag() -> bool:
@@ -109,29 +167,51 @@ def _trace_enabled(depth: int) -> bool:
     return _rank0()
 
 
-_TRACE_SINK = None
+def set_memory_sink(sink=None) -> None:
+    """Route ``lxkit.memory``'s receipt and banner lines through a driver's report.
 
-
-def set_trace_sink(sink=None) -> None:
-    """Route stage cadence through the active driver's scientific report."""
-    global _TRACE_SINK
-    _TRACE_SINK = sink
+    Stage cadence needs no sink: it is the ``lorrax.stage`` logger, which a
+    driver session shows in the main log (``common.log``).
+    """
     from lxkit import memory
     memory.set_sink(sink)
 
 
-def _trace(msg: str) -> None:
-    text = f"[stage {time.strftime('%H:%M:%S')}] {msg}"
-    if _TRACE_SINK is None:
-        print(text, flush=True)
-    else:
-        _TRACE_SINK(text)
+#: The stage-cadence logger; its lines carry the ``stage`` block.
+_STAGE_LOG = get_logger("stage")
+_STAGE_BLOCK = block("stage")
 
 
-def _safe_trace(msg: str) -> None:
+def _trace_level(*, depth: int, manual: bool = False, failed: bool = False) -> int:
+    """The level of a section's ``->`` / ``<-`` line: the one place that decides.
+
+    * an exit by exception (``[EXC]``) is INFO at any depth: the raising rank's
+      record of the cause, and a harness failure signature;
+    * a trace inside another timed section (``depth > 0``) is a substep of the
+      stage whose banner the main log already shows: DEBUG.  So is any section
+      entered off the main thread: a worker's stack starts empty, so its depth
+      says nothing about the stage it serves (this was the one way a substep
+      could still reach the main log at INFO);
+    * a manual stage's own ``->`` / ``<-`` lines are DEBUG: its ``[i/N]`` banner
+      and ``=>`` line replace them;
+    * any other top-level section: INFO while :data:`PLAIN_STAGE_TRACES_IN_MAIN_LOG`.
+    """
+    if failed:
+        return logging.INFO
+    if depth > 0 or manual or threading.current_thread() is not threading.main_thread():
+        return logging.DEBUG
+    return logging.INFO if PLAIN_STAGE_TRACES_IN_MAIN_LOG else logging.DEBUG
+
+
+def _trace(msg: str, *, level: int = logging.INFO) -> None:
+    """One ``[stage hh:mm:ss]`` line at ``level`` (:func:`_trace_level`)."""
+    _STAGE_LOG.log(level, f"[stage {time.strftime('%H:%M:%S')}] {msg}", extra=_STAGE_BLOCK)
+
+
+def _safe_trace(msg: str, *, level: int = logging.INFO) -> None:
 	"""Best-effort cadence output that can never replace numerical errors."""
 	try:
-		_trace(msg)
+		_trace(msg, level=level)
 	except Exception:
 		# Closed stdout/captures and diagnostic formatting bugs are not a
 		# reason to abort a calculation or mask a body/watcher exception.
@@ -234,11 +314,12 @@ class TimingNode:
 
 class TimingSection:
 	__slots__ = ("collector", "node", "stack", "start", "child_elapsed",
-	             "_watchers", "announce", "label", "tracker", "host_rise")
+	             "_watchers", "announce", "label", "tracker", "host_rise",
+	             "manual", "elapsed", "peak_whole")
 
 	def __init__(self, collector: "TimingCollector", node: TimingNode,
 	             stack: list["TimingSection"], *, announce: bool = False,
-	             label: str | None = None):
+	             label: str | None = None, manual: bool = False):
 		self.collector = collector
 		self.node = node
 		self.stack = stack
@@ -253,13 +334,19 @@ class TimingSection:
 		self.label = label
 		self.tracker = None
 		self.host_rise = 0
+		# A manual stage (``manual_stage``): its banner and ``=>`` line replace
+		# the ``->`` / ``<-`` lines.  ``elapsed`` and ``peak_whole`` (bytes, -1:
+		# not read) are this call's wall and device high-water, for the ``=>`` line.
+		self.manual = manual
+		self.elapsed = 0.0
+		self.peak_whole = -1
 
 	def _display_name(self) -> str:
 		return self.label if self.label else self.node.name
 
 	def _cadence_on(self) -> bool:
 		return (_trace_enabled(len(self.stack))
-		        or (self.announce and _rank0()))
+		        or ((self.announce or self.manual) and _rank0()))
 
 	def __enter__(self) -> "TimingSection":
 		# Outside the collector lock: a priced stage's entry wait must not stall heartbeats.
@@ -287,6 +374,7 @@ class TimingSection:
 		finally:
 			from lxkit import memory
 			whole, own, _ = memory.close_tracker(self.tracker)
+			self.peak_whole = whole
 			if whole >= 0:
 				self.node.peak = max(self.node.peak, whole)
 			if own >= 0:
@@ -320,6 +408,21 @@ class TimingSection:
 		if isinstance(value, (list, tuple, set)):
 			for item in value:
 				self._collect_watchers(item)
+
+
+#: Where ``report`` tables go by default: DEBUG lines of ``lorrax.timing``.
+_TABLE_LOG = get_logger("timing")
+
+
+def _table_sink(print_fn: Callable[[str], Any] | None) -> Callable[[str], Any]:
+	"""``report``'s line sink: DEBUG for the default and for a logger's INFO method."""
+	if print_fn is None:
+		return _TABLE_LOG.debug
+	owner = getattr(print_fn, "__self__", None)
+	if (isinstance(owner, (logging.Logger, logging.LoggerAdapter))
+	        and getattr(print_fn, "__name__", "") == "info"):
+		return owner.debug
+	return print_fn
 
 
 class TimingCollector:
@@ -368,10 +471,9 @@ class TimingCollector:
 					speakers.append((index, section))
 				for index, section in sorted(
 						speakers, key=lambda item: (id(item[1].stack), item[0])):
-					_safe_trace(
-						"  " * index
-						+ f".. {section._display_name()} still running; "
-						+ f"elapsed={now - section.start:.1f} s")
+					_say_stage(heartbeat_line(
+						None if section.manual else section._display_name(),
+						now - section.start), heartbeat=True)
 
 	def _ensure_heartbeat_thread_locked(self) -> None:
 		thread = self._heartbeat_thread
@@ -394,7 +496,9 @@ class TimingCollector:
 			try:
 				if section._cadence_on():
 					_safe_trace("  " * (len(section.stack) - 1)
-					            + f"-> {section._display_name()}")
+					            + f"-> {section._display_name()}",
+					            level=_trace_level(depth=len(section.stack) - 1,
+					                               manual=section.manual))
 				host = _host_high_water()
 				if host is not None and len(section.stack) > 1:
 					section.stack[-2].host_rise += host[1]
@@ -428,6 +532,7 @@ class TimingCollector:
 			self._heartbeat_sections.pop(section, None)
 			self._active_sections.discard(section)
 			section.node.record(inclusive, max(0.0, exclusive))
+			section.elapsed = inclusive
 			host = _host_high_water()
 			if host is not None:
 				section.node.host = max(section.node.host, host[0])
@@ -439,9 +544,13 @@ class TimingCollector:
 			# State is already clean if the ordinary foreground print sink fails.
 			# Holding the same lock as the scheduler preserves exit ordering.
 			if cadence:
+				# A line naming an exception is never nested away: it is the
+				# raising rank's record of the cause (and a harness signature).
 				_safe_trace("  " * depth
 				            + f"<- {section._display_name()}  {inclusive:.1f} s"
-				            + (f"  [EXC] {_exc_text(error)}" if failed else ""))
+				            + (f"  [EXC] {_exc_text(error)}" if failed else ""),
+				            level=_trace_level(depth=depth, manual=section.manual,
+				                               failed=failed))
 
 	def reset(self) -> None:
 		stack = getattr(self._local, "stack", None)
@@ -464,12 +573,13 @@ class TimingCollector:
 		return stack
 
 	def section(self, name: str, *, announce: bool = False,
-	            label: str | None = None) -> TimingSection:
+	            label: str | None = None, manual: bool = False) -> TimingSection:
 		stack = self._stack()
 		with self._lock:
 			parent = stack[-1].node if stack else self._root
 			node = parent.child(name)
-		return TimingSection(self, node, stack, announce=announce, label=label)
+		return TimingSection(self, node, stack, announce=announce, label=label,
+		                     manual=manual)
 
 	def timed(self, name: str | None = None, *, watch: bool = False) -> Callable:
 		def decorator(func: Callable) -> Callable:
@@ -541,13 +651,19 @@ class TimingCollector:
 	def report(
 		self,
 		*,
-		print_fn: Callable[[str], Any] = print,
+		print_fn: Callable[[str], Any] | None = None,
 		title: str = "--- Timing (seconds) ---",
 		min_percent: float | None = None,
 		max_depth: int | None = None,
 		wall: float | None = None,
 	) -> None:
 		"""Print the accumulated tree.
+
+		The table is a diagnostic (the main log's TIMING block is the report),
+		so its lines are DEBUG (:func:`_table_sink`): the default ``print_fn``
+		logs them at DEBUG on ``lorrax.timing``, and a logger's ``info`` passed
+		as ``print_fn`` is used at DEBUG.  Any other callable (a list's
+		``append``, a report's sink) receives the lines as given.
 
 		``wall`` — the driver's own end-to-end wall clock, in seconds.
 		When given, two extra rows close the table:
@@ -564,6 +680,7 @@ class TimingCollector:
 		(job 7882533).  A table that always sums to the wall makes the
 		gap a number instead of a question.
 		"""
+		print_fn = _table_sink(print_fn)
 		total, rows = self._rows(min_percent, max_depth)
 		if not rows:
 			print_fn(f"{title} (no data)")
@@ -701,6 +818,152 @@ def section(name: str, *, announce: bool = False,
 	return _GLOBAL_COLLECTOR.section(name, announce=announce, label=label)
 
 
+class ManualStage:
+	"""The handle :func:`manual_stage` yields: the ``=>`` text and the section."""
+
+	__slots__ = ("index", "total", "title", "section", "text", "_loops")
+
+	def __init__(self, index: int, total: int, title: str) -> None:
+		self.index = int(index)
+		self.total = int(total)
+		self.title = str(title)
+		self.section: TimingSection | None = None
+		self.text: str | None = None
+		self._loops: set[str] = set()
+
+	def first_loop(self, title: str) -> bool:
+		"""Whether a progress loop titled ``title`` is this stage's first one (and
+		note it): a later loop of the same title prints only ``Started``, its
+		final bar and ``Finished`` in the main log (``common.progress``)."""
+		first = str(title) not in self._loops
+		self._loops.add(str(title))
+		return first
+
+	def result(self, text: str) -> None:
+		"""The closing ``=>`` line's text (the last call wins; none: ``done``)."""
+		self.text = str(text)
+
+	def watch(self, *values: Any) -> None:
+		"""The section's watchers (they wait only under ``LORRAX_STAGE_SYNC=1``)."""
+		if self.section is not None:
+			self.section.watch(*values)
+
+
+#: Line width of the main log (``report_blocks.WIDTH``) and the indent of a
+#: stage's rows (``report_blocks.DETAIL_INDENT``).
+STAGE_WIDTH = 100
+STAGE_INDENT = 6
+
+
+def fmt_wall(seconds: float) -> str:
+	"""A wall time: ``78.5 s`` below 100 s, ``18 min 39 s`` below an hour, else
+	``1 h 02 min`` (re-exported as ``report_blocks.fmt_wall``)."""
+	seconds = max(float(seconds), 0.0)
+	if round(seconds, 1) < 100.0:
+		return f"{seconds:.1f} s"
+	whole = int(round(seconds))
+	if whole < 3600:
+		return f"{whole // 60} min {whole % 60:02d} s"
+	minutes = int(round(seconds / 60.0))
+	return f"{minutes // 60} h {minutes % 60:02d} min"
+
+
+def _right_align(left: str, right: str) -> str:
+	"""``left`` with ``right`` ending at column 100 (two spaces at least)."""
+	return left + " " * max(STAGE_WIDTH - len(left) - len(right), 2) + right
+
+
+def stage_banner(index: int, total: int, title: str, clock: str) -> str:
+	"""A manual stage's opening line: ``[i/N] title``, the clock ending at column 100."""
+	return _right_align(f"[{int(index)}/{int(total)}] {title}", str(clock))
+
+
+def stage_result(text: str, *, wall_s: float, device_gb: float | None = None) -> str:
+	"""A manual stage's closing line: ``=> text`` at the row indent, then
+	``<wall> · <device peak> GB`` ending at column 100; the wall alone when no
+	device peak was measured."""
+	right = fmt_wall(wall_s) + (f" · {float(device_gb):.2f} GB"
+	                           if device_gb is not None else "")
+	return _right_align(" " * STAGE_INDENT + "=> " + str(text), right)
+
+
+def heartbeat_line(name: str | None, elapsed_s: float) -> str:
+	"""The 60 s heartbeat, a row under the stage: ``.. still running, 60 s``.
+
+	``name`` is the speaking section's label when it is not the manual stage
+	itself (``.. SC W response still running, 2 min 00 s``).  Whole seconds
+	below 100 s, else :func:`fmt_wall`.
+	"""
+	seconds = max(float(elapsed_s), 0.0)
+	wall = f"{int(round(seconds))} s" if round(seconds) < 100 else fmt_wall(seconds)
+	who = f"{name} " if name else ""
+	return " " * STAGE_INDENT + f".. {who}still running, {wall}"
+
+
+#: The manual stages open now, outermost first (``manual_stage``).
+_OPEN_MANUAL: list[ManualStage] = []
+
+
+def current_manual_stage() -> ManualStage | None:
+	"""The innermost open manual stage, or ``None`` between stages."""
+	return _OPEN_MANUAL[-1] if _OPEN_MANUAL else None
+
+
+def current_stage_label() -> str | None:
+	"""The label of this thread's outermost open section when it is a stage (a
+	manual stage or an announced section), else ``None``: where a message that
+	happens now belongs, for the WARNINGS summary."""
+	stack = _GLOBAL_COLLECTOR._stack()
+	if stack and (stack[0].manual or stack[0].announce):
+		return stack[0]._display_name()
+	return None
+
+
+def _say_stage(text: str, **fields: Any) -> None:
+	"""One manual-stage line: INFO on ``lorrax.stage``, block ``stage``, every rank."""
+	try:
+		_STAGE_LOG.info(text, extra={"lorrax": {"block": "stage", **fields}})
+	except Exception:          # noqa: BLE001 - output never fails a run
+		pass
+
+
+@contextmanager
+def manual_stage(index: int, total: int, title: str, *, name: str | None = None,
+                 announce: bool = True):
+	"""Open the ``[index/total] title`` stage of a driver's main log (module docstring).
+
+	A :func:`section` named ``name`` (default ``title``) with the banner before
+	it and, on a normal exit, the ``=>`` result line after it, carrying this
+	call's wall and, when this rank's memory tracker read one, its device peak.
+	"""
+	stage = ManualStage(index, total, title)
+	try:
+		banner = stage_banner(index, total, title, time.strftime("%H:%M:%S"))
+	except Exception:          # noqa: BLE001 - output never fails a run
+		banner = f"[{index}/{total}] {title}"
+	_say_stage(banner, stage_index=stage.index, stage_total=stage.total,
+	           stage_title=stage.title)
+	sec = _GLOBAL_COLLECTOR.section(name or str(title), announce=announce,
+	                                label=str(title), manual=True)
+	_OPEN_MANUAL.append(stage)
+	try:
+		with sec:
+			stage.section = sec
+			yield stage
+	finally:
+		for i in range(len(_OPEN_MANUAL) - 1, -1, -1):
+			if _OPEN_MANUAL[i] is stage:
+				del _OPEN_MANUAL[i]
+				break
+	try:
+		peak = sec.peak_whole
+		line = stage_result(stage.text or "done", wall_s=sec.elapsed,
+		                    device_gb=peak / 1e9 if peak >= 0 else None)
+	except Exception:          # noqa: BLE001 - output never fails a run
+		return
+	_say_stage(line, stage_index=stage.index, stage_result=True)
+
+
 def timed(name: str | None = None, *, watch: bool = False) -> Callable:
 	return _GLOBAL_COLLECTOR.timed(name, watch=watch)
 
@@ -765,7 +1028,7 @@ def process_elapsed_s() -> float | None:
 
 def report(
 	*,
-	print_fn: Callable[[str], Any] = print,
+	print_fn: Callable[[str], Any] | None = None,
 	title: str = "--- Timing (seconds) ---",
 	min_percent: float | None = None,
 	max_depth: int | None = None,

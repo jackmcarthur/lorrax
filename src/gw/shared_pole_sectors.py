@@ -12,6 +12,10 @@ from functools import lru_cache
 import jax.numpy as jnp
 from gw.shared_pole_pencil import (_matrix_layout, _matrix_take_columns, tile_adjoint,
                                    tile_block, tile_join)
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 def _contiguous_q_spans(ids, real):
@@ -265,7 +269,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output, print_fn=prin
                            for name,r in (('TT',sectors[1]['staged']),('CC',sectors[0]['staged']),('CT',cross['staged'])))
             if line!=staged_line:
                 staged_line=line
-                print_fn(f"Shared-pole sector constructor: round of parents {ids[0]}..{ids[real-1]}: {line}")
+                log.debug(f"Shared-pole sector constructor: round of parents {ids[0]}..{ids[real-1]}: {line}")
         else:
             sectors=[];retained=[]
             for family,name in enumerate(('CC','TT')):

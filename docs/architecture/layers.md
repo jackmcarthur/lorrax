@@ -105,8 +105,9 @@ Two rules follow, and both are enforced:
 production_stream, run_session, xla_memory, jax_support, pjrt_log_filter,
 source_closure, network_env, env_flags}`, plus `common/grouped_layout.py`.
 `runtime.run_session.RunSession` is the one driver session: it opens the
-driver's report, owns stdout, resets timing, splits the pre-`main` span,
-closes the report as REFUSED on a raised refusal, and prints the file table.
+driver's report, owns stdout and the logging handlers (`RunStreams`), resets
+timing, splits the pre-`main` span, closes the report as ERROR on a raised
+refusal, and prints the file table.
 `runtime.initialize_communicator_stack()` is the single startup entry point.
 In order it installs the fail-fast excepthook, seals the source closure, sets
 the environment before jax reads it, selects the CPU-collectives transport,
@@ -133,7 +134,9 @@ k-convolution router's factories re-exported from `ffi.fft`
 the `shard_map`-interior `local_*fftn3` aliases.
 
 **jax glue and instrumentation**: `common/{jax_compile_cache, jax_profile,
-timing, progress, gpu_utils, async_io, sanity}.py`. `shard_map` is
+timing, progress, log, gpu_utils, async_io, sanity}.py`; `common/log.py` holds
+the `lorrax` loggers and the handlers a driver session installs, and reaches a
+report only through callables it is handed. `shard_map` is
 `jax.shard_map` and loop-carry marking `lxkit.mark_varying` (jax is
 pinned to 0.9; no version shim).
 

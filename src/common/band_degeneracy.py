@@ -83,6 +83,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from common.log import get_logger, message
+
+_LOG = get_logger(__name__)
+
 #: Ry per eV — the one conversion this module needs.
 _EV_PER_RY = 13.6056980659
 
@@ -287,7 +291,7 @@ def resolve_band_window(
     tol_ry: float = DEGENERACY_TOL_RY,
     mode: str = DEFAULT_MODE,
     where: str = "band window",
-    log=print,
+    log=None,               # accepted for callers; warnings go to logging
 ) -> tuple[int, int]:
     """Return ``(n_val, n_cond)`` whose window boundaries split no multiplet.
 
@@ -426,23 +430,32 @@ def resolve_band_window(
                    f"window counts.  --band-degeneracy off proceeds on a cut "
                    f"multiplet deliberately.")
         raise BandWindowDegeneracyError(f"{head}\n{body}\n{fix}")
-    log(f"*** {head}")
-    for f in findings:
-        log(f"***   - {f}")
     if (n_val_new, n_cond_new) != (n_val, n_cond):
-        log(f"*** SNAPPED OUTWARD to n_val={n_val_new} n_cond={n_cond_new} "
-            f"(bands [{lo_new}, {hi_new}) of {nb}).  The BSE problem is now "
-            f"{n_val_new * n_cond_new} pairs per k instead of "
-            f"{n_val * n_cond} — this is NOT the calculation you asked for, "
-            f"and you are seeing it because --band-degeneracy snap was passed "
-            f"explicitly.  The default (strict) refuses here; off keeps the "
-            f"requested counts. ***")
+        _LOG.warning(
+            f"{where}: band window widened to keep multiplets whole",
+            extra=message(
+                "band_window_snapped",
+                found=("requested", f"n_val={n_val} n_cond={n_cond} "
+                                    f"(bands [{lo}, {hi}) of {nb})"),
+                needs=f"n_val={n_val_new} n_cond={n_cond_new} (bands "
+                      f"[{lo_new}, {hi_new})): {n_val_new * n_cond_new} pairs "
+                      f"per k instead of {n_val * n_cond}",
+                lines=tuple(findings),
+                fix="this is not the calculation asked for; the default "
+                    "--band-degeneracy strict refuses here, off keeps the "
+                    "requested counts"))
     else:
         # Everything found was un-snappable (the midline, or a multiplet that
-        # runs off the end).  Printing "SNAPPED to the same numbers" here
-        # would read as a repair that did not happen.
-        log(f"*** NOT SNAPPED: n_val={n_val} n_cond={n_cond} kept — nothing "
-            f"above can be repaired by widening the window. ***")
+        # runs off the end): saying "snapped to the same numbers" would read
+        # as a repair that did not happen.
+        _LOG.warning(
+            f"{where}: band window cuts a multiplet and cannot be widened",
+            extra=message(
+                "band_window_not_snapped",
+                found=("kept", f"n_val={n_val} n_cond={n_cond} "
+                               f"(bands [{lo}, {hi}) of {nb})"),
+                lines=tuple(findings),
+                fix="more bands (nband) above the window, or the right n_occ"))
     return n_val_new, n_cond_new
 
 
@@ -454,7 +467,7 @@ def check_band_window(
     tol_ry: float = DEGENERACY_TOL_RY,
     mode: str = DEFAULT_MODE,
     where: str = "band window",
-    log=print,
+    log=None,               # accepted for callers; warnings go to logging
 ) -> None:
     """Report-only twin of :func:`resolve_band_window` for a fixed window.
 
@@ -495,4 +508,11 @@ def check_band_window(
            f".  Tolerance {float(tol_ry) * 1e3 * _EV_PER_RY:.3f} meV.")
     if mode == "strict":
         raise BandWindowDegeneracyError(msg)
-    log(f"*** {msg} ***")
+    _LOG.warning(
+        f"{where}: window [{b_min}, {b_max}) cuts a degenerate multiplet",
+        extra=message(
+            "band_window_cuts_multiplet",
+            found=("boundaries", "; ".join(bad)),
+            needs=f"gaps above {float(tol_ry) * 1e3 * _EV_PER_RY:.3f} meV",
+            fix="let the caller's window resolution snap it, or widen the "
+                "input's band count"))

@@ -18,6 +18,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import (
     all_gather_processes, barrier, rank0_transaction,
 )
+from common.log import get_logger
 from .commit_state import set_commit_state
 import common.timing as timing
 from runtime.padding import (
@@ -29,6 +30,8 @@ from runtime.padding import (
     padded_mu_axis,
 )
 
+
+log = get_logger(__name__)
 
 RESTART_LOGICAL_SHAPE_ATTR = "restart_logical_shape"
 RESTART_CARRIER_SHAPE_ATTR = "restart_carrier_shape"
@@ -478,10 +481,9 @@ def _log_restart_write(name, shape, dtype, dt) -> None:
     if not _restart_write_log_on():
         return
     nb = int(np.prod(shape)) * int(np.dtype(dtype).itemsize)
-    print(f"  [restart_write] {name} {tuple(int(v) for v in shape)}"
-          f" {nb / 1e9:.2f} GB QUEUED in {dt:.1f} s"
-          f" (transfer time and rate: see the SlabIO.close drain line)",
-          flush=True)
+    log.debug(f"  [restart_write] {name} {tuple(int(v) for v in shape)}"
+              f" {nb / 1e9:.2f} GB QUEUED in {dt:.1f} s"
+              f" (transfer time and rate: see the SlabIO.close drain line)")
 
 
 # ---------------------------------------------------------------------------
@@ -1029,10 +1031,9 @@ def write_restart_state_to_h5(
                 # jump by the full tensor size, which reads exactly like
                 # progress and is not (AC.3b).
                 _nb = int(np.prod(v_shape)) * int(np.dtype(v_dtype).itemsize)
-                print(f"  [restart_write] W0_qmunu placeholder ALLOCATED "
-                      f"{tuple(int(v) for v in v_shape)} {_nb / 1e9:.2f} GB "
-                      f"in {time.time() - _t0:.1f} s (no data written)",
-                      flush=True)
+                log.debug(f"  [restart_write] W0_qmunu placeholder ALLOCATED "
+                          f"{tuple(int(v) for v in v_shape)} {_nb / 1e9:.2f} GB "
+                          f"in {time.time() - _t0:.1f} s (no data written)")
 
     # bse_io.py reads W0_ready as an HDF5 attr on the W0_qmunu dataset.
     # Set it rank-0-only after SlabIO has released the file, to stay

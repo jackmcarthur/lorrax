@@ -37,7 +37,7 @@ _REPO = os.path.dirname(os.path.dirname(_HERE))
 sys.path.insert(0, os.path.join(_REPO, "src"))
 
 SECTIONS = ("PROVENANCE", "RESOLVED DECK", "SYSTEM", "SELF-ENERGY MODEL",
-            "INTEGRATOR AND STABILITY GATE", "PROGRESS", "SUMMARY", "MAJOR-STAGE TIMING",
+            "INTEGRATOR AND STABILITY GATE", "PROGRESS", "SUMMARY", "TIMING",
             "OUTPUT FILES AND INPUTS")
 CHUNK = re.compile(r"^  samples +(\d+)- *(\d+)  t = +([0-9.]+) as  wall +([0-9.]+) s$")
 NATIVE_MISSING = ("Could not locate liblorrax_ffi", "FfiLibraryNotBuilt")
@@ -149,7 +149,7 @@ def problems(log, stdout, *, completed=True):
                 or abs(r["t_fs"] - float(m.group(3)) / 1000.0) > 6e-5
                 or abs(r["wall_s"] - float(m.group(4))) > 0.011):
             out.append(f"row {r} does not carry chunk line {m.group(0)!r}")
-    for marker in ("RESOLVED DECK", "PROVENANCE", "dPur/Pur", "MAJOR-STAGE TIMING"):
+    for marker in ("RESOLVED DECK", "PROVENANCE", "dPur/Pur", "TIMING" + chr(10) + "------"):
         if marker in stdout:
             out.append(f"log-only text {marker!r} on stdout")
     return out

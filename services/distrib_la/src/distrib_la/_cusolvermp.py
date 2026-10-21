@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import logging
 import threading
 from dataclasses import dataclass
 from functools import partial
@@ -33,6 +34,9 @@ from distrib_la._cyclic import cyclic_to_block, largest_divisor, pad_with_sentin
 from distrib_la._shape import ipiv_local_len
 from jax import shard_map
 from distrib_la.resolve import mesh_key
+
+#: ``distrib_la`` is independently installable: it logs on the ``lorrax.`` namespace directly.
+_LOG = logging.getLogger("lorrax.distrib_la")
 
 __all__ = [
     "CusolverMpBatchedLowerL",
@@ -283,8 +287,8 @@ def _announce_lu(kind, mesh, nq, n, nrhs, mb_a, nb_a, mb_b=None, nb_b=None):
            f"; B {n}x{nrhs} mb_b {mb_b} nb_b {nb_b}, {(nrhs // Py) // max(1, nb_b)} RHS block(s) per rank "
            "(getrs chunks them within the room posted for the solve, else 2 GiB)")
     relabel = "relabeled block-cyclic" if (mb_a, nb_a) != (n // Px, n // Py) else "one tile per rank"
-    print(f"  [distrib_la.cusolvermp] {kind} {nq} x {n}^2 on the {Px}x{Py} mesh: A mb {mb_a} nb {nb_a} "
-          f"({relabel}){rhs}.", flush=True)
+    _LOG.debug(f"  [distrib_la.cusolvermp] {kind} {nq} x {n}^2 on the {Px}x{Py} mesh: A mb {mb_a} nb {nb_a} "
+               f"({relabel}){rhs}.")
 
 
 def post_getrs_room(n: int, nrhs: int, nbytes) -> bool:

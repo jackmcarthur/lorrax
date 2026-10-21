@@ -18,6 +18,10 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from runtime.padding import pad_square, pad_to_axis
 from gw.wavefunction_bundle import parent_sigma_operands
 from .sigma import SynthesisTau, WSynthesis, _admit, _static_key
@@ -328,8 +332,8 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
                               f"{label} {keys[0]}, {len(windows)} row pass(es)", increment=True),
                 stage=None if static else "sigma.tau_sweep")
     if jax.process_index() == 0:
-        print(f"{label} stream {''.join('CT'[f] for f in (int(lefts != (0,)), int(rights != (0,))))}: "
-              f"{len(windows)} row pass(es) of {R} local rows ({local_rows} per rank)", flush=True)
+        log.debug(f"{label} stream {''.join('CT'[f] for f in (int(lefts != (0,)), int(rights != (0,))))}: "
+              f"{len(windows)} row pass(es) of {R} local rows ({local_rows} per rank)")
     partial_spec = NamedSharding(mesh_xy, P(None, ('x', 'y')))
     w_spec = P(None, 'x', None, 'y', None)
 

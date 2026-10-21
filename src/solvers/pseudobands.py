@@ -39,6 +39,9 @@ from solvers.dos import (
     compute_window_partition, DOSResult, WindowPartition,
 )
 from distrib_la import eigh_local
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -305,7 +308,7 @@ def ritz_pseudobands(
     # ── §2: KPM DOS ──
     if dos_result is None:
         if verbose:
-            print("Pseudobands: computing KPM DOS...")
+            log.info("Pseudobands: computing KPM DOS...")
         dos = compute_dos(apply_H, dim, n_moments=n_kpm_moments,
                           n_random=n_kpm_random, seed=seed, verbose=verbose)
     else:
@@ -318,9 +321,9 @@ def ritz_pseudobands(
     cj_resolution = np.pi * B / M_max
     eps_cross = C_m * cj_resolution / F
     if verbose:
-        print(f"  CJ resolution: π·B/M = {cj_resolution:.4f} Ry")
-        print(f"  Crossover energy: ε_cross = {eps_cross:.4f} "
-              f"(E_F + ε_cross = {E_fermi + eps_cross:.4f})")
+        log.info(f"  CJ resolution: π·B/M = {cj_resolution:.4f} Ry")
+        log.info(f"  Crossover energy: ε_cross = {eps_cross:.4f} "
+                 f"(E_F + ε_cross = {E_fermi + eps_cross:.4f})")
 
     E_cross_abs = E_fermi + eps_cross
     E_max_abs = E_max
@@ -360,12 +363,12 @@ def ritz_pseudobands(
     E_available = E_det[available_mask]
 
     if verbose:
-        print(f"  Det bands: {n_protected} protected (E < {E_window_start:.4f}), "
-              f"{int(np.sum(available_mask))} available for stochastic")
-        print(f"  {N_S} spectral windows from {boundaries[0]:.4f} to {boundaries[-1]:.4f}")
+        log.info(f"  Det bands: {n_protected} protected (E < {E_window_start:.4f}), "
+                 f"{int(np.sum(available_mask))} available for stochastic")
+        log.info(f"  {N_S} spectral windows from {boundaries[0]:.4f} to {boundaries[-1]:.4f}")
         widths = np.diff(boundaries)
-        print(f"  Window widths: min={widths.min():.4f}, max={widths.max():.4f}, "
-              f"first 3: [{', '.join(f'{w:.4f}' for w in widths[:3])}]")
+        log.info(f"  Window widths: min={widths.min():.4f}, max={widths.max():.4f}, "
+                 f"first 3: [{', '.join(f'{w:.4f}' for w in widths[:3])}]")
 
     # ── Classify windows: stochastic vs CJ ──
     # Stochastic: window has ≥1 det eigenstate → random-phase construction.
@@ -385,7 +388,7 @@ def ritz_pseudobands(
     n_cj = N_S - n_stochastic
 
     if verbose:
-        print(f"  Window classification: {n_stochastic} stochastic, {n_cj} CJ-Ritz")
+        log.info(f"  Window classification: {n_stochastic} stochastic, {n_cj} CJ-Ritz")
 
     # ── Stochastic windows: build from exact eigenstates ──
     # ── CJ windows: need the telescoping filter ──
@@ -401,7 +404,7 @@ def ritz_pseudobands(
         coeffs = _boundary_coefficients(tilde_eps, M_max)
 
         if verbose:
-            print(f"  Running {M_max} Chebyshev iterations (block size {k})...")
+            log.info(f"  Running {M_max} Chebyshev iterations (block size {k})...")
         key = jax.random.PRNGKey(seed + 42)
         Omega = jax.random.normal(key, (k, dim), dtype=jnp.float64)
         Omega = Omega + 0j
@@ -412,7 +415,7 @@ def ritz_pseudobands(
         Y_all = np.asarray(Y_all)  # (N_S, k, dim)
 
         if verbose:
-            print(f"  Filtered blocks: {Y_all.shape}")
+            log.debug(f"  Filtered blocks: {Y_all.shape}")
 
     # ── Window weights from DOS ──
     win_part = compute_window_partition(dos, boundaries)
@@ -474,9 +477,9 @@ def ritz_pseudobands(
         weight_list.append(np.full(k, w_j))
 
         if verbose and (j < 5 or j == N_S - 1 or (j + 1) % 10 == 0):
-            print(f"    window {j+1}/{N_S} [{mode:5s}]: [{e_lo:.2f},{e_hi:.2f}] "
-                  f"n_eff={n_eff[j]:.1f}, w={w_j:.3f}, "
-                  f"θ=[{theta_np[0]:.4f}, {theta_np[-1]:.4f}]")
+            log.info(f"    window {j+1}/{N_S} [{mode:5s}]: [{e_lo:.2f},{e_hi:.2f}] "
+                     f"n_eff={n_eff[j]:.1f}, w={w_j:.3f}, "
+                     f"θ=[{theta_np[0]:.4f}, {theta_np[-1]:.4f}]")
 
     # ── Output assembly ──
     if Xi_list:
@@ -496,9 +499,9 @@ def ritz_pseudobands(
     if verbose:
         total_eff = float(np.sum(n_eff))
         n_pseudo_total = N_S * k
-        print(f"  Total: {n_protected} protected + {n_pseudo_total} pseudo "
-              f"({n_stochastic * k} stochastic + {n_cj * k} CJ) "
-              f"= {Phi_out.shape[0]} bands (Σ n_eff = {total_eff:.1f})")
+        log.info(f"  Total: {n_protected} protected + {n_pseudo_total} pseudo "
+                 f"({n_stochastic * k} stochastic + {n_cj * k} CJ) "
+                 f"= {Phi_out.shape[0]} bands (Σ n_eff = {total_eff:.1f})")
 
     return PseudobandsResult(
         Phi_out=Phi_out, E_out=E_out, weights=weights,

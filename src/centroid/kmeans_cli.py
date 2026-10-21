@@ -132,13 +132,8 @@ from runtime import (
     debug_print,
     debug_print_enabled,
     initialize_communicator_stack,
-    rank0_print,
 )
 RUNTIME = initialize_communicator_stack(print_fn=debug_print)
-
-# Historical progress messages are forensic detail.  The one driver-wide
-# switch owns all of them; the concise production report uses rank0_print.
-print0 = debug_print
 
 import gc
 import os
@@ -151,7 +146,8 @@ import numpy as np
 from wfn_loader import WfnLoader                                    # noqa: E402
 from common import timing
 from common.collectives import process_rank
-from runtime.production_stream import ProductionStdout
+from common.log import get_logger, message, record
+from runtime.run_session import RunSession
 
 from . import distribution as dist
 from .kmeans_isdf import (
@@ -163,9 +159,10 @@ from .kmeans_isdf import (
     ensure_unique_centroids,
 )
 from .production_output import (
-    CentroidRankNotEstablished,
+    KMEANS_STAGES,
     format_centroid_header,
-    format_kmeans_report,
+    kmeans_results_lines,
+    kmeans_settings_rows,
     pool_rank_warning,
     prune_band_ranges,
     rank_law_estimate,
@@ -213,13 +210,17 @@ def _release_lloyd_before_prune(*arrays) -> None:
             f"; device bytes-in-use {before / 2**30:.2f} -> "
             f"{after / 2**30:.2f} GiB"
         )
-    print("Released completed Lloyd/preparation device state before prune "
-          f"WFN transfer{memory_note}")
+    log.debug("Released completed Lloyd/preparation device state before prune "
+              f"WFN transfer{memory_note}")
 
 
 # Reachable through the one service-path bootstrap above; gated by
 # tests/test_service_path_bootstrap.py.
 import symmetry_maps                                            # noqa: E402
+
+# Historical progress messages are forensic detail: DEBUG, in the rank log
+# under LORRAX_DEBUG_PRINT.  The few facts a run's reader wants are INFO.
+log = get_logger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -341,7 +342,7 @@ def _resolve_symmetry(args, wfn):
     n_improper = int(np.count_nonzero(determinants < 0))
     n_nonsymmorphic = int(np.count_nonzero(
         np.max(np.abs(tau - np.rint(tau)), axis=1) > 1.0e-8))
-    print0(
+    log.debug(
         f"Centroid symmetry: decorated atoms give {n_sym} spatial Seitz "
         f"operations ({n_improper} improper, {n_nonsymmorphic} with "
         "fractional translation); electronic/TR data not consulted")
@@ -375,7 +376,7 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     mode = "transverse" if args.density_mode == "current" else "charge"
     channel = ("Σ_i |Ψ_m†α_iΨ_n/α_fs|²" if mode == "transverse" else
                "|ψ_m†ψ_n|²")
-    print0(
+    log.debug(
         f"k-means weight: sqrt(Σ_k w_k Σ_{{m∈{left_range},n∈{right_range}}} "
         f"{channel}); [{range_label}], unit band weights")
     from .sampling_metric import build_feature_metric_diagonal
@@ -407,7 +408,7 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
         # cells. Snap-then-unfold guarantees on-grid orbit closure (because
         # R is integer and τ × fft_grid is integer for grid-commensurate τ).
         _, reps_snapped, _ = snap_centroids_to_grid(
-            centroids_frac, fft_grid, deduplicate=False, print_fn=print0)
+            centroids_frac, fft_grid, deduplicate=False)
         # Unfold with Rinv = inv(mtrx): the BGW r-action is r' = Rinv·r + τ,
         # matching centroid_source_map_and_wrap and validate_atomic_symmetries.
         # A no-op vs forward S on symmorphic systems (CrI3, MoS2); critical
@@ -415,22 +416,22 @@ def _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
         from symmetry_maps import unfold_orbit_unique_with_id
         unfolded, orbit_id = unfold_orbit_unique_with_id(
             reps_snapped, np.asarray(Rinv), np.asarray(tau))
-        print0(f"\nUnfolded {centroids_frac.shape[0]} reps → "
-               f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")
+        log.debug(f"\nUnfolded {centroids_frac.shape[0]} reps → "
+                  f"{unfolded.shape[0]} distinct centroids (n_sym={n_sym})")
         indices, snapped, _ = snap_centroids_to_grid(
-            unfolded, fft_grid, deduplicate=False, print_fn=print0)
+            unfolded, fft_grid, deduplicate=False)
         return indices, snapped, indices.shape[0], orbit_id
 
-    print0(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
+    log.debug(f"\nSnapping {M_cand} centroids to FFT grid {fft_grid}...")
     indices, snapped, n_dups = snap_centroids_to_grid(
-        centroids_frac, fft_grid, deduplicate=True, print_fn=print0)
+        centroids_frac, fft_grid, deduplicate=True)
     if n_dups == 0:
-        print0(f"✓ All {indices.shape[0]} centroids on unique grid points.")
+        log.debug(f"✓ All {indices.shape[0]} centroids on unique grid points.")
         return indices, snapped, indices.shape[0], None
 
-    print0(f"⚠ {n_dups} duplicates; redistributing to nearby grid points...")
+    log.debug(f"⚠ {n_dups} duplicates; redistributing to nearby grid points...")
     snapped = ensure_unique_centroids(
-        centroids_frac, fft_grid, rho=weight, print_fn=print0)
+        centroids_frac, fft_grid, rho=weight)
     indices = (np.round(snapped * np.asarray(fft_grid))
                .astype(np.int64) % np.asarray(fft_grid))
     return indices, snapped, snapped.shape[0], None
@@ -450,8 +451,8 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 
     # ``N_c`` is a point budget.  The block selector admits only whole orbits
     # that fit, then deflates by every point in each admitted orbit.
-    print0(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
-           f"{' (whole-orbit blocks)' if orbit_id is not None else ''}")
+    log.debug(f"\nPivoted-Cholesky prune: {n_unique} → {N_c}"
+              f"{' (whole-orbit blocks)' if orbit_id is not None else ''}")
 
     n_val, n_cond = _resolve_sigma_window(args, wfn)     # one resolver
     left_range, right_range, range_label = prune_band_ranges(
@@ -466,7 +467,6 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
                     else "charge"),
         k_weights=full_k_quadrature_weights(wfn, sym),
         verbose=(debug_print_enabled() and process_rank() == 0),
-        progress_print_fn=rank0_print,
     )
     if args.prune_window == "v_x_vc":
         kwargs["band_range_left"] = left_range
@@ -477,15 +477,15 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
     else:
         kwargs["n_val"] = n_val
         kwargs["n_cond"] = n_cond
-    print0(f"  prune window: left={left_range} right={right_range} "
-           f"[{range_label}]; Gram="
-           f"{'Σ_i Z_i Z_i† (i=1,2,3)' if args.density_mode == 'current' else 'charge'}")
+    log.info(f"  prune window: left={left_range} right={right_range} "
+             f"[{range_label}]; Gram="
+             f"{'Σ_i Z_i Z_i† (i=1,2,3)' if args.density_mode == 'current' else 'charge'}")
 
     with timing.section("prune"):
         keep_idx, rank, *_, unpicked = prune_candidates_by_pivoted_cholesky(
             **kwargs)
     indices = np.asarray(keep_idx, dtype=np.int64)
-    print0(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
+    log.info(f"After pruning: {indices.shape[0]} centroids (rank={rank})")
     return indices, int(rank), float(unpicked)
 
 
@@ -493,26 +493,48 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
 # Main
 # ─────────────────────────────────────────────────────────────────────────
 
-def select_points(args, wfn_path, *, keep_weight=None):
+class _NoStages:
+    """Library calls of :func:`select_points` print no ``[i/N]`` banners."""
+
+    total = 0
+
+    def begin(self, *args, **kwargs) -> None:
+        pass
+
+    def result(self, text: str) -> None:
+        pass
+
+    @staticmethod
+    def row(label, value) -> None:
+        pass
+
+
+def select_points(args, wfn_path, *, keep_weight=None, stages=None):
     """THE selection, as :func:`main` runs it: weight, weighted k-means in
     orbits, snap and unfold, then the pivoted-Cholesky prune of the
     over-sampled pool.  ``args`` is this module's parsed namespace (with
     ``sigma_ncond``); every rank must enter.  Returns a namespace with the
     FFT-grid ``indices`` (``(n, 3)``), their fractional ``snapped`` positions
     and the selection's receipts.  ``keep_weight`` (default ``args.plot``)
-    keeps the weight array for the caller."""
+    keeps the weight array for the caller.  ``stages`` (the driver's
+    ``common.preprocessing_output.StageSequence``) opens the main log's
+    ``[i/N]`` stages; the last stays open for the caller's file write."""
     from types import SimpleNamespace
+    from common.preprocessing_output import stage_row
     keep_weight = bool(args.plot) if keep_weight is None else bool(keep_weight)
+    row = stage_row if stages is not None else _NoStages.row
+    stages = stages if stages is not None else _NoStages()
 
     N_c = int(args.N_c)
     oversample = float(args.oversample)
     M_cand = int(np.ceil(N_c * oversample)) if oversample > 1.0 else N_c
     if M_cand != N_c:
-        print0(f"Over-sampling: k-means M = {M_cand}, prune to N_c = {N_c} "
-               f"(ratio {oversample:g})")
+        log.debug(f"Over-sampling: k-means M = {M_cand}, prune to N_c = {N_c} "
+                  f"(ratio {oversample:g})")
     else:
-        print0(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
+        log.debug(f"Using N_c = {N_c} clusters (no pivoted-Cholesky pruning)")
 
+    stages.begin(1, "Feature weight", name="centroid.feature_weight")
     with timing.section("setup.wfn_io"):
         wfn = WfnLoader(wfn_path)
         sym = wfn.symmetry()
@@ -520,21 +542,27 @@ def select_points(args, wfn_path, *, keep_weight=None):
         n_rtot = int(np.prod(wfn.fft_grid))
         init_method, init_msg = _decide_init_method(N_c, n_rtot)
         if init_msg is not None:
-            print0(init_msg)
+            log.debug(init_msg)
         dense_warn = _warn_dense_grid_regime(M_cand, N_c, n_rtot)
         if dense_warn is not None:
-            print0(dense_warn)
+            log.warning(
+                dense_warn.removeprefix("WARNING: "),
+                extra=message(
+                    id="centroid_dense_grid",
+                    found=("requested centroids",
+                           f"N_c = {N_c} of {n_rtot} FFT-grid points"),
+                    needs="candidate coverage and Gram conditioning checked",
+                    fix="read the pivoted-Cholesky rank in the centroid header"))
 
     fft_grid = tuple(int(x) for x in wfn.fft_grid)
 
     avec_ang = np.asarray(wfn.avec) * float(wfn.alat) * BOHR_TO_ANG
-    print0(f"WFN FFT-grid shape: {fft_grid}")
-    print0(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
+    log.debug(f"WFN FFT-grid shape: {fft_grid}")
+    log.debug(f"Lattice lengths: {np.linalg.norm(avec_ang, axis=1)} Å")
 
     mesh = dist.build_mesh(int(np.prod(fft_grid)),
                            shard=not args.no_shard,
-                           force_shard=args.force_shard,
-                           print_fn=print0)
+                           force_shard=args.force_shard)
     mesh_axis = dist.MESH_AXES
 
     # The loader was necessarily built mesh-less (the mesh is sized from
@@ -549,6 +577,11 @@ def select_points(args, wfn_path, *, keep_weight=None):
     with timing.section("setup.weight"):
         weight, weight_label, weight_band_ranges = _resolve_weight(
             args, wfn, sym, R, tau, dist_mesh=mesh)
+    row("windows", f"left {weight_band_ranges[0][0] + 1}-{weight_band_ranges[0][1]} x "
+                   f"right {weight_band_ranges[1][0] + 1}-{weight_band_ranges[1][1]} "
+                   f"over {int(np.asarray(sym.nk_tot))} k, unit band weights")
+    stages.result(f"weight on {n_rtot} grid points ({fft_grid[0]} x {fft_grid[1]} "
+                  f"x {fft_grid[2]})")
 
     # w^α re-weighting.  Per Gersho the asymptotic centroid number density
     # goes as w^(3α/5), so α > 1 pulls points into high-density regions.
@@ -559,8 +592,8 @@ def select_points(args, wfn_path, *, keep_weight=None):
         # Clip to non-negative first — QE's iFFT can leave tiny < 0 noise.
         kmeans_weight = np.maximum(
             np.asarray(weight, dtype=np.float64), 0.0) ** float(args.rho_power)
-        print0(f"k-means weight: (weight)^{args.rho_power:g} "
-               f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
+        log.debug(f"k-means weight: (weight)^{args.rho_power:g} "
+                  f"(asymptotic centroid density ∝ w^{0.6*args.rho_power:.3f})")
 
     if orbit_aware:
         # In orbit mode the SAMPLED count is M_cand; the OUTPUT after unfold
@@ -576,20 +609,23 @@ def select_points(args, wfn_path, *, keep_weight=None):
                 f"kmeans can sample at least one orbit; pass --no-orbit or "
                 f"raise N_c."
             )
-        print0(f"Orbit-aware mode: n_sym = {n_sym}, "
-               f"running kmeans for M_rep = {M_cand_orbit} representatives "
-               f"(unfolded ≈ {M_cand_orbit * n_sym} centroids)")
+        log.debug(f"Orbit-aware mode: n_sym = {n_sym}, "
+                  f"running kmeans for M_rep = {M_cand_orbit} representatives "
+                  f"(unfolded ≈ {M_cand_orbit * n_sym} centroids)")
         kmeans_target = M_cand_orbit
     else:
         kmeans_target = M_cand
 
+    stages.begin(2, "Weighted k-means", name="centroid.kmeans")
+    row("target", f"{M_cand} candidates = {kmeans_target} orbit representatives "
+                  f"x {n_sym} operations" if orbit_aware else
+                  f"{M_cand} candidates (literal points)")
     with timing.section("kmeans") as kmeans_section:
         labels, centroids, _lloyd_steps, _lloyd_move_sq = weighted_kmeans_jax(
             avec_ang, kmeans_weight, N_c=kmeans_target, seed=args.seed,
             mesh=mesh, mesh_axis=mesh_axis,
             init_method=init_method,
             R=R, Rinv=Rinv, tau=tau,
-            print_fn=print0,
         )
         # The host materialises ``centroids`` immediately below.  Watch every
         # returned device value here so this phase measures completion rather
@@ -604,9 +640,13 @@ def select_points(args, wfn_path, *, keep_weight=None):
             _snap_and_unfold(centroids_frac, fft_grid, weight, orbit_aware,
                              Rinv, tau, n_sym, M_cand)
 
+    stages.result(f"pool of {int(n_unique)} grid points after "
+                  + ("orbit unfold and " if orbit_aware else "") + "FFT snap")
     pruned = False
     prune_rank = unpicked = None
     n_pool = int(n_unique)
+    if stages.total == 3:
+        stages.begin(3, "Pivoted-Cholesky selection", name="centroid.select")
     if oversample > 1.0 and n_unique > N_c:
         release_arrays = [labels, centroids]
         for array in (weight, kmeans_weight):
@@ -628,10 +668,13 @@ def select_points(args, wfn_path, *, keep_weight=None):
         pruned = True
         prune_rank = int(rank)
 
-        print0(f"  [point rank] {rank}/{n_unique} delivered centroid "
-               "directions certified; rank deficiency is reported, while "
-               "LORRAX_CENTROID_SELECT=strict makes it a refusal")
-
+        log.info(f"  [point rank] {rank}/{n_unique} delivered centroid "
+                 "directions certified; rank deficiency is reported, while "
+                 "LORRAX_CENTROID_SELECT=strict makes it a refusal")
+        row("pivots", f"{int(rank)} independent of {n_unique} kept, from the "
+                      f"{n_pool}-point pool")
+    elif stages.total == 3:
+        row("pruning", f"not needed: the pool holds {n_pool} <= {N_c} points")
 
     return SimpleNamespace(
         wfn=wfn, indices=np.asarray(centroid_indices, dtype=np.int64),
@@ -657,23 +700,42 @@ def orbit_kmeans_points(wfn_path, n_points: int, *, fit_window, seed: int = 0):
     return select_points(args, str(wfn_path), keep_weight=False).indices
 
 
+def _out_suffix(args) -> str:
+    """The suffix of the centroid table and of its report (``''`` / ``_current``)."""
+    return (args.out_suffix if args.out_suffix is not None
+            else ("" if args.density_mode == "scalar" else "_current"))
+
+
 def main():
     args = build_parser().parse_args()
     validate_mode_policy(args)
-    production_warnings = []
-    production_stdout = ProductionStdout(
-        debug=debug_print_enabled(), rank=RUNTIME.process_index,
-        warning_fn=production_warnings.append)
-    production_stdout.install()
+    # The report carries the SAME suffix as the table it describes.  A charge
+    # and a current selection are routinely run in one directory (the deck
+    # names both files), and a bare "kmeans.out" meant the second run silently
+    # destroyed the first one's record -- its band window, seed, candidate
+    # pool and achieved rank.
+    from common.preprocessing_output import ScientificProductionReport, StageSequence
+    report_path = os.path.abspath(f"kmeans{_out_suffix(args)}.out")
+    with RunSession(RUNTIME, "kmeans", ScientificProductionReport, report_path,
+                    stages=KMEANS_STAGES, driver="centroids",
+                    purpose="ISDF centroid selection") as run, \
+            StageSequence(3 if float(args.oversample) > 1.0 else 2) as stages:
+        return _select_and_report(args, run, stages)
 
+
+def _select_and_report(args, run, stages):
+    """Select, write the centroid table, and close ``kmeans<suffix>.out``."""
     # (the compile cache was armed at import, by step 7 of
     # initialize_communicator_stack)
-    print0(f"✓ JAX initialized: {dist.device_summary()}")
+    report = run.report
+    report.begin(input_file=args.input)
+    report.devices(mesh_role="centroid selection")
+    log.info(f"✓ JAX initialized: {dist.device_summary()}")
 
-    timing.reset()
     selection_start = time.perf_counter()
     args.sigma_ncond, wfn_path = _resolve_deck(args)
-    sel = select_points(args, wfn_path)
+    report.settings(kmeans_settings_rows(args, source=report.flag_source))
+    sel = select_points(args, wfn_path, stages=stages)
     (wfn, _indices, centroids_snapped, n_unique, n_pool, pruned,
      prune_rank, unpicked, weight, weight_label, weight_band_ranges, M_cand,
      orbit_aware, n_sym, fft_grid, N_c) = (
@@ -682,11 +744,7 @@ def main():
         sel.weight_band_ranges, sel.M_cand, sel.orbit_aware, sel.n_sym,
         sel.fft_grid, sel.N_c)
 
-    # Default suffix follows --density-mode unless the user overrode it.
-    out_suffix = (args.out_suffix
-                  if args.out_suffix is not None
-                  else ("" if args.density_mode == "scalar" else "_current"))
-    out_file = f"centroids_frac_{n_unique}{out_suffix}.txt"
+    out_file = f"centroids_frac_{n_unique}{_out_suffix(args)}.txt"
     n_val_header, n_cond_header = _resolve_sigma_window(args, wfn)
     prune_left, prune_right, prune_label = prune_band_ranges(
         args, n_val_header, n_cond_header)
@@ -711,7 +769,15 @@ def main():
     rank_warning = pool_rank_warning(
         pool=n_pool, written=n_unique, unpicked=unpicked, rank_law=rank_law)
     if rank_warning is not None:
-        warnings.warn(rank_warning, CentroidRankNotEstablished)
+        log.warning(
+            f"pair-space rank not established: {n_unique} centroids are not a "
+            "complete ISDF basis",
+            extra=message(
+                id="centroid_rank_not_established",
+                found=("pivoted Cholesky", f"stopped by the point budget at "
+                       f"{n_unique} points of a {n_pool}-point pool"),
+                lines=(rank_warning,),
+                fix="raise N_c or --oversample until the rank reads 'pool spent'"))
     header = format_centroid_header(
         feature_fit=feature_fit, source_wfn=wfn_path,
         weight_label=weight_label,
@@ -738,39 +804,40 @@ def main():
             header=header,
             fmt="%.6f", delimiter=" ", comments="# ",
         )
-        print0(f"Saved centroids to {out_file}")
+        log.info(f"Saved centroids to {out_file}")
+        # The table's own header is the selection's full record.
+        log.debug("centroid table header", extra=record(
+            "centroids.header", file=out_file, lines=header.splitlines()))
+    stages.result(f"{n_unique} centroids written to {out_file}"
+                  + (" in whole orbits" if orbit_aware else ""))
+    stages.end()
 
     selection_wall = time.perf_counter() - selection_start
     if process_rank() == 0 and debug_print_enabled():
         timing.report(title="--- kmeans_cli timing (s) ---",
                       wall=selection_wall)
 
-    if process_rank() == 0:
-        # The report carries the SAME suffix as the table it describes.  A
-        # charge and a current selection are routinely run in one directory
-        # (the deck names both files), and a bare "kmeans.out" meant the
-        # second run silently destroyed the first one's provenance -- the
-        # only record of its band window, seed, candidate pool and achieved
-        # rank.  The centroid table was already suffixed; the report was not.
-        report_file = f"kmeans{out_suffix}.out"
-        report_text = format_kmeans_report(
-            header=header, source_wfn=wfn_path, centroid_file=out_file,
-            report_file=report_file,
-            wfn_backend=str(getattr(wfn, "backend", "unknown")),
-            elapsed_s=selection_wall, timing_records=timing.records(),
-            runtime=RUNTIME, warnings=production_warnings)
-        with open(report_file, "w", encoding="utf-8") as stream:
-            stream.write(report_text)
-        if debug_print_enabled():
-            rank0_print(report_text, end="")
-        else:
-            production_stdout.emit(report_text, end="")
+    report.emit_lines(kmeans_results_lines(
+        requested=N_c, candidates=M_cand, pool=n_pool, written=n_unique,
+        out_file=out_file, orbit_aware=orbit_aware, n_sym=n_sym,
+        windows=(prune_left, prune_right), window_label=prune_label,
+        density_mode=args.density_mode, prune_rank=prune_rank,
+        unpicked=unpicked, rank_law=rank_law))
 
     if args.plot:
         from .kmeans_plot import plot_density_and_centroids, interpolate_density
         rho_plot = interpolate_density(weight, (args.plot_zoom,) * 3)
         plot_density_and_centroids(wfn, rho_plot, centroids_snapped)
-    production_stdout.close()
+    # The shared footer without ``RunSession.complete``: that closes with a
+    # barrier this driver never ran (print-only rule).
+    report.timings(run.stage_rows(), wall=run.wall)
+    report.warnings()
+    report.files(run.file_rows([
+        ("source wavefunctions", "read", wfn_path),
+        *((("input deck", "read", args.input),) if args.input else ()),
+        ("ISDF centroids", "written", os.path.abspath(out_file)),
+    ]))
+    report.finish(wall=run.wall)
     return 0
 
 

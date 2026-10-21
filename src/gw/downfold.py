@@ -146,6 +146,10 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common import rank_criterion
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common import spectral_closure
 from common.zeta_projection import (
     least_squares_transfer,
@@ -755,7 +759,7 @@ def _floor_selection_to_orbits(
             f"statement about the band window rather than about mu_small.")
     n_usable = min(int(k_req), rank_i)
     if rank_i < int(k_req):
-        print_fn(
+        log.info(
             f"  [downfold/select] NOTE: the orbit-mode select certified "
             f"{rank_i} of the {int(k_req)} orbits the point budget could have "
             f"held — past that the residual Schur diagonal is at the noise "
@@ -813,7 +817,7 @@ def _floor_selection_to_orbits(
             f"{int(sizes_in_order[k_fit])} = "
             f"{realized + int(sizes_in_order[k_fit])} would exceed "
             f"{mu_S}."))
-    print_fn("\n".join([
+    log.info("\n".join([
         f"  *** [downfold/select] ORBIT-FLOORED: mu_S requested {mu_S} "
         f"points -> REALIZED {realized} ({k_fit} orbits: "
         + "+".join(str(int(v)) for v in sizes_kept) + ") ***",
@@ -956,7 +960,7 @@ def select_cur_centroids(
         _pool_ev, ceiling, where="downfold pool Gram (q=0) rank ceiling",
         rcond=float(rcond), log=print_fn)
     if not _sc_pool["fired"]:
-        print_fn(spectral_closure.describe_clean(
+        log.info(spectral_closure.describe_clean(
             _sc_pool, where="downfold pool Gram (q=0) rank ceiling"))
 
     requested_auto = isinstance(mu_small, str) and str(mu_small).strip().lower() == "auto"
@@ -965,7 +969,7 @@ def select_cur_centroids(
         # LOUD, at selection time, before the expensive stages — because the
         # thing this warns about is invisible everywhere downstream.  Fires
         # only here; an explicit integer mu_small prints none of it.
-        print_fn(describe_auto_hazard(mu_S, float(rcond)))
+        log.info(describe_auto_hazard(mu_S, float(rcond)))
     else:
         mu_S = int(mu_small)
 
@@ -1110,7 +1114,7 @@ def select_cur_centroids(
     star = None
     if sym_perm is not None:
         star = star_stability(keep_idx, sym_perm)
-        print_fn(star.describe())
+        log.info(star.describe())
         if not star.closed:                           # belt and braces
             raise ValueError(
                 "downfold: the orbit-mode selection came back NOT "
@@ -1521,12 +1525,12 @@ def announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
     kap = np.array([r.kappa_eff if r.kappa_eff is not None else np.nan
                     for r in reports])
     marg = np.array([r.overcomplete_margin for r in reports])
-    print_fn(
+    log.info(
         f"  [downfold/solve] rank-truncated transfer at "
         f"rcond={rcond:g}: retained rank of S_SS per q "
         f"min/median/max = {ranks.min()}/{int(np.median(ranks))}/"
         f"{ranks.max()} of mu_S_padded={mu_s_pad} over {len(reports)} q.")
-    print_fn(
+    log.info(
         f"  [downfold/solve] achieved amplification kappa_eff max "
         f"{np.nanmax(kap):.3e} against the cap 1/rcond="
         f"{1.0 / float(rcond):.3e}; overcomplete margin (loosen rcond by "
@@ -1537,7 +1541,7 @@ def announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
     if viol:
         for q, vs in list(viol.items())[:4]:
             for v in vs:
-                print_fn(f"  [downfold/solve]   ** VIOLATION q={q}: {v}")
+                log.info(f"  [downfold/solve]   ** VIOLATION q={q}: {v}")
 
     # The closure verdict, RESTATED HERE.  ``build_transfer`` suppresses
     # ``least_squares_transfer``'s own log line and prints this report
@@ -1556,7 +1560,7 @@ def announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
                     key=lambda q: abs(infos[q]["n_keep_closed"]
                                       - infos[q]["n_keep"]))
         w = infos[worst]
-        print_fn(
+        log.info(
             f"  *** [downfold/solve] SPECTRAL CLOSURE: the rank cut falls "
             f"inside a degenerate block of S_SS on {len(fired)} of "
             f"{len(reports)} q.  Worst q={worst}: rank {w['n_keep']} -> "
@@ -1568,7 +1572,7 @@ def announce_ranks(reports, rcond, mu_s_pad, print_fn, *, ev=None) -> None:
             f"{spectral_closure.resolve_mode(os.environ.get(spectral_closure.MODE_ENV))} "
             f"mode. ***")
     else:
-        print_fn(
+        log.info(
             f"  [downfold/solve] spectral closure: the cut falls in a gap on "
             f"all {len(reports)} q at rtol {spectral_closure.DEFAULT_RTOL:.1e} "
             f"(min relative gap over q "

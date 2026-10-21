@@ -79,6 +79,7 @@ the multi-window union read replaces n single reads).
 from __future__ import annotations
 
 import functools
+import logging
 from dataclasses import dataclass
 import types
 from pathlib import Path
@@ -92,6 +93,10 @@ from jax import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from ._collectives import device_put_process_local
+
+#: A service is independently installable and imports no ``common.log``: it logs on the
+#: ``lorrax.`` namespace directly (the handlers in ``common.log`` sit on that root).
+_LOG = logging.getLogger("lorrax.wfn_loader")
 
 
 __all__ = [
@@ -584,9 +589,8 @@ class WfnLoader:
             "eager": "single-process or mesh-less: host h5py read per rank",
             "phdf5": "collective MPI-IO read through the phdf5 FFI .so",
         }.get(backend, "")
-        print(f"  [WfnLoader] read backend = {backend} "
-              f"(auto, {world} process{'es' if world != 1 else ''}) — {why}",
-              flush=True)
+        _LOG.debug(f"  [WfnLoader] read backend = {backend} "
+                   f"(auto, {world} process{'es' if world != 1 else ''}) — {why}")
 
     def _auto_pick_backend(self) -> str:
         """Pick the lightest backend that works.

@@ -57,6 +57,7 @@ EPSMAT_DEFAULTS = {
     # sys_dim 3 eps0mat with q0_wings = zero: the q -> 0 body omits the O(1) head-wing term
     # ε_b0 ε_00⁻¹ ε_0b.  ``refuse`` or ``omit_head_wing`` (write that body).
     "q0_body_3d": "refuse",
+    "verbose": False,   # read by runtime.read_verbose_switches; declared so it is not refused
 }
 
 _FILES = ("eps0mat", "epsmat")

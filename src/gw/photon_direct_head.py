@@ -8,7 +8,6 @@ inputs to the Γ-cell solve.
 """
 from functools import lru_cache
 
-import sys
 
 import jax
 from lxkit import ordered_psum
@@ -18,6 +17,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from jax import shard_map
 from common.bispinor_init import HALFALPHA
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from gw.qsgw_head import _host_or_device, _pad_head_band_manifold, _mesh_xy
 
 
@@ -688,10 +691,10 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
                 atom_w, atom_u)
     if jax.process_index() == 0 and occupation_state is not None:
         from gw.qsgw_head import drude_report
-        print("  direct photon Γ metal head: tetrahedron Fermi surface, "
-              + drude_report(atoms)
-              + f"; kappa_TF^2 = {8.0 * np.pi * dos:.6f} bohr^-2; "
-              + atoms.describe(), file=sys.stderr, flush=True)
+        log.info("  direct photon Γ metal head: tetrahedron Fermi surface, "
+                 + drude_report(atoms)
+                 + f"; kappa_TF^2 = {8.0 * np.pi * dos:.6f} bohr^-2; "
+                 + atoms.describe())
     cell_average = (_slab_gamma_cell_average if sys_dim == 2
                     else _bulk_gamma_cell_average)
     fields_mean, spread, max_error, rule = cell_average(
@@ -699,15 +702,15 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     if not all(np.all(np.isfinite(value)) for value in fields_mean):
         raise ValueError("GATE photon_direct_head_nonfinite: direct Γ cell average is not finite")
     if jax.process_index() == 0:
-        print_fn("  direct photon Γ: first-order CC/CT/TC/TT "
+        log.info("  direct photon Γ: first-order CC/CT/TC/TT "
                  + ("+ Fermi-surface Lindhard cell; " if occupation_state is not None
                     else "(insulator: interband only); ")
                  + f"{rule}; max rule spread={spread:.3e} Ry, "
-                 f"Dyson residual={max_error:.3e}", flush=True)
+                 f"Dyson residual={max_error:.3e}")
         origin = int(np.argmin(np.abs(z)))
-        print(f"  direct photon Γ origin: z={complex(z[origin]):.6g} Ry, "
+        log.info(f"  direct photon Γ origin: z={complex(z[origin]):.6g} Ry, "
                  f"<W_h - W_inf>_CC/Omega={complex(fields_mean[0][origin][0, 0]):.9g}, "
-                 f"TT trace={complex(np.trace(fields_mean[0][origin][1:, 1:])):.6g}", file=sys.stderr, flush=True)
+                 f"TT trace={complex(np.trace(fields_mean[0][origin][1:, 1:])):.6g}")
     head = dict(zip(("Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds",
                      "constant", "moments", "bare"), fields_mean))
     head.update(rule=rule, rule_spread_ry=spread, dyson_residual=max_error)

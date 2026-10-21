@@ -87,7 +87,7 @@ def test_header_lines():
         driver="gw", purpose="GW quasiparticles",
         argv=("python", "-u", "-m", "gw.gw_jax", "-i", "gnppm.in"),
         directory="/pscratch/sd/j/jackm/run", started=STARTED, host="nid200257",
-        job="Slurm job 60021274", logs=("gnppm.out",))
+        job="Slurm job 60021274", logs=("gnppm.out", "gnppm.json"))
     assert rb.header_lines(run) == [
         RULE,
         "LORRAX gw · GW quasiparticles",
@@ -96,7 +96,7 @@ def test_header_lines():
         "Directory        /pscratch/sd/j/jackm/run",
         "Started          2026-10-19 19:16:11 PDT",
         "Host             nid200257, Slurm job 60021274",
-        "Logs             gnppm.out",
+        "Logs             gnppm.out · gnppm.json",
     ]
 
 
@@ -104,7 +104,7 @@ def test_header_optional_rows_and_command_wrap():
     argv = ("python", "-m", "bse.bse_jax", "-i", "bse.in") + tuple(
         f"--flag-{i}" for i in range(12))
     run = rb.RunFacts(driver="bse", purpose="Bethe-Salpeter eigensolve", argv=argv,
-                      directory="/run", started=STARTED, host="login01", debug=True,
+                      directory="/run", started=STARTED, host="login01",
                       version="LORRAX main, clean", native_bundle="cloud bundle")
     assert rb.header_lines(run) == [
         RULE,
@@ -117,7 +117,6 @@ def test_header_optional_rows_and_command_wrap():
         "Directory        /run",
         "Started          2026-10-19 19:16:11 PDT",
         "Host             login01",
-        "Debug            on (LORRAX_DEBUG_PRINT=1)",
     ]
 
 
@@ -202,12 +201,8 @@ def test_symmetry_block_with_broken_time_reversal():
         "  centroid orbit   closed: 4/4 operations map the 6 sites onto themselves",
         "  time reversal    not a symmetry alone: k and -k are sampled apart",
         "                   GN probe: ordered orientations with the time-odd channel, in its own pass",
-        rb.right_align("  NOTE     the DFT reference breaks time reversal (magnetic)",
+        rb.right_align("  NOTE     the DFT reference breaks time reversal (magnetic QE run)",
                        "[time_reversal_broken]"),
-        "           2-component density check: basis qe-magnetic, residual n/a, coverage "
-        "0.00%, no",
-        "           independent evidence",
-        "           k and -k are not paired by time reversal",
         "  op    QE-TR  used as   R^-1                             tau      (r' = R^-1 r + tau)",
         "  S01   no     unitary   [ 1  0  0;  0  1  0;  0  0  1]   ( 0.000  0.000  0.000)",
         "  S02   no     unitary   [-1  0  0;  0  1  0;  0  0 -1]   ( 0.000  0.500  0.000)",
@@ -222,7 +217,10 @@ def test_time_reversal_variants_and_op_usage():
     assert tr == ["  time reversal    not a symmetry alone: used only inside the 2 t_rev = 1 "
                   "operations"]
     assert note.text == "QE marks 2 of the 4 operations t_rev = 1 (magnetic)"
-    assert note.lines[-1] == "k and -k pair only through those 2 operations"
+    assert note.lines == ()          # the k / -k fact is the row; the check is DEBUG
+    assert rb.time_reversal_check(_magnetic_receipt())[0] == (
+        "2-component density check: basis qe-magnetic, residual n/a, coverage 0.00%, "
+        "no independent evidence")
     table = rb.symmetry_lines(magnetic)[2:]
     assert [row[8:24].split() for row in table[1:]] == [
         ["no", "unitary"], ["yes", "with", "TR"], ["no", "both"], ["yes", "with", "TR"]]
@@ -272,7 +270,8 @@ def test_report_sampling_counts_the_note_once(tmp_path, monkeypatch):
     assert shown[:3] == ["", "SYMMETRY", "--------"]
     assert "K POINTS" in shown
     assert [m.id for m in report.messages()] == ["time_reversal_broken"]
-    assert report.messages()[0].text == "the DFT reference breaks time reversal (magnetic)"
+    assert report.messages()[0].text == ("the DFT reference breaks time reversal "
+                                         "(magnetic QE run)")
 
 
 # ── timing and memory ────────────────────────────────────────────────────────
@@ -312,7 +311,7 @@ def test_report_timings_take_device_peaks_from_stage_rows(tmp_path, monkeypatch)
     report.timings([("runtime + imports", 30.0), ("BSE eigensolve", 1.17, 0.42e9),
                     ("eigenvector write", 0.0, None)], wall=34.6)
     report.close()
-    table = shown[shown.index("MAJOR-STAGE TIMING") + 2:]
+    table = shown[shown.index("TIMING") + 2:]
     assert table[0].endswith("device GB") and table[2].endswith("0.42")
     assert "  device peak      0.42 GB in BSE eigensolve (within the budget)" in table
     assert "  budget           66.35 GB per device (memory_per_device_gb)" in table
@@ -394,12 +393,14 @@ def test_gw_settings_rows():
         "  qp_solver                one_shot_dft    deck     Sigma at E_DFT; H(QP) diagonalized once",
         "  screening_diagrams       w_rpa           default  RPA Dyson series, minimax chi0 time rules",
         "  sys_dim                  3               deck     3D bulk: no Coulomb truncation",
-        "  head_correction          full            default  q->0 head with local fields (s_tensor)",
-        "  degen_avg_tol_ry         1e-06           default  reported diagonals averaged within 1.4e-05 eV",
+        "  head_correction          full            default  q->0 head with local fields from dipole.h5",
         "  restart                  false           deck     fresh ISDF fit; no restart bundle is read",
         "  linalg                   local           deck     9 whole N_mu^2 matrices per rank (0.00494 MiB)",
-        "  memory_per_device_gb     4.01            derived  card rule on NVIDIA A100-SXM4-80GB",
-        "  band_chunk_size          16              default  band panels gathered in chunks of at least this"]
+        "  memory_per_device_gb     4.01            derived  card rule on NVIDIA A100-SXM4-80GB"]
+    # degen_avg_tol_ry and band_chunk_size print only when the deck names them.
+    named = settings_rows(_gw_config(raw_input_keys=frozenset(
+        {"degen_avg_tol_ry", "band_chunk_size"})), n_mu=6, n_q_irr=9, processes=1)
+    assert {"degen_avg_tol_ry", "band_chunk_size"} <= {row.key for row in named}
     from gw.gw_config import QPSolver
     sc = settings_rows(_gw_config(qp_solver=QPSolver("self_consistent"),
                                   density_self_consistent=True,
@@ -628,7 +629,10 @@ def test_warnings_summary_lines():
     long = rb.warnings_summary_lines([rb.Message("WARNING", "unclassified", "x " * 80),
                                       rb.Message("WARNING", "unclassified", "other text")])
     assert long[3] == "  2 warnings; each was printed in full where it happened"
-    assert len(long[4]) == 100 and long[4].endswith("...")
+    column = long[4].index("x1") + 4                 # never cut: wrapped under the text
+    assert all(len(line) <= 100 for line in long) and long[-1].endswith("x1  other text")
+    assert all(line.startswith(" " * column + "x") for line in long[5:-1])
+    assert " ".join([long[4][column:]] + long[5:-1]).split() == ["x"] * 80
 
 
 def test_legacy_warnings_get_ids_and_print_at_the_site(tmp_path, monkeypatch):
@@ -691,8 +695,7 @@ def test_gw_report_keeps_its_receipts_and_warning_words(tmp_path, monkeypatch):
     report.legacy_print("[WARN] dropped by gw")
     report.legacy_print("WARNING: kept")
     report.finish(wall=2.0)
-    assert shown[:2] == ["  Z store: host, 2 tiles",
-                         rb.right_align("WARNING  kept", "[unclassified]")]
+    assert shown[:1] == [rb.right_align("WARNING  kept", "[unclassified]")]  # rest: DEBUG
     assert shown[shown.index("WARNINGS") + 3] == \
         "  WARNING [unclassified]              setup   x1  kept"
     assert re.fullmatch(r"LORRAX gw COMPLETED \S+ \S+ \S+ · 2\.0 s · 1 warning", shown[-1])
@@ -734,3 +737,166 @@ def test_htransform_header_keeps_the_energy_source(tmp_path, monkeypatch):
     assert shown[3] == "Command          python -m bandstructure.htransform -i h.in"
     assert shown[-2:] == ["Logs             htransform.out",
                           "Energy source    the WFN's eigenvalues"]
+
+
+# ── manual stages: banner, result line, bar thinning (common.timing / progress) ──
+def test_stage_banner_and_result_lines_match_the_gw_target():
+    assert rb.stage_banner(1, 4, "ISDF basis and Coulomb metric", "14:44:29") == (
+        "[1/4] ISDF basis and Coulomb metric" + " " * 57 + "14:44:29")
+    assert rb.stage_banner(4, 4, "Quasiparticle bands", "14:44:36") == (
+        "[4/4] Quasiparticle bands" + " " * 67 + "14:44:36")
+    line = rb.stage_result("zeta and V(q) on 6 centroids, 9 q", wall_s=2.38, device_gb=0.13)
+    assert line == ("      => zeta and V(q) on 6 centroids, 9 q" + " " * 43
+                    + "2.4 s \u00b7 0.13 GB")
+    assert len(line) == 100
+    assert rb.stage_result("done", wall_s=125.0) == "      => done" + " " * 77 + "2 min 05 s"
+    # a text too long for the line keeps two spaces before its wall
+    assert rb.stage_result("x" * 95, wall_s=1.0).endswith("x  1.0 s")
+
+
+def test_stage_detail_rows_and_a_labelled_table():
+    assert rb.stage_detail("zeta rank", "6 of 6 kept per q (rcond 1e-08)") == [
+        "      zeta rank      6 of 6 kept per q (rcond 1e-08)"]
+    table = ("rule    where                              nodes\n"
+             "static  x 0.072-8.60 eV, R 119                13")
+    assert rb.stage_detail("chi0 rules", table) == [
+        "      chi0 rules     rule    where                              nodes",
+        "                     static  x 0.072-8.60 eV, R 119                13"]
+    assert rb.stage_detail(None, "a\nb") == ["      a", "      b"]
+
+
+def _shown_steps(num_steps, max_updates):
+    import numpy as np
+    from common.progress import _milestone_mask, main_log_mask
+    milestones = _milestone_mask(num_steps, max_updates)
+    shown = main_log_mask(milestones)
+    assert not np.any(shown & ~milestones)                    # a subset of the milestones
+    return ([int(s) for s in np.flatnonzero(shown)],
+            [int(s) for s in np.flatnonzero(milestones)])
+
+
+def test_main_log_shows_at_most_ten_bars_first_and_last():
+    # the GW target's Sigma tau sweep: 127 nodes, 20 milestones -> these 10
+    assert _shown_steps(127, 20)[0] == [1, 14, 28, 41, 54, 67, 81, 94, 107, 127]
+    assert _shown_steps(2, 10)[0] == [1, 2]
+    assert _shown_steps(1, 1)[0] == [1]
+    assert _shown_steps(100, 100)[0] == [1, 10, 20, 30, 40, 50, 60, 70, 80, 100]
+    assert _shown_steps(30, 10)[0] == _shown_steps(30, 10)[1]   # 10 milestones: all shown
+    for n in (3, 7, 10, 11, 50, 127, 1000):
+        for m in (1, 3, 10, 12, 20, 64, n):
+            shown, milestones = _shown_steps(n, m)
+            assert len(shown) <= 10
+            assert shown[0] == milestones[0] and shown[-1] == milestones[-1]
+
+
+def test_progress_note_replaces_the_eta():
+    from common.progress import _format_progress
+    line = _format_progress(1, 127, 0.1, "Sigma tau sweep", "tau node", 10, note="dispatched")
+    assert re.fullmatch(r"\[ \d\d:\d\d:\d\d \| \u2591{10} \|   1% \] "
+                        r"tau node   1 / 127 \u00b7 dispatched", line)
+    assert _format_progress(2, 2, 1.0, "W", "W role", 10).endswith("W role 2 / 2 \u00b7 ETA 0 s")
+
+
+def test_loop_progress_thins_the_main_log_not_the_rank_stream(caplog):
+    import logging
+    from common.log import fields_of
+    from common.progress import LoopProgress
+    caplog.set_level(logging.DEBUG, logger="lorrax")
+    with LoopProgress(127, title="Sigma tau sweep", item_name="tau node", max_updates=20,
+                      enabled=True, note="dispatched") as bar:
+        for _ in range(127):
+            bar.step()
+    rows = [(r.getMessage(), fields_of(r).get("block")) for r in caplog.records
+            if r.name == "lorrax.progress"]
+    main = [text for text, tag in rows if tag == "progress"]
+    rank_only = [text for text, tag in rows if tag is None]
+    assert main[0].startswith("Started Sigma tau sweep at ")
+    assert main[-1].startswith("Finished Sigma tau sweep at ")
+    bars = main[1:-1]
+    assert len(bars) == 10 and len(rank_only) == 10
+    assert all(line.endswith(" \u00b7 dispatched") for line in bars + rank_only)
+    assert [int(line.split("tau node")[1].split("/")[0]) for line in bars] == [
+        1, 14, 28, 41, 54, 67, 81, 94, 107, 127]
+
+
+def test_manual_stage_banner_result_and_nested_traces(caplog):
+    import logging
+    from common import timing
+    from common.log import fields_of
+    caplog.set_level(logging.DEBUG, logger="lorrax")
+    timing.reset()
+    with timing.manual_stage(2, 4, "Screening", name="screening (chi0 -> W)") as st:
+        with timing.section("W[static] chi0 compile", announce=True):
+            pass
+        st.result("W on 9 q: static and GN probe")
+    stage = [(r.levelno, r.getMessage(), fields_of(r)) for r in caplog.records
+             if r.name == "lorrax.stage"]
+    info = [(text, fields) for level, text, fields in stage if level == logging.INFO]
+    assert len(info) == 2
+    banner, result = info
+    assert re.fullmatch(r"\[2/4\] Screening +\d\d:\d\d:\d\d", banner[0])
+    assert len(banner[0]) == 100 and banner[1]["block"] == "stage"
+    assert banner[1]["stage_title"] == "Screening" and banner[1]["stage_index"] == 2
+    assert re.fullmatch(r"      => W on 9 q: static and GN probe +\d+\.\d s"
+                        r"( \u00b7 \d+\.\d\d GB)?", result[0])
+    assert len(result[0]) == 100 and result[1]["block"] == "stage"
+    # the stage's own -> / <- lines and its substeps' traces are DEBUG
+    debug = [text for level, text, _ in stage if level == logging.DEBUG]
+    assert any(text.endswith("-> W[static] chi0 compile") for text in debug)
+    assert any("<- Screening" in text for text in debug)
+    # the TIMING tree keeps the replaced section's node name, with its child
+    paths = [row["path"] for row in timing.records()]
+    assert ("screening (chi0 -> W)",) in paths
+    assert ("screening (chi0 -> W)", "W[static] chi0 compile") in paths
+    timing.reset()
+
+
+def test_manual_stage_that_raises_prints_its_exc_line_not_a_result(caplog):
+    import logging
+    from common import timing
+    caplog.set_level(logging.DEBUG, logger="lorrax")
+    timing.reset()
+    with pytest.raises(ValueError):
+        with timing.manual_stage(1, 1, "Self-energy") as st:
+            st.result("never printed")
+            raise ValueError("GATE probe: refused")
+    info = [r.getMessage() for r in caplog.records
+            if r.name == "lorrax.stage" and r.levelno == logging.INFO]
+    assert len(info) == 2 and info[0].startswith("[1/1] Self-energy")
+    assert "<- Self-energy" in info[1] and "[EXC] ValueError: GATE probe: refused" in info[1]
+    assert not any("=>" in text for text in info)
+    timing.reset()
+
+
+def test_plain_top_level_traces_follow_the_one_switch(caplog, monkeypatch):
+    import logging
+    from common import timing
+    caplog.set_level(logging.DEBUG, logger="lorrax")
+    timing.reset()
+    levels = {}
+    for flag in (True, False):
+        monkeypatch.setattr(timing, "PLAIN_STAGE_TRACES_IN_MAIN_LOG", flag)
+        caplog.clear()
+        with timing.section(f"plain {flag}", announce=True):
+            pass
+        levels[flag] = {r.levelno for r in caplog.records if r.name == "lorrax.stage"}
+    assert levels == {True: {logging.INFO}, False: {logging.DEBUG}}
+    timing.reset()
+
+
+def test_timing_tables_are_debug(caplog):
+    import logging
+    from common import timing
+    from common.log import get_logger
+    caplog.set_level(logging.DEBUG, logger="lorrax")
+    timing.reset()
+    with timing.section("t.table"):
+        pass
+    caplog.clear()
+    timing.report(print_fn=get_logger("probe").info, title="--- mid-run ---")
+    timing.report(title="--- default ---")
+    assert caplog.records and {r.levelno for r in caplog.records} == {logging.DEBUG}
+    rows = []
+    timing.report(print_fn=rows.append, title="kept")
+    assert rows[0] == "kept"
+    timing.reset()

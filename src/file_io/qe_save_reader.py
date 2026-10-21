@@ -43,6 +43,10 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import h5py
 
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Periodic table (Z ≤ 86)
@@ -408,7 +412,7 @@ class CrystalData:
             assert tau_error < atol, (
                 "translations: max periodic fractional |delta| = "
                 f"{tau_error:.2e} (tol {atol:.0e})")
-        print("validate_against_wfn: all checks passed")
+        log.debug("validate_against_wfn: all checks passed")
 
 
 # ═══════════════════════════════════════════════════════════════════════

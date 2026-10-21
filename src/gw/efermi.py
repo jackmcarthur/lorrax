@@ -78,6 +78,10 @@ import jax
 import jax.numpy as jnp
 
 from common.units import RYD_TO_EV
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 __all__ = [
@@ -1111,7 +1115,7 @@ def solve_oneshot_occupations(config, wfn, wfns, material_class,
 		smearing_width_ry=float(local.smearing_width_ry),
 		n_electrons=float(local.n_electrons))
 	if state.occ_hash != local.occ_hash:
-		print_fn(
+		log.info(
 			f"  one-shot occupations: rank {process_rank()} solved occ_hash="
 			f"{local.occ_hash} (mu={float(local.mu_ry):.12g}); using rank 0's "
 			f"{state.occ_hash} (mu={mu_ry:.12g}) so head and body agree")

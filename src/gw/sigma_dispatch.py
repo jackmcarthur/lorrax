@@ -46,6 +46,10 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
+from common.log import get_logger, message
+
+log = get_logger(__name__)
+
 from common.collectives import device_put_process_local
 from common.units import RYD_TO_EV
 from runtime.padding import PaddedAxis
@@ -519,8 +523,7 @@ def _rotate_v_h_to_qp(v_h_dft, U, *, mesh: Mesh):
         out, NamedSharding(mesh, band_rotation_spec()))
 
 
-def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
-                          print_fn=print):
+def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym):
     """Build the sole Hartree representation: exact, live, and G-space."""
     from dataclasses import replace
     from common.four_current_model import resolve_four_current_representation
@@ -531,7 +534,7 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
     include_transverse = bool(config.bispinor)
     hartree_meta = (replace(meta, nspinor=4, npol=4)
                     if include_transverse and int(meta.nspinor) != 4 else meta)
-    print_fn(
+    log.debug(
         "  V_H: exact FFT-grid matrix built live in G-space "
         "(ρ: one psum; Poisson: replicated; matrix elements: two-axis "
         "band sharded; star broadcast stays on device).")
@@ -541,7 +544,7 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
         nb=int(band_slices.b3), mesh=mesh_xy,
         include_transverse=include_transverse,
         bispinor_lift=(representation.current_lift or "raw"),
-        print_fn=print_fn, return_sharded=True)
+        return_sharded=True)
     charge = exact.charge if include_transverse else exact
     window = (slice(None),
               slice(int(band_slices.b0), int(band_slices.b3)),
@@ -750,7 +753,7 @@ def finalize_dynamic_sigma(
             band_axis=sigma_band_axis,
             out_of_grid=config.sigma.out_of_grid,
         )
-        print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
+        log.info(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
 
         sigma_lorentz = None
@@ -1143,7 +1146,7 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
                 "static CH it ANTI-converges, 94.9 -> 288.2 meV MAE as nband "
                 "goes 60 -> 124, overshooting by ~340 meV, while GN-PPM "
                 "improves 171.3 -> 32.8 over the same range")
-        print_fn(
+        log.info(
             f"  Σc band extrapolation: AUTO-DISABLED for compute_mode = "
             f"{getattr(mode, 'value', mode)} ({why}).  {because}.  "
             f"This stage's Σ is the ordinary full-band sum.")
@@ -1256,7 +1259,7 @@ def _packed_dynamic_sigma_channels(
             cur_x, axis1=-2, axis2=-1)))) * RYD_TO_EV
         _corr_scale = float(jnp.max(jnp.abs(jnp.diagonal(
             current_correlation, axis1=-2, axis2=-1)))) * RYD_TO_EV
-        print_fn(
+        log.debug(
             f"  packed photon current sector (static, w = 0): bare "
             f"exchange max|diag| = {_bare_scale:.6e} eV, static "
             f"correlation max|diag| = {_corr_scale:.6e} eV "
@@ -1371,7 +1374,7 @@ def _sigma_hartree_fields(
         with timing.section("sigma.hartree") as sec:
             sig_h, h_transverse = _compute_live_hartree(
                 config, meta, band_slices, mesh_xy,
-                wfn=wfn, sym=sym, print_fn=print_fn)
+                wfn=wfn, sym=sym)
             sec.watch(sig_h, h_transverse)
         sig_h = jnp.asarray(sig_h, dtype=sig_x.dtype)
         if hartree_basis_rotation is not None:
@@ -1447,12 +1450,12 @@ def _compute_mpa_sigma(
         # parse (GATE cd_head_unimplemented).  Everything else on this seam --
         # eta, Fermi reference, branches, finalize -- is shared unchanged.
         fit_path = head_fit_path = fit_identity = fit_digest = None
-        print_fn("  Sigma frequency integration: contour_deformation (gw.cd)")
+        log.debug("  Sigma frequency integration: contour_deformation (gw.cd)")
     else:
         fit_path, head_fit_path, fit_identity, fit_digest = _mpa_sigma_model_resources(
             W_by_role, sigma_w_model, config.head.correction)
     _xi = sigma_regularization_for_config(config)
-    print_fn(_xi.describe())
+    log.debug(_xi.describe())
     if material_class == "metal":
         if occupation_state is None:
             raise ValueError(
@@ -1468,9 +1471,9 @@ def _compute_mpa_sigma(
     head = None
     if head_fit_path is None:
         if sector_handle.get("direct_photon_head") == "first_order_cc_ct_tc_tt":
-            print_fn("  shared-pole photon Γ: first-order direct CC/CT/TC/TT included in sector poles")
+            log.info("  shared-pole photon Γ: first-order direct CC/CT/TC/TT included in sector poles")
         else:
-            print_fn("  shared-pole scalar head: OFF by explicit head_correction policy")
+            log.info("  shared-pole scalar head: OFF by explicit head_correction policy")
     else:
         head = (head_fit_path if isinstance(head_fit_path, dict) else
                 _bundle_reader.read_head_fit_collective(
@@ -1485,7 +1488,7 @@ def _compute_mpa_sigma(
             head.get("occupation_stamps") or {}, occupation_state,
             compatible_occ_hashes=compatible_occ_hashes)
         if head_occ_match == "legacy_zero_pad":
-            print_fn(
+            log.debug(
                 "  MPA scalar head: occupation provenance matched an exact "
                 "legacy square-mesh zero-pad encoding.")
     from .dynamic_sigma import sigma_on_shell_request
@@ -1713,7 +1716,7 @@ def _compute_mpa_sigma(
         sweep_seconds = time.monotonic() - sweep_started
         pays, predicted = checkpoint_pays(stored or {}, sweep_seconds)
         named = stored is not None and checkpointable(stored)
-        print_fn(f"Sigma checkpoint: {'written' if pays and named else 'skipped'} (sweep "
+        log.debug(f"Sigma checkpoint: {'written' if pays and named else 'skipped'} (sweep "
                  f"{sweep_seconds:.0f} s{' >= ' if pays else ' < '}{PAYOFF:g} x "
                  f"write est {predicted:.0f} s"
                  f"{'' if named else '; a value has no named sharding or its own request'})")
@@ -1728,15 +1731,20 @@ def _compute_mpa_sigma(
                         host=dict(host, head_diag=None if head_diag is None else
                                   asdict(head_diag)),
                         mesh=mesh_xy)
-                print_fn(f"Sigma checkpoint: {nbytes / 2**30:.2f} GiB of swept cubes "
+                log.debug(f"Sigma checkpoint: {nbytes / 2**30:.2f} GiB of swept cubes "
                          f"written in {seconds:.1f} s to {checkpoint[0]}")
             except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 # A restart point never costs the sweep it protects; the
                 # collective writers raise the same refusal on every rank.
                 discard_sigma_checkpoint(checkpoint[0])
-                print_fn(f"WARNING Sigma checkpoint: write failed and {checkpoint[0]} was "
-                         f"removed; finalizing without it ({type(exc).__name__}: "
-                         f"{str(exc)[:300]})")
+                log.warning(
+                    f"Sigma checkpoint: write failed and {checkpoint[0]} was "
+                    f"removed; finalizing without it",
+                    extra=message(
+                        "sigma_checkpoint_write_failed",
+                        found=("write error", f"{type(exc).__name__}: {str(exc)[:300]}"),
+                        lines=("the Sigma sweep result is unaffected; a restart "
+                               "recomputes the sweep",)))
     return finalize(cubes, host)
 
 
@@ -1749,7 +1757,7 @@ def _compute_ppm_sigma(
     """Produce the two-point plasmon-pole Sigma result."""
     from .ppm_pipeline import compute_ppm_sigma_pipeline
     if bool(getattr(config, "restart", False)):
-        print_fn("Sigma checkpoint: none on the PPM route (no W digest reaches this seam "
+        log.debug("Sigma checkpoint: none on the PPM route (no W digest reaches this seam "
                  "to authenticate one); the sweep is recomputed")
     if mode.ppm_model is None:
         raise NotImplementedError(

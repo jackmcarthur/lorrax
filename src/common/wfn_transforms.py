@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 from functools import partial
 from typing import Sequence, TYPE_CHECKING
 
@@ -14,6 +15,8 @@ from common.staged_reshard import band_to_product_r_reshard
 from common.wfn_layout import band_sphere_spec
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import local_fftn3, local_ifftn3
+
+_LOG = logging.getLogger("lorrax.wfn_transforms")
 
 if TYPE_CHECKING:
     from common.meta import Meta
@@ -2139,7 +2142,7 @@ def _centroid_fft_scan_chunk(
         cs = max(1, min(cs_hint, cs_budget))
     else:
         cs = cs_budget
-    print(
+    _LOG.debug(
         "[load_centroids planner] "
         f"persistent={persistent_bytes / 2**30:.2f}, "
         f"scan_tile_rows={cs_budget}, "

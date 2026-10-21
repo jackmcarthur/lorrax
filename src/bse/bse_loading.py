@@ -22,6 +22,9 @@ from .bse_preconditioner import compute_pair_amplitude
 from .bse_window import (PAD_EPS_GUARD_RY, _log0, _parse_wfn_path, resolve_n_occ,
                          assert_bse_window_in_zeta_training)
 from file_io.restart_bundle import (apply_eqp_corrections)
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 def _pad_last_axis(x: jax.Array, target: int) -> jax.Array:
@@ -307,9 +310,9 @@ def load_bse_data_from_restart_sharded(
                 V_q0, W_q, g0_X, g0_Y, vhead, whead, cell_volume,
                 w0_ready=w0_ready, nk=nkx * nky * nkz, q0_head=q0_head,
                 defer_whead=defer_whead)
-            print(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
-                  f"V_cell={cell_volume:.2f}): {head_str} "
-                  f"[source: {head_src}]")
+            log.info(f"BSE-sharded: q=0 head injected (rank-1, dual-sharded G0, "
+                     f"V_cell={cell_volume:.2f}): {head_str} "
+                     f"[source: {head_src}]")
             if defer_whead and w0_ready and whead is not None:
                 head_channel = {
                     "whead": float(complex(whead[0]).real),
@@ -339,7 +342,7 @@ def load_bse_data_from_restart_sharded(
                 "or write ``vhead``/``whead`` datasets into the restart.  "
                 "(Recompute-from-WFN is not available at the loader.)")
             warnings.warn(msg, RuntimeWarning, stacklevel=2)
-            print(f"BSE-sharded: [WARN] {msg}")
+            log.debug(f"BSE-sharded: [WARN] {msg}")   # warnings.warn above carries the warning
 
     # Exchange pair amplitude M(k,c,v,μ) = Σ_s conj(ψ_c) ψ_v, hoisted so the
     # per-iteration matvec receives it instead of rebuilding it from ψ.  ONE

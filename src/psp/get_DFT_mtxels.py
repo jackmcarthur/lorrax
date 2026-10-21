@@ -70,6 +70,9 @@ import h5py
 import psp.vnl_ops as vnl_ops
 
 import common.timing as timing
+from common.log import get_logger, message
+
+log = get_logger(__name__)
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                  # owner's workspace fix -- see _services.py)
 
@@ -85,7 +88,7 @@ _services.ensure_on_path()
 # dual spelling of it would be two module objects waiting to happen.
 
 
-def report_devices(print_fn=print) -> None:
+def report_devices(print_fn=None) -> None:
     """Lightweight device banner — call it, do not trigger it on import.
 
     This used to run at module IMPORT time.  ``jax.devices()`` brings up
@@ -99,7 +102,8 @@ def report_devices(print_fn=print) -> None:
     try:
         devs = jax.devices()
         plat = devs[0].platform if devs else 'none'
-        print_fn(f"JAX: {len(devs)} {plat} devices")
+        (print_fn if print_fn is not None else log.info)(
+            f"JAX: {len(devs)} {plat} devices")
     except Exception:
         pass
 
@@ -637,7 +641,7 @@ def build_hartree_potential(
     truncation_2d: bool,
     expected_electrons: float | None = None,
     charge_tol: float = 1.0e-3,
-    print_fn=print,
+    print_fn=None,
 ) -> jnp.ndarray:
     """ρ(r) → V_H(r) (Ry) with a hard charge-normalisation check.
 
@@ -665,7 +669,8 @@ def build_hartree_potential(
     guard on the projection: a star average cannot change ∫ρ, so anything
     that did would surface here rather than downstream in V_H.
     """
-    rho_r = symmetrize_valence_density(rho_r, wfn, print_fn=print_fn)
+    say = print_fn if print_fn is not None else log.info
+    rho_r = symmetrize_valence_density(rho_r, wfn, print_fn=say)
     volume = float(wfn.cell_volume)
     ngrid = int(np.prod(rho_r.shape))
     V_H_r, rho_sum, rho_v_sum = _hartree_potential_and_sums(
@@ -675,7 +680,7 @@ def build_hartree_potential(
     charge = float(rho_sum) * volume / ngrid
     if expected_electrons is not None:
         rel = abs(charge - expected_electrons) / max(1.0, abs(expected_electrons))
-        print_fn(
+        say(
             f"    rho normalisation: ∫ρ d³r = {charge:.6f} e "
             f"(expected {expected_electrons:.6f}, rel err {rel:.2e})"
         )
@@ -687,12 +692,12 @@ def build_hartree_potential(
                 "term in H0 — refusing to fold in a mis-normalised density."
             )
     else:
-        print_fn(f"    rho normalisation: ∫ρ d³r = {charge:.6f} e")
-    print_fn(
+        say(f"    rho normalisation: ∫ρ d³r = {charge:.6f} e")
+    say(
         f"    Hartree Coulomb: {'2D slab-truncated (Ismail-Beigi)' if truncation_2d else '3D periodic'}"
     )
     hartree_energy = 0.5 * float(rho_v_sum) * volume / ngrid
-    print_fn(f"    Hartree energy (½∫ρV_H) = {hartree_energy:.6f} Ry")
+    say(f"    Hartree energy (½∫ρV_H) = {hartree_energy:.6f} Ry")
     return V_H_r
 
 
@@ -933,23 +938,23 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
         pseudos=pseudos, wfn=wfn, sys_dim=sys_dim,
         caller="get_H_matrix_elements",
     )
-    print("\nComputing DFT Hamiltonian (Ry units)...")
-    print(f"  Coulomb truncation: "
-          f"{'2D slab' if ctx.truncation_2d else '3D bulk'} (sys_dim={sys_dim})")
+    log.info("\nComputing DFT Hamiltonian (Ry units)...")
+    log.info(f"  Coulomb truncation: "
+             f"{'2D slab' if ctx.truncation_2d else '3D bulk'} (sys_dim={sys_dim})")
 
     # 1. Reshard wavefunctions to distribute k-points over XY grid
-    print("  Resharding wavefunctions to device mesh")
+    log.debug("  Resharding wavefunctions to device mesh")
     wfn_k_sharded = shard_over_k(global_psi_G, mesh_xy)
     
     # 2. Prepare atomic structure data (replicated on all devices)
     atom_positions = jnp.asarray(wfn.atom_crys, dtype=jnp.float64)  # Crystal coordinates
     atom_types = jnp.asarray(wfn.atom_types, dtype=jnp.int32)
     bvec = jnp.asarray(wfn.bvec, dtype=jnp.float64)
-    print(f"\nSystem: {len(atom_positions)} atoms, {len(pseudos)} pseudopotential types")
+    log.info(f"\nSystem: {len(atom_positions)} atoms, {len(pseudos)} pseudopotential types")
     assignments = build_atom_pp_assignments(atom_positions, atom_types, pseudos)
     for ap in assignments:
         ppname = os.path.basename(getattr(ap.pseudo, '_source_path', 'N/A')) if ap.pseudo else 'None'
-        print(f"  atom {ap.index}: Z={ap.atomic_number} elem={ap.element} pp={ppname}")
+        log.info(f"  atom {ap.index}: Z={ap.atomic_number} elem={ap.element} pp={ppname}")
 
     species_payload: list[tuple[object, np.ndarray]] = []
     species_tmp: dict[int, dict[str, object]] = {}
@@ -1006,9 +1011,9 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
             "get_H_matrix_elements: shared exact-Hartree matrix has shape "
             f"{hartree_shape}, expected {expected_hartree_shape} for the "
             "resident output carrier.")
-    print("\n  Using shared distributed exact FFT-grid Hartree matrix")
+    log.debug("\n  Using shared distributed exact FFT-grid Hartree matrix")
     # Build local ionic potential on rho grid via G-space and FFT (return total only)
-    print("  Computing local ionic potential V_loc(r) on rho grid...")
+    log.debug("  Computing local ionic potential V_loc(r) on rho grid...")
     try:
         rho_grid = tuple(int(x) for x in getattr(wfn, 'grid_rho'))
     except Exception:
@@ -1026,7 +1031,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
     V_loc_r = jnp.asarray(V_loc_r, dtype=jnp.float64)
 
     # 4. Execute DFT Hamiltonian calculation over k-points using precomputed G-vectors
-    print("\n  Building H(k) on first k-point for debug...")
+    log.debug("\n  Building H(k) on first k-point for debug...")
     H_list = []
     first_k_components = None
     for i in range(1):
@@ -1066,7 +1071,7 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
 
     H_sharded = jnp.stack(H_list, axis=0)
     
-    print(f"  Completed: DFT Hamiltonian matrix shape {H_sharded.shape}")
+    log.debug(f"  Completed: DFT Hamiltonian matrix shape {H_sharded.shape}")
     
     return H_sharded, rho_valence, first_k_components
     
@@ -1104,9 +1109,9 @@ def get_H_matrix_elements(wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
 
 def main(argv=None):
     """Main function for nonlocal pseudopotential calculation."""
-    print("="*60)
-    print("Nonlocal Pseudopotential Matrix Elements Calculator")
-    print("="*60)
+    log.info("="*60)
+    log.info("Nonlocal Pseudopotential Matrix Elements Calculator")
+    log.info("="*60)
 
     argp = argparse.ArgumentParser(description="Nonlocal pseudopotential V_NL calculator")
     argp.add_argument(
@@ -1121,7 +1126,7 @@ def main(argv=None):
 
     # Read input parameters (canonical parser — single source of truth)
     from gw.gw_config import read_lorrax_input as read_cohsex_input
-    print(f"\nReading input from: {args.input}")
+    log.info(f"\nReading input from: {args.input}")
     params = read_cohsex_input(args.input)
     
     # Resolve relative paths against the input file's directory
@@ -1140,60 +1145,60 @@ def main(argv=None):
     # by accident on the same deck.
     sys_dim = int(params.get("sys_dim") if params.get("sys_dim") is not None else 3)
 
-    print(f"Parameters: nval={nval}, ncond={ncond}, nband={nband}, "
-          f"bispinor={bispinor}, sys_dim={sys_dim}")
+    log.info(f"Parameters: nval={nval}, ncond={ncond}, nband={nband}, "
+             f"bispinor={bispinor}, sys_dim={sys_dim}")
     
     # Load wavefunction file
-    print(f"\nLoading wavefunction file: {os.path.basename(params['wfn_file'])}")
+    log.info(f"\nLoading wavefunction file: {os.path.basename(params['wfn_file'])}")
     with timing.section("psp.get_DFT_mtxels.load_wfn"):
         try:
             wfn = WfnLoader(params["wfn_file"])
-            print(f"  Success: {wfn.nkpts} k-points, {wfn.nbands} bands, {wfn.nelec} electrons")
+            log.info(f"  Success: {wfn.nkpts} k-points, {wfn.nbands} bands, {wfn.nelec} electrons")
         except Exception as e:
-            print(f"  Error loading WFN file: {e}")
+            log.error(f"  Error loading WFN file: {e}")
             return 1
     
     # Initialize symmetry mappings
-    print("\nInitializing symmetry mappings...")
+    log.info("\nInitializing symmetry mappings...")
     with timing.section("psp.get_DFT_mtxels.symmetry"):
         sym = wfn.symmetry()
-    print(f"  Success: {sym.nk_tot} total k-points, {sym.nk_red} irreducible k-points")
+    log.info(f"  Success: {sym.nk_tot} total k-points, {sym.nk_red} irreducible k-points")
     
     # Get band ranges
     nvrange, ncrange, nsigmarange, n_fullrange, n_valrange = get_bandranges(
         nval, ncond, nband, wfn.nelec
     )
-    print(f"Band ranges: valence={nvrange}, conduction={ncrange}, sigma={nsigmarange}")
+    log.info(f"Band ranges: valence={nvrange}, conduction={ncrange}, sigma={nsigmarange}")
     
     # Create system metadata
-    print("\nCreating system metadata...")
+    log.info("\nCreating system metadata...")
     meta = Meta.from_system(wfn, sym, nval, ncond, nband, 0, bispinor)  # n_rmu=0 for now
-    print(f"  FFT grid: {meta.fft_grid}")
-    print(f"  Spinor components: {meta.nspinor}")
+    log.info(f"  FFT grid: {meta.fft_grid}")
+    log.info(f"  Spinor components: {meta.nspinor}")
 
     # Density-grid cutoff (Ry): explicit ``ecutrho`` from the input, else default
     # to the WFN's own ``ecutwfc`` so the rho grid is always attached.
     _ecutrho_in = params.get("ecutrho")
     ecutrho_ry = float(_ecutrho_in) if _ecutrho_in is not None else float(wfn.ecutwfc)
     setattr(wfn, 'grid_rho', tuple(2 * n for n in meta.fft_grid))  # 2× wavefunction grid
-    print(f"  Using ecutrho = {ecutrho_ry:.3f} Ry "
-          f"({'input' if _ecutrho_in is not None else 'default=WFN ecutwfc'}); "
-          f"rho grid = {wfn.grid_rho}")
+    log.info(f"  Using ecutrho = {ecutrho_ry:.3f} Ry "
+             f"({'input' if _ecutrho_in is not None else 'default=WFN ecutwfc'}); "
+             f"rho grid = {wfn.grid_rho}")
     
-    mesh_xy = prepare_mesh(print_fn=print)
-    print(f"JAX device mesh: {'x'.join(str(int(n)) for n in mesh_xy.devices.shape)}"
-          f" = {int(mesh_xy.devices.size)} devices")
+    mesh_xy = prepare_mesh(print_fn=log.info)
+    log.info(f"JAX device mesh: {'x'.join(str(int(n)) for n in mesh_xy.devices.shape)}"
+             f" = {int(mesh_xy.devices.size)} devices")
     
     # Load G-vectors and wavefunction coefficients
-    print("\nLoading wavefunction coefficients to devices...")
+    log.info("\nLoading wavefunction coefficients to devices...")
     brange = (0, nsigmarange[1])  # Load all bands for now
     with timing.section("psp.get_DFT_mtxels.read_Gvecs") as timer_read:
         global_psi_G, nb_actual = read_Gvecs_to_devices(wfn, sym, brange, meta, bispinor, mesh_xy)
         timer_read.watch(global_psi_G)
-    print(f"  Loaded {nb_actual} bands in G-space, shape: {global_psi_G.shape}")
+    log.debug(f"  Loaded {nb_actual} bands in G-space, shape: {global_psi_G.shape}")
     
     # Load pseudopotentials from working directory
-    print("\nScanning for pseudopotential files...")
+    log.info("\nScanning for pseudopotential files...")
     with timing.section("psp.get_DFT_mtxels.load_pseudos"):
         pseudos = load_pseudopotentials(input_dir)
     
@@ -1208,17 +1213,17 @@ def main(argv=None):
         exact_hartree_full = compute_hartree_matrix(
             wfn, sym, meta, truncation_2d=(sys_dim == 2),
             nb=int(nb_actual), mesh=mesh_xy, include_transverse=False,
-            print_fn=print)
+            print_fn=log.info)
 
     # Compute DFT Hamiltonian matrix elements
-    print(f"\nComputing DFT Hamiltonian matrix elements...")
+    log.info(f"\nComputing DFT Hamiltonian matrix elements...")
     H_DFT, rho_valence, k0 = get_H_matrix_elements(
         wfn, sym, pseudos, global_psi_G, meta, mesh_xy,
         exact_hartree_full,
         sys_dim=sys_dim)
-    print(f"  Hamiltonian matrix elements shape: {H_DFT.shape}")
+    log.debug(f"  Hamiltonian matrix elements shape: {H_DFT.shape}")
     
-    print(f"  Total electrons in system: {wfn.nelec}")
+    log.info(f"  Total electrons in system: {wfn.nelec}")
     # Report both grid-sum and ΔV-weighted integral of the valence density (rho grid)
     if rho_valence is not None:
         nx2, ny2, nz2 = rho_valence.shape
@@ -1226,7 +1231,7 @@ def main(argv=None):
         raw_sum = float(jnp.sum(rho_valence))
         deltaV = float(wfn.cell_volume) / Ntot
         charge_int = raw_sum * deltaV
-        print(f"  Valence density (rho grid): Σ rho = {raw_sum:.6f}, ΔV = {deltaV:.6e}, ∫ rho d³r = {charge_int:.6f}")
+        log.info(f"  Valence density (rho grid): Σ rho = {raw_sum:.6f}, ΔV = {deltaV:.6e}, ∫ rho d³r = {charge_int:.6f}")
 
     # Write requested k=0 diagonal elements: (band id, K, V_ion, V_H, K+I+H)
     try:
@@ -1255,7 +1260,7 @@ def main(argv=None):
                 fmt=['%4d','% .5f','% .5f','% .5f','% .5f','% .5f'],
                 header='band_id  K(Ry)  V_ion(Ry)  V_H(Ry)  V_NL(Ry)  K+I+H+NL(Ry)'
             )
-            print(f"\nWrote k=0 diagonals to {out_path}")
+            log.info(f"\nWrote k=0 diagonals to {out_path}")
 
             # If a reference exists (k0_diag_check), compare K+I+H diagonals
             # Accept either k0_diag_check or k0_diag_check.txt
@@ -1276,8 +1281,8 @@ def main(argv=None):
                     mref = min(m, ref_vec.shape[0])
                     ours = out[:mref, 5]
                     diff = ours - ref_vec[:mref]
-                    print(f"  k0_diag_check present; comparing first {mref} K+I+H+NL diagonals...")
-                    print(f"    max|Δ|={np.max(np.abs(diff)):.5e}, rms|Δ|={np.sqrt(np.mean(diff**2)):.5e}")
+                    log.info(f"  k0_diag_check present; comparing first {mref} K+I+H+NL diagonals...")
+                    log.info(f"    max|Δ|={np.max(np.abs(diff)):.5e}, rms|Δ|={np.sqrt(np.mean(diff**2)):.5e}")
 
                     # Constrained fit: fix a=1 for K and e=1 for V_NL; solve for b,d in ref - K - V_NL ≈ b*V_ion + d*V_H
                     Kcol   = out[:mref, 1]
@@ -1298,29 +1303,34 @@ def main(argv=None):
                     err_vec = y_fit - y
                     l2 = float(np.linalg.norm(err_vec))
                     rmse = float(np.sqrt(np.mean(err_vec**2)))
-                    print("  Unconstrained fit: ref ≈ A*K + B*Vion + C*VH + D*VNL + E:")
-                    print(f"    A={A:+.6f}  B={B:+.6f}  C={C:+.6f}  D={D:+.6f}  E={E:+.6f}")
-                    print(f"    total_L2={l2:.6e}  rmse={rmse:.6e}")
+                    log.info("  Unconstrained fit: ref ≈ A*K + B*Vion + C*VH + D*VNL + E:")
+                    log.info(f"    A={A:+.6f}  B={B:+.6f}  C={C:+.6f}  D={D:+.6f}  E={E:+.6f}")
+                    log.info(f"    total_L2={l2:.6e}  rmse={rmse:.6e}")
                 except Exception as e:
-                    print(f"  Warning: failed to compare with k0_diag_check ({e})")
+                    log.warning(
+                        f"failed to compare with k0_diag_check ({e})",
+                        extra=message(id="k0_diag_compare_failed",
+                                      found=("k0_diag_check", str(e))))
 
             # Vloc-only fit removed per user request
             
     except Exception as e:
-        print(f"Warning: failed to write k=0 diagonals ({e})")
+        log.warning(f"failed to write k=0 diagonals ({e})",
+                    extra=message(id="k0_diag_write_failed",
+                                  found=("k0_diag.txt", str(e))))
 
-    print("\nDFT Hamiltonian calculation completed successfully!")
-    print("="*60)
+    log.info("\nDFT Hamiltonian calculation completed successfully!")
+    log.info("="*60)
 
     # NO kin_ion.h5 IS WRITTEN HERE any more.  This CLI is the per-term
     # H(k=0) DIAGNOSTIC; the generator is ``python -m gw.kin_ion_io``, which
     # inherits the deck's sys_dim, distributes the k loop and stores V_H as
     # its own dataset.  Writing both from here is what let a 3D-truncated
     # file overwrite a 2D-truncated one — see the removal note above.
-    print("kin_ion.h5 is NOT written by this diagnostic; "
-          "use `python -m gw.kin_ion_io -i <deck> -o kin_ion.h5`.")
+    log.info("kin_ion.h5 is NOT written by this diagnostic; "
+             "use `python -m gw.kin_ion_io -i <deck> -o kin_ion.h5`.")
 
-    timing.report(title="--- Timing (seconds) ---")
+    timing.report(print_fn=log.info, title="--- Timing (seconds) ---")
 
     return 0
 

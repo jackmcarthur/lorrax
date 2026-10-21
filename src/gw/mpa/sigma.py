@@ -15,6 +15,10 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local, device_put_process_local_cached
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common import timing
 from common.progress import LoopProgress
 from common.units import RYD_TO_EV
@@ -1630,7 +1634,7 @@ def _integrate_sigma_batches(
             window_table = _sigma_window_table(accumulator, w_synthesis, plan, tau_capacity)
             counter = accumulator.window_counter()
             if request is not None:
-                print_fn(f"  Sigma window table: {len(window_table.nodes)} windows, "
+                log.debug(f"  Sigma window table: {len(window_table.nodes)} windows, "
                          f"{window_table.nbytes / 2**20:.2f} MiB per device")
 
         n_sweeps = n_tau = 0
@@ -1652,8 +1656,8 @@ def _integrate_sigma_batches(
                     if _batch_rows(_row, _batch) is not None:
                         total_tau += len(np.asarray(_row.window.nodes.t))
         progress = LoopProgress(
-            max(1, total_tau), print_fn, title="Sigma tau sweep",
-            item_name="tau node", max_updates=20)
+            max(1, total_tau), title="Sigma tau sweep",
+            item_name="tau node", max_updates=20, note="dispatched")
         progress.start()
     for lo, Omega, B, B_odd in batches:
         if not synthesis and getattr(meta, 'mu_basis', None) is not None:
@@ -1788,7 +1792,7 @@ def _integrate_sigma_batches(
                         largest = max(range(len(compiled_all)), key=lambda i: int(
                             aot_kernel_peak_bytes(compiled_all[i]).total))
                         tau_kernel.admit(compiled_all[largest], programs[largest][1])
-                    print_fn(
+                    log.debug(
                         "  MPA Sigma sweep begin: one executable per window "
                         "prewarmed")
                     sweep_started = True
@@ -1859,7 +1863,7 @@ def _integrate_sigma_batches(
         # Format read by the sandbox parser (tools/parse_lorrax_sigma_run.py);
         # every node now runs inside its window's executable, so none is
         # left undispatched.
-        print_fn(
+        log.info(
             f"  MPA Sigma: {n_tau} tau dispatches in {n_sweeps} sweeps "
             f"({n_poles} poles, batches of {batch_size}); "
             f"0 undispatched logical tau; "
@@ -1868,7 +1872,7 @@ def _integrate_sigma_batches(
         if max_b or max_d:
             ratio = max_d / max_b if max_b else np.inf
             state = "D=0 twin" if odd_residue_off else "enabled"
-            print_fn(
+            log.info(
                 f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
                 f"max|D|/max|B|={ratio:.12e}")
         return SigmaOmegaResult(
@@ -2308,6 +2312,31 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
         cond_weight=1.0 - f, val_weight=f)
 
 
+def _note_sc_fixed_quadrature(geometry, reasons) -> None:
+    """An SC map's held Sigma rules: the ``sc.quadrature`` record (JSON
+    sidecar) and, when some window was rebuilt, the map's ``changes`` row
+    (``gw.sc_report``).  Values only; nothing here is computed."""
+    from common.log import record
+    from gw import sc_report
+    windows = [dict(name=w["name"], n_tau=w["node_count"], rule=w["rule_source"])
+               for branch in geometry["branches"] for w in branch["windows"]
+               if w.get("sc_fixed_rule")]
+    rebuilt = geometry["sc_fixed_rebuilds_this_iteration"]
+    log.debug("SC fixed quadrature receipt", extra=record(
+        "sc.quadrature", iteration=geometry["sc_fixed_iteration"],
+        rules=geometry["sc_rule_mode"], plan=geometry["sc_plan_event"],
+        escaped=geometry["sc_fixed_escaped_windows"],
+        n_windows=geometry["n_windows"], rebuilds_this_iteration=rebuilt,
+        rebuilds_total=geometry["sc_fixed_total_rebuild_count"],
+        pair_cost=geometry["window_tau_pairs"],
+        recompute=dict(sorted(reasons.items())), windows=windows))
+    if rebuilt and geometry["sc_rule_mode"] == "frozen":
+        run = sc_report.last_run()
+        if run is not None:
+            run.change(None, "rules", f"Sigma rules: {rebuilt} of "
+                                      f"{geometry['n_windows']} windows rebuilt")
+
+
 def compute_sigma_c_mpa_omega_grid(
     wfns,
     fit_src,
@@ -2429,7 +2458,7 @@ def compute_sigma_c_mpa_omega_grid(
             schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout,
                                                      linalg=linalg)
                         if sector_context is None else sector_context["schedule"](ledger))
-        print_fn(f"  shared-pole Sigma capacity: {schedule}")
+        log.debug(f"  shared-pole Sigma capacity: {schedule}")
     elif isinstance(fit_src, MemoryPoleSource):
         # In-memory GN/HL poles: no store, so no file identity to check.
         ledger = fit_src.ledger
@@ -2537,7 +2566,9 @@ def compute_sigma_c_mpa_omega_grid(
                 group_fixed=group_fixed,
                 support_window_ry=support_window_ry, support_top_ev=support_top_ev)
         quadrature_log.record_sigma_plan(geometry)
-        print_fn(
+        from gw.production_report import log_sigma_rules
+        log_sigma_rules(geometry)
+        log.debug(
             f"  MPA windows [box]: "
             f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
             f"eps={geometry['eps']:.3g}, "
@@ -2549,7 +2580,7 @@ def compute_sigma_c_mpa_omega_grid(
             f"rules_built={geometry['rules_built']}")
         if geometry["sc_fixed_quadrature"]:
             reasons = geometry.get("sc_fixed_recompute_reasons") or {}
-            print_fn(
+            log.debug(
                 "  SC fixed quadrature: "
                 f"iteration={geometry['sc_fixed_iteration']}, "
                 f"rules={geometry['sc_rule_mode']}, "
@@ -2578,9 +2609,10 @@ def compute_sigma_c_mpa_omega_grid(
                 f"(far x{geometry['sc_far_pole_factor']:g}), "
                 f"tau_capacity={geometry['sc_tau_capacity']}")
             for name, reason in sorted(reasons.items()):
-                print_fn(
+                log.debug(
                     f"    SC fixed quadrature recompute: {name!r} "
                     f"({reason})")
+            _note_sc_fixed_quadrature(geometry, reasons)
         for branch in geometry["branches"]:
             for window in branch["windows"]:
                 prefix = (
@@ -2594,7 +2626,7 @@ def compute_sigma_c_mpa_omega_grid(
                     "eV, ")
                 if window["sc_fixed_rule"]:
                     box = tuple(value * RYD_TO_EV for value in box)
-                print_fn(
+                log.debug(
                     f"{prefix}{window['name']}: "
                     f"n_tau={window['node_count']}, "
                     f"nodes={window['node_digest']}, "
@@ -2616,7 +2648,7 @@ def compute_sigma_c_mpa_omega_grid(
                         layout=schedule.get("factor_layout", wfns.layout))
                         if sector_context is None else sector_context["synthesis"](
                             reader, ledger, frequencies, schedule))
-                    print_fn("  " + getattr(synthesis, "path_note",
+                    log.debug("  " + getattr(synthesis, "path_note",
                                             "route Sigma W synthesis: pair (no per-branch orientation)"))
                 # A sector's caller owns its synthesis lifetime
                 # (compute_sector_sigma); the scalar model's ends here.

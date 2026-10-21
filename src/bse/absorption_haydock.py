@@ -61,6 +61,9 @@ from .bse_io import (load_bse_data_from_restart_sharded)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_2d, make_bse_shardings
 from .bse_stack_matvec import build_bse_stack_matvec
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 #: Cartesian polarization letters, in the order of the dipole's first axis and
@@ -239,7 +242,7 @@ def write_haydock_outputs(*, out_prefix, pols, alphas, betas, norms, d_alpha,
         ]
         write_absorption_dat(out_dat, omegas_eV, eps2[:, col], eps1[:, col],
                              jdos[:, col], header)
-        print(f"[haydock] wrote {out_dat}")
+        log.info(f"[haydock] wrote {out_dat}")
     out_h5 = out_prefix_p.with_name(f"{out_prefix_p.name}.h5")
     write_absorption_h5(
         out_h5,
@@ -258,7 +261,7 @@ def write_haydock_outputs(*, out_prefix, pols, alphas, betas, norms, d_alpha,
             **(metadata or {}),
         },
     )
-    print(f"[haydock] wrote {out_h5}")
+    log.info(f"[haydock] wrote {out_h5}")
 
 
 def absorption_from_haydock(
@@ -318,7 +321,7 @@ def run_haydock(
     mesh_xy = create_mesh_2d()
     grid_x, grid_y = mesh_xy.devices.shape
 
-    print(f"[haydock] loading BSE data from {restart_file}")
+    log.info(f"[haydock] loading BSE data from {restart_file}")
     data = load_bse_data_from_restart_sharded(
         restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
         input_file=input_file, n_occ=n_occ, eqp_file=eqp_file,
@@ -357,22 +360,22 @@ def run_haydock(
     # pre-snap assumption ``bse_jax``'s ``--write-eigs`` path made loudly.
     n_val_eff = int(data["n_val"])
     n_cond_eff = int(data["n_cond"])
-    print(f"[haydock] mesh {grid_x}x{grid_y}, problem "
-          f"{nc_pad} cond × {nv_pad} val × {nk} k = {nc_pad * nv_pad * nk}")
+    log.info(f"[haydock] mesh {grid_x}x{grid_y}, problem "
+             f"{nc_pad} cond × {nv_pad} val × {nk} k = {nc_pad * nv_pad * nk}")
 
     d_alpha, de_cv = window_dipoles(data, dipole_file, n_occ=n_occ,
                                     wfn_path=_parse_wfn_path(input_file))
-    print(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond_eff}, "
-          f"nv={n_val_eff})")
+    log.debug(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond_eff}, "
+              f"nv={n_val_eff})")
     d_block_np = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)
 
-    print(f"[haydock] running {len(pols)}-block recurrence × {n_iter} iters "
-          f"(polarizations {''.join(POLARIZATIONS[a] for a in pols)}) …")
+    log.info(f"[haydock] running {len(pols)}-block recurrence × {n_iter} iters "
+             f"(polarizations {''.join(POLARIZATIONS[a] for a in pols)}) …")
     alphas, betas, norms = haydock_coefficients(
         data, mesh_xy, d_block_np[list(pols)], n_iter)
-    print(f"[haydock] α_1 = {alphas[:, 0]}  (Ry)")
-    print(f"[haydock] β_1 = {betas[:, 0]}  (Ry)")
-    print(f"[haydock] ‖d‖ = {norms}")
+    log.debug(f"[haydock] α_1 = {alphas[:, 0]}  (Ry)")
+    log.debug(f"[haydock] β_1 = {betas[:, 0]}  (Ry)")
+    log.debug(f"[haydock] ‖d‖ = {norms}")
 
     write_haydock_outputs(
         out_prefix=out_prefix, pols=pols, alphas=alphas, betas=betas,

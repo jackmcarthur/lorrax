@@ -21,6 +21,10 @@ import numpy as np
 import h5py
 
 import common.timing as timing
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 from common import rank_criterion
 from common import spectral_closure
 from common import jax_profile
@@ -125,7 +129,7 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
 		# Unreadable/partial file: say so, then let the writer deal with it.
 		# ``readable=False`` with the file present means exactly what the
 		# ``except Exception`` here used to catch.
-		print_fn(f"  [zeta guard] could not read {zeta_h5_path} "
+		log.info(f"  [zeta guard] could not read {zeta_h5_path} "
 		         f"({probe.error}); continuing.")
 		return
 	existing = probe.mu_extent          # μ off the ζ BLOCK (dispatch: public API)
@@ -141,7 +145,7 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
 			f"input file there), or move/delete the stale ζ.  Refusing now "
 			f"rather than after the fit.")
 	if zeta_done is False:
-		print_fn(
+		log.info(
 			f"  *** LORRAX SANITY: {zeta_h5_path} has zeta_is_done=False — "
 			f"it was left behind by a ζ-fit that did NOT finish writing.  "
 			f"This run will overwrite it, which is fine; but if you meant to "
@@ -570,7 +574,7 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	# counted as truthy and forced a multi-hour refit (audit fix/zq
 	# 2026-07-28).
 	if env_bool('LORRAX_FORCE_REFIT', False):
-		print_fn("    [zeta reuse] LORRAX_FORCE_REFIT set — refitting.")
+		log.info("    [zeta reuse] LORRAX_FORCE_REFIT set — refitting.")
 		return False
 	if not os.path.exists(zeta_h5_path):
 		return False
@@ -578,16 +582,16 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		from file_io.restart_bundle import (read_isdf_header)
 		hdr = read_isdf_header(zeta_h5_path)
 	except Exception as exc:
-		print_fn(f"    [zeta reuse] {zeta_h5_path}: unreadable isdf_header "
+		log.info(f"    [zeta reuse] {zeta_h5_path}: unreadable isdf_header "
 		         f"({exc}) — refitting.")
 		return False
 	if not bool(hdr.zeta_is_done):
-		print_fn(f"    [zeta reuse] {zeta_h5_path} is INCOMPLETE "
+		log.info(f"    [zeta reuse] {zeta_h5_path} is INCOMPLETE "
 		         f"(zeta_is_done=False, i.e. a previous fit died mid-write) "
 		         f"— refitting.")
 		return False
 	if hdr.fit_provenance is None:
-		print_fn(f"    [zeta reuse] {zeta_h5_path} carries no fit_provenance "
+		log.info(f"    [zeta reuse] {zeta_h5_path} carries no fit_provenance "
 		         f"(written by an older LORRAX) — cannot verify what it was "
 		         f"fit for, so refitting.")
 		return False
@@ -602,7 +606,7 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			for _k in _RETIRED_STAMP_KEYS:
 				old.pop(_k, None)
 			if old.get('schema') != new.get('schema'):
-				print_fn(
+				log.info(
 					f"    [zeta reuse] {zeta_h5_path}: provenance schema "
 					f"{old.get('schema')!r} on disk != {new.get('schema')!r} "
 					"now.  Legacy stamps do not explicitly identify their "
@@ -642,12 +646,12 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 					old_bytes=old.get('wfn_bytes'),
 					new_bytes=new.get('wfn_bytes'))
 				if _same:
-					print_fn(f"    [zeta reuse] {zeta_h5_path}: the WFN path "
+					log.info(f"    [zeta reuse] {zeta_h5_path}: the WFN path "
 					         f"differs only in SPELLING — {_why}; not a "
 					         f"reason to refit.")
 					diff.remove('wfn_file')
 				else:
-					print_fn(f"    [zeta reuse] {zeta_h5_path} was fit from a "
+					log.info(f"    [zeta reuse] {zeta_h5_path} was fit from a "
 					         f"DIFFERENT WFN — {_why} — refitting.")
 					return False
 			# A q-IBZ REQUEST over the exact identity q table writes the same
@@ -662,7 +666,7 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 					and diff == ['write_ibz_only']
 					and old.get('write_ibz_only') is False
 					and new.get('write_ibz_only') is True):
-				print_fn(
+				log.info(
 					f"    [zeta reuse] {zeta_h5_path}: on-disk provenance "
 					"records write_ibz_only=false while this run requests true, "
 					"but SymMaps proves the q-IBZ is the full identity q table; "
@@ -747,21 +751,21 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 			_mismatch = [k for k in _added
 			             if new.get(k) != _LEGACY_KEY_DEFAULTS[k]]
 			if not _mismatch:
-				print_fn(f"    [zeta reuse] {zeta_h5_path}: legacy stamp "
+				log.info(f"    [zeta reuse] {zeta_h5_path}: legacy stamp "
 				         f"(missing {', '.join(_added)}) — this run requests "
 				         f"the legacy value(s) those imply; reuse allowed.")
 			else:
 				_d2 = "; ".join(
 					f"{k}: legacy-implied={_LEGACY_KEY_DEFAULTS[k]!r} "
 					f"requested={new.get(k)!r}" for k in _mismatch)
-				print_fn(
+				log.info(
 					f"    [zeta reuse] {zeta_h5_path}: legacy stamp lacks "
 					f"{', '.join(_added)} and this run requests a DIFFERENT "
 					f"value than the legacy fit implies ({_d2}) — "
 					f"refitting.")
 				return False
 		else:
-			print_fn(f"    [zeta reuse] {zeta_h5_path} was fit under "
+			log.info(f"    [zeta reuse] {zeta_h5_path} was fit under "
 			         f"DIFFERENT inputs — refitting.  Changed: {detail}")
 			return False
 	try:
@@ -770,7 +774,7 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 	except Exception:
 		return False
 	if want.shape != got.shape or not np.array_equal(want, got):
-		print_fn(f"    [zeta reuse] {zeta_h5_path} holds a DIFFERENT centroid "
+		log.info(f"    [zeta reuse] {zeta_h5_path} holds a DIFFERENT centroid "
 		         f"set ({got.shape} vs {want.shape}) — refitting.")
 		return False
 	if n_rmu_expected is not None:
@@ -786,17 +790,17 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		# ``f"{type(exc).__name__}: {exc}"`` this site used to format.
 		_probe = probe_zeta_file(zeta_h5_path)
 		if not _probe.readable:
-			print_fn(f"    [zeta reuse] {zeta_h5_path}: ζ dataset unreadable "
+			log.info(f"    [zeta reuse] {zeta_h5_path}: ζ dataset unreadable "
 			         f"({_probe.error}) — refitting.")
 			return False
 		_ext = _probe.mu_extent
 		if _ext is None:
-			print_fn(f"    [zeta reuse] {zeta_h5_path} has an isdf_header but "
+			log.info(f"    [zeta reuse] {zeta_h5_path} has an isdf_header but "
 			         f"NO ζ dataset (neither zeta_q_G nor zeta_q) — "
 			         f"refitting.")
 			return False
 		if _ext != int(n_rmu_expected):
-			print_fn(f"    [zeta reuse] {zeta_h5_path} holds a ζ at "
+			log.info(f"    [zeta reuse] {zeta_h5_path} holds a ζ at "
 			         f"n_mu={_ext} but this channel has "
 			         f"n_mu={int(n_rmu_expected)} — refitting.")
 			return False
@@ -1516,7 +1520,7 @@ def _resolve_zeta_fit_contract(
 			f"ζ̃(q+G) at every G inside its sphere; ζ must be stored "
 			f"at least as wide.  Increase zeta_cutoff (≤ ecutrho = "
 			f"{ecutrho} Ry) or lower bare_coulomb_cutoff.")
-	print_fn(
+	log.debug(
 		f"    cutoffs: zeta = {zeta_cutoff:.1f} Ry, "
 		f"bare-Coulomb = {zeta_vcoul_cutoff:.1f} Ry  "
 		f"(ecutwfc={float(wfn.ecutwfc):.1f}, ecutrho={ecutrho:.1f})")
@@ -1545,7 +1549,7 @@ def _resolve_zeta_fit_contract(
 		# here and carried on meta.
 		from symmetry_maps import select_current_basis
 		_basis_name, meta.current_basis_rows = select_current_basis(wfn.symmetry())
-		print_fn(f"  current fit basis: {_basis_name} (the physical group's current "
+		log.debug(f"  current fit basis: {_basis_name} (the physical group's current "
 		         f"action is monomial in it; symmetry_maps.select_current_basis)")
 		from common.centroid_basis import PackedCentroidBasis
 		basis_T = PackedCentroidBasis.build(
@@ -1735,8 +1739,8 @@ def _plan_route_g_for_channel(
 			_n_a, math.ceil(2.4 * _r) + 1))),
 		n_vertex=int(n_vertex), n_parent=n_parent,
 		orbit_width=widest_unfold_orbit(k_unfold_plan))
-	if jax.process_index() == 0:
-		print_fn(mubatch_plan.format())
+	from gw.gflat_memory_model import log_mubatch_plan
+	log_mubatch_plan(mubatch_plan)
 	return {
 		'mubatch': mubatch_plan,
 		'band_chunk': int(mubatch_plan.band_chunk),
@@ -1763,18 +1767,18 @@ def _gate_fresh_zeta_rank_findings(
 	spectral_closure.raise_if_pending(
 		finding_context, mode=_sc_mode, log=print_fn)
 	if _sc_mode == "off":
-		print_fn("    ζ rank-cut closure: guard is OFF "
+		log.info("    ζ rank-cut closure: guard is OFF "
 		         "(LORRAX_SPECTRAL_CLOSURE=off) — NOT CHECKED, which is an "
 		         "absence and not a pass.")
 	elif _sc_fired:
-		print_fn(f"    ζ rank-cut closure: guard fired above and the "
+		log.info(f"    ζ rank-cut closure: guard fired above and the "
 		         f"straddled block was DROPPED whole (mode={_sc_mode}, "
 		         f"direction={spectral_closure.DEFAULT_DIRECTION}).  ζ's "
 		         f"retained span is point-group invariant; the rank it "
 		         f"carries is LOWER than the one zeta_rcond alone would have "
 		         f"chosen, and its κ_eff is correspondingly better.")
 	else:
-		print_fn(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
+		log.debug(f"    ζ rank-cut closure: ARMED (mode={_sc_mode}, rtol="
 		         f"{spectral_closure.DEFAULT_RTOL:.1e}) and SILENT — no cut "
 		         f"fell inside a degenerate block of C_q on any q.")
 
@@ -1784,23 +1788,23 @@ def _gate_fresh_zeta_rank_findings(
 	rank_criterion.raise_if_pending(
 		finding_context, mode=_rp_mode, log=print_fn)
 	if _rp_mode == "off":
-		print_fn("    ζ rank-cut certification: gate is OFF "
+		log.info("    ζ rank-cut certification: gate is OFF "
 		         f"({rank_criterion.POLICY_MODE_ENV}=off) — NOT CHECKED, "
 		         f"which is an absence and not a pass.")
 	elif _rp_fired:
-		print_fn(f"    ζ rank-cut certification: FIRED above "
+		log.info(f"    ζ rank-cut certification: FIRED above "
 		         f"(mode={_rp_mode}).  The cut bound outside the regime any "
 		         f"measurement certifies; the numbers are in the "
 		         f"[rank-policy] lines.")
 	elif transverse:
-		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
+		log.debug(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
 		         f"transverse κ is UNCERTIFIED, discarded-weight ceiling "
 		         f"{rank_criterion.DISCARDED_WEIGHT_MAX:.1e}) and SILENT — "
 		         f"either the cut bound nothing, or its discarded weight "
 		         f"remained inside the certified regime.")
 	else:
 		# Preserve the established charge-channel message verbatim.
-		print_fn(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
+		log.debug(f"    ζ rank-cut certification: ARMED (mode={_rp_mode}, "
 		         f"certified κ ceiling "
 		         f"{rank_criterion.KAPPA_CERTIFIED_GRAM:.1e} for the charge "
 		         f"Gram, discarded-weight ceiling "
@@ -1815,30 +1819,30 @@ def _report_zeta_chunk_plan(
     """Report the route-G fit's band chunk and output; return its memory estimate."""
     mem_est = chunks.get('memory_estimate', {}) if chunks is not None else {}
     if chunks is not None:
-        print_fn(f"\n  Route-G ISDF fitting: band chunk {chunks['band_chunk']}, "
+        log.debug(f"\n  Route-G ISDF fitting: band chunk {chunks['band_chunk']}, "
                  f"k chunk {chunks['centroid_k_chunk']}")
-        print_fn(f"    Zeta output: {zeta_h5_path}")
+        log.debug(f"    Zeta output: {zeta_h5_path}")
     return mem_est
 
 
 def _reuse_zeta_faces(
         band_slices, cfg, mem_est, mesh_xy, print_fn, sym, wfn, zeta_contract, zeta_h5_path):
     """Produce the reusable zeta paths and the required transverse wavefunction view."""
-    print_fn("")
-    print_fn("  " + "=" * 68)
-    print_fn(f"  REUSING the existing ζ at {zeta_h5_path} — FIT SKIPPED.")
+    log.info("")
+    log.info("  " + "=" * 68)
+    log.info(f"  REUSING the existing ζ at {zeta_h5_path} — FIT SKIPPED.")
     if cfg.bispinor:
-        print_fn("  ...and the three transverse ζ at "
+        log.info("  ...and the three transverse ζ at "
                  "zeta_q_mu{1,2,3}.h5.")
-    print_fn("  isdf_header/zeta_is_done is True, the centroid table")
-    print_fn("  matches, and fit_provenance is identical to this run's")
-    print_fn("  inputs (band windows, cutoffs, solver knobs, source WFN).")
-    print_fn("  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
-    print_fn("  " + "=" * 68)
-    print_fn("")
+    log.info("  isdf_header/zeta_is_done is True, the centroid table")
+    log.info("  matches, and fit_provenance is identical to this run's")
+    log.info("  inputs (band windows, cutoffs, solver knobs, source WFN).")
+    log.info("  Set LORRAX_FORCE_REFIT=1 to refit unconditionally.")
+    log.info("  " + "=" * 68)
+    log.info("")
     if not cfg.bispinor:
         return zeta_h5_path, mem_est, None
-    print_fn(
+    log.debug(
         f"  [bispinor] re-sampling ψ at the "
         f"{int(zeta_contract.meta_transverse.n_rmu)} transverse "
         "centroids for σ^B (the ζ_T fit is skipped, but Σ^B still "
@@ -1906,7 +1910,7 @@ def _fit_charge_zeta_channel(
     # its CC tile from the in-memory ζ (``_bispinor_charge_tile``).
     _write_zeta_file = bool(getattr(cfg, 'write_restart_tensors', True))
     if _reuse_charge:
-        print_fn(f"  [zeta reuse] charge ζ accepted at {zeta_h5_path}; "
+        log.info(f"  [zeta reuse] charge ζ accepted at {zeta_h5_path}; "
                  "charge fit skipped independently.")
     else:
         with timing.section("gw_jax.zeta_fit_chunked"), \
@@ -1940,24 +1944,24 @@ def _fit_charge_zeta_channel(
     _trunc = active_zeta_truncating_knobs()
     if not _reuse_charge and _trunc:
         _names = ", ".join(f"{k}={v}" for k, v in _trunc)
-        print_fn("")
-        print_fn("  " + "!" * 68)
-        print_fn(f"  *** LORRAX SANITY: {_names} truncated this ζ fit. ***")
-        print_fn(f"  {zeta_h5_path} is INCOMPLETE and is NOT being stamped")
-        print_fn( "  with fit_provenance, so no later run can reuse it.  The")
-        print_fn( "  writer also left isdf_header/zeta_is_done False, so no")
-        print_fn( "  restart path will trust it either.  Profiling only —")
-        print_fn( "  delete this file before any production run from this")
-        print_fn( "  directory.")
-        print_fn("  " + "!" * 68)
-        print_fn("")
+        log.info("")
+        log.info("  " + "!" * 68)
+        log.info(f"  *** LORRAX SANITY: {_names} truncated this ζ fit. ***")
+        log.info(f"  {zeta_h5_path} is INCOMPLETE and is NOT being stamped")
+        log.info( "  with fit_provenance, so no later run can reuse it.  The")
+        log.info( "  writer also left isdf_header/zeta_is_done False, so no")
+        log.info( "  restart path will trust it either.  Profiling only —")
+        log.info( "  delete this file before any production run from this")
+        log.info( "  directory.")
+        log.info("  " + "!" * 68)
+        log.info("")
     elif (not _reuse_charge and jax.process_index() == 0
           and (zeta_g is None or _write_zeta_file)):
         try:
             from file_io.isdf_header import stamp_fit_provenance
             stamp_fit_provenance(zeta_h5_path, _provenance)
         except Exception as exc:
-            print_fn(f"    [zeta provenance] not stamped ({exc}); this ζ "
+            log.info(f"    [zeta provenance] not stamped ({exc}); this ζ "
                      f"will be refit on the next run.")
     if not _reuse_charge:
         barrier("zeta_provenance")
@@ -1976,23 +1980,23 @@ def _report_zeta_fit_peak(
             _stats = jax.local_devices()[0].memory_stats()
         except Exception as _exc:
             _stats = None
-            print_fn(f"    [mem] memory_stats() unavailable "
+            log.debug(f"    [mem] memory_stats() unavailable "
                      f"({type(_exc).__name__}: {_exc}); the peak below is "
                      f"whatever the ζ-fit tracker could sample.")
         _pool = classify_xla_pool(_stats, backend=_backend, env=_xm)
         _caveat = _xm.caveat()
         if _pool.disagreement:
-            print_fn(f"    *** LORRAX SANITY: {_pool.disagreement} ***")
+            log.info(f"    *** LORRAX SANITY: {_pool.disagreement} ***")
         _pct = (f"{100 * peak_gb / budget_gb:.0f}%" if budget_gb > 0
                 else "budget unknown")
         if str(_backend).strip().lower() in ("gpu", "cuda", "rocm"):
             _src = ("XLA arena" if _pool.peak_source == "arena"
                     else "nvidia-smi whole-GPU sample")
-            print_fn(f"    GPU high-water mark: {peak_gb:.2f} GB / "
+            log.debug(f"    GPU high-water mark: {peak_gb:.2f} GB / "
                      f"{budget_gb:.2f} GB budget ({_pct})  "
                      f"[source: {_src}]{_caveat}")
         else:
-            print_fn(f"    ζ-fit high-water mark: {peak_gb:.2f} GB / "
+            log.debug(f"    ζ-fit high-water mark: {peak_gb:.2f} GB / "
                      f"{budget_gb:.2f} GB budget ({_pct})  [backend="
                      f"{_backend}: this figure comes from the device "
                      f"memory-stats/nvidia-smi tracker and is NOT this "
@@ -2012,12 +2016,12 @@ def _fit_transverse_zeta_channels(
     ``zeta_q_mu{μ}.h5``.
     """
     from gw.isdf_fitting import fit_zeta_to_h5
-    print_fn(f"\n  [bispinor] resolving ζ^{{μ_L=1,2,3}} on current-density "
+    log.debug(f"\n  [bispinor] resolving ζ^{{μ_L=1,2,3}} on current-density "
              f"centroids: {cfg.paths.centroids_file_current}")
     missing = [mu for mu in (1, 2, 3) if not _reuse_T[mu - 1]]
     for mu in (1, 2, 3):
         if _reuse_T[mu - 1]:
-            print_fn(f"  [zeta reuse] μ_L={mu} accepted at "
+            log.info(f"  [zeta reuse] μ_L={mu} accepted at "
                      f"{_zeta_T_paths[mu]}; fit skipped independently.")
     faces = parent_psi = None
     if missing:
@@ -2048,7 +2052,7 @@ def _fit_transverse_zeta_channels(
     if not missing:
         return transverse_wfn_data, None
     parent_T = transverse_wfn_data['green_parent']
-    print_fn(f"  [bispinor] μ_L={missing} → one route-G loop")
+    log.debug(f"  [bispinor] μ_L={missing} → one route-G loop")
     # Every channel fresh: the six TT tiles are formed from the three live ζ
     # in one pass (q-sharded accumulators), and a ζ_T file is written only
     # for restart or reuse.  With a channel accepted for reuse, the V_q forms
@@ -2095,7 +2099,7 @@ def _fit_transverse_zeta_channels(
                 from file_io.isdf_header import stamp_fit_provenance
                 stamp_fit_provenance(_zeta_T_paths[mu], _provenance_T(mu))
             except Exception as exc:
-                print_fn(f"    [zeta provenance] μ_L={mu} not stamped "
+                log.info(f"    [zeta provenance] μ_L={mu} not stamped "
                          f"({exc}); this ζ_T will be refit on the next "
                          f"run.")
         barrier(f"zeta_provenance_mu{mu}")
@@ -2250,7 +2254,7 @@ def _build_head_channel(zeta_io, *, cfg, meta, wfn, bvec, mesh_xy, sym,
 	dump = getattr(cfg.head, 'mc_average_placement_vcoul', None)
 	if dump:
 		hc = head_ratio_from_bgw_dump(dump, hc, bvec=bvec)
-	print_fn(hc.summary())
+	log.debug(hc.summary())
 	return hc
 
 
@@ -2337,8 +2341,8 @@ def _vcoul_geometry_and_budget(
     bvec, vcoul_cutoff_ry = _vcoul_bvec_and_cutoff(cfg, wfn)
     if mem_est is None:
         mem_est = {}
-    print_fn(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
-    print_fn(f"    V_q budget:    0.9 x (memory_per_device_gb {cfg.memory.per_device_gb:.2f} GB "
+    log.debug(f"    V_q bare cutoff: {vcoul_cutoff_ry:.1f} Ry")
+    log.debug(f"    V_q budget:    0.9 x (memory_per_device_gb {cfg.memory.per_device_gb:.2f} GB "
              f"less the live bytes at V_q)")
     return bvec, vcoul_cutoff_ry
 
@@ -2390,7 +2394,7 @@ def _compute_photon_vq(
                    dtype=np.int32)
         if centroid_indices is not None else None)
     bispinor_h5_path = os.path.join(zeta_dir, "v_q_bispinor.h5")
-    print_fn(f"\n  [bispinor] V_q^{{μ_L,ν_L}} → {bispinor_h5_path}")
+    log.debug(f"\n  [bispinor] V_q^{{μ_L,ν_L}} → {bispinor_h5_path}")
     from contextlib import nullcontext
     from .v_q_bispinor import BispinorFitV
     # Tiles the fits formed from their live ζ; a family accepted for reuse is
@@ -2533,10 +2537,10 @@ def _finalize_vq_views(
     G0 = G0_gathered
     while G0.ndim > 1:
         G0 = G0[0]
-    print_fn(f"\n  V_q computed:")
-    print_fn(f"    Shape: {V_qmunu.shape}")
+    log.debug(f"\n  V_q computed:")
+    log.debug(f"    Shape: {V_qmunu.shape}")
     _vq0_trace = float(ordered_sum(jnp.diagonal(V_q_raw[0])).real)
-    print_fn(f"    V_q=0 trace: {_vq0_trace:.4f}")
+    log.debug(f"    V_q=0 trace: {_vq0_trace:.4f}")
     from common import sanity
     sanity.check_finite("V_q", V_qmunu, print_fn=print_fn)
     sanity.check_positive("V_q[q=0] trace", _vq0_trace, print_fn=print_fn)
@@ -2673,7 +2677,7 @@ def _prepare_fresh_parent_faces(
     _parent_green_faces = parent_faces(parent_y, parent_x, mesh_xy=mesh_xy,
         layout="face")
     del parent_y, parent_x
-    print0("  ψ storage: parents only -- "
+    log.debug("  ψ storage: parents only -- "
            f"{_candidate_plan.n_parent} raw WFN parents, "
            f"{_candidate_plan.n_full} full k rows through typed transport.")
     return (zeta_contract, charge_zeta_identity_receipt, _candidate_plan, _parent_green_plan, chunks, _parent_zeta_plan, _parent_green_faces)
@@ -2713,10 +2717,10 @@ def _prepare_fitted_zeta(
     			n_rmu_padded=int(_meta_receipt_T.n_rmu_padded)))
     if env_bool("LORRAX_EXIT_AFTER_ZETA", False, print_fn=print0):
     	if jax.process_index() == 0:
-    		print("*** LORRAX EARLY EXIT: LORRAX_EXIT_AFTER_ZETA=1 "
+    		log.info("*** LORRAX EARLY EXIT: LORRAX_EXIT_AFTER_ZETA=1 "
     		      "— stopping after fit_zeta.  V_q, W, and Σ were "
     		      "NOT computed; this run produced no self-energy. "
-    		      "***", flush=True)
+    		      "***")
     		import sys as _sys
     		print("*** LORRAX EARLY EXIT (LORRAX_EXIT_AFTER_ZETA) ***",
     		      file=_sys.stderr, flush=True)
@@ -2746,19 +2750,19 @@ def _prepare_fresh_carriers(
     	wfns, *_parent_green_faces,
     	plan=_candidate_plan, mesh_xy=mesh_xy)
     sigma_parent_carrier = _parent_carrier
-    print0(
+    log.debug(
     	"  Parent-k Sigma route ready: G contracted on "
     	f"{_candidate_plan.n_parent} raw WFN parents and Σ_k "
     	"projected on their bands, broadcast to "
     	f"{_candidate_plan.n_full} full k rows by the typed "
     	"band-index unfold.")
     green_parent_carrier = _parent_carrier
-    print0(
+    log.debug(
     	"  Parent-k Green contraction ready: "
     	f"{_parent_green_plan.n_parent} raw WFN parents -> "
     	f"{_parent_green_plan.n_full} full k rows.  Full-k FFTs "
     	"and observables remain unchanged.")
-    print0(f"  Wavefunctions built: {band_slices.nb_full} bands on raw parents.")
+    log.debug(f"  Wavefunctions built: {band_slices.nb_full} bands on raw parents.")
     if transverse_wfn_data is not None:
     	parent_T = transverse_wfn_data['green_parent']
     	with timing.section("gw_jax.wavefunction_setup"):
@@ -2772,7 +2776,7 @@ def _prepare_fresh_carriers(
     	if transverse_basis_receipt is not None:
     		transverse_basis_receipt.assert_matches_carrier(
     			wfns_transverse, where="fresh current parent faces")
-    	print0(f"  [bispinor] σ^B-side Wfns built on "
+    	log.debug(f"  [bispinor] σ^B-side Wfns built on "
     	       f"n_rmu_T={transverse_wfn_data['meta'].n_rmu} "
     	       f"transverse centroids (face layout)")
     basis_T = (None if transverse_wfn_data is None
@@ -2874,7 +2878,7 @@ def _write_fresh_restart(
     						_centroid_table_md5(
     							transverse_wfn_data['centroid_indices']))
     		except Exception as exc:
-    			print0(f"    [restart stamp] centroid content hashes "
+    			log.info(f"    [restart stamp] centroid content hashes "
     			       f"not stamped ({exc}); a restart will warn "
     			       f"instead of verifying the centroid tables.")
     	barrier("restart_centroid_stamp")
@@ -2927,9 +2931,9 @@ def _prepare_fresh_isdf(
         timing.stage_wait(V_qmunu)
         _rows = []
         timing.report(print_fn=_rows.append, title="", max_depth=3)
-        print0("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
+        log.debug("  μ-batch timing through V_q (rank 0, s):\n" + "\n".join(_rows))
     timing.stage_wait(V_qmunu)
-    print0("  Chunked ISDF path complete")
+    log.debug("  Chunked ISDF path complete")
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
 
 def _read_authenticated_restart(
@@ -2941,9 +2945,9 @@ def _read_authenticated_restart(
     	n_rmu_logical=int(meta.n_rmu))
     charge_zeta_identity_receipt = rs.charge_zeta_identity
     V_qmunu = _to_run_order(rs.V_qmunu, (-2, -1))
-    print0("  Loaded restart tensors from H5.")
+    log.info("  Loaded restart tensors from H5.")
     from file_io import describe_coulomb_policy_match
-    print0(describe_coulomb_policy_match(tensors_filename, cfg, meta))
+    log.debug(describe_coulomb_policy_match(tensors_filename, cfg, meta))
     from common import sanity
     sanity.check_finite("restart V_q", V_qmunu, print_fn=print0)
     sanity.check_positive(
@@ -2970,7 +2974,7 @@ def _restart_charge_basis(
                     "centroids_transverse_md5": _hashes["current"],
                     "charge_representation": _bundle["charge_representation"]}
     except Exception as exc:
-    	print0(f"  [restart guard] could not read centroid hash "
+    	log.info(f"  [restart guard] could not read centroid hash "
     	       f"attrs from {tensors_filename} "
     	       f"({type(exc).__name__}: {exc}).")
     _charge = resolve_four_current_representation(int(meta.nspinor) == 4, None)
@@ -2983,7 +2987,7 @@ def _restart_charge_basis(
     		f"(docs/theory/bispinor-gw.md#lift); fix: restart = false.")
     _have_c = _stamped.get('centroids_charge_md5')
     if _have_c is None:
-    	print0(
+    	log.info(
     		f"  *** LORRAX SANITY: {tensors_filename} carries no "
     		f"'centroids_charge_md5' attr — it predates the "
     		f"centroid-content stamp (2026-07-28), so the charge "
@@ -3004,7 +3008,7 @@ def _restart_charge_basis(
     		f"(silently wrong physics).  Set restart = false, or "
     		f"restore the original centroid file.")
     elif not _restart_wfn_provenance_complete:
-    	print0(
+    	log.info(
     		f"  *** LORRAX SANITY: {tensors_filename} carries a "
     		f"matching charge centroid stamp but no canonical "
     		f"qp_state_source_provenance record.  Legacy restart "
@@ -3058,7 +3062,7 @@ def _restart_charge_carrier(
     	_to_run_order(rs.psi_mun_parent, (2,)),
     	plan=_restart_plan, mesh_xy=mesh_xy)
     green_parent_carrier = sigma_parent_carrier
-    print0(
+    log.debug(
     	"  ψ storage: parents only (restart) -- "
     	f"{_restart_plan.n_parent} raw WFN parents read from "
     	f"{os.path.basename(tensors_filename)} stand in for "
@@ -3081,7 +3085,7 @@ def _restart_charge_carrier(
     			centroid_indices=cent_idx_np,
     			vcoul_cutoff_ry=vcoul_cutoff_ry,
     			print_fn=print0)
-    	print0(
+    	log.debug(
     		"  [bgw q0 provenance] restart reused V_q and ζ fit; "
     		"loaded only the finite-q0 head channel from tmp/zeta_q.h5.")
     return (wfns, sigma_parent_carrier, green_parent_carrier, head_channel)
@@ -3129,7 +3133,7 @@ def _restart_current_carrier(
     	meta_restart_transverse.sys_dim = meta.sys_dim
     	meta_restart_transverse.bispinor = True
     	if _have_t is None:
-    		print0(
+    		log.info(
     			f"  *** LORRAX SANITY: {tensors_filename} carries "
     			f"no 'centroids_transverse_md5' attr — it "
     			f"predates the centroid-content stamp "
@@ -3154,7 +3158,7 @@ def _restart_current_carrier(
     			f"or restore the original transverse centroid "
     			f"file.")
     	elif not _restart_wfn_provenance_complete:
-    		print0(
+    		log.info(
     			f"  *** LORRAX SANITY: {tensors_filename} carries a "
     			f"matching transverse centroid stamp but no canonical "
     			f"qp_state_source_provenance record.  The transverse "
@@ -3193,7 +3197,7 @@ def _restart_current_carrier(
     	if transverse_basis_receipt is not None:
     		transverse_basis_receipt.assert_matches_carrier(
     			wfns_transverse, where="restart current parent faces")
-    	print0(f"  [bispinor] σ^B-side Wfns rebuilt from restart "
+    	log.debug(f"  [bispinor] σ^B-side Wfns rebuilt from restart "
     	       f"(raw parents, "
     	       f"n_rmu_T={int(rs.n_rmu_transverse_disk)} "
     	       f"transverse centroids)")
@@ -3325,7 +3329,7 @@ def prepare_isdf_and_wavefunctions(
 		resident = sum(int(np.prod(array.sharding.shard_shape(array.shape)))
 		               * array.dtype.itemsize for array in (carrier.psi_nmu, carrier.psi_mun))
 		np_, nb_, ns_, mu_ = carrier.psi_nmu.shape
-		print0(f"  Resident ψ ({family}): layout={carrier.layout}, parents={np_}, "
+		log.debug(f"  Resident ψ ({family}): layout={carrier.layout}, parents={np_}, "
 		       f"bands={nb_}, ns={ns_}, M={mu_}; {resident} bytes/rank (two copies).")
 	from .wavefunction_bundle import AuthenticatedWavefunctions
 	charge_basis_binding = (
@@ -3419,7 +3423,7 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     from common.centroid_basis import PackedCentroidBasis
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
-    print0(f"  {mu_basis.describe()}")
+    log.debug(f"  {mu_basis.describe()}")
     coarse = None
     if config.compute_mode.is_dynamic:
         # b3 counts bands as on main; the coarse class is a Sigma read class,
@@ -3442,9 +3446,9 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
         b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
     zeta_fit_edge = resolve_zeta_fit_edge(
         band_slices, getattr(config, "zeta_nband", None))
-    print0(f"  {config.bands.describe(zeta_fit_edge)}")
+    log.debug(f"  {config.bands.describe(zeta_fit_edge)}")
     if config.bands.split:
-        print0(f"    chi0/W sums bands [{band_slices.b0}, "
+        log.debug(f"    chi0/W sums bands [{band_slices.b0}, "
                f"{band_slices.b4_chi}); Sigma sums bands [{band_slices.b0}, "
                f"{band_slices.b4_sigma}); psi is LOADED over "
                f"[{band_slices.b0}, {band_slices.b4}) "

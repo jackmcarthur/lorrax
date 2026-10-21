@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from contextlib import contextmanager, nullcontext
@@ -12,6 +13,7 @@ import jax
 _PROFILE_DIR_ENV = "ISDF_JAX_PROFILE_DIR"
 _PROFILE_SECTIONS_ENV = "ISDF_JAX_PROFILE_SECTIONS"
 _warned_trace_failure = False
+_LOG = logging.getLogger("lorrax.jax_profile")
 
 
 def _section_selected(section: str) -> bool:
@@ -54,7 +56,7 @@ def _log_once(msg: str) -> None:
 	if _warned_trace_failure:
 		return
 	if jax.process_index() == 0:
-		print(f"[jax_profile] {msg}")
+		_LOG.warning(f"[jax_profile] {msg}")
 	_warned_trace_failure = True
 
 

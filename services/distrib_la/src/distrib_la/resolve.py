@@ -71,6 +71,7 @@ Backend choice is a deck key; the environment grants a CAPABILITY (which
 """
 from __future__ import annotations
 
+import logging
 import math
 
 from lxkit import memory
@@ -79,6 +80,9 @@ from lxkit import memory
 from lxkit import FFI_PLATFORM_MAP, announce_once, mesh_ffi_platform
 
 from distrib_la import loader
+
+#: ``distrib_la`` is independently installable: it logs on the ``lorrax.`` namespace directly.
+_LOG = logging.getLogger("lorrax.distrib_la")
 
 __all__ = [
     "OPS",
@@ -468,12 +472,12 @@ def _announce_auto_geometry_demote(op: str, px: int, py: int) -> None:
         return
     _AUTO_GEOMETRY_DEMOTE_ANNOUNCED.add(key)
     if _process_index() == 0:
-        print(
+        _LOG.info(
             f"  [distrib_la.resolve] {op} backend 'auto': cusolvermp is "
             f"compiled but the {px}x{py} mesh is 1-D (block-cyclic 2-D "
             f"layout needs px >= 2 and py >= 2) — demoting to native.  "
             f"An explicit 'cusolvermp' request on this mesh refuses "
-            f"instead.", flush=True)
+            f"instead.")
 
 
 def _announce_auto_capability_demote(op: str, target: str, platform: str) -> None:
@@ -505,14 +509,17 @@ def _announce_auto_capability_demote(op: str, target: str, platform: str) -> Non
         reason = loader.probe_target(target, platform)
     except Exception as exc:               # noqa: BLE001 — never let the
         reason = f"(probe_target itself failed: {exc!r})"   # witness raise
-    print(
+    _LOG.warning(
         f"  [distrib_la.resolve] {op} backend 'auto': the mesh geometry "
         f"supports '{target}' but the handler is NOT AVAILABLE — "
         f"demoting to the replicated native path.  Reason: {reason}.  "
         f"This is a PERFORMANCE AND MEMORY cliff, not a correctness "
         f"fallback; an explicit backend request refuses here instead.  "
         f"Fix the FFI build or set the backend explicitly to make this "
-        f"fail loudly.", flush=True)
+        f"fail loudly.",
+        # the ``common.log.message`` extra, by hand: a service imports no ``common``
+        extra={"lorrax": {"id": "distrib_la_auto_demote",
+                          "fix": "fix the FFI build, or set the backend explicitly"}})
 
 
 #: Below this ``n``, an EXPLICIT distributed eigh gets the capacity-route
@@ -1019,12 +1026,12 @@ def resolve_eigh_capacity(mesh_xy, *, n: int | None = None) -> tuple[str, str | 
     if key not in _CAPACITY_UNAVAILABLE_ANNOUNCED:
         _CAPACITY_UNAVAILABLE_ANNOUNCED.add(key)
         if _process_index() == 0:
-            print(
+            _LOG.info(
                 f"  [distrib_la.resolve] eigh 'auto' on the {px}x{py} "
                 f"{key[0]} mesh: no capacity (whole-mesh) eigh here ({reason}).  "
                 f"Stacks run whole matrices per rank (route (c)) where they "
                 f"fit the room; a stack that does not refuses "
-                f"(GATE eigh_capacity_route).", flush=True)
+                f"(GATE eigh_capacity_route).")
     return NATIVE, reason
 
 

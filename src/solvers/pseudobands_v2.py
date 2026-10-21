@@ -28,6 +28,9 @@ from functools import partial
 from solvers.chebyshev import jackson_coefficients
 from solvers.dos import compute_dos, dos_weighted_windows, compute_window_partition, DOSResult
 from distrib_la import eigh_local
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -509,7 +512,7 @@ def ritz_pseudobands_v2(
     # ── §2: KPM DOS ──
     if dos_result is None:
         if verbose:
-            print("  Computing KPM DOS...")
+            log.info("  Computing KPM DOS...")
         dos = compute_dos(apply_H, dim, n_moments=n_kpm_moments,
                           n_random=n_kpm_random, seed=seed, verbose=verbose)
     else:
@@ -543,9 +546,9 @@ def ritz_pseudobands_v2(
     E_dav_max = float(E_dav[-1]) if n_dav > 0 else E_start
 
     if verbose:
-        print(f"  CJ resolution: {cj_resolution:.4f} Ry")
-        print(f"  Protected: {n_protected} bands (E < {E_start:.4f} Ry)")
-        print(f"  Available: {len(E_avail)} bands up to {E_dav_max:.4f} Ry")
+        log.info(f"  CJ resolution: {cj_resolution:.4f} Ry")
+        log.info(f"  Protected: {n_protected} bands (E < {E_start:.4f} Ry)")
+        log.debug(f"  Available: {len(E_avail)} bands up to {E_dav_max:.4f} Ry")
 
     # Place windows with n_min floor (or use override from k=0)
     if boundaries_override is not None:
@@ -558,8 +561,8 @@ def ritz_pseudobands_v2(
 
     if verbose:
         widths = np.diff(boundaries)
-        print(f"  {N_S} windows [{boundaries[0]:.2f}, {boundaries[-1]:.2f}] Ry")
-        print(f"  Widths: min={widths.min():.4f}, max={widths.max():.4f}")
+        log.info(f"  {N_S} windows [{boundaries[0]:.2f}, {boundaries[-1]:.2f}] Ry")
+        log.debug(f"  Widths: min={widths.min():.4f}, max={widths.max():.4f}")
 
     # ── §4: Classify windows ──
     is_dav = np.zeros(N_S, dtype=bool)
@@ -577,7 +580,7 @@ def ritz_pseudobands_v2(
     n_cj_win = len(cj_windows)
 
     if verbose:
-        print(f"  Classification: {n_dav_win} Davidson, {n_cj_win} CJ")
+        log.info(f"  Classification: {n_dav_win} Davidson, {n_cj_win} CJ")
 
     # ── §5-6: CJ filter ──
     Y_cj = {}  # window index → filtered block (k, dim)
@@ -589,7 +592,7 @@ def ritz_pseudobands_v2(
             boundaries, dos.center, dos.half_width, M_max, cj_windows)
 
         if verbose:
-            print(f"  Running {M_max} Chebyshev iterations (block size {k})...")
+            log.info(f"  Running {M_max} Chebyshev iterations (block size {k})...")
 
         rng = jax.random.PRNGKey(seed + 42)
         # Random PW phases per §6
@@ -614,7 +617,7 @@ def ritz_pseudobands_v2(
             cj_boundary_data[j] = (float(b_lo), float(b_hi))
 
         if verbose:
-            print(f"  Filter done: {len(Y_cj)} CJ blocks")
+            log.debug(f"  Filter done: {len(Y_cj)} CJ blocks")
 
     # ── §7-8: Per-window Ritz + Gauss ──
     Phi_dav_j = jnp.asarray(Phi_dav, dtype=jnp.complex128) if n_dav > 0 else None
@@ -723,9 +726,9 @@ def ritz_pseudobands_v2(
 
         if verbose and (j < 5 or j == N_S - 1 or (j + 1) % 10 == 0):
             n_eff = float(np.sum(gauss_w))
-            print(f"    w{j+1}/{N_S} [{mode:3s}]: [{e_lo:.2f},{e_hi:.2f}] "
-                  f"n_eff={n_eff:.1f}, "
-                  f"E=[{nodes_sorted[0]:.3f},{nodes_sorted[-1]:.3f}]")
+            log.info(f"    w{j+1}/{N_S} [{mode:3s}]: [{e_lo:.2f},{e_hi:.2f}] "
+                     f"n_eff={n_eff:.1f}, "
+                     f"E=[{nodes_sorted[0]:.3f},{nodes_sorted[-1]:.3f}]")
 
     # ── Output assembly ──
     if Xi_list:
@@ -744,9 +747,9 @@ def ritz_pseudobands_v2(
     if verbose:
         n_pseudo_total = N_S * k
         total_eff = float(np.sum(w_pseudo**2))
-        print(f"  Total: {n_protected} prot + {n_pseudo_total} pseudo "
-              f"({n_dav_win * k} dav + {n_cj_win * k} CJ) "
-              f"= {Phi_out.shape[0]} bands (Σ w² = {total_eff:.1f})")
+        log.info(f"  Total: {n_protected} prot + {n_pseudo_total} pseudo "
+                 f"({n_dav_win * k} dav + {n_cj_win * k} CJ) "
+                 f"= {Phi_out.shape[0]} bands (Σ w² = {total_eff:.1f})")
 
     return PseudobandsResult(
         Phi_out=Phi_out, E_out=E_out, weights=weights,

@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 
 from common.collectives import all_gather_processes, barrier
+from common.log import get_logger, message
 from file_io import CrystalData, WFNReader, WFNWriter
 from psp.pseudos import load_pseudopotentials
 from psp.h_dft import setup_H_k_from_kvec, make_apply_H
@@ -55,6 +56,8 @@ from solvers import plan_local_davidson
 from solvers.davidson import DEFAULT_M_MAX_FACTOR
 from solvers.davidson_fixed import CONVERGED
 from psp.dft_operators import apply_H_k_batched
+
+log = get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -99,7 +102,7 @@ def _setup_kgrid(crystal, kgrid, nosym, kpoints_override, weights_override, verb
 
     if verbose:
         label = "full" if nosym else "IBZ"
-        print(f"  nk={len(kpoints)} ({label}), ngkmax={ngkmax}")
+        log.info(f"  nk={len(kpoints)} ({label}), ngkmax={ngkmax}")
 
     return kpoints, weights, ngkmax, gvecs_per_k
 
@@ -275,11 +278,11 @@ def run_nscf(
             mode.append(f"Davidson ({nbnd} bands)")
         if do_pseudobands:
             mode.append(f"pseudobands (k={pb_k}, M={pb_M_max}, {pb_n_windows} windows)")
-        print(f"NSCF: {' + '.join(mode)}")
-        print(f"  kgrid={kgrid}, fft={fft_grid}, nspinor={nspinor}")
+        log.info(f"NSCF: {' + '.join(mode)}")
+        log.info(f"  kgrid={kgrid}, fft={fft_grid}, nspinor={nspinor}")
         if truncation_2d:
-            print(f"  2D Coulomb truncation (from assume_isolated='2D')")
-        print(f"  GPUs: {len(jax.devices())}  (processes: {jax.process_count()})")
+            log.info(f"  2D Coulomb truncation (from assume_isolated='2D')")
+        log.info(f"  GPUs: {len(jax.devices())}  (processes: {jax.process_count()})")
 
     # ── Build potentials ────────────────────────────────────────
     V_scf, V_loc, vnl_setup = _build_potentials(crystal, pseudos, verbose)
@@ -298,7 +301,7 @@ def run_nscf(
 
     if do_davidson:
         if verbose:
-            print("\n── Davidson ──")
+            log.info("\n── Davidson ──")
 
         def apply_davidson_H(data, vectors):
             return apply_H_k_batched(vectors, *data[:8])
@@ -342,9 +345,9 @@ def run_nscf(
                     t_compile = time.perf_counter()
                     executable = plan.solve.lower(data, initial, tol, 100, 20).compile()
                     if verbose:
-                        print(f"  Davidson lowering + compilation: "
-                              f"{time.perf_counter()-t_compile:.2f}s")
-                        print(f"  Davidson compiled workspace: {executable.memory_analysis()}")
+                        log.debug(f"  Davidson lowering + compilation: "
+                                  f"{time.perf_counter()-t_compile:.2f}s")
+                        log.debug(f"  Davidson compiled workspace: {executable.memory_analysis()}")
                 if ik % n_proc == rank:
                     owned = (ik, H_k, data, initial)
             if owned is None:
@@ -365,8 +368,8 @@ def run_nscf(
             if do_pseudobands:
                 all_evecs[ik] = evecs_np
             if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
-                print(f"  [rank {rank}] k={ik:3d}/{nk}: "
-                      f"{time.perf_counter()-tk:.3f}s  evals[0]={evals[0]:.6f} Ry")
+                log.info(f"  [rank {rank}] k={ik:3d}/{nk}: "
+                         f"{time.perf_counter()-tk:.3f}s  evals[0]={evals[0]:.6f} Ry")
 
         # Gather evals + evecs across processes.  Each ik has exactly one
         # owner and every other rank left that slot zero, so the cross-rank
@@ -402,8 +405,8 @@ def run_nscf(
 
         if verbose and rank == 0:
             dt = time.perf_counter() - t_dav
-            print(f"  Davidson: {dt:.2f}s ({dt/nk:.3f}s/k, "
-                  f"{n_proc} rank{'s' if n_proc>1 else ''}) → {output_path}")
+            log.info(f"  Davidson: {dt:.2f}s ({dt/nk:.3f}s/k, "
+                     f"{n_proc} rank{'s' if n_proc>1 else ''}) → {output_path}")
 
     # ══════════════════════════════════════════════════════════════
     #  Pseudobands-only: load deterministic bands from WFN.h5
@@ -419,7 +422,7 @@ def run_nscf(
             raise FileNotFoundError(f"pb_wfn_input not found: {wfn_path}")
 
         if verbose:
-            print(f"\n── Loading deterministic bands from {wfn_path} ──")
+            log.info(f"\n── Loading deterministic bands from {wfn_path} ──")
 
         # ``ngkmax``/``gvecs_per_k`` are re-derived here from the FILE's
         # k-points, and the ψ buffer is sized on that re-derived ngkmax —
@@ -431,7 +434,7 @@ def run_nscf(
             wfn_path, crystal, kgrid, nosym, nspinor, verbose)
 
         if verbose:
-            print(f"  Loaded {nbnd} bands, {nk} k-points from {wfn_path}")
+            log.info(f"  Loaded {nbnd} bands, {nk} k-points from {wfn_path}")
 
     # ══════════════════════════════════════════════════════════════
     #  Pseudobands stage
@@ -444,8 +447,8 @@ def run_nscf(
             from solvers.pseudobands import ritz_pseudobands as _pb_func
 
         if verbose:
-            print(f"\n── Pseudobands v{pb_version} (k={pb_k}, M_max={pb_M_max}, "
-                  f"{pb_n_windows} windows) ──")
+            log.info(f"\n── Pseudobands v{pb_version} (k={pb_k}, M_max={pb_M_max}, "
+                     f"{pb_n_windows} windows) ──")
 
         pb_output = os.path.splitext(output_path)[0] + "_pseudobands.h5"
         dim_flat = nspinor * ngkmax
@@ -477,7 +480,7 @@ def run_nscf(
         n_total = pb0.Phi_out.shape[0]
         n_prot_k0 = pb0.n_prot if pb_version == 2 else pb0.n_det
         if verbose:
-            print(f"  Total bands per k: {n_prot_k0} prot + {pb0.n_pseudo} pseudo = {n_total}")
+            log.info(f"  Total bands per k: {n_prot_k0} prot + {pb0.n_pseudo} pseudo = {n_total}")
 
         # Open WFN_pseudobands.h5 on rank 0 only (H5 single-writer).
         pb_rank = jax.process_index()
@@ -522,15 +525,15 @@ def run_nscf(
                 _write_pb_k(pb_writer, ik, pb_ik, H_k, gvecs_per_k[ik], nspinor, ngkmax)
 
             if verbose and (ik < 3 or ik == nk - 1 or (ik + 1) % 16 == 0):
-                print(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.1f}s")
+                log.info(f"  k={ik:3d}/{nk}: {time.perf_counter()-tk:.1f}s")
 
         if pb_writer is not None:
             pb_writer.close()
         if verbose:
-            print(f"  Pseudobands: {time.perf_counter()-t_pb:.1f}s → {pb_output}")
+            log.info(f"  Pseudobands: {time.perf_counter()-t_pb:.1f}s → {pb_output}")
 
     if verbose:
-        print(f"\nTotal NSCF: {time.perf_counter()-t_start:.1f}s")
+        log.info(f"\nTotal NSCF: {time.perf_counter()-t_start:.1f}s")
 
     return eigenvalues
 
@@ -607,8 +610,12 @@ def main():
         from common.jax_compile_cache import ensure_jax_compile_cache
         ensure_jax_compile_cache()
     except Exception as _e:
-        if jax.process_index() == 0:
-            print(f"  [jax compile cache] skipped: {_e}", flush=True)
+        log.warning(
+            f"JAX compile cache skipped: {_e}",
+            extra=message(id="jax_compile_cache_skipped",
+                          found=("compile cache", str(_e)),
+                          fix="check the compile-cache directory is writable; "
+                              "this run recompiles every kernel"))
 
     crystal = CrystalData.from_qe_save(save_dir)
     pseudos = load_pseudopotentials(args.pseudo_dir or save_dir)

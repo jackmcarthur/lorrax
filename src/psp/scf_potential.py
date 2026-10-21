@@ -35,6 +35,9 @@ from psp.dft_operators import (build_G_cart, build_V_scf, compute_V_H_and_V_xc,
                                compute_V_H_and_V_xc_noncollinear)
 import psp.vnl_ops as vnl_ops
 from common.fft_helpers import local_ifftn3
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -112,7 +115,7 @@ def build_dft_potentials(
         q_max=float(np.sqrt(float(mf.ecutwfc))) * 1.01)
 
     if verbose:
-        print(f"  Potentials: {time.perf_counter()-t0:.2f}s")
+        log.debug(f"  Potentials: {time.perf_counter()-t0:.2f}s")
 
     return V_scf, V_loc, vnl_setup
 
@@ -177,8 +180,8 @@ def build_rho_val_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True) 
     integral = float(jnp.sum(rho_r)) * vol / N_grid
     if verbose:
         dt = time.perf_counter() - t0
-        print(f"  ρ_val integral: {integral:.4f} e  "
-              f"(expected {spin_factor * n_occ}, {dt:.2f}s)")
+        log.info(f"  ρ_val integral: {integral:.4f} e  "
+                 f"(expected {spin_factor * n_occ}, {dt:.2f}s)")
 
     return rho_r
 

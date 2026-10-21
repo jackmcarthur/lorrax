@@ -63,6 +63,11 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import timing
+from common.log import get_logger, message, record
+
+log = get_logger(__name__)
+
+from . import sc_report
 from lxkit import ordered_sum
 from common.collectives import barrier, device_put_process_local
 from common.units import RYD_TO_EV
@@ -785,7 +790,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     occ_state, head_surface_weight_kn = _solve_head_occupations(
         inputs, inputs.wfns_dft.enk)
     if occ_state is not None:
-        inputs.print_fn(
+        log.info(
             "  SC head occupations: initialized fixed-N "
             f"{occ_state.smearing_family} state at "
             f"mu={occ_state.mu_ry * RYD_TO_EV:.8f} eV "
@@ -816,7 +821,7 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
                 check_state, np.asarray(inputs.wfn.occs[0]), w_ibz,
                 state_capacity=capacity,
                 num_electrons=float(inputs.wfn.num_electrons))
-            inputs.print_fn(
+            log.debug(
                 "  SC head occupations: WFN consistency max|Δf| = "
                 f"{deviation:.3e}, mu_check = "
                 f"{check_state.mu_ry * RYD_TO_EV:.8f} eV (wfn.efermi "
@@ -953,6 +958,8 @@ def make_initial_state_from_qp_rotations(
         "seed-only U diag(E) U^H, averaged over each k's little group "
         f"(max |ΔH| {moved * RYD_TO_EV:.3e} eV). The quadrature plan and Anderson "
         "history are this run's unless an SC resume line follows.")
+    sc_report.emit_row("SC seed", f"external QP seed {artifact_path} "
+                                  f"(max |dH| {moved * RYD_TO_EV:.3e} eV from its symmetrization)")
     return SCState(
         H_qp_dft=device_put_process_local(H_loop, rep3),
         iteration=0,
@@ -1182,7 +1189,7 @@ def _certified_seed_occupation_state(
         replayed, kweights,
         state_capacity=float(inputs.wfn.occupation_state_capacity))
     if replayed.occ_hash != solved_state.occ_hash:
-        inputs.print_fn(
+        log.debug(
             "    SC occupations: replayed certified root "
             f"mu={replayed.mu_ry:.17g} Ry; exact stored occ_hash "
             f"{replayed.occ_hash} (live root hash was "
@@ -2037,7 +2044,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         occ, kweights, nb_logical, f_spin)
     U_density = _hartree_density_embed_kernel(
         inputs.mesh_xy, band_axis.carrier)(U_qp)
-    inputs.print_fn(
+    log.debug(
         f'    V_H rebuild: current-map occupations on the QP window '
         f'[0, {nb_logical}) (tail above it: {dropped:.1e} e), '
         f'mu={float(efermi_ry) * RYD_TO_EV:.8f} eV')
@@ -2067,16 +2074,14 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         charge_nspinor=charge_ns, sym=inputs.sym,
         sym_perm=inputs.sym.fft_grid_pullback(inputs.sym.active_symmetry_rows, grid),
         memory_budget_bytes=float(getattr(getattr(inputs.config, "memory", None),
-                                          "per_device_gb", 0.0)) * 1e9,
-        print_fn=inputs.print_fn)
+                                          "per_device_gb", 0.0)) * 1e9)
     rho_r = fields[0] if include_current else fields
     expected_electrons = f_spin * occupied_band_count(occ, kweights)
     with timing.section("vh.poisson"):
         V_H_r = build_hartree_potential(
             rho_r, inputs.wfn,
             truncation_2d=bool(getattr(inputs.config, "sys_dim", 3) == 2),
-            expected_electrons=expected_electrons,
-            print_fn=inputs.print_fn)
+            expected_electrons=expected_electrons)
 
     V_T_r = None
     if include_current:
@@ -2090,7 +2095,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         current_g0 = jnp.sum(current_projected, axis=(-3, -2, -1)) / np.sqrt(ngrid)
         current_scale = max(
             float(jnp.linalg.norm(current_projected)), np.finfo(np.float64).tiny)
-        inputs.print_fn(
+        log.debug(
             "    SC projected Dirac-current G=0 diagnostic (J=j/c): "
             f"||J0||={float(jnp.linalg.norm(current_g0)):.6e}, "
             f"||J||={current_scale:.6e}, "
@@ -2159,7 +2164,7 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
         efermi_ry=float(efermi_ry))
 
 
-def _residency_census(named, print_fn) -> None:
+def _residency_census(named) -> None:
     """One line per named array: global bytes, bytes addressable HERE, spec.
 
     The SC loop's (nk, nb, nb)-class objects are what decide how many bands
@@ -2172,7 +2177,7 @@ def _residency_census(named, print_fn) -> None:
     Printed once per run (iteration 0), so it costs one host round trip of
     metadata and no device work.
     """
-    print_fn("    SC residency census (global / addressable here):")
+    log.debug("    SC residency census (global / addressable here):")
     for name, a in named:
         if a is None:
             continue
@@ -2181,7 +2186,7 @@ def _residency_census(named, print_fn) -> None:
             spec = getattr(getattr(a, "sharding", None), "spec", "?")
         except AttributeError:
             local, spec = int(np.asarray(a).nbytes), "host"
-        print_fn(
+        log.debug(
             f"      {name:22s} {tuple(a.shape)!s:18s} "
             f"{a.nbytes / 2**20:10.3f} / {local / 2**20:9.3f} MiB  "
             f"1/{a.nbytes / max(local, 1):<4.0f} {spec}")
@@ -2238,7 +2243,7 @@ def _check_sigma_stage(sigma_result: SigmaResult, *, print_fn) -> None:
 
 
 def _report_extrapolation_eqp_shift(
-    H_extrap, H_unextrap, *, mesh_xy, n_occ, iteration, print_fn) -> None:
+    H_extrap, H_unextrap, *, mesh_xy, n_occ, iteration) -> None:
     """Diagonalize both Σ's H and report the correction AT THE EQP LEVEL.
 
     WHY A SECOND DIAGONALIZATION IS WORTH ITS COST.  The extrapolation report
@@ -2302,7 +2307,7 @@ def _report_extrapolation_eqp_shift(
         f"is known to undershoot one-signed against a measured S(508); a "
         f"MIXED sign here means this deck's three points are not in the "
         f"regime the form was calibrated on.")
-    print_fn("\n".join(lines))
+    log.info("\n".join(lines))
 
 
 def _sc_head_frequency_plan(
@@ -2516,6 +2521,10 @@ def _record_sc_window_plan(inputs, iteration, support):
         for k, n in zip(*np.nonzero(outside)):
             _record_sc(inputs, f"SC sampled-support growth: {state(k, n)}, "
                        f"pad={SUPPORT_PAD_EV:.6f} eV; sampled {grids}")
+        if outside.any():
+            _sc_run().change(iteration, "grid",
+                             f"Sigma grid grown to [{grown_grid[0]:+.2f}, {grown_grid[-1]:+.2f}] "
+                             f"eV for {int(outside.sum())} states")
         return
     if not req.any():
         _record_sc(inputs, f"SC window {event} (map {iteration}): no requested state; grid {grids}")
@@ -2543,6 +2552,10 @@ def _record_sc_window_plan(inputs, iteration, support):
                    f"read support [{e[k, n] - half:+.6f}, {e[k, n] + half:+.6f}] eV "
                    f"crosses the {side} edge; pad {SUPPORT_PAD_EV:.2f} eV; grid {grids}; "
                    f"extension {count} of this run")
+    if crossed.any():
+        _sc_run().change(iteration, "grid",
+                         f"Sigma grid extended to [{grown_grid[0]:+.2f}, {grown_grid[-1]:+.2f}] "
+                         f"eV for {int(crossed.sum())} states")
 
 
 def _record_semicore_z(inputs, iteration, z_kn, semicore_kn):
@@ -2760,13 +2773,34 @@ def _record_sc_map_stages(inputs, iteration, started, before) -> None:
         + " | ".join(f"{label} {seconds:.1f}" for label, seconds in parts)
         + f" | other {wall - sum(seconds for _, seconds in parts):.1f}"
         + f" | wall {wall:.1f}")
+    facts = _sc_run().map(int(iteration))
+    facts.wall_s = float(wall)
+    facts.stage_s = {label: float(seconds) for label, seconds in parts}
     from common.jax_compile_cache import compile_receipt
     compile_receipt(f"SC map {int(iteration)}",
                     emit=lambda line: _record_sc(inputs, f"  [compile-cache] {line}"))
 
 
+def _begin_sc_map_row(state, inputs) -> None:
+    """The main log's ``SC map N`` row, at the map's start: its input and
+    what every map rebuilds from it (read from the deck; nothing computed)."""
+    call = int(state.iteration)
+    role = (getattr(inputs, "initial_state_role", "dft_seed") if call == 0
+            else "accepted_input_map")
+    rebuilt = ["W", "Sigma"]
+    if bool(getattr(inputs.config, "density_self_consistent", False)):
+        rebuilt.append("V_H")
+    if str(getattr(getattr(inputs.config, "sc", None), "head_update", "off")) != "off":
+        rebuilt.append("the q->0 head")
+    facts = _sc_run().map(call)
+    facts.input = sc_report.input_label(role)
+    facts.rebuilt = tuple(rebuilt)
+    sc_report.emit_row(f"SC map {call}", sc_report.map_begin_value(facts))
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     _map_started, _map_stages_before = time.perf_counter(), _sc_stage_seconds()
+    _begin_sc_map_row(state, inputs)
     map0_dft_table = None
     """One self-consistent QSGW step in the DFT basis.
 
@@ -2920,7 +2954,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # eigh; both are allowed so a non-canonical initial carry still
         # reports.
         if state.iteration <= 1:
-            inputs.print_fn(
+            log.debug(
                 f"    SC eigh: {eigh_kind} (nb={nb_carry}, one (nb, nb) tile "
                 f"= {nb_carry * nb_carry * 16 / 2**20:.2f} MiB, "
                 f"route from linalg: "
@@ -3106,7 +3140,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if str(entry_occ_state.smearing_family) == "fixed":
             _assert_index_mask_matches_classes(inputs, scissor_classes)
         scissor_classes = replace(scissor_classes, current_indices_kn=indices_loop)
-        inputs.print_fn(
+        log.info(
             f"    SC scissor classes: {scissor_classes.summary()}")
 
     # THE OFF-GRID SET OF THIS MAP, decided once: the grid the Sigma build
@@ -3277,7 +3311,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             _sanity.check_finite(
                 "H_T[SC] transverse", exact_hartree_dft.transverse_dft,
                 print_fn=inputs.print_fn)
-        inputs.print_fn(
+        log.info(
             f"    density-SC: rebuilt exact scalar"
             f"{' + transverse' if exact_hartree_dft.transverse_dft is not None else ''} "
             f"Hartree from iteration {state.iteration} orbitals "
@@ -3346,7 +3380,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 or (metal and not bool(jnp.array_equal(wfns_qp.occ, entry_occ_state.f_kn)))):
             raise ValueError("GATE photon_direct_map_state: Γ E, f, and U "
                              "must be the same map-entry QP state")
-        inputs.print_fn(f"    direct photon Γ map state: iteration={state.iteration}, "
+        log.debug(f"    direct photon Γ map state: iteration={state.iteration}, "
                         f"active=[{inputs.band_slices.b0},{inputs.band_slices.b3}), "
                         "occupations="
                         + (entry_occ_state.occ_hash if metal else "insulating step")
@@ -3624,7 +3658,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             raise ValueError(
                 "fixed DFT head response does not match the current "
                 "screening frequency plan")
-        inputs.print_fn(
+        log.info(
             "    SC head: fixed DFT direct response plus matching wings "
             "on the current screening frequency plan; local fields fold "
             "once through this iteration's W (sc_head_update=off)")
@@ -3681,7 +3715,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             W_by_role=head_body_by_role,
         )
         if head_body_by_role:
-            inputs.print_fn(
+            log.debug(
                 "    SC head: folded q-linear wings through screened "
                 "W_body(Gamma) before the mini-BZ average")
         if bool(inputs.config.do_G0):
@@ -3756,6 +3790,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                        + f" eV around the near grid [{expanded_grid[0]:+.2f}, "
                        f"{expanded_grid[-1]:+.2f}] eV; {int(sc_support.semicore.sum())} "
                        "coarse (k,state) keep their full Sigma rows")
+            _sc_run().change(int(state.iteration), "coarse",
+                             f"{len(sc_support.windows)} coarse Sigma windows "
+                             f"({sc_support.patch_event}) for "
+                             f"{int(sc_support.semicore.sum())} semicore states")
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in sc_support.joined),
             sc_coarse_windows_ev=tuple(sc_support.windows) or None)
@@ -3903,7 +3941,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         _report_extrapolation_eqp_shift(
             H_qp_dft_full, H_n3,
             mesh_xy=inputs.mesh_xy, n_occ=n_occ,
-            iteration=state.iteration, print_fn=inputs.print_fn)
+            iteration=state.iteration)
 
     if state.iteration == 0:
         _residency_census(
@@ -3927,8 +3965,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
              ("sigma_c_omega_kij_ry", sigma_result.sigma_c_omega_kij_ry),
              ("delta_h_qp", delta_h_qp),
              ("delta_h_dft", delta_h_dft),
-             ("H_qp_dft_full", H_qp_dft_full)),
-            inputs.print_fn)
+             ("H_qp_dft_full", H_qp_dft_full)))
     # Every QP-window identity keeps its full Sigma (owner rule 2026-09-22),
     # so the map output is the full QSGW Hamiltonian: no band is scissored
     # and no off-diagonal is masked.
@@ -3941,7 +3978,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if entry_occ_state is not None:
         drift = (abs(entry_occ_state.mu_ry - state.occupation_state.mu_ry)
                  if state.occupation_state is not None else float("nan"))
-        inputs.print_fn(
+        log.info(
             "    SC occupations: entry-solved fixed-N "
             f"{entry_occ_state.smearing_family} state, "
             f"mu={entry_occ_state.mu_ry * RYD_TO_EV:.8f} eV, "
@@ -4091,11 +4128,29 @@ def _record_shared_pole_replans(inputs, iteration, recipe):
     replan = (recipe.get("support_envelope") or {}).get("line_site_replan")
     if replan:
         _record_sc(inputs, f"SC W line sites re-planned (map {iteration}): {replan}")
+        _sc_run().change(iteration, "w_lines", "W line sites re-planned")
     ceiling = recipe.get("sector_pole_treatment") or {}
     if ceiling.get("status") == "replanned":
         _record_sc(inputs, f"SC W treatment ceiling re-planned (map {iteration}): "
                    f"{ceiling['ceiling_ry']:.6f} Ry = 2 x current span "
                    f"{ceiling['current_response_span_ry']:.6f} Ry")
+        _sc_run().change(iteration, "w_ceiling", "W pole ceiling re-planned")
+
+
+def _report_sc_convergence(verdict, *, n_maps: int, one_map: bool) -> None:
+    """The loop's closing table in the main log (:func:`gw.sc_report.convergence_lines`)
+    and its verdict in the JSON sidecar (``sc.verdict``); printed before the
+    driver raises on a budget without convergence, so that run shows it too."""
+    run = _sc_run()
+    run.converged = bool(verdict.converged)
+    run.verdict = sc_report.verdict_text(
+        converged=bool(verdict.converged), stalled=bool(verdict.stalled),
+        one_map=bool(one_map), n_maps=int(n_maps),
+        max_abs_ev=float(verdict.max_abs_ev), cutoff_ev=float(verdict.cutoff_ev))
+    sc_report.emit_rows(sc_report.convergence_lines(run))
+    log.debug(f"SC verdict: {run.verdict}", extra=record(
+        "sc.verdict", converged=run.converged, stalled=bool(verdict.stalled),
+        n_maps=int(n_maps), one_map=bool(one_map), summary=verdict.summary()))
 
 
 def _record_head_sigma_summary(inputs) -> None:
@@ -4114,6 +4169,13 @@ def _record_head_sigma_summary(inputs) -> None:
         inputs, "  SC head: parallel_transport Sigma term D_k dH "
         + (f"zeroed on all {len(zeroed)} maps ({reason})" if reason
            else f"served on all {len(zeroed)} maps"))
+    if reason:
+        log.warning(
+            f"the q->0 head's parallel-transport Sigma term was off on all "
+            f"{len(zeroed)} maps",
+            extra=message("pt_head_sigma_zeroed", kind="NOTE", lines=(
+                sc_report.plain_reason(reason),
+                "the head velocity is U^dagger v_DFT U on every map")))
 
 
 def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
@@ -4180,13 +4242,31 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
 
 
 def _record_sc(inputs: SCInputs, line: str) -> None:
-    """Send one selected SC line to the production record."""
+    """One SC receipt line, verbatim, at INFO: the rank log's record of the map.
+
+    ``tests/hsuite/chain.py`` matches several of these in the rank-0 log
+    (``REQUIRED_LINES``: the coarse windows, the semicore pin, the sum-band
+    tail, the head lines, the map event; the per-map compile receipt), so
+    their text and level stay.  The main log shows the loop through the
+    :mod:`gw.sc_report` rows instead (``_sc_run`` and its callers).
+    """
+    log.info(line)
+
+
+def _report_sc(inputs: SCInputs, line: str) -> None:
+    """One SC line the main log prints verbatim (the ``SC iteration:`` line
+    the harness reads from it): the report's ``record_fn``, else INFO."""
     record_fn = getattr(inputs, "record_fn", None)
-    fallback = getattr(inputs, "print_fn", None)
     if record_fn is not None:
         record_fn(line)
-    elif fallback is not None:
-        fallback(line)
+    else:
+        log.info(line)
+
+
+def _sc_run() -> "sc_report.SCRun":
+    """The SC loop being logged (:mod:`gw.sc_report`); one is opened if a
+    caller runs a map outside :func:`run_sc_driver` (a test)."""
+    return sc_report.last_run() or sc_report.start_run()
 
 
 def _sc_edge_ambiguity_grid(inputs: SCInputs, sigma) -> tuple[int, str]:
@@ -4687,6 +4767,7 @@ def _write_sc_result_eqp(inputs: SCInputs, state_final: SCState, *,
                       nspin=1, comments=comments)
     _record_sc(inputs, f"  SC eqp files: {', '.join(eqp_paths)} "
                f"(= {snapshot} body)")
+    _sc_run().eqp_files = tuple(str(path) for path in eqp_paths)
 
 
 def _write_sc_eqp_snapshot(
@@ -4890,14 +4971,32 @@ def _write_sc_eqp_snapshot(
         _record_sc(inputs, f"  SC map rotation: {rotation_path}")
     if map_gain is not None:
         _record_sc(inputs, map_gain.summary())
-    _record_sc(
-        inputs,
+    iteration_line = (
         f"    SC iteration: call={int(call_index):04d} role={role} "
         f"gap={gap_ev:.9f} eV max|dE|={float(verdict.max_abs_ev):.9e} eV "
         f"active={band_offset + 1}-{band_offset + e_output.shape[1]} "
         f"protected={_band_ranges(protected, band_offset=band_offset)} "
         f"in_range={_band_ranges(in_range, band_offset=band_offset)}")
-    _record_sc(inputs, f"    SC memory: {_process_memory_receipt()}")
+    # The map's rows in the main log, then the harness's verbatim line.
+    facts = _sc_run().map(int(call_index))
+    facts.role = str(role)
+    facts.max_abs_ev = float(verdict.max_abs_ev)
+    facts.worst_k, facts.worst_band = int(verdict.worst_k), int(verdict.worst_band)
+    facts.cutoff_ev = float(verdict.cutoff_ev)
+    facts.rms_ev = float(verdict.rms_protected_ev)
+    facts.n_bands = int(verdict.n_protected)
+    facts.converged, facts.stalled = bool(verdict.converged), bool(verdict.stalled)
+    facts.gap_ev = gap_ev
+    facts.metal = str(getattr(inputs, "material_class", "")) == "metal"
+    if verdict.edge_ambiguous:
+        facts.changes["edge"] = (f"fixed point not unique: {int(verdict.edge_ambiguous)} "
+                                 "states at a Sigma-grid edge")
+    sc_report.emit_rows(sc_report.map_result_rows(facts))
+    sc_report.record_map(facts)
+    _report_sc(inputs, iteration_line)
+    memory = _process_memory_receipt()
+    log.debug(f"    SC memory: {memory}",
+              extra=record("sc.memory", call=int(call_index), receipt=memory))
     return path
 
 
@@ -5042,9 +5141,14 @@ def _read_sc_checkpoint(state_init, inputs, history_depth, max_iter):
         schema=SC_SCHEMA, discard=False, cubes=False)
     if found[0] is None:
         if found[1] != "absent":
-            _record_sc(inputs, f"  WARNING SC resume: {path} does not continue this "
-                       f"run ({found[1]}; this deck digest {identity['deck_sha256'][:16]}); "
-                       "new SC trajectory from the seed (remove the file to silence this)")
+            log.debug(f"  WARNING SC resume: {path} does not continue this "
+                      f"run ({found[1]}; this deck digest {identity['deck_sha256'][:16]}); "
+                      "new SC trajectory from the seed (remove the file to silence this)")
+            log.warning(f"SC resume: {path} does not continue this run; a new SC "
+                        "trajectory starts from the seed",
+                        extra=message("sc_resume_mismatch",
+                                      found=("checkpoint", str(found[1])),
+                                      fix=f"remove {path} to silence this"))
         return None
     _, _, state, commit = found
     n = len(state["res"])
@@ -5060,6 +5164,7 @@ def _read_sc_checkpoint(state_init, inputs, history_depth, max_iter):
     _record_sc(inputs, f"  SC resume: continuing the Anderson trajectory at map {n} "
                f"from {path} beside {seed} (window {state['filled'] + 1}; Sigma rules "
                "re-fitted on their held boxes, chi rule planned cold)")
+    sc_report.emit_row("SC resume", f"Anderson trajectory continues at map {n} from {path}")
     return dict(path=path, commit=commit, state=state)
 
 
@@ -5073,7 +5178,7 @@ def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
         r"sigma_lorentz_iter[0-9]{4}\.h5)\Z",
         barrier_tag="sc.eqp_snapshots.clear", print_fn=print_fn)
     if removed:
-        print_fn(f"  SC map diagnostics: cleared {len(removed)} stale snapshots")
+        log.debug(f"  SC map diagnostics: cleared {len(removed)} stale snapshots")
 
 
 def _clear_sc_rotation_snapshots(
@@ -5090,7 +5195,7 @@ def _clear_sc_rotation_snapshots(
         dump_dir, r"rotation_iter[0-9]{4}\.npy\Z",
         barrier_tag="sc.rotation_snapshots.clear", print_fn=print_fn)
     if removed:
-        print_fn(f"  SC map rotations: cleared {len(removed)} stale snapshots")
+        log.debug(f"  SC map rotations: cleared {len(removed)} stale snapshots")
 
 
 # ---------------------------------------------------------------------------
@@ -5247,7 +5352,7 @@ def _run_anderson(
     metric_k = np.sqrt(k_star_weights(_kstar(inputs)))[:, None, None]
     n_elem = nk * nb * nb
     mesh = inputs.mesh_xy
-    print_fn(
+    log.info(
         f"  SC Anderson (one map per iteration): history_depth={history_depth}, "
         f"max_iter={max_iter}, tol={tol_ev:.1e} eV")
     # PAD, DO NOT DEGRADE.  ``band_rotation_spec`` puts the two band axes
@@ -5331,7 +5436,7 @@ def _run_anderson(
     # size here, and that is the failure mode that would make this a
     # silent no-op.
     local_b = sum(sh.data.nbytes for sh in x0.addressable_shards)
-    print_fn(
+    log.debug(
         f"  SC Anderson residency: carry {tuple(H0.shape)} (nk={nk} on the "
         f"loop's k-set), n={n_elem} logical, mesh {px}x{py}; bands "
         f"{nb}→{nb_pad} (band divisor {band_div}, "
@@ -5463,7 +5568,7 @@ def _run_anderson(
         rms2 = (
             float(np.sqrt(np.mean((E_new - _e_history[-3]) ** 2)))
             if len(_e_history) >= 3 else float("nan"))
-        print_fn(
+        log.info(
             f"  SC map call {len(rms_history)}: "
             f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
             f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
@@ -5502,12 +5607,15 @@ def _run_anderson(
         # minimizes.  Protected block = the metric mask.
         _spec, _frob = _protected_residual_norms(
             state_out.H_qp_dft, H, metric_mask, eigvalsh_kshard)
-        _record_sc(inputs, f"    SC matrix residual: call={call_index} "
-                           f"max_k ||f_k||_2 = {_spec:.6e} meV; ||f||_F = "
-                           f"{_frob:.6e} meV (protected block)"
-                           + ("; FLAG: max|dE| exceeds max_k ||f_k||_2, which bounds "
-                              "every sorted pair of the full block (Weyl)"
-                              if _verdict.max_abs_ev * 1e3 > 1.000001 * _spec else ""))
+        log.info(f"    SC matrix residual: call={call_index} "
+                 f"max_k ||f_k||_2 = {_spec:.6e} meV; ||f||_F = "
+                 f"{_frob:.6e} meV (protected block)"
+                 + ("; FLAG: max|dE| exceeds max_k ||f_k||_2, which bounds "
+                    "every sorted pair of the full block (Weyl)"
+                    if _verdict.max_abs_ev * 1e3 > 1.000001 * _spec else ""),
+                 extra=record("sc.matrix_residual", call=int(call_index),
+                              max_k_spectral_mev=_spec, frobenius_mev=_frob))
+        _sc_run().map(int(call_index)).matrix_residual_mev = _spec
         _iter_idx[0] += 1
         if call_index > 0:
             _floor_history.append(float(_spec))
@@ -5587,7 +5695,7 @@ def _run_anderson(
     # weights every history entry in that solve. Padded entries stay zero.
     _metric_np = np.zeros((int(x0.shape[0]), _nbp, _nbp), dtype=np.float64)
     _metric_np[:, :nb, :nb] = metric_k * (_fit_mask[:, :, None] * _fit_mask[:, None, :])
-    print_fn(
+    log.debug(
         "  SC Anderson metric: full-grid star-weighted Gram over the per-k "
         "non-scissored DFT identity block; masks refreshed after each map, "
         "scissored rows follow the map")
@@ -5623,9 +5731,11 @@ def _run_anderson(
         except (OSError, RuntimeError, TypeError, ValueError, pickle.PickleError) as exc:
             # The previous map's checkpoint must not outlive this map.
             discard_sigma_checkpoint(checkpoint_path)
-            _record_sc(inputs, f"  WARNING SC checkpoint: map {n} not written "
-                       f"({type(exc).__name__}: {str(exc)[:300]}); no checkpoint is "
-                       "left, so a later process starts from the warm seed alone")
+            log.warning(f"SC checkpoint: map {n} not written",
+                        extra=message("sc_checkpoint_write_failed",
+                                      found=("write error", f"{type(exc).__name__}: {exc}"),
+                                      lines=("no checkpoint is left, so a later process "
+                                             "starts from the warm seed alone",)))
             return
         _record_sc(inputs, f"  SC checkpoint: map {n} written "
                    f"({nbytes / 2**20:.1f} MiB in {seconds:.1f} s) to {checkpoint_path}")
@@ -5678,16 +5788,16 @@ def _run_anderson(
         # retained for the writers.  The pad-inertness check below reads the
         # final x, which this path never reaches -- say so rather than
         # skip it silently.
-        print_fn(
+        log.info(
             f"  SC {'STALLED' if stop.verdict.stalled else 'stopped by the convergence criterion'} "
             f"after {_iter_idx[0]} map calls: {stop.verdict.summary()}")
-        print_fn(
+        log.debug(
             "  SC pad inertness: NOT CHECKED (early stop -- the "
             "check reads the solver's final x, not reached on this path)")
         _maybe_dump_e_history(dump_dir, _e_history, print_fn)
         return stop.state, rms_history
 
-    print_fn(
+    log.info(
         f"  SC Anderson done: {result.iterations} iterations WITHOUT meeting "
         f"the {tol_ev:.3e} eV criterion (budget exhausted), final "
         f"‖residual‖₂ = {float(result.residual_norms[-1]):.4e} Ry -- a "
@@ -5705,7 +5815,7 @@ def _run_anderson(
         pad_max = max(
             float(jnp.max(jnp.abs(result.x[:, nb:, :]))),
             float(jnp.max(jnp.abs(result.x[:, :, nb:]))))
-        print_fn(
+        log.debug(
             f"  SC pad inertness: {nb_pad - nb} pad bands per axis, "
             f"max|H| over the pad zone = {pad_max:.3e} "
             f"(exactly 0.0: {pad_max == 0.0})")
@@ -5746,7 +5856,7 @@ def _maybe_dump_e_history(
         os.makedirs(dump_dir, exist_ok=True)
         np.save(os.path.join(dump_dir, "e_history_kn_ev.npy"),
                 np.stack(e_history, axis=0))
-        print_fn(
+        log.info(
             f"  SC dump: saved {len(e_history)} eigenvalue snapshots to "
             f"{dump_dir}/e_history_kn_ev.npy (shape (map, k, n))"
         )
@@ -6038,7 +6148,7 @@ def load_head_velocity_source(
         # (``response_bank.compute_photon_bank``); no scalar head consumes one.
         # parallel_transport loads the links below and hands the bank the
         # map's QSGW velocity (``photon_head_state``).
-        print_fn(
+        log.info(
             "  SC head: four-current direct Gamma head follows every map "
             "(sc_head_update = dft_velocity): QP-rotated dipole velocity, "
             "this map's Fermi-Dirac state, its own Ward contact")
@@ -6067,7 +6177,7 @@ def load_head_velocity_source(
         from .qsgw_head import load_dft_dipole_head
         source = load_dft_dipole_head(
             input_dir, mesh=mesh, wfn=wfn, meta=meta, config=config)
-        print_fn(
+        log.info(
             "  SC head: authenticated DFT dipole velocity, rotated into "
             "this map's QP basis; live Fermi-surface Drude and static "
             "Thomas-Fermi head"
@@ -6083,7 +6193,7 @@ def load_head_velocity_source(
         from .qsgw_head import load_dft_dipole_head
         source = load_dft_dipole_head(
             input_dir, mesh=mesh, wfn=wfn, meta=meta, config=config)
-        print_fn(
+        log.info(
             "  SC head: authenticated DFT dipole velocity (no "
             f"{pt_path}), rotated into each map's QP basis; no Sigma term")
         return source
@@ -6092,7 +6202,7 @@ def load_head_velocity_source(
 
         source = load_dft_velocity_head(
             pt_path, mesh=mesh, wfn=wfn, meta=meta, config=config)
-        print_fn(
+        log.info(
             "  SC head: loaded the exact DFT p-matrix velocity stage from "
             f"{pt_path} (nb={source.nb_logical}); no finite links, so "
             "the ΔH covariant velocity correction is OFF and the head runs "
@@ -6105,7 +6215,7 @@ def load_head_velocity_source(
 
         source = load_interband_commutator_head(
             pt_path, mesh=mesh, wfn=wfn, meta=meta, config=config)
-        print_fn(
+        log.info(
             "  SC head: interband commutator on the exact DFT velocity from "
             f"{pt_path} (nb={source.nb_logical}); each map adds "
             "[DeltaH, W], W_vc = v_vc/(E_v - E_c) across the gap only, "
@@ -6150,14 +6260,14 @@ def load_head_velocity_source(
                              forward_neighbors=None, collapsed_position=None,
                              link_unserved=unserved)
     if unserved is not None:
-        print_fn(
+        log.info(
             f"  SC head: parallel_transport from {pt_path} "
             f"(nb={source.nb_logical}); its links cannot serve the Sigma "
             f"term ({unserved}), so D_k dH = 0 on every map and the head "
             "runs U^dagger v_DFT U")
         return source
     vgate = source.validation
-    print_fn(
+    log.info(
         "  SC head: loaded validated parallel transport from "
         f"{pt_path} (nb={source.nb_logical}, "
         "head-response rel="
@@ -6382,11 +6492,11 @@ def run_sc_driver(
     kstar = None
     if bool(getattr(config, "sc_on_ibz", False)):
         if kstar_io.is_identity:
-            print_fn("  SC: sc_on_ibz requested but every k-star is a "
+            log.info("  SC: sc_on_ibz requested but every k-star is a "
                      "singleton on this deck; running on the full BZ.")
         else:
             kstar = kstar_io
-            print_fn(
+            log.info(
                 f"  SC: {kstar!r} — H/E/U and retained Σ on the star "
                 "wedge; full BZ exists only inside each map")
             # Device gather — ``np.asarray`` here would raise "spans
@@ -6415,7 +6525,7 @@ def run_sc_driver(
             wfns, np.asarray(fixed_head_omegas, dtype=np.complex128),
             input_dir=input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
             config=config)
-        print_fn(
+        log.debug(
             "  SC head: cached fixed DFT direct response and wings for "
             f"{len(fixed_head_omegas)} frequency sample(s); each map folds "
             "them once through its resident W.")
@@ -6455,12 +6565,18 @@ def run_sc_driver(
         print_fn=print_fn,
         record_fn=record_fn,
     )
-    state_init = (
-        make_initial_state_from_qp_rotations(inputs, seed_path)
-        if seed_path is not None else make_initial_state_from_dft(inputs))
     # Loop knobs from ``config.sc`` (the LORRAX_SC_* env vars are
     # deprecated overrides, applied at config construction).
     sc = config.sc
+    loop = dict(mode=str(config.compute_mode.value), max_iter=int(sc.max_iter),
+                tol_ev=float(sc.tol_ev), accelerator=str(sc.accelerator),
+                depth=int(sc.history_depth))
+    sc_report.start_run(**loop)
+    log.debug("SC loop", extra=record("sc.loop", **loop))
+    sc_report.emit_row("SC loop", sc_report.loop_value(**loop))
+    state_init = (
+        make_initial_state_from_qp_rotations(inputs, seed_path)
+        if seed_path is not None else make_initial_state_from_dft(inputs))
     _record_sc(
         inputs,
         f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
@@ -6477,6 +6593,8 @@ def run_sc_driver(
             "GATE sc_missing_convergence_verdict: the last evaluated SC map "
             "returned no fixed-point verdict")
     _record_head_sigma_summary(inputs)
+    _report_sc_convergence(verdict, n_maps=max(len(rms_history), 1),
+                           one_map=sc.max_iter == 1)
     if sc.max_iter == 1:
         _record_sc(
             inputs, "  SC verdict: ONE-MAP DIAGNOSTIC (convergence was not "
@@ -6535,7 +6653,7 @@ def run_sc_driver(
             if rms_history else " (one-shot)"))
     if screening.static_head_terms is not None:
         from .head_correction import format_static_head_diagnostics
-        print_fn("  SC final map: " + format_static_head_diagnostics(
+        log.debug("  SC final map: " + format_static_head_diagnostics(
             screening.static_head_terms))
 
     # ONE FINAL-MAP RESTART WRITE.  No seed W is persisted before the loop:
@@ -7031,7 +7149,7 @@ def dump_sigma_omega_h5_final(
         sym=sym, star_already_selected=star_already_selected,
         print_fn=print_fn,
     )
-    print_fn(f"  Σ_c(ω) tensor: {path}")
+    log.debug(f"  Σ_c(ω) tensor: {path}")
     # THE QSGW CUBE, WRITTEN WHERE IT IS STILL IN ITS OWN BASIS.  Under
     # self-consistency ``sigma_xc_kij_ry`` is Σ_x + Σ_c^QSGW built from
     # ``wfns_qp``, i.e. the QP basis — the same basis the Σ_c(ω) cube
@@ -7187,7 +7305,7 @@ def dump_qp_wfn_artifacts(
             f"WFN_qp nk={nk_wfn_got} (need wfn.nkpts={nk_wfn_want}) and "
             f"rotations nk={nk_full} (need full BZ "
             f"{int(sym.unfolded_kpts.shape[0])}); kstar={kstar!r}")
-    print_fn(f"  QP dump k-sets: WFN_qp {nk_wfn_got} (file wedge), "
+    log.debug(f"  QP dump k-sets: WFN_qp {nk_wfn_got} (file wedge), "
              f"rotations {nk_full} (full BZ), "
              f"loop {int(U_loop.shape[0])}"
              f"{' (star wedge)' if state_on_ibz else ' (full BZ)'}")
@@ -7257,7 +7375,7 @@ def dump_qp_wfn_artifacts(
             wfn.symmetry(), np.asarray(final_occ_state.f_kn)),
             dtype=np.float64)
         efermi_ry = float(final_occ_state.mu_ry)
-        print_fn(
+        log.info(
             "  State occupations: fixed-N "
             f"{final_occ_state.smearing_family}, "
             f"mu={efermi_ry * RYD_TO_EV:.6f} eV, "
@@ -7353,12 +7471,12 @@ def dump_qp_wfn_artifacts(
         qp_rot_path, stage="qp_rotations_h5_write",
         write=_write_qp_rotations, validate_file=_validate_qp_rotations)
     if write_wfn_h5:
-        print_fn(f"  QP WFN:       {qp_wfn_path}")
-    print_fn(f"  QP rotations: {qp_rot_path}")
+        log.info(f"  QP WFN:       {qp_wfn_path}")
+    log.info(f"  QP rotations: {qp_rot_path}")
     _ref_kind = ("fixed-N mu" if (state.occupation_state is not None
                  and str(state.occupation_state.smearing_family) in ("mp1", "fd"))
                  else "midgap")
-    print_fn(f"  State E_F ({_ref_kind}, eV): {efermi_ry * RYD_TO_EV:.6f}")
+    log.info(f"  State E_F ({_ref_kind}, eV): {efermi_ry * RYD_TO_EV:.6f}")
     return (qp_wfn_path if write_wfn_h5 else None, qp_rot_path, efermi_ry,
             enk_loop_ry)
 

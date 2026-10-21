@@ -12,6 +12,7 @@ nmu2_no_backup is a finding."""
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -19,6 +20,11 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
+
+#: Receipts and route decisions are diagnostics: DEBUG lines plus JSON-sidecar records
+#: (``memory.receipts``, ``routes``).  ``lxkit`` is a service and imports no ``common.log``, so it
+#: logs on the ``lorrax.`` namespace directly, with the ``common.log.record`` extras by hand.
+_LOG = logging.getLogger("lorrax.memory")
 
 TERMS = ("operands", "xla", "vendor", "outside")
 STRICT = os.environ.get("LORRAX_MEMORY_STRICT", "") == "1"
@@ -171,6 +177,9 @@ def _setup() -> Optional[str]:
         pointer = arrays[0].addressable_shards[0].data.unsafe_buffer_pointer()
         if not lib.cuPointerGetAttribute(ctypes.byref(handle), 17, ctypes.c_uint64(pointer)) and handle.value:
             _I.update(lib=lib, handle=handle, source="pool")
+            # Drop the high-water since process start (the pool's preallocation)
+            # so the first stage read is that stage's use, not the reservation.
+            lib.cuMemPoolSetAttribute(handle, 8, ctypes.byref(ctypes.c_uint64(0)))
             return "pool"
         reader = "bfc"                        # no CUDA pool behind this allocator
     stats = device.memory_stats() or {}
@@ -308,7 +317,8 @@ def close_tracker(t: Optional[dict]) -> tuple:
         if t["metered"] > row["measured"]:
             row["measured"], row["exact"] = float(t["metered"]), t["exact"]
         if say:
-            _say(receipt_line(t["name"], price, t["metered"], t["exact"], src))
+            _debug(receipt_line(t["name"], price, t["metered"], t["exact"], src), "memory.receipts",
+                   lambda: _receipt_fields(t["name"], price, t["metered"], t["exact"], src))
     return t["whole"], t["own"], t["exact"]
 
 
@@ -340,6 +350,14 @@ def receipt_line(name: str, price: Price, measured: float, exact: bool, src: str
         return head + " | measured not measured | γ –"
     mark = "" if exact else ({"bfc": ">=", "live": "live "}.get(src, "~") if CALIBRATE else "~")
     return head + f" | measured {mark}{_gb(measured)} | γ " + (f"{measured / total:.2f}" if total else "–")
+
+
+def _receipt_fields(name: str, price: Price, measured: float, exact: bool, src: str) -> dict:
+    """The numbers of a receipt line, in bytes: the JSON-sidecar record of ``memory.receipts``."""
+    total, known = price.bytes(), measured is not None and measured >= 0
+    return dict(stage=str(name), priced_bytes=total, **{f"{n}_bytes": v for n, v in price.terms().items()},
+                measured_bytes=float(measured) if known else None, measured_exact=bool(exact),
+                source=str(src), gamma=float(measured) / total if known and total else None)
 
 
 def receipts() -> list:
@@ -437,13 +455,22 @@ def _trace(t: dict, event: str) -> None:
 
 # --- lines and warnings ----------------------------------------------------------------------------
 def set_sink(sink=None) -> None:
-    """Route receipt, route and banner lines through the driver's report."""
+    """Route the banner and warned-route lines through the driver's report (receipts and routes are
+    DEBUG logs and sidecar records, not sink lines)."""
     _HOOK["sink"] = sink
 
 
 def _say(text: str, *, local: bool = False) -> None:
     try:
         (local or _rank0()) and (_HOOK["sink"] or (lambda line: print(line, flush=True)))(text)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def _debug(text: str, key: str, fields: Callable[[], dict], *, local: bool = False) -> None:
+    """A diagnostic line: DEBUG, plus the record ``fields()`` under ``key`` in the JSON sidecar."""
+    try:
+        (local or _rank0()) and _LOG.debug(text, extra={"lorrax": {"record_key": key, "record": fields()}})
     except Exception:                                          # noqa: BLE001
         pass
 
@@ -577,14 +604,18 @@ def bucket(value) -> int:
 
 # --- admission: the one policy point, route completeness, sizing ----------------
 def record_route(site, route, reason, *, warning=None) -> None:
-    """Record one route decision; rank 0 prints it the first time."""
+    """Record one route decision; rank 0 logs it the first time (DEBUG and the ``routes`` record; a
+    warned route is also printed)."""
     key = (str(site), str(route), str(reason))
     if key in _ROUTES:
         _ROUTES[key]["count"] += 1
         return
     line = f"route {site}: {route} ({reason})" + (f"; WARNING {warning}" if warning else "")
     _ROUTES[key] = dict(site=key[0], route=key[1], reason=key[2], warning=warning, line=line, count=1)
-    _say(("  WARNING: " if warning else "  ") + line)
+    text = ("  WARNING: " if warning else "  ") + line
+    if warning:                                               # a warning stays in the main log
+        _say(text)
+    _debug(text, "routes", lambda: dict(site=key[0], route=key[1], reason=key[2], warning=warning))
 
 
 def routes() -> list:

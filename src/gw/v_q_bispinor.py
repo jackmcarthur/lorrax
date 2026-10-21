@@ -55,6 +55,10 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 
@@ -490,7 +494,7 @@ def _bispinor_tile_spec(mu_L, nu_L, *, zeta_C, zeta_T, use_ibz_C, use_ibz_T,
         v_builder = _v_builder_with_bgw
 
     if verbose and jax.process_index() == 0:
-        print_fn(f"  [bispinor g-flat] tile "
+        log.debug(f"  [bispinor g-flat] tile "
                  f"{UNIQUE_TILES.index((mu_L, nu_L)) + 1}/{len(UNIQUE_TILES)} "
                  f"(μ_L={mu_L}, ν_L={nu_L})  "
                  f"n_rmu_L={n_rmu_C if mu_L == 0 else n_rmu_T} "
@@ -600,9 +604,8 @@ class ParkedVTiles:
             memory.admit(f"four-current V_q host park ({what})",
                          memory.priced(need, "closed form"), have, local=True,
                          device=False)
-        if jax.process_index() == 0:
-            print_fn(f"  μ-batch V_q: {what} parked on host, {need / 1e9:.2f} "
-                     f"GB/rank of a {have / 1e9:.1f} GB host share")
+        log.debug(f"  μ-batch V_q: {what} parked on host, {need / 1e9:.2f} "
+                 f"GB/rank of a {have / 1e9:.1f} GB host share")
         self._tiles = [(park(V), park(g0)) for V, g0 in results]
         self._cap = cap
         self._cap_tile = next((i for i, hit in enumerate(same) if hit), None)

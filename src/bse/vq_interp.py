@@ -144,6 +144,10 @@ from common.sharding_fit import legal_spec as _legal_spec        # noqa: E402
 # a past-the-API edge and ``tests/test_layering.py`` fails on those.  The
 # ``ensure_on_path()`` above is what makes it resolvable in a bare launch.
 from file_io.restart_bundle import read_vq_payload
+from common.log import get_logger, message
+
+log = get_logger(__name__)
+_LOGGER = log     # the module logger, where a local ``log`` shadows it
 
 
 # ===========================================================================
@@ -368,7 +372,7 @@ def v_slab_on_set(zx, qfrac, GS, kind="slab", alpha=None):
     return np.where(zero, 0.0, v)
 
 
-def make_v_on_set(zx, policy, log_fn=print):
+def make_v_on_set(zx, policy, log_fn=log.debug):
     """The kernel the REFIT contracts with — the PRODUCER's, not this module's.
 
     ``v_slab_on_set`` above is the 2-D Ismail-Beigi truncation, and it is the
@@ -643,9 +647,9 @@ def run_gates(zx, C_q):
         flag = "" if tol is None else ("  OK" if v <= tol else "  ** FAIL **")
         if tol is not None and v > tol:
             ok = False
-        print(f"    [gate] {k:<44s} {v:.3e}{flag}")
+        _LOGGER.debug(f"    [gate] {k:<44s} {v:.3e}{flag}")
 
-    print("  [gates] vq_interp coarse data:")
+    _LOGGER.debug("  [gates] vq_interp coarse data:")
     n0 = int(zx["ngk"][0])
     zt = to_sphere(zx, recon(zx, 0), 0)
     log("recon_roundtrip_sphere_Gamma",
@@ -1215,9 +1219,9 @@ def prepare_coarse(zx, C_q, mesh_xy: Mesh, *, alpha=ALPHA, eps_tik=EPS_TIK,
             V_dev_chunks.append(V_b)
         Fch[sl] = _to_host(F_b)
     tail = float(np.exp(-zx["zeta_cutoff"] / (4.0 * alpha ** 2)))
-    print(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
-          f"channels zero-filled; sphere-tail bound {tail:.1e}"
-          f"{'' if keep_host_mirrors else '; host mirrors dropped'}")
+    log.debug(f"  [prep] gset({alpha}) = {nG} G; {n_out} out-of-sphere (q,G) "
+              f"channels zero-filled; sphere-tail bound {tail:.1e}"
+              f"{'' if keep_host_mirrors else '; host mirrors dropped'}")
     stencil_sh = _ns(mesh_xy, P(None, "x", "y"), (nq, n_mu, n_mu),
                      "prepare_coarse.V_SRc")
     # Host-mirror branch: process-local placement (AA.1; the mirror was
@@ -1309,8 +1313,8 @@ def lr_design_blocks(zx, prep, degrees=None):
         des["AtA"][g] = AtA
         des["AtY"][g] = AtY
     ncoef = sum(len(s) for s in des["specs"].values())
-    print(f"  [fit] LR design: degrees {degrees} -> {ncoef} complex "
-          f"coefficients per mu (global)")
+    log.debug(f"  [fit] LR design: degrees {degrees} -> {ncoef} complex "
+              f"coefficients per mu (global)")
     return des
 
 
@@ -1771,7 +1775,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
                        *, zeta_file=None, input_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
                        eigh_backend="auto", head_minibz_average=False,
                        distrib_la_batched_route: str = "batch_reshard",
-                       run_diagnostics=False, log_fn=print, fit_ecut=None):
+                       run_diagnostics=False, log_fn=log.debug, fit_ecut=None):
     """ONE arbitrary-Q exchange-tile model build (stages 1-3), packaged.
 
     This is the SINGLE orchestration of the ``vq_interp`` pipeline
@@ -1872,7 +1876,7 @@ def run_nulls(zx, prep, des, coeffs):
         flag = "  OK" if v <= tol else "  ** FAIL **"
         if v > tol:
             ok = False
-        print(f"    [null] {k:<44s} {v:.3e}{flag}")
+        _LOGGER.debug(f"    [null] {k:<44s} {v:.3e}{flag}")
 
     # exact-stencil reproduction: with the FULL R lattice the trig weights
     # are a delta, so "interpolating" to a training point returns its data
@@ -2131,7 +2135,7 @@ def _zeta_fit_window_of(prov: dict) -> tuple[int, int] | None:
     return (bl[0], bl[1]) if bl == br else None
 
 
-def refit_window_view(zx, band_range, log_fn=print,
+def refit_window_view(zx, band_range, log_fn=log.debug,
                       degeneracy_mode: str = "strict",
                       degeneracy_tol_ry: float | None = None,
                       window_mode: str = "bse"):
@@ -2267,7 +2271,7 @@ def refit_window_view(zx, band_range, log_fn=print,
 REFIT_N_GUARD_DEFAULT = 4
 
 
-def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
+def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=log.debug,
                   r_chunk: int = 2048, policy=None, keep_idx=None,
                   window_mode: str = "zeta",
                   degeneracy_mode: str = "strict",
@@ -2487,21 +2491,31 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
            + ("" if int(zx["n_mu"]) * ns >= nk * nb_wide else
               "  ** SHORT — build_fH_R's orthonormality gate decides **"))
     if n_guard < 4:
-        log_fn(f"  [warn] only {n_guard} guard band(s) above the ζ-fit "
-               f"window.  f(ε) ≡ 0 for ε ≥ max_k ε[nb_fh−1], and the dead "
-               f"set measured FOUR bands deep on a 20-band window and TWO on "
-               f"a 52-band one (2026-08-11-fifth-wall-is-the-f-transform-"
-               f"shoulder.md §2), so the top of the ζ window may come back "
-               f"from eigh as an arbitrary null-space direction.  The "
-               f"f-shoulder gate in compute_wfns_fi is what decides — it "
-               f"prints the dead set's actual depth on THIS deck; this is "
-               f"the warning that makes it cheap to act on.")
+        log.warning(f"only {n_guard} guard band(s) above the ζ-fit "
+                    f"window.  f(ε) ≡ 0 for ε ≥ max_k ε[nb_fh−1], and the dead "
+                    f"set measured FOUR bands deep on a 20-band window and TWO on "
+                    f"a 52-band one (2026-08-11-fifth-wall-is-the-f-transform-"
+                    f"shoulder.md §2), so the top of the ζ window may come back "
+                    f"from eigh as an arbitrary null-space direction.  The "
+                    f"f-shoulder gate in compute_wfns_fi is what decides — it "
+                    f"prints the dead set's actual depth on THIS deck; this is "
+                    f"the warning that makes it cheap to act on.",
+                    extra=message(
+                        id="refit_guard_bands_few",
+                        found=("guard bands above the zeta-fit window", str(n_guard)),
+                        needs="at least 4",
+                        fix="raise nband/ncond so the f-transform shoulder is cleared"))
     if n_guard > 16:
-        log_fn(f"  [warn] {n_guard} guard bands is a LARGE interp window and "
-               f"a large window does not improve — past a system-dependent "
-               f"cliff it WRECKS — the recovered on-grid energies (MoS2/640c: "
-               f"~1 meV at nband<=48, ~955 meV at nband 80).  Keep the guards "
-               f"just deep enough to clear the f-shoulder.")
+        log.warning(f"{n_guard} guard bands is a LARGE interp window and "
+                    f"a large window does not improve — past a system-dependent "
+                    f"cliff it WRECKS — the recovered on-grid energies (MoS2/640c: "
+                    f"~1 meV at nband<=48, ~955 meV at nband 80).  Keep the guards "
+                    f"just deep enough to clear the f-shoulder.",
+                    extra=message(
+                        id="refit_guard_bands_many",
+                        found=("guard bands above the zeta-fit window", str(n_guard)),
+                        needs="at most 16",
+                        fix="lower nband toward the BSE window"))
 
     # The compact selected-state factor is the persistent α basis.  Its
     # physical rows and the ζ-window ψ rows are regenerated together for one
@@ -2565,7 +2579,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             "v_on_set": v_on_set}
 
 
-def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
+def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=log.debug,
                       q_list=None, tol=5e-2):
     """THE gate: refit at a COARSE q must give back the STORED tile.
 
@@ -2778,7 +2792,7 @@ def close_refit_state(rst: dict) -> None:
         wfn.close()
 
 
-def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
+def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=log.debug,
              m_leg: str = "htransform"):
     """Ground-truth V at TILE momentum ``q_tile_frac`` via a per-Q ζ refit.
 

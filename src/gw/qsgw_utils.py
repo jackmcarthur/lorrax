@@ -26,6 +26,10 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +119,7 @@ def _omega_interp_slots(omega_grid, eval_kn, *, context="", print_fn=None):
     covered, n_out, frac = omega_coverage(omega, eval_arr)
     if n_out and print_fn is not None:
         where = f" [{context}]" if context else ""
-        print_fn(f"  omega coverage{where}: {n_out} of {eval_arr.size} ({100.0 * frac:.1f}%) "
+        log.info(f"  omega coverage{where}: {n_out} of {eval_arr.size} ({100.0 * frac:.1f}%) "
                  f"evaluation energies outside [{float(omega[0]):.3f}, {float(omega[-1]):.3f}] "
                  f"use Sigma(omega=0).")
     e = np.where(covered, eval_arr, 0.0)
@@ -992,7 +996,7 @@ def write_qsgw_sigma_cube(
     from file_io import append_qsgw_datasets_h5
 
     if _is_band_sharded_static(sigma_xc_qsgw_kij_ry):
-        print_fn(
+        log.debug(
             "  QSGW cube appendix omitted: the live operator is "
             "P(None,'x','y')-sharded and this optional rank-0 writer does "
             "not gather it")
@@ -1045,7 +1049,7 @@ def solve_qp(
             "solver; self_consistent runs through run_sc_driver.")
     if (config.compute_mode.is_dynamic
             and sigma_result.sigma_c_omega_kij_ry is not None):
-        print_fn(
+        log.info(
             "  QP solver: one_shot_dft — "
             + qp_solver_semantics(QPSolver.ONE_SHOT_DFT).description)
     return sigma_result.sigma_xc_kij_ry + sigma_result.v_h_kij_ry

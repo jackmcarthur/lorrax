@@ -22,6 +22,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.units import RYD_TO_EV
+from common.log import get_logger, message as log_message
 import common.timing as timing
 from common.collectives import device_put_process_local
 from runtime.padding import (authenticate_axis, authenticate_padded_axis,
@@ -33,6 +34,8 @@ from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSI
     _decode_charge_zeta_identity, _loaded_band_axis, _validate_shape_receipt,
     coulomb_policy_from_config, compare_coulomb_policy, parse_coulomb_policy,
     format_coulomb_policy)
+
+log = get_logger(__name__)
 
 if TYPE_CHECKING:
     from zeta_loader import ZetaLoader
@@ -3816,8 +3819,8 @@ def _fix_sphere_wrap(zx):
             changed += 1
         zx["qfr"][q] = best
     if changed:
-        print(f"  [wrapfix] {changed} of {zx['nq']} q relabeled to the "
-              f"sphere-derived center")
+        log.info(f"  [wrapfix] {changed} of {zx['nq']} q relabeled to the "
+                 f"sphere-derived center")
 
 
 def read_vq_payload(restart_file: str, zeta_file: str, *,
@@ -3952,18 +3955,12 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
                 f"(e.g. {_missing[0]}); the on-disk q ordering is not the "
                 f"C-order wrapped {tuple(int(v) for v in zx['kgrid'])} grid "
                 f"this reconstruction assumes.")
-        try:
-            _first = jax.process_index() == 0
-        except Exception:
-            _first = True
-        if _first:
-            print(f"  [vq_interp] zeta_q.h5 holds {zx['nq']} full-BZ q but "
-                  f"mf_header/kpoints/rk has only {qraw.shape[0]} (the WFN is "
-                  f"symmetry-reduced).  q labels reconstructed as the BGW-"
-                  f"wrapped C-order {tuple(int(v) for v in zx['kgrid'])} grid; "
-                  f"run_gates' per-q makeVq-vs-disk check (sigma_freq_debug_output) "
-                  f"verifies it.",
-                  flush=True)
+        log.info(f"  [vq_interp] zeta_q.h5 holds {zx['nq']} full-BZ q but "
+                 f"mf_header/kpoints/rk has only {qraw.shape[0]} (the WFN is "
+                 f"symmetry-reduced).  q labels reconstructed as the BGW-"
+                 f"wrapped C-order {tuple(int(v) for v in zx['kgrid'])} grid; "
+                 f"run_gates' per-q makeVq-vs-disk check (sigma_freq_debug_output) "
+                 f"verifies it.")
         qraw = qfull
     zx["qfr_raw"] = qraw[: zx["nq"]]
     zx["qfr"] = zx["qfr_raw"] - np.round(zx["qfr_raw"])  # BGW-wrapped, pre half-fix
@@ -4529,10 +4526,9 @@ def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray | None) -> np.
                 f"{1e3 * EQP_STAR_SPREAD_TOL_EV:.1f} meV over every star and "
                 f"multiplet).  Symmetry-equivalent k must carry the same QP "
                 f"energies; regenerate the file star-symmetric.")
-        if jax.process_index() == 0:
-            kw, bw = np.unravel_index(int(np.argmax(inside)), inside.shape)
-            in_mult = np.flatnonzero(mult[kw] == mult[kw, bw])
-            print(f"  [eqp] {name}: star spread of E_QP - E_DFT "
+        kw, bw = np.unravel_index(int(np.argmax(inside)), inside.shape)
+        in_mult = np.flatnonzero(mult[kw] == mult[kw, bw])
+        log.debug(f"  [eqp] {name}: star spread of E_QP - E_DFT "
                   f"{1e3 * worst:.4f} meV over DFT-multiplet means (gate "
                   f"{1e3 * EQP_STAR_SPREAD_TOL_EV:.1f} meV), "
                   f"{1e3 * float(star_spread(shift).max()):.4f} meV band by "
@@ -4540,12 +4536,15 @@ def _eqp_on_full_bz(sym, eqp_file: str, e_dft_full_ev: np.ndarray | None) -> np.
                   f"{1e3 * float(inside[kw, bw]):.4f} meV (k {int(kw)}, bands "
                   f"{band_offset + in_mult[0] + 1}-"
                   f"{band_offset + in_mult[-1] + 1})")
-            if cut.any():
-                print(f"  [eqp] WARNING {name}: band {band_offset + n} ends "
-                      f"inside a DFT multiplet at {int(cut.sum())} k; that "
-                      f"multiplet's star spread, "
-                      f"{1e3 * float(star_spread(np.where(gated, 0.0, mean)).max()):.4f}"
-                      f" meV, is reported and not gated.")
+        if cut.any():
+            log.warning(
+                f"[eqp] {name}: band {band_offset + n} ends "
+                f"inside a DFT multiplet at {int(cut.sum())} k; that "
+                f"multiplet's star spread, "
+                f"{1e3 * float(star_spread(np.where(gated, 0.0, mean)).max()):.4f}"
+                f" meV, is reported and not gated.",
+                extra=log_message("eqp_band_cuts_multiplet",
+                                  found=("k points cutting a multiplet", f"{int(cut.sum())}")))
     return e_qp_full
 
 

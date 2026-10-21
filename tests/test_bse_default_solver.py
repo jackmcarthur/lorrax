@@ -74,7 +74,7 @@ def _payload(mesh, ops):
         W_q=put(ops["W_q"], P("x", "y", None, None, None)), V_q0=put(ops["V"], P("x", "y")),
         M=put(M, P(None, "x", "y", None)),
         nkx=KGRID[0], nky=KGRID[1], nkz=KGRID[2], n_cond=NC, n_val=NV,
-        n_cond_pad=NC, n_val_pad=NV, densified=False)
+        n_cond_pad=NC, n_val_pad=NV, n_rmu=NMU, densified=False)
 
 
 def _dense(mesh, ops):

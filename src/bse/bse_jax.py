@@ -18,8 +18,9 @@ import jax
 
 import common.timing as timing
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
-from common.preprocessing_output import ScientificProductionReport
-from common.progress import LoopProgress
+from common.log import get_logger, record
+from common.preprocessing_output import (ScientificProductionReport,
+                                         manual_stage, stage_row)
 from common.report_blocks import Setting
 from common.scientific_output import policy
 from common.units import RYD_TO_EV
@@ -38,6 +39,10 @@ from .bse_lanczos import (
     iters_reported,
 )
 from .bse_io import write_eigenvectors_stream
+from .report_lines import (bse_results_lines, galerkin_rows, locality_rows,
+                           window_direct_gap)
+
+log = get_logger(__name__)
 
 __all__ = [
     "build_bse_ring_matvec_full",
@@ -56,6 +61,28 @@ _STAGES = (
     ("eigenvector write", "bse.write_eigenvectors"),
     ("Haydock absorption", "bse.haydock"),
 )
+
+
+def _host_replica(array):
+    """A replicated or process-local energy table as a host array, read from
+    this process's own buffer (no collective); ``None`` for a sharded one."""
+    import numpy as np
+    try:
+        if getattr(array, "is_fully_addressable", True):
+            return np.asarray(jax.device_get(array))
+        if array.sharding.is_fully_replicated:
+            return np.asarray(array.addressable_data(0))
+    except Exception:                                    # noqa: BLE001 — report only
+        return None
+    return None
+
+
+def _window_gap(data, n_val: int, n_cond: int):
+    """``(E_gap Ry, k 1-based)`` of the solved window, for RESULTS only."""
+    eps_v, eps_c = _host_replica(data["eps_v"]), _host_replica(data["eps_c"])
+    if eps_v is None or eps_c is None:
+        return None
+    return window_direct_gap(eps_v, eps_c, n_val=n_val, n_cond=n_cond)
 
 
 def _preview_lanczos(
@@ -90,7 +117,6 @@ def _preview_lanczos(
     haydock: dict | None = None,
     cell_volume: float | None = None,
     report=None,
-    stage_progress=None,
 ) -> dict:
     restart_file = _find_restart_file(input_file)
     # ONE solve path on any mesh (1x1 included): the sharded loader and
@@ -108,8 +134,9 @@ def _preview_lanczos(
     # auto-detects valence by ``mean_enk < fermi_energy``; user-given
     # n_occ replaces that detection identically to _load_ring_subset.
     # We pass fermi_energy=0.0 (default) and rely on enk_full's reference.
-    with timing.section("bse.load", announce=True,
-                        label="restart load (psi, W_q, V_q0)"):
+    n_stages = 2 + (write_eigs is not None) + (haydock is not None)
+    with manual_stage(1, n_stages, "BSE window from the restart",
+                      name="bse.load") as stage:
         data = load_bse_data_from_restart_sharded(
             restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
             input_file=input_file, n_occ=n_occ,
@@ -140,22 +167,36 @@ def _preview_lanczos(
                 int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x,
                 grid_y, degeneracy_mode=degeneracy_mode,
                 degeneracy_tol_ry=degeneracy_tol_ry)
-    if report is not None:
+        # The BSE-grid htransform (bse_k_grid) and QP-rotation receipts: one
+        # row each here, the whole receipt in the JSON sidecar.
+        from common.scientific_output import (htransform_quality_lines,
+                                              spectral_compression_lines)
         for receipt in _htransform_rank_records:
-            report.spectral_compression(
-                receipt,
-                title="BSE-grid htransform spectral compression")
+            log.debug("BSE-grid htransform spectral compression", extra=record(
+                "bse.htransform.spectral_compression",
+                lines=spectral_compression_lines(receipt)))
+            for label, value in galerkin_rows(receipt):
+                stage_row(label, value)
         for receipt in _htransform_quality_records:
-            report.htransform_quality(
-                receipt,
-                title="BSE-grid htransform interpolation quality")
+            log.debug("BSE-grid htransform interpolation quality", extra=record(
+                "bse.htransform.quality", lines=htransform_quality_lines(receipt)))
+            for label, value in locality_rows(receipt):
+                stage_row(label, value)
         if qp_rotation is not None:
-            from .bse_qp_rotation import report_lines
-            report.heading("QP-rotated basis")
-            for line in report_lines(qp_rotation):
-                report.emit(line)
-    if stage_progress is not None:
-        stage_progress.step()
+            from .bse_qp_rotation import report_lines, summary_text
+            log.debug("QP-rotated basis", extra=record(
+                "bse.qp_rotation", lines=list(report_lines(qp_rotation))))
+            stage_row("QP basis", summary_text(qp_rotation))
+        nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
+        nk = nkx * nky * nkz
+        stage_row("bands", f"{int(data['n_val'])} valence below the occupied "
+                           f"boundary, {int(data['n_cond'])} conduction above it")
+        stage_row("transitions", f"{int(data['n_val']) * int(data['n_cond']) * nk} "
+                                 f"({int(data['n_val'])} x {int(data['n_cond'])} x "
+                                 f"{nk} k); {int(data['n_cond_pad']) * int(data['n_val_pad']) * nk} "
+                                 "padded")
+        stage.result(f"psi, W and V on {int(data['n_rmu'])} centroids, "
+                     f"{nkx} x {nky} x {nkz} k")
     nkx = data["nkx"]; nky = data["nky"]; nkz = data["nkz"]
     nk = nkx * nky * nkz
     nc_pad = int(data["n_cond_pad"])
@@ -169,8 +210,8 @@ def _preview_lanczos(
     n_val_eff = int(data["n_val"])
     n_cond_eff = int(data["n_cond"])
     bse_dim = nc_pad * nv_pad * nk
-    print(f"BSE problem (sharded {grid_x}x{grid_y}): "
-          f"{nc_pad} cond × {nv_pad} val × {nk} k = {bse_dim} dim")
+    log.info(f"BSE problem (sharded {grid_x}x{grid_y}): "
+             f"{nc_pad} cond × {nv_pad} val × {nk} k = {bse_dim} dim")
     if max_lanczos_iter is None:
         max_lanczos_iter = max(30, min(200, bse_dim // 2))
     # ``max_lanczos_iter`` is the *total* Krylov dimension upper
@@ -179,18 +220,22 @@ def _preview_lanczos(
     mode = (f"convergence-driven (rtol={rtol:.1e}, every {check_every} iters)"
             if rtol > 0 else "fixed")
     if block_size > 1:
-        print(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
-              f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
+        log.info(f"Block Lanczos [{mode}]: ≤ {block_max_iter} block iter × "
+                 f"block_size={block_size} = ≤ {block_max_iter * block_size} Krylov dim")
     else:
-        print(f"Lanczos [{mode}]: ≤ {block_max_iter} iterations")
+        log.info(f"Lanczos [{mode}]: ≤ {block_max_iter} iterations")
     # Resolve full-reorth sentinel (-1) to the actual Krylov depth.
     n_reorth_eff = block_max_iter if n_reorth < 0 else n_reorth
     # ONE row for the eigensolve — compile + every Krylov iteration.  It
     # is the number worth comparing across decks, and the only honest way
     # to say "the BSE solve cost X" (the matvec itself runs
     # block_max_iter x block_size times and must NOT be timed per call).
-    with timing.section("bse.eigensolve", announce=True,
-                        label=f"{solver_kind} eigensolve") as _sec:
+    with manual_stage(2, n_stages, "BSE eigensolve",
+                      name="bse.eigensolve") as _sec:
+        stage_row("solver", f"{solver_kind}, {int(n_eig)} roots, block size "
+                            f"{int(block_size)}, at most {block_max_iter} iterations"
+                            + (f", stops at relative change {rtol:.1e}" if rtol > 0
+                               else ""))
         eigenvalues, eigenvectors, n_iter_done = solve_bse_sharded(
             data, mesh_xy, n_eig=n_eig, max_iter=block_max_iter,
             include_W=include_W, block_size=block_size,
@@ -206,37 +251,29 @@ def _preview_lanczos(
             keep_W_R=haydock is not None,
         )
         _sec.watch(eigenvalues, eigenvectors)
+        _sec.result(f"{int(n_eig)} roots of the {int(bse_dim)}-state "
+                    + ("TDA" if tda else "full") + " BSE")
     # Fixed-iteration routes return N_ITER_NOT_MEASURED; only the
     # convergence-driven route (rtol > 0) reports a real count.  Going
     # through the helper is what keeps the sentinel out of arithmetic.
     n_done = iters_reported(n_iter_done, block_max_iter)
+    stopped = None
     if rtol > 0 and solver_kind == "lanczos":
         tag = "Block Lanczos" if block_size > 1 else "Lanczos"
-        print(f"{tag} exited at iter {n_done}/{block_max_iter} "
-              f"(Krylov dim = {n_done * block_size})")
+        log.info(f"{tag} exited at iter {n_done}/{block_max_iter} "
+                 f"(Krylov dim = {n_done * block_size})")
+        stopped = (f"stopped after {n_done} of {block_max_iter} iterations "
+                   f"(Krylov dimension {n_done * block_size})")
     if solver_kind == "davidson" and tda:
-        _davidson_report(report, n_eig=n_eig, tol_mev=float(davidson_tol_mev),
-                         budget=block_max_iter, dim=bse_dim)
-    if stage_progress is not None:
-        stage_progress.step()
+        stopped = _davidson_report(n_eig=n_eig, tol_mev=float(davidson_tol_mev),
+                                   budget=block_max_iter, dim=bse_dim)
     ryd2ev = 13.6056980659
-    print(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
-    print(f"Lowest {n_eig} eigenvalues (eV): {eigenvalues * ryd2ev}")
+    log.info(f"Lowest {n_eig} eigenvalues (Ry): {eigenvalues}")
+    log.info(f"Lowest {n_eig} eigenvalues (eV): {eigenvalues * ryd2ev}")
 
     eigenvalues_host = jax.device_get(eigenvalues).real
-    if report is not None:
-        report.bands((
-            f"BSE valence    : {int(n_val_eff)} bands below the occupied boundary",
-            f"BSE conduction : {int(n_cond_eff)} bands above the occupied boundary",
-            f"Transition size: {int(bse_dim)} padded basis states; "
-            f"{int(n_val_eff * n_cond_eff * nk)} physical",
-            f"Requested roots: {int(n_eig)}",
-        ))
-        report.heading("Exciton spectrum")
-        report.emit("  state       energy (eV)")
-        for index, value in enumerate(eigenvalues_host[:n_eig], start=1):
-            report.emit(f"  S{index:03d}  "
-                        f"{float(value) * ryd2ev:15.5f}")
+    helicity_lines = ()
+    dipoles = None
 
     d_alpha = de_cv = None
     if dipole_file is not None and (write_eigs is not None or haydock is not None):
@@ -252,55 +289,61 @@ def _preview_lanczos(
                 data, dipole_file, n_occ=n_occ_dip,
                 wfn_path=_parse_wfn_path(input_file))
 
+    n_write = 0
     if write_eigs is not None:
-        n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
-        dipoles = None
-        dipole_attrs = None
-        if dipole_file is not None:
-            # ⟨0|r̂_α|S⟩ per written state: the window dipoles Haydock seeds
-            # from (``absorption_common.window_dipoles``: the dipole.h5 slice
-            # at the n_occ the loader and ``--eqp`` settled on, a bse_k_grid
-            # bundle's own, or a --qp-rotations bundle's QP-basis dipoles),
-            # contracted against the solve's distributed eigenvectors in state
-            # blocks (no gather).
-            from .absorption_common import (build_dipole_vector_bse,
-                                            exciton_dipoles_distributed)
-            with timing.section("bse.exciton_dipoles", announce=True):
-                if data["densified"]:
-                    dipole_attrs = {
-                        "route": data["dipoles"]["route"],
-                        "source": data["dipoles"]["source"],
-                        "velocity": data["dipoles"]["velocity"],
-                        "on_grid_rel": data["dipoles"]["on_grid_rel"]}
-                dipoles = exciton_dipoles_distributed(
-                    eigenvectors, build_dipole_vector_bse(
-                        d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
-                    n_write)
-            if helicity_table and report is not None:
-                # Report-only: the per-state σ± strengths of the dipoles just
-                # stored, under the one convention ``inplane_helicity`` owns.
-                from .absorption_common import helicity_table_lines
-                report.heading("In-plane helicity per state (per unit cell)")
-                for line in helicity_table_lines(
-                        eigenvalues_host[:n_write] * ryd2ev, dipoles, nk):
-                    report.emit(line)
-        with timing.section("bse.write_eigenvectors", announce=True):
-            write_eigenvectors_stream(
-                "eigenvectors.h5",
-                eigenvalues,
-                eigenvectors,
-                n_val_eff,
-                n_cond_eff,
-                nkx,
-                nky,
-                nkz,
-                n_write,
-                use_tda=tda,
-                dipoles=dipoles,
-                qp_rotations_file=(None if qp_rotation is None
-                                   else qp_rotation["path"]),
-                dipole_attrs=dipole_attrs,
-            )
+        with manual_stage(3, n_stages, "Exciton dipoles and eigenvectors",
+                          name="bse.output") as _out:
+            n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
+            dipoles = None
+            dipole_attrs = None
+            if dipole_file is not None:
+                # ⟨0|r̂_α|S⟩ per written state: the window dipoles Haydock seeds
+                # from (``absorption_common.window_dipoles``: the dipole.h5 slice
+                # at the n_occ the loader and ``--eqp`` settled on, a bse_k_grid
+                # bundle's own, or a --qp-rotations bundle's QP-basis dipoles),
+                # contracted against the solve's distributed eigenvectors in state
+                # blocks (no gather).
+                from .absorption_common import (build_dipole_vector_bse,
+                                                exciton_dipoles_distributed)
+                with timing.section("bse.exciton_dipoles", announce=True):
+                    if data["densified"]:
+                        dipole_attrs = {
+                            "route": data["dipoles"]["route"],
+                            "source": data["dipoles"]["source"],
+                            "velocity": data["dipoles"]["velocity"],
+                            "on_grid_rel": data["dipoles"]["on_grid_rel"]}
+                    dipoles = exciton_dipoles_distributed(
+                        eigenvectors, build_dipole_vector_bse(
+                            d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
+                        n_write)
+                stage_row("dipoles", f"<0|r|S> for {int(n_write)} states from "
+                                     f"{os.path.basename(str(dipole_file))}")
+                if helicity_table and report is not None:
+                    # Report-only: the per-state σ± strengths of the dipoles just
+                    # stored, under the one convention ``inplane_helicity`` owns.
+                    # Printed in RESULTS.
+                    from .absorption_common import helicity_table_lines
+                    helicity_lines = tuple(helicity_table_lines(
+                        eigenvalues_host[:n_write] * ryd2ev, dipoles, nk))
+            with timing.section("bse.write_eigenvectors", announce=True):
+                write_eigenvectors_stream(
+                    "eigenvectors.h5",
+                    eigenvalues,
+                    eigenvectors,
+                    n_val_eff,
+                    n_cond_eff,
+                    nkx,
+                    nky,
+                    nkz,
+                    n_write,
+                    use_tda=tda,
+                    dipoles=dipoles,
+                    qp_rotations_file=(None if qp_rotation is None
+                                       else qp_rotation["path"]),
+                    dipole_attrs=dipole_attrs,
+                )
+            _out.result(f"eigenvectors.h5: {int(n_write)} states"
+                        + (" with <0|r|S>" if dipoles is not None else ""))
 
     if haydock is not None:
         # ε₂(ω) by the Haydock recursion on THIS payload: the loaded bundle,
@@ -311,12 +354,12 @@ def _preview_lanczos(
         from .absorption_haydock import (POLARIZATIONS, haydock_coefficients,
                                          write_haydock_outputs)
         pols = haydock["pols"]
-        if stage_progress is not None:
-            stage_progress.step()
-        with timing.section(
-                "bse.haydock", announce=True,
-                label=(f"Haydock {len(pols)}-block x {haydock['n_iter']} "
-                       f"({''.join(POLARIZATIONS[a] for a in pols)})")) as _sec_h:
+        with manual_stage(n_stages, n_stages, "Haydock absorption",
+                          name="bse.haydock") as _hay:
+            stage_row("recursion", f"{len(pols)} block(s) "
+                                   f"({''.join(POLARIZATIONS[a] for a in pols)}) x "
+                                   f"{int(haydock['n_iter'])} steps on the "
+                                   f"eigensolve's payload")
             d_block = build_dipole_vector_bse(
                 d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)[list(pols)]
             alphas, betas, norms = haydock_coefficients(
@@ -335,17 +378,23 @@ def _preview_lanczos(
                            "dipole_source": data["dipoles"]["source"],
                            "dipole_on_grid_rel": data["dipoles"]["on_grid_rel"]}
                           if data["densified"] else None))
-        if report is not None:
-            report.heading("Haydock absorption")
-            report.emit(f"  {len(pols)} recursion(s) "
-                        f"({''.join(POLARIZATIONS[a] for a in pols)}) x "
-                        f"{int(haydock['n_iter'])} steps on the eigensolve's "
-                        f"payload, eta {haydock['eta_ev']:.4f} eV -> "
-                        f"{haydock['out_prefix']}.h5")
+            _hay.result(f"{haydock['out_prefix']}.h5, eta "
+                        f"{haydock['eta_ev']:.4f} eV")
 
-    if stage_progress is not None:
-        stage_progress.step()
-        stage_progress.finish()
+    if report is not None:
+        # RESULTS: the exciton table (the harness reads its S rows on the
+        # rank-0 stdout), the window's lowest direct transition and the
+        # binding of S1 against it, the oscillator strengths when computed.
+        gap = _window_gap(data, n_val_eff, n_cond_eff)
+        kind = "QP" if (eqp_file is not None or qp_rotation is not None) else "DFT"
+        report.emit_lines(bse_results_lines(
+            eigenvalues_host[:n_eig] * ryd2ev,
+            gap=None if gap is None else (gap[0] * ryd2ev, gap[1], kind),
+            dipoles=dipoles, n_k=nk, helicity=helicity_lines,
+            eigenvectors=(None if write_eigs is None else
+                          f"eigenvectors.h5, {int(n_write)} states"
+                          + (" with <0|r|S>" if dipoles is not None else "")),
+            extra_rows=(() if stopped is None else (("eigensolve", stopped),))))
 
     return {
         "n_val": int(n_val_eff),
@@ -359,10 +408,11 @@ def _preview_lanczos(
     }
 
 
-def _davidson_report(report, *, n_eig, tol_mev, budget, dim):
-    """Print and report the Davidson stop: roots converged, iterations,
-    matvecs, the largest residual in meV.  Any stop but CONVERGED refuses
-    (``GATE davidson_converged``) before the driver writes anything."""
+def _davidson_report(*, n_eig, tol_mev, budget, dim):
+    """The Davidson stop as one log line and the RESULTS ``eigensolve`` row:
+    roots converged, iterations, matvecs, the largest residual in meV.  Any
+    stop but CONVERGED refuses (``GATE davidson_converged``) before the driver
+    writes anything."""
     import numpy as np
     from solvers.davidson import LAST_RUN as run
     from solvers.davidson_fixed import CONVERGED, STALLED
@@ -375,10 +425,7 @@ def _davidson_report(report, *, n_eig, tol_mev, budget, dim):
             f"{tol_mev:g} meV in {int(run['iter'][0])}/{int(budget)} iterations, "
             f"{int(run['mv'][0])} matvecs, {int(run['restarts'])} restarts; "
             f"max residual {float(np.max(res_mev)):.3e} meV")
-    print(line, flush=True)
-    if report is not None:
-        report.heading("Eigensolver convergence")
-        report.emit("  " + line)
+    log.info(line)
     if status != CONVERGED:
         raise RuntimeError(
             f"GATE davidson_converged: Davidson stopped {word} with {n_conv}/{n_eig} "
@@ -388,6 +435,7 @@ def _davidson_report(report, *, n_eig, tol_mev, budget, dim):
             f"{int(dim)}); max residual {float(np.max(res_mev)):.3e} meV.  No "
             "eigenvector, spectrum or Haydock output was written.  Fix: raise "
             "--max-lanczos-iter or --davidson-m-max, or loosen --davidson-tol-mev")
+    return line
 
 
 
@@ -896,10 +944,6 @@ def main(argv=None) -> int:
                 if args.write_eigs is not None else "not requested"),
         ))
         report.sampling(wfn=wfn, sym=sym)
-        stage_progress = LoopProgress(
-            3 + (args.haydock_iter > 0), report.progress, title="BSE eigensolve",
-            item_name="major stage", max_updates=3 + (args.haydock_iter > 0))
-        stage_progress.start()
 
         result = _preview_lanczos(
             args.input,
@@ -933,7 +977,6 @@ def main(argv=None) -> int:
             haydock=_haydock_settings(args),
             cell_volume=float(wfn.cell_volume),
             report=report,
-            stage_progress=stage_progress,
         )
 
         wfn.close()

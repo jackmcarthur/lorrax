@@ -138,9 +138,10 @@ from solvers.lanczos import (ALPHA_HERM_RTOL, alpha_herm_sink,
                              block_lanczos_eig_jit,
                              report_alpha_herm, split_alpha_sink)
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
+from common.log import get_logger, message, record
 from common.fft_helpers import make_kfft_kminor
-from common.preprocessing_output import ScientificProductionReport
-from common.progress import LoopProgress
+from common.preprocessing_output import (ScientificProductionReport,
+                                         StageSequence, stage_row)
 from common.provenance import lorrax_version, provenance_header
 from common.report_blocks import Setting
 from common.scientific_output import abs_path, band_range, policy
@@ -149,12 +150,17 @@ from .bse_head import head_shifted_eps_c
 from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, w_pair_embedding, build_w_head_channel, resolve_w_head_densify, _resolve_head_params, PAD_EPS_GUARD_RY)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
+
+log = get_logger(__name__)
+_LOGGER = log     # the module logger, where a ``log`` parameter or local shadows it
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
 from .exchange_path import exchange_tiles
 from .bse_window import (apply_eqp_to_bse_window, pad_zone_mask_np,
                          require_valence_pad_guard)
 from . import vq_interp
+from .report_lines import (exciton_band_results_lines, galerkin_rows,
+                           locality_rows, path_node_lines)
 
 RY2EV = 13.6056980659
 # PAD_EPS_GUARD_RY is imported, not defined: it belongs at the loader seam
@@ -388,7 +394,7 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     return solve_path
 
 
-def _report_alpha_over_path(labels, alpha_all, log=print):
+def _report_alpha_over_path(labels, alpha_all, log=log.debug):
     """Run the α-Hermiticity gate on the per-Q scalars the scan returned.
 
     ``alpha_all`` is the scan-stacked payload: one ``(dev, scale, worst)``
@@ -427,7 +433,7 @@ def _report_alpha_over_path(labels, alpha_all, log=print):
 # stacks: htransform conduction caches + V_Q tiles for the whole path
 # ===========================================================================
 def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
-                              *, log=print):
+                              *, log=log.debug):
     """``conj(d)`` on the BSE window, ``(nk, nc_pad, nv_pad, 3)`` complex.
 
     The cell-averaged exchange head is
@@ -485,7 +491,7 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
 
 
 def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
-                       log=print):
+                       log=log.debug):
     """``(centroid_table, keep_idx | None)`` — WHICH ISDF basis to fit ψ in.
 
     On a natively-fitted bundle this is the deck's ``centroids_file`` and
@@ -592,7 +598,7 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
 
 
 def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
-                                  evs_stored_route, kgrid_vq, log=print,
+                                  evs_stored_route, kgrid_vq, log=log.debug,
                                   grade: str = "reference",
                                   window_mode: str = "bse"):
     """The CONTRACTED gate: eigenvalues, not tiles.
@@ -712,7 +718,7 @@ def _certify_refit_against_stored(cert_idx, Qpath, evs_refit_route,
     return rows, worst
 
 
-def apply_q_per_segment(params, q_per_segment, log=print) -> int:
+def apply_q_per_segment(params, q_per_segment, log=log.debug) -> int:
     """Raise every ``K_POINTS crystal_b`` segment to at least N points.
 
     IT IS A BANDSTRUCTURE, SO SAMPLE IT LIKE ONE.  The deck format carries a
@@ -972,7 +978,7 @@ def _local(x):
 
 def gate_htransform_vs_stored(
     psi_cQ_gamma, eps_cQ_gamma, data, mesh_xy, *,
-    htransform_k_indices=None, stored_k_indices=None, log=print,
+    htransform_k_indices=None, stored_k_indices=None, log=log.debug,
 ):
     """On-grid consistency gate at a Γ path point: htransform conduction
     ε vs the stored restart ε (max |Δ|), and the gauge-free per-k subspace
@@ -1088,11 +1094,18 @@ def gate_htransform_vs_stored(
     # but on-grid |Δε_c| ~955 meV — 10_lorrax_exciton_bands_80interp_8v8c).  So
     # the ENERGY gate is the authoritative interp-basis check, tightened here.
     if d_meV > 20.0:
-        log(f"  [warn] on-grid conduction ENERGY error {d_meV:.1f} meV ≫ the "
+        _LOGGER.warning(
+            f"on-grid conduction ENERGY error {d_meV:.1f} meV ≫ the "
             f"~1-2 meV htransform floor.  Inspect the all-coarse transformed-"
             f"energy receipt and the [nodes] metric eps line; then reduce "
             f"nband toward the BSE window, or raise the node count (N_node "
-            f">= 22 x fitted bands) if the metric eps is large.")
+            f">= 22 x fitted bands) if the metric eps is large.",
+            extra=message(
+                id="htransform_on_grid_energy_error",
+                found=("on-grid conduction energy error", f"{d_meV:.1f} meV"),
+                needs="about 1-2 meV, the htransform floor",
+                fix="reduce nband toward the BSE window, or raise the node "
+                    "count (N_node >= 22 x fitted bands)"))
     assert d_eps < 0.05 and smin > 0.5, (
         f"htransform conduction cache grossly inconsistent with the stored grid "
         f"(max|Δε_c|={d_meV:.1f} meV, min-sval={smin:.3f}) — interp basis broken. "
@@ -1425,7 +1438,7 @@ def _w_tile_gauge(wfn, centroids_path, keep_idx, n_rmu, restart_file, log):
             CoulombGeometry.from_wfn(wfn))
 
 
-def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print,
+def _resolve_native_w_head(restart_file, input_file, wfn, *, log=log.debug,
                            q0_head="diagonal"):
     """The ``whead`` the loader resolved for this NATIVE-grid restart.
 
@@ -1467,6 +1480,23 @@ def _resolve_native_w_head(restart_file, input_file, wfn, *, log=print,
             "cell_volume": float(cell_volume)}
 
 
+def _record_htransform_receipts(key: str, rank_records=(), quality_records=()) -> None:
+    """The htransform receipts as one stage row each (``report_lines``); the
+    whole receipt goes to the JSON sidecar under ``key``."""
+    from common.scientific_output import (htransform_quality_lines,
+                                          spectral_compression_lines)
+    for receipt in rank_records:
+        _LOGGER.debug("htransform spectral compression", extra=record(
+            f"{key}.spectral_compression", lines=spectral_compression_lines(receipt)))
+        for label, value in galerkin_rows(receipt):
+            stage_row(label, value)
+    for receipt in quality_records:
+        _LOGGER.debug("htransform interpolation quality", extra=record(
+            f"{key}.quality", lines=htransform_quality_lines(receipt)))
+        for label, value in locality_rows(receipt):
+            stage_row(label, value)
+
+
 def main(argv=None):
     # A function-local import: gw_config parses decks, and this module is
     # imported by things that do not.
@@ -1483,9 +1513,10 @@ def main(argv=None):
     timers: dict[str, float] = {}
     with RunSession(RUNTIME, "exciton_bands", ScientificProductionReport,
                     report_path, stages=lambda: tuple(timers.items()),
-                    driver="exb", purpose="exciton bandstructure") as run:
+                    driver="exb", purpose="exciton bandstructure") as run, \
+            StageSequence(6) as stages:
         report = run.report
-        log = report.legacy_print
+        log = _LOGGER.debug          # helper chatter: forensic detail
         report.begin(input_file=args.input)
         report.devices(mesh_role="BSE transition axes c x v")
         report.settings(settings_rows(args, source=report.flag_source))
@@ -1527,9 +1558,9 @@ def main(argv=None):
         # otherwise 16 processes race on the same paths.  Non-I/O host numpy (Q
         # path / k-roll construction, the per-Q mini-BZ head QMC) runs redundantly
         # on every process; it is deterministic, so all processes agree and the
-        # sharded solve consumes identical operands.  ``log`` is the rank-0 print;
-        # it is also threaded into the heavy helpers as ``log_fn`` so their
-        # progress is not emitted 16×.
+        # sharded solve consumes identical operands.  ``log`` is the DEBUG line of
+        # the module logger; it is also threaded into the heavy helpers as
+        # ``log_fn`` (every rank's own log carries its lines).
         _rank0 = jax.process_index() == 0
 
         # Omitted --px/--py = the run's canonical square mesh (RUNTIME.mesh by
@@ -1592,10 +1623,6 @@ def main(argv=None):
             "ScaLAPACK on CPU. Batched LA is a schedule, not a backend",
         ))
         report.sampling(wfn=wfn, sym=sym)
-        stage_progress = LoopProgress(
-            7, report.progress, title="exciton-band calculation",
-            item_name="major stage", max_updates=7)
-        stage_progress.start()
 
         # Everything above — the startup call, jax.distributed, mesh creation and its
         # MPI clique warm-up, the input parse — is the driver prologue.  Named
@@ -1605,6 +1632,7 @@ def main(argv=None):
         tick("prologue", t_prologue)
 
         # ── load the Q-independent BSE data (production loader) ──────────────
+        stages.begin(1, "BSE window from the restart", name="exb.load_bse")
         t0 = time.time()
         _bse_grid_rank_records = []
         _bse_grid_quality_records = []
@@ -1645,13 +1673,16 @@ def main(argv=None):
                 degeneracy_tol_ry=args.degeneracy_tol_ry, log=log)
         require_valence_pad_guard(data)
         tick("load_bse", t0)
-        stage_progress.step()
-        for receipt in _bse_grid_rank_records:
-            report.spectral_compression(
-                receipt, title="BSE-grid htransform spectral compression")
-        for receipt in _bse_grid_quality_records:
-            report.htransform_quality(
-                receipt, title="BSE-grid htransform interpolation quality")
+        _record_htransform_receipts("exciton_bands.bse_grid_htransform",
+                                    _bse_grid_rank_records,
+                                    _bse_grid_quality_records)
+        stage_row("band window", f"{n_val} valence x {n_cond} conduction bands "
+                                 f"on {nkx} x {nky} x {nkz} k; degeneracy "
+                                 f"{args.band_degeneracy}, tolerance "
+                                 f"{float(args.degeneracy_tol_ry) * RY2EV * 1.0e3:.3f} meV"
+                                 + ("; QP energies from " + os.path.basename(str(args.eqp))
+                                    if args.eqp else ""))
+        stages.result(f"psi, W and V on {n_rmu} centroids, {nkx} x {nky} x {nkz} k")
 
         # Densify/eqp already check this join on their dominating paths.
         if "V_q_coarse" not in data and not args.eqp:
@@ -1663,6 +1694,7 @@ def main(argv=None):
                 where="exciton_bands restart/htransform state")
 
         # ── which ISDF basis the htransform fits in ──────────────────────────
+        stages.begin(2, "Exciton-path htransform", name="exb.htransform")
         # BEFORE initialize_wfns, because that call is the one that reads the
         # centroid table.  On a plain bundle this returns the deck's own path
         # and ``None``, and the program below is unchanged; on a downfolded one
@@ -1716,23 +1748,16 @@ def main(argv=None):
         log(f"Q path: {nQ_path} path points (+{nQ - nQ_path} extra), nodes at "
             f"{list(map(int, node_idx))} labels {node_labels}")
         tick("htransform_setup", t0)
-        stage_progress.step()
         if len(_path_rank_records) != 1:
             raise RuntimeError(
                 "exciton_bands htransform returned "
                 f"{len(_path_rank_records)} spectral receipts; expected one")
-        report.spectral_compression(
-            _path_rank_records[0],
-            title="Exciton-path htransform spectral compression")
-        report.heading("Exciton momentum path")
-        report.emit(f"Path sampling  : {int(nQ_path)} plotted Q points; "
-                    f"{int(nQ - nQ_path)} extra diagnostic points")
-        for inode, (idx, label) in enumerate(zip(node_idx, node_labels), start=1):
-            point = Qpath[int(idx)]
-            report.emit(
-                f"  N{inode:02d}  {label or '-':>3}  "
-                f"Q=({point[0]: .5f} {point[1]: .5f} {point[2]: .5f})  "
-                f"path index {int(idx) + 1}")
+        _record_htransform_receipts("exciton_bands.path_htransform",
+                                    _path_rank_records)
+        stage_row("Q path", "\n".join(
+            [f"{int(nQ_path)} points" + (f" (+{int(nQ - nQ_path)} extra)"
+                                         if nQ > nQ_path else "")]
+            + path_node_lines(Qpath, node_idx, node_labels)))
 
         # ── conduction caches ψ_c(k+Q), ε_c(k+Q) for the whole path ──────────
         # fH is built from every band of ``ctilde``; the BSE conduction bands
@@ -1746,21 +1771,19 @@ def main(argv=None):
             tol_ry=args.degeneracy_tol_ry, mode=args.band_degeneracy,
             input_file=args.input, log_fn=log)
         _nelec = int(wfn.nelec)
-        report.bands((
-            f"Electrons      : {float(getattr(wfn, 'num_electrons', _nelec)):.5f}; "
-            f"occupied-band boundary = {_nelec}",
-            f"BSE valence    : {band_range(_nelec - n_val, _nelec)}",
-            f"BSE conduction : {band_range(_nelec, _nelec + n_cond)}",
-            f"htransform fit : {band_range(_nelec - nval_in, _nelec - nval_in + nb_window)} "
-            f"({int(n_guard)} conduction guard bands)",
-            f"Transition size: {int(nc_pad * nv_pad * nk)} padded; "
-            f"{int(n_cond * n_val * nk)} physical",
-            f"Centroid basis : {int(n_rmu)} interaction centroids",
-            "Centroid table : " + (
-                f"parent htransform sites {abs_path(centroids_path)}; "
-                "the downfold selection is stored in the restart"
-                if keep_idx is not None else abs_path(centroids_path)),
-        ))
+        stage_row("BSE bands", f"valence {band_range(_nelec - n_val, _nelec)}, "
+                               f"conduction {band_range(_nelec, _nelec + n_cond)} "
+                               f"({float(getattr(wfn, 'num_electrons', _nelec)):.5f} "
+                               "electrons)")
+        stage_row("fitted bands", f"{band_range(_nelec - nval_in, _nelec - nval_in + nb_window)} "
+                                  f"({int(n_guard)} conduction guard band"
+                                  f"{'' if int(n_guard) == 1 else 's'})")
+        stage_row("transitions", f"{int(n_cond * n_val * nk)} per Q "
+                                 f"({int(nc_pad * nv_pad * nk)} padded)")
+        stage_row("centroids", f"{int(n_rmu)} from " + (
+            f"the parent htransform sites {os.path.basename(str(centroids_path))} "
+            "(the downfold selection is stored in the restart)"
+            if keep_idx is not None else os.path.basename(str(centroids_path))))
         k_frac = np.stack(np.meshgrid(np.arange(nkx) / nkx, np.arange(nky) / nky,
                                       np.arange(nkz) / nkz, indexing="ij"),
                           axis=-1).reshape(-1, 3)
@@ -1786,9 +1809,8 @@ def main(argv=None):
                 "exciton_bands htransform returned "
                 f"{len(_path_quality_records)} interpolation-quality receipts; "
                 "expected one")
-        report.htransform_quality(
-            _path_quality_records[0],
-            title="Exciton-path htransform interpolation quality")
+        _record_htransform_receipts("exciton_bands.path_htransform",
+                                    quality_records=_path_quality_records)
         psi_cQ_X, psi_cQ_Y, eps_cQ = build_conduction_stacks(
             bundle, nQ, nk, n_cond, nc_pad, n_rmu, n_rmu_pad, mesh_xy)
         # Everything the htransform produced is now copied into the conduction
@@ -1799,7 +1821,6 @@ def main(argv=None):
         # ``bundle`` alone is ψ at every (Q, k) in both shardings.
         del bundle, ctilde, B_at_mu, enk_sigma
         tick("htransform_psi_cQ", t0)
-        stage_progress.step()
 
         # on-grid gate at the first Γ node (path convention: starts at Γ)
         iGamma = [i for i in range(nQ)
@@ -1823,6 +1844,9 @@ def main(argv=None):
             gate_htransform_vs_stored(
                 psi_cQ_X[iGamma[0]], eps_cQ[iGamma[0]], data, mesh_xy, log=log)
             tick("gamma_gate", t0)
+        stages.result(f"psi_c(k+Q), eps_c(k+Q) of {n_cond} conduction bands "
+                      f"at {nQ} Q x {nk} k")
+        stages.begin(3, "Exchange kernel V_Q", name="exb.exchange")
 
         # ── V_Q tiles ─ ONE shared arbitrary-Q model build.  The bse_k_grid
         #    coarse→fine general init (bse_io) calls the SAME
@@ -1936,20 +1960,13 @@ def main(argv=None):
                 eval_vq, pinvF, coeffs_packed = (vqm.eval_vq, vqm.pinvF,
                                                  vqm.coeffs_packed)
         tick("vq_prepare", t0)
-        report.heading("Resolved interaction kernels")
-        report.emit("Exchange route : " + (
+        stage_row("exchange", (
             f"exact stored tiles at {nQ} on-grid Q points" if ongrid else
             "per-Q ISDF refit with the producer Coulomb service" if pure_refit else
             "arbitrary-Q interpolation with exact stored Γ tile"))
-        report.emit("Exchange head  : " + (
+        stage_row("exchange head", (
             "mini-BZ cell-averaged tensor" if head_mbz else
             "point value (stored Γ head-body tile at Γ)"))
-        report.emit("Direct W       : " + (
-            f"sampled on {args.w_coarse_grid}; densified to "
-            f"{nkx} x {nky} x {nkz}" if args.w_coarse_grid else
-            f"native {nkx} x {nky} x {nkz} grid"))
-        report.emit(f"Window policy  : degeneracy={args.band_degeneracy}; "
-                    f"tolerance={float(args.degeneracy_tol_ry) * RY2EV * 1.0e3:.5f} meV")
 
         # ── the per-Q refit state + ITS GATE, before any tile is used ─────────
         rst = None
@@ -2157,7 +2174,8 @@ def main(argv=None):
         if len(head_scalars) > 4:
             log(f"  [head-tensor] ... {len(head_scalars)} Q in total")
         tick("vq_eval", t0)
-        stage_progress.step()
+        stages.result(f"V_Q tiles at {nQ} Q" + (f" (+{n_cert} certification twins)"
+                                                if n_cert else ""))
 
         # cert twins and refit rows reuse their Q's conduction caches: extend the
         # scan xs in the row order fixed above.  This is what makes the twin an
@@ -2170,6 +2188,12 @@ def main(argv=None):
             eps_cQ = eps_cQ[sel]
 
         # ── W_R once (the k-convolution router's k-minor factory), then the single-compile scan ──
+        stages.begin(4, "Direct kernel W_R and the Q-scan solver",
+                     name="exb.direct_kernel")
+        stage_row("direct W", (
+            f"sampled on {args.w_coarse_grid}; densified to "
+            f"{nkx} x {nky} x {nkz}" if args.w_coarse_grid else
+            f"native {nkx} x {nky} x {nkz} grid"))
         t0 = time.time()
         sh = make_bse_shardings(mesh_xy)
         _ifftn = make_kfft_kminor(mesh_xy, (nkx, nky, nkz), sh.W.spec,
@@ -2293,7 +2317,9 @@ def main(argv=None):
             block_size=args.block_size, max_iter=args.max_iter,
             head_tensor=head_mbz)
         tick("w_r_and_build", t0)
-        stage_progress.step()
+        stages.result(f"W_R on {nkx} x {nky} x {nkz}; block Lanczos solver, "
+                      f"{int(args.n_eig)} levels per Q")
+        stages.begin(5, "Q-path eigensolve", name="exb.solve")
         t_c0 = time.time()
         # Exact q=0 direct head: <c k+Q|c' k+Q><v k|v' k> = δδ, so it is the
         # transition-diagonal constant on every Q (bse_head.head_shifted_eps_c).
@@ -2315,7 +2341,6 @@ def main(argv=None):
             solver.alpha_labels, jax.device_get(alpha_dev), log=log)
         t_first = time.time() - t_c0
         tick("solve_scan_cold", t_c0)
-        stage_progress.step()
         if rerun_check_enabled(args):
             # warm re-run: census-clean per-Q cost + reproducibility assert.
             # Pure diagnostic — it re-executes the ENTIRE Q scan a second time.
@@ -2381,29 +2406,19 @@ def main(argv=None):
                 f"refit window={args.refit_window}, {len(cert_rows)} on-grid "
                 f"certification Q, out-prefix {args.out_prefix}")
 
-        report.heading("Exciton spectrum and validation")
         _path_ev = np.asarray(evs_path[:nQ_path], dtype=np.float64) * RY2EV
-        report.emit(f"Computed levels: {int(args.n_eig)} at {int(nQ_path)} path points")
-        report.emit(f"Energy extent  : [{float(np.min(_path_ev)):.5f}, "
-                    f"{float(np.max(_path_ev)):.5f}] eV")
-        report.emit("Hermiticity    : " + ("PASS" if alpha_ok else "FAILED")
-                    + f" (worst max|alpha - alpha^H|/max|alpha| = "
-                    f"{alpha_rel:.2e}, tol {ALPHA_HERM_RTOL:.0e})")
-        for inode, (idx, label) in enumerate(zip(node_idx, node_labels), start=1):
-            levels = _path_ev[int(idx)]
-            shown = "  ".join(f"{float(value):.5f}" for value in levels[:3])
-            suffix = "  ..." if levels.size > 3 else ""
-            report.emit(f"  N{inode:02d} {label or '-':>3}  lowest E_S (eV): "
-                        f"{shown}{suffix}")
         if cert_worst is not None:
-            report.emit(f"Refit cert     : {args.cert_grade}; worst "
-                        f"{float(cert_worst):.5f} meV over {len(cert_rows)} "
-                        "on-grid Q points")
+            _cert_text = (f"{args.cert_grade} grade: worst {float(cert_worst):.5f} meV "
+                          f"over {len(cert_rows)} on-grid Q points")
         elif args.vq_mode in ("refit", "both"):
-            report.emit("Refit cert     : tile-level certification completed "
-                        "for the producer zeta window")
+            _cert_text = ("tile-level certification completed for the producer "
+                          "zeta window")
         else:
-            report.emit("Refit cert     : not applicable to this exchange route")
+            _cert_text = "not applicable to this exchange route"
+        stages.result(f"{int(args.n_eig)} level{'' if int(args.n_eig) == 1 else 's'} "
+                      f"at {int(nQ_path)} path points; lowest "
+                      f"{float(np.min(_path_ev)):.5f} eV")
+        stages.begin(6, "Outputs", name="exb.outputs")
 
         # ── outputs (rank 0 ONLY — the .dat / .png writes and the plot must not
         #    race across the 16 processes; evs_all is fully addressable on every
@@ -2478,17 +2493,17 @@ def main(argv=None):
                     fh.write(f"{iQ:4d} {x_path[iQ]:.6f} "
                              f"{Qpath[iQ][0]: .6f} {Qpath[iQ][1]: .6f} "
                              f"{Qpath[iQ][2]: .6f} refit  {row}\n")
-            print(f"Wrote {dat}")
+            _LOGGER.info(f"Wrote {dat}")
 
             if refit_idx:
-                print("\ninterp vs refit (ground truth) at spot-check Q:")
+                _LOGGER.info("\ninterp vs refit (ground truth) at spot-check Q:")
                 hdr = f"{'iQ':>4} {'s':>8} " + " ".join(
                     f"{'dE'+str(j+1)+'(meV)':>10}" for j in range(args.n_eig))
-                print(hdr)
+                _LOGGER.info(hdr)
                 for iQ in refit_idx:
                     d = (evs_path[iQ] - evs_refit[iQ]) * RY2EV * 1e3
-                    print(f"{iQ:4d} {x_path[iQ]:8.4f} "
-                          + " ".join(f"{v:10.3f}" for v in d))
+                    _LOGGER.info(f"{iQ:4d} {x_path[iQ]:8.4f} "
+                                 + " ".join(f"{v:10.3f}" for v in d))
 
             # plot (Agg; no display)
             import matplotlib
@@ -2523,23 +2538,32 @@ def main(argv=None):
                          fontsize=6.5, color="#5A5A5A", ha="left", va="bottom")
             png = args.out_prefix + ".png"
             fig.savefig(png, dpi=180)
-            print(f"Wrote {png}")
+            _LOGGER.info(f"Wrote {png}")
 
             timers["outputs"] = time.time() - t_out0
             total = time.time() - t_wall
             untimed = total - sum(timers.values())
-            print("\n--- timings (s) ---")
+            _LOGGER.info("\n--- timings (s) ---")
             for k, v in timers.items():
-                print(f"  {k:<22s} {v:9.2f}   {100.0*v/max(total,1e-9):5.1f}%")
+                _LOGGER.info(f"  {k:<22s} {v:9.2f}   {100.0*v/max(total,1e-9):5.1f}%")
             # The residual, ALWAYS printed.  A small number here is the table's own
             # evidence that it is complete; a large one names the gap instead of
             # leaving a reader to discover it by subtraction.
-            print(f"  {'(untimed)':<22s} {untimed:9.2f}   "
-                  f"{100.0*untimed/max(total,1e-9):5.1f}%")
-            print(f"  {'TOTAL':<22s} {total:9.2f}   100.0%")
+            _LOGGER.info(f"  {'(untimed)':<22s} {untimed:9.2f}   "
+                         f"{100.0*untimed/max(total,1e-9):5.1f}%")
+            _LOGGER.info(f"  {'TOTAL':<22s} {total:9.2f}   100.0%")
 
-        stage_progress.step()
-        stage_progress.finish()
+        stages.result(f"{os.path.basename(args.out_prefix)}.dat and "
+                      f"{os.path.basename(args.out_prefix)}.png written")
+        stages.end()
+        report.emit_lines(exciton_band_results_lines(
+            _path_ev, Qpath[:nQ_path], node_idx, node_labels,
+            n_extra=int(nQ - nQ_path),
+            hermiticity=("PASS" if alpha_ok else "FAILED")
+            + f" (worst relative {alpha_rel:.2e}, tol {ALPHA_HERM_RTOL:.0e})",
+            certificate=_cert_text,
+            files=f"{os.path.basename(args.out_prefix)}.dat (all levels), "
+                  f"{os.path.basename(args.out_prefix)}.png"))
 
         # LEAVE TOGETHER.  Everything above this line inside ``if _rank0`` — the
         # .dat write, the interp-vs-refit table, matplotlib — is rank-0 only and
@@ -2562,8 +2586,13 @@ def main(argv=None):
             try:
                 vq_interp.close_refit_state(rst)
             except Exception as exc:                                  # noqa: BLE001
-                print(f"  [exciton_bands] refit resource close failed "
-                      f"({type(exc).__name__}: {exc}); continuing to exit")
+                _LOGGER.warning(
+                    f"  [exciton_bands] refit resource close failed "
+                    f"({type(exc).__name__}: {exc}); continuing to exit",
+                    extra=message(
+                        id="refit_resource_close_failed",
+                        found=("refit resource close", f"{type(exc).__name__}: {exc}"),
+                        lines=("the run continues to exit; the outputs are written",)))
 
         # CLOSE THE LOADER HERE, EXPLICITLY, WHILE THE RANKS ARE STILL IN STEP.
         # ``initialize_wfns`` hands back a MESH-AWARE ``WfnLoader``

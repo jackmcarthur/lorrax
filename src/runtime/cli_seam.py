@@ -22,7 +22,9 @@ mesh.
 
 This module decides nothing.  It holds no policy about which flags exist,
 prints nothing itself, and knows no more about "help" than argparse does.
-Anything richer belongs in the parser.
+Anything richer belongs in the parser.  The one flag every driver shares,
+``--verbose``, is runtime's (``runtime.read_verbose_switches``): it leaves
+argv here, before the parser sees it.
 
 A parser whose ``choices=`` or defaults come from a module that imports jax
 cannot move above the startup call -- hoisting it would drag jax above the
@@ -57,4 +59,8 @@ def refuse_bad_argv(parser, argv=None) -> None:
     ``gw.sigma_dispatch`` imports ``gw.kin_ion_io``, with argv that
     belongs to a different program.
     """
+    # ``--verbose`` is runtime's flag, not the parser's: taken out of argv here
+    # (and the deck's ``verbose = true`` read) before the parser can refuse it.
+    from runtime import read_verbose_switches
+    read_verbose_switches(argv)
     parser.parse_args(sys.argv[1:] if argv is None else argv)

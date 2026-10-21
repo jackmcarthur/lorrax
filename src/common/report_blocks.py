@@ -95,17 +95,10 @@ def right_align(left: str, right: str, width: int = WIDTH) -> str:
     return left + " " * max(gap, 2) + right
 
 
-def fmt_wall(seconds: float) -> str:
-    """A wall time: ``78.5 s`` below 100 s, ``18 min 39 s`` below an hour, else
-    ``1 h 02 min``."""
-    seconds = max(float(seconds), 0.0)
-    if round(seconds, 1) < 100.0:
-        return f"{seconds:.1f} s"
-    whole = int(round(seconds))
-    if whole < 3600:
-        return f"{whole // 60} min {whole % 60:02d} s"
-    minutes = int(round(seconds / 60.0))
-    return f"{minutes // 60} h {minutes % 60:02d} min"
+# A wall time (``78.5 s``, ``18 min 39 s``, ``1 h 02 min``) and a manual stage's
+# banner and ``=>`` line are formatted in ``common.timing``, which prints them and
+# sits below this module (tests/test_layering.py); they are the same functions.
+from common.timing import fmt_wall, stage_banner, stage_result  # noqa: E402
 
 
 def fmt_clock(moment: datetime) -> str:
@@ -157,7 +150,6 @@ class RunFacts:
     host: str
     job: str | None = None            # "Slurm job 60021274" or "Slurm job 59988848, step 6"
     logs: tuple[str, ...] = ()        # the main log, relative to ``directory``
-    debug: bool = False
     version: str | None = None        # printed only when given
     native_bundle: str | None = None  # printed only when given
 
@@ -181,9 +173,7 @@ def header_lines(run: RunFacts) -> list[str]:
     rows.append(("Started", fmt_clock(run.started)))
     rows.append(("Host", run.host + (f", {run.job}" if run.job else "")))
     if run.logs:
-        rows.append(("Logs", ", ".join(run.logs)))
-    if run.debug:
-        rows.append(("Debug", "on (LORRAX_DEBUG_PRINT=1)"))
+        rows.append(("Logs", " · ".join(run.logs)))
     lines = title_lines(run.driver, run.purpose)
     for label, value in rows:
         lines += kv_lines([(label, value)], indent=0)
@@ -321,6 +311,36 @@ def message_lines(msg: Message, *, indent: int = 0) -> list[str]:
     return lines
 
 
+def message_detail(msg: Message) -> str | None:
+    """A message's first detail line, as :func:`message_lines` prints it first
+    under the head (unwrapped): the ``found / needs`` line, else its first free
+    line, else ``fix:``; ``None`` for a message of one line."""
+    parts = ([f"{msg.found[0]}: {msg.found[1]}"] if msg.found else []) + (
+        [f"this run needs: {msg.needs}"] if msg.needs else [])
+    if parts:
+        joined = "    ".join(parts)
+        return joined if TEXT_COL + len(joined) <= WIDTH else parts[0]
+    if msg.lines:
+        return str(msg.lines[0])
+    return f"fix: {msg.fix}" if msg.fix else None
+
+
+def message_repeat_lines(msg: Message, count: int, *, indent: int = 0,
+                         detail: str | None = None) -> list[str]:
+    """A message whose id was printed in full before: ``<text> again (<count>)``
+    with the ``[id]`` ending at column 100, then ``detail`` (wrapped, never cut)
+    when given."""
+    tag = f"[{msg.id}]"
+    column = indent + TEXT_COL
+    head = wrap_value(f"{msg.text} again ({int(count)})", first_col=column,
+                      width=WIDTH - len(tag) - 2)
+    lines = [right_align(" " * indent + f"{msg.kind:<{TEXT_COL}}" + head[0], tag)]
+    lines += head[1:]
+    if detail:
+        lines += _indented(column, detail)
+    return lines
+
+
 def _summary_key(msg: Message) -> tuple:
     """One summary line per kind and id; an unclassified message keeps its text."""
     return (msg.kind, msg.id, msg.text if msg.id == "unclassified" else "")
@@ -335,7 +355,9 @@ def warnings_summary_lines(messages: Sequence[Message]) -> list[str]:
     """The WARNINGS block: one line per id, with its stage and count.
 
     ``messages`` holds one entry per occurrence; each was printed in full where
-    it happened.  With nothing to report the block is the line ``WARNINGS  none``.
+    it happened.  A text is never cut: it wraps, each continuation starting
+    under the text column.  With nothing to report the block is the line
+    ``WARNINGS  none``.
     """
     if not messages:
         return ["", "WARNINGS  none"]
@@ -356,11 +378,9 @@ def warnings_summary_lines(messages: Sequence[Message]) -> list[str]:
     for msg, count in ordered:
         left = (f"  {msg.kind:<7} {'[' + msg.id + ']':<{id_width}} "
                 f"{msg.stage[:stage_width]:<{stage_width}}   x{count:<3}")
-        text = " ".join(str(msg.text).split())
-        room = WIDTH - len(left)
-        if len(text) > room:
-            text = text[:max(room - 3, 0)].rstrip() + "..."
-        lines.append((left + text).rstrip())
+        wrapped = wrap_value(" ".join(str(msg.text).split()), first_col=len(left))
+        lines.append((left + wrapped[0]).rstrip())
+        lines += wrapped[1:]
     return lines
 
 
@@ -458,37 +478,60 @@ def time_reversal_lines(receipt, sym, *, consequence: str | None = None
                  + f" (nspin {int(receipt.nspin)}, nspinor {int(receipt.nspinor)}: "
                  "no 2-component check)")
     else:
-        if method == "occupied-density-subspace":
-            holds, conclusive = bool(receipt.trs_holds), bool(receipt.conclusive)
-            residual = ("n/a" if receipt.subspace_residual is None
-                        else f"{float(receipt.subspace_residual):.1e}")
-            evidence = ", ".join(f"{kind} {int(count)}"
-                                 for kind, count in receipt.evidence_counts)
-            check = (f"2-component density check: basis {receipt.trs_basis}, residual "
-                     f"{residual}, coverage {100.0 * float(receipt.trs_coverage):.2f}%, "
-                     + (evidence or "no independent evidence"))
-        else:
-            holds, conclusive = bool(receipt.trs_holds), True
-            m_rel = "n/a" if receipt.m_rel is None else f"{float(receipt.m_rel):.1e}"
-            check = (f"density check: basis {receipt.trs_basis}, |m|/|rho| {m_rel}, "
-                     f"coverage {100.0 * float(receipt.trs_coverage):.2f}%")
+        holds = bool(receipt.trs_holds)
+        conclusive = (bool(receipt.conclusive) if method == "occupied-density-subspace"
+                      else True)
         if holds:
             value = ("used" if allowed else "not used") + (
                 "" if conclusive else " (the density check is inconclusive)")
         else:
+            # One line: the k / -k fact is the row above, and the density
+            # check's figures are DEBUG plus the ``symmetry.trs_check`` record
+            # (:func:`time_reversal_check`, printed by the report).
             value = "not a symmetry alone: " + (
                 f"used only inside the {n_anti} t_rev = 1 operations" if n_anti
                 else "k and -k are sampled apart")
+            qe = str(getattr(receipt, "trs_basis", "")).startswith("qe")
             note = Message(
                 "NOTE", "time_reversal_broken",
                 (f"QE marks {n_anti} of the {n_sym} operations t_rev = 1 (magnetic)"
-                 if n_anti else "the DFT reference breaks time reversal (magnetic)"),
-                lines=(check, f"k and -k pair only through those {n_anti} operations"
-                       if n_anti else "k and -k are not paired by time reversal"))
+                 if n_anti else "the DFT reference breaks time reversal "
+                 + ("(magnetic QE run)" if qe else "(magnetic)")))
     lines = kv_lines([("time reversal", value)])
     if consequence:
         lines += _indented(LABEL + 2, consequence)
     return lines, note
+
+
+def time_reversal_check(receipt) -> tuple[str, dict] | None:
+    """The density check behind the ``time reversal`` row, as one line and its
+    fields (the report's DEBUG line and ``symmetry.trs_check`` record), or
+    ``None`` when no 2-component check was retained."""
+    if receipt is None:
+        return None
+    method = getattr(receipt, "method", "real-space-density")
+    if method == "occupied-density-subspace" and receipt.trs_basis == "not-2c":
+        return None
+    coverage = 100.0 * float(receipt.trs_coverage)
+    fields = {"method": method, "basis": str(receipt.trs_basis),
+              "holds": bool(receipt.trs_holds), "coverage_percent": coverage}
+    if method == "occupied-density-subspace":
+        residual = ("n/a" if receipt.subspace_residual is None
+                    else f"{float(receipt.subspace_residual):.1e}")
+        evidence = ", ".join(f"{kind} {int(count)}"
+                             for kind, count in receipt.evidence_counts)
+        fields.update(conclusive=bool(receipt.conclusive), residual=(
+            None if receipt.subspace_residual is None else float(receipt.subspace_residual)),
+            evidence={str(kind): int(count) for kind, count in receipt.evidence_counts})
+        text = (f"2-component density check: basis {receipt.trs_basis}, residual "
+                f"{residual}, coverage {coverage:.2f}%, "
+                + (evidence or "no independent evidence"))
+    else:
+        m_rel = "n/a" if receipt.m_rel is None else f"{float(receipt.m_rel):.1e}"
+        fields.update(m_rel=None if receipt.m_rel is None else float(receipt.m_rel))
+        text = (f"density check: basis {receipt.trs_basis}, |m|/|rho| {m_rel}, "
+                f"coverage {coverage:.2f}%")
+    return text, fields
 
 
 def symmetry_lines(sym, *, centroids=None, tr_lines: Sequence[str] = ()) -> list[str]:
@@ -580,6 +623,30 @@ def kpoint_lines(wfn, sym, *, extra: Mapping[str, Sequence] = {},
     if count > max_rows:
         lines.append(f"{'':7}[... {count - 20} more k points]")
     return lines
+
+
+# ── stages ───────────────────────────────────────────────────────────────────
+#: Indent of a stage's detail rows, and the width of their label column.
+DETAIL_INDENT = 6
+DETAIL_LABEL = 15
+
+
+def stage_detail(label: str | None, value: str) -> list[str]:
+    """A detail row under the current stage: indent 6, ``label`` padded to 15,
+    the value at column 21 and wrapped at 100.  Without a label the value
+    starts at the indent; each of its own lines is one row.  With a label and a
+    value of several lines (a small table under its key) the first line follows
+    the label and every further line is kept verbatim at column 21."""
+    pad = " " * DETAIL_INDENT
+    if label is None:
+        return [(pad + line).rstrip() for line in str(value).splitlines() or [""]]
+    column = DETAIL_INDENT + DETAIL_LABEL
+    if "\n" in str(value):
+        first, *rest = str(value).splitlines() or [""]
+        return ([f"{pad}{str(label):<{DETAIL_LABEL - 1}} {first}".rstrip()]
+                + [(" " * column + line).rstrip() for line in rest])
+    wrapped = wrap_value(value, first_col=column)
+    return [f"{pad}{str(label):<{DETAIL_LABEL - 1}} {wrapped[0]}".rstrip()] + wrapped[1:]
 
 
 # ── timing and memory ───────────────────────────────────────────────────────
@@ -740,8 +807,10 @@ __all__ = [
     "device_memory_message",
     "devices_lines",
     "display_path",
+    "message_detail",
     "message_from_exception",
     "message_lines",
+    "message_repeat_lines",
     "warning_count",
     "warnings_summary_lines",
     "fmt_clock",
@@ -752,7 +821,11 @@ __all__ = [
     "kv_lines",
     "output_file_lines",
     "settings_lines",
+    "stage_banner",
+    "stage_detail",
+    "stage_result",
     "symmetry_lines",
+    "time_reversal_check",
     "time_reversal_lines",
     "timing_lines",
     "right_align",

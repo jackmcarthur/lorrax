@@ -40,6 +40,9 @@ from .bse_io import (load_bse_data_from_restart_sharded, pad_zone_mask_np)
 from file_io.restart_bundle import (_find_restart_file)
 import common.timing as timing
 from common.units import RYD_TO_EV
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -188,7 +191,7 @@ def run_kpm_dos(
     ensure_W_R(data_fp32, include_W, mesh_xy)
 
     # --- Spectral bounds from Lanczos ---
-    print(f"Estimating spectral bounds (Lanczos min={n_lanczos})...")
+    log.info(f"Estimating spectral bounds (Lanczos min={n_lanczos})...")
     bounds = estimate_spectral_bounds_sharded(
         data,
         mesh_xy,
@@ -200,16 +203,16 @@ def run_kpm_dos(
     e_min_ry = bounds["e_min_ry"]
     e_max_ry = bounds["e_max_ry_raw"]
 
-    print(f"  E_min (Lanczos)  = {e_min_ry:.6f} Ry = {e_min_ry * ry_to_ev:.3f} eV")
-    print(f"  E_max (Lanczos)  = {e_max_ry:.6f} Ry = {e_max_ry * ry_to_ev:.3f} eV")
+    log.info(f"  E_min (Lanczos)  = {e_min_ry:.6f} Ry = {e_min_ry * ry_to_ev:.3f} eV")
+    log.info(f"  E_max (Lanczos)  = {e_max_ry:.6f} Ry = {e_max_ry * ry_to_ev:.3f} eV")
 
     # Apply manual overrides (in eV -> convert to Ry).
     if emin_ev is not None:
         e_min_ry = emin_ev / ry_to_ev
-        print(f"  E_min (override) = {e_min_ry:.6f} Ry = {emin_ev:.3f} eV")
+        log.info(f"  E_min (override) = {e_min_ry:.6f} Ry = {emin_ev:.3f} eV")
     if emax_ev is not None:
         e_max_ry = emax_ev / ry_to_ev
-        print(f"  E_max (override) = {e_max_ry:.6f} Ry = {emax_ev:.3f} eV")
+        log.info(f"  E_max (override) = {e_max_ry:.6f} Ry = {emax_ev:.3f} eV")
 
     bandwidth = e_max_ry - e_min_ry
     if use_tda:
@@ -226,10 +229,10 @@ def run_kpm_dos(
         e_center = 0.0
         half_width = e_max_buf
 
-    print(f"  E_min (buffered) = {e_min_buf:.6f} Ry = {e_min_buf * ry_to_ev:.3f} eV")
-    print(f"  E_max (buffered) = {e_max_buf:.6f} Ry = {e_max_buf * ry_to_ev:.3f} eV")
-    print(f"  Center = {e_center:.6f} Ry = {e_center * ry_to_ev:.3f} eV")
-    print(f"  Half-width = {half_width:.6f} Ry = {half_width * ry_to_ev:.3f} eV")
+    log.debug(f"  E_min (buffered) = {e_min_buf:.6f} Ry = {e_min_buf * ry_to_ev:.3f} eV")
+    log.debug(f"  E_max (buffered) = {e_max_buf:.6f} Ry = {e_max_buf * ry_to_ev:.3f} eV")
+    log.debug(f"  Center = {e_center:.6f} Ry = {e_center * ry_to_ev:.3f} eV")
+    log.debug(f"  Half-width = {half_width:.6f} Ry = {half_width * ry_to_ev:.3f} eV")
 
     # --- Build BSE-specific callables ---
     apply_h_tilde, h_tilde_operands = make_bse_h_tilde(
@@ -244,8 +247,8 @@ def run_kpm_dos(
         bse_dim *= 2
 
     # --- Chebyshev moments (generic solver) ---
-    print(f"\nComputing {n_moments} Chebyshev moments with {n_random} random vectors...")
-    print(f"  Total matvecs: {n_random * n_moments}")
+    log.info(f"\nComputing {n_moments} Chebyshev moments with {n_random} random vectors...")
+    log.info(f"  Total matvecs: {n_random * n_moments}")
     with timing.section("kpm.moments"):
         mu = chebyshev_moments(
             apply_h_tilde,
@@ -258,8 +261,8 @@ def run_kpm_dos(
             operands=h_tilde_operands,
         )
 
-    print(f"\n  mu_0 = {mu[0]:.6f}  (should be ~1.0)")
-    print(f"  First 10 raw moments: {np.array2string(mu[:10], precision=6)}")
+    log.info(f"\n  mu_0 = {mu[0]:.6f}  (should be ~1.0)")
+    log.debug(f"  First 10 raw moments: {np.array2string(mu[:10], precision=6)}")
 
     # --- Jackson damping ---
     sigma = jackson_coefficients(n_moments)
@@ -322,7 +325,7 @@ def run_kpm_dos(
 
         fig.tight_layout()
         fig.savefig(plot_file, dpi=150)
-        print(f"\nDOS plot saved to {plot_file}")
+        log.info(f"\nDOS plot saved to {plot_file}")
         plt.close(fig)
 
         # --- Save data ---
@@ -341,7 +344,7 @@ def run_kpm_dos(
             n_moments=n_moments,
             n_random=n_random,
         )
-        print(f"Moments + DOS data saved to {npz_file}")
+        log.info(f"Moments + DOS data saved to {npz_file}")
 
     return {
         "mu_raw": mu,
@@ -440,9 +443,9 @@ def run(args) -> None:
     bse_dim = n_c * n_v * nk
     if not args.tda:
         bse_dim *= 2
-    print(f"BSE dimension: {n_c} cond x {n_v} val x {nk} k = {bse_dim}")
-    print(f"KPM parameters: M={args.n_moments} moments, R={args.n_random} random vectors")
-    print(f"Total matvecs: {args.n_random * args.n_moments}")
+    log.info(f"BSE dimension: {n_c} cond x {n_v} val x {nk} k = {bse_dim}")
+    log.info(f"KPM parameters: M={args.n_moments} moments, R={args.n_random} random vectors")
+    log.info(f"Total matvecs: {args.n_random * args.n_moments}")
 
     with timing.section("kpm.total"):
         run_kpm_dos(
@@ -463,7 +466,7 @@ def run(args) -> None:
             use_tda=args.tda,
         )
 
-    timing.report(print_fn=print, title="--- KPM Timing ---")
+    timing.report(print_fn=log.info, title="--- KPM Timing ---")
 
 
 

@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 from common.collectives import device_put_process_local
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 import jax
 import numpy as np
@@ -389,7 +393,7 @@ def compute_static_photon_sigma(
                 heads[term][sector] = head if old is None else old + head
                 head_totals[term] = head if head_totals[term] is None else head_totals[term] + head
             if verbose and jax.process_index() == 0:
-                print_fn(f"  packed photon Sigma term {term} class {key} submitted")
+                log.debug(f"  packed photon Sigma term {term} class {key} submitted")
     finish = band_sigma_finish(mesh_xy, int(wfns_charge.slices.nb_sigma),
                                wfns_charge.green_parent.plan.sym)
     sig_x, sig_sx, sig_coh = (finish(value) for value in totals)

@@ -107,7 +107,8 @@ _L3_MODULES = frozenset({
     "common.grouped_layout",
     "runtime.production_stream", "runtime.xla_memory",
     # the one driver session (report, stdout, timing, refusal, file table);
-    # it imports no report class, only ``common.timing`` and the stream.
+    # it imports no report class, only ``common.timing``, ``common.log`` and
+    # the stream.
     "runtime.run_session",
     "runtime.jax_support", "runtime.pjrt_log_filter",
     # stdlib-only package-origin sealing at the first runtime boundary
@@ -143,6 +144,9 @@ _L3_MODULES = frozenset({
     # jax glue and instrumentation.
     "common.jax_compile_cache", "common.jax_profile", "common.timing",
     "common.progress", "common.gpu_utils", "common.async_io", "common.sanity",
+    # the ``lorrax`` loggers and their three handlers: streams, processes and
+    # one sidecar file; a report reaches it only through callables it is handed
+    "common.log",
     # FFT kernels
     "common.fft_helpers",
     # the sharded-HDF5 transport (NOT the format readers above it).
@@ -706,11 +710,11 @@ def test_the_plumbing_scan_does_not_cry_wolf():
 
 _DRIVER_MAIN_STATEMENTS = {
     "gw.gw_jax": (("main", "_run_gw_stages"), 57),
-    "bse.bse_jax": (("main",), 36),
-    "bse.exciton_bands": (("main",), 400),
+    "bse.bse_jax": (("main",), 34),
+    "bse.exciton_bands": (("main",), 390),
     "bandstructure.htransform": (("main",), 124),
-    "gw.kin_ion_io": (("main",), 128),
-    "psp.get_dipole_mtxels": (("main",), 233),
+    "gw.kin_ion_io": (("main",), 124),
+    "psp.get_dipole_mtxels": (("main",), 230),
     "tdagw.tdgw_jax": (("main",), 12),
 }
 

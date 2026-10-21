@@ -36,6 +36,10 @@ from jax.sharding import Mesh
 
 from file_io.paths import resolve_input_path
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
+from common.log import get_logger
+
+log = get_logger(__name__)
+
                                # owner's workspace fix -- see _services.py)
 
 _services.ensure_on_path()
@@ -228,9 +232,9 @@ def build_bgw_v_grid_fn(
     from file_io import read_bgw_vcoul, fill_v_grid_for_q
 
     bgw_path = resolve_input_path(input_dir, head.bgw_vcoul_file)
-    print_fn(f"  BGW vcoul override: loading {bgw_path}")
+    log.info(f"  BGW vcoul override: loading {bgw_path}")
     bgw_table = read_bgw_vcoul(bgw_path)
-    print_fn(
+    log.debug(
         f"    {bgw_table.q_fracs.shape[0]} unique q-points, "
         f"G counts per q: {[len(g) for g in bgw_table.G_miller_per_q]}"
     )
@@ -247,7 +251,7 @@ def build_bgw_v_grid_fn(
         with h5py.File(aux_path, "r") as fsym:
             sym_real = np.asarray(
                 fsym["mf_header/symmetry/mtrx"][:], dtype=np.int32)
-        print_fn(f"    crystal sym ops loaded from {aux_path}: {sym_real.shape[0]}")
+        log.debug(f"    crystal sym ops loaded from {aux_path}: {sym_real.shape[0]}")
         sym_mats_k = sym_real.transpose(0, 2, 1).copy()
     else:
         sym_mats_k = np.asarray(sym.sym_mats_k, dtype=np.int32)

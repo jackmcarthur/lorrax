@@ -14,6 +14,10 @@ import math
 import operator
 
 import numpy as np
+from common.log import get_logger, record
+
+log = get_logger(__name__)
+
 
 RECIPE_VERSION = "shared_real_pole_v1_r4"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
@@ -734,7 +738,7 @@ def bind_shared_pole_sc_identity(meta, state, *, occupation_state, print_fn):
                     recipe_hash=recipe['recipe_hash'], gate_hash=recipe['gate_hash'],
                     authentication='NON-AUTHENTICATING')
     meta.shared_pole_state_identity = identity
-    print_fn(f"shared-pole SC identity NON-AUTHENTICATING: {identity}; "
+    log.info(f"shared-pole SC identity NON-AUTHENTICATING: {identity}; "
              "scratch only; rebuild every map; no restart reuse or publication")
     return dict(identity)
 
@@ -790,7 +794,7 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
             restart_path, expected_identity=expected_identity, mesh_xy=mesh_xy,
             capacity=capacity, return_header=True)
     except SharedPoleMemberMissing as exc:
-        print_fn(f"shared-pole restart: {exc}; build and register a new member")
+        log.info(f"shared-pole restart: {exc}; build and register a new member")
         return None
     stored = header.get('recipe', {})
     # Table hashes bind the deterministic recipe; state identity binds its
@@ -802,7 +806,7 @@ def shared_pole_restart_handle(restart_path, *, expected_identity, meta,
                 f"GATE shared_pole_restart: recipe {key} mismatch; "
                 f"got {stored.get(key)!r}, want {recipe[key]!r}")
     path = (Path(restart_path).resolve().parent / member['path']).resolve()
-    print_fn(f"shared-pole restart: authenticated {path}; digest={member['digest']}; "
+    log.info(f"shared-pole restart: authenticated {path}; digest={member['digest']}; "
              "skip bank, moments and construction")
     return dict(path=str(path), identity=dict(header['identity']),
                 digest=member['digest'], K=list(header['K']))
@@ -1275,7 +1279,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     meta.shared_pole_capacity = CapacityLedger(
         meta, mesh_xy=mesh_xy, device_budget_bytes=budget, baseline_bytes=baseline)
     meta.shared_pole_capacity.room_bytes = budget - baseline
-    print_fn(f"shared-pole ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "
+    log.debug(f"shared-pole ledger: budget {budget / 1e9:.2f} GB/rank, {baseline / 1e9:.2f} GB/rank "
              f"live outside the ledger at bind (the driver's arrays); admissions see "
              f"{(budget - baseline) / 1e9:.2f} GB/rank")
     recipe = shared_real_pole_v1_r3b
@@ -1473,9 +1477,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                      u_min='SC low-water envelope of max(h,logical gap)',
                      u_max='SC high-water envelope of max(16 eV,L)',
                      support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
+    receipt = {}
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
         rule = next((v for prefix, v in rules.items() if key.startswith(prefix)),
                     'canonical role/ID census and versioned recipe; no accuracy inferred from missing evidence')
-        print_fn(f'  [shared-pole recipe {RECIPE_VERSION}] {key}={shown} (rule: {rule})')
+        log.debug(f'  [shared-pole recipe {RECIPE_VERSION}] {key}={shown} (rule: {rule})')
+        receipt[str(key)] = dict(value=shown, rule=rule)
+    log.debug(f'shared-pole recipe {RECIPE_VERSION}', extra=record(
+        'shared_pole.recipe', version=RECIPE_VERSION, entries=receipt))
     return result

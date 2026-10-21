@@ -28,6 +28,9 @@ from solvers.lanczos import (
     simple_lanczos_eig,
     split_alpha_sink,
 )
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 #: Third element of ``solve_bse_sharded``'s return tuple when the route ran a
 #: FIXED number of iterations and therefore never measured a convergence point.
@@ -204,8 +207,8 @@ def solve_bse_sharded(
     if davidson_precond == "auto":
         from .bse_davidson_helpers import resolve_precond_route
         _resolved = resolve_precond_route("auto", n_flat)
-        print(f"Davidson preconditioner: auto -> {_resolved} "
-              f"(bse_dim={n_flat})", flush=True)
+        log.info(f"Davidson preconditioner: auto -> {_resolved} "
+                 f"(bse_dim={n_flat})")
         davidson_precond = _resolved
 
     # The q=0 slice of W_q, kept for the exact-diagonal preconditioner.  It
@@ -325,14 +328,13 @@ def solve_bse_sharded(
                     nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)))
                 _diag_H.block_until_ready()
             _memoised = exact_diagonal_memo_stats()["hits"] > _memo_before
-            print(f"Davidson preconditioner: EXACT diag(H) "
-                  f"(dE + (V_x{' - W_d' if include_W else ''})/nk), "
-                  f"{'from memo (same payload)' if _memoised else 'assembled'}",
-                  flush=True)
+            log.info(f"Davidson preconditioner: EXACT diag(H) "
+                     f"(dE + (V_x{' - W_d' if include_W else ''})/nk), "
+                     f"{'from memo (same payload)' if _memoised else 'assembled'}")
         else:
-            print("Davidson preconditioner: bare dE", flush=True)
+            log.info("Davidson preconditioner: bare dE")
         if davidson_olsen:
-            print("Davidson preconditioner: Olsen correction ON", flush=True)
+            log.info("Davidson preconditioner: Olsen correction ON")
 
         precond_fn = bse_diagonal_precond(
             eps_c, eps_v, sharding=NamedSharding(mesh_xy, P("x", "y", None)),
@@ -360,8 +362,8 @@ def solve_bse_sharded(
         _mvscan = _os.environ.get("LORRAX_DAV_MVSCAN", "")
         if _mvscan:
             import time as _t
-            print("[mvscan] block-width scaling of the BSE matvec", flush=True)
-            print("[mvscan] width  wall_s     s/vector   rel_to_w1", flush=True)
+            log.info("[mvscan] block-width scaling of the BSE matvec")
+            log.info("[mvscan] width  wall_s     s/vector   rel_to_w1")
             _per1 = None
             for _w in [int(x) for x in _mvscan.split(",") if x.strip()]:
                 _Vw = jnp.repeat(X0[:1], _w, axis=0) if _w > n_eig else X0[:_w]
@@ -375,16 +377,16 @@ def solve_bse_sharded(
                 _dt = (_t.perf_counter() - _t0) / _reps
                 if _per1 is None:
                     _per1 = _dt / _w
-                print(f"[mvscan] {_w:5d}  {_dt:9.5f}  {_dt/_w:9.6f}  "
-                      f"{(_dt/_w)/_per1:8.3f}", flush=True)
+                log.info(f"[mvscan] {_w:5d}  {_dt:9.5f}  {_dt/_w:9.6f}  "
+                         f"{(_dt/_w)/_per1:8.3f}")
                 del _Vw, _o
 
         # One fixed-capacity solve replaces the former shape warmup ladder.
         from solvers.davidson import DEFAULT_M_MAX_FACTOR
         m_max_warm = (int(davidson_m_max) if davidson_m_max
                       else DEFAULT_M_MAX_FACTOR * n_eig)
-        print(f"Davidson: m_max={m_max_warm} ({m_max_warm // n_eig}x n_eig), "
-              f"storing 2*m_max = {2 * m_max_warm} trial vectors", flush=True)
+        log.info(f"Davidson: m_max={m_max_warm} ({m_max_warm // n_eig}x n_eig), "
+                 f"storing 2*m_max = {2 * m_max_warm} trial vectors")
         _price_davidson_basis(max(m_max_warm, 2 * n_eig), X0, mesh_xy)
         eigenvalues, eigenvectors = davidson(
             apply_H, n_eig=n_eig, precond_fn=apply_precond, X0=X0,
@@ -405,7 +407,7 @@ def solve_bse_sharded(
             LAST_RUN as _DAV_HIST,
             instrumentation_summary as _dav_summary,
         )
-        print(_dav_summary(), flush=True)
+        log.debug(_dav_summary())
         _trace_path = _os.environ.get("LORRAX_DAV_TRACE", "")
         if _trace_path and jax.process_index() == 0:
             import numpy as _np
@@ -420,7 +422,7 @@ def solve_bse_sharded(
                 n_distinct_programs=_np.asarray(len(_DAV_TRACES)),
                 total_matvec_applications=_np.asarray(_DAV_MV[0]),
             )
-            print(f"[dav-instr] final snapshot -> {_trace_path}", flush=True)
+            log.debug(f"[dav-instr] final snapshot -> {_trace_path}")
 
         # Keep the physical (c, v) axes distributed across all processors.
         # The writer gathers explicitly when serializing eigenvectors.
@@ -477,11 +479,11 @@ def solve_bse_sharded(
         trlan_plan = plan_subspace(
             capacity=m_max + 1, n_eig=n_keep, vector_sharding=bse_sharding)
 
-        print(f"Thick-restart Lanczos: n_eig={n_eig} m_max={m_max} "
-              f"n_keep={n_keep} restarts={n_restarts} -> {apps} matvec "
-              f"applications, basis {m_max + 1} slots "
-              f"({(m_max + 1) / (int(max_iter) + 1):.2f}x the unrestarted "
-              f"basis at the same budget)", flush=True)
+        log.info(f"Thick-restart Lanczos: n_eig={n_eig} m_max={m_max} "
+                 f"n_keep={n_keep} restarts={n_restarts} -> {apps} matvec "
+                 f"applications, basis {m_max + 1} slots "
+                 f"({(m_max + 1) / (int(max_iter) + 1):.2f}x the unrestarted "
+                 f"basis at the same budget)")
 
         # ONE jit, tensors as ARGUMENTS.  They span every process, so closing
         # over them inside the traced loop body would carry them as constants
@@ -511,8 +513,8 @@ def solve_bse_sharded(
         eigenvalues, eigenvectors, alpha_im = _trlan_run(
             psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
             M)
-        print(f"Thick-restart Lanczos: max |Im <q,Hq>| = "
-              f"{float(alpha_im):.3e} Ry", flush=True)
+        log.info(f"Thick-restart Lanczos: max |Im <q,Hq>| = "
+                 f"{float(alpha_im):.3e} Ry")
         eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
         # An HONEST third slot: the matvec applications actually spent, not
         # an echo of the budget (CONVERGENCE_CENSUS recommendation 2).

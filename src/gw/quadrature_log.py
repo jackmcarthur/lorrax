@@ -12,11 +12,23 @@ from __future__ import annotations
 
 _CHI: dict[tuple, dict] = {}
 _SIGMA: dict = {"geometry": None, "plans": 0}
+#: The tables a stage already printed in the main log (``chi``, ``sigma``).
+_SHOWN: set = set()
 
 
 def reset() -> None:
     _CHI.clear()
     _SIGMA.update(geometry=None, plans=0)
+    _SHOWN.clear()
+
+
+def mark_shown(table: str) -> None:
+    """``table`` (``chi`` or ``sigma``) was printed under its stage."""
+    _SHOWN.add(str(table))
+
+
+def shown(table: str) -> bool:
+    return str(table) in _SHOWN
 
 
 def record_minimax(kind, quad, *, target, omega_ry=0.0, nodes=None,

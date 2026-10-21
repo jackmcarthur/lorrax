@@ -160,6 +160,13 @@ __all__ = [
     "rank0_print",
     "debug_print",
     "debug_print_enabled",
+    "verbose_enabled",
+    "verbose_source",
+    "set_verbose",
+    "read_verbose_switches",
+    "deck_verbose",
+    "VERBOSE_FLAG",
+    "VERBOSE_DECK_KEY",
     "DEBUG_PRINT_ENV",
     "finalize_process",
     "run_main_and_finalize",
@@ -247,11 +254,17 @@ def bootstrap(*, platform: str = "gpu") -> None:
     Idempotent (each piece guards itself); no-op-ish in single-process
     runs.  ``platform`` forwards to :func:`set_default_env`.
     """
+    # The verbose switch (--verbose, the deck's ``verbose = true``) before
+    # anything reads it and before any parser sees --verbose.
+    read_verbose_switches()
     # Source/package sealing is stdlib-only and MUST precede every existing
     # bootstrap step: it puts this checkout's declared service packages ahead of
     # stale installed copies and refuses a LORRAX_CHECKOUT/runtime mismatch
     # before set_default_env's first possible JAX import.
-    _ensure_source_closure(print_fn=rank0_print)
+    _closure = _ensure_source_closure(print_fn=rank0_print)
+    if _resolve_proc_id() == 0:         # the header's Version row, read beside the imports
+        from .source_closure import start_version_probe
+        start_version_probe(_closure)
     # GATE blas_spin: an OpenBLAS copy mapped before runtime set
     # OPENBLAS_THREAD_TIMEOUT cannot be tuned any more; refuse it by name.
     from .blas_env import enforce as _enforce_blas_spin
@@ -2357,17 +2370,154 @@ def rank0_print(*a, **k):
         print(*a, **k)
 
 
-def debug_print_enabled() -> bool:
-    """Whether the process-wide driver debug stream is enabled.
+#: The command-line spelling of the verbose switch.  Runtime takes it out of
+#: ``sys.argv`` (:func:`read_verbose_switches`), so no driver parser declares it.
+VERBOSE_FLAG = "--verbose"
+#: The deck key of the verbose switch (``verbose = true`` in the deck).
+VERBOSE_DECK_KEY = "verbose"
 
-    Debug printing is deliberately a runtime concern, not a physics-config
+#: The switch as set by :func:`set_verbose`: ``(on, source)``.  The
+#: environment alias is read on every call instead (tests set it).
+_VERBOSE: list = [False, None]
+#: The ``sys.argv`` :func:`read_verbose_switches` last read (a harness that
+#: runs drivers in one process sets a new one per driver).
+_VERBOSE_ARGV_READ: list = [None]
+#: A deck line setting the switch: verbose = <word> (any case).
+_VERBOSE_LINE = r"^\s*verbose\s*[=:]\s*([^\s#;]*)"
+
+
+def set_verbose(on: bool = True, *, source: str = "set_verbose") -> None:
+    """Turn the verbose switch on (or off) for the rest of this process.
+
+    ``source`` says what set it (``"--verbose"``, ``"deck"``), for the header.
+    The ``lorrax`` handlers read the switch on every record, so a switch set
+    after the session opened takes effect from the next record on.
+    """
+    _VERBOSE[0], _VERBOSE[1] = bool(on), (str(source) if on else None)
+
+
+def verbose_source() -> str | None:
+    """What turned verbose on, or ``None`` when it is off.
+
+    One of ``--verbose``, ``verbose = true in <deck>``,
+    ``LORRAX_DEBUG_PRINT=1`` (the environment alias), or the ``source`` a
+    caller handed :func:`set_verbose`.
+    """
+    if _VERBOSE[0]:
+        return _VERBOSE[1] or "set_verbose"
+    from .env_flags import env_bool
+    if env_bool(DEBUG_PRINT_ENV, False, print_fn=rank0_print):
+        return f"{DEBUG_PRINT_ENV}=1"
+    return None
+
+
+def debug_print_enabled() -> bool:
+    """Whether verbose output is on: the process-wide driver debug stream.
+
+    THE one decision, for every driver.  Verbose is on when any of these
+    says so: the command-line flag ``--verbose``, the deck key
+    ``verbose = true`` (both read by :func:`read_verbose_switches` at
+    startup), :func:`set_verbose`, or ``LORRAX_DEBUG_PRINT=1`` (the
+    environment alias, read on every call).  Verbose puts DEBUG records in
+    the rank log and in the main log under the current stage
+    (``common.log``).
+
+    Print verbosity is deliberately a runtime concern, not a physics-config
     field.  Every production driver executes in its own process, so this one
     switch is one debug stream *per driver invocation*.  Forensic writers and
     diagnostics that perform extra numerical work retain separate controls;
     they are not print verbosity.
     """
-    from .env_flags import env_bool
-    return env_bool(DEBUG_PRINT_ENV, False, print_fn=rank0_print)
+    return verbose_source() is not None
+
+
+#: The same decision under the name the input flag has.
+verbose_enabled = debug_print_enabled
+
+
+def _bool_word(text: str) -> bool | None:
+    """``env_flags``' boolean words: ``True`` / ``False``, else ``None``."""
+    from .env_flags import ENV_FALSE, ENV_TRUE
+    word = str(text).strip().strip("'\"").lower()
+    if word in ENV_TRUE:
+        return True
+    if word in ENV_FALSE:
+        return False
+    return None
+
+
+def deck_verbose(path) -> bool:
+    """Whether the deck at ``path`` sets ``verbose = true``.
+
+    A plain line scan (``key = value``, ``#`` comments), so it serves every
+    deck the drivers read; an unreadable deck or another value reads
+    ``False`` and the driver's own parser reports the deck.
+    """
+    import re
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if line.lstrip().startswith((";", "#")):
+                    continue
+                match = re.match(_VERBOSE_LINE, line, re.IGNORECASE)
+                if match and _bool_word(match.group(1)) is not None:
+                    return bool(_bool_word(match.group(1)))
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _deck_of(argv) -> str | None:
+    """The deck ``-i`` / ``--input`` names in ``argv``, or ``None``."""
+    for i, arg in enumerate(argv):
+        if arg in ("-i", "--input"):
+            return argv[i + 1] if i + 1 < len(argv) else None
+        if arg.startswith("--input="):
+            return arg.split("=", 1)[1]
+        if arg.startswith("-i") and len(arg) > 2 and not arg.startswith("--"):
+            return arg[2:]
+    return None
+
+
+def _argv_is_pytest(argv0: str) -> bool:
+    """``sys.argv`` belongs to pytest, not to a driver (its ``--verbose`` is pytest's)."""
+    parts = os.path.normpath(str(argv0)).split(os.sep)
+    return any(part in ("pytest", "py.test", "_pytest") or part.startswith("pytest-")
+               for part in parts[-2:])
+
+
+def read_verbose_switches(argv=None) -> None:
+    """Read ``--verbose`` and the deck's ``verbose = true`` from a driver's argv.
+
+    ``argv`` is the argument list WITHOUT the program name, edited in place:
+    ``--verbose`` is taken out, so a driver's own parser never sees it.  The
+    default is ``sys.argv[1:]``, read once per command line (``sys.argv`` itself
+    loses the flag); a pytest command line is not a driver's and is left
+    alone.  The deck is the file ``-i`` / ``--input`` names.
+
+    Called by every driver's startup (:func:`bootstrap`, ``cli_seam``,
+    :func:`run_main_and_finalize`), before any parser and any report.
+    """
+    import sys
+    if argv is None:
+        if (not sys.argv or _argv_is_pytest(sys.argv[0])
+                or _VERBOSE_ARGV_READ[0] == tuple(sys.argv)):
+            return
+        args = sys.argv[1:]
+        kept = [arg for arg in args if arg != VERBOSE_FLAG]
+        if len(kept) != len(args):
+            sys.argv[1:] = kept
+            set_verbose(source=VERBOSE_FLAG)
+        _VERBOSE_ARGV_READ[0] = tuple(sys.argv)
+    else:
+        kept = [arg for arg in argv if arg != VERBOSE_FLAG]
+        if len(kept) != len(argv):
+            if isinstance(argv, list):
+                argv[:] = kept
+            set_verbose(source=VERBOSE_FLAG)
+    deck = _deck_of(kept)
+    if deck and not _VERBOSE[0] and deck_verbose(deck):
+        set_verbose(source=f"verbose = true in {os.path.basename(deck)}")
 
 
 def debug_print(*a, **k):
@@ -2520,6 +2670,7 @@ def run_main_and_finalize(main, argv=None) -> None:
     import sys
     import traceback
 
+    read_verbose_switches(argv)
     try:
         rc = main() if argv is None else main(argv)
     except SystemExit as exc:

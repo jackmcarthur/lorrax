@@ -39,7 +39,10 @@ from common.collectives import (
     resolve_mesh,
     single_device_mesh,
 )
+from common.log import get_logger
 from runtime.padding import spec_divisor
+
+log = get_logger(__name__)
 
 # The centroid geometry is fp64 throughout: a fractional coordinate has to
 # resolve 1/N_fft of a lattice vector, and the Lloyd movement tolerance is
@@ -64,7 +67,7 @@ because the allreduce dominated the 1 ms of local compute)."""
 # ─────────────────────────────────────────────────────────────────────────
 
 def build_mesh(n_points: int, *, shard: bool = True,
-               force_shard: bool = False, print_fn=print) -> Mesh:
+               force_shard: bool = False) -> Mesh:
     """The device mesh for a k-means over ``n_points`` real-space points.
 
     Returns the run's square 2-D ``('x','y')`` mesh, or the 1x1
@@ -105,15 +108,15 @@ def build_mesh(n_points: int, *, shard: bool = True,
     per_shard = n_points // n_dev
 
     if per_shard < _P_PER_SHARD_MIN and not force_shard and not multi_host:
-        print_fn(f"P/{n_dev} = {per_shard} < {_P_PER_SHARD_MIN} points per "
+        log.info(f"P/{n_dev} = {per_shard} < {_P_PER_SHARD_MIN} points per "
                  "shard; falling back to single-device. Pass --force-shard to "
                  "override.")
         return single_device_mesh()
     if multi_host and per_shard < _P_PER_SHARD_MIN:
-        print_fn(f"P/{n_dev} = {per_shard} < {_P_PER_SHARD_MIN}; sharding "
+        log.info(f"P/{n_dev} = {per_shard} < {_P_PER_SHARD_MIN}; sharding "
                  "anyway (multi-host: single-device fallback would deadlock).")
 
-    print_fn(f"Sharded mesh: ('x'={nx}, 'y'={ny}) over {n_dev} devices")
+    log.debug(f"Sharded mesh: ('x'={nx}, 'y'={ny}) over {n_dev} devices")
     return mesh
 
 

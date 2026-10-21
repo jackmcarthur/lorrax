@@ -43,6 +43,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 _services.ensure_on_path()
 
 from distrib_la import mesh_key as _mesh_key   # noqa: E402
+from common.log import get_logger, message
 # Every extent this module shards is an input datum: n_μ is a k-means centroid
 # count, nb_fi is the caller's band window, and the q-batch is batch_size — so
 # each of them divides the mesh axis only by luck.  ``bse_io`` pads its own μ
@@ -74,6 +75,9 @@ from .fh_interp import (
     top_block_eigh,
 )
 from common.ws_images import pair_ws_code_fourier
+
+# ``logger``, not ``log``: ``compute_wfns_fi`` names its ``log_fn`` seam ``log``.
+logger = get_logger(__name__)
 
 
 #: Per-process cache of this module's small epilogue jits (``newton_inv`` and
@@ -287,17 +291,26 @@ def resolve_conduction_window(enk_sigma, *, nb_window: int, nval_in: int,
         np.asarray(enk_sigma).T, b_min, b_max, tol_ry=tol_ry, mode=mode,
         where="exciton_bands htransform conduction window", log=log_fn)
     if n_guard < 4:
-        log_fn(f"  [warn] only {n_guard} conduction guard band(s) above the "
-               f"BSE selection — a selection boundary near a Kramers pair can "
-               f"ring off-grid; widen the input's ncond/nband (>= {b_max + 4} "
-               f"bands).")
+        logger.warning(
+            f"only {n_guard} conduction guard band(s) above the BSE selection",
+            extra=message(
+                id="bse_guard_bands_few",
+                found=("conduction guard bands", n_guard),
+                needs="at least 4: a selection boundary near a Kramers pair "
+                      "can ring off-grid",
+                fix=f"widen the input's ncond/nband (>= {b_max + 4} bands)"))
     if n_guard > 16:
-        log_fn(f"  [warn] htransform fH spans {nb_window} bands with {n_guard} "
-               f"conduction guards above the BSE window — a LARGE interp "
-               f"window is not automatically more accurate.  Check the "
-               f"mandatory all-coarse transformed-energy receipt and this "
-               f"driver's on-grid energy gate; keep nband just above the BSE "
-               f"window unless both remain controlled.")
+        logger.warning(
+            f"htransform fH spans {nb_window} bands with {n_guard} "
+            f"conduction guards above the BSE window",
+            extra=message(
+                id="bse_guard_bands_many",
+                found=("conduction guard bands", n_guard),
+                needs="a window no wider than 16 guards: a LARGE interp "
+                      "window is not automatically more accurate",
+                fix="keep nband just above the BSE window unless both the "
+                    "all-coarse transformed-energy receipt and this driver's "
+                    "on-grid energy gate remain controlled"))
     log_fn(f"  full-band htransform: fH over {nb_window} bands "
            f"({int(nval_in)}v + {nb_window - int(nval_in)}c); BSE conduction "
            f"[{b_min},{b_max}) = {int(n_cond)} band(s) + {n_guard} guard(s)")

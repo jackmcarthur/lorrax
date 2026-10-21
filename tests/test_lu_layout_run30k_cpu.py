@@ -33,11 +33,12 @@ def test_one_tile_below_the_relabel_bound_on_2x2():
     assert cm.lu_blocks(312, 2, 2) == (156, 156)
 
 
-def test_the_lu_layout_is_announced_once_per_program(capsys, monkeypatch):
+def test_the_lu_layout_is_announced_once_per_program(caplog, monkeypatch):
+    caplog.set_level("DEBUG", logger="lorrax")      # a DEBUG diagnostic of lorrax.distrib_la
     mesh = types.SimpleNamespace(shape={"x": P, "y": P}, devices=np.empty((P, P)))
     monkeypatch.setattr(cm, "_validate_mesh", lambda m: (P, P))
     cm._announce_lu("solve_lu", mesh, 1, N, N, 250, 250, 250, 250)
-    out = capsys.readouterr().out
+    out = caplog.text
     assert "A mb 250 nb 250 (relabeled block-cyclic)" in out and "30 RHS block(s) per rank" in out
 
 

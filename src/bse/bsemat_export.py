@@ -36,6 +36,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 import common.timing as timing
 from . import bsemat_algebra as A
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 EIGHT_PI = 8.0 * np.pi
 #: BerkeleyGW ``nrtype.f90``: ``ncell`` (fullbz's Wigner–Seitz scan) and TOL_Small.
@@ -46,8 +49,7 @@ ENERGY_MATCH_TOL_RY = 2.0e-3
 
 
 def _log(msg):
-    if jax.process_index() == 0:
-        print(msg, flush=True)
+    log.info(msg)
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,10 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 
 if TYPE_CHECKING:                       # pragma: no cover — typing only
@@ -786,13 +790,12 @@ def _compute_V_q_g_flat_tiles(
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:
-        print(f"  V_q g-flat [{label}]: n_q_ibz={n_q_ibz}, "
+        log.debug(f"  V_q g-flat [{label}]: n_q_ibz={n_q_ibz}, "
               f"ngkmax={ngkmax}, g_chunk={g_chunk} ({n_chunks}/q), "
               f"n_rmu per ζ {[int(ld.n_rmu) for ld in loaders]}→{mu_pad}, "
               f"{len(specs)} V tile(s), "
-              f"storage={'q-IBZ' if use_ibz else 'full-BZ'}",
-              flush=True)
-        print(f"  V_q plan [{label}]: q_tile={q_tile} "
+              f"storage={'q-IBZ' if use_ibz else 'full-BZ'}")
+        log.debug(f"  V_q plan [{label}]: q_tile={q_tile} "
               f"({n_tiles} tile(s)), priced {priced['priced'] / 1e9:.2f} GB/rank "
               f"= resident {priced['resident'] / 1e9:.2f} + "
               f"{q_tile}×{priced['per_q'] / 1e9:.3f} ζ/q + faces/panels "
@@ -800,8 +803,7 @@ def _compute_V_q_g_flat_tiles(
               + (f"budget {budget / 1e9:.2f} GB; " if budget is not None else
                  "q rows and panels within the fixed tile; ")
               + f"host read staging {priced['host_staged'] / 1e9:.2f} of "
-              f"{host_budget / 1e9:.2f} GB/rank",
-              flush=True)
+              f"{host_budget / 1e9:.2f} GB/rank")
 
     # ---- Accumulators ---------------------------------------------------
     V_sh = NamedSharding(mesh_xy, P(None, 'x', 'y'))
@@ -931,14 +933,14 @@ def _compute_V_q_g_flat_tiles(
             _kernel_total += _t.perf_counter() - _t1
             del zt
             if verbose and jax.process_index() == 0:
-                print(f"    [{label}] q-tile {t + 1}/{n_tiles} "
+                log.debug(f"    [{label}] q-tile {t + 1}/{n_tiles} "
                       f"(q {q0}..{q0 + qn - 1}): read={_t1 - _t0:.2f}s "
                       f"kernel={_t.perf_counter() - _t1:.2f}s "
-                      f"({(_t.perf_counter() - _t1) / qn:.3f}s/q)", flush=True)
+                      f"({(_t.perf_counter() - _t1) / qn:.3f}s/q)")
         if verbose and jax.process_index() == 0:
-            print(f"    [{label}] {n_q_ibz} IBZ q in {n_tiles} tile(s): "
+            log.debug(f"    [{label}] {n_q_ibz} IBZ q in {n_tiles} tile(s): "
                   f"read={_read_total:.2f}s kernel={_kernel_total:.2f}s "
-                  f"({_kernel_total / max(1, n_q_ibz):.3f}s/q)", flush=True)
+                  f"({_kernel_total / max(1, n_q_ibz):.3f}s/q)")
 
     out = []
     for s in specs:
@@ -1354,20 +1356,18 @@ def compute_head_channel_zeta(
         eta = np.zeros_like(np.asarray(table.v_bare))
         eta[live] = (np.asarray(table.v_avg)[live]
                      / np.asarray(table.v_bare)[live] - 1.0)
-        print(f"  head channel: {int((table.mult > 0).sum())}/{n_q_ibz} IBZ q "
+        log.debug(f"  head channel: {int((table.mult > 0).sum())}/{n_q_ibz} IBZ q "
               f"carry a head slot, k={int(table.sel.shape[1])}, "
               f"tie histogram="
-              f"{dict(zip(*[c.tolist() for c in np.unique(table.mult, return_counts=True)]))}",
-              flush=True)
+              f"{dict(zip(*[c.tolist() for c in np.unique(table.mult, return_counts=True)]))}")
         # Per-shell eta, printed as data rather than summarised: it is the
         # ONE input the whole rescale is a function of, it is directly
         # comparable to BerkeleyGW's own vcoul dumps, and a run whose log
         # carries it can be audited without re-running anything.
         for qi in np.nonzero(live)[0]:
-            print(f"    head slot q[{qi}] |q+G|^2={float(table.len2[qi]):.6f} "
+            log.debug(f"    head slot q[{qi}] |q+G|^2={float(table.len2[qi]):.6f} "
                   f"mult={int(table.mult[qi])} v_c={float(table.v_bare[qi]):.6f} "
-                  f"<v>={float(table.v_avg[qi]):.6f} eta={eta[qi]:.6f}",
-                  flush=True)
+                  f"<v>={float(table.v_avg[qi]):.6f} eta={eta[qi]:.6f}")
     return g_head, table, full_to_irr_idx
 
 

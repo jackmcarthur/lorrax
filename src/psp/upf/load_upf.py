@@ -8,6 +8,10 @@ from xsdata.formats.dataclass.parsers import XmlParser
 from xsdata.formats.dataclass.parsers.config import ParserConfig
 import xml.etree.ElementTree as ET
 
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 def detect_version(upf_path: str | Path) -> str:
 	# Decide schema by inspecting the root tag
@@ -165,9 +169,9 @@ def _brief_value(value):
 
 def _print_dataclass_tree(obj, name='root', indent='', depth=0, max_depth=5, list_limit=5):
 	cls_name = type(obj).__name__
-	print(f"{indent}{name}: {cls_name}")
+	log.info(f"{indent}{name}: {cls_name}")
 	if depth >= max_depth:
-		print(f"{indent}  ... (max depth {max_depth} reached)")
+		log.info(f"{indent}  ... (max depth {max_depth} reached)")
 		return
 	for f in fields(obj):
 		value = getattr(obj, f.name)
@@ -176,18 +180,18 @@ def _print_dataclass_tree(obj, name='root', indent='', depth=0, max_depth=5, lis
 			_print_dataclass_tree(value, name=child_name, indent=indent + '  ', depth=depth + 1, max_depth=max_depth, list_limit=list_limit)
 		elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
 			length = len(value)
-			print(f"{indent}  {child_name}: list(len={length})")
+			log.info(f"{indent}  {child_name}: list(len={length})")
 			show = min(length, list_limit)
 			for i in range(show):
 				item = value[i]
 				if is_dataclass(item):
 					_print_dataclass_tree(item, name=f'[{i}]', indent=indent + '    ', depth=depth + 1, max_depth=max_depth, list_limit=list_limit)
 				else:
-					print(f"{indent}    [{i}]: {_brief_value(item)}")
+					log.info(f"{indent}    [{i}]: {_brief_value(item)}")
 			if length > show:
-				print(f"{indent}    ... (+{length - show} more)")
+				log.info(f"{indent}    ... (+{length - show} more)")
 		else:
-			print(f"{indent}  {child_name}: {_brief_value(value)}")
+			log.info(f"{indent}  {child_name}: {_brief_value(value)}")
 
 
 def print_dataclass_tree(obj, max_depth=5, list_limit=5):
@@ -208,13 +212,13 @@ def main(argv=None):
 	pseudo_arg = "tests/cohsex_prod/Mo_ONCV_PBE_FR-1.0.upf" #argv[0]
 	pseudo_path = os.path.abspath(pseudo_arg)
 	if not os.path.isfile(pseudo_path):
-		print(f'Error: file not found: {pseudo_arg}')
+		log.error(f'Error: file not found: {pseudo_arg}')
 		return 1
 	obj = load_upf(pseudo_path)
 	if use_numpy:
 		from psp.upf.normalize import normalize_dataclass
 		obj = normalize_dataclass(obj)
-	print(f"Loaded: {os.path.basename(pseudo_path)} -> {type(obj).__name__}")
+	log.info(f"Loaded: {os.path.basename(pseudo_path)} -> {type(obj).__name__}")
 	# convert D_ij to square array
 	n_proj = obj.pp_header.number_of_proj
 	obj.pp_nonlocal.pp_dij.value = obj.pp_nonlocal.pp_dij.value.reshape(n_proj, n_proj)

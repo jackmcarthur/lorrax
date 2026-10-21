@@ -48,7 +48,8 @@ def test_price_terms_and_ranks():
     assert both.terms()["vendor"] == 2e9 and both.bytes() == 7e9
 
 
-def test_a_stage_prices_the_sum_of_its_parts_and_prints_one_receipt(calibrate, capsys):
+def test_a_stage_prices_the_sum_of_its_parts_and_logs_one_receipt(calibrate, caplog):
+    caplog.set_level("DEBUG", logger="lorrax")      # receipts are DEBUG lines with a sidecar record
     jnp.zeros(4).block_until_ready()                  # the backend is up
     memory.book(memory.priced(32 * MB, "model"), stage="t.stage")
     memory.book(memory.priced(16 * MB, "model"), stage="t.stage")     # same part: the larger
@@ -56,8 +57,14 @@ def test_a_stage_prices_the_sum_of_its_parts_and_prints_one_receipt(calibrate, c
     with timing.section("t.outer"):
         with timing.section("t.stage"):
             x = jnp.ones((16 * MB,), jnp.uint8).block_until_ready()
-    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("memory t.stage:")]
-    assert len(lines) == 1 and "priced 0.07 GB" in lines[0] and "| measured live " in lines[0]
+    receipts = [r for r in caplog.records if r.getMessage().startswith("memory t.stage:")]
+    assert len(receipts) == 1 and receipts[0].levelname == "DEBUG"
+    line = receipts[0].getMessage()
+    assert "priced 0.07 GB" in line and "| measured live " in line
+    fields = receipts[0].lorrax                    # the sidecar record: the numbers, in bytes
+    assert fields["record_key"] == "memory.receipts"
+    assert fields["record"]["stage"] == "t.stage" and "operands_bytes" in fields["record"]
+    assert fields["record"]["priced_bytes"] == 64 * MB and fields["record"]["measured_bytes"] >= 16 * MB
     (row,) = memory.receipts()
     assert row["measured"] >= 16 * MB and memory.findings() == []
     del x
@@ -159,14 +166,17 @@ def test_enforced_limit_only_for_bfc(monkeypatch):
     assert memory.enforced(stats)
 
 
-def test_fastest_that_fits_prints_once(capsys):
+def test_fastest_that_fits_logs_once(caplog):
+    caplog.set_level("DEBUG", logger="lorrax")
     for _ in range(3):
         assert memory.admit("W Dyson 8 x 64^2", (("local", P(1 * GB, "t")),
                                                  ("distributed", P(0, "t"))), 30 * GB) == "local"
     assert memory.admit("s", (("local", P(40 * GB, "t")), ("mesh", P(4 * GB, "t"))), 30 * GB,
                         detail=True)["route"] == "mesh"
-    out = [line for line in capsys.readouterr().out.splitlines() if "route " in line]
-    assert out == ["  route W Dyson 8 x 64^2: local (1.00 GB/rank of room 30.00 GB)"]
+    out = [r for r in caplog.records if "route " in r.getMessage()]
+    assert [r.getMessage() for r in out] == ["  route W Dyson 8 x 64^2: local (1.00 GB/rank of room 30.00 GB)"]
+    assert out[0].levelname == "DEBUG" and out[0].lorrax["record_key"] == "routes"
+    assert out[0].lorrax["record"]["route"] == "local"
     (row,) = memory.routes()
     assert row["count"] == 3 and row["warning"] is None
 
@@ -199,14 +209,17 @@ def test_lazy_price_probe_forced_quiet():
     assert len(memory.routes()) == n
 
 
-def test_report_lists_routes():
+def test_report_records_routes(caplog):
     from gw.production_report import GWProductionReport
+    caplog.set_level("DEBUG", logger="lorrax")
     for _ in range(2):
         memory.admit("W Dyson 8 x 64^2", (("local", P(1 * GB, "t")), ("d", P(0, "t"))), 30 * GB)
-    lines = []
-    GWProductionReport._routes(NS(heading=lambda t: lines.append(f"== {t}"), emit=lines.append))
-    assert lines == ["== Routes",
-                     "  route W Dyson 8 x 64^2: local (1.00 GB/rank of room 30.00 GB) [x2]"]
+    GWProductionReport._record_routes()          # the sidecar's memory.routes, not a log block
+    (rec,) = [r for r in caplog.records
+              if getattr(r, "lorrax", {}).get("record_key") == "memory.routes"]
+    (route,) = [row for row in rec.lorrax["record"]["routes"] if row["site"] == "W Dyson 8 x 64^2"]
+    assert route["line"] == "route W Dyson 8 x 64^2: local (1.00 GB/rank of room 30.00 GB)"
+    assert route["count"] == 2
 
 
 def test_w_dyson_route(monkeypatch):

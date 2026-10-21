@@ -1,12 +1,24 @@
-"""Pure formatting helpers for the production centroid coordinate file."""
+"""Pure formatting helpers for the production centroid coordinate file and
+the ``kmeans.out`` main log (SETTINGS rows and the RESULTS block)."""
 
 from __future__ import annotations
 
 import math
 import os
 
-from common.report_blocks import devices_lines
-from common.timing import total as timing_total
+from common.preprocessing_output import results_lines
+from common.report_blocks import Setting
+from common.scientific_output import band_range
+
+#: The kmeans TIMING table: ``(label, timing sections...)``.
+KMEANS_STAGES = (
+    ("wavefunction setup", "setup.wfn_io"),
+    ("feature weight", "setup.weight"),
+    ("weighted k-means", "kmeans"),
+    ("orbit snap and unfold", "snap_unfold"),
+    ("Lloyd-state release", "release_before_prune"),
+    ("Gram and pivoted Cholesky", "prune"),
+)
 
 
 def validate_mode_policy(args) -> None:
@@ -179,98 +191,100 @@ def format_centroid_header(*, feature_fit: str, source_wfn: str,
     )
 
 
-def format_kmeans_report(*, header: str, source_wfn: str,
-                         centroid_file: str, report_file: str,
-                         wfn_backend: str, elapsed_s: float, runtime,
-                         timing_records,
-                         warnings=()) -> str:
-    """Compact scientific output for one completed centroid selection."""
-    timing_records = tuple(timing_records)
-    phase_rows = (
-        ("Wavefunction setup [setup.wfn_io]",
-         timing_total(timing_records, "setup.wfn_io")),
-        ("Feature metric [setup.weight]",
-         timing_total(timing_records, "setup.weight")),
-        ("Weighted k-means [kmeans]",
-         timing_total(timing_records, "kmeans")),
-        ("Orbit snap/unfold [snap_unfold]",
-         timing_total(timing_records, "snap_unfold")),
-        ("Lloyd-state release [release_before_prune]",
-         timing_total(timing_records, "release_before_prune")),
-        ("Gram and selection [prune]",
-         timing_total(timing_records, "prune")),
-    )
-    recorded_s = sum(seconds for _, seconds in phase_rows)
-    unattributed_s = float(elapsed_s) - recorded_s
+def _windows_text(left, right) -> str:
+    """0-based half-open band windows as 1-based bands: ``left 1-3 x right 1-7``."""
+    return (f"left {band_range(int(left[0]), int(left[1]))} x right "
+            f"{band_range(int(right[0]), int(right[1]))}")
 
-    def path_seconds(*path: str) -> float:
-        return sum(float(record["inclusive"]) for record in timing_records
-                   if tuple(record.get("path", ())) == path)
 
-    detail_rows = {
-        "Weighted k-means [kmeans]": (
-            ("  Initialization [kmeans/init]",
-             path_seconds("kmeans", "init")),
-            ("  Lloyd iterations [kmeans/lloyd]",
-             path_seconds("kmeans", "lloyd")),
-            ("  Final assignment [kmeans/assign_labels]",
-             path_seconds("kmeans", "assign_labels")),
-        ),
-        "Gram and selection [prune]": (
-            ("  Gram build [prune/prune.gram]",
-             path_seconds("prune", "prune.gram")),
-            ("  Block selection [prune/prune.select]",
-             path_seconds("prune", "prune.select")),
-        ),
-    }
-    timing_lines = []
-    for label, seconds in phase_rows:
-        timing_lines.append(f"{label:<40}: {seconds:.3f} s")
-        timing_lines.extend(
-            f"{detail_label:<40}: {detail_seconds:.3f} s"
-            for detail_label, detail_seconds in detail_rows.get(label, ()))
-    lines = [
-        "=" * 78,
-        "LORRAX ISDF CENTROID SELECTION",
-        "=" * 78,
-        "",
-        "DEVICES",
-        "-------",
-        *devices_lines(runtime.facts, mesh_role="centroid selection"),
-        "",
-        "NUMERICAL ENVIRONMENT",
-        "---------------------",
-        f"Wavefunctions  : {wfn_backend} reader",
-        "Selection      : feature-weighted k-means on the real-space FFT grid",
-        "",
-        "CENTROID PROVENANCE",
-        "-------------------",
-        *header.splitlines(),
-        "",
-        "FILES",
-        "-----",
-        f"Source WFN     : {os.path.abspath(source_wfn)}",
-        f"Centroids      : {os.path.abspath(centroid_file)}",
-        f"Report         : {os.path.abspath(report_file)}",
-        "",
-        "TIMING (POST-STARTUP)",
-        "---------------------",
-        *timing_lines,
-        f"{'Other selection work':<40}: {unattributed_s:.3f} s",
-        f"Selection wall : {float(elapsed_s):.3f} s",
+def kmeans_settings_rows(args, *, source) -> list:
+    """The kmeans SETTINGS rows from the parsed command line; ``source(*flags)``
+    says whether a flag was given (``ProductionReport.flag_source``)."""
+    oversample = float(args.oversample)
+    n_c = int(args.N_c)
+    m_cand = int(math.ceil(n_c * oversample)) if oversample > 1.0 else n_c
+    current = args.density_mode == "current"
+    rows = [
+        Setting("N_c", str(n_c), "cli" if n_c != 400 else "default",
+                "point budget: the centroids requested"),
+        Setting("oversample", f"{oversample:g}", source("--oversample"),
+                f"{m_cand} k-means candidates, pruned by pivoted Cholesky"
+                if oversample > 1.0 else "no pivoted-Cholesky pruning"),
+        Setting("density_mode", str(args.density_mode), source("--density-mode"),
+                "transverse current Gram (gamma^{1,2,3} ISDF)" if current
+                else "charge Gram (gamma^0 ISDF)"),
+        Setting("seed", str(int(args.seed)), source("--seed"),
+                "k-means start; same seed and ranks, same points"),
     ]
-    retained = [" ".join(str(item).split()) for item in warnings if str(item).strip()]
-    if retained:
-        lines.extend(["", "WARNINGS", "--------"])
-        lines.extend(f"  {item}" for item in retained)
-    lines.append("LORRAX ISDF centroid selection completed.")
-    return "\n".join(lines) + "\n"
+    if float(args.rho_power) != 1.0:
+        rows.append(Setting("rho_power", f"{float(args.rho_power):g}", "cli",
+                            "centroid density ~ w^(0.6 alpha)"))
+    if args.fit_window is not None:
+        rows.append(Setting("fit_window", str(args.fit_window), "cli",
+                            "left,right band windows, 0-based, half-open"))
+    else:
+        rows.append(Setting("prune_window", str(args.prune_window),
+                            source("--prune-window"),
+                            "pair-density windows of the weight and the Gram"))
+    rows.append(Setting("symmetry closure",
+                        "off" if args.no_orbit else "orbits",
+                        "cli" if (args.no_orbit or args.orbit) else "default",
+                        "literal points" if args.no_orbit else
+                        "whole orbits of the decorated-atom space group"))
+    return rows
+
+
+def rank_text(*, prune_rank, written: int, pool: int, unpicked) -> str:
+    """What the pivoted Cholesky measured, in one row value."""
+    if prune_rank is None:
+        return "not measured (no pivoted-Cholesky pruning)"
+    if unpicked is not None and float(unpicked) <= 1.0:
+        return (f"at least {int(prune_rank)} (pool spent: largest unpicked residual "
+                f"{float(unpicked):.3g} x the floor); {int(prune_rank)} of "
+                f"{int(written)} points are independent directions")
+    return (f"NOT established: the point budget stopped the select at "
+            f"{int(written)} points of the {int(pool)}-point pool (largest "
+            f"unpicked residual {float(unpicked):.3g} x the floor); "
+            f"{int(prune_rank)} kept pivots")
+
+
+def kmeans_results_lines(*, requested: int, candidates: int, pool: int,
+                         written: int, out_file: str, orbit_aware: bool,
+                         n_sym: int, windows, window_label: str,
+                         density_mode: str, prune_rank, unpicked,
+                         rank_law=None) -> list[str]:
+    """The kmeans RESULTS block: what was written, the selection funnel, the
+    orbit closure, the sampling metric and the measured pair-space rank."""
+    left, right = windows
+    metric = ("transverse current" if density_mode == "current" else "charge")
+    rows = [
+        ("centroids", f"{int(written)} written to {os.path.basename(str(out_file))} "
+                      f"({int(requested)} requested)"),
+        ("selection", f"{int(requested)} requested -> {int(candidates)} k-means "
+                      f"candidates -> {int(pool)}-point pool -> {int(written)} written"),
+        ("orbit closure", f"whole orbits of {int(n_sym)} spatial operations "
+                          "(decorated atoms); snapped to the FFT grid"
+                          if orbit_aware else "literal points; snapped to the FFT grid"),
+        ("sampling metric", f"sqrt(diag q=0 {metric} Gram) on "
+                            f"{_windows_text(left, right)} ({window_label}), "
+                            "unit band weights"),
+        ("pair-space rank", rank_text(prune_rank=prune_rank, written=written,
+                                      pool=pool, unpicked=unpicked)),
+    ]
+    if rank_law is not None:
+        n_mu, L, B, _ = rank_law
+        rows.append(("rank law", f"N_mu(1 meV RMS Sigma_x) ~ {n_mu:.0f} at L={L:g}, "
+                                 f"B={B:g}; written/estimate {int(written) / n_mu:.2f}"))
+    return results_lines(rows)
 
 
 __all__ = [
     "CentroidRankNotEstablished",
     "format_centroid_header",
-    "format_kmeans_report",
+    "KMEANS_STAGES",
+    "kmeans_results_lines",
+    "kmeans_settings_rows",
+    "rank_text",
     "pool_rank_warning",
     "prune_band_ranges",
     "rank_law_estimate",

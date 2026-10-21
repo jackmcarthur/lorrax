@@ -37,6 +37,8 @@ from gw.gw_config import (
     resolve_distrib_la_batched_route,
     resolve_eigh_backend,
 )
+from common.log import get_logger, message
+from common.preprocessing_output import StageSequence
 from runtime.run_session import RunSession
 from .production_report import HTransformProductionReport
 from .fh_interp import (
@@ -51,6 +53,9 @@ from .fh_interp import (                                             # noqa: F40
     resolve_extra_rank_pad, resolve_local_vbm_index, select_active_eigenpairs,
     validate_centroid_subset_idx,
 )
+
+# ``logger``, not ``log``: the functions below name their report sink ``log``.
+logger = get_logger(__name__)
 
 
 def plot_bands(result):
@@ -394,6 +399,22 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
                 fh.write(f"{ik:4d} {ib:4d} {kx: .8f} {ky: .8f} {kz: .8f} {s_coord: .8f} {energies[ik, ib]: .8f}\n")
 
 
+class _BasisStateLog:
+    """A ``log`` sink that forwards every call and notes what happened to the
+    Galerkin basis file, from the one ``[galerkin-basis]`` line
+    ``initialize_wfns`` prints per branch, for the OUTPUT FILES row."""
+
+    def __init__(self, log):
+        self._log, self.state = log, "read"
+
+    def __call__(self, *args, **kwargs):
+        text = " ".join(str(x) for x in args)
+        if "[galerkin-basis]" in text:
+            self.state = ("read" if "REUSED" in text else "written" if "published" in text
+                          else "refit in memory" if "REFIT" in text else self.state)
+        return self._log(*args, **kwargs)
+
+
 def main(argv=None):
     parser = add_band_character_arguments(argparse.ArgumentParser(
         allow_abbrev=False, description="Hamiltonian interpolation driver"))
@@ -436,7 +457,7 @@ def main(argv=None):
     output_path = _output_path(args.output_file)
     report_path = _output_path(args.report_file)
     with RunSession(RUNTIME, "htransform", HTransformProductionReport,
-                    report_path) as run:
+                    report_path) as run, StageSequence(3) as stages:
         report = run.report
         log = report.legacy_print
         if args.qp_rotations:
@@ -499,22 +520,19 @@ def main(argv=None):
         from common import sanity
 
         from common.progress import LoopProgress
-        _setup_progress = LoopProgress(
-            1, report.progress, title="wavefunction and Galerkin setup",
-            item_name="stage", max_updates=1).start()
+        report.sampling(wfn=wfn, sym=sym)
+        stages.begin(1, "Wavefunctions and Galerkin basis", name="htransform.setup")
         _centroid_records = []
         _rank_records = []
         with timing.section("initialize_wfns"):
             wfn, sym, meta, mesh_xy, basis, enk_sigma = initialize_wfns(
-                args.input, params, log, args.eqp_file,
+                args.input, params, (_basis_log := _BasisStateLog(log)), args.eqp_file,
                 mesh_xy=mesh_xy, wfn_sym=(wfn, sym),
                 n_guard_bands=args.guard_bands,
                 centroid_record_fn=_centroid_records.append,
                 rank_record_fn=_rank_records.append,
                 require_all_occupied=True,
                 basis_path=GALERKIN_BASIS_FILE)
-        _setup_progress.step()
-        _setup_progress.finish()
         ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
         qp_corrected_band_range = None
         if _qp_rotations_path is not None:
@@ -568,11 +586,16 @@ def main(argv=None):
             raise RuntimeError(
                 "htransform initialize_wfns did not return exactly one Galerkin "
                 f"rank record; got {len(_rank_records)}.")
-        report.sampling(
-            wfn=wfn, sym=sym, centroids=_centroid_records[0])
-        _transform_progress = LoopProgress(
-            1, report.progress, title="fH construction and path solution",
-            item_name="stage", max_updates=1).start()
+        _centroid_path = params.get("centroids_file", "centroids_frac.txt")
+        _centroid_path = (_centroid_path if os.path.isabs(_centroid_path) else
+                          os.path.join(input_dir, _centroid_path))
+        report.setup_rows(centroid_file=_centroid_path,
+                          centroids=_centroid_records[0], n_rmu=int(meta.n_rmu),
+                          rank_record=_rank_records[0])
+        stages.result(f"Galerkin basis of rank {int(ctilde.shape[2])} on "
+                      f"{int(meta.nkx) * int(meta.nky) * int(meta.nkz)} coarse k")
+        stages.begin(2, "Hamiltonian interpolation along the k path",
+                     name="htransform.transform")
         _quality_records = []
         with timing.section("h_transform"):
             result = h_transform(meta, ctilde, enk_sigma, wfn, kpath_data, log, mesh_xy,
@@ -584,28 +607,16 @@ def main(argv=None):
                                  quality_record_fn=_quality_records.append,
                                  sym=sym, return_coeffs=bool(args.color),
                                  B_at_mu=B_at_mu)
-        _transform_progress.step()
-        _transform_progress.finish()
-
-        _centroid_path = params.get("centroids_file", "centroids_frac.txt")
-        _centroid_path = (_centroid_path if os.path.isabs(_centroid_path) else
-                          os.path.join(input_dir, _centroid_path))
-        report.interpolation_space(
-            params=params, wfn=wfn, meta=meta, result=result,
-            enk_sigma_ry=enk_sigma, ctilde=ctilde,
-            centroid_file=_centroid_path, energy_source=_energy_source,
-            centroids=_centroid_records[0])
-        report.spectral_compression(
-            _rank_records[0], title="Spectral compression and validation")
         if len(_quality_records) != 1:
             raise RuntimeError(
                 "htransform returned "
                 f"{len(_quality_records)} interpolation-quality receipts; "
                 "expected one")
-        report.htransform_quality(
-            _quality_records[0],
-            title="Real-space locality and interpolation risk")
-        report.path_summary(result=result)
+        report.transform_rows(result=result, quality_record=_quality_records[0])
+        stages.result(f"{int(result['nb_keep'])} bands at "
+                      f"{len(result['kpath_data'][1] if result['kpath_data'][1] is not None else ())}"
+                      " path points")
+        stages.begin(3, "Outputs", name="htransform.outputs")
 
         # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
         # Driven by ``get_centroids_fi`` + ``kgrid_fi`` + ``wfn_fi_{min,max}``;
@@ -623,17 +634,22 @@ def main(argv=None):
             # have to change, so the refusal is not the first news of it.
             _n_guard = int(ctilde.shape[1]) - b_max
             if _n_guard < 4:
-                log(f"  [warn] wfn_fi_max={b_max} leaves only {_n_guard} guard "
+                logger.warning(
+                    f"wfn_fi_max={b_max} leaves only {_n_guard} guard "
                     f"band(s) below the top of the htransform window "
                     f"({int(ctilde.shape[1])} bands)"
                     + (" — this is the ZERO-GUARD default (wfn_fi_max unset "
                        "means 'the whole window')" if not
-                       int(params["wfn_fi_max"]) else "")
-                    + f".  f(eps) is identically zero at and above "
-                    f"max_k eps of the window's own top band, so the top of what "
-                    f"you are asking BACK may be an arbitrary direction out of "
-                    f"fH's null space.  Raise nband/ncond so the window extends "
-                    f"above wfn_fi_max; the f-shoulder gate decides.")
+                       int(params["wfn_fi_max"]) else ""),
+                    extra=message(
+                        id="htransform_guard_bands_few",
+                        found=("guard bands below the window top", _n_guard),
+                        needs="at least 4: f(eps) is identically zero at and "
+                              "above max_k eps of the window's own top band, "
+                              "so the top of what you ask back may be an "
+                              "arbitrary direction out of fH's null space",
+                        fix="raise nband/ncond so the window extends above "
+                            "wfn_fi_max; the f-shoulder gate decides"))
             with timing.section("wfns_fi"):
                 wfns_fi = compute_wfns_fi(
                     ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
@@ -688,6 +704,14 @@ def main(argv=None):
             )
         _write_progress.step()
         _write_progress.finish()
+        stages.result(f"{os.path.basename(output_path)} written"
+                      + (f" (+{len(_moment_files)} band-character files)"
+                         if _moment_files else ""))
+        stages.end()
+        report.results(result=result, enk_sigma_ry=enk_sigma,
+                       n_val=int(params["nval"]), energy_source=_energy_source,
+                       written=os.path.basename(output_path)
+                       + " (band, k, energy in eV on the path)")
 
         # ── Outputs barrier, then CLOSE THE LOADER EXPLICITLY ─────────────
         # The block above is rank-0-only, so without this barrier the other
@@ -727,7 +751,7 @@ def main(argv=None):
             ("input deck", "read", args.input),
             ("DFT wavefunctions", "read", _wfn_path),
             ("ISDF centroids", "read", _centroid_path),
-            ("Galerkin basis", "read or published",
+            ("Galerkin basis", _basis_log.state,
              os.path.join(input_dir, GALERKIN_BASIS_FILE)),
         ]
         if args.eqp_file:

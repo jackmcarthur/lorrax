@@ -192,6 +192,7 @@ DOWNFOLD_DEFAULTS = {
     # is the stage-1 default because nobody has yet measured what eps_W a
     # good downfold has on a production deck.  Set it once you know.
     "residual_refuse_above": None,
+    "verbose": False,   # read by runtime.read_verbose_switches; declared so it is not refused
 }
 
 #: Keys whose value is lower-cased and stripped before coercion.

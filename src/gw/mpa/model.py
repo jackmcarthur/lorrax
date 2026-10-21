@@ -10,6 +10,10 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 from ffi import _services
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 _services.ensure_on_path()
 import minimax  # noqa: E402
@@ -216,7 +220,7 @@ def validate_reused_mpa_fit(
                 "logical band/quadrature span: "
                 f"stored_ceiling={stored_ceiling:.17g}, "
                 f"live_ceiling={live_ceiling:.17g}")
-        print_fn(
+        log.debug(
             "  MPA screening reuse: stored frequency ceiling conservatively "
             f"covers live logical span ({stored_ceiling:.9g} >= "
             f"{live_ceiling:.9g} Ry).")
@@ -232,11 +236,11 @@ def validate_reused_mpa_fit(
             path, occupation_state, where="mpa_fit_reuse_file",
             compatible_occ_hashes=compatible_hashes)
         if occupation_match == "legacy_zero_pad":
-            print_fn(
+            log.debug(
                 "  MPA screening reuse: occupation provenance matched an "
                 "exact legacy square-mesh zero-pad encoding; physical "
                 f"occ_hash={occupation_state.occ_hash}.")
-    print_fn(
+    log.info(
         "  MPA screening reuse: certified finalized fit opened read-only: "
         f"{path} (n_q={ledger['n_q']}, n_mu={ledger['n_mu']}, "
         f"n_p={ledger['n_p']})")
@@ -268,7 +272,7 @@ def retain_iteration_artifacts(run_dir, label, *, print_fn=print):
         keep=iteration_artifact_paths(run_dir, label),
         barrier_tag=f"mpa.model.retain.{label}", print_fn=print_fn)
     if removed:
-        print_fn(f"  MPA scratch: retained {label}; discarded: "
+        log.debug(f"  MPA scratch: retained {label}; discarded: "
                  + ", ".join(removed))
 
 
@@ -579,7 +583,7 @@ def _solve_wc(
             config, sym, q_idx,
             head_channel, kgrid=meta.kgrid)
         bgw_vhead = bgw_q0shift_vhead(wfn, meta)
-        print_fn(
+        log.debug(
             "  [bgw q0 provenance] finite epsilon q0="
             f"{bgw_q0.q0_reduced}, full row={bgw_q0.requested_full_index}, "
             f"wedge row={bgw_q0.wedge_row} (representative full row "
@@ -653,7 +657,7 @@ def _solve_wc(
                 else complex(z_values[index]))
             head_samples.append(
                 bgw_q0shift_head_sample(bgw_vhead, eps_value, omega))
-            print_fn(
+            log.debug(
                 f"  [bgw q0] sample {index:02d}: z={omega!r}, "
                 f"epsinv_00(head+wings)={eps_value.real:.12e}"
                 + (f"{eps_value.imag:+.12e}j" if eps_value.imag else ""))
@@ -963,7 +967,7 @@ def _evaluate_samples(
 
         q_neg = q_negation_index(
             (int(meta.nkx), int(meta.nky), int(meta.nkz)))
-    print_fn(
+    log.debug(
         "  MPA chi0 orientation route: "
         + chi0_orientation_route(
             material_class, trs_allowed=trs_allowed)
@@ -1034,7 +1038,7 @@ def _evaluate_samples(
                 meta, mesh_xy, occupation_state=occupation_state,
                 kminq_rows=kminq_rows,
                 nb_logical=chi_band_stop(meta, wfns),
-                progress_fn=lambda q_done, q_total, elapsed: print_fn(
+                progress_fn=lambda q_done, q_total, elapsed: log.debug(
                     "  MPA direct chi0 shifted-origin q row "
                     f"{q_done}/{q_total} complete in {elapsed:.3f} s"),
                 ordered=metal_physical)
@@ -1189,7 +1193,7 @@ def build_mpa_fit(
         overwrite_completed=config.mpa.overwrite_completed_artifacts,
     )
     if protected_fit is not None:
-        print_fn(
+        log.info(
             "  MPA destructive regeneration was explicitly requested for "
             f"the finalized fit store {protected_fit}.")
     varpi = np.unique(z_all.imag)
@@ -1250,7 +1254,7 @@ def build_mpa_fit(
     }
     resumed_slabs = sum(int(bits.sum()) for bits in ready.values())
     if resumed_slabs:
-        print_fn(
+        log.info(
             f"  MPA sample resume: preserving {resumed_slabs} ready "
             "component-frequency slabs; chi and Wc readiness are independent.")
 
@@ -1425,7 +1429,7 @@ def build_mpa_fit(
             fit_path, certification=report["certification"],
             require_head=True)
     barrier("mpa_body_and_head_finalized")
-    print_fn(fit_driver.format_cost_report(report))
+    log.info(fit_driver.format_cost_report(report))
     return fit_path, iteration_head
 
 

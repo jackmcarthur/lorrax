@@ -38,6 +38,9 @@ import common.timing as timing
 from common.units import RYD_TO_EV
 from .bse_io import (load_bse_data_from_restart_sharded, make_w_densifier, pad_zone_mask_np)
 from file_io.restart_bundle import (_find_restart_file)
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 jax.config.update("jax_enable_x64", True)
 
@@ -974,9 +977,9 @@ def run_feast_ritz(
             is_last = (it == feast_iter - 1)
             n_quad_it = quad_schedule[it]
             if use_tda:
-                print(f"\n  {window.name} FEAST iteration {it+1}/{feast_iter} (n_quad={n_quad_it})")
+                log.info(f"\n  {window.name} FEAST iteration {it+1}/{feast_iter} (n_quad={n_quad_it})")
             else:
-                print(f"\n  {window.name} FEAST iteration {it+1}/{feast_iter} (n_quad={n_quad_it} x2 full contour)")
+                log.info(f"\n  {window.name} FEAST iteration {it+1}/{feast_iter} (n_quad={n_quad_it} x2 full contour)")
 
             if quadrature == "zolotarev":
                 if lambda_min_eV is None or lambda_max_eV is None:
@@ -1006,7 +1009,7 @@ def run_feast_ritz(
             it_max = int(jax.device_get(jnp.max(iters)))
             n_solves = n_ritz * n_quad_total
             total_matvecs = it_sum + n_solves  # 1 matvec per GMRES iter + 1 initial matvec per solve
-            print(
+            log.debug(
                 f"    GMRES: solves={n_solves}, total_iters={it_sum}, max_iters={it_max}, "
                 f"total_matvecs={total_matvecs}"
             )
@@ -1015,7 +1018,7 @@ def run_feast_ritz(
             if gmres_fp32:
                 filtered = [v.astype(jnp.complex128) for v in filtered]
 
-            print(f"  {window.name} Rayleigh-Ritz [{window.a_eV:.2f}, {window.b_eV:.2f}] eV:")
+            log.debug(f"  {window.name} Rayleigh-Ritz [{window.a_eV:.2f}, {window.b_eV:.2f}] eV:")
             ritz_result = _rayleigh_ritz(
                 matvec, filtered, data,
                 s_cutoff=s_cutoff,
@@ -1028,11 +1031,11 @@ def run_feast_ritz(
 
             s_max = float(ritz_result.s_evals.max()) if ritz_result.s_evals.size else 0.0
             eff_rank = int(np.sum(ritz_result.s_evals >= ritz_result.s_floor)) if s_max > 0 else 0
-            print(f"    overlap: max(S)={s_max:.3e}, s_floor={ritz_result.s_floor:.3e}, eff_rank={eff_rank}/{n_ritz}")
-            print(f"    Ritz values (eV) [{n_in} in-window / {n_ritz} total]:")
+            log.debug(f"    overlap: max(S)={s_max:.3e}, s_floor={ritz_result.s_floor:.3e}, eff_rank={eff_rank}/{n_ritz}")
+            log.info(f"    Ritz values (eV) [{n_in} in-window / {n_ritz} total]:")
             for i, (ev, rr, ok) in enumerate(zip(evals_eV, ritz_result.rel_residuals, in_window), start=1):
                 tag = "" if ok else " *"
-                print(f"      {i:2d}: {ev:12.6f}   relres={rr:9.2e}{tag}")
+                log.info(f"      {i:2d}: {ev:12.6f}   relres={rr:9.2e}{tag}")
 
             # Convergence check: max change from previous iteration.
             if prev_evals is not None:
@@ -1040,7 +1043,7 @@ def run_feast_ritz(
                 if n_cmp > 0:
                     delta = np.abs(ritz_result.ritz_evals[:n_cmp] - prev_evals[:n_cmp])
                     max_delta_eV = np.max(delta) * ry_to_ev
-                    print(f"    Max eigenvalue change: {max_delta_eV:.6e} eV")
+                    log.info(f"    Max eigenvalue change: {max_delta_eV:.6e} eV")
             prev_evals = ritz_result.ritz_evals.copy()
 
             # --- Prepare starting vectors for next iteration ---
@@ -1582,9 +1585,7 @@ def run(args) -> None:
         from common.jax_compile_cache import ensure_jax_compile_cache
         ensure_jax_compile_cache()
     except Exception as _e:
-        import jax as _jax_mod
-        if _jax_mod.process_index() == 0:
-            print(f"  [jax compile cache] skipped: {_e}", flush=True)
+        log.debug(f"  [jax compile cache] skipped: {_e}")
 
     # Omitted --px/--py = the run's canonical square mesh (create_mesh_2d),
     # not 1x1; a given shape must BE that mesh.  args.px/args.py are then
@@ -1687,20 +1688,20 @@ def run(args) -> None:
         include_W=not args.rpa,
         use_tda=use_tda,
     )
-    print(report)
+    log.info(report)
 
     # Diagnostic: count non-interacting transitions per window.
     diag_eV = bounds["diag_energies_ry"] * args.units_ev_per_ry
-    print(f"--- Diagonal (non-interacting) transition count ---")
-    print(f"BSE dimension: {len(diag_eV)}")
+    log.info(f"--- Diagonal (non-interacting) transition count ---")
+    log.info(f"BSE dimension: {len(diag_eV)}")
     for w in windows:
         count = int(np.sum((diag_eV >= w.a_eV) & (diag_eV <= w.b_eV)))
-        print(f"  {w.name} [{w.a_eV:.2f}, {w.b_eV:.2f}] eV: {count} diagonal elements")
+        log.info(f"  {w.name} [{w.a_eV:.2f}, {w.b_eV:.2f}] eV: {count} diagonal elements")
 
     if args.feast_ritz:
-        print("\n--- FEAST Ritz extraction ---")
+        log.info("\n--- FEAST Ritz extraction ---")
         n_quad_schedule = [args.n_quad1] + [args.n_quad2] * max(args.feast_iter - 1, 0)
-        print(
+        log.info(
             f"Quadrature: {args.quadrature}, "
             f"n_quad schedule: {' -> '.join(str(nq) for nq in n_quad_schedule)}, "
             f"gamma={ELLIPSE_GAMMA_FIXED:.2f}, "
@@ -1738,12 +1739,12 @@ def run(args) -> None:
             evals_eV = rr.ritz_evals * args.units_ev_per_ry
             in_window = (evals_eV >= w.a_eV) & (evals_eV <= w.b_eV)
             n_in = int(np.sum(in_window))
-            print(f"\n{name} Ritz values (eV) [{n_in} in-window / {rr.n_total} total]:")
+            log.info(f"\n{name} Ritz values (eV) [{n_in} in-window / {rr.n_total} total]:")
             for i, (ev, ok) in enumerate(zip(evals_eV, in_window), start=1):
                 tag = "" if ok else " *"
-                print(f"  {i:2d}: {ev:12.6f}{tag}")
+                log.info(f"  {i:2d}: {ev:12.6f}{tag}")
 
-    timing.report(print_fn=print, title="--- Timing ---")
+    timing.report(print_fn=log.info, title="--- Timing ---")
 
 
 

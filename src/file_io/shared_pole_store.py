@@ -23,6 +23,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from runtime.padding import combined_divisor, padded_axis, spec_divisor
 from common import timing
+from common.log import get_logger, record as log_record
 from common.collectives import (agree_io_error, device_put_process_local, device_put_process_local_cached,
                                 process_rank, psum_replicate,
                                 rank0_read, rank0_transaction)
@@ -30,6 +31,8 @@ from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import (agree_io_refusal, assert_committed, open_h5_settled,
                                   set_commit_state)
 from symmetry_maps import QirrTables, validate_qirr_tables
+
+log = get_logger(__name__)
 
 SCHEMA = "lorrax.shared-real-pole.v1"
 BANK_SCHEMA = "lorrax.shared-real-pole-bank.v3"
@@ -176,7 +179,9 @@ def _admit(ledger, stage, resident, workspace=0, *, host_payload=0,
     # turn; a part per admission summed them, 36 GB over).
     memory.book(replace(ledger.price(row), operands=memory.Term(), increment=True, label=f"store.{stage}"))
     if jax.process_index() == 0:
-        print("[shared_pole_store capacity] " + _json(dict(device=row, host=host)), flush=True)
+        _receipt = _json(dict(device=row, host=host))
+        log.debug("[shared_pole_store capacity] " + _receipt,
+                  extra=log_record("file_io.shared_pole_store_capacity", json=_receipt))
     return row
 
 

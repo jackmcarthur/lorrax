@@ -30,6 +30,7 @@ right path.
 """
 from __future__ import annotations
 
+import logging
 from functools import lru_cache, partial
 from typing import NamedTuple
 import numpy as np
@@ -43,6 +44,8 @@ from common.wfn_layout import (band_sphere_spec, PSI_NMU_SPEC, PSI_MUNT_SPEC,
                                PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC)
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from runtime.padding import spec_divisor
+
+_LOG = logging.getLogger("lorrax.psi_G_store")
 
 
 
@@ -282,7 +285,7 @@ class PsiGStore:
                 f"{len(self._coords)} addressable mesh cells")
         if jax.process_index() == 0:
             host_gb = self.host_cache_bytes / 1e9
-            print(f"  ψ(G-flat) host cache: {host_gb:.2f} GB/process resident")
+            _LOG.debug(f"  ψ(G-flat) host cache: {host_gb:.2f} GB/process resident")
 
     # ---------------------------------------------------------------------
     # Population — pulls from the WfnLoader, scatters into per-(x,y) tiles.

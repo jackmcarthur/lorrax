@@ -15,9 +15,12 @@ import dataclasses
 import math
 from typing import Optional
 
+from common.log import block, get_logger, record
 from gw import comm_model
 from runtime.padding import padded_axis
 from runtime.tiles import tile_units
+
+log = get_logger(__name__)
 
 
 _C128 = 16  # bytes per complex128
@@ -167,6 +170,25 @@ class MuBatchPlan:
         lines.append("    whole-fit volumes (GB/rank): " + ", ".join(
             f"{k} {v / 1e9:.1f}" for k, v in self.transfer.items()))
         return "\n".join(lines)
+
+
+def log_mubatch_plan(plan: "MuBatchPlan", *, summary: bool = False,
+                     fit: str | None = None) -> None:
+    """Log a route-G μ-batch plan: its table at DEBUG with its fields as the
+    ``isdf.mubatch_plan`` receipt, or with ``summary`` (the fit that runs the
+    plan already logged) one ``zeta plan`` row under the current stage of the
+    main log; ``fit`` names the fit when a run has two (``zeta plan (charge)``,
+    ``zeta plan (transverse)``)."""
+    if not summary:
+        fields = {f.name: getattr(plan, f.name)
+                  for f in dataclasses.fields(plan) if f.repr}
+        log.debug(plan.format(), extra=record("isdf.mubatch_plan", **fields))
+    else:
+        n_batch = int(plan.n_batch)
+        log.info(f"route G, {n_batch} batch{'es' if n_batch != 1 else ''} of "
+                 f"{int(plan.b)} centroids, Z store on the {plan.placement}, "
+                 f"est. {plan.hwm_bytes / 1e9:.2f} GB/dev",
+                 extra=block("isdf", label="zeta plan" + (f" ({fit})" if fit else "")))
 
 
 def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,

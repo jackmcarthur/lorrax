@@ -59,6 +59,9 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.band_degeneracy import resolve_band_window
 from common.units import RYD_TO_EV
+from common.log import get_logger
+
+log = get_logger(__name__)
 
 #: Relative Frobenius tolerance of the star relation on the artifact's
 #: ``H_QP(k)`` and on the restart's centroid band matrices.  Both are exact
@@ -120,7 +123,7 @@ def star_relation_residuals(M, parent, antiunitary):
 
 def qp_window_from_artifact(U, E, band_range, *, n_occ, n_val, n_cond,
                             degeneracy_mode, degeneracy_tol_ry,
-                            log=print):
+                            log=log.info):
     """The BSE window in QP order and its rotation columns.
 
     Parameters
@@ -195,7 +198,7 @@ def qp_window_from_artifact(U, E, band_range, *, n_occ, n_val, n_cond,
     }
 
 
-def certify_star_gauge(S, Sz, parent, antiunitary, *, where, log=print):
+def certify_star_gauge(S, Sz, parent, antiunitary, *, where, log=log.info):
     """Refuse a restart ψ whose star relation is not the artifact's.
 
     ``S``, ``Sz`` (nk, nb, nb): the centroid band matrices of 1 and σ_z over
@@ -255,7 +258,7 @@ def _rotate_block(psi_v, psi_c, u_val, u_cond, *, sharding):
     return rotate(u_val), rotate(u_cond)
 
 
-def rotate_window_psi(psi_v_src, psi_c_src, qp, mesh_xy, *, log=print):
+def rotate_window_psi(psi_v_src, psi_c_src, qp, mesh_xy, *, log=log.info):
     """ψ' of the QP window, eq. (2), after the star-gauge certificate.
 
     Parameters
@@ -289,6 +292,17 @@ def rotate_window_psi(psi_v_src, psi_c_src, qp, mesh_xy, *, log=print):
     return _rotate_block(
         psi_v_src, psi_c_src, u_val, u_cond,
         sharding=NamedSharding(mesh_xy, P(None, None, None, "x")))
+
+
+def summary_text(qp) -> str:
+    """One stage row of the QP-rotated basis (the full block,
+    :func:`report_lines`, goes to the JSON sidecar)."""
+    q0, q1 = qp["band_range"]
+    d = qp["diagnostics"]
+    gap = (np.min(qp["eps_c"]) - np.max(qp["eps_v"])) * RYD_TO_EV
+    return (f"{os.path.basename(str(qp['path']))}: DFT bands {int(q0) + 1}-{int(q1)} "
+            f"rotated whole, QP gap {gap:.4f} eV; cross-gap mixing theta_vc "
+            f"{d['theta_vc_max']:.4f}, theta_cv {d['theta_cv_max']:.4f}")
 
 
 def report_lines(qp):
@@ -375,7 +389,7 @@ def qp_window_dipoles(dipole_cart, delta_e, qp):
 
 def load_qp_rotation(restart_file, input_file, qp_rotations_file, *, header,
                      n_occ, n_val, n_cond, degeneracy_mode, degeneracy_tol_ry,
-                     log=print):
+                     log=log.info):
     """Read, authenticate and window one ``qp_wfn_rotations.h5`` for the BSE.
 
     Refuses: ``--eqp`` beside it, a QP WFN deck, a restart from another WFN

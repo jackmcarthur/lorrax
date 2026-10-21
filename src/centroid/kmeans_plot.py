@@ -15,6 +15,10 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
 
+from common.log import get_logger
+
+log = get_logger(__name__)
+
 
 def interpolate_density(rho_np: np.ndarray, zoom_factors=(1, 1, 1)) -> np.ndarray:
     """Bicubic upsample of ρ for smoother plots. Identity if zoom=1."""
@@ -84,4 +88,4 @@ def plot_density_and_centroids(
     ax.set_title("Charge density and centroids")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"saved {out}")
+    log.info(f"saved {out}")

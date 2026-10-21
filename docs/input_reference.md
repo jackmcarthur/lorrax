@@ -214,6 +214,7 @@ with `head_correction`, and a deck that names the key refuses at parse.
 | `wfn_file` | str | `WFN.h5` | BerkeleyGW-format wavefunction input. |
 | `kin_ion_file` | str | `kin_ion.h5` | T + V_loc + V_NL matrix. Hartree is built live ([contract](theory/hartree.md)). |
 | `report_file` | str | `gwjax.out` | Rank-0 human-readable report: architecture, backends, symmetry and IBZ, band windows, QP gap, paths, warnings and stage timings. A QSGW run adds one row per map and the terminal verdict. |
+| `verbose` | bool | `false` | `true` prints the internal diagnostics (DEBUG lines) in the report under each stage and in the rank logs, for every driver that reads this deck. The same switch as the command-line flag `--verbose` and `LORRAX_DEBUG_PRINT=1`. It changes no result; a few of the diagnostics it prints cost extra work. |
 | `sigma_diag_file` | str | `sigma_diag.dat` | Per-(k, n) Σ decomposition, LORRAX text format ([columns](how-to/berkeleygw-users.md#33-sigma_diagdat)). With band extrapolation on, a one-shot run appends `sigC_raw`, `eqp0_raw`, `eqp1_raw` after `Z`: Σ_c truncated at the Σ band count with no tail, the numbers BerkeleyGW's truncated sum compares with. SC runs write no raw columns. |
 | `eqp0_file` | str | `eqp0.dat` | BerkeleyGW-format zeroth-order QP energies. |
 | `eqp1_file` | str | `eqp1.dat` | BerkeleyGW-format Z-linearized QP energies (Z = 1 in static COHSEX). Z is 1/(1 − Re dΣ_c/dω) from the exact on-shell derivative (`eqp_bgw.on_shell_z_factor`: counts Z outside (0, 1], refuses a non-finite Z); under `sigma_omega_grid_debug = true`, from the ±0.5 eV central difference on the grid. |
@@ -295,6 +296,7 @@ choose each value.
 | `plan` | `auto` | `auto`/`distributed`: the one plan — every stack at `P(None,'x','y')`, the Gram streamed over its local columns and the transfer over q in fixed tiles; one device is its P = 1 case. `local` (the retired all-q plan) refuses. |
 | `report_residual` | `true` | Prints the per-q Pythagorean error bar ε_W (two GEMMs at μ_L per q). |
 | `residual_refuse_above` | unset | Refuses to write the bundle when the worst-q ε_W exceeds this value. It is a tripwire, not a meV guarantee. |
+| `verbose` | `false` | `true` prints the internal diagnostics (DEBUG lines) in the report and the rank logs; the same switch as `--verbose` and `LORRAX_DEBUG_PRINT=1`. It changes no result. |
 
 ## TD-aGW — the `tdgw.toml` deck {#td-agw}
 
@@ -439,3 +441,4 @@ and `--print-schema` prints them.
 | `q0_head` | `s_tensor` | ε⁻¹₀₀(q0): `s_tensor`, the direct head 1/(1 − v(q0) q0ᵀSq0) from the bundle's `S_cart_head`; `unscreened` writes 1 (debug). |
 | `q0_body_3d` | `refuse` | Only with `q0_wings = zero`: a `sys_dim = 3` `eps0mat` body then lacks the O(1) head–wing term ε_b0 ε_00⁻¹ ε_0b ([theory](theory/bgw_epsmat_export.md#5-q-0)). `refuse` stops before writing (`GATE epsmat_q0_body_3d`); `omit_head_wing` writes that body and records it in the receipt. Slab decks ignore it. |
 | `q0_wings` | `dipole` | The q → 0 wings of `eps0mat` ([theory](theory/bgw_epsmat_export.md#5-q-0), E9–E13). `dipole`: from the bundle's stored ω = 0 head wings `head_wing_L`/`head_wing_R` and `S_cart_head_direct` (written by `gw_jax` since 2026-10-18): local-field head 1/ε_M, both wings, and in 3D the body's head–wing term, so no `q0_body_3d` choice is needed; refuses a bundle without them (`GATE epsmat_q0_wings_source`) and one whose stored head is not their fold through the file's W(Γ) (`GATE epsmat_q0_wing_fold`). `zero`: wings 0 and the head from `S_cart_head` (the file before the wings). |
+| `verbose` | `false` | `true` prints the internal diagnostics (DEBUG lines) in the report and the rank logs; the same switch as `--verbose` and `LORRAX_DEBUG_PRINT=1`. It changes no result. |

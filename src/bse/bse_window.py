@@ -42,23 +42,22 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
 from common.collectives import gather_to_host
 from common.units import RYD_TO_EV
 from runtime.padding import pad_axis
+from common.log import get_logger, message
+
+log = get_logger(__name__)
+_LOGGER = log     # the module logger, where a ``log`` parameter shadows it
 
 
 def _log0(*a, **k):
-    """``print`` on process 0 only.
+    """Log a line at INFO.
 
-    The band-window guard emits a four-line block; every rank resolves the
-    same window from the same energies, so without this the warning arrives
-    64 times at P=64 and reads as 64 different problems.  ``band_degeneracy``
-    itself stays pure-numpy and jax-free, which is why the rank filter is
-    injected here rather than living in the guard.
+    The band-window guard emits a four-line block through this sink.  The
+    logging handlers know the rank (the main log is rank 0's, every rank keeps
+    its own rank log), so there is no rank test here.  ``band_degeneracy``
+    itself stays pure-numpy and jax-free, which is why the sink is injected
+    here rather than living in the guard.
     """
-    try:
-        first = jax.process_index() == 0
-    except Exception:
-        first = True
-    if first:
-        print(*a, **k)
+    log.info(" ".join(str(part) for part in a))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -420,9 +419,9 @@ def write_eigenvectors_stream(
             for key, value in (dipole_attrs or {}).items():
                 dset.attrs[key] = value
 
-    print(f"Wrote {n_write} eigenvectors to {output_file}"
-          + ("" if use_tda else " (+ coupling Y)")
-          + ("" if dipoles is None else " (+ per-state dipoles)"))
+    log.info(f"Wrote {n_write} eigenvectors to {output_file}"
+             + ("" if use_tda else " (+ coupling Y)")
+             + ("" if dipoles is None else " (+ per-state dipoles)"))
 
 
 
@@ -559,11 +558,21 @@ def resolve_n_occ(
                 w = WfnLoader(wfn_path)
                 return int(w.nelec)
             else:
-                print(f"  [resolve_n_occ] WFN.h5 not found at {wfn_path}; "
-                      "trying fermi_energy hint next.")
+                log.warning(f"  [resolve_n_occ] WFN.h5 not found at {wfn_path}; "
+                            "trying fermi_energy hint next.",
+                            extra=message(
+                                id="resolve_n_occ_wfn_missing",
+                                found=("WFN.h5", f"not found at {wfn_path}"),
+                                needs="the occupied-band count from WFN.h5",
+                                fix="set n_occ, or point wfn_file at an existing WFN.h5"))
         except Exception as e:
-            print(f"  [resolve_n_occ] WFN.h5 lookup failed "
-                  f"({type(e).__name__}: {e}); trying fermi_energy hint next.")
+            log.warning(f"  [resolve_n_occ] WFN.h5 lookup failed "
+                        f"({type(e).__name__}: {e}); trying fermi_energy hint next.",
+                        extra=message(
+                            id="resolve_n_occ_wfn_lookup_failed",
+                            found=("WFN.h5 lookup", f"{type(e).__name__}: {e}"),
+                            needs="the occupied-band count from WFN.h5",
+                            fix="set n_occ, or repair the wfn_file entry of the deck"))
 
     if fermi_energy is not None:
         mean_enk = np.asarray(np.mean(enk_full, axis=0))
