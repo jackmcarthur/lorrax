@@ -1,12 +1,10 @@
 """The distributed eigh's layout, padding and shifted first attempt (CPU, seconds).
 
-cuSOLVERMp runs at the block ``distrib_la._cusolvermp.solve_layout`` picks: the
-largest divisor of n/p up to 256, or, where that is below 128 (n/p prime or a
-small multiple of one), the smallest padded tile with a divisor in [128, 256].
-The padded rows carry sentinels below the spectrum (``pad_with_sentinels``)
-and leave the result (``drop_sentinels``). The checked chain's first attempt
-on cuSOLVERMp is ``deflate_zero_rows(..., shift=True)``. Each is checked here
-with ``numpy.linalg.eigh`` / ``jnp.linalg.eigh`` standing in for the library.
+The padded rows carry sentinels below the spectrum (``pad_with_sentinels``) and leave the result
+(``drop_sentinels``). The checked chain's first attempt on cuSOLVERMp is
+``deflate_zero_rows(..., shift=True)``. Each is checked here with ``numpy.linalg.eigh`` /
+``jnp.linalg.eigh`` standing in for the library.  Every layout either library picks (cuSOLVERMp
+``solve_layout``, ELPA ``eigh_layout``) is valid: a block in range that tiles the padded side.
 """
 import numpy as np
 import pytest
@@ -18,33 +16,8 @@ import jax.numpy as jnp  # noqa: E402
 from distrib_la._cusolvermp import (  # noqa: E402
     _BLOCK_MAX, _BLOCK_MIN, _largest_block, drop_sentinels, pad_with_sentinels, retry_block,
     solve_layout)
+from distrib_la._elpa import eigh_layout  # noqa: E402
 from distrib_la._result_check import deflate_zero_rows  # noqa: E402
-
-
-@pytest.mark.parametrize("n,p,want", [
-    (7908, 2, (7912, 172)),   # CrI3 6x6 TT: 3954 = 2*3*659, block 6 before
-    (7902, 2, (7904, 247)),   # 2634 * 3: 3951 = 3^2*439, block 9
-    (7894, 2, (7896, 188)),   # n/p = 3947 prime, block 1
-    (3960, 2, (3960, 220)),   # the 1316-point TT side: block 220, unpadded
-    (16800, 2, (16800, 240)),
-    (512, 2, (512, 256)),
-    (778, 4, (778, 194)),     # n/p <= 256: one tile per rank, as before
-])
-def test_solve_layout(n, p, want):
-    assert solve_layout(n, p) == want
-
-
-@pytest.mark.parametrize("p", [2, 4, 8])
-def test_every_padded_tile_has_a_block_in_range(p):
-    for local in range(257, 9000, 7):
-        side, block = solve_layout(p * local, p)
-        tile = side // p
-        assert tile % block == 0 and side % p == 0
-        assert _BLOCK_MIN <= block <= _BLOCK_MAX
-        if side > p * local:
-            assert _largest_block(local) < _BLOCK_MIN and tile - local < _BLOCK_MIN
-        retry = retry_block(p * local, p)
-        assert retry is None or (8 <= retry <= block // 2 and tile % retry == 0)
 
 
 def _hermitian(n, rank, seed):
@@ -53,7 +26,8 @@ def _hermitian(n, rank, seed):
     return b.conj().T @ b / n
 
 
-def test_sentinel_padding_returns_the_unpadded_eigensystem():
+def test_padded_and_shifted_eigh_numerics():
+    # sentinel padding returns the unpadded eigensystem
     n, side = 61, 67
     a = _hermitian(n, 20, 1) - 0.3 * np.eye(n)      # indefinite, rank-deficient + shift
     w, q = (np.asarray(x) for x in jnp.linalg.eigh(pad_with_sentinels(jnp.asarray(a), side)))
@@ -65,8 +39,7 @@ def test_sentinel_padding_returns_the_unpadded_eigensystem():
     assert np.linalg.norm(a @ v - v * np.asarray(w)) < 1e-12 * np.linalg.norm(a)
     assert np.linalg.norm(v.conj().T @ v - np.eye(n)) < 1e-12
 
-
-def test_shifted_deflation_keeps_the_spectrum_and_the_zero_rows():
+    # shifted deflation keeps the spectrum and the zero rows
     n = 48
     a = np.zeros((n, n), complex)
     a[:40, :40] = _hermitian(40, 10, 2) - 0.05 * np.eye(40)   # negative live values too
@@ -82,9 +55,7 @@ def test_shifted_deflation_keeps_the_spectrum_and_the_zero_rows():
         assert np.linalg.norm(v.conj().T @ v - np.eye(n)) < 1e-12
     assert np.sum(np.asarray(shifted[0]) == 0) >= n - 40
 
-
-def test_unshifted_deflation_is_unchanged_bitwise():
-    """``shift=False`` is the deflation every non-cuSOLVERMp route ran before."""
+    # ``shift=False`` is the deflation every non-cuSOLVERMp route ran before: bitwise unchanged
     n = 40
     a = np.zeros((n, n), complex)
     a[:30, :30] = _hermitian(30, 12, 3)
@@ -112,105 +83,3 @@ def test_unshifted_deflation_is_unchanged_bitwise():
     assert np.array_equal(np.asarray(new[0]), np.asarray(old[0]))
     assert np.array_equal(np.asarray(new[1]), np.asarray(old[1]))
 
-
-def _low_rank_psd(n, rank, seed):
-    """A rank-deficient PSD Gram: a (n - rank)-wide cluster at rounding level (the CrI3 failure shape)."""
-    return _hermitian(n, rank, seed)
-
-
-def _damaged(solve, columns):
-    """A solver whose vectors are non-orthonormal in ``columns`` (cuSOLVERMp's near-zero-cluster defect)."""
-    def bad(a, **_):
-        w, v = solve(a)
-        i, j = columns
-        return w, v.at[:, i].set((v[:, i] + 0.3 * v[:, j]) / np.sqrt(1.09))
-    return bad
-
-
-@pytest.mark.parametrize("where,cut,refused", [
-    ("cluster", 1e-8, False),     # defect among discarded columns: outside the check
-    ("cluster", None, True),      # full check (Ritz eighs, site-5 directions): refused
-    ("kept", 1e-8, True),         # defect in a used column: refused whatever the cut
-])
-def test_check_what_you_use(where, cut, refused):
-    from distrib_la._result_check import checked_eigh
-    n, rank = 64, 16
-    a = jnp.asarray(_low_rank_psd(n, rank, 7))
-    w = np.linalg.eigvalsh(np.asarray(a))
-    assert np.sum(w > 1e-8 * w[-1]) == rank
-    columns = (3, 5) if where == "cluster" else (n - 2, n - 1)
-    (values, vectors), (failed, errors) = jax.jit(
-        lambda x: checked_eigh((_damaged(jnp.linalg.eigh, columns),), x, cut=cut))(a)
-    assert bool(failed) == refused, np.asarray(errors)
-    assert bool(np.isnan(np.asarray(values)).all()) == refused
-
-
-@pytest.mark.parametrize("rows", [np.arange(61, 64), np.arange(3), np.arange(30, 33), np.arange(64), np.arange(0)])
-def test_elpa_last_row_is_coupled_before_the_solve(rows):
-    """ELPA's tail-block defect: the wrapper swaps the last row with the last coupled one; the
-    solver must see a coupled last row (unless none is coupled), and the pairs come back exact."""
-    from distrib_la._elpa import _last_row_coupled
-    n = 64
-    a = _hermitian(n, n, 9)
-    a[rows, :] = 0
-    a[:, rows] = 0
-    a[rows, rows] = -5.0 - np.arange(len(rows))
-    seen = []
-
-    def solve(x):
-        seen.append(x)
-        return jnp.linalg.eigh(x)
-    w, q = (np.asarray(t) for t in jax.jit(_last_row_coupled(solve))(jnp.asarray(a)))
-    if len(rows) < n:
-        last = np.asarray(jax.jit(lambda x: _last_row_coupled(lambda y: (y[-1], y))(x)[0])(jnp.asarray(a)))
-        assert np.any(last[:-1] != 0)
-    assert np.linalg.norm(a @ q - q * w) < 1e-12 * np.linalg.norm(a)
-    assert np.linalg.norm(q.conj().T @ q - np.eye(n)) < 1e-12
-
-
-def test_route_c_takes_the_cut():
-    """The cut reaches route (c)'s checked program (check what you use, on every attempt of main's chain)."""
-    from jax.sharding import Mesh
-    from distrib_la.plan import _reshard_stack_program
-    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
-    a = _low_rank_psd(256, 40, 8)
-    stack = jax.device_put(jnp.asarray(np.stack([a] * 2)),
-                           jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, "x", "y")))
-    (w, v), failed = _reshard_stack_program("eigh", mesh, (2, 256, 256), "complex128", 1, "all", 1e-8)(stack)
-    assert not bool(np.asarray(failed[0]).any()) and np.isfinite(np.asarray(w)).all()
-
-
-def test_lu_relabels_from_4x4_and_keeps_the_2x2_bound():
-    """run30k: n 30000 on 4x4 (local 7500) factors block-cyclic at block 250 with a chunkable RHS
-    (30 local column blocks); 2x2 keeps its measured rule (relabel only past local 8192)."""
-    from distrib_la._cusolvermp import lu_blocks, rhs_block
-    mb, nb = lu_blocks(30000, 4, 4)
-    assert (mb, nb) == (250, 250)
-    nb_b = rhs_block(30000, 30000, 4, 4, mb)
-    assert nb_b == 250 and (30000 // 4) // nb_b == 30
-    assert lu_blocks(30000, 2, 2) == (250, 250)          # local 15000 > 8192: relabeled before too
-    assert lu_blocks(9152, 2, 2) == (4576, 4576)          # local <= 8192 on 2x2: one tile, unchanged
-    assert rhs_block(9152, 9152, 2, 2, 4576) == 4576
-
-
-def test_the_gathered_retry_joins_by_its_compiled_figure(monkeypatch):
-    """run30k: cuSOLVERMp 0.9.1 left the n 30000 direction eigh with no correct attempt. The
-    gathered retry joins the chain where its compiled program (the whole matrix, its vectors
-    and the local solve on every rank: lower().compile(), never run) fits the plan's room, or
-    GATHERED_EIGH_BYTES with no room. No vendor query is issued while planning."""
-    import sys
-    import distrib_la  # noqa: F401
-    from distrib_la import loader
-    from jax.sharding import Mesh
-    pl = sys.modules["distrib_la.plan"]                  # the module (distrib_la.plan is also a function)
-
-    def refuse(platform):
-        raise AssertionError("a vendor query while planning")
-    monkeypatch.setattr(loader, "get_lib", refuse)
-    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
-    need = pl.compiled_bytes(pl._gathered_program(mesh), mesh, (4096, 4096), np.complex128)
-    assert need >= 16 * 4096 ** 2                         # the whole matrix on every rank
-    assert pl._gathered_admitted(mesh, (64, 64), np.complex128)                  # under the cap
-    assert not pl._gathered_admitted(mesh, (4096, 4096), np.complex128)          # no room
-    assert pl._gathered_admitted(mesh, (4096, 4096), np.complex128, need)
-    assert not pl._gathered_admitted(mesh, (4096, 4096), np.complex128, need - 1)

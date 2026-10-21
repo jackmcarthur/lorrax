@@ -9,7 +9,7 @@ producer-side (``isdf`` / ``gw.isdf_fitting``) and stay there.
 
 THE PACKAGE IS THE PUBLIC API.  Everything a consumer needs is a top-level name
 here; importing ``zeta_loader.<submodule>`` from lorrax is a layering
-violation the monorepo's ``tests/test_layering.py`` fails on.
+violation the monorepo's ``tools/lint/test_layering.py`` fails on.
 
 The surface
 -----------

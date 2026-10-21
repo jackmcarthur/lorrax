@@ -279,31 +279,6 @@ def qe_real_sph_harmonics_with_grad(l: int, vectors: np.ndarray) -> tuple[np.nda
     return Y_block, grad_cart
 
 
-def _spherical_hankel_transform_l(l: int,
-                                  r: np.ndarray,
-                                  beta_r: np.ndarray,
-                                  q: np.ndarray,
-                                  rab: np.ndarray | None = None) -> np.ndarray:
-    q_grid = np.asarray(q, dtype=np.float64)
-    weights = radial_weights(np.asarray(r, dtype=float), rab, scheme='rab')
-    return make_projector_table(
-        int(l),
-        np.asarray(r, dtype=float),
-        np.asarray(beta_r, dtype=float),
-        q_grid,
-        weights,
-    ).values
-
-
-def spherical_hankel_transform_l_np(l: int,
-                                    r: np.ndarray,
-                                    beta_r: np.ndarray,
-                                    q: np.ndarray,
-                                    rab: np.ndarray | None = None) -> np.ndarray:
-    """Public alias for the numpy spherical Hankel transform used by QE paths."""
-    return _spherical_hankel_transform_l(l, r, beta_r, q, rab)
-
-
 def _fourier_transform_vloc_qe(
     r: np.ndarray,
     rab: np.ndarray | None,

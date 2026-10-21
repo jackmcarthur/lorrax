@@ -30,9 +30,9 @@ global array on a subset of processes is not a slow path, it is a path that
 cannot run the workload — see
 [Design decisions](architecture/decisions.md), 2026-08-05.
 
-Both rules have machine enforcement: `tests/test_layering.py` for the import
+Both rules have machine enforcement: `tools/lint/test_layering.py` for the import
 direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
-`tests/test_env_registry.py` for the environment surface.
+`tools/lint/test_env_registry.py` for the environment surface.
 
 ## The test suite
 
@@ -78,10 +78,23 @@ The P4 verdict is the four-rank `srun` line above. A one-rank launch
 (`srun -n 1 --gpus-per-node=1`) runs the same cell at P1, which is a smoke
 run, not the verdict.
 
-Beside the suite are the five static AST suites (`test_layering.py`,
-`test_crossfile_requests.py`, `test_env_registry.py`, `test_env_grammar.py`,
-`test_fft_shardmap_context.py`). They run as scripts on a login node and also
-collect under pytest.
+There are three kinds of checks, and only the first decides a driver or physics
+change:
+
+- **`tests/hsuite`** (above): the production drivers end to end.
+- **Lint**, `tools/lint/`: the five static AST suites (`test_layering.py`,
+  `test_crossfile_requests.py`, `test_env_registry.py`, `test_env_grammar.py`,
+  `test_fft_shardmap_context.py`). They read source, run no physics, and run as
+  scripts on a login node (`tools/release_check.sh`). They are not in the
+  pytest set (`testpaths = ["tests"]`), though each also collects under pytest
+  if named.
+- **A small unit layer**, `tests/test_*.py`: only checks the hsuite cannot
+  reach, each one protecting a physical or contractual invariant: an exact
+  identity against an independent reference, a refusal that must fire, two
+  routes that must agree, or an output format another tool parses. A check
+  the hsuite already compares against its reference, or that only pins one
+  implementation's incidental behaviour (a program count, a message, a byte
+  price), does not belong. Several related checks share one test.
 
 Benchmarks and backend checks for a standalone service live in that service's
 `services/<svc>/bench/`. They are not tests, and pytest does not collect them.
@@ -91,8 +104,8 @@ Benchmarks and backend checks for a standalone service live in that service's
 - The P4 suite run above is the pre-push verdict for a driver or physics
   change.
 - `tools/release_check.sh` is the one command that runs the pre-push set: the
-  login-node AST suites (layering, cross-file, env registry, env grammar, FFT
-  shard-map), the input-reference drift check, and the origin-delta blob and
+  login-node AST lint suites in `tools/lint` (layering, cross-file, env registry,
+  env grammar, FFT shard-map), the input-reference drift check, and the origin-delta blob and
   secrets scan. Add `--with-allocation` for the end-to-end leg.
 - On Perlmutter, a test result counts only if it was produced on a **compute
   node**. A login-node pytest has no GPU, no container and a different device

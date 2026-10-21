@@ -141,7 +141,7 @@ from common.sharding_fit import fit_sharding as _ns              # noqa: E402
 from common.sharding_fit import legal_spec as _legal_spec        # noqa: E402
 
 # The ζ file's PUBLIC API.  TOP-LEVEL name only: ``zeta_loader.loader`` would be
-# a past-the-API edge and ``tests/test_layering.py`` fails on those.  The
+# a past-the-API edge and ``tools/lint/test_layering.py`` fails on those.  The
 # ``ensure_on_path()`` above is what makes it resolvable in a bare launch.
 from file_io.restart_bundle import read_vq_payload
 from common.log import get_logger, message
@@ -599,41 +599,6 @@ def kq_index(zx, ki, qi):
     """Index of wrap(k − q) on the stored grid."""
     d = zx["k_int"][ki] - zx["k_int"][qi]
     return zx["k_lookup"][tuple(d % zx["kgrid"])]
-
-
-def kq_index_of_frac(zx, qfrac):
-    """Grid index of a fractional q that must lie ON the coarse grid."""
-    kg = zx["kgrid"]
-    ki = np.rint(np.asarray(qfrac) * kg).astype(int) % kg
-    assert np.max(np.abs(np.asarray(qfrac) * kg - np.rint(np.asarray(qfrac) * kg))) < 1e-8, \
-        f"{qfrac} is not on the coarse grid"
-    return zx["k_lookup"][tuple(ki)]
-
-
-def gap_window_pairs(zx, q, nvw=3, ncw=3):
-    """Spin-traced BSE exchange rows M_cvk(μ) = Σ_s conj(u_{c,k−q,s})
-    u_{v,k,s} at the centroids; top-nvw valence × bottom-ncw conduction ×
-    all k → (npair, n_μ).  These contract the tile into the physical
-    gap-window block B = M V M^H — the campaign verdict variable."""
-    nv = zx["nv"]
-    cs = list(range(nv, nv + ncw))
-    vs = list(range(nv - nvw, nv))
-    rows = np.empty((zx["nk"], ncw, nvw, zx["n_mu"]), dtype=np.complex128)
-    for k in range(zx["nk"]):
-        kq = kq_index(zx, k, q)
-        rows[k] = np.einsum("csm,vsm->cvm",
-                            np.conj(zx["psi"][kq][cs]), zx["psi"][k][vs])
-    return rows.reshape(-1, zx["n_mu"])
-
-
-def b_block(x, V):
-    """B[p,p'] = Σ_{μν} x[p,μ] V[μν] conj(x[p',ν]).
-
-    K^x = M V M†: the bra (output) index carries the bare vertex and the ket
-    (the index a trial vector contracts) carries the conjugate, as the
-    transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk requires.
-    """
-    return x @ V @ np.conj(x).T
 
 
 # ===========================================================================

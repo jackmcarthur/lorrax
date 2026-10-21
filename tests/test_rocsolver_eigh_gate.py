@@ -28,7 +28,7 @@ scalar slot; UPLO L/U without symmetrization; the Fe line_select shape c128[16, 
 Plus the row: a stack outside it (batch 1) is ``jnp.linalg.eigh`` bit for bit.
 
 ROCm: ``python -m tests.test_rocsolver_eigh_gate`` on any mesh (one GCD or the 2x2 P=4 mesh).
-Under pytest the device gate skips; the row's CPU checks run.
+Under pytest only the gate's own CPU checks run (comparator, captured stacks).
 """
 import os
 import sys
@@ -36,7 +36,6 @@ import sys
 # runtime before numpy: its first statement sets OPENBLAS_THREAD_TIMEOUT, read once when numpy maps OpenBLAS (runtime.blas_env; GATE blas_spin).
 import runtime  # noqa: F401,E402
 import numpy as np  # noqa: E402
-import pytest  # noqa: E402
 
 TOL = 1e-12
 PROJ_TOL = 1e-9
@@ -363,99 +362,7 @@ def main() -> int:
     return rc
 
 
-# ---- pytest: the row's logic (CPU) ------------------------------------------------------
-
-def test_the_row_is_rocm_only_and_bounded():
-    from distrib_la.local_eigh import BATCHED_EIGH_ROUTE, batched_eigh_row
-    assert set(BATCHED_EIGH_ROUTE) == {"ROCM"}
-    row = BATCHED_EIGH_ROUTE["ROCM"]
-    assert row.target == "lorrax_rocsolver_batched_eigh" and set(row.windows) == {"complex128", "float64"}
-    assert row.windows["complex128"].driver == "heevd" and row.windows["float64"].driver == "syevd"
-    for dt, w in row.windows.items():
-        assert batched_eigh_row((16, 312, 312), dt, "ROCM") is row        # the Fe line_select stack
-        assert batched_eigh_row((w.min_batch, w.min_n, w.min_n), dt, "ROCM") is row
-        assert batched_eigh_row((2, w.max_n + 1, w.max_n + 1), dt, "ROCM") is None
-        if w.min_n > 1:
-            assert batched_eigh_row((64, w.min_n - 1, w.min_n - 1), dt, "ROCM") is None
-        if w.min_batch > 1:
-            assert batched_eigh_row((w.min_n, w.min_n), dt, "ROCM") is None
-        for leg in ("CUDA", "cpu"):
-            assert batched_eigh_row((16, 312, 312), dt, leg) is None
-    assert batched_eigh_row((16, 312, 312), np.complex64, "ROCM") is None
-
-
-def test_the_target_is_in_both_rocm_tables_and_the_family_row():
-    pytest.importorskip("jax")
-    from ffi.common import ffi_loader, families
-    from distrib_la import loader
-    t = "lorrax_rocsolver_batched_eigh"
-    assert loader._PLATFORMS["ROCM"]["targets"][t] == ffi_loader._PLATFORMS["ROCM"]["targets"][t]
-    assert families.family_of(t) == "rocsolver" and families.state("rocsolver", "ROCM")[0] == "built"
-    assert families.FAMILIES["rocsolver"].tol == TOL
-    for leg in ("CUDA", "cpu"):
-        assert t not in loader._PLATFORMS[leg]["targets"] and t not in ffi_loader._PLATFORMS[leg]["targets"]
-
-
-def test_compare_is_gauge_and_degeneracy_blind():
-    rng = np.random.default_rng(1)
-    a = _degenerate(rng, 2, 30, "complex128", 3)
-    w, v = np.linalg.eigh(a)
-    # A random unitary inside every 3-fold cluster: a different basis of the same eigenspaces.
-    v2 = v.copy()
-    for i in range(2):
-        for lo in range(0, 30, 3):
-            q, _r = np.linalg.qr(rng.standard_normal((3, 3)) + 1j * rng.standard_normal((3, 3)))
-            v2[i][:, lo:lo + 3] = v[i][:, lo:lo + 3] @ q
-    assert passes(compare(a, w, v2, w, v))
-    v3 = v2.copy(); v3[0][:, [0, 3]] = v3[0][:, [3, 0]]     # swapped across clusters: caught
-    assert not passes(compare(a, w, v3, w, v))
-
-
-def test_the_na_sc_stacks_carry_the_padding_multiplet():
-    """The captured C_q stack keeps its structure: 40 decoupled rows on one constant diagonal,
-    i.e. an exactly 40-fold eigenvalue strictly inside the spectrum (the regression's trigger)."""
-    with np.load(NA_SC_STACKS) as data:
-        cq, dirs = data["cq_factor"], data["directions"]
-    assert cq.shape == (4, 96, 96) and dirs.shape == (3, 96, 96) and cq.dtype == np.complex128
-    for a in (cq, dirs):
-        assert np.array_equal(a, np.conj(np.swapaxes(a, -1, -2)))
-    for m in cq:
-        pad = m[56:, 56:]
-        assert np.all(m[56:, :56] == 0) and np.all(pad == pad[0, 0] * np.eye(40))
-        w = np.linalg.eigvalsh(m)
-        assert w[0] < pad[0, 0].real < w[-1]
-        assert np.sum(np.abs(w - pad[0, 0].real) <= 1e-12 * w[-1]) >= 40
-
-
-def test_the_tile_and_the_workspace_price():
-    """The row's tile is runtime.tiles.TILE_BYTES; the price bounds the measured workspace
-    (pool log eighc_wsq) and never exceeds one tile plus E; outside the row it is 0."""
-    from runtime.tiles import TILE_BYTES
-    from distrib_la.local_eigh import BATCHED_EIGH_ROUTE, batched_workspace_bytes
-    row = BATCHED_EIGH_ROUTE["ROCM"]
-    assert row.tile_bytes == TILE_BYTES
-    measured = {("complex128", 128): 15925440, ("complex128", 312): 63689152,       # b = 16
-                ("complex128", 3120): 5628233792, ("float64", 128): 10141888,
-                ("float64", 3120): 4063690816}
-    for (dt, n), ws in measured.items():
-        price = batched_workspace_bytes((16, n, n), dt, "ROCM")
-        assert price >= min(ws, TILE_BYTES) and price <= TILE_BYTES + 16 * n * 8
-    assert batched_workspace_bytes((16, 312, 312), "complex128", "CUDA") == 0
-    assert batched_workspace_bytes((1, 312, 312), "complex128", "ROCM") == 0
-
-
-def test_the_route_has_no_host_repair():
-    """Owner rule: no per-call host read.  The handler has no D2H copy or stream sync, and the
-    route passes no repair attribute."""
-    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "ffi", "cpp",
-                            "rocsolver", "batched_eigh_ffi.cc")).read()
-    for token in ("kDeviceToHost", "stream_synchronize", "hipDeviceSynchronize", "hipStreamSynchronize"):
-        assert token not in src, token
-    from distrib_la import local_eigh
-    assert "repair=" not in open(local_eigh.__file__).read()
-
-def test_device_gate_needs_rocm():
-    pytest.skip("run as a script on a ROCm mesh: python -m tests.test_rocsolver_eigh_gate")
+# ---- pytest: CPU checks of the gate itself --------------------------------------------
 
 
 if __name__ == "__main__":

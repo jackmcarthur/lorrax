@@ -805,10 +805,6 @@ class TimingCollector:
 _GLOBAL_COLLECTOR = TimingCollector()
 
 
-def get_collector() -> TimingCollector:
-	return _GLOBAL_COLLECTOR
-
-
 def reset() -> None:
 	_GLOBAL_COLLECTOR.reset()
 

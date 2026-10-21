@@ -51,7 +51,7 @@ failed with the placement (det lane, 2026-10-16).
   count (integer operand, one owner per element with zeros elsewhere, zeros), marked
   `# exact-reduce: <reason>` on the call.
 
-**Checks.** `tests/test_reduction_lint.py` refuses an unmarked raw call.
+**Checks.** `tools/lint/test_reduction_lint.py` refuses an unmarked raw call.
 `LORRAX_REDUCTION_GUARD=log|raise` records or refuses one at trace time, and
 `LORRAX_REDUCTION_TRACE` writes each ordered call's payload. Neither sees an XLA-inserted
 all-reduce. For those, dump the optimized HLO (`--xla_dump_to`) and list `all-reduce` ops

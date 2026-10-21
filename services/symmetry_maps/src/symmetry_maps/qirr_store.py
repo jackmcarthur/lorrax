@@ -74,7 +74,7 @@ tensor", differing on the day one of them gains a check.  They are on
 the public API for the same reason ``vcoul`` puts
 ``_minibz_kernel_bare`` on its: a consumer reaching
 ``symmetry_maps.qirr_store`` for them is a past-the-API edge, and
-``tests/test_layering.py`` rule 6 counts those.
+``tools/lint/test_layering.py`` rule 6 counts those.
 
 THE μ PAD NEVER REACHES DISK (SHARDING_RULES §2).  The producer bakes a
 μ pad into ``sym_perm``/``L_table`` once at construction — identity tail

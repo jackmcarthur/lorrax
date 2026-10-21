@@ -286,7 +286,7 @@ DEFAULT_DIRECTION: str = "drop_block"
 #: NAME of the environment dial the callers read — the seams this guard sits
 #: in have no deck key yet, so the mode arrives from the environment.
 #:
-#: THIS MODULE DOES NOT READ IT.  ``tests/test_layering.py``: "L2 is
+#: THIS MODULE DOES NOT READ IT.  ``tools/lint/test_layering.py``: "L2 is
 #: physics-agnostic mathematics and must be a function of its arguments … if
 #: it must come from the environment, the driver reads it and passes it."
 #: So the NAME lives here, once, and each call site does the ``os.environ``

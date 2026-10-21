@@ -151,14 +151,6 @@ def compute_vnl_velocity_cart(
 	return vnl_ops.vnl_velocity_matrix(psi_G, kdata.Z, kdata.dZ, kdata.E_super)
 
 
-def compute_projected_momentum_bgw_like(*args, **kwargs):
-    raise NotImplementedError("Debug-only momentum projection removed")
-
-
-def compute_block_direct_cnk(*args, **kwargs):
-    raise NotImplementedError("Debug-only direct cnk path removed")
-
-
 # --------------------------
 # Finite-q matrix elements for SOS chi head/wing/S/w pipeline
 # --------------------------
@@ -532,12 +524,6 @@ def dipole_provenance(*, wfn, wfn_path, nval, ncond, nband,
     if soc is not None:
         attrs["prov_soc"] = bool(soc)
     return attrs
-
-
-def stamp_dipole_provenance(h5, **kwargs) -> None:
-    """Stamp :func:`dipole_provenance` onto an open writable h5py file."""
-    for key, value in dipole_provenance(**kwargs).items():
-        h5.attrs[key] = value
 
 
 def _note_parallel_transport_dropped(args, reason) -> None:

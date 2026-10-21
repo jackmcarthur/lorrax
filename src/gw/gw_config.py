@@ -53,7 +53,7 @@ from .band_extrapolation import (
 # :func:`env_bool` from here (L1→L1; ``gw/__init__`` pulls only this
 # jax-free module, so the import adds nothing and cannot cycle).  The
 # remaining copies are pinned set-equal by
-# ``tests/test_env_grammar.py::test_defect3_vocabulary_has_not_drifted``,
+# ``tools/lint/test_env_grammar.py::test_defect3_vocabulary_has_not_drifted``,
 # which reads them straight out of the source text, without importing jax,
 # and fails on any drift.
 #
@@ -76,7 +76,7 @@ from .band_extrapolation import (
 # ``_slab_io_ffi._env_flag`` and ``runtime._env_falsy`` had done.
 #
 # The names below are re-exports, kept because this module's four owned
-# files, ``isdf.core`` and ``tests/test_env_grammar.py`` all reach for
+# files, ``isdf.core`` and ``tools/lint/test_env_grammar.py`` all reach for
 # ``gw_config.env_bool`` by name.  Behaviour is unchanged in every token.
 from runtime.env_flags import (  # noqa: E402
     ANNOUNCED as _ENV_ANNOUNCED,
@@ -150,7 +150,7 @@ def active_zeta_truncating_knobs() -> list[tuple[str, str]]:
 # The re-export is not a compatibility shim to be swept away: ``gw_init``
 # captions the ζ-fit peak and ``gw_output`` prints the startup banner from
 # these, and reading them as ``gw_config.<name>`` is how those call sites and
-# ``tests/test_env_grammar.py`` are written.  Keeping the alias here costs one
+# ``tools/lint/test_env_grammar.py`` are written.  Keeping the alias here costs one
 # import and keeps the deck-level vocabulary in one place.
 #
 # ``runtime`` imports jax only inside function bodies, so this import does NOT

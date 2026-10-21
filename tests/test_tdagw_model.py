@@ -267,11 +267,5 @@ def main() -> int:
     return rc
 
 
-def test_tdagw_model_needs_2x2_mesh():
-    """Collected by pytest: the gate needs its own 2x2 mesh, so it runs as a script."""
-    import pytest
-    pytest.skip("run as a script on a 2x2 mesh: python3 tests/test_tdagw_model.py")
-
-
 if __name__ == "__main__":
     sys.exit(main())

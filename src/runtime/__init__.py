@@ -14,7 +14,7 @@ The adopters (2026-08-01) are the seven chain drivers — ``gw.gw_jax``,
 ``centroid.kmeans_cli``, ``psp.get_dipole_mtxels``, ``gw.kin_ion_io``,
 ``bandstructure.htransform``, ``bse.bse_jax`` and ``bse.exciton_bands`` —
 each making exactly ONE module-top call, gated per driver by
-``tests/test_crossfile_requests.py`` (the R1 audit).  Since 2026-08-27 the BSE
+``tools/lint/test_crossfile_requests.py`` (the R1 audit).  Since 2026-08-27 the BSE
 CLIs that take ``--px/--py`` do not reshape: all six resolve the flags through
 ``bse.bse_ring_comm.create_mesh_xy_from_flags``, which returns this startup
 mesh itself when they are omitted and refuses any shape that is not it, so the

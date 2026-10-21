@@ -587,12 +587,19 @@ def _quadrature_metric(phi, labels, *, block_bytes: int = QUADRATURE_BLOCK_BYTES
 
 
 def _loewdin(gram):
-    """``G^{-1/2}`` per k and ``eps = max_k ||G_k - 1||_2`` (host)."""
+    """``G^{-1/2}`` per k and ``eps = max_k ||G_k - 1||_2`` (host).
+
+    A ``G_k`` whose smallest eigenvalue is within ``nb`` ulp of its largest
+    is singular to roundoff (an exactly rank-deficient sampling lands either
+    side of zero) and is refused like a negative one."""
     vals, vecs = np.linalg.eigh(gram)
-    if not np.all(vals > 0.0):
+    floor = (vals.shape[-1] * np.finfo(np.float64).eps
+             * np.abs(vals).max(axis=-1, keepdims=True))
+    if not np.all(vals > floor):
         raise ValueError(
             "fit_galerkin_basis: the quadrature-metric Gram Phi^H W Phi is "
-            f"not positive definite (min eigenvalue {float(vals.min()):.3e}); "
+            f"not positive definite (min eigenvalue {float(vals.min()):.3e}, "
+            f"roundoff floor {float(floor.max()):.3e}); "
             "the centroid set does not resolve the fitted window")
     inv_half = np.einsum('kmi,ki,kni->kmn', vecs, vals ** -0.5,
                          np.conj(vecs), optimize=True)

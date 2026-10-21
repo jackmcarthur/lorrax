@@ -125,15 +125,13 @@ def _passes(e_coarse, e_fine, *, order, tol, dp54=False):
     return e_fine <= tol and abs(np.log2(e_coarse / e_fine) - order) < 0.3
 
 
-@pytest.mark.parametrize("gam", [(0.0, 0.0), GAMMA_EV], ids=["conservative", "dissipative"])
-@pytest.mark.parametrize("scheme", SCHEMES, ids=[s[0] for s in SCHEMES])
-def test_rabi_exact_every_integrator(ladder, scheme, gam, record):
+def _check_rabi_exact_every_integrator(ladder, scheme, gam, record):
     method, coarse, fine, p0, p1, tol = scheme
     rc, rf = ladder["runs"][(gam, method, coarse)], ladder["runs"][(gam, method, fine)]
     assert rf["stats"]["mesh"] == (2, 2) and rf["stats"]["nk_pad"] == 8
     ec, ef = _error(rc["rho"], rc["ref"]), _error(rf["rho"], rf["ref"])
-    record("max_abs_rho_minus_exact_fine", ef)
-    record("observed_order" if method != "dp54" else "error_ratio_rtol",
+    record(f"{method}:{gam[0]}:max_abs_rho_minus_exact_fine", ef)
+    record(f"{method}:{gam[0]}:" + ("observed_order" if method != "dp54" else "error_ratio_rtol"),
            float(np.log2(ec / ef)) if method != "dp54" else float(ec / ef))
     order = p0 if gam == (0.0, 0.0) else p1
     assert _passes(ec, ef, order=order, tol=tol, dp54=method == "dp54"), \
@@ -145,7 +143,7 @@ def test_rabi_exact_every_integrator(ladder, scheme, gam, record):
         assert pop[1].max() < 2e-3
 
 
-def test_red_twin_swapped_dipole_header(ladder, tmp_path):
+def _check_red_twin_swapped_dipole_header(ladder, tmp_path):
     tl = dict(ladder["tl"])
     tl["r"] = np.swapaxes(tl["r"], -1, -2)              # <c|r|v> = d (1, +i)/sqrt2: sigma-
     hdr = vs.write_header(str(tmp_path / "hdr_swap"), tl)
@@ -155,7 +153,7 @@ def test_red_twin_swapped_dipole_header(ladder, tmp_path):
     assert not err <= 1e-8 and err > 0.5, err
 
 
-def test_red_twin_rydberg_hartree_trap(ladder, record):
+def _check_red_twin_rydberg_hartree_trap(ladder, record):
     """The gap converted with Ha = 2 Ry (BerkeleyGW's Ry) instead of the header's arithmetic."""
     lad = ladder
     gap_bad = lad["tl"]["e_ev"][:, 1] / (2.0 * RYD_TO_EV)
@@ -170,3 +168,12 @@ def test_red_twin_rydberg_hartree_trap(ladder, record):
     record("twin_error", ef)
     assert ef > 50 * 1e-7 and abs(ef / shift - 1) < 0.05 and abs(np.log2(ec / ef)) < 0.3, \
         (ec, ef, shift)
+
+
+def test_rabi_exact_every_integrator(ladder, tmp_path, record):
+    """G1, R1, R2: every integrator against the exact Rabi solution, with and without relaxation, and the twins."""
+    for gam in ((0.0, 0.0), GAMMA_EV):
+        for scheme in SCHEMES:
+            _check_rabi_exact_every_integrator(ladder, scheme, gam, record)
+    _check_red_twin_swapped_dipole_header(ladder, tmp_path)
+    _check_red_twin_rydberg_hartree_trap(ladder, record)

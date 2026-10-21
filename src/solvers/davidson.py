@@ -28,12 +28,6 @@ MATVEC_APPLICATIONS = [0]
 LAST_RUN: dict = {}
 
 
-def reset_instrumentation():
-    TRACE_COUNTS.clear()
-    MATVEC_APPLICATIONS[0] = 0
-    LAST_RUN.clear()
-
-
 def instrumentation_summary():
     return (f'[dav-instr] matvec applications (vectors): {MATVEC_APPLICATIONS[0]}\n'
             f'[dav-instr] solver traces: {sum(TRACE_COUNTS.values())}\n'

@@ -460,11 +460,5 @@ def main() -> int:
     return rc
 
 
-def test_kdft_kbox_gate_needs_rocm():
-    """Collected by pytest: the gate needs a ROCm device, so it runs as a script."""
-    import pytest
-    pytest.skip("run as a script on a ROCm mesh: python -m tests.test_kdft_kbox_gate")
-
-
 if __name__ == "__main__":
     sys.exit(main())

@@ -63,31 +63,6 @@ def _hankel_weighted(l: int, r: np.ndarray, f_r: np.ndarray, q: np.ndarray,
 # Table builders — QE-convention twins of the batched build_all_tables rows
 # ---------------------------------------------------------------------------
 
-def vloc_sr_table(sp: SpeciesData, q: np.ndarray) -> np.ndarray:
-    """Short-range local potential: ∫ [V_loc(r) + Z·e²·erf(r)/r] j₀(qr) r² dr.
-
-    QE convention: simpsn over the r ≤ 10 truncated odd mesh
-    (upflib/vloc_mod.f90 init_tab_vloc).
-    """
-    e2 = 2.0
-    msh, w = qe_vloc_radial_scheme(sp.r, sp.rab)
-    r = sp.r[:msh]
-    safe_r = np.where(r > 0, r, 1.0)
-    erf_over_r = np.where(r > 0, scipy_erf(r) / safe_r, 2.0 / np.sqrt(np.pi))
-    v_sr = sp.vloc_r[:msh] + sp.z_valence * e2 * erf_over_r
-    return _hankel_weighted(0, r, v_sr, q, w)
-
-
-def core_charge_table(sp: SpeciesData, q: np.ndarray) -> np.ndarray:
-    """NLCC core density: ∫ ρ_core(r) j₀(qr) r² dr.
-
-    QE convention: simpsn over the SAME msh mesh as V_loc
-    (upflib/rhoc_mod.f90 init_tab_rhc integrates ``DO ir = 1, msh(nt)``).
-    """
-    msh, w = qe_vloc_radial_scheme(sp.r, sp.rab)
-    return _hankel_weighted(0, sp.r[:msh], sp.rho_core_r[:msh], q, w)
-
-
 def projector_table(sp: SpeciesData, ip: int, q: np.ndarray) -> np.ndarray:
     """Beta projector form factor: ∫ (β(r)/r) j_l(qr) r² dr.
 

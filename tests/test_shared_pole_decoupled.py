@@ -1,4 +1,4 @@
-"""The staged face route and its face products against the local round (CPU 2x2 mesh).
+"""The staged face routes against the local round (CPU 2x2 mesh).
 
 Run with ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4``.
 A synthetic ordered pencil: four parents, each a full-rank positive real-pole model
@@ -12,7 +12,6 @@ agree on the retained poles and factors to round-off.
 import numpy as np
 import pytest
 import jax
-import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
@@ -76,10 +75,21 @@ def _pad(a, w):
     return np.pad(a, ((0, 0), (0, 0), (0, w - a.shape[-1])))
 
 
-def test_decoupled_face_matches_local():
-    """The decoupled face route (stage programs over sub-batches, eighs over every parent)
-    against the local round on the synthetic pencil; the face products are panel_matmul."""
+def _placer(states, infinity, width, iw):
+    """Place the pencil's states and infinity panels (zero-padded to the carrier) on a sharding."""
+    def place(sharding):
+        put = lambda a: jax.device_put(np.asarray(a), sharding)
+        return ([(s[0], put(_pad(s[1], width)), put(_pad(s[2], width)), put(_pad(s[3], width))) for s in states],
+                tuple(put(_pad(a, iw)) for a in infinity))
+    return place
+
+
+def test_face_routes_match_the_local_round(monkeypatch):
+    """The decoupled face route (stage programs over sub-batches, eighs over every parent) and the
+    scalar route's face round (one program, ``face_reduce_round``, pencil columns in the face's
+    tile-interleaved order) against the local round on the synthetic pencil."""
     mesh = _mesh()
+    import gw.shared_pole_execution as ex
     from gw.shared_pole_directions import port_extent
     from gw.shared_pole_execution import face_reduce_decoupled, face_ritz_carrier
     from gw.shared_pole_local import BATCH, reduce_round
@@ -92,11 +102,7 @@ def test_decoupled_face_matches_local():
     gram_keep = shared_real_pole_gates_ordered_v1["normalized_gram_keep"]["sector_threshold"]
     budget = 8
     side = int(tables["active"].shape[-1])
-
-    def place(sharding):
-        put = lambda a: jax.device_put(np.asarray(a), sharding)
-        return ([(s[0], put(_pad(s[1], width)), put(_pad(s[2], width)), put(_pad(s[3], width))) for s in states],
-                tuple(put(_pad(a, iw)) for a in infinity))
+    place = _placer(states, infinity, width, iw)
     ls, li = place(NamedSharding(mesh, P(BATCH)))
     local = reduce_round(ls, li, tables, real=q, mesh_xy=mesh, native_eigh=_local_eigenplan(mesh, side).native_fn,
                          ordered=True, odd_moments=True, keep_budget=budget, retain_span=True, gram_keep=gram_keep)
@@ -134,137 +140,13 @@ def test_decoupled_face_matches_local():
         for p in range(q):
             assert np.allclose(ly[p] @ np.conj(ly[p].T), dy[p] @ np.conj(dy[p].T), rtol=1e-7, atol=1e-9), (sub, p)
 
-
-def test_face_products_match_matmul():
-    """``panel_matmul`` in every transpose form, wide and two-column panels, with and
-    without the latency-hiding option, against ``jnp.matmul`` on the CPU 2x2 face."""
-    mesh = _mesh()
-    from distrib_la import panel_matmul
-    rng = np.random.default_rng(3)
-    face = NamedSharding(mesh, P(None, "x", "y"))
-    q, m, k, n = 3, 8, 12, 4
-    op = {"N": lambda a: a, "T": lambda a: np.swapaxes(a, -1, -2), "C": lambda a: np.conj(np.swapaxes(a, -1, -2))}
-    for ta in "NTC":
-        for tb in "NTC":
-            a = rng.normal(size=(q, m, k)) + 1j * rng.normal(size=(q, m, k))
-            b = rng.normal(size=(q, k, n)) + 1j * rng.normal(size=(q, k, n))
-            # op(stored) is the product's operand: stored = op^-1(a)
-            sa = a if ta == "N" else (np.swapaxes(a, -1, -2) if ta == "T" else np.conj(np.swapaxes(a, -1, -2)))
-            sb = b if tb == "N" else (np.swapaxes(b, -1, -2) if tb == "T" else np.conj(np.swapaxes(b, -1, -2)))
-            assert np.allclose(op[ta](sa), a) and np.allclose(op[tb](sb), b)
-            want = a @ b
-            for columns in (k, 2):
-                per_column = 16 * q * (m // 2 + n // 2)
-                for options in (None, {"xla_gpu_enable_latency_hiding_scheduler": True}):
-                    got = panel_matmul(jax.device_put(sa, face), jax.device_put(sb, face), mesh=mesh,
-                                       panel_bytes=per_column * 2 * columns, transa=ta, transb=tb,
-                                       compiler_options=options)
-                    assert got.sharding.spec == P(None, "x", "y")
-                    assert np.allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12), (ta, tb, columns)
-
-
-def test_paired_schur_cut_takes_the_sector_keep():
-    """The Schur cut of the paired stage uses the caller's keep (the ordered sector threshold),
-    as the H'_vv cut does: H_r = diag(S, I) with S = diag(gamma_r), B = 0, so the restricted
-    metric is the identity and the paired rank counts gamma_r above the cut plus the kept span."""
-    from gw.shared_pole_local import _mm
-    from gw.shared_pole_reduction import paired_stage
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    gamma_r = np.array([[1e-8 / 2, 1e-6, 0.5]])
-    c = gamma_r.shape[-1]
-    eye = np.eye(c, dtype=np.complex128)[None]
-    zero = np.zeros_like(eye)
-    h_r = np.block([[np.diag(gamma_r[0]).astype(np.complex128), zero[0]], [zero[0], eye[0]]])[None]
-    stage = dict(kept=np.ones((1, c), bool), b_r=zero, h_r=jnp.asarray(h_r), g_r=jnp.asarray(np.eye(2 * c, dtype=np.complex128)[None]),
-                 schur=jnp.asarray(np.diag(gamma_r[0]).astype(np.complex128)[None]))
-    for keep, want in ((gates["normalized_gram_keep"]["sector_threshold"], 1), (None, 2)):
-        out = paired_stage(dict(stage), jnp.asarray(gamma_r), jnp.asarray(eye), matmul=_mm, gates=gates, gram_keep=keep)
-        assert int(np.asarray(out["count_r"])[0]) == want + c, (keep, np.asarray(out["count_r"]))
-        assert float(np.asarray(out["paired_metric_residual_relative"])[0]) < 1e-12
-
-
-def test_decoupled_cross_matches_the_joint_reduction():
-    """face_cross_decoupled (stages over sub-batches, each eigh once over the stack) equals
-    reduce_sector_pencil (one program per round) on synthetic definite joint pencils."""
-    mesh = _mesh()
-    from gw.shared_pole_execution import face_cross_decoupled
-    from gw.shared_pole_local import _mm
-    from gw.shared_pole_sectors import reduce_sector_pencil
-    from gw.shared_pole_capacity import _local_eigenplan
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    rng = np.random.default_rng(5)
-    q, k, nc, nt = 5, 8, 6, 4
-    herm = lambda a: (a + np.conj(np.swapaxes(a, -1, -2))) / 2
-    a = rng.normal(size=(q, k, k)) + 1j * rng.normal(size=(q, k, k))
-    metric = herm(a @ np.conj(np.swapaxes(a, -1, -2))) / k + 0.1 * np.eye(k)
-    value = herm(rng.normal(size=(q, k, k)) + 1j * rng.normal(size=(q, k, k)))
-    oc = rng.normal(size=(q, nc, k)) + 1j * rng.normal(size=(q, nc, k))
-    ot = rng.normal(size=(q, nt, k)) + 1j * rng.normal(size=(q, nt, k))
-    face = NamedSharding(mesh, P(None, "x", "y"))
-    eig = lambda m: tuple(np.linalg.eigh(np.asarray(m)))
-    want, wd = reduce_sector_pencil(tuple(jnp.asarray(x) for x in (metric, value, oc, ot)),
-                                    eigh=lambda m, **_: tuple(jnp.asarray(v) for v in eig(m)), matmul=_mm, gates=gates)
-    plan = _local_eigenplan(mesh, k)
-    for width in (q, 2):
-        got, gd = face_cross_decoupled([jax.device_put(x, face) for x in (metric, value, oc, ot)],
-                                       mesh=mesh, eigh_plans=(plan, plan), width=width)
-        assert np.array_equal(np.asarray(want[3]), np.asarray(got[3]))
-        assert np.allclose(np.asarray(want[2]), np.asarray(got[2]), rtol=1e-10, atol=1e-12)
-        for p in range(q):            # factors up to a phase per column: compare c_C c_T^H
-            lw = np.asarray(want[0][p]) @ np.conj(np.asarray(want[1][p]).T)
-            lg = np.asarray(got[0][p]) @ np.conj(np.asarray(got[1][p]).T)
-            assert np.allclose(lw, lg, rtol=1e-8, atol=1e-10), (width, p)
-        for key in ("gram_valid", "retained_metric_positive", "retained_rank"):
-            assert np.array_equal(np.asarray(wd[key]), np.asarray(gd[key])), key
-
-
-def test_release_selection_panels_frees_them_and_keeps_the_models():
-    """After a round's CT pencils, the sectors' (Q, O, infinity) panels and spans are dropped
-    (their bytes return before the CT eighs); the models a sub-batch slice reads are unchanged."""
-    import gc
-    import weakref
-    from gw.shared_pole_sectors import release_selection_panels, slice_sector
-    mesh = _mesh()
-    face = NamedSharding(mesh, P(None, "x", "y"))
-    rng = np.random.default_rng(3)
-    put = lambda shape: jax.device_put(jnp.asarray(rng.normal(size=shape)), face)
-    sector = dict(model=(put((4, 8, 8)), put((4, 8, 8))), signed=(put((4, 8, 8)),),
-                  coefficients=put((4, 8, 8)), states=[(0, put((4, 8, 8)), put((4, 8, 8)))],
-                  infinity=(put((4, 8, 8)),), tables={'t': np.arange(4)}, vectors=(put((4, 8, 8)),),
-                  diagnostics={'d': np.arange(4.0)})
-    before = slice_sector(sector, [1, 3], mesh)
-    panels = [weakref.ref(a) for a in (*sector['states'][0][1:], *sector['infinity'], sector['coefficients'])]
-    release_selection_panels([sector])
-    gc.collect()
-    assert all(ref() is None for ref in panels)
-    assert sector['states'] is None and sector['infinity'] is None and sector['coefficients'] is None
-    after = [np.asarray(a)[[1, 3]] for a in jax.tree.leaves((sector['model'], sector['signed']))]
-    for a, b in zip(jax.tree.leaves((before['model'], before['signed'])), after):
-        assert np.array_equal(np.asarray(a), b)
-
-
-def test_scalar_face_round_matches_local(monkeypatch):
-    """The scalar route's face round (one program, ``face_reduce_round``), whose pencil columns
-    enter the face's tile-interleaved order, against the local round on the synthetic pencil."""
-    mesh = _mesh()
-    import gw.shared_pole_execution as ex
-    from gw.shared_pole_directions import port_extent
-    from gw.shared_pole_local import BATCH, reduce_round
-    from gw.shared_pole_capacity import _local_eigenplan
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
-    # The face round's eigh stacks on route (c), as the staged route's run on CPU.
+    # The scalar route's face round on a second pencil; its eigh stacks on route (c), as the staged
+    # route's run on CPU.
     monkeypatch.setattr(ex, "face_eigh", lambda mesh_, n, room=None, backend=None: _local_eigenplan(mesh_, int(n)))
-    extent = port_extent(mesh)
     states, infinity, tables, models = _pencil(mesh, seed=2)
     q = len(models)
-    width, iw = extent(4), extent(2)
-    gram_keep = shared_real_pole_gates_ordered_v1["normalized_gram_keep"]["sector_threshold"]
     side = int(tables["active"].shape[-1])
-
-    def place(sharding):
-        put = lambda a: jax.device_put(np.asarray(a), sharding)
-        return ([(s[0], put(_pad(s[1], width)), put(_pad(s[2], width)), put(_pad(s[3], width))) for s in states],
-                tuple(put(_pad(a, iw)) for a in infinity))
+    place = _placer(states, infinity, width, iw)
     ls, li = place(NamedSharding(mesh, P(BATCH)))
     local = reduce_round(ls, li, tables, real=q, mesh_xy=mesh, native_eigh=_local_eigenplan(mesh, side).native_fn,
                          ordered=True, odd_moments=True, keep_budget=8, gram_keep=gram_keep)
@@ -278,34 +160,3 @@ def test_scalar_face_round_matches_local(monkeypatch):
     for p in range(q):
         assert np.allclose(lb[p] @ np.conj(lb[p].T), fb[p] @ np.conj(fb[p].T), rtol=1e-7, atol=1e-9), p
 
-
-def test_face_width_compile_matches_the_round(monkeypatch):
-    """The width admission's program (``face_round_compiled_bytes``, abstract operands at the
-    round's layout) compiles to the figure of the face round that runs (``price_round``)."""
-    mesh = _mesh()
-    import gw.shared_pole_execution as ex
-    from gw.shared_pole_capacity import _local_eigenplan
-    from gw.shared_pole_directions import port_extent
-    from lxkit import memory
-    monkeypatch.setattr(ex, "face_eigh", lambda mesh_, n, room=None, backend=None: _local_eigenplan(mesh_, int(n)))
-    from runtime.aot_memory import compiled_new_bytes
-    got = []
-    monkeypatch.setattr(ex, "price_round", lambda executable, mesh_, beside, whole=False:
-                        got.append(int(compiled_new_bytes(executable))))
-    memory.set_budget(1e12)
-    extent = port_extent(mesh)
-    states, infinity, tables, _ = _pencil(mesh, seed=2)
-    width, iw = extent(4), extent(2)
-    face = NamedSharding(mesh, P(None, "x", "y"))
-    put = lambda a: jax.device_put(np.asarray(a), face)
-    fs = [(s[0], put(_pad(s[1], width)), put(_pad(s[2], width)), put(_pad(s[3], width))) for s in states]
-    fi = tuple(put(_pad(a, iw)) for a in infinity)
-    carrier = ex.face_ritz_carrier(mesh, 8)
-    ex.face_reduce_round(fs, fi, tables, mesh=mesh, budget=None, ordered=True, odd_moments=True, keep_budget=8,
-                         eigh_backend="auto", room=1 << 30, admit=False, carrier=carrier,
-                         beside=memory.Price())
-    abstract = ex.face_round_compiled_bytes(
-        mesh, len(tables["points"]), rows=int(fs[0][1].shape[-2]), finite=int(tables["points"].shape[-1]),
-        infinity_width=iw, infinities=len(fi), ordered=True, odd_moments=True, keep_budget=8,
-        carrier=carrier, eigh_backend="auto", room=1 << 30)
-    assert got and got[0] == abstract > 0

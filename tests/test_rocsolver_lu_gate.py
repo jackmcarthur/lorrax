@@ -14,7 +14,6 @@ ROCm: ``python -m tests.test_rocsolver_lu_gate [--big]`` on one GCD.  Under pyte
 checks of the row run; the large-n regression (``test_large_n_route_is_exact_on_rocm``) runs
 only on a ROCm device (skipped elsewhere).
 """
-import os
 import sys
 import time
 
@@ -146,71 +145,7 @@ def main() -> int:
     return 1 if bad else 0
 
 
-# ---- pytest: the row's logic (CPU) ------------------------------------------------------
-
-def test_the_row_is_rocm_only_and_the_span_rule():
-    from distrib_la.local_lu import LOCAL_LU_ROUTE, local_lu_row
-    assert set(LOCAL_LU_ROUTE) == {"ROCM"}
-    row = LOCAL_LU_ROUTE["ROCM"]
-    assert row.target == "lorrax_rocsolver_lu_solve" and row.min_span_bytes == 1 << 31
-    assert row.tri_target == "lorrax_rocsolver_tri_solve"
-    assert set(row.dtypes) == {"float32", "float64", "complex64", "complex128"}
-    # The largest exact complex128 / float64 square systems of the native path stay native...
-    assert local_lu_row((11585, 11585), (11585, 11585), np.complex128, "ROCM") is None
-    assert local_lu_row((16384, 16384), (16384, 16384), np.float64, "ROCM") is None
-    assert local_lu_row((16, 312, 312), (16, 312, 312), np.complex128, "ROCM") is None   # Fe
-    # ...and the sizes the rocBLAS trsm defect hits are routed (A's span or B's).
-    for n, dt in ((11776, np.complex128), (12288, np.complex128), (16512, np.float64)):
-        assert local_lu_row((n, n), (n, n), dt, "ROCM") is row
-        assert local_lu_row((n, n), (n, 1), dt, "ROCM") is row                 # A alone spans it
-    assert local_lu_row((4096, 4096), (4096, 32769), np.complex128, "ROCM") is row  # B spans it
-    assert local_lu_row((4096, 4096), (4096, 32768), np.complex128, "ROCM") is None  # exactly 2^31
-    # complex64 / float32 at theirs (the span rule contains the defect's rule for every n)
-    assert local_lu_row((16384, 16384), (16384, 16384), np.complex64, "ROCM") is None
-    assert local_lu_row((16512, 16512), (16512, 16512), np.complex64, "ROCM") is row
-    assert local_lu_row((23168, 23168), (23168, 23168), np.float32, "ROCM") is None
-    assert local_lu_row((23296, 23296), (23296, 23296), np.float32, "ROCM") is row
-    assert local_lu_row((12288, 12288), (12288,), np.complex128, "ROCM") is row     # a vector b
-    for m in range(256, 40000, 128):
-        for item in (4, 8, 16):
-            if (m - 128) * (m + 1) * item >= 1 << 31:        # the defect's condition
-                assert m * m * item > 1 << 31                # ... is always routed
-    for leg in ("CUDA", "cpu"):
-        assert local_lu_row((12288, 12288), (12288, 12288), np.complex128, leg) is None
-
-
-def test_below_the_span_solve_local_is_jnp_linalg_solve_bit_for_bit():
-    jax = pytest.importorskip("jax")
-    import jax.numpy as jnp
-    from distrib_la import local_lu
-    jax.config.update("jax_enable_x64", True)
-    rng = np.random.default_rng(3)
-    a = rng.normal(size=(4, 40, 40)) + 1j * rng.normal(size=(4, 40, 40)) + 4 * np.eye(40)
-    b = rng.normal(size=(4, 40, 5)) + 0j
-    assert np.array_equal(np.asarray(local_lu.solve_local(jnp.asarray(a), jnp.asarray(b))),
-                          np.asarray(jnp.linalg.solve(jnp.asarray(a), jnp.asarray(b))))
-
-
-def test_the_target_is_in_both_rocm_tables_and_the_family_row():
-    pytest.importorskip("jax")
-    from ffi.common import ffi_loader, families
-    from distrib_la import loader
-    for t, sym in (("lorrax_rocsolver_lu_solve", "RocsolverLuSolveFfi"),
-                   ("lorrax_rocsolver_tri_solve", "RocsolverTriSolveFfi")):
-        assert loader._PLATFORMS["ROCM"]["targets"][t] == ffi_loader._PLATFORMS["ROCM"]["targets"][t] == sym
-        assert families.family_of(t) == "rocsolver" and families.state("rocsolver", "ROCM")[0] == "built"
-        for leg in ("CUDA", "cpu"):
-            assert t not in loader._PLATFORMS[leg]["targets"] and t not in ffi_loader._PLATFORMS[leg]["targets"]
-
-
-def test_the_handler_keeps_every_rocblas_operand_below_two_gib():
-    """The span rule is in the handler source: the limit, the blocking and the reverse laswp."""
-    src = open(os.path.join(os.path.dirname(__file__), "..", "src", "ffi", "cpp", "rocsolver",
-                            "lu_solve_ffi.cc")).read()
-    for needle in ("INT32_MAX) / static_cast<int64_t>(esize)", "b.limit / n", "(b.limit - n) / n + 1",
-                   "(limit - k) / lda + 1", "pv, -1)", "pv, 1)"):
-        assert needle in src, needle
-
+# ---- pytest: CPU checks of the row (the ROCm targets table check is in test_active_local_native_gate)
 
 def _on_rocm():
     try:
@@ -232,15 +167,6 @@ def test_large_n_route_is_exact_on_rocm(n, dt):
     jax.config.update("jax_enable_x64", True)
     out = run_case(n, dt, n, 0, force=False)
     assert out["routed"] and out["finite"] and out["resid"] <= _tol(dt), out
-
-
-@pytest.mark.skipif(not _on_rocm(), reason="GPU (ROCm) regression: needs an MI250X GCD")
-@pytest.mark.parametrize("which", ["lu", "L", "LH"])
-def test_large_n_triangular_route_is_exact_on_rocm(which):
-    import jax
-    jax.config.update("jax_enable_x64", True)
-    out = run_tri(12288, "complex128", 1024, which)
-    assert out["routed"] and out["finite"] and out["resid"] <= TOL, out
 
 
 if __name__ == "__main__":

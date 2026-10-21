@@ -33,44 +33,6 @@ def ordered_moment_identity(signed, infinity, *, matmul):
     return rows
 
 
-def ordered_pole_bound_ry(m1, inverse_coulomb_sqrt, *, energy_span_ry, gap_ry, matmul, eigh):
-    """Upper bound on the RPA poles of W from the bank's own quantities, per parent.
-
-    The poles are +-eigenvalues of s3 M, M = M0 + K with M0 = diag(D) the bare
-    transitions and K = Phi^H V Phi >= 0, so |Omega| <= ||M|| <= D_max + ||K||.
-    Every term of A0 = sum_j D_j (P_j + conj P_j) is PSD with D_j >= D_min, so
-    ||K|| <= ||x2|| / D_min with x2 = H A0 H, and x2 <= H^+ 2M1 H^+ (the
-    difference is x1^2 >= 0). Hence Omega_max <= D_max + lambda_max(H^+ 2M1 H^+)/D_min.
-    ``energy_span_ry`` >= D_max and ``gap_ry`` <= D_min come from the bank census;
-    a gapless census returns +inf and the bound never fires. ``m1`` and
-    ``inverse_coulomb_sqrt`` are [b,n,n] face arrays; returns [b] float64 (Ry).
-    """
-    if not float(gap_ry) > 0:
-        return jnp.full((m1.shape[0],), jnp.inf)
-    whitened = hermitian_part(matmul(inverse_coulomb_sqrt, matmul(2 * m1, inverse_coulomb_sqrt)))
-    top = eigh(whitened)[0][:, -1]
-    return float(energy_span_ry) + jnp.maximum(top, 0) / float(gap_ry)
-
-
-def ordered_shared_pole_value(model, partner, z, *, matmul):
-    """Evaluate the ordered carrier Wc_p(z) from stored positive-pole factors.
-
-    ``model`` and ``partner`` are (b [b,n,K], poles2 [b,K], active [b,K]) for
-    parent p and for the parent of -q (the same tuple at q = -q). Returns
-    b diag(1/(2W(z-W))) b^H - conj(b~) diag(1/(2W~(z+W~))) b~^T. At p = -q
-    this is sum Re(bb^H)/(z^2-W^2) + i Im(bb^H) z/(W(z^2-W^2)): the odd channel
-    is one extra contraction of the same vector, with no extra storage.
-    """
-    b, poles2, active = model
-    bt, poles2t, activet = partner
-    w = jnp.sqrt(jnp.where(active, poles2, 1.0))
-    wt = jnp.sqrt(jnp.where(activet, poles2t, 1.0))
-    d = jnp.where(active, 1 / (2 * w * (z - w)), 0)
-    dt = jnp.where(activet, 1 / (2 * wt * (z + wt)), 0)
-    return (matmul(b * d[:, None, :], b, transb="C")
-            - matmul(bt.conj() * dt[:, None, :], bt.conj(), transb="C"))
-
-
 def signed_shared_pole_passivity(signed, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, gates):
     """Hermitian-part passivity of the signed particle-hole model at z = i eta.
 
@@ -207,19 +169,6 @@ def shared_pole_passivity(model, inverse_coulomb_sqrt, *, eta_ry, matmul, eigh, 
 #: solve is not garbage); the cluster's vectors, never read, cannot refuse the gate, and
 #: its eigenvalues still decide lambda_min.
 PASSIVITY_CHECK_CUT = 1e-8
-
-
-def shared_pole_operator_passivity(wc, inverse_coulomb_sqrt, *, matmul, eigh, gates):
-    """Test an evaluated physical Wc(i eta) against the actual V support.
-
-    ``wc`` may include the versioned symmetry realization; no factors of its
-    averaged residues need to be materialized. Both square operands retain
-    their caller's all-P faces. The caller owns evaluation at imaginary eta
-    and memory admission, including the two square GEMMs and eigensolve.
-    """
-    inverse = inverse_coulomb_sqrt
-    response = -matmul(matmul(inverse, wc), inverse)
-    return _passivity_response_checks(response, eigh=eigh, gates=gates)
 
 
 def _passivity_response_checks(response, *, eigh, gates):

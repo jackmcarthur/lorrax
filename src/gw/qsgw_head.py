@@ -854,30 +854,6 @@ def _mesh_xy(mesh: Mesh) -> tuple[str, str]:
     return names[0], names[1]
 
 
-def _signed_fft_rows(kgrid: tuple[int, int, int]) -> np.ndarray:
-    """Integer real-space rows in the flat-k service's C ordering."""
-    axes = [np.fft.fftfreq(int(n), d=1.0 / int(n)) for n in kgrid]
-    rr = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1)
-    return np.asarray(rr.reshape(-1, 3), dtype=np.float64)
-
-
-def _cartesian_fft_multipliers(
-    kgrid: tuple[int, int, int],
-    bvec_cart: np.ndarray,
-) -> np.ndarray:
-    """Return ``2*pi * d(kappa)/d(k_cart) * R`` as ``(3,nk)``."""
-    B = np.asarray(bvec_cart, dtype=np.float64)
-    if B.shape != (3, 3):
-        raise ValueError(f"bvec_cart must have shape (3,3), got {B.shape}.")
-    if abs(float(np.linalg.det(B))) < 1.0e-14:
-        raise ValueError(
-            "bvec_cart is singular; Cartesian k derivatives are undefined."
-        )
-    # k_cart_j = sum_i kappa_i B_ij, hence
-    # d/dk_cart_j = sum_i (B^-1)_ji d/dkappa_i.
-    return 2.0 * np.pi * (np.linalg.inv(B) @ _signed_fft_rows(kgrid).T)
-
-
 def reduced_covector_to_cartesian(covector_reduced, bvec_cart):
     """Convert a reduced-k covector using LORRAX's row-vector B convention.
 
@@ -897,63 +873,6 @@ def reduced_covector_to_cartesian(covector_reduced, bvec_cart):
             f"axis of extent 3, got {A.shape}."
         )
     return jnp.einsum("ij,j...->i...", np.linalg.inv(B), A, optimize=True)
-
-
-def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
-    """Cached FFT-based Cartesian derivative kernel.
-
-    RETAINED WITHOUT A PRODUCTION CALLER (2026-08-23 retirement sweep,
-    D4): this and :func:`_cartesian_fft_multipliers` used to back the
-    public ``spectral_cartesian_derivative``/``covariant_cartesian_
-    derivative`` pair, both retired below (dead: zero production callers,
-    and the Si velocity expeditions measured the split construction they
-    implemented -- a separately-FFT-differentiated operator plus a
-    finite-link commutator -- as producing a correction with ~0 overlap
-    to the true one on real SOC data; see the module docstring's
-    ``v_Q = v_DFT + D_link(...)`` note and
-    ``reports/metal_head_pt_pipelines_2026-08-23/PLAN.md``).  These two
-    stayed: ``tests/multi_device/parallel_transport_profile.py`` imports
-    them directly (bypassing the now-deleted public wrapper) for its own
-    HLO-rematerialization check.  That test module was ALREADY broken
-    before this sweep touched anything -- it also imports
-    ``covariant_structured_delta``/``_structured_delta_kernel``, which do
-    not exist anywhere in this file and have not since before this
-    session (grep-verified); left unrepaired here, since untangling it
-    means editing a P=4 real-distributed-service gate this sweep cannot
-    execute to verify.  Left in place rather than deleted out from under
-    that reference, per DISCIPLINE's "grep-verified zero callers in src/
-    AND tests/" bar -- this one is not zero in tests/, even though the
-    caller is inert.
-    """
-    from ffi import ffi_dial_key
-
-    key = ("spectral_cart", id(mesh), tuple(kgrid), ffi_dial_key())
-    hit = _KERNEL_CACHE.get(key)
-    if hit is not None:
-        return hit
-    _mesh_xy(mesh)
-    from common.fft_helpers import make_flat_k_fftn, make_flat_k_ifftn
-
-    spec_3d = P(None, None, None, "x", "y")
-    component_spec_3d = P(None, None, None, None, "x", "y")
-    fft = make_flat_k_fftn(mesh, kgrid, spec_3d, norm="ortho")
-    # Batch x/y/z through one inverse-FFT service call.  Besides avoiding
-    # three dispatches, this keeps the shared real-space operator resident
-    # exactly once in the compiled graph.
-    ifft_components = make_flat_k_ifftn(mesh, kgrid, component_spec_3d, norm="ortho")
-    out_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
-
-    @jax.jit
-    def _kernel(operator_k, multipliers_cart_k):
-        operator_R = fft(operator_k)
-        weighted_R = operator_R[:, None, :, :] * (
-            1j * multipliers_cart_k.T[:, :, None, None]
-        )
-        deriv = jnp.moveaxis(ifft_components(weighted_R), 1, 0)
-        return jax.lax.with_sharding_constraint(deriv, out_sharding)
-
-    _KERNEL_CACHE[key] = _kernel
-    return _kernel
 
 
 def link_correction_bound(correction, velocity_dft, occupations_kn, *,

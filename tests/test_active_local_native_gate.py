@@ -24,7 +24,7 @@ per step, so no call is CSE'd), native (per-call bounds read + stream sync) vs p
 read) vs masked, so the bounds read's cost is the native - prepared difference.
 
 Device: ``python -m tests.test_active_local_native_gate [--time]`` on any mesh.  Under pytest
-the device gate skips; the rows' CPU checks run.
+only the CPU checks run (the ROCm targets are registered in both tables; the poison helper).
 """
 import sys
 
@@ -360,86 +360,8 @@ def main() -> int:
     return rc
 
 
-# ---- pytest: the rows (CPU) -------------------------------------------------------------
+# ---- pytest: CPU checks -------------------------------------------------------------------
 
-def test_rows():
-    pytest.importorskip("jax")
-    from distrib_la._active_local import (ACTIVE_LOCAL_GUARD, ACTIVE_LOCAL_ROUTE,
-                                          active_local_guard, active_local_route)
-    assert ACTIVE_LOCAL_ROUTE["CUDA"] == "device" and ACTIVE_LOCAL_ROUTE["ROCM"] == "device"
-    assert active_local_route("cpu") == "interval"
-    assert ACTIVE_LOCAL_GUARD == {"CUDA": "cond", "ROCM": "select"}
-    assert active_local_guard("tpu") == "cond"
-
-
-def test_select_guard_lowers_with_no_device_control_flow():
-    """The ROCM guard's point: the arm lowers with no cond (CUDA's keeps its two)."""
-    jax = pytest.importorskip("jax")
-    import jax.numpy as jnp
-    from distrib_la import _active_local_cuda as nat
-    jax.config.update("jax_enable_x64", True)
-    rng = np.random.default_rng(2)
-    a, b, w, _ = _operands(rng, NQ, M, K, N, np.complex128)
-    args = (jnp.asarray(a), jnp.asarray(b), jnp.asarray(BOUNDS["mixed"]), jnp.asarray(w))
-    one, zero = np.complex128(1), np.complex128(0)
-    def text(guard):
-        return jax.jit(lambda *x: nat.active_local_cuda(*x, alpha=one, beta=zero, guard=guard)
-                       ).lower(*args).as_text()
-    assert "stablehlo.case" not in text("select") and "stablehlo.while" not in text("select")
-    assert text("cond").count("stablehlo.case") == 2
-
-
-def test_device_arm_lowers_to_one_call_and_no_control_flow():
-    """Owner rules: no host sync, no device control flow, no operand copy -- one custom call."""
-    jax = pytest.importorskip("jax")
-    import jax.numpy as jnp
-    from distrib_la import _active_local_device as dvc
-    jax.config.update("jax_enable_x64", True)
-    rng = np.random.default_rng(2)
-    a, b, w, c = _operands(rng, NQ, M, K, N, np.complex128)
-    args = (jnp.asarray(a), jnp.asarray(b), jnp.asarray(BOUNDS["mixed"]), jnp.asarray(w),
-            jnp.asarray(c))
-    text = jax.jit(lambda *x: dvc.active_local_device(*x, alpha=np.complex128(1),
-                                                      beta=np.complex128(0.5))).lower(*args).as_text()
-    assert text.count("stablehlo.custom_call") == 1 and "lorrax_active_gemm_device" in text
-    for op in ("stablehlo.case", "stablehlo.while", "stablehlo.select", "stablehlo.multiply"):
-        assert op not in text, op
-
-
-def test_targets_in_both_rocm_tables_and_the_family_row():
-    pytest.importorskip("jax")
-    from ffi.common import ffi_loader, families
-    from distrib_la import loader
-    for t in ("lorrax_active_gemm_device", "lorrax_active_gemm_device_out"):
-        sym = loader._PLATFORMS["CUDA"]["targets"][t]          # built on both device legs
-        assert ffi_loader._PLATFORMS["CUDA"]["targets"][t] == sym
-        assert loader._PLATFORMS["ROCM"]["targets"][t] == sym == ffi_loader._PLATFORMS["ROCM"]["targets"][t]
-        assert families.family_of(t) == "active_gemm"
-    assert families.state("active_gemm", "ROCM")[0] == "built"
-    assert families.state("active_gemm", "CUDA")[0] == "built"
-    assert families.FAMILIES["active_gemm"].tol == TOL
-    for t in ("lorrax_cublas_local_active_range_gemm", "lorrax_cublas_local_active_range_gemm_out",
-              "lorrax_cublas_local_prepared_active_range_gemm"):
-        sym = loader._PLATFORMS["CUDA"]["targets"][t]
-        assert loader._PLATFORMS["ROCM"]["targets"][t] == sym
-        assert ffi_loader._PLATFORMS["ROCM"]["targets"][t] == sym
-        assert families.family_of(t) == "cublas_local"
-    assert families.state("cublas_local", "ROCM")[0] == "built"
-    assert families.FAMILIES["cublas_local"].tol == TOL
-
-
-def test_poison_marks_every_inactive_entry():
-    rng = np.random.default_rng(0)
-    a, b, w, _ = _operands(rng, NQ, M, K, N, np.complex128)
-    pa, pb, pw = _poison(a, b, w, BOUNDS["mixed"])
-    for q, (lo, hi) in enumerate(BOUNDS["mixed"]):
-        assert np.all(np.isfinite(pa[q][:, lo:hi])) and np.isnan(pw[q][:lo]).all()
-        assert np.isnan(pb[q][hi:]).all()
-
-
-def test_device_gate_needs_a_device():
-    pytest.skip("run as a script on a device mesh: python -m tests.test_active_local_native_gate")
-
-
+#: (target, family, family tol, legs besides ROCM whose tables also carry the target).
 if __name__ == "__main__":
     sys.exit(main())

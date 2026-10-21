@@ -19,7 +19,7 @@ the 2026-07 sweeps that funnelled raw reads through those helpers made the
 raw-read-only version of this tool blind to most of the tree — a
 FALSE-CLEAN sweep.  The recognised helper names are in ``ENV_HELPERS``;
 keep that set in sync with the grammar helpers the tree actually defines
-(``tests/test_env_registry.py`` shares the same visitor and has the
+(``tools/lint/test_env_registry.py`` shares the same visitor and has the
 negative controls).
 
 OLD-INTERPRETER HONESTY: on Python < 3.8 string literals parse as
@@ -31,7 +31,7 @@ the ``--selftest`` flag proves the walker sees a known fixture (run it if
 you doubt the interpreter).
 
 C++ ``getenv()`` reads are NOT covered by the AST walk; find those with
-``grep -rn 'getenv(' src/ffi`` (``tests/test_env_registry.py`` scans them
+``grep -rn 'getenv(' src/ffi`` (``tools/lint/test_env_registry.py`` scans them
 by regex and enforces registry rows for both sides).
 
 Keep ``docs/reference/env_vars.md`` in sync with this tool's output.

@@ -74,7 +74,7 @@ the report is a defect.
 
 `distrib_la._scalapack`, `._slate` and `._cusolvermp` are backends of the
 `distrib_la` public API. Call sites reach them through `distrib_la.backend_module()`
-or a plan; a `src/` import of one fails `tests/test_layering.py`.
+or a plan; a `src/` import of one fails `tools/lint/test_layering.py`.
 The distrib_la benches in `services/distrib_la/bench/` import
 `distrib_la._cusolvermp` directly.
 
@@ -133,7 +133,7 @@ tiles or one large one) belong in the deck.
 imports run downhill only. Three rules hold at every call site:
 
 * **The package is the public API.** A `src/` module imports a service's top-level
-  package, never a submodule (`tests/test_layering.py` rule 6).
+  package, never a submodule (`tools/lint/test_layering.py` rule 6).
 * **Drivers never name a backend.** The backend is chosen inside a service,
   from a deck key or the mesh platform.
 * **Announce or refuse.** A demotion is announced from the rank it happened
@@ -150,7 +150,7 @@ there, and at trace time where it is not. Make every announcement greppable
 and rank-disciplined. A factory-time dial goes into `ffi.FFI_DIAL_ENV` and
 `ffi.ffi_dial_key()`, so it enters kernel cache keys and the compile cache's
 cross-rank fingerprint.
-`tests/test_layering.py` enforces the level.
+`tools/lint/test_layering.py` enforces the level.
 
 Decide explicitly whether the caller picks the backend, and record why.
 Default to *no*: a dial whose settings are "correct" and "worse in every

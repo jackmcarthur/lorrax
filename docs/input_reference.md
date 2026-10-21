@@ -16,7 +16,7 @@ for htransform and exciton bands: a segment count, then one line per vertex,
 Meanings and prose are written by hand. The key set and the default column are
 generated: `python3 tools/gen_input_reference.py` rewrites each default cell from
 `_DEFAULTS` (a note after it in parentheses is kept), and
-`tests/test_env_registry.py` fails when a key has no row, a row names a key the
+`tools/lint/test_env_registry.py` fails when a key has no row, a row names a key the
 parser no longer accepts, or a default cell differs from the code.
 
 The last three sections document other input files: the `[downfold]` deck,

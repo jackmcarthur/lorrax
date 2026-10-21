@@ -49,7 +49,6 @@ CD  driven runs: pulses x refresh cadences x screening (frozen / refreshed), the
     split refresh, a max|df| trigger; per-refresh census, P(t), populations
 """
 import argparse
-import copy
 import json
 import logging
 import os
@@ -121,33 +120,6 @@ def _td_deck(ref, bands, outdir, *, tf_fs, dtm_as=50.0, efield=None, collision="
     if gamma_ev is not None and screening == "refreshed":
         raw["lorrax"]["collision_screening_gamma_ev"] = float(gamma_ev)
     return raw
-
-
-def _toml(raw):
-    """A TOML deck of ``raw`` (strings, numbers, booleans, nested tables, lists)."""
-    lines = []
-
-    def val(v):
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if isinstance(v, str):
-            return json.dumps(v)
-        if isinstance(v, (list, tuple)):
-            return "[" + ", ".join(val(x) for x in v) + "]"
-        return repr(v)
-
-    def table(prefix, d):
-        scal = {k: v for k, v in d.items() if not isinstance(v, dict)}
-        if prefix:
-            lines.append(f"[{prefix}]")
-        for k, v in scal.items():
-            lines.append(f"{k} = {val(v)}")
-        lines.append("")
-        for k, v in d.items():
-            if isinstance(v, dict):
-                table(f"{prefix}.{k}" if prefix else k, v)
-    table("", raw)
-    return "\n".join(lines)
 
 
 def main():

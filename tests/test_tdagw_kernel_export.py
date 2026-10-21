@@ -122,11 +122,5 @@ def main() -> int:
     return 0 if ok else 1
 
 
-def test_tdagw_kernel_export_needs_tdgw():
-    """Collected by pytest: TDGW is not a LORRAX dependency, so this runs as a script."""
-    import pytest
-    pytest.skip("run as a script where TDGW is installed: python3 tests/test_tdagw_kernel_export.py")
-
-
 if __name__ == "__main__":
     sys.exit(main())

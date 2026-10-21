@@ -92,7 +92,7 @@ def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh) -> dict:
     (degenerate ``fine_grid == coarse`` = plain sharded ifftn), so the (μ,ν)
     sharding survives and no rank gathers an N_μ²-class tile (the eager
     ``local_ifftn3`` form this replaces was audit-P0-4-class debt, gated by
-    ``tests/test_fft_shardmap_context.py``).
+    ``tools/lint/test_fft_shardmap_context.py``).
     For the RPA density-response / kernel (``include_W=False``) the W-term is
     never built, so ``W_R`` is only a shape/sharding-correct placeholder and
     ``W_q`` itself serves.  The restart loader emits ``W_q`` but not ``W_R``, so

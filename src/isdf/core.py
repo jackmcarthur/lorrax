@@ -1399,7 +1399,7 @@ def deprecated_env_record(env_name: str, key_value) -> str:
 # ``runtime.env_flags.env_bool`` has the identical vocabulary plus the
 # once-per-(name,value) ``*** LORRAX SANITY`` announcement on unrecognised
 # tokens.  (P1.3 grammar unification, 2026-07-31; the drift gate is
-# ``tests/test_env_grammar.py``, which scans this file as an OWNED file.)
+# ``tools/lint/test_env_grammar.py``, which scans this file as an OWNED file.)
 from runtime.env_flags import env_bool
 from gw.gw_config import ZETA_RCOND_DEFAULT
 
@@ -1427,7 +1427,7 @@ def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
 
 def _closure_mode():
     # The DRIVER reads the dial and passes it: ``common.spectral_closure`` is
-    # L2 mathematics and ``tests/test_layering.py`` requires it to be a
+    # L2 mathematics and ``tools/lint/test_layering.py`` requires it to be a
     # function of its arguments.  The variable's NAME is still declared once,
     # in the guard module, so nothing is duplicated but the lookup itself.
     return spectral_closure.resolve_mode(os.environ.get(spectral_closure.MODE_ENV))
@@ -2309,18 +2309,3 @@ def zeta_factor_resident(L_q, lu_piv, mesh_xy, *, solver_kind):
         lu_piv = linalg_batch_layout(lu_piv, mesh_xy)
     return L_q, lu_piv
 
-
-def _band_norms_slice(
-    band_norms: np.ndarray | None, band_range: tuple[int, int], nb: int,
-) -> jax.Array:
-    """Slice + clamp the pseudobands weights to a ``(nb,)`` jax array; see docs/architecture/zeta_fit_face_psi_cct.md."""
-    if band_norms is None:
-        return jnp.ones((nb,), dtype=jnp.float64)
-    lo, hi = band_range
-    n_avail = max(0, min(int(band_norms.shape[0]) - lo, hi - lo))
-    sliced = np.zeros((hi - lo,), dtype=np.float64)
-    if n_avail > 0:
-        sliced[:n_avail] = np.asarray(band_norms[lo:lo + n_avail], dtype=np.float64)
-    # max(1, 0) = 1 → padded entries divide ψ by 1, leaving the zeroed
-    # ψ at zero.  No divide-by-zero hazard for [n_avail:nb] tail.
-    return jnp.maximum(jnp.asarray(sliced), 1.0)

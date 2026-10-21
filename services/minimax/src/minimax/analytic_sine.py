@@ -228,29 +228,6 @@ def make_rule(A: float, epsilon: float, eta: float = .8,
                     p['q'],p['eta'],corr,v)
 
 
-def amplitude_factor(rule: SineRule, v: float) -> tuple[float,float]:
-    """K_m(v) in the exact correction error formula; adaptive scalar quadrature.
-
-    Returns factor and the quadrature routine's (not rigorous) error estimate.
-    The closed parameter bound does NOT require evaluating this function.
-    """
-    V = math.sin(rule.alpha/2)**2
-    if not (0 <= v <= V):
-        raise ValueError('Need 0 <= v <= sin(alpha/2)^2')
-    q, d = rule.q_correction, rule.m_correction+1
-    def f(u):
-        if u > 30:
-            return 0.
-        s = math.cosh(u)**2
-        gamma = math.acosh(2*s/V-1)
-        r = math.exp(-gamma)
-        ratio = ((1-q)*math.exp(d*(math.log(r)-math.log(q)))*(1+r)
-                 /(1-q*r+(r-q)*r**(2*d)))
-        return (1-v)/(s-v)*ratio/(u*u+math.pi**2/4)
-    integral, est = quad(f,0,30,epsabs=5e-14,epsrel=5e-13,limit=300)
-    return 1-integral,est
-
-
 def audit(rule: SineRule, points: int = 20001) -> dict:
     if points < 3:
         raise ValueError('points must be at least 3')

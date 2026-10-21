@@ -28,9 +28,7 @@ Run the tests with ``JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_devic
 """
 from __future__ import annotations
 
-import importlib.util
 import os
-import sys
 
 import numpy as np
 import pytest
@@ -45,18 +43,6 @@ E_VM = tdgw_io.EFIELD_IN_VPERM
 HBAR_EV_AS = tdgw_io.HBAR_IN_EV_AS
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-def load_td_response():
-    """``tools/td_response.py`` as a module (tools/ has no package)."""
-    name = "lorrax_tools_td_response"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(
-            name, os.path.join(_REPO, "tools", "td_response.py"))
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mod
-        spec.loader.exec_module(mod)
-    return sys.modules[name]
 
 
 @pytest.fixture
@@ -104,19 +90,6 @@ def energies_ha(system):
     The same arithmetic as ``write_header`` -> ``bundle_header``: (e/Ry) * Ry / Ha.
     """
     return (np.asarray(system["e_ev"], float) / RYD_TO_EV) * RYD_TO_EV / HA_IN_EV
-
-
-def write_kernel(path, system, *, tda=False, scale=1.0):
-    """``system['K_ha']`` (times ``scale``) as a TDGW kernel.h5 the deck's model reads.
-
-    ``write_tdgw_kernel`` takes Ry and TDGW reads K = -kernel/2 Ha, so 2 K_Ha
-    is passed: the propagator applies exactly K_Ha.
-    """
-    from tdagw.kernel_export import write_tdgw_kernel
-    write_tdgw_kernel(str(path), 2.0 * scale * np.asarray(system["K_ha"]),
-                      kpts=np.asarray(system["k_frac"]), ibndmin=1, ivbm=system["n_val"],
-                      sys_dim=2, nspinor=system["nspinor"], tda=tda)
-    return str(path)
 
 
 def run_deck(outdir, header_dir, system, *, trials, tf_as, dt_measure_as, method="dp54",
@@ -181,88 +154,6 @@ def run_deck(outdir, header_dir, system, *, trials, tf_as, dt_measure_as, method
     return res, stats
 
 
-def propagate_state(header_dir, system, rho0, *, tf_as, dt_measure_as, rtol=1e-12,
-                    atol=1e-16, max_step_as=None, kernel_file=None, model_hook=None):
-    """Propagate host initial states ``rho0`` (ntr, nk, nb, nb) with no field, dp54.
-
-    The deck route always starts from rho_eq; an instantaneous length-gauge
-    kick rho(0+) = e^{-i kappa r} rho_eq e^{i kappa r} needs the propagator's
-    own entry point, ``tdagw.propagate.run_propagation``, with the system and
-    the self-energy model built by the driver's stages from the same deck.
-    Returns (t (nt,), {"polarization": (nt, ntr, 3), "current": ...}, stats).
-    """
-    import jax.numpy as jnp
-    from common.collectives import resolve_mesh
-    from tdagw import propagate as tp
-    from tdagw import stages
-    from tdagw.td_config import parse_td_deck
-
-    nb = int(system["e_ev"].shape[1])
-    lorrax = {"method": "dp54", "intraband": False}
-    if kernel_file:
-        lorrax.update(kernel_file=str(kernel_file), model="tdgw_kernel")
-    ts_tab = {"t0": 0, "tf": float(tf_as), "dt_measure": float(dt_measure_as)}
-    if max_step_as is not None:
-        ts_tab["max_step"] = float(max_step_as)
-    raw = {"control": {"calc_type": "COHSEX" if kernel_file else "IP", "timesteps": ts_tab,
-                       "ivp": {"rtol": float(rtol), "atol": float(atol)},
-                       "files": {"outdir": "unused", "load_header_from": str(header_dir)}},
-           "system": {"ibndmin": 1, "ibndmax": nb, "ivbm": int(system["n_val"]),
-                      "geometry": "slab"},
-           "measurements": {"types": ["polarization", "current"]}, "lorrax": lorrax}
-    deck = parse_td_deck(raw, source="propagate_state")
-    v = deck.values
-    mesh = resolve_mesh()
-    sysd = stages.load_system(deck, mesh)
-    model = stages.build_self_energy(deck, sysd, mesh)
-    if model_hook is not None:
-        model = model_hook(model)
-    rho0 = np.asarray(rho0, complex)
-    ntr = rho0.shape[0]
-    host = np.zeros((ntr, sysd.nk_pad, nb, nb), complex)
-    host[:, :sysd.nk] = rho0
-    mtsteps = np.arange(v["control.timesteps.t0"], v["control.timesteps.tf"]
-                        - 1e-8 * v["control.timesteps.dt_measure"],
-                        v["control.timesteps.dt_measure"])
-    # dp54 from the deck's controller; only the fields this PropagatorConfig
-    # declares (n_sub went away with the fixed-step sampling rework)
-    want = dict(method="dp54", t0=v["control.timesteps.t0"], tf=v["control.timesteps.tf"],
-                dt_measure=v["control.timesteps.dt_measure"],
-                dt=v["control.timesteps.dt_measure"], n_sub=1, n_corr=2,
-                atol=v["control.ivp.atol"], rtol=v["control.ivp.rtol"],
-                max_step=v["control.timesteps.max_step"], chunk=mtsteps.size,
-                remainder=False)
-    cfg = tp.PropagatorConfig(**{k: x for k, x in want.items()
-                                 if k in tp.PropagatorConfig._fields})
-    got = {}
-
-    def on_chunk(i0, i1, samples, rho_fn, t_state):
-        rho_fn()
-        for k, val in samples.items():
-            got[k] = np.asarray(val)
-
-    stats, _ = tp.run_propagation(
-        cfg, stages.sample_spec(deck, sysd), tp.place_state(host, mesh), sysd.ops, model,
-        lambda t: jnp.zeros((ntr, 3)), mesh, cell_volume=sysd.cell_volume,
-        nspinor=sysd.nspinor, count=ntr * sysd.nk * nb * nb, mtsteps=mtsteps,
-        on_chunk=on_chunk)
-    return mtsteps, got, stats
-
-
-def kicked_states(system, kappas, direction):
-    """rho(0+) = e^{-i kappa r_a} rho_eq e^{i kappa r_a} per k, one state per kappa."""
-    from scipy.linalg import expm
-    r = np.asarray(system["r"])[direction]
-    nk, nb = r.shape[0], r.shape[1]
-    req = np.diag((np.arange(nb) < system["n_val"]).astype(float))
-    out = np.zeros((len(kappas), nk, nb, nb), complex)
-    for i, kap in enumerate(kappas):
-        for k in range(nk):
-            u = expm(-1j * kap * r[k])
-            out[i, k] = u @ req @ u.conj().T
-    return out
-
-
 def circular_trial(e0_vm, omega_ev, *, sign=+1, envelope=None):
     """TDGW Efunc strings of E0 env(t) (cos wt, sign sin wt, 0), t in as.
 
@@ -277,29 +168,6 @@ def circular_trial(e0_vm, omega_ev, *, sign=+1, envelope=None):
 
 def gaussian_env(tc_as, tau_as):
     return f"np.exp(-((t - {float(tc_as)!r}) / {float(tau_as)!r})**2)"
-
-
-def pulse_au(tdr, e0_vm, omega_ev, tc_as, tau_as, pol):
-    """The tools' Pulse of a Gaussian drive written by :func:`trial_for`.
-
-    pol: 'x', 'y', '+' (sigma+), '-' (sigma-).  E = E0 g(t) Re[a e^{-i w t}].
-    """
-    a = {"x": (1, 0, 0), "y": (0, 1, 0), "+": (1, 1j, 0), "-": (1, -1j, 0)}[pol]
-    return tdr.Pulse(a=np.asarray(a, complex) * (e0_vm / E_VM),
-                     w=(omega_ev / HBAR_EV_AS) * T_AS, tc=tc_as / T_AS, tau=tau_as / T_AS)
-
-
-def trial_for(e0_vm, omega_ev, tc_as, tau_as, pol):
-    """TDGW Efunc of the same Gaussian drive (cos/sin carriers, t in as)."""
-    env = f"{float(e0_vm)!r} * {gaussian_env(tc_as, tau_as)}"
-    w = float(omega_ev) / HBAR_EV_AS
-    cos, sin = f"np.cos({w!r} * t)", f"np.sin({w!r} * t)"
-    if pol == "x":
-        return {"E_x": f"{env} * {cos}", "E_y": 0, "E_z": 0}
-    if pol == "y":
-        return {"E_x": 0, "E_y": f"{env} * {cos}", "E_z": 0}
-    s = 1 if pol == "+" else -1
-    return {"E_x": f"{env} * {cos}", "E_y": f"{s} * {env} * {sin}", "E_z": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -576,32 +444,3 @@ def haldane(*, n=6, t1_ev=1.0, t2_ev=0.03, phi=np.pi / 2, mass_ev=0.95, a_bohr=4
 # ---------------------------------------------------------------------------
 # Observables on propagated density matrices
 # ---------------------------------------------------------------------------
-
-def energy_per_cell(system, rho):
-    """E[rho] = g_s sum_k w_k [Tr(eps_k rho_k) + (1/2) Tr(dSigma_k[drho] drho_k)], Ha.
-
-    The functional whose flow is the TD-aGW equation: with K = K^H - K^W and
-    K_{knm,k'n'm'} = K_{k'm'n',kmn} (V-bar symmetric, W reciprocal),
-    dE/dt = g_s sum_k w_k Tr((eps + dSigma) d rho/dt) = Omega E(t).j(t).  The
-    1/2 is the Hartree and screened-exchange double counting.
-    rho : (nt, nk, nb, nb).  Returns (nt,).
-    """
-    e = energies_ha(system)
-    nk, nb = e.shape
-    g_s = 2.0 if system["nspinor"] == 1 else 1.0
-    req = np.zeros((nk, nb, nb))
-    req[:, np.arange(system["n_val"]), np.arange(system["n_val"])] = 1.0
-    d = np.asarray(rho) - req[None]
-    band = np.einsum("kn,tknn->t", e, np.asarray(rho)).real
-    out = band
-    if system.get("K_ha") is not None:
-        ds = np.einsum("knmKNM,tKNM->tknm", system["K_ha"], d)
-        out = out + 0.5 * np.einsum("tknm,tkmn->t", ds, d).real
-    return g_s * out / nk
-
-
-def work_per_cell(t, E, j, cell_volume):
-    """Omega int_0^t E.j dt' on the samples (composite Simpson on even sub-intervals, trapezoid else)."""
-    from scipy.integrate import cumulative_simpson
-    p = np.einsum("ta,ta->t", np.asarray(E), np.asarray(j).real)
-    return cell_volume * np.concatenate([[0.0], cumulative_simpson(p, x=t)])

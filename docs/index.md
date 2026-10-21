@@ -68,7 +68,7 @@ LORRAX starts from a BerkeleyGW-format `WFN.h5`; producing one from a crystal is
 other page links to the owner rather than restating it.** A fact restated on
 two pages drifts: when one copy is corrected, the other stays wrong. If you
 find yourself explaining something the table assigns elsewhere, write one
-sentence and a link. `tests/test_docs_register.py` checks that every link in
+sentence and a link. `tools/lint/test_docs_register.py` checks that every link in
 this table resolves and that every published page is in the site navigation.
 
 ### Use
@@ -92,7 +92,7 @@ this table resolves and that every published page is in the site navigation.
 | **what each driver reads, computes and writes** | [Drivers](drivers.md) · [Downfold](downfold.md) | invocation, the flags and keys that change the result, outputs and refusals of each driver in chain order; the downfold equations, procedure, outputs and refusals. |
 | **what a deck key does** | [Input reference](input_reference.md) | generated from the parser; the deck is the record for anything that changes the numbers. |
 | **what each GW output file contains, and how LORRAX maps to BerkeleyGW** | [BerkeleyGW users](how-to/berkeleygw-users.md) | BerkeleyGW input keys and their deck counterparts; the format, columns, units, band and k conventions of `eqp0.dat`/`eqp1.dat`, `sigma_diag.dat`, `sigma_mnk.h5`, the restart bundle, `qp_wfn_rotations.h5`, `WFN_qp.h5`, the dipole files and `gwjax.out`; the conventions that move numbers between the codes; the measured agreement; the BSE comparison conventions. |
-| **what an environment variable is called and what it defaults to** | [Environment variables](reference/env_vars.md) | **spelling, default, class and parse grammar, and nothing else.** Machine-enforced by `tests/test_env_registry.py`. Every row's explanation lives on the owner page it links to. |
+| **what an environment variable is called and what it defaults to** | [Environment variables](reference/env_vars.md) | **spelling, default, class and parse grammar, and nothing else.** Machine-enforced by `tools/lint/test_env_registry.py`. Every row's explanation lives on the owner page it links to. |
 | **what a particular run actually resolved** | **the driver report** (`kmeans.out` for centroid selection; `gwjax.out` for GW), with the exhaustive runtime inventory behind `LORRAX_DEBUG_PRINT=1`: [annotated startup formats](environment/overview.md#startup-block) | the report records the active calculation pathways; debug adds allocator, library and capability forensics. Both outrank static defaults. |
 | **what the machine provides, and what breaks when a layer is missing** | [Environment overview](environment/overview.md) · [Frontera](environment/machines/frontera.md) · [Perlmutter](environment/machines/perlmutter.md) | the layered dependency tree, the shared JAX configuration, the GPU memory pool, and the per-machine facts. |
 | **why CPU collectives run on `impl=mpi`** | [Collective transports](environment/transports.md) | the gloo corruption evidence, the jaxlib guard and clique warm-up, the thread level and the MPIwrapper recipe. |

@@ -46,7 +46,7 @@ python -m pip install -e ../lxkit -e .
 ```
 
 Import top-level names only. `from distrib_la.<submodule> import …` from
-outside the package fails `tests/test_layering.py`, because the package is its
+outside the package fails `tools/lint/test_layering.py`, because the package is its
 own facade: ScaLAPACK, SLATE and cuSOLVERMp are reached through one
 module, `distrib_la.loader`, and nowhere else. Native JAX routes, the
 vocabularies and the capability report work with no native library present;

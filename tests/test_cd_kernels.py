@@ -11,7 +11,6 @@ import subprocess
 import sys
 import textwrap
 
-import pytest
 
 SCRIPT = textwrap.dedent(r'''
     import numpy as np, jax, jax.numpy as jnp

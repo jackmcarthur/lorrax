@@ -34,14 +34,14 @@ anything else                    ``False``, **announced once per (name,
 ===============================  ==========================================
 
 The last row is the one worth arguing about, and the answer is inherited
-rather than re-decided: ``tests/test_env_grammar.py`` pins unrecognised ->
+rather than re-decided: ``tools/lint/test_env_grammar.py`` pins unrecognised ->
 ``False``, and ``TASTE.md`` rule 13 says a typo must never REFUSE.  So an
 unrecognised token resolves, in a stated direction, and says so — which is
 what makes the direction safe to depend on.
 
 THE C++ TWIN.  ``src/ffi/cpp/phdf5/ctx.h::env_flag`` implements the same
 table for the native layer, which cannot call Python.  Two transcriptions
-of one grammar; ``tests/test_env_grammar.py`` is what holds them in step.
+of one grammar; ``tools/lint/test_env_grammar.py`` is what holds them in step.
 """
 from __future__ import annotations
 

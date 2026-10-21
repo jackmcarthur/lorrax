@@ -12,7 +12,7 @@ branch on.
 THE PACKAGE IS THE PUBLIC API.  There is no separate facade module: everything
 a consumer needs is a top-level name here, and importing
 ``distrib_la.<submodule>`` from outside is a layering violation the
-monorepo's ``tests/test_layering.py`` fails on.  That is what makes
+monorepo's ``tools/lint/test_layering.py`` fails on.  That is what makes
 "only distrib_la sees the provider families" checkable rather than
 aspirational — ScaLAPACK, SLATE and cuSOLVERMp appear in
 exactly one dependency edge in this package (:mod:`distrib_la.loader`, which

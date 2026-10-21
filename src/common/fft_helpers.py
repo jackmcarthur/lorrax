@@ -38,7 +38,7 @@ def local_ifftn3(x_local, *, axes: tuple[int, ...] = (-3, -2, -1), norm: str | N
     Do NOT call it eagerly on a (μ,ν)-sharded global array: outside a
     shard_map, jax gathers the full operand onto every rank — an N_μ²-class
     tile, forbidden by the scaling doctrine (audit P0-4).
-    ``tests/test_fft_shardmap_context.py`` gates this by AST for src/bse and
+    ``tools/lint/test_fft_shardmap_context.py`` gates this by AST for src/bse and
     src/gw: every call site's enclosing-function chain must construct a
     shard_map (or be a ratcheted, documented single-device exception).
     """

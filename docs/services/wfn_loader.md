@@ -12,7 +12,7 @@ There are two supported spellings: `import wfn_loader` and top-level names
 (after runtime startup, or `ffi._services.ensure_on_path()` for a
 direct-library caller, has selected the service set), or
 `from file_io import WfnLoader` / `WFNReader` (an alias of the same class
-object). `from wfn_loader.loader import …` fails `tests/test_layering.py`, and
+object). `from wfn_loader.loader import …` fails `tools/lint/test_layering.py`, and
 `src/file_io/wfn_loader.py` must not exist. Every module-scope importer of
 the public API in `src/` carries a runtime or compatibility seal on a line above the
 import.

@@ -515,28 +515,6 @@ def build_packed_parent_green_carrier(
         layout=wfns.layout)
 
 
-def attach_packed_parent_green_carrier(
-    wfns: "Wavefunctions", psi_nmu_parent, psi_mun_parent, *, plan,
-    mesh_xy: Mesh,
-) -> "Wavefunctions":
-    """Attach already-packed raw-parent faces to a full-k face bundle."""
-    carrier = build_packed_parent_green_carrier(
-        wfns, psi_nmu_parent, psi_mun_parent, plan=plan, mesh_xy=mesh_xy)
-    import dataclasses
-    return dataclasses.replace(wfns, green_parent=carrier)
-
-
-def attach_parent_green_carrier(
-    wfns: "Wavefunctions", psi_rmu_Y_parent, psi_rmuT_X_parent, *, plan,
-    mesh_xy: Mesh,
-) -> "Wavefunctions":
-    """Attach raw-parent loader outputs to a face bundle."""
-    psi_nmu, psi_mun = parent_faces(
-        psi_rmu_Y_parent, psi_rmuT_X_parent, mesh_xy=mesh_xy, layout=wfns.layout)
-    return attach_packed_parent_green_carrier(
-        wfns, psi_nmu, psi_mun, plan=plan, mesh_xy=mesh_xy)
-
-
 def psi_field_names(layout: str) -> tuple[str, ...]:
     """Name the two canonical face orientations for residency accounting."""
     if layout not in _LAYOUTS:
@@ -547,25 +525,6 @@ def psi_field_names(layout: str) -> tuple[str, ...]:
 def padded_centroid_extent(wfns: "Wavefunctions") -> int:
     """Read the packed centroid extent from the parent or transient face carrier."""
     return face_extents(wfns)[2]
-
-
-def bundle_bytes_per_rank(wfns: "Wavefunctions") -> dict:
-    """Count addressable bytes of stored parent and transient child faces on this rank."""
-    out: dict = {}
-    for f in psi_field_names(wfns.layout):
-        arr = getattr(wfns, f)
-        if arr is None:
-            continue
-        out[f] = int(sum(int(s.data.nbytes) for s in arr.addressable_shards))
-    if wfns.green_parent is not None:
-        for f in ("psi_nmu", "psi_mun"):
-            arr = getattr(wfns.green_parent, f)
-            if arr is None:
-                continue
-            out[f"green_parent.{f}"] = int(sum(
-                int(s.data.nbytes) for s in arr.addressable_shards))
-    out["total"] = int(sum(out.values()))
-    return out
 
 
 # ---------------------------------------------------------------------------

@@ -63,7 +63,7 @@ is ``runtime.initialize_communicator_stack`` (step 5b, above).  It landed in
 **L1 — physics** — the most permissive level in the tree — and ``runtime``
 (L3) then had to reach *up* into it.  That import was written
 function-locally, which made the direction invisible in the file header
-without making it legal: ``tests/test_layering.py`` reports lazy edges too.
+without making it legal: ``tools/lint/test_layering.py`` reports lazy edges too.
 
 The fix is the one this tree already made for the same shape, and recorded as
 numbered request **R9** (``docs/architecture/layers.md`` §7, and the LAYERING
@@ -83,7 +83,7 @@ must be importable *before* jax reads its environment.
 (The third package-scope importer used to be ``.cholesky_2d``; the
 distrib_la replumb deleted it and its re-export block, and the conclusion
 above is unchanged because it never rested on that one module — ``import
-common`` still imports jax, and ``tests/test_layering.py`` is what keeps
+common`` still imports jax, and ``tools/lint/test_layering.py`` is what keeps
 that from being a claim nobody re-checks.)  This module itself
 imports only the standard library at module scope (jax is imported inside
 :func:`describe` and ``importlib`` inside the two private probes), so as
