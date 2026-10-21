@@ -1547,7 +1547,57 @@ the endpoint quadrature, density ordering, fixed-$N$ stationary solve and
 the extra coherent dressing term. These are model diagnostics, not material
 initial-state preparation or a justification for dropping principal values.
 
-The next constructive research comparison is the paired covariance-root
+###### Virtual dressing and the initial-state limit
+
+The boundary counterexample has a controlled initial-preparation
+interpretation; it is not proof that a correlated reference cannot help.
+Consider two filled levels coupled to one empty level and a vacuum boson,
+with $\Delta_a=E_{\rm empty}+\Omega-E_a>0$ and weak transition amplitudes
+$v_a$. Define the positive matrix
+
+$$
+B_{ab}=\frac{v_a v_b^*}{\Delta_a\Delta_b},\qquad U(t)=e^{-iE_Pt}.
+$$
+
+In the off-resonant $\eta\to0$ limit, the saturated one-sided particle
+kernel gives $\Gamma_{PP}=i[E_P,B]$. Starting from the bare occupied
+projector and retaining the free commutator, the leading correction is
+$\delta\rho_{PP}(t)=U(t)BU^\dagger(t)-B$. Its trace is zero, but the hole
+matrix $B-U(t)BU^\dagger(t)$ is generally indefinite. Thus virtual
+off-diagonal changes can survive the infinite-time replacement even though
+the off-resonant diagonal scattering rates vanish. A physical finite-time
+calculation also contains the accompanying diagonal virtual depletion:
+$h_{ab}(t)=\alpha_a(t)\alpha_b(t)^*$, where
+$\alpha_a(t)=v_a[1-e^{i\Delta_at}]/\Delta_a$.
+
+A consistently correlated ground-state block is instead
+$\rho_{PP}^{\rm GS}=I-B+O(v^4)$ with matching population in the empty
+sector. Its free commutator cancels this $O(v^2)$ source. Exact small
+fixed-number fermion--boson diagonalization confirms an $O(v^4)$ residual
+of the same full Markov generator at that state, versus $O(v^2)$ at the bare
+projector. This is an off-resonant, fixed-phase weak-coupling diagnostic,
+not a self-consistent instantaneous-H calculation or a proof of driven
+Pauli invariance. An undamped single boson has persistent memory, so its
+coarse-grained initial-slip identity is not a general Markov-limit theorem.
+
+Finite $\eta$ adds a separate effect: diagonal virtual-transition tails
+$2\eta |v_a|^2/(\Delta_a^2+\eta^2)$ need not vanish at the lossless
+correlated ground state. Changing the scalar line shape alone does not
+remove the column-sampling minor above: a causal compact-support spectrum
+can remove absorption tails while retaining unequal dispersive terms.
+Regulator convergence, physical spectral damping and initial-correlation
+preparation must therefore be checked separately. The distinction is
+consistent with [initial slippage in Redfield theory](https://gaspard.pierre.web.ulb.be/GN.JCP.99a.pdf)
+and [correlated GKBA initialization](https://arxiv.org/html/1806.05639v1),
+neither of which is a general positivity theorem for this nonlinear GW
+snapshot closure. These results motivate testing a genuinely correlated
+reference and its consistent regulator before attributing every excursion
+to an irreparable dissipative prescription.
+The independently reproduced three-test CPU control and its exact scope
+are recorded in
+[the finite-memory/initial-dressing receipt](../../tests/tdagw/cri3_qgrid_750_campaign/evidence/FINITE_MEMORY_INITIAL_DRESSING_20261021.json).
+
+A separate constructive research comparison is the paired covariance-root
 channel model below, keeping the original full $M_H$ explicitly. It must be
 tested against a small exact number-conserving fermion–boson model for
 ground-state stationarity and kicked-state coherences, not just positivity.
