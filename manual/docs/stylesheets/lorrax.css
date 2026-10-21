@@ -1,0 +1,224 @@
+/* LORRAX manual theme for MkDocs Material. See docs-kit/STYLE_GUIDE.md. Authors never edit this file. */
+
+:root, [data-md-color-scheme="default"] {
+  --lx-navy: #1f2a44; --lx-ink: #1d2130; --lx-body: #2b2f3a; --lx-muted: #6a6f7c; --lx-faint: #8a8e98;
+  --lx-paper: #fcfbf8; --lx-side: #f4f2ec; --lx-code: #efece4; --lx-rule: #e3e0d8; --lx-rule-soft: #efece4;
+  --lx-blue: #2c4f8f; --lx-blue-tint: #eaeff7; --lx-blue-edge: #cfd9ea;
+  --lx-gold: #b88a1e; --lx-gold-mark: #d4a73a;
+  --lx-red: #a3412a; --lx-red-tint: #f7ebe6; --lx-red-edge: #ebd0c6;
+  --lx-serif: "Source Serif 4", Georgia, serif;
+  --md-primary-fg-color: var(--lx-navy);
+  --md-primary-fg-color--light: var(--lx-blue);
+  --md-primary-fg-color--dark: #131b2e;
+  --md-accent-fg-color: var(--lx-blue);
+  --md-default-bg-color: var(--lx-paper);
+  --md-default-fg-color: var(--lx-ink);
+  --md-default-fg-color--light: var(--lx-muted);
+  --md-default-fg-color--lighter: var(--lx-faint);
+  --md-typeset-color: var(--lx-body);
+  --md-typeset-a-color: var(--lx-blue);
+  --md-code-bg-color: var(--lx-side);
+  --md-code-fg-color: var(--lx-ink);
+  --md-admonition-icon--refuses: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="5.8"/><path d="M3.9 12.1L12.1 3.9"/></svg>');
+  --md-admonition-icon--note: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 7.3V11"/><circle cx="8" cy="5" r="0.7" fill="black" stroke="none"/></svg>');
+  --md-admonition-icon--cache: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 2.5H9.5L12.5 5.5V13.5H4Z"/><path d="M9.5 2.5V5.5H12.5"/></svg>');
+}
+
+/* ---------- shell ---------- */
+.md-header { height: 52px; box-shadow: none; }
+.md-header__inner { height: 52px; }
+.md-header__button.md-logo { display: none; }
+.md-header__title { font-family: var(--lx-serif); font-weight: 600; font-size: 19px; letter-spacing: 0.03em; }
+.md-header__topic:first-child::before { content: ""; display: inline-block; width: 13px; height: 13px; background: var(--lx-gold-mark); margin-right: 10px; vertical-align: -1px; }
+.md-header__topic:first-child::after { content: "Manual"; font-family: "IBM Plex Sans", sans-serif; font-weight: 400; font-size: 13px; letter-spacing: 0; color: #aab3c8; margin-left: 12px; }
+.md-search__form { background: rgba(255,255,255,0.09); border-radius: 4px; height: 32px; }
+.md-tabs { display: none; }
+
+.md-sidebar--primary .md-sidebar__scrollwrap { background: var(--lx-side); border-right: 1px solid var(--lx-rule); }
+.md-nav { font-size: 14px; }
+.md-nav__item--section > .md-nav__link, .md-nav--primary > .md-nav__title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--lx-muted); }
+.md-nav__link { color: #2b2f3a; }
+.md-nav__link--active, .md-nav__link:hover { color: var(--lx-blue); }
+.md-nav--primary .md-nav__link--active { font-weight: 600; box-shadow: inset 2px 0 0 var(--lx-blue); padding-left: 10px; margin-left: -12px; }
+.md-nav--secondary .md-nav__title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--lx-muted); background: transparent; box-shadow: none; }
+.md-nav--secondary .md-nav__list { border-left: 1px solid var(--lx-rule); padding-left: 12px; }
+.md-nav--secondary > .md-nav__list > .md-nav__item > .md-nav__link { font-weight: 600; font-size: 13px; color: #2b2f3a; }
+.md-nav--secondary .md-nav .md-nav__link { font-size: 12.5px; color: var(--lx-muted); font-weight: 400; }
+
+.md-path { font-size: 13px; color: var(--lx-muted); }
+/* wide layout (owner, 2026-10-20): the page grid grows to 1800px (Material's default is 61rem) and the content
+   column takes all of it between the nav and the table of contents, so wide figures and tables get the room */
+.md-grid { max-width: 1800px; }
+.md-content { max-width: none; }
+.md-content__inner { padding-top: 6px; }
+.md-content__button { color: var(--lx-blue); }
+
+.md-footer { background: var(--lx-paper); color: var(--lx-ink); }
+.md-footer__inner { padding: 24px 0; }
+.md-footer__link { border: 1px solid var(--lx-rule); border-radius: 4px; padding: 12px 16px; margin: 0 8px; opacity: 1; color: var(--lx-blue); }
+.md-footer__link:hover { border-color: var(--lx-blue); }
+.md-footer__direction { color: var(--lx-muted); font-size: 12px; opacity: 1; }
+.md-footer-meta { background: var(--lx-side); color: var(--lx-muted); }
+
+/* ---------- typeset ---------- */
+.md-typeset { font-size: 15px; line-height: 1.65; color: var(--lx-body); }
+.md-typeset h1 { font-family: var(--lx-serif); font-weight: 600; font-size: 36px; line-height: 1.15; letter-spacing: -0.01em; color: var(--lx-ink); margin: 10px 0 6px; }
+.md-typeset h2 { font-family: var(--lx-serif); font-weight: 600; font-size: 24px; line-height: 1.25; color: var(--lx-ink); margin: 40px 0 14px; letter-spacing: 0; }
+.md-typeset h3 { font-size: 17px; font-weight: 600; color: var(--lx-ink); margin: 28px 0 8px; letter-spacing: 0; }
+.md-typeset h4 { font-size: 12px; font-weight: 600; color: var(--lx-muted); letter-spacing: 0; margin: 0; padding-bottom: 6px; border-bottom: 1.5px solid var(--lx-ink); text-transform: none; }
+.md-typeset p, .md-typeset ul, .md-typeset ol { text-wrap: pretty; }
+.md-typeset a { text-decoration: none; }
+.md-typeset a:hover { text-decoration: underline; }
+.md-typeset code { font-size: 0.86em; background: var(--lx-code); padding: 1px 5px; border-radius: 3px; color: var(--lx-ink); word-break: normal; }
+.md-typeset pre > code { background: var(--lx-side); font-size: 13px; line-height: 1.6; padding: 14px 16px; border-radius: 4px; }
+.md-typeset pre { border: 1px solid var(--lx-rule); border-radius: 4px; }
+.md-typeset .katex-display { margin: 12px 0; padding: 14px 18px; background: #fbfaf6; border: 1px solid var(--lx-rule-soft); border-radius: 4px; overflow-x: auto; overflow-y: hidden; }
+
+.md-typeset p.page-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: var(--lx-muted); font-size: 15px; margin: 0 0 26px; }
+.md-typeset p.page-summary > code:first-child { background: var(--lx-navy); color: #ffffff; font-size: 12.5px; padding: 2px 7px; }
+.md-typeset p.lead { font-size: 17px; line-height: 1.6; color: var(--lx-ink); margin: 0 0 22px; }
+
+/* tables */
+.md-typeset table:not([class]) { display: table; width: 100%; border: none; border-radius: 0; box-shadow: none; font-size: 14px; background: transparent; }
+.md-typeset table:not([class]) th { background: transparent; font-size: 12px; font-weight: 600; color: var(--lx-muted); padding: 0 12px 8px 0; border-bottom: 1.5px solid var(--lx-ink); min-width: 0; }
+.md-typeset table:not([class]) td { padding: 9px 12px 9px 0; border-top: none; border-bottom: 1px solid var(--lx-rule); vertical-align: top; }
+.md-typeset table:not([class]) tbody tr:hover { background: transparent; box-shadow: none; }
+.md-typeset .refuse { color: var(--lx-red); }
+
+/* at a glance / file lists / up-down lists: definition lists as ruled two-column grids */
+.md-typeset .glance dl, .md-typeset .file-list dl, .md-typeset .updown dl { display: grid; grid-template-columns: 110px minmax(0,1fr); margin: 0; border-top: 1px solid var(--lx-rule); }
+.md-typeset .file-list dl { grid-template-columns: 230px minmax(0,1fr); }
+/* both columns shrink: an `auto` right column with a long entry squeezed the file names to a few characters */
+.md-typeset .updown dl { grid-template-columns: fit-content(55%) minmax(0,1fr); column-gap: 14px; border-top: none; }
+.md-typeset .glance dt, .md-typeset .glance dd, .md-typeset .file-list dt, .md-typeset .file-list dd, .md-typeset .updown dt, .md-typeset .updown dd { margin: 0; padding: 9px 0; border-bottom: 1px solid var(--lx-rule); }
+.md-typeset .glance dt { font-size: 13px; font-weight: 600; color: var(--lx-muted); }
+.md-typeset .glance dd, .md-typeset .file-list dd { font-size: 14px; }
+.md-typeset .file-list dt { padding-right: 12px; }
+.md-typeset .updown { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 28px; }
+.md-typeset .updown dd { color: #5b606c; text-align: right; font-size: 14px; }
+.md-typeset dd > p { margin: 0; }
+
+/* stages */
+.md-typeset .stages ol { list-style: none; counter-reset: lxs; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; }
+/* block + absolute number, not grid: a tight Markdown list puts the item's inline runs (code, links, math)
+   directly in the li, and a grid made each run its own cell in the 34px number column. */
+.md-typeset .stages li { counter-increment: lxs; position: relative; display: block; padding-left: 34px; margin: 0; }
+.md-typeset .stages li::before { content: counter(lxs); position: absolute; left: 0; top: 0; font-family: var(--lx-serif); font-size: 22px; line-height: 1.2; color: var(--lx-gold); }
+.md-typeset .stages li > p { margin: 0; }
+.md-typeset .stages li strong { color: var(--lx-ink); display: block; }
+
+/* admonitions */
+.md-typeset .admonition, .md-typeset details { border-width: 1px; border-radius: 4px; box-shadow: none; font-size: 15px; }
+.md-typeset .admonition.note { border-color: var(--lx-blue-edge); background: var(--lx-blue-tint); }
+.md-typeset .admonition.refuses { border-color: var(--lx-red-edge); background: var(--lx-red-tint); }
+.md-typeset .admonition.cache { border-color: var(--lx-rule); background: #ffffff; }
+.md-typeset .admonition > .admonition-title { background: transparent; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; padding-left: 36px; margin-bottom: 0; }
+.md-typeset .admonition.note > .admonition-title { color: var(--lx-blue); }
+.md-typeset .admonition.refuses > .admonition-title { color: var(--lx-red); }
+.md-typeset .admonition.cache > .admonition-title { font-family: "IBM Plex Mono", monospace; font-size: 13px; letter-spacing: 0; text-transform: none; color: var(--lx-ink); }
+.md-typeset .admonition > .admonition-title::before { width: 14px; height: 14px; left: 14px; top: 50%; transform: translateY(-50%); }
+.md-typeset .admonition.note > .admonition-title::before { background-color: var(--lx-blue); -webkit-mask-image: var(--md-admonition-icon--note); mask-image: var(--md-admonition-icon--note); }
+.md-typeset .admonition.refuses > .admonition-title::before { background-color: var(--lx-red); -webkit-mask-image: var(--md-admonition-icon--refuses); mask-image: var(--md-admonition-icon--refuses); }
+.md-typeset .admonition.cache > .admonition-title::before { background-color: var(--lx-muted); -webkit-mask-image: var(--md-admonition-icon--cache); mask-image: var(--md-admonition-icon--cache); }
+/* collapsed refusal groups (??? refuses "…") match the open box */
+.md-typeset details.refuses { border-color: var(--lx-red-edge); background: var(--lx-red-tint); }
+.md-typeset details.refuses > summary { background: transparent; color: var(--lx-red); }
+.md-typeset details.refuses > summary::before { background-color: var(--lx-red); -webkit-mask-image: var(--md-admonition-icon--refuses); mask-image: var(--md-admonition-icon--refuses); }
+.md-typeset details.refuses ul { margin: 4px 0 8px; }
+.md-typeset details.refuses li { margin-bottom: 2px; }
+.md-typeset .admonition.refuses ul { margin: 4px 0 8px; }
+.md-typeset .admonition.refuses li { margin-bottom: 2px; }
+
+/* expandable treatment rows */
+.md-typeset details.treatment { border-color: var(--lx-rule); background: #ffffff; margin: 0; border-radius: 0; }
+.md-typeset details.treatment + details.treatment { border-top: none; }
+.md-typeset details.treatment > summary { background: transparent; font-family: "IBM Plex Sans", sans-serif; font-size: 14.5px; font-weight: 600; color: var(--lx-ink); padding: 11px 150px 11px 14px; }
+.md-typeset details.treatment > summary:hover { background: #faf8f3; }
+.md-typeset details.treatment > summary::before { -webkit-mask-image: none; mask-image: none; background: none; width: auto; height: auto; left: auto; right: 40px; top: 50%; transform: translateY(-50%); font-size: 11.5px; font-weight: 500; padding: 2px 7px; border-radius: 3px; line-height: 1.4; }
+.md-typeset details.treatment.production > summary::before { content: "Production"; background: #e3efe4; color: #2f6b3a; }
+.md-typeset details.treatment.supported > summary::before { content: "Supported"; background: #e8eef8; color: var(--lx-blue); }
+.md-typeset details.treatment.in-progress > summary::before { content: "In progress"; background: #f8efd9; color: #8a6510; }
+.md-typeset details.treatment.not-in-lorrax > summary::before { content: "Not in LORRAX"; background: var(--lx-code); color: var(--lx-muted); }
+.md-typeset details.treatment > summary::after { background-color: var(--lx-faint); }
+.md-typeset details.treatment[open] { background: var(--lx-paper); }
+.md-typeset details.treatment > :not(summary) { margin-left: 14px; margin-right: 18px; }
+.md-typeset .status { font-size: 11.5px; font-weight: 500; padding: 2px 7px; border-radius: 3px; margin-left: 8px; vertical-align: 1px; }
+.md-typeset .status.production { background: #e3efe4; color: #2f6b3a; }
+.md-typeset .status.supported { background: #e8eef8; color: var(--lx-blue); }
+.md-typeset .status.in-progress { background: #f8efd9; color: #8a6510; }
+.md-typeset .status.not-in-lorrax { background: var(--lx-code); color: var(--lx-muted); }
+
+/* tabs */
+.md-typeset .tabbed-set { border: 1px solid var(--lx-rule); border-radius: 4px; overflow: hidden; margin: 16px 0; }
+.md-typeset .tabbed-labels { background: var(--lx-side); border-bottom: 1px solid var(--lx-rule); box-shadow: none; }
+.md-typeset .tabbed-labels > label { font-size: 13px; font-weight: 400; color: var(--lx-muted); padding: 8px 16px; }
+.md-typeset .tabbed-set > input:checked + label, .md-typeset .tabbed-labels > label:hover { color: var(--lx-ink); }
+.md-typeset .tabbed-labels::before { background: var(--lx-blue); height: 2px; }
+.md-typeset .tabbed-content { background: #fbfaf6; padding: 4px 20px 6px; }
+.md-typeset .tabbed-block > p:first-child strong { font-family: var(--lx-serif); font-size: 21px; font-weight: 600; color: var(--lx-ink); }
+.md-typeset .tabbed-block dl { display: grid; grid-template-columns: 140px minmax(0,1fr); font-size: 13px; margin: 8px 0; }
+.md-typeset .tabbed-block dt { font-size: 10.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--lx-faint); padding: 3px 0; }
+.md-typeset .tabbed-block dd { margin: 0; padding: 3px 0; }
+.md-typeset .tabbed-set pre { margin: 10px 0; }
+
+/* keywords */
+.md-typeset h3.kw { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 0; padding-top: 14px; font-size: 15px; }
+.md-typeset h3.kw > code { background: none; padding: 0; font-size: 15px; font-weight: 600; color: var(--lx-ink); }
+.md-typeset h3.kw::before { content: attr(data-type); order: 2; font-family: "IBM Plex Sans", sans-serif; font-size: 12px; font-weight: 400; color: var(--lx-muted); }
+.md-typeset h3.kw::after { content: "default  " attr(data-default); order: 3; margin-left: auto; font-family: "IBM Plex Mono", monospace; font-size: 12.5px; font-weight: 400; color: var(--lx-blue); white-space: pre; }
+/* required keys (data-default="required") show a red "required" badge instead of a default; sections that hold
+   required keys open with a "Required" group, then an "Optional" group (p.kw-group labels) */
+.md-typeset h3.kw[data-default="required"]::after { content: "required"; font-family: "IBM Plex Sans", sans-serif; font-size: 11.5px; font-weight: 600; color: var(--lx-red); background: var(--lx-red-tint); border: 1px solid var(--lx-red-edge); border-radius: 3px; padding: 1px 7px; }
+.md-typeset p.kw-group { margin: 20px 0 -6px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--lx-muted); }
+.md-typeset h2 + p.kw-group { margin-top: 4px; }
+.md-typeset h3.kw + p { margin: 4px 0 0; }
+.md-typeset p.kw-details { margin: 2px 0 0; color: #5b606c; font-size: 14px; }
+.md-typeset p.kw-values { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 0; }
+.md-typeset p.kw-values code { background: #ffffff; border: 1px solid #d6d2c7; font-size: 12px; padding: 1px 7px; }
+.md-typeset h3.kw ~ p:last-of-type, .md-typeset h3.kw { border-bottom: none; }
+.md-typeset h2 + h3.kw { padding-top: 4px; }
+.md-typeset .kw-entry { padding-bottom: 14px; border-bottom: 1px solid var(--lx-rule); }
+
+/* theory numbering */
+.md-typeset h2 > .n { font-family: var(--lx-serif); font-size: 30px; line-height: 1; color: var(--lx-gold); display: inline-block; width: 44px; font-weight: 400; }
+.md-typeset h2:has(> .n) { font-size: 27px; padding-bottom: 8px; border-bottom: 1.5px solid var(--lx-ink); margin-top: 48px; }
+.md-typeset h3 > .n { font-family: "IBM Plex Mono", monospace; font-size: 12.5px; font-weight: 400; color: var(--lx-gold); margin-right: 10px; }
+.md-typeset h3:has(> .n) { padding-bottom: 4px; border-bottom: 1px solid var(--lx-rule-soft); }
+.md-typeset .sec-body { margin-left: 44px; }
+.md-typeset p.intro { font-size: 16px; line-height: 1.6; color: #3a3f4b; margin-top: 14px; }
+.md-typeset h3 + p.in-code { margin: -36px 0 14px; text-align: right; font-size: 11.5px; color: var(--lx-faint); pointer-events: none; }
+.md-typeset h3 + p.in-code::before { content: "in code "; }
+.md-typeset h3 + p.in-code code { color: var(--lx-blue); background: #eef2f9; }
+
+/* section cards (filled by page.js) */
+.md-typeset .section-cards { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; margin-bottom: 8px; }
+.md-typeset .section-cards a { display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--lx-rule); border-radius: 4px; background: #ffffff; padding: 11px 13px 12px; color: inherit; text-decoration: none; }
+.md-typeset .section-cards a:hover { border-color: var(--lx-blue); text-decoration: none; }
+.md-typeset .section-cards .cn { font-family: var(--lx-serif); font-size: 22px; line-height: 1; color: var(--lx-gold); margin-right: 8px; }
+.md-typeset .section-cards .ct { font-weight: 600; font-size: 14px; color: var(--lx-ink); line-height: 1.25; }
+.md-typeset .section-cards .cs { font-size: 11.5px; line-height: 1.4; color: var(--lx-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.md-typeset .section-cards .cs span { font-family: "IBM Plex Mono", monospace; color: #a0a3ab; margin-right: 5px; }
+
+/* figures */
+.md-typeset .chain-map { margin: 0 0 36px; }
+.md-typeset .algo-figure, .md-typeset .pipeline-figure { margin: 18px 0; overflow-x: auto; }
+/* headline flowcharts (maintainer addition): the slide-style renders from lorrax_flowcharts, embedded as images that
+   open full size on click; the figure keeps its own navy-on-white look against the cream page */
+.md-typeset figure.flowchart { margin: 22px 0 30px; max-width: 100%; }
+.md-typeset figure.flowchart img { display: block; width: 100%; height: auto; border: 1px solid var(--lx-rule); background: #ffffff; }
+.md-typeset figure.flowchart figcaption { max-width: none; margin-top: 8px; font-size: 13px; line-height: 1.5; color: var(--lx-muted); text-align: left; }
+.md-typeset figure.flowchart figcaption strong { color: var(--lx-ink); font-weight: 600; }
+
+/* driver matrix (driver-matrix.js) */
+.lx-matrix { padding: 6px 12px 10px 12px; font-size: 14px; }
+.lx-matrix__title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--lx-muted); padding: 12px 0 8px; }
+.lx-matrix__grid { display: grid; grid-template-columns: minmax(0,1fr) repeat(4, 22px); row-gap: 1px; align-items: center; }
+.lx-matrix__icon { display: flex; justify-content: center; padding-bottom: 4px; color: var(--lx-faint); }
+.lx-matrix__icon.on { color: var(--lx-blue); }
+.lx-matrix__id { font-family: "IBM Plex Mono", monospace; font-size: 13.5px; color: #4d525e; line-height: 1.3; padding-top: 5px; }
+.lx-matrix__id.on { color: var(--lx-ink); font-weight: 600; }
+.lx-matrix__stage { font-size: 11.5px; color: var(--lx-faint); line-height: 1.3; padding-bottom: 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lx-matrix__cell { display: block; width: 12px; height: 12px; margin: 0 auto; box-sizing: border-box; border-radius: 2px; border: 1px solid #9aa3b8; background: #ffffff; }
+.lx-matrix__cell.row { border-color: #9aa3b8; }
+.lx-matrix__cell.on { background: var(--lx-navy); border-color: var(--lx-navy); }
+.lx-matrix__cell:hover { border-color: var(--lx-blue); }

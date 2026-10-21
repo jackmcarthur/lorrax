@@ -1,0 +1,59 @@
+# LORRAX manual
+
+> The LORRAX GW-BSE code's user manual. Every page is listed, including pages kept out of the sidebar; each line gives the page title, its URL and its markdown source in github.com/jackmcarthur/lorrax.
+
+## Pages in the sidebar
+
+- [Files](https://jackmcarthur.github.io/lorrax/drivers/bse/files/): manual/docs/drivers/bse/files.md
+- [BSE driver](https://jackmcarthur.github.io/lorrax/drivers/bse/): manual/docs/drivers/bse/index.md
+- [Input keywords](https://jackmcarthur.github.io/lorrax/drivers/bse/keywords/): manual/docs/drivers/bse/keywords.md
+- [Theory](https://jackmcarthur.github.io/lorrax/drivers/bse/theory/): manual/docs/drivers/bse/theory.md
+- [Files](https://jackmcarthur.github.io/lorrax/drivers/gw/files/): manual/docs/drivers/gw/files.md
+- [GW driver](https://jackmcarthur.github.io/lorrax/drivers/gw/): manual/docs/drivers/gw/index.md
+- [Input keywords](https://jackmcarthur.github.io/lorrax/drivers/gw/keywords/): manual/docs/drivers/gw/keywords.md
+- [Theory](https://jackmcarthur.github.io/lorrax/drivers/gw/theory/): manual/docs/drivers/gw/theory.md
+- [Files](https://jackmcarthur.github.io/lorrax/drivers/nscf/files/): manual/docs/drivers/nscf/files.md
+- [NSCF driver](https://jackmcarthur.github.io/lorrax/drivers/nscf/): manual/docs/drivers/nscf/index.md
+- [Input keywords](https://jackmcarthur.github.io/lorrax/drivers/nscf/keywords/): manual/docs/drivers/nscf/keywords.md
+- [Theory](https://jackmcarthur.github.io/lorrax/drivers/nscf/theory/): manual/docs/drivers/nscf/theory.md
+- [LORRAX](https://jackmcarthur.github.io/lorrax/): manual/docs/index.md
+- [Band extrapolation](https://jackmcarthur.github.io/lorrax/theory/band-extrapolation/): manual/docs/theory/band-extrapolation.md
+- [Centroid selection](https://jackmcarthur.github.io/lorrax/theory/centroid-selection/): manual/docs/theory/centroid-selection.md
+- [Contour deformation](https://jackmcarthur.github.io/lorrax/theory/contour-deformation/): manual/docs/theory/contour-deformation.md
+- [Frequency treatments of Σ](https://jackmcarthur.github.io/lorrax/theory/frequency-treatments/): manual/docs/theory/frequency-treatments.md
+- [ISDF and V(q)](https://jackmcarthur.github.io/lorrax/theory/isdf/): manual/docs/theory/isdf.md
+- [Metals](https://jackmcarthur.github.io/lorrax/theory/metals/): manual/docs/theory/metals.md
+- [Physics overview](https://jackmcarthur.github.io/lorrax/theory/physics/): manual/docs/theory/physics.md
+- [The q → 0 head](https://jackmcarthur.github.io/lorrax/theory/q0-head/): manual/docs/theory/q0-head.md
+- [Quasiparticle self-consistency](https://jackmcarthur.github.io/lorrax/theory/qsgw/): manual/docs/theory/qsgw.md
+- [Shared-pole W](https://jackmcarthur.github.io/lorrax/theory/shared-pole-w/): manual/docs/theory/shared-pole-w.md
+- [Symmetry](https://jackmcarthur.github.io/lorrax/theory/symmetry/): manual/docs/theory/symmetry.md
+- [Time–frequency transforms](https://jackmcarthur.github.io/lorrax/theory/time-frequency/): manual/docs/theory/time-frequency.md
+- [Velocity operator](https://jackmcarthur.github.io/lorrax/theory/velocity-operator/): manual/docs/theory/velocity-operator.md
+- [Short- and long-range W](https://jackmcarthur.github.io/lorrax/theory/w-range-splitting/): manual/docs/theory/w-range-splitting.md
+- [For BerkeleyGW users](https://jackmcarthur.github.io/lorrax/using/berkeleygw-users/): manual/docs/using/berkeleygw-users.md
+- [Environment variables](https://jackmcarthur.github.io/lorrax/using/environment/): manual/docs/using/environment.md
+- [Inputs from DFT](https://jackmcarthur.github.io/lorrax/using/inputs-from-dft/): manual/docs/using/inputs-from-dft.md
+- [Installation](https://jackmcarthur.github.io/lorrax/using/installation/): manual/docs/using/installation.md
+- [Quickstart](https://jackmcarthur.github.io/lorrax/using/quickstart/): manual/docs/using/quickstart.md
+- [Centroids utility](https://jackmcarthur.github.io/lorrax/utilities/centroids/): manual/docs/utilities/centroids.md
+- [Dipole utility](https://jackmcarthur.github.io/lorrax/utilities/dipole/): manual/docs/utilities/dipole.md
+- [Band-structure interpolation](https://jackmcarthur.github.io/lorrax/utilities/htransform-bands/): manual/docs/utilities/htransform-bands.md
+- [Fine-grid interpolation](https://jackmcarthur.github.io/lorrax/utilities/htransform-fine-grid/): manual/docs/utilities/htransform-fine-grid.md
+- [H-transform utility](https://jackmcarthur.github.io/lorrax/utilities/htransform/): manual/docs/utilities/htransform.md
+- [Kin-ion utility](https://jackmcarthur.github.io/lorrax/utilities/kin-ion/): manual/docs/utilities/kin-ion.md
+
+## Unlisted pages (not in the sidebar)
+
+- [Dependencies](https://jackmcarthur.github.io/lorrax/drivers/bse/dependencies/): manual/docs/drivers/bse/dependencies.md
+- [The FEAST route](https://jackmcarthur.github.io/lorrax/drivers/bse/feast/): manual/docs/drivers/bse/feast.md
+- [Dependencies](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/dependencies/): manual/docs/drivers/exciton-bands/dependencies.md
+- [Files](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/files/): manual/docs/drivers/exciton-bands/files.md
+- [exciton-bands driver](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/): manual/docs/drivers/exciton-bands/index.md
+- [Input keywords](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/keywords/): manual/docs/drivers/exciton-bands/keywords.md
+- [Theory](https://jackmcarthur.github.io/lorrax/drivers/exciton-bands/theory/): manual/docs/drivers/exciton-bands/theory.md
+- [Dependencies](https://jackmcarthur.github.io/lorrax/drivers/gw/dependencies/): manual/docs/drivers/gw/dependencies.md
+- [Dependencies](https://jackmcarthur.github.io/lorrax/drivers/nscf/dependencies/): manual/docs/drivers/nscf/dependencies.md
+- [Orbital magnetization](https://jackmcarthur.github.io/lorrax/theory/orbital-magnetization/): manual/docs/theory/orbital-magnetization.md
+- [Parallel algorithms](https://jackmcarthur.github.io/lorrax/theory/parallel-algorithms/): manual/docs/theory/parallel-algorithms.md
+- [Downfold utility](https://jackmcarthur.github.io/lorrax/utilities/downfold/): manual/docs/utilities/downfold.md

@@ -1,0 +1,123 @@
+site_name: LORRAX
+site_url: https://jackmcarthur.github.io/lorrax/
+site_description: Low-scaling real-space real-axis excited-state package
+repo_url: https://github.com/jackmcarthur/lorrax
+repo_name: GitHub
+edit_uri: edit/main/manual/docs/
+
+theme:
+  name: material
+  font:
+    text: IBM Plex Sans
+    code: IBM Plex Mono
+  palette:
+    scheme: default
+    primary: custom
+    accent: custom
+  features:
+    - navigation.sections
+    - navigation.path
+    - navigation.footer
+    - navigation.instant
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - def_list
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.highlight:
+      use_pygments: true
+  - toc:
+      permalink: false
+      toc_depth: 3
+
+extra_css:
+  - https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap
+  - https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css
+  - stylesheets/lorrax.css
+
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js
+  - https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js
+  - javascripts/katex.js
+  - javascripts/figure-kit.js
+  - javascripts/specs/isdf.js
+  - javascripts/specs/lorrax-pipeline.js
+  - javascripts/driver-matrix.js
+  - javascripts/chain-map.js
+  - javascripts/page.js
+
+# Unlisted pages: built, reachable by URL and links, searchable and listed in
+# llms.txt for agents, but kept out of the sidebar for now.
+not_in_nav: |
+  /drivers/exciton-bands/
+  /utilities/downfold.md
+  /theory/orbital-magnetization.md
+  /theory/parallel-algorithms.md
+  /drivers/gw/dependencies.md
+  /drivers/bse/dependencies.md
+  /drivers/nscf/dependencies.md
+  /drivers/bse/feast.md
+
+nav:
+  - Home: index.md
+  - Using LORRAX:
+      - Quickstart: using/quickstart.md
+      - Installation: using/installation.md
+      - Inputs from DFT: using/inputs-from-dft.md
+      - Environment variables: using/environment.md
+      - For BerkeleyGW users: using/berkeleygw-users.md
+  - Drivers:
+      - gw:
+          - Overview: drivers/gw/index.md
+          - Input keywords: drivers/gw/keywords.md
+          - Theory: drivers/gw/theory.md
+          - Files: drivers/gw/files.md
+      - bse:
+          - Overview: drivers/bse/index.md
+          - Input keywords: drivers/bse/keywords.md
+          - Theory: drivers/bse/theory.md
+          - Files: drivers/bse/files.md
+      - nscf:
+          - Overview: drivers/nscf/index.md
+          - Input keywords: drivers/nscf/keywords.md
+          - Theory: drivers/nscf/theory.md
+          - Files: drivers/nscf/files.md
+  - Utilities:
+      - centroids: utilities/centroids.md
+      - kin-ion: utilities/kin-ion.md
+      - dipole: utilities/dipole.md
+      - htransform:
+          - Overview: utilities/htransform.md
+          - Band structures: utilities/htransform-bands.md
+          - Fine grids: utilities/htransform-fine-grid.md
+  - Theory:
+      - Physics overview: theory/physics.md
+      - Frequency treatments of Σ: theory/frequency-treatments.md
+      - Time–frequency transforms: theory/time-frequency.md
+      - Shared-pole W: theory/shared-pole-w.md
+      - Contour deformation: theory/contour-deformation.md
+      - The q → 0 head: theory/q0-head.md
+      - Short- and long-range W: theory/w-range-splitting.md
+      - Metals: theory/metals.md
+      - Band extrapolation: theory/band-extrapolation.md
+      - Quasiparticle self-consistency: theory/qsgw.md
+      - ISDF and V(q): theory/isdf.md
+      - Centroid selection: theory/centroid-selection.md
+      - Symmetry: theory/symmetry.md
+      - Velocity operator: theory/velocity-operator.md
+
+hooks:
+  - hooks/strip_comments.py
