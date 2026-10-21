@@ -360,6 +360,57 @@ def equilibrium_ritz_stage(g, h, output_gram, space, active, *, matmul, eigh):
     return mu, vectors, physical, output_weight, diagnostics
 
 
+def general_equilibration_stage(e, a, left_units, right_units, frequency_scale):
+    """Original general descriptor under eight simultaneous Ruiz sweeps.
+
+    E/A [1,L,R] are complex128 faces; equation-unit vectors [L]/[R]
+    and the frequency scale (Ry) are replicated. No state/pole is removed.
+    Returned positive scales map numerical spaces to original coordinates.
+    """
+    left,right=left_units[None],right_units[None]
+    e=left[:,:,None]*e*right[:,None,:]
+    a=left[:,:,None]*a*right[:,None,:]
+    def step(_,carry):
+        e,a,left,right=carry
+        magnitude=jnp.hypot(abs(e),abs(a)/frequency_scale)
+        rows=jnp.max(magnitude,axis=-1)
+        cols=jnp.max(magnitude,axis=-2)
+        dl=1/jnp.sqrt(jnp.where(rows>0,rows,1))
+        dr=1/jnp.sqrt(jnp.where(cols>0,cols,1))
+        return dl[:,:,None]*e*dr[:,None,:],dl[:,:,None]*a*dr[:,None,:],left*dl,right*dr
+    return jax.lax.fori_loop(0,8,step,(e,a,left,right))
+
+
+def general_descriptor_dilation(e, *, matrix_sharding):
+    """Hermitian [0,E;E.H,0], without normal-equation squaring."""
+    l,r=e.shape[-2:]
+    left=jnp.zeros((1,l,l),e.dtype)
+    right=jnp.zeros((1,r,r),e.dtype)
+    return tile_block(((left,e),(tile_adjoint(e,matrix_sharding),right)),matrix_sharding)
+
+
+def general_projected_stage(e,a,x,y,*,matmul):
+    """CURRENT original descriptor/pencil projected in held original spaces."""
+    return matmul(y,matmul(e,x),transa='C'),matmul(y,matmul(a,x),transa='C')
+
+
+def general_modal_stage(ap,right_balance,left_balance,active,*,matmul,modal):
+    """Balanced ordinary general eigenproblem and dual coefficient maps.
+
+    All three matrices are native faces [1,K,K]. Only declared zero carrier
+    coordinates receive distinct inert sentinels outside the physical block's
+    norm. The nonsymmetric eigensolver is explicit and never host-demoted.
+    """
+    ordinary=matmul(left_balance,matmul(ap,right_balance),transa='C')
+    norm=jnp.linalg.norm(ordinary,axis=(-2,-1))
+    width=ordinary.shape[-1]
+    sentinels=-(norm[:,None]+1)*(1+jnp.arange(width)[None]/width)
+    ordinary=ordinary+diagonal_like(jnp.where(active,0,sentinels),ordinary)
+    values,vr,dual,diagnostics=modal(ordinary)
+    return (values,matmul(right_balance,vr),
+            matmul(left_balance,dual,transb='C'),diagnostics,sentinels)
+
+
 def _paired_member(a, row_inverse, column_inverse, *, half, finite, n_inf):
     """One pencil member [b,R,R] in the paired basis: its (ww, wv, vv) blocks.
 

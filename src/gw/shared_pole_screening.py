@@ -773,6 +773,199 @@ def _general_current_refinement(current,state):
     raise AssertionError('unreachable bounded refinement loop')
 
 
+def _general_model_frequency_diagnostic(current,samples,model,bank,diagnostic):
+    """Preserve bounded frequency evidence and current microscopic probes on refusal."""
+    import sys
+    import jax
+    import jax.numpy as jnp
+    from common.collectives import gather_to_host,rank0_transaction,device_put_process_local
+    from .response_bank import full_density_sample_rules
+    from .w_isdf import full_density_response_stream
+    iq=diagnostic['q'];l,r,p=bank;order=len(model['poles_ry'])
+    E,A,B,C=(diagnostic[k] for k in ('E','A','B','C'))
+    nl,nr=E.shape[-2:];c1,c2=diagnostic['moments']
+    coordinate_units=diagnostic['coordinate_units'];moment_scale=diagnostic['moment_scale']
+    partner=diagnostic['partner'];defer_admission=diagnostic['defer_admission']
+    frequency_coordinates=diagnostic['frequency_coordinates'];workspace=diagnostic['workspace']
+    sites=samples['sites'];fit_positions=samples['fit_positions'];held_positions=samples['held_positions']
+    values=samples['values']
+    H,mm,dyson=current['H'],current['mm'],current['dyson']
+    face,rep=current['face'],current['rep'];put=lambda a:device_put_process_local(np.asarray(a),rep)
+    gamma,eta=current['gamma'],current['eta']
+    recipe,phases=current['recipe'],current['phases']
+    tolerance=current['tolerance']
+    snapshot=current['snapshot'];stop_after=snapshot.get('stop_after_model_q')
+    label,run_dir,started=current['label'],current['run_dir'],current['started']
+    energy,meta=current['energy'],current['meta']
+    nq,stop,response_active=current['nq'],current['stop'],current['response_active']
+    verification_geometry=current['verification_geometry']
+    representation=current['representation'];print_fn=current['print_fn']
+    fit_ids,held_ids=current['fit_ids'],current['held_ids']
+    blocks,pm,ph,pn=current['blocks'],current['pm'],current['ph'],current['pn']
+    energy_d,mesh_xy,grid=current['energy_d'],current['mesh_xy'],current['grid']
+    nk,nb,nmu,ns=current['nk'],current['nb'],current['nmu'],current['ns']
+    layout,qgrid,response_window=current['layout'],current['qgrid'],current['response_window']
+    carrier,execute_response,algebra=current['carrier'],current['execute_response'],current['algebra']
+    growth=float(np.max(p.imag,initial=-np.inf))
+    bad_growth=eta<=growth+1e-12 or float(np.min(sites.imag))<=growth+1e-12
+    if (bad_growth and not defer_admission) or stop_after is not None:
+        # Refusal-only frequency diagnostics are explicitly bounded before
+        # any matrix host read; ordinary successful refreshes never enter.
+        native_arrays=[E[iq],A[iq],model['output_map'],model['input_map'],
+                       model['spaces']['right'],model['spaces']['left']]
+        frequency_bytes=sum(a.size*a.dtype.itemsize for a in native_arrays)
+        if frequency_bytes+65536>workspace:
+            raise ValueError('GATE shared_general_capacity: refusal frequency diagnostic exceeds host bound')
+        pencils=[(np.asarray(gather_to_host(E[iq])),np.asarray(gather_to_host(A[iq])))]
+        model=dict(model,output_map=np.asarray(gather_to_host(model['output_map']))[0],
+            input_map=np.asarray(gather_to_host(model['input_map']))[0],
+            spaces={k:np.asarray(gather_to_host(v))[0] for k,v in model['spaces'].items()})
+        models=[model];batch_index=0;retained=0
+        if jax.process_index()==0:
+            print_fn(f'General shared-pole W [{label}] early diagnostic q={iq} '
+                     f'order={order} growth_Ry={growth:.9g} eta_margin_Ry={eta-growth:.9g}')
+            sys.stdout.flush()
+        # All reductions/gathers happen on EVERY rank before the
+        # root-only I/O transaction. No microscopic factor is read
+        # on the host: only O(K) norms and reduced-frequency arrays.
+        ln=np.asarray(gather_to_host(jnp.sqrt(jnp.sum(abs(l)**2,axis=(-3,-2))))).reshape(-1)
+        rn=np.asarray(gather_to_host(jnp.sqrt(jnp.sum(abs(r)**2,axis=(-3,-2))))).reshape(-1)
+        sample_errors=[]
+        for j,z in enumerate(sites):
+            actual=mm(l/put((z-p)[None,None]),r,transb='C')
+            target=values[j][iq:iq+1]
+            sample_errors.append(float(jnp.linalg.norm(actual-target)/
+                jnp.maximum(jnp.linalg.norm(target),1e-300)))
+        moment_errors=[]
+        for power,target in ((0,c1[iq:iq+1]),(1,c2[iq:iq+1])):
+            actual=mm(l*put((p**power)[None,None]),r,transb='C')
+            moment_errors.append(float(jnp.linalg.norm(actual-target)/
+                jnp.maximum(jnp.linalg.norm(target),1e-300)))
+        root=Path(run_dir)/f'{label}_general_shared_pole'
+        path=root/f'q_{iq:03d}_diagnostic.npz'
+        report=dict(status='refused_laplace' if bad_growth else 'unadmitted_partial',
+            admitted=False,sigma_computed=False,q=iq,partner=partner,
+            reduced_shape=[nl,nr],model_order=order,bank_columns=len(p),
+            max_growth_ry=growth,eta_ry=eta,eta_margin_ry=eta-growth,
+            support_margin_ry=float(np.min(sites.imag))-growth,
+            scalar_tolerance=float(recipe['bank_rule_tolerance']),fit_tolerance=tolerance,
+            sample_errors=sample_errors,moment_errors=moment_errors,
+            direct_dyson_probes_file=f'q_{iq:03d}_direct_probes.json' if bad_growth else None,
+            model_receipt=model['receipt'],phase_seconds=phases,
+            elapsed_seconds=time.monotonic()-started,artifact=str(path),
+            full_microscopic_host_payload=False,n_mu=int(meta.n_rmu),n_q=nq,screening_bands=stop,
+            response_active_bands=[response_active.start,response_active.stop])
+        report['verification_geometry']=verification_geometry
+        report['frequency_coordinates']=frequency_coordinates
+        arrays=dict(E=pencils[batch_index][0],A=pencils[batch_index][1],
+            poles_ry=model['poles_ry'],output_map=model['output_map'],input_map=model['input_map'],
+            space_right=model['spaces']['right'],space_left=model['spaces']['left'],
+            bank_poles_ry=p,left_column_norm=ln,right_column_norm=rn,residue_norm_bound=ln*rn,
+            energy_ry=energy,U_active=np.asarray(snapshot['U_active']),rho_active=np.asarray(snapshot['rho_active']),
+            sites_ry=sites,fit_positions=np.asarray(fit_positions,np.int32),
+            held_positions=np.asarray(held_positions,np.int32),
+            frequency_scale_ry=np.array(moment_scale),
+            left_coordinate_units=coordinate_units[0],right_coordinate_units=coordinate_units[1],
+            gamma_ry=np.array(gamma),eta_ry=np.array(eta))
+        # Full-port actions contract ON DEVICE into frequency-only
+        # Grams. Their host bound includes existing batch inputs,
+        # canonical maps/spaces and the two optional held actions.
+        selected=[j for j in held_positions if j>=len(fit_ids)+len(held_ids)][:2]
+        if not selected:
+            selected=held_positions[:2]
+        action_bytes=16*(nl*nl+nr*nr+len(selected)*nl*nr)
+        base_bytes=retained+sum(e.nbytes+a.nbytes for e,a in pencils)
+        base_bytes+=sum(sum(m[k].nbytes for k in ('poles_ry','output_map','input_map'))+
+                        sum(a.nbytes for a in m['spaces'].values()) for m in models)
+        report['frequency_capture_host_bytes']=base_bytes+action_bytes
+        report['frequency_gram_scope']='unsymmetrized_reduced_transfer_CXB'
+        report['bank_self_negative_mixture']=partner==iq
+        if base_bytes+action_bytes<=workspace:
+            arrays['GC']=np.asarray(gather_to_host(mm(C[iq:iq+1],C[iq:iq+1],transa='C')))[0]
+            arrays['GB']=np.asarray(gather_to_host(mm(B[iq:iq+1],B[iq:iq+1],transb='C')))[0]
+            mixed=[];exact_norm=[]
+            for j in selected:
+                target=values[j][iq:iq+1]
+                mixed.append(np.asarray(gather_to_host(mm(C[iq:iq+1],
+                    mm(target,B[iq:iq+1],transb='C'),transa='C')))[0])
+                exact_norm.append(float(jnp.sum(abs(target)**2)))
+            arrays.update(probe_sites_ry=sites[selected],probe_mixed_J=np.asarray(mixed),
+                          probe_exact_norm_sq=np.asarray(exact_norm))
+        else:
+            report['frequency_action_grams_omitted']='explicit host workspace bound'
+        def save_diagnostic():
+            root.mkdir(parents=True,exist_ok=True)
+            if path.exists():
+                raise FileExistsError(f'diagnostic artifact exists: {path}')
+            np.savez(path,**arrays)
+            path.with_suffix('.json').write_text(_json(report))
+        rank0_transaction(path,stage='shared_general.frequency_diagnostic',write=save_diagnostic)
+        # The reduced model is now durably committed BEFORE any new
+        # microscopic probe can stall/refuse or exhaust the job cap.
+        probes=[]
+        if bad_growth and len(p):
+            suspect=p[int(np.argmax(p.imag))]
+            offset=max(eta,.001*abs(suspect))
+            probe_sites=[suspect+1j*offset,suspect+offset+1j*offset]
+            if stop_after is not None:
+                probe_sites.insert(0,suspect)
+            for probe_index,z in enumerate(probe_sites):
+                probe_start=time.monotonic()
+                raw_probe=None
+                row=dict(z_ry=[float(z.real),float(z.imag)],at_fitted_pole=z==suspect,
+                         gamma_ry=gamma,additional_collision_eta_ry=0.)
+                if jax.process_index()==0:
+                    print_fn(f'General shared-pole W [{label}] direct microscopic dielectric/Dyson probe '
+                             f'q={iq} z_Ry={z}; basic artifact committed')
+                    sys.stdout.flush()
+                try:
+                    for block in blocks:
+                        left_density, right_density = block['density_sides']
+                        left=((pm-ph) if left_density else pm)*jnp.asarray(block['u'])[:,None,None]
+                        right=(ph if right_density else pm)*jnp.asarray(block['f'])[:,None,None]
+                        prules=full_density_sample_rules(energy[:,:stop],np.array([z]),gamma_ry=gamma,
+                            tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),
+                            paired=True,values_only=True)
+                        for rule in prules:
+                            stream=full_density_response_stream(mesh_xy,grid,(nk,nb,nmu,ns),q_ids=[iq],
+                                n_outputs=1,layout=layout,qgrid=qgrid,response_window=response_window,
+                                rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'],
+                                pair_band_ranges=block['band_ranges'],
+                                k_unfold_plan=carrier.plan,execute=execute_response)
+                            part=stream(jnp.asarray(rule['times']),jnp.asarray(rule['weights']),left,pn,right,energy_d)[:,0]
+                            raw_probe=part if raw_probe is None else raw_probe+part
+                    if stop_after is not None:
+                        row.update(_save_general_dielectric_probe(raw_probe,
+                            dict(dyson=dyson, H=H[iq:iq+1], matmul=mm, face=face, rep=rep,
+                                 mask=meta.mu_basis.active_mask),
+                            dict(q=iq,z_ry=row['z_ry'],at_fitted_pole=z==suspect,
+                                 gamma_ry=gamma,scalar_rule_tolerance=float(recipe['bank_rule_tolerance']),
+                                 prefactor=float(algebra['prefactor']),
+                                 elapsed_seconds=time.monotonic()-probe_start),
+                            root=root,index=probe_index))
+                    if z!=suspect:
+                        exact=dyson.value(H[iq:iq+1],raw_probe)
+                        fitted=mm(l/put((z-p)[None,None]),r,transb='C')
+                        row.update(exact_w_norm=float(jnp.linalg.norm(exact)),
+                            fitted_w_norm=float(jnp.linalg.norm(fitted)),relative_w_defect=float(jnp.linalg.norm(fitted-exact)/
+                                jnp.maximum(jnp.linalg.norm(exact),1e-300)))
+                except Exception as error:
+                    row['error']=str(error)
+                row['elapsed_seconds']=time.monotonic()-probe_start
+                probes.append(row)
+            probe_path=root/f'q_{iq:03d}_direct_probes.json'
+            def save_probes():
+                if probe_path.exists():
+                    raise FileExistsError(f'probe artifact exists: {probe_path}')
+                probe_path.write_text(_json(dict(admitted=False,sigma_computed=False,q=iq,probes=probes)))
+            rank0_transaction(probe_path,stage='shared_general.direct_probes',write=save_probes)
+        if bad_growth:
+            raise ValueError(f'GATE shared_general_laplace: q={iq} growth={growth} not below eta/supports; '
+                             f'frequency-only diagnostic retained at {path}')
+        raise RuntimeError(f'GATE shared_general_diagnostic_stop: unadmitted q={iq} partial model; '
+                           f'no Sigma computed; diagnostic retained at {path}')
+
+
 def _general_current_fit(current, samples, *, defer_admission=False):
     """Existing current directions/pencil/canonical lift/check stage.
 
@@ -788,9 +981,7 @@ def _general_current_fit(current, samples, *, defer_admission=False):
     from .response_bank import full_density_sample_rules, full_density_bare_moments
     from .w_isdf import full_density_response_stream
     from .shared_pole_pencil import tile_join, join_vectors
-    from .shared_pole_constructor import (general_pencil_batch_plan,
-        collective_general_pencil_batch, general_pencil_workspace_bytes,
-        reduce_equilibrium_pencil_device,
+    from .shared_pole_constructor import (reduce_equilibrium_pencil_device,reduce_general_pencil_device,
         EQUILIBRIUM_DEVICE_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
     H=current['H']
     V=current['V']
@@ -970,334 +1161,54 @@ def _general_current_fit(current, samples, *, defer_admission=False):
     # explicit numerical admission bound, not a pole budget chosen to fit RAM.
     workspace = int(snapshot.get("host_workspace_bytes", 4*1024**3))
     nl, nr = map(int, E.shape[-2:])
-    host_price = 0 if definite else general_pencil_workspace_bytes((nl,nr))
-    if host_price > workspace:
-        raise ValueError(f"GATE shared_general_capacity: reduced host pencil {nl}x{nr} "
-                         f"needs {host_price}>{workspace} bytes before any host gather")
+    host_price = 0
     end("pencil", (E, A, B, C, output_gram))
-    reduction_phase = 'devicereduce' if definite else 'hostreduce'
+    reduction_phase = 'devicereduce'
     begin(reduction_phase)
-    spaces = fit_basis.setdefault("equilibrium_device_spaces_v1" if definite else "spaces", {})
+    spaces = fit_basis.setdefault("equilibrium_device_spaces_v1" if definite else "general_device_spaces_v1", {})
     if not definite and samples.get('supports') is not None:
         # A previous physical refresh may have ended on expanded support
         # axes. Reuse only compatible general numerical coordinates; never
         # reinterpret those selectors on today's smaller initial pencil.
         for iq,space in list(spaces.items()):
-            if space['left'].shape[0]!=nl or space['right'].shape[0]!=nr:
+            if space['left'].shape[-2]!=nl or space['right'].shape[-2]!=nr:
                 del spaces[iq]
     banks, receipts = {}, []
     stop_after=snapshot.get('stop_after_model_q')
     if stop_after is not None and int(stop_after)!=0:
         raise ValueError('GATE shared_general_diagnostic: only stop_after_model_q=0 is supported')
     parents=[0] if stop_after is not None else [iq for iq in range(nq) if iq <= int(minus[iq])]
-    capture_workspace = 16*1024**2 if definite else 0
-    frequency_saved_bytes=0
-    position=0
-    if definite:
-        from .gw_config import linalg_resolution
-        eigh_backend=linalg_resolution({'linalg':current['config'].backend.linalg}).eigh_backend
-        for iq in parents:
+    from .gw_config import linalg_resolution
+    eigh_backend=linalg_resolution({'linalg':current['config'].backend.linalg}).eigh_backend
+    for iq in parents:
+        if definite:
             model=reduce_equilibrium_pencil_device(E[iq:iq+1],A[iq:iq+1],output_gram[iq:iq+1],
                 mesh_xy=mesh_xy,max_order=cap,rank_tolerance=float(recipe['bank_rule_tolerance']),
                 gamma_ry=gamma,fixed_spaces=spaces.get(iq),
                 multiplet_tolerance=float(recipe['multiplet_relative_tolerance']),
                 capacity=current['capacity'],eigh_backend=eigh_backend)
-            spaces.setdefault(iq,model['spaces'])
-            l=mm(C[iq:iq+1],model['output_map'])
-            r=mm(B[iq:iq+1],model['input_map'],transa='C')
-            p=np.pad(model['poles_ry'],(0,l.shape[-1]-len(model['poles_ry'])))
-            partner=int(minus[iq])
-            if partner==iq:
-                l=tile_join((.5*l,-.5*jnp.conj(l)),-1,face)
-                r=tile_join((r,jnp.conj(r)),-1,face)
-                p=join_vectors((p,-p.conj()),panel_side)
-            banks[iq]=(l,r,p)
-            if partner!=iq:
-                banks[partner]=(-jnp.conj(l),jnp.conj(r),-p.conj())
-            receipts.append(dict(q=iq,partner=partner,**model['receipt']))
-            if stop_after is not None:
-                # An explicit diagnostic may capture bounded frequency data;
-                # ordinary refreshes never gather these matrices or maps.
-                root=Path(run_dir)/f'{label}_general_shared_pole'
-                path=root/f'q_{iq:03d}_diagnostic.npz'
-                diagnostic_arrays=dict(
-                    E=E[iq],A=A[iq],output_gram=output_gram[iq],
-                    output_map=model['output_map'],input_map=model['input_map'],
-                    space_right=model['spaces']['right'])
-                payload_bytes=sum(a.size*a.dtype.itemsize for a in diagnostic_arrays.values())
-                bound=int(snapshot.get('frequency_diagnostic_storage_bytes',workspace))
-                if payload_bytes+65536>bound:
-                    raise ValueError('GATE shared_equilibrium_capture: explicit diagnostic storage bound exceeded')
-                arrays={k:np.asarray(gather_to_host(a)) for k,a in diagnostic_arrays.items()}
-                report=dict(admitted=False,sigma_computed=False,q=iq,model_receipt=model['receipt'],
-                    scope='explicit partial frequency diagnostic; no physical accuracy certificate')
-                def save_device_diagnostic():
-                    root.mkdir(parents=True,exist_ok=True)
-                    if path.exists():raise FileExistsError(path)
-                    np.savez(path,**arrays,poles_ry=model['poles_ry'],bank_poles_ry=p,
-                        metadata_json=np.asarray(_json(report)))
-                rank0_transaction(path,stage='shared_equilibrium.frequency_diagnostic',write=save_device_diagnostic)
-                raise RuntimeError(f'GATE shared_general_diagnostic_stop: unadmitted q={iq} partial model; '
-                                   f'no Sigma computed; diagnostic retained at {path}')
-        position=len(parents)
-    while position<len(parents):
-        retained=sum(a.nbytes for key in ('spaces', 'equilibrium_spaces', 'equilibrium_column_spaces_v1')
-            for space in fit_basis.get(key, {}).values() for a in space.values())
-        plan=general_pencil_batch_plan([(nl,nr)]*min(jax.process_count(),len(parents)-position),
-            max_order=cap,max_workspace_bytes=workspace,retained_host_bytes=retained+capture_workspace,
-            input_matrix_count=3 if definite else 2)
-        ids=parents[position:position+plan['batch_size']]
-        batch_start=time.monotonic()
-        if jax.process_index()==0:
-            print_fn(f"General shared-pole W [{label}] host batch parents={ids} "
-                     f"shape={nl}x{nr} cap={cap} peak_bytes={plan['host_workspace_bytes']}")
-            sys.stdout.flush()
-        # All ranks execute EVERY slice/gather before the pure host owners
-        # reduce their assigned parents concurrently. Never gather in a
-        # rank-conditional lambda or mix independent host modal gauges.
-        pencils=[(np.asarray(gather_to_host(E[iq])),np.asarray(gather_to_host(A[iq]))) for iq in ids]
-        grams = [np.asarray(gather_to_host(output_gram[iq])) for iq in ids] if definite else None
-        if definite and 0 in ids:
-            # These frequency-only arrays ALREADY reside on every host.
-            # Commit them before a strict metric refusal can discard the
-            # expensive microscopic samples. No port face is host-read.
-            j=ids.index(0)
-            capture_bytes=sum(a.nbytes for a in (*pencils[j],grams[j]))
-            storage_bound=int(snapshot.get('frequency_diagnostic_storage_bytes',workspace))
-            if capture_bytes+65536>storage_bound:
-                raise ValueError('GATE shared_equilibrium_capture: frequency-only storage bound exceeded')
-            capture_path=Path(run_dir)/f'{label}_general_shared_pole'/'q_000_equilibrium_pencil.npz'
-            capture_metadata=dict(q=0,admitted=False,sigma_computed=False,
-                representation=representation,equilibrium=equilibrium,gamma_ry=gamma,eta_ry=eta,
-                source_recipe_hash=recipe['source_recipe_hash'],recipe_hash=recipe['recipe_hash'],
-                source_support_reads_ev=recipe['support_reads_ev'],
-                frequency_coordinates=frequency_coordinates,
-                state_selection='principal-rrqr-v1',metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
-                rank_tolerance=float(recipe['bank_rule_tolerance']),
-                frequency_scale_ry=moment_scale,capacity=plan,
-                storage_array_bytes=capture_bytes,storage_bound_bytes=storage_bound,
-                capture_workspace_bytes=capture_workspace,full_microscopic_host_payload=False,
-                energy_sha256=hashlib.sha256(memoryview(energy)).hexdigest(),
-                density_sha256=hashlib.sha256(memoryview(rho)).hexdigest(),
-                U_active_sha256=hashlib.sha256(memoryview(
-                    np.ascontiguousarray(snapshot['U_active']))).hexdigest(),
-                scope='pre-reduction frequency-only diagnostic, NOT an admitted W or trajectory')
-            def save_frequency_capture():
-                capture_path.parent.mkdir(parents=True,exist_ok=True)
-                if capture_path.exists():
-                    raise FileExistsError(capture_path)
-                np.savez(capture_path,G=pencils[j][0],H=pencils[j][1],output_gram=grams[j],
-                    state_units=common_state_units,sites_ry=sites,
-                    fit_positions=np.asarray(fit_positions,np.int64),
-                    held_positions=np.asarray(held_positions,np.int64),
-                    metadata_json=np.asarray(_json(capture_metadata)))
-            rank0_transaction(capture_path,stage='shared_equilibrium.frequency_capture',write=save_frequency_capture)
-            frequency_saved_bytes+=capture_bytes+65536
-        try:
-            models=collective_general_pencil_batch(pencils,max_order=cap,max_workspace_bytes=workspace,
-                rank_tolerance=float(recipe['bank_rule_tolerance']),
-                frequency_scale_ry=moment_scale,coordinate_units=None if definite else coordinate_units,
-                fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained,
-                structure=dict(kind='equilibrium_definite', gamma_ry=gamma,
-                    state_selection='principal-rrqr-v1',state_units=common_state_units,
-                    metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
-                    frequency_scale_ry=moment_scale) if definite else None,
-                output_grams=grams)
-        except ValueError as error:
-            if not definite or not getattr(error,'canonical_host_failure',False):
-                raise
-            # The canonical owner status produced this SAME error on all
-            # ranks. These arrays already reside on every host; no gather
-            # or rank-conditional numerical call is introduced on failure.
-            _save_equilibrium_owner_failure(pencils,grams,ids,error,dict(
-                root=Path(run_dir)/f'{label}_general_shared_pole',
-                retained_storage_bytes=frequency_saved_bytes,
-                storage_bound_bytes=int(snapshot.get('frequency_diagnostic_storage_bytes',workspace)),
-                state_units=common_state_units,sites=sites,
-                metadata=dict(gamma_ry=gamma,eta_ry=eta,representation=representation,
-                    source_recipe_hash=recipe['source_recipe_hash'],recipe_hash=recipe['recipe_hash'],
-                    source_support_reads_ev=recipe['support_reads_ev'],
-                    frequency_coordinates=frequency_coordinates,state_selection='principal-rrqr-v1',
-                    metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
-                    rank_tolerance=float(recipe['bank_rule_tolerance']),frequency_scale_ry=moment_scale,
-                    energy_sha256=hashlib.sha256(memoryview(energy)).hexdigest(),
-                    density_sha256=hashlib.sha256(memoryview(rho)).hexdigest(),
-                    U_active_sha256=hashlib.sha256(memoryview(
-                        np.ascontiguousarray(snapshot['U_active']))).hexdigest(),
-                    capacity=plan,capture_workspace_bytes=capture_workspace)))
-            raise
-        for batch_index,(iq,model) in enumerate(zip(ids,models)):
-            spaces.setdefault(iq, model["spaces"])
-            order = len(model["poles_ry"])
-            carrier_order = extent(order)
-            padding = carrier_order-order
-            omap = np.pad(model["output_map"], ((0, 0), (0, padding)))
-            imap = np.pad(model["input_map"], ((0, 0), (0, padding)))
-            l = mm(C[iq:iq+1], put(omap[None], face))
-            r = mm(B[iq:iq+1], put(imap[None], face), transa="C")
-            p = np.pad(model["poles_ry"], (0, padding))
-            partner = int(minus[iq])
-            if partner == iq:
-                l = tile_join((.5*l, -.5*jnp.conj(l)), -1, face)
-                r = tile_join((r, jnp.conj(r)), -1, face)
-                p = join_vectors((p, -p.conj()), panel_side)
-            banks[iq] = (l, r, p)
-            if partner != iq:
-                banks[partner] = (-jnp.conj(l), jnp.conj(r), -p.conj())
-            receipts.append(dict(q=iq, partner=partner, **model["receipt"]))
-            growth=float(np.max(p.imag,initial=-np.inf))
-            bad_growth=eta<=growth+1e-12 or float(np.min(sites.imag))<=growth+1e-12
-            if (bad_growth and not defer_admission) or stop_after is not None:
-                if jax.process_index()==0:
-                    print_fn(f'General shared-pole W [{label}] early diagnostic q={iq} '
-                             f'order={order} growth_Ry={growth:.9g} eta_margin_Ry={eta-growth:.9g}')
-                    sys.stdout.flush()
-                # All reductions/gathers happen on EVERY rank before the
-                # root-only I/O transaction. No microscopic factor is read
-                # on the host: only O(K) norms and reduced-frequency arrays.
-                ln=np.asarray(gather_to_host(jnp.sqrt(jnp.sum(abs(l)**2,axis=(-3,-2))))).reshape(-1)
-                rn=np.asarray(gather_to_host(jnp.sqrt(jnp.sum(abs(r)**2,axis=(-3,-2))))).reshape(-1)
-                sample_errors=[]
-                for j,z in enumerate(sites):
-                    actual=mm(l/put((z-p)[None,None]),r,transb='C')
-                    target=values[j][iq:iq+1]
-                    sample_errors.append(float(jnp.linalg.norm(actual-target)/
-                        jnp.maximum(jnp.linalg.norm(target),1e-300)))
-                moment_errors=[]
-                for power,target in ((0,c1[iq:iq+1]),(1,c2[iq:iq+1])):
-                    actual=mm(l*put((p**power)[None,None]),r,transb='C')
-                    moment_errors.append(float(jnp.linalg.norm(actual-target)/
-                        jnp.maximum(jnp.linalg.norm(target),1e-300)))
-                root=Path(run_dir)/f'{label}_general_shared_pole'
-                path=root/f'q_{iq:03d}_diagnostic.npz'
-                report=dict(status='refused_laplace' if bad_growth else 'unadmitted_partial',
-                    admitted=False,sigma_computed=False,q=iq,partner=partner,
-                    reduced_shape=[nl,nr],model_order=order,bank_columns=len(p),
-                    max_growth_ry=growth,eta_ry=eta,eta_margin_ry=eta-growth,
-                    support_margin_ry=float(np.min(sites.imag))-growth,
-                    scalar_tolerance=float(recipe['bank_rule_tolerance']),fit_tolerance=tolerance,
-                    sample_errors=sample_errors,moment_errors=moment_errors,
-                    direct_dyson_probes_file=f'q_{iq:03d}_direct_probes.json' if bad_growth else None,
-                    model_receipt=model['receipt'],phase_seconds=phases,
-                    elapsed_seconds=time.monotonic()-started,artifact=str(path),
-                    full_microscopic_host_payload=False,n_mu=int(meta.n_rmu),n_q=nq,screening_bands=stop,
-                    response_active_bands=[response_active.start,response_active.stop])
-                report['verification_geometry']=verification_geometry
-                report['frequency_coordinates']=frequency_coordinates
-                arrays=dict(E=pencils[batch_index][0],A=pencils[batch_index][1],
-                    poles_ry=model['poles_ry'],output_map=model['output_map'],input_map=model['input_map'],
-                    space_right=model['spaces']['right'],space_left=model['spaces']['left'],
-                    bank_poles_ry=p,left_column_norm=ln,right_column_norm=rn,residue_norm_bound=ln*rn,
-                    energy_ry=energy,U_active=np.asarray(snapshot['U_active']),rho_active=np.asarray(snapshot['rho_active']),
-                    sites_ry=sites,fit_positions=np.asarray(fit_positions,np.int32),
-                    held_positions=np.asarray(held_positions,np.int32),
-                    frequency_scale_ry=np.array(moment_scale),
-                    left_coordinate_units=coordinate_units[0],right_coordinate_units=coordinate_units[1],
-                    gamma_ry=np.array(gamma),eta_ry=np.array(eta))
-                # Full-port actions contract ON DEVICE into frequency-only
-                # Grams. Their host bound includes existing batch inputs,
-                # canonical maps/spaces and the two optional held actions.
-                selected=[j for j in held_positions if j>=len(fit_ids)+len(held_ids)][:2]
-                if not selected:
-                    selected=held_positions[:2]
-                action_bytes=16*(nl*nl+nr*nr+len(selected)*nl*nr)
-                base_bytes=retained+sum(e.nbytes+a.nbytes for e,a in pencils)
-                base_bytes+=sum(sum(m[k].nbytes for k in ('poles_ry','output_map','input_map'))+
-                                sum(a.nbytes for a in m['spaces'].values()) for m in models)
-                report['frequency_capture_host_bytes']=base_bytes+action_bytes
-                report['frequency_gram_scope']='unsymmetrized_reduced_transfer_CXB'
-                report['bank_self_negative_mixture']=partner==iq
-                if base_bytes+action_bytes<=workspace:
-                    arrays['GC']=np.asarray(gather_to_host(mm(C[iq:iq+1],C[iq:iq+1],transa='C')))[0]
-                    arrays['GB']=np.asarray(gather_to_host(mm(B[iq:iq+1],B[iq:iq+1],transb='C')))[0]
-                    mixed=[];exact_norm=[]
-                    for j in selected:
-                        target=values[j][iq:iq+1]
-                        mixed.append(np.asarray(gather_to_host(mm(C[iq:iq+1],
-                            mm(target,B[iq:iq+1],transb='C'),transa='C')))[0])
-                        exact_norm.append(float(jnp.sum(abs(target)**2)))
-                    arrays.update(probe_sites_ry=sites[selected],probe_mixed_J=np.asarray(mixed),
-                                  probe_exact_norm_sq=np.asarray(exact_norm))
-                else:
-                    report['frequency_action_grams_omitted']='explicit host workspace bound'
-                def save_diagnostic():
-                    root.mkdir(parents=True,exist_ok=True)
-                    if path.exists():
-                        raise FileExistsError(f'diagnostic artifact exists: {path}')
-                    np.savez(path,**arrays)
-                    path.with_suffix('.json').write_text(_json(report))
-                rank0_transaction(path,stage='shared_general.frequency_diagnostic',write=save_diagnostic)
-                # The reduced model is now durably committed BEFORE any new
-                # microscopic probe can stall/refuse or exhaust the job cap.
-                probes=[]
-                if bad_growth and len(p):
-                    suspect=p[int(np.argmax(p.imag))]
-                    offset=max(eta,.001*abs(suspect))
-                    probe_sites=[suspect+1j*offset,suspect+offset+1j*offset]
-                    if stop_after is not None:
-                        probe_sites.insert(0,suspect)
-                    for probe_index,z in enumerate(probe_sites):
-                        probe_start=time.monotonic()
-                        raw_probe=None
-                        row=dict(z_ry=[float(z.real),float(z.imag)],at_fitted_pole=z==suspect,
-                                 gamma_ry=gamma,additional_collision_eta_ry=0.)
-                        if jax.process_index()==0:
-                            print_fn(f'General shared-pole W [{label}] direct microscopic dielectric/Dyson probe '
-                                     f'q={iq} z_Ry={z}; basic artifact committed')
-                            sys.stdout.flush()
-                        try:
-                            for block in blocks:
-                                left_density, right_density = block['density_sides']
-                                left=((pm-ph) if left_density else pm)*jnp.asarray(block['u'])[:,None,None]
-                                right=(ph if right_density else pm)*jnp.asarray(block['f'])[:,None,None]
-                                prules=full_density_sample_rules(energy[:,:stop],np.array([z]),gamma_ry=gamma,
-                                    tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),
-                                    paired=True,values_only=True)
-                                for rule in prules:
-                                    stream=full_density_response_stream(mesh_xy,grid,(nk,nb,nmu,ns),q_ids=[iq],
-                                        n_outputs=1,layout=layout,qgrid=qgrid,response_window=response_window,
-                                        rule_reference_ry=rule['reference_ry'],pair_bounds_ry=block['bounds'],
-                                        pair_band_ranges=block['band_ranges'],
-                                        k_unfold_plan=carrier.plan,execute=execute_response)
-                                    part=stream(jnp.asarray(rule['times']),jnp.asarray(rule['weights']),left,pn,right,energy_d)[:,0]
-                                    raw_probe=part if raw_probe is None else raw_probe+part
-                            if stop_after is not None:
-                                row.update(_save_general_dielectric_probe(raw_probe,
-                                    dict(dyson=dyson, H=H[iq:iq+1], matmul=mm, face=face, rep=rep,
-                                         mask=meta.mu_basis.active_mask),
-                                    dict(q=iq,z_ry=row['z_ry'],at_fitted_pole=z==suspect,
-                                         gamma_ry=gamma,scalar_rule_tolerance=float(recipe['bank_rule_tolerance']),
-                                         prefactor=float(algebra['prefactor']),
-                                         elapsed_seconds=time.monotonic()-probe_start),
-                                    root=root,index=probe_index))
-                            if z!=suspect:
-                                exact=dyson.value(H[iq:iq+1],raw_probe)
-                                fitted=mm(l/put((z-p)[None,None]),r,transb='C')
-                                row.update(exact_w_norm=float(jnp.linalg.norm(exact)),
-                                    fitted_w_norm=float(jnp.linalg.norm(fitted)),relative_w_defect=float(jnp.linalg.norm(fitted-exact)/
-                                        jnp.maximum(jnp.linalg.norm(exact),1e-300)))
-                        except Exception as error:
-                            row['error']=str(error)
-                        row['elapsed_seconds']=time.monotonic()-probe_start
-                        probes.append(row)
-                    probe_path=root/f'q_{iq:03d}_direct_probes.json'
-                    def save_probes():
-                        if probe_path.exists():
-                            raise FileExistsError(f'probe artifact exists: {probe_path}')
-                        probe_path.write_text(_json(dict(admitted=False,sigma_computed=False,q=iq,probes=probes)))
-                    rank0_transaction(probe_path,stage='shared_general.direct_probes',write=save_probes)
-                if bad_growth:
-                    raise ValueError(f'GATE shared_general_laplace: q={iq} growth={growth} not below eta/supports; '
-                                     f'frequency-only diagnostic retained at {path}')
-                raise RuntimeError(f'GATE shared_general_diagnostic_stop: unadmitted q={iq} partial model; '
-                                   f'no Sigma computed; diagnostic retained at {path}')
-        jax.block_until_ready([banks[iq][:2] for iq in ids])
-        if jax.process_index()==0:
-            print_fn(f"General shared-pole W [{label}] host batch complete parents={ids} "
-                     f"orders={[len(m['poles_ry']) for m in models]} wall={time.monotonic()-batch_start:.3f}s")
-            sys.stdout.flush()
-        del pencils,models,model,omap,imap,grams
-        position+=len(ids)
+        else:
+            model=reduce_general_pencil_device(E[iq:iq+1],A[iq:iq+1],mesh_xy=mesh_xy,
+                max_order=cap,rank_tolerance=float(recipe['bank_rule_tolerance']),
+                fixed_spaces=spaces.get(iq),frequency_scale_ry=moment_scale,
+                coordinate_units=coordinate_units,capacity=current['capacity'],eigh_backend=eigh_backend)
+        spaces.setdefault(iq,model['spaces'])
+        l=mm(C[iq:iq+1],model['output_map'])
+        r=mm(B[iq:iq+1],model['input_map'],transa='C')
+        p=np.pad(model['poles_ry'],(0,l.shape[-1]-len(model['poles_ry'])))
+        partner=int(minus[iq])
+        if partner==iq:
+            l=tile_join((.5*l,-.5*jnp.conj(l)),-1,face)
+            r=tile_join((r,jnp.conj(r)),-1,face)
+            p=join_vectors((p,-p.conj()),panel_side)
+        banks[iq]=(l,r,p)
+        if partner!=iq:
+            banks[partner]=(-jnp.conj(l),jnp.conj(r),-p.conj())
+        receipts.append(dict(q=iq,partner=partner,**model['receipt']))
+        _general_model_frequency_diagnostic(current,samples,model,banks[iq],dict(
+            q=iq,E=E,A=A,B=B,C=C,moments=(c1,c2),coordinate_units=coordinate_units,
+            moment_scale=moment_scale,partner=partner,defer_admission=defer_admission,
+            frequency_coordinates=frequency_coordinates,workspace=workspace))
     end(reduction_phase, [b[:2] for b in banks.values()])
     # Every current full-matrix sample checks the FINAL bank, including the
     # mirrored partner and self-negative convex crossing mixture.
@@ -1458,7 +1369,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         response_partition=response_partition,
         eta_training_verification='active_span_3train_2interlaced_held_v1',
         numerical_spaces='two-sided-descriptor-svd',
-        eigensolver='current-descriptor-balanced-ordinary-geev',
+        eigensolver='explicit-device-right-general-eigenvectors-inverse',
         frequency_equilibration='unit-aware-combined-pencil-Ruiz-infinity-8',
         frequency_scale='max_current_full_requested_energy_span_eta',
         descriptor_rank_tolerance=float(recipe['bank_rule_tolerance']),
@@ -1466,7 +1377,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         scalar_rule_tolerance=float(recipe["bank_rule_tolerance"]),
         full_matrix_fit_held_tolerance=float(snapshot.get("fit_tolerance", .02)),
         modal_reconstruction_tolerance=1e-9, laplace_margin_ry=1e-12,
-        capacity="explicit-full-map-and-host-pencil-bound", store="sha256-complete-full-q")
+        capacity="compiled-native-program-and-provider-workspace", store="sha256-complete-full-q")
     if definite:
         general_gates.update(numerical_spaces='original-coordinate-native-common-span-v1',
             eigensolver='native-positive-H-quotient-Hermitian-eigh',
@@ -1763,12 +1674,14 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         a.nbytes for key in ('spaces', 'equilibrium_spaces', 'equilibrium_column_spaces_v1')
         for space in fit_basis.get(key, {}).values() for a in space.values())
     receipt['held_reduced_device_basis_bytes_per_rank']=sum(
-        a.size*a.dtype.itemsize for space in fit_basis.get('equilibrium_device_spaces_v1',{}).values()
+        a.size*a.dtype.itemsize for key in ('equilibrium_device_spaces_v1','general_device_spaces_v1')
+        for space in fit_basis.get(key,{}).values()
         for a in {id(v):v for v in space.values()}.values())//ranks
     retained = sum(a.size*a.dtype.itemsize for key in ('directions', 'equilibrium_directions')
                    for a in fit_basis.get(key, {}).values())
     retained += sum(a.size*a.dtype.itemsize
-        for space in fit_basis.get('equilibrium_device_spaces_v1',{}).values()
+        for key in ('equilibrium_device_spaces_v1','general_device_spaces_v1')
+        for space in fit_basis.get(key,{}).values()
         for a in {id(v):v for v in space.values()}.values())
     kept = current_meta.shared_pole_capacity.reserve("general_held_numeric_basis",
         resident_bytes_per_rank=max(0, retained-previous_direction_bytes)//ranks,

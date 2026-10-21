@@ -29,6 +29,14 @@ EQUILIBRIUM_METRIC_SOLVER='original-columns-extended-newton-v1'
 EQUILIBRIUM_DEVICE_SOLVER='same-state-device-metric-quotient-v1'
 
 
+def _spectral_cut_receipt(closure):
+    """An end cut has no neighbouring gap; publish null rather than infinity."""
+    import math
+    if closure is None:return None
+    return {key:(None if key in ('gap_rel','gap_rel_closed') and
+                 not math.isfinite(value) else value) for key,value in closure.items()}
+
+
 @lru_cache(maxsize=32)
 def _equilibrium_device_programs(mesh_xy, width, dial_key, room=None, eigh_backend='auto'):
     """Cache shape-specialized native metric/Ritz programs, never current data."""
@@ -192,12 +200,217 @@ def reduce_equilibrium_pencil_device(G, H, output_gram, *, mesh_xy, max_order,
         physical_accuracy_certified=False,sigma_accuracy_certified=False,
         approximation_requires_full_W_validation=True,
         required_validation='original full-W train/held and full complex column-Sigma/collision refinement',
-        spectral_closure=closure,spectral_variable='z+i_gamma',gamma_ry=float(gamma_ry),
+        spectral_closure=_spectral_cut_receipt(closure),spectral_variable='z+i_gamma',gamma_ry=float(gamma_ry),
         host_frequency_matrix_bytes=0,host_reduce_seconds=0.,
         device_reduce_seconds=time.monotonic()-started,**initial,**diagnostics)
     held_space=space if base is None else base
     return dict(poles_ry=poles,output_map=output_map,input_map=input_map,
         spaces=dict(right=held_space,left=held_space),receipt=receipt)
+
+
+@lru_cache(maxsize=32)
+def _general_device_programs(mesh_xy, left, right, dial_key, room, eigh_backend, eig_backend):
+    """Native general descriptor programs; all current pencils are operands."""
+    import jax.numpy as jnp
+    import distrib_la
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from .shared_pole_execution import face_matmul
+    from .shared_pole_reduction import (general_equilibration_stage,general_descriptor_dilation,
+        general_projected_stage,general_modal_stage)
+    from .shared_pole_pencil import tile_split
+    face=NamedSharding(mesh_xy,P(None,'x','y'));rep=NamedSharding(mesh_xy,P())
+    mm=face_matmul(mesh_xy)
+    eig=distrib_la.plan('eigh',mesh_xy,n=left+right,backend=eigh_backend,budget_bytes=room)
+    equilibrate=jax.jit(general_equilibration_stage,out_shardings=(face,face,rep,rep))
+    def svd(e):
+        values,vectors=eig.batched(general_descriptor_dilation(e,matrix_sharding=face))
+        u,v=tile_split(vectors,(left,right),-2,face)
+        return values,u*2**.5,v*2**.5
+    svd=distrib_la.checked_program(svd,mesh_xy,out_shardings=(rep,face,face))
+    project=jax.jit(lambda e,a,x,y:general_projected_stage(e,a,x,y,matmul=mm),
+        out_shardings=(face,face))
+    def local_modal(a):
+        w,vr=distrib_la.eig_local(a,backend=eig_backend)
+        dual=distrib_la.solve_local(vr,jnp.broadcast_to(jnp.eye(a.shape[-1],dtype=a.dtype),a.shape))
+        info=distrib_la.eig_local_diagnostics(a,w,vr,dual)
+        p=int(mesh_xy.shape['y'])
+        small=tuple(jnp.broadcast_to(i[:,None,None],(a.shape[0],p,p)) for i in info)
+        return jnp.eye(a.shape[-1],dtype=a.dtype)*w[:,None,:],vr,dual,small
+    modal=distrib_la.local_batch(local_modal,mesh_xy)
+    run_modal=jax.jit(lambda a,x,y,active:general_modal_stage(a,x,y,active,matmul=mm,modal=modal),
+        out_shardings=(face,face,face,(face,)*4,rep))
+    scale=jax.jit(lambda a,w:a*w,out_shardings=face)
+    lift=jax.jit(lambda x,y,o,i:(mm(x,o),mm(y,i)),out_shardings=(face,face))
+    def checks(e,a,rb,lb,o,values,active):
+        metric=mm(lb,mm(e,rb),transa='C')
+        want=jnp.eye(e.shape[-1],dtype=e.dtype)*active[:,None,:]
+        lhs=mm(a,o);rhs=mm(e,o)*values[:,None,:]
+        error=jnp.linalg.norm(lhs-rhs)/jnp.maximum(
+            jnp.linalg.norm(a)*jnp.linalg.norm(o)+jnp.linalg.norm(e)*jnp.linalg.norm(o)*jnp.max(abs(values)),
+            jnp.finfo(e.real.dtype).tiny)
+        return jnp.linalg.norm(metric-want),error
+    checks=jax.jit(checks,out_shardings=(rep,rep))
+    return equilibrate,svd,project,run_modal,scale,lift,checks
+
+
+def reduce_general_pencil_device(E,A,*,mesh_xy,max_order,rank_tolerance=1e-8,
+                                fixed_spaces=None,frequency_scale_ry=1.,coordinate_units=None,
+                                capacity=None,eigh_backend='auto'):
+    """Two-sided native reduction of one general complex descriptor pencil.
+
+    E/A [1,L,R] and returned original-coordinate spaces/maps [1,L/R,K]
+    remain face tiled. Hermitian dilations supply direct singular vectors;
+    the current restricted descriptor is balanced on every solve. The
+    ordinary non-Hermitian eigensystem uses an explicit device provider and
+    its inverse right eigenvectors, preserving signed/complex/growing poles.
+    Only O(L+R+K) spectra and scalar diagnostics reach the host.
+    """
+    import math
+    import numpy as np
+    import jax.numpy as jnp
+    import distrib_la
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from common.collectives import device_put_process_local,gather_to_host
+    from common.rank_criterion import select_rank
+    from common.spectral_closure import resolve_spectral_cut
+    from common.staged_reshard import permute_sharded_axis
+    from .shared_pole_execution import face_matmul
+    started=time.monotonic()
+    if (E.ndim!=3 or E.shape[0]!=1 or A.shape!=E.shape or min(E.shape[-2:])<1
+            or not 0<float(rank_tolerance)<1 or not np.isfinite(frequency_scale_ry)
+            or frequency_scale_ry<=0 or int(max_order)<1):
+        raise ValueError('GATE shared_general_pencil: one finite native descriptor pair required')
+    backend=distrib_la.resolve_eig_local_backend()
+    nl,nr=E.shape[-2:];p=int(mesh_xy.shape['y'])
+    face=NamedSharding(mesh_xy,P(None,'x','y'));rep=NamedSharding(mesh_xy,P())
+    put=lambda a:device_put_process_local(np.asarray(a),rep)
+    mm=face_matmul(mesh_xy)
+    room=None
+    if capacity is not None:
+        from lxkit import memory
+        ambient=capacity.preview(resident_bytes_per_rank=0,workspace_bytes_per_rank=0,
+            concurrent_with=tuple(capacity.live_stages))
+        room=memory.bucket(max(0,ambient['available_device_bytes_per_rank']-ambient['aggregate_bytes_per_rank']))
+    admitted=[];modal_workspace=None
+    def admit(program,operands,phase,local_order=None,eigh_order=None):
+        nonlocal modal_workspace
+        if capacity is None:return
+        executable=program.lower(*operands).compile()
+        analysis=executable.memory_analysis()
+        price=max(0,int(analysis.temp_size_in_bytes)+int(analysis.output_size_in_bytes)-int(analysis.alias_size_in_bytes))
+        if local_order is not None:
+            workspace=distrib_la.eig_local_workspace(local_order,backend=backend)
+            price+=workspace['device_bytes']
+            modal_workspace=workspace
+        if eigh_order is not None:
+            plan=distrib_la.plan('eigh',mesh_xy,n=eigh_order,backend=eigh_backend,budget_bytes=room)
+            price+=distrib_la.workspace_bytes_per_rank(plan,'eigh',((1,eigh_order,eigh_order),),np.complex128)
+        row=capacity.reserve(f'general_device_{phase}.{len(capacity.entries)}',
+            resident_bytes_per_rank=0,workspace_bytes_per_rank=price,
+            concurrent_with=tuple(capacity.live_stages),whole=local_order is not None)
+        admitted.append(row['stage'])
+    programs=_general_device_programs(mesh_xy,nl,nr,distrib_la.dial_key(),room,eigh_backend,backend)
+    if fixed_spaces is None:
+        if coordinate_units is None:coordinate_units=(np.ones(nl),np.ones(nr))
+        ul,ur=(np.asarray(v,float) for v in coordinate_units)
+        if (ul.shape!=(nl,) or ur.shape!=(nr,) or not np.isfinite(ul).all()
+                or not np.isfinite(ur).all() or np.any(ul<=0) or np.any(ur<=0)):
+            raise ValueError('GATE shared_general_units: positive original equation-unit vectors required')
+        operands=(E,A,put(ul),put(ur),put(frequency_scale_ry))
+        admit(programs[0],operands,'equilibration')
+        eq,_,dl,dr=programs[0](*operands)
+        admit(programs[1],(eq,),'descriptor_svd',eigh_order=nl+nr)
+        spectrum,u,v=programs[1](eq)
+        spectrum=np.asarray(gather_to_host(spectrum))[0]
+        singular=spectrum[-min(nl,nr):]
+        if not np.isfinite(singular).all() or singular[-1]<=0:
+            raise ValueError('GATE shared_general_rank: nonfinite or null descriptor')
+        natural_rank=select_rank(singular,float(rank_tolerance),ceiling=min(nl,nr))
+        rank=min(natural_rank,int(max_order))
+        rank,closure=resolve_spectral_cut(np.maximum(singular,0),rank,
+            where='shared general device descriptor',rcond=float(rank_tolerance))
+        if not 0<rank<=int(max_order):
+            raise ValueError('GATE shared_general_order: resolved descriptor rank empty or exceeds pole budget')
+        width=math.ceil(rank/p)*p
+        index=np.r_[np.arange(len(spectrum)-rank,len(spectrum)),np.repeat(len(spectrum)-1,width-rank)].astype(np.int32)
+        active=np.arange(width)<rank
+        x=permute_sharded_axis(v,2,index,mesh_xy,face.spec)
+        y=permute_sharded_axis(u,2,index,mesh_xy,face.spec)
+        x=programs[4](programs[4](x,dr[:,:,None]),put(active[None,None]))
+        y=programs[4](programs[4](y,dl[:,:,None]),put(active[None,None]))
+        spaces=dict(right=x,left=y)
+    else:
+        x,y=fixed_spaces['right'],fixed_spaces['left']
+        if (x.ndim!=3 or y.ndim!=3 or x.shape[:2]!=(1,nr) or y.shape[:2]!=(1,nl)
+                or x.shape[-1]!=y.shape[-1]):
+            raise ValueError('GATE shared_general_basis: native original-coordinate held spaces required')
+        width=x.shape[-1]
+        norms=jax.jit(lambda a:jnp.sum(abs(a)**2,axis=-2),out_shardings=rep)(x)
+        active=np.asarray(gather_to_host(norms))[0]>0
+        rank=int(np.count_nonzero(active));spaces=fixed_spaces;closure=None;natural_rank=rank
+        if not 0<rank<=int(max_order):raise ValueError('GATE shared_general_basis: invalid held rank')
+    # Original pencils and original-coordinate spaces define CURRENT physics.
+    admit(programs[2],(E,A,x,y),'current_projection')
+    ep,ap=programs[2](E,A,x,y)
+    small=_general_device_programs(mesh_xy,width,width,distrib_la.dial_key(),room,eigh_backend,backend)
+    admit(small[1],(ep,),'current_descriptor_svd',eigh_order=2*width)
+    spectrum,u,v=small[1](ep)
+    spectrum=np.asarray(gather_to_host(spectrum))[0]
+    singular=spectrum[-width:]
+    rounding=128*max(nl,nr,width)*np.finfo(float).eps
+    if (not np.isfinite(singular).all() or singular[-rank]<=max(float(rank_tolerance),rounding)*singular[-1]):
+        raise ValueError('GATE shared_general_basis: current projected descriptor unresolved; no held rank drop')
+    index=np.r_[np.arange(len(spectrum)-rank,len(spectrum)),np.repeat(len(spectrum)-1,width-rank)].astype(np.int32)
+    weights=np.r_[1/np.sqrt(singular[-rank:]),np.zeros(width-rank)]
+    rb=small[4](permute_sharded_axis(v,2,index,mesh_xy,face.spec),put(weights[None,None]))
+    lb=small[4](permute_sharded_axis(u,2,index,mesh_xy,face.spec),put(weights[None,None]))
+    active=put((np.arange(width)<rank)[None])
+    admit(small[3],(ap,rb,lb,active),'modal',width)
+    poles,omap,imap,info,sentinels=small[3](ap,rb,lb,active)
+    info=[np.asarray(gather_to_host(v)).reshape(-1)[0].item() for v in info]
+    if int(info[0]):
+        raise ValueError(f'GATE shared_general_eigenvectors: native modal backward/inverse status={int(info[0])}')
+    poles=np.asarray(gather_to_host(jax.jit(lambda a:jnp.diagonal(a,axis1=-2,axis2=-1),out_shardings=rep)(poles)))[0]
+    sentinels=np.asarray(gather_to_host(sentinels))[0]
+    padding=width-rank
+    inert=np.zeros(width,bool)
+    for sentinel in sentinels[rank:]:
+        candidates=np.flatnonzero(abs(poles-sentinel)<=rounding*max(1,abs(sentinel)))
+        if len(candidates)!=1 or inert[candidates[0]]:
+            raise ValueError('GATE shared_general_padding: modal inert sentinel unresolved')
+        inert[candidates[0]]=True
+    positions=np.flatnonzero(~inert)
+    positions=positions[np.lexsort((poles[positions].imag,poles[positions].real))]
+    logical=poles[positions]
+    index=np.r_[positions,np.repeat(positions[0],padding)].astype(np.int32)
+    mask=put((np.arange(width)<rank)[None,None])
+    output_coefficients=small[4](permute_sharded_axis(omap,2,index,mesh_xy,face.spec),mask)
+    input_coefficients=small[4](permute_sharded_axis(imap,2,index,mesh_xy,face.spec),mask)
+    check_operands=(ep,ap,rb,lb,output_coefficients,put(np.pad(logical,(0,padding))[None]),active)
+    admit(small[6],check_operands,'descriptor_checks')
+    metric_error,generalized_error=small[6](*check_operands)
+    metric_error=float(gather_to_host(metric_error));generalized_error=float(gather_to_host(generalized_error))
+    if (not np.isfinite([metric_error,generalized_error]).all()
+            or generalized_error>64*width*np.finfo(float).eps):
+        raise ValueError('GATE shared_general_eigenvectors: nonfinite current descriptor reconstruction')
+    admit(programs[5],(x,y,output_coefficients,input_coefficients),'original_lift')
+    output,input_=programs[5](x,y,output_coefficients,input_coefficients)
+    return dict(poles_ry=logical,output_map=output,input_map=input_,spaces=spaces,
+        receipt=dict(order=rank,held_state_rank=rank,construction='general-two-sided-tangential-loewner',
+            eigensolver=f'explicit-device-{backend}-right-eigenvectors-inverse',
+            numerical_spaces='original-coordinate-native-two-sided-v1',
+            rank_tolerance=float(rank_tolerance),spectral_closure=_spectral_cut_receipt(closure),
+            natural_descriptor_rank=natural_rank,pole_budget_binds=natural_rank>int(max_order),
+            eigen_residual=float(info[1]),inverse_residual=float(info[2]),
+            eigenvector_condition_estimate=float(info[3]),host_frequency_matrix_bytes=0,
+            current_descriptor_metric_error=metric_error,
+            projected_generalized_backward_error=generalized_error,
+            host_reduce_seconds=0.,device_reduce_seconds=time.monotonic()-started,
+            physical_accuracy_certified=False,sigma_accuracy_certified=False,
+            required_validation='all original full-W fit/held, growth and full complex column-Sigma',
+            modal_provider_workspace=modal_workspace,
+            provider_host_workspace_in_device_ledger=False,
+            capacity_stages=admitted))
 
 
 def collective_general_pencil(E, A, *, max_order, rank_tolerance=1e-10,
