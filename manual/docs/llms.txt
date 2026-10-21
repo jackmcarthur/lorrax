@@ -27,7 +27,7 @@
 - [Physics overview](https://jackmcarthur.github.io/lorrax/theory/physics/): manual/docs/theory/physics.md
 - [The q → 0 head](https://jackmcarthur.github.io/lorrax/theory/q0-head/): manual/docs/theory/q0-head.md
 - [Quasiparticle self-consistency](https://jackmcarthur.github.io/lorrax/theory/qsgw/): manual/docs/theory/qsgw.md
-- [Shared-pole W](https://jackmcarthur.github.io/lorrax/theory/shared-pole-w/): manual/docs/theory/shared-pole-w.md
+- [Tangential W model](https://jackmcarthur.github.io/lorrax/theory/shared-pole-w/): manual/docs/theory/shared-pole-w.md
 - [Symmetry](https://jackmcarthur.github.io/lorrax/theory/symmetry/): manual/docs/theory/symmetry.md
 - [Time–frequency transforms](https://jackmcarthur.github.io/lorrax/theory/time-frequency/): manual/docs/theory/time-frequency.md
 - [Velocity operator](https://jackmcarthur.github.io/lorrax/theory/velocity-operator/): manual/docs/theory/velocity-operator.md

@@ -36,7 +36,7 @@ Writes
 1. **ISDF basis and Coulomb metric**
    Fit $\zeta_{\bq\mu}(\br)$ by least squares on the pair-density Gram over the fit windows, then build $V_\bq(\mu,\nu)$ on the sphere $|\bq+\bG|^2\le$ `bare_coulomb_cutoff`. A `tmp/zeta_q.h5` whose fit provenance matches is reused instead of refitted.
 2. **Screening**
-   $\chi^0_\bq(\br_\mu,\br_\nu;z)$ from the products $-iG^{\gtrless}G^{\lessgtr}$ on the points, at the complex frequencies the treatment requests, then the per-$\bq$ Dyson solve $W_\bq(z)=[I-V_\bq\chi^0_\bq(z)]^{-1}V_\bq$. On the production route $W^c=W-V$ becomes one set of real poles per $\bq$, shared by every matrix element ([shared-pole W](../../theory/shared-pole-w.md)).
+   $\chi^0_\bq(\br_\mu,\br_\nu;z)$ from the products $-iG^{\gtrless}G^{\lessgtr}$ on the points, at the complex frequencies the treatment requests, then the per-$\bq$ Dyson solve $W_\bq(z)=[I-V_\bq\chi^0_\bq(z)]^{-1}V_\bq$. On the production route $W^c=W-V$ becomes one set of real poles per $\bq$, shared by every matrix element ([Tangential W model](../../theory/shared-pole-w.md)).
 3. **Self-energy**
    $\Sigma^x$ and $\Sigma^c(\omega)$, read at each state's own energy, with the $\bq\to0$ head carried as a separate scalar channel ([the q → 0 head](../../theory/q0-head.md)). On the dynamic treatments the $\Sigma^c$ band sum is extrapolated past `number_bands_sigma` ([band extrapolation](../../theory/band-extrapolation.md)).
 4. **Quasiparticle bands**
@@ -103,7 +103,7 @@ Two treatments are for production runs: the shared-pole model, full frequency, f
     qp_solver     = self_consistent
     ```
 
-    **Note** The production route for insulators, metals and time-reversal-broken decks, with `qp_solver = self_consistent`. `sigma_w_accuracy = relaxed` selects the looser recipe tier. `mpa_pole_batch_size`, `mpa_fit_reuse_file` and `mpa_overwrite_completed_artifacts` refuse here. Full page: [Shared-pole W](../../theory/shared-pole-w.md).
+    **Note** The production route for insulators, metals and time-reversal-broken decks, with `qp_solver = self_consistent`. `sigma_w_accuracy = relaxed` selects the looser recipe tier. `mpa_pole_batch_size`, `mpa_fit_reuse_file` and `mpa_overwrite_completed_artifacts` refuse here. Full page: [Tangential W model](../../theory/shared-pole-w.md).
 
 ??? treatment supported "gn_ppm · Godby–Needs plasmon pole · plasmon pole"
     One real pole per matrix element, fixed by $W^c$ at $z=0$ and at $z=i\omega_p$, $\omega_p=$ `ppm_omega_p` (default 2 Ry). On a time-reversal-broken deck the fit carries a second, odd residue.
@@ -201,7 +201,7 @@ The numerical controls (`sigma_quadrature_eps`, the centroid count, the pole bud
 | k grid | (WFN) | The link error $\epsilon_{\mathrm{link}}$ printed by dipole and on every QSGW map: 9 % on MoS₂ 3×3, 4.6 % on Fe 4³, 3.4 % on Si 4³. On MoS₂ 3×3 the QSGW gap is 5.167 eV without the link term and 4.483 eV with it. | Refine the k grid ([velocity operator §3.6](../../theory/velocity-operator.md#berry-valid)). |
 | ISDF points | `centroids_file` | $\Sigma^x$ RMS ≤ 1 meV at $N_\mu\approx0.5\,r$ ([ISDF §4](../../theory/isdf.md#isdf-accuracy)). | Select on the Σ pair set. |
 | Σ quadrature | `sigma_quadrature_eps` | Default $10^{-4}$: eqp0 within 0.89 meV of $\varepsilon=10^{-6}$ (Fe 4³ QSGW, $E_F\pm15$ eV). | Lower $\varepsilon$. |
-| Pole count of $W$ | (recipe) | 0.80 meV QP RMS against contour deformation, Si ([shared-pole W §7.9](../../theory/shared-pole-w.md#ritz-count)). | — |
+| Pole count of $W$ | (recipe) | 0.80 meV QP RMS against contour deformation, Si ([Tangential W model §7.9](../../theory/shared-pole-w.md#ritz-count)). | — |
 | Semicore read | (fixed, η = 5 eV) | $E_F\pm1$ eV: 3.6 / 15.9 meV on Fe 4³, 2.9 / 20.0 meV on MoS₂ 3×3 ([QSGW §3.3](../../theory/qsgw.md#bands-core)). | `sigma_omega_patches_ev` windows at a smaller η. |
 
 !!! note "Agreement with BerkeleyGW"

@@ -137,7 +137,7 @@ A spinor `WFN.h5` (`nspinor = 2`, from `noncolin = .true.` with or without `lspi
 A magnet is run noncollinear, as a spinor `WFN.h5`; a collinear spin-polarized run (`nspin = 2`) refuses. What sets a magnet apart is broken time reversal. LORRAX measures time reversal on the occupied states before anything uses it ([`LORRAX_TRS_CHECK`](environment.md)), and when it is broken the whole calculation changes:
 
 - **Symmetry.** Time reversal enters only through the operations QE marks as composed with it. $\bq$ and $-\bq$ are no longer related, so both are computed.
-- **Frequency dependence.** $W^c(z)$ is no longer even in $z$, and every pole model carries an odd part: a second, odd residue per pole in GN-PPM and the elementwise multipole fit, and the ordered shared-pole model, which pairs each $\bq$ with $-\bq$ and needs the high-frequency moments $M_0$ to $M_3$ ([Shared-pole W](../theory/shared-pole-w.md#pen-ordered)). More of $W$ is sampled and fitted.
+- **Frequency dependence.** $W^c(z)$ is no longer even in $z$, and every pole model carries an odd part: a second, odd residue per pole in GN-PPM and the elementwise multipole fit, and the ordered shared-pole model, which pairs each $\bq$ with $-\bq$ and needs the high-frequency moments $M_0$ to $M_3$ ([Tangential W model](../theory/shared-pole-w.md#pen-ordered)). More of $W$ is sampled and fitted.
 - **Treatments.** `hl_ppm`, `screening_diagrams = w_bse` and, on a metal, the elementwise multipole fit and `head_correction = full` on the shared-pole route refuse. The full list: [Symmetry](../theory/symmetry.md#sym-trs-consumers).
 
 For a magnet:

@@ -196,7 +196,7 @@ Each fact has one home page. The table follows the chain.
 | ζ fit and $V_\bq(\mu,\nu)$ | G1 | [ISDF and V(q)](isdf.md) |
 | Time and frequency rules | G3, G6 | [time–frequency transforms](time-frequency.md) |
 | $\chi^0$, $W$, frequency models of $W^c$ | G5, G7, G8 | [frequency treatments](frequency-treatments.md) |
-| Shared-pole $W$ | G9, G9b | [shared-pole W](shared-pole-w.md) |
+| Tangential W model | G9, G9b | [Tangential W model](shared-pole-w.md) |
 | $\bq\to0$ head | G10 | [the q → 0 head](q0-head.md) |
 | Fractional occupations | G14 | [metals](metals.md) |
 | Band tail of $\Sigma^c$ | G16 | [band extrapolation](band-extrapolation.md) |

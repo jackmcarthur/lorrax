@@ -94,7 +94,7 @@ $\langle m\bk|V^{\mathrm H}|n\bk\rangle$ is contracted with the mean-field orbit
 `sigma_dispatch.compute_sigma_xc`
 {: .in-code }
 
-$\chi^0 \to W \to \Sigma^c(\omega)$ and $\Sigma^x$ are rebuilt from $\psi^{\mathrm{QP}}$, $E^{\mathrm{QP}}$ and $f$ through the run's own frequency treatment, with $\Sigma^c = i\,G^{\gtrless}W^c$, $t\gtrless0$ ([GW theory](../drivers/gw/theory.md), [frequency treatments](frequency-treatments.md)). With the production shared-pole $W$, every map rebuilds the pole model from its own states ([shared-pole W](shared-pole-w.md)). The $\bq\to0$ head follows the map on the QP velocity chosen by `sc_head_update` ([the q → 0 head](q0-head.md), [velocity operator](velocity-operator.md)). The band-extrapolation fit is redone on every map. Each map costs one full $\chi^0\to W\to\Sigma$ evaluation.
+$\chi^0 \to W \to \Sigma^c(\omega)$ and $\Sigma^x$ are rebuilt from $\psi^{\mathrm{QP}}$, $E^{\mathrm{QP}}$ and $f$ through the run's own frequency treatment, with $\Sigma^c = i\,G^{\gtrless}W^c$, $t\gtrless0$ ([GW theory](../drivers/gw/theory.md), [frequency treatments](frequency-treatments.md)). With the production shared-pole $W$, every map rebuilds the pole model from its own states ([Tangential W model](shared-pole-w.md)). The $\bq\to0$ head follows the map on the QP velocity chosen by `sc_head_update` ([the q → 0 head](q0-head.md), [velocity operator](velocity-operator.md)). The band-extrapolation fit is redone on every map. Each map costs one full $\chi^0\to W\to\Sigma$ evaluation.
 
 ### <span class="n">2.5</span> Assembly {: #om-assemble }
 

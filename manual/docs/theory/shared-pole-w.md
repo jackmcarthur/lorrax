@@ -1,4 +1,4 @@
-# Shared-pole W
+# Tangential W model
 
 The correlation part of W as one set of real poles, shared by every matrix element and built from a few dozen samples.
 {: .page-summary }
@@ -106,22 +106,14 @@ Equation (1.4) has millions of poles, far more than Σ can afford. Replacing a l
 On the ISDF points, with $\phi$ the matrix of all $2N_t$ pair potentials $\phi_{mn\bk\bq}(\mu)$, (1.4) reads
 
 $$
-W^c_\bq(z)=\phi\,(z-H_\bq)^{-1}\sigma\phi^\dagger \tag{3.1}
+W^c_\bq(z)=\mathcal C\,(z-\mathcal A)^{-1}\mathcal B,\qquad \mathcal C=\phi,\quad \mathcal A=H_\bq,\quad \mathcal B=\sigma\phi^\dagger \tag{3.1}
 $$
 
-This is the transfer function of a linear system whose state matrix $H_\bq$ acts on a space of dimension $2N_t$, the order of the system. A potential applied at the $N_\mu$ points enters the transitions through the input matrix $\sigma\phi^\dagger$, evolves under $H_\bq$, and is read out as an induced potential through the output matrix $\phi$, and the triple $(\phi,H_\bq,\sigma\phi^\dagger)$ is called a realization of $W^c$. Model reduction seeks a realization $\phi_r(z-H_r)^{-1}\sigma_r\phi_r^\dagger$ of much lower order whose transfer function is close to $W^c$ where it is used. In our setting $H_\bq$ is never formed, but $W^c$ can be sampled at any complex $z$ for the price of one $\chi^0$ evaluation and one Dyson solve (§[6.2](#bank-times)), so only methods that work from samples apply.
-
-### <span class="n">3.2</span> Methods {: #red-methods }
-
-Moment matching fits the Taylor coefficients of the transfer function at a point. At $z=\infty$ these are the Laurent coefficients $\phi H^k\sigma\phi^\dagger$, whose first two nonzero ones are $2M_1$ and $2M_3$ of (2.3), and a Lanczos recursion on $H$ matches them stably [14]. The Lanczos–Haydock method for absorption spectra does this for the single element $\langle M|(z-H)^{-1}\sigma|M\rangle$ [8, 9], but $W$ has $N_\mu^2$ elements, and the recursion needs products with $H$. Balanced truncation comes with an error bound [15, 16] but needs Lyapunov solves in the full space. Rational Krylov projection restricts $H$ to the span of vectors $(z_a-H)^{-1}Br_a$, and the reduced model then interpolates $W$ at the shifts $z_a$ [12, 17]. Rational fitting, for example by the AAA algorithm [19], chooses poles and residues to match sampled values. The Loewner framework builds the reduced model from samples without a fit [11], and for exact data it reproduces the rational Krylov projection although it never touches $H$. We use it because it involves no nonlinear fit and, as §4.3 shows, it preserves the structure of (2.2).
-
-### <span class="n">3.3</span> Why a small model suffices {: #red-small }
-
-Σ uses $W^c$ only through sums over its poles weighted by $1/(\omega-E\mp\Omega\pm i\eta)$, which vary with $\Omega$ on the scale $\eta$. Poles closer together than $\eta$ therefore need not be resolved one by one, and the model only has to reproduce averages of the spectral measure of (2.2) over that scale. A model with real poles and positive residues, as §4.3 builds, is a quadrature of that measure, and samples at a height $h$ above $\eta$ fix those averages as long as the supports are spaced finely enough along the line. Away from the spectrum, as on the imaginary axis, the error of a rational approximation falls geometrically with the number of poles, and the count grows only as the logarithm of the spectral range [20, 21, 22]. Along a line at height $h$ it grows as the reach of the line divided by $h$ (§5). Neither count depends on the measure, so the number of transitions $N_t$ does not enter. Each pole carries a rank-one residue, so data of size $N_\mu\times N_\mu$ need of order $N_\mu$ poles, and LORRAX caps the count at $\lceil1.8N_\mu\rceil$. On Si that model reproduces quasiparticle energies from contour deformation to 0.80 meV RMS (§[7.9](#ritz-count)).
+This is the transfer function of a linear system whose state matrix $H_\bq$ acts on a space of dimension $2N_t$, the order of the system. A potential applied at the $N_\mu$ points enters the transitions through the input matrix $\sigma\phi^\dagger$, evolves under $H_\bq$, and is read out as an induced potential through the output matrix $\phi$, and the triple $(\mathcal C,\mathcal A,\mathcal B)$ is called a realization of $W^c$. With time reversal, Casida's form (2.2) is the symmetric realization $W^c_\bq(s)=F^\dagger(s-C_\bq)^{-1}F$ in $s=z^2$, with $F=\sqrt2\,\Delta^{1/2}\phi^\dagger$ on the resonant pairs. Model reduction seeks a realization $\phi_r(z-H_r)^{-1}\sigma_r\phi_r^\dagger$ of much lower order whose transfer function is close to $W^c$ where it is used. In our setting $H_\bq$ is never formed, but $W^c$ can be sampled at any complex $z$ for the price of one $\chi^0$ evaluation and one Dyson solve (§[6.2](#bank-times)), so only methods that work from samples apply. §[9.1](#red-methods) compares them, and we use the Loewner framework of §4, which needs no nonlinear fit and keeps the structure of (2.2). A model of order about $N_\mu$ suffices because Σ resolves $W^c$ only on the scale of its broadening $\eta$ (§[9.2](#red-small)).
 
 ## <span class="n">4</span> The Loewner framework {: #loewner }
 
-A large matrix is usually reduced by projecting it onto a few important directions, for example its leading singular vectors. We cannot do that with $H_\bq$, which is never formed. The samples give us something almost as useful. Each one is the action of the resolvent $(z-H_\bq)^{-1}$ on a known vector, read out through $\phi$. The Loewner framework [11, 10] uses these samples to build the projection of $H_\bq$ onto the space of such resolvent vectors, overlaps included, without forming any vector of the large space.
+A large matrix is usually reduced by projecting it onto a few important directions, for example its leading singular vectors or a Krylov space grown from one starting vector. When what we need is a particular matrix function, here the resolvent $(z-H_\bq)^{-1}$, it is more useful to project onto samples of that function. Each sample of $W^c$ is the action of the resolvent on a known vector, read out through $\phi$, and a model projected onto these resolvent vectors is exact at every point where a sample was taken. $H_\bq$ is never formed, so neither are the vectors. The Loewner framework [11, 10] builds the projection of $H_\bq$ onto them, overlaps included, from the samples alone.
 {: .intro }
 
 ### <span class="n">4.1</span> Samples as resolvent vectors {: #loewner-identities }
@@ -154,20 +146,26 @@ $$
 
 Because $\mathbb L$ holds overlaps, it allows the operations of an explicit basis. Its rank shows how many independent directions the samples span, and its eigenvectors orthogonalize them, all without the vectors themselves.
 
-A matrix pencil is the linear family $\mathbb L_s-\theta\,\mathbb L$, and its eigenvalues are the values of $\theta$ at which it is singular, that is, the solutions of $\mathbb L_sx=\theta\,\mathbb Lx$. With $U$ the matrix of columns $u_j$ and $\tilde U$ the matrix of rows $\tilde u_i$, this equation reads $\tilde U(H-\theta)Ux=0$. It is the eigenvalue problem of $H$ projected onto the space of the resolvent vectors, a rational Krylov space [12, 17]. When the vectors span all $2N_t$ transitions, its eigenvalues are the poles of $W$. With fewer vectors they are the poles that space can represent best, and every new sample adds one vector to it. Once enough samples are taken, the rank of $\mathbb L$ equals the number of poles of the sampled function [11, 29]. $W^c$ has far more poles than we sample, so $\mathbb L$ never becomes singular, but its singular values fall off quickly, because a few poles already describe $W^c$ well at the supports (§3.3). We therefore take more samples than the model needs and cut the model where the singular values drop below a tolerance (§[7.9](#ritz-count)). The model built on the pencil,
+A matrix pencil is the linear family $\mathbb L_s-\theta\,\mathbb L$, and its eigenvalues are the values of $\theta$ at which it is singular, that is, the solutions of $\mathbb L_sx=\theta\,\mathbb Lx$. With $U$ the matrix of columns $u_j$, the sampled resolvent vectors, and $\tilde U$ the matrix of rows $\tilde u_i$, this equation reads
+
+$$
+\tilde U\,(H-\theta)\,U\,x=0
+$$
+
+**The pencil is the eigenvalue problem of $H$ projected onto the span of the sampled resolvent vectors**, a rational Krylov space [12, 17]. When the vectors span all $2N_t$ transitions, its eigenvalues are the poles of $W$. With fewer vectors they are the poles that space can represent best, and every new sample adds one vector to it. Once enough samples are taken, the rank of $\mathbb L$ equals the number of poles of the sampled function [11, 29]. $W^c$ has far more poles than we sample, so $\mathbb L$ never becomes singular, but its singular values fall off quickly, because a few poles already describe $W^c$ well at the supports (§[9.2](#red-small)). We therefore take more samples than the model needs and cut the model where the singular values drop below a tolerance (§[7.9](#ritz-count)). The model built on the pencil,
 
 $$
 W_r(z)=\mathbb W\,(\mathbb L_s-z\,\mathbb L)^{-1}\,\mathbb V,\qquad \mathbb W=\big[W(\lambda_j)r_j\big]_j,\qquad \mathbb V=\big[\ell_iW(\xi_i)\big]_i \tag{4.4}
 $$
 
-reproduces every sample, $W_r(\lambda_j)r_j=W(\lambda_j)r_j$ and $\ell_iW_r(\xi_i)=\ell_iW(\xi_i)$ [11]. When a left point and a right point coincide, $\xi_i=\lambda_j$, the divided difference in (4.2) becomes the derivative $\ell_iW'(\lambda_j)r_j$, and the model then matches the derivative as well. This is **Hermite interpolation**, and LORRAX uses it at every support on the imaginary axis. Taken to its limit, with all the data as derivatives at a single point, the Loewner matrix becomes the Hankel matrix of Taylor coefficients. At $z=\infty$ those coefficients are the moments (2.3) on which the Lanczos–Haydock recursion of absorption spectra is built [29], so the Loewner construction is the many-point version of that familiar moment method.
+reproduces every sample, $W_r(\lambda_j)r_j=W(\lambda_j)r_j$ and $\ell_iW_r(\xi_i)=\ell_iW(\xi_i)$ [11], for the reason given after (4.7). When a left point and a right point coincide, $\xi_i=\lambda_j$, the divided difference in (4.2) becomes the derivative $\ell_iW'(\lambda_j)r_j$, and the model then matches the derivative as well. This is **Hermite interpolation**, and LORRAX uses it at every support on the imaginary axis. Taken to its limit, with all the data as derivatives at a single point, the Loewner matrix becomes the Hankel matrix of Taylor coefficients. At $z=\infty$ those coefficients are the moments (2.3) on which the Lanczos–Haydock recursion of absorption spectra is built [29], so the Loewner construction is the many-point version of that familiar moment method.
 
 ### <span class="n">4.3</span> The Hermitian pencil in s {: #loewner-hermitian }
 
 `gw.shared_pole_pencil.assemble_shared_pole_pencil`
 {: .in-code }
 
-LORRAX applies §4.2 to Casida's form (2.2), with $s=z^2$ in place of $z$, $C_\bq$ in place of $H$, and $\sqrt2\,\phi\Delta^{1/2}$ and its adjoint in place of $\phi$ and $\sigma\phi^\dagger$. Each support $z_a$ gives a right point $s_a=z_a^2$ with an $N_\mu\times r_a$ block of directions $Q_a$, taken from the sample itself (§[7.5](#pen-directions)). Because $W^c(\bar s)=W^c(s)^\dagger$, the same sample also gives the left point $\bar s_a$ with directions $Q_a^\dagger$, so $\tilde U=U^\dagger$ and the pencil is Hermitian. In the general framework the left and right points are chosen separately, and the poles are far more robust to noise when the two sets interleave than when they are separated [30]. Taking every left point as the conjugate of a right point removes that choice. It also makes $\mathbb G$ the Pick matrix of $-W^c(s)$, a Nevanlinna function of $s$, at the supports, the matrix whose positivity Fei, Yeh and Gull use to test that Matsubara data admit a positive spectral function [31]. LORRAX works with the negatives of the two Loewner matrices, which we call the **overlap matrix** $\mathbb G=-\mathbb L$ and the **projected Casida matrix** $\mathbb H=-\mathbb L_s$. In the language of linear systems, $U$ and $\tilde U$ are the generalized controllability and observability matrices of the data, and $\mathbb G$ and $\mathbb H$ are the matrices $E$ and $A$ of a realization built from the samples alone [28, 29]. With the blocks $U_a=\sqrt2\,(s_a-C_\bq)^{-1}\Delta^{1/2}\phi^\dagger Q_a$,
+LORRAX applies §4.2 to Casida's form (2.2), with $s=z^2$ in place of $z$, $C_\bq$ in place of $H$, and $\sqrt2\,\phi\Delta^{1/2}$ and its adjoint in place of $\phi$ and $\sigma\phi^\dagger$. Each support $z_a$ gives a right point $s_a=z_a^2$ with an $N_\mu\times r_a$ block of directions $Q_a$, taken from the sample itself (§[7.5](#pen-directions)). Because $W^c(\bar s)=W^c(s)^\dagger$, the same sample also gives the left point $\bar s_a$ with directions $Q_a^\dagger$, so $\tilde U=U^\dagger$ and the pencil is Hermitian. In the general framework the left and right points are chosen separately, and the poles are far more robust to noise when the two sets interleave than when they are separated [30]. Taking every left point as the conjugate of a right point removes that choice. It also makes $\mathbb G$ the Pick matrix of $-W^c(s)$, a Nevanlinna function of $s$, at the supports, the matrix whose positivity Fei, Yeh and Gull use to test that Matsubara data admit a positive spectral function [31]. LORRAX works with the negatives of the two Loewner matrices, which we call the **overlap matrix** $\mathbb G=-\mathbb L$ and the **projected Casida matrix** $\mathbb H=-\mathbb L_s$. In the language of linear systems, $U$ and $\tilde U$ are the generalized controllability and observability matrices of the data, and $\mathbb G$ and $\mathbb H$ are the matrices $E$ and $A$ of a realization built from the samples alone [28, 29]. With $F$ of §3.1 and the blocks $U_a=(s_a-C_\bq)^{-1}FQ_a$,
 
 $$
 \begin{aligned}
@@ -178,10 +176,10 @@ $$
 
 $\mathbb G$ is a Gram matrix, so it is positive semidefinite. On the imaginary axis $s_a$ is real, so $s_b=\bar s_a$ for $a=b$, and that entry of $\mathbb G$ becomes $-Q_a^\dagger\,\partial_sW^c(s_a)\,Q_a$, the Hermite case of §4.2. Line supports add a second state at $\bar s_a$ from the same sample (§[7.6](#pencil)).
 
-Finite supports alone always lose spectral weight. We write $B=\sqrt2\,\Delta^{1/2}\phi^\dagger$, so that (2.2) reads $W^c(s)=B^\dagger(s-C_\bq)^{-1}B$, and let $P$ be the orthogonal projector onto the span of the $U_a$. The model's $1/s$ coefficient is then $B^\dagger PB\preceq B^\dagger B=2M_1$, and the $f$-sum weight of (2.3) is underestimated in every direction. A support at $s=\infty$ removes this loss. The rescaled resolvent vector has a finite limit,
+Finite supports alone always lose spectral weight. With $P$ the orthogonal projector onto the span of the $U_a$, the model's $1/s$ coefficient is $F^\dagger PF\preceq F^\dagger F=2M_1$, and the $f$-sum weight of (2.3) is underestimated in every direction. A support at $s=\infty$ removes this loss. The rescaled resolvent vector has a finite limit,
 
 $$
-s\,(s-C_\bq)^{-1}BQ_\infty=BQ_\infty+\frac{C_\bq BQ_\infty}{s}+\dots\;\longrightarrow\;U_\infty=BQ_\infty
+s\,(s-C_\bq)^{-1}FQ_\infty=FQ_\infty+\frac{C_\bq FQ_\infty}{s}+\dots\;\longrightarrow\;U_\infty=FQ_\infty
 $$
 
 so infinity is a support like any other, and setting $(s-C_\bq)^{-1}\to1$ in the identities behind (4.5) gives its entries from the exact moments (2.3),
@@ -193,7 +191,7 @@ $$
 \end{aligned} \tag{4.6}
 $$
 
-with $\mathbb W_\infty=B^\dagger U_\infty=2M_1Q_\infty$. Because $PU_\infty=U_\infty$, the model's Laurent coefficients $B^\dagger PB$ and $B^\dagger PC_\bq PB$ agree with $2M_1$ and $2M_3$ in the probed directions, so one vector fixes two moments. This Gauss doubling makes the point at infinity a Hermite support whose two data are the first two Laurent coefficients, as an imaginary-axis support supplies a value and a derivative.
+with $\mathbb W_\infty=F^\dagger U_\infty=2M_1Q_\infty$. Because $PU_\infty=U_\infty$, the model's Laurent coefficients $F^\dagger PF$ and $F^\dagger PC_\bq PF$ agree with $2M_1$ and $2M_3$ in the probed directions, so one vector fixes two moments. This Gauss doubling makes the point at infinity a Hermite support whose two data are the first two Laurent coefficients, as an imaginary-axis support supplies a value and a derivative.
 
 Both moments are band sums and need no Dyson solve. With $m_k=\sum_{vc\bk}\Delta^k_{vc\bk\bq}\,M_{vc\bk\bq}M^\dagger_{vc\bk\bq}$ over the pair densities on the $N_\mu$ points, the forms in (2.3) become
 
@@ -212,6 +210,12 @@ $$
 \end{aligned} \tag{4.7}
 $$
 
+**The model interpolates every sample because each exact resolvent vector $U_a$ lies in the span of $U$.** The model is the Galerkin inverse on that span, $W_r(s)=F^\dagger U\,[U^\dagger(s-C_\bq)U]^{-1}U^\dagger F=\mathbb W(s\,\mathbb G-\mathbb H)^{-1}\mathbb W^\dagger$, and it acts exactly on $(s_a-C_\bq)\,U_a=FQ_a$,
+
+$$
+W_r(s_a)\,Q_a=F^\dagger U\big[U^\dagger(s_a-C_\bq)U\big]^{-1}U^\dagger(s_a-C_\bq)\,U_a=F^\dagger U_a=W^c(s_a)\,Q_a
+$$
+
 Equation (4.7) is the Rayleigh–Ritz problem of the positive definite $C_\bq$ on the space spanned by the $U_a$, so every $\Omega_j^2$ is real and lies inside $[\Omega_{\min}^2,\Omega_{\max}^2]$, and every residue is positive semidefinite. Rayleigh–Ritz on a rational Krylov space is a rational Gauss quadrature of the spectral measure of $C_\bq$ [21, 23], which is why so few supports reach high accuracy.
 
 ## <span class="n">5</span> Where the samples go {: #supports }
@@ -223,7 +227,7 @@ The construction of §4 works for any supports, but its accuracy where Σ reads 
 {: .intro }
 
 <figure class="flowchart" markdown>
-[![Supports of the shared-pole model in the complex frequency plane](../assets/figures/theory-sharedpole-supports.png)](../assets/figures/theory-sharedpole-supports.png)
+[![Supports of the tangential W model in the complex frequency plane](../assets/figures/theory-sharedpole-supports.png)](../assets/figures/theory-sharedpole-supports.png)
 <figcaption><strong>Fig. 6.1.</strong> Production supports for Si (4×4×4 k points, η = 0.25 eV, quasiparticles requested for the 4 occupied and 4 lowest empty bands). (a) Filled circles enter the pencil, open circles are held supports that only check the model, and the dotted line marks $\omega_{\mathrm{pl}}$. The grey profile is the density of transitions $E_c-E_v$, which the poles of $W^c$ follow. With time reversal $W^c$ is even in $z$, so $\mathrm{Re}\,z<0$ needs no samples. (b) The line sites divide the area under $g^{1/2}$, the square root of the crossing density, into equal parts.</figcaption>
 </figure>
 
@@ -235,7 +239,7 @@ No support sits at $z=0$, so the static value $W^c(0)$, which the BSE reads, is 
 
 ## <span class="n">6</span> Poles in time {: #time }
 
-The pole form (2.1) is what lets Σ be evaluated in time, and the samples of $W^c$ at the supports are themselves computed in time. The time-node rules for both are derived on [Time–frequency transforms](time-frequency.md), and here we give only what is specific to the shared-pole model.
+The pole form (2.1) is what lets Σ be evaluated in time, and the samples of $W^c$ at the supports are themselves computed in time. The time-node rules for both are derived on [Time–frequency transforms](time-frequency.md), and here we give only what is specific to the tangential W model.
 {: .intro }
 
 ### <span class="n">6.1</span> Synthesis at the Σ time nodes {: #sig-synth }
@@ -255,8 +259,8 @@ $$
 with the upper sign for $G^>$ windows and the lower for $G^<$. The synthesis costs $\mathcal O(N_\mu^2|P|)$ per node, while the Fourier transforms and the product with $G$ are paid once per node whatever the number of poles. The [elementwise multipole route](frequency-treatments.md#multipole) instead repeats the whole node once per batch of poles.
 
 <figure class="flowchart" markdown>
-[![Shared-pole W in the self-energy](../assets/figures/g9b.png)](../assets/figures/g9b.png)
-<figcaption><strong>Fig. G9b.</strong> Σ from the shared-pole model. For each product window and time node $t_\ell$, $W^c_\bq(\pm t_\ell)$ is synthesized from the window's poles and multiplied by $G^{\gtrless}$ in $\bR$, and Fig. G4 folds the result into frequency; stage 3 evaluates the static $W_\bq(0)$ the BSE reads.</figcaption>
+[![The tangential W model in the self-energy](../assets/figures/g9b.png)](../assets/figures/g9b.png)
+<figcaption><strong>Fig. G9b.</strong> Σ from the tangential W model. For each product window and time node $t_\ell$, $W^c_\bq(\pm t_\ell)$ is synthesized from the window's poles and multiplied by $G^{\gtrless}$ in $\bR$, and Fig. G4 folds the result into frequency; stage 3 evaluates the static $W_\bq(0)$ the BSE reads.</figcaption>
 </figure>
 
 ### <span class="n">6.2</span> χ⁰ at the supports {: #bank-times }
@@ -298,7 +302,7 @@ The construction runs once per irreducible $\bq$ after the ISDF fit and $V_\bq$,
 {: .intro }
 
 <figure class="flowchart" markdown>
-[![Shared-pole screened interaction](../assets/figures/g9.png)](../assets/figures/g9.png)
+[![Tangential W model of the screened interaction](../assets/figures/g9.png)](../assets/figures/g9.png)
 <figcaption><strong>Fig. G9.</strong> Stage 1 samples $W^c$ and its derivative at the support frequencies: a line above the real axis at equal quantiles of the square root of the crossing density, and a log-spaced imaginary ladder, the same $z_a$ for every $\bq$. Stage 2 keeps the action of $W^c$ on a few probe directions per support, and of the exact moments on the leading directions of $M_1$, and assembles the Loewner pencil $(\mathbb H,\mathbb G)$ in $s=z^2$. Stage 3 diagonalizes the pencil, whose Ritz pairs are the poles $\Omega_{j\bq}$ and factor vectors $b_{j\bq}(\mu)$ that go to `model.h5`.</figcaption>
 </figure>
 
@@ -324,7 +328,7 @@ $E$ runs over the reads, each requested state's energy plus multiples of `sigma_
 `gw.shared_pole_recipe.imaginary_sample_count`
 {: .in-code }
 
-The imaginary supports are geometric between a floor set by the gap and a ceiling above the plasma frequency, and their count is a rational-approximation count of the kind cited in §3.3, for the ratio $\kappa$ of the plasma ceiling to the floor:
+The imaginary supports are geometric between a floor set by the gap and a ceiling above the plasma frequency, and their count is a rational-approximation count of the kind cited in §[9.2](#red-small), for the ratio $\kappa$ of the plasma ceiling to the floor:
 
 $$
 \begin{aligned}
@@ -460,7 +464,7 @@ The keys below change what this page computes, and full entries are on the [GW i
 `gw.shared_pole_screening.screen_shared_poles`
 {: .in-code }
 
-The production route needs both lines in the deck, because `sigma_w_model` defaults to `mpa` (the elementwise fit) and `compute_mode = auto` never selects `mpa`.
+The deck and the code keep the model's earlier name, `shared_pole`. The production route needs both lines in the deck, because `sigma_w_model` defaults to `mpa` (the elementwise fit) and `compute_mode = auto` never selects `mpa`.
 
 ```ini
 compute_mode  = mpa
@@ -480,7 +484,7 @@ sigma_w_model = shared_pole
 `gw.mpa.sigma.shared_pole_static_wc`
 {: .in-code }
 
-The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor gives one branch of $W^c_\bq(0)$, and the two branches add to the static value of §2.1. With `write_restart_tensors = true` (default) the restart bundle stores $W_\bq(0)=V_\bq+W^c_\bq(0)$ as `W0_qmunu` for the BSE, written by `screening.restart_static_w`. It is skipped, with a printed reason, on a metal, or under `head_correction = full` when there is no $\omega=0$ head sample. `write_poles = true` exports the stored factors with $\Omega^2$ and $K$, which is complete for any static-$W$ consumer. The $\bq\to0$ head reads the shared-pole body at Γ ([The q → 0 head](q0-head.md)), and on a time-reversal-broken store, metals included, it folds the signed body.
+The synthesis of (6.1) with the weight $-1/\Omega_j$ in place of the time factor gives one branch of $W^c_\bq(0)$, and the two branches add to the static value of §2.1. With `write_restart_tensors = true` (default) the restart bundle stores $W_\bq(0)=V_\bq+W^c_\bq(0)$ as `W0_qmunu` for the BSE, written by `screening.restart_static_w`. It is skipped, with a printed reason, on a metal, or under `head_correction = full` when there is no $\omega=0$ head sample. `write_poles = true` exports the stored factors with $\Omega^2$ and $K$, which is complete for any static-$W$ consumer. The $\bq\to0$ head reads the body of the model at Γ ([The q → 0 head](q0-head.md)), and on a time-reversal-broken store, metals included, it folds the signed body.
 
 ### <span class="n">8.3</span> Keys {: #keys-list }
 
@@ -555,6 +559,19 @@ Paths are under `tmp/mpa/`, and `<label>` is `oneshot`, or `sc_NNNN` for SC map 
 :   With `write_w = true`: the whole sample bank, about 16 times the pole export. No consumer reads it.
 
 </div>
+
+## <span class="n">9</span> Reference: background on model reduction {: #background }
+
+The methods of model reduction that could build the model, and why a model of modest order suffices.
+{: .intro }
+
+### <span class="n">9.1</span> Methods {: #red-methods }
+
+Moment matching fits the Taylor coefficients of the transfer function at a point. At $z=\infty$ these are the Laurent coefficients $\phi H^k\sigma\phi^\dagger$, whose first two nonzero ones are $2M_1$ and $2M_3$ of (2.3), and a Lanczos recursion on $H$ matches them stably [14]. The Lanczos–Haydock method for absorption spectra does this for the single element $\langle M|(z-H)^{-1}\sigma|M\rangle$ [8, 9], but $W$ has $N_\mu^2$ elements, and the recursion needs products with $H$. Balanced truncation comes with an error bound [15, 16] but needs Lyapunov solves in the full space. Rational Krylov projection restricts $H$ to the span of vectors $(z_a-H)^{-1}Br_a$, and the reduced model then interpolates $W$ at the shifts $z_a$ [12, 17]. Rational fitting, for example by the AAA algorithm [19], chooses poles and residues to match sampled values. The Loewner framework builds the reduced model from samples without a fit [11], and for exact data it reproduces the rational Krylov projection although it never touches $H$. We use it because it involves no nonlinear fit and, as §[4.3](#loewner-hermitian) shows, it preserves the structure of (2.2).
+
+### <span class="n">9.2</span> Why a small model suffices {: #red-small }
+
+Σ uses $W^c$ only through sums over its poles weighted by $1/(\omega-E\mp\Omega\pm i\eta)$, which vary with $\Omega$ on the scale $\eta$. Poles closer together than $\eta$ therefore need not be resolved one by one, and the model only has to reproduce averages of the spectral measure of (2.2) over that scale. A model with real poles and positive residues, as §[4.3](#loewner-hermitian) builds, is a quadrature of that measure, and samples at a height $h$ above $\eta$ fix those averages as long as the supports are spaced finely enough along the line. Away from the spectrum, as on the imaginary axis, the error of a rational approximation falls geometrically with the number of poles, and the count grows only as the logarithm of the spectral range [20, 21, 22]. Along a line at height $h$ it grows as the reach of the line divided by $h$ (§[5](#supports)). Neither count depends on the measure, so the number of transitions $N_t$ does not enter. Each pole carries a rank-one residue, so data of size $N_\mu\times N_\mu$ need of order $N_\mu$ poles, and LORRAX caps the count at $\lceil1.8N_\mu\rceil$. On Si that model reproduces quasiparticle energies from contour deformation to 0.80 meV RMS (§[7.9](#ritz-count)).
 
 ## Notation {: #notation }
 

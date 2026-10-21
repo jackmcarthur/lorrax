@@ -267,7 +267,7 @@ $N_q$ is the q-irreducible wedge when the centroid set is orbit-closed, else eve
 `shared_pole_store.write_shared_pole_model`
 {: .in-code }
 
-With `sigma_w_model = shared_pole`, each screening build writes `tmp/mpa/<label>_shared_pole/`, where `<label>` is `oneshot` or `sc_<NNNN>`. Its `model.h5`, schema `lorrax.shared-real-pole.v1`, holds $W^c_\bq(\mu,\nu;z)=\sum_j b_{j\bq}(\mu)b^*_{j\bq}(\nu)\big[(z-\Omega_{j\bq})^{-1}-(z+\Omega_{j\bq})^{-1}\big]$, with $b$ normalised as in [Shared-pole W §2.1](../../theory/shared-pole-w.md#model-form):
+With `sigma_w_model = shared_pole`, each screening build writes `tmp/mpa/<label>_shared_pole/`, where `<label>` is `oneshot` or `sc_<NNNN>`. Its `model.h5`, schema `lorrax.shared-real-pole.v1`, holds $W^c_\bq(\mu,\nu;z)=\sum_j b_{j\bq}(\mu)b^*_{j\bq}(\nu)\big[(z-\Omega_{j\bq})^{-1}-(z+\Omega_{j\bq})^{-1}\big]$, with $b$ normalised as in [Tangential W model §2.1](../../theory/shared-pole-w.md#model-form):
 
 ```tree
 tmp/mpa/<label>_shared_pole/model.h5

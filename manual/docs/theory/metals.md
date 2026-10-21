@@ -166,7 +166,7 @@ The production metal model is the shared-pole $W$ with occupation-weighted Σ br
 
 ### <span class="n">4.1</span> The metal model of W {: #sigma-w }
 
-A metal deck sets `compute_mode = mpa` and `sigma_w_model = shared_pole`. The default `sigma_w_model` is `mpa` (elementwise poles), which on a metal is a comparison route and refuses when time reversal is measured broken (`GATE mpa_ordered_metal`). The shared-pole bank carries the signed metallic weights through its occupation envelope ([Shared-pole W §6.3](shared-pole-w.md#bank-accuracy)). The scalar head is fitted on the metal MPA plan of §2.2: the body's own grid on elementwise MPA, a plan of its own with the shared-pole Γ body evaluated on it under `shared_pole` ([The q → 0 head §3.1](q0-head.md#poles-samples)).
+A metal deck sets `compute_mode = mpa` and `sigma_w_model = shared_pole`. The default `sigma_w_model` is `mpa` (elementwise poles), which on a metal is a comparison route and refuses when time reversal is measured broken (`GATE mpa_ordered_metal`). The shared-pole bank carries the signed metallic weights through its occupation envelope ([Tangential W model §6.3](shared-pole-w.md#bank-accuracy)). The scalar head is fitted on the metal MPA plan of §2.2: the body's own grid on elementwise MPA, a plan of its own with the shared-pole Γ body evaluated on it under `shared_pole` ([The q → 0 head §3.1](q0-head.md#poles-samples)).
 
 ### <span class="n">4.2</span> Occupation-weighted Σ branches {: #sigma-branches }
 

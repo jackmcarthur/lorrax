@@ -181,7 +181,7 @@ with $\chi^0_\bR(t_\ell)$ the product of [GW theory Eq. (2.2)](../drivers/gw/the
 `gw.response_bank.integrate_response_group`
 {: .in-code }
 
-On the shared-pole route every support sample of a group shares one set of complex time nodes ([Shared-pole W §6.2](shared-pole-w.md#bank-times)). One Green pair per node serves every member's value and $\partial_s$ derivative and both particle–hole orientations. Per node the product is transformed to $\bq$ and only the rows of the $\bq$ batch and their $-\bq$ partners are kept; they are folded into each member with that member's forward and reverse weights. The carry is $[2\cdot\text{members},\,\bq,\,\mu_x,\,\nu_y]$; the node loop runs over the live nodes only, and the rank's rows run in the passes of §[2.3](#par-kconv-passes).
+On the shared-pole route every support sample of a group shares one set of complex time nodes ([Tangential W model §6.2](shared-pole-w.md#bank-times)). One Green pair per node serves every member's value and $\partial_s$ derivative and both particle–hole orientations. Per node the product is transformed to $\bq$ and only the rows of the $\bq$ batch and their $-\bq$ partners are kept; they are folded into each member with that member's forward and reverse weights. The carry is $[2\cdot\text{members},\,\bq,\,\mu_x,\,\nu_y]$; the node loop runs over the live nodes only, and the rank's rows run in the passes of §[2.3](#par-kconv-passes).
 
 The group holds every sample when the carry fits the device. Otherwise the stream still runs once, with every sample, and each finished row pass goes to SlabIO's per-rank streamed tier (§[6.3](#par-mem-io)): host memory when the bank takes at most half the host budget, else one file per rank. Splitting the samples into device groups would re-run every Green pair per group; it is used only when the disk refuses the bank and on the full-k Green route.
 
@@ -192,7 +192,7 @@ The group holds every sample when the carry fits the device. Otherwise the strea
 
 Each product window ([GW theory §3.3](../drivers/gw/theory.md#sig-tf); why windows: [Time–frequency transforms §4](time-frequency.md#windows)) is one compiled program whose device loop runs the window's nodes; nothing returns to the host between nodes. Per node $t_\ell$:
 
-1. **W at the node.** On the shared-pole route, $W^c_\bq(t_\ell)=b\,\mathrm{diag}(d_j(t_\ell))\,b^\dagger$ on the irreducible $\bq$ only, by the Green-builder GEMM from the resident pole factors ([shared-pole W §6.1](shared-pole-w.md#sig-synth)).
+1. **W at the node.** On the shared-pole route, $W^c_\bq(t_\ell)=b\,\mathrm{diag}(d_j(t_\ell))\,b^\dagger$ on the irreducible $\bq$ only, by the Green-builder GEMM from the resident pole factors ([Tangential W model §6.1](shared-pole-w.md#sig-synth)).
 2. **Product per row pass.** $W^c$'s window rows are unfolded and transformed to $\bR$ on the load; the parent $G^{\gtrless}(t_\ell)$ of the window's rows is one local GEMM; the k-convolution of Eq. (2.1) forms $\Sigma^c_\bk(\br_\mu,\br_\nu;t_\ell)$ for the window's rows, which are projected on the bands at once.
 3. **Fold.** The band matrix at the node is added to the on-shell slots with a per-state coefficient:
 
@@ -234,7 +234,7 @@ The two plans agree to round-off. With $Q<P$ the local plan leaves $P-Q$ ranks i
 `gw.shared_pole_constructor`
 {: .in-code }
 
-The constructor reduces each irreducible $\bq$'s samples to poles ([shared-pole W §7.8](shared-pole-w.md#ritz)). Local rounds give one whole parent per rank and solve its pencil with local dense kernels; they are taken whenever the complete selection stack and a conservative pencil price fit the device, under either `linalg`. Otherwise the face route runs a batch of parents on the whole mesh with distributed GEMMs and eigensolves. A local round holds a whole parent's pencil per rank, so its peak does not fall with $P$; the face route is the path past that point.
+The constructor reduces each irreducible $\bq$'s samples to poles ([Tangential W model §7.8](shared-pole-w.md#ritz)). Local rounds give one whole parent per rank and solve its pencil with local dense kernels; they are taken whenever the complete selection stack and a conservative pencil price fit the device, under either `linalg`. Otherwise the face route runs a batch of parents on the whole mesh with distributed GEMMs and eigensolves. A local round holds a whole parent's pencil per rank, so its peak does not fall with $P$; the face route is the path past that point.
 
 ## <span class="n">6</span> Memory and I/O {: #par-mem }
 

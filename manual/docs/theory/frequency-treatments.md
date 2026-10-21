@@ -200,7 +200,7 @@ A "W solve" is one $\chi^0$ evaluation plus one Dyson solve $W=[1-V\chi^0(z)]^{-
 
     One set of real poles per irreducible $\bq$, shared by every matrix element, with one factor vector per pole. The poles are the Ritz values of a Hermitian pencil built from samples of $W^c$ and its exact high-frequency moments; nothing is fitted.
 
-    18 to 40 W solves on a line above the real axis and a log-spaced imaginary ladder, each with its derivative at no second solve. Σ synthesizes $W^c(t)$ from every pole at each time node. It is the production route for insulators, metals and time-reversal-broken decks. Full page: [Shared-pole W](shared-pole-w.md), with the normalisation of $b$ in [§2.1](shared-pole-w.md#model-form).
+    18 to 40 W solves on a line above the real axis and a log-spaced imaginary ladder, each with its derivative at no second solve. Σ synthesizes $W^c(t)$ from every pole at each time node. It is the production route for insulators, metals and time-reversal-broken decks. Full page: [Tangential W model](shared-pole-w.md), with the normalisation of $b$ in [§2.1](shared-pole-w.md#model-form).
 
     $$
     W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{K_\bq}b_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right],\qquad \Omega_{j\bq}>0 \tag{2.1}
@@ -438,7 +438,7 @@ $$
 W^c_{\bq}(\mu,\nu;z)=\sum_{j=1}^{K_\bq}b_{j\bq}(\mu)\,b^*_{j\bq}(\nu)\left[\frac{1}{z-\Omega_{j\bq}}-\frac{1}{z+\Omega_{j\bq}}\right],\qquad \Omega_{j\bq}>0 \tag{5.4}
 $$
 
-The samples sit on a line $z=\omega+ih$ placed by the crossing density of the requested states and on a log-spaced imaginary ladder; tangential samples and the exact moments $M_1$, $M_3$ fill a Loewner pencil whose Ritz pairs are the poles. Real poles, positive residues and the moments hold by construction, and the support count grows only as $\ln(1/\epsilon)$. Derivation, keys and constants: [Shared-pole W](shared-pole-w.md), with the normalisation of $b$ in [§2.1](shared-pole-w.md#model-form).
+The samples sit on a line $z=\omega+ih$ placed by the crossing density of the requested states and on a log-spaced imaginary ladder; tangential samples and the exact moments $M_1$, $M_3$ fill a Loewner pencil whose Ritz pairs are the poles. Real poles, positive residues and the moments hold by construction, and the support count grows only as $\ln(1/\epsilon)$. Derivation, keys and constants: [Tangential W model](shared-pole-w.md), with the normalisation of $b$ in [§2.1](shared-pole-w.md#model-form).
 
 !!! refuses
     - Under `sigma_w_model = shared_pole`: `mpa_pole_batch_size`, `mpa_fit_reuse_file`, `mpa_overwrite_completed_artifacts`, and, when `head_correction = off`, every MPA sampling key (`GATE shared_pole_unused_inputs`). Remove them.

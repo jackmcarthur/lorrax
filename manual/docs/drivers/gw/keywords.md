@@ -79,7 +79,7 @@ Optional
 ### `sigma_w_model` {: .kw data-type="enum" data-default="mpa" }
 Model of $W^c$ under `compute_mode = mpa`.
 
-`shared_pole` is the production model ([shared-pole W](../../theory/shared-pole-w.md)); `mpa` fits poles element by element. Naming the key with another `compute_mode` refuses.
+`shared_pole` is the production model ([Tangential W model](../../theory/shared-pole-w.md)); `mpa` fits poles element by element. Naming the key with another `compute_mode` refuses.
 {: .kw-details }
 
 `shared_pole` `mpa`
@@ -113,7 +113,7 @@ Diagrams summed by $W$: the RPA Dyson series, the ladder-corrected resolvent, or
 {: .kw-values }
 
 ### `write_poles` {: .kw data-type="bool" data-default="false" }
-Exports the stored shared-pole factors $\tilde b_{j\bq}(\mu)=\sqrt{2\Omega_{j\bq}}\,b_{j\bq}(\mu)$ and $\Omega^2_{j\bq}$ to `tmp/mpa/<map>_poles.h5`, with $b$ the residue-normalised factor of [Shared-pole W §2.1](../../theory/shared-pole-w.md#model-form).
+Exports the stored shared-pole factors $\tilde b_{j\bq}(\mu)=\sqrt{2\Omega_{j\bq}}\,b_{j\bq}(\mu)$ and $\Omega^2_{j\bq}$ to `tmp/mpa/<map>_poles.h5`, with $b$ the residue-normalised factor of [Tangential W model §2.1](../../theory/shared-pole-w.md#model-form).
 
 A static-W consumer needs nothing else, since $W(0) = V - 2b\,\Omega^{-1} b^\dagger = V - \tilde b\,\Omega^{-2} \tilde b^\dagger$. Requires `compute_mode = mpa` and `sigma_w_model = shared_pole`.
 {: .kw-details }

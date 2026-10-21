@@ -208,7 +208,7 @@ Because a residue reads two knots, a knot chunk needs only the $(\bk,l)$ rows so
 
 ## <span class="n">5</span> χ⁰ and W at the CD points {: #chi0 }
 
-$\chi^0$ at every imaginary node and every knot, ghosts included, comes from the shared-pole response bank's own time-domain quadrature ([Shared-pole W §6.2](shared-pole-w.md#bank-times)), not from a sum over transitions with energy denominators. The rule is built per chunk of points, so each chunk's Green-pair sweep serves only its own points.
+$\chi^0$ at every imaginary node and every knot, ghosts included, comes from the shared-pole response bank's own time-domain quadrature ([Tangential W model §6.2](shared-pole-w.md#bank-times)), not from a sum over transitions with energy denominators. The rule is built per chunk of points, so each chunk's Green-pair sweep serves only its own points.
 {: .intro }
 
 ### <span class="n">5.1</span> The point set and its windows {: #chi0-points }
@@ -357,7 +357,7 @@ The table below sets the CD route beside LORRAX's production treatment and besid
 
 ### <span class="n">9.1</span> Against the shared-pole W {: #compare-shared-pole }
 
-| | Contour deformation (`gw.cd`) | Shared-pole W ([page](shared-pole-w.md)) |
+| | Contour deformation (`gw.cd`) | Tangential W model ([page](shared-pole-w.md)) |
 |---|---|---|
 | $W^c$ | exact ISDF RPA value at each point | $K_\bq$ shared real poles, Ritz values of a Loewner pencil |
 | Dyson solves | one per imaginary node and per knot (with ghosts), per irreducible $\bq$; hundreds | 18 to 40 supports |
@@ -367,7 +367,7 @@ The table below sets the CD route beside LORRAX's production treatment and besid
 | head, band extrapolation | off (refused) | on |
 | use | reference and comparisons | production |
 
-On Si the shared-pole budget gives 0.80 meV QP RMS against a contour-deformation reference ([Shared-pole W §7.9](shared-pole-w.md#ritz-count)).
+On Si the shared-pole budget gives 0.80 meV QP RMS against a contour-deformation reference ([Tangential W model §7.9](shared-pole-w.md#ritz-count)).
 
 ### <span class="n">9.2</span> Against BerkeleyGW {: #compare-bgw }
 
