@@ -1,5 +1,8 @@
 """Tiny general-eigenpair checks; CPU is an oracle, CUDA lowering is explicit."""
 from functools import partial
+import ctypes
+import io
+import os
 from types import SimpleNamespace
 
 import jax
@@ -8,17 +11,21 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
-from distrib_la import (eig_local, eig_local_diagnostics, local_batch,
+from distrib_la import (eig_local, eig_local_diagnostics, eig_local_workspace, local_batch,
                         resolve_eig_local_backend, solve_local)
-from distrib_la import local_eig
+from distrib_la import loader, local_eig
 
 
 @pytest.fixture(autouse=True)
 def _x64():
     resolve_eig_local_backend.cache_clear()
+    loader._jax_geev_query_context.cache_clear()
+    loader.local_geev_workspace.cache_clear()
     with jax.enable_x64(True):
         yield
     resolve_eig_local_backend.cache_clear()
+    loader._jax_geev_query_context.cache_clear()
+    loader.local_geev_workspace.cache_clear()
 
 
 def _nonnormal(n=8):
@@ -145,3 +152,76 @@ def test_actual_provider_lowering_names_device_geev():
     else:
         assert "lapack_zgeev_ffi" in text
     assert "host_callback" not in text and "xla_python_cpu_callback" not in text
+
+
+def test_workspace_receipt_distinguishes_cpu_and_cuda(monkeypatch):
+    if resolve_eig_local_backend() == "lapack":
+        receipt = eig_local_workspace(8, backend="lapack")
+        assert receipt["device_bytes"] == 0 and receipt["host_bytes"] is None
+    monkeypatch.setattr(local_eig, "resolve_eig_local_backend", lambda: "cusolver")
+    monkeypatch.setattr(loader, "local_geev_workspace", lambda n: (8192, 4096, "/jax/libcusolver.so.12"))
+    receipt = eig_local_workspace(8, backend="cusolver")
+    assert receipt == dict(device_bytes=8192, host_bytes=4096, provider="cusolverDnXgeev",
+                           library_path="/jax/libcusolver.so.12", batch_workspace_reuse="serial")
+    with pytest.raises(RuntimeError, match="actual provider is cusolver"):
+        eig_local_workspace(8, backend="lapack")
+
+
+def test_geev_query_matches_jax_abi_and_reuses_only_mapped_provider(monkeypatch):
+    calls = []
+
+    def create(handle):
+        ctypes.cast(handle, ctypes.POINTER(ctypes.c_void_p))[0] = 123
+        calls.append("create")
+        return 0
+
+    def params(handle):
+        ctypes.cast(handle, ctypes.POINTER(ctypes.c_void_p))[0] = 456
+        return 0
+
+    def query(*args):
+        calls.append(("query", args))
+        ctypes.cast(args[-2], ctypes.POINTER(ctypes.c_size_t))[0] = 8192
+        ctypes.cast(args[-1], ctypes.POINTER(ctypes.c_size_t))[0] = 4096
+        return 0
+
+    def cleanup(params):
+        calls.append(("cleanup", params.value))
+        return 0
+
+    lib = SimpleNamespace(cusolverDnCreate=create, cusolverDnCreateParams=params,
+                          cusolverDnDestroyParams=cleanup, cusolverDnXgeev_bufferSize=query)
+    mapped = ("a-b r-xp 00000000 01:01 123 /jax/libcusolver.so.12\n"
+              "b-c r--p 00000000 01:01 123 /jax/libcusolver.so.12\n")
+    monkeypatch.setattr(loader, "open", lambda _: io.StringIO(mapped), raising=False)
+
+    def load(path, *, mode):
+        assert path == "/jax/libcusolver.so.12"
+        assert mode & os.RTLD_NOLOAD
+        return lib
+
+    monkeypatch.setattr(loader.ctypes, "CDLL", load)
+    assert loader.local_geev_workspace(8) == (8192, 4096, "/jax/libcusolver.so.12")
+    assert loader.local_geev_workspace(8) == (8192, 4096, "/jax/libcusolver.so.12")
+    assert calls[0] == "create" and len(calls) == 3
+    args = calls[1][1]
+    assert args[:2][0].value == 123 and args[:2][1].value == 456
+    assert args[2:-2] == (0, 1, 8, 5, None, 8, 5, None, 5, None, 8, 5, None, 8, 5)
+    assert len(query.argtypes) == len(args) == 19
+    assert calls[2] == ("cleanup", 456)
+
+
+def test_geev_query_refuses_provider_error_and_releases_params(monkeypatch):
+    cleaned = []
+
+    def params(handle):
+        ctypes.cast(handle, ctypes.POINTER(ctypes.c_void_p))[0] = 456
+        return 0
+
+    lib = SimpleNamespace(cusolverDnCreateParams=params,
+                          cusolverDnXgeev_bufferSize=lambda *args: 3,
+                          cusolverDnDestroyParams=lambda p: cleaned.append(p.value) or 0)
+    monkeypatch.setattr(loader, "_jax_geev_query_context", lambda: (lib, ctypes.c_void_p(123), "/jax/libcusolver.so.12"))
+    with pytest.raises(RuntimeError, match="Xgeev size query failed: status=3"):
+        loader.local_geev_workspace(8)
+    assert cleaned == [456]

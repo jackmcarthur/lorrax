@@ -48,6 +48,7 @@ no trace.
 from __future__ import annotations
 
 import ctypes
+from functools import lru_cache
 import hashlib
 import os
 import sys
@@ -874,3 +875,82 @@ def active_eigh_workspace(capacity: int, platform: str = "CUDA") -> int:
     if size <= 0:
         raise LibraryUnusable(f"active eigensolver workspace query failed: {size}")
     return size
+
+
+@lru_cache(maxsize=1)
+def _jax_geev_query_context():
+    """Use exactly the cuSOLVER already mapped by JAX, without loading a system copy.
+
+    Keep one query handle for the process, like the native eigh size query:
+    destroying a cuSOLVER handle synchronizes outstanding device work. No
+    matrix or user workspace is allocated. The caller has already initialized
+    and compile-probed its actual CUDA provider.
+    """
+    try:
+        paths = set()
+        with open("/proc/self/maps") as mapped:
+            for line in mapped:
+                fields = line.rstrip().split(None, 5)
+                if (len(fields) == 6 and fields[5].startswith("/")
+                        and os.path.basename(fields[5]).startswith("libcusolver.so")):
+                    paths.add(os.path.realpath(fields[5]))
+    except OSError as exc:
+        raise RuntimeError(f"GATE local_eig_workspace: cannot read mapped provider: {exc}") from exc
+    if len(paths) != 1:
+        raise RuntimeError(
+            f"GATE local_eig_workspace: expected one mapped JAX cuSOLVER, got {sorted(paths)}")
+    path = paths.pop()
+    try:
+        lib = ctypes.CDLL(path, mode=os.RTLD_NOLOAD | os.RTLD_LOCAL)
+        ptr, size = ctypes.c_void_p, ctypes.c_size_t
+        for name, args in (
+                ("cusolverDnCreate", [ctypes.POINTER(ptr)]),
+                ("cusolverDnCreateParams", [ctypes.POINTER(ptr)]),
+                ("cusolverDnDestroyParams", [ptr]),
+                ("cusolverDnXgeev_bufferSize", [
+                    ptr, ptr, ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+                    ctypes.c_int, ptr, ctypes.c_int64, ctypes.c_int, ptr,
+                    ctypes.c_int, ptr, ctypes.c_int64, ctypes.c_int, ptr,
+                    ctypes.c_int64, ctypes.c_int, ctypes.POINTER(size), ctypes.POINTER(size)])):
+            fn = getattr(lib, name)
+            fn.argtypes, fn.restype = args, ctypes.c_int
+        handle = ptr()
+        status = lib.cusolverDnCreate(ctypes.byref(handle))
+        if status or not handle.value:
+            raise RuntimeError(f"cusolverDnCreate failed: status={status}")
+    except (OSError, AttributeError, RuntimeError) as exc:
+        raise RuntimeError(f"GATE local_eig_workspace: unusable mapped {path}: {exc}") from exc
+    return lib, handle, path
+
+
+@lru_cache(maxsize=128)
+def local_geev_workspace(n: int) -> tuple[int, int, str]:
+    """Exact ``(device_bytes, host_bytes, library_path)`` for one C128 right-only geev.
+
+    Query-only ABI of ``cusolverDnXgeev_bufferSize``. Null matrix pointers
+    and default params match JAX 0.9.1's own GeevImpl. JAX processes a local
+    batch serially with one shared workspace, so these bytes are NOT multiplied
+    by batch length. Concurrent kernel invocations need separate workspaces.
+    Every process queries its own mapped provider; there is no rank-0 query.
+    """
+    import operator
+    n = operator.index(n)
+    if n < 1 or n >= 1 << 63:
+        raise ValueError("local_geev_workspace: n must be a positive int64 extent")
+    lib, handle, path = _jax_geev_query_context()
+    params, device, host = ctypes.c_void_p(), ctypes.c_size_t(), ctypes.c_size_t()
+    status = lib.cusolverDnCreateParams(ctypes.byref(params))
+    if status or not params.value:
+        raise RuntimeError(f"GATE local_eig_workspace: cusolverDnCreateParams failed: status={status}")
+    try:
+        # library_types.h: CUDA_C_64F = 5; cusolverEigMode_t: NOVECTOR = 0,
+        # VECTOR = 1. All four matrix/output types and computeType are C128.
+        status = lib.cusolverDnXgeev_bufferSize(
+            handle, params, 0, 1, n, 5, None, n, 5, None, 5, None, n,
+            5, None, n, 5, ctypes.byref(device), ctypes.byref(host))
+    finally:
+        cleanup = lib.cusolverDnDestroyParams(params)
+    if status or cleanup:
+        raise RuntimeError(
+            f"GATE local_eig_workspace: Xgeev size query failed: status={status}, cleanup={cleanup}, n={n}")
+    return int(device.value), int(host.value), path

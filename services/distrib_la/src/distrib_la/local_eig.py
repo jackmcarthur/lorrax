@@ -14,6 +14,7 @@ batch. Compiled ``memory_analysis`` alone does not price that opaque workspace.
 from __future__ import annotations
 
 from functools import lru_cache
+import operator
 from typing import Literal
 
 import jax
@@ -24,7 +25,7 @@ from lxkit import device_vendor
 from distrib_la.tolerance import roundoff_tol
 
 __all__ = ["EigLocalBackend", "resolve_eig_local_backend", "eig_local",
-           "eig_local_diagnostics"]
+           "eig_local_diagnostics", "eig_local_workspace"]
 
 EigLocalBackend = Literal["cusolver", "lapack"]
 
@@ -93,6 +94,36 @@ def _matrix(a, name):
     if np.dtype(a.dtype) != np.dtype(np.complex128):
         raise TypeError(f"local_eig: {name} must be complex128, got {a.dtype}")
     return a
+
+
+def eig_local_workspace(n: int, *, backend: EigLocalBackend) -> dict:
+    """Eager receipt for opaque geev scratch, beside compiled program bytes.
+
+    CUDA queries the exact already-mapped provider with default params,
+    complex128 and right vectors only. ``device_bytes`` and ``host_bytes``
+    are scratch for ONE active kernel; JAX reuses it serially across the local
+    batch. Concurrent kernels require a workspace each. Run on every process
+    before admission; the caller owns mesh-wide agreement and its live set.
+
+    CPU returns zero accelerator bytes and ``host_bytes=None``: CPU LAPACK's
+    host workspace is not queried. The receipt is not a total-program price.
+    NVIDIA's geev is a hybrid CPU/GPU algorithm, even on the explicit CUDA path.
+    A failed CUDA query refuses, with no guessed-size or CPU fallback.
+    """
+    n = operator.index(n)
+    if n < 1 or n >= 1 << 63:
+        raise ValueError("eig_local_workspace: n must be a positive int64 extent")
+    resolved = resolve_eig_local_backend()
+    if backend != resolved:
+        raise RuntimeError(
+            f"GATE local_eig_provider: requested {backend}, actual provider is {resolved}")
+    if backend == "lapack":
+        return dict(device_bytes=0, host_bytes=None, provider="CPU LAPACK",
+                    library_path=None, batch_workspace_reuse="serial")
+    from distrib_la.loader import local_geev_workspace
+    device, host, path = local_geev_workspace(n)
+    return dict(device_bytes=device, host_bytes=host, provider="cusolverDnXgeev",
+                library_path=path, batch_workspace_reuse="serial")
 
 
 def eig_local(a, *, backend: EigLocalBackend):
