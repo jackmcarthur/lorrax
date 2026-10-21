@@ -12,11 +12,12 @@ f48831528 against a dump from 5c375042c: 1.7e-15 of the largest dipole).
 Datasets (rank 0 writes):
 
 * ``d_alpha`` (3, nk, nc, nv) complex128, bohr: the dipoles the BSE uses,
-  ``⟨c̃|v̂|ṽ⟩/ΔE`` on the DFT f(H) path and the exact ``i⟨c̃|r̂|ṽ⟩`` of the
-  fine QP states with ``--eqp`` (``bse_densify.densified_dipoles``);
+  ``⟨c̃|v̂|ṽ⟩/ΔE`` (Rayleigh-quotient ΔE under ``--eqp``), or the exact
+  ``i⟨c̃|r̂|ṽ⟩`` of the fine QP states with ``--eqp --dipole-position-fix``
+  (``bse_densify.densified_dipoles``);
 * ``de_cv`` (nk, nc, nv) float64, Ry; ``q_frac`` (nk, 3);
-* with ``--eqp``: ``d_alpha_rq``, the pre-fix ``v/ΔE_RQ`` (to check the gauge
-  identity against a run made before the fix: ``--check-key d_alpha_rq``);
+* with ``--eqp --dipole-position-fix``: ``d_alpha_rq``, ``v/ΔE_RQ`` (the
+  default dipoles; ``--check-key d_alpha_rq`` checks a default run);
 * with ``--full-window``: ``v_window``, ``r_window`` (3, nk, nb, nb) and
   ``e_dft_window`` (nk, nb).
 
@@ -79,6 +80,8 @@ def main(argv=None):
                     help="also write v_window, r_window, e_dft_window")
     ap.add_argument("--pair-rule", choices=DENSIFIED_POSITION_PAIR_RULES, default="mask")
     ap.add_argument("--pair-gap-ev", type=float, default=0.05)
+    ap.add_argument("--dipole-position-fix", action="store_true",
+                    help="as bse_jax --dipole-position-fix (exact r of the fine QP states)")
     ap.add_argument("--out", required=True, help="output .h5")
     ap.add_argument("--check-eigenvectors", default=None,
                     help="eigenvectors.h5 of the BSE run to re-contract")
@@ -94,7 +97,8 @@ def main(argv=None):
         input_file=args.input, n_occ=args.n_occ, degeneracy_mode=args.band_degeneracy,
         degeneracy_tol_ry=args.degeneracy_tol_ry, eqp_file=args.eqp, velocity_file=args.dipole,
         velocity_full_window=bool(args.full_window), velocity_pair_rule=args.pair_rule,
-        velocity_pair_gap_ev=args.pair_gap_ev)
+        velocity_pair_gap_ev=args.pair_gap_ev,
+        velocity_position_fix=bool(args.dipole_position_fix))
     dip = data.get("dipoles")
     if not data.get("densified") or dip is None:
         raise SystemExit(
@@ -132,7 +136,7 @@ def main(argv=None):
         key = args.check_key
         if dip.get(key) is None:
             raise SystemExit(f"GATE dump_window_dipoles_check_key: {key} is not in this bundle "
-                             f"(d_alpha_rq exists only with --eqp)")
+                             f"(d_alpha_rq exists only with --eqp --dipole-position-fix)")
         rel, n = check_eigenvectors(args.check_eigenvectors, np.asarray(dip[key]))
         print(f"[dump_window_dipoles] gauge identity {key} vs {args.check_eigenvectors}: "
               f"max|P - stored|/max|stored| = {rel:.3e} over {n} states", flush=True)

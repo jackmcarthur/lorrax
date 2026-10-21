@@ -127,6 +127,7 @@ def load_bse_data_from_restart_sharded(
     velocity_full_window: bool = False,
     velocity_pair_rule: str = "mask",
     velocity_pair_gap_ev: float = 0.05,
+    velocity_position_fix: bool = False,
     q0_head: str = "rank1",
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
@@ -159,10 +160,14 @@ def load_bse_data_from_restart_sharded(
     also keeps the velocity over every window pair and its own band
     energies (``data["dipoles"]["v_window"]``, ``["e_dft_window"]``), which
     the TD-aGW system builder (``tdagw.td_system``) needs; off by default.
-    With it the window position ``["r_window"]`` comes too, exact in the
-    fine states (QP f(H) with ``eqp_file``), its same-occupation pairs by
+    With it the window position ``["r_window"]`` comes too (in the fine
+    states of a QP f(H) with ``eqp_file`` only under
+    ``velocity_position_fix``), its same-occupation pairs by
     ``velocity_pair_rule`` / ``velocity_pair_gap_ev``
     (``bse_densify.densified_dipoles``' ``pair_rule`` / ``pair_gap_ev``).
+    ``velocity_position_fix`` (``--dipole-position-fix``, opt-in) applies
+    ``densified_dipoles``' exact-position fix under ``eqp_file``; off, the
+    dipoles are ``v/ΔE_RQ`` and a QP/DFT mixing receipt is logged.
 
     ``inject_head=False`` returns the head-LESS V_q0 / W_q bodies exactly as
     stored on disk (the rank-1 q=0 head from vhead/whead is NOT added). Used by
@@ -398,6 +403,7 @@ def load_bse_data_from_restart_sharded(
                            else os.path.abspath(velocity_file)),
             velocity_full_window=bool(velocity_full_window),
             velocity_pair_rule=str(velocity_pair_rule),
+            velocity_position_fix=bool(velocity_position_fix),
             velocity_pair_gap_ev=float(velocity_pair_gap_ev))
     # A densified bundle's ε already carry ``eqp_file``; the drivers re-slice
     # the coarse restart's QP energies only when this is False.

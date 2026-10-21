@@ -399,6 +399,7 @@ def build_td_system(input_file: str, mesh_xy, *, bands, dipole_file: str,
                     zeta_file: Optional[str] = None,
                     degeneracy_mode: Optional[str] = None,
                     eigenvectors_file: Optional[str] = None,
+                    position_fix: bool = False,
                     log=print) -> TdBundleSystem:
     """Header + ΔΣ model of a GW restart bundle from one ``load_td_model`` call.
 
@@ -412,6 +413,9 @@ def build_td_system(input_file: str, mesh_xy, *, bands, dipole_file: str,
         the smallest accepted c↔v gap.
     eigenvectors_file : a ``bse_jax --write-eigs --dipole`` file on the same
         bundle and window: adds the ⟨0|r|S⟩ gauge receipt.
+    position_fix : densified deck with ``eqp_file``: the loader's opt-in exact
+        position of the fine QP states (``lorrax.dipole_position_fix``,
+        ``bse_jax --dipole-position-fix``); off, ``v/ΔE_RQ``.
     """
     from file_io.restart_bundle import _find_restart_file, read_metadata
     from tdagw.model import _deck_densifies, load_td_model
@@ -422,7 +426,8 @@ def build_td_system(input_file: str, mesh_xy, *, bands, dipole_file: str,
         input_file, mesh_xy, bands=(b_lo, b_hi), n_occ=n_occ, zeta_file=zeta_file,
         degeneracy_mode=degeneracy_mode, eqp_file=eqp_file,
         velocity_file=dipole_file if densified else None,
-        velocity_full_window=densified, keep_window=True)
+        velocity_full_window=densified, velocity_position_fix=bool(position_fix),
+        keep_window=True)
     window = model["window"]
     e_qp, n_val = window_energies(window)
     if densified:

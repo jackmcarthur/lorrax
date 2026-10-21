@@ -867,11 +867,79 @@ def _position_in_fine_states(v_win, f_win, n_val, newton, *, rule, gap_ry,
     return r_win, eps_all, offblock, cv_eig_sum
 
 
+def _qp_window_mixing(f_win, n_val):
+    """``(max v↔c mixing, max relative off-diagonal)`` of f(H) in the fine states.
+
+    ``f_win`` (nq, nb, nb) is the velocity's DFT f(H) block in the fine
+    window, valence rows first.  The two numbers of the r-fix record
+    (``max_offblock_mixing``, ``fh_offdiag_rel_max``), computed the same way
+    whether or not the fix is applied: they say when ``--dipole-position-fix``
+    is needed (the fine QP states are not DFT eigenstates).
+    """
+    fq = 0.5 * (f_win + np.conj(np.swapaxes(f_win, -1, -2)))
+    w = np.linalg.eigh(fq)[1]
+    mix = np.maximum(np.linalg.norm(w[:, :n_val, n_val:], axis=(1, 2)),
+                     np.linalg.norm(w[:, n_val:, :n_val], axis=(1, 2)))
+    off = np.linalg.norm(
+        f_win - np.einsum("qii->qi", f_win)[..., None] * np.eye(f_win.shape[-1]),
+        axis=(1, 2)) / np.maximum(np.linalg.norm(f_win, axis=(1, 2)), 1e-300)
+    return float(mix.max()), float(off.max())
+
+
+#: Smallest eigenvalue of the weight ``g`` over the fine window, relative to
+#: its largest, that :func:`_velocity_from_weighted` divides by (the weight
+#: is >= 1 - e^-4 on the window's own bands at every coarse k).
+DENSIFIED_VELOCITY_WEIGHT_FLOOR = 1.0e-3
+
+
+def velocity_weight(energies, e_cut, width):
+    r"""``g(ε) = 1 − exp(−((e_cut − ε)/width)²)`` below ``e_cut``, 0 above.
+
+    The weight :func:`densified_dipoles` carries the velocity with when the
+    fit window's top band meets an unfitted band: ``e_cut`` is the lowest
+    energy of the first unfitted band, so ``g`` vanishes (C¹) on every state
+    a band crossing can move in or out of the window, and ``width`` is half
+    the distance from the BSE window's top to ``e_cut``, so ``g ≥ 1 − e⁻⁴``
+    on the window.  Energies in Ry, any shape.
+    """
+    x = (float(e_cut) - np.asarray(energies, dtype=np.float64)) / float(width)
+    return np.where(x > 0.0, -np.expm1(-x * x), 0.0)
+
+
+def _velocity_from_weighted(o_win, f_win, g_of_f, *, where):
+    r"""``⟨i|v̂|j⟩`` in the fine window from the interpolated ``g v g``.
+
+    ``o_win`` (3, nq, nb, nb) is the window block of the htransform-carried
+    ``g(H) v g(H)`` and ``f_win`` (nq, nb, nb) the window block of the
+    velocity's own f(H), both in the same fine states; ``g_of_f`` maps
+    f-eigenvalues to the weight (Newton inverse, then
+    :func:`velocity_weight`).  Returns ``(G^{-1} o_win G^{-1}, floor)`` with
+    ``G = g(f_win)`` and ``floor`` the min/max eigenvalue of ``G``.  Exact
+    where the window is an invariant subspace of f(H) (every coarse k, the
+    DFT path); otherwise the error is the window's leak out of that
+    subspace times ``1 − g``, small on the window.
+    """
+    w, u = np.linalg.eigh(0.5 * (f_win + np.conj(np.swapaxes(f_win, -1, -2))))
+    g = np.asarray(g_of_f(w), dtype=np.float64)
+    floor = float(np.min(g.min(axis=-1) / np.maximum(g.max(axis=-1), 1e-300)))
+    if not floor > DENSIFIED_VELOCITY_WEIGHT_FLOOR:
+        raise ValueError(
+            f"GATE densified_velocity_weight: got min/max weight {floor:.3e} "
+            f"over the fine window ({where}); want > "
+            f"{DENSIFIED_VELOCITY_WEIGHT_FLOOR:.0e}; why: the velocity is "
+            f"interpolated as g v g and divided back in the window, and g "
+            f"vanishes where unfitted bands enter the fit window; fix: more "
+            f"conduction guard bands above the BSE window (raise ncond).")
+    g_inv = np.einsum("qij,qj,qkj->qik", u, 1.0 / g, np.conj(u))
+    return np.einsum("qij,aqjk,qkl->aqil", g_inv, o_win, g_inv), floor
+
+
 def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       coarse_grid, n_val, window_start, a_band_index,
                       mesh_xy, log_fn=print, full_window: bool = False,
                       qp_states: bool = False, pair_rule: str = "mask",
-                      pair_gap_ev: float = 0.05) -> dict:
+                      pair_gap_ev: float = 0.05,
+                      mixing_receipt: bool = False) -> dict:
     r"""r-form dipoles of a ``bse_k_grid`` bundle, in the gauge of its own ψ.
 
     The coarse WFN's velocity matrix ``v(k)`` (``psp.get_dipole_mtxels``'
@@ -882,13 +950,20 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     states, and no gauge fit, exists:
 
     .. math::
-        v_B(k) = C_k^{T} v(k)\, C_k^{*},\qquad
+        v_B(k) = C_k^{T} g(k)\, v(k)\, g(k)\, C_k^{*},\qquad
         V_R = \frac{1}{N_k}\sum_k e^{2\pi i k\cdot R}\, v_B(k),\qquad
-        v_{ij}(q) = \Big[U_q^\dagger\,
-            \mathrm{Herm}\sum_R e^{-2\pi i q\cdot R} V_R\; U_q\Big]_{ij}
+        v(q) = G_q^{-1}\, U_q^\dagger\,
+            \mathrm{Herm}\sum_R e^{-2\pi i q\cdot R} V_R\; U_q\, G_q^{-1}
 
     (``bandstructure.orbital.interpolate_band_operator``, the htransform's
-    band-operator route).  The transition energies are the velocity's own:
+    band-operator route), with ``g = velocity_weight(ε)`` of the velocity's
+    own energies and ``G_q = g(U_q^† f(H)(q) U_q)`` the same weight in the
+    fine window (:func:`_velocity_from_weighted`).  ``g`` vanishes above the
+    lowest energy of the first unfitted band: where the fit window's top band
+    meets it the projected ``v`` is not smooth in k (Si 4³→8³, 36 fitted
+    bands: outer-shell image 26 % unweighted, against 1.9 % for f(H)).  A
+    window whose top band stays below every unfitted band takes ``g ≡ 1``,
+    the unweighted route.  The transition energies are the velocity's own:
     the file's ``band_energies`` (DFT for ``dipole.h5``), never ``--eqp``,
     because ``r = v/ΔE`` is scissor-invariant.  Under ``--eqp`` the fine
     states are eigenvectors of the QP ``f(H)``, so each band's energy is the
@@ -955,13 +1030,23 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         c <- v): ``v_window`` and ``e_dft_window`` below.  Off by default;
         the default outputs do not depend on it.
     qp_states : bool
-        The fine states are eigenstates of a QUASIPARTICLE f(H) (``--eqp``;
-        the loader passes ``eqp_file is not None``).  Then the velocity's
-        DFT f(H) block is not diagonal in them, and ``v/ΔE`` of its
-        Rayleigh quotients is not their position (CrI3 8→12: Σ|d|² 0.986,
-        onset 0.87 against the native fine grid): the dipoles become the
-        exact ``⟨c̃|r̂|ṽ⟩`` of :func:`_position_in_fine_states`.  False
-        (DFT f(H)): the outputs are bitwise those of ``v/ΔE``.
+        The exact-position fix, opt-in (``--dipole-position-fix``; the
+        loader passes ``eqp_file is not None and velocity_position_fix``).
+        Under ``--eqp`` the fine states are eigenstates of a QUASIPARTICLE
+        f(H); with strongly band-dependent QP shifts that interpolant mixes
+        the velocity's DFT bands, the DFT f(H) block is not diagonal in them,
+        and ``v/ΔE`` of its Rayleigh quotients is not their position (CrI3
+        8→12: Σ|d|² 0.986, onset 0.87 against the native fine grid; the fix
+        0.05 %).  Then the dipoles are the ``⟨c̃|r̂|ṽ⟩`` of
+        :func:`_position_in_fine_states`, exact when the DFT f(H)
+        interpolant is the more accurate one.  Off (default): ``v/ΔE_RQ``;
+        Si 4³→8³, a near-scissor QP ladder, is 4x closer to the native grid
+        this way (the DFT f(H) block mixes v↔c by 3.8 % there).
+    mixing_receipt : bool
+        Log the receipt that decides the opt-in (the loader passes
+        ``eqp_file is not None``): max valence↔conduction mixing of the DFT
+        f(H) eigenbasis in the fine states and the largest relative f(H)
+        off-diagonal (:func:`_qp_window_mixing`).
     pair_rule, pair_gap_ev : str, float
         Same-occupation pairs of the window position (``r_window``, and the
         c̃ṽ dipoles where W mixes valence and conduction rows):
@@ -1019,11 +1104,34 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     f_eps, a_f, n_f, shift = f_transform_eigs(
         jnp.asarray(e_full.T), a_band_index=a_band_index)
     f_full = np.asarray(f_eps, dtype=np.float64).T             # (nk, nb)
+    # When the fit window's top band meets an unfitted band, v projected on
+    # the window is not smooth in k (the projector jumps where they cross;
+    # Si 4³, 36 fitted of 100 bands: v image outer shell 26 % against 1.9 %
+    # for f(H)).  The velocity is then carried as g v g with g =
+    # velocity_weight, zero above the first unfitted band's lowest energy,
+    # and g is divided back in the fine window (_velocity_from_weighted).
+    # An isolated window top keeps the unweighted route, bit for bit.
+    nb_win = int(fine.coeffs_fi.shape[-1])
+    e_all = np.asarray(e_parent, dtype=np.float64)
+    e_cut = float(e_all[:, b1].min()) if e_all.shape[1] > b1 else np.inf
+    weight = None
+    if e_cut < float(e_all[:, b1 - 1].max()):
+        e_win = float(np.sort(e_all[:, b0:b1], axis=1)[:, window_start + nb_win - 1].max())
+        if not e_cut > e_win:
+            raise ValueError(
+                f"GATE densified_velocity_weight: the first band above the fit "
+                f"window [{b0},{b1}) of {path} reaches {e_cut:.6f} Ry, at or "
+                f"below the BSE window's top {e_win:.6f} Ry; why: the window's "
+                f"own states then cross unfitted bands and no smooth weight "
+                f"separates them; fix: raise ncond (more guard bands).")
+        weight = (e_cut, 0.5 * (e_cut - e_win))
+        g_full = velocity_weight(e_full, *weight)                 # (nk, nb)
+        v_full = v_full * (g_full[:, None, :, None] * g_full[:, None, None, :])
 
     # Four band operators on one replicated carrier (48·nk·nb² B per
-    # device, the htransform's own velocity layout): the three velocity
-    # components and f(H) of the velocity's energies.  Band axes padded to
-    # the mesh so the image's (x, y) face divides.
+    # device, the htransform's own velocity layout): the three weighted
+    # velocity components and f(H) of the velocity's energies.  Band axes
+    # padded to the mesh so the image's (x, y) face divides.
     nbp = padded_axis(nb_fit, mesh_xy, name="densified velocity bands").carrier
     ops = np.zeros((4, nk_co, nbp, nbp), np.complex128)
     ops[:3, :, :nb_fit, :nb_fit] = np.moveaxis(v_full, 1, 0)
@@ -1045,10 +1153,19 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                                     B_at_mu=basis.basis_at_nodes,
                                     image_record_fn=_record)
     del ops, coeffs
-    v_cv = np.asarray(gather_to_host(jax.jit(
-        lambda o: o[:nq, :3, n_val:, :n_val])(out)))            # (nq, 3, nc, nv)
-    lam = np.asarray(gather_to_host(jax.jit(
-        lambda o: jnp.real(jnp.diagonal(o[:nq, 3], axis1=-2, axis2=-1)))(out)))
+    win = np.asarray(gather_to_host(jax.jit(lambda o: o[:nq])(out)))  # (nq, 4, nb, nb)
+    f_win = win[:, 3]
+    v_win, weight_floor = np.moveaxis(win[:, :3], 1, 0), 1.0
+    if weight is not None:
+        def _g_of_f(phi):
+            e, res = newton_inv(a_f, n_f, shift, jnp.asarray(phi))
+            require_newton_converged(float(res), where="densified_dipoles weight")
+            return velocity_weight(np.asarray(e), *weight)
+        v_win, weight_floor = _velocity_from_weighted(v_win, f_win, _g_of_f,
+                                                      where=str(path))
+    del win
+    v_cv = v_win[:, :, n_val:, :n_val]                          # (3, nq, nc, nv)
+    lam = np.real(np.einsum("qii->qi", f_win))
     e_dft, residual = newton_inv(a_f, n_f, shift, jnp.asarray(lam))
     require_newton_converged(float(residual), where="densified_dipoles")
     e_dft = np.asarray(e_dft, dtype=np.float64)                 # (nq, nb_fi)
@@ -1063,7 +1180,7 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
             f"band inversion of the velocity's own Hamiltonian; fix: a window "
             f"whose conduction bands lie above its valence bands in that "
             f"Hamiltonian (dipole_qsgw.h5 for a QSGW state).")
-    d_alpha = np.moveaxis(v_cv, 1, 0) / de_cv[None]             # (3, nq, nc, nv)
+    d_alpha = v_cv / de_cv[None]                                # (3, nq, nc, nv)
     if pair_rule not in DENSIFIED_POSITION_PAIR_RULES:
         raise ValueError(
             f"GATE densified_pair_rule: got {pair_rule!r}; want one of "
@@ -1071,13 +1188,6 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
             f"decides the same-occupation pairs of the window position; fix: "
             f"pass pair_rule='mask' (default).")
     gap_ry = float(pair_gap_ev) / RYD_TO_EV
-    v_win = f_win = None
-    if qp_states or full_window:
-        nb_win = int(e_dft.shape[1])
-        win = np.asarray(gather_to_host(jax.jit(
-            lambda o: o[:nq, :, :nb_win, :nb_win])(out)))          # (nq, 4, nb, nb)
-        v_win, f_win = np.moveaxis(win[:, :3], 1, 0), win[:, 3]
-        del win
     d_alpha_rq = rfix = r_window = None
     if qp_states:
         def _newton(phi):
@@ -1121,6 +1231,14 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     elif full_window:
         r_window = _position_from_velocity_rule(v_win, e_dft, n_val,
                                                 rule=pair_rule, gap_ry=gap_ry)
+    mixing = None
+    if mixing_receipt and not qp_states:
+        mixing = _qp_window_mixing(f_win, n_val)
+        log_fn(f"[bse_k_grid dipoles] --eqp without --dipole-position-fix: d = "
+               f"v/dE_RQ; QP/DFT window mixing receipt: max off-block (v<->c) "
+               f"mixing {mixing[0]:.3e}, f(H) off-diagonal max {mixing[1]:.3e} "
+               f"(relative); large values (strongly band-dependent QP shifts, "
+               f"CrI3-type) call for --dipole-position-fix")
 
     on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
         out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
@@ -1143,6 +1261,11 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
            f"band_energies (Rayleigh quotients of its f(H) in the fine "
            f"states): max |E - eps_bundle| = {shift_mev:.3f} meV (the --eqp "
            f"shift; 0 without --eqp)")
+    log_fn("[bse_k_grid dipoles] velocity carried unweighted (fit window top isolated)"
+           if weight is None else
+           f"[bse_k_grid dipoles] velocity carried as g v g (fit window top meets "
+           f"band {b1} at {weight[0]:.6f} Ry; width {weight[1]:.6f} Ry); window "
+           f"weight min/max {weight_floor:.6f} (gate {DENSIFIED_VELOCITY_WEIGHT_FLOOR:.0e})")
     log_fn("[bse_k_grid dipoles] image locality, outer-shell L2 fraction "
            "(diagnostic): " + ", ".join(
                f"{name} {locality[name][0]:.3e}" for name in _DIPOLE_IMAGES
@@ -1170,6 +1293,8 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         "on_grid_state_dev": float(state_dev),
         "n_on_grid": int(n_on_grid),
         "image_locality": locality,
+        "velocity_weight": None if weight is None else {
+            "e_cut_ry": weight[0], "width_ry": weight[1], "floor": float(weight_floor)},
     }
     if full_window:
         result["v_window"] = v_window
@@ -1180,6 +1305,9 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     if qp_states:
         result["d_alpha_rq"] = d_alpha_rq
         result["rfix"] = rfix
+    if mixing is not None:
+        result["qp_mixing"] = {"max_offblock_mixing": mixing[0],
+                               "fh_offdiag_rel_max": mixing[1]}
     return result
 
 
@@ -1283,6 +1411,7 @@ def _interpolate_bse_data_to_grid(
     velocity_full_window: bool = False,
     velocity_pair_rule: str = "mask",
     velocity_pair_gap_ev: float = 0.05,
+    velocity_position_fix: bool = False,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -1340,6 +1469,10 @@ def _interpolate_bse_data_to_grid(
     velocity_pair_rule, velocity_pair_gap_ev : str, float
         :func:`densified_dipoles`' ``pair_rule`` / ``pair_gap_ev`` (the
         same-occupation pairs of ``r_window``).
+    velocity_position_fix : bool
+        With ``eqp_file``: the exact-position fix of
+        :func:`densified_dipoles` (``qp_states``), opt-in
+        (``--dipole-position-fix``); off, ``v/ΔE_RQ`` and the mixing receipt.
     head_channel : dict or None
         C1's split-and-reattach hand-off from the loader, ``None`` on the
         ``legacy`` arm.  When present it carries ``whead`` (the head scalar the
@@ -1472,8 +1605,10 @@ def _interpolate_bse_data_to_grid(
             fh_energies=np.asarray(gather_to_host(enk_sigma)).T,
             coarse_grid=coarse_grid, n_val=n_val, window_start=b_min,
             a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn,
-            full_window=velocity_full_window, qp_states=eqp_file is not None,
-            pair_rule=velocity_pair_rule, pair_gap_ev=velocity_pair_gap_ev)
+            full_window=velocity_full_window,
+            qp_states=eqp_file is not None and bool(velocity_position_fix),
+            pair_rule=velocity_pair_rule, pair_gap_ev=velocity_pair_gap_ev,
+            mixing_receipt=eqp_file is not None)
         del bundle.coeffs_fi, velocity
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))

@@ -65,6 +65,7 @@ def _preview_lanczos(
     n_eig: int = 5,
     write_eigs: int | None = None,
     dipole_file: str | None = None,
+    dipole_position_fix: bool = False,
     helicity_table: bool = False,
     max_lanczos_iter: int | None = None,
     include_W: bool = True,
@@ -120,6 +121,7 @@ def _preview_lanczos(
             eqp_file=eqp_file,
             qp_rotations_file=qp_rotations_file,
             velocity_file=dipole_file,
+            velocity_position_fix=dipole_position_fix,
             q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
         )
         qp_rotation = data.get("qp_rotation")
@@ -474,6 +476,13 @@ def build_parser():
              "exciton_data/dipoles in eigenvectors.h5.  Under bse_k_grid it "
              "is the deck (coarse) WFN's dipole.h5: the densifier carries it "
              "through the htransform into the fine states")
+    parser.add_argument(
+        "--dipole-position-fix", action="store_true",
+        help="bse_k_grid with --eqp: the dipoles are the exact <c|r|v> of the "
+             "fine QP states, from the DFT f(H) eigenbasis of the window "
+             "(bse_densify.densified_dipoles qp_states), instead of "
+             "v/dE_RQ.  Opt in when the logged QP/DFT window mixing is large "
+             "(strongly band-dependent QP shifts, CrI3-type)")
     parser.add_argument(
         "--helicity-table", action="store_true",
         help="with --dipole: add each written state's in-plane circular "
@@ -899,6 +908,7 @@ def main(argv=None) -> int:
             n_eig=args.n_eig,
             write_eigs=args.write_eigs,
             dipole_file=args.dipole,
+            dipole_position_fix=args.dipole_position_fix,
             helicity_table=args.helicity_table,
             max_lanczos_iter=args.max_lanczos_iter,
             include_W=not (args.rpa or not args.bse),

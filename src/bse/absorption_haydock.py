@@ -293,6 +293,7 @@ def run_haydock(
     n_occ: int,
     eqp_file: str | None,
     dipole_file: str,
+    dipole_position_fix: bool = False,
     V_cell: float,
     n_iter: int,
     eta_eV: float,
@@ -322,6 +323,7 @@ def run_haydock(
         restart_file, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
         input_file=input_file, n_occ=n_occ, eqp_file=eqp_file,
         velocity_file=dipole_file,
+        velocity_position_fix=dipole_position_fix,
         q0_head="diagonal",           # operands via bse_head.head_shifted_eps_c
     )
     # Resolve n_occ for the downstream dipole slice — same source as the
@@ -399,6 +401,9 @@ def main(argv=None):
                    help="dipole.h5 from psp.get_dipole_mtxels (default: "
                         "dipole.h5); under bse_k_grid the deck (coarse) WFN's, "
                         "carried through the htransform into the fine states")
+    p.add_argument("--dipole-position-fix", action="store_true",
+                   help="bse_k_grid with --eqp: exact <c|r|v> of the fine QP "
+                        "states instead of v/dE_RQ (bse_jax --dipole-position-fix)")
     p.add_argument("--V-cell", type=float, required=True,
                    help="Unit-cell volume (bohr^3)")
     p.add_argument("--n-iter", type=int, default=200,
@@ -429,6 +434,7 @@ def main(argv=None):
         input_file=args.input,
         n_val=args.n_val, n_cond=args.n_cond, n_occ=args.n_occ,
         eqp_file=args.eqp, dipole_file=args.dipole,
+        dipole_position_fix=args.dipole_position_fix,
         V_cell=args.V_cell, n_iter=args.n_iter,
         eta_eV=args.eta_eV, n_spin=args.n_spin, n_spinor=args.n_spinor,
         omega_min_eV=args.omega_min_eV, omega_max_eV=args.omega_max_eV,
