@@ -130,7 +130,10 @@ A large matrix is usually reduced by projecting it onto a few important directio
 A sample of $W$ is an $N_\mu\times N_\mu$ matrix. We keep only its action on a few directions, which is tangential interpolation [12], so each direction adds one state to the model where a whole sample would add $N_\mu$ [10]. A potential pattern $r$ is applied at the ISDF points at frequency $z$, and the induced potential $W(z)\,r$ is read out at every point, as a network analyzer drives a circuit through a chosen combination of its ports [27].
 
 !!! note "In short"
-    We define trial directions $r_j$ of length $N_\mu$, one entry per ISDF point $\br_\mu$, where $W$ acts. Each corresponds to a resolvent vector $u_j=(\lambda_j-H)^{-1}\sigma\phi^\dagger r_j$ of length $2N_t$, one entry per transition $mn\bk$, where $H_\bq$ acts, and the left pairs $\ell_i$, $\tilde u_i$ are defined the same way. The samples give $\tilde S=\tilde UU$ and $\tilde H=\tilde UHU$ (called $\mathbb G$ and $\mathbb H$ from §4.3 on), and the small resolvent $U(z\tilde S-\tilde H)^{-1}\tilde U\approx(z-H)^{-1}$ is the projection onto the span of the $u_j$, exact at every sample.
+    - **Left pairs:** a direction $\ell_i$ on the $N_\mu$ points $\br_\mu$ and its vector $\tilde u_i=\ell_i\,\phi\,(\xi_i-H)^{-1}$ on the $2N_t$ transitions $mn\bk$.
+    - **Right pairs:** a direction $r_j$ on the points and its vector $u_j=(\lambda_j-H)^{-1}\sigma\phi^\dagger r_j$ on the transitions.
+
+    The left and right data build the model as if the $u_j$ were a compressed basis. This is like replacing the resolvent by a small one, $(z-H)^{-1}\approx U(z\tilde S-\tilde H)^{-1}\tilde U$ with $\tilde S=\tilde UU$ and $\tilde H=\tilde UHU$, which is exact at every sample.
 
 At right points $\lambda_j$ with directions $r_j$, and at left points $\xi_i$ with row directions $\ell_i$, the samples are
 
