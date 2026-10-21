@@ -308,10 +308,43 @@ def build_sc_td_reference(source, frame, inputs, *, mesh, active):
         position="rotated_DFT_velocity_over_current_SC_energy_difference",
         hartree_policy=hartree_policy, bare_head_coefficient_ry=coefficient,
         pair_receipt=pair_receipt, zero_field_drift_gate="required_not_run",
-        executable_memory_admission="required_not_run", nk_pad=nk_pad)
+        executable_memory_admission="required_not_run", nk_pad=nk_pad,
+        numerical_frequency_origin=prepared.get("frequency_origin_receipt"))
     return dict(header=header, ops=ops, model=model, prepared=prepared, receipts=receipts,
                 snapshot_options=dict(hamiltonian="reference", form="raw", hermitian="dynamic",
                                       statistics="retarded_reference", basis="instantaneous"))
+
+
+def _native_frequency_origin(energy_ry, occupations, source_reference_ry):
+    """Choose a numerical Sigma origin once, without changing physical mu.
+
+    The logical accepted-reference tables have shape ``(nk, nb)``. A binary
+    gapped reference uses its global occupied/empty midpoint; other sources
+    retain the explicit original reference. Absolute energies, occupations,
+    screening census and all transfer-frequency poles are left unchanged.
+    """
+    energy, occ = np.asarray(energy_ry, float), np.asarray(occupations, float)
+    original = float(source_reference_ry)
+    if (energy.ndim != 2 or energy.shape != occ.shape or not energy.size
+            or not np.isfinite(energy).all() or not np.isfinite(occ).all()
+            or not np.isfinite(original)):
+        raise ValueError("GATE td_native_frequency_origin: finite logical reference tables required")
+    binary = bool(np.all((occ == 0.) | (occ == 1.)))
+    occupied, empty = occ == 1., occ == 0.
+    vbm = float(energy[occupied].max()) if binary and occupied.any() else None
+    cbm = float(energy[empty].min()) if binary and empty.any() else None
+    gapped = vbm is not None and cbm is not None and cbm > vbm
+    origin = .5*(vbm+cbm) if gapped else original
+    receipt = dict(policy="accepted_binary_midgap" if gapped else "explicit_source_reference_fallback",
+        source_reference_ry=original, numerical_origin_ry=origin,
+        logical_reference_shape=list(energy.shape), binary_reference=binary,
+        occupied_max_ry=vbm, empty_min_ry=cbm,
+        reference_gap_ry=None if vbm is None or cbm is None else cbm-vbm,
+        computed_once_from="logical_source_energy_and_occupations",
+        scope="numerical_common_frequency_origin_only_not_physical_mu",
+        physical_census_mu_changed=False, absolute_energies_changed=False,
+        occupations_changed=False, transfer_poles_changed=False)
+    return origin, receipt
 
 
 def prepare_native_source(source, mesh):
@@ -394,13 +427,17 @@ def prepare_native_source(source, mesh):
             jax.jit(lambda p: jnp.any(p[:, nb:] != 0))(psi)))
         if np.any(occupations_padded[:, nb:] != 0) or padding_nonzero:
             raise ValueError("GATE td_native_band_padding: padded occupations/orbitals must be exact zero")
+    original_reference = float(source.get("efermi_ry") or 0.0)
+    frequency_origin, origin_receipt = _native_frequency_origin(
+        energy_padded[:, :nb], occupations_padded[:, :nb], original_reference)
     return dict(energy=energy_padded[:, :nb], occupations=occupations_padded[:, :nb],
         energy_padded=energy_padded, occupations_padded=occupations_padded,
         nb_padded=int(energy_padded.shape[1]), k_frac=frac,
         kgrid=kgrid, nk=nk, qgrid=qgrid, nq=nq, nb=nb, nb_chi=nb_chi, nb_sigma=nb_sigma,
         mesh=mesh, nmu_logical=int(meta.n_rmu), spin_weight=2.0/(nspin*nspinor),
         psi=psi, V_q=V, head=source.get("head"),
-        efermi_ry=float(source.get("efermi_ry") or 0.0), native_full_microscopic=True,
+        efermi_ry=original_reference, frequency_origin_ry=frequency_origin,
+        frequency_origin_receipt=origin_receipt, native_full_microscopic=True,
         flat_grid=flat_grid)
 
 
@@ -455,6 +492,11 @@ def make_native_snapshot_evaluator(source, prepared, options):
     if not scratch:
         raise ValueError("GATE td_native_screening_scratch: unique model output directory required")
     cache = dict(n=0)
+    frequency_origin = float(prepared.get("frequency_origin_ry", prepared["efermi_ry"]))
+    origin_receipt = prepared.get("frequency_origin_receipt", dict(
+        policy="explicit_prepared_source_reference", source_reference_ry=prepared["efermi_ry"],
+        numerical_origin_ry=frequency_origin,
+        scope="numerical_common_frequency_origin_only_not_physical_mu"))
     plan = window_sigma_plan(source["config"], head=source.get("head"), window_only=True)
     tail = _source_spectral_tail(source)
     if tail is not None:
@@ -470,7 +512,7 @@ def make_native_snapshot_evaluator(source, prepared, options):
         U, e, rho = (np.asarray(basis[k]) for k in ("U", "e", "rho"))
         # Validate the REAL ordered request before any screening work. Its
         # supports follow current active shells, not stale SC160 metadata.
-        support_reads = _native_window_support_reads(e, prepared["efermi_ry"], plan)
+        support_reads = _native_window_support_reads(e, frequency_origin, plan)
         # Screening/line owners consume the full native padded carrier.
         # Logical metadata/tail cuts remain capped at nb; inert padding keeps
         # its exact source energy sentinel and zero density/orbitals.
@@ -503,7 +545,7 @@ def make_native_snapshot_evaluator(source, prepared, options):
                 run_dir=os.path.abspath(scratch), label=f"snapshot_{cache['n']:06d}",
                 fit_basis=fit_bases, print_fn=options.get("say", print))
             handle = shared_pole_window_source(built["shared_pole"], built["meta"],
-                efermi_ry=prepared["efermi_ry"], linalg=source.get("linalg"))
+                efermi_ry=frequency_origin, linalg=source.get("linalg"))
             screening_receipt = built["receipt"]
             if equilibrium:
                 cache.update(equilibrium=handle, equilibrium_receipt=screening_receipt)
@@ -516,6 +558,7 @@ def make_native_snapshot_evaluator(source, prepared, options):
         out = window_sigma_c(source["wfns"], handle, window, plan, meta=source["meta"],
             mesh_xy=prepared["mesh"], branches=True, pairing="vertex", static_limit=False,
             print_fn=options.get("say", print))
+        out["native_receipt"]["numerical_frequency_origin"] = origin_receipt
         active_pair, full_pair = out["active_branch_pair"], out["branch_pair"]
         gamma, injection, _ = C.branch_operators(active_pair["cond"], active_pair["val"])
         _, _, mh = C.branch_operators(full_pair["cond"], full_pair["val"])
