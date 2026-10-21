@@ -229,6 +229,12 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
         weights = -np.asarray(group["value"][:, :, :count] if paired else group["value"][:, 0, :count])
         if paired:
             weights = weights.swapaxes(0, 1)
+        if values_only:
+            capacity = int(minimax.RESPONSE_NODE_CAPACITY)
+            if count > capacity:
+                raise ValueError('GATE response_full_density: value panel exceeds native node carrier')
+            times = np.pad(times, (0, capacity-count))
+            weights = np.pad(weights, [(0, 0)]*(weights.ndim-1)+[(0, capacity-count)])
         result.append(dict(members=list(map(int, group["members"])), times=times,
                            weights=weights, reference_ry=reference,
                            sampled_error=float(np.max(group["sampled_error"])),
@@ -236,6 +242,8 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
                            construction=group.get("construction", "shared_hankel"),
                            interval_ry=[lo, hi], max_pencil_bytes=bound,
                            max_panel_count=32))
+        if values_only:
+            result[-1].update(active_count=count, carrier_capacity=capacity)
         if "ritz_refusal" in group:
             result[-1]["ritz_refusal"] = group["ritz_refusal"]
         if "analytic_box_certificate" in group:

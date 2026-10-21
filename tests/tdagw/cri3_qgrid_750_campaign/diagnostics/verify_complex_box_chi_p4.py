@@ -97,7 +97,7 @@ def response_stage(c):
                     value = host(stream(c['put'](rule['times'], P()), c['put'](rule['weights'], P()),
                         l, c['pn'], r, c['put'](energy, P())))
                     actual = value if actual is None else actual+value
-                    node_calls += len(rule['times'])
+                    node_calls += rule['active_count']
                 expected = frequency_literal(c['psi'], energy, left, right,
                     c['coords'], grid, sites, gamma)
                 if qgrid != grid:
@@ -105,7 +105,8 @@ def response_stage(c):
                 np.testing.assert_allclose(actual, expected, rtol=4e-7, atol=3e-10, err_msg=name)
                 maximum = max(maximum, float(np.max(abs(actual-expected)))); calls += 1
                 records.append(dict(current=current, block=name, qgrid=list(qgrid),
-                    nodes=sum(len(v['times']) for v in rules), panels=len(rules),
+                    nodes=sum(v['active_count'] for v in rules), panels=len(rules),
+                    node_carrier_slots=sum(len(v['times']) for v in rules),
                     max_bound=max(v['sampled_error'] for v in rules),
                     max_coefficient_mass=max(v['coefficient_mass'] for v in rules)))
         assert execution['compiled'] and execution['memory']

@@ -252,6 +252,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     import jax
     import jax.numpy as jnp
     import distrib_la
+    import minimax
     from jax.sharding import NamedSharding, PartitionSpec as P
     from ffi import ffi_dial_key
     from common.collectives import device_put_process_local, gather_to_host, rank0_transaction
@@ -336,6 +337,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         source_policy_version=recipe.get("recipe_version", recipe.get("version")),
         scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
         numerical_response_rule='analytic-denominator-box-values-only-v1',
+        numerical_response_carrier=int(minimax.RESPONSE_NODE_CAPACITY),
         response_partition=response_partition,
         eta_training_verification='active_span_3train_2interlaced_held_v1',
         numerical_spaces='two-sided-descriptor-svd',
@@ -501,7 +503,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     end("planning")
     if jax.process_index() == 0:
         print_fn(f"General shared-pole W [{label}] scalar plan: {len(rules)} panels, "
-                 f"{sum(len(r['times']) for r in rules)} Green pairs; "
+                 f"{sum(r.get('active_count',len(r['times'])) for r in rules)} Green pairs; "
+                 f"node carrier capacity={max(len(r['times']) for r in rules)}; "
                  f"max error={max(r['sampled_error'] for r in rules):.3e}, "
                  f"mass={max(r['coefficient_mass'] for r in rules):.3e}; "
                  "Hankel workspace bound=4GiB, panel count bound=32")
@@ -534,7 +537,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         if jax.process_index() == 0 and (panel_index == 0 or (panel_index+1) % 4 == 0
                                         or panel_index+1 == len(rules)):
             print_fn(f"General shared-pole W [{label}] stream panel {panel_index+1}/{len(rules)} "
-                     f"nodes={len(rule['times'])} wall={time.monotonic()-panel_start:.3f}s "
+                     f"nodes={rule.get('active_count',len(rule['times']))} "
+                     f"carrier={len(rule['times'])} wall={time.monotonic()-panel_start:.3f}s "
                      f"elapsed={time.monotonic()-phase_start['stream']:.3f}s")
             sys.stdout.flush()
     end("stream", polarizations)
@@ -912,8 +916,10 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                                       density_sides=list(b['density_sides']),components=b['components'],
                                       endpoint_bounds_ry=b['bounds'],
                                       structural_band_ranges=b['band_ranges'].tolist()) for b in blocks]
-    receipt['quadrature_work'] = dict(ordered_green_pairs=sum(len(r['times']) for r in rules),
-        product_greens_per_node=2,output_node_updates=sum(len(r['times'])*len(r['members']) for r in rules),
+    receipt['quadrature_work'] = dict(ordered_green_pairs=sum(r.get('active_count',len(r['times'])) for r in rules),
+        node_carrier_slots=sum(len(r['times']) for r in rules),
+        maximum_node_carrier_capacity=max(len(r['times']) for r in rules),
+        product_greens_per_node=2,output_node_updates=sum(r.get('active_count',len(r['times']))*len(r['members']) for r in rules),
         largest_output_count=max(len(r['members']) for r in rules),
         rule_groups=len(rules),scalar_provider='exact_endpoint_blocks_public_minimax_owners')
     receipt["phase_seconds"] = phases
