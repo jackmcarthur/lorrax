@@ -1,0 +1,285 @@
+{
+    "schema": "mgkba_endpoint_reference_toy_v1",
+    "status": "INDEPENDENT_TINY_THEORY_DIAGNOSTIC_NOT_MATERIAL_OR_GPU_VALIDATION",
+    "base_revision": "84c147c",
+    "script": "tests/tdagw/cri3_qgrid_750_campaign/diagnostics/audit_mgkba_endpoint_reference.py",
+    "primary_background": [
+        "https://arxiv.org/pdf/2311.03980",
+        "https://arxiv.org/html/2208.11971",
+        "https://arxiv.org/html/1806.05639v1"
+    ],
+    "model": {
+        "energies": [
+            0,
+            0.6,
+            1.3
+        ],
+        "omega": 0.4,
+        "vertex_02": [
+            0.2,
+            0
+        ],
+        "vertex_12": [
+            0,
+            0.3
+        ],
+        "particle_count": 2
+    },
+    "projector": {
+        "raw_trace": 0,
+        "filled_blocking_eigenvalues": [
+            -0.015318135767358602,
+            0.02412370295587494
+        ],
+        "empty_injection": 0.008805567188516336
+    },
+    "coherent_endpoint": {
+        "column_integral_error_max": 3.3801086929408086e-15,
+        "quadrature_error_estimate": 1.3648423753959396e-12,
+        "wrong_negative_lag_order_error_max": 0.10017037929465313,
+        "raw_trace": -2.7755575615628914e-17,
+        "wrong_negative_lag_order_trace": 0.0403487690330884
+    },
+    "spectral_only_number_test": {
+        "raw_fresh_trace": -2.0816681711721685e-17,
+        "spectral_only_fresh_trace": 0.020174384516544085
+    },
+    "projector_PV_dressing": {
+        "identity_error_max": 3.469446951953614e-18,
+        "commutator_only_error_fro": 4.9065389333867974e-18,
+        "coherent_remainder_fro": 0,
+        "dressing_fro": 0.1240649657606037,
+        "dressing_trace": 0,
+        "rho_minus_Z_eigenvalues": [
+            0.08772567727330567,
+            0.9122713201563813,
+            1.000003002570313
+        ],
+        "limitation": "rho-Z is only a first-order candidate density reconstruction; no PSD, exact-GS, transport or driven-coherence equivalence is asserted."
+    },
+    "coherent_PV_dressing": {
+        "identity_error_max": 1.8440363494407353e-17,
+        "commutator_only_error_fro": 0.13897981305496315,
+        "coherent_remainder_fro": 0.13897981305496315,
+        "dressing_fro": 0.3590311067938146,
+        "dressing_trace": 0.0334226647375889,
+        "rho_minus_Z_eigenvalues": [
+            0.3106550009069689,
+            0.7676434733329242,
+            0.8882788610225185
+        ],
+        "limitation": "rho-Z is only a first-order candidate density reconstruction; no PSD, exact-GS, transport or driven-coherence equivalence is asserted."
+    },
+    "nonlinear_stationary": [
+        {
+            "eta": 0.1,
+            "coupling": 1,
+            "root_success": true,
+            "full_rhs_residual_fro": 1.5377763584697642e-16,
+            "trace": 2,
+            "eigenvalues": [
+                0.33658040001876066,
+                0.7961477860901433,
+                0.8672718138910956
+            ],
+            "diagonal": [
+                0.8006267630523809,
+                0.8627928369288581,
+                0.3365804000187609
+            ],
+            "offdiag_abs_max": 0.017277200217447004,
+            "tangent_jacobian_real_range": [
+                -0.10281082479443136,
+                -0.018088546186065976
+            ]
+        },
+        {
+            "eta": 0.05,
+            "coupling": 1,
+            "root_success": true,
+            "full_rhs_residual_fro": 1.5651023690585927e-17,
+            "trace": 2,
+            "eigenvalues": [
+                0.3285141022545919,
+                0.7999992447912122,
+                0.8714866529541956
+            ],
+            "diagonal": [
+                0.804576373070686,
+                0.8669095246747218,
+                0.3285141022545921
+            ],
+            "offdiag_abs_max": 0.017500198120087466,
+            "tangent_jacobian_real_range": [
+                -0.053528094783052454,
+                -0.009462877540711501
+            ]
+        },
+        {
+            "eta": 0.01,
+            "coupling": 1,
+            "root_success": true,
+            "full_rhs_residual_fro": 2.95371450094925e-17,
+            "trace": 2,
+            "eigenvalues": [
+                0.3257817973998177,
+                0.8013389639117752,
+                0.8728792386884068
+            ],
+            "diagonal": [
+                0.8059516904829099,
+                0.868266512117272,
+                0.32578179739981794
+            ],
+            "offdiag_abs_max": 0.01757038644846486,
+            "tangent_jacobian_real_range": [
+                -0.01085149135882981,
+                -0.0019221758512168751
+            ]
+        },
+        {
+            "eta": 0.001,
+            "coupling": 1,
+            "root_success": true,
+            "full_rhs_residual_fro": 9.84471153846169e-18,
+            "trace": 2,
+            "eigenvalues": [
+                0.32566739982461496,
+                0.8013954397272772,
+                0.8729371604481078
+            ],
+            "diagonal": [
+                0.8060096837283462,
+                0.8683229164470387,
+                0.32566739982461496
+            ],
+            "offdiag_abs_max": 0.017573266855108117,
+            "tangent_jacobian_real_range": [
+                -0.0010857621036517082,
+                -0.00019234294471354345
+            ]
+        }
+    ],
+    "weak_coupling_stationary": [
+        {
+            "eta": 0.01,
+            "coupling": 0.1,
+            "root_success": true,
+            "full_rhs_residual_fro": 3.788046498485219e-21,
+            "trace": 1.9999999999999998,
+            "eigenvalues": [
+                0.3972968821381049,
+                0.7041682884407787,
+                0.8985348294211162
+            ],
+            "diagonal": [
+                0.7041685836366394,
+                0.8985345342252555,
+                0.3972968821381049
+            ],
+            "offdiag_abs_max": 0.00023953311088584933,
+            "tangent_jacobian_real_range": [
+                -0.00012335486067195276,
+                -9.116405736361418e-06
+            ]
+        },
+        {
+            "eta": 0.01,
+            "coupling": 0.3,
+            "root_success": true,
+            "full_rhs_residual_fro": 2.4613419125652504e-18,
+            "trace": 2,
+            "eigenvalues": [
+                0.3887141585027515,
+                0.7158782469039398,
+                0.8954075945933087
+            ],
+            "diagonal": [
+                0.7159025555101819,
+                0.8953832859870665,
+                0.3887141585027515
+            ],
+            "offdiag_abs_max": 0.0020889033758276585,
+            "tangent_jacobian_real_range": [
+                -0.0010963223779352424,
+                -8.819465687882345e-05
+            ]
+        },
+        {
+            "eta": 0.01,
+            "coupling": 1,
+            "root_success": true,
+            "full_rhs_residual_fro": 2.95371450094925e-17,
+            "trace": 2,
+            "eigenvalues": [
+                0.3257817973998177,
+                0.8013389639117752,
+                0.8728792386884068
+            ],
+            "diagonal": [
+                0.8059516904829099,
+                0.868266512117272,
+                0.32578179739981794
+            ],
+            "offdiag_abs_max": 0.01757038644846486,
+            "tangent_jacobian_real_range": [
+                -0.01085149135882981,
+                -0.0019221758512168751
+            ]
+        }
+    ],
+    "exact_number_conserving_fermion_boson_ground_states": [
+        {
+            "coupling": 1,
+            "boson_cutoff": 12,
+            "energy": 0.4705892914124235,
+            "density_eigenvalues": [
+                0.11622031422040001,
+                0.8837980713110635,
+                0.9999816144685371
+            ],
+            "density_diagonal": [
+                0.9802947089559743,
+                0.9034849768236263,
+                0.11622031422039995
+            ],
+            "trace": 2.0000000000000004,
+            "raw_rhs_at_eta_005_fro": 0.01837514841597648
+        },
+        {
+            "coupling": 1,
+            "boson_cutoff": 18,
+            "energy": 0.4705892913948321,
+            "density_eigenvalues": [
+                0.11622031429355492,
+                0.8837980712383784,
+                0.9999816144680664
+            ],
+            "density_diagonal": [
+                0.9802947089390399,
+                0.9034849767674049,
+                0.11622031429355498
+            ],
+            "trace": 1.9999999999999998,
+            "raw_rhs_at_eta_005_fro": 0.01837514844122138
+        },
+        {
+            "coupling": 0.1,
+            "boson_cutoff": 12,
+            "energy": 0.5989446743478268,
+            "density_eigenvalues": [
+                0.0008844880650900358,
+                0.9991155119473657,
+                0.9999999999875446
+            ],
+            "density_diagonal": [
+                0.9998611549454506,
+                0.9992543569894599,
+                0.0008844880650900358
+            ],
+            "trace": 2.0000000000000004,
+            "raw_rhs_at_eta_005_fro": 0.00012597412604185558
+        }
+    ],
+    "limitations": "Toy diagnostic only. Nonlinear Markov stationary density is not assumed a ground state. Exact fermion-boson comparison is a model analogue, not exact self-consistent GW. No spectral/density clipping, fit reduction, material calculation or production prescription change."
+}

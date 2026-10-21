@@ -1478,6 +1478,82 @@ general coherent densities. These are diagnostic controls, not an enabled
 alternative. Reproduction and exact scope are recorded in
 [the independent audit](../../tests/tdagw/cri3_qgrid_750_campaign/evidence/INDEPENDENT_PAULI_LOCALIZATION_20261021.json).
 
+###### Endpoint audit and correlated-reference interpretation
+
+For the stated upper-endpoint line, its reversed-time partner is fixed by
+anti-adjointness, not by replacing the sign of the lag in the same ordering:
+$G^<(t-\tau,t)=i e^{+iE\tau}\rho(t)$ and
+$G^>(t-\tau,t)=-i e^{+iE\tau}(I-\rho(t))$. Substitution into the KBE integrand
+$\Sigma^<G^>-\Sigma^>G^<$ gives precisely
+$A_{\rm in}(I-\rho)-A_{\rm out}\rho+\mathrm{h.c.}$ and column-energy
+sampling. Also $A_{\rm in}+A_{\rm out}=iM$ for the correlation part of
+$M$, by $\Sigma^R(\tau)=\Sigma^>(\tau)-\Sigma^<(\tau)$ at positive lag.
+The separately Hermitian static term remains coherent. This ordering agrees
+with the mirrored ansatz/rate equations in
+[Stefanucci and Perfetto, §5.1](https://arxiv.org/pdf/2311.03980).
+Neither moving the external density to the other side nor adjointing a rate
+amplitude changes its Hermitian compression at an exact empty/filled
+projector. Such changes cannot in general repair the boundary defect above.
+
+There is a more specific quasiparticle-dressing interpretation of the
+dispersive shell difference. Let
+$S_\alpha(\omega)=\operatorname{Herm}R_\alpha(\omega)$,
+where $\alpha=p,h$ labels particle/hole, and define the Hermitian matrix
+
+$$
+(F_\alpha)_{ab}=\frac{(S_\alpha)_{ab}(E_b)-(S_\alpha)_{ab}(E_a)}{E_b-E_a},\qquad
+F_t=F_p+F_h,\qquad Z=F_h-\tfrac12\{F_t,\rho\}.
+$$
+
+The equal-energy value is the continuous derivative, not a clipped
+denominator. With $\Gamma_{\rm PV}=-i[E,F_t]$ and $D_{\rm PV}=-i[E,F_h]$,
+direct matrix algebra gives
+
+$$
+C_{\rm PV}=-i[E,Z]-\tfrac{i}{2}\{F_t,[E,\rho]\}.
+$$
+
+Only for $[E,\rho]=0$ is this just the free derivative of a density dressing.
+Any redefinition of the state using this dressing changes its time derivative,
+particle-number accounting and observable reconstruction; driven coherences
+retain the second term. Deleting $C_{\rm PV}$ while leaving $\rho$ interpreted
+as the physical reduced density is therefore not an exact reassignment to
+the retained $M_H$. An extended-quasiparticle approximation needs its own
+small-width/slow-variation justification and off-shell density reconstruction;
+the [EQP literature](https://arxiv.org/html/2208.11971) distinguishes that density
+from quasiparticle occupations. Likewise, a correlated initial density alone
+does not supply the initial-correlation integral of
+[GKBA+IC](https://arxiv.org/html/1806.05639v1). That finite-initial-time term
+cannot simply be appended to the present infinite-past Markov integral.
+
+The independent three-level audit has $E=(0,.6,1.3)$, $N=2$, a passive boson
+$\Omega=.4$ and Hermitian vertex $M_{02}=.2$, $M_{12}=.3i$ plus adjoints.
+Its literal column amplitudes conserve fresh number and have a negative
+filled boundary rate. They nevertheless admit a physical, stable,
+fixed-number nonlinear stationary density with full $M_H$ retained.
+This toy holds the internal phases at the specified $E$ while its coherent
+Hamiltonian is $\operatorname{diag}E+M_H[\rho]$; it does not solve the
+instantaneous-Hamiltonian QSGW fixed point of the material prescription.
+This does **not** identify a correlated ground state: its empty-level
+population tends $.33658,.32851,.32578,.32567$ for
+$\eta=.1,.05,.01,.001$, while relaxation rates vanish with $\eta$.
+At one-tenth vertex strength the Markov stationary empty population is
+$.39730$, versus $.00088449$ in the exact fixed-$N$ fermion–boson ground
+state. The limit of infinite relaxation time and $\eta\to0$ is singular.
+The reproducible script/evidence are
+`tests/tdagw/cri3_qgrid_750_campaign/diagnostics/audit_mgkba_endpoint_reference.py`
+and `evidence/MGKBA_ENDPOINT_REFERENCE_TOY_v1.json`; tiny regressions cover
+the endpoint quadrature, density ordering, fixed-$N$ stationary solve and
+the extra coherent dressing term. These are model diagnostics, not material
+initial-state preparation or a justification for dropping principal values.
+
+The next constructive research comparison is the paired covariance-root
+channel model below, keeping the original full $M_H$ explicitly. It must be
+tested against a small exact number-conserving fermion–boson model for
+ground-state stationarity and kicked-state coherences, not just positivity.
+Frequency covariance roots combine all overlapping poles before taking the
+root; independent per-pole roots are a different comparison model.
+
 ###### Research alternative: paired covariance-root jumps
 
 This is an unimplemented alternative collision prescription, not a repair or
