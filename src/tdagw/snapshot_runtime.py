@@ -535,6 +535,7 @@ def make_native_snapshot_evaluator(source, prepared, options):
                 eta_ry=float(source["config"].sigma.regularization_ev)/RYD_TO_EV,
                 spm_support_sites_ev=options.get("spm_support_sites", ""),
                 support_reads_ev=support_reads,
+                general_refinement=True,
                 fit_tolerance=float(options.get("fit_tolerance", 0.02)))
             if options.get('stop_after_model_q') is not None:
                 snapshot['stop_after_model_q']=int(options['stop_after_model_q'])

@@ -219,18 +219,11 @@ def _density_endpoint_column_support(rho, stop, *, occupations=None, active=None
     return occupied.astype(float)*live, empty.astype(float)*live
 
 
-def _save_general_dielectric_probe(raw, operators, record, *, root, index):
-    """Commit scalar native epsilon/inverse witnesses, never a host mu face.
-
-    ``operators`` contains current face-sharded ``H``, the checked Dyson
-    owner, physical centroid mask, matrix-product owner and face/rep layouts.
-    All matrix operands enter the metric programs as runtime arguments.
-    Every rank performs the numerical work before root-only transactions.
-    """
+def _general_dielectric_basic(raw, operators, record):
+    """All-rank native epsilon metrics; no host face or persistence."""
     import jax
     import jax.numpy as jnp
-    from common.collectives import rank0_transaction
-    from .response_bank import dielectric_physical_metrics, dielectric_inverse_bounds
+    from .response_bank import dielectric_physical_metrics
     started = time.monotonic()
     base_elapsed = float(record.get('elapsed_seconds', 0.))
     dyson, h = operators['dyson'], operators['H']
@@ -238,8 +231,6 @@ def _save_general_dielectric_probe(raw, operators, record, *, root, index):
     mask = np.asarray(operators['mask'], bool)
     basic_metrics = jax.jit(lambda e, m: dielectric_physical_metrics(e, m, matmul=mm),
         in_shardings=(face, rep), out_shardings=rep)
-    inverse_metrics = jax.jit(lambda e, m, b: dielectric_physical_metrics(e, m, matmul=mm, inverse=b),
-        in_shardings=(face, rep, face), out_shardings=rep)
     epsilon = dyson.dielectric_matrix(h, raw)
     basic = {k: float(v) for k, v in basic_metrics(epsilon, jnp.asarray(mask)).items()}
     basic.update(record, logical_dimension=int(mask.sum()), packed_dimension=int(mask.size),
@@ -247,6 +238,38 @@ def _save_general_dielectric_probe(raw, operators, record, *, root, index):
         epsilon_definition='I-prefactor*H*P_raw(z)*H', additional_collision_eta_ry=0.,
         admitted=False, sigma_computed=False,
         elapsed_seconds=base_elapsed+time.monotonic()-started)
+    return basic
+
+
+def _general_dielectric_inverse(raw, operators, basic):
+    """Strict native inverse witness at SAME raw Pi/site; never swallows failure."""
+    import jax
+    import jax.numpy as jnp
+    from .response_bank import dielectric_physical_metrics, dielectric_inverse_bounds
+    dyson,h=operators['dyson'],operators['H']
+    mm,face,rep=(operators[k] for k in ('matmul','face','rep'))
+    mask=np.asarray(operators['mask'],bool)
+    inverse_metrics=jax.jit(lambda e,m,b:dielectric_physical_metrics(e,m,matmul=mm,inverse=b),
+        in_shardings=(face,rep,face),out_shardings=rep)
+    eps,inverse=dyson.dielectric(h,raw)
+    metrics={k:float(v) for k,v in inverse_metrics(eps,jnp.asarray(mask),inverse).items()}
+    bounds=dielectric_inverse_bounds(metrics['epsilon_fro'],metrics['inverse_fro'],
+        metrics['inverse_residual_fro'],int(mask.sum()),
+        padding_defect=max(metrics['padding_defect'],metrics['inverse_padding_defect']))
+    return dict(basic,**metrics,inverse_bounds=bounds)
+
+
+def _save_general_dielectric_probe(raw, operators, record, *, root, index, strict=False):
+    """Persist native scalar witnesses; strict refinement propagates failures.
+
+    All native numerical work is all-rank and runtime-operand only. Basic
+    metrics commit before LU. Legacy diagnostic mode preserves its error
+    record; strict mode NEVER turns an unresolved provider/inverse failure
+    into a false-pole classification. No microscopic face crosses the host.
+    """
+    from common.collectives import rank0_transaction
+    started=time.monotonic();base_elapsed=float(record.get('elapsed_seconds',0.))
+    basic=_general_dielectric_basic(raw,operators,record)
     root = Path(root)
     basic_path = root / f'q_{int(record["q"]):03d}_dielectric_{index:02d}_basic.json'
     def save_basic():
@@ -256,13 +279,10 @@ def _save_general_dielectric_probe(raw, operators, record, *, root, index):
         basic_path.write_text(_json(basic))
     rank0_transaction(basic_path, stage='shared_general.dielectric_basic', write=save_basic)
     try:
-        eps, inverse = dyson.dielectric(h, raw)
-        metrics = {k: float(v) for k, v in inverse_metrics(eps, jnp.asarray(mask), inverse).items()}
-        bounds = dielectric_inverse_bounds(metrics['epsilon_fro'], metrics['inverse_fro'],
-            metrics['inverse_residual_fro'], int(mask.sum()),
-            padding_defect=max(metrics['padding_defect'], metrics['inverse_padding_defect']))
-        result = dict(basic, **metrics, inverse_bounds=bounds)
+        result=_general_dielectric_inverse(raw,operators,basic)
     except Exception as error:
+        if strict:
+            raise
         result = dict(basic, inverse_error=str(error))
     result['elapsed_seconds'] = base_elapsed+time.monotonic()-started
     inverse_path = root / f'q_{int(record["q"]):03d}_dielectric_{index:02d}_inverse.json'
@@ -271,7 +291,8 @@ def _save_general_dielectric_probe(raw, operators, record, *, root, index):
             raise FileExistsError(inverse_path)
         inverse_path.write_text(_json(result))
     rank0_transaction(inverse_path, stage='shared_general.dielectric_inverse', write=save_inverse)
-    return dict(dielectric_basic_file=basic_path.name, dielectric_inverse_file=inverse_path.name)
+    files=dict(dielectric_basic_file=basic_path.name, dielectric_inverse_file=inverse_path.name)
+    return dict(files,witness=result) if strict else files
 
 
 def _general_current_site_samples(current, sites, *, scalar_cache, begin, end,
@@ -434,279 +455,400 @@ def _save_equilibrium_owner_failure(pencils, grams, ids, error, capture):
     return str(path)
 
 
-def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapshot,
-                                 run_dir, label, fit_basis=None, print_fn=print):
-    """Full microscopic instantaneous-rho W, with general shared frequency poles.
+def _general_initial_supports(sites,fit_positions):
+    """Record incumbent parity/mirror choices without changing old samples."""
+    supports=[]
+    for training_index,i in enumerate(fit_positions):
+        side='R' if training_index%2 else 'L'
+        base=dict(sample_index=int(i),side=side,z_ry=complex(sites[i]),
+            panel_id=f'initial:{i}',direction_key=int(i),primary_side=side,
+            sample_crossing=False,direction_crossing=False)
+        supports.append(base)
+        if sites[i].real!=0:
+            supports.append(dict(base,side='L' if side=='R' else 'R',
+                z_ry=-complex(sites[i]).conjugate(),panel_id=f'initial:{i}:mirror',
+                sample_crossing=True,direction_crossing=True))
+    return supports
 
-    ``snapshot`` supplies ``U_active[k,a,a]``, ``E_active_ry[k,a]``,
-    ``rho_active[k,a,a]`` in that instantaneous basis, ``active_slice`` and
-    optional full ``energy_ry[k,b]``. ``gamma_ry`` is the declared lag decay;
-    ``eta_ry`` is the electronic retarded evaluation height. Every native
-    centroid, screening band and full-grid q is retained. Native support,
-    direction-width and pole-budget controls come from the source recipe,
-    never from the projected TD prototype's rank/order controls.
 
-    General tangential interpolation has independent full-port factors and
-    unchanged complex poles. Opposite q models are related algebraically;
-    self-negative q models use an explicit half-weight crossing mixture.
-    ``fit_basis`` optionally holds only interpolation directions/reduction
-    spaces within one inner Hamiltonian solve. Current response, residues,
-    collective poles and all held checks are recomputed on every call.
-    ``response_partition='full'`` opts into an exact merged endpoint product;
-    the default ``'blocks'`` keeps FF/FA/AF/AA numerical quadrature separate.
-    An exact binary, commuting, globally noninverted reference on the full
-    grid or a nonnegative Fejer q mixture selects a same-state definite H
-    realization. Native PSD V, current metric/null/output and all final W
-    checks remain required; negative H is not repaired. Coherent refreshes
-    return to the independent general realization and may still refuse.
+def _general_refinement_identity(current):
+    """Bind the CURRENT small state and device-digested physical operands.
 
-    Explicit ``direct_dielectric_probe={q: 0, z_ry: [real, imag]}`` evaluates
-    only that current microscopic response and commits native dielectric
-    witnesses, then raises an UNADMITTED diagnostic stop before any fit/Σ.
+    Digest reductions read no host mu payload and do not retain ephemeral
+    faces. Contiguous E/rho use memoryviews; strided views use bounded chunks.
     """
-    import copy
+    from common.contract_bands import merge_spin_centroid
+    from .response_bank import operator_digest
+    def digest(value):
+        value=np.asarray(value)
+        result=hashlib.sha256()
+        if value.flags.c_contiguous:
+            result.update(memoryview(value))
+        else:
+            for chunk in np.nditer(value,flags=['external_loop','buffered','zerosize_ok'],
+                    op_flags=['readonly'],order='C',buffersize=65536):
+                result.update(memoryview(np.ascontiguousarray(chunk)))
+        return result.hexdigest()
+    snapshot=current['snapshot'];meta=current['meta'];mesh=current['mesh_xy']
+    active=snapshot['active_slice']
+    if not isinstance(active,slice):active=slice(*active)
+    identity=dict(energies=digest(current['energy']),occupations=digest(current['rho']),
+        U_active=digest(snapshot['U_active']),
+        wavefunctions=operator_digest(merge_spin_centroid(current['pm'],1,2),mesh,cache=False),
+        bare_coulomb=operator_digest(current['V'],mesh,cache=False),
+        centroids=digest(meta.mu_basis.canonical_indices),
+        centroid_packing=digest(meta.mu_basis.layout.axis.packed_to_canonical),
+        electronic_grid=list(current['grid']),response_grid=list(current['qgrid']),
+        active_bands=[active.start,active.stop],
+        response_window=current['response_window'],gamma_ry=current['gamma'],eta_ry=current['eta'],
+        source_recipe_hash=current['recipe']['source_recipe_hash'],
+        recipe_hash=current['recipe']['recipe_hash'],
+        policy='native-current-data-refinement-v1')
+    return hashlib.sha256(_json(identity).encode()).hexdigest(),identity
+
+
+def _general_refinement_selected(snapshot, *, definite, direct_request):
+    """Native joint opt-in never changes the exact EQ or diagnostic member."""
+    selected=snapshot.get('general_refinement',False)
+    if not isinstance(selected,bool):
+        raise ValueError('GATE shared_general_refinement: explicit boolean selection required')
+    return selected and not definite and direct_request is None
+
+
+def _general_refinement_phases(current,prefix):
+    """Keep each round/probe's phase names unique while reusing the stage."""
+    phase_start={}
+    def begin(name):
+        phase_start[name]=time.monotonic()
+        current['begin'](prefix+'_'+name)
+    def end(name,operands=None):
+        current['end'](prefix+'_'+name,operands)
+        phase_start.pop(name)
+    return begin,end,phase_start
+
+
+def _general_refinement_provider_receipt(current,sites,rules,memory_start):
+    """Authenticate actual native admissions and all consumed public rules."""
+    rows=current['response_execution']['memory'][memory_start:]
+    native=bool(rows) and all(row.get('device_budget_status')=='PASS' for row in rows)
+    tolerance=float(current['recipe']['bank_rule_tolerance'])
+    certified=bool(rules) and all(np.isfinite(rule['sampled_error'])
+        and 0<=rule['sampled_error']<=tolerance for rule in rules)
+    if not native or not certified:
+        raise ValueError('GATE shared_general_refinement_provider: actual native admission and public scalar certificates required')
+    return dict(state_digest=current['state_digest'],sites_ry=np.asarray(sites),
+        native_capacity_admitted=native,scalar_rules_certified=certified,
+        native_dispatch_count=len(rows),maximum_scalar_bound=max(r['sampled_error'] for r in rules))
+
+
+def _save_general_refinement_round(current,attempt,record):
+    """Commit bounded scalar provenance on the agreed normal control path."""
+    from common.collectives import rank0_transaction
+    path=Path(current['run_dir'])/f"{current['label']}_general_refinement"/f'round_{attempt:02d}.json'
+    payload=_json(dict(record,state_digest=current['state_digest'],admitted=False,
+        scope='intermediate current-data refinement; final full-W gates still required'))
+    if len(payload.encode())>1024**2:
+        raise ValueError('GATE shared_general_refinement_storage: scalar round receipt exceeds 1MiB')
+    def save():
+        path.parent.mkdir(parents=True,exist_ok=True)
+        if path.exists():raise FileExistsError(path)
+        path.write_text(payload)
+    rank0_transaction(path,stage='shared_general.refinement_round',write=save)
+
+
+@lru_cache(maxsize=16)
+def _general_refinement_programs(mesh_xy,nq,pole_index,q,row_extent):
+    """Admitted runtime-factor norms and narrow residue directions, no host mu."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from lxkit import ordered_norm
+    from .shared_pole_refinement import residue_aligned_directions
+    face=NamedSharding(mesh_xy,P(None,'x','y'))
+    rep=NamedSharding(mesh_xy,P())
+    columns=NamedSharding(mesh_xy,P(None,'y'))
+    @partial(jax.jit,in_shardings=(face,face),out_shardings=(columns,columns))
+    def norms(left,right):
+        return (ordered_norm(left,axis=-2,mesh=mesh_xy,spec=face.spec),
+                ordered_norm(right,axis=-2,mesh=mesh_xy,spec=face.spec))
+    @partial(jax.jit,in_shardings=(face,face,rep),out_shardings=(face,face,face,face))
+    def panels(left,right,minus):
+        port_norm=lambda a:ordered_norm(a,axis=-2,keepdims=True,
+            mesh=mesh_xy,spec=P(None,'x',None))
+        left,right=residue_aligned_directions(left,right,pole_index,port_norm=port_norm)
+        selector=(jnp.arange(nq)==q)[:,None,None]
+        left=jnp.where(selector,left[0][None],0.)
+        right=jnp.where(selector,right[0][None],0.)
+        left=jnp.pad(left,((0,0),(0,0),(0,row_extent-1)))
+        right=jnp.pad(right,((0,0),(0,0),(0,row_extent-1)))
+        return left,right,jnp.conj(left[minus]),jnp.conj(right[minus])
+    return norms,panels
+
+
+def _general_support_panels(current,samples,directions,*,eigh_plan,column_extent):
+    """Build/reuse CURRENT explicit-side actions; no old response rerun."""
+    import jax.numpy as jnp
+    import distrib_la
+    mm=current['mm'];recipe=current['recipe'];minus=current['minus']
+    actions=current.setdefault('support_actions',{})
+    left,right=[],[]
+    for support in samples['supports']:
+        panel=support['panel_id'];i=support['sample_index'];side=support['side']
+        if panel not in actions:
+            w=samples['values'][i]
+            if support.get('sample_crossing',False):w=jnp.conj(w[minus])
+            if 'candidate_index' in support:
+                q=current['refinement_panels'][panel]
+            else:
+                key=support['direction_key']
+                if key not in directions:
+                    source=samples['values'][i]
+                    if support['primary_side']=='L':source=current['adjoint_program'](source)
+                    width=(int(recipe['imaginary_width']) if samples['sites'][i].real==0
+                        else int(recipe.get('line_direction_cap') or current['nmu']))
+                    directions[key],_=distrib_la.right_singular_vectors(source,
+                        float(recipe['direction_cutoff']),eigh_plan=eigh_plan,column_extent=column_extent,
+                        max_rank=width,multiplet_tol=float(recipe['multiplet_relative_tolerance']))
+                q=directions[key]
+                if support.get('direction_crossing',False):q=jnp.conj(q[minus])
+            action=mm(w,q) if side=='R' else mm(q,w,transa='C')
+            actions[panel]=(q,action)
+        q,action=actions[panel]
+        (right if side=='R' else left).append((complex(support['z_ry']),q,action))
+    return left,right
+
+
+def _general_refinement_reserve(current,fitted,round_index):
+    """Reserve bounded NEW data before norms/probes/panels; old data stay live."""
+    from .shared_pole_refinement import MAX_REFINEMENT_POLES
+    ledger=current['capacity'];ledger.at_phase()
+    nq,nmu=current['nq'],current['nmu'];mesh=current['mesh_xy'];ranks=int(mesh.size)
+    width=int(mesh.shape['y']);added_panels=4*MAX_REFINEMENT_POLES*width
+    nl,nr=fitted['nl'],fitted['nr']
+    dl=dr=added_panels//2
+    stored=6*MAX_REFINEMENT_POLES  # Three physical sites and their q-cross images.
+    resident=16*nq*stored*nmu*nmu//ranks
+    resident+=64*nq*nmu*added_panels//ranks
+    resident+=32*nq*((nl+dl)*(nr+dr)-nl*nr)//ranks
+    resident+=32*sum(len(b[2]) for b in fitted['banks'].values())//max(1,width)
+    upstream=tuple(ledger.live_stages)
+    prefix=f"general_refinement_{current['label']}_{round_index}"
+    held=ledger.reserve(prefix+'_retained',resident_bytes_per_rank=resident,
+        workspace_bytes_per_rank=0,concurrent_with=upstream)
+    work=ledger.reserve(prefix+'_workspace',resident_bytes_per_rank=0,
+        workspace_bytes_per_rank=16*(MAX_REFINEMENT_POLES*nq+8)*nmu*nmu//ranks,
+        concurrent_with=upstream+(held['stage'],))
+    ledger.live_stages=upstream+(held['stage'],work['stage'])
+    return dict(retained=held,workspace=work,upstream=upstream,
+        max_new_physical_sites=3*MAX_REFINEMENT_POLES,max_new_stored_sites=stored)
+
+
+def _general_current_refinement(current,state):
+    """At most TWO native current-data refits; never repair/drop a pole."""
+    import jax
+    import jax.numpy as jnp
+    from common.collectives import gather_to_host,device_put_process_local
+    from .shared_pole_refinement import (MAX_REFINEMENT_ROUNDS,general_refinement_candidates,
+        general_refinement_preflight,general_refinement_targets,
+        evaluate_general_refinement,authenticate_false_pole)
+    meta=current['meta'];mesh=current['mesh_xy'];nq=current['nq']
+    coords=np.unravel_index(np.arange(nq),current['qgrid'])
+    minus=np.ravel_multi_index(tuple((-c)%n for c,n in zip(coords,current['qgrid'])),current['qgrid'])
+    execute=current['execute_response'];reports=[]
+    for attempt in range(MAX_REFINEMENT_ROUNDS+1):
+        begin,end,_=_general_refinement_phases(current,f'refinement_fit_{attempt:02d}')
+        fit_current=dict(current,begin=begin,end=end)
+        geometry=dict(sites_ry=[[float(z.real),float(z.imag)] for z in state['sites']],
+            fit_positions=state['fit_positions'],held_positions=state['held_positions'],
+            supports=state['supports'],policy='distinct-LR-same-side-crossing-v1')
+        current['recipe']['general_support_geometry']=geometry
+        current['recipe']['general_gates']['support_geometry_hash']=hashlib.sha256(_json(geometry).encode()).hexdigest()
+        current['recipe']['gate_hash']=hashlib.sha256(_json(current['recipe']['general_gates']).encode()).hexdigest()
+        fitted=_general_current_fit(fit_current,state,defer_admission=True)
+        # Only this snapshot's actions/moments are carried to the next fit.
+        for key in ('support_actions','moments'):
+            if key in fit_current:current[key]=fit_current[key]
+        growing=[q for q,bank in fitted['banks'].items() if
+            np.max(bank[2].imag,initial=-np.inf)>=min(current['eta'],float(np.min(state['sites'].imag)))-1e-12]
+        if not growing:
+            failures=[r for r in fitted['checks'] if not np.isfinite(r['error']) or r['error']>current['tolerance']]
+            if failures:
+                raise ValueError(f"GATE shared_general_held_w: refined full-W checks failed: {failures[:1]}")
+            fitted['refinement_receipts']=reports
+            return fitted,state
+        if attempt==MAX_REFINEMENT_ROUNDS:
+            _save_general_refinement_round(current,attempt,dict(status='REFUSED_BOUNDED_REFINEMENT',
+                growing_q=growing,poles=fitted['receipts'],checks=fitted['checks']))
+            raise ValueError('GATE shared_general_laplace: bounded two-round current refinement exhausted')
+        capacity=_general_refinement_reserve(current,fitted,attempt)
+        # A solve-bearing owner binds its numerical room at construction.
+        # Rebind AFTER added reservations, never reuse the pre-round LU room.
+        current['dyson']=current['refresh_dyson']()
+        current['sample_current']['dyson']=current['dyson']
+        metadata=[]
+        for q in range(nq):
+            l,r,p=fitted['banks'][q]
+            norms,_=_general_refinement_programs(mesh,nq,0,q,int(mesh.shape['y']))
+            ln,rn=execute(norms,(l,r),'direct')
+            bound=np.asarray(gather_to_host(ln*rn)).reshape(-1)
+            metadata.append(dict(poles_ry=p,residue_norm_bound=bound))
+        candidates=general_refinement_candidates(metadata,minus,current['eta'],
+            state_digest=state['state_digest'],round_index=attempt,
+            support_height_ry=float(np.min(state['sites'].imag)))
+        if not candidates:
+            raise ValueError('GATE shared_general_laplace: unresolved growing model has no observable refinement candidate')
+        general_refinement_preflight(candidates,state['sites'],state_digest=state['state_digest'],
+            eta_ry=current['eta'],existing_supports=state['supports'])
+        raw_cache={};witnesses=[]
+        scalar_cache={};round_rules=[]
+        memory_start=len(current['response_execution']['memory'])
+        for ci,candidate in enumerate(candidates):
+            z=candidate['z_ry'];q=candidate['q']
+            if z not in raw_cache:
+                begin,end,starts=_general_refinement_phases(current,f'refinement_{attempt:02d}_probe_{ci:02d}')
+                sampled=_general_current_site_samples(current['sample_current'],np.asarray([z]),
+                    scalar_cache={},begin=begin,end=end,
+                    phase_start=starts,print_fn=current['print_fn'],evaluate_dyson=False)
+                raw_cache[z]=sampled['values'][0]
+                round_rules.extend(dict(rule,refinement_round=attempt,
+                    microscopic_sites_ry=[[float(z.real),float(z.imag)]]) for rule in sampled['rules'])
+                del sampled
+            raw=raw_cache[z]
+            root=Path(current['run_dir'])/f"{current['label']}_general_refinement"/f'round_{attempt:02d}'
+            saved=_save_general_dielectric_probe(raw[q:q+1],
+                dict(dyson=current['dyson'],H=current['H'][q:q+1],matmul=current['mm'],
+                    face=current['face'],rep=current['rep'],mask=meta.mu_basis.active_mask),
+                dict(q=q,z_ry=[float(z.real),float(z.imag)],at_requested_site=True,
+                    state_digest=state['state_digest'],gamma_ry=current['gamma']),
+                root=root,index=ci,strict=True)
+            witness=saved['witness']
+            authenticate_false_pole(candidate,witness,state_digest=state['state_digest'],gamma_ry=current['gamma'])
+            witnesses.append(witness)
+        plan=general_refinement_targets(candidates,witnesses,state['sites'],
+            state_digest=state['state_digest'],gamma_ry=current['gamma'],eta_ry=current['eta'],
+            existing_supports=state['supports'])
+        def evaluate(sites):
+            missing=[z for z in map(complex,sites) if z not in raw_cache]
+            new={}
+            if missing:
+                begin,end,starts=_general_refinement_phases(current,f'refinement_{attempt:02d}_targets')
+                sampled=_general_current_site_samples(current['sample_current'],np.asarray(missing),
+                    scalar_cache=scalar_cache,begin=begin,end=end,
+                    phase_start=starts,print_fn=current['print_fn'])
+                new.update(zip(missing,sampled['values']))
+                round_rules.extend(dict(rule,refinement_round=attempt,
+                    microscopic_sites_ry=[[float(z.real),float(z.imag)] for z in missing])
+                    for rule in sampled['rules'])
+            for z in sites:
+                if complex(z) in raw_cache:
+                    new[complex(z)]=current['dyson'].value(current['H'],raw_cache[complex(z)])
+            return [new[complex(z)] for z in sites],_general_refinement_provider_receipt(
+                current,sites,round_rules,memory_start)
+        extended=evaluate_general_refinement(state,plan,evaluate_current=evaluate,
+            crossing=lambda value:jnp.conj(value[minus]))
+        panels=current.setdefault('refinement_panels',{})
+        for ci,candidate in enumerate(candidates):
+            l,r,_=fitted['banks'][candidate['q']]
+            _,program=_general_refinement_programs(mesh,nq,candidate['pole_index'],candidate['q'],int(mesh.shape['y']))
+            args=(l,r,device_put_process_local(minus,current['rep']))
+            lp,rp,lm,rm=execute(program,args,'direct')
+            for support in plan['supports']:
+                if support['candidate_index']!=ci:continue
+                pair=(lp,lm) if support['residue_factor']=='left' else (rp,rm)
+                panels[support['panel_id']]=pair[int(support['direction_crossing'])]
+        # Descriptor axes grow. Old general SVD spaces cannot be silently
+        # reinterpreted; equilibrium column selectors are a separate family.
+        current['fit_basis'].setdefault('spaces',{}).clear()
+        reports.append(dict(round=attempt,plan=plan,capacity=capacity,
+            previous_reduced_shape=[fitted['nl'],fitted['nr']],
+            exact_point_witnesses=witnesses,all_original_samples_retained=True))
+        _save_general_refinement_round(current,attempt,dict(reports[-1],
+            status='CURRENT_SAMPLES_EXTENDED_NOT_YET_REFITTED',
+            incremental_evaluation=extended['incremental_evaluation_receipt']))
+        current.setdefault('incremental_rules',[]).extend(round_rules)
+        jax.block_until_ready(extended['values'])
+        state=extended
+        del raw_cache,fitted,l,r,lp,rp,lm,rm,args,raw
+        current['capacity'].live_stages=capacity['upstream']+(capacity['retained']['stage'],)
+    raise AssertionError('unreachable bounded refinement loop')
+
+
+def _general_current_fit(current, samples, *, defer_admission=False):
+    """Existing current directions/pencil/canonical lift/check stage.
+
+    Runtime samples and CURRENT moments are retained verbatim across bounded
+    refinement rounds. Default admission/error order is unchanged.
+    """
     import math
     import sys
     import jax
     import jax.numpy as jnp
     import distrib_la
-    import minimax
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    from ffi import ffi_dial_key
     from common.collectives import device_put_process_local, gather_to_host, rank0_transaction
-    from common.contract_bands import merge_spin_centroid
-    from symmetry_maps import QirrOperator
-    from .wavefunction_bundle import rotate_wavefunctions
-    from .greens_function_kernel import density_left_endpoint
-    from .centroid_k_unfold import authenticate_canonical_full_grid
-    from .response_bank import (full_density_sample_rules, full_density_bare_moments,
-                                 _coulomb_algebra, dense_layout, response_algebra,
-                                 operator_digest, _bank_execution)
+    from .response_bank import full_density_sample_rules, full_density_bare_moments
     from .w_isdf import full_density_response_stream
-    from .shared_pole_directions import _sample_point
-    from .shared_pole_execution import face_matmul
     from .shared_pole_pencil import tile_join, join_vectors
-    from .shared_pole_constructor import (general_pencil_batch_plan, collective_general_pencil_batch,
-                                          general_pencil_workspace_bytes,
-                                          EQUILIBRIUM_METRIC_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
-    from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
-    from types import SimpleNamespace
-    from file_io.shared_pole_store import write_general_shared_pole_model
-    started = time.monotonic()
-    direct_request = _direct_dielectric_request(snapshot)
-    response_partition = snapshot.get('response_partition', 'blocks')
-    phases, phase_start = {}, {}
-    def begin(name):
-        phase_start[name] = time.monotonic()
-        if jax.process_index() == 0:
-            print_fn(f"General shared-pole W [{label}] BEGIN {name}")
-            sys.stdout.flush()
-    def end(name, operands=None):
-        if operands is not None:
-            jax.block_until_ready(operands)
-        phases[name] = time.monotonic()-phase_start.pop(name)
-        if jax.process_index() == 0:
-            print_fn(f"General shared-pole W [{label}] END {name} {phases[name]:.3f}s")
-            sys.stdout.flush()
-    begin("setup")
-    current_meta = copy.copy(meta)
-    source_recipe = current_meta.shared_pole_recipe
-    if fit_basis is None or direct_request is not None:
-        fit_basis = {}
-    previous_direction_bytes = sum(a.size*a.dtype.itemsize
-        for key in ('directions', 'equilibrium_directions') for a in fit_basis.get(key, {}).values())
-    nk = int(meta.nk_tot)
-    grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
-    qgrid = tuple(int(n) for n in (getattr(meta, "qgrid", None) or grid))
-    response_window = getattr(meta, "qgrid_response_window", "sharp")
-    nq = int(np.prod(qgrid))
-    sym = getattr(meta, "q_sym", sym)
-    if not np.array_equal(np.asarray(sym.q_irr_full_idx), np.arange(nq)):
-        raise ValueError("GATE shared_general_full_q: every current q must be an explicit parent")
-    qcoords = np.asarray(sym.q_irr_kgrid_int)
-    canonical_qcoords = np.indices(qgrid).reshape(3, -1).T
-    if (qcoords.shape != (nq, 3) or qcoords.dtype.kind not in "iu"
-            or not np.array_equal(qcoords % np.asarray(qgrid), canonical_qcoords)):
-        raise ValueError("GATE shared_general_full_q: canonical unshifted bosonic q coordinates required")
-    active = snapshot["active_slice"]
-    if not isinstance(active, slice):
-        active = slice(*active)
-    energy = np.asarray(snapshot.get("energy_ry", gather_to_host(wfns.enk)), float).copy()
-    energy[:, active] = np.asarray(snapshot["E_active_ry"], float)
-    occupations = np.asarray(gather_to_host(wfns.occ), float)
-    rho = np.eye(energy.shape[1], dtype=complex)[None]*occupations[:, :, None]
-    rho[:, active, active] = np.asarray(snapshot["rho_active"], complex)
-    if (not np.isfinite(rho).all() or np.max(abs(rho-rho.conj().swapaxes(-1, -2))) > 1e-10):
-        raise ValueError("GATE shared_general_density: finite Hermitian full density required")
-    stop = min(int(meta.b_id_4_chi_user), int(wfns.slices.b4_logical))-int(wfns.slices.b0)
-    if int(wfns.slices.b0) != 0 or stop < active.stop:
-        raise ValueError("GATE shared_general_bands: complete screening support must contain active window")
-    equilibrium = _equilibrium_definite_eligibility(energy, rho, stop, grid, qgrid, response_window)
-    definite = equilibrium['eligible']
-    representation = 'equilibrium-definite-same-state' if definite else 'general-two-sided-full-density'
-    gamma = float(snapshot.get("gamma_ry", snapshot.get("adiabatic_ry", 0)))
-    current = rotate_wavefunctions(wfns, jnp.asarray(snapshot["U_active"]),
-        enk_active_new=jnp.asarray(energy[:, active]), enk_base=jnp.asarray(energy),
-        efermi=None, mesh_xy=mesh_xy, active_slice=active, occupations=occupations)
-    census = meta.shared_pole_census
-    bind_shared_pole_census(current, current_meta,
-        occupation_state=SimpleNamespace(f_kn=np.real(rho.diagonal(axis1=-2, axis2=-1)),
-            mu_ry=float(census["mu_ry"]), smearing_family="instantaneous-full-density-diagonal-census",
-            smearing_width_ry=0.0),
-        trs_allowed=False, state_capacity=float(census["state_capacity"]),
-        kweights=np.asarray(census["k_weights"]))
-    resolved = resolve_shared_pole_recipe(config, current, current_meta, mesh_xy=mesh_xy,
-        print_fn=print_fn, support_reads_ev=snapshot.get("support_reads_ev", source_recipe["support_reads_ev"]))
-    # Geometry and selection are numerical spaces held only within this
-    # physical refresh. Current census and scientific identity stay current.
-    recipe = dict(fit_basis.setdefault("recipe", resolved), census=current_meta.shared_pole_census)
-    general_gates = dict(version="full-density-general-shared-pole-gates-v6",
-        source_policy_version=recipe.get("recipe_version", recipe.get("version")),
-        scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
-        numerical_response_rule='analytic-denominator-box-values-only-v1',
-        numerical_response_carrier=int(minimax.RESPONSE_NODE_CAPACITY),
-        response_partition=response_partition,
-        eta_training_verification='active_span_3train_2interlaced_held_v1',
-        numerical_spaces='two-sided-descriptor-svd',
-        eigensolver='current-descriptor-balanced-ordinary-geev',
-        frequency_equilibration='unit-aware-combined-pencil-Ruiz-infinity-8',
-        frequency_scale='max_current_full_requested_energy_span_eta',
-        descriptor_rank_tolerance=float(recipe['bank_rule_tolerance']),
-        full_microscopic_support=True, finite_density_and_residues=True,
-        scalar_rule_tolerance=float(recipe["bank_rule_tolerance"]),
-        full_matrix_fit_held_tolerance=float(snapshot.get("fit_tolerance", .02)),
-        modal_reconstruction_tolerance=1e-9, laplace_margin_ry=1e-12,
-        capacity="explicit-full-map-and-host-pencil-bound", store="sha256-complete-full-q")
-    if definite:
-        general_gates.update(numerical_spaces='original-column-selector-P_I-v1',
-            eigensolver='current-positive-H-extended-Cholesky-Hermitian-eigh',
-            metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
-            common_state_selection='original-state-joint-RRQR-v1',
-            frequency_equilibration='positive-diagonal-common-H-congruence',
-            equilibrium_definite=equilibrium)
-    recipe.update(source_recipe_hash=recipe["recipe_hash"], source_passive_gate_hash=recipe["gate_hash"],
-        source_passive_gate_version=recipe["gate_version"], gate_version=general_gates["version"],
-        construction_representation=representation,
-        inherited_passive_gram_and_passivity="NOT_APPLICABLE", general_gates=general_gates,
-        gate_hash=hashlib.sha256(_json(general_gates).encode()).hexdigest())
-    recipe["recipe_hash"] = hashlib.sha256(_json({k:v for k,v in recipe.items() if k != "recipe_hash"}).encode()).hexdigest()
-    current_meta.shared_pole_recipe = recipe
-    current_meta.shared_pole_capacity.live_stages = ()
-    carrier = current.green_parent
-    if carrier is None or carrier.psi_mun.shape[0] != nk:
-        raise ValueError("GATE shared_general_full_k: explicit full-grid wavefunction parents required")
-    plan = carrier.plan
-    if (not np.array_equal(np.asarray(plan.irr_idx), np.arange(nk))
-            or plan.parent_full_rows is None
-            or not np.array_equal(np.asarray(plan.parent_full_rows), np.arange(nk))):
-        raise ValueError("GATE shared_general_full_k: native flat-grid identity row order required")
-    grid_receipt = authenticate_canonical_full_grid(
-        plan, grid, sym=sym if qgrid == grid else None)
-    grid_receipt.update(response_grid=list(qgrid), n_q=nq, response_q_order="canonical-C")
-    pm, pn = carrier.psi_mun, carrier.psi_nmu
-    layout = carrier.layout
-    ns, nmu, nb = map(int, pm.shape[1:])
-    # Carrier padding/out-of-chi bands are exact-zero operands, not a band
-    # cutoff chosen for this algorithm. All requested physical chi bands stay.
-    band_mask = jnp.arange(nb) < stop
-    pm, pn = pm*band_mask[None, None, None], pn*band_mask[None, :, None, None]
-    rho[:, stop:, :] = 0; rho[:, :, stop:] = 0
-    v = QirrOperator.of(V_q)
-    if not v.is_whole_zone() or v.n_full != nq:
-        raise ValueError("GATE shared_general_full_q: full native Coulomb operator required")
-    V = v.at_rows(np.arange(nq))
-    face = NamedSharding(mesh_xy, P(None, "x", "y"))
-    rep = NamedSharding(mesh_xy, P())
-    mm = face_matmul(mesh_xy)
-    pencil_program, infinity_program, adjoint_program, normal_program = _general_frequency_programs(
-        mesh_xy, face.spec, ffi_dial_key())
-    if definite:
-        common_program, output_gram_program = _equilibrium_frequency_programs(
-            mesh_xy, face.spec, ffi_dial_key())
-    fit_ids, held_ids = list(map(int, recipe["fit_ids"])), list(map(int, recipe["held_ids"]))
-    sites = np.asarray([_sample_point(recipe, i) for i in fit_ids+held_ids], complex)
-    # Fit the observed continuation scale, while keeping independent
-    # interlaced holds and EVERY original native fit/held position intact.
-    eta = float(snapshot["eta_ry"])
-    if direct_request is None:
-        sites,verification_geometry=active_eta_verification_sites(sites,energy,active,eta,
-            native_fit_count=len(fit_ids))
-        fit_positions=verification_geometry['fit_positions']
-        held_positions=verification_geometry['held_positions']
-    else:
-        sites = np.asarray([direct_request['z_ry']], complex)
-        fit_positions, held_positions = [], []
-        verification_geometry = dict(scope='UNADMITTED one-site microscopic dielectric diagnostic',
-            q=0, sites_ry=[[float(sites[0].real), float(sites[0].imag)]])
-    recipe['general_support_geometry']=dict(sites_ry=[[float(z.real),float(z.imag)] for z in sites],
-        fit_positions=fit_positions,held_positions=held_positions,
-        training_width_policy='native imaginary_width / line_direction_cap by support type')
-    widths = [int(recipe["imaginary_width"]) if z.real == 0 else
-              int(recipe.get("line_direction_cap") or nmu) for z in sites[fit_positions]]
-    recipe['general_support_geometry']['training_widths']=widths
-    general_gates['support_geometry_hash']=hashlib.sha256(_json(recipe['general_support_geometry']).encode()).hexdigest()
-    recipe['gate_hash']=hashlib.sha256(_json(general_gates).encode()).hexdigest()
-    recipe['recipe_hash']=hashlib.sha256(_json({k:v for k,v in recipe.items() if k!='recipe_hash'}).encode()).hexdigest()
-    side_bound = sum(extent for z, extent in zip(sites[fit_positions], widths) if z.real != 0)
-    if direct_request is None:
-        side_bound += sum(widths)+2*int(recipe["infinity_width"])
-    ranks = int(mesh_xy.size)
-    query_q_ids = np.arange(nq) if direct_request is None else np.asarray([0])
-    query_count = len(query_q_ids)
-    bank_bytes = 16*query_count*len(sites)*nmu*nmu//ranks
-    action_bytes = 16*query_count*4*nmu*side_bound//ranks
-    pencil_bytes = (48 if definite else 32)*query_count*side_bound*side_bound//ranks
-    green_bytes = 16*nk*(ns*nmu)**2*6//ranks
-    dielectric_bytes = 0 if direct_request is None else 16*(nq+8)*nmu*nmu//ranks
-    price = current_meta.shared_pole_capacity.reserve("general_full_map",
-        resident_bytes_per_rank=bank_bytes+action_bytes+pencil_bytes,
-        workspace_bytes_per_rank=green_bytes+bank_bytes+dielectric_bytes)
-    current_meta.shared_pole_capacity.live_stages = (price["stage"],)
-    # Same executable/native-scratch admission as the equilibrium bank. The
-    # full-map reservation above owns the retained response and panel carry;
-    # each dispatch measures its actual TWO-left/common-right operands.
-    response_execution = dict(seconds={}, memory=[], compiled=[])
-    execute_response = _bank_execution(current_meta, mesh_xy, response_execution, config)
-    ph = density_left_endpoint(mesh_xy, pm.shape, layout=layout)(pm, jnp.asarray(rho))
-    energy_d = jnp.asarray(energy)
-    H, inverse, negative, support = _coulomb_algebra(mesh_xy, nmu, int(meta.n_rmu),
-                              dense_layout(meta, config, mesh_xy, nmu))(V)
-    # The inverse/support are not used by this builder. Do not keep an
-    # otherwise dead full-port inverse live through response and reduction.
-    del inverse, support
-    if bool(jnp.any(negative)):
-        raise ValueError("GATE shared_general_coulomb: bare V has resolved negative spectrum")
-    dyson, _, _, algebra = response_algebra(current_meta, config, mesh_xy=mesh_xy, n=nmu, ordered=True)
-    tolerance = float(snapshot.get("fit_tolerance", .02))
-    if len(fit_ids) < 4:
-        raise ValueError("GATE shared_general_supports: at least four native fitted supports required")
-    end("setup", (ph, H))
-    sample_current=dict(energy=energy,rho=rho,occupations=occupations,active=active,
-        response_active=snapshot.get('response_active_slice',active),stop=stop,nb=nb,
-        response_partition=response_partition,gamma=gamma,recipe=recipe,label=label,
-        pm=pm,ph=ph,pn=pn,energy_d=energy_d,mesh_xy=mesh_xy,grid=grid,qgrid=qgrid,
-        nk=nk,nmu=nmu,ns=ns,layout=layout,response_window=response_window,
-        query_q_ids=query_q_ids,plan=plan,execute_response=execute_response,dyson=dyson,H=H)
-    sampled=_general_current_site_samples(sample_current,sites,
-        scalar_cache=fit_basis.setdefault('scalar_rules',{}),begin=begin,end=end,
-        phase_start=phase_start,print_fn=print_fn,evaluate_dyson=direct_request is None)
-    rules,blocks,response_active=(sampled[k] for k in ('rules','blocks','response_active'))
-    if direct_request is not None:
-        z = direct_request['z_ry']
-        root = Path(run_dir)/f'{label}_general_shared_pole'
-        record = dict(q=0, z_ry=[float(z.real), float(z.imag)], at_requested_site=True,
-            gamma_ry=gamma, scalar_rule_tolerance=float(recipe['bank_rule_tolerance']),
-            prefactor=float(algebra['prefactor']), status='UNADMITTED_DIRECT_DIELECTRIC',
-            phase_seconds=dict(phases), grid=grid_receipt,
-            response_active_bands=[response_active.start, response_active.stop], screening_bands=stop)
-        _save_general_dielectric_probe(sampled['values'][0],
-            dict(dyson=dyson, H=H[:1], matmul=mm, face=face, rep=rep,
-                 mask=meta.mu_basis.active_mask), record, root=root, index=0)
-        raise RuntimeError('GATE shared_general_dielectric_diagnostic_stop: UNADMITTED q=0 one-site '
-                           f'microscopic dielectric witnesses retained at {root}; no fitted W or Sigma')
-    values=sampled['values']
-    del sampled
-    sample_wall = time.monotonic()-started
+    from .shared_pole_constructor import (general_pencil_batch_plan,
+        collective_general_pencil_batch, general_pencil_workspace_bytes,
+        EQUILIBRIUM_METRIC_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
+    H=current['H']
+    V=current['V']
+    adjoint_program=current['adjoint_program']
+    algebra=current['algebra']
+    begin=current['begin']
+    blocks=current['blocks']
+    carrier=current['carrier']
+    common_program=current['common_program']
+    definite=current['definite']
+    dyson=current['dyson']
+    end=current['end']
+    energy=current['energy']
+    energy_d=current['energy_d']
+    equilibrium=current['equilibrium']
+    eta=current['eta']
+    execute_response=current['execute_response']
+    face=current['face']
+    fit_basis=current['fit_basis']
+    fit_ids=current['fit_ids']
+    gamma=current['gamma']
+    grid=current['grid']
+    held_ids=current['held_ids']
+    infinity_program=current['infinity_program']
+    label=current['label']
+    layout=current['layout']
+    mesh_xy=current['mesh_xy']
+    meta=current['meta']
+    mm=current['mm']
+    nb=current['nb']
+    nk=current['nk']
+    nmu=current['nmu']
+    normal_program=current['normal_program']
+    nq=current['nq']
+    ns=current['ns']
+    output_gram_program=current['output_gram_program']
+    pencil_program=current['pencil_program']
+    ph=current['ph']
+    phases=current['phases']
+    pm=current['pm']
+    pn=current['pn']
+    print_fn=current['print_fn']
+    qgrid=current['qgrid']
+    recipe=current['recipe']
+    rep=current['rep']
+    representation=current['representation']
+    response_active=current['response_active']
+    response_window=current['response_window']
+    rho=current['rho']
+    run_dir=current['run_dir']
+    snapshot=current['snapshot']
+    started=current['started']
+    stop=current['stop']
+    tolerance=current['tolerance']
+    verification_geometry=current['verification_geometry']
+    sites=samples['sites']
+    values=samples['values']
+    fit_positions=samples['fit_positions']
+    held_positions=samples['held_positions']
     put = lambda a, sh=rep: device_put_process_local(np.asarray(a), sh)
     panel_side = int(mesh_xy.shape["y"])
     extent = lambda n: max(panel_side, math.ceil(int(n)/panel_side)*panel_side)
@@ -715,40 +857,45 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     begin("directions")
     coords = np.unravel_index(np.arange(nq), qgrid)
     minus = np.ravel_multi_index(tuple((-c) % n for c, n in zip(coords, qgrid)), qgrid)
+    current['minus']=minus
     left_states, right_states, common_states = [], [], []
-    for training_index,i in enumerate(fit_positions):
-        W = values[i]
-        width = (int(recipe["imaginary_width"]) if sites[i].real == 0
-                 else int(recipe.get("line_direction_cap") or nmu))
-        if i not in directions:
-            # Both sides use singular directions: -Herm(W) is not PSD for
-            # a general coherent/gain input and must not be used as a Gram.
-            source = W if training_index % 2 else adjoint_program(W)
-            q, _ = distrib_la.right_singular_vectors(source, float(recipe["direction_cutoff"]),
-                eigh_plan=eig, column_extent=extent, max_rank=width,
-                multiplet_tol=float(recipe["multiplet_relative_tolerance"]))
-            directions[i] = q
-        q = directions[i]
-        if definite:
-            common_states.append((sites[i]+1j*gamma, q, mm(W, q)))
-            if sites[i].real != 0:
-                qm, wm = jnp.conj(q[minus]), jnp.conj(W[minus])
-                common_states.append((-sites[i].conjugate()+1j*gamma, qm, mm(wm, qm)))
-            continue
-        if training_index % 2:
-            right_states.append((sites[i], q, mm(W, q)))
-        else:
-            left_states.append((sites[i], q, mm(q, W, transa="C")))
-        if sites[i].real != 0:
-            # Exact crossing supplies the opposite frequency using the
-            # independently current partner sample. No additional Dyson
-            # sample, equilibrium transpose relation or PSD premise enters.
-            qm = jnp.conj(q[minus])
-            wm = jnp.conj(W[minus])
+    if not definite and samples.get('supports') is not None:
+        left_states,right_states=_general_support_panels(current,samples,directions,
+            eigh_plan=eig,column_extent=extent)
+    else:
+        for training_index,i in enumerate(fit_positions):
+            W = values[i]
+            width = (int(recipe["imaginary_width"]) if sites[i].real == 0
+                     else int(recipe.get("line_direction_cap") or nmu))
+            if i not in directions:
+                # Both sides use singular directions: -Herm(W) is not PSD for
+                # a general coherent/gain input and must not be used as a Gram.
+                source = W if training_index % 2 else adjoint_program(W)
+                q, _ = distrib_la.right_singular_vectors(source, float(recipe["direction_cutoff"]),
+                    eigh_plan=eig, column_extent=extent, max_rank=width,
+                    multiplet_tol=float(recipe["multiplet_relative_tolerance"]))
+                directions[i] = q
+            q = directions[i]
+            if definite:
+                common_states.append((sites[i]+1j*gamma, q, mm(W, q)))
+                if sites[i].real != 0:
+                    qm, wm = jnp.conj(q[minus]), jnp.conj(W[minus])
+                    common_states.append((-sites[i].conjugate()+1j*gamma, qm, mm(wm, qm)))
+                continue
             if training_index % 2:
-                left_states.append((-sites[i].conjugate(), qm, mm(qm, wm, transa="C")))
+                right_states.append((sites[i], q, mm(W, q)))
             else:
-                right_states.append((-sites[i].conjugate(), qm, mm(wm, qm)))
+                left_states.append((sites[i], q, mm(q, W, transa="C")))
+            if sites[i].real != 0:
+                # Exact crossing supplies the opposite frequency using the
+                # independently current partner sample. No additional Dyson
+                # sample, equilibrium transpose relation or PSD premise enters.
+                qm = jnp.conj(q[minus])
+                wm = jnp.conj(W[minus])
+                if training_index % 2:
+                    left_states.append((-sites[i].conjugate(), qm, mm(qm, wm, transa="C")))
+                else:
+                    right_states.append((-sites[i].conjugate(), qm, mm(wm, qm)))
     def joined(states, left):
         zs = join_vectors([np.full(s[1].shape[-1], s[0]) for s in states], panel_side)
         return (put(zs), tile_join([s[1] for s in states], -1, face),
@@ -769,12 +916,16 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     # those full-matrix coefficients exact.
     # They are not forced to be Hermitian/even for a coherent finite-band
     # projected density algebra. Gamma shifts X2 by -i gamma X1 once.
-    x1, x2 = full_density_bare_moments((pm, pn, ph, energy_d), meta,
-                                      mesh_xy=mesh_xy, q_ids=np.arange(nq),
-                                      k_unfold_plan=plan, execute=execute_response)
-    pref = float(algebra["prefactor"])
-    c1 = mm(V, mm(pref*x1, V))
-    c2 = mm(V, mm(pref*(x2-1j*gamma*x1), V))+mm(V, mm(pref*x1, mm(V, mm(pref*x1, V))))
+    if 'moments' in current:
+        c1,c2=current['moments']
+    else:
+        x1, x2 = full_density_bare_moments((pm, pn, ph, energy_d), meta,
+                                          mesh_xy=mesh_xy, q_ids=np.arange(nq),
+                                          k_unfold_plan=plan, execute=execute_response)
+        pref = float(algebra["prefactor"])
+        c1 = mm(V, mm(pref*x1, V))
+        c2 = mm(V, mm(pref*(x2-1j*gamma*x1), V))+mm(V, mm(pref*x1, mm(V, mm(pref*x1, V))))
+        current['moments']=(c1,c2)
     moment_scale = max(float(np.ptp(energy[:, :stop])), eta)
     if "infinity" not in directions:
         c2_scaled = c2/moment_scale
@@ -825,6 +976,13 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     end("pencil", (E, A, B, C, output_gram))
     begin("hostreduce")
     spaces = fit_basis.setdefault("equilibrium_column_spaces_v1" if definite else "spaces", {})
+    if not definite and samples.get('supports') is not None:
+        # A previous physical refresh may have ended on expanded support
+        # axes. Reuse only compatible general numerical coordinates; never
+        # reinterpret those selectors on today's smaller initial pencil.
+        for iq,space in list(spaces.items()):
+            if space['left'].shape[0]!=nl or space['right'].shape[0]!=nr:
+                del spaces[iq]
     banks, receipts = {}, []
     stop_after=snapshot.get('stop_after_model_q')
     if stop_after is not None and int(stop_after)!=0:
@@ -940,7 +1098,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             receipts.append(dict(q=iq, partner=partner, **model["receipt"]))
             growth=float(np.max(p.imag,initial=-np.inf))
             bad_growth=eta<=growth+1e-12 or float(np.min(sites.imag))<=growth+1e-12
-            if bad_growth or stop_after is not None:
+            if (bad_growth and not defer_admission) or stop_after is not None:
                 if jax.process_index()==0:
                     print_fn(f'General shared-pole W [{label}] early diagnostic q={iq} '
                              f'order={order} growth_Ry={growth:.9g} eta_margin_Ry={eta-growth:.9g}')
@@ -1099,7 +1257,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     for iq in range(nq):
         l, r, p = banks[iq]
         growth = float(np.max(p.imag, initial=-np.inf))
-        if eta <= growth+1e-12 or np.min(sites.imag) <= growth+1e-12:
+        if not defer_admission and (eta <= growth+1e-12 or np.min(sites.imag) <= growth+1e-12):
             raise ValueError(f"GATE shared_general_laplace: q={iq} growth={growth} not below eta/supports")
         for power, target in ((0, c1[iq:iq+1]), (1, c2[iq:iq+1])):
             actual = mm(l*put((p**power)[None, None]), r, transb="C")
@@ -1110,10 +1268,384 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             target = values[j][iq:iq+1]
             error = float(jnp.linalg.norm(got-target)/jnp.maximum(jnp.linalg.norm(target), 1e-300))
             checks.append(dict(q=iq, support=j, held=j in held_positions, error=error))
-            if not np.isfinite(error) or error > tolerance:
+            if not defer_admission and (not np.isfinite(error) or error > tolerance):
                 raise ValueError(f"GATE shared_general_held_w: q={iq} support={j} relative error {error:.6g}>{tolerance}")
     end("checks")
+    return dict(banks=banks,receipts=receipts,c1=c1,c2=c2,checks=checks,moment_checks=moment_checks,frequency_coordinates=frequency_coordinates,nl=nl,nr=nr,host_price=host_price,positive_cap=positive_cap,cap=cap,extent=extent)
+
+
+def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapshot,
+                                 run_dir, label, fit_basis=None, print_fn=print):
+    """Full microscopic instantaneous-rho W, with general shared frequency poles.
+
+    ``snapshot`` supplies ``U_active[k,a,a]``, ``E_active_ry[k,a]``,
+    ``rho_active[k,a,a]`` in that instantaneous basis, ``active_slice`` and
+    optional full ``energy_ry[k,b]``. ``gamma_ry`` is the declared lag decay;
+    ``eta_ry`` is the electronic retarded evaluation height. Every native
+    centroid, screening band and full-grid q is retained. Native support,
+    direction-width and pole-budget controls come from the source recipe,
+    never from the projected TD prototype's rank/order controls.
+
+    General tangential interpolation has independent full-port factors and
+    unchanged complex poles. Opposite q models are related algebraically;
+    self-negative q models use an explicit half-weight crossing mixture.
+    ``fit_basis`` optionally holds only interpolation directions/reduction
+    spaces within one inner Hamiltonian solve. Current response, residues,
+    collective poles and all held checks are recomputed on every call.
+    ``response_partition='full'`` opts into an exact merged endpoint product;
+    the default ``'blocks'`` keeps FF/FA/AF/AA numerical quadrature separate.
+    An exact binary, commuting, globally noninverted reference on the full
+    grid or a nonnegative Fejer q mixture selects a same-state definite H
+    realization. Native PSD V, current metric/null/output and all final W
+    checks remain required; negative H is not repaired. Coherent refreshes
+    return to the independent general realization and may still refuse.
+
+    Explicit ``direct_dielectric_probe={q: 0, z_ry: [real, imag]}`` evaluates
+    only that current microscopic response and commits native dielectric
+    witnesses, then raises an UNADMITTED diagnostic stop before any fit/Σ.
+    """
+    import copy
+    import math
+    import sys
+    import jax
+    import jax.numpy as jnp
+    import distrib_la
+    import minimax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from ffi import ffi_dial_key
+    from common.collectives import device_put_process_local, gather_to_host, rank0_transaction
+    from common.contract_bands import merge_spin_centroid
+    from symmetry_maps import QirrOperator
+    from .wavefunction_bundle import rotate_wavefunctions
+    from .greens_function_kernel import density_left_endpoint
+    from .centroid_k_unfold import authenticate_canonical_full_grid
+    from .response_bank import (full_density_sample_rules, full_density_bare_moments,
+                                 _coulomb_algebra, dense_layout, response_algebra,
+                                 operator_digest, _bank_execution)
+    from .w_isdf import full_density_response_stream
+    from .shared_pole_directions import _sample_point
+    from .shared_pole_execution import face_matmul
+    from .shared_pole_pencil import tile_join, join_vectors
+    from .shared_pole_constructor import (general_pencil_batch_plan, collective_general_pencil_batch,
+                                          general_pencil_workspace_bytes,
+                                          EQUILIBRIUM_METRIC_SOLVER as _EQUILIBRIUM_METRIC_SOLVER)
+    from .shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
+    from types import SimpleNamespace
+    from file_io.shared_pole_store import write_general_shared_pole_model
+    started = time.monotonic()
+    direct_request = _direct_dielectric_request(snapshot)
+    response_partition = snapshot.get('response_partition', 'blocks')
+    phases, phase_start = {}, {}
+    def begin(name):
+        phase_start[name] = time.monotonic()
+        if jax.process_index() == 0:
+            print_fn(f"General shared-pole W [{label}] BEGIN {name}")
+            sys.stdout.flush()
+    def end(name, operands=None):
+        if operands is not None:
+            jax.block_until_ready(operands)
+        phases[name] = time.monotonic()-phase_start.pop(name)
+        if jax.process_index() == 0:
+            print_fn(f"General shared-pole W [{label}] END {name} {phases[name]:.3f}s")
+            sys.stdout.flush()
+    begin("setup")
+    current_meta = copy.copy(meta)
+    source_recipe = current_meta.shared_pole_recipe
+    if fit_basis is None or direct_request is not None:
+        fit_basis = {}
+    previous_direction_bytes = sum(a.size*a.dtype.itemsize
+        for key in ('directions', 'equilibrium_directions') for a in fit_basis.get(key, {}).values())
+    nk = int(meta.nk_tot)
+    grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    qgrid = tuple(int(n) for n in (getattr(meta, "qgrid", None) or grid))
+    response_window = getattr(meta, "qgrid_response_window", "sharp")
+    nq = int(np.prod(qgrid))
+    sym = getattr(meta, "q_sym", sym)
+    if not np.array_equal(np.asarray(sym.q_irr_full_idx), np.arange(nq)):
+        raise ValueError("GATE shared_general_full_q: every current q must be an explicit parent")
+    qcoords = np.asarray(sym.q_irr_kgrid_int)
+    canonical_qcoords = np.indices(qgrid).reshape(3, -1).T
+    if (qcoords.shape != (nq, 3) or qcoords.dtype.kind not in "iu"
+            or not np.array_equal(qcoords % np.asarray(qgrid), canonical_qcoords)):
+        raise ValueError("GATE shared_general_full_q: canonical unshifted bosonic q coordinates required")
+    active = snapshot["active_slice"]
+    if not isinstance(active, slice):
+        active = slice(*active)
+    energy = np.asarray(snapshot.get("energy_ry", gather_to_host(wfns.enk)), float).copy()
+    energy[:, active] = np.asarray(snapshot["E_active_ry"], float)
+    occupations = np.asarray(gather_to_host(wfns.occ), float)
+    rho = np.eye(energy.shape[1], dtype=complex)[None]*occupations[:, :, None]
+    rho[:, active, active] = np.asarray(snapshot["rho_active"], complex)
+    if (not np.isfinite(rho).all() or np.max(abs(rho-rho.conj().swapaxes(-1, -2))) > 1e-10):
+        raise ValueError("GATE shared_general_density: finite Hermitian full density required")
+    stop = min(int(meta.b_id_4_chi_user), int(wfns.slices.b4_logical))-int(wfns.slices.b0)
+    if int(wfns.slices.b0) != 0 or stop < active.stop:
+        raise ValueError("GATE shared_general_bands: complete screening support must contain active window")
+    equilibrium = _equilibrium_definite_eligibility(energy, rho, stop, grid, qgrid, response_window)
+    definite = equilibrium['eligible']
+    refinement_selected=_general_refinement_selected(snapshot,definite=definite,direct_request=direct_request)
+    representation = 'equilibrium-definite-same-state' if definite else 'general-two-sided-full-density'
+    gamma = float(snapshot.get("gamma_ry", snapshot.get("adiabatic_ry", 0)))
+    current = rotate_wavefunctions(wfns, jnp.asarray(snapshot["U_active"]),
+        enk_active_new=jnp.asarray(energy[:, active]), enk_base=jnp.asarray(energy),
+        efermi=None, mesh_xy=mesh_xy, active_slice=active, occupations=occupations)
+    census = meta.shared_pole_census
+    bind_shared_pole_census(current, current_meta,
+        occupation_state=SimpleNamespace(f_kn=np.real(rho.diagonal(axis1=-2, axis2=-1)),
+            mu_ry=float(census["mu_ry"]), smearing_family="instantaneous-full-density-diagonal-census",
+            smearing_width_ry=0.0),
+        trs_allowed=False, state_capacity=float(census["state_capacity"]),
+        kweights=np.asarray(census["k_weights"]))
+    resolved = resolve_shared_pole_recipe(config, current, current_meta, mesh_xy=mesh_xy,
+        print_fn=print_fn, support_reads_ev=snapshot.get("support_reads_ev", source_recipe["support_reads_ev"]))
+    # Geometry and selection are numerical spaces held only within this
+    # physical refresh. Current census and scientific identity stay current.
+    recipe = dict(fit_basis.setdefault("recipe", resolved), census=current_meta.shared_pole_census)
+    general_gates = dict(version="full-density-general-shared-pole-gates-v6",
+        source_policy_version=recipe.get("recipe_version", recipe.get("version")),
+        scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
+        numerical_response_rule='analytic-denominator-box-values-only-v1',
+        numerical_response_carrier=int(minimax.RESPONSE_NODE_CAPACITY),
+        response_partition=response_partition,
+        eta_training_verification='active_span_3train_2interlaced_held_v1',
+        numerical_spaces='two-sided-descriptor-svd',
+        eigensolver='current-descriptor-balanced-ordinary-geev',
+        frequency_equilibration='unit-aware-combined-pencil-Ruiz-infinity-8',
+        frequency_scale='max_current_full_requested_energy_span_eta',
+        descriptor_rank_tolerance=float(recipe['bank_rule_tolerance']),
+        full_microscopic_support=True, finite_density_and_residues=True,
+        scalar_rule_tolerance=float(recipe["bank_rule_tolerance"]),
+        full_matrix_fit_held_tolerance=float(snapshot.get("fit_tolerance", .02)),
+        modal_reconstruction_tolerance=1e-9, laplace_margin_ry=1e-12,
+        capacity="explicit-full-map-and-host-pencil-bound", store="sha256-complete-full-q")
+    if definite:
+        general_gates.update(numerical_spaces='original-column-selector-P_I-v1',
+            eigensolver='current-positive-H-extended-Cholesky-Hermitian-eigh',
+            metric_solver=_EQUILIBRIUM_METRIC_SOLVER,
+            common_state_selection='original-state-joint-RRQR-v1',
+            frequency_equilibration='positive-diagonal-common-H-congruence',
+            equilibrium_definite=equilibrium)
+    if refinement_selected:
+        from .shared_pole_refinement import MAX_REFINEMENT_ROUNDS,MAX_REFINEMENT_POLES
+        general_gates['general_refinement']=dict(policy='native-current-data-refinement-v1',
+            max_rounds=MAX_REFINEMENT_ROUNDS,max_poles_per_round=MAX_REFINEMENT_POLES,
+            max_new_full_q_sites_per_round=3*MAX_REFINEMENT_POLES,
+            support_policy='distinct-LR-same-side-crossing-v1',
+            exact_point_epsilon='computed-matrix-nonsingularity-only',
+            final_admission='all-original-and-added-full-W-fit-held-growth-capacity')
+    recipe.update(source_recipe_hash=recipe["recipe_hash"], source_passive_gate_hash=recipe["gate_hash"],
+        source_passive_gate_version=recipe["gate_version"], gate_version=general_gates["version"],
+        construction_representation=representation,
+        inherited_passive_gram_and_passivity="NOT_APPLICABLE", general_gates=general_gates,
+        gate_hash=hashlib.sha256(_json(general_gates).encode()).hexdigest())
+    recipe["recipe_hash"] = hashlib.sha256(_json({k:v for k,v in recipe.items() if k != "recipe_hash"}).encode()).hexdigest()
+    current_meta.shared_pole_recipe = recipe
+    current_meta.shared_pole_capacity.live_stages = ()
+    carrier = current.green_parent
+    if carrier is None or carrier.psi_mun.shape[0] != nk:
+        raise ValueError("GATE shared_general_full_k: explicit full-grid wavefunction parents required")
+    plan = carrier.plan
+    if (not np.array_equal(np.asarray(plan.irr_idx), np.arange(nk))
+            or plan.parent_full_rows is None
+            or not np.array_equal(np.asarray(plan.parent_full_rows), np.arange(nk))):
+        raise ValueError("GATE shared_general_full_k: native flat-grid identity row order required")
+    grid_receipt = authenticate_canonical_full_grid(
+        plan, grid, sym=sym if qgrid == grid else None)
+    grid_receipt.update(response_grid=list(qgrid), n_q=nq, response_q_order="canonical-C")
+    pm, pn = carrier.psi_mun, carrier.psi_nmu
+    layout = carrier.layout
+    ns, nmu, nb = map(int, pm.shape[1:])
+    # Carrier padding/out-of-chi bands are exact-zero operands, not a band
+    # cutoff chosen for this algorithm. All requested physical chi bands stay.
+    band_mask = jnp.arange(nb) < stop
+    pm, pn = pm*band_mask[None, None, None], pn*band_mask[None, :, None, None]
+    rho[:, stop:, :] = 0; rho[:, :, stop:] = 0
+    v = QirrOperator.of(V_q)
+    if not v.is_whole_zone() or v.n_full != nq:
+        raise ValueError("GATE shared_general_full_q: full native Coulomb operator required")
+    V = v.at_rows(np.arange(nq))
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    rep = NamedSharding(mesh_xy, P())
+    mm = face_matmul(mesh_xy)
+    pencil_program, infinity_program, adjoint_program, normal_program = _general_frequency_programs(
+        mesh_xy, face.spec, ffi_dial_key())
+    common_program=output_gram_program=None
+    if definite:
+        common_program, output_gram_program = _equilibrium_frequency_programs(
+            mesh_xy, face.spec, ffi_dial_key())
+    fit_ids, held_ids = list(map(int, recipe["fit_ids"])), list(map(int, recipe["held_ids"]))
+    sites = np.asarray([_sample_point(recipe, i) for i in fit_ids+held_ids], complex)
+    # Fit the observed continuation scale, while keeping independent
+    # interlaced holds and EVERY original native fit/held position intact.
+    eta = float(snapshot["eta_ry"])
+    if direct_request is None:
+        sites,verification_geometry=active_eta_verification_sites(sites,energy,active,eta,
+            native_fit_count=len(fit_ids))
+        fit_positions=verification_geometry['fit_positions']
+        held_positions=verification_geometry['held_positions']
+    else:
+        sites = np.asarray([direct_request['z_ry']], complex)
+        fit_positions, held_positions = [], []
+        verification_geometry = dict(scope='UNADMITTED one-site microscopic dielectric diagnostic',
+            q=0, sites_ry=[[float(sites[0].real), float(sites[0].imag)]])
+    recipe['general_support_geometry']=dict(sites_ry=[[float(z.real),float(z.imag)] for z in sites],
+        fit_positions=fit_positions,held_positions=held_positions,
+        training_width_policy='native imaginary_width / line_direction_cap by support type')
+    widths = [int(recipe["imaginary_width"]) if z.real == 0 else
+              int(recipe.get("line_direction_cap") or nmu) for z in sites[fit_positions]]
+    recipe['general_support_geometry']['training_widths']=widths
+    general_gates['support_geometry_hash']=hashlib.sha256(_json(recipe['general_support_geometry']).encode()).hexdigest()
+    recipe['gate_hash']=hashlib.sha256(_json(general_gates).encode()).hexdigest()
+    recipe['recipe_hash']=hashlib.sha256(_json({k:v for k,v in recipe.items() if k!='recipe_hash'}).encode()).hexdigest()
+    side_bound = sum(extent for z, extent in zip(sites[fit_positions], widths) if z.real != 0)
+    if direct_request is None:
+        side_bound += sum(widths)+2*int(recipe["infinity_width"])
+    ranks = int(mesh_xy.size)
+    query_q_ids = np.arange(nq) if direct_request is None else np.asarray([0])
+    query_count = len(query_q_ids)
+    bank_bytes = 16*query_count*len(sites)*nmu*nmu//ranks
+    action_bytes = 16*query_count*4*nmu*side_bound//ranks
+    pencil_bytes = (48 if definite else 32)*query_count*side_bound*side_bound//ranks
+    green_bytes = 16*nk*(ns*nmu)**2*6//ranks
+    dielectric_bytes = 0 if direct_request is None else 16*(nq+8)*nmu*nmu//ranks
+    price = current_meta.shared_pole_capacity.reserve("general_full_map",
+        resident_bytes_per_rank=bank_bytes+action_bytes+pencil_bytes,
+        workspace_bytes_per_rank=green_bytes+bank_bytes+dielectric_bytes)
+    current_meta.shared_pole_capacity.live_stages = (price["stage"],)
+    # Same executable/native-scratch admission as the equilibrium bank. The
+    # full-map reservation above owns the retained response and panel carry;
+    # each dispatch measures its actual TWO-left/common-right operands.
+    response_execution = dict(seconds={}, memory=[], compiled=[])
+    execute_response = _bank_execution(current_meta, mesh_xy, response_execution, config)
+    ph = density_left_endpoint(mesh_xy, pm.shape, layout=layout)(pm, jnp.asarray(rho))
+    energy_d = jnp.asarray(energy)
+    H, inverse, negative, support = _coulomb_algebra(mesh_xy, nmu, int(meta.n_rmu),
+                              dense_layout(meta, config, mesh_xy, nmu))(V)
+    # The inverse/support are not used by this builder. Do not keep an
+    # otherwise dead full-port inverse live through response and reduction.
+    del inverse, support
+    if bool(jnp.any(negative)):
+        raise ValueError("GATE shared_general_coulomb: bare V has resolved negative spectrum")
+    dyson, _, _, algebra = response_algebra(current_meta, config, mesh_xy=mesh_xy, n=nmu, ordered=True)
+    tolerance = float(snapshot.get("fit_tolerance", .02))
+    if len(fit_ids) < 4:
+        raise ValueError("GATE shared_general_supports: at least four native fitted supports required")
+    end("setup", (ph, H))
+    sample_current=dict(energy=energy,rho=rho,occupations=occupations,active=active,
+        response_active=snapshot.get('response_active_slice',active),stop=stop,nb=nb,
+        response_partition=response_partition,gamma=gamma,recipe=recipe,label=label,
+        pm=pm,ph=ph,pn=pn,energy_d=energy_d,mesh_xy=mesh_xy,grid=grid,qgrid=qgrid,
+        nk=nk,nmu=nmu,ns=ns,layout=layout,response_window=response_window,
+        query_q_ids=query_q_ids,plan=plan,execute_response=execute_response,dyson=dyson,H=H)
+    sampled=_general_current_site_samples(sample_current,sites,
+        scalar_cache=fit_basis.setdefault('scalar_rules',{}),begin=begin,end=end,
+        phase_start=phase_start,print_fn=print_fn,evaluate_dyson=direct_request is None)
+    rules,blocks,response_active=(sampled[k] for k in ('rules','blocks','response_active'))
+    if direct_request is not None:
+        z = direct_request['z_ry']
+        root = Path(run_dir)/f'{label}_general_shared_pole'
+        record = dict(q=0, z_ry=[float(z.real), float(z.imag)], at_requested_site=True,
+            gamma_ry=gamma, scalar_rule_tolerance=float(recipe['bank_rule_tolerance']),
+            prefactor=float(algebra['prefactor']), status='UNADMITTED_DIRECT_DIELECTRIC',
+            phase_seconds=dict(phases), grid=grid_receipt,
+            response_active_bands=[response_active.start, response_active.stop], screening_bands=stop)
+        _save_general_dielectric_probe(sampled['values'][0],
+            dict(dyson=dyson, H=H[:1], matmul=mm, face=face, rep=rep,
+                 mask=meta.mu_basis.active_mask), record, root=root, index=0)
+        raise RuntimeError('GATE shared_general_dielectric_diagnostic_stop: UNADMITTED q=0 one-site '
+                           f'microscopic dielectric witnesses retained at {root}; no fitted W or Sigma')
+    values=sampled['values']
+    del sampled
+    sample_wall = time.monotonic()-started
+    fit_current=dict(
+        H=H,
+        V=V,
+        adjoint_program=adjoint_program,
+        algebra=algebra,
+        begin=begin,
+        blocks=blocks,
+        carrier=carrier,
+        common_program=common_program,
+        definite=definite,
+        dyson=dyson,
+        end=end,
+        energy=energy,
+        energy_d=energy_d,
+        equilibrium=equilibrium,
+        eta=eta,
+        execute_response=execute_response,
+        face=face,
+        fit_basis=fit_basis,
+        fit_ids=fit_ids,
+        gamma=gamma,
+        grid=grid,
+        held_ids=held_ids,
+        infinity_program=infinity_program,
+        label=label,
+        layout=layout,
+        mesh_xy=mesh_xy,
+        meta=meta,
+        mm=mm,
+        nb=nb,
+        nk=nk,
+        nmu=nmu,
+        normal_program=normal_program,
+        nq=nq,
+        ns=ns,
+        output_gram_program=output_gram_program,
+        pencil_program=pencil_program,
+        ph=ph,
+        phases=phases,
+        pm=pm,
+        pn=pn,
+        print_fn=print_fn,
+        qgrid=qgrid,
+        recipe=recipe,
+        rep=rep,
+        representation=representation,
+        response_active=response_active,
+        response_window=response_window,
+        rho=rho,
+        run_dir=run_dir,
+        snapshot=snapshot,
+        started=started,
+        stop=stop,
+        tolerance=tolerance,
+        verification_geometry=verification_geometry,
+    )
+    fit_samples=dict(sites=sites,values=values,fit_positions=fit_positions,held_positions=held_positions)
+    if refinement_selected:
+        digest,state_identity=_general_refinement_identity(fit_current)
+        fit_current.update(state_digest=digest,capacity=current_meta.shared_pole_capacity,
+            sample_current=sample_current,response_execution=response_execution,
+            refresh_dyson=lambda:response_algebra(current_meta,config,
+                mesh_xy=mesh_xy,n=nmu,ordered=True)[0])
+        fit_samples.update(state_digest=digest,refinement_rounds=0,
+            supports=_general_initial_supports(sites,fit_positions))
+        fitted,fit_samples=_general_current_refinement(fit_current,fit_samples)
+        sites,values,fit_positions,held_positions=(fit_samples[k] for k in
+            ('sites','values','fit_positions','held_positions'))
+        rules=rules+fit_current.get('incremental_rules',[])
+        verification_geometry=dict(verification_geometry,refinement_rounds=fit_samples['refinement_rounds'],
+            final_fit_positions=fit_positions,final_held_positions=held_positions,
+            final_sites_ry=[[float(z.real),float(z.imag)] for z in sites])
+    else:
+        fitted=_general_current_fit(fit_current,fit_samples)
+    banks=fitted['banks']
+    receipts=fitted['receipts']
+    c1=fitted['c1']
+    c2=fitted['c2']
+    checks=fitted['checks']
+    moment_checks=fitted['moment_checks']
+    frequency_coordinates=fitted['frequency_coordinates']
+    nl=fitted['nl']
+    nr=fitted['nr']
+    host_price=fitted['host_price']
+    positive_cap=fitted['positive_cap']
+    cap=fitted['cap']
+    extent=fitted['extent']
     begin("persist")
+    put = lambda a, sh=rep: device_put_process_local(np.asarray(a), sh)
     identity = dict(iteration_id=str(label), energies=hashlib.sha256(energy.tobytes()).hexdigest(),
         occupations=hashlib.sha256(memoryview(rho)).hexdigest(),
         hamiltonian=hashlib.sha256((energy.tobytes()+np.asarray(snapshot["U_active"]).tobytes())).hexdigest(),
@@ -1165,6 +1697,10 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         rule_groups=len(rules),scalar_provider='exact_endpoint_blocks_public_minimax_owners')
     receipt["phase_seconds"] = phases
     receipt["response_execution"] = response_execution
+    if refinement_selected:
+        receipt['general_refinement']=dict(state_digest=digest,state_identity=state_identity,
+            rounds=fitted['refinement_receipts'],all_original_samples_retained=True,
+            final_sample_count=len(sites),final_support_count=len(fit_samples['supports']))
     receipt["physical_grid_order"] = grid_receipt
     receipt["native_positive_pole_budget"] = positive_cap
     receipt["general_signed_pole_budget"] = int(cap)

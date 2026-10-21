@@ -72,7 +72,8 @@ def test_scalar_witness_owner_preserves_current_complex_epsilon_padding_and_basi
 
 
 def test_diagnostic_selection_and_stop_precede_all_dyson_values_directions_and_fitting():
-    from gw.shared_pole_screening import screen_general_shared_poles, _general_current_site_samples
+    from gw.shared_pole_screening import (screen_general_shared_poles, _general_current_site_samples,
+        _general_current_fit)
     source = inspect.getsource(screen_general_shared_poles)
     tree = ast.parse(source)
     stops = [n for n in ast.walk(tree) if isinstance(n, ast.Raise)
@@ -95,5 +96,6 @@ def test_diagnostic_selection_and_stop_precede_all_dyson_values_directions_and_f
     assert call.lineno < stop.lineno
     assert stop.lineno < next(n.lineno for n in ast.walk(tree) if isinstance(n, ast.Assign)
         and any(isinstance(t, ast.Name) and t.id == 'values' for t in n.targets))
-    assert source.index('shared_general_dielectric_diagnostic_stop') < source.index('begin("directions")')
+    assert source.index('shared_general_dielectric_diagnostic_stop') < source.index('_general_current_fit(fit_current')
+    assert 'begin("directions")' in inspect.getsource(_general_current_fit)
     assert 'dielectric_bytes' in source and 'query_count = len(query_q_ids)' in source

@@ -198,7 +198,7 @@ def test_exact_eligibility_transitions_keep_distinct_held_space_namespaces():
     import gw.shared_pole_screening as owner
     tree = ast.parse(Path(owner.__file__).read_text())
     builder = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
-                   and n.name == 'screen_general_shared_poles')
+                   and n.name == '_general_current_fit')
     expressions = {}
     for node in ast.walk(builder):
         if (isinstance(node, ast.Assign) and len(node.targets) == 1

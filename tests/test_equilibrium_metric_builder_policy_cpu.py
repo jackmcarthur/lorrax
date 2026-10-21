@@ -8,9 +8,10 @@ import numpy as np
 def builder_tree():
     import gw.shared_pole_screening as owner
     tree=ast.parse(Path(owner.__file__).read_text())
-    function=next(n for n in tree.body if isinstance(n,ast.FunctionDef)
-                  and n.name=='screen_general_shared_poles')
-    return owner,function
+    functions=[n for n in tree.body if isinstance(n,ast.FunctionDef)
+               and n.name in ('screen_general_shared_poles','_general_current_fit')]
+    assert len(functions)==2
+    return owner,ast.Module(body=functions,type_ignores=[])
 
 
 def test_production_metric_solver_is_explicit_only_for_eligible_equilibrium():
