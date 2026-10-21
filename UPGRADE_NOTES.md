@@ -20,10 +20,18 @@ eigenvalues equal the GPU 1600-step Lanczos to 6e-12 meV): 19 iterations,
 265 H applications against 1600, eigenvalues within 8.5e-8 meV of the
 reference. Without locking the same solve takes 640-800.
 
-- **Results move** by the solver's residual only: 8.5e-8 meV on Si 8^3. hsuite
-  `bse`/`bse_bisp` already ran Davidson; they now use the exact diagonal and
-  the 0.01 meV stop (was 1e-8 Ry). The move is bounded by the residual, far
-  inside `ATOL["bse_ev"]` (0.1 meV); the GPU hsuite gate has not run yet.
+- **Results move** by the solver's residual where the old solve converged:
+  8.5e-8 meV on Si 8^3, 0.00 meV on hsuite `bse` (GPU gate, P=4). hsuite
+  `bse_bisp` moves by -0.16 meV (S001) and -22.38 meV (S002; 31 % of the
+  fixture's 72 meV DFT gap), and its reference is regenerated (-1.01590,
+  -0.86783 eV): the old one came from main's explicit `--solver davidson`
+  stopping unconverged at its 40-iteration cap (40/40 iterations, residuals
+  16.1 / 106.4 meV), which main wrote with exit 0. The new values equal
+  full-Krylov Lanczos (K = 50, the whole space) on both the old and the new
+  restart.
+- **Warning.** Results from explicit `--solver davidson` runs on main before
+  this landing may be unconverged: check their logs (iterations against the
+  cap, residuals) before reusing them.
 - **Command lines.** A flag only another solver reads now refuses
   (`--lanczos-rtol`, `--lanczos-check-every`, `--n-reorth`, `--block-size` are
   Lanczos's; `--davidson-*` Davidson's; `--trlan-*` TRLan's): a line that tuned
