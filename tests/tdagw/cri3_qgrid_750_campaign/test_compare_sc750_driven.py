@@ -195,3 +195,71 @@ def test_strict_default_still_refuses_calibration_only_campaign(tmp_path):
     with pytest.raises(ValueError, match="completed three-arm"):
         module.main([str(tmp_path), "--out", str(tmp_path/"plots")])
     assert not (tmp_path/"plots").exists()
+
+
+def _pilot_campaign(root,arm=module.ARMS[1]):
+    """Three synthetic committed samples, NOT material dynamics evidence."""
+    requested=dict(arms=[arm],amplitudes_v_m=[1.e8],purpose='synthetic schema test')
+    policy=dict(response_qgrid=[4,4,1],response_window='fejer')
+    manifest=dict(execution_revision='synthetic_test',actual_active=[100,144],response_policy=policy,
+        diagnostic_role='UNQUALIFIED_DRIVEN_PILOT',qualified_comparison=False,
+        plan=dict(diagnostic_pilot=requested,duration_fs=.15,measure_as=50.,fit_tolerance=.05,
+            pulse=dict(polarization=[1.,0.,0.])))
+    (root/'manifest.json').write_text(json.dumps(manifest))
+    tag=arm[0]+'_pilot_0';directory=root/tag;directory.mkdir()
+    times=np.arange(3)*.05/module.FS_PER_AU
+    with h5py.File(directory/'tdgw.h5','w') as f:
+        cp=f.create_group('tdgw_data/checkpoint');cp['it_next']=3;cp['tchkp']=.15/module.FS_PER_AU
+        header=f.create_group('tdgw_header/wfn_header')
+        header['w_k']=np.ones(64)/64;header['kpts']=np.zeros((64,3))
+        bands=header.create_group('bands')
+        for name,value in zip(('start','stop','step'),(101,145,1)):bands[name]=value
+        td=f['tdgw_data'].create_group('time_domain')
+        for name,width in (('polarization',3),('Efield',3),('carrier_density',2)):
+            group=td.create_group(name);group['times']=times
+            value=np.arange(3*width).reshape(3,width).astype(complex)*.001
+            if name=='polarization':value+=.00001j
+            group['data']=value
+    callback_spec=importlib.util.spec_from_file_location('pilot_fixture_producer',
+        Path(__file__).with_name('sc750_driven_callback.py'))
+    producer=importlib.util.module_from_spec(callback_spec);callback_spec.loader.exec_module(producer)
+    payload,measured=producer.completed_observables(directory/'tdgw.h5',
+        duration_fs=.15,measure_interval_fs=.05)
+    np.savez(directory/'plot_data.npz',**payload)
+    row=dict(tag=tag,arm=arm,amplitude_v_m=1.e8,completed=True,qualified_comparison=False,
+        diagnostic_role='UNQUALIFIED_DRIVEN_PILOT',zero_gate=False,duration_fs=.15,
+        actual_active=[100,144],response_policy=policy,**measured)
+    (directory/'complete.json').write_text(json.dumps(row))
+    terminal=dict(status='UNQUALIFIED_DRIVEN_PILOT_COMPLETE',diagnostic_role='UNQUALIFIED_DRIVEN_PILOT',
+        qualified_comparison=False,no_zero_control_or_calibrated_comparison_claim=True,
+        requested=requested,numerical_fit_tolerance=.05,runs=[row],raw_zero_status='NOT_DONE_DIAGNOSTIC_PILOT_ONLY')
+    (root/'pilot_complete.json').write_text(json.dumps(terminal))
+    return directory,terminal,payload
+
+
+@pytest.mark.parametrize('arm',module.ARMS[1:])
+def test_one_actual_complete_pilot_preserves_literal_arm_complex_data_and_exact_times(tmp_path,arm):
+    directory,terminal,payload=_pilot_campaign(tmp_path,arm)
+    (tmp_path/'C_pilot_uncommitted').mkdir()  # No receipt => never inferred/plotted.
+    _,items,report=module.pilot_inputs(tmp_path)
+    assert len(items)==1 and items[0]['arm']==arm
+    np.testing.assert_array_equal(items[0]['time_fs'],payload['time_fs'])
+    np.testing.assert_array_equal(items[0]['polarization_au'],payload['polarization_au'])
+    assert np.max(items[0]['polarization_au'].imag)>0
+    assert report['qualified_comparison'] is False
+    assert report['numerical_fit_tolerance']==.05
+    assert report['scope']=='UNQUALIFIED_DIAGNOSTIC_PILOTS_ONLY'
+    # The existing qualified mode must not silently accept pilot_complete.
+    with pytest.raises(FileNotFoundError):
+        module.main([str(tmp_path),'--out',str(tmp_path/'qualified')])
+
+
+def test_pilot_rejects_incomplete_native_payload_and_mislabelled_frozen_arm(tmp_path):
+    directory,terminal,_=_pilot_campaign(tmp_path)
+    terminal['runs'][0]['arm']='off'
+    (tmp_path/'pilot_complete.json').write_text(json.dumps(terminal))
+    with pytest.raises(ValueError,match='join mismatch'):module.pilot_inputs(tmp_path)
+    terminal['runs'][0]['arm']=module.ARMS[1]
+    (tmp_path/'pilot_complete.json').write_text(json.dumps(terminal))
+    with h5py.File(directory/'tdgw.h5','a') as f:f['tdgw_data/checkpoint/it_next'][...]=2
+    with pytest.raises(ValueError,match='coverage'):module.pilot_inputs(tmp_path)

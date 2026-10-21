@@ -267,12 +267,121 @@ def plot_calibration(root, out, tags=None):
     (out/"calibration_only.json").write_text(json.dumps(report, indent=2)+"\n")
 
 
+def pilot_inputs(root):
+    """Join only terminal diagnostic-pilot rows to their actual native H5.
+
+    Uses the producer's completed_observables owner, exact native timestamps
+    and saved payload. A started or partially completed pilot is not inferred
+    from an output file, nor is B confused with the no-collision static arm.
+    """
+    import importlib.util
+    root=Path(root)
+    manifest=json.loads((root/'manifest.json').read_text())
+    terminal=json.loads((root/'pilot_complete.json').read_text())
+    plan=manifest['plan'];requested=plan.get('diagnostic_pilot')
+    if (not isinstance(requested,dict) or not requested.get('arms')
+            or any(arm not in ARMS[1:] for arm in requested['arms'])
+            or len(set(requested['arms']))!=len(requested['arms'])
+            or terminal.get('status')!='UNQUALIFIED_DRIVEN_PILOT_COMPLETE'
+            or terminal.get('diagnostic_role')!='UNQUALIFIED_DRIVEN_PILOT'
+            or terminal.get('qualified_comparison') is not False
+            or manifest.get('diagnostic_role')!='UNQUALIFIED_DRIVEN_PILOT'
+            or manifest.get('qualified_comparison') is not False
+            or terminal.get('requested')!=requested
+            or terminal.get('no_zero_control_or_calibrated_comparison_claim') is not True
+            or terminal.get('numerical_fit_tolerance')!=plan['fit_tolerance']):
+        raise ValueError('explicit terminal unqualified diagnostic-pilot schema required')
+    rows=terminal.get('runs')
+    if not isinstance(rows,list) or not rows:
+        raise ValueError('pilot_complete must name actual completed pilot runs')
+    path=Path(__file__).with_name('sc750_driven_callback.py')
+    spec=importlib.util.spec_from_file_location('sc750_plot_observable_owner',path)
+    producer=importlib.util.module_from_spec(spec);spec.loader.exec_module(producer)
+    items=[];seen=set()
+    for row in rows:
+        tag=row.get('tag');arm=row.get('arm');amp=row.get('amplitude_v_m')
+        if (not isinstance(tag,str) or Path(tag).name!=tag or tag in ('.','..') or tag in seen
+                or arm not in requested['arms'] or amp not in requested['amplitudes_v_m']
+                or tag!=f"{arm[0]}_pilot_{requested['amplitudes_v_m'].index(amp)}"
+                or row.get('completed') is not True or row.get('qualified_comparison') is not False
+                or row.get('diagnostic_role')!='UNQUALIFIED_DRIVEN_PILOT'
+                or row.get('zero_gate') is not False
+                or row.get('duration_fs')!=plan['duration_fs']
+                or row.get('actual_active')!=manifest['actual_active']
+                or row.get('response_policy')!=manifest['response_policy']):
+            raise ValueError('pilot_complete run/arm/window/policy join mismatch')
+        seen.add(tag);directory=root/tag
+        if json.loads((directory/'complete.json').read_text())!=row:
+            raise ValueError('pilot terminal and per-run completion disagree')
+        payload,measured=producer.completed_observables(directory/'tdgw.h5',
+            duration_fs=plan['duration_fs'],measure_interval_fs=plan['measure_as']/1000.)
+        for key in ('completed_samples','checkpoint_fs','carrier_peak','hole_peak'):
+            if row.get(key)!=measured[key]:
+                raise ValueError('pilot completion/native measurements mismatch: '+key)
+        with np.load(directory/'plot_data.npz',allow_pickle=False) as saved:
+            for key,value in payload.items():
+                if not np.array_equal(saved[key],value):
+                    raise ValueError('pilot native H5/plot NPZ mismatch: '+key)
+        with h5py.File(directory/'tdgw.h5','r') as f:
+            header=f['tdgw_header/wfn_header']
+            bands=tuple(int(header['bands'][key][()]) for key in ('start','stop','step'))
+            weights=np.asarray(header['w_k']);kpts=np.asarray(header['kpts'])
+        if (bands!=(manifest['actual_active'][0]+1,manifest['actual_active'][1]+1,1)
+                or weights.shape!=(64,) or kpts.shape!=(64,3)
+                or not np.isfinite(weights).all() or not np.isfinite(kpts).all()
+                or not np.isclose(weights.sum(),1.)):
+            raise ValueError('pilot native full64/window header mismatch')
+        items.append(dict(payload,path=str(directory),arm=arm,amplitude_v_m=amp))
+    report=dict(scope='UNQUALIFIED_DIAGNOSTIC_PILOTS_ONLY',qualified_comparison=False,
+        raw_zero_status=terminal.get('raw_zero_status'),numerical_fit_tolerance=plan['fit_tolerance'],
+        execution_revision=manifest['execution_revision'],actual_active=manifest['actual_active'],
+        response_policy=manifest['response_policy'],completed_runs=rows,
+        interpolation=False,zero_field_subtraction=False,
+        qualification='Actual exploratory P/E/carriers only. No matched-comparison, damping, convergence or positivity claim.')
+    return manifest,items,report
+
+
+def plot_pilots(root,out):
+    """Plot native observables even for ONE completed unqualified B or C pilot."""
+    manifest,items,report=pilot_inputs(root)
+    projection=np.asarray(manifest['plan']['pulse']['polarization'],float)
+    if (projection.shape!=(3,) or not np.isfinite(projection).all()
+            or not np.isclose(projection@projection,1.)):
+        raise ValueError('literal unit pulse polarization required')
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig,axes=plt.subplots(2,2,figsize=(12,8))
+    for item in items:
+        t=item['time_fs'];label=f"{item['arm']}; {item['amplitude_v_m']:g} V/m (pilot)"
+        p=item['polarization_au']@projection;e=item['field_au']@projection
+        axes[0,0].plot(t,p.real,label=label)
+        axes[0,1].plot(t,e.real,label=label)
+        axes[1,0].plot(t,item['conduction_electrons_per_cell'],label=label+' electrons')
+        axes[1,0].plot(t,item['valence_holes_per_cell'],'--',label=label+' holes')
+        axes[1,1].plot(t,p.imag,label=label)
+    for axis,ylabel in zip(axes.flat,('Re P along pulse (native au)','Re applied E along pulse (native au)',
+            'electrons/cell; holes dashed','Im P diagnostic along pulse (native au)')):
+        axis.set(xlabel='time (fs)',ylabel=ylabel);axis.legend(fontsize=7)
+    fig.suptitle('UNQUALIFIED diagnostic pilots — no matched comparison or damping inference')
+    fig.tight_layout();out=Path(out);out.mkdir(parents=True,exist_ok=False)
+    fig.savefig(out/'diagnostic_pilot.png',dpi=150);plt.close(fig)
+    report['actual_coverage']=[dict(arm=i['arm'],path=i['path'],
+        first_fs=float(i['time_fs'][0]),last_fs=float(i['time_fs'][-1]),
+        samples=len(i['time_fs']),maximum_field_imaginary_au=float(abs(i['field_au'].imag).max()))
+        for i in items]
+    (out/'diagnostic_pilot.json').write_text(json.dumps(report,indent=2)+'\n')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("campaign", help="completed sc750_driven_callback output")
     parser.add_argument("--out", required=True, help="new plot/report directory")
-    parser.add_argument("--calibration-only", action="store_true",
+    modes=parser.add_mutually_exclusive_group()
+    modes.add_argument("--calibration-only", action="store_true",
                         help="only complete10fs static-A calibration legs; no B/C claim")
+    modes.add_argument('--diagnostic-pilot',action='store_true',
+                        help='only pilot_complete actual B/C runs; explicitly unqualified, no damping claim')
     parser.add_argument("--calibration-tags", nargs="+",
                         help="explicit subset of committed A_calibration_NN legs (calibration-only)")
     args = parser.parse_args(argv)
@@ -283,6 +392,8 @@ def main(argv=None):
         return plot_calibration(root, out, tags=args.calibration_tags)
     if args.calibration_tags is not None:
         raise ValueError("calibration-tags requires explicit calibration-only mode")
+    if args.diagnostic_pilot:
+        return plot_pilots(root,out)
     manifest = json.loads((root/"manifest.json").read_text())
     done = json.loads((root/"complete.json").read_text())
     plan = manifest["plan"]
