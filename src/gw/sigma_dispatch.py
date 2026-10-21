@@ -1625,16 +1625,14 @@ def _compute_mpa_sigma(
         from .cd.sigma import compute_sigma_c_cd_omega_grid
         # The CD body takes an explicit frequency axis: the on-shell request's
         # distinct frequencies, or the deck grid under sigma_omega_grid_debug.
+        # With a request it returns the SPM/MPA route's on-shell operand
+        # (OnShellSigma, gw.cd.sigma.cd_on_shell_body), never an omega-grid
+        # cube on the deck's grid; its derivative slot is the CD derivative
+        # accumulators' exact dSigma/domega on the pair table.
         body = compute_sigma_c_cd_omega_grid(
             wfns, cd_handle, meta, mesh_xy, sym=sym, config=config, run_dir=input_dir,
-            sig_x=sig_x, **dict(body_options, omega_grid_ry=(
+            sig_x=sig_x, on_shell_request=request, **dict(body_options, omega_grid_ry=(
                 config.omega_grid_ry if request is None else request.frequencies_ry)))
-        if request is not None:
-            # The CD body holds Sigma_c on the request's distinct frequencies; the
-            # finalize reads it as the SPM/MPA route's on-shell operand
-            # (OnShellSigma), never as an omega-grid cube on the deck's grid.
-            from .cd.sigma import cd_on_shell_body
-            body = cd_on_shell_body(body, request, mesh_xy, print_fn=print_fn)
     else:
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
