@@ -2359,7 +2359,7 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
 RESPONSE_BLOCKS = ("FF", "FA", "AF", "AA")
 
 
-def response_blocks(energy, f, u, active, *, allow_crossing=False):
+def response_blocks(energy, f, u, active, *, allow_crossing=False, exact_endpoint_support=False):
     """chi0 as four (hole x electron) blocks, each with its own transition interval.
 
     ``active`` = (a0, a1): the active bands A (0-based, half-open, on the band
@@ -2377,6 +2377,9 @@ def response_blocks(energy, f, u, active, *, allow_crossing=False):
     other blocks too. For a coherent-density caller f/u on A describe ONLY
     endpoint support (both one), not the actual density; independently formed
     Psi rho and Psi(I-rho) faces must supply the matrix weights.
+    ``exact_endpoint_support=True`` instead accepts their exact FULL-matrix
+    column supports on A, including any arbitrarily small coherence. Only
+    those support-certified columns enter the interval; the default is unchanged.
     """
     a0, a1 = (int(x) for x in active)
     band = np.arange(energy.shape[1])[None, :]
@@ -2393,7 +2396,8 @@ def response_blocks(energy, f, u, active, *, allow_crossing=False):
                          f"f = {f[k, b]:.6g} on frozen band {b} (k row {k}) outside the active "
                          f"bands [{a0}, {a1}); want 0/1 on every frozen band; why: the frozen "
                          "blocks' rules are positive-interval rules built once for the run")
-    holes, electrons = dict(F=F & (f == 1), A=A), dict(F=F & (u == 1), A=A)
+    holes = dict(F=F & (f == 1), A=A & (f != 0) if exact_endpoint_support else A)
+    electrons = dict(F=F & (u == 1), A=A & (u != 0) if exact_endpoint_support else A)
     out = []
     for name in RESPONSE_BLOCKS:
         h, e = holes[name[0]], electrons[name[1]]

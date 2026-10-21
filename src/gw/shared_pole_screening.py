@@ -117,6 +117,33 @@ def _direct_dielectric_request(snapshot):
     return dict(q=0, z_ry=z)
 
 
+def _density_endpoint_column_support(rho, stop, *, occupations=None, active=None):
+    """Exact full-matrix column supports of rho and I-rho; no occupation cut.
+
+    ``rho[k,b,b]`` is the already validated full current density. A coherent
+    column stays live even at a zero diagonal, however small its off-diagonal
+    entries. Only exact zero endpoint columns and bands outside the declared
+    screening support disappear. With ``occupations`` and numerical ``active``
+    supplied, frozen endpoints keep their ORIGINAL scalar weights (and the
+    existing fractional-frozen refusal); active matrix weights live in Psi rho.
+    """
+    rho = np.asarray(rho)
+    if rho.ndim != 3 or rho.shape[-1] != rho.shape[-2] or not 0 < stop <= rho.shape[-1]:
+        raise ValueError('GATE shared_general_endpoint_support: square density and physical band stop required')
+    live = np.arange(rho.shape[-1])[None] < stop
+    occupied = np.any(rho != 0, axis=-2)
+    # Comparison avoids allocating a second full complex I-rho host cube.
+    empty = np.any(rho != np.eye(rho.shape[-1], dtype=rho.dtype)[None], axis=-2)
+    if occupations is not None or active is not None:
+        occupations = np.asarray(occupations)
+        if occupations.shape != occupied.shape or not isinstance(active, slice):
+            raise ValueError('GATE shared_general_endpoint_support: current occupations and numerical active slice required')
+        inside = (np.arange(rho.shape[-1]) >= active.start)&(np.arange(rho.shape[-1]) < active.stop)
+        occupied = np.where(inside[None], occupied, occupations)
+        empty = np.where(inside[None], empty, 1.-occupations)
+    return occupied.astype(float)*live, empty.astype(float)*live
+
+
 def _save_general_dielectric_probe(raw, operators, record, *, root, index):
     """Commit scalar native epsilon/inverse witnesses, never a host mu face.
 
@@ -399,12 +426,10 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     if not 0 <= response_active.start <= active.start < active.stop <= response_active.stop <= stop:
         raise ValueError('GATE response_blocks_active: numerical response group must contain the coherent window')
     band = np.arange(nb)[None]
-    amask = (band >= response_active.start)&(band < response_active.stop)
-    live = band < stop
-    f_support = np.where(amask,1.,occupations)*live
-    u_support = np.where(amask,1.,1.-occupations)*live
+    f_support, u_support = _density_endpoint_column_support(rho, stop,
+        occupations=occupations, active=response_active)
     blocks = response_blocks(energy,f_support,u_support,(response_active.start,response_active.stop),
-                             allow_crossing=True)
+                             allow_crossing=True, exact_endpoint_support=True)
     rules, scalar_cache = [], fit_basis.setdefault('scalar_rules',{})
     # Do not force native high-height supports to use the narrow eta-height
     # continuation grid. Partition by actual height and by noncrossing status;
