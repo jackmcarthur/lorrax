@@ -1092,28 +1092,43 @@ def run_feast_ritz(
 FEAST_TOL_MEV = 0.01
 
 
-def refuse_unconverged_feast(results: dict, windows, *, tol_mev: float, ry_to_ev: float) -> str:
+def refuse_unconverged_feast(results: dict, windows, *, tol_mev: float, ry_to_ev: float,
+                             n_ritz: int | None = None) -> str:
     """``GATE feast_converged``: the in-window Ritz pairs of every window, the
     ones FEAST reports, each with residual below ``tol_mev``; otherwise refuse
     before anything is reported.  Out-of-window pairs (marked ``*``) are the
-    filter's leakage, not results, and are not tested."""
+    filter's leakage, not results, and are not tested.  A window whose Ritz
+    pairs are all in-window (``n_in == n_ritz``, the requested count, default
+    the pairs returned) is saturated: it may hold more eigenvalues than the
+    subspace, so it refuses too."""
     wmap = {w.name: w for w in windows}
-    worst, bad, n_tested = 0.0, [], 0
+    worst, bad, n_tested, saturated = 0.0, [], 0, []
     for name, rr in results.items():
         w = wmap.get(name)
         if w is None:
             continue
         ev = np.asarray(rr.ritz_evals) * ry_to_ev
         res = np.asarray(rr.rel_residuals) * ry_to_ev * 1.0e3        # meV
-        for i in np.where((ev >= w.a_eV) & (ev <= w.b_eV))[0]:
+        inside = np.where((ev >= w.a_eV) & (ev <= w.b_eV))[0]
+        cap = int(n_ritz) if n_ritz is not None else len(ev)
+        if cap > 0 and len(inside) >= cap:
+            saturated.append(f"{name} [{w.a_eV:g}, {w.b_eV:g}] eV: {len(inside)}/{cap}")
+        for i in inside:
             n_tested += 1
             worst = max(worst, float(res[i]))
             if not res[i] < tol_mev:
                 bad.append(f"{name}#{i + 1} {ev[i]:.6f} eV: {res[i]:.3e} meV")
     line = (f"FEAST {'NOT converged' if bad else 'converged'}: {n_tested - len(bad)}/"
             f"{n_tested} in-window Ritz pairs with residual < {tol_mev:g} meV; "
-            f"max {worst:.3e} meV")
+            f"max {worst:.3e} meV"
+            + (f"; saturated: {', '.join(saturated)} in-window pairs" if saturated else ""))
     log.info(line)
+    if saturated:
+        raise RuntimeError(
+            f"GATE feast_converged: {line}.  A saturated window can hold more "
+            "eigenvalues than its Ritz subspace, so some may be missing.  No FEAST "
+            "eigenvalues were reported.  Fix: raise --feast-ritz-count, narrow the "
+            "window, or use the default eigensolve (bse_jax without --feast).")
     if bad:
         raise RuntimeError(
             f"GATE feast_converged: {line} ({'; '.join(bad[:6])}"
@@ -1773,7 +1788,7 @@ def run(args) -> None:
                 use_tda=use_tda,
             )
         refuse_unconverged_feast(results, windows, tol_mev=args.feast_tol_mev,
-                                 ry_to_ev=args.units_ev_per_ry)
+                                 ry_to_ev=args.units_ev_per_ry, n_ritz=args.feast_ritz_count)
         wmap = {w.name: w for w in windows}
         for name, rr in results.items():
             w = wmap.get(name)

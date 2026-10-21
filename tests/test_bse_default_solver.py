@@ -21,8 +21,9 @@ the loader's shardings, the screened kernel real in R space (so H is Hermitian):
    lowest 8 (0.01 meV from dense) in fewer H applications than the default lock.
 7. Routes: no route flag is the eigensolve (Davidson), ``--lanczos`` its alias, ``--feast``
    FEAST; two route flags, or a FEAST flag without ``--feast``, refuse.  ``GATE
-   feast_converged`` refuses an in-window Ritz pair at 13.6 meV and passes when only an
-   out-of-window pair is unconverged.
+   feast_converged`` refuses an in-window Ritz pair at 13.6 meV and a saturated window (every
+   Ritz pair in-window), and passes when only an out-of-window pair is unconverged.  ``GATE
+   nontda_dense_size``: a non-TDA window over 4096 states refuses before the restart load.
 
 A script on a 1x1 mesh (login node, <= 4 threads) or a 2x2 mesh of four host devices
 (``XLA_FLAGS=--xla_force_host_platform_device_count=4``, at least 16 host threads):
@@ -195,19 +196,32 @@ def _driver_cases(mesh, ops):
     win = [WindowSpec("W1", 0.0, 2.0, "test")]
     ry_ev = RY_MEV / 1e3
 
-    def feast_gate(res):
+    def feast_gate(res, evals=(0.05, 0.1, 0.3)):
         try:
-            refuse_unconverged_feast({"W1": SimpleNamespace(ritz_evals=np.array([0.05, 0.1, 0.3]),
+            refuse_unconverged_feast({"W1": SimpleNamespace(ritz_evals=np.array(evals),
                                                             rel_residuals=np.array(res))},
-                                     win, tol_mev=TOL_MEV, ry_to_ev=ry_ev)
+                                     win, tol_mev=TOL_MEV, ry_to_ev=ry_ev, n_ritz=len(evals))
             return "pass"
         except RuntimeError as exc:
             return "refused" if "GATE feast_converged" in str(exc) else str(exc)
+    loads = []
+    real_load = bse_io.load_bse_data_from_restart_sharded
+    try:
+        bse_io.load_bse_data_from_restart_sharded = lambda *a, **k: loads.append(1)
+        bse_jax._preview_lanczos("toy.in", NV, NC, n_eig=N_EIG, tda=False, kgrid=(16, 16, 2))
+        dense_gate = "no refusal"
+    except ValueError as exc:
+        dense_gate = str(exc)
+    finally:
+        bse_io.load_bse_data_from_restart_sharded = real_load
     routes = [route([]), route(["--lanczos"]), route(["--feast"]), route(["--feast", "--lanczos"]),
               route(["--feast-n-quad1", "6"])]
     return {"routes_and_feast_gate": routes == ["eigensolve/davidson", "eigensolve/davidson", "feast",
                                                 "refused", "refused"]
-            and feast_gate([1e-9, 1e-3, 1.0]) == "refused" and feast_gate([1e-9, 1e-9, 1.0]) == "pass",
+            and feast_gate([1e-9, 1e-3, 1.0]) == "refused" and feast_gate([1e-9, 1e-9, 1.0]) == "pass"
+            and feast_gate([1e-9, 1e-9, 1e-9], evals=(0.05, 0.1, 0.12)) == "refused"
+            and "_DENSE_N_MAX" in dense_gate and "N=8192" in dense_gate and "--tda" in dense_gate
+            and loads == [],
             "dipole_position_fix_reaches_loader": seen.get("velocity_file") == "toy_dipole.h5"
             and seen.get("velocity_position_fix") is True,
             "capped_davidson_refuses_unwritten": "GATE davidson_converged" in gate
@@ -241,7 +255,8 @@ def main() -> int:
         f"6 margin locked at 1 meV: CONVERGED, <= {TOL_MEV} meV from dense, fewer H applications":
             out["margin_lock_converged"] and out["margin_lock_vs_dense_meV"] <= TOL_MEV
             and out["margin_lock_matvecs"] < out["davidson_matvecs"],
-        "7 routes (default eigensolve, --lanczos alias, --feast explicit) and GATE feast_converged":
+        "7 routes (--lanczos alias, --feast explicit), GATE feast_converged (residual, saturation), "
+        "GATE nontda_dense_size before the load":
             out["routes_and_feast_gate"],
     }
     ok = all(checks.values())

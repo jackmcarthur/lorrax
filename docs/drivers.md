@@ -336,7 +336,7 @@ solver flags are eigensolve-only (marked *Lanczos* below, after its old flag).
 
 | flag | default | meaning |
 |---|---|---|
-| `--lanczos` / `--feast` | eigensolve | the eigensolve (`--solver`, Davidson by default) is the default route since 2026-10-21; `--lanczos` is a no-op alias. `--feast` runs FEAST windows (`bse_feast`, `--feast-iter` 2) and refuses unless every in-window Ritz pair's residual is below `--feast-tol-mev` (0.01 meV; `GATE feast_converged`) |
+| `--lanczos` / `--feast` | eigensolve | the eigensolve (`--solver`, Davidson by default) is the default route since 2026-10-21; `--lanczos` is a no-op alias. `--feast` runs FEAST windows (`bse_feast`, `--feast-iter` 2) and refuses unless every in-window Ritz pair's residual is below `--feast-tol-mev` (0.01 meV; `GATE feast_converged`), and when a window is saturated (every Ritz pair in-window: raise `--feast-ritz-count`) |
 | `--bse` / `--rpa` | RPA | `--bse` adds $-W$ |
 | `--tda` | off | resonant block only; without it every route solves the full BSE, and `--lanczos` goes to the dense `bse_nontda` solver, ignoring `--solver`, `--block-size` and `--n-reorth` |
 | `--n-val` / `--n-cond` / `--n-occ` | 4 / 4 / the WFN's `ifmax` | transition window; the occupied-band count is `--n-occ` (*Lanczos*), else the deck WFN's `ifmax` |

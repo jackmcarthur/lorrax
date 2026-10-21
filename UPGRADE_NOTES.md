@@ -20,12 +20,15 @@ convergence test.
   (Davidson); it used to run FEAST. `--lanczos` is kept as a no-op alias, and
   FEAST needs `--feast`. A FEAST flag without `--feast` refuses, as do two route
   flags. Without `--tda` the default is now the dense structure-preserving
-  non-TDA solve (`bse_nontda`, N <= 4096); it used to be non-TDA FEAST.
+  non-TDA solve (`bse_nontda`, N <= 4096); it used to be non-TDA FEAST. A
+  larger non-TDA window refuses before the restart load and the W transform
+  (`GATE nontda_dense_size`) and names the alternatives (`--tda`, `--feast`).
 - **FEAST refuses unconverged pairs** (`GATE feast_converged`): every in-window
   Ritz pair's residual must be below `--feast-tol-mev` (0.01 meV, the Davidson
   default); out-of-window pairs are leakage and are not tested. It used to log
-  the residuals and report the values regardless. `--feast-iter` (2) is now a
-  `bse_jax` flag.
+  the residuals and report the values regardless. A saturated window (every
+  Ritz pair in-window, so eigenvalues may be missing) refuses too; raise
+  `--feast-ritz-count`. `--feast-iter` (2) is now a `bse_jax` flag.
 - **Margin roots.** BSE Davidson (`bse_jax`, `exciton_bands`) solves 8 roots
   above `--n-eig` (fewer when the transition space is small, at most half of
   it), stops when the lowest `--n-eig` converge, and reports only those. NSCF
@@ -44,6 +47,11 @@ convergence test.
   `--solver lanczos` its default stays 40. `bse_lanczos.solve_bse_sharded`'s
   Python defaults are now `solver_kind="davidson"`,
   `davidson_precond="exact"` (were `lanczos` / `bare`), as on the CLI.
+- **Open (audit S3).** The NSCF Davidson program's HLO differs once from
+  main's (the new opt-in parameters are traced through); its results are
+  bitwise equal, and the first NSCF run after the update recompiles.
+- **Open (audit S4).** No test covers a multiplet straddling the `--n-eig`
+  boundary, the case the margin roots exist for.
 
 ## 2026-10-21 — BSE lowest-N default is Davidson with a residual stop; Haydock runs in the eigensolve's process
 

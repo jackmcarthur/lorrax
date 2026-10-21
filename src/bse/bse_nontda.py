@@ -99,6 +99,29 @@ jax.config.update("jax_enable_x64", True)
 # fine-grid request fails loudly instead of OOM-ing.  N = nc_pad * nv_pad * nk.
 _DENSE_N_MAX = 4096
 
+
+def _dense_refusal(N: int) -> str:
+    """The one refusal text for a dense window over ``_DENSE_N_MAX``."""
+    return (f"non-TDA dense window N={N} (n_cond x n_val x nk, mesh-padded) exceeds "
+            f"_DENSE_N_MAX={_DENSE_N_MAX}: the dense structure-preserving solve "
+            "assembles A and B, O(N^2).  Alternatives: --tda (the TDA Davidson, the "
+            "default eigensolve), --feast (FEAST windows, refused unless converged to "
+            "--feast-tol-mev), or a smaller --n-val / --n-cond.  The matrix-free SDY "
+            "route (bse_nontda solver='matrixfree') has no bse_jax flag and refuses on a "
+            "sharded mesh.")
+
+
+def refuse_dense_window(n_cond: int, n_val: int, nk: int, mesh_xy) -> int:
+    """``GATE nontda_dense_size`` before any load: N of the dense non-TDA build
+    from the logical window, the k count and the mesh padding (each band axis
+    rounded up to its mesh extent, as the loader pads).  A degeneracy snap can
+    only widen the window, so the build's own check stays."""
+    px, py = (int(n) for n in mesh_xy.devices.shape)
+    N = (-(-int(n_cond) // px) * px) * (-(-int(n_val) // py) * py) * int(nk)
+    if N > _DENSE_N_MAX:
+        raise ValueError(_dense_refusal(N))
+    return N
+
 # --- the dense build's trial width ------------------------------------------
 # The peak is NOT set by the BSE window.  The ring kernel's T tensor is
 # ``(b, mu_local, nu_local, ns, ns, nk)`` -- c and v are contracted away at
@@ -329,10 +352,7 @@ def _materialize_A_B(matvec_full, args, sh, nc, nv, nk, *, col_chunk=None,
     the device budget via ``dense_col_chunk``; pass an int only to pin it."""
     N = nc * nv * nk
     if N > _DENSE_N_MAX:
-        raise ValueError(
-            f"non-TDA dense window N={N} exceeds _DENSE_N_MAX={_DENSE_N_MAX}; "
-            "the dense definite-pencil solver targets the BGW-parity (small) "
-            "regime — fine-grid non-TDA needs matrix-free FEAST-on-K (follow-on).")
+        raise ValueError(_dense_refusal(N))
     if col_chunk is None:
         col_chunk = dense_col_chunk(args, mesh_xy, N, log=log)
     eye = np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk)

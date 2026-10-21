@@ -118,8 +118,16 @@ def _preview_lanczos(
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
     haydock: dict | None = None,
     cell_volume: float | None = None,
+    kgrid: tuple | None = None,
     report=None,
 ) -> dict:
+    if not tda and kgrid is not None:
+        # GATE nontda_dense_size before the restart load and the W transform.
+        from math import prod
+        from .bse_densify import _resolve_bse_k_grid
+        from .bse_nontda import refuse_dense_window
+        refuse_dense_window(n_cond, n_val, prod(
+            _resolve_bse_k_grid(None, input_file) or kgrid), create_mesh_2d())
     restart_file = _find_restart_file(input_file)
     # ONE solve path on any mesh (1x1 included): the sharded loader and
     # ``solve_bse_sharded`` on the trial-stack matvec.  The single-device
@@ -1076,6 +1084,7 @@ def main(argv=None) -> int:
             tda=use_tda,
             haydock=_haydock_settings(args),
             cell_volume=float(wfn.cell_volume),
+            kgrid=tuple(int(n) for n in wfn.kgrid),
             report=report,
         )
 
