@@ -151,6 +151,65 @@ sum, μ-space work, electronic FFT, or current-W refresh.
 
 ## Specific remaining opportunities, not measured gains
 
+### First general full-density stream: completed 93C stream, refused fit
+
+Source `93c448f`, step `60062281.0`, passed scalar planning in **5.229 s**:
+**28 panels / 6,137 Green pairs**, maximum certificate `8.852e-9` at the
+unchanged `1e-8` tolerance, coefficient mass **175.9**. The stream then
+completed in **405.294 s**. Subsequent synchronized phases were Dyson
+**3.171 s**, direction selection **13.651 s**, and pencil assembly
+**11.510 s**. These are measured phases of this full750/full-ρ/16q refresh,
+not the earlier equilibrium compact44 Σ timing.
+
+The q0 reduced realization was **refused**, not admitted: order 424,
+largest pole imaginary part **1.00665239 Ry**, versus electronic evaluation
+height **0.01837465 Ry**. No ordered Σ, t0 collision, or propagation followed.
+Thus the completed stream is not a successful total-W or TD benchmark.
+The two direct microscopic W probes near the suspect pole had relative
+fit defects 0.957% and 0.706%; neither was at the pole or supplied a native
+dielectric inverse witness. Agreement against a large W background does
+not validate the pole. No pole clipping or numerical gate relaxation is used.
+
+One **5.85 s host-only scalar replay**, using the actual logged sites,
+current active energy span, block intervals and identical existing owners,
+reproduced exactly all 28 panels / 6,137 nodes:
+
+| Block | Green pairs | Panels | Share of nodes, not wall time |
+| --- | ---: | ---: | ---: |
+| FF | 60 | 3 | 0.98% |
+| FA | 3,484 | 12 | 56.77% |
+| AF | 1,873 | 9 | 30.52% |
+| AA | 720 | 4 | 11.73% |
+
+The low-height crossing groups alone use FA 2,898 + AF 1,604 + AA 579 nodes:
+**82.79%** of the total. These include the added `.25 eV` training/held
+supports with separate `.05 eV` response-lag decay, on broad transition
+intervals; FA spans about 5.59 Ry. In contrast, the newly certified
+high-imaginary FA fallback is only 152 nodes (**2.48%**). AA alone and the
+scalar planner are therefore not the main *node-count* cause. This does not
+authorize dropping verification/training sites, spectator transitions or
+coherences, nor loosening the certificate. A future numerical improvement
+must preserve the same full-density primitives and requested accuracy.
+
+Actual logs show **9 row passes of 84 local rows**, 3 nodes per accumulate.
+Panel 1 (22 nodes) took 4.217 s inclusive, with printed 1.1 s compilation and
+2.6 s native dispatch. Panel 4 (384 nodes) took 16.981 s inclusive, with 1.1 s
+compilation and 15.7 s dispatch; the next panel's compile time was 0.0 s.
+Thus this measured panel is dominated by execution, not compilation repeated
+per node. Distinct output counts and final partial-node shapes can compile
+once each. The loop skips inactive padded node slots; 384 is a panel carrier,
+not a requirement to evaluate 384 physical nodes in a shorter panel.
+
+See [the exact scalar replay and partial timing record](evidence/GENERAL_CHI_SCALAR_REPLAY_93C.json),
+which binds the local partial log snapshot and lists all group/panel counts.
+Node shares cannot be converted directly to time shares: band-range widths,
+FFT work and output counts differ. The final phase/refusal evidence is
+`material_ownq4_zero44_93C_60062281/q0_diagnostic/q_000_diagnostic.json`
+under the artifact root, alongside `q_000_direct_probes.json` and the
+frequency-only NPZ. No successful total-W runtime or speedup is claimed.
+
+### Other scoped opportunities
+
 - The older *passive* `window_sigma_c` path still executes prefix
   `[0,b_hi)` destinations and crops afterward: `ppm_sigma.py:2130–2140`,
   `2532–2534`, `2576–2579`, `2647–2656`. Its `window_only` option narrows
