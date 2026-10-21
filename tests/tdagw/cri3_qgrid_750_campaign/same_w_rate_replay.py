@@ -1,6 +1,6 @@
 """Replay the saved t0 active-rate BODY before any GW map or W construction.
 
-Four-rank diagnostic only. Native initialization and the authenticated accepted
+Four- or sixteen-rank diagnostic only. Native initialization and the authenticated accepted
 SC INPUT supply the full750 orbitals; the committed general W is read verbatim.
 Only active44 intermediate columns run. No head, virtual MH, tail, fixed point,
 collision-law change, or propagation is performed.
@@ -124,7 +124,8 @@ def main(argv=None):
     out=Path(args.out).resolve();finished=[];started=time.monotonic()
     original=sc_iteration.run_self_consistency
     def intercept(initial,inputs,**kwargs):
-        if jax.process_count()!=4:raise ValueError('GATE same_W_rate_replay: four ranks required')
+        if jax.process_count() not in (4,16):
+            raise ValueError('GATE same_W_rate_replay: four or sixteen ranks required')
         say=inputs.print_fn
         frozen.validate_callback_reference(frame,inputs.meta.qgrid,policy,inputs.config.qgrid_response_window)
         if (fingerprint_from_binding(inputs.wfn_fingerprint_binding,inputs.wfn)!=frame['wfn_fingerprint']
