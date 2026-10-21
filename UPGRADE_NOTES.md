@@ -5,6 +5,37 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — `bse_k_grid` `--eqp` dipoles: Rayleigh-quotient default, exact position opt-in (`--dipole-position-fix`)
+
+Owner decision. Under `--eqp` the densified dipoles are again
+`v/ΔE` of the fine states' Rayleigh quotients (what they were before
+219ee8275). The exact-position fix of 219ee8275 (r from the DFT f(H)
+eigenbasis of the window, rotated back) is now opt-in:
+`bse_jax --dipole-position-fix`, `absorption_haydock --dipole-position-fix`,
+`dump_window_dipoles --dipole-position-fix`, loader `velocity_position_fix`.
+
+- **Why.** The fix is exact only when the interpolated DFT f(H) is more
+  accurate than the QP f(H) that defines ψ. Si 4³→8³ (near-scissor ladder):
+  the DFT block mixes valence and conduction by 3.8 % and the fix puts the
+  window-sum |d|² 11.5 % rms off the native 8³ grid (max 39 %) against 2.9 %
+  (max 4.6 %) for the default; IP ε₂ 2.4 % against 0.86 % rms of peak.
+- **CrI3-type runs must opt in** (strongly band-dependent QP shifts). CrI3
+  8×8→12×12 against the native 12×12: the default loses 1.4 % of Σ|d|²
+  (0.986), 13 % below 1.6 eV (0.87), the lowest transition's quotient 60 meV
+  high; the fix matches to 0.05 %. 8×8→30×30: 0.985 / 0.81.
+- **Receipt.** Without the fix the log prints the fix's own mixing numbers
+  (max valence↔conduction mixing of the DFT f(H) eigenbasis, max relative
+  f(H) off-diagonal; `result["qp_mixing"]`). Large values say the run needs
+  the fix. There is no automatic switch.
+- **Results move.** `bse_k_grid` runs with `--eqp`: dipoles, oscillator
+  strengths and absorption (not the exciton energies). TD-aGW
+  (`tdagw.td_system`) loads without the fix, so its `r_window` under `--eqp`
+  is now the pair-rule position of `v/ΔE_RQ`; TD-aGW has no opt-in yet.
+- **Code.** `densified_dipoles(..., qp_states=, mixing_receipt=)`:
+  `qp_states` is the fix; `dump_window_dipoles` writes `d_alpha_rq` only with
+  it. Bitwise: the opt-in path equals the old r-fix and the default equals the
+  old `d_alpha_rq` (toy of `tests/test_bse_kgrid_dipoles_rfix_cpu.py`).
+
 ## 2026-10-21 — `bse_k_grid` dipoles: weighted velocity at an entangled fit-window top; `dipole.h5` band range
 
 The densifier carries the coarse velocity through the htransform as

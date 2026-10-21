@@ -867,6 +867,25 @@ def _position_in_fine_states(v_win, f_win, n_val, newton, *, rule, gap_ry,
     return r_win, eps_all, offblock, cv_eig_sum
 
 
+def _qp_window_mixing(f_win, n_val):
+    """``(max v↔c mixing, max relative off-diagonal)`` of f(H) in the fine states.
+
+    ``f_win`` (nq, nb, nb) is the velocity's DFT f(H) block in the fine
+    window, valence rows first.  The two numbers of the r-fix record
+    (``max_offblock_mixing``, ``fh_offdiag_rel_max``), computed the same way
+    whether or not the fix is applied: they say when ``--dipole-position-fix``
+    is needed (the fine QP states are not DFT eigenstates).
+    """
+    fq = 0.5 * (f_win + np.conj(np.swapaxes(f_win, -1, -2)))
+    w = np.linalg.eigh(fq)[1]
+    mix = np.maximum(np.linalg.norm(w[:, :n_val, n_val:], axis=(1, 2)),
+                     np.linalg.norm(w[:, n_val:, :n_val], axis=(1, 2)))
+    off = np.linalg.norm(
+        f_win - np.einsum("qii->qi", f_win)[..., None] * np.eye(f_win.shape[-1]),
+        axis=(1, 2)) / np.maximum(np.linalg.norm(f_win, axis=(1, 2)), 1e-300)
+    return float(mix.max()), float(off.max())
+
+
 #: Smallest eigenvalue of the weight ``g`` over the fine window, relative to
 #: its largest, that :func:`_velocity_from_weighted` divides by (the weight
 #: is >= 1 - e^-4 on the window's own bands at every coarse k).
@@ -919,7 +938,8 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       coarse_grid, n_val, window_start, a_band_index,
                       mesh_xy, log_fn=print, full_window: bool = False,
                       qp_states: bool = False, pair_rule: str = "mask",
-                      pair_gap_ev: float = 0.05) -> dict:
+                      pair_gap_ev: float = 0.05,
+                      mixing_receipt: bool = False) -> dict:
     r"""r-form dipoles of a ``bse_k_grid`` bundle, in the gauge of its own ψ.
 
     The coarse WFN's velocity matrix ``v(k)`` (``psp.get_dipole_mtxels``'
@@ -1010,13 +1030,23 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
         c <- v): ``v_window`` and ``e_dft_window`` below.  Off by default;
         the default outputs do not depend on it.
     qp_states : bool
-        The fine states are eigenstates of a QUASIPARTICLE f(H) (``--eqp``;
-        the loader passes ``eqp_file is not None``).  Then the velocity's
-        DFT f(H) block is not diagonal in them, and ``v/ΔE`` of its
-        Rayleigh quotients is not their position (CrI3 8→12: Σ|d|² 0.986,
-        onset 0.87 against the native fine grid): the dipoles become the
-        exact ``⟨c̃|r̂|ṽ⟩`` of :func:`_position_in_fine_states`.  False
-        (DFT f(H)): the outputs are bitwise those of ``v/ΔE``.
+        The exact-position fix, opt-in (``--dipole-position-fix``; the
+        loader passes ``eqp_file is not None and velocity_position_fix``).
+        Under ``--eqp`` the fine states are eigenstates of a QUASIPARTICLE
+        f(H); with strongly band-dependent QP shifts that interpolant mixes
+        the velocity's DFT bands, the DFT f(H) block is not diagonal in them,
+        and ``v/ΔE`` of its Rayleigh quotients is not their position (CrI3
+        8→12: Σ|d|² 0.986, onset 0.87 against the native fine grid; the fix
+        0.05 %).  Then the dipoles are the ``⟨c̃|r̂|ṽ⟩`` of
+        :func:`_position_in_fine_states`, exact when the DFT f(H)
+        interpolant is the more accurate one.  Off (default): ``v/ΔE_RQ``;
+        Si 4³→8³, a near-scissor QP ladder, is 4x closer to the native grid
+        this way (the DFT f(H) block mixes v↔c by 3.8 % there).
+    mixing_receipt : bool
+        Log the receipt that decides the opt-in (the loader passes
+        ``eqp_file is not None``): max valence↔conduction mixing of the DFT
+        f(H) eigenbasis in the fine states and the largest relative f(H)
+        off-diagonal (:func:`_qp_window_mixing`).
     pair_rule, pair_gap_ev : str, float
         Same-occupation pairs of the window position (``r_window``, and the
         c̃ṽ dipoles where W mixes valence and conduction rows):
@@ -1201,6 +1231,14 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     elif full_window:
         r_window = _position_from_velocity_rule(v_win, e_dft, n_val,
                                                 rule=pair_rule, gap_ry=gap_ry)
+    mixing = None
+    if mixing_receipt and not qp_states:
+        mixing = _qp_window_mixing(f_win, n_val)
+        log_fn(f"[bse_k_grid dipoles] --eqp without --dipole-position-fix: d = "
+               f"v/dE_RQ; QP/DFT window mixing receipt: max off-block (v<->c) "
+               f"mixing {mixing[0]:.3e}, f(H) off-diagonal max {mixing[1]:.3e} "
+               f"(relative); large values (strongly band-dependent QP shifts, "
+               f"CrI3-type) call for --dipole-position-fix")
 
     on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
         out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
@@ -1267,6 +1305,9 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
     if qp_states:
         result["d_alpha_rq"] = d_alpha_rq
         result["rfix"] = rfix
+    if mixing is not None:
+        result["qp_mixing"] = {"max_offblock_mixing": mixing[0],
+                               "fh_offdiag_rel_max": mixing[1]}
     return result
 
 
@@ -1370,6 +1411,7 @@ def _interpolate_bse_data_to_grid(
     velocity_full_window: bool = False,
     velocity_pair_rule: str = "mask",
     velocity_pair_gap_ev: float = 0.05,
+    velocity_position_fix: bool = False,
     log_fn=print,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
@@ -1427,6 +1469,10 @@ def _interpolate_bse_data_to_grid(
     velocity_pair_rule, velocity_pair_gap_ev : str, float
         :func:`densified_dipoles`' ``pair_rule`` / ``pair_gap_ev`` (the
         same-occupation pairs of ``r_window``).
+    velocity_position_fix : bool
+        With ``eqp_file``: the exact-position fix of
+        :func:`densified_dipoles` (``qp_states``), opt-in
+        (``--dipole-position-fix``); off, ``v/ΔE_RQ`` and the mixing receipt.
     head_channel : dict or None
         C1's split-and-reattach hand-off from the loader, ``None`` on the
         ``legacy`` arm.  When present it carries ``whead`` (the head scalar the
@@ -1559,8 +1605,10 @@ def _interpolate_bse_data_to_grid(
             fh_energies=np.asarray(gather_to_host(enk_sigma)).T,
             coarse_grid=coarse_grid, n_val=n_val, window_start=b_min,
             a_band_index=htransform_a_band, mesh_xy=mesh_xy, log_fn=log_fn,
-            full_window=velocity_full_window, qp_states=eqp_file is not None,
-            pair_rule=velocity_pair_rule, pair_gap_ev=velocity_pair_gap_ev)
+            full_window=velocity_full_window,
+            qp_states=eqp_file is not None and bool(velocity_position_fix),
+            pair_rule=velocity_pair_rule, pair_gap_ev=velocity_pair_gap_ev,
+            mixing_receipt=eqp_file is not None)
         del bundle.coeffs_fi, velocity
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))

@@ -311,14 +311,22 @@ Newton-inverted, and
 $$E_n(q) = f^{-1}\big(U_{qn}^\dagger\,[f(H)]_{\rm file}(q)\, U_{qn}\big),\qquad
 d^\alpha_{cvq} = \frac{v^\alpha_{cv}(q)}{E_c(q) - E_v(q)} .$$
 
-Under `--eqp` the fine states diagonalize the interpolated QP $f(H)$ instead.
-A band-dependent correction makes that a different operator off the coarse
-grid, so the states mix the file's bands and $v/\Delta E$ of their Rayleigh
-quotients is not their position: on CrI3 8×8→12×12 against the native 12×12
-it loses 1.4 % of $\sum|d|^2$ (13 % below 1.6 eV), with $\sum|v|^2$ kept to
-4e-4 and the lowest transition's quotient 60 meV high. The dipoles are then
-the exact position of the fine states (`qp_states`, the loader passes
-`eqp_file is not None`): per q, $F = U^\dagger [f(H)]_{\rm file} U = W\,\mathrm{diag}(\varphi)\,W^\dagger$,
+Under `--eqp` the fine states diagonalize the interpolated QP $f(H)$ instead,
+and the default dipoles are $v/\Delta E$ of their Rayleigh quotients, as
+above. A strongly band-dependent correction makes the QP $f(H)$ a different
+operator off the coarse grid, so the states mix the file's bands and those
+dipoles are not their position: on CrI3 8×8→12×12 against the native 12×12
+they lose 1.4 % of $\sum|d|^2$ (13 % below 1.6 eV), with $\sum|v|^2$ kept to
+4e-4 and the lowest transition's quotient 60 meV high. The opt-in
+`--dipole-position-fix` (`qp_states`; the loader passes `eqp_file is not
+None and velocity_position_fix`) then takes the exact position of the fine
+states from the DFT $f(H)$ eigenbasis of the window, which matches CrI3 to
+0.05 %. It is exact only when the DFT interpolant is the more accurate one:
+on Si 4³→8³ (a near-scissor ladder) its window block mixes valence and
+conduction by 3.8 % and the fix moves the window-sum $|d|^2$ 11.6 % rms
+off-grid against 2.6 % for the default. Without the fix the log prints the
+same mixing receipt (max off-block mixing, $f(H)$ off-diagonal) so a run can
+see when it needs it. The fix, per q: $F = U^\dagger [f(H)]_{\rm file} U = W\,\mathrm{diag}(\varphi)\,W^\dagger$,
 $\varepsilon = f^{-1}(\varphi)$,
 
 $$r' = \frac{(W^\dagger v W)_{mn}}{i(\varepsilon_m - \varepsilon_n)},\qquad
