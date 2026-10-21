@@ -1,0 +1,97 @@
+{
+  "status": "PASS",
+  "date": "2026-10-21",
+  "kind": "CPU-only perturbative theory diagnostic, not a material or trajectory qualification",
+  "test": "tests/tdagw/test_finite_memory_initial_dressing_cpu.py",
+  "test_sha256": "b5ba4259fb63b521829edc22f5e1793e5591a980f5bbf68a92c3897c2a8228a0",
+  "command": "PYTHONPATH=src /tmp/lorrax_mgkba_cpu_venv/bin/python -m pytest tests/tdagw/test_finite_memory_initial_dressing_cpu.py -q -p no:cacheprovider",
+  "result": "3 passed in 0.21s",
+  "model": {
+    "hamiltonian": "H=sum_i E_i c_i^dagger c_i + Omega b^dagger b + g (c^dagger M c)(b+b^dagger)",
+    "energies": [-1.0, -0.5, 1.0],
+    "omega": 1.0,
+    "vertex": "M_02=M_12=M_20=M_21=1, all other entries zero; complex phase also tested",
+    "fermion_number": 2,
+    "oscillator_cutoff": 6,
+    "joint_sector_dimension": 18,
+    "initial_product_state": "occupied orbitals 0,1 and oscillator vacuum",
+    "physical_density": "rho_ij=<c_j^dagger c_i>, trace 2",
+    "eta": 0.0,
+    "time": 0.8,
+    "instantaneous_Hs_fixed_point_solved": false,
+    "phase_convention": "The fixed E is the zeroth-order free Hamiltonian. Consistent O(g^2) Hs shifts affect these second-order rates at O(g^4); this is not a finite-g self-consistent material closure."
+  },
+  "identities": {
+    "definitions": "Delta_i=E_2+Omega-E_i=(3,2.5); beta_i=g M_i2/Delta_i; B=beta beta^dagger; U=exp(-i E_PP t)",
+    "finite_memory_quench": "h_PP=alpha alpha^dagger+O(g^4), alpha_i=beta_i(1-exp(+i Delta_i t)); rho_22=Tr(h_PP)+O(g^4)",
+    "bare_Markov_source": "Gamma_p,PP=i[E_PP,B]; C_PP(P)=-i[E_PP,B], which is trace zero but indefinite",
+    "bare_Markov_solution": "h_PP(t)=B-U B U^dagger+O(g^4)",
+    "correlated_ground_state": "h_GS=B+O(g^4); free commutator and Markov PV source cancel to O(g^2)",
+    "slipped_start_identity": "For h_PP(0)=2B, the second-order Markov solution is B+U B U^dagger, positive; this equals the quench expression after discarding fast exp(+/-i Delta_i t) cross terms, not an exact long-time average of the undamped oscillator"
+  },
+  "coupling_scan": [
+    {
+      "g": 0.1,
+      "quench_ED_vs_finite_memory_Fro": 0.00015908878619678486,
+      "GS_ED_vs_order2_dressing_Fro": 0.000025033028067096352,
+      "bare_Markov_rhs_Fro": 0.0009428090415820638,
+      "exact_GS_Markov_rhs_Fro": 0.000011396316659353643,
+      "bare_filled_blocking_min": -0.000666666666666667
+    },
+    {
+      "g": 0.05,
+      "quench_ED_vs_finite_memory_Fro": 0.000010007651976650173,
+      "GS_ED_vs_order2_dressing_Fro": 0.000001558276602843407,
+      "bare_Markov_rhs_Fro": 0.00023570226039551596,
+      "exact_GS_Markov_rhs_Fro": 0.0000007083942006967013,
+      "bare_filled_blocking_min": -0.00016666666666666674
+    },
+    {
+      "g": 0.025,
+      "quench_ED_vs_finite_memory_Fro": 0.0000006264936437932429,
+      "GS_ED_vs_order2_dressing_Fro": 0.00000009729392728759827,
+      "bare_Markov_rhs_Fro": 0.00005892556509887899,
+      "exact_GS_Markov_rhs_Fro": 0.000000044214276576299185,
+      "bare_filled_blocking_min": -0.000041666666666666686
+    },
+    {
+      "g": 0.0125,
+      "quench_ED_vs_finite_memory_Fro": 0.00000003917174180289736,
+      "GS_ED_vs_order2_dressing_Fro": 0.000000006079333215919353,
+      "bare_Markov_rhs_Fro": 0.000014731391274719747,
+      "exact_GS_Markov_rhs_Fro": 0.0000000027624499177989482,
+      "bare_filled_blocking_min": -0.000010416666666666671
+    }
+  ],
+  "checks": {
+    "bare_rhs_scaling": "g^2: factor 4 on halving g",
+    "ED_quench_error_GS_dressing_error_GS_rhs_scaling": "g^4: factors between 15.7 and 16.3 on halving g",
+    "max_exact_density_trace_error": 1.7763568394002505e-15,
+    "all_exact_density_eigenvalues_in_0_1": true,
+    "finite_memory_ODE_vs_Gram_complex_vertex_max_error_bound": 2e-13,
+    "complex_vertex_ED_vs_finite_memory_error_bound": 1.4e-6,
+    "oscillator_cutoff_6_vs_8_GS_density_error_bound": 1e-12
+  },
+  "finite_eta_tail_diagnostic": {
+    "g": 0.025,
+    "definition": "Leading g^2 RHS at rho_GS^(2): free commutator on the dressed density plus collision at P; no g^4 feedback included",
+    "eta_and_rhs_Fro": [[0.0, 1.9166167708542177e-20], [0.001, 4.812053379109219e-7], [0.005, 2.4060186171869876e-6], [0.01, 4.8119867827958615e-6], [0.2, 9.570600400109405e-5]],
+    "interpretation": "Finite eta gives off-resonant Lorentzian population tails and O(g^2 eta) stationarity error at small eta. A finite-width bath requires its own consistent preparation/statistics; the undamped GS cancellation is not its stationarity proof."
+  },
+  "scope_limits": [
+    "Exact positivity of the joint model does not prove general positivity of finite-memory approximate GKBA.",
+    "The isolated oscillator has persistent memory; no universal Markov/slippage theorem is asserted.",
+    "A bare projector is a valid factorized interaction quench, but then its finite lower time endpoint must be respected; inserting infinite history does not describe that same preparation.",
+    "A correlated initial density alone generally does not specify initial correlations. A consistent IC integral or history is needed in a finite-memory NEGF calculation.",
+    "The runtime density is an equal-time one-particle density in a rotated orbital basis. Relabelling it as a bare quasiparticle distribution does not derive the missing off-shell density map.",
+    "A Hermitian counterterm cannot change P[H,P]P or Q[H,P]Q and cannot repair the fixed projector boundary compression.",
+    "A true correlated ground-state preparation can remove the leading artifact in this controlled example; an arbitrary stationary Markov solution is not a variational ground state.",
+    "No production code, material density, saved W, collision law, numerical guard, or clipping was changed. No SSH/GPU work."
+  ],
+  "primary_sources": [
+    {"url": "https://arxiv.org/html/1806.05639", "use": "Karlsson et al. 2018: negative-time IC integral, equilibrium stationarity, prescribed-equilibrium-W IC in Appendix C; Section V warns stationarity is not a variational ground-state equation."},
+    {"url": "https://gaspard.pierre.web.ulb.be/GN.JCP.99a.pdf", "use": "Gaspard and Nagaoka 1999: weak-coupling Redfield initial slippage represents short-time non-Markov bath relaxation; example positivity restoration, not a universal guarantee."},
+    {"url": "https://journals.aps.org/prb/abstract/10.1103/PhysRevB.52.14615", "use": "Spicka and Lipavsky 1995: observables require corrections beyond quasiparticle approximation, rather than identifying the distribution with all physical observables."},
+    {"url": "https://arxiv.org/html/2208.11971v3", "use": "Morawetz 2023 Eq.13 explicitly relates physical reduced density and quasiparticle distribution through an off-shell correlation term."}
+  ]
+}
