@@ -364,8 +364,8 @@ def _reduce_equilibrium_pencil(G, H, output_gram, *, structure, max_order,
 
     G/H and O.H O are small square frequency matrices, never microscopic
     ports. The caller must authenticate the equilibrium definite-member
-    premise; this function does not classify a physical density. It is not
-    selected by the production builder. Null directions require current
+    premise; this function does not classify a physical density. The native
+    builder selects it only for its authenticated equilibrium subset. Null directions require current
     metric/output loss witnesses, not a pole or positive-eigenvalue repair.
     """
     import numpy as np

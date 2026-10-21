@@ -533,13 +533,13 @@ $$
 so a TRS bank adds no partner columns and **the ordered model equals the even
 model at equal retained span**.
 
-### 6.4 Proposed equilibrium prerequisite for damped full-density refreshes
+### 6.4 Equilibrium-definite realization for damped full-density refreshes
 
-**Design proposal, not implemented or material-qualified.** An unstructured
+**Implemented and host-tested; not material-qualified.** An unstructured
 two-sided Loewner truncation can fit finite samples while introducing upper-
 half-plane poles. Accurate interpolation and a small eigenproblem backward
-error do not preserve the positive member in (W 25). The following candidate
-would use the **same current full-density Green/χ contraction and all physical
+error do not preserve the positive member in (W 25). The equilibrium branch
+uses the **same current full-density Green/χ contraction and all physical
 bands/ports**, changing the frequency realization, not clipping its poles.
 
 First authenticate an equilibrium projector commuting with the current
@@ -586,12 +586,15 @@ remain complex: fixed-q adjoint reflection does not make $W_q$ even. Retain
 both signs and preserve the separate q/−q covariance and transposed partner
 residues in (W 16), including self-negative momenta.
 
-Implementation would reuse `shared_pole_pencil.finite_pencil_column` for
-(W 25), the existing distributed metric/eigh owners, and the signed output
-algebra (W 27). It cannot feed the present general E/A directly to
+The implementation uses the existing distributed general finite/infinity
+assembly with conjugate left actions in `_equilibrium_frequency_programs`,
+then the explicit `equilibrium_definite` host reducer in
+`shared_pole_constructor`. Only the small frequency matrices and output Gram
+cross that capacity-priced canonical-owner seam; microscopic factors remain
+distributed. It cannot feed the present general E/A directly to
 `reduce_ordered_shared_pole_pencil`: that implementation expects the paired
-±frequency layout and its confluent derivatives. An upper-half-plane-only
-value-state variant needs an explicit extension of that reduction owner.
+±frequency layout and its confluent derivatives. The value-state reducer
+instead uses the same-state H congruence above.
 If infinity states are included, undamp the moments first:
 $C_1^0=C_1^\gamma$, $C_2^0=C_2^\gamma+i\gamma C_1^\gamma$ (and the higher
 binomial transforms). One level $X_\infty=JC^\dagger Q_\infty$ needs only
@@ -618,9 +621,27 @@ mode. A strictly proper bank must resolve/refuse that output or establish an
 explicit admissible null-output policy; it must not silently drop it.
 Native/held full-W, moment and full-complex column-Σ checks remain necessary.
 
-This proposal gives no stability/positive-residue theorem for a noncommuting
+`tests/test_equilibrium_definite_constructor_cpu.py` and
+`tests/test_equilibrium_definite_builder_cpu.py` cover complex q/−q pairs,
+nonzero $C_1$, finite/infinity identities, current held metrics, null-output
+refusals and the actual cached assembly. The noisy redundant-state stress
+test is deliberately a **refusal**: relative sample perturbations of
+$10^{-10}$–$10^{-8}$ can resolve negative eigenvalues in the exact H-null
+space. A scalar χ certificate alone does not bound that full-W error.
+Independent state selection or a propagated sample-error certificate is
+still needed before claiming robust material admission. No PSD floor or
+pole projection is used.
+
+The builder authenticates an exact binary diagonal projector with a strict
+global occupied/empty gap and the existing positive-Coulomb check. A smaller
+sharp real-space window is excluded from this branch; the nonnegative Fejér
+mixture is eligible. Coherent/fractional states retain the general realization,
+with separate held numerical caches so a change of family cannot reuse an
+incompatible basis.
+
+This construction gives no stability/positive-residue theorem for a noncommuting
 or inverted instantaneous density, and must not impose equilibrium structure
-on that case. It would not reduce the measured 405 s microscopic stream:
+on that case. It does not reduce the microscopic Green/χ stream:
 only numerical frequency reduction changes. Same-state source-positive-bank
 reuse plus the uniform shift is a narrower equilibrium control, requiring
 independent current-state and sample authentication, not a refreshed-screening

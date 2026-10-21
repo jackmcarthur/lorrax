@@ -57,6 +57,59 @@ def _general_frequency_programs(mesh_xy, matrix_spec, dial_key):
             jax.jit(lambda a: .5*(a+jnp.conj(jnp.swapaxes(a, -1, -2))), out_shardings=face))
 
 
+@lru_cache(maxsize=8)
+def _equilibrium_frequency_programs(mesh_xy, matrix_spec, dial_key):
+    """Same-state G/H and O†O programs; all current port data are operands.
+
+    The spectral variable is zeta=z+i*gamma. Adjoint LEFT actions are O†,
+    not a new lower-half-plane evaluation of the damped physical response.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding
+    from .shared_pole_execution import face_matmul
+    pencil = _general_frequency_programs(mesh_xy, matrix_spec, dial_key)[0]
+    face = NamedSharding(mesh_xy, matrix_spec)
+    mm = face_matmul(mesh_xy)
+    def common(zeta, q, output):
+        return pencil(jnp.conj(zeta), zeta, q,
+            jnp.conj(jnp.swapaxes(output, -1, -2)), q, output)
+    return (jax.jit(common, out_shardings=(face,)*4),
+            jax.jit(lambda output: mm(output, output, transa='C'), out_shardings=face))
+
+
+def _equilibrium_definite_eligibility(energy, rho, stop, grid, qgrid, response_window):
+    """Authenticate the equilibrium subset, without approximating its density.
+
+    Positive bare V is checked separately by the existing native root owner.
+    A sharp *smaller* R window is a signed q mixture, so it cannot inherit
+    the equilibrium definite-member theorem. Fejer weights are nonnegative.
+    No near-equilibrium tolerance promotes coherent/fractional states here.
+    """
+    energy, rho = np.asarray(energy), np.asarray(rho)
+    if (energy.ndim != 2 or rho.shape != (*energy.shape, energy.shape[1])
+            or not 0 < stop <= energy.shape[1]
+            or not np.isfinite(energy[:, :stop]).all() or not np.isfinite(rho).all()):
+        raise ValueError('GATE shared_equilibrium_eligibility: finite current energy/density required')
+    physical = rho[:, :stop, :stop]
+    f = physical.diagonal(axis1=-2, axis2=-1)
+    reason = 'eligible'
+    if np.any(physical != np.eye(stop)[None]*f[:, :, None]):
+        reason = 'density does not exactly commute as a diagonal current projector'
+    elif np.any((f != 0) & (f != 1)):
+        reason = 'current reference is not a binary projector'
+    elif not np.any(f == 0) or not np.any(f == 1):
+        reason = 'occupied and empty physical states are both required'
+    elif float(np.min(energy[:, :stop][f == 0])) <= float(np.max(energy[:, :stop][f == 1])):
+        reason = 'current projector has no strict global noninverted gap'
+    elif tuple(qgrid) != tuple(grid) and response_window != 'fejer':
+        reason = 'signed spatial cutoff does not preserve a positive equilibrium response mixture'
+    return dict(eligible=reason == 'eligible', reason=reason,
+        premise='exact binary commuting globally noninverted full-band projector and native PSD V',
+        response_window=response_window, electronic_grid=list(grid), response_grid=list(qgrid),
+        scope='equilibrium realization only; no coherent-refresh or collision-positivity guarantee')
+
+
 def active_eta_verification_sites(native_sites, energy, active, eta_ry, *, native_fit_count=0):
     """Keep native IDs, append active-height training and independent holds.
 
@@ -241,6 +294,11 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     collective poles and all held checks are recomputed on every call.
     ``response_partition='full'`` opts into an exact merged endpoint product;
     the default ``'blocks'`` keeps FF/FA/AF/AA numerical quadrature separate.
+    An exact binary, commuting, globally noninverted reference on the full
+    grid or a nonnegative Fejer q mixture selects a same-state definite H
+    realization. Native PSD V, current metric/null/output and all final W
+    checks remain required; negative H is not repaired. Coherent refreshes
+    return to the independent general realization and may still refuse.
 
     Explicit ``direct_dielectric_probe={q: 0, z_ry: [real, imag]}`` evaluates
     only that current microscopic response and commits native dielectric
@@ -294,7 +352,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     source_recipe = current_meta.shared_pole_recipe
     if fit_basis is None or direct_request is not None:
         fit_basis = {}
-    previous_direction_bytes = sum(a.size*a.dtype.itemsize for a in fit_basis.get("directions", {}).values())
+    previous_direction_bytes = sum(a.size*a.dtype.itemsize
+        for key in ('directions', 'equilibrium_directions') for a in fit_basis.get(key, {}).values())
     nk = int(meta.nk_tot)
     grid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     qgrid = tuple(int(n) for n in (getattr(meta, "qgrid", None) or grid))
@@ -318,6 +377,13 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     rho[:, active, active] = np.asarray(snapshot["rho_active"], complex)
     if (not np.isfinite(rho).all() or np.max(abs(rho-rho.conj().swapaxes(-1, -2))) > 1e-10):
         raise ValueError("GATE shared_general_density: finite Hermitian full density required")
+    stop = min(int(meta.b_id_4_chi_user), int(wfns.slices.b4_logical))-int(wfns.slices.b0)
+    if int(wfns.slices.b0) != 0 or stop < active.stop:
+        raise ValueError("GATE shared_general_bands: complete screening support must contain active window")
+    equilibrium = _equilibrium_definite_eligibility(energy, rho, stop, grid, qgrid, response_window)
+    definite = equilibrium['eligible']
+    representation = 'equilibrium-definite-same-state' if definite else 'general-two-sided-full-density'
+    gamma = float(snapshot.get("gamma_ry", snapshot.get("adiabatic_ry", 0)))
     current = rotate_wavefunctions(wfns, jnp.asarray(snapshot["U_active"]),
         enk_active_new=jnp.asarray(energy[:, active]), enk_base=jnp.asarray(energy),
         efermi=None, mesh_xy=mesh_xy, active_slice=active, occupations=occupations)
@@ -350,9 +416,14 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         full_matrix_fit_held_tolerance=float(snapshot.get("fit_tolerance", .02)),
         modal_reconstruction_tolerance=1e-9, laplace_margin_ry=1e-12,
         capacity="explicit-full-map-and-host-pencil-bound", store="sha256-complete-full-q")
+    if definite:
+        general_gates.update(numerical_spaces='same-state-positive-H-congruence',
+            eigensolver='Hermitian-indefinite-G-in-current-positive-H-metric',
+            frequency_equilibration='none; same-state congruence only',
+            equilibrium_definite=equilibrium)
     recipe.update(source_recipe_hash=recipe["recipe_hash"], source_passive_gate_hash=recipe["gate_hash"],
         source_passive_gate_version=recipe["gate_version"], gate_version=general_gates["version"],
-        construction_representation="general-two-sided-full-density",
+        construction_representation=representation,
         inherited_passive_gram_and_passivity="NOT_APPLICABLE", general_gates=general_gates,
         gate_hash=hashlib.sha256(_json(general_gates).encode()).hexdigest())
     recipe["recipe_hash"] = hashlib.sha256(_json({k:v for k,v in recipe.items() if k != "recipe_hash"}).encode()).hexdigest()
@@ -372,9 +443,6 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     pm, pn = carrier.psi_mun, carrier.psi_nmu
     layout = carrier.layout
     ns, nmu, nb = map(int, pm.shape[1:])
-    stop = min(int(meta.b_id_4_chi_user), int(wfns.slices.b4_logical))-int(wfns.slices.b0)
-    if int(wfns.slices.b0) != 0 or stop < active.stop:
-        raise ValueError("GATE shared_general_bands: complete screening support must contain active window")
     # Carrier padding/out-of-chi bands are exact-zero operands, not a band
     # cutoff chosen for this algorithm. All requested physical chi bands stay.
     band_mask = jnp.arange(nb) < stop
@@ -389,6 +457,9 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     mm = face_matmul(mesh_xy)
     pencil_program, infinity_program, adjoint_program, normal_program = _general_frequency_programs(
         mesh_xy, face.spec, ffi_dial_key())
+    if definite:
+        common_program, output_gram_program = _equilibrium_frequency_programs(
+            mesh_xy, face.spec, ffi_dial_key())
     fit_ids, held_ids = list(map(int, recipe["fit_ids"])), list(map(int, recipe["held_ids"]))
     sites = np.asarray([_sample_point(recipe, i) for i in fit_ids+held_ids], complex)
     # Fit the observed continuation scale, while keeping independent
@@ -421,7 +492,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     query_count = len(query_q_ids)
     bank_bytes = 16*query_count*len(sites)*nmu*nmu//ranks
     action_bytes = 16*query_count*4*nmu*side_bound//ranks
-    pencil_bytes = 32*query_count*side_bound*side_bound//ranks
+    pencil_bytes = (48 if definite else 32)*query_count*side_bound*side_bound//ranks
     green_bytes = 16*nk*(ns*nmu)**2*6//ranks
     dielectric_bytes = 0 if direct_request is None else 16*(nq+8)*nmu*nmu//ranks
     price = current_meta.shared_pole_capacity.reserve("general_full_map",
@@ -443,7 +514,6 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     if bool(jnp.any(negative)):
         raise ValueError("GATE shared_general_coulomb: bare V has resolved negative spectrum")
     dyson, _, _, algebra = response_algebra(current_meta, config, mesh_xy=mesh_xy, n=nmu, ordered=True)
-    gamma = float(snapshot.get("gamma_ry", snapshot.get("adiabatic_ry", 0)))
     tolerance = float(snapshot.get("fit_tolerance", .02))
     if len(fit_ids) < 4:
         raise ValueError("GATE shared_general_supports: at least four native fitted supports required")
@@ -566,11 +636,11 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     panel_side = int(mesh_xy.shape["y"])
     extent = lambda n: max(panel_side, math.ceil(int(n)/panel_side)*panel_side)
     eig = distrib_la.plan("eigh", mesh_xy, n=nmu)
-    directions = fit_basis.setdefault("directions", {})
+    directions = fit_basis.setdefault("equilibrium_directions" if definite else "directions", {})
     begin("directions")
     coords = np.unravel_index(np.arange(nq), qgrid)
     minus = np.ravel_multi_index(tuple((-c) % n for c, n in zip(coords, qgrid)), qgrid)
-    left_states, right_states = [], []
+    left_states, right_states, common_states = [], [], []
     for training_index,i in enumerate(fit_positions):
         W = values[i]
         width = (int(recipe["imaginary_width"]) if sites[i].real == 0
@@ -584,6 +654,12 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                 multiplet_tol=float(recipe["multiplet_relative_tolerance"]))
             directions[i] = q
         q = directions[i]
+        if definite:
+            common_states.append((sites[i]+1j*gamma, q, mm(W, q)))
+            if sites[i].real != 0:
+                qm, wm = jnp.conj(q[minus]), jnp.conj(W[minus])
+                common_states.append((-sites[i].conjugate()+1j*gamma, qm, mm(wm, qm)))
+            continue
         if training_index % 2:
             right_states.append((sites[i], q, mm(W, q)))
         else:
@@ -602,11 +678,16 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         zs = join_vectors([np.full(s[1].shape[-1], s[0]) for s in states], panel_side)
         return (put(zs), tile_join([s[1] for s in states], -1, face),
                 tile_join([s[2] for s in states], -2 if left else -1, face))
-    mu, ql, il = joined(left_states, True)
-    lam, qr, wr = joined(right_states, False)
+    if definite:
+        lam, qr, wr = joined(common_states, False)
+        mu, ql, il = jnp.conj(lam), qr, adjoint_program(wr)
+    else:
+        mu, ql, il = joined(left_states, True)
+        lam, qr, wr = joined(right_states, False)
     end("directions", (ql, il, qr, wr))
     begin("pencil")
-    E, A, B, C = pencil_program(mu, lam, ql, il, qr, wr)
+    E, A, B, C = (common_program(lam, qr, wr) if definite else
+                   pencil_program(mu, lam, ql, il, qr, wr))
     # General infinity rows constrain the exact 1/z and 1/z² coefficients
     # on the retained infinity directions. Full-port moment defects are
     # measured below; finite direction/reduction accuracy does not make
@@ -632,12 +713,20 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             rcond=max(nmu*np.finfo(float).eps, float(recipe["direction_cutoff"])**2),
             multiplet_tol=float(recipe["multiplet_relative_tolerance"]))
     qi = directions["infinity"]
-    E, A, B, C = infinity_program(mu, lam, E, A, B, C, ql, il, qr, wr, qi, c1, c2)
+    # Definite H uses UNDAMPED zeta moments. C1 is unchanged, whereas the
+    # physical z^-2 coefficient includes -i*gamma*C1 exactly once.
+    infinity_c2 = c2+1j*gamma*c1 if definite else c2
+    E, A, B, C = infinity_program(mu, lam, E, A, B, C, ql, il, qr, wr, qi, c1, infinity_c2)
+    output_gram = output_gram_program(C) if definite else None
     # Infinity conditions have one extra energy unit per endpoint relative
     # to finite divided differences. Match those units BEFORE numerical
     # rank selection, respecting the actual tiled join order on each axis.
     coordinate_units=(join_vectors((np.ones(mu.shape[0]),np.full(qi.shape[-1],1/moment_scale)),panel_side),
                       join_vectors((np.ones(lam.shape[0]),np.full(qi.shape[-1],1/moment_scale)),panel_side))
+    if definite:
+        # Independent row/column equilibration destroys a same-state Gram.
+        # The H-congruence owner handles its current metric without it.
+        coordinate_units = (np.ones(E.shape[-2]), np.ones(E.shape[-1]))
     frequency_coordinates=dict(frequency_scale_ry=moment_scale,
         infinity_width=int(qi.shape[-1]),tile_extent=panel_side,
         left_units_sha256=hashlib.sha256(coordinate_units[0].tobytes()).hexdigest(),
@@ -654,9 +743,9 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     if host_price > workspace:
         raise ValueError(f"GATE shared_general_capacity: reduced host pencil {nl}x{nr} "
                          f"needs {host_price}>{workspace} bytes before any host gather")
-    end("pencil", (E, A, B, C))
+    end("pencil", (E, A, B, C, output_gram))
     begin("hostreduce")
-    spaces = fit_basis.setdefault("spaces", {})
+    spaces = fit_basis.setdefault("equilibrium_spaces" if definite else "spaces", {})
     banks, receipts = {}, []
     stop_after=snapshot.get('stop_after_model_q')
     if stop_after is not None and int(stop_after)!=0:
@@ -664,9 +753,11 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     parents=[0] if stop_after is not None else [iq for iq in range(nq) if iq <= int(minus[iq])]
     position=0
     while position<len(parents):
-        retained=sum(a.nbytes for space in spaces.values() for a in space.values())
+        retained=sum(a.nbytes for key in ('spaces', 'equilibrium_spaces')
+            for space in fit_basis.get(key, {}).values() for a in space.values())
         plan=general_pencil_batch_plan([(nl,nr)]*min(jax.process_count(),len(parents)-position),
-            max_order=cap,max_workspace_bytes=workspace,retained_host_bytes=retained)
+            max_order=cap,max_workspace_bytes=workspace,retained_host_bytes=retained,
+            input_matrix_count=3 if definite else 2)
         ids=parents[position:position+plan['batch_size']]
         batch_start=time.monotonic()
         if jax.process_index()==0:
@@ -677,10 +768,13 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         # reduce their assigned parents concurrently. Never gather in a
         # rank-conditional lambda or mix independent host modal gauges.
         pencils=[(np.asarray(gather_to_host(E[iq])),np.asarray(gather_to_host(A[iq]))) for iq in ids]
+        grams = [np.asarray(gather_to_host(output_gram[iq])) for iq in ids] if definite else None
         models=collective_general_pencil_batch(pencils,max_order=cap,max_workspace_bytes=workspace,
             rank_tolerance=float(recipe['bank_rule_tolerance']),
-            frequency_scale_ry=moment_scale,coordinate_units=coordinate_units,
-            fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained)
+            frequency_scale_ry=moment_scale,coordinate_units=None if definite else coordinate_units,
+            fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained,
+            structure=dict(kind='equilibrium_definite', gamma_ry=gamma) if definite else None,
+            output_grams=grams)
         for batch_index,(iq,model) in enumerate(zip(ids,models)):
             spaces.setdefault(iq, model["spaces"])
             order = len(model["poles_ry"])
@@ -851,7 +945,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
             print_fn(f"General shared-pole W [{label}] host batch complete parents={ids} "
                      f"orders={[len(m['poles_ry']) for m in models]} wall={time.monotonic()-batch_start:.3f}s")
             sys.stdout.flush()
-        del pencils,models,model,omap,imap
+        del pencils,models,model,omap,imap,grams
         position+=len(ids)
     end("hostreduce", [b[:2] for b in banks.values()])
     # Every current full-matrix sample checks the FINAL bank, including the
@@ -911,6 +1005,9 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     receipt["capacity"] = price
     receipt['verification_geometry']=verification_geometry
     receipt['frequency_coordinates']=frequency_coordinates
+    receipt['equilibrium_definite']=dict(equilibrium, selected=definite,
+        sample_uncertainty_policy='no PSD floor; current metric/null/output witnesses must pass',
+        subsequent_coherent_refresh='general realization, independently revalidated; may refuse')
     receipt['response_active_bands'] = [response_active.start,response_active.stop]
     receipt['response_blocks'] = [dict(name=b['name'],interval_ry=[b['lo'],b['hi']],
                                       density_sides=list(b['density_sides']),components=b['components'],
@@ -932,8 +1029,10 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     receipt["reduced_host_pencil_shape"] = [nl, nr]
     receipt["reduced_host_workspace_bytes_per_rank"] = host_price
     receipt["held_reduced_host_basis_bytes_per_rank"] = sum(
-        a.nbytes for space in spaces.values() for a in space.values())
-    retained = sum(a.size*a.dtype.itemsize for a in directions.values())
+        a.nbytes for key in ('spaces', 'equilibrium_spaces')
+        for space in fit_basis.get(key, {}).values() for a in space.values())
+    retained = sum(a.size*a.dtype.itemsize for key in ('directions', 'equilibrium_directions')
+                   for a in fit_basis.get(key, {}).values())
     kept = current_meta.shared_pole_capacity.reserve("general_held_numeric_basis",
         resident_bytes_per_rank=max(0, retained-previous_direction_bytes)//ranks,
         workspace_bytes_per_rank=0)
