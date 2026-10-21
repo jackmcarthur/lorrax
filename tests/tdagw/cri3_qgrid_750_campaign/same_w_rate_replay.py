@@ -104,12 +104,13 @@ def main(argv=None):
     if (Path(args.out).exists() or any(not 0<x<1 for x in args.quadrature_eps)
             or len(args.quadrature_eps)>3):
         parser.error('fresh output and one to three finite relative quadrature targets in (0,1) required')
+    # Bootstrap the native process before frame I/O imports NumPy/BLAS.
+    from gw import gw_jax,sc_iteration
     from tests.tdagw.cri3_qgrid_750_campaign import native_frozen_map_probe as frozen
     arrays,frame=frozen.load_accepted_frame(args.frames)
     policy=frozen.accepted_response_policy(frame,args.accepted_deck)
     snapshot=load_projector_snapshot(args.snapshot)
     baseline=json.loads(Path(args.snapshot_json).read_text())
-    from gw import gw_jax,sc_iteration
     from common.collectives import rank0_transaction,device_put_process_local,gather_to_host
     from common.parallel_transport import fingerprint_from_binding
     from common.contract_bands import merge_spin_centroid
