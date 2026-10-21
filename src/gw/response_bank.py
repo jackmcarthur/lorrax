@@ -27,7 +27,7 @@ from .efermi import OCCUPATION_WEIGHT_FLOOR, band_in_occupation_window
 
 
 def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=None,
-                              interval_ry=None, paired=False):
+                              interval_ry=None, paired=False, values_only=False):
     """Native scalar quadrature for full bands or one EXACT endpoint block.
 
     Energies/sites use Ry; all screening bands participate, including frozen
@@ -42,6 +42,9 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
     retarded primitives: -1/(d-z) and -1/(d+z), with the second evaluated at
     conjugate time. Strictly noncrossing groups use the public continuum-
     checked Laplace owner (Ke+Ko, Ke-Ko); others retain shared complex rules.
+    ``values_only=True`` explicitly requests no derivative target and uses
+    the public analytic denominator-box value rules for both primitives.
+    The existing value+derivative default and its returned arrays are unchanged.
     """
     import minimax
     energy, sites = np.asarray(energy, float), np.asarray(sites, complex)
@@ -49,6 +52,8 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
             or not np.isfinite(energy).all() or not np.isfinite(sites).all()
             or np.any(sites.imag+gamma_ry <= 0)):
         raise ValueError("GATE response_full_density: finite full bands and upper Laplace supports required")
+    if values_only and not paired:
+        raise ValueError('GATE response_full_density: value-only box rules require paired primitives')
     extent = float(energy.max()-energy.min())
     lo, hi = (-extent, extent) if interval_ry is None else tuple(map(float, interval_ry))
     if not np.isfinite([lo, hi]).all() or lo > hi:
@@ -60,6 +65,8 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
     # current density, W, physical poles, or wavefunctions. The refresh owner
     # supplies a fresh dictionary at each physical Hamiltonian solve.
     key = (shifted.tobytes(), float(tolerance), bool(paired))
+    if values_only:
+        key += ('analytic-box-values-only-v1',)
     if (held is not None and held.get("key") == key
             and held["interval_ry"][0] <= lo and held["interval_ry"][1] >= hi):
         return held["rules"]
@@ -75,6 +82,68 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
     # different FFT collectives. Gather attempts through the response owner.
     bound = 4*1024**3
     request = tuple(range(len(sites)))
+    def complex_values(members):
+        z = shifted[list(members)]
+        out, total = [], 0
+        for side, poles in enumerate((z, -z.conjugate())):
+            box = (float(poles.real.min()-hi), float(poles.real.max()-lo),
+                   float(poles.imag.min()), float(poles.imag.max()))
+            relative = box[0] > 0 or box[1] < 0
+            ratio = float(poles.imag.max()/poles.imag.min())
+            eps = float(tolerance) if relative else float(tolerance)/ratio
+            rule = minimax.analytic_box_rule(box, eps, mass_cap=83.)
+            horizon = max(np.log(10/eps)/box[2], float(np.max(abs(rule.times))))
+            cloud = minimax.boundary_samples(box, rule.theta_deg, horizon, eps)
+            mass = minimax.rule_roundoff_amplification(rule.times, rule.weights, cloud,
+                abs(cloud) if relative else box[2])
+            error = float(rule.sup_error)*(1. if relative else ratio)
+            if (not np.isfinite([error, mass]).all() or error > tolerance or mass > 83.
+                    or not np.isfinite(rule.times).all() or not np.isfinite(rule.weights).all()):
+                raise ValueError('GATE response_full_density: analytic value box certificate/mass')
+            times = 1j*np.asarray(rule.times, complex)
+            total += len(times)
+            if total > 32*384:
+                raise ValueError('GATE response_full_density: value box exceeds 32 node carriers')
+            certificate = dict(owner='minimax.analytic_box_rule', box=list(box),
+                relative=bool(relative), requested_targets=['value'], value_bound=error,
+                native_term_mass=mass, mass_cap=83., forward_or_reverse=side,
+                reference_policy='lo for Re(t)>=0; hi otherwise; zero-growth endpoint correction')
+            arm_start = len(out)
+            coefficient_mass_by_member = np.zeros(len(z))
+            # Split by the sign of REAL Laplace time. Together with the
+            # actual endpoint extrema in the common Green owner this makes
+            # exp((origin-(Lref-Rref))*t) <= 1, never zero times infinity.
+            for positive in (True, False):
+                selected = np.flatnonzero((times.real >= 0) == positive)
+                reference = lo if positive else hi
+                for begin in range(0, len(selected), 384):
+                    ids = selected[begin:begin+384]
+                    t = times[ids]
+                    phase = (poles[:, None]-reference)*t[None]
+                    with np.errstate(divide='ignore'):
+                        log_weight = np.log(abs(rule.weights[ids]))[None]+phase.real
+                    if (not np.isfinite(phase).all() or np.any(np.isnan(log_weight))
+                            or np.max(log_weight, initial=-np.inf) > np.log(np.finfo(float).max)-2):
+                        raise ValueError('GATE response_full_density: value box phase overflow')
+                    # Combine the scalar magnitude BEFORE exponentiation;
+                    # a tiny weight and huge separate phase are not operands.
+                    angle = np.angle(rule.weights[ids])[None]+phase.imag
+                    coefficient = np.exp(log_weight)*(np.cos(angle)+1j*np.sin(angle))
+                    if side:
+                        coefficient = coefficient.conjugate()
+                    value = np.zeros((len(z), 2, len(ids)), complex)
+                    value[:, side] = coefficient
+                    coefficient_mass_by_member += z.imag*np.sum(abs(coefficient), axis=-1)
+                    coefficient_mass = float(np.max(coefficient_mass_by_member))
+                    if not np.isfinite(coefficient_mass) or coefficient_mass > 5000.:
+                        raise ValueError('GATE response_full_density: value box coefficient mass')
+                    out.append(dict(t=t, count=len(t), value=-value, members=list(members),
+                        reference_ry=reference, sampled_error=error, coefficient_mass=coefficient_mass,
+                        construction='analytic_box_values_only', analytic_box_certificate=certificate))
+            for row in out[arm_start:]:
+                row['coefficient_mass'] = float(np.max(coefficient_mass_by_member))
+        return out
+
     def crossing(members):
         z=shifted[list(members)]
         center=.5*(lo+hi)
@@ -109,7 +178,9 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
                 construction='continuum_crossing_real_time'))
         return out
 
-    if paired and lo > float(np.max(abs(shifted.real))):
+    if values_only:
+        groups = _gather_group_rules([request], build=complex_values)[0]
+    elif paired and lo > float(np.max(abs(shifted.real))):
         def remote(members):
             z = shifted[list(members)]
             try:
@@ -167,6 +238,8 @@ def full_density_sample_rules(energy, sites, *, gamma_ry, tolerance=1e-8, held=N
                            max_panel_count=32))
         if "ritz_refusal" in group:
             result[-1]["ritz_refusal"] = group["ritz_refusal"]
+        if "analytic_box_certificate" in group:
+            result[-1]["analytic_box_certificate"] = group["analytic_box_certificate"]
     if held is not None:
         held.update(key=key, extent_ry=max(abs(lo),abs(hi)), interval_ry=[lo, hi], rules=result)
     return result

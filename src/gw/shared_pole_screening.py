@@ -310,6 +310,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
     general_gates = dict(version="full-density-general-shared-pole-gates-v6",
         source_policy_version=recipe.get("recipe_version", recipe.get("version")),
         scalar_provider='coherent_endpoint_blocks_public_minimax_v1',
+        numerical_response_rule='analytic-denominator-box-values-only-v1',
         eta_training_verification='active_span_3train_2interlaced_held_v1',
         numerical_spaces='two-sided-descriptor-svd',
         eigensolver='current-descriptor-balanced-ordinary-geev',
@@ -466,7 +467,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                 sys.stdout.flush()
             planned = full_density_sample_rules(energy[:,:stop],sites[ids],gamma_ry=gamma,
                 tolerance=float(recipe['bank_rule_tolerance']), interval_ry=(block['lo'],block['hi']),
-                paired=True,held=scalar_cache.setdefault(key,{}))
+                paired=True,values_only=True,held=scalar_cache.setdefault(key,{}))
             for rule in planned:
                 rules.append(dict(rule,block_index=bi,block=block['name'],
                                   members=[int(ids[j]) for j in rule['members']]))
@@ -772,7 +773,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                                 left=((pm-ph) if block['name'][1]=='A' else pm)*jnp.asarray(block['u'])[:,None,None]
                                 right=(ph if block['name'][0]=='A' else pm)*jnp.asarray(block['f'])[:,None,None]
                                 prules=full_density_sample_rules(energy[:,:stop],np.array([z]),gamma_ry=gamma,
-                                    tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),paired=True)
+                                    tolerance=float(recipe['bank_rule_tolerance']),interval_ry=(block['lo'],block['hi']),
+                                    paired=True,values_only=True)
                                 for rule in prules:
                                     stream=full_density_response_stream(mesh_xy,grid,(nk,nb,nmu,ns),q_ids=[iq],
                                         n_outputs=1,layout=layout,qgrid=qgrid,response_window=response_window,
