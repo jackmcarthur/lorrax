@@ -1,0 +1,4 @@
+&input_pw2bgw
+   prefix = 'silicon'
+   rhog_flag = .true.
+/

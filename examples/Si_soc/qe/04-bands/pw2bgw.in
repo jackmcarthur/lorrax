@@ -1,0 +1,7 @@
+&input_pw2bgw
+   prefix = 'silicon'
+   wfng_flag = .true.
+   wfng_file = 'WFN_bands'
+   wfng_kgrid = .true.
+   wfng_nk1 = 6, wfng_nk2 = 6, wfng_nk3 = 6
+/

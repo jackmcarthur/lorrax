@@ -1,0 +1,9 @@
+&input_pw2bgw
+   prefix = 'silicon'
+   wfng_flag = .true.
+   wfng_kgrid = .true.
+   wfng_nk1 = 6, wfng_nk2 = 6, wfng_nk3 = 6
+   vxc_flag = .true.
+   vxc_diag_nmin = 1
+   vxc_diag_nmax = 28
+/

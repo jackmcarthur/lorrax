@@ -1,0 +1,19 @@
+# Lowest 100 excitons by PRIMME. Full diagonalization ('diagonalization', the default) of
+# the 64,000 transitions needs ~310 GB of memory: more than one node.
+diagonalization_primme
+number_eigenvalues 100
+
+number_val_bands_coarse 8
+number_val_bands_fine 8
+number_cond_bands_coarse 16
+number_cond_bands_fine 8
+
+use_symmetries_coarse_grid
+no_symmetries_fine_grid
+no_symmetries_shifted_grid
+
+use_velocity
+spinor
+gaussian_broadening
+energy_resolution 0.15
+eqp_co_corrections

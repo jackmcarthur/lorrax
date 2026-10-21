@@ -1,0 +1,17 @@
+[cohsex]
+sys_dim = 3
+nval = 8                 # every occupied band
+ncond = 16               # returns bands 1-24; its 4 guard bands (25-28) stay inside the GW QP block
+centroids_file = centroids_frac_996.txt
+
+# The path of qe/04-bands (L-G-X-U|K-G), which inteqp interpolates onto. htransform reads
+# each count as the steps of the segment that ENDS at that corner; QE's crystal_b puts the
+# count on the corner the segment starts from. Shifted this way, the path is QE's 202 points.
+K_POINTS {crystal_b}
+6
+  0.500  0.500  0.500   1  # L
+  0.000  0.000  0.000  50  # G
+  0.000  0.500  0.500  50  # X
+  0.250  0.625  0.625  50  # U
+  0.375  0.750  0.375   1  # K
+  0.000  0.000  0.000  50  # G

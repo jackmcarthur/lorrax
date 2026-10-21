@@ -1,0 +1,36 @@
+&control
+   calculation = 'bands'
+   prefix = 'silicon'
+   pseudo_dir = '../../pseudo'
+   outdir = './'
+/
+&system
+   ibrav = 0
+   nat = 2
+   ntyp = 1
+   ecutwfc = 25.0
+   noncolin = .true.
+   lspinorb = .true.
+   nbnd = 30
+/
+&electrons
+   conv_thr = 1.0d-10
+   diago_full_acc = .true.
+/
+CELL_PARAMETERS angstrom
+   2.715  2.715  0.000
+   0.000  2.715  2.715
+   2.715  0.000  2.715
+ATOMIC_SPECIES
+   Si  28.086  Si_FR.UPF
+ATOMIC_POSITIONS crystal
+   Si  -0.125  -0.125  -0.125
+   Si   0.125   0.125   0.125
+K_POINTS crystal_b
+6 
+0.5 0.5 0.5 50  ! L
+0.0 0.0 0.0 50  ! G
+0.0 0.5 0.5 50  ! X
+0.25 0.625 0.625 1  ! U
+0.375 0.75 0.375 50  ! K
+0.0 0.0 0.0 50  ! G
