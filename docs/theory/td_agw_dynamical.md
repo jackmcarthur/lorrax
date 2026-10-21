@@ -1153,6 +1153,16 @@ are independent; one cannot replace the reverse product by the stationary
 conjugation shortcut. All supplied virtual bands remain, including frozen-active
 transitions. Frozen states have identity rotation and a per-side edge scissor.
 
+For the ordered self-energy member the two active left panels are
+$[\Psi\rho,\Psi(I-\rho)]$, paired with the same unweighted right orbitals
+and right-index energies. The second panel is formed as the narrow active
+complement, not as two separately summed particle contributions
+$\Psi-\Psi\rho$. Liveness tests each right column for exact nonzero entries
+of $\rho$ or $I-\rho$; it never thresholds coherences. An exactly filled
+(empty) density therefore has no active particle (hole) branch. This is an
+algebraically identical carrier representation, not a secularization,
+change of collision prescription or positivity repair.
+
 An exact finite-band identity clarifies causality without introducing
 propagated auxiliary states. With transition index $t=(k,b,d)$, vertex map
 $T_{\mu t}$ carrying the spin/k/metric factors, define
