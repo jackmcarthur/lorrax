@@ -400,6 +400,40 @@ def _general_current_site_samples(current, sites, *, scalar_cache, begin, end,
     return dict(values=values,rules=rules,blocks=blocks,response_active=response_active)
 
 
+def _save_equilibrium_owner_failure(pencils, grams, ids, error, capture):
+    """Preserve ONLY an all-rank canonical failure's already-gathered parent.
+
+    No numerical operation or JAX gather occurs here. A plain ValueError
+    without the canonical protocol marker MUST NOT enter a collective I/O
+    path: unrelated rank-local exceptions propagate normally instead.
+    """
+    from common.collectives import rank0_transaction
+    if not getattr(error,'canonical_host_failure',False):
+        raise ValueError('GATE shared_equilibrium_capture: synchronized canonical owner metadata required')
+    owner=getattr(error,'owner_rank',None)
+    if (not isinstance(owner,int) or not 0<=owner<len(ids)
+            or tuple(getattr(error,'reduced_shape',()))!=pencils[owner][0].shape):
+        raise ValueError('GATE shared_equilibrium_capture: invalid failed owner/shape')
+    g,h=pencils[owner];n=grams[owner];q=int(ids[owner])
+    payload=sum(a.nbytes for a in (g,h,n))
+    if payload+65536+capture['retained_storage_bytes']>capture['storage_bound_bytes']:
+        raise ValueError('GATE shared_equilibrium_capture: failed-parent frequency storage bound exceeded')
+    path=Path(capture['root'])/f'q_{q:03d}_equilibrium_failure.npz'
+    metadata=dict(capture['metadata'],q=q,owner_rank=owner,reduced_shape=list(g.shape),
+        cause=str(error),admitted=False,sigma_computed=False,
+        storage_array_bytes=payload,retained_storage_bytes=capture['retained_storage_bytes'],
+        storage_bound_bytes=capture['storage_bound_bytes'],full_microscopic_host_payload=False,
+        scope='canonical failed-parent frequency-only forensic capture; not an admitted model')
+    def save():
+        path.parent.mkdir(parents=True,exist_ok=True)
+        if path.exists():
+            raise FileExistsError(path)
+        np.savez(path,G=g,H=h,output_gram=n,state_units=capture['state_units'],
+            sites_ry=capture['sites'],metadata_json=np.asarray(_json(metadata)))
+    rank0_transaction(path,stage='shared_equilibrium.failed_owner_capture',write=save)
+    return str(path)
+
+
 def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapshot,
                                  run_dir, label, fit_basis=None, print_fn=print):
     """Full microscopic instantaneous-rho W, with general shared frequency poles.
@@ -792,6 +826,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         raise ValueError('GATE shared_general_diagnostic: only stop_after_model_q=0 is supported')
     parents=[0] if stop_after is not None else [iq for iq in range(nq) if iq <= int(minus[iq])]
     capture_workspace = 16*1024**2 if definite else 0
+    frequency_saved_bytes=0
     position=0
     while position<len(parents):
         retained=sum(a.nbytes for key in ('spaces', 'equilibrium_spaces')
@@ -831,6 +866,8 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                 capture_workspace_bytes=capture_workspace,full_microscopic_host_payload=False,
                 energy_sha256=hashlib.sha256(memoryview(energy)).hexdigest(),
                 density_sha256=hashlib.sha256(memoryview(rho)).hexdigest(),
+                U_active_sha256=hashlib.sha256(memoryview(
+                    np.ascontiguousarray(snapshot['U_active']))).hexdigest(),
                 scope='pre-reduction frequency-only diagnostic, NOT an admitted W or trajectory')
             def save_frequency_capture():
                 capture_path.parent.mkdir(parents=True,exist_ok=True)
@@ -842,14 +879,38 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
                     held_positions=np.asarray(held_positions,np.int64),
                     metadata_json=np.asarray(_json(capture_metadata)))
             rank0_transaction(capture_path,stage='shared_equilibrium.frequency_capture',write=save_frequency_capture)
-        models=collective_general_pencil_batch(pencils,max_order=cap,max_workspace_bytes=workspace,
-            rank_tolerance=float(recipe['bank_rule_tolerance']),
-            frequency_scale_ry=moment_scale,coordinate_units=None if definite else coordinate_units,
-            fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained,
-            structure=dict(kind='equilibrium_definite', gamma_ry=gamma,
-                state_selection='principal-rrqr-v1',state_units=common_state_units,
-                frequency_scale_ry=moment_scale) if definite else None,
-            output_grams=grams)
+            frequency_saved_bytes+=capture_bytes+65536
+        try:
+            models=collective_general_pencil_batch(pencils,max_order=cap,max_workspace_bytes=workspace,
+                rank_tolerance=float(recipe['bank_rule_tolerance']),
+                frequency_scale_ry=moment_scale,coordinate_units=None if definite else coordinate_units,
+                fixed_spaces=[spaces.get(iq) for iq in ids],retained_host_bytes=retained,
+                structure=dict(kind='equilibrium_definite', gamma_ry=gamma,
+                    state_selection='principal-rrqr-v1',state_units=common_state_units,
+                    frequency_scale_ry=moment_scale) if definite else None,
+                output_grams=grams)
+        except ValueError as error:
+            if not definite or not getattr(error,'canonical_host_failure',False):
+                raise
+            # The canonical owner status produced this SAME error on all
+            # ranks. These arrays already reside on every host; no gather
+            # or rank-conditional numerical call is introduced on failure.
+            _save_equilibrium_owner_failure(pencils,grams,ids,error,dict(
+                root=Path(run_dir)/f'{label}_general_shared_pole',
+                retained_storage_bytes=frequency_saved_bytes,
+                storage_bound_bytes=int(snapshot.get('frequency_diagnostic_storage_bytes',workspace)),
+                state_units=common_state_units,sites=sites,
+                metadata=dict(gamma_ry=gamma,eta_ry=eta,representation=representation,
+                    source_recipe_hash=recipe['source_recipe_hash'],recipe_hash=recipe['recipe_hash'],
+                    source_support_reads_ev=recipe['support_reads_ev'],
+                    frequency_coordinates=frequency_coordinates,state_selection='principal-rrqr-v1',
+                    rank_tolerance=float(recipe['bank_rule_tolerance']),frequency_scale_ry=moment_scale,
+                    energy_sha256=hashlib.sha256(memoryview(energy)).hexdigest(),
+                    density_sha256=hashlib.sha256(memoryview(rho)).hexdigest(),
+                    U_active_sha256=hashlib.sha256(memoryview(
+                        np.ascontiguousarray(snapshot['U_active']))).hexdigest(),
+                    capacity=plan,capture_workspace_bytes=capture_workspace)))
+            raise
         for batch_index,(iq,model) in enumerate(zip(ids,models)):
             spaces.setdefault(iq, model["spaces"])
             order = len(model["poles_ry"])

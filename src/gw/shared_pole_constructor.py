@@ -131,8 +131,15 @@ def _share_general_pencil(model, error, *, owner_rank, price, shape):
         record[:] = np.frombuffer(payload, np.uint8)
     status = json.loads(np.asarray(all_gather_processes(record))[owner_rank].tobytes())
     if status["error"] is not None:
-        raise ValueError(f"GATE shared_general_owner: owner_rank={owner_rank}, "
-                         f"reduced_shape={shape}: "+status["error"])
+        failure=ValueError(f"GATE shared_general_owner: owner_rank={owner_rank}, "
+                           f"reduced_shape={shape}: "+status["error"])
+        # Every rank decoded the SAME bounded canonical status. Expose its
+        # owner without parsing prose, so the driver can preserve ONLY that
+        # already-gathered frequency pencil before rethrowing this gate.
+        failure.owner_rank=int(owner_rank)
+        failure.reduced_shape=tuple(shape)
+        failure.canonical_host_failure=True
+        raise failure
     result = []
     for i, shape in enumerate(status["shapes"]):
         array = (np.ascontiguousarray(arrays[i], dtype=np.complex128) if rank == owner_rank
@@ -192,6 +199,9 @@ def collective_general_pencil_batch(pencils, *, max_order, rank_tolerance=1e-10,
             error=exc
     if world==1:
         if error is not None:
+            error.owner_rank=0
+            error.reduced_shape=tuple(pencils[0][0].shape)
+            error.canonical_host_failure=True
             raise error
         return [model]
     results=[]
