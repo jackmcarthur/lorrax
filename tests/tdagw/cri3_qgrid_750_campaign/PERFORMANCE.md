@@ -372,6 +372,36 @@ actual partial costs and a strict metric limitation, not a full-cycle or
 physical-gain verdict. The complete source/capture/accounting scope is in
 [EQFF_MATERIAL_REFUSAL_60066941.json](evidence/EQFF_MATERIAL_REFUSAL_60066941.json).
 
+### Cached q0 CPU diagnostic: live metric cutoff, no admitted remedy
+
+A bounded CPU-only replay examined the saved q0 pencil without rebuilding
+the material. It called the exact pinned `ff4553b` original-state RRQR owner,
+selecting **661 of 2084 states**, then evaluated the existing H-null tests.
+The computed unscaled principal-H eigenvalues were all positive (minimum
+.412032, maximum 1.91607e11), but the bank-tolerance cutoff was 1916.07.
+That cutoff classified 182 states as null; their full original-normalized
+G loss was **1.33245e-6**, above the existing approximately 1e-8 allowance.
+Thus q0 independently exhibits the live-null mechanism, although the old
+batch error still does not identify its actual first failing owner.
+
+Finite/infinity unit congruence left 159 nominal null states and G loss
+`6.95337e-7`. Selected-diagonal H congruence left 30: its raw scaled loss
+looked small, but the **original orthonormal null-span G loss was 6.27803e-8**,
+still above the unchanged allowance. Scaling alone is not an admitted fix;
+rescaling cannot hide a live discarded subspace. The corresponding output
+Gram losses were measured separately. The smallest computed H values were
+also below the diagnostic backward-error scales, so these positive displayed
+eigenvalues are **not a certified positive-definiteness result**. No cutoff
+waiver, PSD repair, model replacement, W admission or trajectory followed.
+
+The remote run used one pinned CPU core, BLAS 1, CPU-only JAX, a 180 s watchdog
+and 4 GiB RSS guard. It completed in **21.953 s**, peak RSS **1.207 GB**, using
+**zero GPUh**; no dense array analysis ran on the shared local machine.
+The real pure-Python threadpool limiter was supplied through an isolated
+wheel path, not a shared-venv modification. See the
+[unaltered small result](evidence/EQFF_Q0_CPU_DIAGNOSTIC_v2.json) and
+[execution/hash receipt](evidence/EQFF_Q0_CPU_EXECUTION_RECEIPT.json).
+
 ### Correction: the707 t0 request was not on its instantaneous shells
 
 The preserved707 measurements above remain raw historical evidence, but

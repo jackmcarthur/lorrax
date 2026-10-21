@@ -1,0 +1,30 @@
+{
+  "status": "CPU_Q0_DIAGNOSTIC_ONLY_NOT_MODEL_ADMISSION",
+  "source_revision": "ff4553b03cef0a0f8be893bfd2b222bd64db617b",
+  "helper_sha256": "a6b9049a7a44a1413d58e5b76fb15e781155a97a410cc29909d40a43b94a639f",
+  "launcher_sha256": "6eb33c8b3953cab35b389dc1651d60153bd61fc676cff85c87aeb155b4318b6e",
+  "input_sha256": "fee071ecafbb9c13e91a2f8eaf6abd744a073bbbe93b92a044a4b1a6fd2c3ef0",
+  "result_sha256": "b7103f79b7124c0fd055b04f5eeb1778f3fbf4d17252886e263878fb6d29dd67",
+  "stdout_sha256": "3a749b2d0d414219da7a4bae142463e4e3ba17a8e6b7e53a43a84af03ac009f6",
+  "remote_execution": "Perlmutter login21, pinned single permitted core 6, no scheduler/GPU allocation",
+  "JAX_PLATFORMS": "cpu",
+  "CUDA_VISIBLE_DEVICES": "",
+  "BLAS_OMP_MKL_NUMEXPR_threads": 1,
+  "max_wall_seconds": 180,
+  "rss_limit_bytes": 4294967296,
+  "measured_seconds": 21.95299515800434,
+  "measured_peak_rss_bytes": 1206833152,
+  "returncode": 0,
+  "gpu_hours": 0,
+  "array_analysis_local": false,
+  "dependency": {
+    "name": "threadpoolctl",
+    "version": "3.6.0",
+    "wheel_sha256": "43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb",
+    "scope": "Real 18 KB pure-Python wheel supplied on isolated PYTHONPATH; shared runtime venv not modified; original helper unchanged"
+  },
+  "previous_attempt": "v1 stopped before array load/factorization because threadpoolctl was absent; startup-only traceback/log preserved",
+  "local_evidence": "/home/jackm/mgkba_campaign_20261019/qgrid_20261020/material_ownq4_zero44_EQFF_60066941",
+  "remote_result": "/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/qgrid_20261020/EQFF_Q0_CPU_DIAGNOSTIC_v2.json",
+  "scope": "q0-only frequency-coordinate diagnostic, not proof of which material batch owner failed, positive-H certification, changed threshold, repaired model, W/TD admission or performance measurement"
+}
