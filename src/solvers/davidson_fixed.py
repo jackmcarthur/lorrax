@@ -119,27 +119,33 @@ def _whiten(p, normalizer):
 
 
 def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, budget, stall_patience,
-               lock_converged=False):
+               lock_converged=False, n_converge=None):
     """Only small correction blocks cross conditionals; capacity buffers alias.
 
     ``lock_converged``: a root whose residual already passes the test adds no
     correction (soft locking), so the whitening drops its row and H is applied
     only to the corrections of unconverged roots.  Its Ritz pair stays in the
     basis and is re-tested every iteration.
+    ``n_converge``: the stop (and the stall test) reads only the lowest
+    ``n_converge`` roots; the rest are margin roots that keep the block wide
+    enough to hold a multiplet split at the boundary.  ``None``: every root.
     """
+    n_test = block if n_converge is None else int(n_converge)
     def step(st):
         v, hv, h, m = st.basis, st.images, st.projected, st.size
         e, c = subspace.eigh(h, m)
         x, hx = subspace.reconstruct(v, hv, c, m, st.vectors)
         residual = hx-e.reshape((block,)+(1,)*(x.ndim-1))*x
         norms = jnp.sqrt(jnp.sum(jnp.abs(residual)**2, axis=tuple(range(1, x.ndim))))
-        converged = jnp.all(norms < tolerance*jnp.maximum(1., jnp.abs(e)))
+        passes = norms < tolerance*jnp.maximum(1., jnp.abs(e))
+        converged = jnp.all(passes[:n_test])
         status = jnp.where(converged, CONVERGED,
                            jnp.where(st.iterations+1 >= budget, ITERATION_LIMIT, RUNNING))
         finite = jnp.all(jnp.isfinite(e)) & jnp.all(jnp.isfinite(norms))
         status = jnp.where(finite, status, NONFINITE).astype(jnp.int32)
-        improved = jnp.max(norms) < .99*st.best_residual
-        best = jnp.where(improved, jnp.max(norms), st.best_residual)
+        worst = jnp.max(norms[:n_test])
+        improved = worst < .99*st.best_residual
+        best = jnp.where(improved, worst, st.best_residual)
         stalled = jnp.where(improved, 0, st.stalled+1).astype(jnp.int32)
         status = jnp.where((status == RUNNING) & (stall_patience > 0) &
                            (stalled >= stall_patience), STALLED, status).astype(jnp.int32)
@@ -148,7 +154,7 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
         def correction(_):
             p = precondition(data, residual, e, x)
             if lock_converged:
-                open_ = norms >= tolerance*jnp.maximum(1., jnp.abs(e))
+                open_ = ~passes
                 p = jnp.where(open_.reshape((block,)+(1,)*(x.ndim-1)), p, jnp.zeros((), p.dtype))
             finite_correction = jnp.all(jnp.isfinite(p))
             p = jax.lax.cond(
@@ -181,7 +187,7 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
 
 
 def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vector_sharding=None,
-                  lock_converged=False):
+                  lock_converged=False, n_converge=None):
     """Plan a complex128 local solver before solver compilation.
 
     ``apply_h(data, vectors)`` preserves ``(rows, *vector_shape)`` and must
@@ -193,7 +199,8 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
     ``capacity >= 2*n_eig`` is explicit; no iteration changes an array shape.
     There is no hidden default capacity or persistent compilation cache.
     The service resolves CUDA active BLAS or the CPU compatibility provider.
-    ``lock_converged`` turns on soft locking (:func:`_make_step`).
+    ``lock_converged`` turns on soft locking and ``n_converge`` (``<= n_eig``) stops on
+    the lowest roots only (:func:`_make_step`); both default to the old behaviour.
     """
     if not isinstance(n_eig, int) or not isinstance(capacity, int):
         raise TypeError('n_eig and capacity must be Python integers')
@@ -202,6 +209,8 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
         raise ValueError('vector_shape must contain positive Python integers')
     if not 1 <= n_eig <= prod(vector_shape) or capacity < 2*n_eig:
         raise ValueError('require 1 <= n_eig <= vector size and capacity >= 2*n_eig')
+    if n_converge is not None and not (isinstance(n_converge, int) and 1 <= n_converge <= n_eig):
+        raise ValueError('n_converge must be a Python integer with 1 <= n_converge <= n_eig')
     subspace = plan_subspace(capacity=capacity, n_eig=n_eig, vector_sharding=vector_sharding)
     normalizer = plan_subspace(capacity=n_eig, n_eig=n_eig, vector_sharding=vector_sharding)
     block = n_eig
@@ -234,7 +243,7 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
         result = jax.lax.while_loop(
             lambda st: (st.status == RUNNING) & (st.iterations < max_iterations),
             _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, max_iterations, stall_patience,
-                       lock_converged=lock_converged), state)
+                       lock_converged=lock_converged, n_converge=n_converge), state)
         info = DavidsonInfo(result.status, result.iterations, result.matvecs,
                             result.restarts, result.size, result.residuals)
         return result.values, result.vectors, info

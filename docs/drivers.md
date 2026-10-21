@@ -362,8 +362,10 @@ Computes the finite-momentum exciton dispersion $E_S(Q)$ of the TDA
 Hamiltonian $H_Q = D_Q + V_Q - W$ in the basis $|vk \to c\,k{+}Q\rangle$ along
 the deck's `K_POINTS {crystal_b}` path. The shifted conduction states come
 from htransform, W is the coarse-grid convolution of the GW restart, and the
-exchange tile at off-grid $Q$ comes from `bse.vq_interp`. The whole path is
-one compiled `lax.scan`. Writes `<prefix>.dat` and `<prefix>.png` (rank 0).
+exchange tile at off-grid $Q$ comes from `bse.vq_interp`. Each $Q$'s lowest
+roots come from `bse_lanczos`' Davidson (the default: one planned solver for
+the path, residual stop, a $Q$ that does not converge refuses) or, with
+`--solver lanczos`, from block Lanczos in one compiled `lax.scan`. Writes `<prefix>.dat` and `<prefix>.png` (rank 0).
 
 Invoke: `python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-eig 6`.
 

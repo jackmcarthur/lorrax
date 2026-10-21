@@ -452,10 +452,11 @@ STAGES = (
      ["-i", "htransform.in", "--guard-bands", "1", "-o", "htransform.dat",
       "--report-file", "htransform.out"]),
     # One conduction band: the window's top band must lie below the fitted
-    # window's top, or fH cannot see it (compute_wfns_fi refuses).
+    # window's top, or fH cannot see it (compute_wfns_fi refuses).  The default
+    # per-Q solver (Davidson, 0.01 meV); --max-iter caps its iterations.
     ("exciton_bands", "bse.exciton_bands",
      ["-i", "excited.in", "--n-val", "1", "--n-cond", "1", "--n-eig", "1",
-      "--block-size", "1", "--max-iter", "40", "--vq-mode", "ongrid",
+      "--max-iter", "40", "--vq-mode", "ongrid",
       "--q-per-segment", "1", "--band-degeneracy", "off", *_P,
       "--out-prefix", "exciton", "--report-file", "exciton.out"]),
     ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),

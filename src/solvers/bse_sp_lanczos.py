@@ -174,6 +174,7 @@ def sdy_lanczos_eig(
     m_max: int = 105,
     n_keep: int | None = None,
     n_restarts: int = 8,
+    tol: float | None = None,
     seed: int = 42,
     dtype=jnp.complex128,
     X0: jax.Array | None = None,
@@ -197,6 +198,14 @@ def sdy_lanczos_eig(
         As ``solvers.thick_restart_lanczos``.  ``m_max`` is the memory cap; the
         squared problem's Krylov dimension runs ~1.5x the Hermitian one, so a
         TDA knee at 71 slots suggests starting near 105 here.
+    tol : float, optional
+        Convergence-driven restarts: run restart cycles (at most ``n_restarts``)
+        until every one of the lowest ``n_eig`` satisfies
+        ``resid_i / (2 omega_i) < tol``, the ``resid`` bound on θ = ω² carried to
+        ω (``dω = dθ / 2ω``), in the operator's energy units.  ``None`` runs
+        exactly ``n_restarts`` cycles, as before.  ``diag['cycles']`` is the
+        count run and ``diag['resid_omega']`` the per-root ω residual; the caller
+        refuses on it (``bse_nontda`` GATE nontda_converged).
     X0 : (k, *trailing), optional
         Start vector; only ``X0[0]`` is used.  Seeding from converged TDA
         eigenvectors is strongly preferred to a random start — the coupling
@@ -298,7 +307,8 @@ def sdy_lanczos_eig(
             f"| steps={sdy_steps(m_max, n_keep, n_restarts)} "
             f"pair_applications="
             f"{sdy_pair_applications(m_max, n_keep, n_restarts)}"
-            + ("  [RED TWIN: complex restart Q]" if q_phase else ""))
+            + ("  [RED TWIN: complex restart Q]" if q_phase else "")
+            + ("" if tol is None else f" | tol={float(tol):g} (cycles <= {n_restarts})"))
 
     # ── start vector ───────────────────────────────────────────────────
     if X0 is not None:
@@ -474,11 +484,26 @@ def sdy_lanczos_eig(
         UV, theta_k, s_arrow = _restart(UV, T, beta[m_max - 1])
         return (UV, theta_k, s_arrow, alpha, beta, aim, adn, imd, b2min)
 
-    if n_restarts > 0:
-        (UV, theta_k, s_arrow, alpha, beta, aim, adn, imd,
-         b2min) = lax.fori_loop(
-            0, n_restarts, _cycle,
-            (UV, theta_k, s_arrow, alpha, beta, aim, adn, imd, b2min))
+    def _resid_omega(UV, theta_k, s_arrow):
+        """Per-root ``resid / 2ω``; slot ``n_keep`` holds u_{k+1} after any restart."""
+        rho = jnp.sqrt(2.0 * jnp.sum(jnp.abs(UV[0, n_keep]) ** 2))
+        om_ = jnp.sqrt(jnp.maximum(theta_k[:n_eig], jnp.asarray(1e-300, jnp.float64)))
+        return rho * jnp.abs(s_arrow[:n_eig]) / (2.0 * om_)
+
+    carry = (UV, theta_k, s_arrow, alpha, beta, aim, adn, imd, b2min)
+    cycles = jnp.int32(n_restarts)
+    if n_restarts > 0 and tol is None:
+        carry = lax.fori_loop(0, n_restarts, _cycle, carry)
+    elif n_restarts > 0:
+        # Stop on convergence: a cycle runs only while a root is still open.
+        def _open(st):
+            c, cr = st
+            return (c < n_restarts) & (
+                jnp.max(_resid_omega(cr[0], cr[1], cr[2])) >= float(tol))
+        cycles, carry = lax.while_loop(
+            _open, lambda st: (st[0] + 1, _cycle(st[0], st[1])),
+            (jnp.int32(0), carry))
+    UV, theta_k, s_arrow, alpha, beta, aim, adn, imd, b2min = carry
 
     # ── eigenpairs.  After the last restart UV[:, :n_keep] ARE the Ritz
     #    vectors and theta_k their values (= ω²), ascending from eigh. ──
@@ -515,6 +540,8 @@ def sdy_lanczos_eig(
         "im_uu": jnp.max(jnp.abs(G_uu.imag)),
         "im_vv": jnp.max(jnp.abs(G_vv.imag)),
         "resid": rho * jnp.abs(s_arrow[:n_eig]),
+        "resid_omega": _resid_omega(UV, theta_k, s_arrow),
+        "cycles": cycles,
         "theta_sq": theta_k,
         "alpha": alpha,
         "beta": beta,

@@ -64,6 +64,7 @@ as scripts; they skip under pytest where there is no device. Run them with
 `test_rocsolver_eigh_gate`, `test_rocsolver_lu_gate`, `test_subspace_native_gate`,
 `test_active_local_native_gate`, `test_distrib_la_elpa_gate`, `test_fourier_plan_xla_gate`,
 `test_kconv_xla_gate`, `test_kdft_{kbox,outer,parent,plane}_gate`, `test_bse_w_blocks`, `test_bse_default_solver`,
+`test_exciton_bands_davidson`, `test_bse_nontda_matrix_free`,
 `test_tdagw_{collision_fullrho,collision_instbasis,dynsig,dynsig_sigma,model,kernel_export}`,
 `phdf5_read_multi_gate.py`, `phdf5_sector_race_gate.py`. `tdagw/_*_516_case.py` are the
 manual CrI3 diagnostics, run explicitly at P4 on compute nodes; `fixtures_cd/` holds the

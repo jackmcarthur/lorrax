@@ -711,7 +711,7 @@ def test_the_plumbing_scan_does_not_cry_wolf():
 _DRIVER_MAIN_STATEMENTS = {
     "gw.gw_jax": (("main", "_run_gw_stages"), 57),
     "bse.bse_jax": (("main",), 30),
-    "bse.exciton_bands": (("main",), 390),
+    "bse.exciton_bands": (("main",), 393),
     "bandstructure.htransform": (("main",), 124),
     "gw.kin_ion_io": (("main",), 124),
     "psp.get_dipole_mtxels": (("main",), 230),

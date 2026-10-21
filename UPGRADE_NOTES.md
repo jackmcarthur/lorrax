@@ -5,6 +5,35 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — Davidson for every lowest-N BSE solve: exciton bands per Q, margin roots, a convergence-driven non-TDA matrix-free route
+
+`bse.exciton_bands` now solves each Q's `--n-eig` lowest with `bse_lanczos`'
+Davidson (`--solver davidson`, the default), the route `bse_jax` uses: the
+exact diagonal E_c(k+Q) - E_v(k) plus the kernel diagonal as preconditioner,
+soft locking, and a stop when every root's residual is below
+`--davidson-tol-mev` (0.01 meV). One planned solver serves the path. A Q that
+stops on the cap refuses (`GATE davidson_converged`) before anything is
+written. `--solver lanczos` keeps the fixed block-Lanczos scan, which has no
+convergence test.
+
+- **Margin roots.** BSE Davidson (`bse_jax`, `exciton_bands`) solves 8 roots
+  above `--n-eig` (fewer when the transition space is small, at most half of
+  it), stops when the lowest `--n-eig` converge, and reports only those. NSCF
+  Davidson is unchanged.
+- **Non-TDA matrix-free** (`bse_nontda`, `solver='matrixfree'`, opt-in): restart
+  cycles now run until every root's omega residual is below 0.01 meV
+  (`mf_tol_mev`; cap `mf_n_restarts`, now 50) and a capped stop refuses
+  (`GATE nontda_converged`). It used to run 3 cycles and return the result
+  whatever the residual. The default dense non-TDA route is unchanged.
+- **Results move** by the solvers' residuals: predicted at most 0.01 meV on
+  hsuite `exciton_bands`, `bse` and `bse_bisp`.
+- **Command lines.** `exciton_bands --block-size` is read by `--solver lanczos`
+  only and refuses otherwise. `--max-iter` is the Davidson iteration cap,
+  default max(30, min(200, n/2)) at transition dimension n; under
+  `--solver lanczos` its default stays 40. `bse_lanczos.solve_bse_sharded`'s
+  Python defaults are now `solver_kind="davidson"`,
+  `davidson_precond="exact"` (were `lanczos` / `bare`), as on the CLI.
+
 ## 2026-10-21 — BSE lowest-N default is Davidson with a residual stop; Haydock runs in the eigensolve's process
 
 `bse_jax --lanczos --tda` now solves the `--n-eig` lowest roots with block

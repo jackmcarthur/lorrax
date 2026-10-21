@@ -26,6 +26,10 @@ log = get_logger(__name__)
 TRACE_COUNTS: dict = {}
 MATVEC_APPLICATIONS = [0]
 LAST_RUN: dict = {}
+#: Planned solvers kept by the caller's ``plan_key`` (one compile for a run of
+#: same-shape solves whose operands are all arguments).  Small and process-local.
+_PLANS: dict = {}
+_PLANS_MAX = 8
 
 
 def instrumentation_summary():
@@ -45,7 +49,7 @@ def _default_precond(r, eigenvalues):
 
 def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
              m_max=None, max_iter=100, tol=1e-8, stall_patience=20, verbose=True,
-             data=None, lock_converged=False):
+             data=None, lock_converged=False, n_converge=None, plan_key=None):
     """Lowest Hermitian eigenpairs, using fixed-capacity active-only iteration.
 
     ``X0`` has shape ``(n_eig, *vector_shape)``; vector axes retain their
@@ -61,6 +65,12 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
     Eigenvalues return on the host; eigenvectors preserve distributed storage.
     ``lock_converged`` stops correcting roots that already pass the test
     (soft locking: fewer H applications, same stopping rule).
+    ``n_converge`` (``<= n_eig``) stops when the lowest ``n_converge`` roots pass;
+    the others are margin roots.  ``None``: every root.
+    ``plan_key`` (hashable) reuses the planned solver of an earlier call with the
+    same key, so a run of solves compiles once.  The caller's key must fix
+    everything static (operator and preconditioner programs, shapes, sharding,
+    capacity); every device array must reach the solve through ``data``.
     ``LAST_RUN`` holds one final snapshot and an explicit termination status.
     """
     if X0 is None:
@@ -88,9 +98,17 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
         TRACE_COUNTS[key] = TRACE_COUNTS.get(key, 0)+1
         return apply_H(payload, v) if explicit_data else apply_H(v)
     sharding = initial.sharding if isinstance(initial.sharding, jax.sharding.NamedSharding) else None
-    plan = plan_davidson(apply, precondition, n_eig=n_eig, capacity=capacity,
-                         vector_shape=initial.shape[1:], vector_sharding=sharding,
-                         lock_converged=lock_converged)
+    full_key = None if plan_key is None else (plan_key, n_eig, capacity, initial.shape[1:],
+                                              sharding, bool(lock_converged), n_converge)
+    plan = _PLANS.get(full_key) if full_key is not None else None
+    if plan is None:
+        plan = plan_davidson(apply, precondition, n_eig=n_eig, capacity=capacity,
+                             vector_shape=initial.shape[1:], vector_sharding=sharding,
+                             lock_converged=lock_converged, n_converge=n_converge)
+        if full_key is not None:
+            if len(_PLANS) >= _PLANS_MAX:
+                _PLANS.pop(next(iter(_PLANS)))
+            _PLANS[full_key] = plan
     started = time.perf_counter()
     values, vectors, info = plan.solve(data if explicit_data else (), initial, tol, max_iter, stall_patience)
     values = gather_to_host(values)
@@ -109,9 +127,10 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
     if status == NONFINITE:
         raise FloatingPointError('davidson: nonfinite operator/preconditioner output')
     if verbose:
-        count = _count_converged(residuals < tol*np.maximum(1., np.abs(values)), n_eig)
+        n_test = n_eig if n_converge is None else int(n_converge)
+        count = _count_converged(residuals < tol*np.maximum(1., np.abs(values)), n_test)
         label = 'Converged' if status == CONVERGED else 'STALLED' if status == STALLED else 'NOT CONVERGED'
-        log.info(f'Davidson: {label}; {count}/{n_eig} roots, {iterations} iterations, '
-                 f'{matvecs} matvecs, {int(restarts)} restarts; max residual={np.max(residuals):.3e}',
+        log.info(f'Davidson: {label}; {count}/{n_test} roots, {iterations} iterations, '
+                 f'{matvecs} matvecs, {int(restarts)} restarts; max residual={np.max(residuals[:n_test]):.3e}',
                  extra=block("davidson"))
     return values, vectors

@@ -420,33 +420,16 @@ def _preview_lanczos(
 
 
 def _davidson_report(*, n_eig, tol_mev, budget, dim):
-    """The Davidson stop as one log line and the RESULTS ``eigensolve`` row:
-    roots converged, iterations, matvecs, the largest residual in meV.  Any
-    stop but CONVERGED refuses (``GATE davidson_converged``) before the driver
-    writes anything."""
-    import numpy as np
-    from solvers.davidson import LAST_RUN as run
-    from solvers.davidson_fixed import CONVERGED, STALLED
-    res_mev = np.asarray(run["res"][0]) * RYD_TO_EV * 1.0e3
-    n_conv = int(np.sum(res_mev < tol_mev))
-    status = int(run["status"])
-    word = ("converged" if status == CONVERGED else
-            "STALLED" if status == STALLED else "NOT converged")
-    line = (f"Davidson {word}: {n_conv}/{n_eig} roots with residual < "
-            f"{tol_mev:g} meV in {int(run['iter'][0])}/{int(budget)} iterations, "
-            f"{int(run['mv'][0])} matvecs, {int(run['restarts'])} restarts; "
-            f"max residual {float(np.max(res_mev)):.3e} meV")
-    log.info(line)
-    if status != CONVERGED:
-        raise RuntimeError(
-            f"GATE davidson_converged: Davidson stopped {word} with {n_conv}/{n_eig} "
-            f"roots below the {tol_mev:g} meV residual after {int(run['iter'][0])}/"
-            f"{int(budget)} iterations (the cap is --max-lanczos-iter, default "
-            f"max(30, min(200, dim // 2)) = {max(30, min(200, int(dim) // 2))} at dim "
-            f"{int(dim)}); max residual {float(np.max(res_mev)):.3e} meV.  No "
-            "eigenvector, spectrum or Haydock output was written.  Fix: raise "
-            "--max-lanczos-iter or --davidson-m-max, or loosen --davidson-tol-mev")
-    return line
+    """The Davidson stop as one log line and the RESULTS ``eigensolve`` row;
+    any stop but CONVERGED refuses (``GATE davidson_converged``,
+    ``bse_lanczos.davidson_stop_line``) before the driver writes anything."""
+    from .bse_lanczos import davidson_stop_line
+    return davidson_stop_line(
+        n_eig=n_eig, tol_mev=tol_mev, budget=budget,
+        cap=(f"the cap is --max-lanczos-iter, default max(30, min(200, dim // 2)) = "
+             f"{max(30, min(200, int(dim) // 2))} at dim {int(dim)}"),
+        refused="No eigenvector, spectrum or Haydock output was written.",
+        fix="raise --max-lanczos-iter or --davidson-m-max, or loosen --davidson-tol-mev")
 
 
 def _files_text(paths) -> str:

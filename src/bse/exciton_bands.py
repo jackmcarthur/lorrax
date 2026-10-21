@@ -394,6 +394,93 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     return solve_path
 
 
+def build_path_solver_davidson(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
+                               nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
+                               *, n_eig: int, max_iter: int, tol_mev: float, W_q0):
+    """The ``--solver davidson`` (default) counterpart of :func:`build_path_solver`:
+    the same call signature and outputs, the per-Q lowest ``n_eig`` from
+    ``bse_lanczos.solve_bse_sharded``'s Davidson (exact diagonal
+    E_c(k+Q) - E_v(k) + (V_x(Q) - W_d)/nk, soft locking, margin roots, the
+    ``tol_mev`` residual stop).  One planned solver serves every Q
+    (``davidson_plan_key``); each Q's operands are arguments.  A Q that does not
+    converge refuses (``GATE davidson_converged``) before the driver writes.
+    ``W_q0`` is the q = 0 slice of W_q, taken before W_q was donated."""
+    from common.collectives import replicate_to_mesh
+    from .bse_lanczos import RY_TO_MEV, davidson_stop_line, solve_bse_sharded
+    sh = make_bse_shardings(mesh_xy)
+    rows_of = {}
+
+    def _row(a, i, sharding):
+        if sharding not in rows_of:
+            rows_of[sharding] = jax.jit(
+                lambda a, i: lax.dynamic_index_in_dim(a, i, 0, keepdims=False),
+                out_shardings=sharding)
+        return rows_of[sharding](a, i)
+
+    pair = jax.jit(compute_pair_amplitude, out_shardings=sh.M)
+    static = dict(nkx=nkx, nky=nky, nkz=nkz, n_cond=n_cond, n_val=n_val,
+                  n_cond_pad=nc_pad, n_val_pad=nv_pad)
+
+    def solve_path(psi_cQ_X, psi_cQ_Y, eps_cQ, V_Q,
+                   psi_v_X, psi_v_Y, eps_v, W_R, D_head=None, M_Q=None):
+        rows = []
+        for iQ in range(int(psi_cQ_X.shape[0])):
+            i = jnp.int32(iQ)
+            c_X = _row(psi_cQ_X, i, sh.psi_x)
+            payload = dict(static, psi_c_X=c_X, psi_c_Y=_row(psi_cQ_Y, i, sh.psi_y),
+                           eps_c=_row(eps_cQ, i, sh.eps), V_q0=_row(V_Q, i, sh.V),
+                           psi_v_X=psi_v_X, psi_v_Y=psi_v_Y, eps_v=eps_v, W_R=W_R,
+                           W_q=None, M=pair(c_X, psi_v_X), _W_q0_for_precond=W_q0)
+            if D_head is not None:
+                payload["head_tensor"] = (D_head, _row(M_Q, i, NamedSharding(mesh_xy, P())))
+            ev, _, _ = solve_bse_sharded(
+                payload, mesh_xy, n_eig=n_eig, max_iter=max_iter, solver_kind="davidson",
+                davidson_precond="exact", davidson_tol_Ry=tol_mev / RY_TO_MEV,
+                davidson_plan_key="exciton_bands")
+            davidson_stop_line(n_eig=n_eig, tol_mev=tol_mev, budget=max_iter,
+                               cap="the cap is --max-iter", where=f" at Q row {iQ}",
+                               refused="No exciton band file was written.",
+                               fix="raise --max-iter, or loosen --davidson-tol-mev")
+            rows.append(np.asarray(_gather_host(ev)).real)
+        return replicate_to_mesh(np.stack(rows), mesh_xy), ()
+
+    solve_path.alpha_labels = []
+    return solve_path
+
+
+def check_solver_flags(ap, args) -> None:
+    """A flag only the other ``--solver`` reads refuses (the default is davidson)."""
+    if args.solver == "davidson" and args.block_size != ap.get_default("block_size"):
+        ap.error("--block-size is read by --solver lanczos only (the default solver "
+                 "is davidson since 2026-10-21); drop it or add --solver lanczos")
+    if args.solver == "lanczos" and args.davidson_tol_mev != ap.get_default("davidson_tol_mev"):
+        ap.error("--davidson-tol-mev is read by --solver davidson only")
+
+
+def _precond_w_q0(args, data):
+    """The q = 0 slice of W_q for the Davidson exact diagonal, taken before W_q is donated."""
+    if args.solver != "davidson" or data.get("W_q") is None:
+        return None
+    return data["W_q"][:, :, 0, 0, 0]
+
+
+def _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, head_mbz, W_q0):
+    """The per-Q lowest-``n_eig`` solver of the band scan: Davidson (default, cap
+    ``max(30, min(200, n_phys // 2))`` iterations) or ``--solver lanczos``'s fixed
+    block-Lanczos scan (40 block iterations)."""
+    if args.solver == "lanczos":
+        return build_path_solver(
+            mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, n_eig=args.n_eig,
+            block_size=args.block_size,
+            max_iter=40 if args.max_iter is None else args.max_iter, head_tensor=head_mbz)
+    n_phys = int(n_cond) * int(n_val) * nkx * nky * nkz
+    return build_path_solver_davidson(
+        mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val, n_eig=args.n_eig,
+        max_iter=(max(30, min(200, n_phys // 2)) if args.max_iter is None
+                  else args.max_iter),
+        tol_mev=args.davidson_tol_mev, W_q0=W_q0)
+
+
 def _report_alpha_over_path(labels, alpha_all, log=log.debug):
     """Run the α-Hermiticity gate on the per-Q scalars the scan returned.
 
@@ -1134,8 +1221,14 @@ def settings_rows(args, *, source) -> tuple:
                 else "none", source("--w-coarse-grid"),
                 "W on a coarse grid, trigonometric densification" if args.w_coarse_grid
                 else "W on the native BSE k grid"),
-        Setting("--max-iter", str(int(args.max_iter)), source("--max-iter"),
-                f"block Lanczos, block size {int(args.block_size)}"),
+        Setting("--solver", str(args.solver), source("--solver"),
+                f"Davidson per Q, exact diagonal, residual below "
+                f"{float(args.davidson_tol_mev):g} meV" if args.solver == "davidson"
+                else f"block Lanczos per Q, block size {int(args.block_size)}"),
+        Setting("--max-iter", "auto" if args.max_iter is None else str(int(args.max_iter)),
+                source("--max-iter"),
+                "iteration cap" if args.solver == "davidson"
+                else "block iterations (Krylov = block x iter)"),
         Setting("--eqp", os.path.basename(str(args.eqp)) if args.eqp else "none",
                 source("--eqp"),
                 "quasiparticle corrections from this file" if args.eqp
@@ -1223,9 +1316,19 @@ def build_parser():
                          "grows linearly, and that is what to watch on a "
                          "densified (bse_k_grid) bundle.")
     ap.add_argument("--n-eig", type=int, default=6)
-    ap.add_argument("--block-size", type=int, default=8)
-    ap.add_argument("--max-iter", type=int, default=40,
-                    help="block-Lanczos iterations (Krylov = block·iter)")
+    ap.add_argument("--solver", choices=("davidson", "lanczos"), default="davidson",
+                    help="per-Q lowest --n-eig solver: davidson (default; "
+                         "bse_lanczos' exact-diagonal Davidson, stopped on the "
+                         "--davidson-tol-mev residual) or lanczos (fixed block "
+                         "Lanczos, --block-size x --max-iter)")
+    ap.add_argument("--davidson-tol-mev", type=float, default=0.01,
+                    help="--solver davidson: every root's residual below this (meV)")
+    ap.add_argument("--block-size", type=int, default=8,
+                    help="--solver lanczos only: block size")
+    ap.add_argument("--max-iter", type=int, default=None,
+                    help="iteration cap: Davidson iterations (default "
+                         "max(30, min(200, n_phys // 2))) or block-Lanczos "
+                         "iterations (default 40, Krylov = block x iter)")
     ap.add_argument("--vq-mode", choices=("interp", "refit", "both", "ongrid"),
                     default="interp")
     ap.add_argument("--eqp", type=str, default=None,
@@ -1490,6 +1593,7 @@ def main(argv=None):
 
     ap = build_parser()
     args = ap.parse_args(argv)
+    check_solver_flags(ap, args)
 
     report_path = os.path.abspath(
         args.report_file if args.report_file else args.out_prefix + ".out")
@@ -2193,6 +2297,7 @@ def main(argv=None):
         # is a different array of a different shape and donation is declined
         # anyway.  It also still needs ``data["W_q"]`` to build that sub-grid,
         # which is why the reference is dropped per-branch and not once up here.
+        W_q0 = _precond_w_q0(args, data)
         _ifftn_donated = jax.jit(_ifftn, donate_argnums=(0,))
         if args.w_coarse_grid is None:
             W_R = _ifftn_donated(data["W_q"])         # fast path: native fine W (byte-identical)
@@ -2294,13 +2399,11 @@ def main(argv=None):
                 args, nk, nc_pad, nv_pad, n_val, n_cond, log=log)
             head_args = (jnp.asarray(D_head),
                          jnp.asarray(M_stack, dtype=jnp.float64))
-        solver = build_path_solver(
-            mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val,
-            n_eig=args.n_eig,
-            block_size=args.block_size, max_iter=args.max_iter,
-            head_tensor=head_mbz)
+        solver = _band_solver(args, mesh_xy, nkx, nky, nkz, nc_pad, nv_pad,
+                              n_cond, n_val, head_mbz, W_q0)
         tick("w_r_and_build", t0)
-        stages.result(f"W_R on {nkx} x {nky} x {nkz}; block Lanczos solver, "
+        stages.result(f"W_R on {nkx} x {nky} x {nkz}; "
+                      f"{'block Lanczos' if args.solver == 'lanczos' else 'Davidson'} solver, "
                       f"{int(args.n_eig)} levels per Q")
         stages.begin(5, "Q-path eigensolve", name="exb.solve")
         t_c0 = time.time()
@@ -2352,12 +2455,13 @@ def main(argv=None):
                 f"{n_solve} Q; warm re-run check SKIPPED (the default since "
                 f"2026-08-08 — pass --rerun-check to run it)")
         t0 = time.time()
-        mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
-                           data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
-                           W_R, *head_args).compile().memory_analysis()
-        log(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
-            f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
-            f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
+        if args.solver == "lanczos":    # the Davidson route is priced in bse_lanczos
+            mem = solver.lower(psi_cQ_X, psi_cQ_Y, eps_cQ, V_stack,
+                               data["psi_v_X"], data["psi_v_Y"], data["eps_v"],
+                               W_R, *head_args).compile().memory_analysis()
+            log(f"solve_path memory_analysis: temp={mem.temp_size_in_bytes/2**20:.1f} MiB "
+                f"args={mem.argument_size_in_bytes/2**20:.1f} MiB "
+                f"out={mem.output_size_in_bytes/2**20:.1f} MiB")
         # TIMED: this is an AOT ``lower().compile()`` of the SAME program that was
         # just executed, for a memory report.  Whether it hits XLA's in-process
         # executable cache or recompiles from scratch is an XLA implementation
@@ -2542,8 +2646,11 @@ def main(argv=None):
         report.emit_lines(exciton_band_results_lines(
             _path_ev, Qpath[:nQ_path], node_idx, node_labels,
             n_extra=int(nQ - nQ_path),
-            hermiticity=("PASS" if alpha_ok else "FAILED")
-            + f" (worst relative {alpha_rel:.2e}, tol {ALPHA_HERM_RTOL:.0e})",
+            hermiticity=(("PASS" if alpha_ok else "FAILED")
+                         + f" (worst relative {alpha_rel:.2e}, tol {ALPHA_HERM_RTOL:.0e})"
+                         if args.solver == "lanczos" else
+                         f"not tested (Davidson; every Q's residual below "
+                         f"{float(args.davidson_tol_mev):g} meV)"),
             certificate=_cert_text,
             files=f"{os.path.basename(args.out_prefix)}.dat (all levels), "
                   f"{os.path.basename(args.out_prefix)}.png"))

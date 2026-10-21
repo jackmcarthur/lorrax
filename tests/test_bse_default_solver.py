@@ -5,9 +5,10 @@ On a synthetic spinor payload (k grid 2x2x2, 4v x 4c, N_mu 24: transition dimens
 the loader's shardings, the screened kernel real in R space (so H is Hermitian):
 
 1. ``bse_jax``'s CLI defaults (``--solver davidson --davidson-precond exact
-   --davidson-tol-mev 0.01``) through ``bse_lanczos.solve_bse_sharded`` stop CONVERGED and
-   give the lowest 8 eigenvalues within 0.01 meV of a full-Krylov Lanczos (120 of 128 steps)
-   and of ``eigvalsh`` of the operator assembled from the same matvec.
+   --davidson-tol-mev 0.01``) through ``bse_lanczos.solve_bse_sharded`` solve 8 + 8 margin
+   roots, stop CONVERGED on the lowest 8 and return those 8, within 0.01 meV of a full-Krylov
+   Lanczos (120 of 128 steps) and of ``eigvalsh`` of the operator assembled from the same
+   matvec.
 2. ``GATE davidson_converged``: the driver (``bse_jax._preview_lanczos``, loader stubbed)
    capped at 2 iterations refuses, and its run directory stays empty.
 3. ``keep_W_R``: ``absorption_haydock.haydock_coefficients`` on the eigensolve's payload
@@ -104,7 +105,8 @@ def run_cases(mesh):
         davidson_tol_Ry=defaults["davidson_tol_mev"] / RY_MEV, keep_W_R=True)
     ev_d = np.asarray(ev_d).real
     out = {"davidson_converged": int(LAST_RUN["status"]) == CONVERGED,
-           "davidson_iterations": int(it_d), "davidson_matvecs": int(LAST_RUN["mv"][0])}
+           "davidson_iterations": int(it_d), "davidson_matvecs": int(LAST_RUN["mv"][0]),
+           "davidson_roots": f"{len(ev_d)}+{len(LAST_RUN['res'][0]) - len(ev_d)}"}
     ev_l, _, _ = solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG,
                                    max_iter=H.shape[0] - N_EIG, solver_kind="lanczos", block_size=1)
     ev_l = np.asarray(ev_l).real
@@ -189,8 +191,10 @@ def main() -> int:
         return 0
     out = run_cases(mesh)
     checks = {
-        f"1 Davidson (CLI defaults) CONVERGED, <= {TOL_MEV} meV from full-Krylov Lanczos and dense":
-            out["davidson_converged"] and out["davidson_vs_lanczos_meV"] <= TOL_MEV
+        f"1 Davidson (CLI defaults, {N_EIG} + 8 margin roots) CONVERGED, <= {TOL_MEV} meV "
+        "from full-Krylov Lanczos and dense":
+            out["davidson_converged"] and out["davidson_roots"] == f"{N_EIG}+8"
+            and out["davidson_vs_lanczos_meV"] <= TOL_MEV
             and out["davidson_vs_dense_meV"] <= TOL_MEV and out["lanczos_vs_dense_meV"] <= 1e-6,
         "2 GATE davidson_converged refuses a run capped at 2 iterations, nothing written":
             out["capped_davidson_refuses_unwritten"],

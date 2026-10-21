@@ -406,9 +406,17 @@ the refit and with the stored tile, and the eigenvalues must agree within
 path with no point on the coarse grid refuses under `bse`. The grade and the
 worst difference are written into the output header.
 
-**One compile.** The per-$Q$ solve (pair amplitudes and block Lanczos over
-the BSE stack matvec) is one jitted function under one `lax.scan` over the
-whole $Q$ list. A Python loop over $Q$ would recompile per point. Extra points
+**The per-$Q$ solver.** By default each $Q$ is solved by `bse_lanczos`'
+Davidson, the `bse_jax` default: the exact diagonal
+$\varepsilon_c(k+Q) - \varepsilon_{vk}$ plus the kernel diagonal as
+preconditioner, soft locking, 8 margin roots above `--n-eig`, and a stop when
+every root's residual is below `--davidson-tol-mev` (0.01 meV). One planned
+solver serves the whole path, with each $Q$'s operands as arguments, so it
+compiles once. A $Q$ that stops on the `--max-iter` cap refuses
+(`GATE davidson_converged`) before anything is written. `--solver lanczos`
+keeps the fixed block Lanczos (pair amplitudes and block Lanczos over the BSE
+stack matvec), one jitted function under one `lax.scan` over the whole $Q$
+list; it has no convergence test. Extra points
 cost one scan row each, so `--q-per-segment` (default 16) raises each
 segment's point count to at least that floor; `--q-per-segment 1` keeps the
 deck's counts. The cost that grows with the number of $Q$ is the htransform
@@ -441,7 +449,9 @@ as markers.
 | flag | default | meaning |
 |---|---|---|
 | `--n-val` / `--n-cond` | 4 / 4 | BSE window, in bands |
-| `--n-eig` / `--block-size` / `--max-iter` | 6 / 8 / 40 | per-$Q$ block Lanczos |
+| `--solver` / `--davidson-tol-mev` | `davidson` / 0.01 | per-$Q$ solver: Davidson to a residual below the tolerance (meV), or `lanczos`, the fixed block-Lanczos scan |
+| `--n-eig` / `--max-iter` | 6 / auto | roots per $Q$; iteration cap: Davidson max(30, min(200, n/2)) at transition dimension n, block Lanczos 40 |
+| `--block-size` | 8 | block-Lanczos width; `--solver lanczos` only, refused otherwise |
 | `--band-degeneracy` | `strict` | a window edge inside a multiplet refuses (`snap` widens it, `off` proceeds); checked on the loader window and the htransform conduction window |
 | `--refit-guard-bands` | 4 | guard bands of the refit's $f(H)$ window above the ζ window; 0 must fail the tile identity |
 | `--a-band` | top band | band whose bandwidth sets $a$ in $f$ (§3) |

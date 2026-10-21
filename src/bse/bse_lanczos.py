@@ -66,6 +66,36 @@ from common.units import RYD_TO_EV
 #: The Davidson residual tolerance of the default lowest-N solve, meV.
 DAVIDSON_TOL_MEV = 0.01
 RY_TO_MEV = RYD_TO_EV * 1.0e3
+#: Margin roots of the BSE Davidson: it solves n_eig + this many, stops on the
+#: lowest n_eig and reports those, so a multiplet split at the n_eig boundary
+#: is held in the block instead of being dropped (audit S1).
+DAVIDSON_MARGIN_ROOTS = 8
+
+
+def davidson_stop_line(*, n_eig, tol_mev, budget, cap, refused, fix, where=""):
+    """The last Davidson solve (``solvers.davidson.LAST_RUN``) as one log line over its
+    lowest ``n_eig`` roots.  Any stop but CONVERGED refuses (``GATE davidson_converged``);
+    a driver calls this before it writes anything.  ``cap`` names the iteration cap,
+    ``refused`` what was not written, ``fix`` the remedy."""
+    from solvers.davidson import LAST_RUN as run
+    from solvers.davidson_fixed import CONVERGED, STALLED
+    res_mev = (np.asarray(run["res"][0]) * RY_TO_MEV)[:int(n_eig)]
+    n_conv = int(np.sum(res_mev < tol_mev))
+    status = int(run["status"])
+    word = ("converged" if status == CONVERGED else
+            "STALLED" if status == STALLED else "NOT converged")
+    it, worst = int(run["iter"][0]), float(np.max(res_mev))
+    line = (f"Davidson {word}{where}: {n_conv}/{n_eig} roots with residual < "
+            f"{tol_mev:g} meV in {it}/{int(budget)} iterations, "
+            f"{int(run['mv'][0])} matvecs, {int(run['restarts'])} restarts; "
+            f"max residual {worst:.3e} meV")
+    log.info(line)
+    if status != CONVERGED:
+        raise RuntimeError(
+            f"GATE davidson_converged: Davidson stopped {word}{where} with {n_conv}/{n_eig} "
+            f"roots below the {tol_mev:g} meV residual after {it}/{int(budget)} iterations "
+            f"({cap}); max residual {worst:.3e} meV.  {refused}  Fix: {fix}")
+    return line
 
 from .bse_ring_comm import make_bse_shardings
 from .bse_head import head_shifted_eps_c
@@ -118,9 +148,9 @@ def solve_bse_sharded(
     rtol: float = 0.0,
     atol: float = 1e-8,
     check_every: int = 4,
-    solver_kind: str = "lanczos",
+    solver_kind: str = "davidson",
     davidson_m_max: int | None = None,
-    davidson_precond: str = "bare",
+    davidson_precond: str = "exact",
     davidson_olsen: bool = False,
     trlan_m_max: int | None = None,
     trlan_n_keep: int | None = None,
@@ -129,6 +159,8 @@ def solve_bse_sharded(
     davidson_tol_Ry: float = DAVIDSON_TOL_MEV / RY_TO_MEV,
     tda: bool = True,
     keep_W_R: bool = False,
+    davidson_margin: int = DAVIDSON_MARGIN_ROOTS,
+    davidson_plan_key=None,
 ) -> Tuple[jax.Array, jax.Array]:
     """The BSE eigensolve (Lanczos / block / Davidson / TRLan) on any mesh.
 
@@ -169,6 +201,12 @@ def solve_bse_sharded(
     ``data["W_R"]`` (one (μ, ν, k) tile per rank, the solve's own) for a second
     consumer in the same process (``bse_jax --haydock-iter``); a payload that
     already carries ``W_R`` is solved on it without a second transform.
+
+    Davidson (the default) solves ``n_eig + davidson_margin`` roots and stops
+    when the lowest ``n_eig`` pass the residual test; only those are returned.
+    ``davidson_plan_key`` (any hashable) reuses the planned solver across calls
+    on same-shape payloads.  A payload may carry ``head_tensor = (D_head,
+    M_head)``, the stack matvec's head-term operands (Davidson only).
     """
     if os.environ.get("LORRAX_LANCZOS_REORTH", "").strip():
         raise ValueError("LORRAX_LANCZOS_REORTH is retired: CGS2 is the only reorthogonalisation route; unset it")
@@ -197,9 +235,16 @@ def solve_bse_sharded(
     # The legacy ``matvec_kind`` selector is retired here; see the retirement
     # note in bse_stack_matvec (ring/gather/simple + selector deletion pending).
     from .bse_stack_matvec import build_bse_stack_matvec
+    # ``head_tensor`` (exciton_bands' mini-BZ head): ``(D_head, M_head)`` operands
+    # of the stack matvec's head term, read by the Davidson route only.
+    head_tensor = data.get("head_tensor")
+    if head_tensor is not None and solver_kind != "davidson":
+        raise ValueError("solve_bse_sharded: a head_tensor payload is solved by "
+                         "solver_kind='davidson' only")
     with timing.section("bse.solve.matvec_build"):
         matvec_ring = build_bse_stack_matvec(
             mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa",
+            **({"head_tensor": True} if head_tensor is not None else {}),
         )
 
     # ``auto`` is resolved to one of the two real routes HERE, before anything
@@ -300,7 +345,7 @@ def solve_bse_sharded(
         # W_R already built above (donated top-level ifft).
 
         operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                         eps_c, eps_v, W_R, V_q0, M)
+                         eps_c, eps_v, W_R, V_q0, M, *(head_tensor or ()))
 
         def apply_H(solver_data, V):
             V = jax.lax.with_sharding_constraint(V, sh.X)
@@ -346,8 +391,13 @@ def solve_bse_sharded(
         def apply_precond(payload, R, values, X):
             return precond_apply(payload[1], R, values, X)
 
+        # Margin roots (DAVIDSON_MARGIN_ROOTS): solve n_solve, stop on and report
+        # the lowest n_eig.  Fewer when the physical space cannot hold a
+        # 2 x n_solve basis.
+        n_phys = int(data["n_cond"]) * int(data["n_val"]) * nk
+        n_solve = n_eig + max(0, min(int(davidson_margin), n_phys // 2 - n_eig))
         X0 = init_bse_subspace(
-            eps_c, eps_v, n_eig=n_eig,
+            eps_c, eps_v, n_eig=n_solve,
             n_cond=int(data["n_cond"]), n_val=int(data["n_val"]),
             n_random=davidson_n_random_init,
             mesh=mesh_xy, sharding=bse_sharding)
@@ -383,13 +433,19 @@ def solve_bse_sharded(
 
         # One fixed-capacity solve replaces the former shape warmup ladder.
         from solvers.davidson import DEFAULT_M_MAX_FACTOR
-        m_max_warm = (int(davidson_m_max) if davidson_m_max
-                      else DEFAULT_M_MAX_FACTOR * n_eig)
-        log.info(f"Davidson: m_max={m_max_warm} ({m_max_warm // n_eig}x n_eig), "
-                 f"storing 2*m_max = {2 * m_max_warm} trial vectors")
-        _price_davidson_basis(max(m_max_warm, 2 * n_eig), X0, mesh_xy)
+        m_max_warm = max(int(davidson_m_max) if davidson_m_max
+                         else DEFAULT_M_MAX_FACTOR * n_eig, 2 * n_solve)
+        log.info(f"Davidson: {n_eig} roots + {n_solve - n_eig} margin, "
+                 f"m_max={m_max_warm}, storing 2*m_max = {2 * m_max_warm} trial vectors")
+        _price_davidson_basis(m_max_warm, X0, mesh_xy)
         eigenvalues, eigenvectors = davidson(
-            apply_H, n_eig=n_eig, precond_fn=apply_precond, X0=X0,
+            apply_H, n_eig=n_solve, n_converge=n_eig, precond_fn=apply_precond, X0=X0,
+            # A caller that solves many same-shape payloads (exciton_bands, one per
+            # Q) names the run; the key adds everything the two programs close over.
+            plan_key=(None if davidson_plan_key is None else (
+                davidson_plan_key, mesh_xy, bool(include_W), head_tensor is not None,
+                davidson_precond, bool(davidson_olsen), float(davidson_eps_shift_Ry),
+                tuple((tuple(a.shape), str(a.dtype)) for a in operator_data))),
             data=solver_data,
             m_max=m_max_warm,
             max_iter=max_iter, tol=float(davidson_tol_Ry),
@@ -428,7 +484,7 @@ def solve_bse_sharded(
         # The writer gathers explicitly when serializing eigenvectors.
         root_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
         eigenvectors = jax.jit(
-            lambda a: a.reshape(n_eig, 1, nc_pad, nv_pad, nk),
+            lambda a: a[:n_eig].reshape(n_eig, 1, nc_pad, nv_pad, nk),
             out_shardings=root_sharding,
         )(eigenvectors)
         # ``davidson`` returns eigenvalues as a HOST numpy array (it needs them
@@ -437,7 +493,7 @@ def solve_bse_sharded(
         # per-rank copy as the replica with NO collective; its precondition —
         # bit-identical on every rank — holds because every rank ran the same
         # deterministic reduction to get it.
-        eigenvalues = replicate_to_mesh(np.asarray(eigenvalues), mesh_xy)
+        eigenvalues = replicate_to_mesh(np.asarray(eigenvalues)[:n_eig], mesh_xy)
         # The iterations the while_loop actually ran: Davidson stops on its
         # residual test, so this is a measured count, not the budget.
         return eigenvalues, eigenvectors, jnp.int32(int(_DAV_HIST["iter"][0]))

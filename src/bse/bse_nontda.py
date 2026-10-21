@@ -485,10 +485,31 @@ def solve_nontda_product(A, B, n_eig):
 # for it, and it will go quiet by itself the day the defect is fixed.
 _MF_METRIC_TOL = 1e-8
 
+#: The matrix-free route's stop: every root's ω residual below this (meV), the
+#: TDA Davidson's default; cycles are capped by ``mf_n_restarts``.
+MF_TOL_MEV = 0.01
+
+
+def refuse_unconverged_sdy(dg, *, n_eig, tol_mev, n_restarts) -> str:
+    """``GATE nontda_converged``: the SDY solve's stop as one line; any of the
+    lowest ``n_eig`` with ``resid / 2ω`` at or above ``tol_mev`` refuses before the
+    caller returns eigenpairs."""
+    from common.units import RYD_TO_EV
+    res = np.asarray(dg["resid_omega"])[:int(n_eig)] * RYD_TO_EV * 1.0e3
+    n_conv, cyc, worst = int(np.sum(res < tol_mev)), int(dg["cycles"]), float(np.max(res))
+    line = (f"non-TDA matrix-free {'converged' if n_conv == int(n_eig) else 'NOT converged'}: "
+            f"{n_conv}/{int(n_eig)} roots with omega residual < {tol_mev:g} meV after "
+            f"{cyc}/{int(n_restarts)} restart cycles; max {worst:.3e} meV")
+    if n_conv < int(n_eig):
+        raise RuntimeError(
+            f"GATE nontda_converged: {line}.  No eigenpairs were returned.  Fix: "
+            "raise mf_n_restarts or mf_m_max, or use the dense route (solver='dense').")
+    return line
+
 
 def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
-                              m_max=140, n_keep=40, n_restarts=3,
-                              metric_tol=_MF_METRIC_TOL, log=None):
+                              m_max=140, n_keep=40, n_restarts=50,
+                              tol_mev=MF_TOL_MEV, metric_tol=_MF_METRIC_TOL, log=None):
     """Lowest ``n_eig`` (omega, X, Y) with no dense assembly.
 
     Returns ``(omega_Ry, Z (2N, n_eig))`` in the same convention
@@ -501,6 +522,7 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
     from .bse_stack_matvec import build_bse_stack_pair_matvec
     from solvers.bse_sp_lanczos import (sdy_lanczos_eig, sdy_pair_applications,
                                         sdy_steps)
+    from common.units import RYD_TO_EV
 
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
     pair = build_bse_stack_pair_matvec(mesh_xy, nkx, nky, nkz)
@@ -517,7 +539,8 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
         om, X, Y, dg = sdy_lanczos_eig(
             lambda Z: pair(Z, sp, *T), lambda Z: pair(Z, sm, *T),
             (nc, nv, nk), n_eig=n_eig, m_max=m_max, n_keep=n_keep,
-            n_restarts=n_restarts, sharding=UV_sh, announce=_l)
+            n_restarts=n_restarts, tol=tol_mev / (RYD_TO_EV * 1.0e3),
+            sharding=UV_sh, announce=_l)
         return (jax.lax.with_sharding_constraint(om, rep),
                 jax.lax.with_sharding_constraint(X, rep),
                 jax.lax.with_sharding_constraint(Y, rep),
@@ -530,10 +553,11 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
     Y = np.asarray(jax.device_get(Y)).reshape(n_eig, -1)
     dg = {k: np.asarray(jax.device_get(v)) for k, v in dg.items()}
 
-    _l(f"  [nontda] matrix-free: {sdy_steps(m_max, n_keep, n_restarts)} SDY "
-       f"steps, {sdy_pair_applications(m_max, n_keep, n_restarts)} fused pair "
+    cycles = int(dg["cycles"])
+    _l(f"  [nontda] matrix-free: {sdy_steps(m_max, n_keep, cycles)} SDY "
+       f"steps, {sdy_pair_applications(m_max, n_keep, cycles)} fused pair "
        f"applications (m_max={m_max} n_keep={n_keep} "
-       f"n_restarts={n_restarts})")
+       f"{cycles}/{n_restarts} restart cycles)")
     _l(f"  [nontda] matrix-free invariants: metric_sym {float(dg['metric_sym_err']):.3e} "
        f"orth {float(dg['orth_err']):.3e} im_uu {float(dg['im_uu']):.3e} "
        f"im_vv {float(dg['im_vv']):.3e} drift {float(dg['imag_drift']):.3e}")
@@ -570,6 +594,10 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
             "request on a multi-device job), or use the dense route, until "
             "that is fixed.")
 
+    # (3) convergence: restarts stop on the ω residual; a capped stop refuses.
+    _l("  [nontda] " + refuse_unconverged_sdy(
+        dg, n_eig=n_eig, tol_mev=tol_mev, n_restarts=n_restarts))
+
     Z = np.concatenate([X.T, Y.T], axis=0)          # (2N, n_eig)
     order = np.argsort(omega)
     return omega[order], Z[:, order]
@@ -577,8 +605,8 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
 
 def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
                              recip_tol=_NONTDA_RECIP_TOL, solver="dense",
-                             mf_m_max=140, mf_n_keep=40, mf_n_restarts=3,
-                             **_ignored):
+                             mf_m_max=140, mf_n_keep=40, mf_n_restarts=50,
+                             mf_tol_mev=MF_TOL_MEV, **_ignored):
     """Non-TDA (full BSE) lowest-eigenvalue solve — one entry, dispatched on B.
 
     Returns ``(eigenvalues_Ry (n_eig,), eigenvectors (n_eig, 2, nc, nv, nk),
@@ -602,7 +630,10 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         SDY Algorithm 4 (:mod:`solvers.bse_sp_lanczos`) over the fused pair
         applier.  Cost set by the spectrum, not by ``N``; ``O(k N)`` memory.
         OPT-IN, and it refuses on a sharded mesh today — see
-        ``_solve_nontda_matrix_free`` for why and for when that stops."""
+        ``_solve_nontda_matrix_free`` for why and for when that stops.
+        Restart cycles stop when every root's ω residual is below
+        ``mf_tol_mev`` (cap ``mf_n_restarts``); a capped stop refuses
+        (GATE nontda_converged)."""
     if solver not in ("dense", "matrixfree"):
         raise ValueError(
             f"solve_bse_nontda_sharded: solver must be 'dense' or "
@@ -625,7 +656,7 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         omega, Z = _solve_nontda_matrix_free(
             data, mesh_xy, sh, args, nc, nv, nk, n_eig,
             m_max=mf_m_max, n_keep=mf_n_keep, n_restarts=mf_n_restarts,
-            log=_log0)
+            tol_mev=mf_tol_mev, log=_log0)
         evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
                           Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
         return jnp.asarray(omega), jnp.asarray(evecs), jnp.int32(0)
