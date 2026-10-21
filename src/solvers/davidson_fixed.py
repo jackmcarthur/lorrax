@@ -119,7 +119,7 @@ def _whiten(p, normalizer):
 
 
 def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, budget, stall_patience,
-               lock_converged=False, n_converge=None):
+               lock_converged=False, n_converge=None, margin_lock=1.0):
     """Only small correction blocks cross conditionals; capacity buffers alias.
 
     ``lock_converged``: a root whose residual already passes the test adds no
@@ -129,8 +129,12 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
     ``n_converge``: the stop (and the stall test) reads only the lowest
     ``n_converge`` roots; the rest are margin roots that keep the block wide
     enough to hold a multiplet split at the boundary.  ``None``: every root.
+    ``margin_lock`` (> 1, with locking and ``n_converge``): a margin root also
+    locks once its residual is below ``margin_lock`` times the tolerance; it
+    stays in the basis as a guard but stops costing corrections.
     """
     n_test = block if n_converge is None else int(n_converge)
+    loose_margin = lock_converged and float(margin_lock) != 1.0 and n_test < block
     def step(st):
         v, hv, h, m = st.basis, st.images, st.projected, st.size
         e, c = subspace.eigh(h, m)
@@ -155,6 +159,9 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
             p = precondition(data, residual, e, x)
             if lock_converged:
                 open_ = ~passes
+                if loose_margin:
+                    loose = norms < (tolerance*float(margin_lock))*jnp.maximum(1., jnp.abs(e))
+                    open_ = open_ & ~(loose & (jnp.arange(block) >= n_test))
                 p = jnp.where(open_.reshape((block,)+(1,)*(x.ndim-1)), p, jnp.zeros((), p.dtype))
             finite_correction = jnp.all(jnp.isfinite(p))
             p = jax.lax.cond(
@@ -187,7 +194,7 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
 
 
 def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vector_sharding=None,
-                  lock_converged=False, n_converge=None):
+                  lock_converged=False, n_converge=None, margin_lock=1.0):
     """Plan a complex128 local solver before solver compilation.
 
     ``apply_h(data, vectors)`` preserves ``(rows, *vector_shape)`` and must
@@ -211,6 +218,8 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
         raise ValueError('require 1 <= n_eig <= vector size and capacity >= 2*n_eig')
     if n_converge is not None and not (isinstance(n_converge, int) and 1 <= n_converge <= n_eig):
         raise ValueError('n_converge must be a Python integer with 1 <= n_converge <= n_eig')
+    if not float(margin_lock) >= 1.0:
+        raise ValueError('margin_lock must be >= 1 (a multiple of the tolerance)')
     subspace = plan_subspace(capacity=capacity, n_eig=n_eig, vector_sharding=vector_sharding)
     normalizer = plan_subspace(capacity=n_eig, n_eig=n_eig, vector_sharding=vector_sharding)
     block = n_eig
@@ -243,7 +252,8 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
         result = jax.lax.while_loop(
             lambda st: (st.status == RUNNING) & (st.iterations < max_iterations),
             _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, max_iterations, stall_patience,
-                       lock_converged=lock_converged, n_converge=n_converge), state)
+                       lock_converged=lock_converged, n_converge=n_converge,
+                       margin_lock=margin_lock), state)
         info = DavidsonInfo(result.status, result.iterations, result.matvecs,
                             result.restarts, result.size, result.residuals)
         return result.values, result.vectors, info

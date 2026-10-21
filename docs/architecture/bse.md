@@ -261,11 +261,11 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 
 | route | driver flags | module | use |
 |---|---|---|---|
-| FEAST | no `--lanczos`; `--tda` or not | `bse.bse_feast` | contour eigensolve in KPM-sized windows |
-| Davidson (default) | `--lanczos --tda` | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `--n-eig` roots, stopped when every residual is below `--davidson-tol-mev` (0.01 meV) |
-| Lanczos, block Lanczos | `--lanczos --tda --solver lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
-| thick-restart Lanczos | `--lanczos --tda --solver trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `--trlan-m-max` |
-| full BSE | `--lanczos` without `--tda` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve, N ≤ 4096 |
+| Davidson (default) | `--tda` (no route flag; `--lanczos` is an alias) | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `--n-eig` roots, stopped when every residual is below `--davidson-tol-mev` (0.01 meV) |
+| Lanczos, block Lanczos | `--tda --solver lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
+| thick-restart Lanczos | `--tda --solver trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `--trlan-m-max` |
+| full BSE | no route flag, without `--tda` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve, N ≤ 4096 |
+| FEAST | `--feast`; `--tda` or not | `bse.bse_feast` | contour eigensolve in KPM-sized windows; refuses unless every in-window Ritz residual is below `--feast-tol-mev` (0.01 meV, `GATE feast_converged`) |
 | density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
 | absorption | `python -m bse.absorption_haydock`, or `bse_jax --haydock-iter N` after the eigensolve | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
 

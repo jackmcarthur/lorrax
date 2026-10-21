@@ -49,7 +49,8 @@ def _default_precond(r, eigenvalues):
 
 def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
              m_max=None, max_iter=100, tol=1e-8, stall_patience=20, verbose=True,
-             data=None, lock_converged=False, n_converge=None, plan_key=None):
+             data=None, lock_converged=False, n_converge=None, plan_key=None,
+             margin_lock=1.0):
     """Lowest Hermitian eigenpairs, using fixed-capacity active-only iteration.
 
     ``X0`` has shape ``(n_eig, *vector_shape)``; vector axes retain their
@@ -66,6 +67,7 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
     ``lock_converged`` stops correcting roots that already pass the test
     (soft locking: fewer H applications, same stopping rule).
     ``n_converge`` (``<= n_eig``) stops when the lowest ``n_converge`` roots pass;
+    ``margin_lock`` (> 1) locks the others at that multiple of ``tol``;
     the others are margin roots.  ``None``: every root.
     ``plan_key`` (hashable) reuses the planned solver of an earlier call with the
     same key, so a run of solves compiles once.  The caller's key must fix
@@ -99,12 +101,14 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
         return apply_H(payload, v) if explicit_data else apply_H(v)
     sharding = initial.sharding if isinstance(initial.sharding, jax.sharding.NamedSharding) else None
     full_key = None if plan_key is None else (plan_key, n_eig, capacity, initial.shape[1:],
-                                              sharding, bool(lock_converged), n_converge)
+                                              sharding, bool(lock_converged), n_converge,
+                                              float(margin_lock))
     plan = _PLANS.get(full_key) if full_key is not None else None
     if plan is None:
         plan = plan_davidson(apply, precondition, n_eig=n_eig, capacity=capacity,
                              vector_shape=initial.shape[1:], vector_sharding=sharding,
-                             lock_converged=lock_converged, n_converge=n_converge)
+                             lock_converged=lock_converged, n_converge=n_converge,
+                             margin_lock=margin_lock)
         if full_key is not None:
             if len(_PLANS) >= _PLANS_MAX:
                 _PLANS.pop(next(iter(_PLANS)))

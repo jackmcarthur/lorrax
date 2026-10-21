@@ -107,6 +107,8 @@ def _preview_lanczos(
     davidson_m_max: int | None = None,
     davidson_precond: str = "exact",
     davidson_tol_mev: float = 0.01,
+    davidson_margin: int = 8,
+    davidson_margin_tol_mev: float | None = None,
     davidson_olsen: bool = False,
     davidson_eps_shift: float | None = None,
     trlan_m_max: int | None = None,
@@ -247,6 +249,9 @@ def _preview_lanczos(
             davidson_precond=davidson_precond,
             davidson_olsen=davidson_olsen,
             davidson_tol_Ry=float(davidson_tol_mev) / (RYD_TO_EV * 1.0e3),
+            davidson_margin=int(davidson_margin),
+            davidson_margin_tol_Ry=(None if davidson_margin_tol_mev is None else
+                                    float(davidson_margin_tol_mev) / (RYD_TO_EV * 1.0e3)),
             trlan_m_max=trlan_m_max, trlan_n_keep=trlan_n_keep,
             keep_W_R=haydock is not None,
         )
@@ -534,7 +539,18 @@ def build_parser():
                         help="Use full BSE kernel (D+V-W). Overrides default RPA.")
     parser.add_argument("--kpm-window-count", type=int, default=4,
                         help="Number of KPM-derived windows for FEAST.")
-    parser.add_argument("--lanczos", action="store_true", help="Run Lanczos preview + timing instead of FEAST.")
+    parser.add_argument("--lanczos", action="store_true",
+                        help="the eigensolve route (--solver, default davidson), which "
+                             "is the default since 2026-10-21; kept as a no-op alias")
+    parser.add_argument("--feast", action="store_true",
+                        help="FEAST window solver (the default route until 2026-10-21; "
+                             "now explicit).  Refuses unless every in-window Ritz pair "
+                             "is below --feast-tol-mev (GATE feast_converged)")
+    parser.add_argument("--feast-tol-mev", type=float, default=0.01,
+                        help="--feast: every in-window Ritz pair's residual "
+                             "||H x - E x|| below this (meV), the Davidson default")
+    parser.add_argument("--feast-iter", type=int, default=2,
+                        help="--feast: FEAST subspace iterations (bse_feast's default)")
     parser.add_argument(
         "--feast-window1",
         nargs=2,
@@ -661,6 +677,18 @@ def build_parser():
              "||r||^2/gap, far below it.  Default 0.01 meV.",
     )
     parser.add_argument(
+        "--davidson-margin", type=int, default=8,
+        help="Davidson: extra roots solved above --n-eig (at most half the "
+             "transition space) and not reported; the stop reads the lowest "
+             "--n-eig.  Default 8.",
+    )
+    parser.add_argument(
+        "--davidson-margin-tol-mev", type=float, default=None,
+        help="Davidson: residual (meV) at which a margin root locks: it stays "
+             "in the basis and gets no further correction.  Default: "
+             "--davidson-tol-mev.",
+    )
+    parser.add_argument(
         "--davidson-olsen", action="store_true",
         help="Davidson: Olsen-correct the preconditioned direction (project "
              "out its component along the current Ritz vector). Two batched "
@@ -743,14 +771,14 @@ _RETIRED_FLAGS = {
 #: name: the default FEAST route used to drop --eqp, --n-eig, --n-occ and
 #: the solver flags silently, so a QP run came back on DFT energies.
 _COMMON_DESTS = {"input", "n_val", "n_cond", "px", "py", "rpa", "bse", "tda",
-                 "lanczos", "kpm_dos"}
+                 "lanczos", "feast", "kpm_dos"}
 _ROUTE_DESTS = {
     "feast": {
         "feast_n_lanczos", "feast_buffer", "feast_n_quad1", "feast_n_quad2",
         "feast_quadrature", "feast_units_ev_per_ry", "feast_ritz_count",
         "gmres_max_iter", "gmres_tol", "gmres_seed", "gmres_fp32",
         "kpm_window_count", "kpm_n_moments", "kpm_n_random", "kpm_n_lanczos",
-        "feast_window1", "feast_window2"},
+        "feast_window1", "feast_window2", "feast_tol_mev", "feast_iter"},
     "kpm": {
         "kpm_n_moments", "kpm_n_random", "kpm_n_lanczos", "kpm_window_count",
         "kpm_plot_file", "kpm_emin_ev", "kpm_emax_ev"},
@@ -758,13 +786,17 @@ _ROUTE_DESTS = {
         "n_eig", "write_eigs", "report_file", "max_lanczos_iter", "block_size",
         "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
-        "davidson_m_max", "davidson_tol_mev", "trlan_m_max", "trlan_n_keep",
+        "davidson_m_max", "davidson_tol_mev", "davidson_margin",
+        "davidson_margin_tol_mev", "trlan_m_max", "trlan_n_keep",
         "eqp", "n_occ", "band_degeneracy", "degeneracy_tol_ry", "dipole",
         "dipole_position_fix", "helicity_table", "qp_rotations", *(
             "haydock_" + k for k in ("iter", "pol", "eta_ev", "omega_min_ev",
                                      "omega_max_ev", "n_omega", "n_spin",
                                      "no_eps1", "out_prefix"))},
 }
+
+#: The route names the refusals print ("lanczos" is the eigensolve's old flag).
+_ROUTE_NAMES = {"lanczos": "eigensolve", "feast": "--feast", "kpm": "--kpm-dos"}
 
 #: On the eigensolve route, the flags only one ``--solver`` reads.  One set away
 #: from its default under another solver refuses: the default solver changed
@@ -773,7 +805,8 @@ _ROUTE_DESTS = {
 _SOLVER_DESTS = {
     "lanczos": {"block_size", "lanczos_rtol", "lanczos_check_every", "n_reorth"},
     "davidson": {"davidson_precond", "davidson_olsen", "davidson_eps_shift",
-                 "davidson_m_max", "davidson_tol_mev"},
+                 "davidson_m_max", "davidson_tol_mev", "davidson_margin",
+                 "davidson_margin_tol_mev"},
     "trlan": {"trlan_m_max", "trlan_n_keep"},
 }
 
@@ -789,8 +822,12 @@ def parse_args(argv=None):
     args = parser.parse_args(raw)
     if args.input is None:
         parser.error("Default run requires -i/--input.")
-    route = ("kpm" if args.kpm_dos else "lanczos" if args.lanczos
-             else "feast")
+    # The eigensolve ("lanczos", by its old flag) is the default route since
+    # 2026-10-21; FEAST was, and is now explicit.  --lanczos is a no-op alias.
+    if sum((args.kpm_dos, args.feast, args.lanczos)) > 1:
+        parser.error("--kpm-dos, --feast and --lanczos each select a route "
+                     "(--lanczos, the eigensolve, is the default); give one")
+    route = "kpm" if args.kpm_dos else "feast" if args.feast else "lanczos"
     ignored = sorted(
         "--" + dest.replace("_", "-") for dest, value in vars(args).items()
         if dest not in _COMMON_DESTS | _ROUTE_DESTS[route]
@@ -798,11 +835,11 @@ def parse_args(argv=None):
     if ignored:
         parser.error(
             f"{', '.join(ignored)} {'is' if len(ignored) == 1 else 'are'} not "
-            f"read by the {route} route and would be ignored; drop "
+            f"read by the {_ROUTE_NAMES[route]} route and would be ignored; drop "
             f"{'it' if len(ignored) == 1 else 'them'} or choose the route "
-            f"that reads {'it' if len(ignored) == 1 else 'them'} (--lanczos "
-            f"for the eigensolve with QP energies and eigenvectors, "
-            f"--kpm-dos for the density of states, neither for FEAST)")
+            f"that reads {'it' if len(ignored) == 1 else 'them'} (the default, "
+            f"the eigensolve with QP energies and eigenvectors; --feast for "
+            f"FEAST windows; --kpm-dos for the density of states)")
     if args.eqp is not None and args.qp_rotations is not None:
         parser.error("--eqp and --qp-rotations are two descriptions of the QP "
                      "state: the first relabels DFT bands with diagonal QP "
@@ -824,6 +861,12 @@ def parse_args(argv=None):
         "--" + dest.replace("_", "-") for dest in vars(args)
         if dest.startswith("haydock_") and dest != "haydock_iter"
         and getattr(args, dest) != parser.get_default(dest))
+    if args.davidson_margin < 0:
+        parser.error("--davidson-margin must be >= 0")
+    if (args.davidson_margin_tol_mev is not None
+            and args.davidson_margin_tol_mev < args.davidson_tol_mev):
+        parser.error("--davidson-margin-tol-mev is a looser lock for the margin "
+                     "roots: it must be >= --davidson-tol-mev")
     if args.haydock_iter < 0:
         parser.error("--haydock-iter must be >= 0 (0 = off)")
     if args.haydock_iter == 0 and haydock_flags:
@@ -872,7 +915,8 @@ def settings_rows(args, *, source) -> tuple:
                 "rebuild)" if include_w else
                 "kernel D + V: RPA, no screened direct term"),
         Setting("--solver", str(args.solver), source("--solver"),
-                (f"block of {int(args.n_eig)} roots, {args.davidson_precond} "
+                (f"block of {int(args.n_eig)} roots + up to {int(args.davidson_margin)} "
+                 f"margin, {args.davidson_precond} "
                  f"diagonal preconditioner; trial-stack matvec"
                  if args.solver == "davidson" else
                  f"block size {int(args.block_size)}, {int(args.n_eig)} roots; "
@@ -965,7 +1009,8 @@ def main(argv=None) -> int:
             kpm_n_moments=args.kpm_n_moments,
             kpm_n_random=args.kpm_n_random, kpm_seed=args.gmres_seed,
             kpm_n_energy_pts=2000, kpm_n_lanczos=args.kpm_n_lanczos,
-            window1=args.feast_window1, window2=args.feast_window2))
+            window1=args.feast_window1, window2=args.feast_window2,
+            feast_iter=args.feast_iter, feast_tol_mev=args.feast_tol_mev))
         return 0
 
     # Non-TDA (full BSE) now flows through the same preview via the
@@ -1022,6 +1067,8 @@ def main(argv=None) -> int:
             davidson_olsen=args.davidson_olsen,
             davidson_eps_shift=args.davidson_eps_shift,
             davidson_tol_mev=args.davidson_tol_mev,
+            davidson_margin=args.davidson_margin,
+            davidson_margin_tol_mev=args.davidson_margin_tol_mev,
             trlan_m_max=args.trlan_m_max,
             trlan_n_keep=args.trlan_n_keep,
             degeneracy_mode=args.band_degeneracy,

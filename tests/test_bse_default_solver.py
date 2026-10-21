@@ -17,6 +17,12 @@ the loader's shardings, the screened kernel real in R space (so H is Hermitian):
    ``velocity_position_fix=True``.
 5. ``GATE cpu_davidson_threads`` refuses four emulated CPU devices on 4 host threads and
    passes them on 16.
+6. Margin roots locked at 1 meV (``--davidson-margin-tol-mev 1``) stop CONVERGED with the same
+   lowest 8 (0.01 meV from dense) in fewer H applications than the default lock.
+7. Routes: no route flag is the eigensolve (Davidson), ``--lanczos`` its alias, ``--feast``
+   FEAST; two route flags, or a FEAST flag without ``--feast``, refuse.  ``GATE
+   feast_converged`` refuses an in-window Ritz pair at 13.6 meV and passes when only an
+   out-of-window pair is unconverged.
 
 A script on a 1x1 mesh (login node, <= 4 threads) or a 2x2 mesh of four host devices
 (``XLA_FLAGS=--xla_force_host_platform_device_count=4``, at least 16 host threads):
@@ -107,6 +113,12 @@ def run_cases(mesh):
     out = {"davidson_converged": int(LAST_RUN["status"]) == CONVERGED,
            "davidson_iterations": int(it_d), "davidson_matvecs": int(LAST_RUN["mv"][0]),
            "davidson_roots": f"{len(ev_d)}+{len(LAST_RUN['res'][0]) - len(ev_d)}"}
+    ev_m, _, _ = solve_bse_sharded(
+        _payload(mesh, ops), mesh, n_eig=N_EIG, max_iter=200,
+        davidson_tol_Ry=defaults["davidson_tol_mev"] / RY_MEV, davidson_margin_tol_Ry=1.0 / RY_MEV)
+    out.update(margin_lock_converged=int(LAST_RUN["status"]) == CONVERGED,
+               margin_lock_matvecs=int(LAST_RUN["mv"][0]),
+               margin_lock_vs_dense_meV=float(np.max(np.abs(np.asarray(ev_m).real - exact)) * RY_MEV))
     ev_l, _, _ = solve_bse_sharded(_payload(mesh, ops), mesh, n_eig=N_EIG,
                                    max_iter=H.shape[0] - N_EIG, solver_kind="lanczos", block_size=1)
     ev_l = np.asarray(ev_l).real
@@ -173,7 +185,30 @@ def _driver_cases(mesh, ops):
             return str(exc)
         finally:
             os.sched_getaffinity = real
-    return {"dipole_position_fix_reaches_loader": seen.get("velocity_file") == "toy_dipole.h5"
+    def route(argv):
+        try:
+            r, a = bse_jax.parse_args(["-i", "toy.in", *argv])
+            return r if r != "lanczos" else f"eigensolve/{a.solver}"
+        except SystemExit:
+            return "refused"
+    from bse.bse_feast import WindowSpec, refuse_unconverged_feast
+    win = [WindowSpec("W1", 0.0, 2.0, "test")]
+    ry_ev = RY_MEV / 1e3
+
+    def feast_gate(res):
+        try:
+            refuse_unconverged_feast({"W1": SimpleNamespace(ritz_evals=np.array([0.05, 0.1, 0.3]),
+                                                            rel_residuals=np.array(res))},
+                                     win, tol_mev=TOL_MEV, ry_to_ev=ry_ev)
+            return "pass"
+        except RuntimeError as exc:
+            return "refused" if "GATE feast_converged" in str(exc) else str(exc)
+    routes = [route([]), route(["--lanczos"]), route(["--feast"]), route(["--feast", "--lanczos"]),
+              route(["--feast-n-quad1", "6"])]
+    return {"routes_and_feast_gate": routes == ["eigensolve/davidson", "eigensolve/davidson", "feast",
+                                                "refused", "refused"]
+            and feast_gate([1e-9, 1e-3, 1.0]) == "refused" and feast_gate([1e-9, 1e-9, 1.0]) == "pass",
+            "dipole_position_fix_reaches_loader": seen.get("velocity_file") == "toy_dipole.h5"
             and seen.get("velocity_position_fix") is True,
             "capped_davidson_refuses_unwritten": "GATE davidson_converged" in gate
             and "/2 iterations" in gate and written == [],
@@ -203,6 +238,11 @@ def main() -> int:
         "4 --lanczos --dipole-position-fix parsed and reaches the loader":
             out["dipole_position_fix_reaches_loader"],
         "5 GATE cpu_davidson_threads: 4 devices refuse on 4 threads, run on 16": out["cpu_threads_gate"],
+        f"6 margin locked at 1 meV: CONVERGED, <= {TOL_MEV} meV from dense, fewer H applications":
+            out["margin_lock_converged"] and out["margin_lock_vs_dense_meV"] <= TOL_MEV
+            and out["margin_lock_matvecs"] < out["davidson_matvecs"],
+        "7 routes (default eigensolve, --lanczos alias, --feast explicit) and GATE feast_converged":
+            out["routes_and_feast_gate"],
     }
     ok = all(checks.values())
     if jax.process_index() == 0:

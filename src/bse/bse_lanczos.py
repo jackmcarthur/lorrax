@@ -160,6 +160,7 @@ def solve_bse_sharded(
     tda: bool = True,
     keep_W_R: bool = False,
     davidson_margin: int = DAVIDSON_MARGIN_ROOTS,
+    davidson_margin_tol_Ry: float | None = None,
     davidson_plan_key=None,
 ) -> Tuple[jax.Array, jax.Array]:
     """The BSE eigensolve (Lanczos / block / Davidson / TRLan) on any mesh.
@@ -204,6 +205,8 @@ def solve_bse_sharded(
 
     Davidson (the default) solves ``n_eig + davidson_margin`` roots and stops
     when the lowest ``n_eig`` pass the residual test; only those are returned.
+    ``davidson_margin_tol_Ry`` (default: ``davidson_tol_Ry``) is the residual at
+    which a margin root locks (it stays in the basis, uncorrected).
     ``davidson_plan_key`` (any hashable) reuses the planned solver across calls
     on same-shape payloads.  A payload may carry ``head_tensor = (D_head,
     M_head)``, the stack matvec's head-term operands (Davidson only).
@@ -435,7 +438,9 @@ def solve_bse_sharded(
         from solvers.davidson import DEFAULT_M_MAX_FACTOR
         m_max_warm = max(int(davidson_m_max) if davidson_m_max
                          else DEFAULT_M_MAX_FACTOR * n_eig, 2 * n_solve)
-        log.info(f"Davidson: {n_eig} roots + {n_solve - n_eig} margin, "
+        log.info(f"Davidson: {n_eig} roots + {n_solve - n_eig} margin"
+                 + ("" if davidson_margin_tol_Ry is None else
+                    f" (locked at {float(davidson_margin_tol_Ry) * RY_TO_MEV:g} meV)") + ", "
                  f"m_max={m_max_warm}, storing 2*m_max = {2 * m_max_warm} trial vectors")
         _price_davidson_basis(m_max_warm, X0, mesh_xy)
         eigenvalues, eigenvectors = davidson(
@@ -454,6 +459,8 @@ def solve_bse_sharded(
             # is applied only to the open roots' directions.  Si 8^3 lowest 40
             # at 0.01 meV (dense CPU count): 265 H applications, 800 without.
             lock_converged=True,
+            margin_lock=(1.0 if davidson_margin_tol_Ry is None else
+                         max(1.0, float(davidson_margin_tol_Ry) / float(davidson_tol_Ry))),
         )
 
         # ── perf-campaign probe: trace + history dump (env-gated) ──

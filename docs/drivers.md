@@ -327,21 +327,22 @@ includes it. The Hamiltonian, the inputs, the screened W(0) handoff, the
 matvec and its kernels, the solvers, the dipoles, the outputs and the refusals
 are on [the BSE page](architecture/bse.md).
 
-Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos --tda --bse ...` in the GW
+Invoke: `python -u -m bse.bse_jax -i cohsex.in --tda --bse ...` in the GW
 run directory. The mesh is the run's square startup mesh; `--px`/`--py` must
 be square and use every device. The CLI is strict: an unknown flag refuses,
-and so does a flag the chosen route (Lanczos, `--kpm-dos`, or the default
-FEAST) does not read — `--eqp`, `--qp-rotations`, `--n-eig`, `--n-occ` and the
-solver flags are Lanczos-only.
+and so does a flag the chosen route (the default eigensolve, `--feast` or
+`--kpm-dos`) does not read — `--eqp`, `--qp-rotations`, `--n-eig`, `--n-occ` and the
+solver flags are eigensolve-only (marked *Lanczos* below, after its old flag).
 
 | flag | default | meaning |
 |---|---|---|
-| `--lanczos` | off | Krylov eigensolve; without it the driver runs FEAST (`bse_feast`) |
+| `--lanczos` / `--feast` | eigensolve | the eigensolve (`--solver`, Davidson by default) is the default route since 2026-10-21; `--lanczos` is a no-op alias. `--feast` runs FEAST windows (`bse_feast`, `--feast-iter` 2) and refuses unless every in-window Ritz pair's residual is below `--feast-tol-mev` (0.01 meV; `GATE feast_converged`) |
 | `--bse` / `--rpa` | RPA | `--bse` adds $-W$ |
 | `--tda` | off | resonant block only; without it every route solves the full BSE, and `--lanczos` goes to the dense `bse_nontda` solver, ignoring `--solver`, `--block-size` and `--n-reorth` |
 | `--n-val` / `--n-cond` / `--n-occ` | 4 / 4 / the WFN's `ifmax` | transition window; the occupied-band count is `--n-occ` (*Lanczos*), else the deck WFN's `ifmax` |
 | `--band-degeneracy` | `strict` | *Lanczos*. A window edge inside a multiplet: `strict` refuses and names working counts, `snap` widens outward, `off` proceeds; tolerance `--degeneracy-tol-ry` (1 meV) |
 | `--solver` | `davidson` | *Lanczos*. `davidson` (default since 2026-10-20): block Davidson on the `--n-eig` lowest roots with the exact diagonal preconditioner and soft locking, stopped by its residual test; `lanczos` (fixed Krylov dimension, or `--lanczos-rtol`); `trlan` (thick restart, bounded memory, fixed matvec budget, `--trlan-*`). A flag only another solver reads refuses (`--block-size`, `--lanczos-rtol`, `--lanczos-check-every`, `--n-reorth` are Lanczos's; `--davidson-*` Davidson's; `--trlan-*` TRLan's) |
+| `--davidson-margin` / `--davidson-margin-tol-mev` | 8 / `--davidson-tol-mev` | *Lanczos*, Davidson. Roots solved above `--n-eig` and not reported (at most half the transition space); the residual at which a margin root locks (stays in the basis, no further correction) |
 | `--davidson-tol-mev` / `--davidson-precond` / `--davidson-m-max` | 0.01 / `exact` / 10·n-eig | *Lanczos*, Davidson. Stop when every root's residual $\lVert Hx - Ex\rVert$ is below the tolerance (meV; an exact eigenvalue lies within the residual, the error is typically residual²/gap); diagonal `exact` = assembled diag(H), `bare` = $E_c - E_v$; basis capacity before a restart |
 | `--block-size` / `--max-lanczos-iter` / `--n-reorth` | 1 / auto / −1 | *Lanczos*. Block width / iteration budget: Lanczos's total Krylov dimension, Davidson's cap on block iterations, TRLan's matvec budget / reorthogonalization window (−1 = full, needed for degenerate spinor spectra) |
 | `--n-eig` / `--write-eigs [N]` | 5 / off | *Lanczos*. Eigenpairs; write `eigenvectors.h5` |

@@ -5,7 +5,7 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
-## 2026-10-21 — Davidson for every lowest-N BSE solve: exciton bands per Q, margin roots, a convergence-driven non-TDA matrix-free route
+## 2026-10-21 — Davidson for every lowest-N BSE solve: the `bse_jax` default route, exciton bands per Q, margin roots, convergence gates on FEAST and the non-TDA matrix-free route
 
 `bse.exciton_bands` now solves each Q's `--n-eig` lowest with `bse_lanczos`'
 Davidson (`--solver davidson`, the default), the route `bse_jax` uses: the
@@ -16,10 +16,21 @@ stops on the cap refuses (`GATE davidson_converged`) before anything is
 written. `--solver lanczos` keeps the fixed block-Lanczos scan, which has no
 convergence test.
 
+- **`bse_jax` route.** With no route flag `bse_jax` now runs the eigensolve
+  (Davidson); it used to run FEAST. `--lanczos` is kept as a no-op alias, and
+  FEAST needs `--feast`. A FEAST flag without `--feast` refuses, as do two route
+  flags. Without `--tda` the default is now the dense structure-preserving
+  non-TDA solve (`bse_nontda`, N <= 4096); it used to be non-TDA FEAST.
+- **FEAST refuses unconverged pairs** (`GATE feast_converged`): every in-window
+  Ritz pair's residual must be below `--feast-tol-mev` (0.01 meV, the Davidson
+  default); out-of-window pairs are leakage and are not tested. It used to log
+  the residuals and report the values regardless. `--feast-iter` (2) is now a
+  `bse_jax` flag.
 - **Margin roots.** BSE Davidson (`bse_jax`, `exciton_bands`) solves 8 roots
   above `--n-eig` (fewer when the transition space is small, at most half of
   it), stops when the lowest `--n-eig` converge, and reports only those. NSCF
-  Davidson is unchanged.
+  Davidson is unchanged. `bse_jax --davidson-margin N` sets the count and
+  `--davidson-margin-tol-mev` a looser residual at which margin roots lock.
 - **Non-TDA matrix-free** (`bse_nontda`, `solver='matrixfree'`, opt-in): restart
   cycles now run until every root's omega residual is below 0.01 meV
   (`mf_tol_mev`; cap `mf_n_restarts`, now 50) and a capped stop refuses

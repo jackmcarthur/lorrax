@@ -1086,6 +1086,44 @@ def run_feast_ritz(
     return results
 
 
+#: GATE feast_converged's default: every in-window Ritz pair's residual
+#: ||H x - E x|| (x normalised, so it bounds the eigenvalue error) below this,
+#: in meV -- the Davidson route's default stop.
+FEAST_TOL_MEV = 0.01
+
+
+def refuse_unconverged_feast(results: dict, windows, *, tol_mev: float, ry_to_ev: float) -> str:
+    """``GATE feast_converged``: the in-window Ritz pairs of every window, the
+    ones FEAST reports, each with residual below ``tol_mev``; otherwise refuse
+    before anything is reported.  Out-of-window pairs (marked ``*``) are the
+    filter's leakage, not results, and are not tested."""
+    wmap = {w.name: w for w in windows}
+    worst, bad, n_tested = 0.0, [], 0
+    for name, rr in results.items():
+        w = wmap.get(name)
+        if w is None:
+            continue
+        ev = np.asarray(rr.ritz_evals) * ry_to_ev
+        res = np.asarray(rr.rel_residuals) * ry_to_ev * 1.0e3        # meV
+        for i in np.where((ev >= w.a_eV) & (ev <= w.b_eV))[0]:
+            n_tested += 1
+            worst = max(worst, float(res[i]))
+            if not res[i] < tol_mev:
+                bad.append(f"{name}#{i + 1} {ev[i]:.6f} eV: {res[i]:.3e} meV")
+    line = (f"FEAST {'NOT converged' if bad else 'converged'}: {n_tested - len(bad)}/"
+            f"{n_tested} in-window Ritz pairs with residual < {tol_mev:g} meV; "
+            f"max {worst:.3e} meV")
+    log.info(line)
+    if bad:
+        raise RuntimeError(
+            f"GATE feast_converged: {line} ({'; '.join(bad[:6])}"
+            f"{'; ...' if len(bad) > 6 else ''}).  No FEAST eigenvalues were "
+            "reported.  Fix: raise --feast-iter, --gmres-max-iter or the "
+            "quadrature, tighten --gmres-tol, loosen --feast-tol-mev, or use the "
+            "default eigensolve (bse_jax without --feast) for the lowest roots.")
+    return line
+
+
 def estimate_spectral_bounds_sharded(
     data: dict,
     mesh_xy: Mesh,
@@ -1527,6 +1565,9 @@ def build_parser():
     )
     parser.add_argument("--feast-iter", type=int, default=2,
                         help="Number of FEAST subspace iterations (re-filter Ritz vectors).")
+    parser.add_argument("--feast-tol-mev", type=float, default=FEAST_TOL_MEV,
+                        help="GATE feast_converged: every in-window Ritz pair's "
+                             "residual ||H x - E x|| below this (meV); default 0.01.")
     parser.add_argument("--quadrature", type=str, default="ellipse",
                         choices=["zolotarev", "ellipse"],
                         help="Quadrature type for FEAST filter (default: ellipse).")
@@ -1731,6 +1772,8 @@ def run(args) -> None:
                 include_W=not args.rpa,
                 use_tda=use_tda,
             )
+        refuse_unconverged_feast(results, windows, tol_mev=args.feast_tol_mev,
+                                 ry_to_ev=args.units_ev_per_ry)
         wmap = {w.name: w for w in windows}
         for name, rr in results.items():
             w = wmap.get(name)
