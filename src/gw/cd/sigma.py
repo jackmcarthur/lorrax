@@ -15,6 +15,10 @@ of the cube is ``symmetry_maps.unfold_file_wedge_band_operator``, the contour la
 
     Sigma_c(E) = anchor(E) + sum_i imag_i(E) - anchor_subtraction(E) + sum_j real_j(E)
 
+dSigma_c/dE (the Z of the on-shell finalize) is the same sum with every term differentiated in closed form
+(``gw.cd.laws`` ``*_dx``), accumulated beside the cube on the same contractions, one frequency per row:
+the row's on-shell ``pair`` frequency (:func:`derivative_x`, the ``dacc_*`` accumulators).
+
 Streaming.  W(z) is never persisted.  Nodes (z = i u) and knots (z = j h + i eta) are streamed in
 chunks of ``runtime.tiles.tile_units`` (TASTE 96: the tile is sized from the chunk's own shapes,
 never from free memory or the deck budget; the last chunk is padded with zero-weight nodes or
@@ -90,7 +94,9 @@ CD_RECIPE = dict(version="cd_production_v3", laws="ordered_cd TRREF / Run211 jet
                  residue_rows="banded per knot chunk and branch (live bands, BAND_RUNG 8; exact)",
                  band_tiles="tile_sum over l (runtime.tiles.tile_units; exact up to summation order)",
                  psi_tables="q-sharded pair slabs streamed from the band carrier (pair_psi_slabs)",
-                 qz_flat="zero rows to a multiple of P (chunk free of P / gcd(nq_irr, P))")
+                 qz_flat="zero rows to a multiple of P (chunk free of P / gcd(nq_irr, P))",
+                 derivative="dSigma/domega on the on-shell pair table: closed-form d/dx weights on the same "
+                            "contractions (gw.cd.laws *_dx), rows bound to their pair frequency")
 
 
 def _say(print_fn, started, msg):
@@ -204,7 +210,8 @@ def cd_memory_plan(*, n, nq_irr, nk, n_carrier_k, nb_carrier, n_rows, nb_s, L, L
         psi_pair_slab=16.0 * nq_loc * n_rows * L * ns * n,
         psi_neg_pair_slab=16.0 * nq_loc * n_rows * L_neg * ns * n,
         psi_M=16.0 * n_rows * nb_s * ns * n,
-        accumulators=3 * 16.0 * (n_omega * n_rows * nb_s * nb_s + n_rows * nb_s),
+        # cube, own diagonal and the dSigma/dE matrix (one frequency per row), per contour part
+        accumulators=3 * 16.0 * ((n_omega + 1) * n_rows * nb_s * nb_s + n_rows * nb_s),
         coulomb_roots_face=u * nq_irr / P,
         energy_tables=16.0 * nk * L,
         band_tile=band_tile * band_bytes_per_unit(n_rows, nb_s, n, ns, n_omega))
@@ -407,6 +414,16 @@ def tile_sum(body, count, tile, zero):
     return add(out, body(n_full * tile, tail)) if tail else out
 
 
+def derivative_x(T, x):
+    """x at each row's derivative frequency: x_d[k, m, l] = x[k, T["d_idx"][k, m], l] (a gather, bit-exact).
+
+    ``T["d_idx"]`` [kw, m] int32 indexes the omega grid (the on-shell request's ``pair`` table, looked up
+    by the consumer), so the derivative accumulator reads the same x, knots and band tables as the cube.
+    """
+    idx = T["d_idx"]
+    return jnp.take_along_axis(x, jnp.broadcast_to(idx[:, :, None], idx.shape + x.shape[2:]), axis=1)
+
+
 def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile=None, own0=0):
     """The four q-parallel CD kernels (jitted shard_maps; accumulators and tables replicated, pair slabs q-sharded).
 
@@ -426,6 +443,10 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
     ``own0`` (static, ``cd_own_energy_band_min``): the own-energy diagonal covers window rows m >= own0
     (``own`` [kw, m - own0]; T["eps_own"] holds those rows only); the omega-grid cube keeps every row.
     0 is the whole window, the same program as before the key existed.
+    ``dacc`` (imag, real, anchor; optional): the dSigma_c/dE accumulator [kw, m, m] with E bound to the bra
+    row m at the omega-grid entry ``T["d_idx"][k, m]`` (:func:`derivative_x`, ``laws.row_apply``): the same
+    contractions with the ``*_dx`` weights of ``gw.cd.laws``, no further W.  Given, the kernel returns
+    ``(acc', own', dacc')``; absent, the program is the one without it.
     """
     axes = ("x", "y")
     tile = int(band_tile) if band_tile else None
@@ -441,8 +462,14 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
         # independent of the GPU placement
         return acc + ordered_psum(inc, axes)
 
-    def zeros2(acc, own):
-        return jnp.zeros_like(acc), jnp.zeros_like(own)
+    def zeros(accs):
+        return tuple(jnp.zeros_like(a) for a in accs)
+
+    def add(accs, incs):
+        return tuple(a + i for a, i in zip(accs, incs))
+
+    def masked(accs, v):
+        return tuple(v * a for a in accs)
 
     def cd_sigma_x(V, acc, T):
         def over_q(s, iq):
@@ -456,27 +483,34 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
         inc, _ = jax.lax.scan(over_q, jnp.zeros_like(acc), jnp.arange(nq_loc), unroll=1)
         return psum_add(acc, inc)
 
-    def cd_imag_contract(W, u_c, w_c, acc, own, T):
+    def cd_imag_contract(W, u_c, w_c, accs, T):
+        deriv = len(accs) == 3
+
         def over_q(carry, iq):
             g = q0() + iq
 
             def band_tile_(lo, width):
                 rho, x, x_own, f = pair_rows(T, g, T["psi_q"][iq], lo, width)
+                x_d = derivative_x(T, x) if deriv else None
 
                 def over_z(c2, iz):
                     a = contract(rho, W[iz, iq], nk)
                     ops, wts = laws.imag_node_terms(a, u_c[iz], w_c[iz], x, f, eta)
                     _, wts_own = laws.imag_node_terms(a, u_c[iz], w_c[iz], x_own, f, eta)
-                    return (c2[0] + laws.apply(ops, wts), c2[1] + own_apply(ops, wts_own)), None
-                out, _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
+                    inc = (laws.apply(ops, wts), own_apply(ops, wts_own))
+                    if deriv:
+                        _, wts_d = laws.imag_node_terms(a, u_c[iz], w_c[iz], x_d, f, eta,
+                                                        kernel=laws.imag_node_kernels_dx)
+                        inc = inc + (laws.row_apply(ops, wts_d),)
+                    return add(c2, inc), None
+                out, _ = jax.lax.scan(over_z, zeros(accs), jnp.arange(W.shape[0]), unroll=1)
                 return out
-            s_acc, s_own = tile_sum(band_tile_, T["psi_q"].shape[2], tile, zeros2(acc, own))
-            v = T["qvalid"][g]
-            return (carry[0] + v * s_acc, carry[1] + v * s_own), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, zeros2(acc, own), jnp.arange(nq_loc), unroll=1)
-        return psum_add(acc, inc), psum_add(own, inc_own)
+            part = tile_sum(band_tile_, T["psi_q"].shape[2], tile, zeros(accs))
+            return add(carry, masked(part, T["qvalid"][g])), None
+        inc, _ = jax.lax.scan(over_q, zeros(accs), jnp.arange(nq_loc), unroll=1)
+        return tuple(psum_add(a, i) for a, i in zip(accs, inc))
 
-    def cd_real_contract(W, dW, z_c, node0, acc, own, T, bands, negative):
+    def cd_real_contract(W, dW, z_c, node0, accs, T, bands, negative):
         """One knot chunk's Hermite residues on the banded rows of ``bands`` (one table per live branch).
 
         ``negative`` (static, one flag per table): False = x >= 0 residues of pair g against W_g,
@@ -486,6 +520,20 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
         the band tile, each branch runs its own column tiles (:func:`tile_sum`) and applies per branch.
         """
         single = tile is None or all(int(t.shape[-1]) <= tile for t in bands)
+        deriv = len(accs) == 3
+
+        def branch_coefficients(x, x_own, f, neg):
+            out = (laws.hermite_branch_coefficients(x, f, h_ry, neg),
+                   laws.hermite_branch_coefficients(x_own, f, h_ry, neg))
+            if deriv:
+                out = out + (laws.hermite_branch_coefficients(derivative_x(T, x), f, h_ry, neg, derivative=True),)
+            return out
+
+        def knot_increment(op, node, coeffs):
+            inc = (own_apply(op, laws.real_knot_select(node, coeffs[1])),)
+            if deriv:
+                inc = inc + (laws.row_apply(op, laws.real_knot_select(node, coeffs[2])),)
+            return inc
 
         def over_q(carry, iq):
             g = q0() + iq
@@ -494,50 +542,48 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
                 for table, neg in zip(bands, negative):
                     rho, x, x_own, f = pair_rows(T, T["qneg"][g] if neg else g, T["psi_nq" if neg else "psi_q"][iq],
                                                  bands=table[g])
-                    sides.append((rho, laws.hermite_branch_coefficients(x, f, h_ry, neg),
-                                  laws.hermite_branch_coefficients(x_own, f, h_ry, neg), neg))
+                    sides.append((rho, branch_coefficients(x, x_own, f, neg), neg))
 
                 def over_z(c2, iz):
                     node, z = node0 + iz, z_c[iz]
                     Wz, dWz = W[iz, iq], dW[iz, iq]
-                    ops, wts, inc_own = [], [], 0
-                    for rho, coeffs, coeffs_own, neg in sides:
+                    ops, wts, inc_rest = [], [], (0,) * (len(accs) - 1)
+                    for rho, coeffs, neg in sides:
                         op = laws.real_knot_operators(z, contract(rho, Wz.T if neg else Wz, nk),
                                                       contract(rho, dWz.T if neg else dWz, nk))
                         ops.append(op)
-                        wts.append(laws.real_knot_select(node, coeffs))
-                        inc_own = inc_own + own_apply(op, laws.real_knot_select(node, coeffs_own))
+                        wts.append(laws.real_knot_select(node, coeffs[0]))
+                        inc_rest = add(inc_rest, knot_increment(op, node, coeffs))
                     inc = laws.apply(jnp.concatenate(ops, -1), jnp.concatenate(wts, -1))
-                    return (c2[0] + inc, c2[1] + inc_own), None
-                (s_acc, s_own), _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
+                    return add(c2, (inc,) + inc_rest), None
+                part, _ = jax.lax.scan(over_z, zeros(accs), jnp.arange(W.shape[0]), unroll=1)
             else:
-                s_acc, s_own = zeros2(acc, own)
+                part = zeros(accs)
                 for table, neg in zip(bands, negative):
                     tab, psi_rows, pair = table[g], T["psi_nq" if neg else "psi_q"][iq], T["qneg"][g] if neg else g
 
                     def column_tile(lo, width, tab=tab, psi_rows=psi_rows, pair=pair, neg=neg):
                         cols = tab if width is None else jax.lax.dynamic_slice_in_dim(tab, lo, width, axis=1)
                         rho, x, x_own, f = pair_rows(T, pair, psi_rows, bands=cols)
-                        coeffs = laws.hermite_branch_coefficients(x, f, h_ry, neg)
-                        coeffs_own = laws.hermite_branch_coefficients(x_own, f, h_ry, neg)
+                        coeffs = branch_coefficients(x, x_own, f, neg)
 
                         def over_z(c2, iz):
                             node, z = node0 + iz, z_c[iz]
                             Wz, dWz = W[iz, iq], dW[iz, iq]
                             op = laws.real_knot_operators(z, contract(rho, Wz.T if neg else Wz, nk),
                                                           contract(rho, dWz.T if neg else dWz, nk))
-                            return (c2[0] + laws.apply(op, laws.real_knot_select(node, coeffs)),
-                                    c2[1] + own_apply(op, laws.real_knot_select(node, coeffs_own))), None
-                        out, _ = jax.lax.scan(over_z, zeros2(acc, own), jnp.arange(W.shape[0]), unroll=1)
+                            inc = (laws.apply(op, laws.real_knot_select(node, coeffs[0])),)
+                            return add(c2, inc + knot_increment(op, node, coeffs)), None
+                        out, _ = jax.lax.scan(over_z, zeros(accs), jnp.arange(W.shape[0]), unroll=1)
                         return out
-                    b_acc, b_own = tile_sum(column_tile, tab.shape[-1], tile, zeros2(acc, own))
-                    s_acc, s_own = s_acc + b_acc, s_own + b_own
-            v = T["qvalid"][g]
-            return (carry[0] + v * s_acc, carry[1] + v * s_own), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, zeros2(acc, own), jnp.arange(nq_loc), unroll=1)
-        return psum_add(acc, inc), psum_add(own, inc_own)
+                    part = add(part, tile_sum(column_tile, tab.shape[-1], tile, zeros(accs)))
+            return add(carry, masked(part, T["qvalid"][g])), None
+        inc, _ = jax.lax.scan(over_q, zeros(accs), jnp.arange(nq_loc), unroll=1)
+        return tuple(psum_add(a, i) for a, i in zip(accs, inc))
 
-    def cd_anchor(W0, dW0, acc, own, T):
+    def cd_anchor(W0, dW0, accs, T):
+        deriv = len(accs) == 3
+
         def over_q(carry, iq):
             g = q0() + iq
 
@@ -549,12 +595,18 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
                 total_o, _, _ = laws.anchor_part(a0, d0, x_own, f, eta, beta, apply_fn=own_apply)
                 sub_o = laws.anchor_subtraction(cp, cm, laws.imag_anchor_sums(T["u_all"], T["w_all"], x_own, f, eta, beta),
                                                 apply_fn=own_apply)
-                return total - sub, total_o - sub_o
-            s_acc, s_own = tile_sum(band_tile_, T["psi_q"].shape[2], tile, zeros2(acc, own))
-            v = T["qvalid"][g]
-            return (carry[0] + v * s_acc, carry[1] + v * s_own), None
-        (inc, inc_own), _ = jax.lax.scan(over_q, zeros2(acc, own), jnp.arange(nq_loc), unroll=1)
-        return psum_add(acc, inc), psum_add(own, inc_own)
+                out = (total - sub, total_o - sub_o)
+                if deriv:
+                    x_d = derivative_x(T, x)
+                    sums_d = laws.imag_anchor_sums(T["u_all"], T["w_all"], x_d, f, eta, beta,
+                                                   kernel=laws.imag_node_kernels_dx)
+                    out = out + (laws.anchor_part_dx(cp, cm, x_d, f, eta, beta, apply_fn=laws.row_apply)
+                                 - laws.anchor_subtraction(cp, cm, sums_d, apply_fn=laws.row_apply),)
+                return out
+            part = tile_sum(band_tile_, T["psi_q"].shape[2], tile, zeros(accs))
+            return add(carry, masked(part, T["qvalid"][g])), None
+        inc, _ = jax.lax.scan(over_q, zeros(accs), jnp.arange(nq_loc), unroll=1)
+        return tuple(psum_add(a, i) for a, i in zip(accs, inc))
 
     q3, q4 = P(axes), P(None, axes)
 
@@ -566,26 +618,38 @@ def build_contraction_kernels(mesh_xy, *, nk, nq_loc, eta, h_ry, beta, band_tile
         named.__name__ = named.__qualname__ = name or fn.__name__
         return jax.jit(named)
 
+    def accumulators(acc, own, dacc):
+        return (acc, own) if dacc is None else (acc, own, dacc)
+
+    imag_program = wrap(cd_imag_contract, (q4, P(), P(), P(), "T"), P())
+    anchor_program = wrap(cd_anchor, (q3, q3, P(), "T"), P())
     real_programs = {}
 
-    def real(W, dW, z_c, node0, acc, own, T, bands, negative):
+    def imag(W, u_c, w_c, acc, own, T, dacc=None):
+        """Imaginary-node kernel: (acc', own') or, with ``dacc``, (acc', own', dacc')."""
+        return imag_program(W, u_c, w_c, accumulators(acc, own, dacc), T)
+
+    def anchor(W0, dW0, acc, own, T, dacc=None):
+        """Anchor kernel at z = i eta: (acc', own') or, with ``dacc``, (acc', own', dacc')."""
+        return anchor_program(W0, dW0, accumulators(acc, own, dacc), T)
+
+    def real(W, dW, z_c, node0, acc, own, T, bands, negative, dacc=None):
         """Banded real-axis kernel; one program per branch-flag tuple, jit-cached per table width."""
         negative = tuple(bool(v) for v in negative)
         if len(negative) != len(bands) or not negative:
             raise ValueError(f"GATE cd_band_tables: {len(bands)} tables vs branch flags {negative}; want one flag per "
                              "table and at least one table (a chunk no residue reads is skipped by the caller)")
         if negative not in real_programs:
-            def body(W, dW, z_c, node0, acc, own, T, bands):
-                return cd_real_contract(W, dW, z_c, node0, acc, own, T, bands, negative)
-            real_programs[negative] = wrap(body, (q4, q4, P(), P(), P(), P(), "T", P()), (P(), P()),
-                                           name="cd_real_contract")
-        return real_programs[negative](W, dW, z_c, node0, acc, own, T, tuple(bands))
+            def body(W, dW, z_c, node0, accs, T, bands):
+                return cd_real_contract(W, dW, z_c, node0, accs, T, bands, negative)
+            real_programs[negative] = wrap(body, (q4, q4, P(), P(), P(), "T", P()), P(), name="cd_real_contract")
+        return real_programs[negative](W, dW, z_c, node0, accumulators(acc, own, dacc), T, tuple(bands))
 
     return SimpleNamespace(
         sigma_x=wrap(cd_sigma_x, (q3, P(), "T"), P()),
-        imag=wrap(cd_imag_contract, (q4, P(), P(), P(), P(), "T"), (P(), P())),
+        imag=imag,
         real=real,
-        anchor=wrap(cd_anchor, (q3, q3, P(), P(), "T"), (P(), P())),
+        anchor=anchor,
         band_tile=tile)
 
 
@@ -915,7 +979,7 @@ CD_RESUME_FREE_KEYS = ("cd_checkpoint", "restart")
 #: assemble/unfold tail, :func:`cd_on_shell_body`, the finalize and the output stage) resumes.
 CD_ACCUMULATOR_FUNCTIONS = (
     "residue_reach_need", "own_energy_window", "band_rung", "residue_band_tables", "table_specs", "pair_rows",
-    "contract", "tile_sum", "build_contraction_kernels", "build_dyson_kernels", "qz_flat_programs",
+    "contract", "tile_sum", "derivative_x", "build_contraction_kernels", "build_dyson_kernels", "qz_flat_programs",
     "carrier_band_blocks", "pair_psi_slabs", "knot_chunk", "cd_chunk_plan", "chunk_bytes_per_unit",
     "band_bytes_per_unit", "cd_memory_plan", "bank_chi0", "real_replay_start", "stream_cd_chunks")
 CD_ACCUMULATOR_MODULES = ("gw.cd.chi0_rules", "gw.cd.laws", "gw.cd.rule", "gw.response_bank")
@@ -1190,14 +1254,18 @@ class CdCheckpoint:
 def compute_sigma_c_cd_omega_grid(
     wfns, cd_handle, meta, mesh_xy, *, sym, config, omega_grid_ry, efermi_ry,
     regularization_width_ry, occupation_state=None, print_fn=print, run_dir=None,
-    sig_x=None, band_brackets=None, band_counts=None, omega_eta_ry=None, **_body_options):
+    sig_x=None, band_brackets=None, band_counts=None, omega_eta_ry=None, on_shell_request=None,
+    **_body_options):
     """Sigma_c(omega) [n_omega, nk_full, nb_c, nb_c] (Ry) on the deck's omega grid by CD.
 
     ``cd_handle`` is ``W_by_role["cd_stream"]`` from ``gw.screening.compute_screening_model``
     (``V_q`` wedge operator, deck sub-keys); ``omega_grid_ry`` is relative to ``efermi_ry``;
     ``regularization_width_ry`` is eta.  The rest of ``body_options`` is the pole executor's.
     Returns :class:`gw.ppm_sigma.SigmaOmegaResult`, cube at ``P(None, None, 'x', 'y')`` on the padded
-    Sigma band carrier.  Rank 0 writes beside the deck: ``cd_sigma_receipt.json``,
+    Sigma band carrier.  With ``on_shell_request`` (:class:`gw.ppm_sigma.OnShellRequest`; ``omega_grid_ry``
+    is then its ``frequencies_ry``) the kernels also accumulate dSigma_c/domega with each row bound to its
+    ``pair`` table frequency (the ``dacc_*`` accumulators), and the result is :func:`cd_on_shell_body`'s,
+    whose derivative slot is that exact derivative.  Rank 0 writes beside the deck: ``cd_sigma_receipt.json``,
     ``cd_sigma_own_energy.npz`` (diagonal at the DFT energies on the own-energy rows ``bands0`` and its
     three contour parts; ``sigma_x_diag_ry`` on the whole window ``window_bands0``),
     ``cd_leak_ledger.csv`` and the partial dumps ``cd_partial_{imag,anchor}.npz``.  ``cd_checkpoint``
@@ -1309,6 +1377,15 @@ def compute_sigma_c_cd_omega_grid(
     enk_L = energy[:, l0:l1]
     f_L = f_cd[:, l0:l1]
     eps_own = energy[rows_all, m0 + o0:m1]                         # [rows, nb_o] own energies
+    # dSigma/domega rows: each (row, window band) at its on-shell pair-table frequency, as an index into the
+    # omega grid (the derivative accumulator gathers the cube's own x there; derivative_x).
+    d_idx = None
+    if on_shell_request is not None:
+        pair_ry = np.asarray(on_shell_request.tables_ry, np.float64)[on_shell_request.slot("pair")]
+        if pair_ry.shape[0] != nk or pair_ry.shape[1] > nb_s:
+            raise ValueError(f"GATE cd_on_shell_shape: pair table {pair_ry.shape} vs (nk={nk}, <= {nb_s} window bands)")
+        d_idx = np.zeros((n_rows, nb_s), np.int32)                 # bands past the request read entry 0, unread
+        d_idx[:, :pair_ry.shape[1]] = cd_frequency_lookup(omega_grid_ry, pair_ry[rows_all])
 
     # residue coverage (GATE cd_residue_coverage): the largest |x| any live residue reads
     need = residue_reach_need(omega, eps_own, enk_L, f_L)
@@ -1359,7 +1436,10 @@ def compute_sigma_c_cd_omega_grid(
         raise ValueError(f"GATE cd_psi_shape: {tuple(src.shape)} vs (k, nb_full={nb_full}, s, n={n})")
     ns = int(src.shape[2])
     L_neg = max(1, int(band_summary["extent_pos_neg"][1]))          # the x < 0 tables read bands [0, L_neg) only
-    band_tile = int(cd_handle.get("band_tile") or 0) or tile_units(band_bytes_per_unit(n_rows, nb_s, n, ns, nE), L)
+    # The derivative rows add one weight row per window band (x_d [kw, m, l]) beside the E grid's.
+    n_weight_rows = nE + (0 if d_idx is None else nb_s)
+    band_tile = int(cd_handle.get("band_tile") or 0) or tile_units(
+        band_bytes_per_unit(n_rows, nb_s, n, ns, n_weight_rows), L)
     slab_block = tile_units(16.0 * ns * n * (int(src.shape[0]) + nk + 2 * nq_loc * n_rows), L)
     mem_plan = cd_memory_plan(n=n, nq_irr=nq_irr, nk=nk, n_carrier_k=int(src.shape[0]), nb_carrier=nb_full,
                               n_rows=n_rows, nb_s=nb_s, L=L, L_neg=L_neg, ns=ns, n_omega=nE, ndev=ndev,
@@ -1385,6 +1465,8 @@ def compute_sigma_c_cd_omega_grid(
                 kw=_rep(rows_all.astype(np.int32)), enk=_rep(enk_L), f=_rep(f_L), omega=_rep(omega),
                 eps_own=_rep(eps_own), qneg=_rep(qneg_pad.astype(np.int32)), qvalid=_rep(qvalid), u_all=_rep(u_ry_all),
                 w_all=_rep(w_ry_all))
+    if d_idx is not None:
+        tabs["d_idx"] = _rep(d_idx)
     u_dev, w_dev = _rep(u_ry), _rep(w_ry)
     beta = tuple(float(b) for b in laws.BETA_RY)
     K = build_contraction_kernels(mesh_xy, nk=nk, nq_loc=nq_loc, eta=eta, h_ry=h_ry, beta=beta, band_tile=band_tile,
@@ -1455,6 +1537,9 @@ def compute_sigma_c_cd_omega_grid(
     acc_imag, own_imag = zeros(*acc_shape), zeros(*own_shape)
     acc_real, own_real = zeros(*acc_shape), zeros(*own_shape)
     acc_anc, own_anc = zeros(*acc_shape), zeros(*own_shape)
+    # dSigma/domega at the pair-table frequency of each row, per contour part (only with an on-shell request)
+    d_keys = () if d_idx is None else ("dacc_imag", "dacc_real", "dacc_anc")
+    d_accs = {key: zeros(n_rows, nb_s, nb_s) for key in d_keys}
     timings = {}
 
     def clock(name, t0):
@@ -1560,7 +1645,8 @@ def compute_sigma_c_cd_omega_grid(
             omega_sha256=hashlib.sha256(np.ascontiguousarray(omega).tobytes()).hexdigest(), eta_ry=eta,
             knot_step_ry=h_ry, J=J, J_pad=J_pad, imaginary_nodes=n_imag, n_imag_pad=n_imag_pad,
             chunk_imag=chunk_i, chunk_real=chunk_r, stop_after_imag=stop_after["imag"],
-            stop_after_real_from=stop_after["real_from"])
+            stop_after_real_from=stop_after["real_from"],
+            derivative_index_sha256=None if d_idx is None else hashlib.sha256(d_idx.tobytes()).hexdigest())
         ckpt = CdCheckpoint(os.path.join(run_dir, CD_CHECKPOINT_FILE), identity, mesh_xy, print_fn=print_fn)
         if ckpt_mode == "resume":
             resume = ckpt.read()
@@ -1589,13 +1675,14 @@ def compute_sigma_c_cd_omega_grid(
         jax.block_until_ready(W)
         clock("unfold", t0)
         t0 = time.monotonic()
-        acc, own = K.imag(W, u_dev[c0:c1], w_dev[c0:c1], accs["acc_imag"], accs["own_imag"], tabs)
-        jax.block_until_ready(acc)
+        out = K.imag(W, u_dev[c0:c1], w_dev[c0:c1], accs["acc_imag"], accs["own_imag"], tabs,
+                     dacc=accs.get("dacc_imag"))
+        jax.block_until_ready(out[0])
         clock("contract_imag", t0)
         del W
         ledger.append(ledger_sample("imag", ic, time.monotonic() - t_chunk))
         _say(print_fn, started, f"imaginary nodes {min(c1, n_imag)}/{n_imag} " + json.dumps({k: round(v, 1) for k, v in timings.items()}))
-        return dict(accs, acc_imag=acc, own_imag=own)
+        return dict(accs, acc_imag=out[0], own_imag=out[1], **dict(zip(d_keys[:1], out[2:])))
 
     def chi_real(ic):
         """chi0 at real chunk ``ic``'s planned window (gw.cd.chi0_rules.cd_windows: chunk 0 with both ghost
@@ -1624,26 +1711,27 @@ def compute_sigma_c_cd_omega_grid(
         del wc_flat, dw_flat
         jax.block_until_ready(dW)
         clock("unfold", t0)
-        acc_a, own_a = accs["acc_anc"], accs["own_anc"]
+        anc = (accs["acc_anc"], accs["own_anc"]) + tuple(accs[k] for k in d_keys[2:])
         if j0 == 0:
             t0 = time.monotonic()
-            acc_a, own_a = K.anchor(W[0], dW[0], acc_a, own_a, tabs)
-            jax.block_until_ready(acc_a)
+            anc = K.anchor(W[0], dW[0], anc[0], anc[1], tabs, dacc=accs.get("dacc_anc"))
+            jax.block_until_ready(anc[0])
             clock("anchor", t0)
-            partial_dump("anchor", sigma_c_anchor_own_ry=own_a, sigma_c_imag_own_ry=accs["own_imag"])
+            partial_dump("anchor", sigma_c_anchor_own_ry=anc[1], sigma_c_imag_own_ry=accs["own_imag"])
         t0 = time.monotonic()
-        acc_r, own_r = accs["acc_real"], accs["own_real"]
+        res = (accs["acc_real"], accs["own_real"]) + tuple(accs[k] for k in d_keys[1:2])
         bands, negative = band_tables(ic)
         if bands:                                       # a chunk no live residue reads adds an exact zero
-            acc_r, own_r = K.real(W, dW, z_core, jnp.int32(j0), acc_r, own_r, tabs,
-                                  tuple(_rep(b) for b in bands), negative)
-            jax.block_until_ready(acc_r)
+            res = K.real(W, dW, z_core, jnp.int32(j0), res[0], res[1], tabs, tuple(_rep(b) for b in bands), negative,
+                         dacc=accs.get("dacc_real"))
+            jax.block_until_ready(res[0])
         clock("contract_real", t0)
         del W, dW
         ledger.append(ledger_sample("real", ic, time.monotonic() - t_chunk))
         if ic % 10 == 0 or j1 >= J_pad:
             _say(print_fn, started, f"real knots {min(j1, J)}/{J} " + json.dumps({k: round(v, 1) for k, v in timings.items()}))
-        return dict(accs, acc_anc=acc_a, own_anc=own_a, acc_real=acc_r, own_real=own_r)
+        return dict(accs, acc_anc=anc[0], own_anc=anc[1], acc_real=res[0], own_real=res[1],
+                    **dict(zip(d_keys[2:], anc[2:])), **dict(zip(d_keys[1:2], res[2:])))
 
     def on_chunk(axis, ic, accs):
         if axis == "imag" and ic == len(imag_chunks) - 1:
@@ -1658,9 +1746,10 @@ def compute_sigma_c_cd_omega_grid(
         imag_chunks=imag_chunks, real_chunks=real_chunks, chi_real=chi_real, join=join_fn, tail_of=tail_fn,
         imag_step=imag_step, real_step=real_step, resume=resume, on_chunk=on_chunk, stop_after=stop_after,
         accs=dict(acc_imag=acc_imag, own_imag=own_imag, acc_real=acc_real, own_real=own_real,
-                  acc_anc=acc_anc, own_anc=own_anc))
+                  acc_anc=acc_anc, own_anc=own_anc, **d_accs))
     acc_imag, own_imag, acc_real, own_real, acc_anc, own_anc = (
         accs[k] for k in ("acc_imag", "own_imag", "acc_real", "own_real", "acc_anc", "own_anc"))
+    d_accs = {k: accs[k] for k in d_keys}
     del accs
     ckpt_note = dict(mode=ckpt_mode, path=None if ckpt is None else ckpt.path,
                      writes=0 if ckpt is None else ckpt.writes, seconds=0.0 if ckpt is None else ckpt.seconds,
@@ -1707,12 +1796,25 @@ def compute_sigma_c_cd_omega_grid(
     nbc = int(axis.carrier)
     padw = nbc - nb_s
     out_sh = NamedSharding(mesh_xy, P(None, None, "x", "y"))
-    cube = jax.jit(lambda s: jnp.pad(s, ((0, 0), (0, 0), (0, padw), (0, padw))), out_shardings=out_sh)(sigma_w)
+    pad_carrier = jax.jit(lambda s: jnp.pad(s, ((0, 0), (0, 0), (0, padw), (0, padw))), out_shardings=out_sh)
+    unfold_k = jax.jit(lambda v: jnp.moveaxis(unfold_file_wedge_band_operator(
+        sym, jnp.moveaxis(v, 1, 0), trs_rule="transpose"), 0, 1), out_shardings=out_sh)
+    cube = pad_carrier(sigma_w)
     del sigma_w, acc_anc, acc_imag, acc_real
     if not full_bz:
-        cube = jax.jit(lambda v: jnp.moveaxis(unfold_file_wedge_band_operator(
-            sym, jnp.moveaxis(v, 1, 0), trs_rule="transpose"), 0, 1), out_shardings=out_sh)(cube)
+        cube = unfold_k(cube)
     jax.block_until_ready(cube)
+    # dSigma/domega: the derivative matrix (each row at its pair frequency) takes the cube's path as a
+    # one-frequency cube -- padded carrier, the same k unfold -- and the finalize reads its band diagonal.
+    d_diag = None
+    if d_keys:
+        dsig = d_accs["dacc_anc"] + d_accs["dacc_imag"] + d_accs["dacc_real"]           # [rows, nb_s, nb_s]
+        del d_accs
+        dsig = pad_carrier(jax.jit(lambda a: a[None, :nk_red] * 1.0, out_shardings=rep)(dsig))
+        if not full_bz:
+            dsig = unfold_k(dsig)
+        d_diag = host(jax.jit(lambda v: jnp.diagonal(v[0], axis1=1, axis2=2), out_shardings=rep)(dsig))  # [nk, nbc]
+        del dsig
     clock("assemble", t0)
     cert_note = None
     if cert:
@@ -1724,7 +1826,7 @@ def compute_sigma_c_cd_omega_grid(
         cert_note = dict(stars=[[int(i), int(k)] for i, k in cert], max_abs_meV=dev, max_ref_meV=scale)
         _say(print_fn, started, f"symmetry certificate (direct star rows vs wedge-unfolded cube): {json.dumps(cert_note)}")
     ledger.append(ledger_sample("assemble", 0, time.monotonic() - t0))
-    finite = bool(np.isfinite(own).all())
+    finite = bool(np.isfinite(own).all()) and (d_diag is None or bool(np.isfinite(d_diag).all()))
     barrier("cd_sigma_done")
     receipt = dict(recipe=CD_RECIPE, eta_ev=eta * EV, knot_step_ev=h_ry * EV, J=J, J_pad=J_pad,
                    reach_ev=real_ry[J - 1] * EV, need_ev=need * EV, imaginary_nodes=n_imag, n_imag_pad=n_imag_pad,
@@ -1747,7 +1849,9 @@ def compute_sigma_c_cd_omega_grid(
                  eps_own_ry=eps_own[:nk_red], sigma_c_own_ry=own, sigma_c_anchor_own_ry=parts["anchor"],
                  sigma_c_imag_own_ry=parts["imag"], sigma_c_real_own_ry=parts["real"],
                  sigma_x_diag_ry=np.real(np.diagonal(sx_cd_h, axis1=1, axis2=2)),
-                 sigma_x_kmn_ry=sx_cd_h, mu_ry=mu, omega_ry=omega, u_ry=u_ry_all, w_ry=w_ry_all, real_ry=real_ry[:J])
+                 sigma_x_kmn_ry=sx_cd_h, mu_ry=mu, omega_ry=omega, u_ry=u_ry_all, w_ry=w_ry_all, real_ry=real_ry[:J],
+                 **({} if d_diag is None else dict(
+                     omega_pair_ry=omega[d_idx[:nk_red]], dsigma_c_domega_pair=d_diag[kw_rows, :nb_s])))
         with open(os.path.join(run_dir, "cd_sigma_receipt.json"), "w") as fh:
             json.dump(receipt, fh, indent=1, default=str)
         with open(os.path.join(run_dir, "cd_leak_ledger.csv"), "w") as fh:
@@ -1758,9 +1862,12 @@ def compute_sigma_c_cd_omega_grid(
     if not finite:
         raise ValueError("GATE cd_finite: non-finite Sigma_c")
     _say(print_fn, started, "done " + json.dumps({k: round(v, 1) for k, v in timings.items()}))
-    return SigmaOmegaResult(omega_ry=np.asarray(omega_grid_ry, np.float64),
+    body = SigmaOmegaResult(omega_ry=np.asarray(omega_grid_ry, np.float64),
                             omega_ev=np.asarray(omega_grid_ry, np.float64) * EV,
                             sigma_c_kij=cube, band_axis=axis, band_counts=(), efermi_ry=float(efermi_ry))
+    if on_shell_request is None:
+        return body
+    return cd_on_shell_body(body, on_shell_request, mesh_xy, derivative=d_diag, print_fn=print_fn)
 
 
 # ------------------------------------------------------------------------- the on-shell handoff (post-processing)
@@ -1769,33 +1876,39 @@ def compute_sigma_c_cd_omega_grid(
 CD_ON_SHELL_LOOKUP_RY = 1.0e-9
 
 
-def cd_linear_on_axis(values, axis, points):
-    """``values[w, k, n]`` linearly interpolated along the increasing ``axis`` at ``points[k, n]`` (inside it)."""
+def cd_frequency_lookup(axis, points):
+    """Index of each ``points`` entry on the increasing frequency ``axis`` (the nearest sample), GATE cd_on_shell_lookup.
+
+    A point must be a sample of the axis to :data:`CD_ON_SHELL_LOOKUP_RY` (the operand and the derivative
+    accumulator read samples, not interpolants).  Returns int64 indices shaped like ``points``.
+    """
     axis = np.asarray(axis, dtype=np.float64)
-    j = np.clip(np.searchsorted(axis, points, side="right"), 1, axis.size - 1)
-    t = (points - axis[j - 1]) / (axis[j] - axis[j - 1])
-    k, n = np.meshgrid(np.arange(points.shape[0]), np.arange(points.shape[1]), indexing="ij")
-    return values[j - 1, k, n] * (1.0 - t) + values[j, k, n] * t
+    points = np.asarray(points, dtype=np.float64)
+    n_e = axis.size
+    j = np.clip(np.searchsorted(axis, points), 1, max(n_e - 1, 1))
+    idx = np.where(np.abs(axis[j - 1] - points) <= np.abs(axis[np.minimum(j, n_e - 1)] - points), j - 1,
+                   np.minimum(j, n_e - 1))
+    dev = float(np.abs(axis[idx] - points).max(initial=0.0))
+    if dev > CD_ON_SHELL_LOOKUP_RY:
+        raise ValueError(f"GATE cd_on_shell_lookup: a request table entry is {dev:.3e} Ry from every CD frequency; "
+                         f"want: <= {CD_ON_SHELL_LOOKUP_RY:g}; why: the operand reads samples, not interpolants")
+    return idx
 
 
-def cd_on_shell_body(body, request, mesh_xy, *, dE_ev=None, print_fn=print):
+def cd_on_shell_body(body, request, mesh_xy, *, derivative, print_fn=print):
     """The CD body on the on-shell request -> the SPM/MPA finalize's operand (``gw.ppm_sigma.OnShellSigma``).
 
     :func:`compute_sigma_c_cd_omega_grid` evaluates Sigma_c(omega) on ``request.frequencies_ry`` (the sorted
     distinct union of the request's tables, ``gw.sigma_dispatch._compute_mpa_sigma``), so every table entry
     is a sample of the cube.  The pair and the value slots read the cube at their table's entry, no
-    interpolation (GATE cd_on_shell_lookup).  CD has no exact dSigma/domega: the derivative slot (on the
-    ``pair`` table, where the eqp readers take Z) is the central difference +-dE of the sampled diagonal
-    (``eqp_bgw.Z_FINITE_DIFFERENCE_EV``, BerkeleyGW's finite_difference_spacing), probes linearly
-    interpolated between request frequencies (:func:`cd_linear_on_axis`, the linear rule of
-    ``qsgw_utils.interp_along_omega`` without its omega = 0 fallback: the probes are clamped onto the sampled
-    range) -- ``eqp_bgw.compute_z_factor_from_omega_grid``'s rule on this axis.  NOT the SPM/MPA slot's
-    definition: there it is the exact on-shell derivative of the sweep's quadrature; CD has no derivative
-    accumulator, so its Z is the BerkeleyGW-style secant Z.  Every rank enters (the
-    diagonal read is collective).  Returns ``body`` with ``sigma_c_kij`` the :class:`OnShellSigma`.
+    interpolation (GATE cd_on_shell_lookup).  The derivative slot (on the ``pair`` table, where the eqp
+    readers take Z) is ``derivative`` [nk, nbc]: the band diagonal of the CD derivative accumulators
+    (``dacc_*``), dSigma_nn/domega at the pair frequency in closed form on the same contractions and
+    quadrature as the cube -- the SPM/MPA slot's definition (the exact on-shell derivative of the sweep's
+    quadrature), not a finite difference.  Every rank enters (the diagonal read is collective).  Returns
+    ``body`` with ``sigma_c_kij`` the :class:`OnShellSigma`.
     """
     from common.collectives import gather_to_host, replicate_to_mesh
-    from gw.eqp_bgw import Z_FINITE_DIFFERENCE_EV
     from gw.ppm_sigma import OnShellSigma, slots_from_diagonal
 
     F = np.asarray(body.omega_ry, dtype=np.float64)
@@ -1807,15 +1920,12 @@ def cd_on_shell_body(body, request, mesh_xy, *, dE_ev=None, print_fn=print):
     n_e, nk, nbc = (int(v) for v in cube.shape[:3])
     tables = np.asarray(request.tables_ry, dtype=np.float64)    # [n_table, nk, nb_logical], Ry from E_F
     n_table, nk_t, nb = tables.shape
-    if nk_t != nk or nb > nbc or n_e != F.size:
-        raise ValueError(f"GATE cd_on_shell_shape: tables {tables.shape} vs cube {tuple(cube.shape)}")
-    j = np.clip(np.searchsorted(F, tables), 1, max(n_e - 1, 1))
-    idx = np.where(np.abs(F[j - 1] - tables) <= np.abs(F[np.minimum(j, n_e - 1)] - tables), j - 1,
-                   np.minimum(j, n_e - 1))
+    derivative = np.asarray(derivative)
+    if nk_t != nk or nb > nbc or n_e != F.size or derivative.shape != (nk, nbc):
+        raise ValueError(f"GATE cd_on_shell_shape: tables {tables.shape}, derivative {derivative.shape} vs cube "
+                         f"{tuple(cube.shape)}")
+    idx = cd_frequency_lookup(F, tables)
     dev = float(np.abs(F[idx] - tables).max(initial=0.0))
-    if dev > CD_ON_SHELL_LOOKUP_RY:
-        raise ValueError(f"GATE cd_on_shell_lookup: a request table entry is {dev:.3e} Ry from every CD frequency; "
-                         f"want: <= {CD_ON_SHELL_LOOKUP_RY:g}; why: the operand reads samples, not interpolants")
     idx = np.pad(idx, ((0, 0), (0, 0), (0, nbc - nb)))         # padded bands read entry 0, an exact zero there
     rep = NamedSharding(mesh_xy, P())
     spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
@@ -1823,15 +1933,8 @@ def cd_on_shell_body(body, request, mesh_xy, *, dE_ev=None, print_fn=print):
                                              out_shardings=rep)(cube)))          # [E, nk, nbc]
     kk, nn = np.meshgrid(np.arange(nk), np.arange(nbc), indexing="ij")
     values = diag[idx, kk[None], nn[None]]                      # [n_table, nk, nbc]
-    dE = float(Z_FINITE_DIFFERENCE_EV if dE_ev is None else dE_ev) / float(RYD_TO_EV)
-    e = tables[request.slot("pair")]
-    ep, em = np.clip(e + dE, F[0], F[-1]), np.clip(e - dE, F[0], F[-1])
-    clamped = (ep != e + dE) | (em != e - dE)
-    span = np.where(clamped, ep - em, 2.0 * dE)
-    d_log = diag[:, :, :nb]
-    rise = cd_linear_on_axis(d_log, F, ep) - cd_linear_on_axis(d_log, F, em)
-    deriv = np.where(span > 0.0, rise / np.where(span > 0.0, span, 1.0), 0.0)
-    rows = np.concatenate([values, np.pad(deriv, ((0, 0), (0, nbc - nb)))[None]]).astype(np.complex128)
+    deriv = np.where(np.arange(nbc) < nb, derivative, 0.0)    # logical bands; the padded carrier reads zero
+    rows = np.concatenate([values, deriv[None]]).astype(np.complex128)
     p_y = int(mesh_xy.shape["y"])
     slots = jax.jit(lambda r: slots_from_diagonal(r, p_y), out_shardings=spec)(replicate_to_mesh(rows, mesh_xy))
 
@@ -1843,7 +1946,7 @@ def cd_on_shell_body(body, request, mesh_xy, *, dE_ev=None, print_fn=print):
     pair = jax.jit(cd_on_shell_pair, out_shardings=spec)(
         cube, replicate_to_mesh(idx[request.slot("pair")].astype(np.int32), mesh_xy))
     log.info(f"  CD on shell: {n_table} table(s) {tuple(request.names)} read at {n_e} CD frequencies (max lookup "
-             f"{dev:.1e} Ry); dSigma/domega by +-{dE * float(RYD_TO_EV):g} eV central difference on them "
-             f"({int(clamped.sum())} of {clamped.size} states clamped at the sampled range)")
+             f"{dev:.1e} Ry); dSigma/domega from the CD derivative accumulators (closed form, no finite "
+             "difference)")
     return dataclasses.replace(body, sigma_c_kij=OnShellSigma(pair=pair, slots=slots, request=request,
                                                               mesh_xy=mesh_xy))
