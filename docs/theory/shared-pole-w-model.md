@@ -533,6 +533,93 @@ $$
 so a TRS bank adds no partner columns and **the ordered model equals the even
 model at equal retained span**.
 
+### 6.4 Proposed equilibrium prerequisite for damped full-density refreshes
+
+**Design proposal, not implemented or material-qualified.** An unstructured
+two-sided Loewner truncation can fit finite samples while introducing upper-
+half-plane poles. Accurate interpolation and a small eigenproblem backward
+error do not preserve the positive member in (W 25). The following candidate
+would use the **same current full-density Green/χ contraction and all physical
+bands/ports**, changing the frequency realization, not clipping its poles.
+
+First authenticate an equilibrium projector commuting with the current
+Hamiltonian, noninverted occupied/empty energies, positive scalar Coulomb
+operator, and the same declared spatial window. For uniform response-lag
+decay $\gamma$, the exact identity is
+
+$$
+W_\gamma(z)=W_0(\zeta),\qquad \zeta=z+i\gamma,
+\qquad W_0(\zeta)=C(\zeta J-M)^{-1}C^\dagger,\quad M\succ0.
+$$
+
+Here and below $W$ denotes the correlation part. This is a physical declared
+lag shift, not a fitted width or an additional collision $\eta$. With current
+samples $W_i=W_\gamma(z_i)$, directions $Q_i$, outputs $O_i=W_iQ_i$, and
+$X_i=(\zeta_iJ-M)^{-1}C^\dagger Q_i$, form one common state space:
+
+$$
+\mathcal G_{ij}
+=\frac{O_i^\dagger Q_j-Q_i^\dagger O_j}
+       {\zeta_j-\bar\zeta_i}=X_i^\dagger JX_j,
+\qquad
+\mathcal H_{ij}=\zeta_j\mathcal G_{ij}-O_i^\dagger Q_j
+=X_i^\dagger MX_j,\qquad O=[O_i].
+$$
+
+All $\operatorname{Im}\zeta_i>0$ makes this finite block nonconfluent, even
+for repeated supports. The lower adjoint data mean
+$W_0(\bar\zeta_i)=W_\gamma(z_i)^\dagger$;
+**not** $W_\gamma(\bar z_i)$. A checked congruence
+$Z^\dagger\mathcal H Z=I$ and Hermitian eigensolve
+$Z^\dagger\mathcal GZ\,u_j=\mu_j u_j$ give
+
+$$
+p_j=\mu_j^{-1}-i\gamma,\qquad
+R_j=\operatorname{sign}(\mu_j)\,b_jb_j^\dagger,
+\qquad b_j=OZu_j/\sqrt{|\mu_j|}.
+$$
+
+Every resolved finite pole then has the declared negative imaginary part
+because the *projected equations* retain a definite member, not because an
+already fitted growing pole was altered. Complex spinor/gyrotropic data
+remain complex: fixed-q adjoint reflection does not make $W_q$ even. Retain
+both signs and preserve the separate q/−q covariance and transposed partner
+residues in (W 16), including self-negative momenta.
+
+Implementation would reuse `shared_pole_pencil.finite_pencil_column` for
+(W 25), the existing distributed metric/eigh owners, and the signed output
+algebra (W 27). It cannot feed the present general E/A directly to
+`reduce_ordered_shared_pole_pencil`: that implementation expects the paired
+±frequency layout and its confluent derivatives. An upper-half-plane-only
+value-state variant needs an explicit extension of that reduction owner.
+If infinity states are included, undamp the moments first:
+$C_1^0=C_1^\gamma$, $C_2^0=C_2^\gamma+i\gamma C_1^\gamma$ (and the higher
+binomial transforms). One level $X_\infty=JC^\dagger Q_\infty$ needs only
+these two moments: its output is $C_1^0Q_\infty$, metric block
+$Q_\infty^\dagger C_1^0Q_\infty$, and definite block
+$Q_\infty^\dagger C_2^0Q_\infty$. Thus the existing general
+`add_infinity` assembly can be reused with conjugate left supports/actions
+and undamped $C_2$. This is not the existing *paired two-level* ordered
+infinity block, which requires four moments. Equilibration and rank reduction
+must be congruences of the same state space; the current independent
+left/right Ruiz factors and E-SVD cut are not that reduction.
+
+Admission must refuse resolved negative $\mathcal H$, not floor it. Exact
+$\mathcal H$-null directions are state dependencies and also null in
+$\mathcal G,O$; numerical removal still needs the existing loss checks.
+Separately, $\mu=0$ can produce a nonzero constant $-cc^\dagger$, not a dark
+mode. A strictly proper bank must resolve/refuse that output or establish an
+explicit admissible null-output policy; it must not silently drop it.
+Native/held full-W, moment and full-complex column-Σ checks remain necessary.
+
+This proposal gives no stability/positive-residue theorem for a noncommuting
+or inverted instantaneous density, and must not impose equilibrium structure
+on that case. It would not reduce the measured 405 s microscopic stream:
+only numerical frequency reduction changes. Same-state source-positive-bank
+reuse plus the uniform shift is a narrower equilibrium control, requiring
+independent current-state and sample authentication, not a refreshed-screening
+claim or a cure for the general driven realization.
+
 ## 7 How the self-energy consumes the model
 
 ### 7.1 Contour deformation without time reversal
