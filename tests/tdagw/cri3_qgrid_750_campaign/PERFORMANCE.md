@@ -423,6 +423,27 @@ preserved byte-for-byte: [binary64 prototype](evidence/EQFF_Q0_CHOLESKY_PROTOTYP
 [extended prototype](evidence/EQFF_Q0_EXTENDED_CHOLESKY_9929_v1.json), and
 [its execution receipt](evidence/EQFF_Q0_EXTENDED_CHOLESKY_9929_v1_EXECUTION.json).
 
+The third, fixed-refinement prototype retained the same 661 states and
+performed exactly two current-H Newton congruences with inner-32 compensated
+extended products. All four extended evaluations of the **delivered rounded
+maps** passed the unchanged `1e-9` requirement: original-H pre/final rotation
+`3.69636e-10` / `2.87301e-10`, and balanced-coordinate pre/final rotation
+`2.01585e-10` / `2.97855e-10`. Its computed-H positive lower bound was
+`1.51590e-10`. The direct binary64 original-H check still reported
+`7.58413e-7` and failed; this is not hidden by the extended checks.
+
+The run took **97.002 s / .956 GB**, zero GPUh. Cached-selector loading ended
+at 1.940 s, factor/inverse at 3.490 s, residual/SPD witness at 10.148 s,
+the two prescribed congruences at 29.816 s, and the final independent metric
+checks at 64.503 s. Three optional refined direct-LU/transfer diagnostics
+then ran to 97.004 s. Thus 97 s is not production-only recurring cost:
+RRQR was reused, while extra reference comparisons were included. This
+q0-only numerical result admits neither the full material W nor the old
+unknown failing parent. No states, thresholds or physical model changed.
+See the [raw result](evidence/EQFF_Q0_REFINED_CHOLESKY_c6ebe_v1.json),
+[execution/hash receipt](evidence/EQFF_Q0_REFINED_CHOLESKY_c6ebe_v1_EXECUTION.json)
+and [unaltered progress log](evidence/EQFF_Q0_REFINED_CHOLESKY_c6ebe_v1.log).
+
 ### Correction: the707 t0 request was not on its instantaneous shells
 
 The preserved707 measurements above remain raw historical evidence, but
