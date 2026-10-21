@@ -1021,6 +1021,7 @@ def _general_current_fit(current, samples, *, defer_admission=False):
     pencil_program=current['pencil_program']
     ph=current['ph']
     phases=current['phases']
+    plan=current['plan']
     pm=current['pm']
     pn=current['pn']
     print_fn=current['print_fn']
@@ -1544,7 +1545,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         label=label,
         layout=layout,
         mesh_xy=mesh_xy,
-        meta=meta,
+        meta=current_meta,
         mm=mm,
         nb=nb,
         nk=nk,
@@ -1556,6 +1557,7 @@ def screen_general_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym, snapsh
         pencil_program=pencil_program,
         ph=ph,
         phases=phases,
+        plan=plan,
         pm=pm,
         pn=pn,
         print_fn=print_fn,
