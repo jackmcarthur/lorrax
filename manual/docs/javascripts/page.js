@@ -12,7 +12,17 @@
     const h2s = [...root.querySelectorAll('h2')].filter(h => h.querySelector('.n'));
     const cards = root.querySelector('.section-cards');
     if (cards && h2s.length) {
-      cards.innerHTML = h2s.map(h => {
+      // Consecutive "Reference: ..." sections share one card that lists each of them.
+      const isRef = h => /^Reference\b/.test(h.textContent.replace(h.querySelector('.n').textContent, '').trim());
+      const groups = [];
+      h2s.forEach(h => { const last = groups[groups.length - 1]; if (isRef(h) && last && isRef(last[0])) last.push(h); else groups.push([h]); });
+      cards.innerHTML = groups.map(g => {
+        if (g.length > 1) {
+          const ns = g.map(h => h.querySelector('.n').textContent.trim());
+          const list = g.map((h, i) => `<div class="cs"><span>${ns[i]}</span>${h.textContent.replace(ns[i], '').trim().replace(/^Reference:\s*/, '').replace(/^./, c => c.toUpperCase())}</div>`).join('');
+          return `<a href="#${g[0].id}"><div><span class="cn">${ns[0]}–${ns[ns.length - 1]}</span><span class="ct">Reference</span></div><div>${list}</div></a>`;
+        }
+        const h = g[0];
         const n = h.querySelector('.n').textContent.trim(), title = h.textContent.replace(n, '').trim();
         const subs = [];
         let s = h.nextElementSibling;
