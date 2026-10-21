@@ -131,7 +131,8 @@ def _share_general_pencil(model, error, *, owner_rank, price, shape):
         record[:] = np.frombuffer(payload, np.uint8)
     status = json.loads(np.asarray(all_gather_processes(record))[owner_rank].tobytes())
     if status["error"] is not None:
-        raise ValueError("GATE shared_general_owner: "+status["error"])
+        raise ValueError(f"GATE shared_general_owner: owner_rank={owner_rank}, "
+                         f"reduced_shape={shape}: "+status["error"])
     result = []
     for i, shape in enumerate(status["shapes"]):
         array = (np.ascontiguousarray(arrays[i], dtype=np.complex128) if rank == owner_rank
