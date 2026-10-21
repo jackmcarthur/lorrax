@@ -1,0 +1,52 @@
+{
+  "schema": "device_W_replay_startup_failures_v1",
+  "status": "NO_NEW_FULL_W_TIMING_OR_MODEL_ADMISSION_FROM_THESE_ATTEMPTS",
+  "source_revision": "de5d6d8",
+  "source_archive_sha256": "9e2a4aaa4bea002ed33cfc206aff0220f96dd5d7957f996f7c98bffe412e3efb",
+  "gpu_count": 16,
+  "physical_steps": 0,
+  "jobs": [
+    {
+      "job": 60078936,
+      "state": "FAILED",
+      "allocation_seconds": 157,
+      "driver_step_seconds": 147,
+      "failure": "Private pre-map harness omitted source capacity.live_stages binding; native capacity gate refused before chi. Driver arrays were included in measured baseline; no ledger-owned predecessor exists at this boundary. Harness now declares an empty predecessor set and reads current room. No capacity gate bypass."
+    },
+    {
+      "job": 60079068,
+      "state": "CANCELLED_BY_OPERATOR",
+      "allocation_seconds": 188,
+      "driver_step_seconds": 184,
+      "failure": "Startup blocked before application output. Compute-node process inspection found uninterruptible I/O waits, including ln of the home-directory CUDA runtime link and Python startup, negligible CPU/RSS. SSH remained connected. Operator cancelled rather than retaining idle GPUs; this is not a numerical W failure."
+    },
+    {
+      "job": 60079225,
+      "state": "FAILED",
+      "allocation_seconds": 224,
+      "driver_step_seconds": 211,
+      "failure": "Runtime preflight passed all four nodes; chi stream ran. Extracted fit helper then raised NameError: plan is not defined in the uncached current-moment call. Fixed by explicitly passing current plan and current_meta, integration commit985b792; native tiny uncached-moment regression passes. No completed W timing/model result."
+    },
+    {
+      "job": 60079908,
+      "state": "FAILED_PREFLIGHT",
+      "source_revision": "a289c39",
+      "allocation_seconds": 16,
+      "staging_step_seconds": 13,
+      "failure": "Three node runtime imports passed; nid003441 exceeded the10s preflight cap. Native driver did not run. Next reviewed client excludes that node and permits30s preflight while retaining an overall staging cap."
+    }
+  ],
+  "combined_reserved_GPUh": 2.6,
+  "all_allocations_released": true,
+  "accounting_scope": "These four failed attempts only; successful same-W rate replays and later runs are separate. Driver/staging/extern lifetimes are contained in allocation cost and are not additive. Startup process lifetime is not GPU numerical utilization.",
+  "followup": {
+    "fixed_source_revision": "a289c393a47ac890609247b06c40309f786c316c",
+    "fixed_source_archive_sha256": "3c14264dd91bffd2b1344a4f514547c2e83f7ab224b13f91d15becfe6c5ed822",
+    "cold_and_held_benchmark_helper_sha256": "6b77e47b293cdfc75ca662511c2a07c23d0143814cb20387f81f7174be0a5188",
+    "helper_repository_path": "../diagnostics/benchmark_general_screen_device.py",
+    "combined_launcher_sha256": "dcc52cf7c3db1625bc56832cb6ba8321aa586ee740dd62edcb77b8115b7391d9",
+    "scope": "Separate cold/held W and saved-W spectral statuses; no physical trajectory or automatic number/Pauli admission. No future result asserted here."
+  },
+  "raw_logs_root": "/pscratch/sd/j/jackm/cs_claude/coll_stab/mgkba_20261019/qgrid_20261020",
+  "raw_log_pattern": "screen_device_JOBID.log; allocation and tmux records under the same owned campaign"
+}

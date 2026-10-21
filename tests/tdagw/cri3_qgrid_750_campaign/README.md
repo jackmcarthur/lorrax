@@ -366,3 +366,12 @@ full44×44 both-retarded branch matrices at those common energies, then saves
 only the selected k, raw widths `i(R-R†)` and their unclipped eigenvalues.
 This supplies data missing from row/column on-shell tables. There are no
 matrix roots, new collision closure, extra on-shell sweep or PSD assertion.
+
+`diagnostics/benchmark_general_screen_device.py` preserves the bounded native
+pre-map screening benchmark. It authenticates the accepted frame and saved
+t0 projector, then reconstructs all16 current W rows twice: cold and with
+held numerical fit spaces. Current response, poles/residues and checks are
+recomputed on both calls; source band extrapolation is not disabled. It
+stops before Sigma or propagation. The explicit pilot W fit tolerance is5%,
+not a material convergence claim. Invocation requires a separately reviewed
+native launcher, provenance environment and wall cap; it submits no jobs.
