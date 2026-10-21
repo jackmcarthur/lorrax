@@ -288,9 +288,21 @@ the Galerkin fit's, enters the htransform's basis and is Fourier-interpolated
 as $f(H)$ is (`bandstructure.orbital.interpolate_band_operator`), then
 contracted with the same fine eigenvectors $U_q$ that build the densified ψ:
 
-$$v_B(k) = C_k^{T}\, v(k)\, C_k^{*},\qquad
+$$v_B(k) = C_k^{T}\, g\, v(k)\, g\, C_k^{*},\qquad
 V_R = \frac{1}{N_k}\sum_k e^{2\pi i k\cdot R}\, v_B(k),\qquad
-v(q) = U_q^\dagger\, \mathrm{Herm}\Big[\sum_R e^{-2\pi i q\cdot R} V_R\Big]\, U_q .$$
+v(q) = G_q^{-1}\, U_q^\dagger\, \mathrm{Herm}\Big[\sum_R e^{-2\pi i q\cdot R} V_R\Big]\, U_q\, G_q^{-1} .$$
+
+The weight $g = g(\varepsilon)$ (`bse_densify.velocity_weight`) is
+$1 - e^{-x^2}$, $x = (E_{\rm cut} - \varepsilon)/w$, and zero above
+$E_{\rm cut}$, the lowest energy of the first band above the fit window;
+$w$ is half the distance from the BSE window's top to $E_{\rm cut}$, so
+$g \ge 1 - e^{-4}$ on the window, and $G_q = g$ of the window block of the
+file's $f(H)$ in the fine states. When the fit window's top band meets that
+band the window projector jumps where they cross and the unweighted $v$ is
+not smooth in k (Si 4³→8³, 36 of 100 bands: outer-shell image 26 % against
+1.9 % for $f(H)$; window-sum $|p|^2$ off-grid 6.1 % rms, weighted 2.4 %).
+A fit window whose top stays below every unfitted band takes $g \equiv 1$,
+bit for bit the unweighted route; on-grid both are exact.
 
 The energies are the velocity's own. On the DFT path the fine states
 diagonalize the file's $f(H)$, each state's energy is its Rayleigh quotient,
@@ -455,6 +467,8 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE velocity_wfn_fingerprint` | `file_io.dipole.require_dipole_wfn_fingerprint` (from `velocity_stamp` and `absorption_common.window_dipoles`) | a `--dipole` that is not the deck WFN's: under `bse_k_grid` e.g. the fine grid's own `dipole.h5` (read before the htransform fit); on an undensified run another WFN's file with the same k list, or a file with no `prov_wfn_sha256` |
 | `GATE densified_dipoles` | `absorption_common.window_dipoles` | a `bse_k_grid` bundle whose dipoles were not built from `--dipole` (loaded without `velocity_file`) |
 | `GATE densified_velocity_bands` | `bse_densify.densified_dipoles` | a velocity file with fewer bands than the htransform window |
+| `GATE densified_velocity_weight` | `bse_densify.densified_dipoles` | an unfitted band reaching the BSE window's top, or a velocity weight below 1e-3 of its maximum in the fine window |
+| `GATE dipole_band_window` | `file_io.dipole.require_dipole_bands` (`absorption_common.window_dipoles` and `slice_dipole_to_bse_window`, `gw.qsgw_head.head_source`) | a `dipole.h5` whose stored bands (`band_min`/`band_max`, else `[0, nb)`) do not cover the window from band 0 |
 | `GATE densified_position_gap` | `bse_densify.densified_dipoles` | `--eqp` fine states whose DFT eigenbasis puts a conduction row at or below a valence row |
 | `GATE densified_pair_rule` | `bse_densify.densified_dipoles` | a pair rule other than `mask`, `cut`, `cv` |
 | `GATE densified_dipole_gap` | the same | a non-positive $E_c - E_v$ in the velocity's own energies |

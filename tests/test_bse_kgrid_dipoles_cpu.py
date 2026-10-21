@@ -15,12 +15,15 @@ away.  Run with
 3. Under a scissor the fine states come from the QP f(H) while ``r = v/ΔE``
    keeps the velocity file's energies: the dipoles do not move with the QP
    energies, and dividing by the QP ΔE (the red twin) would.
-4. A permuted fine q list fires ``GATE densified_dipole_on_grid``;
+4. A fit window whose top band meets an unfitted band carries the velocity
+   weighted (exact on-grid, closer off-grid than unweighted).
+5. A permuted fine q list fires ``GATE densified_dipole_on_grid``;
    ``window_dipoles`` refuses a densified bundle without its own dipoles, an
    undensified bundle whose dipole has another k list, and one whose dipole
    is stamped for another WFN (or not stamped), or whose bands do not
    cover the window (``GATE dipole_band_window``).
 """
+import sys
 from types import SimpleNamespace
 
 import h5py
@@ -192,6 +195,76 @@ def test_scissor_keeps_the_velocity_energies():
     # Red twin: the QP ΔE in the denominator is off by ΔE_DFT/ΔE_QP.
     wrong = sc["d_alpha"] * sc["de_cv"][None] / de_qp[None]
     assert _rel(np.abs(wrong), np.abs(dft["d_alpha"])) > 0.2
+
+
+def _densify_entangled(mesh, top_onsite, hop_top):
+    """A 16-orbital toy, 14 fitted bands, BSE window [2, 6): six guard bands.
+
+    The velocity file holds all 16 bands, as ``psp.get_dipole_mtxels`` does,
+    so ``densified_dipoles`` can see where the fit window's top band meets
+    the first unfitted one.  Returns ``(dip, fine, rel)``, ``rel`` against
+    the exact dipoles in the densified states' gauge.
+    """
+    onsite = np.r_[np.linspace(-1.6, -0.7, 4), np.linspace(0.6, 1.5, 4),
+                   np.linspace(1.8, 3.3, 6), top_onsite]
+    m, nb = len(onsite), 14
+    rng = np.random.default_rng(3)
+    a = rng.standard_normal((m, m)) + 1j * rng.standard_normal((m, m))
+    h = {(0, 0): np.diag(onsite) + 0.02 * (a + a.conj().T)}
+    for r in ((1, 0), (0, 1), (1, 1), (1, -1)):
+        b = 0.05 * (rng.standard_normal((m, m)) + 1j * rng.standard_normal((m, m)))
+        b[12:, 12:] *= hop_top / 0.05          # the top orbitals disperse strongly
+        h[r], h[(-r[0], -r[1])] = b, b.conj().T
+    kc = _grid(KC)
+    ph = np.exp(2j * np.pi * np.random.default_rng(11).random((len(kc), m)))
+    mod = sys.modules[__name__]
+    saved = mod.NB
+    try:
+        mod.NB = m
+        c_all, e_all, v_all = _states(h, kc, phases=ph)
+        mod.NB = nb
+        c, e = c_all[:, :nb], e_all[:, :nb]
+        nodes = _nodes(c)
+        with xla_reference():
+            fine = compute_wfns_fi(
+                ctilde=jnp.asarray(c), B_at_mu=nodes, enk_sigma=jnp.asarray(e.T),
+                kgrid_co=KC, kgrid_fi=KF, band_window_fi=(B_MIN, B_MAX),
+                mesh_xy=mesh, return_coeffs=True)
+            dip = densified_dipoles(
+                (v_all, e_all, "toy dH/dk", "toy.h5"), sym=_sym(kc), fh_energies=e,
+                basis=SimpleNamespace(ctilde=jnp.asarray(c), band_range=(0, nb),
+                                      basis_at_nodes=nodes),
+                fine=fine, coarse_grid=KC, n_val=N_VAL, window_start=B_MIN,
+                a_band_index=None, mesh_xy=mesh, log_fn=lambda *a: None)
+        ref, _ = _exact_rotated(h, fine)
+    finally:
+        mod.NB = saved
+    return dip, fine, _rel(dip["d_alpha"], ref)
+
+
+def test_entangled_window_top_weights_the_velocity(monkeypatch):
+    """The fit window's top band meets an unfitted band (Si: 36 of 100).
+
+    The projected velocity is then not smooth in k, so it is carried as
+    g v g (``bse_densify.velocity_weight``, zero above the first unfitted
+    band's lowest energy) and g is divided back in the fine window: the
+    on-grid identity stays exact and the off-grid dipoles are closer to the
+    exact ones than the unweighted route (g = 1, the control).  An isolated
+    window top keeps the unweighted route (no weight recorded).
+    """
+    import bse.bse_densify as bse_densify
+    mesh = _mesh()
+    iso, _, rel_iso = _densify_entangled(mesh, (6.0, 6.3), 0.05)
+    assert iso["velocity_weight"] is None and rel_iso < 0.02
+    dip, _, rel = _densify_entangled(mesh, (3.4, 3.6), 0.25)
+    w = dip["velocity_weight"]
+    assert w is not None and w["floor"] > 0.9
+    assert dip["on_grid_rel"] < 1e-12 and dip["on_grid_state_dev"] < 1e-8
+    monkeypatch.setattr(bse_densify, "velocity_weight",
+                        lambda e, *a: np.ones_like(np.asarray(e, dtype=np.float64)))
+    flat, _, rel_flat = _densify_entangled(mesh, (3.4, 3.6), 0.25)
+    assert flat["on_grid_rel"] < 1e-12
+    assert rel < 0.6 * rel_flat                 # measured 0.118 vs 0.242
 
 
 def test_permuted_q_list_fires_the_on_grid_gate():

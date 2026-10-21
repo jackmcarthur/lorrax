@@ -5,6 +5,39 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — `bse_k_grid` dipoles: weighted velocity at an entangled fit-window top; `dipole.h5` band range
+
+The densifier carries the coarse velocity through the htransform as
+`g v g` when the fit window's top band meets the first unfitted band, and
+divides `g` back in the fine window (`bse_densify.velocity_weight`,
+`_velocity_from_weighted`). `g = 1 − exp(−x²)`, `x = (E_cut − ε)/w`, zero
+above `E_cut` = the first unfitted band's lowest energy; `w` = half the
+distance from the BSE window's top to `E_cut`. There the window projector
+jumps where bands cross, and the unweighted velocity is not smooth in k (Si
+4³→8³, 36 of 100 bands: image outer shell 26 % against 1.9 % for f(H)). A
+window top that stays below every unfitted band keeps the unweighted route
+bit for bit, and the on-grid identity stays exact either way.
+
+- **Results move.** `bse_k_grid` dipoles when the velocity file holds bands
+  above the fit window and they are entangled with it (every production
+  deck so far). Si 4³→8³ kg_srlr, momentum operator, against the explicit 8³
+  dipoles: window-sum |p|² off-grid rms 6.1 % → 2.4 %; with the default
+  Rayleigh-quotient dipoles |d|² 6.5 % → 2.9 % rms (max 20 % → 4.6 %) and
+  IP ε₂ 1.4 % → 0.86 % rms of peak. Exciton energies do not move.
+- **Gate.** `GATE densified_velocity_weight`: an unfitted band at or below the
+  BSE window's top, or a weight below 1e-3 in the fine window. Fix: raise
+  `ncond`.
+- **`dipole.h5`.** Every writer stamps `band_min = 0`, `band_max = nb` (the
+  absolute band range of the stored axis; `nbands` stays the WFN's count).
+  No regeneration: an unstamped file reads `[0, nb)`. `GATE
+  dipole_band_window` (`file_io.dipole.require_dipole_bands`) refuses a file
+  that does not cover the reader's window from band 0: the BSE slicer
+  (`absorption_common.slice_dipole_to_bse_window`, so `window_dipoles`,
+  `exciton_bands` and `w_ladder`) and `head_dense_file`. A short file used to
+  slice to fewer conduction bands without a word.
+- **Test.** `tests/test_bse_kgrid_dipoles_cpu.py`
+  (`test_entangled_window_top_weights_the_velocity`, band-window refusals).
+
 ## 2026-10-20 — BSE q=0 screened head uses the exact band overlaps (opt-in loader mode)
 
 At q = 0, G = 0 the direct-kernel pair densities are band overlaps,
