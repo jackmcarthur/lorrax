@@ -10,7 +10,7 @@ space (so H is Hermitian) and the exchange V positive:
   8 eigenvalues of the operator to 0.01 meV, against a full-Krylov single-vector
   Lanczos (120 of 128 steps, full CGS2) on the same payload and against ``eigvalsh`` of the
   operator assembled column by column from the same matvec; the Davidson stop is
-  CONVERGED.  The red twin is the old fixed 30-step Lanczos default, which misses the
+  CONVERGED.  The control variant, the old fixed 30-step Lanczos default, misses the
   0.01 meV mark.  (The matvec count is not a criterion here: on a 128-dimensional toy a
   full Krylov space is cheap.  The Si 8^3 counts are in the track report.)
 * ``keep_W_R``: a second solve on the kept ``W_R`` repeats the first bit for bit, and
@@ -150,7 +150,7 @@ def run_cases(mesh):
     out["davidson_vs_lanczos_meV"] = float(np.max(np.abs(ev_d - ev_l)) * RY_MEV)
     out["davidson_vs_dense_meV"] = float(np.max(np.abs(ev_d - exact)) * RY_MEV)
     out["lanczos_vs_dense_meV"] = float(np.max(np.abs(ev_l - exact)) * RY_MEV)
-    out["red_twin_lanczos30_vs_dense_meV"] = float(np.max(np.abs(ev_l30 - exact)) * RY_MEV)
+    out["control_lanczos30_vs_dense_meV"] = float(np.max(np.abs(ev_l30 - exact)) * RY_MEV)
 
     n_iter = 20
     a1, b1, n1 = haydock_coefficients(data, mesh, ops["d"], n_iter)          # eigensolve's W_R
@@ -210,7 +210,7 @@ def main() -> int:
         f"Davidson vs Lanczos <= {TOL_MEV} meV": out["davidson_vs_lanczos_meV"] <= TOL_MEV,
         f"Davidson vs dense <= {TOL_MEV} meV": out["davidson_vs_dense_meV"] <= TOL_MEV,
         "Lanczos reference vs dense <= 1e-6 meV": out["lanczos_vs_dense_meV"] <= 1e-6,
-        f"red twin: 30-step Lanczos misses {TOL_MEV} meV": out["red_twin_lanczos30_vs_dense_meV"] > TOL_MEV,
+        f"control variant: 30-step Lanczos misses {TOL_MEV} meV": out["control_lanczos30_vs_dense_meV"] > TOL_MEV,
         "second solve on kept W_R bitwise": out["second_solve_on_kept_W_R_bitwise"],
         "Haydock on eigensolve payload == standalone (1e-12)": out["haydock_combined_vs_standalone"] <= 1e-12,
         "Haydock vs dense recurrence (1e-9)": out["haydock_vs_dense"] <= 1e-9,
