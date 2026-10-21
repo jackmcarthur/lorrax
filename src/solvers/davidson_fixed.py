@@ -118,8 +118,15 @@ def _whiten(p, normalizer):
     return normalizer.constrain(result), rank
 
 
-def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, budget, stall_patience):
-    """Only small correction blocks cross conditionals; capacity buffers alias."""
+def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, budget, stall_patience,
+               lock_converged=False):
+    """Only small correction blocks cross conditionals; capacity buffers alias.
+
+    ``lock_converged``: a root whose residual already passes the test adds no
+    correction (soft locking), so the whitening drops its row and H is applied
+    only to the corrections of unconverged roots.  Its Ritz pair stays in the
+    basis and is re-tested every iteration.
+    """
     def step(st):
         v, hv, h, m = st.basis, st.images, st.projected, st.size
         e, c = subspace.eigh(h, m)
@@ -140,6 +147,9 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
 
         def correction(_):
             p = precondition(data, residual, e, x)
+            if lock_converged:
+                open_ = norms >= tolerance*jnp.maximum(1., jnp.abs(e))
+                p = jnp.where(open_.reshape((block,)+(1,)*(x.ndim-1)), p, jnp.zeros((), p.dtype))
             finite_correction = jnp.all(jnp.isfinite(p))
             p = jax.lax.cond(
                 restart, lambda p: normalizer.orthogonalize(x, p, block),
@@ -170,7 +180,8 @@ def _make_step(apply_h, precondition, subspace, normalizer, block, capacity, dat
     return step
 
 
-def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vector_sharding=None):
+def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vector_sharding=None,
+                  lock_converged=False):
     """Plan a complex128 local solver before solver compilation.
 
     ``apply_h(data, vectors)`` preserves ``(rows, *vector_shape)`` and must
@@ -182,6 +193,7 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
     ``capacity >= 2*n_eig`` is explicit; no iteration changes an array shape.
     There is no hidden default capacity or persistent compilation cache.
     The service resolves CUDA active BLAS or the CPU compatibility provider.
+    ``lock_converged`` turns on soft locking (:func:`_make_step`).
     """
     if not isinstance(n_eig, int) or not isinstance(capacity, int):
         raise TypeError('n_eig and capacity must be Python integers')
@@ -221,7 +233,8 @@ def plan_davidson(apply_h, precondition, *, n_eig, capacity, vector_shape, vecto
                        jnp.zeros(block), jnp.full(block, jnp.inf), jnp.where(rank == block, block, 0).astype(jnp.int32), jnp.int32(0), jnp.asarray(jnp.inf), jnp.int32(0))
         result = jax.lax.while_loop(
             lambda st: (st.status == RUNNING) & (st.iterations < max_iterations),
-            _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, max_iterations, stall_patience), state)
+            _make_step(apply_h, precondition, subspace, normalizer, block, capacity, data, tolerance, max_iterations, stall_patience,
+                       lock_converged=lock_converged), state)
         info = DavidsonInfo(result.status, result.iterations, result.matvecs,
                             result.restarts, result.size, result.residuals)
         return result.values, result.vectors, info

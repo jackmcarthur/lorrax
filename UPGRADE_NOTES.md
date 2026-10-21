@@ -5,6 +5,53 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — BSE lowest-N default is Davidson with a residual stop; Haydock runs in the eigensolve's process
+
+`bse_jax --lanczos --tda` now solves the `--n-eig` lowest roots with block
+Davidson (`--solver davidson`): the exact assembled diagonal preconditioner
+(`--davidson-precond exact`), soft locking (a root under the tolerance adds no
+correction, `solvers.plan_davidson(lock_converged=True)`), and a stop when
+every root's residual `||Hx - Ex||` is below `--davidson-tol-mev` (0.01 meV;
+an exact eigenvalue lies within the residual). The old default, single-vector
+Lanczos at a fixed Krylov dimension, is `--solver lanczos`. On the Si 8^3 SOC
+deck (8v x 8c, 512 k, dimension 32768, N_mu 1100, lowest 40), counted on the
+dense operator assembled from the loader's own operands (whose tight
+eigenvalues equal the GPU 1600-step Lanczos to 6e-12 meV): 19 iterations,
+265 H applications against 1600, eigenvalues within 8.5e-8 meV of the
+reference. Without locking the same solve takes 640-800.
+
+- **Results move** by the solver's residual only: 8.5e-8 meV on Si 8^3. hsuite
+  `bse`/`bse_bisp` already ran Davidson; they now use the exact diagonal and
+  the 0.01 meV stop (was 1e-8 Ry). The move is bounded by the residual, far
+  inside `ATOL["bse_ev"]` (0.1 meV); the GPU hsuite gate has not run yet.
+- **Command lines.** A flag only another solver reads now refuses
+  (`--lanczos-rtol`, `--lanczos-check-every`, `--n-reorth`, `--block-size` are
+  Lanczos's; `--davidson-*` Davidson's; `--trlan-*` TRLan's): a line that tuned
+  the Lanczos recurrence must say `--solver lanczos`. `--max-lanczos-iter` is
+  the Davidson iteration cap. `--davidson-precond exact` also works under
+  `--rpa` (diagonal `dE + V_x/nk`).
+- **One process for eigensolve + absorption.** `--haydock-iter N` (with `--tda
+  --dipole`) runs `bse.absorption_haydock`'s recursion after the eigensolve on
+  the same payload and the solve's `W_R` (`solve_bse_sharded(keep_W_R=True)`),
+  writing the same `absorption_haydock.h5` and `absorption_haydock_b*_eh.dat`;
+  `--haydock-pol`, `--haydock-eta-ev`, `--haydock-omega-*`, `--haydock-n-omega`,
+  `--haydock-n-spin`, `--haydock-no-eps1`, `--haydock-out-prefix` mirror the
+  standalone flags, and the cell volume is the deck WFN's. This drops the second
+  process's startup, restart load (25 s with `bse_k_grid` htransform + densify
+  on Si 8^3), W transform and compiles.
+- **Haydock.** `absorption_haydock --pol` (default `xyz`) recurses a subset of
+  polarizations, one matvec each per step (`x` alone for cubic crystals); the h5
+  arrays carry one column per polarization run and a `polarizations` attribute.
+  The standalone route transforms `W_q` with it donated (one `(mu, nu, k)` tile
+  per rank instead of two), places the seed block on the trial layout, and
+  keeps the Lanczos vectors on it (main's step all-gathered the residual block
+  for its norm). The IP JDOS builds one Lorentzian for all polarizations in
+  bounded blocks (`absorption_common.LORENTZ_BLOCK_ELEMENTS`): Si 8^3, 4001
+  omegas, 6.35 s -> 2.09 s on four cores, and no `n_omega x n_transitions`
+  host array.
+- **Test.** `tests/test_bse_default_solver.py` (script; 1x1 on a login node,
+  2x2 with at least 8 host threads).
+
 ## 2026-10-20 — BSE q=0 screened head uses the exact band overlaps (opt-in loader mode)
 
 At q = 0, G = 0 the direct-kernel pair densities are band overlaps,

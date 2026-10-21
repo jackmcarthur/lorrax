@@ -489,14 +489,30 @@ def build_dipole_vector_bse(d_alpha, n_cond_pad=None, n_val_pad=None):
     return out
 
 
+#: Elements of one (n_omega, states) Lorentzian block: 2^24 float64 = 128 MiB.
+LORENTZ_BLOCK_ELEMENTS = 1 << 24
+
+
 def lorentzian_broaden(omegas, energies, weights, eta):
-    """ε(ω) = Σ_i weights[i] · η/π / ((ω - E_i)² + η²)."""
+    """ε(ω) = Σ_i weights[i] · η/π / ((ω - E_i)² + η²).
+
+    ``weights`` is ``(n_states,)`` or ``(n_states, m)`` (one column per
+    polarization), so one Lorentzian serves every column.  The
+    ``(n_omega, n_states)`` kernel is formed in state blocks of at most
+    :data:`LORENTZ_BLOCK_ELEMENTS`: a whole kernel is ``n_omega`` x the number of
+    transitions (4001 x 32768 = 1.0 GB on Si 8^3; 4000 x 1e7 = 320 GB at a
+    production window), which is host memory nothing priced.
+    """
     omegas = np.asarray(omegas)
-    energies = np.asarray(energies)
+    energies = np.asarray(energies).reshape(-1)
     weights = np.asarray(weights)
-    delta = omegas[:, None] - energies[None, :]
-    L = (eta / np.pi) / (delta * delta + eta * eta)
-    return L @ weights
+    out = np.zeros((omegas.size,) + weights.shape[1:],
+                   dtype=np.result_type(weights.dtype, np.float64))
+    step = max(1, LORENTZ_BLOCK_ELEMENTS // max(1, omegas.size))
+    for i in range(0, energies.size, step):
+        delta = omegas[:, None] - energies[None, i:i + step]
+        out += ((eta / np.pi) / (delta * delta + eta * eta)) @ weights[i:i + step]
+    return out
 
 
 def jdos_from_transitions(d_alpha, de_cv, omegas_Ry, V_cell, n_k, eta_Ry,
@@ -517,11 +533,10 @@ def jdos_from_transitions(d_alpha, de_cv, omegas_Ry, V_cell, n_k, eta_Ry,
     pref = 16.0 * np.pi ** 2 / (V_cell * n_k * n_spin * n_spinor)
     de_flat = np.asarray(de_cv).flatten()
     f_alpha = (np.abs(np.asarray(d_alpha)) ** 2).astype(np.float64)
-    jdos = np.zeros((np.asarray(omegas_Ry).size, 3), dtype=np.float64)
-    for a in range(3):
-        jdos[:, a] = pref * lorentzian_broaden(
-            omegas_Ry, de_flat, f_alpha[a].flatten(), eta_Ry)
-    return jdos
+    # One Lorentzian for the three polarizations (it used to be built per
+    # polarization, whole: 3 x n_omega x n_transitions on the host).
+    return pref * lorentzian_broaden(
+        omegas_Ry, de_flat, f_alpha.reshape(f_alpha.shape[0], -1).T, eta_Ry)
 
 
 def kramers_kronig_eps1(omegas, eps2):

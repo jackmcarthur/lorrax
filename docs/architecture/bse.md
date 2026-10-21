@@ -262,12 +262,12 @@ per rank. The fused kernel runs at 2.27× the flop floor.
 | route | driver flags | module | use |
 |---|---|---|---|
 | FEAST | no `--lanczos`; `--tda` or not | `bse.bse_feast` | contour eigensolve in KPM-sized windows |
-| Lanczos, block Lanczos | `--lanczos --tda` | `bse_lanczos.solve_bse_sharded` | spectrum shape; CGS2 reorthogonalization, full window by default |
-| Davidson | `--lanczos --tda --solver davidson` | `solvers.davidson.davidson`, preconditioner and start subspace from `bse.bse_davidson_helpers` | per-state convergence |
+| Davidson (default) | `--lanczos --tda` | `solvers.davidson.davidson` with `lock_converged`, the exact diagonal preconditioner and start subspace from `bse.bse_davidson_helpers` | lowest `--n-eig` roots, stopped when every residual is below `--davidson-tol-mev` (0.01 meV) |
+| Lanczos, block Lanczos | `--lanczos --tda --solver lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; fixed Krylov dimension, CGS2 reorthogonalization, full window by default |
 | thick-restart Lanczos | `--lanczos --tda --solver trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `--trlan-m-max` |
 | full BSE | `--lanczos` without `--tda` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve, N ≤ 4096 |
 | density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
-| absorption | `python -m bse.absorption_haydock` | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
+| absorption | `python -m bse.absorption_haydock`, or `bse_jax --haydock-iter N` after the eigensolve | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
 
 Without `--tda`, `--lanczos` ignores `--solver`, `--block-size` and
 `--n-reorth` without a message (`bse/bse_lanczos.py:118-121`).
@@ -364,8 +364,13 @@ also drop $[\Delta H, \mathcal W]$, which for a diagonal $\Delta H$ is the term
 that keeps $r^{QP} = r^\mathrm{DFT}$. The dipole must carry $-i[r, V_\mathrm{NL}]$.
 
 `absorption_haydock` always uses the TDA BSE kernel, D + V − W, and needs at
-least two devices. It seeds one Lanczos recursion per polarization; the three
-seeds are one trial block of the stack matvec. It does not reorthogonalize and
+least two devices. It seeds one Lanczos recursion per polarization; the seeds
+(`--pol`, default `xyz`; each costs one matvec per step, and `x` alone is the
+spectrum of a cubic crystal) are one trial block of the stack matvec. The
+recursion (`haydock_coefficients`) reuses a payload's `W_R` when the eigensolve
+kept it, which is how `bse_jax --haydock-iter` runs it in the same process;
+the standalone route transforms `W_q` once with it donated, as the eigensolve
+does. It does not reorthogonalize and
 runs 200 steps by default. Claim 2848 measured the solver on CrI3 8×8×1 SOC
 (with bare V as W) against a 500-state sum over states plus a
 deflated CGS2 tail: at 200 steps both the plain and the CGS2 recursion agree

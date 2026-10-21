@@ -58,6 +58,12 @@ def iters_reported(n_iter_done, budget: int) -> int:
     return int(budget) if n < 0 else n
 
 
+from common.units import RYD_TO_EV
+
+#: The Davidson residual tolerance of the default lowest-N solve, meV.
+DAVIDSON_TOL_MEV = 0.01
+RY_TO_MEV = RYD_TO_EV * 1.0e3
+
 from .bse_ring_comm import make_bse_shardings
 from .bse_head import head_shifted_eps_c
 import common.timing as timing
@@ -83,7 +89,9 @@ def solve_bse_sharded(
     trlan_n_keep: int | None = None,
     davidson_n_random_init: int = 5,
     davidson_eps_shift_Ry: float = 1e-3,
+    davidson_tol_Ry: float = DAVIDSON_TOL_MEV / RY_TO_MEV,
     tda: bool = True,
+    keep_W_R: bool = False,
 ) -> Tuple[jax.Array, jax.Array]:
     """The BSE eigensolve (Lanczos / block / Davidson / TRLan) on any mesh.
 
@@ -113,6 +121,17 @@ def solve_bse_sharded(
     dispatches to the structure-preserving full-BSE eigensolver
     ``bse_nontda.solve_bse_nontda_sharded`` — the ONE non-TDA seam, no parallel
     solver stack — which returns paired (X, Y) eigenvectors (X^H X - Y^H Y = +1).
+
+    ``davidson_tol_Ry`` is the Davidson stopping rule: every root's residual
+    norm ``||H x - θ x||`` below it (times ``max(1, |θ|)``).  For a Hermitian H
+    a residual r puts an exact eigenvalue within ``||r||`` of θ, so the default,
+    0.01 meV, bounds each root's error by 0.01 meV without assuming a gap; the
+    usual error is ``||r||^2 / gap``, far smaller.
+
+    ``keep_W_R`` leaves the transformed screened kernel on the payload as
+    ``data["W_R"]`` (one (μ, ν, k) tile per rank, the solve's own) for a second
+    consumer in the same process (``bse_jax --haydock-iter``); a payload that
+    already carries ``W_R`` is solved on it without a second transform.
     """
     if os.environ.get("LORRAX_LANCZOS_REORTH", "").strip():
         raise ValueError("LORRAX_LANCZOS_REORTH is retired: CGS2 is the only reorthogonalisation route; unset it")
@@ -191,7 +210,9 @@ def solve_bse_sharded(
     # donated jit lets XLA alias W_R onto W_q's buffer and lets the caller
     # drop the Python reference, so only ONE copy survives into the solve.
     # Value-identical: same helper, same axes, same norm, same operand.
-    if include_W:
+    if include_W and data.get("W_R") is not None:
+        W_R = data["W_R"]               # a previous solve's transform (keep_W_R)
+    elif include_W:
         with timing.section("bse.solve.W_ifft") as _sec_wifft:
             # The sharded helper, not ``jnp.fft.ifftn``: a plain ifftn on a
             # sharded tensor inserts a 337-MiB all-gather around the FFT under
@@ -219,6 +240,8 @@ def solve_bse_sharded(
             W_R = _W_ifft_donated(data["W_q"])
             data["W_q"] = None          # release the caller-side reference
             _sec_wifft.watch(W_R)
+        if keep_W_R:
+            data["W_R"] = W_R
     else:
         W_R = data["W_q"]
 
@@ -256,11 +279,8 @@ def solve_bse_sharded(
         # sharding, ZERO collectives, no new shard_map, no retrace.
         _diag_H = None
         if davidson_precond == "exact":
-            if _W_q0 is None:
-                raise ValueError(
-                    "--davidson-precond exact needs the W term; this run has "
-                    "include_W=False, so diag(H) is just dE and the bare "
-                    "route is already exact.")
+            # include_W=False (RPA): _W_q0 is None and the build emits no
+            # screened-direct term, so the diagonal is dE + w V_x / nk.
             from .bse_davidson_helpers import build_bse_exact_diagonal
             from .bse_davidson_helpers import exact_diagonal_memo_stats
             _memo_before = exact_diagonal_memo_stats()["hits"]
@@ -271,7 +291,7 @@ def solve_bse_sharded(
                 _diag_H.block_until_ready()
             _memoised = exact_diagonal_memo_stats()["hits"] > _memo_before
             print(f"Davidson preconditioner: EXACT diag(H) "
-                  f"(dE + (V_x - W_d)/nk), "
+                  f"(dE + (V_x{' - W_d' if include_W else ''})/nk), "
                   f"{'from memo (same payload)' if _memoised else 'assembled'}",
                   flush=True)
         else:
@@ -334,8 +354,12 @@ def solve_bse_sharded(
             apply_H, n_eig=n_eig, precond_fn=apply_precond, X0=X0,
             data=solver_data,
             m_max=m_max_warm,
-            max_iter=max_iter, tol=atol if atol > 0 else 1e-8,
+            max_iter=max_iter, tol=float(davidson_tol_Ry),
             verbose=True,
+            # Soft locking: a root under the tolerance adds no correction, so H
+            # is applied only to the open roots' directions.  Si 8^3 lowest 40
+            # at 0.01 meV (dense CPU count): 265 H applications, 800 without.
+            lock_converged=True,
         )
 
         # ── perf-campaign probe: trace + history dump (env-gated) ──
@@ -376,12 +400,9 @@ def solve_bse_sharded(
         # bit-identical on every rank — holds because every rank ran the same
         # deterministic reduction to get it.
         eigenvalues = replicate_to_mesh(np.asarray(eigenvalues), mesh_xy)
-        # ``N_ITER_NOT_MEASURED``, not ``max_iter``: the branch this merge
-        # carries was written when this route still returned its budget, and
-        # registered that as its deferred item 4.  ``main`` has since landed
-        # the sentinel (``bse_lanczos.py:49``, read at ``bse_jax.py:212``), so
-        # the deferral is satisfied here and the honest value is kept.
-        return eigenvalues, eigenvectors, jnp.int32(N_ITER_NOT_MEASURED)
+        # The iterations the while_loop actually ran: Davidson stops on its
+        # residual test, so this is a measured count, not the budget.
+        return eigenvalues, eigenvectors, jnp.int32(int(_DAV_HIST["iter"][0]))
 
 
     # ── Thick-restart Lanczos: fixed-shape, memory-capped Krylov ──────────

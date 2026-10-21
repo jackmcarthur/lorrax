@@ -49,7 +49,7 @@ def _default_precond(r, eigenvalues):
 
 def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
              m_max=None, max_iter=100, tol=1e-8, stall_patience=20, verbose=True,
-             data=None):
+             data=None, lock_converged=False):
     """Lowest Hermitian eigenpairs, using fixed-capacity active-only iteration.
 
     ``X0`` has shape ``(n_eig, *vector_shape)``; vector axes retain their
@@ -63,6 +63,8 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
     ``stall_patience`` stops after that many iterations without a 1% reduction
     of the largest residual (zero disables it). Stalling is not convergence.
     Eigenvalues return on the host; eigenvectors preserve distributed storage.
+    ``lock_converged`` stops correcting roots that already pass the test
+    (soft locking: fewer H applications, same stopping rule).
     ``LAST_RUN`` holds one final snapshot and an explicit termination status.
     """
     if X0 is None:
@@ -91,7 +93,8 @@ def davidson(apply_H, *, n_eig, precond_fn=None, init_fn=None, X0=None,
         return apply_H(payload, v) if explicit_data else apply_H(v)
     sharding = initial.sharding if isinstance(initial.sharding, jax.sharding.NamedSharding) else None
     plan = plan_davidson(apply, precondition, n_eig=n_eig, capacity=capacity,
-                         vector_shape=initial.shape[1:], vector_sharding=sharding)
+                         vector_shape=initial.shape[1:], vector_sharding=sharding,
+                         lock_converged=lock_converged)
     started = time.perf_counter()
     values, vectors, info = plan.solve(data if explicit_data else (), initial, tol, max_iter, stall_patience)
     values = gather_to_host(values)

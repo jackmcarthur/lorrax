@@ -54,6 +54,7 @@ _STAGES = (
     ("BSE eigensolve", "bse.eigensolve"),
     ("exciton dipoles", "bse.exciton_dipoles"),
     ("eigenvector write", "bse.write_eigenvectors"),
+    ("Haydock absorption", "bse.haydock"),
 )
 
 
@@ -74,9 +75,10 @@ def _preview_lanczos(
     rtol: float = 0.0,
     check_every: int = 4,
     n_reorth: int = -1,
-    solver_kind: str = "lanczos",
+    solver_kind: str = "davidson",
     davidson_m_max: int | None = None,
-    davidson_precond: str = "bare",
+    davidson_precond: str = "exact",
+    davidson_tol_mev: float = 0.01,
     davidson_olsen: bool = False,
     davidson_eps_shift: float | None = None,
     trlan_m_max: int | None = None,
@@ -84,6 +86,8 @@ def _preview_lanczos(
     tda: bool = True,
     degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
+    haydock: dict | None = None,
+    cell_volume: float | None = None,
     report=None,
     stage_progress=None,
 ) -> dict:
@@ -195,17 +199,22 @@ def _preview_lanczos(
                 if davidson_eps_shift else 1e-3),
             davidson_precond=davidson_precond,
             davidson_olsen=davidson_olsen,
+            davidson_tol_Ry=float(davidson_tol_mev) / (RYD_TO_EV * 1.0e3),
             trlan_m_max=trlan_m_max, trlan_n_keep=trlan_n_keep,
+            keep_W_R=haydock is not None,
         )
         _sec.watch(eigenvalues, eigenvectors)
     # Fixed-iteration routes return N_ITER_NOT_MEASURED; only the
     # convergence-driven route (rtol > 0) reports a real count.  Going
     # through the helper is what keeps the sentinel out of arithmetic.
     n_done = iters_reported(n_iter_done, block_max_iter)
-    if rtol > 0:
+    if rtol > 0 and solver_kind == "lanczos":
         tag = "Block Lanczos" if block_size > 1 else "Lanczos"
         print(f"{tag} exited at iter {n_done}/{block_max_iter} "
               f"(Krylov dim = {n_done * block_size})")
+    if solver_kind == "davidson" and tda:
+        _davidson_report(report, n_eig=n_eig, tol_mev=float(davidson_tol_mev),
+                         budget=block_max_iter)
     if stage_progress is not None:
         stage_progress.step()
     ryd2ev = 13.6056980659
@@ -227,6 +236,20 @@ def _preview_lanczos(
             report.emit(f"  S{index:03d}  "
                         f"{float(value) * ryd2ev:15.5f}")
 
+    d_alpha = de_cv = None
+    if dipole_file is not None and (write_eigs is not None or haydock is not None):
+        from file_io.restart_bundle import read_metadata
+        from .absorption_common import window_dipoles
+        from .bse_io import resolve_n_occ
+        from .bse_window import _parse_wfn_path
+        n_occ_dip = (n_occ_eqp if n_occ_eqp is not None else resolve_n_occ(
+            read_metadata(restart_file)["energies"], n_occ=n_occ,
+            input_file=input_file))
+        with timing.section("bse.exciton_dipoles"):
+            d_alpha, de_cv = window_dipoles(
+                data, dipole_file, n_occ=n_occ_dip,
+                wfn_path=_parse_wfn_path(input_file))
+
     if write_eigs is not None:
         n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
         dipoles = None
@@ -238,19 +261,9 @@ def _preview_lanczos(
             # bundle's own, or a --qp-rotations bundle's QP-basis dipoles),
             # contracted against the solve's distributed eigenvectors in state
             # blocks (no gather).
-            from file_io.restart_bundle import read_metadata
             from .absorption_common import (build_dipole_vector_bse,
-                                            exciton_dipoles_distributed,
-                                            window_dipoles)
-            from .bse_io import resolve_n_occ
-            from .bse_window import _parse_wfn_path
-            n_occ_dip = (n_occ_eqp if n_occ_eqp is not None else resolve_n_occ(
-                read_metadata(restart_file)["energies"], n_occ=n_occ,
-                input_file=input_file))
+                                            exciton_dipoles_distributed)
             with timing.section("bse.exciton_dipoles", announce=True):
-                d_alpha, _ = window_dipoles(
-                    data, dipole_file, n_occ=n_occ_dip,
-                    wfn_path=_parse_wfn_path(input_file))
                 if data["densified"]:
                     dipole_attrs = {
                         "route": data["dipoles"]["route"],
@@ -287,6 +300,47 @@ def _preview_lanczos(
                 dipole_attrs=dipole_attrs,
             )
 
+    if haydock is not None:
+        # ε₂(ω) by the Haydock recursion on THIS payload: the loaded bundle,
+        # the eigensolve's W_R (keep_W_R) and the same matvec, so the second
+        # process's startup, load (htransform + densify on bse_k_grid), W
+        # transform and compiles are not paid again.
+        from .absorption_common import build_dipole_vector_bse
+        from .absorption_haydock import (POLARIZATIONS, haydock_coefficients,
+                                         write_haydock_outputs)
+        pols = haydock["pols"]
+        if stage_progress is not None:
+            stage_progress.step()
+        with timing.section(
+                "bse.haydock", announce=True,
+                label=(f"Haydock {len(pols)}-block x {haydock['n_iter']} "
+                       f"({''.join(POLARIZATIONS[a] for a in pols)})")) as _sec_h:
+            d_block = build_dipole_vector_bse(
+                d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)[list(pols)]
+            alphas, betas, norms = haydock_coefficients(
+                data, mesh_xy, d_block, int(haydock["n_iter"]))
+            write_haydock_outputs(
+                out_prefix=haydock["out_prefix"], pols=pols, alphas=alphas,
+                betas=betas, norms=norms, d_alpha=d_alpha, de_cv=de_cv,
+                V_cell=float(cell_volume), nk=nk, eta_eV=haydock["eta_ev"],
+                n_spin=int(haydock["n_spin"]),
+                n_spinor=int(data["psi_c_X"].shape[2]),
+                omega_min_eV=haydock["omega_min_ev"],
+                omega_max_eV=haydock["omega_max_ev"],
+                n_omega=int(haydock["n_omega"]), no_eps1=haydock["no_eps1"],
+                n_iter=int(haydock["n_iter"]),
+                metadata=({"dipole_route": data["dipoles"]["route"],
+                           "dipole_source": data["dipoles"]["source"],
+                           "dipole_on_grid_rel": data["dipoles"]["on_grid_rel"]}
+                          if data["densified"] else None))
+        if report is not None:
+            report.heading("Haydock absorption")
+            report.emit(f"  {len(pols)} recursion(s) "
+                        f"({''.join(POLARIZATIONS[a] for a in pols)}) x "
+                        f"{int(haydock['n_iter'])} steps on the eigensolve's "
+                        f"payload, eta {haydock['eta_ev']:.4f} eV -> "
+                        f"{haydock['out_prefix']}.h5")
+
     if stage_progress is not None:
         stage_progress.step()
         stage_progress.finish()
@@ -298,7 +352,40 @@ def _preview_lanczos(
         "bse_dim": int(bse_dim),
         "restart_file": str(restart_file),
         "eigenvector_file": "eigenvectors.h5" if write_eigs is not None else None,
+        "haydock_file": (None if haydock is None
+                         else f"{haydock['out_prefix']}.h5"),
     }
+
+
+def _davidson_report(report, *, n_eig, tol_mev, budget):
+    """Print and report the Davidson stop: roots converged, iterations,
+    matvecs, the largest residual in meV.  An unconverged stop is a WARNING."""
+    import numpy as np
+    from common.report_blocks import Message
+    from solvers.davidson import LAST_RUN as run
+    from solvers.davidson_fixed import CONVERGED, STALLED
+    res_mev = np.asarray(run["res"][0]) * RYD_TO_EV * 1.0e3
+    n_conv = int(np.sum(res_mev < tol_mev))
+    status = int(run["status"])
+    word = ("converged" if status == CONVERGED else
+            "STALLED" if status == STALLED else "NOT converged")
+    line = (f"Davidson {word}: {n_conv}/{n_eig} roots with residual < "
+            f"{tol_mev:g} meV in {int(run['iter'][0])}/{int(budget)} iterations, "
+            f"{int(run['mv'][0])} matvecs, {int(run['restarts'])} restarts; "
+            f"max residual {float(np.max(res_mev)):.3e} meV")
+    print(line, flush=True)
+    if report is None:
+        return
+    report.heading("Eigensolver convergence")
+    report.emit("  " + line)
+    if status != CONVERGED:
+        report.warn(Message(
+            "WARNING", "davidson_not_converged",
+            f"Davidson stopped {word}: {n_eig - n_conv} of {n_eig} roots above "
+            f"the {tol_mev:g} meV residual",
+            found=("max residual", f"{float(np.max(res_mev)):.3e} meV"),
+            fix="raise --max-lanczos-iter (the iteration cap) or "
+                "--davidson-m-max, or loosen --davidson-tol-mev"))
 
 
 
@@ -401,8 +488,12 @@ def build_parser():
         "--max-lanczos-iter",
         type=int,
         default=None,
-        help="Lanczos iterations for eigensolve (default: auto-scale with problem size). "
-             "When --block-size > 1, this is total Krylov dimension (= block iters × block_size).",
+        help="Iteration budget (default: auto-scale with problem size, "
+             "max(30, min(200, bse_dim // 2))).  --solver lanczos: the Krylov "
+             "dimension it runs (block iters x --block-size).  --solver "
+             "davidson: the CAP on block iterations; the solve stops at its "
+             "residual test (--davidson-tol-mev).  --solver trlan: the matvec "
+             "budget.",
     )
     parser.add_argument(
         "--block-size",
@@ -444,29 +535,35 @@ def build_parser():
     parser.add_argument(
         "--solver",
         choices=("lanczos", "davidson", "trlan"),
-        default="lanczos",
-        help="Eigensolver. ``lanczos`` (default) for fast spectrum-shape "
-             "convergence (ε₂(ω)). ``davidson`` for tight per-state "
-             "eigenvector convergence using diagonal (E_c−E_v) "
-             "preconditioner — better for individual-state oscillator "
-             "strengths in densely-packed band-edge spectra. ``trlan`` for "
-             "thick-restart Lanczos: the same Krylov convergence as "
-             "``lanczos`` from a basis capped at --trlan-m-max slots instead "
-             "of --max-lanczos-iter slots, which is what makes the solve fit "
-             "at production bse_dim. Costs extra matvecs for the cap.",
+        default="davidson",
+        help="Eigensolver for the lowest --n-eig roots.  ``davidson`` (the "
+             "default since 2026-10-20): block Davidson with the exact "
+             "diagonal preconditioner, stopped when every root's residual is "
+             "below --davidson-tol-mev.  ``lanczos``: single-vector or block "
+             "Lanczos at a fixed Krylov dimension (--max-lanczos-iter), or to "
+             "--lanczos-rtol.  ``trlan``: thick-restart Lanczos, the Krylov "
+             "convergence of ``lanczos`` from a basis capped at "
+             "--trlan-m-max slots, for a fixed matvec budget.  Flags of a "
+             "solver that is not selected refuse.",
     )
     parser.add_argument(
         "--davidson-precond", choices=("bare", "exact", "auto"),
-        default="bare",
-        help="Davidson preconditioner diagonal. ``bare`` (default) divides by "
-             "the transition energy dE = E_c - E_v. ``exact`` divides by the "
-             "assembled diag(H) = dE + (V_x - W_d)/nk, which is what "
-             "BerkeleyGW hands PRIMME; it is assembled once per payload and "
-             "the per-iteration cost is identical to the bare route. ``auto`` "
-             "chooses between them on the transition-space dimension, at the "
-             "crossover in bse_davidson_helpers.EXACT_PRECOND_AUTO_MIN_DIM -- "
-             "which is a placeholder awaiting a large-deck measurement, not a "
-             "measured value.",
+        default="exact",
+        help="Davidson preconditioner diagonal. ``exact`` (default) divides by "
+             "the assembled diag(H) = dE + (V_x - W_d)/nk (dE + V_x/nk under "
+             "--rpa), which is what BerkeleyGW hands PRIMME; it is assembled "
+             "once per payload and the per-iteration cost is identical to the "
+             "bare route. ``bare`` divides by the transition energy "
+             "dE = E_c - E_v. ``auto`` chooses on the transition-space "
+             "dimension at bse_davidson_helpers.EXACT_PRECOND_AUTO_MIN_DIM.",
+    )
+    parser.add_argument(
+        "--davidson-tol-mev", type=float, default=0.01,
+        help="Davidson stopping rule, meV: every root's residual norm "
+             "||H x - E x|| below it (relative above |E| = 1 Ry).  A residual "
+             "r puts an exact eigenvalue within ||r|| of E, so this bounds "
+             "each root's eigenvalue error; the error is typically "
+             "||r||^2/gap, far below it.  Default 0.01 meV.",
     )
     parser.add_argument(
         "--davidson-olsen", action="store_true",
@@ -496,6 +593,32 @@ def build_parser():
         help="Thick-restart Lanczos: Ritz vectors retained across a restart. "
              "Default n_eig+10. Must satisfy n_eig <= n_keep < m_max.",
     )
+    parser.add_argument(
+        "--haydock-iter", type=int, default=0,
+        help="with --tda --dipole: after the eigensolve, run N steps of the "
+             "Haydock recursion (bse.absorption_haydock's) on the same loaded "
+             "payload and kernel, in this process, and write "
+             "--haydock-out-prefix.h5 plus one .dat per polarization.  0 "
+             "(default) = off.  Same physics and outputs as the separate "
+             "driver, without its startup, load and W transform.")
+    parser.add_argument("--haydock-pol", default="xyz",
+                        help="with --haydock-iter: Cartesian polarizations to "
+                             "recurse, a subset of 'xyz' (default all); one "
+                             "matvec per polarization per step")
+    parser.add_argument("--haydock-eta-ev", type=float, default=0.1,
+                        help="with --haydock-iter: Lorentzian broadening (eV)")
+    parser.add_argument("--haydock-omega-min-ev", type=float, default=0.0)
+    parser.add_argument("--haydock-omega-max-ev", type=float, default=15.0)
+    parser.add_argument("--haydock-n-omega", type=int, default=1500)
+    parser.add_argument("--haydock-n-spin", type=int, default=1,
+                        help="with --haydock-iter: spin multiplicity of the "
+                             "eps2 prefactor (2 only for collinear "
+                             "spin-polarised); n_spinor is the payload's")
+    parser.add_argument("--haydock-no-eps1", action="store_true",
+                        help="with --haydock-iter: skip the Kramers-Kronig eps1")
+    parser.add_argument("--haydock-out-prefix", default="absorption_haydock",
+                        help="with --haydock-iter: output prefix (h5 and the "
+                             "absorption_haydock_b<1-3>_eh.dat files beside it)")
     parser.add_argument("--kpm-dos", action="store_true", help="Run KPM Chebyshev DOS and exit.")
     parser.add_argument("--kpm-n-moments", type=int, default=100, help="Chebyshev moments M for KPM.")
     parser.add_argument("--kpm-n-random", type=int, default=4, help="Stochastic trace vectors R for KPM.")
@@ -540,9 +663,23 @@ _ROUTE_DESTS = {
         "n_eig", "write_eigs", "report_file", "max_lanczos_iter", "block_size",
         "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
-        "davidson_m_max", "trlan_m_max", "trlan_n_keep", "eqp", "n_occ",
-        "band_degeneracy", "degeneracy_tol_ry", "dipole", "helicity_table",
-        "qp_rotations"},
+        "davidson_m_max", "davidson_tol_mev", "trlan_m_max", "trlan_n_keep",
+        "eqp", "n_occ", "band_degeneracy", "degeneracy_tol_ry", "dipole",
+        "helicity_table", "qp_rotations", *(
+            "haydock_" + k for k in ("iter", "pol", "eta_ev", "omega_min_ev",
+                                     "omega_max_ev", "n_omega", "n_spin",
+                                     "no_eps1", "out_prefix"))},
+}
+
+#: On the eigensolve route, the flags only one ``--solver`` reads.  One set away
+#: from its default under another solver refuses: the default solver changed
+#: from lanczos to davidson on 2026-10-20, and a command line that tuned the
+#: Lanczos recurrence must not run Davidson and drop the tuning in silence.
+_SOLVER_DESTS = {
+    "lanczos": {"block_size", "lanczos_rtol", "lanczos_check_every", "n_reorth"},
+    "davidson": {"davidson_precond", "davidson_olsen", "davidson_eps_shift",
+                 "davidson_m_max", "davidson_tol_mev"},
+    "trlan": {"trlan_m_max", "trlan_n_keep"},
 }
 
 
@@ -576,9 +713,44 @@ def parse_args(argv=None):
                      "state: the first relabels DFT bands with diagonal QP "
                      "energies, the second rotates them into the eigenbasis "
                      "of H_QP; choose one")
-    if args.dipole is not None and (args.write_eigs is None or not args.tda):
+    if route == "lanczos":
+        wrong = sorted(
+            "--" + dest.replace("_", "-")
+            for solver, dests in _SOLVER_DESTS.items() if solver != args.solver
+            for dest in dests if getattr(args, dest) != parser.get_default(dest))
+        if wrong:
+            parser.error(
+                f"{', '.join(wrong)} {'is' if len(wrong) == 1 else 'are'} not "
+                f"read by --solver {args.solver} (the default since 2026-10-20 "
+                f"is davidson); name the solver that reads "
+                f"{'it' if len(wrong) == 1 else 'them'} or drop "
+                f"{'it' if len(wrong) == 1 else 'them'}")
+    haydock_flags = sorted(
+        "--" + dest.replace("_", "-") for dest in vars(args)
+        if dest.startswith("haydock_") and dest != "haydock_iter"
+        and getattr(args, dest) != parser.get_default(dest))
+    if args.haydock_iter < 0:
+        parser.error("--haydock-iter must be >= 0 (0 = off)")
+    if args.haydock_iter == 0 and haydock_flags:
+        parser.error(f"{', '.join(haydock_flags)} only configure "
+                     f"--haydock-iter N > 0, which is off")
+    if args.haydock_iter > 0:
+        if not args.tda or args.dipole is None:
+            parser.error("--haydock-iter runs the TDA Haydock recursion seeded "
+                         "by the window dipoles: it needs --tda and --dipole")
+        if args.qp_rotations is not None:
+            parser.error("--haydock-iter on a --qp-rotations bundle is not "
+                         "supported: run bse.absorption_haydock's inputs")
+        from .absorption_haydock import parse_polarizations
+        try:
+            args.haydock_pols = parse_polarizations(args.haydock_pol)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.dipole is not None and (
+            (args.write_eigs is None and args.haydock_iter == 0) or not args.tda):
         parser.error("--dipole stores per-state dipoles beside the written "
-                     "eigenvectors: it needs --write-eigs and --tda (the "
+                     "eigenvectors or seeds --haydock-iter: it needs "
+                     "--write-eigs or --haydock-iter, and --tda (the "
                      "full-BSE oscillator strength needs both halves of the "
                      "paired vector)")
     if args.helicity_table and args.dipole is None:
@@ -602,12 +774,19 @@ def settings_rows(args, *, source) -> tuple:
                 "rebuild)" if include_w else
                 "kernel D + V: RPA, no screened direct term"),
         Setting("--solver", str(args.solver), source("--solver"),
-                f"block size {int(args.block_size)}, {int(args.n_eig)} roots; "
-                "trial-stack matvec"),
-        Setting("--lanczos-rtol", f"{float(args.lanczos_rtol):g}", source("--lanczos-rtol"),
-                f"stop at this relative change, checked every "
-                f"{int(args.lanczos_check_every)} iterations"
-                if args.lanczos_rtol > 0.0 else "fixed Krylov dimension: no convergence test"),
+                (f"block of {int(args.n_eig)} roots, {args.davidson_precond} "
+                 f"diagonal preconditioner; trial-stack matvec"
+                 if args.solver == "davidson" else
+                 f"block size {int(args.block_size)}, {int(args.n_eig)} roots; "
+                 "trial-stack matvec")),
+        (Setting("--davidson-tol-mev", f"{float(args.davidson_tol_mev):g}",
+                 source("--davidson-tol-mev"),
+                 "stop when every root's residual is below this (meV)")
+         if args.solver == "davidson" else
+         Setting("--lanczos-rtol", f"{float(args.lanczos_rtol):g}", source("--lanczos-rtol"),
+                 f"stop at this relative change, checked every "
+                 f"{int(args.lanczos_check_every)} iterations"
+                 if args.lanczos_rtol > 0.0 else "fixed Krylov dimension: no convergence test")),
         Setting("--qp-rotations" if args.qp_rotations else "--eqp",
                 os.path.basename(str(basis_file)) if basis_file else "none",
                 source("--qp-rotations", "--eqp"),
@@ -616,7 +795,10 @@ def settings_rows(args, *, source) -> tuple:
                 else "DFT bands and energies"),
         Setting("--band-degeneracy", str(args.band_degeneracy), source("--band-degeneracy"),
                 f"tolerance {float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.3f} meV"),
-    )
+    ) + ((Setting("--haydock-iter", str(int(args.haydock_iter)), source("--haydock-iter"),
+                  f"Haydock eps2 ({args.haydock_pol}) on the eigensolve's payload, "
+                  f"eta {float(args.haydock_eta_ev):g} eV"),)
+         if getattr(args, "haydock_iter", 0) else ())
 
 
 def main(argv=None) -> int:
@@ -689,9 +871,10 @@ def main(argv=None) -> int:
                 if args.write_eigs is not None else "not requested"),
         ))
         report.sampling(wfn=wfn, sym=sym)
+        n_stages = 4 if args.haydock_iter > 0 else 3
         stage_progress = LoopProgress(
-            3, report.progress, title="BSE eigensolve",
-            item_name="major stage", max_updates=3)
+            n_stages, report.progress, title="BSE eigensolve",
+            item_name="major stage", max_updates=n_stages)
         stage_progress.start()
 
         result = _preview_lanczos(
@@ -716,11 +899,22 @@ def main(argv=None) -> int:
             davidson_precond=args.davidson_precond,
             davidson_olsen=args.davidson_olsen,
             davidson_eps_shift=args.davidson_eps_shift,
+            davidson_tol_mev=args.davidson_tol_mev,
             trlan_m_max=args.trlan_m_max,
             trlan_n_keep=args.trlan_n_keep,
             degeneracy_mode=args.band_degeneracy,
             degeneracy_tol_ry=args.degeneracy_tol_ry,
             tda=use_tda,
+            haydock=(None if args.haydock_iter <= 0 else {
+                "n_iter": int(args.haydock_iter), "pols": args.haydock_pols,
+                "eta_ev": float(args.haydock_eta_ev),
+                "omega_min_ev": float(args.haydock_omega_min_ev),
+                "omega_max_ev": float(args.haydock_omega_max_ev),
+                "n_omega": int(args.haydock_n_omega),
+                "n_spin": int(args.haydock_n_spin),
+                "no_eps1": bool(args.haydock_no_eps1),
+                "out_prefix": str(args.haydock_out_prefix)}),
+            cell_volume=float(wfn.cell_volume),
             report=report,
             stage_progress=stage_progress,
         )
@@ -733,6 +927,9 @@ def main(argv=None) -> int:
         if result["eigenvector_file"]:
             file_rows.append(("exciton eigenvectors", "written",
                               result["eigenvector_file"]))
+        if result["haydock_file"]:
+            file_rows.append(("Haydock absorption", "written",
+                              result["haydock_file"]))
         file_rows += [(label, "read", path) for label, path in (
             ("QP corrections", args.eqp), ("QP rotations", args.qp_rotations))
             if path]
