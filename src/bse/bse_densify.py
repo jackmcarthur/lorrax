@@ -1830,9 +1830,11 @@ def _interpolate_bse_data_to_grid(
     # (head and, in a slab, the G_z channels), which is added back exactly
     # at every fine q (``_srlr_terms``).
     srlr = resolve_w_head_densify(None, params) == "srlr"
+
     def _densified_w():
         """W on the fine grid and its fine Γ head diagonal ``q0_head_ry``."""
-        W_coarse = data["W_q"]
+        # Popped: once the fine W exists the coarse tile has no reference left.
+        W_coarse = data.pop("W_q")
         # The tile's μ positions, read and receipt-checked ONCE: the embedding, the
         # srlr model rows and the c1 head phase all take this array.
         r_mu = w_tile_centroid_frac(wfn, centroids_path, keep, n_rmu,

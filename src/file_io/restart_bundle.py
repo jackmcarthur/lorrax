@@ -891,21 +891,25 @@ def read_lr_channels(filename):
 
 def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
                      *, nohead=False, full_exchange=False, screened_w=None,
-                     screened=True):
+                     screened=True, read_psi=True):
     """Return canonical BSE ψ faces, Γ exchange and the screened q grid.
 
     A missing stored W is accepted only with an explicit screened body
     from the response owner. Bare V is never used as the direct term.
     ``screened=False`` (a kernel without the direct term) reads no W and
-    returns ``None`` in its place.
+    returns ``None`` in its place; ``read_psi=False`` (a bundle about to be
+    densified, whose ψ the fine htransform replaces) returns ``None`` for both
+    ψ faces.
     """
     m = read_metadata(filename)
     if screened and not m["screened_ready"] and screened_w is None:
         raise ValueError(
             "GATE bse_requires_screened_w0: missing stored W0 and no "
             "screened body supplied by the static response owner")
-    v = read_wavefunctions(filename, input_file, mesh_xy, bands=val_indices)
-    c = read_wavefunctions(filename, input_file, mesh_xy, bands=cond_indices)
+    v = c = None
+    if read_psi:
+        v = read_wavefunctions(filename, input_file, mesh_xy, bands=val_indices)
+        c = read_wavefunctions(filename, input_file, mesh_xy, bands=cond_indices)
     grid = tuple(int(n) for n in m["grid"])
     # Γ's exchange tile alone; the full-zone V only when a caller asks for it.
     V0 = read_interaction_gamma(filename, "bare", mesh_xy, nohead=nohead)

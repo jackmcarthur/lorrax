@@ -556,7 +556,7 @@ def solve_bse_sharded(
         @partial(
             jax.jit,
             in_shardings=(
-                sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+                sh.psi_x, None, None, sh.psi_y,      # coupling legs: unread (TDA)
                 sh.eps, sh.eps, sh.W, sh.V, sh.M,
             ),
             # Keep Ritz vectors distributed; the streaming writer owns host I/O.
@@ -615,7 +615,7 @@ def solve_bse_sharded(
     @partial(
         jax.jit,
         in_shardings=(
-            sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+            sh.psi_x, None, None, sh.psi_y,          # coupling legs: unread (TDA)
             sh.eps, sh.eps, sh.W, sh.V, sh.M,
         ),
         # Fourth entry covers the α-Hermiticity payload: a pytree prefix, so

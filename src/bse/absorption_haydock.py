@@ -164,7 +164,7 @@ def haydock_program(mesh_xy, kgrid, n_iter):
     @partial(
         jax.jit,
         in_shardings=(
-            sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+            sh.X, sh.psi_x, None, None, sh.psi_y,    # coupling legs: unread (TDA)
             sh.eps, sh.eps, sh.W, sh.V, sh.M,
         ),
         out_shardings=(rep, rep, rep),
@@ -337,6 +337,7 @@ def run_haydock(
         velocity_file=dipole_file,
         velocity_position_fix=dipole_position_fix,
         q0_head="diagonal",           # operands via bse_head.head_shifted_eps_c
+        coupling_legs=False,          # TDA recursion: psi_c_Y / psi_v_X unread
     )
     # Resolve n_occ for the downstream dipole slice — same source as the
     # loader used (WFN.h5 ifmax → largest-gap fallback).

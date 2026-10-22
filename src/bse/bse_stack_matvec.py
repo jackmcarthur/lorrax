@@ -952,7 +952,9 @@ def build_bse_stack_matvec(
         WX = w_stack(X, psi_c_X, psi_v_Y, W_R)
         return D_term + VX - WX
 
-    in_sh = [sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+    # psi_c_Y / psi_v_X are not read (the coupling block's legs): unconstrained,
+    # so a TDA payload may pass None for them (the loader's coupling_legs=False).
+    in_sh = [sh.X, sh.psi_x, None, None, sh.psi_y,
              sh.eps, sh.eps, sh.W, sh.V, sh.M]
     if head_tensor:
         # D_head / M_head are small and replicated: three Cartesian channels

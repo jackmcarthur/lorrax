@@ -166,6 +166,7 @@ def _preview_lanczos(
             velocity_position_fix=dipole_position_fix,
             q0_head="diagonal",       # operands via bse_head.head_shifted_eps_c
             need_W=include_W,         # local_fields: no W read, rebuilt or kept
+            coupling_legs=not tda,    # TDA: psi_c_Y / psi_v_X are never read
         )
         qp_rotation = data.get("qp_rotation")
         grid_x, grid_y = mesh_xy.devices.shape

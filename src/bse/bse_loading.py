@@ -143,6 +143,7 @@ def load_bse_data_from_restart_sharded(
     velocity_position_fix: bool = False,
     q0_head: str = "rank1",
     need_W: bool = True,
+    coupling_legs: bool = True,
 ) -> dict:
     """Load BSE tensors from canonical gw_jax restart state (psi_parent_y/enk_full).
 
@@ -152,6 +153,11 @@ def load_bse_data_from_restart_sharded(
     fills the matvec signature's slot, ``data["w_loaded"]`` is False, and the
     screened q = 0 head is not taken (``whead`` belongs to W).  A bundle with no
     W0 then loads too.
+
+    ``coupling_legs=False`` (a TDA consumer) returns ``psi_c_Y`` and
+    ``psi_v_X`` as ``None``: the TDA matvec reads ψ_c on 'x' and ψ_v on 'y'
+    alone, so the two other layouts (each N_k·n·n_s·N_μ/√P per rank) are
+    dropped once ``M`` is built.  The coupling block (full BSE) needs them.
 
     ``qp_rotations_file`` (``qp_rotations_file``) puts the window in the GW
     run's QP basis (``bse.bse_qp_rotation``): the window is resolved on the
@@ -285,10 +291,12 @@ def load_bse_data_from_restart_sharded(
         g0 = pad_to_axis(header["head_vector"], padded_mu_axis(n_rmu, mesh_xy), axis=-1)
         g0_X = device_put_process_local(g0, NamedSharding(mesh_xy, P("x")))
         g0_Y = device_put_process_local(g0, NamedSharding(mesh_xy, P("y")))
+    # A pending densification replaces ψ and M whole (the fine htransform
+    # builds both), so the coarse ψ is not read at all.
     psi_v_X, psi_c_X, V_q0, W_q, V_q_full = read_bse_payload(
         restart_file, input_file, mesh_xy, read_val, read_cond,
         nohead=use_nohead, full_exchange=load_v_full, screened_w=screened_w,
-        screened=need_W)
+        screened=need_W, read_psi=not densify_pending)
     screened_w = None                # relaid out as W_q: one W layout survives
     if not need_W:
         W_q = no_w_operand(mesh_xy)
@@ -300,24 +308,27 @@ def load_bse_data_from_restart_sharded(
     if pad_bands:
         # ψ pad = 0 (bilinear ⇒ inert, and it is what decouples the pad
         # block); ε pad = signed sentinel (diagonal of a diagonalisation).
-        _v = pad_axis(psi_v_X, grid_y, axis=1)
-        _c = pad_axis(psi_c_X, grid_x, axis=1)
         # ``.padded`` by name: n_val_pad / n_cond_pad are the MESH-ROUNDED
         # extents (bse_ring_comm asserts ``n_cond_pad % px == 0``), never
-        # the logical band counts.
-        psi_v_X, n_val_pad = _v.array, _v.padded
-        psi_c_X, n_cond_pad = _c.array, _c.padded
-        eps_v = pad_axis(eps_v, grid_y, axis=1, fill=-PAD_EPS_GUARD_RY).array
-        eps_c = pad_axis(eps_c, grid_x, axis=1, fill=PAD_EPS_GUARD_RY).array
+        # the logical band counts; ε and ψ pad the band axis alike.
+        _ev = pad_axis(eps_v, grid_y, axis=1, fill=-PAD_EPS_GUARD_RY)
+        _ec = pad_axis(eps_c, grid_x, axis=1, fill=PAD_EPS_GUARD_RY)
+        eps_v, n_val_pad = _ev.array, _ev.padded
+        eps_c, n_cond_pad = _ec.array, _ec.padded
+        if not densify_pending:
+            psi_v_X = pad_axis(psi_v_X, grid_y, axis=1).array
+            psi_c_X = pad_axis(psi_c_X, grid_x, axis=1).array
     else:
-        n_val_pad = int(psi_v_X.shape[1])
-        n_cond_pad = int(psi_c_X.shape[1])
+        n_val_pad = int(eps_v.shape[1])
+        n_cond_pad = int(eps_c.shape[1])
     # Replicated on the mesh: a single-device ε meeting the sharded solver
     # operands would compile a reshard program per shape.
     eps_v, eps_c = (device_put_process_local(e, NamedSharding(mesh_xy, P()))
                     for e in (eps_v, eps_c))
-    psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
-    psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
+    psi_v_Y = psi_c_Y = None
+    if not densify_pending:
+        psi_v_Y = jax.lax.with_sharding_constraint(psi_v_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
+        psi_c_Y = jax.lax.with_sharding_constraint(psi_c_X, NamedSharding(mesh_xy, P(None, None, None, "y")))
 
     resolve_w_head_densify(                  # refuses a retired mode by name
         w_head_densify, _read_lorrax_input_quietly(input_file))
@@ -375,7 +386,7 @@ def load_bse_data_from_restart_sharded(
     # copy in the transition layout (c on x, v on y, μ whole): 1/P per rank,
     # and both V-term legs (encode, decode) read it locally.  Was two copies
     # sharded on μ only (M_X μ on x, M_Y ν on y), 2·M/√P per rank.
-    M = jax.lax.with_sharding_constraint(
+    M = None if densify_pending else jax.lax.with_sharding_constraint(
         compute_pair_amplitude(psi_c_X, psi_v_X),
         NamedSharding(mesh_xy, P(None, "x", "y", None)))
 
@@ -411,6 +422,9 @@ def load_bse_data_from_restart_sharded(
         "q0_head_ry": q0_head_ry,
         "w_loaded": bool(need_W),
     }
+    # The bundle holds the only references: the densifier pops the coarse W
+    # and frees it once the fine W exists.
+    W_q = V_q0 = V_q_full = None
 
     # ── kgrid_fine coarse→fine densification ─────────────────────────────
     # Unset or == the coarse grid → the coarse bundle above is returned
@@ -440,6 +454,10 @@ def load_bse_data_from_restart_sharded(
     # the coarse restart's QP energies only when this is False.
     data["densified"] = bool(densify_pending)
     data.setdefault("k_shift", (0.0, 0.0, 0.0))
+    if not coupling_legs:
+        # The TDA matvec reads ψ_c on 'x' and ψ_v on 'y' only; the other two
+        # layouts feed the coupling block alone, and M is already built.
+        data["psi_c_Y"] = data["psi_v_X"] = None
     return data
 
 
