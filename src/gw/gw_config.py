@@ -3160,6 +3160,26 @@ def _locate_input_blocks(
     return (start, end, kp_idx, kp_end)
 
 
+def _bgw_line(line: str) -> str:
+    """A deck line in BerkeleyGW's syntax, rewritten as ``key = value``.
+
+    BerkeleyGW's inputs write ``key value`` and bare flags (``full_bse``,
+    ``use_momentum``); both are accepted, so absorption.inp lines can be pasted:
+    a bare word reads ``= true``, ``key v1 v2`` reads ``key = v1 v2``.  A line
+    with ``=`` or ``:``, a section header, a comment, a blank line and an
+    indented continuation are left as they are.
+    """
+    body, sep, comment = line.partition('#')
+    stripped = body.strip()
+    if (not stripped or stripped.startswith((';', '[')) or '=' in body
+            or ':' in body or line[:1] in (' ', '\t')):
+        return line
+    parts = stripped.split(None, 1)
+    value = parts[1] if len(parts) > 1 else "true"
+    tail = f"  #{comment}" if sep else "\n"
+    return f"{parts[0]} = {value}{tail}"
+
+
 def _read_input_section(
         end, kp_end, kp_idx, lines, start, filename):
     """Produce the INI section after removing its K_POINTS block."""
@@ -3180,7 +3200,7 @@ def _read_input_section(
                 f"{filename}, line {i + 1}: ';' does not start a comment "
                 f"after a value ({lines[i].strip()!r}).  A comment starts "
                 f"with '#'.")
-    section_lines = [lines[i] for i in kept]
+    section_lines = [_bgw_line(lines[i]) for i in kept]
     parser = configparser.ConfigParser(inline_comment_prefixes=('#',))
     parser.read_string(''.join(section_lines))
     section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
