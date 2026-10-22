@@ -1892,7 +1892,7 @@ BSE_DECK_KEYS = (
     "davidson_m_max", "trlan_m_max", "trlan_n_keep",
     # spectrum (Haydock)
     "haydock", "number_iterations", "energy_resolution", "omega_min_ev",
-    "omega_max_ev", "delta_frequency", "no_eps1",
+    "omega_max_ev", "delta_frequency", "no_eps1", "polarization",
     # KPM density of states and FEAST windows
     "kpm_dos", "kpm_window_count", "kpm_n_moments", "kpm_n_random",
     "kpm_n_lanczos", "kpm_emin_ev", "kpm_emax_ev", "kpm_plot_file",

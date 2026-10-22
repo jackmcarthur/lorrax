@@ -550,6 +550,50 @@ def lorentzian_broaden(omegas, energies, weights, eta):
     return out
 
 
+def polarization_directions(polarization, wfn_path):
+    """``(directions, labels)``: the light polarizations a spectrum is computed for.
+
+    ``polarization`` unset: the three Cartesian axes x, y, z (rows of the
+    identity), labelled ``b1 b2 b3`` as the per-direction files have always been.
+    ``polarization = p1 p2 p3`` (BerkeleyGW's keyword): components along the
+    reciprocal lattice vectors b1 b2 b3.  The Cartesian vector Σ_i p_i b_i is
+    built first and normalized; the crystal coefficients themselves are never
+    normalized (on a non-orthogonal lattice that is a different direction and
+    length).  ``directions`` is ``(n_pol, 3)``, real, unit rows, Cartesian.
+    """
+    if polarization is None:
+        return np.eye(3), ("b1", "b2", "b3")
+    p = np.asarray(polarization, dtype=np.float64).reshape(-1)
+    if p.size != 3 or not np.all(np.isfinite(p)) or not np.any(p):
+        raise ValueError(f"polarization takes three components p1 p2 p3 along b1 b2 b3, "
+                         f"not all zero; got {polarization!r}")
+    import h5py
+    with h5py.File(wfn_path, "r") as f:
+        bvec = np.asarray(f["mf_header/crystal/bvec"][()], dtype=np.float64)  # rows b_i
+    e = p @ bvec
+    return (e / np.linalg.norm(e))[None, :], ("e",)
+
+
+def project_dipoles(d_alpha, directions):
+    """``ê · d`` for each direction: ``d_alpha`` (3, ...) Cartesian -> (n_pol, ...)."""
+    d = np.asarray(d_alpha)
+    return np.tensordot(np.asarray(directions, dtype=np.float64), d, axes=(1, 0))
+
+
+def broaden(omegas, centers, weights, width, kind="lorentzian"):
+    """Σ_i w_i δ(ω - c_i) with a Lorentzian (half width ``width``) or a Gaussian
+    (standard deviation ``width``) of unit area.  ``weights`` (n_centers, n_cols)
+    -> (n_omega, n_cols); all energies in one unit."""
+    if kind == "lorentzian":
+        return lorentzian_broaden(omegas, centers, weights, width)
+    if kind != "gaussian":
+        raise ValueError(f"broadening {kind!r}: want lorentzian or gaussian")
+    om = np.asarray(omegas, dtype=np.float64)[:, None]
+    c = np.asarray(centers, dtype=np.float64).reshape(-1)[None, :]
+    g = np.exp(-0.5 * ((om - c) / width) ** 2) / (np.sqrt(2.0 * np.pi) * width)
+    return g @ np.asarray(weights, dtype=np.float64).reshape(c.shape[1], -1)
+
+
 def jdos_from_transitions(d_alpha, de_cv, omegas_Ry, V_cell, n_k, eta_Ry,
                           n_spin, n_spinor):
     """Independent-particle ε₂⁰(ω) — the 4th column of BGW's absorption_*.dat.

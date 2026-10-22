@@ -55,7 +55,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.fft_helpers import get_donated_kfft_kminor
 
-from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, window_dipoles, write_absorption_dat, write_absorption_h5)
+from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, polarization_directions, project_dipoles, window_dipoles, write_absorption_dat, write_absorption_h5)
 from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params, eqp_file,
                        omega_count, read_settings, spin_kernel)
 from .bse_preconditioner import set_exchange_channel
@@ -204,16 +204,17 @@ def haydock_coefficients(data, mesh_xy, d_block_np, n_iter):
     return np.asarray(alphas), np.asarray(betas), np.asarray(norms)
 
 
-def write_haydock_outputs(*, out_prefix, pols, alphas, betas, norms, d_alpha,
-                          de_cv, V_cell, nk, eta_eV, n_spin, n_spinor,
+def write_haydock_outputs(*, out_prefix, directions, labels, alphas, betas, norms,
+                          d_alpha, de_cv, V_cell, nk, eta_eV, n_spin, n_spinor,
                           omega_min_eV, omega_max_eV, n_omega, no_eps1,
                           n_iter, metadata=None):
     """ε₂ (continued fraction), the IP JDOS, optionally ε₁ (Kramers-Kronig), and
     the per-polarization ``.dat`` files plus ``<out_prefix>.h5``; rank 0 writes.
 
-    ``pols`` are the Cartesian indices of the recursions run (rows of
-    ``alphas``); the arrays in the h5 carry one column per entry and the
-    ``polarizations`` attribute names them.
+    ``directions`` (n_pol, 3) are the Cartesian unit polarizations of the
+    recursions run (rows of ``alphas``, ``absorption_common.polarization_directions``)
+    and ``labels`` their names: ``b1 b2 b3`` for the three axes, ``e`` for a
+    deck ``polarization``.  The h5 arrays carry one column per direction.
     """
     omegas_eV = np.linspace(omega_min_eV, omega_max_eV, n_omega)
     omegas_Ry = omegas_eV / RYD2EV
@@ -221,7 +222,7 @@ def write_haydock_outputs(*, out_prefix, pols, alphas, betas, norms, d_alpha,
     eps2 = absorption_from_haydock(
         omegas_Ry, eta_Ry, alphas, betas, norms, V_cell, nk, n_spin, n_spinor)
     jdos = jdos_from_transitions(
-        np.asarray(d_alpha)[list(pols)], de_cv, omegas_Ry, V_cell, nk, eta_Ry,
+        project_dipoles(d_alpha, directions), de_cv, omegas_Ry, V_cell, nk, eta_Ry,
         n_spin, n_spinor)
     if no_eps1:
         eps1 = np.ones_like(eps2)
@@ -235,11 +236,14 @@ def write_haydock_outputs(*, out_prefix, pols, alphas, betas, norms, d_alpha,
     if jax.process_index() != 0:
         return
     out_prefix_p = Path(out_prefix)
-    for col, a in enumerate(pols):
-        out_dat = out_prefix_p.with_name(f"absorption_haydock_b{a + 1}_eh.dat")
+    for col, label in enumerate(labels):
+        name = ("absorption_haydock_eh.dat" if label == "e"
+                else f"absorption_haydock_{label}_eh.dat")
+        out_dat = out_prefix_p.with_name(name)
+        e = np.asarray(directions[col], dtype=np.float64)
         header = [
             "BSE absorption — Haydock continued-fraction route",
-            f"polarization: b{a + 1} ({POLARIZATIONS[a]})",
+            f"polarization: {label}, Cartesian ({e[0]:.6f}, {e[1]:.6f}, {e[2]:.6f})",
             f"V_cell = {V_cell:.6f} bohr^3,  N_k = {nk}",
             f"eta = {eta_eV:.4f} eV,  n_spin = {n_spin},  n_spinor = {n_spinor}",
             f"n_iter = {n_iter},  ‖d‖ = {norms[col]:.6e}",
@@ -261,7 +265,8 @@ def write_haydock_outputs(*, out_prefix, pols, alphas, betas, norms, d_alpha,
             "n_spin": n_spin,
             "n_spinor": n_spinor,
             "n_iter": n_iter,
-            "polarizations": "".join(POLARIZATIONS[a] for a in pols),
+            "polarizations": " ".join(labels),
+            "polarization_vectors": np.asarray(directions, dtype=np.float64).tolist(),
             **(metadata or {}),
         },
     )
@@ -311,7 +316,7 @@ def run_haydock(
     n_omega: int,
     out_prefix: str,
     no_eps1: bool,
-    pols: tuple[int, ...] = (0, 1, 2),
+    polarization=None,
 ):
     """End-to-end Haydock absorption: load BSE data, run the block recursion over
     the requested polarizations, evaluate the continued fraction, write outputs.
@@ -372,17 +377,19 @@ def run_haydock(
     log.debug(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond_eff}, "
               f"nv={n_val_eff})")
     d_block_np = build_dipole_vector_bse(d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)
+    directions, labels = polarization_directions(polarization, _parse_wfn_path(input_file))
 
-    log.info(f"[haydock] running {len(pols)}-block recurrence × {n_iter} iters "
-             f"(polarizations {''.join(POLARIZATIONS[a] for a in pols)}) …")
+    log.info(f"[haydock] running {len(labels)}-block recurrence × {n_iter} iters "
+             f"(polarizations {' '.join(labels)}) …")
     alphas, betas, norms = haydock_coefficients(
-        data, mesh_xy, d_block_np[list(pols)], n_iter)
+        data, mesh_xy, project_dipoles(d_block_np, directions), n_iter)
     log.debug(f"[haydock] α_1 = {alphas[:, 0]}  (Ry)")
     log.debug(f"[haydock] β_1 = {betas[:, 0]}  (Ry)")
     log.debug(f"[haydock] ‖d‖ = {norms}")
 
     write_haydock_outputs(
-        out_prefix=out_prefix, pols=pols, alphas=alphas, betas=betas,
+        out_prefix=out_prefix, directions=directions, labels=labels,
+        alphas=alphas, betas=betas,
         norms=norms, d_alpha=d_alpha, de_cv=de_cv, V_cell=V_cell, nk=nk,
         eta_eV=eta_eV, n_spin=n_spin, n_spinor=n_spinor,
         omega_min_eV=omega_min_eV, omega_max_eV=omega_max_eV, n_omega=n_omega,
@@ -406,6 +413,7 @@ HAYDOCK_KEYS = {
     "omega_max_ev": Key("omega_max_eV", "float"),
     "delta_frequency": Key("delta_frequency", "float"),
     "no_eps1": Key("no_eps1", "bool"),
+    "polarization": Key("polarization", "floats"),
 }
 
 
@@ -428,7 +436,7 @@ def _defaults():
     return argparse.Namespace(
         n_val=None, n_cond=None, n_occ=None, dipole=None, dipole_position_fix=False,
         n_iter=200, eta_eV=0.1, omega_min_eV=0.0, omega_max_eV=15.0, n_omega=1500,
-        delta_frequency=None, no_eps1=False)
+        delta_frequency=None, no_eps1=False, polarization=None)
 
 
 def main(argv=None):
@@ -456,7 +464,6 @@ def main(argv=None):
         set_exchange_channel(kernel["channel"])
     except DeckError as exc:
         p.error(str(exc))
-    pols = tuple(range(3))
     if args.n_iter <= 0:
         p.error("number_iterations must be > 0")
 
@@ -476,7 +483,8 @@ def main(argv=None):
         eta_eV=args.eta_eV, n_spin=1, n_spinor=n_spinor,
         omega_min_eV=args.omega_min_eV, omega_max_eV=args.omega_max_eV,
         n_omega=args.n_omega,
-        out_prefix=cli.out_prefix, no_eps1=args.no_eps1, pols=pols,
+        out_prefix=cli.out_prefix, no_eps1=args.no_eps1,
+        polarization=args.polarization,
     )
 
 

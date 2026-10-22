@@ -373,22 +373,25 @@ def _preview_lanczos(
         # the eigensolve's W_R (keep_W_R) and the same matvec, so the second
         # process's startup, load (htransform + densify on kgrid_fine), W
         # transform and compiles are not paid again.
-        from .absorption_common import build_dipole_vector_bse
-        from .absorption_haydock import (POLARIZATIONS, haydock_coefficients,
-                                         write_haydock_outputs)
-        pols = haydock["pols"]
+        from .absorption_common import (build_dipole_vector_bse,
+                                        polarization_directions, project_dipoles)
+        from .absorption_haydock import haydock_coefficients, write_haydock_outputs
+        from .bse_window import _parse_wfn_path
+        directions, labels = polarization_directions(
+            haydock["polarization"], _parse_wfn_path(input_file))
         with manual_stage(n_stages, n_stages, "Haydock absorption",
                           name="bse.haydock") as _hay:
-            stage_row("recursion", f"{len(pols)} block(s) "
-                                   f"({''.join(POLARIZATIONS[a] for a in pols)}) x "
+            stage_row("recursion", f"{len(labels)} block(s) "
+                                   f"({' '.join(labels)}) x "
                                    f"{int(haydock['n_iter'])} steps on the "
                                    f"eigensolve's payload")
-            d_block = build_dipole_vector_bse(
-                d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad)[list(pols)]
+            d_block = project_dipoles(build_dipole_vector_bse(
+                d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad), directions)
             alphas, betas, norms = haydock_coefficients(
                 data, mesh_xy, d_block, int(haydock["n_iter"]))
             write_haydock_outputs(
-                out_prefix=haydock["out_prefix"], pols=pols, alphas=alphas,
+                out_prefix=haydock["out_prefix"], directions=directions,
+                labels=labels, alphas=alphas,
                 betas=betas, norms=norms, d_alpha=d_alpha, de_cv=de_cv,
                 V_cell=float(cell_volume), nk=nk, eta_eV=haydock["eta_ev"],
                 n_spin=int(haydock["n_spin"]),
@@ -790,6 +793,7 @@ def _settings_parser():
     parser.add_argument("--haydock", action="store_true")
     parser.add_argument("--number-iterations", type=int, default=None)
     parser.add_argument("--delta-frequency", type=float, default=None)
+    parser.add_argument("--polarization", default=None)
     return parser
 
 
@@ -844,6 +848,7 @@ BSE_KEYS = {
     "omega_max_ev": Key("haydock_omega_max_ev", "float"),
     "delta_frequency": Key("delta_frequency", "float"),
     "no_eps1": Key("haydock_no_eps1", "bool"),
+    "polarization": Key("polarization", "floats"),
     "kpm_dos": Key("kpm_dos", "bool"),
     "kpm_window_count": Key("kpm_window_count", "int"),
     "kpm_n_moments": Key("kpm_n_moments", "int"),
@@ -878,6 +883,7 @@ _SHARED_KEYS = frozenset({
     "dipole_file", "dipole_position_fix", "number_eigenvalues", "solver",
     "solver_max_iter", "block_size", "davidson_tol_mev", "number_iterations",
     "energy_resolution", "omega_min_ev", "omega_max_ev", "delta_frequency", "no_eps1",
+    "polarization", "lorentzian_broadening", "gaussian_broadening",
 })
 
 #: The settings each route reads, beyond the ones every route reads.  A key
@@ -1046,11 +1052,6 @@ def parse_args(argv=None):
         if args.qp_rotations is not None:
             parser.error("haydock = true on a qp_rotations_file bundle is not "
                          "supported: run bse.absorption_haydock's inputs")
-        from .absorption_haydock import parse_polarizations
-        try:
-            args.haydock_pols = parse_polarizations(args.haydock_pol)
-        except ValueError as exc:
-            parser.error(str(exc))
     if args.dipole is not None and (
             (args.write_eigs is None and args.haydock_iter == 0) or not args.tda):
         parser.error("dipole_file stores per-state dipoles beside the written "
@@ -1104,7 +1105,8 @@ def settings_rows(args, *, source) -> tuple:
                 f"tolerance {float(args.degeneracy_tol_ry) * RYD_TO_EV * 1.0e3:.3f} meV"),
     ) + ((Setting("number_iterations", str(int(args.haydock_iter)),
                   source("haydock", "number_iterations"),
-                  f"Haydock eps2 ({args.haydock_pol}) on the eigensolve's payload, "
+                  f"Haydock eps2 ({'b1 b2 b3' if args.polarization is None else 'e'}) "
+                  f"on the eigensolve's payload, "
                   f"eta {float(args.haydock_eta_ev):g} eV"),)
          if getattr(args, "haydock_iter", 0) else ())
 
@@ -1113,7 +1115,7 @@ def _haydock_settings(args) -> dict | None:
     """The Haydock deck keys as ``_preview_lanczos``'s ``haydock`` bundle (None: off)."""
     if args.haydock_iter <= 0:
         return None
-    return {"n_iter": int(args.haydock_iter), "pols": args.haydock_pols,
+    return {"n_iter": int(args.haydock_iter), "polarization": args.polarization,
             "eta_ev": float(args.haydock_eta_ev),
             "omega_min_ev": float(args.haydock_omega_min_ev),
             "omega_max_ev": float(args.haydock_omega_max_ev),
