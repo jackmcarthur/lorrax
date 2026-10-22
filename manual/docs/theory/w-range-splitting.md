@@ -155,7 +155,17 @@ W^{\mathrm{LR}}_{\bq_{\mathrm{fi}}}(\mu,\nu)=\frac{1}{V_{\mathrm{cell}}}\sum_{\b
 D_{\bq_{\mathrm{fi}}}=\big(1-v_L P_{\bq_{\mathrm{fi}}}\big)^{-1}v_L \tag{4.1}
 $$
 
-The log prints one `[srlr]` line with $N_L$, the fit degrees and the residuals.
+The log prints a short block when the interpolation runs: the coarse and fine grids, the size $N_L$ of $\bG_L$, the fit degrees and residuals, the window radii, and how many coarse and fine $\bq$ used the model and how many were skipped ($w=0$, interpolant only).
+
+```text
+W interpolation (srlr): coarse <grid> -> fine <grid>
+  long-range subspace G_L: <N_L> plane wave(s) per q (G = 0, or G_z = -n..n in a slab)
+  fit on <n> coarse q: F~ degree <d> (rel. residual <r>), P degree <d> in q^2 (rel. residual <r>)
+  window w(q): 1 below <r_a>, 0 above <r_b> bohr^-1 (q_ins <q>)
+  model used at <n> of <N> coarse q and <n> of <N> fine q, Gamma exact; skipped (w = 0, interpolant only): <n> coarse q, <n> fine q
+  head kernel <kernel>; S anchor <source>
+```
+
 
 ### <span class="n">4.2</span> The short-range part {: #remainder }
 
@@ -187,12 +197,12 @@ $$
 
 The long-range plane waves and the head describe the same singular element from two sides. In bulk, with $P(\bG_{\mathrm{ws}},\bG_{\mathrm{ws}})\approx\bar S\,q^2$, (4.1) reproduces the integrand that the head page averages over the mini-BZ, $8\pi/\big(q^2(1-8\pi\bar S)\big)$. In a slab it is $(8\pi z_c/q)\big(1+O(q)\big)$, and screening sets in only at finite $q$. $P$ already contains the local fields that the head page adds through its own Schur complement, and with `head_correction = full` the anchor $S$ is the folded tensor $S^{\mathrm{eff}}(0)$.
 
-## <span class="n">5</span> The head-only route (c1) {: #c1 }
+## <span class="n">5</span> The fine Γ head {: #c1 }
 
 `gw.head_densify.build_fine_head_scalars`
 {: .in-code }
 
-With `w_head_densify = c1`, the default, only the $\Gamma$ head is held back. The coarse values at $\bq\neq0$ are Fourier-interpolated as they are, divergent element included, and the head is added as a rank-one term at every fine point inside the coarse $\Gamma$ cell $\Gamma_c$,
+The head $h_{\mathrm{fi}}$ of (4.4) is the fine-$\Gamma$ entry of the head scalars below. Until 2026-10-22 the same formula was also a model of its own, `w_head_densify = c1`, which held back only the $\Gamma$ head, Fourier-interpolated the coarse values at $\bq\neq0$ as they are, divergent element included, and added the head as a rank-one term at every fine point inside the coarse $\Gamma$ cell $\Gamma_c$. That model was removed; `srlr` keeps (5.1) at the fine $\Gamma$ only,
 
 $$
 W_{\bq_{\mathrm{fi}}}(\mu,\nu)=\big[W\big]^{\mathrm{interp}}_{\bq_{\mathrm{fi}}}(\mu,\nu)+\frac{h(\bq_{\mathrm{fi}})}{V_{\mathrm{cell}}}\,\zeta^*_{\Gamma\mu}(\mathbf 0)\,\zeta_{\Gamma\nu}(\mathbf 0),\qquad
@@ -202,7 +212,7 @@ $$
 
 $\bar W_{00}$ is the bundle's static head, or the deck's `whead_0freq`, and $s$ is the screened integrand of the [q → 0 head](q0-head.md#minibz-avg), evaluated at each fine $\bq\neq0$ and averaged over the fine cell at $\Gamma$. Points on the boundary of $\Gamma_c$ are shared with their neighbours by weight, and $h=0$ outside $\Gamma_c$. The ratio $\bar W_{00}/\langle s\rangle_{\Gamma_c}$ is logged, and a value more than 5 % from one warns. $S$ is the restart's `S_cart_head`, or is rebuilt from `dipole.h5` when the restart has none.
 
-The route is cheap and needs nothing beyond the head, but it leaves the coarse neighbours of $\Gamma$ untouched. Their values still contain the $1/q^2$ rise, and the interpolation between them overshoots, as in the lower panel of Fig. 1. In a slab the $G_z\neq0$ plane waves are not treated at all. `srlr` removes both defects and keeps the `c1` head only at the fine $\Gamma$.
+The removed route was cheap and needed nothing beyond the head, but it left the coarse neighbours of $\Gamma$ untouched. Their values still contained the $1/q^2$ rise, and the interpolation between them overshot, as in the lower panel of Fig. 1, and in a slab the $G_z\neq0$ plane waves were not treated at all. `srlr` removes both defects.
 
 ## <span class="n">6</span> Files, keys and refusals {: #files }
 
@@ -235,14 +245,15 @@ The densification runs in the BSE loader whenever the deck's `kgrid_fine` differ
 | Key | Default | Role here |
 |---|---|---|
 | [`kgrid_fine`](../drivers/bse/keywords.md#kgrid_fine) | empty | the fine grid; empty or equal to the coarse grid skips the densification |
-| [`w_head_densify`](../drivers/bse/keywords.md#w_head_densify) | `c1` | `c1` (§5) or `srlr` (§2 to §4); `legacy` is retired and refuses by name |
+| [`w_head_densify`](../drivers/bse/keywords.md#w_head_densify) | `srlr` | the only model (§2 to §4); `c1` and `legacy` were removed and refuse with one line |
 | `head_minibz_average` | `false` | must match the GW run; enters the Γ-cell average of the head |
 | `mc_average_vcoul_body` | `true` | read by GW; decides the averaged head kernel of §2 |
 
-`exciton_bands --w-coarse-grid` decimates a native fine $W$ and densifies it back through the same interpolation. It implements `c1` only, and `srlr` there refuses (`GATE w_head_densify_path`).
+`exciton_bands --w-coarse-grid` decimates a native fine $W$ and densifies it back through the same interpolation: the restart's `W0_lr`, on its native grid, is decimated to the same sub-grid, so the model is fitted on, and subtracted at, the $\bq$ the interpolant sees.
 
 !!! refuses
-    - No `W0_lr` group in the bundle (`GATE srlr_restart_channels`). Rerun GW with a static Dyson W0, for example `compute_mode = cohsex` or `gn_ppm`, or use `c1`.
+    - `w_head_densify = c1` or `legacy`: "`w_head_densify = c1` was removed: srlr is the only model".
+    - No `W0_lr` group in the bundle (`GATE srlr_restart_channels`). Rerun GW with a static Dyson W0, for example `compute_mode = cohsex`, `gn_ppm` or `hl_ppm`.
     - W0 stored on the full zone, so `W0_lr` has no unfold tables (`GATE srlr_wedge_tables`).
     - A downfolded bundle (`GATE srlr_downfold`), because `W0_lr` belongs to the native centroid set.
     - `W0_lr` written for another `sys_dim`, another $\bq$ wedge or another centroid count.
@@ -250,7 +261,7 @@ The densification runs in the BSE loader whenever the deck's `kgrid_fine` differ
     - Symmetry rows not in the bundle's flat FFT order (`GATE srlr_q_order`), or a slab relabelling that leaves the set of $\bG_L$ (`GATE srlr_channel_relabel`).
 
 !!! note "Today and intended"
-    `c1` is the default and what a production run uses today. The production GW route is the tangential model, whose restart has no `W0_lr`, so `srlr` refuses on it by name. `srlr` runs today on the bundle of a static Dyson run, for example a `cohsex` or `gn_ppm` GW on the same deck, since the BSE reads only the static $W(0)$. The intended state is that the tangential route writes the arrays of its own $W(0)$ and `srlr` becomes the default.
+    `srlr` is the default and only model since 2026-10-22. The tangential GW route's restart has no `W0_lr`, so a `kgrid_fine` BSE on it refuses by name; use the bundle of a static Dyson run on the same deck (`cohsex`, `gn_ppm`, `hl_ppm`), since the BSE reads only the static $W(0)$. The intended state is that the tangential route writes the arrays of its own $W(0)$.
 
 ## <span class="n">7</span> A measured example {: #example }
 

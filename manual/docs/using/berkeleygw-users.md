@@ -33,7 +33,7 @@ The run directory also holds QE's `data-file-schema.xml`, from which LORRAX read
 | `sigma.out` | `gwjax.out` | Ends with `LORRAX GW calculation completed.` or a `REFUSED` line. |
 | `bsemat.h5` | written by [`bse.bsemat_cli`](../drivers/berkeleygw-export.md#bsemat) | For BerkeleyGW's `absorption.x`; the LORRAX BSE driver never stores a kernel. |
 | `eigenvectors.h5` | `eigenvectors.h5` | BerkeleyGW layout; `bse.bse_jax write_eigenvectors`. |
-| `absorption_eh.dat` | `absorption_haydock_b{1,2,3}_eh.dat` | One file per Cartesian polarization: ω (eV), $\varepsilon_2$, $\varepsilon_1$, JDOS. |
+| `absorption_eh.dat`, `absorption_noeh.dat`, `eigenvalues.dat` | the same names (`_b1` … `_b3` for the three axes) | The eigensolve writes them in BerkeleyGW's exact format; the Haydock route writes `absorption_haydock[_b{1,2,3}]_eh.dat`, same columns. |
 | `vmtxel` | `dipole.h5` | Velocity matrix elements on the full grid. |
 
 ## Conceptual differences {: #concepts }

@@ -115,10 +115,10 @@ Coarse much wider than fine is the expected case: the GW grid carries the conduc
 ### `number_val_bands_coarse` {: .kw data-type="int" data-default="—" }
 Accepted and ignored, with a warning: the H-transform always fits every valence band of the GW window.
 
-### `w_head_densify` {: .kw data-type="enum" data-default="c1" }
-Long-range model split off $W$ before the densification under `kgrid_fine`. `srlr`: the plane-wave channels $\bq+\bG_a\to0$ carry the long range from the bundle's `W0_lr`; `c1`: the $\bq \to 0$ head alone. See [Short- and long-range W](../../theory/w-range-splitting.md).
+### `w_head_densify` {: .kw data-type="enum" data-default="srlr" }
+Long-range model split off $W$ before the densification under `kgrid_fine`. `srlr`, the only model: the plane-wave channels $\bq+\bG_a\to0$ carry the long range from the bundle's `W0_lr`, fitted on the coarse grid and added back at every fine $\bq$. It needs a GW restart with `W0_lr` (a static Dyson $W$: `cohsex`, `gn_ppm`, `hl_ppm`). `c1` and `legacy` were removed and refuse with one line. See [Short- and long-range W](../../theory/w-range-splitting.md).
 
-`c1` `srlr`
+`srlr`
 {: .kw-values }
 
 ### `head_minibz_average` {: .kw data-type="bool" data-default="false" }
@@ -165,7 +165,7 @@ Davidson internals: the preconditioner diagonal (`exact`, `bare`, `auto`), extra
 **Dipoles, spectra and output files**
 
 ### `dipole_file` {: .kw data-type="path" data-default="—" }
-`dipole.h5` (`psp.get_dipole_mtxels`), relative to the deck. With it, and the TDA, each state's $\langle 0\lvert\hat r\rvert S\rangle$ goes to `eigenvalues_b1.dat`…`_b3.dat`, the spectra below are written, and the Haydock recursion is seeded. Under `kgrid_fine` it is the coarse WFN's file, carried through the band interpolation.
+`dipole.h5` (`psp.get_dipole_mtxels`), relative to the deck. With it, and the TDA, each state's $\langle 0\lvert\hat r\rvert S\rangle$ goes to `eigenvalues_b1.dat`…`_b3.dat` (`eigenvalues.dat` along a deck `polarization`), the spectra below are written, and the Haydock recursion is seeded. Under `kgrid_fine` it is the coarse WFN's file, carried through the band interpolation.
 
 ### `use_momentum`, `use_velocity` {: .kw data-type="bool" data-default="—" }
 BerkeleyGW's operator choice, checked against `dipole_file`'s `skip_vnl` stamp. LORRAX chooses the operator when the dipole file is made: `psp.get_dipole_mtxels --skip-vnl` is the momentum $p$ alone, the default is the velocity $p + i[V_{\mathrm{NL}}, r]$.
@@ -235,6 +235,6 @@ A separate entry point: the TDA screened recursion ($D + w V - W$), at least two
 | `--eta-eV`, `--n-iter`, `--n-omega`, `--pol` (Haydock) | `energy_resolution`, `number_iterations`, `delta_frequency`, `polarization` |
 | `--V-cell`, `--n-spinor`, `--n-spin` (Haydock) | removed: read from the WFN |
 | `--lanczos` | removed (it changed nothing) |
-| other `--davidson-*`, `--trlan-*`, `--lanczos-*`, `--kpm-*`, `--feast-*`, `--gmres-*` | the deck key of the same name in snake case |
+| other `--davidson-*`, `--trlan-*`, `--lanczos-*`, `--kpm-*` | the deck key of the same name in snake case |
 | `bse_k_grid` | `kgrid_fine` |
 | `--ring-timing`, `w_head_densify = legacy`, `LORRAX_LANCZOS_REORTH` | retired |

@@ -60,10 +60,13 @@ The bundle's full schema belongs to the [GW Files](../gw/files.md#restart) page.
 :   Run report of the eigensolve route (`--report-file`): pathways, environment, window, exciton energies in eV, stage timings and the files read and written.
 
 `eigenvalues.dat`, `eigenvalues_b1.dat` … `eigenvalues_b3.dat`
-:   Eigensolve route: every root in BerkeleyGW's format, `eigenvalues.dat` alone or, with `dipole_file`, one file per Cartesian polarization.
+:   Eigensolve route: every root in BerkeleyGW's format, under its names: `eigenvalues.dat` for one polarization (a deck `polarization`, or no `dipole_file`), `eigenvalues_b1.dat` … `_b3.dat` for the three Cartesian axes. A triplet run writes the same files and rows, with BerkeleyGW's ` mg ` in the column header.
+
+`absorption_eh.dat`, `absorption_noeh.dat` (or `absorption_b1_eh.dat` … `_b3_noeh.dat`)
+:   Eigensolve route with `dipole_file` and the TDA: BerkeleyGW's four header lines and `4f16.9` rows ($\omega$, $\varepsilon_2$, $\varepsilon_1$, DOS), named per polarization as the eigenvalue files.
 
 `eigenvectors.h5`
-:   `write_eigenvectors`: the lowest $N$ exciton energies and amplitudes in BerkeleyGW's format. With `dipole_file` it also holds the per-state dipoles as `exciton_data/dipoles`, a LORRAX addition that BerkeleyGW readers ignore.
+:   `write_eigenvectors`: the lowest $N$ exciton energies and amplitudes in BerkeleyGW's layout, read unchanged by its readers: `exciton_header/versionnumber`, 32-bit integer scalars, `kpts` $(N_k, 3)$, the four eigenvector datasets $(N_Q, N, N_k, n_c, n_v, n_s, 2)$ with the valence index counted down from the VBM, `spin_kernel` 3 spinor, 1 singlet, 0 triplet, 2 local fields, and the deck WFN's `mf_header` (on a `kgrid_fine` grid with the k list replaced and the per-k band data left out). Under the TDA the left and de-excitation datasets are zeros; with `full_bse` they hold $X$, $-Y$ and $Y$. With `dipole_file` it also holds the per-state dipoles as `exciton_data/dipoles`, a LORRAX addition that BerkeleyGW readers ignore.
 
 `bse_dos_kpm.png`, `bse_dos_kpm.npz`
 :   `kpm_dos = true`: the exciton density of states, its Chebyshev moments and the window edges (`kpm_plot_file`).
