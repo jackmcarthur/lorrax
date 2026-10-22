@@ -425,7 +425,7 @@ def _release_bank_file(path):
 
 #: The per-map scratch generation ``screen_tangential_poles`` creates under an SC
 #: label (bank, Coulomb staging, constant and receipts); a run directory from
-#: before the rename holds them as ``sc_NNNN_shared_pole`` (common.renames).
+#: before the rename holds them under the old suffix (common.renames.DISK_NAMES).
 _MANAGED_SCRATCH = r"sc_[0-9]{4}" + suffix_pattern("_tangential")
 #: Set once this process has swept earlier processes' streamed stores (prepare_output).
 _SWEPT: list = []

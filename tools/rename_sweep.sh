@@ -26,6 +26,10 @@ if [[ ${1:-} == --go ]]; then go=--go; shift; fi
 (( $# )) || { sed -n 2,22p "$0"; exit 2; }
 cd "$(git rev-parse --show-toplevel)"
 skip=(':!manual' ':!UPGRADE_NOTES.md' ':!src/common/renames.py' ':!tools/rename_sweep.sh')
+# More paths to leave alone (history files of another repo, say), as git pathspecs:
+#   RENAME_SKIP=":!REVISIONS_R3.md :!notes/old" tools/rename_sweep.sh ...
+read -r -a extra <<< "${RENAME_SKIP:-}"
+skip+=("${extra[@]}")
 
 kebab() { echo "${1//_/-}"; }
 sentence() { local k; k=$(kebab "$1"); echo "${k^}"; }
