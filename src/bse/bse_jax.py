@@ -1216,7 +1216,10 @@ def main(argv=None) -> int:
             feast_ritz_count=args.feast_ritz_count,
             gmres_max_iter=args.gmres_max_iter, gmres_tol=args.gmres_tol,
             gmres_seed=args.gmres_seed, gmres_fp32=args.gmres_fp32,
-            rpa=use_rpa, tda=use_tda, windows_kpm=True,
+            # KPM-weighted windows unless the deck names its own: bse_feast
+            # reads feast_window1/2 only when windows_kpm is off.
+            rpa=use_rpa, tda=use_tda,
+            windows_kpm=args.feast_window1 is None and args.feast_window2 is None,
             windows_kpm_count=args.kpm_window_count,
             kpm_n_moments=args.kpm_n_moments,
             kpm_n_random=args.kpm_n_random, kpm_seed=args.gmres_seed,
