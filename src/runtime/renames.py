@@ -52,7 +52,17 @@ class Rename:
 #: Deck keys: {(deck, old key): new key or Rename}.  ``deck`` is ``"gw"`` (the
 #: GW deck's ``[cohsex]`` section, also read by the drivers that share it) or
 #: ``"td"`` (the TD-aGW TOML deck, dotted keys such as ``lorrax.collision``).
-DECK_KEYS: dict[tuple[str, str], str | Rename] = {}
+DECK_KEYS: dict[tuple[str, str], str | Rename] = {
+    # 2026-10-21, BerkeleyGW names for the fine grid (absorption.x's WFN_fi,
+    # kgrid.x's grid; kgrid_fine_shift is its dk) and the htransform utility's
+    # fine window (counted from the occupied boundary, as absorption.x's).
+    ("gw", "bse_k_grid"): "kgrid_fine",
+    ("gw", "kgrid_fi"): "kgrid_fine",
+    ("gw", "wfn_fi_min"): Rename("number_val_bands_fine", "valence bands below the "
+                                 "occupied boundary, not a 0-based band index"),
+    ("gw", "wfn_fi_max"): Rename("number_cond_bands_fine", "conduction bands above the "
+                                 "occupied boundary, not a 0-based band index"),
+}
 
 #: Deck values: {(deck, key, old value): new value or Rename}.  ``key`` is the NEW key.
 DECK_VALUES: dict[tuple[str, str, str], str | Rename] = {

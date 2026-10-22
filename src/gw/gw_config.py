@@ -1533,7 +1533,18 @@ _DEFAULTS = {
     # returned byte-identically (fast path untouched).  This is the native-
     # coarse route for a nonnested target; exciton_bands ``--w-coarse-grid``
     # instead decimates a native fine W and therefore remains nested-only.
+    # The same key sets the htransform utility's fine grid (get_centroids_fi).
     "kgrid_fine": "",
+    # kgrid.x's k offset of the fine grid, "dx dy dz" in fractions of ONE
+    # fine-grid step (k_i = (i + dk)/N per axis; 0.5 = half a step).  Empty or
+    # zero = Γ-centred.  Only k - k' enters W, so W stays on the unshifted q grid.
+    "kgrid_fine_shift": "",
+    # Conduction bands of the coarse (GW) grid fed to the H-transform; empty =
+    # every conduction band of the deck's window (ncond).  The valence side
+    # (number_val_bands_coarse) is accepted and ignored: the H-transform fits
+    # every valence band of the window.
+    "number_cond_bands_coarse": "",
+    "number_val_bands_coarse": "",
     # Coarse-to-fine W-head treatment.  ``c1`` splits the singular Gamma
     # head before densification and re-attaches it analytically; ``legacy``
     # is retained only as the shipped A/B control.
@@ -1840,10 +1851,10 @@ _DEFAULTS = {
     # now only the relative pseudo-inverse cutoff of the refit's node Gram
     # (isdf.galerkin, refit_rcond).
     "htransform_qr_eps": 1.0e-3,
-    "get_centroids_fi": False,   # Gate; if True, compute fine-grid wfns at coarse centroids.
-    "wfn_fi_min": 0,             # Sub-window of htransform band axis (0-based).
-    "wfn_fi_max": 0,             # Exclusive upper end. wfn_fi_max==0 → use full window.
-    "kgrid_fine": "",              # "nx ny nz" or "nx,ny,nz". Empty → no fine grid.
+    # Gate; if True, the htransform utility also interpolates onto kgrid_fine
+    # (+ kgrid_fine_shift) and writes the bands number_val_bands_fine below and
+    # number_cond_bands_fine above the occupied boundary.
+    "get_centroids_fi": False,
     # Fine-grid q CHUNK: how many q-points of the fine set have their
     # f(H(q)) built and decomposed at once.  0 (DEFAULT) = N_q_co, the
     # COARSE k-point count prod(kgrid_co) — not a bare constant.  fH_R is
@@ -2928,8 +2939,6 @@ def _input_storage(
     )
     bse = BSEConfig(
         get_centroids_fi=bool(params["get_centroids_fi"]),
-        wfn_fi_min=int(params["wfn_fi_min"]),
-        wfn_fi_max=int(params["wfn_fi_max"]),
         kgrid_fine=str(params["kgrid_fine"] or ""),
         wfn_fi_q_chunk=int(params["wfn_fi_q_chunk"]),
     )
@@ -4725,8 +4734,6 @@ class DebugConfig:
 class BSEConfig:
     """BSE interpolation setup (htransform-driven fine-k wfn recovery); see docs/dev/gw_config_contracts.md."""
     get_centroids_fi: bool
-    wfn_fi_min: int
-    wfn_fi_max: int
     kgrid_fine: str
     wfn_fi_q_chunk: int   # 0 = N_q_co (prod(kgrid_co)); see compute_wfns_fi
 

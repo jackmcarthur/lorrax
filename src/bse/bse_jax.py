@@ -26,7 +26,7 @@ from common.scientific_output import policy
 from common.units import RYD_TO_EV
 from runtime.run_session import RunSession
 
-from .bse_deck import (DeckError, Key, check_dipole_operator, deck_params,
+from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params,
                        deck_source, eqp_file, key_of, omega_count, read_settings)
 from .bse_ring_comm import (
     build_bse_ring_matvec_full,
@@ -358,6 +358,7 @@ def _preview_lanczos(
                     qp_rotations_file=(None if qp_rotation is None
                                        else qp_rotation["path"]),
                     dipole_attrs=dipole_attrs,
+                    k_shift=tuple(data.get("k_shift", (0.0, 0.0, 0.0))),
                 )
             _out.result(f"eigenvectors.h5: {int(n_write)} states"
                         + (" with <0|r|S>" if dipoles is not None else ""))
@@ -949,6 +950,7 @@ def _deck_settings(input_file, parser):
                                                args.haydock_omega_max_ev,
                                                float(args.delta_frequency))
         check_dipole_operator(params, named, args.dipole)
+        check_fine_grid_keys(params, named)
     except DeckError as exc:
         parser.error(str(exc))
     return schema, args, named

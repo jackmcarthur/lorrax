@@ -56,7 +56,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.fft_helpers import get_donated_kfft_kminor
 
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, window_dipoles, write_absorption_dat, write_absorption_h5)
-from .bse_deck import (DeckError, Key, check_dipole_operator, deck_params, eqp_file,
+from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params, eqp_file,
                        omega_count, read_settings)
 from .bse_head import head_shifted_eps_c
 from .bse_window import _parse_wfn_path
@@ -447,6 +447,7 @@ def main(argv=None):
             args.n_omega = omega_count(args.omega_min_eV, args.omega_max_eV,
                                        float(args.delta_frequency))
         check_dipole_operator(params, named, args.dipole)
+        check_fine_grid_keys(params, named)
     except DeckError as exc:
         p.error(str(exc))
     pols = tuple(range(3))

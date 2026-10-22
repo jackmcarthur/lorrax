@@ -446,6 +446,82 @@ class _BasisStateLog:
         return self._log(*args, **kwargs)
 
 
+def write_fine_grid_bands(params, *, ctilde, B_at_mu, enk_sigma, meta, wfn, mesh_xy,
+                          a_band, use_low_mem_eigh, output_path, log):
+    """The fine-grid bands of ``get_centroids_fi``, written to ``<stem>_fine.h5``.
+
+    The H-transform interpolates onto ``kgrid_fine`` with kgrid.x's offset
+    ``kgrid_fine_shift`` (fractions of one fine step; a shift breaks the grid's
+    symmetry and samples the zone evenly for a DOS).  Only the window written is
+    returned: ``number_val_bands_fine`` valence bands below the occupied boundary
+    and ``number_cond_bands_fine`` conduction bands above it (default: the deck's
+    nval and ncond).  Datasets: ``kpoints`` (crystal, (nk, 3)), ``energies_ev``
+    ((nk, nb)), ``bands`` (1-based); attributes ``kgrid``, ``kgrid_shift``.
+    Returns the file's path.
+    """
+    import h5py
+
+    from .bse_setup import compute_wfns_fi, parse_kgrid_shift
+
+    def _count(key, default):
+        raw = str(params.get(key, "") or "").strip()
+        try:
+            return int(raw) if raw else int(default)
+        except ValueError:
+            raise ValueError(f"deck key `{key}` takes an integer, got {raw!r}") from None
+
+    if not str(params.get("kgrid_fine", "") or "").strip():
+        raise ValueError("get_centroids_fi interpolates onto kgrid_fine; set kgrid_fine NX NY NZ")
+    nval = int(params["nval"])
+    nv_fine = _count("number_val_bands_fine", nval)
+    nc_fine = _count("number_cond_bands_fine", params["ncond"])
+    nb_fit = int(ctilde.shape[1])
+    b_min, b_max = nval - nv_fine, nval + nc_fine
+    if nv_fine <= 0 or nc_fine <= 0 or b_min < 0 or b_max > nb_fit:
+        raise ValueError(
+            f"number_val_bands_fine = {nv_fine}, number_cond_bands_fine = {nc_fine}: "
+            f"the window [{b_min}, {b_max}) of the {nb_fit} fitted bands is empty or "
+            f"leaves them (nval = {nval}; number_cond_bands_coarse sets the fitted "
+            f"conduction bands)")
+    # The f-shoulder: f(eps) is identically zero at and above max_k eps of the
+    # fitted window's top band, so the top of the fine window needs guard bands
+    # above it (``compute_wfns_fi``'s f-shoulder gate refuses; this says it first).
+    _n_guard = nb_fit - b_max
+    if _n_guard < 4:
+        logger.warning(
+            f"number_cond_bands_fine = {nc_fine} leaves {_n_guard} guard band(s) below "
+            f"the top of the {nb_fit}-band H-transform window",
+            extra=message(
+                id="htransform_guard_bands_few",
+                found=("guard bands above the fine window", _n_guard),
+                needs="at least 4: the top of the fine window may otherwise be an "
+                      "arbitrary direction out of fH's null space",
+                fix="raise number_cond_bands_coarse (or lower number_cond_bands_fine)"))
+    shift = parse_kgrid_shift(params.get("kgrid_fine_shift", ""))
+    with timing.section("wfns_fi"):
+        fine = compute_wfns_fi(
+            ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
+            kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
+            kgrid_fine=params["kgrid_fine"], kgrid_shift=shift,
+            band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, a_band_index=a_band,
+            use_low_mem_eigh=use_low_mem_eigh, log_fn=log)
+    energies = np.asarray(gather_to_host(fine.enk_full), dtype=np.float64) * RYD_TO_EV
+    stem, _ext = os.path.splitext(output_path)
+    path = f"{stem}_fine.h5"
+    if jax.process_index() == 0:
+        band_start = int(wfn.nelec) - nval
+        kgrid = [int(n) for n in str(params["kgrid_fine"]).replace(",", " ").split()]
+        with h5py.File(path, "w") as f:
+            f.create_dataset("kpoints", data=np.asarray(fine.q_frac, dtype=np.float64))
+            f.create_dataset("energies_ev", data=energies)
+            f.create_dataset("bands", data=np.arange(band_start + b_min + 1,
+                                                     band_start + b_max + 1))
+            f.attrs["kgrid"] = kgrid
+            f.attrs["kgrid_shift"] = list(shift)
+            f.attrs["units"] = "eV; kpoints in crystal coordinates of the reciprocal lattice"
+    return path
+
+
 def main(argv=None):
     parser = add_band_character_arguments(argparse.ArgumentParser(
         allow_abbrev=False, description="Hamiltonian interpolation driver"))
@@ -511,6 +587,28 @@ def main(argv=None):
         distrib_la_batched_route = resolve_distrib_la_batched_route(params)
         use_low_mem_eigh = linalg_resolution(params).layout == "distributed"
         n_return_bands = int(params["nval"]) + int(params["ncond"])
+        # number_cond_bands_coarse: the conduction bands the H-transform fits,
+        # the deck's ncond plus guard bands (it replaces --guard-bands).
+        _nc_coarse = str(params.get("number_cond_bands_coarse", "") or "").strip()
+        if _nc_coarse:
+            if args.guard_bands != parser.get_default("guard_bands"):
+                parser.error("number_cond_bands_coarse sets the fitted conduction bands, "
+                             "and so the guard bands; drop --guard-bands")
+            try:
+                args.guard_bands = int(_nc_coarse) - int(params["ncond"])
+            except ValueError:
+                parser.error(f"deck key `number_cond_bands_coarse` takes an integer, "
+                             f"got {_nc_coarse!r}")
+            if args.guard_bands < 0:
+                parser.error(f"number_cond_bands_coarse = {_nc_coarse} is below ncond = "
+                             f"{int(params['ncond'])}, the conduction bands written on the path")
+        if str(params.get("number_val_bands_coarse", "") or "").strip():
+            logger.warning("number_val_bands_coarse has no effect: the H-transform always "
+                           "fits every valence band of the window (nval)",
+                           extra=message(id="number_val_bands_coarse_ignored",
+                                         found=("number_val_bands_coarse",
+                                                str(params["number_val_bands_coarse"])),
+                                         fix="remove number_val_bands_coarse"))
     
         # Override WFN file if provided via CLI
         if args.wfn_file is not None:
@@ -650,52 +748,17 @@ def main(argv=None):
                       " path points")
         stages.begin(3, "Outputs", name="htransform.outputs")
 
-        # Optional BSE interpolation handoff: fine-k wfns at coarse centroids.
-        # Driven by ``get_centroids_fi`` + ``kgrid_fine`` + ``wfn_fi_{min,max}``;
-        # see ``bandstructure.bse_setup.compute_wfns_fi`` for the contract.
+        # Fine-grid interpolation (``get_centroids_fi``): the bands
+        # number_val_bands_fine below and number_cond_bands_fine above the
+        # occupied boundary, on kgrid_fine shifted by kgrid_fine_shift
+        # (kgrid.x's dk), written to <output stem>_fine.h5.  Contract:
+        # ``bandstructure.bse_setup.compute_wfns_fi``.
         if params.get("get_centroids_fi", False):
-            from .bse_setup import compute_wfns_fi
-            b_min = int(params["wfn_fi_min"])
-            b_max = int(params["wfn_fi_max"]) or int(ctilde.shape[1])
-            # SPLASH RADIUS OF THE f-SHOULDER, named by
-            # ``2026-08-11-fifth-wall-is-the-f-transform-shoulder.md`` §7 and
-            # audited here.  ``wfn_fi_max`` unset DEFAULTS to the full band count
-            # — zero guard bands, i.e. exactly the configuration that row
-            # convicts.  ``compute_wfns_fi``'s f-shoulder gate is what refuses;
-            # this warns first, in the vocabulary of the deck key the user would
-            # have to change, so the refusal is not the first news of it.
-            _n_guard = int(ctilde.shape[1]) - b_max
-            if _n_guard < 4:
-                logger.warning(
-                    f"wfn_fi_max={b_max} leaves only {_n_guard} guard "
-                    f"band(s) below the top of the htransform window "
-                    f"({int(ctilde.shape[1])} bands)"
-                    + (" — this is the ZERO-GUARD default (wfn_fi_max unset "
-                       "means 'the whole window')" if not
-                       int(params["wfn_fi_max"]) else ""),
-                    extra=message(
-                        id="htransform_guard_bands_few",
-                        found=("guard bands below the window top", _n_guard),
-                        needs="at least 4: f(eps) is identically zero at and "
-                              "above max_k eps of the window's own top band, "
-                              "so the top of what you ask back may be an "
-                              "arbitrary direction out of fH's null space",
-                        fix="raise nband/ncond so the window extends above "
-                            "wfn_fi_max; the f-shoulder gate decides"))
-            with timing.section("wfns_fi"):
-                wfns_fi = compute_wfns_fi(
-                    ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
-                    kgrid_co=(int(meta.nkx), int(meta.nky), int(meta.nkz)),
-                    kgrid_fine=params["kgrid_fine"],
-                    band_window_fi=(b_min, b_max),
-                    mesh_xy=mesh_xy, a_band_index=args.a_band,
-                    use_low_mem_eigh=use_low_mem_eigh, log_fn=log,
-                )
-            log(f"BSE setup: psi_rmu_Y={wfns_fi.psi_rmu_Y.shape} "
-                f"P{wfns_fi.psi_rmu_Y.sharding.spec}, "
-                f"psi_rmuT_X={wfns_fi.psi_rmuT_X.shape} "
-                f"P{wfns_fi.psi_rmuT_X.sharding.spec}, "
-                f"enk_full={wfns_fi.enk_full.shape}")
+            fine_file = write_fine_grid_bands(
+                params, ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
+                meta=meta, wfn=wfn, mesh_xy=mesh_xy, a_band=args.a_band,
+                use_low_mem_eigh=use_low_mem_eigh, output_path=output_path, log=log)
+            log(f"fine-grid bands written to {fine_file}")
 
         _moment_files = band_character_and_moments(
                 colors=args.color, moments_grid=args.moments_grid,

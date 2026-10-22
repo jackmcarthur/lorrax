@@ -141,20 +141,22 @@ def n_pad_transitions(data) -> int:
                  - int(data["n_cond"]) * int(data["n_val"]))
 
 
-def _generate_kpts_grid(nkx: int, nky: int, nkz: int) -> np.ndarray:
+def _generate_kpts_grid(nkx: int, nky: int, nkz: int, shift=(0.0, 0.0, 0.0)) -> np.ndarray:
     """Monkhorst-Pack style k-point grid in crystal coords [0, 1), C-order.
 
-    Returns ``(nk, 3)``: the BSE's k-row order.  Consumers:
+    Returns ``(nk, 3)``: the BSE's k-row order, k = (i + dk)/N with ``shift``
+    kgrid.x's dk (``kgrid_fine_shift``; 0 for a Γ-centred grid).  Consumers:
     ``write_eigenvectors_stream`` and the QP-rotation frame check
     (``bse_qp_rotation.load_qp_rotation``).
     """
+    dx, dy, dz = (float(s) for s in shift)
     kpts = []
     for ix in range(nkx):
         for iy in range(nky):
             for iz in range(nkz):
-                kx = ix / nkx
-                ky = iy / nky
-                kz = iz / nkz if nkz > 0 else 0.0
+                kx = (ix + dx) / nkx
+                ky = (iy + dy) / nky
+                kz = (iz + dz) / nkz if nkz > 0 else 0.0
                 kpts.append([kx, ky, kz])
     return np.array(kpts, dtype=np.float64)
 
@@ -173,6 +175,7 @@ def write_eigenvectors_stream(
     dipoles: Optional[np.ndarray] = None,
     qp_rotations_file: Optional[str] = None,
     dipole_attrs: Optional[dict] = None,
+    k_shift=(0.0, 0.0, 0.0),
 ) -> None:
     # ``qp_rotations_file``: the amplitudes are on QP-rotated states
     # (``bse.bse_qp_rotation``); stamped as ``exciton_header`` attributes
@@ -255,7 +258,7 @@ def write_eigenvectors_stream(
             f"({_nc_arr}, {_nv_arr}).  Pass the LOADER's resolved counts "
             f"(data['n_cond'] / data['n_val']), not the CLI request — under "
             f"band_degeneracy = snap the resolved window is the wider one.")
-    kpts = _generate_kpts_grid(nkx, nky, nkz)
+    kpts = _generate_kpts_grid(nkx, nky, nkz, k_shift)
     nk = kpts.shape[0]
     ns = 1
     nQ = 1

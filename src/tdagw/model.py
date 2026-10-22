@@ -626,8 +626,15 @@ def load_td_model(input_file: str, mesh_xy: Mesh, *, bands, wfn_file: str | None
 
 
 def _deck_densifies(input_file: str, header: dict) -> bool:
-    """True when the deck's ``kgrid_fine`` differs from the restart's grid (the loader's own test)."""
-    from bse.bse_densify import _resolve_kgrid_fine
+    """True when the deck's ``kgrid_fine`` differs from the restart's grid (the loader's own test).
+
+    A ``kgrid_fine_shift`` refuses: the TD-aGW system builds its k list
+    Γ-centred (``td_system``), so it does not take a shifted fine grid yet.
+    """
+    from bse.bse_densify import _resolve_kgrid_fine, _resolve_kgrid_fine_shift
+    if any(_resolve_kgrid_fine_shift(input_file)):
+        raise ValueError("GATE td_kgrid_fine_shift: TD-aGW does not take a shifted fine "
+                         "grid yet; remove kgrid_fine_shift from the deck")
     fine = _resolve_kgrid_fine(None, input_file)
     coarse = tuple(int(n) for n in np.asarray(header["grid"]).reshape(-1)[:3])
     return fine is not None and tuple(int(n) for n in fine) != coarse

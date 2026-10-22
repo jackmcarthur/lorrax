@@ -168,6 +168,19 @@ def eqp_file(params: dict, named: set, deck_path: str) -> str | None:
     return raw if os.path.isabs(raw) else os.path.join(deck_dir, raw)
 
 
+def check_fine_grid_keys(params: dict, named: set) -> None:
+    """The fine-grid keys (``kgrid_fine_shift``, ``number_*_bands_coarse``) need
+    ``kgrid_fine``: without a fine grid there is no interpolation to configure."""
+    if str(params.get("kgrid_fine", "") or "").strip():
+        return
+    stray = [k for k in ("kgrid_fine_shift", "number_cond_bands_coarse",
+                         "number_val_bands_coarse")
+             if k in named and str(params.get(k, "") or "").strip()]
+    if stray:
+        raise DeckError(f"{', '.join(f'`{k}`' for k in stray)} configure{'s' if len(stray) == 1 else ''} "
+                        f"the interpolation onto kgrid_fine, which this deck does not set")
+
+
 def check_dipole_operator(params: dict, named: set, dipole_path: str | None) -> None:
     """``use_momentum`` / ``use_velocity``: assert which operator ``dipole_path`` holds.
 

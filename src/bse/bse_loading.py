@@ -16,6 +16,7 @@ from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
 
 from .bse_densify import (_interpolate_bse_data_to_grid,
                           _read_lorrax_input_quietly, _resolve_kgrid_fine,
+                          _resolve_kgrid_fine_shift,
                           resolve_w_head_densify)
 from .bse_head import _inject_q0_head, _resolve_head_params
 from .bse_preconditioner import compute_pair_amplitude
@@ -218,8 +219,11 @@ def load_bse_data_from_restart_sharded(
     # head-EXCLUDED body and re-attaches the head per fine q afterwards, so on
     # a densifying run the rank-1 whead must NOT go on now.
     fine_grid = _resolve_kgrid_fine(kgrid_fine, input_file)
+    fine_shift = _resolve_kgrid_fine_shift(input_file)
+    if fine_grid is None and any(fine_shift):
+        raise ValueError("kgrid_fine_shift shifts kgrid_fine, which the deck does not set")
     densify_pending = (fine_grid is not None
-                       and fine_grid != (nkx, nky, nkz))
+                       and (fine_grid != (nkx, nky, nkz) or any(fine_shift)))
     qp_rotation = None
     if qp_rotations_file is None:
         n_val, n_cond = resolve_band_window(enk_full, n_occ, n_val, n_cond,
@@ -407,10 +411,12 @@ def load_bse_data_from_restart_sharded(
             velocity_full_window=bool(velocity_full_window),
             velocity_pair_rule=str(velocity_pair_rule),
             velocity_position_fix=bool(velocity_position_fix),
-            velocity_pair_gap_ev=float(velocity_pair_gap_ev))
+            velocity_pair_gap_ev=float(velocity_pair_gap_ev),
+            fine_shift=fine_shift)
     # A densified bundle's ε already carry ``eqp_file``; the drivers re-slice
     # the coarse restart's QP energies only when this is False.
     data["densified"] = bool(densify_pending)
+    data.setdefault("k_shift", (0.0, 0.0, 0.0))
     return data
 
 

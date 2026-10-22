@@ -117,14 +117,39 @@ def _parse_kgrid_fine(spec) -> tuple[int, int, int]:
     return tuple(int(x) for x in parts)
 
 
-def _uniform_kgrid_frac(kgrid: tuple[int, int, int]) -> jax.Array:
-    """Γ-centred uniform k-grid in crystal coords, wrapped to (-0.5, 0.5]."""
+def parse_kgrid_shift(spec) -> tuple[float, float, float]:
+    """``kgrid_fine_shift``: kgrid.x's dk, ``"dx dy dz"`` in fractions of one
+    fine-grid step, each reduced to [0, 1).  Empty or None -> (0, 0, 0)."""
+    if spec is None or (isinstance(spec, str) and not spec.strip()):
+        return (0.0, 0.0, 0.0)
+    parts = list(spec) if isinstance(spec, (tuple, list)) else \
+        str(spec).replace(',', ' ').split()
+    if len(parts) != 3:
+        raise ValueError(f"kgrid_fine_shift takes three numbers dx dy dz (kgrid.x's dk, "
+                         f"in fractions of one fine-grid step), got {spec!r}")
+    vals = tuple(float(str(x).replace('d', 'e').replace('D', 'e')) for x in parts)
+    if not all(np.isfinite(vals)):
+        raise ValueError(f"kgrid_fine_shift must be finite, got {spec!r}")
+    return tuple(float(v % 1.0) for v in vals)
+
+
+def uniform_kgrid_frac(kgrid: tuple[int, int, int],
+                       shift=(0.0, 0.0, 0.0)) -> np.ndarray:
+    """The uniform k grid k_i = (i + dk)/N in crystal coords, C order (ix
+    slowest), wrapped to (-0.5, 0.5]; ``shift`` is kgrid.x's dk (fractions of
+    one step).  Host float64."""
     nx, ny, nz = kgrid
-    ix = np.arange(nx, dtype=np.float64) / nx
-    iy = np.arange(ny, dtype=np.float64) / ny
-    iz = np.arange(nz, dtype=np.float64) / nz
+    dx, dy, dz = (float(s) for s in shift)
+    ix = (np.arange(nx, dtype=np.float64) + dx) / nx
+    iy = (np.arange(ny, dtype=np.float64) + dy) / ny
+    iz = (np.arange(nz, dtype=np.float64) + dz) / nz
     grid = np.stack(np.meshgrid(ix, iy, iz, indexing='ij'), axis=-1).reshape(-1, 3)
-    return jnp.asarray((grid + 0.5) % 1.0 - 0.5)
+    return (grid + 0.5) % 1.0 - 0.5
+
+
+def _uniform_kgrid_frac(kgrid: tuple[int, int, int], shift=(0.0, 0.0, 0.0)) -> jax.Array:
+    """:func:`uniform_kgrid_frac` on the device (Γ-centred when ``shift`` is 0)."""
+    return jnp.asarray(uniform_kgrid_frac(kgrid, shift))
 
 
 #: The f-shoulder tripwire's floor on ``min_k |f(ε_b)| / max|f|``, over the
@@ -243,8 +268,8 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
             f"how many you need is the DEPTH OF THE DEAD SET printed above "
             f"({n_zero_k} exactly-zero (band, k) slots), which was four bands "
             f"on a 20-band window and two on a 52-band one.  In a deck: raise "
-            f"``nband``/``ncond`` above the window you return "
-            f"(``wfn_fi_max``, the BSE window, the ζ-fit window).  In code: "
+            f"``number_cond_bands_coarse`` (or ``ncond``) above the window you "
+            f"return (``number_cond_bands_fine``, the ζ-fit window).  In code: "
             f"``htransform.initialize_wfns(n_guard_bands=…)``, which "
             f"``bse.vq_interp.refit_prepare`` drives from "
             f"``--refit-guard-bands``.  Do NOT reach for "
@@ -329,6 +354,7 @@ def compute_wfns_fi(
     a_band_index: int | None = None,
     batch_size: int | None = None,
     q_list=None,
+    kgrid_shift=None,
     return_coeffs: bool = False,
     use_low_mem_eigh: bool = False,
     htransform_quality_record_fn=None,
@@ -368,6 +394,8 @@ def compute_wfns_fi(
                    the q axis splits.
         q_list:    optional (nq, 3) fractional q — evaluate at exactly these
                    points instead of a uniform grid (wrapped to (−0.5, 0.5]).
+        kgrid_shift: with ``kgrid_fine``, kgrid.x's dk ``(dx, dy, dz)`` in
+                   fractions of one fine-grid step: k_i = (i + dk)/N.
         return_coeffs: also return the eigenvector coefficients
                    ``.coeffs_fi`` (nk_fi, rank, nb_fi), q-sharded.
         use_low_mem_eigh: the deck's ``linalg = distributed``: no rank may
@@ -436,7 +464,9 @@ def compute_wfns_fi(
     if q_list is None:
         kgrid_fine = _parse_kgrid_fine(kgrid_fine)
         nq = kgrid_fine[0] * kgrid_fine[1] * kgrid_fine[2]
-        log(f"  bse_setup: {kgrid_co} → {kgrid_fine} ({nq} q-pts), "
+        kgrid_shift = parse_kgrid_shift(kgrid_shift)
+        log(f"  bse_setup: {kgrid_co} → {kgrid_fine} ({nq} q-pts"
+            + (f", shift {kgrid_shift}" if any(kgrid_shift) else "") + "), "
             f"bands [{b_min}, {b_max}) of {nb_co} fitted, rank {rank}, "
             f"{_batch_note}")
     else:
@@ -466,7 +496,7 @@ def compute_wfns_fi(
 
     # ── q-points (uniform fine grid or explicit list), padded to batch ───
     if q_list is None:
-        q_all = _uniform_kgrid_frac(kgrid_fine)
+        q_all = _uniform_kgrid_frac(kgrid_fine, kgrid_shift)
     else:
         q_all = jnp.asarray((q_list + 0.5) % 1.0 - 0.5)
     n_pad = padded_axis(nq, bs, name="BSE setup q batch").pad

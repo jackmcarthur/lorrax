@@ -148,7 +148,8 @@ from common.report_blocks import Setting
 from common.scientific_output import abs_path, band_range, policy
 from runtime.run_session import RunSession
 from .bse_head import head_shifted_eps_c
-from .bse_deck import DeckError, Key, deck_params, deck_source, eqp_file, read_settings
+from .bse_deck import (DeckError, Key, check_fine_grid_keys, deck_params, deck_source,
+                       eqp_file, read_settings)
 from .bse_io import (load_bse_data_from_restart_sharded, decimate_W_q_to_subgrid, make_w_densifier, w_pair_embedding, build_w_head_channel, resolve_w_head_densify, _resolve_head_params, PAD_EPS_GUARD_RY)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
@@ -1371,6 +1372,11 @@ def deck_settings(ap, args):
         settings.eqp = eqp_file(params, named, args.input)
         if settings.degeneracy_check_override:
             settings.band_degeneracy = "off"
+        check_fine_grid_keys(params, named)
+        if "kgrid_fine_shift" in named and any(
+                float(x) for x in str(params["kgrid_fine_shift"]).replace(",", " ").split()):
+            raise DeckError("bse.exciton_bands does not take a shifted fine grid yet: its "
+                            "k + Q list is Γ-centred; remove kgrid_fine_shift")
     except DeckError as exc:
         ap.error(str(exc))
     for key, value in vars(settings).items():

@@ -313,6 +313,46 @@ def _resolve_kgrid_fine(kgrid_fine, input_file: Optional[str]):
     return None
 
 
+def _resolve_kgrid_fine_shift(input_file: Optional[str]) -> tuple[float, float, float]:
+    """The deck's ``kgrid_fine_shift`` (kgrid.x's dk, fractions of one fine step), or 0."""
+    from bandstructure.bse_setup import parse_kgrid_shift
+    params = _read_lorrax_input_quietly(input_file)
+    return parse_kgrid_shift(params.get("kgrid_fine_shift", ""))
+
+
+def coarse_conduction_count(params: dict, n_cond: int, *, log_fn=log.debug):
+    """``number_cond_bands_coarse``: the conduction bands of the coarse grid that
+    enter the H-transform (None: every conduction band of the deck's window).
+
+    ``number_val_bands_coarse`` is accepted and has no effect: the H-transform
+    fits every valence band of the window.  Fewer coarse than fine conduction
+    bands refuses; fewer than four guard bands above the fine window warns.
+    """
+    raw_v = str(params.get("number_val_bands_coarse", "") or "").strip()
+    if raw_v:
+        log.warning("number_val_bands_coarse has no effect: the H-transform always fits "
+                    "every valence band of the GW window (a requirement of its f(H)); "
+                    "number_val_bands_fine chooses the BSE window",
+                    extra=message(id="number_val_bands_coarse_ignored",
+                                  found=("number_val_bands_coarse", raw_v),
+                                  fix="remove number_val_bands_coarse"))
+    raw = str(params.get("number_cond_bands_coarse", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        nc_co = int(raw)
+    except ValueError:
+        raise ValueError(f"deck key `number_cond_bands_coarse` takes an integer, "
+                         f"got {raw!r}") from None
+    if nc_co < int(n_cond):
+        raise ValueError(
+            f"GATE bse_window_outside_coarse: number_cond_bands_fine = {n_cond} "
+            f"exceeds number_cond_bands_coarse = {nc_co}; the fine window is "
+            f"interpolated from the coarse bands, so it cannot be wider.  fix: "
+            f"raise number_cond_bands_coarse (4 or more above the fine window).")
+    return nc_co
+
+
 #: Deck / CLI values for ``w_head_densify``: ``c1`` (default) re-attaches the
 #: Γ head analytically; ``srlr`` moves the whole long-range part of W (head
 #: and, in a slab, its G_z channels) into a fitted model (:func:`_srlr_terms`).
@@ -952,8 +992,12 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                       mesh_xy, log_fn=log.debug, full_window: bool = False,
                       qp_states: bool = False, pair_rule: str = "mask",
                       pair_gap_ev: float = 0.05,
-                      mixing_receipt: bool = False) -> dict:
+                      mixing_receipt: bool = False, probe=None) -> dict:
     r"""r-form dipoles of a ``kgrid_fine`` bundle, in the gauge of its own ψ.
+
+    ``probe``: on a shifted fine grid, a ``compute_wfns_fi`` bundle (with
+    coefficients) at the coarse k, on which the on-grid identities are read;
+    no point of the shifted grid is a coarse k.
 
     The coarse WFN's velocity matrix ``v(k)`` (``psp.get_dipole_mtxels``'
     ``dipole.h5``, unfolded in the loader's gauge, which is the Galerkin
@@ -1165,7 +1209,15 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                                     tuple(coarse_grid), mesh_xy,
                                     B_at_mu=basis.basis_at_nodes,
                                     image_record_fn=_record)
-    del ops, coeffs
+    del coeffs
+    if probe is not None:
+        q_probe = np.asarray(probe.q_frac, dtype=np.float64)
+        out_probe = interpolate_band_operator(
+            ops, basis.ctilde, _coefficients_by_q(probe.coeffs_fi, padded_axis(
+                int(q_probe.shape[0]), mesh_xy, name="dipole probe q carrier").carrier,
+                mesh_xy),
+            q_probe, tuple(coarse_grid), mesh_xy, B_at_mu=basis.basis_at_nodes)
+    del ops
     win = np.asarray(gather_to_host(jax.jit(lambda o: o[:nq])(out)))  # (nq, 4, nb, nb)
     f_win = win[:, 3]
     v_win, weight_floor = np.moveaxis(win[:, :3], 1, 0), 1.0
@@ -1253,10 +1305,17 @@ def densified_dipoles(velocity, *, sym, basis, fine, fh_energies,
                f"(relative); large values (strongly band-dependent QP shifts, "
                f"CrI3-type) call for dipole_position_fix")
 
-    on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
-        out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
-        k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start,
-        fh_energies=fh_energies)
+    if probe is None:
+        on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
+            out, basis.ctilde, fine.coeffs_fi, ops_host=(v_full, f_full),
+            k_coarse=sym.unfolded_kpts, q_fine=q_frac, window_start=window_start,
+            fh_energies=fh_energies)
+    else:
+        on_grid_rel, state_dev, defect, n_on_grid = _dipole_on_grid_identity(
+            out_probe, basis.ctilde, probe.coeffs_fi, ops_host=(v_full, f_full),
+            k_coarse=sym.unfolded_kpts, q_fine=q_probe, window_start=window_start,
+            fh_energies=fh_energies)
+        del out_probe
     v_window = v_win if full_window else None                   # (3, nq, nb, nb)
     del out, f_win
     shift_mev = float(np.max(np.abs(
@@ -1425,9 +1484,15 @@ def _interpolate_bse_data_to_grid(
     velocity_pair_rule: str = "mask",
     velocity_pair_gap_ev: float = 0.05,
     velocity_position_fix: bool = False,
+    fine_shift=(0.0, 0.0, 0.0),
     log_fn=log.debug,
 ) -> dict:
     """Interpolate the WHOLE coarse BSE ``data`` bundle onto ``fine_grid``.
+
+    ``fine_shift`` is ``kgrid_fine_shift`` (kgrid.x's dk, fractions of one
+    fine step): ψ and ε are evaluated at k_i = (i + dk)/N.  Only k − k' enters
+    the direct term, and that difference does not depend on dk, so W stays on
+    the unshifted fine q grid; the Q = 0 exchange tile is k-independent.
 
     The single coarse→fine densification the ``kgrid_fine`` knob drives, living
     in the GENERAL init so EVERY solver consumes a fine-grid bundle unchanged.
@@ -1525,6 +1590,15 @@ def _interpolate_bse_data_to_grid(
     params = read_lorrax_input(input_file)
     _distrib_la_batched_route = resolve_distrib_la_batched_route(
         params, override=distrib_la_batched_route)
+    fine_shift = tuple(float(x) for x in fine_shift)
+    nc_coarse = coarse_conduction_count(params, n_cond, log_fn=log_fn)
+    n_extra_guard = 0
+    if nc_coarse is not None:
+        # The H-transform's window is the deck's [nelec - nval, nelec + ncond);
+        # number_cond_bands_coarse narrows its conduction side, or widens it
+        # with guard bands loaded above ncond (initialize_wfns' one lever).
+        n_extra_guard = max(0, nc_coarse - int(params["ncond"]))
+        params = dict(params, ncond=min(int(params["ncond"]), nc_coarse))
 
     # The restart and fresh htransform WFN first meet at this seam.
     from file_io.qp_wfn import refuse_conflicting_qp_state_sources
@@ -1575,7 +1649,7 @@ def _interpolate_bse_data_to_grid(
          input_file, params, log_fn, mesh_xy=mesh_xy, eqp_file=eqp_file,
          centroid_subset_idx=_fit_subset,
          rank_record_fn=htransform_rank_record_fn,
-         wfn_sym=wfn_sym)
+         wfn_sym=wfn_sym, n_guard_bands=n_extra_guard)
     ctilde, B_at_mu = basis.ctilde, basis.basis_at_nodes
     nb_window = int(ctilde.shape[1])
     nval_in = int(params["nval"])          # window-relative CBM index
@@ -1583,8 +1657,9 @@ def _interpolate_bse_data_to_grid(
     if b_min < 0 or b_max > nb_window:
         raise ValueError(
             f"kgrid_fine BSE window [{b_min},{b_max}) escapes the htransform fH "
-            f"window [0,{nb_window}); the input's nval/nband must load "
-            f">= {n_val} valence and >= {n_cond} conduction guard bands.")
+            f"window [0,{nb_window}); the deck's nval and "
+            f"number_cond_bands_coarse (or ncond) must load >= {n_val} valence "
+            f"and >= {n_cond} conduction bands.")
     # SPLASH RADIUS OF THE f-SHOULDER (``2026-08-11-fifth-wall-is-the-f-\
     # transform-shoulder.md`` §7, audited here).  The check above refuses
     # ``b_max > nb_window`` and so PERMITS ``b_max == nb_window`` — a deck
@@ -1601,16 +1676,17 @@ def _interpolate_bse_data_to_grid(
                     f"{nb_window}-band htransform window.  The f-transform's shift "
                     f"is max_k eps of THAT window's top band, so f == 0 there and "
                     f"the shoulder below it carries ~1% of fH's weight; the top of "
-                    f"the returned window may be arbitrary.  Raise nband/ncond.",
+                    f"the returned window may be arbitrary.  Raise "
+                    f"number_cond_bands_coarse (or ncond).",
                     extra=message(
-                        id="kgrid_fine_guard_bands_few",
-                        found=("conduction guard bands above the BSE window",
+                        id="bse_coarse_guard_bands_few",
+                        found=("number_cond_bands_coarse - number_cond_bands_fine",
                                str(_n_guard)),
                         needs="at least 4",
-                        fix="raise nband/ncond in the deck"))
+                        fix="raise number_cond_bands_coarse (or ncond)"))
     bundle = compute_wfns_fi(
         ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
-        kgrid_co=coarse_grid, kgrid_fine=fine_grid,
+        kgrid_co=coarse_grid, kgrid_fine=fine_grid, kgrid_shift=fine_shift,
         band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
         a_band_index=htransform_a_band,
         batch_size=int(params.get("wfn_fi_q_chunk", 0)),
@@ -1619,6 +1695,17 @@ def _interpolate_bse_data_to_grid(
     dipoles = None
     if velocity is not None:
         from common.collectives import gather_to_host
+        probe = None
+        if any(fine_shift):
+            # No point of a shifted grid is a coarse k, so the interpolant's
+            # on-grid identities are read on a probe batch AT the coarse k.
+            probe = compute_wfns_fi(
+                ctilde=ctilde, B_at_mu=B_at_mu, enk_sigma=enk_sigma,
+                kgrid_co=coarse_grid, q_list=np.asarray(sym.unfolded_kpts),
+                band_window_fi=(b_min, b_max), mesh_xy=mesh_xy, log_fn=log_fn,
+                a_band_index=htransform_a_band,
+                batch_size=int(params.get("wfn_fi_q_chunk", 0)),
+                return_coeffs=True)
         dipoles = densified_dipoles(
             velocity, sym=sym, basis=basis, fine=bundle,
             fh_energies=np.asarray(gather_to_host(enk_sigma)).T,
@@ -1627,7 +1714,8 @@ def _interpolate_bse_data_to_grid(
             full_window=velocity_full_window,
             qp_states=eqp_file is not None and bool(velocity_position_fix),
             pair_rule=velocity_pair_rule, pair_gap_ev=velocity_pair_gap_ev,
-            mixing_receipt=eqp_file is not None)
+            mixing_receipt=eqp_file is not None, probe=probe)
+        del probe
         del bundle.coeffs_fi, velocity
 
     x4 = NamedSharding(mesh_xy, P(None, None, None, "x"))
@@ -1859,6 +1947,8 @@ def _interpolate_bse_data_to_grid(
         "V_q_coarse": data["V_q_full"],
         "V_q_coarse_grid": coarse_grid,
         "nkx": fine_grid[0], "nky": fine_grid[1], "nkz": fine_grid[2],
+        # kgrid_fine_shift: the bundle's k rows are (i + dk)/N.
+        "k_shift": fine_shift,
         # The fine window dipoles in this bundle's ψ gauge, or None: a
         # densified bundle never slices a dipole file (window_dipoles).
         "dipoles": dipoles,
