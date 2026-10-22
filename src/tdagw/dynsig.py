@@ -857,7 +857,7 @@ def gw_window_source(gw_deck: str, mesh: Mesh, *, workdir: str, screening: bool 
     it runs).  Returns the observer's dict (``member`` "gn_ppm" or "tangential",
     ``wfns``, ``meta``, ``config``, ``head``, ``efermi_ry``, ``request``; GN-PPM:
     ``poles``, ``V_q``, ``quad`` and with ``screening`` ``fit_plan``,
-    ``W_supports``; shared pole: ``model``, ``occupation_state``, ``linalg`` and
+    ``W_supports``; tangential: ``model``, ``occupation_state``, ``linalg`` and
     with ``screening`` ``screening_inputs``, ``recipe_inputs``) plus ``poles`` (the
     window Sigma's model: the ``PPMBuildResult``, or
     ``gw.ppm_sigma.tangential_window_source`` of the run's model), ``plan``
@@ -1747,7 +1747,7 @@ def window_collision(source: dict, ops, *, mesh: Mesh, k_frac, b_lo: int, ntr: i
                      snapshot_tol_ha: float = 1e-9, snapshot_mixing: float = 0.5,
                      snapshot_acceleration: str = "anderson",
                      say=print, record=None):
-    """The held collision term at t0 and its refresh hook (§1.5, §7.1), GN-PPM or shared pole.
+    """The held collision term at t0 and its refresh hook (§1.5, §7.1), GN-PPM or tangential.
 
     Parameters
     ----------

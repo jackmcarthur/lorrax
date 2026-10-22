@@ -166,7 +166,7 @@ mass-weighted fit is what loses such a state.
 | sign-definite | relative | sup_box \|d\| \|Q(d) − 1/d\| ≤ ε |
 
 ε is `sigma_quadrature_eps`, the only accuracy dial, read the same way on
-every Σ route (GN/HL-PPM, MPA, shared pole). The default is 10⁻⁴ (the
+every Σ route (GN/HL-PPM, MPA, tangential). The default is 10⁻⁴ (the
 `relaxed` tangential tier defaults to 5·10⁻⁴); the
 [input reference](../input_reference.md) owns both.
 

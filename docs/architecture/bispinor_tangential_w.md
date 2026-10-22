@@ -374,10 +374,10 @@ and each canonical parent is written once (`GATE tangential_sector_rounds`).
 ## 6 The store {#sector-store}
 
 A map writes four ordered models, `CC`, `TT`, `CT_C` and `CT_T`
-(`write_tangential_model`, schema `lorrax.shared-real-pole.v1`, recipe stamped
+(`write_tangential_model`, schema `lorrax.tangential.v1`, recipe stamped
 `raw-sector-endpoint-v1`). The factor dataset is `[q, μ, components, K]`, with 3
 components for `TT` and `CT_T` and 1 otherwise. `CT_C` and `CT_T` share one pole
-census. A manifest `sectors.json` (`lorrax.shared-real-pole-sectors.v1`,
+census. A manifest `sectors.json` (`lorrax.tangential-sectors.v1`,
 representation `sector-ordered-ph`; `write_tangential_sector_manifest`,
 `src/file_io/tangential_store.py:973`) binds the four models and the bank's
 constant. Reuse of a published manifest on an interrupted SC map is

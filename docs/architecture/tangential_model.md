@@ -366,8 +366,8 @@ $10^{-12}$. The bare moments are checked where they are produced
 
 ## 7 Store schema
 
-`model.h5` (`lorrax.shared-real-pole.v1`) and `bank.h5`
-(`lorrax.shared-real-pole-bank.v3`) share one authenticated header
+`model.h5` (`lorrax.tangential.v1`) and `bank.h5`
+(`lorrax.tangential-bank.v3`) share one authenticated header
 (`file_io.tangential_store`); bulk payloads cross SlabIO only.
 
 | field | meaning |

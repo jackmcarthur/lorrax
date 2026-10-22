@@ -1,4 +1,4 @@
-"""Canonical shared real-pole model and construction scratch I/O.
+"""Canonical tangential model and construction scratch I/O.
 
 The physical convention is Wc(z) = b (z_Ry**2 - Lambda)**-1 b†.
 The on-disk dataset remains ``factor`` for compatibility; it stores b.
@@ -24,6 +24,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from runtime.padding import combined_divisor, padded_axis, spec_divisor
 from common import timing
 from common.log import get_logger, record as log_record
+from common.renames import disk_name
 from common.collectives import (agree_io_error, device_put_process_local, device_put_process_local_cached,
                                 process_rank, psum_replicate,
                                 rank0_read, rank0_transaction)
@@ -34,9 +35,9 @@ from symmetry_maps import QirrTables, validate_qirr_tables
 
 log = get_logger(__name__)
 
-SCHEMA = "lorrax.shared-real-pole.v1"
-BANK_SCHEMA = "lorrax.shared-real-pole-bank.v3"
-SECTOR_SCHEMA = "lorrax.shared-real-pole-sectors.v1"
+SCHEMA = "lorrax.tangential.v1"
+BANK_SCHEMA = "lorrax.tangential-bank.v3"
+SECTOR_SCHEMA = "lorrax.tangential-sectors.v1"
 _TABLE_KEYS = ("irr_idx_q", "sym_idx_q", "q_irr_frac", "sym_perm", "L_table")
 _IDENTITY_KEYS = ("iteration_id", "hamiltonian", "energies", "occupations",
                   "wavefunctions", "centroids")
@@ -1006,7 +1007,7 @@ def _model_metadata(path, expected_identity):
     """Every metadata check of ``validate_tangential_model``; return the header."""
     header = _read_header(path)
     _check_identity(header["identity"], expected_identity)
-    if header["schema"] != SCHEMA or not header["finalized"] or not all(header["written_q"]):
+    if disk_name(header["schema"]) != SCHEMA or not header["finalized"] or not all(header["written_q"]):
         _refuse("missing final tangential commit or incomplete q census")
     sector = header.get("sector")
     components = header.get("factor_components", 1)
@@ -1150,7 +1151,7 @@ def validate_tangential_sector_manifest(path, *, expected_identity, mesh_xy, cap
         error=exc
     agree_io_refusal(error,path=path,stage='tangential.sector_manifest.read')
     _check_identity(header.get('identity'),expected_identity)
-    if (header.get('schema')!=SECTOR_SCHEMA or header.get('representation')!='sector-ordered-ph'
+    if (disk_name(header.get('schema'))!=SECTOR_SCHEMA or header.get('representation')!='sector-ordered-ph'
             or header.get('operator_realization')!='raw-sector-endpoint-v1'):
         _refuse('unsupported sector manifest')
     content={k:v for k,v in header.items() if k!='digest'}
@@ -1201,7 +1202,7 @@ def read_tangential_census(io, *, header, capacity=None):
     """
     if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
         _refuse("metadata-only validation cannot authorize tensor reads")
-    if header["schema"] != SCHEMA or not header["finalized"]:
+    if disk_name(header["schema"]) != SCHEMA or not header["finalized"]:
         _refuse("pole census requires a validated finalized model")
     _check_io_capacity(capacity,io.mesh,header)
     amount = 8*header["n_q_irr"]*header["Kmax"]
@@ -1227,7 +1228,7 @@ def read_tangential_matrix(io, q_span, *, meta, header):
         _refuse("scalar matrix reader cannot consume a sector endpoint; use the face reader")
     if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
         _refuse("metadata-only validation cannot authorize tensor reads")
-    if header["schema"] != SCHEMA or not header["finalized"]:
+    if disk_name(header["schema"]) != SCHEMA or not header["finalized"]:
         _refuse("matrix reader requires a finalized model")
     basis, ledger = _check_basis(meta, header), _capacity(meta)
     # Both guards belong to the reader this one was extracted from
@@ -1298,7 +1299,7 @@ def read_tangential_faces(io, q_span, *, meta, header, column_span=None, basis=N
         _refuse(f"face orientations must be a nonempty subset of ('x','y'); got {orientations}")
     if header.get("validation_receipt", {}).get("status") == "NOT_MEASURED":
         _refuse("metadata-only validation cannot authorize tensor reads")
-    if header["schema"] != SCHEMA or not header["finalized"]:
+    if disk_name(header["schema"]) != SCHEMA or not header["finalized"]:
         _refuse("face reader requires a validated finalized model")
     basis = _check_basis(meta, header, basis)
     components = header.get("factor_components", 1)
@@ -2330,7 +2331,7 @@ def _validate_bank(path, *, expected_identity, mesh_xy,
         _refuse(f"scratch bank schema {header.get('schema')} is retired: it stores dense W at every "
                 f"line sample and the minus-q partner fields; {BANK_SCHEMA} stores only the "
                 "line-sample direction panels")
-    if header.get("schema") != BANK_SCHEMA:
+    if disk_name(header.get("schema")) != BANK_SCHEMA:
         _refuse("scratch bank schema mismatch")
     _check_identity(header["identity"], expected_identity)
     if hashlib.sha256(_json(header["recipe"]).encode()).hexdigest() != header["recipe_hash"]:
@@ -2827,7 +2828,7 @@ def _dense_plan(io, q_span, *, meta, header, sample_span, sample_ids, fields, q_
     :func:`read_tangential_bank` and :func:`read_round_samples`, so both
     return the same arrays.
     """
-    if header.get("schema") != BANK_SCHEMA:
+    if disk_name(header.get("schema")) != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
     _check_basis(meta, header)
     if io.mesh is not meta.mu_basis.mesh_xy:
@@ -3024,7 +3025,7 @@ def _line_panel_plan(io, q_span, *, meta, header, family, sample, cross, q_ids, 
     returning ``(panels, counts)``. One plan serves the per-sample read and
     the round read, so both return the same arrays.
     """
-    if header.get("schema") != BANK_SCHEMA:
+    if disk_name(header.get("schema")) != BANK_SCHEMA:
         _refuse("scratch bank reader schema mismatch")
     _check_basis(meta, header)
     if io.mesh is not meta.mu_basis.mesh_xy:

@@ -114,7 +114,7 @@ class observe_window_sigma_source:
       ``W_supports`` (copies of the fit's two W samples, W(0) and W(probe) on
       the fit's q set, taken right after the fit), the held inputs of the
       GN-PPM screening update (``gw.ppm_sigma.screening_update``, Eq. 6);
-    * shared pole (``gw.sigma_dispatch``'s scalar tangential Sigma stage):
+    * tangential (``gw.sigma_dispatch``'s scalar tangential Sigma stage):
       ``model`` (the screening handle: ``path``, ``identity``, ``digest``,
       ``K``), ``occupation_state`` (the run's), ``linalg``; ``screening=True``
       also ``screening_inputs``, the arguments of the run's

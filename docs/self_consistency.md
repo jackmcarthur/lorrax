@@ -580,7 +580,7 @@ Jacobian has eigenvalues of about −3 or below along cycle directions on
 GN-PPM decks with many bands near the gap, so a plain fixed point 2-cycles
 and damping only shrinks the cycle; undamped linear mixing also amplifies
 the input's time-reversal-reality error 6–8× per map (Si 4×4×4, scalar
-shared pole).
+tangential).
 
 **Residency.** The history holds $2(m + 1)$ copies of the carry, stacked on a
 leading axis that is never sharded, with bra bands on mesh axis X, ket bands

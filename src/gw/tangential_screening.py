@@ -1,4 +1,4 @@
-"""Deck-driven shared real-pole screening (DESIGN §3, rulings15–16).
+"""Deck-driven tangential screening (DESIGN §3, rulings15–16).
 
 The response, constructor and persistence owners implement their own stages.
 This helper authenticates the current map and passes handles between stages:
@@ -18,6 +18,7 @@ import numpy as np
 from common import timing
 from common.log import block, get_logger, message
 from common.log import record as sidecar_record
+from common.renames import disk_names, run_dir_entry, suffix_pattern
 
 log = get_logger(__name__)
 
@@ -423,8 +424,9 @@ def _release_bank_file(path):
 
 
 #: The per-map scratch generation ``screen_tangential_poles`` creates under an SC
-#: label (bank, Coulomb staging, constant and receipts).
-_MANAGED_SCRATCH = r"sc_[0-9]{4}_tangential"
+#: label (bank, Coulomb staging, constant and receipts); a run directory from
+#: before the rename holds them as ``sc_NNNN_shared_pole`` (common.renames).
+_MANAGED_SCRATCH = r"sc_[0-9]{4}" + suffix_pattern("_tangential")
 #: Set once this process has swept earlier processes' streamed stores (prepare_output).
 _SWEPT: list = []
 
@@ -449,7 +451,8 @@ def retain_iteration_scratch(run_dir, label, *, print_fn=print):
 
     root = os.path.abspath(os.fspath(run_dir))
     removed = remove_managed(
-        root, _MANAGED_SCRATCH, keep=[os.path.join(root, f"{label}_tangential")],
+        root, _MANAGED_SCRATCH,
+        keep=[os.path.join(root, f"{label}{suffix}") for suffix in disk_names("_tangential")],
         barrier_tag=f"tangential.scratch.retain.{label}", print_fn=print_fn)
     if removed:
         log.debug(f"  tangential scratch: retained {label}; discarded: "
@@ -588,7 +591,7 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                             run_dir=run_dir, label=label, print_fn=print_fn,
                             tables=_tangential_tables(meta, sym, centroid_indices))
                 return result
-        root = Path(run_dir).resolve() / (str(label) + "_tangential")
+        root = run_dir_entry(Path(run_dir).resolve(), str(label) + "_tangential")
         # The bare V parents (a collective device digest, before the rank-0 resume
         # decision): a complete bank resumes only when built against these values.
         coulomb = None if photon else _coulomb_resource(V_q, meta, sym, mesh_xy)
@@ -609,7 +612,8 @@ def screen_tangential_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # generation's leftovers before it creates any.
             stale = remove_stale_streamed_banks(
                 [root / "streamed_bank"] if _SWEPT else
-                [p / "streamed_bank" for p in Path(run_dir).resolve().glob("*_tangential")])
+                [p / "streamed_bank" for suffix in disk_names("_tangential")
+                 for p in Path(run_dir).resolve().glob("*" + suffix)])
             _SWEPT.append(True)
             if stale:
                 log.warning("tangential output: removed streamed stores left by an earlier "

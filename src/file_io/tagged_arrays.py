@@ -47,6 +47,12 @@ TANGENTIAL_MEMBER_DATASET = "tangential_member"
 _TANGENTIAL_MEMBER_FIELDS = ("path", "schema", "digest", "iteration_id")
 
 
+def _member_dataset(h5):
+    """The bundle's model-member dataset under its current or old name (common.renames), or None."""
+    from common.renames import disk_names
+    return next((name for name in disk_names(TANGENTIAL_MEMBER_DATASET) if name in h5), None)
+
+
 class TangentialMemberMissing(ValueError):
     """No member in a committed bundle; the caller may construct it once."""
 
@@ -136,9 +142,9 @@ def register_tangential_restart_member(
         # has released its handle before this metadata-only transaction.
         with h5py.File(restart_path, "r+") as h5:
             assert_committed(h5, path=restart_path)
-            if TANGENTIAL_MEMBER_DATASET in h5:
-                existing = _tangential_member_record(
-                    h5[TANGENTIAL_MEMBER_DATASET][()])
+            present = _member_dataset(h5)
+            if present is not None:
+                existing = _tangential_member_record(h5[present][()])
                 if existing != member:
                     raise ValueError(
                         "GATE tangential_member: immutable member replacement "
@@ -206,8 +212,9 @@ def read_tangential_restart_member(
             restart_path = restart_path.resolve()
             with h5py.File(restart_path, "r") as h5:
                 assert_committed(h5, path=restart_path)
-                if TANGENTIAL_MEMBER_DATASET in h5:
-                    member = _tangential_member_record(h5[TANGENTIAL_MEMBER_DATASET][()])
+                present = _member_dataset(h5)
+                if present is not None:
+                    member = _tangential_member_record(h5[present][()])
         except Exception as exc:
             error = ValueError(exc.reason) if isinstance(exc, TangentialMemberRefused) else exc
         agree_io_refusal(error, path=restart_path,

@@ -250,7 +250,8 @@ def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
     if isinstance(value, BispinorGWMode):
         return value
     raw = getattr(value, "value", value)
-    spelling = str(raw).strip().lower()
+    from common.renames import deck_value
+    spelling = deck_value("gw", "bispinor_gw", str(raw).strip().lower())
     retired = _RETIRED_BISPINOR_GW_MODES.get(spelling)
     if retired is not None:
         gate, want, why = retired
@@ -2220,7 +2221,7 @@ def mpa_sigma_runs_scalar_executor(config) -> bool:
     """Does this run's MPA Σ_c run the scalar pole-sum executor?; see docs/dev/gw_config_contracts.md.
 
     Scalar decks do, and so does the bispinor charge route
-    (``bispinor_gw = bare_transverse`` with the shared pole): its store is
+    (``bispinor_gw = bare_transverse`` with the tangential model): its store is
     the four-component charge operator and ``sigma_dispatch._compute_mpa_sigma``
     hands it to ``compute_sigma_c_mpa_omega_grid`` like a scalar store.  The
     four-current sector bank (``full_tangential``) runs that executor once
@@ -3512,6 +3513,10 @@ def read_lorrax_input(filename: str) -> dict:
     if start is not None:
         (section, end) = _read_input_section(
             end, kp_end, kp_idx, lines, start, filename)
+        # Old key and value spellings (common.renames) become the current ones
+        # first, so every check below sees only current names.
+        from common.renames import rename_deck_keys, rename_deck_values
+        rename_deck_keys("gw", section)
         (retired) = _report_early_retired_keys(
             section)
         _report_remaining_retired_keys(
@@ -3519,6 +3524,7 @@ def read_lorrax_input(filename: str) -> dict:
         _refuse_unknown_input_keys(
             end, filename, lines, section, start)
         params = _parse_input_keys(section)
+        rename_deck_values("gw", params)
     else:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()

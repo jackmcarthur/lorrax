@@ -1,4 +1,4 @@
-"""Tangential Hermite/Ritz construction of physical shared real-pole W.
+"""Tangential Hermite/Ritz construction of the physical tangential W.
 
 The physical convention is W(s) = b (s - Lambda)^-1 b.H, s = z_Ry**2;
 S_m = 2 M_(2m+1).  Thus b has units Ry**(3/2), Lambda Ry**2, and

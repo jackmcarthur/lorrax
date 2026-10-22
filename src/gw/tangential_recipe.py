@@ -1,4 +1,4 @@
-"""Shared real-pole input recipe and gate vocabulary (DESIGN §§5–6).
+"""Tangential-model input recipe and gate vocabulary (DESIGN §§5–6).
 
 Host metadata only: no response matrices, device allocation, backend selection,
 chemical-potential solve, or numerical gate implementation lives here. Physical
@@ -21,7 +21,7 @@ log = get_logger(__name__)
 
 RECIPE_VERSION = "shared_real_pole_v1_r4"
 GATE_VERSION = "shared_real_pole_gates_v1_r3b"
-RECEIPT_SCHEMA = "lorrax.shared-real-pole.receipt.v1"
+RECEIPT_SCHEMA = "lorrax.tangential.receipt.v1"
 ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_imaginary": 4}
 
 shared_real_pole_v1_r3b = {

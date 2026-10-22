@@ -922,7 +922,7 @@ def driver_persists_w0(mode, config) -> bool:
     synthesis owner.  A self-consistent run evaluates the accepted final
     map's model, once, after the loop (``sc_iteration.run_sc_driver``).
     The bispinor charge route (``bispinor_gw = bare_transverse`` with the
-    shared pole) is included: its store is the four-component charge
+    tangential) is included: its store is the four-component charge
     operator in the scalar representations, so the same evaluator gives
     the charge-sector ``V + Wc(0)`` on the run's charge V.  BSE reads that
     charge W0 only; the bare TT exchange of that route never enters the

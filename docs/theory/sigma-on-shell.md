@@ -146,7 +146,7 @@ bytes per rank on the band tiles, against `16·2·nk_wedge·nb²/(p_x p_y)` for
 the on-shell pair, and the window table carries `n_ω`-wide coefficient rows.
 The full-BZ cube, its head add, the QSGW interpolation, the writer's eV
 cubes (made one at a time) and the SC rotation each hold a cube more.
-Measured on Fe 8^3 (MPA shared pole, SC, 4 A100 ranks, n_ω = 271, 59 k,
+Measured on Fe 8^3 (MPA tangential, SC, 4 A100 ranks, n_ω = 271, 59 k,
 38 bands): `sigma_mnk.h5` is 714 MiB against 7.9 MiB (one 352 MiB cube
 each for Σ_c and Σ_total), the τ sweep 122.3 s against 105.3 s (+16 %), and
 the per-rank device peak is unchanged at 16.34 GiB because the W response

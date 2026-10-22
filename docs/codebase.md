@@ -28,7 +28,7 @@ else.
 
 | package | level | owns | entry points | imported by |
 |---|---|---|---|---|
-| `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (shared pole, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
+| `gw` | L1 | the GW and QSGW driver: ζ orchestration, $V_q$, screening (tangential, MPA, plasmon pole, ladder), Σ, the $q\to0$ heads, SC maps, downfolding | `python -m gw.gw_jax`, `gw.kin_ion_io`, `gw.downfold_cli`, `gw.epsmat_cli`, `gw.eqp_bgw`, `gw.plane_wave_pipeline` (opt-in) | `bse`, `bandstructure`, `file_io`, `psp`, `centroid`, `isdf`, `lxkit.deck_doctor` |
 | `bse` | L1 | the Bethe–Salpeter equation: kernels, TDA and full solvers, absorption, exciton bands, the $W_\mathrm{BSE}$ ladder | `python -m bse.bse_jax`, `bse.exciton_bands`, `bse.absorption_haydock`, `bse.bse_feast`, `bse.bse_kpm`, `bse.bse_w_exact` | `gw.screening_bse`, `file_io.restart_bundle` (both lazily) |
 | `bandstructure` | L1 | band interpolation (htransform), fine-k wavefunctions for the BSE, band operators | `python -m bandstructure.htransform` | `bse` |
 | `centroid` | L1 (`kmeans_isdf` L2, `distribution` L3) | ISDF centroid selection: weighted k-means, pivoted-Cholesky pruning, the sampling metric | `python -m centroid.kmeans_cli` | `gw`, `bandstructure` (htransform nodes) |
@@ -114,7 +114,7 @@ else.
 | `ppm_accumulators.py` | Accumulates plasmon-pole self-energy terms. |
 | `ppm_pipeline.py` | Orchestrates plasmon-pole setup and evaluation. |
 | `ppm_sigma.py` | Evaluates the GN-PPM correlation self-energy. |
-| `ppm_tau_kernel.py` | The shared device τ kernel of dynamic Σ (plasmon pole, MPA, shared pole). |
+| `ppm_tau_kernel.py` | The shared device τ kernel of dynamic Σ (plasmon pole, MPA, tangential). |
 | `ppm_windows.py` | Dynamic-Σ branch records and the Σ broadening (η) resolver. |
 | `production_report.py` | Renders the human-readable production configuration report. |
 | `qgrid_symmetry.py` | Resolves q-grid symmetry policy and index tables. |
@@ -131,16 +131,16 @@ else.
 | `screening.py` | Plans and executes screening calculations. |
 | `screening_bse.py` | The GW-side stage of `screening_diagrams = w_bse` / `w_rpa_resolvent`. |
 | `tangential_capacity.py` | Device-byte accounting for one tangential construction. |
-| `tangential_constructor.py` | Constructs the physical shared real-pole W (tangential Hermite/Ritz). |
+| `tangential_constructor.py` | Constructs the physical tangential W (Hermite/Ritz). |
 | `tangential_directions.py` | Selects directions and builds the per-parent state panels. |
 | `tangential_execution.py` | Runs tangential equations on the full x/y mesh. |
 | `tangential_gates.py` | Measured gates and diagnostics of a constructed tangential model. |
 | `tangential_head.py` | Evaluates current Gamma tangential W and routes its scalar head through the common head and MPA owners. |
 | `tangential_local.py` | Runs tangential parent rounds, one parent per rank. |
 | `tangential_pencil.py` | Builds resolvent-identity pencil columns for the tangential construction. |
-| `tangential_recipe.py` | Shared real-pole input recipe and gate table. |
+| `tangential_recipe.py` | Tangential-model input recipe and gate table. |
 | `tangential_reduction.py` | Ritz reduction of the tangential pencils. |
-| `tangential_screening.py` | Deck-driven shared real-pole screening stage. |
+| `tangential_screening.py` | Deck-driven tangential screening stage. |
 | `tangential_sectors.py` | Charge/current cross pencils on parent-local stacks. |
 | `sigma_box_plan.py` | Denominator-box quadrature plan for dynamic Σ(ω). |
 | `sigma_dispatch.py` | Dispatches one self-energy call per resolved compute mode. |
@@ -242,7 +242,7 @@ else.
 | `qp_wfn.py` | Reads and writes quasiparticle wavefunction data. |
 | `read_bgw_vcoul.py` | Compatibility shim over the `vcoul` service's parser of BerkeleyGW's `vcoul` file. |
 | `restart_bundle.py` | Reads the GW restart bundle. |
-| `tangential_store.py` | Shared real-pole model and construction-scratch I/O. |
+| `tangential_store.py` | Tangential model and construction-scratch I/O. |
 | `sigma_checkpoint.py` | The sweep-checkpoint schema, written by a one-shot tangential sweep: on shell `tmp/sigma_checkpoint_oneshot_on_shell.h5` (pair and slots), under `sigma_omega_grid_debug = true` `tmp/sigma_checkpoint_oneshot.h5` (cubes); and the SC loop's `sc_seed/sc_checkpoint.h5`. |
 | `sigma_output.py` | Writes self-energy and quasiparticle outputs. |
 | `slab_io.py` | Exposes sharded slab reads and writes. |

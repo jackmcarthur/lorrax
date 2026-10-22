@@ -5,6 +5,35 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — The shared-pole W model is the tangential W model
+
+The production full-frequency W model is renamed after the tangential
+interpolation that builds it, in the code, the decks, the files and the
+logs. The entries below this one keep the old name. Nothing is computed
+differently.
+
+- **Decks:** `sigma_w_model = tangential` (was `shared_pole`),
+  `bispinor_gw = full_tangential` (was `full_shared_pole`), and in TD-aGW
+  decks `collision_screening = tangential` (was `shared_pole`). The old values
+  are still accepted, with one NOTE saying what to write instead.
+- **Files:** the per-map store is `<label>_tangential/` (was
+  `<label>_shared_pole/`); the model, bank, sector-manifest and receipt schemas
+  are `lorrax.tangential.v1`, `lorrax.tangential-bank.v3`,
+  `lorrax.tangential-sectors.v1`, `lorrax.tangential.receipt.v1`; the restart
+  bundle's member dataset is `tangential_member`. Stores, banks and restart
+  bundles written before the rename are read where they are, under their old
+  names. The recipe and gate tags (`shared_real_pole_v1_r4`,
+  `shared_real_pole_gates_*`) and their hashes do not change, so a stored model
+  still authenticates.
+- **Logs and refusals:** `GATE shared_pole_*` ids are `GATE tangential_*`,
+  and the log lines say "tangential" where they said "shared-pole". A script
+  that greps a log or a GATE id must use the new spelling.
+- **Code:** `gw.shared_pole_*` modules are `gw.tangential_*`,
+  `file_io.shared_pole_store` is `file_io.tangential_store`, and every
+  `shared_pole` identifier is `tangential` (`screen_shared_poles` is
+  `screen_tangential_poles`). The old spellings LORRAX still accepts are listed
+  in one table, `src/common/renames.py`; RENAMING.md has the procedure.
+
 ## 2026-10-21 — Centroid and kin-ion flag cleanup
 
 `centroid.kmeans_cli`: the positional count is `n_centroids` (was `N_c`;
