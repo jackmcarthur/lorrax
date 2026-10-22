@@ -1,36 +1,38 @@
 # Renaming a name across LORRAX
 
 **The rule.** Renaming a public identifier, a deck key or value, a CLI flag, or
-an HDF5 group, dataset or attribute goes through the alias table
+an HDF5 group, dataset or attribute goes through the table
 `src/runtime/renames.py` plus the sweep below. Never through an ad-hoc `sed`.
-The old name stays readable: it is accepted with one NOTE (`renamed_name`)
-saying what to write instead, and the run continues under the new name.
 
-First used for the shared-pole W model, which became the tangential W model
-(2026-10-21). The BerkeleyGW flag renames reuse it: add rows, run the same
-commands.
+**Inputs are not aliased** (owner, 2026-10-21). An old deck key, deck value or
+command-line flag refuses with one line, "`old` is now `new`" (or "`old` was
+removed: ..."), and the user edits the deck or the command line. The table is
+the hint table for those lines. **Names on disk stay readable**: an HDF5
+dataset, a schema string or a run-directory suffix inside an existing restart
+is data, not input, so it is read under its old spelling with one NOTE
+(`renamed_name`).
 
-## The alias table
+First used for the shared-pole W model, which became the tangential W model,
+then for the BerkeleyGW names of the BSE keys (both 2026-10-21).
+
+## The table
 
 `src/runtime/renames.py` lives in `runtime`, the bottom layer, so every
 package may import it. It holds:
 
-| table | key | read by |
-|---|---|---|
-| `DECK_KEYS` | `(deck, old key)` | `gw_config.read_lorrax_input`, `td_config.parse_td_deck`, before any other check |
-| `DECK_VALUES` | `(deck, new key, old value)` | the same readers, and `coerce_bispinor_gw_mode` |
-| `CLI_FLAGS` | `(driver module or "*", "--old")` | `runtime.read_verbose_switches`, which every driver runs at start-up, before its parser |
-| `DISK_NAMES` | old name | readers of HDF5 datasets, header schemas and run-directory suffixes (`disk_name`, `disk_names`, `run_dir_entry`, `suffix_pattern`) |
-| `FROZEN` | spelling kept on purpose | nothing: it documents what the sweep must not change |
+| table | key | read by | old spelling |
+|---|---|---|---|
+| `DECK_KEYS` | `(deck, old key)` | `gw_config.read_lorrax_input`, `td_config.parse_td_deck`, before any other check | refuses |
+| `DECK_VALUES` | `(deck, new key, old value)` | the same readers, and `coerce_bispinor_gw_mode` | refuses |
+| `CLI_FLAGS` | `(driver module or "*", "--old")` | `runtime.read_verbose_switches`, which every driver runs at start-up, before its parser | refuses |
+| `DISK_NAMES` | old name | readers of HDF5 datasets, header schemas and run-directory suffixes (`disk_name`, `disk_names`, `run_dir_entry`, `suffix_pattern`) | read, one NOTE |
+| `FROZEN` | spelling kept on purpose | nothing: it documents what the sweep must not change | — |
 
-A row's value is the new name, or a `Rename(new, note=..., convert=...)` when
-the meaning moved as well as the name: `note` is appended to the NOTE, and
-`convert` maps the old value to the new one (a BerkeleyGW band count that
-counts from another origin, say). A deck-key converter may return
-`{new key: value, ...}` to fill several keys from one old key. A flag's
-converter takes and returns the argument string; `--old`, `--old=v` and
-`--old v` are all rewritten. A rename to a key that the deck also names under
-its new spelling refuses (`GATE renamed_key_twice`).
+A row's value is the new name, or a `Rename(new, note)` whose note is appended
+to the refusal. `Rename("", note)` marks a removed name; the note says why or
+what to use. A `CLI_FLAGS` row whose new name does not start with `--` names a
+deck key: the setting moved from the command line into the deck, and the
+refusal says "`--n-val` is now deck key `number_val_bands_fine`".
 
 ## Tools
 
@@ -56,8 +58,9 @@ its new spelling refuses (`GATE renamed_key_twice`).
    datasets, schemas, run-directory names), GATE ids and log text, Python
    identifiers, prose. Anything that feeds a stored hash or a version tag a
    restart compares stays as it is: add it to `FROZEN`.
-2. **Alias rows** in `src/runtime/renames.py` for every user-visible old
-   spelling. A reader of a new kind of name calls the helpers there.
+2. **Rows** in `src/runtime/renames.py` for every user-visible old
+   spelling, so the old input refuses with the new name. A reader of a new kind
+   of name calls the helpers there.
 3. **Record the frozen hashes** before the sweep (for the tangential rename:
    `RECIPE_HASH`, `GATE_HASH`, `ORDERED_GATE_HASH`, `CHARGE4_*_GATE_HASH` and
    the version tags of `gw.tangential_recipe`).
@@ -82,13 +85,12 @@ its new spelling refuses (`GATE renamed_key_twice`).
      with the same run on `origin/main`;
    - the unit layer: `JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 pytest tests`;
    - **an old deck and an old run directory**, read by the new code, on a
-     copy. A deck: `gw_config.read_lorrax_input(<old deck>)` prints the NOTE
-     and returns the new spelling. A restart: the production entry point
+     copy. A deck: `gw_config.read_lorrax_input(<old deck>)` refuses with the
+     one-line "`old` is now `new`". A restart: the production entry point
      (for the tangential rename, `gw.tangential_recipe.tangential_restart_handle`,
      with `JAX_ENABLE_X64=1` and a CPU mesh) authenticates the old bundle.
      Done for the tangential rename on a Frontier ZnO run of 2026-10-16
-     (`spx_ab/r2_plain`): `sp_export.in` and `bisp_sc.in` load with one NOTE
-     each; the restart bundle's `shared_pole_member` and its
+     (`spx_ab/r2_plain`): the restart bundle's `shared_pole_member` and its
      `lorrax.shared-real-pole.v1` model authenticate, payload digest included,
      from `oneshot_shared_pole/`, used in place.
 7. **Landing on a moved main.** Do not rebase the sweep commit: rerun step 4 on
@@ -125,5 +127,5 @@ labels changed is re-rendered (`bash render/r.sh <ids>`).
   table feeds `GATE_HASH`, so it stays.
 - An old deck can also stop on a key retired some other way:
   `head_correction = no_local_fields` in the 2026-10-16 decks refuses on
-  current main. A removal that should keep old decks running belongs in this
-  table too, as a `Rename` with a converter.
+  current main. A removal belongs in this table too, as `Rename("", note)`,
+  so its refusal says what to use.

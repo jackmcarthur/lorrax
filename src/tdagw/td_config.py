@@ -417,9 +417,9 @@ def parse_td_deck(raw: dict, *, source: str = "<dict>") -> TdDeck:
     flat = _flatten({k: v for k, v in raw.items() if k != "measurements"})
     if "types" in meas_raw:
         flat["measurements.types"] = meas_raw.pop("types")
-    from runtime.renames import rename_deck_keys, rename_deck_values
-    rename_deck_keys("td", flat)        # old spellings -> current (runtime.renames)
-    rename_deck_values("td", flat)
+    from runtime.renames import refuse_old_deck_keys, refuse_old_deck_values
+    refuse_old_deck_keys("td", flat)        # an old spelling refuses (runtime.renames)
+    refuse_old_deck_values("td", flat)
     unknown = sorted(k for k in flat if k not in TD_DEFAULTS)
     per_meas = {}
     for k, v in meas_raw.items():

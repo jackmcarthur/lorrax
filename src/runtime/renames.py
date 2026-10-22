@@ -1,27 +1,28 @@
-"""Renamed names: the one table of old spellings LORRAX still accepts.
+"""Renamed names: the one table of old spellings and what replaced them.
 
 A rename changes a deck key, a deck value, a command-line flag or a name
-written to disk.  Every row maps the OLD spelling to the NEW one.  Readers go
-through the helpers below, so an old deck, an old command line or an old file
-keeps working: the old name is accepted, one NOTE per name and process says
-what to write instead, and the run continues under the new name.  Writers only
-ever write the new name.
+written to disk.  Every row maps the OLD spelling to the NEW one.
+
+Decks and command lines are NOT aliased (owner, 2026-10-21): an old deck key,
+deck value or flag refuses with one line, "`old` is now `new`" (or "`old` was
+removed: ..."), and the user edits the input.  The tables below are the hint
+table for those refusals.  Names on disk are different: an HDF5 dataset, a
+schema string or a run-directory suffix inside an existing restart is data, not
+input, so :data:`DISK_NAMES` keeps the old spelling readable, with one NOTE.
 
 A row is either the new name (a string) or a :class:`Rename`, which adds a note
-for the NOTE line and, when the meaning moved as well as the name, a converter
-from the old value to the new one.  Example (hypothetical)::
-
-    ("gw", "nval"): Rename("number_val_bands", note="counts from the top of the
-                           valence, as BerkeleyGW", convert=lambda v: str(int(v) + 1))
+to the refusal.  ``Rename("")`` means the name was removed; its note says why
+or what to use.  A :data:`CLI_FLAGS` row whose new name does not start with
+``--`` names a deck key: the setting moved from the command line into the deck.
 
 This module lives in ``runtime`` (the bottom layer, stdlib only) so that the
 argv hook every driver runs at start-up (``runtime.read_verbose_switches``)
-can rename flags before any parser sees them; every layer may import it.
+can refuse old flags before any parser sees them; every layer may import it.
 
 The source tree is renamed with ``tools/rename_sweep.sh``; docs/dev/renaming.md has
-the procedure.  Drop a row only once no deck, command line or file still in use can
-carry the old spelling.  This file is never swept, so the old spellings below
-survive every sweep.
+the procedure.  A row may be dropped once nobody can still be carrying the old
+spelling.  This file is never swept, so the old spellings below survive every
+sweep.
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
 
 log = logging.getLogger("lorrax.runtime.renames")
 
@@ -41,16 +41,12 @@ log = logging.getLogger("lorrax.runtime.renames")
 class Rename:
     """One renamed name.
 
-    ``new``: the new name.  ``note``: what else changed, appended to the NOTE.
-    ``convert``: old value -> new value, for a rename whose meaning moved too.
-    A deck-key converter may return a dict ``{new key: value}`` to fill several
-    keys from one old key.  A flag converter takes and returns the argument
-    string.
+    ``new``: the new name; empty when the name was removed.  ``note``: appended
+    to the refusal (what else changed, or why a removed name has no successor).
     """
 
     new: str
     note: str = ""
-    convert: Callable[[Any], Any] | None = None
 
 
 #: Deck keys: {(deck, old key): new key or Rename}.  ``deck`` is ``"gw"`` (the
@@ -66,10 +62,10 @@ DECK_VALUES: dict[tuple[str, str, str], str | Rename] = {
     ("td", "lorrax.collision_screening", "shared_pole"): "tangential",
 }
 
-#: Command-line flags: {(program, old flag): new flag or Rename}.  ``program``
-#: is the driver's module (``gw.gw_jax``, ``centroid.kmeans_cli``) or ``"*"``
-#: for every driver.  Long flags only; ``--old``, ``--old=v`` and ``--old v``
-#: are all rewritten before the driver's parser runs.
+#: Command-line flags: {(program, old flag): new flag, deck key or Rename}.
+#: ``program`` is the driver's module (``gw.gw_jax``, ``bse.bse_jax``) or
+#: ``"*"`` for every driver.  Long flags only; ``--old``, ``--old=v`` and
+#: ``--old v`` are all refused before the driver's parser runs.
 CLI_FLAGS: dict[tuple[str, str], str | Rename] = {}
 
 #: Names on disk: {old: new}.  HDF5 dataset names, header schema strings and
@@ -87,7 +83,7 @@ DISK_NAMES: dict[str, str] = {
 }
 
 #: Spellings kept ON PURPOSE: {spelling: why}.  Not renamed, by the sweep or by
-#: hand; RENAMING.md's check skips them.
+#: hand; the procedure's check skips them.
 FROZEN: dict[str, str] = {
     "shared_real_pole_v1_r4": "RECIPE_VERSION: a restart compares the stored tag, so a new "
                               "spelling is a recipe bump that refuses every stored model",
@@ -107,53 +103,45 @@ def _row(value) -> Rename:
     return value if isinstance(value, Rename) else Rename(str(value))
 
 
-def _note(old: str, row: Rename, where: str) -> None:
-    """One NOTE per old spelling and process (``common.log`` message extras)."""
-    if old in _noted:
-        return
-    _noted.add(old)
-    text = f"renamed: {where} {old!r} is now {row.new!r}; the old spelling is accepted"
-    if row.note:
-        text += f" ({row.note})"
-    log.warning(text, extra={"lorrax": {"id": "renamed_name", "found": (where, old),
-                                        "fix": f"write {row.new}", "kind": "NOTE"}})
+def refusal(old: str, value, *, flag: bool = False) -> str:
+    """The one-line refusal for ``old`` (a deck key, ``key = value`` or a flag)."""
+    row = _row(value)
+    if not row.new:
+        text = f"`{old}` was removed"
+        return text + (f": {row.note}" if row.note else "")
+    new = row.new
+    if flag and not new.startswith("--"):
+        new = f"deck key `{new}`"
+    else:
+        new = f"`{new}`"
+    return f"`{old}` is now {new}" + (f" ({row.note})" if row.note else "")
 
 
-def rename_deck_keys(deck: str, section) -> None:
-    """Move each old key of ``section`` (a dict or a configparser section) to its new key."""
-    for (family, old), value in DECK_KEYS.items():
-        if family != deck or old not in section:
-            continue
-        row = _row(value)
-        moved = row.convert(section[old]) if row.convert else section[old]
-        targets = moved if isinstance(moved, dict) else {row.new: moved}
-        for new in targets:
-            if new in section:
-                raise ValueError(f"GATE renamed_key_twice: the deck names both {old} (old) and "
-                                 f"{new} (new); keep only {new}")
-        del section[old]
-        for new, val in targets.items():
-            section[new] = val
-        _note(old, row, "deck key")
+def refuse_old_deck_keys(deck: str, section) -> None:
+    """Refuse every old key of ``section`` (a dict or a configparser section)."""
+    lines = [refusal(old, value) for (family, old), value in DECK_KEYS.items()
+             if family == deck and old in section]
+    if lines:
+        raise ValueError("\n".join(lines))
 
 
-def deck_value(deck: str, key: str, value):
-    """The new spelling of ``value`` for ``key``; any other value comes back unchanged."""
+def check_deck_value(deck: str, key: str, value):
+    """``value`` unchanged, or a refusal when it is an old spelling of ``key``'s value."""
     if not isinstance(value, str):
         return value
     hit = DECK_VALUES.get((deck, key, value.strip().lower()))
     if hit is None:
         return value
     row = _row(hit)
-    _note(value.strip(), row, f"{key} =")
-    return row.convert(value) if row.convert else row.new
+    raise ValueError(refusal(f"{key} = {value.strip()}",
+                             Rename(f"{key} = {row.new}" if row.new else "", row.note)))
 
 
-def rename_deck_values(deck: str, params: dict) -> None:
-    """Rewrite every old value in ``params`` (new keys) to its new spelling, in place."""
+def refuse_old_deck_values(deck: str, params: dict) -> None:
+    """Refuse every old value in ``params`` (keyed by current names)."""
     for (family, key, _old) in DECK_VALUES:
         if family == deck and key in params:
-            params[key] = deck_value(deck, key, params[key])
+            check_deck_value(deck, key, params[key])
 
 
 def main_program() -> str:
@@ -164,31 +152,35 @@ def main_program() -> str:
     return os.path.splitext(os.path.basename(sys.argv[0] if sys.argv else ""))[0]
 
 
-def rename_cli_argv(argv: list[str], program: str | None = None) -> list[str]:
-    """``argv`` (without the program name) with every old flag of :data:`CLI_FLAGS` renamed."""
+def old_cli_flags(argv: list[str], program: str | None = None) -> list[str]:
+    """One refusal line per old flag of :data:`CLI_FLAGS` in ``argv`` (no program name)."""
     if not CLI_FLAGS:
-        return list(argv)
+        return []
     program = main_program() if program is None else program
-    rows = {old: _row(v) for (prog, old), v in CLI_FLAGS.items() if prog in ("*", program)}
-    out, i = [], 0
-    while i < len(argv):
-        arg = argv[i]
-        flag, eq, val = arg.partition("=")
-        row = rows.get(flag) if arg.startswith("--") else None
-        if row is None:
-            out.append(arg)
-            i += 1
-            continue
-        _note(flag, row, "command-line flag")
-        if eq:
-            out.append(f"{row.new}={row.convert(val) if row.convert else val}")
-        elif row.convert and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-            out += [row.new, row.convert(argv[i + 1])]
-            i += 1
-        else:
-            out.append(row.new)
-        i += 1
-    return out
+    rows = {old: v for (prog, old), v in CLI_FLAGS.items() if prog in ("*", program)}
+    lines = []
+    for arg in argv:
+        flag = arg.partition("=")[0]
+        if arg.startswith("--") and flag in rows:
+            lines.append(refusal(flag, rows[flag], flag=True))
+    return lines
+
+
+def refuse_old_cli_flags(argv: list[str], program: str | None = None) -> None:
+    """Exit with the refusal lines when ``argv`` names an old flag."""
+    lines = old_cli_flags(argv, program)
+    if lines:
+        raise SystemExit("\n".join(f"lorrax: {line}" for line in lines))
+
+
+def _note(old: str, new: str, where: str) -> None:
+    """One NOTE per old on-disk spelling and process (``common.log`` message extras)."""
+    if old in _noted:
+        return
+    _noted.add(old)
+    log.warning(f"renamed: {where} {old!r} is now {new!r}; the old spelling is read",
+                extra={"lorrax": {"id": "renamed_name", "found": (where, old),
+                                  "fix": f"new files carry {new}", "kind": "NOTE"}})
 
 
 def disk_name(name: str) -> str:
@@ -196,7 +188,7 @@ def disk_name(name: str) -> str:
     new = DISK_NAMES.get(name) if isinstance(name, str) else None
     if new is None:
         return name
-    _note(name, Rename(new), "name on disk")
+    _note(name, new, "name on disk")
     return new
 
 
@@ -219,7 +211,7 @@ def run_dir_entry(run_dir, name: str) -> Path:
         if new.startswith("_") and name.endswith(new):
             legacy = path.with_name(name[: -len(new)] + old)
             if legacy.exists():
-                _note(legacy.name, Rename(name), "run directory")
+                _note(legacy.name, name, "run directory")
                 return legacy
     return path
 

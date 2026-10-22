@@ -65,10 +65,11 @@ live in `services/<svc>/bench/` and are not collected by pytest.
 - A function implementing a physics equation names the equation it computes, so a
   reader can check it against the theory page.
 - Renaming a public identifier, a deck key or value, a CLI flag, or an HDF5
-  group, dataset or attribute goes through the alias table
+  group, dataset or attribute goes through the table
   `src/runtime/renames.py` and the sweep in
   [`docs/dev/renaming.md`](docs/dev/renaming.md), never through an ad-hoc `sed`.
-  The old name stays readable, with one NOTE saying what to write instead.
+  An old deck key, deck value or flag is not aliased: it refuses with one line,
+  "`old` is now `new`". Old HDF5 names inside existing files stay readable.
 
 ## Conventions (read before editing GW code)
 

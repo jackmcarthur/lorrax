@@ -37,10 +37,11 @@ direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
 ## Renaming
 
 Renaming a public identifier, a deck key or value, a CLI flag, or an HDF5
-group, dataset or attribute goes through the alias table
+group, dataset or attribute goes through the table
 `src/runtime/renames.py` and the sweep in [Renaming](dev/renaming.md), never
-through an ad-hoc `sed`. The old name stays readable, with one NOTE saying
-what to write instead.
+through an ad-hoc `sed`. An old deck key, deck value or flag is not aliased:
+it refuses with one line, "`old` is now `new`". Old HDF5 names inside
+existing files stay readable, with one NOTE.
 
 ## The test suite
 

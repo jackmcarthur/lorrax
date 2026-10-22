@@ -250,8 +250,8 @@ def coerce_bispinor_gw_mode(value) -> BispinorGWMode:
     if isinstance(value, BispinorGWMode):
         return value
     raw = getattr(value, "value", value)
-    from runtime.renames import deck_value
-    spelling = deck_value("gw", "bispinor_gw", str(raw).strip().lower())
+    from runtime.renames import check_deck_value
+    spelling = check_deck_value("gw", "bispinor_gw", str(raw).strip().lower())
     retired = _RETIRED_BISPINOR_GW_MODES.get(spelling)
     if retired is not None:
         gate, want, why = retired
@@ -3513,10 +3513,10 @@ def read_lorrax_input(filename: str) -> dict:
     if start is not None:
         (section, end) = _read_input_section(
             end, kp_end, kp_idx, lines, start, filename)
-        # Old key and value spellings (runtime.renames) become the current ones
-        # first, so every check below sees only current names.
-        from runtime.renames import rename_deck_keys, rename_deck_values
-        rename_deck_keys("gw", section)
+        # An old key or value spelling (runtime.renames) refuses first, naming
+        # its new spelling, before any other check.
+        from runtime.renames import refuse_old_deck_keys, refuse_old_deck_values
+        refuse_old_deck_keys("gw", section)
         (retired) = _report_early_retired_keys(
             section)
         _report_remaining_retired_keys(
@@ -3524,7 +3524,7 @@ def read_lorrax_input(filename: str) -> dict:
         _refuse_unknown_input_keys(
             end, filename, lines, section, start)
         params = _parse_input_keys(section)
-        rename_deck_values("gw", params)
+        refuse_old_deck_values("gw", params)
     else:
         params = dict(_DEFAULTS)
         params[_DECK_NAMED_KEYS] = frozenset()

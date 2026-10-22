@@ -5,6 +5,14 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-21 — Old deck keys, values and flags refuse instead of being aliased
+
+A renamed deck key, deck value or command-line flag is no longer accepted
+under its old spelling. It refuses with one line, "`old` is now `new`" (or
+"`old` was removed: ..."), before the run starts; edit the deck or the
+command line. HDF5 names inside existing restart bundles, stores and banks are
+still read under their old spellings, with one NOTE.
+
 ## 2026-10-21 — The shared-pole W model is the tangential W model
 
 The production full-frequency W model is renamed after the tangential
@@ -14,8 +22,8 @@ differently.
 
 - **Decks:** `sigma_w_model = tangential` (was `shared_pole`),
   `bispinor_gw = full_tangential` (was `full_shared_pole`), and in TD-aGW
-  decks `collision_screening = tangential` (was `shared_pole`). The old values
-  are still accepted, with one NOTE saying what to write instead.
+  decks `collision_screening = tangential` (was `shared_pole`). An old value
+  refuses with one line naming the new one: edit the deck.
 - **Files:** the per-map store is `<label>_tangential/` (was
   `<label>_shared_pole/`); the model, bank, sector-manifest and receipt schemas
   are `lorrax.tangential.v1`, `lorrax.tangential-bank.v3`,
@@ -31,8 +39,8 @@ differently.
 - **Code:** `gw.shared_pole_*` modules are `gw.tangential_*`,
   `file_io.shared_pole_store` is `file_io.tangential_store`, and every
   `shared_pole` identifier is `tangential` (`screen_shared_poles` is
-  `screen_tangential_poles`). The old spellings LORRAX still accepts are listed
-  in one table, `src/runtime/renames.py`; `docs/dev/renaming.md` has the procedure.
+  `screen_tangential_poles`). Every old spelling is listed in one table,
+  `src/runtime/renames.py`; `docs/dev/renaming.md` has the procedure.
 
 ## 2026-10-21 — Centroid and kin-ion flag cleanup
 
