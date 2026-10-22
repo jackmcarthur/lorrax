@@ -1211,6 +1211,17 @@ def main(argv=None) -> int:
         return 0
 
     if route == "feast":
+        if use_tda:
+            # GATE feast_tda_complex: the TDA contour sums 2 Re over the upper
+            # half-plane from real starts into real Ritz vectors, exact only
+            # for a real symmetric A; LORRAX's A is complex Hermitian.
+            raise SystemExit(
+                "lorrax: GATE feast_tda_complex: feast = true with the TDA cannot "
+                "converge on a complex A (real Ritz vectors); use the default "
+                "Davidson eigensolve (drop feast = true), or full_bse = true.")
+        log.warning("NOTE: feast = true is deprecated and experimental; the "
+                    "default Davidson eigensolve is the supported route.",
+                    extra={"lorrax": {"id": "feast_deprecated", "kind": "NOTE"}})
         from . import bse_feast
         bse_feast.run(bse_feast.settings(
             args.input, n_val=args.n_val, n_cond=args.n_cond, px=args.px,
