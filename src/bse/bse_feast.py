@@ -27,9 +27,8 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from solvers.quadrature import feast_ellipse_quadrature as _feast_ellipse_quadrature_generic
-from .bse_ring_comm import (build_bse_ring_matvec_full,
-                            create_mesh_xy_from_flags, make_bse_shardings)
-from .bse_stack_matvec import build_bse_stack_matvec
+from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
+from .bse_stack_matvec import build_bse_stack_matvec, build_bse_stack_matvec_full
 from .bse_preconditioner import energy_diff_cv_k
 from .bse_head import head_shifted_eps_c, q0_head_keys
 from .bse_preconditioner import compute_pair_amplitude
@@ -749,9 +748,10 @@ def _rayleigh_ritz(
         HV_batch = matvec(jnp.concatenate(vectors, axis=0), *args)
         hv = [HV_batch[i:i + 1] for i in range(len(vectors))]
     else:
-        # Non-TDA carries the [X, Y] pair axis (build_bse_ring_matvec_full);
-        # not covered by the stack matvec — keep the per-vector application.
-        hv = [matvec(v, *args) for v in vectors]
+        # Non-TDA: the [X, Y] pair axis leads and the trials ride axis 1, so the
+        # (2, 1, nc, nv, nk) vectors stack into one call as well.
+        HV_batch = matvec(jnp.concatenate(vectors, axis=1), *args)
+        hv = [HV_batch[:, i:i + 1] for i in range(len(vectors))]
 
     V = jnp.stack(vectors, axis=0)
     HV = jnp.stack(hv, axis=0)
@@ -901,12 +901,13 @@ def run_feast_ritz(
             kernel="bse" if include_W else "rpa",
         )
     else:
-        matvec = build_bse_ring_matvec_full(
+        # Full BSE: the same kernels, two fused pair applications per call.
+        matvec = build_bse_stack_matvec_full(
             mesh_xy,
             data["nkx"],
             data["nky"],
             data["nkz"],
-            include_W=include_W,
+            kernel="bse" if include_W else "rpa",
         )
     sh = make_bse_shardings(mesh_xy)
 

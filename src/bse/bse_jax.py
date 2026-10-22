@@ -31,11 +31,11 @@ from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_ke
                        read_settings, spin_kernel)
 from .bse_preconditioner import set_exchange_channel
 from .bse_ring_comm import (
-    build_bse_ring_matvec_full,
     create_mesh_2d,
     create_mesh_xy_from_flags,
     make_bse_shardings,
 )
+from .bse_stack_matvec import build_bse_stack_matvec_full
 from .bse_preconditioner import compute_pair_amplitude
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_lanczos import (
@@ -49,7 +49,7 @@ from .report_lines import (bse_results_lines, galerkin_rows, locality_rows,
 log = get_logger(__name__)
 
 __all__ = [
-    "build_bse_ring_matvec_full",
+    "build_bse_stack_matvec_full",
     "compute_pair_amplitude",
     "create_mesh_2d",
     "make_bse_shardings",

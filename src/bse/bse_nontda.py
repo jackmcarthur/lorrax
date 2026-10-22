@@ -5,7 +5,8 @@ lowest-eigenvalue solver for the optical coupling-block Hamiltonian, reached
 Physics (per-element; validated to machine precision on the gnppm fixture — see
 ``reports/bse_refactor_map_2026-07-15/PHASE2_LOG.md`` §"non-TDA eigensolvers").
 
-The optical non-TDA operator (``build_bse_ring_matvec_full(screening=False)``) is
+The optical non-TDA operator (``bse_stack_matvec.build_bse_stack_matvec_full``,
+two calls of the fused pair applier, the TDA matvec's kernels) is
 the para-Hermitian ("Casida") Hamiltonian
 
     H = [[ A ,  B ],
@@ -17,17 +18,18 @@ Hermitian — measured ||B - B^H||/||B|| ~ 1.5 on the spinor fixture).  Its
 eigenvalues are real and come in +-omega pairs.  This is the physical optical
 BSE (Onida-Reining-Rubio; Rohlfing-Louie).  The historical matvec computed the
 naive [[A,B],[-B,-A]], whose spectrum is COMPLEX (max|Im| ~ 1e-4 Ry) — a bug that
-survived because full-BSE-with-W was never value-validated; fixed in
-``bse_ring_comm.build_bse_ring_matvec_full`` (screening=False).
+survived because full-BSE-with-W was never value-validated; fixed in the ring
+matvec that served this operator until 2026-10-21, and kept by the pair form.
 
-(A +- B) actions compose from the full matvec VERBATIM (no new kernel; reuse):
+The dense blocks come from the pair applier ``pair(x, s) = A x + s B conj(x)``
+on REAL identity columns ``E`` (``conj(E) = E``):
 
-    matvec([U;  U])[X-block] = A U + B U = (A + B) U
-    matvec([U; -U])[X-block] = A U - B U = (A - B) U
-    matvec([U;  0])[X-block] = A U
-    matvec([0;  U])[X-block] = B U
+    pair(E, +1) = (A + B) E,   pair(E, -1) = (A - B) E,
+    A = (pair(E, +1) + pair(E, -1)) / 2,   B = (pair(E, +1) - pair(E, -1)) / 2,
 
-because ``H[U; sU] = [A U + s B U ; -B* U - s A* U]`` and the X-block is the top row.
+one pair call per column chunk with the signs riding the trials.  (A +- B) on a
+complex block composes from the full matvec (``make_ab_appliers``):
+``H[U; sU] = [A U + s B U ; -B* U - s A* U]`` and the X-block is the top row.
 
 Structure-preserving reduction, dispatched on B's symmetry:
 
@@ -85,8 +87,7 @@ import jax
 import jax.numpy as jnp
 
 from common.fft_helpers import make_kfft_kminor
-from common.gpu_utils import device_budget_bytes
-from .bse_ring_comm import build_bse_ring_matvec_full, make_bse_shardings
+from .bse_ring_comm import make_bse_shardings
 from .bse_head import head_shifted_eps_c
 from common.log import get_logger, message
 
@@ -122,83 +123,15 @@ def refuse_dense_window(n_cond: int, n_val: int, nk: int, mesh_xy) -> int:
         raise ValueError(_dense_refusal(N))
     return N
 
-# --- the dense build's trial width ------------------------------------------
-# The peak is NOT set by the BSE window.  The ring kernel's T tensor is
-# ``(b, mu_local, nu_local, ns, ns, nk)`` -- c and v are contracted away at
-# encode time -- so narrowing the window does not make the build cheaper.
-# MEASURED (Si 4x4x4, 480 centroids, P=1): an identical 56.47 GiB XLA estimate
-# at N=1024 (4c x 4v) AND at N=64 (1c x 1v), the latter dying outright with
-# ``RESOURCE_EXHAUSTED: Failed to allocate request for 42.19GiB`` on a 40 GB
-# A100.  One trial column of T is 900 MiB on that deck, and the old hard-coded
-# ``col_chunk = 8`` -- blind to (mu, nu, ns, nk) -- asked for eight of them.
-#
-# The compiled peak is linear in the width and ~5.3x the T footprint itself
-# (memory_analysis on the production matvec, same deck):
-#
-#     b        T total      compiled peak     peak/T
-#     1      0.879 GiB        4.643 GiB        5.28
-#     2      1.758 GiB        9.042 GiB        5.14
-#     4      3.516 GiB       17.867 GiB        5.08
-#     8      7.031 GiB       35.402 GiB        5.04
-#
-# so the width is derived from the footprint and the device budget instead.
-_DENSE_T_PEAK_FACTOR = 5.3    # compiled peak / T footprint (measured, above)
-_DENSE_T_BUDGET_FRAC = 0.4    # of the run budget (common.gpu_utils.device_budget_bytes)
-
-# The budget is the run's budget (deck, else the collective default), never free memory.  Free
-# memory is ambient -- it depends on what else is resident when this runs -- and
-# a width derived from it is not reproducible: the same leg on the same deck
-# picked col_chunk=2 and col_chunk=5 twenty minutes apart on this pool, purely
-# from GPU occupancy.  A trial width that moves run-to-run silently changes the
-# XLA batch width of every column, which is exactly the kind of thing a
-# bit-identity A/B must not inherit from the weather.
-
-
-def dense_col_chunk(args, mesh_xy, N, *, log=None):
-    """Trial-batch width for the dense build, sized from the ring T footprint.
-
-    Returns the largest ``b`` whose compiled peak fits ``_DENSE_T_BUDGET_FRAC``
-    of the per-device budget, clamped to ``[1, N]``.  When even ``b = 1`` does
-    not fit it WARNS with the arithmetic and proceeds at 1 rather than refusing:
-    1 is the narrowest this build has, the budget is itself an estimate, and a
-    warning that explains the OOM about to happen is strictly more useful than
-    a refusal that pre-empts a run which might have fitted.
-    """
-    psi_c_X, W_R = args[0], args[6]
-    px, py = mesh_xy.devices.shape
-    from runtime.padding import padded_axis
-    mu_local = padded_axis(
-        int(W_R.shape[0]), int(px),
-        name="non-TDA row-centroid carrier").carrier // int(px)
-    nu_local = padded_axis(
-        int(W_R.shape[1]), int(py),
-        name="non-TDA column-centroid carrier").carrier // int(py)
-    nspinor = int(psi_c_X.shape[2])
-    nk = int(np.prod(np.asarray(W_R.shape[2:5])))
-    per_col = mu_local * nu_local * nspinor * nspinor * nk * 16
-    peak_per_col = per_col * _DENSE_T_PEAK_FACTOR
-    budget = device_budget_bytes() * _DENSE_T_BUDGET_FRAC
-    chunk = int(min(int(N), max(1, int(budget // peak_per_col))))
-    shape = (f"mu_l={mu_local} x nu_l={nu_local} x ns^2={nspinor ** 2} x "
-             f"nk={nk}")
-    if log is not None:
-        log(f"  [nontda] dense build: ring T = {per_col / 2 ** 20:.1f} "
-            f"MiB/column ({shape}); compiled peak ~"
-            f"{peak_per_col / 2 ** 30:.2f} GiB/column -> col_chunk={chunk} "
-            f"against a {budget / 2 ** 30:.1f} GiB budget")
-        if peak_per_col > budget:
-            _LOGGER.warning(
-                f"  [nontda] WARNING: even ONE trial column wants ~"
-                f"{peak_per_col / 2 ** 30:.1f} GiB, over the "
-                f"{budget / 2 ** 30:.1f} GiB budget. Proceeding at "
-                f"col_chunk=1; if this OOMs, shard wider (raise px*py) or use "
-                f"the matrix-free route (make_ab_appliers).",
-                extra=message(
-                    id="nontda_column_over_budget",
-                    found=("one trial column", f"{peak_per_col / 2 ** 30:.1f} GiB"),
-                    needs=f"at most {budget / 2 ** 30:.1f} GiB",
-                    fix="raise px*py, or use the matrix-free route (make_ab_appliers)"))
-    return chunk
+# --- the dense build's column chunk -----------------------------------------
+# The pair applier runs its trials through a ``lax.scan`` with one T-family
+# alive whatever the width (``bse_stack_matvec``), so the chunk is bounded by
+# the X-class trial block (2 x chunk x N complex128 per rank, gathered whole),
+# not by the W term.  The ring matvec this build used until 2026-10-21 held a
+# T per trial (compiled peak ~5.3 x T per column, 900 MiB a column on Si 4^3,
+# 480 centroids), which forced 3-column chunks and 342 dispatches at N = 1024;
+# a fixed 256 columns is at most 16 dispatches at the N = 4096 wall.
+_DENSE_COL_CHUNK = 256
 
 
 # --- the restart's q <-> -q reciprocity -------------------------------------
@@ -285,18 +218,16 @@ def check_restart_reciprocity(W_q, *, tol=_NONTDA_RECIP_TOL, log=None,
     return rel
 
 
-def _full_matvec_and_args(data, mesh_xy, sh, *, include_W, with_halves=False):
-    """Build the fixed optical non-TDA matvec + its threaded argument tuple."""
+def _full_matvec_and_args(data, mesh_xy, sh, *, include_W):
+    """The fused pair applier of the optical non-TDA operator and its 9 operands.
+
+    ``pair(X, s, *args) = A X + s B conj(X)`` (``bse_stack_matvec.
+    build_bse_stack_pair_matvec``); the dense build and the matrix-free route
+    both read the operator through it."""
+    from .bse_stack_matvec import build_bse_stack_pair_matvec
     nkx, nky, nkz = int(data["nkx"]), int(data["nky"]), int(data["nkz"])
-    halves = None
-    if with_halves:
-        matvec, ap_A, ap_B = build_bse_ring_matvec_full(
-            mesh_xy, nkx, nky, nkz, include_W=include_W, screening=False,
-            return_half_appliers=True)
-        halves = (ap_A, ap_B)
-    else:
-        matvec = build_bse_ring_matvec_full(
-            mesh_xy, nkx, nky, nkz, include_W=include_W, screening=False)
+    pair = build_bse_stack_pair_matvec(
+        mesh_xy, nkx, nky, nkz, kernel="bse" if include_W else "rpa")
     if include_W:
         W_ifft = make_kfft_kminor(
             mesh_xy, (nkx, nky, nkz), sh.W.spec, kind="ifftn", norm="ortho")
@@ -322,7 +253,7 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W, with_halves=False):
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
             head_shifted_eps_c(data["eps_c"], data), data["eps_v"], W_R,
             data["V_q0"], data["M"])
-    return (matvec, args, halves) if with_halves else (matvec, args)
+    return pair, args
 
 
 def make_ab_appliers(matvec_full, args, sh):
@@ -339,77 +270,30 @@ def make_ab_appliers(matvec_full, args, sh):
     return (lambda U: _apply(U, 1.0)), (lambda U: _apply(U, -1.0))
 
 
-def _materialize_A_B(matvec_full, args, sh, nc, nv, nk, *, col_chunk=None,
-                     mesh_xy=None, log=None, halves=None):
-    """Dense A, B (N x N, N = nc*nv*nk) from the full matvec, one identity slice
-    at a time, in a SINGLE pass — the resonant trial block returns ``A U`` and
-    ``-B* U`` together, so ``B`` is read off the block the build used to discard
-    (bit-identical; see the comment on the loop).  Columns are processed in
-    chunks of ``col_chunk`` so the W-term T-tensor (linear in the trial-batch
-    width) stays bounded — the gate runs on any 1 GPU, not only 80 GB HBM.
+def _materialize_A_B(pair, args, sh, nc, nv, nk, *, col_chunk=_DENSE_COL_CHUNK):
+    """Dense A, B (N x N, N = nc*nv*nk) from the pair applier, one chunk of
+    identity columns per call.
 
-    ``col_chunk=None`` (the default) DERIVES that width from the T footprint and
-    the device budget via ``dense_col_chunk``; pass an int only to pin it."""
+    The identity columns ``E`` are real, so ``pair(E, +1) = (A + B) E`` and
+    ``pair(E, -1) = (A - B) E`` (module docstring); one call takes the chunk
+    twice, ``[E; E]`` with signs ``[+1; -1]``, and ``A = (F + G)/2``,
+    ``B = (F - G)/2``.  Every operator application is used."""
     N = nc * nv * nk
     if N > _DENSE_N_MAX:
         raise ValueError(_dense_refusal(N))
-    if col_chunk is None:
-        col_chunk = dense_col_chunk(args, mesh_xy, N, log=log)
     eye = np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk)
-
-    # ONE pass, not two.  The operator is the SHAO form
-    #
-    #     H = [[ A ,  B ],
-    #          [-B*, -A*]]
-    #
-    # so a trial block in the RESONANT slot returns BOTH blocks of its column:
-    #
-    #     matvec([U; 0]) = (A U, -B* U)
-    #
-    # The build used to take ``[0]`` here and throw ``-B* U`` away, then run a
-    # SECOND full pass with the trial block in the anti-resonant slot to get
-    # ``B U`` back.  It is the same information: column-wise
-    # ``B[:, j] = conj(-bottom[:, j])``.  The identity is not an inference --
-    # ``tests/test_bse_dense_reference.py`` already asserts ``row (2,1) must be
-    # -B*`` on the real spinor fixture, and it is exactly the operator this
-    # module's docstring derives.
-    #
-    # MEASURED on the Si 4x4x4 record deck (N=1024, col_chunk=3), old vs new:
-    # the derived B is **BIT-IDENTICAL** to the separately-computed one
-    # (``np.array_equal`` True, max|dB| = 0.0) and the five eigenvalues agree to
-    # 0.000 neV -- because the kernel forms the anti-resonant row by conjugating
-    # the same product, and conjugation is exact in floating point.  The second
-    # pass cost 163.948 s of a 347 s run: 49.7% of the dense build, for nothing.
-    #
-    # HALF-APPLIER ROUTE (``halves`` present).  Even the one-pass build above
-    # still pays for the two terms the full matvec evaluates against the ZERO
-    # block: ``B*0`` and ``conj(A conj(0))``.  ``A U`` and ``B U`` are the only
-    # two things wanted, and ``bse_ring_comm`` now exposes exactly those two
-    # appliers, so the build asks for them and nothing else -- 2 half-operator
-    # applications per column instead of 4, all of them used.
-    #
-    # Bit-identical to the full-matvec route, and exactly so: ``B*0`` is an
-    # exact zero (a linear kernel on zeros), ``AX + 0 == AX``, and the B column
-    # the full route recovers is ``conj(conj(B U))``, which is ``B U`` digit for
-    # digit because conjugation only flips a sign bit.
     A_out = np.empty((N, N), dtype=np.complex128)       # [flat, col]
     B_out = np.empty((N, N), dtype=np.complex128)
-    a_args = args[:9]                                   # ... eps_c, eps_v, W_R, V_q0, M
-    b_args = (args[0], args[1], args[2], args[3], args[6], args[7], args[8])
-    for c0 in range(0, N, col_chunk):
-        blk = eye[c0:c0 + col_chunk]                     # (b, nc, nv, nk)
+    for c0 in range(0, N, int(col_chunk)):
+        blk = eye[c0:c0 + int(col_chunk)]                # (b, nc, nv, nk)
         b = blk.shape[0]
-        if halves is not None:
-            U = jax.lax.with_sharding_constraint(jnp.asarray(blk), sh.X)
-            A_out[:, c0:c0 + b] = np.asarray(halves[0](U, *a_args)).reshape(b, N).T
-            B_out[:, c0:c0 + b] = np.asarray(halves[1](U, *b_args)).reshape(b, N).T
-            continue
-        z = np.zeros_like(blk)
-        Xf = jax.lax.with_sharding_constraint(
-            jnp.asarray(np.stack([blk, z], axis=0)), sh.X_full)
-        both = matvec_full(Xf, *args)
-        A_out[:, c0:c0 + b] = np.asarray(both[0]).reshape(b, N).T
-        B_out[:, c0:c0 + b] = np.conj(-np.asarray(both[1]).reshape(b, N).T)
+        U = jax.lax.with_sharding_constraint(
+            jnp.asarray(np.concatenate([blk, blk], axis=0)), sh.X)
+        s = jnp.concatenate([jnp.ones((b,)), -jnp.ones((b,))])
+        FG = np.asarray(pair(U, s, *args)).reshape(2 * b, N)
+        F, G = FG[:b].T, FG[b:].T
+        A_out[:, c0:c0 + b] = 0.5 * (F + G)
+        B_out[:, c0:c0 + b] = 0.5 * (F - G)
     return A_out, B_out
 
 
@@ -664,13 +548,12 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
     nk = nkx * nky * nkz
     nc = int(data["n_cond_pad"]); nv = int(data["n_val_pad"])
     # Preflight BEFORE the dense build: the input decides whether A can be
-    # Hermitian at all, and the build is O(N^2) columns of a ring T tensor.
+    # Hermitian at all, and the build is O(N^2).
     # Skipped when the W term is off (include_W=False has no W to check).
     if include_W and data.get("W_q") is not None:
         check_restart_reciprocity(data["W_q"], tol=recip_tol, log=_log0,
                                   input_file=data.get("input_file"))
-    matvec, args, halves = _full_matvec_and_args(
-        data, mesh_xy, sh, include_W=include_W, with_halves=True)
+    pair, args = _full_matvec_and_args(data, mesh_xy, sh, include_W=include_W)
     N = nc * nv * nk
     if solver == "matrixfree":
         omega, Z = _solve_nontda_matrix_free(
@@ -680,8 +563,7 @@ def solve_bse_nontda_sharded(data, mesh_xy, *, n_eig=5, include_W=True,
         evecs = np.stack([Z[:N, :].T.reshape(n_eig, nc, nv, nk),
                           Z[N:, :].T.reshape(n_eig, nc, nv, nk)], axis=1)
         return jnp.asarray(omega), jnp.asarray(evecs), jnp.int32(0)
-    A, B = _materialize_A_B(matvec, args, sh, nc, nv, nk,
-                            mesh_xy=mesh_xy, log=_log0, halves=halves)
+    A, B = _materialize_A_B(pair, args, sh, nc, nv, nk)
     b_herm = np.linalg.norm(B - B.conj().T) / max(np.linalg.norm(B), 1e-300)
     if b_herm < 1e-6:
         omega, Z = solve_nontda_product(A, B, n_eig)           # real / RPA

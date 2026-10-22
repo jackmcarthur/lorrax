@@ -247,13 +247,27 @@ forms $A^{(ij)}$ directly. CrI3 30×30 at $N_\mu$ = 3000 on four ranks
 120 × 120. The plan, the U block and the W term's per-rank price print once
 (`[bse] W term blocks:`); a price over the device budget warns and runs.
 
-Full (non-TDA) BSE runs on `bse_ring_comm.build_bse_ring_matvec_full`: it is
-the operator of FEAST and KPM without `full_bse = false`, and `bse_nontda` builds the
-dense $(A, B)$ from it (N ≤ 4096). `build_bse_stack_pair_matvec`, the
-real-linear applier $\mathrm{pair}(X, s) = AX + s\,B\bar X$ (Shao–da
-Jornada–Yang, Algorithm 4), serves only `bse_nontda`'s matrix-free solver,
-which the CLI does not select. The ring matvec is also the screening operator
-of `bse.w_ladder` (`w_bse`), `bse.bse_w_exact` and `bse.w_omega_chain`.
+Full (non-TDA) BSE runs on the same kernels. `build_bse_stack_pair_matvec` is
+the real-linear applier $\mathrm{pair}(X, s) = AX + s\,B\bar X$ (Shao–da
+Jornada–Yang, Algorithm 4): the B encode swaps the two ζ legs, so $T_A + s\,T_B$
+goes through one convolution and one decode, and the sign rides each trial.
+`build_bse_stack_matvec_full` is $H[X; Y]$ from one pair call on the $2b$
+trials $z = X + \bar Y$ ($s = +1$) and $w = X - \bar Y$ ($s = -1$):
+$F + G = 2(AX + BY)$ and $\overline{G - F} = 2Y_{out}$, exact. It is the
+operator of FEAST and KPM with `full_bse = true`; `bse_nontda` builds the dense
+$(A, B)$ (N ≤ 4096) from pair calls on real identity columns,
+$A = (F + G)/2$, $B = (F - G)/2$, 256 columns a call, and its matrix-free
+route runs on the same applier. Its live set, like the TDA matvec's, is one
+T-family per rank whatever the trial width. Against the ring matvec it
+replaced (CPU, one device, $N_k = 4^3$, 8c × 4v, $N_\mu$ = 192, $n_s$ = 2): 552
+against 1063 ms for one $[X; Y]$ trial and 375 against 1195 ms a trial at four,
+with XLA scratch 342 MiB flat against 869, 3467 and 6923 MiB at 1, 4 and 8
+trials; $H[X; Y]$ agrees with the ring's to 2.8e-16 relative and the dense
+spectra to 1.4e-14 Ry (synthetic spinor and scalar payloads and the H2⁻
+restart, 1×1 and 2×2).
+`bse_ring_comm.build_bse_ring_matvec_full` remains the screening operator of
+`bse.w_ladder` (`w_bse`, `w_rpa_resolvent`), `bse.bse_w_exact` and
+`bse.w_omega_chain`, and refuses `screening=False`.
 
 Measured (claim 2874): CrI3
 8×8×1 SOC, 8v × 14c, P4 A100-40GB. One Haydock step (D + V − W on three

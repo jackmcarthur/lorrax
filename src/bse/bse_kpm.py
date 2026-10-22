@@ -30,9 +30,8 @@ from solvers.chebyshev import (
     reconstruct_dos,
     partition_windows,
 )
-from .bse_ring_comm import (build_bse_ring_matvec_full,
-                            create_mesh_xy_from_flags, make_bse_shardings)
-from .bse_stack_matvec import build_bse_stack_matvec
+from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
+from .bse_stack_matvec import build_bse_stack_matvec, build_bse_stack_matvec_full
 from .bse_feast import (estimate_spectral_bounds_sharded,
                         _build_gmres_data_fp32, ensure_W_R)
 from .bse_head import head_shifted_eps_c
@@ -168,12 +167,13 @@ def run_kpm_dos(
             kernel="bse" if include_W else "rpa",
         )
     else:
-        matvec = build_bse_ring_matvec_full(
+        # Full BSE: the same kernels, two fused pair applications per call.
+        matvec = build_bse_stack_matvec_full(
             mesh_xy,
             data["nkx"],
             data["nky"],
             data["nkz"],
-            include_W=include_W,
+            kernel="bse" if include_W else "rpa",
         )
 
     data_fp32 = _build_gmres_data_fp32(data)

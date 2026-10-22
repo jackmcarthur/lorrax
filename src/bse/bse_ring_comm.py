@@ -606,8 +606,7 @@ def apply_V_ring(
     # Back-contract carries the BARE vertex: K^x = M V M†, fixed by the
     # transition density <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk.  (The reverse assignment
     # builds conj(K^x), which cannot be covariant alongside the correct W term.)
-    # This also sets the non-TDA B block: apply_V_ring_B conjugates ψ^Y on the
-    # way in, so its forward leg is the bare M and it assembles B = M V M^T.
+    # The optical coupling block's B = M V M^T is bse_stack_matvec's pair applier.
     VX = jnp.einsum("kcvM,bM->bcvk", M, U)  # broadcast over k
 
     return VX / sqrt_nk
@@ -620,12 +619,17 @@ def build_bse_ring_matvec_full(
     nkz: int,
     low_mem: bool = True,
     include_W: bool = True,
-    screening: bool = False,
-    return_half_appliers: bool = False,
+    screening: bool = True,
     ladder_rung_slots: bool = False,
     fuse_ladder_rung: bool = True,
 ):
-    """Build full (non-TDA) BSE matvec ``[X;Y] -> H[X;Y]``.
+    """Build the non-TDA SCREENING matvec ``[X;Y] -> H[X;Y]`` (the density response).
+
+    The optical BSE does not run here: its full matvec is
+    ``bse_stack_matvec.build_bse_stack_matvec_full``, two fused pair applications
+    on the TDA matvec's kernels, and ``screening=False`` refuses.  This builder is
+    the screening operator of ``bse.w_ladder`` (``w_bse``, ``w_rpa_resolvent``),
+    ``bse.bse_w_exact`` and ``bse.w_omega_chain``.
 
     ``fuse_ladder_rung`` (LADDER SCREENING ONLY — ``screening and include_W``;
     inert everywhere else) sums the two rung ``T`` intermediates of each block
@@ -635,20 +639,10 @@ def build_bse_ring_matvec_full(
     the unfused core is to rounding, not to the bit).  ``False`` selects the
     unfused core for the A/B and for bisection — see ``_impl_core_fused``.
 
-    ``screening`` selects the coupling-block kernel AND the anti-resonant row
-    (``_antiresonant_row``), which together fix *which* physical operator this is:
+    The coupling-block kernel AND the anti-resonant row (``_antiresonant_row``)
+    together fix *which* physical operator this is:
 
-    - ``screening=False`` (default): the OPTICAL BSE, the para-Hermitian
-      ``H = [[A, B], [-B*, -A*]]`` (* = complex conjugate) with ``A`` Hermitian
-      and ``B`` complex-SYMMETRIC.  The B (coupling) block uses the excitonic
-      exchange ``V_B`` (Henneke Eq. 2-20, conjugated pairing
-      ``⟨M_t|v|conj(M_t')⟩`` — ``apply_V_ring_B``) plus the c'↔v'-swapped direct
-      term.  With ``include_W`` this is the TDHF/BSE exciton Hamiltonian; its
-      spectrum is REAL with +-omega pairs (solved by ``bse_nontda``).  NOTE: the
-      historical ``-B, -A`` anti-resonant row gave a COMPLEX spectrum for complex
-      B and was never value-validated — fixed here (PHASE2_LOG "non-TDA
-      eigensolvers").
-    - ``screening=True``: the test-charge DENSITY response (the object whose
+    ``screening=True`` is the test-charge DENSITY response (the object whose
       resolvent gives the screened Coulomb ``W = v + vχv``).  Here the B block
       uses the SAME RING kernel ``K^A = (1/Nk)⟨M_t|v|M_t'⟩`` as the A block
       (``apply_V_ring``), and the ring part of the anti-resonant row is
@@ -704,11 +698,11 @@ def build_bse_ring_matvec_full(
             "psi operands the direct rung consumes on a build_finite_q_data "
             "payload, and no other operator both takes that payload and "
             "carries a rung. Got screening=%r, include_W=%r." % (screening, include_W))
-    if ladder_rung_slots and return_half_appliers:
+    if not screening:
         raise ValueError(
-            "ladder_rung_slots does not compose with return_half_appliers: "
-            "no half-applier caller exists for the ladder operator (the "
-            "chain path is refused, w_ladder.refuse_chain_path).")
+            "build_bse_ring_matvec_full serves the screening operator only "
+            "(screening=True); the optical full BSE is "
+            "bse_stack_matvec.build_bse_stack_matvec_full")
     px, py = mesh_xy.devices.shape
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
@@ -781,26 +775,6 @@ def build_bse_ring_matvec_full(
 
     apply_V_ring_only = _shard_map_fn(
         _apply_V_ring_only,
-        mesh=mesh_xy,
-        in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
-                  P(None, "x", "y", None), P("x", "y")),
-        out_specs=P(None, "x", "y", None),
-    )
-
-    def _apply_V_ring_B(X, psi_c_Y, psi_v_Y, M, V_q0):
-        return apply_V_ring(
-            X,
-            jnp.conj(psi_c_Y),
-            jnp.conj(psi_v_Y),
-            M,
-            V_q0,
-            nk,
-            px,
-            py,
-        )
-
-    apply_V_ring_B = _shard_map_fn(
-        _apply_V_ring_B,
         mesh=mesh_xy,
         in_specs=(P(None, "x", "y", None), P(None, None, None, "y"), P(None, None, None, "y"),
                   P(None, "x", "y", None), P("x", "y")),
@@ -885,13 +859,9 @@ def build_bse_ring_matvec_full(
 
     def _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
                  psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
-        # screening (RPA density response): ring kernel K^A, same as the A block
-        # (apply_V_ring_only); optical BSE: excitonic V_B (apply_V_ring_B). Both take
-        # the SAME hoisted M (audit P3) — apply_V_ring_B conjugates only ψ^Y.
-        if screening:
-            V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
-        else:
-            V_term = apply_V_ring_B(X, psi_c_Y, psi_v_Y, M, V_q0)
+        # The density response's coupling block takes the ring kernel K^A, the
+        # A block's own (apply_V_ring_only), on the SAME hoisted M (audit P3).
+        V_term = apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
         if not include_W:
             return V_term
         return V_term - _w_term_B(X, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y, W_R)
@@ -934,43 +904,28 @@ def build_bse_ring_matvec_full(
           — breaks the RPA limit by 2.3e-03, because ``K^A = M v M^dag`` is
           Hermitian but NOT symmetric (measured ``|K^A - (K^A)^T|/|K^A| =
           1.95``).  This is the same class of defect as the historical
-          ``-B, -A`` optical bug recorded below: an un-conjugated row against a
-          complex-symmetric coupling.
+          ``-B, -A`` optical bug (``bse_nontda`` module docstring): an
+          un-conjugated row against a complex-symmetric coupling.
 
-        * ``screening=False`` (OPTICAL BSE): ``A`` is Hermitian (``A = A^H``) but
-          the coupling ``B`` is complex-SYMMETRIC (``B = B^T``, NOT Hermitian).
-          The physical para-Hermitian Casida operator is ``[[A, B], [-B*, -A*]]``
-          (Onida-Reining-Rubio; Rohlfing-Louie), whose spectrum is REAL with
-          +-omega pairs, so ``Y_out = -B* X - A* Y``.  ``B* X = conj(B conj(X))``
-          and ``A* Y = conj(A conj(Y))`` reuse the SAME appliers on conjugated
-          inputs (operator ingredients unchanged), then conjugate the result — no
-          new kernel.  The naive ``-B X - A Y`` gives a COMPLEX (unphysical)
-          spectrum for complex ``B`` and was the historical, never-value-validated
-          bug (PHASE2_LOG "non-TDA eigensolvers", first checked numbers)."""
-        if screening and not include_W:
+        The OPTICAL row, ``-B* X - A* Y``, is
+        ``bse_stack_matvec.build_bse_stack_matvec_full``'s."""
+        if not include_W:
             AY = _apply_A(Y, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
                           W_R, V_q0, M, psi_cW_X, psi_vW_Y)
             BX = _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
                           psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
             return -BX - AY
-        if screening:
-            # Ring parts un-conjugated (the Hartree dyad's bottom row), direct
-            # parts conjugated (the ladder rung's anti-resonant blocks).  The
-            # conjugated appliers reuse the SAME kernels on conjugated inputs —
-            # no second W path, so nothing can drift between the two rows.
-            AY = (apply_D_term(Y, eps_c, eps_v)
-                  + apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M, V_q0)
-                  - jnp.conj(_w_term_A(jnp.conj(Y), psi_cW_X, psi_vW_Y, W_R)))
-            BX = (apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
-                  - jnp.conj(_w_term_B(jnp.conj(X), psi_cW_X, psi_cW_Y,
-                                       psi_vW_X, psi_vW_Y, W_R)))
-            return -BX - AY
-        AsY = jnp.conj(_apply_A(jnp.conj(Y), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                eps_c, eps_v, W_R, V_q0, M, psi_cW_X, psi_vW_Y))
-        BsX = jnp.conj(_apply_B(jnp.conj(X), psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                                W_R, V_q0, M, psi_cW_X, psi_cW_Y,
-                                psi_vW_X, psi_vW_Y))
-        return -BsX - AsY
+        # Ring parts un-conjugated (the Hartree dyad's bottom row), direct
+        # parts conjugated (the ladder rung's anti-resonant blocks).  The
+        # conjugated appliers reuse the SAME kernels on conjugated inputs —
+        # no second W path, so nothing can drift between the two rows.
+        AY = (apply_D_term(Y, eps_c, eps_v)
+              + apply_V_ring_only(Y, psi_c_Y, psi_v_Y, M, V_q0)
+              - jnp.conj(_w_term_A(jnp.conj(Y), psi_cW_X, psi_vW_Y, W_R)))
+        BX = (apply_V_ring_only(X, psi_c_Y, psi_v_Y, M, V_q0)
+              - jnp.conj(_w_term_B(jnp.conj(X), psi_cW_X, psi_cW_Y,
+                                   psi_vW_X, psi_vW_Y, W_R)))
+        return -BX - AY
 
     def _impl_core_fused(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
                          eps_v, W_R, V_q0, M, psi_cW_X, psi_cW_Y, psi_vW_X,
@@ -1049,7 +1004,7 @@ def build_bse_ring_matvec_full(
 
     def _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
                    W_R, V_q0, M, psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
-        if fuse_ladder_rung and screening and include_W:
+        if fuse_ladder_rung and include_W:
             return _impl_core_fused(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                                     eps_c, eps_v, W_R, V_q0, M,
                                     psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
@@ -1117,41 +1072,7 @@ def build_bse_ring_matvec_full(
             ),
             out_shardings=sh.X_full,
         )
-    if not return_half_appliers:
-        return matvec
-
-    # The two HALF-operator appliers, EXPOSED rather than duplicated.  Until now
-    # they were reachable only through ``_matvec_impl``, which evaluates FOUR of
-    # them per call -- ``A X``, ``B Y``, ``conj(A conj(Y))``, ``conj(B conj(X))``
-    # -- so a caller that wants a single block (the dense build; any matrix-free
-    # route) paid for two applications against a ZERO block.  Same closures,
-    # same operator ingredients, same shardings as the corresponding terms
-    # inside the full matvec: nothing is re-derived and there is no second copy
-    # of the kernel to drift.
-    # Half-appliers serve raw payloads only (the ladder_rung_slots combination
-    # refuses above), so the rung's psi operands ARE the density ones here.
-    def _apply_A_raw(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                     W_R, V_q0, M):
-        return _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                        W_R, V_q0, M, psi_c_X, psi_v_Y)
-
-    def _apply_B_raw(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M):
-        return _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M,
-                        psi_c_X, psi_c_Y, psi_v_X, psi_v_Y)
-
-    apply_A = jax.jit(
-        _apply_A_raw,
-        in_shardings=(sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                      sh.eps, sh.eps, sh.W, sh.V, sh.M),
-        out_shardings=sh.X,
-    )
-    apply_B = jax.jit(
-        _apply_B_raw,
-        in_shardings=(sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                      sh.W, sh.V, sh.M),
-        out_shardings=sh.X,
-    )
-    return matvec, apply_A, apply_B
+    return matvec
 
 
 def build_realspace_random_transition_generator(

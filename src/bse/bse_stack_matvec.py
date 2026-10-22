@@ -68,11 +68,13 @@ whole TD band window, and reuses :func:`exchange_encode` /
 
 Consumers: ``bse_lanczos.solve_bse_sharded`` (block Lanczos and Davidson),
 ``bse_feast`` (TDA GMRES contour solves, ``_rayleigh_ritz``, the spectral
-bounds), ``bse_kpm`` and the pseudopole and Haydock paths.  The non-TDA
-coupling block's encode is :func:`build_bse_stack_pair_matvec` below.
-``bse_ring_comm.build_bse_ring_matvec_full`` stays as the ``_materialize_A_B``
-oracle and the equality gate's twin.  ``bse_preconditioner.exchange_spin_weight``
-owns the scalar-singlet exchange weight for both.
+bounds), ``bse_kpm`` and the pseudopole and Haydock paths.  The full (non-TDA)
+BSE runs on the same kernels: :func:`build_bse_stack_pair_matvec` is the coupling
+block's applier, and :func:`build_bse_stack_matvec_full` is ``H [X; Y]`` as two
+of its applications in one call (FEAST and KPM without TDA, ``bse_nontda``'s dense
+build and matrix-free route).  ``bse_ring_comm.build_bse_ring_matvec_full`` is the
+screening operator only (``w_ladder``, ``bse_w_exact``).
+``bse_preconditioner.exchange_spin_weight`` owns the exchange weight for all.
 
 THE COUPLING BLOCK, AND THE FUSION THAT PAYS FOR IT
 ---------------------------------------------------
@@ -428,10 +430,10 @@ def _tda_block(name, conv, fused, kconv, pc_t):
     return outer_load
 
 
-def _pair_blocks(name, conv, fused, kconv, pc_t, sc):
+def _pair_blocks(name, conv, fused, kconv, pc_t):
     """``(block_AB, block_A, block_B)``: the coupling pair's W term on one (μ, ν) block.
 
-    ``xs = (X_b, Xb_b)``: the whole trial and its conjugate; ``mu = (ψ^X_c, ψ^X_v)`` and
+    ``xs = (X_b, Xb_b, s_b)``: the whole trial, its conjugate and its sign; ``mu = (ψ^X_c, ψ^X_v)`` and
     ``nu = (ψ^Y_v, ψ^Y_c)``: the block's slices (the B encode's leg swap reads ψ^X_v on μ and
     ψ^Y_c on ν, :func:`_encode_T_B` / :func:`_outer_legs_B`).  ``block_AB`` is the fused
     applier's ONE chain of ``T_A + s·T_B`` (legs concatenated along K on the outer load);
@@ -447,7 +449,7 @@ def _pair_blocks(name, conv, fused, kconv, pc_t, sc):
 
         def T_B(xs, mu, nu):
             return _encode_T_B(xs[1], nu[1], mu[1])
-        return (lambda xs, mu, nu, W: chain(T_A(xs, mu, nu) + sc * T_B(xs, mu, nu), mu, W),
+        return (lambda xs, mu, nu, W: chain(T_A(xs, mu, nu) + xs[2] * T_B(xs, mu, nu), mu, W),
                 lambda xs, mu, nu, W: chain(T_A(xs, mu, nu), mu, W),
                 lambda xs, mu, nu, W: chain(T_B(xs, mu, nu), mu, W))
 
@@ -460,7 +462,7 @@ def _pair_blocks(name, conv, fused, kconv, pc_t, sc):
         L_A, R_A, cA = _outer_legs(xs[0], mu[0], nu[0])
         L_B, R_B = _outer_legs_B(xs[1], nu[1], mu[1])
         R_A = jnp.conj(R_A) if cA else R_A      # one convention for the concatenation
-        return decode(jnp.concatenate([L_A, sc * L_B], axis=-1),
+        return decode(jnp.concatenate([L_A, xs[2] * L_B], axis=-1),
                       jnp.concatenate([R_A, R_B], axis=1), False, mu, W)
 
     def block_A(xs, mu, nu, W):
@@ -767,7 +769,7 @@ def _make_v_term(mesh_xy, pair: bool):
 
     def _pair(X, Xb, sc, M, V_q0, enc, dec):
         S = (exchange_encode(X, M)
-             + sc * jnp.einsum("kcvN,bcvk->bN", M, Xb)) * enc
+             + sc[:, None] * jnp.einsum("kcvN,bcvk->bN", M, Xb)) * enc
         return exchange_decode(M, _exchange_U(S, V_q0)) * dec
 
     if pair:
@@ -1044,7 +1046,7 @@ def build_bse_stack_pair_matvec(
         wterm = _blocked_w_term(plan, W_R, _w_layout(name))
         whole = plan[0][1] * plan[1][1] == 1
         block_AB, block_A, block_B = _pair_blocks(
-            name, conv, fused, kconv, fused[0](psi_c_X) if name == "fused" and whole else None, sc)
+            name, conv, fused, kconv, fused[0](psi_c_X) if name == "fused" and whole else None)
 
         def _body_fused(carry, xs):
             return carry, wterm(mu, nu, partial(block_AB, xs), sqrt_nk)
@@ -1052,10 +1054,11 @@ def build_bse_stack_pair_matvec(
         def _body_unfused(carry, xs):
             # THE TWIN.  Two full chains.  Kept only to price the fusion.
             return carry, (wterm(mu, nu, partial(block_A, xs), sqrt_nk)
-                           + sc * wterm(mu, nu, partial(block_B, xs), sqrt_nk))
+                           + xs[2] * wterm(mu, nu, partial(block_B, xs), sqrt_nk))
 
+        # The sign rides the scan with its trial: one call may mix s = +1 and -1.
         _, WX = lax.scan(_body_fused if fuse else _body_unfused,
-                         None, (X_full, Xb_full), unroll=1)
+                         None, (X_full, Xb_full, sc), unroll=1)
         return _scatter_trial_block(WX, mesh_xy)
 
     w_pair = _shard_map_fn(
@@ -1073,7 +1076,8 @@ def build_bse_stack_pair_matvec(
     def _pair(X, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
               V_q0, M):
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-        sc = s.astype(X.dtype)
+        # One sign per trial: a scalar (SDY's F or G) broadcasts.
+        sc = jnp.broadcast_to(jnp.asarray(s).astype(X.dtype), X.shape[:1])
         Xb = jnp.conj(X)
 
         # ── D term — the A block ONLY.  B carries no diagonal, so an SDY step
@@ -1105,4 +1109,58 @@ def build_bse_stack_pair_matvec(
         in_shardings=(sh.X, rep, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
                       sh.eps, sh.eps, sh.W, sh.V, sh.M),
         out_shardings=sh.X,
+    )
+
+
+# ===========================================================================
+#  The full (non-TDA) BSE matvec — two pair applications in one call
+# ===========================================================================
+
+def build_bse_stack_matvec_full(
+    mesh_xy: Mesh,
+    nkx: int,
+    nky: int,
+    nkz: int,
+    *,
+    kernel: str = "bse",
+):
+    """Build the optical full-BSE matvec ``[X; Y] -> H [X; Y]`` on the pair applier.
+
+    ``H = [[A, B], [-B*, -A*]]`` (``bse_nontda`` module docstring): ``A = D + w_x V - W``
+    Hermitian, ``B = w_x V^B - W^B`` complex symmetric.  With ``pair(x, s) = A x +
+    s B conj(x)`` (:func:`build_bse_stack_pair_matvec`), ``z = X + conj(Y)`` and
+    ``w = X - conj(Y)``,
+
+        F = pair(z, +1) = A X + B Y + (A conj(Y) + B conj(X))
+        G = pair(w, -1) = A X + B Y - (A conj(Y) + B conj(X))
+
+    so ``X_out = (F + G)/2`` and ``Y_out = -(B* X + A* Y) = conj(G - F)/2``: exact
+    algebra, one pair call on the ``2b`` trials ``[z; w]`` with signs ``[+1; -1]``.
+    The A/B blocks are therefore the TDA matvec's kernels (the same encode,
+    k-convolution, decode, block plan and fused route), and the live set is
+    one T-family per rank whatever the trial width (the trial scan), where the
+    ring matvec this replaces held ``n_trials`` of them.
+
+    Signature: ``matvec(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
+    W_R, V_q0, M) -> H X_full`` with ``X_full`` ``(2, b, n_c, n_v, nk)`` at
+    ``P(None, None, 'x', 'y', None)`` (``make_bse_shardings(...).X_full``).
+    ``kernel='rpa'`` drops ``W`` and ``W^B`` (``A = D + V``, ``B = V^B``).
+    """
+    sh = make_bse_shardings(mesh_xy)
+    pair = build_bse_stack_pair_matvec(mesh_xy, nkx, nky, nkz, kernel=kernel)
+
+    def _full(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M):
+        X, Yc = X_full[0], jnp.conj(X_full[1])
+        b = X.shape[0]
+        s = jnp.concatenate([jnp.ones((b,), X.real.dtype), -jnp.ones((b,), X.real.dtype)])
+        FG = pair(jnp.concatenate([X + Yc, X - Yc], axis=0), s,
+                  psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M)
+        F, G = FG[:b], FG[b:]
+        return jnp.stack([0.5 * (F + G), 0.5 * jnp.conj(G - F)], axis=0)
+
+    return jax.jit(
+        _full,
+        in_shardings=(sh.X_full, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
+                      sh.eps, sh.eps, sh.W, sh.V, sh.M),
+        out_shardings=sh.X_full,
     )

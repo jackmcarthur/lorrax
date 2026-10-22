@@ -131,8 +131,7 @@ def _is_jax_array(x) -> bool:
 
 #: Share of TOTAL per-device memory one block of eigenvector rows may occupy
 #: while :func:`exciton_dipoles_distributed` contracts it.  Total, not free
-#: memory, for the reproducibility reason ``bse_nontda.dense_col_chunk`` gives:
-#: a block width read off ambient free memory changes run to run.
+#: memory: a block width read off ambient free memory changes run to run.
 _DIPOLE_BLOCK_BUDGET_FRAC = 0.05
 
 

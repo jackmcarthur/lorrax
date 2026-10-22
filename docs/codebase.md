@@ -271,8 +271,8 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding and q = 0 head; builds a missing static W(0) through `gw.static_screening` when the restart has none. |
 | `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: dense build, and an opt-in matrix-free solver. |
 | `bse_preconditioner.py` | Transition energies, the exchange pair amplitude and the exchange spin weight. |
-| `bse_ring_comm.py` | The BSE mesh, shardings, and the full (A, B) ring matvec. |
-| `bse_stack_matvec.py` | The trial-stack TDA matvec and the non-TDA pair applier. |
+| `bse_ring_comm.py` | The BSE mesh, shardings, and the ring matvec of the screening (density-response) operator. |
+| `bse_stack_matvec.py` | The trial-stack TDA matvec, the non-TDA pair applier, and the full-BSE matvec built on it. |
 | `bse_w_exact.py` | Exact W_c(ω) by shifted solves on the RPA density resolvent; the TRS pair gauge the ladder uses. |
 | `bse_window.py` | The band window, its padding, the `--eqp` re-slice and the `eigenvectors.h5` writer. |
 | `exchange_path.py` | Exchange tiles V_Q along an exciton momentum path. |
