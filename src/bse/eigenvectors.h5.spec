@@ -1,16 +1,15 @@
 THIS IS A DOCUMENT FOR FORTRAN ORDERED ARRAYS! YOU SHOULD INTERPRET ALL ARRAY DIMS AS BEING REVERSED
 E.G. nQ FOR THE OUTERMOST DIM IN THE EIGENVECTORS DATASET
 
+Integers are 32-bit scalars and logicals 32-bit 0/1, as BerkeleyGW's
+Common/evecs.f90 writes them; it writes no eps_header or bse_header group, and
+neither does bse.bse_jax.
+
 Group: mf_header
-Content: Header from the [WFN file](../wfn_h5_spec).
-#===============================================================================
-
-Group: eps_header
-Content: Header from the [epsmat file](../epsmat_h5_spec).
-#===============================================================================
-
-Group: bse_header
-Content: Header from the [bsemat file](../bsemat_h5_spec).
+Content: Header from the [WFN file](../wfn_h5_spec). bse.bse_jax copies the
+deck WFN's. On a kgrid_fine grid it replaces kpoints/nrk, rk, w, kgrid and
+shift by the BSE grid and leaves out kpoints/ngk, ifmin, ifmax, el and occ,
+which no WFN gives on that grid.
 #===============================================================================
 
 Group: exciton_header
@@ -24,7 +23,7 @@ Content: All the dimensions and scalar quantities
 	states the amplitudes are on (bse.bse_qp_rotation). Absent means the deck
 	WFN's DFT bands; only then do nv/nc index dipole.h5.
 
-	Dataset: version
+	Dataset: versionnumber
 	Type: integer
 	Rank: 0
 	Value: Version number of this particular file.
@@ -137,6 +136,10 @@ Content: All the arrays
 	Dims(7): nQ
 	Value: The electron-hole coefficients, that is, the right BSE
 	eigenvectors Avc. This array is used when TDA is true or false.
+	The valence index counts down from the VBM (v = 1 is the highest
+	valence band), the conduction index up from the CBM; k runs over kpts.
+	All four eigenvector datasets are always created; under the TDA the
+	three unused ones read as zeros.
 	
 	Dataset: eigenvectors_left
 	Type: double

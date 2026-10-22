@@ -240,17 +240,15 @@ def write_haydock_outputs(*, out_prefix, directions, labels, alphas, betas, norm
         name = ("absorption_haydock_eh.dat" if label == "e"
                 else f"absorption_haydock_{label}_eh.dat")
         out_dat = out_prefix_p.with_name(name)
+        # BerkeleyGW's four header lines only; the run's facts go to the log
+        # and to the .h5 below.
         e = np.asarray(directions[col], dtype=np.float64)
-        header = [
-            "BSE absorption — Haydock continued-fraction route",
-            f"polarization: {label}, Cartesian ({e[0]:.6f}, {e[1]:.6f}, {e[2]:.6f})",
-            f"V_cell = {V_cell:.6f} bohr^3,  N_k = {nk}",
-            f"eta = {eta_eV:.4f} eV,  n_spin = {n_spin},  n_spinor = {n_spinor}",
-            f"n_iter = {n_iter},  ‖d‖ = {norms[col]:.6e}",
-        ]
         write_absorption_dat(out_dat, omegas_eV, eps2[:, col], eps1[:, col],
-                             jdos[:, col], header)
-        log.info(f"[haydock] wrote {out_dat}")
+                             jdos[:, col])
+        log.info(f"[haydock] wrote {out_dat}: polarization {label} = Cartesian "
+                 f"({e[0]:.6f}, {e[1]:.6f}, {e[2]:.6f}), V_cell = {V_cell:.6f} bohr^3, "
+                 f"N_k = {nk}, eta = {eta_eV:.4f} eV, n_spin = {n_spin}, "
+                 f"n_spinor = {n_spinor}, n_iter = {n_iter}, |d| = {norms[col]:.6e}")
     out_h5 = out_prefix_p.with_name(f"{out_prefix_p.name}.h5")
     write_absorption_h5(
         out_h5,

@@ -161,6 +161,32 @@ def _generate_kpts_grid(nkx: int, nky: int, nkz: int, shift=(0.0, 0.0, 0.0)) -> 
     return np.array(kpts, dtype=np.float64)
 
 
+#: mf_header/kpoints datasets indexed by k (``wfn.h5.spec``): they have no values
+#: on a kgrid_fine grid, which no WFN describes.
+_PER_K_BAND_DATA = ("ngk", "ifmin", "ifmax", "el", "occ")
+
+
+def _copy_mf_header(f, wfn_path: str, fine_grid=None) -> None:
+    """``mf_header`` of ``wfn_path`` into the open file ``f``, as BerkeleyGW's
+    ``write_hdf5_mf_header`` puts WFN_fi's there.  ``fine_grid`` =
+    ``(kpts (nk, 3), kgrid, shift)`` replaces the k-point list (``nrk``, ``rk``,
+    ``w``, ``kgrid``, ``shift``) and drops :data:`_PER_K_BAND_DATA`."""
+    with h5py.File(wfn_path, "r") as src:
+        src.copy(src["mf_header"], f, "mf_header")
+    if fine_grid is None:
+        return
+    kpts, kgrid, shift = fine_grid
+    kp = f["mf_header/kpoints"]
+    for name in _PER_K_BAND_DATA + ("nrk", "rk", "w", "kgrid", "shift"):
+        if name in kp:
+            del kp[name]
+    kp.create_dataset("nrk", data=np.int32(len(kpts)))
+    kp.create_dataset("rk", data=np.asarray(kpts, np.float64))
+    kp.create_dataset("w", data=np.full(len(kpts), 1.0 / len(kpts)))
+    kp.create_dataset("kgrid", data=np.asarray(kgrid, np.int32))
+    kp.create_dataset("shift", data=np.asarray(shift, np.float64))
+
+
 def write_eigenvectors_stream(
     output_file: str,
     eigenvalues: jax.Array,
@@ -176,7 +202,21 @@ def write_eigenvectors_stream(
     qp_rotations_file: Optional[str] = None,
     dipole_attrs: Optional[dict] = None,
     k_shift=(0.0, 0.0, 0.0),
+    spin_kernel: int = 3,
+    wfn_path: Optional[str] = None,
+    wfn_grid: bool = True,
 ) -> None:
+    # BerkeleyGW's ``Common/evecs.f90`` (``evecs_create_and_write_header_hdf5``,
+    # ``evecs_write_*_hdf5``) is the layout, read back by its own reader:
+    # integers int32 scalars (``hdf5_write_int``, logicals as 0/1), the
+    # Fortran dims reversed (``kpts`` (nk, 3), ``exciton_Q_shifts`` (nQ, 3),
+    # eigenvectors (nQ, nevecs, nk, nc, nv, ns, 2)), the four eigenvector
+    # datasets always created (unwritten ones read as zeros under the TDA),
+    # ``mf_header`` the WFN's (``wfn_path``) and no other header group.
+    # ``spin_kernel``: ``bse_preconditioner.bgw_spin_kernel``.  ``wfn_grid``
+    # False (a kgrid_fine run): the WFN's mf_header with its k-point list
+    # replaced by the BSE grid and its per-k band data dropped (no WFN exists
+    # on that grid).
     # ``qp_rotations_file``: the amplitudes are on QP-rotated states
     # (``bse.bse_qp_rotation``); stamped as ``exciton_header`` attributes
     # ``transition_basis = "qp_rotations"`` and the artifact's path.  Absent
@@ -219,10 +259,12 @@ def write_eigenvectors_stream(
     #
     # TDA eigenvectors arrive as ``(n_write, 1, nc, nv, nk)`` (resonant X
     # only); full-BSE (non-TDA) as ``(n_write, 2, nc, nv, nk)`` = the paired
-    # (X, Y) with X^H X - Y^H Y = +1.  For non-TDA the resonant X is written
-    # to ``eigenvectors`` (so the sum-over-states absorption reads the
-    # dominant part) and the coupling Y to a sibling ``eigenvectors_coupling``
-    # dataset, so both components are persisted.  BGW eigenvectors.h5 stores
+    # (X, Y) with X^H X - Y^H Y = +1.  For non-TDA BerkeleyGW's right vector
+    # is u_r = (X, Y) and its left one u_l = (X, -Y) (the sigma_z metric:
+    # u_l^H u_r = 1, and ``BSE/diag.f90``'s dipoles_l then equals dipoles_r),
+    # written as ``eigenvectors`` = X, ``eigenvectors_deexcitation`` = Y,
+    # ``eigenvectors_left`` = X, ``eigenvectors_deexcitation_left`` = -Y
+    # (``evecs_reshape_Avc``).  BGW eigenvectors.h5 stores
     # eigenvalues in eV (BSE/diag.f90's write path; ``eigenvalues.dat``'s
     # header says "eig (eV)") and our solvers return Ry — convert here.
     #
@@ -263,12 +305,9 @@ def write_eigenvectors_stream(
     ns = 1
     nQ = 1
     flavor = 2
-    spin_kernel = 3
     bse_hamiltonian_size = ns * nk * n_val * n_cond
-    evec_sz = bse_hamiltonian_size
-
-    kpts_fortran = kpts.T.copy()
-    exciton_Q_shifts = np.zeros((1, 3), dtype=np.float64)
+    evec_sz = bse_hamiltonian_size if use_tda else 2 * bse_hamiltonian_size
+    exciton_Q_shifts = np.zeros((nQ, 3), dtype=np.float64)
 
     def _to_bgw(comp, which):
         # comp: (nc_pad, nv_pad, nk) -> BGW (nk, nc, nv, ns) layout.
@@ -354,49 +393,45 @@ def write_eigenvectors_stream(
             gather_to_host(eigenvectors[i])
         return
 
-    with h5py.File(output_file, "w") as f:
-        f.create_group("mf_header")
-        f.create_group("eps_header")
-        f.create_group("bse_header")
+    def _int(group, name, value):
+        group.create_dataset(name, data=np.int32(value))
 
+    with h5py.File(output_file, "w") as f:
         exciton_header = f.create_group("exciton_header")
-        exciton_header.create_dataset("version", data=1)
-        exciton_header.create_dataset("flavor", data=flavor)
+        _int(exciton_header, "versionnumber", 1)
+        _int(exciton_header, "flavor", flavor)
         if qp_rotations_file is not None:
             exciton_header.attrs["transition_basis"] = "qp_rotations"
             exciton_header.attrs["qp_rotations_file"] = os.path.abspath(
                 qp_rotations_file)
 
         params = exciton_header.create_group("params")
-        params.create_dataset("bse_hamiltonian_size", data=bse_hamiltonian_size)
-        params.create_dataset("evec_sz", data=evec_sz)
-        params.create_dataset("spin_kernel", data=spin_kernel)
-        params.create_dataset("nevecs", data=n_write)
-        params.create_dataset("ns", data=ns)
-        params.create_dataset("nc", data=n_cond)
-        params.create_dataset("nv", data=n_val)
-        params.create_dataset("use_tda", data=1 if use_tda else 0)
+        _int(params, "bse_hamiltonian_size", bse_hamiltonian_size)
+        _int(params, "evec_sz", evec_sz)
+        _int(params, "nevecs", n_write)
+        _int(params, "ns", ns)
+        _int(params, "nc", n_cond)
+        _int(params, "nv", n_val)
+        _int(params, "spin_kernel", spin_kernel)
+        _int(params, "use_tda", 1 if use_tda else 0)
 
         kpoints = exciton_header.create_group("kpoints")
-        kpoints.create_dataset("nk", data=nk)
-        kpoints.create_dataset("kpts", data=kpts_fortran)
-        kpoints.create_dataset("nQ", data=nQ)
-        kpoints.create_dataset("exciton_Q_shifts", data=exciton_Q_shifts.T)
+        _int(kpoints, "nk", nk)
+        _int(kpoints, "nQ", nQ)
+        kpoints.create_dataset("kpts", data=kpts)                     # (nk, 3)
+        kpoints.create_dataset("exciton_Q_shifts", data=exciton_Q_shifts)
 
         exciton_data = f.create_group("exciton_data")
-        exciton_data.create_dataset("eigenvalues", data=eigenvalues)
-        evec_dset = exciton_data.create_dataset(
-            "eigenvectors",
-            shape=(1, n_write, nk, n_cond, n_val, ns, 2),
-            dtype=np.float64,
-        )
-        coupling_dset = None
-        if not use_tda:
-            coupling_dset = exciton_data.create_dataset(
-                "eigenvectors_coupling",
-                shape=(1, n_write, nk, n_cond, n_val, ns, 2),
-                dtype=np.float64,
-            )
+        exciton_data.create_dataset("eigenvalues", data=np.asarray(eigenvalues, np.float64))
+        shape = (nQ, n_write, nk, n_cond, n_val, ns, 2)
+        evec_dset, left_dset, deex_dset, deex_left_dset = (
+            exciton_data.create_dataset(name, shape=shape, dtype=np.float64)
+            for name in ("eigenvectors", "eigenvectors_left",
+                         "eigenvectors_deexcitation",
+                         "eigenvectors_deexcitation_left"))
+
+        if wfn_path is not None:
+            _copy_mf_header(f, wfn_path, None if wfn_grid else (kpts, (nkx, nky, nkz), k_shift))
 
         for i in range(n_write):
             vec = gather_to_host(eigenvectors[i])
@@ -408,12 +443,12 @@ def write_eigenvectors_stream(
                 # (2, nc, nv, nk) = paired (X, Y) from the non-TDA solver.
                 Xc, Yc = vec[0], vec[1]
             re, im = _to_bgw(Xc, f"{i} (resonant X)")
-            evec_dset[0, i, :, :, :, :, 0] = re
-            evec_dset[0, i, :, :, :, :, 1] = im
+            evec_dset[0, i, ..., 0], evec_dset[0, i, ..., 1] = re, im
             if Yc is not None:
+                left_dset[0, i, ..., 0], left_dset[0, i, ..., 1] = re, im
                 re, im = _to_bgw(Yc, f"{i} (coupling Y)")
-                coupling_dset[0, i, :, :, :, :, 0] = re
-                coupling_dset[0, i, :, :, :, :, 1] = im
+                deex_dset[0, i, ..., 0], deex_dset[0, i, ..., 1] = re, im
+                deex_left_dset[0, i, ..., 0], deex_left_dset[0, i, ..., 1] = -re, -im
 
         if dipoles is not None:
             dset = exciton_data.create_dataset(

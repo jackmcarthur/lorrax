@@ -29,7 +29,7 @@ from runtime.run_session import RunSession
 from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params,
                        deck_source, eqp_file, key_of, note_extended_kernel, omega_count,
                        read_settings, spin_kernel)
-from .bse_preconditioner import set_exchange_channel
+from .bse_preconditioner import bgw_spin_kernel, set_exchange_channel
 from .bse_ring_comm import (
     create_mesh_2d,
     create_mesh_xy_from_flags,
@@ -351,6 +351,7 @@ def _preview_lanczos(
         with manual_stage(3, n_stages, "Exciton dipoles and eigenvectors",
                           name="bse.output") as _out:
             n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
+            from .bse_window import _parse_wfn_path
             with timing.section("bse.write_eigenvectors", announce=True):
                 write_eigenvectors_stream(
                     "eigenvectors.h5",
@@ -368,13 +369,19 @@ def _preview_lanczos(
                                        else qp_rotation["path"]),
                     dipole_attrs=dipole_attrs,
                     k_shift=tuple(data.get("k_shift", (0.0, 0.0, 0.0))),
+                    spin_kernel=bgw_spin_kernel(int(data["psi_c_X"].shape[2]), include_W),
+                    wfn_path=_parse_wfn_path(input_file),
+                    wfn_grid=not data["densified"],
                 )
             _out.result(f"eigenvectors.h5: {int(n_write)} states"
                         + (" with <0|r|S>" if dipoles is not None else ""))
 
     # Every root, in BerkeleyGW's own files (with its dipoles when computed).
     energies_ev = eigenvalues_host[:n_eig] * ryd2ev
-    roots_files = _write_all_roots(input_file, energies_ev, dipoles, nk)
+    roots_files = _write_all_roots(
+        input_file, energies_ev, dipoles, nk,
+        polarization=(spectrum or haydock or {}).get("polarization"),
+        triplet=bgw_spin_kernel(int(data["psi_c_X"].shape[2]), include_W) == 0)
     spectrum_files = []
     if dipoles is not None and spectrum is not None:
         # BerkeleyGW's absorption_eh.dat / absorption_noeh.dat from the solved
@@ -483,25 +490,32 @@ def _files_text(paths) -> str:
     return names[0] if len(names) == 1 else f"{names[0]} .. {names[-1]}"
 
 
-def _write_all_roots(input_file, energies_ev, dipoles, nk: int) -> list[str]:
-    """Every root to BerkeleyGW's ``eigenvalues.dat`` (energies) or, with
-    dipoles, its three-polarization ``eigenvalues_b1.dat`` .. ``_b3.dat``
+def _write_all_roots(input_file, energies_ev, dipoles, nk: int, *,
+                     polarization=None, triplet=False) -> list[str]:
+    """Every root to BerkeleyGW's ``eigenvalues.dat`` (energies, or the dipole
+    along a deck ``polarization``) or, with dipoles and no ``polarization``,
+    its three-axis ``eigenvalues_b1.dat`` .. ``_b3.dat``
     (``absorption_common.write_bgw_eigenvalues``), rank 0 writing.  The
     header's ``vol`` is ``N_k`` times the deck WFN's cell volume and its
     ``nspin, nspinor`` that WFN's.  Returns the paths (on every rank)."""
+    from .absorption_common import (eigenvalue_file_names, polarization_directions,
+                                    write_bgw_eigenvalues)
+    from .bse_window import _parse_wfn_path
+    wfn_path = _parse_wfn_path(input_file)
+    directions, labels = polarization_directions(polarization, wfn_path)
     if jax.process_index() == 0:
         import h5py
-        from .absorption_common import write_bgw_eigenvalues
-        from .bse_window import _parse_wfn_path
-        with h5py.File(_parse_wfn_path(input_file), "r") as f:
+        with h5py.File(wfn_path, "r") as f:
             celvol = float(f["mf_header/crystal/celvol"][()])
             n_spin = int(f["mf_header/kpoints/nspin"][()])
             n_spinor = int(f["mf_header/kpoints/nspinor"][()])
         return write_bgw_eigenvalues(".", energies_ev, dipoles, n_spin=n_spin,
                                      n_spinor=n_spinor,
-                                     vol_supercell=float(nk) * celvol)
+                                     vol_supercell=float(nk) * celvol,
+                                     directions=directions, labels=labels,
+                                     triplet=triplet)
     return (["eigenvalues.dat"] if dipoles is None else
-            [f"eigenvalues_{s}.dat" for s in ("b1", "b2", "b3")])
+            eigenvalue_file_names(labels))
 
 
 def _emit_results(report, log_lines, stdout_lines) -> None:

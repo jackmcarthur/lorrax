@@ -33,6 +33,17 @@ def set_exchange_channel(channel: str) -> None:
     _EXCHANGE_CHANNEL[0] = channel
 
 
+def bgw_spin_kernel(nspinor: int, include_w: bool = True) -> int:
+    """BerkeleyGW's ``spin_kernel`` (``Common/nrtype.f90`` ``BSE_KERNEL_*``) of this
+    run: 3 spinor (whatever the kernel, as ``BSE/input_fi.f90`` forces it),
+    2 local fields, 0 triplet, 1 singlet."""
+    if int(nspinor) == 2:
+        return 3
+    if not include_w:
+        return 2
+    return 0 if _EXCHANGE_CHANNEL[0] == "triplet" else 1
+
+
 def exchange_spin_weight(nspinor: int) -> float:
     """Spin weight of the bare-Coulomb exchange channel: 2 scalar singlet, 0 scalar
     triplet, 1 spinor.
