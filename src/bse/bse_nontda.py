@@ -278,19 +278,24 @@ def _materialize_A_B(pair, args, sh, nc, nv, nk, *, col_chunk=_DENSE_COL_CHUNK):
     ``pair(E, -1) = (A - B) E`` (module docstring); one call takes the chunk
     twice, ``[E; E]`` with signs ``[+1; -1]``, and ``A = (F + G)/2``,
     ``B = (F - G)/2``.  Every operator application is used."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from lxkit import device_put_process_local
     N = nc * nv * nk
     if N > _DENSE_N_MAX:
         raise ValueError(_dense_refusal(N))
+    # The columns come back to every process's host through one replicated
+    # copy, read from that process's own buffer: an np.asarray of the
+    # X-sharded result spans other processes' devices and refuses at P > 1.
+    to_host = jax.jit(lambda a: a, out_shardings=NamedSharding(sh.X.mesh, P()))
     eye = np.eye(N, dtype=np.complex128).reshape(N, nc, nv, nk)
     A_out = np.empty((N, N), dtype=np.complex128)       # [flat, col]
     B_out = np.empty((N, N), dtype=np.complex128)
     for c0 in range(0, N, int(col_chunk)):
         blk = eye[c0:c0 + int(col_chunk)]                # (b, nc, nv, nk)
         b = blk.shape[0]
-        U = jax.lax.with_sharding_constraint(
-            jnp.asarray(np.concatenate([blk, blk], axis=0)), sh.X)
+        U = device_put_process_local(np.concatenate([blk, blk], axis=0), sh.X)
         s = jnp.concatenate([jnp.ones((b,)), -jnp.ones((b,))])
-        FG = np.asarray(pair(U, s, *args)).reshape(2 * b, N)
+        FG = np.asarray(to_host(pair(U, s, *args)).addressable_data(0)).reshape(2 * b, N)
         F, G = FG[:b].T, FG[b:].T
         A_out[:, c0:c0 + b] = 0.5 * (F + G)
         B_out[:, c0:c0 + b] = 0.5 * (F - G)
