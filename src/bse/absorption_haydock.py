@@ -57,7 +57,8 @@ from common.fft_helpers import get_donated_kfft_kminor
 
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, window_dipoles, write_absorption_dat, write_absorption_h5)
 from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params, eqp_file,
-                       omega_count, read_settings)
+                       omega_count, read_settings, spin_kernel)
+from .bse_preconditioner import set_exchange_channel
 from .bse_head import head_shifted_eps_c
 from .bse_window import _parse_wfn_path
 from .bse_io import (load_bse_data_from_restart_sharded)
@@ -448,6 +449,11 @@ def main(argv=None):
                                        float(args.delta_frequency))
         check_dipole_operator(params, named, args.dipole)
         check_fine_grid_keys(params, named)
+        kernel = spin_kernel(params, named, _parse_wfn_path(cli.input))
+        if not kernel["include_w"]:
+            raise DeckError("bse.absorption_haydock runs the screened TDA recursion "
+                            "(D + w V - W): drop local_fields")
+        set_exchange_channel(kernel["channel"])
     except DeckError as exc:
         p.error(str(exc))
     pols = tuple(range(3))

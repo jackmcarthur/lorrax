@@ -156,7 +156,7 @@ def _driver_cases(mesh, ops):
     import numpy as np
     from bse import bse_io, bse_jax, bse_lanczos
     _, args = bse_jax.parse_args(["-i", _toy_deck(
-        ["full_bse = false", "spin_singlet = true", "write_eigenvectors = -1",
+        ["write_eigenvectors = -1",
          "dipole_file = /toy/toy_dipole.h5", "dipole_position_fix = true"])])
     seen = {}
 

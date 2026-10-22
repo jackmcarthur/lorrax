@@ -1883,7 +1883,8 @@ BSE_DECK_KEYS = (
     "eqp_corrections", "eqp_co_corrections", "qp_rotations_file",
     "dipole_file", "dipole_position_fix", "use_momentum", "use_velocity",
     # kernel and solver
-    "full_bse", "spin_singlet", "local_fields", "number_eigenvalues",
+    "full_bse", "spin_singlet", "spin_triplet", "local_fields", "spinor",
+    "number_eigenvalues",
     "write_eigenvectors", "helicity_table", "solver", "solver_max_iter",
     "block_size", "lanczos_rtol", "lanczos_check_every", "lanczos_n_reorth",
     "davidson_precond", "davidson_tol_mev", "davidson_margin",

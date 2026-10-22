@@ -27,7 +27,9 @@ from common.units import RYD_TO_EV
 from runtime.run_session import RunSession
 
 from .bse_deck import (DeckError, Key, check_dipole_operator, check_fine_grid_keys, deck_params,
-                       deck_source, eqp_file, key_of, omega_count, read_settings)
+                       deck_source, eqp_file, key_of, note_extended_kernel, omega_count,
+                       read_settings, spin_kernel)
+from .bse_preconditioner import set_exchange_channel
 from .bse_ring_comm import (
     build_bse_ring_matvec_full,
     create_mesh_2d,
@@ -782,6 +784,9 @@ def _settings_parser():
              "counts QP states.  Mutually exclusive with eqp_corrections.")
     parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
     parser.add_argument("--degeneracy-check-override", action="store_true")
+    # TDA (BerkeleyGW's default; full_bse opts out) and the screened kernel
+    # (D + w V - W; local_fields = true drops W) are the defaults.
+    parser.set_defaults(tda=True, bse=True)
     parser.add_argument("--haydock", action="store_true")
     parser.add_argument("--number-iterations", type=int, default=None)
     parser.add_argument("--delta-frequency", type=float, default=None)
@@ -812,7 +817,6 @@ BSE_KEYS = {
     "dipole_file": Key("dipole", "path"),
     "dipole_position_fix": Key("dipole_position_fix", "bool"),
     "full_bse": Key("tda", "bool", convert=lambda full: not full),
-    "spin_singlet": Key("bse", "bool"),
     "local_fields": Key("rpa", "bool"),
     "number_eigenvalues": Key("n_eig", "int"),
     "write_eigenvectors": Key("write_eigs", "int", convert=_write_eigenvectors),
@@ -951,6 +955,13 @@ def _deck_settings(input_file, parser):
                                                float(args.delta_frequency))
         check_dipole_operator(params, named, args.dipole)
         check_fine_grid_keys(params, named)
+        from .bse_window import _parse_wfn_path
+        kernel = spin_kernel(params, named, _parse_wfn_path(input_file))
+        args.rpa, args.spin_channel = not kernel["include_w"], kernel["channel"]
+        args.kernel_label = kernel["label"]
+        args.kernel_name = "spinor" if kernel["nspinor"] == 2 else kernel["channel"]
+        set_exchange_channel(kernel["channel"])
+        note_extended_kernel(params, named, log)
     except DeckError as exc:
         parser.error(str(exc))
     return schema, args, named
@@ -1029,9 +1040,9 @@ def parse_args(argv=None):
             parser.error("haydock = true runs the TDA Haydock recursion seeded "
                          "by the window dipoles: it needs the TDA (no full_bse) "
                          "and dipole_file")
-        if args.rpa or not args.bse:
+        if args.rpa:
             parser.error("haydock = true runs absorption_haydock's screened "
-                         "recursion (D + V - W): it needs spin_singlet = true")
+                         "recursion (D + w V - W): drop local_fields")
         if args.qp_rotations is not None:
             parser.error("haydock = true on a qp_rotations_file bundle is not "
                          "supported: run bse.absorption_haydock's inputs")
@@ -1063,11 +1074,9 @@ def settings_rows(args, *, source) -> tuple:
         Setting("full_bse", "off" if use_tda else "on", source("full_bse"),
                 "Tamm-Dancoff Hermitian BSE" if use_tda else
                 "full resonant-antiresonant BSE"),
-        Setting("spin_singlet" if include_w else "local_fields", "on",
-                source("spin_singlet", "local_fields"),
-                "kernel D + V - W: screened direct term (stored W0 or a static RPA "
-                "rebuild)" if include_w else
-                "kernel D + V: RPA, no screened direct term"),
+        Setting("kernel", getattr(args, "kernel_name", "singlet") if include_w else "local_fields",
+                source("spin_singlet", "spin_triplet", "local_fields", "spinor"),
+                getattr(args, "kernel_label", "")),
         Setting("solver", "block_lanczos" if args.solver == "lanczos" else str(args.solver),
                 source("solver"),
                 (f"block of {int(args.n_eig)} roots + up to {int(args.davidson_margin)} "

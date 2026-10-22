@@ -108,8 +108,8 @@ _bse_flags(("bse.bse_jax", "bse.absorption_haydock"), {
 })
 _bse_flags(("bse.bse_jax",), {
     "--tda": Rename("full_bse", "TDA is now the default; full_bse = true solves the full BSE"),
-    "--bse": Rename("spin_singlet", "the screened kernel is the default: spinor on a spinor "
-                                    "WFN, spin_singlet otherwise"),
+    "--bse": Rename("", "the screened kernel is the default: the spinor kernel on a "
+                        "spinor WFN, spin_singlet (or spin_triplet) on a non-spinor one"),
     "--rpa": Rename("local_fields", "local_fields = true drops W"),
     "--lanczos": Rename("", "it changed nothing; the eigensolve is the default route"),
     "--feast": "feast",

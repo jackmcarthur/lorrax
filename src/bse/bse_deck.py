@@ -168,6 +168,74 @@ def eqp_file(params: dict, named: set, deck_path: str) -> str | None:
     return raw if os.path.isabs(raw) else os.path.join(deck_dir, raw)
 
 
+def wfn_spin(wfn_path: str) -> tuple[int, int]:
+    """``(nspinor, nspin)`` of a BerkeleyGW-format WFN.h5 (``mf_header/kpoints``)."""
+    import h5py
+    with h5py.File(wfn_path, "r") as f:
+        k = f["mf_header/kpoints"]
+        return int(k["nspinor"][()]), int(k["nspin"][()])
+
+
+def spin_kernel(params: dict, named: set, wfn_path: str) -> dict:
+    """The BSE kernel the deck's spin keys select on this WFN.
+
+    LORRAX runs full-spinor and non-spinor WFNs.  Spinor: one kernel, D + V - W
+    (exchange weight 1); ``spinor = true`` is accepted as an assertion, and
+    ``spin_singlet`` / ``spin_triplet`` refuse.  Non-spinor: ``spin_singlet``
+    (the default, D + 2V - W) or ``spin_triplet`` (D - W).  The screened direct
+    term is always on unless ``local_fields = true`` (D + w V, the RPA with local
+    fields), which is never the default.  Returns ``{"include_w", "channel",
+    "label"}``; the channel only sets the scalar exchange weight
+    (``bse_preconditioner.set_exchange_channel``).
+    """
+    def flag(key):
+        return key in named and as_bool(key, params[key])
+
+    import os
+    if not os.path.isfile(wfn_path):
+        # The driver refuses a missing WFN when it loads it; the deck keys are
+        # then read as written (a spinor kernel cannot be checked).
+        nspinor, nspin = (1 if (flag("spin_singlet") or flag("spin_triplet")) else 2), 1
+    else:
+        nspinor, nspin = wfn_spin(wfn_path)
+    if nspin != 1:
+        raise DeckError(f"{wfn_path} is collinear spin-polarized (nspin = {nspin}); the BSE "
+                        f"runs spinor or non-spinor WFNs")
+    spinor = nspinor == 2
+    if "spinor" in named and as_bool("spinor", params["spinor"]) != spinor:
+        raise DeckError(f"`spinor = {params['spinor']}` disagrees with {wfn_path}, which is "
+                        f"{'a spinor' if spinor else 'a non-spinor'} WFN")
+    singlet, triplet, rpa = flag("spin_singlet"), flag("spin_triplet"), flag("local_fields")
+    if spinor and (singlet or triplet):
+        raise DeckError(f"`{'spin_singlet' if singlet else 'spin_triplet'}` is for a non-spinor "
+                        f"WFN; a spinor WFN has one kernel (exchange weight 1): remove it")
+    if singlet and triplet:
+        raise DeckError("`spin_singlet` and `spin_triplet` name two kernels; keep one")
+    if triplet and rpa:
+        raise DeckError("`local_fields` keeps only the exchange term, which `spin_triplet` "
+                        "removes; keep one")
+    channel = "triplet" if triplet else "singlet"
+    if spinor:
+        label = "spinor kernel D + V - W" if not rpa else "spinor RPA, D + V (local_fields)"
+    elif rpa:
+        label = "singlet RPA, D + 2V (local_fields)"
+    else:
+        label = ("triplet D - W (spin_triplet)" if triplet
+                 else "singlet D + 2V - W (spin_singlet)")
+    return {"include_w": not rpa, "channel": channel, "label": label, "nspinor": nspinor}
+
+
+def note_extended_kernel(params: dict, named: set, log) -> None:
+    """``extended_kernel`` is kernel.x's (bse.bsemat_cli); a solver deck only notes it."""
+    if "extended_kernel" in named and as_bool("extended_kernel", params["extended_kernel"]):
+        log.warning("extended_kernel has no effect on the BSE solve: LORRAX does not "
+                    "interpolate the kernel; full_bse selects the non-TDA problem "
+                    "(extended_kernel is read by bse.bsemat_cli)",
+                    extra={"lorrax": {"id": "extended_kernel_solver", "kind": "NOTE",
+                                      "found": ("extended_kernel", "true"),
+                                      "fix": "full_bse = true for the non-TDA BSE"}})
+
+
 def check_fine_grid_keys(params: dict, named: set) -> None:
     """The fine-grid keys (``kgrid_fine_shift``, ``number_*_bands_coarse``) need
     ``kgrid_fine``: without a fine grid there is no interpolation to configure."""
