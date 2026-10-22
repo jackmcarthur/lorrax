@@ -1823,6 +1823,10 @@ def _interpolate_bse_data_to_grid(
     M = jax.lax.with_sharding_constraint(
         compute_pair_amplitude(psi_c_X, psi_v_X),
         NamedSharding(mesh_xy, P(None, "x", "y", None)))
+    # Fine states, M and optional dipoles retain the interpolation results.
+    # Drop the fitted basis and unsplit bundle
+    # before the V/W interpolation allocates its outputs and scratch.
+    del basis, ctilde, B_at_mu, enk_sigma, bundle
 
     # ── V_Q exchange q=0 tile on the fine grid ────────────────────────────
     # A Q=0 exciton's exchange kernel is DENSE in (k,k') through the ONE q=0
