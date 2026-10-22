@@ -1156,11 +1156,17 @@ def estimate_spectral_bounds_sharded(
 
     Uses an adaptive Lanczos run that stops when the largest Ritz value
     (of the tridiagonal) converges to within the specified tolerances.
-    """
-    data_fp32 = ensure_W_R(_build_gmres_data_fp32(data), include_W, mesh_xy)
 
-    eps_c = head_shifted_eps_c(data_fp32["eps_c"], data_fp32)
-    eps_v = data_fp32["eps_v"]
+    In complex128, on the payload's own operands (its ``W_R`` when it has one):
+    the W term's fused outer-product kernel serves complex128 only, so the
+    complex64 copy this used to build refused on the GPU route
+    (``kconv_outer ... operands must all be complex128``), and it held a second
+    W in each precision besides.
+    """
+    data_b = data if data.get("W_R") is not None else ensure_W_R(dict(data), include_W, mesh_xy)
+
+    eps_c = head_shifted_eps_c(data_b["eps_c"], data_b)
+    eps_v = data_b["eps_v"]
     n_cond = int(data["n_cond"])
     n_val = int(data["n_val"])
 
@@ -1194,13 +1200,13 @@ def estimate_spectral_bounds_sharded(
     # extents the loader put in the bundle.
     _pad_mask = jnp.asarray(
         pad_zone_mask_np(n_cond, n_val, n_cond_pad, n_val_pad, nk),
-        dtype=jnp.float32)
+        dtype=jnp.float64)
 
     @jax.jit
     def _make_random_vector(key_in):
         k1, k2 = jax.random.split(key_in)
-        q = jax.random.normal(k1, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float32)
-        q = q + 1j * jax.random.normal(k2, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float32)
+        q = jax.random.normal(k1, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
+        q = q + 1j * jax.random.normal(k2, (1, n_cond_pad, n_val_pad, nk), dtype=jnp.float64)
         q = q * _pad_mask
         q = q / jnp.linalg.norm(q)
         return jax.lax.with_sharding_constraint(q, sh.X)
@@ -1233,15 +1239,15 @@ def estimate_spectral_bounds_sharded(
     for _ in range(n_lanczos_max):
         z = matvec(
             q,
-            data_fp32["psi_c_X"],
-            data_fp32["psi_c_Y"],
-            data_fp32["psi_v_X"],
-            data_fp32["psi_v_Y"],
+            data_b["psi_c_X"],
+            data_b["psi_c_Y"],
+            data_b["psi_v_X"],
+            data_b["psi_v_Y"],
             eps_c,
             eps_v,
-            data_fp32["W_R"],
-            data_fp32["V_q0"],
-            data_fp32["M"],  # hoisted V-term pair amplitude (audit P3)
+            data_b["W_R"],
+            data_b["V_q0"],
+            data_b["M"],  # hoisted V-term pair amplitude (audit P3)
         )
 
         alpha = jnp.vdot(q, z).real

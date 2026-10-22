@@ -32,8 +32,7 @@ from solvers.chebyshev import (
 )
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_stack_matvec import build_bse_stack_matvec, build_bse_stack_matvec_full
-from .bse_feast import (estimate_spectral_bounds_sharded,
-                        _build_gmres_data_fp32, ensure_W_R)
+from .bse_feast import estimate_spectral_bounds_sharded, ensure_W_R
 from .bse_head import head_shifted_eps_c
 from .bse_io import (load_bse_data_from_restart_sharded, pad_zone_mask_np)
 from file_io.restart_bundle import (_find_restart_file)
@@ -176,19 +175,9 @@ def run_kpm_dos(
             kernel="bse" if include_W else "rpa",
         )
 
-    data_fp32 = _build_gmres_data_fp32(data)
-    data_fp32.update(
-        {
-            "nkx": data["nkx"],
-            "nky": data["nky"],
-            "nkz": data["nkz"],
-            "n_val": data["n_val"],
-            "n_cond": data["n_cond"],
-            "n_val_pad": data["n_val_pad"],
-            "n_cond_pad": data["n_cond_pad"],
-        }
-    )
-    ensure_W_R(data_fp32, include_W, mesh_xy)
+    # Moments in complex128 on the payload itself: the W term's fused kernel
+    # serves complex128 only, and one W_R serves the bounds and the moments.
+    ensure_W_R(data, include_W, mesh_xy)
 
     # --- Spectral bounds from Lanczos ---
     log.info(f"Estimating spectral bounds (Lanczos min={n_lanczos})...")
@@ -236,8 +225,8 @@ def run_kpm_dos(
 
     # --- Build BSE-specific callables ---
     apply_h_tilde, h_tilde_operands = make_bse_h_tilde(
-        matvec, data_fp32, e_center, half_width)
-    random_vector_fn = make_bse_random_vector(data_fp32, use_tda)
+        matvec, data, e_center, half_width)
+    random_vector_fn = make_bse_random_vector(data, use_tda)
 
     nk = int(data["nkx"] * data["nky"] * data["nkz"])
     n_cond = int(data["n_cond"])
@@ -256,7 +245,7 @@ def run_kpm_dos(
             n_moments,
             n_random,
             seed=seed,
-            dtype_real=data_fp32["eps_c"].dtype,
+            dtype_real=data["eps_c"].dtype,
             make_random_vector=random_vector_fn,
             operands=h_tilde_operands,
         )
