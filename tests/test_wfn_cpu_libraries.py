@@ -42,9 +42,33 @@ def main():
                                   np.asarray(expected.addressable_shards[0].data))
     assert probes == ["cpu"], probes
     assert ffi_loader.loaded_platforms_in_order() == ["cpu"]
+    # GW's staging receipt has no mesh argument. After CPU initialization,
+    # it must follow the live backend even without the prelude's env pin.
+    from ffi.io import staging_totals
+    get_lib, library_requests = ffi_loader.get_lib, []
+
+    def host_library(platform=None):
+        assert platform in (None, "cpu"), f"CPU staging receipt requested {platform}"
+        library_requests.append(platform)
+        return get_lib(platform)
+
+    ffi_loader.get_lib = host_library
+    from_env = ffi_loader.platform_from_env
+    # Model an unset environment in its reader; mutating os.environ after
+    # MPI/XLA started native threads would violate runtime.env_guard.
+    ffi_loader.platform_from_env = lambda default=None: default
+    try:
+        totals = staging_totals()
+        assert totals is not None and min(totals) >= 0, totals
+        assert library_requests
+        assert ffi_loader.loaded_platforms_in_order() == ["cpu"]
+    finally:
+        ffi_loader.get_lib = get_lib
+        ffi_loader.platform_from_env = from_env
     if jax.process_index() == 0:
         print("WFN_CPU_LIBRARIES PASS " + json.dumps(dict(probes=probes,
-              platforms=ffi_loader.loaded_platforms_in_order(), shape=actual.shape)), flush=True)
+              platforms=ffi_loader.loaded_platforms_in_order(), shape=actual.shape,
+              staging_totals_without_platform_env=totals)), flush=True)
     runtime.finalize_process(0)
     return 0
 

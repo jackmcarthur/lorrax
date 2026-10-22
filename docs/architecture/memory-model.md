@@ -91,6 +91,24 @@ the run keeps `B`). On CPU `L` is the node's `MemTotal` over the processes on th
 node and the process's devices. The room beside what is allocated now is
 `memory.room() = B − bytes_in_use` (the allocator's own figure; CPU: live arrays),
 the minimum over processes, floored to a whole GiB.
+On CPU the live count is the per-device union of local storage intervals:
+global/local aliases and overlapping views spend the budget once. Reading
+the count neither synchronizes pending kernels nor retains local arrays.
+
+CPU compiler heaps are separate from that live-array count. A cold P121
+1 MiB all-to-all compile left 30.39 GiB of node PSS, although glibc had
+already freed most of the compiler scratch. Releasing those free pages
+with input and executable live reduced it to 14.32 GiB, with exact output
+and unchanged warmed collective latency. The shared real-compile boundary
+(`common.jax_compile_cache`) now reclaims free glibc pages only on CPU, when
+both RSS growth and free heap reach the existing malloc trim threshold
+(128 MiB by default). Its RSS watermark spans smaller compiles and follows
+natural deallocation. The existing `LORRAX_MALLOC_TUNE` opt-out and threshold
+win; GPU compiles, persistent-cache hits, and tiny follow-up compiles do not
+trim. The integrated P121 probe used one trim per rank (15.8 ms median,
+4.35 s cold compile); this reduces retained host memory after compilation,
+not the compiler's transient peak (evidence:
+`/pscratch/sd/j/jackm/cs_claude/htransform_followup_20261022/winterp_evidence/collective_p121_*`).
 
 ### Routes and admission {#routes}
 
@@ -115,7 +133,23 @@ a provider context under `linalg = local` carries it as its `outside` term
 | head Γ GEMM (`gw.tangential_head._gamma_gemm_route`), ζ face GEMMs | staged where its program compiled fits the room (`distrib_la.staged_fits`); `panel_matmul` faces |
 | transverse ζ factor, Galerkin factor, coarse V(q) chunk | each route's own program compiled (`runtime.aot_memory.compiled_price`) |
 | htransform node-pair stages: fine-q top block, path and active window, orbital operators, moment grid (`bandstructure.fh_interp.admit_node_route`) | `q-batched`: whole $(N_B, N_B)$ matrices of the rank's q rows after one face→q exchange; `face`: one q tiled over the mesh (`linalg = distributed` pins it); each route's program compiled, the chosen executable then run |
-| nodal fit: quadrature metric, node Gram (`isdf.galerkin`) | host orbit-folded blocks of at most 64 MiB; the Gram on the face with the `distrib_la` eigh plan |
+| nodal fit: quadrature metric, band/node Grams (`isdf.galerkin`) | orbit normal equations and every nonnegative principal solve on `P(x,y)`; point-pair scratch streamed in bounded blocks; band Gram, Loewdin and coefficients on band/rank faces through `distrib_la`; only linear geometry, orbit weights and eigenvalue vectors reach hosts |
+
+The nodal fit keeps sampled states on centroid faces. Whole-orbit packing
+allows each rank to accumulate its normal-equation tile without gathering
+node samples or a whole orbit matrix. The shared nonnegative quadratic solver
+keeps all principal systems distributed and returns inactive weights exactly
+zero. Loewdin eigenvectors and inverse roots remain band faces; explicit
+all-to-all and transpose-partner exchanges produce the compact product-rank
+coefficient and target carriers. Basis artifacts continue to store physical
+band/rank extents through SlabIO, which reads directly into mesh-padded faces.
+The shared full-grid refit also keeps its coefficient chunks on node/state
+faces, forms its node Gram and sampled overlaps through bounded SUMMA panels,
+and exchanges the final rows directly into product-r slabs. Its retained-band
+residual uses those same faces; it never recreates the complete coefficient
+window on each rank.
+The remaining replicated fit metadata grows linearly with node/orbit count or
+with `N_k N_b` eigenvalues; there is no host `N_orbit²` or `N_k N_b²` matrix.
 
 ### Prices from measurement {#measured}
 
@@ -477,7 +511,7 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: the fixed tile, at least 16 centroids | — |
 | exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk`: q rows within the fixed tile | — |
 | htransform R images | f(H)_R and the back-map L_R, `16·N_k·N_B·(N_B + N_T)/P` (`N_B` = spin × nodes, `N_T` = spin × centroids, 0 when they are the nodes), and the int16 WS code tiles `2·N_k·N_B·(N_B + N_T)/P` | `fh_interp.build_fH_R` compiled (one program); `node_pair_table` exact code extents; WS tie-mask tile's own compiled executable | warns and admits |
-| BSE coarse-to-fine W | resident coarse W plus the fine output and embedding/FFT temporaries, all on the centroid face | `bse_densify._densified_w`: the exact densifier executable's compiled new bytes, admitted beside resident arrays before that executable runs | warns and admits |
+| BSE coarse-to-fine W | resident coarse W plus the fine output on the centroid face, and one fixed tile of embedding/FFT scratch | `bse_densify.make_w_densifier` scans centroid-face blocks within `TILE_BYTES`; `_densified_w` admits the exact executable's output and scratch beside resident arrays | warns and admits |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata includes the TRS-augmented centroid permutation
@@ -499,11 +533,21 @@ reduced process peak RSS from 1,925 to 469 MiB and the retained replicated
 host table from 149 MiB to 1.8 KiB (evidence:
 `/pscratch/sd/j/jackm/cs_claude/bse_memory_prerelease_20261022/memory/`).
 
-Fine W's resident size alone does not determine preprocessing capacity. A CPU
-P4 compiled probe at 10,000 centroids, coarse 3×3 and fine 6×6, needs 36.4 GB
-per rank: 3.6 GB coarse input, 14.4 GB fine output and 18.4 GB temporaries.
-The production coarse-to-fine boundary admits those new output/temporary
-bytes against the room beside the already resident coarse input.
+Fine W's resident size alone does not determine preprocessing capacity. The
+shared densifier scans independent centroid-face blocks inside `shard_map`,
+so coarse inverse FFTs, pair-dependent WS weights, and fine transforms use
+one fixed tile instead of whole additional W carriers. Both centroid axes
+can be blocked; no whole k axis is split. The final five-dimensional output
+is the scan carry, avoiding a whole-output layout copy on exit. The exact
+compiled price separates the output's face scaling from per-rank scratch,
+and is admitted beside the already resident coarse input.
+
+A Perlmutter CPU P4 probe with 10,000 centroids, coarse 3×3 and fine 6×6 has
+3.6 GB coarse input and 14.4 GB fine output per rank. Centroid tiling reduces
+compiled temporaries from 18.40 GB to 0.99 GB and measured peak RSS from
+36.63 GB to 19.43 GB; execution changes from 23.06 s to 24.99 s. These are
+W-only memory proxies, not physical 100-atom calculations (evidence:
+`/pscratch/sd/j/jackm/cs_claude/htransform_followup_20261022/winterp_evidence/`).
 
 The χ₀ node cannot be chunked over q, because the k-convolution needs the
 whole k axis on every rank. A completed W of an earlier screening role is

@@ -47,6 +47,8 @@ workload it exists for.
 Buffers round up to 2 MiB and are freed at `close`. Pinned memory does not
 show in `/proc`; `ffi.io.staging_totals()` returns
 `(live_contexts, staged_bytes)`.
+With no platform argument, this diagnostic follows the initialized JAX
+backend, including CPU runs that leave `JAX_PLATFORMS` unset.
 
 **Device memory.** `write_slab` holds a reference to its operand until that
 operand's `H5Dwrite` completes. The process's one writer queue holds at most

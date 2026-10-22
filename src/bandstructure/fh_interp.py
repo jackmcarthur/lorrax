@@ -987,7 +987,13 @@ def build_fH_R(ctilde: jax.Array, enk_sigma: jax.Array,
     # This changes placement only: the two operands contain identical values
     # and preserve the incumbent einsum order over the unsharded band axis.
     ctilde_x = jax.device_put(ctilde, coeff_x)
-    ctilde_y = jax.device_put(ctilde_x, coeff_y)
+    # These rank faces differ only by their mesh owner. Generic resharding
+    # may gather the entire rank axis; exchange each local tile once.
+    from common.collectives import to_transpose_partner
+    ctilde_y = jax.jit(shard_map(
+        lambda a: to_transpose_partner(a, int(mesh_xy.shape['x'])),
+        mesh=mesh_xy, in_specs=coeff_x.spec, out_specs=coeff_y.spec,
+        check_vma=False), out_shardings=coeff_y)(ctilde_x)
     jax.block_until_ready((ctilde_x, ctilde_y))
     log_fn(
         "  [route] Galerkin coefficient carrier: paired rank shards "

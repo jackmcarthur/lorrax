@@ -80,6 +80,30 @@ Refusals are `ValueError` or `RuntimeError` (`TypeError` /
 such as `src/bandstructure/bse_setup.py` re-raise `type(exc)(why)` with added
 context, which a service-specific exception class would break.
 
+## Non-negative quadratics
+
+`solve_nonnegative_quadratic(A, b, *, mesh, n_logical, maxiter=None)` minimizes
+`0.5*x.T@A@x - b.T@x` subject to `x >= 0`. `A` is real float64 SPD on
+`P('x','y')`; `b` and the returned weights are vectors on `P('x')`,
+replicated along y. The matrix extent is mesh padded; variables after
+`n_logical` are fixed exactly to zero. The caller supplies any ridge and
+resolves the shared `lxkit.memory` run budget before entering collectively.
+
+The function consumes **both inputs by donation** while diagonally scaling
+the quadratic. It uses block principal pivots and the existing distributed
+LU plan for masked principal systems. Inactive rows and columns become an
+identity block on the original face, so there is no dynamic active-submatrix
+gather. The normal matrix and its factors stay distributed; only scalar
+KKT convergence information reaches Python. A non-finite solve, failed
+residual check or iteration limit refuses with `GATE nonnegative_quadratic`.
+Every kernel executes the compiled program admitted at its actual operands;
+the LU result checks remain in the service's cacheable `checked_program`.
+
+This is an eager iterative solve, rather than a trace-safe factory. Its
+default limit is `20*n_logical` principal solves. It serves the orbit-tied
+nodal quadrature metric without requiring a replicated NumPy normal matrix,
+Cholesky factor or SciPy NNLS workspace on every process.
+
 ## Dense factorizations: `plan` {#dense-factorizations}
 
 ```python

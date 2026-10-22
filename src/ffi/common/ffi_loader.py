@@ -1121,12 +1121,14 @@ def phdf5_staging_totals(ctx_handle: int = 0,
     """``(live_ctxs, staging_bytes)`` for THIS process, or None when the
     loaded library predates the symbol (2026-09-20).
 
+    ``None`` follows the initialized JAX backend, as the other phdf5
+    lifecycle calls do; an unset JAX_PLATFORMS does not select CUDA.
     Non-collective and never touches a file: it reads the in-process ctx
     registry.  Pinned host memory is invisible to /proc (``cudaMallocHost``
     is driver-managed, not ``mlock``), so this is the only direct measure of
     the staging budget the SC loop's memory receipt reports.
     """
-    lib = get_lib(platform or platform_from_env("CUDA"))
+    lib = get_lib(platform)
     fn = getattr(lib, "lrx_phdf5_staging_totals", None)
     if fn is None:
         return None

@@ -1,8 +1,8 @@
 # Start-up, environment and caches
 
-This page owns three start-up contracts: when the process environment may be
-written, what makes an on-disk cache safe to share, and how a site recipe pairs
-a checkout with the FFI libraries built from it. The start-up steps themselves
+This page owns the start-up contracts for the process environment, CPU malloc
+arenas, concurrent on-disk caches, and the pairing of a checkout with its FFI
+libraries. The start-up steps themselves
 and their costs are in [Compilation](compilation.md#3-xla-programs). The
 variables are in the [registry](../reference/env_vars.md).
 
@@ -111,3 +111,29 @@ not in the repo). Use the same pattern for a new site:
 The key changes when any FFI source, the site config or the jax/jaxlib pin
 changes, which is exactly when a rebuild is needed. It does not change for
 Python-only commits, so Python-only lanes share one build.
+
+## 4 CPU malloc arenas {#cpu-arenas}
+
+After resolving a CPU platform and before creating JAX/MPI workers,
+`runtime.set_default_env()` calls `runtime.blas_env.tune_cpu_malloc_arenas()`.
+On glibc it limits future malloc arena creation to two through
+`mallopt(M_ARENA_MAX, 2)`. Each rank otherwise accumulates arenas for its XLA,
+OpenMP and native callback workers; free space in those arenas can remain
+resident after preprocessing. This limit controls allocator fragmentation,
+not the number of compute threads. It complements the existing mmap/trim
+threshold policy and does not clear JAX executable caches.
+
+The launcher's explicit `MALLOC_ARENA_MAX` or
+`GLIBC_TUNABLES=glibc.malloc.arena_max=...` wins. The existing
+`LORRAX_MALLOC_TUNE=0` opts out. Accelerator clients and non-glibc hosts are
+left alone. The operation writes no environment variables, and its result
+is recorded in the startup `malloc_tune.cpu_arenas` facts. Import/runtime
+startup should precede numerical worker creation: changing the cap cannot
+destroy arenas that were created earlier.
+
+The Perlmutter CPU pre-release profile (2026-10-22) verified the cap with
+`malloc_info`: a warmed four-rank FFT/GEMM run used a median 156.5 arenas per
+rank with the default policy and two after the change. At 64 ranks the
+counts were 41 and two. Warmed GEMM time changed by less than one percent;
+the FFT had no measured slowdown. The focused integration check is
+`tests/test_runtime_cpu_arenas.py`.

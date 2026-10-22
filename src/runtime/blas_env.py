@@ -61,6 +61,49 @@ STATE: dict = {"applied": None, "timeout": None, "reason": None,
                "preloaded": None, "libs": None}
 
 
+def tune_cpu_malloc_arenas(platforms: str) -> dict:
+    """Bound glibc's CPU worker arenas before JAX creates its worker pools.
+
+    MPI ranks need independent data, but hundreds of per-worker malloc arenas
+    retain freed preprocessing scratch in each rank. Two arenas preserve a
+    main/worker arena while bounding that fragmentation. Caller arena settings
+    and the existing malloc-tuning opt-out win. No backend is initialized here.
+    """
+    result = dict(applied=False, maximum=None, reason=None)
+    bridge = sys.modules.get("jax._src.xla_bridge")
+    backend = getattr(bridge, "_default_backend", None)
+    if platforms.strip().lower() != "cpu" or backend not in (None, "cpu"):
+        result["reason"] = "not a resolved CPU client"
+        return result
+    if env_falsy("LORRAX_MALLOC_TUNE"):
+        result["reason"] = "disabled by LORRAX_MALLOC_TUNE"
+        return result
+    if "MALLOC_ARENA_MAX" in os.environ:
+        result["reason"] = "caller supplied MALLOC_ARENA_MAX"
+        return result
+    if any(s.startswith("glibc.malloc.arena_max=")
+           for s in os.environ.get("GLIBC_TUNABLES", "").split(":")):
+        result["reason"] = "caller supplied glibc.malloc.arena_max"
+        return result
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None)
+        if not hasattr(libc, "gnu_get_libc_version"):
+            result["reason"] = "not glibc"
+            return result
+        mallopt = libc.mallopt
+        mallopt.argtypes = [ctypes.c_int, ctypes.c_int]
+        mallopt.restype = ctypes.c_int
+        if mallopt(-8, 2) != 1:             # M_ARENA_MAX, malloc.h
+            result["reason"] = "glibc rejected M_ARENA_MAX=2"
+            return result
+    except (AttributeError, OSError) as exc:
+        result["reason"] = f"{type(exc).__name__}: {exc}"
+        return result
+    result.update(applied=True, maximum=2)
+    return result
+
+
 def mapped_openblas() -> list | None:
     """Paths of every OpenBLAS shared object mapped in this process, or None
     when the process map is unreadable (no ``/proc``)."""

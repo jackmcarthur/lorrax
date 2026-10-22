@@ -197,16 +197,19 @@ def pair_ws_weights(pos, a_c, b_c, valid_c, tol, *, pos_b=None, pin=None,
     return w / jnp.sum(w, axis=-1, keepdims=True)
 
 
-def pair_ws_embed(X_R, images: dict, fine_grid, *, pin=None):
+def pair_ws_embed(X_R, images: dict, fine_grid, *, pos_b=None, pin=None):
     """Place a coarse ``X(R)`` on a finer R lattice, pair by pair.
 
-    ``X_R`` is ``(n, n, *kgrid)`` (``ifftn`` R order, rows and columns on
-    ``images['pos']``).  Element ``(i, j)`` of class ``c`` goes to the fine
+    ``X_R`` is ``(n, m, *kgrid)`` (``ifftn`` R order), with rows on
+    ``images['pos']`` and columns on ``pos_b`` (the same positions when
+    omitted).  Element ``(i, j)`` of class ``c`` goes to the fine
     slots ``(R_c + L T) mod fine_grid`` with its weights
     (:func:`pair_ws_weights`); ``Σ_T w = 1``, so an ``fftn`` over the fine
     lattice reproduces ``X`` at every k common to both grids.  No FFT
     normalisation is applied.  Traceable; ``pin`` constrains the
-    ``(n, n, ·)`` layouts (carry and weights) inside a jit.
+    ``(n, m, ·)`` layouts (carry and weights) inside a jit.  Rectangular
+    blocks use the same full-position candidate table, so they retain every
+    minimal image of the original tensor.
     """
     coarse = tuple(int(v) for v in images["kgrid"])
     fine = tuple(int(v) for v in fine_grid)
@@ -214,32 +217,33 @@ def pair_ws_embed(X_R, images: dict, fine_grid, *, pin=None):
         raise ValueError(f"pair_ws_embed: tensor grid {tuple(X_R.shape[2:])}, "
                          f"table grid {coarse}, fine grid {fine} (each fine "
                          f"extent must be at least the coarse one)")
-    n = int(X_R.shape[0])
-    if int(X_R.shape[1]) != n or int(images["pos"].shape[0]) != n:
+    n, m = (int(v) for v in X_R.shape[:2])
+    pos = jnp.asarray(images["pos"])
+    pos_b = pos if pos_b is None else jnp.asarray(pos_b)
+    if int(pos.shape[0]) != n or int(pos_b.shape[0]) != m:
         raise ValueError(f"pair_ws_embed: tensor {tuple(X_R.shape[:2])} and "
-                         f"{images['pos'].shape[0]} positions disagree")
+                         f"positions ({pos.shape[0]}, {pos_b.shape[0]}) disagree")
     keep = pin if pin is not None else (lambda x: x)
     fi = np.mod(images["img"], np.asarray(fine))
     slot = np.where(images["valid"],
                     (fi[..., 0] * fine[1] + fi[..., 1]) * fine[2] + fi[..., 2],
                     0).astype(np.int32)
     n_c = int(np.prod(coarse))
-    Xc = jnp.moveaxis(X_R.reshape(n, n, n_c), -1, 0)
-    pos = jnp.asarray(images["pos"])
+    Xc = jnp.moveaxis(X_R.reshape(n, m, n_c), -1, 0)
     tol = float(images["tol"])
 
     def _class(acc, xs):
         xc, a_c, b_c, v_c, s_c = xs
-        w = pair_ws_weights(pos, a_c, b_c, v_c, tol, pin=pin,
+        w = pair_ws_weights(pos, a_c, b_c, v_c, tol, pos_b=pos_b, pin=pin,
                             dtype=X_R.real.dtype)
         return keep(acc.at[:, :, s_c].add(xc[:, :, None] * w)), None
 
-    acc0 = keep(jnp.zeros((n, n, int(np.prod(fine))), dtype=X_R.dtype))
+    acc0 = keep(jnp.zeros((n, m, int(np.prod(fine))), dtype=X_R.dtype))
     acc, _ = jax.lax.scan(
         _class, acc0,
         (Xc, jnp.asarray(images["a"]), jnp.asarray(images["b"]),
          jnp.asarray(images["valid"]), jnp.asarray(slot)))
-    return keep(acc.reshape((n, n) + fine))
+    return keep(acc.reshape((n, m) + fine))
 
 
 def pair_ws_fourier(X_R, images: dict, k, *, pin=None):
