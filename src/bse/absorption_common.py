@@ -594,6 +594,62 @@ def broaden(omegas, centers, weights, width, kind="lorentzian"):
     return g @ np.asarray(weights, dtype=np.float64).reshape(c.shape[1], -1)
 
 
+def write_state_spectra(*, energies_Ry, exciton_dipoles, d_alpha, de_cv,
+                        directions, labels, V_cell, nk, n_spinor, width_eV, kind,
+                        omegas_eV, no_eps1, prefix="absorption"):
+    """BerkeleyGW's ``absorption_eh.dat`` and ``absorption_noeh.dat`` from solved states.
+
+    ε₂(ω) = 16π²/(V N_k n_spinor) Σ_S |ê·⟨0|r|S⟩|² δ(ω − Ω_S) over the computed
+    states (eh) and Σ_cvk |ê·d_cvk|² δ(ω − ΔE_cvk) over the window's
+    transitions (noeh), the prefactor ``jdos_from_transitions`` and the Haydock
+    route use; δ is a Gaussian of standard deviation ``width_eV`` or a
+    Lorentzian of half width ``width_eV`` (``kind``).  ε₁ by Kramers-Kronig on
+    the grid.  Column 4 is the density of the computed exciton states (eh) or of
+    the transitions (noeh), per eV.  One pair of files per direction:
+    ``<prefix>_eh.dat`` for a deck ``polarization``, ``<prefix>_b1_eh.dat`` ..
+    ``_b3`` for the three axes.  The eh spectrum holds only the computed
+    states: it is complete below the highest of them.  Rank 0 writes; the
+    paths are returned on every rank.
+    """
+    import jax
+    omegas_eV = np.asarray(omegas_eV, dtype=np.float64)
+    pref = 16.0 * np.pi ** 2 / (V_cell * nk * n_spinor)
+    om_Ry, w_Ry = omegas_eV / RYD2EV, float(width_eV) / RYD2EV
+    e_S = np.asarray(energies_Ry, dtype=np.float64).reshape(-1)
+    D = project_dipoles(np.asarray(exciton_dipoles).T, directions)          # (npol, nS)
+    eps2_eh = pref * broaden(om_Ry, e_S, np.abs(D.T) ** 2, w_Ry, kind)       # (nw, npol)
+    dos_eh = broaden(omegas_eV, e_S * RYD2EV, np.ones((e_S.size, 1)), width_eV, kind)[:, 0]
+    de = np.asarray(de_cv, dtype=np.float64).reshape(-1)
+    dt = project_dipoles(d_alpha, directions).reshape(len(labels), -1)       # (npol, ntrans)
+    eps2_noeh = pref * broaden(om_Ry, de, np.abs(dt.T) ** 2, w_Ry, kind)
+    jdos = broaden(omegas_eV, de * RYD2EV, np.ones((de.size, 1)), width_eV, kind)[:, 0]
+    complete = float(e_S.max() * RYD2EV) if e_S.size else float("nan")
+    paths = []
+    for col, label in enumerate(labels):
+        for tag, eps2, col4 in (("eh", eps2_eh, dos_eh), ("noeh", eps2_noeh, jdos)):
+            name = f"{prefix}_{tag}.dat" if label == "e" else f"{prefix}_{label}_{tag}.dat"
+            paths.append(name)
+            if jax.process_index() != 0:
+                continue
+            e2 = eps2[:, col]
+            e1 = np.ones_like(e2) if no_eps1 else kramers_kronig_eps1(om_Ry, e2)
+            e = np.asarray(directions[col], dtype=np.float64)
+            header = [
+                f"BSE absorption from the eigensolve ({'with' if tag == 'eh' else 'without'} "
+                f"electron-hole interaction)",
+                f"polarization: {label}, Cartesian ({e[0]:.6f}, {e[1]:.6f}, {e[2]:.6f})",
+                f"{kind} broadening, energy_resolution = {float(width_eV):.4f} eV; "
+                f"V_cell = {V_cell:.6f} bohr^3, N_k = {nk}, n_spinor = {n_spinor}",
+            ]
+            if tag == "eh":
+                header.append(f"{e_S.size} computed states: complete below {complete:.4f} eV; "
+                              f"column 4 is their density of states (1/eV)")
+            else:
+                header.append(f"{de.size} window transitions; column 4 is their density (1/eV)")
+            write_absorption_dat(name, omegas_eV, e2, e1, col4, header)
+    return paths
+
+
 def jdos_from_transitions(d_alpha, de_cv, omegas_Ry, V_cell, n_k, eta_Ry,
                           n_spin, n_spinor):
     """Independent-particle ε₂⁰(ω) — the 4th column of BGW's absorption_*.dat.

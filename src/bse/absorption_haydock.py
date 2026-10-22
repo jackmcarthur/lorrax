@@ -414,6 +414,7 @@ HAYDOCK_KEYS = {
     "delta_frequency": Key("delta_frequency", "float"),
     "no_eps1": Key("no_eps1", "bool"),
     "polarization": Key("polarization", "floats"),
+    "gaussian_broadening": Key("gaussian_broadening", "bool"),
 }
 
 
@@ -436,7 +437,8 @@ def _defaults():
     return argparse.Namespace(
         n_val=None, n_cond=None, n_occ=None, dipole=None, dipole_position_fix=False,
         n_iter=200, eta_eV=0.1, omega_min_eV=0.0, omega_max_eV=15.0, n_omega=1500,
-        delta_frequency=None, no_eps1=False, polarization=None)
+        delta_frequency=None, no_eps1=False, polarization=None,
+        gaussian_broadening=False)
 
 
 def main(argv=None):
@@ -464,6 +466,9 @@ def main(argv=None):
         set_exchange_channel(kernel["channel"])
     except DeckError as exc:
         p.error(str(exc))
+    if args.gaussian_broadening:
+        p.error("the Haydock continued fraction is Lorentzian only (as BerkeleyGW's "
+                "haydock): drop gaussian_broadening")
     if args.n_iter <= 0:
         p.error("number_iterations must be > 0")
 

@@ -121,6 +121,7 @@ def _preview_lanczos(
     degeneracy_mode: str = DEFAULT_MODE,
     degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
     haydock: dict | None = None,
+    spectrum: dict | None = None,
     cell_volume: float | None = None,
     kgrid: tuple | None = None,
     report=None,
@@ -293,7 +294,7 @@ def _preview_lanczos(
     dipoles = None
 
     d_alpha = de_cv = None
-    if dipole_file is not None and (write_eigs is not None or haydock is not None):
+    if dipole_file is not None:
         from file_io.restart_bundle import read_metadata
         from .absorption_common import window_dipoles
         from .bse_io import resolve_n_occ
@@ -307,43 +308,42 @@ def _preview_lanczos(
                 wfn_path=_parse_wfn_path(input_file))
 
     n_write = 0
+    dipole_attrs = None
+    if dipole_file is not None:
+        # ⟨0|r̂_α|S⟩ per root (every root, for eigenvalues_b*.dat and
+        # the brightest in RESULTS; eigenvectors.h5 keeps the written
+        # states'): the window dipoles Haydock seeds
+        # from (``absorption_common.window_dipoles``: the dipole.h5 slice
+        # at the n_occ the loader and ``eqp_corrections`` settled on, a kgrid_fine
+        # bundle's own, or a qp_rotations_file bundle's QP-basis dipoles),
+        # contracted against the solve's distributed eigenvectors in state
+        # blocks (no gather).
+        from .absorption_common import (build_dipole_vector_bse,
+                                        exciton_dipoles_distributed)
+        with timing.section("bse.exciton_dipoles", announce=True):
+            if data["densified"]:
+                dipole_attrs = {
+                    "route": data["dipoles"]["route"],
+                    "source": data["dipoles"]["source"],
+                    "velocity": data["dipoles"]["velocity"],
+                    "on_grid_rel": data["dipoles"]["on_grid_rel"]}
+            dipoles = exciton_dipoles_distributed(
+                eigenvectors, build_dipole_vector_bse(
+                    d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
+                int(n_eig))
+        stage_row("dipoles", f"<0|r|S> for {int(dipoles.shape[0])} states "
+                             f"from {os.path.basename(str(dipole_file))}")
+        if helicity_table and report is not None:
+            # Report-only: the per-state σ± strengths of the dipoles just
+            # stored, under the one convention ``inplane_helicity`` owns.
+            # Printed in RESULTS.
+            from .absorption_common import helicity_table_lines
+            helicity_lines = tuple(helicity_table_lines(
+                eigenvalues_host[:dipoles.shape[0]] * ryd2ev, dipoles, nk))
     if write_eigs is not None:
         with manual_stage(3, n_stages, "Exciton dipoles and eigenvectors",
                           name="bse.output") as _out:
             n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
-            dipoles = None
-            dipole_attrs = None
-            if dipole_file is not None:
-                # ⟨0|r̂_α|S⟩ per root (every root, for eigenvalues_b*.dat and
-                # the brightest in RESULTS; eigenvectors.h5 keeps the written
-                # states'): the window dipoles Haydock seeds
-                # from (``absorption_common.window_dipoles``: the dipole.h5 slice
-                # at the n_occ the loader and ``eqp_corrections`` settled on, a kgrid_fine
-                # bundle's own, or a qp_rotations_file bundle's QP-basis dipoles),
-                # contracted against the solve's distributed eigenvectors in state
-                # blocks (no gather).
-                from .absorption_common import (build_dipole_vector_bse,
-                                                exciton_dipoles_distributed)
-                with timing.section("bse.exciton_dipoles", announce=True):
-                    if data["densified"]:
-                        dipole_attrs = {
-                            "route": data["dipoles"]["route"],
-                            "source": data["dipoles"]["source"],
-                            "velocity": data["dipoles"]["velocity"],
-                            "on_grid_rel": data["dipoles"]["on_grid_rel"]}
-                    dipoles = exciton_dipoles_distributed(
-                        eigenvectors, build_dipole_vector_bse(
-                            d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
-                        int(n_eig))
-                stage_row("dipoles", f"<0|r|S> for {int(dipoles.shape[0])} states "
-                                     f"from {os.path.basename(str(dipole_file))}")
-                if helicity_table and report is not None:
-                    # Report-only: the per-state σ± strengths of the dipoles just
-                    # stored, under the one convention ``inplane_helicity`` owns.
-                    # Printed in RESULTS.
-                    from .absorption_common import helicity_table_lines
-                    helicity_lines = tuple(helicity_table_lines(
-                        eigenvalues_host[:dipoles.shape[0]] * ryd2ev, dipoles, nk))
             with timing.section("bse.write_eigenvectors", announce=True):
                 write_eigenvectors_stream(
                     "eigenvectors.h5",
@@ -368,6 +368,22 @@ def _preview_lanczos(
     # Every root, in BerkeleyGW's own files (with its dipoles when computed).
     energies_ev = eigenvalues_host[:n_eig] * ryd2ev
     roots_files = _write_all_roots(input_file, energies_ev, dipoles, nk)
+    spectrum_files = []
+    if dipoles is not None and spectrum is not None:
+        # BerkeleyGW's absorption_eh.dat / absorption_noeh.dat from the solved
+        # states and the window transitions (complete below the highest root).
+        from .absorption_common import polarization_directions, write_state_spectra
+        from .bse_window import _parse_wfn_path
+        directions, labels = polarization_directions(
+            spectrum["polarization"], _parse_wfn_path(input_file))
+        spectrum_files = write_state_spectra(
+            energies_Ry=eigenvalues_host[:n_eig], exciton_dipoles=dipoles,
+            d_alpha=d_alpha, de_cv=de_cv, directions=directions, labels=labels,
+            V_cell=float(cell_volume), nk=nk, n_spinor=int(data["psi_c_X"].shape[2]),
+            width_eV=spectrum["width_ev"], kind=spectrum["kind"],
+            omegas_eV=spectrum["omegas_ev"], no_eps1=spectrum["no_eps1"],
+            prefix=spectrum["prefix"])
+        log.info(f"absorption spectra from {int(n_eig)} states: {', '.join(spectrum_files)}")
     if haydock is not None:
         # ε₂(ω) by the Haydock recursion on THIS payload: the loaded bundle,
         # the eigensolve's W_R (keep_W_R) and the same matvec, so the second
@@ -437,6 +453,7 @@ def _preview_lanczos(
         "haydock_file": (None if haydock is None
                          else f"{haydock['out_prefix']}.h5"),
         "roots_files": tuple(roots_files),
+        "spectrum_files": tuple(spectrum_files),
     }
 
 
@@ -794,6 +811,8 @@ def _settings_parser():
     parser.add_argument("--number-iterations", type=int, default=None)
     parser.add_argument("--delta-frequency", type=float, default=None)
     parser.add_argument("--polarization", default=None)
+    parser.add_argument("--lorentzian-broadening", action="store_true")
+    parser.add_argument("--gaussian-broadening", action="store_true")
     return parser
 
 
@@ -848,6 +867,8 @@ BSE_KEYS = {
     "omega_max_ev": Key("haydock_omega_max_ev", "float"),
     "delta_frequency": Key("delta_frequency", "float"),
     "no_eps1": Key("haydock_no_eps1", "bool"),
+    "lorentzian_broadening": Key("lorentzian_broadening", "bool"),
+    "gaussian_broadening": Key("gaussian_broadening", "bool"),
     "polarization": Key("polarization", "floats"),
     "kpm_dos": Key("kpm_dos", "bool"),
     "kpm_window_count": Key("kpm_window_count", "int"),
@@ -910,7 +931,8 @@ _ROUTE_DESTS = {
         "davidson_margin_tol_mev", "trlan_m_max", "trlan_n_keep",
         "eqp", "n_occ", "band_degeneracy", "degeneracy_tol_ry", "dipole",
         "dipole_position_fix", "helicity_table", "qp_rotations", "haydock",
-        "number_iterations", "delta_frequency", *(
+        "number_iterations", "delta_frequency", "polarization",
+        "lorentzian_broadening", "gaussian_broadening", *(
             "haydock_" + k for k in ("iter", "pol", "eta_ev", "omega_min_ev",
                                      "omega_max_ev", "n_omega", "n_spin",
                                      "no_eps1", "out_prefix"))},
@@ -1052,13 +1074,16 @@ def parse_args(argv=None):
         if args.qp_rotations is not None:
             parser.error("haydock = true on a qp_rotations_file bundle is not "
                          "supported: run bse.absorption_haydock's inputs")
-    if args.dipole is not None and (
-            (args.write_eigs is None and args.haydock_iter == 0) or not args.tda):
-        parser.error("dipole_file stores per-state dipoles beside the written "
-                     "eigenvectors or seeds the Haydock recursion: it needs "
-                     "write_eigenvectors or haydock = true, and the TDA (the "
+    if args.dipole is not None and not args.tda:
+        parser.error("dipole_file gives the per-state dipoles, the absorption "
+                     "spectra and the Haydock seed of the TDA: drop full_bse (the "
                      "full-BSE oscillator strength needs both halves of the "
                      "paired vector)")
+    if args.lorentzian_broadening and args.gaussian_broadening:
+        parser.error("lorentzian_broadening and gaussian_broadening name two "
+                     "profiles; keep one (the default is gaussian, as BerkeleyGW's "
+                     "diagonalization)")
+    args.spectrum_prefix = "absorption" if cli.out_prefix is None else cli.out_prefix
     if args.helicity_table and args.dipole is None:
         parser.error("helicity_table reports the per-state dipoles: it needs "
                      "dipole_file (with write_eigenvectors and the TDA)")
@@ -1124,6 +1149,21 @@ def _haydock_settings(args) -> dict | None:
             "out_prefix": str(args.haydock_out_prefix)}
 
 
+def _spectrum_settings(args) -> dict | None:
+    """The absorption_eh/noeh settings (None without dipole_file or under full_bse)."""
+    if args.dipole is None or not args.tda:
+        return None
+    import numpy as np
+    return {"polarization": args.polarization,
+            "width_ev": float(args.haydock_eta_ev),
+            "kind": "lorentzian" if args.lorentzian_broadening else "gaussian",
+            "omegas_ev": np.linspace(float(args.haydock_omega_min_ev),
+                                     float(args.haydock_omega_max_ev),
+                                     int(args.haydock_n_omega)),
+            "no_eps1": bool(args.haydock_no_eps1),
+            "prefix": args.spectrum_prefix}
+
+
 def _file_rows(result, wfn_path, args):
     """The OUTPUT FILES rows: what the run read and wrote."""
     rows = [("GW/BSE restart", "read", result["restart_file"]),
@@ -1133,6 +1173,8 @@ def _file_rows(result, wfn_path, args):
         ("Haydock absorption", result["haydock_file"])) if path]
     rows += [("exciton energies, all roots", "written", path)
              for path in result["roots_files"]]
+    rows += [("absorption spectrum", "written", path)
+             for path in result.get("spectrum_files", ())]
     rows += [(label, "read", path) for label, path in (
         ("QP corrections", args.eqp), ("QP rotations", args.qp_rotations)) if path]
     rows.append(("input deck", "read", args.input))
@@ -1243,6 +1285,7 @@ def main(argv=None) -> int:
             degeneracy_tol_ry=args.degeneracy_tol_ry,
             tda=use_tda,
             haydock=_haydock_settings(args),
+            spectrum=_spectrum_settings(args),
             cell_volume=float(wfn.cell_volume),
             kgrid=tuple(int(n) for n in wfn.kgrid),
             report=report,
